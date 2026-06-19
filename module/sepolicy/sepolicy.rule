@@ -1,0 +1,14 @@
+# SELinux 策略规则
+# 允许 UFI-AXIS-Core 访问 AT 通道设备节点
+allow ufi_axis_core_device smd_device chr_file { open read write ioctl };
+allow ufi_axis_core_device ttyUSB_device chr_file { open read write ioctl };
+
+# 允许访问 /proc 文件系统
+allow ufi_axis_core proc:file { open read };
+
+# 允许访问 /sys 文件系统
+allow ufi_axis_core sysfs:dir { search };
+allow ufi_axis_core sysfs:file { open read };
+
+# 允许执行 shell 命令
+allow ufi_axis_core shell_exec:file { execute };

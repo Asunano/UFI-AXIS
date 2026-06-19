@@ -1,0 +1,31 @@
+# Gradle / Build
+.gradle
+build/
+*.apk
+*.aab
+*.aar
+*.jar
+*.dex
+*.class
+
+# IDE
+*.iml
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Android
+local.properties
+/captures
+.externalNativeBuild
+.cxx
+
+# Generated
+.codebuddy/
+generated-images/

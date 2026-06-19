@@ -1,0 +1,6 @@
+id=ufi_axis_core
+name=UFI-AXIS-Core
+version=v0.1
+versionCode=1
+author=Asunano
+description=随身 WiFi 设备系统级后端 — Magisk 模块，直控基带芯片

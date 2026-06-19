@@ -1,0 +1,8 @@
+{
+  "token": "ufi_axis_default_token",
+  "secret": "ufi_axis_default_secret",
+  "port": 8088,
+  "auto_start_on_boot": true,
+  "rate_limit_max": 100,
+  "rate_limit_window_sec": 60
+}
