@@ -11,11 +11,11 @@ import androidx.activity.viewModels
 import androidx.compose.runtime.*
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.ufi_axis.data.api.RetrofitClient
-import com.ufi_axis.data.repository.UfiAxisRepository
 import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.ui.components.UpdateDialog
 import com.ufi_axis.ui.navigation.MainNavGraph
 import com.ufi_axis.ui.screens.SetupScreen
+import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.UFIAXISTheme
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.NetworkMonitor
@@ -36,7 +36,16 @@ class MainActivity : ComponentActivity() {
         networkMonitor.startMonitoring()
 
         setContent {
-            UFIAXISTheme {
+            val themeManager = remember { ThemeManager(applicationContext) }
+            val selectedThemeId by themeManager.selectedThemeId.collectAsState()
+            val customAccent by themeManager.customAccentColor.collectAsState()
+            val dynamicEnabled by themeManager.dynamicEnabled.collectAsState()
+
+            val palette = remember(selectedThemeId, customAccent, dynamicEnabled) {
+                themeManager.getCurrentPalette()
+            }
+
+            UFIAXISTheme(palette = palette) {
                 var isSetupComplete by remember { mutableStateOf(prefs.isSetupComplete) }
 
                 if (!isSetupComplete) {
@@ -51,12 +60,11 @@ class MainActivity : ComponentActivity() {
                     )
                 } else {
                     val api = remember { RetrofitClient.getApiService(prefs) }
-                    val repository = remember { UfiAxisRepository(api) }
                     val webSocketRepository = remember {
                         WebSocketRepository(prefs.baseUrl.replace("http", "ws").trimEnd('/'), prefs.token)
                     }
                     val viewModel: MainViewModel = viewModel(
-                        factory = MainViewModel.provideFactory(repository, webSocketRepository, networkMonitor, this@MainActivity)
+                        factory = MainViewModel.provideFactory(api, webSocketRepository, networkMonitor, applicationContext)
                     )
 
                     val updateState by viewModel.updateState.collectAsState()
@@ -74,16 +82,14 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    UFIAXISTheme {
-                        MainNavGraph(
-                            viewModel = viewModel,
-                            onServerConfigChanged = {
-                                RetrofitClient.recreate(prefs)
-                                webSocketRepository.reconnect()
-                                viewModel.refreshDashboard()
-                            }
-                        )
-                    }
+                    MainNavGraph(
+                        viewModel = viewModel,
+                        onServerConfigChanged = {
+                            RetrofitClient.recreate(prefs)
+                            webSocketRepository.reconnect()
+                            viewModel.dashboard.refreshDashboard()
+                        }
+                    )
                 }
             }
         }

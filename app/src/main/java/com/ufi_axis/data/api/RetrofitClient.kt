@@ -8,7 +8,40 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import java.io.IOException
 import java.util.concurrent.TimeUnit
+
+/**
+ * Retry interceptor for transient failures (IOException, 5xx).
+ * Retries up to [maxRetries] times with [retryDelayMs] between attempts.
+ */
+class RetryInterceptor(
+    private val maxRetries: Int = 2,
+    private val retryDelayMs: Long = 500
+) : Interceptor {
+    override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
+        val request = chain.request()
+        var lastException: IOException? = null
+        for (attempt in 0..maxRetries) {
+            try {
+                val response = chain.proceed(request)
+                // Retry on 5xx server errors
+                if (response.code >= 500 && attempt < maxRetries) {
+                    response.close()
+                    Thread.sleep(retryDelayMs)
+                    continue
+                }
+                return response
+            } catch (e: IOException) {
+                lastException = e
+                if (attempt < maxRetries) {
+                    Thread.sleep(retryDelayMs)
+                }
+            }
+        }
+        throw lastException ?: IOException("Request failed after ${maxRetries + 1} attempts")
+    }
+}
 
 object RetrofitClient {
 
@@ -33,6 +66,7 @@ object RetrofitClient {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun createApiService(prefs: AppPreferences): UfiAxisApi {
         val ip = prefs.serverIp.ifBlank { "127.0.0.1" }
         val baseUrl = "http://$ip:${prefs.serverPort}/"
@@ -58,9 +92,10 @@ object RetrofitClient {
         }
 
         val builder = OkHttpClient.Builder()
+            .addInterceptor(RetryInterceptor(maxRetries = 2, retryDelayMs = 500))
             .addInterceptor(authInterceptor)
             .addInterceptor(traceInterceptor)
-            .connectTimeout(10, TimeUnit.SECONDS)
+            .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(25, TimeUnit.SECONDS)
             .writeTimeout(15, TimeUnit.SECONDS)
 
@@ -73,7 +108,10 @@ object RetrofitClient {
 
         val client = builder.build()
 
-        val gson = com.google.gson.Gson()
+        // Gson 严格模式无法处理 goform 透传的字符串数字（如 "rsrp":"99"）
+        val gson = com.google.gson.GsonBuilder()
+            .setLenient()
+            .create()
 
         return Retrofit.Builder()
             .baseUrl(baseUrl)

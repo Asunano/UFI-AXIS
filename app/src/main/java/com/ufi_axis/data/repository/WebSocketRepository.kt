@@ -39,6 +39,10 @@ class WebSocketRepository(
     private val _cachedData = MutableStateFlow<Map<String, WebSocketMessage>>(emptyMap())
     val cachedData: StateFlow<Map<String, WebSocketMessage>> = _cachedData
 
+    /** data_changed 事件流 — 精准增量刷新的数据源 */
+    private val _dataChanged = MutableSharedFlow<String>(replay = 0)
+    val dataChanged: SharedFlow<String> = _dataChanged
+
     private var retryCount = 0
     private val maxRetryCount = 10
     private var retryJob: Job? = null
@@ -58,7 +62,7 @@ class WebSocketRepository(
                 DebugLog.d("WS", "Connected to $baseUrl/ws/realtime")
                 _connectionState.value = ConnectionState.CONNECTED
                 retryCount = 0
-                subscribeToTopics(listOf("cpu", "memory", "traffic", "signal", "battery", "alert"))
+                subscribeToTopics(listOf("cpu", "memory", "traffic", "signal", "battery", "alert", "data_changed", "sms_contacts"))
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -68,6 +72,14 @@ class WebSocketRepository(
                         val message = gson.fromJson(text, WebSocketMessage::class.java)
                         _cachedData.value = _cachedData.value + (message.type to message)
                         _messages.emit(message)
+                        // 解析 data_changed 事件 → 精准增量刷新
+                        if (message.type == "data_changed") {
+                            val changed = message.data?.asJsonObject?.get("changed")?.asString
+                            if (changed != null) {
+                                DebugLog.d("WS", "Data changed event: $changed")
+                                _dataChanged.emit(changed)
+                            }
+                        }
                         DebugLog.d("WS", "Parsed message type=${message.type}")
                     } catch (e: JsonSyntaxException) {
                         DebugLog.parseError("WS", "ws://realtime", text, e)

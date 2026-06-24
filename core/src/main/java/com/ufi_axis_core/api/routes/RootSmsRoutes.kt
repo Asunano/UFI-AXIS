@@ -10,18 +10,32 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 
 class RootSmsRoutes(
-    private val smsController: SmsController
+    private val smsController: SmsController,
+    private val dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null
 ) {
     fun register(route: Route) {
         route.route("/sms") {
+            // ── 按号码聚合的联系人列表（后端处理分组，前端直接渲染）──
+            get("/contacts") {
+                val contacts = smsController.getContactList(dataScheduler)
+                call.respond(toJsonElement(mapOf(
+                    "contacts" to contacts,
+                    "count" to contacts.size
+                )))
+            }
+
             get("/list") {
                 val limit = (call.request.queryParameters["limit"] ?: "50").toIntOrNull()?.coerceIn(1, 200) ?: 50
+                val offset = (call.request.queryParameters["offset"] ?: "0").toIntOrNull()?.coerceAtLeast(0) ?: 0
                 val folder = call.request.queryParameters["folder"] ?: "all"
+                val phone = call.request.queryParameters["phone"]?.takeIf { it.isNotBlank() }
                 val messages = when (folder) {
-                    "inbox" -> smsController.getInbox(limit)
-                    "sent" -> smsController.getSent(limit)
-                    else -> smsController.getAll(limit)
+                    "inbox" -> smsController.getInbox(limit, offset, phone)
+                    "sent" -> smsController.getSent(limit, offset, phone)
+                    else -> smsController.getAll(limit, offset, phone)
                 }
+                // 仅在传了phone参数时计算总数（按号码过滤），否则返回当前批次大小
+                val total = if (phone != null) smsController.getFilteredCount(phone) else messages.size
                 call.respond(toJsonElement(mapOf(
                     "messages" to messages.map { mapOf(
                         "id" to it.id,
@@ -31,7 +45,8 @@ class RootSmsRoutes(
                         "timestamp" to it.date,
                         "read" to it.read
                     )},
-                    "count" to messages.size
+                    "count" to messages.size,
+                    "total" to total
                 )))
             }
 

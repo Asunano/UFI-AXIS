@@ -2,6 +2,7 @@ package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
 import io.ktor.http.*
 import io.ktor.server.application.call
@@ -79,20 +80,6 @@ class ConfigRoutes(
                     updated.add("auto_start_on_boot")
                 }
 
-                body["rate_limit_max"]?.jsonPrimitive?.intOrNull?.let {
-                    if (it >= 1) {
-                        settings.rateLimitMax = it
-                        updated.add("rate_limit_max")
-                    }
-                }
-
-                body["rate_limit_window_sec"]?.jsonPrimitive?.intOrNull?.let {
-                    if (it >= 1) {
-                        settings.rateLimitWindowSec = it
-                        updated.add("rate_limit_window_sec")
-                    }
-                }
-
                 body["goform_ip"]?.jsonPrimitive?.contentOrNull?.let {
                     if (it.isNotBlank()) {
                         settings.goformIp = it
@@ -138,7 +125,24 @@ class ConfigRoutes(
                     if (it in 500..30000) {
                         settings.qosCacheTtlMs = it
                         ShellQoS.updateCacheTtl(it.toLong())
+                        GoformQoS.updateCacheTtl(it.toLong())
                         updated.add("qos_cache_ttl_ms")
+                    }
+                }
+
+                body["qos_goform_query_max"]?.jsonPrimitive?.intOrNull?.let {
+                    if (it in 1..8) {
+                        settings.qosGoformQueryMax = it
+                        GoformQoS.adaptiveAdjust(it, settings.qosGoformSetMax)
+                        updated.add("qos_goform_query_max")
+                    }
+                }
+
+                body["qos_goform_set_max"]?.jsonPrimitive?.intOrNull?.let {
+                    if (it in 1..4) {
+                        settings.qosGoformSetMax = it
+                        GoformQoS.adaptiveAdjust(settings.qosGoformQueryMax, it)
+                        updated.add("qos_goform_set_max")
                     }
                 }
 

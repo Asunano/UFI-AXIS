@@ -38,12 +38,6 @@ class WebSocketManager(
      * 处理新的 WebSocket 连接
      */
     suspend fun handleConnection(session: DefaultWebSocketServerSession) {
-        // 连接数上限保护
-        if (connections.size >= maxConnections) {
-            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) reached")
-            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
-            return
-        }
         // 认证检查: 通过 URL 查询参数验证 token
         if (expectedToken != null) {
             val requestToken = session.call.request.queryParameters["token"]
@@ -55,7 +49,18 @@ class WebSocketManager(
         }
 
         val subscribedTypes = mutableSetOf<String>()
-        connections[session] = subscribedTypes
+        // 原子地检查连接上限并注册（防止竞态导致连接数超过 maxConnections）
+        val existing = connections.putIfAbsent(session, subscribedTypes)
+        if (existing != null) {
+            AppLogger.w(tag, "WebSocket session already registered, skipping")
+            return
+        }
+        if (connections.size > maxConnections) {
+            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) exceeded")
+            connections.remove(session)
+            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
+            return
+        }
 
         AppLogger.i(tag, "New WebSocket connection. Total: ${connections.size}")
 
@@ -85,7 +90,8 @@ class WebSocketManager(
             }
         } catch (e: ClosedReceiveChannelException) {
             AppLogger.i(tag, "WebSocket connection closed")
-        } catch (e: Exception) {
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) {
             AppLogger.e(tag, "WebSocket error", e)
         } finally {
             connections.remove(session)
@@ -128,9 +134,20 @@ class WebSocketManager(
                 session.send(Frame.Text(pong))
             }
 
-        } catch (e: Exception) {
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) {
             AppLogger.e(tag, "Failed to parse WebSocket message: $text", e)
         }
+    }
+
+    /**
+     * 广播数据变更通知 — 当配置/设备信息等发生变化时，通知前端刷新对应模块。
+     * 订阅类型: "data_changed"
+     * 推送: { type: "data_changed", data: { changed: "wifi|device|sim|network|lan|..." } }
+     */
+    suspend fun broadcastDataChanged(changedType: String) {
+        if (connections.isEmpty()) return
+        broadcast("data_changed", mapOf("changed" to changedType))
     }
 
     /**
@@ -157,9 +174,10 @@ class WebSocketManager(
             if (type in subscribedTypes) {
                 try {
                     session.send(Frame.Text(text))
-                } catch (e: Exception) {
-                    deadSessions.add(session)
-                }
+                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (e: Exception) {
+                        deadSessions.add(session)
+                    }
             }
         }
 
@@ -179,7 +197,8 @@ class WebSocketManager(
         connections.keys.forEach { session ->
             try {
                 session.close(CloseReason(CloseReason.Codes.GOING_AWAY, "Server shutting down"))
-            } catch (_: Exception) {}
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (_: Exception) {}
         }
         connections.clear()
     }

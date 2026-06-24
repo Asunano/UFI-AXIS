@@ -34,6 +34,8 @@ class Aria2Engine(
     private var process: Process? = null
     @Volatile private var running = false
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = false }
+    /** 等待 RPC 就绪的协程 Job，stop() 时取消防止泄漏 */
+    private var rpcReadyJob: Job? = null
 
     /** 缓存的版本号 */
     var cachedVersion: String? = null
@@ -180,9 +182,30 @@ class Aria2Engine(
             // 网络
             appendLine("disable-ipv6=${config.disableIpv6}")
             appendLine("check-certificate=${config.checkCertificate}")
+            // 仅在开启证书校验时指定 CA bundle（Android 上 aria2 的 OpenSSL 可能找不到默认 CA store）。
+            // 关闭校验时不设置 ca-certificate，避免 aria2 TLS 库加载不兼容的 CA 文件导致异常。
+            if (config.checkCertificate) {
+                for (caPath in listOf(
+                    "/etc/ssl/certs/ca-certificates.crt",
+                    "/system/etc/security/cacerts.pem"
+                )) {
+                    if (java.io.File(caPath).canRead()) {
+                        appendLine("ca-certificate=$caPath")
+                        break
+                    }
+                }
+            }
+            // DNS: async-dns=true 让 aria2 自己发 DNS 查询（绕开 Android Bionic/musl getaddrinfo
+            // 在无 /etc/resolv.conf 或 netd 不通时返回 "No address associated with hostname" 的问题）。
+            // 使用国内可靠可达的 DNS 服务器，避免 8.8.8.8/1.1.1.1 在墙内被拦截。
+            appendLine("async-dns=true")
+            appendLine("async-dns-server=223.5.5.5,119.29.29.29,114.114.114.114")
+            appendLine("dns-cache-timeout=600")
             appendLine("max-tries=${config.maxTries}")
             appendLine("retry-wait=${config.retryWait}")
             if (config.maxResumeTries > 0) appendLine("max-resume-failure=${config.maxResumeTries}")
+            appendLine("connect-timeout=15")
+            appendLine("timeout=30")
             // 日志
             appendLine("log=${logFile.absolutePath}")
             appendLine("log-level=${config.logLevel}")
@@ -224,7 +247,9 @@ class Aria2Engine(
             }
 
             // 等待 RPC 就绪（在 IO 协程中，包含详细的诊断日志）
-            CoroutineScope(Dispatchers.IO).launch {
+            // 注意：使用成员变量 rpcReadyJob 管理，stop() 时取消，防止 scope 泄漏
+            rpcReadyJob?.cancel()
+            rpcReadyJob = CoroutineScope(Dispatchers.IO + SupervisorJob()).launch {
                 val ready = waitForRpc()
                 if (ready) {
                     cachedVersion = getVersion()
@@ -250,6 +275,9 @@ class Aria2Engine(
 
     fun stop() {
         if (!running && process == null) return
+        // 取消等待 RPC 就绪的协程，防止 scope 泄漏
+        rpcReadyJob?.cancel()
+        rpcReadyJob = null
         try {
             // 先通过 RPC 通知 aria2 优雅关闭
             rpcCall("aria2.shutdown", emptyList())
@@ -546,5 +574,131 @@ class Aria2Engine(
 
         AppLogger.e(TAG, "TCP connected but JSON-RPC not responding after ${System.currentTimeMillis()-start}ms")
         return false
+    }
+
+    // ─── 最原始下载测试（命令行直调，不用 conf/RPC）────────────────
+
+    /**
+     * 用最原始的 aria2c 命令行模式下载一个文件。
+     * 不依赖配置文件、RPC 服务器等任何中间层，便于诊断底层网络/二进制问题。
+     *
+     * @param url 下载链接
+     * @param saveDir 保存目录
+     * @param fileName 文件名（可选，null=由 HTTP 头/URL 推断）
+     * @param timeoutSec 最大等待秒数（默认 60 秒）
+     * @return RawDownloadResult 包含所有输出、退出码、耗时
+     */
+    data class RawDownloadResult(
+        val success: Boolean,
+        val exitCode: Int,
+        val stdout: String,
+        val stderr: String,
+        val elapsedMs: Long,
+        val downloadedFile: String?
+    )
+
+    fun rawDownload(
+        url: String,
+        saveDir: String = DownloadManager.DEFAULT_SAVE_DIR,
+        fileName: String? = null,
+        timeoutSec: Long = 120,
+        killLingering: Boolean = true  // 默认杀掉残留进程；从 submitAria2Download 调用时传 false
+    ): RawDownloadResult {
+        AppLogger.i(TAG, "=== rawDownload START ===")
+        AppLogger.i(TAG, "  URL: $url")
+        AppLogger.i(TAG, "  saveDir: $saveDir")
+        AppLogger.i(TAG, "  fileName: ${fileName ?: "(auto)"}")
+
+        // 确保无残留 aria2c 进程占用端口（除非调用方要求保留，如 RPC 引擎正运行中）
+        if (killLingering) killLingeringProcess()
+
+        val binary = File(binaryPath)
+        if (!binary.exists()) {
+            AppLogger.e(TAG, "aria2c binary not found at $binaryPath")
+            return RawDownloadResult(false, -1, "", "binary not found: $binaryPath", 0, null)
+        }
+
+        File(saveDir).mkdirs()
+
+        // 最精简的命令行：不设 conf-path，不启用 RPC，纯 CLI 模式
+        val cmd = mutableListOf(
+            binary.absolutePath,
+            url,
+            "--check-certificate=false",
+            "--file-allocation=none",
+            "--console-log-level=debug",
+            "--dir=$saveDir",
+            "--max-connection-per-server=1",
+            "--split=1",
+            "--connect-timeout=15",
+            "--timeout=60"
+        )
+        fileName?.let { cmd.add("--out=$it") }
+
+        AppLogger.i(TAG, "  CMD: ${cmd.joinToString(" ")}")
+
+        val startMs = System.currentTimeMillis()
+        return try {
+            val pb = ProcessBuilder(cmd)
+            pb.redirectErrorStream(false) // 分开 stdout 和 stderr 以便诊断
+
+            val proc = pb.start()
+            AppLogger.i(TAG, "  Process started (alive=${proc.isAlive})")
+
+            val stdoutThread = Thread {
+                try {
+                    proc.inputStream.bufferedReader().use { reader ->
+                        reader.lines().forEach { line ->
+                            AppLogger.i("aria2-raw-stdout", line)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+            val stderrThread = Thread {
+                try {
+                    proc.errorStream.bufferedReader().use { reader ->
+                        reader.lines().forEach { line ->
+                            AppLogger.i("aria2-raw-stderr", line)
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+            stdoutThread.start()
+            stderrThread.start()
+
+            val exited = proc.waitFor(timeoutSec, java.util.concurrent.TimeUnit.SECONDS)
+            if (!exited) {
+                AppLogger.e(TAG, "  Process timed out after ${timeoutSec}s, destroying...")
+                proc.destroyForcibly()
+                proc.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+            }
+
+            stdoutThread.join(3000)
+            stderrThread.join(3000)
+
+            val elapsed = System.currentTimeMillis() - startMs
+            val exitCode = proc.exitValue()
+
+            // 扫描下载目录中最近创建/修改的文件
+            val downloadedFile = File(saveDir).listFiles()
+                ?.filter { it.isFile }
+                ?.maxByOrNull { it.lastModified() }
+                ?.absolutePath
+
+            AppLogger.i(TAG, "=== rawDownload END exitCode=$exitCode elapsed=${elapsed}ms file=$downloadedFile ===")
+
+            RawDownloadResult(
+                success = exitCode == 0,
+                exitCode = exitCode,
+                stdout = "(see aria2-raw-stdout logs)",
+                stderr = "(see aria2-raw-stderr logs)",
+                elapsedMs = elapsed,
+                downloadedFile = downloadedFile
+            )
+        } catch (e: Exception) {
+            val elapsed = System.currentTimeMillis() - startMs
+            AppLogger.e(TAG, "rawDownload exception: ${e.javaClass.simpleName}: ${e.message}", e)
+            RawDownloadResult(false, -1, "", "${e.javaClass.simpleName}: ${e.message}", elapsed, null)
+        }
     }
 }

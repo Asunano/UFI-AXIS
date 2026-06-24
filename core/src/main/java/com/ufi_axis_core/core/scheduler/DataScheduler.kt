@@ -1,29 +1,30 @@
 package com.ufi_axis_core.core.scheduler
 
-import com.ufi_axis_core.collector.at.ATChannel
+import com.ufi_axis_core.collector.signal.SignalCollector
 import com.ufi_axis_core.collector.system.CpuInfo
 import com.ufi_axis_core.collector.system.MemoryInfo
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformSignalClient
+import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.core.database.AppDatabase
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.contentOrNull
 import com.ufi_axis_core.core.database.CpuHistoryRecord
 import com.ufi_axis_core.core.database.SignalRecord
 import com.ufi_axis_core.core.database.TrafficRecord
 import com.ufi_axis_core.core.database.MemoryHistoryRecord
 import com.ufi_axis_core.core.database.BatteryHistoryRecord
-import com.ufi_axis_core.api.middleware.QoSMiddleware
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.ShellExecutor
+import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
 import com.ufi_axis_core.api.websocket.WebSocketManager
 import kotlinx.coroutines.*
@@ -34,15 +35,27 @@ import java.util.concurrent.ConcurrentLinkedQueue
 /**
  * 多频率采集调度器
  *
- * 不同数据类型按不同频率采集:
- * - CPU/内存: 2s (高优先级)
- * - 信号/网速: 3s (中优先级)
- * - 流量统计: 5s (低优先级)
- * - 电池/温度: 30s
+ * ════════════════════════════════════════
+ * 数据分类与采集策略
+ * ════════════════════════════════════════
+ *
+ * 【实时数据】— 需要高频采集，不缓存或短缓存
+ * - 信号质量 (RSRP/SINR/RSRQ/RSSI): 自适应 MEDIUM（~10s）
+ * - 实时网速/吞吐量 (goform thrpt + TrafficStats): 自适应 MEDIUM（~10s）
+ * - CPU/内存: 自适应 MEDIUM（~10s）
+ * - WiFi 客户端列表: TTL 15s（实时性要求高）
+ *
+ * 【可缓存数据】— 变化缓慢，低频采集 + 长缓存
+ * - 月流量统计: 120s 固定间隔
+ * - 电池/温度: 120s 固定间隔
+ * - SMS 联系人缓存: 60s 固定间隔
+ * - 设备信息/固件版本: TTL 10-30min
+ * - 运营商/SIM 卡信息: TTL 15min
+ * - 设备设置/LAN/APN: TTL 5-10min
  *
  * 智能并发控制:
  * - 启动时检测CPU核心数、内存大小
- * - 每30秒检测设备性能(CPU/内存)
+ * - 每60秒检测设备性能(CPU/内存)
  * - 动态调整线程池大小
  * - 高负载时降低频率，低负载时提高频率
  *
@@ -56,20 +69,25 @@ import java.util.concurrent.ConcurrentLinkedQueue
 class DataScheduler(
     private val systemCollector: SystemCollector,
     private val telephonyCollector: TelephonyCollector,
-    private val atChannel: ATChannel,
     private val database: AppDatabase,
     private val webSocketManager: WebSocketManager,
-    private val goformClient: GoformClient? = null,
+    private val signalClient: GoformSignalClient? = null,
+    private val smsClient: GoformSmsClient? = null,
     private val alertEngine: com.ufi_axis_core.alert.AlertEngine? = null,
-    private val dynamicThreadPool: DynamicThreadPool = DynamicThreadPool(),
-    private val qosMiddleware: QoSMiddleware? = null
+    private val dynamicThreadPool: DynamicThreadPool = DynamicThreadPool()
 ) {
     private val tag = "DataScheduler"
-    // 使用 Dispatchers.Default，实际采集频率由 getAdaptiveDelay 根据 DynamicThreadPool 的性能评分动态调整
-    private val schedulerScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // 使用 Dispatchers.IO 而非 Default — DataScheduler 所有协程都在做 IO（shell/http/db），
+    // 占 Default 线程池会导致 CPU-bound 协程饥饿
+    private val schedulerScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "DataScheduler coroutine exception (uncaught)", e)
+    })
     private var isRunning = false
     private var performanceMonitorJob: Job? = null
     private var flushJob: Job? = null
+
+    // 信号采集器（三层优先级合并逻辑独立管理）
+    private val signalCollector = SignalCollector(signalClient, telephonyCollector)
 
     // 批量写入缓冲区 — 减少对 Room 的 I/O 次数，降低低端设备卡顿
     private val cpuBuffer = ConcurrentLinkedQueue<CpuHistoryRecord>()
@@ -93,11 +111,13 @@ class DataScheduler(
         val cached = _latestSignal.value
         val age = System.currentTimeMillis() - (cached?.timestamp ?: 0)
         if (cached != null && age < 10_000) {
-            return signalRecordToMap(cached)
+            // 缓存命中：SignalRecord 不存储 network_registered，从 TelephonyCollector 实时补充
+            val map = signalRecordToMap(cached).toMutableMap()
+            map["network_registered"] = telephonyCollector.isNetworkRegistered()
+            return map
         }
-        // 缓存过期或不存在，执行一次采集
-        val signalInfo = collectSignalUnified()
-        val record = buildSignalRecord(signalInfo)
+        val signalInfo = signalCollector.collect()
+        val record = signalCollector.buildRecord(signalInfo)
         _latestSignal.value = record
         return signalInfo
     }
@@ -124,6 +144,10 @@ class DataScheduler(
     private val _goformTraffic = MutableStateFlow<Pair<Long, Long>?>(null)  // (rxBytes, txBytes)
     val goformTraffic: StateFlow<Pair<Long, Long>?> = _goformTraffic
 
+    // Goform 实时吞吐量缓存（来自 Modem 固件直接上报，比 Android TrafficStats 更准确）
+    @Volatile private var goformRxThrpt: Long = 0L
+    @Volatile private var goformTxThrpt: Long = 0L
+
     fun start() {
         if (isRunning) return
         isRunning = true
@@ -143,51 +167,45 @@ class DataScheduler(
             }
         }
 
-        // CPU: 高优先级 2s
+        // ── 【实时数据】CPU + 内存: 合并到同一协程，减少并发协程数（中优先级 10s 自适应）
         schedulerScope.launch {
             while (isActive) {
                 collectCpu()
-                delay(getAdaptiveDelay(DataPriority.HIGH))
-            }
-        }
-
-        // 内存: 高优先级 2s
-        schedulerScope.launch {
-            while (isActive) {
                 collectMemory()
-                delay(getAdaptiveDelay(DataPriority.HIGH))
-            }
-        }
-
-        // 信号质量: 中优先级 3s
-        schedulerScope.launch {
-            while (isActive) {
-                collectSignal()
                 delay(getAdaptiveDelay(DataPriority.MEDIUM))
             }
         }
 
-        // 实时网速: 中优先级 3s
+        // ── 【实时数据】信号 + 实时吞吐量 + 网速（合并为 1 条 goform 查询，原 3 条）
         schedulerScope.launch {
             while (isActive) {
+                collectSignal()
                 collectTraffic()
                 delay(getAdaptiveDelay(DataPriority.MEDIUM))
             }
         }
 
-        // 流量统计: 60s 固定间隔（goform 查询频率受限，间隔太长会被拒）
+        // ── 【可缓存数据】月流量统计: 120s 固定间隔
         schedulerScope.launch {
             while (isActive) {
                 collectGoformTraffic()
+                delay(120_000L)
+            }
+        }
+
+        // ── 【可缓存数据】SMS 联系人缓存: 60s
+        schedulerScope.launch {
+            while (isActive) {
+                collectSmsCache()
                 delay(60_000L)
             }
         }
 
-        // 电池/温度: 30s 固定间隔
+        // ── 【可缓存数据】电池/温度: 120s
         schedulerScope.launch {
             while (isActive) {
                 collectBattery()
-                delay(BATTERY_COLLECTION_INTERVAL_MS)
+                delay(120_000L)
             }
         }
 
@@ -204,8 +222,11 @@ class DataScheduler(
         isRunning = false
         performanceMonitorJob?.cancel()
         flushJob?.cancel()
-        // 停止前刷写剩余缓冲数据，避免数据丢失
-        schedulerScope.launch { flushBuffers() }
+        // 停止前同步刷写剩余缓冲数据（runBlocking 确保 flush 完成后再取消子协程，
+        // 避免 launch + cancelChildren 竞态导致 flush 被中断、数据丢失）
+        try {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) { flushBuffers() }
+        } catch (_: Exception) {}
         schedulerScope.coroutineContext.cancelChildren()
         AppLogger.i(tag, "Data scheduler stopped")
     }
@@ -243,12 +264,13 @@ class DataScheduler(
                     val maxTemp = readMaxCpuTemp()
 
                     // 自适应 ShellQoS 策略：根据温度和 CPU 负载动态调整 root 并发数
+                    // maxPermits=4 → 极限不超过 4，防止 Unisoc 内核 sprd_ipc_probe 竞态
                     val adaptiveRootPermits = when {
                         maxTemp > THERMAL_CRITICAL_THRESHOLD -> 1   // 85°C+ 极限收缩
                         maxTemp > THERMAL_WARNING_THRESHOLD -> 2    // 75°C+ 温和收缩
                         cpuUsage > 80f -> 2                          // CPU 高负载
                         cpuUsage > 50f -> 3                          // CPU 中负载，保持默认
-                        else -> 4                                    // 低负载，稍微放宽
+                        else -> 3                                    // 低负载，不放大（maxPermits=4 留 1 给 AT/ShellRoutes）
                     }
                     ShellQoS.adaptiveAdjust(adaptiveRootPermits)
 
@@ -260,20 +282,29 @@ class DataScheduler(
                     }
                     ShellQoS.updateCacheTtl(adaptiveTtl)
 
-                    // QoSMiddleware 感知 ShellQoS 负载，同步调整请求级并发
-                    qosMiddleware?.adjustByLoad(
-                        ShellQoS.rootAvailablePermits,
-                        ShellQoS.rootTotalPermits
-                    )
+                    // 自适应 GoformQoS 策略：控制后端→设备 HTTP 通信并发
+                    val goformQueryPermits = when {
+                        maxTemp > THERMAL_CRITICAL_THRESHOLD -> 1
+                        maxTemp > THERMAL_WARNING_THRESHOLD || cpuUsage > 80f -> 2
+                        cpuUsage > 50f -> 3
+                        else -> 5
+                    }
+                    val goformSetPermits = when {
+                        maxTemp > THERMAL_CRITICAL_THRESHOLD || cpuUsage > 80f -> 1
+                        else -> 2
+                    }
+                    GoformQoS.adaptiveAdjust(goformQueryPermits, goformSetPermits)
+                    GoformQoS.updateCacheTtl(adaptiveTtl)
 
-                    AppLogger.d(tag, "Performance check: cpu=${cpuUsage}%, freeMem=${freeMemory / 1024 / 1024}MB, poolSize=${dynamicThreadPool.getThreadPoolInfo().maxPoolSize}, rootPermits=${ShellQoS.rootTotalPermits}(target=${ShellQoS.rootTargetPermits}), cacheTtl=${adaptiveTtl}ms")
+                    AppLogger.d(tag, "Performance check: cpu=${cpuUsage}%, freeMem=${freeMemory / 1024 / 1024}MB, poolSize=${dynamicThreadPool.getThreadPoolInfo().maxPoolSize}, rootPermits=${ShellQoS.rootTotalPermits}(target=${ShellQoS.rootTargetPermits}), goformQ=${GoformQoS.queryTotalPermits}(t=${GoformQoS.queryTargetPermits}), goformS=${GoformQoS.setTotalPermits}, cacheTtl=${adaptiveTtl}ms")
 
                     // 温度熔断
                     when {
                         maxTemp > THERMAL_CRITICAL_THRESHOLD -> {
-                            // 85°C: 紧急降温 — 清空可用 shell 许可，暂停 10s
+                            // 85°C: 紧急降温 — 清空 shell 和 goform 缓存，暂停 10s
                             ShellQoS.clearCache()
-                            AppLogger.w(tag, "Thermal critical: ${maxTemp / 1000}°C > ${THERMAL_CRITICAL_THRESHOLD / 1000}°C, clearing shell cache and pausing")
+                            GoformQoS.clearCache()
+                            AppLogger.w(tag, "Thermal critical: ${maxTemp / 1000}°C > ${THERMAL_CRITICAL_THRESHOLD / 1000}°C, clearing caches and pausing")
                             delay(THERMAL_PAUSE_MS)
                         }
                         maxTemp > THERMAL_WARNING_THRESHOLD -> {
@@ -290,46 +321,80 @@ class DataScheduler(
 
     private fun getAdaptiveDelay(priority: DataPriority): Long {
         val baseDelay = when (priority) {
-            DataPriority.HIGH -> 2_000L    // CPU/内存: 2s base
-            DataPriority.MEDIUM -> 3_000L   // 网速/信号: 3s base
-            DataPriority.LOW -> 5_000L      // 流量统计: 5s base
+            DataPriority.HIGH -> 6_000L    // CPU/内存: 6s base (was 3s) — 加倍放慢
+            DataPriority.MEDIUM -> 10_000L   // 网速/信号: 10s base (was 5s) — 加倍放慢
+            DataPriority.LOW -> 20_000L      // 流量统计: 20s base (was 10s) — 加倍放慢
         }
 
         val poolSize = dynamicThreadPool.getThreadPoolInfo().maxPoolSize
+        // 取最大因子，而非乘法乘积，防止极端情况下延迟暴增到 75 秒
         val poolFactor = when {
-            poolSize <= 1 -> 2.0           // 高负载时降低频率
-            poolSize <= 2 -> 1.5           // 中负载时适度降低
-            poolSize >= 4 -> 0.75          // 低负载时提高频率
-            else -> 1.0                    // 正常频率
+            poolSize <= 1 -> 2.0
+            poolSize <= 2 -> 1.5
+            poolSize >= 4 -> 0.75
+            else -> 1.0
         }
 
-        // Shell 负载因子：shell 满载时延迟翻 3 倍
         val rootTotal = ShellQoS.rootTotalPermits
         val rootAvail = ShellQoS.rootAvailablePermits
         val shellLoad = if (rootTotal > 0) 1.0 - (rootAvail.toDouble() / rootTotal) else 0.0
         val shellFactor = 1.0 + shellLoad * 2.0
 
-        return (baseDelay * poolFactor * shellFactor).toLong()
+        val goformTotal = GoformQoS.queryTotalPermits
+        val goformAvail = GoformQoS.queryAvailablePermits
+        val goformLoad = if (goformTotal > 0) 1.0 - (goformAvail.toDouble() / goformTotal) else 0.0
+        val goformFactor = 1.0 + goformLoad * 1.5
+
+        // 取三个因子的最大值（而非乘积），保证最大延迟不超过 baseDelay * 2.0
+        val combinedFactor = maxOf(poolFactor, shellFactor, goformFactor).coerceIn(0.5, 2.0)
+
+        return (baseDelay * combinedFactor).toLong()
     }
+
+    // 上一次 TrafficStats 累计值，用于计算实时速率差值
+    @Volatile private var prevRxBytes: Long = 0L
+    @Volatile private var prevTxBytes: Long = 0L
+    @Volatile private var prevTrafficTime: Long = 0L
 
     private suspend fun collectTraffic() {
         try {
             val trafficInfo = systemCollector.getTrafficStats()
+            val rxBytes = trafficInfo["rx_bytes"] as? Long ?: 0L
+            val txBytes = trafficInfo["tx_bytes"] as? Long ?: 0L
+            val now = System.currentTimeMillis()
+
+            // ── 实时速率：优先 goform thrpt（Modem 固件），回退到 TrafficStats 差值 ──
+            var rxSpeed = goformRxThrpt
+            var txSpeed = goformTxThrpt
+
+            if (rxSpeed <= 0 && txSpeed <= 0) {
+                // goform 数据不可用时，用 TrafficStats 差值计算瞬时速率
+                val elapsed = (now - prevTrafficTime).coerceAtLeast(100L) / 1000.0  // 秒
+                if (prevTrafficTime > 0 && elapsed > 0) {
+                    rxSpeed = ((rxBytes - prevRxBytes).coerceAtLeast(0L) / elapsed).toLong()
+                    txSpeed = ((txBytes - prevTxBytes).coerceAtLeast(0L) / elapsed).toLong()
+                }
+            }
+
+            prevRxBytes = rxBytes; prevTxBytes = txBytes; prevTrafficTime = now
+
             val record = TrafficRecord(
-                rxBytes = trafficInfo["rx_bytes"] as? Long ?: 0,
-                txBytes = trafficInfo["tx_bytes"] as? Long ?: 0,
-                rxSpeed = trafficInfo["rx_speed"] as? Long ?: 0,
-                txSpeed = trafficInfo["tx_speed"] as? Long ?: 0
+                rxBytes = rxBytes,
+                txBytes = txBytes,
+                rxSpeed = rxSpeed,
+                txSpeed = txSpeed
             )
             trafficBuffer.offerBounded(record)
             _latestTraffic.value = record
 
-            // WebSocket 推送（含 display 字段，与 REST /api/traffic/realtime 对齐）
+            // WebSocket 推送（含 goform thrpt 实时数据和 display 字段）
             webSocketManager.broadcast("traffic", mapOf(
                 "rx_speed" to record.rxSpeed,
                 "tx_speed" to record.txSpeed,
                 "rx_bytes" to record.rxBytes,
                 "tx_bytes" to record.txBytes,
+                "realtime_rx_thrpt" to goformRxThrpt,
+                "realtime_tx_thrpt" to goformTxThrpt,
                 "rx_speed_display" to formatSpeed(record.rxSpeed),
                 "tx_speed_display" to formatSpeed(record.txSpeed),
                 "timestamp" to System.currentTimeMillis()
@@ -345,10 +410,29 @@ class DataScheduler(
 
     private suspend fun collectSignal() {
         try {
-            val signalInfo = collectSignalUnified()
-            val record = buildSignalRecord(signalInfo)
+            // ── 单次合并查询（信号 16 字段 + 实时吞吐量 2 字段）─
+            // 替代原 getSignalInfo() 2 次 + getTrafficThrpt() 1 次
+            val goformData = try {
+                kotlinx.coroutines.withTimeout(5_000L) {
+                    signalClient?.getSignalInfo()
+                }
+            } catch (_: Exception) {
+                null
+            }
 
-            // 仅在有有效信号值时才写入历史数据库
+            // ── 提取实时吞吐量（来自合并查询结果）─
+            if (goformData != null) {
+                val rx = goformData["realtime_rx_thrpt"]?.jsonPrimitive?.longOrNull ?: 0L
+                val tx = goformData["realtime_tx_thrpt"]?.jsonPrimitive?.longOrNull ?: 0L
+                goformRxThrpt = rx
+                goformTxThrpt = tx
+            }
+
+            // ── 信号采集（传入已预取的 goform 数据，避免重复查询）─
+            val signalInfo = signalCollector.collect(goformData)
+            val record = signalCollector.buildRecord(signalInfo)
+
+            // ── 以下保持与原有逻辑一致 ──
             if (record.rsrp != 0 || record.sinr != 0 || record.rssi != 0) {
                 signalBuffer.offerBounded(record)
             } else {
@@ -356,7 +440,6 @@ class DataScheduler(
             }
             _latestSignal.value = record
 
-            // WebSocket 推送（过滤空字符串值）
             val cleanSignalInfo = signalInfo.filterValues { value ->
                 when (value) {
                     is String -> value.isNotEmpty()
@@ -366,8 +449,7 @@ class DataScheduler(
             }
             webSocketManager.broadcast("signal", cleanSignalInfo)
 
-            // 告警检查: 信号质量
-            val rsrp = signalInfo.intValue("rsrp")
+            val rsrp = (signalInfo["rsrp"] as? Number)?.toInt() ?: 0
             if (rsrp != 0) {
                 alertEngine?.checkSignal(rsrp)
             }
@@ -375,184 +457,6 @@ class DataScheduler(
             AppLogger.e(tag, "Failed to collect signal", e)
         }
     }
-
-    /**
-     * 统一信号采集 — 四层优先级:
-     * 1. Goform 独立字段（Z5g_rsrp、Nr_snr、nr_rsrq 等）
-     * 2. Goform neighbor_cell_info + PCI 匹配（提取服务小区的 SINR/RSRQ）
-     * 3. AT+CESQ（标准字段补充，扩展字段在此设备不可靠仅做最后手段）
-     * 4. TelephonyCollector 兜底
-     */
-    private suspend fun collectSignalUnified(): Map<String, Any> {
-        val result = mutableMapOf<String, Any>()
-        val goformSignal = goformClient?.getSignalInfo()
-        // Goform 辅助函数
-        fun goformStr(key: String): String? =
-            goformSignal?.get(key)?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotEmpty() }
-        fun goformInt(key: String): Int? = goformStr(key)?.toIntOrNull()
-
-        // ── 第 1 层: Goform 独立字段 ──
-        // RSRP: 5G > 4G
-        goformInt("Z5g_rsrp")?.let { result["rsrp"] = it }
-        if (!result.containsKey("rsrp")) goformInt("lte_rsrp")?.let { result["rsrp"] = it }
-        // SINR: Nr_snr(5G) > Lte_snr(4G)
-        goformInt("Nr_snr")?.let { result["sinr"] = it }
-        if (!result.containsKey("sinr")) goformInt("Lte_snr")?.let { result["sinr"] = it }
-        // RSRQ: nr_rsrq(5G) > lte_rsrq(4G)
-        goformInt("nr_rsrq")?.let { result["rsrq"] = it }
-        if (!result.containsKey("rsrq")) goformInt("lte_rsrq")?.let { result["rsrq"] = it }
-        // RSSI: nr_rssi(5G) > lte_rssi(4G)（注意: goform 'rssi' 字段是信号条数 0-5）
-        goformInt("nr_rssi")?.let { result["rssi"] = it }
-        if (!result.containsKey("rssi")) goformInt("lte_rssi")?.let { result["rssi"] = it }
-        // 元数据
-        goformStr("network_type")?.let { result["rat"] = GoformClient.mapNetworkType(it) }
-        goformStr("cell_id")?.let { result["cell_id"] = it }
-        val provider = goformStr("network_provider")
-        result["operator"] = if (!provider.isNullOrBlank()) provider else telephonyCollector.getOperatorName()
-
-        // ── 第 2 层: neighbor_cell_info + PCI 匹配 ──
-        if (goformSignal != null && (!result.containsKey("sinr") || !result.containsKey("rsrq"))) {
-            extractFromNeighborCells(goformSignal, result)
-        }
-
-        // ── 第 3 层: AT+CESQ 补充（标准字段可靠，扩展字段此设备不可靠） ──
-        supplementFromAT(result)
-
-        // ── 第 4 层: TelephonyCollector 兜底 ──
-        supplementFromTelephony(result)
-        return result
-    }
-
-    /**
-     * 第 2 层: 从 Goform neighbor_cell_info 提取服务小区信号。
-     * neighbor_cell_info 返回 [{band, earfcn, pci, rsrp, rsrq, sinr}, ...]，
-     * 用 Nr_pci/Lte_pci 匹配服务小区 PCI 提取 SINR/RSRQ。
-     */
-    private fun extractFromNeighborCells(goformSignal: JsonObject, result: MutableMap<String, Any>) {
-        val neighborArray = try {
-            goformSignal["neighbor_cell_info"]?.jsonArray
-        } catch (_: Exception) { null } ?: return
-
-        // 获取服务小区 PCI
-        fun pciValue(key: String): Int? =
-            goformSignal[key]?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotEmpty() }?.toIntOrNull()
-        val nrPci = pciValue("Nr_pci")
-        val ltePci = pciValue("Lte_pci")
-
-        // 解析邻区列表
-        val cells = neighborArray.mapNotNull { cell ->
-            try {
-                val obj = cell.jsonObject
-                val pci = obj["pci"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                val rsrp = obj["rsrp"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                val rsrq = obj["rsrq"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                val sinr = obj["sinr"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
-                if (pci != null) NeighborCell(pci, rsrp, rsrq, sinr) else null
-            } catch (_: Exception) { null }
-        }
-
-        // PCI 匹配策略: Nr_pci → Lte_pci → 最强信号小区
-        val serving = cells.firstOrNull { it.pci == nrPci }
-            ?: cells.firstOrNull { it.pci == ltePci }
-            ?: cells.maxByOrNull { it.rsrp ?: -999 }
-
-        serving?.let { cell ->
-            if (!result.containsKey("sinr") && cell.sinr != null) result["sinr"] = cell.sinr
-            if (!result.containsKey("rsrq") && cell.rsrq != null) result["rsrq"] = cell.rsrq
-            if (!result.containsKey("rsrp") && cell.rsrp != null) result["rsrp"] = cell.rsrp
-            // neighbor_cell_info 无 RSSI 字段，从 RSRP 估算
-            if (!result.containsKey("rssi") && cell.rsrp != null && cell.rsrp in -140..-30) {
-                result["rssi"] = cell.rsrp + 20
-            }
-        }
-    }
-
-    private data class NeighborCell(
-        val pci: Int, val rsrp: Int?, val rsrq: Int?, val sinr: Int?
-    )
-
-    /**
-     * 第 3 层: AT+CESQ 补充缺失信号字段。
-     * 标准 LTE 字段（SS 公式）可靠；扩展字段 7-9 在此 ZTE 设备编码不匹配标准公式，
-     * 仅在标准字段全部缺失时才使用。
-     */
-    private suspend fun supplementFromAT(result: MutableMap<String, Any>) {
-        val needed = listOf("rsrp", "rsrq", "sinr", "rssi").any { !result.containsKey(it) }
-        if (!needed) return
-
-        val atSignal = try { atChannel.getSignalQuality() } catch (_: Exception) { return }
-
-        for (key in listOf("rsrp", "rsrq", "sinr")) {
-            if (result.containsKey(key)) continue
-            (atSignal[key] as? Number)?.let { result[key] = it.toInt() }
-        }
-        if (!result.containsKey("rssi")) {
-            (atSignal["rssi"] as? Number)?.toInt()?.let { rssi ->
-                if (rssi in -120..-30) {
-                    val rsrp = (result["rsrp"] as? Int)
-                    if (rsrp == null || rssi >= rsrp) result["rssi"] = rssi
-                }
-            }
-        }
-    }
-
-    /**
-     * 第 4 层兜底: 用 TelephonyCollector 补充 Goform、neighbor_cell_info 和 AT 均缺失的字段。
-     * RSSI 最终回退: 从 RSRP 估算 (RSSI ≈ RSRP + 20, 假设 20MHz/100RB)。
-     */
-    private suspend fun supplementFromTelephony(result: MutableMap<String, Any>) {
-        val telephonySignal by lazy { telephonyCollector.getSignalInfo() }
-
-        // RSSI: Goform 的 lte_rssi/nr_rssi 缺失时，尝试 Telephony，再从 RSRP 估算
-        if (!result.containsKey("rssi")) {
-            val telephonyRssi = telephonySignal["rssi"]
-            val existingRsrp = result["rsrp"]?.let {
-                when (it) {
-                    is Number -> it.toInt()
-                    is String -> it.toIntOrNull()
-                    else -> null
-                }
-            }
-            // 物理约束: RSSI(宽带功率) 必须 >= RSRP(单子载波功率)
-            // Telephony 返回 -113(asu=0) 但 RSRP=-65 时不可能，拒绝并走估算路径
-            if (telephonyRssi != null && telephonyRssi is Number && telephonyRssi.toInt() in -120..-30) {
-                val rssiVal = telephonyRssi.toInt()
-                if (existingRsrp == null || rssiVal >= existingRsrp) {
-                    result["rssi"] = telephonyRssi
-                }
-            }
-            // 最终回退: 从 RSRP 估算 RSSI (≈ RSRP + 20, 假设 20MHz/100RB)
-            if (!result.containsKey("rssi") && existingRsrp != null && existingRsrp in -140..-30) {
-                result["rssi"] = existingRsrp + 20
-            }
-        }
-        if (!result.containsKey("rsrp")) {
-            telephonySignal["rsrp"]?.let { result["rsrp"] = it }
-        }
-        if (!result.containsKey("sinr")) {
-            telephonySignal["sinr"]?.let { result["sinr"] = it }
-        }
-        if (!result.containsKey("rsrq")) {
-            telephonySignal["rsrq"]?.let { result["rsrq"] = it }
-        }
-        if (!result.containsKey("rat")) {
-            result["rat"] = telephonyCollector.getNetworkType()
-        }
-        // 运营商: PLMN 纯数字码或 Unknown → 可读运营商名
-        val operator = result["operator"]?.toString()
-        if (operator.isNullOrBlank() || operator == "Unknown" || operator.all { it.isDigit() }) {
-            result["operator"] = telephonyCollector.getOperatorName()
-        }
-    }
-
-    private fun buildSignalRecord(signalInfo: Map<String, Any>): SignalRecord = SignalRecord(
-        rsrp = signalInfo.intValue("rsrp"),
-        sinr = signalInfo.intValue("sinr"),
-        rsrq = signalInfo.intValue("rsrq"),
-        rssi = signalInfo.intValue("rssi"),
-        rat = signalInfo.stringValue("rat", ""),
-        operator = signalInfo.stringValue("operator", "")
-    )
 
     private suspend fun collectCpu() {
         try {
@@ -636,8 +540,9 @@ class DataScheduler(
 
     private suspend fun collectGoformTraffic() {
         try {
-            val stats = goformClient?.getTrafficStats()
+            val stats = signalClient?.getTrafficStats()
             if (stats != null && stats.isNotEmpty()) {
+                // 月累计流量
                 val rx = stats["monthly_rx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 val tx = stats["monthly_tx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 if (rx > 0 || tx > 0) {
@@ -646,10 +551,112 @@ class DataScheduler(
                         "monthly_rx_bytes" to rx, "monthly_tx_bytes" to tx
                     ))
                 }
+                // 实时吞吐量（Modem 固件直接上报，bytes/s）
+                val rxThrpt = stats["realtime_rx_thrpt"]?.jsonPrimitive?.longOrNull ?: 0L
+                val txThrpt = stats["realtime_tx_thrpt"]?.jsonPrimitive?.longOrNull ?: 0L
+                goformRxThrpt = rxThrpt
+                goformTxThrpt = txThrpt
             }
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect goform traffic", e)
         }
+    }
+
+    // ── SMS 缓存：后台 goform 轮询 + 按联系人聚合 ──
+
+    // 缓存的联系人列表（按号码聚合，含未读数/总数/最新消息）
+    @Volatile private var cachedSmsContacts: List<Map<String, Any>> = emptyList()
+    // 防漏检测：记录上次快速轮询的最高ID，用于判断两次轮询间是否遗漏消息
+    @Volatile private var lastPollMaxSmsId: Long = 0L
+
+    private suspend fun collectSmsCache() {
+        try {
+            val sms = smsClient ?: return
+            // 轮询最新 5 条消息（覆盖验证码等场景），30s 间隔足够
+            val smsData = sms.getSmsList(page = 0, perPage = FAST_PER_PAGE)
+            if (smsData == null) return
+            val arr = smsData["messages"]?.jsonArray ?: return
+
+            val messages = arr.mapNotNull { el ->
+                try {
+                    val obj = el.jsonObject
+                    val id = obj["id"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
+                    val number = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val content = decodeSmsB64(
+                        obj["content"]?.jsonPrimitive?.contentOrNull ?: "",
+                        obj["encode_type"]?.jsonPrimitive?.contentOrNull ?: "0"
+                    )
+                    val dateStr = obj["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                    val tag = obj["tag"]?.jsonPrimitive?.contentOrNull ?: "0"
+                    val direction = when (tag) { "2", "3" -> "sent"; else -> "received" }
+                    val read = tag != "1"
+                    val date = parseSmsDate(dateStr)
+                    mapOf<String, Any>(
+                        "id" to id, "number" to number, "content" to content,
+                        "date" to date, "read" to read, "direction" to direction
+                    )
+                } catch (_: Exception) { null }
+            }
+
+            if (messages.isEmpty()) return
+
+            // 更新最高ID
+            val newMax = messages.maxOfOrNull { (it["id"] as? Long) ?: 0L } ?: 0L
+            if (newMax > lastPollMaxSmsId) lastPollMaxSmsId = newMax
+
+            // 按号码聚合 → 联系人列表
+            val contacts = messages.groupBy { it["number"] as? String ?: "" }
+                .mapValues { (_, msgs) ->
+                    val latest = msgs.maxByOrNull { (it["date"] as? Long) ?: 0L }
+                    mapOf<String, Any>(
+                        "phoneNumber" to (latest?.get("number") ?: "unknown"),
+                        "total" to msgs.size,
+                        "unread" to msgs.count { (it["read"] as? Boolean) != true && (it["direction"] as? String) == "received" },
+                        "latestMsg" to (latest?.get("content") as? String ?: ""),
+                        "latestTimestamp" to ((latest?.get("date") as? Long) ?: 0L),
+                        "latestDirection" to (latest?.get("direction") as? String ?: "received")
+                    )
+                }
+                .values
+                .sortedByDescending { it["latestTimestamp"] as Long }
+
+            cachedSmsContacts = contacts
+
+            webSocketManager.broadcast("sms_contacts", mapOf(
+                "contacts" to contacts,
+                "count" to contacts.size,
+                "timestamp" to System.currentTimeMillis()
+            ))
+
+            AppLogger.d(tag, "SMS cache: ${contacts.size} contacts, ${messages.size} messages")
+        } catch (e: Exception) {
+            AppLogger.e(tag, "Failed to collect SMS cache", e)
+        }
+    }
+
+    internal fun getCachedSmsContacts(): List<Map<String, Any>> = cachedSmsContacts
+
+    private fun decodeSmsB64(contentB64: String, encodeType: String): String {
+        return try {
+            val decoded = android.util.Base64.decode(contentB64, android.util.Base64.DEFAULT)
+            when (encodeType) { "2" -> String(decoded, Charsets.UTF_16BE); else -> String(decoded, Charsets.UTF_8) }
+        } catch (_: Exception) { contentB64 }
+    }
+
+    @Suppress("SameParameterValue")
+    private fun parseSmsDate(dateStr: String): Long {
+        val parts = dateStr.split(",")
+        if (parts.size < 6) return 0L
+        val year = 2000 + (parts[0].toIntOrNull() ?: return 0L)
+        val month = parts[1].toIntOrNull() ?: return 0L
+        val day = parts[2].toIntOrNull() ?: return 0L
+        val hour = parts[3].toIntOrNull() ?: return 0L
+        val minute = parts[4].toIntOrNull() ?: return 0L
+        val second = parts[5].toIntOrNull() ?: return 0L
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("GMT+8"))
+        cal.set(year, month - 1, day, hour, minute, second)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
     }
 
     /**
@@ -716,20 +723,26 @@ class DataScheduler(
     }
 
     /**
-     * 有界入队：超过 MAX_BUFFER_SIZE 时丢弃最旧记录，防止 DB 写入卡住时内存无限增长
+     * 有界入队：超过 MAX_BUFFER_SIZE 时丢弃最旧记录。
+     * 用 AtomicInteger counter 代替 size() O(n) 遍历。
      */
+    private val bufferCounter = java.util.concurrent.atomic.AtomicInteger(0)
+
     private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T) {
-        while (size >= MAX_BUFFER_SIZE) poll()
+        if (bufferCounter.incrementAndGet() > MAX_BUFFER_SIZE) {
+            if (poll() != null) bufferCounter.decrementAndGet() else bufferCounter.set(size.coerceAtMost(MAX_BUFFER_SIZE))
+        }
         offer(item)
     }
 
     /**
      * 读取 CPU 最高温度（毫摄氏度）
      * 从 /sys/class/thermal/ 下所有 thermal_zone 的 temp 文件读取，返回最大值
+     * 使用缓存 Shell 调用减少 sysfs 压力
      */
     private suspend fun readMaxCpuTemp(): Int {
         return try {
-            val result = ShellExecutor.execute("cat /sys/class/thermal/thermal_zone*/temp")
+            val result = ShellExecutor.executeAsRoot("cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null")
             result.stdout.lines()
                 .mapNotNull { it.trim().toIntOrNull() }
                 .maxOrNull() ?: 0
@@ -737,9 +750,10 @@ class DataScheduler(
     }
 
     private companion object {
-        const val PERFORMANCE_CHECK_INTERVAL_MS = 30_000L
+        const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L   // 性能监控: 60s（原30s，加倍放慢）
         const val BATTERY_COLLECTION_INTERVAL_MS = 30_000L
-        const val BATCH_FLUSH_INTERVAL_MS = 10_000L        // 缓冲区刷写间隔（10秒）
+        const val BATCH_FLUSH_INTERVAL_MS = 20_000L        // 缓冲区刷写间隔（20秒，原10秒，加倍放慢）
+        const val FAST_PER_PAGE = 5                          // SMS快速轮询：每次5条
         const val MAX_BUFFER_SIZE = 100                     // 单缓冲区最大记录数（防 DB 写入卡住时内存溢出）
         const val HISTORY_RETENTION_DAYS = 7L               // 监控数据保留天数
         const val HISTORY_QUERY_LIMIT = 50_000               // 单次查询最大记录数
@@ -755,21 +769,4 @@ class DataScheduler(
     }
 }
 
-@Suppress("UNCHECKED_CAST")
-private fun Map<String, Any>.intValue(key: String): Int {
-    val v = this[key] ?: return 0
-    return when (v) {
-        is Number -> v.toInt()
-        is JsonPrimitive -> v.content.toIntOrNull() ?: 0
-        is String -> v.toIntOrNull() ?: 0
-        else -> 0
-    }
-}
 
-private fun Map<String, Any>.stringValue(key: String, default: String = ""): String {
-    val v = this[key] ?: return default
-    return when (v) {
-        is JsonPrimitive -> v.content
-        else -> v.toString()
-    }
-}

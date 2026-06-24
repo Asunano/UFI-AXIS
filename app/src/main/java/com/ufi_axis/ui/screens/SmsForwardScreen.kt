@@ -24,7 +24,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 @Composable
 fun SmsForwardScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.smsForwardState.collectAsState()
-    LaunchedEffect(Unit) { viewModel.loadSmsForwardConfig() }
+    LaunchedEffect(Unit) { viewModel.tools.loadSmsForwardConfig() }
 
     val cfg = state.config
     var enabled by remember(cfg) { mutableStateOf(cfg?.enabled ?: false) }
@@ -48,12 +48,12 @@ fun SmsForwardScreen(viewModel: MainViewModel, navController: NavHostController)
     val saveSucceeded = saveAttempted && !state.isLoading && state.errorMessage == null
 
     UfiScreenScaffold(title = "短信转发", navController = navController, showBack = true) { padding ->
-        UfiScrollableColumn(modifier = Modifier.padding(padding)) {
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
             state.errorMessage?.let { err -> UfiErrorBanner(message = err) }
 
             // 总开关
             UfiSettingsGroup {
-                SettingsToggle(
+                UfiSettingsToggle(
                     title = "启用短信转发",
                     description = if (enabled) "已开启自动转发新短信" else "已关闭",
                     checked = enabled,
@@ -108,7 +108,7 @@ fun SmsForwardScreen(viewModel: MainViewModel, navController: NavHostController)
 
                 // 设备信息开关
                 UfiSettingsGroup {
-                    SettingsToggle(
+                    UfiSettingsToggle(
                         title = "附加设备信息",
                         description = "转发内容中附加电池、CPU、内存等状态",
                         checked = forwardDevInfo,
@@ -172,7 +172,7 @@ fun SmsForwardScreen(viewModel: MainViewModel, navController: NavHostController)
                     onClick = {
                     val actualMethod = if (enabled) (if (method == "disabled") "smtp" else method) else "disabled"
                     saveAttempted = true
-                    viewModel.saveSmsForwardConfig(SmsForwardConfig(
+                    viewModel.tools.saveSmsForwardConfig(SmsForwardConfig(
                         enabled = enabled,
                         method = actualMethod,
                         smtp_host = smtpHost, smtp_port = smtpPort.toIntOrNull() ?: 465,
@@ -186,7 +186,7 @@ fun SmsForwardScreen(viewModel: MainViewModel, navController: NavHostController)
                 })
                 if (enabled && method != "disabled") {
                     UfiSecondaryButton(text = "测试发送", modifier = Modifier.weight(1f), onClick = {
-                        viewModel.testSmsForward()
+                        viewModel.tools.testSmsForward()
                     })
                 }
             }

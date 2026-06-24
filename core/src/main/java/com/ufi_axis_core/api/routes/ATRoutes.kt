@@ -18,6 +18,25 @@ import kotlinx.serialization.json.*
 class ATRoutes(
     private val atChannel: ATChannel
 ) {
+    companion object {
+        /**
+         * 危险 AT 命令黑名单 — 阻止可能导致 modem 崩溃/设备重启的指令
+         *
+         * 这些命令会触发基带/网络栈/整机重启，在 kernel 存在 sprd-sblock
+         * 驱动 BUG 的设备上会导致 kobject_add_internal -EEXIST 内核 panic。
+         */
+        private val DANGEROUS_AT_PATTERNS = listOf(
+            Regex("AT\\+CFUN\\s*=", RegexOption.IGNORE_CASE),     // 基带功能控制(含重启)
+            Regex("AT\\+SFUN\\s*=", RegexOption.IGNORE_CASE),     // 网络栈控制(含重启)
+            Regex("AT\\+RESET", RegexOption.IGNORE_CASE),         // 设备复位
+            Regex("AT\\+POF", RegexOption.IGNORE_CASE),           // 关机
+            Regex("AT\\*", RegexOption.IGNORE_CASE)               // 厂商私有指令(通配)
+        )
+
+        fun isDangerousCommand(command: String): Boolean =
+            DANGEROUS_AT_PATTERNS.any { it.containsMatchIn(command) }
+    }
+
     fun register(route: Route) {
         route.route("/at") {
             // 发送 AT 指令
@@ -28,6 +47,16 @@ class ATRoutes(
                 if (command.isEmpty()) {
                     call.respond(HttpStatusCode.BadRequest,
                         toJsonElement(mapOf("error" to "command is required")))
+                    return@post
+                }
+
+                // ── 安全过滤：拦截危险 AT 命令 ──
+                if (isDangerousCommand(command)) {
+                    call.respond(HttpStatusCode.Forbidden,
+                        toJsonElement(mapOf(
+                            "error" to "Dangerous AT command blocked: $command",
+                            "reason" to "This command may cause modem crash or device reboot"
+                        )))
                     return@post
                 }
 

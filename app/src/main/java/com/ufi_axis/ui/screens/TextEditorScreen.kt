@@ -15,6 +15,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.UfiAlertDialog
+import com.ufi_axis.ui.components.common.UfiLoadingIndicator
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
 
@@ -33,7 +34,7 @@ fun TextEditorScreen(
 
     // Load file content on first composition
     LaunchedEffect(filePath) {
-        viewModel.readFile(filePath)
+        viewModel.files.readFile(filePath)
     }
 
     // Watch for file content changes
@@ -59,7 +60,7 @@ fun TextEditorScreen(
                     if (isLoaded) {
                         IconButton(
                             onClick = {
-                                viewModel.writeFile(filePath, editText)
+                                viewModel.files.writeFile(filePath, editText)
                                 hasChanges = false
                                 showSaveSuccess = true
                             },
@@ -85,7 +86,7 @@ fun TextEditorScreen(
         ) {
             if (!isLoaded) {
                 Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) {
-                    CircularProgressIndicator()
+                    UfiLoadingIndicator()
                 }
             } else {
                 OutlinedTextField(
@@ -123,7 +124,7 @@ fun TextEditorScreen(
         UfiAlertDialog(
             title = "错误",
             text = msg,
-            onDismiss = { viewModel.clearFileOperationMessage() }
+            onDismiss = { viewModel.files.clearFileOperationMessage() }
         )
     }
 }

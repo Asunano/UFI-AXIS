@@ -48,6 +48,9 @@ object ShellExecutor {
                 } else {
                     ShellResult(process.exitValue(), output.trim(), "")
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                process?.destroyForcibly()
+                throw e
             } catch (e: Exception) {
                 process?.destroyForcibly()
                 ShellResult(-1, "", e.message ?: "Unknown error")
@@ -79,6 +82,9 @@ object ShellExecutor {
                 } else {
                     ShellResult(process.exitValue(), output.trim(), "")
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                process?.destroyForcibly()
+                throw e
             } catch (e: Exception) {
                 process?.destroyForcibly()
                 ShellResult(-1, "", e.message ?: "Unknown error")
@@ -87,22 +93,37 @@ object ShellExecutor {
     }
 
     /**
-     * 限制读取进程输出大小，防止 OOM
+     * 限制读取进程输出大小，防止 OOM。
+     * 使用 .use {} 确保 BufferedReader / InputStream 在完成后关闭，
+     * 避免每次 shell 执行泄漏文件描述符导致 "Too many open files"。
      */
     private fun readLimitedOutput(process: Process, maxSize: Int): String {
-        val reader = BufferedReader(InputStreamReader(process.inputStream))
         val sb = StringBuilder()
         val buffer = CharArray(8192)
-        var totalRead = 0
-        var n: Int
-        while (reader.read(buffer).also { n = it } != -1) {
-            val remaining = maxSize - totalRead
-            if (remaining <= 0) break
-            val toRead = minOf(n, remaining)
-            sb.append(buffer, 0, toRead)
-            totalRead += toRead
+        process.inputStream.bufferedReader().use { reader ->
+            var totalRead = 0
+            var n: Int
+            while (reader.read(buffer).also { n = it } != -1) {
+                val remaining = maxSize - totalRead
+                if (remaining <= 0) break
+                val toRead = minOf(n, remaining)
+                sb.append(buffer, 0, toRead)
+                totalRead += toRead
+            }
         }
         return sb.toString()
+    }
+
+    /**
+     * 批量执行多条 root 命令（逐条执行，无并发限流）。
+     * 提供给前端路由绕过 ShellQoS 直接调用，避免用户操作被设备通信限流影响。
+     */
+    suspend fun batchExecuteAsRoot(
+        commands: List<String>,
+        timeoutMs: Long = 30_000L
+    ): BatchResult {
+        val results = commands.map { executeAsRoot(it, timeoutMs) }
+        return BatchResult(results, results.map { it.isSuccess })
     }
 
     /**

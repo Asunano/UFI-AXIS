@@ -3,6 +3,7 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -16,6 +17,7 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.viewmodel.MainViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -24,12 +26,12 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     val state by viewModel.appManageState.collectAsState()
     var showInstallDialog by remember { mutableStateOf(false) }
 
-    LaunchedEffect(state.filter) { viewModel.loadAppList(state.filter) }
+    LaunchedEffect(state.filter) { viewModel.apps.loadAppList(state.filter) }
 
     UfiScreenScaffold(title = "应用管理", navController = navController, showBack = true,
         actions = {
             if (state.hasRoot) Icon(Icons.Default.VerifiedUser, null, Modifier.padding(end = 8.dp), tint = MaterialTheme.colorScheme.primary)
-            IconButton(onClick = { viewModel.loadAppList(state.filter) }) { Icon(Icons.Default.Refresh, null) }
+            IconButton(onClick = { viewModel.apps.loadAppList(state.filter) }) { Icon(Icons.Default.Refresh, null) }
             IconButton(onClick = { showInstallDialog = true }) { Icon(Icons.Default.Add, null) }
         }
     ) { padding ->
@@ -37,7 +39,7 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
             UfiSingleChipSelector(
                 options = listOf("user" to "用户", "system" to "系统", "all" to "全部"),
                 selectedValue = state.filter,
-                onSelect = { viewModel.loadAppList(it) },
+                onSelect = { viewModel.apps.loadAppList(it) },
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
             )
 
@@ -45,21 +47,21 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
                 InstallAppBottomSheet(
                     isLoading = state.installLoading,
                     onDismiss = { showInstallDialog = false },
-                    onInstallUrl = { viewModel.installAppFromUrl(it); showInstallDialog = false },
-                    onInstallPath = { viewModel.installAppFromPath(it); showInstallDialog = false }
+                    onInstallUrl = { viewModel.apps.installAppFromUrl(it); showInstallDialog = false },
+                    onInstallPath = { viewModel.apps.installAppFromPath(it); showInstallDialog = false }
                 )
             }
 
             state.selectedApp?.let { detail ->
                 AppDetailBottomSheet(detail,
-                    onDismiss = { viewModel.dismissAppDetail() },
-                    onAction = { viewModel.performAppAction(it, detail.packageName) })
+                    onDismiss = { viewModel.apps.dismissAppDetail() },
+                    onAction = { viewModel.apps.performAppAction(it, detail.packageName) })
             }
 
             state.errorMessage?.let { UfiErrorBanner(message = it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
 
             if (state.isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { UfiLoadingIndicator() }
             } else if (state.apps.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     UfiEmptyState(icon = Icons.Default.Android, message = "未找到应用")
@@ -67,7 +69,7 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
             } else {
                 LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     items(state.apps, key = { it.packageName }) { app ->
-                        AppListItem(app = app, onClick = { viewModel.loadAppDetail(app.packageName) })
+                        AppListItem(app = app, onClick = { viewModel.apps.loadAppDetail(app.packageName) })
                     }
                 }
             }
@@ -82,7 +84,7 @@ private fun InstallAppBottomSheet(isLoading: Boolean, onDismiss: () -> Unit, onI
     var path by remember { mutableStateOf("") }
     var useUrl by remember { mutableStateOf(true) }
 
-    ModalBottomSheet(onDismissRequest = onDismiss, shape = RoundedCornerShape(topStart = Spacing.CardCorner, topEnd = Spacing.CardCorner)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, shape = UfiCardDefaults.bottomSheetTopShape) {
         Column(Modifier.padding(Spacing.InnerPadding)) {
             Text("安装应用", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(12.dp))
@@ -120,40 +122,51 @@ private fun AppListItem(app: AppItem, onClick: () -> Unit) {
     val statusText = when {
         app.isFrozen -> "冻结"
         !app.isEnabled -> "禁用"
-        else -> "启用"
+        else -> "运行中"
     }
     Card(
         modifier = Modifier.fillMaxWidth(),
         onClick = onClick,
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.widgetShape,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        elevation = UfiCardDefaults.cardElevation()
     ) {
-        Row(Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            Icon(Icons.Default.Android, null, Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
-            Spacer(Modifier.width(8.dp))
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.1f),
+                modifier = Modifier.size(48.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Default.Android, null, Modifier.size(24.dp), tint = MaterialTheme.colorScheme.primary)
+                }
+            }
+            Spacer(Modifier.width(16.dp))
             Column(Modifier.weight(1f)) {
-                Text(app.packageName.split(".").lastOrNull() ?: app.packageName,
-                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(app.packageName.split(".").lastOrNull()?.replaceFirstChar { it.uppercase() } ?: app.packageName,
+                    style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(2.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (app.versionName.isNotBlank()) "v${app.versionName}" else "",
-                        style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Spacer(Modifier.width(8.dp))
-                    Surface(shape = RoundedCornerShape(4.dp), color = statusColor.copy(alpha = 0.12f)) {
-                        Text(" $statusText ", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                            style = MaterialTheme.typography.labelSmall, color = statusColor)
-                    }
+                Text(app.packageName, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Surface(shape = UfiCardDefaults.chipShape, color = statusColor.copy(alpha = 0.12f)) {
+                    Text(" $statusText ", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelSmall, color = statusColor, fontWeight = FontWeight.Bold)
+                }
+                if (app.versionName.isNotBlank()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("v${app.versionName}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
     }
 }
 
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AppDetailBottomSheet(detail: AppDetailResponse, onDismiss: () -> Unit, onAction: (String) -> Unit) {
-    ModalBottomSheet(onDismissRequest = onDismiss, shape = RoundedCornerShape(topStart = Spacing.CardCorner, topEnd = Spacing.CardCorner)) {
+    ModalBottomSheet(onDismissRequest = onDismiss, shape = UfiCardDefaults.bottomSheetTopShape) {
         Column(Modifier.padding(Spacing.InnerPadding)) {
             Text(detail.packageName.split(".").lastOrNull() ?: detail.packageName,
                 style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)

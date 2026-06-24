@@ -13,12 +13,15 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
+import android.content.ContentValues
+import android.os.Environment
+import android.provider.MediaStore
 import java.io.File
-import java.io.FileOutputStream
-import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 双引擎后台下载管理器
@@ -34,7 +37,10 @@ class DownloadManager(
         private const val BUFFER_SIZE = 8192
         private const val PROGRESS_INTERVAL_MS = 500L
         private const val ARIA2_POLL_INTERVAL_MS = 1500L
-        const val DEFAULT_SAVE_DIR = "/storage/emulated/0/Downloads/UFI"
+        // aria2c 子进程写入的私有工作目录（避免 scoped storage 限制）
+        const val DEFAULT_SAVE_DIR = "/storage/emulated/0/Android/data/com.ufi_axis_core/files/Downloads"
+        // 下载完成后自动转移到的公共目录（用户可见）
+        const val PUBLIC_DOWNLOAD_DIR = "/storage/emulated/0/Downloads/UFI"
     }
 
     @Serializable
@@ -51,7 +57,7 @@ class DownloadManager(
         var error: String? = null,
         val createdAt: Long = System.currentTimeMillis(),
         var completedAt: Long = 0L,
-        val engine: String = "java",
+        val engine: String = "aria2",
         val protocol: String = "http",
         var gid: String? = null,
         var connections: Int = 0,
@@ -66,11 +72,11 @@ class DownloadManager(
         var maxConnectionsPerServer: Int = 4,
         var globalSpeedLimit: Long = 0,
         var perTaskSpeedLimit: Long = 0,
-        var saveDir: String = DEFAULT_SAVE_DIR,
+        var saveDir: String = PUBLIC_DOWNLOAD_DIR,
         var splitCount: Int = 4,
         var minSplitSizeMb: Int = 1,
         var maxOverallUploadLimit: Long = 0,
-        var fileAllocation: String = "prealloc",
+        var fileAllocation: String = "none",
         // ── 高级 BT ──
         var btSeedRatio: Float = 1.0f,
         var btMaxPeers: Int = 50,
@@ -108,7 +114,6 @@ class DownloadManager(
     )
 
     private val tasks = ConcurrentHashMap<String, DownloadTask>()
-    private val jobs = ConcurrentHashMap<String, Job>()
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val persistFile: File
     private val configFile: File
@@ -121,7 +126,6 @@ class DownloadManager(
 
     private var aria2PollJob: Job? = null
     private var smartThrottleJob: Job? = null
-    private var javaSemaphore = kotlinx.coroutines.sync.Semaphore(3)
 
     /** 当前智能限速状态（供 UI 显示） */
     @Volatile var throttleState: String = "normal"
@@ -139,6 +143,10 @@ class DownloadManager(
     @Volatile var throttleWasStopped: Boolean = false
         private set
 
+    // 保底链 root 检测缓存（必须在 init 块之前初始化）
+    private val rootChecked = AtomicBoolean(false)
+    private val rootAvailable = AtomicBoolean(false)
+
     /** DataScheduler 引用，复用已采集的传感器缓存数据，避免重复 shell 调用 */
     private var dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null
     fun setDataScheduler(scheduler: com.ufi_axis_core.core.scheduler.DataScheduler) {
@@ -151,12 +159,17 @@ class DownloadManager(
         persistFile = File(dir, "tasks.json")
         configFile = File(dir, "config.json")
         loadConfig()
+        // 关键：调用 getExternalFilesDir 让 Android 系统创建 /Android/data/<pkg>/files/ 父目录链
+        // 否则 aria2c 子进程无法 mkdir DEFAULT_SAVE_DIR (Permission denied)
+        appContext.getExternalFilesDir(null)
+        File(DEFAULT_SAVE_DIR).mkdirs()
+        smartMkdir(config.saveDir)
+        // 启动时恢复孤儿文件：将私有目录中已完成但未转移的文件移至公共目录
+        recoverOrphanedDownloads()
         loadTasks()
         // 将之前下载中的任务标记为暂停
         tasks.values.filter { it.status == "downloading" }.forEach { it.status = "paused" }
         saveTasks()
-        File(config.saveDir).mkdirs()
-        javaSemaphore = kotlinx.coroutines.sync.Semaphore(config.maxConcurrent)
 
         // 懒加载: 探测 aria2 版本信息（不长期运行进程）
         aria2.probeVersion()
@@ -170,13 +183,23 @@ class DownloadManager(
             )
         }
 
-        // 如果有未完成的 aria2 任务，自动启动引擎恢复
+        // 如果有未完成的 aria2 任务，自动启动引擎（RPC 就绪后启动轮询）
         val hasPendingAria2 = tasks.values.any {
             it.engine == "aria2" && (it.status == "paused" || it.status == "pending")
         }
         if (hasPendingAria2) {
             aria2.start(config)
-            startAria2Polling()
+            scope.launch {
+                var waited = 0L
+                while (!aria2.isRunning() && waited < 15_000) {
+                    delay(500); waited += 500
+                }
+                if (aria2.isRunning()) {
+                    startAria2Polling()
+                } else {
+                    AppLogger.e(TAG, "aria2 init: engine failed to become ready after ${waited}ms")
+                }
+            }
         }
 
         // 启动智能性能监控
@@ -188,7 +211,6 @@ class DownloadManager(
     fun updateConfig(newConfig: DownloadConfig) {
         config = newConfig
         saveConfig()
-        javaSemaphore = kotlinx.coroutines.sync.Semaphore(config.maxConcurrent)
 
         // 重启 Tracker 定时任务
         trackerManager.stopAutoUpdate()
@@ -543,7 +565,75 @@ class DownloadManager(
         } catch (_: Exception) { 0 }
     }
 
+    // ─── 最原始下载测试（命令行直调，不用 conf/RPC）─────────
+
+    /**
+     * 用最原始的 aria2c CLI 模式测试下载。
+     * 先停止当前 RPC 引擎，直接调 `aria2c <url> --check-certificate=false ...`
+     * 捕获所有 stdout/stderr 到 AppLogger。
+     *
+     * @param url 下载链接
+     * @return RawTestResult
+     */
+    data class RawTestResult(
+        val success: Boolean,
+        val exitCode: Int,
+        val elapsedMs: Long,
+        val logSummary: String,
+        val downloadedFile: String?
+    )
+
+    fun rawTestDownload(url: String): RawTestResult {
+        AppLogger.i(TAG, "━━━ Raw Test Download START ━━━")
+        val result = aria2.rawDownload(url)
+        AppLogger.i(TAG, "━━━ Raw Test Download END: success=${result.success} exit=${result.exitCode} time=${result.elapsedMs}ms file=${result.downloadedFile} ━━━")
+        return RawTestResult(
+            success = result.success,
+            exitCode = result.exitCode,
+            elapsedMs = result.elapsedMs,
+            logSummary = "exit=${result.exitCode}, stdout=${result.stdout}, stderr=${result.stderr}",
+            downloadedFile = result.downloadedFile
+        )
+    }
+
     // ─── 任务 API ──────────────────────────────────────────
+
+    /**
+     * 按 URL 查找重复任务（排除 error 状态，允许重试）
+     * @return 存在且状态非 error 的旧任务
+     */
+    fun findDuplicateByUrl(url: String): DownloadTask? {
+        return tasks.values.firstOrNull {
+            it.url == url && it.status != "error" && it.status != "removed"
+        }
+    }
+
+    /**
+     * 查找同名任务（fileName 完全匹配且非 error 状态）
+     */
+    fun findTasksByName(fileName: String): List<DownloadTask> {
+        if (fileName.isBlank()) return emptyList()
+        return tasks.values.filter {
+            it.fileName == fileName && it.status != "error"
+        }
+    }
+
+    /**
+     * 生成不重复的文件名，追加 (1)/(2)… 后缀
+     */
+    fun generateUniqueFileName(baseName: String): String {
+        if (baseName.isBlank()) return baseName
+        val dotIndex = baseName.lastIndexOf('.')
+        val name = if (dotIndex > 0) baseName.substring(0, dotIndex) else baseName
+        val ext = if (dotIndex > 0) baseName.substring(dotIndex) else ""
+        var counter = 1
+        var newName = "${name}($counter)$ext"
+        while (tasks.values.any { it.fileName == newName }) {
+            counter++
+            newName = "${name}($counter)$ext"
+        }
+        return newName
+    }
 
     fun createTask(
         url: String,
@@ -555,13 +645,22 @@ class DownloadManager(
         val id = UUID.randomUUID().toString().take(8)
         val protocol = detectProtocol(url)
         val engine = "aria2"  // 统一走 aria2
-        val dir = savePath ?: config.saveDir
-        File(dir).mkdirs()
+        // savePath 始终指向公共目录（用户期望的最终位置）
+        val finalSavePath = savePath ?: config.saveDir
+        // 区分目录路径 vs 文件路径，避免把文件名当成目录创建
+        // 使用 smartMkdir 保底链（root → File.mkdirs）
+        if (isFilePath(finalSavePath)) {
+            File(finalSavePath).parentFile?.let { smartMkdir(it.absolutePath) }
+        } else {
+            smartMkdir(finalSavePath)
+        }
+        // 确保私有工作目录存在（aria2c 实际下载位置）
+        File(DEFAULT_SAVE_DIR).mkdirs()
 
         val task = DownloadTask(
             id = id, url = url,
             fileName = fileName ?: "",
-            savePath = dir,
+            savePath = finalSavePath,
             engine = engine, protocol = protocol
         )
         tasks[id] = task
@@ -577,152 +676,204 @@ class DownloadManager(
 
     fun pauseTask(id: String): Boolean {
         val task = tasks[id] ?: return false
-        return if (task.engine == "aria2") {
-            task.gid?.let { aria2.pause(it) } ?: false
-        } else {
-            jobs[id]?.cancel(); jobs.remove(id)
-            task.status = "paused"; saveTasks(); true
-        }
+        return task.gid?.let { aria2.pause(it) } ?: false
     }
 
     fun resumeTask(id: String): Boolean {
         val task = tasks[id] ?: return false
         if (task.status != "paused" && task.status != "error") return false
         task.error = null
-        return if (task.engine == "aria2") {
-            task.gid?.let { aria2.unpause(it) } ?: run {
-                startAria2IfNeeded(); submitAria2Download(task, null, null); true
-            }
-        } else {
-            task.status = "pending"; saveTasks(); startJavaDownload(id); true
+        return task.gid?.let { aria2.unpause(it) } ?: run {
+            startAria2IfNeeded(); submitAria2Download(task, null, null); true
         }
     }
 
     fun deleteTask(id: String, deleteFile: Boolean = false): Boolean {
         val task = tasks[id] ?: return false
-        if (task.engine == "aria2") {
-            task.gid?.let { aria2.remove(it); if (deleteFile) aria2.removeDownloadResult(it) }
-        } else {
-            jobs[id]?.cancel(); jobs.remove(id)
+        task.gid?.let { aria2.remove(it); if (deleteFile) aria2.removeDownloadResult(it) }
+
+        // 删除任务记录时，若要求同时删除下载文件
+        if (deleteFile) {
+            deleteDownloadedFiles(task)
         }
+
         tasks.remove(id)
-        if (deleteFile && task.engine == "java") File(task.savePath).delete()
         saveTasks()
         return true
     }
 
-    fun getActiveCount(): Int = tasks.values.count { it.status == "downloading" || it.status == "pending" }
+    /**
+     * 删除任务对应的实际下载文件。
+     * 按优先级依次尝试：
+     * ① task.savePath（任务记录的目标路径）
+     * ② DEFAULT_SAVE_DIR/fileName（aria2 私有工作目录）
+     * ③ config.saveDir/fileName（用户配置的保存目录）
+     * ④ PUBLIC_DOWNLOAD_DIR/fileName（默认公共目录）
+     * ⑤ shell find 在 /storage/emulated/0 下按文件名搜索（文件被移动后的保底）
+     */
+    /**
+     * 同步删除下载文件（使用 runBlocking 确保一次只运行一个 find 进程，
+     * 避免批量删除时并发 find 扫描全盘导致 CPU 100% 过热关机）
+     */
+    private fun deleteDownloadedFiles(task: DownloadTask) {
+        if (task.fileName.isBlank()) return
+
+        // Java File API 受进程 UID 限制，所有操作通过 shell 执行
+        runBlocking(Dispatchers.IO) {
+            val searchPaths = mutableSetOf(
+                task.savePath,
+                "${DEFAULT_SAVE_DIR}/${task.fileName}",
+                "${config.saveDir}/${task.fileName}",
+                "${PUBLIC_DOWNLOAD_DIR}/${task.fileName}"
+            )
+
+            var found = false
+
+            for (path in searchPaths) {
+                val existsResult = com.ufi_axis_core.util.ShellExecutor.execute(
+                    "test -e \"$path\" && echo yes"
+                )
+                val exists = existsResult.isSuccess && existsResult.stdout.trim() == "yes"
+                if (exists) {
+                    val isDirResult = com.ufi_axis_core.util.ShellExecutor.execute(
+                        "test -d \"$path\" && echo yes"
+                    )
+                    val isDir = isDirResult.isSuccess && isDirResult.stdout.trim() == "yes"
+                    val rmCmd = if (isDir) "rm -rf \"$path\"" else "rm -f \"$path\""
+                    val deleteResult = com.ufi_axis_core.util.ShellExecutor.executeAsRoot(rmCmd)
+                    if (deleteResult.isSuccess) {
+                        AppLogger.i(TAG, "Deleted file (shell): $path")
+                        found = true
+                    } else {
+                        AppLogger.w(TAG, "Failed to delete file (shell): $path")
+                    }
+                }
+            }
+
+            // 清理 aria2 控制文件 (.aria2)
+            val controlPath = "${DEFAULT_SAVE_DIR}/${task.fileName}.aria2"
+            com.ufi_axis_core.util.ShellExecutor.executeAsRoot("rm -f \"$controlPath\"")
+
+            // shell find 兜底：文件被移动到未知路径时，按文件名在用户存储中搜索
+            if (!found && !task.fileName.contains("..") && task.totalSize > 0) {
+                try {
+                    val findResult = com.ufi_axis_core.util.ShellExecutor.execute(
+                        "find /storage/emulated/0 -maxdepth 5 -name \"${task.fileName}\" -type f 2>/dev/null | head -5"
+                    )
+                    if (findResult.isSuccess && findResult.stdout.isNotBlank()) {
+                        val foundPaths = findResult.stdout.lines().filter { it.isNotBlank() }
+                        for (fp in foundPaths) {
+                            val sizeResult = com.ufi_axis_core.util.ShellExecutor.execute(
+                                "stat -L -c %s \"$fp\" 2>/dev/null"
+                            )
+                            val fileSize = sizeResult.stdout.trim().toLongOrNull() ?: -1L
+                            if (fileSize != task.totalSize) {
+                                AppLogger.w(TAG, "Moved file size mismatch, skipping: $fp (expected ${task.totalSize}, got $fileSize)")
+                                continue
+                            }
+                            val deleteResult = com.ufi_axis_core.util.ShellExecutor.executeAsRoot(
+                                "rm -rf \"$fp\""
+                            )
+                            if (deleteResult.isSuccess) {
+                                AppLogger.i(TAG, "Deleted moved file (shell find, size verified): $fp")
+                            }
+                        }
+                    }
+                } catch (_: Exception) {}
+            }
+
+            if (!found) {
+                if (task.totalSize > 0) {
+                    AppLogger.w(TAG, "deleteDownloadedFiles: file '${task.fileName}' not found at any known location")
+                } else {
+                    AppLogger.d(TAG, "deleteDownloadedFiles: unknown file size, skip shell find for '${task.fileName}'")
+                }
+            }
+        }
+    }
+
+    fun getActiveCount(): Int = tasks.values.count { it.status in listOf("downloading", "pending", "meta") }
+
+    /** 重新下载：删除旧任务 → 用相同 URL 重新提交 */
+    fun retryTask(id: String): Boolean {
+        val old = tasks[id] ?: return false
+        val url = old.url
+        val fileName = old.fileName
+        val savePath = old.savePath
+        val speedLimit = if (config.perTaskSpeedLimit > 0) config.perTaskSpeedLimit else null
+        // 先删除旧任务
+        deleteTask(id, deleteFile = false)
+        // 用原始参数重建
+        val task = createTask(
+            url = url,
+            fileName = if (fileName.isNotBlank()) fileName else null,
+            savePath = if (savePath.isNotBlank()) savePath else null,
+            speedLimit = speedLimit,
+            connections = config.maxConnectionsPerServer
+        )
+        return task.id.isNotBlank()
+    }
 
     fun shutdown() {
         aria2PollJob?.cancel(); smartThrottleJob?.cancel()
-        jobs.keys.forEach { jobs[it]?.cancel(); tasks[it]?.let { t -> if (t.status == "downloading") t.status = "paused" } }
-        jobs.clear(); saveTasks(); aria2.stop(); trackerManager.stopAutoUpdate(); scope.cancel()
-    }
-
-    // ─── Java 引擎 ────────────────────────────────────────
-
-    private fun startJavaDownload(id: String) {
-        val task = tasks[id] ?: return
-        jobs[id] = scope.launch {
-            javaSemaphore.acquire()
-            try {
-                executeJavaDownload(task)
-            } catch (_: CancellationException) {
-                if (task.status == "downloading") task.status = "paused"; saveTasks()
-            } catch (e: Exception) {
-                task.status = "error"; task.error = e.message ?: e.javaClass.simpleName; saveTasks()
-            } finally {
-                javaSemaphore.release(); jobs.remove(id)
-            }
-        }
-    }
-
-    private suspend fun executeJavaDownload(task: DownloadTask) {
-        task.status = "downloading"; saveTasks()
-        val file = File(task.savePath)
-        val existingBytes = if (file.exists()) file.length() else 0L
-        val totalSize = withContext(Dispatchers.IO) { probeFileSize(task.url) }
-
-        if (totalSize > 0 && existingBytes >= totalSize) {
-            task.totalSize = totalSize; task.downloadedBytes = totalSize
-            task.progress = 1f; task.status = "completed"
-            task.completedAt = System.currentTimeMillis(); saveTasks(); return
-        }
-
-        val conn = withContext(Dispatchers.IO) {
-            val c = URL(task.url).openConnection() as HttpURLConnection
-            c.connectTimeout = 15_000; c.readTimeout = 60_000
-            c.setRequestProperty("User-Agent", "UFI-AXIS-Download/1.0")
-            if (existingBytes > 0L) c.setRequestProperty("Range", "bytes=$existingBytes-")
-            c
-        }
-        try {
-            withContext(Dispatchers.IO) { conn.connect() }
-            val code = conn.responseCode
-            val resumeFrom: Long; val responseTotal: Long
-            if (code == 206) {
-                resumeFrom = existingBytes
-                responseTotal = conn.getHeaderField("Content-Range")?.substringAfterLast("/")?.toLongOrNull()
-                    ?: (existingBytes + conn.contentLengthLong)
-            } else if (code == 200) {
-                resumeFrom = 0L; responseTotal = conn.contentLengthLong.takeIf { it > 0 } ?: totalSize
-                if (existingBytes > 0L) file.delete()
-            } else throw Exception("HTTP $code: ${conn.responseMessage}")
-
-            task.totalSize = responseTotal; task.downloadedBytes = resumeFrom; task.connections = 1
-            val startTime = System.currentTimeMillis(); val startBytes = resumeFrom
-            val speedLimitBps = config.perTaskSpeedLimit
-
-            conn.inputStream.use { ins ->
-                FileOutputStream(file, resumeFrom > 0L).use { outs ->
-                    val buf = ByteArray(BUFFER_SIZE); var lastUpdate = 0L
-                    while (true) {
-                        yield()
-                        val n = ins.read(buf); if (n <= 0) break
-                        outs.write(buf, 0, n); task.downloadedBytes += n
-                        if (speedLimitBps > 0) {
-                            val elapsed = (System.currentTimeMillis() - startTime).coerceAtLeast(1)
-                            val expected = (task.downloadedBytes - startBytes) * 1000 / speedLimitBps
-                            if (elapsed < expected) delay(expected - elapsed)
-                        }
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate > PROGRESS_INTERVAL_MS) {
-                            lastUpdate = now
-                            task.progress = if (responseTotal > 0) (task.downloadedBytes.toFloat() / responseTotal).coerceIn(0f, 0.99f) else -1f
-                            val el = (now - startTime) / 1000.0
-                            if (el > 0) task.speed = ((task.downloadedBytes - startBytes) / el).toLong()
-                            saveTasks()
-                        }
-                    }
-                    outs.flush()
-                }
-            }
-            task.progress = 1f; task.status = "completed"
-            task.completedAt = System.currentTimeMillis(); task.speed = 0L; saveTasks()
-        } finally { conn.disconnect() }
+        tasks.values.filter { it.status == "downloading" }.forEach { it.status = "paused" }
+        saveTasks(); aria2.stop(); trackerManager.stopAutoUpdate(); scope.cancel()
     }
 
     // ─── aria2 引擎 ───────────────────────────────────────
 
     private fun startAria2IfNeeded() {
         if (!aria2.isRunning()) {
+            AppLogger.i(TAG, "Starting aria2 engine...")
             aria2.start(config)
-            startAria2Polling()
+            // 延迟启动轮询：等 RPC 就绪后再开始同步任务状态
+            scope.launch {
+                var waited = 0L
+                while (!aria2.isRunning() && waited < 15_000) {
+                    delay(500); waited += 500
+                }
+                if (aria2.isRunning()) {
+                    startAria2Polling()
+                } else {
+                    AppLogger.e(TAG, "aria2 engine failed to become ready after ${waited}ms")
+                }
+            }
         }
     }
 
+    private var rawTestOnce = false // 只运行一次原始 CLI 诊断测试
+
     private fun submitAria2Download(task: DownloadTask, speedLimit: Long?, connections: Int?) {
         scope.launch {
+            // ── 首次下载诊断测试（fire-and-forget，不阻塞实际下载）──
+            if (!rawTestOnce) {
+                rawTestOnce = true
+                scope.launch {
+                    AppLogger.i(TAG, "━━━ Auto raw-test (background) ━━━")
+                    aria2.rawDownload(url = task.url, saveDir = DEFAULT_SAVE_DIR,
+                        fileName = null, timeoutSec = 10, killLingering = false)
+                    AppLogger.i(TAG, "━━━ Auto raw-test completed ━━━")
+                }
+            }
+
             // 等待 aria2 RPC 就绪
             var waited = 0
-            while (!aria2.isRunning() && waited < 18000) {
+            val aria2Ver = aria2.cachedVersion
+            while (!aria2.isRunning() && waited < 12000) {
                 delay(500); waited += 500
             }
             if (!aria2.isRunning()) {
-                task.status = "error"; task.error = "aria2 引擎未就绪"; saveTasks(); return@launch
+                val diag = buildString {
+                    append("aria2 引擎未就绪")
+                    if (aria2Ver == null) append("（二进制可能不兼容，版本探测失败）")
+                    else append("（v$aria2Ver 启动超时，请检查日志）")
+                }
+                task.status = "error"; task.error = diag; saveTasks(); return@launch
             }
+            // aria2c 子进程只能写私有目录（scoped storage 限制），
+            // 完成后 transferToPublicDir 会拷贝到 task.savePath 公共目录
             val gid = aria2.addUri(
-                uris = listOf(task.url), dir = task.savePath,
+                uris = listOf(task.url), dir = DEFAULT_SAVE_DIR,
                 fileName = task.fileName.ifBlank { null },
                 maxConnPerServer = connections ?: config.maxConnectionsPerServer,
                 speedLimit = speedLimit ?: if (config.perTaskSpeedLimit > 0) config.perTaskSpeedLimit else null
@@ -731,7 +882,13 @@ class DownloadManager(
                 task.gid = gid; task.status = "downloading"
                 task.connections = connections ?: config.maxConnectionsPerServer; saveTasks()
             } else {
-                task.status = "error"; task.error = "aria2 提交失败"; saveTasks()
+                task.status = "error"
+                task.error = when {
+                    task.protocol == "https" && config.checkCertificate -> "aria2 提交失败（HTTPS证书校验可能不通过，尝试关闭\"校验证书\"）"
+                    task.protocol == "https" -> "aria2 提交失败（可能是TLS/证书问题，查看aria2日志）"
+                    else -> "aria2 提交失败（查看设备日志排查）"
+                }
+                saveTasks()
             }
         }
     }
@@ -740,7 +897,13 @@ class DownloadManager(
         aria2PollJob?.cancel()
         aria2PollJob = scope.launch {
             while (isActive) {
-                try { syncAria2Status() } catch (_: CancellationException) { break } catch (_: Exception) {}
+                try {
+                    syncAria2Status()
+                } catch (_: CancellationException) {
+                    break
+                } catch (e: Exception) {
+                    AppLogger.w(TAG, "aria2 poll error (retry in ${ARIA2_POLL_INTERVAL_MS}ms): ${e.message}")
+                }
                 delay(ARIA2_POLL_INTERVAL_MS)
             }
         }
@@ -759,9 +922,15 @@ class DownloadManager(
             task.uploadSpeed = s["uploadSpeed"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
             task.seeders = s["numSeeders"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
             task.connections = s["connections"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
-            task.progress = if (totalLen > 0) (completedLen.toFloat() / totalLen).coerceIn(0f, 1f) else 0f
+            // 进度计算：区分 metadata 获取阶段和真正的下载阶段
+            task.progress = if (totalLen > 0) {
+                (completedLen.toFloat() / totalLen).coerceIn(0f, 1f)
+            } else {
+                // totalLength=0 且无 connection → metadata 获取阶段，进度未知
+                -1f
+            }
 
-            // 更新文件名和路径（aria2 提供完整路径）
+            // 更新文件名（aria2 提供文件名，但不覆盖公共目标路径）
             val files = s["files"]?.jsonArray
             if (!files.isNullOrEmpty()) {
                 val fullPath = files[0].jsonObject["path"]?.jsonPrimitive?.contentOrNull
@@ -769,30 +938,304 @@ class DownloadManager(
                     val actualFileName = fullPath.substringAfterLast("/")
                     if (task.fileName.isBlank()) {
                         task.fileName = actualFileName
-                    }
-                    // 更新 savePath 为完整文件路径（目录/文件名）
-                    if (!fullPath.startsWith("magnet") && actualFileName.isNotBlank()) {
-                        task.savePath = fullPath
+                        // 文件名首次获取时更新 savePath（保持指向公共目录）
+                        if (task.savePath.startsWith(DEFAULT_SAVE_DIR) || task.savePath.isBlank()) {
+                            task.savePath = PUBLIC_DOWNLOAD_DIR
+                        }
                     }
                 }
             }
-            // 如果 aria2 返回了 dir 字段，用它来修正路径
+            // 如果 aria2 返回了 dir 字段且 fileName 不在当前 savePath 中（首次轮询），
+            // 但只在 savePath 尚未指向公共目录时修正
             val aria2Dir = s["dir"]?.jsonPrimitive?.contentOrNull
-            if (aria2Dir != null && task.fileName.isNotBlank() && !task.savePath.contains(task.fileName)) {
-                task.savePath = "${aria2Dir.trimEnd('/')}/${task.fileName}"
+            if (aria2Dir != null && task.fileName.isNotBlank() &&
+                task.savePath.isBlank()) {
+                task.savePath = "${PUBLIC_DOWNLOAD_DIR}/${task.fileName}"
             }
 
-            task.status = when (s["status"]?.jsonPrimitive?.contentOrNull) {
-                "active" -> "downloading"; "paused" -> "paused"; "waiting" -> "pending"
-                "complete" -> { task.completedAt = System.currentTimeMillis(); "completed" }
+            val newStatus = when (s["status"]?.jsonPrimitive?.contentOrNull) {
+                "active" -> {
+                    // metadata-fetching phase: totalLength=0, BT protocol, no data yet
+                    if (totalLen <= 0 && task.protocol in listOf("magnet", "torrent")) "meta"
+                    else "downloading"
+                }
+                "paused" -> "paused"; "waiting" -> "pending"
+                "complete" -> {
+                    // 如果之前已是 completed，不再重复触发 transferToPublicDir
+                    if (task.status != "completed") {
+                        task.completedAt = System.currentTimeMillis()
+                        // aria2 始终下载到私有目录 DEFAULT_SAVE_DIR，
+                        // 完成后必须转移到 task.savePath 公共目标
+                        scope.launch { transferToPublicDir(task) }
+                    }
+                    "completed"
+                }
                 "error" -> { task.error = s["errorMessage"]?.jsonPrimitive?.contentOrNull ?: "aria2 错误"; "error" }
                 "removed" -> "error"; else -> task.status
             }
+            task.status = newStatus
         }
         saveTasks()
     }
 
+    // ─── 文件转移（私有目录 → 公共下载目录）──────────────
+
+    /**
+     * 启动时恢复孤儿文件：应用崩溃/重启后，私有目录中已下载完成但未转移到公共目录的文件，
+     * 在此补转移。使用三层保底链，无 root 设备也能尽力恢复。
+     */
+    private fun recoverOrphanedDownloads() {
+        val privateDir = File(DEFAULT_SAVE_DIR)
+        if (!privateDir.exists() || !privateDir.isDirectory) return
+        val items = privateDir.listFiles()?.filter {
+            !it.name.endsWith(".aria2")  // 跳过 aria2 控制文件 (.aria2)
+        } ?: return
+        if (items.isEmpty()) return
+
+        val pubDir = File(config.saveDir)
+        smartMkdir(pubDir.absolutePath)
+        var recovered = 0
+
+        for (item in items) {
+            val target = File(pubDir, item.name)
+            if (item.isDirectory) {
+                // 磁链/BT 输出目录
+                if (smartCopyDir(item, target)) {
+                    val fileCount = target.walkTopDown().count { it.isFile }
+                    AppLogger.i(TAG, "recover dir: ~$fileCount files '${item.name}/' → ${target.absolutePath}/")
+                    recovered += fileCount
+                } else {
+                    AppLogger.w(TAG, "recover dir ALL failed: ${item.name} (will stay in private dir)")
+                }
+            } else {
+                if (item.length() <= 0L) continue
+                if (target.exists() && target.length() == item.length()) {
+                    AppLogger.d(TAG, "recover skip (already exists): ${item.name}")
+                    continue
+                }
+                if (smartCopyFile(item, target)) {
+                    AppLogger.i(TAG, "recover file: ${item.length()} bytes ${item.name} → ${target.absolutePath}")
+                    recovered++
+                } else {
+                    AppLogger.w(TAG, "recover file ALL failed: ${item.name} (will stay in private dir)")
+                }
+            }
+        }
+        if (recovered > 0) {
+            AppLogger.i(TAG, "recoverOrphanedDownloads: completed, $recovered items transferred")
+        }
+    }
+
+    /**
+     * 下载完成后，将文件/目录从私有工作目录拷贝到公共 Download 目录。
+     * aria2c 子进程只能写入私有目录，而公共目录受 Android Scoped Storage 限制。
+     *
+     * 保底链：root cp → MediaStore → 直接拷贝 → 私有目录兜底
+     *
+     * 支持两种场景：
+     * - 普通 HTTP 下载 → 单文件拷贝
+     * - 磁链/BT 下载 → 递归目录拷贝（aria2 产出的是文件夹）
+     */
+    private fun transferToPublicDir(task: DownloadTask): DownloadTask {
+        val targetName = task.fileName.ifBlank { 
+            File(task.savePath).name.ifBlank { return task }
+        }
+        // aria2c 下载到私有工作目录（可能是文件或目录）
+        val privateSource = File(DEFAULT_SAVE_DIR, targetName)
+        if (!privateSource.exists()) {
+            AppLogger.w(TAG, "transferToPublicDir: source not found: ${privateSource.absolutePath}")
+            return task
+        }
+
+        val isDir = privateSource.isDirectory
+        if (!isDir && privateSource.length() <= 0L) {
+            AppLogger.w(TAG, "transferToPublicDir: file is empty: ${privateSource.absolutePath}")
+            return task
+        }
+
+        // 确定公共目标路径
+        val savePathFile = File(task.savePath)
+        val publicTarget: File = when {
+            savePathFile.isDirectory || !isFilePath(task.savePath) -> {
+                smartMkdir(savePathFile.absolutePath)
+                File(savePathFile, targetName)
+            }
+            else -> {
+                savePathFile.parentFile?.let { smartMkdir(it.absolutePath) }
+                savePathFile
+            }
+        }
+
+        // 如果公共目录已有相同大小的文件，跳过拷贝
+        if (!isDir && publicTarget.exists() && publicTarget.length() == privateSource.length()) {
+            AppLogger.i(TAG, "transferToPublicDir: already exists (same size), skip: ${publicTarget.absolutePath}")
+            task.savePath = publicTarget.absolutePath
+            saveTasks()
+            return task
+        }
+
+        val success = if (isDir) smartCopyDir(privateSource, publicTarget)
+                      else smartCopyFile(privateSource, publicTarget)
+
+        if (success) {
+            task.savePath = publicTarget.absolutePath
+            AppLogger.i(TAG, "transferToPublicDir: OK '${targetName}' → ${publicTarget.absolutePath}")
+        } else {
+            // ── 终极保底：所有方式均失败，回退到私有目录 ──
+            AppLogger.w(TAG, "transferToPublicDir: ALL methods failed for '$targetName', keeping in private dir")
+            task.savePath = privateSource.absolutePath
+        }
+        saveTasks()
+        return task
+    }
+
+    // ─── 文件拷贝三层保底机制 ─────────────────────────────────
+    // ① root shell cp（最快、最可靠）→ ② MediaStore API → ③ 直接拷贝 → ④ 私有目录兜底
+
+    /** 检测 root 是否可用（只测一次，缓存结果） */
+    private fun isRootAvailable(): Boolean {
+        if (rootChecked.get()) return rootAvailable.get()
+        synchronized(rootChecked) {
+            if (rootChecked.get()) return rootAvailable.get()
+            rootChecked.set(true)
+            val ok = try {
+                val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "echo ok"))
+                p.waitFor(3, TimeUnit.SECONDS) && p.exitValue() == 0
+            } catch (_: Exception) { false }
+            rootAvailable.set(ok)
+            AppLogger.i(TAG, "Root available: $ok")
+            return ok
+        }
+    }
+
+    /** 通过 root shell cp 拷贝单个文件 */
+    private fun rootCp(src: String, dst: String): Boolean {
+        try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cp '$src' '$dst'"))
+            p.waitFor(60, TimeUnit.SECONDS)
+            return p.exitValue() == 0
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "rootCp: ${e.message}")
+            return false
+        }
+    }
+
+    /** root cp -r 递归拷贝目录 */
+    private fun rootCpRecursive(srcDir: String, dstDir: String): Boolean {
+        try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cp -r '$srcDir' '$dstDir'"))
+            p.waitFor(120, TimeUnit.SECONDS)
+            return p.exitValue() == 0
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "rootCpRecursive: ${e.message}")
+            return false
+        }
+    }
+
+    /** root mkdir -p 创建目录（含父目录） */
+    private fun rootMkdir(path: String): Boolean {
+        try {
+            val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "mkdir -p '$path'"))
+            p.waitFor(5, TimeUnit.SECONDS)
+            return p.exitValue() == 0
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "rootMkdir: ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * 通过 MediaStore API 写入公共 Downloads 目录。
+     * 这是 Android 官方推荐的无权限公共目录写入方式，适配无 root 设备。
+     */
+    private fun writeViaMediaStore(src: File, dstFileName: String): Boolean {
+        try {
+            val mime = when {
+                dstFileName.endsWith(".apk") -> "application/vnd.android.package-archive"
+                dstFileName.endsWith(".zip") -> "application/zip"
+                dstFileName.endsWith(".torrent") -> "application/x-bittorrent"
+                dstFileName.endsWith(".mp4") -> "video/mp4"
+                dstFileName.endsWith(".mp3") -> "audio/mpeg"
+                dstFileName.endsWith(".pdf") -> "application/pdf"
+                dstFileName.endsWith(".jpg", true) || dstFileName.endsWith(".jpeg", true) -> "image/jpeg"
+                dstFileName.endsWith(".png", true) -> "image/png"
+                else -> "application/octet-stream"
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, dstFileName)
+                put(MediaStore.Downloads.MIME_TYPE, mime)
+                put(MediaStore.Downloads.RELATIVE_PATH, "Download/UFI/")
+            }
+            val uri = appContext.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: return false
+            appContext.contentResolver.openOutputStream(uri)?.use { out ->
+                src.inputStream().use { inp -> inp.copyTo(out) }
+            } ?: return false
+            AppLogger.i(TAG, "MediaStore: wrote ${src.length()} bytes → Downloads/UFI/$dstFileName")
+            return true
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "MediaStore write failed for '$dstFileName': ${e.message}")
+            return false
+        }
+    }
+
+    /**
+     * 统一的文件拷贝保底链（单文件）。
+     * @return false 表示所有方式均失败，调用方应回退到私有目录
+     */
+    private fun smartCopyFile(src: File, dst: File): Boolean {
+        // ① root shell
+        if (isRootAvailable() && rootCp(src.absolutePath, dst.absolutePath)) {
+            AppLogger.d(TAG, "smartCopyFile: root cp OK '${src.name}'")
+            return true
+        }
+        // ② MediaStore
+        if (writeViaMediaStore(src, dst.name)) {
+            return true
+        }
+        // ③ 直接拷贝（MANAGE_EXTERNAL_STORAGE 已授予时可能成功）
+        try {
+            src.copyTo(dst, overwrite = true)
+            AppLogger.d(TAG, "smartCopyFile: direct copy OK '${src.name}'")
+            return true
+        } catch (_: Exception) {}
+        return false
+    }
+
+    /**
+     * 统一的目录拷贝保底链（磁链/BT）。
+     * MediaStore 不支持目录，所以只有 ①→③ 两级。
+     */
+    private fun smartCopyDir(srcDir: File, dstDir: File): Boolean {
+        // ① root shell
+        if (isRootAvailable() && rootCpRecursive(srcDir.absolutePath, dstDir.absolutePath)) {
+            AppLogger.d(TAG, "smartCopyDir: root cp -r OK '${srcDir.name}/'")
+            return true
+        }
+        // ② 直接递归拷贝
+        try {
+            srcDir.copyRecursively(dstDir, overwrite = true)
+            AppLogger.d(TAG, "smartCopyDir: direct copyRecursively OK '${srcDir.name}/'")
+            return true
+        } catch (_: Exception) {}
+        return false
+    }
+
+    /**
+     * 统一的目录创建保底链。
+     */
+    private fun smartMkdir(path: String): Boolean {
+        if (isRootAvailable() && rootMkdir(path)) return true
+        return try { File(path).mkdirs() } catch (_: Exception) { false }
+    }
+
     // ─── 工具 ──────────────────────────────────────────────
+
+    /** 判断路径是否像文件路径（最后一段包含扩展名），而非目录 */
+    private fun isFilePath(path: String): Boolean {
+        val lastPart = path.substringAfterLast("/")
+        return lastPart.contains(".")
+    }
 
     private fun detectProtocol(url: String): String {
         val l = url.lowercase()
@@ -807,15 +1250,6 @@ class DownloadManager(
         }
     }
 
-    private fun probeFileSize(url: String): Long {
-        return try {
-            val c = URL(url).openConnection() as HttpURLConnection
-            c.requestMethod = "HEAD"; c.connectTimeout = 10_000; c.readTimeout = 10_000
-            c.connect(); val len = c.contentLengthLong; c.disconnect()
-            if (len > 0) len else -1L
-        } catch (_: Exception) { -1L }
-    }
-
     private fun extractFileName(url: String): String {
         try {
             val name = URL(url).path.substringAfterLast("/").takeIf { it.isNotBlank() && it.contains(".") }
@@ -826,7 +1260,10 @@ class DownloadManager(
 
     // ─── 持久化 ────────────────────────────────────────────
 
-    private fun saveTasks() { try { persistFile.writeText(json.encodeToString(tasks.values.toList())) } catch (_: Exception) {} }
+    private fun saveTasks() {
+        try { persistFile.writeText(json.encodeToString(tasks.values.toList())) }
+        catch (e: Exception) { AppLogger.e(TAG, "saveTasks failed: ${e.javaClass.simpleName}: ${e.message}", e) }
+    }
     private fun loadTasks() { try { if (persistFile.exists()) { val t = persistFile.readText(); if (t.isNotBlank()) json.decodeFromString<List<DownloadTask>>(t).forEach { tasks[it.id] = it } } } catch (_: Exception) {} }
     private fun saveConfig() { try { configFile.writeText(json.encodeToString(config)) } catch (_: Exception) {} }
     private fun loadConfig() { try { if (configFile.exists()) { val t = configFile.readText(); if (t.isNotBlank()) config = json.decodeFromString<DownloadConfig>(t) } } catch (_: Exception) {} }

@@ -1,6 +1,6 @@
 package com.ufi_axis_core.controller.system
 
-import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformDeviceClient
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 
@@ -9,7 +9,7 @@ import com.ufi_axis_core.util.ShellExecutor
  * 设备重启、关机等系统级操作
  */
 class SystemController(
-    private val goformClient: GoformClient
+    private val deviceClient: GoformDeviceClient
 ) {
     private val tag = "SystemController"
 
@@ -21,7 +21,7 @@ class SystemController(
         AppLogger.i(tag, "Rebooting device")
 
         // 方式1: Goform
-        if (goformClient.rebootDevice()) {
+        if (deviceClient.rebootDevice()) {
             return true
         }
 

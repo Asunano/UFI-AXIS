@@ -39,7 +39,7 @@ private fun buildCompoundSize(size: String, unit: String): String {
 fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.trafficManagementState.collectAsState()
 
-    LaunchedEffect(Unit) { viewModel.loadTrafficLimit() }
+    LaunchedEffect(Unit) { viewModel.tools.loadTrafficLimit() }
 
     val cfg = state.limitConfig
 
@@ -60,12 +60,12 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
     LaunchedEffect(state.successMessage) {
         if (state.successMessage != null) {
             kotlinx.coroutines.delay(2000)
-            viewModel.clearTrafficMessage()
+            viewModel.tools.clearTrafficMessage()
         }
     }
 
     UfiScreenScaffold(title = "流量管理", navController = navController, showBack = true) { padding ->
-        UfiScrollableColumn(modifier = Modifier.padding(padding)) {
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
             state.errorMessage?.let { err -> UfiErrorBanner(message = err) }
             state.successMessage?.let { msg ->
                 UfiSettingsGroup {
@@ -78,7 +78,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 UfiSettingsGroup {
                     Box(Modifier.fillMaxWidth().padding(24.dp),
                         contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
+                        UfiLoadingIndicator()
                     }
                 }
             }
@@ -139,7 +139,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                         UfiDivider()
                         Spacer(Modifier.height(Spacing.Small))
 
-                        ProgressBar(
+                        UfiProgressBar(
                             progress = percent / 100f,
                             label = "月用量",
                             value = "${percent}% (${FormatUtils.formatBytes(monthTotal)} / ${limitSize} ${limitUnit})",
@@ -151,7 +151,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
 
             // ── 卡片 2：限额设置（合并单卡片 + 分区） ──
             UfiSettingsGroup {
-                SettingsToggle(
+                UfiSettingsToggle(
                     title = "启用流量限额",
                     description = if (enabled) "已开启流量限额管理" else "已关闭",
                     checked = enabled,
@@ -198,7 +198,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                     UfiDivider()
                     Spacer(Modifier.height(Spacing.Small))
 
-                    SettingsToggle(
+                    UfiSettingsToggle(
                         title = "自动清零",
                         description = if (autoClear) "每月自动重置流量统计" else "手动管理",
                         checked = autoClear,
@@ -223,7 +223,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                     text = "保存设置",
                     loading = state.isSaving,
                     onClick = {
-                        viewModel.saveDataLimit(
+                        viewModel.tools.saveDataLimit(
                             enabled = enabled,
                             limitSize = buildCompoundSize(limitSize, limitUnit),
                             limitUnit = "MB",
@@ -285,7 +285,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                         val data = if (calibrateWay == "data") {
                             parseToBytes(calibrateValue, calibrateUnit).toString()
                         } else calibrateValue
-                        viewModel.calibrateFlow(calibrateWay, data,
+                        viewModel.tools.calibrateFlow(calibrateWay, data,
                             if (calibrateWay == "time") calibrateValue else "0")
                     }
                 )

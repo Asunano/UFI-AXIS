@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * 内置短 TTL 缓存、批量合并、DSL 构建器，为智能化 shell 调度提供统一 API。
  *
  * ## 核心功能
- * - **自适应限流**: root shell 默认 3 并发（1~10 动态调整），普通 shell 5 并发（2~8）
+ * - **自适应限流**: root shell 默认 3 并发（1~4 动态调整），普通 shell 5 并发（2~8）
  * - **TTL 缓存**: 相同命令在 TTL 内返回缓存结果（默认 2s，高负载时自动延长）
  * - **批量合并**: 多条命令合并为单次 shell 调用，减少进程创建开销
  * - **DSL 构建器**: `ShellQoS.batch { root(...); cached(...) }` 便捷 API
@@ -24,7 +24,7 @@ object ShellQoS {
     private const val MAX_CACHE_SIZE = 50  // 缓存硬上限，防止 shell 输出累积
 
     private val rootSemaphore = AdaptiveSemaphore(
-        initialPermits = DEFAULT_ROOT_PERMITS, minPermits = 1, maxPermits = 10
+        initialPermits = DEFAULT_ROOT_PERMITS, minPermits = 1, maxPermits = 4
     )
     private val normalSemaphore = AdaptiveSemaphore(
         initialPermits = NORMAL_PERMITS, minPermits = 2, maxPermits = 8
@@ -335,7 +335,7 @@ object ShellQoS {
      * AdaptiveSemaphore 在后续 release 调用中逐步逼近目标值。
      */
     fun updateRootPermits(permits: Int) {
-        val clamped = permits.coerceIn(1, 10)
+        val clamped = permits.coerceIn(1, 4)
         rootSemaphore.adjustTo(clamped)
         clearCache()
         AppLogger.i("ShellQoS", "Root permits adjusted to $clamped (target: ${rootSemaphore.target}, current: ${rootSemaphore.totalPermits})")

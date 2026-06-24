@@ -15,6 +15,12 @@ interface UfiAxisApi {
     @GET("api/device/info")
     suspend fun getDeviceInfo(): DeviceInfoResponse
 
+    @GET("api/device/identity")
+    suspend fun getDeviceIdentity(): Map<String, String>
+
+    @GET("api/device/version")
+    suspend fun getDeviceVersion(): DeviceVersionResponse
+
     @GET("api/device/model")
     suspend fun getDeviceModel(): DeviceModel
 
@@ -39,6 +45,9 @@ interface UfiAxisApi {
 
     @GET("api/system/uptime")
     suspend fun getUptime(): UptimeInfo
+
+    @GET("api/system/root-check")
+    suspend fun checkRootAccess(): RootCheckResponse
 
     // ========== Traffic ==========
     @GET("api/traffic/realtime")
@@ -84,10 +93,18 @@ interface UfiAxisApi {
     suspend fun sendSms(@Body body: SmsSendRequest): SmsSendResponse
 
     @GET("api/sms/list")
-    suspend fun getSmsList(@Query("limit") limit: Int = 100): SmsListResponse
+    suspend fun getSmsList(
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0,
+        @Query("phone") phone: String? = null
+    ): SmsListResponse
 
-    @POST("api/sim/ussd")
-    suspend fun sendUssd(@Body body: UssdRequest): UssdResponse
+    @GET("api/sms/contacts")
+    suspend fun getSmsContacts(): SmsContactListResponse
+
+    // ========== Shell ==========
+    @POST("api/shell/exec")
+    suspend fun shellExec(@Body body: ShellExecRequest): ShellExecResponse
 
     // ========== AT ==========
     @POST("api/at/command")
@@ -282,6 +299,13 @@ interface UfiAxisApi {
     @POST("api/adb/stop")
     suspend fun stopAdb(): SuccessResponse
 
+    // ADB auto-start on boot
+    @GET("api/adb/auto-start")
+    suspend fun getAdbAutoStart(): JsonElement
+
+    @POST("api/adb/auto-start")
+    suspend fun setAdbAutoStart(@Body body: Map<String, Boolean>): SuccessResponse
+
     // ========== SMS Forward ==========
     @GET("api/sms-forward/config")
     suspend fun getSmsForwardConfig(): SmsForwardConfig
@@ -339,22 +363,6 @@ interface UfiAxisApi {
     @POST("api/device/usb-tether")
     suspend fun setUsbTethering(@Body body: Map<String, Boolean>): SuccessResponse
 
-    @POST("api/device/sa-mode")
-    suspend fun setSaMode(@Body body: Map<String, Boolean>): SuccessResponse
-
-    // ========== VoLTE / VoNR ==========
-    @GET("api/system/volte")
-    suspend fun getVolteStatus(@Query("slot") slot: Int = 0): JsonElement
-
-    @POST("api/system/volte")
-    suspend fun setVolteStatus(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
-
-    @GET("api/system/vonr")
-    suspend fun getVonrStatus(@Query("slot") slot: Int = 0): JsonElement
-
-    @POST("api/system/vonr")
-    suspend fun setVonrStatus(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
-
     // ========== WiFi Enable ==========
     @POST("api/wifi/enable")
     suspend fun setWifiEnabled(@Body body: Map<String, Boolean>): SuccessResponse
@@ -393,6 +401,10 @@ interface UfiAxisApi {
     // ========== Hostname ==========
     @POST("api/device/hostname")
     suspend fun setHostname(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
+
+    // ========== Telephony Reset ==========
+    @POST("api/device/telephony-reset")
+    suspend fun resetTelephony(): ShellExecResponse
 
     // ========== DHCP ==========
     @POST("api/device/dhcp")
@@ -552,4 +564,8 @@ data class FileReadResponse(
     val content: String,
     val encoding: String = "utf-8",
     val size: Int
+)
+
+data class RootCheckResponse(
+    val hasRoot: Boolean
 )

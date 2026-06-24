@@ -1,13 +1,14 @@
 package com.ufi_axis_core.util
 
 import android.util.Log
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileWriter
-import java.io.PrintWriter
 import java.time.LocalDate
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 
 /**
@@ -18,6 +19,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * - app_yyyy-MM-dd.log   应用日志
  * - at_yyyy-MM-dd.log    AT 指令日志
  * - error_yyyy-MM-dd.log 错误日志
+ *
+ * 性能优化：文件写入复用 BufferedWriter，避免每行日志都 new FileWriter/PrintWriter
  */
 object AppLogger {
 
@@ -41,6 +44,9 @@ object AppLogger {
 
     private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.getDefault())
     private val timeFormat = DateTimeFormatter.ofPattern("HH:mm:ss.SSS", Locale.getDefault())
+
+    // 文件写入器缓存 (key = "prefix_date"，自动按天切换)
+    private val writerCache = ConcurrentHashMap<String, BufferedWriter>()
 
     /**
      * 初始化日志目录
@@ -87,9 +93,16 @@ object AppLogger {
      * @param limit 返回最大条目数
      */
     fun getBufferedLogs(level: String? = null, limit: Int = 200): List<String> {
-        val all = logBuffer.toList()
-        val filtered = if (level != null) all.filter { it.contains("[$level]") } else all
-        return filtered.takeLast(limit)
+        // 用 iterator 遍历避免 toList() 全量拷贝
+        val result = mutableListOf<String>()
+        val iter = logBuffer.iterator()
+        while (iter.hasNext()) {
+            val entry = iter.next()
+            if (level == null || level in entry) {
+                result.add(entry)
+            }
+        }
+        return result.takeLast(limit)
     }
 
     /**
@@ -109,7 +122,7 @@ object AppLogger {
             LogLevel.ERROR -> Log.e("$TAG/$tag", message)
         }
 
-        // 文件持久化
+        // 文件持久化（复用 BufferedWriter）
         writeToFile(type, entry)
 
         // 内存环形缓冲区（受 bufferEnabled 和 bufferMinLevel 控制）
@@ -122,16 +135,31 @@ object AppLogger {
     private fun writeToFile(type: LogType, entry: String) {
         val dir = logDir ?: return
         val date = LocalDate.now().format(dateFormat)
-        val file = File(dir, "${type.prefix}_$date.log")
+        val key = "${type.prefix}_$date"
 
         try {
-            PrintWriter(FileWriter(file, true)).use { pw ->
-                pw.println(entry)
+            val writer = writerCache.getOrPut(key) {
+                val f = File(dir, "${type.prefix}_$date.log")
+                BufferedWriter(FileWriter(f, true), 4096)
             }
+            writer.write(entry)
+            writer.newLine()
+            writer.flush()
         } catch (e: Exception) {
-            // 写日志文件失败时只输出到 Logcat
+            // 写日志文件失败时移除缓存 writer，下次重新创建
+            writerCache.remove(key)
             Log.e("$TAG/Logger", "Failed to write log file: ${e.message}")
         }
+    }
+
+    /**
+     * 关闭所有文件写入器（进程退出前调用）
+     */
+    fun closeWriters() {
+        writerCache.values.forEach {
+            try { it.close() } catch (_: Exception) {}
+        }
+        writerCache.clear()
     }
 
     /**

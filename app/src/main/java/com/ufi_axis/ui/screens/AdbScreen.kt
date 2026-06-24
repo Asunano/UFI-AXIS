@@ -4,6 +4,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -11,39 +12,65 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.viewmodel.MainViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AdbScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.adbState.collectAsState()
-    LaunchedEffect(Unit) { viewModel.refreshAdbStatus() }
+    LaunchedEffect(Unit) { viewModel.tools.refreshAdbStatus() }
 
     UfiScreenScaffold(title = "ADB WiFi", navController = navController, showBack = true) { padding ->
-        UfiScrollableColumn(modifier = Modifier.padding(padding)) {
-            state.errorMessage?.let { err -> UfiErrorBanner(message = err, onRetry = { viewModel.refreshAdbStatus() }) }
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
+            state.errorMessage?.let { err -> UfiErrorBanner(message = err, onRetry = { viewModel.tools.refreshAdbStatus() }) }
 
             state.status?.let { s ->
                 UfiSettingsGroup {
                     UfiSectionHeader(title = "ADB 状态")
-                    InfoRow("运行状态", if (s.connected) "运行中" else "已停止")
-                    InfoRow("端口", s.port.toString())
+                    UfiInfoRow("运行状态", if (s.connected) "运行中" else "已停止")
+                    UfiInfoRow("端口", s.port.toString())
                     if (s.last_ping_ms > 0) {
                         val ago = (System.currentTimeMillis() - s.last_ping_ms) / 1000
-                        InfoRow("最后保活", "${ago}秒前")
+                        UfiInfoRow("最后保活", "${ago}秒前")
                     }
                 }
 
+                // 开机自启开关
+                UfiSettingsGroup {
+                    UfiSectionHeader(title = "开机自启")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "开机自动启动 ADB WiFi",
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Switch(
+                            checked = state.autoStartOnBoot,
+                            onCheckedChange = { viewModel.tools.setAdbAutoStart(it) }
+                        )
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "启用后，设备开机时将自动启动 ADB WiFi 服务",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
                 UfiButtonRow {
-                    UfiPrimaryButton(text = "启动 ADB", onClick = { viewModel.startAdb() },
+                    UfiPrimaryButton(text = "启动 ADB", onClick = { viewModel.tools.startAdb() },
                         enabled = !s.connected && !state.isLoading, modifier = Modifier.weight(1f))
-                    UfiSecondaryButton(text = "停止 ADB", onClick = { viewModel.stopAdb() },
+                    UfiSecondaryButton(text = "停止 ADB", onClick = { viewModel.tools.stopAdb() },
                         enabled = s.connected && !state.isLoading, modifier = Modifier.weight(1f))
                 }
 
                 if (s.connected) {
                     Card(
-                        shape = RoundedCornerShape(Spacing.CardCorner),
+                        shape = UfiCardDefaults.legacyShape,
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
                     ) {
                         Column(Modifier.padding(12.dp)) {

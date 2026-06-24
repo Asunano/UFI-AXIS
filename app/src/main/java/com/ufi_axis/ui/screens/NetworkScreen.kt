@@ -1,446 +1,478 @@
 package com.ufi_axis.ui.screens
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
+import com.ufi_axis.ui.animation.blurEntrance
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
-import com.google.gson.JsonParser
+import com.ufi_axis.viewmodel.module.parseWifiSettings
+import com.ufi_axis.viewmodel.module.parseWifiClients
+import com.ufi_axis.viewmodel.module.parseCurrentBand
+import com.ufi_axis.viewmodel.module.parseDeviceSettingsField
+import com.google.gson.JsonElement
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
+    val dashboardState by viewModel.dashboardState.collectAsState()
 
-    LaunchedEffect(Unit) {
-        viewModel.refreshNetwork()
-        viewModel.loadBandStatus()
-        viewModel.loadDeviceSettings()
-        viewModel.loadBlacklist()
-        viewModel.restoreWifiChipPreference()
+    // ── 6 个弹窗状态 ──
+    var showWifiDialog by remember { mutableStateOf(false) }
+    var showNetworkModeDialog by remember { mutableStateOf(false) }
+    var showBandLockDialog by remember { mutableStateOf(false) }
+    var showApnDialog by remember { mutableStateOf(false) }
+    var showDhcpDialog by remember { mutableStateOf(false) }
+    var showCellLockDialog by remember { mutableStateOf(false) }
+    var showNetworkFeaturesDialog by remember { mutableStateOf(false) }
+
+    // 有 Bug: com.ufi_axis.ui.util.rememberIsActive 不可用，用手写替代
+    var isScreenActive by remember { mutableStateOf(true) }
+    DisposableEffect(Unit) {
+        onDispose { isScreenActive = false }
     }
 
-    UfiScreenScaffold(title = "网络", actions = { IconButton(onClick = { viewModel.refreshNetwork() }) { Icon(Icons.Default.Refresh, null) } }) { padding ->
-        UfiScrollableColumn(modifier = Modifier.padding(padding)) {
-            state.errorMessage?.let { e -> UfiErrorBanner(message = e) }
+    // 首次加载 + 出错自动重试（主界面仪表盘 10s 轮询，网络界面无轮询导致出错后永久卡住）
+    LaunchedEffect(isScreenActive) {
+        if (!isScreenActive) return@LaunchedEffect
+        kotlinx.coroutines.delay(200)
+        loadNetworkAll(viewModel)
+    }
+    var retryCount by remember { mutableIntStateOf(0) }
+    LaunchedEffect(state.errorMessage, isScreenActive) {
+        if (state.errorMessage != null && isScreenActive && retryCount < 3) {
+            kotlinx.coroutines.delay(5_000)
+            retryCount++
+            loadNetworkAll(viewModel)
+        }
+    }
 
-            state.signalInfo?.let { sig ->
-                UfiSettingsGroup {
-                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        sig.rsrp?.let { rsrp ->
-                            Column(Modifier.weight(1f)) {
-                                Text("RSRP", style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text("$rsrp dBm", style = MaterialTheme.typography.titleLarge,
-                                    color = signalColor(rsrp), fontWeight = FontWeight.Bold)
-                                Text(signalLevelText(rsrp), style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            SignalBars(rsrp)
-                        }
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        sig.sinr?.let { UfiStatItem("$it dB", "SINR") }
-                        sig.rsrq?.let { UfiStatItem("$it dB", "RSRQ") }
-                        sig.rssi?.let { UfiStatItem("$it dBm", "RSSI") }
-                    }
-                    if (sig.rat != null || sig.operator != null) {
-                        Spacer(Modifier.height(8.dp))
-                        UfiDivider()
-                        Spacer(Modifier.height(4.dp))
-                        sig.rat?.let { InfoRow("制式", it) }
-                        sig.operator?.let { InfoRow("运营商", it) }
-                    }
-                }
-            }
-
-            UfiCollapsibleGroup(title = "移动网络", subtitle = "拨号、连接模式、数据开关") {
-                UfiLinearLoading(isLoading = state.isLoading)
-
-                Text("蜂窝数据连接", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Spacer(Modifier.height(4.dp))
-                UfiButtonRow {
-                    OutlinedButton(onClick = { viewModel.connectNetwork() }, modifier = Modifier.weight(1f)) {
-                        Icon(Icons.Default.Link, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("拨号")
-                    }
-                    OutlinedButton(onClick = { viewModel.disconnectNetwork() }, modifier = Modifier.weight(1f)) {
-                        Icon(Icons.Default.LinkOff, null, modifier = Modifier.size(16.dp)); Spacer(Modifier.width(4.dp)); Text("断开")
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                UfiDivider()
-
-                var showConnMode by remember { mutableStateOf(false) }
-                var connMode by remember { mutableStateOf("auto") }
-                LaunchedEffect(deviceSettingsState.settings) {
-                    deviceSettingsState.settings?.asJsonObject?.get("connection_mode")?.asString?.let {
-                        connMode = if (it == "AUTO" || it == "auto" || it == "0") "auto" else "manual"
-                    }
-                }
-                SettingsValue(title = "连接模式", description = "自动或手动拨号",
-                    value = if (connMode == "auto") "自动拨号" else "手动拨号", onClick = { showConnMode = true })
-                if (showConnMode) {
-                    UfiChoiceSheet(title = "连接模式", options = listOf("auto" to "自动拨号", "manual" to "手动拨号"),
-                        selectedValue = connMode, onDismiss = { showConnMode = false },
-                        onSelect = { connMode = it; viewModel.setConnectionMode(it) })
-                }
-                UfiDivider()
-                SettingsToggle(title = "移动数据", description = if (state.mobileDataEnabled) "已开启" else "已关闭",
-                    checked = state.mobileDataEnabled, onCheckedChange = { viewModel.toggleMobileData(it) })
-                UfiDivider()
-
-                var showMode by remember { mutableStateOf(false) }
-                var selectedMode by remember { mutableStateOf("AUTO") }
-                val modeLabels = mapOf("AUTO" to "自动", "LTE_AND_5G" to "4G/5G NSA", "Only_5G" to "5G SA",
-                    "Only_LTE" to "仅 4G", "Only_WCDMA" to "仅 3G", "LTE_WCDMA" to "4G/3G")
-                LaunchedEffect(deviceSettingsState.settings) {
-                    val json = deviceSettingsState.settings?.asJsonObject
-                    val bearer = json?.get("BearerPreference")?.asString
-                        ?: json?.get("net_select")?.asString
-                    bearer?.let {
-                        selectedMode = when (it) {
-                            "WL_AND_5G", "AUTO" -> "AUTO"
-                            "Only_5G" -> "Only_5G"
-                            "LTE_AND_5G" -> "LTE_AND_5G"
-                            "Only_LTE" -> "Only_LTE"
-                            "Only_WCDMA" -> "Only_WCDMA"
-                            "WCDMA_AND_LTE" -> "LTE_WCDMA"
-                            else -> it
-                        }
-                    }
-                }
-                SettingsValue(title = "网络模式", description = "选择接入技术",
-                    value = modeLabels[selectedMode] ?: selectedMode, onClick = { showMode = true })
-                if (showMode) {
-                    UfiChoiceSheet(title = "网络模式", options = modeLabels.entries.map { it.key to it.value },
-                        selectedValue = selectedMode, onDismiss = { showMode = false },
-                        onSelect = { selectedMode = it; viewModel.setNetworkMode(it) })
-                }
-            }
-
-            UfiCollapsibleGroup(title = "频段锁定", subtitle = "LTE / NR 频段选择") {
-                val lteBands = listOf(1, 3, 5, 8, 34, 38, 39, 40, 41)
-                val nrBands = listOf(1, 5, 8, 28, 41, 78)
-                var selectedLte by remember { mutableStateOf(setOf<Int>()) }
-                var selectedNr by remember { mutableStateOf(setOf<Int>()) }
-
-                LaunchedEffect(state.bandStatus) {
-                    state.bandStatus?.asJsonObject?.let { json ->
-                        json.get("lte_band_lock")?.asString?.let {
-                            selectedLte = it.split(",").mapNotNull { v -> v.trim().toIntOrNull() }.toSet()
-                        }
-                        json.get("nr_band_lock")?.asString?.let {
-                            selectedNr = it.split(",").mapNotNull { v -> v.trim().toIntOrNull() }.toSet()
-                        }
-                    }
+    UfiScreenScaffold(title = "网络设置", actions = {
+        IconButton(onClick = { viewModel.network.refreshNetwork() }) { Icon(Icons.Default.Refresh, null) }
+    }) { padding ->
+        PullToRefreshBox(
+            isRefreshing = state.isLoading,
+            onRefresh = { viewModel.network.refreshNetwork() },
+            modifier = Modifier.padding(padding).fillMaxSize()
+        ) {
+            UfiPageBackground(modifier = Modifier.blurEntrance("network"), useGradient = true) {
+                state.errorMessage?.let { e ->
+                    UfiErrorBanner(message = e, onRetry = { viewModel.network.refreshNetwork() })
                 }
 
-                Text("LTE 频段", style = MaterialTheme.typography.labelMedium)
-                Spacer(Modifier.height(4.dp))
-                UfiIntChipSelector(values = lteBands, selectedValues = selectedLte, onToggle = { band ->
-                    selectedLte = if (band in selectedLte) selectedLte - band else selectedLte + band
-                }, prefix = "B")
-                Spacer(Modifier.height(8.dp))
-                Text("NR 频段", style = MaterialTheme.typography.labelMedium)
-                Spacer(Modifier.height(4.dp))
-                UfiIntChipSelector(values = nrBands, selectedValues = selectedNr, onToggle = { band ->
-                    selectedNr = if (band in selectedNr) selectedNr - band else selectedNr + band
-                }, prefix = "N")
-                Spacer(Modifier.height(8.dp))
-                UfiButtonRow {
-                    Button(onClick = {
-                        if (selectedLte.isNotEmpty()) viewModel.lockBand("lte", selectedLte.sorted().joinToString(","), "lock")
-                        if (selectedNr.isNotEmpty()) viewModel.lockBand("nr", selectedNr.sorted().joinToString(","), "lock")
-                    }, modifier = Modifier.weight(1f)) { Text("锁定") }
-                    OutlinedButton(onClick = { viewModel.lockBand("all", "", "unlock"); selectedLte = emptySet(); selectedNr = emptySet() },
-                        modifier = Modifier.weight(1f)) { Text("解锁全部") }
+                // ═══════════ 1. 蜂窝网络状态 & SIM 卡 ═══════════
+                val currentBand = remember(state.cellInfo) { parseCurrentBand(state.cellInfo) }
+                val downlinkSpeed = remember(dashboardState.trafficRealtime) {
+                    dashboardState.trafficRealtime?.rx_speed_display?.takeIf { it.isNotBlank() }
                 }
-                Spacer(Modifier.height(8.dp))
-                UfiDivider()
-                Spacer(Modifier.height(4.dp))
-
-                // 基站管理入口
-                UfiNavigationItem(title = "基站管理", description = "邻区列表、基站锁定",
-                    onClick = { navController.navigate("detail/cell-lock") })
-            }
-
-            val wifiJson = state.wifiSettings?.asJsonObject
-            val wifiInner = try {
-                wifiJson?.get("settings")?.asString?.let { JsonParser.parseString(it)?.asJsonObject } ?: wifiJson
-            } catch (_: Exception) { wifiJson }
-            val currentSsid = wifiInner?.get("wifi_chip1_ssid1_ssid")?.asString ?: ""
-            val currentPwd = wifiInner?.get("wifi_chip1_ssid1_passphrase")?.asString ?: ""
-            val activeChip = wifiInner?.get("wifi_chip")?.asString ?: "chip1"
-
-            UfiCollapsibleGroup(title = "热点", subtitle = if (state.wifiEnabled) "已开启 \u00B7 $currentSsid" else "已关闭") {
-                SettingsToggle(title = "热点开关", description = if (state.wifiEnabled) "已开启 \u00B7 $currentSsid" else "已关闭",
-                    checked = state.wifiEnabled, onCheckedChange = { viewModel.setWifiEnabled(it) })
-                UfiDivider()
-
-                Text("WiFi 频段", style = MaterialTheme.typography.labelMedium)
-                Spacer(Modifier.height(4.dp))
-                UfiSingleChipSelector(
-                    options = listOf("chip1" to "2.4 GHz", "chip2" to "5 GHz"),
-                    selectedValue = activeChip,
-                    onSelect = { viewModel.switchWifiChip(it) }
-                )
-                Spacer(Modifier.height(8.dp))
-                UfiDivider()
-
-                var ssid by remember(currentSsid) { mutableStateOf(currentSsid) }
-                var pwd by remember(currentPwd) { mutableStateOf(currentPwd) }
-                var saveMsg by remember { mutableStateOf<String?>(null) }
-                UfiTextField(value = ssid, onValueChange = { ssid = it; saveMsg = null }, label = "热点名称 (SSID)",
-                    supportingText = { Text("当前: $currentSsid") })
-                Spacer(Modifier.height(4.dp))
-                UfiPasswordField(value = pwd, onValueChange = { pwd = it; saveMsg = null }, label = "热点密码",
-                    placeholder = if (currentPwd.isNotEmpty()) "当前: ${"*".repeat(currentPwd.length)} (留空不修改)" else "留空则不修改")
-                Spacer(Modifier.height(8.dp))
-                saveMsg?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary); Spacer(Modifier.height(4.dp)) }
-                UfiButtonRow {
-                    UfiPrimaryButton(text = "保存", onClick = {
-                        val config = mutableMapOf<String, Any>("ssid" to ssid)
-                        if (pwd.isNotBlank() && pwd != currentPwd) config["passphrase"] = pwd
-                        // 传递当前芯片 index 确保写入正确的 AP
-                        val chipIdx = if (activeChip == "chip2") "1" else "0"
-                        config["chip_index"] = chipIdx
-                        viewModel.setWifiConfig(config); viewModel.refreshNetwork(); saveMsg = "热点设置已保存"
-                    }, modifier = Modifier.weight(1f))
-                    UfiSecondaryButton(text = "刷新", onClick = { viewModel.refreshNetwork(); ssid = currentSsid; pwd = currentPwd; saveMsg = null }, modifier = Modifier.weight(1f))
-                }
-                Spacer(Modifier.height(4.dp))
-                UfiButtonRow {
-                    OutlinedButton(onClick = { viewModel.setWifiPower(2); viewModel.refreshNetwork() }, modifier = Modifier.weight(1f)) { Text("高功率") }
-                    OutlinedButton(onClick = { viewModel.setWifiPower(0); viewModel.refreshNetwork() }, modifier = Modifier.weight(1f)) { Text("低功率") }
-                    OutlinedButton(onClick = { viewModel.setWifiPower(1); viewModel.refreshNetwork() }, modifier = Modifier.weight(1f)) { Text("中功率") }
-                }
-            }
-
-            val clientsJson = state.wifiClients?.asJsonObject
-            val wifiStations = try { clientsJson?.getAsJsonArray("station_list") } catch (_: Exception) { null }
-            val lanStations = try { clientsJson?.getAsJsonArray("lan_station_list") } catch (_: Exception) { null }
-            val allStations = buildList {
-                wifiStations?.forEach { add(it) }
-                lanStations?.forEach { add(it) }
-            }
-            val clientCount = allStations.size
-
-            // 解析黑名单
-            val blackJson = state.blacklistInfo?.let {
-                try { JsonParser.parseString(it.toString()).asJsonObject } catch (_: Exception) { null }
-            }
-            val blackMacs = (blackJson?.get("BlackMacList")?.asString ?: "")
-                .split(";").filter { it.isNotBlank() }.toSet()
-            val blackNames = (blackJson?.get("BlackNameList")?.asString ?: "")
-                .split(";").filter { it.isNotBlank() }
-            val blackNameByMac = blackMacs.zip(
-                blackNames + List((blackMacs.size - blackNames.size).coerceAtLeast(0)) { "" }
-            ).toMap()
-
-            if (clientCount > 0) {
-                UfiSettingsGroup {
-                    Text("已连接设备 ($clientCount)", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = Spacing.Small))
-                    val stations = allStations.mapNotNull { element ->
-                        try {
-                            val obj = element.asJsonObject
-                            Triple(obj.get("hostname")?.asString ?: "未知", obj.get("ip_addr")?.asString ?: "-", obj.get("mac_addr")?.asString ?: "-")
-                        } catch (_: Exception) { null }
-                    }
-                    stations.forEachIndexed { index, (hostname, ip, mac) ->
-                        if (index > 0) UfiDivider()
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(hostname, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-                                Text("$ip  \u00B7  $mac", style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            if (mac.isNotBlank() && mac != "-") {
-                                val isBlocked = mac in blackMacs
-                                TextButton(onClick = {
-                                    if (isBlocked) viewModel.unblockDevice(mac, hostname)
-                                    else viewModel.blockDevice(mac, hostname)
-                                }) {
-                                    Text(
-                                        if (isBlocked) "解除拉黑" else "拉黑",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isBlocked) MaterialTheme.colorScheme.error
-                                                else MaterialTheme.colorScheme.primary
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 已拉黑设备列表
-            if (blackMacs.isNotEmpty()) {
-                UfiSettingsGroup {
-                    Text("已拉黑设备 (${blackMacs.size})", style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.padding(bottom = Spacing.Small))
-                    blackMacs.forEachIndexed { index, mac ->
-                        if (index > 0) UfiDivider()
-                        val name = blackNameByMac[mac] ?: ""
-                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                            Column(Modifier.weight(1f)) {
-                                Text(name.ifBlank { "未知设备" }, style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium)
-                                Text(mac, style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                            }
-                            TextButton(onClick = { viewModel.unblockDevice(mac, name) }) {
-                                Text("解除拉黑", style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                    }
-                }
-            }
-
-            UfiCollapsibleGroup(title = "APN", subtitle = "接入点名称配置") {
-                var autoSelect by remember { mutableStateOf(true) }
-                var apnName by remember { mutableStateOf("") }
-                var apnValue by remember { mutableStateOf("") }
-                SettingsToggle(title = "自动选择", checked = autoSelect, onCheckedChange = { autoSelect = it })
-                if (!autoSelect) {
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(value = apnName, onValueChange = { apnName = it }, label = "APN 名称")
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(value = apnValue, onValueChange = { apnValue = it }, label = "APN")
-                }
-                Spacer(Modifier.height(Spacing.Medium))
-                UfiPrimaryButton(text = "保存", onClick = { viewModel.setApnConfig(mapOf("auto_select" to autoSelect, "name" to apnName, "apn" to apnValue)) })
-            }
-
-            UfiCollapsibleGroup(title = "局域网", subtitle = "LAN / DHCP 配置") {
-                UfiButtonRow {
-                    OutlinedButton(onClick = { viewModel.loadLanSettings() }, modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Default.Settings, null, modifier = Modifier.size(16.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text("查询当前配置")
-                    }
-                }
-
-                // 当前配置只读展示
-                state.lanSettings?.asJsonObject?.let { lan ->
-                    Spacer(Modifier.height(4.dp))
-                    lan.get("lan_ipaddr")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("LAN IP", it) }
-                    lan.get("lan_netmask")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("子网掩码", it) }
-                    lan.get("mac_address")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("MAC 地址", it) }
-                    lan.get("dhcpEnabled")?.asString?.takeIf { it.isNotBlank() }?.let {
-                        InfoRow("DHCP", if (it == "1" || it.equals("true", true)) "已开启" else "已关闭")
-                    }
-                    lan.get("dhcpStart")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("DHCP 起始", it) }
-                    lan.get("dhcpEnd")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("DHCP 结束", it) }
-                    lan.get("dhcpLease_hour")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("租约时间", "${it}h") }
-                    lan.get("mtu")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("MTU", it) }
-                    lan.get("tcp_mss")?.asString?.takeIf { it.isNotBlank() }?.let { InfoRow("TCP MSS", it) }
-                }
-
-                // ---- 编辑表单 ----
-                var dhcpEnabled by remember { mutableStateOf(true) }
-                var lanIp by remember { mutableStateOf("") }
-                var lanNetmask by remember { mutableStateOf("") }
-                var dhcpStart by remember { mutableStateOf("") }
-                var dhcpEnd by remember { mutableStateOf("") }
-                var dhcpLease by remember { mutableStateOf("86400") }
-
-                // 查询结果回填到表单
-                state.lanSettings?.asJsonObject?.let { lan ->
-                    LaunchedEffect(lan) {
-                        lan.get("lan_ipaddr")?.asString?.let { lanIp = it }
-                        lan.get("lan_netmask")?.asString?.let { lanNetmask = it }
-                        val dhcpOn = lan.get("dhcpEnabled")?.asString
-                        dhcpEnabled = dhcpOn == "1" || dhcpOn.equals("true", ignoreCase = true)
-                        lan.get("dhcpStart")?.asString?.let { dhcpStart = it }
-                        lan.get("dhcpEnd")?.asString?.let { dhcpEnd = it }
-                        // dhcpLease_hour 是小时数，转为秒
-                        val leaseHour = lan.get("dhcpLease_hour")?.asString?.toIntOrNull()
-                        dhcpLease = if (leaseHour != null && leaseHour > 0) (leaseHour * 3600).toString() else "86400"
-                    }
-                }
-
-                Spacer(Modifier.height(Spacing.Medium))
-                UfiDivider()
-                Spacer(Modifier.height(Spacing.Medium))
-
-                SettingsToggle(
-                    title = "DHCP 服务器",
-                    description = if (dhcpEnabled) "自动分配 IP 地址" else "手动配置 IP",
-                    checked = dhcpEnabled,
-                    onCheckedChange = { dhcpEnabled = it }
+                CellularStatusCard(
+                    state = state,
+                    currentBand = currentBand,
+                    downlinkSpeed = downlinkSpeed
                 )
 
-                Spacer(Modifier.height(Spacing.Small))
-                UfiTextField(value = lanIp, onValueChange = { lanIp = it }, label = "LAN IP 地址")
-                Spacer(Modifier.height(Spacing.Small))
-                UfiTextField(value = lanNetmask, onValueChange = { lanNetmask = it }, label = "子网掩码")
+                Spacer(Modifier.height(Spacing.SectionTop))
 
-                if (dhcpEnabled) {
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(value = dhcpStart, onValueChange = { dhcpStart = it }, label = "DHCP 起始 IP")
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(value = dhcpEnd, onValueChange = { dhcpEnd = it }, label = "DHCP 结束 IP")
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiDigitField(
-                        value = dhcpLease, onValueChange = { dhcpLease = it },
-                        label = "租约时间（秒）", modifier = Modifier.fillMaxWidth()
+                // ═══════════ 2. SIM 卡功能（合并：连接模式 + 网络制式 + 频段锁定 + APN + 基站信息） ═══════════
+                val roamingEnabled = parseRoamingEnabled(deviceSettingsState.settings)
+                val connModeJson = parseConnModeDlg(deviceSettingsState.settings)
+                val netModeJson = parseNetModeDlg(deviceSettingsState.settings)
+                val modeLabels = mapOf(
+                    "AUTO" to "自动", "LTE_AND_5G" to "4G/5G NSA", "Only_5G" to "5G SA",
+                    "Only_LTE" to "仅 4G", "Only_WCDMA" to "仅 3G", "LTE_WCDMA" to "4G/3G"
+                )
+
+                UfiSectionHeader(title = "SIM 卡功能")
+                UfiSettingsGroup {
+                    // 移动数据
+                    UfiSettingsToggle(
+                        title = "移动数据",
+                        description = if (state.mobileDataEnabled) "已开启" else "已关闭",
+                        checked = state.mobileDataEnabled,
+                        onCheckedChange = { viewModel.network.toggleMobileData(it) }
+                    )
+                    UfiDivider()
+
+                    // 数据漫游
+                    UfiSettingsToggle(
+                        title = "数据漫游",
+                        description = if (roamingEnabled) "漫游中" else "已关闭",
+                        checked = roamingEnabled,
+                        onCheckedChange = { viewModel.network.setRoamingEnabled(it) }
+                    )
+                    UfiDivider()
+
+                    // 连接模式 → 弹窗
+                    UfiNavigationItem(
+                        title = "连接模式",
+                        description = if (connModeJson == "auto") "自动拨号" else "手动拨号",
+                        onClick = { showNetworkModeDialog = true }
+                    )
+                    UfiDivider()
+
+                    // 网络制式 → 弹窗
+                    UfiNavigationItem(
+                        title = "网络制式",
+                        description = modeLabels[netModeJson] ?: netModeJson,
+                        onClick = { showNetworkModeDialog = true }
+                    )
+                    UfiDivider()
+
+                    // 频段锁定 → 弹窗
+                    UfiNavigationItem(
+                        title = "频段锁定",
+                        description = "锁定指定 LTE / NR 频段",
+                        onClick = { showBandLockDialog = true }
+                    )
+                    UfiDivider()
+
+                    // APN 接入点 → 弹窗
+                    UfiNavigationItem(
+                        title = "APN 接入点",
+                        description = "配置接入点名称与网络参数",
+                        onClick = { showApnDialog = true }
+                    )
+                    UfiDivider()
+
+                    // 基站信息 → 弹窗
+                    UfiNavigationItem(
+                        title = "基站信息",
+                        description = "查看/锁定邻区基站",
+                        onClick = { showCellLockDialog = true }
                     )
                 }
 
-                Spacer(Modifier.height(Spacing.Medium))
-                UfiPrimaryButton(
-                    text = "保存",
-                    onClick = {
-                        viewModel.setDhcpSetting(
-                            lanIp = lanIp,
-                            lanNetmask = lanNetmask,
-                            dhcpType = if (dhcpEnabled) "SERVER" else "DISABLE",
-                            dhcpStart = if (dhcpEnabled) dhcpStart else "",
-                            dhcpEnd = if (dhcpEnabled) dhcpEnd else "",
-                            dhcpLease = if (dhcpEnabled) dhcpLease else "86400"
+                Spacer(Modifier.height(Spacing.SectionTop))
+
+                // ═══════════ 3. 连接与共享 ═══════════
+                val wifi = remember(state.wifiSettings) { parseWifiSettings(state.wifiSettings) }
+                val clientsParsed = remember(state.wifiClients) { parseWifiClients(state.wifiClients) }
+                val allStations = remember(clientsParsed) {
+                    buildList {
+                        clientsParsed.stationList?.forEach { add(it) }
+                        clientsParsed.lanStationList?.forEach { add(it) }
+                    }
+                }
+
+                UfiSectionHeader(title = "连接与共享")
+                UfiSettingsGroup {
+                    // WiFi 热点 → 弹窗
+                    UfiNavigationItem(
+                        title = "WiFi 热点",
+                        description = if (state.wifiEnabled) {
+                            "${wifi.ssid.ifBlank { "未命名" }} · ${allStations.size} 台设备 · ${if (wifi.activeChip == "chip2") "5GHz" else "2.4GHz"}"
+                        } else "已关闭",
+                        onClick = { showWifiDialog = true }
+                    )
+                    UfiDivider()
+
+                    // DHCP 设置 → 弹窗
+                    UfiNavigationItem(
+                        title = "DHCP 设置",
+                        description = "局域网地址分配与租约配置",
+                        onClick = { showDhcpDialog = true }
+                    )
+                    UfiDivider()
+
+                    // 网络功能 → 弹窗
+                    UfiNavigationItem(
+                        title = "网络功能",
+                        description = "FOTA · USB 共享 · SAMBA · NFC",
+                        onClick = { showNetworkFeaturesDialog = true }
+                    )
+                }
+
+                Spacer(Modifier.height(Spacing.SectionTop))
+
+                // ═══════════ 4. 网速测试 ═══════════
+                val speedTestState by viewModel.speedTestState.collectAsState()
+                UfiSectionHeader(title = "网速测试")
+                UfiSettingsGroup {
+                    val lastResult = speedTestState.result?.take(60)
+                    UfiNavigationItem(
+                        title = "网速测试",
+                        description = lastResult ?: "内网/外网带宽测试 · 可自定义时长",
+                        onClick = { navController.navigate("detail/speed-test") }
+                    )
+                }
+
+                // ── 6 个弹窗实例 ──
+                NetworkModeDialog(viewModel, showNetworkModeDialog, onDismiss = { showNetworkModeDialog = false })
+                BandLockDialog(viewModel, showBandLockDialog, onDismiss = { showBandLockDialog = false })
+                WifiSettingsDialog(viewModel, showWifiDialog, onDismiss = { showWifiDialog = false })
+                ApnConfigDialog(viewModel, showApnDialog, onDismiss = { showApnDialog = false })
+                DhcpSettingsDialog(viewModel, showDhcpDialog, onDismiss = { showDhcpDialog = false })
+                CellLockDialog(viewModel, showCellLockDialog, onDismiss = { showCellLockDialog = false })
+                NetworkFeaturesDialog(viewModel, showNetworkFeaturesDialog, onDismiss = { showNetworkFeaturesDialog = false })
+
+                UfiLoadingBox(isLoading = state.isLoading) {}
+                Spacer(Modifier.height(Spacing.Large))
+            }
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════
+// 蜂窝网络状态主卡片
+// ═══════════════════════════════════════════════
+
+@Composable
+private fun CellularStatusCard(
+    state: com.ufi_axis.viewmodel.state.NetworkState,
+    currentBand: String? = null,
+    downlinkSpeed: String? = null
+) {
+    val palette = LocalResolvedPalette.current
+    val sig = state.signalInfo; val net = state.networkStatus; val sim = state.simInfo
+    val isConnected = net?.isCellularConnected == true
+    val rawRat = sig?.rat?.takeIf { it.isNotBlank() && it != "WiFi" } ?: net?.network_type?.takeIf { it.isNotBlank() && it != "WiFi" }
+    val operator = sig?.operator?.takeIf { it.isNotBlank() } ?: net?.operator?.takeIf { it.isNotBlank() } ?: "未知"
+    val networkTypeLabel = when {
+        rawRat == null -> if (isConnected) "已连接" else "未知"
+        rawRat.contains("5G", true) || rawRat.contains("NR", true) -> "5G"
+        rawRat.contains("4G", true) || rawRat.contains("LTE", true) -> "4G"
+        else -> rawRat
+    }
+    val rsrpVal = sig?.rsrp
+    val accentColor = if (isConnected) networkTypeColor(networkTypeLabel) else MaterialTheme.colorScheme.error
+
+    UfiSectionHeader(title = "蜂窝网络")
+
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        shape = UfiCardDefaults.shape,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        elevation = UfiCardDefaults.cardElevation(),
+        border = UfiCardDefaults.cardLightBorder()
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(
+                    shape = CircleShape,
+                    color = accentColor.copy(alpha = 0.12f),
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            if (isConnected) Icons.Default.SignalCellularAlt else Icons.Default.SignalCellularOff,
+                            contentDescription = null,
+                            modifier = Modifier.size(22.dp),
+                            tint = accentColor
                         )
                     }
-                )
+                }
+                Spacer(Modifier.width(14.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        if (isConnected) "已连接" else "未连接",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = accentColor
+                    )
+                    Text(
+                        text = operator,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.textSecondary,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Surface(
+                    color = accentColor.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(6.dp)
+                ) {
+                    Text(
+                        text = " $networkTypeLabel ",
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        color = accentColor,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Black
+                    )
+                }
             }
 
-            state.simInfo?.let { sim ->
-                UfiSettingsGroup {
-                    Text("SIM 卡", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(bottom = Spacing.Small))
-                    InfoRow("状态", sim.sim_state ?: "未知")
-                    InfoRow("类型", sim.phone_type ?: "未知")
-                    sim.imei?.let { InfoRow("IMEI", it) }
-                    sim.imsi?.let { InfoRow("IMSI", it) }
-                    Spacer(Modifier.height(8.dp))
-                    UfiButtonRow {
-                        OutlinedButton(onClick = { viewModel.switchSimSlot(1); viewModel.refreshNetwork() }, modifier = Modifier.weight(1f)) { Text("卡槽 1") }
-                        OutlinedButton(onClick = { viewModel.switchSimSlot(2); viewModel.refreshNetwork() }, modifier = Modifier.weight(1f)) { Text("卡槽 2") }
+            if (currentBand != null || downlinkSpeed != null) {
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    currentBand?.let { band ->
+                        Surface(
+                            color = accentColor.copy(alpha = 0.1f),
+                            shape = RoundedCornerShape(4.dp)
+                        ) {
+                            Text(
+                                text = band,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                color = accentColor,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                    }
+                    downlinkSpeed?.let { speed ->
+                        Text(
+                            text = "▼ ",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = accentColor,
+                        )
+                        Text(
+                            text = speed,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = palette.textSecondary,
+                            fontWeight = FontWeight.Medium
+                        )
                     }
                 }
             }
 
-            UfiSettingsGroup {
-                UfiNavigationItem(title = "短信", description = "查看和发送短信", onClick = { navController.navigate("detail/sms") })
+            if (rsrpVal != null) {
+                Spacer(Modifier.height(14.dp))
+                val bars = signalBars(rsrpVal)
+                val levelText = signalLevelText(rsrpVal)
+                val barColor = signalColor(rsrpVal)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("信号", style = MaterialTheme.typography.labelSmall, color = palette.textSecondary)
+                    Spacer(Modifier.width(8.dp))
+                    Row(Modifier.weight(1f), verticalAlignment = Alignment.Bottom) {
+                        for (i in 1..5) {
+                            val h = (14 + i * 5).dp
+                            Box(
+                                modifier = Modifier
+                                    .width(6.dp)
+                                    .height(h)
+                                    .padding(horizontal = 1.dp)
+                            ) {
+                                Surface(
+                                    modifier = Modifier.fillMaxSize(),
+                                    color = if (i <= bars) barColor else palette.textSecondary.copy(alpha = 0.15f),
+                                    shape = RoundedCornerShape(2.dp)
+                                ) {}
+                            }
+                        }
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "$rsrpVal dBm",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = barColor
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Surface(color = barColor.copy(alpha = 0.12f), shape = RoundedCornerShape(4.dp)) {
+                        Text(
+                            levelText,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = barColor
+                        )
+                    }
+                }
             }
 
-            UfiLoadingBox(isLoading = state.isLoading) {}
-            Spacer(Modifier.height(Spacing.Large))
+            if (sig != null) {
+                Spacer(Modifier.height(10.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    sig.rsrp?.let { UfiMetricBadge("RSRP", "${it}dBm", it, -120, -80, Modifier.weight(1f)) }
+                    Spacer(Modifier.width(8.dp))
+                    sig.sinr?.let { UfiMetricBadge("SNR", "${it}dB", it, 0, 20, Modifier.weight(1f)) }
+                    Spacer(Modifier.width(8.dp))
+                    sig.rsrq?.let { UfiMetricBadge("RSRQ", "${it}dB", it, -20, -10, Modifier.weight(1f)) }
+                }
+            }
+
+            if (sim != null) {
+                Spacer(Modifier.height(14.dp))
+                HorizontalDivider(color = palette.textSecondary.copy(alpha = 0.1f))
+                Spacer(Modifier.height(12.dp))
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.SimCard, null, Modifier.size(16.dp), tint = palette.textSecondary)
+                    Spacer(Modifier.width(8.dp))
+                    Text("SIM 卡", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = palette.textSecondary)
+                }
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    Column(Modifier.weight(1f)) {
+                        UfiLabelValueRow("运营商", sim.phone_type ?: "—")
+                        Spacer(Modifier.height(4.dp))
+                        sim.imei?.let { UfiLabelValueRow("IMEI", it) }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        UfiLabelValueRow("状态", sim.sim_state ?: "—")
+                        Spacer(Modifier.height(4.dp))
+                        sim.iccid?.let { UfiLabelValueRow("ICCID", it) }
+                    }
+                }
+            }
         }
     }
 }
+
+
+
+// ═══════════════════════════════════════════════
+// 频段锁定组件（被 BandLockDialog 复用）
+// ═══════════════════════════════════════════════
+
+@Composable
+fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.state.NetworkState) {
+    var selectedLte by remember { mutableStateOf(setOf<Int>()) }
+    var selectedNr by remember { mutableStateOf(setOf<Int>()) }
+    val supportLte = listOf(1, 3, 5, 8, 34, 38, 39, 40, 41)
+    val supportNr = listOf(1, 5, 8, 28, 41, 78)
+
+    LaunchedEffect(state.bandStatus) {
+        val parsed = com.ufi_axis.viewmodel.module.parseBandStatus(state.bandStatus)
+        selectedLte = parseBandSet(parsed.lteBandLock); selectedNr = parseBandSet(parsed.nrBandLock)
+    }
+
+    Column(Modifier.padding(16.dp)) {
+        UfiSectionGroupTitle("频段锁定", "锁定指定 LTE/NR 频段")
+        Text("LTE 频段", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        UfiIntChipSelector(values = supportLte, selectedValues = selectedLte, onToggle = { selectedLte = if (it in selectedLte) selectedLte - it else selectedLte + it }, prefix = "B")
+        Spacer(Modifier.height(12.dp))
+        Text("NR 频段", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+        UfiIntChipSelector(values = supportNr, selectedValues = selectedNr, onToggle = { selectedNr = if (it in selectedNr) selectedNr - it else selectedNr + it }, prefix = "N")
+        Spacer(Modifier.height(24.dp))
+        UfiButtonRow {
+            UfiPrimaryButton(text = "锁定所选", onClick = { viewModel.network.lockBands(if (selectedLte.isNotEmpty()) selectedLte.joinToString(",") else null, if (selectedNr.isNotEmpty()) selectedNr.joinToString(",") else null) }, modifier = Modifier.weight(1f))
+            UfiSecondaryButton(text = "全部解锁", onClick = { viewModel.network.lockBands(null, null); selectedLte = emptySet(); selectedNr = emptySet() }, modifier = Modifier.weight(1f))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════
+// 内部辅助函数
+// ═══════════════════════════════════════════════
+
+private suspend fun loadNetworkAll(viewModel: MainViewModel) {
+    viewModel.network.refreshNetwork()
+    viewModel.network.loadBandStatus()
+    viewModel.network.loadCellInfo()
+    viewModel.network.loadDeviceSettings()
+    viewModel.network.loadBlacklist()
+    viewModel.network.restoreWifiChipPreference()
+}
+
+private fun parseRoamingEnabled(settings: JsonElement?): Boolean {
+    val v = parseDeviceSettingsField(settings, "roam_setting_option", "dial_roam_setting_option") ?: return false
+    return v == "on" || v == "1"
+}
+
+private fun parseBandSet(raw: String?): Set<Int> = raw?.split(",")?.mapNotNull { it.trim().toIntOrNull() }?.toSet() ?: emptySet()

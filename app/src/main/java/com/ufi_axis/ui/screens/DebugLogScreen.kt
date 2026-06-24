@@ -23,12 +23,14 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavHostController
+import com.ufi_axis.ui.components.common.UfiLoadingIndicator
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
@@ -64,13 +66,24 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
         return state.logs.subList(start, (end + 1).coerceAtMost(state.logs.size))
     }
 
-    LaunchedEffect(Unit) { viewModel.loadDebugLogs() }
+    LaunchedEffect(Unit) { viewModel.tools.loadDebugLogs() }
 
-    // 自动刷新：每 3 秒拉取最新日志（始终开启）
+    // 自动刷新：仅在前台时每 3s 拉取，退到后台自动暂停
+    var isScreenActive by remember { mutableStateOf(true) }
+    // 使用 lifecycle-aware observer 监听前后台切换
+    val lifecycleOwner = remember { (context as? androidx.lifecycle.LifecycleOwner) }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            isScreenActive = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner?.lifecycle?.addObserver(observer)
+        onDispose { lifecycleOwner?.lifecycle?.removeObserver(observer) }
+    }
+
     LaunchedEffect(Unit) {
-        while (isActive) {
+        while (true) {
             delay(3000)
-            if (!selectionMode) viewModel.loadDebugLogs()
+            if (isScreenActive && !selectionMode) viewModel.tools.loadDebugLogs()
         }
     }
 
@@ -128,7 +141,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                         Icon(Icons.Default.FileDownload, "导出")
                     }
                 }
-                IconButton(onClick = { viewModel.loadDebugLogs() }) {
+                IconButton(onClick = { viewModel.tools.loadDebugLogs() }) {
                     Icon(Icons.Default.Refresh, "刷新")
                 }
                 Box {
@@ -151,7 +164,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                             text = { Text("清空日志") },
                             onClick = {
                                 showMenu = false
-                                viewModel.clearDebugLogs()
+                                viewModel.tools.clearDebugLogs()
                             },
                             leadingIcon = { Icon(Icons.Default.Delete, null) }
                         )
@@ -173,7 +186,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                     levels.forEach { (level, label) ->
                         FilterChip(
                             selected = state.filterLevel == level,
-                            onClick = { viewModel.setDebugLogFilter(level) },
+                            onClick = { viewModel.tools.setDebugLogFilter(level) },
                             label = { Text(label, fontSize = 12.sp) },
                             modifier = Modifier.height(28.dp)
                         )
@@ -202,7 +215,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
 
             if (state.isLoading && state.logs.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
+                    UfiLoadingIndicator()
                 }
             } else if (state.logs.isEmpty()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {

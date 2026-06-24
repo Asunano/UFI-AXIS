@@ -32,8 +32,6 @@ class UfiAxisRepository(private val api: UfiAxisApi) {
     suspend fun getNetworkStatus() = api.getNetworkStatus()
     suspend fun setMobileData(enabled: Boolean) = api.setMobileData(mapOf("enabled" to enabled))
     suspend fun setAirplaneMode(enabled: Boolean) = api.setAirplaneMode(mapOf("enabled" to enabled))
-    suspend fun setBandLock(rat: String, bands: String, action: String = "lock") =
-        api.setBandLock(mapOf("rat" to rat, "bands" to bands, "action" to action))
     suspend fun getBandStatus() = api.getBandStatus()
     suspend fun setNetworkMode(mode: String) = api.setNetworkMode(ModeRequest(mode))
 
@@ -41,7 +39,6 @@ class UfiAxisRepository(private val api: UfiAxisApi) {
     suspend fun getSimInfo() = api.getSimInfo()
     suspend fun sendSms(phone: String, message: String) = api.sendSms(SmsSendRequest(phone, message))
     suspend fun getSmsList(limit: Int = 100) = api.getSmsList(limit)
-    suspend fun sendUssd(code: String) = api.sendUssd(UssdRequest(code))
 
     // ========== AT ==========
     suspend fun sendAtCommand(command: String) = api.sendAtCommand(AtCommandRequest(command))
@@ -151,13 +148,6 @@ class UfiAxisRepository(private val api: UfiAxisApi) {
     suspend fun setLedEnabled(enabled: Boolean) = api.setLedEnabled(mapOf("enabled" to enabled))
     suspend fun setRoamingEnabled(enabled: Boolean) = api.setRoamingEnabled(mapOf("enabled" to enabled))
     suspend fun setUsbTethering(enabled: Boolean) = api.setUsbTethering(mapOf("enabled" to enabled))
-    suspend fun setSaMode(enabled: Boolean) = api.setSaMode(mapOf("enabled" to enabled))
-
-    // ========== VoLTE / VoNR ==========
-    suspend fun getVolteStatus(slot: Int = 0) = api.getVolteStatus(slot)
-    suspend fun setVolteStatus(enabled: Boolean, slot: Int = 0) = api.setVolteStatus(mapOf("enabled" to if (enabled) "1" else "0", "slot" to slot))
-    suspend fun getVonrStatus(slot: Int = 0) = api.getVonrStatus(slot)
-    suspend fun setVonrStatus(enabled: Boolean, slot: Int = 0) = api.setVonrStatus(mapOf("enabled" to if (enabled) "1" else "0", "slot" to slot))
 
     // ========== WiFi Enable ==========
     suspend fun setWifiEnabled(enabled: Boolean) = api.setWifiEnabled(mapOf("enabled" to enabled))

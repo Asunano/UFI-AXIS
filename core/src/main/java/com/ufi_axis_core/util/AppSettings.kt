@@ -22,8 +22,6 @@ class AppSettings(context: Context) {
         private const val KEY_SECRET = "auth_secret"
         private const val KEY_PORT = "server_port"
         private const val KEY_AUTO_START = "auto_start_on_boot"
-        private const val KEY_RATE_LIMIT_MAX = "rate_limit_max"
-        private const val KEY_RATE_LIMIT_WINDOW = "rate_limit_window_sec"
         private const val KEY_GOFORM_IP = "goform_ip"
         private const val KEY_GOFORM_PORT = "goform_port"
         private const val KEY_GOFORM_PASSWORD = "goform_password"
@@ -31,14 +29,15 @@ class AppSettings(context: Context) {
         private const val KEY_QOS_ENABLED = "qos_enabled"
         private const val KEY_QOS_SHELL_MAX = "qos_shell_max_concurrent"
         private const val KEY_QOS_CACHE_TTL = "qos_cache_ttl_ms"
+        private const val KEY_QOS_GOFORM_QUERY_MAX = "qos_goform_query_max"
+        private const val KEY_QOS_GOFORM_SET_MAX = "qos_goform_set_max"
+        private const val KEY_ADB_AUTO_START = "adb_auto_start_on_boot"
 
         // Defaults
         const val DEFAULT_TOKEN = "ufi-axis-default-token"
         const val DEFAULT_SECRET = "ufi-axis-default-secret"
         const val DEFAULT_PORT = 8088
         const val DEFAULT_AUTO_START = true
-        const val DEFAULT_RATE_LIMIT_MAX = 100
-        const val DEFAULT_RATE_LIMIT_WINDOW_SEC = 60
         const val DEFAULT_GOFORM_IP = "192.168.0.1"
         const val DEFAULT_GOFORM_PORT = 8080
         const val DEFAULT_GOFORM_PASSWORD = "admin"
@@ -46,6 +45,8 @@ class AppSettings(context: Context) {
         const val DEFAULT_QOS_ENABLED = true
         const val DEFAULT_QOS_SHELL_MAX = 3
         const val DEFAULT_QOS_CACHE_TTL = 2000
+        const val DEFAULT_QOS_GOFORM_QUERY_MAX = 4
+        const val DEFAULT_QOS_GOFORM_SET_MAX = 2
 
         @Volatile
         private var instance: AppSettings? = null
@@ -78,16 +79,6 @@ class AppSettings(context: Context) {
     var autoStartOnBoot: Boolean
         get() = prefs.getBoolean(KEY_AUTO_START, DEFAULT_AUTO_START)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_START, value).apply()
-
-    // --- Rate Limit ---
-
-    var rateLimitMax: Int
-        get() = prefs.getInt(KEY_RATE_LIMIT_MAX, DEFAULT_RATE_LIMIT_MAX)
-        set(value) = prefs.edit().putInt(KEY_RATE_LIMIT_MAX, value.coerceAtLeast(1)).apply()
-
-    var rateLimitWindowSec: Int
-        get() = prefs.getInt(KEY_RATE_LIMIT_WINDOW, DEFAULT_RATE_LIMIT_WINDOW_SEC)
-        set(value) = prefs.edit().putInt(KEY_RATE_LIMIT_WINDOW, value.coerceAtLeast(1)).apply()
 
     // --- Goform ---
 
@@ -123,6 +114,20 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_QOS_CACHE_TTL, DEFAULT_QOS_CACHE_TTL)
         set(value) = prefs.edit().putInt(KEY_QOS_CACHE_TTL, value.coerceIn(500, 30000)).apply()
 
+    var qosGoformQueryMax: Int
+        get() = prefs.getInt(KEY_QOS_GOFORM_QUERY_MAX, DEFAULT_QOS_GOFORM_QUERY_MAX)
+        set(value) = prefs.edit().putInt(KEY_QOS_GOFORM_QUERY_MAX, value.coerceIn(1, 8)).apply()
+
+    var qosGoformSetMax: Int
+        get() = prefs.getInt(KEY_QOS_GOFORM_SET_MAX, DEFAULT_QOS_GOFORM_SET_MAX)
+        set(value) = prefs.edit().putInt(KEY_QOS_GOFORM_SET_MAX, value.coerceIn(1, 4)).apply()
+
+    // --- ADB Auto-Start ---
+
+    var adbAutoStartOnBoot: Boolean
+        get() = prefs.getBoolean(KEY_ADB_AUTO_START, false)
+        set(value) = prefs.edit().putBoolean(KEY_ADB_AUTO_START, value).apply()
+
     // --- Helpers ---
 
     /** 将全部配置导出为 Map，供 API 返回 */
@@ -131,15 +136,16 @@ class AppSettings(context: Context) {
         "secret" to secret,
         "port" to port,
         "auto_start_on_boot" to autoStartOnBoot,
-        "rate_limit_max" to rateLimitMax,
-        "rate_limit_window_sec" to rateLimitWindowSec,
         "goform_ip" to goformIp,
         "goform_port" to goformPort,
         "goform_password" to goformPassword,
         "debug_mode" to debugMode,
         "qos_enabled" to qosEnabled,
         "qos_shell_max_concurrent" to qosShellMaxConcurrent,
-        "qos_cache_ttl_ms" to qosCacheTtlMs
+        "qos_cache_ttl_ms" to qosCacheTtlMs,
+        "qos_goform_query_max" to qosGoformQueryMax,
+        "qos_goform_set_max" to qosGoformSetMax,
+        "adb_auto_start_on_boot" to adbAutoStartOnBoot
     )
 
     /** 恢复全部默认值 */

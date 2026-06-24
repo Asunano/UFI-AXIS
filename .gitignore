@@ -29,3 +29,22 @@ local.properties
 # Generated
 .codebuddy/
 generated-images/
+
+# Temp / Scripts
+*.ps1
+*.txt
+build_err.txt
+
+# Reference projects
+UFI-TOOLS-REF/
+ufi-ui-kit/
+
+# Kotlin build cache
+.kotlin/
+
+# Gradle daemon
+gradle/gradle-daemon-jvm.properties
+
+# Fix scripts
+fix_*
+patch_*

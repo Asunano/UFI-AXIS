@@ -59,6 +59,12 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="设置"
+            android:theme="@style/Theme.UFIAXISCore" />
+
         <!-- 后端前台服务 -->
         <service
             android:name=".service.BackendService"

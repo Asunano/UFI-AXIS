@@ -12,6 +12,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -25,10 +26,13 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.util.FormatUtils
-import com.ufi_axis.viewmodel.DownloadConfigItem
-import com.ufi_axis.viewmodel.DownloadTaskItem
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.DownloadConfigItem
+import com.ufi_axis.viewmodel.state.DownloadState
+import com.ufi_axis.viewmodel.state.DownloadTaskItem
+import com.ufi_axis.viewmodel.state.DuplicateInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.text.SimpleDateFormat
@@ -41,15 +45,16 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.downloadState.collectAsState()
     var showNewDialog by remember { mutableStateOf(false) }
     var selectedTab by remember { mutableIntStateOf(0) }
+    var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
 
     // Smart polling: 2s when active downloads, 5s otherwise
     LaunchedEffect(Unit) {
-        viewModel.loadDownloads()
+        viewModel.downloads.loadDownloads()
         while (isActive) {
-            val hasActive = state.tasks.any { it.status == "downloading" || it.status == "pending" }
+            val hasActive = state.tasks.any { it.status in listOf("downloading", "pending", "meta") }
             delay(if (hasActive) 2000L else 5000L)
-            if (state.tasks.any { it.status == "downloading" || it.status == "pending" }) {
-                viewModel.loadDownloads()
+            if (state.tasks.any { it.status in listOf("downloading", "pending", "meta") }) {
+                viewModel.downloads.loadDownloads()
             }
         }
     }
@@ -59,38 +64,45 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
         navController = navController,
         showBack = true
     ) { padding ->
-        Column(
-            Modifier
-                .fillMaxSize()
-                .padding(padding)
-        ) {
-            // Tab row
-            PrimaryTabRow(
-                selectedTabIndex = selectedTab,
-                modifier = Modifier.fillMaxWidth()
+        Box(Modifier.fillMaxSize()) {
+            PullToRefreshBox(
+                isRefreshing = state.isLoading,
+                onRefresh = { viewModel.downloads.loadDownloads() },
+                modifier = Modifier.padding(padding).fillMaxSize()
             ) {
-                Tab(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    text = { Text("任务") },
-                    icon = { Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                )
-                Tab(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    text = { Text("设置") },
-                    icon = { Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp)) }
-                )
-            }
+                Column(Modifier.fillMaxSize()) {
+                    PrimaryTabRow(
+                        selectedTabIndex = selectedTab,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Tab(
+                            selected = selectedTab == 0,
+                            onClick = { selectedTab = 0 },
+                            text = { Text("任务") },
+                            icon = { Icon(Icons.Default.CloudDownload, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
+                        Tab(
+                            selected = selectedTab == 1,
+                            onClick = { selectedTab = 1 },
+                            text = { Text("设置") },
+                            icon = { Icon(Icons.Default.Settings, contentDescription = null, modifier = Modifier.size(18.dp)) }
+                        )
+                    }
 
-            state.errorMessage?.let { error ->
-                UfiErrorBanner(message = error)
-            }
+                    state.errorMessage?.let { error ->
+                        UfiErrorBanner(message = error)
+                    }
 
-            when (selectedTab) {
-                0 -> DownloadTasksTab(state, viewModel, showNewDialog = { showNewDialog = true })
-                1 -> DownloadSettingsTab(state, viewModel)
+                    when (selectedTab) {
+                        0 -> DownloadTasksTab(state, viewModel, showNewDialog = { showNewDialog = true }, toastMessage = { toastMessage = it })
+                        1 -> DownloadSettingsTab(state, viewModel)
+                    }
+                }
             }
+            UfiToastHost(
+                toastMessage = toastMessage,
+                onDismiss = { toastMessage = null }
+            )
         }
     }
 
@@ -99,9 +111,26 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
             config = state.config,
             onDismiss = { showNewDialog = false },
             onConfirm = { url, fileName, savePath, speedLimit, connections ->
-                viewModel.createDownload(url, fileName, savePath, speedLimit, connections)
+                viewModel.downloads.createDownload(url, fileName, savePath, speedLimit, connections)
                 showNewDialog = false
             }
+        )
+    }
+
+    state.duplicateInfo?.let { info ->
+        UfiAlertDialog(
+            title = "重复下载",
+            text = "已有相同下载记录「${info.existingTask.fileName.ifBlank { info.existingTask.url.substringAfterLast("/") }}」（${info.existingTask.status}，${FormatUtils.formatBytes(info.existingTask.totalSize)}），是否将文件另存为「${info.suggestedFileName}」继续下载？",
+            confirmText = "另存为",
+            onConfirm = {
+                viewModel.downloads.createDownloadForce(
+                    url = info.newUrl, fileName = info.suggestedFileName,
+                    savePath = info.savePath, speedLimit = info.speedLimit, connections = info.connections
+                )
+            },
+            dismissText = "取消",
+            onDismissAction = { viewModel.downloads.dismissDuplicate() },
+            onDismiss = { viewModel.downloads.dismissDuplicate() }
         )
     }
 }
@@ -110,15 +139,18 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
 
 @Composable
 private fun DownloadTasksTab(
-    state: com.ufi_axis.viewmodel.DownloadState,
+    state: DownloadState,
     viewModel: MainViewModel,
-    showNewDialog: () -> Unit
+    showNewDialog: () -> Unit,
+    toastMessage: (ToastMessage) -> Unit = {}
 ) {
     val activeTasks = state.tasks.filter {
-        it.status == "downloading" || it.status == "pending" || it.status == "paused" || it.status == "error"
+        it.status == "downloading" || it.status == "pending" || it.status == "paused" || it.status == "error" || it.status == "meta"
     }
+    val failedTasks = state.tasks.filter { it.status == "error" }
     val completedTasks = state.tasks.filter { it.status == "completed" }
     val hasCompleted = completedTasks.isNotEmpty()
+    var showBatchDeleteConfirm by remember { mutableStateOf(false) }
 
     Column(Modifier.fillMaxSize()) {
         // Action bar
@@ -138,14 +170,41 @@ private fun DownloadTasksTab(
                     onClick = showNewDialog,
                     modifier = Modifier.weight(1f)
                 )
+                if (failedTasks.isNotEmpty()) {
+                    UfiSecondaryButton(
+                        text = "重试失败",
+                        onClick = {
+                            failedTasks.forEach { viewModel.downloads.retryDownload(it.id) }
+                            toastMessage(ToastMessage("已重试 ${failedTasks.size} 个失败任务", ToastType.INFO))
+                        },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
                 if (hasCompleted) {
                     UfiSecondaryButton(
                         text = "清除已完成",
-                        onClick = { viewModel.clearCompletedDownloads() },
+                        onClick = { showBatchDeleteConfirm = true },
                         modifier = Modifier.weight(1f)
                     )
                 }
             }
+        }
+
+        // 批量删除确认
+        if (showBatchDeleteConfirm) {
+            UfiConfirmDialog(
+                title = "清除已完成",
+                text = "确定删除所有 ${completedTasks.size} 个已完成任务${if (completedTasks.any { it.savePath.isNotBlank() }) "及下载文件？\n如需保留文件，请在单个任务中删除" else "？"}",
+                confirmText = "全部删除",
+                onConfirm = {
+                    showBatchDeleteConfirm = false
+                    val count = completedTasks.size
+                    viewModel.downloads.clearCompletedDownloads()
+                    toastMessage(ToastMessage("已清除 $count 个任务", ToastType.SUCCESS))
+                },
+                onDismiss = { showBatchDeleteConfirm = false },
+                destructive = true
+            )
         }
 
         // aria2 status bar
@@ -189,7 +248,7 @@ private fun DownloadTasksTab(
                 // Throttle badge
                 if (state.throttleState != "normal") {
                     Surface(
-                        shape = RoundedCornerShape(4.dp),
+                        shape = UfiCardDefaults.smallShape,
                         color = when (state.throttleState) {
                             "stopped", "critical" -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.6f)
                             "warning" -> MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.6f)
@@ -299,93 +358,63 @@ private fun DownloadTaskCard(
     viewModel: MainViewModel,
     isCompleted: Boolean
 ) {
-    val statusColor = when (task.status) {
-        "downloading" -> MaterialTheme.colorScheme.primary
-        "paused" -> MaterialTheme.colorScheme.tertiary
-        "error" -> MaterialTheme.colorScheme.error
-        "completed" -> MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
-        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    val statusBadgeType = when (task.status) {
+        "downloading" -> UfiBadgeType.INFO
+        "meta" -> UfiBadgeType.WARNING
+        "paused" -> UfiBadgeType.DEFAULT
+        "pending" -> UfiBadgeType.DEFAULT
+        "error" -> UfiBadgeType.ERROR
+        "completed" -> UfiBadgeType.SUCCESS
+        else -> UfiBadgeType.DEFAULT
     }
     val statusLabel = when (task.status) {
         "downloading" -> "下载中"
+        "meta" -> "获取种子"
         "paused" -> "已暂停"
         "pending" -> "等待中"
         "error" -> "失败"
         "completed" -> "已完成"
         else -> task.status
     }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var deleteWithFile by remember { mutableStateOf(false) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp)
+        shape = UfiCardDefaults.legacyShape
     ) {
-        Column(
-            modifier = Modifier.padding(12.dp)
-        ) {
-            // Row 1: Protocol badge + File name + Status
+        Column(modifier = Modifier.padding(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Protocol badge
-                Surface(
-                    shape = RoundedCornerShape(3.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant
-                ) {
-                    Text(
-                        task.protocol.uppercase(),
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Medium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                UfiBadge(text = task.protocol.uppercase(), type = UfiBadgeType.DEFAULT)
                 Spacer(Modifier.width(6.dp))
-                // File name
                 Column(Modifier.weight(1f)) {
                     Text(
                         task.fileName.ifBlank { task.url.substringAfterLast("/").take(40) },
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
                 }
                 Spacer(Modifier.width(6.dp))
-                // Status badge
-                Surface(
-                    shape = RoundedCornerShape(4.dp),
-                    color = statusColor.copy(alpha = 0.12f)
-                ) {
-                    Text(
-                        statusLabel,
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Medium,
-                        color = statusColor
-                    )
-                }
+                UfiBadge(text = statusLabel, type = statusBadgeType)
             }
 
-            // Progress bar
-            if (task.status == "downloading" || task.status == "paused" || task.status == "pending") {
+            if (task.status in listOf("downloading", "paused", "pending", "meta")) {
                 Spacer(Modifier.height(8.dp))
+                if (task.status == "meta") {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        CircularProgressIndicator(modifier = Modifier.size(12.dp), strokeWidth = 2.dp, color = Color(0xFFE65100))
+                        Text("获取种子信息中...", style = MaterialTheme.typography.labelSmall, color = Color(0xFFE65100))
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
                 if (task.progress >= 0f && task.totalSize > 0) {
-                    LinearProgressIndicator(
-                        progress = { task.progress },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(2.dp)),
-                    )
+                    UfiCompactProgressBar(progress = task.progress)
                 } else {
-                    LinearProgressIndicator(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(2.dp)),
-                    )
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(3.dp).clip(UfiCardDefaults.microShape))
                 }
             }
 
-            // Size / speed / aria2 info
             Spacer(Modifier.height(6.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -394,105 +423,63 @@ private fun DownloadTaskCard(
             ) {
                 val sizeText = buildString {
                     append(FormatUtils.formatBytes(task.downloadedBytes))
-                    if (task.totalSize > 0) {
-                        append(" / ${FormatUtils.formatBytes(task.totalSize)}")
-                    }
-                    if (task.progress >= 0f && task.totalSize > 0) {
-                        append("  (${(task.progress * 100).toInt()}%)")
-                    }
+                    if (task.totalSize > 0) append(" / ${FormatUtils.formatBytes(task.totalSize)}")
+                    if (task.progress >= 0f && task.totalSize > 0) append("  (${(task.progress * 100).toInt()}%)")
                 }
-                Text(
-                    sizeText,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                // Speed info
+                Text(sizeText, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (task.speed > 0 && task.status == "downloading") {
-                        Text(
-                            "${FormatUtils.formatBytes(task.speed)}/s ↓",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Medium,
-                            color = MaterialTheme.colorScheme.primary
-                        )
+                        Text("${FormatUtils.formatBytes(task.speed)}/s ↓", style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.primary)
                     }
                     if (task.uploadSpeed > 0) {
-                        Text(
-                            "${FormatUtils.formatBytes(task.uploadSpeed)}/s ↑",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Medium,
-                            color = Color(0xFFE65100)
-                        )
+                        Text("${FormatUtils.formatBytes(task.uploadSpeed)}/s ↑", style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium, color = Color(0xFFE65100))
                     }
                 }
             }
 
-            // P2P details (connections, seeders)
             if (task.status == "downloading") {
                 Spacer(Modifier.height(4.dp))
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (task.connections > 0) {
-                        Text(
-                            "连接: ${task.connections}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-                        )
-                    }
-                    if (task.seeders > 0) {
-                        Text(
-                            "做种: ${task.seeders}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
-                        )
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (task.connections > 0) Text("连接: ${task.connections}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
+                    if (task.seeders > 0) Text("做种: ${task.seeders}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
                 }
             }
 
-            // Error message
             if (task.status == "error" && task.error != null) {
                 Spacer(Modifier.height(4.dp))
-                Text(
-                    task.error!!,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.error,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Text(task.error!!, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
 
-            // Action buttons
             Spacer(Modifier.height(6.dp))
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                 when (task.status) {
-                    "downloading" -> {
-                        SmallIconButton(Icons.Default.Pause, "暂停") { viewModel.pauseDownload(task.id) }
-                    }
-                    "paused", "error" -> {
-                        SmallIconButton(Icons.Default.PlayArrow, "继续") { viewModel.resumeDownload(task.id) }
-                    }
+                    "downloading", "meta" -> SmallIconButton(Icons.Default.Pause, "暂停") { viewModel.downloads.pauseDownload(task.id) }
+                    "paused", "error" -> SmallIconButton(Icons.Default.PlayArrow, "继续") { viewModel.downloads.resumeDownload(task.id) }
                 }
-                SmallIconButton(Icons.Default.Delete, "删除",
-                    tint = MaterialTheme.colorScheme.error
-                ) { viewModel.deleteDownload(task.id, deleteFile = false) }
+                if (task.status == "error") {
+                    SmallIconButton(Icons.Default.Refresh, "重试", tint = Color(0xFFFF9800)) { viewModel.downloads.retryDownload(task.id) }
+                }
+                SmallIconButton(Icons.Default.ContentCopy, "复制链接", tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)) { viewModel.downloads.copyLinkToClipboard(task.url) }
+                SmallIconButton(Icons.Default.Delete, "删除", tint = MaterialTheme.colorScheme.error) { showDeleteConfirm = true }
                 if (isCompleted) {
-                    SmallIconButton(Icons.Default.DeleteForever, "删除文件",
-                        tint = MaterialTheme.colorScheme.error
-                    ) { viewModel.deleteDownload(task.id, deleteFile = true) }
+                    SmallIconButton(Icons.Default.DeleteForever, "删除文件", tint = MaterialTheme.colorScheme.error) { deleteWithFile = true; showDeleteConfirm = true }
                 }
                 Spacer(Modifier.weight(1f))
-                Text(
-                    task.savePath.substringBeforeLast("/"),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.widthIn(max = 150.dp)
+                Text(task.savePath.substringBeforeLast("/"), style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f), maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.widthIn(max = 150.dp))
+            }
+
+            if (showDeleteConfirm) {
+                UfiConfirmDialog(
+                    title = if (deleteWithFile) "删除任务及文件" else "删除任务",
+                    text = if (deleteWithFile) "确定要删除「${task.fileName.ifBlank { task.url.take(30) }}」及其下载文件吗？此操作不可撤销。" else "确定要删除下载任务「${task.fileName.ifBlank { task.url.take(30) }}」吗？",
+                    confirmText = "删除",
+                    onConfirm = { viewModel.downloads.deleteDownload(task.id, deleteFile = deleteWithFile); showDeleteConfirm = false; deleteWithFile = false },
+                    onDismiss = { showDeleteConfirm = false; deleteWithFile = false },
+                    destructive = true
                 )
             }
         }
@@ -504,7 +491,7 @@ private fun DownloadTaskCard(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun DownloadSettingsTab(
-    state: com.ufi_axis.viewmodel.DownloadState,
+    state: DownloadState,
     viewModel: MainViewModel
 ) {
     var config by remember(state.config) { mutableStateOf(state.config) }
@@ -713,7 +700,7 @@ private fun DownloadSettingsTab(
                     Spacer(Modifier.weight(1f))
                     TextButton(
                         onClick = {
-                            viewModel.validatePath(config.saveDir) { result ->
+                            viewModel.downloads.validatePath(config.saveDir) { result ->
                                 // Validation result handled via state update
                             }
                         },
@@ -992,7 +979,7 @@ private fun DownloadSettingsTab(
                 Spacer(Modifier.height(8.dp))
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp),
+                    shape = UfiCardDefaults.inputShape,
                     color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f)
                 ) {
                     Column(modifier = Modifier.padding(10.dp)) {
@@ -1033,14 +1020,14 @@ private fun DownloadSettingsTab(
                 Spacer(Modifier.height(8.dp))
                 UfiSecondaryButton(
                     text = if (state.trackerRefreshing) "刷新中…" else "立即刷新",
-                    onClick = { viewModel.refreshTrackers() },
+                    onClick = { viewModel.downloads.refreshTrackers() },
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(6.dp))
                 UfiSecondaryButton(
                     text = "编辑 Tracker 列表",
                     onClick = {
-                        viewModel.loadTrackers()
+                        viewModel.downloads.loadTrackers()
                         showTrackerEditDialog = true
                     },
                     modifier = Modifier.fillMaxWidth()
@@ -1182,7 +1169,7 @@ private fun DownloadSettingsTab(
                     Spacer(Modifier.height(8.dp))
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
+                        shape = UfiCardDefaults.inputShape,
                         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
@@ -1235,7 +1222,7 @@ private fun DownloadSettingsTab(
                             // Stopped level
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Surface(
-                                    shape = RoundedCornerShape(2.dp),
+                                    shape = UfiCardDefaults.microShape,
                                     color = MaterialTheme.colorScheme.error,
                                     modifier = Modifier.size(8.dp)
                                 ) {}
@@ -1261,7 +1248,7 @@ private fun DownloadSettingsTab(
                     Spacer(Modifier.height(8.dp))
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(8.dp),
+                        shape = UfiCardDefaults.inputShape,
                         color = when (state.throttleState) {
                             "stopped" -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f)
                             "critical" -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
@@ -1352,7 +1339,7 @@ private fun DownloadSettingsTab(
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(Spacing.CardCorner),
+                shape = UfiCardDefaults.legacyShape,
                 colors = CardDefaults.cardColors(
                     containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
                 )
@@ -1382,7 +1369,7 @@ private fun DownloadSettingsTab(
                 UfiPrimaryButton(
                     text = "保存配置",
                     onClick = {
-                        viewModel.updateDownloadConfig(config)
+                        viewModel.downloads.updateDownloadConfig(config)
                         hasChanges = false
                     },
                     modifier = Modifier.fillMaxWidth()
@@ -1409,7 +1396,7 @@ private fun DownloadSettingsTab(
             isLoading = state.trackerListLoading,
             onDismiss = { showTrackerEditDialog = false },
             onSave = { trackers ->
-                viewModel.saveTrackerList(trackers)
+                viewModel.downloads.saveTrackerList(trackers)
                 showTrackerEditDialog = false
             }
         )
@@ -1656,7 +1643,7 @@ private fun NewDownloadDialog(
                     trailingIcon = {
                         if (detectedProtocol != null) {
                             Surface(
-                                shape = RoundedCornerShape(3.dp),
+                                shape = UfiCardDefaults.smallShape,
                                 color = Color(0xFFE65100).copy(alpha = 0.12f)
                             ) {
                                 Text(

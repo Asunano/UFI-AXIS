@@ -17,6 +17,10 @@ class ProxyRoutes(private val targetIp: String, private val targetPort: Int = 80
     private val client = HttpClient(CIO) { engine { requestTimeout = 30000 }; expectSuccess = false }
     private val targetBase: String get() = if (targetPort == 80) "http://$targetIp" else "http://$targetIp:$targetPort"
 
+    fun close() {
+        try { client.close() } catch (_: Exception) {}
+    }
+
     fun register(route: Route) {
         route.route("/proxy") {
             get("/goform/{rest...}") { handleProxy(call) }

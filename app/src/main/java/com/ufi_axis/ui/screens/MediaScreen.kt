@@ -26,6 +26,7 @@ import androidx.media3.ui.PlayerView
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 import java.net.URLEncoder
@@ -186,7 +187,7 @@ fun MediaScreen(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Surface(
-                        shape = RoundedCornerShape(6.dp),
+                        shape = UfiCardDefaults.chipShape,
                         color = MaterialTheme.colorScheme.primaryContainer,
                         modifier = Modifier.size(32.dp)
                     ) {

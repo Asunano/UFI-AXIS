@@ -1,6 +1,8 @@
 package com.ufi_axis_core.api.routes
 
+import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
@@ -13,7 +15,9 @@ import kotlinx.serialization.json.*
 
 class WifiRoutes(
     private val goformClient: GoformClient,
-    private val networkController: NetworkController
+    private val wifiClient: GoformWifiClient,
+    private val networkController: NetworkController,
+    private val dataHub: DataHub? = null
 ) {
     fun register(route: Route) {
         route.route("/wifi") {
@@ -21,7 +25,8 @@ class WifiRoutes(
             post("/enable") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setWifiEnabled(enabled)
+                val success = wifiClient.setWifiEnabled(enabled)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -34,6 +39,7 @@ class WifiRoutes(
                     return@post
                 }
                 val success = networkController.setWifiSSID(ssid, password)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "ssid" to ssid)))
             }
@@ -46,6 +52,7 @@ class WifiRoutes(
                     return@post
                 }
                 val success = networkController.setWifiPassword(password)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -60,7 +67,8 @@ class WifiRoutes(
                 val maxStaNum = p["max_sta_num"]?.jsonPrimitive?.intOrNull
                 val broadcastDisabled = p["broadcast_disabled"]?.jsonPrimitive?.intOrNull
                 val chipIndex = p["chip_index"]?.jsonPrimitive?.contentOrNull
-                val success = goformClient.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                val success = wifiClient.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -72,7 +80,8 @@ class WifiRoutes(
                 val bandwidth = p["bandwidth"]?.jsonPrimitive?.intOrNull
                 val mode = p["mode"]?.jsonPrimitive?.contentOrNull
                 val countryCode = p["country_code"]?.jsonPrimitive?.contentOrNull
-                val success = goformClient.setWifiAdvConfig(channel, bandwidth, mode, countryCode)
+                val success = wifiClient.setWifiAdvConfig(channel, bandwidth, mode, countryCode)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -85,7 +94,8 @@ class WifiRoutes(
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "level must be 0-2")))
                     return@post
                 }
-                val success = goformClient.setWifiPower(level)
+                val success = wifiClient.setWifiPower(level)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "level" to level)))
             }
@@ -96,101 +106,26 @@ class WifiRoutes(
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull
                 val ssid = p["ssid"]?.jsonPrimitive?.contentOrNull
                 val authMode = p["auth_mode"]?.jsonPrimitive?.contentOrNull
-                val success = goformClient.setWifiGuest(enabled, ssid, authMode)
+                val success = wifiClient.setWifiGuest(enabled, ssid, authMode)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
 
             get("/settings") {
-                val settings = goformClient.getWifiSettings()
-                val moduleInfo = try { goformClient.getWifiModuleInfo() } catch (e: Exception) {
-                    AppLogger.w("WifiRoutes", "getWifiModuleInfo failed: ${e.message}")
-                    null
+                val dh = dataHub
+                if (dh == null) {
+                    call.respond(HttpStatusCode.ServiceUnavailable,
+                        toJsonElement(mapOf("error" to "DataHub not available")))
+                    return@get
                 }
-
-                val result = mutableMapOf<String, JsonElement>()
-                settings?.forEach { (key, value) -> result[key] = value }
-
-                if (moduleInfo != null) {
-                    moduleInfo["WiFiModuleSwitch"]?.let { result["WiFiModuleSwitch"] = it }
-
-                    val responseList = moduleInfo["ResponseList"]?.jsonArray
-                    AppLogger.i("WifiRoutes", "ResponseList size=${responseList?.size ?: 0}")
-
-                    if (responseList != null && responseList.isNotEmpty()) {
-                        val allAps = responseList.mapNotNull {
-                            try { it.jsonObject } catch (_: Exception) { null }
-                        }
-
-                        // 优先找到当前活跃的 AP (AccessPointSwitchStatus == "1")
-                        val activeAp = allAps.firstOrNull {
-                            it["AccessPointSwitchStatus"]?.jsonPrimitive?.contentOrNull == "1"
-                        } ?: allAps.firstOrNull()
-
-                        if (activeAp != null) {
-                            activeAp["SSID"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_chip1_ssid1_ssid"] = JsonPrimitive(it)
-                            }
-
-                            // Password: Base64 解码后返回明文
-                            // 修复: 如果 activeAp 密码为空，尝试从其他 AP 获取（设备可能只在特定 chip 上返回密码）
-                            val activePwd = activeAp["Password"]?.jsonPrimitive?.contentOrNull
-                            val effectivePwd = if (!activePwd.isNullOrBlank()) activePwd
-                                else allAps.firstNotNullOfOrNull {
-                                    it["Password"]?.jsonPrimitive?.contentOrNull?.takeIf { pwd -> pwd.isNotBlank() }
-                                }
-                            if (!effectivePwd.isNullOrBlank()) {
-                                result["wifi_chip1_ssid1_passphrase"] =
-                                    JsonPrimitive(goformClient.base64Decode(effectivePwd))
-                            }
-
-                            activeAp["ChipIndex"]?.jsonPrimitive?.contentOrNull?.let { chipIdx ->
-                                result["wifi_chip"] = JsonPrimitive(
-                                    if (chipIdx == "0") "chip1" else "chip2"
-                                )
-                            }
-
-                            activeAp["AuthMode"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_chip1_ssid1_auth_mode"] = JsonPrimitive(it)
-                            }
-                            activeAp["EncrypType"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_chip1_ssid1_encryp_type"] = JsonPrimitive(it)
-                            }
-                            activeAp["ApMaxStationNumber"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_chip1_ssid1_max_sta_num"] = JsonPrimitive(it)
-                            }
-                            activeAp["ApBroadcastDisabled"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_chip1_ssid1_broadcast_ssid"] = JsonPrimitive(it)
-                            }
-                        }
-
-                        // 额外返回每个 chip 的数据（用于频段切换时显示正确信息）
-                        allAps.forEach { ap ->
-                            val chipIdx = ap["ChipIndex"]?.jsonPrimitive?.contentOrNull ?: return@forEach
-                            val prefix = if (chipIdx == "0") "chip1" else "chip2"
-                            ap["SSID"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_${prefix}_ssid"] = JsonPrimitive(it)
-                            }
-                            ap["Password"]?.jsonPrimitive?.contentOrNull?.let { b64pwd ->
-                                if (b64pwd.isNotBlank()) {
-                                    result["wifi_${prefix}_passphrase"] = JsonPrimitive(goformClient.base64Decode(b64pwd))
-                                }
-                            }
-                            ap["AccessPointSwitchStatus"]?.jsonPrimitive?.contentOrNull?.let {
-                                result["wifi_${prefix}_active"] = JsonPrimitive(it == "1")
-                            }
-                        }
-                    }
-                } else {
-                    AppLogger.w("WifiRoutes", "moduleInfo is null, relying on flat fields only")
-                }
-
-                call.respond(toJsonElement(result))
+                val merged = dh.getWifiSettingsMerged(goformClient::base64Decode)
+                call.respond(toJsonElement(merged))
             }
 
             // WiFi 模块详细信息（包含 AuthMode/EncrypType/Password 等，与参考项目一致）
             get("/module-info") {
-                val info = goformClient.getWifiModuleInfo()
+                val info = wifiClient.getWifiModuleInfo()
                 call.respond(toJsonElement(info ?: emptyMap<String, Any>()))
             }
 
@@ -203,7 +138,8 @@ class WifiRoutes(
                         toJsonElement(mapOf("error" to "chip must be chip1 or chip2")))
                     return@post
                 }
-                val success = goformClient.switchWifiChip(chip)
+                val success = wifiClient.switchWifiChip(chip)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "chip" to chip)))
             }
@@ -212,7 +148,8 @@ class WifiRoutes(
             post("/nfc") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setWifiNfc(enabled)
+                val success = wifiClient.setWifiNfc(enabled)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -221,13 +158,20 @@ class WifiRoutes(
             post("/sleep") {
                 val p = call.receive<JsonObject>()
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "0"
-                val success = goformClient.setWifiSleep(time)
+                val success = wifiClient.setWifiSleep(time)
+                if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "time" to time)))
             }
 
             get("/clients") {
-                val clients = goformClient.getConnectedClients()
+                val dh = dataHub
+                if (dh == null) {
+                    call.respond(HttpStatusCode.ServiceUnavailable,
+                        toJsonElement(mapOf("error" to "DataHub not available")))
+                    return@get
+                }
+                val clients = dh.wifiQuery { getConnectedClients() }
                 call.respond(toJsonElement(clients ?: emptyMap<String, Any>()))
             }
         }

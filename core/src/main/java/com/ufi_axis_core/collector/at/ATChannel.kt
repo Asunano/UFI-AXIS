@@ -4,8 +4,10 @@ import android.content.Context
 import android.os.Build
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
+import com.ufi_axis_core.util.ShellQoS
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * AT 指令通道 — 通过 Android service call (Binder IPC) 直接与 Unisoc modem 通信
@@ -26,35 +28,51 @@ class ATChannel(private val context: Context) {
     private var connected: Boolean = false
     val isConnected: Boolean get() = connected
 
+    // ── 限流 & 退避 ──
+    // 最小命令间隔 500ms，防止连续 AT 命令压垮 modem
+    private val minCommandIntervalMs = 500L
+    private var lastCommandTime: Long = 0L
+    // 连续失败计数（用于指数退避）
+    private var consecutiveFailures = 0
+    private val maxBackoffMs = 30_000L
+    // 最大连续失败次数，超过后禁用 AT 通道，需外部重新 init()
+    private val maxConsecutiveFailures = 20
+    @Volatile var isDisabled: Boolean = false
+
+    // ── Mutex 超时保护：防止 sendCommand/init 无限阻塞 ──
+    val isLocked: Boolean get() = mutex.isLocked
+
+    companion object {
+        const val MUTEX_WAIT_TIMEOUT_MS = 10_000L   // sendCommand 等待 mutex 超时
+    }
+
+    // ── service call Binder IPC 防抖 ──
+    // 每次 service call 可能触发 sprd_ipc_probe 驱动重新加载 /class/smem，
+    // 在高频调用下（如每 3s 2 次）会触发 kobject_add_internal -EEXIST 内核 panic。
+    // 最小 service call 间隔 15s，防止内核驱动竞态。
+    private val minServiceCallIntervalMs = 15_000L
+    private var lastServiceCallTime: Long = 0L
+
     /**
-     * 初始化 AT 通道：
-     * 1. 探测设备平台
-     * 2. 发送 AT 测试指令验证连通性
+     * 初始化 AT 通道：探测设备平台，标记通道可用
      */
-    suspend fun init(): Boolean = mutex.withLock {
-        AppLogger.i(tag, "Initializing AT channel (service call mode)...")
-
-        // 探测平台
+    suspend fun init(): Boolean {
         platform = detectPlatform()
-        AppLogger.i(tag, "Detected platform: $platform, API level: ${Build.VERSION.SDK_INT}")
-
-        // 测试 AT 通道
-        connected = true // 临时设为 true 以便测试
-        val testOk = sendCommandInternal("AT")?.contains("OK") == true
-        if (!testOk) {
-            AppLogger.w(tag, "AT init test failed")
-            connected = false
-        } else {
-            AppLogger.i(tag, "AT channel ready ($platform)")
-        }
-        testOk
+        connected = true
+        AppLogger.i(tag, "AT channel ready ($platform, API ${Build.VERSION.SDK_INT})")
+        return true
     }
 
     /**
      * 发送 AT 指令并返回响应文本
      */
-    suspend fun sendCommand(command: String, timeoutMs: Long = 3000): String? = mutex.withLock {
-        sendCommandInternal(command, timeoutMs)
+    suspend fun sendCommand(command: String, timeoutMs: Long = 3000): String? = withTimeoutOrNull(MUTEX_WAIT_TIMEOUT_MS) {
+        mutex.withLock {
+            sendCommandInternal(command, timeoutMs)
+        }
+    } ?: run {
+        AppLogger.w(tag, "sendCommand('$command') timed out waiting for mutex (${MUTEX_WAIT_TIMEOUT_MS}ms)")
+        null
     }
 
     /**
@@ -63,19 +81,68 @@ class ATChannel(private val context: Context) {
      *
      * 根据 Android API 等级构造 service call 命令，通过 root shell 执行，
      * 然后将 hex word 输出解析为可读文本。
+     *
+     * 限流策略：
+     * - 最小命令间隔 200ms，防止连续 AT 压垮 modem
+     * - 连续失败时指数退避（1→2→4→8...最多 10s）
+     * - 成功后重置退避计数
      */
     private suspend fun sendCommandInternal(command: String, timeoutMs: Long = 3000): String? {
+        // ── 熔断：连续失败过多，禁用 AT 通道 ──
+        if (isDisabled) {
+            AppLogger.w(tag, "AT channel disabled due to $consecutiveFailures consecutive failures")
+            return null
+        }
+
+        // ── 限流：确保命令间隔 ≥ minCommandIntervalMs ──
+        val elapsed = System.currentTimeMillis() - lastCommandTime
+        if (elapsed < minCommandIntervalMs) {
+            kotlinx.coroutines.delay(minCommandIntervalMs - elapsed)
+        }
+
+        // ── service call 防抖：两次 Binder IPC ≥ 15s，防止 sprd_ipc_probe 驱动竞态 ──
+        val scElapsed = System.currentTimeMillis() - lastServiceCallTime
+        if (scElapsed < minServiceCallIntervalMs) {
+            val waitMs = minServiceCallIntervalMs - scElapsed
+            AppLogger.d(tag, "service call cooldown: waiting ${waitMs}ms (min interval=${minServiceCallIntervalMs}ms)")
+            kotlinx.coroutines.delay(waitMs)
+        }
+
+        // ── 退避：连续失败时等待更长时间 ──
+        if (consecutiveFailures > 0) {
+            val backoff = (1L shl (consecutiveFailures - 1).coerceAtMost(6)) * 500L
+                .coerceAtMost(maxBackoffMs)
+            kotlinx.coroutines.delay(backoff)
+        }
+
         AppLogger.at("TX", command)
         try {
             val shellCmd = buildServiceCallCommand(command, slot = 0)
-            val result = ShellExecutor.executeAsRoot(shellCmd, timeoutMs + 500)
+            // 必须通过 ShellQoS 执行 — service call 会触发 sprd_ipc_probe 驱动，
+            // 直接调用 ShellExecutor 绕过 root 信号量限流，并发时导致内核 panic
+            val result = ShellQoS.executeAsRoot(shellCmd, timeoutMs + 500)
             val rawText = parseServiceCallHex(result.stdout)
             val response = parseATResponse(rawText)
+
+            // 成功 → 重置退避计数
+            consecutiveFailures = 0
             AppLogger.at("RX", command, response ?: "ERROR")
             return response
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // 取消不递增失败计数，防止误触发熔断禁用 AT 通道
+            throw e
         } catch (e: Exception) {
-            AppLogger.e(tag, "AT sendCommand failed", e)
+            consecutiveFailures++
+            // ── 熔断：连续失败超过上限 → 禁用 AT 通道 ──
+            if (consecutiveFailures >= maxConsecutiveFailures) {
+                isDisabled = true
+                AppLogger.e(tag, "AT channel DISABLED after $consecutiveFailures consecutive failures")
+            }
+            AppLogger.e(tag, "AT sendCommand failed (failure #$consecutiveFailures)", e)
             return null
+        } finally {
+            lastCommandTime = System.currentTimeMillis()
+            lastServiceCallTime = System.currentTimeMillis()
         }
     }
 
@@ -138,40 +205,6 @@ class ATChannel(private val context: Context) {
         return sb.toString()
     }
 
-    suspend fun getSignalQuality(): Map<String, Any> {
-        val result = mutableMapOf<String, Any>()
-        sendCommand("AT+CSQ")?.let { parseCSQ(it, result) }
-        sendCommand("AT+CESQ")?.let { parseCESQ(it, result) }
-        sendCommand("AT+COPS?")?.let { result["operator"] = parseCOPS(it) }
-        sendCommand("AT+CREG?")?.let { result["registered"] = parseCREG(it) }
-        return result
-    }
-
-    suspend fun getSimInfo(): Map<String, Any> {
-        val result = mutableMapOf<String, Any>()
-        sendCommand("AT+CIMI")?.let { if (!it.contains("ERROR")) result["imsi"] = it.trim() }
-        sendCommand("AT+CGSN")?.let { if (!it.contains("ERROR")) result["imei"] = it.trim() }
-        return result
-    }
-
-    suspend fun sendSms(phoneNumber: String, message: String): Boolean {
-        sendCommand("AT+CMGF=1")
-        val response = sendCommand("AT+CMGS=\"$phoneNumber\"\r$message\u001A", 15000)
-        return response?.contains("+CMGS:") == true
-    }
-
-    suspend fun lockBand(rat: String, earfcn: Int): Boolean {
-        val cmd = when (rat.uppercase()) {
-            "LTE" -> "AT+ZLOCKFREQ=$earfcn"
-            "NR" -> "AT+ZLOCKNR=$earfcn"
-            else -> return false
-        }
-        return sendCommand(cmd)?.contains("OK") == true
-    }
-
-    suspend fun unlockBand(): Boolean =
-        sendCommand("AT+ZLOCKFREQ=0")?.contains("OK") == true
-
     fun getPlatformInfo(): Map<String, Any> = if (connected) {
         mapOf("platform" to platform.name, "connected" to true, "method" to "service_call")
     } else {
@@ -179,7 +212,7 @@ class ATChannel(private val context: Context) {
     }
 
     private suspend fun detectPlatform(): Platform {
-        val cpuInfo = ShellExecutor.executeAsRoot("cat /proc/cpuinfo").stdout
+        val cpuInfo = ShellQoS.executeAsRootCached("cat /proc/cpuinfo").stdout
         return when {
             cpuInfo.contains("Spreadtrum", true) || cpuInfo.contains("sprd", true) -> Platform.SPREADTRUM
             cpuInfo.contains("Qualcomm", true) || cpuInfo.contains("qcom", true) -> Platform.QUALCOMM
@@ -193,62 +226,9 @@ class ATChannel(private val context: Context) {
             .joinToString("\n").ifEmpty { if (raw.contains("OK")) "OK" else null }
     }
 
-    private fun parseCSQ(response: String, result: MutableMap<String, Any>) {
-        val m = Regex("\\+CSQ:\\s*(\\d+),(\\d+)").find(response) ?: return
-        val rssi = m.groupValues[1].toIntOrNull() ?: 99
-        val rssiDbm = if (rssi in 0..31) -113 + rssi * 2 else -113
-        result["rssi"] = rssiDbm
-        result["signal_level"] = when { rssi >= 20 -> "Excellent"; rssi >= 15 -> "Good"; rssi >= 10 -> "Fair"; rssi >= 5 -> "Poor"; else -> "No Signal" }
-    }
-
-    private fun parseCESQ(response: String, result: MutableMap<String, Any>) {
-        // 匹配标准 6 字段 + 可选扩展字段（ZTE 5G NSA 设备额外返回 NR 信号指标）
-        val m = Regex("\\++CESQ:\\s*(\\d+),(\\d+),(\\d+),(\\d+),(\\d+),(\\d+)(?:,(\\d+),(\\d+),(\\d+))?").find(response) ?: return
-        val rxlev = m.groupValues[1].toIntOrNull() ?: 99
-        val rsrqIdx = m.groupValues[5].toIntOrNull() ?: 255
-        val rsrpIdx = m.groupValues[6].toIntOrNull() ?: 255
-
-        // 标准 LTE 字段 (SS-RSRP/SS-RSRQ, 3GPP TS 36.133)
-        // SS-RSRP: index 0-97 → -140 ~ -43 dBm, step ≈ 0.38dB, 255=unknown
-        if (rsrpIdx != 255) result["rsrp"] = -140 + rsrpIdx * 97 / 254
-        // SS-RSRQ: index 0-34 → -19.5 ~ -2.5 dB, 255=unknown
-        if (rsrqIdx != 255) result["rsrq"] = (-19.5 + rsrqIdx * 17.0 / 254).toInt()
-
-        // 5G NSA 扩展字段 7-9 — 仅在标准字段为 255(unknown) 时回退使用
-        // ZTE 设备标准 LTE 字段有效时与 Goform 一致，扩展字段编码不同须作为后备
-        if (m.groupValues.size > 7 && m.groupValues[7].isNotEmpty()) {
-            val nrRsrpIdx = m.groupValues[7].toIntOrNull() ?: 255
-            val nrSinrIdx = m.groupValues[8].toIntOrNull() ?: 255
-            val nrRsrqIdx = m.groupValues[9].toIntOrNull() ?: 255
-            // RSRP: 仅当标准字段无效时回退
-            if (rsrpIdx == 255 && nrRsrpIdx != 255) {
-                result["rsrp"] = -140 + nrRsrpIdx * 97 / 254
-            }
-            // SINR: CESQ 标准字段无 SINR，始终从扩展字段取
-            if (nrSinrIdx != 255) {
-                result["sinr"] = -20 + nrSinrIdx * 40 / 254
-            }
-            // RSRQ: 仅当标准字段无效时回退
-            if (rsrqIdx == 255 && nrRsrqIdx != 255) {
-                result["rsrq"] = (-19.5 + nrRsrqIdx * 17.0 / 254).toInt()
-            }
-        }
-
-        // RSSI 补充：CSQ=99(unknown) 但 CESQ rxlev 有效时估算
-        if (rxlev != 99 && !result.containsKey("rssi")) {
-            result["rssi"] = -110 + rxlev
-        }
-    }
-
-    private fun parseCOPS(response: String): String =
-        Regex("\\+COPS:\\s*\\d+,\\d+,\"([^\"]+)\"").find(response)?.groupValues?.get(1) ?: "Unknown"
-
-    private fun parseCREG(response: String): Boolean {
-        val s = Regex("\\+CREG:\\s*\\d+,(\\d+)").find(response)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-        return s == 1 || s == 5
-    }
-
     fun stop() {
         connected = false
+        consecutiveFailures = 0
+        isDisabled = false
     }
 }

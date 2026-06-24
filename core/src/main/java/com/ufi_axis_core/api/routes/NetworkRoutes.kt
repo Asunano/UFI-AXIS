@@ -1,16 +1,23 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformNetworkClient
+import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.core.database.AppDatabase
+import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.core.cache.CacheTTL
+import com.ufi_axis_core.core.cache.ResponseCache
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 
 /**
@@ -18,11 +25,14 @@ import kotlinx.serialization.json.*
  */
 class NetworkRoutes(
     private val telephonyCollector: TelephonyCollector,
-    private val atChannel: ATChannel,
     private val networkController: NetworkController,
     private val database: AppDatabase,
     private val goformClient: GoformClient? = null,
-    private val dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null
+    private val signalClient: GoformSignalClient? = null,
+    private val networkClient: GoformNetworkClient? = null,
+    private val dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null,
+    private val cache: ResponseCache? = null,
+    private val dataHub: DataHub? = null
 ) {
     fun register(route: Route) {
         route.route("/network") {
@@ -37,7 +47,9 @@ class NetworkRoutes(
             get("/signal/history") {
                 val hoursParam = (call.request.queryParameters["hours"] ?: "24").toIntOrNull() ?: 24
                 val startTime = System.currentTimeMillis() - hoursParam * 60 * 60 * 1000L
-                val records = database.signalDao().getRecordsSince(startTime)
+                val records = withContext(Dispatchers.IO) {
+                    database.signalDao().getRecordsSince(startTime)
+                }
                 call.respond(toJsonElement(mapOf(
                     "records" to records,
                     "count" to records.size,
@@ -45,29 +57,23 @@ class NetworkRoutes(
                 )))
             }
 
-            // 网络状态
+            // 网络状态（通过 DataHub 统一缓存，消除与 DeviceRoutes /info 的重复 goform 查询）
             get("/status") {
-                // 优先使用 Goform 数据，fallback 到 TelephonyCollector
-                val goformInfo = try {
-                    goformClient?.getSignalInfo()
+                // DataHub.getNetworkTypeInfo() 10s TTL 缓存，合并 network_type + provider + ppp_status 为单次 goform 查询
+                val hubInfo = try {
+                    dataHub?.getNetworkTypeInfo()
                 } catch (_: Exception) { null }
-                val goformType = goformInfo?.get("network_type")?.jsonPrimitive?.contentOrNull
-                val goformProvider = goformInfo?.get("network_provider")?.jsonPrimitive?.contentOrNull
-                // 使用 goform ppp_status 判断实际数据连接状态（PPP 拨号），
-                // 而非 Android mobile_data 系统设置（两者独立）
-                val pppStatus = try {
-                    goformClient?.querySingle("ppp_status")?.jsonPrimitive?.contentOrNull
-                } catch (_: Exception) { null }
-                val mobileDataEnabled = when {
-                    pppStatus != null -> pppStatus.contains("connected", ignoreCase = true) &&
-                        !pppStatus.contains("disconnected", ignoreCase = true)
-                    else -> telephonyCollector.isMobileDataEnabled()
-                }
+
+                val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
+                val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }
+                val pppStatus = hubInfo?.pppStatus
+                val mobileDataEnabled = if (hubInfo != null) hubInfo.isPppConnected
+                    else telephonyCollector.isMobileDataEnabled()
                 call.respond(toJsonElement(mapOf(
                     "network" to networkController.getNetworkStatus(),
                     "mobile_data" to mobileDataEnabled,
                     "ppp_status" to (pppStatus ?: ""),
-                    "operator" to (if (!goformProvider.isNullOrBlank()) goformProvider else telephonyCollector.getOperatorName()),
+                    "operator" to (goformProvider ?: telephonyCollector.getOperatorName()),
                     "network_type" to (if (goformType != null) GoformClient.mapNetworkType(goformType) else telephonyCollector.getNetworkType())
                 )))
             }
@@ -77,6 +83,7 @@ class NetworkRoutes(
                 val params = call.receive<JsonObject>()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val success = networkController.setMobileData(enabled)
+                if (success) dataHub?.invalidateNetwork()  // 清除 ppp_status 缓存，使下次 /status 查询到最新连接状态
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "enabled" to enabled))
@@ -94,65 +101,67 @@ class NetworkRoutes(
                 )
             }
 
-            // 锁频 — 使用 LTE_BAND_LOCK / NR_BAND_LOCK goformId (与参考项目一致)
-            post("/band") {
-                val client = goformClient
-                if (client == null) {
-                    call.respond(HttpStatusCode.ServiceUnavailable,
-                        toJsonElement(mapOf("error" to "Goform client not available")))
-                    return@post
-                }
-                val params = call.receive<JsonObject>()
-                val rat = params["rat"]?.jsonPrimitive?.contentOrNull ?: ""
-                val bands = params["bands"]?.jsonPrimitive?.contentOrNull ?: ""
-                val action = params["action"]?.jsonPrimitive?.contentOrNull ?: "lock"
+            // ═══════════ 频段锁定（goform + AT+SFUN 网络栈重启，无需设备重启）═══════════
+            // GET  /network/band-status → 查询当前 lte_band_lock / nr_band_lock（goform 只读）
+            // POST /network/band          → 通过 goform 写入 + AT+SFUN 重启网络协议栈立即生效
+            //   返回: { success, mode, needs_reboot: false, network_restarted }
 
-                val success = when {
-                    action == "unlock" -> {
-                        // 解锁 = 设置全部频段
-                        val lteAll = "1,3,5,8,34,38,39,40,41"
-                        val nrAll = "1,5,8,28,41,78"
-                        client.lockLteBands(lteAll) && client.lockNrBands(nrAll)
-                    }
-                    rat.equals("lte", ignoreCase = true) -> client.lockLteBands(bands)
-                    rat.equals("nr", ignoreCase = true) -> client.lockNrBands(bands)
-                    rat.equals("all", ignoreCase = true) -> {
-                        // bands 里同时包含 LTE 和 NR 频段，分别设置
-                        val lteBands = bands.split(",").filter { it.trim().toIntOrNull() in 1..255 }
-                            .joinToString(",")
-                        val nrBands = bands.split(",").filter { it.trim().startsWith("N", ignoreCase = true) || it.trim().toIntOrNull() in 1..255 }
-                            .joinToString(",")
-                        var ok = true
-                        if (lteBands.isNotEmpty()) ok = client.lockLteBands(lteBands) && ok
-                        if (nrBands.isNotEmpty()) ok = client.lockNrBands(nrBands) && ok
-                        ok
-                    }
-                    else -> false
-                }
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.BadRequest,
-                    toJsonElement(mapOf("success" to success, "action" to action))
-                )
-            }
-
-            // 查询当前频段锁定状态
+            // 查询当前频段锁定状态（通过 DataHub 统一获取）
             get("/band-status") {
-                val client = goformClient
-                if (client == null) {
+                val dh = dataHub
+                if (dh == null && signalClient == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
-                        toJsonElement(mapOf("error" to "Goform client not available")))
+                        toJsonElement(mapOf("error" to "DataHub/Goform client not available")))
                     return@get
                 }
-                val settings = client.queryDeviceSettings() ?: emptyMap()
-                call.respond(toJsonElement(mapOf(
-                    "lte_band_lock" to (settings["lte_band_lock"]?.jsonPrimitive?.contentOrNull ?: ""),
-                    "nr_band_lock" to (settings["nr_band_lock"]?.jsonPrimitive?.contentOrNull ?: "")
-                )))
+                val result = cache!!.getOrPut("network:band-status", CacheTTL.BAND_STATUS) {
+                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient?.getBandLockStatus()) ?: JsonObject(emptyMap())
+                    toJsonElement(mapOf(
+                        "lte_band_lock" to (data["lte_band_lock"]?.jsonPrimitive?.contentOrNull ?: ""),
+                        "nr_band_lock" to (data["nr_band_lock"]?.jsonPrimitive?.contentOrNull ?: "")
+                    ))
+                }
+                call.respond(result)
+            }
+
+            // 锁定/解锁频段（goform 写入 + AT+SFUN 网络栈重启，无需设备重启）
+            post("/band") {
+                val params = call.receive<JsonObject>()
+                val action = params["action"]?.jsonPrimitive?.contentOrNull ?: "lock"
+
+                val result = if (action == "unlock") {
+                    networkController.lockBands(null, null, unlockAll = true)
+                } else {
+                    // 支持两种请求格式：
+                    // 新格式: { "lte_bands":"1,3", "nr_bands":"41,78" }
+                    // 旧格式: { "rat":"lte", "bands":"1,3" }   → 兼容旧客户端
+                    val lteBands = params["lte_bands"]?.jsonPrimitive?.contentOrNull
+                        ?: (if (params["rat"]?.jsonPrimitive?.contentOrNull?.lowercase() == "lte")
+                            params["bands"]?.jsonPrimitive?.contentOrNull else null)
+                    val nrBands = params["nr_bands"]?.jsonPrimitive?.contentOrNull
+                        ?: (if (params["rat"]?.jsonPrimitive?.contentOrNull?.lowercase() == "nr")
+                            params["bands"]?.jsonPrimitive?.contentOrNull else null)
+                    networkController.lockBands(lteBands, nrBands)
+                }
+
+                if (result.success) {
+                    cache?.invalidate("network:band-status")
+                }
+                call.respond(
+                    if (result.success) HttpStatusCode.OK else HttpStatusCode.BadRequest,
+                    toJsonElement(mapOf(
+                        "success" to result.success,
+                        "action" to action,
+                        "mode" to result.mode,
+                        "needs_reboot" to false,
+                        "network_restarted" to result.stackRestarted
+                    ))
+                )
             }
 
             // 网络模式 — 使用 SET_BEARER_PREFERENCE goformId (与参考项目一致)
             post("/mode") {
-                val client = goformClient
+                val client = networkClient
                 val params = call.receive<JsonObject>()
                 val mode = params["mode"]?.jsonPrimitive?.contentOrNull ?: "AUTO"
                 // 映射前端模式到参考项目的 BearerPreference 值
@@ -169,19 +178,11 @@ class NetworkRoutes(
                 val success = if (client != null) {
                     client.setBearerPreference(bearerValue)
                 } else {
-                    // fallback: 使用 AT 命令
-                    val atCmd = when (mode.uppercase()) {
-                        "AUTO", "WL_AND_5G" -> "AT+ZPREFMOD=1,1,1"
-                        "5G_ONLY", "ONLY_5G", "5G_SA" -> "AT+ZPREFMOD=0,0,1"
-                        "LTE_ONLY", "ONLY_LTE", "4G_ONLY" -> "AT+ZPREFMOD=0,1,0"
-                        "4G_5G", "LTE_NR" -> "AT+ZPREFMOD=0,1,1"
-                        "WCDMA_ONLY", "ONLY_WCDMA" -> "AT+ZPREFMOD=2,0,0"
-                        else -> return@post call.respond(HttpStatusCode.BadRequest,
-                            toJsonElement(mapOf("error" to "Unknown mode: $mode")))
-                    }
-                    val response = atChannel.sendCommand(atCmd)
-                    response?.contains("OK") == true
+                    // goform 不可用时无法设置网络模式（AT+ZPREFMOD 在此设备不支持）
+                    AppLogger.w("NetworkRoutes", "Goform client not available, cannot set network mode")
+                    false
                 }
+                if (success) cache?.invalidate("network:band-status")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "mode" to mode))
@@ -190,7 +191,7 @@ class NetworkRoutes(
 
             // 承载偏好 (LTE/NSA/SA 等)
             post("/bearer") {
-                val client = goformClient
+                val client = networkClient
                 if (client == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
                         toJsonElement(mapOf("error" to "Goform client not available")))
@@ -207,13 +208,14 @@ class NetworkRoutes(
 
             // 连接网络 (拨号)
             post("/connect") {
-                val client = goformClient
+                val client = networkClient
                 if (client == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
                         toJsonElement(mapOf("error" to "Goform client not available")))
                     return@post
                 }
                 val success = client.connectNetwork()
+                if (success) dataHub?.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -222,13 +224,14 @@ class NetworkRoutes(
 
             // 断开网络
             post("/disconnect") {
-                val client = goformClient
+                val client = networkClient
                 if (client == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
                         toJsonElement(mapOf("error" to "Goform client not available")))
                     return@post
                 }
                 val success = client.disconnectNetwork()
+                if (success) dataHub?.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -237,7 +240,7 @@ class NetworkRoutes(
 
             // 连接模式 (手动/自动)
             post("/connection-mode") {
-                val client = goformClient
+                val client = networkClient
                 if (client == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
                         toJsonElement(mapOf("error" to "Goform client not available")))
@@ -252,33 +255,39 @@ class NetworkRoutes(
                 )
             }
 
-            // 高铁模式（参考项目 main.js: AT+SP5GCMDS）
-            get("/high-rail") {
-                val enabled = networkController.getHighRailMode()
-                call.respond(toJsonElement(mapOf("enabled" to enabled)))
-            }
+            // ═══════════ 基站/小区信息 ═══════════
+            // GET /network/cell-info      → 完整基站信息（邻区 + 已锁定基站 + 当前服务小区）
+            // GET /network/neighbor-cells → 仅邻区列表（快速刷新，无缓存）
 
-            // 基站信息（邻区 + 已锁定基站）
+            // 基站信息（通过 DataHub 统一获取）
             get("/cell-info") {
-                val client = goformClient
-                if (client == null) {
+                val dh = dataHub
+                if (dh == null && signalClient == null) {
                     call.respond(HttpStatusCode.ServiceUnavailable,
-                        toJsonElement(mapOf("error" to "Goform client not available")))
+                        toJsonElement(mapOf("error" to "DataHub/Goform client not available")))
                     return@get
                 }
-                val cellInfo = client.getCellInfo()
-                call.respond(toJsonElement(cellInfo ?: emptyMap<String, Any>()))
+                val result = cache!!.getOrPut("network:cell-info", CacheTTL.CELL_INFO) {
+                    val cellInfo = dh?.signalQuery { getCellInfo() } ?: signalClient?.getCellInfo()
+                    toJsonElement(cellInfo ?: emptyMap<String, Any>())
+                }
+                call.respond(result)
             }
 
-            post("/high-rail") {
-                val params = call.receive<JsonObject>()
-                val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = networkController.setHighRailMode(enabled)
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "enabled" to enabled))
-                )
+            // 仅邻区列表（不缓存，每次实时查询）
+            get("/neighbor-cells") {
+                val dh = dataHub
+                if (dh == null && signalClient == null) {
+                    call.respond(HttpStatusCode.ServiceUnavailable,
+                        toJsonElement(mapOf("error" to "DataHub/Goform client not available")))
+                    return@get
+                }
+                val neighbors = dh?.signalQuery { getNeighborCellInfo() } ?: signalClient?.getNeighborCellInfo()
+                call.respond(toJsonElement(mapOf(
+                    "neighbor_cell_info" to (neighbors ?: JsonArray(emptyList()))
+                )))
             }
+
         }
     }
 }

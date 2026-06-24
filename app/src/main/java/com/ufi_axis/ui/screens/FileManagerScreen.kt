@@ -1,5 +1,10 @@
 package com.ufi_axis.ui.screens
 
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
@@ -9,6 +14,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -17,8 +23,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufi_axis.data.api.FileItem
+import com.ufi_axis.ui.animation.blurEntrance
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
 import com.google.gson.JsonParser
@@ -44,7 +52,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
-        uri?.let { viewModel.uploadFileToServer(it, state.currentPath) }
+        uri?.let { viewModel.files.uploadFileToServer(it, state.currentPath) }
     }
 
     // Smart file open: media files open directly, others show action dialog
@@ -63,9 +71,10 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     }
 
     LaunchedEffect(Unit) {
-        viewModel.loadDiskUsage()  // Handles auto-navigation based on volume count
-        viewModel.dismissFileContent() // Clear any residual file content from TextEditorScreen
-        viewModel.loadPhoneDownloadHistory()
+        viewModel.files.loadDiskUsage()  // Handles auto-navigation based on volume count
+        viewModel.files.dismissFileContent() // Clear any residual file content from TextEditorScreen
+        viewModel.files.loadPhoneDownloadHistory()
+        viewModel.files.checkRootAccess()  // Check root status for permission validation
     }
 
     UfiScreenScaffold(
@@ -73,29 +82,34 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
         navController = navController, showBack = true,
         actions = {
             if (state.multiSelectMode) {
-                IconButton(onClick = { viewModel.selectAllFiles() }) { Icon(Icons.Default.SelectAll, "全选") }
-                IconButton(onClick = { viewModel.batchCopySelected() }) { Icon(Icons.Default.ContentCopy, "复制") }
-                IconButton(onClick = { viewModel.batchCutSelected() }) { Icon(Icons.Default.ContentCut, "剪切") }
-                IconButton(onClick = { viewModel.batchDeleteSelected() }) {
+                IconButton(onClick = { viewModel.files.selectAllFiles() }) { Icon(Icons.Default.SelectAll, "全选") }
+                IconButton(onClick = { viewModel.files.batchCopySelected() }) { Icon(Icons.Default.ContentCopy, "复制") }
+                IconButton(onClick = { viewModel.files.batchCutSelected() }) { Icon(Icons.Default.ContentCut, "剪切") }
+                IconButton(onClick = { viewModel.files.batchDeleteSelected() }) {
                     Icon(Icons.Default.Delete, "删除", tint = MaterialTheme.colorScheme.error)
                 }
-                IconButton(onClick = { viewModel.toggleMultiSelectMode() }) { Icon(Icons.Default.Close, "取消") }
+                IconButton(onClick = { viewModel.files.toggleMultiSelectMode() }) { Icon(Icons.Default.Close, "取消") }
             } else {
                 if (state.clipboard != null) {
-                    IconButton(onClick = { viewModel.pasteFromClipboard(state.currentPath) }) { Icon(Icons.Default.ContentPaste, "粘贴") }
+                    IconButton(onClick = { viewModel.files.pasteFromClipboard(state.currentPath) }) { Icon(Icons.Default.ContentPaste, "粘贴") }
                 }
-                IconButton(onClick = { viewModel.toggleMultiSelectMode() }) { Icon(Icons.Default.Checklist, "操控模式") }
+                IconButton(onClick = { viewModel.files.toggleMultiSelectMode() }) { Icon(Icons.Default.Checklist, "操控模式") }
                 IconButton(onClick = { showDownloadHistory = true }) { Icon(Icons.Default.DownloadDone, "下载历史") }
                 IconButton(onClick = { showSearchDialog = true }) { Icon(Icons.Default.Search, "搜索") }
-                IconButton(onClick = { viewModel.toggleRootMode() }) {
+                IconButton(onClick = { viewModel.files.toggleRootMode() }) {
                     Icon(Icons.Default.Shield, "Root 模式",
                         tint = if (state.rootMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                IconButton(onClick = { viewModel.refreshFileList() }) { Icon(Icons.Default.Refresh, "刷新") }
+                IconButton(onClick = { viewModel.files.refreshFileList() }) { Icon(Icons.Default.Refresh, "刷新") }
             }
         }
     ) { padding ->
-        Column(Modifier.fillMaxSize().padding(padding)) {
+        PullToRefreshBox(
+            isRefreshing = state.isLoading,
+            onRefresh = { viewModel.files.refreshFileList() },
+            modifier = Modifier.padding(padding).fillMaxSize()
+        ) {
+        Column(Modifier.blurEntrance("files").fillMaxSize()) {
             val isAtVirtualRoot = state.currentPath.isEmpty()
             val isAtVolumeRoot = state.currentPath == state.storageRoot
                     || state.storageVolumes.any { it.mountPath == state.currentPath }
@@ -108,7 +122,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (!isAtVirtualRoot && !(isAtVolumeRoot && state.storageVolumes.size <= 1)) {
-                            IconButton(onClick = { viewModel.navigateToParent() }, modifier = Modifier.size(32.dp)) {
+                            IconButton(onClick = { viewModel.files.navigateToParent() }, modifier = Modifier.size(32.dp)) {
                                 Icon(Icons.Default.ArrowBack, "上级", Modifier.size(20.dp))
                             }
                             Spacer(Modifier.width(4.dp))
@@ -119,7 +133,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                             maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
                         if (state.rootMode) {
                             Spacer(Modifier.width(4.dp))
-                            Surface(shape = RoundedCornerShape(4.dp), color = MaterialTheme.colorScheme.error) {
+                            Surface(shape = UfiCardDefaults.smallShape, color = MaterialTheme.colorScheme.error) {
                                 Text("ROOT", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onError,
                                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), fontWeight = FontWeight.Bold)
                             }
@@ -133,7 +147,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                                 listOf("name" to "按名称", "size" to "按大小", "date" to "按日期", "type" to "按类型").forEach { (key, label) ->
                                     DropdownMenuItem(
                                         text = { Text(label, color = if (state.sortBy == key) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface) },
-                                        onClick = { viewModel.setSortBy(key); showSortMenu = false },
+                                        onClick = { viewModel.files.setSortBy(key); showSortMenu = false },
                                         leadingIcon = { if (state.sortBy == key) Icon(Icons.Default.Check, null, tint = MaterialTheme.colorScheme.primary) else Spacer(Modifier.width(24.dp)) }
                                     )
                                 }
@@ -160,7 +174,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                         ) {
                             quickPaths.forEach { (path, label) ->
                                 SuggestionChip(
-                                    onClick = { viewModel.loadFileList(path); showQuickPaths = false },
+                                    onClick = { viewModel.files.loadFileList(path); showQuickPaths = false },
                                     label = { Text(label, style = MaterialTheme.typography.labelSmall) }
                                 )
                             }
@@ -200,7 +214,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                 UfiAlertDialog(
                     title = if (it.contains("失败")) "错误" else "提示",
                     text = it,
-                    onDismiss = { viewModel.clearFileOperationMessage() }
+                    onDismiss = { viewModel.files.clearFileOperationMessage() }
                 )
             }
 
@@ -212,7 +226,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                 // ── 虚拟根视图：显示存储卷卡片 ──
                 if (state.isLoading || state.storageVolumes.isEmpty()) {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        if (state.isLoading) CircularProgressIndicator()
+                        if (state.isLoading) UfiLoadingIndicator()
                         else Text("正在检测存储...",
                             style = MaterialTheme.typography.bodyLarge,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -227,9 +241,9 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                             val vol = state.storageVolumes[idx]
                             val isSd = vol.label.contains("SD") || vol.mountPath.startsWith("/storage/") && !vol.mountPath.contains("emulated")
                             Card(
-                                onClick = { viewModel.navigateToDir(vol.mountPath) },
+                                onClick = { viewModel.files.navigateToDir(vol.mountPath) },
                                 modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(Spacing.CardCorner),
+                                shape = UfiCardDefaults.legacyShape,
                                 colors = CardDefaults.cardColors(
                                     containerColor = MaterialTheme.colorScheme.surfaceVariant
                                 )
@@ -271,14 +285,14 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                     }
                 }
             } else if (state.isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { UfiLoadingIndicator() }
             } else {
                 if (isSearchMode) {
                     // 搜索结果头部
                     Row(Modifier.padding(horizontal = Spacing.PagePadding, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Text("搜索结果 (${displayFiles.size})", style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.primary, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { viewModel.clearSearchResults() }) { Text("返回", style = MaterialTheme.typography.labelSmall) }
+                        TextButton(onClick = { viewModel.files.clearSearchResults() }) { Text("返回", style = MaterialTheme.typography.labelSmall) }
                     }
                 }
 
@@ -291,14 +305,16 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                         SuggestionChip(onClick = { showNewFileDialog = true },
                             label = { Text("新建文件", style = MaterialTheme.typography.labelSmall) },
                             icon = { Icon(Icons.Default.NoteAdd, null, Modifier.size(16.dp)) })
-                        SuggestionChip(
-                            onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
-                            enabled = !state.isUploading,
-                            label = { Text(if (state.isUploading) "上传中..." else "上传文件", style = MaterialTheme.typography.labelSmall) },
-                            icon = {
-                                if (state.isUploading) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-                                else Icon(Icons.Default.Upload, null, Modifier.size(16.dp))
-                            })
+                        if (state.transferAllowed) {
+                            SuggestionChip(
+                                onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                                enabled = !state.isUploading,
+                                label = { Text(if (state.isUploading) "上传中..." else "上传文件", style = MaterialTheme.typography.labelSmall) },
+                                icon = {
+                                    if (state.isUploading) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                    else Icon(Icons.Default.Upload, null, Modifier.size(16.dp))
+                                })
+                        }
                     }
                 }
 
@@ -318,27 +334,29 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                                 file = file,
                                 multiSelectMode = state.multiSelectMode,
                                 isSelected = file.path in state.selectedPaths,
-                                onToggleSelect = { viewModel.toggleFileSelection(file.path) },
+                                onToggleSelect = { viewModel.files.toggleFileSelection(file.path) },
                                 onOpen = { smartOpenFile(file) },
                                 onNavigate = {
-                                    if (isSearchMode) viewModel.clearSearchResults()
-                                    viewModel.navigateToDir(it.path)
+                                    if (isSearchMode) viewModel.files.clearSearchResults()
+                                    viewModel.files.navigateToDir(it.path)
                                 },
-                                onInfo = { viewModel.getFileInfo(it.path) },
-                                onCopy = { viewModel.copyToClipboard(it.path, false) },
-                                onCut = { viewModel.copyToClipboard(it.path, true) },
+                                onInfo = { viewModel.files.getFileInfo(it.path) },
+                                onCopy = { viewModel.files.copyToClipboard(it.path, false) },
+                                onCut = { viewModel.files.copyToClipboard(it.path, true) },
                                 onRename = { showRenameDialog = it },
                                 onDelete = { showDeleteConfirm = it },
                                 onEdit = { filePath ->
                                     val encodedPath = URLEncoder.encode(filePath, "UTF-8")
                                     navController.navigate("file/editor?path=$encodedPath")
                                 },
-                                onDownload = { viewModel.downloadFileToPhone(file.path, file.name) }
+                                showDownload = state.transferAllowed,
+                                onDownload = { viewModel.files.downloadFileToPhone(file.path, file.name) }
                             )
                         }
                     }
                 }
             }
+        }
         }
     }
 
@@ -418,7 +436,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                 }
             },
             confirmButton = {
-                TextButton(onClick = { viewModel.cancelDownload() }) {
+                TextButton(onClick = { viewModel.files.cancelDownload() }) {
                     Text("取消")
                 }
             }
@@ -455,7 +473,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                         items(history) { item ->
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
-                                shape = RoundedCornerShape(8.dp)
+                                shape = UfiCardDefaults.shape
                             ) {
                                 Row(
                                     modifier = Modifier.padding(10.dp),
@@ -497,7 +515,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
             confirmButton = {
                 if (state.phoneDownloadHistory.isNotEmpty()) {
                     TextButton(onClick = {
-                        viewModel.clearPhoneDownloadHistory()
+                        viewModel.files.clearPhoneDownloadHistory()
                     }) { Text("清空") }
                 }
             },
@@ -512,7 +530,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     if (showNewFolderDialog) {
         UfiInputDialog(
             title = "新建文件夹", initialValue = "", hint = "文件夹名称", confirmText = "创建",
-            onConfirm = { viewModel.createDirectory("${state.currentPath}/$it"); showNewFolderDialog = false },
+            onConfirm = { viewModel.files.createDirectory("${state.currentPath}/$it"); showNewFolderDialog = false },
             onDismiss = { showNewFolderDialog = false },
             validator = { if (it.isBlank()) "名称不能为空" else null }
         )
@@ -521,7 +539,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     if (showNewFileDialog) {
         UfiInputDialog(
             title = "新建文件", initialValue = "", hint = "文件名 (如 note.txt)", confirmText = "创建",
-            onConfirm = { viewModel.createFile(it); showNewFileDialog = false },
+            onConfirm = { viewModel.files.createFile(it); showNewFileDialog = false },
             onDismiss = { showNewFileDialog = false },
             validator = { if (it.isBlank()) "名称不能为空" else null }
         )
@@ -530,7 +548,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     if (showSearchDialog) {
         UfiInputDialog(
             title = "搜索文件", initialValue = "", hint = "输入文件名关键词", confirmText = "搜索",
-            onConfirm = { viewModel.searchFiles(it); showSearchDialog = false },
+            onConfirm = { viewModel.files.searchFiles(it); showSearchDialog = false },
             onDismiss = { showSearchDialog = false },
             validator = { if (it.isBlank()) "请输入搜索关键词" else null }
         )
@@ -539,7 +557,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
     showRenameDialog?.let { file ->
         UfiInputDialog(
             title = "重命名", initialValue = file.name, hint = "新文件名", confirmText = "确定",
-            onConfirm = { viewModel.renameFile(file.path, it); showRenameDialog = null },
+            onConfirm = { viewModel.files.renameFile(file.path, it); showRenameDialog = null },
             onDismiss = { showRenameDialog = null },
             validator = { if (it.isBlank()) "名称不能为空" else null }
         )
@@ -550,7 +568,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
             title = "确认删除",
             text = "确定要删除 \"${file.name}\" 吗？${if (file.isDirectory) "目录内所有内容将一并删除。" else ""}此操作不可撤销。",
             confirmText = "删除", destructive = true,
-            onConfirm = { viewModel.deleteFileOrDir(file.path); showDeleteConfirm = null },
+            onConfirm = { viewModel.files.deleteFileOrDir(file.path); showDeleteConfirm = null },
             onDismiss = { showDeleteConfirm = null }
         )
     }
@@ -567,7 +585,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
 
         ModalBottomSheet(
             onDismissRequest = { fileActionDialog = null },
-            shape = RoundedCornerShape(topStart = Spacing.CardCorner, topEnd = Spacing.CardCorner)
+            shape = UfiCardDefaults.bottomSheetTopShape
         ) {
             Column(Modifier.padding(Spacing.InnerPadding)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -592,21 +610,23 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                     }, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(8.dp))
                 }
-                if (isApk) {
+                if (isApk && state.transferAllowed) {
                     UfiPrimaryButton(text = "安装", onClick = {
                         fileActionDialog = null
-                        viewModel.installApk(file.path)
+                        viewModel.files.installApk(file.path)
                     }, modifier = Modifier.fillMaxWidth())
                     Spacer(Modifier.height(8.dp))
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    UfiSecondaryButton(text = "下载", onClick = {
-                        fileActionDialog = null
-                        viewModel.downloadFileToPhone(file.path, file.name)
-                    }, modifier = Modifier.weight(1f))
+                    if (state.transferAllowed) {
+                        UfiSecondaryButton(text = "下载", onClick = {
+                            fileActionDialog = null
+                            viewModel.files.downloadFileToPhone(file.path, file.name)
+                        }, modifier = Modifier.weight(1f))
+                    }
                     UfiSecondaryButton(text = "信息", onClick = {
                         fileActionDialog = null
-                        viewModel.getFileInfo(file.path)
+                        viewModel.files.getFileInfo(file.path)
                     }, modifier = Modifier.weight(1f))
                 }
                 Spacer(Modifier.height(8.dp))
@@ -621,16 +641,51 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
             title = "系统目录访问警告",
             text = "\"$protectedPath\" 是系统目录，普通模式下无法访问。\n\n启用 Root 模式可能影响系统稳定性，确定要继续吗？",
             confirmText = "启用 Root 模式", destructive = true,
-            onConfirm = { viewModel.forceNavigate(protectedPath) },
-            onDismiss = { viewModel.dismissProtectedPath() }
+            onConfirm = { viewModel.files.forceNavigate(protectedPath) },
+            onDismiss = { viewModel.files.dismissProtectedPath() }
         )
     }
 
+    // ── 存储权限提示弹窗 ──
+    if (state.showStoragePermissionDialog) {
+        val context = androidx.compose.ui.platform.LocalContext.current
+        AlertDialog(
+            onDismissRequest = { viewModel.files.dismissStoragePermissionDialog() },
+            icon = { Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error) },
+            title = { Text("需要存储管理权限") },
+            text = {
+                Column(Modifier.fillMaxWidth()) {
+                    Text("当前设备未获取 Root 权限，上传、下载等操作需要存储管理权限。")
+                    Spacer(Modifier.height(8.dp))
+                    Text("请在系统设置中授予\u201c所有文件管理权限\u201d以启用这些功能。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    viewModel.files.dismissStoragePermissionDialog()
+                    context.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.fromParts("package", context.packageName, null)
+                        }
+                    )
+                }) {
+                    Text("前往设置", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.files.dismissStoragePermissionDialog() }) {
+                    Text("我知道了")
+                }
+            }
+        )
+    }
     // 文件信息底栏
     state.selectedFile?.let { fileInfo ->
         ModalBottomSheet(
-            onDismissRequest = { viewModel.dismissFileInfo() },
-            shape = RoundedCornerShape(topStart = Spacing.CardCorner, topEnd = Spacing.CardCorner)
+            onDismissRequest = { viewModel.files.dismissFileInfo() },
+            shape = UfiCardDefaults.bottomSheetTopShape
         ) {
             Column(Modifier.padding(Spacing.InnerPadding)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -650,13 +705,15 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                 Spacer(Modifier.height(Spacing.Medium))
                 if (!fileInfo.isDirectory) {
                     Spacer(Modifier.height(Spacing.Medium))
-                    UfiSecondaryButton(text = "下载", onClick = {
-                        viewModel.downloadFileToPhone(fileInfo.path, fileInfo.name)
-                        viewModel.dismissFileInfo()
-                    }, modifier = Modifier.fillMaxWidth())
+                    if (state.transferAllowed) {
+                        UfiSecondaryButton(text = "下载", onClick = {
+                            viewModel.files.downloadFileToPhone(fileInfo.path, fileInfo.name)
+                            viewModel.files.dismissFileInfo()
+                        }, modifier = Modifier.fillMaxWidth())
+                    }
                     Spacer(Modifier.height(Spacing.Medium))
                 }
-                UfiSecondaryButton(text = "关闭", onClick = { viewModel.dismissFileInfo() })
+                UfiSecondaryButton(text = "关闭", onClick = { viewModel.files.dismissFileInfo() })
                 Spacer(Modifier.height(Spacing.Large))
             }
         }
@@ -668,7 +725,7 @@ fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController
                    else clip.sourcePaths.first().substringAfterLast("/")
         Snackbar(
             modifier = Modifier.padding(Spacing.PagePadding),
-            action = { TextButton(onClick = { viewModel.clearClipboard() }) { Text("取消") } }
+            action = { TextButton(onClick = { viewModel.files.clearClipboard() }) { Text("取消") } }
         ) { Text("$actionLabel: $desc — 导航到目标目录后点击粘贴") }
     }
 }
@@ -687,6 +744,7 @@ private fun FileItemRow(
     onRename: (FileItem) -> Unit,
     onDelete: (FileItem) -> Unit,
     onEdit: (String) -> Unit,
+    showDownload: Boolean = true,
     onDownload: (FileItem) -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
@@ -699,12 +757,12 @@ private fun FileItemRow(
             else if (isNavigable) onNavigate(file)
             else onOpen(file)
         },
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.legacyShape,
         colors = CardDefaults.cardColors(
             containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.3f)
             else MaterialTheme.colorScheme.surface
         ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        elevation = UfiCardDefaults.noElevation()
     ) {
         Row(
             Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -745,8 +803,10 @@ private fun FileItemRow(
                             leadingIcon = { Icon(Icons.Default.OpenInNew, null) })
                         DropdownMenuItem(text = { Text("编辑") }, onClick = { onEdit(file.path); showMenu = false },
                             leadingIcon = { Icon(Icons.Default.Edit, null) })
-                        DropdownMenuItem(text = { Text("下载") }, onClick = { onDownload(file); showMenu = false },
-                            leadingIcon = { Icon(Icons.Default.Download, null) })
+                        if (showDownload) {
+                            DropdownMenuItem(text = { Text("下载") }, onClick = { onDownload(file); showMenu = false },
+                                leadingIcon = { Icon(Icons.Default.Download, null) })
+                        }
                     }
                     DropdownMenuItem(text = { Text("信息") }, onClick = { onInfo(file); showMenu = false },
                         leadingIcon = { Icon(Icons.Default.Info, null) })

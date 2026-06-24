@@ -20,14 +20,23 @@ import java.io.File
 class SystemCollector(private val context: Context) {
 
     private val tag = "SystemCollector"
-    @Volatile private var lastRxBytes: Long = 0
-    @Volatile private var lastTxBytes: Long = 0
-    @Volatile private var lastTimestamp: Long = 0
 
     /**
      * 获取 CPU 信息：总使用率 + 各核频率
      */
+    /**
+     * 缓存控制：CPU 频率和温度变化较慢，缓存有效期内直接返回上次结果。
+     * 由 DataScheduler 每 3s 调用一次，但 sysfs 值实际变化周期远大于 3s。
+     */
+    private var lastCpuCacheTime: Long = 0L
+    private var lastCpuCache: CpuInfo? = null
+
     suspend fun getCpuInfo(): CpuInfo {
+        val now = System.currentTimeMillis()
+        // ── CPU 信息缓存：5s 内直接返回上一次结果，减少 sysfs 读取压力 ──
+        if (lastCpuCache != null && (now - lastCpuCacheTime) < 5_000L) {
+            return lastCpuCache!!
+        }
         var cpuUsage = 0.0
         val cores = mutableListOf<CpuCore>()
         var temperature = 0.0
@@ -58,7 +67,10 @@ class SystemCollector(private val context: Context) {
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to get CPU info", e)
         }
-        return CpuInfo(usage_percent = cpuUsage, core_count = cores.size, cores = cores, temperature = temperature)
+        val info = CpuInfo(usage_percent = cpuUsage, core_count = cores.size, cores = cores, temperature = temperature)
+        lastCpuCache = info
+        lastCpuCacheTime = now
+        return info
     }
 
     /**
@@ -163,35 +175,16 @@ class SystemCollector(private val context: Context) {
     }
 
     /**
-     * 获取流量统计
-     * 返回总收发字节数 + 实时速率
+     * 获取流量统计（仅返回累计收发字节数，速率由 DataScheduler 从 Goform thrpt 获取）
      */
     fun getTrafficStats(): Map<String, Any> {
         val result = mutableMapOf<String, Any>()
         try {
             val rxBytes = TrafficStats.getTotalRxBytes()
             val txBytes = TrafficStats.getTotalTxBytes()
-            val currentTime = SystemClock.elapsedRealtime()
-
-            var rxSpeed = 0L
-            var txSpeed = 0L
-
-            if (lastTimestamp > 0) {
-                val elapsed = (currentTime - lastTimestamp) / 1000.0
-                if (elapsed > 0) {
-                    rxSpeed = ((rxBytes - lastRxBytes) / elapsed).toLong()
-                    txSpeed = ((txBytes - lastTxBytes) / elapsed).toLong()
-                }
-            }
-
-            lastRxBytes = rxBytes
-            lastTxBytes = txBytes
-            lastTimestamp = currentTime
 
             result["rx_bytes"] = rxBytes
             result["tx_bytes"] = txBytes
-            result["rx_speed"] = rxSpeed
-            result["tx_speed"] = txSpeed
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to get traffic stats", e)
         }
@@ -212,15 +205,23 @@ class SystemCollector(private val context: Context) {
 
     // --- 内部方法 ---
 
+    /**
+     * 读取 CPU 使用率（两次采样取差值）。
+     * 使用协程 delay 而非 shell sleep，避免阻塞 Dispatchers.IO 线程。
+     */
     private suspend fun readCpuUsage(): Double {
         try {
-            // Batch: 2 shell calls + 200ms Kotlin delay → 1 shell call with internal sleep
-            val result = ShellExecutor.execute("head -1 /proc/stat; sleep 0.2; head -1 /proc/stat")
-            val lines = result.stdout.lines().filter { it.startsWith("cpu ") }
-            if (lines.size < 2) return 0.0
+            // 必须用无缓存 execute()：两次读取间隔 200ms 远小于缓存 TTL (2000ms)，
+            // 若走 executeCached() 会命中缓存返回相同数据，导致 diff 恒为 0
+            val stat1 = ShellQoS.execute("cat /proc/stat").stdout
+                .lines().firstOrNull { it.startsWith("cpu ") } ?: return 0.0
+            kotlinx.coroutines.delay(200)
+            val stat2 = ShellQoS.execute("cat /proc/stat").stdout
+                .lines().firstOrNull { it.startsWith("cpu ") } ?: return 0.0
 
-            val values1 = lines[0].substring(4).trim().split(" ").map { it.toLongOrNull() ?: 0 }
-            val values2 = lines[1].substring(4).trim().split(" ").map { it.toLongOrNull() ?: 0 }
+            // 使用 \\s+ 分隔以适应多空格/制表符对齐的 /proc/stat 格式
+            val values1 = stat1.substring(4).trim().split("\\s+".toRegex()).map { it.toLongOrNull() ?: 0 }
+            val values2 = stat2.substring(4).trim().split("\\s+".toRegex()).map { it.toLongOrNull() ?: 0 }
 
             if (values1.size < 4 || values2.size < 4) return 0.0
 

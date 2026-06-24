@@ -24,7 +24,7 @@ class SpeedTestRoutes {
                 try {
                     withContext(Dispatchers.IO) {
                         val chunks = (call.request.queryParameters["ckSize"]?.toIntOrNull()
-                            ?: 10).coerceIn(1, 1024)
+                            ?: 10).coerceIn(1, 4096)
                         val totalBytes = buffer.size.toLong() * chunks
 
                         call.response.headers.append(HttpHeaders.ContentLength, totalBytes.toString())

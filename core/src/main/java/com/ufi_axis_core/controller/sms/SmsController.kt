@@ -3,14 +3,14 @@ package com.ufi_axis_core.controller.sms
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
-import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.serialization.json.*
 
 class SmsController(
     private val context: Context? = null,
-    private val goformClient: GoformClient? = null
+    private val smsClient: GoformSmsClient? = null
 ) {
     private val tag = "SmsController"
     private val smsInboxUri = Uri.parse("content://sms/inbox")
@@ -20,9 +20,103 @@ class SmsController(
     data class SmsMessage(val id: Long, val address: String, val body: String, val date: Long, val read: Boolean, val direction: String)
     data class SendResult(val success: Boolean, val message: String)
 
-    suspend fun getAll(limit: Int = 50): List<SmsMessage> = readSms(null, limit)
-    suspend fun getInbox(limit: Int = 50): List<SmsMessage> = readSms("inbox", limit)
-    suspend fun getSent(limit: Int = 50): List<SmsMessage> = readSms("sent", limit)
+    suspend fun getAll(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms(null, limit, offset, phone)
+    suspend fun getInbox(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms("inbox", limit, offset, phone)
+    suspend fun getSent(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms("sent", limit, offset, phone)
+
+    /** 获取按号码过滤的总数（ContentResolver优先，goform回退） */
+    suspend fun getFilteredCount(phone: String?): Int {
+        if (phone.isNullOrBlank()) return getTotalCount()
+        // ContentResolver 优先
+        try {
+            context?.let { ctx ->
+                val cursor = ctx.contentResolver.query(smsAllUri, arrayOf("_id"), "address=?", arrayOf(phone), null)
+                cursor?.use { if (it.count > 0) return it.count }
+            }
+        } catch (_: Exception) {}
+        // goform 回退：拉取消息并过滤计数
+        try {
+            smsClient?.let { gc ->
+                val smsData = gc.getSmsList(page = 0, perPage = 100)
+                if (smsData != null) {
+                    val arr = smsData["messages"]?.jsonArray
+                    if (arr != null) {
+                        return arr.count { el ->
+                            (el.jsonObject["number"]?.jsonPrimitive?.contentOrNull) == phone
+                        }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        return 0
+    }
+
+    /**
+     * 获取按号码聚合的联系人列表（goform 缓存优先，ContentResolver 回退）
+     * 返回每个联系人：phoneNumber, total, unread, latestMsg, latestTimestamp, latestDirection
+     */
+    suspend fun getContactList(dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null): List<Map<String, Any>> {
+        // 优先使用 DataScheduler 中 goform 缓存的联系人列表
+        val cached = dataScheduler?.getCachedSmsContacts()
+        if (cached != null && cached.isNotEmpty()) {
+            return cached
+        }
+        // 回退1: goform 直接查询
+        try {
+            smsClient?.let { gc ->
+                val smsData = gc.getSmsList(page = 0, perPage = 100)
+                if (smsData != null) {
+                    val arr = smsData["messages"]?.jsonArray
+                    if (arr != null && arr.isNotEmpty()) {
+                        val msgs = arr.mapNotNull { el ->
+                            try {
+                                val obj = el.jsonObject
+                                val number = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
+                                val content = decodeB64(obj["content"]?.jsonPrimitive?.contentOrNull ?: "",
+                                    obj["encode_type"]?.jsonPrimitive?.contentOrNull ?: "0")
+                                val dateStr = obj["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                                val tag = obj["tag"]?.jsonPrimitive?.contentOrNull ?: "0"
+                                SmsMessage(0L, number, content, parseSmsDate(dateStr),
+                                    tag != "1", when (tag) { "2", "3" -> "sent"; else -> "received" })
+                            } catch (_: Exception) { null }
+                        }
+                        return msgs.groupBy { it.address }
+                            .mapValues { (_, ms) ->
+                                val latest = ms.maxByOrNull { it.date }
+                                mapOf<String, Any>(
+                                    "phoneNumber" to (latest?.address ?: "unknown"),
+                                    "total" to ms.size,
+                                    "unread" to ms.count { !it.read && it.direction == "received" },
+                                    "latestMsg" to (latest?.body ?: ""),
+                                    "latestTimestamp" to (latest?.date ?: 0L),
+                                    "latestDirection" to (latest?.direction ?: "received")
+                                )
+                            }
+                            .values.sortedByDescending { it["latestTimestamp"] as Long }
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+
+        // 回退2: ContentResolver
+        val all = getAll(limit = 5000, offset = 0) ?: emptyList()
+        if (all.isEmpty()) return emptyList()
+
+        return all.groupBy { it.address }
+            .mapValues { (_, msgs) ->
+                val latest = msgs.maxByOrNull { it.date }
+                mapOf<String, Any>(
+                    "phoneNumber" to (latest?.address ?: "unknown"),
+                    "total" to msgs.size,
+                    "unread" to msgs.count { !it.read && it.direction == "received" },
+                    "latestMsg" to (latest?.body ?: ""),
+                    "latestTimestamp" to (latest?.date ?: 0L),
+                    "latestDirection" to (latest?.direction ?: "received")
+                )
+            }
+            .values
+            .sortedByDescending { it["latestTimestamp"] as Long }
+    }
 
     /**
      * 获取最新一条短信（参考项目 SmsPoll.getLatestSms）
@@ -46,7 +140,7 @@ class SmsController(
         } catch (_: Exception) {}
         // fallback: Goform
         try {
-            goformClient?.let { gc ->
+            smsClient?.let { gc ->
                 val sms = gc.getSmsList(perPage = 200) ?: return@let
                 val arr = sms["messages"]?.jsonArray ?: return@let
                 for (el in arr) {
@@ -55,8 +149,10 @@ class SmsController(
                     if (mid == id) {
                         val number = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
                         val content = decodeB64(obj["content"]?.jsonPrimitive?.contentOrNull ?: "", obj["encode_type"]?.jsonPrimitive?.contentOrNull ?: "0")
-                        val date = obj["date"]?.jsonPrimitive?.longOrNull ?: 0L
-                        return SmsMessage(id, number, content, date, true, "received")
+                        val dateStr = obj["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                        val date = parseSmsDate(dateStr)
+                        val tag = obj["tag"]?.jsonPrimitive?.contentOrNull ?: "0"
+                        return SmsMessage(id, number, content, date, smsReadFromTag(tag), smsDirectionFromTag(tag))
                     }
                 }
             }
@@ -66,8 +162,8 @@ class SmsController(
 
     suspend fun delete(id: Long): Boolean {
         try {
-            goformClient?.let { gc ->
-                if (gc.ensureLogin()) { val r = gc.deleteSms(id.toString()); if (r) return true }
+            smsClient?.let { gc ->
+                val r = gc.deleteSms(id.toString()); if (r) return true
             }
         } catch (_: Exception) {}
         try {
@@ -87,8 +183,8 @@ class SmsController(
     private suspend fun markAsRead(read: Boolean, id: Long): Boolean {
         val readVal = if (read) 1 else 0
         try {
-            goformClient?.let { gc ->
-                if (read && gc.ensureLogin()) { val r = gc.markSmsRead(id.toString()); if (r) return true }
+            smsClient?.let { gc ->
+                if (read) { val r = gc.markSmsRead(id.toString()); if (r) return true }
             }
         } catch (_: Exception) {}
         try {
@@ -105,8 +201,8 @@ class SmsController(
     suspend fun send(phoneNumber: String, message: String): SendResult {
         // 方案1: Goform API
         try {
-            goformClient?.let { gc ->
-                if (gc.ensureLogin() && gc.sendSms(phoneNumber, message)) return SendResult(true, "已通过 Goform 发送")
+            smsClient?.let { gc ->
+                if (gc.sendSms(phoneNumber, message)) return SendResult(true, "已通过 Goform 发送")
             }
         } catch (_: Exception) {}
         // 方案2: ContentResolver 写入发件箱
@@ -153,20 +249,22 @@ class SmsController(
         return r.stdout.trim().toIntOrNull() ?: 0
     }
 
-    private suspend fun readSms(folder: String?, limit: Int): List<SmsMessage> {
+    private suspend fun readSms(folder: String?, limit: Int, offset: Int = 0, phone: String? = null): List<SmsMessage> {
         // 方案1: ContentResolver (最可靠)
         try {
             context?.let { ctx ->
                 val uri = when (folder) {
                     "inbox" -> smsInboxUri; "sent" -> smsSentUri; else -> smsAllUri
                 }
-                val cursor = ctx.contentResolver.query(uri, arrayOf("_id","address","body","date","read","type"), null, null, "date DESC")
+                val selection = if (!phone.isNullOrBlank()) "address=?" else null
+                val selectionArgs = if (!phone.isNullOrBlank()) arrayOf(phone) else null
+                val cursor = ctx.contentResolver.query(uri, arrayOf("_id","address","body","date","read","type"), selection, selectionArgs, "date DESC")
                 cursor?.use {
                     val msgs = mutableListOf<SmsMessage>()
                     while (it.moveToNext()) { msgs.add(parseCursorRow(it)) }
                     if (msgs.isNotEmpty()) {
                         AppLogger.d(tag, "readSms via ContentResolver: ${msgs.size} messages")
-                        return msgs.take(limit)
+                        return msgs.drop(offset).take(limit)
                     }
                     AppLogger.d(tag, "readSms via ContentResolver: 0 messages (empty)")
                 }
@@ -177,7 +275,7 @@ class SmsController(
 
         // 方案2: Goform API
         try {
-            goformClient?.let { gc ->
+            smsClient?.let { gc ->
                 val smsData = gc.getSmsList(perPage = limit.coerceAtLeast(200))
                 if (smsData != null) {
                     val arr = smsData["messages"]?.jsonArray
@@ -188,18 +286,21 @@ class SmsController(
                                 val id = obj["id"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
                                 val number = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
                                 val content = decodeB64(obj["content"]?.jsonPrimitive?.contentOrNull ?: "", obj["encode_type"]?.jsonPrimitive?.contentOrNull ?: "0")
-                                val date = obj["date"]?.jsonPrimitive?.longOrNull ?: 0L
-                                SmsMessage(id, number, content, date, true, "received")
+                                val dateStr = obj["date"]?.jsonPrimitive?.contentOrNull ?: ""
+                                val date = parseSmsDate(dateStr)
+                                val tag = obj["tag"]?.jsonPrimitive?.contentOrNull ?: "0"
+                                SmsMessage(id, number, content, date, smsReadFromTag(tag), smsDirectionFromTag(tag))
                             } catch (_: Exception) { null }
                         }
                         AppLogger.d(tag, "readSms via goform: ${msgs.size} messages")
-                        return msgs
+                        val filtered = if (!phone.isNullOrBlank()) msgs.filter { it.address == phone } else msgs
+                        return filtered.sortedByDescending { it.date }.drop(offset).take(limit)
                     }
                     AppLogger.d(tag, "readSms via goform: messages array empty or null (keys=${smsData.keys.joinToString()})")
                 } else {
                     AppLogger.d(tag, "readSms via goform: getSmsList returned null (login failed?)")
                 }
-            } ?: AppLogger.d(tag, "readSms: goformClient is null")
+            } ?: AppLogger.d(tag, "readSms: smsClient is null")
         } catch (e: Exception) {
             AppLogger.d(tag, "readSms goform failed: ${e.message}")
         }
@@ -214,7 +315,8 @@ class SmsController(
         }
         val all = parseRow(result.stdout)
         AppLogger.d(tag, "readSms via shell: ${all.size} messages")
-        return all.sortedByDescending { it.date }.take(limit)
+        val filtered = if (!phone.isNullOrBlank()) all.filter { it.address == phone } else all
+        return filtered.sortedByDescending { it.date }.drop(offset).take(limit)
     }
 
     private fun parseCursorRow(cursor: android.database.Cursor): SmsMessage {
@@ -234,6 +336,32 @@ class SmsController(
             when (encodeType) { "2" -> String(decoded, Charsets.UTF_16BE); else -> String(decoded, Charsets.UTF_8) }
         } catch (_: Exception) { contentB64 }
     }
+
+    /**
+     * 解析 Goform 短信日期格式: "YY,MM,DD,HH,mm,ss,+TZ"
+     * 示例: "26,06,10,21,19,13,+0800" → 2026-06-10 21:19:13 GMT+8
+     */
+    private fun parseSmsDate(dateStr: String): Long {
+        val parts = dateStr.split(",")
+        if (parts.size < 6) return 0L
+        val year = 2000 + (parts[0].toIntOrNull() ?: return 0L)
+        val month = parts[1].toIntOrNull() ?: return 0L
+        val day = parts[2].toIntOrNull() ?: return 0L
+        val hour = parts[3].toIntOrNull() ?: return 0L
+        val minute = parts[4].toIntOrNull() ?: return 0L
+        val second = parts[5].toIntOrNull() ?: return 0L
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("GMT+8"))
+        cal.set(year, month - 1, day, hour, minute, second)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis
+    }
+
+    /** tag映射方向: 0/1=received, 2/3=sent */
+    private fun smsDirectionFromTag(tag: String): String =
+        when (tag) { "2", "3" -> "sent"; else -> "received" }
+
+    /** tag映射已读: 1=unread, 其他=read */
+    private fun smsReadFromTag(tag: String): Boolean = tag != "1"
 
     private fun parseRow(output: String): List<SmsMessage> {
         val msgs = mutableListOf<SmsMessage>()

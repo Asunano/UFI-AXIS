@@ -17,6 +17,7 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.ScheduledTask
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.viewmodel.MainViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -26,12 +27,12 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
     var showCreateDialog by remember { mutableStateOf(false) }
     var editingTask by remember { mutableStateOf<ScheduledTask?>(null) }
 
-    LaunchedEffect(Unit) { viewModel.loadTaskList() }
+    LaunchedEffect(Unit) { viewModel.tools.loadTaskList() }
 
     UfiScreenScaffold(title = "定时任务", navController = navController, showBack = true,
         actions = {
             if (state.tasks.isNotEmpty()) {
-                IconButton(onClick = { viewModel.clearTasks() }) { Icon(Icons.Default.DeleteSweep, "清除全部") }
+                IconButton(onClick = { viewModel.tools.clearTasks() }) { Icon(Icons.Default.DeleteSweep, "清除全部") }
             }
             IconButton(onClick = { showCreateDialog = true }) { Icon(Icons.Default.Add, "新建任务") }
         }
@@ -40,7 +41,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
             state.errorMessage?.let { err ->
                 Card(
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                    shape = RoundedCornerShape(Spacing.CardCorner),
+                    shape = UfiCardDefaults.legacyShape,
                     modifier = Modifier.fillMaxWidth().padding(16.dp)
                 ) {
                     Text(err, modifier = Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onErrorContainer)
@@ -56,8 +57,8 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                     items(state.tasks, key = { it.id }) { task ->
                         TaskCard(task = task,
                             onEdit = { editingTask = it },
-                            onDelete = { viewModel.deleteTask(it.id) },
-                            onToggle = { viewModel.updateTask(it.id, it.copy(enabled = !it.enabled)) }
+                            onDelete = { viewModel.tools.deleteTask(it.id) },
+                            onToggle = { viewModel.tools.updateTask(it.id, it.copy(enabled = !it.enabled)) }
                         )
                     }
                 }
@@ -67,12 +68,12 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
 
     if (showCreateDialog) {
         TaskEditDialog(title = "新建任务", initial = ScheduledTask(),
-            onConfirm = { viewModel.createTask(it); showCreateDialog = false },
+            onConfirm = { viewModel.tools.createTask(it); showCreateDialog = false },
             onDismiss = { showCreateDialog = false })
     }
     editingTask?.let { task ->
         TaskEditDialog(title = "编辑任务", initial = task,
-            onConfirm = { viewModel.updateTask(task.id, it); editingTask = null },
+            onConfirm = { viewModel.tools.updateTask(task.id, it); editingTask = null },
             onDismiss = { editingTask = null })
     }
 }
@@ -81,9 +82,9 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
 private fun TaskCard(task: ScheduledTask, onEdit: (ScheduledTask) -> Unit, onDelete: (ScheduledTask) -> Unit, onToggle: (ScheduledTask) -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.legacyShape,
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        elevation = UfiCardDefaults.noElevation()
     ) {
         Column(Modifier.padding(8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -115,7 +116,7 @@ private fun TaskEditDialog(title: String, initial: ScheduledTask, onConfirm: (Sc
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.legacyShape,
         title = { Text(title, fontWeight = FontWeight.Bold) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {

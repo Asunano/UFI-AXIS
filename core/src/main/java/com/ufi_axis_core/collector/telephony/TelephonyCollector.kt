@@ -166,7 +166,7 @@ class TelephonyCollector(private val context: Context) {
 
     // --- 内部方法 ---
 
-    private fun isNetworkRegistered(): Boolean {
+    internal fun isNetworkRegistered(): Boolean {
         return try {
             telephonyManager?.networkOperator?.isNotEmpty() == true
         } catch (e: Exception) {

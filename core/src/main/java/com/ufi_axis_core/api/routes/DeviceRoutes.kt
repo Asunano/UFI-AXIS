@@ -4,16 +4,25 @@ import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformDeviceClient
+import com.ufi_axis_core.controller.goform.GoformNetworkClient
+import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.controller.system.SystemController
+import com.ufi_axis_core.util.AppSettings
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
+import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.core.cache.CacheTTL
+import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.ShellQoS
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 设备信息路由
@@ -25,42 +34,73 @@ class DeviceRoutes(
     private val telephonyCollector: TelephonyCollector,
     private val atChannel: ATChannel,
     private val goformClient: GoformClient,
-    private val systemController: SystemController
+    private val signalClient: GoformSignalClient,
+    private val networkClient: GoformNetworkClient,
+    private val deviceClient: GoformDeviceClient,
+    private val systemController: SystemController,
+    private val cache: ResponseCache? = null,
+    private val dataHub: DataHub? = null,
+    private val settings: AppSettings? = null
 ) {
     fun register(route: Route) {
         route.route("/device") {
             get("/info") {
-                val deviceInfo = systemController.getDeviceModel()
-                val simInfo = telephonyCollector.getSimInfo()
-                val storageInfo = systemCollector.getStorageInfo()
-                val uptime = systemCollector.getUptime()
-                val atInfo = atChannel.getPlatformInfo()
-                val kernelVersion = systemController.getKernelVersion()
-
-                // 优先使用 goform 数据获取网络类型和运营商，避免 TelephonyCollector 在无 SIM 设备上返回 "Unknown"
-                val goformInfo = try { goformClient.getSignalInfo() } catch (_: Exception) { null }
-                val rawType = goformInfo?.get("network_type")?.jsonPrimitive?.contentOrNull
-                val goformProvider = goformInfo?.get("network_provider")?.jsonPrimitive?.contentOrNull
-
-                call.respond(toJsonElement(mapOf(
-                    "device" to deviceInfo,
-                    "sim" to simInfo,
-                    "storage" to storageInfo,
-                    "uptime" to uptime,
-                    "at_channel" to atInfo,
-                    "kernel" to kernelVersion,
-                    "network" to mapOf(
-                        "operator" to (if (!goformProvider.isNullOrBlank()) goformProvider else telephonyCollector.getOperatorName()),
-                        "type" to (if (rawType != null) GoformClient.mapNetworkType(rawType) else telephonyCollector.getNetworkType()),
-                        "connected" to telephonyCollector.isNetworkAvailable()
-                    )
-                )))
+                suspend fun fetch(): JsonElement {
+                    val deviceInfo = systemController.getDeviceModel()
+                    val simInfo = telephonyCollector.getSimInfo()
+                    val storageInfo = systemCollector.getStorageInfo()
+                    val uptime = systemCollector.getUptime()
+                    val atInfo = atChannel.getPlatformInfo()
+                    val kernelVersion = systemController.getKernelVersion()
+                    // 通过 DataHub 获取网络类型信息（10s TTL 缓存，与 NetworkRoutes /status 共享）
+                    val hubInfo = try { dataHub?.getNetworkTypeInfo() } catch (_: Exception) { null }
+                    val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
+                    val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }
+                    // 从 DataHub 获取设备身份信息（已通过 ResponseCache 缓存）
+                    val identity = try { dataHub?.getDeviceIdentity() } catch (_: Exception) { null }
+                    return toJsonElement(mapOf(
+                        "device" to deviceInfo, "sim" to simInfo, "storage" to storageInfo,
+                        "uptime" to uptime, "at_channel" to atInfo, "kernel" to kernelVersion,
+                        "network" to mapOf(
+                            "operator" to (goformProvider ?: telephonyCollector.getOperatorName()),
+                            "type" to (if (goformType != null) GoformClient.mapNetworkType(goformType) else telephonyCollector.getNetworkType()),
+                            "connected" to telephonyCollector.isNetworkAvailable()
+                        ),
+                        "identity" to identity
+                    ))
+                }
+                call.respond(cache?.let { it.getOrPut("device:info", CacheTTL.DEVICE_INFO) { fetch() } } ?: fetch())
             }
 
-            // Goform 设备状态（直接从设备获取准确数据）
+            // Goform 设备状态（通过 DataHub 获取准确数据）
             get("/goform") {
-                val goformData = goformClient.getFullStatus()
-                call.respond(toJsonElement(goformData ?: emptyMap<String, Any>()))
+                suspend fun f(): JsonElement {
+                    val data = dataHub?.signalQuery { getFullStatus() } ?: signalClient.getFullStatus()
+                    return toJsonElement(data ?: emptyMap<String, Any>())
+                }
+                call.respond(if (cache != null) cache.getOrPut("device:goform", CacheTTL.GOFORM_FULL_STATUS) { f() } else f())
+            }
+
+            // 设备身份信息（通过 DataHub 获取，与 NetworkRoutes 共享缓存）
+            get("/identity") {
+                suspend fun f(): JsonElement {
+                    val data = dataHub?.getDeviceIdentity() ?: signalClient.getDeviceIdentity()
+                    return toJsonElement(data ?: emptyMap<String, Any>())
+                }
+                call.respond(if (cache != null) cache.getOrPut("device:identity", CacheTTL.DEVICE_IDENTITY) { f() } else f())
+            }
+
+            // 设备固件版本（通过 DataHub 获取）
+            get("/version") {
+                suspend fun f(): JsonElement {
+                    val data = dataHub?.signalQuery { getDeviceVersion() } ?: signalClient.getDeviceVersion()
+                    return toJsonElement(mapOf(
+                        "language" to (data?.get("Language")?.jsonPrimitive?.contentOrNull ?: ""),
+                        "cr_version" to (data?.get("cr_version")?.jsonPrimitive?.contentOrNull ?: ""),
+                        "wa_inner_version" to (data?.get("wa_inner_version")?.jsonPrimitive?.contentOrNull ?: "")
+                    ))
+                }
+                call.respond(if (cache != null) cache.getOrPut("device:version", CacheTTL.DEVICE_VERSION) { f() } else f())
             }
 
             get("/model") {
@@ -73,6 +113,7 @@ class DeviceRoutes(
 
             // 重启设备
             post("/reboot") {
+                cache?.invalidate("device:*")
                 val success = systemController.reboot()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
@@ -82,7 +123,8 @@ class DeviceRoutes(
 
             // 恢复出厂设置
             post("/factory-reset") {
-                val success = goformClient.factoryReset()
+                cache?.invalidate("*")
+                val success = deviceClient.factoryReset()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -93,7 +135,8 @@ class DeviceRoutes(
             post("/debug") {
                 val params = call.receive<JsonObject>()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setDebugMode(enabled)
+                val success = deviceClient.setDebugMode(enabled)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "enabled" to enabled))
@@ -104,7 +147,8 @@ class DeviceRoutes(
             post("/usb-mode") {
                 val params = call.receive<JsonObject>()
                 val mode = params["mode"]?.jsonPrimitive?.intOrNull ?: 0
-                val success = goformClient.setUsbMode(mode)
+                val success = deviceClient.setUsbMode(mode)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "mode" to mode))
@@ -121,22 +165,41 @@ class DeviceRoutes(
                         toJsonElement(mapOf("error" to "old_password and new_password are required")))
                     return@post
                 }
-                val success = goformClient.changePassword(oldPwd, newPwd)
+                val success = deviceClient.changePassword(oldPwd, newPwd)
+                if (success) {
+                    // 同步更新后端本地存储的 goform 密码，使后续请求无需重启即可生效
+                    settings?.goformPassword = newPwd
+                    goformClient.updateGoformPassword(newPwd)
+                    cache?.invalidate("device:*")
+                }
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
 
-            // APN 配置
+            // APN 配置（完整字段，与参考项目 saveAPNProfile + switchAPNAuto 一致）
             post("/apn") {
                 val p = call.receive<JsonObject>()
                 val autoSelect = p["auto_select"]?.jsonPrimitive?.booleanOrNull
-                val name = p["name"]?.jsonPrimitive?.contentOrNull
+                val index = p["index"]?.jsonPrimitive?.intOrNull ?: 0
+                val profileName = p["profile_name"]?.jsonPrimitive?.contentOrNull
                 val apn = p["apn"]?.jsonPrimitive?.contentOrNull
-                val user = p["user"]?.jsonPrimitive?.contentOrNull
-                val pass = p["pass"]?.jsonPrimitive?.contentOrNull
-                val authType = p["auth_type"]?.jsonPrimitive?.intOrNull
-                val pdpType = p["pdp_type"]?.jsonPrimitive?.intOrNull
-                val success = goformClient.setApnConfig(autoSelect, name, apn, user, pass, authType, pdpType)
+                val username = p["username"]?.jsonPrimitive?.contentOrNull
+                val password = p["password"]?.jsonPrimitive?.contentOrNull
+                // auth_type: "none" | "pap" | "chap"（字符串）
+                val authType = p["auth_type"]?.jsonPrimitive?.contentOrNull
+                // pdp_type: "IP" | "IPv6" | "IPv4v6"（字符串，非整数）
+                val pdpType = p["pdp_type"]?.jsonPrimitive?.contentOrNull
+                val success = networkClient.setApnConfig(
+                    autoSelect = autoSelect,
+                    index = index,
+                    profileName = profileName,
+                    apn = apn,
+                    username = username,
+                    password = password,
+                    authType = authType,
+                    pdpType = pdpType
+                )
+                if (success) cache?.invalidate("device:apn")
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -144,7 +207,8 @@ class DeviceRoutes(
             // APN 删除 (与参考项目 requests.js deleteAPNProfile 一致)
             delete("/apn/{index}") {
                 val index = call.parameters["index"]?.toIntOrNull() ?: 0
-                val success = goformClient.deleteApnProfile(index)
+                val success = networkClient.deleteApnProfile(index)
+                if (success) cache?.invalidate("device:apn")
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -153,7 +217,8 @@ class DeviceRoutes(
             post("/apn/switch") {
                 val p = call.receive<JsonObject>()
                 val index = p["index"]?.jsonPrimitive?.intOrNull ?: 0
-                val success = goformClient.switchApnManual(index)
+                val success = networkClient.switchApnManual(index)
+                if (success) cache?.invalidate("device:apn")
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -165,7 +230,8 @@ class DeviceRoutes(
                 val url = p["url"]?.jsonPrimitive?.contentOrNull
                 val username = p["username"]?.jsonPrimitive?.contentOrNull
                 val password = p["password"]?.jsonPrimitive?.contentOrNull
-                val success = goformClient.setTr069Config(enable, url, username, password)
+                val success = deviceClient.setTr069Config(enable, url, username, password)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success)))
             }
@@ -194,52 +260,50 @@ class DeviceRoutes(
                 call.respond(toJsonElement(mapOf("today" to today, "month" to month)))
             }
 
-            // 流量限额配置查询（从 ZTE 设备 goform 读取）
+            // 流量限额配置查询（通过 DataHub 从 goform 读取）
             get("/traffic-limit") {
-                val raw = goformClient.getDataUsage()
+                val raw = dataHub?.signalQuery { getDataUsage() } ?: signalClient.getDataUsage()
                 if (raw == null) {
-                    call.respond(toJsonElement(mapOf("error" to "查询失败")))
+                    call.respond(HttpStatusCode.ServiceUnavailable,
+                        toJsonElement(mapOf("error" to "无法查询设备流量限额配置，请检查设备连接")))
                     return@get
                 }
-                val enabled = raw["data_volume_limit_switch"]?.jsonPrimitive?.contentOrNull == "1"
-                val limitSize = raw["data_volume_limit_size"]?.jsonPrimitive?.contentOrNull ?: ""
-                val limitUnit = raw["data_volume_limit_unit"]?.jsonPrimitive?.contentOrNull ?: "MB"
-                val alertPercent = raw["data_volume_alert_percent"]?.jsonPrimitive?.contentOrNull ?: "80"
-                val autoClear = raw["wan_auto_clear_flow_data_switch"]?.jsonPrimitive?.contentOrNull == "1"
-                val clearDate = raw["traffic_clear_date"]?.jsonPrimitive?.contentOrNull ?: "1"
-                val monthlyRx = raw["monthly_rx_bytes"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
-                val monthlyTx = raw["monthly_tx_bytes"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
-                val monthlyTime = raw["monthly_time"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
-                call.respond(toJsonElement(mapOf(
-                    "enabled" to enabled,
-                    "limit_size" to limitSize,
-                    "limit_unit" to limitUnit,
-                    "alert_percent" to alertPercent,
-                    "auto_clear" to autoClear,
-                    "clear_date" to clearDate,
-                    "monthly_rx_bytes" to monthlyRx,
-                    "monthly_tx_bytes" to monthlyTx,
-                    "monthly_time" to monthlyTime
-                )))
+                // 从缓存读取（成功时不缓存错误），优先走 ResponseCache
+                val cached = if (cache != null) {
+                    cache.getOrPut("device:traffic-limit", CacheTTL.TRAFFIC_LIMIT) {
+                        buildTrafficLimitResponse(raw)
+                    }
+                } else {
+                    buildTrafficLimitResponse(raw)
+                }
+                call.respond(cached)
             }
 
-            // 性能模式 (ZTE 设备)
+            // 性能模式 (ZTE 设备 goform PERFORMANCE_MODE_SETTING: 0=均衡, 1=高性能)
+            // 接受两种入参格式：
+            //   {"mode": "performance"} ↔ perfVal=1
+            //   {"mode": "balanced"}    ↔ perfVal=0
+            //   {"enabled": true}       ↔ perfVal=1
             post("/performance") {
                 val p = call.receive<JsonObject>()
-                val mode = p["mode"]?.jsonPrimitive?.contentOrNull ?: "balanced"
-                val perfVal = when (mode) {
-                    "performance" -> 1
-                    else -> 0
+                val perfVal = when {
+                    p.containsKey("enabled") -> if (p["enabled"]?.jsonPrimitive?.booleanOrNull == true) 1 else 0
+                    else -> {
+                        val mode = p["mode"]?.jsonPrimitive?.contentOrNull ?: "balanced"
+                        if (mode == "performance") 1 else 0
+                    }
                 }
-                val success = goformClient.setPerformanceMode(perfVal)
-                call.respond(toJsonElement(mapOf("success" to success, "mode" to mode)))
+                val success = deviceClient.setPerformanceMode(perfVal)
+                if (success) cache?.invalidate("device:settings")
+                call.respond(toJsonElement(mapOf("success" to success, "performance_mode" to perfVal)))
             }
 
             // 指示灯控制
             post("/led") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                val success = goformClient.setIndicatorLight(enabled)
+                val success = deviceClient.setIndicatorLight(enabled)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
 
@@ -247,46 +311,48 @@ class DeviceRoutes(
             post("/roaming") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setRoaming(enabled)
+                val success = networkClient.setRoaming(enabled)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
 
-            // USB 网络共享 (tethering)
-            post("/usb-tether") {
+            // USB 网络共享 (tethering) [已禁用]
+            if (false) post("/usb-tether") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val cmd = if (enabled) "svc usb setFunctions rndis" else "svc usb setFunctions none"
-                val success = ShellQoS.executeAsRoot(cmd).isSuccess
+                val success = withContext(Dispatchers.IO) {
+                    ShellExecutor.executeAsRoot(cmd).isSuccess
+                }
+                if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
 
-            // 5G SA 模式 — 通过 SET_BEARER_PREFERENCE 实现
-            post("/sa-mode") {
-                val p = call.receive<JsonObject>()
-                val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                // 参考项目: SA = "Only_5G", 关闭时恢复 AUTO = "WL_AND_5G"
-                val preference = if (enabled) "Only_5G" else "WL_AND_5G"
-                val success = goformClient.setBearerPreference(preference)
-                call.respond(toJsonElement(mapOf("success" to success, "sa_mode" to enabled)))
-            }
-
-            // 查询设备设置状态（LED、性能模式、漫游、Bearer、频段锁等）
+            // 查询设备设置状态（通过 DataHub 获取）
             get("/settings") {
-                val settings = goformClient.queryDeviceSettings() ?: emptyMap()
-                call.respond(toJsonElement(settings))
+                suspend fun f(): JsonElement {
+                    val data = dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings()
+                    return toJsonElement(data ?: emptyMap<String, Any>())
+                }
+                call.respond(if (cache != null) cache.getOrPut("device:settings", CacheTTL.DEVICE_SETTINGS) { f() } else f())
             }
 
-            // FOTA 禁用
+            // FOTA 禁用（语义：enabled=true → 禁用 FOTA → UpgMode=0）
+            // 与 REF goform SetUpgAutoSetting UpgMode="0" 禁用 一致
             post("/fota") {
                 val p = call.receive<JsonObject>()
-                val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setFotaEnabled(enabled)
-                call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
+                val disable = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
+                // disable=true → setFotaEnabled(false) → UpgMode=0 (禁用 FOTA)
+                val success = deviceClient.setFotaEnabled(!disable)
+                if (success) cache?.invalidate("device:settings")
+                call.respond(toJsonElement(mapOf("success" to success, "fota_disabled" to disable)))
             }
 
             // SELinux 状态
             get("/selinux") {
-                val status = ShellQoS.executeCached("getenforce 2>/dev/null").stdout.trim().ifEmpty { "Unknown" }
+                val status = withContext(Dispatchers.IO) {
+                    ShellExecutor.execute("getenforce 2>/dev/null").stdout.trim().ifEmpty { "Unknown" }
+                }
                 call.respond(toJsonElement(mapOf("selinux" to status)))
             }
 
@@ -294,7 +360,8 @@ class DeviceRoutes(
             post("/samba") {
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = goformClient.setSambaSetting(enabled)
+                val success = deviceClient.setSambaSetting(enabled)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
 
@@ -309,19 +376,28 @@ class DeviceRoutes(
                         toJsonElement(mapOf("error" to "pci, earfcn, rat are required")))
                     return@post
                 }
-                val success = goformClient.cellLock(pci, earfcn, rat)
+                val success = deviceClient.cellLock(pci, earfcn, rat)
+                if (success) {
+                    cache?.invalidate("network:cell-info")
+                    cache?.invalidate("device:settings")
+                }
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
             // 解锁所有基站
             post("/cell-unlock") {
-                val success = goformClient.unlockAllCell()
+                val success = deviceClient.unlockAllCell()
+                if (success) {
+                    cache?.invalidate("network:cell-info")
+                    cache?.invalidate("device:settings")
+                }
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
             // 设备关机
             post("/shutdown") {
-                val success = goformClient.shutdownDevice()
+                cache?.invalidate("*")
+                val success = deviceClient.shutdownDevice()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -333,7 +409,8 @@ class DeviceRoutes(
                 val p = call.receive<JsonObject>()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "00:00"
-                val success = goformClient.setRestartSchedule(enabled, time)
+                val success = deviceClient.setRestartSchedule(enabled, time)
+                if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled, "time" to time)))
             }
 
@@ -347,7 +424,8 @@ class DeviceRoutes(
                         toJsonElement(mapOf("error" to "mac and hostname are required")))
                     return@post
                 }
-                val success = goformClient.setHostname(mac, hostname)
+                val success = deviceClient.setHostname(mac, hostname)
+                if (success) cache?.invalidate("device:info")
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
@@ -360,7 +438,8 @@ class DeviceRoutes(
                 val dhcpStart = p["dhcp_start"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpEnd = p["dhcp_end"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpLease = p["dhcp_lease"]?.jsonPrimitive?.contentOrNull ?: "86400"
-                val success = goformClient.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+                val success = deviceClient.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+                if (success) cache?.invalidate("device:lan")
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
@@ -373,7 +452,8 @@ class DeviceRoutes(
                 val alertPercent = p["alert_percent"]?.jsonPrimitive?.contentOrNull
                 val autoClear = p["auto_clear"]?.jsonPrimitive?.booleanOrNull
                 val clearDate = p["clear_date"]?.jsonPrimitive?.contentOrNull
-                val success = goformClient.setDataLimit(enabled, limitSize, limitUnit, alertPercent, autoClear, clearDate)
+                val success = networkClient.setDataLimit(enabled, limitSize, limitUnit, alertPercent, autoClear, clearDate)
+                if (success) cache?.invalidate("device:traffic-limit")
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
@@ -383,32 +463,55 @@ class DeviceRoutes(
                 val way = p["way"]?.jsonPrimitive?.contentOrNull ?: "data"
                 val data = p["data"]?.jsonPrimitive?.contentOrNull ?: "0"
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "0"
-                val success = goformClient.calibrateFlow(way, data, time)
+                val success = networkClient.calibrateFlow(way, data, time)
+                if (success) cache?.invalidate("device:traffic-limit")
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
 
-            // APN 配置查询
+            // APN 配置查询（通过 DataHub 获取）
             get("/apn") {
-                val apn = goformClient.getApnConfig()
-                call.respond(toJsonElement(apn ?: emptyMap<String, Any>()))
+                val result = cache!!.getOrPut("device:apn", CacheTTL.APN_CONFIG) {
+                    val apn = dataHub?.signalQuery { getApnConfig() } ?: signalClient.getApnConfig()
+                    toJsonElement(apn ?: emptyMap<String, Any>())
+                }
+                call.respond(result)
             }
 
-            // SIM PIN 状态
+            // SIM PIN 状态（通过 DataHub 获取）
             get("/sim-pin") {
-                val pin = goformClient.getSimPinStatus()
+                val pin = dataHub?.signalQuery { getSimPinStatus() } ?: signalClient.getSimPinStatus()
                 call.respond(toJsonElement(pin ?: emptyMap<String, Any>()))
             }
 
-            // LAN/DHCP 状态查询
+            // LAN/DHCP 状态查询（通过 DataHub 获取）
             get("/lan-settings") {
-                val lan = goformClient.getLanSettings()
-                call.respond(toJsonElement(lan ?: emptyMap<String, Any>()))
+                suspend fun f(): JsonElement {
+                    val data = dataHub?.signalQuery { getLanSettings() } ?: signalClient.getLanSettings()
+                    return toJsonElement(data ?: emptyMap<String, Any>())
+                }
+                call.respond(if (cache != null) cache.getOrPut("device:lan", CacheTTL.LAN_SETTINGS) { f() } else f())
             }
 
-            // MAC 访问控制列表查询（黑名单）
+            // MAC 访问控制列表查询（通过 DataHub 获取）
             get("/access-control") {
-                val acl = goformClient.queryDeviceAccessControlList()
-                call.respond(toJsonElement(acl ?: emptyMap<String, Any>()))
+                val result = cache!!.getOrPut("device:acl", CacheTTL.ACCESS_CONTROL) {
+                    val acl = dataHub?.signalQuery { queryDeviceAccessControlList() } ?: signalClient.queryDeviceAccessControlList()
+                    toJsonElement(acl ?: emptyMap<String, Any>())
+                }
+                call.respond(result)
+            }
+
+            // 重置 Telephony Provider（紧急恢复：SIM 卡无限重置时使用）
+            post("/telephony-reset") {
+                val result = withContext(Dispatchers.IO) {
+                    ShellExecutor.executeAsRoot("pm clear com.android.providers.telephony 2>/dev/null")
+                }
+                call.respond(toJsonElement(mapOf(
+                    "success" to result.isSuccess,
+                    "exit_code" to result.exitCode,
+                    "stdout" to result.stdout,
+                    "stderr" to result.stderr
+                )))
             }
 
             // MAC 访问控制列表设置
@@ -417,9 +520,35 @@ class DeviceRoutes(
                 val aclMode = p["acl_mode"]?.jsonPrimitive?.contentOrNull ?: "0"
                 val macList = p["mac_list"]?.jsonPrimitive?.contentOrNull ?: ""
                 val nameList = p["name_list"]?.jsonPrimitive?.contentOrNull ?: ""
-                val success = goformClient.setDeviceAccessControlList(aclMode, macList, nameList)
+                val success = deviceClient.setDeviceAccessControlList(aclMode, macList, nameList)
+                if (success) cache?.invalidate("device:acl")
                 call.respond(toJsonElement(mapOf("success" to success)))
             }
         }
+    }
+
+    // ──────────── 辅助方法 ────────────
+
+    private fun buildTrafficLimitResponse(raw: JsonObject): JsonElement {
+        val enabled = raw["data_volume_limit_switch"]?.jsonPrimitive?.contentOrNull == "1"
+        val limitSize = raw["data_volume_limit_size"]?.jsonPrimitive?.contentOrNull ?: ""
+        val limitUnit = raw["data_volume_limit_unit"]?.jsonPrimitive?.contentOrNull ?: "MB"
+        val alertPercent = raw["data_volume_alert_percent"]?.jsonPrimitive?.contentOrNull ?: "80"
+        val autoClear = raw["wan_auto_clear_flow_data_switch"]?.jsonPrimitive?.contentOrNull == "1"
+        val clearDate = raw["traffic_clear_date"]?.jsonPrimitive?.contentOrNull ?: "1"
+        val monthlyRx = raw["monthly_rx_bytes"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
+        val monthlyTx = raw["monthly_tx_bytes"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
+        val monthlyTime = raw["monthly_time"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
+        return toJsonElement(mapOf(
+            "enabled" to enabled,
+            "limit_size" to limitSize,
+            "limit_unit" to limitUnit,
+            "alert_percent" to alertPercent,
+            "auto_clear" to autoClear,
+            "clear_date" to clearDate,
+            "monthly_rx_bytes" to monthlyRx,
+            "monthly_tx_bytes" to monthlyTx,
+            "monthly_time" to monthlyTime
+        ))
     }
 }

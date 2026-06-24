@@ -1,7 +1,6 @@
 package com.ufi_axis.ui.components.common
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -14,7 +13,9 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.unit.dp
+import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -31,6 +32,7 @@ fun UfiPasswordField(
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default
 ) {
     var visible by remember { mutableStateOf(false) }
+    val palette = LocalResolvedPalette.current
 
     OutlinedTextField(
         value = value,
@@ -43,7 +45,18 @@ fun UfiPasswordField(
         modifier = modifier.fillMaxWidth(),
         visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
         keyboardOptions = keyboardOptions,
-        supportingText = errorMessage?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
+        supportingText = errorMessage?.let { { Text(it, color = palette.error) } },
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = palette.inputBorderFocused,
+            unfocusedBorderColor = palette.inputBorder,
+            cursorColor = palette.accent,
+            focusedTextColor = palette.textPrimary,
+            unfocusedTextColor = palette.textPrimary,
+            focusedLabelColor = palette.accent,
+            unfocusedLabelColor = palette.textSecondary,
+            focusedTrailingIconColor = palette.iconTint,
+            unfocusedTrailingIconColor = palette.iconTint.copy(alpha = 0.6f)
+        ),
         trailingIcon = if (showToggle) {
             {
                 IconButton(onClick = { visible = !visible }) {
@@ -54,7 +67,7 @@ fun UfiPasswordField(
                 }
             }
         } else null,
-        shape = RoundedCornerShape(Spacing.CardCorner)
+        shape = UfiCardDefaults.inputShape
     )
 }
 
@@ -78,6 +91,7 @@ fun UfiTextField(
     leadingIcon: @Composable (() -> Unit)? = null,
     supportingText: @Composable (() -> Unit)? = null
 ) {
+    val palette = LocalResolvedPalette.current
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
@@ -94,9 +108,22 @@ fun UfiTextField(
         trailingIcon = trailingIcon,
         leadingIcon = leadingIcon,
         supportingText = if (errorMessage != null) {
-            { Text(errorMessage, color = MaterialTheme.colorScheme.error) }
+            { Text(errorMessage, color = palette.error) }
         } else supportingText,
-        shape = RoundedCornerShape(Spacing.CardCorner)
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = palette.inputBorderFocused,
+            unfocusedBorderColor = palette.inputBorder,
+            cursorColor = palette.accent,
+            focusedTextColor = palette.textPrimary,
+            unfocusedTextColor = palette.textPrimary,
+            focusedLabelColor = palette.accent,
+            unfocusedLabelColor = palette.textSecondary,
+            focusedLeadingIconColor = palette.iconTint,
+            unfocusedLeadingIconColor = palette.iconTint.copy(alpha = 0.6f),
+            focusedTrailingIconColor = palette.iconTint,
+            unfocusedTrailingIconColor = palette.iconTint.copy(alpha = 0.6f)
+        ),
+        shape = UfiCardDefaults.inputShape
     )
 }
 
@@ -112,6 +139,7 @@ fun UfiDigitField(
     errorMessage: String? = null,
     enabled: Boolean = true
 ) {
+    val palette = LocalResolvedPalette.current
     OutlinedTextField(
         value = value,
         onValueChange = { onValueChange(it.filter { c -> c.isDigit() }.take(maxLength)) },
@@ -121,8 +149,17 @@ fun UfiDigitField(
         enabled = enabled,
         modifier = modifier,
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-        supportingText = errorMessage?.let { { Text(it, color = MaterialTheme.colorScheme.error) } },
-        shape = RoundedCornerShape(Spacing.CardCorner)
+        supportingText = errorMessage?.let { { Text(it, color = palette.error) } },
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = palette.inputBorderFocused,
+            unfocusedBorderColor = palette.inputBorder,
+            cursorColor = palette.accent,
+            focusedTextColor = palette.textPrimary,
+            unfocusedTextColor = palette.textPrimary,
+            focusedLabelColor = palette.accent,
+            unfocusedLabelColor = palette.textSecondary
+        ),
+        shape = UfiCardDefaults.inputShape
     )
 }
 
@@ -138,6 +175,7 @@ fun UfiFieldRow(
     )
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UfiInputWithAction(
     value: String,
@@ -150,6 +188,7 @@ fun UfiInputWithAction(
     enabled: Boolean = true,
     actionEnabled: Boolean = true
 ) {
+    val palette = LocalResolvedPalette.current
     Row(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(Spacing.Medium),
@@ -163,18 +202,32 @@ fun UfiInputWithAction(
             singleLine = true,
             enabled = enabled,
             modifier = Modifier.weight(1f),
-            shape = RoundedCornerShape(Spacing.CardCorner)
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = palette.inputBorderFocused,
+                unfocusedBorderColor = palette.inputBorder,
+                cursorColor = palette.accent,
+                focusedTextColor = palette.textPrimary,
+                unfocusedTextColor = palette.textPrimary,
+                focusedLabelColor = palette.accent,
+                unfocusedLabelColor = palette.textSecondary
+            ),
+            shape = UfiCardDefaults.inputShape
         )
         Button(
             onClick = onAction,
             enabled = actionEnabled && value.isNotBlank(),
-            shape = RoundedCornerShape(Spacing.CardCorner)
+            shape = UfiCardDefaults.buttonShape,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = palette.accent,
+                contentColor = palette.onAccent
+            )
         ) {
             Text(actionText)
         }
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun UfiSearchBar(
     query: String,
@@ -182,18 +235,30 @@ fun UfiSearchBar(
     placeholder: String = "搜索...",
     modifier: Modifier = Modifier
 ) {
+    val palette = LocalResolvedPalette.current
     OutlinedTextField(
         value = query,
         onValueChange = onQueryChange,
         placeholder = { Text(placeholder) },
         singleLine = true,
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = palette.inputBorderFocused,
+            unfocusedBorderColor = palette.inputBorder,
+            cursorColor = palette.accent,
+            focusedTextColor = palette.textPrimary,
+            unfocusedTextColor = palette.textPrimary,
+            focusedLeadingIconColor = palette.iconTint,
+            unfocusedLeadingIconColor = palette.iconTint.copy(alpha = 0.6f),
+            focusedTrailingIconColor = palette.iconTint,
+            unfocusedTrailingIconColor = palette.iconTint.copy(alpha = 0.6f)
+        ),
+        shape = UfiCardDefaults.inputShape,
         leadingIcon = {
             Icon(
                 imageVector = Icons.Default.Search,
                 contentDescription = "搜索",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                tint = palette.iconTint.copy(alpha = 0.6f)
             )
         },
         trailingIcon = {
@@ -202,7 +267,7 @@ fun UfiSearchBar(
                     Icon(
                         imageVector = Icons.Default.Clear,
                         contentDescription = "清除",
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        tint = palette.iconTint.copy(alpha = 0.6f)
                     )
                 }
             }

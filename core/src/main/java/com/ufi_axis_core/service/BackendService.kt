@@ -11,25 +11,13 @@ import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
-import com.ufi_axis_core.alert.AlertEngine
-import com.ufi_axis_core.api.middleware.AuthMiddleware
-import com.ufi_axis_core.api.routes.*
-import com.ufi_axis_core.api.websocket.WebSocketManager
-import com.ufi_axis_core.collector.at.ATChannel
-import com.ufi_axis_core.collector.system.SystemCollector
-import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.goform.GoformClient
-import com.ufi_axis_core.controller.network.NetworkController
-import com.ufi_axis_core.controller.sim.SimController
-import com.ufi_axis_core.controller.system.SystemController
-import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.scheduler.DataScheduler
-import com.ufi_axis_core.core.server.HttpServer
 import com.ufi_axis_core.util.AppLogger
-import com.ufi_axis_core.util.AppSettings
-import com.ufi_axis_core.util.AssetExtractor
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.coroutines.*
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * 后端前台服务
@@ -43,17 +31,25 @@ import kotlinx.coroutines.*
  *
  * Magisk 自启动 & 进程管理，零保活
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class BackendService : Service() {
 
     private val tag = "BackendService"
-    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val serviceScope = CoroutineScope(Dispatchers.IO.limitedParallelism(8) + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "BackendService coroutine exception (uncaught)", e)
+    })
 
     companion object {
         const val CHANNEL_ID = "ufi_axis_core_service"
         const val NOTIFICATION_ID = 1
+        private val WHITESPACE_REGEX = Regex("\\s+")
+        private const val MAX_CRASH_RETRY = 3
 
         @Volatile
         var isRunning: Boolean = false
+
+        // 启动失败计数（防止 START_STICKY + init 失败 = 无限重启循环）
+        val crashRetryCount = AtomicInteger(0)
 
         fun start(context: Context) {
             // minSdk=31, startForegroundService 始终可用
@@ -65,16 +61,10 @@ class BackendService : Service() {
         }
     }
 
-    // 组件引用
-    private var httpServer: HttpServer? = null
-    private var dataScheduler: DataScheduler? = null
-    private var alertEngine: AlertEngine? = null
-    private var webSocketManager: WebSocketManager? = null
-    private var goformClient: GoformClient? = null
-    private var adbController: com.ufi_axis_core.controller.adb.AdbController? = null
-    private var taskScheduler: com.ufi_axis_core.core.scheduler.TaskScheduler? = null
+    // 组件图（由 ComponentFactory 构建）
+    private var graph: ComponentGraph? = null
+    // 系统级组件引用（用于 destroy 和启动动作）
     private var batteryNotifier: BatteryNotifier? = null
-    private var downloadManager: com.ufi_axis_core.controller.system.DownloadManager? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -96,6 +86,10 @@ class BackendService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (isRunning) {
+            AppLogger.i(tag, "Service already running, ignoring duplicate start")
+            return START_STICKY
+        }
         AppLogger.i(tag, "Service starting...")
 
         serviceScope.launch {
@@ -125,96 +119,25 @@ class BackendService : Service() {
             AppLogger.i(tag, "Initializing components...")
             updateNotification("正在初始化组件...")
 
-            val settings = AppSettings.getInstance(this)
-            val port = settings.port
-            AppLogger.setDebugMode(settings.debugMode)
+            val gatewayIp = getDeviceGatewayIp()
+            val g = ComponentFactory.build(this, gatewayIp)
+            graph = g
 
-            // 0. 提取 shell 资产（二进制 + 脚本）
-            try {
-                AssetExtractor.extractAll(applicationContext)
-                AppLogger.i(tag, "Shell assets extracted")
-            } catch (e: Exception) {
-                AppLogger.w(tag, "Asset extraction failed: ${e.message}")
-            }
-
-            // 1. 数据库
-            val database = AppDatabase.getInstance(this)
-            AppLogger.i(tag, "Database initialized")
-
-            // 2. AT 通道（加超时保护，避免 AT 初始化卡住阻塞整个服务启动）
-            val atChannel = ATChannel(applicationContext)
-            val atConnected = try {
-                kotlinx.coroutines.withTimeoutOrNull(10_000L) { atChannel.init() } ?: false
-            } catch (e: Exception) {
-                AppLogger.e(tag, "AT channel init exception", e); false
-            }
-            AppLogger.i(tag, "AT channel: ${if (atConnected) "connected" else "not available"}")
-
-            // 3. 采集器
-            val systemCollector = SystemCollector(this)
-            val telephonyCollector = TelephonyCollector(this)
-
-            // 4. 控制器 - 使用配置的 IP、端口和密码
-            val goformIp = settings.goformIp.ifBlank { getDeviceGatewayIp() }
-            val goform = GoformClient(
-                deviceIp = goformIp,
-                port = settings.goformPort,
-                password = settings.goformPassword
-            )
-            goformClient = goform
-            val networkController = NetworkController(this, atChannel, goform)
-            val simController = SimController(this, atChannel, database, goform)
-            val systemController = SystemController(goform)
-
-            // 5. WebSocket 管理器（传入 token 用于认证）
-            val wsManager = WebSocketManager(expectedToken = settings.token)
-            webSocketManager = wsManager
-
-            // 6. 告警引擎
-            val alert = AlertEngine(database.alertDao(), wsManager)
-            alertEngine = alert
-
-            // 6.5 共享组件：动态线程池 + QoS 中间件
-            val dynamicThreadPool = com.ufi_axis_core.util.DynamicThreadPool()
-            val qosMiddleware = com.ufi_axis_core.api.middleware.QoSMiddleware()
-
-            // 7. 数据采集调度器（注入告警引擎 + 共享线程池）
-            val scheduler = DataScheduler(
-                systemCollector, telephonyCollector, atChannel, database, wsManager, goform,
-                alertEngine = alert,
-                dynamicThreadPool = dynamicThreadPool,
-                qosMiddleware = qosMiddleware
-            )
-            dataScheduler = scheduler
-
-            // 8. 认证中间件（从配置读取 Token/Secret/频率限制）
-            val authMiddleware = AuthMiddleware(settings)
-
-            // 9. 新控制器
-            val ac = com.ufi_axis_core.controller.adb.AdbController(goform).also { adbController = it }
-
-            // 10. API 路由
-            val deviceRoutes = DeviceRoutes(systemCollector, telephonyCollector, atChannel, goform, systemController)
-            val networkRoutes = NetworkRoutes(telephonyCollector, atChannel, networkController, database, goform, scheduler)
-            val systemRoutes = SystemRoutes(systemCollector, scheduler, database, atChannel, applicationContext)
-            val trafficRoutes = TrafficRoutes(scheduler, database)
-
-            // 电池事件通知
-            val smsFwdForBattery = com.ufi_axis_core.controller.sms.SmsForwardController(this, systemCollector)
+            // ── 电池事件通知（依赖 smsForwardController） ──
             val notifier = BatteryNotifier(
                 onLowBattery = { pct ->
                     serviceScope.launch {
-                        try { smsFwdForBattery.forwardSms("SYSTEM", "低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
                     }
                 },
                 onVeryLowBattery = { pct ->
                     serviceScope.launch {
-                        try { smsFwdForBattery.forwardSms("SYSTEM", "极低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "极低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
                     }
                 },
                 onFullBattery = {
                     serviceScope.launch {
-                        try { smsFwdForBattery.forwardSms("SYSTEM", "电池已充满", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "电池已充满", System.currentTimeMillis()) } catch (_: Exception) {}
                     }
                 },
                 onChargeStart = {
@@ -223,74 +146,12 @@ class BackendService : Service() {
             )
             batteryNotifier = notifier
 
-            // 高级工具路由
-            val advancedRoutes = AdvancedRoutes(applicationContext)
-            val simRoutes = SimRoutes(simController, database, goform)
-            val atRoutes = ATRoutes(atChannel)
-            val alertRoutes = AlertRoutes(alert)
-            val wifiRoutes = WifiRoutes(goform, networkController)
-            val configRoutes = ConfigRoutes(settings)
-            val appManager = com.ufi_axis_core.controller.system.AppManager()
-            val appRoutes = AppRoutes(appManager)
-            val shellRoutes = ShellRoutes()
-            val fileRoutes = com.ufi_axis_core.api.routes.FileRoutes()
-            val smsController = com.ufi_axis_core.controller.sms.SmsController(this, goform)
-            val rootSmsRoutes = RootSmsRoutes(smsController)
-            val adbRoutes = com.ufi_axis_core.api.routes.AdbRoutes(ac)
-            val proxyRoutes = com.ufi_axis_core.api.routes.ProxyRoutes(settings.goformIp.ifBlank { getDeviceGatewayIp() }, settings.goformPort)
-            val smsForwardController = com.ufi_axis_core.controller.sms.SmsForwardController(this, systemCollector)
-            val smsForwardRoutes = com.ufi_axis_core.api.routes.SmsForwardRoutes(smsForwardController)
-            val ts = com.ufi_axis_core.core.scheduler.TaskScheduler(this).also { taskScheduler = it }
-            val taskRoutes = com.ufi_axis_core.api.routes.TaskRoutes(ts)
-            val speedTestRoutes = com.ufi_axis_core.api.routes.SpeedTestRoutes()
-            val debugLogRoutes = com.ufi_axis_core.api.routes.DebugLogRoutes()
-            val qosRoutes = com.ufi_axis_core.api.routes.QoSRoutes(qosMiddleware, dynamicThreadPool)
-            val monitorRoutes = com.ufi_axis_core.api.routes.MonitorRoutes(database)
-            val dm = com.ufi_axis_core.controller.system.DownloadManager(applicationContext)
-            downloadManager = dm
-            // 复用 DataScheduler 已采集的传感器缓存，避免 DownloadManager 重复 shell 调用
-            dataScheduler?.let { dm.setDataScheduler(it) }
-            val downloadRoutes = com.ufi_axis_core.api.routes.DownloadRoutes(dm)
-
-            // 11. HTTP Server
-            val server = HttpServer(
-                port = port,
-                authMiddleware = authMiddleware,
-                qosMiddleware = qosMiddleware,
-                webSocketManager = wsManager,
-                deviceRoutes = deviceRoutes,
-                networkRoutes = networkRoutes,
-                systemRoutes = systemRoutes,
-                trafficRoutes = trafficRoutes,
-                simRoutes = simRoutes,
-                atRoutes = atRoutes,
-                alertRoutes = alertRoutes,
-                wifiRoutes = wifiRoutes,
-                configRoutes = configRoutes,
-                appRoutes = appRoutes,
-                shellRoutes = shellRoutes,
-                fileRoutes = fileRoutes,
-                rootSmsRoutes = rootSmsRoutes,
-                adbRoutes = adbRoutes,
-                proxyRoutes = proxyRoutes,
-                smsForwardRoutes = smsForwardRoutes,
-                taskRoutes = taskRoutes,
-                speedTestRoutes = speedTestRoutes,
-                debugLogRoutes = debugLogRoutes,
-                advancedRoutes = advancedRoutes,
-                qosRoutes = qosRoutes,
-                monitorRoutes = monitorRoutes,
-                downloadRoutes = downloadRoutes
-            )
-            httpServer = server
-
-            // 启动后台短信轮询（参考项目 SmsPoll: 8秒间隔，检测最新短信+时间窗口+去重）
+            // ── SMS 轮询 Job ──
             val smsPollJob = serviceScope.launch {
-                val smsForwardCtl = smsForwardController
-                val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, goform)
+                val smsForwardCtl = g.smsForwardController
+                val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.smsClient)
                 var lastForwardedId: Long = -1
                 var pollCount = 0
-                // 首次轮询前记录配置状态
                 val initCfg = smsForwardCtl.loadConfig()
                 AppLogger.i(tag, "SMS poll init: enabled=${initCfg.enabled}, method=${initCfg.method}, smtpHost=${initCfg.smtpHost.takeIf { it.isNotBlank() } ?: "(empty)"}")
                 while (isActive) {
@@ -299,7 +160,6 @@ class BackendService : Service() {
                     try {
                         val cfg = smsForwardCtl.loadConfig()
                         if (!cfg.enabled) {
-                            // 每 60 次(约 8 分钟)静默提醒一次
                             if (pollCount % 60 == 1) AppLogger.d(tag, "SMS poll #$pollCount: forwarding disabled, skipping")
                             continue
                         }
@@ -308,9 +168,7 @@ class BackendService : Service() {
                             if (pollCount % 30 == 1) AppLogger.w(tag, "SMS poll #$pollCount: getLatest() returned null — SMS 读取失败（ContentResolver 和 goform 均无数据）")
                             continue
                         }
-                        // 去重：已转发过的不再处理
                         if (latest.id == lastForwardedId) continue
-                        // 时间窗口：只处理最近 2 分钟内的短信（参考项目 minute=2）
                         val age = System.currentTimeMillis() - latest.date
                         if (age <= 2 * 60 * 1000L) {
                             AppLogger.i(tag, "New SMS #${latest.id} from ${latest.address}: ${latest.body.take(50)}")
@@ -318,7 +176,6 @@ class BackendService : Service() {
                             AppLogger.i(tag, "Forward result: ${if (ok) "success" else "failed"} (method=${cfg.method})")
                             lastForwardedId = latest.id
                         } else {
-                            // 最新短信超过 2 分钟 — 正常情况（没有新短信）
                             if (pollCount % 60 == 1) AppLogger.d(tag, "SMS poll #$pollCount: latest SMS age=${age / 1000}s (>2min), no new SMS")
                         }
                     } catch (e: Exception) {
@@ -326,13 +183,15 @@ class BackendService : Service() {
                     }
                 }
             }
-            smsPollJob
 
-            // 启动服务
-            scheduler.start()
-            server.start()
+            // ── 启动服务 ──
+            g.dataScheduler.start()
+            val serverOk = g.server.start()
+            if (!serverOk) {
+                AppLogger.e(tag, "HTTP Server failed to start, but service will continue")
+            }
 
-            // 注册电池事件监听
+            // ── 注册电池事件监听 ──
             try {
                 val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -345,36 +204,10 @@ class BackendService : Service() {
                 AppLogger.w(tag, "Battery notifier registration failed: ${e.message}")
             }
 
-            // 恢复 VoLTE/VoNR 持久化状态
-            serviceScope.launch {
+            // ── 自动启动 iperf3 ── （已禁用）
+            if (false) serviceScope.launch {
                 try {
-                    val voPrefs = applicationContext.getSharedPreferences("ufi_axis_vo", Context.MODE_PRIVATE)
-                    val at = atChannel
-                    if (at != null && at.isConnected) {
-                        // VoLTE
-                        if (voPrefs.contains("voLte_slot0")) {
-                            val enabled = voPrefs.getBoolean("voLte_slot0", false)
-                            val val0 = if (enabled) "1" else "0"
-                            at.sendCommand("AT+CAVIMS=$val0", 5000)
-                            AppLogger.i(tag, "VoLTE restored: slot0=$val0")
-                        }
-                        // VoNR
-                        if (voPrefs.contains("voNr_slot0")) {
-                            val enabled = voPrefs.getBoolean("voNr_slot0", false)
-                            val val0 = if (enabled) "1" else "0"
-                            at.sendCommand("AT+SP5GCMDS=\"set nr param\",45,$val0", 5000)
-                            AppLogger.i(tag, "VoNR restored: slot0=$val0")
-                        }
-                    }
-                } catch (e: Exception) {
-                    AppLogger.w(tag, "VoLTE/VoNR restore failed: ${e.message}")
-                }
-            }
-
-            // 自动启动 iperf3
-            serviceScope.launch {
-                try {
-                    val iperf3Path = AssetExtractor.getPath(applicationContext, "iperf3")
+                    val iperf3Path = com.ufi_axis_core.util.AssetExtractor.getPath(applicationContext, "iperf3")
                     ShellExecutor.executeAsRoot("$iperf3Path -s -D")
                     AppLogger.i(tag, "iperf3 auto-started")
                 } catch (e: Exception) {
@@ -382,26 +215,56 @@ class BackendService : Service() {
                 }
             }
 
-            updateNotification("UFI-AXIS-Core 运行中 (:$port)")
-            AppLogger.i(tag, "All components initialized successfully. Server listening on :$port")
+            // ── 开机自动启动 ADB WiFi (根据配置) ── （已禁用）
+            if (false) if (g.settings.adbAutoStartOnBoot) {
+                serviceScope.launch {
+                    delay(5000) // 等待其他组件稳定
+                    try {
+                        val started = g.adbController.start()
+                        AppLogger.i(tag, "ADB auto-start: ${if (started) "success" else "failed"}")
+                    } catch (e: Exception) {
+                        AppLogger.w(tag, "ADB auto-start error: ${e.message}")
+                    }
+                }
+            }
+
+            updateNotification("UFI-AXIS-Core 运行中 (:${g.settings.port})")
+            AppLogger.i(tag, "All components initialized successfully. Server listening on :${g.settings.port}")
+
+            // 重置启动失败计数（成功启动后）
+            crashRetryCount.set(0)
 
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to initialize components", e)
             updateNotification("UFI-AXIS-Core 启动失败: ${e.message}")
+
+            // 防止 START_STICKY 无限重启循环：连续失败 3 次后主动停止
+            val retries = crashRetryCount.incrementAndGet()
+            AppLogger.e(tag, "Init failure count: $retries/$MAX_CRASH_RETRY")
+            if (retries >= MAX_CRASH_RETRY) {
+                AppLogger.e(tag, "Too many init failures, stopping service to prevent crash loop")
+                crashRetryCount.set(0)
+                isRunning = false
+                stopSelf()
+            }
         }
     }
 
     private suspend fun stopAllComponents() {
         AppLogger.i(tag, "Stopping all components...")
         try { batteryNotifier?.let { unregisterReceiver(it) } } catch (e: Exception) { AppLogger.e(tag, "Error unregistering battery notifier", e) }
-        try { httpServer?.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping server", e) }
-        try { dataScheduler?.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping scheduler", e) }
-        try { alertEngine?.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping alert engine", e) }
-        try { webSocketManager?.closeAll() } catch (e: Exception) { AppLogger.e(tag, "Error closing websocket", e) }
-        try { goformClient?.close() } catch (e: Exception) { AppLogger.e(tag, "Error closing goform client", e) }
-        try { adbController?.destroy() } catch (e: Exception) { AppLogger.e(tag, "Error stopping adb", e) }
-        try { taskScheduler?.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping task scheduler", e) }
-        try { downloadManager?.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down download manager", e) }
+        val g = graph ?: return
+        try { g.server.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping server", e) }
+        // drain 等待 Netty 事件循环线程完全关闭，避免其 pending 的协程完成处理器
+        // 在后续 scope.cancel() 中抛出 CompletionHandlerException
+        try { delay(300) } catch (_: Exception) {}
+        try { g.dataScheduler.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping scheduler", e) }
+        try { g.alertEngine.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping alert engine", e) }
+        try { g.wsManager.closeAll() } catch (e: Exception) { AppLogger.e(tag, "Error closing websocket", e) }
+        try { g.goformClient.close() } catch (e: Exception) { AppLogger.e(tag, "Error closing goform client", e) }
+        try { g.adbController.destroy() } catch (e: Exception) { AppLogger.e(tag, "Error stopping adb", e) }
+        try { g.taskScheduler.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping task scheduler", e) }
+        try { g.downloadManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down download manager", e) }
     }
 
     private fun createNotificationChannel() {
@@ -418,7 +281,7 @@ class BackendService : Service() {
         notificationManager.createNotificationChannel(channel)
     }
 
-    private fun getDeviceGatewayIp(): String {
+    private suspend fun getDeviceGatewayIp(): String {
         // 方法1: Android ConnectivityManager
         try {
             val cm = getSystemService(CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
@@ -430,7 +293,7 @@ class BackendService : Service() {
 
         // 方法2: ip route
         try {
-            val ipRoute = runBlocking { ShellExecutor.execute("ip route 2>/dev/null | grep default").stdout }
+            val ipRoute = ShellExecutor.execute("ip route 2>/dev/null | grep default").stdout
             val m = Regex("default via (\\d+\\.\\d+\\.\\d+\\.\\d+)").find(ipRoute)
             if (m != null) { val gw = m.groupValues[1]; AppLogger.i(tag, "Gateway (ip route): $gw"); return gw }
         } catch (_: Exception) {}
@@ -438,17 +301,17 @@ class BackendService : Service() {
         // 方法3: getprop (各接口名)
         try {
             for (prop in listOf("dhcp.wlan0.gateway", "dhcp.wlan.gateway", "dhcp.eth0.gateway", "dhcp.rmnet0.gateway")) {
-                val gw = runBlocking { ShellExecutor.execute("getprop $prop").stdout.trim() }
+                val gw = ShellExecutor.execute("getprop $prop").stdout.trim()
                 if (gw.isNotBlank() && gw != "unknown") { AppLogger.i(tag, "Gateway (getprop): $gw"); return gw }
             }
         } catch (_: Exception) {}
 
         // 方法4: /proc/net/route 解析
         try {
-            val route = runBlocking { ShellExecutor.executeAsRoot("cat /proc/net/route 2>/dev/null").stdout }
+            val route = ShellExecutor.executeAsRoot("cat /proc/net/route 2>/dev/null").stdout
             val lines = route.lines()
             for (line in lines) {
-                val parts = line.split("\\s+".toRegex())
+                val parts = line.split(WHITESPACE_REGEX)
                 if (parts.size >= 3 && parts[1] == "00000000") {
                     val gwHex = parts[2].padStart(8, '0')
                     // /proc/net/route 中 gateway 是 little-endian hex:

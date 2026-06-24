@@ -1,7 +1,5 @@
 package com.ufi_axis_core.api.routes
 
-import android.content.Context
-import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.scheduler.DataScheduler
@@ -9,7 +7,6 @@ import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.ShellQoS
 import io.ktor.http.*
 import io.ktor.server.application.call
-import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
@@ -25,20 +22,30 @@ import kotlinx.serialization.json.*
 class SystemRoutes(
     private val systemCollector: SystemCollector,
     private val dataScheduler: DataScheduler,
-    private val database: AppDatabase,
-    private val atChannel: ATChannel? = null,
-    private val context: Context? = null
+    private val database: AppDatabase
 ) {
-    private val prefs by lazy {
-        context?.getSharedPreferences("ufi_axis_vo", Context.MODE_PRIVATE)
-    }
     fun register(route: Route) {
         route.route("/system") {
             // CPU 信息（优先从调度器缓存读取，减少开销）
             get("/cpu") {
                 val cached = dataScheduler.latestCpu.value
                 val cpuInfo = cached ?: systemCollector.getCpuInfo()
-                call.respond(toJsonElement(cpuInfo))
+                // 手动构建 JsonObject 绕过 trySerialize，
+                // 防止序列化失败时 toJsonElement 降级为 toString() 导致 Gson 解析崩溃
+                call.respond(buildJsonObject {
+                    put("usage_percent", cpuInfo.usage_percent)
+                    put("core_count", cpuInfo.core_count)
+                    put("cores", buildJsonArray {
+                        cpuInfo.cores.forEach { core ->
+                            add(buildJsonObject {
+                                put("core", core.core)
+                                put("freq_mhz", core.freq_mhz)
+                                put("freq_display", core.freq_display)
+                            })
+                        }
+                    })
+                    put("temperature", cpuInfo.temperature)
+                })
             }
 
             // CPU 历史
@@ -75,105 +82,10 @@ class SystemRoutes(
                 call.respond(toJsonElement(systemCollector.getUptime()))
             }
 
-            // VoLTE 状态 (与参考项目 KanoUtils.kt 一致: AT+CAVIMS?)
-            get("/volte") {
-                val slot = call.request.queryParameters["slot"]?.toIntOrNull() ?: 0
-                val at = atChannel
-                val enabled = if (at != null && at.isConnected) {
-                    val raw = at.sendCommand("AT+CAVIMS?", 5000) ?: ""
-                    // 解析: +CAVIMS: <state>  取第一个逗号分隔值
-                    val body = raw.substringBefore("OK")
-                        .substringAfter(":", "")
-                        .replace("\"", "")
-                        .replace("\r", " ")
-                        .replace("\n", " ")
-                        .trim()
-                    body.split(",").map { it.trim() }.getOrNull(0)?.toIntOrNull() == 1
-                } else {
-                    // fallback: settings
-                    val result = ShellQoS.executeAsRootCached("settings get global volte_status_$slot 2>/dev/null")
-                    result.stdout.trim() == "1"
-                }
-                call.respond(toJsonElement(mapOf("enabled" to enabled, "slot" to slot)))
-            }
-
-            // 设置 VoLTE (与参考项目 KanoUtils.kt 一致: AT+CAVIMS=$state)
-            post("/volte") {
-                val p = call.receive<JsonObject>()
-                val enabledElem = p["enabled"]?.jsonPrimitive
-                val enabledStr = when {
-                    enabledElem == null -> "1"
-                    enabledElem.isString -> enabledElem.content
-                    else -> if (enabledElem.boolean) "1" else "0"
-                }
-                val enabled = if (enabledStr == "0") "0" else "1"
-                val slot = p["slot"]?.jsonPrimitive?.intOrNull ?: 0
-                val at = atChannel
-                val success = if (at != null && at.isConnected) {
-                    at.sendCommand("AT+CAVIMS=$enabled", 5000)?.contains("OK") == true
-                } else {
-                    ShellQoS.executeAsRoot(
-                        "settings put global volte_status_$slot $enabled 2>/dev/null"
-                    ).isSuccess
-                }
-                // 持久化到 SharedPreferences（commit 同步写盘）
-                if (success) {
-                    prefs?.edit()?.putBoolean("voLte_slot$slot", enabled == "1")?.commit()
-                }
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "enabled" to (enabled == "1"), "slot" to slot))
-                )
-            }
-
-            // VoNR 状态 (与参考项目 KanoUtils.kt 一致: AT+SP5GCMDS="get nr synch_param",42)
-            get("/vonr") {
-                val slot = call.request.queryParameters["slot"]?.toIntOrNull() ?: 0
-                val at = atChannel
-                val enabled = if (at != null && at.isConnected) {
-                    val raw = at.sendCommand("AT+SP5GCMDS=\"get nr synch_param\",42", 5000) ?: ""
-                    // 解析: 取第三个逗号分隔值
-                    val body = raw.substringBefore("OK")
-                        .substringAfter(":", "")
-                        .replace("\"", "")
-                        .replace("\r", " ")
-                        .replace("\n", " ")
-                        .trim()
-                    body.split(",").map { it.trim() }.getOrNull(2)?.toIntOrNull() == 1
-                } else {
-                    val result = ShellQoS.executeAsRootCached("settings get global vonr_status_$slot 2>/dev/null")
-                    result.stdout.trim() == "1"
-                }
-                call.respond(toJsonElement(mapOf("enabled" to enabled, "slot" to slot)))
-            }
-
-            // 设置 VoNR (与参考项目 KanoUtils.kt 一致: AT+SP5GCMDS="set nr param",45,$state)
-            post("/vonr") {
-                val p = call.receive<JsonObject>()
-                val enabledElem = p["enabled"]?.jsonPrimitive
-                val enabledStr = when {
-                    enabledElem == null -> "1"
-                    enabledElem.isString -> enabledElem.content
-                    else -> if (enabledElem.boolean) "1" else "0"
-                }
-                val enabled = if (enabledStr == "0") "0" else "1"
-                val slot = p["slot"]?.jsonPrimitive?.intOrNull ?: 0
-                val at = atChannel
-                val success = if (at != null && at.isConnected) {
-                    at.sendCommand("AT+SP5GCMDS=\"set nr param\",45,$enabled", 5000)?.contains("OK") == true
-                } else {
-                    ShellQoS.executeAsRoot(
-                        "settings put global vonr_status_$slot $enabled 2>/dev/null"
-                    ).isSuccess
-                }
-                // 持久化到 SharedPreferences（commit 同步写盘）
-                if (success) {
-                    prefs?.edit()?.putBoolean("voNr_slot$slot", enabled == "1")?.commit()
-                }
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "enabled" to (enabled == "1"), "slot" to slot))
-                )
+            // Root 权限检测
+            get("/root-check") {
+                val hasRoot = ShellExecutor.hasRootAccess()
+                call.respond(buildJsonObject { put("hasRoot", hasRoot) })
             }
         }
     }

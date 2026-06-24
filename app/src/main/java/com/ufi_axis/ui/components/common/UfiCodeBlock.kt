@@ -1,13 +1,13 @@
 package com.ufi_axis.ui.components.common
 
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 
 @Composable
 fun UfiCodeBlock(
@@ -19,7 +19,7 @@ fun UfiCodeBlock(
     if (text.isBlank()) return
     Card(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.legacyShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
         )
@@ -42,7 +42,7 @@ fun UfiHistoryItem(
 ) {
     Card(
         modifier = modifier.fillMaxWidth().padding(vertical = 2.dp),
-        shape = RoundedCornerShape(8.dp),
+        shape = UfiCardDefaults.inputShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
         )
@@ -63,7 +63,7 @@ fun UfiResultCard(
 ) {
     Card(
         modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(Spacing.CardCorner),
+        shape = UfiCardDefaults.legacyShape,
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
         )

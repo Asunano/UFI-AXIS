@@ -11,6 +11,8 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import java.text.SimpleDateFormat
 import java.util.*
@@ -47,10 +49,14 @@ class AdvancedRoutes(private val appContext: Context) {
                         (1..8).map { chars[rng.nextInt(chars.length)] }.joinToString("")
                     }
                     // Stop any existing ttyd
-                    ShellQoS.executeAsRoot("pkill -f 'ttyd.*-p $port'")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("pkill -f 'ttyd.*-p $port'")
+                    }
                     kotlinx.coroutines.delay(500)
                     val cmd = "nohup $ttydPath -W -p $port -c \"ufi:$password\" /system/bin/sh &"
-                    ShellQoS.executeAsRoot(cmd)
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot(cmd)
+                    }
                     kotlinx.coroutines.delay(1000)
                     val running = isProcessRunning("ttyd")
                     call.respond(
@@ -69,7 +75,9 @@ class AdvancedRoutes(private val appContext: Context) {
 
             post("/ttyd/stop") {
                 try {
-                    ShellQoS.executeAsRoot("pkill -f ttyd")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("pkill -f ttyd")
+                    }
                     call.respond(toJsonElement(mapOf("success" to true)))
                 } catch (e: Exception) {
                     AppLogger.e(tag, "ttyd/stop failed", e)
@@ -92,9 +100,13 @@ class AdvancedRoutes(private val appContext: Context) {
             post("/iperf3/start") {
                 try {
                     val iperf3Path = AssetExtractor.getPath(appContext, "iperf3")
-                    ShellQoS.executeAsRoot("pkill -f iperf3")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("pkill -f iperf3")
+                    }
                     kotlinx.coroutines.delay(300)
-                    ShellQoS.executeAsRoot("nohup $iperf3Path -s -D &")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("nohup $iperf3Path -s -D &")
+                    }
                     kotlinx.coroutines.delay(500)
                     val running = isProcessRunning("iperf3")
                     call.respond(
@@ -110,7 +122,9 @@ class AdvancedRoutes(private val appContext: Context) {
 
             post("/iperf3/stop") {
                 try {
-                    ShellQoS.executeAsRoot("pkill -f iperf3")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("pkill -f iperf3")
+                    }
                     call.respond(toJsonElement(mapOf("success" to true)))
                 } catch (e: Exception) {
                     AppLogger.e(tag, "iperf3/stop failed", e)
@@ -128,7 +142,9 @@ class AdvancedRoutes(private val appContext: Context) {
                     )
                     val statusMap = mutableMapOf<String, String>()
                     // Single shell call to list all packages
-                    val allPkgs = ShellQoS.executeAsRootCached("pm list packages").stdout
+                    val allPkgs = withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("pm list packages").stdout
+                    }
                     for (pkg in packages) {
                         statusMap[pkg] = if (allPkgs.contains(pkg)) "installed" else "removed"
                     }
@@ -152,8 +168,9 @@ class AdvancedRoutes(private val appContext: Context) {
                     val cmds = packages.flatMap { pkg ->
                         listOf("pm disable $pkg", "pm uninstall -k --user 0 $pkg")
                     }
-                    val batchResult = ShellQoS.batchExecuteAsRoot(cmds)
-                    // Extract per-package results (every even index is disable, odd is uninstall)
+                    val batchResult = withContext(Dispatchers.IO) {
+                        ShellExecutor.batchExecuteAsRoot(cmds)
+                    }                    // Extract per-package results (every even index is disable, odd is uninstall)
                     val results = mutableMapOf<String, Boolean>()
                     packages.forEachIndexed { i, pkg ->
                         val uninstallIdx = i * 2 + 1
@@ -183,7 +200,9 @@ class AdvancedRoutes(private val appContext: Context) {
                         append("echo \"\$i|\$o|\$f|\$m\"; ")
                         append("done")
                     }
-                    val result = ShellQoS.executeAsRootCached(shellCmd)
+                    val result = withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot(shellCmd)
+                    }
                     val cores = mutableListOf<Map<String, Any>>()
                     result.stdout.lines().filter { it.contains("|") }.forEach { line ->
                         val parts = line.split("|")
@@ -206,28 +225,36 @@ class AdvancedRoutes(private val appContext: Context) {
             }
 
             post("/cpu-cores") {
-                try {
-                    val p = call.receive<JsonObject>()
-                    val enable = p["enable"]?.jsonPrimitive?.booleanOrNull ?: true
-                    val value = if (enable) "1" else "0"
-                    // Individual commands chained — avoids for loop + sh -c nesting issues inside su -c
-                    val cmd = (0..3).joinToString(" && ") { i ->
-                        "sh -c 'echo $value > /sys/devices/system/cpu/cpu$i/online'"
-                    }
-                    val r = ShellQoS.executeAsRoot(cmd)
-                    call.respond(toJsonElement(mapOf(
-                        "success" to r.isSuccess, "enable" to enable
+                // ── CPU hotplug 写入 /sys/devices/system/cpu/cpu*/online 是危险操作 ──
+                // 在 Unisoc/UIS8581E 设备上会直接触发 kernel panic (sprd_ipc_probe → kobject_add_internal -EEXIST)
+                // 仅允许读取（GET），禁止写入（POST）
+                AppLogger.w(tag, "cpu-cores POST blocked: CPU hotplug is unsafe on Unisoc devices")
+                call.respond(HttpStatusCode.Forbidden,
+                    toJsonElement(mapOf(
+                        "success" to false,
+                        "error" to "CPU core online/offline is disabled to prevent kernel panic on this device",
+                        "reason" to "Writing to /sys/devices/system/cpu/cpu*/online triggers sprd_ipc_probe driver race"
                     )))
-                } catch (e: Exception) {
-                    AppLogger.e(tag, "cpu-cores POST failed", e)
-                    call.respond(HttpStatusCode.InternalServerError,
-                        toJsonElement(mapOf("success" to false, "error" to (e.message ?: "Unknown error"))))
-                }
             }
 
             // ==================== 网络加速 ====================
+            //  注意: 删除 iptables/tc 规则会清除运营商的流量整形，可能导致大流量时
+            //        网络栈不稳定。仅在明确需要时调用，且有 30 分钟冷却时间防止滥用。
+
+            var lastNetAccelTime: Long = 0L
+            val netAccelCooldownMs = 30 * 60 * 1000L  // 30 分钟冷却
 
             post("/net-accelerate") {
+                val cooldownRemaining = netAccelCooldownMs - (System.currentTimeMillis() - lastNetAccelTime)
+                if (cooldownRemaining > 0) {
+                    call.respond(HttpStatusCode.TooManyRequests,
+                        toJsonElement(mapOf(
+                            "success" to false,
+                            "error" to "Network acceleration can only be called once every 30 minutes",
+                            "retry_after_seconds" to (cooldownRemaining / 1000)
+                        )))
+                    return@post
+                }
                 try {
                     val commands = listOf(
                         "iptables -D FORWARD -j zte_fw_net_limit",
@@ -236,7 +263,10 @@ class AdvancedRoutes(private val appContext: Context) {
                         "tc qdisc del dev wlan0 root"
                     )
                     // Batch: 4 shell calls → 1
-                    ShellQoS.batchExecuteAsRoot(commands)
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.batchExecuteAsRoot(commands)
+                    }
+                    lastNetAccelTime = System.currentTimeMillis()
                     call.respond(toJsonElement(mapOf(
                         "success" to true, "commands_executed" to commands.size
                     )))
@@ -252,10 +282,12 @@ class AdvancedRoutes(private val appContext: Context) {
             post("/disable-phantom-killer") {
                 try {
                     // Batch: 2 shell calls → 1
-                    val r = ShellQoS.batchExecuteAsRoot(listOf(
-                        "settings put global settings_enable_monitor_phantom_procs false",
-                        "settings put global max_phantom_processes 2147483647"
-                    ))
+                    val r = withContext(Dispatchers.IO) {
+                        ShellExecutor.batchExecuteAsRoot(listOf(
+                            "settings put global settings_enable_monitor_phantom_procs false",
+                            "settings put global max_phantom_processes 2147483647"
+                        ))
+                    }
                     call.respond(toJsonElement(mapOf("success" to r.allSuccess)))
                 } catch (e: Exception) {
                     AppLogger.e(tag, "disable-phantom-killer failed", e)
@@ -268,7 +300,9 @@ class AdvancedRoutes(private val appContext: Context) {
 
             get("/bandwidth-limit") {
                 try {
-                    val output = ShellQoS.executeAsRootCached("tc class show dev br0").stdout
+                    val output = withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("tc class show dev br0").stdout
+                    }
                     val targetLine = output.lines().firstOrNull { it.contains("1:10") } ?: ""
                     val rateMatch = Regex("rate (\\d+)mbit").find(targetLine)
                     if (rateMatch != null) {
@@ -295,23 +329,29 @@ class AdvancedRoutes(private val appContext: Context) {
                         return@post
                     }
                     val iface = "br0"
-                    ShellQoS.executeAsRoot("tc qdisc del dev $iface root")
-                    val r1 = ShellQoS.executeAsRoot(
-                        "tc qdisc add dev $iface root handle 1: htb default 10"
-                    )
+                    val r1 = withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("tc qdisc del dev $iface root")
+                        ShellExecutor.executeAsRoot(
+                            "tc qdisc add dev $iface root handle 1: htb default 10"
+                        )
+                    }
                     if (!r1.isSuccess) {
                         call.respond(HttpStatusCode.InternalServerError,
                             toJsonElement(mapOf("success" to false, "error" to "Cannot create root qdisc")))
                         return@post
                     }
-                    ShellQoS.executeAsRoot(
-                        "tc class add dev $iface parent 1: classid 1:1 htb rate ${mbitInt}mbit ceil ${mbitInt}mbit"
-                    )
-                    val r3 = ShellQoS.executeAsRoot(
-                        "tc class add dev $iface parent 1:1 classid 1:10 htb rate ${mbitInt}mbit ceil ${mbitInt}mbit"
-                    )
+                    val r3 = withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot(
+                            "tc class add dev $iface parent 1: classid 1:1 htb rate ${mbitInt}mbit ceil ${mbitInt}mbit"
+                        )
+                        ShellExecutor.executeAsRoot(
+                            "tc class add dev $iface parent 1:1 classid 1:10 htb rate ${mbitInt}mbit ceil ${mbitInt}mbit"
+                        )
+                    }
                     if (!r3.isSuccess) {
-                        ShellQoS.executeAsRoot("tc qdisc del dev $iface root")
+                        withContext(Dispatchers.IO) {
+                            ShellExecutor.executeAsRoot("tc qdisc del dev $iface root")
+                        }
                         call.respond(HttpStatusCode.InternalServerError,
                             toJsonElement(mapOf("success" to false, "error" to "Cannot create traffic class")))
                         return@post
@@ -326,7 +366,9 @@ class AdvancedRoutes(private val appContext: Context) {
 
             delete("/bandwidth-limit") {
                 try {
-                    ShellQoS.executeAsRoot("tc qdisc del dev br0 root")
+                    withContext(Dispatchers.IO) {
+                        ShellExecutor.executeAsRoot("tc qdisc del dev br0 root")
+                    }
                     call.respond(toJsonElement(mapOf("success" to true)))
                 } catch (e: Exception) {
                     AppLogger.e(tag, "bandwidth-limit DELETE failed", e)
@@ -405,7 +447,9 @@ class AdvancedRoutes(private val appContext: Context) {
      */
     private suspend fun isProcessRunning(processName: String): Boolean {
         return try {
-            val result = ShellQoS.executeCached("ps -A | grep -v grep | grep $processName")
+            val result = withContext(Dispatchers.IO) {
+                ShellExecutor.execute("ps -A | grep -v grep | grep $processName")
+            }
             result.isSuccess && result.stdout.trim().isNotEmpty()
         } catch (_: Exception) { false }
     }

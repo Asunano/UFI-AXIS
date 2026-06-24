@@ -6,13 +6,14 @@ import com.google.gson.annotations.SerializedName
 // ========== Device ==========
 
 data class DeviceInfoResponse(
-    val device: DeviceModel,
-    val sim: SimState,
-    val storage: StorageInfo,
-    val uptime: UptimeInfo,
-    val at_channel: AtChannelState,
-    val kernel: String,
-    val network: NetworkInfo
+    val device: DeviceModel? = null,
+    val sim: SimState? = null,
+    val storage: StorageInfo? = null,
+    val uptime: UptimeInfo? = null,
+    val at_channel: AtChannelState? = null,
+    val kernel: String? = null,
+    val network: NetworkInfo? = null,
+    val identity: Map<String, String>? = null
 )
 
 data class DeviceModel(
@@ -46,7 +47,7 @@ data class CpuInfo(
 data class CpuCore(
     val core: Int,
     val freq_mhz: Double,
-    val freq_display: String
+    val freq_display: String = ""
 )
 
 data class MemoryInfo(
@@ -90,6 +91,8 @@ data class TrafficRealtime(
     val tx_bytes: Long,
     val rx_speed_display: String = "",
     val tx_speed_display: String = "",
+    val realtime_rx_thrpt: Long = 0,
+    val realtime_tx_thrpt: Long = 0,
     val timestamp: Long = 0L
 )
 
@@ -148,9 +151,16 @@ data class SignalInfo(
 data class NetworkStatusResponse(
     val network: NetworkState,
     val mobile_data: Boolean,
+    val ppp_status: String = "",
     val operator: String,
     val network_type: String
-)
+) {
+    /** 参考 UFI-TOOLS-REF: 用 ppp_status goform 字段判断蜂窝数据真实连接状态。
+     *  ZTE 设备上 ConnectivityManager 不反映 modem PPP 链路状态，必须用此字段。 */
+    val isCellularConnected: Boolean get() =
+        ppp_status.contains("connected", ignoreCase = true) &&
+        !ppp_status.contains("disconnected", ignoreCase = true)
+}
 
 data class NetworkState(
     val is_connected: Boolean,
@@ -200,7 +210,8 @@ data class SimInfoResponse(
     val sim_state: String,
     val phone_type: String,
     val imei: String? = null,
-    val imsi: String? = null
+    val imsi: String? = null,
+    val iccid: String? = null
 )
 
 data class SmsSendRequest(
@@ -216,6 +227,21 @@ data class SmsSendResponse(
 
 data class SmsListResponse(
     val messages: List<SmsRecord>,
+    val count: Int,
+    val total: Int = 0
+)
+
+data class SmsContact(
+    val phoneNumber: String,
+    val total: Int,
+    val unread: Int,
+    val latestMsg: String,
+    val latestTimestamp: Long,
+    val latestDirection: String
+)
+
+data class SmsContactListResponse(
+    val contacts: List<SmsContact>,
     val count: Int
 )
 
@@ -229,13 +255,19 @@ data class SmsRecord(
     val read: Boolean = true
 )
 
-data class UssdRequest(
-    val code: String
+// ========== Shell ==========
+
+data class ShellExecRequest(
+    val command: String,
+    val as_root: Boolean = true,
+    val timeout: Int = 30
 )
 
-data class UssdResponse(
-    val code: String,
-    val response: String
+data class ShellExecResponse(
+    val exit_code: Int,
+    val stdout: String,
+    val stderr: String,
+    val success: Boolean
 )
 
 // ========== AT ==========
@@ -366,11 +398,14 @@ data class AppConfig(
     val secret: String,
     val port: Int,
     val auto_start_on_boot: Boolean,
-    val rate_limit_max: Int,
-    val rate_limit_window_sec: Int,
     val goform_ip: String = "192.168.0.1",
     val goform_port: Int = 8080,
-    val goform_password: String = "admin"
+    val goform_password: String = "admin",
+    val qos_enabled: Boolean = true,
+    val qos_shell_max_concurrent: Int = 3,
+    val qos_cache_ttl_ms: Int = 2000,
+    val qos_goform_query_max: Int = 4,
+    val qos_goform_set_max: Int = 2
 )
 
 data class ConfigUpdateResponse(
@@ -491,6 +526,13 @@ data class ServerVersionInfo(
     val version: String,
     val min_client_version: String,
     val update_url: String
+)
+
+/** 设备固件版本（来自 ZTE goform） */
+data class DeviceVersionResponse(
+    val language: String = "",
+    val cr_version: String = "",
+    val wa_inner_version: String = ""
 )
 
 // ========== Monitor ==========

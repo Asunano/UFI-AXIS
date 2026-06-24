@@ -16,6 +16,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -57,7 +58,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(Spacing.CardCorner),
+                shape = UfiCardDefaults.legacyShape,
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
             ) {
                 Column(Modifier.padding(Spacing.InnerPadding), verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
@@ -74,7 +75,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                         containerColor = if (isError) MaterialTheme.colorScheme.errorContainer
                                         else MaterialTheme.colorScheme.primaryContainer
                     ),
-                    shape = RoundedCornerShape(Spacing.CardCorner)
+                    shape = UfiCardDefaults.legacyShape
                 ) {
                     Text(testResult!!, modifier = Modifier.padding(Spacing.InnerPadding),
                         style = MaterialTheme.typography.bodyMedium)
@@ -92,13 +93,13 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                         val result = testConnection(ip, port, token)
                         testResult = result.first; isError = !result.second; isTesting = false
                     }
-                }, enabled = !isTesting)
+                }, enabled = !isTesting, modifier = Modifier.weight(1f))
 
                 UfiPrimaryButton(text = "开始使用", onClick = {
                     if (ip.isBlank()) { isError = true; return@UfiPrimaryButton }
                     val port = portText.toIntOrNull() ?: 8088
                     onSetupComplete(ip, port, token)
-                }, enabled = !isTesting && ip.isNotBlank())
+                }, enabled = !isTesting && ip.isNotBlank(), modifier = Modifier.weight(1f))
             }
 
             Spacer(Modifier.height(Spacing.XLarge))

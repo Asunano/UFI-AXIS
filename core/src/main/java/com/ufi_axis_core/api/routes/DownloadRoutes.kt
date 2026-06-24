@@ -9,6 +9,7 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 import java.io.File
+import java.net.URL
 
 class DownloadRoutes(
     private val downloadManager: DownloadManager
@@ -71,11 +72,65 @@ class DownloadRoutes(
                 val savePath = body["save_path"]?.jsonPrimitive?.contentOrNull
                 val speedLimit = body["speed_limit"]?.jsonPrimitive?.longOrNull
                 val connections = body["connections"]?.jsonPrimitive?.intOrNull
-                val task = downloadManager.createTask(url, fileName, savePath, speedLimit, connections)
+
+                // 重复检测：检查相同 URL 的任务是否已存在（排除 error 状态）
+                val force = call.request.queryParameters["force"]?.toBoolean() ?: false
+                if (!force) {
+                    val existing = downloadManager.findDuplicateByUrl(url)
+                    if (existing != null) {
+                        val existingName = existing.fileName.ifBlank {
+                            try { java.net.URL(url).path.substringAfterLast("/") } catch (_: Exception) { "" }
+                        }
+                        val suggested = if (existingName.isNotBlank()) {
+                            downloadManager.generateUniqueFileName(existingName)
+                        } else ""
+                        call.respond(HttpStatusCode.Conflict, toJsonElement(mapOf(
+                            "duplicate" to true,
+                            "existing_task" to taskToMap(existing),
+                            "suggested_filename" to suggested
+                        )))
+                        return@post
+                    }
+                }
+
+                // 如果有 force 或重命名请求，将 fileName 设为排重后的新文件名
+                val finalFileName = if (force && fileName != null) {
+                    downloadManager.generateUniqueFileName(fileName)
+                } else fileName
+
+                val task = downloadManager.createTask(url, finalFileName, savePath, speedLimit, connections)
                 call.respond(HttpStatusCode.Created, toJsonElement(mapOf("success" to true, "task" to taskToMap(task))))
             }
 
-            // Pause / Resume / Delete
+            // 原始 CLI 下载测试（调试用，绕过 conf/RPC 直调 aria2c）
+            post("/raw-test") {
+                val body = call.receive<JsonObject>()
+                val testUrl = body["url"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (testUrl.isBlank()) {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "url is required")))
+                    return@post
+                }
+                val fileName = body["file_name"]?.jsonPrimitive?.contentOrNull
+                val savePath = body["save_path"]?.jsonPrimitive?.contentOrNull
+                val timeout = body["timeout_sec"]?.jsonPrimitive?.longOrNull ?: 120
+                val result = downloadManager.aria2.rawDownload(
+                    url = testUrl,
+                    saveDir = savePath ?: DownloadManager.DEFAULT_SAVE_DIR,
+                    fileName = fileName,
+                    timeoutSec = timeout
+                )
+                call.respond(toJsonElement(mapOf(
+                    "success" to result.success,
+                    "exit_code" to result.exitCode,
+                    "elapsed_ms" to result.elapsedMs,
+                    "downloaded_file" to result.downloadedFile,
+                    "stdout" to result.stdout,
+                    "stderr" to result.stderr,
+                    "url" to testUrl
+                )))
+            }
+
+            // Pause / Resume / Delete / Retry
             post("/{id}/pause") {
                 val id = call.parameters["id"] ?: ""
                 call.respond(toJsonElement(mapOf("success" to downloadManager.pauseTask(id))))
@@ -84,14 +139,21 @@ class DownloadRoutes(
                 val id = call.parameters["id"] ?: ""
                 call.respond(toJsonElement(mapOf("success" to downloadManager.resumeTask(id))))
             }
+            post("/{id}/retry") {
+                val id = call.parameters["id"] ?: ""
+                val ok = downloadManager.retryTask(id)
+                if (ok) call.respond(toJsonElement(mapOf("success" to true)))
+                else call.respond(HttpStatusCode.NotFound, toJsonElement(mapOf("error" to "Task not found")))
+            }
             delete("/{id}") {
                 val id = call.parameters["id"] ?: ""
                 val deleteFile = call.request.queryParameters["delete_file"]?.toBoolean() ?: false
                 call.respond(toJsonElement(mapOf("success" to downloadManager.deleteTask(id, deleteFile))))
             }
             post("/clear-completed") {
+                val deleteFile = call.request.queryParameters["delete_file"]?.toBoolean() ?: false
                 val n = downloadManager.getAllTasks().filter { it.status == "completed" }
-                    .also { it.forEach { t -> downloadManager.deleteTask(t.id, false) } }.size
+                    .also { it.forEach { t -> downloadManager.deleteTask(t.id, deleteFile) } }.size
                 call.respond(toJsonElement(mapOf("success" to true, "cleared" to n)))
             }
 

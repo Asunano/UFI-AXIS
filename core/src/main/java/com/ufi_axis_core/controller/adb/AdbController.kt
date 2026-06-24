@@ -1,12 +1,15 @@
 package com.ufi_axis_core.controller.adb
 
+import android.os.SystemClock
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.controller.goform.GoformDeviceClient
 import com.ufi_axis_core.util.AppLogger
-import com.ufi_axis_core.util.ShellQoS
+import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.coroutines.*
 
 class AdbController(
-    private val goformClient: GoformClient? = null
+    private val goformClient: GoformClient? = null,
+    private val deviceClient: GoformDeviceClient? = null
 ) {
     private val tag = "AdbController"
     private var keepAliveJob: Job? = null
@@ -26,9 +29,9 @@ class AdbController(
             goformClient?.let { gc ->
                 val loginOk = gc.ensureLogin()
                 if (loginOk) {
-                    gc.setUsbPortSwitch(false)  // 先关闭再开启，确保生效
+                    deviceClient?.setUsbPortSwitch(false)  // 先关闭再开启，确保生效
                     delay(500)
-                    gc.setUsbPortSwitch(true)
+                    deviceClient?.setUsbPortSwitch(true)
                     AppLogger.i(tag, "ADB enabled via Goform USB_PORT_SETTING")
                 }
             }
@@ -38,7 +41,7 @@ class AdbController(
 
         // 方案2: setprop 方式 (fallback) — batch: 3 → 1
         try {
-            ShellQoS.batchExecuteAsRoot(listOf(
+            ShellExecutor.batchExecuteAsRoot(listOf(
                 "setprop persist.service.adb.tcp.port $port",
                 "setprop service.adb.tcp.port $port",
                 "start adbd"
@@ -49,29 +52,46 @@ class AdbController(
 
         delay(1000)
 
-        // 验证 ADB 是否启动成功
+        // 验证 adbd 是否启动成功
         val running = checkAdbdRunning()
-        if (running) {
-            isEnabled = true
-            isConnected = true
-            lastPingMs = System.currentTimeMillis()
-            startKeepAlive()
-            AppLogger.i(tag, "ADB WiFi started on port $port")
-            return true
+        if (!running) {
+            AppLogger.w(tag, "ADB start verification failed: adbd not running")
+            return false
         }
-        AppLogger.w(tag, "ADB start verification failed")
-        return false
+
+        // 启动 adb 客户端并建立 localhost 连接 (对应 REF 的 ensureAdbAlive)
+        try {
+            ShellExecutor.execute("adb start-server 2>/dev/null")
+            delay(1500)
+
+            // 先清理可能已存在的僵死连接
+            ensureAdbConnection()
+        } catch (e: Exception) {
+            AppLogger.w(tag, "adb client init failed: ${e.message}")
+        }
+
+        isEnabled = true
+        isConnected = checkAdbConnected()
+        lastPingMs = SystemClock.elapsedRealtime()
+        startKeepAlive()
+        AppLogger.i(tag, "ADB WiFi started on port $port, connected=$isConnected")
+        return true
     }
 
     suspend fun stop(): Boolean {
         AppLogger.i(tag, "Stopping ADB WiFi")
         stopKeepAlive()
         try {
-            goformClient?.let { gc ->
-                try { gc.setUsbPortSwitch(false) } catch (_: Exception) {}
+            // 先断连 adb 客户端
+            try { ShellExecutor.execute("adb kill-server 2>/dev/null") } catch (_: Exception) {}
+            // 再停止 adbd
+            deviceClient?.let { dc ->
+                try { dc.setUsbPortSwitch(false) } catch (_: Exception) {}
             }
-            // Batch: 2 → 1
-            ShellQoS.batchExecuteAsRoot(listOf("stop adbd", "setprop service.adb.tcp.port ''"))
+            ShellExecutor.batchExecuteAsRoot(listOf(
+                "stop adbd",
+                "setprop service.adb.tcp.port ''"
+            ))
             isEnabled = false; isConnected = false
             return true
         } catch (e: Exception) {
@@ -82,16 +102,24 @@ class AdbController(
     suspend fun ping(): Boolean {
         // 先检查 adbd 进程状态
         val running = checkAdbdRunning()
-        if (running) { lastPingMs = System.currentTimeMillis(); isConnected = true; return true }
+        if (!running) {
+            isConnected = false
+            return false
+        }
 
-        // 尝试通过 adb connect 验证
+        // 检查 adb 客户端是否已连接 (不使用 grep，直接 Kotlin 检查)
         try {
-            val test = ShellQoS.executeCached("adb devices 2>/dev/null | grep 'localhost:5555'")
-            if (test.isSuccess && test.stdout.contains("device")) {
-                lastPingMs = System.currentTimeMillis(); isConnected = true; return true
+            val result = ShellExecutor.execute("adb devices 2>/dev/null")
+            if (result.isSuccess && result.stdout.contains("localhost:$wifiPort") &&
+                result.stdout.contains("\tdevice")) {
+                lastPingMs = SystemClock.elapsedRealtime()
+                isConnected = true
+                return true
             }
         } catch (_: Exception) {}
-        isConnected = false; return false
+
+        isConnected = false
+        return false
     }
 
     suspend fun getStatus(): Map<String, Any> {
@@ -99,9 +127,48 @@ class AdbController(
         return mapOf("enabled" to isEnabled, "connected" to running, "port" to wifiPort, "last_ping_ms" to lastPingMs)
     }
 
+    /**
+     * 确保 adb 客户端与本地 adbd 连接
+     * 首次连接或断连后重新建立 localhost 连接
+     */
+    private suspend fun ensureAdbConnection() {
+        val connected = checkAdbConnected()
+        if (!connected) {
+            AppLogger.i(tag, "adb client not connected to localhost, connecting...")
+            // 可能有僵死的 adb 进程，先杀
+            killAdbClientProcess()
+            delay(500)
+            // adb start-server 会隐式启动 client daemon
+            ShellExecutor.execute("adb start-server 2>/dev/null")
+            delay(1000)
+            val connectResult = ShellExecutor.execute("adb connect localhost:$wifiPort 2>/dev/null")
+            AppLogger.i(tag, "adb connect result: ${connectResult.stdout.trim().take(100)}")
+            delay(1000)
+        }
+    }
+
+    private suspend fun checkAdbConnected(): Boolean {
+        try {
+            val result = ShellExecutor.execute("adb devices 2>/dev/null")
+            return result.isSuccess &&
+                result.stdout.contains("localhost:$wifiPort") &&
+                result.stdout.contains("\tdevice")
+        } catch (_: Exception) { return false }
+    }
+
     private suspend fun checkAdbdRunning(): Boolean {
-        val result = ShellQoS.executeAsRootCached("getprop init.svc.adbd")
+        val result = ShellExecutor.executeAsRoot("getprop init.svc.adbd")
         return result.isSuccess && result.stdout.trim() == "running"
+    }
+
+    /**
+     * 杀掉僵死的 adb 客户端进程 (非 adbd)
+     */
+    private suspend fun killAdbClientProcess() {
+        try {
+            // 只杀 client 进程，不杀 adbd daemon
+            ShellExecutor.executeAsRoot("killall adb 2>/dev/null || true")
+        } catch (_: Exception) {}
     }
 
     private fun startKeepAlive() {
@@ -112,17 +179,30 @@ class AdbController(
                 try {
                     if (!ping() && isEnabled) {
                         AppLogger.w(tag, "ADB lost, reconnecting...")
-                        ShellQoS.tryExecuteAsRoot("start adbd")
+                        // 杀掉僵死 adb 客户端进程后重建连接
+                        killAdbClientProcess()
+                        delay(500)
+                        ShellExecutor.executeAsRoot("start adbd")
                         delay(2000)
-                        // 尝试 adb connect (如 adb 可用)
-                        ShellQoS.tryExecute("adb connect localhost 2>/dev/null")
+                        // 使用 execute (非 tryExecute) 确保命令一定执行
+                        ShellExecutor.execute("adb start-server 2>/dev/null")
+                        delay(1000)
+                        ShellExecutor.execute("adb connect localhost:$wifiPort 2>/dev/null")
                         delay(500)
                         ping()
                     } else if (isEnabled) {
-                        // 定期 adb connect 保持连接
-                        ShellQoS.tryExecute("adb connect localhost 2>/dev/null")
+                        // 定期 adb connect 保持连接，使用 execute 确保执行
+                        val result = ShellExecutor.execute("adb connect localhost:$wifiPort 2>/dev/null")
+                        if (!result.stdout.contains("already connected") &&
+                            result.stdout.contains("connected")) {
+                            AppLogger.d(tag, "ADB keep-alive: reconnected")
+                        }
                     }
-                } catch (_: Exception) {}
+                } catch (e: CancellationException) {
+                    throw e  // 协程取消不应被吞掉
+                } catch (e: Exception) {
+                    AppLogger.w(tag, "ADB keep-alive error: ${e.message}")
+                }
             }
         }
     }

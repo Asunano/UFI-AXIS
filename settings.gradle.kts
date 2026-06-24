@@ -21,5 +21,5 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "UFI-AXIS"
-include(":core")  // 后端 (原 UFI-AXIS-Core)
-include(":app")   // 前端 (原 UFI-AXIS)
+include(":core")  // 后端 
+include(":app")   // 前端 

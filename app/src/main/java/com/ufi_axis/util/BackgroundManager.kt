@@ -68,6 +68,6 @@ class BackgroundManager(context: Context) {
 
 @Composable
 fun rememberBackgroundManager(): BackgroundManager {
-    val context = LocalContext.current
+    val context = LocalContext.current.applicationContext
     return remember { BackgroundManager(context) }
 }

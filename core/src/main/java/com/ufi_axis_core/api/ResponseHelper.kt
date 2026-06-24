@@ -58,9 +58,11 @@ object ResponseHelper {
                 @Suppress("UNCHECKED_CAST")
                 json.encodeToJsonElement(serializer as kotlinx.serialization.KSerializer<Any>, value)
             } else {
+                android.util.Log.w("ResponseHelper", "No serializer for ${kClass.simpleName}, falling back to toString()")
                 null
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            android.util.Log.e("ResponseHelper", "Serialize failed for ${value::class.simpleName}: ${e.message}", e)
             null
         }
     }
