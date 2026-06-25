@@ -12,6 +12,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
+import com.ufi_axis.util.DebugLog
 import com.ufi_axis.viewmodel.MainViewModel
 import com.google.gson.JsonObject
 import kotlinx.coroutines.delay
@@ -47,7 +48,7 @@ fun ApnConfigDialog(
                 isAutoMode = mode; appliedAutoMode = mode
                 val curIdx = obj?.get("Current_index")?.asString?.toIntOrNull() ?: 0
                 selectedProfileIdx = curIdx
-            } catch (_: Exception) {}
+            } catch (e: Exception) { DebugLog.w("ApnConfig", "Failed to parse APN config", e) }
             isLoading = false
         }
     }

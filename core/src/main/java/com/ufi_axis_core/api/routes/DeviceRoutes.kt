@@ -1,24 +1,16 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.collector.at.ATChannel
-import com.ufi_axis_core.collector.system.SystemCollector
-import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.GoformClient
-import com.ufi_axis_core.controller.goform.GoformDeviceClient
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.system.SystemController
-import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.api.routes.RouteContext
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
-import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.core.cache.CacheTTL
-import com.ufi_axis_core.core.cache.ResponseCache
+import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.ShellQoS
 import kotlinx.coroutines.Dispatchers
@@ -30,18 +22,21 @@ import kotlinx.coroutines.withContext
  * GET /api/device/goform - Goform 设备状态
  */
 class DeviceRoutes(
-    private val systemCollector: SystemCollector,
-    private val telephonyCollector: TelephonyCollector,
-    private val atChannel: ATChannel,
-    private val goformClient: GoformClient,
-    private val signalClient: GoformSignalClient,
-    private val networkClient: GoformNetworkClient,
-    private val deviceClient: GoformDeviceClient,
-    private val systemController: SystemController,
-    private val cache: ResponseCache? = null,
-    private val dataHub: DataHub? = null,
-    private val settings: AppSettings? = null
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter，使已有方法无需修改 ──
+    private val systemCollector get() = ctx.systemCollector
+    private val telephonyCollector get() = ctx.telephonyCollector
+    private val atChannel get() = ctx.atChannel
+    private val goformClient get() = ctx.goformClient
+    private val signalClient get() = ctx.signalClient
+    private val networkClient get() = ctx.networkClient
+    private val deviceClient get() = ctx.deviceClient
+    private val systemController get() = ctx.systemController
+    private val cache get() = ctx.responseCache
+    private val dataHub get() = ctx.dataHub
+    private val settings get() = ctx.settings
+
     fun register(route: Route) {
         route.route("/device") {
             get("/info") {
@@ -53,11 +48,11 @@ class DeviceRoutes(
                     val atInfo = atChannel.getPlatformInfo()
                     val kernelVersion = systemController.getKernelVersion()
                     // 通过 DataHub 获取网络类型信息（10s TTL 缓存，与 NetworkRoutes /status 共享）
-                    val hubInfo = try { dataHub?.getNetworkTypeInfo() } catch (_: Exception) { null }
+                    val hubInfo = try { dataHub?.getNetworkTypeInfo() } catch (e: Exception) { AppLogger.w("DeviceRoutes", "Failed to get network type info: ${e.message}"); null }
                     val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
                     val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }
                     // 从 DataHub 获取设备身份信息（已通过 ResponseCache 缓存）
-                    val identity = try { dataHub?.getDeviceIdentity() } catch (_: Exception) { null }
+                    val identity = try { dataHub?.getDeviceIdentity() } catch (e: Exception) { AppLogger.w("DeviceRoutes", "Failed to get device identity: ${e.message}"); null }
                     return toJsonElement(mapOf(
                         "device" to deviceInfo, "sim" to simInfo, "storage" to storageInfo,
                         "uptime" to uptime, "at_channel" to atInfo, "kernel" to kernelVersion,

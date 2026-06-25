@@ -32,6 +32,7 @@ class AppSettings(context: Context) {
         private const val KEY_QOS_GOFORM_QUERY_MAX = "qos_goform_query_max"
         private const val KEY_QOS_GOFORM_SET_MAX = "qos_goform_set_max"
         private const val KEY_ADB_AUTO_START = "adb_auto_start_on_boot"
+        private const val KEY_ALERT_CONFIG = "alert_config"
 
         // Defaults
         const val DEFAULT_TOKEN = "ufi-axis-default-token"
@@ -127,6 +128,17 @@ class AppSettings(context: Context) {
     var adbAutoStartOnBoot: Boolean
         get() = prefs.getBoolean(KEY_ADB_AUTO_START, false)
         set(value) = prefs.edit().putBoolean(KEY_ADB_AUTO_START, value).apply()
+
+    // --- Alert Config ---
+
+    var alertConfigJson: String?
+        get() = prefs.getString(KEY_ALERT_CONFIG, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_ALERT_CONFIG, value)
+            else editor.remove(KEY_ALERT_CONFIG)
+            editor.apply()
+        }
 
     // --- Helpers ---
 

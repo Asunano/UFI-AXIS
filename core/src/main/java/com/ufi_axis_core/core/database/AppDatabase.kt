@@ -44,6 +44,23 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun memoryHistoryDao(): MemoryHistoryDao
     abstract fun batteryHistoryDao(): BatteryHistoryDao
 
+    /**
+     * 将 4 个 buffer 的写入合并为 1 个事务，减少事务竞争。
+     * 每 20 秒调用一次，4 个独立事务 → 1 个事务，WAL 模式写合并更高效。
+     */
+    @androidx.room.Transaction
+    open suspend fun flushAllBuffers(
+        cpu: List<CpuHistoryRecord>,
+        mem: List<MemoryHistoryRecord>,
+        traffic: List<TrafficRecord>,
+        signal: List<SignalRecord>
+    ) {
+        if (cpu.isNotEmpty()) cpuHistoryDao().insertAll(cpu)
+        if (mem.isNotEmpty()) memoryHistoryDao().insertAll(mem)
+        if (traffic.isNotEmpty()) trafficDao().insertAll(traffic)
+        if (signal.isNotEmpty()) signalDao().insertAll(signal)
+    }
+
     companion object {
         private const val DB_NAME = "ufi_axis_core.db"
         @Volatile

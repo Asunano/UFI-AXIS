@@ -9,6 +9,8 @@ import android.os.SystemClock
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.ShellQoS
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import java.io.File
 
@@ -42,28 +44,20 @@ class SystemCollector(private val context: Context) {
         var temperature = 0.0
         try {
             cpuUsage = readCpuUsage()
-
+            
             val coreCount = Runtime.getRuntime().availableProcessors()
-            // Batch: N cores + 1 temp → single shell call (N+1 → 1)
-            val sep = "|SEP|"
-            val paths = (0 until coreCount).map { i ->
-                "/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq"
-            } + "/sys/class/thermal/thermal_zone0/temp"
-            val batchCmd = paths.joinToString(" ; echo \"$sep\" ; ") { "cat $it 2>/dev/null || echo 0" }
-            val batchResult = ShellQoS.executeAsRootCached(batchCmd)
-            val segments = batchResult.stdout.split(sep).map { it.trim() }
-
+            // 直接读取 sysfs 文件，免 root 免 shell fork
             for (i in 0 until coreCount) {
-                val freqKhz = segments.getOrNull(i)?.toLongOrNull() ?: 0
+                val freqKhz = File("/sys/devices/system/cpu/cpu$i/cpufreq/scaling_cur_freq")
+                    .also { if (!it.exists()) continue }
+                    .readText().trim().toLongOrNull() ?: 0
                 val freqMhz = freqKhz / 1000.0
                 cores.add(CpuCore(core = i, freq_mhz = freqMhz, freq_display = formatFrequency(freqKhz)))
             }
-
-            val tempStr = segments.getOrNull(coreCount)
-            if (tempStr != null) {
-                val tempMilli = tempStr.toLongOrNull() ?: 0
-                temperature = tempMilli / 1000.0
-            }
+            
+            val tempMilli = File("/sys/class/thermal/thermal_zone0/temp")
+                .readText().trim().toLongOrNull() ?: 0
+            temperature = tempMilli / 1000.0
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to get CPU info", e)
         }
@@ -208,22 +202,24 @@ class SystemCollector(private val context: Context) {
     /**
      * 读取 CPU 使用率（两次采样取差值）。
      * 使用协程 delay 而非 shell sleep，避免阻塞 Dispatchers.IO 线程。
+     *
+     * 直接读取 /proc/stat（本地文件，无需 fork shell 进程），
+     * 避免每次采样都调用 ShellQoS.execute() 创建子进程的开销。
+     * 低端设备上进程创建成本极高，而文件读写在 IO 线程上几乎无开销。
      */
-    private suspend fun readCpuUsage(): Double {
+    private suspend fun readCpuUsage(): Double = withContext(Dispatchers.IO) {
         try {
-            // 必须用无缓存 execute()：两次读取间隔 200ms 远小于缓存 TTL (2000ms)，
-            // 若走 executeCached() 会命中缓存返回相同数据，导致 diff 恒为 0
-            val stat1 = ShellQoS.execute("cat /proc/stat").stdout
-                .lines().firstOrNull { it.startsWith("cpu ") } ?: return 0.0
+            val stat1 = File("/proc/stat").readLines()
+                .firstOrNull { it.startsWith("cpu ") } ?: return@withContext 0.0
             kotlinx.coroutines.delay(200)
-            val stat2 = ShellQoS.execute("cat /proc/stat").stdout
-                .lines().firstOrNull { it.startsWith("cpu ") } ?: return 0.0
+            val stat2 = File("/proc/stat").readLines()
+                .firstOrNull { it.startsWith("cpu ") } ?: return@withContext 0.0
 
             // 使用 \\s+ 分隔以适应多空格/制表符对齐的 /proc/stat 格式
             val values1 = stat1.substring(4).trim().split("\\s+".toRegex()).map { it.toLongOrNull() ?: 0 }
             val values2 = stat2.substring(4).trim().split("\\s+".toRegex()).map { it.toLongOrNull() ?: 0 }
 
-            if (values1.size < 4 || values2.size < 4) return 0.0
+            if (values1.size < 4 || values2.size < 4) return@withContext 0.0
 
             val idle1 = values1[3]
             val idle2 = values2[3]
@@ -233,11 +229,11 @@ class SystemCollector(private val context: Context) {
             val totalDiff = (total2 - total1).toDouble()
             val idleDiff = (idle2 - idle1).toDouble()
 
-            return if (totalDiff > 0) {
+            return@withContext if (totalDiff > 0) {
                 ((totalDiff - idleDiff) / totalDiff) * 100.0
             } else 0.0
         } catch (e: Exception) {
-            return 0.0
+            0.0
         }
     }
 
@@ -330,6 +326,16 @@ data class CpuInfo(
     val core_count: Int,
     val cores: List<CpuCore>,
     val temperature: Double = 0.0
+)
+
+/**
+ * 精简 CPU 信息，仅保留必要字段供 StateFlow 常驻内存。
+ * 不含各核频率详情（cores），完整 CpuInfo 通过 WebSocket 广播或 getCpuInfo() 获取。
+ */
+data class CpuInfoLite(
+    val usage_percent: Double,
+    val core_count: Int,
+    val temperature: Double
 )
 
 @Serializable

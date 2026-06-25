@@ -1,7 +1,7 @@
 package com.ufi_axis_core.util
 
 import kotlinx.serialization.json.JsonObject
-import java.util.concurrent.ConcurrentHashMap
+import java.util.*
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -35,7 +35,13 @@ object GoformQoS {
         initialPermits = DEFAULT_SET_PERMITS, minPermits = 1, maxPermits = 4
     )
 
-    private val queryCache = ConcurrentHashMap<String, CacheEntry>()
+    private val cacheLock = Any()
+
+    private val queryCache = object : LinkedHashMap<String, CacheEntry>(MAX_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean {
+            return size > MAX_CACHE_SIZE
+        }
+    }
 
     @Volatile
     private var cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS
@@ -102,10 +108,12 @@ object GoformQoS {
      */
     fun getCachedQuery(key: String): JsonObject? {
         val now = System.currentTimeMillis()
-        queryCache[key]?.let { entry ->
-            if (now - entry.timestamp < cacheTtlMs) {
-                cacheHits.incrementAndGet()
-                return entry.result
+        synchronized(cacheLock) {
+            queryCache[key]?.let { entry ->
+                if (now - entry.timestamp < cacheTtlMs) {
+                    cacheHits.incrementAndGet()
+                    return entry.result
+                }
             }
         }
         return null
@@ -115,7 +123,9 @@ object GoformQoS {
      * 写入查询缓存
      */
     fun cacheQuery(key: String, result: JsonObject) {
-        queryCache[key] = CacheEntry(result, System.currentTimeMillis())
+        synchronized(cacheLock) {
+            queryCache[key] = CacheEntry(result, System.currentTimeMillis())
+        }
         pruneExpiredCache()
     }
 
@@ -137,7 +147,7 @@ object GoformQoS {
     val setTotalPermits: Int get() = setSemaphore.totalPermits
 
     /** 缓存条目数 */
-    val cacheSize: Int get() = queryCache.size
+    val cacheSize: Int get() = synchronized(cacheLock) { queryCache.size }
 
     /** 当前缓存 TTL */
     val currentCacheTtlMs: Long get() = cacheTtlMs
@@ -150,7 +160,7 @@ object GoformQoS {
         "set_available" to setSemaphore.availablePermits,
         "set_total" to setSemaphore.totalPermits,
         "set_target" to setSemaphore.target,
-        "cache_size" to queryCache.size,
+        "cache_size" to synchronized(cacheLock) { queryCache.size },
         "cache_ttl_ms" to cacheTtlMs,
         "stats" to mapOf(
             "total_queries" to totalQueries.get(),
@@ -183,23 +193,22 @@ object GoformQoS {
 
     /** 清空查询缓存 */
     fun clearCache() {
-        queryCache.clear()
+        synchronized(cacheLock) {
+            queryCache.clear()
+        }
         AppLogger.i("GoformQoS", "Query cache cleared")
     }
 
     // ==================== 内部方法 ====================
 
     private fun pruneExpiredCache() {
-        if (queryCache.size > MAX_CACHE_SIZE) {
-            queryCache.clear()
-            return
-        }
         val now = System.currentTimeMillis()
-        val iterator = queryCache.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (now - entry.value.timestamp > cacheTtlMs) {
-                iterator.remove()
+        synchronized(cacheLock) {
+            val iterator = queryCache.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value.timestamp > cacheTtlMs) {
+                    iterator.remove()
+                }
             }
         }
     }

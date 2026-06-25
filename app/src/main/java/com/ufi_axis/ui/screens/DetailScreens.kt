@@ -166,7 +166,7 @@ fun SystemDetailScreen(viewModel: MainViewModel, navController: NavHostControlle
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BatteryDetailScreen(viewModel: MainViewModel, navController: NavHostController) {
-    val state by viewModel.dashboardState.collectAsState()
+    val batteryInfo by viewModel.dashboardBatteryInfo.collectAsState()
 
     UfiScreenScaffold(title = "电池详情", navController = navController, showBack = true) { padding ->
         PullToRefreshBox(
@@ -175,7 +175,7 @@ fun BatteryDetailScreen(viewModel: MainViewModel, navController: NavHostControll
             modifier = Modifier.padding(padding).fillMaxSize()
         ) {
         UfiPageBackground {
-            state.batteryInfo?.let { battery ->
+            batteryInfo?.let { battery ->
                 val batColor = batteryColor(battery.percent)
                 UfiSettingsGroup {
                     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

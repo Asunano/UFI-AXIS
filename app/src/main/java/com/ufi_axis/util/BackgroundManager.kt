@@ -1,19 +1,12 @@
 package com.ufi_axis.util
 
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.RenderEffect
-import android.graphics.Shader
-import android.net.Uri
-import android.os.Build
-import androidx.compose.runtime.*
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.*
-import androidx.compose.ui.graphics.drawscope.DrawScope
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
 
 data class BackgroundState(
@@ -25,21 +18,21 @@ data class BackgroundState(
 class BackgroundManager(context: Context) {
     private val prefs = context.getSharedPreferences("ufi_axis_background", Context.MODE_PRIVATE)
 
-    var state by mutableStateOf(loadState())
-        private set
+    private val _state = MutableStateFlow(loadState())
+    val state: StateFlow<BackgroundState> = _state.asStateFlow()
 
     fun updateEnabled(enabled: Boolean) {
-        state = state.copy(enabled = enabled)
+        _state.value = _state.value.copy(enabled = enabled)
         saveState()
     }
 
     fun updateImagePath(path: String?) {
-        state = state.copy(imagePath = path)
+        _state.value = _state.value.copy(imagePath = path)
         saveState()
     }
 
     fun updateBlurRadius(radius: Float) {
-        state = state.copy(blurRadius = radius.coerceIn(0f, 50f))
+        _state.value = _state.value.copy(blurRadius = radius.coerceIn(0f, 50f))
         saveState()
     }
 
@@ -52,17 +45,19 @@ class BackgroundManager(context: Context) {
     }
 
     private fun saveState() {
+        val s = _state.value
         prefs.edit()
-            .putBoolean("bg_enabled", state.enabled)
-            .putString("bg_image_path", state.imagePath)
-            .putFloat("bg_blur_radius", state.blurRadius)
+            .putBoolean("bg_enabled", s.enabled)
+            .putString("bg_image_path", s.imagePath)
+            .putFloat("bg_blur_radius", s.blurRadius)
             .apply()
     }
 
     fun clearBackground() {
-        state = BackgroundState()
+        val oldPath = _state.value.imagePath
+        _state.value = BackgroundState()
         saveState()
-        state.imagePath?.let { File(it).delete() }
+        oldPath?.let { File(it).delete() }
     }
 }
 

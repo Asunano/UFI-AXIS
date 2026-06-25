@@ -1,7 +1,6 @@
 package com.ufi_axis.util
 
 import android.content.Context
-import com.google.gson.Gson
 import com.ufi_axis.data.cache.CacheDatabase
 import com.ufi_axis.data.cache.CachedDashboardEntity
 import kotlinx.coroutines.*
@@ -18,8 +17,6 @@ data class CachedDashboardData(
 class CacheManager(context: Context) {
 
     private val dao = CacheDatabase.getInstance(context).dashboardCacheDao()
-    private val gson = Gson()
-
     // 使用 SupervisorJob + Dispatchers.IO，支持外部取消
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)

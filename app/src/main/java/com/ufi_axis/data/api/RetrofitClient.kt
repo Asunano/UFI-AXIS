@@ -1,6 +1,7 @@
 package com.ufi_axis.data.api
 
 import com.ufi_axis.BuildConfig
+import com.ufi_axis.util.AppGson
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
 import okhttp3.Interceptor
@@ -8,16 +9,20 @@ import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.Invocation
+import retrofit2.http.Streaming
+import kotlinx.coroutines.delay
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
  * Retry interceptor for transient failures (IOException, 5xx).
- * Retries up to [maxRetries] times with [retryDelayMs] between attempts.
+ * Kept minimal (maxRetries=1, 200ms) to avoid blocking OkHttp thread pool.
+ * Heavy retry should use [retryIO] at the coroutine call site instead.
  */
 class RetryInterceptor(
-    private val maxRetries: Int = 2,
-    private val retryDelayMs: Long = 500
+    private val maxRetries: Int = 1,
+    private val retryDelayMs: Long = 200
 ) : Interceptor {
     override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
         val request = chain.request()
@@ -25,7 +30,6 @@ class RetryInterceptor(
         for (attempt in 0..maxRetries) {
             try {
                 val response = chain.proceed(request)
-                // Retry on 5xx server errors
                 if (response.code >= 500 && attempt < maxRetries) {
                     response.close()
                     Thread.sleep(retryDelayMs)
@@ -41,6 +45,22 @@ class RetryInterceptor(
         }
         throw lastException ?: IOException("Request failed after ${maxRetries + 1} attempts")
     }
+}
+
+/**
+ * Coroutine-safe retry wrapper for suspend API calls.
+ * Uses non-blocking [delay] instead of [Thread.sleep], safe for any dispatcher.
+ *
+ * Usage:
+ *   val result = retryIO { api.getDeviceInfo() }
+ */
+suspend fun <T> retryIO(times: Int = 2, initialDelay: Long = 200, block: suspend () -> T): T {
+    repeat(times - 1) { attempt ->
+        try { return block() } catch (_: IOException) {
+            delay(initialDelay * (1L shl attempt))  // exponential backoff: 200, 400
+        }
+    }
+    return block()
 }
 
 object RetrofitClient {
@@ -84,15 +104,23 @@ object RetrofitClient {
             val request = chain.request()
             val response = chain.proceed(request)
             if (prefs.debugMode) {
-                val url = request.url.toString()
-                val body = response.peekBody(8192).string()
-                DebugLog.json("HTTP", url, body)
+                val isStreaming = try {
+                    request.tag(Invocation::class.java)
+                        ?.method()
+                        ?.isAnnotationPresent(Streaming::class.java) == true
+                } catch (_: Exception) { false }
+                if (!isStreaming) {
+                    try {
+                        val body = response.peekBody(4096).string()
+                        DebugLog.json("HTTP", request.url.toString(), body.take(2000))
+                    } catch (_: Exception) {}
+                }
             }
             response
         }
 
         val builder = OkHttpClient.Builder()
-            .addInterceptor(RetryInterceptor(maxRetries = 2, retryDelayMs = 500))
+            .addInterceptor(RetryInterceptor(maxRetries = 1, retryDelayMs = 200))
             .addInterceptor(authInterceptor)
             .addInterceptor(traceInterceptor)
             .connectTimeout(15, TimeUnit.SECONDS)
@@ -109,9 +137,7 @@ object RetrofitClient {
         val client = builder.build()
 
         // Gson 严格模式无法处理 goform 透传的字符串数字（如 "rsrp":"99"）
-        val gson = com.google.gson.GsonBuilder()
-            .setLenient()
-            .create()
+        val gson = AppGson.instance
 
         return Retrofit.Builder()
             .baseUrl(baseUrl)

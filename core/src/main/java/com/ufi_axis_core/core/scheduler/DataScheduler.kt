@@ -2,6 +2,7 @@ package com.ufi_axis_core.core.scheduler
 
 import com.ufi_axis_core.collector.signal.SignalCollector
 import com.ufi_axis_core.collector.system.CpuInfo
+import com.ufi_axis_core.collector.system.CpuInfoLite
 import com.ufi_axis_core.collector.system.MemoryInfo
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
@@ -23,14 +24,31 @@ import com.ufi_axis_core.core.database.MemoryHistoryRecord
 import com.ufi_axis_core.core.database.BatteryHistoryRecord
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DynamicThreadPool
-import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
 import com.ufi_axis_core.api.websocket.WebSocketManager
+import java.io.File
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import java.util.concurrent.ConcurrentLinkedQueue
+
+/** 分批清理单个 DAO 的过期数据，避免长事务导致 WAL 文件膨胀 */
+private suspend fun deleteBatched(
+    dao: suspend (Long, Int) -> Int,
+    cutoff: Long,
+    batchSize: Int = 1000,
+    tag: String = ""
+): Int {
+    var total = 0
+    var deleted: Int
+    do {
+        deleted = dao(cutoff, batchSize)
+        total += deleted
+    } while (deleted >= batchSize)
+    if (total > 0) AppLogger.d("DataScheduler", "Batched delete $tag: $total rows")
+    return total
+}
 
 /**
  * 多频率采集调度器
@@ -131,8 +149,8 @@ class DataScheduler(
         if (r.operator.isNotEmpty()) put("operator", r.operator)
     }
 
-    private val _latestCpu = MutableStateFlow<CpuInfo?>(null)
-    val latestCpu: StateFlow<CpuInfo?> = _latestCpu
+    private val _latestCpu = MutableStateFlow<CpuInfoLite?>(null)
+    val latestCpu: StateFlow<CpuInfoLite?> = _latestCpu
 
     private val _latestMemory = MutableStateFlow<MemoryInfo?>(null)
     val latestMemory: StateFlow<MemoryInfo?> = _latestMemory
@@ -222,13 +240,14 @@ class DataScheduler(
         isRunning = false
         performanceMonitorJob?.cancel()
         flushJob?.cancel()
-        // 停止前同步刷写剩余缓冲数据（runBlocking 确保 flush 完成后再取消子协程，
-        // 避免 launch + cancelChildren 竞态导致 flush 被中断、数据丢失）
-        try {
-            kotlinx.coroutines.runBlocking(Dispatchers.IO) { flushBuffers() }
-        } catch (_: Exception) {}
-        schedulerScope.coroutineContext.cancelChildren()
-        AppLogger.i(tag, "Data scheduler stopped")
+        // 在 schedulerScope 内异步刷写剩余缓冲数据后取消所有子协程，
+        // 避免 runBlocking(Dispatchers.IO) 在 IO 线程上调用时导致线程池耗尽死锁。
+        // 使用 NonCancellable 防止 cancelChildren 取消当前协程自身。
+        schedulerScope.launch(NonCancellable) {
+            flushBuffers()
+            schedulerScope.coroutineContext.cancelChildren()
+            AppLogger.i(tag, "Data scheduler stopped")
+        }
     }
 
     /**
@@ -239,7 +258,7 @@ class DataScheduler(
             try {
                 val cpuInfo = systemCollector.getCpuInfo()
                 val memoryInfo = systemCollector.getMemoryInfo()
-                _latestCpu.value = cpuInfo
+                _latestCpu.value = CpuInfoLite(cpuInfo.usage_percent, cpuInfo.core_count, cpuInfo.temperature)
                 _latestMemory.value = memoryInfo
                 AppLogger.i(tag, "Device performance: CPU cores=${cpuInfo.cores.size}, usage=${cpuInfo.usage_percent}%, memory total=${memoryInfo.total / 1024 / 1024}MB, used=${memoryInfo.used / 1024 / 1024}MB")
             } catch (e: Exception) {
@@ -326,29 +345,11 @@ class DataScheduler(
             DataPriority.LOW -> 20_000L      // 流量统计: 20s base (was 10s) — 加倍放慢
         }
 
-        val poolSize = dynamicThreadPool.getThreadPoolInfo().maxPoolSize
-        // 取最大因子，而非乘法乘积，防止极端情况下延迟暴增到 75 秒
-        val poolFactor = when {
-            poolSize <= 1 -> 2.0
-            poolSize <= 2 -> 1.5
-            poolSize >= 4 -> 0.75
-            else -> 1.0
-        }
+        val shellLoad = 1.0 - (ShellQoS.rootAvailablePermits.toDouble() / ShellQoS.rootTotalPermits)
+        val goformLoad = 1.0 - (GoformQoS.queryAvailablePermits.toDouble() / GoformQoS.queryTotalPermits)
+        val load = maxOf(shellLoad, goformLoad).coerceIn(-0.5, 1.0)
 
-        val rootTotal = ShellQoS.rootTotalPermits
-        val rootAvail = ShellQoS.rootAvailablePermits
-        val shellLoad = if (rootTotal > 0) 1.0 - (rootAvail.toDouble() / rootTotal) else 0.0
-        val shellFactor = 1.0 + shellLoad * 2.0
-
-        val goformTotal = GoformQoS.queryTotalPermits
-        val goformAvail = GoformQoS.queryAvailablePermits
-        val goformLoad = if (goformTotal > 0) 1.0 - (goformAvail.toDouble() / goformTotal) else 0.0
-        val goformFactor = 1.0 + goformLoad * 1.5
-
-        // 取三个因子的最大值（而非乘积），保证最大延迟不超过 baseDelay * 2.0
-        val combinedFactor = maxOf(poolFactor, shellFactor, goformFactor).coerceIn(0.5, 2.0)
-
-        return (baseDelay * combinedFactor).toLong()
+        return (baseDelay * (1.0 + load).coerceIn(0.5, 2.0)).toLong()
     }
 
     // 上一次 TrafficStats 累计值，用于计算实时速率差值
@@ -461,7 +462,7 @@ class DataScheduler(
     private suspend fun collectCpu() {
         try {
             val cpuInfo = systemCollector.getCpuInfo()
-            _latestCpu.value = cpuInfo
+            _latestCpu.value = CpuInfoLite(cpuInfo.usage_percent, cpuInfo.core_count, cpuInfo.temperature)
 
             val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
             val cpuRecord = CpuHistoryRecord(
@@ -572,10 +573,16 @@ class DataScheduler(
     private suspend fun collectSmsCache() {
         try {
             val sms = smsClient ?: return
-            // 轮询最新 5 条消息（覆盖验证码等场景），30s 间隔足够
-            val smsData = sms.getSmsList(page = 0, perPage = FAST_PER_PAGE)
-            if (smsData == null) return
+            // 轮询最新 5 条消息（覆盖验证码等场景），60s 间隔
+            val smsData = sms.getSmsList(page = 0, perPage = FAST_PER_PAGE) ?: return
             val arr = smsData["messages"]?.jsonArray ?: return
+
+            // 从原始 JSON 中提取最大消息 ID，无需先反序列化每条消息
+            val newMax = arr.maxOfOrNull {
+                it.jsonObject["id"]?.jsonPrimitive?.longOrNull ?: 0L
+            } ?: 0L
+            if (newMax <= lastPollMaxSmsId) return  // 无新消息，跳过后续解析、聚合和广播
+            lastPollMaxSmsId = newMax
 
             val messages = arr.mapNotNull { el ->
                 try {
@@ -600,10 +607,6 @@ class DataScheduler(
 
             if (messages.isEmpty()) return
 
-            // 更新最高ID
-            val newMax = messages.maxOfOrNull { (it["id"] as? Long) ?: 0L } ?: 0L
-            if (newMax > lastPollMaxSmsId) lastPollMaxSmsId = newMax
-
             // 按号码聚合 → 联系人列表
             val contacts = messages.groupBy { it["number"] as? String ?: "" }
                 .mapValues { (_, msgs) ->
@@ -620,7 +623,7 @@ class DataScheduler(
                 .values
                 .sortedByDescending { it["latestTimestamp"] as Long }
 
-            cachedSmsContacts = contacts
+            cachedSmsContacts = contacts.take(MAX_SMS_CONTACTS)
 
             webSocketManager.broadcast("sms_contacts", mapOf(
                 "contacts" to contacts,
@@ -667,22 +670,20 @@ class DataScheduler(
         try {
             val cpuBatch = mutableListOf<CpuHistoryRecord>()
             while (true) { cpuBuffer.poll()?.let { cpuBatch.add(it) } ?: break }
-            if (cpuBatch.isNotEmpty()) database.cpuHistoryDao().insertAll(cpuBatch)
 
             val memBatch = mutableListOf<MemoryHistoryRecord>()
             while (true) { memoryBuffer.poll()?.let { memBatch.add(it) } ?: break }
-            if (memBatch.isNotEmpty()) database.memoryHistoryDao().insertAll(memBatch)
 
             val trafficBatch = mutableListOf<TrafficRecord>()
             while (true) { trafficBuffer.poll()?.let { trafficBatch.add(it) } ?: break }
-            if (trafficBatch.isNotEmpty()) database.trafficDao().insertAll(trafficBatch)
 
             val signalBatch = mutableListOf<SignalRecord>()
             while (true) { signalBuffer.poll()?.let { signalBatch.add(it) } ?: break }
-            if (signalBatch.isNotEmpty()) database.signalDao().insertAll(signalBatch)
 
             val totalFlushed = cpuBatch.size + memBatch.size + trafficBatch.size + signalBatch.size
             if (totalFlushed > 0) {
+                // 4 个 buffer 合并为 1 个事务，减少 WAL 模式下的事务竞争
+                database.flushAllBuffers(cpuBatch, memBatch, trafficBatch, signalBatch)
                 AppLogger.d(tag, "Flushed buffers: cpu=${cpuBatch.size}, mem=${memBatch.size}, traffic=${trafficBatch.size}, signal=${signalBatch.size}")
             }
         } catch (e: Exception) {
@@ -692,23 +693,50 @@ class DataScheduler(
 
     /**
      * 清理过期数据，总量上限约 150MB
+     *
+     * 使用分批删除（LIMIT 1000）避免长事务阻塞 WAL 文件合并。
+     * 清理完成后执行 WAL checkpoint(TRUNCATE) 回收空间。
      */
     private suspend fun cleanOldData() {
         try {
             val now = System.currentTimeMillis()
             val monitorCutoff = now - HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1000L
 
-            // 监控数据统一保留 HISTORY_RETENTION_DAYS 天
-            val trafficDeleted = database.trafficDao().deleteOlderThan(monitorCutoff)
-            val signalDeleted = database.signalDao().deleteOlderThan(monitorCutoff)
-            val cpuDeleted = database.cpuHistoryDao().deleteOlderThan(monitorCutoff)
-            val memoryDeleted = database.memoryHistoryDao().deleteOlderThan(monitorCutoff)
-            val batteryDeleted = database.batteryHistoryDao().deleteOlderThan(monitorCutoff)
-            // 告警记录: 保留 30 天
+            // 监控数据统一保留 HISTORY_RETENTION_DAYS 天，分批删除避免长事务
+            val cpuDeleted = deleteBatched(
+                { cutoff, limit -> database.cpuHistoryDao().deleteOlderThanBatched(cutoff, limit) },
+                monitorCutoff, tag = "cpu_history"
+            )
+            val memoryDeleted = deleteBatched(
+                { cutoff, limit -> database.memoryHistoryDao().deleteOlderThanBatched(cutoff, limit) },
+                monitorCutoff, tag = "memory_history"
+            )
+            val trafficDeleted = deleteBatched(
+                { cutoff, limit -> database.trafficDao().deleteOlderThanBatched(cutoff, limit) },
+                monitorCutoff, tag = "traffic_records"
+            )
+            val signalDeleted = deleteBatched(
+                { cutoff, limit -> database.signalDao().deleteOlderThanBatched(cutoff, limit) },
+                monitorCutoff, tag = "signal_history"
+            )
+            val batteryDeleted = deleteBatched(
+                { cutoff, limit -> database.batteryHistoryDao().deleteOlderThanBatched(cutoff, limit) },
+                monitorCutoff, tag = "battery_history"
+            )
+            // 告警记录: 保留 30 天（告警量少，无需分批）
             val alertDeleted = database.alertDao().deleteOlderThan(now - 30L * 24 * 60 * 60 * 1000L)
             // 短信记录: 永久保留，不自动清理
 
-            AppLogger.i(tag, "Cleaned data: cpu=$cpuDeleted, memory=$memoryDeleted, traffic=$trafficDeleted, signal=$signalDeleted, battery=$batteryDeleted, alert=$alertDeleted")
+            if (cpuDeleted + memoryDeleted + trafficDeleted + signalDeleted + batteryDeleted + alertDeleted > 0) {
+                AppLogger.i(tag, "Cleaned data: cpu=$cpuDeleted, memory=$memoryDeleted, traffic=$trafficDeleted, signal=$signalDeleted, battery=$batteryDeleted, alert=$alertDeleted")
+
+                // WAL checkpoint(TRUNCATE)：合并 WAL 文件回主库，回收磁盘空间
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    try {
+                        database.openHelper.writableDatabase.execSQL("PRAGMA wal_checkpoint(TRUNCATE)")
+                    } catch (_: Exception) {}
+                }
+            }
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to clean data", e)
         }
@@ -724,13 +752,12 @@ class DataScheduler(
 
     /**
      * 有界入队：超过 MAX_BUFFER_SIZE 时丢弃最旧记录。
-     * 用 AtomicInteger counter 代替 size() O(n) 遍历。
+     * 各 buffer 独立判断 size()，避免全局计数器带来的跨 buffer 干扰。
+     * 虽然 size() 是 O(n)，但 buffer 上限仅 100，可忽略不计。
      */
-    private val bufferCounter = java.util.concurrent.atomic.AtomicInteger(0)
-
     private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T) {
-        if (bufferCounter.incrementAndGet() > MAX_BUFFER_SIZE) {
-            if (poll() != null) bufferCounter.decrementAndGet() else bufferCounter.set(size.coerceAtMost(MAX_BUFFER_SIZE))
+        while (size >= MAX_BUFFER_SIZE) {
+            poll() ?: break
         }
         offer(item)
     }
@@ -738,14 +765,17 @@ class DataScheduler(
     /**
      * 读取 CPU 最高温度（毫摄氏度）
      * 从 /sys/class/thermal/ 下所有 thermal_zone 的 temp 文件读取，返回最大值
-     * 使用缓存 Shell 调用减少 sysfs 压力
+     * 直接读取 sysfs，无需 root 权限，避免 shell fork 开销
      */
-    private suspend fun readMaxCpuTemp(): Int {
-        return try {
-            val result = ShellExecutor.executeAsRoot("cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null")
-            result.stdout.lines()
-                .mapNotNull { it.trim().toIntOrNull() }
-                .maxOrNull() ?: 0
+    private suspend fun readMaxCpuTemp(): Int = withContext(Dispatchers.IO) {
+        try {
+            val thermalDir = File("/sys/class/thermal")
+            thermalDir.listFiles()
+                ?.filter { it.name.startsWith("thermal_zone") }
+                ?.mapNotNull { zone ->
+                    File(zone, "temp").readText().trim().toIntOrNull()
+                }
+                ?.maxOrNull() ?: 0
         } catch (_: Exception) { 0 }
     }
 
@@ -760,6 +790,7 @@ class DataScheduler(
         const val THERMAL_WARNING_THRESHOLD = 75_000    // 75°C (milli-degrees)
         const val THERMAL_CRITICAL_THRESHOLD = 85_000  // 85°C (milli-degrees)
         const val THERMAL_PAUSE_MS = 10_000L           // 温度熔断暂停时间
+        const val MAX_SMS_CONTACTS = 100               // SMS 联系人缓存上限
     }
 
     enum class DataPriority {

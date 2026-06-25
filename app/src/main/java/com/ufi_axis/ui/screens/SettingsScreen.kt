@@ -204,13 +204,13 @@ fun SettingsScreen(
                     UfiDivider()
                 }
                 // 设备固件版本（goform 实时获取）
-                val dashboardState by viewModel.dashboardState.collectAsState()
+                val deviceVer by viewModel.dashboardDeviceVersion.collectAsState()
                 LaunchedEffect(Unit) { viewModel.dashboard.loadDeviceVersion() }
-                val deviceVer = dashboardState.deviceVersion
-                if (deviceVer != null && deviceVer.cr_version.isNotEmpty()) {
-                    UfiInfoRow("固件版本", deviceVer.cr_version)
+                val ver = deviceVer
+                if (ver != null && ver.cr_version.isNotEmpty()) {
+                    UfiInfoRow("固件版本", ver.cr_version)
                     UfiDivider()
-                    UfiInfoRow("基带版本", deviceVer.wa_inner_version)
+                    UfiInfoRow("基带版本", ver.wa_inner_version)
                 } else {
                     UfiInfoRow("版本", "获取中…")
                 }

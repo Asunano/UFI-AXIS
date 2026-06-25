@@ -1,15 +1,13 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.collector.system.SystemCollector
-import com.ufi_axis_core.core.database.AppDatabase
-import com.ufi_axis_core.core.scheduler.DataScheduler
+import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.routes.RouteContext
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.util.ShellQoS
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import kotlinx.serialization.json.*
 
 /**
@@ -20,16 +18,18 @@ import kotlinx.serialization.json.*
  * GET /api/system/storage  - 存储信息
  */
 class SystemRoutes(
-    private val systemCollector: SystemCollector,
-    private val dataScheduler: DataScheduler,
-    private val database: AppDatabase
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val systemCollector get() = ctx.systemCollector
+    private val dataScheduler get() = ctx.dataScheduler
+    private val database get() = ctx.database
+
     fun register(route: Route) {
         route.route("/system") {
-            // CPU 信息（优先从调度器缓存读取，减少开销）
+            // CPU 信息（StateFlow 仅持有 CpuInfoLite 无 cores，统一走 getCpuInfo()）
             get("/cpu") {
-                val cached = dataScheduler.latestCpu.value
-                val cpuInfo = cached ?: systemCollector.getCpuInfo()
+                val cpuInfo = systemCollector.getCpuInfo()
                 // 手动构建 JsonObject 绕过 trySerialize，
                 // 防止序列化失败时 toJsonElement 降级为 toString() 导致 Gson 解析崩溃
                 call.respond(buildJsonObject {
@@ -48,11 +48,11 @@ class SystemRoutes(
                 })
             }
 
-            // CPU 历史
+            // CPU 历史（使用轻量查询，仅 SELECT 需要的列）
             get("/cpu/history") {
                 val hoursParam = (call.request.queryParameters["hours"] ?: "24").toIntOrNull() ?: 24
                 val startTime = System.currentTimeMillis() - hoursParam * 60 * 60 * 1000L
-                val records = database.cpuHistoryDao().getRecordsSince(startTime)
+                val records = database.cpuHistoryDao().getLightweightSince(startTime)
                 call.respond(toJsonElement(mapOf(
                     "records" to records,
                     "count" to records.size,

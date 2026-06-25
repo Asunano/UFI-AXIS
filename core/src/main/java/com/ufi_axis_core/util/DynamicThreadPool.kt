@@ -1,21 +1,18 @@
 package com.ufi_axis_core.util
 
-import kotlinx.coroutines.CoroutineDispatcher
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * A thread pool that dynamically adjusts its maximum concurrency based on system resource usage.
+ * 基于系统资源使用率动态调整「目标并行度」的指标追踪器。
  *
- * Pool size is governed by CPU usage and available memory thresholds, with the dispatcher
- * automatically reconfigured when conditions change.
+ * 真实协程调度仍然通过 Dispatchers.IO 执行（DataScheduler 均为 IO 密集型任务），
+ * 本类仅负责计算当前设备允许的目标并行度，供 DataScheduler.getAdaptiveDelay() 计算自适应间隔。
  *
- * 优化：复用 Dispatchers.Default.limitedParallelism() 创建的视图，
- * 避免每个 adjustByPerformance 周期都创建新的协程调度器实例。
+ * 过去曾使用 Dispatchers.Default.limitedParallelism() 创建动态调度器，
+ * 但从未有协程在该调度器上启动，因此已剥离 dispatcher 相关代码以消除 API 误导和维护成本。
  */
 class DynamicThreadPool {
     private val tag = "DynamicThreadPool"
@@ -24,9 +21,6 @@ class DynamicThreadPool {
 
     @Volatile
     private var maxPoolSize: Int = DEFAULT_MAX_POOL_SIZE
-
-    @Volatile
-    private var dispatcher: CoroutineDispatcher = createDispatcher(DEFAULT_MAX_POOL_SIZE)
 
     private val _poolInfo = MutableStateFlow(ThreadPoolInfo(CORE_POOL_SIZE, maxPoolSize, currentPoolSize.get()))
 
@@ -52,13 +46,9 @@ class DynamicThreadPool {
             AppLogger.i(tag, "Adjusting thread pool: $maxPoolSize -> $newMaxSize (cpu=$cpuUsage%, freeMem=${freeMemory / 1024 / 1024}MB)")
             maxPoolSize = newMaxSize
             currentPoolSize.set(newMaxSize)
-            dispatcher = createDispatcher(newMaxSize)
             _poolInfo.value = ThreadPoolInfo(CORE_POOL_SIZE, maxPoolSize, currentPoolSize.get())
         }
     }
-
-    /** Returns the current [CoroutineDispatcher] configured for this pool. */
-    fun getDispatcher(): CoroutineDispatcher = dispatcher
 
     /** Returns a snapshot of the current thread pool configuration. */
     fun getThreadPoolInfo(): ThreadPoolInfo {
@@ -68,10 +58,6 @@ class DynamicThreadPool {
             currentPoolSize = currentPoolSize.get()
         )
     }
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private fun createDispatcher(parallelism: Int): CoroutineDispatcher =
-        Dispatchers.Default.limitedParallelism(parallelism)
 
     private companion object {
         const val CORE_POOL_SIZE = 1

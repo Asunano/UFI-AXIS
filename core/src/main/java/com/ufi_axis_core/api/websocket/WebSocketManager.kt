@@ -5,6 +5,7 @@ import io.ktor.http.*
 import io.ktor.server.websocket.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.channels.ClosedReceiveChannelException
+import kotlinx.coroutines.*
 import kotlinx.serialization.json.*
 import java.util.concurrent.ConcurrentHashMap
 
@@ -14,8 +15,8 @@ import java.util.concurrent.ConcurrentHashMap
  * 端点: WS /ws/realtime
  *
  * 认证:
- * - 通过 URL 查询参数 ?token=xxx 或首条消息进行认证
- *
+ * - 通过 HTTP Header `Authorization: Bearer xxx` 进行认证
+ * - 认证失败则会立即关闭连接
  * 订阅格式:
  * { "subscribe": ["signal", "cpu", "traffic", "battery", "alert", "memory"] }
  *
@@ -34,22 +35,66 @@ class WebSocketManager(
     private val connections = ConcurrentHashMap<WebSocketSession, MutableSet<String>>()
     private val maxConnections = 5  // 低端设备限制最大 WebSocket 连接数
 
+    // 广播序列化缓存：同类型 100ms 内复用预序列化的 JSON 文本，减少临时对象分配
+    private val broadcastCache = ConcurrentHashMap<String, Pair<String, Long>>()
+
+    // 按订阅类型分组的连接索引，避免广播时遍历所有连接检查订阅类型
+    private val subscriptions = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
+
+    // 心跳 Job
+    private var heartbeatJob: Job? = null
+
+    private companion object {
+        private const val BROADCAST_CACHE_TTL_MS = 100L
+        private const val HEARTBEAT_INTERVAL_MS = 30_000L  // 30 秒心跳
+    }
+
+    /**
+     * 启动周期性心跳检测，30 秒 ping 所有连接。
+     * 发送失败或 session 已不活跃的连接会被立即移除。
+     */
+    fun startHeartbeat(scope: CoroutineScope) {
+        heartbeatJob?.cancel()
+        heartbeatJob = scope.launch {
+            while (isActive) {
+                delay(HEARTBEAT_INTERVAL_MS)
+                val ping = buildJsonObject { put("ping", JsonPrimitive(1)) }
+                val text = json.encodeToString(JsonElement.serializer(), ping)
+                connections.keys.forEach { session ->
+                    try {
+                        session.send(Frame.Text(text))
+                    } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                    catch (_: Exception) {
+                        connections.remove(session)
+                        subscriptions.values.forEach { it.remove(session) }
+                    }
+                }
+            }
+        }
+    }
+
+    fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
     /**
      * 处理新的 WebSocket 连接
      */
     suspend fun handleConnection(session: DefaultWebSocketServerSession) {
-        // 认证检查: 通过 URL 查询参数验证 token
+        // 认证检查: 通过 Authorization Header 验证 token（避免 token 出现在 URL 日志中）
         if (expectedToken != null) {
-            val requestToken = session.call.request.queryParameters["token"]
+            val bearer = session.call.request.headers["Authorization"]
+            val requestToken = bearer?.removePrefix("Bearer ")?.trim()
             if (requestToken != expectedToken) {
                 AppLogger.w(tag, "WebSocket auth failed: invalid token")
                 session.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Authentication failed"))
                 return
             }
+            AppLogger.i(tag, "WebSocket auth success via Authorization header")
         }
 
         val subscribedTypes = mutableSetOf<String>()
-        // 原子地检查连接上限并注册（防止竞态导致连接数超过 maxConnections）
         val existing = connections.putIfAbsent(session, subscribedTypes)
         if (existing != null) {
             AppLogger.w(tag, "WebSocket session already registered, skipping")
@@ -95,6 +140,8 @@ class WebSocketManager(
             AppLogger.e(tag, "WebSocket error", e)
         } finally {
             connections.remove(session)
+            // 从订阅索引中移除该 session 的所有订阅
+            subscriptions.values.forEach { it.remove(session) }
             AppLogger.i(tag, "WebSocket connection removed. Total: ${connections.size}")
         }
     }
@@ -113,14 +160,24 @@ class WebSocketManager(
 
             // 处理订阅请求
             jsonObject["subscribe"]?.jsonArray?.let { types ->
+                // 从订阅索引中移除旧的订阅
+                subscribedTypes.forEach { subscriptions[it]?.remove(session) }
                 subscribedTypes.clear()
-                types.forEach { subscribedTypes.add(it.jsonPrimitive.content) }
+                types.forEach {
+                    val type = it.jsonPrimitive.content
+                    subscribedTypes.add(type)
+                    subscriptions.getOrPut(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                }
                 AppLogger.i(tag, "Client subscribed to: $subscribedTypes")
             }
 
             // 处理取消订阅
             jsonObject["unsubscribe"]?.jsonArray?.let { types ->
-                types.forEach { subscribedTypes.remove(it.jsonPrimitive.content) }
+                types.forEach {
+                    val type = it.jsonPrimitive.content
+                    subscribedTypes.remove(type)
+                    subscriptions[type]?.remove(session)
+                }
                 AppLogger.i(tag, "Client unsubscribed. Now: $subscribedTypes")
             }
 
@@ -146,7 +203,7 @@ class WebSocketManager(
      * 推送: { type: "data_changed", data: { changed: "wifi|device|sim|network|lan|..." } }
      */
     suspend fun broadcastDataChanged(changedType: String) {
-        if (connections.isEmpty()) return
+        if (subscriptions["data_changed"]?.isEmpty() != false) return
         broadcast("data_changed", mapOf("changed" to changedType))
     }
 
@@ -154,35 +211,56 @@ class WebSocketManager(
      * 向所有订阅了指定类型的客户端广播数据
      */
     suspend fun broadcast(type: String, data: Map<String, Any>) {
-        if (connections.isEmpty()) return
-
-        val message = buildJsonObject {
-            put("type", JsonPrimitive(type))
-            put("data", buildJsonObject {
-                data.forEach { (key, value) ->
-                    val jv = toJsonValue(value)
-                    put(key, jv)
-                }
-            })
-            put("timestamp", JsonPrimitive(System.currentTimeMillis()))
+        // 广播前先清理已不活跃的连接（TCP 未关闭但客户端已失效的场景）
+        connections.keys.removeAll { session ->
+            if (!session.isActive) {
+                subscriptions.values.forEach { it.remove(session) }
+                true
+            } else false
         }
 
-        val text = json.encodeToString(JsonElement.serializer(), message)
-        val deadSessions = mutableListOf<WebSocketSession>()
+        val subscribers = subscriptions[type] ?: return
+        if (subscribers.isEmpty()) return
 
-        connections.forEach { (session, subscribedTypes) ->
-            if (type in subscribedTypes) {
-                try {
-                    session.send(Frame.Text(text))
-                } catch (e: kotlinx.coroutines.CancellationException) { throw e }
-                    catch (e: Exception) {
-                        deadSessions.add(session)
+        val now = System.currentTimeMillis()
+
+        // 100ms 内同类型广播复用上次序列化结果
+        val text = broadcastCache[type]?.let { (cachedText, ts) ->
+            if (now - ts < BROADCAST_CACHE_TTL_MS) cachedText else null
+        } ?: run {
+            val message = buildJsonObject {
+                put("type", JsonPrimitive(type))
+                put("data", buildJsonObject {
+                    data.forEach { (key, value) ->
+                        val jv = toJsonValue(value)
+                        put(key, jv)
                     }
+                })
+                put("timestamp", JsonPrimitive(now))
+            }
+            json.encodeToString(JsonElement.serializer(), message).also {
+                broadcastCache[type] = Pair(it, now)
             }
         }
 
-        // 清理已断开的连接
-        deadSessions.forEach { connections.remove(it) }
+        // 预编码为 ByteArray，多个客户端共享同一份字节数据
+        val frameBytes = text.toByteArray()
+        val dead = mutableListOf<WebSocketSession>()
+
+        subscribers.forEach { session ->
+            try {
+                session.send(Frame.Text(true, frameBytes))
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                catch (_: Exception) {
+                    dead.add(session)
+                }
+        }
+
+        // 清理已断开的连接和订阅索引
+        dead.forEach { session ->
+            subscriptions[type]?.remove(session)
+            connections.remove(session)
+        }
     }
 
     /**
@@ -201,6 +279,7 @@ class WebSocketManager(
             catch (_: Exception) {}
         }
         connections.clear()
+        subscriptions.clear()
     }
 
     /**

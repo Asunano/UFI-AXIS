@@ -18,6 +18,7 @@ import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.coroutines.*
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import java.util.concurrent.atomic.AtomicInteger
+import java.io.File
 
 /**
  * 后端前台服务
@@ -38,6 +39,12 @@ class BackendService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO.limitedParallelism(8) + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         AppLogger.e(tag, "BackendService coroutine exception (uncaught)", e)
     })
+
+    /**
+     * SMS 轮询独立 scope：使用普通 IO（无 parallelism 限制），
+     * 避免 while(isActive) 永久循环占用 limitedParallelism(8) 的稀缺线程。
+     */
+    private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     companion object {
         const val CHANNEL_ID = "ufi_axis_core_service"
@@ -111,6 +118,7 @@ class BackendService : Service() {
             stopAllComponents()
         }
         serviceScope.cancel()
+        smsPollScope.cancel()
         super.onDestroy()
     }
 
@@ -127,17 +135,17 @@ class BackendService : Service() {
             val notifier = BatteryNotifier(
                 onLowBattery = { pct ->
                     serviceScope.launch {
-                        try { g.smsForwardController.forwardSms("SYSTEM", "低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "低电量警告: ${pct}%", System.currentTimeMillis()) } catch (e: Exception) { AppLogger.w(tag, "Battery low SMS forward failed: ${e.message}") }
                     }
                 },
                 onVeryLowBattery = { pct ->
                     serviceScope.launch {
-                        try { g.smsForwardController.forwardSms("SYSTEM", "极低电量警告: ${pct}%", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "极低电量警告: ${pct}%", System.currentTimeMillis()) } catch (e: Exception) { AppLogger.w(tag, "Battery very low SMS forward failed: ${e.message}") }
                     }
                 },
                 onFullBattery = {
                     serviceScope.launch {
-                        try { g.smsForwardController.forwardSms("SYSTEM", "电池已充满", System.currentTimeMillis()) } catch (_: Exception) {}
+                        try { g.smsForwardController.forwardSms("SYSTEM", "电池已充满", System.currentTimeMillis()) } catch (e: Exception) { AppLogger.w(tag, "Battery full SMS forward failed: ${e.message}") }
                     }
                 },
                 onChargeStart = {
@@ -146,8 +154,8 @@ class BackendService : Service() {
             )
             batteryNotifier = notifier
 
-            // ── SMS 轮询 Job ──
-            val smsPollJob = serviceScope.launch {
+            // ── SMS 轮询 Job（使用独立 scope，避免永久循环占满 limitedParallelism(8)）──
+            smsPollScope.launch {
                 val smsForwardCtl = g.smsForwardController
                 val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.smsClient)
                 var lastForwardedId: Long = -1
@@ -289,14 +297,18 @@ class BackendService : Service() {
             val lp = cm?.getLinkProperties(activeNetwork)
             val dhcp = lp?.dhcpServerAddress?.hostAddress
             if (!dhcp.isNullOrBlank()) { AppLogger.i(tag, "Gateway (DHCP): $dhcp"); return dhcp }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Gateway detection method 1 (ConnectivityManager) failed: ${e.message}")
+        }
 
         // 方法2: ip route
         try {
             val ipRoute = ShellExecutor.execute("ip route 2>/dev/null | grep default").stdout
             val m = Regex("default via (\\d+\\.\\d+\\.\\d+\\.\\d+)").find(ipRoute)
             if (m != null) { val gw = m.groupValues[1]; AppLogger.i(tag, "Gateway (ip route): $gw"); return gw }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Gateway detection method 2 (ip route) failed: ${e.message}")
+        }
 
         // 方法3: getprop (各接口名)
         try {
@@ -304,11 +316,13 @@ class BackendService : Service() {
                 val gw = ShellExecutor.execute("getprop $prop").stdout.trim()
                 if (gw.isNotBlank() && gw != "unknown") { AppLogger.i(tag, "Gateway (getprop): $gw"); return gw }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Gateway detection method 3 (getprop) failed: ${e.message}")
+        }
 
-        // 方法4: /proc/net/route 解析
+        // 方法4: /proc/net/route 解析（直接文件读取，免 root）
         try {
-            val route = ShellExecutor.executeAsRoot("cat /proc/net/route 2>/dev/null").stdout
+            val route = File("/proc/net/route").readText()
             val lines = route.lines()
             for (line in lines) {
                 val parts = line.split(WHITESPACE_REGEX)
@@ -323,7 +337,9 @@ class BackendService : Service() {
                     AppLogger.i(tag, "Gateway (proc/net/route): $gw"); return gw
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Gateway detection method 4 (/proc/net/route) failed: ${e.message}")
+        }
 
         AppLogger.w(tag, "Could not detect gateway, falling back to 192.168.0.1")
         return "192.168.0.1"

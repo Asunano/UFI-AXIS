@@ -29,6 +29,9 @@ interface CpuHistoryDao {
     @Query("DELETE FROM cpu_history WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
 
+    @Query("DELETE FROM cpu_history WHERE rowid IN (SELECT rowid FROM cpu_history WHERE timestamp < :cutoff LIMIT :limit)")
+    suspend fun deleteOlderThanBatched(cutoff: Long, limit: Int = 1000): Int
+
     @Query("SELECT COUNT(*) FROM cpu_history")
     suspend fun getCount(): Int
 }
@@ -71,6 +74,9 @@ interface TrafficDao {
     @Query("DELETE FROM traffic_records WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
 
+    @Query("DELETE FROM traffic_records WHERE rowid IN (SELECT rowid FROM traffic_records WHERE timestamp < :cutoff LIMIT :limit)")
+    suspend fun deleteOlderThanBatched(cutoff: Long, limit: Int = 1000): Int
+
     @Query("SELECT COUNT(*) FROM traffic_records")
     suspend fun getCount(): Int
 }
@@ -112,6 +118,9 @@ interface SignalDao {
 
     @Query("DELETE FROM signal_history WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
+
+    @Query("DELETE FROM signal_history WHERE rowid IN (SELECT rowid FROM signal_history WHERE timestamp < :cutoff LIMIT :limit)")
+    suspend fun deleteOlderThanBatched(cutoff: Long, limit: Int = 1000): Int
 
     @Query("SELECT COUNT(*) FROM signal_history")
     suspend fun getCount(): Int
@@ -197,6 +206,9 @@ interface MemoryHistoryDao {
     @Query("DELETE FROM memory_history WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
 
+    @Query("DELETE FROM memory_history WHERE rowid IN (SELECT rowid FROM memory_history WHERE timestamp < :cutoff LIMIT :limit)")
+    suspend fun deleteOlderThanBatched(cutoff: Long, limit: Int = 1000): Int
+
     @Query("SELECT COUNT(*) FROM memory_history")
     suspend fun getCount(): Int
 }
@@ -234,6 +246,9 @@ interface BatteryHistoryDao {
 
     @Query("DELETE FROM battery_history WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
+
+    @Query("DELETE FROM battery_history WHERE rowid IN (SELECT rowid FROM battery_history WHERE timestamp < :cutoff LIMIT :limit)")
+    suspend fun deleteOlderThanBatched(cutoff: Long, limit: Int = 1000): Int
 
     @Query("SELECT COUNT(*) FROM battery_history")
     suspend fun getCount(): Int

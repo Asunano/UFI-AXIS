@@ -345,6 +345,9 @@ interface UfiAxisApi {
     @GET("api/device/data-usage")
     suspend fun getDataUsage(): JsonElement
 
+    @GET("api/dashboard/summary")
+    suspend fun getDashboardSummary(): JsonElement
+
     @GET("api/device/selinux")
     suspend fun getSelinuxStatus(): JsonElement
 

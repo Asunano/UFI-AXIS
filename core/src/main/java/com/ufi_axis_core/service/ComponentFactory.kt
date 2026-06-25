@@ -35,14 +35,18 @@ import kotlinx.coroutines.*
 object ComponentFactory {
 
     private const val TAG = "ComponentFactory"
+    private var built = false
 
     /**
      * 构建完整组件图。
      * @param context Service Context（用于 AssetExtractor、ATChannel、SystemCollector 等）
      * @param gatewayIp 设备网关 IP（goform 连接地址）
      * @return 完整的 [ComponentGraph]
+     * @throws IllegalStateException 如果 [build] 已被调用过
      */
     suspend fun build(context: Context, gatewayIp: String): ComponentGraph {
+        check(!built) { "ComponentGraph already built, build() must only be called once" }
+        built = true
         val settings = AppSettings.getInstance(context)
         AppLogger.setDebugMode(settings.debugMode)
         AppLogger.i(TAG, "Building component graph...")
@@ -99,7 +103,7 @@ object ComponentFactory {
         AppLogger.i(TAG, "[6] WebSocket manager initialized")
 
         // ── 7. 告警引擎 ──
-        val alert = AlertEngine(database.alertDao(), wsManager)
+        val alert = AlertEngine(database.alertDao(), wsManager, settings)
         AppLogger.i(TAG, "[7] Alert engine initialized")
 
         // ── 8. 共享组件 ──
@@ -139,16 +143,41 @@ object ComponentFactory {
         val dataHub = DataHub(scheduler, signalClient, wifiClient, responseCache)
         AppLogger.i(TAG, "[12.5] DataHub initialized")
 
+        // ── 12.6 RouteContext: 集中所有 Route 共享依赖 ──
+        val routeCtx = RouteContext(
+            systemCollector = systemCollector,
+            telephonyCollector = telephonyCollector,
+            atChannel = atChannel,
+            goformClient = goform,
+            signalClient = signalClient,
+            networkClient = networkClient,
+            deviceClient = deviceClient,
+            wifiClient = wifiClient,
+            simClient = simClient,
+            systemController = systemController,
+            networkController = networkController,
+            simController = simController,
+            adbController = adbController,
+            database = database,
+            dataScheduler = scheduler,
+            responseCache = responseCache,
+            dataHub = dataHub,
+            settings = settings,
+            dynamicThreadPool = dynamicThreadPool,
+            qosMiddleware = qosMiddleware
+        )
+        AppLogger.i(TAG, "[12.6] RouteContext initialized")
+
         // ── 13. API 路由 ──
-        val deviceRoutes = DeviceRoutes(systemCollector, telephonyCollector, atChannel, goform, signalClient, networkClient, deviceClient, systemController, responseCache, dataHub, settings)
-        val networkRoutes = NetworkRoutes(telephonyCollector, networkController, database, goform, signalClient, networkClient, scheduler, responseCache, dataHub)
-        val systemRoutes = SystemRoutes(systemCollector, scheduler, database)
-        val trafficRoutes = TrafficRoutes(scheduler, database)
+        val deviceRoutes = DeviceRoutes(routeCtx)
+        val networkRoutes = NetworkRoutes(routeCtx)
+        val systemRoutes = SystemRoutes(routeCtx)
+        val trafficRoutes = TrafficRoutes(routeCtx)
         val advancedRoutes = AdvancedRoutes(context.applicationContext)
-        val simRoutes = SimRoutes(simController, database, signalClient, simClient, responseCache, dataHub)
+        val simRoutes = SimRoutes(routeCtx)
         val atRoutes = ATRoutes(atChannel)
         val alertRoutes = AlertRoutes(alert)
-        val wifiRoutes = WifiRoutes(goform, wifiClient, networkController, dataHub)
+        val wifiRoutes = WifiRoutes(routeCtx)
         val configRoutes = ConfigRoutes(settings)
         val appManager = com.ufi_axis_core.controller.system.AppManager()
         val appRoutes = AppRoutes(appManager)
@@ -161,14 +190,16 @@ object ComponentFactory {
         val taskRoutes = TaskRoutes(taskScheduler)
         val speedTestRoutes = SpeedTestRoutes()
         val debugLogRoutes = DebugLogRoutes()
-        val qosRoutes = QoSRoutes(qosMiddleware, dynamicThreadPool)
+        val qosRoutes = QoSRoutes(routeCtx)
         val monitorRoutes = MonitorRoutes(database)
         val downloadRoutes = DownloadRoutes(downloadManager)
+        val dashboardRoutes = DashboardRoutes(routeCtx)
         AppLogger.i(TAG, "[13] API routes initialized")
 
         // ── 14. HTTP Server ──
         val server = HttpServer(
             port = settings.port,
+            ctx = routeCtx,
             authMiddleware = authMiddleware,
             qosMiddleware = qosMiddleware,
             webSocketManager = wsManager,
@@ -186,7 +217,6 @@ object ComponentFactory {
             fileRoutes = fileRoutes,
             rootSmsRoutes = rootSmsRoutes,
             adbRoutes = adbRoutes,
-            dataHub = dataHub,
             smsForwardRoutes = smsForwardRoutes,
             taskRoutes = taskRoutes,
             speedTestRoutes = speedTestRoutes,
@@ -195,7 +225,7 @@ object ComponentFactory {
             qosRoutes = qosRoutes,
             monitorRoutes = monitorRoutes,
             downloadRoutes = downloadRoutes,
-            responseCache = responseCache
+            dashboardRoutes = dashboardRoutes
         )
         AppLogger.i(TAG, "[14] HTTP server ready (with API cache)")
 

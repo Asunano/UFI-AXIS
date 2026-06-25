@@ -1,11 +1,11 @@
 package com.ufi_axis.viewmodel.module
 
 import android.content.Context
-import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import com.ufi_axis.data.model.*
-import com.ufi_axis.data.repository.DeviceRepository
-import com.ufi_axis.data.repository.FileAppRepository
-import com.ufi_axis.data.repository.NetworkRepository
+import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.CleanHistoryRequest
 import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.util.*
 import com.ufi_axis.viewmodel.state.*
@@ -15,9 +15,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
 class DashboardModule(
-    private val deviceRepo: DeviceRepository,
-    private val networkRepo: NetworkRepository,
-    private val fileAppRepo: FileAppRepository,
+    private val api: UfiAxisApi,
     private val webSocketRepository: WebSocketRepository,
     private val networkMonitor: NetworkMonitor,
     private val appContext: Context,
@@ -27,6 +25,15 @@ class DashboardModule(
     private val _dashboardState = MutableStateFlow(DashboardState())
     val dashboardState: StateFlow<DashboardState> = _dashboardState.asStateFlow()
 
+    // ── 按字段派生的 StateFlow（各 screen 按需订阅，避免全量重组） ──
+    val cpuInfoState: StateFlow<CpuInfo?> = _dashboardState.map { it.cpuInfo }.stateIn(scope, SharingStarted.Eagerly, null)
+    val memoryInfoState: StateFlow<MemoryInfo?> = _dashboardState.map { it.memoryInfo }.stateIn(scope, SharingStarted.Eagerly, null)
+    val trafficRealtimeState: StateFlow<TrafficRealtime?> = _dashboardState.map { it.trafficRealtime }.stateIn(scope, SharingStarted.Eagerly, null)
+    val signalInfoState: StateFlow<SignalInfo?> = _dashboardState.map { it.signalInfo }.stateIn(scope, SharingStarted.Eagerly, null)
+    val batteryInfoState: StateFlow<BatteryInfo?> = _dashboardState.map { it.batteryInfo }.stateIn(scope, SharingStarted.Eagerly, null)
+    val deviceVersionState: StateFlow<DeviceVersionResponse?> = _dashboardState.map { it.deviceVersion }.stateIn(scope, SharingStarted.Eagerly, null)
+    val isLoadingState: StateFlow<Boolean> = _dashboardState.map { it.isLoading }.stateIn(scope, SharingStarted.Eagerly, false)
+
     private val _monitorState = MutableStateFlow(MonitorState())
     val monitorState: StateFlow<MonitorState> = _monitorState.asStateFlow()
 
@@ -34,16 +41,15 @@ class DashboardModule(
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
 
     // ── Internal ──
-    private val gson = Gson()
+    private val gson = AppGson.instance
     private val cacheManager = CacheManager(appContext.applicationContext)
     private var autoRefreshJob: Job? = null
     private var saveDebounceJob: Job? = null
-    private var lastSavedTime = 0L
     @Volatile private var lastWsUpdate = 0L
+    @Volatile private var dashboardSummaryCache: JsonElement? = null
+    @Volatile private var dashboardSummaryCacheTime: Long = 0L
+    private val DASHBOARD_CACHE_TTL_MS = 5000L
     private var wasOffline = false
-
-    /** Callback: persist initial + refreshed data for other modules (e.g. device info) */
-    var onDataLoaded: ((DashboardState) -> Unit)? = null
 
     // ── Init ──
     fun init() {
@@ -89,17 +95,10 @@ class DashboardModule(
     }
 
     private fun debounceSaveToCache() {
-        val now = System.currentTimeMillis()
         saveDebounceJob?.cancel()
-        if (now - lastSavedTime > 10_000) {
-            saveToCache()
-            lastSavedTime = now
-            return
-        }
         saveDebounceJob = scope.launch {
-            delay(3_000)
+            delay(5_000)
             saveToCache()
-            lastSavedTime = System.currentTimeMillis()
         }
     }
 
@@ -144,7 +143,7 @@ class DashboardModule(
                 wasOffline = !isOnline
                 _dashboardState.update { it.copy(isOffline = !isOnline) }
                 if (!isOnline) {
-                    val cached = webSocketRepository.cachedData.value
+                    val cached = webSocketRepository.cachedData
                     _dashboardState.update { s ->
                         var next = s
                         cached["cpu"]?.let { next = next.copy(cpuInfo = gson.fromJson(it.data, CpuInfo::class.java)) }
@@ -160,52 +159,54 @@ class DashboardModule(
 
     // ── Dashboard Refresh ──
     // CPU/内存/流量/信号 已由 WebSocket 实时推送，不再发送 REST 请求。
-    // 减少 11→7 个并发请求，后端不再因 shell 竞争返回 429。
-    fun refreshDashboard() {
+    // 后端聚合端点 /api/dashboard/summary — 一次性返回全部 Dashboard 数据。
+    // 减少 7 个并发请求 → 1 个聚合请求 + 前端 5 秒缓存。
+    fun refreshDashboard(forceRefresh: Boolean = false) {
         scope.launch {
             _dashboardState.update { it.copy(isLoading = true, errorMessage = null) }
             try {
-                // 仅查询 WebSocket 未覆盖的一次性数据（设备信息/电池/存储/运行时间/流量统计/限额/网络状态）
-                val bat = async { runCatching { deviceRepo.getBatteryInfo() } }
-                val stor = async { runCatching { deviceRepo.getStorageInfo() } }
-                val up = async { runCatching { deviceRepo.getUptime() } }
-                val summary = async { runCatching { networkRepo.getTrafficSummary() } }
-                val limit = async { runCatching { networkRepo.getTrafficLimit() } }
-                val net = async { runCatching { networkRepo.getNetworkStatus() } }
+                val cache = dashboardSummaryCache
+                val json: JsonElement
+                val now = System.currentTimeMillis()
+                if (!forceRefresh && cache != null && now - dashboardSummaryCacheTime < DASHBOARD_CACHE_TTL_MS) {
+                    json = cache
+                } else {
+                    json = api.getDashboardSummary().also {
+                        dashboardSummaryCache = it
+                        dashboardSummaryCacheTime = now
+                    }
+                }
 
-                val rInfo = runCatching { deviceRepo.getDeviceInfo() }
+                val obj = json.asJsonObject
+                // 每个字段独立解析，一个失败不影响其他
+                val rInfo = runCatching { obj.get("device_info")?.asJsonObject?.let { gson.fromJson(it, DeviceInfoResponse::class.java) } }
+                val rBat = runCatching { obj.get("battery")?.asJsonObject?.let { gson.fromJson(it, BatteryInfo::class.java) } }
+                val rStor = runCatching { obj.get("storage")?.asJsonObject?.let { gson.fromJson(it, StorageInfo::class.java) } }
+                val rUp = runCatching { obj.get("uptime")?.asJsonObject?.let { gson.fromJson(it, UptimeInfo::class.java) } }
+                val rSummary = runCatching { obj.get("traffic_summary")?.asJsonObject?.let { gson.fromJson(it, TrafficSummary::class.java) } }
+                val rLimit = runCatching { obj.get("traffic_limit")?.asJsonObject?.let { gson.fromJson(it, TrafficLimitConfig::class.java) } }
+                val rNet = runCatching { obj.get("network_status")?.asJsonObject?.let { gson.fromJson(it, NetworkStatusResponse::class.java) } }
 
-                val rBat = bat.await(); val rStor = stor.await()
-                val rUp = up.await(); val rSummary = summary.await()
-                val rLimit = limit.await(); val rNet = net.await()
-
-                val results = listOf(
+                val failures = listOfNotNull(
                     "设备信息" to rInfo, "电池" to rBat, "存储" to rStor,
                     "运行时间" to rUp, "流量统计" to rSummary,
                     "流量限额" to rLimit, "网络状态" to rNet
-                )
-                val failures = results.filter { it.second.isFailure }
-                val errorMsg = if (failures.isNotEmpty()) {
-                    failures.joinToString("; ") { (name, result) ->
-                        "$name: ${result.exceptionOrNull()?.message ?: "未知错误"}"
-                    }
-                } else null
+                ).filter { it.second.isFailure }.joinToString("; ") { (name, result) ->
+                    "$name: ${result.exceptionOrNull()?.message ?: "未知错误"}"
+                }.ifEmpty { null }
 
                 _dashboardState.update { current ->
                     current.copy(
                         deviceInfo = rInfo.getOrNull(), batteryInfo = rBat.getOrNull(),
                         storageInfo = rStor.getOrNull(), uptimeInfo = rUp.getOrNull(),
-                        trafficSummary = rSummary.getOrNull(), networkStatus = rNet.getOrNull(),
-                        trafficLimitConfig = rLimit.getOrNull()?.let {
-                            com.google.gson.Gson().fromJson(it.toString(), com.ufi_axis.data.model.TrafficLimitConfig::class.java)
-                        },
-                        // CPU/内存/流量/信号 完全依赖 WebSocket 推送，不清空已有值
-                        isLoading = false, errorMessage = errorMsg,
+                        trafficSummary = rSummary.getOrNull(),
+                        trafficLimitConfig = rLimit.getOrNull(),
+                        networkStatus = rNet.getOrNull(),
+                        isLoading = false, errorMessage = failures,
                         lastUpdated = System.currentTimeMillis()
                     )
                 }
                 saveToCache()
-                onDataLoaded?.invoke(_dashboardState.value)
             } catch (e: Exception) {
                 DebugLog.e("Dashboard", "refreshDashboard failed", e)
                 _dashboardState.update { it.copy(isLoading = false, errorMessage = "连接失败: ${e.message}") }
@@ -222,17 +223,26 @@ class DashboardModule(
     fun stopAutoRefresh() { autoRefreshJob?.cancel(); autoRefreshJob = null }
 
     // ── History ──
+    companion object {
+        /** 历史记录最大条数：360 ≈ 10秒间隔 × 1小时，UI 图表不需要完整24小时数据 */
+        private const val MAX_HISTORY_RECORDS = 360
+    }
+
     fun loadCpuHistory(hours: Int = 24) {
         scope.launch {
-            try { _dashboardState.update { it.copy(cpuHistory = deviceRepo.getCpuHistory(hours).records) } }
-            catch (e: Exception) { _dashboardState.update { it.copy(errorMessage = "CPU历史加载失败: ${e.message}") } }
+            try {
+                val records = api.getCpuHistory(hours).records
+                _dashboardState.update { it.copy(cpuHistory = if (records.size > MAX_HISTORY_RECORDS) records.takeLast(MAX_HISTORY_RECORDS) else records) }
+            } catch (e: Exception) { _dashboardState.update { it.copy(errorMessage = "CPU历史加载失败: ${e.message}") } }
         }
     }
 
     fun loadSignalHistory(hours: Int = 24) {
         scope.launch {
-            try { _dashboardState.update { it.copy(signalHistory = networkRepo.getSignalHistory(hours).records) } }
-            catch (e: Exception) { _dashboardState.update { it.copy(errorMessage = "信号历史加载失败: ${e.message}") } }
+            try {
+                val records = api.getSignalHistory(hours).records
+                _dashboardState.update { it.copy(signalHistory = if (records.size > MAX_HISTORY_RECORDS) records.takeLast(MAX_HISTORY_RECORDS) else records) }
+            } catch (e: Exception) { _dashboardState.update { it.copy(errorMessage = "信号历史加载失败: ${e.message}") } }
         }
     }
 
@@ -241,7 +251,7 @@ class DashboardModule(
         scope.launch {
             _updateState.value = _updateState.value.copy(checking = true)
             try {
-                val versionInfo = deviceRepo.getServerVersion()
+                val versionInfo = api.getServerVersion()
                 _updateState.value = UpdateState(
                     hasUpdate = compareVersions(versionInfo.version, "1.0") > 0,
                     serverVersion = versionInfo.version, updateUrl = versionInfo.update_url, checking = false
@@ -256,7 +266,7 @@ class DashboardModule(
     fun loadDeviceVersion() {
         scope.launch {
             try {
-                val ver = deviceRepo.getDeviceVersion()
+                val ver = api.getDeviceVersion()
                 _dashboardState.update { it.copy(deviceVersion = ver) }
             } catch (e: Exception) {
                 _dashboardState.update { it.copy(errorMessage = "设备版本加载失败: ${e.message}") }
@@ -270,57 +280,47 @@ class DashboardModule(
 
     fun loadMonitorHistory(hours: Int = 24, force: Boolean = false) {
         val now = System.currentTimeMillis()
-        // force=true 跳过限频（用户主动切换时间范围时传入）
         if (!force && now - lastMonitorRefreshMs < MIN_REFRESH_INTERVAL_MS) return
         lastMonitorRefreshMs = now
 
+        _monitorState.update { it.copy(selectedHours = hours, isLoading = true, errorMessage = null) }
+        // 串行加载 8 个类型，避免 8 并发 HTTP 请求
         scope.launch {
-            val current = _monitorState.value
-            _monitorState.update { it.copy(selectedHours = hours, isLoading = true, errorMessage = null) }
             try {
-                // 无 Semaphore 限制：HTTP 请求是 I/O 密集型，8 并发不会压垮设备
-                coroutineScope {
-                    val types = listOf(
-                        "cpu" to current.cpuHistory,
-                        "memory" to current.memoryHistory,
-                        "traffic_rx" to current.trafficRxHistory,
-                        "traffic_tx" to current.trafficTxHistory,
-                        "signal_rsrp" to current.signalRsrpHistory,
-                        "signal_sinr" to current.signalSinrHistory,
-                        "battery" to current.batteryHistory,
-                        "temperature" to current.temperatureHistory
-                    )
-                    val results = types.map { (type, oldList) ->
-                        async {
-                            val resp = runCatching { fileAppRepo.getMonitorHistory(type, hours) }
-                            val points = resp.getOrNull()?.points ?: oldList
-                            type to points
-                        }
-                    }.awaitAll().toMap()
-
-                    _monitorState.update {
-                        it.copy(
-                            cpuHistory = results["cpu"] as? List<DownsampledPoint> ?: it.cpuHistory,
-                            memoryHistory = results["memory"] as? List<DownsampledPoint> ?: it.memoryHistory,
-                            trafficRxHistory = results["traffic_rx"] as? List<DownsampledPoint> ?: it.trafficRxHistory,
-                            trafficTxHistory = results["traffic_tx"] as? List<DownsampledPoint> ?: it.trafficTxHistory,
-                            signalRsrpHistory = results["signal_rsrp"] as? List<DownsampledPoint> ?: it.signalRsrpHistory,
-                            signalSinrHistory = results["signal_sinr"] as? List<DownsampledPoint> ?: it.signalSinrHistory,
-                            batteryHistory = results["battery"] as? List<DownsampledPoint> ?: it.batteryHistory,
-                            temperatureHistory = results["temperature"] as? List<DownsampledPoint> ?: it.temperatureHistory,
-                            isLoading = false
-                        )
-                    }
-                }
+                val types = listOf("cpu", "memory", "traffic_rx", "traffic_tx",
+                    "signal_rsrp", "signal_sinr", "battery", "temperature")
+                types.forEach { type -> loadMonitorHistory(type, hours) }
+                _monitorState.update { it.copy(isLoading = false) }
             } catch (e: Exception) {
                 _monitorState.update { it.copy(isLoading = false, errorMessage = "加载监控数据失败: ${e.message}") }
             }
         }
     }
 
+    fun loadMonitorHistory(type: String, hours: Int) {
+        scope.launch {
+            runCatching { api.getMonitorHistory(type, hours) }.onSuccess { resp ->
+                val points = resp.points
+                _monitorState.update { state ->
+                    when (type) {
+                        "cpu" -> state.copy(cpuHistory = points)
+                        "memory" -> state.copy(memoryHistory = points)
+                        "traffic_rx" -> state.copy(trafficRxHistory = points)
+                        "traffic_tx" -> state.copy(trafficTxHistory = points)
+                        "signal_rsrp" -> state.copy(signalRsrpHistory = points)
+                        "signal_sinr" -> state.copy(signalSinrHistory = points)
+                        "battery" -> state.copy(batteryHistory = points)
+                        "temperature" -> state.copy(temperatureHistory = points)
+                        else -> state
+                    }
+                }
+            }
+        }
+    }
+
     fun loadMonitorStorage() {
         scope.launch {
-            try { _monitorState.update { it.copy(storageInfo = fileAppRepo.getMonitorStorage()) } }
+            try { _monitorState.update { it.copy(storageInfo = api.getMonitorStorage()) } }
             catch (e: Exception) { _monitorState.update { it.copy(errorMessage = "加载存储统计失败: ${e.message}") } }
         }
     }
@@ -329,7 +329,7 @@ class DashboardModule(
         scope.launch {
             _monitorState.update { it.copy(cleanMessage = null) }
             try {
-                val result = fileAppRepo.cleanHistory(type, days)
+                val result = api.cleanHistory(CleanHistoryRequest(type, days))
                 val totalDeleted = result.deleted.values.sum()
                 _monitorState.update { it.copy(cleanMessage = "已清理 $totalDeleted 条记录") }
                 loadMonitorHistory(_monitorState.value.selectedHours)
@@ -344,52 +344,9 @@ class DashboardModule(
         _monitorState.update { it.copy(cleanMessage = null, errorMessage = null) }
     }
 
-    // ── Error Clearing ──
-    // ── Smart Refresh (data_changed 精准增量刷新) ──
     fun smartRefresh(changedType: String) {
         when {
-            changedType == "device:*" -> refreshDashboard()     // 设备重启/恢复出厂 → 全量刷新
-            changedType == "device:info" -> refreshDeviceInfo()  // 主机名变更 → 仅刷新设备信息
-        }
-    }
-
-    /** 精准刷新设备信息（CPU/内存/流量/信号由 WebSocket 推送，无需 HTTP 请求） */
-    private fun refreshDeviceInfo() {
-        scope.launch {
-            try {
-                val info = async { runCatching { deviceRepo.getDeviceInfo() } }
-                val bat = async { runCatching { deviceRepo.getBatteryInfo() } }
-                val stor = async { runCatching { deviceRepo.getStorageInfo() } }
-                val up = async { runCatching { deviceRepo.getUptime() } }
-                val summary = async { runCatching { networkRepo.getTrafficSummary() } }
-                val net = async { runCatching { networkRepo.getNetworkStatus() } }
-
-                val rInfo = info.await(); val rBat = bat.await(); val rStor = stor.await()
-                val rUp = up.await(); val rSummary = summary.await(); val rNet = net.await()
-
-                val failures = listOfNotNull(
-                    "设备信息" to rInfo, "电池" to rBat, "存储" to rStor,
-                    "运行时间" to rUp, "流量统计" to rSummary, "网络状态" to rNet
-                ).filter { it.second.isFailure }.joinToString("; ") { (n, r) ->
-                    "$n: ${r.exceptionOrNull()?.message ?: "未知"}"
-                }.ifEmpty { null }
-
-                _dashboardState.update { current ->
-                    current.copy(
-                        deviceInfo = rInfo.getOrNull() ?: current.deviceInfo,
-                        batteryInfo = rBat.getOrNull() ?: current.batteryInfo,
-                        storageInfo = rStor.getOrNull() ?: current.storageInfo,
-                        uptimeInfo = rUp.getOrNull() ?: current.uptimeInfo,
-                        trafficSummary = rSummary.getOrNull() ?: current.trafficSummary,
-                        networkStatus = rNet.getOrNull() ?: current.networkStatus,
-                        errorMessage = failures ?: current.errorMessage,
-                        lastUpdated = System.currentTimeMillis()
-                    )
-                }
-                onDataLoaded?.invoke(_dashboardState.value)
-            } catch (e: Exception) {
-                _dashboardState.update { it.copy(errorMessage = "设备信息刷新失败: ${e.message}") }
-            }
+            changedType.startsWith("device:") -> refreshDashboard(forceRefresh = true)
         }
     }
 

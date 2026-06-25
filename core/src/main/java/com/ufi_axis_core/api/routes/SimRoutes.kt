@@ -1,18 +1,13 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.goform.GoformSimClient
-import com.ufi_axis_core.controller.sim.SimController
-import com.ufi_axis_core.core.database.AppDatabase
+import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.core.cache.CacheTTL
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.ufi_axis_core.api.DataHub
-import com.ufi_axis_core.api.ResponseHelper.toJsonElement
-import com.ufi_axis_core.core.cache.CacheTTL
-import com.ufi_axis_core.core.cache.ResponseCache
 import kotlinx.serialization.json.*
 
 /**
@@ -24,13 +19,16 @@ import kotlinx.serialization.json.*
  * 注意: SMS 路由(/api/sms/)统一由 RootSmsRoutes 管理
  */
 class SimRoutes(
-    private val simController: SimController,
-    private val database: AppDatabase,
-    private val signalClient: GoformSignalClient? = null,
-    private val simClient: GoformSimClient? = null,
-    private val cache: ResponseCache? = null,
-    private val dataHub: DataHub? = null
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val simController get() = ctx.simController
+    private val database get() = ctx.database
+    private val signalClient get() = ctx.signalClient
+    private val simClient get() = ctx.simClient
+    private val cache get() = ctx.responseCache
+    private val dataHub get() = ctx.dataHub
+
     fun register(route: Route) {
         // 注意: SMS 路由(/api/sms/*)统一由 RootSmsRoutes 管理，此处仅注册 /sim 路由
         route.route("/sim") {

@@ -1,24 +1,24 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.api.DataHub
-import com.ufi_axis_core.controller.goform.GoformClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
-import com.ufi_axis_core.controller.network.NetworkController
+import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.routes.RouteContext
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import kotlinx.serialization.json.*
 
 class WifiRoutes(
-    private val goformClient: GoformClient,
-    private val wifiClient: GoformWifiClient,
-    private val networkController: NetworkController,
-    private val dataHub: DataHub? = null
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val goformClient get() = ctx.goformClient
+    private val wifiClient get() = ctx.wifiClient
+    private val networkController get() = ctx.networkController
+    private val dataHub get() = ctx.dataHub
+
     fun register(route: Route) {
         route.route("/wifi") {
             // WiFi 开关

@@ -60,24 +60,35 @@ class AdaptiveSemaphore(
     fun tryAcquire(): Boolean = semaphore.tryAcquire()
 
     fun release() {
-        val current = _currentPermits.get()
-        val target = targetPermits
+        while (true) {
+            val current = _currentPermits.get()
+            val target = targetPermits
 
-        if (current > target) {
-            // 收缩：吞掉这次 release，减少一个许可
-            if (_currentPermits.compareAndSet(current, current - 1)) {
-                // 不调用 semaphore.release()，许可被"吞掉"
-                return
-            }
-            // CAS 失败，走正常 release
-        } else if (current < target) {
-            // 扩展：额外释放一个许可
-            if (_currentPermits.compareAndSet(current, current + 1)) {
-                semaphore.release() // 额外释放，增加可用许可
+            when {
+                current > target -> {
+                    // 收缩：吞掉这次 release，减少一个许可
+                    if (_currentPermits.compareAndSet(current, current - 1)) {
+                        // 不调用 semaphore.release()，许可被"吞掉"
+                        return
+                    }
+                    // CAS 失败，重试
+                }
+                current < target -> {
+                    // 扩展：额外释放一个许可
+                    if (_currentPermits.compareAndSet(current, current + 1)) {
+                        semaphore.release() // 额外释放，增加可用许可
+                        semaphore.release() // 正常释放
+                        return
+                    }
+                    // CAS 失败，重试
+                }
+                else -> {
+                    // 正常释放
+                    semaphore.release()
+                    return
+                }
             }
         }
-
-        semaphore.release()
     }
 
     /**

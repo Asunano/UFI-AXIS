@@ -57,12 +57,13 @@ class GoformClient(
     private val httpClient: HttpClient by lazy {
         HttpClient(CIO) {
             engine {
-                maxConnectionsCount = 10
-                requestTimeout = 8000
+                maxConnectionsCount = 8
+                requestTimeout = 10_000
                 endpoint {
-                    maxConnectionsPerRoute = 5
-                    connectTimeout = 5000
-                    keepAliveTime = 3000
+                    maxConnectionsPerRoute = 6
+                    connectTimeout = 3000
+                    keepAliveTime = 30_000
+                    pipelineMaxSize = 4
                 }
             }
             expectSuccess = false
@@ -93,17 +94,8 @@ class GoformClient(
         // 快速路径：TTL 内且已验证过，无需加锁
         if (isLoggedIn && (now - lastValidatedAt) < sessionCacheTtlMs) return true
 
-        // 指数退避：连续失败越多，冷却越长（锁外提前检查，避免无意义锁竞争）
-        val failCount = consecutiveLoginFailures.get().coerceAtMost(6)
-        val backoffMs = (baseLoginCooldownMs * (1L shl failCount)).coerceAtMost(maxLoginBackoffMs)
-        if (now - lastLoginAttempt < backoffMs && lastLoginAttempt > 0L) {
-            if (failCount > 0) {
-                AppLogger.d(tag, "Login cooling (failCount=$failCount, backoff=${backoffMs}ms, remaining=${backoffMs - (now - lastLoginAttempt)}ms)")
-            }
-            return false
-        }
-
         // 锁内：session 验证 + 登录原子执行，防止并发重复登录
+        // backoff 检查也放在锁内，避免 TOCTOU 竞态（锁外读取 lastLoginAttempt 可能过时）
         return loginMutex.withLock {
             // 双重检查：可能在等锁期间已被其他协程登录成功
             if (isLoggedIn && (System.currentTimeMillis() - lastValidatedAt) < sessionCacheTtlMs) return@withLock true
@@ -111,6 +103,18 @@ class GoformClient(
             if (isLoggedIn && validateSession()) {
                 lastValidatedAt = System.currentTimeMillis()
                 return@withLock true
+            }
+            // 锁内 backoff 检查：防止并发登录风暴
+            // 在锁内读取 lastLoginAttempt 避免 TOCTOU 竞态，等锁期间其他协程可能已登录成功
+            val nowLocked = System.currentTimeMillis()
+            val failCount = consecutiveLoginFailures.get()
+            if (failCount > 0) {
+                val backoffMs = (baseLoginCooldownMs * (1L shl failCount.coerceAtMost(6))).coerceAtMost(maxLoginBackoffMs)
+                if (nowLocked - lastLoginAttempt < backoffMs && lastLoginAttempt > 0L) {
+                    AppLogger.d(tag, "Login cooling (failCount=$failCount, backoff=${backoffMs}ms, remaining=${backoffMs - (nowLocked - lastLoginAttempt)}ms)")
+                    // 返回 isLoggedIn：等锁期间另一协程可能已登录成功，避免误报 false
+                    return@withLock isLoggedIn
+                }
             }
             // session 无效 → 标记未登录，继续执行登录流程
             isLoggedIn = false
@@ -377,21 +381,32 @@ class GoformClient(
 
     // ==================== AD 防重放 ====================
 
-    private suspend fun computeAd(): String {
-        return try {
+    /** 当缓存缺失时，从设备获取 wa_inner_version 和 cr_version 并缓存 */
+    private suspend fun fetchVersionInfo() {
+        try {
             val base = baseUrl()
-            val infoResp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=Language,cr_version,wa_inner_version&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
+            val infoResp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=wa_inner_version,cr_version&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
                 header("Referer", "$base/index.html")
                 if (sessionCookie != null) header("Cookie", sessionCookie!!)
             }
             val infoJson = json.parseToJsonElement(infoResp.bodyAsText()).jsonObject
-            val wa = infoJson["wa_inner_version"]?.jsonPrimitive?.contentOrNull ?: ""
-            val cr = infoJson["cr_version"]?.jsonPrimitive?.contentOrNull ?: ""
+            waVersion = infoJson["wa_inner_version"]?.jsonPrimitive?.contentOrNull
+            crVersion = infoJson["cr_version"]?.jsonPrimitive?.contentOrNull
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (_: Exception) {}
+    }
+
+    private suspend fun computeAd(): String {
+        return try {
+            // waVersion/crVersion 登录时已获取，版本号极少变化，复用缓存避免每次写操作都重复请求
+            if (waVersion == null || crVersion == null) {
+                fetchVersionInfo()
+            }
+            val wa = waVersion ?: ""; val cr = crVersion ?: ""
             if (wa.isEmpty() || cr.isEmpty()) {
                 AppLogger.w(tag, "computeAd: version fields empty wa='$wa' cr='$cr'")
                 return ""
             }
-            waVersion = wa; crVersion = cr
             val parsed = sha256Hex(wa + cr).uppercase()
             val rd = getRd() ?: run { AppLogger.w(tag, "computeAd: RD is null"); return "" }
             sha256Hex(parsed + rd).uppercase()

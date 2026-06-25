@@ -92,7 +92,8 @@ class MainActivity : Activity() {
                         data = Uri.parse("package:$packageName")
                     }
                     startActivity(intent)
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    AppLogger.w("MainActivity", "Failed to open storage permission settings: ${e.message}")
                     startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                 }
             }
@@ -181,7 +182,8 @@ class MainActivity : Activity() {
                     .setPositiveButton("确定") { _, _ -> }
                     .setCancelable(false)
                     .show()
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                AppLogger.w("MainActivity", "Failed to show error dialog: ${e.message}")
                 // 如果连 Dialog 都创建不了，用 Toast 兜底
                 Toast.makeText(this, "$title: ${throwable.message}", Toast.LENGTH_LONG).show()
             }

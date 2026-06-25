@@ -1,11 +1,10 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
-import com.ufi_axis_core.api.middleware.QoSMiddleware
-import com.ufi_axis_core.util.DynamicThreadPool
-import com.ufi_axis_core.util.ShellExecutor
-import com.ufi_axis_core.util.ShellQoS
+import com.ufi_axis_core.api.routes.RouteContext
 import com.ufi_axis_core.util.GoformQoS
+import com.ufi_axis_core.util.ShellQoS
+import java.io.File
 import io.ktor.server.application.call
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -17,9 +16,12 @@ import kotlinx.coroutines.withContext
  * GET /api/qos/status — 返回完整的 QoS 系统状态
  */
 class QoSRoutes(
-    private val qosMiddleware: QoSMiddleware,
-    private val dynamicThreadPool: DynamicThreadPool
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val qosMiddleware get() = ctx.qosMiddleware
+    private val dynamicThreadPool get() = ctx.dynamicThreadPool
+
     fun register(route: Route) {
         route.route("/qos") {
             get("/status") {
@@ -28,8 +30,7 @@ class QoSRoutes(
                 // 读取 CPU 温度（非 root，轻量级）
                 val cpuTemp = withContext(Dispatchers.IO) {
                     try {
-                        val result = ShellExecutor.execute("cat /sys/class/thermal/thermal_zone0/temp")
-                        result.stdout.trim().toIntOrNull() ?: 0
+                        File("/sys/class/thermal/thermal_zone0/temp").readText().trim().toIntOrNull() ?: 0
                     } catch (_: Exception) { 0 }
                 }
 

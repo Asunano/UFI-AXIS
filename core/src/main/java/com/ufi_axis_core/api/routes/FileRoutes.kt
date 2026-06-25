@@ -15,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
 import java.io.File
+import java.util.concurrent.TimeUnit
 
 class FileRoutes {
 
@@ -44,8 +45,11 @@ class FileRoutes {
                     return@get
                 }
 
-                // Resolve symlink chains: /sdcard → /storage/self/primary → /storage/emulated/0
-                val realPath = resolveRealPath(path) ?: path
+                // Resolve symlink chains and validate (prevent symlink traversal)
+                val realPath = resolveAndValidate(path) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@get
+                }
 
                 // Try ls with --time-style=long-iso (GNU coreutils)
                 // BusyBox ls 不支持此参数但可能仍以 exit 0 退出，需检查输出内容
@@ -139,35 +143,39 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@get
                 }
-
-                val name = filePath.substringAfterLast("/")
-
+                val safePath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@get
+                }
+            
+                val name = safePath.substringAfterLast("/")
+            
                 // Batch: stat + test -d + test -L → 1 shell call
-                val infoScript = """stat -L "$filePath" 2>/dev/null; echo "|__DIR__|"; test -d "$filePath" && echo yes || echo no; echo "|__SYM__|"; test -L "$filePath" && echo yes || echo no"""
+                val infoScript = """stat -L "$safePath" 2>/dev/null; echo "|__DIR__|"; test -d "$safePath" && echo yes || echo no; echo "|__SYM__|"; test -L "$safePath" && echo yes || echo no"""
                 val infoResult = rootShell(infoScript)
                 val sections = infoResult.stdout.split("|__DIR__|", "|__SYM__|")
-
+            
                 val statOutput = sections.getOrNull(0) ?: ""
                 val dirCheck = sections.getOrNull(1)?.trim() ?: ""
                 val symCheck = sections.getOrNull(2)?.trim() ?: ""
-
+            
                 var isDir = statOutput.contains("directory", ignoreCase = true) || dirCheck == "yes"
                 val isSymlink = !statOutput.contains("symbolic link") && symCheck == "yes"
-
+            
                 val size = Regex("Size:\\s*(\\d+)").find(statOutput)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
-
+            
                 // Try multiple stat output formats for permissions
-                val perms = tryStatFormat(filePath)
-
+                val perms = tryStatFormat(safePath)
+            
                 val owner = Regex("Uid:.*?/\\)\\s*(\\S+)").find(statOutput)?.groupValues?.get(1) ?: ""
                 val group = Regex("Gid:.*?/\\)\\s*(\\S+)").find(statOutput)?.groupValues?.get(1) ?: ""
-
+            
                 val mtime = Regex("Modify:\\s*(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}(?::\\d{2})?)")
                     .find(statOutput)?.groupValues?.get(1)?.trim() ?: ""
                 val epoch = parseModifyTime(mtime)
-
+            
                 call.respond(toJsonElement(mapOf(
-                    "name" to name, "path" to filePath, "isDirectory" to isDir,
+                    "name" to name, "path" to safePath, "isDirectory" to isDir,
                     "size" to size, "lastModified" to epoch, "permissions" to perms,
                     "owner" to owner, "group" to group, "isSymlink" to isSymlink
                 )))
@@ -180,8 +188,12 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
+                val safePath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
                 // -L follows symlinks for correct size
-                val sizeResult = rootShell("stat -L -c %s \"$filePath\" 2>/dev/null")
+                val sizeResult = rootShell("stat -L -c %s \"$safePath\" 2>/dev/null")
                 val fileSize = sizeResult.stdout.trim().toLongOrNull() ?: 0
                 if (fileSize > MAX_READ_SIZE) {
                     call.respond(toJsonElement(mapOf(
@@ -190,7 +202,7 @@ class FileRoutes {
                     )))
                     return@post
                 }
-                val fileTypeResult = rootShell("file -b \"$filePath\" 2>/dev/null")
+                val fileTypeResult = rootShell("file -b \"$safePath\" 2>/dev/null")
                 val fileType = fileTypeResult.stdout.trim().lowercase()
                 if (fileType.contains("executable") || fileType.contains("shared object") ||
                     fileType.contains("data") || fileType.contains("image") || fileType.contains("archive")) {
@@ -200,7 +212,7 @@ class FileRoutes {
                     )))
                     return@post
                 }
-                val result = rootShell("cat \"$filePath\" 2>/dev/null")
+                val result = rootShell("cat \"$safePath\" 2>/dev/null")
                 val content = if (result.stdout.length > MAX_READ_SIZE)
                     result.stdout.take(MAX_READ_SIZE) + "\n... [截断]"
                 else result.stdout
@@ -217,10 +229,14 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
+                val safePath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
                 // Use base64 to safely write content (avoids shell escaping issues)
                 val b64 = java.util.Base64.getEncoder().encodeToString(content.toByteArray(Charsets.UTF_8))
                 val result = rootShell(
-                    "mkdir -p \"${parentOf(filePath)}\" && echo '$b64' | base64 -d > \"$filePath\""
+                    "mkdir -p \"${parentOf(safePath)}\" && echo '$b64' | base64 -d > \"$safePath\""
                 )
                 call.respond(toJsonElement(mapOf("success" to result.isSuccess)))
             }
@@ -232,8 +248,12 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
+                val safePath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
                 // 安全校验：禁止删除系统关键目录
-                val dangerCheck = isDangerousDeletePath(filePath)
+                val dangerCheck = isDangerousDeletePath(safePath)
                 if (dangerCheck != null) {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf(
                         "success" to false, "error" to dangerCheck
@@ -241,15 +261,15 @@ class FileRoutes {
                     return@post
                 }
                 // 校验路径存在
-                val exists = rootShell("test -e \"$filePath\" && echo yes").stdout.trim() == "yes"
+                val exists = rootShell("test -e \"$safePath\" && echo yes").stdout.trim() == "yes"
                 if (!exists) {
                     call.respond(HttpStatusCode.NotFound, toJsonElement(mapOf(
                         "success" to false, "error" to "文件或目录不存在"
                     )))
                     return@post
                 }
-                val result = rootShell("rm -rf \"$filePath\"")
-                val stillExists = rootShell("test -e \"$filePath\" && echo yes").stdout.trim() == "yes"
+                val result = rootShell("rm -rf \"$safePath\"")
+                val stillExists = rootShell("test -e \"$safePath\" && echo yes").stdout.trim() == "yes"
                 call.respond(toJsonElement(mapOf(
                     "success" to (result.isSuccess && !stillExists),
                     "deleted" to result.isSuccess,
@@ -265,7 +285,15 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
-                val result = rootShell("mv \"$oldPath\" \"$newPath\"")
+                val safeOldPath = resolveAndValidate(oldPath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val safeNewPath = resolveAndValidate(newPath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val result = rootShell("mv \"$safeOldPath\" \"$safeNewPath\"")
                 call.respond(toJsonElement(mapOf("success" to result.isSuccess)))
             }
 
@@ -277,9 +305,17 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
+                val safeSource = resolveAndValidate(source) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val safeDest = resolveAndValidate(dest) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
 
                 // ① 校验来源存在
-                val srcExists = rootShell("test -e \"$source\" && echo yes").stdout.trim() == "yes"
+                val srcExists = rootShell("test -e \"$safeSource\" && echo yes").stdout.trim() == "yes"
                 if (!srcExists) {
                     call.respond(HttpStatusCode.NotFound, toJsonElement(mapOf(
                         "success" to false, "error" to "源文件或目录不存在"
@@ -288,8 +324,8 @@ class FileRoutes {
                 }
 
                 // ② 防止递归移动：目标路径是源路径的子目录 → 死循环
-                val srcNormalized = source.trimEnd('/')
-                val destNormalized = dest.trimEnd('/')
+                val srcNormalized = safeSource.trimEnd('/')
+                val destNormalized = safeDest.trimEnd('/')
                 if (destNormalized.startsWith("$srcNormalized/")) {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf(
                         "success" to false, "error" to "不能将目录移动到自身内部"
@@ -298,50 +334,50 @@ class FileRoutes {
                 }
 
                 // ③ 记录源文件/目录的信息（大小校验用）
-                val isDir = rootShell("test -d \"$source\" && echo yes").stdout.trim() == "yes"
+                val isDir = rootShell("test -d \"$safeSource\" && echo yes").stdout.trim() == "yes"
                 val srcSize = if (!isDir) {
-                    rootShell("stat -L -c %s \"$source\" 2>/dev/null").stdout.trim().toLongOrNull() ?: -1L
+                    rootShell("stat -L -c %s \"$safeSource\" 2>/dev/null").stdout.trim().toLongOrNull() ?: -1L
                 } else -1L
 
                 // ④ 目标已存在时标记
-                val destAlreadyExists = rootShell("test -e \"$dest\" && echo yes").stdout.trim() == "yes"
+                val destAlreadyExists = rootShell("test -e \"$safeDest\" && echo yes").stdout.trim() == "yes"
 
                 // ⑤ 优先尝试 mv（同一文件系统下直接原子移动）
                 var moved = false
                 var usedFallback = false
                 var integrityOk = false
 
-                val mvResult = rootShell("mv \"$source\" \"$dest\"")
+                val mvResult = rootShell("mv \"$safeSource\" \"$safeDest\"")
                 moved = mvResult.isSuccess
                 if (moved) {
                     // mv 成功 → 验证目标完整性
-                    integrityOk = verifyMoveIntegrity(source, dest, isDir, srcSize)
+                    integrityOk = verifyMoveIntegrity(safeSource, safeDest, isDir, srcSize)
                     if (!integrityOk) {
                         // mv 后完整性校验失败（极低概率），尝试恢复
-                        rootShell("mv \"$dest\" \"$source\"")
+                        rootShell("mv \"$safeDest\" \"$safeSource\"")
                         moved = false
                     }
                 }
 
                 if (!moved) {
                     // ⑥ mv 失败（如跨文件系统），改用 cp + rm
-                    val copyResult = rootShell("cp -rf \"$source\" \"$dest\"")
+                    val copyResult = rootShell("cp -rf \"$safeSource\" \"$safeDest\"")
                     if (copyResult.isSuccess) {
-                        integrityOk = verifyMoveIntegrity(source, dest, isDir, srcSize)
+                        integrityOk = verifyMoveIntegrity(safeSource, safeDest, isDir, srcSize)
                         if (integrityOk) {
-                            rootShell("rm -rf \"$source\"")
+                            rootShell("rm -rf \"$safeSource\"")
                             moved = true
                             usedFallback = true
                         } else {
                             // cp 后完整性校验失败 → 清理目标 → 保留源文件
-                            rootShell("rm -rf \"$dest\"")
+                            rootShell("rm -rf \"$safeDest\"")
                         }
                     }
                 }
 
                 // 验证最终结果
-                val destExists = rootShell("test -e \"$dest\" && echo yes").stdout.trim() == "yes"
-                val sourceGone = rootShell("test -e \"$source\" && echo yes").stdout.trim() != "yes"
+                val destExists = rootShell("test -e \"$safeDest\" && echo yes").stdout.trim() == "yes"
+                val sourceGone = rootShell("test -e \"$safeSource\" && echo yes").stdout.trim() != "yes"
                 call.respond(toJsonElement(mapOf(
                     "success" to (moved && integrityOk && destExists && sourceGone),
                     "dest_exists" to destExists,
@@ -360,7 +396,15 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
-                val result = rootShell("cp -rf \"$source\" \"$dest\"")
+                val safeSource = resolveAndValidate(source) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val safeDest = resolveAndValidate(dest) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val result = rootShell("cp -rf \"$safeSource\" \"$safeDest\"")
                 call.respond(toJsonElement(mapOf("success" to result.isSuccess)))
             }
 
@@ -371,7 +415,11 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
-                val result = rootShell("mkdir -p \"$dirPath\"")
+                val safeDirPath = resolveAndValidate(dirPath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val result = rootShell("mkdir -p \"$safeDirPath\"")
                 call.respond(toJsonElement(mapOf("success" to result.isSuccess)))
             }
 
@@ -384,7 +432,10 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path or empty query")))
                     return@get
                 }
-                val realPath = resolveRealPath(path) ?: path
+                val realPath = resolveAndValidate(path) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@get
+                }
                 // 使用 find + grep 搜索，限制深度和结果数
                 val result = rootShell("find \"$realPath\" -maxdepth $maxDepth -iname \"*$query*\" 2>/dev/null | head -50")
                 val files = if (result.isSuccess && result.stdout.isNotBlank()) {
@@ -478,7 +529,11 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@post
                 }
-                val result = rootShell("touch \"$filePath\"")
+                val safePath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@post
+                }
+                val result = rootShell("touch \"$safePath\"")
                 call.respond(toJsonElement(mapOf("success" to result.isSuccess)))
             }
 
@@ -489,7 +544,10 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@get
                 }
-                val realPath = resolveRealPath(filePath) ?: filePath
+                val realPath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@get
+                }
                 // 检查文件大小
                 val sizeResult = rootShell("stat -L -c %s \"$realPath\" 2>/dev/null")
                 val fileSize = sizeResult.stdout.trim().toLongOrNull() ?: 0
@@ -506,7 +564,9 @@ class FileRoutes {
                 call.response.header(HttpHeaders.ContentLength, fileSize.toString())
                 call.respondOutputStream(ContentType.parse(mimeType)) {
                     withContext(Dispatchers.IO) {
-                        val process = Runtime.getRuntime().exec("su -c cat \"$realPath\"")
+                        val process = ProcessBuilder("su", "-c", "cat \"$realPath\"")
+                            .redirectErrorStream(true)
+                            .start()
                         try {
                             process.inputStream.use { input ->
                                 val buffer = ByteArray(8192)
@@ -516,8 +576,8 @@ class FileRoutes {
                                 }
                             }
                         } finally {
-                            process.waitFor()
-                            process.destroy()
+                            process.waitFor(30, TimeUnit.SECONDS)
+                            process.destroyForcibly()
                         }
                     }
                 }
@@ -530,7 +590,10 @@ class FileRoutes {
                     call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
                     return@get
                 }
-                val realPath = resolveRealPath(filePath) ?: filePath
+                val realPath = resolveAndValidate(filePath) ?: run {
+                    call.respond(HttpStatusCode.BadRequest, toJsonElement(mapOf("error" to "Invalid path")))
+                    return@get
+                }
                 val fileName = realPath.substringAfterLast("/")
                 val mimeType = MimeTypes.fromFileName(fileName)
 
@@ -565,7 +628,9 @@ class FileRoutes {
                             val skipBlock = start / 8192
                             val countBlocks = contentLength / 8192 + 1
                             val ddCmd = "dd if=\"$realPath\" bs=8192 skip=$skipBlock count=$countBlocks 2>/dev/null"
-                            val process = Runtime.getRuntime().exec("su -c $ddCmd")
+                            val process = ProcessBuilder("su", "-c", ddCmd)
+                                .redirectErrorStream(true)
+                                .start()
                             try {
                                 val skipOffset = (start % 8192).toInt()
                                 if (skipOffset > 0) {
@@ -581,7 +646,8 @@ class FileRoutes {
                                     remaining -= read
                                 }
                             } finally {
-                                process.destroy()
+                                process.waitFor(30, TimeUnit.SECONDS)
+                                process.destroyForcibly()
                             }
                         }
                     } else {
@@ -592,7 +658,9 @@ class FileRoutes {
 
                         call.respondOutputStream(ContentType.parse(mimeType)) {
                             // Use root shell cat to read file (bypass Scoped Storage)
-                            val process = Runtime.getRuntime().exec("su -c cat \"$realPath\"")
+                            val process = ProcessBuilder("su", "-c", "cat \"$realPath\"")
+                                .redirectErrorStream(true)
+                                .start()
                             try {
                                 val buffer = ByteArray(8192)
                                 while (true) {
@@ -601,7 +669,8 @@ class FileRoutes {
                                     write(buffer, 0, read)
                                 }
                             } finally {
-                                process.destroy()
+                                process.waitFor(30, TimeUnit.SECONDS)
+                                process.destroyForcibly()
                             }
                         }
                     }
@@ -627,7 +696,8 @@ class FileRoutes {
                                     if (!isSafePath(targetDir)) {
                                         throw IllegalArgumentException("Invalid target path")
                                     }
-                                    val destPath = "${targetDir.trimEnd('/')}/$fileName"
+                                    val safeTargetDir = resolveAndValidate(targetDir) ?: throw IllegalArgumentException("Invalid target path")
+                                    val destPath = "${safeTargetDir.trimEnd('/')}/$fileName"
                                     val tmpFile = File.createTempFile("ufi_upload_", null)
                                     try {
                                         // Stream uploaded file data directly to temp file
@@ -689,6 +759,17 @@ class FileRoutes {
         val result = rootShell("realpath \"$path\" 2>/dev/null")
         val resolved = result.stdout.trim()
         return if (result.isSuccess && resolved.isNotBlank() && resolved != path) resolved else null
+    }
+
+    /**
+     * 解析符号链接并校验目标路径合法性，防止符号链接绕过路径限制（如 /sdcard/evil → /data/data/...）。
+     * 若路径不是符号链接（resolveRealPath 返回 null）则直接返回原路径；
+     * 若是符号链接但目标不在用户存储范围内，返回 null 拒绝访问。
+     */
+    private suspend fun resolveAndValidate(path: String): String? {
+        val resolved = resolveRealPath(path) ?: return path
+        // 符号链接的目标路径必须在用户存储范围内
+        return if (isUserStoragePath(resolved)) resolved else null
     }
 
     /** Try to get permission string from stat in a single call (3 → 1). */

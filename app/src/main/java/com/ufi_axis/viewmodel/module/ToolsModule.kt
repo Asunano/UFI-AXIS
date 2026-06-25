@@ -1,20 +1,20 @@
 package com.ufi_axis.viewmodel.module
 
 import android.content.Context
+import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.data.model.*
-import com.ufi_axis.data.repository.CommsRepository
-import com.ufi_axis.data.repository.NetworkRepository
+import com.ufi_axis.util.AppGson
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.viewmodel.state.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 class ToolsModule(
-    private val commsRepo: CommsRepository,
-    private val networkRepo: NetworkRepository,
+    private val api: UfiAxisApi,
     private val appContext: Context,
     private val scope: CoroutineScope
 ) {
+    private val gson = AppGson.instance
     // ── State ──
     private val _toolsState = MutableStateFlow(ToolsState())
     val toolsState: StateFlow<ToolsState> = _toolsState.asStateFlow()
@@ -40,14 +40,20 @@ class ToolsModule(
     private val _qosConfigState = MutableStateFlow(QosConfigState())
     val qosConfigState: StateFlow<QosConfigState> = _qosConfigState.asStateFlow()
 
-    var onNetworkError: ((String?) -> Unit)? = null
+    // ── Cross-module Events ──
+    private val _events = MutableSharedFlow<UiEvent>()
+    val events: SharedFlow<UiEvent> = _events.asSharedFlow()
+
+    private fun emitNetworkError(msg: String?) {
+        _events.tryEmit(UiEvent.ShowNetworkError(msg))
+    }
 
     // ── AT Command ──
     fun sendAtCommand(command: String) {
         scope.launch {
             _toolsState.value = _toolsState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val response = commsRepo.sendAtCommand(command)
+                val response = api.sendAtCommand(AtCommandRequest(command))
                 val historyItem = "> ${response.command}\n${response.response}"
                 _toolsState.value = _toolsState.value.copy(atResponse = response.response,
                     atHistory = listOf(historyItem) + _toolsState.value.atHistory, isLoading = false)
@@ -62,7 +68,7 @@ class ToolsModule(
         scope.launch {
             _toolsState.value = _toolsState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val response = commsRepo.sendSms(phone, message)
+                val response = api.sendSms(SmsSendRequest(phone, message))
                 _toolsState.value = _toolsState.value.copy(isLoading = false, errorMessage = if (!response.success) "短信发送失败" else null)
                 if (response.success) {
                     loadSmsList()
@@ -81,7 +87,7 @@ class ToolsModule(
         scope.launch {
             _toolsState.value = _toolsState.value.copy(isLoading = true)
             try {
-                val resp = commsRepo.getSmsContacts()
+                val resp = api.getSmsContacts()
                 _toolsState.value = _toolsState.value.copy(smsContacts = resp.contacts, isLoading = false)
             } catch (e: Exception) {
                 _toolsState.value = _toolsState.value.copy(isLoading = false, errorMessage = "短信联系人加载失败: ${e.message}")
@@ -96,7 +102,7 @@ class ToolsModule(
 
     fun loadSmsList() {
         scope.launch {
-            try { _toolsState.value = _toolsState.value.copy(smsList = commsRepo.getSmsList().messages) }
+            try { _toolsState.value = _toolsState.value.copy(smsList = api.getSmsList().messages) }
             catch (e: Exception) { _toolsState.value = _toolsState.value.copy(errorMessage = "短信列表加载失败: ${e.message}") }
         }
     }
@@ -110,7 +116,7 @@ class ToolsModule(
                     conversationLoading = true, conversationTotal = 0)
             }
             try {
-                val resp = commsRepo.getSmsList(limit = CONVERSATION_PAGE_SIZE, offset = 0, phone = phone)
+                val resp = api.getSmsList(limit = CONVERSATION_PAGE_SIZE, offset = 0, phone = phone)
                 // 后端返回 DESC（最新在前），转为 ASC 用于对话展示
                 val msgs = resp.messages.sortedBy { it.timestamp }
                 val total = resp.total.coerceAtLeast(msgs.size.coerceAtLeast(resp.count))
@@ -135,7 +141,7 @@ class ToolsModule(
             val offset = _toolsState.value.conversationOffset
             _toolsState.update { it.copy(conversationLoading = true) }
             try {
-                val resp = commsRepo.getSmsList(limit = CONVERSATION_PAGE_SIZE, offset = offset, phone = phone)
+                val resp = api.getSmsList(limit = CONVERSATION_PAGE_SIZE, offset = offset, phone = phone)
                 val older = resp.messages.sortedBy { it.timestamp }
                 val total = resp.total.coerceAtLeast(
                     (older.size + _toolsState.value.conversationMessages.size).coerceAtLeast(resp.count))
@@ -173,7 +179,7 @@ class ToolsModule(
         scope.launch {
             _toolsState.value = _toolsState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val result = commsRepo.shellExec(command, asRoot)
+                val result = api.shellExec(ShellExecRequest(command, asRoot, 30))
                 val output = buildString {
                     if (result.stdout.isNotBlank()) append(result.stdout)
                     if (result.stderr.isNotBlank()) {
@@ -206,7 +212,7 @@ class ToolsModule(
                 _toolsState.update { it.copy(deletingMessageIds = it.deletingMessageIds + idLong) }
 
                 // 2. 调用后端删除（goform + ContentResolver）
-                commsRepo.deleteSms(id)
+                api.deleteSms(mapOf("id" to id))
 
                 // 3. 等待动画播放完成（350ms fadeOut）
                 delay(350L)
@@ -233,7 +239,7 @@ class ToolsModule(
     fun markSmsRead(id: String) {
         scope.launch {
             try {
-                commsRepo.markSmsRead(id)
+                api.markSmsRead(mapOf("id" to id))
                 loadSmsList()
                 loadSmsContacts()
                 // 如果正在对话中，更新消息已读状态
@@ -252,8 +258,8 @@ class ToolsModule(
 
     fun switchSimSlot(slot: Int) {
         scope.launch {
-            try { networkRepo.switchSimSlot(slot) }
-            catch (e: Exception) { onNetworkError?.invoke("切换卡槽失败: ${e.message}") }
+            try { api.switchSimSlot(mapOf("slot" to slot)) }
+            catch (e: Exception) { emitNetworkError("切换卡槽失败: ${e.message}") }
         }
     }
 
@@ -262,8 +268,8 @@ class ToolsModule(
         scope.launch {
             _alertsState.value = _alertsState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val config = async { runCatching { commsRepo.getAlertConfig() } }
-                val list = async { runCatching { commsRepo.getAlertList(50) } }
+                val config = async { runCatching { api.getAlertConfig() } }
+                val list = async { runCatching { api.getAlertList(50) } }
                 val rConfig = config.await(); val rList = list.await()
 
                 val failures = listOfNotNull(
@@ -284,14 +290,14 @@ class ToolsModule(
 
     fun updateAlertConfig(config: AlertConfig) {
         scope.launch {
-            try { commsRepo.updateAlertConfig(config); loadAlerts() }
+            try { api.updateAlertConfig(config); loadAlerts() }
             catch (e: Exception) { _alertsState.value = _alertsState.value.copy(errorMessage = "更新告警配置失败: ${e.message}") }
         }
     }
 
     fun ackAlert(id: Long) {
         scope.launch {
-            try { commsRepo.ackAlert(id); loadAlerts() }
+            try { api.ackAlert(AckRequest(id)); loadAlerts() }
             catch (e: Exception) { _alertsState.value = _alertsState.value.copy(errorMessage = "确认告警失败: ${e.message}") }
         }
     }
@@ -301,9 +307,11 @@ class ToolsModule(
         scope.launch {
             _adbState.value = _adbState.value.copy(isLoading = true)
             try {
-                val status = commsRepo.getAdbStatus()
-                val autoStart = try { commsRepo.getAdbAutoStart() }
-                    catch (_: Exception) { _adbState.value.autoStartOnBoot }  // 网络失败保留旧值
+                val status = api.getAdbStatus()
+                val autoStart = try {
+                    val resp = api.getAdbAutoStart()
+                    resp.getAsJsonObject().get("auto_start_on_boot")?.asBoolean ?: false
+                } catch (e: Exception) { DebugLog.w("Tools", "refreshAdbStatus: getAdbAutoStart failed", e); _adbState.value.autoStartOnBoot }  // 网络失败保留旧值
                 _adbState.value = AdbState(status = status, autoStartOnBoot = autoStart)
             }
             catch (e: Exception) { _adbState.value = AdbState(errorMessage = "获取ADB状态失败: ${e.message}") }
@@ -314,7 +322,7 @@ class ToolsModule(
         scope.launch {
             _adbState.value = _adbState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val resp = commsRepo.startAdb(port)
+                val resp = api.startAdb(mapOf("port" to port))
                 if (!resp.success) _adbState.value = _adbState.value.copy(errorMessage = "启动失败", isLoading = false)
                 else refreshAdbStatus()
             } catch (e: Exception) { _adbState.value = _adbState.value.copy(errorMessage = "启动失败: ${e.message}", isLoading = false) }
@@ -325,7 +333,7 @@ class ToolsModule(
         scope.launch {
             _adbState.value = _adbState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val resp = commsRepo.stopAdb()
+                val resp = api.stopAdb()
                 if (!resp.success) _adbState.value = _adbState.value.copy(errorMessage = "停止失败", isLoading = false)
                 else refreshAdbStatus()
             } catch (e: Exception) { _adbState.value = _adbState.value.copy(errorMessage = "停止失败: ${e.message}", isLoading = false) }
@@ -335,7 +343,7 @@ class ToolsModule(
     fun setAdbAutoStart(enabled: Boolean) {
         scope.launch {
             try {
-                commsRepo.setAdbAutoStart(enabled)
+                api.setAdbAutoStart(mapOf("enabled" to enabled))
                 _adbState.value = _adbState.value.copy(autoStartOnBoot = enabled)
             } catch (e: Exception) {
                 _adbState.value = _adbState.value.copy(errorMessage = "设置失败: ${e.message}")
@@ -347,7 +355,7 @@ class ToolsModule(
     fun loadSmsForwardConfig() {
         scope.launch {
             _smsForwardState.value = _smsForwardState.value.copy(isLoading = true)
-            try { _smsForwardState.value = SmsForwardState(config = commsRepo.getSmsForwardConfig()) }
+            try { _smsForwardState.value = SmsForwardState(config = api.getSmsForwardConfig()) }
             catch (e: Exception) { _smsForwardState.value = SmsForwardState(errorMessage = "加载失败: ${e.message}") }
         }
     }
@@ -356,7 +364,7 @@ class ToolsModule(
         scope.launch {
             _smsForwardState.value = _smsForwardState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val result = commsRepo.saveSmsForwardConfig(config)
+                val result = api.saveSmsForwardConfig(config)
                 if (result.success) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false); loadSmsForwardConfig() }
                 else _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "保存失败：服务器返回失败")
             } catch (e: Exception) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "保存失败: ${e.message}") }
@@ -367,7 +375,7 @@ class ToolsModule(
         scope.launch {
             _smsForwardState.value = _smsForwardState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val result = commsRepo.testSmsForward()
+                val result = api.testSmsForward()
                 val obj = result.getAsJsonObject()
                 val success = obj.get("success")?.getAsBoolean() ?: false
                 val error = obj.get("error")?.getAsString()
@@ -380,35 +388,35 @@ class ToolsModule(
     fun loadTaskList() {
         scope.launch {
             _tasksState.value = _tasksState.value.copy(isLoading = true)
-            try { _tasksState.value = TasksState(tasks = commsRepo.getTaskList().tasks) }
+            try { _tasksState.value = TasksState(tasks = api.getTaskList().tasks) }
             catch (e: Exception) { _tasksState.value = TasksState(errorMessage = "加载失败: ${e.message}") }
         }
     }
 
     fun createTask(task: ScheduledTask) {
         scope.launch {
-            try { commsRepo.createTask(task); loadTaskList() }
+            try { api.createTask(task); loadTaskList() }
             catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "创建失败: ${e.message}") }
         }
     }
 
     fun updateTask(id: String, task: ScheduledTask) {
         scope.launch {
-            try { commsRepo.updateTask(id, task); loadTaskList() }
+            try { api.updateTask(id, task); loadTaskList() }
             catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "更新失败: ${e.message}") }
         }
     }
 
     fun deleteTask(id: String) {
         scope.launch {
-            try { commsRepo.deleteTask(id); loadTaskList() }
+            try { api.deleteTask(id); loadTaskList() }
             catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "删除失败: ${e.message}") }
         }
     }
 
     fun clearTasks() {
         scope.launch {
-            try { commsRepo.clearTasks(); loadTaskList() }
+            try { api.clearTasks(); loadTaskList() }
             catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "清除失败: ${e.message}") }
         }
     }
@@ -418,7 +426,7 @@ class ToolsModule(
         scope.launch {
             _debugLogState.value = _debugLogState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val result = commsRepo.getDebugLogs(level, 300)
+                val result = api.getDebugLogs(level, 300)
                 val obj = result.getAsJsonObject()
                 val logsArray = obj.getAsJsonArray("logs")
                 val logs = logsArray?.map { it.asString } ?: emptyList()
@@ -430,7 +438,7 @@ class ToolsModule(
     fun clearDebugLogs() {
         scope.launch {
             try {
-                commsRepo.clearDebugLogs()
+                api.clearDebugLogs()
                 _debugLogState.value = DebugLogState(filterLevel = _debugLogState.value.filterLevel)
             } catch (e: Exception) { _debugLogState.value = _debugLogState.value.copy(errorMessage = "清除失败: ${e.message}") }
         }
@@ -447,7 +455,7 @@ class ToolsModule(
 
     fun syncDebugMode(enabled: Boolean) {
         scope.launch {
-            try { commsRepo.updateConfig(mapOf("debug_mode" to enabled)) }
+            try { api.updateConfig(mapOf("debug_mode" to enabled)) }
             catch (e: Exception) { DebugLog.w("Tools", "syncDebugMode failed: ${e.message}") }
         }
     }
@@ -457,7 +465,7 @@ class ToolsModule(
         scope.launch {
             _trafficManagementState.value = _trafficManagementState.value.copy(isLoading = true, errorMessage = null, successMessage = null)
             try {
-                val result = networkRepo.getTrafficLimit()
+                val result = api.getTrafficLimit()
                 // 检查响应中是否包含错误字段
                 val jsonObj = result.asJsonObject
                 if (jsonObj.has("error")) {
@@ -467,7 +475,7 @@ class ToolsModule(
                     )
                     return@launch
                 }
-                val config = com.google.gson.Gson().fromJson(result, TrafficLimitConfig::class.java)
+                val config = gson.fromJson(result, TrafficLimitConfig::class.java)
                 _trafficManagementState.value = _trafficManagementState.value.copy(limitConfig = config, isLoading = false)
             } catch (e: Exception) {
                 _trafficManagementState.value = _trafficManagementState.value.copy(isLoading = false, errorMessage = "加载失败: ${e.message}")
@@ -480,7 +488,7 @@ class ToolsModule(
         scope.launch {
             _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = true, errorMessage = null, successMessage = null)
             try {
-                val resp = networkRepo.setDataLimit(mapOf(
+                val resp = api.setDataLimit(mapOf(
                     "enabled" to enabled, "limit_size" to limitSize, "limit_unit" to limitUnit,
                     "alert_percent" to alertPercent, "auto_clear" to autoClear, "clear_date" to clearDate))
                 _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = false,
@@ -495,7 +503,7 @@ class ToolsModule(
         scope.launch {
             _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = true, errorMessage = null, successMessage = null)
             try {
-                val resp = networkRepo.calibrateFlow(mapOf("way" to way, "data" to data, "time" to time))
+                val resp = api.calibrateFlow(mapOf("way" to way, "data" to data, "time" to time))
                 _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = false,
                     successMessage = if (resp.success) "校准成功" else null,
                     errorMessage = if (!resp.success) "校准失败" else null)
@@ -513,7 +521,7 @@ class ToolsModule(
         scope.launch {
             try {
                 DebugLog.d("Config", "syncing goform: ip=$ip port=$port")
-                commsRepo.updateConfig(mapOf("goform_ip" to ip, "goform_port" to port, "goform_password" to password))
+                api.updateConfig(mapOf("goform_ip" to ip, "goform_port" to port, "goform_password" to password))
             } catch (e: Exception) { DebugLog.w("Config", "syncGatewayConfig failed", e) }
         }
     }
@@ -523,7 +531,7 @@ class ToolsModule(
         scope.launch {
             _qosConfigState.value = _qosConfigState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val cfg = commsRepo.getConfig()
+                val cfg = api.getConfig()
                 _qosConfigState.value = _qosConfigState.value.copy(
                     config = QosConfig(
                         enabled = cfg.qos_enabled,
@@ -546,7 +554,7 @@ class ToolsModule(
         scope.launch {
             _qosConfigState.value = _qosConfigState.value.copy(isSaving = true, errorMessage = null)
             try {
-                commsRepo.updateConfig(mapOf(
+                api.updateConfig(mapOf(
                     "qos_enabled" to enabled,
                     "qos_shell_max_concurrent" to shellMax,
                     "qos_cache_ttl_ms" to cacheTtl,

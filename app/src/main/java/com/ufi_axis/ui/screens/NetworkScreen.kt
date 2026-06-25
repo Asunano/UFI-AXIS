@@ -32,7 +32,7 @@ import com.google.gson.JsonElement
 fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
-    val dashboardState by viewModel.dashboardState.collectAsState()
+    val dashboardTrafficRealtime by viewModel.dashboardTrafficRealtime.collectAsState()
 
     // ── 6 个弹窗状态 ──
     var showWifiDialog by remember { mutableStateOf(false) }
@@ -79,9 +79,7 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
 
                 // ═══════════ 1. 蜂窝网络状态 & SIM 卡 ═══════════
                 val currentBand = remember(state.cellInfo) { parseCurrentBand(state.cellInfo) }
-                val downlinkSpeed = remember(dashboardState.trafficRealtime) {
-                    dashboardState.trafficRealtime?.rx_speed_display?.takeIf { it.isNotBlank() }
-                }
+                val downlinkSpeed by remember { derivedStateOf { dashboardTrafficRealtime?.rx_speed_display?.takeIf { it.isNotBlank() } } }
                 CellularStatusCard(
                     state = state,
                     currentBand = currentBand,

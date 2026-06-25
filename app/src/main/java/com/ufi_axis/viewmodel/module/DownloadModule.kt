@@ -10,6 +10,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.RequestBody.Companion.toRequestBody
+import com.ufi_axis.util.AppHttpClient
 
 class DownloadModule(
     private val appContext: Context,
@@ -25,7 +26,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads"
                 val result = withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute().body?.string() ?: "{}"
                 }
@@ -116,7 +117,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val apiUrl = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     // 预解析 DNS：路由器端系统 DNS 不可用，由手机端解析并传 IP 给 Core
                     val resolvedIps = try {
                         val host = java.net.URI(url).host
@@ -193,7 +194,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val apiUrl = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads?force=true"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val json = com.google.gson.JsonObject().apply {
                         addProperty("url", url); addProperty("file_name", fileName)
                         if (!savePath.isNullOrBlank()) addProperty("save_path", savePath)
@@ -224,7 +225,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/$id/pause"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute()
                 }
@@ -239,7 +240,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/$id/resume"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute()
                 }
@@ -254,7 +255,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/$id?delete_file=$deleteFile"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).delete().addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute()
                 }
@@ -270,7 +271,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/$id/retry"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).post(ByteArray(0).toRequestBody(null))
                         .addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute()
@@ -292,7 +293,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/clear-completed"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute()
                 }
@@ -307,7 +308,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/config"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val json = com.google.gson.JsonObject().apply {
                         addProperty("max_concurrent", config.maxConcurrent)
                         addProperty("max_connections_per_server", config.maxConnectionsPerServer)
@@ -365,7 +366,7 @@ class DownloadModule(
                 val encoded = java.net.URLEncoder.encode(path, "UTF-8")
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/validate-path?path=$encoded"
                 val result = withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute().body?.string() ?: "{}"
                 }
@@ -388,7 +389,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/trackers/refresh"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).post(ByteArray(0).toRequestBody(null)).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute().close()
                 }
@@ -404,7 +405,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/trackers"
                 val result = withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val request = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer ${prefs.token}").build()
                     client.newCall(request).execute().body?.string() ?: "{}"
                 }
@@ -421,7 +422,7 @@ class DownloadModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/downloads/trackers/save"
                 withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient()
+                    val client = AppHttpClient.instance
                     val json = com.google.gson.JsonObject().apply { addProperty("trackers", trackers) }
                     val mediaType = "application/json".toMediaTypeOrNull()!!
                     val body = json.toString().toRequestBody(mediaType)

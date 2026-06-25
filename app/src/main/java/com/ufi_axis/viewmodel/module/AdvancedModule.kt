@@ -1,13 +1,13 @@
 package com.ufi_axis.viewmodel.module
 
 import android.content.Context
-import com.ufi_axis.data.repository.FileAppRepository
+import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.viewmodel.state.AdvancedState
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 class AdvancedModule(
-    private val repo: FileAppRepository,
+    private val api: UfiAxisApi,
     private val appContext: Context,
     private val scope: CoroutineScope
 ) {
@@ -18,8 +18,8 @@ class AdvancedModule(
         scope.launch {
             _state.value = _state.value.copy(isLoading = true, errorMessage = null)
             try {
-                val ttyd = runCatching { repo.getTtydStatus() }
-                val iperf3 = runCatching { repo.getIperf3Status() }
+                val ttyd = runCatching { api.getTtydStatus() }
+                val iperf3 = runCatching { api.getIperf3Status() }
                 _state.value = _state.value.copy(
                     ttydRunning = ttyd.getOrNull()?.asJsonObject?.get("running")?.asBoolean ?: false,
                     iperf3Running = iperf3.getOrNull()?.asJsonObject?.get("running")?.asBoolean ?: false,
@@ -32,7 +32,7 @@ class AdvancedModule(
     fun toggleTtyd(start: Boolean) {
         scope.launch {
             try {
-                if (start) repo.startTtyd() else repo.stopTtyd()
+                if (start) api.startTtyd() else api.stopTtyd()
                 delay(1000); loadAdvancedStatus()
             } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "TTYD操作失败: ${e.message}") }
         }
@@ -41,7 +41,7 @@ class AdvancedModule(
     fun toggleIperf3(start: Boolean) {
         scope.launch {
             try {
-                if (start) repo.startIperf3() else repo.stopIperf3()
+                if (start) api.startIperf3() else api.stopIperf3()
                 delay(500); loadAdvancedStatus()
             } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "iperf3操作失败: ${e.message}") }
         }
@@ -49,7 +49,7 @@ class AdvancedModule(
 
     fun loadCpuCores() {
         scope.launch {
-            try { _state.value = _state.value.copy(cpuCores = repo.getCpuCores()) }
+            try { _state.value = _state.value.copy(cpuCores = api.getCpuCores()) }
             catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "CPU核心查询失败: ${e.message}") }
         }
     }
@@ -57,8 +57,8 @@ class AdvancedModule(
     fun setCpuCores(enable: Boolean) {
         scope.launch {
             try {
-                repo.setCpuCores(enable); delay(800)
-                val cores = runCatching { repo.getCpuCores() }.getOrNull()
+                api.setCpuCores(mapOf("enable" to enable)); delay(800)
+                val cores = runCatching { api.getCpuCores() }.getOrNull()
                 _state.value = _state.value.copy(cpuCores = cores ?: _state.value.cpuCores, operationMessage = if (enable) "小核已开启" else "小核已关闭")
             } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "CPU核心设置失败: ${e.message}") }
         }
@@ -66,7 +66,7 @@ class AdvancedModule(
 
     fun loadFotaStatus() {
         scope.launch {
-            try { _state.value = _state.value.copy(fotaStatus = repo.getFotaStatus()) }
+            try { _state.value = _state.value.copy(fotaStatus = api.getFotaStatus()) }
             catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "FOTA状态查询失败: ${e.message}") }
         }
     }
@@ -74,7 +74,7 @@ class AdvancedModule(
     fun disableFota() {
         scope.launch {
             try {
-                repo.disableFotaAdvanced(); delay(500); loadFotaStatus()
+                api.disableFotaAdvanced(); delay(500); loadFotaStatus()
                 _state.value = _state.value.copy(operationMessage = "FOTA已禁用")
             } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "FOTA禁用失败: ${e.message}") }
         }
@@ -82,14 +82,14 @@ class AdvancedModule(
 
     fun netAccelerate() {
         scope.launch {
-            try { repo.netAccelerate(); _state.value = _state.value.copy(operationMessage = "网络加速已执行") }
+            try { api.netAccelerate(); _state.value = _state.value.copy(operationMessage = "网络加速已执行") }
             catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "网络加速失败: ${e.message}") }
         }
     }
 
     fun disablePhantomKiller() {
         scope.launch {
-            try { repo.disablePhantomKiller(); _state.value = _state.value.copy(operationMessage = "Phantom Killer已禁用") }
+            try { api.disablePhantomKiller(); _state.value = _state.value.copy(operationMessage = "Phantom Killer已禁用") }
             catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "操作失败: ${e.message}") }
         }
     }
@@ -98,7 +98,7 @@ class AdvancedModule(
     fun loadBandwidthLimit() {
         scope.launch {
             try {
-                val resp = repo.getBandwidthLimit()
+                val resp = api.getBandwidthLimit()
                 val obj = resp.asJsonObject
                 _state.value = _state.value.copy(
                     bandwidthEnabled = obj.get("enabled")?.asBoolean ?: false,
@@ -111,7 +111,7 @@ class AdvancedModule(
     fun setBandwidthLimit(mbit: String) {
         scope.launch {
             try {
-                repo.setBandwidthLimit(mbit)
+                api.setBandwidthLimit(mapOf("mbit" to mbit))
                 delay(500)
                 loadBandwidthLimit()
                 _state.value = _state.value.copy(operationMessage = "带宽限制已设置为 ${mbit}Mbit")
@@ -122,7 +122,7 @@ class AdvancedModule(
     fun removeBandwidthLimit() {
         scope.launch {
             try {
-                repo.removeBandwidthLimit()
+                api.removeBandwidthLimit()
                 delay(300)
                 loadBandwidthLimit()
                 _state.value = _state.value.copy(operationMessage = "带宽限制已解除")

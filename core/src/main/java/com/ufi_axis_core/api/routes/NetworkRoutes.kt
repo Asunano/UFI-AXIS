@@ -1,21 +1,15 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.collector.telephony.TelephonyCollector
+import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.routes.RouteContext
 import com.ufi_axis_core.controller.goform.GoformClient
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.network.NetworkController
-import com.ufi_axis_core.core.database.AppDatabase
+import com.ufi_axis_core.core.cache.CacheTTL
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.ufi_axis_core.api.DataHub
-import com.ufi_axis_core.api.ResponseHelper.toJsonElement
-import com.ufi_axis_core.core.cache.CacheTTL
-import com.ufi_axis_core.core.cache.ResponseCache
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.*
@@ -24,16 +18,19 @@ import kotlinx.serialization.json.*
  * 网络控制路由
  */
 class NetworkRoutes(
-    private val telephonyCollector: TelephonyCollector,
-    private val networkController: NetworkController,
-    private val database: AppDatabase,
-    private val goformClient: GoformClient? = null,
-    private val signalClient: GoformSignalClient? = null,
-    private val networkClient: GoformNetworkClient? = null,
-    private val dataScheduler: com.ufi_axis_core.core.scheduler.DataScheduler? = null,
-    private val cache: ResponseCache? = null,
-    private val dataHub: DataHub? = null
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val telephonyCollector get() = ctx.telephonyCollector
+    private val networkController get() = ctx.networkController
+    private val database get() = ctx.database
+    private val goformClient get() = ctx.goformClient
+    private val signalClient get() = ctx.signalClient
+    private val networkClient get() = ctx.networkClient
+    private val dataScheduler get() = ctx.dataScheduler
+    private val cache get() = ctx.responseCache
+    private val dataHub get() = ctx.dataHub
+
     fun register(route: Route) {
         route.route("/network") {
             // 信号详情 - 统一从 DataScheduler 获取（缓存+三源优先级采集）
@@ -43,12 +40,12 @@ class NetworkRoutes(
                 call.respond(toJsonElement(signal))
             }
 
-            // 信号历史
+            // 信号历史（使用轻量查询，仅 SELECT 需要的列）
             get("/signal/history") {
                 val hoursParam = (call.request.queryParameters["hours"] ?: "24").toIntOrNull() ?: 24
                 val startTime = System.currentTimeMillis() - hoursParam * 60 * 60 * 1000L
                 val records = withContext(Dispatchers.IO) {
-                    database.signalDao().getRecordsSince(startTime)
+                    database.signalDao().getLightweightSince(startTime)
                 }
                 call.respond(toJsonElement(mapOf(
                     "records" to records,
@@ -62,7 +59,10 @@ class NetworkRoutes(
                 // DataHub.getNetworkTypeInfo() 10s TTL 缓存，合并 network_type + provider + ppp_status 为单次 goform 查询
                 val hubInfo = try {
                     dataHub?.getNetworkTypeInfo()
-                } catch (_: Exception) { null }
+                } catch (e: Exception) {
+                    AppLogger.w("NetworkRoutes", "Failed to get network type info: ${e.message}")
+                    null
+                }
 
                 val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
                 val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }

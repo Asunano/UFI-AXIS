@@ -1,11 +1,10 @@
 package com.ufi_axis_core.api.routes
 
-import com.ufi_axis_core.core.database.AppDatabase
-import com.ufi_axis_core.core.scheduler.DataScheduler
+import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.routes.RouteContext
 import io.ktor.server.application.call
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 
 /**
  * 流量统计路由
@@ -14,9 +13,12 @@ import com.ufi_axis_core.api.ResponseHelper.toJsonElement
  * GET /api/traffic/summary   - 流量汇总（优先使用 Goform 月流量数据）
  */
 class TrafficRoutes(
-    private val dataScheduler: DataScheduler,
-    private val database: AppDatabase
+    private val ctx: RouteContext
 ) {
+    // ── 反向兼容 getter ──
+    private val dataScheduler get() = ctx.dataScheduler
+    private val database get() = ctx.database
+
     // 每日基线缓存：记录每天首次查询时的月累计值，用于计算今日流量
     @Volatile private var dailyBaselineDate: String? = null
     @Volatile private var dailyBaselineRx: Long = 0L
@@ -41,11 +43,11 @@ class TrafficRoutes(
                 }
             }
 
-            // 流量历史
+            // 流量历史（使用轻量查询，仅 SELECT 需要的列）
             get("/history") {
                 val hoursParam = (call.request.queryParameters["hours"] ?: "24").toIntOrNull() ?: 24
                 val startTime = System.currentTimeMillis() - hoursParam * 60 * 60 * 1000L
-                val records = database.trafficDao().getRecordsSince(startTime)
+                val records = database.trafficDao().getLightweightSince(startTime)
                 call.respond(toJsonElement(mapOf(
                     "records" to records,
                     "count" to records.size,

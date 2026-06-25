@@ -4,6 +4,8 @@ import com.ufi_axis_core.core.database.AlertDao
 import com.ufi_axis_core.core.database.AlertRecord
 import com.ufi_axis_core.api.websocket.WebSocketManager
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.util.AppSettings
+import kotlinx.serialization.json.Json
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -27,7 +29,8 @@ import kotlinx.serialization.Serializable
  */
 class AlertEngine(
     private val alertDao: AlertDao,
-    private val webSocketManager: WebSocketManager
+    private val webSocketManager: WebSocketManager,
+    private val appSettings: AppSettings
 ) {
     private val tag = "AlertEngine"
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -50,15 +53,33 @@ class AlertEngine(
         val signalCriticalRsrp: Int = -115
     )
 
-    private val _config = MutableStateFlow(AlertConfig())
+    private val _config = MutableStateFlow(loadConfig())
     val config: StateFlow<AlertConfig> = _config
 
     /**
-     * 更新告警配置
+     * 从 SharedPreferences 加载告警配置
+     */
+    private fun loadConfig(): AlertConfig {
+        val json = appSettings.alertConfigJson
+        return if (json != null) {
+            try {
+                Json.decodeFromString<AlertConfig>(json)
+            } catch (e: Exception) {
+                AppLogger.w(tag, "Failed to parse alert config, using defaults: ${e.message}")
+                AlertConfig()
+            }
+        } else {
+            AlertConfig()
+        }
+    }
+
+    /**
+     * 更新告警配置（持久化到 SharedPreferences）
      */
     fun updateConfig(newConfig: AlertConfig) {
         _config.value = newConfig
-        AppLogger.i(tag, "Alert config updated")
+        appSettings.alertConfigJson = Json.encodeToString(AlertConfig.serializer(), newConfig)
+        AppLogger.i(tag, "Alert config updated and persisted")
     }
 
     /**

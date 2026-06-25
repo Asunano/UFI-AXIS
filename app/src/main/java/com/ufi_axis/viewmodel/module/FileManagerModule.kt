@@ -7,10 +7,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import androidx.core.content.ContextCompat
-import com.google.gson.Gson
 import com.google.gson.JsonParser
 import com.ufi_axis.data.api.FileItem
-import com.ufi_axis.data.repository.FileAppRepository
+import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.util.AppGson
+import com.ufi_axis.util.DebugLog
+import com.ufi_axis.util.AppHttpClient
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.state.*
 import kotlinx.coroutines.*
@@ -20,10 +22,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 
 class FileManagerModule(
-    private val repo: FileAppRepository,
+    private val api: UfiAxisApi,
     private val appContext: Context,
     private val scope: CoroutineScope
 ) {
+    private val gson = AppGson.instance
     // ── State ──
     private val _state = MutableStateFlow(FileManagerState())
     val state: StateFlow<FileManagerState> = _state.asStateFlow()
@@ -39,7 +42,7 @@ class FileManagerModule(
     fun checkRootAccess() {
         scope.launch {
             try {
-                val resp = repo.checkRootAccess()
+                val resp = api.checkRootAccess()
                 val hasRoot = resp.hasRoot
                 _state.update { it.copy(
                     rootStatusChecked = true,
@@ -49,8 +52,8 @@ class FileManagerModule(
                 if (!hasRoot) {
                     checkStoragePermission()
                 }
-            } catch (_: Exception) {
-                // 网络错误默认允许访问（后端 fallback 机制仍可工作）
+            } catch (e: Exception) {
+                DebugLog.w("FileManager", "checkRootAccess failed, defaulting to allowed", e)
                 _state.update { it.copy(rootStatusChecked = true) }
             }
         }
@@ -79,7 +82,7 @@ class FileManagerModule(
             _state.update { it.copy(isLoading = true, errorMessage = null, operationMessage = null, pendingProtectedPath = null) }
             try {
                 val force = _state.value.rootMode
-                val resp = repo.listFiles(path, force)
+                val resp = api.listFiles(path, force)
                 if (resp.error == "PROTECTED_PATH") {
                     _state.update { it.copy(isLoading = false, pendingProtectedPath = path) }
                 } else {
@@ -133,7 +136,7 @@ class FileManagerModule(
     // ── File Info / Content ──
     fun getFileInfo(path: String) {
         scope.launch {
-            try { _state.update { it.copy(selectedFile = repo.getFileInfo(path)) } }
+            try { _state.update { it.copy(selectedFile = api.getFileInfo(path)) } }
             catch (e: Exception) { _state.update { it.copy(errorMessage = "获取文件信息失败: ${e.message}") } }
         }
     }
@@ -142,7 +145,7 @@ class FileManagerModule(
 
     fun readFile(path: String) {
         scope.launch {
-            try { _state.update { it.copy(fileContent = repo.readFile(path).content) } }
+            try { _state.update { it.copy(fileContent = api.readFile(mapOf("path" to path)).content) } }
             catch (e: Exception) { _state.update { it.copy(errorMessage = "读取文件失败: ${e.message}") } }
         }
     }
@@ -153,7 +156,7 @@ class FileManagerModule(
     fun deleteFileOrDir(path: String) {
         scope.launch {
             try {
-                val resp = repo.deleteFile(path)
+                val resp = api.deleteFile(mapOf("path" to path))
                 if (resp.success) { refreshFileList(); _state.update { it.copy(operationMessage = "已删除") } }
                 else _state.update { it.copy(errorMessage = "删除失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "删除失败: ${e.message}") } }
@@ -165,7 +168,7 @@ class FileManagerModule(
             try {
                 val parent = oldPath.substringBeforeLast("/")
                 val newPath = "$parent/$newName"
-                val resp = repo.renameFile(oldPath, newPath)
+                val resp = api.renameFile(mapOf("old_path" to oldPath, "new_path" to newPath))
                 if (resp.success) { refreshFileList(); _state.update { it.copy(operationMessage = "已重命名") } }
                 else _state.update { it.copy(errorMessage = "重命名失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "重命名失败: ${e.message}") } }
@@ -186,7 +189,7 @@ class FileManagerModule(
                 for (srcPath in clip.sourcePaths) {
                     val fileName = srcPath.substringAfterLast("/")
                     val destPath = "$destinationDir/$fileName"
-                    val resp = if (clip.isCut) repo.moveFile(srcPath, destPath) else repo.copyFile(srcPath, destPath)
+                    val resp = if (clip.isCut) api.moveFile(mapOf("source" to srcPath, "destination" to destPath)) else api.copyFile(mapOf("source" to srcPath, "destination" to destPath))
                     if (resp.success) successCount++
                 }
                 if (successCount > 0) {
@@ -202,7 +205,7 @@ class FileManagerModule(
     fun createDirectory(path: String) {
         scope.launch {
             try {
-                val resp = repo.createDirectory(path)
+                val resp = api.createDirectory(mapOf("path" to path))
                 if (resp.success) { refreshFileList(); _state.update { it.copy(operationMessage = "已创建文件夹") } }
                 else _state.update { it.copy(errorMessage = "创建文件夹失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "创建文件夹失败: ${e.message}") } }
@@ -213,7 +216,7 @@ class FileManagerModule(
         scope.launch {
             try {
                 val path = "${_state.value.currentPath}/$name"
-                val resp = repo.touchFile(path)
+                val resp = api.touchFile(mapOf("path" to path))
                 if (resp.success) { refreshFileList(); _state.update { it.copy(operationMessage = "已创建文件") } }
                 else _state.update { it.copy(errorMessage = "创建文件失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "创建文件失败: ${e.message}") } }
@@ -223,7 +226,7 @@ class FileManagerModule(
     fun writeFile(path: String, content: String) {
         scope.launch {
             try {
-                val resp = repo.writeFile(path, content)
+                val resp = api.writeFile(mapOf("path" to path, "content" to content))
                 if (resp.success) _state.update { it.copy(operationMessage = "已保存文件", fileContent = null) }
                 else _state.update { it.copy(errorMessage = "保存文件失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "保存文件失败: ${e.message}") } }
@@ -233,7 +236,7 @@ class FileManagerModule(
     fun chmodFile(path: String, mode: String) {
         scope.launch {
             try {
-                val resp = repo.chmodFile(path, mode)
+                val resp = api.chmodFile(mapOf("path" to path, "mode" to mode))
                 if (resp.success) { refreshFileList(); _state.update { it.copy(operationMessage = "权限已修改") } }
                 else _state.update { it.copy(errorMessage = "修改权限失败") }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "修改权限失败: ${e.message}") } }
@@ -244,7 +247,7 @@ class FileManagerModule(
     fun loadDiskUsage() {
         scope.launch {
             try {
-                val raw = repo.getDiskUsage()
+                val raw = api.getDiskUsage()
                 val json = JsonParser.parseString(raw.toString()).asJsonObject
                 val disksArr = json.getAsJsonArray("disks")
                 val volumes = disksArr?.map { disk ->
@@ -273,7 +276,8 @@ class FileManagerModule(
                         files = if (isInitialLoad) emptyList() else _state.value.files,
                         isLoading = if (isInitialLoad) false else _state.value.isLoading) }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                DebugLog.w("FileManager", "loadDiskUsage failed, using fallback", e)
                 val fallback = "/storage/emulated/0"
                 val isInitialLoad = _state.value.currentPath.isEmpty() && _state.value.storageVolumes.isEmpty()
                 _state.update { it.copy(storageRoot = fallback, storageVolumes = listOf(StorageVolume("内部存储", fallback, "", "", "", ""))) }
@@ -286,14 +290,14 @@ class FileManagerModule(
     fun searchFiles(query: String) {
         scope.launch {
             try {
-                val resp = repo.searchFiles(_state.value.currentPath, query)
+                val resp = api.searchFiles(_state.value.currentPath, query)
                 val files = resp.asJsonObject?.getAsJsonArray("files")?.mapNotNull {
                     try {
                         val obj = it.asJsonObject
                         FileItem(name = obj.get("name")?.asString ?: "", path = obj.get("path")?.asString ?: "",
                             isDirectory = obj.get("isDirectory")?.asBoolean ?: false,
                             size = 0, lastModified = 0, permissions = "", isSymlink = false)
-                    } catch (_: Exception) { null }
+                    } catch (e: Exception) { DebugLog.w("FileManager", "searchFiles: failed to parse file item", e); null }
                 } ?: emptyList()
                 _state.update { it.copy(searchResults = files) }
             } catch (e: Exception) { _state.update { it.copy(errorMessage = "搜索失败: ${e.message}") } }
@@ -326,7 +330,7 @@ class FileManagerModule(
             val paths = _state.value.selectedPaths
             if (paths.isEmpty()) return@launch
             var success = 0
-            for (path in paths) { try { if (repo.deleteFile(path).success) success++ } catch (_: Exception) {} }
+            for (path in paths) { try { if (api.deleteFile(mapOf("path" to path)).success) success++ } catch (e: Exception) { DebugLog.w("FileManager", "batchDelete: failed to delete $path", e) } }
             _state.update { it.copy(multiSelectMode = false, selectedPaths = emptySet(), operationMessage = "已删除 $success/${paths.size} 个文件") }
             refreshFileList()
         }
@@ -371,7 +375,7 @@ class FileManagerModule(
                 )
             }
             _state.update { it.copy(phoneDownloadHistory = items) }
-        } catch (_: Exception) {}
+        } catch (e: Exception) { DebugLog.w("FileManager", "loadPhoneDownloadHistory: failed to parse", e) }
     }
 
     private fun savePhoneDownloadHistory(item: PhoneDownloadHistoryItem) {
@@ -391,7 +395,7 @@ class FileManagerModule(
                 arr.add(obj)
             }
             _phoneHistoryPrefs.edit().putString("history", arr.toString()).apply()
-        } catch (_: Exception) {}
+        } catch (e: Exception) { DebugLog.w("FileManager", "savePhoneDownloadHistory: failed to serialize", e) }
     }
 
     fun clearPhoneDownloadHistory() {
@@ -413,10 +417,7 @@ class FileManagerModule(
                     val url = getStreamUrl(path)
                     val partialFile = _downloadPartialFile
                     val existingBytes = if (partialFile != null && partialFile.exists()) partialFile.length() else 0L
-                    val client = okhttp3.OkHttpClient.Builder()
-                        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                        .readTimeout(120, java.util.concurrent.TimeUnit.SECONDS)
-                        .build()
+                    val client = AppHttpClient.instance
                     val requestBuilder = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer ${prefs.token}")
                     if (existingBytes > 0L) requestBuilder.addHeader("Range", "bytes=$existingBytes-")
                     val response = client.newCall(requestBuilder.build()).execute()
@@ -446,7 +447,7 @@ class FileManagerModule(
                                 output.write(buf, 0, n)
                                 bytesDownloaded += n
                                 val now = System.currentTimeMillis()
-                                if (now - lastUpdate > 200) {
+                                if (now - lastUpdate > 500) {
                                     lastUpdate = now
                                     val progress = if (totalSize > 0) (bytesDownloaded.toFloat() / totalSize).coerceIn(0f, 0.99f) else -1f
                                     withContext(Dispatchers.Main) { _state.update { it.copy(downloadProgress = progress, downloadBytes = bytesDownloaded) } }
@@ -515,17 +516,21 @@ class FileManagerModule(
                             if (cursor.moveToFirst()) { val idx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME); if (idx >= 0) cursor.getString(idx) ?: "uploaded_file" else "uploaded_file" } else "uploaded_file"
                         } ?: "uploaded_file"
                         if (!rawName.contains('.')) { val ext = android.webkit.MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType); if (ext != null) "$rawName.$ext" else rawName } else rawName
-                    } catch (_: Exception) { "uploaded_file" }
+                    } catch (e: Exception) { DebugLog.w("FileManager", "upload: failed to resolve file name", e); "uploaded_file" }
                     withContext(Dispatchers.Main) { _state.update { it.copy(uploadFileName = fileName) } }
-                    val totalSize = try { appContext.contentResolver.openFileDescriptor(localUri, "r")?.use { it.statSize } ?: -1L } catch (_: Exception) { -1L }
-                    val client = okhttp3.OkHttpClient.Builder().connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS).writeTimeout(300, java.util.concurrent.TimeUnit.SECONDS).readTimeout(30, java.util.concurrent.TimeUnit.SECONDS).retryOnConnectionFailure(false).build()
+                    val totalSize = try { appContext.contentResolver.openFileDescriptor(localUri, "r")?.use { it.statSize } ?: -1L } catch (e: Exception) { DebugLog.w("FileManager", "upload: failed to get file size", e); -1L }
+                    val client = AppHttpClient.instance
+                    val mediaType = mimeType.toMediaTypeOrNull() ?: "application/octet-stream".toMediaTypeOrNull()!!
+                    // 先复制到临时文件，避免重试时多次打开 ContentProvider
+                    val tempFile = File(appContext.cacheDir, "upload_${System.currentTimeMillis()}_$fileName")
+                    appContext.contentResolver.openInputStream(localUri)?.use { input ->
+                        tempFile.outputStream().use { output -> input.copyTo(output) }
+                    } ?: throw Exception("无法读取文件")
                     fun buildRequestBody(): okhttp3.RequestBody {
-                        val inputStream = appContext.contentResolver.openInputStream(localUri) ?: throw Exception("无法读取文件")
-                        val mediaType = mimeType.toMediaTypeOrNull() ?: "application/octet-stream".toMediaTypeOrNull()!!
                         val fileBody = object : okhttp3.RequestBody() {
                             override fun contentType() = mediaType
                             override fun contentLength() = totalSize
-                            override fun writeTo(sink: okio.BufferedSink) = inputStream.use { input ->
+                            override fun writeTo(sink: okio.BufferedSink) = tempFile.inputStream().use { input ->
                                 val buf = ByteArray(8192); var written = 0L
                                 while (true) { val n = input.read(buf); if (n <= 0) break; sink.write(buf, 0, n); written += n; if (totalSize > 0 && written % 65536 < 8192) _state.update { it.copy(uploadProgress = (written.toFloat() / totalSize).coerceIn(0f, 0.99f)) } }
                             }
@@ -533,14 +538,18 @@ class FileManagerModule(
                         return okhttp3.MultipartBody.Builder().setType(okhttp3.MultipartBody.FORM).addFormDataPart("path", targetDir).addFormDataPart("file", fileName, fileBody).build()
                     }
                     var lastError = ""
-                    for (attempt in 0..2) {
-                        if (attempt > 0) { delay(1500L * attempt); withContext(Dispatchers.Main) { _state.update { it.copy(uploadProgress = 0f) } } }
-                        val request = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer $token").post(buildRequestBody()).build()
-                        val response = client.newCall(request).execute()
-                        if (response.isSuccessful) return@withContext "success:$fileName"
-                        if (response.code == 429 && attempt < 2) { response.close(); continue }
-                        lastError = try { val errBody = response.body?.string() ?: ""; if (errBody.contains("error")) Gson().fromJson(errBody, Map::class.java)["error"]?.toString() ?: "HTTP ${response.code}" else "HTTP ${response.code}" } catch (_: Exception) { "HTTP ${response.code}" }
-                        break
+                    try {
+                        for (attempt in 0..2) {
+                            if (attempt > 0) { delay(1500L * attempt); withContext(Dispatchers.Main) { _state.update { it.copy(uploadProgress = 0f) } } }
+                            val request = okhttp3.Request.Builder().url(url).addHeader("Authorization", "Bearer $token").post(buildRequestBody()).build()
+                            val response = client.newCall(request).execute()
+                            if (response.isSuccessful) return@withContext "success:$fileName"
+                            if (response.code == 429 && attempt < 2) { response.close(); continue }
+                            lastError = try { val errBody = response.body?.string() ?: ""; if (errBody.contains("error")) gson.fromJson(errBody, Map::class.java)["error"]?.toString() ?: "HTTP ${response.code}" else "HTTP ${response.code}" } catch (e: Exception) { DebugLog.w("FileManager", "upload: failed to parse error response", e); "HTTP ${response.code}" }
+                            break
+                        }
+                    } finally {
+                        tempFile.delete()
                     }
                     "error:$lastError"
                 }
@@ -565,7 +574,7 @@ class FileManagerModule(
                 val prefs = AppPreferences(appContext)
                 val url = "http://${prefs.serverIp}:${prefs.serverPort}/api/apps/install"
                 val result = withContext(Dispatchers.IO) {
-                    val client = okhttp3.OkHttpClient.Builder().connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS).readTimeout(120, java.util.concurrent.TimeUnit.SECONDS).build()
+                    val client = AppHttpClient.instance
                     val json = com.google.gson.JsonObject().apply { addProperty("path", path) }
                     val mediaType = "application/json".toMediaTypeOrNull()!!
                     val body = json.toString().toRequestBody(mediaType)

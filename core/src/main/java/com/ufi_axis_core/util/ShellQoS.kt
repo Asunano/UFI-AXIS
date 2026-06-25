@@ -1,6 +1,6 @@
 package com.ufi_axis_core.util
 
-import java.util.concurrent.ConcurrentHashMap
+import java.util.*
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -22,6 +22,7 @@ object ShellQoS {
     private const val NORMAL_PERMITS = 5
     private const val DEFAULT_CACHE_TTL_MS = 2000L
     private const val MAX_CACHE_SIZE = 50  // 缓存硬上限，防止 shell 输出累积
+    private const val MAX_CACHED_OUTPUT_SIZE = 16_384  // 缓存截断上限 16KB，避免大 stdout 撑爆内存
 
     private val rootSemaphore = AdaptiveSemaphore(
         initialPermits = DEFAULT_ROOT_PERMITS, minPermits = 1, maxPermits = 4
@@ -30,8 +31,19 @@ object ShellQoS {
         initialPermits = NORMAL_PERMITS, minPermits = 2, maxPermits = 8
     )
 
-    private val cache = ConcurrentHashMap<String, CacheEntry>()
-    private val batchCache = ConcurrentHashMap<String, BatchCacheItem>()
+    private val cacheLock = Any()
+
+    private val cache = object : LinkedHashMap<String, CacheEntry>(MAX_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CacheEntry>?): Boolean {
+            return size > MAX_CACHE_SIZE
+        }
+    }
+
+    private val batchCache = object : LinkedHashMap<String, BatchCacheItem>(MAX_CACHE_SIZE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, BatchCacheItem>?): Boolean {
+            return size > MAX_CACHE_SIZE
+        }
+    }
 
     @Volatile
     private var cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS
@@ -74,12 +86,17 @@ object ShellQoS {
         command: String,
         timeoutMs: Long = 30_000L
     ): ShellExecutor.ShellResult {
+        val cacheKey = normalizeCommand(command)
         val now = System.currentTimeMillis()
-        cache[command]?.let { entry ->
-            if (now - entry.timestamp < cacheTtlMs) return entry.result
+        synchronized(cacheLock) {
+            cache[cacheKey]?.let { entry ->
+                if (now - entry.timestamp < cacheTtlMs) return entry.result
+            }
         }
         val result = executeAsRoot(command, timeoutMs)
-        cache[command] = CacheEntry(result, now)
+        synchronized(cacheLock) {
+            cache[cacheKey] = CacheEntry(truncateForCache(result), System.currentTimeMillis())
+        }
         pruneExpiredCache()
         return result
     }
@@ -91,12 +108,17 @@ object ShellQoS {
         command: String,
         timeoutMs: Long = 30_000L
     ): ShellExecutor.ShellResult {
+        val cacheKey = normalizeCommand(command)
         val now = System.currentTimeMillis()
-        cache[command]?.let { entry ->
-            if (now - entry.timestamp < cacheTtlMs) return entry.result
+        synchronized(cacheLock) {
+            cache[cacheKey]?.let { entry ->
+                if (now - entry.timestamp < cacheTtlMs) return entry.result
+            }
         }
         val result = execute(command, timeoutMs)
-        cache[command] = CacheEntry(result, now)
+        synchronized(cacheLock) {
+            cache[cacheKey] = CacheEntry(truncateForCache(result), System.currentTimeMillis())
+        }
         pruneExpiredCache()
         return result
     }
@@ -159,13 +181,17 @@ object ShellQoS {
         timeoutMs: Long = 30_000L
     ): BatchResult {
         if (commands.isEmpty()) return BatchResult(emptyList(), emptyList())
-        val cacheKey = "BATCH:" + commands.joinToString("|")
+        val cacheKey = "BATCH:" + commands.sorted().joinToString("|")
         val now = System.currentTimeMillis()
-        batchCache[cacheKey]?.let { entry ->
-            if (now - entry.timestamp < cacheTtlMs) return entry.result
+        synchronized(cacheLock) {
+            batchCache[cacheKey]?.let { entry ->
+                if (now - entry.timestamp < cacheTtlMs) return entry.result
+            }
         }
         val result = batchExecuteAsRoot(commands, timeoutMs)
-        batchCache[cacheKey] = BatchCacheItem(result, now)
+        synchronized(cacheLock) {
+            batchCache[cacheKey] = BatchCacheItem(truncateBatchForCache(result), System.currentTimeMillis())
+        }
         pruneBatchCache(now)
         return result
     }
@@ -293,7 +319,7 @@ object ShellQoS {
     val normalTotalPermits: Int get() = normalSemaphore.totalPermits
 
     /** 缓存条目数 */
-    val cacheSize: Int get() = cache.size
+    val cacheSize: Int get() = synchronized(cacheLock) { cache.size }
 
     /** 当前缓存 TTL */
     val currentCacheTtlMs: Long get() = cacheTtlMs
@@ -311,7 +337,7 @@ object ShellQoS {
         "root_target" to rootSemaphore.target,
         "normal_available" to normalSemaphore.availablePermits,
         "normal_total" to normalSemaphore.totalPermits,
-        "cache_size" to cache.size,
+        "cache_size" to synchronized(cacheLock) { cache.size },
         "cache_ttl_ms" to cacheTtlMs,
         "batch_stats" to mapOf(
             "total_batches" to batchCount.get(),
@@ -351,8 +377,10 @@ object ShellQoS {
 
     /** 清空命令缓存（包括普通缓存和批量缓存） */
     fun clearCache() {
-        cache.clear()
-        batchCache.clear()
+        synchronized(cacheLock) {
+            cache.clear()
+            batchCache.clear()
+        }
     }
 
     /** 重置批量统计计数器 */
@@ -362,6 +390,19 @@ object ShellQoS {
     }
 
     // ==================== 内部方法 ====================
+
+    /**
+     * 标准化缓存 key：去除时间戳等动态参数，标准化空白，提高缓存命中率。
+     *
+     * 处理场景：
+     * - 命令中包含 `_=timestamp` 后缀（如 URL 防缓存参数）
+     * - 多余空白/换行
+     */
+    private fun normalizeCommand(cmd: String): String {
+        return cmd.replace(Regex("_=\\d+"), "")  // 去除 _=timestamp
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
 
     /**
      * 构建批量脚本：命令间插入唯一分隔符用于输出解析
@@ -404,31 +445,45 @@ object ShellQoS {
     }
 
     private fun pruneExpiredCache() {
-        // 硬上限保护：缓存过大时直接清空，避免 shell 输出字符串累积导致内存溢出
-        if (cache.size > MAX_CACHE_SIZE) {
-            cache.clear()
-            return
-        }
         val now = System.currentTimeMillis()
-        val iterator = cache.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (now - entry.value.timestamp > cacheTtlMs) {
-                iterator.remove()
+        synchronized(cacheLock) {
+            val iterator = cache.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value.timestamp > cacheTtlMs) {
+                    iterator.remove()
+                }
             }
         }
     }
 
+    /**
+     * 截断 ShellResult 的 stdout/stderr 再缓存，防止大输出撑爆内存。
+     * 返回截断后的副本，原结果不受影响。
+     */
+    private fun truncateForCache(result: ShellExecutor.ShellResult): ShellExecutor.ShellResult {
+        val stdout = if (result.stdout.length > MAX_CACHED_OUTPUT_SIZE)
+            result.stdout.take(MAX_CACHED_OUTPUT_SIZE) else result.stdout
+        val stderr = if (result.stderr.length > MAX_CACHED_OUTPUT_SIZE)
+            result.stderr.take(MAX_CACHED_OUTPUT_SIZE) else result.stderr
+        return if (stdout !== result.stdout || stderr !== result.stderr)
+            result.copy(stdout = stdout, stderr = stderr) else result
+    }
+
+    /**
+     * 截断 BatchResult 中每条 ShellResult 的输出再缓存。
+     */
+    private fun truncateBatchForCache(result: BatchResult): BatchResult {
+        val truncated = result.results.map { truncateForCache(it) }
+        return if (truncated != result.results) BatchResult(truncated, result.successes) else result
+    }
+
     private fun pruneBatchCache(now: Long) {
-        if (batchCache.size > MAX_CACHE_SIZE) {
-            batchCache.clear()
-            return
-        }
-        val iterator = batchCache.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (now - entry.value.timestamp > cacheTtlMs) {
-                iterator.remove()
+        synchronized(cacheLock) {
+            val iterator = batchCache.entries.iterator()
+            while (iterator.hasNext()) {
+                if (now - iterator.next().value.timestamp > cacheTtlMs) {
+                    iterator.remove()
+                }
             }
         }
     }

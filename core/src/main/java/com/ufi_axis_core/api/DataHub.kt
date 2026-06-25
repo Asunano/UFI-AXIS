@@ -6,10 +6,7 @@ import com.ufi_axis_core.core.cache.CacheTTL
 import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.util.AppLogger
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
-import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 统一请求数据中心（DataHub）
@@ -18,7 +15,6 @@ import java.util.concurrent.ConcurrentHashMap
  * ```
  * Routes ──▶ DataHub ──┬── 实时缓存 (DataScheduler)
  *                       ├── 按需缓存 (ResponseCache)
- *                       ├── 自有泛型缓存 (typedCache)
  *                       └── 透传查询 (signalQuery/wifiQuery)
  *                                  │
  *                                  ▼
@@ -46,7 +42,7 @@ import java.util.concurrent.ConcurrentHashMap
  * ## 新增 goform 查询指南
  * 1. **只透传**（无缓存）→ 路由内直接用 `dataHub.signalQuery { it.getXxx() }`
  * 2. **需要缓存** → 在 DataHub 添加专用方法，选择 CacheTTL 常量
- * 3. **跨路由共享** → 使用 typedGetOrPut 或 ResponseCache.getOrPut
+ * 3. **跨路由共享** → 使用 ResponseCache.getOrPut / getOrPutAny
  */
 class DataHub(
     private val scheduler: DataScheduler,
@@ -56,8 +52,6 @@ class DataHub(
 ) {
     companion object {
         private const val TAG = "DataHub"
-        private const val TYPED_CACHE_MAX_SIZE = 50
-        private const val TYPED_CACHE_PRUNE_RATIO = 0.25f  // 超出时淘汰最旧的 25%%
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -84,18 +78,18 @@ class DataHub(
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * [typedCache 30s] 网络类型信息（运营商、网络制式）—【可缓存数据】
+     * [ResponseCache getOrPutAny 30s] 网络类型信息（运营商、网络制式）—【可缓存数据】
      * 供 NetworkRoutes /status 和 DeviceRoutes /info 共用。
      * goform HTTP 查询可能因路由器固件无响应导致长时间阻塞，使用 withTimeout 保证 5s 内返回。
      */
     suspend fun getNetworkTypeInfo(): GoformNetworkInfo {
-        return typedGetOrPut("hub:network-type-info", 30_000L) {
+        return responseCache.getOrPutAny("hub:network-type-info", 30_000L) {
             val raw = try {
                 kotlinx.coroutines.withTimeout(5_000L) {
                     signalClient.getSignalInfo()
                 }
             } catch (_: Exception) {
-                com.ufi_axis_core.util.AppLogger.w("DataHub", "goform network-type-info query timeout")
+                AppLogger.w("DataHub", "goform network-type-info query timeout")
                 null
             }
             GoformNetworkInfo(
@@ -190,57 +184,8 @@ class DataHub(
 
     /** 网络变更后调用 */
     suspend fun invalidateNetwork() {
-        invalidateTyped("hub:network-type-info")
+        responseCache.invalidateAny("hub:network-type-info")
         responseCache.invalidate("network:*")
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // 内部：泛型 TTL 缓存
-    // ═══════════════════════════════════════════════════════════
-
-    private val typedCache = ConcurrentHashMap<String, TypedCacheEntry<*>>()
-    private val cacheLocks = ConcurrentHashMap<String, Mutex>()
-
-    private data class TypedCacheEntry<T>(val data: T, val timestamp: Long, val ttlMs: Long) {
-        fun isExpired(): Boolean = System.currentTimeMillis() - timestamp > ttlMs
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private suspend fun <T> typedGetOrPut(key: String, ttlMs: Long, fetcher: suspend () -> T): T {
-        val entry = typedCache[key] as? TypedCacheEntry<T>
-        if (entry != null && !entry.isExpired()) return entry.data
-
-        val lock = cacheLocks.computeIfAbsent(key) { Mutex() }
-        return lock.withLock {
-            val recheck = typedCache[key] as? TypedCacheEntry<T>
-            if (recheck != null && !recheck.isExpired()) return@withLock recheck.data
-
-            val data = fetcher()
-            typedCache[key] = TypedCacheEntry(data, System.currentTimeMillis(), ttlMs)
-            pruneTypedCache()
-            data
-        }
-    }
-
-    private fun invalidateTyped(pattern: String) {
-        val regex = pattern.replace("*", ".*").toRegex()
-        typedCache.keys.removeAll { regex.matches(it) }
-        cacheLocks.keys.removeAll { regex.matches(it) }
-    }
-
-    /**
-     * 当 typedCache 超过最大限制时，淘汰最旧的 25%% 条目
-     */
-    private fun pruneTypedCache() {
-        if (typedCache.size <= TYPED_CACHE_MAX_SIZE) return
-        val toRemove = (typedCache.size * TYPED_CACHE_PRUNE_RATIO).toInt().coerceAtLeast(5)
-        val oldestEntries = typedCache.entries
-            .sortedBy { it.value.timestamp }
-            .take(toRemove)
-        for ((key, _) in oldestEntries) {
-            typedCache.remove(key)
-            cacheLocks.remove(key)
-        }
     }
 
     // ═══════════════════════════════════════════════════════════

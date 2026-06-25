@@ -1,12 +1,10 @@
 package com.ufi_axis_core.core.server
 
-import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.middleware.AuthMiddleware
 import com.ufi_axis_core.api.middleware.QoSMiddleware
 import com.ufi_axis_core.api.routes.*
 import com.ufi_axis_core.api.websocket.WebSocketManager
-import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import io.ktor.http.*
@@ -33,6 +31,7 @@ import java.time.Duration
 
 class HttpServer(
     private val port: Int = 8088,
+    private val ctx: RouteContext,
     private val authMiddleware: AuthMiddleware,
     private val qosMiddleware: QoSMiddleware,
     private val webSocketManager: WebSocketManager,
@@ -49,8 +48,8 @@ class HttpServer(
     private val shellRoutes: ShellRoutes,
     private val rootSmsRoutes: RootSmsRoutes,
     private val fileRoutes: FileRoutes,
+    private val dashboardRoutes: DashboardRoutes,
     private val adbRoutes: AdbRoutes? = null,
-    private val dataHub: DataHub? = null,
     private val smsForwardRoutes: SmsForwardRoutes? = null,
     private val taskRoutes: TaskRoutes? = null,
     private val speedTestRoutes: SpeedTestRoutes? = null,
@@ -58,8 +57,7 @@ class HttpServer(
     private val advancedRoutes: AdvancedRoutes? = null,
     private val qosRoutes: QoSRoutes? = null,
     private val monitorRoutes: MonitorRoutes? = null,
-    private val downloadRoutes: DownloadRoutes? = null,
-    private val responseCache: ResponseCache? = null
+    private val downloadRoutes: DownloadRoutes? = null
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB
@@ -186,16 +184,16 @@ class HttpServer(
                 // 缓存管理 — 查看缓存状态和手动清理
                 route("/cache") {
                     get("/stats") {
-                        call.respond(toJsonElement(responseCache?.getStats() ?: mapOf("enabled" to false)))
+                        call.respond(toJsonElement(ctx.responseCache.getStats()))
                     }
                     post("/clear") {
-                        responseCache?.clear()
+                        ctx.responseCache.clear()
                         call.respond(toJsonElement(mapOf("success" to true, "message" to "Cache cleared")))
                     }
                     post("/invalidate") {
                         val p = call.receive<kotlinx.serialization.json.JsonObject>()
                         val pattern = p["pattern"]?.jsonPrimitive?.contentOrNull ?: "*"
-                        responseCache?.invalidate(pattern)
+                        ctx.responseCache.invalidate(pattern)
                         call.respond(toJsonElement(mapOf("success" to true, "pattern" to pattern)))
                     }
                 }
@@ -208,9 +206,9 @@ class HttpServer(
                     // 耗时 shell 操作切到 IO 线程池，避免阻塞 Netty Worker 线程
                     val shellResult = withContext(Dispatchers.IO) {
                         mutableMapOf<String, Any>().apply {
-                            try { put("root", ShellExecutor.executeAsRoot("id").stdout.contains("uid=0")) } catch (_: Exception) { put("root", false) }
-                            try { put("adbd", ShellExecutor.executeAsRoot("getprop init.svc.adbd").stdout.trim()) } catch (_: Exception) { put("adbd", "unknown") }
-                            try { put("mobile_data", ShellExecutor.executeAsRoot("settings get global mobile_data").stdout.trim()) } catch (_: Exception) { put("mobile_data", "unknown") }
+                            try { put("root", ShellExecutor.executeAsRoot("id").stdout.contains("uid=0")) } catch (e: Exception) { AppLogger.w("HttpServer", "Diagnose root check failed: ${e.message}"); put("root", false) }
+                            try { put("adbd", ShellExecutor.executeAsRoot("getprop init.svc.adbd").stdout.trim()) } catch (e: Exception) { AppLogger.w("HttpServer", "Diagnose adbd check failed: ${e.message}"); put("adbd", "unknown") }
+                            try { put("mobile_data", ShellExecutor.executeAsRoot("settings get global mobile_data").stdout.trim()) } catch (e: Exception) { AppLogger.w("HttpServer", "Diagnose mobile_data check failed: ${e.message}"); put("mobile_data", "unknown") }
                             try {
                                 var gw = ""
                                 val ipRoute = ShellExecutor.execute("ip route 2>/dev/null | grep default").stdout
@@ -220,7 +218,7 @@ class HttpServer(
                                 if (gw.isBlank()) gw = ShellExecutor.execute("getprop dhcp.wlan.gateway 2>/dev/null").stdout.trim()
                                 if (gw.isBlank()) gw = "192.168.0.1"
                                 put("gateway", gw)
-                            } catch (_: Exception) { put("gateway", "unknown") }
+                            } catch (e: Exception) { AppLogger.w("HttpServer", "Diagnose gateway check failed: ${e.message}"); put("gateway", "unknown") }
                         }
                     }
                     diag.putAll(shellResult)
@@ -240,6 +238,7 @@ class HttpServer(
                 appRoutes.register(this)
                 shellRoutes.register(this)
                 fileRoutes.register(this)
+                dashboardRoutes.register(this)
                 adbRoutes?.register(this)
                 smsForwardRoutes?.register(this)
                 taskRoutes?.register(this)

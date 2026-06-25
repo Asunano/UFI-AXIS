@@ -1,21 +1,22 @@
 package com.ufi_axis.viewmodel.module
 
 import android.content.Context
-import com.google.gson.Gson
 import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import com.google.gson.JsonObject
-import com.ufi_axis.data.repository.NetworkRepository
-import com.ufi_axis.data.repository.WifiLanRepository
+import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.ModeRequest
+import com.ufi_axis.util.AppGson
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
+import okhttp3.Request
+import com.ufi_axis.util.AppHttpClient
 import com.ufi_axis.viewmodel.state.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
 class NetworkModule(
-    private val networkRepo: NetworkRepository,
-    private val wifiLanRepo: WifiLanRepository,
+    private val api: UfiAxisApi,
     private val appContext: Context,
     private val scope: CoroutineScope
 ) {
@@ -29,22 +30,26 @@ class NetworkModule(
     private val _speedTestState = MutableStateFlow(SpeedTestState())
     val speedTestState: StateFlow<SpeedTestState> = _speedTestState.asStateFlow()
 
-    // ── Callbacks ──
-    var onDashboardRefresh: (() -> Unit)? = null
-    var onDashboardError: ((String?) -> Unit)? = null
+    // ── Cross-module Events ──
+    private val _events = MutableSharedFlow<UiEvent>()
+    val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
-    private val gson = Gson()
+    private val gson = AppGson.instance
+
+    private fun emitDashboardError(msg: String?) {
+        _events.tryEmit(UiEvent.ShowDashboardError(msg))
+    }
 
     // ── Network ──
     fun refreshNetwork() {
         scope.launch {
             _networkState.value = _networkState.value.copy(isLoading = true, errorMessage = null)
             try {
-                val sig = async { runCatching { networkRepo.getSignalInfo() } }
-                val net = async { runCatching { networkRepo.getNetworkStatus() } }
-                val sim = async { runCatching { networkRepo.getSimInfo() } }
-                val wifi = async { runCatching { wifiLanRepo.getWifiSettings() } }
-                val clients = async { runCatching { wifiLanRepo.getWifiClients() } }
+                val sig = async { runCatching { api.getSignalInfo() } }
+                val net = async { runCatching { api.getNetworkStatus() } }
+                val sim = async { runCatching { api.getSimInfo() } }
+                val wifi = async { runCatching { api.getWifiSettings() } }
+                val clients = async { runCatching { api.getWifiClients() } }
 
                 val rSig = sig.await(); val rNet = net.await(); val rSim = sim.await()
                 val rWifi = wifi.await(); val rClients = clients.await()
@@ -77,7 +82,7 @@ class NetworkModule(
     fun toggleMobileData(enabled: Boolean) {
         scope.launch {
             _networkState.value = _networkState.value.copy(isLoading = true, errorMessage = null)
-            try { networkRepo.setMobileData(enabled); delay(1500); refreshNetwork() }
+            try { api.setMobileData(mapOf("enabled" to enabled)); waitForNetworkReady(); refreshNetwork() }
             catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "操作失败: ${e.message}", isLoading = false) }
         }
     }
@@ -85,9 +90,9 @@ class NetworkModule(
     fun toggleAirplaneMode(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = networkRepo.setAirplaneMode(enabled)
+                val resp = api.setAirplaneMode(mapOf("enabled" to enabled))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "操作失败")
-                delay(1000); onDashboardRefresh?.invoke(); refreshNetwork()
+                waitForNetworkReady(); refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "操作失败: ${e.message}") }
         }
     }
@@ -95,9 +100,9 @@ class NetworkModule(
     fun setNetworkMode(mode: String) {
         scope.launch {
             try {
-                val resp = networkRepo.setNetworkMode(mode)
+                val resp = api.setNetworkMode(ModeRequest(mode))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "设置失败")
-                delay(1000); refreshNetwork()
+                waitForNetworkReady(); refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "设置失败: ${e.message}") }
         }
     }
@@ -107,14 +112,18 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = if (lteBands == null && nrBands == null) {
-                    networkRepo.setBandLockCombined(null, null, "unlock")
+                    api.setBandLock(buildMap { put("action", "unlock") })
                 } else {
-                    networkRepo.setBandLockCombined(lteBands, nrBands, "lock")
+                    api.setBandLock(buildMap {
+                        if (!lteBands.isNullOrBlank()) put("lte_bands", lteBands)
+                        if (!nrBands.isNullOrBlank()) put("nr_bands", nrBands)
+                        if (lteBands.isNullOrBlank() && nrBands.isNullOrBlank()) put("action", "unlock")
+                    })
                 }
                 if (!resp.success) {
                     _networkState.value = _networkState.value.copy(errorMessage = "锁频失败")
                 } else {
-                    delay(800)
+                    waitForNetworkReady()
                     loadBandStatus()
                 }
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "锁频失败: ${e.message}") }
@@ -124,7 +133,7 @@ class NetworkModule(
     fun loadBandStatus() {
         scope.launch {
             try {
-                _networkState.update { it.copy(bandStatus = networkRepo.getBandStatus(), loadVersion = System.currentTimeMillis()) }
+                _networkState.update { it.copy(bandStatus = api.getBandStatus(), loadVersion = System.currentTimeMillis()) }
             } catch (e: Exception) {
                 _networkState.update { it.copy(errorMessage = "频段状态加载失败: ${e.message}") }
             }
@@ -135,7 +144,7 @@ class NetworkModule(
         scope.launch {
             _deviceSettingsState.update { it.copy(isLoading = true, loadVersion = System.currentTimeMillis()) }
             try {
-                _deviceSettingsState.update { DeviceSettingsState(settings = wifiLanRepo.getDeviceSettings(), loadVersion = System.currentTimeMillis()) }
+                _deviceSettingsState.update { DeviceSettingsState(settings = api.getDeviceSettings(), loadVersion = System.currentTimeMillis()) }
             }
             catch (e: Exception) { _deviceSettingsState.update { it.copy(errorMessage = "加载设备设置失败: ${e.message}", isLoading = false) } }
         }
@@ -144,7 +153,7 @@ class NetworkModule(
     fun setBearerPreference(preference: String) {
         scope.launch {
             try {
-                val resp = networkRepo.setBearerPreference(preference)
+                val resp = api.setBearerPreference(mapOf("preference" to preference))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "设置失败")
                 refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "设置失败: ${e.message}") }
@@ -154,10 +163,10 @@ class NetworkModule(
     fun connectNetwork() {
         scope.launch {
             try {
-                val resp = networkRepo.connectNetwork()
+                val resp = api.connectNetwork()
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "连接失败")
                 else _networkState.value = _networkState.value.copy(errorMessage = null)
-                delay(2000); refreshNetwork()
+                waitForNetworkReady(); refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "连接失败: ${e.message}") }
         }
     }
@@ -165,10 +174,10 @@ class NetworkModule(
     fun disconnectNetwork() {
         scope.launch {
             try {
-                val resp = networkRepo.disconnectNetwork()
+                val resp = api.disconnectNetwork()
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "断开失败")
                 else _networkState.value = _networkState.value.copy(errorMessage = null)
-                delay(2000); refreshNetwork()
+                delay(500); refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "断开失败: ${e.message}") }
         }
     }
@@ -176,7 +185,7 @@ class NetworkModule(
     fun setConnectionMode(mode: String) {
         scope.launch {
             try {
-                val resp = networkRepo.setConnectionMode(mode)
+                val resp = api.setConnectionMode(mapOf("mode" to mode))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "设置失败")
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "设置失败: ${e.message}") }
         }
@@ -193,7 +202,7 @@ class NetworkModule(
                 // 根据时长动态计算 chunks：按 ~10MB/s 基线估算，确保数据量覆盖测试时长
                 // chunks=1 → 1MB，coerceIn 保证至少 10MB、最多 1024MB(=1GB)
                 val chunks = (maxDurationSec * 10).coerceIn(10, 1024)
-                responseBody = networkRepo.speedTest(chunks)
+                responseBody = api.speedTest(chunks)
                 val buf = ByteArray(8192)
                 var totalBytes = 0L
                 val deadlineMs = start + maxDurationSec * 1000L
@@ -213,7 +222,7 @@ class NetworkModule(
             } catch (e: Exception) {
                 _speedTestState.value = SpeedTestState(errorMessage = "内网测速失败: ${e.message}", testType = "internal")
             } finally {
-                try { responseBody?.close() } catch (_: Exception) {}
+                try { responseBody?.close() } catch (e: Exception) { DebugLog.w("NetworkModule", "Failed to close speedtest response body: ${e.message}") }
             }
         }
     }
@@ -222,20 +231,17 @@ class NetworkModule(
     fun runExternalSpeedTest(url: String = "https://speedtest.tele2.net/100MB.zip", maxDurationSec: Int = 15) {
         scope.launch(Dispatchers.IO) {
             _speedTestState.value = SpeedTestState(isRunning = true, testType = "external")
-            var connection: java.net.HttpURLConnection? = null
+            var response: okhttp3.Response? = null
             var input: java.io.InputStream? = null
             try {
                 val start = android.os.SystemClock.elapsedRealtime()
-                connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                connection.connectTimeout = 10_000
-                connection.readTimeout = (maxDurationSec + 5) * 1000
-                connection.requestMethod = "GET"
-                connection.connect()
-                if (connection.responseCode != 200) throw Exception("HTTP ${connection.responseCode}")
+                val request = Request.Builder().url(url).build()
+                response = AppHttpClient.instance.newCall(request).execute()
+                if (!response.isSuccessful) throw Exception("HTTP ${response.code}")
                 val buf = ByteArray(8192)
                 var totalBytes = 0L
                 val deadlineMs = start + maxDurationSec * 1000L
-                input = connection.inputStream
+                input = response!!.body!!.byteStream()
                 while (isActive && android.os.SystemClock.elapsedRealtime() < deadlineMs) {
                     val bytesRead = input.read(buf)
                     if (bytesRead == -1) break
@@ -251,8 +257,8 @@ class NetworkModule(
             } catch (e: Exception) {
                 _speedTestState.value = SpeedTestState(errorMessage = "外网测速失败: ${e.message}", testType = "external")
             } finally {
-                try { input?.close() } catch (_: Exception) {}
-                try { connection?.disconnect() } catch (_: Exception) {}
+                try { input?.close() } catch (e: Exception) { DebugLog.w("NetworkModule", "Failed to close speedtest input stream: ${e.message}") }
+                try { response?.close() } catch (e: Exception) { DebugLog.w("NetworkModule", "Failed to close speedtest response: ${e.message}") }
             }
         }
     }
@@ -260,21 +266,21 @@ class NetworkModule(
     // ── Cell ──
     fun loadCellInfo() {
         scope.launch {
-            try { _networkState.update { it.copy(cellInfo = networkRepo.getCellInfo(), loadVersion = System.currentTimeMillis()) } }
+            try { _networkState.update { it.copy(cellInfo = api.getCellInfo(), loadVersion = System.currentTimeMillis()) } }
             catch (e: Exception) { _networkState.update { it.copy(errorMessage = "基站信息查询失败: ${e.message}") } }
         }
     }
 
     fun cellLock(pci: String, earfcn: String, rat: String) {
         scope.launch {
-            try { networkRepo.cellLock(pci, earfcn, rat); delay(500); loadCellInfo() }
+            try { api.cellLock(mapOf("pci" to pci, "earfcn" to earfcn, "rat" to rat)); delay(500); loadCellInfo() }
             catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "锁基站失败: ${e.message}") }
         }
     }
 
     fun unlockAllCell() {
         scope.launch {
-            try { networkRepo.unlockAllCell(); delay(500); loadCellInfo() }
+            try { api.unlockAllCell(); delay(500); loadCellInfo() }
             catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "解锁基站失败: ${e.message}") }
         }
     }
@@ -283,7 +289,7 @@ class NetworkModule(
     fun loadLanSettings() {
         scope.launch {
             _networkState.update { it.copy(errorMessage = null, loadVersion = System.currentTimeMillis()) }
-            try { _networkState.update { it.copy(lanSettings = wifiLanRepo.getLanSettings(), loadVersion = System.currentTimeMillis()) } }
+            try { _networkState.update { it.copy(lanSettings = api.getLanSettings(), loadVersion = System.currentTimeMillis()) } }
             catch (e: Exception) { _networkState.update { it.copy(errorMessage = "LAN设置查询失败: ${e.message}") } }
         }
     }
@@ -291,7 +297,7 @@ class NetworkModule(
     fun setDhcpSetting(lanIp: String, lanNetmask: String, dhcpType: String, dhcpStart: String, dhcpEnd: String, dhcpLease: String) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+                val resp = api.setDhcpSetting(mapOf("lan_ip" to lanIp, "lan_netmask" to lanNetmask, "dhcp_type" to dhcpType, "dhcp_start" to dhcpStart, "dhcp_end" to dhcpEnd, "dhcp_lease" to dhcpLease))
                 if (resp.success) { delay(500); loadLanSettings() }
                 else _networkState.value = _networkState.value.copy(errorMessage = "DHCP设置失败")
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "DHCP设置失败: ${e.message}") }
@@ -301,7 +307,7 @@ class NetworkModule(
     // ── Blacklist ──
     fun loadBlacklist() {
         scope.launch {
-            try { _networkState.update { it.copy(blacklistInfo = wifiLanRepo.getAccessControl(), loadVersion = System.currentTimeMillis()) } }
+            try { _networkState.update { it.copy(blacklistInfo = api.getAccessControl(), loadVersion = System.currentTimeMillis()) } }
             catch (e: Exception) { _networkState.update { it.copy(errorMessage = "黑名单查询失败: ${e.message}") } }
         }
     }
@@ -309,14 +315,14 @@ class NetworkModule(
     fun blockDevice(mac: String, name: String) {
         scope.launch {
             try {
-                val current = wifiLanRepo.getAccessControl()
-                val json = try { current.asJsonObject } catch (_: Exception) { com.google.gson.JsonObject() }
+                val current = api.getAccessControl()
+                val json = try { current.asJsonObject } catch (e: Exception) { DebugLog.w("Network", "Failed to parse access control JSON for blockDevice", e); com.google.gson.JsonObject() }
                 val existingMacs = (json.get("BlackMacList")?.asString ?: "").split(";").filter { it.isNotBlank() }
                 val existingNames = (json.get("BlackNameList")?.asString ?: "").split(";").filter { it.isNotBlank() }
                 val aclMode = json.get("AclMode")?.asString ?: "2"
                 val newMacs = if (mac in existingMacs) existingMacs else listOf(mac) + existingMacs
                 val newNames = if (name in existingNames) existingNames else listOf(name) + existingNames
-                wifiLanRepo.setAccessControl(aclMode, newMacs.joinToString(";"), newNames.joinToString(";"))
+                api.setAccessControl(mapOf("acl_mode" to aclMode, "mac_list" to newMacs.joinToString(";"), "name_list" to newNames.joinToString(";")))
                 loadBlacklist()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "拉黑失败: ${e.message}") }
         }
@@ -325,14 +331,14 @@ class NetworkModule(
     fun unblockDevice(mac: String, name: String) {
         scope.launch {
             try {
-                val current = wifiLanRepo.getAccessControl()
-                val json = try { current.asJsonObject } catch (_: Exception) { com.google.gson.JsonObject() }
+                val current = api.getAccessControl()
+                val json = try { current.asJsonObject } catch (e: Exception) { DebugLog.w("Network", "unblockDevice: failed to parse access control JSON", e); com.google.gson.JsonObject() }
                 val existingMacs = (json.get("BlackMacList")?.asString ?: "").split(";").filter { it.isNotBlank() }
                 val existingNames = (json.get("BlackNameList")?.asString ?: "").split(";").filter { it.isNotBlank() }
                 val aclMode = json.get("AclMode")?.asString ?: "2"
                 val newMacs = existingMacs.filter { it != mac }
                 val newNames = existingNames.filter { it != name }
-                wifiLanRepo.setAccessControl(aclMode, newMacs.joinToString(";"), newNames.joinToString(";"))
+                api.setAccessControl(mapOf("acl_mode" to aclMode, "mac_list" to newMacs.joinToString(";"), "name_list" to newNames.joinToString(";")))
                 loadBlacklist()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "解除拉黑失败: ${e.message}") }
         }
@@ -341,7 +347,7 @@ class NetworkModule(
     fun setAccessControl(aclMode: String, macList: String = "") {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setAccessControl(aclMode, macList)
+                val resp = api.setAccessControl(mapOf("acl_mode" to aclMode, "mac_list" to macList, "name_list" to ""))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "访问控制设置失败")
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "访问控制设置失败: ${e.message}") }
         }
@@ -351,99 +357,99 @@ class NetworkModule(
     fun rebootDevice() {
         scope.launch {
             try {
-                val resp = wifiLanRepo.rebootDevice()
-                if (resp.success) onDashboardError?.invoke("设备正在重启...")
-                else onDashboardError?.invoke("重启失败")
-            } catch (e: Exception) { onDashboardError?.invoke("重启失败: ${e.message}") }
+                val resp = api.rebootDevice()
+                if (resp.success) emitDashboardError("设备正在重启...")
+                else emitDashboardError("重启失败")
+            } catch (e: Exception) { emitDashboardError("重启失败: ${e.message}") }
         }
     }
 
     fun factoryReset() {
         scope.launch {
-            try { wifiLanRepo.factoryReset() }
-            catch (e: Exception) { onDashboardError?.invoke("恢复出厂失败: ${e.message}") }
+            try { api.factoryReset() }
+            catch (e: Exception) { emitDashboardError("恢复出厂失败: ${e.message}") }
         }
     }
 
     fun shutdownDevice() {
         scope.launch {
             try {
-                val resp = wifiLanRepo.shutdownDevice()
-                if (resp.success) onDashboardError?.invoke("设备正在关机...")
-                else onDashboardError?.invoke("关机失败")
-            } catch (e: Exception) { onDashboardError?.invoke("关机失败: ${e.message}") }
+                val resp = api.shutdownDevice()
+                if (resp.success) emitDashboardError("设备正在关机...")
+                else emitDashboardError("关机失败")
+            } catch (e: Exception) { emitDashboardError("关机失败: ${e.message}") }
         }
     }
 
     fun setDeviceMode(enabled: Boolean) {
         scope.launch {
-            try { wifiLanRepo.setDeviceMode(enabled) }
-            catch (e: Exception) { onDashboardError?.invoke("ADB调试设置失败: ${e.message}") }
+            try { api.setDeviceMode(mapOf("enabled" to enabled)) }
+            catch (e: Exception) { emitDashboardError("ADB调试设置失败: ${e.message}") }
         }
     }
 
     fun setUsbMode(mode: Int) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setUsbMode(mode)
-                if (!resp.success) onDashboardError?.invoke("USB模式切换失败")
-            } catch (e: Exception) { onDashboardError?.invoke("USB模式切换失败: ${e.message}") }
+                val resp = api.setUsbMode(mapOf("mode" to mode))
+                if (!resp.success) emitDashboardError("USB模式切换失败")
+            } catch (e: Exception) { emitDashboardError("USB模式切换失败: ${e.message}") }
         }
     }
 
     fun changePassword(oldPwd: String, newPwd: String) {
         scope.launch {
-            try { wifiLanRepo.changePassword(oldPwd, newPwd) }
-            catch (e: Exception) { onDashboardError?.invoke("修改密码失败: ${e.message}") }
+            try { api.changePassword(mapOf("old_password" to oldPwd, "new_password" to newPwd)) }
+            catch (e: Exception) { emitDashboardError("修改密码失败: ${e.message}") }
         }
     }
 
     fun setHostname(mac: String, hostname: String) {
         scope.launch {
-            try { wifiLanRepo.setHostname(mac, hostname) }
-            catch (e: Exception) { onDashboardError?.invoke("主机名设置失败: ${e.message}") }
+            try { api.setHostname(mapOf("mac" to mac, "hostname" to hostname)) }
+            catch (e: Exception) { emitDashboardError("主机名设置失败: ${e.message}") }
         }
     }
 
     // ── WiFi Config ──
     fun setWifiConfig(config: Map<String, Any>) {
         scope.launch {
-            try { wifiLanRepo.setWifiConfig(config) }
-            catch (e: Exception) { onDashboardError?.invoke("WiFi设置失败: ${e.message}") }
+            try { api.setWifiConfig(config) }
+            catch (e: Exception) { emitDashboardError("WiFi设置失败: ${e.message}") }
         }
     }
 
     fun setWifiAdvConfig(config: Map<String, Any>) {
         scope.launch {
-            try { wifiLanRepo.setWifiAdvConfig(config) }
-            catch (e: Exception) { onDashboardError?.invoke("WiFi高级设置失败: ${e.message}") }
+            try { api.setWifiAdvConfig(config) }
+            catch (e: Exception) { emitDashboardError("WiFi高级设置失败: ${e.message}") }
         }
     }
 
     fun setWifiPower(level: Int) {
         scope.launch {
-            try { wifiLanRepo.setWifiPower(level) }
-            catch (e: Exception) { onDashboardError?.invoke("功率设置失败: ${e.message}") }
+            try { api.setWifiPower(mapOf("level" to level)) }
+            catch (e: Exception) { emitDashboardError("功率设置失败: ${e.message}") }
         }
     }
 
     fun setWifiGuest(config: Map<String, Any>) {
         scope.launch {
-            try { wifiLanRepo.setWifiGuest(config) }
-            catch (e: Exception) { onDashboardError?.invoke("访客WiFi设置失败: ${e.message}") }
+            try { api.setWifiGuest(config) }
+            catch (e: Exception) { emitDashboardError("访客WiFi设置失败: ${e.message}") }
         }
     }
 
     fun setApnConfig(config: Map<String, Any>) {
         scope.launch {
-            try { wifiLanRepo.setApnConfig(config) }
-            catch (e: Exception) { onDashboardError?.invoke("APN设置失败: ${e.message}") }
+            try { api.setApnConfig(config) }
+            catch (e: Exception) { emitDashboardError("APN设置失败: ${e.message}") }
         }
     }
 
     fun loadApnConfig(onResult: (JsonElement?) -> Unit) {
         scope.launch {
-            try { onResult(wifiLanRepo.getApnConfig()) }
+            try { onResult(api.getApnConfig()) }
             catch (e: Exception) {
                 _networkState.value = _networkState.value.copy(errorMessage = "APN配置加载失败: ${e.message}")
                 onResult(null)
@@ -454,10 +460,10 @@ class NetworkModule(
     fun deleteApnProfile(index: Int, onResult: (Boolean) -> Unit) {
         scope.launch {
             try {
-                wifiLanRepo.deleteApnProfile(index)
+                api.deleteApnProfile(index)
                 onResult(true)
             } catch (e: Exception) {
-                onDashboardError?.invoke("删除APN失败: ${e.message}")
+                emitDashboardError("删除APN失败: ${e.message}")
                 onResult(false)
             }
         }
@@ -466,10 +472,10 @@ class NetworkModule(
     fun switchApnProfile(index: Int, onResult: (Boolean) -> Unit) {
         scope.launch {
             try {
-                wifiLanRepo.switchApn(index)
+                api.switchApn(mapOf("index" to index))
                 onResult(true)
             } catch (e: Exception) {
-                onDashboardError?.invoke("切换APN失败: ${e.message}")
+                emitDashboardError("切换APN失败: ${e.message}")
                 onResult(false)
             }
         }
@@ -477,15 +483,15 @@ class NetworkModule(
 
     fun setTr069Config(config: Map<String, Any>) {
         scope.launch {
-            try { wifiLanRepo.setTr069Config(config) }
-            catch (e: Exception) { onDashboardError?.invoke("TR-069设置失败: ${e.message}") }
+            try { api.setTr069Config(config) }
+            catch (e: Exception) { emitDashboardError("TR-069设置失败: ${e.message}") }
         }
     }
 
     // ── Enhanced Device Settings ──
     fun setWifiEnabled(enabled: Boolean) {
         scope.launch {
-            try { wifiLanRepo.setWifiEnabled(enabled); delay(1000); refreshNetwork() }
+            try { api.setWifiEnabled(mapOf("enabled" to enabled)); waitForNetworkReady(); refreshNetwork() }
             catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "WiFi开关失败: ${e.message}") }
         }
     }
@@ -493,7 +499,7 @@ class NetworkModule(
     fun setFotaDisabled(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setFotaDisabled(enabled)
+                val resp = api.setFotaDisabled(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "FOTA设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "FOTA设置失败: ${e.message}") }
@@ -503,7 +509,7 @@ class NetworkModule(
     fun setPerformanceMode(mode: String) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setPerformanceMode(mode)
+                val resp = api.setPerformanceMode(mapOf("mode" to mode))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "性能模式设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "性能模式设置失败: ${e.message}") }
@@ -513,7 +519,7 @@ class NetworkModule(
     fun setLedEnabled(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setLedEnabled(enabled)
+                val resp = api.setLedEnabled(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "指示灯设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "指示灯设置失败: ${e.message}") }
@@ -523,7 +529,7 @@ class NetworkModule(
     fun setRoamingEnabled(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setRoamingEnabled(enabled)
+                val resp = api.setRoamingEnabled(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "漫游设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "漫游设置失败: ${e.message}") }
@@ -533,7 +539,7 @@ class NetworkModule(
     fun setUsbTethering(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setUsbTethering(enabled)
+                val resp = api.setUsbTethering(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "USB共享设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "USB共享设置失败: ${e.message}") }
@@ -544,7 +550,7 @@ class NetworkModule(
         scope.launch {
             try {
                 AppPreferences(appContext).preferredWifiChip = chip
-                wifiLanRepo.switchWifiChip(chip); delay(3000); refreshNetwork()
+                api.switchWifiChip(mapOf("chip" to chip)); waitForNetworkReady(); refreshNetwork()
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "WiFi频段切换失败: ${e.message}") }
         }
     }
@@ -555,10 +561,10 @@ class NetworkModule(
                 val prefs = AppPreferences(appContext)
                 val preferred = prefs.preferredWifiChip
                 if (preferred.isBlank()) return@launch
-                val settings = wifiLanRepo.getWifiSettings()
+                val settings = api.getWifiSettings()
                 val parsed = parseWifiSettings(settings)
                 if (parsed.activeChip.isBlank()) return@launch
-                if (parsed.activeChip != preferred) { wifiLanRepo.switchWifiChip(preferred); delay(2000); refreshNetwork() }
+                if (parsed.activeChip != preferred) { api.switchWifiChip(mapOf("chip" to preferred)); waitForNetworkReady(); refreshNetwork() }
             } catch (e: Exception) {
                 DebugLog.w("Network", "restoreWifiChipPreference failed: ${e.message}")
             }
@@ -568,7 +574,7 @@ class NetworkModule(
     fun setWifiNfc(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setWifiNfc(enabled)
+                val resp = api.setWifiNfc(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "NFC设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "NFC设置失败: ${e.message}") }
@@ -578,7 +584,7 @@ class NetworkModule(
     fun setWifiSleep(time: String) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setWifiSleep(time)
+                val resp = api.setWifiSleep(mapOf("time" to time))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "WiFi休眠设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "WiFi休眠设置失败: ${e.message}") }
@@ -588,7 +594,7 @@ class NetworkModule(
     fun setSambaSetting(enabled: Boolean) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setSambaSetting(enabled)
+                val resp = api.setSambaSetting(mapOf("enabled" to enabled))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "Samba设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "Samba设置失败: ${e.message}") }
@@ -598,7 +604,7 @@ class NetworkModule(
     fun setRestartSchedule(enabled: Boolean, time: String) {
         scope.launch {
             try {
-                val resp = wifiLanRepo.setRestartSchedule(enabled, time)
+                val resp = api.setRestartSchedule(mapOf("enabled" to enabled, "time" to time))
                 if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "定时重启设置失败")
                 else { delay(500); loadDeviceSettings() }
             } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "定时重启设置失败: ${e.message}") }
@@ -609,11 +615,24 @@ class NetworkModule(
     fun resetTelephony(onResult: suspend (Boolean, String) -> Unit = { _, _ -> }) {
         scope.launch {
             try {
-                val resp = networkRepo.resetTelephony()
+                val resp = api.resetTelephony()
                 onResult(resp.success, if (resp.success) "Telephony 已重置，请等待 SIM 重新识别" else "重置失败: exit_code=${resp.exit_code}")
             } catch (e: Exception) {
                 onResult(false, "重置失败: ${e.message}")
             }
+        }
+    }
+
+    // ── 轮询等待网络就绪，替代 hardcoded delay ──
+    /** 轮询网络状态，等待蜂窝数据连接恢复，替代不可靠的固定 delay */
+    private suspend fun waitForNetworkReady(maxWaitMs: Long = 5000) {
+        val deadline = System.currentTimeMillis() + maxWaitMs
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val status = api.getNetworkStatus()
+                if (status.isCellularConnected) return
+            } catch (_: Exception) {}
+            delay(500)
         }
     }
 
@@ -636,9 +655,9 @@ class NetworkModule(
     private fun refreshNetworkLight() {
         scope.launch {
             try {
-                val sig = async { runCatching { networkRepo.getSignalInfo() } }
-                val net = async { runCatching { networkRepo.getNetworkStatus() } }
-                val band = async { runCatching { networkRepo.getBandStatus() } }
+                val sig = async { runCatching { api.getSignalInfo() } }
+                val net = async { runCatching { api.getNetworkStatus() } }
+                val band = async { runCatching { api.getBandStatus() } }
                 val rSig = sig.await(); val rNet = net.await(); val rBand = band.await()
 
                 val failures = listOfNotNull(
@@ -663,8 +682,8 @@ class NetworkModule(
     private fun refreshWifiOnly() {
         scope.launch {
             try {
-                val wifi = async { runCatching { wifiLanRepo.getWifiSettings() } }
-                val clients = async { runCatching { wifiLanRepo.getWifiClients() } }
+                val wifi = async { runCatching { api.getWifiSettings() } }
+                val clients = async { runCatching { api.getWifiClients() } }
                 val rWifi = wifi.await(); val rClients = clients.await()
 
                 val failures = listOfNotNull(
@@ -691,7 +710,7 @@ class NetworkModule(
     private fun refreshSimOnly() {
         scope.launch {
             try {
-                _networkState.update { it.copy(simInfo = networkRepo.getSimInfo()) }
+                _networkState.update { it.copy(simInfo = api.getSimInfo()) }
             } catch (e: Exception) {
                 _networkState.update { it.copy(errorMessage = "SIM信息刷新失败: ${e.message}") }
             }
@@ -704,8 +723,7 @@ class NetworkModule(
 // ZTE goform 的嵌套字符串 (如 queryAccessPointInfo 内的 ResponseList)
 // 已在服务器端解析并展开为平铺字段，客户端无需再做解包。
 
-@Suppress("DEPRECATION")
-private val _parseGson = com.google.gson.GsonBuilder().setLenient().create()
+private val _parseGson = AppGson.instance
 
 /** WiFi 设置解析结果（服务器 GET /api/wifi/settings 平铺字段） */
 data class WifiParsed(
@@ -749,7 +767,8 @@ fun parseWifiSettings(raw: JsonElement?): WifiParsed {
             || obj.safeGetString("wifi_enable") == "1"
 
         WifiParsed(ssid, passphrase, chip, enabled)
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        DebugLog.w("Network", "parseWifiSettings failed", e)
         WifiParsed()
     }
 }
@@ -784,13 +803,14 @@ fun parseWifiClients(raw: JsonElement?): WifiClientsParsed {
                     val s = value.asString
                     if (s.startsWith("[")) _parseGson.fromJson(s, JsonArray::class.java) else null
                 } else null
-            } catch (_: Exception) { null }
+            } catch (e: Exception) { DebugLog.w("Network", "parseArrayField failed", e); null }
         }
         WifiClientsParsed(
             stationList = parseArrayField("station_list"),
             lanStationList = parseArrayField("lan_station_list")
         )
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        DebugLog.w("Network", "parseWifiClients failed", e)
         WifiClientsParsed(null, null)
     }
 }
@@ -834,7 +854,7 @@ fun parseCurrentBand(cellInfo: JsonElement?): String? {
                 ?.split(",")?.firstOrNull { it.isNotBlank() }
             if (!lteBand.isNullOrBlank()) "B$lteBand" else null
         }
-    } catch (_: Exception) { null }
+    } catch (e: Exception) { DebugLog.w("Network", "parseCurrentBand failed", e); null }
 }
 
 fun parseBandStatus(raw: JsonElement?): BandStatusParsed {
@@ -845,7 +865,8 @@ fun parseBandStatus(raw: JsonElement?): BandStatusParsed {
             lteBandLock = obj.safeGetString("lte_band_lock") ?: "",
             nrBandLock = obj.safeGetString("nr_band_lock") ?: ""
         )
-    } catch (_: Exception) {
+    } catch (e: Exception) {
+        DebugLog.w("Network", "parseBandStatus failed", e)
         BandStatusParsed()
     }
 }
@@ -865,7 +886,7 @@ fun parseDeviceSettingsField(raw: JsonElement?, vararg keys: String): String? {
             if (v != null) return v
         }
         null
-    } catch (_: Exception) { null }
+    } catch (e: Exception) { DebugLog.w("Network", "parseDeviceSettingsField failed", e); null }
 }
 
 // ── 安全 JSON 取值辅助（使用 Java 原生 API，避免 Kotlin 扩展版本兼容问题） ──
@@ -875,5 +896,5 @@ private fun JsonObject.safeGetString(key: String): String? {
     return try {
         val el = get(key) ?: return null
         if (el.isJsonPrimitive) el.getAsJsonPrimitive().getAsString() else null
-    } catch (_: Exception) { null }
+    } catch (e: Exception) { DebugLog.w("Network", "safeGetString failed for key=$key", e); null }
 }

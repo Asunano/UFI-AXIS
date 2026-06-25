@@ -7,6 +7,7 @@ import com.ufi_axis.data.model.WebSocketMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -17,8 +18,9 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import com.ufi_axis.util.AppGson
 import com.ufi_axis.util.DebugLog
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
 
 class WebSocketRepository(
     private val baseUrl: String,
@@ -26,18 +28,22 @@ class WebSocketRepository(
 ) {
     private var webSocket: WebSocket? = null
     private val client = OkHttpClient.Builder()
-        .pingInterval(15, TimeUnit.SECONDS)
         .build()
-    private val gson = Gson()
+    private val gson = AppGson.instance
+    val sharedGson: Gson get() = gson
 
-    private val _messages = MutableSharedFlow<WebSocketMessage>(replay = 1)
+    // 增加 buffer 容量 + DROP_OLDEST 策略，防止下游处理慢时 emit 挂起
+    // extraBufferCapacity=64 可缓存约 64 条消息，DROP_OLDEST 丢弃最早消息避免 OOM
+    private val _messages = MutableSharedFlow<WebSocketMessage>(
+        replay = 1, extraBufferCapacity = 64, onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     val messages: SharedFlow<WebSocketMessage> = _messages
 
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     val connectionState: StateFlow<ConnectionState> = _connectionState
 
-    private val _cachedData = MutableStateFlow<Map<String, WebSocketMessage>>(emptyMap())
-    val cachedData: StateFlow<Map<String, WebSocketMessage>> = _cachedData
+    private val _cachedData = ConcurrentHashMap<String, WebSocketMessage>()
+    val cachedData: Map<String, WebSocketMessage> get() = _cachedData
 
     /** data_changed 事件流 — 精准增量刷新的数据源 */
     private val _dataChanged = MutableSharedFlow<String>(replay = 0)
@@ -53,7 +59,7 @@ class WebSocketRepository(
         _connectionState.value = ConnectionState.CONNECTING
 
         val request = Request.Builder()
-            .url("$baseUrl/ws/realtime?token=$token")
+            .url("$baseUrl/ws/realtime")
             .addHeader("Authorization", "Bearer $token")
             .build()
 
@@ -70,7 +76,7 @@ class WebSocketRepository(
                 scope.launch {
                     try {
                         val message = gson.fromJson(text, WebSocketMessage::class.java)
-                        _cachedData.value = _cachedData.value + (message.type to message)
+                        _cachedData[message.type] = message
                         _messages.emit(message)
                         // 解析 data_changed 事件 → 精准增量刷新
                         if (message.type == "data_changed") {
