@@ -1,0 +1,129 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 3,
+    "identityHash": "v3_placeholder",
+    "entities": [
+      {
+        "tableName": "traffic_records",
+        "createSql": "CREATE TABLE IF NOT EXISTS `traffic_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `rxBytes` INTEGER NOT NULL, `txBytes` INTEGER NOT NULL, `rxSpeed` INTEGER NOT NULL, `txSpeed` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "rxBytes", "columnName": "rxBytes", "affinity": "INTEGER", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "txBytes", "columnName": "txBytes", "affinity": "INTEGER", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "rxSpeed", "columnName": "rxSpeed", "affinity": "INTEGER", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "txSpeed", "columnName": "txSpeed", "affinity": "INTEGER", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 5, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "signal_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `signal_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `rsrp` INTEGER NOT NULL, `sinr` INTEGER NOT NULL, `rsrq` INTEGER NOT NULL, `rssi` INTEGER NOT NULL, `rat` TEXT NOT NULL, `operator` TEXT NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "rsrp", "columnName": "rsrp", "affinity": "INTEGER", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "sinr", "columnName": "sinr", "affinity": "INTEGER", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "rsrq", "columnName": "rsrq", "affinity": "INTEGER", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "rssi", "columnName": "rssi", "affinity": "INTEGER", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "rat", "columnName": "rat", "affinity": "TEXT", "notNull": true, "pos": 5, "defaultValue": "undefined"},
+          {"fieldPath": "operator", "columnName": "operator", "affinity": "TEXT", "notNull": true, "pos": 6, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 7, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "alert_records",
+        "createSql": "CREATE TABLE IF NOT EXISTS `alert_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `type` TEXT NOT NULL, `level` TEXT NOT NULL, `message` TEXT NOT NULL, `value` TEXT NOT NULL, `threshold` TEXT NOT NULL, `acknowledged` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "type", "columnName": "type", "affinity": "TEXT", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "level", "columnName": "level", "affinity": "TEXT", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "message", "columnName": "message", "affinity": "TEXT", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "value", "columnName": "value", "affinity": "TEXT", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "threshold", "columnName": "threshold", "affinity": "TEXT", "notNull": true, "pos": 5, "defaultValue": "undefined"},
+          {"fieldPath": "acknowledged", "columnName": "acknowledged", "affinity": "INTEGER", "notNull": true, "pos": 6, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 7, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "cpu_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `cpu_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `usagePercent` REAL NOT NULL, `coreCount` INTEGER NOT NULL, `maxFreqMhz` REAL NOT NULL, `temperature` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "usagePercent", "columnName": "usagePercent", "affinity": "REAL", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "coreCount", "columnName": "coreCount", "affinity": "INTEGER", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "maxFreqMhz", "columnName": "maxFreqMhz", "affinity": "REAL", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "temperature", "columnName": "temperature", "affinity": "REAL", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 5, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "sms_records",
+        "createSql": "CREATE TABLE IF NOT EXISTS `sms_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `direction` TEXT NOT NULL, `phoneNumber` TEXT NOT NULL, `content` TEXT NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "direction", "columnName": "direction", "affinity": "TEXT", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "phoneNumber", "columnName": "phoneNumber", "affinity": "TEXT", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "content", "columnName": "content", "affinity": "TEXT", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 4, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "memory_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `memory_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `total` INTEGER NOT NULL, `used` INTEGER NOT NULL, `available` INTEGER NOT NULL, `usagePercent` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "total", "columnName": "total", "affinity": "INTEGER", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "used", "columnName": "used", "affinity": "INTEGER", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "available", "columnName": "available", "affinity": "INTEGER", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "usagePercent", "columnName": "usagePercent", "affinity": "REAL", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 5, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      },
+      {
+        "tableName": "battery_history",
+        "createSql": "CREATE TABLE IF NOT EXISTS `battery_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `level` INTEGER NOT NULL, `isCharging` INTEGER NOT NULL, `temperature` REAL NOT NULL, `voltage` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+        "fields": [
+          {"fieldPath": "id", "columnName": "id", "affinity": "INTEGER", "notNull": true, "pos": 0, "defaultValue": "undefined"},
+          {"fieldPath": "level", "columnName": "level", "affinity": "INTEGER", "notNull": true, "pos": 1, "defaultValue": "undefined"},
+          {"fieldPath": "isCharging", "columnName": "isCharging", "affinity": "INTEGER", "notNull": true, "pos": 2, "defaultValue": "undefined"},
+          {"fieldPath": "temperature", "columnName": "temperature", "affinity": "REAL", "notNull": true, "pos": 3, "defaultValue": "undefined"},
+          {"fieldPath": "voltage", "columnName": "voltage", "affinity": "REAL", "notNull": true, "pos": 4, "defaultValue": "undefined"},
+          {"fieldPath": "timestamp", "columnName": "timestamp", "affinity": "INTEGER", "notNull": true, "pos": 5, "defaultValue": "undefined"}
+        ],
+        "primaryKey": {"autoGenerate": true, "columnNames": ["id"], "pos": 0},
+        "indices": [],
+        "foreignKeys": []
+      }
+    ],
+    "views": [],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS `traffic_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `rxBytes` INTEGER NOT NULL, `txBytes` INTEGER NOT NULL, `rxSpeed` INTEGER NOT NULL, `txSpeed` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `signal_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `rsrp` INTEGER NOT NULL, `sinr` INTEGER NOT NULL, `rsrq` INTEGER NOT NULL, `rssi` INTEGER NOT NULL, `rat` TEXT NOT NULL, `operator` TEXT NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `alert_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `type` TEXT NOT NULL, `level` TEXT NOT NULL, `message` TEXT NOT NULL, `value` TEXT NOT NULL, `threshold` TEXT NOT NULL, `acknowledged` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `cpu_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `usagePercent` REAL NOT NULL, `coreCount` INTEGER NOT NULL, `maxFreqMhz` REAL NOT NULL, `temperature` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `sms_records` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `direction` TEXT NOT NULL, `phoneNumber` TEXT NOT NULL, `content` TEXT NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `memory_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `total` INTEGER NOT NULL, `used` INTEGER NOT NULL, `available` INTEGER NOT NULL, `usagePercent` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS `battery_history` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `level` INTEGER NOT NULL, `isCharging` INTEGER NOT NULL, `temperature` REAL NOT NULL, `voltage` REAL NOT NULL, `timestamp` INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'v3_placeholder')"
+    ]
+  }
+}

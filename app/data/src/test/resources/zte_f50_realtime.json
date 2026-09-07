@@ -1,0 +1,9 @@
+{
+  "rx_speed": "1048576",
+  "tx_speed": "524288",
+  "realtime_rx_bytes": "2097152",
+  "realtime_tx_bytes": "1048576",
+  "realtime_rx_thrpt": "524288",
+  "realtime_tx_thrpt": "262144",
+  "realtime_time": "1717000050"
+}

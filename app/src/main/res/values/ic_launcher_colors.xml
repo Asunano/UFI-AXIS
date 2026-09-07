@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Launcher icon colours. Kept as plain resources, not ui.theme tokens: the
+  launcher renders this icon with no Compose composition in scope, and the
+  icon must not change when the in-app theme preset changes.
+
+  :app  = dark glyph on near-white   |   :core = inverted
+  Both stay above 4.5:1 so the glyph reads at 48dp.
+-->
+<resources>
+    <color name="ic_launcher_background">#F8FAFC</color>
+    <color name="ic_launcher_glyph">#1E293B</color>
+</resources>

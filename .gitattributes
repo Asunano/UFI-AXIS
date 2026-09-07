@@ -1,0 +1,58 @@
+# =============================================================================
+# UFI-AXIS .gitattributes
+#
+# 为什么需要它：本机 `core.autocrlf = true`（Windows 默认），意味着"入库转 LF、
+# 签出转 CRLF"这件事由**每台机器的本地配置**决定。仓库一公开，Linux/macOS 协作者
+# 的 autocrlf 是 false/input，同一个文件在两边被判定的换行不一致，就会刷出
+# 「整文件 diff」——每行都变了，实际什么都没改，review 与 blame 双双失效。
+# .gitattributes 把规则钉在**仓库里**，压过所有本地配置，一次性消除这类噪音。
+#
+# 改动本文件后需执行一次：`git add --renormalize .`（把索引里的内容按新规则重写；
+# 库里本来就是 LF，所以这一步不会产生真实 diff）。
+# =============================================================================
+
+# 默认：由 git 嗅探是否文本；判定为文本的一律 **LF 存库、LF 签出**。
+* text=auto eol=lf
+
+# ── 必须 CRLF：Windows 命令解释器对 LF 的行为不可靠 ──
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# ── 必须 LF：要在 Linux / 设备侧被 sh 执行 ──
+gradlew text eol=lf
+*.sh text eol=lf
+
+# ── 二进制：禁止任何换行转换，也不参与文本 diff ──
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.jar binary
+*.apk binary
+*.aab binary
+*.so binary
+*.zip binary
+*.keystore binary
+*.jks binary
+# Windows PE 可执行 / 动态库（scripts/UFI-AXIS-Core-install 的 adb.exe 与两个 DLL）。
+# 与下面那组无扩展名二进制同一个道理：text=auto 的嗅探对 PE 基本不会误判，但一旦误判，
+# 换行转换会静默改坏文件，而症状只会在用户机器上出现。显式声明省这份心。
+*.exe binary
+*.dll binary
+
+# core 随 APK 打进设备的预编译 ARM 可执行文件：**没有扩展名**，只能按路径显式声明。
+# 不声明就得依赖 text=auto 的内容嗅探（靠是否含 NUL 字节判断），一旦误判成文本，
+# 换行转换会把可执行文件改坏，且症状是"设备上执行报 Exec format error"，极难联想到 git。
+core/src/main/assets/shell/adb binary
+core/src/main/assets/shell/aria2c binary
+core/src/main/assets/shell/curl binary
+core/src/main/assets/shell/jq binary
+core/src/main/assets/shell/socat binary
+core/src/main/assets/shell/ttyd binary
+
+# ── GitHub 展示：生成物不计入语言统计、默认折叠 diff ──
+web/package-lock.json linguist-generated=true

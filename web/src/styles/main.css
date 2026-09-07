@@ -1,0 +1,159 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* 语义化 CSS 变量 — 由 Naive UI 主题覆盖，Tailwind 通过变量引用 */
+  --page-bg: #f5f7fa;
+  --card-bg: #ffffff;
+  --text-primary: #1a1a1a;
+  --text-secondary: #666666;
+  --text-muted: #999999;
+  --border-subtle: #e8e8e8;
+
+  /* 功能色 */
+  --accent-color: #2080f0;
+  --accent-color-light: rgba(32, 128, 240, 0.08);
+  --success: #18a058;
+  --warning: #f0a020;
+  --error: #d03050;
+  --info: #2080f0;
+
+  /* 表面色 */
+  --surface-hover: rgba(0, 0, 0, 0.03);
+  --surface-elevated: #fafafa;
+
+  /* 圆角 */
+  --radius-sm: 6px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  /* 胶囊：此前存在 999px 与 20px 两套写法，统一到这里 */
+  --radius-pill: 999px;
+
+  /* ── 间距阶梯 ──
+     现状是 482 处硬编码 px、9 档取值（含 2/3/6/10/14px 这些非 4 倍数杂值）。
+     这里只保留 4 的倍数六档，杂值故意不给变量 —— 新代码没有"顺手抄一个 10px"的出口。
+     不回填已有字面量（决策 D1，对齐 Android 侧不回填 dp 的决定），只卡增量。 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+
+  /* ── 字号阶梯 ──
+     现状 12 档，其中 12px(85 处) 与 13px(83 处) 混用在同层级正文上，是最大的不一致源。
+     定 --font-base=13px 为正文，12px 降级为 --font-sm（密集区/次要信息）。
+     同样只卡增量，不回填。 */
+  --font-xs: 11px;
+  --font-sm: 12px;
+  --font-base: 13px;
+  --font-md: 14px;
+  --font-lg: 16px;
+  --font-xl: 20px;
+  --font-2xl: 26px;
+}
+
+/* 深色模式变量 — 通过 Naive UI NConfigProvider 的 theme 切换 */
+.dark {
+  --page-bg: #101014;
+  --card-bg: #1a1a20;
+  --text-primary: #e0e0e0;
+  --text-secondary: #999999;
+  --text-muted: #666666;
+  --border-subtle: #2a2a30;
+
+  --accent-color-light: rgba(32, 128, 240, 0.12);
+  --surface-hover: rgba(255, 255, 255, 0.04);
+  --surface-elevated: #222228;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  background-color: var(--page-bg);
+  color: var(--text-primary);
+}
+
+/* 滚动条 — 细窄不干扰 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 统一主内容区背景，让浅灰背景铺满顶栏以下的整块区域。
+   Naive UI 的 n-layout 把背景色画在 CSS 变量 --n-color 上，而这个变量是以**内联 style**
+   写在元素上的（`style="--n-color:#fff"`），n-layout-scroll-container 又继承它 ——
+   所以只改 background-color 会被内联变量重新算回白色，必须直接覆盖变量本身。
+   变量只写在 .main-content 上：顶栏 .n-layout-header 是它的兄弟节点，不受影响，
+   仍保持主题自带的白色/深色以形成层次。
+   布局侧由 DefaultLayout 的 .main-content{flex:1} 保证高度撑满，滚动容器透明即可透出该背景。 */
+.main-content {
+  --n-color: var(--page-bg) !important;
+  background-color: var(--page-bg) !important;
+}
+
+.main-content .n-layout-scroll-container {
+  background-color: transparent !important;
+}
+
+/* ── 断点约定（2026-09-05）──
+   全站只用三档，新代码不要再引入第四个数值：
+     max-width: 768px   → 单列 / 移动形态（侧栏转抽屉的同一阈值，见 DefaultLayout 的 isMobile）
+     max-width: 1024px  → 双列降级为单列（侧栏自动收起的同一阈值，见 NARROW_BREAKPOINT）
+     max-height: 720px  → 矮视口压缩（笔记本 768p / 浏览器缩放 / 分屏）
+   退役：settings 各面板原先各写一份 max-width:900px，与上面两档都不重合，
+   导致 900–1024 之间设置页仍双列而仪表盘/网络/监控已单列。现已统一到 1024。 */
+
+/* ── 设置类分栏的卡片栅格 ──
+   settings/panels 下 8 个面板都用这一种「auto-fit 卡片栅格 + full-width 通栏」，
+   原先 8 份 scoped 拷贝逐字相同（含 8 份 media query）。提到全局只留一份：
+   改栅格/改断点只需动这里。scoped 组件里用这个类名不受 scope 影响（scope 只作用于组件自己声明的选择器）。
+   注意：MonitorView 里语义不同的同名类已改名为 .monitor-prefs。 */
+.settings-panel {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.settings-panel > .full-width {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 1024px) {
+  .settings-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── 卡片底部动作区 ──
+   settings 的 General / Service / Performance / Update 四个面板原先各写一份
+   `display:flex; justify-content:flex-end; margin-top:12px`，四份都漏了 gap ——
+   所以「检查更新 / 上传更新 / 恢复内置 / 回滚」这些按钮是紧贴在一起的。
+   提到全局只留一份并补上 gap：改间距只需动这里，新面板也自动拿到正确的排布。
+   flex-wrap 是给窄屏的：四个按钮排不下时换行，而不是把卡片挤出横向滚动条。 */
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}

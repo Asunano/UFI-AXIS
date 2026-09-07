@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Launcher icon colours, identical to :app — the two APKs are told apart by the
+  "Core" badge in the foreground vector, not by colour.
+  Kept as plain resources, not ui.theme tokens: the launcher renders this icon
+  with no Compose composition in scope.
+-->
+<resources>
+    <color name="ic_launcher_background">#F8FAFC</color>
+    <color name="ic_launcher_glyph">#1E293B</color>
+</resources>

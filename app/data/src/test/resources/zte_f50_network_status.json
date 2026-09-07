@@ -1,0 +1,12 @@
+{
+  "network": {
+    "is_connected": true,
+    "has_internet": true,
+    "has_cellular": true,
+    "has_wifi": false
+  },
+  "mobile_data": true,
+  "ppp_status": "ppp_connected",
+  "operator": "中国移动",
+  "network_type": "LTE"
+}

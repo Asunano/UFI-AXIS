@@ -1,0 +1,104 @@
+# =============================================================================
+# UFI-AXIS .gitignore
+# 原则：宽泛通配符（*.txt / *.ps1 / fix_* 等）一律限定在仓库根目录（前缀 /），
+#       避免误伤子模块源码；确需入库的文件用 ! 显式取反。
+# =============================================================================
+
+# ── Gradle / 构建产物 ────────────────────────────────────────────────────────
+.gradle/
+build/
+# 重命名备份的构建目录（build.old / build.old1 / build.old-<时间戳>）
+build.old*/
+*.apk
+*.aab
+*.aar
+*.jar
+*.dex
+*.class
+*.hprof
+# Gradle Wrapper jar 必须入库，否则 clone 后 ./gradlew 与 CI 全部失败
+!gradle/wrapper/gradle-wrapper.jar
+# 本地 JDK 探测结果，随机器而异
+gradle/gradle-daemon-jvm.properties
+# Kotlin 增量编译缓存
+.kotlin/
+
+# ── 本地 Gradle User Home / 临时解包目录（体积巨大，切勿入库）────────────────
+.ghome*/
+.cli-gradle/
+.m3tmp/
+
+# ── IDE ─────────────────────────────────────────────────────────────────────
+*.iml
+*.ipr
+*.iws
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+# 编辑器带 PID 后缀的备份（如 ThemeManager.kt~10352，~ 不在末尾）
+*~*
+
+# ── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+# Windows 保留设备名误生成的垃圾文件（物理删除需 shell 特殊语法）
+/nul
+
+# ── Android ─────────────────────────────────────────────────────────────────
+local.properties
+/captures/
+.externalNativeBuild/
+.cxx/
+
+# ── 签名密钥（严禁入库）─────────────────────────────────────────────────────
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+# 本地签名 init 脚本（含 keystore 路径/别名配置，勿入库）
+init-signing*.gradle
+
+# ── 前端 ──────────────────────────────────────────────────────────────────
+# web/ 子项目另有自己的 .gitignore（已忽略 dist/、node_modules/）。
+# core/src/main/assets/web/ 由 core:network 的 copyWebDist 任务（Sync）从 web/dist
+# 镜像生成，是构建产物，切勿入库。
+# ⚠ Sync 语义 = 目标目录与 web/dist 完全一致，手工放进去的文件下次构建会被删除；
+#   需要内置的静态资源请放 web/public/。
+core/src/main/assets/web/
+node_modules/
+*.tsbuildinfo
+
+# ── 日志 / 调试产物 ─────────────────────────────────────────────────────────
+*.log
+logs_pull/
+generated-images/
+
+# ── 仓库根的临时脚本 / 补丁 / 文本（仅根目录，避免误伤源码）─────────────────
+/*.ps1
+/*.txt
+/*.diff
+/*.patch
+/*.orig
+/*.rej
+/fix_*
+/patch_*
+
+# ── 助手 / 工具工作区与本地文档产物 ─────────────────────────────────────────
+.codebuddy/
+.workbuddy/
+# AI 助手工作区：评审方案、临时日志/脚本等本地文档，不属于源码（docs/ 已收录项目文档，随仓库提交）
+.comate/
+design/
+deliverables/
+
+# ── 打包 / 抓取产物（仅根目录）───────────────────────────────────────────────
+# web-x.y.z.zip 等发布包由 CI 或 package-web 脚本生成，不入库
+/*.zip
+# 设备端界面 dump，调试用的一次性抓取产物
+/ui_main.xml
+
+# ── 参考项目（外部代码，非本仓库内容）───────────────────────────────────────
+UFI-TOOLS-REF/
+ufi-ui-kit/

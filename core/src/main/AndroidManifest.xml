@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 网络权限 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+
+    <!-- 电话/网络信息 -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
+
+    <!-- 位置（Android 12+ CellInfo 采集需要） -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- 短信 -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- 存储（文件管理需要） -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+
+    <!-- 系统信息 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 流量统计（NetworkStatsManager 需要，需用户在设置中授权） -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+
+    <!-- APK 安装（PackageInstaller API 静默安装，系统应用自动授权） -->
+    <uses-permission android:name="android.permission.INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- 包可见性（Android 11+）：应用列表经 shell pm 可见全部包，而 App 进程 PackageManager
+         受可见性过滤，部分包 getApplicationInfo 抛 NameNotFoundException → 详情 404。
+         设备管理工具声明全量查询权限，对齐两种视图。 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+
+    <application
+        android:name=".UfiAxisCoreApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.UFIAXISCore">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.UFIAXISCore"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="设置"
+            android:theme="@style/Theme.UFIAXISCore" />
+
+        <!-- 后端前台服务 -->
+        <service
+            android:name=".service.BackendService"
+            android:exported="true"
+            android:stopWithTask="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 开机广播接收器 -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="true"
+            android:directBootAware="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- APK 安装接收器：接收 PackageInstaller session commit 结果回调 -->
+        <receiver
+            android:name=".service.InstallReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.ufi_axis_core.action.INSTALL_RESULT" />
+            </intent-filter>
+        </receiver>
+
+        <!-- APK 安装服务：接收 am startservice 请求，在 app 进程内通过 PackageInstaller API 安装。
+             比 am broadcast 更可靠（某些 ROM 的 am broadcast exit=255）。
+             IntentService 天然在后台线程执行，不阻塞主线程。 -->
+        <service
+            android:name=".service.InstallService"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.ufi_axis_core.action.INSTALL_APK" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>

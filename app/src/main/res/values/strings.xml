@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">UFI-AXIS</string>
+    <!-- 2026-08-10 无障碍保活服务描述（系统「无障碍」设置页展示；明确不读取任何窗口内容） -->
+    <string name="accessibility_notify_guard_description">通知守护保活（UFI-AXIS 后台通知守护）。仅用于保活，不读取任何窗口内容。</string>
+</resources>

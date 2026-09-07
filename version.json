@@ -1,0 +1,49 @@
+{
+  "frontend": {
+    "version": "0.0.1",
+    "versionCode": 1,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
+  },
+  "backend": {
+    "version": "0.0.1",
+    "versionCode": 1,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
+  },
+  "web": {
+    "version": "0.0.1",
+    "versionCode": 1,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": ""
+  },
+  "components": {
+    "frpc": {
+      "upstream": "fatedier/frp",
+      "version": "0.71.0",
+      "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_linux_arm64.tar.gz",
+      "sha256": "f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266",
+      "size": 12375716,
+      "archive": "tar.gz",
+      "entry": "frpc"
+    },
+    "cloudflared": {
+      "upstream": "cloudflare/cloudflared",
+      "version": "2026.8.3",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.8.3/cloudflared-linux-arm64",
+      "sha256": "4bcfd35521a7cbc545ebfd5d57334a71ee180e2a64874981f374c81472118391",
+      "size": 37382432,
+      "archive": "raw",
+      "entry": ""
+    }
+  }
+}

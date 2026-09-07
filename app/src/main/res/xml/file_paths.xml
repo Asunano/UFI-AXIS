@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="cache" path="." />
+    <files-path name="files" path="." />
+    <!-- 2026-08-10 C5：前端 App 更新 APK 存放目录 filesDir/update/（供系统安装器读取） -->
+    <files-path name="update" path="update/" />
+</paths>

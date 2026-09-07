@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "limit_value": "470",
+  "limit_unit_display": "GB",
+  "limit_bytes": 504658657280,
+  "data_volume_alert_percent": "90",
+  "auto_clear": false,
+  "clear_date": "5",
+  "monthly_rx_bytes": "123456789012",
+  "monthly_tx_bytes": "9876543210",
+  "monthly_time": "1717000000",
+  "used_bytes": "133333332222",
+  "unknown_firmware_field": "DROP_ME"
+}

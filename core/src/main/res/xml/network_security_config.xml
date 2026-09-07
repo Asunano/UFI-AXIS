@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    允许对 localhost 的明文 HTTP 通信。
+    aria2 JSON-RPC 运行在 127.0.0.1:6801，使用 HTTP（非 HTTPS），
+    Android 9+ (API 28+) 默认禁止明文流量，需要显式放行。
+-->
+<network-security-config>
+    <!-- 允许访问本机 aria2 RPC -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

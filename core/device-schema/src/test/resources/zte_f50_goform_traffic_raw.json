@@ -1,0 +1,13 @@
+{
+  "_note": "设备原始 goform 响应形状（TRAFFIC_LIMIT 分组）。手写自 ZteGoformProfile 登记的 source 名，2026-08-29 建。对侧夹具：app/data/src/test/resources/zte_f50_firmware_traffic.json 是 core 响应形状（canonical 键），两份的数字刻意一致（470 GB / 504658657280 / 90%）。改任一侧要同时改另一侧。本键未登记，会被 allowlist 丢掉。注意 wan_auto_clear_flow_data_switch 是 on/off 编码（与漫游同组），归一化后才变成 1/0。",
+  "data_volume_limit_switch": "1",
+  "data_volume_limit_size": "470_1024",
+  "data_volume_limit_unit": "data",
+  "data_volume_alert_percent": "90",
+  "wan_auto_clear_flow_data_switch": "off",
+  "traffic_clear_date": "5",
+  "monthly_rx_bytes": "123456789012",
+  "monthly_tx_bytes": "9876543210",
+  "monthly_time": "1717000000",
+  "unknown_firmware_field": "DROP_ME"
+}

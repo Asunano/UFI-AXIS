@@ -1,0 +1,93 @@
+# =============================================================================
+# UFI-AXIS CI Build（Debug）工作流
+# =============================================================================
+# 每次 push / PR 时编译 :core 与 :app 的 debug APK，并校验 version.json 与
+# gradle 默认版本一致（单一版本源约定：发版只改根目录 version.json）。
+#
+# 注意：
+#   - JDK 21 + SDK 36（与 release.yml 完全一致，已验证步骤照抄）。
+#   - 只跑 assembleDebug（不跑 release/签名，签名由 release.yml 负责）。
+#   - 若 version.json 双对象与 gradle.properties 的 ufiFrontendVersionName/ufiBackendVersionName 不一致 → fail，
+#     提示先改 version.json（单一版本源）。
+# =============================================================================
+
+name: CI Build (debug)
+
+on:
+  push:
+    branches: ['*']
+    tags-ignore: ['v*']
+  pull_request:
+
+jobs:
+  build:
+    name: Build Debug APKs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ── Web 前端依赖（:core:network:buildWeb 需要 vue-tsc/vite，CI 全新 checkout 无 node_modules）──
+      - name: Set up Node.js (web build)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: cd web && npm ci
+
+      # ── 单一版本源校验：version.json 双对象与 gradle 默认一致 ──
+      # 发版流程：先改根目录 version.json → CI 校验通过 → 打 v<backend.version> tag → release.yml 发布
+      # 前端 App = version.json.frontend ↔ ufiFrontendVersionName/Code
+      # 后端 Core = version.json.backend  ↔ ufiBackendVersionName/Code
+      - name: Verify version.json matches gradle defaults
+        run: |
+          FE_VERSION_JSON=$(jq -r .frontend.version version.json)
+          FE_CODE_JSON=$(jq -r .frontend.versionCode version.json)
+          BE_VERSION_JSON=$(jq -r .backend.version version.json)
+          BE_CODE_JSON=$(jq -r .backend.versionCode version.json)
+          FE_VERSION_GRADLE=$(grep -E '^ufiFrontendVersionName=' gradle.properties | cut -d= -f2)
+          FE_CODE_GRADLE=$(grep -E '^ufiFrontendVersionCode=' gradle.properties | cut -d= -f2)
+          BE_VERSION_GRADLE=$(grep -E '^ufiBackendVersionName=' gradle.properties | cut -d= -f2)
+          BE_CODE_GRADLE=$(grep -E '^ufiBackendVersionCode=' gradle.properties | cut -d= -f2)
+          echo "version.json: frontend=$FE_VERSION_JSON/$FE_CODE_JSON backend=$BE_VERSION_JSON/$BE_CODE_JSON"
+          echo "gradle.properties: frontend=$FE_VERSION_GRADLE/$FE_CODE_GRADLE backend=$BE_VERSION_GRADLE/$BE_CODE_GRADLE"
+          if [ "$FE_VERSION_JSON" != "$FE_VERSION_GRADLE" ] || [ "$FE_CODE_JSON" != "$FE_CODE_GRADLE" ] || \
+             [ "$BE_VERSION_JSON" != "$BE_VERSION_GRADLE" ] || [ "$BE_CODE_JSON" != "$BE_CODE_GRADLE" ]; then
+            echo "::error::version.json 与 gradle.properties 不一致，请先修改 version.json（单一版本源）"
+            exit 1
+          fi
+
+      - name: Build debug APKs
+        run: ./gradlew :core:assembleDebug :app:assembleDebug --no-daemon
+
+      - name: Upload core debug APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: core-debug
+          path: core/build/outputs/apk/debug/core-debug.apk
+
+      - name: Upload app debug APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk

@@ -1,0 +1,162 @@
+# =============================================================================
+# 可选二进制组件版本跟踪（frpc / cloudflared）
+# =============================================================================
+# 背景：2026-09-01 起 frpc 与 cloudflared 不再随 core APK 分发（两者解压后合计约 50MB，
+# 曾占 APK 压缩体积的一半）。改为由设备端按需从**上游官方 release 直链**下载，
+# 直链与校验和写在根目录 version.json 的 `components` 段里，由本工作流每天刷新。
+#
+# 为什么不需要配置个人 token（PAT）：
+#   - 匿名调 GitHub API 是「每 IP 每小时 60 次」，而 GitHub 托管 runner 的出口 IP 是共享的，
+#     匿名会偶发 403；
+#   - Actions 自带的 `secrets.GITHUB_TOKEN` 是「每仓库每小时 1000 次」，而本工作流一天只用
+#     2 次请求，绰绰有余。只有在 main 开了分支保护、禁止 GITHUB_TOKEN 推送时才需要换成 PAT。
+#
+# 校验和来源（组件是要被 execve 执行的二进制，无校验的公网下载一律拒绝安装）：
+#   - frp     ：官方 release 自带 `frp_sha256_checksums.txt`，直接解析，**不下载二进制**；
+#   - cloudflared：官方没有稳定的校验和文件，只能下载后 sha256sum 自算（约 36MB，几秒）。
+#     注意：这里只算哈希，不重打包也不转存，version.json 里写的仍是上游直链。
+#
+# 设备端消费方式见 core/api/.../components/ComponentManager.kt：
+#   拉 version.json → components.<id> → 镜像前缀（大陆加速）→ 流式下载 + SHA-256 →
+#   tar.gz 则提取 entry → ELF(aarch64) 体检 → 原子安装到 filesDir/components/。
+# =============================================================================
+
+name: Component Versions (frp / cloudflared)
+
+on:
+  schedule:
+    # 每天 UTC 18:00（北京时间次日 02:00）检查一次
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 与 release.yml 共用同一个组：两者都会 commit 根目录 version.json，
+# 并发跑会撞 non-fast-forward。
+concurrency:
+  group: version-json
+  cancel-in-progress: false
+
+jobs:
+  track:
+    name: Refresh components in version.json
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      # ── frp：解析官方 checksums 文件，零二进制下载 ──
+      - name: Track frpc
+        run: |
+          set -euo pipefail
+          REL="$(gh api repos/fatedier/frp/releases/latest)"
+          TAG="$(jq -r '.tag_name' <<<"$REL")"
+          VERSION="${TAG#v}"
+          CUR="$(jq -r '.components.frpc.version // ""' version.json)"
+          CUR_URL="$(jq -r '.components.frpc.url // ""' version.json)"
+          if [ "$VERSION" = "$CUR" ] && [ -n "$CUR_URL" ]; then
+            echo "frpc 已是 $VERSION，跳过"
+            exit 0
+          fi
+
+          # linux_arm64 的 tar.gz（仓库只支持 arm64-v8a 设备）
+          ASSET="$(jq -c '.assets[] | select(.name | test("^frp_.*_linux_arm64\\.tar\\.gz$"))' <<<"$REL" | head -n1)"
+          if [ -z "$ASSET" ]; then
+            echo "::error::frp $TAG 未找到 linux_arm64 tar.gz 资产（上游改名了？）"
+            exit 1
+          fi
+          NAME="$(jq -r '.name' <<<"$ASSET")"
+          URL="$(jq -r '.browser_download_url' <<<"$ASSET")"
+          SIZE="$(jq -r '.size' <<<"$ASSET")"
+
+          CHECKSUMS_URL="$(jq -r '.assets[] | select(.name | test("sha256.*checksums.*\\.txt$"; "i")) | .browser_download_url' <<<"$REL" | head -n1)"
+          if [ -z "$CHECKSUMS_URL" ]; then
+            echo "::error::frp $TAG 未找到 sha256 checksums 文件"
+            exit 1
+          fi
+          curl -fsSL "$CHECKSUMS_URL" -o /tmp/frp_checksums.txt
+          # checksums 行格式：<sha256>  <文件名>
+          SHA="$(awk -v n="$NAME" '$2 == n || $2 == "*"n { print $1 }' /tmp/frp_checksums.txt | head -n1)"
+          if [ -z "$SHA" ]; then
+            echo "::error::checksums 文件里没有 $NAME 的条目"
+            exit 1
+          fi
+
+          jq --arg v "$VERSION" --arg u "$URL" --arg s "$SHA" --argjson z "$SIZE" \
+            '.components.frpc.version = $v
+             | .components.frpc.url = $u
+             | .components.frpc.sha256 = $s
+             | .components.frpc.size = $z
+             | .components.frpc.archive = "tar.gz"
+             | .components.frpc.entry = "frpc"' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "frpc → $VERSION ($NAME, $SIZE bytes)"
+
+      # ── cloudflared：上游无校验和文件，下载后自算 sha256 ──
+      - name: Track cloudflared
+        run: |
+          set -euo pipefail
+          REL="$(gh api repos/cloudflare/cloudflared/releases/latest)"
+          TAG="$(jq -r '.tag_name' <<<"$REL")"
+          VERSION="${TAG#v}"
+          CUR="$(jq -r '.components.cloudflared.version // ""' version.json)"
+          CUR_URL="$(jq -r '.components.cloudflared.url // ""' version.json)"
+          if [ "$VERSION" = "$CUR" ] && [ -n "$CUR_URL" ]; then
+            echo "cloudflared 已是 $VERSION，跳过"
+            exit 0
+          fi
+
+          # 精确匹配裸二进制（同名还有 .deb / .rpm / .tgz，锚定 ^...$ 排除它们）
+          ASSET="$(jq -c '.assets[] | select(.name == "cloudflared-linux-arm64")' <<<"$REL" | head -n1)"
+          if [ -z "$ASSET" ]; then
+            echo "::error::cloudflared $TAG 未找到 cloudflared-linux-arm64 资产（上游改名了？）"
+            exit 1
+          fi
+          URL="$(jq -r '.browser_download_url' <<<"$ASSET")"
+          SIZE="$(jq -r '.size' <<<"$ASSET")"
+
+          curl -fsSL "$URL" -o /tmp/cloudflared
+          # 体检：必须是 ELF64 aarch64，否则设备端装上也跑不起来，早失败早发现
+          FILE_INFO="$(file -b /tmp/cloudflared)"
+          echo "asset: $FILE_INFO"
+          case "$FILE_INFO" in
+            *ELF*64-bit*ARM\ aarch64*) : ;;
+            *) echo "::error::下载到的不是 ELF64 aarch64 可执行文件: $FILE_INFO"; exit 1 ;;
+          esac
+          SHA="$(sha256sum /tmp/cloudflared | awk '{print $1}')"
+          ACTUAL_SIZE="$(stat -c %s /tmp/cloudflared)"
+          rm -f /tmp/cloudflared
+
+          jq --arg v "$VERSION" --arg u "$URL" --arg s "$SHA" --argjson z "$ACTUAL_SIZE" \
+            '.components.cloudflared.version = $v
+             | .components.cloudflared.url = $u
+             | .components.cloudflared.sha256 = $s
+             | .components.cloudflared.size = $z
+             | .components.cloudflared.archive = "raw"
+             | .components.cloudflared.entry = ""' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "cloudflared → $VERSION ($ACTUAL_SIZE bytes, 声明 $SIZE)"
+
+      - name: Commit version.json if changed
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- version.json; then
+            echo "components 无变化，跳过 commit"
+            exit 0
+          fi
+          echo "version.json 更新后："
+          jq '.components' version.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          FRP_V="$(jq -r '.components.frpc.version' version.json)"
+          CF_V="$(jq -r '.components.cloudflared.version' version.json)"
+          git commit -m "ci: 更新可选组件版本（frpc $FRP_V / cloudflared $CF_V）"
+          # 期间可能有人推了别的提交，rebase 后再推
+          git pull --rebase origin main
+          git push origin HEAD:main

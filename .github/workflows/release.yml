@@ -1,0 +1,316 @@
+# =============================================================================
+# UFI-AXIS Release APK 构建与签名工作流
+# =============================================================================
+# 使用前提（必须由仓库管理员在 GitHub 仓库 Settings → Secrets and variables →
+# Actions → Repository secrets 中配置以下四个密钥后，签名步骤才会成功）：
+#
+#   - SIGNING_KEY          : keystore 文件的 base64 编码内容（可由
+#                            `base64 -w0 your.keystore` 生成）
+#   - ALIAS                : keystore 中的密钥别名（key alias）
+#   - KEY_STORE_PASSWORD   : keystore 密码
+#   - KEY_PASSWORD         : 密钥（key）密码
+#
+# 说明：
+#   - 本地开发者无需任何签名配置即可 `./gradlew :app:assembleRelease`
+#     （app/build.gradle.kts 与 core/build.gradle.kts 均无 signingConfigs）。
+#   - 本工作流在 CI 内由 r0adkll/sign-android-release 动作对「未签名」的
+#     release APK 执行 zipalign + v1/v2 签名，密钥仅来源于上述仓库 Secrets。
+#   - 触发方式：手动（workflow_dispatch）或推送 `v*` 标签时自动发布。
+# =============================================================================
+
+name: Release APK (Build & Sign)
+
+# 触发：手动触发，或推送 v* 标签时自动发布
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# 与 component-versions.yml 共用同一个组：两者都会 commit 根目录 version.json，
+# 并发跑会撞 non-fast-forward。发版频率低，串行排队的代价可以忽略。
+concurrency:
+  group: version-json
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Sign Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ── 单一版本源（2026-08-10 C4）：读根目录 version.json 双对象 → 校验 tag → 注入 gradle ──
+      # 前端 App = version.json.frontend；后端 Core = version.json.backend（前后端分离管理）。
+      # tag 统一以 backend 版本为基准（v$BACKEND_VERSION），frontend 版本在 version.json 内管理，
+      # 不参与 tag 命名——若未来需要可改为 frontend 或拼接，见下方 Verify tag 注释。
+      - name: Read version.json
+        id: version
+        run: |
+          FRONTEND_VERSION=$(jq -r .frontend.version version.json)
+          FRONTEND_VERSION_CODE=$(jq -r .frontend.versionCode version.json)
+          FRONTEND_CHANGELOG=$(jq -r .frontend.changelog version.json)
+          BACKEND_VERSION=$(jq -r .backend.version version.json)
+          BACKEND_VERSION_CODE=$(jq -r .backend.versionCode version.json)
+          BACKEND_CHANGELOG=$(jq -r .backend.changelog version.json)
+          echo "FRONTEND_VERSION=$FRONTEND_VERSION" >> $GITHUB_OUTPUT
+          echo "FRONTEND_VERSION_CODE=$FRONTEND_VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "FRONTEND_CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$FRONTEND_CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "BACKEND_VERSION=$BACKEND_VERSION" >> $GITHUB_OUTPUT
+          echo "BACKEND_VERSION_CODE=$BACKEND_VERSION_CODE" >> $GITHUB_OUTPUT
+          echo "BACKEND_CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$BACKEND_CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "frontend=$FRONTEND_VERSION/$FRONTEND_VERSION_CODE backend=$BACKEND_VERSION/$BACKEND_VERSION_CODE"
+
+      # tag 与 version.json 一致性校验（仅 tag 触发时）：打 tag 前必须先改 version.json
+      # tag 基准统一用 backend 版本（与回写 version.json 的 release 下载路径一致）
+      - name: Verify tag matches version.json
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          BACKEND_VERSION="${{ steps.version.outputs.BACKEND_VERSION }}"
+          if [ "v${BACKEND_VERSION}" != "${{ github.ref_name }}" ]; then
+            echo "::error::tag ${{ github.ref_name }} 与 version.json backend.version ($BACKEND_VERSION) 不一致，请先修改 version.json 再打 tag"
+            exit 1
+          fi
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+          # r0adkll/sign-android-release@v1 硬编码使用 build-tools 29.0.3 的 zipalign，
+          # 不装会在 Sign APK 步骤报 "Couldn't find the Android build-tools @ .../29.0.3"
+          sdkmanager "build-tools;29.0.3"
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # ── Web 前端依赖（:core:network:buildWeb 需要 vue-tsc/vite，CI 全新 checkout 无 node_modules）──
+      - name: Set up Node.js (web build)
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: cd web && npm ci
+
+      # ── CI 门禁：单元测试必须全绿，否则阻断发布 ──
+      # 2026-09-02：原门禁只有 :app / :app:data / :app:viewmodel / :core 四个模块，
+      # 而 :core:api（PairingRoutesTest 等鉴权回归）、:core:alert、:core:common、:app:ui
+      # 的单测从来没在 CI 跑过 —— 安全相关的回归用例形同虚设。
+      # 改为在根项目上跑 testDebugUnitTest（所有 Android 模块一次覆盖），
+      # 再补一条纯 JVM 模块 :core:device-schema 的 test（它没有 debug 变体）。
+      # F15 为 androidTest（MigrationTestHelper，需设备/模拟器），仍不在此处运行。
+      - name: Run unit tests (release gate)
+        run: ./gradlew testDebugUnitTest :core:device-schema:test --no-daemon
+
+      # 本地不配置签名（build.gradle.kts 无 signingConfigs），这里产出未签名 release APK
+      # 版本注入：前后端分离，-PufiFrontendVersionName/Code 与 -PufiBackendVersionName/Code
+      # 分别来自根目录 version.json 的 frontend / backend 对象（单一版本源）
+      - name: Build release APKs (unsigned)
+        run: |
+          ./gradlew :app:assembleRelease :core:assembleRelease --no-daemon \
+            -PufiFrontendVersionName=${{ steps.version.outputs.FRONTEND_VERSION }} \
+            -PufiFrontendVersionCode=${{ steps.version.outputs.FRONTEND_VERSION_CODE }} \
+            -PufiBackendVersionName=${{ steps.version.outputs.BACKEND_VERSION }} \
+            -PufiBackendVersionCode=${{ steps.version.outputs.BACKEND_VERSION_CODE }}
+
+      - name: Sign app APK
+        id: sign_app
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Sign core APK
+        id: sign_core
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: core/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      # ── 重命名签名产物（2026-09-06）──
+      # r0adkll 固定输出 "<原名>-signed.apk"（即 app-release-unsigned-signed.apk），观感差且误导
+      # （实际已签名）。更新通道只消费 version.json 的 apkUrl，无文件名模式匹配，
+      # 改名只需保证回写/上传/Release 三处引用一致。命名规范：UFI-AXIS-{app|core}-<版本号>.apk
+      - name: Rename signed APKs
+        id: rename
+        run: |
+          APP_DIR="$(dirname "${{ steps.sign_app.outputs.signedReleaseFile }}")"
+          CORE_DIR="$(dirname "${{ steps.sign_core.outputs.signedReleaseFile }}")"
+          APP_NAME="UFI-AXIS-app-${{ steps.version.outputs.FRONTEND_VERSION }}.apk"
+          CORE_NAME="UFI-AXIS-core-${{ steps.version.outputs.BACKEND_VERSION }}.apk"
+          mv "${{ steps.sign_app.outputs.signedReleaseFile }}" "$APP_DIR/$APP_NAME"
+          mv "${{ steps.sign_core.outputs.signedReleaseFile }}" "$CORE_DIR/$CORE_NAME"
+          echo "app=$APP_DIR/$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "core=$CORE_DIR/$CORE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload app APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: app-release
+          path: ${{ steps.rename.outputs.app }}
+
+      - name: Upload core APK
+        uses: actions/upload-artifact@v6
+        with:
+          name: core-release
+          path: ${{ steps.rename.outputs.core }}
+
+      # ── Core 一键安装器（scripts/UFI-AXIS-Core-install）──
+      # 目录随仓库带着 adb.exe + 两个 DLL、Windows 的 .bat 与 Linux/macOS 的 .sh，
+      # 唯一缺的就是 APK。安装脚本按 `core/*.apk` 通配来装，所以这里只需把本次签名+改名后的
+      # core 包丢进 core/，不需要与某个固定文件名对齐。
+      # log/ 是本地运行产物（已被仓库既有的 *.log 规则忽略），打包时再排除一次，防止有人手动塞进来。
+      - name: Package Core one-click installer ZIP
+        id: installer_zip
+        run: |
+          INSTALLER_DIR="scripts/UFI-AXIS-Core-install"
+          # 缺 adb.exe 就直接失败：装不了的安装器发出去比不发更糟
+          if [ ! -f "$INSTALLER_DIR/adb.exe" ]; then
+            echo "::error::$INSTALLER_DIR/adb.exe 缺失，一键安装器无法工作（是否漏提交？）"
+            exit 1
+          fi
+          mkdir -p "$INSTALLER_DIR/core"
+          # 清掉可能残留的旧包：脚本会安装 core/ 下**所有** apk，多一个就会多装一次
+          rm -f "$INSTALLER_DIR"/core/*.apk
+          cp "${{ steps.rename.outputs.core }}" "$INSTALLER_DIR/core/"
+          ZIP_NAME="UFI-AXIS-Core-install-${{ steps.version.outputs.BACKEND_VERSION }}.zip"
+          # 从 scripts/ 起打包，让 zip 内保留一层目录名 —— 用户解压即得完整安装器目录，
+          # 而不是把 adb.exe 和 bat 散落到下载目录里
+          cd scripts
+          zip -r "../$ZIP_NAME" UFI-AXIS-Core-install -x 'UFI-AXIS-Core-install/log/*'
+          cd ..
+          echo "file=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          unzip -l "$ZIP_NAME"
+
+      - name: Upload Core installer ZIP as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: core-installer
+          path: ${{ steps.installer_zip.outputs.file }}
+
+      # ── Web 前端独立更新包（供不重装 APK 单独更新 web 前端使用）──
+      - name: Package web update ZIP
+        id: web_zip
+        run: |
+          WEB_VERSION=$(jq -r .version web/dist/version.json)
+          cd web/dist
+          zip -r ../../web-update-${WEB_VERSION}.zip .
+          cd ../..
+          echo "version=${WEB_VERSION}" >> $GITHUB_OUTPUT
+          echo "file=web-update-${WEB_VERSION}.zip" >> $GITHUB_OUTPUT
+          ls -la web-update-${WEB_VERSION}.zip
+
+      - name: Upload web update ZIP as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: web-update
+          path: web-update-*.zip
+
+      # ── version-manifest.json 已于 2026-09-06 移除 ──
+      # 更新源统一为仓库根 version.json（raw 直读），release 不再附带清单副本，
+      # 避免两份清单漂移；运行时解析端（UpdateManager）本就兼容 root 对象直读。
+
+
+      # ── 回写仓库根 version.json（2026-08-12：前端信息源改为 raw version.json）──
+      # 用与上方相同的签名产物 sha256，jq 原位更新 frontend/backend 的 apkUrl/apkSha256
+      # （camelCase 对齐旧项目 UFITOOLS-Widget；apkUrl 指向本次 release 的下载直链），
+      # 随后 commit + push 回仓库（GITHUB_TOKEN 由 actions/checkout 注入，contents: write 已授权）。
+      # push 失败不阻断 release（用 `||` 兜底 + warning，避免 tag 触发时 detached HEAD 推送失败拖垮发布）。
+      - name: Write back version.json (apkUrl/apkSha256/apkSize/publishedAt/tagName)
+        run: |
+          APP_APK="${{ steps.rename.outputs.app }}"
+          APP_NAME="$(basename "$APP_APK")"
+          APP_SHA="$(sha256sum "$APP_APK" | awk '{print $1}')"
+          APP_SIZE="$(stat -c %s "$APP_APK")"
+          CORE_APK="${{ steps.rename.outputs.core }}"
+          CORE_NAME="$(basename "$CORE_APK")"
+          CORE_SHA="$(sha256sum "$CORE_APK" | awk '{print $1}')"
+          CORE_SIZE="$(stat -c %s "$CORE_APK")"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq \
+            --arg fapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$APP_NAME" \
+            --argjson fsize "$APP_SIZE" \
+            --arg fsha "$APP_SHA" \
+            --arg fpub "$PUBLISHED_AT" \
+            --arg ftag "${{ github.ref_name }}" \
+            --arg bapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$CORE_NAME" \
+            --argjson bsize "$CORE_SIZE" \
+            --arg bsha "$CORE_SHA" \
+            --arg bpub "$PUBLISHED_AT" \
+            --arg btag "${{ github.ref_name }}" \
+            '.frontend.apkUrl = $fapk | .frontend.apkSize = $fsize | .frontend.apkSha256 = $fsha | .frontend.publishedAt = $fpub | .frontend.tagName = $ftag | .backend.apkUrl = $bapk | .backend.apkSize = $bsize | .backend.apkSha256 = $bsha | .backend.publishedAt = $bpub | .backend.tagName = $btag' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "version.json 回写后："
+          cat version.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "ci: 回写 release ${{ github.ref_name }} apkUrl/apkSize/apkSha256/publishedAt/tagName" \
+            || echo "version.json 无变更，跳过 commit"
+          # 防止 detached HEAD（tag 触发）回写时因远端 main 已有提交而 non-fast-forward 被拒：
+          # 先 fetch 最新 main 并 rebase 到其上，保证后续 push HEAD:main 可快进。
+          # 顺序必须是「先 commit 再 rebase」—— index 里有暂存改动时 git rebase 会直接拒绝执行，
+          # 之前 add → rebase → commit 的写法被 `|| true` 吞掉错误，防 non-FF 实际上是空转。
+          git fetch origin main || true
+          git rebase origin/main || git rebase --abort || true
+          # 只推 main：远端没有 master 分支，`push HEAD:master` 兜底会凭空新建一条分支，故移除
+          git push origin HEAD:main || echo "::warning::version.json 回写 push 失败（不阻断 release）"
+
+      # 重复发布同一 tag 时先清空旧附件（softprops 不会删除不在 files 列表里的旧资产，
+      # 否则改名前的 app-release-unsigned-signed.apk 会与新命名的 APK 残留共存）
+      - name: Clean stale release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${{ github.ref_name }}" --jq '.id' 2>/dev/null || true)
+          if [ -n "$RELEASE_ID" ]; then
+            gh api "repos/${{ github.repository }}/releases/$RELEASE_ID/assets" --jq '.[].id' \
+              | while read -r id; do gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" || true; done
+          fi
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          # softprops 对同一 tag 已存在的 release 默认就是「create or update」，
+          # 无需额外开关（此前写的 allowUpdates 是 ncipollo/release-action 的入参，
+          # runner 不校验未知 with 键，等于一行死配置，已移除）。
+          # 它只会删除同名冲突的旧资产，不会清理不在 files 里的残留 —— 改名后的清理仍靠
+          # 上方 Clean stale release assets 步骤。
+          fail_on_unmatched_files: true
+          # release body 用后端 changelog（tag 基准为 backend）；如需同时展示两端，可改为拼接
+          # "## Frontend\n${{ steps.version.outputs.FRONTEND_CHANGELOG }}\n\n## Backend\n${{ steps.version.outputs.BACKEND_CHANGELOG }}"
+          body: ${{ steps.version.outputs.BACKEND_CHANGELOG }}
+          files: |
+            ${{ steps.rename.outputs.app }}
+            ${{ steps.rename.outputs.core }}
+            web-update-*.zip
+            ${{ steps.installer_zip.outputs.file }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

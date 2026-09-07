@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.UFIAXIS" parent="android:Theme.Material.Light.NoActionBar">
+        <!--
+            把**所有** Compose Dialog 的窗口主题换成 UfiDialogWindowTheme。
+
+            为什么必须在这里改（而不是在 Kotlin 侧调 API）：
+            androidx.compose.ui 的 `Dialog()` 内部是
+                `ComponentDialog(ContextThemeWrapper(view.context, R.style.DialogWindowTheme))`
+            而 `Dialog` 的构造函数会从这个 context 解析 `android:dialogTheme` 作为**窗口主题**。
+            Compose 的 `DialogWindowTheme` 只覆盖了 `windowClipToOutline`，并没有声明
+            `android:dialogTheme`，所以最终落到本 Activity 主题继承来的
+            `android:Theme.Material.Light.Dialog`——它带着
+              • windowIsTranslucent = false      → 窗口内背景模糊**永久不渲染**（见下）
+              • windowBackground    = @android:drawable/dialog_background_material（浅色圆角底）
+              • windowElevation     = floating_window_z（底部黑色投影）
+            这正是真机上「胶囊没有毛玻璃 + 外圈浅色框 + 底部黑影」三个症状的**同一个根因**。
+
+            `android:dialogTheme` 只作用于 Dialog，**不影响 Activity 窗口本身**，
+            所以这里不会把主界面变成半透明窗口（无 API 26 固定朝向崩溃、无不透明优化损失）。
+        -->
+        <item name="android:dialogTheme">@style/UfiDialogWindowTheme</item>
+    </style>
+
+    <!--
+        UFI 统一的 Dialog 窗口主题。
+
+        ## windowIsTranslucent = true 是「窗口内背景模糊」的**硬性前提**
+        `Window.setBackgroundBlurRadius` 的官方契约原文：
+          *"The window background drawable is drawn on top of the blurred region.
+            The blur region bounds and rounded corners will mimic those of the background
+            drawable. **For the blur region to be visible, the window has to be translucent
+            (android.R.attr#windowIsTranslucent) and floating (android.R.attr#windowIsFloating).**"*
+
+        模糊是绘制在窗口 Surface **下面**的，窗口不半透明就永远看不到。平台实现里
+        （DecorView.updateBackgroundBlurRadius）这一条是硬门槛：
+            mBackgroundBlurRadius = mCrossWindowBlurEnabled && mWindow.isTranslucent()
+                    ? mOriginalBackgroundBlurRadius : 0;
+        —— 不满足时连 BackgroundBlurDrawable 都不会创建，但**所有 API 调用都返回成功**。
+        这就是真机诊断 Badge 显示 `B=1 C=1 R=1`（已提交 + 系统支持 + 判定生效）
+        却一个像素都没糊的原因：缺的从来不是调用，是主题。
+
+        ## windowIsFloating = true 是第二个硬性前提
+        同一段契约要求窗口必须是 floating。从 android:Theme.Material.Light.Dialog 继承即为 true，
+        这里显式写出来，防止将来换 parent 时被静默改掉。
+
+        ## 其余几项：清掉平台 Dialog 的默认装饰
+        Compose 的 Dialog 内容自带完整背景（Surface / 胶囊自绘玻璃），平台那层
+        dialog_background_material 与 elevation 阴影只会在内容外围露出一圈浅色框和黑影。
+        本项目所有 Dialog 都是 Compose 绘制，统一清成「透明、无阴影、无遮罩」才是正确基线。
+    -->
+    <style name="UfiDialogWindowTheme" parent="android:Theme.Material.Light.Dialog">
+        <!-- 窗口内背景模糊的两个硬性前提，缺一不可。 -->
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowIsFloating">true</item>
+
+        <!-- 平台默认的浅色圆角底：真机上表现为「胶囊外圈比本体略大的浅色框」。 -->
+        <item name="android:windowBackground">@null</item>
+        <!-- 显式清空窗口边框/框 drawable：双保险消除系统给透明窗口描的 1px 边。 -->
+        <item name="android:windowFrame">@null</item>
+        <!-- 平台默认 elevation：真机上表现为「胶囊底部的黑色阴影团」。 -->
+        <item name="android:windowElevation">0dp</item>
+
+        <!--
+            ★ 底部白边修复（与 UfiCapsuleBlurHost.applyWindowBlur 配套）：
+            胶囊 Dialog 用 FLAG_LAYOUT_NO_LIMITS 把窗口延伸到系统导航栏区域后，平台会用
+            **本窗口的** navigationBarColor 去填手势小白条那条带子；从
+            android:Theme.Material.Light.Dialog 继承来的是不透明底色，真机表现为
+            「胶囊下方一条白色遮罩」。contrast enforced 则会给半透明导航栏再补一层浅色 scrim。
+
+            为什么必须写在主题里而不是只在 Kotlin 侧设：胶囊 Dialog 会随 showBottomBar
+            反复创建/销毁，而 applyWindowBlur 要等组合提交后的 DisposableEffect 才跑 ——
+            只靠 Kotlin 侧会在每次重建时闪一帧白边。主题在窗口创建时就生效，没有窗口期。
+        -->
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowClipToOutline">false</item>
+        <!-- 变暗与胶囊这类常驻浮层互斥；对话框的遮罩由 UfiDialogShell 自己画。 -->
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+</resources>
