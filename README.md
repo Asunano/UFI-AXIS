@@ -424,11 +424,6 @@ package-web.bat           # Windows（不要用 Compress-Archive，见下方 FAQ
 
 ---
 
-## 更新日志
-
-各版本的变更说明见 [Releases](https://github.com/Asunano/UFI-AXIS/releases)。版本号本身以根目录 [version.json](version.json) 为唯一源（当前 frontend / backend / web 均为 `0.0.1`，首个公开测试版本）。
-
----
 
 ## 感谢
 
