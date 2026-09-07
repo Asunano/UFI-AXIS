@@ -100,7 +100,8 @@ class AlertConfigSyncTest {
     @Test
     fun `fresh engine default configVersion is 1`() = runTest {
         assertEquals(1L, engine.getConfig().configVersion)
-        assertTrue(engine.getConfig().enabled)
+        // 2026-09-07：默认不开启告警（与 app 侧 AlertConfig.enabled 默认值一致）
+        assertFalse(engine.getConfig().enabled)
     }
 
     @Test
@@ -207,20 +208,32 @@ class AlertConfigSyncTest {
 
     @Test
     fun `perType false stops that type from being detected while others keep working`() = runTest {
-        engine.updateConfig(engine.getConfig().copy(perType = mapOf("temperature" to false)))
+        engine.updateConfig(
+            engine.getConfig().copy(
+                enabled = true,
+                perType = mapOf("temperature" to false, "battery" to true)
+            )
+        )
 
         engine.checkTemperature(99.0)                 // 关掉的类型：不检测、不入库
         assertTrue(dao.rows.none { it.type == "temperature" })
 
-        engine.checkBattery(level = 5, isCharging = false)  // 未关掉的类型：照常入库
+        engine.checkBattery(level = 5, isCharging = false)  // 显式打开的类型：照常入库
         assertEquals(1, dao.rows.count { it.type == "battery" })
     }
 
     @Test
-    fun `missing perType key means enabled`() = runTest {
-        // 缺省即启用（与 app/web 两端 UI 的 `?: true` 同口径）；
-        // 若门控写成 `perType[type] == true`，从未显式打开过的类型会全部静默失效。
+    fun `missing perType key means disabled`() = runTest {
+        // 2026-09-07 改口径：缺省即**关闭**（与 app 侧 UI 兜底 `?: false`、
+        // core `typeEnabled` 的 `perType[type] == true` 同口径）。
+        // 若门控退回 `!= false`，从未显式打开过的类型会全部静默检测入库。
+        engine.updateConfig(engine.getConfig().copy(enabled = true))
         assertTrue(engine.getConfig().perType.isEmpty())
+        engine.checkSignal(-130)
+        assertTrue(dao.rows.none { it.type == "signal" })
+
+        // 显式打开后才检测
+        engine.updateConfig(engine.getConfig().copy(perType = mapOf("signal" to true)))
         engine.checkSignal(-130)
         assertEquals(1, dao.rows.count { it.type == "signal" })
     }
@@ -228,7 +241,9 @@ class AlertConfigSyncTest {
     @Test
     fun `perType false also gates connectivity which bypasses evaluate`() = runTest {
         // connectivity 不走 evaluate()，直接调 triggerAlert，必须单独门控
-        engine.updateConfig(engine.getConfig().copy(perType = mapOf("connectivity" to false)))
+        engine.updateConfig(
+            engine.getConfig().copy(enabled = true, perType = mapOf("connectivity" to false))
+        )
         engine.checkConnectivity(isConnected = true, networkType = "5G")   // 首次：状态初始化
         engine.checkConnectivity(isConnected = false, networkType = "")    // 状态跃迁：本应告警
         assertTrue(dao.rows.none { it.type == "connectivity" })

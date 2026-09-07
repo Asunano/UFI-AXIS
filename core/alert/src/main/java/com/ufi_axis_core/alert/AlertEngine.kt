@@ -132,7 +132,7 @@ class AlertEngine(
         val enabled: Boolean = false,
         // ── 投递开关：true 时仍记录，但允许向用户投递（in-app banner + 系统通知） ──
         val notifyEnabled: Boolean = true,
-        // ── 分类开关：type -> 是否启用该类型告警（缺省视为启用） ──
+        // ── 分类开关：type -> 是否启用该类型告警（缺键视为**关闭**，见 typeEnabled） ──
         val perType: Map<String, Boolean> = emptyMap(),
         // ── 同 (type,level) 最小聚合间隔秒（窗口内只累加 count，不新插入） ──
         val minIntervalSec: Int = 1800,

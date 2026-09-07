@@ -2149,7 +2149,7 @@ AT 通道状态。
 **响应：**
 ```json
 {
-  "enabled": true,
+  "enabled": false,
   "notifyEnabled": true,
   "perType": {},
   "minIntervalSec": 1800,
@@ -2174,7 +2174,7 @@ AT 通道状态。
 - 值为 JSON `null` 的键视为"未提供"（不会把字段清空）；
 - `perType` 是**整体替换**（不做深合并），传 `{}` 即清空所有分类开关；
 - `perType` 的语义（2026-08-27 起引擎真的生效）：`type -> false` 该类型**不检测、不入库、不广播**；
-  **键缺省视为启用**（清空 `perType` = 全部启用，不是全部关闭）；总开关 `enabled=false` 时一律不检测。
+  **键缺省视为关闭**（2026-09-07 起：清空 `perType` = 全部关闭；用户须显式打开每个类型）；总开关 `enabled` 默认 `false`，为 `false` 时一律不检测。
   可用的 type：`temperature` / `battery` / `traffic` / `signal` / `connectivity`；
 - 与 `PUT /api/notifications/config` 的通知开关是两件事：这里控制**服务端要不要产生告警**，那里控制**客户端要不要投递通知**；
 - 必须带 `configVersion` 且与服务端当前值一致，否则返回 `409`（缺省 `configVersion` 同样按陈旧写处理）；
@@ -2340,11 +2340,11 @@ AT 通道状态。
 ```json
 {
   "alert_enabled": false,
-  "connectivity_enabled": true,
-  "sms_enabled": true,
-  "verification_enabled": true,
-  "download_enabled": true,
-  "traffic_80_enabled": true,
+  "connectivity_enabled": false,
+  "sms_enabled": false,
+  "verification_enabled": false,
+  "download_enabled": false,
+  "traffic_80_enabled": false,
   "device_events_enabled": false,
   "dnd_enabled": false,
   "dnd_start_hour": 23,
@@ -2358,11 +2358,11 @@ AT 通道状态。
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | alert_enabled | boolean | false | 告警族总闸门：阈值告警 / 设备离线上线 / 流量 80% / 隧道失败，关掉则一条都不投递 |
-| connectivity_enabled | boolean | true | 设备离线/上线通知（受 `alert_enabled` 总闸约束）。客户端按「离线只报一次、报过离线才报恢复」成对去重 |
-| sms_enabled | boolean | true | 新短信通知 |
-| verification_enabled | boolean | true | 验证码提取通知（依附 `sms_enabled`，短信关则一并不发） |
-| download_enabled | boolean | true | 下载完成/失败通知 |
-| traffic_80_enabled | boolean | true | 流量达限额 80% 预警（受 `alert_enabled` 二级闸门约束） |
+| connectivity_enabled | boolean | false | 设备离线/上线通知（受 `alert_enabled` 总闸约束）。客户端按「离线只报一次、报过离线才报恢复」成对去重 |
+| sms_enabled | boolean | false | 新短信通知 |
+| verification_enabled | boolean | false | 验证码提取通知（依附 `sms_enabled`，短信关则一并不发） |
+| download_enabled | boolean | false | 下载完成/失败通知 |
+| traffic_80_enabled | boolean | false | 流量达限额 80% 预警（受 `alert_enabled` 二级闸门约束） |
 | device_events_enabled | boolean | false | 设备事件（WiFi 客户端上下线等） |
 | dnd_enabled | boolean | false | 免打扰时段开关，仅 critical 可突破。时段由下面两项决定 |
 | dnd_start_hour | int | 23 | 免打扰起始小时，0-23。`start > end` 表示跨零点（23→7 = 当晚 23:00 至次日 07:00）；与 `dnd_end_hour` 相等视为零长度窗口 = 不静默 |

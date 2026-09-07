@@ -34,6 +34,11 @@ import java.util.concurrent.atomic.AtomicLong
 @Config(sdk = [33])
 class AlertEngineDedupTest {
 
+    private companion object {
+        /** 本类用到的告警类型（perType 需显式打开，缺键 = 关闭）。 */
+        val ALERT_TYPES = listOf("temperature", "battery", "traffic", "signal", "connectivity")
+    }
+
     /** 内存版 AlertDao 假实现，复刻核心 SQL 语义（bump/markResolved/trimTo）。 */
     private class FakeAlertDao : AlertDao {
         val rows = mutableListOf<AlertRecord>()
@@ -178,6 +183,15 @@ class AlertEngineDedupTest {
         push = RecordingPushService()
         val settings = AppSettings(ApplicationProvider.getApplicationContext<Application>())
         engine = AlertEngine(dao, ws, settings, push)
+        // 2026-09-07：告警默认不开启（enabled=false，且 perType 缺键视为关闭）。
+        // 本类测的是去重/聚合/环形上限语义，故显式把要用到的类型全部打开；
+        // 「总开关关闭」的短路语义由 `enabled false shorts all checks` 单独覆盖。
+        engine.updateConfig(
+            engine.getConfig().copy(
+                enabled = true,
+                perType = ALERT_TYPES.associateWith { true }
+            )
+        )
     }
 
     @Test
@@ -212,8 +226,10 @@ class AlertEngineDedupTest {
 
     @Test
     fun `ring buffer - trimTo keeps only most recent maxRows`() = runTest {
+        // 预置行必须是**已确认**：triggerAlert 会先找同 (type,level) 的未确认行做聚合，
+        // 若预置行未确认则走聚合分支（不插入、不裁剪），测不到环形上限。
         repeat(2500) { i ->
-            dao.insert(AlertRecord(type = "signal", level = "warning", message = "x$i", value = "", threshold = "", timestamp = i.toLong()))
+            dao.insert(AlertRecord(type = "signal", level = "warning", message = "x$i", value = "", threshold = "", acknowledged = true, timestamp = i.toLong()))
         }
         // 触发一次 trim：通过 checkSignal 跃迁（normal→warning）
         engine.checkSignal(-120)

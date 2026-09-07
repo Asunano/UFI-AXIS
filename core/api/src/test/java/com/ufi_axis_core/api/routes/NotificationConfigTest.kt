@@ -55,13 +55,18 @@ class NotificationConfigTest {
     }
 
     @Test
-    fun `默认值全部合法且 alert 默认关`() {
+    fun `默认值全部合法且通知一律默认关`() {
         val d = NotificationConfig()
         assertNull(NotificationRoutes.validate(d))
-        // 与 app 侧所有实际闸门 switchOn(KEY_ALERT_NOTIF, false) 对齐
+        // 2026-09-07：通知一律不默认开启，与 app 侧 switchOn(key, false)、
+        // NotifyScene.defaultEnabled、web AlertConfigPanel 的本地初值逐字一致
         assertFalse(d.alert_enabled)
         assertFalse(d.device_events_enabled)
-        assertTrue(d.sms_enabled)
+        assertFalse(d.connectivity_enabled)
+        assertFalse(d.sms_enabled)
+        assertFalse(d.verification_enabled)
+        assertFalse(d.download_enabled)
+        assertFalse(d.traffic_80_enabled)
     }
 
     @Test

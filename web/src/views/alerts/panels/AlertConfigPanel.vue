@@ -292,14 +292,17 @@ const thresholdNotify = computed(() => NOTIFY_SWITCHES.filter((s) => s.group ===
 const eventNotify = computed(() => NOTIFY_SWITCHES.filter((s) => s.group === 'event'));
 const guardNotify = computed(() => NOTIFY_SWITCHES.filter((s) => s.group === 'guard'));
 
+// 本地初值必须与 core `NotificationConfig` 的默认值逐字一致（2026-09-07 起全部为 false，
+// 通知一律不默认开启）：loadNotifyConfig 失败时会静默沿用这份初值，若这里写 true，
+// 网络抖动就会让 web 上显示"已开"而设备真值是关 —— 假开关。
 const notifyConfig = reactive<NotifyConfig>({
   alert_enabled: false,
-  connectivity_enabled: true,
+  connectivity_enabled: false,
 
-  sms_enabled: true,
-  verification_enabled: true,
-  download_enabled: true,
-  traffic_80_enabled: true,
+  sms_enabled: false,
+  verification_enabled: false,
+  download_enabled: false,
+  traffic_80_enabled: false,
   device_events_enabled: false,
   dnd_enabled: false,
   dnd_start_hour: 23,
@@ -344,10 +347,10 @@ async function saveNotify(patch: Partial<NotifyConfig>) {
 function applyConfig(data: any) {
   rawConfig.value = { ...(data || {}) };
   Object.assign(config, {
-    // 2026-09-04：兜底由 false 改为 true，与 core `AlertEngine.AlertConfig.enabled`
-    // 和 app `AlertConfig.enabled` 一致。core 少返回这个字段时，原来 web 显示"关"、
-    // app 显示"开"，同一个真源在两端读出相反状态（假开关的另一种形态）。
-    enabled: data.enabled ?? true,
+    // 2026-09-07：兜底改回 false，与 core `AlertEngine.AlertConfig.enabled`
+    // 和 app `AlertConfig.enabled` 的新默认值（不默认开启）一致。core 少返回这个
+    // 字段时若兜底成 true，会出现"web 显示开、app 显示关"的假开关。
+    enabled: data.enabled ?? false,
     temperatureWarning: data.temperatureWarning ?? 45,
     temperatureCritical: data.temperatureCritical ?? 55,
     batteryWarning: data.batteryWarning ?? 20,
