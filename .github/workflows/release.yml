@@ -241,7 +241,14 @@ jobs:
       # （camelCase 对齐旧项目 UFITOOLS-Widget；apkUrl 指向本次 release 的下载直链），
       # 随后 commit + push 回仓库（GITHUB_TOKEN 由 actions/checkout 注入，contents: write 已授权）。
       # push 失败不阻断 release（用 `||` 兜底 + warning，避免 tag 触发时 detached HEAD 推送失败拖垮发布）。
+      #
+      # 2026-09-07：补上 tag 守卫。此前缺这一行，手动 workflow_dispatch（在 main 上跑）时
+      # github.ref_name = "main"，回写出的 apkUrl 会变成
+      # .../releases/download/main/UFI-AXIS-app-<ver>.apk（不存在的死链），tagName 也被写成 "main"，
+      # 然后 commit+push 回 main —— 而 version.json 是 App/Web 更新检查的唯一数据源，
+      # 等于手动跑一次构建就把线上更新源写坏。与下方 Clean stale / Create Release 两步的守卫对齐。
       - name: Write back version.json (apkUrl/apkSha256/apkSize/publishedAt/tagName)
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           APP_APK="${{ steps.rename.outputs.app }}"
           APP_NAME="$(basename "$APP_APK")"

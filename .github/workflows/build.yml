@@ -15,7 +15,9 @@ name: CI Build (debug)
 
 on:
   push:
-    branches: ['*']
+    # '**' 而非 '*'：GitHub 的分支 glob 里 '*' 不跨 '/'，用 '*' 会漏掉 feat/xxx、fix/xxx 这类
+    # 带前缀的分支（CI 静默不触发，版本一致性门禁与 debug 编译一起失效）。
+    branches: ['**']
     tags-ignore: ['v*']
   pull_request:
 
