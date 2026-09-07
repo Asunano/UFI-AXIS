@@ -2,22 +2,22 @@
   "frontend": {
     "version": "0.0.1",
     "versionCode": 1,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.0.1/UFI-AXIS-app-0.0.1.apk",
+    "apkSha256": "1370263feb9a14840f23e0466b54c2cd5b3f11a414a6debedd61fa49c155b766",
     "changelog": "",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 6803954,
+    "publishedAt": "2026-09-07T11:24:04Z",
+    "tagName": "v0.0.1"
   },
   "backend": {
     "version": "0.0.1",
     "versionCode": 1,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.0.1/UFI-AXIS-core-0.0.1.apk",
+    "apkSha256": "3e0dc76de0478ce15ddf8a356819601db17c71ae1e99a83bcb9d0b8cf7ff22fd",
     "changelog": "",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 15332604,
+    "publishedAt": "2026-09-07T11:24:04Z",
+    "tagName": "v0.0.1"
   },
   "web": {
     "version": "0.0.1",
