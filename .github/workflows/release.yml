@@ -335,6 +335,19 @@ jobs:
           # 只推 main：远端没有 master 分支，`push HEAD:master` 兜底会凭空新建一条分支，故移除
           git push origin HEAD:main || echo "::warning::version.json 回写 push 失败（不阻断 release）"
 
+      # ── 标签前移到回写提交（2026-09-13）：根治「旧版无法升级」──
+      # 此前流程：tag 触发 → 构建 release → 再把 apkUrl 回写进 version.json 并 commit+push 到 main，
+      # 但 tag 始终指向「回写前」的提交，于是标签快照里的 version.json 永远缺少 apkUrl。
+      # 任何直接读标签快照的通道（或回写落地前的竞态窗口）会拿到空 apkUrl，
+      # 触发 App 端「清单缺少 apkUrl / apkurl 不合法」而无法下载升级。
+      # 这里把 tag 强移到回写后的 HEAD（已含 apkUrl），让标签快照与 main 一致。
+      # 仅 tag 触发时执行；workflow_dispatch（ref=main）跳过以免误移 main 上的 tag。
+      - name: Move tag to write-back commit (tag snapshot carries apkUrl)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          git tag -f "${{ github.ref_name }}" HEAD
+          git push -f origin "${{ github.ref_name }}"
+
       # 重复发布同一 tag 时先清空旧附件（softprops 不会删除不在 files 列表里的旧资产，
       # 否则改名前的 app-release-unsigned-signed.apk 会与新命名的 APK 残留共存）
       - name: Clean stale release assets
