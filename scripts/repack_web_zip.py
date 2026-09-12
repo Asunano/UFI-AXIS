@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Repack web/dist into web-0.0.1.zip using forward-slash entries only.
+"""Repack web/dist into web-0.0.2.zip using forward-slash entries only.
 
 The device-side ZipInputStream is sensitive to backslashes; zipfile on Windows
 would otherwise emit '\\' separators. We build from dist/ so the archive mirrors
@@ -10,7 +10,7 @@ import zipfile
 
 ROOT = r"D:\AndroidStudioProjects\new\UFI-AXIS"
 DIST = os.path.join(ROOT, "web", "dist")
-OUT = os.path.join(ROOT, "web-0.0.1.zip")
+OUT = os.path.join(ROOT, "web-0.0.2.zip")
 
 if not os.path.isdir(DIST):
     raise SystemExit(f"dist not found: {DIST}")
