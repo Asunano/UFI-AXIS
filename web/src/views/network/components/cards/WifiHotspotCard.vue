@@ -16,7 +16,9 @@
 
     <template #footer>
       <n-button size="small" @click="emit('open-qr')">
-        <template #icon><n-icon><QrCodeOutline /></n-icon></template>
+        <template #icon
+          ><n-icon><QrCodeOutline /></n-icon
+        ></template>
         显示二维码
       </n-button>
       <n-button size="small" type="primary" @click="emit('edit')">修改设置</n-button>
@@ -39,16 +41,18 @@ defineProps<{
 
 const emit = defineEmits<{
   'open-qr': [];
-  'edit': [];
+  edit: [];
 }>();
 </script>
 
 <style scoped>
-/* 2 列 KV：8 项 → 4 行 × 2 列。
-   删原 768 二次重排（断点统一由 Slice 2 处理）。 */
+/* KV 栅格：8 项自动铺成 2~4 列。
+   下限 260px 是按两个已知宽度定的 —— 通栏（~1150px 内容宽）时刚好 4 列 → 8 项 2 行；
+   仍是半宽（~550px）时回落 2 列 → 4 行，与 2026-09-10 之前的观感一致。
+   写死 repeat(2, ...) 的话通栏会退化成 4 行，卡片反而变高。 */
 .kv-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 0 20px;
 }
 </style>

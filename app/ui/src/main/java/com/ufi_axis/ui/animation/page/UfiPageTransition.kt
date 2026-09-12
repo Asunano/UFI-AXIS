@@ -12,7 +12,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.UfiExperimentalApi
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 页面转场的**默认时间曲线** —— 全库唯一来源。

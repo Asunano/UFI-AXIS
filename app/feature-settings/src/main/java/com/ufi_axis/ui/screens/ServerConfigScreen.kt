@@ -115,11 +115,11 @@ fun ServerConfigScreen(
                     )
                 }
 
-                // ── 2. 网关与密码（网关地址 + 管理密码 合一） ──
+                // ── 2. 设备后台（网关地址 + 后台密码 合一） ──
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Router,
-                        title = "网关与密码",
+                        title = "设备后台",
                         description = "$displayGwAddress · Web 管理 API",
                         onClick = { showGatewayPwdDialog = true },
                         trailing = { UfiSettingsChevron() }
@@ -211,7 +211,7 @@ fun ServerConfigScreen(
         )
     }
 
-    // ═══════════ DIALOG 2: 网关与密码（网关地址 + 密码修改） ═══════════
+    // ═══════════ DIALOG 2: 设备后台（网关地址 + 后台密码修改） ═══════════
     var gwAddr by remember(displayGwAddress) { mutableStateOf(displayGwAddress) }
     var gwSelectedTab by remember { mutableIntStateOf(0) }
     var oldPwd by remember { mutableStateOf("") }
@@ -226,7 +226,7 @@ fun ServerConfigScreen(
             gwSelectedTab = 0
             oldPwd = ""; newPwd = ""; confirmPwd = ""; gwPwdError = null
         },
-        title = "网关与密码",
+        title = "设备后台",
         icon = rememberVectorPainter(Icons.Filled.Router),
         showCloseButton = false,
         actions = {
@@ -263,7 +263,7 @@ fun ServerConfigScreen(
                     showGatewayPwdDialog = false
                     gwSelectedTab = 0
                     oldPwd = ""; newPwd = ""; confirmPwd = ""; gwPwdError = null
-                    toastMessage = ToastMessage("网关与密码已保存", ToastType.SUCCESS)
+                    toastMessage = ToastMessage("设备后台配置已保存", ToastType.SUCCESS)
                 },
                 onDismiss = {
                     showGatewayPwdDialog = false
@@ -274,11 +274,11 @@ fun ServerConfigScreen(
         }
     ) {
         UfiDialogBody {
-            // 滑块分栏：网关地址 / 管理密码，缩短单屏长度
+            // 滑块分栏：网关地址 / 后台密码，缩短单屏长度
             UfiScrollableTabRow(
                 selectedTabIndex = gwSelectedTab,
                 onTabSelected = { gwSelectedTab = it },
-                tabs = listOf("网关地址", "管理密码")
+                tabs = listOf("网关地址", "后台密码")
             )
             Spacer(Modifier.height(Spacing.Medium))
 
@@ -289,7 +289,7 @@ fun ServerConfigScreen(
                     Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
                         Text("网关地址", style = MaterialTheme.typography.titleSmall,
                             color = palette.accent)
-                        Text("Web 管理 API 地址，用于 Goform 指令通信",
+                        Text("设备自带网页后台的地址，用于下发控制指令",
                             style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
                     }
                     UfiDialogTextField(
@@ -301,9 +301,9 @@ fun ServerConfigScreen(
                 }
                 else -> {
                     Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
-                        Text("管理密码", style = MaterialTheme.typography.titleSmall,
+                        Text("设备后台密码", style = MaterialTheme.typography.titleSmall,
                             color = palette.accent)
-                        Text("修改路由器 Web 管理密码",
+                        Text("随身 WiFi 自带网页后台的登录密码",
                             style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
                     }
                     UfiDialogField(label = "当前密码") {

@@ -1,6 +1,5 @@
 package com.ufi_axis.ui.theme
 
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.lerp
 
@@ -288,35 +287,12 @@ data class ResolvedPalette(
 
     // scrim 已提升为构造字段（见上），原 `Color.Black.copy(alpha = …)` 写死实现删除。
 
-    /** 极光渐变（缎带 / 主按钮 / FAB / Hero 微光）。固定品牌签名：青→靛→紫，深浅共用亮色停止点。 */
-    val auroraGradient: Brush
-        get() = Brush.horizontalGradient(
-            colors = listOf(Color(0xFF34E7E4), Color(0xFF5B8CFF), Color(0xFFB14CFF))
-        )
-
-    /** 极光渐变之上的文字/图标色（深色字保证对比度，深浅主题均适用）。 */
-    val auroraOn: Color
-        get() = Color(0xFF04121A)
-
-    /** 主题渐变（由当前主题的 accent + accentSecondary 派生）。跟随主题色变换，用于 Hero / 大色块等需要主题色但不锁定具体色的位置。 */
-    val themeGradient: Brush
-        get() = Brush.horizontalGradient(
-            colors = listOf(
-                accent,
-                lerp(accent, accentSecondary, 0.5f),
-                accentSecondary
-            )
-        )
-
-    /** 极光柔光（Hero 微光填充等），半透明品牌色。 */
-    val auroraSoft: Brush
-        get() = Brush.horizontalGradient(
-            colors = listOf(
-                Color(0xFF34E7E4).copy(alpha = 0.18f),
-                Color(0xFF5B8CFF).copy(alpha = 0.18f),
-                Color(0xFFB14CFF).copy(alpha = 0.18f)
-            )
-        )
+    // 2026-09-07（P1d）：`auroraGradient` / `auroraOn` / `themeGradient` / `auroraSoft` 四个渐变
+    // getter 已删除 —— 全库零调用点（渐变 Hero 卡改用 accent + ufiShade 就地派生，见
+    // HomeConnectionCard / NetworkScreen / TrafficManagementScreen / MonitorOverview），
+    // 且前三个里写死的品牌极光三色是本类最后一批「不跟随皮肤」的输出色。
+    // 若日后需要主题渐变，请用 `accent` + `accentSecondary` + `Color.ufiShade` 现场组合，
+    // 不要恢复固定色值的 getter。
 }
 
 /** [ResolvedPalette.accentStrong] 的混合比例：一档 ≈ 16%，明显但不至于变成另一个颜色。 */
@@ -325,6 +301,7 @@ private const val ACCENT_STEP = 0.16f
 /** [ResolvedPalette.accentMuted] 的混合比例：往表面色混 60%，保留色相但退到低强调层级。 */
 private const val ACCENT_MUTE_RATIO = 0.60f
 
+
 /**
  * sRGB 分量线性混合（保持 [from] 的 alpha）。
  *
@@ -332,7 +309,7 @@ private const val ACCENT_MUTE_RATIO = 0.60f
  * 它在 Oklab 空间插值，结果无法由十六进制值直接推算，评审和回归对色时不好核对；
  * 而 accentStrong / accentMuted 要的只是"同色相深/浅一档"，sRGB 分量混合已足够，
  * 且与黑色混合恰好等价于 HSV 的 V 缩放（H、S 不变），行为可预测。
- * 仍保留 `warningContainer` / `themeGradient` 原有的 `lerp`，避免改动它们的观感。
+ * 仍保留 `warningContainer` 原有的 `lerp`，避免改动它的观感。
  */
 private fun srgbMix(from: Color, to: Color, ratio: Float): Color = Color(
     red = from.red + (to.red - from.red) * ratio,

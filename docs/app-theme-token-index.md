@@ -1,6 +1,7 @@
 # `com.ufi_axis.ui.theme` — 设计令牌索引
 
-> 建立于 2026-09-04（P3a/P3b，计划书 `docs/theme-migration-plan.md` 的 P3）。
+> 建立于 2026-09-04（P3a/P3b）；**2026-09-07 校准过一轮**。
+> 本文件只回答「改 X 去哪」，不记录「还剩什么没做」。
 > 目标是回答一个问题：**「我要改 X，去改哪个文件的哪一行？」**
 >
 > 为什么需要这份文档：改造前令牌散在 7 个文件 3 个包，其中动效令牌横跨
@@ -8,7 +9,11 @@
 > 要在三处之间来回找。P3a 把动效令牌搬进本包后，**所有设计令牌都在 `ui.theme` 一个包里**，
 > 本文件就是那个包的目录。
 >
-> ⚠ 行号是 2026-09-04 的实测值。改动这些文件后行号会漂移，**符号名是可靠的锚点，行号只是近路**。
+> ⚠ **行号只当近路用，符号名才是锚点。** 大部分行号是 2026-09-04 的实测值，此后
+> `ThemePalette`（色槽从 22 个构造参数长到 42 个）、`UfiCardDefaults`（已移入 `theme/`）、
+> `MotionTokens` 都改过，**已知存在整段偏移**。2026-09-07 只校准了这轮真正改过语义的行
+> （预设皮肤、默认皮肤 id、`aurora*` 删除、`outline` 桥接、三档新圆角、stagger、胶囊图标默认值），
+> 其余未逐条重数 —— 找不到就按符号名搜。
 
 ---
 
@@ -31,15 +36,19 @@
 ```
 theme/
   Color.kt            域色 + 图表色 + 语义色便捷入口
+  ColorContrast.kt    WCAG 对比度阈值 + contrastRatio / onColorFor / ufiShade（混色唯一来源）
+  CustomPalette.kt    自定义皮肤：一个种子色推出全部色槽
+  DynamicPalette.kt   Android 12+ 动态取色（Monet）接入
   MotionTokens.kt     ★ 动效令牌（2026-09-04 新建，合并自两个包）
   Spacing.kt          圆角 + 组件尺寸 + 间距
   Theme.kt            UFIAXISTheme 根组合 + palette → M3 ColorScheme 桥
   ThemeLocals.kt      CompositionLocal（palette / UI 缩放补偿）
   ThemeManager.kt     ☆ 运行时用户设置的持久化（不是设计令牌）
   ThemePalette.kt     色槽定义 + 派生色算法
-  ThemePresets.kt     ★ 唯一一套预设皮肤「默认」（2026-09-05 其余全部删除）
+  ThemePresets.kt     ★ 预设皮肤：中性灰阶「默认」1 套 + 彩色 6 套（rose/amber/lime/emerald/blue/violet）
 
   Type.kt             字体族 + 字阶 + 字重 + 语义文字样式
+  UfiBannerDefaults.kt 横幅（错误 / 离线 / 实时状态）的配色与形状默认值
   UfiCardDefaults.kt  形状语义 + elevation + 卡片 Modifier
   README.md           本文件
 ```
@@ -52,10 +61,10 @@ theme/
 
 | 想改 | 文件 : 行 | 符号 | 影响面 |
 |---|---|---|---|
-| 某套皮肤的具体色值 | `ThemePresets.kt:27` / `:49` / `:71` / `:93` / `:115` / `:137` | `Default` / `TechBlue` / `MintGreen` / `DreamPurple` / `VibrantOrange` / `Aurora` | 只影响该皮肤。改 `Aurora` 影响默认用户（默认皮肤 id 在 `ThemeManager.kt:27`） |
-| 新增一套皮肤 | `ThemePresets.kt:27~156` 后追加 + `:159` 加进 `allPresets` | `allPresets` | 设置页 `AppearanceSettingsScreen.kt:443` 自动遍历，**无需改任何 UI 代码** |
-| 皮肤下拉里的顺序 | `ThemePresets.kt:159` | `allPresets` 的 `listOf` 顺序 | 只影响设置页排列 |
-| 默认皮肤 | `ThemeManager.kt:27` **和** `:132` | 两处 `"aurora"` 字面量 | 两处必须同改（一处是首次读盘默认值，一处是跨实例监听的兜底值），只改一处会出现"重启后变回去" |
+| 某套皮肤的具体色值 | `ThemePresets.kt` 各预设定义处（`Default` / `Rose:143` / `Amber:165` / `Lime:193` / `Emerald:221` / `Blue:249` / `Violet:271`） | 7 套预设 | 只影响该皮肤。改 `Default` 影响未选过皮肤的用户（默认 id = `ThemePresets.DEFAULT_ID` = `"default"`，`ThemePresets.kt:81`） |
+| 新增一套皮肤 | `ThemePresets.kt` 追加定义 + `:304` 加进 `allPresets` | `allPresets` / `ALLOWED_IDS:321` / `SELECTABLE_IDS:336` | 设置页自动遍历，**无需改任何 UI 代码**；`ColorTest.kt:241` 钉着 id 列表，加皮肤要同步那一行 |
+| 皮肤下拉里的顺序 | `ThemePresets.kt:304` | `allPresets` 的 `listOf` 顺序 | 只影响设置页排列 |
+| 默认皮肤 | `ThemeManager.kt:271`（**只有这一处**） | `prefs.getString(KEY_THEME_ID, ThemePresets.DEFAULT_ID)` + `normalizeThemeId` | 2026-09-05 起 `prefListener` 刻意不再有 `KEY_THEME_ID` 分支（磁盘旧值会盖回内存新值），跨实例走 companion 共享 flow，所以**不存在"两处必须同改"** |
 | 新增一个**语义色槽** | `ThemePalette.kt:11`（构造参数）+ `:97`（`resolve()`）+ `ResolvedPalette` `:126` | `ThemePalette` / `resolve` / `ResolvedPalette` | 加 `ResolvedPalette` 字段会让所有构造点编译失败（`resolve()` 与 `ColorTest`）——**这是护栏不是麻烦**，能挡住漏改。`ThemePalette` 新参数请给默认值，否则 6 个预设全要改 |
 | 按压态 / disabled 的主色深浅档 | `ThemePalette.kt:190` / `:200`；比例常量在 `:291` / `:294` | `accentStrong` / `accentMuted` / `ACCENT_STEP` / `ACCENT_MUTE_RATIO` | 全站所有按压态与禁用态主色。改比例是"一行改全站"，改完两种明暗都要看 |
 | 主色浅底（选中行底色） | `ThemePalette.kt:229` | `accentContainer` | 选中行、被强调卡片、M3 的 `primaryContainer` / `tertiaryContainer`（`Theme.kt:26`/`:52` 桥接） |
@@ -63,8 +72,8 @@ theme/
 | 描边 / 分隔线的 alpha | `ThemePalette.kt:152` / `:156` / `:160` / `:208` / `:243` | `cardBorder` / `dialogBorder` / `toastBorder` / `inputBorder` / `chipUnselectedBorder` | 各自独立一档，分别对应卡片/弹窗/Toast/输入框/chip。**不要合并**：弹窗描边刻意比卡片重（层级区分） |
 | 开关配色 | `ThemePalette.kt:88~92`（关闭态槽）+ `:168` / `:172`（开启态派生） | `switchTrackOff*` / `switchThumbOff*` / `switchTrackOn` / `switchThumbOn` | 全站所有 `UfiSwitch` |
 | 遮罩 | `ThemePalette.kt:68` | `scrimLight` / `scrimDark` | 所有弹窗/抽屉背后的暗化层 |
-| 品牌渐变 | `ThemePalette.kt:260` / `:266` / `:270` / `:280` | `auroraGradient` / `auroraOn` / `themeGradient` / `auroraSoft` | ⚠ 这四个当前**零调用点**（计划书 §2.4(d) 记录，P1d 待清）。改它们现在看不到效果 |
-| M3 组件的取色（`MaterialTheme.colorScheme`） | `Theme.kt:21` | `buildColorSchemeFromPalette` | 所有裸 M3 组件。⚠ 里面 `onPrimary`/`onSecondary`/`onTertiary`/`onError` 仍写死 `Color.White`（`:25`/`:29`/`:33`/`:37` 与 `:51`/`:55`/`:59`/`:63`），浅色 accent 皮肤下会看不见字 |
+| 品牌渐变 | — | ~~`auroraGradient` / `auroraOn` / `themeGradient` / `auroraSoft`~~ | 2026-09-07（P1d）**已删除**：四者全库零调用点，且前三个里写死的品牌极光三色是本类最后一批不跟随皮肤的输出色。需要主题渐变请用 `accent` + `accentSecondary` + `Color.ufiShade` 现场组合 |
+| M3 组件的取色（`MaterialTheme.colorScheme`） | `Theme.kt:23` 起 | `buildColorSchemeFromPalette` | 所有裸 M3 组件。2026-09-04 起 `onPrimary`/`onSecondary`/`onTertiary` 接 `onAccent`、`onError` 接 `onError`、`outline` 接 `inputBorder`，**已无写死 `Color.White`**（该文件连 `import Color` 都不需要了，是体检信号）；映射被 `ColorTest.kt:509-538` 钉住 |
 
 ### 1.2 域色（信号 · 电量 · 图表 · 流量 · 频段）
 
@@ -72,7 +81,7 @@ theme/
 
 | 想改 | 文件 : 行 | 符号 | 影响面 |
 |---|---|---|---|
-| 信号强度 5 档 | `Color.kt:15~19` | `SignalExcellent` / `Good` / `Fair` / `Poor` / `Dead` | 实际只被 `UfiSignalBars.kt` 内部使用（计划书 §2.4(c) 实测：三个 `*Color()` 函数外部零调用），影响面比看起来小 |
+| 信号强度 5 档 | `Color.kt:15~19` | `SignalExcellent` / `Good` / `Fair` / `Poor` / `Dead` | 只被 `UfiSignalBars.kt` 内部的 `signalColor()` 使用（2026-09-07：同组的 `networkTypeColor()` / `batteryColor()` 因全库零调用已删除，它们消费的制式/电量色常量暂留，待「域色是否随皮肤」定案），影响面比看起来小 |
 | 网络制式 4 档 | `Color.kt:22~25` | `Network5G` / `4G` / `3G` / `2G` | 同上 |
 | 电量 3 档 | `Color.kt:28~30` | `BatteryHigh` / `Medium` / `Low` | 同上 |
 | 上/下行流量色 | `Color.kt:33~34` | `TrafficDown` / `TrafficUp` | 流量卡片、图表图例 |
@@ -90,7 +99,7 @@ theme/
 | 换整套字体 | `Type.kt:25`（接口）+ `:47`（注入） | `FontSet` / `setFontSet` | 全站。**只在首屏 `UFIAXISTheme` 组合之前调用有效**（`Typography` 是顶层 `val`，首次触达即固化）——写在 `Application.onCreate` |
 | 当前默认字体 | `Type.kt:31` | `SystemFontSet` | 三族（display/body/mono）当前都指向系统字体 |
 | 等宽字体 | `Type.kt:55` | `MonoFont` | 所有 `mono*` 文字样式（`Type.kt:285~299`）：dBm / IP / 速率 / 时间戳 / 日志 / 代码 |
-| 让"标题族"与"正文族"真的不同 | `Type.kt:31~35` 让 `display` 与 `body` 返回不同 `FontFamily` | `SystemFontSet` | ⚠ 现状两者同为 `FontFamily.Default`，所以 `Type.kt:281` `listItemTitle` 注释里说的"靠字体族区分层级"**当前是失效的**，层级只由字号与字重承担 |
+| 让"标题族"与"正文族"真的不同 | `Type.kt` 的 `SystemFontSet` 里让 `display` 与 `body` 返回不同 `FontFamily` | `SystemFontSet` | ⚠ 现状两者同为 `FontFamily.Default`（只有 `mono` 是 `FontFamily.Monospace`），所以"靠字体族区分层级"**当前是失效的**，层级只由字号与字重承担。`listItemTitle` 与顶栏两处 KDoc 已如实标注失效原因与恢复条件，**代码注释不需要再修**；要不要真的引入第二个字体族是待决项 |
 
 ### 1.4 字阶（字号 / 行高 / 字距）
 
@@ -114,9 +123,10 @@ theme/
 | **全站基准圆角** | `Spacing.kt:12` | `CornerBase = 12.dp` | 卡片 / 按钮 / 输入框 / chip / toast / 小组件全部跟随（`UfiCardDefaults` 里 10 个 `*CornerRadius` 都指向它）。**这是"全站圆角改一档"的唯一入口** |
 | 弹窗圆角 | `Spacing.kt:20` | `CornerDialog = 12.dp` | 只影响弹窗。当前与 `CornerBase` 同值；保留独立常量就是为了"弹窗单独变圆"只需改这一行 |
 | 徽章/进度轨道 | `Spacing.kt:22` | `CornerMicro = 6.dp` | `microShape` |
-| 圆角梯度其余档 | `Spacing.kt:27` / `:29` / `:31` / `:33` / `:35` / `:37` / `:39` / `:49` | `CornerTrack 4` / `CornerTag 5` / `CornerSmall 8` / `CornerMedium 14` / `CornerLarge 16` / `CornerCapsule 24` / `CornerBubble 25` / `CornerChatBubble 12` | 各自一个语义。**不要跨语义借用**——2026-09-03 就是因为 `chatBubbleShape` 借用 `CornerDialog`，导致"改弹窗圆角连带改短信气泡"才拆出 `CornerChatBubble` |
-| 聊天输入框圆角 | `UfiCardDefaults.kt:177` | `chatInputCornerRadius = 20.dp` | ⚠ 这一档**没有走 `Spacing`**，直接写在 `UfiCardDefaults`。属遗留不一致（见 §6 末） |
-| 细线轨道圆角 | `UfiCardDefaults.kt:106` | `hairlineCornerRadius = 1.dp` | 同上，也没走 `Spacing` |
+| 圆角梯度其余档 | `Spacing.kt` 的 `Corner*` 段 | `CornerTrack 4` / `CornerTag 5` / `CornerSmall 8` / `CornerMedium 14` / `CornerLarge 16` / `CornerCapsule 24` / `CornerBubble 25` / `CornerChatBubble 12` | 各自一个语义。**不要跨语义借用**——2026-09-03 就是因为 `chatBubbleShape` 借用 `CornerDialog`，导致"改弹窗圆角连带改短信气泡"才拆出 `CornerChatBubble` |
+| 聊天输入框圆角 | `Spacing.kt` 的 `CornerChatInput = 20.dp` | `UfiCardDefaults.chatInputCornerRadius` 现已派生自它 | 2026-09-07 修：此前直接写在 `UfiCardDefaults`，是"圆角全部取自 Spacing"这句话的反例 |
+| 细线轨道圆角 | `Spacing.kt` 的 `CornerHairline = 1.dp` | `UfiCardDefaults.hairlineCornerRadius` 现已派生自它 | 同上，2026-09-07 一并收敛 |
+| 气泡尖角 | `Spacing.kt` 的 `CornerBubbleTip = 4.dp` | `consoleBubbleShape` / `chatBubbleShape` 内的尖角 | 2026-09-07 修：原为两个函数内 4 处就地 `4.dp`。值与 `CornerTrack` 相同但语义不同（轨道 vs 气泡指向），刻意分开 |
 
 ### 1.7 形状语义（业务代码该用的东西）
 
@@ -127,7 +137,7 @@ theme/
 | 语义 shape 总表 | `UfiCardDefaults.kt:38`（对象起始） | `shape:47` / `largeShape:42` / `smallShape:52` / `widgetShape:67` / `dialogShape:77` / `toastShape:82` / `inputShape:87` / `microShape:92` / `buttonShape:97` / `chipShape:102` / `bottomSheetTopShape:72` / `smsSheetTopShape:183` | 每个 `*Shape` 都从 `Spacing.Corner*` 派生 → **想调圆角改 `Spacing.kt`，想调"哪个组件用哪档"改这里** |
 | 全圆 / 药丸 | `UfiCardDefaults.kt:112` | `pillShape`（`percent = 50`） | 进度条、圆点、药丸按钮。与 dp 无关，半径永远等于高度一半 |
 | 梯度 shape | `UfiCardDefaults.kt:117` / `:122` / `:127` / `:132` / `:137` / `:142` | `trackShape` / `tagShape` / `subtleShape` / `mediumShape` / `iconTileShape` / `capsuleShape` | 分别对应 §1.6 的 `CornerTrack/Tag/Small/Medium/Large/Capsule` |
-| 不对称气泡 | `UfiCardDefaults.kt:146`（控制台）/ `:167`（短信） | `consoleBubbleShape(isUser)` / `chatBubbleShape(isReceived)` | 两个函数内的"尖角"都写死 `4.dp`（`:150~151`、`:171~172`），不在 `Spacing` 里 |
+| 不对称气泡 | `UfiCardDefaults.kt` 的 `consoleBubbleShape` / `chatBubbleShape` | `consoleBubbleShape(isUser)` / `chatBubbleShape(isReceived)` | 主圆角取 `Spacing.CornerBubble`(25) / `CornerChatBubble`(12)，尖角取 `Spacing.CornerBubbleTip`(4)。⚠ 两种气泡主圆角差一倍，属待收敛项 |
 
 ### 1.8 组件尺寸
 
@@ -164,7 +174,7 @@ theme/
 | 时长梯度（17 档） | `MotionTokens.kt:188`（`Duration`） | `Flick 90:195` / `Micro 120:197` / `Swift 160:199` / `Quick 180:201` / `Base 200:203` / `Standard 220:205` / `Fluid 250:212` / `Gentle 280:214` / `Smooth 300:216` / `Sweeping 320:225` / `Deliberate 400:227` / `Emphatic 420:233` / `Reveal 600:235` / `Languid 800:237` / `Orbit 1000:239` / `Ambient 1200:241` / `Pulse 1500:243` | 改一档 = 改所有引用该档的调用点。高危档：`Base`（全站最常用）、`Sweeping`（页面转场锚点，7 个调用点） |
 | **页面转场默认时长** | `MotionTokens.kt:225` → 实际拼装在 `animation/page/UfiPageTransition.kt:33` | `Duration.Sweeping` → `UfiPageTransitionDefaultSpec` | 接口默认 spec（`UfiPageTransition.kt:85`）与宿主 fallback（`UfiPageSwitcherHost.kt:1421`）共用它。**这是 P2c 修过的 bug 隐患**：以前两处各写一遍 320，改一处另一处静默不同步 |
 | 标题模糊时长 | `MotionTokens.kt:367` | `HEADER_TITLE_BLUR_MS = 350` | 只影响 `UfiHeader` 的标题模糊。**有意例外**（不在梯度上），原名 `PAGE_TRANSITION_MS` 名不符实已改名 |
-| 列表交错延迟 | `MotionTokens.kt:378` | `STAGGER_DELAY_MS = 35L` | `Modifier.staggeredEntrance`（`animation/StaggeredEntrance.kt:40`）。第 N 项延迟 = N × 本值，改成 50 会让第 10 项从 350ms 涨到 500ms |
+| 列表交错延迟 | `MotionTokens.kt` 的 `STAGGER_DELAY_MS = 35L` | `STAGGER_DELAY_MS` | 第 N 项延迟 = N × 本值。⚠ 2026-09-07：唯一消费者 `Modifier.staggeredEntrance` 因全库零调用点已删除，本常量**暂留**作为交错入场的时间口径 —— 重新实现时引用它，不要再写裸 35 |
 | 数据刷新淡入 | `MotionTokens.kt:381` | `DATA_FADE_MS`（= `Duration.Smooth`） | 别在这里改数值，它只是 `Smooth` 的别名 |
 | 胶囊收起时长 | `ui/navigation/MainNavGraph.kt:109` | `CAPSULE_HIDE_MS = 360` | ⚠ **唯一留在 `ui.theme` 外的时长**，`private const val`、单一调用点（`:448`）、有意例外。若哪天它有了第二个使用点，就该收进 `Duration` |
 
@@ -275,7 +285,7 @@ Color.NeutralOutline ─► cardShadowColor
 | 过渡模糊开关 | `blurEnabled:74`，setter `:230` | 默认 `true` | 只作用于 **Tab 切页**（`UfiPageSwitcher` 宿主的 `applyTransitionBlur`），经 `LocalUfiBlurEnabled` 下传；弱机由 `UfiPageSwitcherDefaults.isBlurSupported` 强制降级。⚠ 2026-09-05 曾被误当成"切页抽搐/卡顿"的根因整体删除，已完整还原 —— 真实根因是胶囊索引双数据源 / `UfiScreenScaffold` 缺 `background()` / 胶囊窗口 relayout 重放这三处。正向护栏见 `NavInsetHandoffGuardTest.pageSwitcher_mustBlurDuringTransition` |
 | 全局 UI 缩放 | `uiScalePercent:84`，setter `:239` | `UI_SCALE_BASE = 0.9f`（`:421`）× `percent/100`；默认 100（`:422`）；区间 90~120（`:423~424`） | 落地方式是在 `Theme.kt:117~125` 覆盖 `LocalDensity`，**不是**改 `Spacing`/`Type` 常量 —— 全仓约 1500 处硬编码 dp 不走 `Spacing`，改常量只会"卡片变小内部间距不变"。下限 90% 已让 `ButtonHeight 48dp` 落到 ≈38.9dp（接近触摸目标下限），不要再放低 |
 | 胶囊抬高 | `capsuleLiftDp:98`，setter `:257` | 默认 30（`:445`），区间 0~40（`:446~447`） | 位置参数 |
-| 胶囊图标尺寸 | `capsuleIconSizeDp:104`，setter `:267` | 默认 38（`:455`），区间 18~40（`:456~457`） | 上限必须 ≥ 默认值，否则 `coerceIn` 会把默认值夹掉 |
+| 胶囊图标尺寸 | `capsuleIconSizeDp`，setter 同区块 | 默认 **26**（`ThemeManager.kt:755`），区间 18~40（`:756~757`） | 2026-09-04 由 38 降到 26：38dp 会把 Tab 单元格撑成近正方形，选中滑块圆角取自身半高 → 必然渲染成圆点。上限必须 ≥ 默认值，否则 `coerceIn` 会把默认值夹掉 |
 | 胶囊标签字号 | `capsuleLabelTextSp:110`，setter `:277` | 默认 10（`:460`），区间 8~14（`:461~462`） | 与令牌 `UfiTextStyles.capsuleLabel`（`Type.kt:311`）**配合**：样式来自令牌、字号来自本设置 |
 | 胶囊圆角 | `capsuleCornerDp:116`，setter `:288` | 默认 30（`:465`），区间 10~30（`:466~467`） | 与 `Spacing.CornerCapsule`（24dp）**无关**，别改错 |
 | 胶囊图标文字间隔 | `capsuleIconTextSpacingDp:127`，setter `:299` | 默认 0（`:477`），区间 0~12（`:478~479`） | 0 是**合法**下限，下游判据用 `>= 0` 而不是 `> 0` |
@@ -300,7 +310,7 @@ Color.NeutralOutline ─► cardShadowColor
 
 ## 4. 规范名 ↔ 现名映射表
 
-`docs/design-system-spec.md` 用 M3 语义命名，本项目用自研命名。
+Material 3 设计规范用 M3 语义命名，本项目用自研命名。
 **项目有意不改名（决策 D1）**：改名要重写 405 处引用，属纯风格 churn，不减少任何入口（决策 D8）。
 所以需要这张桥梁表 —— 拿规范当"色值/字阶取值参考"时照它翻译。
 
@@ -318,7 +328,7 @@ Color.NeutralOutline ─► cardShadowColor
 | `background` | `pageBg` | `ThemePalette.kt:21` |
 | `onSurface` | `textPrimary` | `ThemePalette.kt:27` |
 | `onSurfaceVariant` | `textSecondary` | `ThemePalette.kt:30` |
-| `outline` | `textSecondary`（M3 桥接）/ 语义上是 `cardBorder` 一族 | `Theme.kt:46` / `:72`；`ThemePalette.kt:152` |
+| `outline` | `inputBorder`（M3 桥接，2026-09-04 起）；卡片描边语义仍是 `cardBorder` 一族 | `Theme.kt:89` / `:116`；`ThemePalette.kt:240` |
 | `outlineVariant` | `divider` | `ThemePalette.kt:33`；桥接 `Theme.kt:47` / `:73` |
 | `error` / `onError` | `error` / `onError` | `ThemePalette.kt:49` / `:79` |
 | `accentStrong` | `accentStrong`（同名） | `ThemePalette.kt:190` |
@@ -404,35 +414,41 @@ Color.NeutralOutline ─► cardShadowColor
 
 ---
 
-## 6. 动效令牌的迁移状态（读旧代码时会遇到）
+## 6. 动效令牌的迁移状态
 
-P3a 只搬定义、**没有改约 287 处调用点**（一次性改会让 diff 大到无法评审）。所以现在有两条路径并存：
+**2026-09-07 迁移完成，两条路径已合并为一条。**
 
 | | 路径 | 状态 |
 |---|---|---|
-| 新代码 | `com.ufi_axis.ui.theme.UfiMotion` / `UfiAnimSpecs` | ✅ 唯一真实定义（`theme/MotionTokens.kt`） |
-| 旧代码 | `com.ufi_axis.ui.components.common.UfiMotion`（`Ufi.kt`）<br>`com.ufi_axis.ui.animation.UfiAnimSpecs`（`UfiAnimations.kt`） | ⚠ `@Deprecated` 转发壳，**零行为、零字面量**，只把调用转到 `ui.theme` |
+| 全部代码 | `com.ufi_axis.ui.theme.UfiMotion` / `UfiAnimSpecs`（`theme/MotionTokens.kt`） | ✅ 唯一定义、唯一入口 |
+| ~~旧路径~~ | ~~`components.common.UfiMotion`（`Ufi.kt`）/ `animation.UfiAnimSpecs`（`UfiAnimations.kt`）~~ | ❌ 两个 `@Deprecated` 转发壳已删除；`UfiAnimations.kt` 整文件删除 |
 
-要点：
+迁移实测（留档，便于日后做同类收口时估工）：
 
-- 旧 import **零改动仍可编译**，只会拿到废弃警告。改一个文件时顺手把 import 换到 `ui.theme` 即可，
-  不必成批改。全部迁完后删掉两个转发壳。
-- 用**转发 `object`** 而不是 `typealias`：Kotlin 的 `typealias` 只在类型位置生效，
-  `UfiMotion.Duration.Base` 这种"通过对象名访问成员"的表达式位置用不了别名，旧调用点会直接编译失败。
-- **同时 `*` 导入 `components.common` 与 `theme` 的文件会撞名**（两个同名 object 优先级相同 →
-  `Overload resolution ambiguity`）。解法是加一行显式 `import com.ufi_axis.ui.theme.UfiMotion`
-  ——显式导入优先级高于星号导入。实测本仓只有 `MonitorScreen.kt` 命中，已加（见其 import 处注释）。
+- 消费方共 **32 个文件**，分三类：显式 import 旧包 8 个、`components.common` 同包隐式引用 20 个、
+  **靠 `import components.common.*` 星号导入解析** 4 个（`SmsScreen` / `AdvancedConsoleScreen` /
+  `TaskScreen` / `UpdateDialogs`，另 `SetupScreen` 同型）。第三类最容易漏 —— 它们既没有旧 import
+  可供 grep，也不在同包清单里，**只有编译器能发现**（第一轮改完后正是这 4 个报
+  `Unresolved reference 'UfiMotion'`）。
+- 判据最终用的是「引用了 `UfiMotion.` 但文件里没有 `com.ufi_axis.ui.theme.UfiMotion` 就补一行 import」，
+  一次覆盖三类。副作用：只在注释/KDoc 里提到 `UfiAnimSpecs.` 的文件也会被误判，多加的 3 行已手动删掉。
+- 验收：`./gradlew :app:assembleDebug` 通过，且日志里 **`UfiMotion is deprecated` 警告归零**
+  （剩余警告全是 Compose 自身的 API 弃用，与本项无关）。
 
-### 6.1 已知的遗留不一致（登记但本轮未改）
+一条仍然有效的经验：**同时 `*` 导入两个包会撞名**（同名 object 优先级相同 →
+`Overload resolution ambiguity`），解法是加显式 import —— 显式优先于星号。
 
-1. `UfiCardDefaults.chatInputCornerRadius = 20.dp`（`:177`）与 `hairlineCornerRadius = 1.dp`（`:106`）
-   **没有走 `Spacing.Corner*`**，是形状语义层里直接写的 dp。其余 12 个 `*CornerRadius` 都是从
-   `Spacing` 派生的，所以"改圆角只改 `Spacing.kt`"这句话对这两档不成立。
-2. `consoleBubbleShape` / `chatBubbleShape` 里的"尖角" `4.dp`（`:150~151` / `:171~172`）同样是就地字面量。
-3. `Theme.kt` 的 M3 桥接里 `onPrimary` / `onSecondary` / `onTertiary` / `onError` 仍写死 `Color.White`
-   （`:25`/`:29`/`:33`/`:37`、`:51`/`:55`/`:59`/`:63`），而 `ResolvedPalette` 已经有可配置的
-   `onAccent` / `onError` 色槽 —— 浅色 accent 皮肤下裸 M3 组件会出现白字白底。属换肤链路残留（计划书 P1c 范畴）。
-4. 同一个 `outline` 概念在项目里有两套答案：M3 桥接把 `outline` 接到 `textSecondary`（`Theme.kt:46`/`:72`），
-   而语义上的描边色是 `cardBorder` 一族。裸 M3 组件的描边因此比自研组件重得多。
-5. `auroraGradient` / `auroraOn` / `auroraSoft` / `themeGradient`（`ThemePalette.kt:260~287`）当前零调用点。
-6. 间距仍是"语义命名"而非"尺度阶梯"，缺 24/32/48 档（P3d 可选项，本轮跳过）。
+### 6.1 已知的遗留不一致
+
+1. ~~`chatInputCornerRadius` / `hairlineCornerRadius` 没走 `Spacing`~~ → **2026-09-07 已修**：
+   新增 `Spacing.CornerChatInput`(20dp) / `CornerHairline`(1dp)，两档改为派生。
+2. ~~`consoleBubbleShape` / `chatBubbleShape` 里的尖角 `4.dp` 是就地字面量~~ → **已修**：
+   新增 `Spacing.CornerBubbleTip`(4dp)，4 处全部改为派生。至此 `UfiCardDefaults` 里
+   「圆角全部取自 `Spacing`」这句话**真的成立**了。
+3. ~~`Theme.kt` 的 M3 桥接写死 `Color.White`~~ → **2026-09-04 已修**（见 §1.1 最后一行）。
+4. ~~`outline` 有两套答案~~ → **2026-09-04 已修**：M3 `outline` 接 `inputBorder`，
+   `Theme.kt:46-53` 有"为什么不接更弱的 `cardBorder`"的论证。
+5. ~~`aurora*` / `themeGradient` 零调用~~ → **2026-09-07 已删除**（见 §1.1 品牌渐变行）。
+6. 间距仍是"语义命名"而非"尺度阶梯"，缺 24/32/48 档（P3d 可选项，仍未做）。
+7. `MonitorOverview` 严重度色块图标仍写死 `Color.White`（severity 实底之上的前景），
+   属「语义实底 + 白前景」这个更大的议题。

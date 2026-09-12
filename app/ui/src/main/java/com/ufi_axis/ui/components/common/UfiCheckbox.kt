@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * Themed checkbox with label and optional description.

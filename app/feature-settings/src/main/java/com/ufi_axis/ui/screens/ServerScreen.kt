@@ -22,7 +22,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 /**
  * 「服务器」二级入口主页（v2 2026-08-23：去掉顶部 Tab，改成 3 张入口卡）。
  *
- * 历史：原 v1 在页面顶部 UfiScrollableTabRow「服务器配置 / 设备控制 / 配对管理」三 Tab，
+ * 历史：原 v1 在页面顶部 UfiScrollableTabRow「服务器配置 / 设备控制 / 配对与访问」三 Tab，
  * 各 Tab 内嵌调用对应 Screen（showHeader=false）。现按用户偏好去掉 Tab，
  * 把 3 个二级页平铺成 3 张入口卡（图标 + 标题 + 副标题 + chevron），
  * 点击后 navigate 到 DETAIL_SERVER_CONFIG / DETAIL_DEVICE_CONTROL / DETAIL_PAIRING
@@ -44,12 +44,12 @@ fun ServerScreen(
                 Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 入口 1：服务器配置（Core 连接 / 网关密码 / QoS）
+                // 入口 1：服务器配置（连接地址 / 设备后台 / Web 面板）
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Router,
                         title = "服务器配置",
-                        description = "Core 连接 · 网关密码 · QoS 性能",
+                        description = "连接地址 · 设备后台 · Web 面板",
                         onClick = { navController.navigate(Routes.DETAIL_SERVER_CONFIG) },
                         trailing = { UfiSettingsChevron() }
                     )
@@ -66,12 +66,12 @@ fun ServerScreen(
                     )
                 }
 
-                // 入口 3：配对管理
+                // 入口 3：配对与访问
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Smartphone,
-                        title = "配对管理",
-                        description = "已配对设备列表与密码管理",
+                        title = "配对与访问",
+                        description = "已配对设备 · 配对密码 · 数量限制",
                         onClick = { navController.navigate(Routes.DETAIL_PAIRING) },
                         trailing = { UfiSettingsChevron() }
                     )

@@ -35,6 +35,8 @@
 - [Web 前端资源 /api/web](#web-前端资源-apiweb)
 - [内网穿透 /api/tunnel](#内网穿透-apitunnel)
 - [邮件通知 /api/sms-forward](#邮件通知-apisms-forward)
+- [Webhook 通知 /api/notify/webhook](#webhook-通知-apinotifywebhook)
+- [本机短信通知 /api/notify/sms](#本机短信通知-apinotifysms)
 - [定时任务 /api/tasks](#定时任务-apitasks)
 - [自动化规则 /api/rules](#自动化规则-apirules)
 - [下载管理 /api/downloads](#下载管理-apidownloads)
@@ -236,14 +238,30 @@ WebCrypto 输出 **raw r||s**（固定 64 字节），core 按长度判定后统
 
 ### 鉴权失败的响应
 
-失败一律回**自定义状态码 `444`** + `{ "error": "...", "code": "..." }`（不是 401）——
-客户端按 444 判「需要重新配对/登录」。`code` 取值：
+失败体形状固定为 `{ "error": "...", "code": "..." }`，**状态码本身就是给客户端的指令**
+（2026-09-08 拆分，此前一律回 444）：
 
-| code | 触发条件 |
-| --- | --- |
-| `UNAUTHORIZED` | 没带 `Authorization`，或 token 哈希不匹配任何已配对设备 |
-| `INVALID_DEVICE_KEY` | 设备记录里没有公钥（旧记录）→ 必须重新配对 |
-| `INVALID_SIGNATURE` | 缺签名头 / 时间戳超窗 / 验签失败 / nonce 重放 |
+| 状态码 | 含义 | 客户端应做的事 |
+| --- | --- | --- |
+| `444`（自定义） | 凭据不作数了 | 清空本地 token，回配对流程 |
+| `401` | 这次请求本身有问题 | **保留凭据**，修好参数重试 |
+| `503` | 服务端配对存储不可读（降级） | **保留凭据**，按 `Retry-After` 退避重试 |
+
+`code` 取值：
+
+| code | HTTP | 触发条件 |
+| --- | --- | --- |
+| `UNAUTHORIZED` | 444 | 没带 `Authorization`，或 token 哈希不匹配任何已配对设备 |
+| `INVALID_DEVICE_KEY` | 444 | 设备记录里没有公钥（旧记录）→ 必须重新配对 |
+| `INVALID_SIGNATURE` | 401 | 缺签名头 / 验签失败 / nonce 重放（换新的 ts+nonce 重签即可） |
+| `STALE_TIMESTAMP` | 401 | `X-Timestamp` 超出 ±5min 窗口 → 校时后重试 |
+| `AUTH_STORE_UNAVAILABLE` | 503 | 服务端 `paired_devices.json` 读不出来，**判不了**你是否已配对 |
+
+为什么要拆 401/503 出来：444 在两端的约定是"清凭据、重新配对"。
+时钟漂移、少发一个签名头、以及服务端配对文件损坏，都是**可自愈**的临时故障；
+把它们也映射成 444，等于让一次临时故障销毁用户凭据 ——
+2026-09-08 就发生过「Core 重启后配对文件损坏 → 全部客户端被判未配对 → 用户被迫重新输密码」。
+降级态回 503 把这个事故从"全员重新配对"降级成"客户端退避重试"。
 
 ### 免鉴权范围
 
@@ -283,16 +301,18 @@ WebSocket 有自己的一套握手鉴权（query 参数，见 [WebSocket /ws/rea
 | 200 | 成功 |
 | 201 | 创建成功 |
 | 400 | 请求参数错误 |
-| 401 | 业务级凭据校验失败（**配对/设备密码**：`INVALID_CODE` / `INVALID_PASSWORD` / `INVALID_DEVICE_KEY` 等） |
+| 401 | 业务级凭据校验失败（**配对码/配对密码**：`INVALID_CODE` / `INVALID_PASSWORD` / `INVALID_DEVICE_KEY` 等），以及 `/api/**` 的**可重试**鉴权失败（`INVALID_SIGNATURE` / `STALE_TIMESTAMP`） |
 | 403 | 禁止访问（如非本地子网访问 `/pairing/*`、诊断端点开关关闭） |
 | 404 | 资源不存在 |
 | 409 | 冲突（如重复下载） |
 | 413 | 请求体过大（默认 >512KB，上传类端点见「服务器配置」） |
 | 429 | 请求过于频繁 / 密码错误锁定 / 测速并发位耗尽 |
-| 444 | **`/api/**` 鉴权失败**（自定义码：token 无效 / 缺签名头 / 验签失败 / 重放），客户端据此判「需重新配对」 |
+| 444 | **`/api/**` 凭据失效**（自定义码：没带 token / token 不认识 / 记录缺公钥），客户端据此判「需重新配对」 |
 | 500 | 服务器内部错误 |
+| 503 | `/api/**` 配对存储不可读（`AUTH_STORE_UNAVAILABLE`），带 `Retry-After`，**不要**清凭据 |
 
-`/api/**` 的鉴权失败**不会**回 401 —— 401 只出现在配对与密码相关的业务校验里。
+`/api/**` 的鉴权失败按「是不是可自愈」分流：凭据真失效走 444，
+签名/时间戳这类请求级问题走 401，服务端存储降级走 503（见[认证与授权](#认证与授权)）。
 
 ---
 
@@ -357,11 +377,11 @@ POST /pairing/confirm
        "device_pubkey": "<SPKI DER base64>",
        "challenge": "Zm9vYmFy...",
        "signature": "<sign(challenge)>",
-       "password": "mypass123",          # 首次配对：这就是新设备密码
+       "password": "mypass123",          # 首次配对：这就是新配对密码
        "device_name": "My Browser" }
      → { "token": "abc...", "fingerprint": "Xy9..." }
 
-# ④ 之后每个 /api 请求都要四件套（缺一即 444）
+# ④ 之后每个 /api 请求都要四件套（缺一即 401 INVALID_SIGNATURE）
 GET /api/dashboard/summary
     Authorization: Bearer abc...
     X-Timestamp: 1767225600000
@@ -370,7 +390,7 @@ GET /api/dashboard/summary
 ```
 
 已配对过的设备重新登录时，`pairing_code` 可传空串 —— 一次性码只在服务重启重新进入配对模式时
-才会重新生成，已初始化设备凭**设备密码**登录即可（`loginByPassword` 分支）。
+才会重新生成，已初始化设备凭**配对密码**登录即可（`loginByPassword` 分支）。
 
 #### `GET /pairing/info`
 
@@ -392,9 +412,17 @@ GET /api/dashboard/summary
 - `storage_status` 的两个键是 **camelCase**（`hasRoot` / `isExternalStorageManager`），
   不是 snake_case；
 - `pairing_code` **只在 `has_default_password = true`（设备尚未初始化）时才有值**，
-  否则是空串 `""` —— 设备密码已设置后走「密码登录」分支，继续对免鉴权请求回显配对码
+  否则是空串 `""` —— 配对密码已设置后走「密码登录」分支，继续对免鉴权请求回显配对码
   等于白送凭据；
 - `expires_at` 恒为 `null`（配对码不过期，只在服务重启重新进入配对模式时更换）。
+
+**隧道来源降级：** 请求经 frpc / cloudflared 转发进来时（判据是服务端侧接收地址为回环，
+见 `PairingRoutes.isTunnelOrigin`），响应**只含 `device_name` 与 `has_default_password`**，
+不含 `pairing_code` / `device_id` / `storage_status`。所以「`has_default_password=true`
+却拿不到 `pairing_code`」唯一的成因就是远端来源，客户端应直接提示"首次配对需在局域网内完成"。
+
+> 注意：`isLocalSubnet`（下面各端点的 `403 FORBIDDEN`）拦不住隧道 —— frpc 从 `127.0.0.1`
+> 连进来，客户端地址恒为回环、天然满足同网段判定。公网面的门是这里的隧道来源降级。
 
 **错误：** `403 FORBIDDEN`（非本地子网）、`429 TOO_MANY_REQUESTS`。
 
@@ -408,6 +436,10 @@ GET /api/dashboard/summary
 **错误：** `403 FORBIDDEN`、`429 TOO_MANY_REQUESTS`。
 
 #### `POST /pairing/confirm`
+
+> **隧道来源限制：** 设备**尚未设置配对密码**时（`has_default_password=true`），此端点只接受
+> 局域网请求，隧道来源返回 `403 FORBIDDEN`。原因：这条路径是"初始化"语义，只要配对码正确
+> 就能拿走设备，没有第二道密码门。设备已初始化后的**密码登录**不受限制，远端 Web 可正常登录。
 
 **请求体：**
 ```json
@@ -431,7 +463,7 @@ GET /api/dashboard/summary
 | `device_pubkey` | 是 | X.509 SPKI DER 的 base64（`exportKey('spki')` / `PublicKey.encoded`）。缺失回 400 |
 | `challenge` | 是 | `/pairing/challenge` 下发的原文。缺失回 400 |
 | `signature` | 是 | 对 **challenge 原文**签名（不做任何额外拼装），DER 或 raw `r\|\|s` 均可。缺失回 400 |
-| `password` | 是 | 首次配对时**该值即被设为设备密码**（4-64 字符）；之后是校验用的设备密码。缺失回 400 `PASSWORD_REQUIRED` |
+| `password` | 是 | 首次配对时**该值即被设为配对密码**（4-64 字符）；之后是校验用的配对密码。缺失回 400 `PASSWORD_REQUIRED` |
 | `device_name` | 否 | 配对设备显示名（1-32 字符）；留空则用指纹当名字 |
 | `device_hwid` | 否 | 仅用于合并「同一台设备换了密钥」的重复记录，**不参与任何安全判定**（明文可伪造），也不再旁路配额 |
 | `goform_ip` / `goform_port` / `goform_password` | 否 | 初次配对可一并写入设备后台连接配置；格式非法回 400 `INVALID_GOFORM_CONFIG` |
@@ -453,18 +485,23 @@ Goform 配置格式 → 密码 → 落库。
 **错误响应：**
 - `400` — `{ "error": "pairing_code required", "code": "BAD_REQUEST" }`（未初始化设备缺配对码）
 - `400` — `{ "error": "device_pubkey, challenge and signature required", "code": "BAD_REQUEST" }`
-- `400` — `{ "error": "Device password required", "code": "PASSWORD_REQUIRED" }`
-- `400` — `{ "error": "Goform 后台配置无效（IP/端口/密码格式错误）", "code": "INVALID_GOFORM_CONFIG" }`
+- `400` — `{ "error": "请输入配对密码", "code": "PASSWORD_REQUIRED" }`
+- `400` — `{ "error": "设备后台配置无效（IP/端口/密码格式错误）", "code": "INVALID_GOFORM_CONFIG" }`
 - `401` — `{ "error": "device_pubkey 无效或挑战签名校验失败", "code": "INVALID_DEVICE_KEY" }`
 - `401` — `{ "error": "挑战不存在或已过期，请重新获取", "code": "INVALID_CHALLENGE" }`（重新取挑战再试）
 - `401` — `{ "error": "Invalid or expired pairing code", "code": "INVALID_CODE" }`
-- `401` — `{ "error": "Invalid device password", "code": "INVALID_PASSWORD" }`（首次配对时密码长度不合法也回这个）
+- `401` — `{ "error": "配对密码错误", "code": "INVALID_PASSWORD" }`（首次配对时密码长度不合法也回这个）
 - `409` — `{ "error": "Device already paired", "code": "ALREADY_PAIRED" }`（**语义是配对数已达 `pairing_max_devices`**，不是"这台已配对"；已配对指纹允许刷新）
 - `429` — `{ "error": "Too many failed password attempts, retry later", "code": "PASSWORD_LOCKED" }`
 
+> `error` 是**给人看的**提示文案，会随产品措辞调整（配对密码相关的几条已是中文）；`code` 才是**给程序判断的**稳定标识。客户端一律按 `code` 分支，不要匹配 `error` 内容。core 侧日志仍记英文原文，便于与历史日志对照。
+
 #### `POST /pairing/change-password`
 
-设置或修改设备配对密码（免认证；**旧密码即管理权限门禁**）。
+设置或修改配对密码（免认证；**旧密码即管理权限门禁**）。
+
+> **隧道来源限制：** `has_default_password=true` 时"旧密码"就是出厂默认值，这道门等于不存在，
+> 所以**首次设置密码**只接受局域网请求，隧道来源返回 `403 FORBIDDEN`。之后的正常改密不受限制。
 
 **请求体：**
 ```json
@@ -485,7 +522,7 @@ Goform 配置格式 → 密码 → 落库。
 
 **错误响应：**
 - `400` — `{ "error": "new_password must be 4-64 characters", "code": "INVALID_NEW_PASSWORD" }`
-- `400` — `{ "error": "Goform 后台配置无效（IP/端口/密码格式错误）", "code": "INVALID_GOFORM_CONFIG" }`
+- `400` — `{ "error": "设备后台配置无效（IP/端口/密码格式错误）", "code": "INVALID_GOFORM_CONFIG" }`
 - `401` — `{ "error": "Wrong old password", "code": "WRONG_OLD_PASSWORD", "has_default_password": false }`
 - `429` — `{ "error": "Too many failed password attempts, retry later", "code": "PASSWORD_LOCKED" }`
 
@@ -493,6 +530,10 @@ Goform 配置格式 → 密码 → 落库。
 
 解除**所有**设备的配对（免认证，仅限本地子网），清除配对状态并重新进入配对模式，
 同时清掉本 IP 的速率限制记录以便立即重新配对。
+
+> **隧道来源限制：** 一律返回 `403 FORBIDDEN`。执行成功会让设备回到"任何局域网客户端都能
+> 初始化"的状态，破坏性最强，远端没有正当需求。需要解除配对时请在局域网内操作，
+> 或用已鉴权的 `POST /api/pairing/unpair`。
 
 **响应：**
 ```json
@@ -568,7 +609,7 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 
 #### `POST /api/pairing/unpair/{fingerprint}`
 
-解除指定指纹的设备配对（**不校验设备密码**；需要双因素的版本见
+解除指定指纹的设备配对（**不校验配对密码**；需要双因素的版本见
 `DELETE /api/pairing/devices/{fingerprint}`）。
 
 **路径参数：**
@@ -657,7 +698,7 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 
 #### `DELETE /api/pairing/devices/{fingerprint}`
 
-解除指定设备的配对（**双因素**：已鉴权 + 设备密码）。
+解除指定设备的配对（**双因素**：已鉴权 + 配对密码）。
 
 **路径参数：**
 - `fingerprint` — 要解除配对的设备指纹（同上，可含 `/`）
@@ -669,7 +710,7 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 }
 ```
 
-- `password` — 必填，设备配对密码。请求体解析失败等同未传 → `MISSING_PASSWORD`
+- `password` — 必填，配对密码。请求体解析失败等同未传 → `MISSING_PASSWORD`
 
 **响应：**
 ```json
@@ -682,8 +723,8 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 其余设备不受影响 —— **不再有 `rotated` 字段**，也不存在「移除最后一台就轮换全局凭据」那种连坐设计。
 
 **错误码：**
-- `401 MISSING_PASSWORD` — `Password required`
-- `401 INVALID_PASSWORD` — `Invalid device password`
+- `401 MISSING_PASSWORD` — `请输入配对密码`
+- `401 INVALID_PASSWORD` — `配对密码错误`
 - `404 DEVICE_NOT_FOUND` — `Device not found`
 - `429 PASSWORD_LOCKED` — `Too many failed password attempts, retry later`
 
@@ -881,7 +922,7 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 - **开关**：配置项 `goform_command_enabled`（默认 `false`）。关闭时回 `403` `FORBIDDEN`
   （不是鉴权失败，别跳登录页）。
 - **鉴权**：路由在 `/api` 下，与其它 `/api` 端点一样要带 Bearer + `X-Timestamp`/`X-Nonce`/`X-Signature`
-  （见[认证与授权](#认证与授权)）；缺任一项回 444。
+  （见[认证与授权](#认证与授权)）；缺任一项回 401 `INVALID_SIGNATURE`。
 - **不脱敏**：返回值是设备真值 —— 密码、IMEI、ICCID 都不打码。这是它必须默认关的原因。
   需要"安全的诊断视图"请用 `GET /api/device/goform`（脱敏版）。
 - **限流**：占 `GoformQoS` 的查询许可，并享用 2s 传输层缓存（同一组 cmd 在 2s 内只打设备一次）。
@@ -1273,7 +1314,7 @@ LAN / DHCP 设置。缓存 10 分钟。值域全是字符串，缺失即省略�
 
 #### `POST /api/device/password`
 
-修改管理员密码。
+修改设备后台密码（随身 WiFi 自带网页后台的登录密码）。
 
 **请求体：**
 ```json
@@ -2150,11 +2191,8 @@ AT 通道状态。
 ```json
 {
   "enabled": false,
-  "notifyEnabled": true,
   "perType": {},
   "minIntervalSec": 1800,
-  "edgeTriggeredOnly": true,
-  "maxRows": 2000,
   "configVersion": 1,
   "temperatureWarning": 45.0,
   "temperatureCritical": 55.0,
@@ -2339,6 +2377,8 @@ AT 通道状态。
 **响应：**
 ```json
 {
+  "master_enabled": false,
+  "mail_respect_dnd": false,
   "alert_enabled": false,
   "connectivity_enabled": false,
   "sms_enabled": false,
@@ -2346,30 +2386,40 @@ AT 通道状态。
   "download_enabled": false,
   "traffic_80_enabled": false,
   "device_events_enabled": false,
+  "tunnel_enabled": false,
   "dnd_enabled": false,
   "dnd_start_hour": 23,
   "dnd_end_hour": 7,
   "guard_enabled": false,
   "guard_interval_minutes": 30,
-  "guard_foreground_keepalive_enabled": false
+  "guard_foreground_keepalive_enabled": false,
+  "history_max_rows": 500,
+  "history_max_age_days": 30,
+  "critical_override_enabled": true
 }
 ```
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| alert_enabled | boolean | false | 告警族总闸门：阈值告警 / 设备离线上线 / 流量 80% / 隧道失败，关掉则一条都不投递 |
-| connectivity_enabled | boolean | false | 设备离线/上线通知（受 `alert_enabled` 总闸约束）。客户端按「离线只报一次、报过离线才报恢复」成对去重 |
+| master_enabled | boolean | false | **L1 全局通知总闸**（2026-09-08 新增）：管所有渠道——客户端状态栏与设备端邮件。关掉后一条都不发；「发送测试通知」刻意豁免，便于排查链路 |
+| mail_respect_dnd | boolean | false | 邮件是否也遵守免打扰时段。状态栏**恒定**遵守；邮件默认不受影响（事后可查的渠道，半夜静音诉求通常只针对会响铃的状态栏）。**邮件开不开**的真源是 `SmsForwardController.isSendable()`（`/api/sms-forward/config` 的 `enabled` + SMTP 必填项），本组不再放第二份 |
+| alert_enabled | boolean | false | 阈值告警分类（温度/电量/流量/信号）。2026-09-08 起**只是分类开关**，不再兼任总闸 |
+| connectivity_enabled | boolean | false | 设备离线/上线通知。客户端按「离线只报一次、报过离线才报恢复」成对去重 |
 | sms_enabled | boolean | false | 新短信通知 |
-| verification_enabled | boolean | false | 验证码提取通知（依附 `sms_enabled`，短信关则一并不发） |
+| verification_enabled | boolean | false | 验证码提取通知。2026-09-08 起**独立**于 `sms_enabled`（此前投递路径只查短信键，"只留验证码"做不到） |
 | download_enabled | boolean | false | 下载完成/失败通知 |
-| traffic_80_enabled | boolean | false | 流量达限额 80% 预警（受 `alert_enabled` 二级闸门约束） |
+| traffic_80_enabled | boolean | false | 流量达限额 80% 预警 |
 | device_events_enabled | boolean | false | 设备事件（WiFi 客户端上下线等） |
+| tunnel_enabled | boolean | false | 隧道失败通知的**客户端分类开关**（2026-09-08 新增）。与 `AppSettings.tunnelNotifyOnFailure`（设备端要不要推）串联，不是第二份真源；此前 app 侧借用 `alert_enabled` |
 | dnd_enabled | boolean | false | 免打扰时段开关，仅 critical 可突破。时段由下面两项决定 |
 | dnd_start_hour | int | 23 | 免打扰起始小时，0-23。`start > end` 表示跨零点（23→7 = 当晚 23:00 至次日 07:00）；与 `dnd_end_hour` 相等视为零长度窗口 = 不静默 |
-| dnd_end_hour | int | 7 | 免打扰结束小时，0-23 |
-| guard_enabled | boolean | false | 后台守护轮询开关 |
+| dnd_end_hour | int | 7 | 免打扰结束小时，0-23（右端开区间） |
+| guard_enabled | boolean | false | 后台守护轮询开关。2026-09-08 起它是守护的**唯一**闸门（此前 `alert_notification_enabled` 关掉会连带静默停掉巡检） |
 | guard_interval_minutes | int | 30 | 守护轮询间隔，取值 15-60 |
 | guard_foreground_keepalive_enabled | boolean | false | 前台服务保活（常驻通知） |
+| history_max_rows | int | 500 | 通知历史保留条数，取值 100-5000。**一个字段管两张表**：设备端邮件投递记录（`mail_send_records`）与客户端状态栏通知历史（app `notify_history`）——同一件事的两个渠道，给两个旋钮只会让人猜"我改的是哪一个"。两侧都在每次裁剪时现取当前值（不缓存，改完立即生效）；清理按批触发（每写入 20 条一次），实际条数可能略高于设定值 |
+| history_max_age_days | int | 30 | 通知历史保留天数，取值 0-365，**0 = 不按时间清理**。与 `history_max_rows` 是「先到者生效」的两道上限，同样一个字段管两张表。两道都必须可见：此前 app 侧藏着一条写死的 7 天规则，用户把条数调到 5000 也只留得下 7 天，而界面上没有任何地方提到时间 |
+| critical_override_enabled | boolean | **true** | **CRITICAL 兜底**（2026-09-10 新增）。**本组唯一默认开启的字段** —— 客户端的本地初值必须逐字跟上，写成 false 就会出现「界面显示关着、设备上其实开着」的反向假开关。开启时，级别为 `critical` 的事件（断网 / 套餐用尽 / 自动关网这一档）**穿透**免打扰时段、该渠道未勾选的触发场景、该渠道的最低级别门槛；**永远穿不透** `master_enabled`、渠道配置不完整、当日配额已用尽。穿透时 core 侧留一行 WARN。判定只有一处：`NotificationDispatcher.deliverTo`。 |
 
 #### `PUT /api/notifications/config`
 
@@ -2397,8 +2447,8 @@ AT 通道状态。
 
 **边界说明：**
 
-- **不含隧道失败通知**。它的真源是 `AppSettings.tunnelNotifyOnFailure`，由 `PUT /api/tunnel/settings` 的 `notify_on_failure` 管理；在此再放一个字段会让同一个概念出现两个真源。
-- 本组只管「是否发通知」，**告警阈值本身在 `/api/alerts/config`**。`alert_enabled` 与 `AlertConfig.notifyEnabled` 是两个不同的闸门：前者是客户端系统通知总开关，后者是 core 告警引擎自身的通知标记。
+- **隧道有两个开关，各管一件事**：`tunnel_enabled`（本组，本机要不要弹状态栏）与 `AppSettings.tunnelNotifyOnFailure`（`PUT /api/tunnel/settings` 的 `notify_on_failure`，设备端要不要推）串联，不是同一概念的两份真源。
+- 本组只管「是否发通知」，**告警阈值本身在 `/api/alerts/config`**。两组的交集已在 2026-09-08 消除：`AlertConfig.notifyEnabled` 已删除（它自称"投递总闸"，实际全 core 只有邮件转发读它），邮件是否放行改由本组的 `master_enabled` + `mail_respect_dnd` 决定；**本组没有 `mail_enabled`** —— 邮件通道开不开的真源是 `/api/sms-forward/config` 的 `enabled` + SMTP 必填项。
 
 ---
 
@@ -2856,10 +2906,169 @@ WiFi 休眠定时器。
 | snippet | string | 正文预览，**超过 80 字会被截断并补 `...`** —— 拿它当完整正文会丢内容，要全文用 `body` |
 | body | string | 来源短信**全文**，不截断。DB v8 起入库；v8 之前的旧记录首次被读取时，core 会按 `msgId` 回查原短信自动回填并写回 DB。仅当原短信已被删除时才会是空串，此时读取方回退到 `snippet` |
 | timestamp | long | 来源短信时间（ms） |
-| keyword | string | 命中的关键词，取值来自固定词表：`验证码` / `校验码` / `动态码` / `确认码` / `密码` |
+| keyword | string | 命中的关键词，取值来自固定词表：`验证码` / `校验码` / `动态码` / `确认码` / `口令` / `密码` / `code` / `OTP` |
 
-> 解析规则：命中关键词后在**附近 20 字符**内找不与其他数字相连的 4 位或 6 位数字，命中即入表。5 位或 7 位数字不会被提取。
+> 解析规则（2026-09-08 起两条路径统一到 `SmsCodeExtractor`）：命中关键词后在**附近 20 字符**内找不与其他数字相连的 **4-8 位**数字，取距离关键词最近的那个。同一份判据也用于邮件转发的场景判定，避免「邮件认这条是验证码、验证码库不认」。
 > 缓存表读取失败时返回 `{"codes": [], "count": 0}`（不报错），所以空数组既可能是「没有验证码」也可能是「DAO 不可用」。
+
+### 短信拦截（黑名单 + 关键词）
+
+> 2026-09-08 新增。取代旧的 `sms-forward.blacklist`（一个 StringSet，每条同时匹配发件人**和**正文，无法区分「拉黑号码」与「屏蔽关键词」）。
+>
+> 拦截在 core 侧的 **6 个接入点**统一生效，判定函数只有一份（`SmsFilter`）：邮件转发不发、WS 通知不推、验证码不入库、短信列表滤掉、总数/联系人同口径扣除、未读数不计入。
+> 客户端**不需要也不应该**自己再过滤一遍。
+>
+> **不提供规则试算端点**：`contains/equals/prefix/suffix` 行为可预测，「规则有没有生效」看 `hit_count` 与拦截记录。
+> **不使用 `configVersion` 版本门**：规则是逐条增删改，没有整对象覆盖问题。
+>
+> 两个相关开关在 `GET/PUT /api/config`：`sms_filter_exempt_verification_code`（默认 `true`）、`sms_filter_store_full_body`（默认 `false`）。
+> 规则或这两个开关变更后，core 会广播 `config_changed { "type": "sms_rules" }`。
+>
+> 拦截模块未装配（降级启动，无 Room DAO）时，以下端点一律返回 `503` + `code: "UNAVAILABLE"`。
+
+#### `GET /api/sms/rules`
+
+列出全部拦截规则（含已停用的），按 `created_at` 倒序。
+
+**响应：**
+```json
+{
+  "rules": [
+    {
+      "id": 3,
+      "enabled": true,
+      "scope": "body",
+      "match_type": "contains",
+      "pattern": "中奖",
+      "note": "营销短信",
+      "hit_count": 12,
+      "last_hit_at": 1234567890000,
+      "created_at": 1234567800000
+    }
+  ],
+  "count": 1,
+  "scopes": ["sender", "body", "both"],
+  "match_types": ["contains", "equals", "prefix", "suffix"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| id | long | 主键（autoincrement） |
+| enabled | bool | 关掉即**真的不参与判定**（不是只改显示） |
+| scope | string | `sender` 只匹配发件人 / `body` 只匹配正文 / `both` 两者任一命中 |
+| match_type | string | `contains` / `equals` / `prefix` / `suffix`，全部忽略大小写。**不支持正则** |
+| pattern | string | 匹配串，非空 |
+| note | string | 用户备注，可空 |
+| hit_count | int | 命中次数。只由三条**写**路径（邮件 / 推送 / 验证码入库）累加，刷列表不会让它变大；内存累加 + 定期增量 UPDATE，读本端点时会强制 flush 一次 |
+| last_hit_at | long | 最后命中时间（ms），0 = 从未命中 |
+| created_at | long | 创建时间（ms） |
+
+> `scopes` / `match_types` 是可选值枚举，随响应下发，客户端不必硬编码第二份。
+>
+> 号码黑名单 = `scope=sender` + `match_type=equals`（或 `prefix` 覆盖 `+86` 差异）；关键词 = `scope=body` + `match_type=contains`。底层是同一张表、同一个判定函数，UI 分两个列表呈现即可。
+
+#### `POST /api/sms/rules`
+
+新增规则。
+
+**请求体：**
+```json
+{ "pattern": "中奖", "scope": "body", "match_type": "contains", "note": "营销短信", "enabled": true }
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| pattern | 是 | — | 非空（空串在 `contains` 下会命中**每一条**短信，因此被拒） |
+| scope | 否 | `body` | 必须在枚举内 |
+| match_type | 否 | `contains` | 必须在枚举内 |
+| note | 否 | `""` | — |
+| enabled | 否 | `true` | — |
+
+**响应：** `{ "success": true, "id": 3 }`
+
+**失败：** `400` + `code: "BAD_REQUEST"`，`message` 说明是 pattern 为空还是枚举非法。
+
+#### `PUT /api/sms/rules/{id}`
+
+修改规则（含 `enabled` 开关切换）。**字段级合并**：只覆盖请求体里出现的字段，缺失字段保留现值 —— 所以「只切开关」可以只发 `{"enabled": false}`。
+
+**响应：** `{ "success": true, "id": 3 }`
+**失败：** `400`（id 非法 / 校验不通过）、`404` + `code: "NOT_FOUND"`（id 不存在）。
+
+#### `DELETE /api/sms/rules/{id}`
+
+删除规则。
+
+**响应：** `{ "success": true, "id": 3, "deleted": 1 }`
+
+> `deleted: 0` 表示该 id 已不存在，**仍返回成功** —— 目标状态「它不在列表里」已达成。
+> 规则删除后，历史拦截记录里的 `rule_pattern` / `rule_scope` / `rule_match` 快照仍然保留，记录不会变成看不懂的孤儿。
+
+#### `GET /api/sms/blocked`
+
+拦截记录列表，**keyset 游标分页**（与 `/api/alerts/list` 同一形态，**没有 offset**）。
+
+**查询参数：**
+
+| 参数 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| limit | int | 50 | 1..200 |
+| cursor_ts | long | — | 上一页末项的 `blocked_at`；首页不传 |
+| cursor_id | long | — | 上一页末项的 `id`；与 `cursor_ts` 成对使用 |
+
+**响应：**
+```json
+{
+  "records": [
+    {
+      "id": 8,
+      "msg_id": 1024,
+      "sender": "10086",
+      "snippet": "恭喜您中奖了……",
+      "body": "",
+      "rule_id": 3,
+      "rule_pattern": "中奖",
+      "rule_scope": "body",
+      "rule_match": "contains",
+      "blocked_path": "push,vc",
+      "blocked_at": 1234567890000
+    }
+  ],
+  "count": 1,
+  "total": 1,
+  "next_cursor_ts": 1234567890000,
+  "next_cursor_id": 8,
+  "has_more": false
+}
+```
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| msg_id | long | 设备侧短信 id；**邮件路径拿不到 id 时为 0**（那条记录按 `sender` + 60 秒窗口去重） |
+| snippet | string | 正文预览，最多 120 字 |
+| body | string | 正文全文。**默认空串** —— 只有打开 `sms_filter_store_full_body` 之后新产生的记录才有 |
+| rule_* | — | 命中规则的**快照**，刻意冗余：规则删掉之后这条记录仍要读得懂 |
+| blocked_path | string | 命中的路径，逗号拼接去重：`mail`（邮件未发） / `push`（通知未推） / `vc`（验证码未入库）。同一条短信多路径命中**只有一行记录**，路径合并进这个字段 |
+| blocked_at | long | 拦截时间（ms） |
+
+> 环形上限**写死 500 条**，insert 之后立即裁剪最旧的。**不做成配置项** —— 历史上 `AlertConfig.maxRows` 就是「存了但引擎从不读」的假开关，最后被删掉。
+> 读路径（列表 / 计数 / 联系人）只过滤、**不产生记录**，否则每次下拉刷新都会刷出一批重复行。
+
+#### `DELETE /api/sms/blocked`
+
+清空全部拦截记录。
+
+**响应：** `{ "success": true }`
+
+#### `DELETE /api/sms/blocked/{id}`
+
+删除单条拦截记录。
+
+**响应：** `{ "success": true, "id": 8, "deleted": 1 }`
+
+> 误拦之后**只提供「停用规则」，不提供「恢复短信」**：邮件已经没发、通知已经没推，事后补不回来。
+> 未读数同理**不做追溯**：先收到短信、后加规则的那些历史记录不会回改已读状态（追溯要拿正文重跑全表判定，而且「刚加规则历史未读数就变了」本身就很难解释）。
 
 ---
 
@@ -3010,19 +3219,18 @@ WiFi 休眠定时器。
 {
   "content": "file content here...",
   "encoding": "utf-8",
-  "size": 1024
+  "size": 1024,
+  "truncated": false
 }
 ```
 
 `encoding` 恒为 `"utf-8"`（不做编码探测，非 UTF-8 文本会出现替换字符）。
 
-> **失败也走 200，靠 `content` 的占位文案判别**（三种，都不是错误码）：
-> - `"[不是文件或不存在]"` —— 此时 `size` 是 `0`；
-> - `"[文件过大: N bytes，超过 512KB 限制，不支持在线查看]"` —— `size` 是**真实文件字节数**；
-> - `"[二进制文件，不支持在线查看]"` —— 只看前 4096 字节里有没有 `0x00`，`size` 是真实字节数。
->
-> 正常读取时 `size` 是**返回内容的字符数**（`content.length`），**不是文件字节数** ——
-> 中文文本里两者必然不等，别拿它跟 `/api/files/info` 的 `size` 对比。
+`size` 恒为**文件真实字节数**（`File.length()`），与 `/api/files/info` 的 `size` 同源，可直接对比。
+
+> **失败也走 200**，靠 `truncated` 判别（`content` 同时给出可读占位文案，但不要拿文案做判断）：
+> - `truncated = true` 表示 `content` 不是完整文件内容，直接保存回去会损坏文件，UI 必须转只读；
+> - 三种情况：非文件/不存在（`size = 0`）、超过 512KB、前 4096 字节里含 `0x00` 的二进制文件。
 > 路径非法才回 `400 BAD_REQUEST`。
 
 #### `POST /api/files/write`
@@ -3463,6 +3671,90 @@ WiFi 休眠定时器。
 
 ---
 
+## 终端命令历史 /api/console
+
+> 需要认证。`POST /api/shell/exec` 与 `POST /api/at/command` 执行完后由 core 自动落库，
+> **app 与 web 读的是同一份记录**（DB v13 的 `console_history` 表）。
+
+本组端点**不执行命令**，只读写历史 —— 历史的真源是「core 实际执行过什么」，
+客户端不能自由往里塞行（唯一例外是下面的 `/import`）。
+
+每通道保留最近 500 条（`shell` / `at` 各自计数，互不挤占）；`stdout` / `stderr`
+各截断到 4096 字符，截断过则 `truncated = true`。**被安全黑名单拦下的命令同样入库**
+（`exit_code = null`、`ok = false`），审计里最该看的就是这部分。
+
+#### `GET /api/console/history`
+
+**查询参数：**
+- `channel` — `shell` / `at`，其他值或缺省 = 不过滤（两通道混排）
+- `limit` — 1..200，默认 50
+- `cursor_ts` / `cursor_id` — 上一页末项的 `created_at` / `id`；首页不传
+
+分页是 keyset 游标（与 `/api/sms/blocked`、`/api/alerts/list` 同形态，DAO 层无 OFFSET）。
+
+**响应：**
+```json
+{
+  "records": [
+    {
+      "id": 128,
+      "channel": "shell",
+      "command": "ls /data",
+      "as_root": true,
+      "exit_code": 0,
+      "stdout": "app\nlocal\n",
+      "stderr": "",
+      "ok": true,
+      "truncated": false,
+      "duration_ms": 42,
+      "source": "web",
+      "created_at": 1767225600000
+    }
+  ],
+  "count": 1,
+  "total": 37,
+  "next_cursor_ts": 1767225600000,
+  "next_cursor_id": 128,
+  "has_more": false
+}
+```
+
+- `exit_code` **可为 null**：AT 通道与被拦下的命令没有退出码，**不要**当成 0 处理；
+- `source` 是客户端在执行时自报的 `app` / `web`（不认识的值归一为 `unknown`），
+  只用于展示，不参与任何判定；
+- `duration_ms` 是 core 在路由层量的端到端耗时。
+
+#### `DELETE /api/console/history`
+
+清空历史。`?channel=shell|at` 只清该通道，不带则全清。响应 `{ "success": true, "channel": "shell" }`。
+
+#### `DELETE /api/console/history/{id}`
+
+删单条。`id` 已不存在也回 `success: true`（目标状态「它不在列表里」已达成），
+`deleted` 是实际影响行数。
+
+#### `POST /api/console/history/import`
+
+两端本地旧历史的**一次性**导入（升级前 app 存在 `filesDir/console_history.json`、
+web 存在 `localStorage['ufi.console.history']`）。
+
+**请求体：** `{ "records": [ { 同上，字段全部可缺省 } ] }`，单次最多 1000 条；
+`channel` 不是 `shell`/`at` 或 `command` 为空的行被丢弃；`created_at > 0` 时原样保留
+（否则导入后全挤在同一时刻、顺序就乱了）。
+
+**响应：** `{ "success": true, "imported": 42, "received": 45 }`
+
+> **不做去重**：同一条命令可以合法地重复执行，这张表没有能标识「同一条」的自然键。
+> 幂等性由客户端负责 —— 导入成功后删掉本地历史文件 / localStorage 键即可。
+
+#### WebSocket 通知
+
+新记录落库后 core 推 `data_changed`，`changed` 值为 `console:shell` / `console:at`。
+推送**只是信号、不带内容**（`broadcast()` 有 100ms 同类型缓存，推内容会让 100ms 内的
+第二条命令拿到第一条的 payload）。客户端收到后重新拉一次对应通道即可。
+
+---
+
 ## 服务器配置 /api/config
 
 > 需要认证。UFI-AXIS 后端自身的配置管理。
@@ -3489,7 +3781,8 @@ WiFi 休眠定时器。
 `goform_port`、`goform_password`、`debug_mode`、`log_enabled`、`core_log_enabled`、
 `app_log_enabled`、`goform_dump_enabled`、`goform_command_enabled`、`qos_enabled`、
 `qos_shell_max_concurrent`、`qos_cache_ttl_ms`、`qos_goform_query_max`、`qos_goform_set_max`、
-`adb_auto_start_on_boot`、`sms_code_enabled`、`sms_code_cleanup_hours`、`update_url`、
+`adb_auto_start_on_boot`、`sms_code_enabled`、`sms_code_cleanup_hours`、
+`sms_filter_exempt_verification_code`、`sms_filter_store_full_body`、`update_url`、
 `update_mirror_base`。
 
 **这里没有 `token` / `secret`。** 随「严格设备独立性」改造（2026-08-28），全局 token 与 HMAC
@@ -3521,6 +3814,8 @@ WiFi 休眠定时器。
   "qos_goform_set_max": 5,
   "sms_code_enabled": true,
   "sms_code_cleanup_hours": 24,
+  "sms_filter_exempt_verification_code": true,
+  "sms_filter_store_full_body": false,
   "update_url": "https://example.com/update.json",
   "update_mirror_base": "https://mirror.example.com"
 }
@@ -4034,6 +4329,12 @@ WiFi 休眠定时器。
 > `dingtalk_secret`）已从 core 删除，传了也会被忽略。
 > **路径未改名**（仍是 `/api/sms-forward/*`）：app 与 web 都按它引用，改名只会破坏跨端契约。
 > 新增 `scenes`（通知场景白名单）与 `POST /notify`（app 通知转邮件）。
+> 2026-09-08：新增 `GET/DELETE /history`（投递历史，逐条留档成败与失败原因）。
+> 2026-09-10（DB v12）：投递记录改为**三态** —— 记录多了 `outcome`（`sent` / `failed` / `skipped`）、
+> `GET /history` 多了 `result=skipped` 与 `skipped_total`、`DELETE /history` 多了 `channel` 参数。
+> 2026-09-10（规则同构）：配置多了 `min_level` 与 `daily_limit`（+ `sent_today` / `quota_remaining` /
+> `levels` / `daily_limit_min` / `daily_limit_max` 五个只读位），三条渠道的字段名与语义逐字一致；
+> **`POST /config` 从"永不报错"变成了可能 400**。
 
 #### `GET /api/sms-forward/config`
 
@@ -4050,14 +4351,42 @@ WiFi 休眠定时器。
   "smtp_from": "user@example.com",
   "smtp_to": "dest@example.com",
   "forward_dev_info": true,
-  "blacklist": [],
-  "scenes": ["alert", "verification"]
+  "scenes": ["alert", "verification"],
+  "min_level": "info",
+  "daily_limit": 0,
+  "sent_today": 3,
+  "quota_remaining": null,
+  "levels": ["info", "warning", "critical"],
+  "daily_limit_min": 0,
+  "daily_limit_max": 500
 }
 ```
 
-`scenes` 是需要同时发邮件的**通知场景 id** 白名单，取值与 app 的 `NotifyScene.sceneId` 一致：
-`alert` / `connectivity` / `sms` / `verification` / `download` / `traffic80` / `events` / `tunnel`。
+`scenes` 是需要同时发邮件的**通知场景 id** 白名单，与 Webhook / 本机短信是同一套词表：
+`alert` / `connectivity` / `sms` / `verification` / `download` / `traffic80` / `events` / `tunnel` / `battery`。
 底层是 `StringSet`，**顺序不保证**。
+
+**投递规则（2026-09-10「规则同构」新增，三条渠道字段名与语义逐字一致）：**
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| min_level | string | `info` | 最低投递级别（`info` / `warning` / `critical`，**小写 wire name**）。低于它的事件 `Skipped(LEVEL_TOO_LOW)`，不发。默认 `info` 是为了不改变存量用户观察到的行为（此前邮件没有门槛） |
+| daily_limit | int | 0 | 每日封数上限，范围 **0–500**，**0 = 不限**。按设备本地日期跨天重置。上限 500 是因为免费 SMTP 的日发信量普遍限制在几百封，撞上之后账号会被临时锁定 |
+| sent_today | int | — | 只读。今天已发出几封（只有 `Sent` 计一封 —— SMTP 250 应答是确定结论） |
+| quota_remaining | int \| **null** | — | 只读。今天还剩几封，已钳到 0；**`daily_limit = 0`（不限）时是 `null`**。客户端必须渲染成「不限」而不是 0 —— 0 的含义是"已经用尽"，与"不限"恰好相反 |
+| levels | string[] | — | 只读。级别取值域，供客户端渲染下拉。**不要手抄第二份**：core 加一档时手抄的那份不会报错，只会少一项 |
+| daily_limit_min / daily_limit_max | int | 0 / 500 | 只读。取值域。三条渠道**刻意不同**：邮件 0..500、Webhook 0..1000、本机短信 **1..50（不允许 0）** |
+
+> **计数器是本渠道独占的**（`sms_forward` 的一对 `quota_day` / `quota_count`），与 Webhook、本机短信那两份物理隔离。共享一个计数器意味着邮件发多了会吃掉短信的额度，而那种故障在账面上看不出任何异常。
+
+> 场景**只决定"这条渠道投不投"**，不决定"哪些渠道会收到这个场景"。后者由触发源定：
+> 除了「告警聚合更新」与「各渠道的发送测试」只走单条渠道之外，其余场景都投给全部已注册渠道，
+> 其中 `sms` / `verification` / `battery` 三个场景**排除 WS 推送**（推送侧另有触发源，
+> 或客户端没有对应的分流分支）。所以在邮件 / Webhook / 本机短信三处勾这九个场景都是真开关。
+> `test` 不在这张表里 —— 测试信带 `manual`，跳过场景判定，勾不勾都发。
+>
+> 级别与场景两道**都会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），
+> 配额不会。客户端的界面文案要把这件事写在级别、场景与免打扰旁边。
 
 #### `GET /api/sms-forward/diagnose`
 
@@ -4101,17 +4430,27 @@ WiFi 休眠定时器。
   "smtp_from": "user@example.com",
   "smtp_to": "dest@example.com",
   "forward_dev_info": true,
-  "blacklist": ["+8610000000"],
-  "scenes": ["alert", "verification"]
+  "scenes": ["alert", "verification"],
+  "min_level": "warning",
+  "daily_limit": 50
 }
 ```
 
-**响应：** `{ "success": true }`（恒为 true，且**不回传新配置** —— 保存后需要重新 `GET /config` 才能刷新 `*_set` 屏蔽位）
+**响应：** `{ "success": true }`（成功时恒为 true，且**不回传新配置** —— 保存后需要重新 `GET /config` 才能刷新 `*_set` 屏蔽位）
 
-**需要客户端自己兜住的边界（core 侧无校验）：**
+**400 校验（2026-09-10 新增，`code = BAD_REQUEST`）：**
+
+这个端点从"永不报错"变成了**可能返回 400**。客户端必须有这条错误分支 —— 沿用"保存必成功"的假设会让用户看到「已保存」而设备侧根本没写进去。两个条件：
+
+| 条件 | 报错（中文，直接展示给用户） |
+|---|---|
+| `min_level` 不是 `info` / `warning` / `critical` 之一 | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做"认不出就回落" —— 静默回落会让用户以为自己设的门槛生效了 |
+| `daily_limit` 不在 0–500 | `每日封数上限（daily_limit）需在 0..500 之间（0 = 不限），收到 …` |
+
+**需要客户端自己兜住的边界（这两项之外 core 侧无校验）：**
 
 - 凭据字段 `smtp_pass`：**不传 == 传空串 == 保留原值**。因此该端点无法清空已设置的密码，只能覆盖成新的非空值。响应/GET 里只有派生的 `smtp_pass_set`，回传这个布尔不产生任何效果。
-- `blacklist` / `scenes`：传数组即整体替换（传 `[]` 即清空），不传则保留。底层都是 `StringSet`，**顺序不保证**。
+- `scenes`：传数组即整体替换（传 `[]` 即清空），不传则保留。底层是 `StringSet`，**顺序不保证**。
 - `scenes` 里的场景 id **不做白名单校验**：拼错的 id 会被原样存下，然后永远匹配不到任何通知（静默不发信）。
 - 类型不匹配不会报错而是**静默回落原值**（例如 `smtp_port` 传字符串 `"465"` 会被当作缺失，端口保持不变）。客户端必须按类型发送。
 - 无必填校验、无邮箱格式校验、无端口范围校验 —— 缺字段也会「保存成功」，但发信永远不会成功。app 与 web 都在前端做了必填与端口范围校验。
@@ -4120,32 +4459,489 @@ WiFi 休眠定时器。
 
 发送测试邮件。**用的是已持久化的配置**，未保存的改动不生效。
 
+**手动触发不受通知总开关与免打扰约束**：用户刚按下"发送测试"，静默什么都不发比发出去更难排查。响应里的 `auto_notify_enabled` 说明闸门（`master_enabled` +（`mail_respect_dnd` 时的）静默窗口）当前放不放行自动通知 —— `false` 意味着"这封测试发出去了，但自动通知此刻是关的"。
+
 **请求体：** 无（body 被忽略）
 
 **响应：** HTTP 恒为 200，成败看 body
-- 成功：`{ "success": true }`
-- 失败：`{ "success": false, "error": "邮件通知未启用" | "SMTP 配置不完整（服务器/用户名/密码/收件地址）" | "发送失败，请检查日志" | "<异常类>: <消息>" }`
+- 成功：`{ "success": true, "auto_notify_enabled": true }`
+- 失败：`{ "success": false, "auto_notify_enabled": true, "error": "邮件通知未启用" | "SMTP 配置不完整（服务器/用户名/密码/收件地址）" | "邮件发送失败，可在投递记录中查看失败原因" | "<异常类>: <消息>" }`
 
-#### `POST /api/sms-forward/notify`
+> SMTP 投递带**有界重试**（最多 3 次，退避 2s + 6s，只重试超时/连接失败这类网络错误；账号密码错、地址非法、收件人全部无效只试 1 次）。所以一次失败的 `/test` 最坏要等约 40s 才返回，`error` 里会带上实际尝试次数。整轮投递只写 **1 条** `mail_send_records`。
 
-把一条**已经发出的 app 系统通知**转投邮件。app 在 `NotificationCenter.notify` 成功后 fire-and-forget 调用；SMTP 凭据与场景白名单都只存在 core，所以是否真发由 core 判定，app 不做判断。
+> **旧端点 `POST sms-forward/notify` 已于 2026-09-10 删除**（此处刻意不写带 `/api` 前缀的完整路径：契约校验器会把文档里的路径字面量当成"手册声明了该端点"，而 core 已经没有它了）。那是 core 接管告警判定之前的遗留通路：温度/电量/信号阈值由 app 判定、弹完通知再回传给 core 发信。判定搬进 `AlertEngine` 之后它就没有调用方了（删除前核实：app 与 web 全仓都不请求），而留着会让 app 有能力绕过 core 的判定直接指定场景发通知，与「判定与投递都在 core」的分工冲突。客户端不需要做任何事 —— 通知由 core 自己产生并投递。
 
-**请求体：**
+#### `GET /api/sms-forward/history`
+
+投递历史（2026-09-08 新增，`mail_send_records` 表；AppDatabase v11 起带 `channel` 列，**v12 起带三态的 `outcome` 列**）。
+
+> **表名保留、口径已扩大**：这张表现在是**多渠道共用**的投递记录（邮件 / Webhook / 本机短信），
+> `channel` 列区分。路径与表名都没改 —— app 与 web 都按它引用，改名只会破坏跨端契约。
+
+`/diagnose` 的计数器只回答"成功几封、失败几封、最后一条错误是什么" —— 回答不了"哪一封没发出去、什么时候、为什么"，失败原因还会被下一次失败覆盖。本端点按投递逐条留档。
+
+**查询参数：**
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| limit | int | 50 | 单页条数，钳制到 1..200 |
+| cursor_ts | long | — | 上一页末项的 `sent_at`（首页不传） |
+| cursor_id | long | — | 上一页末项的 `id`（**必须与 `cursor_ts` 成对**，缺一个当首页处理） |
+| result | string | — | `success` 只看已发出、`failed` 只看失败、`skipped` 只看被跳过；不传或其他值 = 不过滤。注意这一档的名字是 `success` 而记录里的取值是 `sent`（`result` 早于三态存在，改它会破坏跨端契约） |
+| channel | string | — | 按投递渠道过滤：`mail` / `webhook` / `local_sms`（推送渠道**不留记录** —— WS 广播是一对多的，没有"逐端投递结果"这种东西）；不传或空串 = 不过滤 |
+
+**响应：**
 ```json
 {
-  "scene": "alert",
-  "title": "设备温度过高",
-  "body": "当前 62℃，阈值 60℃"
+  "records": [
+    {
+      "id": 128,
+      "scene": "alert",
+      "channel": "mail",
+      "subject": "[UFI-AXIS] 设备温度过高",
+      "recipient": "dest@example.com",
+      "outcome": "failed",
+      "success": false,
+      "error": "MessagingException: IOException while sending message <- SocketTimeoutException: Read timed out",
+      "sent_at": 1787049393000
+    }
+  ],
+  "count": 1,
+  "total": 42,
+  "failed_total": 2,
+  "skipped_total": 7,
+  "next_cursor_ts": 1787049393000,
+  "next_cursor_id": 128,
+  "has_more": false
 }
 ```
 
-`scene` / `title` 必填（缺失或空串 → `400 BAD_REQUEST`）；`body` 可选，默认空串。
+keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一致（DAO 层全仓没有 `OFFSET`）。`cursor_ts` 与 `cursor_id` 必须成对回传：只带 `cursor_ts` 会让 SQL 里的 `id < :cursorId` 变成 `id < NULL`（恒为 NULL），同一毫秒的边界行被整段跳过，所以 core 干脆把"只带一个"当首页处理。
 
-**响应：** `{ "success": true, "sent": true }`
+**`outcome` 是三态，且是唯一真源**（v12 新增）：
 
-`sent == false` 是**正常结果**而非错误：邮件通知未启用、SMTP 配置不完整、或该 `scene` 不在 `scenes` 白名单里，都返回 200 + `sent: false`。
+| outcome | 含义 | `error` 列 |
+|---|---|---|
+| `sent` | 投出去了（SMTP 250 / HTTP 2xx / 短信信箱 tag=2） | 空串 |
+| `failed` | 发起过投递但失败（重试耗尽后的终态） | 摊平的异常链或状态码摘要，开头带尝试次数 |
+| `skipped` | **没发起**，被闸门按用户自己的配置拦下 | 跳过原因的**中文说明**（**六档**：`通知总开关已关闭` / `处于免打扰时段` / `渠道配置不完整` / `该渠道未勾选此触发场景` / `事件级别低于该渠道的最低级别` / `当日发送配额已用尽`） |
 
-> app **不会**用这个端点上报 `sms` / `verification` 两个场景（2026-08-30）。core 自己收到短信时（ContentObserver / 兜底轮询 → `SmsForwardController.forwardSms`）已经按同样的 scene 发过一封带全文与验证码高亮的邮件，app 再报一次就是同一条短信两封邮件，且两条路径互不知情、无法互相去重。短信族邮件的唯一生产者是 core 的短信路径；`scenes` 里勾选 `sms` / `verification` 仍然生效，管的就是那条路径。
+`success` 字段从 v12 起只是 `outcome == "sent"` 的**副本**，保留只为不破坏既有调用方。**客户端不要用它做分类** —— `skipped` 行的 `success` 也是 `false`，照它渲染会把"被跳过"说成"发送失败"。跳过原因由 core 直接给中文，客户端**不要再维护一张原因映射表**：core 加一档新原因时那张表不会报错，只会在界面上显示成空白。
+
+**`skipped` 的噪声闸：只在渠道已配置时才记。** 判据是渠道自己的 `isConfigured()`，不是"原因不是配置不完整" —— 总开关/免打扰那两道闸排在配置检查**之前**，SMTP 一项没填的渠道在免打扰时段拿到的是"处于免打扰时段"这一档，只看原因照样会把表刷满（默认 500 条的环形缓冲几十条就冲满，真正的失败记录被挤出去）。所以：**没配全的渠道在这张表里什么都不会有**，那种情况去看设备日志。
+
+> **不要按 `error` 文案做分类或高亮**：那段中文是给人看的显示文本，core 改一句措辞就会让匹配静默失效 —— 2026-09-10 把 `通知总开关关闭或处于免打扰时段` 拆成 `通知总开关已关闭` 与 `处于免打扰时段` 两档正是这样一次改动。分类只认 `outcome`。
+
+`failed_total` 与 `skipped_total` 是**两个独立计数，不能相加**：跳过不是失败，把两者并成一个数会让"失败 12 条"里其实有 11 条是"免打扰时段没发"。两者都是该渠道（受 `channel` 影响）的**全表**计数，**不受 `result` 筛选影响** —— 客户端可以在任何筛选档下用同一组数字做摘要。`/diagnose` 的 `sent_*` 三个计数器口径**没变**：那边仍然只统计发起过投递的两态。
+
+整轮重试**只写 1 条**（重试三次写三条的话，用户看到的是"三封发不出去"，与事实不符）。
+
+**不存正文**：正文可能含验证码与短信全文，历史只需要回答"发了什么主题、成没成"。`recipient` 列按渠道脱敏：邮件是收件地址原文，Webhook 只写 **scheme + host**，本机短信只写**前 3 后 2** 的号码 —— path/query 里的 device key 与完整手机号都不该落进用户可导出的记录。
+
+环形上限由 `GET/PUT /api/notifications/config` 的 `history_max_rows`（默认 500，范围 100-5000）与 `history_max_age_days`（默认 30，0 = 不按时间清理）共同决定，**先到者生效**；两者都在每次裁剪时现取当前值 —— 改完设置立即生效，不需要重启 core。
+
+#### `DELETE /api/sms-forward/history`
+
+清空投递历史。**响应：** `{ "success": true }`
+
+| 参数 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| channel | string | — | 只清这一条渠道（`mail` / `webhook` / `local_sms`）；**不传或空串 = 清空所有渠道** |
+
+> 客户端的清空按钮**必须带 `channel`**：记录视图是按渠道进的，不带参数会把另两条渠道的失败记录一起删掉，而按钮所在的那一页对此没有任何提示。文案也要只讲当前渠道。
+
+
+
+---
+
+## Webhook 通知 /api/notify/webhook
+
+> 需要认证。**通知渠道之一**（阶段 2，2026-09-09）：把一条通知按用户配的模板 POST 到用户配的 URL。
+>
+> 有了它，Bark / ntfy / 企业微信群机器人 / 飞书 / PushPlus / Server 酱 / 自建服务全部变成"填 URL + 贴模板"。
+>
+> **一条投递路径，七个预设**：预设只是"帮用户把模板填好"的默认值表，存储里存的是**最终的**
+> url / method / headers / body。投递代码里**没有** `when (preset)` —— 按预设分支的话，
+> 用户改了模板之后行为还会跟界面显示的不一致（他改的是模板，生效的是分支里写死的那份）。
+> `preset` 字段**不参与投递判定**，它决定的是"per-preset 那一份配置读写哪一个槽位"
+> （每个预设各存一份，见下面的存储模型）。
+>
+> 渠道 id 是 **`webhook`**；配置存独立 prefs（`notify_webhook`），**不进 `/api/notifications/config`** ——
+> 那一组是"客户端要不要弹通知"的开关，渠道配置归渠道自己（与邮件的 `sms_forward`、
+> 本机短信的 `notify_local_sms` 同做法）。
+
+#### `GET /api/notify/webhook/config`
+
+读全量配置。响应里**连预设表与占位符清单一起回** —— 那是 core 的数据，客户端只渲染。让 app 与 web 各抄一份就又多了两份会分叉的手抄镜像（表现是"照着界面填完却发不出去"）。
+
+**响应：**
+```json
+{
+  "enabled": false,
+  "preset": "BARK",
+  "url": "https://api.day.app/abcdef",
+  "method": "POST",
+  "headers": { "Authorization": "Bearer xxx" },
+  "body_template": "{\"title\":\"{{title}}\",\"body\":\"{{message}}\",\"level\":\"{{level}}\"}",
+  "content_type": "application/json; charset=utf-8",
+  "timeout_ms": 10000,
+  "scenes": ["alert", "connectivity"],
+  "respect_dnd": true,
+  "min_level": "info",
+  "daily_limit": 0,
+  "sent_today": 12,
+  "quota_remaining": null,
+  "levels": ["info", "warning", "critical"],
+  "daily_limit_min": 0,
+  "daily_limit_max": 1000,
+  "configured": true,
+  "placeholders": [
+    { "name": "title", "desc": "通知标题" },
+    { "name": "message", "desc": "通知正文" }
+  ],
+  "presets": [
+    {
+      "name": "PUSHPLUS",
+      "display_name": "PushPlus",
+      "user_fills": "请求体模板里的 PushPlus Token",
+      "secret_label": "PushPlus Token",
+      "secret_marker": "<token>",
+      "secret_target": "body",
+      "url": "https://www.pushplus.plus/send",
+      "method": "POST",
+      "headers": {},
+      "content_type": "application/json; charset=utf-8",
+      "body_template": "{\"token\":\"<token>\",\"title\":\"{{title}}\",\"content\":\"{{message}}\"}"
+    }
+  ]
+}
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| enabled | boolean | false | 渠道开关 |
+| preset | string | `CUSTOM` | 预设枚举名（`presets[].name`）。**不参与投递判定**，但它决定 per-preset 字段读写哪一份（见下面的存储模型）。认不出的名字 PUT 时回 **400**（大小写不敏感，只拒真不存在的）；`GET` 读到一份坏掉的 prefs 时仍回落 `CUSTOM` —— 那是"别让整份配置读不出来"，不是入参回落 |
+| url | string | "" | 请求地址。填了就必须是 `http://` / `https://`（scheme 白名单全仓一份，见下） |
+| method | string | `POST` | 只支持 `POST` / `GET` / `PUT`。放开任意 method 等于把配置项变成通用 HTTP 客户端；`GET` **不带 body** |
+| headers | object | {} | 自定义请求头。**值里可以用占位符**，头部名不替换（名字是配置的一部分，不该随每条通知变化） |
+| body_template | string | `CUSTOM` 的默认模板 | 请求体模板，占位符见 `placeholders` |
+| content_type | string | `application/json; charset=utf-8` | 决定占位符走不走 JSON 转义（判据是"含 `json` 字样"，大小写不敏感）。解析不了时回落 `application/json`。**客户端要把它做成可编辑的自由文本**：预设只提供默认值，`CUSTOM` 用户在 JSON 与纯文本之间切换靠的就是这一项；别做成"JSON / 纯文本"二选一的下拉 —— 自建服务可能要 `application/x-www-form-urlencoded` 之类的 MIME。校验只有"不能为空" |
+| timeout_ms | long | 10000 | 单次请求超时，范围 **1000–60000**。下限 1s 是因为再短连 TLS 握手都做不完；上限 60s 是因为三次尝试 × 60s + 退避 8s 已接近 3 分钟，而 `TrafficAutoOffGuard` 那类"等通报到位再动作"的链路会一直悬着 |
+| scenes | string[] | [] | 勾选的场景 id（与邮件 / 本机短信同一套词表）。空集 = 只有手动测试会发出去 |
+| respect_dnd | boolean | **true** | 免打扰时段要不要连 Webhook 一起静默。默认 true —— Bark / ntfy / 群机器人跟状态栏一样会响铃；邮件默认 false 是因为邮件是"事后可查"的渠道 |
+| min_level | string | `info` | **规则同构的旋钮之一**（2026-09-10 新增）：最低投递级别（`info` / `warning` / `critical`）。低于它 `Skipped(LEVEL_TOO_LOW)`。默认 `info` 是为了不改变存量用户观察到的行为（此前这条渠道没有门槛，给个 `critical` 等于让所有人升级后突然收不到通知） |
+| daily_limit | int | 0 | **规则同构的旋钮之二**：每日条数上限，范围 **0–1000**，**0 = 不限**，按设备本地日期跨天重置。上限 1000 是因为 1000 条/天已经是平均 1.4 分钟一条，再多就不是通知而是日志流 |
+
+**只读回显字段**（客户端不要自己算第二套）：
+
+| 字段 | 说明 |
+|---|---|
+| configured | 能不能投，读的就是渠道那一份 `isConfigured()`。判据见下 |
+| sent_today | 今天已发出几条（只有 HTTP 2xx 的 `Sent` 计一条） |
+| quota_remaining | 今天还剩几条，已钳到 0；**`daily_limit = 0`（不限）时是 `null`** —— 客户端必须渲染成「不限」而不是 0，0 的含义是"已经用尽"，恰好相反 |
+| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不要手抄第二份**；三条渠道的值域刻意不同（邮件 0..500、本机短信 1..50 且不允许 0） |
+| placeholders | 模板里可用的占位符，**对象数组**：每项含 `name`（占位符名，模板里写成 `{{name}}`）与 `desc`（中文说明，给界面上的按钮 / 提示用）。数组顺序即建议的展示顺序；**不含 URL** —— URL 不做替换。说明文案的唯一真源在 core，客户端不要维护第二张表 |
+| presets | 七个内置预设的完整默认值表（含「用户要填的那一样东西」的元数据 `secret_label` / `secret_marker` / `secret_target`），见下 |
+
+> **计数器是本渠道独占的**（`notify_webhook` 的一对 `quota_day` / `quota_count`），与邮件、本机短信那两份物理隔离 —— 共享计数器意味着一条渠道发多了会吃掉另一条的额度。级别与场景两道**会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），配额不会。
+
+##### 存储模型：每个预设各存一份
+
+`notify_webhook` 这份 prefs 是**两层**的：
+
+| 层 | 字段 | 真键名 |
+|---|---|---|
+| 顶层（跨预设共享） | `preset`（当前选中）/ `enabled` / `scenes` / `respect_dnd` / `min_level` / `daily_limit`，以及配额计数器 | 就是字段名，如 `enabled` |
+| 每预设一份 | `url` / `method` / `headers` / `body_template` / `content_type` / `timeout_ms` | `<预设名小写>.<字段>`，如 `bark.url`、`pushplus.body_template`（headers 那一项的键是 `<预设名小写>.headers_json`） |
+
+分层的判据是「这个取值属于**这个目标**，还是属于**这条渠道**」：地址与模板是"发到哪、怎么发"，跟着预设走；开关、场景、级别、上限是"这条渠道要不要发、什么时候发"，与目标无关。`timeout_ms` 跟着预设是因为它和 url 一起构成"这个目标怎么连"。
+
+**配额计数器留在顶层**：那是渠道级额度。跟着预设分家的话，用户换个预设就能重开一天的量 —— 等于把「每日条数上限」做成假开关。
+
+直接后果（客户端必须照这个来）：
+
+- **切换预设不覆盖任何东西**。只改顶层那个"当前选哪个"，其它预设那几份原样躺着，切回来读到的还是上次填的那份。所以客户端**不要**再弹「切换会覆盖当前配置」这类确认 —— 覆盖行为已经不存在。
+- **某个预设"从未配过"是一个有意义的状态**：那一份的键不存在时，`GET` 回该预设的默认值（`presets[]` 里那份）并且**不落盘**。因此客户端**不要**把预设默认值填进表单再提交 —— 提交一次就把"从未配过"坐实成"配过"，将来改了预设默认模板就传不到这些用户，而界面上看不出任何原因。
+- **切换后必须重新 `GET`**（或用 PUT 的回显）重画界面：本地表单里那份是**上一个**预设的值。
+
+> **一次性搬迁**：改造之前的版本把那六个字段直接摆在 prefs 根上（`url` / `method` / `headers_json` / `body_template` / `content_type` / `timeout_ms`）。首次 `load()` 时会把它们搬到**顶层 `preset` 记着的那个预设**名下（不是 `custom` —— 那六个值就是用户当时正在用的那一份，塞进自定义会让一个用 Bark 的用户升级后看到"Bark 未配置"，而 device key 躺在自定义那一栏里），搬完即删旧键。判据是"旧 `url` 键在、新 `<preset>.url` 键不在"，因此幂等，不需要额外的版本号或标记位。**接口形状不受影响**，客户端不用为此做任何事。
+
+##### `configured` 的判据（三条，缺一即 false）
+
+1. `enabled` 为 true；
+2. `url` 非空且以 `http://` / `https://` 开头；
+3. **`url` 里不含 `<`** —— 预设地址里的 `<device_key>` / `<topic>` / `<key>` / `<token>` / `<SENDKEY>` 是**示例占位**，直接发出去会打到一个不存在的目标上，而用户看到的只是"配好了但收不到"。所以留着尖括号就算没配完。
+
+> **已知边界**：这道 `<占位>` 检查**只看 URL**。`PUSHPLUS` 的 token 在 **body 模板**里（`{"token":"<token>",…}`，即 `secret_target = body`），所以它的 `configured` 会是 true 而请求仍然会被目标拒收（PushPlus 回业务错误码）。客户端可以按 `secret_target` 自己认出这一档并在界面上提示"密钥还没填"；排查时看 `/test` 响应的 `response_body`。
+
+##### 占位符
+
+十项，`placeholders` 里回的就是这张表（`name` + `desc`）：
+
+| name | 模板里写法 | 含义 |
+|---|---|---|
+| title | `{{title}}` | 通知标题 |
+| message | `{{message}}` | 通知正文 |
+| level | `{{level}}` | 级别的英文口径（`info` / `warning` / `critical`），与 `min_level` 同一套词 |
+| level_label | `{{level_label}}` | 级别的中文名（提示 / 警告 / 严重），给人读的那一份 |
+| scene | `{{scene}}` | 触发场景（如 `alert`、`sms`），就是用户勾选的那一格 |
+| type | `{{type}}` | 更细的事件类型（如 `temperature`、`connectivity`） |
+| time | `{{time}}` | 设备本地时间 `yyyy-MM-dd HH:mm:ss`（与邮件正文里的时间逐字一致） |
+| timestamp | `{{timestamp}}` | 毫秒时间戳（十进制串），给需要自己判时效的目标 |
+| meta | `{{meta}}` | 附加信息，**每行一条** `键: 值`（如「发件人: 10086」）；空值的行会丢掉 |
+| highlight | `{{highlight}}` | 需要突出的短值（如短信验证码），没有时是**空串**（不是 `null` 字面量） |
+
+> `{{highlight}}` 常常就是**短信验证码原文**。把它写进模板意味着验证码会随通知发到目标服务上，客户端界面在提供"插入占位符"这类便捷入口时应当就地提示这一点。
+
+`CUSTOM` 的默认模板只摊开常用的六个（`title` / `message` / `level` / `scene` / `type` / `time`）—— 十个全塞进去这份默认体就没法读了；其余几项由客户端的占位符插入入口补。
+
+- **JSON 类模板的值先做 JSON 字符串转义再替换**（判据是 `content_type` 含 `json`）：短信正文里一个引号就能把 `{"content":"{{message}}"}` 撑成非法 JSON，目标回 400，而用户只看到"通知没收到"。转义借 kotlinx.serialization 编一个字符串再剥掉外层引号，不手写 replace 表。
+- **非 JSON（如 ntfy 的纯文本 body）不转义** —— 否则用户收到的正文里会出现 `\n` 字面量。
+- **header 值里的 `\r` / `\n` 一律换成空格**：header 值里的换行会被下游解析成额外的头部（HTTP 头注入），而通知标题恰恰是最容易带换行的字段。
+- **URL 不做替换**。把标题拼进 URL 需要另一套 percent-encoding 规则，而且会让"通知内容"参与决定"请求发到哪里"—— 那是给自己开一个 SSRF 的口子。
+
+##### 七个预设
+
+`user_fills` 是给人读的一句话（"这一段你必须自己换掉"）；`secret_label` / `secret_marker` / `secret_target` 是同一件事的**机器可读版本** —— 七个预设里用户真正要填的只有**一样**，客户端据此只渲染一个输入框、把其余请求字段收进「高级设置」。
+
+| name | display_name | user_fills | secret_label | secret_marker | secret_target | 默认 URL | Content-Type |
+|---|---|---|---|---|---|---|---|
+| `CUSTOM` | 自定义 | 完整 URL 与请求体模板 | （空） | （空） | `none` | （空） | JSON |
+| `BARK` | Bark | 服务器地址 + device key（URL 末段） | Device Key | `<device_key>` | `url` | `https://api.day.app/<device_key>` | JSON |
+| `NTFY` | ntfy | 服务器地址 + topic（URL 末段） | Topic | `<topic>` | `url` | `https://ntfy.sh/<topic>` | **text/plain** |
+| `WECOM` | 企业微信群机器人 | 机器人 Webhook 地址（含 key 参数） | 机器人 Key | `<key>` | `url` | `https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=<key>` | JSON |
+| `FEISHU` | 飞书群机器人 | 机器人 Webhook 地址（含 token 末段） | 机器人 Token | `<token>` | `url` | `https://open.feishu.cn/open-apis/bot/v2/hook/<token>` | JSON |
+| `PUSHPLUS` | PushPlus | 请求体模板里的 PushPlus Token | PushPlus Token | `<token>` | **`body`** | `https://www.pushplus.plus/send`（固定，不需要用户改） | JSON |
+| `SERVERCHAN` | Server 酱 | SENDKEY（URL 末段） | SENDKEY | `<SENDKEY>` | `url` | `https://sctapi.ftqq.com/<SENDKEY>.send` | JSON |
+
+`secret_target` 三档：`none` = 没有这样一个字段（`CUSTOM` 全手填）；`url` = marker 在**默认 URL** 里；`body` = marker 在**默认请求体模板**里（只有 `PUSHPLUS`）。不用"要不要填"的布尔，是因为布尔分不出后两处，而替换错地方的表现是"密钥根本没进请求"，界面上看不出任何异常。
+
+> **客户端替换时必须把 marker 整段连尖括号一起换掉。** 写成 `<abc123>` 这种半截值会踩 `configured` 的第三条判据（URL 含裸 `<` 即"未配置齐全"），渠道会永远不投递；`body` 档虽然不进那条判据，但半截值同样会被目标服务拒收。
+>
+> 存储里存的是**替换完的**最终 url / body_template，**没有"密钥"这个独立字段**。所以客户端要做"只填一个输入框"的双向换算时，参照系只能是预设默认值：把默认值按 marker 切成前缀 + 后缀，当前值以该前缀开头、以该后缀结尾时，中间那段就是已填的密钥；对不上就说明用户改过别的部分，此时应当退回完整字段编辑（硬替换会吃掉他的改动）。
+
+默认 body 模板（全部 `method = POST`）：
+
+- `CUSTOM` — `{"title":"{{title}}","message":"{{message}}","level":"{{level}}","scene":"{{scene}}","type":"{{type}}","time":"{{time}}"}`（六个常用占位符摊开，方便对着自建服务改）
+- `BARK` — `{"title":"{{title}}","body":"{{message}}","level":"{{level}}"}`
+- `NTFY` — `{{message}}`（**纯文本**；标题走 `Title` 头）。默认头是 `Title: {{title}}`、`Priority: default`、`Tags: {{level}}`。`Priority` 刻意给**固定值**而不是 `{{level}}`：ntfy 只认 `min/low/default/high/max`（或 1..5），塞 `warning` / `critical` 会被 400 拒掉 —— 那样预设一开箱就是坏的。级别改放 `Tags`（自由字符串，会显示在消息上）
+- `WECOM` — `{"msgtype":"text","text":{"content":"{{title}}\n{{message}}"}}`
+- `FEISHU` — `{"msg_type":"text","content":{"text":"{{title}}\n{{message}}"}}`
+- `PUSHPLUS` — `{"token":"<token>","title":"{{title}}","content":"{{message}}"}`（URL 固定，token 在 body 里 —— 这就是 `secret_target = body` 的那一处）
+- `SERVERCHAN` — `{"title":"{{title}}","desp":"{{message}}"}`（正文字段名是 `desp`，不是 message）
+
+除 `NTFY` 外默认头都是空。
+
+#### `PUT /api/notify/webhook/config`
+
+**字段级合并**：body 是配置字段的任意子集，未出现（或值为 `null`）的键**保留服务端现值**。所以"只切一个开关"不会把 URL / 模板顺手清空。
+
+> **`headers` 是唯一的例外 —— 传了就整体替换。** 按键合并的话用户永远删不掉一个头部（少传即保留 = 永远删不掉），而"改完发现旧的 `Authorization` 还在"是安全问题。**改任何一个头部时必须传全量 map。**
+
+服务端还会做两处规范化：`url` **trim**、`method` **转大写**。`preset` **不做回落** —— 认不出的名字回 400（见下）。
+
+##### `preset` 的三种 patch 形状
+
+per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_type` / `timeout_ms`）写到哪一份，由 patch 里有没有 `preset` 决定：
+
+| patch | 语义 | 落盘 |
+|---|---|---|
+| **只带** `preset`（可再带顶层字段） | **纯切换**：只改"当前选哪个" | 只写顶层，per-preset 那一份**一个键都不碰**（目标预设"从未配过"就保持从未配过） |
+| `preset` + per-preset 字段 | 切到 X 并顺手填好它 | 那些字段写到 **X** 那一份下；合并的"底"取的是 **X 上次存的那份**，不是当前预设的值 |
+| 不带 `preset` | 改当前那一份 | 写顶层 + 当前预设那一份 |
+
+判据是"键出现过"而不是"值和现值不同"：显式传 `"url": null` 在本接口的口径里是"这个字段我没意见"，那种 patch 也不会把目标那一份落盘。
+
+**客户端口径**（两条，踩了就是数据丢失类的表现）：
+
+1. **切换预设只发 `{"preset":"X"}`**，不要把本地表单里那份 url / 模板 / headers 一起发 —— 它们会被写进**新**预设的槽位，把"从未配过"变成"配成了旧预设的值"。切完**重新 `GET`**（或读 PUT 的回显）重画，别拿本地旧值渲染。
+2. **不要提交预设默认值。** 默认值是 core 在"读不到"时给的且刻意不落盘；客户端替用户提交一次，将来改预设默认模板就传不到这些用户。
+
+**请求：**
+```json
+{ "enabled": true, "url": "https://api.day.app/abcdef", "timeout_ms": 8000, "scenes": ["alert", "traffic80"] }
+```
+
+**响应：** `{ "success": true, "config": { …立即回读的全量配置… } }`
+
+**400 校验**（第一条违规即返回，`code = BAD_REQUEST`）：
+
+| 条件 | 报错 |
+|---|---|
+| `url` 非空且不是 http(s) | `url 必须以 http:// 或 https:// 开头，收到 …`（回显只截前 40 字 —— URL 里常带 token） |
+| `method` 不在 `POST/GET/PUT` | `method 只支持 POST/GET/PUT，收到 …` |
+| `timeout_ms` 不在 1000..60000 | `timeout_ms 必须在 1000..60000 之间，收到 …` |
+| `content_type` 为空 | `content_type 不能为空` |
+| header **名**为空或含换行 | `header 名不能为空、不能含换行` |
+| header **值**含换行 | `header 值不能含换行（换行会被下游解析成额外的头部）` |
+| `scenes` 含未知场景 id | `scenes 含未知场景：…` |
+| `daily_limit` 不在 0..1000 | `每日条数上限（daily_limit）需在 0..1000 之间（0 = 不限），收到 …` |
+| `min_level` 不是 `info` / `warning` / `critical` | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做"认不出就回落"—— 静默回落会让用户以为自己设的门槛生效了 |
+| `preset` 不在预设表里 | `preset 只支持 CUSTOM/BARK/NTFY/WECOM/FEISHU/PUSHPLUS/SERVERCHAN，收到 …`（大小写不敏感，`bark` 与 `BARK` 都认）。**严格拒绝**：配置按预设分开存之后，把 `Barkk` 静默落进 `custom.*` 的表现是"我配好的 Bark 不见了"，而日志里没有任何异常。客户端应当把这条报错原文显示出来 |
+
+`url` 为空**是合法的**（= 还没配完，`configured` 会是 false）。校验通过但字段类型不对（例如 `timeout_ms` 传了字符串）也回 400，文案是 `Webhook 配置字段类型不合法：…`。
+
+> **headers 为什么不脱敏回显**：`Authorization` 这类值是凭据，但**它必须能被回显** —— 用户要在界面上改它，而"星号回显、原值保留"那套（`smtp_pass_set`）只在单个固定字段上说得通；headers 是任意键值对，回显成星号再提交就把真值覆盖掉了。而且 Bark / Server 酱的凭据本来就在 URL 里，只脱敏 headers 是自欺欺人。**日志与投递记录里仍然脱敏**（日志里凭据类头部的值换成 `***(长度)`，投递记录只写 URL 的 scheme+host）—— 那两处是会被导出、被贴出来的。
+
+#### `POST /api/notify/webhook/test`
+
+发一条测试通知。**不受总开关、免打扰与场景勾选约束**（`manual = true`），但仍要求配置齐全 —— URL 没填的"测试"发不出去是事实。事件用 `scene = test`、`level = info`、`channels = {webhook}`，正文是固定串「这是一条来自 UFI-AXIS 的 Webhook 测试通知」（写清楚"这是测试" —— 它会同时出现在群机器人里，别让同事以为设备真出事了）。
+
+**响应：**
+```json
+{
+  "success": true,
+  "auto_notify_enabled": false,
+  "status_code": 200,
+  "response_body": "{\"code\":0,\"message\":\"success\"}",
+  "attempted_at": 1757400000000
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| success | 目标返回 **2xx** 才为 true |
+| error | 失败 / 未投递的原因；成功时不出现。未启用时是 `Webhook 通知未启用`；配置不全时是那条 400 校验文案，或 `请求地址未填写完整（预设中的 <占位> 需替换为真实值）`；被跳过时是对应 `SkipReason` 的中文说明（如 `该渠道未勾选此触发场景`） |
+| auto_notify_enabled | 通知总开关（+ 该渠道的免打扰设置）当前状态。测试信不受它约束，但**自动通知受** —— 不回这个字段就会出现"测试收到了，真实通知一条也没有"的假成功 |
+| status_code | HTTP 状态码。**null = 请求没走完**（超时 / 连不上 / DNS / TLS），此时看 `error` |
+| response_body | 响应体摘要，**最多 200 字**（只读前 8 KB 再截断 —— 目标是用户填的任意 URL，指向一个几百 MB 的文件也完全可能） |
+| attempted_at | 那一次尝试的时间戳（毫秒） |
+
+`status_code` / `response_body` 是排 Webhook 时**唯一**有用的信息（`{"code":40001,"msg":"invalid token"}` 这种）：投递结果里没有它们，core 专门从渠道的"最后一次尝试"快照里捞出来回给 UI。**成功也要显示** —— 某些服务用 `200` 回业务错误，只说"成功"会让用户停止排查。
+
+**状态码 → 重试策略**（这也是自动通知的判据，不只是 `/test`）：
+
+| 状态码 | 结果 | 为什么 |
+|---|---|---|
+| `2xx` | 成功 | 这就是 Webhook 的"送达确认" |
+| `429` / `5xx` | 失败，**可重试** | 限流与服务端故障都是"换个时间就可能成功"的 |
+| 其余 `4xx` | 失败，不可重试 | URL 写错、token 失效、body 被拒收，重试改不了结果 |
+| `3xx` | 失败，不可重试 | 客户端**不跟随重定向**（Location 可以指向非 http(s) 的 scheme，而"跟到哪儿去了"对用户不可见）。错误文案会提示将请求地址改为最终地址 |
+| 网络层异常 | 失败，**可重试** | 超时 / 连不上 / DNS / TLS 在 UFI 这种设备上是常态 |
+
+重试由通知分发器统一执行（最多 3 次，退避 2s + 6s），**整轮只写 1 条投递记录**。
+
+**投递记录**：与邮件 / 本机短信共用 `mail_send_records`（`channel = "webhook"`），可用 `GET /api/sms-forward/history?channel=webhook` 查。`recipient` 列只写 **scheme + host**（丢掉 path 与 query）—— Bark 的 device key、Server 酱的 SENDKEY、企业微信的 key 全都在 path / query 里，那就是密钥，写进用户可导出的记录等于把它泄漏出去。
+
+**送达确认的连带后果**：Webhook 的 2xx 会被 `TrafficAutoOffGuard` 的"通报到位"判定采信 —— 只配了 Bark、没配 SMTP 的用户，自动关网会照常执行。这正是那个判定想要的语义（"用户确实收到通报了"），不是副作用。
+
+
+---
+
+## 本机短信通知 /api/notify/sms
+
+> 需要认证。**通知渠道之一**（阶段 3，2026-09-09）：用设备自己的 SIM 把通知发成一条短信。
+>
+> 存在的理由是**链路互补**：邮件与 Webhook 都走**数据网**，本渠道走**信令网**。而"数据断了 /
+> 套餐用尽 / 自动关网"这几类最该通知的场景，恰恰是前两条发不出去的时候。
+>
+> **这条渠道会产生短信费用**，所以有三道刹车：最低级别（默认只投 `critical`）、每日条数上限
+> （默认 5 条，本地日期跨天重置）、场景勾选。渠道 id 是 **`local_sms`**（不是 `sms` —— 那是场景 id）。
+>
+> 配置存独立 prefs（`notify_local_sms`），**不进 `/api/notifications/config`** —— 那一组是"客户端要不要
+> 弹通知"的开关，渠道配置归渠道自己（与邮件的 `sms_forward`、Webhook 的 `notify_webhook` 同做法）。
+
+#### `GET /api/notify/sms/config`
+
+读全量配置。
+
+**响应：**
+```json
+{
+  "enabled": false,
+  "target_number": "13800138000",
+  "min_level": "critical",
+  "daily_limit": 5,
+  "scenes": ["connectivity", "traffic80"],
+  "respect_dnd": true,
+  "configured": false,
+  "sent_today": 2,
+  "quota_remaining": 3,
+  "levels": ["info", "warning", "critical"],
+  "daily_limit_min": 1,
+  "daily_limit_max": 50
+}
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| enabled | boolean | false | 渠道开关 |
+| target_number | string | "" | 目标号码。允许数字 / `+` / `-` / 空格；投递前去掉分隔符。空 = 未配完 |
+| min_level | string | `critical` | 最低投递级别（`info` / `warning` / `critical`）。低于它的事件 `Skipped(LEVEL_TOO_LOW)`，**不发**。与另两条渠道**同名同义**，只是默认值不同（那两条默认 `info`）；读坏配置时这条渠道刻意回落 `critical` —— 退化成最省钱的一档 |
+| daily_limit | int | 5 | 每日条数上限，范围 **1–50**，**不允许 0**。这是与另两条渠道**刻意不同**的一处：邮件与 Webhook 的 0 表示"不限"，而这条渠道按条计费，"不限"是账单事故。客户端要把这条差异写在界面上，别让用户撞一次 400 才知道。**按设备本地日期跨天重置**（不是 24 小时滑动窗口） |
+| scenes | string[] | [] | 勾选的场景 id（与邮件 / Webhook 同一套词表）。空集 = 只有手动测试会发出去 |
+| respect_dnd | boolean | true | 免打扰时段要不要连本渠道一起静默。默认 true（短信会半夜把人叫醒） |
+
+**只读回显字段**（客户端不要自己算第二套）：
+
+| 字段 | 说明 |
+|---|---|
+| configured | 能不能投 = `enabled && 号码合法`。读的就是渠道那一份 `isConfigured()` |
+| sent_today | 今天已发出几条。**受理即计一条**（详见 `/test`） |
+| quota_remaining | 今天还剩几条，已钳到 0（用户把上限从 20 调到 5 时不会出现负数）。契约上这个字段在 `daily_limit = 0`（不限）时是 `null`，但**这条渠道的下限是 1**，所以实际不会出现 null —— 客户端仍按 `int \| null` 解析（三条渠道共用同一份形状） |
+| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不要手抄第二份** |
+
+> **计数器是本渠道独占的**（`notify_local_sms` 的一对 `quota_day` / `quota_count`），与邮件、Webhook 那两份物理隔离 —— 共享的话邮件发多了会吃掉短信额度，而"某天突然收不到关键短信"这类故障在账面上看不出任何异常。级别与场景两道**会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），**配额不会**（穿透它就是无上限烧钱）。
+
+#### `PUT /api/notify/sms/config`
+
+**字段级合并**：body 是配置字段的任意子集，未出现（或值为 `null`）的键保留服务端现值。
+
+**请求：**
+```json
+{ "enabled": true, "target_number": "138-0013-8000", "min_level": "warning", "daily_limit": 3 }
+```
+
+**响应：** `{ "success": true, "config": { …立即回读的全量配置… } }`
+
+**400 校验**（第一条违规即返回，`code = BAD_REQUEST`）：
+
+- `target_number` 填了但形状不对（去掉 `-` 与空格后需 3–20 位，除首位可选 `+` 外全是数字）。**空号码是合法的**（= 还没配完）；
+- `daily_limit` 不在 1–50；
+- `scenes` 含未知场景 id（打错字的话界面上勾了却永远不触发，日志里也看不出异常，所以提前拒掉）；
+- `min_level` 不是 `info` / `warning` / `critical` 之一。**严格拒绝**，不做"认不出就回落"——在这条渠道上回落到 `info` 等于把最省钱的档位悄悄换成最能烧钱的那档。
+
+#### `POST /api/notify/sms/test`
+
+发一条测试短信。**不受总开关、免打扰与场景勾选约束**（`manual = true`），但**仍受最低级别与每日配额约束** —— 那两道是花钱的闸，不能被"测试"绕过。事件用 `scene = test`、`level = critical`、`channels = {local_sms}`。
+
+> **这个端点会真的从设备 SIM 发出一条短信、产生费用、并消耗一条今日配额。**
+> 客户端必须在调用之前让用户确认。
+
+**响应：**
+```json
+{
+  "success": true,
+  "auto_notify_enabled": false,
+  "verdict": "SENT",
+  "detail": "设备已发出",
+  "counted_toward_quota": true,
+  "sent_today": 3,
+  "quota_remaining": 2,
+  "daily_limit": 5,
+  "attempted_at": 1757400000000
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| success | 固件确认已发出（信箱 `tag=2`）才为 true |
+| error | 失败 / 未投递的原因；成功时不出现 |
+| auto_notify_enabled | 通知总开关（+ 免打扰）当前状态。测试信不受它约束，但**自动通知受** —— 不回这个字段就会出现"测试收到了，真实通知一条也没有"的假成功 |
+| verdict | 固件结论：`SENT` / `FAILED`（信箱 tag=3）/ `PENDING` / `REJECTED` / `NO_RESPONSE` / `EXCEPTION` |
+| counted_toward_quota | **这一次算不算进今日配额** |
+| sent_today / quota_remaining / daily_limit | 结算后的用量 |
+
+**配额口径（这是本组端点最容易误解的一点）：**
+
+配额口径是**排除不了「已经发出去」就计一条**：`SENT` / `FAILED` / `PENDING` 都进过发送队列，`NO_RESPONSE`（请求没走完 / 响应无法解析 / 超时，拿不到设备表态）也可能已经发出，都计。只有设备**明确拒收**（`REJECTED`：设备回了响应、结果是没受理）不计，而那恰好是**唯一可重试**的一档，于是重试永远不会重复扣配额、也永远不会重复计费。
+
+**`PENDING` 为什么算失败**：设备受理了但几秒内没回最终状态，多半已经发出去。所以它**不重试**（重试就是第二条话费），但也**不能报成功** —— 本渠道的 `Sent` 会被自动关网的"通报到位"判定直接采信（`hasDeliveryConfirmation = true`），报一个没确认的结果就是把那个判据变回恒真。
+
+**投递记录**：与邮件 / Webhook 共用 `mail_send_records`（`channel = "local_sms"`），可用 `GET /api/sms-forward/history?channel=local_sms` 查。`recipient` 列只写**脱敏号码**（前 3 后 2）——完整手机号是个人信息，不该落进可导出的记录。
+
+**配额用尽时**：返回 `Skipped(QUOTA_EXCEEDED)`（`error` 里是人话说明），**不会真的发送**。core 侧为它打一行 **WARN**（不是 INFO）—— 那是真的漏了一条通知，release 日志里必须查得到。
+
 
 ---
 
@@ -5324,14 +6120,14 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 > 它从 core 路由、app Retrofit 注解、web 调用、本手册四个来源各自抽端点集合再交叉比对，
 > 「本手册声明但 core 不存在」的必须为空。
 
-守门脚本最近一次统计（2026-08-29，退出 0）：
+守门脚本最近一次统计（2026-09-09，退出码 1 —— 唯一的 P0 是 web `TasksView.vue` 里一条被误抽成 `/api/:p/:p` 的通配路径，与本手册无关）：
 
 | 来源 | 端点数 |
 |------|--------|
-| core 路由声明 | 209 |
-| 本手册 | 198 |
-| Android app | 180 |
-| web 面板 | 184 |
+| core 路由声明 | 230 |
+| 本手册 | 220 |
+| Android app | 217 |
+| web 面板 | 199 |
 
 （三侧比 core 少是正常的：core 有不少端点只被单侧消费，手册也不逐条列举静态资源与通配路由。）
 
@@ -5356,7 +6152,9 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 | /api/tunnel | 25 |
 | /api/alerts | 7 |
 | /api/notifications | 2 |
-| /api/sms-forward | 5 |
+| /api/sms-forward | 7 |
+| /api/notify/webhook | 3 |
+| /api/notify/sms | 3 |
 | /api/config | 4 |
 | /api/pairing (认证) | 4 |
 | /api/pairing/devices | 3 |
@@ -5383,7 +6181,7 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 以下端点曾出现在本手册中，但 `core/` 从未实现过。由 `node scripts/verify-api-contract.mjs` 于 2026-08-26 检出并删除，登记在此避免再次被"补写"进文档或客户端：
 
 - `GET /api/adb/status`、`GET /api/adb/ping`、`GET /api/adb/auto-start`、`POST /api/adb/start`、`POST /api/adb/stop`、`POST /api/adb/auto-start`
-  - 替代方案：ADB / 特权 shell 的只读状态由 `/api/shell/root`（GET，返回 `root`/`uid`/`method`）与 `/api/diagnose`（GET，返回 `adbd`）提供，不新增路由。详见 `docs/APP-WEB-FIX-TASKS.md` §C07。
+  - 替代方案：ADB / 特权 shell 的只读状态由 `/api/shell/root`（GET，返回 `root`/`uid`/`method`）与 `/api/diagnose`（GET，返回 `adbd`）提供，不新增路由。
 - `POST /api/device/usb-mode`
   - core 全仓无 `usb-mode` / `usb_mode` 实现；app 侧 `UfiAxisApi.kt` 也未声明该方法。USB 模式切换目前无后端能力。
 

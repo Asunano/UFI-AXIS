@@ -23,7 +23,8 @@ import java.util.Locale
  */
 object GoformSessionLog {
 
-    private val dir = File("/sdcard/Download/UFI-AXIS/log/core")
+    // 目录取自 [LogPaths]（唯一真源）
+    private val dir = File(LogPaths.dir(LogPaths.Component.CORE))
     private val logFile get() = File(dir, "goform-session.log")
 
     /** 单文件上限 512KB，超限保留尾部 100KB（诊断场景足够，防止无限增长）。 */

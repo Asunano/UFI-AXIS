@@ -44,9 +44,13 @@ class WebSocketManager(
      * 握手鉴权器：返回设备指纹表示通过，返回 null 表示拒绝。
      *
      * 以函数注入而非直接依赖 `PairedDeviceStore`，让 `:core:websocket` 不必知道配对存储的存在，
-     * 也让本类可在纯 JVM 测试里注入确定性实现。null = 不鉴权（仅测试用）。
+     * 也让本类可在纯 JVM 测试里注入确定性实现。传 null = 不鉴权（仅测试用）。
+     *
+     * **没有默认值是故意的**：`/ws/` 在 `AuthMiddleware.isPublic` 里被整体豁免，鉴权完全靠
+     * 这里的握手检查；服务又绑在 0.0.0.0。一旦给它一个 `= null` 默认值，漏传就等于把
+     * 实时通道（signal / traffic / cpu / alert）无鉴权暴露到局域网，且不会有任何编译或运行报错。
      */
-    private val authenticator: WsAuthenticator? = null
+    private val authenticator: WsAuthenticator?
 ) {
 
     private val tag = "WebSocketManager"
@@ -80,6 +84,8 @@ class WebSocketManager(
 
     private companion object {
         private const val BROADCAST_CACHE_TTL_MS = 500L
+        /** 单个客户端 send 的上限；超时只丢帧，不摘连接（见 [broadcast]）。 */
+        private const val SEND_TIMEOUT_MS = 3000L
     }
 
     // 心跳由 Ktor WebSocket 插件自动管理（pingPeriod=15s, timeout=30s），
@@ -191,7 +197,10 @@ class WebSocketManager(
                 types.forEach {
                     val type = it.jsonPrimitive.content
                     subscribedTypes.add(type)
-                    subscriptions.getOrPut(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                    // computeIfAbsent 而非 getOrPut：后者是 get-then-put 两步，不是原子操作。
+                    // 两个客户端并发订阅同一 type 时会各自建一个 Set，其中一个被覆盖，
+                    // 那个客户端从此静默收不到该 type 的任何广播。
+                    subscriptions.computeIfAbsent(type) { ConcurrentHashMap.newKeySet() }.add(session)
                 }
                 AppLogger.i(tag, "Client subscribed to: $subscribedTypes")
             }
@@ -278,17 +287,49 @@ class WebSocketManager(
 
         subscribers.forEach { session ->
             try {
-                session.send(Frame.Text(true, frameBytes))
+                // 每个 send 单独限时：`send` 在背压下会挂起，一个卡住的客户端
+                // （半开 TCP、息屏的手机）会把整轮广播和调用方的 DataScheduler 循环一起拖住。
+                // 超时只丢这一帧、不摘连接 —— 连接活性交给 Ktor 协议层的 ping/pong 判定，
+                // 免得一次瞬时慢发就把正常客户端踢下线。
+                val sent = kotlinx.coroutines.withTimeoutOrNull(SEND_TIMEOUT_MS) {
+                    session.send(Frame.Text(true, frameBytes))
+                }
+                if (sent == null) {
+                    AppLogger.w(tag, "broadcast[$type] send timeout (${SEND_TIMEOUT_MS}ms), frame dropped for one slow client")
+                }
             } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                 catch (_: Exception) {
                     dead.add(session)
                 }
         }
 
-        // 清理已断开的连接和订阅索引
-        dead.forEach { session ->
-            subscriptions[type]?.remove(session)
-            connections.remove(session)
+        // 清理已断开的连接：统一走 dropSession
+        dead.forEach { dropSession(it) }
+    }
+
+    /**
+     * 摘掉一条**发送已经抛异常**的连接。
+     *
+     * 两件事都必须做：
+     * - 遍历 [subscriptions] 的**全部** topic 移除它。原来只从 `subscriptions[type]`
+     *   移除当前这一个 topic，它在别的 topic 的订阅集合里还留着 —— 后续每个 topic 的广播
+     *   都会再对同一条死连接抛一次异常，日志刷满、每轮广播白白多几次超时。
+     * - 主动 `close()`。不关的话对端已经没了，但它的 [handleConnection] 还挂在
+     *   `for (frame in session.incoming)` 上，`connections` 里那一项永远不会被清掉。
+     *
+     * **不在这里动 [connections]，也不在这里判 stale**：这两件事由 [handleConnection] 的
+     * finally 单一负责。这里提前 `connections.remove(session)` 的话，另一条连接断开时
+     * 它的 finally 会看到一个被提前减小的 `connections` —— 明明还有连接在，却误判
+     * `connections.isEmpty()` 并置 stale（前端显示「数据可能过期」）。
+     * close() 之后死连接自己的 finally 会跑，账由它来记。
+     */
+    private suspend fun dropSession(session: WebSocketSession) {
+        subscriptions.values.forEach { it.remove(session) }
+        try {
+            session.close(CloseReason(CloseReason.Codes.GOING_AWAY, "Broadcast send failed"))
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) {
+            AppLogger.w(tag, "死连接 close 失败（已从全部订阅索引摘除）：${e.message}")
         }
     }
 

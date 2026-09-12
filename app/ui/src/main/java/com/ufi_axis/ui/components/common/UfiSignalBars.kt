@@ -41,22 +41,13 @@ fun signalLevelText(rsrp: Int?): String = when {
     else -> "极差"
 }
 
-fun networkTypeColor(networkType: String?): Color = when {
-    networkType == null -> Color.Gray
-    networkType.contains("5G", ignoreCase = true) -> Network5G
-    networkType.contains("NR", ignoreCase = true) -> Network5G
-    networkType.contains("4G", ignoreCase = true) -> Network4G
-    networkType.contains("LTE", ignoreCase = true) -> Network4G
-    networkType.contains("3G", ignoreCase = true) -> Network3G
-    networkType.contains("WCDMA", ignoreCase = true) -> Network3G
-    else -> Network2G
-}
-
-fun batteryColor(percent: Int): Color = when {
-    percent >= 60 -> BatteryHigh
-    percent >= 20 -> BatteryMedium
-    else -> BatteryLow
-}
+// 本组信号读数 API 里，[F24] 冻结范围的**豁免已登记**：
+// `docs/app-theme-token-index.md`（信号 / 制式 / 电量三组域色的影响面表）记着
+// networkTypeColor / batteryColor 的处置，改动或恢复前先看那处，别只看本文件。
+//
+// 制式与电量的域色常量（Network5G/4G/3G/2G、BatteryHigh/Medium/Low）**保留**：
+// 「域色是否随皮肤」还没定，定了再一并处理。
+// signalColor 保留 public：与 signalBars / signalLevelText 是同一组信号读数 API，后两者有外部调用点。
 
 @Composable
 fun UfiSignalBars(

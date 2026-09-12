@@ -143,8 +143,8 @@ class WebUpdateRoutes(
                     AppLogger.e(TAG, "Web override 清除失败，override 仍然有效")
                     call.respond(HttpStatusCode.InternalServerError, toJsonElement(mapOf(
                         "success" to false,
-                        "error" to "清除未完成：override 目录仍存在，请重启服务后重试",
-                        "message" to "清除未完成：override 目录仍存在，请重启服务后重试"
+                        "error" to "清除未完成：自定义前端文件仍存在，请重启服务后重试",
+                        "message" to "清除未完成：自定义前端文件仍存在，请重启服务后重试"
                     )))
                 }
             }

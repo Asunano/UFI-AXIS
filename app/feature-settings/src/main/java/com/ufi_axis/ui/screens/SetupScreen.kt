@@ -61,6 +61,7 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.text.Charsets
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 初次连接引导（Onboarding）重构后的 SetupScreen。
@@ -78,10 +79,10 @@ import kotlin.text.Charsets
  *   - #8 并发配对第二台 confirm 返回 409 → 提示。
  *   - #15 配对中被杀 → 回前台重新拉取 /pairing/info，若 409 则给出解除配对引导。
  *
- * 2026-08-11 阶段 3（设备密码认证）：
+ * 2026-08-11 阶段 3（配对密码认证）：
  *   - /pairing/info 增 device_name / has_default_password 解析；CONFIRM 文案"设备标识"→"设备名"。
- *   - 密码输入 UI：has_default_password=true → "设置设备密码"（新密码+确认+使用默认 admin）；
- *     false → "输入设备密码"（单框）。
+ *   - 密码输入 UI：has_default_password=true → "设置配对密码"（新密码+确认+使用默认 admin）；
+ *     false → "输入配对密码"（单框）。
  *   - doPair 携带 password + device_name（本机 Settings.Global.DEVICE_NAME，读不到可空）。
  *   - ConfirmOutcome 增 InvalidPassword / PasswordLocked 分支。
  *
@@ -152,12 +153,12 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     var isError by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
-    // 设备密码（阶段3）：首次配对设置（新+确认）/ 再次配对校验（单框）
+    // 配对密码（阶段3）：首次配对设置（新+确认）/ 再次配对校验（单框）
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
 
     // CONFIRM 子步骤：仅当 [needsGoformSetup]（后端从未被首次设置）时使用：
-    //   0=设置设备密码，1=GoForm 后台设置。
+    //   0=设置配对密码，1=GoForm 后台设置。
     // 当后端已被设置过（hasDefaultPassword=false，即 devicePasswordSet=true），
     // CONFIRM 阶段仅显示密码步，用户输完密码直接配对（不展示也不允许走 GoForm 步）。
     var confirmStep by remember { mutableStateOf(0) }
@@ -243,8 +244,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         //     ② 指纹被设备移除时 confirm 回 InvalidCode → 退回 MANUAL，手动输入又命中同一分支 → 死循环，
         //       永远到不了密码登录界面。
         //   现在统一走 CONFIRM 阶段，模式完全由后端权威字段 has_default_password 派生：
-        //     true  → 配对（首次初始化）：两步向导（设置设备密码 → GoForm 后台配置 → 配对）；
-        //     false → 登录（普通连接）：仅输入设备密码即可连接（后端已支持配对码消耗后凭密码登录）。
+        //     true  → 配对（首次初始化）：两步向导（设置配对密码 → GoForm 后台配置 → 配对）；
+        //     false → 登录（普通连接）：仅输入配对密码即可连接（后端已支持配对码消耗后凭密码登录）。
         pairingInfo = null
         busy = true
         message = null
@@ -329,12 +330,12 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     return
                 }
                 if (password.length < 4 || password.length > 64) {
-                    toastMessage = ToastMessage("设备密码长度需为 4-64 位", ToastType.WARNING)
+                    toastMessage = ToastMessage("配对密码长度需为 4-64 位", ToastType.WARNING)
                     return
                 }
             }
         } else if (password.isBlank()) {
-            toastMessage = ToastMessage("请输入设备密码", ToastType.WARNING)
+            toastMessage = ToastMessage("请输入配对密码", ToastType.WARNING)
             return
         }
         // GoForm 配置解析与校验（仅在「初始化状态/首次设置」时收集并提交）：
@@ -386,7 +387,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                 }
                 is ConfirmOutcome.InvalidPassword -> {
                     busy = false
-                    toastMessage = ToastMessage("设备密码错误，请重试", ToastType.WARNING)
+                    toastMessage = ToastMessage("配对密码错误，请重试", ToastType.WARNING)
                 }
                 is ConfirmOutcome.PasswordLocked -> {
                     busy = false
@@ -642,9 +643,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                     // 步骤指示器：初始化两步 / 正常仅密码
                                     Text(
                                         when {
-                                            needsGoformSetup && confirmStep == 0 -> "第 1 步 / 共 2 步 · 设置设备密码"
+                                            needsGoformSetup && confirmStep == 0 -> "第 1 步 / 共 2 步 · 设置配对密码"
                                             needsGoformSetup && confirmStep == 1 -> "第 2 步 / 共 2 步 · GoForm 后台设置"
-                                            else -> "重新连接设备 · 输入设备密码"
+                                            else -> "重新连接设备 · 输入配对密码"
                                         },
                                         style = MaterialTheme.typography.labelSmall,
                                         color = palette.accent,
@@ -659,7 +660,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                         modifier = Modifier.fillMaxWidth()
                                     )
                                     Text(
-                                        if (needsGoformSetup) "正在与该设备配对" else "设备已配置过，输入设备密码即可登录",
+                                        if (needsGoformSetup) "正在与该设备配对" else "设备已配置过，输入配对密码即可登录",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = palette.textSecondary,
                                         textAlign = TextAlign.Center,
@@ -671,7 +672,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                         needsGoformSetup && confirmStep == 0 -> {
                                             if (info.hasDefaultPassword) {
                                                 Text(
-                                                    "设置设备密码（留空使用默认 admin）",
+                                                    "设置配对密码（留空使用默认 admin）",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = palette.textSecondary,
                                                     textAlign = TextAlign.Center,
@@ -712,7 +713,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                                 )
                                             } else {
                                                 Text(
-                                                    "输入设备密码后点击下一步",
+                                                    "输入配对密码后点击下一步",
                                                     style = MaterialTheme.typography.labelSmall,
                                                     color = palette.textSecondary,
                                                     textAlign = TextAlign.Center,
@@ -729,7 +730,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                                             nonDefaultPasswordFormatError = "密码仅限英文、数字和符号"
                                                         }
                                                     },
-                                                    label = "设备密码",
+                                                    label = "配对密码",
                                                     isError = nonDefaultPasswordFormatError != null,
                                                     errorMessage = nonDefaultPasswordFormatError,
                                                     modifier = Modifier.fillMaxWidth()
@@ -771,7 +772,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                         // 正常状态：仅密码步（单框必填，跳过 GoForm 步）
                                         else -> {
                                             Text(
-                                                "输入设备密码后点击配对",
+                                                "输入配对密码后点击配对",
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = palette.textSecondary,
                                                 textAlign = TextAlign.Center,
@@ -788,7 +789,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                                         normalPasswordFormatError = "密码仅限英文、数字和符号"
                                                     }
                                                 },
-                                                label = "设备密码",
+                                                label = "配对密码",
                                                 isError = normalPasswordFormatError != null,
                                                 errorMessage = normalPasswordFormatError,
                                                 modifier = Modifier.fillMaxWidth()
@@ -1061,11 +1062,16 @@ private suspend fun httpConfirmPairing(
                     else ConfirmOutcome.Success(token, fingerprint)
                 }
                 409 -> ConfirmOutcome.AlreadyPaired
-                400, 401, 403 -> {
+                // 403 只有一种成因：core 把"首次配对"限制在局域网内（隧道来源被拒），
+                // 与配对码/密码错误无关，不能落到 Invalid 上显示成"配对码无效"。
+                403 -> ConfirmOutcome.Error(
+                    readErrorMessage(conn).ifBlank { "该操作只能在设备所在的局域网内完成" }
+                )
+                400, 401 -> {
                     val errorCode = readErrorCode(conn)
                     when (errorCode) {
                         "INVALID_PASSWORD" -> ConfirmOutcome.InvalidPassword
-                        "PASSWORD_REQUIRED" -> ConfirmOutcome.Error("设备密码已设置，请输入设备密码")
+                        "PASSWORD_REQUIRED" -> ConfirmOutcome.Error("配对密码已设置，请输入配对密码")
                         "PASSWORD_LOCKED" -> ConfirmOutcome.PasswordLocked
                         "INVALID_DEVICE_KEY", "INVALID_CHALLENGE" -> ConfirmOutcome.DeviceKeyRejected
                         else -> ConfirmOutcome.Invalid
@@ -1088,6 +1094,20 @@ private fun readErrorCode(conn: HttpURLConnection): String {
     return try {
         val text = BufferedReader(InputStreamReader(conn.errorStream, Charsets.UTF_8)).readText()
         JSONObject(text).optString("code", "")
+    } catch (e: Exception) {
+        ""
+    }
+}
+
+/**
+ * 从错误响应体读取面向用户的文案（错误格式 {error, code}）。
+ *
+ * 与 [readErrorCode] 二选一调用：errorStream 只能读一次。
+ */
+private fun readErrorMessage(conn: HttpURLConnection): String {
+    return try {
+        val text = BufferedReader(InputStreamReader(conn.errorStream, Charsets.UTF_8)).readText()
+        JSONObject(text).optString("error", "")
     } catch (e: Exception) {
         ""
     }

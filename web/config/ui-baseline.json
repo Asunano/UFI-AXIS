@@ -1,0 +1,7 @@
+{
+  "_comment": "UI 基线：只卡增量，不回填（对齐 Android 侧 config/literal-baseline.properties 与决策 D4）。校验脚本见 scripts/check-ui-baseline.mjs；抬高基线请在 PR 里写清理由。",
+  "exempt": ["src/components/ToggleRow.vue", "src/views/gallery/GalleryView.vue"],
+  "_exemptWhy": "ToggleRow 是开关行的唯一正规实现，它内部那个 n-switch 正是被复用的那一个；GalleryView 是给改 UI 的人用的验收页，刻意把三种开关版式并列展示。",
+  "scopedColorLiterals": 33,
+  "bareSwitches": 41
+}

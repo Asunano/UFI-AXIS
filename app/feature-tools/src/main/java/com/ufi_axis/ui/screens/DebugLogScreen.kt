@@ -3,7 +3,6 @@ package com.ufi_axis.ui.screens
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
-import android.os.Environment
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
@@ -47,6 +46,7 @@ import com.ufi_axis.util.LogFileInfo
 import com.ufi_axis.util.LogKind
 import com.ufi_axis.util.LogLevel
 import com.ufi_axis.util.LogSource
+import com.ufi_axis.util.UfiLogPaths
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -122,7 +122,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 开关下发失败 / 回读失败统一走 toast。清掉 state 里的错误，否则每次重组都会再弹一次。
     LaunchedEffect(logSwitches.errorMessage) {
         logSwitches.errorMessage?.let {
-            toastMessage = ToastMessage(it, ToastType.ERROR, durationMs = 5000L)
+            toastMessage = ToastMessage(it, ToastType.ERROR, durationMs = TOAST_LONG_MS)
             viewModel.tools.clearLogSwitchError()
         }
     }
@@ -282,7 +282,9 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                         exitSelectionMode()
                     }) { Icon(Icons.Default.ContentCopy, "复制选中") }
                     IconButton(onClick = {
-                        exportLogs(selectedLogs(), source) { toastMessage = it }
+                        exportLogs(selectedLogs(), source, kindFilter, levelFilter) {
+                            toastMessage = it
+                        }
                         exitSelectionMode()
                     }) { Icon(Icons.Default.FileDownload, "导出选中") }
                 }
@@ -358,7 +360,11 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     id = "exportAll",
                                     label = "导出全部",
                                     icon = Icons.Default.FileDownload,
-                                    onClick = { exportLogs(visible, source) { toastMessage = it } }
+                                    onClick = {
+                                        exportLogs(visible, source, kindFilter, levelFilter) {
+                                            toastMessage = it
+                                        }
+                                    }
                                 )
                             )
                         }
@@ -806,6 +812,9 @@ private fun LogList(
 private const val FILTER_ALL = "ALL"
 private const val REFRESH_MS = 2000L
 
+/** 需要用户看清内容的 toast（导出路径、开关下发失败）用长时长，默认时长读不完一条路径。 */
+private const val TOAST_LONG_MS = 5000L
+
 // 顶部开关 chip 的 id（只在本页内用，与后端字段名无关）
 private const val SWITCH_MASTER = "master"
 private const val SWITCH_APP = "app"
@@ -829,22 +838,63 @@ private fun filterSummary(kind: String, level: String, query: String): String {
 }
 
 /**
- * 导出到 Downloads。文件名带来源，避免双端日志导出后分不清是谁的。
+ * 导出到 `Download/UFI-AXIS/log/export/<source>/<yyyy-MM-dd>/`（路径来自 [UfiLogPaths]）。
+ *
+ * 2026-09-11 修掉两处用户报的缺陷：
+ * 1. 原来**直接落 Download 根**，与用户自己的下载文件混在一起，也不在品牌目录下；
+ * 2. 文件名只有来源 + 时间戳，导出三次「网络/错误」和「全部」之后就分不清哪份是哪份 ——
+ *    现在把当前筛选的**类型与级别**写进文件名（未筛选的那一维写
+ *    [UfiLogPaths.UNFILTERED]），toast 也报完整相对路径，用户拿文件管理器能直接翻到。
+ *
  * 内容用 [LogEntry.format]，与 core 原始行格式一致，便于直接粘贴对照。
+ * 目录建不出来时给明确的失败提示 —— 导出是用户主动发起的动作，静默失败等于骗人。
  */
 private fun exportLogs(
     logs: List<LogEntry>,
     source: LogSource,
+    kindFilter: String,
+    levelFilter: String,
     onResult: (ToastMessage) -> Unit
 ) {
+    val sourceDir = if (source == LogSource.APP) UfiLogPaths.APP_DIR else UfiLogPaths.CORE_DIR
+    val date = UfiLogPaths.today()
     try {
-        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val fileName = "ufi_axis_${source.name.lowercase(Locale.US)}_log_$timestamp.txt"
-        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        downloadsDir.mkdirs()
-        File(downloadsDir, fileName).writeText(logs.joinToString("\n") { it.format() })
-        onResult(ToastMessage("已导出到 Downloads/$fileName", ToastType.SUCCESS, durationMs = 5000L))
+        val dir = UfiLogPaths.exportDir(source = sourceDir, date = date)
+        if (dir == null) {
+            onResult(
+                ToastMessage(
+                    "导出失败：无法创建目录 ${UfiLogPaths.exportRelative(sourceDir, date)}",
+                    ToastType.ERROR,
+                    durationMs = TOAST_LONG_MS
+                )
+            )
+            return
+        }
+        val stamp = SimpleDateFormat("HHmmss", Locale.US).format(Date())
+        val file = File(
+            dir,
+            UfiLogPaths.exportFileName(kindSlug(kindFilter), levelSlug(levelFilter), stamp)
+        )
+        file.writeText(logs.joinToString("\n") { it.format() })
+        onResult(
+            ToastMessage(
+                "已导出到 ${UfiLogPaths.displayPath(file.absolutePath)}",
+                ToastType.SUCCESS,
+                durationMs = TOAST_LONG_MS
+            )
+        )
     } catch (e: Exception) {
-        onResult(ToastMessage("导出失败: ${e.message}", ToastType.ERROR, durationMs = 5000L))
+        onResult(ToastMessage("导出失败: ${e.message}", ToastType.ERROR, durationMs = TOAST_LONG_MS))
     }
 }
+
+/** 文件名里的类型段。用 `net`/`runtime` 与 [AppFileLogger] 的落盘文件名同名，不用枚举名。 */
+private fun kindSlug(kindFilter: String): String = when (kindFilter) {
+    LogKind.NETWORK.name -> "net"
+    LogKind.RUNTIME.name -> "runtime"
+    else -> UfiLogPaths.UNFILTERED
+}
+
+/** 文件名里的级别段（`debug`/`info`/`warn`/`error`）。 */
+private fun levelSlug(levelFilter: String): String =
+    if (levelFilter == FILTER_ALL) UfiLogPaths.UNFILTERED else levelFilter.lowercase(Locale.US)

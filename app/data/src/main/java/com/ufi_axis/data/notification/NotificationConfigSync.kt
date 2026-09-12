@@ -14,6 +14,11 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 data class NotificationConfigDto(
+    /**
+     * L1 全局通知总闸（2026-09-08）。app 侧本地真源是
+     * [NotificationCenter.KEY_NOTIFY_MASTER]，判定只有 `NotificationCenter.notify` 一处。
+     */
+    val master_enabled: Boolean = false,
     val alert_enabled: Boolean = false,
     // 2026-09-07：日常通知 6 项默认全部 false（用户要求「不要默认开启，需手动打开」）。
     // 必须与 core `NotificationConfig`、`NotifyScene.defaultEnabled`、[readLocal] 的 defValue、
@@ -25,12 +30,34 @@ data class NotificationConfigDto(
     val download_enabled: Boolean = false,
     val traffic_80_enabled: Boolean = false,
     val device_events_enabled: Boolean = false,
+    /** 隧道失败通知的**本机**分类开关（2026-09-08 从 alert_enabled 拆出）。 */
+    val tunnel_enabled: Boolean = false,
+    /**
+     * 邮件是否也遵守免打扰时段（判定在 core，app 只镜像给「邮件通知」页显示 / 下发）。
+     */
+    val mail_respect_dnd: Boolean = false,
+    /**
+     * 「严重事件兜底」（**默认 true —— 本 DTO 唯一默认开启的字段**）。
+     *
+     * 默认值必须与 core `NotificationConfig.critical_override_enabled`、
+     * [NotificationCenter.DEFAULT_CRITICAL_OVERRIDE]、[NotificationConfigSync.readLocal]
+     * 的 defValue 与 `NotifyPrefs.MIRRORED_BOOL_KEYS` 逐字一致 ——
+     * 其余字段都默认 false，写惯了很容易在某一处漏成 false，那就是假开关。
+     */
+    val critical_override_enabled: Boolean = NotificationCenter.DEFAULT_CRITICAL_OVERRIDE,
     val dnd_enabled: Boolean = false,
     val dnd_start_hour: Int = NotificationCenter.DEFAULT_DND_START_HOUR,
     val dnd_end_hour: Int = NotificationCenter.DEFAULT_DND_END_HOUR,
     val guard_enabled: Boolean = false,
     val guard_interval_minutes: Int = GuardScheduler.DEFAULT_INTERVAL_MINUTES,
-    val guard_foreground_keepalive_enabled: Boolean = false
+    val guard_foreground_keepalive_enabled: Boolean = false,
+    /**
+     * 通知历史保留条数（一个值管两张表：本机状态栏通知历史 + 设备端邮件投递记录）。
+     * 默认值必须与 core `NotificationConfig.history_max_rows` 一致。
+     */
+    val history_max_rows: Int = NotificationCenter.DEFAULT_HISTORY_MAX_ROWS,
+    /** 通知历史保留天数（**0 = 不按时间清理**）。与条数是「先到者生效」的两道上限。 */
+    val history_max_age_days: Int = NotificationCenter.DEFAULT_HISTORY_MAX_AGE_DAYS
 )
 
 /** `PUT /api/notifications/config` 的响应：回显服务端合并+校验后的最终值。 */
@@ -69,6 +96,7 @@ object NotificationConfigSync {
             // 默认值统一取 false（2026-09-07 起全部如此）：app 侧所有实际闸门用的都是
             // switchOn(KEY_xxx, false)，defValue 与上面 DTO 的字段默认值必须逐字一致 ——
             // 一旦分叉就会出现「UI 显示关但实际还在推送」。
+            master_enabled = p.getBoolean(NotificationCenter.KEY_NOTIFY_MASTER, false),
             alert_enabled = p.getBoolean(NotificationCenter.KEY_ALERT_NOTIF, false),
             connectivity_enabled = p.getBoolean(NotificationCenter.KEY_CONNECTIVITY_NOTIF, false),
 
@@ -77,6 +105,14 @@ object NotificationConfigSync {
             download_enabled = p.getBoolean(NotificationCenter.KEY_DOWNLOAD_NOTIF, false),
             traffic_80_enabled = p.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false),
             device_events_enabled = p.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false),
+            tunnel_enabled = p.getBoolean(NotificationCenter.KEY_TUNNEL_NOTIF, false),
+            mail_respect_dnd = p.getBoolean(NotificationCenter.KEY_MAIL_RESPECT_DND, false),
+            // 唯一的例外：这一项默认 **true**（core 侧同样）。照抄上面那行的 false
+            // 会让"从未同步过配置"的机器把兜底显示成关，而 core 侧其实是开的。
+            critical_override_enabled = p.getBoolean(
+                NotificationCenter.KEY_CRITICAL_OVERRIDE,
+                NotificationCenter.DEFAULT_CRITICAL_OVERRIDE
+            ),
             dnd_enabled = p.getBoolean(NotificationCenter.KEY_DND_ENABLED, false),
             dnd_start_hour = p.getInt(
                 NotificationCenter.KEY_DND_START_HOUR, NotificationCenter.DEFAULT_DND_START_HOUR
@@ -90,7 +126,14 @@ object NotificationConfigSync {
                 GuardScheduler.DEFAULT_INTERVAL_MINUTES
             ),
             guard_foreground_keepalive_enabled =
-                p.getBoolean(NotificationCenter.KEY_GUARD_FOREGROUND_KEEPALIVE, false)
+                p.getBoolean(NotificationCenter.KEY_GUARD_FOREGROUND_KEEPALIVE, false),
+            history_max_rows = p.getInt(
+                NotificationCenter.KEY_HISTORY_MAX_ROWS, NotificationCenter.DEFAULT_HISTORY_MAX_ROWS
+            ),
+            history_max_age_days = p.getInt(
+                NotificationCenter.KEY_HISTORY_MAX_AGE_DAYS,
+                NotificationCenter.DEFAULT_HISTORY_MAX_AGE_DAYS
+            )
         )
     }
 
@@ -109,6 +152,7 @@ object NotificationConfigSync {
         if (local == remote) return
 
         NotifyPrefs.shared(context).edit()
+            .putBoolean(NotificationCenter.KEY_NOTIFY_MASTER, remote.master_enabled)
             .putBoolean(NotificationCenter.KEY_ALERT_NOTIF, remote.alert_enabled)
             .putBoolean(NotificationCenter.KEY_CONNECTIVITY_NOTIF, remote.connectivity_enabled)
 
@@ -117,9 +161,30 @@ object NotificationConfigSync {
             .putBoolean(NotificationCenter.KEY_DOWNLOAD_NOTIF, remote.download_enabled)
             .putBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, remote.traffic_80_enabled)
             .putBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, remote.device_events_enabled)
+            .putBoolean(NotificationCenter.KEY_TUNNEL_NOTIF, remote.tunnel_enabled)
+            .putBoolean(NotificationCenter.KEY_MAIL_RESPECT_DND, remote.mail_respect_dnd)
+            .putBoolean(
+                NotificationCenter.KEY_CRITICAL_OVERRIDE, remote.critical_override_enabled
+            )
             .putBoolean(NotificationCenter.KEY_DND_ENABLED, remote.dnd_enabled)
             .putInt(NotificationCenter.KEY_DND_START_HOUR, remote.dnd_start_hour.coerceIn(0, 23))
             .putInt(NotificationCenter.KEY_DND_END_HOUR, remote.dnd_end_hour.coerceIn(0, 23))
+            // 钳到允许区间：远端已被 core 的 validate 挡过一轮，这里兜住"直接改配置文件"的情况 ——
+            // 一个 0 条会让裁剪把整张历史表清空（0 天则是合法的"不限"）。
+            .putInt(
+                NotificationCenter.KEY_HISTORY_MAX_ROWS,
+                remote.history_max_rows.coerceIn(
+                    NotificationCenter.MIN_HISTORY_MAX_ROWS,
+                    NotificationCenter.MAX_HISTORY_MAX_ROWS
+                )
+            )
+            .putInt(
+                NotificationCenter.KEY_HISTORY_MAX_AGE_DAYS,
+                remote.history_max_age_days.coerceIn(
+                    NotificationCenter.MIN_HISTORY_MAX_AGE_DAYS,
+                    NotificationCenter.MAX_HISTORY_MAX_AGE_DAYS
+                )
+            )
             .apply()
 
         if (guard != null) {
@@ -162,6 +227,24 @@ object NotificationConfigSync {
             NotificationConfigClient.stopKeepAlive(context)
         }
 
+        // ★ 周期任务的排期同理要在 if/else **之外**按最终值重算一次。
+        //
+        // 排期条件是「guard_enabled AND master_enabled」（见 [GuardScheduler.syncSchedule]），
+        // 而这个函数可能只改了 master 一个字段 —— 上面 `guard != null` 那支只在 guard_enabled
+        // 本身变化时才调 setEnabled，`guard == null` 那支连 WorkManager 都不碰。
+        // 不在这里补一次，从 web 关掉「全局通知」后 Worker 会继续每 15/30/60 分钟联网空跑。
+        // 幂等且不需要实例，所以无条件调用。
+        GuardScheduler.syncSchedule(context)
+
+
+        // ★ 镜像快照必须显式推一次。
+        //
+        // `pushToNotifyProcess` 只覆盖 AIDL 那几个 setter（免打扰 / 守护 / 保活），而
+        // `NotifyPrefs.MIRRORED_BOOL_KEYS` / `MIRRORED_INT_KEYS` 还包含全局总闸、短信/验证码/
+        // 隧道分类、日志开关与两道历史保留上限 —— `:ufi_notify` 读这些键只认自己那份 mirror_ 副本。
+        // 不推的话：从 web 关掉「全局通知」，那个进程仍按旧值继续弹（本仓明令禁止的假开关）；
+        // 改小保留条数，它仍按旧上限裁历史。
+        NotifyDispatchReceiver.dispatchSwitchSnapshot(context)
 
         pushToNotifyProcess(context, remote)
     }

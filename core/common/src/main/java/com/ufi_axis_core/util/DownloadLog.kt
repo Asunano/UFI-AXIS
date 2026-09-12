@@ -14,7 +14,8 @@ import java.util.Locale
  */
 object DownloadLog {
 
-    private val dir = File("/sdcard/Download/UFI-AXIS/log/core")
+    // 目录取自 [LogPaths]（唯一真源），与 AppLogger 的日志根同一个父目录
+    private val dir = File(LogPaths.dir(LogPaths.Component.CORE))
 
     /** 单文件上限 1MB，超限保留尾部 200KB。 */
     private const val MAX_BYTES = 1_048_576L

@@ -1,6 +1,6 @@
 // :core:contract —— app / web / core 三端共享的契约常量。
 //
-// 硬性约束（见 docs/APP-WEB-FIX-TASKS.md §T03）：
+// 硬性约束：
 //   1. 纯 JVM 模块，**不得**引入任何 Android 依赖，也**不得**依赖 :core:common
 //      （contract 是最底层，反向依赖会构成循环）；
 //   2. 只放"双端都要用同一份"的常量与枚举，不放业务逻辑、不放 DTO 实现；

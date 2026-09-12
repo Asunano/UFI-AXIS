@@ -28,6 +28,11 @@ import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
+import com.ufi_axis_core.notify.NotifyEvent
+import com.ufi_axis_core.notify.NotifyLevel
+import com.ufi_axis_core.notify.NotifyScenes
+import com.ufi_axis_core.notify.Notifier
+import com.ufi_axis_core.notify.PushChannel
 import com.ufi_axis_core.api.websocket.WebSocketManager
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
@@ -101,6 +106,15 @@ class DataScheduler(
     private val vcDao: com.ufi_axis_core.core.database.SmsVerificationCodeDao? = null,
     private val smsController: com.ufi_axis_core.controller.sms.SmsController? = null,
     /**
+     * 短信拦截判定（2026-09-08）。这里是三条**写**路径中的两条 ——
+     * WS 推送（`collectSmsCache` 的通知段）与验证码入库（`scanVerificationCodes`），
+     * 命中则不推 / 不入库并写一条拦截记录。
+     *
+     * 判定走 `SmsRuleStore` 的 `@Volatile` 内存快照，**不查 DB、不读 prefs**：
+     * `collectSmsCache` 挂在 5s 轮询上，每轮多一次 Room 查询就是每天多两万次。
+     */
+    private val ruleStore: com.ufi_axis_core.controller.sms.SmsRuleStore? = null,
+    /**
      * 设备字段映射表（计划书 3.2）。选型在 `ComponentFactory` 里做一次后注入。
      *
      * **不接受 null**：`SignalCollector` 的第 1 层就是归一化，关掉等于信号数据全空，
@@ -134,7 +148,7 @@ class DataScheduler(
 
     /** 套餐限额供给器（见 [attachTrafficLimitProvider]）。 */
     @Volatile private var trafficLimitProvider: (suspend () -> JsonObject?)? = null
-    /** 上次检查套餐限额的时间戳；限额是月度量，15s 的流量循环里按 [TRAFFIC_LIMIT_CHECK_INTERVAL_MS] 节流。 */
+    /** 上次检查套餐限额的时间戳；限额是月度量，15s 的流量循环里按 [trafficLimitCheckIntervalMs] 节流。 */
     @Volatile private var lastTrafficLimitCheckAt = 0L
 
     /** 「到达限额自动关网」看护（见 [attachTrafficAutoOffGuard]）。 */
@@ -186,6 +200,21 @@ class DataScheduler(
         trafficAutoOffGuard = guard
         AppLogger.i(tag, "TrafficAutoOffGuard attached")
     }
+
+    /**
+     * 注入通知分发器（2026-09-08 阶段 1）。
+     *
+     * 只用在一处：发现新短信 / 验证码时推一条实时通知（见 [collectSmsCache]）。
+     * 在此之前那里是**手写 payload 直接 `broadcast("notification", …)`**，绕过了统一出口 ——
+     * 于是"推送长什么样"在全仓有两份定义，改 `PushNotification` 时很容易漏掉这一份。
+     */
+    fun attachNotifier(n: Notifier?) {
+        notifier = n
+        AppLogger.i(tag, "通知分发器${if (n != null) "已接入" else "已解除"}")
+    }
+
+    @Volatile
+    private var notifier: Notifier? = null
 
     /**
      * 注入「设备事件」看护（2026-08-31）：WiFi 客户端接入 / 离开。
@@ -380,7 +409,11 @@ class DataScheduler(
     // 网速差值计算后备：当设备 realtime_thrpt 为 0 时，用 monthly_bytes 差值计算
     @Volatile private var lastMonthlyRxBytes: Long = 0L
     @Volatile private var lastMonthlyTxBytes: Long = 0L
-    @Volatile private var lastMonthlyTimestamp: Long = 0L
+    // 采样间隔一定要用单调时钟（SystemClock.elapsedRealtime），不能用墙上时钟：
+    // 这批设备开机后例行做一次 NTP 校时，用户也可能手动改系统时间。墙上时钟一跳，
+    // (now - last) 就可能是负数或几万秒 —— 除出来的网速要么负、要么荒谬地大，
+    // 而字节增量上的 coerceAtLeast(0) 只兜住了分子，兜不住分母。
+    @Volatile private var lastMonthlyElapsedMs: Long = 0L
 
     fun start() {
         if (isRunning) return
@@ -457,7 +490,9 @@ class DataScheduler(
         // 2026-08-29：从固定 30s 提频。验证码短信的到达通知对延迟最敏感，30s 轮询意味着
         // 最坏情况要等半分钟才收到通知。这条循环不打 goform（走 ContentResolver），
         // 且 collectSmsCache() 内部有 `newMax <= lastPollMaxSmsId` 短路——没有新消息时
-        // 直接 return，不做解析/聚合/广播，所以提频的代价只有 Cursor 查询本身。
+        // 不做未读标记/聚合/广播，所以提频的代价只有 Cursor 查询本身。
+        // 2026-09-08 更正：验证码提取**不在**那条短路之后了（挂在短路后会让"打开开关"永远
+        // 等不到扫描，见 collectSmsCache），所以开关开着时每轮会多做最多 5 次主键 exists()。
         schedulerScope.launch {
             while (isActive) {
                 collectSmsCache()
@@ -482,7 +517,7 @@ class DataScheduler(
         schedulerScope.launch {
             while (isActive) {
                 checkDeviceEvents()
-                delay(DEVICE_EVENT_CHECK_INTERVAL_MS)
+                delay(deviceEventCheckIntervalMs)
             }
         }
 
@@ -689,8 +724,12 @@ class DataScheduler(
             DataPriority.LOW -> 20_000L      // 流量统计: 20s base
         }
 
-        val shellLoad = 1.0 - (ShellQoS.rootAvailablePermits.toDouble() / ShellQoS.rootTotalPermits)
-        val goformLoad = 1.0 - (GoformQoS.queryAvailablePermits.toDouble() / GoformQoS.queryTotalPermits)
+        // 分母来自运行时的 QoS 许可总数。今天它被 minPermits 夹住不会为 0，但这是
+        // 一个「改错一行就变 Infinity/NaN」的除法：load 一旦 NaN，coerceIn 直接原样放行 NaN，
+        // 采集间隔就会算成 0（toLong 把 NaN 变 0）—— 表现是采集循环空转打满 goform。
+        // 这里不依赖别处的钳制，自己保证分母 ≥ 1。
+        val shellLoad = 1.0 - (ShellQoS.rootAvailablePermits.toDouble() / ShellQoS.rootTotalPermits.coerceAtLeast(1))
+        val goformLoad = 1.0 - (GoformQoS.queryAvailablePermits.toDouble() / GoformQoS.queryTotalPermits.coerceAtLeast(1))
         val load = maxOf(shellLoad, goformLoad).coerceIn(-0.5, 1.0)
 
         return (baseDelay * (1.0 + load).coerceIn(0.5, 1.5)).toLong()
@@ -710,13 +749,17 @@ class DataScheduler(
             val rxBytes = goform?.first ?: 0L
             val txBytes = goform?.second ?: 0L
             val now = System.currentTimeMillis()
+            // 上报给客户端的 timestamp 仍然是墙上时钟（前端要显示真实时间点），
+            // 但下面算速率的间隔只认单调时钟，两者不能混用。
+            val nowElapsed = android.os.SystemClock.elapsedRealtime()
 
             // 实时网速：优先使用设备上报的 realtime_thrpt，为 0 时用 monthly_bytes 差值计算
             var rxSpeed = goformRxThrpt
             var txSpeed = goformTxThrpt
-            if (rxSpeed == 0L && txSpeed == 0L && lastMonthlyTimestamp > 0 && rxBytes > 0) {
-                val elapsedSec = (now - lastMonthlyTimestamp) / 1000.0
-                if (elapsedSec > 0.5) {  // 至少 0.5s 间隔才有意义
+            if (rxSpeed == 0L && txSpeed == 0L && lastMonthlyElapsedMs > 0 && rxBytes > 0) {
+                val elapsedSec = (nowElapsed - lastMonthlyElapsedMs) / 1000.0
+                // 至少 0.5s 间隔才有意义；非正数（含单调时钟本身异常）一律跳过，绝不拿它当除数。
+                if (elapsedSec > 0.5) {
                     val deltaRx = (rxBytes - lastMonthlyRxBytes).coerceAtLeast(0)
                     val deltaTx = (txBytes - lastMonthlyTxBytes).coerceAtLeast(0)
                     rxSpeed = (deltaRx / elapsedSec).toLong()
@@ -726,7 +769,7 @@ class DataScheduler(
             // 记录本次 monthly 值，供下次差值计算
             lastMonthlyRxBytes = rxBytes
             lastMonthlyTxBytes = txBytes
-            lastMonthlyTimestamp = now
+            lastMonthlyElapsedMs = nowElapsed
 
             val record = TrafficRecord(
                 rxBytes = rxBytes,
@@ -761,6 +804,11 @@ class DataScheduler(
 
             // 自动化规则: 当月累计流量（电平类）
             conditionEngine?.evaluateTraffic(rxBytes + txBytes)
+        } catch (e: CancellationException) {
+            // stop() 会 cancelChildren()，采集正卡在挂起点时抛的就是这个。
+            // 被下面的泛型 catch 吞掉的话，停机瞬间每条采集都会刷一条 ERROR，
+            // 看起来像采集失败，实际只是正常停机 —— 必须原样抛回去。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect traffic", e)
         }
@@ -769,7 +817,7 @@ class DataScheduler(
     /**
      * 套餐限额百分比预警（2026-08-31 从 app 侧下沉）+ 到达阈值自动关网（2026-09-01）。
      *
-     * 由 [collectTraffic] 调用，但按 [TRAFFIC_LIMIT_CHECK_INTERVAL_MS] 节流：
+     * 由 [collectTraffic] 调用，但按 [trafficLimitCheckIntervalMs]（设置项，默认 5min）节流：
      * 流量循环 15s 一轮，而限额是月度量，没必要每轮都去 goform 拉一次 `getDataUsage()`。
      * 供给器为 null（未装配）或返回 null（预警与自动关网都关着 / 查询失败）时静默跳过。
      *
@@ -781,7 +829,7 @@ class DataScheduler(
         val engine = alertEngine
         val guard = trafficAutoOffGuard
         if (engine == null && guard == null) return
-        if (now - lastTrafficLimitCheckAt < TRAFFIC_LIMIT_CHECK_INTERVAL_MS) return
+        if (now - lastTrafficLimitCheckAt < trafficLimitCheckIntervalMs) return
         lastTrafficLimitCheckAt = now
         try {
             val limit = withTimeout(8_000L) { provider() } ?: return
@@ -907,6 +955,8 @@ class DataScheduler(
             alertEngine?.checkConnectivity(deviceOnline, networkType)
             // 自动化规则: 网络类型跳变 / 断网（边沿类）
             conditionEngine?.evaluateConnectivity(deviceOnline, networkType)
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect signal", e)
         }
@@ -937,6 +987,8 @@ class DataScheduler(
 
             // 告警检查: CPU 温度
             alertEngine?.checkTemperature(cpuInfo.temperature)
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect CPU", e)
         }
@@ -972,6 +1024,8 @@ class DataScheduler(
             alertEngine?.checkBattery(level, isCharging)
             // 自动化规则: 电量低（电平类）
             conditionEngine?.evaluateBattery(level, isCharging)
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect battery", e)
         }
@@ -1001,6 +1055,8 @@ class DataScheduler(
                     "usage_percent" to memoryInfo.usage_percent
                 ))
             }
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect memory", e)
         }
@@ -1030,6 +1086,8 @@ class DataScheduler(
         } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
             AppLogger.w(tag, "collectGoformTraffic timed out (8s): ${e.message}")
             // 超时不记录错误,避免日志泛滥
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect goform traffic", e)
         }
@@ -1099,7 +1157,7 @@ class DataScheduler(
             // 2026-08-22：改走 SmsController（ContentResolver 优先，零 goform 请求）；
             // 首次初始化把现有短信全部标记已读并记录水位线
             val ctl = smsController ?: return
-            val all = ctl.getAll(limit = 200)
+            val all = ctl.getAllUnfiltered(limit = 200)
             if (all.isEmpty()) {
                 prefs.smsInitialized = true
                 return
@@ -1131,6 +1189,21 @@ class DataScheduler(
     @Volatile private var cachedSmsContacts: List<Map<String, Any>> = emptyList()
     // 防漏检测：记录上次快速轮询的最高ID，用于判断两次轮询间是否遗漏消息
     @Volatile private var lastPollMaxSmsId: Long = 0L
+    /**
+     * 验证码开关（`sms_code_enabled`）的上次观测值，用于在轮询 tick 上识别 false→true 边沿。
+     *
+     * 2026-09-08 事故：用户在设置页打开"短信验证码解析"后，`/api/sms/verification-codes`
+     * 永远返回空列表，直到**下一条新短信**到达才开始工作。原因是配置写入（ConfigRoutes 的
+     * `boolField("sms_code_enabled")`）只改 AppSettings，不会回扫任何历史消息，而扫描逻辑
+     * 又挂在 `newMax > lastPollMaxSmsId` 这个"有新消息"边沿之下 —— core 启动后的第一轮轮询
+     * 就把 `lastPollMaxSmsId` 顶到了当前最高 ID（那时开关还是关的，什么也没提取），之后每一轮
+     * 都在短路处 return，扫描代码根本执行不到。
+     *
+     * 故意**不持久化**：验证码去重的唯一真相是 `vcDao.exists(msg_id)`，这里只是"本进程有没有
+     * 观测过开关"。null = 还没观测过，因此进程重启后若开关已是开的也会补跑一次回扫
+     * （幂等、有界），顺带覆盖"重装/清库后开关本来就是开的"这种冷缓存场景。
+     */
+    @Volatile private var lastSmsCodeEnabled: Boolean? = null
 
     private suspend fun collectSmsCache() {
         try {
@@ -1138,11 +1211,41 @@ class DataScheduler(
             // 2026-08-22：改走 SmsController（ContentResolver 优先，零 goform 请求、零会话），
             // 不再直连 goform 解析 JSON；轮询最新 5 条消息（覆盖验证码等场景）。
             // 调用间隔见 SMS_ACTIVE_INTERVAL_MS / SMS_IDLE_INTERVAL_MS。
-            val latest = ctl.getAll(limit = FAST_PER_PAGE)
+            //
+            // 用 getAllUnfiltered 而不是 getAll：本方法是三条**写**路径中的两条，职责恰恰是
+            // 「看到被拦的短信 → 不推、不入库、标已读、写一条拦截记录」。走过滤后的列表的话，
+            // 被拦短信对这里根本不存在 —— 拦截照样生效，但「已拦截」列表永远是空的。
+            val latest = ctl.getAllUnfiltered(limit = FAST_PER_PAGE)
             if (latest.isEmpty()) return
 
+            // ── SMS 验证码扫描（功能开启时提取验证码）──
+            //
+            // 2026-09-08：这一段**必须留在下面 `newMax <= lastPollMaxSmsId` 短路之前**。
+            // 它原来在短路之后，于是"用户打开开关"这个动作永远等不到扫描：core 启动第一轮
+            // 就把内存里的 `lastPollMaxSmsId` 顶到了当前最高 ID（那轮开关还是关的，没提取任何东西），
+            // 之后没有新短信进来就一直在短路处 return，`/api/sms/verification-codes` 于是空到
+            // 下一条短信到达为止。扫描本身**不需要**这个边沿：`vcDao.exists(msg_id)` 就是幂等去重，
+            // 重复扫同一批消息只会多几次主键查询，不会重复入库。
+            // 真正需要边沿的只有"来了新短信"这件事本身（未读标记 + 水位线 + WS 通知 + 聚合缓存），
+            // 那些仍在短路之后，所以通知不会每轮重发。
+            //
+            // codeOf：本轮新提取出的 msgId → 验证码，供下面决定推"验证码"还是"新短信"。
+            val codeOf = HashMap<Long, String>()
+            val codeEnabled = settings?.smsCodeEnabled == true
+            var backfillOk = true
+            if (codeEnabled && vcDao != null) {
+                // 开关 false→true（或本进程首次观测到它是开的）→ 一次性深回扫历史消息。
+                // 只有这里会读比 FAST_PER_PAGE 更深的一页：日常轮询仍然只看最新 5 条。
+                if (lastSmsCodeEnabled != true) backfillOk = backfillVerificationCodes(ctl, codeOf)
+                scanVerificationCodes(ctl, latest, codeOf)
+            }
+            // 观测值推进：回扫读历史短信失败时**不**推进，下一轮（5/15s 后）再试一次 ——
+            // 否则一次 Cursor 异常就把"用户刚打开开关"这个一次性边沿永久吞掉。
+            // 开关关着、或降级装配没有 vcDao 时 backfillOk 恒为 true，直接推进，不会每轮重试。
+            if (backfillOk) lastSmsCodeEnabled = codeEnabled
+
             val newMax = latest.maxOf { it.id }
-            if (newMax <= lastPollMaxSmsId) return  // 无新消息，跳过后续解析、聚合和广播
+            if (newMax <= lastPollMaxSmsId) return  // 无新消息，跳过后续的未读标记、聚合和广播
             lastPollMaxSmsId = newMax
 
             // ── SMS 已读状态：检测新消息并写入未读状态 ──
@@ -1154,10 +1257,20 @@ class DataScheduler(
             }
             for (m in latest) {
                 if (m.id > (settings?.smsHighWaterMark ?: 0L)) {
-                    // 只有接收的新消息才标记未读，发送的默认已读
+                    // 只有接收的新消息才标记未读，发送的默认已读。
+                    //
+                    // 2026-09-08：被拦截的短信也直接标记已读 —— `getUnreadCount` 是纯 DB COUNT，
+                    // 而 DB 里**没有正文**，关键词规则在 DB 层无从判断。在唯一能看到正文的地方
+                    // （这里）把它写成已读，未读数就天然不含被拦短信，`getUnreadCount` 一行不用改，
+                    // 联系人列表的 unread 聚合也自动一致。
+                    //
+                    // **明确不做追溯**：先收到短信、后加规则的那些历史 `sms_read_state` 不回改。
+                    // 追溯要拿正文重跑全表判定，成本高，而且语义可疑 ——
+                    // 「我刚加了条规则，历史未读数突然变了」比未读数偏大更让人不安。
+                    val blocked = ruleStore?.isBlocked(m.address, m.body) == true
                     smsReadStateDao?.insert(com.ufi_axis_core.core.database.SmsReadState(
                         msg_id = m.id,
-                        read = (m.direction == "sent"),
+                        read = (m.direction == "sent" || blocked),
                         phone = m.address
                     ))
                 }
@@ -1171,25 +1284,6 @@ class DataScheduler(
                 settings?.smsHighWaterMark = newMax
             }
 
-            // ── SMS 验证码扫描（功能开启时，对新收到的消息提取验证码） ──
-            // codeOf：本轮新提取出的 msgId → 验证码，供下面决定推"验证码"还是"新短信"。
-            val codeOf = HashMap<Long, String>()
-            if (settings?.smsCodeEnabled == true && vcDao != null) {
-                for (m in latest) {
-                    try {
-                        if (m.direction != "received") continue
-                        // 去重：已处理过的消息跳过
-                        if (vcDao.exists(m.id) > 0) continue
-                        val vc = ctl.extractCode(m.address, m.body, m.id, m.date)
-                        if (vc != null) {
-                            vcDao.insert(vc)
-                            codeOf[m.id] = vc.code
-                            AppLogger.d(tag, "VC extracted: code=${vc.code} from=${vc.source}")
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-
             // ── 新短信 / 新验证码 → WS `notification` 频道（2026-09-04）──
             //
             // 为什么必须由 core 推：app 侧此前**只有**两条发现新短信的路径 ——
@@ -1200,39 +1294,77 @@ class DataScheduler(
             // `notification` 是 `:ufi_notify` 守护进程订阅的频道，因此 app 在后台
             // 甚至主进程被回收时也能弹。
             //
-            // 走 webSocketManager.broadcast 而不是 pushService.pushAlert：后者会**同时**广播
-            // 到 `alert` 频道并把短信写进告警管线（告警列表 + 告警总闸 + 告警 channel），
-            // 短信不该混进告警。payload 形状与 WebSocketPushService 保持一致，两端解析共用一套。
+            // 2026-09-08 阶段 1：改走通知分发器（[attachNotifier]），不再手写 payload。
+            // 原来这里直接 `webSocketManager.broadcast("notification", …)` 拼一份与
+            // `PushNotification` 同形但类型是 `Map<String, Any?>` 的 map —— 于是"推送长什么样"
+            // 在全仓有两份定义，改契约时很容易漏掉这一份。
+            //
+            // **落到线上的 JSON 与 topic 都逐字不变**：
+            // - JSON：`PushChannel` 的映射是 scene→type、level 小写、title/body→title/message、
+            //   extra 原样、timestamp 原样，6 个键与顺序都与下面这段原 map 一致；
+            // - topic：`sms` / `verification` 在 `PushChannel.SINGLE_TOPIC_SCENES` 里，
+            //   `mirrorToAlertTopic = false` → **只发 `notification`，不镜像到 `alert`**。
+            //   镜像会让 web 的告警列表把短信列成告警（可见的功能回归）。
+            //
+            // 只投 push 渠道：短信的**邮件**由 `SmsForwardController.forwardSms` 另行 emit
+            // （它按 `lastForwardedSmsId` 去重，与这里"每轮只推最新一条"不是一回事）。
             //
             // **每轮最多推一条**：`broadcast` 对同一频道有 100ms 序列化缓存，
             // 同轮连发第二条会被替换成第一条的内容（发出去两条一模一样的通知）；
             // 而 app 侧短信/验证码的 notificationId 是固定的，多条本来也会互相覆盖。
-            // 所以取本轮最新的那条 —— 与 app 进短信页时 `maybeNotifyNewSms` 只弹最新未读一致。
-            val newest = newReceived.maxByOrNull { it.id }
-            if (newest != null) {
+            // 所以取本轮最新的那条 —— app 侧的短信通知也是固定 id、只显示最新那条，语义一致。
+            //
+            // 2026-09-08 拦截接入：命中规则的**不推**，并写一条拦截记录（path=push）。
+            // 先过滤再取最新，不能反 —— 否则「最新那条正好被拦」会连带把同轮里没被拦的
+            // 那几条一起吞掉（本来该推的通知永久丢失，而且日志里看不出为什么）。
+            // 通知侧 app 完全不做过滤：core 不推，app 天然收不到（core 判定、app 渲染）。
+            val pushable = ArrayList<com.ufi_axis_core.controller.sms.SmsController.SmsMessage>(newReceived.size)
+            val filterStore = ruleStore
+            for (m in newReceived) {
+                val verdict = filterStore?.evaluate(m.address, m.body)
+                if (filterStore != null && verdict is com.ufi_axis_core.controller.sms.SmsFilter.Verdict.Block) {
+                    filterStore.recordBlocked(
+                        msgId = m.id, sender = m.address, body = m.body,
+                        block = verdict,
+                        path = com.ufi_axis_core.controller.sms.SmsRuleStore.Path.PUSH
+                    )
+                } else {
+                    pushable.add(m)
+                }
+            }
+            val newest = pushable.maxByOrNull { it.id }
+            val emit = notifier
+            if (newest != null && emit != null) {
                 val code = codeOf[newest.id]
-                val data = mapOf<String, Any?>(
-                    "type" to if (code != null) "verification" else "sms",
-                    "level" to "info",
-                    "title" to if (code != null) "验证码" else "新短信",
-                    "message" to if (code != null) {
-                        "${newest.address}：$code"
-                    } else {
-                        "${newest.address}：${newest.body.take(60)}"
-                    },
-                    "timestamp" to newest.date,
-                    "extra" to buildMap {
-                        put("id", newest.id.toString())
-                        put("sender", newest.address)
-                        put("snippet", newest.body.take(120))
-                        if (code != null) put("code", code)
-                    }
+                val isCode = code != null
+                emit(
+                    NotifyEvent(
+                        scene = if (isCode) NotifyScenes.VERIFICATION else NotifyScenes.SMS,
+                        level = NotifyLevel.INFO,
+                        title = if (isCode) "验证码" else "新短信",
+                        body = if (isCode) {
+                            "${newest.address}：$code"
+                        } else {
+                            "${newest.address}：${newest.body.take(SMS_PUSH_MESSAGE_CHARS)}"
+                        },
+                        extra = buildMap {
+                            put("id", newest.id.toString())
+                            put("sender", newest.address)
+                            put("snippet", newest.body.take(SMS_PUSH_SNIPPET_CHARS))
+                            if (code != null) put("code", code)
+                        },
+                        timestamp = newest.date,
+                        channels = setOf(PushChannel.ID)
+                    )
                 )
-                webSocketManager.broadcast("notification", data)
-                AppLogger.i(tag, "SMS 通知已推送：id=${newest.id} type=${if (code != null) "verification" else "sms"}")
+                AppLogger.i(tag, "SMS 通知已推送：id=${newest.id} type=${if (isCode) "verification" else "sms"}")
             }
 
-            val messages = latest.map { m ->
+            // 聚合缓存是**展示口径**，所以这里要把被拦的滤掉（上面用的是未过滤列表，
+            // 因为写路径必须看得见它们）。当前 getCachedSmsContacts() 还没有调用方，
+            // 但口径先对齐，免得将来接上去时才发现被拦号码挂在联系人列表里。
+            val visible = latest.filter { filterStore?.isBlocked(it.address, it.body) != true }
+            val messages = visible.map { m ->
                 mapOf<String, Any>(
                     "id" to m.id, "number" to m.address, "content" to m.body,
                     "date" to m.date, "read" to true, "direction" to m.direction
@@ -1265,9 +1397,111 @@ class DataScheduler(
             // 冷数据：不通过 WebSocket 推送，前端通过 REST API 按需获取
 
             AppLogger.d(tag, "SMS cache: ${contacts.size} contacts, ${mergedMessages.size} messages")
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect SMS cache", e)
         }
+    }
+
+    /**
+     * 对一批消息做验证码提取并入库，返回本次**新入库**条数。
+     *
+     * 幂等的唯一依据是 `vcDao.exists(msg_id)`（`sms_verification_codes.msg_id` 就是主键，
+     * 插入还是 `OnConflictStrategy.IGNORE`）—— 所以同一批消息被反复扫描只会多几次主键查询，
+     * 不会重复入库，也不会重复计数。这正是"扫描可以脱离有新消息边沿、每轮都跑"的前提，
+     * 别再把它挪回 `lastPollMaxSmsId` 短路之后（2026-09-08 事故，见 [lastSmsCodeEnabled]）。
+     */
+    private suspend fun scanVerificationCodes(
+        ctl: com.ufi_axis_core.controller.sms.SmsController,
+        messages: List<com.ufi_axis_core.controller.sms.SmsController.SmsMessage>,
+        codeOf: MutableMap<Long, String>
+    ): Int {
+        val dao = vcDao ?: return 0
+        val filterStore = ruleStore
+        var inserted = 0
+        for (m in messages) {
+            // 只解析收到的消息：自己发出去的短信里的数字不是验证码
+            if (m.direction != "received") continue
+            try {
+                // 去重：已处理过的消息跳过
+                if (dao.exists(m.id) > 0) continue
+                // 2026-09-08 拦截接入：命中规则的**不入库**，并写一条拦截记录（path=vc）。
+                // 判定放在 exists() 之后：已经入库过的记录不该因为「后来加了规则」而被记一笔拦截
+                // （那不是拦截，那是历史数据，删不删由用户在验证码列表里决定）。
+                //
+                // 注意验证码豁免在这里的语义：豁免只让**关键词**规则放行，`scope=sender` 的
+                // 号码黑名单照旧拦 —— 用户把某个号码拉黑之后，它发来的验证码也不该出现在通知 Tab。
+                val verdict = filterStore?.evaluate(m.address, m.body)
+                if (filterStore != null && verdict is com.ufi_axis_core.controller.sms.SmsFilter.Verdict.Block) {
+                    filterStore.recordBlocked(
+                        msgId = m.id, sender = m.address, body = m.body,
+                        block = verdict,
+                        path = com.ufi_axis_core.controller.sms.SmsRuleStore.Path.VC
+                    )
+                    continue
+                }
+                val vc = ctl.extractCode(m.address, m.body, m.id, m.date) ?: continue
+                dao.insert(vc)
+                codeOf[m.id] = vc.code
+                inserted++
+                AppLogger.d(tag, "VC extracted: code=${vc.code} from=${vc.source}")
+            } catch (e: CancellationException) {
+                // 停机/切换采集模式时的取消不是"这条解析失败"，吞掉会让整个循环继续跑完
+                // 一整批已经没人要的结果。与 SmsRuleStore / SmsController 同一口径：先抛。
+                throw e
+            } catch (e: Exception) {
+                // 单条失败只跳过这条，但必须留下上下文：这里原来是 `catch (_: Exception) {}`，
+                // 结果"验证码没解析出来"在日志里一点痕迹都没有，只能靠猜。
+                AppLogger.w(tag, "VC 提取失败，跳过该条：msgId=${m.id} from=${m.address}: ${e.message}")
+            }
+        }
+        return inserted
+    }
+
+    /**
+     * 验证码开关刚打开时的一次性回扫：把用户**已有**的短信也过一遍提取器。
+     *
+     * 为什么需要：打开开关这个动作只写 AppSettings（`ConfigRoutes` 的 `sms_code_enabled`），
+     * 不会产生任何新短信，而日常轮询只看最新 [FAST_PER_PAGE] 条 —— 用户的诉求恰恰是
+     * "我刚打开这个功能，想看到我最近收到的验证码"，只靠 5 条窗口永远满足不了。
+     *
+     * 边界（刻意都收紧了，这是跑在 5s 轮询 tick 上的活儿，不是后台任务）：
+     * - 一次性：由 [lastSmsCodeEnabled] 的 false→true 边沿触发，不装闹钟、不加 WakeLock。
+     * - 有界：最多读 [VC_BACKFILL_LIMIT] 条，一次 Cursor 查询 + 最多同样条数的主键查询。
+     * - 只回扫清理窗口内的消息：清理是按 `created_at` 删的，回扫会给老消息盖上"现在"的
+     *   created_at，等于把用户那边已经过期消失的验证码复活一遍，而且每次进程重启复活一次。
+     * - `vcDao == null` 的降级装配直接判成"无需回扫"（返回 true，不重试）。
+     *
+     * @return true = 这次回扫算跑过了（含"没什么可回扫"）；false = 读历史短信失败，调用方
+     *         不要推进 [lastSmsCodeEnabled]，下一轮再试。
+     */
+    private suspend fun backfillVerificationCodes(
+        ctl: com.ufi_axis_core.controller.sms.SmsController,
+        codeOf: MutableMap<Long, String>
+    ): Boolean {
+        if (vcDao == null) return true
+        val history = try {
+            ctl.getAllUnfiltered(limit = VC_BACKFILL_LIMIT)
+        } catch (e: CancellationException) {
+            // 取消不是"读历史短信失败"。吞掉它会走到 return false，而 false 的语义是
+            // "不要推进 lastSmsCodeEnabled，下一轮再试" —— 于是「用户刚打开开关」这个
+            // 一次性边沿被变成每轮 5s 都重试一次的回扫。
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "验证码回扫失败：读历史短信异常，下一轮重试: ${e.message}")
+            return false
+        }
+        val cleanupHours = settings?.smsCodeCleanupHours ?: 24
+        val cutoff = if (cleanupHours > 0) System.currentTimeMillis() - cleanupHours * 3600_000L else 0L
+        val scoped = if (cutoff > 0) history.filter { it.date >= cutoff } else history
+        val inserted = scanVerificationCodes(ctl, scoped, codeOf)
+        AppLogger.i(
+            tag,
+            "验证码开关刚打开：回扫历史短信 ${scoped.size}/${history.size} 条" +
+                "（limit=$VC_BACKFILL_LIMIT, 保留窗口=${cleanupHours}h），新入库 $inserted 条"
+        )
+        return true
     }
 
     /** 批量合并本地已读状态到消息列表 */
@@ -1469,15 +1703,28 @@ class DataScheduler(
     private val thermalWarnMilliC: Int get() = (settings?.monitorThermalWarnC ?: 70) * 1000
     private val thermalCriticalMilliC: Int get() = (settings?.monitorThermalCriticalC ?: 80) * 1000
     private val thermalPauseMs: Long get() = (settings?.monitorThermalPauseSec ?: 20) * 1000L
+    // 2026-09-08 补齐：上一次改造漏了这两个，于是「套餐限额预警」与「设备接入/离开提醒」
+    // 三类告警的周期完全不可调 —— 用户把告警扫描间隔调到 5 秒，它们还是 5 分钟 / 60 秒。
+    private val trafficLimitCheckIntervalMs: Long
+        get() = (settings?.monitorTrafficLimitCheckSec ?: 300) * 1000L
+    private val deviceEventCheckIntervalMs: Long
+        get() = (settings?.monitorDeviceEventCheckSec ?: 60) * 1000L
 
     private companion object {
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s
-        const val TRAFFIC_LIMIT_CHECK_INTERVAL_MS = 300_000L // 套餐限额百分比检查: 5min（月度量，不必跟着 15s 流量循环跑）
-        const val DEVICE_EVENT_CHECK_INTERVAL_MS = 60_000L   // 设备事件（WiFi 客户端）差异检测: 60s
         const val BATTERY_COLLECTION_INTERVAL_MS = 60_000L
         // 刷写间隔 / 空闲采集间隔 / 告警扫描间隔 / 保留天数 / 温控档位
         // 2026-09-03 起改由 AppSettings 提供（见类体上方的 flushIntervalMs 等），此处不再放常量。
+        // 套餐限额检查间隔 / 设备事件比对间隔 2026-09-08 起同样改由 AppSettings 提供
+        //（trafficLimitCheckIntervalMs / deviceEventCheckIntervalMs）。
         const val FAST_PER_PAGE = 5                          // SMS快速轮询：每次5条
+        // 验证码开关 false→true 时一次性回扫的深度。100 条的取舍：
+        // ① 一次 ContentResolver 查询 + 最多 100 次主键 exists()，跑在 5s 轮询 tick 上，
+        //    比 initializeSmsReadStates() 的 200 条更保守（那个只在首装跑一次，不在热循环里）；
+        // ② 100 条已经远远覆盖验证码的保留窗口（smsCodeCleanupHours 默认 24h），
+        //    回扫还会再按该窗口过滤一次，读更深也不会多入库；
+        // ③ 上限与 REST /sms/list 的 200 同数量级，不需要新的分页语义。
+        const val VC_BACKFILL_LIMIT = 100                    // 验证码回扫：一次性最多回看 100 条
         // SMS 采集间隔：验证码通知的及时性优先级最高，所以这是唯一一条比信号采集还密的循环。
         // 代价只是系统 Cursor 压力 —— collectSmsCache() 走 SmsController（ContentResolver 优先），
         // 零 goform 请求，不占 GoformQoS 许可，也不给设备加压。
@@ -1486,6 +1733,15 @@ class DataScheduler(
         const val MAX_BUFFER_SIZE = 50                     // 单缓冲区最大记录数（降低内存占用）
         const val HISTORY_QUERY_LIMIT = 10_000               // 单次查询最大记录数
         const val MAX_SMS_CONTACTS = 50               // SMS 联系人缓存上限
+
+        /**
+         * 短信推送里 `message` / `extra.snippet` 的截断长度。
+         *
+         * 2026-09-08 收进分发器时从裸字面量提上来，取值与迁移前逐字一致（60 / 120）——
+         * 这两个数字是**线上可见**的（app 的通知正文与详情用的就是它们），不能顺手改。
+         */
+        const val SMS_PUSH_MESSAGE_CHARS = 60
+        const val SMS_PUSH_SNIPPET_CHARS = 120
     }
 
     enum class DataPriority {

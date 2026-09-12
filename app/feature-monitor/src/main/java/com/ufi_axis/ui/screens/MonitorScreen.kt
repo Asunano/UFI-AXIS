@@ -4,11 +4,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.ScrollState
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
@@ -22,21 +18,17 @@ import androidx.compose.material.icons.filled.CalendarMonth
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Inbox
+import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
-import androidx.compose.animation.togetherWith
-import androidx.compose.animation.scaleIn
-import androidx.compose.animation.scaleOut
-import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -44,7 +36,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,7 +54,8 @@ import com.ufi_axis.ui.components.AggregatedAlertRowView
 import com.ufi_axis.ui.components.AlertTypeDetailDialog
 import com.ufi_axis.ui.components.EventSummaryCard
 import com.ufi_axis.ui.components.MonitorEventStatCards
-import com.ufi_axis.ui.components.MonitorEventList
+import com.ufi_axis.ui.components.MonitorEventCard
+
 
 import com.ufi_axis.ui.components.MonitorLevelFilter
 import com.ufi_axis.ui.components.MonitorOverviewTab
@@ -235,7 +227,9 @@ fun MonitorScreen(
         navController = navController,
         showBack = showBack,
         actions = {
-            IconButton(onClick = { navController.navigate("detail/monitor-settings") }) {
+            // 只留一个齿轮。「告警设置」是监控设置里的一个入口（2026-09-08 从这里挪进去）——
+            // 顶栏并排两个图标要用户先猜哪个是哪个，而它本身就属于"监控的设置"。
+            IconButton(onClick = { navController.navigate(Routes.DETAIL_MONITOR_SETTINGS) }) {
                 Icon(
                     imageVector = Icons.Default.Settings,
                     contentDescription = "监控设置",
@@ -346,7 +340,16 @@ private fun MonitorOverviewTabContent(
 
     // ★ 2026-09-02 懒加载：告警只在「总览 Tab 真被打开」时拉 —— 本函数只在该 Tab 下组合，
     // 所以组合本身就是"用户看到了"的信号。直接进图表 Tab 的用户不会白拉一次告警列表。
-    LaunchedEffect(Unit) { viewModel.dashboard.loadAlerts() }
+    //
+    // 告警引擎开关（core `AlertConfig.enabled` 的镜像）跟着一起拉：关着时设备不检测、不入库，
+    // 下面的事件列表恒为空 —— 必须把这个原因说出来，见 [AlertEngineOffCard]。
+    val alertConfig by viewModel.alertPrefs.configFlow.collectAsState()
+    // 镜像还没拉到（null）时不显示提示：那会儿还不知道引擎到底开着没，先说"关了"是猜的。
+    val engineOff = alertConfig?.enabled == false
+    LaunchedEffect(Unit) {
+        viewModel.dashboard.loadAlerts()
+        viewModel.tools.loadAlerts()
+    }
 
     // FIX-6（2026-08-23 · 23:47）：监控中心「总览」Tab 改为按类型聚合视图。
     // 根因：上一次修复仅下放到了 DETAIL_EVENTS（事件中心全屏页），但用户打开 MAIN 路由下的
@@ -414,7 +417,9 @@ private fun MonitorOverviewTabContent(
             // 顺带修掉一个漏显：错误卡当年是个 LazyColumn item，列表滚下去它就被回收、错误也跟着没了。
 
             item(key = "hero") {
-                UfiLinearLoading(isLoading = monitorState.isLoading && monitorState.alerts.isEmpty())
+                // 2026-09-08：首屏空数据时的 UfiLinearLoading（M3 indeterminate 横条，无限循环动画）
+                // 已删除，改成一行静态文案。横条本身没有进度信息，只是在动；数据到了卡片直接出现。
+                MonitorLoadingHint(visible = monitorState.isLoading && monitorState.alerts.isEmpty())
                 EventSummaryCard(
                     alerts = todayAlerts,
                     range = todayRange,
@@ -468,7 +473,24 @@ private fun MonitorOverviewTabContent(
                 )
             }
 
-            if (todayAlerts.isEmpty() && !monitorState.isLoading) {
+            if (engineOff && todayAlerts.isEmpty()) {
+                // 引擎关着时事件列表必然是空的，而空态写的是「今日暂无异常事件」——
+                // 那句话在这种情况下是假的：不是没异常，是根本没在看。所以**整块换掉空态**，
+                // 而不是在空态上面再叠一张提示卡（2026-09-08 改：原来是插在列表前的独立 item）。
+                //
+                // 有历史事件时不换：那些是引擎关之前产生的，列表本身就该显示，
+                // 此时再顶一张"没开启"的卡会盖住用户真正要看的内容。
+                item(key = "engineOff") {
+                    AlertEngineOffCard(
+                        onEnable = {
+                            alertConfig?.let { viewModel.tools.updateAlertConfig(it.copy(enabled = true)) }
+                        },
+                        onOpenSettings = { navController.navigate(Routes.DETAIL_ALERT_SETTINGS) },
+                        canEnable = alertConfig != null,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
+                    )
+                }
+            } else if (todayAlerts.isEmpty() && !monitorState.isLoading) {
                 item(key = "empty") {
                     // fillParentMaxSize() 会让这条提示自己占满一屏——它上面还有 hero + 6 格 + chips，
                     // 结果「今日暂无异常事件」被整屏空白顶到折叠以下，要再滚一屏才看得到。
@@ -543,9 +565,7 @@ private fun MonitorOverviewTabContent(
                     pageCount = overviewPageCount,
                     onPrev = { if (currentPage > 0) currentPage-- },
                     onNext = { if (currentPage < overviewPageCount - 1) currentPage++ },
-                    // 翻页脉冲原本写在已删除的 FloatingEventPaginationBar 内部；公共组件不含缩放，
-                    // 由调用点自己套（见 rememberPagePulseModifier）。
-                    modifier = rememberPagePulseModifier(currentPage)
+                    modifier = Modifier
                         .wrapContentWidth(Alignment.CenterHorizontally)
                         .padding(horizontal = Spacing.CardHorizontalMargin),
                     variant = UfiPaginationVariant.Floating,
@@ -603,9 +623,15 @@ private fun MonitorChartsTabContent(
     }
     val showReset = range is MonitorTimeRange.Custom && range.startMs != MonitorTimeRange.todayStartMs()
 
+    // X 轴 / tooltip 时间格式：选中「今天」语义（近 24 小时内、或自定义从今日 0 点起）不显示日期，
+    // 其它范围（近 7 天、跨天自定义等）显示「日期 + 时间」。直接按所选范围判定，
+    // 避免「选了 7 天但设备早期无数据、实际点集只跨 1 天」时仍不显示日期（空桶被服务端跳过）。
     val timeRangeStr = remember(monitorState.selectedRange) {
         val r = monitorState.selectedRange
-        if (r is MonitorTimeRange.Custom && r.startMs == MonitorTimeRange.todayStartMs()) "today" else "week"
+        when (r) {
+            is MonitorTimeRange.Preset -> if (r.hours <= 24) "today" else "week"
+            is MonitorTimeRange.Custom -> if (r.startMs == MonitorTimeRange.todayStartMs()) "today" else "week"
+        }
     }
 
     Row(
@@ -653,7 +679,7 @@ private fun MonitorChartsTabContent(
         }
 
         item {
-            UfiLinearLoading(isLoading = monitorState.isLoading && monitorState.cpuHistory.isEmpty())
+            MonitorLoadingHint(visible = monitorState.isLoading && monitorState.cpuHistory.isEmpty())
         }
 
         // 2026-09-05：错误 item 已移除，见本文件上方同类注释（全局错误浮层）。
@@ -861,6 +887,78 @@ private fun MonitorChartSection(
     }
 }
 
+/**
+ * 「告警引擎没开」提示卡（2026-09-08）。
+ *
+ * 引擎关着（core `AlertConfig.enabled = false`）时设备既不检测也不入库，事件列表恒为空，
+ * 而空态写的是「今日暂无异常事件」—— 那句话在这种情况下是假的：不是没异常，是根本没在看。
+ * 所以把原因、一键开启、以及去调阈值的入口摆在列表最前面。
+ *
+ * @param canEnable 配置镜像是否已拉到。没拉到就不能写：那会用本地默认值 + 旧 version 提交，
+ *                  可能把设备上的阈值整体重置成默认值（同 [AlertSettingsScreen] 的 configLoaded 守卫）。
+ */
+@Composable
+private fun AlertEngineOffCard(
+    onEnable: () -> Unit,
+    onOpenSettings: () -> Unit,
+    canEnable: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalResolvedPalette.current
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = UfiCardDefaults.shape,
+        color = palette.warning.copy(alpha = 0.08f),
+        border = BorderStroke(1.dp, palette.warning.copy(alpha = 0.4f))
+    ) {
+        Column(
+            modifier = Modifier.padding(Spacing.InnerPadding),
+            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.NotificationsActive,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                    tint = palette.warning
+                )
+                Spacer(Modifier.width(Spacing.Small))
+                Text(
+                    text = "设备告警引擎未开启",
+                    style = UfiTextStyles.sectionTitle,
+                    color = palette.textPrimary
+                )
+            }
+            Text(
+                text = "设备当前不检测温度、电量、流量、信号等异常，所以这里不会出现任何事件。",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+                UfiButton(
+                    text = "立即开启",
+                    size = UfiButtonSize.Small,
+                    enabled = canEnable,
+                    onClick = onEnable
+                )
+                UfiButton(
+                    variant = UfiButtonVariant.Secondary,
+                    size = UfiButtonSize.Small,
+                    text = "告警设置",
+                    onClick = onOpenSettings
+                )
+            }
+            if (!canEnable) {
+                Text(
+                    text = "正在读取告警配置，读取完成后才能开启。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.textSecondary.copy(alpha = 0.75f)
+                )
+            }
+        }
+    }
+}
+
 // ==================== 事件中心独立全屏页内容（v26 · 方案 A） ====================
 
 @Composable
@@ -1020,23 +1118,31 @@ fun EventsCenterContent(viewModel: MainViewModel) {
     }
 
     Box(Modifier.fillMaxSize()) {
-        val scrollState = rememberScrollState()
+        // 2026-09-08：由 Column(verticalScroll) 改为 LazyColumn —— 事件卡真正懒加载。
+        // 原实现把整页 pageSize 条 MonitorEventCard 一次性全部组合（默认 20 条，可调到 100），
+        // 进入 Tab / 翻页 / 切筛选都要同步组合完才出画面，那正是"卡一下"的来源。
+        // 头部（统计卡 + 模式切换 + 筛选行）内容是一整块、不需要各自回收，装在单个 item 里。
+        val listState = rememberLazyListState()
         val paginationBarVisible = rememberSmartPaginationBarVisible(
-            scrollState = scrollState,
+            listState = listState,
             currentPage = currentPage,
             pageCount = effectivePageCount
         )
         LaunchedEffect(currentPage) {
-            scrollState.animateScrollTo(0)
+            // 翻页回顶部用瞬时 scrollToItem：animateScrollToItem 会让整页从旧位置"飞"回去，
+            // 观感与刷新动画无异（新一页的内容已经换好了，滚动过程只是延迟看到它）。
+            listState.scrollToItem(0)
         }
         val fabReservedBottom = if (effectivePageCount > 1) 56.dp else bottomPadding
-        Column(
+        LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
-                .verticalScroll(scrollState)
                 .padding(bottom = fabReservedBottom)
         ) {
-            UfiLinearLoading(isLoading = monitorState.isLoading && monitorState.alerts.isEmpty())
+            item(key = "eventsHeader") {
+            Column {
+            MonitorLoadingHint(visible = monitorState.isLoading && monitorState.alerts.isEmpty())
 
             // 2026-09-05：错误横幅已移除，改由全局错误浮层统一展示（见本文件上方注释）。
 
@@ -1190,76 +1296,55 @@ fun EventsCenterContent(viewModel: MainViewModel) {
                 )
             }
             Spacer(Modifier.height(Spacing.Small))
+            }   // header Column
+            }   // item("eventsHeader")
 
-if (filteredAlerts.isEmpty() && !monitorState.isLoading) {
-                UfiEmptyState(
-                    icon = Icons.Default.Inbox,
-                    message = "暂无符合条件的事件",
-                    hint = "调整筛选条件试试",
-                    modifier = Modifier.fillMaxWidth()
-                )
+            // 列表本体：每条事件一个 LazyColumn item，滚到才组合。
+            // 2026-09-08：翻页的 AnimatedContent（淡入 + 0.98→1 微缩放）已删除 —— 翻页是"换一批
+            // 数据"而不是导航转场，内容淡入会让首屏可见时间多等一个 Duration.Smooth，观感就是刷新动画。
+            if (filteredAlerts.isEmpty() && !monitorState.isLoading) {
+                item(key = "emptyAll") {
+                    UfiEmptyState(
+                        icon = Icons.Default.Inbox,
+                        message = "暂无符合条件的事件",
+                        hint = "调整筛选条件试试",
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             } else if (pageAlerts.isEmpty()) {
-                UfiEmptyState(
-                    icon = Icons.Default.Inbox,
-                    message = "本页无事件",
-                    hint = "切换到第 1 页查看",
-                    modifier = Modifier.fillMaxWidth()
-                )
+                item(key = "emptyPage") {
+                    UfiEmptyState(
+                        icon = Icons.Default.Inbox,
+                        message = "本页无事件",
+                        hint = "切换到第 1 页查看",
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             } else if (aggregateMode) {
                 // FIX-3：按 (type, level) 聚合视图。每行仅显示类型 + 累计次数 + 最近时间 + 等级 chip。
                 // 点击 → detailTarget = (type, level) → AlertTypeDetailDialog 弹出具体事件 + 内置分页。
-                AnimatedContent(
-                    targetState = currentPage,
-                    transitionSpec = {
-                        val top = TransformOrigin(0.5f, 0f)
-                        (fadeIn(animationSpec = tween(UfiMotion.Duration.Smooth)) +
-                            scaleIn(initialScale = 0.98f, transformOrigin = top, animationSpec = tween(UfiMotion.Duration.Smooth)))
-                            .togetherWith(
-                                fadeOut(animationSpec = tween(UfiMotion.Duration.Base)) +
-                                    scaleOut(targetScale = 1.02f, transformOrigin = top, animationSpec = tween(UfiMotion.Duration.Base))
-                            )
-                    },
-                    label = "eventPageListAggregated"
-                ) { _ ->
-                    Column(
+                items(aggPageSlice, key = { "${it.type}|${it.level}" }) { row ->
+                    AggregatedAlertRowView(
+                        row = row,
+                        onClick = { detailTarget = row.type to row.level },
                         modifier = Modifier
-                            .fillMaxWidth()
                             .padding(horizontal = Spacing.CardHorizontalMargin)
-                    ) {
-                        aggPageSlice.forEach { row ->
-                            AggregatedAlertRowView(
-                                row = row,
-                                onClick = { detailTarget = row.type to row.level },
-                                modifier = Modifier.padding(vertical = 4.dp)
-                            )
-                        }
-                    }
+                            .padding(vertical = 4.dp)
+                    )
                 }
             } else {
-                AnimatedContent(
-                    targetState = currentPage,
-                    transitionSpec = {
-                        val top = TransformOrigin(0.5f, 0f)
-                        (fadeIn(animationSpec = tween(UfiMotion.Duration.Smooth)) +
-                            scaleIn(initialScale = 0.98f, transformOrigin = top, animationSpec = tween(UfiMotion.Duration.Smooth)))
-                            .togetherWith(
-                                fadeOut(animationSpec = tween(UfiMotion.Duration.Base)) +
-                                    scaleOut(targetScale = 1.02f, transformOrigin = top, animationSpec = tween(UfiMotion.Duration.Base))
-                            )
-                    },
-                    label = "eventPageList"
-                ) { page ->
-                    val start = page * pageSize
-                    val slice = if (start >= filteredAlerts.size) emptyList()
-                        else filteredAlerts.subList(start, kotlin.math.min(start + pageSize, filteredAlerts.size))
-                    MonitorEventList(
-                        alerts = slice,
+                val start = currentPage * pageSize
+                val slice = if (start >= filteredAlerts.size) emptyList()
+                    else filteredAlerts.subList(start, kotlin.math.min(start + pageSize, filteredAlerts.size))
+                items(slice, key = { it.id }) { alert ->
+                    MonitorEventCard(
+                        alert = alert,
                         onAckOne = { id -> viewModel.dashboard.ackAlert(id) },
                         onDelete = { id -> pendingDeleteAlertId = id },
-                        horizontalPadding = Spacing.CardHorizontalMargin,
-                        emptyTitle = if (eventReadFilter == "unread") "暂无未读事件" else "暂无符合条件的事件",
-                        emptySubtitle = if (eventReadFilter == "unread") "所有事件都已读" else "调整筛选条件试试",
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.padding(
+                            horizontal = Spacing.CardHorizontalMargin,
+                            vertical = 4.dp
+                        )
                     )
                 }
             }
@@ -1278,9 +1363,7 @@ if (filteredAlerts.isEmpty() && !monitorState.isLoading) {
                 pageCount = effectivePageCount,
                 onPrev = { if (currentPage > 0) currentPage-- },
                 onNext = { if (currentPage < effectivePageCount - 1) currentPage++ },
-                // 翻页脉冲原本写在已删除的 FloatingEventPaginationBar 内部；公共组件不含缩放，
-                // 由调用点自己套（见 rememberPagePulseModifier）。
-                modifier = rememberPagePulseModifier(currentPage)
+                modifier = Modifier
                     .wrapContentWidth(Alignment.CenterHorizontally)
                     .padding(horizontal = Spacing.CardHorizontalMargin),
                 variant = UfiPaginationVariant.Floating,
@@ -1680,6 +1763,9 @@ private fun FixedMonitorChart(
                 bucketMs = bucketMs,
                 xDomainStartMs = xDomainStartMs,
                 xDomainEndMs = xDomainEndMs,
+                // 同屏 8 张图共用同一个 Y 轴列宽下限，X 轴才会对齐（见该常量的 KDoc）。
+                // 各图的轴标签字符数都已压到 ≤5，所以全部撞在这个下限上。
+                yAxisMinWidth = Spacing.ChartYAxisAlignedWidth,
                 modifier = Modifier.fillMaxWidth()
             )
         } else {
@@ -1687,13 +1773,14 @@ private fun FixedMonitorChart(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
-                if (isLoading) {
-                    UfiLoadingIndicator(modifier = Modifier.size(26.dp))
-                    Spacer(Modifier.height(6.dp))
-                    Text("数据加载中…", style = MaterialTheme.typography.labelSmall, color = LocalResolvedPalette.current.textSecondary)
-                } else {
-                    Text("暂无数据", style = MaterialTheme.typography.labelSmall, color = LocalResolvedPalette.current.textSecondary)
-                }
+                // 2026-09-08：加载态原来画 UfiLoadingIndicator（1s 一圈的呼吸弧）。
+                // 它挂在 monitorState.isLoading 上，每轮轮询都会转一遍 —— 那就是用户看到的"刷新动画"。
+                // 只留静态文案：图表是否有数据一眼可见，转圈提供不了额外信息。
+                Text(
+                    if (isLoading) "数据加载中…" else "暂无数据",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = LocalResolvedPalette.current.textSecondary
+                )
             }
         }
     }
@@ -1809,10 +1896,36 @@ private fun toUfiPoints(points: List<DownsampledPoint>): List<UfiDownsampledPoin
 
 private fun pctAxisLabel(v: Double): String = "${v.toInt()}%"
 
-private fun trafficYAxisLabel(v: Double): String = when {
-    v >= 1_048_576 -> "%.1f MB/s".format(v / 1_048_576)
-    v >= 1024 -> "%.1f KB/s".format(v / 1024)
-    else -> "%.1f B/s".format(v)
+/**
+ * 速率图的 **Y 轴**刻度文案。
+ *
+ * 2026-09-09 重写。原来是 `"%.1f MB/s"` / `"%.1f KB/s"` / `"%.1f B/s"`，最长 `389.0 KB/s` 共 10 字符 ——
+ * 而 Y 轴列宽是按最宽刻度实测算的，绘图区左右外距又都由它推导（见 `UfiMonitorChart` 的
+ * `yAxisMinWidth` 注释）。于是同屏 8 张图里只有这两张速率图的 X 轴又短又偏左，
+ * 而且峰值跨过 1MB/s 时（10 字符 ↔ 9 字符）宽度还会自己抖一下。
+ *
+ * 现在做两件事把字符数**钉在 ≤5**：
+ * 1. 单位压成单字母、去掉 `/s` —— 单位在卡片标题「上/下行速率」和 tooltip 里都还在
+ *    （tooltip 走的是 [yFormatterFor] 的 `FormatUtils.formatRate`，仍是完整 "12.3 MB/s"），
+ *    轴上重复一遍只是把绘图区挤窄；
+ * 2. 尾数 ≥100 用整数、<100 留一位小数。尾数值域是 [0, 1024)，所以最长形态只有
+ *    `1023K`（4+1）与 `99.9M`（4+1）两种，上界 5 字符。
+ *
+ * 改这里之前请先读 `Spacing.ChartYAxisAlignedWidth`：对齐是靠"所有图的标签都 ≤5 字符、
+ * 于是全部撞在同一个宽度下限上"实现的，字符数一旦超上界，这张图会重新错开。
+ */
+private fun trafficYAxisLabel(v: Double): String {
+    val (mantissa, suffix) = when {
+        v >= 1_073_741_824 -> v / 1_073_741_824 to "G"
+        v >= 1_048_576 -> v / 1_048_576 to "M"
+        v >= 1024 -> v / 1024 to "K"
+        else -> v to ""
+    }
+    return if (mantissa >= 100) {
+        "%.0f%s".format(mantissa, suffix)
+    } else {
+        "%.1f%s".format(mantissa, suffix)
+    }
 }
 
 /**
@@ -1900,23 +2013,10 @@ private fun monitorRatLabel(raw: String?): String? {
 }
 
 /**
- * 浮动分页条的「按滚动方向自动隐藏」判据 —— [ScrollState]（`verticalScroll` 列）版。
+ * 浮动分页条的「按滚动方向自动隐藏」判据 —— [LazyListState]（[LazyColumn]）版（2026-09-05 P3）。
  *
- * 事件中心用这一支（[EventsCenterContent] 的内容是 Column + verticalScroll）。
- */
-@Composable
-private fun rememberSmartPaginationBarVisible(
-    scrollState: ScrollState,
-    currentPage: Int,
-    pageCount: Int
-): Boolean = rememberSmartPaginationBarVisible(
-    currentPage = currentPage,
-    pageCount = pageCount,
-    scrollValue = { scrollState.value }
-)
-
-/**
- * 同一判据的 [LazyListState]（[LazyColumn]）版（2026-09-05 P3）。
+ * 2026-09-08：原来还有一支 [androidx.compose.foundation.ScrollState] 版（事件中心当年是
+ * Column + verticalScroll）。事件中心改成 LazyColumn 之后两个 Tab 都走这一支，那支已删除。
  *
  * 总览 Tab 的内容是 LazyColumn，拿不到"从顶部滚了多少像素"这个连续量；这里用
  * `首个可见 item 下标 × 步长 + 该 item 内偏移` 合成一个**单调代理值**：
@@ -1995,22 +2095,22 @@ private fun rememberSmartPaginationBarVisible(
 }
 
 /**
- * 翻页脉冲：页码变化时先跳到 1.08 再用 pagePulse() 弹回 1，给"页真的翻了"一个可见的确认。
+ * 首屏加载提示：**静态**一行文案，替代原来的 `UfiLinearLoading`（M3 indeterminate 横条）。
  *
- * 2026-09-04 收口：这段原本埋在私有 `FloatingEventPaginationBar` 内部。公共 [UfiPagination]
- * 不含任何容器/阴影/入场/缩放（那些由调用点决定），所以脉冲提到这里，由两处浮动分页条各自套上。
- * 首帧不播（`mounted` 门）：进页面就抖一下是噪音，不是反馈。
+ * 判据一律是「isLoading **且**对应数据为空」，即只在首屏出现；轮询刷新走 `silent = true`，
+ * 不会翻 isLoading，所以已有数据时这行永远不出现（见本文件顶部轮询注释）。
  */
 @Composable
-private fun rememberPagePulseModifier(currentPage: Int): Modifier {
-    val pulse = remember { Animatable(1f) }
-    val mounted = remember { mutableStateOf(false) }
-    LaunchedEffect(currentPage) {
-        if (!mounted.value) { mounted.value = true; return@LaunchedEffect }
-        pulse.snapTo(1.08f)
-        pulse.animateTo(1f, animationSpec = UfiMotion.pagePulse())
-    }
-    return Modifier.graphicsLayer { scaleX = pulse.value; scaleY = pulse.value }
+private fun MonitorLoadingHint(visible: Boolean, modifier: Modifier = Modifier) {
+    if (!visible) return
+    Text(
+        text = "加载中…",
+        style = MaterialTheme.typography.labelSmall,
+        color = LocalResolvedPalette.current.textSecondary,
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.CardHorizontalMargin, vertical = Spacing.Medium)
+    )
 }
 
 @Composable
@@ -2073,7 +2173,7 @@ private fun PageSizeSettingsDialog(
     ) {
         val palette = LocalResolvedPalette.current
         Text(
-            text = "选择列表每页显示的事件数量，配置跨冷启动持久化。",
+            text = "选择列表每页显示的事件数量，重启应用后仍保留。",
             style = MaterialTheme.typography.bodyMedium,
             color = palette.textSecondary
         )

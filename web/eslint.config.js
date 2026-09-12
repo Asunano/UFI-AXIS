@@ -41,6 +41,12 @@ export default tseslint.config(
     files: ['**/*.vue'],
     rules: { 'no-irregular-whitespace': 'off' },
   },
+  {
+    // 构建期脚本跑在 Node 里：console / process / fs 都是合法全局，
+    // 用浏览器那套 globals 会把它们全报成 no-undef。
+    files: ['scripts/**/*.{js,mjs}'],
+    languageOptions: { globals: { ...globals.node } },
+  },
   // prettier 放最后：关掉所有与格式化冲突的规则，格式统一交给 prettier
   prettier
 );

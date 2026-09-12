@@ -15,6 +15,7 @@ android {
 
 dependencies {
     implementation(project(":core:common"))
+    implementation(project(":core:contract"))
     implementation(project(":core:database"))
     implementation(project(":core:websocket"))
     implementation(libs.kotlinx.serialization.json)

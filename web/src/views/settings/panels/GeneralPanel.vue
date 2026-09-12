@@ -6,14 +6,14 @@
         <n-button size="tiny" type="error" quaternary @click="resetConfig">恢复默认</n-button>
       </template>
       <div class="config-section">
-        <div class="section-subtitle">Goform 连接</div>
+        <div class="section-subtitle">设备后台连接</div>
         <div class="config-grid">
           <div class="config-item">
             <span class="config-label">IP</span>
             <n-input v-model:value="generalForm.goformIp" placeholder="192.168.0.1" size="small" />
           </div>
           <div class="config-item">
-            <span class="config-label">Goform 端口</span>
+            <span class="config-label">设备后台端口</span>
             <n-input-number
               v-model:value="generalForm.goformPort"
               :min="ConfigLimits.goformPort[0]"
@@ -115,19 +115,47 @@
         >
       </div>
     </GridCard>
+    <!-- 恢复默认配置：需配对密码，core 侧 /api/config/reset 会校验 -->
+    <n-modal
+      v-model:show="resetModalOpen"
+      preset="card"
+      title="恢复默认配置"
+      style="max-width: 460px"
+      :mask-closable="!resetting"
+    >
+      <n-space vertical :size="12">
+        <n-alert type="warning" :bordered="false">
+          将把端口、设备后台连接、日志、QoS、更新源等配置全部恢复默认，<strong>需重启服务生效</strong>。
+          配对信息与配对密码不受影响。
+        </n-alert>
+        <n-input
+          v-model:value="resetPassword"
+          type="password"
+          show-password-on="click"
+          placeholder="请输入配对密码"
+          :disabled="resetting"
+          @keyup.enter="submitReset"
+        />
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button size="small" :disabled="resetting" @click="resetModalOpen = false">取消</n-button>
+          <n-button size="small" type="error" :loading="resetting" @click="submitReset">恢复默认</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from 'vue';
-import { useMessage, useDialog } from 'naive-ui';
+import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import { ConfigLimits } from '@/api/contract';
 import { buildChangedPayload, commitConfigSave } from '@/views/settings/settingsShared';
 
 const message = useMessage();
-const dialog = useDialog();
 const api = getApiClient();
 
 // ── 通用设置 ──
@@ -240,24 +268,41 @@ async function saveGeneral() {
   }
 }
 
+/**
+ * 恢复默认配置。
+ *
+ * core 侧 `/api/config/reset` 从 2026-09-10 起要求配对密码：此前它只要求「已配对身份」，
+ * 而它会清掉配置里的一切 —— 一台借出去用过、配对记录还没删的旧手机就能远程触发。
+ * 所以这里不能再用 dialog.warning 一键确认，必须收一次密码。
+ */
+const resetModalOpen = ref(false);
+const resetPassword = ref('');
+const resetting = ref(false);
+
 function resetConfig() {
-  dialog.warning({
-    title: '恢复默认配置',
-    content: '将把包含端口、Goform 密码在内的全部配置恢复默认，并需重启服务生效。确定继续？',
-    positiveText: '恢复默认',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      try {
-        const { data } = await api.post('/api/config/reset');
-        message.warning(data.message || '配置已恢复默认，需重启服务生效');
-        // 只刷新本分栏：QoS / 版本信息等其余分栏此刻并未挂载，
-        // 下次打开它们时会各自 onMounted 重新拉取，无需在这里代劳。
-        loadGeneralConfig();
-      } catch (e: any) {
-        message.error(e?.response?.data?.error || '恢复失败');
-      }
-    },
-  });
+  resetPassword.value = '';
+  resetModalOpen.value = true;
+}
+
+async function submitReset() {
+  if (!resetPassword.value) {
+    message.warning('请输入配对密码');
+    return;
+  }
+  resetting.value = true;
+  try {
+    const { data } = await api.post('/api/config/reset', { password: resetPassword.value });
+    message.warning(data.message || '配置已恢复默认，需重启服务生效');
+    resetModalOpen.value = false;
+    resetPassword.value = '';
+    // 只刷新本分栏：QoS / 版本信息等其余分栏此刻并未挂载，
+    // 下次打开它们时会各自 onMounted 重新拉取，无需在这里代劳。
+    loadGeneralConfig();
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '恢复失败');
+  } finally {
+    resetting.value = false;
+  }
 }
 
 /**
@@ -286,7 +331,8 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
+/* .settings-panel 栅格与断点、.config-grid/.config-item/.config-label/.switch-item 版式、
+   .section-subtitle、.card-actions 均已统一到 src/styles/main.css（全局各一份） */
 
 /* ── Config layout ── */
 .config-section {
@@ -294,44 +340,5 @@ onUnmounted(() => {
 }
 .config-section:last-child {
   margin-bottom: 0;
-}
-.section-subtitle {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-.config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.config-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.config-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.switch-item {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-}
-.inline-group {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-
-/* .card-actions 已统一到 src/styles/main.css（全局一份，四个面板共用） */
-
-/* ── Responsive ── */
-@media (max-width: 768px) {
-  .config-grid {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

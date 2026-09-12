@@ -37,7 +37,13 @@ import { useMessage } from 'naive-ui';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { normalizeWifiSettings, normalizeWifiClients } from '@/composables/utils';
-import { NetworkMode, NetworkModeOptions, BearerToNetworkMode } from '@/api/contract';
+import {
+  NetworkMode,
+  NetworkModeOptions,
+  BearerToNetworkMode,
+  NetworkModeSwitchProbe,
+  shouldKeepProbingMode,
+} from '@/api/contract';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
 
 /** 设备 goform 写入到查询接口可见的延迟补偿。见文件头约定 1。 */
@@ -159,6 +165,18 @@ export function useNetworkControls() {
     () => networkModes.find((m) => m.value === selectedMode.value)?.label || selectedMode.value
   );
 
+  /**
+   * 正在切换中的**目标**制式；null = 没有进行中的切换。
+   *
+   * 它同时是 [loadDeviceSettings] 的闸门：切换期间设备仍报旧档位，回读值**不许**覆盖
+   * [selectedMode]，否则界面会被弹回切换前的档位（2026-09-11 真机缺陷）。
+   */
+  const switchingMode = ref<string | null>(null);
+  /** 上一次切换在 `NetworkModeSwitchProbe` 的预算内没等到设备报出目标档位。 */
+  const modeSwitchTimedOut = ref(false);
+
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
   const roamingEnabled = ref(false);
   const connectionMode = ref('auto');
   const connModeOptions = [
@@ -179,13 +197,24 @@ export function useNetworkControls() {
    * 一次请求把 /api/device/settings 里用到的字段全取出来。
    * 注意：网络模式/漫游在这个端点（BearerPreference / roam_setting_option / connection_mode），
    * 而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
+   *
+   * @returns 这次读到的网络制式别名（读失败返回 null），供切换回读确认比对目标档位。
    */
-  async function loadDeviceSettings() {
+  async function loadDeviceSettings(): Promise<string | null> {
     try {
-      const { data } = await api.get('/api/device/settings');
+      const res = await api.get('/api/device/settings');
+      // 请求被取消（组件卸载 / 路由切走）时 useCancellableApi resolve 成 { __canceled: true }，
+      // data 为 undefined。不显式识别的话 BearerPreference 会被读成 ''、回读值塌成 'AUTO'：
+      // 既会把选中项刷成"自动"，也会让切换回读把"没读到"误判成"已经到目标档位"。
+      if ((res as { __canceled?: boolean })?.__canceled === true) return null;
+      const data = res.data;
+      if (data == null) return null;
       const raw = String(data?.BearerPreference ?? '');
       // 未知取值不静默显示成「自动」，直接透出原始值，避免误导
-      selectedMode.value = BearerToNetworkMode[raw] || raw || 'AUTO';
+      const readback = BearerToNetworkMode[raw] || raw || 'AUTO';
+      // 切换期间**不许**用回读值覆盖选中项：设备重新注册时报的还是旧档位，
+      // 覆盖就会把界面弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
+      if (switchingMode.value === null) selectedMode.value = readback;
       const roam = String(data?.roam_setting_option ?? data?.dial_roam_setting_option ?? '');
       roamingEnabled.value = roam === 'on' || roam === '1';
       const mode = String(data?.connection_mode ?? '').toLowerCase();
@@ -193,8 +222,10 @@ export function useNetworkControls() {
       if (data?.sleep_sysIdleTimeToSleep != null) {
         sleepTime.value = Number(data.sleep_sysIdleTimeToSleep) || 0;
       }
+      return readback;
     } catch {
       /* 保持默认 */
+      return null;
     }
   }
 
@@ -284,14 +315,59 @@ export function useNetworkControls() {
       after: { reload: refreshNetworkStatus, always: true },
     });
 
-  const applyNetworkMode = () =>
-    runWrite({
+  /**
+   * 切换网络制式。
+   *
+   * 与其他写操作不同，这里**不用** `runWrite` 的 `after` 回读：`after` 只读一次，而设备
+   * 在重新注册期间报的还是旧档位，读一次就渲染 = 界面停在切换前的档位。改成
+   * 「切换中」中间态 + 有上限的回读确认（[probeNetworkMode]）。
+   */
+  const applyNetworkMode = async () => {
+    const target = selectedMode.value;
+    switchingMode.value = target;
+    modeSwitchTimedOut.value = false;
+    const accepted = await runWrite({
       setBusy: (on) => (modeLoading.value = on),
-      request: () => api.post('/api/network/mode', { mode: selectedMode.value }),
-      ok: '网络模式已切换',
+      request: () => api.post('/api/network/mode', { mode: target }),
+      // 下发成功只代表固件收下了，真正切完要等回读确认，所以这句是"正在"而不是"已"
+      ok: '正在切换网络模式，设备重新搜网需要一点时间',
       fail: '切换失败',
-      after: { reload: loadDeviceSettings, always: true },
     });
+    if (!accepted) {
+      // 失败：core 已经把真因（会话失效 / 设备拒绝）放进 error 字段，runWrite 弹过了。
+      // 先放开闸门再回读，把选中项还原成设备当前值 —— 否则界面停在一个设备上并不成立的档位。
+      switchingMode.value = null;
+      await loadDeviceSettings();
+      return false;
+    }
+    return await probeNetworkMode(target);
+  };
+
+  /**
+   * 有上限地回读，等设备报出目标档位。
+   *
+   * 上限来自 contract 的 `NetworkModeSwitchProbe`（与 app 同源）：设备在弱信号下可能十几秒
+   * 都注册不上，无上限轮询会一直打 goform 查询。预算内没等到就明确说"尚未完成"，
+   * **不静默停在旧值上** —— 静默会让用户以为切换失败（实际往往稍后就切过去了）。
+   */
+  async function probeNetworkMode(target: string): Promise<boolean> {
+    await sleep(NetworkModeSwitchProbe.firstDelayMs);
+    let attempt = 0;
+    let reached = false;
+    for (;;) {
+      attempt += 1;
+      reached = (await loadDeviceSettings()) === target;
+      if (!shouldKeepProbingMode(attempt, reached)) break;
+      await sleep(NetworkModeSwitchProbe.intervalMs);
+    }
+    switchingMode.value = null;
+    modeSwitchTimedOut.value = !reached;
+    // 闸门放开后补一次回读，让选中项与设备一致：成功时等于 target，超时时回到设备当前值
+    await loadDeviceSettings();
+    if (reached) message.success('网络模式已切换');
+    else message.warning('设备尚未完成切换，可稍后刷新查看');
+    return reached;
+  }
 
   const saveSleepTimer = () =>
     runWrite({
@@ -470,6 +546,9 @@ export function useNetworkControls() {
     modeLoading,
     modeLabel,
     applyNetworkMode,
+    // 「切换中」中间态：调用方据此显示"正在切换 / 尚未完成"，不要自己去猜回读值
+    switchingMode,
+    modeSwitchTimedOut,
 
     // 连接
     roamingEnabled,

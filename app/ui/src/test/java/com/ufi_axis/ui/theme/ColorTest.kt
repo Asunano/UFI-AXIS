@@ -20,6 +20,48 @@ import org.junit.Test
  */
 class ColorTest {
 
+    /**
+     * accent 对卡面达不到 [MIN_NON_TEXT_CONTRAST] 的「预设 id → 明暗档」清单 ——
+     * 唯一的对比度例外，**只准缩不准扩**（由 [`the accent floor exemption list matches reality`] 钉住）。
+     *
+     * - amber / lime / emerald 的**浅色态**：设计稿主色是高亮黄绿（#F59E0B / #A3E635 / #4ADE80），
+     *   压在纯白卡上 2.15 / 2.24 / 2.34:1。
+     * - violet 的**深色态**：#7C3AED 压在 `cardBgDark`（#261346，同色相深紫）上 2.92:1，
+     *   差门槛 3%。它是 6 套彩色皮肤里色相最暗的一套，卡面又是自身色相调出来的。
+     *
+     * 这几项都要重新标定对应预设的 accent 槽才能修（会明显改动它们的品牌观感），
+     * 属于独立的设计决策。它们的可读兜底是 `accentSecondary`（深色态取亮、浅色态取深），
+     * 该槽的下限由同一个测试**无例外**地守着。
+     *
+     * 出厂默认皮肤不在此列：它的三个 accent 槽已于 2026-09-08 修正，明暗两态均达标。
+     */
+    private val ACCENT_FLOOR_EXEMPTIONS: Set<Pair<String, Boolean>> = setOf(
+        "amber" to false,
+        "lime" to false,
+        "emerald" to false,
+        "violet" to true
+    )
+
+    /**
+     * 例外清单必须与实测一致：多一项说明有预设悄悄退化了，少一项说明该把它从清单里删掉。
+     */
+    @Test
+    fun `the accent floor exemption list matches reality`() {
+        val actual = ThemePresets.allPresets.flatMap { preset ->
+            listOf(false, true).mapNotNull { isDark ->
+                val p = preset.resolve(isDark)
+                (preset.id to isDark).takeIf { contrastRatio(p.accent, p.cardBg) < MIN_NON_TEXT_CONTRAST }
+            }
+        }.toSet()
+        assertEquals(
+            "accent 不达 $MIN_NON_TEXT_CONTRAST:1 的（预设, isDark）实测为 $actual，" +
+                "与钉住的例外清单 $ACCENT_FLOOR_EXEMPTIONS 不一致。" +
+                "多出的是新引入的退化；少了的应当从清单里删除（说明它已被重新标定）。",
+            ACCENT_FLOOR_EXEMPTIONS,
+            actual
+        )
+    }
+
     @Test
     fun `ChartColors light and dark return different values for every field`() {
         val light = ChartColors(isDark = false)
@@ -122,7 +164,8 @@ class ColorTest {
         val dark = ThemePresets.Default.resolve(isDark = true)
 
         assertEquals(Color.White, light.onAccent)
-        assertEquals(Color.White, dark.onAccent)
+        // 2026-09-08：深色态 accent 已翻亮成 0xFFB0B0B0，白字压上去只有 1.7:1，故翻黑。
+        assertEquals(Color(0xFF1A1A1A), dark.onAccent)
         assertEquals(Color(0xFFE53935), light.error)
         assertEquals(Color(0xFFFF6B6B), dark.error)
         assertEquals(Color(0xFFFFEBEE), light.errorContainer)
@@ -142,12 +185,13 @@ class ColorTest {
         assertEquals(Color.White.copy(alpha = 0.15f), dark.switchTrackOff)
         assertEquals(Color(0xFFFAFAFA), light.switchThumbOff)
         assertEquals(Color.White.copy(alpha = 0.5f), dark.switchThumbOff)
-        // P2-中 追加的两槽：默认值必须仍是纯白（= 四个页面文件里原来写死的 Color.White），
-        // 亮暗两套都一样——渐变卡的白色内容改造前从不区分明暗模式。
+        // P2-中 追加的两槽：浅色态仍是纯白（= 四个页面文件里原来写死的 Color.White）。
+        // 深色态 2026-09-08 起是深墨 0xFF1A1A1A：default 的 accentDark 已翻亮成 0xFFB0B0B0，
+        // 渐变 Hero 卡在深色下变成亮灰底，白字压上去只有 1.x:1 —— 前景必须跟着翻黑。
         assertEquals(Color.White, light.onGradient)
-        assertEquals(Color.White, dark.onGradient)
+        assertEquals(Color(0xFF1A1A1A), dark.onGradient)
         assertEquals(Color.White, light.gradientMuted)
-        assertEquals(Color.White, dark.gradientMuted)
+        assertEquals(Color(0xFF1A1A1A), dark.gradientMuted)
     }
 
     /**
@@ -196,7 +240,8 @@ class ColorTest {
     @Test
     fun `accent gradient values are pinned for every preset`() {
         val expected = mapOf(
-            "default" to listOf("#1D1D1D", "#A7A7A7", "#707070", "#3B3B3B"),
+            // 2026-09-08：default 的深色两项随 accentDark 重标定（#555555 → #B0B0B0）而变。
+            "default" to listOf("#1D1D1D", "#A7A7A7", "#BDBDBD", "#606060"),
             "rose" to listOf("#C72B50", "#F8ADBF", "#F05479", "#801D38"),
             "amber" to listOf("#CE8509", "#FBD89D", "#F7AE32", "#84510C"),
             "lime" to listOf("#89C12D", "#DAF5AE", "#B2EA55", "#55791E"),
@@ -303,8 +348,7 @@ class ColorTest {
      * 也就是说**动 accent 比动正文色危险得多**：改玫红 / 宝蓝的 accent 前务必先跑本测试。
      */
     @Test
-    fun `every preset meets the contrast floor in both modes`() {
-        for (preset in ThemePresets.allPresets) {
+    fun `every preset meets the contrast floor in both modes`() {        for (preset in ThemePresets.allPresets) {
             for (isDark in listOf(false, true)) {
                 val p = preset.resolve(isDark)
                 val tag = "${preset.id}(isDark=$isDark)"
@@ -316,6 +360,28 @@ class ColorTest {
                 floorAtLeast(contrastRatio(p.textPrimary, p.cardBg), MIN_TEXT_CONTRAST, "textPrimary 对 cardBg")
                 floorAtLeast(contrastRatio(p.textSecondary, p.cardBg), MIN_TEXT_CONTRAST, "textSecondary 对 cardBg")
                 floorAtLeast(contrastRatio(p.iconTint, p.cardBg), MIN_NON_TEXT_CONTRAST, "iconTint 对 cardBg")
+                // 2026-09-08：accent 在本仓有 90+ 处当**前景**用（图标 tint / 文字 / 描边 /
+                // 圆环描线），所以它必须自身就落在当前明暗档的可读侧。默认皮肤原来把
+                // accentDark 写成 #555555，对 cardBgDark(#2A2A2A) 仅 1.9:1 —— 那就是
+                //「深色模式下图标文字发灰」的唯一病因（彩色皮肤天然达标，所以换皮肤就好了）。
+                // 本断言是这条约定的护栏：新增/调整任何预设时，accent 都不许再掉到门槛下。
+                //
+                // 例外只有 [ACCENT_FLOOR_EXEMPTIONS] 里钉死的四项（三套亮色皮肤的浅色态 +
+                // 紫色的深色态），且不许扩大；它们靠 accentSecondary 兜可读性。
+                if ((preset.id to isDark) !in ACCENT_FLOOR_EXEMPTIONS) {
+                    floorAtLeast(
+                        contrastRatio(p.accent, p.cardBg),
+                        MIN_NON_TEXT_CONTRAST,
+                        "accent 对 cardBg"
+                    )
+                }
+                // accentSecondary 同样有前景消费点（FileIcon 的文件图标 tint、服务状态色），
+                // 且它是上面三套浅色态唯一可读的强调色 —— 这条不设例外。
+                floorAtLeast(
+                    contrastRatio(p.accentSecondary, p.cardBg),
+                    MIN_NON_TEXT_CONTRAST,
+                    "accentSecondary 对 cardBg"
+                )
                 floorAtLeast(contrastRatio(p.textPrimary, p.pageBg), MIN_NON_TEXT_CONTRAST, "textPrimary 对 pageBg")
                 floorAtLeast(contrastRatio(p.onAccent, p.accent), MIN_NON_TEXT_CONTRAST, "onAccent 对 accent 实底")
                 floorAtLeast(
@@ -422,61 +488,6 @@ class ColorTest {
                 "没有种子色」时的兜底，见 ThemeManager.getCurrentPalette 的 KDoc。",
             ThemePresets.Default,
             ThemePresets.findById(CUSTOM_THEME_ID)
-        )
-    }
-
-    /**
-     * 设置项图标色（[UfiSettingsItem] 的默认 tint = `textPrimary`）对**卡面**的对比度
-     * 必须 ≥ [MIN_NON_TEXT_CONTRAST]，明暗两态都要过。
-     *
-     * 背景：默认 tint 曾经是 `accent`，而 `default` 预设的 `accentDark`（0xFF555555）
-     * 压在 `cardBgDark`（0xFF2A2A2A）上只有 ~1.9:1 —— 真机上就是「深色模式下设置项
-     * 图标是灰的，看不见」。改成 `textPrimary` 后这条测试负责钉住它不再退回去。
-     *
-     * 判据取 WCAG 2.1 的 3:1（非文本图形/图标的最低要求），不用 4.5:1：
-     * 图标是大面积实心图形，不承担逐字辨认的负担。
-     * 顺带也量一遍 `textPrimary` 对 `pageBg` —— 有些设置行直接铺在页面底上而非卡上。
-     */
-    @Test
-    fun `settings item icon tint keeps at least 3 to 1 contrast on card and page`() {
-        for (preset in ThemePresets.allPresets) {
-            for (isDark in listOf(false, true)) {
-                val p = preset.resolve(isDark)
-                val onCard = contrastRatio(p.textPrimary, p.cardBg)
-                val onPage = contrastRatio(p.textPrimary, p.pageBg)
-                assertTrue(
-                    "${preset.id}(isDark=$isDark) textPrimary 对 cardBg 的对比度 " +
-                        "${"%.2f".format(onCard)}:1 低于 $MIN_NON_TEXT_CONTRAST:1 —— " +
-                        "设置项图标会糊在卡面上（这正是 2026-09-05 修掉的那个 bug）。",
-                    onCard >= MIN_NON_TEXT_CONTRAST
-                )
-                assertTrue(
-                    "${preset.id}(isDark=$isDark) textPrimary 对 pageBg 的对比度 " +
-                        "${"%.2f".format(onPage)}:1 低于 $MIN_NON_TEXT_CONTRAST:1。",
-                    onPage >= MIN_NON_TEXT_CONTRAST
-                )
-            }
-        }
-    }
-
-    /**
-     * 反向锚点：记录**为什么不能**把设置项图标接回 `accent`。
-     *
-     * 这条断言故意断言"accent 在深色下达不到 3:1"——它不是在要求 accent 保持难看，
-     * 而是把当年的根因固化成可执行的说明：只要 `default` 的 `accentDark` 还是这个值，
-     * 谁把 `UfiSettingsItem` 的默认 tint 改回 accent，深色下就一定不可读。
-     * 若将来真的重新标定了 `accentDark`（使它在深色下 ≥ 3:1），这条会红灯，
-     * 那时可以连同本测试一起删除。
-     */
-    @Test
-    fun `accent is documented as unusable for icon tint in dark mode`() {
-        val dark = ThemePresets.Default.resolve(isDark = true)
-        val ratio = contrastRatio(dark.accent, dark.cardBg)
-        assertTrue(
-            "default 的 accentDark 对 cardBgDark 现在是 ${"%.2f".format(ratio)}:1。" +
-                "若它已 ≥ $MIN_NON_TEXT_CONTRAST:1，说明 accent 被重新标定过，本测试可以删除；" +
-                "在那之前，UfiSettingsItem 的默认 tint 不许接回 accent。",
-            ratio < MIN_NON_TEXT_CONTRAST
         )
     }
 

@@ -28,6 +28,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.io.File
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.Signature
@@ -46,7 +47,12 @@ import java.util.Base64
  * 与 App 侧 Keystore 行为一致；Web 侧输出 raw r||s 由 [DeviceAuth.normalizeToDer] 归一化，
  * 该分支由 DeviceAuthTest 覆盖，这里不重复。
  *
- * 拒绝状态码沿用历史上的自定义 444（客户端据此判「需重新登录」），载荷带 `code`。
+ * 拒绝状态码分三档（2026-09-08 拆分，此前一律 444）：
+ * 444 = 凭据真的不作数（没 token / token 不认识 / 记录没公钥）→ 客户端清凭据重新配对；
+ * 401 = 这次请求本身有问题（时间戳超窗 / 签名缺失或不对 / 重放）→ 保留凭据重试；
+ * 503 = 服务端配对存储读不出来（降级）→ 保留凭据退避重试。
+ * 拆分的动因见 `PairedDeviceStore` 类注释里的事故复盘：把可自愈的临时故障映射成 444，
+ * 等于让客户端自毁凭据。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -56,6 +62,8 @@ class AuthMiddlewareTest {
     private lateinit var spkiBase64: String
     private lateinit var fingerprint: String
     private lateinit var verifier: DeviceRequestVerifier
+    private lateinit var context: Context
+    private lateinit var store: PairedDeviceStore
 
     private val token = "device-token-for-tests"
 
@@ -67,9 +75,9 @@ class AuthMiddlewareTest {
         spkiBase64 = Base64.getEncoder().encodeToString(keyPair.public.encoded)
         fingerprint = requireNotNull(DeviceAuth.fingerprintOf(spkiBase64))
 
-        val ctx = ApplicationProvider.getApplicationContext<Context>()
-        val settings = AppSettings(ctx).apply { resetAll() }
-        val store = PairedDeviceStore(ctx, settings)
+        context = ApplicationProvider.getApplicationContext<Context>()
+        val settings = AppSettings(context).apply { resetAll() }
+        store = PairedDeviceStore(context, settings)
         store.clear()
         store.upsert(
             fingerprint = fingerprint,
@@ -81,6 +89,7 @@ class AuthMiddlewareTest {
         // 每个用例一个全新的 NonceCache，避免用例间 nonce 互相污染
         verifier = DeviceRequestVerifier(store, DeviceAuth.NonceCache())
     }
+
 
     /** 用测试密钥对规范串签名，输出 base64url（无填充）。 */
     private fun sign(method: String, uri: String, timestamp: String, nonce: String): String {
@@ -135,21 +144,23 @@ class AuthMiddlewareTest {
     }
 
     @Test
-    fun `valid token without signature headers is rejected (444 INVALID_SIGNATURE)`() = runBlocking {
+    fun `valid token without signature headers is rejected (401 INVALID_SIGNATURE)`() = runBlocking {
         // 这是本次重写最关键的一条：旧实现里"不发签名头"等于跳过签名校验，
-        // 即签名机制形同不存在。现在必须被拒。
+        // 即签名机制形同不存在。现在必须被拒 —— 但拒的是**这次请求**，不是凭据，
+        // 所以是 401 而不是 444（444 会让客户端清掉 token）。
         testApplication {
             application { configure() }
             val resp = client.get("/protected") {
                 header(HttpHeaders.Authorization, "Bearer $token")
             }
-            assertEquals(444, resp.status.value)
+            assertEquals(HttpStatusCode.Unauthorized, resp.status)
             assertTrue(ErrorCode.INVALID_SIGNATURE in resp.bodyAsText())
         }
     }
 
     @Test
-    fun `stale timestamp is rejected (444 INVALID_SIGNATURE)`() = runBlocking {
+    fun `stale timestamp is rejected (401 STALE_TIMESTAMP)`() = runBlocking {
+        // 时钟漂移是可自愈的：客户端校时重试即可。回 444 会让它误判"凭据失效"并要求重新配对。
         testApplication {
             application { configure() }
             val stale = (System.currentTimeMillis() - DeviceAuth.MAX_TIMESTAMP_DRIFT_MS - 60_000).toString()
@@ -159,13 +170,13 @@ class AuthMiddlewareTest {
                 header(AuthMiddleware.HEADER_NONCE, "nonce-stale")
                 header(AuthMiddleware.HEADER_SIGNATURE, sign("GET", "/protected", stale, "nonce-stale"))
             }
-            assertEquals(444, resp.status.value)
-            assertTrue(ErrorCode.INVALID_SIGNATURE in resp.bodyAsText())
+            assertEquals(HttpStatusCode.Unauthorized, resp.status)
+            assertTrue(ErrorCode.STALE_TIMESTAMP in resp.bodyAsText())
         }
     }
 
     @Test
-    fun `signature bound to another uri is rejected (444 INVALID_SIGNATURE)`() = runBlocking {
+    fun `signature bound to another uri is rejected (401 INVALID_SIGNATURE)`() = runBlocking {
         // URI 在签名内，所以拿 /other 的签名请求 /protected 必须失败，
         // 否则一次抓包就能被改写成任意端点调用。
         testApplication {
@@ -177,7 +188,7 @@ class AuthMiddlewareTest {
                 header(AuthMiddleware.HEADER_NONCE, "nonce-other-uri")
                 header(AuthMiddleware.HEADER_SIGNATURE, sign("GET", "/other", ts, "nonce-other-uri"))
             }
-            assertEquals(444, resp.status.value)
+            assertEquals(HttpStatusCode.Unauthorized, resp.status)
             assertTrue(ErrorCode.INVALID_SIGNATURE in resp.bodyAsText())
         }
     }
@@ -196,10 +207,38 @@ class AuthMiddlewareTest {
             }
             assertEquals(HttpStatusCode.OK, request().status)
             val replayed = request()
-            assertEquals(444, replayed.status.value)
+            assertEquals(HttpStatusCode.Unauthorized, replayed.status)
             assertTrue(ErrorCode.INVALID_SIGNATURE in replayed.bodyAsText())
         }
     }
+
+    @Test
+    fun `degraded store answers retryable 503 instead of 444`() = runBlocking {
+        // 2026-09-08 事故的核心修复：配对存储读不出来时，服务端**不知道**这个 token 认不认识。
+        // 此时回 444（"你没配对"）会让客户端清空本地凭据 —— 一次文件损坏放大成全员重新配对。
+        // 正确答案是 503 + AUTH_STORE_UNAVAILABLE：保留凭据，退避重试。
+        val target = File(context.filesDir, "paired_devices.json")
+        // .bak 是第一顺位恢复源，要造"完全读不出来"就得连它一起去掉
+        File(context.filesDir, "paired_devices.json.bak").delete()
+        File(context.filesDir, "paired_devices.json.corrupt").delete()
+        target.writeText("[{\"fingerprint\":\"fp-1\"")   // 截断写留下的半截 JSON
+        store.load()
+        assertTrue("前置条件：存储应进入降级态", store.degraded)
+
+        testApplication {
+            application { configure() }
+            val ts = System.currentTimeMillis().toString()
+            val resp = client.get("/protected") {
+                header(HttpHeaders.Authorization, "Bearer $token")
+                header(AuthMiddleware.HEADER_TIMESTAMP, ts)
+                header(AuthMiddleware.HEADER_NONCE, "nonce-degraded")
+                header(AuthMiddleware.HEADER_SIGNATURE, sign("GET", "/protected", ts, "nonce-degraded"))
+            }
+            assertEquals(HttpStatusCode.ServiceUnavailable, resp.status)
+            assertTrue(ErrorCode.AUTH_STORE_UNAVAILABLE in resp.bodyAsText())
+        }
+    }
+
 
     @Test
     fun `health endpoint bypasses auth and returns 200`() = runBlocking {

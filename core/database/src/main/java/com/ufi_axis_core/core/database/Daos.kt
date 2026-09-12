@@ -363,6 +363,11 @@ interface AlertDao {
         level: String?, type: String?, unreadOnly: Int, start: Long?, end: Long?
     ): Int
 
+    /** 全表总数。存储统计（`GET /api/monitor/storage`）用它 ——
+     *  2026-09-08 之前那里取的是 `getRecentAlerts(1).size`，于是"告警记录条数"最大只会是 1。 */
+    @Query("SELECT COUNT(*) FROM alert_records")
+    suspend fun getCount(): Int
+
     /** 按类型分组计数（事件中心分类胶囊用）。 */
     @Query("SELECT type, COUNT(*) as cnt FROM alert_records GROUP BY type")
     suspend fun getCountByType(): List<TypeCount>
@@ -428,6 +433,11 @@ interface SmsDao {
 
     @Query("DELETE FROM sms_records WHERE timestamp < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long): Int
+
+    /** 全表总数。存储统计（`GET /api/monitor/storage`）用它 ——
+     *  2026-09-08 之前那里的短信条数是硬编码的 0，因为这个方法当时不存在。 */
+    @Query("SELECT COUNT(*) FROM sms_records")
+    suspend fun getCount(): Int
 }
 
 /**
@@ -531,6 +541,207 @@ interface SmsVerificationCodeDao {
     /** 总数（Tab 角标用） */
     @Query("SELECT COUNT(*) FROM sms_verification_codes")
     suspend fun getCount(): Int
+}
+
+/**
+ * 短信拦截规则 DAO。
+ *
+ * 规则总量是人手维护的量级（几条到几十条），所以列表查询不分页；
+ * 真正需要控制写放大的是 [bumpHit] —— 见它的注释。
+ */
+@Dao
+interface SmsRuleDao {
+    /** 全部规则（管理界面用，含停用的）。按创建时间倒序，新加的在最上面。 */
+    @Query("SELECT * FROM sms_rule ORDER BY created_at DESC")
+    suspend fun getAll(): List<SmsRule>
+
+    /** 启用中的规则（判定快照的数据源）。 */
+    @Query("SELECT * FROM sms_rule WHERE enabled = 1 ORDER BY created_at DESC")
+    suspend fun getEnabled(): List<SmsRule>
+
+    @Insert
+    suspend fun insert(rule: SmsRule): Long
+
+    @Update
+    suspend fun update(rule: SmsRule)
+
+    @Query("DELETE FROM sms_rule WHERE id = :id")
+    suspend fun deleteById(id: Long): Int
+
+    /** 清空全部规则。仅供备份恢复的 `replace` 模式使用（先清空再按包里的规则重建）。 */
+    @Query("DELETE FROM sms_rule")
+    suspend fun deleteAll()
+
+    @Query("SELECT COUNT(*) FROM sms_rule")
+    suspend fun countAll(): Int
+
+    /**
+     * 命中计数**增量** UPDATE（照 [AlertDao.bumpExisting] 的 `count = count + 1` 写法）。
+     *
+     * 为什么必须是增量而不是「读出整行改完写回」：命中发生在 5s 短信轮询这条热路径上，
+     * 全量重写模式（`PairedDeviceStore.touch` 的 30s 整表重写）刚在 2026-09-08 引发过
+     * 配对信息丢失事故 —— 重写期间的并发写会被整份覆盖掉。
+     * 调用方在内存里累加 delta，定期 flush 一次。
+     */
+    @Query("UPDATE sms_rule SET hit_count = hit_count + :delta, last_hit_at = :now WHERE id = :id")
+    suspend fun bumpHit(id: Long, delta: Int, now: Long)
+}
+
+/**
+ * 短信拦截记录 DAO。
+ *
+ * 分页形态**整套照抄 [AlertDao.getPaged]** 的 keyset 游标：全 DAO 层没有任何 `OFFSET`，
+ * 而 keyset 在「边写边翻页」时不会漏行/重复行，limit+offset 会。
+ * 前端也能直接复用告警列表已有的「加载更多 + cursor」交互。
+ */
+@Dao
+interface SmsBlockedLogDao {
+    @Insert
+    suspend fun insert(record: SmsBlockedLog): Long
+
+    @Update
+    suspend fun update(record: SmsBlockedLog)
+
+    /**
+     * 游标分页。
+     * - cTs/cId 为上一页末项的 (blocked_at,id)；首页传 null 走全量最新。
+     * - 排序固定 blocked_at DESC, id DESC，与游标 keyset 一致。
+     */
+    @Query("""
+        SELECT * FROM sms_blocked_log
+        WHERE (:cTs IS NULL OR blocked_at < :cTs OR (blocked_at = :cTs AND id < :cId))
+        ORDER BY blocked_at DESC, id DESC
+        LIMIT :limit
+    """)
+    suspend fun getPaged(cTs: Long?, cId: Long?, limit: Int): List<SmsBlockedLog>
+
+    @Query("SELECT COUNT(*) FROM sms_blocked_log")
+    suspend fun countAll(): Int
+
+    /** 按 msg_id 查已有记录（去重主路径：同一条短信多路径命中只留一行，合并 blocked_path）。 */
+    @Query("SELECT * FROM sms_blocked_log WHERE msg_id = :msgId ORDER BY blocked_at DESC LIMIT 1")
+    suspend fun findByMsgId(msgId: Long): SmsBlockedLog?
+
+    /**
+     * 按发件人查最近一条记录（去重兜底路径）。
+     *
+     * 邮件转发那条链路拿不到设备侧短信 id（`forwardSms` 只有 from/body/timestamp），
+     * msg_id 只能落 0 —— 那时用 sender + 时间窗口近似「是不是同一条短信」。
+     */
+    @Query("""
+        SELECT * FROM sms_blocked_log
+        WHERE sender = :sender AND blocked_at >= :since
+        ORDER BY blocked_at DESC LIMIT 1
+    """)
+    suspend fun findRecentBySender(sender: String, since: Long): SmsBlockedLog?
+
+    @Query("DELETE FROM sms_blocked_log WHERE id = :id")
+    suspend fun deleteById(id: Long): Int
+
+    @Query("DELETE FROM sms_blocked_log")
+    suspend fun deleteAll()
+
+    /**
+     * 环形上限裁剪：仅保留最近 maxRows 条（按 blocked_at DESC），其余淘汰。
+     * 照抄 [AlertDao.trimTo]，调用时机也一样（insert 之后立刻裁剪）。
+     *
+     * 上限**写死常量**、不做成配置项：`AlertConfig.maxRows` 曾经是可配置项但引擎从不读它，
+     * 最后被判定为假开关删掉（`AlertEngine.kt:156-159`）。要么真的读配置，要么就别给旋钮。
+     */
+    @Query("""
+        DELETE FROM sms_blocked_log
+        WHERE id NOT IN (
+            SELECT id FROM sms_blocked_log ORDER BY blocked_at DESC LIMIT :maxRows
+        )
+    """)
+    suspend fun trimTo(maxRows: Int)
+}
+
+/**
+ * 通知投递记录 DAO（表名 `mail_send_records` 是历史包袱，见 [MailSendRecord]）。
+ *
+ * 分页与裁剪形态与 [SmsBlockedLogDao] 一致（keyset 游标 + insert 后立刻环形裁剪、上限写死常量）。
+ * 多出来的是两个分类计数（[countFailed] / [countSkipped]）：投递历史页最有用的过滤是
+ * "只看没发出去的"，而 v12 起"没发出去"分成**失败**与**跳过**两种性质完全不同的情况。
+ *
+ * 三类读接口都带一个可空的 `channel`：null = 不过滤。列表页必须能按渠道分开看，
+ * 否则邮件 / Webhook / 本机短信混在一起没法排查。
+ *
+ * **过滤一律走 `outcome` 而不是 `success`**：后者是前者的副本，v12 起 skipped 行的
+ * `success` 也是 0，拿 `success = 0` 当"失败"筛会把跳过混进失败数里
+ * （正是 [MailSendRecord] 反复强调不能发生的那件事）。
+ */
+@Dao
+interface MailSendRecordDao {
+    @Insert
+    suspend fun insert(record: MailSendRecord): Long
+
+    /**
+     * 游标分页。
+     * - cTs/cId 为上一页末项的 (sent_at,id)；首页传 null 走全量最新。
+     * - [outcome] 为 null 时不过滤结果，否则取 [MailSendRecord.OUTCOME_SENT] 等三个常量之一。
+     * - [channel] 为 null 时不过滤渠道。
+     */
+    @Query("""
+        SELECT * FROM mail_send_records
+        WHERE (:cTs IS NULL OR sent_at < :cTs OR (sent_at = :cTs AND id < :cId))
+          AND (:outcome IS NULL OR outcome = :outcome)
+          AND (:channel IS NULL OR channel = :channel)
+        ORDER BY sent_at DESC, id DESC
+        LIMIT :limit
+    """)
+    suspend fun getPaged(
+        cTs: Long?,
+        cId: Long?,
+        outcome: String?,
+        channel: String?,
+        limit: Int
+    ): List<MailSendRecord>
+
+    @Query("SELECT COUNT(*) FROM mail_send_records WHERE (:channel IS NULL OR channel = :channel)")
+    suspend fun countAll(channel: String?): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM mail_send_records " +
+            "WHERE outcome = 'failed' AND (:channel IS NULL OR channel = :channel)"
+    )
+    suspend fun countFailed(channel: String?): Int
+
+    /** 跳过条数。与 [countFailed] 分开是刻意的：跳过不是失败（见 [MailSendRecord.OUTCOME_SKIPPED]）。 */
+    @Query(
+        "SELECT COUNT(*) FROM mail_send_records " +
+            "WHERE outcome = 'skipped' AND (:channel IS NULL OR channel = :channel)"
+    )
+    suspend fun countSkipped(channel: String?): Int
+
+    @Query("DELETE FROM mail_send_records")
+    suspend fun deleteAll()
+
+    /**
+     * 只清一个渠道的记录。
+     *
+     * 三条渠道共用一张表，而清空按钮在**各自**的投递记录页上 —— 只给 [deleteAll] 的话，
+     * 在 Webhook 页上按一次清空会把邮件那侧的失败记录一起删掉，而用户看不到那个后果。
+     */
+    @Query("DELETE FROM mail_send_records WHERE channel = :channel")
+    suspend fun deleteByChannel(channel: String)
+
+    /**
+     * 按时间清理（与 [trimTo] 是「先到者生效」的两道上限）。
+     *
+     * 两道上限都由 `NotificationConfig` 的设置项决定，没有藏在代码里的第三条规则。
+     */
+    @Query("DELETE FROM mail_send_records WHERE sent_at < :cutoff")
+    suspend fun deleteOlderThan(cutoff: Long)
+
+    /** 环形上限裁剪：仅保留最近 maxRows 条（理由同 [SmsBlockedLogDao.trimTo]）。 */
+    @Query("""
+        DELETE FROM mail_send_records
+        WHERE id NOT IN (
+            SELECT id FROM mail_send_records ORDER BY sent_at DESC LIMIT :maxRows
+        )
+    """)
+    suspend fun trimTo(maxRows: Int)
 }
 
 /**
@@ -656,3 +867,60 @@ data class BatteryAggregateBucket(
     val minVal: Double,
     val maxVal: Double
 )
+
+/**
+ * 终端命令历史 DAO（见 [ConsoleHistoryRecord]）。
+ *
+ * 分页照抄 [SmsBlockedLogDao.getPaged] 的 keyset 游标：全 DAO 层没有 `OFFSET`，
+ * 而终端历史正是「边写边翻页」的典型场景（翻旧记录时另一端可能在执行新命令），
+ * limit+offset 会漏行或重复行。
+ */
+@Dao
+interface ConsoleHistoryDao {
+    @Insert
+    suspend fun insert(record: ConsoleHistoryRecord): Long
+
+    /** 批量插入，供两端本地旧历史的一次性导入使用。 */
+    @Insert
+    suspend fun insertAll(records: List<ConsoleHistoryRecord>)
+
+    /**
+     * 游标分页。
+     * - [channel] 为 null 时不过滤，两个通道混排（当前两端都是分 Tab 拉，不会用到）。
+     * - cTs/cId 为上一页末项的 (created_at, id)；首页传 null。
+     */
+    @Query("""
+        SELECT * FROM console_history
+        WHERE (:channel IS NULL OR channel = :channel)
+          AND (:cTs IS NULL OR created_at < :cTs OR (created_at = :cTs AND id < :cId))
+        ORDER BY created_at DESC, id DESC
+        LIMIT :limit
+    """)
+    suspend fun getPaged(channel: String?, cTs: Long?, cId: Long?, limit: Int): List<ConsoleHistoryRecord>
+
+    @Query("SELECT COUNT(*) FROM console_history WHERE (:channel IS NULL OR channel = :channel)")
+    suspend fun countBy(channel: String?): Int
+
+    @Query("DELETE FROM console_history WHERE id = :id")
+    suspend fun deleteById(id: Long): Int
+
+    /** [channel] 为 null 时清空全部。 */
+    @Query("DELETE FROM console_history WHERE (:channel IS NULL OR channel = :channel)")
+    suspend fun deleteBy(channel: String?)
+
+    /**
+     * 环形上限裁剪，**按通道各自裁**。
+     *
+     * 两个通道共用一张表，若照 [SmsBlockedLogDao.trimTo] 那样全表裁剪，刷得多的一侧
+     * （通常是 shell）会把另一侧的历史整段挤掉，用户看到的是「AT 记录莫名消失」。
+     * 上限写死常量、不做配置项（同 [SmsBlockedLogDao.trimTo] 的理由）。
+     */
+    @Query("""
+        DELETE FROM console_history
+        WHERE channel = :channel AND id NOT IN (
+            SELECT id FROM console_history WHERE channel = :channel
+            ORDER BY created_at DESC, id DESC LIMIT :maxRows
+        )
+    """)
+    suspend fun trimChannelTo(channel: String, maxRows: Int)
+}

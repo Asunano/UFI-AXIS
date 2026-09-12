@@ -52,6 +52,10 @@ class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configur
         // 是否真的启动由 NotifyService.shouldRun 决定（只看「前台服务保活」这一个开关 ——
         // 2026-09-05 前这里看的是「系统通知推送」，于是用户没开保活也会有常驻通知）。
         if (isMainProcess()) {
+            // 通知闸门层级迁移（2026-09-08）：老版本 alert_notification_enabled 兼任全局总闸，
+            // 现已拆成 notification_master_enabled + 各分类键。必须在任何通知投递之前跑，
+            // 否则升级后首批通知会读到 master 未初始化（= false）而被静默丢掉。
+            com.ufi_axis.data.notification.NotificationCenter.migrateGateKeys(this)
             com.ufi_axis.notification.NotifyService.startIfEnabled(this)
         }
 

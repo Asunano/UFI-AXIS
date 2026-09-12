@@ -1,19 +1,23 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    API 31+ 的备份 / 换机迁移规则（API 30 及以下走 backup_rules.xml）。
+
+    两个场景都要排除凭据文件 ufi_axis_credentials：
+    - cloud-backup：云备份还原到新机；
+    - device-transfer：换机直传。
+
+    理由与 backup_rules.xml 相同：设备私钥在 Android Keystore 里不参与备份迁移，
+    token 被带过去只会造成「token 有效但签名对不上」的恒定 401，而 401 是保留凭据
+    重试语义、客户端不会自愈回配对页。让新机识别不出配对状态、重新配对一次才是对的。
+    device_hwid 若被带走，还会让服务端把前一台设备的配对记录当作旧指纹删掉。
+
+    文件名与 AppPreferences.CRED_PREFS_NAME 对应，改名要同步改这里。
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="ufi_axis_credentials.xml"/>
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="ufi_axis_credentials.xml"/>
     </device-transfer>
-    -->
 </data-extraction-rules>

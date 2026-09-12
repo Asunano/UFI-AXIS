@@ -2,6 +2,10 @@
 package com.ufi_axis_core.controller.system
 
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.notify.NotifyEvent
+import com.ufi_axis_core.notify.NotifyLevel
+import com.ufi_axis_core.notify.NotifyScenes
+import com.ufi_axis_core.notify.Notifier
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.BatteryManager
@@ -978,7 +982,7 @@ class DownloadManager(
                     if (aria2Ver == null) append("（二进制可能不兼容，版本探测失败）")
                     else append("（v$aria2Ver 启动超时，请检查日志）")
                 }
-                task.status = "error"; task.error = diag; saveTasks(); mailTaskResult(task, "error"); return@launch
+                task.status = "error"; task.error = diag; saveTasks(); notifyTaskResult(task, "error"); return@launch
             }
             // aria2c 子进程只能写私有目录（scoped storage 限制），
             // 完成后 transferToPublicDir 会拷贝到 task.savePath 公共目录
@@ -1017,29 +1021,32 @@ class DownloadManager(
                     else -> "aria2 提交失败（查看设备日志排查）"
                 }
                 saveTasks()
-                mailTaskResult(task, "error")
+                notifyTaskResult(task, "error")
             }
         }
     }
 
-    // ── 邮件通知钩子（由 ComponentFactory 接到 SmsForwardController.sendSceneNotification("download", …)）──
-    // 下载是 core 的能力，"完成/失败"的状态跃迁只有 core 看得见。此前邮件靠 app 前台轮询
-    // （DownloadModule.loadDownloads → NotificationCenter.checkDownloadTaskStatus）发现状态变化后回传，
-    // app 不在线 = 永远没有下载邮件。现在在跃迁处直接发，投递与 app 是否连接无关。
+    // ── 通知钩子（由 ComponentFactory 接到 NotificationDispatcher::emit）──
+    // 下载是 core 的能力，"完成/失败"的状态跃迁只有 core 看得见。此前邮件靠 app 前台轮询下载列表、
+    // 自己比对上一次的状态后回传，app 不在线 = 永远没有下载邮件；推送则挂在另一个
+    // attachPushService 钩子上 —— 同一件事两个出口，加第三个渠道就要再缝一遍。
+    // 2026-09-08 合成一个：投给哪些渠道由分发器的注册表决定。
     @Volatile
-    private var mailForwarder: (suspend (title: String, body: String) -> Unit)? = null
+    private var notifier: Notifier? = null
 
-    /** 装配邮件钩子；传 null 解除。 */
-    fun attachMailForwarder(forwarder: (suspend (title: String, body: String) -> Unit)?) {
-        mailForwarder = forwarder
+    /** 装配通知钩子；传 null 解除。 */
+    fun attachNotifier(n: Notifier?) {
+        notifier = n
     }
 
     /**
-     * 任务结果邮件（fire-and-forget）。是否真的发出由 core 的邮件配置 + 场景白名单决定，
-     * 这里不判开关；失败只落日志，绝不影响下载本身。
+     * 任务终态通知（fire-and-forget）：交给分发器。
+     *
+     * 这里**不判任何开关**：总闸与免打扰在分发器，场景勾选在邮件渠道。
+     * 失败只落日志，绝不影响下载本身。
      */
-    private fun mailTaskResult(task: DownloadTask, status: String) {
-        val forwarder = mailForwarder ?: return
+    private fun notifyTaskResult(task: DownloadTask, status: String) {
+        val emit = notifier ?: return
         val name = task.fileName.ifBlank { task.url.substringAfterLast('/').ifBlank { task.id } }
         val failed = status == "error"
         val title = if (failed) "下载失败: $name" else "下载完成: $name"
@@ -1049,14 +1056,33 @@ class DownloadManager(
             if (task.totalSize > 0) appendLine("大小: ${task.totalSize / 1024 / 1024} MB")
             if (failed) appendLine("错误: ${task.error ?: "未知"}")
         }.trimEnd()
+
         scope.launch {
             try {
-                forwarder(title, body)
+                emit(
+                    NotifyEvent(
+                        scene = NotifyScenes.DOWNLOAD,
+                        level = if (failed) NotifyLevel.WARNING else NotifyLevel.INFO,
+                        title = title,
+                        body = body,
+                        // extra 逐字沿用原 PushNotification.extra：app 侧 `NotifyService`
+                        // 读 status 判断是不是失败，改一个键它就会把失败渲染成成功。
+                        extra = mapOf(
+                            "task_id" to task.id,
+                            "name" to name,
+                            "status" to status,
+                            "error" to (task.error ?: "")
+                        )
+                    )
+                )
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                AppLogger.w(TAG, "download mail failed: ${e.message}")
+                AppLogger.w(TAG, "download notify failed: ${e.message}")
             }
         }
     }
+
 
     private fun startAria2Polling() {
         aria2PollJob?.cancel()
@@ -1438,7 +1464,7 @@ class DownloadManager(
             if (newStatus != prevStatus) {
                 saveTasks()  // 状态跃迁立刻落盘，避免重启后读回过期状态
                 if (newStatus == "completed" || newStatus == "error") {
-                    mailTaskResult(task, newStatus)
+                    notifyTaskResult(task, newStatus)
                 }
             }
         }
@@ -1710,9 +1736,44 @@ class DownloadManager(
         try { persistFile.writeText(json.encodeToString(tasks.values.toList())) }
         catch (e: Exception) { AppLogger.e(TAG, "saveTasks failed: ${e.javaClass.simpleName}: ${e.message}", e) }
     }
-    private fun loadTasks() { try { if (persistFile.exists()) { val t = persistFile.readText(); if (t.isNotBlank()) json.decodeFromString<List<DownloadTask>>(t).forEach { tasks[it.id] = it } } } catch (_: Exception) {} }
-    private fun saveConfig() { try { configFile.writeText(json.encodeToString(config)) } catch (_: Exception) {} }
-    private fun loadConfig() { try { if (configFile.exists()) { val t = configFile.readText(); if (t.isNotBlank()) config = json.decodeFromString<DownloadConfig>(t) } } catch (_: Exception) {}; migrateConfig() }
+    /**
+     * 任务/配置的读写失败以前是 `catch (_: Exception) {}` 全静默的。
+     * 后果是「用户改的配置自己回默认值」这类现场完全不可查：文件权限异常、
+     * 半截 JSON、字段类型不兼容，表现都一样 —— 静静地退回默认 config、任务列表空掉。
+     * 所以这里只补日志（带文件路径 + 异常类型），控制流一个字都不改：
+     * 读失败仍然沿用默认值继续跑，不能因为一次读盘失败就让下载模块起不来。
+     */
+    private fun loadTasks() {
+        try {
+            if (persistFile.exists()) {
+                val t = persistFile.readText()
+                if (t.isNotBlank()) json.decodeFromString<List<DownloadTask>>(t).forEach { tasks[it.id] = it }
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "loadTasks failed, tasks stay empty: ${persistFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun saveConfig() {
+        try {
+            configFile.writeText(json.encodeToString(config))
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "saveConfig failed, config not persisted: ${configFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun loadConfig() {
+        try {
+            if (configFile.exists()) {
+                val t = configFile.readText()
+                if (t.isNotBlank()) config = json.decodeFromString<DownloadConfig>(t)
+            }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "loadConfig failed, falling back to defaults: ${configFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+        }
+        migrateConfig()
+    }
+
 
     /**
      * 老配置迁移。config.json 里的值优先级高于默认值，所以光改默认值对已有设备无效：

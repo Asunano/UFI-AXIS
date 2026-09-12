@@ -18,7 +18,7 @@ import type { ConsoleMessage } from './types';
 const props = defineProps<{ message: ConsoleMessage }>();
 
 const roleLabel = computed(() =>
-  props.message.role === 'user' ? '命令' : props.message.role === 'error' ? '错误' : '响应',
+  props.message.role === 'user' ? '命令' : props.message.role === 'error' ? '错误' : '响应'
 );
 
 async function copy() {
@@ -42,6 +42,12 @@ async function copy() {
 .bubble-row.is-error {
   justify-content: flex-start;
 }
+/* ── 终端气泡配色：刻意不接主题令牌（域色豁免）──
+   下面 9 个写死值是一套 One Dark 风格的**终端配色**（深蓝底 #1a1a2e / 用户气泡 #2a3a5e /
+   错误 #e06c75 / 正文 #c8c8d8），语义是「这是一个终端」，不是「这是本站的强调色/错误色」。
+   接 --accent-color / --error 会让它跟着换肤走，反而丢掉终端该有的辨识度；
+   而且它在浅色模式下也应当保持深底（终端就是深的），所以也不需要 .dark 档。
+   与 Android 侧「域色是否随皮肤」是同一性质的豁免，不要在 W4 的清理里顺手换掉。 */
 .bubble {
   max-width: 75%;
   background: #1a1a2e;

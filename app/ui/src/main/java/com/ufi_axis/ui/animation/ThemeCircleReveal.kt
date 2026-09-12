@@ -3,7 +3,7 @@ package com.ufi_axis.ui.animation
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.LocalThemePalette
 
 /**

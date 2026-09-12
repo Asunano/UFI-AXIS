@@ -308,7 +308,7 @@ function goDetail() {
      这样分隔线能贴满整条的高度、不出现断头 */
   gap: 0;
   padding: 0 6px 0 0;
-  background: var(--bg-subtle, rgba(127, 127, 127, 0.06));
+  background: var(--surface-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
   cursor: default;
@@ -319,8 +319,8 @@ function goDetail() {
     border-color 0.2s ease;
 }
 .dtb-bar:hover {
-  background: var(--bg-hover, rgba(127, 127, 127, 0.1));
-  border-color: var(--border-color, var(--border-subtle));
+  background: var(--surface-hover);
+  border-color: var(--border-subtle);
 }
 
 /* 一段信息。除第一段外都带左侧发丝线 —— 这是唯一的分隔手段，不再靠内层胶囊 */
@@ -374,7 +374,7 @@ function goDetail() {
   flex-shrink: 0;
 }
 .dtb-dot.is-online {
-  background: var(--success-color, #18a058);
+  background: var(--success);
   box-shadow: 0 0 0 3px rgba(24, 160, 88, 0.18);
 }
 .dtb-dot.is-offline {
@@ -464,7 +464,7 @@ function goDetail() {
   letter-spacing: 0.02em;
 }
 .dev-panel-state.is-online {
-  color: var(--success-color, #18a058);
+  color: var(--success);
 }
 .dev-panel-state.is-offline {
   color: var(--text-muted);
@@ -526,21 +526,24 @@ function goDetail() {
   line-height: 1.7;
   letter-spacing: 0.02em;
 }
+/* 四个徽标的淡底/文字色都走语义令牌。`--*-light` 自带暗色档，
+   所以原先那 4 条 `.dark .dev-badge-*` 覆盖（0.1→0.14 / 0.08→0.12）已删除 ——
+   取值与令牌逐字相同，行为不变，少一份要同步的拷贝。 */
 .dev-badge-ok {
-  background: rgba(24, 160, 88, 0.1);
-  color: #18a058;
+  background: var(--success-light);
+  color: var(--success);
 }
 .dev-badge-warn {
-  background: rgba(240, 160, 32, 0.1);
-  color: #f0a020;
+  background: var(--warning-light);
+  color: var(--warning);
 }
 .dev-badge-root {
-  background: rgba(208, 48, 80, 0.08);
-  color: #d03050;
+  background: var(--error-light);
+  color: var(--error);
 }
 .dev-badge-info {
-  background: rgba(32, 128, 240, 0.08);
-  color: #2080f0;
+  background: var(--accent-color-light);
+  color: var(--accent-color);
 }
 
 /* 暗色模式微调 */
@@ -548,17 +551,5 @@ function goDetail() {
   box-shadow:
     0 8px 32px rgba(0, 0, 0, 0.35),
     0 2px 8px rgba(0, 0, 0, 0.2);
-}
-.dark .dev-badge-ok {
-  background: rgba(24, 160, 88, 0.14);
-}
-.dark .dev-badge-warn {
-  background: rgba(240, 160, 32, 0.14);
-}
-.dark .dev-badge-root {
-  background: rgba(208, 48, 80, 0.12);
-}
-.dark .dev-badge-info {
-  background: rgba(32, 128, 240, 0.12);
 }
 </style>

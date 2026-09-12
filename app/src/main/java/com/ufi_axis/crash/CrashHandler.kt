@@ -3,9 +3,9 @@ package com.ufi_axis.crash
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
-import android.os.Environment
 import android.os.Process
 import com.ufi_axis.util.AppLogBuffer
+import com.ufi_axis.util.UfiLogPaths
 import kotlin.system.exitProcess
 import java.io.File
 import java.io.FileWriter
@@ -16,9 +16,14 @@ import java.util.Locale
 
 /**
  * 全局未捕获异常处理器：在进程崩溃时把栈信息、设备信息与近期 logcat 写入
- * 公共下载目录 `Download/UFI-AXIS/<yyyy-MM-dd>/crash_<HH-mm-ss>.log`，
+ * `Download/UFI-AXIS/log/app/crash/<yyyy-MM-dd>/crash_<HH-mm-ss>.log`，
  * 方便用户通过文件管理器直接查看。随后仍交给系统默认处理器
  * （保留系统崩溃提示并终止进程）。下次启动由 MainActivity 检测并弹窗展示。
+ *
+ * 路径来自 [UfiLogPaths]（app 侧唯一一处路径约定）。2026-09-11 之前这里自己拼
+ * `Download/UFI-AXIS/<yyyy-MM-dd>/`，**直接污染品牌根目录** —— 那正是 core
+ * `ComponentFactory.migrateLegacyLogsOnce()` 要清掉的形态。旧文件由
+ * [migrateLegacyCrashLogsOnce] 一次性搬到新位置。
  *
  * 2026-09-04「release 默认关日志、但闪退必须留证据」：
  * - 崩溃**不受日志开关约束**（关掉日志≠放弃崩溃证据），但此前崩溃文件里只有
@@ -29,16 +34,22 @@ import java.util.Locale
  */
 object CrashHandler : Thread.UncaughtExceptionHandler {
 
-    private const val BASE_DIR_NAME = "UFI-AXIS"
     private const val MAX_CRASH_FILES = 50
     private const val LOGCAT_LINES = 150
     private const val BUFFER_DUMP_LINES = 200
+
+    /** 改造前的私有回退崩溃目录（`filesDir/crash`），只在一次性搬迁里出现。 */
+    private const val LEGACY_PRIVATE_CRASH_DIR = "crash"
 
     private var defaultHandler: Thread.UncaughtExceptionHandler? = null
     private lateinit var appContext: Context
 
     fun install(context: Context) {
         appContext = context.applicationContext
+        // 搬迁刻意**同步**跑在这里：MainActivity 组合时就会读 [latestCrash] 弹窗，
+        // 放到后台线程会让「升级后第一次启动」有概率看不到升级前那次崩溃。
+        // 代价是主线程上几次 renameTo（小文件、只有首次真正做事）。
+        migrateLegacyCrashLogsOnce()
         defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler(this)
     }
@@ -53,35 +64,12 @@ object CrashHandler : Thread.UncaughtExceptionHandler {
             }
     }
 
-    /**
-     * 崩溃日志根目录：`Download/UFI-AXIS/`。
-     * 优先使用公共 Download 目录（用户可直接通过文件管理器查看）；
-     * 若外部存储不可用则回退到应用内部 filesDir/crash/。
-     */
-    private fun crashBaseDir(): File {
-        // 优先尝试公共 Download 目录
-        val publicDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        if (publicDir != null) {
-            val base = File(publicDir, BASE_DIR_NAME)
-            if (base.exists() || base.mkdirs()) return base
-        }
-        // 回退到应用内部存储
-        val fallback = File(appContext.filesDir, "crash")
-        if (!fallback.exists()) fallback.mkdirs()
-        return fallback
-    }
-
-    /** 当日崩溃日志子目录：`<baseDir>/yyyy-MM-dd/` */
-    private fun crashDirForToday(): File {
-        val dateDir = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
-        val dir = File(crashBaseDir(), dateDir)
-        if (!dir.exists()) dir.mkdirs()
-        return dir
-    }
+    /** 当日崩溃日志目录：`log/app/crash/<yyyy-MM-dd>/`，外部存储不可写时走私有回退。 */
+    private fun crashDirForToday(): File? = UfiLogPaths.appCrashDir(appContext)
 
     @Synchronized
     private fun writeCrashLog(thread: Thread, ex: Throwable) {
-        val dir = crashDirForToday()
+        val dir = crashDirForToday() ?: return
 
         val now = Date()
         val stamp = SimpleDateFormat("HH-mm-ss", Locale.US).format(now)
@@ -139,43 +127,74 @@ object CrashHandler : Thread.UncaughtExceptionHandler {
     }.getOrDefault(-1)
 
     private fun trimOldFiles(dir: File) {
-        val files = dir.listFiles { f -> f.name.startsWith("crash_") && f.name.endsWith(".log") }
+        val files = dir.listFiles { f -> UfiLogPaths.isCrashFileName(f.name) }
             ?.sortedBy { it.lastModified() } ?: return
         files.take(maxOf(0, files.size - MAX_CRASH_FILES)).forEach { it.delete() }
     }
 
+    // region 一次性搬迁：`UFI-AXIS/<日期>/crash_*.log` → `UFI-AXIS/log/app/crash/<日期>/`
+    // 幂等靠三件事：进程内 [legacyMigrated] 标志、判据只认「日期目录 + crash_*.log」、
+    // 搬完即删（renameTo 成功源文件就不存在，第二次跑匹配不到任何东西）。
+    // **不会碰 core 的地盘**：品牌根下 core 的东西全在 `log/` 里，而 `log` 不是日期目录名，
+    // 所以只认 `yyyy-MM-dd` 这一条判据就够（见 [UfiLogPaths.isDateDirName]）。
+    // 将来不再需要支持从 2026-09-11 之前的版本直升时，可以把这一段连同标志位一起删掉。
+
+    @Volatile
+    private var legacyMigrated = false
+
+    private fun migrateLegacyCrashLogsOnce() {
+        if (legacyMigrated) return
+        legacyMigrated = true
+        runCatching {
+            // 两处旧位置各自搬到**同一介质**的新位置：跨介质（filesDir → /sdcard）的 renameTo
+            // 会直接失败，把私有目录里的旧崩溃搬到外部存储只会静默丢件。
+            val jobs = buildList<Pair<File, (String) -> File?>> {
+                UfiLogPaths.legacyBrandRoot()?.let { root ->
+                    add(root to { date -> UfiLogPaths.appCrashDir(appContext, date) })
+                }
+                add(
+                    File(appContext.filesDir, LEGACY_PRIVATE_CRASH_DIR) to { date ->
+                        UfiLogPaths.privateFallbackDir(appContext, UfiLogPaths.appCrashRelative(date))
+                            .takeIf { it.exists() || it.mkdirs() }
+                    }
+                )
+            }
+            for ((base, targetOf) in jobs) {
+                val dateDirs = base.listFiles { f ->
+                    f.isDirectory && UfiLogPaths.isDateDirName(f.name)
+                } ?: continue
+                for (dateDir in dateDirs) {
+                    val target = targetOf(dateDir.name) ?: continue
+                    val crashes = dateDir.listFiles { f ->
+                        f.isFile && UfiLogPaths.isCrashFileName(f.name)
+                    } ?: continue
+                    crashes.forEach { f ->
+                        val dst = File(target, f.name)
+                        // 同名（同一天同一秒）几乎不可能；真撞上就保留已有的那份，不覆盖证据
+                        if (!dst.exists()) f.renameTo(dst)
+                    }
+                    // 搬空了就把旧日期目录一并收掉，品牌根才真的干净
+                    if (dateDir.listFiles().isNullOrEmpty()) dateDir.delete()
+                }
+            }
+        }
+    }
+    // endregion
+
     // region UI 读取接口
-    /**
-     * 列出所有崩溃日志文件（跨日期子目录），按修改时间倒序。
-     * 同时扫描公共 Download 目录和应用内部 fallback 目录。
-     */
+    /** 崩溃日志文件（跨日期子目录 + 外部/私有两处），按修改时间倒序。 */
     fun listCrashFiles(context: Context): List<File> {
         val result = mutableListOf<File>()
-        // 扫描公共 Download 目录
-        val publicBase = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        if (publicBase != null) {
-            val base = File(publicBase, BASE_DIR_NAME)
-            if (base.exists()) collectCrashFiles(base, result)
-        }
-        // 扫描应用内部 fallback 目录
-        val internalDir = File(context.applicationContext.filesDir, "crash")
-        if (internalDir.exists()) {
-            result.addAll(
-                internalDir.listFiles { f -> f.name.startsWith("crash_") && f.name.endsWith(".log") }
-                    ?.toList() ?: emptyList()
-            )
+        UfiLogPaths.appCrashRoots(context.applicationContext).forEach { root ->
+            if (root.isDirectory) collectCrashFiles(root, result)
         }
         return result.sortedByDescending { it.lastModified() }
     }
 
-    /** 递归收集日期子目录下的崩溃日志 */
-    private fun collectCrashFiles(baseDir: File, out: MutableList<File>) {
-        // 直接子文件（旧格式 crash_yyyy-MM-dd_HH-mm-ss.log）
-        baseDir.listFiles { f -> f.isFile && f.name.startsWith("crash_") && f.name.endsWith(".log") }
-            ?.let { out.addAll(it) }
-        // 日期子目录（新格式 yyyy-MM-dd/crash_HH-mm-ss.log）
-        baseDir.listFiles { f -> f.isDirectory }?.forEach { subDir ->
-            subDir.listFiles { f -> f.name.startsWith("crash_") && f.name.endsWith(".log") }
+    /** 收集崩溃根目录下各日期子目录里的 dump。 */
+    private fun collectCrashFiles(crashRoot: File, out: MutableList<File>) {
+        crashRoot.listFiles { f -> f.isDirectory }?.forEach { dateDir ->
+            dateDir.listFiles { f -> f.isFile && UfiLogPaths.isCrashFileName(f.name) }
                 ?.let { out.addAll(it) }
         }
     }
@@ -183,20 +202,17 @@ object CrashHandler : Thread.UncaughtExceptionHandler {
     fun latestCrash(context: Context): File? = listCrashFiles(context).firstOrNull()
 
     fun clearCrashes(context: Context) {
-        // 清理公共目录
-        val publicBase = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        if (publicBase != null) {
-            val base = File(publicBase, BASE_DIR_NAME)
-            if (base.exists()) {
-                base.listFiles()?.forEach { subDir ->
-                    if (subDir.isDirectory) subDir.listFiles()?.forEach { it.delete() }
-                    else subDir.delete()
+        UfiLogPaths.appCrashRoots(context.applicationContext).forEach { root ->
+            if (!root.isDirectory) return@forEach
+            root.listFiles()?.forEach { dateDir ->
+                if (dateDir.isDirectory) {
+                    dateDir.listFiles()?.forEach { it.delete() }
+                    dateDir.delete()
+                } else {
+                    dateDir.delete()
                 }
             }
         }
-        // 清理内部 fallback 目录
-        val internalDir = File(context.applicationContext.filesDir, "crash")
-        internalDir.listFiles()?.forEach { it.delete() }
     }
 
     // 2026-08-11：闪退日志弹窗去重——记录"已读"的崩溃时间戳，避免同一进程重复弹出

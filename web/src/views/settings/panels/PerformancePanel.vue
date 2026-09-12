@@ -27,7 +27,7 @@
           />
         </div>
         <div class="config-item">
-          <span class="config-label">Goform 查询上限 (1-8)</span>
+          <span class="config-label">设备后台查询上限 (1-8)</span>
           <n-input-number
             v-model:value="qosForm.goformQueryLimit"
             :min="ConfigLimits.qosGoformQueryMax[0]"
@@ -36,7 +36,7 @@
           />
         </div>
         <div class="config-item">
-          <span class="config-label">Goform 设置上限 (1-4)</span>
+          <span class="config-label">设备后台设置上限 (1-4)</span>
           <n-input-number
             v-model:value="qosForm.goformSetLimit"
             :min="ConfigLimits.qosGoformSetMax[0]"
@@ -204,36 +204,8 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
-
-/* ── Config layout ── */
-.section-subtitle {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-.config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.config-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.config-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.switch-item {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-}
-
-/* .card-actions 已统一到 src/styles/main.css（全局一份，四个面板共用） */
+/* .settings-panel 栅格与断点、.config-grid/.config-item/.config-label/.switch-item 版式、
+   .section-subtitle、.card-actions 均已统一到 src/styles/main.css（全局各一份） */
 
 /* ── QoS status grid ── */
 .status-grid {
@@ -245,12 +217,5 @@ onMounted(() => {
 .text-muted {
   color: var(--text-muted);
   font-size: 13px;
-}
-
-/* ── Responsive ── */
-@media (max-width: 768px) {
-  .config-grid {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

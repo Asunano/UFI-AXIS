@@ -43,7 +43,7 @@ const CATEGORIES: Category[] = [
   {
     key: 'general',
     label: '通用',
-    desc: 'Token、Goform 连接、服务监听端口、日志开关、短信验证码与更新源',
+    desc: 'Token、设备后台连接、服务监听端口、日志开关、短信验证码与更新源',
     component: defineAsyncComponent(() => import('./panels/GeneralPanel.vue')),
   },
   {
@@ -67,13 +67,13 @@ const CATEGORIES: Category[] = [
   {
     key: 'notify',
     label: '通知',
-    desc: '短信转发规则与连通性诊断',
+    desc: '邮件、Webhook 与本机短信三条通知渠道的配置与测试',
     component: defineAsyncComponent(() => import('./panels/NotifyPanel.vue')),
   },
   {
     key: 'pairing',
     label: '配对与授权',
-    desc: '配对码、已配对设备管理与管理员密码',
+    desc: '配对码、已配对设备与配对密码',
     component: defineAsyncComponent(() => import('./panels/PairingPanel.vue')),
   },
   {
@@ -81,6 +81,12 @@ const CATEGORIES: Category[] = [
     label: '日志',
     desc: '调试日志查看与清理（开关在「通用」分栏）',
     component: defineAsyncComponent(() => import('./panels/LogsPanel.vue')),
+  },
+  {
+    key: 'backup',
+    label: '备份与恢复',
+    desc: '导出配置备份包、从备份文件恢复',
+    component: defineAsyncComponent(() => import('./panels/BackupPanel.vue')),
   },
   {
     key: 'about',

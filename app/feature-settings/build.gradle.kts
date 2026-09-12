@@ -34,4 +34,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.kotlinx.serialization.json)
+
+    // ★ 单元测试：Webhook 简易输入框与存储之间的前后缀换算（纯函数，无需 Robolectric）
+    testImplementation(libs.junit)
 }

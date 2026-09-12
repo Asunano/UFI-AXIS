@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 环形进度指示器（donut chart 风格）。

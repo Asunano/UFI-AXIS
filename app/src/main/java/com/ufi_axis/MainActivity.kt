@@ -10,7 +10,11 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.toArgb
@@ -33,6 +37,13 @@ import com.ufi_axis.ui.components.common.UfiAlertToastBridge
 import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
 import com.ufi_axis.app.navigation.buildAppScreens
+import androidx.navigation.compose.rememberNavController
+import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.components.common.UfiButton
+import com.ufi_axis.ui.components.common.UfiButtonVariant
+import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.UfiDialogBody
+import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.page.registerBuiltInTransitions
 import com.ufi_axis.ui.navigation.MainNavGraph
@@ -193,9 +204,10 @@ class MainActivity : ComponentActivity() {
                     forceSetup = true
                 }
 
-                // 凭据失效（444/401）→ 清空本地 Token 并回到配对引导（边缘情况 #1/#3）。
-                // onUnauthorized 由 Retrofit OkHttp 拦截器在业务 /api/* 返回 401 时触发。
-                // F22：全局回调集中到 ConnectionBootstrap（行为与原实现一致，在 UI 线程执行）。
+                // 凭据被**确证**吊销 → 清空本地 Token 并回到配对引导（边缘情况 #1/#3）。
+                // 触发条件（444 / 连续次数 / 时间跨度 / 传输失败豁免）全在 RetrofitClient 的
+                // 鉴权策略里，这里只是装配；一次瞬时 401 不再把人踢下线（2026-09-08 事故）。
+                // F22：全局回调集中到 ConnectionBootstrap。
                 ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
                     isSetupComplete = false
                 }
@@ -359,12 +371,14 @@ class MainActivity : ComponentActivity() {
                         // `remember(screens, navController, entry)`）—— 于是任何上层重组
                         // （主题、缩放、toast、深链接 state…）都会让 5 个 Tab 页连内容一起重建。
                         // 从二级页返回时这次重建恰好和平移动画撞在同几帧，就是"返回卡一下"。
+                        val navController = rememberNavController()
                         val appScreens = remember(viewModel, onServerConfigChanged, onRepairRequested) {
                             buildAppScreens(viewModel, onServerConfigChanged, onRepairRequested)
                         }
                         MainNavGraph(
                             screens = appScreens,
                             themeManager = themeManager,
+                            navController = navController,
                             pendingSmsPhone = pendingSmsPhone,
                             pendingAlertDeepLink = pendingAlertDeepLink
                         )
@@ -407,6 +421,62 @@ class MainActivity : ComponentActivity() {
                             lastGlobalErrorAt = now
                             toastMessage = ToastMessage(err.message, ToastType.ERROR)
                         }
+
+                        // ── 后端掉线提示（2026-09-12）──
+                        // 数据加载出错且复查 /health 也失败时弹出，带「重试」与「进入服务器设置」两个动作。
+                        // 触发与去抖逻辑在 MainViewModel.collectBackendDownSignal / backendDownDialogState。
+                        val backendDown by viewModel.backendDownDialogState.collectAsState()
+                        backendDown?.let { dialog ->
+                            UfiCustomDialog(
+                                visible = true,
+                                onDismiss = { viewModel.dismissBackendDownDialog() },
+                                // 后端掉线属于必须处理的状态：禁止点外部 / 按返回键关闭，
+                                // 强制用户在「重试」与「进入服务器设置」之间二选一。
+                                dismissOnClickOutside = false,
+                                dismissOnBackPress = false,
+                                title = "无法连接后端服务",
+                                confirmButton = {
+                                    UfiButton(
+                                        text = "重试",
+                                        onClick = { viewModel.retryFromBackendDown() }
+                                    )
+                                },
+                                dismissButton = {
+                                    UfiButton(
+                                        variant = UfiButtonVariant.Secondary,
+                                        text = "服务器设置",
+                                        onClick = {
+                                            viewModel.dismissBackendDownDialog()
+                                            navController.navigate(Routes.DETAIL_SERVER_CONFIG)
+                                        }
+                                    )
+                                }
+                            ) {
+                                UfiDialogBody {
+                                    Text(
+                                        text = "无法访问后端服务（健康检查接口无响应），很可能是后端服务已停止或连接地址不可达。",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = LocalResolvedPalette.current.textSecondary
+                                    )
+                                    dialog.errorMessage?.let { em ->
+                                        Spacer(Modifier.height(Spacing.Small))
+                                        Text(
+                                            text = "原始错误：$em",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = LocalResolvedPalette.current.textSecondary
+                                        )
+                                    }
+                                    dialog.healthErrorMessage?.let { he ->
+                                        Spacer(Modifier.height(Spacing.Small))
+                                        Text(
+                                            text = "健康检查：$he",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = LocalResolvedPalette.current.textSecondary
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
@@ -414,6 +484,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+    override fun onResume() {
+        super.onResume()
+        // 后台守护「从最近任务隐藏」开关：每次回到前台重新应用，覆盖进程被系统回收重建的场景。
+        prefs.applyHideFromRecents()
+    }
 
     override fun onDestroy() {
         super.onDestroy()

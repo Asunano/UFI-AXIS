@@ -29,20 +29,29 @@ class SystemCollector(private val context: Context) {
     private val processStartedAt: Long = System.currentTimeMillis()
 
     /**
-     * 获取 CPU 信息：总使用率 + 各核频率
-     */
-    /**
      * 缓存控制：CPU 频率和温度变化较慢，缓存有效期内直接返回上次结果。
      * 由 DataScheduler 每 3s 调用一次，但 sysfs 值实际变化周期远大于 3s。
+     *
+     * 时间戳与数据必须是**一个**不可变快照，且用 @Volatile 发布：
+     * 原实现是两个普通 var（`lastCpuCacheTime` / `lastCpuCache`），读方有两路 —— 性能监控
+     * 协程和 API 路由协程跑在不同线程上。两个字段分别写，读方可能看到「新时间戳配旧数据」
+     * 甚至只看到时间戳的写入而看不到 CpuInfo 的写入（无 happens-before），
+     * 那个 `lastCpuCache!!` 也就只是「碰巧没人写 null」才没炸。
+     * 换成单个 @Volatile 引用后，一次写发布整个快照，读方拿到的时间戳和数据永远配对，!! 也不需要了。
      */
-    private var lastCpuCacheTime: Long = 0L
-    private var lastCpuCache: CpuInfo? = null
+    private data class CpuSnapshot(val info: CpuInfo, val takenAt: Long)
 
+    @Volatile private var cpuSnapshot: CpuSnapshot? = null
+
+    /**
+     * 获取 CPU 信息：总使用率 + 各核频率
+     */
     suspend fun getCpuInfo(): CpuInfo {
         val now = System.currentTimeMillis()
         // ── CPU 信息缓存：5s 内直接返回上一次结果，减少 sysfs 读取压力 ──
-        if (lastCpuCache != null && (now - lastCpuCacheTime) < 5_000L) {
-            return lastCpuCache!!
+        val cached = cpuSnapshot
+        if (cached != null && (now - cached.takenAt) < 5_000L) {
+            return cached.info
         }
         var cpuUsage = 0.0
         val cores = mutableListOf<CpuCore>()
@@ -71,8 +80,7 @@ class SystemCollector(private val context: Context) {
             AppLogger.e(tag, "Failed to get CPU info", e)
         }
         val info = CpuInfo(usage_percent = cpuUsage, core_count = cores.size, cores = cores, temperature = temperature)
-        lastCpuCache = info
-        lastCpuCacheTime = now
+        cpuSnapshot = CpuSnapshot(info, now)
         return info
     }
 

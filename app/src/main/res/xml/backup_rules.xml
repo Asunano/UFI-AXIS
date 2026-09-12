@@ -1,13 +1,20 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    系统自动备份规则（API 30 及以下走这份，API 31+ 走 data_extraction_rules.xml）。
+
+    默认行为是「全都备份」，这里只做排除。
+
+    为什么必须排除 ufi_axis_credentials：设备私钥在 Android Keystore 里，**不参与备份迁移**。
+    如果 token 被云备份带到新机，会出现 token 有效、密钥却是新生成的 → 请求签名与服务端
+    记录的旧公钥对不上 → 恒定 401。而 401 在本项目里是「保留凭据重试」语义，客户端不会
+    自愈回配对引导页，用户看到的是「通知和连接莫名失效且怎么也好不了」。
+    宁可让新机识别不出配对状态、老老实实重新配对一次。
+
+    device_hwid 同理：它是服务端合并「同一硬件换了指纹」的依据，跨设备还原会让两台真实
+    不同的机器自报同一个 hwid，服务端会把前一台的配对记录当作旧指纹删掉。
+
+    文件名与 AppPreferences.CRED_PREFS_NAME 对应，改名要同步改这里。
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <exclude domain="sharedpref" path="ufi_axis_credentials.xml"/>
 </full-backup-content>

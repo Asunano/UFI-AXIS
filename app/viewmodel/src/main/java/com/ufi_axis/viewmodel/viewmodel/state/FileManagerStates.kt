@@ -74,20 +74,37 @@ data class QuickPath(
 )
 
 /**
- * 已加载的文本文件 — 按 path 区分，解决切换文件时仍显示上一个文件内容的缓存 bug。
+ * 一次文本读取的结果。
  *
- * @param path 加载目标路径，与 [FileManagerModule.readFile] 入参一一对应
- * @param content 已读取的文本（即使是 [truncated] 也保留完整 content，只是 UI 强制只读）
- * @param size 服务端 /read 返回的 size 字段（字节数）
- * @param truncated true 表示服务端在 [MAX_READ_SIZE] 处截断（见 core FileRoutes.MAX_READ_SIZE=512KB），
- *                  UI 应强制只读并提示「仅显示前 X 行 / 下载查看完整」避免 OOM
+ * 2026-09-11：取代旧的 `LoadedFile` + `FileManagerState.loadedFile` 那套「读进共享 state」的做法。
+ * 文本编辑器改为直接 `suspend` 拿返回值，好处有两个：
+ * - 不再与其它文件操作共用 `errorMessage` 槽（旧实现里编辑器的错误弹窗关不掉，正是因为
+ *   它 dismiss 时调的函数只清 `operationMessage`）；
+ * - 「重新加载」天然可用 —— 旧实现靠 `!isLoaded` 一次性守卫防覆盖，导致再读也不刷新。
+ *
+ * @param content 文本正文。[reason] 非空时它是服务端给的说明文字，不是文件内容。
+ * @param size 文件真实字节数
+ * @param encoding 服务端实际使用的解码字符集
+ * @param reason 内容不可用的原因：`too_large` / `binary` / `not_file`；为空表示内容完整可用
+ * @param encodingSuspect 以 UTF-8 解码时出现替换字符，可能是 GBK 等其它编码
  */
-data class LoadedFile(
-    val path: String,
+data class TextFileContent(
     val content: String,
-    val size: Int,
-    val truncated: Boolean
-)
+    val size: Long,
+    val encoding: String,
+    val reason: String?,
+    val encodingSuspect: Boolean
+) {
+    /** 内容是否可用（可展示 / 可编辑）。 */
+    val usable: Boolean get() = reason == null
+
+    companion object {
+        const val REASON_TOO_LARGE = "too_large"
+        const val REASON_BINARY = "binary"
+        const val REASON_NOT_FILE = "not_file"
+    }
+}
+
 
 // ========== File Manager ==========
 
@@ -109,9 +126,6 @@ data class FileManagerState(
     val errorMessage: String? = null,
     val clipboard: ClipboardEntry? = null,
     val selectedFile: FileInfoResponse? = null,
-    val fileContent: String? = null,
-    /** 当前加载的文件元数据（path/content/size/truncated），用以解决旧 [fileContent] 的「切文件不刷新」缓存 bug */
-    val loadedFile: LoadedFile? = null,
     val operationMessage: String? = null,
     val storagePermissionGranted: Boolean = false,
     val showStoragePermissionDialog: Boolean = false,
@@ -135,5 +149,14 @@ data class FileManagerState(
     val searchDepth: Int = 3,
     // ---- Caching (iteration 2): TTL-based directory listing cache ----
     val cacheByPath: Map<String, CachedListing> = emptyMap(),
-    val cacheConfigTtlMs: Long = 30_000L
+    val cacheConfigTtlMs: Long = 30_000L,
+    // ---- 编辑器本地副本缓存（2026-09-11）----
+    // 超过服务端单次可读上限的文本文件无法在线阅读，改为整份下载到手机缓存后再编辑。
+    // 这四项目的是让「下载中」有进度可看、让「缓存清理」有数字可显示。
+    val editorCacheBytes: Long = 0L,
+    val editorCacheCount: Int = 0,
+    val editorFetching: Boolean = false,
+    /** 0f~1f；-1f = 总量未知（无 Content-Length 且无 Range 头）。 */
+    val editorFetchProgress: Float = -1f,
+    val editorFetchFileName: String = ""
 )

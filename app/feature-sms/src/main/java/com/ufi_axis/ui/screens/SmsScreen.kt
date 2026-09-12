@@ -67,6 +67,7 @@ import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.ui.navigation.LocalPendingSmsPhone
+import com.ufi_axis.ui.navigation.Routes
 import java.text.SimpleDateFormat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -76,6 +77,7 @@ import java.util.Locale
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import com.ufi_axis.ui.theme.UfiMotion
 
 // ════════════════════════════════════════════════════
 // 短信主入口 — 标准手机短信界面风格
@@ -83,17 +85,6 @@ import android.content.Context
 
 /** 会话列表静默自动刷新间隔（毫秒）。只在「消息」页签可见且没打开对话时跑。 */
 private const val CONTACTS_AUTO_REFRESH_MS = 10_000L
-
-/** 验证码缓存自动清理间隔档位（小时；"0" = 永不清理）。短信设置弹窗内联双栏 grid 用。 */
-private val SMS_CODE_CLEANUP_OPTIONS = listOf(
-    "0" to "永不清理",
-    "1" to "1 小时",
-    "6" to "6 小时",
-    "24" to "24 小时",
-    "72" to "3 天",
-    "168" to "7 天",
-    "720" to "30 天"
-)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -104,13 +95,16 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val scope = rememberCoroutineScope()
     var isComposing by remember { mutableStateOf(false) }
     var showOptInDialog by remember { mutableStateOf(false) }
-    var showSettingsDialog by remember { mutableStateOf(false) }
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     // 点击验证码卡片后要展示详情的那一条（null = 不显示弹窗）。
     // 2026-08-29：原来点卡片是 openVerificationCodeSource(source) → 切到「消息」页签并打开该号码的
     // 对话。但用户点验证码卡片的意图基本是"看清完整内容 / 再确认一遍码"，被弹到另一个页签反而
     // 丢失了当前浏览位置（回来还要再点回「通知」）。改成原地弹窗，跳转降级为弹窗里的一个按钮。
     var codeDetail by remember { mutableStateOf<VerificationCode?>(null) }
+    // 会话行长按「加入黑名单」的二次确认对象（null = 不显示）。
+    // 提到屏幕层持有而不是放在行里：确认结果要弹 Toast，而 UfiToastHost 挂在这一层；
+    // 放在行内的话，列表刷新（10s 静默轮询）重组时那一行连带弹窗会被整块换掉。
+    var pendingBlacklistPhone by remember { mutableStateOf<String?>(null) }
     // 「查看原对话」跳走前暂存的那条：对话关闭后原样弹回来，让用户回到点跳转之前的状态
     var reopenCodeAfterConversation by remember { mutableStateOf<VerificationCode?>(null) }
     // 两个列表的滚动位置提到屏幕级持有。对话页是根 AnimatedContent 的另一层，
@@ -121,22 +115,20 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val context = LocalContext.current
 
     // ── 首屏骨架的判据：「本次进入页面，这份数据还没出过任何结果」──────────────────
-    // 为什么不能直接看 isLoading（上一轮就是这么写的）：
+    // 为什么不能直接看 isLoading（更早一版就是这么写的）：
     //  1) 进页面第一帧 isLoading 还是 false（loadSmsContacts 要等 LaunchedEffect 才发出去），
     //     直接看它会先闪一帧「暂无短信」空态、再跳骨架、再跳列表 —— 连跳两次；
     //  2) isLoading 之后每次手动刷新 / 重新拉取都会再翻 true，直接看它等于"刷新也放骨架"，
     //     而按需求刷新必须完全无动画。
-    // 闩锁只认第一次落地（拿到数据 / 报错 / 观察到一次 loading 结束），置位后不再回落。
-    val contactsFirstLoadPending = rememberFirstLoadPending(
-        loading = { toolsState.isLoading },
-        hasData = { toolsState.smsContacts.isNotEmpty() },
-        failed = { toolsState.errorMessage != null }
-    )
-    val codesFirstLoadPending = rememberFirstLoadPending(
-        loading = { toolsState.verificationCodesLoading },
-        hasData = { toolsState.verificationCodes.isNotEmpty() },
-        failed = { toolsState.errorMessage != null }
-    )
+    // 也不能去嗅 isLoading 的下降沿（上一版）：见 rememberFirstLoadPending 的注释。
+    // 现在统一读 ViewModel 给的「已完成过一次加载尝试」标记，成功/失败/空结果都能收场。
+    val contactsFirstLoadPending = rememberFirstLoadPending { toolsState.smsContactsLoaded }
+    val codesFirstLoadPending = rememberFirstLoadPending { toolsState.verificationCodesLoaded }
+
+    // 未读数优先取 /count 的全局值，它没读到才回落联系人求和（会偏小，因为联系人列表
+    // 只覆盖有会话记录的号码）。口径说明见 ToolsState.smsCount。
+    // 2026-09-08 从短信设置页搬来，连口径一起搬 —— 不要在两处各算一版。
+    val unreadTotal = toolsState.smsCount?.unread ?: toolsState.smsContacts.sumOf { it.unread }
 
     // 发完短信后要把会话列表拉回顶部。
     // 列表 `items(contacts, key = { it.phoneNumber })` 是带 key 的，而后端按最新消息时间重排，
@@ -168,12 +160,17 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     LaunchedEffect(Unit) {
         viewModel.tools.loadSmsContacts()
         viewModel.tools.refreshDeviceConfig()
+        // 设备短信条数 / 未读数（列表首行那条信息行要用）。
+        // 2026-09-08 从短信设置页搬来：条数与「全部标为已读」现在长在消息 Tab 上，
+        // 拉取自然也跟着搬 —— 留在设置页的话，不进设置页就永远拿不到这两个数。
+        viewModel.tools.loadSmsCount()
         // 进入页面时也静默拉一次验证码：否则停在「消息」页签时 unread 恒为 0，
         // 「通知」角标要等用户点进去才算得出来（点进去又立刻清零）→ 角标永远不亮。
         viewModel.tools.loadVerificationCodes()
     }
     rememberResumeRefresh {
         viewModel.tools.loadSmsContacts()
+        viewModel.tools.loadSmsCount()
         viewModel.tools.loadVerificationCodes()
     }
 
@@ -281,7 +278,11 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     Icon(Icons.Default.Refresh, "刷新", tint = palette.textSecondary)
                 }
             }
-            IconButton(onClick = { showSettingsDialog = true }) {
+            // 齿轮 → 独立的「短信设置」页面。
+            // 2026-09-08：这里原来是 `showSettingsDialog = true` 弹一个 UfiCustomDialog，
+            // 那个弹窗已连同它的状态一起删除 —— 拦截规则与拦截记录是两个各自带列表的二级页，
+            // 从弹窗里再弹一层窗口既没地方放、返回栈也说不清。不保留两个入口。
+            IconButton(onClick = { navController.navigate(Routes.DETAIL_SMS_SETTINGS) }) {
                 Icon(Icons.Default.Settings, "设置", tint = palette.textSecondary)
             }
         }
@@ -369,7 +370,28 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                             SmsConversationList(
                                                 contacts = toolsState.smsContacts,
                                                 listState = contactsListState,
-                                                viewModel = viewModel
+                                                viewModel = viewModel,
+                                                // 设备短信条数：读不到（null）就整条不画。
+                                                // 不给「—」占位 —— 一条常驻的空信息行正是要避免的东西。
+                                                deviceSmsTotal = toolsState.smsCount?.total,
+                                                unreadTotal = unreadTotal,
+                                                onMarkAllRead = {
+                                                    scope.launch {
+                                                        // markAllSmsRead 内部成功后已经重拉联系人与 /count
+                                                        // （ToolsModule.kt:850-861），这里不要再补一次。
+                                                        val ok = viewModel.tools.markAllSmsRead()
+                                                        toastMessage = if (ok) ToastMessage("已全部标为已读", ToastType.SUCCESS)
+                                                        else ToastMessage("操作失败，请重试", ToastType.ERROR)
+                                                    }
+                                                },
+                                                onMarkRead = { phone ->
+                                                    scope.launch {
+                                                        val ok = viewModel.tools.markConversationRead(phone)
+                                                        toastMessage = if (ok) ToastMessage("已标记为已读", ToastType.SUCCESS)
+                                                        else ToastMessage("操作失败，请重试", ToastType.ERROR)
+                                                    }
+                                                },
+                                                onRequestBlacklist = { pendingBlacklistPhone = it }
                                             )
                                         }
                                         // 首屏骨架：从未加载过且列表为空。
@@ -388,10 +410,13 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                         // 不画空态也不画骨架，等聚合结果到位（原逻辑保留）。
                                         toolsState.smsList.isNotEmpty() -> Unit
                                         else -> {
+                                            // fillMaxSize 是必须的：空态版式（96dp 圆底图标 + 两级文字）
+                                            // 靠调用方给高度才能在可视区里居中，不给就只按内容高度贴在顶部。
                                             UfiEmptyState(
                                                 icon = Icons.Default.ChatBubbleOutline,
                                                 message = "暂无短信",
-                                                hint = "点击右下角按钮发送新短信"
+                                                hint = "点击右下角按钮发送新短信",
+                                                modifier = Modifier.fillMaxSize()
                                             )
                                         }
                                     }
@@ -598,90 +623,35 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // ── SMS 设置对话框 ──
-    // 容量只在这个弹窗里显示，所以打开时才拉 —— 放页面级 LaunchedEffect 等于每次进短信页白跑一次。
-    LaunchedEffect(showSettingsDialog) {
-        if (showSettingsDialog) viewModel.tools.loadSmsCount()
-    }
-    if (showSettingsDialog) {
-        UfiCustomDialog(
+    // ── 会话行长按「加入黑名单」的二次确认 ──
+    // 文案必须把后果说全：这是「静默丢消息」的操作，用户点之前得知道它拦到什么程度、
+    // 以及历史短信不受影响（core 明确不做追溯，见设计文档「明确不做追溯」）。
+    pendingBlacklistPhone?.let { phone ->
+        UfiConfirmDialog(
             visible = true,
-            onDismiss = { showSettingsDialog = false },
-            title = "短信设置",
-            icon = rememberVectorPainter(Icons.Filled.Settings),
-            showCloseButton = false
-        ) {
-            UfiDialogBody {
-                // 弹窗内一律用 UfiDialog* 家族。原来这里混用了 UfiSettingsToggle / UfiSettingsValue /
-                // UfiInfoRow —— 那三个是「设置页卡片行」组件（bodyLarge 标题 + 24dp 前置图标 +
-                // KeyboardArrowRight），塞进弹窗后字号比同窗其它字段大一号，右箭头还会误导成
-                // 「点进下一页」（实际是就地改值 / 就地执行）。
-                Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
-                    UfiDialogSwitchField(
-                        label = "验证码自动解析",
-                        checked = toolsState.smsCodeEnabled,
-                        onCheckedChange = { viewModel.tools.setSmsCodeEnabled(it) }
-                    )
-                    Text(
-                        "自动识别新收到的验证码短信",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = palette.textSecondary
-                    )
-                }
-                if (toolsState.smsCodeEnabled) {
-                    // 原来是「一行 UfiSettingsValue 再叠一层 UfiSelectionDialog」——弹窗套弹窗。
-                    // 改成弹窗内联的 UfiOptionGrid（公共组件），与 DeviceControlScreen
-                    // 「WiFi 休眠」七档双栏同款，少一层窗口也少一次误触关错窗的机会。
-                    UfiDialogField(label = "自动清理间隔") {
-                        UfiOptionGrid(
-                            options = SMS_CODE_CLEANUP_OPTIONS.map { (value, label) ->
-                                UfiOptionItem(value = value, label = label)
-                            },
-                            selectedValue = toolsState.smsCodeCleanupHours.toString(),
-                            onSelect = { viewModel.tools.setSmsCodeCleanupHours(it.toInt()) },
-                            columns = 2
-                        )
-                    }
-                }
-                // 「短信转发」入口已迁到 设置 → 通知与守护 → 邮件通知
-                // （功能范围从"只转短信"扩到"转所有通知场景"，不再只属于短信页）。
-
-                // 设备短信容量（GET /api/sms/count）。只在读到过时画：读失败不留占位，
-                // 更不能拿联系人未读求和去凑一个偏小的数字冒充全局口径。
-                toolsState.smsCount?.let { c ->
-                    UfiDialogInfoRow("设备短信条数", "${c.total} 条 · ${c.unread} 条未读")
-                }
-
-                // 一次性动作，不是开关也不是跳转：走按钮而不是「行 + 右箭头」。
-                // 未读为 0 时禁用 —— 没有未读还发一次请求纯属白跑。
-                // 未读数优先取 /count 的全局值，它没读到才回落联系人求和（会偏小）。
-                val unreadTotal = toolsState.smsCount?.unread
-                    ?: toolsState.smsContacts.sumOf { it.unread }
-                UfiDialogField(label = "未读短信") {
-                    UfiButton(
-                        variant = UfiButtonVariant.Secondary,
-                        text = if (unreadTotal > 0) "全部标为已读（$unreadTotal 条）" else "无未读短信",
-                        enabled = unreadTotal > 0,
-                        onClick = {
-                            showSettingsDialog = false
-                            scope.launch {
-                                val ok = viewModel.tools.markAllSmsRead()
-                                toastMessage = if (ok) ToastMessage("已全部标为已读", ToastType.SUCCESS)
-                                else ToastMessage("操作失败，请重试", ToastType.ERROR)
-                            }
-                        }
-                    )
+            title = "加入黑名单",
+            text = "该号码之后的短信不再提醒、不再转发，也不会出现在列表里，" +
+                "可在「短信设置 → 已拦截」中查看。已收到的历史短信不受影响。",
+            confirmText = "加入黑名单",
+            destructive = true,
+            onDismiss = { pendingBlacklistPhone = null },
+            onConfirm = {
+                pendingBlacklistPhone = null
+                scope.launch {
+                    // 规则形态固定 scope=sender / match=equals，由 ViewModel 负责，
+                    // app 这一层只负责"用户按了确认"这件事。
+                    val ok = viewModel.tools.addSmsSenderBlacklist(phone)
+                    toastMessage = if (ok) ToastMessage("已把 $phone 加入黑名单", ToastType.SUCCESS)
+                    else ToastMessage("加入黑名单失败，请重试", ToastType.ERROR)
                 }
             }
-            // 右上角关闭按钮换成底部标准动作条：与验证码详情弹窗一致，全部走公共组件。
-            UfiDialogActions(
-                onDismiss = { showSettingsDialog = false },
-                onConfirm = { showSettingsDialog = false },
-                confirmText = "完成",
-                dismissText = null
-            )
-        }
+        )
     }
+
+    // 2026-09-08：原来这里是「短信设置」UfiCustomDialog（含验证码开关 / 清理间隔 / 设备短信
+    // 条数 / 全部标为已读）+ 一个「打开时才拉 /api/sms/count」的 LaunchedEffect。
+    // 整段已搬到独立页面 SmsSettingsScreen（齿轮改为 navigate），弹窗与状态一并删除 ——
+    // 同一个设置留两个入口，改了一边另一边就是错的。
 }
 
 // ═══════════════════════════════════════════════
@@ -696,12 +666,24 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
  * 转场一开始 Tab 栏就被移除，内容区高度突然抽高一截，于是看到"抽搐"。
  * 现在切换整体上提到 SmsScreen 的根 AnimatedContent：对话页是覆盖整屏的另一层，
  * 列表层（含 Tab 栏）作为一个整体平移出去，中途没有任何节点增删，高度恒定。
+ *
+ * @param deviceSmsTotal 设备短信总条数。**为 null 时整条信息行不渲染** —— 读不到就别占位，
+ *        更不要在列表上方留一条常驻空行。
+ * @param unreadTotal 未读总数（口径见调用点）。> 0 时信息行才出现「全部标为已读」动作。
  */
 @Composable
 private fun SmsConversationList(
     contacts: List<SmsContact>,
     listState: LazyListState,
-    viewModel: MainViewModel
+    viewModel: MainViewModel,
+    deviceSmsTotal: Int?,
+    unreadTotal: Int,
+    /** 信息行的「全部标为已读」：结果由屏幕层弹 Toast。 */
+    onMarkAllRead: () -> Unit,
+    /** 长按菜单「标记已读」：整段会话标已读，结果由屏幕层弹 Toast。 */
+    onMarkRead: (String) -> Unit,
+    /** 长按菜单「加入黑名单」：只上报意图，二次确认与写入在屏幕层做。 */
+    onRequestBlacklist: (String) -> Unit
 ) {
     // ── 懒加载 = 渐进渲染（不是真分页）────────────────────────────────────────────
     // 依据：会话列表来自 `GET /api/sms/contacts`（RootSmsRoutes.kt），后端按号码聚合后
@@ -730,10 +712,44 @@ private fun SmsConversationList(
         contentPadding = PaddingValues(horizontal = Spacing.CardHorizontalMargin, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        // ── 设备短信信息行（2026-09-08 从短信设置页「其它」分组搬来）─────────────────
+        // 放在 LazyColumn **里面**当第一个 item，而不是列表外面的固定行：
+        // 用户明确说了「不要常驻」——往下翻会话时它跟着滚出视口，回到顶部又能看到。
+        // 固定在列表外等于永久占掉一条高度，正是被否掉的那个形态。
+        //
+        // 用 [UfiStatusCard] 而不是 [UfiSectionHeader]：它就是「一行式某某当前状态 +
+        // trailing 动作槽」——条数进状态徽标、未读进副文案、动作进 trailing，三样都有位置；
+        // UfiSectionHeader 只有标题 + trailing，条数和未读得挤进同一个标题字符串里。
+        // 也不手搓 Surface + Row：那会顶高 checkLiteralBaseline 的 dp / m3 两个类别。
+        if (deviceSmsTotal != null) {
+            item(key = "device-sms-info") {
+                UfiStatusCard(
+                    title = "设备短信",
+                    statusText = "$deviceSmsTotal 条",
+                    // 有未读才用 WARNING 让徽标亮起来；全读完是常态，常态不该是彩色。
+                    statusType = if (unreadTotal > 0) UfiBadgeType.WARNING else UfiBadgeType.DEFAULT,
+                    subtitle = if (unreadTotal > 0) "$unreadTotal 条未读" else "没有未读短信",
+                    // 「全部标为已读」只在真有未读时出现。不做"常驻但置灰"——
+                    // 一个永远点不动的按钮比没有这个按钮更让人困惑。
+                    trailing = if (unreadTotal > 0) {
+                        {
+                            UfiButton(
+                                text = "全部已读",
+                                onClick = onMarkAllRead,
+                                variant = UfiButtonVariant.Secondary,
+                                size = UfiButtonSize.Small
+                            )
+                        }
+                    } else null
+                )
+            }
+        }
         items(rendered, key = { it.phoneNumber }) { contact ->
             SmsConversationRow(
                 contact = contact,
-                onClick = { viewModel.tools.openConversation(contact.phoneNumber) }
+                onClick = { viewModel.tools.openConversation(contact.phoneNumber) },
+                onMarkRead = { onMarkRead(contact.phoneNumber) },
+                onRequestBlacklist = { onRequestBlacklist(contact.phoneNumber) }
             )
         }
         // 2026-09-04 删掉尾部 `item("render-footer") { UfiSkeletonListItem() }`：
@@ -746,23 +762,65 @@ private fun SmsConversationList(
 // 单条会话行 — 扁平设计，参考 Google Messages
 // ═══════════════════════════════════════════════
 
+/**
+ * 单条会话行。
+ *
+ * 2026-09-08 加长按菜单：**直接复用消息气泡那一套范式**（见 [ChatBubbleRow]）——
+ * `combinedClickable` 取长按 + `onGloballyPositioned { boundsInWindow() }` 采锚点 +
+ * [UfiPopupMenu]。不要退回 M3 原生 `DropdownMenu`：它在部分机型不继承自定义 colorScheme
+ * 会出现白底（那正是 UfiPopupMenu 存在的原因）。
+ *
+ * 全仓没有 swipe-to-action 组件，所以行内动作走长按菜单而不是侧滑。
+ *
+ * 菜单里**没有「删除会话」**：core 只有 `POST /api/sms/delete`（按单条 id 删），
+ * 没有按号码整段删的端点。在 app 侧先拉全部消息再逐条删属于业务编排，
+ * 按「core 负责业务、app 只做展示」的分工不该写在这里。
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun SmsConversationRow(
     contact: SmsContact,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onMarkRead: () -> Unit,
+    onRequestBlacklist: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
     val hasUnread = contact.unread > 0
     val cardShape = UfiCardDefaults.dialogShape
+    var showActions by remember { mutableStateOf(false) }
+    // UfiPopupMenu 的定位需要锚点在窗口中的矩形；长按点用整行的几何中心
+    // （combinedClickable 不暴露长按 offset，气泡与文件管理器 FileRowCard 也是这么取的）
+    var rowBounds by remember { mutableStateOf(IntRect.Zero) }
+    var longPressPoint by remember { mutableStateOf(IntOffset.Zero) }
 
+    Box(
+        modifier = Modifier.onGloballyPositioned { coords ->
+            val r = coords.boundsInWindow()
+            rowBounds = IntRect(
+                r.left.roundToInt(), r.top.roundToInt(),
+                r.right.roundToInt(), r.bottom.roundToInt()
+            )
+        }
+    ) {
     Surface(
-        onClick = onClick,
         shape = cardShape,
         color = palette.cardBg,
         modifier = Modifier
             .fillMaxWidth()
             .ufiCardShadow(elevation = 3.dp, shape = cardShape)
             .border(1.dp, palette.divider.copy(alpha = 0.4f), cardShape)
+            // 从 `Surface(onClick = …)` 改成 combinedClickable：那个重载只有单击，
+            // 挂不上长按。点击行为保持不变（打开会话）。
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = {
+                    longPressPoint = IntOffset(
+                        (rowBounds.left + rowBounds.right) / 2,
+                        (rowBounds.top + rowBounds.bottom) / 2
+                    )
+                    showActions = true
+                }
+            )
     ) {
         Row(
             modifier = Modifier
@@ -873,6 +931,56 @@ private fun SmsConversationRow(
                 }
             }
         }
+    }
+
+        UfiPopupMenu(
+            visible = showActions,
+            onDismiss = { showActions = false },
+            anchorBounds = rowBounds,
+            anchorPoint = longPressPoint,
+            options = buildList {
+                add(
+                    UfiPopupOption(
+                        id = "open",
+                        label = "打开会话",
+                        icon = Icons.Default.ChatBubbleOutline,
+                        onClick = {
+                            onClick()
+                            showActions = false
+                        }
+                    )
+                )
+                // 没有未读时不给这一项：点了也是白发一次请求。
+                if (hasUnread) {
+                    add(
+                        UfiPopupOption(
+                            id = "read",
+                            label = "标记已读",
+                            icon = Icons.Default.DoneAll,
+                            onClick = {
+                                onMarkRead()
+                                showActions = false
+                            }
+                        )
+                    )
+                }
+                add(UfiPopupOption.divider())
+                add(
+                    UfiPopupOption(
+                        id = "blacklist",
+                        label = "加入黑名单",
+                        icon = Icons.Default.Block,
+                        isDestructive = true,
+                        onClick = {
+                            // 只上报意图：拦截是「静默丢消息」的操作，必须先过二次确认，
+                            // 确认弹窗与写入都在屏幕层（见 pendingBlacklistPhone）。
+                            onRequestBlacklist()
+                            showActions = false
+                        }
+                    )
+                )
+            }
+        )
     }
 }
 
@@ -1142,28 +1250,30 @@ private val CONVERSATION_SKELETON_WIDTHS = listOf(0.62f, 0.45f, 0.70f, 0.50f, 0.
 /**
  * 「首屏是否还没出过结果」闩锁：返回 true = 该画骨架；false = 已经落地过一次，永久不再画。
  *
- * 三个信号都用 lambda 传进来（而不是传 Boolean 值）：本函数只在首次组合时启动一个
+ * [loaded] 用 lambda 传进来（而不是传 Boolean 值）：本函数只在首次组合时启动一个
  * `LaunchedEffect(Unit)`，lambda 里读的是 collectAsState 那个稳定 State 实例，
  * 所以协程里能一直拿到最新值，而不是被首帧的值冻住。
  *
- * 判据：拿到数据 / 报错 / 观察到一次 loading 由 true 落回 false —— 任一成立即视为"出过结果"。
- * 三条一起判是为了不依赖单一信号：轮询/缓存命中可能让 loading 那一下快到观察不到，
- * 那时 hasData 会兜住；空结果则由 loading 边沿兜住。
+ * 判据是 ViewModel 侧给的「这份数据已完成过一次加载尝试」（成功 / 失败都算），
+ * 而**不是**去嗅 loading 的 true→false 边沿。
+ * 2026-09-08 事故：上一版靠 `loading / hasData / failed` 三个信号里的边沿判断，
+ * 验证码那份数据的 loading 从来没被置 true、失败又被静默吞掉 —— 三条全不动，
+ * `first {}` 永不返回、`settled` 永远是 false，页面永久停在骨架上，
+ * "暂无验证码通知"空态成了不可达代码。落地信号是单调的（只 false→true），
+ * 不存在"边沿被 snapshot 合并掉"这类问题。
+ *
+ * `remember` 的初值直接读一次 [loaded]：重进页面时 VM 里的数据还在，
+ * 不该为了等一帧 LaunchedEffect 再闪一下骨架。
+ *
+ * 2026-09-08 从 `private` 放宽到 `internal`：同包的 [SmsFilterRulesScreen] 与
+ * [SmsBlockedScreen] 也要用它（两个列表各一份闩锁）。Kotlin 的 `private` 是文件级可见性，
+ * 同包不同文件调不到；复制一份出去等于让"骨架判据"出现第二种实现。
  */
 @Composable
-private fun rememberFirstLoadPending(
-    loading: () -> Boolean,
-    hasData: () -> Boolean,
-    failed: () -> Boolean
-): Boolean {
-    var settled by remember { mutableStateOf(false) }
+internal fun rememberFirstLoadPending(loaded: () -> Boolean): Boolean {
+    var settled by remember { mutableStateOf(loaded()) }
     LaunchedEffect(Unit) {
-        var sawLoading = false
-        snapshotFlow { Triple(loading(), hasData(), failed()) }
-            .first { (isLoading, ok, err) ->
-                if (isLoading) sawLoading = true
-                ok || err || (sawLoading && !isLoading)
-            }
+        snapshotFlow { loaded() }.first { it }
         settled = true
     }
     return !settled
@@ -1545,32 +1655,19 @@ private fun VerificationCodePanel(
 
     if (!enabled) {
         // 功能未开启：引导卡片
-        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.padding(32.dp)
-            ) {
-                Icon(
-                    Icons.Default.VerifiedUser,
-                    null,
-                    modifier = Modifier.size(48.dp),
-                    tint = palette.accent.copy(alpha = 0.7f)
-                )
-                Spacer(Modifier.height(Spacing.Large))
-                Text("验证码自动解析", style = MaterialTheme.typography.titleMedium, color = palette.textPrimary)
-                Spacer(Modifier.height(Spacing.Medium))
-                Text(
-                    "开启后，新收到的验证码短信将自动识别并显示在这里，方便快速复制。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary,
-                    textAlign = TextAlign.Center
-                )
-                Spacer(Modifier.height(Spacing.XLarge))
+        // 「功能未开启」引导也走 [UfiEmptyState]（action 槽位放开启按钮）：
+        // 它与下面的「暂无验证码通知」是同一个 Tab 的两种空，版式不一致会让人以为进错了页面。
+        UfiEmptyState(
+            icon = Icons.Default.VerifiedUser,
+            message = "验证码自动解析",
+            hint = "开启后，新收到的验证码短信将自动识别并显示在这里，方便快速复制。",
+            modifier = Modifier.fillMaxSize(),
+            action = {
                 FilledTonalButton(onClick = onEnable) {
                     Text("开启功能")
                 }
             }
-        }
+        )
         return
     }
 
@@ -1588,7 +1685,8 @@ private fun VerificationCodePanel(
         UfiEmptyState(
             icon = Icons.Default.NotificationsNone,
             message = "暂无验证码通知",
-            hint = "新收到的验证码短信将自动显示在这里"
+            hint = "新收到的验证码短信将自动显示在这里",
+            modifier = Modifier.fillMaxSize()
         )
         return
     }

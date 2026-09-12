@@ -193,9 +193,11 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                     checked = state.tunnelNotifyOnFailure,
                     onCheckedChange = { on ->
                         viewModel.tunnel.setNotifyOnFailure(on)
-                        // 只检测总闸；通知权限本身已由「系统通知推送」那一处统一接管，不在这里重复检测
+                        // 只检测全局总闸；通知权限本身已由「系统通知推送」那一处统一接管，不在这里重复检测。
+                        // 2026-09-08：判据由 KEY_ALERT_NOTIF 改为 KEY_NOTIFY_MASTER —— 隧道通知
+                        // 现在有自己的分类键（KEY_TUNNEL_NOTIF），不再借用告警键。
                         if (on && !NotifyPrefs.switchOn(
-                                context, NotificationCenter.KEY_ALERT_NOTIF, false
+                                context, NotificationCenter.KEY_NOTIFY_MASTER, false
                             )
                         ) {
                             toastMessage = ToastMessage(
@@ -210,16 +212,16 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                 UfiDivider()
                 UfiSettingsToggle(
                     title = "断开自动重连",
-                    description = "进程意外退出后按下方间隔自动拉起；后端服务重启也会恢复上次在跑的隧道。" +
-                        "连续失败 ${state.tunnelMaxReconnectAttempts} 次后停手，等手动处理。" +
-                        "手动点过“停止”的隧道不会被拉起。",
+                    description = "隧道意外中断后按下方间隔自动重连；设备端服务重启后也会恢复上次运行中的隧道。" +
+                        "连续失败 ${state.tunnelMaxReconnectAttempts} 次后停止重试，需手动恢复。" +
+                        "手动停止过的隧道不会自动重连。",
                     checked = state.tunnelAutoReconnect,
                     onCheckedChange = { viewModel.tunnel.setAutoReconnect(it) }
                 )
                 UfiDivider()
                 UfiSettingsItem(
                     title = "巡检间隔",
-                    description = "看护协程多久检查一次隧道是否还活着",
+                    description = "多久检查一次隧道是否正常",
                     enabled = state.tunnelAutoReconnect
                 )
                 UfiSlider(

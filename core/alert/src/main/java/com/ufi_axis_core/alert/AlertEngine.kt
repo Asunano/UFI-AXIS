@@ -3,6 +3,12 @@ package com.ufi_axis_core.alert
 import com.ufi_axis_core.core.database.AlertDao
 import com.ufi_axis_core.core.database.AlertRecord
 import com.ufi_axis_core.api.websocket.WebSocketManager
+import com.ufi_axis_core.contract.Alerts
+import com.ufi_axis_core.notify.NotifyEvent
+import com.ufi_axis_core.notify.NotifyLevel
+import com.ufi_axis_core.notify.NotifyScenes
+import com.ufi_axis_core.notify.Notifier
+import com.ufi_axis_core.notify.PushChannel
 import com.ufi_axis_core.util.*
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -28,15 +34,14 @@ import kotlinx.serialization.Serializable
  * - 状态变化检测（2026-08-11 P1-E 补丁）: connectivity 仅在 online↔offline 切换时触发，
  *   避免周期采集反复触发"网络已恢复"告警堆叠（WiFi 抖动场景下每分钟一条堆积 50 条）
  * - 分级: info / warning / critical
- * - 推送到手机端 (WebSocket)
+ * - 投递（WS 推送 + 邮件）统一交给 [NotificationDispatcher]（见 [attachNotifier]）
  * - SQLite 持久化
  * - 系统通知推送由手机端 NotificationCenter 统一负责（device 端仅入库 + 广播，避免双进程重复弹通知）
  */
 class AlertEngine(
     private val alertDao: AlertDao,
     private val webSocketManager: WebSocketManager,
-    private val appSettings: AppSettings,
-    private val pushService: NotificationPushService
+    private val appSettings: AppSettings
 ) {
     private val tag = "AlertEngine"
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -64,44 +69,100 @@ class AlertEngine(
     @Volatile var lastBroadcast: Map<String, Any?>? = null
 
     /**
-     * 邮件投递钩子（由 `ComponentFactory` 装配到 `SmsForwardController.sendSceneNotification`）。
+     * 通知投递钩子（装配层接到 `NotificationDispatcher::emit`）。
      *
      * 2026-08-31 加：在此之前告警邮件的**唯一**生产者是 app —— app 收到 WS 推送 → 弹系统通知 →
-     * 回传 `/api/sms-forward/notify` 让 core 发信。于是 app 没连上（或没装）时，温度/电量/信号/
-     * 流量/离线告警一封邮件都发不出来，与"邮件通知是 core 的独立能力"的初衷相反。
-     * 现在 core 自己在告警落库的同一处发信；app 侧对应场景的 `mailForward` 已关，避免一条两封。
+     * 再回传给 core 发信。于是 app 没连上（或没装）时，温度/电量/信号/流量/离线告警一封邮件都发
+     * 不出来，与"邮件通知是 core 的独立能力"的初衷相反。那条回传端点已于 2026-09-10 删除。
      *
-     * 只在**新告警行插入**时调用（聚合累加不发），否则稳态超标会变成邮件轰炸。
+     * 2026-09-08 阶段 1：原来这里是一个 5 参数的**邮件专用**钩子（type/level/message/value/
+     * threshold），推送则是另一条路（构造参数里的 `pushService`）—— 同一件事两个出口，
+     * 加第三个渠道要再缝一遍。现在只有这一个钩子，推送与邮件都由分发器的渠道列表决定。
+     *
+     * 总开关与免打扰不在这里判 —— 闸门在分发器，这里判一遍就成了两份真源。
      */
     @Volatile
-    private var mailForwarder: (suspend (type: String, level: String, message: String, value: String, threshold: String) -> Unit)? = null
+    private var notifier: Notifier? = null
 
-    /** 装配邮件投递钩子；传 null 解除。装配时机不限（与 `attachConditionEngine` 同风格）。 */
-    fun attachMailForwarder(
-        forwarder: (suspend (type: String, level: String, message: String, value: String, threshold: String) -> Unit)?
-    ) {
-        mailForwarder = forwarder
-        AppLogger.i(tag, "Alert mail forwarder ${if (forwarder != null) "attached" else "detached"}")
+    /** 装配通知钩子；传 null 解除。装配时机不限（与 `attachConditionEngine` 同风格）。 */
+    fun attachNotifier(n: Notifier?) {
+        notifier = n
+        AppLogger.i(tag, "Alert notifier ${if (n != null) "attached" else "detached"}")
     }
 
     /**
-     * 把新告警交给邮件钩子。失败只落日志：邮件发不出去不能影响告警入库/广播。
-     * `notifyEnabled=false` 表示用户关掉了投递（只记录不打扰），邮件同样不发。
+     * 把一条告警交给分发器。失败只落日志：投递发不出去不能影响告警入库/广播。
+     *
+     * @param channels 限定渠道（null = 全部）。**聚合更新必须限定成只推送** ——
+     *   见 [triggerAlert] 里那条注释。
      */
-    private suspend fun forwardAlertMail(
+    private suspend fun emitAlert(
         type: String,
         level: String,
         message: String,
         value: String,
-        threshold: String
+        threshold: String,
+        alertId: Long,
+        aggregated: Boolean,
+        channels: Set<String>?
     ) {
-        val forwarder = mailForwarder ?: return
-        if (!_config.value.notifyEnabled) return
+        val emit = notifier ?: return
         try {
-            forwarder(type, level, message, value, threshold)
+            emit(
+                NotifyEvent(
+                    scene = sceneOf(type),
+                    // 推送 type 必须是**具体告警类型**（temperature / connectivity / …），
+                    // 不是 sceneOf 归并后的那一格 —— app 的 `:ufi_notify` 靠它重建
+                    // AlertRecord、web 靠它筛选与配色。两者粒度不同，见 NotifyEvent.type。
+                    type = type,
+                    level = NotifyLevel.fromWire(level),
+                    // title 走告警文案本身：**邮件主题**要看得出发生了什么，
+                    // 放固定词等于收件箱里一排一模一样的标题。
+                    title = message,
+                    // 推送那一侧仍是固定串「设备告警」——那是线上契约里的既有取值，
+                    // `alert` topic 上还有 web 与 app 主进程 UI 在消费同一份 payload，
+                    // 它们是否渲染 title 未逐一核实，所以不跟着邮件主题一起变。见 [PUSH_TITLE]。
+                    pushTitle = PUSH_TITLE,
+                    // body → PushNotification.message，**必须仍是告警文案**：
+                    // app 就是拿它当 `AlertRecord.message` 的。详情走 meta，不塞正文。
+                    body = message,
+                    meta = listOf(
+                        "告警类型" to type,
+                        "级别" to level,
+                        "当前值" to value,
+                        "阈值" to threshold
+                    ),
+                    extra = mapOf(
+                        "id" to alertId.toString(),
+                        "value" to value,
+                        "threshold" to threshold,
+                        "aggregated" to aggregated.toString()
+                    ),
+                    channels = channels
+                )
+            )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            AppLogger.w(tag, "Alert mail forward failed: ${e.javaClass.simpleName}: ${e.message}")
+            AppLogger.w(tag, "Alert notify failed: ${e.javaClass.simpleName}: ${e.message}")
         }
+    }
+
+    /**
+     * 「告警 type → 通知场景」的映射表。
+     *
+     * 2026-09-08 从 `ComponentFactory` 搬进来：装配层不该替告警引擎翻译自己的 type ——
+     * 新增一个 type 时该改的地方就在这个文件里，而不是在一层之外的 lambda 里。
+     *
+     * 未登记的 type 归 [NotifyScenes.ALERT]（阈值告警是默认族），所以漏登记的后果是
+     * "归到阈值告警场景"而不是"通知发不出去"。
+     */
+    private fun sceneOf(type: String): String = when (type) {
+        "connectivity" -> NotifyScenes.CONNECTIVITY
+        // 套餐限额百分比预警自成一个场景（≠ 绝对 MB 阈值告警）
+        "traffic_limit" -> NotifyScenes.TRAFFIC_80
+        "device_online", "device_offline" -> NotifyScenes.EVENTS
+        else -> NotifyScenes.ALERT
     }
 
     // P1-E 补丁（2026-08-11）：connectivity 上次网络状态记忆（防止周期采集重复触发"网络已恢复"告警）
@@ -120,7 +181,7 @@ class AlertEngine(
 
     // 告警配置
     // ════════════ 多端同步真源约定（P2 核心） ════════════
-    // - enabled / notifyEnabled / perType / 阈值 等全部以 core 端 SharedPreferences 为唯一权威。
+    // - enabled / perType / 阈值 等全部以 core 端 SharedPreferences 为唯一权威。
     // - 手机端只是镜像：连接 core 即 GET /config 拉取；仅用户「显式切换」时才 PUT（带 configVersion）。
     // - 严禁「连接即写默认 enabled=true」——这是 ab 设备回弹的根因，已清除。
     // - configVersion 单调递增守门：旧版本 PUT 返回 409，调用方须 GET 最新后重试。
@@ -130,16 +191,14 @@ class AlertEngine(
         // 2026-09-07：默认 false（用户要求告警不默认开启）。与 app 侧
         // `com.ufi_axis.data.model.AlertConfig.enabled` / UI 兜底 `?: false` 逐字一致。
         val enabled: Boolean = false,
-        // ── 投递开关：true 时仍记录，但允许向用户投递（in-app banner + 系统通知） ──
-        val notifyEnabled: Boolean = true,
         // ── 分类开关：type -> 是否启用该类型告警（缺键视为**关闭**，见 typeEnabled） ──
         val perType: Map<String, Boolean> = emptyMap(),
         // ── 同 (type,level) 最小聚合间隔秒（窗口内只累加 count，不新插入） ──
         val minIntervalSec: Int = 1800,
-        // ── 仅状态跃迁触发（true 时电平持续超标不再反复触发） ──
-        val edgeTriggeredOnly: Boolean = true,
-        // ── 环形上限：保留最近 N 条 ──
-        val maxRows: Int = 2000,
+        // 2026-09-07 删除两个假开关：
+        // - `edgeTriggeredOnly`：只被持久化/同步，引擎从来不读它 —— 无论真假都一律走 evaluate() 边沿触发；
+        // - `maxRows`：同样从来不读，环形裁剪写死用 MAX_ALERT_ROWS。
+        // 留着只会让人以为改了有效果。真要做成可配，得先让 triggerAlert 读它。
         // ── 多端同步版本号（单调递增；PUT 守门用） ──
         val configVersion: Long = 1L,
         // ── 阈值（保持向后兼容） ──
@@ -189,17 +248,46 @@ class AlertEngine(
      * 从 SharedPreferences 加载告警配置
      */
     private fun loadConfig(): AlertConfig {
-        val json = appSettings.alertConfigJson
-        return if (json != null) {
-            try {
-                Json.decodeFromString<AlertConfig>(json)
-            } catch (e: Exception) {
-                AppLogger.w(tag, "Failed to parse alert config, using defaults: ${e.message}")
-                AlertConfig()
-            }
-        } else {
-            AlertConfig()
+        val json = appSettings.alertConfigJson ?: return AlertConfig()
+        val parsed = try {
+            // 必须用 ConfigJson（ignoreUnknownKeys=true），不能用裸 Json：
+            // 裸 Json 严格模式下，任何一次字段增删都会让**已存在的整份配置**解析失败，
+            // 落到下面的 catch 里静默重置成默认值 —— 用户的告警开关与阈值一起丢。
+            ConfigJson.decodeFromString(AlertConfig.serializer(), json)
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Failed to parse alert config, using defaults: ${e.message}")
+            return AlertConfig()
         }
+        return migrateLegacyConfig(json, parsed)
+    }
+
+    /**
+     * 一次性迁移：把旧版写下的配置按**旧语义**补齐 `enabled` / `perType`。
+     *
+     * 旧版本用裸 `Json`（`encodeDefaults=false`）持久化，等于默认值的字段根本不落盘；
+     * 而当时 `enabled` 默认 **true**、`typeEnabled` 的判据是 `!= false`（缺键=开）。
+     * 2026-09-07 把默认改成 false、判据改成 `== true` 之后，这些旧配置重新解析出来
+     * 就变成「引擎关 + 所有分类关」—— 用户没动过任何开关，告警却全哑了。
+     *
+     * 判据只看 JSON 里有没有 `enabled` 键：现在写盘一律 `encodeDefaults=true`，
+     * 所以缺这个键 ⇔ 这份配置是旧版写的。迁移后立即回写，因此只会发生一次。
+     */
+    private fun migrateLegacyConfig(rawJson: String, parsed: AlertConfig): AlertConfig {
+        val keys = try {
+            ConfigJson.parseToJsonElement(rawJson).jsonObject.keys
+        } catch (e: Exception) {
+            return parsed
+        }
+        if ("enabled" in keys) return parsed
+        val migrated = parsed.copy(
+            enabled = true,
+            // 旧语义下缺键=该类型开启，所以先把全部类型铺成 true，再让存下来的键覆盖 ——
+            // 用户在旧版里显式关掉的那几类仍然是 false。
+            perType = Alerts.Type.ALL.associateWith { true } + parsed.perType
+        )
+        appSettings.alertConfigJson = ConfigJson.encodeToString(AlertConfig.serializer(), migrated)
+        AppLogger.w(tag, "旧版告警配置缺少 enabled 键，按旧语义迁移为开启（perType 补齐 ${migrated.perType.size} 项）")
+        return migrated
     }
 
     /**
@@ -209,7 +297,7 @@ class AlertEngine(
      */
     fun updateConfig(newConfig: AlertConfig) {
         _config.value = newConfig
-        appSettings.alertConfigJson = Json.encodeToString(AlertConfig.serializer(), newConfig)
+        appSettings.alertConfigJson = ConfigJson.encodeToString(AlertConfig.serializer(), newConfig)
         AppLogger.i(tag, "Alert config updated and persisted")
     }
 
@@ -227,7 +315,7 @@ class AlertEngine(
         }
         val bumped = incoming.copy(configVersion = current.configVersion + 1)
         _config.value = bumped
-        appSettings.alertConfigJson = Json.encodeToString(AlertConfig.serializer(), bumped)
+        appSettings.alertConfigJson = ConfigJson.encodeToString(AlertConfig.serializer(), bumped)
         AppLogger.i(tag, "Alert config replaced (v${bumped.configVersion}) and persisted")
         return bumped
     }
@@ -238,6 +326,17 @@ class AlertEngine(
     fun getConfig(): AlertConfig = _config.value
 
     companion object {
+        /**
+         * 告警**推送**的固定标题（`PushNotification.title`）。
+         *
+         * 与 [NotifyEvent.title]（= 告警文案）刻意不同：邮件主题要看得出发生了什么，
+         * 而推送的 title 是**线上契约里的既有取值**，逐字保持不变。
+         * app 的 `NotifyService` 确实不读它（它从 type/level/message/extra 重建 `AlertRecord`），
+         * 但 `alert` topic 上还有 web 与 app 主进程 UI 在消费同一份 payload，
+         * 是否渲染 title 未逐一核实 —— 契约字段不做"顺手改良"。
+         */
+        private const val PUSH_TITLE = "设备告警"
+
         /**
          * 告警配置对外（HTTP 响应 / WS 广播 / 合并基线）的序列化器。
          *
@@ -598,17 +697,16 @@ class AlertEngine(
         val bumped = alertDao.bumpExisting(type, level, now)
         if (bumped > 0 && existing != null) {
             AppLogger.i(tag, "Alert aggregated: [$level] $message (count++)")
-            // 2026-08-25：通过新公共组件 NotificationPushService 推送详情，前端无需再拉取列表
-            pushService.pushAlert(
-                type = type,
-                level = level,
-                message = message,
-                extra = mapOf(
-                    "id" to existing.id.toString(),
-                    "value" to value,
-                    "threshold" to threshold,
-                    "aggregated" to "true"
-                )
+            // **只推送、不发邮件**：聚合意味着"同一件事又发生了一次"，前端要靠它把 badge 数字
+            // 往上加，但邮件不能跟着发 —— 稳态持续超标会变成邮件轰炸（这是 2026-08-31
+            // 加邮件钩子时就定下的语义，接分发器不能把它丢掉）。
+            // 限定渠道而不是"这里不调 notifier"：将来加 Webhook / 短信渠道时，
+            // "聚合只走实时渠道"这条语义会自动跟着 channels 走，不需要再各处判一遍。
+            emitAlert(
+                type = type, level = level, message = message,
+                value = value, threshold = threshold,
+                alertId = existing.id, aggregated = true,
+                channels = setOf(PushChannel.ID)
             )
             return
         }
@@ -630,22 +728,14 @@ class AlertEngine(
         alertDao.trimTo(MAX_ALERT_ROWS)
 
         AppLogger.i(tag, "Alert triggered & stored: [$level] $message (id=$newId)")
-        
-        // 2026-08-25：通过新公共组件 NotificationPushService 推送详情
-        pushService.pushAlert(
-            type = type,
-            level = level,
-            message = message,
-            extra = mapOf(
-                "id" to newId.toString(),
-                "value" to value,
-                "threshold" to threshold,
-                "aggregated" to "false"
-            )
-        )
 
-        // 邮件投递：core 自己发，不依赖 app 是否在线（见 mailForwarder 注释）
-        forwardAlertMail(type, level, message, value, threshold)
+        // 新告警：投给**所有**已注册渠道（推送 + 邮件）。core 自己发，不依赖 app 是否在线。
+        emitAlert(
+            type = type, level = level, message = message,
+            value = value, threshold = threshold,
+            alertId = newId, aggregated = false,
+            channels = null
+        )
     }
 
     /**

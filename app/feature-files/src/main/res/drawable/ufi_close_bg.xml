@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 半透明黑底圆，用于视频预览右上角关闭按钮，保证在浅色画面上也清晰可见。 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="oval">
+    <solid android:color="#CC000000" />
+</shape>

@@ -127,12 +127,12 @@ watch(
   border-left: 3px solid transparent;
 }
 .log-item.log-success {
-  background: rgba(24, 160, 88, 0.06);
-  border-left-color: #18a058;
+  background: var(--success-light);
+  border-left-color: var(--success);
 }
 .log-item.log-fail {
-  background: rgba(208, 48, 80, 0.06);
-  border-left-color: #d03050;
+  background: var(--error-light);
+  border-left-color: var(--error);
 }
 .log-item-header {
   display: flex;
@@ -140,10 +140,10 @@ watch(
   gap: 6px;
 }
 .log-success .log-status-icon {
-  color: #18a058;
+  color: var(--success);
 }
 .log-fail .log-status-icon {
-  color: #d03050;
+  color: var(--error);
 }
 .log-time {
   font-size: 12px;

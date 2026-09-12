@@ -12,6 +12,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
+import com.ufi_axis.ui.theme.UfiMotion
 
 @Composable
 fun UfiFloatingActionButton(

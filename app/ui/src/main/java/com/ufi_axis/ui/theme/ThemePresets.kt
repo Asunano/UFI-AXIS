@@ -86,23 +86,28 @@ object ThemePresets {
      * 加回彩色皮肤后**它仍是出厂默认**（[DEFAULT_ID] 未变）—— 中性灰阶是"不选颜色"
      * 的那一档，用户没主动挑颜色时不该被塞一套彩色。
      *
-     * 注意 `accentDark = 0xFF555555` 刻意保留：它对 [cardBgDark]（0xFF2A2A2A）的对比度
-     * 只有约 1.9:1，所以**不能**拿它当图标色 —— 设置项图标已改读 `textPrimary`
-     * （见 `UfiSettingsItem`）。accent 在本仓的职责是"实底色块 / 进度条 / 选中填充"，
-     * 那些位置底下垫的是 accent 本身，不参与前景对比度判据。
+     * 2026-09-08 根治：本套的三个 accent 槽原先是**明暗方向搞反**的，这是"深色模式下
+     * 图标/文字发灰"的唯一根因，而不是某个页面写错了取色：
+     * - `accentDark` 原 0xFF555555 对 [cardBgDark]（0xFF2A2A2A）仅 **1.9:1**，
+     *   而全仓有 90+ 处把 accent 当前景（图标 tint / 文字 / 描边 / 圆环）；
+     * - `accentSecondaryDark` 原 0xFF555555 同样 1.9:1；
+     * - `accentSecondaryLight` 原 0xFFE5E5E5 对白卡仅 1.26:1（`FileIcon` 拿它当文件图标 tint）。
      *
-     * ⚠️ 已知遗留（本轮**未**修，改它会动到出厂观感）：`accentSecondaryLight`
-     * （0xFFE5E5E5，浅灰）对白卡只有 1.26:1，而 `FileIcon` 拿 `accentSecondary` 当文件
-     * 图标的 tint —— 也就是说默认皮肤下文件管理器的文件图标本来就偏淡。
-     * 6 套彩色皮肤的同一槽位实测 3.13~8.12:1，不存在这个问题。
+     * 6 套彩色皮肤遵循的约定是"accent 永远落在**当前明暗档的可读侧**"（深色态取亮色、
+     * 浅色态取深色），本套照该约定改正后，那 90+ 处前景**一次性全部合规**，
+     * 无需任何调用点改动 —— 这也是为什么这里不再需要"可读版 accent"派生槽。
+     *
+     * accent 变亮后它当**实底**时的前景必须翻黑，所以 `onAccentDark` / `onGradientDark` /
+     * `gradientMutedDark` 一并给出深墨值（与 amber / lime / emerald 三套同一处置）。
+     * 浅色态 accent 仍是 0xFF222222 深灰，故 `on*Light` 保持默认白。
      */
     val Default = ThemePalette(
         id = DEFAULT_ID,
         name = "默认",
         accentLight = Color(0xFF222222),
-        accentDark = Color(0xFF555555),
-        accentSecondaryLight = Color(0xFFE5E5E5),
-        accentSecondaryDark = Color(0xFF555555),
+        accentDark = Color(0xFFB0B0B0),
+        accentSecondaryLight = Color(0xFF5A5A5A),
+        accentSecondaryDark = Color(0xFFD9D9D9),
         pageBgLight = Color(0xFFF8F8F8),
         pageBgDark = Color(0xFF1A1A1A),
         cardBgLight = Color(0xFFFFFFFF),
@@ -114,7 +119,12 @@ object ThemePresets {
         dividerLight = Color(0xFFE5E5E5),
         dividerDark = Color(0xFF333333),
         iconTintLight = Color(0xFF111111),
-        iconTintDark = Color(0xFFEEEEEE)
+        iconTintDark = Color(0xFFEEEEEE),
+        // accent 深色态已翻亮（0xFFB0B0B0），压在它上面的前景必须翻黑，否则实底按钮/
+        // 渐变 Hero 卡会变成"白字压亮灰"。浅色态 accent 仍是深灰，故 on*Light 用默认白。
+        onAccentDark = Color(0xFF1A1A1A),
+        onGradientDark = Color(0xFF1A1A1A),
+        gradientMutedDark = Color(0xFF1A1A1A)
     )
 
     // ══════════════════════════════════════════════════════════════════════════

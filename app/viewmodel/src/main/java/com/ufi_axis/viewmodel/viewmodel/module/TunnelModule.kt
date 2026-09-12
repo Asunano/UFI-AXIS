@@ -30,12 +30,6 @@ class TunnelModule(
     private val _state = MutableStateFlow(TunnelState())
     val state: StateFlow<TunnelState> = _state.asStateFlow()
 
-    private val notificationCenter by lazy { com.ufi_axis.data.notification.NotificationCenter(appContext) }
-
-    /** 上一轮 /status 的实例状态，用于"变成失败了"的边沿检测（只在变化时发通知，不是每轮都发） */
-    private var lastFrpStatus: Map<String, String> = emptyMap()
-    private var lastCfStatus: Map<String, String> = emptyMap()
-
     private fun api() = RetrofitClient.getApiService(AppPreferences(appContext))
 
     // ── 看护设置（后端是唯一真源：core 的看护协程直接读它，app 只做展示与提交）──
@@ -325,7 +319,7 @@ class TunnelModule(
                 val success = result.jsonObject["success"]?.jsonPrimitive?.booleanOrNull ?: false
                 if (!success) {
                     _state.value = _state.value.copy(
-                        errorMessage = "删除通道 [$name] 失败（可能正在运行且停不掉，或文件已不存在）"
+                        errorMessage = "删除通道 [$name] 失败：它可能仍在运行且无法停止，或配置文件已不存在"
                     )
                 }
                 loadFrpConfigs()
@@ -498,7 +492,7 @@ class TunnelModule(
                 val success = result.jsonObject["success"]?.jsonPrimitive?.booleanOrNull ?: false
                 if (!success) {
                     _state.value = _state.value.copy(
-                        errorMessage = "删除隧道 [$name] 失败（可能正在运行且停不掉）"
+                        errorMessage = "删除隧道 [$name] 失败：它可能仍在运行且无法停止"
                     )
                 }
                 loadCfTunnels()
@@ -760,40 +754,6 @@ class TunnelModule(
             tunnelNotifyOnFailure = element["notify_on_failure"]?.jsonPrimitive?.booleanOrNull
                 ?: _state.value.tunnelNotifyOnFailure
         )
-
-        maybeNotifyFailures("FRP 通道", frpInstances, lastFrpStatus)
-        maybeNotifyFailures("Cloudflare 隧道", cfInstances, lastCfStatus)
-        lastFrpStatus = frpInstances.associate { it.name to it.status }
-        lastCfStatus = cfInstances.associate { it.name to it.status }
-    }
-
-    /**
-     * 启动失败 / 意外退出提醒：只在**状态边沿**（上一轮不是 Error、这一轮是 Error）时发一条，
-     * 否则每轮轮询都会重复弹。首轮（没有历史）不发 —— 进页面就弹一堆旧失败没有意义。
-     *
-     * 通知 id 由「引擎标签 + 实例名」一起派生：只用名字的话，同名的 FRP 通道与 CF 隧道
-     * 会算出同一个 id，后发的那条把前一条覆盖掉。
-     */
-    private fun maybeNotifyFailures(
-        label: String,
-        instances: List<TunnelInstanceInfo>,
-        previous: Map<String, String>
-    ) {
-        if (!_state.value.tunnelNotifyOnFailure || previous.isEmpty()) return
-        instances.forEach { inst ->
-            val was = previous[inst.name] ?: return@forEach
-            if (inst.status == "Error" && was != "Error") {
-                notificationCenter.notify(
-                    scene = com.ufi_axis.data.notification.NotifyScene.TUNNEL,
-                    payload = com.ufi_axis.data.notification.NotifyPayload(
-                        title = "$label 已断开",
-                        message = "${inst.name}：${inst.lastError.ifBlank { "进程已退出" }}",
-                        notificationId = TUNNEL_NOTIFY_BASE_ID + ("$label|${inst.name}".hashCode().and(0x7FF)),
-                        groupKey = "tunnel_failure"
-                    )
-                )
-            }
-        }
     }
 
     private fun parseInstances(obj: JsonObject?): List<TunnelInstanceInfo> =
@@ -807,9 +767,4 @@ class TunnelModule(
                 lastError = o["last_error"]?.jsonPrimitive?.contentOrNull ?: ""
             )
         } ?: emptyList()
-
-    companion object {
-        /** 隧道失败通知 id 基址（按实例名散列偏移，保证不同实例互不覆盖） */
-        private const val TUNNEL_NOTIFY_BASE_ID = 9600
-    }
 }

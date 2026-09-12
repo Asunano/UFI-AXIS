@@ -13,6 +13,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Backup
 import androidx.compose.material.icons.filled.Gavel
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Language
@@ -362,6 +363,21 @@ fun AboutDeviceScreen(
                         )
                     }
                 }
+            }
+
+            // ══════════ 备份与恢复 ══════════
+            // 放在关于页而不是设置一级页：它是整机维护动作，与设置页那些"改某一项配置"的入口
+            // 不是同一类；和更新一样，一年用不到几次。
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    icon = Icons.Filled.Backup,
+                    title = "备份与恢复",
+                    description = "导出配置备份包 · 从备份文件恢复",
+                    onClick = {
+                        navController.navigate(Routes.DETAIL_BACKUP_RESTORE) { launchSingleTop = true }
+                    },
+                    trailing = { UfiSettingsChevron() }
+                )
             }
 
             // ══════════ 调试（隐藏组：仅在版本号连点 5 次激活调试模式后出现）══════════

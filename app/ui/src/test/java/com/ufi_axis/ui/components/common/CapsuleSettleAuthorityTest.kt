@@ -5,6 +5,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 胶囊归位判据的纯函数单测（[authorityCaughtUp] / [settledIndexOf]）。

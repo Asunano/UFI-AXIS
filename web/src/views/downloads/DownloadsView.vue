@@ -884,7 +884,7 @@ onMounted(() => {
 // 有任务在跑就 2s 刷一轮（与 app 端一致），全是终态时降到 6s 心跳 —— 列表不能完全冻住，
 // meta→verifying→downloading→completed 这些跃迁全靠后端推进，前端必须一直看着。
 const hasActiveTask = computed(() =>
-  tasks.value.some((t) => ['downloading', 'pending', 'meta', 'verifying'].includes(t.status)),
+  tasks.value.some((t) => ['downloading', 'pending', 'meta', 'verifying'].includes(t.status))
 );
 useInterval(loadTasks, () => (hasActiveTask.value ? 2000 : 6000));
 
@@ -920,7 +920,7 @@ onUnmounted(() => {
   background: var(--text-muted);
 }
 .status-dot.active {
-  background: #18a058;
+  background: var(--success);
 }
 .status-version {
   color: var(--text-muted);
@@ -930,7 +930,7 @@ onUnmounted(() => {
   color: var(--border-subtle);
 }
 .throttle-warn {
-  color: #f0a020;
+  color: var(--warning);
 }
 .top-actions {
   display: flex;
@@ -983,28 +983,28 @@ onUnmounted(() => {
   font-weight: 500;
 }
 .status-downloading {
-  color: #2080f0;
+  color: var(--accent-color);
 }
 .status-paused {
   color: var(--text-secondary);
 }
 .status-completed {
-  color: #18a058;
+  color: var(--success);
 }
 .status-error {
-  color: #d03050;
+  color: var(--error);
 }
 .status-meta {
-  color: #f0a020;
+  color: var(--warning);
 }
 .status-verifying {
-  color: #2080f0;
+  color: var(--accent-color);
 }
 .status-pending {
   color: var(--text-muted);
 }
 .task-speed {
-  color: var(--accent-color, #2080f0);
+  color: var(--accent-color);
 }
 .task-progress {
   margin-top: 8px;
@@ -1012,28 +1012,10 @@ onUnmounted(() => {
 .task-error {
   margin-top: 6px;
   font-size: 12px;
-  color: #d03050;
+  color: var(--error);
 }
-.config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.config-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.config-item.full {
-  grid-column: 1 / -1;
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-}
-.config-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+/* .config-grid / .config-item / .config-item.full / .config-label 已统一到
+   src/styles/main.css（全局一份，与 settings 三个面板共用，含 768px 折单列） */
 .form-hint {
   font-size: 12px;
   color: var(--text-muted);
@@ -1055,13 +1037,13 @@ onUnmounted(() => {
   line-height: 1.4;
 }
 .path-hint.ok {
-  color: #18a058;
+  color: var(--success);
 }
 .path-hint.warn {
-  color: #f0a020;
+  color: var(--warning);
 }
 .path-hint.bad {
-  color: #d03050;
+  color: var(--error);
 }
 .tracker-info {
   display: flex;
@@ -1085,9 +1067,6 @@ onUnmounted(() => {
   .top-bar {
     flex-direction: column;
     align-items: flex-start;
-  }
-  .config-grid {
-    grid-template-columns: 1fr;
   }
   .tracker-info {
     flex-direction: column;

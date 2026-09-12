@@ -13,6 +13,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
@@ -159,12 +160,64 @@ fun UfiTextField(
      * 传 false 时宽度完全交给 [modifier]，供「行内窄字段」使用
      * （如下载设置里 `Modifier.width(80.dp)` 的做种率、配对页 90dp 的数量输入）。
      */
-    fillMaxWidth: Boolean = true
+    fillMaxWidth: Boolean = true,
+    /**
+     * 2026-09-11 新增：**光标/选区位置**（默认 null = 不关心，与既有调用点行为完全一致）。
+     *
+     * 为什么需要它：「点一下把 `{{title}}` 插到光标处」这类功能必须知道插入点在哪，
+     * 而 `value: String` 里没有这个信息。传了 [onSelectionChange] 之后本组件改用 M3 的
+     * `TextFieldValue` 重载，选区**由调用方持有**（受控），插入后调用方把光标挪到插入内容之后 ——
+     * 组件内部再存一份 `TextFieldValue` 就会与外部 `value` 打架，表现是"在中间打字光标跳到末尾"。
+     *
+     * 越界的选区在这里夹到 `0..value.length`：调用方先改文本再改选区时会有一瞬的不一致，
+     * 而越界选区会让 `TextFieldValue` 在测量阶段抛。
+     */
+    selection: TextRange? = null,
+    /** 见 [selection]。null = 走原来的 `String` 重载（既有调用点全部落在这一支）。 */
+    onSelectionChange: ((TextRange) -> Unit)? = null
 ) {
     val palette = LocalResolvedPalette.current
+    val supporting: (@Composable () -> Unit)? = if (errorMessage != null) {
+        { Text(errorMessage, color = palette.error) }
+    } else supportingText
+    val fieldModifier = if (fillMaxWidth) modifier.fillMaxWidth() else modifier
+    // 两支各自调一次 OutlinedTextField：M3 的 String 与 TextFieldValue 是两个独立重载，
+    // 没有共用入口。既有调用点必须留在 String 那一支 —— 走 TextFieldValue 而外部只回传
+    // String 的话，光标位置每次重组都被重置成末尾。
+    if (onSelectionChange == null) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            label = { if (label.isNotBlank()) Text(label) },
+            placeholder = placeholder?.let { { Text(it) } },
+            singleLine = singleLine,
+            minLines = minLines,
+            maxLines = maxLines,
+            isError = isError,
+            enabled = enabled,
+            modifier = fieldModifier,
+            keyboardOptions = keyboardOptions,
+            keyboardActions = keyboardActions,
+            trailingIcon = trailingIcon,
+            leadingIcon = leadingIcon,
+            supportingText = supporting,
+            colors = ufiInputColors(),
+            shape = UfiCardDefaults.inputShape
+        )
+        return
+    }
+    val caret = selection ?: TextRange(value.length)
+    val safeCaret = TextRange(
+        caret.start.coerceIn(0, value.length),
+        caret.end.coerceIn(0, value.length)
+    )
     OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
+        value = TextFieldValue(text = value, selection = safeCaret),
+        onValueChange = { next ->
+            // 文本没变就别回调：选区移动（点一下、拖选）不该被记成一次编辑。
+            if (next.text != value) onValueChange(next.text)
+            onSelectionChange(next.selection)
+        },
         label = { if (label.isNotBlank()) Text(label) },
         placeholder = placeholder?.let { { Text(it) } },
         singleLine = singleLine,
@@ -172,14 +225,12 @@ fun UfiTextField(
         maxLines = maxLines,
         isError = isError,
         enabled = enabled,
-        modifier = if (fillMaxWidth) modifier.fillMaxWidth() else modifier,
+        modifier = fieldModifier,
         keyboardOptions = keyboardOptions,
         keyboardActions = keyboardActions,
         trailingIcon = trailingIcon,
         leadingIcon = leadingIcon,
-        supportingText = if (errorMessage != null) {
-            { Text(errorMessage, color = palette.error) }
-        } else supportingText,
+        supportingText = supporting,
         colors = ufiInputColors(),
         shape = UfiCardDefaults.inputShape
     )

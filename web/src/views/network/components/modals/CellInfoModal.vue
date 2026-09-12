@@ -1,10 +1,5 @@
 <template>
-  <n-modal
-    v-model:show="show"
-    preset="card"
-    title="基站信息"
-    style="width: 520px; max-width: calc(100vw - 32px)"
-  >
+  <n-modal v-model:show="show" preset="card" title="基站信息" style="width: 520px; max-width: calc(100vw - 32px)">
     <div v-if="cellInfo?.serving_cell" class="kv-grid">
       <InfoRow label="PCI" :value="String(cellInfo.serving_cell.pci ?? '--')" />
       <InfoRow
@@ -12,14 +7,8 @@
         :value="String(cellInfo.serving_cell.earfcn ?? cellInfo.serving_cell.fc_number ?? '--')"
       />
       <InfoRow label="频段" :value="String(cellInfo.serving_cell.band ?? '--')" />
-      <InfoRow
-        label="RSRP"
-        :value="cellInfo.serving_cell.rsrp != null ? `${cellInfo.serving_cell.rsrp} dBm` : '--'"
-      />
-      <InfoRow
-        label="SINR"
-        :value="cellInfo.serving_cell.sinr != null ? `${cellInfo.serving_cell.sinr} dB` : '--'"
-      />
+      <InfoRow label="RSRP" :value="cellInfo.serving_cell.rsrp != null ? `${cellInfo.serving_cell.rsrp} dBm` : '--'" />
+      <InfoRow label="SINR" :value="cellInfo.serving_cell.sinr != null ? `${cellInfo.serving_cell.sinr} dB` : '--'" />
     </div>
     <div style="margin-top: 16px">
       <div class="neighbor-head">

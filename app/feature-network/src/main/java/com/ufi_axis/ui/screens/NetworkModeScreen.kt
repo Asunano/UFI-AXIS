@@ -39,6 +39,12 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
     // 设备回读的 net_select 是 Bearer 取值域，比对前先经 fromBearer 换算。
     val currentMode = NetworkMode.fromBearer(netModeJson)
 
+    // 2026-09-11：「切换中」优先于回读值 —— 设备重新注册期间 /api/device/settings 仍报旧档位，
+    // 按回读值渲染就会停在切换前的档位上（真机复现的那条）。
+    val pendingMode = state.pendingNetworkMode
+    val displayMode = pendingMode ?: currentMode
+    val switching = pendingMode != null
+
     var showSheet by remember { mutableStateOf(false) }
 
     // 进入即刷新设备设置，保证初值准确
@@ -79,8 +85,9 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             UfiBadge(
-                                text = if (connModeJson == "auto") "已连接" else "已断开",
-                                type = if (connModeJson == "auto") UfiBadgeType.SUCCESS else UfiBadgeType.WARNING
+                                text = if (switching) "切换中" else if (connModeJson == "auto") "已连接" else "已断开",
+                                type = if (switching) UfiBadgeType.WARNING
+                                    else if (connModeJson == "auto") UfiBadgeType.SUCCESS else UfiBadgeType.WARNING
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
@@ -100,16 +107,22 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                         Spacer(Modifier.height(14.dp))
 
                         Text(
-                            NETWORK_MODE_LABELS[currentMode] ?: netModeJson,
+                            NETWORK_MODE_LABELS[displayMode] ?: netModeJson,
                             style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
                             color = palette.textPrimary
                         )
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            if (connModeJson == "auto") "自动拨号 · 设备根据信号在 4G/5G 间自动切换"
-                            else "手动拨号 · 由你指定网络制式",
+                            when {
+                                // 切换期间讲清"在等设备搜网"，别让用户以为点了没反应
+                                switching -> "正在切换制式 · 设备重新搜网需要一点时间"
+                                // 回读预算用尽仍未报出目标档位：明说，不静默停在旧值上
+                                state.modeSwitchTimedOut -> "设备尚未完成切换 · 可稍后刷新查看"
+                                connModeJson == "auto" -> "自动拨号 · 设备根据信号在 4G/5G 间自动切换"
+                                else -> "手动拨号 · 由你指定网络制式"
+                            },
                             style = MaterialTheme.typography.bodySmall,
-                            color = palette.textSecondary
+                            color = if (state.modeSwitchTimedOut && !switching) palette.error else palette.textSecondary
                         )
 
                         Spacer(Modifier.height(18.dp))
@@ -185,7 +198,7 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                         items(NetworkMode.UI_OPTIONS.size) { idx ->
                             val key = NetworkMode.UI_OPTIONS[idx]
                             val label = NETWORK_MODE_LABELS[key] ?: key
-                            val isSelected = key == currentMode
+                            val isSelected = key == displayMode
                             Box(
                                 Modifier
                                     .fillMaxWidth()

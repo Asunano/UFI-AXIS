@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.screens
 
+import android.content.Context
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -8,10 +9,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.SmsForwardConfig
+import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyPrefs
 import com.ufi_axis.data.notification.NotifyScene
 import com.ufi_axis.ui.components.common.*
+import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
@@ -43,6 +48,17 @@ import com.ufi_axis.viewmodel.MainViewModel
  * 点「保存」才下发。两者都走同一个 `persist(...)`：core 的 POST 是字段级合并，
  * 但 app 侧发的是整个对象，**未编辑的字段必须从 `cfg` 原样带回**，否则会被空串覆盖。
  *
+ * ## 2026-09-10「规则同构」
+ *
+ * core 给三条渠道配了同一组投递规则（最低级别 + 每日上限），本页因此多了三行：
+ * 最低级别 / 每日上限 / 今日用量。组件、措辞、排布全部取自 `NotifyChannelRules.kt`，
+ * 与 [WebhookNotifyScreen] / [LocalSmsNotifyScreen] 逐字一致 —— 这次改造的目的就是
+ * 让用户在任一渠道页看到同一组旋钮。邮件的区间是 `0..500` 且允许 0（不限）。
+ *
+ * 同时 `POST /api/sms-forward/config` **从"永不报错"变成了可能回 400**
+ * （上限越界 / 级别名认不出）。失败原因由 [UfiErrorBanner] 常驻显示，
+ * 文案是 core 的中文原句（`ToolsModule.coreErrorMessage` 从错误体里取）。
+ *
  * 路由/接口仍沿用 `sms-forward` 命名（`/api/sms-forward/…`）—— web 端与 API
  * 手册都引用该路径，改名只会破坏跨端契约，没有功能收益。
  *
@@ -53,7 +69,12 @@ import com.ufi_axis.viewmodel.MainViewModel
 fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController) {
     val palette = LocalResolvedPalette.current
     val state by viewModel.smsForwardState.collectAsState()
-    LaunchedEffect(Unit) { viewModel.tools.loadSmsForwardConfig() }
+    // 只为「最近投递」入口的右侧摘要（没发出 / 已跳过 / 总数）
+    val toolsState by viewModel.toolsState.collectAsState()
+    LaunchedEffect(Unit) {
+        viewModel.tools.loadSmsForwardConfig()
+        viewModel.tools.loadDeliveryHistory(DELIVERY_CHANNEL_MAIL)
+    }
     // 诊断跟着配置走：保存成功后 ToolsModule 会自动重载 config，这里随之重新拉一次诊断，
     // 于是统计数字与「可发信」在保存/测试后立刻刷新，不需要用户手动下拉。
     LaunchedEffect(state.config) { if (state.config != null) viewModel.tools.loadSmsForwardDiagnose() }
@@ -62,8 +83,39 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
     var enabled by remember(cfg) { mutableStateOf(cfg?.enabled ?: false) }
     var forwardDevInfo by remember(cfg) { mutableStateOf(cfg?.forward_dev_info ?: false) }
     var scenes by remember(cfg) { mutableStateOf(cfg?.scenes ?: emptyList()) }
+    // ── 「规则同构」的两个旋钮（2026-09-10）──
+    // 与 enabled / scenes 同一套写法：本地镜像 cfg，改完立即下发。
+    // **必须有本地副本**：本页的 POST 发的是整个对象，未编辑的字段要原样带回，
+    // 少带一个就会被 DTO 默认值覆盖（min_level 掉回 info、daily_limit 掉回 0）。
+    var minLevel by remember(cfg) { mutableStateOf(cfg?.min_level ?: NOTIFY_LEVEL_INFO) }
+    var dailyLimit by remember(cfg) { mutableIntStateOf(cfg?.daily_limit ?: 0) }
     var smtpDialogOpen by remember { mutableStateOf(false) }
     var scopeDialogOpen by remember { mutableStateOf(false) }
+    var limitDialogOpen by remember { mutableStateOf(false) }
+
+    // ── 邮件是否遵守免打扰时段（2026-09-08）──
+    // 判定在 core（NotificationRoutes.mailAllowed）；本地 prefs 只是镜像，供本页显示与下发。
+    // 时段本身在「通知与守护」页改，这里只读来显示，避免造第二个编辑入口。
+    val context = LocalContext.current
+    val prefs = remember {
+        context.getSharedPreferences(NotificationCenter.PREFS_NAME, Context.MODE_PRIVATE)
+    }
+    var mailRespectDnd by remember {
+        mutableStateOf(prefs.getBoolean(NotificationCenter.KEY_MAIL_RESPECT_DND, false))
+    }
+    val dndOn = prefs.getBoolean(NotificationCenter.KEY_DND_ENABLED, false)
+    val dndStart = prefs.getInt(NotificationCenter.KEY_DND_START_HOUR, NotificationCenter.DEFAULT_DND_START_HOUR)
+    val dndEnd = prefs.getInt(NotificationCenter.KEY_DND_END_HOUR, NotificationCenter.DEFAULT_DND_END_HOUR)
+
+    // 「严重事件兜底」的本机镜像（真源在 core）。只用来决定免打扰 / 场景那两处提示怎么写 ——
+    // 兜底关着却写"严重事件会穿透"就是承诺一件不会发生的事。
+    // 走 NotifyPrefs.switchOn 而不是上面那种 prefs.getBoolean：这个字段默认 **true**，
+    // 默认值只在 NotifyPrefs / NotificationCenter 定义一处，抄进来必然某天分叉成 false。
+    val criticalOverrideOn = NotifyPrefs.switchOn(
+        context,
+        NotificationCenter.KEY_CRITICAL_OVERRIDE,
+        NotificationCenter.DEFAULT_CRITICAL_OVERRIDE
+    )
 
     // 本页触发的在途动作。为什么需要它：`state.isLoading` 是 SmsForwardState 的**单一** loading 位，
     // 被 loadSmsForwardConfig / saveSmsForwardConfig / testSmsForward 三个动作共用。
@@ -82,6 +134,8 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
         newEnabled: Boolean = enabled,
         newDevInfo: Boolean = forwardDevInfo,
         newScenes: List<String> = scenes,
+        newMinLevel: String = minLevel,
+        newDailyLimit: Int = dailyLimit,
         host: String = cfg?.smtp_host ?: "",
         port: Int = cfg?.smtp_port ?: 465,
         user: String = cfg?.smtp_user ?: "",
@@ -101,10 +155,9 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
                 smtp_from = from,
                 smtp_to = to,
                 forward_dev_info = newDevInfo,
-                // 黑名单 UI 已于 2026-08-30 从本页移除（将并入短信页统一管理），
-                // 但字段仍在载荷里 —— 必须**原样回传**，传 emptyList() 会静默清空设备上的黑名单。
-                blacklist = cfg?.blacklist ?: emptyList(),
-                scenes = newScenes
+                scenes = newScenes,
+                min_level = newMinLevel,
+                daily_limit = newDailyLimit
             )
         )
     }
@@ -118,13 +171,21 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
         pending = null
         // 失败信息由 UfiErrorBanner 常驻展示（加载失败也走同一处），这里只报成功，避免同一条错误报两遍。
         if (state.errorMessage == null) {
-            toastMessage = ToastMessage(
-                when (action) {
-                    EmailNotifyAction.SAVE -> "配置已保存"
-                    EmailNotifyAction.TEST -> "测试邮件已发送"
-                },
-                ToastType.SUCCESS
-            )
+            toastMessage = when (action) {
+                EmailNotifyAction.SAVE -> ToastMessage("配置已保存", ToastType.SUCCESS)
+                // 测试成功 ≠ 用户以后收得到：测试信走 manual 口径**不受通知总闸约束**，
+                // 而自动通知受。core 在 /test 响应里回了 auto_notify_enabled 就是为了说明这件事；
+                // 不读它的话用户看到"测试邮件已发送"就以为配好了，实际一条自动通知都不会来。
+                EmailNotifyAction.TEST -> if (state.lastTestAutoNotifyEnabled == false) {
+                    ToastMessage(
+                        text = "测试已发出，但通知总开关当前关闭，自动通知不会发送",
+                        type = ToastType.WARNING,
+                        subtitle = "在「通知与守护」页打开「全局通知」后，自动通知才会发出"
+                    )
+                } else {
+                    ToastMessage("测试邮件已发送", ToastType.SUCCESS)
+                }
+            }
         }
     }
 
@@ -200,8 +261,11 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
             }
 
             // ── ② 设置。输入项全部收进弹窗，列表行只显示摘要 + 右侧值。
-            UfiSettingsGroup {
-                UfiGroupHeader("邮件通知")
+            //
+            // 2026-09-08 摊平：原来这一段套在一张「邮件通知」分组卡里，而页面标题已经就是
+            // 「邮件通知」—— 那个分组头是在重复标题。下面的记录也一样（「发送记录」组里只有
+            // 一行「邮件发送记录」）。现在一项一卡，不再有比内容还多的分组头。
+            UfiSettingsRowCard {
                 UfiSettingsToggle(
                     title = "启用邮件通知",
                     description = if (diagnose?.sendable == true) {
@@ -215,21 +279,77 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
                         persist(newEnabled = it)
                     }
                 )
-                UfiDivider()
+            }
+
+            UfiSettingsRowCard {
                 UfiSettingsValue(
                     title = "SMTP 配置",
                     description = "服务器、端口、账号与收件地址",
                     value = summarizeSmtp(cfg),
                     onClick = { smtpDialogOpen = true }
                 )
-                UfiDivider()
+            }
+
+            // ── 最低级别 · 每日上限 · 今日用量（2026-09-10「规则同构」）──
+            //
+            // 三行走 NotifyChannelRules.kt 的共用件，与 Webhook / 本机短信逐字一致。
+            // 顺序也一致（级别 → 上限 → 用量 → 场景 → 免打扰）：三页看到的是同一组旋钮，
+            // 这正是这次改造的目的。metered = false —— 邮件不按条计费。
+            NotifyMinLevelRow(
+                levels = cfg?.levels ?: emptyList(),
+                current = minLevel,
+                metered = false,
+                // 本页的 cfg 可能还是 null（回读没完成）：那时候 levels 空只是"还没读到"，
+                // 不该亮"设备端版本较旧"那句话。
+                configLoaded = cfg != null,
+                onSelect = {
+                    minLevel = it
+                    persist(newMinLevel = it)
+                }
+            )
+
+            NotifyDailyLimitRow(
+                dailyLimit = dailyLimit,
+                min = cfg?.daily_limit_min ?: 0,
+                max = cfg?.daily_limit_max ?: 0,
+                onClick = { limitDialogOpen = true }
+            )
+
+            NotifyQuotaRow(
+                sentToday = cfg?.sent_today ?: 0,
+                dailyLimit = dailyLimit,
+                quotaRemaining = cfg?.quota_remaining
+            )
+
+            UfiSettingsRowCard {
                 UfiSettingsValue(
                     title = "邮件转发范围",
                     description = "哪些通知在推送的同时发一封邮件",
                     value = if (scenes.isEmpty()) "仅短信" else "${scenes.size} 个场景",
                     onClick = { scopeDialogOpen = true }
                 )
-                UfiDivider()
+            }
+
+            UfiSettingsRowCard {
+                UfiSettingsToggle(
+                    title = "遵守免打扰时段",
+                    description = when {
+                        !dndOn -> "尚未设置免打扰时段，可在「通知管理」中设置"
+                        mailRespectDnd -> "免打扰时段内（%02d:00–%02d:00）暂停发送邮件".format(dndStart, dndEnd) +
+                            " · " + notifyCriticalOverrideNote(criticalOverrideOn)
+                        else -> "免打扰时段内仍会发送邮件"
+                    },
+                    checked = mailRespectDnd,
+                    onCheckedChange = {
+                        mailRespectDnd = it
+                        prefs.edit().putBoolean(NotificationCenter.KEY_MAIL_RESPECT_DND, it).apply()
+                        // 真源在 core（邮件由设备端自己发），本地 prefs 只是镜像
+                        viewModel.tools.updateNotificationConfig(mapOf("mail_respect_dnd" to it))
+                    }
+                )
+            }
+
+            UfiSettingsRowCard {
                 UfiSettingsToggle(
                     title = "附加设备信息",
                     description = "邮件正文附加电池、CPU、内存等状态",
@@ -241,9 +361,29 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
                 )
             }
 
-            // 「短信黑名单」已于 2026-08-30 从本页移除：它只作用于短信转发，
-            // 与短信页的过滤逻辑重复，后续统一到短信界面管理。
-            // 注意保存时仍需回传 cfg.blacklist（见上方 persist）。
+            // 短信拦截（号码黑名单 + 关键词）不在本页：它作用于所有接收通道，不只邮件转发。
+            // 入口在 短信页 → 顶栏齿轮 → 短信设置 → 拦截规则。
+
+            // ── ③ 最近投递（2026-09-08 从原「通知历史」双 Tab 页拆出）──
+            // 放在本页而不是通知那边：这份记录只对邮件渠道有意义，跟 SMTP 配置在一起才找得到。
+            // 摘要与另两条渠道页的入口卡共用 deliveryHistorySummary，三处逐字一致。
+            UfiSettingsRowCard {
+                UfiSettingsValue(
+                    title = DELIVERY_HISTORY_ENTRY_TITLE,
+                    description = DELIVERY_HISTORY_ENTRY_DESCRIPTION,
+                    value = deliveryHistorySummary(
+                        // 三条渠道共用一个 state 槽位，先确认里面装的就是邮件那一份。
+                        ready = toolsState.deliveryHistoryLoaded &&
+                            toolsState.deliveryHistoryChannel == DELIVERY_CHANNEL_MAIL,
+                        total = toolsState.deliveryHistoryTotal,
+                        failedTotal = toolsState.deliveryHistoryFailedTotal,
+                        skippedTotal = toolsState.deliveryHistorySkippedTotal
+                    ),
+                    onClick = {
+                        navController.navigate(Routes.deliveryHistory(DELIVERY_CHANNEL_MAIL))
+                    }
+                )
+            }
 
             Spacer(Modifier.height(Spacing.Large))
         }
@@ -259,13 +399,32 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
             )
         }
         if (scopeDialogOpen) {
-            MailScopeDialog(
+            NotifyScenesDialog(
+                title = "邮件转发范围",
+                leadNote = "勾选哪些内容要发邮件；短信正文与验证码是两个独立开关" +
+                    "（同一条短信抓到验证码时按验证码算）",
                 selected = scenes,
+                criticalOverrideOn = criticalOverrideOn,
                 onDismiss = { scopeDialogOpen = false },
                 onSave = { next ->
                     scenes = next
                     scopeDialogOpen = false
                     persist(newScenes = next)
+                }
+            )
+        }
+        if (limitDialogOpen) {
+            NotifyDailyLimitDialog(
+                current = dailyLimit,
+                min = cfg?.daily_limit_min ?: 0,
+                max = cfg?.daily_limit_max ?: 0,
+                // 本页的写动作共用 state.isLoading，所以只在"是本页发起的保存"时算 saving
+                saving = state.isLoading && pending == EmailNotifyAction.SAVE,
+                onDismiss = { limitDialogOpen = false },
+                onSave = { limit ->
+                    dailyLimit = limit
+                    limitDialogOpen = false
+                    persist(newDailyLimit = limit)
                 }
             )
         }
@@ -339,43 +498,6 @@ private fun SmtpConfigDialog(
     }
 }
 
-/** 邮件转发范围弹窗（暂存-确认）：多选 chip，点「保存」才下发。 */
-@Composable
-private fun MailScopeDialog(
-    selected: List<String>,
-    onDismiss: () -> Unit,
-    onSave: (List<String>) -> Unit
-) {
-    val palette = LocalResolvedPalette.current
-    val draft = remember { mutableStateListOf<String>().apply { addAll(selected) } }
-
-    UfiCustomDialog(
-        visible = true,
-        onDismiss = onDismiss,
-        title = "邮件转发范围",
-        confirmButton = {
-            UfiButton(text = "保存", onClick = { onSave(draft.toList()) })
-        },
-        dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
-        }
-    ) {
-        UfiDialogBody {
-            Text(
-                "勾选哪些内容要发邮件；短信正文与验证码是两个独立开关（同一条短信抓到验证码时按验证码算）",
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary
-            )
-
-            UfiMultiChipSelector(
-                options = MAIL_SCENES.map { (scene, label) -> scene.sceneId to label },
-                selectedValues = draft.toSet(),
-                onToggle = { id -> if (draft.contains(id)) draft.remove(id) else draft.add(id) }
-            )
-        }
-    }
-}
-
 /** SMTP 摘要：`smtp.qq.com:465`；缺服务器或收件地址都算未配置完。 */
 private fun summarizeSmtp(config: SmsForwardConfig?): String = when {
     config == null -> "加载中"
@@ -388,21 +510,10 @@ private fun formatMailTime(ts: Long): String =
     java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
         .format(java.util.Date(ts))
 
-/**
- * 可选邮件转发场景（顺序即 chip 顺序）。
- *
- * 不直接遍历 `NotifyScene.entries`：这里是**邮件**的场景白名单（core 的 `SmsForwardConfig.scenes`），
- * 与 app 的系统通知开关是两件事，能发邮件的场景只有这几个。
- * 短信正文与验证码是 core 短信链路的两个独立开关（`forwardSms` 按是否抓到验证码分流）。
- */
-private val MAIL_SCENES: List<Pair<NotifyScene, String>> = listOf(
-    NotifyScene.SMS to "短信正文",
-    NotifyScene.VERIFICATION_CODE to "验证码",
-    NotifyScene.ALERT to "阈值告警",
-    NotifyScene.CONNECTIVITY to "离线/上线",
-    NotifyScene.TRAFFIC_80 to "流量预警",
-    NotifyScene.DOWNLOAD to "下载结束",
-    NotifyScene.TUNNEL to "隧道异常",
-    NotifyScene.DEVICE_EVENTS to "设备事件"
-)
+// 可选场景（`sceneId to 中文标签`）的映射已搬到 [NOTIFY_SCENE_LABELS]（NotifySceneLabels.kt）：
+// Webhook 渠道勾的是同一套场景 id，各留一份必然分叉。
+// 这里是**邮件**的场景白名单（core 的 `SmsForwardConfig.scenes`），与 app 的系统通知开关
+// 是两件事，所以不遍历 `NotifyScene.entries`。
+
+
 

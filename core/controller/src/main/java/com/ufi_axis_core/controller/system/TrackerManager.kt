@@ -157,16 +157,19 @@ class TrackerManager(
     // ─── 内部方法 ──────────────────────────────────────────
 
     private fun fetchTrackers(url: String): String? {
+        // disconnect 必须放在 finally：早期实现只在成功分支和非 200 分支调用它，
+        // 读超时 / IO 异常时连接与未关闭的 reader（socket fd）一起泄漏，
+        // 而 catch 又把异常吞掉 —— tracker 每次刷新都漏一个 fd。
+        var conn: java.net.HttpURLConnection? = null
         return try {
-            val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+            conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
             conn.connectTimeout = 15_000
             conn.readTimeout = 15_000
             conn.setRequestProperty("User-Agent", "UFI-AXIS-Download/1.0")
             conn.connect()
             val code = conn.responseCode
             if (code == 200) {
-                val text = conn.inputStream.bufferedReader().readText().trim()
-                conn.disconnect()
+                val text = conn.inputStream.bufferedReader().use { it.readText() }.trim()
                 // _aria2.txt 格式：逗号分隔单行
                 // 也兼容换行分隔的格式（去除空行后用逗号拼接）
                 if (text.contains("\n")) {
@@ -180,12 +183,13 @@ class TrackerManager(
                 }
             } else {
                 AppLogger.w(TAG, "Tracker fetch HTTP $code from $url")
-                conn.disconnect()
                 null
             }
         } catch (e: Exception) {
             AppLogger.w(TAG, "Tracker fetch exception: ${e.javaClass.simpleName}: ${e.message}")
             null
+        } finally {
+            conn?.disconnect()
         }
     }
 
@@ -194,10 +198,18 @@ class TrackerManager(
         return (System.currentTimeMillis() - meta.lastUpdated) > intervalHours * 3600_000L
     }
 
+    /**
+     * 元信息读写以前是 `catch (_: Exception) {}` 全静默。
+     * 一旦 tracker-meta.json 写不进去或内容坏掉，表现只是「上次更新时间永远为 0」，
+     * 于是 isStale() 每次都判过期 —— 每次启动都重新拉一遍远程列表，现场却查不到任何线索。
+     * 只补日志（文件路径 + 异常类型），控制流不动：读失败继续用默认 meta。
+     */
     private fun saveMeta() {
         try {
             metaFile.writeText(json.encodeToString(meta))
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "saveMeta failed, meta not persisted: ${metaFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     private fun loadMeta() {
@@ -208,6 +220,9 @@ class TrackerManager(
                     meta = json.decodeFromString<TrackerMeta>(text)
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "loadMeta failed, falling back to defaults: ${metaFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 }
+

@@ -40,6 +40,28 @@ data class NetworkState(
      */
     val neighborCells: NeighborCellsResponse? = null,
     val lanSettings: LanSettingsResponse? = null,
+    /**
+     * 设备身份信息（`GET /api/device/identity`），含本机号码(msisdn)、IMEI 等。
+     * null = 还没读过 / 读失败。Hero 卡用本机号码与 IMEI 替代原来的 LAN IP 副标题。
+     */
+    val deviceIdentity: Map<String, String>? = null,
+    /**
+     * 正在切换中的**目标**网络制式（contract 别名）；null = 没有进行中的切换。
+     *
+     * 为什么必须有这个位：`POST /api/network/mode` 返回成功只代表固件收下了命令，设备还要
+     * 重新注册网络，这期间 `GET /api/device/settings` 的 `BearerPreference` **仍报旧档位**。
+     * 没有它，界面只能显示回读值，于是用户看到的是"点了 4G，界面还是仅 5G，过一会儿才自己
+     * 变对"。有了它，切换期间界面显示目标档位 +「切换中」，回读到的旧值不参与高亮。
+     *
+     * 不要拿它当 loading 用：[isLoading] 是全页共享位，任何一次刷新都会置 true。
+     */
+    val pendingNetworkMode: String? = null,
+    /**
+     * 上一次制式切换在 `NetworkMode.SwitchProbe` 的回读预算内没等到设备报出目标档位。
+     *
+     * true 时界面要说清"设备尚未完成切换"，**不能**静默停在旧档位上假装什么都没发生。
+     */
+    val modeSwitchTimedOut: Boolean = false,
     val isLoading: Boolean = false,
     val errorMessage: String? = null,
     /** 每次加载递增，确保缓存返回相同内容时 StateFlow 仍能发射 */

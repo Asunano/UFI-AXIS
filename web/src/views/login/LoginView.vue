@@ -3,21 +3,31 @@
     <div class="login-card">
       <div class="login-header">
         <div class="login-logo">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#1E293B" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <svg
+            width="28"
+            height="28"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="#1E293B"
+            stroke-width="1.25"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
             <path d="M10 3.2a9 9 0 1 0 10.8 10.8a1 1 0 0 0 -1 -1h-3.8a4.1 4.1 0 1 1 -5 -5v-4a0.9 0.9 0 0 0 -1 -0.8" />
             <path d="M15 3.5a9 9 0 0 1 5.5 5.5h-4.5a9 9 0 0 0 -1 -1v-4.5" />
           </svg>
         </div>
         <h1 class="login-title">UFI-AXIS</h1>
-        <p class="login-subtitle">{{ hasDefaultPassword ? '首次配对 · 请设置管理员密码' : '随身 WiFi 管理平台' }}</p>
+        <p class="login-subtitle">{{ hasDefaultPassword ? '首次配对 · 请设置配对密码' : '随身 WiFi 管理平台' }}</p>
       </div>
 
-      <!-- 只有首次配对（hasDefaultPassword=true）才分两步：0=设置设备密码，1=GoForm 后台设置。
+      <!-- 只有首次配对（hasDefaultPassword=true）才分两步：0=设置配对密码，1=GoForm 后台设置。
            与 app 的 SetupScreen.confirmStep 语义一致 —— 两步都只是 UI 分屏，
            中间不发任何请求，最终仍由 handleLogin() 一次性 POST /pairing/confirm 提交。
            普通登录模式只有密码一屏，不渲染步骤条。 -->
       <n-steps v-if="hasDefaultPassword" :current="pairStep + 1" size="small" class="pair-steps">
-        <n-step title="设置设备密码" />
+        <n-step title="设置配对密码" />
         <n-step title="GoForm 后台设置" />
       </n-steps>
 
@@ -25,7 +35,7 @@
            rules 仅用于各字段 blur 时的即时提示。原先这里挂了 ref="formRef"，
            而 <script setup> 中并没有同名变量 —— 是个永远绑不上的死属性。 -->
       <n-form :model="form" :rules="rules" label-placement="left" label-width="0">
-        <!-- 第 1 步「设置设备密码」。普通登录模式下这也是唯一一屏。 -->
+        <!-- 第 1 步「设置配对密码」。普通登录模式下这也是唯一一屏。 -->
         <div v-if="!hasDefaultPassword || pairStep === 0" class="step-pane">
           <!-- 同源模式：自动检测服务器地址，无需手动输入 -->
           <div v-if="isSameOrigin" class="server-hint">
@@ -51,7 +61,7 @@
               v-model:value="form.password"
               type="password"
               show-password-on="click"
-              :placeholder="hasDefaultPassword ? '请设置管理员密码（4-64 位）' : '设备密码'"
+              :placeholder="hasDefaultPassword ? '请设置配对密码（4-64 位）' : '配对密码'"
               :input-props="{ autocomplete: hasDefaultPassword ? 'new-password' : 'current-password' }"
               @keyup.enter="submitPasswordStep"
             >
@@ -61,7 +71,7 @@
             </n-input>
           </n-form-item>
 
-          <!-- 初次配对：设置管理员密码（第 1 步专有） -->
+          <!-- 初次配对：设置配对密码（第 1 步专有） -->
           <template v-if="hasDefaultPassword">
             <div class="pw-strength">
               <div class="pw-strength-bars">
@@ -81,7 +91,7 @@
                 v-model:value="form.confirmPassword"
                 type="password"
                 show-password-on="click"
-                placeholder="确认管理员密码"
+                placeholder="确认配对密码"
                 :input-props="{ autocomplete: 'new-password' }"
                 @keyup.enter="submitPasswordStep"
               >
@@ -97,10 +107,10 @@
              端口用 n-input-number 自带范围校验，不合并成 app 那样的单个「IP:端口」文本框。 -->
         <div v-else class="step-pane">
           <!-- 初次配对：同时配置 Goform 后台（调制解调器原生管理界面）连接 -->
-          <div class="goform-section">
-            <div class="goform-title">调制解调器后台 (Goform)</div>
+          <div class="goform-section sub-panel">
+            <div class="goform-title">设备后台</div>
             <p class="goform-desc">
-              设备经此地址访问调制解调器原生管理界面，默认通常为 192.168.0.1:8080、密码 admin。一般无需修改。
+              设备经此地址访问自带的网页后台，默认通常为 192.168.0.1:8080、密码 admin。一般无需修改。
             </p>
             <div class="goform-grid">
               <div class="goform-field">
@@ -136,7 +146,7 @@
           </div>
 
           <n-alert type="info" :bordered="false" class="login-hint">
-            首次使用，请设置管理员密码。该密码用于后续登录与管理设备，请务必牢记。
+            首次使用，请设置配对密码。该密码用于后续登录与管理设备，请务必牢记。
           </n-alert>
         </div>
 
@@ -225,10 +235,10 @@ const rules = computed(() => ({
   serverUrl: { required: true, message: '请输入设备地址', trigger: 'blur' },
   password: hasDefaultPassword.value
     ? [
-        { required: true, message: '请设置管理员密码', trigger: 'blur' },
+        { required: true, message: '请设置配对密码', trigger: 'blur' },
         { min: 4, max: 64, message: '密码长度需 4-64 位', trigger: 'blur' },
       ]
-    : { required: false, message: '请输入设备密码', trigger: 'blur' },
+    : { required: false, message: '请输入配对密码', trigger: 'blur' },
   confirmPassword: hasDefaultPassword.value
     ? {
         required: true,
@@ -245,7 +255,7 @@ const loading = ref(false);
 const error = ref('');
 const hasDefaultPassword = ref(false);
 
-// 首次配对的分步下标：0=设置设备密码，1=GoForm 后台设置（对应 app SetupScreen 的 confirmStep）。
+// 首次配对的分步下标：0=设置配对密码，1=GoForm 后台设置（对应 app SetupScreen 的 confirmStep）。
 // 普通登录模式不使用它（模板里第 1 步的 pane 对 hasDefaultPassword=false 恒显示）。
 const pairStep = ref(0);
 
@@ -293,21 +303,21 @@ async function fetchPairingInfoWithRetry(): Promise<string | null> {
 }
 
 /**
- * 第 1 步「设置设备密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次一致。
+ * 第 1 步「设置配对密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次一致。
  * 通过返回 null，否则返回错误文案。
  * 「下一步」按钮与 handleLogin() 共用这一份——分步不削弱最终门禁，
  * handleLogin() 在此之后还会继续校验 Goform 字段。
  */
 function validatePasswordStep(): string | null {
   if (!isSameOrigin.value && !form.serverUrl) return '请输入设备地址';
-  // 初次配对：必须设置管理员密码（4-64 位，且两次一致）
+  // 初次配对：必须设置配对密码（4-64 位，且两次一致）
   if (hasDefaultPassword.value) {
-    if (!form.password) return '请设置管理员密码';
+    if (!form.password) return '请设置配对密码';
     if (form.password.length < 4 || form.password.length > 64) return '密码长度需 4-64 位';
     if (form.password !== form.confirmPassword) return '两次输入的密码不一致';
     return null;
   }
-  if (!form.password) return '请输入设备密码';
+  if (!form.password) return '请输入配对密码';
   return null;
 }
 
@@ -344,8 +354,8 @@ function submitPasswordStep() {
 /**
  * 登录 / 初次配对：镜像 Android app 的配对流程。
  * 1) GET /pairing/info 取配对码
- * 2) POST /pairing/confirm（配对码 + Web 指纹 + 设备密码）换 token
- *    —— 设备未设密码时，该密码即被设为新管理员密码（对应 app 的“初次配对设置密码”）
+ * 2) POST /pairing/confirm（配对码 + Web 指纹 + 配对密码）换 token
+ *    —— 设备未设密码时，该密码即被设为新配对密码（对应 app 的“初次配对设置密码”）
  * 3) 写回 token，校验连通性后进入仪表盘
  */
 async function handleLogin() {
@@ -362,7 +372,7 @@ async function handleLogin() {
   if (hasDefaultPassword.value) {
     // Goform 后台连接配置校验（与设备出厂默认值一致，一般无需改动）
     if (!goformIp.value.trim() || !goformPassword.value) {
-      error.value = '请填写调制解调器后台地址与密码';
+      error.value = '请填写设备后台地址与密码';
       return;
     }
     const gp = Number(goformPort.value);
@@ -383,7 +393,7 @@ async function handleLogin() {
     const api = getApiClient();
 
     // 1. 取配对码
-    // 设备已初始化（非默认密码）时允许空配对码：后端支持凭设备密码登录（登录=自动配对），
+    // 设备已初始化（非默认密码）时允许空配对码：后端支持凭配对密码登录（登录=自动配对），
     // 一次性配对码仅在设备首次初始化（配对）时必需。
     let pairingCode: string | null = null;
     try {
@@ -399,11 +409,13 @@ async function handleLogin() {
       return;
     }
     if (!pairingCode && hasDefaultPassword.value) {
-      error.value = '设备未处于配对模式，无法完成首次配对';
+      // 局域网来源在 has_default_password=true 时一定拿得到配对码，所以「有默认密码却没有码」
+      // 只有一种成因：请求是从隧道转发进来的，core 有意不下发（见 PairingRoutes 的隧道来源降级）。
+      error.value = '首次配对只能在设备所在的局域网内完成';
       return;
     }
 
-    // 2. 挑战-应答 + 设备密码换 token（初次配对时该密码即被设为新密码）
+    // 2. 挑战-应答 + 配对密码换 token（初次配对时该密码即被设为新密码）
     // Goform 后台配置仅在首次配对（初始化设备）时提交；普通登录不携带，
     // 避免用表单默认值覆盖设备上已配置的 Goform 连接设置。
     //
@@ -469,20 +481,23 @@ function handleConfirmError(e: any) {
   if (status === 401 && code === 'INVALID_CODE') {
     error.value = '配对码无效，请刷新页面后重试';
   } else if (status === 401 && code === 'INVALID_PASSWORD') {
-    error.value = '设备密码错误';
+    error.value = '配对密码错误';
   } else if (status === 401 && (code === 'INVALID_DEVICE_KEY' || code === 'INVALID_CHALLENGE')) {
     // 挑战一次性且 2 分钟过期；重新点登录会重新走 challenge，不需要用户改任何输入
     error.value = '设备身份校验失败，请重新点击登录';
   } else if (status === 429 && code === 'PASSWORD_LOCKED') {
-    error.value = '设备密码错误次数过多，已锁定，请 15 分钟后再试';
+    error.value = '配对密码错误次数过多，已锁定，请 15 分钟后再试';
   } else if (status === 409 && code === 'ALREADY_PAIRED') {
     error.value = '配对设备数量已达上限，请先在「配对管理」解除其他设备';
   } else if (status === 400 && code === 'PASSWORD_REQUIRED') {
-    error.value = '请输入设备密码';
+    error.value = '请输入配对密码';
   } else if (status === 400 && code === 'INVALID_GOFORM_CONFIG') {
-    error.value = '调制解调器后台配置无效（IP/端口/密码格式错误）';
+    error.value = '设备后台配置无效（IP/端口/密码格式错误）';
   } else if (status === 400) {
     error.value = '请求参数缺失';
+  } else if (status === 403) {
+    // core 把「首次配对」限制在局域网内，文案由服务端给出（含具体动作名）
+    error.value = e.response?.data?.error || '该操作只能在设备所在的局域网内完成';
   } else if (status === 429) {
     error.value = '操作过于频繁，请稍后重试';
   } else {
@@ -614,12 +629,9 @@ function handleNetworkError(e: any) {
   min-width: 28px;
   text-align: right;
 }
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .goform-section {
   margin: 4px 0 8px;
-  padding: 14px 14px 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: var(--page-bg);
 }
 .goform-title {
   font-size: 13px;

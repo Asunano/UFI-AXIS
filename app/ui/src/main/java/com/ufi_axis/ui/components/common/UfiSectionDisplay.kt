@@ -6,6 +6,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -54,6 +55,43 @@ fun UfiInfoRow(label: String, value: String?) {
             text = displayValue ?: "\u2014",
             style = UfiTextStyles.bodyEmphasis,
             color = palette.textPrimary
+        )
+    }
+}
+
+/**
+ * 「标签在上、值在下」的信息格 —— 卡内 2×N 紧凑网格的单元格。
+ *
+ * 2026-09-10 新增（纯追加，未动本文件既有签名）：这种格子原先在配对管理页手搓成私有
+ * `PairInfoCell`，而"设备名 / 标识 / 状态 / 数量"这类成组只读信息在设备信息、隧道详情
+ * 里都是同一形态，留在页面里就是下一处会被复制的手搓件。
+ *
+ * 与相邻两个组件的分工（别互相替代）：
+ * - [UfiInfoRow]：标签值**左右**分列、一行一项。格子宽度只有半屏时，左右分列会让
+ *   长值（设备标识、IP）立刻被挤进省略号，所以网格里必须上下排。
+ * - [UfiStatItem]：**居中** + 值用大字，那是"指标"；本组件左对齐、值用正文字号，是"信息"。
+ *
+ * 值固定单行 + 省略号：网格靠等高对齐，值换行会把同排另一格顶歪。
+ */
+@Composable
+fun UfiInfoCell(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalResolvedPalette.current
+    Column(modifier = modifier) {
+        Text(
+            text = label,
+            style = UfiTextStyles.note,
+            color = palette.textSecondary
+        )
+        Text(
+            text = value,
+            style = UfiTextStyles.bodyEmphasis,
+            color = palette.textPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
         )
     }
 }

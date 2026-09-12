@@ -3,9 +3,7 @@ package com.ufi_axis.ui.components.common
 
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.scaleOut
+import androidx.compose.animation.ExitTransition
 import com.ufi_axis.ui.R as UiR
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -48,6 +46,7 @@ import kotlinx.coroutines.delay
 // FIX-7（2026-08-23）：shell 默认 × close 图标。
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import com.ufi_axis.ui.theme.UfiMotion
 
 // ─────────────────────────────────────────────────
 // Dialog animation constants (centralized)
@@ -181,8 +180,11 @@ internal fun UfiDialogShell(
             mounted = true
             shown = true
         } else {
-            shown = false
-            delay(UfiDialogAnim.ExitDuration.toLong() + 16L)
+            // 统一为 B 类观感：关闭时不做卡片级退出动画，整窗（卡片+遮罩）随平台
+            // ufi_dialog_exit 一同缩放淡出。关键：不能先 shown=false 让卡片单独消失再揭窗，
+            // 否则会出现「卡片瞬间消失、只剩遮罩随后淡出」的闪烁——卡片须保持可见，
+            // 随整窗一起在 ufi_dialog_exit 里平滑淡出。
+            delay(16L)
             mounted = false
         }
     }
@@ -326,10 +328,9 @@ internal fun UfiDialogShell(
                 AnimatedVisibility(
                     visible = shown,
                     enter = EnterTransition.None,
-                    exit = scaleOut(
-                        targetScale = UfiDialogAnim.ExitScaleTarget,
-                        animationSpec = tween(UfiDialogAnim.ExitDuration, easing = UfiMotion.Easing.Accelerate)
-                    ) + fadeOut(animationSpec = tween(UfiDialogAnim.ExitDuration, easing = UfiMotion.Easing.Accelerate))
+                    // 统一为 B 类观感：关闭时不做卡片级 scaleOut+fadeOut，仅由平台窗口
+                    // ufi_dialog_exit（240ms）承担整窗淡出，与 when 硬卸载的弹窗完全一致。
+                    exit = ExitTransition.None
                 ) {
                     Box(
                         modifier = Modifier
@@ -482,7 +483,10 @@ fun DialogButtonRow(
             OutlinedButton(
                 onClick = onDismiss,
                 border = BorderStroke(1.dp, outlineColor ?: palette.dialogBorder),
-                colors = ButtonDefaults.outlinedButtonColors(contentColor = outlineTextColor ?: palette.textPrimary),
+                // 2026-09-08：原为 palette.textPrimary。同一个"取消"在两条路径上不同色 ——
+                // UfiDialogActions 走 UfiButton(Secondary) 是 accent，这里是 textPrimary，
+                // 同一个 App 里两种弹窗的取消按钮观感不一致。统一到 Secondary 的口径。
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = outlineTextColor ?: palette.accent),
                 shape = UfiCardDefaults.buttonShape,
                 enabled = enabled,
                 interactionSource = dismissInteraction,

@@ -36,7 +36,7 @@ object ErrorCode {
     /** 数据尚未就绪（采集未预热），如 `/api/traffic/realtime`。 */
     const val NO_DATA_YET = "NO_DATA_YET"
 
-    // ── 配对 / 设备密码（沿用 core 已有字面量，禁止改值）──
+    // ── 配对 / 配对密码（沿用 core 已有字面量，禁止改值）──
     const val INVALID_CODE = "INVALID_CODE"
     const val ALREADY_PAIRED = "ALREADY_PAIRED"
     const val INVALID_PASSWORD = "INVALID_PASSWORD"
@@ -54,8 +54,26 @@ object ErrorCode {
     const val INVALID_DEVICE_KEY = "INVALID_DEVICE_KEY"
     /** 配对挑战不存在 / 已被使用 / 已过期，客户端应重新 `POST /pairing/challenge`（HTTP 401）。 */
     const val INVALID_CHALLENGE = "INVALID_CHALLENGE"
-    /** 请求签名缺失、时间戳超窗或 nonce 重放（HTTP 401）。 */
+    /** 请求签名缺失、验签失败或 nonce 重放（HTTP 401）：客户端换新的 ts/nonce 重签**重试**即可。 */
     const val INVALID_SIGNATURE = "INVALID_SIGNATURE"
+
+    /**
+     * 请求 `X-Timestamp` 超出 ±5min 窗口（HTTP 401）。
+     *
+     * 2026-09-08 从 [INVALID_SIGNATURE] 里拆出来：时钟漂移是**可恢复**的，
+     * 客户端该做的是校时后重试，而不是像收到 444 那样清掉设备凭据去重新配对。
+     */
+    const val STALE_TIMESTAMP = "STALE_TIMESTAMP"
+
+    /**
+     * 配对存储不可读（HTTP 503），服务端处于降级态，**无法判断**请求方是否已配对。
+     *
+     * 2026-09-08 事故的对外契约：`paired_devices.json` 损坏时若回 444「你没配对」，
+     * 客户端会照约定清空本地 token → 全员重新配对 + 重新输密码。
+     * 回 503 + 本码的语义是「保留凭据，退避重试」。
+     */
+    const val AUTH_STORE_UNAVAILABLE = "AUTH_STORE_UNAVAILABLE"
+
 
     // ── 告警配置 ──
     /** `PUT api/alerts/config` 版本守门失败（HTTP 409），值与历史响应一致。 */

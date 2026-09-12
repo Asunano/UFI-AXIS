@@ -2,11 +2,16 @@ package com.ufi_axis.viewmodel.module
 
 import android.content.Context
 import android.content.Intent
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.view.accessibility.AccessibilityManager
 import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.data.model.*
 import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyHistoryStore
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppLogBuffer
 import com.ufi_axis.util.AppPreferences
@@ -86,8 +91,14 @@ class ToolsModule(
     private val _diagnoseState = MutableStateFlow(DiagnoseState())
     val diagnoseState: StateFlow<DiagnoseState> = _diagnoseState.asStateFlow()
 
+    /**
+     * 旧版终端历史文件，只用于一次性迁移到 core（见 [migrateLegacyConsoleHistory]）。
+     * 迁移成功即删除；新记录一律由 core 的 `console_history` 表保管。
+     */
     private val consoleHistoryFile = File(appContext.filesDir, "console_history.json")
-    private val MAX_PERSISTED_PER_TAB = 500
+
+    /** 终端历史每次拉取的条数；core 侧每通道保留 500 条。 */
+    private val CONSOLE_HISTORY_PAGE = 200
 
     // ── 设备更新状态（2026-08-10：后端自拉取 + 前端兜底推送） ──
     private val _updateDeviceState = MutableStateFlow<UpdateStatusResponse?>(null)
@@ -620,18 +631,11 @@ class ToolsModule(
         scope.launch {
             _events.collect { event -> crossModuleEventSink.tryEmit(event) }
         }
-        // 恢复持久化的控制台对话（AT / Shell）—— IO 线程读取，避免主线程阻塞
-        scope.launch(Dispatchers.IO) {
-            val history = loadConsoleHistory() ?: return@launch
-            val maxId = maxOf(
-                history.at.maxOfOrNull { it.id } ?: 0L,
-                history.shell.maxOfOrNull { it.id } ?: 0L
-            )
-            ConsoleMessage.seedIdAbove(maxId)
-            _toolsState.value = _toolsState.value.copy(
-                atMessages = history.at,
-                shellMessages = history.shell
-            )
+        // 终端历史现在由 core 保管（两端共享同一份）：先把旧版本地文件搬过去，再拉最新一页。
+        scope.launch {
+            migrateLegacyConsoleHistory()
+            refreshConsoleHistory(CONSOLE_CHANNEL_AT)
+            refreshConsoleHistory(CONSOLE_CHANNEL_SHELL)
         }
     }
 
@@ -710,19 +714,136 @@ class ToolsModule(
         return false
     }
 
-    /** 持久化控制台对话（AT + Shell）到 filesDir/console_history.json */
-    private fun persistConsoleHistory() {
-        scope.launch(Dispatchers.IO) {
-            runCatching {
-                val at = _toolsState.value.atMessages.takeLast(MAX_PERSISTED_PER_TAB)
-                val shell = _toolsState.value.shellMessages.takeLast(MAX_PERSISTED_PER_TAB)
-                consoleHistoryFile.writeText(AppJson.encodeToString(ConsoleHistoryPayload(at, shell)))
-            }.onFailure { e -> DebugLog.w("Tools", "持久化控制台历史失败: ${e.message}") }
+    /**
+     * 把 core 的一条命令记录摊成 UI 需要的两个气泡（命令 + 输出）。
+     *
+     * 气泡 id 用 `记录 id * 2` / `* 2 + 1`：LazyColumn 的 key 只要求唯一，
+     * 本地乐观气泡用的是 [ConsoleMessage.nextMessageId]（从毫秒时间戳起步的大数），
+     * 与这里的小数不会撞。
+     */
+    private fun ConsoleHistoryItem.toMessages(): List<ConsoleMessage> {
+        val isShell = channel == CONSOLE_CHANNEL_SHELL
+        val commandText = if (isShell) "${if (as_root) "# " else "$ "}$command" else command
+        val output = buildString {
+            if (stdout.isNotBlank()) append(stdout)
+            if (stderr.isNotBlank()) {
+                if (isNotEmpty()) append("\n")
+                if (isShell) append("[stderr]\n")
+                append(stderr)
+            }
+            if (truncated) {
+                if (isNotEmpty()) append("\n")
+                append("[输出过长已截断]")
+            }
+            // AT 没有退出码，exit_code 为 null（core 刻意不用 0 顶替）
+            if (exit_code != null) append("\n[exit: $exit_code]")
+            if (isEmpty()) append(if (ok) "(无输出)" else "(无响应)")
+        }
+        return listOf(
+            ConsoleMessage(id = id * 2, role = ConsoleRole.USER, text = commandText, timestamp = created_at),
+            ConsoleMessage(
+                id = id * 2 + 1,
+                role = if (ok) ConsoleRole.ASSISTANT else ConsoleRole.ERROR,
+                text = output,
+                timestamp = created_at
+            )
+        )
+    }
+
+    /**
+     * 从 core 拉取某个通道的终端历史并覆盖本地列表。
+     *
+     * core 是唯一真源（`console_history` 表），两端看到的是同一份记录。
+     * 返回的是「最新在前」，UI 是聊天式从上到下按时间递增，所以要 reversed。
+     */
+    fun refreshConsoleHistory(channel: String) {
+        scope.launch {
+            val messages = try {
+                api.getConsoleHistory(channel = channel, limit = CONSOLE_HISTORY_PAGE)
+                    .records.reversed().flatMap { it.toMessages() }
+            } catch (e: Exception) {
+                // 拉不到就保留当前列表（可能是本次会话刚发的命令），不清空、不报错弹窗
+                DebugLog.w("Tools", "拉取终端历史失败($channel): ${e.message}")
+                return@launch
+            }
+            _toolsState.value = when (channel) {
+                CONSOLE_CHANNEL_AT -> _toolsState.value.copy(atMessages = messages)
+                else -> _toolsState.value.copy(shellMessages = messages)
+            }
         }
     }
 
-    /** 读取持久化控制台历史；文件缺失/损坏返回 null（损坏时删除避免反复失败） */
-    private fun loadConsoleHistory(): ConsoleHistoryPayload? {
+    /** 清空某个通道的历史（core 侧删除，两端同时生效）。 */
+    fun clearConsoleHistory(channel: String) {
+        scope.launch {
+            try {
+                api.clearConsoleHistory(channel)
+            } catch (e: Exception) {
+                DebugLog.w("Tools", "清空终端历史失败($channel): ${e.message}")
+                return@launch
+            }
+            _toolsState.value = when (channel) {
+                CONSOLE_CHANNEL_AT -> _toolsState.value.copy(atMessages = emptyList())
+                else -> _toolsState.value.copy(shellMessages = emptyList())
+            }
+        }
+    }
+
+    /**
+     * 旧版本地历史的一次性迁移：`filesDir/console_history.json` → core。
+     *
+     * 旧文件只有 `role/text/timestamp`，没有命令与输出的结构化区分，所以只能按
+     * 「USER 气泡 = 一条命令，紧跟其后的气泡 = 它的输出」这条顺序假设还原，
+     * 并把 `#` / `$` 前缀反解成 as_root。还原不出的字段（退出码、耗时）留空。
+     *
+     * 迁移完成后**删除文件**，这既是幂等保证（下次启动没文件就不会重复导入），
+     * 也避免两份历史长期并存造成困惑。导入失败则保留文件，下次启动再试。
+     */
+    private suspend fun migrateLegacyConsoleHistory() {
+        val legacy = withContext(Dispatchers.IO) { loadLegacyConsoleHistory() } ?: return
+        val records = legacy.at.toLegacyRecords(CONSOLE_CHANNEL_AT) +
+            legacy.shell.toLegacyRecords(CONSOLE_CHANNEL_SHELL)
+        if (records.isEmpty()) {
+            withContext(Dispatchers.IO) { runCatching { consoleHistoryFile.delete() } }
+            return
+        }
+        try {
+            val resp = api.importConsoleHistory(ConsoleHistoryImportRequest(records))
+            DebugLog.i("Tools", "终端历史迁移完成：本地 ${records.size} 条 → core ${resp.imported} 条")
+            withContext(Dispatchers.IO) { runCatching { consoleHistoryFile.delete() } }
+        } catch (e: Exception) {
+            // 保留文件，下次启动再试（设备离线时首启很可能就是这条路径）
+            DebugLog.w("Tools", "终端历史迁移失败，稍后重试: ${e.message}")
+        }
+    }
+
+    /** 按「USER 气泡 + 紧随其后的输出气泡」配对，还原成 core 的记录结构。 */
+    private fun List<ConsoleMessage>.toLegacyRecords(channel: String): List<ConsoleHistoryItem> {
+        val out = mutableListOf<ConsoleHistoryItem>()
+        var i = 0
+        while (i < size) {
+            val msg = this[i]
+            if (msg.role != ConsoleRole.USER) { i++; continue }
+            val raw = msg.text
+            val asRoot = raw.startsWith("# ")
+            val command = raw.removePrefix("# ").removePrefix("$ ")
+            val reply = getOrNull(i + 1)?.takeIf { it.role != ConsoleRole.USER }
+            out += ConsoleHistoryItem(
+                channel = channel,
+                command = command,
+                as_root = asRoot,
+                stdout = reply?.text.orEmpty(),
+                ok = reply?.role == ConsoleRole.ASSISTANT,
+                source = "app",
+                created_at = msg.timestamp
+            )
+            i += if (reply != null) 2 else 1
+        }
+        return out
+    }
+
+    /** 读取旧版持久化文件；缺失/损坏返回 null（损坏时删除避免反复失败）。 */
+    private fun loadLegacyConsoleHistory(): ConsoleHistoryPayload? {
         if (!consoleHistoryFile.exists()) return null
         return runCatching {
             val text = consoleHistoryFile.readText()
@@ -748,7 +869,6 @@ class ToolsModule(
                     atMessages = _toolsState.value.atMessages + assistantMsg,
                     isLoading = false
                 )
-                persistConsoleHistory()
             } catch (e: Exception) {
                 val errorMsg = ConsoleMessage(role = ConsoleRole.ERROR, text = e.message ?: "AT 指令失败")
                 _toolsState.value = _toolsState.value.copy(
@@ -756,7 +876,6 @@ class ToolsModule(
                     isLoading = false,
                     errorMessage = null
                 )
-                persistConsoleHistory()
             }
         }
     }
@@ -795,20 +914,27 @@ class ToolsModule(
      *
      * @param silent 静默刷新：不翻 [ToolsState.isLoading]（否则下拉刷新指示器会被自动轮询点亮），
      *        失败也只记日志、不写 [ToolsState.errorMessage] —— 一次轮询失败不该在页面顶部挂错误横幅。
+     *        但两条路都会置 [ToolsState.smsContactsLoaded]：首屏骨架靠它收场，
+     *        跟"这次刷新是否安静"无关。
      */
     fun loadSmsContacts(silent: Boolean = false) {
         scope.launch {
             if (!silent) _toolsState.value = _toolsState.value.copy(isLoading = true)
             try {
                 val resp = api.getSmsContacts()
-                _toolsState.value = _toolsState.value.copy(smsContacts = resp.contacts, isLoading = false)
-                // T04 N9：新短信差异检测（last_sms_total 对比未读数）
-                notificationCenter.maybeNotifyNewSms(resp.contacts)
+                _toolsState.value = _toolsState.value.copy(
+                    smsContacts = resp.contacts, isLoading = false, smsContactsLoaded = true
+                )
             } catch (e: Exception) {
                 if (silent) {
                     DebugLog.w("Tools", "短信联系人静默刷新失败", e)
+                    _toolsState.value = _toolsState.value.copy(smsContactsLoaded = true)
                 } else {
-                    _toolsState.value = _toolsState.value.copy(isLoading = false, errorMessage = "短信联系人加载失败: ${e.message}")
+                    _toolsState.value = _toolsState.value.copy(
+                        isLoading = false,
+                        errorMessage = "短信联系人加载失败: ${e.message}",
+                        smsContactsLoaded = true
+                    )
                 }
             }
         }
@@ -852,11 +978,31 @@ class ToolsModule(
         false
     }
 
+    /**
+     * 把某个号码的会话整段标为已读（`POST /api/sms/read-conversation`），**不打开对话**。
+     *
+     * [openConversation] 里也调同一个端点，但那里是"打开对话"的副作用、失败被静默忽略；
+     * 这里是用户在会话行长按菜单里显式点的动作，需要返回值来决定 Toast 文案。
+     *
+     * 不做乐观更新：未读数的真源在设备，先本地清零再失败会长期不一致（口径同 [markAllSmsRead]）。
+     */
+    suspend fun markConversationRead(phone: String): Boolean = try {
+        val ok = api.markConversationRead(mapOf("phone" to phone)).success
+        if (ok) {
+            loadSmsContacts(silent = true)
+            loadSmsCount()
+        }
+        ok
+    } catch (e: Exception) {
+        DebugLog.w("Tools", "会话标记已读失败", e)
+        false
+    }
+
     /** WS 推送更新联系人列表（免 HTTP 请求，实时性高） */
     fun updateSmsContactsFromWs(contacts: List<SmsContact>) {
-        _toolsState.value = _toolsState.value.copy(smsContacts = contacts)
-        // T04 N9：WS sms_contacts 实时推送也做未读数差异检测
-        notificationCenter.maybeNotifyNewSms(contacts)
+        // 推送本身就是一次"结果落地"：HTTP 那条路还没回来（或压根失败）时，
+        // 首屏骨架也该由它收场，否则页面会一直停在骨架上等一个可能不来的响应。
+        _toolsState.value = _toolsState.value.copy(smsContacts = contacts, smsContactsLoaded = true)
     }
 
     fun loadSmsList() {
@@ -979,9 +1125,14 @@ class ToolsModule(
     /**
      * 拉取验证码缓存。
      *
-     * 2026-08-29：改为**无感刷新** —— 不再翻 `verificationCodesLoading` 让页面出现加载态，
-     * 数据静默替换。该字段仍保留给需要显式 loading 的调用方（当前 UI 已不读它）。
-     * 同时角标改成「未读水位」语义：`msgId > smsCodeSeenMsgId` 的条数；若用户此刻正停在
+     * 2026-08-29：改为**无感刷新** —— 不翻任何加载态，数据静默替换。
+     * 2026-09-08：无感刷新那次顺手删掉了页面唯一的"落地"信号，导致首屏骨架永久挂死
+     * （详见 [ToolsState.verificationCodesLoaded]）。现在成功与失败两条路都把
+     * [ToolsState.verificationCodesLoaded] 置 true：它只表示"这次尝试结束了"，
+     * 不是加载态，因此既能让首屏骨架收场（空列表 → 空态），又不会让后续刷新闪骨架。
+     * 失败仍然不写 [ToolsState.errorMessage]：一次静默刷新失败不该在页面顶部挂错误横幅。
+     *
+     * 角标是「未读水位」语义：`msgId > smsCodeSeenMsgId` 的条数；若用户此刻正停在
      * 通知页签，拉到新数据的同时直接标记为已看，避免角标闪一下又灭。
      */
     fun loadVerificationCodes() {
@@ -997,36 +1148,649 @@ class ToolsModule(
                 _toolsState.update {
                     it.copy(
                         verificationCodes = resp.codes,
-                        verificationCodesLoading = false,
+                        verificationCodesLoaded = true,
                         verificationCodesUnread = resp.codes.count { c -> c.msgId > seen }
                     )
                 }
-                // T04 N10：验证码差异检测（游标 + 新鲜度窗口，必须整批传入）
-                notificationCenter.maybeNotifyVerificationCodes(resp.codes)
+                autoCopyNewestVerificationCode(resp.codes)
             } catch (e: Exception) {
-                // 无感刷新：失败也不弹错误横幅打断阅读，只在日志留痕（列表仍显示上一次的数据）
+                // 无感刷新：失败也不弹错误横幅打断阅读，只在日志留痕（列表仍显示上一次的数据）；
+                // 但"尝试过了"必须记下来，否则首屏骨架没有任何收场条件。
                 DebugLog.w("Sms", "验证码加载失败: ${e.message}")
-                _toolsState.update { it.copy(verificationCodesLoading = false) }
+                _toolsState.update { it.copy(verificationCodesLoaded = true) }
             }
         }
     }
 
+    /**
+     * 自动复制"新收到"的验证码到剪贴板。
+     *
+     * 仅在「自动复制开关开启」且「系统无障碍服务（UfiNotifyAccessibilityService）已启用」时生效 ——
+     * 这是产品硬性要求：无障碍未开启则功能不可用。无障碍可在运行期被用户关闭，因此这里每次都
+     * 重新探测，避免开着开关却因服务被关而静默失效。
+     *
+     * 只在真正新收到的验证码上触发：用 [lastAutoCopiedMsgId] 记录已处理到的最大 msgId，
+     * 仅当本次拉取的列表里出现比它更大的 msgId 才复制其中最新的一条，并推进基线。
+     * 首次观察（基线为 -1）只校准基线、不复制历史验证码；无障碍关闭期间到达的验证码也会被推进
+     * 基线消费掉，重新开启后不会把过期码补复制到剪贴板。
+     */
+    private var lastAutoCopiedMsgId = -1L
+
+    private fun autoCopyNewestVerificationCode(codes: List<com.ufi_axis.data.model.VerificationCode>) {
+        val maxId = codes.maxOfOrNull { it.msgId } ?: return
+        if (maxId <= lastAutoCopiedMsgId) return
+        if (lastAutoCopiedMsgId == -1L) {
+            lastAutoCopiedMsgId = maxId
+            return
+        }
+        val autoCopy = _toolsState.value.smsCodeAutoCopy
+        if (autoCopy && isAccessibilityServiceEnabled()) {
+            codes.filter { it.msgId > lastAutoCopiedMsgId }
+                .maxByOrNull { it.msgId }
+                ?.let { copyToClipboard(it.code) }
+        }
+        lastAutoCopiedMsgId = maxId
+    }
+
+    /** 本应用的无障碍服务（UfiNotifyAccessibilityService）是否已启用 */
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        val am = appContext.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
+        val serviceName = "com.ufi_axis.notification.UfiNotifyAccessibilityService"
+        return am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any {
+                it.resolveInfo.serviceInfo.packageName == appContext.packageName &&
+                    it.resolveInfo.serviceInfo.name == serviceName
+            }
+    }
+
+    private fun copyToClipboard(text: String) {
+        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+        cm.setPrimaryClip(ClipData.newPlainText("验证码", text))
+        DebugLog.i("Sms", "自动复制验证码已写入剪贴板")
+    }
+
+    /**
+     * 验证码自动解析开关。
+     *
+     * 乐观更新 + **失败回滚**。2026-09-08：原实现是 `catch (_: Exception) {}` ——
+     * 请求失败时本地已经翻成新值、core 那边没变，下一次 [refreshDeviceConfig] 回读又把它
+     * 拨回去，用户看到的就是「设置自己弹回来」而且中间没有任何提示。
+     */
     fun setSmsCodeEnabled(enabled: Boolean) {
+        val previous = _toolsState.value.smsCodeEnabled
         _toolsState.update { it.copy(smsCodeEnabled = enabled, smsCodeOptInShown = true) }
         scope.launch {
             try {
                 api.updateConfig(mapOf("sms_code_enabled" to enabled))
                 if (enabled) loadVerificationCodes()
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(smsCodeEnabled = previous) }
+                emitNetworkError("验证码解析开关保存失败: ${e.message}")
+            }
         }
     }
 
+    /** 验证码缓存自动清理间隔（小时；0 = 永不清理）。乐观更新 + 失败回滚，理由同 [setSmsCodeEnabled]。 */
     fun setSmsCodeCleanupHours(hours: Int) {
+        val previous = _toolsState.value.smsCodeCleanupHours
         _toolsState.update { it.copy(smsCodeCleanupHours = hours) }
         scope.launch {
             try {
                 api.updateConfig(mapOf("sms_code_cleanup_hours" to hours))
-            } catch (_: Exception) {}
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(smsCodeCleanupHours = previous) }
+                emitNetworkError("清理间隔保存失败: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * 自动复制验证码开关。乐观更新 + 失败回滚（同 [setSmsCodeEnabled]）。
+     *
+     * 开启成功后重置自动复制基线（[lastAutoCopiedMsgId] = -1），避免把历史验证码当成"新"的
+     * 复制出去。该开关的可用性还依赖系统无障碍服务（UfiNotifyAccessibilityService），
+     * UI 会在未开启时禁用本开关并引导去开启；运行时若无障碍被关闭，[autoCopyNewestVerificationCode]
+     * 侧也会重新探测并跳过复制。
+     */
+    fun setSmsCodeAutoCopy(enabled: Boolean) {
+        val previous = _toolsState.value.smsCodeAutoCopy
+        _toolsState.update { it.copy(smsCodeAutoCopy = enabled) }
+        scope.launch {
+            try {
+                api.updateConfig(mapOf("sms_code_auto_copy" to enabled))
+                if (enabled) lastAutoCopiedMsgId = -1L
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(smsCodeAutoCopy = previous) }
+                emitNetworkError("自动复制验证码保存失败: ${e.message}")
+            }
+        }
+    }
+
+    // ── 短信拦截（号码黑名单 + 关键词）────────────────────────────────────────────
+    //
+    // 判定全部在 core：命中的短信不发邮件、不推通知、不入验证码库、不进列表与计数，
+    // app 天然收不到。所以这一段**只做规则的增删改查 + 拦截记录的读/清**，
+    // 一行判定逻辑都不该出现在这里。
+
+    /**
+     * 拉取规则列表。
+     *
+     * @param silent 静默刷新：失败只记日志、不写 [ToolsState.errorMessage]。
+     *        但两条路都会置 [ToolsState.smsRulesLoaded] —— 首屏骨架靠它收场，
+     *        跟「这次刷新是否安静」无关（口径同 [loadSmsContacts]）。
+     */
+    fun loadSmsRules(silent: Boolean = false) {
+        scope.launch {
+            try {
+                val resp = api.getSmsRules()
+                // 按创建时间正序：规则行带 key，若按 hit_count 之类会变的字段排序，
+                // 命中一次列表就重排，用户正在点的那一行会从手指底下跑走。
+                _toolsState.update {
+                    it.copy(smsRules = resp.rules.sortedBy { r -> r.createdAt }, smsRulesLoaded = true)
+                }
+            } catch (e: Exception) {
+                if (silent) {
+                    DebugLog.w("Sms", "拦截规则静默刷新失败: ${e.message}")
+                    _toolsState.update { it.copy(smsRulesLoaded = true) }
+                } else {
+                    _toolsState.update {
+                        it.copy(smsRulesLoaded = true, errorMessage = "拦截规则加载失败: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 新增（[id] <= 0）或修改规则。返回 false = 写入失败，调用方据此提示。
+     *
+     * **不做乐观更新**：新增拿不到 core 生成的 id、修改要等校验（pattern 空串会被 400 拒），
+     * 先本地插一条再回滚反而会让列表闪一下。写成功后统一重拉，以 core 为唯一真源。
+     */
+    suspend fun saveSmsRule(
+        id: Long,
+        pattern: String,
+        ruleScope: String,
+        matchType: String,
+        note: String
+    ): Boolean {
+        _toolsState.update { it.copy(smsRulesBusy = true) }
+        return try {
+            val body = SmsRuleRequest(
+                pattern = pattern,
+                scope = ruleScope,
+                matchType = matchType,
+                note = note
+            )
+            val ok = if (id > 0) api.updateSmsRule(id, body).success
+            else api.createSmsRule(body).success
+            if (ok) loadSmsRules(silent = true)
+            ok
+        } catch (e: Exception) {
+            DebugLog.w("Sms", "拦截规则保存失败: ${e.message}")
+            false
+        } finally {
+            _toolsState.update { it.copy(smsRulesBusy = false) }
+        }
+    }
+
+    /**
+     * 切换单条规则的启用态。**乐观更新 + 失败回滚**。
+     *
+     * 这里做乐观更新是因为开关必须立刻跟手（等一个来回会让人以为没点上），
+     * 而失败时把那一条按 id 精准还原 —— 不是整列表重拉，那会把用户同时改的其它行也覆盖掉。
+     * 请求体只带 `enabled`：core 的 PUT 是字段级合并，不会顺手把 pattern/scope 重置。
+     */
+    suspend fun setSmsRuleEnabled(id: Long, enabled: Boolean): Boolean {
+        val previous = _toolsState.value.smsRules.firstOrNull { it.id == id } ?: return false
+        _toolsState.update { s ->
+            s.copy(smsRules = s.smsRules.map { if (it.id == id) it.copy(enabled = enabled) else it })
+        }
+        return try {
+            val ok = api.updateSmsRule(id, SmsRuleRequest(enabled = enabled)).success
+            if (!ok) restoreSmsRule(previous)
+            ok
+        } catch (e: Exception) {
+            DebugLog.w("Sms", "拦截规则开关保存失败: ${e.message}")
+            restoreSmsRule(previous)
+            false
+        }
+    }
+
+    /** 把某一条规则还原成写入前的快照（失败回滚用）。 */
+    private fun restoreSmsRule(snapshot: SmsRule) {
+        _toolsState.update { s ->
+            s.copy(smsRules = s.smsRules.map { if (it.id == snapshot.id) snapshot else it })
+        }
+    }
+
+    /**
+     * 删除规则。乐观移除 + 失败把那一条插回原位。
+     *
+     * `deleted = 0` 也算成功：core 的语义是「目标状态『它不在列表里』已达成」。
+     */
+    suspend fun deleteSmsRule(id: Long): Boolean {
+        val snapshot = _toolsState.value.smsRules
+        if (snapshot.none { it.id == id }) return false
+        _toolsState.update { s -> s.copy(smsRules = s.smsRules.filterNot { it.id == id }) }
+        return try {
+            val ok = api.deleteSmsRule(id).success
+            if (!ok) _toolsState.update { it.copy(smsRules = snapshot) }
+            ok
+        } catch (e: Exception) {
+            DebugLog.w("Sms", "拦截规则删除失败: ${e.message}")
+            _toolsState.update { it.copy(smsRules = snapshot) }
+            false
+        }
+    }
+
+    /**
+     * 把号码加入黑名单（短信页会话行长按用）。
+     *
+     * 固定 `scope=sender, match_type=equals`：这是「拉黑这个号码」的精确表达。
+     * 用 contains 会把号码当子串匹配（拉黑 `123` 会连 `12345` 一起拦），
+     * 用 body 更是会把正文里提到该号码的正常短信也拦掉 —— 那正是旧 `blacklist` 字段的 bug。
+     */
+    suspend fun addSmsSenderBlacklist(phone: String): Boolean = saveSmsRule(
+        id = 0L,
+        pattern = phone.trim(),
+        ruleScope = SmsRuleScope.SENDER,
+        matchType = SmsRuleMatch.EQUALS,
+        note = "会话列表拉黑"
+    )
+
+    /**
+     * 拉取拦截记录**首页**（重置 keyset 游标）。
+     *
+     * 失败不写 [ToolsState.errorMessage]（自查列表读不到就画空态，不该在页面顶部挂常驻横幅），
+     * 但成功与失败都置 [ToolsState.smsBlockedLoaded] —— 否则首屏骨架没有收场条件。
+     */
+    fun loadSmsBlocked() {
+        scope.launch {
+            try {
+                val resp = api.getSmsBlocked(limit = SMS_BLOCKED_PAGE_SIZE)
+                val prefs = AppPreferences(appContext)
+                val seen = prefs.smsBlockedSeenId
+                _toolsState.update {
+                    it.copy(
+                        smsBlocked = resp.records,
+                        smsBlockedLoaded = true,
+                        smsBlockedLoadingMore = false,
+                        smsBlockedCursorTs = resp.nextCursorTs,
+                        smsBlockedCursorId = resp.nextCursorId,
+                        smsBlockedHasMore = resp.hasMore,
+                        smsBlockedTotal = resp.total,
+                        smsBlockedUnviewed = resp.records.count { r -> r.id > seen }
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("Sms", "拦截记录加载失败: ${e.message}")
+                _toolsState.update { it.copy(smsBlockedLoaded = true, smsBlockedLoadingMore = false) }
+            }
+        }
+    }
+
+    /**
+     * 加载下一页拦截记录（列表滚到底触发）。
+     *
+     * 游标为 null 时直接返回：那说明首页还没回来，此时带空游标发请求等于重复拉第一页。
+     * [ToolsState.smsBlockedLoadingMore] 兼作并发闸门 —— 滚动回调一帧可能触发多次。
+     */
+    fun loadMoreSmsBlocked() {
+        val s = _toolsState.value
+        if (!s.smsBlockedHasMore || s.smsBlockedLoadingMore) return
+        val cursorTs = s.smsBlockedCursorTs ?: return
+        val cursorId = s.smsBlockedCursorId ?: return
+        scope.launch {
+            _toolsState.update { it.copy(smsBlockedLoadingMore = true) }
+            try {
+                val resp = api.getSmsBlocked(
+                    limit = SMS_BLOCKED_PAGE_SIZE,
+                    cursorTs = cursorTs,
+                    cursorId = cursorId
+                )
+                val prefs = AppPreferences(appContext)
+                val seen = prefs.smsBlockedSeenId
+                _toolsState.update { cur ->
+                    // 按 id 去重再拼：core 的 keyset 分页本身不会重，但「翻页途中新记录插到表头」
+                    // 会让某一页边界重叠一条，重复 key 会让 LazyColumn 直接崩。
+                    val existing = cur.smsBlocked.mapTo(HashSet()) { it.id }
+                    val merged = cur.smsBlocked + resp.records.filterNot { it.id in existing }
+                    cur.copy(
+                        smsBlocked = merged,
+                        smsBlockedLoadingMore = false,
+                        smsBlockedCursorTs = resp.nextCursorTs,
+                        smsBlockedCursorId = resp.nextCursorId,
+                        smsBlockedHasMore = resp.hasMore,
+                        smsBlockedTotal = resp.total,
+                        smsBlockedUnviewed = merged.count { r -> r.id > seen }
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("Sms", "拦截记录翻页失败: ${e.message}")
+                // 只落忙碌态，**不动游标与 hasMore**：下一次滚到底还能用同一个游标重试。
+                _toolsState.update { it.copy(smsBlockedLoadingMore = false) }
+            }
+        }
+    }
+
+    /**
+     * 把「已拦截」角标的已读水位推到当前列表的最大记录 id，并把角标数归 0。
+     *
+     * 只前推不回退（`maxOf`）：并发的刷新若拿到旧快照，不会把水位往回拨、
+     * 让已经看过的记录重新点亮角标。
+     */
+    fun markSmsBlockedSeen() {
+        val records = _toolsState.value.smsBlocked
+        if (records.isNotEmpty()) {
+            val prefs = AppPreferences(appContext)
+            prefs.smsBlockedSeenId = maxOf(prefs.smsBlockedSeenId, records.maxOf { it.id })
+        }
+        _toolsState.update { it.copy(smsBlockedUnviewed = 0) }
+    }
+
+    /** 清空全部拦截记录。成功后重拉（列表变空、游标归零），失败返回 false 交给 UI 提示。 */
+    suspend fun clearSmsBlocked(): Boolean = try {
+        val ok = api.clearSmsBlocked().success
+        if (ok) loadSmsBlocked()
+        ok
+    } catch (e: Exception) {
+        DebugLog.w("Sms", "拦截记录清空失败: ${e.message}")
+        false
+    }
+
+    /**
+     * 删除单条拦截记录。乐观移除 + 失败还原。
+     *
+     * 回滚只还原**列表**，total 用 `+1` 对称乐观分支的 `-1`：`snapshot` 只是已加载的那一页
+     * （每页 50），而 total 是服务端全表总数（上限 500）。原来回滚时写 `snapshot.size`，
+     * 一次删除失败就能把「共 500 条」直接掉成「共 50 条」。
+     */
+    suspend fun deleteSmsBlocked(id: Long): Boolean {
+        val snapshot = _toolsState.value.smsBlocked
+        if (snapshot.none { it.id == id }) return false
+        _toolsState.update { s ->
+            s.copy(
+                smsBlocked = s.smsBlocked.filterNot { it.id == id },
+                smsBlockedTotal = (s.smsBlockedTotal - 1).coerceAtLeast(0)
+            )
+        }
+        return try {
+            val ok = api.deleteSmsBlocked(id).success
+            if (!ok) _toolsState.update { it.copy(smsBlocked = snapshot, smsBlockedTotal = it.smsBlockedTotal + 1) }
+            ok
+        } catch (e: Exception) {
+            DebugLog.w("Sms", "拦截记录删除失败: ${e.message}")
+            _toolsState.update { it.copy(smsBlocked = snapshot, smsBlockedTotal = it.smsBlockedTotal + 1) }
+            false
+        }
+    }
+
+    // ══════════════════ 通知历史（2026-09-08） ══════════════════
+    //
+    // 两个数据源、两套 keyset 游标分页，刻意不合并成一个列表：
+    // - 系统通知历史在**本机 Room**（`notify_history`），写入方是 `:ufi_notify`；
+    // - 邮件历史在**设备端**（`GET /api/sms-forward/history`）。
+    // 合并成一条时间线要先把两边全拉下来才能排序，翻页语义直接失效。
+    //
+    // 两侧都用 (ts,id) 双游标而不是 OFFSET：写入方在另一个进程 / 另一台设备上，
+    // 翻页途中随时会有新记录插到表头，OFFSET 会漏行（全仓 DAO 层也没有 OFFSET）。
+
+    /**
+     * 读系统通知历史首页（换筛选也走这里，会重置游标）。
+     *
+     * 失败不写 [ToolsState.errorMessage]：自查列表读不到就画空态，不该在页面顶部挂常驻横幅
+     * （与 [loadSmsBlocked] 同口径）。
+     *
+     * [ToolsState.notifyHistoryLoadingMore] 兼作并发闸门 —— 首页与翻页并发会互相盖掉游标，
+     * 而「进页面」与「回到前台」这两个触发点本来就可能落在同一帧。
+     */
+    fun loadNotifyHistory(filter: NotifyHistoryStore.Filter = _toolsState.value.notifyHistoryFilter) {
+        val cur = _toolsState.value
+        // 换筛选必须放行：正在飞的那次请求属于旧筛选，结果已经没用了。
+        if (cur.notifyHistoryLoadingMore && filter == cur.notifyHistoryFilter) return
+        scope.launch {
+            _toolsState.update { it.copy(notifyHistoryLoadingMore = true) }
+            try {
+                val page = NotifyHistoryStore.list(
+                    context = appContext,
+                    filter = filter,
+                    cursorTs = null,
+                    cursorId = null,
+                    limit = NOTIFY_HISTORY_PAGE_SIZE
+                )
+                val total = NotifyHistoryStore.count(appContext)
+                val last = page.lastOrNull()
+                _toolsState.update {
+                    it.copy(
+                        notifyHistory = page,
+                        notifyHistoryFilter = filter,
+                        notifyHistoryLoaded = true,
+                        notifyHistoryLoadingMore = false,
+                        notifyHistoryTotal = total,
+                        notifyHistoryCursorTs = last?.ts,
+                        notifyHistoryCursorId = last?.id,
+                        notifyHistoryHasMore = page.size >= NOTIFY_HISTORY_PAGE_SIZE
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("NotifyHistory", "本机通知历史读取失败: ${e.message}")
+                // **不推进筛选**：列表还是上一份数据，把 chip 拨到新值会让「筛选」与「数据」对不上。
+                _toolsState.update {
+                    it.copy(notifyHistoryLoaded = true, notifyHistoryLoadingMore = false)
+                }
+            }
+        }
+    }
+
+    /**
+     * 加载下一页系统通知历史（滚到底触发）。
+     *
+     * 游标为 null 说明首页还没回来，此时带空游标发请求等于重复拉第一页。
+     * 按 id 去重再拼：keyset 本身不会重，但清空/裁剪与翻页并发时边界可能重叠一条，
+     * 重复 key 会让 LazyColumn 直接崩。
+     */
+    fun loadMoreNotifyHistory() {
+        val s = _toolsState.value
+        if (!s.notifyHistoryHasMore || s.notifyHistoryLoadingMore) return
+        val cursorTs = s.notifyHistoryCursorTs ?: return
+        val cursorId = s.notifyHistoryCursorId ?: return
+        scope.launch {
+            _toolsState.update { it.copy(notifyHistoryLoadingMore = true) }
+            try {
+                val page = NotifyHistoryStore.list(
+                    context = appContext,
+                    filter = s.notifyHistoryFilter,
+                    cursorTs = cursorTs,
+                    cursorId = cursorId,
+                    limit = NOTIFY_HISTORY_PAGE_SIZE
+                )
+                val last = page.lastOrNull()
+                _toolsState.update { cur ->
+                    val existing = cur.notifyHistory.mapTo(HashSet()) { it.id }
+                    cur.copy(
+                        notifyHistory = cur.notifyHistory + page.filterNot { it.id in existing },
+                        notifyHistoryLoadingMore = false,
+                        // 游标只在真取到行时前进；空页说明到底了，hasMore 同时落 false。
+                        notifyHistoryCursorTs = last?.ts ?: cur.notifyHistoryCursorTs,
+                        notifyHistoryCursorId = last?.id ?: cur.notifyHistoryCursorId,
+                        notifyHistoryHasMore = page.size >= NOTIFY_HISTORY_PAGE_SIZE
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("NotifyHistory", "本机通知历史翻页失败: ${e.message}")
+                // 只落忙碌态，不动游标与 hasMore：下一次滚到底还能用同一个游标重试。
+                _toolsState.update { it.copy(notifyHistoryLoadingMore = false) }
+            }
+        }
+    }
+
+    /** 清空本机通知历史。成功后重拉（列表变空、总数归零）。 */
+    suspend fun clearNotifyHistory(): Boolean = try {
+        NotifyHistoryStore.clear(appContext)
+        loadNotifyHistory()
+        true
+    } catch (e: Exception) {
+        DebugLog.w("NotifyHistory", "本机通知历史清空失败: ${e.message}")
+        false
+    }
+
+    /**
+     * 读投递记录首页（换渠道或换筛选也走这里，两种都会重置游标）。
+     *
+     * 并发闸门与「换筛选放行」的理由同 [loadNotifyHistory]：同一组条件的重复请求丢掉，
+     * 条件变了必须放行 —— 那是用户的新意图，拦掉就等于点了没反应。
+     *
+     * @param channel `"mail"` / `"webhook"` / `"local_sms"`，null = 不限渠道。
+     *   由调用方（各渠道的记录页）给定，本模块不猜。
+     * @param result 三态筛选的线上口径值，null = 不过滤。
+     */
+    fun loadDeliveryHistory(channel: String?, result: String? = null) {
+        val cur = _toolsState.value
+        if (cur.deliveryHistoryLoadingMore &&
+            channel == cur.deliveryHistoryChannel &&
+            result == cur.deliveryHistoryResult
+        ) return
+        val channelChanged = channel != cur.deliveryHistoryChannel
+        scope.launch {
+            _toolsState.update { s ->
+                // 换渠道时先把上一条渠道的行与计数清掉：留着它们会让用户把别人的记录
+                // 当成本渠道的，而"清空后显示骨架"至少是诚实的"还不知道"。
+                val base = if (channelChanged) {
+                    s.copy(
+                        deliveryHistory = emptyList(),
+                        deliveryHistoryLoaded = false,
+                        deliveryHistoryTotal = 0,
+                        deliveryHistoryFailedTotal = 0,
+                        deliveryHistorySkippedTotal = 0,
+                        deliveryHistoryCursorTs = null,
+                        deliveryHistoryCursorId = null,
+                        deliveryHistoryHasMore = false
+                    )
+                } else {
+                    s
+                }
+                base.copy(deliveryHistoryLoadingMore = true, deliveryHistoryChannel = channel)
+            }
+            try {
+                val resp = api.getMailHistory(
+                    limit = DELIVERY_HISTORY_PAGE_SIZE,
+                    channel = channel,
+                    result = result
+                )
+                _toolsState.update {
+                    it.copy(
+                        deliveryHistory = resp.records,
+                        deliveryHistoryResult = result,
+                        deliveryHistoryLoaded = true,
+                        deliveryHistoryLoadingMore = false,
+                        deliveryHistoryCursorTs = resp.nextCursorTs,
+                        deliveryHistoryCursorId = resp.nextCursorId,
+                        deliveryHistoryHasMore = resp.hasMore,
+                        deliveryHistoryTotal = resp.total,
+                        deliveryHistoryFailedTotal = resp.failedTotal,
+                        deliveryHistorySkippedTotal = resp.skippedTotal
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("DeliveryHistory", "投递记录加载失败: ${e.message}")
+                // 同 loadNotifyHistory：失败不推进筛选，否则页面显示「只看没发出」而列表是上一份数据。
+                _toolsState.update {
+                    it.copy(deliveryHistoryLoaded = true, deliveryHistoryLoadingMore = false)
+                }
+            }
+        }
+    }
+
+    /**
+     * 加载下一页投递记录（并发闸门与游标语义同 [loadMoreSmsBlocked]）。
+     *
+     * 渠道与结果两个筛选都从 state 原样带回去：漏一个就会翻出别的渠道或别的结果的记录，
+     * 表现是「往下滚一屏，筛选自己变了」。
+     */
+    fun loadMoreDeliveryHistory() {
+        val s = _toolsState.value
+        if (!s.deliveryHistoryHasMore || s.deliveryHistoryLoadingMore) return
+        val cursorTs = s.deliveryHistoryCursorTs ?: return
+        val cursorId = s.deliveryHistoryCursorId ?: return
+        scope.launch {
+            _toolsState.update { it.copy(deliveryHistoryLoadingMore = true) }
+            try {
+                val resp = api.getMailHistory(
+                    limit = DELIVERY_HISTORY_PAGE_SIZE,
+                    cursorTs = cursorTs,
+                    cursorId = cursorId,
+                    channel = s.deliveryHistoryChannel,
+                    result = s.deliveryHistoryResult
+                )
+                _toolsState.update { cur ->
+                    val existing = cur.deliveryHistory.mapTo(HashSet()) { it.id }
+                    cur.copy(
+                        deliveryHistory = cur.deliveryHistory +
+                            resp.records.filterNot { it.id in existing },
+                        deliveryHistoryLoadingMore = false,
+                        deliveryHistoryCursorTs = resp.nextCursorTs,
+                        deliveryHistoryCursorId = resp.nextCursorId,
+                        deliveryHistoryHasMore = resp.hasMore,
+                        deliveryHistoryTotal = resp.total,
+                        deliveryHistoryFailedTotal = resp.failedTotal,
+                        deliveryHistorySkippedTotal = resp.skippedTotal
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("DeliveryHistory", "投递记录翻页失败: ${e.message}")
+                _toolsState.update { it.copy(deliveryHistoryLoadingMore = false) }
+            }
+        }
+    }
+
+    /**
+     * 清空**当前渠道**的投递记录（`DELETE …/history?channel=…`）。
+     *
+     * 只清当前渠道：三条渠道共用一张表，但用户是在某一条渠道的记录页里点的清空，
+     * 顺手把另两条也删掉属于越权。成功后先把本渠道的列表与三个计数归零（不等重拉回来，
+     * 否则会有一段时间"点了清空但列表还在"），再按当前筛选重拉一次拿准确的空态。
+     */
+    suspend fun clearDeliveryHistory(): Boolean = try {
+        val s = _toolsState.value
+        val channel = s.deliveryHistoryChannel
+        val ok = api.clearMailHistory(channel = channel).success
+        if (ok) {
+            _toolsState.update {
+                it.copy(
+                    deliveryHistory = emptyList(),
+                    deliveryHistoryTotal = 0,
+                    deliveryHistoryFailedTotal = 0,
+                    deliveryHistorySkippedTotal = 0,
+                    deliveryHistoryCursorTs = null,
+                    deliveryHistoryCursorId = null,
+                    deliveryHistoryHasMore = false
+                )
+            }
+            loadDeliveryHistory(channel, s.deliveryHistoryResult)
+        }
+        ok
+    } catch (e: Exception) {
+        DebugLog.w("DeliveryHistory", "投递记录清空失败: ${e.message}")
+        false
+    }
+
+    /**
+     * 验证码豁免关键词拦截开关（走既有 `PUT /api/config`）。
+     *
+     * 乐观更新 + **失败回滚**：真源在 core，本地翻了而 core 没改的话，
+     * 下一次 [refreshDeviceConfig] 回读就会把开关拨回去 —— 那就是「设置自己弹回来」。
+     */
+    fun setSmsFilterExemptVerificationCode(enabled: Boolean) {
+        val previous = _toolsState.value.smsFilterExemptVerificationCode
+        _toolsState.update { it.copy(smsFilterExemptVerificationCode = enabled) }
+        scope.launch {
+            try {
+                api.updateConfig(mapOf("sms_filter_exempt_verification_code" to enabled))
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(smsFilterExemptVerificationCode = previous) }
+                emitNetworkError("验证码豁免开关保存失败: ${e.message}")
+            }
         }
     }
 
@@ -1053,7 +1817,11 @@ class ToolsModule(
             _toolsState.update {
                 it.copy(
                     smsCodeEnabled = cfg.sms_code_enabled,
-                    smsCodeCleanupHours = cfg.sms_code_cleanup_hours
+                    smsCodeCleanupHours = cfg.sms_code_cleanup_hours,
+                    smsCodeAutoCopy = cfg.sms_code_auto_copy,
+                    // 验证码豁免：真源在 core，这里是镜像。默认值两端都是 true，
+                    // 所以「core 没返回这个键」与「core 说 true」等价，不会造出假开关。
+                    smsFilterExemptVerificationCode = cfg.sms_filter_exempt_verification_code
                 )
             }
             // core 为真源：直接覆盖本地缓存。
@@ -1184,6 +1952,24 @@ class ToolsModule(
     companion object {
         private const val CONVERSATION_PAGE_SIZE = 100
 
+        /**
+         * 拦截记录每页条数（keyset 游标）。
+         *
+         * 与 core 的 `GET /api/sms/blocked` 默认值一致（50，上限 200）。取 50 而不是 100：
+         * 这是自查列表，用户翻两页就该去改规则而不是一直往下滚；而且 core 侧记录总量
+         * 被环形上限写死在 500，页太大等于一次把大半张表拉过来。
+         */
+        private const val SMS_BLOCKED_PAGE_SIZE = 50
+
+        /**
+         * 通知历史每页条数（两个 tab 各自分页，但页大小取同一个值 ——
+         * 两个列表长得一样，一边 50 一边 30 只会让滚动手感不一致）。
+         *
+         * 邮件那侧与 core `GET /api/sms-forward/history` 的默认值一致（50，上限 200）。
+         */
+        private const val NOTIFY_HISTORY_PAGE_SIZE = 50
+        private const val DELIVERY_HISTORY_PAGE_SIZE = 50
+
         /** 发送成功后延迟多久再静默补一次刷新（设备写信箱 / 同步短信库有延迟，立刻拉是发送前的快照） */
         private const val SEND_REFRESH_DELAY_MS = 2_500L
 
@@ -1223,7 +2009,6 @@ class ToolsModule(
                     shellMessages = _toolsState.value.shellMessages + assistantMsg,
                     isLoading = false
                 )
-                persistConsoleHistory()
             } catch (e: Exception) {
                 val errorMsg = ConsoleMessage(role = ConsoleRole.ERROR, text = e.message ?: "Shell 执行失败")
                 _toolsState.value = _toolsState.value.copy(
@@ -1231,7 +2016,6 @@ class ToolsModule(
                     isLoading = false,
                     errorMessage = null
                 )
-                persistConsoleHistory()
             }
         }
     }
@@ -1352,6 +2136,28 @@ class ToolsModule(
     }
 
     // ── SMS Forward ──
+    /**
+     * 把 core 的错误体 `{"error": 中文原因}` 取出来。
+     *
+     * 为什么必须有这一步：Retrofit 的 `HttpException.message` 是 `"HTTP 400 Bad Request"`，
+     * 直接往界面上转等于把 core 写好的那句「每日上限需在 0–500 之间 / 未知的级别名 xxx」扔了，
+     * 用户只能看到一个数字。三条渠道的 config 写入口都用它 ——
+     * 各写一份的话，改了一处会剩下两个还在显示 HTTP 码的页面。
+     *
+     * 非 HTTP 异常（连不上 / 超时）落到 `e.message`：那种情况下没有错误体可取。
+     */
+    private fun coreErrorMessage(e: Exception): String {
+        if (e is retrofit2.HttpException) {
+            val body = runCatching { e.response()?.errorBody()?.string() }.getOrNull()
+            val reason = runCatching {
+                (AppJson.parseToJsonElement(body ?: "") as? JsonObject)
+                    ?.get("error")?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }
+            }.getOrNull()
+            if (!reason.isNullOrBlank()) return reason
+        }
+        return e.message ?: "未知错误"
+    }
+
     fun loadSmsForwardConfig() {
         scope.launch {
             _smsForwardState.value = _smsForwardState.value.copy(isLoading = true)
@@ -1359,11 +2165,15 @@ class ToolsModule(
             // 整体替换会在每次重载配置（含保存后的自动重载）时把它清空，UI 上是诊断区一闪就没。
             try {
                 _smsForwardState.value = _smsForwardState.value.copy(
-                    config = api.getSmsForwardConfig(), isLoading = false, errorMessage = null
+                    config = api.getSmsForwardConfig(), loaded = true,
+                    isLoading = false, errorMessage = null
                 )
             } catch (e: Exception) {
+                // loaded 也要置位：它的语义是"尝试过一次"而不是"成功过一次"。
+                // 只在成功时置位的话，读失败时界面分不出"还在读"与"读不到"，
+                // 于是永远停在「加载中」（口径同 WebhookState / LocalSmsState 的 loaded）。
                 _smsForwardState.value = _smsForwardState.value.copy(
-                    isLoading = false, errorMessage = "加载失败: ${e.message}"
+                    loaded = true, isLoading = false, errorMessage = "加载失败: ${e.message}"
                 )
             }
         }
@@ -1385,6 +2195,16 @@ class ToolsModule(
         }
     }
 
+    /**
+     * 写邮件通知配置。
+     *
+     * **2026-09-10：这个端点会 400 了**（`daily_limit` 越界 / `min_level` 认不出）。
+     * 此前它永不报错，所以这里原来只有一句 `e.message` —— 那会把 core 写好的中文原因
+     * 换成 `HTTP 400 Bad Request`。现在走 [coreErrorMessage]，口径与另两条渠道一致。
+     *
+     * 失败时**不回读配置**：回读会把用户刚在弹窗里改的值刷回旧值，看起来像"改动凭空消失"。
+     * 页面上的 `UfiErrorBanner` 会把原因常驻显示出来。
+     */
     fun saveSmsForwardConfig(config: SmsForwardConfig) {
         scope.launch {
             _smsForwardState.value = _smsForwardState.value.copy(isLoading = true, errorMessage = null)
@@ -1392,7 +2212,11 @@ class ToolsModule(
                 val result = api.saveSmsForwardConfig(config)
                 if (result.success) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false); loadSmsForwardConfig() }
                 else _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "保存失败：服务器返回失败")
-            } catch (e: Exception) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "保存失败: ${e.message}") }
+            } catch (e: Exception) {
+                _smsForwardState.value = _smsForwardState.value.copy(
+                    isLoading = false, errorMessage = "保存失败：${coreErrorMessage(e)}"
+                )
+            }
         }
     }
 
@@ -1403,8 +2227,209 @@ class ToolsModule(
                 val result = api.testSmsForward()
                 val success = result.success
                 val error = result.error
-                _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = if (success) null else (error ?: "测试发送失败"))
+                // auto_notify_enabled 必须落进 state：只看 success 会让"SMTP 通了但总开关关着"
+                // 显示成纯成功，用户之后一条自动通知都收不到却以为配好了。
+                _smsForwardState.value = _smsForwardState.value.copy(
+                    isLoading = false,
+                    lastTestAutoNotifyEnabled = result.auto_notify_enabled,
+                    errorMessage = if (success) null else (error ?: "测试发送失败")
+                )
             } catch (e: Exception) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "测试失败: ${e.message}") }
+        }
+    }
+
+    // ── Webhook 通知渠道（/api/notify/webhook）──
+    //
+    // 三个动作各自只碰自己那一位 in-flight 标记（loading / saving / testing），
+    // 理由见 WebhookState 的注释：邮件那侧共用一个 isLoading 已经踩过坑。
+
+    private val _webhookState = MutableStateFlow(WebhookState())
+    val webhookState: StateFlow<WebhookState> = _webhookState.asStateFlow()
+
+    /**
+     * 读 Webhook 配置。
+     *
+     * 成功与失败两条路都置 [WebhookState.loaded] —— 首屏"加载中 / 未启用"靠它收场，
+     * 与"这次读成不成功"无关（口径同 [loadSmsRules]）。
+     * 读失败时**不写** config：宁可显示"读不到"，也不用默认值假装配置是空的
+     * （那会让用户以为设置丢了，然后重填一遍覆盖掉真配置）。
+     */
+    fun loadWebhookConfig() {
+        scope.launch {
+            _webhookState.update { it.copy(loading = true) }
+            try {
+                val config = api.getWebhookConfig()
+                _webhookState.update {
+                    it.copy(config = config, loaded = true, loading = false, errorMessage = null)
+                }
+            } catch (e: Exception) {
+                _webhookState.update {
+                    it.copy(
+                        loaded = true,
+                        loading = false,
+                        errorMessage = "Webhook 配置加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 下发字段级 patch，并以**服务端回显**为准落地。
+     *
+     * 回显（`resp.config`）直接写进 state 而不是本地乐观更新：core 会 trim URL、
+     * 把 method 转大写、按预设名回落，本地猜一遍必然与真值漂移。
+     * 校验失败（400）走异常分支 —— core 的报错文案里写了是哪一条约束不过，原样转给用户。
+     */
+    fun saveWebhookConfig(patch: WebhookConfigPatch) {
+        scope.launch {
+            _webhookState.update { it.copy(saving = true) }
+            try {
+                val resp = api.updateWebhookConfig(patch)
+                if (resp.success && resp.config != null) {
+                    _webhookState.update {
+                        it.copy(
+                            config = resp.config,
+                            loaded = true,
+                            saving = false,
+                            saveTick = it.saveTick + 1,
+                            saveError = null
+                        )
+                    }
+                } else {
+                    _webhookState.update {
+                        it.copy(
+                            saving = false,
+                            saveTick = it.saveTick + 1,
+                            saveError = "服务器返回失败"
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                _webhookState.update {
+                    it.copy(
+                        saving = false,
+                        saveTick = it.saveTick + 1,
+                        // core 的 400 文案（url scheme / method / 超时区间 / 每日上限区间 /
+                        // 级别名）在错误体里，不是在 HttpException.message 里
+                        saveError = coreErrorMessage(e)
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 发一条测试通知。
+     *
+     * 整份响应都存进 [WebhookState.lastTest]：状态码与响应体摘要是用户排 Webhook 的
+     * 唯一线索，只留一个成功/失败布尔等于把排错信息扔了。
+     * 网络层异常也要造一条 [WebhookTestResponse] —— 否则"请求根本没发出去"在界面上
+     * 与"发出去但没成功"长得一样。
+     */
+    fun testWebhook() {
+        scope.launch {
+            _webhookState.update { it.copy(testing = true) }
+            val result = try {
+                api.testWebhook()
+            } catch (e: Exception) {
+                WebhookTestResponse(success = false, error = "请求失败: ${e.message}")
+            }
+            _webhookState.update {
+                it.copy(testing = false, testTick = it.testTick + 1, lastTest = result)
+            }
+        }
+    }
+
+    // ── 本机短信回发渠道（/api/notify/sms）──
+    //
+    // 形状与上面 Webhook 那一组一致（三个 in-flight 位各管一件事），
+    // 唯一的不同是 test 会**真的花钱**：确认弹窗在 UI 侧，这里只负责发请求与落结算。
+
+    private val _localSmsState = MutableStateFlow(LocalSmsState())
+    val localSmsState: StateFlow<LocalSmsState> = _localSmsState.asStateFlow()
+
+    /**
+     * 读本机短信配置。
+     *
+     * 成功与失败两条路都置 [LocalSmsState.loaded]（口径同 [loadWebhookConfig]）；
+     * 读失败时**不写** config —— 宁可显示"读不到"，也不用默认值假装配置是空的，
+     * 那会让用户重填一遍把设备上的真配置覆盖掉。
+     */
+    fun loadLocalSmsConfig() {
+        scope.launch {
+            _localSmsState.update { it.copy(loading = true) }
+            try {
+                val config = api.getLocalSmsConfig()
+                _localSmsState.update {
+                    it.copy(config = config, loaded = true, loading = false, errorMessage = null)
+                }
+            } catch (e: Exception) {
+                _localSmsState.update {
+                    it.copy(
+                        loaded = true,
+                        loading = false,
+                        errorMessage = "本机短信配置加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 下发字段级 patch，并以**服务端回显**为准落地。
+     *
+     * 回显直接写进 state 而不是本地乐观更新：core 会 trim 号码、把级别名统一成小写，
+     * 而且 `sent_today` / `quota_remaining` 这两个只读位只有设备算得出 —— 本地猜一遍必然漂。
+     */
+    fun saveLocalSmsConfig(patch: LocalSmsConfigPatch) {
+        scope.launch {
+            _localSmsState.update { it.copy(saving = true) }
+            try {
+                val resp = api.updateLocalSmsConfig(patch)
+                if (resp.success && resp.config != null) {
+                    _localSmsState.update {
+                        it.copy(
+                            config = resp.config,
+                            loaded = true,
+                            saving = false,
+                            saveTick = it.saveTick + 1,
+                            saveError = null
+                        )
+                    }
+                } else {
+                    _localSmsState.update {
+                        it.copy(saving = false, saveTick = it.saveTick + 1, saveError = "服务器返回失败")
+                    }
+                }
+            } catch (e: Exception) {
+                _localSmsState.update {
+                    // core 的 400 文案（号码形状 / 上限区间 / 未知场景 / 级别名）在错误体里
+                    it.copy(saving = false, saveTick = it.saveTick + 1, saveError = coreErrorMessage(e))
+                }
+            }
+        }
+    }
+
+    /**
+     * 发一条**真实**测试短信。调用方必须先让用户确认（会产生话费、消耗一条配额）。
+     *
+     * 成功后顺手回读一次配置：`sent_today` / `quota_remaining` 变了，
+     * 而配置页上那行"今日 N/M"读的就是配置里的这两个字段 —— 不回读就会停在旧数字上。
+     */
+    fun testLocalSms() {
+        scope.launch {
+            _localSmsState.update { it.copy(testing = true) }
+            val result = try {
+                api.testLocalSms()
+            } catch (e: Exception) {
+                LocalSmsTestResponse(success = false, error = "请求失败: ${e.message}")
+            }
+            _localSmsState.update {
+                it.copy(testing = false, testTick = it.testTick + 1, lastTest = result)
+            }
+            // 只在真的动过配额时才回读，省一次请求（未启用/未配全那两条分支不会计数）。
+            if (result.counted_toward_quota) loadLocalSmsConfig()
         }
     }
 
@@ -2014,13 +3039,9 @@ class ToolsModule(
         }
     }
 
-    /** 清空指定 Tab 的控制台对话（"at" 或 "shell"），保留另一 Tab，并持久化 */
+    /** 清空指定 Tab 的控制台对话（"at" 或 "shell"）。历史在 core，两端同时生效。 */
     fun clearConsole(tab: String) {
-        _toolsState.value = _toolsState.value.copy(
-            atMessages = if (tab == "at") emptyList() else _toolsState.value.atMessages,
-            shellMessages = if (tab == "shell") emptyList() else _toolsState.value.shellMessages
-        )
-        persistConsoleHistory()
+        clearConsoleHistory(if (tab == "at") CONSOLE_CHANNEL_AT else CONSOLE_CHANNEL_SHELL)
     }
 
     fun clearError() { _toolsState.value = _toolsState.value.copy(errorMessage = null) }
@@ -2028,6 +3049,9 @@ class ToolsModule(
     // ── Smart Refresh (data_changed 精准增量刷新) ──
     fun smartRefresh(changedType: String) {
         when {
+            // 另一端（或本端）执行了命令 → core 已落库，拉一次对应通道即可对齐
+            changedType == "console:${CONSOLE_CHANNEL_SHELL}" -> refreshConsoleHistory(CONSOLE_CHANNEL_SHELL)
+            changedType == "console:${CONSOLE_CHANNEL_AT}" -> refreshConsoleHistory(CONSOLE_CHANNEL_AT)
             // core 明确说了"这个值变了"，必须绕过新鲜度闸门
             changedType == "device:traffic-limit" -> loadTrafficLimit(force = true)
         }

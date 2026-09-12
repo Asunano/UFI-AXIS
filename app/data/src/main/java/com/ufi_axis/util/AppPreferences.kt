@@ -9,6 +9,54 @@ class AppPreferences(private val context: Context) {
     private val prefs: SharedPreferences =
         context.getSharedPreferences("ufi_axis_prefs", Context.MODE_PRIVATE)
 
+    /**
+     * 凭据专用 prefs：只放 [token] 与 [deviceHwid]，并在 `backup_rules.xml` /
+     * `data_extraction_rules.xml` 里整份排除出系统备份与换机迁移。
+     *
+     * 为什么必须单独一个文件：Android 的备份规则**粒度是文件，不能按键排除**。
+     * 这两个键原先和主题、通知开关一起躺在 `ufi_axis_prefs` 里，于是只有两个选项 ——
+     * 要么让凭据进云备份，要么把用户全部偏好一起排除掉。
+     *
+     * 为什么不能让 token 进云备份：设备私钥在 Android Keystore 里，**不参与备份迁移**。
+     * 恢复到新机后 token 有效、密钥却是新生成的 → 签名与服务端记录里的旧公钥对不上 →
+     * 恒定 401，而 401 是「保留凭据重试」语义，客户端不会自愈回配对页，用户看到的是
+     * 「通知和连接莫名失效且怎么也好不了」。宁可让它认不出配对状态、老老实实重新配对。
+     */
+    private val credPrefs: SharedPreferences =
+        context.getSharedPreferences(CRED_PREFS_NAME, Context.MODE_PRIVATE)
+
+    init {
+        migrateCredentialsOutOfSharedPrefs()
+    }
+
+    /**
+     * 一次性迁移：把 [KEY_TOKEN] / [KEY_DEVICE_HWID] 从 `ufi_axis_prefs` 搬到 [credPrefs]。
+     *
+     * 判据是「旧文件里还有这个键」，搬完即从旧文件删除，所以只会发生一次。
+     * 两个键分别判断：`device_hwid` 是懒生成的，老用户可能只有 token 没有 hwid。
+     */
+    private fun migrateCredentialsOutOfSharedPrefs() {
+        if (!prefs.contains(KEY_TOKEN) && !prefs.contains(KEY_DEVICE_HWID)) return
+        val editor = prefs.edit()
+        val credEditor = credPrefs.edit()
+        if (prefs.contains(KEY_TOKEN)) {
+            // 已迁移过又出现旧键（例如系统备份把旧文件整份还原回来）时不覆盖新值：
+            // credPrefs 里的才是当前真源。
+            if (!credPrefs.contains(KEY_TOKEN)) {
+                credEditor.putString(KEY_TOKEN, prefs.getString(KEY_TOKEN, "") ?: "")
+            }
+            editor.remove(KEY_TOKEN)
+        }
+        if (prefs.contains(KEY_DEVICE_HWID)) {
+            if (!credPrefs.contains(KEY_DEVICE_HWID)) {
+                credEditor.putString(KEY_DEVICE_HWID, prefs.getString(KEY_DEVICE_HWID, "") ?: "")
+            }
+            editor.remove(KEY_DEVICE_HWID)
+        }
+        credEditor.apply()
+        editor.apply()
+    }
+
     var serverIp: String
         get() = prefs.getString(KEY_SERVER_IP, "") ?: ""
         set(value) {
@@ -23,10 +71,11 @@ class AppPreferences(private val context: Context) {
             notifyConnectionChanged()
         }
 
+    /** 配对签发的鉴权 token。存在 [credPrefs]，不进系统备份。 */
     var token: String
-        get() = prefs.getString(KEY_TOKEN, "") ?: ""
+        get() = credPrefs.getString(KEY_TOKEN, "") ?: ""
         set(value) {
-            prefs.edit().putString(KEY_TOKEN, value).apply()
+            credPrefs.edit().putString(KEY_TOKEN, value).apply()
             notifyConnectionChanged()
         }
 
@@ -37,11 +86,13 @@ class AppPreferences(private val context: Context) {
      * **不跨进程 reload**。重新配对后主进程写入新 token，守护进程仍用旧 token → 401/444 →
      * WebSocket 与兜底轮询双双失效，用户表现为"通知突然再也不来了"。
      *
-     * 只在主进程、且用户已开启告警通知时通报（避免给关掉通知的用户凭空拉起常驻服务）。
+     * 只在主进程、且用户开着**全局通知总闸**时通报（避免给关掉通知的用户凭空拉起常驻服务）。
+     * 2026-09-08：判据由 `KEY_ALERT_NOTIF`（那时它兼任总闸，现已收窄为"告警分类"）
+     * 改为 `KEY_NOTIFY_MASTER` —— 只关告警分类、仍要收短信通知的用户不该丢 token 同步。
      */
     private fun notifyConnectionChanged() {
         if (android.app.Application.getProcessName().contains(":")) return
-        if (!prefs.getBoolean(com.ufi_axis.data.notification.NotificationCenter.KEY_ALERT_NOTIF, false)) return
+        if (!prefs.getBoolean(com.ufi_axis.data.notification.NotificationCenter.KEY_NOTIFY_MASTER, false)) return
         try {
             com.ufi_axis.data.notification.NotifyDispatchReceiver
                 .dispatchConnectionChange(context, baseUrl, token)
@@ -66,7 +117,7 @@ class AppPreferences(private val context: Context) {
      */
     var deviceHwid: String
         get() {
-            val cached = prefs.getString(KEY_DEVICE_HWID, "") ?: ""
+            val cached = credPrefs.getString(KEY_DEVICE_HWID, "") ?: ""
             if (cached.isNotBlank()) return cached
             // Settings.Secure.getString 在极端 ROM 上可能抛异常，统一按“取不到”处理并回退
             val androidId: String = runCatching {
@@ -77,11 +128,11 @@ class AppPreferences(private val context: Context) {
             } else {
                 androidId
             }
-            prefs.edit().putString(KEY_DEVICE_HWID, hwid).apply()
+            credPrefs.edit().putString(KEY_DEVICE_HWID, hwid).apply()
             return hwid
         }
         set(value) {
-            prefs.edit().putString(KEY_DEVICE_HWID, value).apply()
+            credPrefs.edit().putString(KEY_DEVICE_HWID, value).apply()
         }
 
     /**
@@ -251,6 +302,44 @@ class AppPreferences(private val context: Context) {
         set(value) = prefs.edit().putLong(KEY_SMS_CODE_SEEN_MSG_ID, value).apply()
 
     /**
+     * 「已拦截」入口角标的已读水位：用户看过的最大拦截记录 id，默认 0 = 全部未看。
+     *
+     * 与 [smsCodeSeenMsgId] 是同一套「未读水位」语义，但必须是**独立的键** ——
+     * 两者管的是不同列表，合用会导致「看过验证码就等于看过被拦短信」。
+     *
+     * 用记录 id 而不是 `blocked_at`：core 侧 `sms_blocked_log.id` 是 AUTOINCREMENT，
+     * 单调且唯一；时间戳同一毫秒可能落多条，拿它当水位会把同毫秒的其余几条算成已看。
+     */
+    var smsBlockedSeenId: Long
+        get() = prefs.getLong(KEY_SMS_BLOCKED_SEEN_ID, 0L)
+        set(value) = prefs.edit().putLong(KEY_SMS_BLOCKED_SEEN_ID, value).apply()
+
+    /**
+     * 从系统「最近任务 / 概览」列表中隐藏本应用（excludeFromRecents）。
+     *
+     * 开启后 App 不出现在多任务卡片里，减少被误关、保护隐私；与后台守护 / 保活配合更"隐身"。
+     * 默认 false。写入即生效：setter 会立即对当前任务调用
+     * `ActivityManager.AppTask.setExcludeFromRecents`，无需调用方额外处理；
+     * [applyHideFromRecents] 供 MainActivity.onResume 幂等重放（进程被回收重建后仍生效）。
+     */
+    var hideFromRecents: Boolean
+        get() = prefs.getBoolean(KEY_HIDE_FROM_RECENTS, false)
+        set(value) {
+            prefs.edit().putBoolean(KEY_HIDE_FROM_RECENTS, value).apply()
+            applyHideFromRecents(value)
+        }
+
+    /** 把当前 [hideFromRecents] 取值应用到所有本进程任务（幂等，onResume 调用）。 */
+    fun applyHideFromRecents() = applyHideFromRecents(hideFromRecents)
+
+    private fun applyHideFromRecents(enabled: Boolean) {
+        runCatching {
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+            am.appTasks.forEach { it.setExcludeFromRecents(enabled) }
+        }
+    }
+
+    /**
      * 拼接 baseUrl。
      * serverIp 为空时回退到设备网关地址 [gatewayIp]（默认 192.168.0.1），而非 127.0.0.1——
      * 后端运行在随身 WiFi 设备自身，手机 App 必须通过设备网关 IP 访问；回退 127.0.0.1 会让
@@ -278,6 +367,12 @@ class AppPreferences(private val context: Context) {
         private const val KEY_SERVER_IP = "server_ip"
         private const val KEY_SERVER_PORT = "server_port"
         private const val KEY_TOKEN = "token"
+
+        /**
+         * 凭据 prefs 文件名。**必须与 `backup_rules.xml` /
+         * `data_extraction_rules.xml` 里的排除项保持一致**，改名要同步改那两个文件。
+         */
+        internal const val CRED_PREFS_NAME = "ufi_axis_credentials"
         private const val KEY_SETUP_COMPLETE = "setup_complete"
         private const val KEY_AUTO_REFRESH = "auto_refresh"
         private const val KEY_LOG_ENABLED = "log_enabled"
@@ -303,6 +398,9 @@ class AppPreferences(private val context: Context) {
         private const val KEY_AUTO_CHECK_UPDATE = "auto_check_update"
         private const val KEY_LAST_AUTO_CHECK_TIME = "last_auto_check_time"
         private const val KEY_SMS_CODE_SEEN_MSG_ID = "sms_code_seen_msg_id"
+        private const val KEY_SMS_BLOCKED_SEEN_ID = "sms_blocked_seen_id"
+        /** 从系统最近任务列表隐藏本应用（excludeFromRecents），默认 false。 */
+        private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
 
         // ── 配对模式（Onboarding 重构）──
 

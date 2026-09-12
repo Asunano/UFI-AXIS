@@ -7,7 +7,6 @@ import androidx.compose.animation.EnterExitState
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.ExperimentalAnimationApi
-import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.AnimationVector1D
@@ -53,7 +52,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis_core.util.UiFrameGate
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -1215,9 +1214,16 @@ private fun AnimatedContentBackend(
     AnimatedContent(
         targetState = selectedIndex,
         modifier = modifier,
+        // 不使用 SizeTransform：本后端页面切场动画由 Box 的 graphicsLayer 位移（position）实现，
+        // 页面本体是 fillMaxSize（与容器同尺寸），不存在「尺寸收缩/展开」观感，SizeTransform 纯属冗余。
+        // 关键：AnimatedContent 一旦挂上 SizeTransform，会在切场测量时**额外用 maxHeight=Infinity 复测一遍
+        // 槽位以取「自然尺寸」做插值**；此时页面内 LazyColumn(weight(1f)) 在父 Column 拿到无限高度后
+        // 会展开到完整内容高度（长目录可达数十万 px），AnimatedContent 再把这个值当 minHeight 强压给容器，
+        // 超过屏幕 maxHeight → SizeNode 抛 `Can't represent a width of 0 and height of N in Constraints`
+        // （与先前 scaleIn 0 宽崩溃同机制，2026-09-11 真机崩溃日志复现：height=412858）。
+        // clip 由下方 Box 的 Modifier.clipToBounds() 独立负责，移除 SizeTransform 不影响裁剪。
         transitionSpec = {
-            (EnterTransition.None togetherWith ExitTransition.None)
-                .using(SizeTransform(clip = transition.clipToBounds))
+            EnterTransition.None togetherWith ExitTransition.None
         },
         contentAlignment = Alignment.Center,
         label = "UfiPageSwitcherAnimatedContent",

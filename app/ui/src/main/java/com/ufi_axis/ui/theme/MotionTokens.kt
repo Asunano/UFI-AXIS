@@ -62,7 +62,7 @@ object UfiAnimSpecs {
 
     // ===== 按压 / 点击反馈 =====
 
-    /** 通用点按缩放（0.6 / 500）：`Modifier.clickScale`、滑块拇指 */
+    /** 通用点按缩放（0.6 / 500）：滑块拇指、[UfiMotion.press] 的底层曲线 */
     fun <T> clickScale(): SpringSpec<T> = spring(dampingRatio = 0.6f, stiffness = 500f)
 
     /** 按钮按压（1.0 / 600）：全部 Ufi 按钮族 + 监控页图标按钮，无回弹的紧实反馈 */
@@ -117,7 +117,7 @@ object UfiAnimSpecs {
     fun <T> sliderTrack(): SpringSpec<T> = spring(dampingRatio = 1f, stiffness = 350f)
 
     /**
-     * 胶囊展开刚度（3000f，dampingRatio 走 `Spring.DampingRatioNoBouncy`）。
+     * 胶囊展开刚度（900f，dampingRatio 走 `Spring.DampingRatioNoBouncy`）。
      *
      * 只有这一项以裸常量而非 spec 函数暴露：`CapsuleRegressionGuardTest` 用正则要求
      * `UfiCapsuleTabBar` 的 `EXPAND_SPRING` 赋值处 40 字符内出现字面 `spring(`
@@ -125,8 +125,12 @@ object UfiAnimSpecs {
      *
      * 2026-09-04（P3a）：随本对象迁包。护栏读的是 `UfiCapsuleTabBar.kt` 的**源文本**，
      * 与本常量所在的包无关，所以迁包不影响它；调用点只改了 import 行。
+     *
+     * 2026-09-08：3000f → 900f。3000f 让胶囊在 ~0.15s 内长到位，而标签淡入是 320ms 的
+     * tween，一次交互被拆成"胶囊先跳、字后显影"两段 —— 这就是「文字显示消失突兀」的来源。
+     * 900f ≈ 0.3s，与标签同量级，整体读起来是一段运动。
      */
-    const val CapsuleExpandStiffness = 3000f
+    const val CapsuleExpandStiffness = 900f
 
     // ===== 非 spring（历史遗留，由 UfiMotion 转发）=====
 
@@ -416,11 +420,14 @@ object UfiMotion {
     /**
      * 列表项交错入场的**逐项延迟**（毫秒）。
      *
-     * 2026-09-04（P2a）：原来这里是 `50L`、而真正在跑的
-     * [com.ufi_axis.ui.animation.staggeredEntrance] 写的是 `index * 35L` ——
-     * 同一个概念两个值，且 `50L` 没有任何调用点（纯死常量）。
-     * 统一取 **35L**：这是当前真实在跑的值，改成 50 会让第 10 项的延迟从 350ms 涨到 500ms，
+     * 2026-09-04（P2a）：原来这里是 `50L`、而真正在跑的 `Modifier.staggeredEntrance`
+     * 写的是 `index * 35L` —— 同一个概念两个值，且 `50L` 没有任何调用点（纯死常量）。
+     * 统一取 **35L**：这是当时真实在跑的值，改成 50 会让第 10 项的延迟从 350ms 涨到 500ms，
      * 长列表能肉眼看出"入场变慢"。以"不制造观感变化"为准则，向实际行为对齐而不是向死常量对齐。
+     *
+     * 2026-09-07：`Modifier.staggeredEntrance` 本身也因全库零调用点被删除（见
+     * `animation/Entrance.kt` 的文件头）。本常量**暂留**为交错入场的唯一时间口径 ——
+     * 重新实现时直接引用它，不要再写裸 35。
      */
     const val STAGGER_DELAY_MS = 35L
 

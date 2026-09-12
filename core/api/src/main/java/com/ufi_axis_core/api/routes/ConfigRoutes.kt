@@ -25,7 +25,15 @@ import kotlinx.serialization.json.*
  * POST /api/config/reset    - 恢复默认配置
  */
 class ConfigRoutes(
-    private val settings: AppSettings
+    private val settings: AppSettings,
+    /**
+     * 短信拦截相关开关变更后的生效钩子（重载 `SmsRuleStore` 的内存快照）。
+     *
+     * 必须有：判定读的是 `@Volatile` 快照而不是 prefs，只写 `AppSettings` 等于
+     * 「界面上关了豁免，引擎照旧豁免」—— 又一个假开关。
+     * 用可选回调注入是因为 `:core:api` 这一层拿不到 store 的构造依赖（Room DAO）。
+     */
+    private val onSmsFilterConfigChanged: (suspend () -> Unit)? = null
 ) {
     fun register(route: Route) {
         route.route("/config") {
@@ -40,7 +48,8 @@ class ConfigRoutes(
                 )))
             }
 
-            // 获取全部配置（脱敏显示 goform_password）
+            // 获取全部配置（goform_password 只以脱敏形式出现在这里；
+            // AppSettings.toMap() 刻意不含该键，见其 KDoc）
             get {
                 val masked = settings.toMap().toMutableMap()
                 masked["goform_password"] = maskSecret(settings.goformPassword)
@@ -178,6 +187,18 @@ class ConfigRoutes(
                 intField("sms_code_cleanup_hours", ConfigLimits.SMS_CODE_CLEANUP_HOURS) {
                     settings.smsCodeCleanupHours = it
                 }
+                boolField("sms_code_auto_copy") { settings.smsCodeAutoCopy = it }
+
+                // SMS 拦截（黑名单 + 关键词）的两个开关。规则本身走 /api/sms/rules，不在这里。
+                boolField("sms_filter_exempt_verification_code") {
+                    settings.smsFilterExemptVerificationCode = it
+                }
+                boolField("sms_filter_store_full_body") { settings.smsFilterStoreFullBody = it }
+                // 豁免开关写进 prefs 之后必须让判定快照重载，否则改了不生效。
+                // storeFullBody 是每次写记录时才读的，本来就不需要重载，但一起走这个钩子更难忘。
+                if (updated.any { it.startsWith("sms_filter_") }) {
+                    onSmsFilterConfigChanged?.invoke()
+                }
 
                 // update_mirror_base 允许设为空串 = 直连（因此不能用 textField）；
                 // contentOrNull 对 JsonNull/数字/布尔返回 null，只有显式传字符串才会进入此分支。
@@ -198,21 +219,52 @@ class ConfigRoutes(
             }
 
 
-            // 恢复默认
+            /**
+             * 恢复默认配置。
+             *
+             * **需要配对密码**（设备已设过密码时）。原实现只要求「已配对身份」，
+             * 而它调的 `resetAll()` 当时会清掉密码哈希 —— 一台借出去用过、配对记录还没删的
+             * 旧手机就能远程把设备打回可接管的出厂态。同一份代码里语义更轻的 `unpair` /
+             * `removeDevice` 都要密码，这里没有理由更松。
+             *
+             * `resetAll()` 现在也不再清除身份与凭据键（见 `AppSettings.PRESERVED_ON_RESET`），
+             * 两道改动是互补的：一道防越权触发，一道限制影响范围。
+             */
             post("/reset") {
+                val body = runCatching { call.receiveJsonObject() }.getOrNull()
+                val password = body?.get("password")?.jsonPrimitive?.contentOrNull ?: ""
+                if (settings.devicePasswordSet && !settings.verifyDevicePassword(password)) {
+                    call.respondFail(
+                        HttpStatusCode.Unauthorized,
+                        ErrorCode.INVALID_PASSWORD,
+                        "配对密码错误，无法恢复默认配置"
+                    )
+                    return@post
+                }
                 settings.resetAll()
                 call.respond(toJsonElement(mapOf(
                     "success" to true,
-                    "message" to "已恢复默认配置，需重启服务生效"
+                    "message" to "已恢复默认配置（配对信息与配对密码保持不变），需重启服务生效"
                 )))
             }
         }
     }
 
-    private fun maskSecret(secret: String): String {
-        return if (secret.length <= 4) "****"
-        else secret.take(2) + "*".repeat(secret.length - 4) + secret.takeLast(2)
-    }
+    /**
+     * 脱敏占位符：**定长**，与真实值的长度、内容都无关。
+     *
+     * 2026-09-08：原实现是 `take(2) + "*" * (len-4) + takeLast(2)`（如 `ad****in`）——
+     * 等于把 goform 后台密码的**准确长度**加首尾各两位，明文送给任何已鉴权客户端。
+     * 已配对客户端不等于可以拿到设备后台口令（配对口令与 goform 口令是两把不同的钥匙），
+     * 这条 GET /config 的返回本来只该表达「有没有设过」。
+     *
+     * 客户端侧不依赖具体掩码串：web 的 GeneralPanel 读回后**无条件**把密码框清成空串
+     * （web/src/views/settings/panels/GeneralPanel.vue:184-187），app 只判 isNotBlank
+     * 当作「已设置」（ToolsModule:1080）；「不许回写脱敏值」的识别在 core 自己的
+     * [isMaskedValue]（含 3 个以上连续星号），所以固定掩码必须保留 `***` 特征。
+     */
+    private fun maskSecret(secret: String): String =
+        if (secret.isEmpty()) "" else MASK_PLACEHOLDER
 
     /**
      * 检测值是否为脱敏占位符（含 3+ 连续星号），
@@ -220,4 +272,11 @@ class ConfigRoutes(
      */
     private fun isMaskedValue(value: String): Boolean =
         value.contains("***")
+
+    private companion object {
+        /** 定长脱敏占位符。含 `***`，因此回写时会被 [isMaskedValue] 拦下。 */
+        const val MASK_PLACEHOLDER = "********"
+    }
 }
+
+

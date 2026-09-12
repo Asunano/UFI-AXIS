@@ -43,21 +43,27 @@ import com.ufi_axis.ui.theme.ProvideThemePalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.buildColorSchemeFromPalette
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 组件画廊 —— 把共享组件库按族铺开，用于**发现"同一种 UI 在不同界面不一样"**。
  *
- * 为什么需要它（2026-09-03 建立）：`components/common/` 下有 54 个文件、98 个 Composable 平铺在
- * 一个目录里，其中按钮 11 个入口、卡片 8 个、对话框壳 9 个、chip 7 个、输入 13 个、加载态 10 个。
+ * 为什么需要它（2026-09-03 建立）：`components/common/` 下的组件全部平铺在一个目录里，
  * 在此之前**全库没有任何组件预览页**，重复与不一致只能靠逐页翻真机才能发现。
  *
- * 用法：设置 → 外观 → 组件画廊。顶部可切换明/暗，用来查"换主题后哪些元素没跟着变"
- * （画廊只覆盖 [LocalResolvedPalette]，因此读 `MaterialTheme.colorScheme` 或写死
- * `Color.White` 的组件会在这里原地暴露出来）。
+ * 现状口径（2026-09-07 实测，替换建立时那组已过期的数字）：56 个文件、124 个顶层 Composable；
+ * 带文字按钮已收敛为 1 个入口（`UfiButton`，P4c 把 5 个合并掉），其余族的入口数为
+ * 对话框壳 9 / 加载态 13 / 卡片 5（广义 11）/ chip 6 / 输入 5+3（弹窗版仍是平行的一套，待收敛）。
+ * 这些数字会变，**不要拿它当依据做判断**，需要准数时数一遍。
+ *
+ * 用法：设置 → 关于本机 → 组件画廊（2026-09-05 从「设置 → 外观」搬来）。顶部可切换明/暗，
+ * 用来查"换主题后哪些元素没跟着变"（画廊只覆盖 [LocalResolvedPalette]，因此读
+ * `MaterialTheme.colorScheme` 或写死 `Color.White` 的组件会在这里原地暴露出来）。
  *
  * 维护约定：新增共享组件时**必须**在这里补一条预览。删除组件时同步删预览（编译会提醒）。
  *
- * 覆盖范围：按钮 / chip 与徽章 / 列表行 / 卡片 / 输入 / 开关与选择 / 反馈态 / 分段控件 / 弹窗。
+ * 覆盖范围：按钮 / chip 与徽章 / 列表行 / 卡片 / 容器卡 / 输入 / 开关与勾选 / 反馈态 /
+ * 分段控件 / 弹窗 / 图标一致性，共 11 个分区。
  * 刻意不含：需要真实数据或宿主环境的组件（`UfiChart`、`UfiCapsuleTabBar`、页面切换器、
  * 文件与短信等业务组件）—— 它们在画廊里只能造假数据，看了也说明不了一致性问题。
  */
@@ -450,6 +456,14 @@ fun UfiGalleryScreen(navController: NavHostController) {
                     UfiSettingsRowCard {
                         Text("RowCard 内容", style = UfiTextStyles.body, color = palette.textPrimary)
                     }
+                    // UfiNoticeCard 也自带 CardHorizontalMargin，所以和上面两张并列放在
+                    // contentInset = false 的这一节里。
+                    UfiNoticeCard(message = "UfiNoticeCard · INFO：页面内联的一段说明。")
+                    UfiNoticeCard(
+                        severity = UfiNoticeSeverity.WARNING,
+                        title = "UfiNoticeCard · WARNING",
+                        message = "需要留意的事：淡底 + 淡描边，带标题时标题在图标右侧。"
+                    )
                 }
 
                 GallerySection("输入 · 6 个入口") {

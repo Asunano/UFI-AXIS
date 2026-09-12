@@ -428,7 +428,7 @@ function appActions(app: AppInfo) {
     { label: '授予全部权限 (ADB)', key: 'grant-perms' },
     { label: '权限管理', key: 'permission' },
     { type: 'divider', key: 'd2' },
-    { label: '卸载', key: 'uninstall', props: { style: 'color: #d03050' } },
+    { label: '卸载', key: 'uninstall', props: { style: 'color: var(--error)' } },
   ];
 }
 
@@ -508,7 +508,7 @@ loadApps();
   color: var(--text-muted);
 }
 .no-root-warn {
-  color: #f0a020;
+  color: var(--warning);
 }
 .filter-count {
   font-size: 12px;
@@ -549,7 +549,7 @@ loadApps();
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--hover-color, rgba(128, 128, 128, 0.12));
+  background: var(--surface-elevated);
   color: var(--text-muted);
   font-size: 14px;
   font-weight: 500;

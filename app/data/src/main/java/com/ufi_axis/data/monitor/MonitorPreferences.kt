@@ -30,7 +30,10 @@ data class MonitorSettings(
     val idleIntervalSec: Int = 60,                         // ⑨ 无前端连接时的采集间隔秒（10..600）
     val thermalWarnC: Int = 70,                            // ⑩ 温控预警阈值 ℃（50..90）
     val thermalCriticalC: Int = 80,                        // ⑪ 温控熔断阈值 ℃（55..100，且必须 > 预警）
-    val thermalPauseSec: Int = 20                          // ⑫ 熔断后暂停采集时长秒（5..300）
+    val thermalPauseSec: Int = 20,                         // ⑫ 熔断后暂停采集时长秒（5..300）
+    // ── 2026-09-08 补齐：上一次漏掉的两个 DataScheduler 常量 ──
+    val trafficLimitCheckSec: Int = 300,                   // ⑬ 套餐限额检查间隔秒（60..3600）
+    val deviceEventCheckSec: Int = 60                      // ⑭ 设备接入/离开比对间隔秒（15..600）
 )
 
 /**
@@ -98,7 +101,9 @@ data class MonitorPrefsPayload(
     val idleIntervalSec: Int = 60,
     val thermalWarnC: Int = 70,
     val thermalCriticalC: Int = 80,
-    val thermalPauseSec: Int = 20
+    val thermalPauseSec: Int = 20,
+    val trafficLimitCheckSec: Int = 300,
+    val deviceEventCheckSec: Int = 60
 )
 
 /** 把 core 回读到的偏好覆盖到本地设置上，保留本地 `collectEnabled`。 */
@@ -115,7 +120,9 @@ fun MonitorSettings.applyRemote(remote: MonitorPrefsPayload): MonitorSettings = 
     idleIntervalSec = remote.idleIntervalSec,
     thermalWarnC = remote.thermalWarnC,
     thermalCriticalC = remote.thermalCriticalC,
-    thermalPauseSec = remote.thermalPauseSec
+    thermalPauseSec = remote.thermalPauseSec,
+    trafficLimitCheckSec = remote.trafficLimitCheckSec,
+    deviceEventCheckSec = remote.deviceEventCheckSec
 )
 
 /** 抽出要上行到 core 的偏好项。 */
@@ -132,7 +139,9 @@ fun MonitorSettings.toRemotePayload(): MonitorPrefsPayload = MonitorPrefsPayload
     idleIntervalSec = idleIntervalSec,
     thermalWarnC = thermalWarnC,
     thermalCriticalC = thermalCriticalC,
-    thermalPauseSec = thermalPauseSec
+    thermalPauseSec = thermalPauseSec,
+    trafficLimitCheckSec = trafficLimitCheckSec,
+    deviceEventCheckSec = deviceEventCheckSec
 )
 
 /** `PUT /api/monitor/preferences` 的响应：回显服务端合并+校验后的最终值。 */

@@ -380,7 +380,7 @@ class KeepAliveGateGuardTest {
      * 那是拿 A 开关去停 B 开关授权的服务：用户明明还开着「前台服务保活」（那一页也还显示为开），
      * 常驻通知却消失；并且 `:ufi_notify` 是短信 / 验证码推送的唯一订阅方，那条实时通道
      * 会一起断掉。总闸只决定「发不发告警类通知」（`maybeNotifyNewAlerts` /
-     * `notifyDeviceConnectivity` 自己会 return），不决定「守护进程要不要活着」。
+     * `NotificationCenter.notify` 自己会 return），不决定「守护进程要不要活着」。
      */
     @Test
     fun alertMasterSwitch_mustNotStopKeepAliveService() {

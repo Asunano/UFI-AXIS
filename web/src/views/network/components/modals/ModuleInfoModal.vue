@@ -1,10 +1,5 @@
 <template>
-  <n-modal
-    v-model:show="show"
-    preset="card"
-    title="WiFi 模块信息"
-    style="width: 520px; max-width: calc(100vw - 32px)"
-  >
+  <n-modal v-model:show="show" preset="card" title="WiFi 模块信息" style="width: 520px; max-width: calc(100vw - 32px)">
     <n-spin :show="moduleInfoLoading">
       <div class="module-body">
         <div v-if="moduleInfoRows.length" class="kv-table">
@@ -18,7 +13,7 @@
 
         <n-collapse v-if="moduleInfo" style="margin-top: 12px">
           <n-collapse-item title="查看原始 JSON" name="raw">
-            <pre class="module-info-pre">{{ JSON.stringify(moduleInfo, null, 2) }}</pre>
+            <pre class="module-info-pre sub-panel">{{ JSON.stringify(moduleInfo, null, 2) }}</pre>
           </n-collapse-item>
         </n-collapse>
       </div>
@@ -119,11 +114,8 @@ watch(
   word-break: break-all;
   white-space: pre-wrap;
 }
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .module-info-pre {
-  background: var(--surface-elevated);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  padding: 12px;
   font-size: 12px;
   font-family: monospace;
   white-space: pre-wrap;

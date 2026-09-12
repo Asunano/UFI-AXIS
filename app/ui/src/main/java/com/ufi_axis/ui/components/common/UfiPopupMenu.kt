@@ -24,19 +24,22 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 悬浮选项菜单（2026-08-27 从 `UfiDialogParts.kt` 独立成文件）。
@@ -142,17 +145,64 @@ fun UfiPopupAnchor(
 }
 
 /**
- * 判断字符是否为 CJK（中日韩）表意文字 / 假名 / 谚文，用于估算菜单 label 宽度。
- * 覆盖：CJK 扩展 A~F、基本汉字、兼容汉字、日文假名、韩文谚文、全角形。
+ * 菜单定位策略。
+ *
+ * 位置在**测量之后**由 Compose 回调计算（[calculatePosition] 的 `popupContentSize` 是菜单
+ * 的真实尺寸、`windowSize` 是真实窗口尺寸），因此不需要任何尺寸估算。
+ *
+ * 2026-09-08 换掉了原来那套手算：宽按「label 字符数 × 平均字宽（CJK 17dp / 拉丁 9dp）」估、
+ * 高按「48dp/行」估，再拿 `configuration.screenHeightDp` 当窗口高度。估值只要偏大就会误判
+ * 「下方放不下」提前翻到上方，翻上方后再被 clamp 到窗口顶部 —— 菜单于是压在状态栏底下，
+ * 表现为「超出屏幕边界」。7 档的验证码清理间隔菜单真实高度约 270dp，估算给到 352dp，
+ * 正好落进这个误判区间。
+ *
+ * @param anchor 调用方给的锚点矩形（窗口坐标）。**优先于** Compose 回调里的 `anchorBounds`：
+ *   有调用方把 [UfiPopupMenu] 挂在锚点之外的层级（如页面根部），那时 Compose 给的是那一层的
+ *   bounds 而不是真正的锚点。为 [IntRect.Zero]（没传）时才回退到 `anchorBounds`。
+ * @param anchorPoint 长按点（窗口坐标），非 null 时菜单中心对齐该点。
+ * @param marginPx 菜单与窗口边缘的最小间距。
  */
-private fun Char.isCJK(): Boolean {
-    val c = this
-    return c in '\u3400'..'\u9FFF' ||
-        c in '\uF900'..'\uFAFF' ||
-        c in '\u3040'..'\u30FF' ||
-        c in '\uAC00'..'\uD7A3' ||
-        c in '\uFF00'..'\uFFEF'
+private class UfiMenuPositionProvider(
+    private val anchor: IntRect,
+    private val anchorPoint: IntOffset?,
+    private val marginPx: Int
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize
+    ): IntOffset {
+        val w = popupContentSize.width
+        val h = popupContentSize.height
+        // 菜单比窗口还大时（极小屏 + 超多选项）maxX/maxY 会小于 marginPx，
+        // coerceAtLeast 保证 coerceIn 的区间合法，此时贴左上角、由内部滚动/裁剪兜底。
+        val maxX = (windowSize.width - w - marginPx).coerceAtLeast(marginPx)
+        val maxY = (windowSize.height - h - marginPx).coerceAtLeast(marginPx)
+
+        if (anchorPoint != null) {
+            // 长按：菜单中心对齐手指落点，再整体 clamp 进窗口。
+            return IntOffset(
+                (anchorPoint.x - w / 2).coerceIn(marginPx, maxX),
+                (anchorPoint.y - h / 2).coerceIn(marginPx, maxY)
+            )
+        }
+
+        val rect = if (anchor == IntRect.Zero) anchorBounds else anchor
+        // 下方优先，放不下才翻到上方（与 M3 DropdownMenu 一致）。
+        val y = if (rect.bottom + h + marginPx <= windowSize.height) {
+            rect.bottom
+        } else {
+            rect.top - h - marginPx
+        }
+        // 水平右对齐锚点右缘向左展开。
+        return IntOffset(
+            (rect.right - w).coerceIn(marginPx, maxX),
+            y.coerceIn(marginPx, maxY)
+        )
+    }
 }
+
 
 /**
  * 悬浮选项菜单（底层实现）。
@@ -196,7 +246,6 @@ fun UfiPopupMenu(
     val palette = LocalResolvedPalette.current
     val cardShape = UfiCardDefaults.shape
     val density = LocalDensity.current
-    val configuration = LocalConfiguration.current
     val itemPaddingH = 14.dp
     val itemPaddingV = 9.dp
 
@@ -229,61 +278,13 @@ fun UfiPopupMenu(
     // 仅当完全不可见（visible 与退出动画期间的 internalVisible 均为假）才卸载 Popup
     if (!visible && !internalVisible) return
 
-    // ── 估算菜单尺寸并定位 ──
-    // 关键：Compose 的 Popup(alignment=TopStart, offset) 会把 offset 叠加到「父容器
-    // （包着按钮的 Box）的窗口左上角」上，而非直接使用绝对窗口坐标。因此这里先按绝对窗口
-    // 坐标估算菜单一角，再减去锚点左上角转成相对偏移；否则菜单会被整体平移到屏幕外
-    // （表现为点击无反应）。
-    val offset = remember(anchorBounds, anchorPoint, options.size) {
-        // 宽度按最长 label 动态估算：图标 18dp + 间距 10dp + label 估算宽度 + 两侧 padding 28dp
-        val maxLabelChars = options.maxOf { it.label.length }
-        val avgCharDp = if (options.any { it.label.any(Char::isCJK) }) 17.0 else 9.0
-        val labelWidthDp = (maxLabelChars * avgCharDp).coerceAtMost(180.0)
-        val estW = (labelWidthDp + 72.0).dp  // 72 = 18 (icon) + 10 (spacer) + 28 (paddingH 14*2) + 16 (buffer)
-        val winW = with(density) { configuration.screenWidthDp.dp.roundToPx() }
-        val winH = with(density) { configuration.screenHeightDp.dp.roundToPx() }
-        val estWPx = with(density) { estW.roundToPx() }
-        // estHPx = 选项数 * 48dp（行高，含 padding）
-        val lineHeightPx = with(density) { 48.dp.roundToPx() }
-        val menuVPadding = with(density) { 8.dp.roundToPx() }
-        val estHPx = options.size * lineHeightPx + menuVPadding * 2
-        val screenMarginPx = with(density) { 8.dp.roundToPx() }
-
-        // 先按绝对窗口坐标算出菜单左上角 absX / absY，最后统一减去锚点容器左上角
-        // (anchorBounds.left/top) 转成 Popup 的相对 offset（Popup 的 offset 是叠加到
-        // 父容器窗口左上角上的，而非直接绝对窗口坐标）。
-        val absPos: IntOffset = if (anchorPoint != null) {
-            // ── 长按点定位：菜单中心对齐长按点 + clamp 到屏幕内 ──
-            // 菜单中心对齐手指长按点：长按点偏右时菜单向左展开，偏左时向右展开；
-            // 长按点在屏幕顶部时菜单往下排，在底部时往上排，始终保持 ±estH/2 围绕长按点。
-            val px = anchorPoint.x
-            val py = anchorPoint.y
-            val x = (px - estWPx / 2).coerceIn(screenMarginPx, (winW - estWPx - screenMarginPx).coerceAtLeast(screenMarginPx))
-            val y = (py - estHPx / 2).coerceIn(screenMarginPx, (winH - estHPx - screenMarginPx).coerceAtLeast(screenMarginPx))
-            IntOffset(x, y)
-        } else {
-            // ── 矩形锚点定位：右对齐到锚点右缘 + 锚点下方优先（工具栏「更多」菜单等沿用）──
-            val spaceBelow = winH - anchorBounds.bottom
-            val y = if (spaceBelow >= estHPx + screenMarginPx) {
-                anchorBounds.bottom
-            } else {
-                // 翻上方：菜单底部 = 锚点顶部 - margin
-                (anchorBounds.top - estHPx - screenMarginPx)
-                    .coerceAtLeast(screenMarginPx)
-            }
-            var x = (anchorBounds.right - estWPx).coerceAtLeast(screenMarginPx)
-            // 边界保护：右缘不能超出屏幕 - margin
-            if (x + estWPx > winW - screenMarginPx) {
-                x = (winW - estWPx - screenMarginPx).coerceAtLeast(screenMarginPx)
-            }
-            IntOffset(x, y)
-        }
-        IntOffset(absPos.x - anchorBounds.left, absPos.y - anchorBounds.top)
+    val screenMarginPx = with(density) { 8.dp.roundToPx() }
+    val positionProvider = remember(anchorBounds, anchorPoint, screenMarginPx) {
+        UfiMenuPositionProvider(anchorBounds, anchorPoint, screenMarginPx)
     }
 
     Popup(
-        alignment = Alignment.TopStart,
-        offset = offset,
+        popupPositionProvider = positionProvider,
         onDismissRequest = { dismiss() },
         properties = PopupProperties(
             focusable = focusable,

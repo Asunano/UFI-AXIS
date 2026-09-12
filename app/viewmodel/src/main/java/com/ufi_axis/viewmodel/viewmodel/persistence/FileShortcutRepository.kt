@@ -9,23 +9,23 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 
 /**
- * ÊéÇ© / ¿ì½İÂ·¾¶µÄ³Ö¾Ã»¯²Ö´¢¡£
+ * ä¹¦ç­¾ / å¿«æ·è·¯å¾„çš„æŒä¹…åŒ–ä»“å‚¨ã€‚
  *
- * ³Ö¾Ã»¯·½°¸£ºSharedPreferences£¨Óë [com.ufi_axis.viewmodel.module.FileManagerModule]
- * ÖĞ phoneDownloadHistory µÄ´æ´¢Ä£Ê½ÍêÈ«Ò»ÖÂ£º`AppJson.encodeToString` /
- * `AppJson.decodeFromString` ĞòÁĞ»¯Õû¸ö `List<T>`£¬ÁãĞÂÔöÒÀÀµ£©¡£¼Ü¹¹ÎÄµµ ¡ì6 Ìáµ½µÄ DataStore
- * ÔÚ±¾²Ö¿âÎŞ¶ÔÓ¦ÒÀÀµ£¬´Ë´¦²ÉÓÃÓë¼ÈÓĞ´úÂëÍ¬¹¹µÄ SharedPreferences ÊµÏÖ£¬¹¦ÄÜµÈ¼Û£¨ÖØÆô±£Áô£©¡£
+ * æŒä¹…åŒ–æ–¹æ¡ˆï¼šSharedPreferencesï¼ˆä¸ [com.ufi_axis.viewmodel.module.FileManagerModule]
+ * ä¸­ phoneDownloadHistory çš„å­˜å‚¨æ¨¡å¼å®Œå…¨ä¸€è‡´ï¼š`AppJson.encodeToString` /
+ * `AppJson.decodeFromString` åºåˆ—åŒ–æ•´ä¸ª `List<T>`ï¼Œé›¶æ–°å¢ä¾èµ–ï¼‰ã€‚æ¶æ„æ–‡æ¡£ Â§6 æåˆ°çš„ DataStore
+ * åœ¨æœ¬ä»“åº“æ— å¯¹åº”ä¾èµ–ï¼Œæ­¤å¤„é‡‡ç”¨ä¸æ—¢æœ‰ä»£ç åŒæ„çš„ SharedPreferences å®ç°ï¼ŒåŠŸèƒ½ç­‰ä»·ï¼ˆé‡å¯ä¿ç•™ï¼‰ã€‚
  *
- * ËùÓĞ¶ÁĞ´¾ùÎªĞ¡ IO£¬Í³Ò»°ü¹üÔÚ [withContext] + [Dispatchers.IO] ÖĞÖ´ĞĞ£»
- * ·½·¨Ç©Ãû¾ùÎª `suspend`£¬ÓÉµ÷ÓÃ·½ÔÚĞ­³Ì×÷ÓÃÓòÄÚµ÷ÓÃ£¬±ÜÃâ×èÈûÖ÷Ïß³Ì¡£
- * ½âÎö×ö·ÀÓùĞÔ try/catch£¬Ê§°ÜÒ»ÂÉ·µ»Ø¿ÕÁĞ±í£¬±£Ö¤Ö÷Á÷³Ì²»±»³Ö¾Ã»¯Òì³£×è¶Ï¡£
+ * æ‰€æœ‰è¯»å†™å‡ä¸ºå° IOï¼Œç»Ÿä¸€åŒ…è£¹åœ¨ [withContext] + [Dispatchers.IO] ä¸­æ‰§è¡Œï¼›
+ * æ–¹æ³•ç­¾åå‡ä¸º `suspend`ï¼Œç”±è°ƒç”¨æ–¹åœ¨åç¨‹ä½œç”¨åŸŸå†…è°ƒç”¨ï¼Œé¿å…é˜»å¡ä¸»çº¿ç¨‹ã€‚
+ * è§£æåšé˜²å¾¡æ€§ try/catchï¼Œå¤±è´¥ä¸€å¾‹è¿”å›ç©ºåˆ—è¡¨ï¼Œä¿è¯ä¸»æµç¨‹ä¸è¢«æŒä¹…åŒ–å¼‚å¸¸é˜»æ–­ã€‚
  */
 class FileShortcutRepository(
     private val appContext: Context
 ) {
     private val prefs = appContext.getSharedPreferences("file_shortcuts", Context.MODE_PRIVATE)
 
-    // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤ Bookmarks ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Bookmarks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     suspend fun loadBookmarks(): List<Bookmark> = withContext(Dispatchers.IO) {
         val raw = prefs.getString("bookmarks", null) ?: return@withContext emptyList()
@@ -40,11 +40,11 @@ class FileShortcutRepository(
         try {
             prefs.edit().putString("bookmarks", AppJson.encodeToString(ListSerializer(Bookmark.serializer()), list)).apply()
         } catch (e: Exception) {
-            // ĞòÁĞ»¯ / ÂäÅÌÊ§°Ü½ö¶ªÆú£¬²»Ó°ÏìÖ÷Á÷³Ì
+            // åºåˆ—åŒ– / è½ç›˜å¤±è´¥ä»…ä¸¢å¼ƒï¼Œä¸å½±å“ä¸»æµç¨‹
         }
     }
 
-    // ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤ QuickPaths ©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤©¤
+    // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ QuickPaths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     suspend fun loadQuickPaths(): List<QuickPath> = withContext(Dispatchers.IO) {
         val raw = prefs.getString("quick_paths", null) ?: return@withContext emptyList()
@@ -59,7 +59,7 @@ class FileShortcutRepository(
         try {
             prefs.edit().putString("quick_paths", AppJson.encodeToString(ListSerializer(QuickPath.serializer()), list)).apply()
         } catch (e: Exception) {
-            // ĞòÁĞ»¯ / ÂäÅÌÊ§°Ü½ö¶ªÆú£¬²»Ó°ÏìÖ÷Á÷³Ì
+            // åºåˆ—åŒ– / è½ç›˜å¤±è´¥ä»…ä¸¢å¼ƒï¼Œä¸å½±å“ä¸»æµç¨‹
         }
     }
 }

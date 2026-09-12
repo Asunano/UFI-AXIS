@@ -2,10 +2,16 @@ package com.ufi_axis_core.controller.network
 
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.notify.NotifyEvent
+import com.ufi_axis_core.notify.NotifyLevel
+import com.ufi_axis_core.notify.NotifyScenes
+import com.ufi_axis_core.notify.Notifier
+
 import com.ufi_axis_core.util.formatDataSize
 import com.ufi_axis_core.util.formatUsagePercent
 import com.ufi_axis_core.util.normalizeAlertPercent
 import com.ufi_axis_core.util.trafficUsagePercent
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -26,20 +32,54 @@ import kotlinx.serialization.json.put
  *
  * ## 触发链路
  *
- * `DataScheduler` 的流量循环每 5 分钟调一次 [onUsage]（节流见
- * `DataScheduler.TRAFFIC_LIMIT_CHECK_INTERVAL_MS`），阈值直接复用**流量管理里已有的
+ * `DataScheduler` 的流量循环按「套餐限额检查间隔」调一次 [onUsage]（默认 5 分钟，
+ * 2026-09-08 起是设置项 `AppSettings.monitorTrafficLimitCheckSec`，节流见
+ * `DataScheduler.trafficLimitCheckIntervalMs`），阈值直接复用**流量管理里已有的
  * 告警百分比** `alert_percent`，不再引入第二个阈值配置。
  *
- * ## 为什么先发邮件、发成功才关
+ * ## 为什么先发通知、发成功才关
  *
  * 用户视角里"网断了"和"设备坏了"没有区别。所以顺序是
- * **发邮件 → 发信成功 → 等 1 分钟 → 关网**：
- * - 邮件发失败就**不关网**（宁可多跑流量，也不能让人以为故障还查不到原因）；
- * - 1 分钟是留给用户的反应窗口（收到邮件还能抢救一下手上的下载）。
+ * **发通知 → 确认通报到位 → 等 1 分钟 → 关网**：
+ * - 通报没到位就**不关网**（宁可多跑流量，也不能让人以为故障还查不到原因）；
+ * - 1 分钟是留给用户的反应窗口（收到通知还能抢救一下手上的下载）。
+ *
+ * ### 「通报到位」到底怎么判（这条规则必须写明白，别让它成为看不见的规则）
+ *
+ * 判定实现是 `DeliveryReport.anyConfirmedSent()`，只看**有送达确认的渠道**
+ * （邮件 SMTP 250 应答、Webhook 2xx、本机短信信箱 tag=2；推送是 fire-and-forget 广播，
+ * 恒 `Sent`，拿它判等于恒真）。算"到位"的情形：
+ * - `Sent` —— 真发出去了；
+ * - `Skipped(GATE)` —— 用户**自己**关了通知总开关或设了免打扰；
+ * - `Skipped(SCENE_OFF)` / `Skipped(LEVEL_TOO_LOW)`（2026-09-09 补齐）——
+ *   用户**自己**在那个渠道里取消了 `traffic80` 的勾选、或把最低级别调高了。
+ *
+ * 后两档补齐的理由：「在邮件设置里取消勾选 traffic80」与「关掉通知总开关」是**同一类主动
+ * 选择**，而补齐之前只认 GATE，于是前者会让自动关网**永久不执行** —— 用户开着"到量自动
+ * 关网"，却因为少勾一个邮件场景而从来不生效。那正是 GATE 那一档想避免的"假开关"，
+ * 只是换了个入口进来。
+ *
+ * #### 「用户自选静默照常关网」不是零通知（别把它当漏洞修）
+ *
+ * 上面三档 `Skipped` 都算"到位"，读起来像"没人被通知却把网关了"。实际不是：
+ * **WS 推送渠道仍然会投**。它不受总闸与场景勾选约束（是 fire-and-forget 广播，客户端
+ * 自己决定弹不弹），所以 app 在前台/连着 WS 时照样看得到这条预警 ——
+ * 被静默的只是邮件 / Webhook / 本机短信这几条**有送达确认**的渠道，
+ * 而那正是用户自己关掉的东西。
+ * 也正因为推送恒 `Sent`，它不能用来判"通报到位"（见 [notifier]）：一个恒真的判据
+ * 等于没有判据。两件事必须分开看 —— **判据里不认它，但它确实投了**。
+
+ *
+ * 仍然**不关网**的三种（原语义保留）：
+ * - `Skipped(NOT_CONFIGURED)` —— 渠道没配全，用户根本收不到任何通报；
+ * - `Skipped(QUOTA_EXCEEDED)` —— 短信渠道当天配额烧完了。这是"**想通知但没能力**"，
+ *   与"SMTP 没配"同类，不是用户选的静默；
+ * - `Failed` —— 重试完仍然发不出去。
  *
  * 关网动作放在 [scope] 的独立协程里：等待这 1 分钟不能占着采集循环。
  *
  * ## 只关一次
+
  *
  * 触发后把「计费周期 + 已关网」写进 `AppSettings.trafficAutoOffStateJson`。用量回落
  * （清零日 / 用户校准）或跨月时这个凭据作废，下一周期才能再触发。凭据必须持久化，
@@ -50,10 +90,24 @@ import kotlinx.serialization.json.put
 class TrafficAutoOffGuard(
     private val settings: AppSettings,
     private val networkController: NetworkController,
-    /** 发信口（返回 true = 确实发出去了）。由 ComponentFactory 接到 SmsForwardController。 */
-    private val mailSender: suspend (title: String, body: String) -> Boolean,
+    /**
+     * 通知口（由 ComponentFactory 接到 `NotificationDispatcher::emit`）。
+     *
+     * 返回每渠道结果 + 渠道元信息，本类只看 `anyConfirmedSent()`：
+     * **有送达确认的渠道通报到位了**（判定口径与"算作到位"的几种例外见类头注释）。
+     * 2026-09-08 之前这里是 `(title, body) -> Boolean` 的邮件专用钩子；换成统一签名时
+     * 一度用 `anySent()`，那是错的 —— 推送恒返回 `Sent`，判据会恒真，SMTP 没配好也照样断网。
+     *
+     * 投递**带有界重试**（最多 3 次、退避 2s + 6s，见 `RetryPolicy.DEFAULT`），所以最坏情况这里
+     * 要多等约 40s 才拿到结果，关网也就被推迟同样的时间。这是刻意取舍：
+     * 宁可晚关 40s，也不要"通知还没发出去就把网关了"—— 用户视角里那就是设备突然坏了。
+     */
+    private val notifier: Notifier,
+
+
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
+
 
     private val tag = "TrafficAutoOffGuard"
 
@@ -93,11 +147,15 @@ class TrafficAutoOffGuard(
                 if (cfg.restoreOnReset) {
                     val ok = runCatching { networkController.setMobileData(true) }.getOrDefault(false)
                     AppLogger.i(tag, "流量已清零，自动重新打开移动数据: $ok")
-                    mailSender("移动数据已恢复", buildString {
-                        appendLine("流量已清零（或计费周期已切换），移动数据网络已自动重新打开。")
-                        appendLine("恢复结果: ${if (ok) "成功" else "失败，请手动检查"}")
-                    }.trimEnd())
+                    notify(
+                        title = "移动数据已恢复",
+                        body = buildString {
+                            appendLine("流量已清零（或计费周期已切换），移动数据网络已自动重新打开。")
+                            appendLine("恢复结果: ${if (ok) "成功" else "失败，请手动检查"}")
+                        }.trimEnd()
+                    )
                 } else {
+
                     AppLogger.i(tag, "流量已清零，但恢复策略是「只关一次」，保持关闭")
                 }
             }
@@ -121,21 +179,27 @@ class TrafficAutoOffGuard(
                         else "关闭后不会自动恢复，需要手动重新打开移动数据。"
                     )
                 }.trimEnd()
-                val sent = mailSender("流量即将达到限额，1 分钟后将关闭移动数据", body)
-                if (!sent) {
-                    // 关键约定：邮件没发出去就不关网。否则用户只会看到"突然断网"。
-                    AppLogger.w(tag, "预警邮件未发出（场景未勾选 / SMTP 未配置 / 发送失败），本次不关闭移动数据")
+                // 这一步会一直等到整轮投递（含重试）出结果，最坏约 40s；
+                // 后面那 1 分钟的反应窗口照旧，所以关网最多晚 40s 发生。刻意如此，见 [notifier]。
+                val reported = notify("流量即将达到限额，1 分钟后将关闭移动数据", body)
+                if (!reported) {
+                    // 关键约定：通报没到位就不关网。否则用户只会看到"突然断网"。
+                    AppLogger.w(tag, "预警通知没能通报到位（SMTP 未配置齐全、场景未勾选，或重试后仍失败），本次不关闭移动数据")
                     return@launch
                 }
+
+
                 delay(DELAY_BEFORE_OFF_MS)
                 val ok = runCatching { networkController.setMobileData(false) }.getOrDefault(false)
                 if (ok) {
                     writeState(State(cycle, turnedOff = true, at = System.currentTimeMillis()))
                     AppLogger.w(tag, "已达流量告警阈值（$shown%），移动数据已自动关闭")
                 } else {
-                    // 不写 state：下一轮（5 分钟后）会重来一遍（含邮件），比"以为关了其实没关"安全
+                    // 不写 state：下一轮限额检查会重来一遍（含通知），比"以为关了其实没关"安全
                     AppLogger.e(tag, "自动关闭移动数据失败，将在下一轮重试")
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 AppLogger.e(tag, "自动关网流程异常", e)
             } finally {
@@ -143,6 +207,23 @@ class TrafficAutoOffGuard(
             }
         }
     }
+
+    /**
+     * 发一条流量预警类通知，返回"通报到位了吗"（口径见类头注释与 [notifier]）。
+     *
+     * 场景固定 [NotifyScenes.TRAFFIC_80]：与套餐限额百分比预警同一个场景，
+     * 用户在邮件通知页勾了才发邮件（勾没勾由渠道判，不在这里）。
+     */
+    private suspend fun notify(title: String, body: String): Boolean = notifier(
+        NotifyEvent(
+            scene = NotifyScenes.TRAFFIC_80,
+            level = NotifyLevel.WARNING,
+            title = title,
+            body = body
+        )
+    ).anyConfirmedSent()
+
+
 
     private fun currentCycle(): String = java.time.LocalDate.now().let {
         "%04d-%02d".format(it.year, it.monthValue)

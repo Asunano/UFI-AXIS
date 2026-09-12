@@ -27,6 +27,7 @@ import java.nio.charset.Charset
 import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Goform 客户端（ZTE 设备私有协议防腐层实现）。
@@ -44,7 +45,11 @@ import java.util.concurrent.atomic.AtomicInteger
 class GoformClient(
     private val deviceIp: String = "192.168.0.1",
     private val port: Int = 8080,
-    private val password: String = "YWRtaW4="
+    // 无默认值：口令必须由调用方显式注入（唯一构造点 ComponentFactory.buildNetworkGraph
+    // 传的是 settings.goformPassword）。此前默认值是 "YWRtaW4="（base64 of admin），
+    // 而它会被**原样**当作 sha256Hex(password) 的输入，与 AppSettings.DEFAULT_GOFORM_PASSWORD
+    // （明文 "admin"）算出的 hash 不一致 —— 依赖默认值的调用方会静默登录失败。
+    private val password: String
 ) : GoformGateway {
 
     private val tag = "GoformClient"
@@ -77,10 +82,27 @@ class GoformClient(
 
     private val loginMutex = Mutex()
     private val consecutiveLoginFailures = AtomicInteger(0)
-    private var sessionCookie: String? = null
-    private var waVersion: String? = null
-    private var crVersion: String? = null
-    private var lastLoginAttempt = 0L
+    // ── 会话/退避状态一律 @Volatile ──
+    // 这些字段在 loginMutex 内被读，却同时被 query/post 路径（`lastGiveWayAt`）和
+    // invalidateSession()/resetLogin()（`lastValidatedAt`）在**锁外**写，
+    // 而且写方与读方跑在不同的 Dispatchers.IO 协程上。非 volatile 时写可能对读方不可见，
+    // 让位窗口与指数退避会静默失效 —— 正是 ensureLogin 那段注释想防的登录风暴。
+
+    /**
+     * 会话快照：cookie 与「是否已登录」**必须一起换**，所以合成一个不可变对象整体替换。
+     *
+     * 2026-09-08：原来这是两个独立的 `@Volatile` 字段。`ensureLogin()` 的快速路径在锁外
+     * 读 `isLoggedIn` 判定「可以发请求了」，请求构建时再回头读一次 `sessionCookie` ——
+     * 这两次读之间 `invalidateSession()` 可以把 cookie 置 null，于是这一次请求带着**空 Cookie**
+     * 发出去，必然被设备判未鉴权。改成快照之后，判定与取 cookie 用的是同一份不可变值：
+     * 判定通过就一定有当时那个 cookie，[invalidateSession] 只影响**下一次**判定。
+     */
+    private class SessionSnapshot(val cookie: String?, val loggedIn: Boolean)
+
+    private val session = AtomicReference(SessionSnapshot(null, false))
+    @Volatile private var waVersion: String? = null
+    @Volatile private var crVersion: String? = null
+    @Volatile private var lastLoginAttempt = 0L
     private val baseLoginCooldownMs = 1500L
     // 2026-08-23: 退避上限从 60s 降到 10s —— 之前连续 session 失效会让退避叠到 60s，
     // 前端轮询全被拦截，造成「长时间断连，必须手动重启核心服务」体感。10s 已足够
@@ -90,11 +112,11 @@ class GoformClient(
     // 太长的 TTL 会让确保登录一直走缓存路径，等到下一次真断了才一起 invalidate 一波。
     private val sessionCacheTtlMs = 90_000L
     private val sessionValidationIntervalMs = 60_000L // 每 60s 验证一次
-    private var lastValidatedAt = 0L
-    @Volatile private var isLoggedIn = false
+    @Volatile private var lastValidatedAt = 0L
+
     
     // 让位退避：检测到官方后台在线时主动避让 30s
-    private var lastGiveWayAt = 0L
+    @Volatile private var lastGiveWayAt = 0L
     private val giveWayDurationMs = 30_000L
 
     private val resolveMutex = Mutex()
@@ -162,7 +184,7 @@ class GoformClient(
         val base = baseUrl()
         return httpClient.get(url) {
             header("Referer", "$base/index.html")
-            if (sessionCookie != null) header("Cookie", sessionCookie!!)
+            attachSessionCookie(session.get())
         }
     }
 
@@ -173,24 +195,46 @@ class GoformClient(
         null
     }
 
+    /**
+     * 附带**指定快照**里的 session Cookie。
+     *
+     * 快照必须由调用链上游（[ensureSession] 的返回值）传进来，不允许在这里回头读
+     * [session] —— 那就又回到「判定用一份、发请求用另一份」的 check-then-act：
+     * 判空与解引用之间被 [invalidateSession] 插空，请求会带着空 Cookie 发出去被设备判未鉴权。
+     */
+    private fun HttpRequestBuilder.attachSessionCookie(snapshot: SessionSnapshot?) {
+        val cookie = snapshot?.cookie
+        if (cookie != null) header("Cookie", cookie)
+    }
+
     // ============ Login ============
 
-    override suspend fun ensureLogin(): Boolean {
+    override suspend fun ensureLogin(): Boolean = ensureSession() != null
+
+    /**
+     * 与 [ensureLogin] 同一套判定，但返回**当次判定所依据的会话快照**（null = 不可用）。
+     *
+     * 请求构建必须用这个返回值取 cookie，不要回头再读 [session]：判定与取 cookie 之间
+     * 隔着一次 goform 往返，`invalidateSession()` 完全来得及把 cookie 置 null。
+     */
+    private suspend fun ensureSession(): SessionSnapshot? {
         ensureBaseUrlResolved()
         val now = System.currentTimeMillis()
         // ── 快速路径：缓存时间内且未到验证周期，直接返回 ──
-        if (isLoggedIn && (now - lastValidatedAt) < sessionValidationIntervalMs) return true
-        
+        val fast = session.get()
+        if (fast.loggedIn && (now - lastValidatedAt) < sessionValidationIntervalMs) return fast
+
         return loginMutex.withLock {
             val nowLocked = System.currentTimeMillis()
+            val current = session.get()
             // ── 二次检查 ──
-            if (isLoggedIn && (nowLocked - lastValidatedAt) < sessionValidationIntervalMs) return@withLock true
-            
+            if (current.loggedIn && (nowLocked - lastValidatedAt) < sessionValidationIntervalMs) return@withLock current
+
             // ── 到达验证周期或已失效：执行 validate ──
-            if (isLoggedIn && (nowLocked - lastValidatedAt) < sessionCacheTtlMs) {
-                if (validateSession()) {
+            if (current.loggedIn && (nowLocked - lastValidatedAt) < sessionCacheTtlMs) {
+                if (validateSession(current)) {
                     lastValidatedAt = nowLocked
-                    return@withLock true
+                    return@withLock current
                 }
             }
 
@@ -200,7 +244,7 @@ class GoformClient(
             val giveWayElapsed = nowLocked - lastGiveWayAt
             if (lastGiveWayAt > 0 && giveWayElapsed < giveWayDurationMs) {
                 AppLogger.d(tag, "ensureLogin: Giving way to official UI (remains ${ (giveWayDurationMs - giveWayElapsed)/1000 }s)")
-                return@withLock false
+                return@withLock null
             }
 
             // 2026-08-24: 不论 isLoggedIn 是否为 true，只要有失败记录就应用退避。
@@ -208,10 +252,10 @@ class GoformClient(
             if (failCount > 0) {
                 val backoffMs = (baseLoginCooldownMs * (1L shl failCount.coerceAtMost(6))).coerceAtMost(maxLoginBackoffMs)
                 if (nowLocked - lastLoginAttempt < backoffMs && lastLoginAttempt > 0L) {
-                    return@withLock false
+                    return@withLock null
                 }
             }
-            isLoggedIn = false
+            markLoggedOut()
             AppLogger.i(tag, "Performing login to $deviceIp:$port... (failCount=$failCount)")
             try {
                 val base = baseUrl()
@@ -231,7 +275,7 @@ class GoformClient(
                     setBody("isTest=false&goformId=LOGIN_MULTI_USER&user=admin&password=$encPwd&IP=localhost")
                 }
                 var loginBody = loginResp.bodyAsText()
-                loginResp.headers["Set-Cookie"]?.split(";")?.firstOrNull()?.let { sessionCookie = it }
+                loginResp.headers["Set-Cookie"]?.split(";")?.firstOrNull()?.let { storeCookie(it) }
                 if (loginResp.status != HttpStatusCode.OK || isLoginFailed(loginBody)) {
                     // 如果是 session 冲突，记录让位
                     if (loginBody.contains("\"result\":\"session\"", ignoreCase = true)) {
@@ -246,7 +290,7 @@ class GoformClient(
                         setBody("isTest=false&goformId=LOGIN&user=admin&password=$encPwd")
                     }
                     loginBody = fallbackResp.bodyAsText()
-                    fallbackResp.headers["Set-Cookie"]?.split(";")?.firstOrNull()?.let { sessionCookie = it }
+                    fallbackResp.headers["Set-Cookie"]?.split(";")?.firstOrNull()?.let { storeCookie(it) }
                     if (fallbackResp.status != HttpStatusCode.OK || isLoginFailed(loginBody)) {
                         if (loginBody.contains("\"result\":\"session\"", ignoreCase = true)) {
                             lastGiveWayAt = System.currentTimeMillis()
@@ -255,44 +299,55 @@ class GoformClient(
                             AppLogger.e(tag, "LOGIN fallback also rejected: ${loginBody.take(200)}")
                         }
                         consecutiveLoginFailures.incrementAndGet()
-                        isLoggedIn = false
+                        markLoggedOut()
                         lastLoginAttempt = System.currentTimeMillis()
-                        return@withLock false
+                        return@withLock null
                     }
                 }
+                // 登录成功：把 cookie 与「已登录」一次性合成新快照，后续请求都用它。
+                val loggedIn = session.updateAndGet { SessionSnapshot(it.cookie, true) }
                 val infoResp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=wa_inner_version,cr_version&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
                     header("Referer", "$base/index.html")
-                    if (sessionCookie != null) header("Cookie", sessionCookie!!)
+                    attachSessionCookie(loggedIn)
                 }
                 try {
                     val infoJson = json.parseToJsonElement(infoResp.bodyAsText()).jsonObject
                     waVersion = infoJson["wa_inner_version"]?.jsonPrimitive?.contentOrNull
                     crVersion = infoJson["cr_version"]?.jsonPrimitive?.contentOrNull
                 } catch (e: CancellationException) { throw e } catch (_: Exception) {}
-                isLoggedIn = true
                 consecutiveLoginFailures.set(0)
                 lastLoginAttempt = System.currentTimeMillis()
                 lastValidatedAt = System.currentTimeMillis()
                 lastGiveWayAt = 0L // 登录成功，重置让位
                 AppLogger.i(tag, "Login successful. wa=$waVersion cr=$crVersion")
-                true
+                loggedIn
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 AppLogger.e(tag, "Login failed", e)
                 consecutiveLoginFailures.incrementAndGet()
-                isLoggedIn = false
+                markLoggedOut()
                 lastLoginAttempt = System.currentTimeMillis()
-                false
+                null
             }
         }
     }
 
-    private suspend fun validateSession(): Boolean {
+    /** 只换 cookie，登录态不动（登录流程中途拿到 Set-Cookie 时用）。 */
+    private fun storeCookie(cookie: String) {
+        session.updateAndGet { SessionSnapshot(cookie, it.loggedIn) }
+    }
+
+    /** 只落「未登录」，**保留 cookie** —— 与改造前 `isLoggedIn = false` 的语义逐字一致。 */
+    private fun markLoggedOut() {
+        session.updateAndGet { SessionSnapshot(it.cookie, false) }
+    }
+
+    private suspend fun validateSession(snapshot: SessionSnapshot): Boolean {
         return try {
             val base = baseUrl()
             val resp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=RD&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
                 header("Referer", "$base/index.html")
-                if (sessionCookie != null) header("Cookie", sessionCookie!!)
+                attachSessionCookie(snapshot)
             }
             val body = resp.bodyAsText()
             val authFailure = isAuthFailure(body)
@@ -322,16 +377,14 @@ class GoformClient(
      * 不应把 cookie 失效 + 网络抖动混为一谈。
      */
     override fun invalidateSession() {
-        isLoggedIn = false
-        sessionCookie = null
+        session.set(SessionSnapshot(null, false))
         lastValidatedAt = 0L
         // 故意不动 consecutiveLoginFailures：失败计数只跟踪「登录尝试」是否成功。
     }
 
     override fun resetLogin() {
-        isLoggedIn = false
+        session.set(SessionSnapshot(null, false))
         consecutiveLoginFailures.set(0)
-        sessionCookie = null
         lastValidatedAt = 0L
     }
 
@@ -341,16 +394,48 @@ class GoformClient(
 
     // ============ Auth-failure detection ============
 
+    /**
+     * 设备在 `result` 字段里表达的会话/鉴权失败取值（全小写比较）。
+     * 只放**确定**语义的值 —— 这个集合是「精确等值」用的，不是子串。
+     */
+    private val AUTH_FAILURE_RESULTS = setOf("not logged in", "session", "none secure connection")
+
+    /**
+     * 会话/鉴权失败判定。
+     *
+     * 2026-09-08：原实现是一串 `body.contains(...)`，其中 `contains("redirect")`
+     * 与 `contains("\"result\":\"session\"")` 会把**正常业务响应**误判成掉线：
+     * 设备 JSON 里只要出现 `redirect_url`、`session_timeout` 这类字段名就中招，
+     * 后果是白白 invalidateSession() → 强制重登 → 撞上登录退避，表现成随机断连。
+     * 现在的口径分两路：
+     *  - body 是 JSON：只按 `result` 字段**精确等值**比较（外加显式的 `Error` 字段）；
+     *  - body 不是 JSON（设备把未鉴权请求返回 login.html，回的是 HTML）：才退回子串匹配。
+     * 判 HTML 走子串这一路是常态而非异常，所以只在「看起来像 JSON」时才调 parseJson，
+     * 免得 HTML 每次都在日志里刷一条 parseJson failed。
+     */
     internal fun isAuthFailure(body: String): Boolean {
         if (body.isBlank()) return false
-        return body.contains("\"result\":\"not logged in\"", ignoreCase = true)
-            || body.contains("\"result\":\"session\"", ignoreCase = true)
-            || body.contains("login.html", ignoreCase = true)
-            || body.contains("redirect", ignoreCase = true)
-            || body.contains("none secure connection", ignoreCase = true)
-            || body.contains("\"Error\":\"", ignoreCase = true)
-            || (body.trimStart().startsWith("<!DOCTYPE") || body.trimStart().startsWith("<html"))
+        val trimmed = body.trimStart()
+        if (trimmed.startsWith("<")) return true
+        if (trimmed.startsWith("{")) {
+            val obj = parseJson(body)
+            if (obj != null) {
+                val result = (obj["result"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase(Locale.ROOT)
+                if (result != null && result in AUTH_FAILURE_RESULTS) return true
+                // 设备也会把错误塞进 Error 字段（历史上见过 "Error":"..."），非空即失败
+                val err = (obj["Error"] as? JsonPrimitive)?.contentOrNull
+                return !err.isNullOrBlank()
+            }
+            // 声称是 JSON 却解析不出来：不在这里下结论，交给调用方的完整性校验/解析失败分支
+            return false
+        }
+        val lower = body.lowercase(Locale.ROOT)
+        return lower.contains("login.html") ||
+            lower.contains("redirect") ||
+            lower.contains("none secure connection") ||
+            lower.contains("not logged in")
     }
+
 
     private fun isResponseComplete(body: String): Boolean {
         if (body.isBlank()) return false
@@ -366,51 +451,107 @@ class GoformClient(
 
     // ============ POST ============
 
-    override suspend fun goformPost(params: Map<String, String>): String? {
-        return withContext(Dispatchers.IO) {
-            val start = System.currentTimeMillis()
-            val result = goformPostInternal(params)
-            val cost = System.currentTimeMillis() - start
-            // 任何写操作都会让 GoformQoS 的 2 秒查询快照过时。不清的话，写完立刻回读会命中
-            // 旧快照拿到写入前的值 —— 表现为「开关点了没反应、状态弹回原值、要点好几次」。
-            // 上层 ResponseCache.invalidate 挡不住这一层，因为它在更下游。
-            // 写操作频率远低于查询，整体清空的代价可以接受。
-            GoformQoS.clearCache()
-            GoformQoS.adaptiveAdjust(
-                targetQueryPermits = 6,
-                targetSetPermits = 3
-            )
-            AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[QoS] goformPost cost=${cost}ms")
-            result
+    override suspend fun goformPost(params: Map<String, String>): String? =
+        (postMeasured(params, retryOnSessionLost = false) as? GoformWriteResult.Accepted)?.body
+
+    /**
+     * **幂等**写操作专用入口：会话失效时重登并只重试一次，并把
+     * 「会话失效 / 连不上 / 设备表过态」三件事分开返回（判据见 [GoformWriteResult]）。
+     *
+     * 为什么不让 [goformPost] 一律重试：`SEND_SMS` 这类命令**非幂等**，重发一次可能就是
+     * 第二笔话费（见 `GoformSmsClient.sendSms` 的 `NO_RESPONSE` 判据）。重试与否必须由
+     * 调用方按命令语义显式选择，所以这里另开一条路，而不是把重试塞进公共 POST。
+     *
+     * 设置类命令（`goformId=SET_*` / `SET_BEARER_PREFERENCE` 等）对同一取值幂等，
+     * 重发安全 —— 这也是修「切换网络制式第一次必定失败」的落点：读路径早就有这套重试
+     * （见 [queryInternal]），写路径一直没有，于是一次会话抖动就等于一次用户可见的失败。
+     */
+    internal suspend fun goformPostIdempotent(params: Map<String, String>): GoformWriteResult =
+        postMeasured(params, retryOnSessionLost = true)
+
+    private suspend fun postMeasured(
+        params: Map<String, String>,
+        retryOnSessionLost: Boolean
+    ): GoformWriteResult = withContext(Dispatchers.IO) {
+        val start = System.currentTimeMillis()
+        var attemptNo = 1
+        var result = goformPostOnce(params)
+        // 重试**必须**在 set 许可归还之后发起（goformPostOnce 内部的 withSetPermit 已退出），
+        // 理由与 queryInternal 那段注释一致：持一个许可再去申请第二个，在许可被自适应调节
+        // 压到 1 时就是永久挂死。上限由 GoformWritePolicy.MAX_ATTEMPTS 兜，不会无界重试。
+        while (retryOnSessionLost && GoformWritePolicy.shouldRetry(attemptNo, result)) {
+            attemptNo++
+            AppLogger.w(tag, "[goform_set] session lost, re-login and retry (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
+            result = goformPostOnce(params)
         }
+        val cost = System.currentTimeMillis() - start
+        // 任何写操作都会让 GoformQoS 的 2 秒查询快照过时。不清的话，写完立刻回读会命中
+        // 旧快照拿到写入前的值 —— 表现为「开关点了没反应、状态弹回原值、要点好几次」。
+        // 上层 ResponseCache.invalidate 挡不住这一层，因为它在更下游。
+        // 写操作频率远低于查询，整体清空的代价可以接受。
+        GoformQoS.clearCache()
+        GoformQoS.adaptiveAdjust(
+            targetQueryPermits = 6,
+            targetSetPermits = 3
+        )
+        AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[QoS] goformPost cost=${cost}ms attempts=$attemptNo")
+        result
     }
 
 
-    private suspend fun goformPostInternal(params: Map<String, String>): String? {
-        if (!ensureLogin()) {
+    /**
+     * 单次 `goform_set_cmd_process` 往返。
+     *
+     * 传输层异常在这里就地收成 [GoformWriteResult.Unreachable]，**不再往上抛** ——
+     * 原来它会一路冒到 Ktor 的兜底处理器变成一个没有 body 语义的 500，
+     * 客户端只能显示「服务器内部错误」。
+     */
+    private suspend fun goformPostOnce(params: Map<String, String>): GoformWriteResult {
+        val snapshot = ensureSession()
+        if (snapshot == null) {
             AppLogger.e(tag, "goformPost aborted: not logged in")
-            return null
+            return GoformWriteResult.SessionLost
         }
         return GoformQoS.withSetPermit {
-            val ad = computeAd(params)
+            // AD 由 wa_inner_version / cr_version / RD 三次前置查询算出来。会话已死时这三次
+            // 查询拿回来的是登录页，解析不出字段 → computeAd 返回 null。所以「AD 算不出来」
+            // 在实测里就是「会话失效」最常见的外观，必须归到可重试一侧。
+            val ad = try {
+                computeAd(params, snapshot)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                AppLogger.w(tag, "[goform_set] AD precheck transport error: ${e.message}")
+                return@withSetPermit GoformWriteResult.Unreachable(e.message ?: e::class.java.simpleName)
+            }
             if (ad == null) {
-                AppLogger.e(tag, "goformPost aborted: AD compute failed (cookie=${sessionCookie?.take(8)})")
+                AppLogger.e(tag, "goformPost aborted: AD compute failed (cookie=${snapshot.cookie?.take(8)})")
                 invalidateSession()
-                return@withSetPermit null
+                return@withSetPermit GoformWriteResult.SessionLost
             }
             val base = baseUrl()
             val formBody = GoformCodec.buildSetFormBody(params, ad)
-            val resp = httpClient.post("$base/goform/goform_set_cmd_process") {
-                header("Referer", "$base/index.html")
-                header("Origin", base)
-                header("Content-Type", "application/x-www-form-urlencoded")
-                if (sessionCookie != null) header("Cookie", sessionCookie!!)
-                setBody(formBody)
+            val rawBody: String
+            val status: HttpStatusCode
+            try {
+                val resp = httpClient.post("$base/goform/goform_set_cmd_process") {
+                    header("Referer", "$base/index.html")
+                    header("Origin", base)
+                    header("Content-Type", "application/x-www-form-urlencoded")
+                    attachSessionCookie(snapshot)
+                    setBody(formBody)
+                }
+                rawBody = GoformCodec.decodeBody(resp.readBytes())
+                status = resp.status
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                AppLogger.w(tag, "[goform_set] transport error: ${e.message}")
+                return@withSetPermit GoformWriteResult.Unreachable(e.message ?: e::class.java.simpleName)
             }
-            val rawBody = GoformCodec.decodeBody(resp.readBytes())
-            val status = resp.status
             AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_set] status=$status body=${rawBody.take(200)}")
-            if (status != HttpStatusCode.OK || isAuthFailure(rawBody)) {
+            val verdict = GoformWritePolicy.classify(status.value, isAuthFailure(rawBody), rawBody)
+            if (verdict is GoformWriteResult.SessionLost) {
                 if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
                     lastGiveWayAt = System.currentTimeMillis()
                     AppLogger.w(tag, "[goform_set] session active on official UI, backing off")
@@ -418,9 +559,8 @@ class GoformClient(
                     AppLogger.w(tag, "[goform_set] auth/session lost, invalidating; body=${rawBody.take(120)}")
                 }
                 invalidateSession()
-                return@withSetPermit null
             }
-            rawBody
+            verdict
         }
     }
 
@@ -431,106 +571,149 @@ class GoformClient(
         return queryInternal(commands, retry = true)
     }
 
+    /**
+     * 重试**必须**在许可释放之后发起。
+     *
+     * 早期实现直接在 `withQueryPermit { … }` 块内递归调用自身，等于「持有一个许可再去申请
+     * 第二个」。`GoformQoS.querySemaphore` 的许可数会被自适应调节压到 2（DataScheduler 温度
+     * 临界）甚至 1（`ConfigRoutes` 的 adaptiveAdjust，minPermits=1），而 kotlinx 的
+     * `Semaphore.acquire()` 没有超时 —— 许可为 1 时任意一次重试即永久挂死，许可为 2 时两个
+     * 并发重试即挂死，整条 goform 读路径再也不恢复（表现为「长时间断连，必须重启核心服务」）。
+     */
     private suspend fun queryInternal(commands: List<String>, retry: Boolean): JsonObject? {
-        if (!ensureLogin()) return null
-        return GoformQoS.withQueryPermit {
-            // 缓存边界（计划书 1.0.3）：这一层是**传输层**缓存，key 是 cmd 名集合，
-            // value 是设备**原始**响应。字段归一化在它的下游（GoformFieldMapper /
-            // GoformXxxClient），上层业务缓存（ResponseCache / DataHub）存的才是 canonical 数据。
-            // 不要在这一层改字段名或改值 —— 否则 QoS 快照会同时污染所有调用方，
-            // 而且归一化会变成"有时做有时不做"（缓存命中时被跳过）。
-            val key = commands.sorted().joinToString(",")
-            GoformQoS.getCachedQuery(key)?.let {
-                AppLogger.d(tag, "[cache HIT] $key")
-                return@withQueryPermit it
-            }
-            val base = baseUrl()
-            val cmdParam = commands.joinToString(",")
-            val url = "$base/goform/goform_get_cmd_process?cmd=$cmdParam&multi_data=1&isTest=false&_=${System.currentTimeMillis()}"
-            val resp = httpClient.get(url) {
-                header("Referer", "$base/index.html")
-                if (sessionCookie != null) header("Cookie", sessionCookie!!)
-            }
-            val rawBody = GoformCodec.decodeBody(resp.readBytes())
-            val status = resp.status
-            AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_get] cmd=$cmdParam status=$status body=${rawBody.take(200)}")
-            
-            // 2026-08-24: 增强校验。部分设备在负载过高时会返回截断/非完整的 JSON。
-            // 如果请求了多个字段但返回字段数过少（且非 auth 错误），标记为失效。
-            val isPartial = status == HttpStatusCode.OK && !isAuthFailure(rawBody) && 
-                    commands.size > 5 && countJsonFields(rawBody) < 2
-            
-            if (status != HttpStatusCode.OK || isAuthFailure(rawBody) || isPartial) {
-                if (isPartial) {
-                    AppLogger.w(tag, "[goform_get] Partial response detected ($cmdParam), invalidating session")
-                } else if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
-                    lastGiveWayAt = System.currentTimeMillis()
-                    AppLogger.w(tag, "[goform_get] session active on official UI, backing off")
-                } else {
-                    AppLogger.w(tag, "[goform_get] auth/session lost (status=$status), invalidating")
-                }
-                invalidateSession()
-                if (retry && ensureLogin()) {
-                    return@withQueryPermit queryInternal(commands, retry = false)
-                }
-                return@withQueryPermit null
-            }
-            val obj = parseJson(rawBody)
-            if (obj == null) {
-                AppLogger.w(tag, "[goform_get] parse failed: ${rawBody.take(200)}")
-                return@withQueryPermit null
-            }
-            GoformQoS.cacheQuery(key, obj)
-            obj
-        }
+        val snapshot = ensureSession() ?: return null
+        var authLost = false
+        val first = GoformQoS.withQueryPermit { queryOnce(commands, snapshot) { authLost = true } }
+        if (first != null || !authLost) return first
+        // 会话失效：此刻许可已归还，重登与重试都在许可之外，不会自我阻塞。
+        if (!retry) return null
+        // 重登会换 cookie，必须**重新取一份快照**再发第二次，不能复用上面那份已失效的。
+        val renewed = ensureSession() ?: return null
+        return GoformQoS.withQueryPermit { queryOnce(commands, renewed) { } }
     }
+
+    /**
+     * 单次 goform 读取。返回 null 时通过 [onAuthLost] 区分「会话失效（可重试）」与
+     * 「解析失败（重试无意义）」，避免把两种失败混成同一个 null。
+     */
+    private suspend fun queryOnce(
+        commands: List<String>,
+        snapshot: SessionSnapshot,
+        onAuthLost: () -> Unit
+    ): JsonObject? {
+        // 缓存边界（计划书 1.0.3）：这一层是**传输层**缓存，key 是 cmd 名集合，
+        // value 是设备**原始**响应。字段归一化在它的下游（GoformFieldMapper /
+        // GoformXxxClient），上层业务缓存（ResponseCache / DataHub）存的才是 canonical 数据。
+        // 不要在这一层改字段名或改值 —— 否则 QoS 快照会同时污染所有调用方，
+        // 而且归一化会变成"有时做有时不做"（缓存命中时被跳过）。
+        val key = commands.sorted().joinToString(",")
+        GoformQoS.getCachedQuery(key)?.let {
+            AppLogger.d(tag, "[cache HIT] $key")
+            return it
+        }
+        val base = baseUrl()
+        val cmdParam = commands.joinToString(",")
+        val url = "$base/goform/goform_get_cmd_process?cmd=$cmdParam&multi_data=1&isTest=false&_=${System.currentTimeMillis()}"
+        val resp = httpClient.get(url) {
+            header("Referer", "$base/index.html")
+            attachSessionCookie(snapshot)
+        }
+        val rawBody = GoformCodec.decodeBody(resp.readBytes())
+        val status = resp.status
+        AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_get] cmd=$cmdParam status=$status body=${rawBody.take(200)}")
+
+        // 2026-08-24: 增强校验。部分设备在负载过高时会返回截断/非完整的 JSON。
+        // 如果请求了多个字段但返回字段数过少（且非 auth 错误），标记为失效。
+        //
+        // 2026-09-08：字段数原来用 `countJsonFields()`（数 body 里 ':' 的个数）估算，
+        // 而字符串值里的冒号（URL、"12:00"、base64 短信正文）会把计数虚高。
+        // 误判成 partial 就白白 invalidateSession() 强制重登；漏判则把截断的数据
+        // 当权威值往上游灌。反正下面就要解析，直接数**解析出来的顶层 key**，两处共用一次解析。
+        val authFailure = isAuthFailure(rawBody)
+        val obj = if (status == HttpStatusCode.OK && !authFailure) parseJson(rawBody) else null
+        val isPartial = status == HttpStatusCode.OK && !authFailure &&
+                commands.size > 5 && obj != null && obj.size < 2
+
+        if (status != HttpStatusCode.OK || authFailure || isPartial) {
+            if (isPartial) {
+                AppLogger.w(tag, "[goform_get] Partial response detected ($cmdParam, keys=${obj?.size ?: 0}), invalidating session")
+            } else if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
+                lastGiveWayAt = System.currentTimeMillis()
+                AppLogger.w(tag, "[goform_get] session active on official UI, backing off")
+            } else {
+                AppLogger.w(tag, "[goform_get] auth/session lost (status=$status), invalidating")
+            }
+            invalidateSession()
+            onAuthLost()
+            return null
+        }
+        if (obj == null) {
+            AppLogger.w(tag, "[goform_get] parse failed: ${rawBody.take(200)}")
+            return null
+        }
+        GoformQoS.cacheQuery(key, obj)
+        return obj
+    }
+
 
     override suspend fun querySingle(command: String): JsonElement? {
         if (!ensureLogin()) return null
         return querySingleInternal(command, retry = true)
     }
 
+    /** 重试在许可之外发起，理由同 [queryInternal]。 */
     private suspend fun querySingleInternal(command: String, retry: Boolean): JsonElement? {
-        if (!ensureLogin()) return null
-        return GoformQoS.withQueryPermit {
-            val base = baseUrl()
-            val url = "$base/goform/goform_get_cmd_process?cmd=$command&isTest=false&_=${System.currentTimeMillis()}"
-            val resp = httpClient.get(url) {
-                header("Referer", "$base/index.html")
-                if (sessionCookie != null) header("Cookie", sessionCookie!!)
+        val snapshot = ensureSession() ?: return null
+        var authLost = false
+        val first = GoformQoS.withQueryPermit { querySingleOnce(command, snapshot) { authLost = true } }
+        if (first != null || !authLost) return first
+        if (!retry) return null
+        // 重登换了 cookie，第二次必须用新快照（理由同 [queryInternal]）。
+        val renewed = ensureSession() ?: return null
+        return GoformQoS.withQueryPermit { querySingleOnce(command, renewed) { } }
+    }
+
+    private suspend fun querySingleOnce(
+        command: String,
+        snapshot: SessionSnapshot,
+        onAuthLost: () -> Unit
+    ): JsonElement? {
+        val base = baseUrl()
+        val url = "$base/goform/goform_get_cmd_process?cmd=$command&isTest=false&_=${System.currentTimeMillis()}"
+        val resp = httpClient.get(url) {
+            header("Referer", "$base/index.html")
+            attachSessionCookie(snapshot)
+        }
+        val rawBody = GoformCodec.decodeBody(resp.readBytes())
+        val status = resp.status
+        AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_get_single] cmd=$command status=$status body=${rawBody.take(200)}")
+        if (status != HttpStatusCode.OK || isAuthFailure(rawBody)) {
+            if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
+                lastGiveWayAt = System.currentTimeMillis()
+                AppLogger.w(tag, "[goform_get_single] session active on official UI, backing off")
+            } else {
+                AppLogger.w(tag, "[goform_get_single] auth/session lost (status=$status), invalidating")
             }
-            val rawBody = GoformCodec.decodeBody(resp.readBytes())
-            val status = resp.status
-            AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_get_single] cmd=$command status=$status body=${rawBody.take(200)}")
-            if (status != HttpStatusCode.OK || isAuthFailure(rawBody)) {
-                if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
-                    lastGiveWayAt = System.currentTimeMillis()
-                    AppLogger.w(tag, "[goform_get_single] session active on official UI, backing off")
-                } else {
-                    AppLogger.w(tag, "[goform_get_single] auth/session lost (status=$status), invalidating")
-                }
-                invalidateSession()
-                if (retry && ensureLogin()) {
-                    return@withQueryPermit querySingleInternal(command, retry = false)
-                }
-                return@withQueryPermit null
-            }
-            try {
-                json.parseToJsonElement(rawBody)
-            } catch (e: CancellationException) { throw e } catch (e: Exception) {
-                AppLogger.w(tag, "[goform_get_single] parse failed: ${rawBody.take(200)}")
-                null
-            }
+            invalidateSession()
+            onAuthLost()
+            return null
+        }
+        return try {
+            json.parseToJsonElement(rawBody)
+        } catch (e: CancellationException) { throw e } catch (e: Exception) {
+            AppLogger.w(tag, "[goform_get_single] parse failed: ${rawBody.take(200)}")
+            null
         }
     }
 
+
     // ============ AD / LD / RD ============
 
-    private suspend fun fetchVersionInfo(): Pair<String?, String?> {
+    private suspend fun fetchVersionInfo(snapshot: SessionSnapshot): Pair<String?, String?> {
         val base = baseUrl()
         val resp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=wa_inner_version,cr_version&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
             header("Referer", "$base/index.html")
-            if (sessionCookie != null) header("Cookie", sessionCookie!!)
+            attachSessionCookie(snapshot)
         }
         val body = resp.bodyAsText()
         return try {
@@ -539,13 +722,13 @@ class GoformClient(
         } catch (e: CancellationException) { throw e } catch (_: Exception) { null to null }
     }
 
-    private suspend fun computeAd(params: Map<String, String>): String? {
-        val (wa, cr) = fetchVersionInfo()
+    private suspend fun computeAd(params: Map<String, String>, snapshot: SessionSnapshot): String? {
+        val (wa, cr) = fetchVersionInfo(snapshot)
         if (wa.isNullOrBlank() || cr.isNullOrBlank()) {
             AppLogger.w(tag, "computeAd: missing wa/cr (wa=$wa cr=$cr)")
             return null
         }
-        val rd = getRd()
+        val rd = getRd(snapshot)
         if (rd == null) {
             AppLogger.w(tag, "computeAd: RD is null")
             return null
@@ -554,11 +737,11 @@ class GoformClient(
         return sha256Hex(adRaw).uppercase()
     }
 
-    private suspend fun getRd(): String? {
+    private suspend fun getRd(snapshot: SessionSnapshot): String? {
         val base = baseUrl()
         val resp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=RD&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
             header("Referer", "$base/index.html")
-            if (sessionCookie != null) header("Cookie", sessionCookie!!)
+            attachSessionCookie(snapshot)
         }
         val body = resp.bodyAsText()
         return try {
@@ -578,7 +761,8 @@ class GoformClient(
             )
             AppLogger.d(tag, "Goform logout done")
             resp != null
-        } catch (e: Exception) {
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
             AppLogger.e(tag, "logout failed", e)
             false
         }
@@ -598,13 +782,49 @@ class GoformClient(
         return false
     }
 
+    /** 登录响应里代表成功的 `result` 取值（全小写精确比较）。 */
+    private val LOGIN_SUCCESS_RESULTS = setOf("0", "success")
+
+    /** 登录响应里代表失败的 `result` 取值（全小写精确比较）。 */
+    private val LOGIN_FAILURE_RESULTS = setOf(
+        "failure", "login fail", "login failed", "password error",
+        "not logged in", "session", "none secure connection"
+    )
+
+    /**
+     * 登录响应是否表示失败。
+     *
+     * 2026-09-08：原实现是对整个 body 做小写子串匹配，其中 `b.contains("session")`
+     * 会把任何**恰好带 session 字样**的合法响应（如含 `session_timeout` 字段）判成登录失败 ——
+     * 而这个判定的代价很重：直接 `consecutiveLoginFailures++`，退避是 1500 * 2^n，
+     * 几次误判就把整条 goform 路径按到退避上限，表现成「长时间断连」。
+     * 现在只按 `result` 字段精确比较；子串匹配仅保留给**非 JSON**的 HTML 登录页/明文错误串。
+     * 未知 result 一律不判失败（保持既有宽松语义，不新增「登不进去」的失败模式），
+     * 但打一条 WARN 留证据 —— 真遇到新固件的取值，日志里能看见再收紧。
+     */
     internal fun isLoginFailed(body: String?): Boolean {
         if (body.isNullOrBlank()) return false
-        val b = body.lowercase(Locale.ROOT)
-        return b.contains("login fail") || b.contains("password error") ||
-            b.contains("not logged in") || b.contains("session") ||
-            b.contains("error") && b.contains("\"result\"") && !b.contains("\"result\":\"success\"")
+        val trimmed = body.trimStart()
+        // HTML：设备把未鉴权/出错的登录请求返回成页面，这一路只能靠形状与子串判
+        if (trimmed.startsWith("<")) return true
+        if (!trimmed.startsWith("{")) {
+            val lower = body.lowercase(Locale.ROOT)
+            return lower.contains("login fail") || lower.contains("password error") ||
+                lower.contains("not logged in") || lower.contains("login.html")
+        }
+        val obj = parseJson(body) ?: return false
+        val result = (obj["result"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase(Locale.ROOT)
+        if (result != null) {
+            if (result in LOGIN_SUCCESS_RESULTS) return false
+            if (result in LOGIN_FAILURE_RESULTS) return true
+            AppLogger.w(tag, "isLoginFailed: unknown login result='$result', treating as success")
+            return false
+        }
+        // 没有 result 字段：只认显式的 Error 字段
+        val err = (obj["Error"] as? JsonPrimitive)?.contentOrNull
+        return !err.isNullOrBlank()
     }
+
 
     // ============ crypto ============
 
@@ -632,12 +852,8 @@ class GoformClient(
         }
     }
 
-    private fun countJsonFields(body: String): Int {
-        if (body.isBlank() || !body.trimStart().startsWith("{")) return 0
-        return body.count { it == ':' } // 粗略估算字段数，避免完整解析开销
-    }
-
     override fun close() {
+
         try { httpClient.close() } catch (_: Exception) {}
         AppLogger.i(tag, "GoformClient closed")
     }

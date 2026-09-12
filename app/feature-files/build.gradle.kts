@@ -43,4 +43,5 @@ dependencies {
     implementation(libs.media3.exoplayer)
     implementation(libs.media3.ui)
     implementation(libs.media3.extractor)
+    implementation(libs.media3.datasource.okhttp)
 }

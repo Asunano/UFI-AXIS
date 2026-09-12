@@ -18,8 +18,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -43,6 +41,7 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.UpdateSource
 import com.ufi_axis.viewmodel.state.FrontendUpdateState
 import com.ufi_axis.viewmodel.state.UpdatePromptState
+import com.ufi_axis.ui.theme.UfiMotion
 
 // 2026-09-06：原 UpdateCheckDialog（只讲 App 自更新的那个弹窗）已删除，由本文件末尾的
 // [UnifiedUpdateDialog] 取代 —— 它把 App 项与 Core 项放进同一个弹窗，只有一项有更新时
@@ -236,7 +235,7 @@ fun UpdateSettingsDialog(
                 // 同步到设备精简：移除「同步」按钮行——关闭弹窗时由调用方按需同步（改过才发）
                 // 推送 APK 更新（兜底）
                 UfiSettingsItem(
-                    title = "推送 APK 更新（兜底）",
+                    title = "推送 APK 更新（备用方式）",
                     description = "选择本地 APK 手动推送到设备安装（后端无法自下载时）",
                     trailing = {
                         UfiButton(variant = UfiButtonVariant.Subtle, size = UfiButtonSize.Small, text = "选择 APK", onClick = onPushApk)

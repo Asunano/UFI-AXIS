@@ -122,6 +122,9 @@ object Endpoints {
 
         /** `{ root, uid, method: "adb_shell" | "shell" }` —— 替代不存在的 `api/adb/status`。 */
         const val ROOT = "$BASE/root"
+
+        /** 执行一条 shell 命令（特权命令走 ADB 公共服务，见项目约定）。 */
+        const val EXEC = "$BASE/exec"
     }
 
     object Tasks {
@@ -135,8 +138,155 @@ object Endpoints {
         const val SUMMARY = "$API/dashboard/summary"
     }
 
+    /**
+     * 测速。内网吞吐/探针 + 外网节点白名单转发。
+     *
+     * [RELAY] 仅供 Web 浏览器使用：外网自建节点未下发 CORS 头，
+     * 浏览器无法直连 `https://…/speedtest` 读 body；App 走原生 HTTP 不经此处。
+     */
+    object SpeedTest {
+        const val BASE = "$API/speedtest"
+        const val UPLOAD = "$BASE/upload"
+        /** GET/POST：`url` 必须是白名单外网节点地址；转发 Range / 流式 body */
+        const val RELAY = "$BASE/relay"
+    }
+
+    /**
+     * 短信。这里只登记 2026-09-08 拦截改造**新增**的端点 ——
+     * 本文件的规则是「本次改到的端点必须走 contract」，不追求把 api/sms 下的端点一次性搬完，
+     * 免得又造出一份看起来权威、实际半旧的清单。
+     *
+     * 现存但未登记的：`list` / `contacts` / `count` / `{id}` / `send` / `delete` / `read` /
+     * `read-conversation` / `mark-all-read` / `verification-codes`。
+     */
+    object Sms {
+        /** 仅前缀，不是端点。 */
+        const val BASE = "$API/sms"
+
+        /**
+         * 拦截规则（号码黑名单 + 关键词，同一张表的不同 scope）。
+         * `GET` 列表 / `POST` 新增；单条改删走 [RULE_BY_ID]。
+         *
+         * **没有** `rules/test`：去掉正则后 contains/equals/prefix/suffix 行为可预测，
+         * 「规则有没有生效」由 `hit_count` + [BLOCKED] 回答。
+         */
+        const val RULES = "$BASE/rules"
+
+        /** `PUT`（字段级合并，含 enabled 切换）/ `DELETE` 单条规则。 */
+        fun ruleById(id: Long): String = "$RULES/$id"
+
+        /** 路径模板（Ktor 路由 / 文档用）。 */
+        const val RULE_BY_ID = "$RULES/{id}"
+
+        /**
+         * 拦截记录。`GET` keyset 游标分页（`limit` / `cursor_ts` / `cursor_id`，**无 offset**）；
+         * `DELETE` 清空。单条删除走 [BLOCKED_BY_ID]。
+         */
+        const val BLOCKED = "$BASE/blocked"
+
+        fun blockedById(id: Long): String = "$BLOCKED/$id"
+
+        /** 路径模板。 */
+        const val BLOCKED_BY_ID = "$BLOCKED/{id}"
+    }
+
+    /**
+     * 邮件通知渠道（`SmsForwardRoutes`，2026-09-12 入 contract）。
+     *
+     * 路径**保持 `sms-forward` 不变**（2026-08-29 由「短信转发」改名后只剩 SMTP 一种通道，
+     * 但 app 与 API 手册都按旧路径引用，改名只会破坏跨端契约）。
+     *
+     * 两处行为约定：
+     * - 写配置是 **POST** 而非 PUT，且是字段级合并；凭据字段传空串等于不传（保留原值）；
+     * - [CONFIG] 在 `daily_limit` 越界或 `min_level` 认不出时回 **400**（不是 200）；
+     *   [TEST] 失败时反而是 HTTP 200 + `{success:false,error}` —— 两者要分开处理。
+     */
+    object SmsForward {
+        const val BASE = "$API/sms-forward"
+        const val CONFIG = "$BASE/config"
+        const val DIAGNOSE = "$BASE/diagnose"
+        const val TEST = "$BASE/test"
+
+        /** 三条渠道（邮件 / Webhook / 本机短信）共用的投递记录，`channel` 列区分。 */
+        const val HISTORY = "$BASE/history"
+    }
+
+    /**
+     * 另两条通知渠道（`WebhookRoutes` / `LocalSmsRoutes`，2026-09-12 入 contract）。
+     *
+     * 与邮件渠道并列、各自独立存配置。与 [SmsForward.TEST] 同样的坑：两个 test 端点
+     * **失败也是 HTTP 200** + `{ success: false, error }`。
+     *
+     * [SMS_TEST] 会**真的从设备 SIM 发出短信**（产生费用并占用当日配额），调用前必须确认。
+     */
+    object Notify {
+        const val BASE = "$API/notify"
+
+        const val WEBHOOK_CONFIG = "$BASE/webhook/config"
+        const val WEBHOOK_TEST = "$BASE/webhook/test"
+        const val SMS_CONFIG = "$BASE/sms/config"
+        const val SMS_TEST = "$BASE/sms/test"
+    }
+
+    /**
+     * AT 命令通道（`ATRoutes`，2026-09-12 入 contract）。
+     *
+     * [COMMAND] 执行单条 AT 指令；[STATUS] / [PLATFORM] 是只读探测。
+     * 执行历史由 `ConsoleRoutes` 在写侧记录（`channel=at`），客户端不通过本组写历史。
+     */
+    object At {
+        const val BASE = "$API/at"
+        const val COMMAND = "$BASE/command"
+        const val STATUS = "$BASE/status"
+        const val PLATFORM = "$BASE/platform"
+    }
+
     /** `{ adbd, ... }` —— 诊断快照。 */
     const val DIAGNOSE = "$API/diagnose"
+
+    /**
+     * 配置备份与恢复（`BackupRoutes`，2026-09-12 入 contract）。
+     *
+     * 四个端点全部在 `/api` 鉴权块内，没有免鉴权例外。两处行为约定：
+     * - [EXPORT] 在 `encrypted=false` 时**必须**带 `acknowledge_plaintext=true`，
+     *   否则 400 —— 明文包里含设备后台密码与隧道凭据，服务端不接受"悄悄导出";
+     * - [PREVIEW] / [IMPORT] 的请求体是备份包二进制，口令走 `X-Backup-Passphrase`
+     *   请求头（**不是** query：query 会进访问日志与浏览器历史）。
+     *
+     * 上传体积上限 8MB（`BackupRoutes.MAX_UPLOAD_BYTES`），HTTP 层的
+     * 请求体限制按同一常量放行。
+     */
+    object Backup {
+        const val BASE = "$API/backup"
+        const val INFO = "$BASE/info"
+        const val EXPORT = "$BASE/export"
+        const val PREVIEW = "$BASE/preview"
+        const val IMPORT = "$BASE/import"
+    }
+
+    /**
+     * 终端命令历史（`ConsoleRoutes`，2026-09-12 入 contract）。
+     *
+     * 这一组**只读写历史、不执行命令**：历史的真源是「core 实际执行过什么」，
+     * 由 `ShellRoutes` / `ATRoutes` 在执行后写入。唯一的例外是 [HISTORY_IMPORT]，
+     * 供两端把升级前的本地历史一次性搬进来（客户端负责幂等，服务端不做去重）。
+     *
+     * 分页是 keyset 游标：`limit` / `cursor_ts` / `cursor_id`，响应回
+     * `next_cursor_ts` / `next_cursor_id` / `has_more`（与 alerts / sms blocked 同形）。
+     */
+    object Console {
+        const val BASE = "$API/console"
+        const val HISTORY = "$BASE/history"
+
+        /** `POST`：一次性导入两端本地旧历史，单次最多接受 1000 条。 */
+        const val HISTORY_IMPORT = "$HISTORY/import"
+
+        /** `DELETE` 单条。id 不存在也算成功（目标状态「它不在列表里」已达成）。 */
+        fun historyById(id: Long): String = "$HISTORY/$id"
+
+        /** 路径模板（Ktor 路由 / 文档用）。 */
+        const val HISTORY_BY_ID = "$HISTORY/{id}"
+    }
 
     /** WebSocket 实时通道，订阅协议见 [WsChannel]。 */
     const val WS_REALTIME = "ws/realtime"

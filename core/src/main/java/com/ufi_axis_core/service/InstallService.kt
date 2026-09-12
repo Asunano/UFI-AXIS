@@ -7,6 +7,7 @@ import android.content.pm.PackageInstaller
 import android.os.Handler
 import android.os.Looper
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.util.LogPaths
 import java.io.File
 import java.io.FileInputStream
 import java.util.concurrent.CountDownLatch
@@ -35,11 +36,10 @@ class InstallService : IntentService("UfiInstallService") {
         /**
          * 分类存放的 install log 目录（与 watchdog/core/keepalive 一致，归到 Download/UFI-AXIS/log/）。
          * 不再写到 /Download/UFI-AXIS/ufi_install_pi.log（旧版遗留路径已重定向，避免散乱在根目录）。
+         *
+         * 路径取自 [LogPaths]（唯一真源），探测顺序与回退语义保持原样。
          */
-        private val INSTALL_LOG_DIRS = listOf(
-            "/storage/emulated/0/Download/UFI-AXIS/log/install",
-            "/sdcard/Download/UFI-AXIS/log/install"
-        )
+        private val INSTALL_LOG_DIRS = LogPaths.dirCandidates(LogPaths.Component.INSTALL)
         private val INSTALL_LOG_FILE = "install.log"
 
         private fun installLogPath(): String {

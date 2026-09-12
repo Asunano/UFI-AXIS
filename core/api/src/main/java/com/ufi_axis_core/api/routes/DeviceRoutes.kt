@@ -49,7 +49,7 @@ class DeviceRoutes(
         if (settings?.goformCommandEnabled == true) return false
         call.respondFail(
             HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
-            "裸 goform 命令通道已关闭，需要排障请先打开配置项 goform_command_enabled"
+            "设备原始命令通道已关闭，需先在配置项 goform_command_enabled 中开启"
         )
         return true
     }
@@ -94,7 +94,7 @@ class DeviceRoutes(
                 if (settings?.goformDumpEnabled != true) {
                     call.respondFail(
                         HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
-                        "设备原始字段 dump 已关闭，需要排障请先打开配置项 goform_dump_enabled"
+                        "设备原始字段读取已关闭，需先在配置项 goform_dump_enabled 中开启"
                     )
                     return@get
                 }
@@ -146,7 +146,7 @@ class DeviceRoutes(
                 if (data == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "设备无响应或登录失败，无法执行 goform 查询"
+                        "设备无响应或登录失败，查询未执行"
                     )
                     return@post
                 }
@@ -177,7 +177,7 @@ class DeviceRoutes(
                 if (response == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "设备无响应或登录失败，goform 命令未执行"
+                        "设备无响应或登录失败，命令未执行"
                     )
                     return@post
                 }
@@ -262,7 +262,7 @@ class DeviceRoutes(
                 )
             }
 
-            // 修改管理密码
+            // 修改设备后台密码
             post("/password") {
                 val p = call.receiveJsonObject()
                 val oldPwd = p["old_password"]?.jsonPrimitive?.contentOrNull ?: ""

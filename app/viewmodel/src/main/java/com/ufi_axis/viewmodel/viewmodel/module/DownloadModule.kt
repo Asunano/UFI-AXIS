@@ -5,7 +5,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.SystemClock
 import com.ufi_axis.data.api.RetrofitClient
-import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.state.*
 import kotlinx.coroutines.*
@@ -21,9 +20,6 @@ class DownloadModule(
     val state: StateFlow<DownloadState> = _state.asStateFlow()
 
     private fun api() = RetrofitClient.getApiService(AppPreferences(appContext))
-
-    // T04 N11/N12：下载完成/失败通知唯一出口（data 层、懒创建）
-    private val notificationCenter by lazy { NotificationCenter(appContext) }
 
     /**
      * 最近一次下载列表**成功落地**的时刻（单调时钟，`0` = 本进程内从未成功）。
@@ -138,11 +134,6 @@ class DownloadModule(
                         onlyDownloadWhenCharging = cfgObj["only_download_when_charging"]?.jsonPrimitive?.content?.toBoolean() ?: false
                     )
                 } else _state.value.config
-                // T04 N11/N12：下载状态差异检测（completed/error 各发一次）
-                tasks.forEach { task ->
-                    val sizeMb = if (task.totalSize > 0L) task.totalSize / (1024L * 1024L) else 0L
-                    notificationCenter.checkDownloadTaskStatus(task.id, task.fileName, task.status, sizeMb)
-                }
                 val trackerCount = json["tracker_count"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0
                 val trackerStatus = json["tracker_status"]?.jsonPrimitive?.content ?: "idle"
                 val trackerLastUpdated = json["tracker_last_updated"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L

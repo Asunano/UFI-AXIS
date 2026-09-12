@@ -1,14 +1,28 @@
 <template>
   <div class="network-view">
     <!--
-      四卡布局（2026-09-03）：左上「网络信息」/ 右上「WiFi 热点」/ 左下「局域网设备」/ 右下「更多设置」。
-      顺序即位置 —— 两列网格按 DOM 顺序自动填格，不需要写 grid-area。
+      四卡布局（2026-09-03 建立，2026-09-10 按栅格等高约束重排）：
+        行 1 = 网络信息 ｜ 更多设置      两列
+        行 2 = WiFi 热点                 通栏
+        行 3 = 局域网设备                 通栏
+      顺序即位置 —— 两列网格按 DOM 顺序自动填格，不需要写 grid-area；通栏卡用 .full-width。
       窄屏（<1024px）塌成单列，顺序不变。
+
+      为什么这么排（基于实测数据）：
+      `.network-grid` 同一行的轨道等高、矮卡贴顶，所以同行两卡的高度差就是矮卡下方那块空白。
+      改造前的顺序是「网络信息 ｜ WiFi 热点 / 局域网设备 ｜ 更多设置」，
+      实测右列在「WiFi 热点」下面留了 68.5px 空洞、第二行两卡差 175px（局域网设备高度随
+      在线设备数变化，0 台时只有 130px）。
+      重排后两张参与配对的卡是「网络信息(316px) ｜ 更多设置(305px)」，差 11.5px；
+      剩下两张各自通栏，不受行高约束：
+        · WiFi 热点 —— 8 项 KV，通栏后 .kv-grid 从 2 列变 4 列，反而从 4 行压到 2 行；
+        · 局域网设备 —— 本来就是「名称 / IP / MAC / 操作」四段式表格，582px 一列时最挤，
+          通栏是它该有的宽度。
       主卡逻辑已抽到 components/cards/（props 下行 + 事件上行）；
       设备写操作与回读统一由 useNetworkControls 提供（与仪表盘共用同一份实现）。
     -->
     <div class="network-grid">
-      <!-- 左上：网络信息（连接状态 + 开关 + 信号质量） -->
+      <!-- 行 1 左：网络信息（连接状态 + 开关 + 信号质量） -->
       <NetworkInfoCard
         :net-status="netStatus"
         :signal="signal"
@@ -29,8 +43,22 @@
         @ppp-disconnect="pppDisconnect"
       />
 
-      <!-- 右上：WiFi 热点 -->
+      <!-- 行 1 右：更多设置（六个入口瓦片） -->
+      <MoreSettingsCard
+        :mode-label="modeTileLabel"
+        :sleep-time="sleepTime"
+        @open-mode="showModeModal = true"
+        @open-band="bandModal.open()"
+        @open-speed="speedModal.open()"
+        @open-sleep="showSleepModal = true"
+        @open-module="moduleModal.open()"
+        @open-cell="cellModal.open()"
+      />
+
+      <!-- 行 2（通栏）：WiFi 热点。class 透传到 GridCard 根节点，配合 main.css 的
+           `.network-grid > .full-width` 生效。 -->
       <WifiHotspotCard
+        class="full-width"
         :loading="wifiLoading"
         :wifi-enabled="wifiEnabled"
         :settings="wifiSettings"
@@ -39,8 +67,9 @@
         @edit="showWifiEditModal = true"
       />
 
-      <!-- 左下：局域网设备 -->
+      <!-- 行 3（通栏）：局域网设备。高度随在线设备数变化，通栏后不参与等高配对。 -->
       <LanDevicesCard
+        class="full-width"
         :clients="wifiClients"
         :blocked-list="blockedList"
         :blocked-macs="blockedMacs"
@@ -48,18 +77,6 @@
         @open-acl="showAclModal = true"
         @block="blockDevice"
         @unblock="unblockDevice"
-      />
-
-      <!-- 右下：更多设置 -->
-      <MoreSettingsCard
-        :mode-label="modeLabel"
-        :sleep-time="sleepTime"
-        @open-mode="showModeModal = true"
-        @open-band="bandModal.open()"
-        @open-speed="speedModal.open()"
-        @open-sleep="showSleepModal = true"
-        @open-module="moduleModal.open()"
-        @open-cell="cellModal.open()"
       />
     </div>
 
@@ -69,6 +86,8 @@
       v-model:selected-mode="selectedMode"
       :mode-loading="modeLoading"
       :network-modes="networkModes"
+      :switching="switchingMode !== null"
+      :timed-out="modeSwitchTimedOut"
       @apply="applyModeAndClose"
     />
 
@@ -158,6 +177,8 @@ const {
   modeLoading,
   modeLabel,
   applyNetworkMode,
+  switchingMode,
+  modeSwitchTimedOut,
   roamingEnabled,
   roamingSaving,
   setRoaming,
@@ -223,10 +244,23 @@ const moduleComponent = moduleModal.component;
 const moduleShow = moduleModal.show;
 
 function applyModeAndClose() {
-  applyNetworkMode().finally(() => {
-    showModeModal.value = false;
-  });
+  // 下发一被受理就关弹窗：回读确认要等设备重新注册（最长十几秒），
+  // 不该让用户对着一个空转的弹窗等 —— 「切换中」由更多设置卡上的制式标签呈现。
+  showModeModal.value = false;
+  applyNetworkMode();
 }
+
+/**
+ * 更多设置卡上的制式标签。
+ *
+ * 切换期间显示目标档位 +「切换中」，超时显示「尚未完成」——
+ * 直接显示回读值会让界面停在切换前的档位（2026-09-11 真机缺陷）。
+ */
+const modeTileLabel = computed(() => {
+  if (switchingMode.value !== null) return `${modeLabel.value} · 切换中`;
+  if (modeSwitchTimedOut.value) return `${modeLabel.value} · 尚未完成`;
+  return modeLabel.value;
+});
 
 /**
  * 二维码取数要知道「请求回来时弹窗还开着吗」：关掉后再建 object URL 就没人 revoke 了。
@@ -299,8 +333,18 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 16px;
+  /* 同一行等高、矮卡贴顶：矮卡下方会留出页面底色，所以同一行的两张卡高度必须接近。
+     高度没法保证的卡（WiFi 热点 / 局域网设备）走通栏，见模板顶部注释。 */
   align-items: start;
 }
+
+/* 通栏卡。用 :deep() 而不是裸类名：这里的子元素是卡片组件，
+   类名落在子组件根节点上，写 [data-v-本组件] 的直系子选择器才不依赖
+   「父组件 scope id 会加到子组件根节点」这条规则。 */
+.network-grid > :deep(.full-width) {
+  grid-column: 1 / -1;
+}
+
 @media (max-width: 1024px) {
   .network-grid {
     grid-template-columns: 1fr;

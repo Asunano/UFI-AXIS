@@ -16,7 +16,17 @@
       <div class="sider-inner">
         <div class="sider-brand">
           <div class="w-8 h-8 rounded-lg bg-white border border-black/10 flex items-center justify-center">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1E293B" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <svg
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="#1E293B"
+              stroke-width="1.25"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
               <path d="M10 3.2a9 9 0 1 0 10.8 10.8a1 1 0 0 0 -1 -1h-3.8a4.1 4.1 0 1 1 -5 -5v-4a0.9 0.9 0 0 0 -1 -0.8" />
               <path d="M15 3.5a9 9 0 0 1 5.5 5.5h-4.5a9 9 0 0 0 -1 -1v-4.5" />
             </svg>
@@ -43,31 +53,29 @@
     <!-- 主内容区 -->
     <n-layout class="main-layout">
       <!-- 顶栏 -->
-      <n-layout-header bordered class="h-14 flex items-center justify-between px-layout">
-        <div class="flex items-center gap-3">
-          <n-button v-if="isMobile" quaternary circle @click="drawerVisible = true">
-            <template #icon
-              ><n-icon :size="20"><MenuOutline /></n-icon
-            ></template>
+      <n-layout-header bordered class="app-header">
+        <div class="header-left">
+          <n-button v-if="isMobile" quaternary circle class="header-menu-btn" @click="drawerVisible = true">
+            <template #icon><n-icon :size="20"><MenuOutline /></n-icon></template>
           </n-button>
-          <span class="text-base font-medium">{{ currentTitle }}</span>
-          <div class="flex items-center gap-3">
+          <span class="header-title">{{ currentTitle }}</span>
+          <!-- 设备条占宽大，手机隐藏，避免标题被挤成多行 -->
+          <div v-if="!isMobile" class="header-device">
             <n-divider vertical class="nav-divider" />
             <DeviceTopBar />
           </div>
         </div>
-        <div class="flex items-center gap-2">
-          <!-- WS 状态指示 -->
+        <div class="header-right">
+          <!-- WS 状态：颜色不随明暗切换，保证始终可读 -->
           <n-tooltip>
             <template #trigger>
-              <div class="flex items-center gap-1.5 px-2 py-1 rounded-md" :class="wsStatusClass">
-                <div class="w-1.5 h-1.5 rounded-full" :class="wsDotClass"></div>
-                <span class="text-xs">{{ wsStatusText }}</span>
+              <div class="ws-pill" :class="wsStatusClass" :title="wsStatusText">
+                <span class="ws-dot" :class="wsDotClass" />
+                <span class="ws-text">{{ wsStatusText }}</span>
               </div>
             </template>
             WebSocket {{ wsStore.fatalReason || wsStore.status }}
           </n-tooltip>
-          <!-- 暗色模式 -->
           <n-button quaternary circle @click="appStore.toggleDarkMode()">
             <template #icon>
               <n-icon :size="18">
@@ -76,11 +84,8 @@
               </n-icon>
             </template>
           </n-button>
-          <!-- 退出 -->
           <n-button quaternary circle @click="handleLogout">
-            <template #icon
-              ><n-icon :size="18"><LogOutOutline /></n-icon
-            ></template>
+            <template #icon><n-icon :size="18"><LogOutOutline /></n-icon></template>
           </n-button>
         </div>
       </n-layout-header>
@@ -103,8 +108,20 @@
         <div class="sider-inner">
           <div class="sider-brand">
             <div class="w-8 h-8 rounded-lg bg-white border border-black/10 flex items-center justify-center">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#1E293B" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M10 3.2a9 9 0 1 0 10.8 10.8a1 1 0 0 0 -1 -1h-3.8a4.1 4.1 0 1 1 -5 -5v-4a0.9 0.9 0 0 0 -1 -0.8" />
+              <svg
+                width="20"
+                height="20"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="#1E293B"
+                stroke-width="1.25"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <path
+                  d="M10 3.2a9 9 0 1 0 10.8 10.8a1 1 0 0 0 -1 -1h-3.8a4.1 4.1 0 1 1 -5 -5v-4a0.9 0.9 0 0 0 -1 -0.8"
+                />
                 <path d="M15 3.5a9 9 0 0 1 5.5 5.5h-4.5a9 9 0 0 0 -1 -1v-4.5" />
               </svg>
             </div>
@@ -269,16 +286,16 @@ function handleMenuSelect(key: string) {
   drawerVisible.value = false;
 }
 
-// WS 状态
+// WS 状态 —— 只切换 class 名；颜色写在 CSS 固定值里，不随 dark 模式翻转
 const wsStatusClass = computed(() => {
-  if (wsStore.status === 'connected') return 'bg-green-50 dark:bg-green-900/20';
-  if (wsStore.status === 'connecting') return 'bg-yellow-50 dark:bg-yellow-900/20';
-  return 'bg-gray-50 dark:bg-gray-800';
+  if (wsStore.status === 'connected') return 'is-connected';
+  if (wsStore.status === 'connecting') return 'is-connecting';
+  return 'is-offline';
 });
 const wsDotClass = computed(() => {
-  if (wsStore.status === 'connected') return 'bg-green-500';
-  if (wsStore.status === 'connecting') return 'bg-yellow-500';
-  return 'bg-gray-400';
+  if (wsStore.status === 'connected') return 'dot-ok';
+  if (wsStore.status === 'connecting') return 'dot-warn';
+  return 'dot-muted';
 });
 const wsStatusText = computed(() => {
   if (wsStore.status === 'connected') return '已连接';
@@ -392,6 +409,118 @@ onUnmounted(() => {
   padding: 24px;
 }
 
+/* ── 顶栏 ── */
+.app-header {
+  height: 56px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 16px;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.header-menu-btn {
+  flex-shrink: 0;
+}
+.header-title {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.header-device {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  flex: 0 0 auto;
+}
+
+/* WS 胶囊：明暗两套都用「淡底 + 深字」，避免暗色下白字糊在半透明底上 */
+.ws-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1;
+  flex-shrink: 0;
+  user-select: none;
+}
+.ws-pill.is-connected {
+  background: #dcfce7;
+  color: #166534;
+}
+.ws-pill.is-connecting {
+  background: #fef3c7;
+  color: #92400e;
+}
+.ws-pill.is-offline {
+  background: #f4f4f5;
+  color: #52525b;
+}
+.ws-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.ws-dot.dot-ok {
+  background: #22c55e;
+}
+.ws-dot.dot-warn {
+  background: #eab308;
+}
+.ws-dot.dot-muted {
+  background: #a1a1aa;
+}
+.ws-text {
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  .app-header {
+    padding: 0 12px;
+    gap: 8px;
+  }
+  .header-left {
+    gap: 8px;
+  }
+  .header-title {
+    font-size: 15px;
+  }
+  .header-right {
+    gap: 4px;
+  }
+  /* 手机上状态字可以省略，只留点 + tooltip */
+  .ws-text {
+    display: none;
+  }
+  .ws-pill {
+    padding: 6px;
+  }
+}
+
 /* ── 侧栏 / 抽屉：品牌区固定，菜单区独立滚动 ── */
 .sider-inner {
   display: flex;
@@ -420,6 +549,9 @@ onUnmounted(() => {
 .sider-menu-scroll::-webkit-scrollbar-track {
   background: transparent;
 }
+/* 滚动条滑块：刻意用中性灰半透明而不是 --border-subtle。
+   它要同时压在浅色与深色侧栏上，中性灰叠加在两种底色上都能看见；
+   接 --border-subtle 反而会在暗色下和背景糊在一起（那个变量本身就是随明暗切换的低对比描边色）。 */
 .sider-menu-scroll::-webkit-scrollbar-thumb {
   background: rgba(128, 128, 128, 0.3);
   border-radius: 2px;

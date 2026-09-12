@@ -23,6 +23,7 @@ import com.ufi_axis.ui.animation.page.UfiPageSwitcherDefaults
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.ufiStandardCard
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 骨架屏是否降级为静态（不跑扫光）。

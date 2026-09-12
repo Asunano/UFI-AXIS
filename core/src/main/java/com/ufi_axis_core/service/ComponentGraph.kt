@@ -11,6 +11,7 @@ import com.ufi_axis_core.controller.adb.AdbController
 import com.ufi_axis_core.controller.goform.*
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.sms.SmsForwardController
+import com.ufi_axis_core.controller.sms.SmsRuleStore
 import com.ufi_axis_core.controller.system.DownloadManager
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.controller.system.TunnelManager
@@ -77,6 +78,10 @@ data class ControllerGraph(
     val systemController: SystemController,
     val adbController: AdbController,
     val smsForwardController: SmsForwardController,
+    // 暴露它只为了让停止流程能收掉它自己的 CoroutineScope + 落盘最后一批命中次数
+    //（理由同上面的 pushService）。它本身是在 build() 里先于控制器子图创建的，
+    // 六个判定接入点各自持有引用，这里只是给停机流程一个入口。
+    val smsRuleStore: SmsRuleStore,
     val downloadManager: DownloadManager,
     val taskScheduler: TaskScheduler,
     val conditionEngine: ConditionEngine,
@@ -87,6 +92,18 @@ data class ControllerGraph(
 data class ServerGraph(
     val server: HttpServer,
     val wsManager: WebSocketManager,
+    // 暴露它只为了让停止流程能收掉它自己的 CoroutineScope：
+    // 内部持有 `Dispatchers.Default + SupervisorJob()`，不 cancel 的话服务停掉之后
+    // 排队中的推送还会继续往已关闭的 WebSocketManager 里灌。
+    val pushService: com.ufi_axis_core.api.websocket.WebSocketPushService,
+    // 通知分发器（2026-09-08 阶段 1）。暴露它的理由与 pushService / smsRuleStore 相同：
+    // 停机流程需要一个入口把注册表清空 —— 否则组件都停了，触发源还会继续往里 emit，
+    // 投递最终打在已经关闭的 WebSocketManager / 已 cancel 的 historyScope 上。
+    val notificationDispatcher: com.ufi_axis_core.notify.NotificationDispatcher,
+    // Webhook 渠道（2026-09-09 阶段 2）。暴露它只为了停机时关掉那个 HttpClient 的连接池 ——
+    // 分发器只清注册表，渠道自己的资源由 owner 收（与 pushService 同分工）。
+    val webhookChannel: com.ufi_axis_core.controller.notify.WebhookChannel,
+
     val authMiddleware: AuthMiddleware,
     val alertEngine: AlertEngine,
     val dataScheduler: DataScheduler,

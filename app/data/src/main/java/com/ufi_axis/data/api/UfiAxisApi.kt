@@ -121,6 +121,28 @@ interface UfiAxisApi {
     @POST("api/shell/exec")
     suspend fun shellExec(@Body body: ShellExecRequest): ShellExecResponse
 
+    // ========== 终端命令历史（core 存，app / web 共享） ==========
+    /** @param channel `shell` / `at`，不传则两个通道混排 */
+    @GET("api/console/history")
+    suspend fun getConsoleHistory(
+        @Query("channel") channel: String? = null,
+        @Query("limit") limit: Int = 50,
+        @Query("cursor_ts") cursorTs: Long? = null,
+        @Query("cursor_id") cursorId: Long? = null
+    ): ConsoleHistoryResponse
+
+    @DELETE("api/console/history")
+    suspend fun clearConsoleHistory(@Query("channel") channel: String? = null): SuccessResponse
+
+    @DELETE("api/console/history/{id}")
+    suspend fun deleteConsoleHistoryItem(@Path("id") id: Long): SuccessResponse
+
+    /** 旧版本地历史的一次性导入（升级后只调一次，见 ToolsModule 的迁移逻辑）。 */
+    @POST("api/console/history/import")
+    suspend fun importConsoleHistory(
+        @Body body: ConsoleHistoryImportRequest
+    ): ConsoleHistoryImportResponse
+
     // ========== AT ==========
     @POST("api/at/command")
     suspend fun sendAtCommand(@Body body: AtCommandRequest): AtCommandResponse
@@ -342,12 +364,87 @@ interface UfiAxisApi {
     @GET("api/sms/verification-codes")
     suspend fun getVerificationCodes(): VerificationCodeListResponse
 
+    // ========== 短信拦截（号码黑名单 + 关键词） ==========
+    //
+    // 判定全在 core：命中就不发邮件、不推 WS、不入验证码库、不进列表与计数。
+    // app 这七个端点只做「规则的增删改查」与「拦截记录的读/清」，**不做任何判定**。
+    //
+    // 刻意没有 `rules/test`（试算）：去掉正则之后 contains/equals/prefix/suffix 行为可预测，
+    // 「我的规则有没有生效」由 hit_count + 拦截记录回答。
+
+    @GET("api/sms/rules")
+    suspend fun getSmsRules(): SmsRuleListResponse
+
+    @POST("api/sms/rules")
+    suspend fun createSmsRule(@Body body: SmsRuleRequest): SmsFilterMutationResponse
+
+    /**
+     * 修改规则（含 enabled 切换）。core 侧是**字段级合并** —— 请求体里没给值的字段保留原值，
+     * 所以「只切开关」传 `SmsRuleRequest(enabled = …)` 就够，不会把 pattern/scope 一起重置。
+     */
+    @PUT("api/sms/rules/{id}")
+    suspend fun updateSmsRule(@Path("id") id: Long, @Body body: SmsRuleRequest): SmsFilterMutationResponse
+
+    @DELETE("api/sms/rules/{id}")
+    suspend fun deleteSmsRule(@Path("id") id: Long): SmsFilterMutationResponse
+
+    /**
+     * 拦截记录列表：**keyset 游标**分页，没有 offset。
+     *
+     * 翻页把上一页响应里的 `next_cursor_ts` / `next_cursor_id` 原样传回来；首页两个都传 null。
+     * 用两个游标而不是单个时间戳：同一毫秒可能落多条记录，只按 ts 翻页会漏或重。
+     */
+    @GET("api/sms/blocked")
+    suspend fun getSmsBlocked(
+        @Query("limit") limit: Int = 50,
+        @Query("cursor_ts") cursorTs: Long? = null,
+        @Query("cursor_id") cursorId: Long? = null
+    ): SmsBlockedListResponse
+
+    @DELETE("api/sms/blocked")
+    suspend fun clearSmsBlocked(): SmsFilterMutationResponse
+
+    @DELETE("api/sms/blocked/{id}")
+    suspend fun deleteSmsBlocked(@Path("id") id: Long): SmsFilterMutationResponse
+
     @POST("api/sim/switch")
     suspend fun switchSimSlot(@Body body: Map<String, Int>): SimSwitchResponse
 
     // ========== Config ==========
     @GET("api/config/version")
     suspend fun getServerVersion(): ServerVersionInfo
+
+    // ========== 配置备份与恢复（2026-09-11） ==========
+    // 三条与二进制打交道的端点都不是 JSON：导出**回** ZIP，预览/恢复**收** ZIP。
+    // 口令走 X-Backup-Passphrase 请求头而不是 query —— query 会进访问日志。
+
+    @GET("api/backup/info")
+    suspend fun getBackupInfo(): BackupInfoResponse
+
+    /** 导出：请求体是 JSON，响应体是 `.ufibak`（外层 ZIP）二进制。 */
+    @Streaming
+    @POST("api/backup/export")
+    suspend fun exportBackup(@Body body: BackupExportRequest): ResponseBody
+
+    /**
+     * 预览：只读清单，不落任何配置。
+     *
+     * [body] 必须自带 `application/octet-stream` —— [com.ufi_axis.data.api.RetrofitClient]
+     * 会给没有 Content-Type 的请求体补 `application/json`。
+     */
+    @POST("api/backup/preview")
+    suspend fun previewBackup(
+        @Body body: okhttp3.RequestBody,
+        @Header("X-Backup-Passphrase") passphrase: String? = null
+    ): BackupPreviewResponse
+
+    /** 恢复。[mode] 传 `replace` 才清掉本机多出来的项，默认 `merge` 只覆盖包里有的。 */
+    @POST("api/backup/import")
+    suspend fun importBackup(
+        @Body body: okhttp3.RequestBody,
+        @Query("mode") mode: String = BACKUP_MODE_MERGE,
+        @Header("X-Backup-Passphrase") passphrase: String? = null
+    ): BackupImportResponse
 
     // ========== Update（2026-08-10：后端自拉取 + 前端兜底推送） ==========
     @POST("api/update/check")
@@ -490,9 +587,24 @@ interface UfiAxisApi {
     suspend fun unfreezeApp(@Body body: AppActionRequest): AppActionResponse
 
     // ========== 邮件通知（路径仍是 /api/sms-forward） ==========
+    /**
+     * 读邮件通知全量配置。
+     *
+     * 2026-09-10 起响应里也带「规则同构」那一组：`min_level` / `daily_limit` 两个旋钮，
+     * `sent_today` / `quota_remaining` 两个只读位（`daily_limit = 0` 时后者是 **null** =
+     * 不限），以及 `levels` / `daily_limit_min|max` 三个值域。全部是 core 的判据，UI 直接渲染。
+     */
     @GET("api/sms-forward/config")
     suspend fun getSmsForwardConfig(): SmsForwardConfig
 
+    /**
+     * 写邮件通知配置。
+     *
+     * **2026-09-10 起可能返回 400**（Retrofit 抛 `HttpException`）：`daily_limit` 越界
+     * 或 `min_level` 认不出时。此前这个端点没有任何校验、永远 `success:true`，
+     * 所以调用方必须有失败分支 —— 错误体是 `{"error": 中文原因}`，把那句话原样显示出来
+     * 比"保存失败"有用（口径同 Webhook / 本机短信的 PUT）。
+     */
     @POST("api/sms-forward/config")
     suspend fun saveSmsForwardConfig(@Body body: SmsForwardConfig): SmsForwardSaveResponse
 
@@ -504,13 +616,82 @@ interface UfiAxisApi {
     suspend fun diagnoseSmsForward(): SmsForwardDiagnose
 
     /**
-     * 把一条 **app 通知**交给 core 发邮件（SMTP 能力只在 core 侧）。
+     * 通知投递历史：**keyset 游标**分页，参数与 [getSmsBlocked] 同形。
      *
-     * 是否真的发出由 core 按 `scenes` 白名单决定 —— 场景开关的唯一真源在 core，
-     * app 无脑上报即可，不在本地再存一份开关。
+     * 三条渠道共用这一份记录表（响应 DTO 见 [MailHistoryListResponse]），路径仍是
+     * `sms-forward` —— 端点名是跨端契约，改它只会破坏 web 与 API 手册。
+     *
+     * @param channel `"mail"` / `"webhook"` / `"local_sms"`；传 null 不过滤（= 全部渠道）。
+     * @param result **三态**筛选：`"success"`（已发出）/ `"failed"`（发起了但失败）/
+     *   `"skipped"`（被闸门拦下、没发起）；传 null 不过滤。
+     *   过滤放在服务端而不是客户端筛内存：只看失败时用户想翻的是**全表**的失败记录，
+     *   本地筛当前页会出现「明明 total 里有 12 条失败，列表只显示 2 条」。
      */
-    @POST("api/sms-forward/notify")
-    suspend fun forwardNotificationMail(@Body body: Map<String, String>): SmsForwardNotifyResponse
+    @GET("api/sms-forward/history")
+    suspend fun getMailHistory(
+        @Query("limit") limit: Int = 50,
+        @Query("cursor_ts") cursorTs: Long? = null,
+        @Query("cursor_id") cursorId: Long? = null,
+        @Query("channel") channel: String? = null,
+        @Query("result") result: String? = null
+    ): MailHistoryListResponse
+
+    /**
+     * 清空投递记录。
+     *
+     * @param channel 只清这一条渠道（`mail` / `webhook` / `local_sms`）；
+     *   传 null = **全清**（三条渠道共用一张表）。所以调用方的确认文案必须跟这个参数对齐 ——
+     *   说成"一并清空"而实际只清了一条，或者反过来，都会让用户以为记录莫名丢了。
+     */
+    @DELETE("api/sms-forward/history")
+    suspend fun clearMailHistory(
+        @Query("channel") channel: String? = null
+    ): SmsForwardSaveResponse
+
+    // ========== 通用 Webhook 通知渠道 ==========
+    /**
+     * 读全量配置。响应里连**预设表与占位符清单**一起回（`presets` / `placeholders`）——
+     * 那是 core 的数据，UI 直接渲染，不在 app 里抄第二份（抄了就会分叉）。
+     */
+    @GET("api/notify/webhook/config")
+    suspend fun getWebhookConfig(): WebhookConfigResponse
+
+    /**
+     * 字段级合并；body 只带改动的键（null 等于"不改"，见 [WebhookConfigPatch]）。
+     * 响应带立即回读的 `config`，"存进去没有"当场就能验掉。
+     */
+    @PUT("api/notify/webhook/config")
+    suspend fun updateWebhookConfig(@Body body: WebhookConfigPatch): WebhookConfigSaveResponse
+
+    /**
+     * 发一条测试通知（manual 口径：不受总开关 / 免打扰 / 场景勾选约束，但仍要求配置齐全）。
+     * 响应带 HTTP 状态码与响应体摘要 —— 那是用户排 Webhook 时唯一的线索。
+     */
+    @POST("api/notify/webhook/test")
+    suspend fun testWebhook(): WebhookTestResponse
+
+    // ========== 本机短信回发渠道 ==========
+    /**
+     * 读全量配置。响应里带 `configured` / `sent_today` / `quota_remaining` 三个只读位
+     * 与 `levels` / `daily_limit_min|max` 三个值域 —— 都是 core 的判据，UI 直接渲染。
+     */
+    @GET("api/notify/sms/config")
+    suspend fun getLocalSmsConfig(): LocalSmsConfigResponse
+
+    /**
+     * 字段级合并；body 只带改动的键（null 等于"不改"，见 [LocalSmsConfigPatch]）。
+     * 响应带立即回读的 `config`，"存进去没有"当场就能验掉。
+     */
+    @PUT("api/notify/sms/config")
+    suspend fun updateLocalSmsConfig(@Body body: LocalSmsConfigPatch): LocalSmsConfigSaveResponse
+
+    /**
+     * 发一条测试短信。**这会真的从设备 SIM 发出一条短信、产生费用、并消耗一条今日配额** ——
+     * 所以 UI 必须在调用之前让用户确认（不是"点了再说"的按钮）。
+     * 响应带固件结论、是否计入配额与剩余配额。
+     */
+    @POST("api/notify/sms/test")
+    suspend fun testLocalSms(): LocalSmsTestResponse
 
     // ========== Scheduled Tasks ==========
     @GET("api/tasks")
@@ -824,7 +1005,7 @@ interface UfiAxisApi {
     @PUT("api/pairing/config")
     suspend fun updatePairingConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
 
-    // ========== Pairing Devices（2026-08-11：设备密码认证 + 配对设备管理） ==========
+    // ========== Pairing Devices（2026-08-11：配对密码认证 + 配对设备管理） ==========
     /** 已配对设备列表（Bearer；GET /api/pairing/devices）。 */
     @GET("api/pairing/devices")
     suspend fun getPairedDevices(): JsonElement
@@ -836,14 +1017,14 @@ interface UfiAxisApi {
         @Body body: Map<String, String>
     ): JsonElement
 
-    /** 移除已配对设备（Bearer + 设备密码；body {password}；最后一台移除触发 token 轮换）。 */
+    /** 移除已配对设备（Bearer + 配对密码；body {password}；最后一台移除触发 token 轮换）。 */
     @HTTP(method = "DELETE", path = "api/pairing/devices/{fingerprint}", hasBody = true)
     suspend fun removePairedDevice(
         @Path("fingerprint") fingerprint: String,
         @Body body: Map<String, String>
     ): JsonElement
 
-    /** 修改设备密码（root 路径免鉴权，旧密码即门禁；body {old_password, new_password}）。 */
+    /** 修改配对密码（root 路径免鉴权，旧密码即门禁；body {old_password, new_password}）。 */
     @POST("pairing/change-password")
     suspend fun changeDevicePassword(@Body body: Map<String, String>): JsonElement
 
@@ -1052,6 +1233,24 @@ data class FileInfoResponse(
 @Serializable
 data class FileReadResponse(
     val content: String,
+    /** 服务端实际使用的解码字符集。请求里指定的编码若不被支持，这里回显的是实际用的那个。 */
     val encoding: String = "utf-8",
-    val size: Int
+    /** 文件真实字节数。Long 而非 Int：过大分支会回真实长度，可能超过 Int 上限 */
+    val size: Long,
+    /** content 不是完整文件内容（过大 / 二进制 / 非文件） */
+    val truncated: Boolean = false,
+    /**
+     * 内容不可用的具体原因：`too_large` / `binary` / `not_file`；内容完整时为 null。
+     *
+     * 2026-09-11 新增。此前三种情况都只置 `truncated = true` 并把说明文字塞进 [content]，
+     * 客户端无法区分，只能给一句「服务端已截断」的误导文案。老版本 core 不回这个字段，
+     * 客户端按 `truncated` 回落（见 `FileManagerModule.readTextFile`）。
+     */
+    val reason: String? = null,
+    /**
+     * 以 UTF-8 解码时出现了替换字符（U+FFFD），内容可能是 GBK 等其它编码。
+     *
+     * 只上报、不自动切换：猜错编码比不猜更糟（GBK 误判会把中文变成乱码却"看起来能读"）。
+     */
+    val encoding_suspect: Boolean = false
 )

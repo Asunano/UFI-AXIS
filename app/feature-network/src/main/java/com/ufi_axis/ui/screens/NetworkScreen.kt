@@ -14,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
@@ -237,8 +238,9 @@ private fun CellularStatusCard(
         val band = currentBand?.takeIf { it.isNotBlank() && it != "—" }
         if (band != null) append(" $band")
     }.takeIf { it.isNotBlank() }
-    // 副标题：设备 LAN IP（取自 lanSettings，无数据时 —）
-    val ipText = state.lanSettings?.lanIp?.takeIf { it.isNotBlank() } ?: "—"
+    // 副标题：本机号码(msisdn) + IMEI（取自设备身份信息，无数据时 —）
+    val msisdn = state.deviceIdentity?.get("msisdn")?.takeIf { it.isNotBlank() } ?: "—"
+    val imei = state.deviceIdentity?.get("imei")?.takeIf { it.isNotBlank() } ?: "—"
     val rsrpVal = sig?.rsrp
     val bars = rsrpVal?.let { signalBars(it) } ?: 0
 
@@ -314,14 +316,6 @@ private fun CellularStatusCard(
                             }
                         }
                     }
-                    Spacer(Modifier.height(3.dp))
-                    Text(
-                        text = "IP $ipText",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.gradientMuted.copy(alpha = 0.72f),  // 原 Color.White 72%：IP 副标题
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
                 }
                 Spacer(Modifier.width(10.dp))
                 // 右上角信号条（不显示 dBm 文字，dBm 数值在下方三张 HeroMetric）
@@ -334,7 +328,13 @@ private fun CellularStatusCard(
                 }
             }
 
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(10.dp))
+            // 本机号码 / IMEI：左右两张小指标卡（与下方 HeroMetric 同款值+标签）
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                IdentityMetric(msisdn, "本机号码", Modifier.weight(1f))
+                IdentityMetric(imei, "IMEI", Modifier.weight(1f))
+            }
+            Spacer(Modifier.height(12.dp))
 
             // ═══ 行2：RSRP / SNR / RSRQ 三 metric（半透明白卡，一行） ═══
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -343,6 +343,38 @@ private fun CellularStatusCard(
                 HeroMetric(sig?.rsrq?.toString() ?: "—", "RSRQ dB", Modifier.weight(1f))
             }
 
+        }
+    }
+}
+
+// hero 卡上的「本机号码 / IMEI」小指标卡（与 HeroMetric 同款值+标签，值较长带 ellipsis）
+@Composable
+private fun IdentityMetric(value: String, label: String, modifier: Modifier = Modifier) {
+    val palette = LocalResolvedPalette.current
+    Surface(
+        modifier = modifier,
+        color = palette.gradientMuted.copy(alpha = 0.12f),  // 原 Color.White 12%：小卡底
+        shape = UfiCardDefaults.subtleShape
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 10.dp, horizontal = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Text(
+                value,
+                style = UfiTextStyles.bodyEmphasis,
+                color = palette.onGradient,  // 原 Color.White：值
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(Modifier.height(2.dp))
+            Text(
+                label,
+                style = MaterialTheme.typography.labelSmall,
+                color = palette.gradientMuted.copy(alpha = 0.7f)  // 原 Color.White 70%：标签
+            )
         }
     }
 }
@@ -494,6 +526,7 @@ private fun loadNetworkAll(viewModel: MainViewModel) {
     viewModel.network.loadCellInfo()
     viewModel.network.loadDeviceSettings()
     viewModel.network.loadLanSettings()
+    viewModel.network.loadDeviceIdentity()
 }
 
 

@@ -29,6 +29,16 @@ class DeviceRequestVerifier(
         object MissingToken : Result()
         /** token 不属于任何已配对设备（含已被移除=已吊销）。 */
         object UnknownToken : Result()
+        /**
+         * 配对存储读不出来（[PairedDeviceStore.degraded]），**无法判断**这个 token 认不认识。
+         *
+         * 2026-09-08 事故的教训：这种情况以前和 [UnknownToken] 走同一条分支，
+         * 于是一次文件损坏就等于"对所有客户端宣布你没配对"，客户端照约定清空本地凭据 ——
+         * 数据损坏被放大成全员重新配对 + 重新输密码。现在它是独立结果，
+         * 由调用方回可重试的 503，客户端保留凭据退避重试。
+         */
+        object StoreUnavailable : Result()
+
         /** 记录里没有公钥：只可能是配对文件被手工篡改，fail-secure 拒绝并要求重新配对。 */
         object DeviceKeyMissing : Result()
         /** 缺 ts / nonce / sig 任一。 */
@@ -49,7 +59,13 @@ class DeviceRequestVerifier(
     ): Result {
         if (token.isNullOrBlank()) return Result.MissingToken
         val device = store.findByTokenHash(DeviceAuth.sha256Hex(token.toByteArray(Charsets.UTF_8)))
-            ?: return Result.UnknownToken
+        if (device == null) {
+            // 降级态下"查不到"不等于"没配对"：存储读不出来时我们根本没有判据。
+            // 顺序也重要 —— 先判有没有匹配，再看是不是降级，
+            // 这样降级期间恰好命中 .bak 恢复出的记录的设备照常放行，不会被一刀切成 503。
+            return if (store.degraded) Result.StoreUnavailable else Result.UnknownToken
+        }
+
         if (device.pubKey.isBlank()) return Result.DeviceKeyMissing
         if (timestamp.isNullOrBlank() || nonce.isNullOrBlank() || signature.isNullOrBlank()) {
             return Result.MissingSignature

@@ -21,10 +21,8 @@ import android.app.PendingIntent
  * **限频取值原则**（2026-08-25 修复：此前 `isRateLimited` 只读不写，限频实际从未生效）：
  * 已有更精确去重手段的场景一律设 0，避免"第二条不同内容的通知被静默丢弃"：
  * - ALERT：core 侧边沿触发（同级别不重复推）+ 游标 + 10min 签名 TTL；
- * - SMS / VERIFICATION_CODE：未读总数基线 / 消息 id 游标；
- * - DOWNLOAD：按 taskId 记录上次 status；
- * - CONNECTIVITY：`connectivity_offline_notified` 状态位（离线/上线成对，见
- *   `NotificationCenter.notifyDeviceConnectivity`）。
+ * - SMS / VERIFICATION_CODE / DOWNLOAD / TUNNEL / CONNECTIVITY：**判定与「只提醒一次」
+ *   的记账全部在 core**，推送到达即代表该提醒，app 只渲染，不需要也不该再限频。
  * 目前**没有场景**依赖限频窗口 —— 新增场景前先想清楚有没有更精确的去重键。
  *
  * 使用示例：
@@ -46,17 +44,7 @@ enum class NotifyScene(
     val defaultEnabled: Boolean,
     val importance: Int,
     val dndBreakthrough: Boolean = false,
-    val rateLimitMinutes: Int = 5,
-    /**
-     * 本场景的系统通知是否由 **app 侧**转投邮件（[NotificationCenter.notify] 成功后回传 core）。
-     *
-     * [SMS] / [VERIFICATION_CODE] = false：core 收到短信时（ContentObserver 或兜底轮询）
-     * 已经走 `SmsForwardController.forwardSms` 发过同一条内容的邮件，而且那封带全文与
-     * 验证码高亮。app 再回传一次就是同一条短信两封邮件，且两条路径互不知情、无法互相去重
-     * （2026-08-30 用户实测：进短信页时收到 4 小时前那条码的第二封邮件）。
-     * 因此短信族邮件的唯一生产者定为 core 的短信路径，app 只负责系统通知。
-     */
-    val mailForward: Boolean = true
+    val rateLimitMinutes: Int = 5
 ) {
     /**
      * 温度/电量/流量/信号阈值告警（最高优先级，可突破免打扰）。
@@ -73,10 +61,7 @@ enum class NotifyScene(
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_MAX,
         dndBreakthrough = true,
-        rateLimitMinutes = 0,
-        // 2026-08-31：告警邮件的唯一生产者改为 core 的 AlertEngine（告警落库处直接发信），
-        // 这样 app 没连上也能收到告警邮件。app 再回传就会一条告警两封邮件。
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /**
@@ -89,20 +74,18 @@ enum class NotifyScene(
      * 一律不默认开启、需手动打开。本字段同时是 `sceneEnabledKey` 的读取默认值，必须与
      * core `NotificationConfig.connectivity_enabled`、`NotificationConfigDto`、
      * `NotificationConfigSync.readLocal` 及 DailyNotifyScreen 的 `defaultEnabled` 逐字一致。
-     * 仍受总闸 `alert_notification_enabled` 约束（闸门在 `notifyDeviceConnectivity` 开头）。
+     * 仍受总闸 `alert_notification_enabled` 约束。
      *
      * `rateLimitMinutes = 0`：限频按场景记时间戳，离线/上线共享同一窗口 ——
-     * 离线报完 5 分钟内恢复的话上线通知会被吞掉。去重改由
-     * `notifyDeviceConnectivity` 的 `connectivity_offline_notified` 状态位成对保证。
+     * 离线报完 5 分钟内恢复的话上线通知会被吞掉。判定与「只报一次」的记账都在 core，
+     * app 收到推送即渲染。
      */
     CONNECTIVITY(
         sceneId = "connectivity",
         channelId = NotificationCenter.CHANNEL_CONNECTIVITY,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_HIGH,
-        rateLimitMinutes = 0,
-        // 同 ALERT：离线/上线邮件由 core 的 AlertEngine connectivity 告警直接发（见其 mailForwarder）
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /** 新短信到达（静默，不响铃） */
@@ -111,8 +94,7 @@ enum class NotifyScene(
         channelId = NotificationCenter.CHANNEL_SMS,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_DEFAULT,
-        rateLimitMinutes = 0,
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /** 验证码提取（依附短信 channel） */
@@ -121,8 +103,7 @@ enum class NotifyScene(
         channelId = NotificationCenter.CHANNEL_SMS,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_DEFAULT,
-        rateLimitMinutes = 0,
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /** 下载完成/失败 */
@@ -131,10 +112,7 @@ enum class NotifyScene(
         channelId = NotificationCenter.CHANNEL_DOWNLOADS,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_DEFAULT,
-        rateLimitMinutes = 0,
-        // 2026-08-31：下载邮件改由 core 的 DownloadManager 在状态跃迁处直接发
-        // （app 这条要靠前台轮询才发现，且会与 core 那条重复）
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /** 流量 80% 限额预警（复用告警 channel，DEFAULT 不响铃） */
@@ -143,10 +121,7 @@ enum class NotifyScene(
         channelId = NotificationCenter.CHANNEL_ALERTS,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_DEFAULT,
-        rateLimitMinutes = 0,
-        // 2026-08-31：判定与邮件都下沉到 core 的 AlertEngine.checkTrafficLimit（type=traffic_limit），
-        // app 只负责把 core 推来的告警显示成通知。
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /** 设备事件（WiFi 客户端上下线，默认关闭） */
@@ -155,38 +130,31 @@ enum class NotifyScene(
         channelId = NotificationCenter.CHANNEL_EVENTS,
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_LOW,
-        rateLimitMinutes = 0,
-        // 同上：core 的 DeviceEventWatcher 发现 station_list 变化时直接发信 + WS 推送。
-        mailForward = false
+        rateLimitMinutes = 0
     ),
 
     /**
      * 内网穿透隧道启动失败 / 意外断开。
      *
-     * **分场景开关不在本地**：唯一真源是 core 的 `tunnel_notify_on_failure`
-     * （`PUT /api/tunnel/settings`），调用点 `TunnelModule.maybeNotifyFailures` 已按它闸门；
-     * 隧道设置页的开关直接写这个字段，不在 NotificationConfig 里造第二份真源。
-     * 但 `sceneEnabledKey(TUNNEL)` 返回**上层总闸** `alert_notification_enabled` ——
-     * 总闸关掉时不该有任何告警类通知漏出来（[defaultEnabled] 因此不参与判断）。
+     * **要不要推**的真源在 core 的 `tunnel_notify_on_failure`（`PUT /api/tunnel/settings`），
+     * 闸门在 `TunnelManager.notifyGiveUp` —— 推送出不来就等于关；隧道设置页的开关直接写那个字段。
+     *
+     * **本机要不要弹**：2026-09-08 起有了自己的分类键 `tunnel_notification_enabled`
+     * （`sceneEnabledKey(TUNNEL)`）。此前它借用 `alert_notification_enabled`，
+     * 于是"只关隧道提醒、留阈值告警"做不到。全局总闸 `notification_master_enabled`
+     * 由 `notify()` 统一判定，不需要本场景操心。
      *
      * `rateLimitMinutes = 0`：限频是**按场景**记时间戳的，一开就变成"同一时刻只有第一条隧道能提醒"，
-     * 后面那条会被静默丢掉、而调用方的边沿状态已经推进过，那次断开就再也提醒不出来了。
-     * 去重靠调用方的"非 Error → Error"边沿触发，不需要限频。
+     * 后面那条会被静默丢掉。去重靠 core 侧的"重连到达上限才推一次"，不需要限频。
      */
     TUNNEL(
         sceneId = "tunnel",
         channelId = NotificationCenter.CHANNEL_EVENTS,
-        // 2026-09-04：由 true 改为 false。`notify()` 用 `scene.defaultEnabled` 当作
-        // **sceneEnabledKey 的默认值**，而 TUNNEL 的 key 是总闸 `alert_notification_enabled`
-        // （其余 9 处读它都是 default=false）。写 true 就等于"用户从未碰过总闸时，
-        // 隧道通知可以突破一个显示为关闭的总闸"——反向的假开关。
-        // 上面注释说的"defaultEnabled 不参与判断"与实现不符，这里对齐实现。
+        // 默认 false：`notify()` 用它当 sceneEnabledKey 的默认值，写 true 等于"用户从未碰过
+        // 隧道通知开关时它自己就是开的"——与其余 7 个分类键（default=false）不一致。
         defaultEnabled = false,
         importance = NotificationManager.IMPORTANCE_DEFAULT,
-        rateLimitMinutes = 0,
-        // 2026-08-31：隧道邮件改由 core 的 TunnelManager 看护放弃处直接发（同样受
-        // tunnel_notify_on_failure 约束），app 这条只保留系统通知
-        mailForward = false
+        rateLimitMinutes = 0
     )
 }
 

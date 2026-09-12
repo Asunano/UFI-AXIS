@@ -1,7 +1,5 @@
 <template>
-  <div class="typing" aria-label="执行中">
-    <span></span><span></span><span></span>
-  </div>
+  <div class="typing" aria-label="执行中"><span></span><span></span><span></span></div>
 </template>
 
 <script setup lang="ts"></script>
@@ -16,6 +14,7 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
+  /* 与 ConsoleBubble.vue 同一条域色豁免：终端配色不接主题令牌，理由见那里的注释 */
   background: #6c6c8a;
   animation: typing-blink 1.2s infinite ease-in-out;
 }

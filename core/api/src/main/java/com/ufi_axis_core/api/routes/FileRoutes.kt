@@ -13,10 +13,16 @@ import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.*
 import java.io.File
+import java.net.URLEncoder
+import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
@@ -33,6 +39,77 @@ class FileRoutes {
         private const val MAX_READ_SIZE = 512 * 1024 // 512 KB 文本读取上限
         private const val MAX_DOWNLOAD_SIZE = 50L * 1024 * 1024 // 50 MB 下载上限
         private const val INTERNAL_STORAGE = "/storage/emulated/0"
+
+        /** `/search` 的深度与规模上限：depth 由调用方给，必须夹取，否则一次请求能走遍整卡 */
+        private const val DEFAULT_SEARCH_DEPTH = 3
+        private const val MAX_SEARCH_DEPTH = 8
+        private const val MAX_SEARCH_RESULTS = 50
+        private const val SEARCH_TIMEOUT_MS = 10_000L
+
+        /**
+         * `/read` 的统一响应。
+         *
+         * `size` 恒为文件真实字节数（`File.length()`）。之前这个字段在 4 个分支里有 3 种语义
+         * （0 / 文件字节数 / content 的 UTF-16 字符数），前端只能靠 content 的中文前缀猜是否截断，
+         * 所以这里补一个显式的 `truncated`。
+         */
+        /**
+         * `/read` 的响应信封。
+         *
+         * @param reason 内容不可用的原因（[REASON_TOO_LARGE] / [REASON_BINARY] / [REASON_NOT_FILE]）；
+         *   null 表示 [content] 就是完整文件内容。2026-09-11 新增 —— 此前三种情况都只置
+         *   `truncated = true` 并把说明文字塞进 content，客户端无从区分，只能给一句含糊的提示。
+         *   `truncated` 保留是为了老客户端仍能判断"内容不可信"。
+         * @param suspect 以 UTF-8 解码时出现了替换字符，内容可能是 GBK 等其它编码
+         */
+        private fun readResponse(
+            content: String,
+            size: Long,
+            truncated: Boolean,
+            encoding: String = "utf-8",
+            reason: String? = null,
+            suspect: Boolean = false
+        ) = toJsonElement(mapOf(
+            "content" to content,
+            "encoding" to encoding,
+            "size" to size,
+            "truncated" to truncated,
+            "reason" to reason,
+            "encoding_suspect" to suspect
+        ))
+
+        const val REASON_TOO_LARGE = "too_large"
+        const val REASON_BINARY = "binary"
+        const val REASON_NOT_FILE = "not_file"
+
+        /**
+         * 把客户端给的编码名解析成 [Charset]。
+         *
+         * 不认的名字回落 UTF-8 而不是报错：编码名来自用户在下拉里选的值，
+         * 拼错一个字母就让整个文件打不开是不必要的严苛；响应里的 `encoding`
+         * 会回显实际使用的那个，客户端能看出请求没被采纳。
+         */
+        internal fun charsetOf(name: String?): Charset = runCatching {
+            if (name.isNullOrBlank()) Charsets.UTF_8 else Charset.forName(name)
+        }.getOrDefault(Charsets.UTF_8)
+
+
+        /**
+         * 按 RFC 6266 / RFC 5987 拼 Content-Disposition。
+         *
+         * 之前是直接把文件名插进 `filename="$name"`：一旦名字里带 `"` 或 `\`，
+         * 参数会提前闭合，整个头从那里被截断 —— 比非 ASCII 乱码严重得多。
+         * 所以给两个参数：ASCII 兜底的 `filename`（不安全字符换成 `_`）+ 精确的 `filename*`。
+         * 换行类字符不用单独处理，Ktor 的 checkHeaderValue 会先拒掉所有 < 0x20。
+         */
+        internal fun contentDisposition(disposition: String, fileName: String): String {
+            val ascii = fileName
+                .map { if (it.code in 0x20..0x7E && it != '"' && it != '\\') it else '_' }
+                .joinToString("")
+                .ifBlank { "download" }
+            val encoded = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
+            return "$disposition; filename=\"$ascii\"; filename*=UTF-8''$encoded"
+        }
     }
 
     fun register(route: Route) {
@@ -96,6 +173,7 @@ class FileRoutes {
             post("/read") {
                 val body = call.receiveJsonObject()
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                val charset = charsetOf(body["encoding"]?.jsonPrimitive?.contentOrNull)
                 val realPath = safeResolveForRead(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -103,28 +181,39 @@ class FileRoutes {
                 withContext(Dispatchers.IO) {
                     val f = File(realPath)
                     if (!f.isFile) {
-                        call.respond(toJsonElement(mapOf("content" to "[不是文件或不存在]", "encoding" to "utf-8", "size" to 0)))
+                        call.respond(readResponse(
+                            "[不是文件或不存在]", 0L,
+                            truncated = true, reason = REASON_NOT_FILE
+                        ))
                         return@withContext
                     }
                     val fileSize = f.length()
                     if (fileSize > MAX_READ_SIZE) {
-                        call.respond(toJsonElement(mapOf(
-                            "content" to "[文件过大: $fileSize bytes，超过 ${MAX_READ_SIZE / 1024}KB 限制，不支持在线查看]",
-                            "encoding" to "utf-8", "size" to fileSize
-                        )))
+                        call.respond(readResponse(
+                            "[文件过大: $fileSize bytes，超过 ${MAX_READ_SIZE / 1024}KB 限制，不支持在线查看]",
+                            fileSize, truncated = true, reason = REASON_TOO_LARGE
+                        ))
                         return@withContext
                     }
                     val bytes = f.readBytes()
                     if (bytes.take(4096).any { it == 0.toByte() }) {
-                        call.respond(toJsonElement(mapOf(
-                            "content" to "[二进制文件，不支持在线查看]",
-                            "encoding" to "utf-8", "size" to fileSize
-                        )))
+                        call.respond(readResponse(
+                            "[二进制文件，不支持在线查看]", fileSize,
+                            truncated = true, reason = REASON_BINARY
+                        ))
                         return@withContext
                     }
-                    val text = String(bytes, Charsets.UTF_8)
-                    val content = if (text.length > MAX_READ_SIZE) text.take(MAX_READ_SIZE) + "\n... [截断]" else text
-                    call.respond(toJsonElement(mapOf("content" to content, "encoding" to "utf-8", "size" to content.length)))
+                    // 到这里 bytes.size <= MAX_READ_SIZE，而 UTF-8 解出的字符数不会多于字节数，
+                    // 所以不可能再需要二次截断 —— 旧的 text.length > MAX_READ_SIZE 分支是死代码。
+                    val text = String(bytes, charset)
+                    // U+FFFD 是解码器遇到非法字节序列时填的替换字符。只在按 UTF-8 读时才作为
+                    // "编码可能不对"的信号：用户显式选了 GBK 还出现替换字符，那是文件本身的问题，
+                    // 再提示一次"可能不是 GBK"只会让人反复换编码试。
+                    val suspect = charset == Charsets.UTF_8 && text.contains('\uFFFD')
+                    call.respond(readResponse(
+                        text, fileSize, truncated = false,
+                        encoding = charset.name().lowercase(), suspect = suspect
+                    ))
                 }
             }
 
@@ -132,6 +221,7 @@ class FileRoutes {
                 val body = call.receiveJsonObject()
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
                 val content = body["content"]?.jsonPrimitive?.contentOrNull ?: ""
+                val charset = charsetOf(body["encoding"]?.jsonPrimitive?.contentOrNull)
                 val realPath = safeResolve(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -140,7 +230,7 @@ class FileRoutes {
                     runCatching {
                         val f = File(realPath)
                         f.parentFile?.mkdirs()
-                        f.writeText(content, Charsets.UTF_8)
+                        f.writeText(content, charset)
                         f.exists()
                     }.getOrDefault(false)
                 }
@@ -261,7 +351,8 @@ class FileRoutes {
             get("/search") {
                 val path = call.request.queryParameters["path"] ?: INTERNAL_STORAGE
                 val query = call.request.queryParameters["query"] ?: ""
-                val maxDepth = call.request.queryParameters["depth"]?.toIntOrNull() ?: 3
+                val maxDepth = (call.request.queryParameters["depth"]?.toIntOrNull() ?: DEFAULT_SEARCH_DEPTH)
+                    .coerceIn(1, MAX_SEARCH_DEPTH)
                 if (query.isBlank()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "empty query")
                     return@get
@@ -272,20 +363,39 @@ class FileRoutes {
                 }
                 val root = File(realPath)
                 if (!root.exists()) {
-                    call.respond(toJsonElement(mapOf("files" to emptyList<String>(), "query" to query)))
+                    call.respond(toJsonElement(mapOf(
+                        "files" to emptyList<String>(), "query" to query, "timed_out" to false
+                    )))
                     return@get
                 }
                 withContext(Dispatchers.IO) {
-                    // walkTopDown() 在遇到无读权限的子目录时会抛出 AccessDeniedException，
-                    // 直接 toList() 会导致整个 handler 500。用 runCatching 兜住，返回已收集部分。
-                    val files = runCatching {
-                        root.walkTopDown().maxDepth(maxDepth)
-                            .filter { it != root && it.name.contains(query, ignoreCase = true) }
-                            .take(50)
-                            .map { mapOf("name" to it.name, "path" to it.absolutePath, "isDirectory" to it.isDirectory) }
-                            .toList()
-                    }.getOrDefault(emptyList())
-                    call.respond(toJsonElement(mapOf("files" to files, "query" to query)))
+                    val found = mutableListOf<Map<String, Any>>()
+                    // 结果收在闭包外的 list 里：超时时才能把已经找到的部分返回。
+                    // 必须有墙钟上限 —— 结果数上限只在凑满时短路，一个查不到的关键词
+                    // 会把 maxDepth 以内的整棵树走完。
+                    val completed = withTimeoutOrNull(SEARCH_TIMEOUT_MS) {
+                        try {
+                            for (f in root.walkTopDown().maxDepth(maxDepth)) {
+                                currentCoroutineContext().ensureActive()
+                                if (f == root || !f.name.contains(query, ignoreCase = true)) continue
+                                found += mapOf(
+                                    "name" to f.name,
+                                    "path" to f.absolutePath,
+                                    "isDirectory" to f.isDirectory
+                                )
+                                if (found.size >= MAX_SEARCH_RESULTS) break
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            // walkTopDown 遇到无读权限的子目录会抛 AccessDeniedException，
+                            // 整个 handler 不该因此 500 —— 返回已收集的部分。
+                        }
+                        true
+                    } != null
+                    call.respond(toJsonElement(mapOf(
+                        "files" to found, "query" to query, "timed_out" to !completed
+                    )))
                 }
             }
 
@@ -329,7 +439,7 @@ class FileRoutes {
                 }
                 val mimeType = MimeTypes.fromFileName(f.name).ifBlank { "application/octet-stream" }
                 val fileName = f.name
-                call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=\"$fileName\"")
+                call.response.header(HttpHeaders.ContentDisposition, contentDisposition("attachment", fileName))
                 call.response.header(HttpHeaders.ContentLength, fileSize.toString())
                 call.respondOutputStream(ContentType.parse(mimeType)) {
                     withContext(Dispatchers.IO) { f.inputStream().use { it.copyTo(this@respondOutputStream) } }
@@ -374,7 +484,7 @@ class FileRoutes {
                     call.response.header(HttpHeaders.AcceptRanges, "bytes")
                     call.response.header(HttpHeaders.ContentRange, "bytes $start-$safeEnd/$fileSize")
                     call.response.header(HttpHeaders.ContentLength, contentLength.toString())
-                    call.response.header(HttpHeaders.ContentDisposition, "inline; filename=\"$fileName\"")
+                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
                     call.respondOutputStream(ContentType.parse(mimeType), HttpStatusCode.PartialContent) {
                         withContext(Dispatchers.IO) {
                             f.inputStream().use { input ->
@@ -401,7 +511,7 @@ class FileRoutes {
                 } else {
                     call.response.header(HttpHeaders.AcceptRanges, "bytes")
                     call.response.header(HttpHeaders.ContentLength, fileSize.toString())
-                    call.response.header(HttpHeaders.ContentDisposition, "inline; filename=\"$fileName\"")
+                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
                     call.respondOutputStream(ContentType.parse(mimeType)) {
                         withContext(Dispatchers.IO) { f.inputStream().use { it.copyTo(this@respondOutputStream) } }
                     }

@@ -41,22 +41,30 @@
             android:layout_marginTop="16dp"
             android:background="?android:attr/dividerVertical" />
 
-        <!-- Goform 配置 -->
+        <!-- 设备后台 -->
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="Goform 设备接口"
+            android:text="设备后台"
             android:textSize="16sp"
             android:textStyle="bold"
             android:textColor="?android:attr/textColorPrimary" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="设备自带 Web 管理后台的连接参数。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
 
         <EditText
             android:id="@+id/etGoformIp"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:hint="Goform IP 地址"
+            android:hint="后台 IP 地址"
             android:singleLine="true"
             android:inputType="text" />
 
@@ -65,7 +73,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="8dp"
-            android:hint="Goform 端口"
+            android:hint="后台端口"
             android:singleLine="true"
             android:inputType="number" />
 
@@ -80,7 +88,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="Goform 登录密码"
+                android:hint="设备后台密码"
                 android:singleLine="true"
                 android:inputType="textPassword" />
 
@@ -90,6 +98,87 @@
                 android:layout_height="wrap_content"
                 android:text="显示" />
         </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="?android:attr/dividerVertical" />
+
+        <!-- 配对密码：由「修改密码」按钮单独提交，
+             不参与 保存(btnSave) 的通用落库路径 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="配对密码"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="?android:attr/textColorPrimary" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="App / Web 控制台配对与登录使用的密码，长度 4-64 位。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <EditText
+            android:id="@+id/etCoreOldPwd"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="当前密码"
+            android:singleLine="true"
+            android:inputType="textPassword" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:orientation="horizontal">
+
+            <EditText
+                android:id="@+id/etCoreNewPwd"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:hint="新密码（4-64 位）"
+                android:singleLine="true"
+                android:inputType="textPassword" />
+
+            <Button
+                android:id="@+id/btnToggleCorePwd"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="显示" />
+        </LinearLayout>
+
+        <EditText
+            android:id="@+id/etCoreNewPwd2"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:hint="确认新密码"
+            android:singleLine="true"
+            android:inputType="textPassword" />
+
+        <Button
+            android:id="@+id/btnChangeCorePwd"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="修改密码" />
+
+        <TextView
+            android:id="@+id/tvCorePwdStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text=""
+            android:textSize="13sp"
+            android:visibility="gone" />
 
         <View
             android:layout_width="match_parent"

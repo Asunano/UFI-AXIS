@@ -323,13 +323,17 @@ class BackendService : Service() {
     }
 
     /**
-     * 读取最新一条短信，若是没转发过的新消息则立即转发。
+     * 扫一遍「水位之后的新短信」，把其中真实来信逐条转成邮件。
      *
      * 三道闸：
      * - 配置可发信（[com.ufi_axis_core.controller.sms.SmsForwardController.isSendable]）：
      *   不可发就直接退出，绝不为此做任何 IO / 持锁；
      * - id 去重（持久化的 `lastForwardedSmsId`）：同一条只发一次，服务重启也认；
      * - `age <= `[SMS_MAX_AGE_MS]：首次装机 / 换 id 体系时别把老短信补发一遍。
+     *
+     * 后两道的选取逻辑在纯函数 [com.ufi_axis_core.controller.sms.SmsForwardWindow.plan] 里
+     * （那里也写着为什么必须扫一批而不是只看最新一条：**来信与本机发出的短信几乎同时落库、
+     * 来信在先**时，只看最新一条会把那封邮件永久跳过）。
      *
      * @param source 仅用于日志区分触发来源（observer / poll）。
      */
@@ -343,19 +347,42 @@ class BackendService : Service() {
                 if (!forwardCtl.isSendable()) return
                 // fallbackOnEmpty：纯 goform 设备的短信不进系统 Provider，Provider 读到的是空列表
                 // （不是"不可用"），不允许空列表兜底就等于邮件功能在这类设备上完全不工作。
-                val latest = smsCtl.getLatest(fallbackOnEmpty = true) ?: return
+                val window = smsCtl.getAllUnfiltered(
+                    limit = com.ufi_axis_core.controller.sms.SmsForwardWindow.SCAN_READ_LIMIT,
+                    fallbackOnEmpty = true
+                )
+                if (window.isEmpty()) return
                 val lastId = forwardCtl.lastForwardedSmsId
-                if (latest.id == lastId) return
-                val age = System.currentTimeMillis() - latest.date
-                if (lastId < 0L || age > SMS_MAX_AGE_MS || latest.direction != "received") {
-                    // 首次落基线 / 历史短信 / 自己发出去的短信：只记 id 不发信
-                    forwardCtl.lastForwardedSmsId = latest.id
-                    return
+                val plan = com.ufi_axis_core.controller.sms.SmsForwardWindow.plan(
+                    messages = window,
+                    lastForwardedId = lastId,
+                    now = System.currentTimeMillis(),
+                    maxAgeMs = SMS_MAX_AGE_MS
+                )
+                if (plan.highWaterMark == lastId) return
+                if (plan.skipped > 0) {
+                    AppLogger.w(
+                        tag,
+                        "SMS forward ($source): 窗口内新来信超过单轮上限" +
+                            "（${com.ufi_axis_core.controller.sms.SmsForwardWindow.MAX_BATCH_PER_SCAN} 条）" +
+                            "，放弃较早的 ${plan.skipped} 条邮件通知（正文仍可在 /api/sms 查到）"
+                    )
                 }
-                AppLogger.i(tag, "New SMS #${latest.id} from ${latest.address} via $source: ${latest.body.take(50)}")
-                forwardCtl.lastForwardedSmsId = latest.id
-                val ok = forwardCtl.forwardSms(latest.address, latest.body, latest.date)
-                AppLogger.i(tag, "Forward result: ${if (ok) "success" else "failed"}")
+                // 先推进 lastForwardedSmsId 再投递，**顺序是刻意的**：
+                // 投递失败（含总闸关闭 / 免打扰静默期 / SMTP 挂了）时这些短信不会被下一轮补发。
+                // 反过来（先投递成功再落 id）看着更"可靠"，但那意味着用户一打开总开关就会被
+                // 静默期里攒下的一堆邮件糊脸 —— 那些通知的时效早就过了。
+                // 这是明确的取舍，不是漏改：短信正文在 /api/sms 里一直查得到，补发的只是通知。
+                forwardCtl.lastForwardedSmsId = plan.highWaterMark
+                // **逐条串行**：forwardSms 内部持 WakeLock 走 SMTP，并发只会让几个握手互相抢锁。
+                for (msg in plan.toForward) {
+                    AppLogger.i(tag, "New SMS #${msg.id} from ${msg.address} via $source: ${msg.body.take(50)}")
+                    val ok = forwardCtl.forwardSms(msg.address, msg.body, msg.date)
+                    AppLogger.i(tag, "Forward result #${msg.id}: ${if (ok) "success" else "failed"}")
+                }
+            } catch (e: CancellationException) {
+                // 取消不是投递失败（本仓纪律）：原样重抛，别把它记成一条 SMS 转发错误
+                throw e
             } catch (e: Exception) {
                 AppLogger.w(tag, "SMS forward ($source) error: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -713,22 +740,53 @@ class BackendService : Service() {
 
 
 
-            // ── 电池事件通知（依赖 smsForwardController） ──
+            // ── 电池事件通知（走通知分发器） ──
             // 走 launchMailEvent：与短信一样，投递期间自己持锁，别指望"前端连着"那把保活锁。
+            //
+            // 2026-09-08：此前这里借 `forwardSms("SYSTEM", …)` **把电池事件伪装成短信**，
+            // 而 `SYSTEM` 这个伪发件人被显式排除在场景判定之外 —— 等于绕过了全部场景开关，
+            // 用户在邮件设置里一个勾都没打也会收到低电量邮件，界面上还找不到关它的地方。
+            // 现在它有自己的场景 [NotifyScenes.BATTERY]（存量用户由 `migrateScenesV3` 补进
+            // scenes，保持升级前后行为一致）。
+            //
+            // `exclude = {push}`：除**推送**之外的所有渠道都投（邮件、Webhook、本机短信……）。
+            // 2026-09-10 从 `channels = {mail}` 放开 —— 此前写死邮件，用户在 Webhook /
+            // 本机短信里勾了「电池状态」永远不触发，是个假开关。
+            //
+            // 单独排除推送是**核实过的事实**，不是保守：app 侧 `NotifyService` 的推送分流只认
+            // `sms`/`verification` 与 `download`/`tunnel`，其余带 `message` 的一律当成 AlertRecord
+            // 走 `maybeNotifyNewAlerts` —— `type = "battery"` 会被记成一条阈值告警（`id = 0`），
+            // 还会把告警游标推到电池事件的时间戳，把随后到达的真告警吞掉。
+            // 让它进推送需要 app 侧一整套镜像（通知 channel + 分类开关 + 分流分支）外加把
+            // `battery` 补进 `PushChannel.SINGLE_TOPIC_SCENES`（否则 web 的告警列表会多出一条
+            // core `alert_records` 里不存在的记录），那是新功能，见 `NotifyScenes.BATTERY`。
+            //
+            // 用 exclude 而不是把渠道 id 列全：那份清单每加一条新渠道都要回来补，漏补就又是假开关。
+            val emitBattery: suspend (String, String) -> Unit = { title, body ->
+                g.serverGraph.notificationDispatcher.emit(
+                    com.ufi_axis_core.notify.NotifyEvent(
+                        scene = com.ufi_axis_core.notify.NotifyScenes.BATTERY,
+                        level = com.ufi_axis_core.notify.NotifyLevel.WARNING,
+                        title = title,
+                        body = body,
+                        exclude = setOf(com.ufi_axis_core.notify.PushChannel.ID)
+                    )
+                )
+            }
             val notifier = BatteryNotifier(
                 onLowBattery = { pct ->
                     launchMailEvent("Battery low") {
-                        g.controller.smsForwardController.forwardSms("SYSTEM", "低电量警告: ${pct}%", System.currentTimeMillis())
+                        emitBattery("低电量警告", "设备电量已降至 ${pct}%")
                     }
                 },
                 onVeryLowBattery = { pct ->
                     launchMailEvent("Battery very low") {
-                        g.controller.smsForwardController.forwardSms("SYSTEM", "极低电量警告: ${pct}%", System.currentTimeMillis())
+                        emitBattery("极低电量警告", "设备电量已降至 ${pct}%，随时可能关机")
                     }
                 },
                 onFullBattery = {
                     launchMailEvent("Battery full") {
-                        g.controller.smsForwardController.forwardSms("SYSTEM", "电池已充满", System.currentTimeMillis())
+                        emitBattery("电池已充满", "设备电池已充满，可以拔掉充电器")
                     }
                 },
                 onChargeStart = {
@@ -976,7 +1034,17 @@ class BackendService : Service() {
         try { g.serverGraph.alertEngine.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping alert engine", e) }
         try { g.controller.taskScheduler.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping task scheduler", e) }
         // ② 再断开对外通道（WS 先关，避免 server 停了还有连接在等推送）
+        // 分发器排在最前：它先关门（之后任何触发源 emit 都是空操作）、再**挂起等在途轮次收尾** ——
+        // 否则下面把 webhookChannel / wsManager / historyScope 收掉之后，还在跑的那几个协程会往
+        // 已关闭的组件里投递（投递撞上被关掉的 CIO 连接池、投递记录写进已 cancel 的 scope）。
+        try { g.serverGraph.notificationDispatcher.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down notification dispatcher", e) }
+        // Webhook 渠道自带一个 HttpClient（连接池 + CIO 的线程），排在分发器之后：
+        // 上一步已经等过在途轮次，此时不会再有人在用这个连接池。
+        try { g.serverGraph.webhookChannel.close() } catch (e: Exception) { AppLogger.e(tag, "Error closing webhook channel", e) }
         try { g.serverGraph.wsManager.closeAll() } catch (e: Exception) { AppLogger.e(tag, "Error closing websocket", e) }
+        // 推送服务自带 CoroutineScope，不 cancel 的话服务停掉之后排队中的推送还会往已关闭的
+        // WebSocketManager 里灌。必须在 wsManager 关闭之后立刻收掉。
+        try { g.serverGraph.pushService.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down push service", e) }
         try { g.serverGraph.server.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping server", e) }
         // Netty eventLoopGroup 异步关闭，需等待足够时间让 event loop 线程完成清理。
         // 过短会导致 CompletionHandlerException（event loop 线程的完成处理器引用已取消的协程）。
@@ -988,6 +1056,18 @@ class BackendService : Service() {
         try { g.controller.tunnelManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down tunnel manager", e) }
         // 关闭 ADB shell 持久会话
         try { com.ufi_axis_core.util.AdbShellExecutor.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down ADB shell", e) }
+        // 配对存储：同步落一次盘并收掉 lastSeen 的异步 flush 线程。
+        // 2026-09-08 事故：它的 flush 线程是 daemon，进程退出时被直接掐掉，而当时的落盘是
+        // 「截断真文件再写」，死在这个窗口里就留下半截 paired_devices.json ——
+        // 下次启动读不出任何设备，手机被判未配对、清空 token、回配对页要求输密码。
+        // 落盘现在是原子的，这里补上显式收尾：停止流程必须自己把线程收干净。
+        try { com.ufi_axis_core.util.PairedDeviceStore.shutdownInstance() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down paired device store", e) }
+        // 拦截规则 store：先把内存里累计的命中次数落盘再收协程。
+        // `pendingHits` 只在「下次命中且过了 60s」或读规则列表时才写盘，不在这里 flush 的话
+        // 最后一批命中数随停机丢掉 —— 而「命中 N 次」是用户判断规则到底有没有生效的唯一线索。
+        try { g.controller.smsRuleStore.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down sms rule store", e) }
+        // 邮件控制器的历史写入 scope：不 cancel 的话停机后排队中的记录写入与裁剪还在打 Room。
+        try { g.controller.smsForwardController.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down sms forward controller", e) }
         // 重置 ComponentFactory 构建状态，允许服务重启时重新 build
         com.ufi_axis_core.service.ComponentFactory.reset()
     }

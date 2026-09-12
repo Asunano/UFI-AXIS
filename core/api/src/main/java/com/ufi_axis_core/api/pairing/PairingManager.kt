@@ -103,9 +103,13 @@ class PairingManager(
      * @param hasRoot / @param isExternalStorageManager 由路由 rootChecker/Environment seam 注入。
      *
      * `pairing_code` 只在**设备尚未初始化**（`hasDefaultPassword=true`）时下发：
-     * 此时配对码是完成初始化的必要条件，客户端必须能自动取到。一旦设备密码已设置，
+     * 此时配对码是完成初始化的必要条件，客户端必须能自动取到。一旦配对密码已设置，
      * 后续客户端走「密码登录」分支（见 [confirm] 第 1 步的 `loginByPassword`），
      * 不再需要配对码——继续对免鉴权请求回显它只会白送给扫描者一个凭据。
+     *
+     * 注：这里说的配对密码，符号名沿用 `devicePassword*`（`AppSettings.devicePasswordSet` /
+     * `setDevicePassword` / `verifyDevicePassword`）——那是持久化 key 的一部分，
+     * 改名会让存量设备读不出已设置的密码，所以只统一注释口径。
      */
     fun infoPayload(
         deviceName: String,
@@ -128,8 +132,8 @@ class PairingManager(
      *
      * 两种模式（2026-08-22 语义拆分）：
      * - 配对（首次初始化）：设备从未设置密码（devicePasswordSet=false）→ 严格校验一次性
-     *   配对码；请求密码即被落库为设备密码（“设置密码”语义），可同时写入 Goform 配置。
-     * - 登录（普通连接）：设备已初始化（devicePasswordSet=true）→ 凭设备密码即可连接；
+     *   配对码；请求密码即被落库为配对密码（“设置密码”语义），可同时写入 Goform 配置。
+     * - 登录（普通连接）：设备已初始化（devicePasswordSet=true）→ 凭配对密码即可连接；
      *   配对码已消耗或未携带时不再阻断（[InvalidCode]），密码正确即绑定指纹并下发 token。
      *   已配对指纹免码刷新；上限检查仍然生效。
      *
@@ -313,7 +317,7 @@ class PairingManager(
     }
 
     /**
-     * 修改设备密码（旧密码即管理权限证明，端点免 Bearer）。
+     * 修改配对密码（旧密码即管理权限证明，端点免 Bearer）。
      * 新密码长度 <4 或 >64 → 400；旧密码错 → 401 WRONG_OLD_PASSWORD；锁定 → 429。
      */
     fun changePassword(
@@ -337,7 +341,7 @@ class PairingManager(
                 ChangePwdResult.WrongOldPassword
             }
         }
-        // Goform 后台连接配置（IP/端口/密码）校验，置于设置设备密码之前，避免部分落库
+        // Goform 后台连接配置（IP/端口/密码）校验，置于设置配对密码之前，避免部分落库
         when (val g = validateGoformSettings(goformIp, goformPort, goformPassword)) {
             is GoformApplyResult.Failure -> return ChangePwdResult.InvalidGoformConfig
             is GoformApplyResult.Success -> {}

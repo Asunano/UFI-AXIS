@@ -33,6 +33,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * Custom header bar matching UFITOOLSWidget style:

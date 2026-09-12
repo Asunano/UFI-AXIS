@@ -60,6 +60,8 @@ class HttpServer(
     private val webResourceManager: com.ufi_axis_core.util.WebResourceManager,
     private val webUpdateRoutes: com.ufi_axis_core.api.routes.WebUpdateRoutes,
     private val smsForwardRoutes: SmsForwardRoutes? = null,
+    private val webhookRoutes: com.ufi_axis_core.api.routes.WebhookRoutes? = null,
+    private val localSmsRoutes: com.ufi_axis_core.api.routes.LocalSmsRoutes? = null,
     private val taskRoutes: TaskRoutes? = null,
     private val speedTestRoutes: SpeedTestRoutes? = null,
     private val debugLogRoutes: DebugLogRoutes? = null,
@@ -69,7 +71,11 @@ class HttpServer(
     private val downloadRoutes: DownloadRoutes? = null,
     private val serviceRoutes: com.ufi_axis_core.api.routes.ServiceRoutes? = null,
     private val tunnelRoutes: com.ufi_axis_core.api.routes.TunnelRoutes? = null,
-    private val componentRoutes: com.ufi_axis_core.api.routes.ComponentRoutes? = null
+    private val componentRoutes: com.ufi_axis_core.api.routes.ComponentRoutes? = null,
+    /** 终端命令历史（AT / Shell 两端共享），可空只为兼容尚未装配它的调用方。 */
+    private val consoleRoutes: com.ufi_axis_core.api.routes.ConsoleRoutes? = null,
+    /** 配置备份导出 / 恢复，可空同上。 */
+    private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB（普通路由：防滥用 + 内存安全）
@@ -78,6 +84,16 @@ class HttpServer(
         private const val WEB_UPDATE_BODY_SIZE = 50L * 1024 * 1024  // Web 资源 ZIP 上传上限 50MB
         // 可选二进制组件本地上传上限：cloudflared 裸二进制约 36MB，留足余量
         private const val COMPONENT_UPLOAD_BODY_SIZE = 96L * 1024 * 1024
+
+        /**
+         * backup 前缀下各端点的请求体上限。
+         *
+         * 直接引用 [com.ufi_axis_core.api.routes.BackupRoutes.MAX_UPLOAD_BYTES]，**不另写一份
+         * 字面量**：两处漂移的后果是「路由层按 8MB 设计、HTTP 层按 512KB 拦」，表现为
+         * 「小备份能预览、稍大的包莫名 413」这种极难定位的问题。
+         */
+        private val BACKUP_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.BackupRoutes.MAX_UPLOAD_BYTES.toLong()
         private val VERSIONED_ASSET_REGEX = Regex("[_-][A-Za-z0-9]{6,}\\.")
     }
 
@@ -92,12 +108,16 @@ class HttpServer(
     //  - /api/update/upload（APK 推送兜底）用动态上限 = 版本清单 apkSize×1.2+10MB 缓冲（未知回落 100MB）；
     //  - /api/web/update（Web 资源 ZIP 手动上传）用固定 50MB 上限；
     //  - /api/files/upload（文件管理器上传）用 200MB 上限；
+    //  - /api/backup 前缀（备份包上传）用 BackupRoutes 的上限；
     //  - 其余路由保持 512KB（防滥用/非预期 body）。
     //
     // 2026-09-02 安全修复：原实现 `contentLength() ?: return` —— 没有 Content-Length 就**整段跳过**。
     // 而 `Transfer-Encoding: chunked` 正是合法的无 Content-Length 请求，于是任何上限都能被一行
     // 请求头绕过（在 256MB RAM 的设备上足以打爆内存）。现在改为：带 body 的请求必须给出
     // Content-Length，否则直接拒。我们自己的客户端（OkHttp/Retrofit、axios）都会带上。
+    //
+    // 2026-09-12 修复：备份路由此前**漏登记**，导致走 else 的 512KB —— 而 BackupRoutes 自己
+    // 按 8MB 设计，表现为「小包能预览、稍大的包莫名其妙 413」。上限只在一处定义，见 BACKUP_UPLOAD_BODY_SIZE。
     private val RequestBodyLimit = createApplicationPlugin(name = "RequestBodyLimit") {
         onCall { call ->
             val path = call.request.path()
@@ -105,6 +125,7 @@ class HttpServer(
                 path.startsWith("/api/update/upload") -> updateRoutes.uploadLimitBytes()
                 path.startsWith("/api/web/update") -> WEB_UPDATE_BODY_SIZE
                 path.startsWith("/api/files/upload") -> FILE_UPLOAD_BODY_SIZE
+                path.startsWith("/api/backup") -> BACKUP_UPLOAD_BODY_SIZE
                 path.startsWith("/api/components/") && path.endsWith("/upload") -> COMPONENT_UPLOAD_BODY_SIZE
                 else -> MAX_REQUEST_BODY_SIZE
             }
@@ -228,7 +249,23 @@ class HttpServer(
         }
 
         install(CORS) {
+            // 为什么这里必须保持 anyHost()（2026-09-08 复核，结论是「不收紧」）：
+            // ① web 控制台有**显式的跨域模式**：用户自己填 core 地址，页面本身可以托管在任何
+            //    地方（见 web/src/views/login/LoginView.vue 的 isSameOrigin 分支 +
+            //    stores/app.ts 的 baseUrl）。合法 Origin 的集合在 core 侧根本不可知，
+            //    白名单写不出来。
+            // ② 走 frp / Cloudflare Tunnel 访问时，浏览器 Origin 是 https://xxx（443），
+            //    而这里没装 ForwardedHeaders，Ktor 看到的 request origin 仍是 http://host:8088。
+            //    一旦改成「同源 + 白名单」，Ktor 会把**真正同源**的隧道流量判成跨域，
+            //    所有 PUT/POST/DELETE 直接 403 —— 这种坏法在局域网直连下测不出来。
+            // ③ 本地开发不依赖 CORS：vite 把 /api 与 /ws 代理到设备（web/vite.config.ts:51），
+            //    浏览器视角是同源。
+            // 前提与代价：没有 allowCredentials，所以不存在「浏览器自动带上凭据」的 CSRF 面；
+            // 真正的门是每设备 ECDSA 签名（Authorization + X-Timestamp/X-Nonce/X-Signature），
+            // 不是 CORS。残留风险是免鉴权路径（/health、/pair、/pairing/*）可被任意页面跨域读写，
+            // 那属于这些路由自己该做的速率限制，不该用一刀切的 CORS 来兜。
             anyHost()
+
             allowMethod(HttpMethod.Get)
             allowMethod(HttpMethod.Post)
             allowMethod(HttpMethod.Put)
@@ -515,10 +552,14 @@ class HttpServer(
                 updateRoutes.register(this)
                 appRoutes.register(this)
                 shellRoutes.register(this)
+                consoleRoutes?.register(this)
+                backupRoutes?.register(this)
                 fileRoutes.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)
                 smsForwardRoutes?.register(this)
+                webhookRoutes?.register(this)
+                localSmsRoutes?.register(this)
                 taskRoutes?.register(this)
                 speedTestRoutes?.register(this)
                 debugLogRoutes?.register(this)

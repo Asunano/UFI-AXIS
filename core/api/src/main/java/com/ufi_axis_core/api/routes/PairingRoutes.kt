@@ -1,5 +1,7 @@
 // F31：PairingRoutes 免 Bearer 鉴权为设计意图（设备首次配对尚无 Token，必须开放）。勿改为需 Token。
-// 但破坏性操作（unpair / change-password）必须校验设备密码——免 Token ≠ 免鉴权。
+// 但破坏性操作（unpair / change-password）必须校验配对密码——免 Token ≠ 免鉴权。
+// 配对密码在存储层的符号名沿用 `devicePassword*`（`settings.devicePasswordSet` 等）：
+// 那是持久化 key 的一部分，改名会让存量设备读不出已设置的密码，所以只统一注释口径。
 package com.ufi_axis_core.api.routes
 
 import android.os.Build
@@ -10,6 +12,7 @@ import com.ufi_axis_core.api.pairing.PairingManager
 import com.ufi_axis_core.api.pairing.PairingManager.ChangePwdResult
 import com.ufi_axis_core.api.pairing.PairingManager.PairingConfirmResult
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -34,6 +37,31 @@ private fun isLocalSubnet(ip: String): Boolean {
         addr.isLoopbackAddress || addr.isSiteLocalAddress || addr.isLinkLocalAddress
     }.getOrDefault(false)
 }
+
+/**
+ * 请求是否从隧道（frpc / cloudflared）转发进来。
+ *
+ * 判据由两个条件**同时**成立构成：
+ * 1. [tunnelActive]：设备上确实有隧道进程在运行。没有隧道时不存在隧道来源，这一条把下面
+ *    那个不精确的地址判据整体关掉；
+ * 2. 服务端侧的接收地址是回环地址。局域网客户端连的是设备的 LAN IP，而隧道是在设备本机
+ *    连 `127.0.0.1:8088`（见 app 侧 frpc 模板的 localIP/localPort）。
+ *
+ * 不能拿 `remoteAddress` 判：隧道转发之后它恒为 127.0.0.1，正好满足 [isLocalSubnet]，
+ * 这是「同网段限制」未能拦住公网来源的原因。
+ *
+ * 为什么必须加第 1 条（2026-09-11 修）：本机直连同样落在回环地址上 —— app 与 core 装在
+ * 同一台设备时，或在设备上用 `http://127.0.0.1:8088` 打开 Web 面板时。只看地址会把这些
+ * 局域网/本机操作误判为公网来源，表现为「在局域网内也提示远程连接」。
+ *
+ * 剩余的不精确之处：隧道正在运行期间，本机直连仍会被判为隧道来源。这个方向是保守的
+ * （多拦不少拦），且此时确实无法从连接本身区分两者，故保留。
+ */
+internal fun isTunnelOrigin(localAddress: String, tunnelActive: Boolean): Boolean =
+    tunnelActive && runCatching {
+        InetAddress.getByName(localAddress).isLoopbackAddress
+    }.getOrDefault(false)
+
 
 /**
  * 配对模式端点（免鉴权，且独立于 /api 鉴权块）。
@@ -61,6 +89,12 @@ private fun isLocalSubnet(ip: String): Boolean {
  * 1. 速率限制：每 IP 每 [rateLimitMs]（默认 500ms）仅放行一次（info/challenge/confirm/change-password 独立计数器）；
  * 2. 子网限制：仅响应本网段（RFC1918 / 回环 / 链路本地）地址；
  * 3. 密码错误锁定：每 IP 15min 5 次 + 全局 15min 20 次失败 → 429 PASSWORD_LOCKED（PairingManager 内内存计数）。
+ * 4. 隧道来源降级（见 [isTunnelOrigin]）——第 2 条拦不住隧道，这条才是公网面的门：
+ *    - `/info`：只回 `device_name` + `has_default_password`，不给 `pairing_code` / `device_id` / `storage_status`；
+ *    - `/confirm`：设备**尚未设置配对密码**时拒绝（这条路径没有密码门，配对码对了就能拿走设备）；
+ *    - `/change-password`：`hasDefaultPassword=true` 时拒绝（此时"旧密码"就是出厂默认值，等于没有门）；
+ *    - `/unpair`：一律拒绝（破坏性最强，远端没有正当需求）；
+ *    - `/challenge`：放行（只发随机 nonce，不含秘密，拦了远端就完全无法登录）。
  */
 class PairingRoutes(
     private val ctx: RouteContext,
@@ -77,6 +111,18 @@ class PairingRoutes(
      * 测试中以确定性值注入，避免依赖测试宿主上报的 remoteAddress。
      */
     private val subnetChecker: (String) -> Boolean = { ip -> isLocalSubnet(ip) },
+    /**
+     * 设备上是否有隧道进程在运行（见 [isTunnelOrigin] 的第 1 条判据）。
+     * 默认 `true` 是保守取值：忘记接线时行为退回到本轮之前的「只看地址」，不会放松门禁。
+     */
+    private val tunnelActive: () -> Boolean = { true },
+    /**
+     * 可测试性 seam：判定请求是否从隧道转发进来（见 [isTunnelOrigin]）。
+     * 测试宿主的 `local.localAddress` 不可控，所以以确定性值注入。
+     */
+    private val tunnelChecker: (ApplicationCall) -> Boolean = { call ->
+        isTunnelOrigin(call.request.local.localAddress, tunnelActive())
+    },
     /**
      * 可测试性 seam：解析设备名（Settings.Global.DEVICE_NAME → deviceId 回退）。
      * 默认委托 [PairingManager.resolveDeviceName]（读 Settings.Global）；测试注入固定值。
@@ -159,7 +205,7 @@ class PairingRoutes(
 
     @Serializable
     private data class UnpairBody(
-        /** 设备密码：解除全部配对是破坏性操作，必须证明操作者是设备主人。 */
+        /** 配对密码：解除全部配对是破坏性操作，必须证明操作者是设备主人。 */
         val password: String? = null
     )
 
@@ -191,6 +237,19 @@ class PairingRoutes(
         if (wait > 0) delay(wait)
     }
 
+    /**
+     * 隧道来源不允许执行"初始化 / 破坏性"操作时的统一响应。
+     * 文案直接说清"要在局域网内做"，否则用户只会看到一个没头没尾的 403。
+     */
+    private suspend fun respondLocalOnly(call: ApplicationCall, action: String) {
+        AppLogger.w(TAG, "Rejected $action from tunnel origin (local=${call.request.local.localAddress})")
+        call.respondFail(
+            HttpStatusCode.Forbidden,
+            ErrorCode.FORBIDDEN,
+            "$action 只能在设备所在的局域网内完成"
+        )
+    }
+
     private suspend fun handleInfo(call: ApplicationCall) {
         val ip = clientIp(call)
         if (!subnetChecker(ip)) {
@@ -203,7 +262,16 @@ class PairingRoutes(
         }
         val hasRoot = try { rootChecker() } catch (e: Exception) { false }
         val isEsm = isExternalStorageManager()
-        call.respond(toJsonElement(pairingManager.infoPayload(deviceNameProvider(), hasRoot, isEsm)))
+        val payload = pairingManager.infoPayload(deviceNameProvider(), hasRoot, isEsm)
+        // 隧道来源只回登录页真正用得上的两项：pairing_code 是接管未初始化设备的全部条件，
+        // device_id / storage_status 一个是设备指纹材料、一个是本机才能处理的授权状态，
+        // 远端都没有用途。已初始化设备的 pairing_code 本来就是空串，密码登录不受影响。
+        val safe = if (tunnelChecker(call)) {
+            payload.filterKeys { it == "device_name" || it == "has_default_password" }
+        } else {
+            payload
+        }
+        call.respond(toJsonElement(safe))
     }
 
     /**
@@ -211,7 +279,7 @@ class PairingRoutes(
      *
      * 免鉴权是必然的（客户端此刻还没有凭据），因此挑战本身不能是任何秘密：
      * 它只是随机数，攻击者拿到也只能证明"我持有我自己的私钥"，而后续 confirm 仍要过
-     * 配对码/设备密码/配额三道门。挑战的唯一作用是把「持有私钥」变成可验证的事实。
+     * 配对码/配对密码/配额三道门。挑战的唯一作用是把「持有私钥」变成可验证的事实。
      */
     private suspend fun handleChallenge(call: ApplicationCall) {
         val ip = clientIp(call)
@@ -232,6 +300,12 @@ class PairingRoutes(
             call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN, "Forbidden: not on local subnet")
             return
         }
+        // 首次初始化（设备还没有配对密码）这条路径**没有密码门** —— 配对码对了就能拿走设备，
+        // 所以只允许局域网。已初始化设备的密码登录不受影响（远端 Web 仍要能登录）。
+        if (!settings.devicePasswordSet && tunnelChecker(call)) {
+            respondLocalOnly(call, "首次配对")
+            return
+        }
         if (rateLimited(ip, confirmLastAccess)) {
             call.respondFail(HttpStatusCode.TooManyRequests, ErrorCode.TOO_MANY_REQUESTS, "Too many requests, retry later")
             return
@@ -242,7 +316,7 @@ class PairingRoutes(
         val challenge = body?.challenge?.trim().orEmpty()
         val signature = body?.signature?.trim().orEmpty()
         // 配对码必填仅针对全新设备（devicePasswordSet=false，首次配对=初始化语义）；
-        // 已配置设备允许空码（一次性码已消耗且服务未重启时码为空）→ 凭设备密码登录（PairingManager 内判定）。
+        // 已配置设备允许空码（一次性码已消耗且服务未重启时码为空）→ 凭配对密码登录（PairingManager 内判定）。
         if (code.isEmpty() && !settings.devicePasswordSet) {
             call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "pairing_code required")
             return
@@ -285,16 +359,20 @@ class PairingRoutes(
                 call.respondFail(HttpStatusCode.Conflict, ErrorCode.ALREADY_PAIRED, "Device already paired")
             }
             is PairingConfirmResult.InvalidPassword -> {
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "Invalid device password")
+                // 日志保留英文原文：便于与历史日志/`code` 对照排查，界面文案改中文后不再能靠 error 串搜日志。
+                AppLogger.w(TAG, "Invalid device password (pairing/confirm) ip=$ip")
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
             }
             is PairingConfirmResult.PasswordLocked -> {
                 call.respondFail(HttpStatusCode.TooManyRequests, ErrorCode.PASSWORD_LOCKED, "Too many failed password attempts, retry later")
             }
             is PairingConfirmResult.PasswordRequired -> {
-                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.PASSWORD_REQUIRED, "Device password required")
+                AppLogger.w(TAG, "Device password required (pairing/confirm) ip=$ip")
+                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.PASSWORD_REQUIRED, "请输入配对密码")
             }
             is PairingConfirmResult.InvalidGoformConfig -> {
-                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_GOFORM_CONFIG, "Goform 后台配置无效（IP/端口/密码格式错误）")
+                AppLogger.w(TAG, "Invalid goform config (pairing/confirm) ip=$ip")
+                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_GOFORM_CONFIG, "设备后台配置无效（IP/端口/密码格式错误）")
             }
             is PairingConfirmResult.InvalidDeviceKey -> {
                 call.respondFail(
@@ -318,6 +396,12 @@ class PairingRoutes(
         val ip = clientIp(call)
         if (!subnetChecker(ip)) {
             call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN, "Forbidden: not on local subnet")
+            return
+        }
+        // hasDefaultPassword=true 时"旧密码"就是出厂默认值，这道门等于不存在 ——
+        // 首次设置密码只允许局域网。之后的正常改密（要提供真旧密码）远端可用。
+        if (settings.hasDefaultPassword && tunnelChecker(call)) {
+            respondLocalOnly(call, "首次设置配对密码")
             return
         }
         if (rateLimited(ip, changePasswordLastAccess)) {
@@ -351,7 +435,8 @@ class PairingRoutes(
                 call.respondFail(HttpStatusCode.TooManyRequests, ErrorCode.PASSWORD_LOCKED, "Too many failed password attempts, retry later")
             }
             is ChangePwdResult.InvalidGoformConfig -> {
-                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_GOFORM_CONFIG, "Goform 后台配置无效（IP/端口/密码格式错误）")
+                AppLogger.w(TAG, "Invalid goform config (pairing/change-password) ip=$ip")
+                call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_GOFORM_CONFIG, "设备后台配置无效（IP/端口/密码格式错误）")
             }
         }
     }
@@ -360,6 +445,12 @@ class PairingRoutes(
         val ip = clientIp(call)
         if (!subnetChecker(ip)) {
             call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN, "Forbidden: not on local subnet")
+            return
+        }
+        // 清空全部配对并重回配对模式是最强的破坏性操作，远端没有正当需求：
+        // 一旦被执行，设备会重新进入"任何局域网客户端都能初始化"的状态。
+        if (tunnelChecker(call)) {
+            respondLocalOnly(call, "解除全部配对")
             return
         }
         if (rateLimited(ip, unpairLastAccess)) {
@@ -375,14 +466,21 @@ class PairingRoutes(
                 call.respond(ok("message" to "Device unpaired, re-entered pairing mode"))
             }
             is PairingManager.UnpairResult.MissingPassword -> {
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "Password required")
+                AppLogger.w(TAG, "Password required (pairing/unpair) ip=$ip")
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "请输入配对密码")
             }
             is PairingManager.UnpairResult.InvalidPassword -> {
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "Invalid device password")
+                AppLogger.w(TAG, "Invalid device password (pairing/unpair) ip=$ip")
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
             }
             is PairingManager.UnpairResult.PasswordLocked -> {
                 call.respondFail(HttpStatusCode.TooManyRequests, ErrorCode.PASSWORD_LOCKED, "Too many failed password attempts, retry later")
             }
         }
+    }
+
+    private companion object {
+        /** 与 PairingManager 共用同一日志标签，配对全流程可一次过滤出来。 */
+        private const val TAG = "Pairing"
     }
 }

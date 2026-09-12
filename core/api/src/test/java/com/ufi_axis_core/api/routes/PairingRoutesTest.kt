@@ -85,12 +85,14 @@ class PairingRoutesTest {
     private fun buildRoutes(
         rateLimitMs: Long = 10_000L,
         deviceName: String = "UFI-AXIS-5G",
-        subnetOk: Boolean = true
+        subnetOk: Boolean = true,
+        tunnelOrigin: Boolean = false
     ): PairingRoutes = PairingRoutes(
         ctx,
         manager,
         rootChecker = { true },
         subnetChecker = { subnetOk },
+        tunnelChecker = { tunnelOrigin },
         deviceNameProvider = { deviceName },
         rateLimitMs = rateLimitMs
     )
@@ -563,7 +565,118 @@ class PairingRoutesTest {
     }
 
     // ────────────────────────────────────────────────
-    // 设备密码（以下用例关闭速率限制以便连续重试）
+    // 隧道来源降级（frpc / cloudflared 转发进来的请求）
+    // 同网段限制拦不住隧道：转发之后 remoteAddress 恒为 127.0.0.1，天然满足 isLocalSubnet。
+    // 以下用例锁住"哪些操作不许从隧道做"这条策略。
+    // ────────────────────────────────────────────────
+
+    @Test
+    fun `GET info from tunnel hides pairing code and device id`() {
+        val routes = buildRoutes(tunnelOrigin = true)
+        testApplication {
+            application { mount(routes) }
+            val obj = client.get("/pairing/info").json()
+            assertFalse("隧道来源绝不下发配对码", "pairing_code" in obj)
+            assertFalse("隧道来源不回 device_id", "device_id" in obj)
+            assertFalse("隧道来源不回 storage_status", "storage_status" in obj)
+            // 登录页只需要这两项
+            assertEquals("UFI-AXIS-5G", obj["device_name"]?.jsonPrimitive?.content)
+            assertEquals(true, obj["has_default_password"]?.jsonPrimitive?.boolean)
+        }
+    }
+
+    @Test
+    fun `GET info from lan still returns pairing code`() {
+        val routes = buildRoutes()
+        testApplication {
+            application { mount(routes) }
+            val obj = client.get("/pairing/info").json()
+            assertTrue("局域网来源仍需拿到配对码才能完成初始化", "pairing_code" in obj)
+        }
+    }
+
+    @Test
+    fun `POST challenge from tunnel is allowed`() {
+        // 挑战只是随机 nonce，不含秘密；拦了远端就完全无法登录。
+        val routes = buildRoutes(tunnelOrigin = true)
+        testApplication {
+            application { mount(routes) }
+            assertEquals(HttpStatusCode.OK, client.post("/pairing/challenge").status)
+        }
+    }
+
+    @Test
+    fun `POST confirm from tunnel is rejected before password is set`() {
+        val routes = buildRoutes(tunnelOrigin = true)
+        val device = TestDeviceIdentity()
+        testApplication {
+            val code = settings.pairingCode
+            application { mount(routes) }
+            val resp = client.confirm(device, code)
+            assertEquals(HttpStatusCode.Forbidden, resp.status)
+            assertFalse("首次配对被拒后不得留下配对态", settings.paired)
+        }
+    }
+
+    @Test
+    fun `POST confirm from tunnel is allowed once password is set`() {
+        // 已初始化设备走的是"密码登录"分支，远端 Web 必须能登录。
+        val routes = buildRoutes(tunnelOrigin = true, rateLimitMs = 0)
+        val device = TestDeviceIdentity()
+        testApplication {
+            settings.setDevicePassword("secret123")
+            application { mount(routes) }
+            assertEquals(HttpStatusCode.OK, client.confirm(device, "", password = "secret123").status)
+        }
+    }
+
+    @Test
+    fun `POST change-password from tunnel is rejected while password is default`() {
+        val routes = buildRoutes(tunnelOrigin = true)
+        testApplication {
+            application { mount(routes) }
+            val resp = client.post("/pairing/change-password") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"old_password":"admin","new_password":"newpass123"}""")
+            }
+            assertEquals(HttpStatusCode.Forbidden, resp.status)
+        }
+    }
+
+    @Test
+    fun `POST change-password from tunnel is allowed once password is set`() {
+        val routes = buildRoutes(tunnelOrigin = true, rateLimitMs = 0)
+        testApplication {
+            settings.setDevicePassword("oldpass")
+            application { mount(routes) }
+            val resp = client.post("/pairing/change-password") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"old_password":"oldpass","new_password":"newpass123"}""")
+            }
+            assertEquals(HttpStatusCode.OK, resp.status)
+        }
+    }
+
+    @Test
+    fun `POST unpair from tunnel is always rejected`() {
+        val routes = buildRoutes(tunnelOrigin = true)
+        testApplication {
+            settings.setDevicePassword("secret123")
+            settings.confirmPairing(settings.pairingCode, "fp-x")
+            application { mount(routes) }
+            val resp = client.post("/pairing/unpair") {
+                contentType(ContentType.Application.Json)
+                setBody("""{"password":"secret123"}""")
+            }
+            assertEquals(HttpStatusCode.Forbidden, resp.status)
+            assertTrue("隧道来源不得清空配对", settings.paired)
+        }
+    }
+
+    // ────────────────────────────────────────────────
+    // 配对密码（以下用例关闭速率限制以便连续重试）
+    // 被测符号沿用 `devicePassword*`（`devicePasswordConfigured` / `verifyDevicePassword`）：
+    // 那是持久化 key 的一部分，改名会让存量设备读不出已设置的密码，所以只统一注释口径。
     // ────────────────────────────────────────────────
 
     @Test
@@ -571,13 +684,13 @@ class PairingRoutesTest {
         val routes = buildRoutes(rateLimitMs = 0)
         testApplication {
             application { mount(routes) }
-            // 首次 confirm：passwordSet=false → 将 password 落库为设备密码
+            // 首次 confirm：passwordSet=false → 将 password 落库为配对密码
             val code = settings.pairingCode
             assertEquals(
                 HttpStatusCode.OK,
                 client.confirm(TestDeviceIdentity("a"), code, password = "secret123", deviceName = "张三的手机").status
             )
-            assertTrue("首次 confirm 应已配置设备密码", settings.devicePasswordConfigured)
+            assertTrue("首次 confirm 应已配置配对密码", settings.devicePasswordConfigured)
             assertTrue("设置的密码应可验证", settings.verifyDevicePassword("secret123"))
             assertFalse("默认 admin 不应再有效", settings.verifyDevicePassword("admin"))
 

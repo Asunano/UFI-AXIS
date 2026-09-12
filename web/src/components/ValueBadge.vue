@@ -37,7 +37,10 @@ const badgeStyle = computed(() => {
 });
 
 const tintedBg = computed(() => {
-  const c = props.color || '#2080f0';
+  const c = props.color;
+  // 不传 color 时数值取 var(--accent-color)，底色也必须走同一个令牌 ——
+  // 原来这里兜底写死 #2080f0（蓝），主色改绿后就成了「绿字蓝底」
+  if (!c) return 'var(--accent-color-light)';
   // 将 hex 转为淡色背景
   if (c.startsWith('#')) {
     const r = parseInt(c.slice(1, 3), 16);
@@ -82,7 +85,7 @@ const tintedBg = computed(() => {
   font-weight: 700;
 }
 .badge-outline {
-  background: var(--bg-subtle, rgba(127, 127, 127, 0.08));
+  background: var(--surface-elevated);
   border: 1px solid var(--border-subtle);
 }
 .badge-outline .badge-label {

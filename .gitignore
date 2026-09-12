@@ -55,6 +55,12 @@ local.properties
 # ── 签名密钥（严禁入库）─────────────────────────────────────────────────────
 *.jks
 *.keystore
+# 例外：项目级 **调试** 证书必须入库。口令固定为 android、别名 androiddebugkey，
+# 是公开内容，入库无安全风险；不入库则 CI 全新 checkout 时 :app/:core 的
+# validateSigningDebug 直接失败（Keystore file not found for signing config 'debug'），
+# 而 :app / :core 的 debug signingConfig 正指向它（为了让全机 debug 包签名一致、
+# 可互相 adb install -r 覆盖）。真正的 release 私钥在 keystore.properties（仍被忽略）。
+!app/debug.keystore
 keystore.properties
 signing.properties
 # 本地签名 init 脚本（含 keystore 路径/别名配置，勿入库）
@@ -90,8 +96,12 @@ generated-images/
 .workbuddy/
 # AI 助手工作区：评审方案、临时日志/脚本等本地文档，不属于源码（docs/ 已收录项目文档，随仓库提交）
 .comate/
-design/
-deliverables/
+# ⚠ 必须锚定到仓库根（前缀 /）：裸 `design/` 是「任意层级」模式，会连
+#   docs/design/ 与 docs/deliverables/ 一并吞掉 —— 而 README 的仓库结构里
+#   docs/ 明确含 plans/ · design/ · deliverables/ 三类。无锚点时这两类
+#   设计方案与交付记录**永远无法入库**，且 git status 不显示（静默丢弃）。
+/design/
+/deliverables/
 
 # ── 打包 / 抓取产物（仅根目录）───────────────────────────────────────────────
 # web-x.y.z.zip 等发布包由 CI 或 package-web 脚本生成，不入库

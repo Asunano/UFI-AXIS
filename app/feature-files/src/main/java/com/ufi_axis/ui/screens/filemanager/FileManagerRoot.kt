@@ -24,6 +24,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -45,10 +46,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.dp
@@ -94,11 +100,13 @@ import com.ufi_axis.ui.screens.filemanager.dialogs.SearchDialog
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.UfiWeight
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ufiStandardCard
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.ui.animation.blurEntrance
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
@@ -168,31 +176,44 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
     // 一次性 toast 提示（复制/剪切/粘贴/删除等操作的反馈），替代常驻 PasteBanner。
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
 
+    // 预览悬浮窗目标：图片/视频/音频点开时不再 navigate 进独立页，而是把目标文件存这里，
+    // 由 FilePreviewOverlay 在文件管理器之上叠加显示。文本类仍走 navigate 进编辑器。
+    var previewTarget by remember { mutableStateOf<FileItem?>(null) }
+
+    // 视频全屏状态由 FilePreviewOverlay 回传；全屏时后台文件列表的 RenderEffect 模糊归零，
+    // 避免与 SurfaceView 视频解码抢 GPU 带宽导致卡顿/掉帧。
+    var videoFullscreen by remember { mutableStateOf(false) }
+
+    // 预览悬浮窗打开时，把文件管理器主内容做模糊，营造磨砂背景（替代纯黑遮罩）。
+    // minSdk=31，RenderEffect 模糊在 31+ 可用；0.dp 时等于无操作。
+    // 视频全屏时强制关闭模糊，把 GPU 资源全让给视频层。
+    // 打开时平滑模糊（磨砂观感），关闭时立即归零（snap）：关闭路径上若仍走 250ms tween，
+    // 每帧都要重算 RenderEffect，与视频退出动画/解码抢 GPU，是「关闭掉帧」的次因；
+    // 关闭瞬间浮层仍在淡出、背景基本被遮挡，snap 到 0 在视觉上无感。
+    val previewBgBlurred = previewTarget != null && !videoFullscreen
+    val bgBlur by animateDpAsState(
+        targetValue = if (previewBgBlurred) 14.dp else 0.dp,
+        animationSpec = if (previewBgBlurred) tween(UfiMotion.Duration.Fluid) else snap(),
+        label = "fileManagerBgBlur"
+    )
+
     // 列表/网格视图现在以 state.viewMode 为单一数据源（由 FileManagerModule 持有并持久化）。
 
     // T8b — 文件操作分派：行点击直接打开；三点按钮弹出 UfiPopupMenu 操作菜单（见 FileRowCard）。
-    // Extension whitelist dispatch: route files to image/media/text viewers by suffix;
-    // unknown (non-folder) types open the detail dialog instead of the text editor.
+    // 点击分发。判据来自 FileKind 这份唯一真源 —— 与列表图标、菜单文案共用同一张表，
+    // 所以不会再出现「显示了视频图标却点不开」这种矛盾。没有内置预览的类别落到详情弹窗。
     fun resolveOpenRoute(f: FileItem) {
         if (f.isDirectory) {
             viewModel.navigateToDir(f.path)
             return
         }
-        val ext = f.name.substringAfterLast('.', "").lowercase()
-        val imageExts = setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif")
-        val videoExts = setOf("mp4", "mkv", "avi", "mov", "webm", "m4v")
-        val audioExts = setOf("mp3", "wav", "ogg", "m4a", "aac", "flac")
-        val textExts = setOf(
-            "txt", "log", "json", "xml", "html", "htm", "css", "js", "ts", "kt",
-            "java", "kts", "md", "csv", "yml", "yaml", "conf", "ini", "sh", "py",
-            "c", "cpp", "h", "prop", "gradle"
-        )
         val encoded = URLEncoder.encode(f.path, "UTF-8")
-        when {
-            ext in imageExts -> navController.navigate("file/image?path=" + encoded)
-            ext in videoExts -> navController.navigate("file/media?path=" + encoded + "&type=video")
-            ext in audioExts -> navController.navigate("file/media?path=" + encoded + "&type=audio")
-            ext in textExts -> navController.navigate("file/editor?path=" + encoded)
+        when (fileKindOf(f.name)) {
+            // 图片/视频/音频：不再进独立导航页，改为在文件管理器之上叠加预览悬浮窗。
+            FileKind.IMAGE -> previewTarget = f
+            FileKind.VIDEO -> previewTarget = f
+            FileKind.AUDIO -> previewTarget = f
+            FileKind.TEXT -> navController.navigate("file/editor?path=" + encoded)
             else -> { infoTarget = f; showInfo = true }
         }
     }
@@ -228,35 +249,54 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
     UfiScreenScaffold(
         title = "文件管理器",
         navController = navController,
-        showBack = false,
-        navigationIcon = {
-            val exitPalette = LocalResolvedPalette.current
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .heightIn(min = 48.dp)
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = LocalIndication.current
-                    ) { navController.popBackStack() }
-                    .padding(horizontal = 16.dp, vertical = 10.dp)
-            ) {
-                Text(
-                    text = "退出",
-                    color = exitPalette.accent,
-                    style = UfiTextStyles.bodyLead.copy(fontWeight = UfiWeight.Medium)
-                )
-            }
-        }
+        showHeader = false
     ) { padding ->
         UfiPageBackgroundBox(modifier = Modifier.fillMaxSize()) {
             // 嵌套 Box 提供 BoxScope，使底部悬浮条 / 顶部 Toast 的 Modifier.align() 合法。
+            // 预览打开时只对「文件管理器内容」做模糊（bgBlur），作为悬浮窗的磨砂背景；
+            // 浮层（FilePreviewOverlay）是本 Box 的兄弟节点、不在此 blur 作用域内，故保持清晰。
             Box(modifier = Modifier.fillMaxSize()) {
-            Column(
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .blur(bgBlur)
+        ) {
+            // 自绘标题栏（替代 UfiScreenScaffold 内置 UfiHeader，使其与文件列表处于同一模糊层）：
+            // 预览打开时「文件管理器」标题与「退出」随内容一起磨砂，作为悬浮窗背景。
+            Box(
                 modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
+                    .fillMaxWidth()
+                    .padding(top = 4.dp, bottom = 8.dp)
+                    .padding(horizontal = Spacing.HeaderPaddingH)
             ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .heightIn(min = 48.dp)
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = LocalIndication.current
+                        ) { navController.popBackStack() }
+                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                ) {
+                    Text(
+                        text = "退出",
+                        color = palette.accent,
+                        style = UfiTextStyles.bodyLead.copy(fontWeight = UfiWeight.Medium)
+                    )
+                }
+                Text(
+                    text = "文件管理器",
+                    style = UfiTextStyles.headerTitle,
+                    color = palette.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.align(Alignment.Center)
+                )
+            }
+
                 // 地址栏与工具栏分离：BreadcrumbBar 单独一行展示可点击路径，
                 // FileToolbar 只负责核心操作图标，避免多重路径导致布局异常。
                 BreadcrumbBar(
@@ -270,6 +310,12 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                 )
 
                 val canBack = state.currentPath.isNotEmpty() && state.currentPath != state.storageRoot
+                // 系统返回键（手势 / 物理键）：还能向上时返回上一级目录（如 /Android/media → /Android）；
+                // 到根目录才不拦截，交给导航栈 popBackStack 退出文件管理器。
+                // 预览悬浮窗打开时本返回键让位给浮层的关闭逻辑（见下方 BackHandler），避免冲突。
+                BackHandler(enabled = canBack && previewTarget == null) { viewModel.navigateToParent() }
+                // 预览悬浮窗打开时：系统返回键优先关闭浮层。
+                BackHandler(enabled = previewTarget != null) { previewTarget = null }
                 FileToolbar(
                     viewMode = state.viewMode,
                     canBack = canBack,
@@ -363,8 +409,11 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                         // 收益全在首帧 —— 一个装了几百个文件的目录，item 的组合/测量被摊到多帧，
                         // 不再全压在"进目录"那一帧上（那是最容易被感知为卡顿的时刻）。
                         // 语义上没有任何数据丢失：baseList 一直是完整的，只是没全部挂到布局树上。
-                        var renderLimit by remember(state.currentPath, state.searchResults, state.viewMode) {
-                            mutableStateOf(FILE_RENDER_PAGE)
+                        // 分页进度：按路径分槽持久化（rememberSaveable）。打开文本编辑页（独立 NavHost
+                        // 目的地）再返回会让 FileManagerRoot 整体重组，普通 remember 会归零；用 saveable
+                        // 后停留在原位置，不会异常弹回列表顶部。
+                        var renderLimit by rememberSaveable(state.currentPath, state.searchResults, state.viewMode) {
+                            mutableIntStateOf(FILE_RENDER_PAGE)
                         }
                         val displayFiles = baseList.take(renderLimit)
                         val hasMoreToRender = renderLimit < baseList.size
@@ -373,8 +422,37 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                         // 两份都在这里无条件创建（而不是各自放进下面的 if 分支里）：
                         // 放进分支的话切换视图模式会让 remember 槽位随分支一起销毁，
                         // 切回来时滚动位置归零 —— 用户切个视图就被弹回列表顶部。
-                        val fileListState = rememberLazyListState()
-                        val fileGridState = rememberLazyGridState()
+                        // 关键修复：滚动位置用 rememberSaveable 按路径分槽保存，进入文本编辑页返回后
+                        // 重组不再丢失滚动位置（修复「退出编辑页异常跳回列表顶部」）。
+                        val savedListIndex = rememberSaveable(state.currentPath, state.searchResults) { mutableIntStateOf(0) }
+                        val savedListOffset = rememberSaveable(state.currentPath, state.searchResults) { mutableIntStateOf(0) }
+                        val savedGridIndex = rememberSaveable(state.currentPath, state.searchResults) { mutableIntStateOf(0) }
+                        val savedGridOffset = rememberSaveable(state.currentPath, state.searchResults) { mutableIntStateOf(0) }
+                        val fileListState = rememberLazyListState(
+                            initialFirstVisibleItemIndex = savedListIndex.intValue,
+                            initialFirstVisibleItemScrollOffset = savedListOffset.intValue
+                        )
+                        val fileGridState = rememberLazyGridState(
+                            initialFirstVisibleItemIndex = savedGridIndex.intValue,
+                            initialFirstVisibleItemScrollOffset = savedGridOffset.intValue
+                        )
+                        // 实时把滚动位置写回持久化槽，供返回时恢复。
+                        LaunchedEffect(fileListState) {
+                            snapshotFlow {
+                                fileListState.firstVisibleItemIndex to fileListState.firstVisibleItemScrollOffset
+                            }.collect { (i, o) -> savedListIndex.intValue = i; savedListOffset.intValue = o }
+                        }
+                        LaunchedEffect(fileGridState) {
+                            snapshotFlow {
+                                fileGridState.firstVisibleItemIndex to fileGridState.firstVisibleItemScrollOffset
+                            }.collect { (i, o) -> savedGridIndex.intValue = i; savedGridOffset.intValue = o }
+                        }
+
+                        // 进入新文件夹/搜索结果变化后自动回到顶部（路径不变时此处不触发，保留原位置）。
+                        LaunchedEffect(state.currentPath, state.searchResults) {
+                            fileListState.scrollToItem(0)
+                            fileGridState.scrollToItem(0)
+                        }
 
                         // 触发条件：最后一个可见 item 距列表尾部不足 RENDER_LOAD_AHEAD 条。
                         // 用 snapshotFlow 而不是在组合里直接读 layoutInfo：后者每帧滚动都会
@@ -546,10 +624,24 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                     onCancelDownload = { viewModel.cancelDownload() },
                     onResumeDownload = { viewModel.resumeDownload(state.downloadPath, state.downloadFileName) },
                     modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = if (state.multiSelectMode) 84.dp else 16.dp)
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = if (state.multiSelectMode) 84.dp else 16.dp)
                 )
             }
+
+            // 预览悬浮窗：图片/视频/音频直接在文件管理器之上叠加，不进新界面。
+            // 作为嵌套 Box 的最后一个子节点，z 序最高、覆盖全屏（含顶部退出栏与底部浮条）。
+            FilePreviewOverlay(
+                target = previewTarget,
+                onDismiss = {
+                    previewTarget = null
+                    // 关闭预览时强制复位全屏状态：全屏下直接关闭时 FilePreviewOverlay 的
+                    // videoFullscreen 仍停在 true（仅被 AnimatedVisibility 隐藏），不会回调
+                    // onFullscreenChange(false)，否则此处状态卡死导致 bgBlur 恒为 0。
+                    videoFullscreen = false
+                },
+                onFullscreenChange = { videoFullscreen = it }
+            )
 
             }
 
@@ -702,17 +794,8 @@ private fun FileRenderFooter() {
  * Folders open; known image/video/audio/text types map to view/play/edit;
  * anything else falls back to the detail dialog.
  */
-private fun openActionLabel(item: FileItem): String {
-    if (item.isDirectory) return "打开"
-    val ext = item.name.substringAfterLast('.', "").lowercase()
-    return when (ext) {
-        in setOf("jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif") -> "查看图片"
-        in setOf("mp4", "mkv", "avi", "mov", "webm", "m4v") -> "播放视频"
-        in setOf("mp3", "wav", "ogg", "m4a", "aac", "flac") -> "播放音频"
-        in setOf("txt", "log", "json", "xml", "html", "htm", "css", "js", "ts", "kt", "java", "kts", "md", "csv", "yml", "yaml", "conf", "ini", "sh", "py", "c", "cpp", "h", "prop", "gradle") -> "编辑"
-        else -> "详情"
-    }
-}
+private fun openActionLabel(item: FileItem): String =
+    fileKindOf(item.name, item.isDirectory).openActionLabel
 
 // ===== 网格视图项（列表/网格切换） =====
 

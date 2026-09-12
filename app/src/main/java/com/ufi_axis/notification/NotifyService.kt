@@ -112,13 +112,11 @@ class NotifyService : Service() {
 
         override fun reloadConfig() {
             guardScheduler.refresh()
-            val current = guardScheduler.state.value
-            if (current.enabled) {
-                // 幂等重调度（UPDATE）：进程重启 / 外部 prefs 写入后恢复周期任务
-                guardScheduler.setInterval(current.intervalMinutes)
-            } else {
-                guardScheduler.cancel()
-            }
+            // 幂等重排：条件是「guard_enabled AND master_enabled」，两者都读本进程的 mirror_ 副本
+            //（主进程改完会经 dispatchSwitchSnapshot 推快照过来）。
+            // 原来这里写的是 `if (state.enabled) setInterval else cancel` —— 那个分支只看守护自己的
+            // 开关，总闸关着时会把已被取消的周期任务又排回来。
+            GuardScheduler.syncSchedule(this@NotifyService)
         }
     }
 
@@ -228,6 +226,30 @@ class NotifyService : Service() {
                                 }
                                 // 让前台 UI（若存活）刷新短信列表
                                 sendAlertBroadcast()
+                                return@collect
+                            }
+                            // 下载终态 / 隧道看护放弃：同样不走告警管线。
+                            // 边沿判定（"这次才刚变成完成/失败"、"重连到达上限才放弃"）以及
+                            // 隧道的 `tunnel_notify_on_failure` 闸门全在 core，推送到达即代表该提醒；
+                            // app 只把 core 给的 title/message 渲染成系统通知，不再自己比状态。
+                            if (pushType == "download" || pushType == "tunnel") {
+                                val extra = dataObj?.get("extra") as? JsonObject
+                                val title = dataObj?.get("title")?.jsonPrimitive?.content ?: ""
+                                val body = dataObj?.get("message")?.jsonPrimitive?.content ?: ""
+                                if (pushType == "download") {
+                                    notificationCenter.notifyDownloadResult(
+                                        title = title.ifBlank { "下载任务" },
+                                        message = body,
+                                        isError = extra?.get("status")?.jsonPrimitive?.content == "error"
+                                    )
+                                } else {
+                                    notificationCenter.notifyTunnelFailure(
+                                        kind = extra?.get("kind")?.jsonPrimitive?.content ?: "",
+                                        name = extra?.get("name")?.jsonPrimitive?.content ?: "",
+                                        title = title.ifBlank { "隧道异常" },
+                                        message = body
+                                    )
+                                }
                                 return@collect
                             }
                             if (dataObj != null && dataObj.containsKey("message")) {

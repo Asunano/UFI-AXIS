@@ -21,6 +21,10 @@ import java.util.Locale
  *                                               net.log       网络日志（tag 前缀 NET）
  *                                               error.log     WARN/ERROR
  * ```
+ * 路径与回退目录都来自 [UfiLogPaths]（app 侧唯一一处路径约定）。本对象只管**运行时日志**：
+ * 同一个 `log/app/` 下还有 `crash/` 与 `api-error/` 两个子目录，它们由 `CrashHandler` /
+ * [ApiErrorLogger] 各自维护，所以下面所有列举/清理都只认 `yyyy-MM-dd` 形态的日期目录 ——
+ * 别让运行日志的保留天数和体积预算把崩溃证据一起删了。
  * 超过 [MAX_FILE_BYTES] 轮转成 `*.log.1`（只留一代），整个 app 日志根目录不超过
  * [MAX_DIR_BYTES]，并且只保留最近 [KEEP_DAYS] 天 —— 这三道闸门是为了避免重演
  * core 那次「几天涨到 500MB」。
@@ -36,9 +40,6 @@ object AppFileLogger {
 
     private const val TAG = "AppFileLogger"
 
-    /** 用户可直接查看的 app 日志根目录。 */
-    private val USER_LOG_ROOT = File("/sdcard/Download/UFI-AXIS/log/app")
-
     private const val MAX_FILE_BYTES = 5L * 1024 * 1024
     private const val MAX_DIR_BYTES = 40L * 1024 * 1024
     private const val KEEP_DAYS = 7
@@ -49,7 +50,7 @@ object AppFileLogger {
     private val lock = Any()
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
 
-    /** 日志根目录；外部存储不可写时回退到 `filesDir/logs`（保证极端情况下也有地方写）。 */
+    /** 日志根目录；外部存储不可写时由 [UfiLogPaths] 回退到 `filesDir/logs/app`。 */
     @Volatile
     private var root: File? = null
 
@@ -62,19 +63,18 @@ object AppFileLogger {
     /** 在 `UfiAxisApplication.onCreate()` 调用一次；未初始化时 [append] 直接跳过。 */
     fun init(context: Context) {
         synchronized(lock) {
-            root = if (USER_LOG_ROOT.exists() || USER_LOG_ROOT.mkdirs()) {
-                USER_LOG_ROOT
-            } else {
-                Log.w(TAG, "external log dir unavailable, fallback to private dir")
-                File(context.filesDir, "logs").also { it.mkdirs() }
-            }
+            root = UfiLogPaths.appLogDir(context)
+            if (root == null) Log.w(TAG, "log dir unavailable, file logging disabled")
             lastWriteDate = dateFormat.format(Date())
             cleanOldLogs()
         }
     }
 
     /** 当前日志目录绝对路径，UI 上直接显示给用户去文件管理器找。 */
-    fun dirPath(): String = root?.absolutePath ?: USER_LOG_ROOT.absolutePath
+    fun dirPath(): String = root?.absolutePath
+        ?: UfiLogPaths.externalDir(UfiLogPaths.appLogRelative())?.absolutePath
+        ?: UfiLogPaths.appLogRelative()
+
 
     /**
      * 落盘一条日志。由 [AppLogBuffer.add] 调用。
@@ -132,14 +132,15 @@ object AppFileLogger {
         }
     }
 
-    /** 所有 app 日志文件（展平日期子目录）。 */
+    /** 所有 app **运行时**日志文件（展平日期子目录；`crash/`、`api-error/` 不在此列）。 */
     private fun allFiles(): List<File> {
         val base = root ?: return emptyList()
         return base.listFiles()
-            ?.filter { it.isDirectory }
+            ?.filter { it.isDirectory && UfiLogPaths.isDateDirName(it.name) }
             ?.flatMap { day -> day.listFiles()?.filter { it.isFile }?.toList() ?: emptyList() }
             ?: emptyList()
     }
+
 
     private fun relativeName(f: File): String = "${f.parentFile?.name}/${f.name}"
 
@@ -182,7 +183,10 @@ object AppFileLogger {
                 if (it.delete()) freed += size
             }
             root?.listFiles()
-                ?.filter { it.isDirectory && it.listFiles().isNullOrEmpty() }
+                ?.filter {
+                    it.isDirectory && UfiLogPaths.isDateDirName(it.name) &&
+                        it.listFiles().isNullOrEmpty()
+                }
                 ?.forEach { it.delete() }
             return freed
         }
@@ -193,8 +197,10 @@ object AppFileLogger {
         val base = root ?: return
         val cutoff = System.currentTimeMillis() - KEEP_DAYS * 24L * 60 * 60 * 1000
         base.listFiles()?.forEach { day ->
-            if (!day.isDirectory) return@forEach
+            // 只清日期目录：同级的 crash/ 与 api-error/ 各有各的保留策略，不归这里管
+            if (!day.isDirectory || !UfiLogPaths.isDateDirName(day.name)) return@forEach
             val date = runCatching { dateFormat.parse(day.name) }.getOrNull() ?: return@forEach
+
             if (date.time < cutoff) {
                 day.listFiles()?.forEach { it.delete() }
                 day.delete()

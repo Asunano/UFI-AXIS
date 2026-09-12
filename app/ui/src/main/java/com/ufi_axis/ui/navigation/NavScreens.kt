@@ -82,6 +82,19 @@ object Routes {
     const val DETAIL_SPEED_TEST = "detail/speed-test"
     const val DETAIL_TRAFFIC_MGMT = "detail/traffic-management"
     const val DETAIL_SMS = "detail/sms"
+    /** 短信设置页（2026-09-08 由短信页顶栏齿轮的弹窗改造成独立页面）。 */
+    const val DETAIL_SMS_SETTINGS = "detail/sms-settings"
+    /**
+     * 拦截规则页（号码黑名单与关键词的增删改查）。
+     *
+     * 2026-09-08：原先与拦截记录合成一个 `detail/sms-filter?tab={tab}` 双 Tab 页，
+     * 现已拆成两条无参路由 —— 那两块内容各有各的顶栏动作、角标与列表状态，
+     * 合在一页里读代码和用界面都要先问"我现在在哪一半"。
+     */
+    const val DETAIL_SMS_FILTER_RULES = "detail/sms-filter-rules"
+    /** 已拦截页（core 记下的拦截结果，只读 + 自查动作）。拆分理由同 [DETAIL_SMS_FILTER_RULES]。 */
+    const val DETAIL_SMS_BLOCKED = "detail/sms-blocked"
+
     const val DETAIL_APPS = "detail/apps"
     const val DETAIL_TASKS = "detail/tasks"
     /**
@@ -90,17 +103,62 @@ object Routes {
      */
     const val DETAIL_EMAIL_NOTIFY = "detail/email-notify"
     const val DETAIL_DAILY_NOTIFY = "detail/daily-notify"
+
+    /**
+     * 推送渠道总览（2026-09-09）：设备把通知投到哪里去，一页列全。
+     *
+     * 为什么要有这一页而不是把 Webhook 直接挂进「通知与守护」：
+     * 那一页管的是「要不要提醒你」（总闸 / 分类 / 免打扰 / 守护），渠道管的是「往哪儿送」，
+     * 两件事。而且渠道会继续加（邮件 → Webhook → 本机短信 → …），每加一个就往那页塞一张卡的话，
+     * 那页会变成配置大杂烩。
+     *
+     * 本页只列**可配置**的渠道（邮件 / Webhook / 本机短信）。WS 实时推送不在这里 ——
+     * 它随 core 常开、没有任何可配项，摆一行只读说明只会让用户以为自己漏设了什么。
+     */
+    const val DETAIL_PUSH_CHANNELS = "detail/push-channels"
+
+    /** 通用 Webhook 渠道配置（`/api/notify/webhook/…`）。入口在 [DETAIL_PUSH_CHANNELS]。 */
+    const val DETAIL_WEBHOOK_NOTIFY = "detail/webhook-notify"
+
+    /**
+     * 本机短信回发渠道配置（`/api/notify/sms/…`）。入口在 [DETAIL_PUSH_CHANNELS]。
+     *
+     * 唯一走**信令网**的渠道：邮件与 Webhook 都靠数据网，而"数据断了 / 套餐用尽 / 自动关网"
+     * 恰恰是它们发不出去的时候。代价是**按条计费**，所以那一页的每个开关都带费用提示。
+     */
+    const val DETAIL_LOCAL_SMS_NOTIFY = "detail/local-sms-notify"
+
+    /**
+     * 通知管理（2026-09-08）：通知类开关 + 告警类设置 + 系统通知记录，全部收在这一页。
+     *
+     * 拆页的直接原因：上一版把「全局通知」（客户端投递总闸）与「告警总开关」
+     * （设备端告警引擎）摆在同一屏，两个都长得像总开关，分不清谁管谁。
+     * 现在「通知与守护」只剩 Hero（全局通知总闸）+ 三个入口：本页 / 邮件通知 / 后台守护。
+     */
+    const val DETAIL_NOTIFY_MANAGE = "detail/notify-manage"
+
+    /** 系统通知记录（本机 Room）：每条状态栏通知的结果，含被拦下的原因。入口在通知管理页。 */
+    const val DETAIL_NOTIFY_HISTORY = "detail/notify-history"
+
+    /**
+     * 投递记录（设备端 `mail_send_records`）：三条渠道共用同一个页面，`channel` 决定看哪一份。
+     *
+     * 用一条带参路由而不是给三条渠道各复制一个 composable：列表形态、筛选、翻页完全一样，
+     * 复制三份的唯一产物是三处会各自跑偏的文案。入口在各渠道自己的配置页里。
+     */
+    const val DETAIL_DELIVERY_HISTORY = "detail/delivery-history?channel={channel}"
+
     const val DETAIL_FILES = "detail/files"
     const val DETAIL_DEBUG_LOG = "detail/debug-log"
     const val DETAIL_DIAGNOSE = "detail/diagnose"
     const val DETAIL_MONITOR = "detail/monitor"
     const val DETAIL_MONITOR_SETTINGS = "detail/monitor-settings"
-    // 监控设置的 5 个分组：2026-09-03 从"同一页内的局部状态"改成独立页面，
+    // 监控设置的分组：2026-09-03 从"同一页内的局部状态"改成独立页面，
     // 与「设置 → 服务器 → 服务器配置」同构（每一级都是路由，转场/返回/系统返回键全部由导航接管）
+    // 2026-09-08 删掉两条：metrics（8 个指标开关并入 collection 的弹窗）、
+    // behavior（唯一的导出 ZIP 开关并入 storage）。
     const val DETAIL_MONITOR_COLLECTION = "detail/monitor-settings/collection"
-    const val DETAIL_MONITOR_METRICS = "detail/monitor-settings/metrics"
     const val DETAIL_MONITOR_CHART = "detail/monitor-settings/chart"
-    const val DETAIL_MONITOR_BEHAVIOR = "detail/monitor-settings/behavior"
     // 采集调度：core 侧 DataScheduler / 告警扫描 / 温控的调参入口（保留天数、各类间隔、温控档位）
     const val DETAIL_MONITOR_SCHEDULER = "detail/monitor-settings/scheduler"
     const val DETAIL_MONITOR_STORAGE = "detail/monitor-settings/storage"
@@ -128,6 +186,8 @@ object Routes {
     const val DETAIL_ABOUT = "detail/about"
     const val DETAIL_ALERT_SETTINGS = "detail/alert-settings"
     const val DETAIL_BACKGROUND_GUARD = "detail/background-guard"
+    /** 配置备份与恢复（2026-09-11）：core + 本机偏好合体的 `.ufibak` 包导出 / 导入。 */
+    const val DETAIL_BACKUP_RESTORE = "detail/backup-restore"
     const val DETAIL_TUNNEL = "detail/tunnel"
     // FIX-9（2026-08-23）：内网穿透拆 3 屏：主页（入口列表）+ FRP 详情 + CF Tunnel 详情 + 通用设置
     const val DETAIL_TUNNEL_FRP = "detail/tunnel/frp"
@@ -146,9 +206,19 @@ object Routes {
     fun tunnelFrpChannel(name: String): String =
         "detail/tunnel/frp/channel?name=" + android.net.Uri.encode(name)
 
-    /** 构造 CF 单隧道管理页路由（隧道名可能含中文/空格，编解码规则同上） */
+    /** 构造 CF 单隧道管理页路由（隧道名含中文/空格，编解码规则同上） */
     fun tunnelCfTunnel(name: String): String =
         "detail/tunnel/cf/tunnel?name=" + android.net.Uri.encode(name)
+
+    /**
+     * 构造投递记录页路由。
+     *
+     * 渠道 id 是 core 定义的 ASCII 常量（`mail` / `webhook` / `local_sms`），不需要 URL 编码；
+     * 留这个构造函数是为了让三个入口拼路由的方式只有一种写法。
+     */
+    fun deliveryHistory(channel: String): String = "detail/delivery-history?channel=$channel"
+
+
 
     // 设置页 9 入口精简为 4：新增的两个合并二级页
     const val DETAIL_SERVER = "detail/server"
@@ -187,10 +257,28 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_SPEED_TEST, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TRAFFIC_MGMT, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_SMS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_SMS_SETTINGS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_SMS_FILTER_RULES, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_SMS_BLOCKED, TransitionType.DETAIL),
+
     AppRoute(Routes.DETAIL_APPS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TASKS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_EMAIL_NOTIFY, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_PUSH_CHANNELS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_WEBHOOK_NOTIFY, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_LOCAL_SMS_NOTIFY, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DAILY_NOTIFY, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_NOTIFY_MANAGE, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_NOTIFY_HISTORY, TransitionType.DETAIL),
+    // 投递记录：channel 缺省成邮件 —— 老的深链接（不带参数）仍能落到一个有意义的页面，
+    // 而不是标题空白、列表混着三条渠道。
+    AppRoute(
+        route = Routes.DETAIL_DELIVERY_HISTORY,
+        transition = TransitionType.DETAIL,
+        arguments = listOf(
+            navArgument("channel") { type = NavType.StringType; defaultValue = "mail" }
+        )
+    ),
     AppRoute(Routes.DETAIL_FILES, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DEBUG_LOG, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DIAGNOSE, TransitionType.DETAIL),
@@ -215,6 +303,7 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_ABOUT, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_ALERT_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_BACKGROUND_GUARD, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BACKUP_RESTORE, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TUNNEL, TransitionType.DETAIL),
     // FIX-9：内网穿透三拆路由
     AppRoute(Routes.DETAIL_TUNNEL_FRP, TransitionType.DETAIL),
@@ -276,9 +365,7 @@ val appRoutes: List<AppRoute> = listOf(
     ),
     AppRoute(Routes.DETAIL_MONITOR_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_COLLECTION, TransitionType.DETAIL),
-    AppRoute(Routes.DETAIL_MONITOR_METRICS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_CHART, TransitionType.DETAIL),
-    AppRoute(Routes.DETAIL_MONITOR_BEHAVIOR, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_SCHEDULER, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_STORAGE, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_EVENTS, TransitionType.DETAIL)

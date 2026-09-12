@@ -107,6 +107,17 @@ class UfiAxisCoreApplication : Application() {
                 // 1) 记录到日志
                 AppLogger.e("CrashHandler", crashLog)
                 // 2) 持久化到文件（AppLogger 崩溃时可能来不及 flush，确保落盘）
+                //
+                // ── 两份 dump 的分工（刻意冗余，不是重复）──
+                // 这一份在**私有目录**：不需要外部存储权限、存储没挂载也能写，是崩溃留证的底线；
+                // 每次崩溃一个独立文件（`crash_<ms>.txt`，[MAX_CRASH_FILES] 份轮换），
+                // 所以崩溃重启循环的每一轮都能分别取回；它的绝对路径还会被
+                // [AppSettings.recordCrash] 记下，供 `GET /api/service/crash` 回读（见下方 4）。
+                // 代价是这台设备没有 root，用户拿文件管理器进不去 —— 只能经 API 取。
+                // 下面第 3 步那一份在 Download 下：用户能直接翻，但它是 append 到单个
+                // `crash.log`（[DownloadLog] 1MB 上限、超限只保尾部 200KB），
+                // 连续崩溃会把最早那几次挤掉，且依赖外部存储可用。
+                // 两者的失效场景与取回方式都不重叠，缺任一份都会丢掉一类崩溃现场。
                 val crashFile = File(dataDir, "logs/crash_${System.currentTimeMillis()}.txt")
                 crashFile.parentFile?.mkdirs()
                 try { crashFile.writeText(safeCrashLog) } catch (_: Exception) {}

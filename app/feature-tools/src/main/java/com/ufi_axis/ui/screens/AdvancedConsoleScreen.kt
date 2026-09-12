@@ -73,6 +73,7 @@ import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.text.input.ImeAction
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 高级控制台 — 聊天记录式 AT 指令 + Shell 命令工具。

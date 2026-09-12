@@ -51,7 +51,7 @@ class AlertRoutes(
                     call.respondFail(
                         HttpStatusCode.Conflict,
                         ErrorCode.CONFIG_VERSION_CONFLICT,
-                        "配置版本过期，请重新拉取最新配置后再保存",
+                        "配置已被其他端修改，请刷新后重新保存",
                         mapOf(
                             "error" to ErrorCode.CONFIG_VERSION_CONFLICT,
                             "currentVersion" to current.configVersion,

@@ -94,8 +94,13 @@ fun UfiInputDialog(
     visible: Boolean = true,
     icon: Painter? = null
 ) {
-    var text by remember { mutableStateOf(initialValue) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // 2026-09-12 修复：重命名弹窗每次打开需预填当前名称。原 `remember` 无 key，仅在首次
+    // 组合时用初始值播种一次，之后永久复用旧文本——若首次打开时 renameTarget 尚未就绪、
+    // initialValue 为空串，输入框就永远空白（用户反馈「重命名时不显示原名称」即此）。
+    // 改为以 initialValue 为 key 重新播种：initialValue 变化（每次打开不同文件）即重置为正确初值；
+    // 校验错误也随对话框重置，避免上一次的报错残留。
+    var text by remember(initialValue) { mutableStateOf(initialValue) }
+    var error by remember(initialValue) { mutableStateOf<String?>(null) }
     val palette = LocalResolvedPalette.current
 
     UfiDialogShell(

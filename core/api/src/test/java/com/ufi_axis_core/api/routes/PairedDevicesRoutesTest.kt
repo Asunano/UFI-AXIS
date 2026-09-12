@@ -135,16 +135,18 @@ class PairedDevicesRoutesTest {
     }
 
     @Test
-    fun `GET devices with token but no signature is rejected (444)`() {
+    fun `GET devices with token but no signature is rejected (401)`() {
+        // 2026-09-08：签名类失败改回 401（可重试），444 只留给真正的吊销 —— 见 AuthMiddleware。
         val device = pairDevice("Device One")
         testApplication {
             application { registerApi() }
             val resp = client.get("/api/pairing/devices") {
                 header(HttpHeaders.Authorization, "Bearer ${device.token}")
             }
-            assertEquals(444, resp.status.value)
+            assertEquals(401, resp.status.value)
         }
     }
+
 
     @Test
     fun `GET devices returns paired records with signed request`() {

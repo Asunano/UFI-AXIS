@@ -159,19 +159,24 @@ fun UfiDialogPasswordField(
  * Chip 选择器字段（二选一 / 多选一）。
  *
  * options: List<Pair<valueKey, displayLabel>>，如 listOf("chip1" to "2.4 GHz", "chip2" to "5 GHz")
+ *
+ * @param wrap 2026-09-08 新增（默认 false，行为不变）：选项多到一行放不下时折行。
+ *             弹窗宽度比设置行更窄，5 个以上的 chip 基本都要折 —— 如存储管理的「清理范围」。
  */
 @Composable
 fun UfiDialogChipSelector(
     label: String,
     options: List<Pair<String, String>>,
     selectedValue: String,
-    onSelect: (String) -> Unit
+    onSelect: (String) -> Unit,
+    wrap: Boolean = false
 ) {
     UfiDialogField(label) {
         UfiSingleChipSelector(
             options = options,
             selectedValue = selectedValue,
-            onSelect = onSelect
+            onSelect = onSelect,
+            wrap = wrap
         )
     }
 }
@@ -258,7 +263,7 @@ fun UfiDialogSwitchField(
             color = palette.textPrimary
         )
         // 2026-08-31：M3 Switch（52×32dp）→ 自绘 UfiSwitch（42×24dp），
-        // 全站开关统一到一种几何，见 docs/UFI-AXIS-UI-Common-Layer.md §3.7
+        // 全站开关统一到一种几何。
         UfiSwitch(
             checked = checked,
             onCheckedChange = onCheckedChange,
@@ -294,6 +299,26 @@ fun UfiDialogInfoRow(label: String, value: String, multiline: Boolean = false) {
             modifier = if (multiline) Modifier.weight(1f, fill = false) else Modifier
         )
     }
+}
+
+/**
+ * 弹窗内的说明文字（次要色小字）。
+ *
+ * 2026-09-11 新增。此前每个弹窗都在 content 里手写
+ * `Text(..., style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)`，
+ * 同一句"说明"在不同弹窗里字号/颜色靠各自抄一遍维持一致 —— 抄漏一处就看得出来。
+ * 与 [UfiDialogWarning] 是同一族的两档：本组件是**中性说明**（次要色小字、无底），
+ * [UfiDialogWarning] 是**风险提示**（警告色 + 淡底）。别用后者说普通的话，
+ * 满屏橙块会让真正的风险提示失去重量。
+ */
+@Composable
+fun UfiDialogNote(text: String) {
+    val palette = LocalResolvedPalette.current
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = palette.textSecondary
+    )
 }
 
 /**

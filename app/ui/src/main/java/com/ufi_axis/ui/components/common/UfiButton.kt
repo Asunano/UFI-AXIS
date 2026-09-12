@@ -59,6 +59,7 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 按钮视觉角色。**用 enum 而不是 `filled`/`danger` 之类 boolean 组合** ——
@@ -178,7 +179,11 @@ fun UfiButton(
         if (loading) {
             UfiLoadingIndicator(
                 modifier = Modifier.size(Spacing.ButtonLoadingIndicatorSize),
-                strokeWidth = LOADING_STROKE_WIDTH
+                strokeWidth = LOADING_STROKE_WIDTH,
+                // 与紧邻的按钮文字同色：文字吃的是 M3 提供的 contentColor（Primary=onAccent、
+                // Secondary=accent、Danger=onError），转圈若用默认 accent，在 accent 实底上
+                // 就是同色压同色，且与文字不同色。
+                color = LocalContentColor.current
             )
             Spacer(Modifier.width(Spacing.Small))
         } else if (icon != null) {

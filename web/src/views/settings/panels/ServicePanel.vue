@@ -253,41 +253,15 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-/* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
+/* .settings-panel 栅格与断点、.config-grid/.config-item/.config-label/.switch-item 版式、
+   .section-subtitle、.card-actions 均已统一到 src/styles/main.css（全局各一份） */
 
-/* ── Config layout ── */
-.section-subtitle {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-bottom: 8px;
-  font-weight: 500;
-}
-.config-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-}
-.config-item {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.config-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.switch-item {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-}
+/* 只在本面板使用：「日志保留天数」输入框与单位文字并排 */
 .inline-group {
   display: flex;
   gap: 8px;
   align-items: center;
 }
-
-/* .card-actions 已统一到 src/styles/main.css（全局一份，四个面板共用） */
 
 /* ── 与「调试日志」卡共用的头部操作区（LogsPanel 里各留一份）── */
 .log-header-actions {
@@ -300,12 +274,5 @@ onUnmounted(() => {
 .text-muted {
   color: var(--text-muted);
   font-size: 13px;
-}
-
-/* ── Responsive ── */
-@media (max-width: 768px) {
-  .config-grid {
-    grid-template-columns: 1fr;
-  }
 }
 </style>

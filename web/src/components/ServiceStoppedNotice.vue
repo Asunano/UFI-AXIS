@@ -15,8 +15,7 @@
             本页依赖实时数据，因此暂不可用。
           </p>
           <p class="hint">
-            重新开启后一切自动恢复：被暂停的下载会断点续传，定时任务重新排期。
-            设置页在服务停止时始终可用。
+            重新开启后一切自动恢复：被暂停的下载会断点续传，定时任务重新排期。 设置页在服务停止时始终可用。
           </p>
           <p v-if="serviceStore.errorMessage" class="err">{{ serviceStore.errorMessage }}</p>
         </div>
@@ -73,6 +72,6 @@ function goSettings() {
 .desc .err {
   margin-top: 8px;
   font-size: 12px;
-  color: var(--error-color, #d03050);
+  color: var(--error);
 }
 </style>

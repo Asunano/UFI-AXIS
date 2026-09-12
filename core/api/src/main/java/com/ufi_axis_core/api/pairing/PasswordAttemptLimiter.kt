@@ -5,7 +5,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 设备密码错误尝试限制（内存态，进程重启清零）。
+ * 配对密码错误尝试限制（内存态，进程重启清零）。
+ * （被校验的密码在存储层叫 `devicePassword*`：那是持久化 key 的一部分，改名会让存量配置读不出来。）
  *
  * 两层防护，都**只统计失败**，从不限制正常请求频率：
  *

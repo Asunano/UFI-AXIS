@@ -1,30 +1,30 @@
 {
   "frontend": {
-    "version": "0.0.1",
-    "versionCode": 1,
-    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.0.1/UFI-AXIS-app-0.0.1.apk",
-    "apkSha256": "1370263feb9a14840f23e0466b54c2cd5b3f11a414a6debedd61fa49c155b766",
-    "changelog": "",
-    "apkSize": 6803954,
-    "publishedAt": "2026-09-07T11:24:04Z",
-    "tagName": "v0.0.1"
-  },
-  "backend": {
-    "version": "0.0.1",
-    "versionCode": 1,
-    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.0.1/UFI-AXIS-core-0.0.1.apk",
-    "apkSha256": "3e0dc76de0478ce15ddf8a356819601db17c71ae1e99a83bcb9d0b8cf7ff22fd",
-    "changelog": "",
-    "apkSize": 15332604,
-    "publishedAt": "2026-09-07T11:24:04Z",
-    "tagName": "v0.0.1"
-  },
-  "web": {
-    "version": "0.0.1",
-    "versionCode": 1,
+    "version": "0.0.2",
+    "versionCode": 2,
     "apkUrl": "",
     "apkSha256": "",
-    "changelog": ""
+    "changelog": "新增通知渠道体系：Webhook、本地短信、推送渠道可分别配置与测试发送，投递记录以「已发出 / 没发出 / 已跳过」三态留档（跳过带中文原因），失败数与跳过数分开统计。\n新增通知管理、系统通知历史、短信过滤规则与拦截记录页面。\n新增备份与恢复：设备配置可加密导出为文件，支持先预览变更再导入。\n新增控制台历史命令记录，终端页可回看与复用。\n文本类文件支持查找替换与工具栏编辑。\n新增后端健康探测：服务不可达时主动弹窗，提供「重试」与「服务器设置」两个入口。\n优化监控总览按告警类型聚合；图表时间轴格式随所选范围变化，不再出现「选了 7 天仍只显示时:分」。",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
+  },
+  "backend": {
+    "version": "0.0.2",
+    "versionCode": 2,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "新增 /api/notify/webhook 与 /api/notify/sms：渠道配置读写、预设切换与测试发送。\n新增 /api/backup/export、/preview、/import：设备配置加密备份与恢复（口令经请求头传递，不进 URL）。\n新增 /api/console/history：控制台命令历史记录与导入。\n新增短信过滤规则、拦截记录与本地短信发送接口。\n通知配置同步与守护调度收口；日志路径统一。",
+    "apkSize": 0,
+    "publishedAt": "",
+    "tagName": ""
+  },
+  "web": {
+    "version": "0.0.2",
+    "versionCode": 2,
+    "apkUrl": "",
+    "apkSha256": "",
+    "changelog": "新增通知渠道配置（Webhook / 本地短信）与投递记录查看。\n新增备份与恢复面板。\n测速弹窗重构；文件预览与文本编辑器增强；终端页支持命令历史。\n设置页栅格改为固定两列；更新页与配对页改为通栏布局，消除宽屏下的卡片参差与空洞。\n修复折线图动效与笔尖对齐。"
   },
   "components": {
     "frpc": {

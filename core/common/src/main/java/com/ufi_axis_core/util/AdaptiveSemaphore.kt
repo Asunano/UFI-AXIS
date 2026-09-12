@@ -1,8 +1,6 @@
 package com.ufi_axis_core.util
 
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -26,18 +24,32 @@ class AdaptiveSemaphore(
     private val minPermits: Int = 1,
     private val maxPermits: Int = 10
 ) {
-    init {
-        require(initialPermits in minPermits..maxPermits) {
-            "initialPermits($initialPermits) must be within [minPermits=$minPermits, maxPermits=$maxPermits]"
-        }
-    }
-
     // 容量取 maxPermits，保证扩容双 release 不会越界
     private val semaphore = Semaphore(maxPermits)
     private val _currentPermits = AtomicInteger(initialPermits)
     @Volatile private var targetPermits = initialPermits
-    private val initMutex = Mutex()
-    @Volatile private var drained = false
+
+    init {
+        require(initialPermits in minPermits..maxPermits) {
+            "initialPermits($initialPermits) must be within [minPermits=$minPermits, maxPermits=$maxPermits]"
+        }
+        // 排空必须在构造期同步完成。
+        //
+        // 早期实现把排空放在首次 acquire 前的挂起路径里（ensureInitialized + repeat { acquire() }），
+        // 而 `Semaphore.acquire()` 是**可取消**挂起点：首个调用者在 repeat 中途被取消（路由超时、
+        // scheduler 停循环）时，已经吃掉的许可不会归还，而"已排空"标志仍是 false，
+        // 于是下一个调用者进来又排空一整轮。反复几次可用许可归零，ShellQoS / GoformQoS
+        // 的所有消费方全部无限期阻塞且不抛任何异常（表现为 core 长时间失联、必须重启服务）。
+        //
+        // 构造期底层许可全部空闲，tryAcquire() 必定成功，既不挂起也不可能被取消。
+        val toDrain = maxPermits - initialPermits
+        repeat(toDrain) { i ->
+            check(semaphore.tryAcquire()) {
+                "AdaptiveSemaphore drain failed at $i/$toDrain (capacity=$maxPermits)"
+            }
+        }
+        AppLogger.d("AdaptiveSemaphore", "Initialized: total=$initialPermits, capacity=$maxPermits, drained=$toDrain")
+    }
 
     val availablePermits: Int get() = semaphore.availablePermits
     val totalPermits: Int get() = _currentPermits.get()
@@ -52,28 +64,11 @@ class AdaptiveSemaphore(
         }
     }
 
-    private suspend fun ensureInitialized() {
-        if (drained) return
-        initMutex.withLock {
-            if (!drained) {
-                // 底层容量是 maxPermits，初始可用需降到 initialPermits
-                val toDrain = maxPermits - initialPermits
-                if (toDrain > 0) {
-                    repeat(toDrain) { semaphore.acquire() }
-                }
-                drained = true
-                AppLogger.d("AdaptiveSemaphore", "Initialized: total=$initialPermits, capacity=$maxPermits, drained=$toDrain")
-            }
-        }
-    }
-
     suspend fun acquire() {
-        ensureInitialized()
         semaphore.acquire()
     }
 
-    suspend fun tryAcquire(): Boolean {
-        ensureInitialized()
+    fun tryAcquire(): Boolean {
         return semaphore.tryAcquire()
     }
 

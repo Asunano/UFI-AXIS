@@ -161,7 +161,7 @@ onUnmounted(() => {
   overflow-y: auto;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: var(--bg-subtle, #fafafa);
+  background: var(--surface-elevated);
 }
 .log-entry {
   display: flex;
@@ -177,7 +177,7 @@ onUnmounted(() => {
   border-bottom: none;
 }
 .log-entry:hover {
-  background: var(--bg-hover, rgba(0, 0, 0, 0.03));
+  background: var(--surface-hover);
 }
 .log-level {
   flex-shrink: 0;
@@ -190,20 +190,23 @@ onUnmounted(() => {
   line-height: 1.7;
 }
 .level-info {
-  color: #2080f0;
-  background: rgba(32, 128, 240, 0.1);
+  color: var(--accent-color);
+  background: var(--accent-color-light);
 }
+/* debug 这档刻意保留写死值：它是这组语义色里唯一的「中性」成员，
+   `--cat-neutral-*` 是不透明色块（浅色 #f5f5f5）、`--surface-hover` 又太淡，
+   都会让这一档明显变样。等真要收时得先补一个 `--neutral-light` 档。 */
 .level-debug {
   color: #606060;
   background: rgba(96, 96, 96, 0.1);
 }
 .level-warn {
-  color: #f0a020;
-  background: rgba(240, 160, 32, 0.1);
+  color: var(--warning);
+  background: var(--warning-light);
 }
 .level-error {
-  color: #d03050;
-  background: rgba(208, 48, 80, 0.1);
+  color: var(--error);
+  background: var(--error-light);
 }
 .log-tag {
   flex-shrink: 0;

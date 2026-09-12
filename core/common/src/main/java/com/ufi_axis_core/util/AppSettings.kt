@@ -67,6 +67,11 @@ class AppSettings(context: Context) {
         // ── SMS 验证码解析 ──
         private const val KEY_SMS_CODE_ENABLED = "sms_code_enabled"
         private const val KEY_SMS_CODE_CLEANUP_HOURS = "sms_code_cleanup_hours"
+        private const val KEY_SMS_CODE_AUTO_COPY = "sms_code_auto_copy"
+
+        // ── SMS 拦截（黑名单 + 关键词）──
+        private const val KEY_SMS_FILTER_EXEMPT_VC = "sms_filter_exempt_verification_code"
+        private const val KEY_SMS_FILTER_STORE_FULL_BODY = "sms_filter_store_full_body"
 
         // ── 配对模式（Onboarding 重构）──
         private const val KEY_DEVICE_ID = "device_id"
@@ -77,9 +82,129 @@ class AppSettings(context: Context) {
         private const val KEY_PAIRING_ENABLED = "pairing_enabled"
         private const val KEY_PAIRING_MAX_DEVICES = "pairing_max_devices"
 
-        // ── 设备密码（配对认证，2026-08-11）──
+        // ── 配对密码（配对认证，2026-08-11）──
+        // 字段名与 key 沿用 `device_password*` / `KEY_DEVICE_PASSWORD_*`：它们是持久化 key 的一部分，
+        // 改名会让存量设备读不出已设置的密码（等于把人锁在门外），所以只统一注释口径。
         private const val KEY_DEVICE_PASSWORD_HASH = "device_password_hash"
         private const val KEY_DEVICE_PASSWORD_SET = "device_password_set"
+        // 2026-09-08：PBKDF2 化（见 setDevicePassword / verifyDevicePassword）。
+        private const val KEY_DEVICE_PASSWORD_SALT = "device_password_salt"
+        private const val KEY_DEVICE_PASSWORD_VERSION = "device_password_version"
+
+        /**
+         * [resetAll] 不会清除的键 —— 设备身份与凭据。
+         *
+         * 「恢复默认配置」只该恢复配置。把这几个键一起清掉等于让设备退回出厂默认密码态、
+         * 重新对局域网散发配对码（详见 [resetAll] 的注释）。
+         *
+         * `aria2_rpc_secret` 也在列：它清掉后已在跑的 aria2 进程会立刻鉴权失败，
+         * 而它本身不是用户可见的配置项，没有"恢复默认"的意义。
+         */
+        private val PRESERVED_ON_RESET = setOf(
+            KEY_DEVICE_ID,
+            KEY_PAIRED,
+            KEY_PAIRING_CODE,
+            KEY_PAIRED_APP_FP,
+            KEY_PAIRED_AT,
+            KEY_DEVICE_PASSWORD_HASH,
+            KEY_DEVICE_PASSWORD_SET,
+            KEY_DEVICE_PASSWORD_SALT,
+            KEY_DEVICE_PASSWORD_VERSION,
+            KEY_ARIA2_RPC_SECRET
+        )
+
+        /**
+         * 可备份的配置键白名单。
+         *
+         * **进包的判据**：它是"用户设定的配置"，且换一台设备仍然成立。
+         *
+         * 因此以下几类刻意不在列（每一条都是"还原了反而出错"）：
+         * - **身份与凭据**：`device_id` / 配对指纹 / 配对密码哈希与盐 / `pairing_code`
+         *   —— 备份包不该能把设备所有权搬走；`aria2_rpc_secret` 是本机运行凭据，
+         *   还原过去只会让正在跑的 aria2 立刻鉴权失败。
+         * - **运行态**：`pending_update` 系列、`traffic_auto_off_state`、
+         *   `traffic_daily_baseline`、`sms_high_water_mark`、`last_seen_bundled_web_version`
+         *   —— 它们描述"这台设备现在进行到哪了"，跨设备还原等于把进度倒回去。
+         * - **崩溃标记**：`last_crash_*`，还原过去等于伪造一次别的设备的崩溃。
+         * - **一次性迁移标记**：`sms_initialized` —— 还原它会让迁移被跳过。
+         *
+         * 敏感字段（`goform_password`、`tunnel_cf_token`）**在列**：备份的价值就在于
+         * 恢复后能直接用，而保护它们的手段是整包加密，不是从包里剔除。
+         */
+        internal val BACKUP_FIELDS: List<BackupField> = listOf(
+            // 服务
+            BackupField(KEY_PORT, BackupValueType.INT, 1024, 65535),
+            BackupField(KEY_AUTO_START, BackupValueType.BOOL),
+            BackupField(KEY_BG_SERVICE_ENABLED, BackupValueType.BOOL),
+            // 设备后台（goform）
+            BackupField(KEY_GOFORM_IP, BackupValueType.STRING),
+            BackupField(KEY_GOFORM_PORT, BackupValueType.INT, 1, 65535),
+            BackupField(KEY_GOFORM_PASSWORD, BackupValueType.STRING, sensitive = true),
+            BackupField(KEY_DEVICE_PROFILE_ID, BackupValueType.STRING),
+            BackupField(KEY_FIELD_NORMALIZATION, BackupValueType.BOOL),
+            BackupField(KEY_GOFORM_DUMP_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_GOFORM_COMMAND_ENABLED, BackupValueType.BOOL),
+            // 日志
+            BackupField(KEY_DEBUG_MODE, BackupValueType.BOOL),
+            BackupField(KEY_LOG_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_CORE_LOG_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_APP_LOG_ENABLED, BackupValueType.BOOL),
+            // QoS
+            BackupField(KEY_QOS_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_QOS_SHELL_MAX, BackupValueType.INT, 1, 10),
+            BackupField(KEY_QOS_CACHE_TTL, BackupValueType.LONG, 500, 30_000),
+            BackupField(KEY_QOS_GOFORM_QUERY_MAX, BackupValueType.INT, 1, 8),
+            BackupField(KEY_QOS_GOFORM_SET_MAX, BackupValueType.INT, 1, 4),
+            BackupField(KEY_ADB_AUTO_START, BackupValueType.BOOL),
+            // 告警 / 监控 / 通知（整份 JSON，由各自的 DTO 校验）
+            BackupField(KEY_ALERT_CONFIG, BackupValueType.STRING),
+            BackupField(KEY_TRAFFIC_AUTO_OFF_CONFIG, BackupValueType.STRING),
+            BackupField(KEY_MONITOR_PREFERENCES, BackupValueType.STRING),
+            BackupField(KEY_NOTIFICATION_CONFIG, BackupValueType.STRING),
+            // 更新源
+            BackupField(KEY_UPDATE_URL, BackupValueType.STRING),
+            BackupField(KEY_UPDATE_MIRROR_BASE, BackupValueType.STRING),
+            // 短信
+            BackupField(KEY_SMS_CODE_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_SMS_CODE_CLEANUP_HOURS, BackupValueType.INT, 1, 720),
+            BackupField(KEY_SMS_CODE_AUTO_COPY, BackupValueType.BOOL),
+            BackupField(KEY_SMS_FILTER_EXEMPT_VC, BackupValueType.BOOL),
+            BackupField(KEY_SMS_FILTER_STORE_FULL_BODY, BackupValueType.BOOL),
+            // 配对配额（不是凭据，是策略）
+            BackupField(KEY_PAIRING_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_PAIRING_MAX_DEVICES, BackupValueType.INT, 0, 100),
+            // 隧道
+            BackupField(KEY_TUNNEL_AUTO_RECONNECT, BackupValueType.BOOL),
+            BackupField(KEY_TUNNEL_RECONNECT_INTERVAL, BackupValueType.INT, 10, 120),
+            BackupField(KEY_TUNNEL_NOTIFY_ON_FAILURE, BackupValueType.BOOL),
+            BackupField(KEY_TUNNEL_FRP_ACTIVE, BackupValueType.STRING),
+            BackupField(KEY_TUNNEL_CF_ACTIVE, BackupValueType.STRING),
+            BackupField(KEY_TUNNEL_FRP_DESIRED, BackupValueType.STRING),
+            BackupField(KEY_TUNNEL_CF_DESIRED, BackupValueType.STRING),
+            BackupField(KEY_TUNNEL_CF_TOKEN, BackupValueType.STRING, sensitive = true),
+            // 采集调度（范围与各自 getter 的夹取一致）
+            BackupField(KEY_MON_RETENTION_DAYS, BackupValueType.INT, 1, 90),
+            BackupField(KEY_MON_FLUSH_SEC, BackupValueType.INT, 5, 300),
+            BackupField(KEY_MON_ALERT_SCAN_SEC, BackupValueType.INT, 5, 300),
+            BackupField(KEY_MON_IDLE_SEC, BackupValueType.INT, 10, 600),
+            BackupField(KEY_MON_THERMAL_WARN_C, BackupValueType.INT, 50, 90),
+            BackupField(KEY_MON_THERMAL_CRIT_C, BackupValueType.INT, 55, 100),
+            BackupField(KEY_MON_THERMAL_PAUSE_SEC, BackupValueType.INT, 5, 300),
+            BackupField(KEY_MON_TRAFFIC_LIMIT_CHECK_SEC, BackupValueType.INT, 60, 3600),
+            BackupField(KEY_MON_DEVICE_EVENT_CHECK_SEC, BackupValueType.INT, 15, 600)
+        )
+
+        private val BACKUP_FIELDS_BY_KEY: Map<String, BackupField> =
+            BACKUP_FIELDS.associateBy { it.key }
+
+        /** 备份包里出现的敏感键，供 UI 提示"这个包含密码与令牌"。 */
+        val SENSITIVE_BACKUP_KEYS: Set<String> =
+            BACKUP_FIELDS.filter { it.sensitive }.map { it.key }.toSet()
+
+        /** 旧算法：裸 SHA-256、无 salt、单轮。只在校验时兼容，校验通过即就地升级。 */
+        private const val PASSWORD_VERSION_LEGACY_SHA256 = 1
+        /** 当前算法：PBKDF2-HMAC-SHA256 + 每密码随机 salt。 */
+        private const val PASSWORD_VERSION_PBKDF2 = 2
 
         // ── Web 前端独立更新（版本追踪）──
         // 2026-08-28：旧 key last_seen_bundled_web_build_time 已弃用（buildTime 每次构建都变，
@@ -109,6 +234,9 @@ class AppSettings(context: Context) {
         private const val KEY_MON_THERMAL_WARN_C = "monitor_thermal_warn_c"
         private const val KEY_MON_THERMAL_CRIT_C = "monitor_thermal_critical_c"
         private const val KEY_MON_THERMAL_PAUSE_SEC = "monitor_thermal_pause_sec"
+        // 2026-09-08 补齐：这两个是 2026-09-03 那次改造漏掉的最后两个编译期常量
+        private const val KEY_MON_TRAFFIC_LIMIT_CHECK_SEC = "monitor_traffic_limit_check_sec"
+        private const val KEY_MON_DEVICE_EVENT_CHECK_SEC = "monitor_device_event_check_sec"
 
 
         // Defaults
@@ -230,17 +358,23 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_PAIRING_MAX_DEVICES, 0)
         set(value) = prefs.edit().putInt(KEY_PAIRING_MAX_DEVICES, value.coerceAtLeast(0)).apply()
 
-    // ── 设备密码（配对认证，2026-08-11）──
-    // 哈希存 SharedPreferences（SHA-256 hex，复用 HashUtil），明文永不落库/回显。
+    // ── 配对密码（配对认证，2026-08-11）──
+    // 哈希存 SharedPreferences，明文永不落库/回显。
     // 首次 confirm 时（devicePasswordSet=false）将请求密码直接落库=“设置密码”；
     // 之后 confirm / 删除设备 / 改密 一律校验密码。
+    //
+    // 2026-09-08 算法升级（v1 → v2）：原来是 `HashUtil.sha256(pw)` —— 单轮、无 salt。
+    // 单轮 SHA-256 在消费级 GPU 上是百亿量级/秒，无 salt 又能被彩虹表直接命中；
+    // 而这台设备本身跑着 root 工具链，「攻击者能读到 SharedPreferences」并不是苛刻前提。
+    // 现在改成 PBKDF2-HMAC-SHA256 + 每密码随机 salt（平台自带，无新依赖）。
+    // 旧哈希不强制用户改密：校验旧密码成功的那一刻手里就有明文，就地重算成 v2 写回。
 
-    /** 设备密码 SHA-256 哈希（hex）。未设置过时为空串。 */
-    var devicePasswordHash: String
+    /** 配对密码派生结果（hex）。未设置过时为空串。格式由 [KEY_DEVICE_PASSWORD_VERSION] 决定。 */
+    private var devicePasswordHash: String
         get() = prefs.getString(KEY_DEVICE_PASSWORD_HASH, "") ?: ""
         set(value) = prefs.edit().putString(KEY_DEVICE_PASSWORD_HASH, value).apply()
 
-    /** 是否已设置过设备密码（首次 confirm 设置后为 true）。 */
+    /** 是否已设置过配对密码（首次 confirm 设置后为 true）。 */
     var devicePasswordSet: Boolean
         get() = prefs.getBoolean(KEY_DEVICE_PASSWORD_SET, false)
         set(value) = prefs.edit().putBoolean(KEY_DEVICE_PASSWORD_SET, value).apply()
@@ -253,24 +387,53 @@ class AppSettings(context: Context) {
     val hasDefaultPassword: Boolean
         get() = !devicePasswordSet
 
-    /** 是否已配置设备密码（与 [hasDefaultPassword] 互补；首次设置后恒 true）。 */
+    /** 是否已配置配对密码（与 [hasDefaultPassword] 互补；首次设置后恒 true）。 */
     val devicePasswordConfigured: Boolean
         get() = devicePasswordSet
 
-    /** 设置设备密码：写入 SHA-256 哈希并置已设置标志。 */
+    /** 设置配对密码：随机 salt + PBKDF2 派生后落盘，并置已设置标志与算法版本。 */
     fun setDevicePassword(pw: String) {
+        val salt = HashUtil.randomSalt()
+        val derived = HashUtil.pbkdf2(pw, salt)
         prefs.edit().apply {
-            putString(KEY_DEVICE_PASSWORD_HASH, HashUtil.sha256(pw))
+            putString(KEY_DEVICE_PASSWORD_HASH, derived)
+            putString(KEY_DEVICE_PASSWORD_SALT, salt.toHex())
+            putInt(KEY_DEVICE_PASSWORD_VERSION, PASSWORD_VERSION_PBKDF2)
             putBoolean(KEY_DEVICE_PASSWORD_SET, true)
             apply()
         }
     }
 
-    /** 校验设备密码（常量时间比较，防时序侧信道）。未设置过时恒 false。 */
+    /**
+     * 校验配对密码（常量时间比较，防时序侧信道）。未设置过时恒 false。
+     *
+     * v1（裸 SHA-256）仍可校验，且校验通过后**就地升级**成 v2：
+     * 这是唯一能拿到明文的时机，错过就只能强制用户改密。升级对调用方完全透明。
+     */
     fun verifyDevicePassword(pw: String): Boolean {
-        val hash = devicePasswordHash
-        if (hash.isEmpty()) return false
-        return HashUtil.constantTimeEquals(hash, HashUtil.sha256(pw))
+        val stored = devicePasswordHash
+        if (stored.isEmpty()) return false
+        // 缺 version 键的一律按 v1（升级前写入的记录没有这个键）
+        return when (prefs.getInt(KEY_DEVICE_PASSWORD_VERSION, PASSWORD_VERSION_LEGACY_SHA256)) {
+            PASSWORD_VERSION_PBKDF2 -> {
+                val salt = HashUtil.hexToBytes(prefs.getString(KEY_DEVICE_PASSWORD_SALT, "") ?: "")
+                if (salt.isEmpty()) {
+                    // 版本说是 v2 却读不出 salt：无法校验。不静默当成 false 之外还要留痕，
+                    // 否则表现成「密码突然全错」而查不到原因。
+                    AppLogger.e("AppSettings", "device password marked v2 but salt is missing/corrupt")
+                    return false
+                }
+                HashUtil.constantTimeEquals(stored, HashUtil.pbkdf2(pw, salt))
+            }
+            else -> {
+                val ok = HashUtil.constantTimeEquals(stored, HashUtil.sha256(pw))
+                if (ok) {
+                    AppLogger.i("AppSettings", "device password rehashed from v1(sha256) to v2(pbkdf2)")
+                    setDevicePassword(pw)
+                }
+                ok
+            }
+        }
     }
 
     /**
@@ -359,7 +522,7 @@ class AppSettings(context: Context) {
      * 密码登录模式完成配对（登录=自动配对）。
      *
      * 适用：设备已完成首次初始化（密码已设置）、一次性配对码已消耗或未携带，
-     * 客户端凭设备密码登录。密码校验由 PairingManager.confirm 前置完成，
+     * 客户端凭配对密码登录。密码校验由 PairingManager.confirm 前置完成，
      * 此处跳过配对码校验直接绑定指纹。
      * 不消耗/生成配对码（首次配对语义仍由 [confirmPairing] 承担）。
      */
@@ -793,6 +956,35 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_SMS_CODE_CLEANUP_HOURS, 24)
         set(value) = prefs.edit().putInt(KEY_SMS_CODE_CLEANUP_HOURS, value).apply()
 
+    /** 自动复制验证码到剪贴板（需先开启系统无障碍服务，否则不生效） */
+    var smsCodeAutoCopy: Boolean
+        get() = prefs.getBoolean(KEY_SMS_CODE_AUTO_COPY, false)
+        set(value) = prefs.edit().putBoolean(KEY_SMS_CODE_AUTO_COPY, value).apply()
+
+    /**
+     * 验证码短信是否豁免**关键词**拦截规则。**默认 true**。
+     *
+     * 语义（`SmsFilter.evaluate` 是唯一实现）：开启时被判定为验证码的短信跳过
+     * `scope=body` 的规则，但 `scope=sender` 的号码黑名单、以及 `scope=both` 的 sender 侧
+     * 仍然生效 —— 拉黑一个号码是明确意图，不该被「它这次发的是验证码」绕过；
+     * 关键词是模糊匹配，误伤验证码的代价最高。
+     *
+     * 改这个开关之后必须让 `SmsRuleStore` 重载快照，否则是个假开关。
+     */
+    var smsFilterExemptVerificationCode: Boolean
+        get() = prefs.getBoolean(KEY_SMS_FILTER_EXEMPT_VC, true)
+        set(value) = prefs.edit().putBoolean(KEY_SMS_FILTER_EXEMPT_VC, value).apply()
+
+    /**
+     * 拦截记录是否留存短信**全文**。默认 false（只存 120 字 snippet）。
+     *
+     * 拦截记录是短信正文第一次成规模落进 core 的 DB（此前只有验证码存正文），
+     * 所以全文留存做成显式开关且默认关 —— 想看全文的人自己打开，不替所有人做决定。
+     */
+    var smsFilterStoreFullBody: Boolean
+        get() = prefs.getBoolean(KEY_SMS_FILTER_STORE_FULL_BODY, false)
+        set(value) = prefs.edit().putBoolean(KEY_SMS_FILTER_STORE_FULL_BODY, value).apply()
+
     // --- Web 前端独立更新（版本追踪） ---
 
     /**
@@ -916,14 +1108,48 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_MON_THERMAL_PAUSE_SEC, 20).coerceIn(5, 300)
         set(value) = prefs.edit().putInt(KEY_MON_THERMAL_PAUSE_SEC, value.coerceIn(5, 300)).apply()
 
+    // ── 2026-09-08 补齐的两项 ──
+    // 2026-09-03 那次把 flush/alertScan/idle/thermal 提到设置里时，漏了 DataScheduler 的
+    // TRAFFIC_LIMIT_CHECK_INTERVAL_MS 与 DEVICE_EVENT_CHECK_INTERVAL_MS，于是「套餐限额预警」
+    // 与「设备接入/离开提醒」这三类告警的实时性完全不可调 —— 用户把告警扫描间隔调到 5 秒，
+    // 它们还是 5 分钟 / 60 秒。现在两个常量都删了，真源就在这里。
 
-    /** 将全部配置导出为 Map，供 API 返回 */
+    /**
+     * 套餐限额百分比的检查间隔（秒），60..3600，默认 300。
+     *
+     * 下限给到 60 秒而不是 5 秒：每次检查要向设备发一次 goform `getDataUsage`，
+     * 那是跟设备官方 Web UI 抢同一个会话的请求，调太密会互相踢登录态。
+     */
+    var monitorTrafficLimitCheckSec: Int
+        get() = prefs.getInt(KEY_MON_TRAFFIC_LIMIT_CHECK_SEC, 300).coerceIn(60, 3600)
+        set(value) = prefs.edit()
+            .putInt(KEY_MON_TRAFFIC_LIMIT_CHECK_SEC, value.coerceIn(60, 3600)).apply()
+
+    /**
+     * WiFi 客户端接入/离开的比对间隔（秒），15..600，默认 60。
+     *
+     * 接入与离开共用同一次 `station_list` 查询，所以这一个值同时决定两类提醒的延迟。
+     * 下限 15 秒同样是为了不跟设备 Web UI 抢会话。注意首轮只建基线不报事件，
+     * 所以刚打开开关后第一条提醒最迟要等两个周期。
+     */
+    var monitorDeviceEventCheckSec: Int
+        get() = prefs.getInt(KEY_MON_DEVICE_EVENT_CHECK_SEC, 60).coerceIn(15, 600)
+        set(value) = prefs.edit()
+            .putInt(KEY_MON_DEVICE_EVENT_CHECK_SEC, value.coerceIn(15, 600)).apply()
+
+
+    /**
+     * 将全部配置导出为 Map，供 API 返回。
+     *
+     * **不含 `goform_password`**：这是唯一的明文凭据字段，放进通用导出 Map 里意味着
+     * 任何一个新调用方只要忘了脱敏就会把它吐出去。需要它的一方（`ConfigRoutes` 的 GET）
+     * 自己 put 脱敏值。
+     */
     fun toMap(): Map<String, Any> = mapOf(
         "port" to port,
         "auto_start_on_boot" to autoStartOnBoot,
         "goform_ip" to goformIp,
         "goform_port" to goformPort,
-        "goform_password" to goformPassword,
         "debug_mode" to debugMode,
         "log_enabled" to logEnabled,
         "core_log_enabled" to coreLogEnabled,
@@ -938,12 +1164,168 @@ class AppSettings(context: Context) {
         "adb_auto_start_on_boot" to adbAutoStartOnBoot,
         "sms_code_enabled" to smsCodeEnabled,
         "sms_code_cleanup_hours" to smsCodeCleanupHours,
+        "sms_code_auto_copy" to smsCodeAutoCopy,
+        // 两个拦截相关开关必须出现在这里：客户端靠 GET /api/config 回读当前值，
+        // web 的差量提交（settingsShared.buildChangedPayload）也是拿 GET 的结果做基线 ——
+        // 漏一个键就等于「界面上的开关永远显示默认值，改了也提交不出去」。
+        "sms_filter_exempt_verification_code" to smsFilterExemptVerificationCode,
+        "sms_filter_store_full_body" to smsFilterStoreFullBody,
         "update_url" to updateUrl,
         "update_mirror_base" to updateMirrorBase
     )
 
-    /** 恢复全部默认值 */
+    // ────────────────────────────────────────────────────────────
+    // 备份导出 / 导入
+    // ────────────────────────────────────────────────────────────
+
+    /**
+     * 导出可备份的配置键。
+     *
+     * 只导出**实际存在**的键：没设过的键不出现在包里，这样 `merge` 恢复时不会用
+     * 「导出那台设备的默认值」去覆盖目标设备上用户改过的值。
+     */
+    fun exportBackupFields(): Map<String, Any> {
+        val out = LinkedHashMap<String, Any>()
+        BACKUP_FIELDS.forEach { field ->
+            if (!prefs.contains(field.key)) return@forEach
+            val value: Any? = when (field.type) {
+                BackupValueType.BOOL -> prefs.getBoolean(field.key, false)
+                BackupValueType.INT -> prefs.getInt(field.key, 0)
+                BackupValueType.LONG -> prefs.getLong(field.key, 0L)
+                BackupValueType.STRING -> prefs.getString(field.key, null)
+            }
+            if (value != null) out[field.key] = value
+        }
+        return out
+    }
+
+    /**
+     * 导入配置键。
+     *
+     * @param values 键 → 值，值只接受 Boolean / Int / Long / String（路由层负责把 JSON 转成这些）
+     * @param replace true = 先把白名单内的键全部清掉（回默认）再写入；false = 只覆盖包里有的键
+     *
+     * 每个值都按 [BACKUP_FIELDS] 的类型与范围校验后才写入。**不能跳过校验直接写 prefs**：
+     * 部分键只在 setter 里夹取（例如 `server_port`），绕过 setter 写入一个越界值会让服务
+     * 下次启动就崩在端口绑定上，而备份文件是可以被手工编辑的。
+     */
+    fun importBackupFields(values: Map<String, Any?>, replace: Boolean): BackupImportReport {
+        val applied = mutableListOf<String>()
+        val rejected = LinkedHashMap<String, String>()
+        val editor = prefs.edit()
+
+        if (replace) {
+            // 只清白名单内的键：身份凭据、运行态、崩溃标记都不在白名单里，天然不受影响。
+            BACKUP_FIELDS.forEach { editor.remove(it.key) }
+        }
+
+        values.forEach { (key, raw) ->
+            val field = BACKUP_FIELDS_BY_KEY[key]
+            if (field == null) {
+                rejected[key] = "不是可备份的配置项"
+                return@forEach
+            }
+            if (raw == null) {
+                rejected[key] = "值为空"
+                return@forEach
+            }
+            when (field.type) {
+                BackupValueType.BOOL -> {
+                    val v = raw as? Boolean
+                    if (v == null) rejected[key] = "需要布尔值" else editor.putBoolean(key, v)
+                }
+                BackupValueType.INT -> {
+                    val v = (raw as? Number)?.toInt()
+                    when {
+                        v == null -> rejected[key] = "需要整数"
+                        field.min != null && v < field.min -> rejected[key] = "小于下限 ${field.min}"
+                        field.max != null && v > field.max -> rejected[key] = "大于上限 ${field.max}"
+                        else -> editor.putInt(key, v)
+                    }
+                }
+                BackupValueType.LONG -> {
+                    val v = (raw as? Number)?.toLong()
+                    when {
+                        v == null -> rejected[key] = "需要整数"
+                        field.min != null && v < field.min -> rejected[key] = "小于下限 ${field.min}"
+                        field.max != null && v > field.max -> rejected[key] = "大于上限 ${field.max}"
+                        else -> editor.putLong(key, v)
+                    }
+                }
+                BackupValueType.STRING -> {
+                    val v = raw as? String
+                    if (v == null) rejected[key] = "需要字符串" else editor.putString(key, v)
+                }
+            }
+            if (!rejected.containsKey(key)) applied += key
+        }
+        editor.apply()
+
+        return BackupImportReport(
+            applied = applied,
+            rejected = rejected,
+            // 这两个键只在服务启动时读一次（端口绑定 / 组件图构造），改了不重启等于没改
+            needsRestart = applied.any { it == KEY_PORT || it == KEY_DEVICE_PROFILE_ID }
+        )
+    }
+
+    /**
+     * 恢复默认配置。
+     *
+     * **不清除身份与凭据键**（[PRESERVED_ON_RESET]）。
+     *
+     * 2026-09-10：原实现是 `prefs.edit().clear()`，会把 `device_password_hash` / `salt` /
+     * `device_password_set` / 配对指纹 / `device_id` 一起抹掉，而 `paired_devices.json` 不在
+     * 这份 prefs 里、不受影响 —— 结果是「已配对客户端照常能用，但设备退回出厂默认密码态，
+     * `/pairing/info` 重新向局域网散发配对码」，任何人都能重新初始化并设一个新密码。
+     * 而 `/api/config/reset` 只要求已配对身份、不要求配对密码，成本远低于物理重置。
+     *
+     * 「恢复默认配置」的语义是恢复**配置**，不包含放弃设备所有权。
+     */
     fun resetAll() {
-        prefs.edit().clear().apply()
+        val editor = prefs.edit()
+        prefs.all.keys.filterNot { it in PRESERVED_ON_RESET }.forEach { editor.remove(it) }
+        editor.apply()
     }
 }
+
+/** [AppSettings.BACKUP_FIELDS] 里一项的值类型。 */
+enum class BackupValueType { BOOL, INT, LONG, STRING }
+
+/**
+ * 一个可备份的配置键。
+ *
+ * @param min / [max] 数值型的合法区间（含端点）；null = 不限。**必须与对应 setter/getter 的
+ *        夹取范围一致** —— 备份文件是可以被手工编辑的，导入是唯一能挡住越界值的地方。
+ * @param sensitive 是否是密码 / 令牌类字段。只用于让 UI 提示"此包含敏感信息"，
+ *        不影响是否进包（保护手段是整包加密）。
+ */
+class BackupField(
+    val key: String,
+    val type: BackupValueType,
+    val min: Long? = null,
+    val max: Long? = null,
+    val sensitive: Boolean = false
+) {
+    constructor(
+        key: String,
+        type: BackupValueType,
+        min: Int,
+        max: Int,
+        sensitive: Boolean = false
+    ) : this(key, type, min.toLong(), max.toLong(), sensitive)
+}
+
+/**
+ * 导入结果。
+ *
+ * @param applied 实际写入的键
+ * @param rejected 键 → 拒绝原因（类型不符 / 越界 / 不在白名单），面向用户展示
+ * @param needsRestart 是否改动了只在启动时读取的键（端口、设备档位）
+ */
+class BackupImportReport(
+    val applied: List<String>,
+    val rejected: Map<String, String>,
+    val needsRestart: Boolean
+)
+

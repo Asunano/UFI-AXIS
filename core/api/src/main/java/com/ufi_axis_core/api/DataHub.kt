@@ -47,7 +47,7 @@ import kotlinx.serialization.json.*
  * `DeviceFields.UNSTABLE_ENDPOINTS`）。原因：透传等于把 goform 的字段命名当成对外
  * 契约，设备侧一改名，web 与 app 都得跟着改；而且固件新增的字段会自动泄漏出去。
  *
- * 正确做法（详见 `docs/plans/DEVICE-ADAPTER-PLAN.md` §8 场景 A/B）：
+ * 正确做法（场景 A/B）：
  * 1. **字段登记**：在 `ZteGoformProfile` 加一条 `fieldOf(canonical, group, "设备原名"…)`，
  *    canonical 取 `DeviceFields` 常量（没有就先加，新键用 `snake_case`）。
  * 2. **归一化在设备客户端层做**，不在 route 层：`GoformSignalClient` / `GoformWifiClient`

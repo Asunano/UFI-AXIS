@@ -22,9 +22,17 @@ data class PushNotification(
 interface NotificationPushService {
     /**
      * 发送一条实时通知。
+     *
      * @param notification 通知内容负载
+     * @param mirrorToAlertTopic 是否把同一份 payload 再发一遍到 `alert` 频道。
+     *
+     * **默认 true = 保持既有线上行为**（见 `WebSocketPushService.push` 的注释：
+     * 那是给旧客户端的兼容镜像，不是设计）。只有"本来就没有镜像过"的来源才传 false ——
+     * 目前是 `PushChannel` 里的 sms / verification 两个场景：它们此前由
+     * `DataScheduler` 手写 `broadcast("notification", …)` **单发**，
+     * 一旦跟着镜像到 `alert`，web 的告警列表就会把短信列成告警（可见的功能回归）。
      */
-    fun push(notification: PushNotification)
+    fun push(notification: PushNotification, mirrorToAlertTopic: Boolean = true)
 
     /**
      * 快捷发送告警类通知。
@@ -39,3 +47,4 @@ interface NotificationPushService {
         ))
     }
 }
+

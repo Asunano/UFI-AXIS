@@ -508,33 +508,27 @@ class NavInsetHandoffGuardTest {
     }
 
     /**
-     * [UfiSettingsItem] 的默认图标色**不得**是 `palette.accent`。
+     * [UfiSettingsItem] 的默认图标色**必须**跟随主题（`palette.accent`）。
      *
-     * 2026-09-05 真机 bug：深色模式下设置项图标是一片灰。原因是默认 tint 取 `accent`，
-     * 而 `default` 预设的 `accentDark`（0xFF555555）压在 `cardBgDark`（0xFF2A2A2A）上
-     * WCAG 对比度只有约 1.9:1，远低于非文本图形 3:1 的下限。
+     * 本测试 2026-09-05 建立时是**反向**的（"不得是 accent"）：当时默认皮肤把 `accentDark`
+     * 写成 0xFF555555，压在 `cardBgDark`（0xFF2A2A2A）上只有约 1.9:1，深色下设置项图标一片灰，
+     * 于是单点把 tint 改成 `textPrimary` 绕开。
      *
-     * 为什么不是去改 `accentDark`：`accent` 在本仓的语义是**实底色块**
-     * （主按钮 / FAB / 渐变 Hero / 进度条已填充段 / 选中填充 / switch 滑块 /
-     * 聚焦描边 / chip 选中底），全仓约 330 处消费点。把它提亮到近白会同时破坏那些位置
-     * —— `onAccent` 默认是白，近白 accent 底上的白字直接消失。
+     * 2026-09-08 根因已修：默认皮肤的三个 accent 槽改成"深色态取亮、浅色态取深"
+     * （accentDark → 0xFFB0B0B0，对卡面 6.6:1），accent 当前景全站合法，绕道随之作废。
+     * 绕道的实际代价是不一致 —— 工具页 / 入口卡图标跟随主题色，设置页入口图标却恒为黑白，
+     * 换红、蓝等彩色皮肤时尤其明显。现在锁的是"跟随主题"这个不变量。
      *
-     * 具体色值的对比度由 `ColorTest` 的两条测试量化钉住；这里只锁"取色来源"这个不变量，
-     * 因为 tint 的来源没有运行期出口（要 Compose 运行时才能观测）。
+     * 具体色值的对比度由 `ColorTest` 的「7 套预设 × 明暗」不变量量化钉住；
+     * 这里只锁取色来源，因为 tint 的来源没有运行期出口（要 Compose 运行时才能观测）。
      */
     @Test
-    fun settingsItem_defaultIconTintMustNotBeAccent() {
+    fun settingsItem_defaultIconTintMustFollowTheme() {
         val code = executableCode(source(settingsItemPath))
         assertTrue(
-            "UfiSettingsItem 的 `effectiveIconTint` 必须回落到 `palette.textPrimary`：" +
-                "设置行的前导图标与同一行标题是同级信息，标题走的就是 textPrimary。",
-            Regex("""effectiveIconTint[\s\S]{0,120}palette\.textPrimary""")
-                .containsMatchIn(code)
-        )
-        assertFalse(
-            "UfiSettingsItem 的默认图标色又变回 `palette.accent` —— 深色下对比度约 1.9:1，" +
-                "这正是「深色模式设置项图标是灰的」那个 bug。",
-            Regex("""effectiveIconTint[\s\S]{0,120}palette\.accent""")
+            "UfiSettingsItem 的 `effectiveIconTint` 必须回落到 `palette.accent`：" +
+                "设置页入口图标要与工具页 / UfiEntryCard 的图标同口径跟随主题皮肤。",
+            Regex("""effectiveIconTint[\s\S]{0,160}palette\.accent""")
                 .containsMatchIn(code)
         )
     }

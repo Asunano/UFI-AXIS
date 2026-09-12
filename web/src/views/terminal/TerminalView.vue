@@ -38,11 +38,7 @@
           </template>
           <template v-else>
             <n-tag :type="shellRoot.root ? 'warning' : 'default'" size="small" round>
-              {{
-                shellRoot.root
-                  ? `特权 Shell${shellRoot.uid ? ' · ' + shellRoot.uid : ''}`
-                  : '普通 Shell（无特权）'
-              }}
+              {{ shellRoot.root ? `特权 Shell${shellRoot.uid ? ' · ' + shellRoot.uid : ''}` : '普通 Shell（无特权）' }}
             </n-tag>
             <span v-if="shellRoot.method" class="status-platform">{{ shellRoot.method }}</span>
             <n-switch v-model:value="shellAsRoot" size="small" />
@@ -73,24 +69,12 @@
 
       <!-- ── 快捷命令 ── -->
       <div class="quick-cmds">
-        <n-tag
-          v-for="q in activeQuick"
-          :key="q.key"
-          size="small"
-          class="quick-tag"
-          @click="runQuick(q.cmd)"
-        >
+        <n-tag v-for="q in activeQuick" :key="q.key" size="small" class="quick-tag" @click="runQuick(q.cmd)">
           {{ q.label }}
         </n-tag>
         <template v-if="activeTab === 'shell'">
           <span class="quick-sep">getprop:</span>
-          <n-tag
-            v-for="k in quickProps"
-            :key="k"
-            size="small"
-            class="quick-tag"
-            @click="runQuick('getprop ' + k)"
-          >
+          <n-tag v-for="k in quickProps" :key="k" size="small" class="quick-tag" @click="runQuick('getprop ' + k)">
             {{ k }}
           </n-tag>
         </template>
@@ -112,15 +96,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
+import { useWebSocketStore } from '@/stores/websocket';
 import ConsoleMessageList from './components/ConsoleMessageList.vue';
 import ConsoleInputBar from './components/ConsoleInputBar.vue';
 import { nextId, ensureSeqAbove, type ConsoleMessage } from './components/types';
 
 const api = getApiClient();
 const message = useMessage();
+const wsStore = useWebSocketStore();
 
 // ── 当前 Tab（单布局：状态条/列表/输入栏都按它切数据）──
 const activeTab = ref<'at' | 'shell'>('at');
@@ -157,7 +143,7 @@ const activeQuick = computed(() => (activeTab.value === 'at' ? quickAtCmds : qui
 const atMessages = ref<ConsoleMessage[]>([]);
 const shellMessages = ref<ConsoleMessage[]>([]);
 const activeMessages = computed<ConsoleMessage[]>(() =>
-  activeTab.value === 'at' ? atMessages.value : shellMessages.value,
+  activeTab.value === 'at' ? atMessages.value : shellMessages.value
 );
 
 // ── AT 状态 ──
@@ -198,46 +184,95 @@ const atPlatformText = computed(() => {
 });
 const atMethodText = computed(() => (atPlatform.connected && atPlatform.method ? atPlatform.method : '--'));
 
-// ── 历史持久化（localStorage，每 tab 上限 500，写入节流）──
-const HISTORY_KEY = 'ufi.console.history';
+// ── 历史（core 存，app / web 共享同一份）──
+// 旧版把历史存在 localStorage：换个浏览器、清一次缓存就没了，手机 app 更是完全看不见。
+// 现在唯一真源是 core 的 console_history 表，本页只负责拉取与展示。
 const HISTORY_MAX = 500;
-function loadHistory() {
+const HISTORY_PAGE = 200;
+const LEGACY_HISTORY_KEY = 'ufi.console.history';
+
+/** 把 core 的一条记录摊成两个气泡（命令 + 输出），口径与 app 侧一致。 */
+function recordToMessages(r: any): ConsoleMessage[] {
+  const isShell = r.channel === 'shell';
+  const commandText = isShell ? `${r.as_root ? '# ' : '$ '}${r.command}` : String(r.command ?? '');
+  let out = '';
+  if (r.stdout) out += r.stdout;
+  if (r.stderr) out += (out ? '\n' : '') + (isShell ? '[stderr]\n' : '') + r.stderr;
+  if (r.truncated) out += (out ? '\n' : '') + '[输出过长已截断]';
+  // AT 没有退出码，core 落的是 null（刻意不用 0 顶替）
+  if (r.exit_code !== null && r.exit_code !== undefined) out += `\n[exit: ${r.exit_code}]`;
+  if (!out) out = r.ok ? '(无输出)' : '(无响应)';
+  return [
+    { id: r.id * 2, role: 'user', text: commandText, timestamp: r.created_at },
+    { id: r.id * 2 + 1, role: r.ok ? 'assistant' : 'error', text: out, timestamp: r.created_at },
+  ];
+}
+
+async function loadHistory(channel: 'at' | 'shell') {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    if (!raw) return;
-    const parsed = JSON.parse(raw) as { at?: ConsoleMessage[]; shell?: ConsoleMessage[] };
-    let maxId = 0;
-    if (Array.isArray(parsed.at)) {
-      atMessages.value = parsed.at.slice(-HISTORY_MAX);
-      maxId = Math.max(maxId, ...atMessages.value.map((m) => m.id));
-    }
-    if (Array.isArray(parsed.shell)) {
-      shellMessages.value = parsed.shell.slice(-HISTORY_MAX);
-      maxId = Math.max(maxId, ...shellMessages.value.map((m) => m.id));
-    }
-    ensureSeqAbove(maxId);
+    const { data } = await api.get('/api/console/history', { params: { channel, limit: HISTORY_PAGE } });
+    const records = Array.isArray(data?.records) ? data.records : [];
+    // core 返回最新在前，聊天式列表要按时间递增
+    const messages: ConsoleMessage[] = records.slice().reverse().flatMap(recordToMessages);
+    if (channel === 'at') atMessages.value = messages;
+    else shellMessages.value = messages;
+    ensureSeqAbove(messages.length ? Math.max(...messages.map((m) => m.id)) : 0);
   } catch {
-    /* 历史损坏则忽略 */
+    /* 拉不到就保留当前列表（可能有本次会话刚发的命令），不清空 */
   }
 }
-let saveTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleSave() {
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(
-        HISTORY_KEY,
-        JSON.stringify({
-          at: atMessages.value.slice(-HISTORY_MAX),
-          shell: shellMessages.value.slice(-HISTORY_MAX),
-        }),
-      );
-    } catch {
-      /* 容量超限则忽略 */
-    }
-  }, 300);
+
+/** 旧版 localStorage 历史的一次性迁移：上传给 core 后清掉本地键。 */
+async function migrateLegacyHistory() {
+  let parsed: { at?: ConsoleMessage[]; shell?: ConsoleMessage[] } | null = null;
+  try {
+    const raw = localStorage.getItem(LEGACY_HISTORY_KEY);
+    if (!raw) return;
+    parsed = JSON.parse(raw);
+  } catch {
+    localStorage.removeItem(LEGACY_HISTORY_KEY);
+    return;
+  }
+  const records = [...legacyToRecords(parsed?.at ?? [], 'at'), ...legacyToRecords(parsed?.shell ?? [], 'shell')];
+  if (!records.length) {
+    localStorage.removeItem(LEGACY_HISTORY_KEY);
+    return;
+  }
+  try {
+    await api.post('/api/console/history/import', { records });
+    // 删本地键即幂等保证：下次进页面没有它就不会重复导入
+    localStorage.removeItem(LEGACY_HISTORY_KEY);
+  } catch {
+    /* 保留本地键，下次进页面再试（设备离线时很可能走这条） */
+  }
 }
-watch([() => atMessages.value.length, () => shellMessages.value.length], scheduleSave);
+
+/** 旧记录只有 role/text，按「命令气泡 + 紧随其后的输出气泡」配对还原结构。 */
+function legacyToRecords(list: ConsoleMessage[], channel: 'at' | 'shell') {
+  const out: Record<string, unknown>[] = [];
+  for (let i = 0; i < list.length; ) {
+    const m = list[i];
+    if (!m || m.role !== 'user') {
+      i++;
+      continue;
+    }
+    const asRoot = m.text.startsWith('# ');
+    const command = m.text.replace(/^[#$] /, '');
+    const next = list[i + 1];
+    const reply = next && next.role !== 'user' ? next : null;
+    out.push({
+      channel,
+      command,
+      as_root: asRoot,
+      stdout: reply?.text ?? '',
+      ok: reply?.role === 'assistant',
+      source: 'web',
+      created_at: m.timestamp,
+    });
+    i += reply ? 2 : 1;
+  }
+  return out;
+}
 
 // ── 辅助 ──
 function apiError(e: any, fallback = '请求失败'): string {
@@ -247,9 +282,7 @@ function apiError(e: any, fallback = '请求失败'): string {
 }
 function isCanceled(e: any): boolean {
   return (
-    e?.name === 'CanceledError' ||
-    e?.code === 'ERR_CANCELED' ||
-    (e instanceof DOMException && e.name === 'AbortError')
+    e?.name === 'CanceledError' || e?.code === 'ERR_CANCELED' || (e instanceof DOMException && e.name === 'AbortError')
   );
 }
 
@@ -274,10 +307,7 @@ function applyAtPlatform(data: any) {
 async function loadAtStatus() {
   atStatusLoading.value = true;
   try {
-    const [statusRes, platformRes] = await Promise.allSettled([
-      api.get('/api/at/status'),
-      api.get('/api/at/platform'),
-    ]);
+    const [statusRes, platformRes] = await Promise.allSettled([api.get('/api/at/status'), api.get('/api/at/platform')]);
     if (platformRes.status === 'fulfilled') applyAtPlatform(platformRes.value.data);
     else applyAtPlatform(null);
     if (statusRes.status === 'rejected') throw statusRes.reason;
@@ -303,7 +333,7 @@ async function sendAtCommand(cmd?: string) {
   const controller = new AbortController();
   activeControllers.add(controller);
   try {
-    const { data } = await api.post('/api/at/command', { command }, { signal: controller.signal });
+    const { data } = await api.post('/api/at/command', { command, source: 'web' }, { signal: controller.signal });
     appendAt({
       id: nextId(),
       role: data.success === false ? 'error' : 'assistant',
@@ -352,8 +382,8 @@ async function execShellCmd(cmd?: string) {
   try {
     const { data } = await api.post(
       '/api/shell/exec',
-      { command, as_root: shellAsRoot.value, timeout: shellTimeout.value },
-      { signal: controller.signal },
+      { command, as_root: shellAsRoot.value, timeout: shellTimeout.value, source: 'web' },
+      { signal: controller.signal }
     );
     const exitCode = data.exit_code ?? (data.success ? 0 : -1);
     // stdout / stderr 合并为一条，stderr 段落前加标记，末尾追加 [exit: N]
@@ -386,21 +416,37 @@ function runQuick(cmd: string) {
   if (activeTab.value === 'at') sendAtCommand(cmd);
   else execShellCmd(cmd);
 }
-function clearActive() {
-  if (activeTab.value === 'at') atMessages.value = [];
+async function clearActive() {
+  const channel = activeTab.value === 'at' ? 'at' : 'shell';
+  try {
+    // 历史在 core，清空对两端同时生效
+    await api.delete('/api/console/history', { params: { channel } });
+  } catch (e: any) {
+    message.error(apiError(e, '清空历史失败'));
+    return;
+  }
+  if (channel === 'at') atMessages.value = [];
   else shellMessages.value = [];
 }
 
 // ── 初始化 / 清理 ──
-onMounted(() => {
-  loadHistory();
+onMounted(async () => {
+  await migrateLegacyHistory();
+  loadHistory('at');
+  loadHistory('shell');
   loadAtStatus();
   loadShellRoot();
+});
+// 另一端（或本端）执行命令后 core 会推 data_changed:console:<channel>，拉一次对齐
+const unsubConsole = wsStore.on('data_changed', (payload: any) => {
+  const changed = String(payload?.changed ?? '');
+  if (changed === 'console:at') loadHistory('at');
+  else if (changed === 'console:shell') loadHistory('shell');
 });
 onUnmounted(() => {
   activeControllers.forEach((c) => c.abort());
   activeControllers.clear();
-  if (saveTimer) clearTimeout(saveTimer);
+  unsubConsole();
 });
 </script>
 
@@ -445,7 +491,7 @@ onUnmounted(() => {
   background: var(--text-muted);
 }
 .status-dot.active {
-  background: #18a058;
+  background: var(--success);
 }
 .status-platform {
   color: var(--text-muted);

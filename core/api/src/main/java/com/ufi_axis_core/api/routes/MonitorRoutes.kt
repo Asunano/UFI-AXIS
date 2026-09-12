@@ -66,7 +66,13 @@ data class MonitorPreferences(
     /** 温控熔断阈值 ℃ 55..100（到这个温度暂停采集） */
     val thermalCriticalC: Int = 80,
     /** 温控熔断暂停时长（秒）5..300 */
-    val thermalPauseSec: Int = 20
+    val thermalPauseSec: Int = 20,
+
+    // ── 2026-09-08 补齐：2026-09-03 那次漏掉的最后两个 DataScheduler 常量 ──
+    /** 套餐限额百分比检查间隔（秒）60..3600。下限 60 是为了不跟设备 Web UI 抢 goform 会话 */
+    val trafficLimitCheckSec: Int = 300,
+    /** WiFi 客户端接入/离开的比对间隔（秒）15..600。接入与离开共用同一次 station_list 查询 */
+    val deviceEventCheckSec: Int = 60
 )
 
 
@@ -136,23 +142,29 @@ class MonitorRoutes(
         /** 返回第一条约束违规说明；全部合法返回 null。 */
         internal fun validatePreferences(p: MonitorPreferences): String? = when {
             p.defaultHours !in ALLOWED_HOURS ->
-                "defaultHours 必须是 ${ALLOWED_HOURS.sorted().joinToString("/")} 之一，收到 ${p.defaultHours}"
+                "默认时间范围（defaultHours）必须是 ${ALLOWED_HOURS.sorted().joinToString("/")} 之一，收到 ${p.defaultHours}"
             p.refreshIntervalSec !in REFRESH_MIN_SEC..REFRESH_MAX_SEC ->
-                "refreshIntervalSec 必须在 $REFRESH_MIN_SEC..$REFRESH_MAX_SEC 秒之间，收到 ${p.refreshIntervalSec}"
+                "自动刷新间隔（refreshIntervalSec）必须在 $REFRESH_MIN_SEC..$REFRESH_MAX_SEC 秒之间，收到 ${p.refreshIntervalSec}"
             p.fillAlpha < 0f || p.fillAlpha > 1f ->
-                "fillAlpha 必须在 0..1 之间，收到 ${p.fillAlpha}"
+                "图表填充透明度（fillAlpha）必须在 0..1 之间，收到 ${p.fillAlpha}"
             // ── 采集调度（2026-09-03）：范围与 AppSettings 的钳制保持一致，越界直接拒绝而不是静默夹住 ──
-            p.retentionDays !in 1..90 -> "retentionDays 必须在 1..90 天之间，收到 ${p.retentionDays}"
-            p.flushIntervalSec !in 5..300 -> "flushIntervalSec 必须在 5..300 秒之间，收到 ${p.flushIntervalSec}"
-            p.alertScanSec !in 5..300 -> "alertScanSec 必须在 5..300 秒之间，收到 ${p.alertScanSec}"
-            p.idleIntervalSec !in 10..600 -> "idleIntervalSec 必须在 10..600 秒之间，收到 ${p.idleIntervalSec}"
-            p.thermalWarnC !in 50..90 -> "thermalWarnC 必须在 50..90℃ 之间，收到 ${p.thermalWarnC}"
-            p.thermalCriticalC !in 55..100 -> "thermalCriticalC 必须在 55..100℃ 之间，收到 ${p.thermalCriticalC}"
+            p.retentionDays !in 1..90 -> "历史保留天数（retentionDays）必须在 1..90 天之间，收到 ${p.retentionDays}"
+            p.flushIntervalSec !in 5..300 -> "采集写入间隔（flushIntervalSec）必须在 5..300 秒之间，收到 ${p.flushIntervalSec}"
+            p.alertScanSec !in 5..300 -> "告警扫描间隔（alertScanSec）必须在 5..300 秒之间，收到 ${p.alertScanSec}"
+            p.idleIntervalSec !in 10..600 -> "空闲采集间隔（idleIntervalSec）必须在 10..600 秒之间，收到 ${p.idleIntervalSec}"
+            p.thermalWarnC !in 50..90 -> "温控预警阈值（thermalWarnC）必须在 50..90℃ 之间，收到 ${p.thermalWarnC}"
+            p.thermalCriticalC !in 55..100 -> "温控熔断阈值（thermalCriticalC）必须在 55..100℃ 之间，收到 ${p.thermalCriticalC}"
             p.thermalCriticalC <= p.thermalWarnC ->
                 "熔断阈值必须高于预警阈值（收到 预警 ${p.thermalWarnC}℃ / 熔断 ${p.thermalCriticalC}℃）"
-            p.thermalPauseSec !in 5..300 -> "thermalPauseSec 必须在 5..300 秒之间，收到 ${p.thermalPauseSec}"
+            p.thermalPauseSec !in 5..300 -> "熔断暂停时长（thermalPauseSec）必须在 5..300 秒之间，收到 ${p.thermalPauseSec}"
+            // 2026-09-08 补齐的两项。下限刻意抬高（60 / 15 而不是 5）：这两个周期每轮都要向设备
+            // 发 goform 请求，与设备官方 Web UI 抢同一个会话，调太密会互相踢登录态。
+            p.trafficLimitCheckSec !in 60..3600 ->
+                "套餐限额检查间隔（trafficLimitCheckSec）必须在 60..3600 秒之间，收到 ${p.trafficLimitCheckSec}"
+            p.deviceEventCheckSec !in 15..600 ->
+                "设备事件检查间隔（deviceEventCheckSec）必须在 15..600 秒之间，收到 ${p.deviceEventCheckSec}"
             else -> (p.enabledTypes - METRIC_KEYS).takeIf { it.isNotEmpty() }?.let {
-                "enabledTypes 含未知指标：${it.sorted().joinToString(",")}"
+                "监控指标开关（enabledTypes）含未知指标：${it.sorted().joinToString(",")}"
             }
         }
     }
@@ -242,6 +254,18 @@ class MonitorRoutes(
 
             /**
              * 存储统计
+             *
+             * `size_kb` 是**按行估算**（`count × 每行字节常数`），不含索引与 SQLite 页开销，
+             * 也不反映"DELETE 之后文件不缩小"。要真实占盘得查 `dbstat`，那是编译期可选模块，
+             * 不保证在设备上可用，所以这里维持估算并在两端 UI 上明说。
+             *
+             * 2026-09-08 修掉两个坏掉的计数：
+             * - `alert_records` 原来取 `getRecentAlerts(1).size`，最大只会是 1（把"探测非空"当计数用了），
+             *   现在走新增的 `AlertDao.getCount()`。
+             * - `sms_records` 原来硬编码 0，因为 `SmsDao` 当时没有计数方法。表本身是真的
+             *   （`Entities.kt` 的 `@Entity(tableName = "sms_records")`），只是没人去数它。
+             *   现在补了 `SmsDao.getCount()`。注意这张表**不参与清理**（见下面 /clean 的说明），
+             *   所以它的占比只会涨不会降 —— 这正是需要如实显示的信息。
              */
             get("/storage") {
                 val tables = withContext(Dispatchers.IO) {
@@ -251,8 +275,8 @@ class MonitorRoutes(
                         tableInfo("traffic_records", database.trafficDao().getCount(), 50),
                         tableInfo("signal_history", database.signalDao().getCount(), 60),
                         tableInfo("battery_history", database.batteryHistoryDao().getCount(), 45),
-                        tableInfo("alert_records", runCatching { database.alertDao().getRecentAlerts(1) }.getOrNull()?.size ?: 0, 120),
-                        tableInfo("sms_records", 0, 200)
+                        tableInfo("alert_records", database.alertDao().getCount(), 120),
+                        tableInfo("sms_records", database.smsDao().getCount(), 200)
                     )
                 }
                 val totalKb = tables.sumOf { it["size_kb"] as Double }
@@ -450,7 +474,7 @@ class MonitorRoutes(
     }
 
     /**
-     * 采集调度那 7 项的真源是 AppSettings 的强类型字段（DataScheduler 直接读它，不解析 JSON），
+     * 采集调度那 9 项的真源是 AppSettings 的强类型字段（DataScheduler 直接读它，不解析 JSON），
      * 所以回读时统一用 settings 覆盖 blob 里的副本，避免两处不一致。
      */
     private fun withSchedulerFields(p: MonitorPreferences): MonitorPreferences = p.copy(
@@ -460,7 +484,9 @@ class MonitorRoutes(
         idleIntervalSec = settings.monitorIdleIntervalSec,
         thermalWarnC = settings.monitorThermalWarnC,
         thermalCriticalC = settings.monitorThermalCriticalC,
-        thermalPauseSec = settings.monitorThermalPauseSec
+        thermalPauseSec = settings.monitorThermalPauseSec,
+        trafficLimitCheckSec = settings.monitorTrafficLimitCheckSec,
+        deviceEventCheckSec = settings.monitorDeviceEventCheckSec
     )
 
     /** 把采集调度字段落到 AppSettings（PUT 时调用） */
@@ -472,6 +498,8 @@ class MonitorRoutes(
         settings.monitorThermalWarnC = p.thermalWarnC
         settings.monitorThermalCriticalC = p.thermalCriticalC
         settings.monitorThermalPauseSec = p.thermalPauseSec
+        settings.monitorTrafficLimitCheckSec = p.trafficLimitCheckSec
+        settings.monitorDeviceEventCheckSec = p.deviceEventCheckSec
     }
 
     private fun tableInfo(name: String, count: Int, bytesPerRow: Int): Map<String, Any> {

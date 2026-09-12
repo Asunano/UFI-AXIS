@@ -1,10 +1,5 @@
 <template>
-  <n-modal
-    v-model:show="show"
-    preset="card"
-    title="WiFi 休眠定时"
-    style="width: 420px; max-width: calc(100vw - 32px)"
-  >
+  <n-modal v-model:show="show" preset="card" title="WiFi 休眠定时" style="width: 420px; max-width: calc(100vw - 32px)">
     <n-spin :show="sleepLoading">
       <div class="sleep-body">
         <div class="hint-text">空闲超过设定时长后关闭 WiFi；填 0 表示永不休眠。单位是分钟。</div>
@@ -12,12 +7,8 @@
           <template #suffix>分钟</template>
         </n-input-number>
         <div class="quick-options">
-          <n-button size="tiny" :type="sleepTime === 0 ? 'primary' : 'default'" @click="sleepTime = 0"
-            >不休眠</n-button
-          >
-          <n-button size="tiny" :type="sleepTime === 5 ? 'primary' : 'default'" @click="sleepTime = 5"
-            >5 分钟</n-button
-          >
+          <n-button size="tiny" :type="sleepTime === 0 ? 'primary' : 'default'" @click="sleepTime = 0">不休眠</n-button>
+          <n-button size="tiny" :type="sleepTime === 5 ? 'primary' : 'default'" @click="sleepTime = 5">5 分钟</n-button>
           <n-button size="tiny" :type="sleepTime === 15 ? 'primary' : 'default'" @click="sleepTime = 15"
             >15 分钟</n-button
           >

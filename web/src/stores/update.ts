@@ -274,7 +274,9 @@ export const useUpdateStore = defineStore('update', () => {
       }
     }
     if (Date.now() >= deadlineAt.value) {
-      failTimeout(`安装阶段超过 ${Math.round(INSTALL_DEADLINE_MS / 1000)} 秒仍未完成（core 状态：${status.value.state}）`);
+      failTimeout(
+        `安装阶段超过 ${Math.round(INSTALL_DEADLINE_MS / 1000)} 秒仍未完成（core 状态：${status.value.state}）`
+      );
     }
   }
 

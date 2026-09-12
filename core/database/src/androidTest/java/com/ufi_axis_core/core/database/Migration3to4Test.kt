@@ -63,9 +63,19 @@ class Migration3to4Test {
             )
         }
 
-        // 2) 以 v4 schema 打开（应用 MIGRATION_3_4）；打开成功即代表 schema 校验通过
+        // 2) 以当前 schema 打开（**完整迁移链**）；打开成功即代表 schema 校验通过
+        //
+        // 2026-09-08：这里原来只 `addMigrations(MIGRATION_3_4)` 且写作不带类名的
+        // `MIGRATION_3_4` —— 前者在 DB 版本涨到 4 以上之后必然抛「A migration from 4 to N
+        // was required but not found」，后者根本编译不过（迁移常量在 `AppDatabase` 的
+        // companion object 里，必须带类名限定）。这个测试跑在 androidTest（要设备）上，
+        // 所以两处都一直没人发现。修的是测试自身的写法，被测行为没变。
+        //
+        // 同日二次修正：改用 `AppDatabase.ALL_MIGRATIONS`。上一次是手抄一份迁移列表，
+        // 结果 DB 涨到 10 之后这里仍停在 8→9，同一个「缺迁移必抛」的坑又踩了一遍。
+        // 现在生产装配与两个迁移测试共用同一个数组，新增迁移不需要改这里。
         val appDb = Room.databaseBuilder(context, AppDatabase::class.java, migrateDbName)
-            .addMigrations(MIGRATION_3_4)
+            .addMigrations(*AppDatabase.ALL_MIGRATIONS)
             .build()
 
         appDb.use { db ->

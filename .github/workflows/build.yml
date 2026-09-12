@@ -29,11 +29,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # ── 安全守卫：签名凭据绝不允许入库（2026-09-12）──
+      # keystore.properties / *.jks / signing.properties 一旦被跟踪，凭据就永久留在 git
+      # 历史里。本项目的更新通道是 version.json.apkUrl 静默自动更新，签名私钥泄露等价于
+      # 全量设备的远程代码执行，因此把「不入库」从约定升级成可执行的 CI 门禁。
+      # 唯一例外：app/debug.keystore —— 公开的调试证书，刻意入库以统一各机 debug 签名
+      # （保住 adb install -r 覆盖能力），不含任何秘密。
+      - name: Guard — signing secrets must not be tracked
+        run: |
+          tracked=$(git ls-files -- '*.jks' '*.keystore' 'keystore.properties' 'signing.properties' \
+            | grep -v '^app/debug\.keystore$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::检测到被跟踪的签名凭据文件，请先 git rm --cached 再提交："
+            echo "$tracked"
+            exit 1
+          fi
+          echo "OK: 未发现入库的签名凭据"
+
+      # ── 编码守卫：跟踪的文本文件必须是 UTF-8（2026-09-12）──
+      # 起因：app/viewmodel 的 FileShortcutRepository.kt 曾整文件以 **GBK** 入库并长期隐身 ——
+      # Kotlin 编译器只对**注释里**的非法编码静默容忍，构建不报错，而在 IDE / GitHub / grep
+      # 下中文注释全是乱码，还随时可能被 UTF-8 编辑器二次写坏。
+      # 用**扩展名白名单**而不是黑名单：core/src/main/assets/shell/ 下的 ARM 可执行文件
+      # 没有扩展名，黑名单会漏进来被误判成「非 UTF-8」。
+      # 刻意不列 *.bat：scripts/UFI-AXIS-Core-install 那个安装脚本第 3 行是 `chcp 936`，
+      # GBK 编码与代码页匹配才是正确的，转成 UTF-8 反而会输出乱码。
+      - name: Guard — tracked text files must be UTF-8
+        run: |
+          bad=$(git ls-files '*.kt' '*.kts' '*.java' '*.aidl' '*.pro' '*.keep' \
+                  '*.ts' '*.vue' '*.mjs' '*.js' '*.json' '*.css' '*.html' '*.svg' \
+                  '*.xml' '*.md' '*.yml' '*.yaml' '*.toml' '*.properties' '*.py' '*.sh' \
+                | while read -r f; do
+                    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || echo "$f"
+                  done)
+          if [ -n "$bad" ]; then
+            echo "::error::以下跟踪文件不是 UTF-8，请转码后再提交（iconv -f GBK -t UTF-8 <文件>）："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 跟踪的文本文件均为 UTF-8"
+
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
           java-version: '21'
+
+      # ── Gradle 缓存（2026-09-07）──
+      # 此前 CI 完全没有 Gradle 缓存：每次都重新下载全部依赖 + 重新解压 wrapper + 从零编译。
+      # setup-gradle 缓存 ~/.gradle（依赖、wrapper、build-cache-1 目录），按默认策略只在
+      # 默认分支写缓存、其他分支只读，避免特性分支互相污染。
+      - name: Setup Gradle (dependency & build cache)
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
@@ -80,7 +127,7 @@ jobs:
           fi
 
       - name: Build debug APKs
-        run: ./gradlew :core:assembleDebug :app:assembleDebug --no-daemon
+        run: ./gradlew :core:assembleDebug :app:assembleDebug
 
       - name: Upload core debug APK
         uses: actions/upload-artifact@v6

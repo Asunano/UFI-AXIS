@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * API 响应缓存 — 减少对 Goform/Shell 等慢速数据源的重复查询。
@@ -82,7 +83,43 @@ class ResponseCache(
     // 第三部分：防击穿锁（每 key 独立 Mutex，防止同 key 并发穿透）
     // ═══════════════════════════════════════════════════════════
 
-    private val locks = ConcurrentHashMap<String, Mutex>()
+    /**
+     * 一个 key 的防击穿锁 + 它的等待者引用计数。
+     *
+     * 为什么要显式计数而不是看 `mutex.isLocked`：`isLocked` 只在**真正挂上锁之后**才为 true，
+     * 而 [locks] 里的条目是 `computeIfAbsent` 先拿到、`withLock` 后加锁的 ——
+     * 这两步之间的那一瞬 `isLocked == false`，条目被判成垃圾回收掉，下一个协程
+     * `computeIfAbsent` 就会拿到一个**新** Mutex，两者并发进入临界区。
+     * 计数在拿到条目的同一次原子操作里 +1，这个窗口就不存在了。
+     */
+    private class LockEntry {
+        val mutex = Mutex()
+
+        /** 正在等待或持有 [mutex] 的协程数。归零且 key 不在缓存中才允许回收。 */
+        val waiters = AtomicInteger(0)
+    }
+
+    private val locks = ConcurrentHashMap<String, LockEntry>()
+
+    /**
+     * 取（必要时创建）一把 key 锁并登记一个等待者。
+     *
+     * `compute` 是 ConcurrentHashMap 的原子操作，"取到条目"与"计数 +1"在同一个 bin 锁里完成，
+     * 与 [cleanupLocks] 的 `computeIfPresent` 互斥 —— 不会出现"刚拿到条目就被别人回收"。
+     */
+    private fun acquireLock(key: String): LockEntry =
+        locks.compute(key) { _, existing ->
+            (existing ?: LockEntry()).also { it.waiters.incrementAndGet() }
+        }!!
+
+    /**
+     * 注销一个等待者。**必须放在 finally 里**：fetcher 抛异常、协程被取消都要走到，
+     * 否则计数只增不减，这个 key 的锁永远回收不掉（[locks] 无限增长又回到本来要修的问题）。
+     */
+    private fun releaseLock(entry: LockEntry) {
+        entry.waiters.decrementAndGet()
+    }
+
 
     /**
      * 数据新鲜度标记：当上游（WS 客户端全部断开 / 内部刷新失败）信号数据可能过期时置位，
@@ -116,14 +153,25 @@ class ResponseCache(
     /**
      * 清理不再需要的锁条目 — 当 locks 超过阈值时，移除不在缓存中的 key。
      * 防止长时间运行后 locks Map 无限增长。
+     *
+     * 只回收「既不在缓存里、又没有任何等待者」的锁。
+     *
+     * 早期实现是 `locks.keys.retainAll(activeKeys)`：某个 key 的 fetcher 还在飞的时候，
+     * 它恰恰**不在**缓存里（还没 put），锁于是被当成垃圾清掉；第二个协程拿到的是一个
+     * **新** Mutex，两者并发进入临界区 —— 防击穿保护刚好对最慢、最需要保护的那些 key 失效。
+     * 后来改成 `!mutex.isLocked` 判活，窗口只是缩小没有消失：`computeIfAbsent` 拿到 Mutex 之后、
+     * `withLock` 真正加锁之前它还不是 locked。现在判据换成 [LockEntry.waiters]，
+     * 而且判定与摘除都在 `computeIfPresent` 的同一个原子操作里，与 [acquireLock] 的 `compute` 互斥。
      */
     private fun cleanupLocks() {
         if (locks.size <= LOCKS_CLEAN_THRESHOLD) return
-        synchronized(lock) {
-            val activeKeys = cache.keys + anyCache.keys.map { "any:$it" }
-            locks.keys.retainAll(activeKeys)
+        val activeKeys = synchronized(lock) { cache.keys + anyCache.keys.map { "any:$it" } }
+        for (key in locks.keys) {
+            if (key in activeKeys) continue
+            locks.computeIfPresent(key) { _, entry -> if (entry.waiters.get() == 0) null else entry }
         }
     }
+
 
     // ═══════════════════════════════════════════════════════════
     // 第四部分：公开 API — 主缓存
@@ -157,9 +205,9 @@ class ResponseCache(
         if (readThroughPaused) getIgnoringTtl(key)?.let { return it }
 
         // 慢路径：按 key 加锁，防止同 key 并发穿透
-        val keyLock = locks.computeIfAbsent(key) { Mutex() }
+        val keyLock = acquireLock(key)
         return try {
-            keyLock.withLock {
+            keyLock.mutex.withLock {
                 // 双重检查
                 get(key)?.let { return it }
                 if (readThroughPaused) getIgnoringTtl(key)?.let { return it }
@@ -170,6 +218,8 @@ class ResponseCache(
                 data
             }
         } finally {
+            // 顺序要紧：先注销等待者再清理，否则自己这把锁永远被自己的计数挡着回收不掉。
+            releaseLock(keyLock)
             cleanupLocks()
         }
     }
@@ -297,9 +347,9 @@ class ResponseCache(
 
 
         // 慢路径：按 key 加锁（"any:" 前缀隔离 key 空间）
-        val keyLock = locks.computeIfAbsent("any:$key") { Mutex() }
+        val keyLock = acquireLock("any:$key")
         return try {
-            keyLock.withLock {
+            keyLock.mutex.withLock {
                 synchronized(lock) {
                     @Suppress("UNCHECKED_CAST")
                     val recheck = anyCache[key] as? AnyCacheEntry<T>
@@ -312,6 +362,7 @@ class ResponseCache(
                 data
             }
         } finally {
+            releaseLock(keyLock)
             cleanupLocks()
         }
     }

@@ -1,7 +1,11 @@
 <template>
   <div class="settings-panel">
-    <!-- Card 1.5: 前端资源 -->
-    <GridCard title="前端资源">
+    <!-- Card 1.5: 前端资源
+         2026-09-10 第二轮改为通栏：本卡与「后端更新」的高度都随**运行状态**变化 ——
+         前端侧会多出「内置版本」行（v-if override）与 web 更新状态面板（v-if 进行中），
+         后端侧会多出进度条与消息行。实测这两种状态下同行参差 59.5px（超 1 行）。
+         高度无法静态预测的卡片不能参与等高配对，所以两张都走通栏、本页不做配对。 -->
+    <GridCard class="full-width" title="前端资源">
       <template #extra>
         <n-button size="tiny" quaternary @click="loadWebVersion">刷新</n-button>
       </template>
@@ -18,7 +22,7 @@
         <InfoRow v-if="webVersion.mode === 'override'" label="内置版本" :value="webVersion.bundledVersion || '--'" />
       </div>
       <!-- Web 自动更新状态（从 root version.json 的 web 对象自拉取） -->
-      <div v-if="showWebUpdateStatus" class="web-update-status">
+      <div v-if="showWebUpdateStatus" class="web-update-status sub-panel">
         <div class="web-update-status-head">
           <n-tag :type="webUpdateStateType" size="small" :bordered="false">{{ webUpdateStateLabel }}</n-tag>
           <span class="web-update-status-msg">{{ webUpdateStatus.message }}</span>
@@ -49,8 +53,9 @@
       <input ref="fileInputRef" type="file" accept=".zip" style="display: none" @change="handleFileSelect" />
     </GridCard>
 
-    <!-- Card 1.6: 后端更新（core APK 自更新，/api/update/*）-->
-    <GridCard title="后端更新">
+    <!-- Card 1.6: 后端更新（core APK 自更新，/api/update/*）
+         通栏理由同上（高度随 state/progress/多出来的重检与重置按钮变化）。 -->
+    <GridCard class="full-width" title="后端更新">
       <template #extra>
         <n-button size="tiny" quaternary :loading="backendLoading" @click="loadBackendStatus">刷新</n-button>
       </template>
@@ -77,7 +82,7 @@
         <div v-if="apkUploadLabel" class="update-hint">{{ apkUploadLabel }}</div>
       </div>
       <!-- 「检查更新」的结果：只查不装。装不装由用户在二次确认弹窗里决定 -->
-      <div v-if="backendCheck" class="backend-check">
+      <div v-if="backendCheck" class="backend-check sub-panel">
         <div class="web-update-status-ver">
           当前 <b>{{ backendCheck.currentVersion || '—' }}</b>
           <span class="arrow">→</span>
@@ -118,27 +123,29 @@
         </n-button>
       </div>
       <input ref="apkInputRef" type="file" accept=".apk" style="display: none" @change="handleApkSelect" />
+    </GridCard>
 
-      <!-- 手机 App 安装包（core 从更新清单的 frontend 对象解析）-->
-      <div class="app-apk-section">
-        <div class="app-apk-head">
-          <span class="app-apk-title">手机 App 安装包</span>
-          <n-button size="tiny" quaternary :loading="appApkLoading" @click="loadAppApkInfo">查询</n-button>
+    <!-- Card 1.7: 手机 App 安装包（core 从更新清单的 frontend 对象解析）
+         2026-09-10 从「后端更新」卡里拆出来独立成卡，两个理由：
+         · 排版：内容上它是第三个关注点（web 资源 / core APK / app APK），塞在「后端更新」里
+           把那张卡撑到 291px，与同行的「前端资源」（233px）差 58px；而且它的高度取决于
+           有没有 changelog（v-if），是个随状态增长的偏移量，拆掉后两张卡的高度差收敛到 20px 内。
+         · 拆出来的这张卡仍会长短不定（未查询时只有一句提示），所以它走通栏，不与任何卡配对 ——
+           通栏卡不受「同一行等高」约束，不会产生空洞。 -->
+    <GridCard class="full-width" title="手机 App 安装包">
+      <template #extra>
+        <n-button size="tiny" quaternary :loading="appApkLoading" @click="loadAppApkInfo">查询</n-button>
+      </template>
+      <template v-if="appApk.version">
+        <InfoRow label="最新版本" :value="`${appApk.version}${appApk.versionCode ? ` (${appApk.versionCode})` : ''}`" />
+        <InfoRow v-if="appApk.changelog" label="更新说明" :value="appApk.changelog" />
+        <!-- 不用 GET /api/update/frontend-apk：它需要 Bearer 头，<a download> 带不上；
+             apk_url 是上游直链，浏览器可直接下载 -->
+        <div v-if="appApk.apkUrl" class="app-apk-link">
+          <a :href="appApk.apkUrl" target="_blank" rel="noreferrer noopener">下载 APK（上游直链）</a>
         </div>
-        <template v-if="appApk.version">
-          <InfoRow
-            label="最新版本"
-            :value="`${appApk.version}${appApk.versionCode ? ` (${appApk.versionCode})` : ''}`"
-          />
-          <InfoRow v-if="appApk.changelog" label="更新说明" :value="appApk.changelog" />
-          <!-- 不用 GET /api/update/frontend-apk：它需要 Bearer 头，<a download> 带不上；
-               apk_url 是上游直链，浏览器可直接下载 -->
-          <div v-if="appApk.apkUrl" class="app-apk-link">
-            <a :href="appApk.apkUrl" target="_blank" rel="noreferrer noopener">下载 APK（上游直链）</a>
-          </div>
-        </template>
-        <div v-else class="update-hint">点「查询」向 core 请求更新清单里的 App 版本信息（结果缓存 5 分钟）。</div>
-      </div>
+      </template>
+      <div v-else class="update-hint">点「查询」向 core 请求更新清单里的 App 版本信息（结果缓存 5 分钟）。</div>
     </GridCard>
   </div>
 </template>
@@ -409,9 +416,7 @@ const backendShowProgress = computed(() => BACKEND_BUSY_STATES.includes(backendS
 const backendLatestLabel = computed(
   () => backendCheck.value?.latestVersion || backendStatus.value.latestVersion || '--'
 );
-const showBackendRecheck = computed(
-  () => updateStore.phase === 'timeout' || backendStatus.value.state === 'failed'
-);
+const showBackendRecheck = computed(() => updateStore.phase === 'timeout' || backendStatus.value.state === 'failed');
 const showBackendReset = computed(
   () => ['failed', 'need_push', 'done'].includes(backendStatus.value.state) || updateStore.phase === 'timeout'
 );
@@ -668,12 +673,9 @@ onUnmounted(() => {
 }
 
 /* ── Web 自动更新状态 ── */
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .web-update-status {
   margin-top: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-subtle, #fafafa);
 }
 .web-update-status-head {
   display: flex;
@@ -705,10 +707,6 @@ onUnmounted(() => {
 }
 .backend-check {
   margin-top: 10px;
-  padding: 8px 10px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 8px;
-  background: var(--bg-subtle, #fafafa);
 }
 .update-hint {
   margin-top: 8px;
@@ -716,21 +714,8 @@ onUnmounted(() => {
   color: var(--text-muted);
   line-height: 1.5;
 }
-.app-apk-section {
-  margin-top: 14px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border-subtle);
-}
-.app-apk-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 4px;
-}
-.app-apk-title {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+/* .app-apk-section / .app-apk-head / .app-apk-title 已随「手机 App 安装包」独立成卡删除
+   （2026-09-10）—— 那三条是为「卡内二级分区」写的，拆成 GridCard 后卡头由 GridCard 提供。 */
 .app-apk-link {
   margin-top: 6px;
   font-size: 13px;

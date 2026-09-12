@@ -14,9 +14,18 @@
 import { computed } from 'vue';
 import type { ComputedRef } from 'vue';
 import { useAppStore } from '@/stores/app';
+import { cssVar } from '@/composables/cssVar';
 
 export interface ChartColors {
-  primary: string;
+  /**
+   * 图表/仪表里的「蓝」，来自 `--info`，**不是**品牌主色。
+   *
+   * 刻意不提供 `--accent-color`：主色现在与 `--success` 同为 #18a058，
+   * 多系列图一旦用主色，「主色」和「成功」就会画成同一根线 ——
+   * 流量图的下行/上行、仪表的「未设限额」与「余量充足」都会分不开。
+   * 系列配色要的是互相可区分，不是跟着换肤走，所以这里固定用语义色。
+   */
+  info: string;
   success: string;
   warning: string;
   error: string;
@@ -29,26 +38,20 @@ export interface ChartColors {
   popoverBg: string;
 }
 
-/** 把 CSS 变量解析成 canvas 能用的具体色值 */
-function cssVar(name: string, fallback: string): string {
-  if (typeof window === 'undefined') return fallback;
-  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return v || fallback;
-}
-
 /**
- * 解析后的图表配色，随暗色模式切换自动重算。
+ * 解析后的图表配色，随暗色模式 / 皮肤切换自动重算。
  *
- * 依赖 `appStore.darkMode`：store 的 toggleDarkMode 先改 ref 再切
- * documentElement 的 .dark class，computed 到下一次渲染才求值，
- * 那时 class 已经生效，getComputedStyle 读到的是新主题的值。
+ * 依赖 `appStore.darkMode` 与 `appStore.themeId`：store 先改 ref 再改 DOM
+ * （`.dark` class / `data-theme` 属性），computed 到下一次渲染才求值，
+ * 那时 DOM 已经生效，getComputedStyle 读到的是新主题的值。
  */
 export function useChartColors(): ComputedRef<ChartColors> {
   const appStore = useAppStore();
   return computed<ChartColors>(() => {
     void appStore.darkMode;
+    void appStore.themeId;
     return {
-      primary: cssVar('--accent-color', '#2080f0'),
+      info: cssVar('--info', '#2080f0'),
       success: cssVar('--success', '#18a058'),
       warning: cssVar('--warning', '#f0a020'),
       error: cssVar('--error', '#d03050'),

@@ -2,8 +2,7 @@ import { isCancel, type AxiosInstance, type AxiosResponse } from 'axios';
 import { getApiClient } from './useApi';
 import { useRequestScope } from './useRequestScope';
 
-export interface CancellableApi
-  extends Pick<AxiosInstance, 'get' | 'post' | 'put' | 'delete' | 'patch'> {
+export interface CancellableApi extends Pick<AxiosInstance, 'get' | 'post' | 'put' | 'delete' | 'patch'> {
   abortAll: () => void;
 }
 
@@ -23,9 +22,7 @@ export function useCancellableApi(): CancellableApi {
   const scope = useRequestScope();
   const base = getApiClient();
 
-  const wrap = <M extends 'get' | 'post' | 'put' | 'delete' | 'patch'>(
-    method: M
-  ): AxiosInstance[M] => {
+  const wrap = <M extends 'get' | 'post' | 'put' | 'delete' | 'patch'>(method: M): AxiosInstance[M] => {
     const orig = base[method] as (...args: unknown[]) => Promise<AxiosResponse>;
     const fn = (url: unknown, body?: unknown, config?: Record<string, unknown>) => {
       const controller = scope.newController();

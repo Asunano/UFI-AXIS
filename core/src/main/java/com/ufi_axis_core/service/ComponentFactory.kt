@@ -26,6 +26,7 @@ import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.AssetExtractor
 import com.ufi_axis_core.util.DynamicThreadPool
+import com.ufi_axis_core.util.LogPaths
 import com.ufi_axis_core.util.NativeExecProbe
 import com.ufi_axis_core.util.PairedDeviceStore
 import com.ufi_axis_core.util.ShellExecutor
@@ -63,15 +64,19 @@ object ComponentFactory {
         runCatching {
             // 把 /Download/UFI-AXIS/ 根目录下旧路径日志文件归档到 /log/_archive/。
             // 排除目录本身（仅匹配根目录下的文件，不递归）。
+            // 两个路径都取自 LogPaths（唯一真源）：这段 shell 拼在 Kotlin 里，
+            // 所以能引用常量 —— 与 assets 下那两个独立脚本不同（见 LogPaths 的说明）。
+            val archiveDir = LogPaths.dir(LogPaths.Component.ARCHIVE)
+            val legacyRoot = LogPaths.appRoot()
             val cmd = """
-                |ARCHIVE=/sdcard/Download/UFI-AXIS/log/_archive
+                |ARCHIVE=$archiveDir
                 |TS=$(date +%Y%m%d_%H%M%S)
                 |mkdir -p "${'$'}ARCHIVE" 2>/dev/null
                 |for f in \
-                |    /sdcard/Download/UFI-AXIS/ufi_update_*.log \
-                |    /sdcard/Download/UFI-AXIS/ufi_update_core*.log \
-                |    /sdcard/Download/UFI-AXIS/ufi_install_pi*.log \
-                |    /sdcard/Download/UFI-AXIS/.launch.out; do
+                |    $legacyRoot/ufi_update_*.log \
+                |    $legacyRoot/ufi_update_core*.log \
+                |    $legacyRoot/ufi_install_pi*.log \
+                |    $legacyRoot/.launch.out; do
                 |  [ -e "${'$'}f" ] || continue
                 |  bn="$(basename "${'$'}f")"
                 |  mv "${'$'}f" "${'$'}ARCHIVE/${'$'}TS"'_'"${'$'}bn" 2>/dev/null
@@ -152,7 +157,12 @@ object ComponentFactory {
         // 公钥验签，两者必须共用**同一个** verifier 实例——它内部持有 nonce 缓存，
         // 共享才能拦住"HTTP 用过的 nonce 拿去开 WS"这类跨通道重放。
         // PairedDeviceStore 构造时会迁移旧 pairedFingerprints（见其 init 块）。
-        val pairedDeviceStore = PairedDeviceStore(context.applicationContext, settings)
+        //
+        // 走 getInstance 而不是 new：本函数在没 reset() 的情况下可以跑第二遍（见开头那条 WARN），
+        // 直接 new 会造出第二个存储实例——各有各的锁与 flush 队列，旧实例排队中的那次落盘
+        // 会拿旧快照全量覆盖，把新实例刚写的配对记录抹掉。
+        val pairedDeviceStore = PairedDeviceStore.getInstance(context.applicationContext, settings)
+
         val deviceVerifier = com.ufi_axis_core.util.DeviceRequestVerifier(pairedDeviceStore)
         AppLogger.i(TAG, "[5.5] Paired device store & request verifier initialized")
 
@@ -175,7 +185,8 @@ object ComponentFactory {
 
         // ── 7. 告警引擎 ──
         // 告警系统通知统一由手机端 NotificationCenter 负责，device 端仅入库 + 广播（避免双进程重复弹通知）
-        val alert = AlertEngine(database.alertDao(), wsManager, settings, pushService)
+        // 投递（推送 + 邮件）在下面统一 attachNotifier，引擎本身不再持有 pushService。
+        val alert = AlertEngine(database.alertDao(), wsManager, settings)
         AppLogger.i(TAG, "[7] Alert engine initialized")
 
         // ── 8. 共享组件 ──
@@ -187,7 +198,19 @@ object ComponentFactory {
         AppLogger.i(TAG, "[8] Shared components initialized (cache + ws notification enabled)")
 
         // ── 8.5 SMS 控制器（提前创建，供 DataScheduler VC 扫描使用）──
-        val smsController = com.ufi_axis_core.controller.sms.SmsController(context, network.smsClient, database.smsReadStateDao(), database.smsVerificationCodeDao())
+        //
+        // 拦截规则 store 必须**先于** SmsController 创建：判定要在六个接入点上共用同一份
+        // @Volatile 内存快照，store 就是那份快照的唯一 owner（详见 SmsRuleStore 头注释）。
+        val smsRuleStore = com.ufi_axis_core.controller.sms.SmsRuleStore(
+            ruleDao = database.smsRuleDao(),
+            logDao = database.smsBlockedLogDao(),
+            exemptVerificationCode = { settings.smsFilterExemptVerificationCode },
+            storeFullBody = { settings.smsFilterStoreFullBody },
+            broadcaster = { type, data -> wsManager.broadcast(type, data) }
+        )
+        val smsController = com.ufi_axis_core.controller.sms.SmsController(
+            context, network.smsClient, database.smsReadStateDao(), database.smsVerificationCodeDao(), smsRuleStore
+        )
 
         // ── 9. 数据采集调度器 ──
         val scheduler = DataScheduler(
@@ -204,6 +227,7 @@ object ComponentFactory {
             settings = settings,
             vcDao = database.smsVerificationCodeDao(),
             smsController = smsController,
+            ruleStore = smsRuleStore,
             // SignalCollector 的字段映射表。它不吃"关归一化"那个开关（第 1 层就是归一化），
             // 所以关闭时也回落默认 profile。
             deviceProfile = deviceProfile ?: DeviceProfiles.DEFAULT
@@ -227,39 +251,144 @@ object ComponentFactory {
             systemCollector = collector.systemCollector,
             networkController = network.networkController,
             wifiClient = network.wifiClient,
-            networkClient = network.networkClient
+            networkClient = network.networkClient,
+            smsRuleStore = smsRuleStore
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
         scheduler.attachConditionEngine(controller.conditionEngine)
 
-        // 告警邮件：core 侧自产自销 —— 告警落库处直接发信，不再依赖 app 弹通知后回传。
-        // 场景 id 与 app 的 NotifyScene 对齐（connectivity 走 connectivity，其余归 alert），
-        // 用户在邮件设置里勾了哪个场景才发；app 侧这两个场景的 mailForward 已关，避免一条两封。
-        alert.attachMailForwarder { type, level, message, value, threshold ->
-            val scene = when (type) {
-                "connectivity" -> "connectivity"
-                "traffic_limit" -> "traffic80"   // 套餐限额百分比预警自成一个场景（≠ 绝对 MB 阈值告警）
-                "device_online", "device_offline" -> "events"
-                else -> "alert"
-            }
-            val detail = buildString {
-                appendLine("告警类型: $type")
-                appendLine("级别: $level")
-                if (value.isNotBlank()) appendLine("当前值: $value")
-                if (threshold.isNotBlank()) appendLine("阈值: $threshold")
-            }.trimEnd()
-            controller.smsForwardController.sendSceneNotification(scene, message, detail)
+        // 邮件路径的拦截判定（2026-09-08）：SmsForwardController 在 buildControllerGraph 里构造，
+        // 那一层拿不到 AppDatabase，所以规则 store 走 attach 注入。
+        controller.smsForwardController.attachRuleStore(smsRuleStore)
+        // 邮件投递记录（2026-09-08）：同样因为拿不到 AppDatabase 才走 attach。
+        // 记录只在唯一发信出口 `sendMail` 里写，没 attach 时只是不留历史、发信照走。
+        // 两道保留上限都是设置项（`NotificationConfig.history_max_rows` / `history_max_age_days`），
+        // 用 lambda 每次裁剪现取 —— attach 时读一次存下来就成了"改完要重启 core 才生效"的假开关。
+        controller.smsForwardController.attachMailHistory(
+            dao = database.mailSendRecordDao(),
+            maxRows = { NotificationRoutes.read(settings).history_max_rows },
+            maxAgeDays = { NotificationRoutes.read(settings).history_max_age_days }
+        )
+        // 启动期一次性：旧 `blacklist` prefs → sms_rule 表（读一次、删键、落幂等标记），随后加载快照。
+        // 异步跑，不阻塞装配 —— HTTP 服务要等 build() 返回才启动。
+        smsRuleStore.startStartupMaintenance(
+            controller.smsForwardController.takeLegacyBlacklistForMigration()
+        )
+
+        // ── 12.4 通知闸门与分发器（2026-09-08 阶段 1；2026-09-09 阶段 2 加 webhook）──
+        //
+        // 闸门判据 = NotificationConfig 的 `master_enabled &&（该渠道遵守免打扰时再过静默窗口）`。
+        // "渠道通道开不开"不在这里 —— 那件事的真源在各渠道自己那边
+        //（邮件 SmsForwardController.isSendable()、Webhook WebhookDelivery.isConfigured()）。
+        //
+        // 为什么判定在装配层包成 lambda：它要读 :core:api 的 NotificationConfig，而
+        // :core:controller / :core:common 都不能反向依赖它。判定实现全仓只有
+        // NotificationRoutes.notifyAllowed 一份，这里只是把它递下去。
+        //
+        // 入参是**渠道 id**：总闸对所有渠道同一份，但"免打扰要不要管我"是每渠道各自的
+        // 用户配置（邮件 mail_respect_dnd 默认 false；webhook respectDnd 默认 true ——
+        // 它跟状态栏一样会响铃）。不带参数的话就只能让渠道各自再判一次免打扰，
+        // 那就是第二份闸门判定。
+        //
+        // 返回值是**三态** GateVerdict（2026-09-10）：布尔分不出"总开关关着"与"在免打扰
+        // 时段"，而 CRITICAL 兜底只允许穿透后者。两半都在 notifyVerdict 里算好递下去，
+        // 分发器不重算任何一半。
+        val webhookStore = com.ufi_axis_core.controller.notify.WebhookConfigStore(context)
+        val localSmsStore = com.ufi_axis_core.controller.notify.LocalSmsConfigStore(context)
+        val notifyGate: (String) -> com.ufi_axis_core.notify.GateVerdict = { channelId ->
+            NotificationRoutes.notifyVerdict(
+                NotificationRoutes.read(settings),
+                java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY),
+                respectDnd = when (channelId) {
+                    com.ufi_axis_core.controller.sms.MailChannel.ID ->
+                        NotificationRoutes.read(settings).mail_respect_dnd
+                    com.ufi_axis_core.controller.notify.WebhookChannel.ID ->
+                        webhookStore.load().respectDnd
+                    com.ufi_axis_core.controller.notify.LocalSmsChannel.ID ->
+                        localSmsStore.load().respectDnd
+                    // 认不出的渠道按"遵守免打扰"处理：新渠道忘了在这里登记时，
+                    // 宁可半夜多静默一条，也不要默默绕过用户设的静默时段。
+                    else -> true
+                }
+            )
+        }
+        // 「此刻放不放行」的只读视图，给两个 /test 端点的 auto_notify_enabled 用 ——
+        // 读的和拦的是同一个 lambda，所以"界面上显示的状态"与"实际拦不拦"不会分叉。
+        val notifyGateOpen: (String) -> Boolean = { channelId ->
+            notifyGate(channelId) == com.ufi_axis_core.notify.GateVerdict.ALLOW
         }
 
-        // 下载结束 / 隧道异常同理：这两件事都发生在 core 内部（aria2 状态跃迁、看护重连放弃），
-        // 以前只有 app 前台轮询才能发现并回传，现在 core 自己发。
-        controller.downloadManager.attachMailForwarder { title, body ->
-            controller.smsForwardController.sendSceneNotification("download", title, body)
+        // 同一个谓词递给三个地方，但**只有分发器是强制点**：
+        // ① NotificationDispatcher —— 唯一拦投递的地方，而且按渠道判
+        //    （邮件/Webhook 受总闸约束 → Skipped(MASTER_OFF) / Skipped(QUIET_HOURS)；
+        //     推送不受约束照投，否则总闸默认关闭时 app 的 :ufi_notify 与 web 实时告警
+        //     会一条都收不到）；
+        // ② SmsForwardController.attachMailGate —— **只读取值口**，唯一用途是
+        //    POST /api/sms-forward/test 响应里的 auto_notify_enabled；
+        // ③ WebhookRoutes / LocalSmsRoutes 的 gate —— 同上。
+        controller.smsForwardController.attachMailGate {
+            notifyGateOpen(com.ufi_axis_core.controller.sms.MailChannel.ID)
         }
-        controller.tunnelManager.attachMailForwarder { title, body ->
-            controller.smsForwardController.sendSceneNotification("tunnel", title, body)
-        }
+
+        // criticalOverride：CRITICAL 兜底总开关的取值口（默认 true）。每次现读 ——
+        // 存下来等于"改了设置要重启 core 才生效"。穿透表与逐条理由在
+        // NotificationDispatcher.deliverTo 上，这里只负责把取值递下去。
+        val notificationDispatcher = com.ufi_axis_core.notify.NotificationDispatcher(
+            gate = notifyGate,
+            criticalOverride = { NotificationRoutes.read(settings).critical_override_enabled }
+        )
+        // 注册顺序 = 投递顺序（分发器串行投递）。push 放前面：它是内存操作、几乎立即返回，
+        // 而邮件那条要持 WakeLock 做 SMTP 握手，最坏几十秒。先把实时的那条发出去。
+        notificationDispatcher.register(com.ufi_axis_core.notify.PushChannel(pushService))
+        notificationDispatcher.register(
+            com.ufi_axis_core.controller.sms.MailChannel(controller.smsForwardController)
+        )
+        // Webhook（阶段 2）：投递记录写进邮件那张表（DB v11 的 channel 列就是为此加的），
+        // 但 insert + 环形裁剪的实现只有 SmsForwardController 那一份 —— 用函数接口接线，
+        // 免得让 Webhook 渠道去认识邮件控制器。
+        val webhookChannel = com.ufi_axis_core.controller.notify.WebhookChannel(
+            store = webhookStore,
+            history = com.ufi_axis_core.controller.notify.DeliveryHistoryRecorder {
+                channelId, scene, subject, target, outcome, detail ->
+                controller.smsForwardController.recordChannelHistory(
+                    channelId, scene, subject, target, outcome, detail
+                )
+            }
+        )
+        notificationDispatcher.register(webhookChannel)
+        // 本机短信（阶段 3）：唯一走**信令网**的渠道 —— 数据断了 / 套餐用尽 / 自动关网时，
+        // 邮件与 Webhook 恰恰都发不出去。发送出口复用 network.smsClient（全仓唯一那条
+        // goform SEND_SMS 通道），投递记录同样写进 mail_send_records 的 channel 列。
+        val localSmsChannel = com.ufi_axis_core.controller.notify.LocalSmsChannel(
+            store = localSmsStore,
+            smsClient = network.smsClient,
+            history = com.ufi_axis_core.controller.notify.DeliveryHistoryRecorder {
+                channelId, scene, subject, target, outcome, detail ->
+                controller.smsForwardController.recordChannelHistory(
+                    channelId, scene, subject, target, outcome, detail
+                )
+            }
+        )
+        notificationDispatcher.register(localSmsChannel)
+        val notifier: com.ufi_axis_core.notify.Notifier = { event -> notificationDispatcher.emit(event) }
+        AppLogger.i(TAG, "[12.4] 通知分发器已就绪（渠道：push + mail + webhook + local_sms）")
+
+        // 触发源装配：**一个签名、一行 attach**。
+        // 2026-09-08 之前这里是 50 行手写 lambda（告警 5 参数、下载/隧道 2 参数、
+        // 流量预警返回 Boolean、外加两条 attachPushService），加一个渠道要在这里再缝一遍。
+        //
+        // 「告警 type → scene」的映射表也不在这里了 —— 搬进了 AlertEngine.sceneOf：
+        // 装配层不该替告警引擎翻译它自己的 type。
+        alert.attachNotifier(notifier)
+        controller.downloadManager.attachNotifier(notifier)
+        controller.tunnelManager.attachNotifier(notifier)
+        // 设备短信的**邮件**：控制器判完短信业务后把事件交回分发器（限定 mail 渠道），
+        // 这样全仓只有一个重试循环。
+        controller.smsForwardController.attachNotifier(notifier)
+        // 设备短信的**推送**：scheduler 在"发现新短信"的边沿 emit（限定 push 渠道）。
+        // 两条链路的去重键不同（邮件按 lastForwardedSmsId、推送按每轮最新一条），所以分开 emit。
+        scheduler.attachNotifier(notifier)
 
 
 
@@ -275,11 +404,8 @@ object ComponentFactory {
         val trafficAutoOffGuard = TrafficAutoOffGuard(
             settings = settings,
             networkController = network.networkController,
-            // 走 traffic80 场景：与套餐限额预警同一个邮件场景，用户在邮件设置里勾了才发。
-            // 发信失败（含"场景没勾"）会返回 false，Guard 据此**放弃关网**。
-            mailSender = { title, body ->
-                controller.smsForwardController.sendSceneNotification("traffic80", title, body)
-            },
+            // 场景固定 traffic80（在 Guard 内部定），一个渠道都没投出去时 Guard **放弃关网**。
+            notifier = notifier,
         )
         scheduler.attachTrafficLimitProvider {
             val alertOn = NotificationRoutes.read(settings).traffic_80_enabled
@@ -335,15 +461,31 @@ object ComponentFactory {
         AppLogger.i(TAG, "[12.6] RouteContext initialized")
 
         // ── 13. API 路由 ──
+        // 终端命令历史：AT 与 Shell 共用一个 recorder（同一张表，两端共享同一份记录）。
+        // 必须先于 atRoutes / shellRoutes 构造。
+        val consoleRecorder = com.ufi_axis_core.api.routes.ConsoleHistoryRecorder(
+            dao = database.consoleHistoryDao(),
+            onChanged = { changed -> wsManager.broadcastDataChanged(changed) }
+        )
+        val consoleRoutes = com.ufi_axis_core.api.routes.ConsoleRoutes(
+            dao = database.consoleHistoryDao(),
+            recorder = consoleRecorder
+        )
+        // 配置备份：Assembler 负责各段内容，Routes 负责 ZIP / manifest / 加密
+        val backupRoutes = com.ufi_axis_core.api.routes.BackupRoutes(
+            settings = settings,
+            assembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database),
+            tunnelActive = { controller.tunnelManager.anyRunning() }
+        )
         val deviceRoutes = DeviceRoutes(routeCtx)
         val networkRoutes = NetworkRoutes(routeCtx)
         val systemRoutes = SystemRoutes(routeCtx)
         val trafficRoutes = TrafficRoutes(routeCtx)
         val simRoutes = SimRoutes(routeCtx)
-        val atRoutes = ATRoutes(collector.atChannel)
+        val atRoutes = ATRoutes(collector.atChannel, consoleRecorder)
         val alertRoutes = AlertRoutes(alert)
         val wifiRoutes = WifiRoutes(routeCtx)
-        val configRoutes = ConfigRoutes(settings)
+        val configRoutes = ConfigRoutes(settings) { smsRuleStore.reloadRules() }
         // 2026-08-10 设备更新：后端自拉取 + ADB 静默安装（P1 B2 改走 v4 守护脚本执行通道）
         // 读取已提取的 assets/shell/ufi_update.sh 模板（ComponentFactory 顶部已 extractAll），
         // 供 UpdateManager 覆盖写到 /data/local/tmp/ufi_update.sh 后 fire-and-forget 执行
@@ -382,10 +524,25 @@ object ComponentFactory {
         }
         val updateRoutes = com.ufi_axis_core.api.routes.UpdateRoutes(updateManager)
         val appRoutes = AppRoutes(appManager)
-        val shellRoutes = ShellRoutes()
+        val shellRoutes = ShellRoutes(consoleRecorder)
         val fileRoutes = FileRoutes()
-        val rootSmsRoutes = RootSmsRoutes(smsController, scheduler)
-        val smsForwardRoutes = SmsForwardRoutes(controller.smsForwardController)
+        val rootSmsRoutes = RootSmsRoutes(smsController, scheduler, smsRuleStore)
+        val smsForwardRoutes = SmsForwardRoutes(controller.smsForwardController, notifier)
+        // Webhook 渠道（阶段 2）：配置 + 测试。gate 传的是同一个谓词（按 webhook 渠道绑好
+        // respectDnd），只用于 /test 响应里的 auto_notify_enabled —— 不拦投递。
+        val webhookRoutes = com.ufi_axis_core.api.routes.WebhookRoutes(
+            store = webhookStore,
+            channel = webhookChannel,
+            notifier = notifier,
+            gate = { notifyGateOpen(com.ufi_axis_core.controller.notify.WebhookChannel.ID) }
+        )
+        // 本机短信渠道（阶段 3）：配置 + 测试。gate 同样只用于 /test 响应里的 auto_notify_enabled。
+        val localSmsRoutes = com.ufi_axis_core.api.routes.LocalSmsRoutes(
+            store = localSmsStore,
+            channel = localSmsChannel,
+            notifier = notifier,
+            gate = { notifyGateOpen(com.ufi_axis_core.controller.notify.LocalSmsChannel.ID) }
+        )
         val taskRoutes = TaskRoutes(controller.taskScheduler, controller.conditionEngine)
         val speedTestRoutes = SpeedTestRoutes()
         val debugLogRoutes = DebugLogRoutes()
@@ -425,7 +582,12 @@ object ComponentFactory {
         // ── 13.5 配对模式路由（免鉴权；发现改为网关探测 + 手动输入，不再注册 mDNS）──
         // pairedDeviceStore 已在 [5.5] 创建（WS 握手鉴权需要它）
         val pairingManager = PairingManager(settings, pairedDeviceStore)
-        val pairingRoutes = PairingRoutes(routeCtx, pairingManager)
+        val pairingRoutes = PairingRoutes(
+            routeCtx,
+            pairingManager,
+            // 隧道来源判据的第 1 条：没有隧道在跑时，回环接收地址只能是本机直连
+            tunnelActive = { controller.tunnelManager.anyRunning() }
+        )
         val pairedDevicesRoutes = PairedDevicesRoutes(pairingManager)
         AppLogger.i(TAG, "[13.5] Pairing components initialized")
 
@@ -458,6 +620,8 @@ object ComponentFactory {
             fileRoutes = fileRoutes,
             rootSmsRoutes = rootSmsRoutes,
             smsForwardRoutes = smsForwardRoutes,
+            webhookRoutes = webhookRoutes,
+            localSmsRoutes = localSmsRoutes,
             taskRoutes = taskRoutes,
             speedTestRoutes = speedTestRoutes,
             debugLogRoutes = debugLogRoutes,
@@ -473,7 +637,9 @@ object ComponentFactory {
             webResourceManager = webResourceManager,
             webUpdateRoutes = webUpdateRoutes,
             tunnelRoutes = tunnelRoutes,
-            componentRoutes = componentRoutes
+            componentRoutes = componentRoutes,
+            consoleRoutes = consoleRoutes,
+            backupRoutes = backupRoutes
         )
         AppLogger.i(TAG, "[14] HTTP server ready (with API cache)")
 
@@ -490,6 +656,9 @@ object ComponentFactory {
             serverGraph = buildServerGraph(
                 server = server,
                 wsManager = wsManager,
+                pushService = pushService,
+                notificationDispatcher = notificationDispatcher,
+                webhookChannel = webhookChannel,
                 authMiddleware = authMiddleware,
                 alertEngine = alert,
                 dataScheduler = scheduler,
@@ -611,7 +780,9 @@ object ComponentFactory {
         systemCollector: SystemCollector,
         networkController: NetworkController,
         wifiClient: GoformWifiClient,
-        networkClient: GoformNetworkClient
+        networkClient: GoformNetworkClient,
+        /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
+        smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore
     ): ControllerGraph {
         // SystemController 依赖 deviceClient，与原步骤 5 同阶段构造
         val systemController = SystemController(deviceClient)
@@ -634,6 +805,7 @@ object ComponentFactory {
             systemController = systemController,
             adbController = adbController,
             smsForwardController = smsForwardController,
+            smsRuleStore = smsRuleStore,
             downloadManager = downloadManager,
             taskScheduler = taskScheduler,
             conditionEngine = conditionEngine,
@@ -645,6 +817,9 @@ object ComponentFactory {
     private fun buildServerGraph(
         server: HttpServer,
         wsManager: WebSocketManager,
+        pushService: com.ufi_axis_core.api.websocket.WebSocketPushService,
+        notificationDispatcher: com.ufi_axis_core.notify.NotificationDispatcher,
+        webhookChannel: com.ufi_axis_core.controller.notify.WebhookChannel,
         authMiddleware: AuthMiddleware,
         alertEngine: AlertEngine,
         dataScheduler: DataScheduler,
@@ -654,6 +829,9 @@ object ComponentFactory {
         return ServerGraph(
             server = server,
             wsManager = wsManager,
+            pushService = pushService,
+            notificationDispatcher = notificationDispatcher,
+            webhookChannel = webhookChannel,
             authMiddleware = authMiddleware,
             alertEngine = alertEngine,
             dataScheduler = dataScheduler,

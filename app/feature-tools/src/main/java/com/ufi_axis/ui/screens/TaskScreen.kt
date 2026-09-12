@@ -50,6 +50,7 @@ import com.ufi_axis_core.util.CronParser.ScheduleValue
 import kotlinx.serialization.json.JsonPrimitive
 import java.text.SimpleDateFormat
 import java.util.*
+import com.ufi_axis.ui.theme.UfiMotion
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,30 +108,15 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
             if (selectedTab == 0) {
                 // ── 定时任务 ──
                 if (state.tasks.isEmpty() && !state.isLoading) {
-                    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(
-                                modifier = Modifier
-                                    .size(96.dp)
-                                    .clip(CircleShape)
-                                    .background(palette.accentContainer),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Default.Schedule, null, modifier = Modifier.size(48.dp), tint = palette.accent)
-                            }
-                            Spacer(Modifier.height(20.dp))
-                            Text(
-                                "暂无定时任务",
-                                style = UfiTextStyles.screenTitle,
-                                color = palette.textPrimary
-                            )
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                "点击右上角 + 创建第一个任务",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = palette.textSecondary
-                            )
-                            Spacer(Modifier.height(24.dp))
+                    // 2026-09-08：这里原来是手搓的「圆底图标 + 两级文字 + 胶囊按钮」整块。
+                    // 那套版式已经收进公共组件 [UfiEmptyState]（连尺寸档位一起提到 Spacing），
+                    // 本页改为调用它 —— 观感不变，全站空态从此只有一份实现。
+                    UfiEmptyState(
+                        icon = Icons.Default.Schedule,
+                        message = "暂无定时任务",
+                        hint = "点击右上角 + 创建第一个任务",
+                        modifier = Modifier.fillMaxSize(),
+                        action = {
                             Button(
                                 onClick = { navController.navigate("detail/task-edit") },
                                 shape = UfiCardDefaults.capsuleShape,
@@ -141,7 +127,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                                 Text("新建任务")
                             }
                         }
-                    }
+                    )
                 } else {
                     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(state.tasks, key = { it.id }) { task ->
@@ -157,30 +143,12 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
             } else {
                 // ── 条件规则（当…就…）──
                 if (state.rules.isEmpty() && !state.isLoading) {
-                    Box(Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(
-                                modifier = Modifier
-                                    .size(96.dp)
-                                    .clip(CircleShape)
-                                    .background(palette.accentContainer),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(Icons.Default.AutoAwesome, null, modifier = Modifier.size(48.dp), tint = palette.accent)
-                            }
-                            Spacer(Modifier.height(20.dp))
-                            Text(
-                                "暂无自动化规则",
-                                style = UfiTextStyles.screenTitle,
-                                color = palette.textPrimary
-                            )
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                "「当 流量达标 / 网络跳变 / 电量低 … 就 执行动作」",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = palette.textSecondary
-                            )
-                            Spacer(Modifier.height(24.dp))
+                    UfiEmptyState(
+                        icon = Icons.Default.AutoAwesome,
+                        message = "暂无自动化规则",
+                        hint = "当流量达标 / 网络切换 / 电量过低时自动执行动作",
+                        modifier = Modifier.fillMaxSize(),
+                        action = {
                             Button(
                                 onClick = { navController.navigate("detail/rule-edit") },
                                 shape = UfiCardDefaults.capsuleShape,
@@ -191,7 +159,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                                 Text("新建规则")
                             }
                         }
-                    }
+                    )
                 } else {
                     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(state.rules, key = { it.id }) { rule ->

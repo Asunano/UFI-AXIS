@@ -36,6 +36,7 @@
         class="chart-container"
         :series="trafficSeries"
         :window-ms="TRAFFIC_WINDOW_MS"
+        :sample-ms="TRAFFIC_SAMPLE_MS"
         :left-range="trafficRange"
         :left-formatter="formatSpeedAxis"
         :legend="false"
@@ -56,6 +57,7 @@
         class="chart-container"
         :series="signalSeries"
         :window-ms="SIGNAL_WINDOW_MS"
+        :sample-ms="SIGNAL_SAMPLE_MS"
         :left-range="dbmYRange"
         :right-range="dbYRange"
         :left-formatter="formatDbm"
@@ -120,6 +122,10 @@ const netDetailTab = ref<'traffic' | 'signal'>('traffic');
 // 那个"呼吸"比空白更碍眼，所以这次选固定窗口。
 const TRAFFIC_WINDOW_MS = 60_000; // 流量满窗 60s（约 60 点，1s 一帧）
 const SIGNAL_WINDOW_MS = 180_000; // 信号满窗 3min（约 18 点，10s 一帧）
+// 标称采样间隔：ScrollingLineChart 的笔尖推进速度按它算（与真实节奏一致时笔尖在屏幕上静止）。
+// 两个值都来自 core 的 WS 推送节奏，改那边的节奏时这里要跟着改。
+const TRAFFIC_SAMPLE_MS = 1_000;
+const SIGNAL_SAMPLE_MS = 10_000;
 const CHART_KEEP_SLACK_MS = 5_000; // 缓冲区比窗口多留一点，左端不出现缺口
 const TRAFFIC_FLOOR_KBPS = 128; // 流量 Y 轴下限：空闲时几百字节的噪点不该被放大成大波浪
 
@@ -190,7 +196,7 @@ const trafficSeries = computed<ScrollingSeries[]>(() => [
   {
     id: 'rx',
     name: '下行',
-    color: colors.value.primary,
+    color: colors.value.info,
     points: trafficHistory.value.map((p) => ({ t: p.t, v: p.rx })),
     area: true,
     width: 2,
@@ -225,7 +231,7 @@ const signalSeries = computed<ScrollingSeries[]>(() => [
   {
     id: 'rsrp',
     name: 'RSRP',
-    color: colors.value.primary,
+    color: colors.value.info,
     points: signalHistory.value.map((p) => ({ t: p.t, v: p.rsrp })),
     area: false,
     width: 1.8,

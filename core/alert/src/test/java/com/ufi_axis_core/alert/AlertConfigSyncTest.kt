@@ -8,8 +8,6 @@ import com.ufi_axis_core.core.database.AlertRecord
 import com.ufi_axis_core.core.database.TypeCount
 import com.ufi_axis_core.core.database.LevelCount
 import com.ufi_axis_core.util.AppSettings
-import com.ufi_axis_core.util.NotificationPushService
-import com.ufi_axis_core.util.PushNotification
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
@@ -50,6 +48,7 @@ class AlertConfigSyncTest {
             if (idx >= 0) rows[idx] = record
         }
         override suspend fun getRecentAlerts(limit: Int): List<AlertRecord> = rows.sortedByDescending { it.timestamp }.take(limit)
+        override suspend fun getCount(): Int = rows.size
         override suspend fun getAlertsBetween(startTime: Long, endTime: Long): List<AlertRecord> = rows.filter { it.timestamp in startTime..endTime }.sortedByDescending { it.timestamp }
         override suspend fun getUnacknowledgedAlerts(): List<AlertRecord> = rows.filter { !it.acknowledged }
         override suspend fun getLatestByType(type: String): AlertRecord? = rows.filter { it.type == type }.maxByOrNull { it.timestamp }
@@ -78,15 +77,6 @@ class AlertConfigSyncTest {
         override suspend fun ackResolved(minAgeSec: Long?): Int { var n = 0; rows.forEachIndexed { i, r -> if (r.resolvedAt != null) { rows[i] = r.copy(acknowledged = true); n++ } }; return n }
     }
 
-    /**
-     * 无副作用的推送桩：NotificationPushService 是接口，实现 push() 为空体即可。
-     * 用空实现而非 mock 可避免引入额外测试依赖；perType 门控用例会真的走到
-     * triggerAlert，断言落在 FakeAlertDao.rows 上，不依赖推送。
-     */
-    private class NoopPushService : NotificationPushService {
-        override fun push(notification: PushNotification) { /* 静默丢弃 */ }
-    }
-
     private lateinit var engine: AlertEngine
     private lateinit var dao: FakeAlertDao
 
@@ -94,7 +84,11 @@ class AlertConfigSyncTest {
     fun setup() {
         val settings = AppSettings(ApplicationProvider.getApplicationContext<Application>())
         dao = FakeAlertDao()
-        engine = AlertEngine(dao, WebSocketManager(null), settings, NoopPushService())
+        // 2026-09-08 阶段 1：引擎不再持有 pushService（投递统一走 attachNotifier）。
+        // 这里**故意不 attach**：本类测的是配置合并 / 版本守门 / perType 门控，断言全部落在
+        // FakeAlertDao.rows 上。没接分发器时 emitAlert 直接返回 —— 正好钉住
+        // 「投递发不出去不影响告警入库/广播」这条既有语义。
+        engine = AlertEngine(dao, WebSocketManager(null), settings)
     }
 
     @Test
@@ -151,20 +145,14 @@ class AlertConfigSyncTest {
         // 先让当前配置带上"别端设置过"的非默认值
         val base = engine.getConfig().copy(
             perType = mapOf("temperature" to false),
-            notifyEnabled = false,
-            minIntervalSec = 60,
-            edgeTriggeredOnly = false,
-            maxRows = 500
+            minIntervalSec = 60
         )
-        // 只传 {enabled, configVersion}（旧语义下会把上面 5 个字段全部重置为默认值）
+        // 只传 {enabled, configVersion}（旧语义下会把上面几个字段全部重置为默认值）
         val merged = AlertEngine.mergeConfigPatch(base, patch("""{"enabled":false,"configVersion":1}"""))
 
         assertFalse(merged.enabled)                                  // 显式字段生效
         assertEquals(mapOf("temperature" to false), merged.perType)   // 未传字段保持原值
-        assertFalse(merged.notifyEnabled)
         assertEquals(60, merged.minIntervalSec)
-        assertFalse(merged.edgeTriggeredOnly)
-        assertEquals(500, merged.maxRows)
     }
 
     @Test
@@ -185,7 +173,7 @@ class AlertConfigSyncTest {
         // 必须用 ConfigJson（encodeDefaults=true）编码 —— app 侧 AppJson 也是这个口径；
         // 若客户端用省略默认值的编码器，被省略的键在合并语义下等于"不改"（这是设计，不是 bug）。
         val base = engine.getConfig().copy(perType = mapOf("signal" to false))
-        val full = base.copy(perType = emptyMap(), notifyEnabled = false, temperatureWarning = 50.0)
+        val full = base.copy(perType = emptyMap(), temperatureWarning = 50.0)
         val fullJson = AlertEngine.ConfigJson
             .encodeToJsonElement(AlertEngine.AlertConfig.serializer(), full).jsonObject
 

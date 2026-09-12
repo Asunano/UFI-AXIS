@@ -86,6 +86,14 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/settings/SettingsView.vue'),
       },
       {
+        // 组件画廊：UI 改动的人工验收页。刻意**不挂进侧栏 menuOptions**（那是给用户的导航，
+        // 这页是给改 UI 的人用的），靠 #/gallery 直接访问。仍在 DefaultLayout 下，
+        // 所以照样受登录守卫保护，不会变成免鉴权入口。
+        path: 'gallery',
+        name: 'gallery',
+        component: () => import('@/views/gallery/GalleryView.vue'),
+      },
+      {
         // 配对与授权已并入设置页分栏。同样保留旧路径做重定向。
         path: 'pairing',
         redirect: { name: 'settings', query: { tab: 'pairing' } },

@@ -66,9 +66,7 @@ internal val SERVICE_INDEPENDENT_ROUTES: Set<String> = setOf(
     Routes.DETAIL_DATA_MANAGEMENT,
     Routes.DETAIL_MONITOR_SETTINGS,
     Routes.DETAIL_MONITOR_COLLECTION,
-    Routes.DETAIL_MONITOR_METRICS,
     Routes.DETAIL_MONITOR_CHART,
-    Routes.DETAIL_MONITOR_BEHAVIOR,
     Routes.DETAIL_MONITOR_SCHEDULER,
     Routes.DETAIL_MONITOR_STORAGE,
     Routes.DETAIL_ALERT_SETTINGS,
@@ -76,6 +74,14 @@ internal val SERVICE_INDEPENDENT_ROUTES: Set<String> = setOf(
     Routes.DETAIL_DAILY_NOTIFY,
     Routes.DETAIL_BACKGROUND_GUARD,
     Routes.DETAIL_NOTIFICATIONS_GUARD,
+    // 通知管理：分类开关、免打扰、保留上限写的都是本机 prefs（core 只是回显），
+    // core 挂着时也必须能改 —— 通知能不能弹是本机的事。
+    Routes.DETAIL_NOTIFY_MANAGE,
+    // 系统通知记录读本机 Room，与 core 服务无关；被 ServiceGate 换掉会让
+    // "core 挂了想查本机记录"直接没门。
+    Routes.DETAIL_NOTIFY_HISTORY,
+    // 投递记录在设备端：读不到就画空态，比换成「服务已停止」更贴近用户此刻想知道的事。
+    Routes.DETAIL_DELIVERY_HISTORY,
     Routes.DETAIL_DOWNLOAD_SETTINGS,
     Routes.DETAIL_DOWNLOAD_BASIC,
     Routes.DETAIL_DOWNLOAD_THROTTLE,

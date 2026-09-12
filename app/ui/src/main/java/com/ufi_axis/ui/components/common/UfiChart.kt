@@ -46,11 +46,13 @@ import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.platform.LocalDensity
 import com.ufi_axis.ui.theme.ChartAlert
 import com.ufi_axis.ui.theme.ChartWarn
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
@@ -60,6 +62,7 @@ import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 多 series 图表的单个数据序列。
@@ -145,7 +148,17 @@ fun UfiMonitorChart(
     //    传入统一域后：所有图共用同一条时间标尺，末点更早的序列老实地停在中间，
     //    刻度也自动同源（chartXPx / chartAxisTickTimes 都只吃 tMin/tSpan）。
     xDomainStartMs: Long? = null,
-    xDomainEndMs: Long? = null
+    xDomainEndMs: Long? = null,
+    // ── 2026-09-09：Y 轴列宽下限。
+    //    为什么要能外部指定：下面那段测量是「按最宽刻度文本自适应」，再用这个下限夹一下。
+    //    而绘图区左右外距都由算出来的宽度推导（symmetricHorizontal 时左右各来一次），
+    //    所以**下限直接决定了同屏多张图能不能对齐**：全都撞下限才对齐，谁的标签超了谁自己缩进更多。
+    //    此前监控页 8 张图里只有速率图的轴标签带单位（"12.3 MB/s"，9 字符 ≈ 63dp），
+    //    其余 6 张都 ≤4 字符被默认 32dp 夹平 —— 于是只有速率图的 X 轴又短又偏左，
+    //    而且量级跨过 1MB/s 时（"389.0 KB/s" 10 字符 ↔ 9 字符）宽度还会自己抖一下。
+    //    修法见 `Spacing.ChartYAxisAlignedWidth` 的说明：把各图标签字符数压到同一上界，
+    //    再把下限抬到能容纳这个上界，对齐就是"都被夹平"的结果，不依赖数据。
+    yAxisMinWidth: Dp = Spacing.ChartYAxisMinWidth
 ) {
     if (points.isEmpty()) return
 
@@ -330,24 +343,11 @@ fun UfiMonitorChart(
     }
     val tMinAll = tBounds.first
     val tSpanAll = (tBounds.second - tMinAll).coerceAtLeast(1L)
-    // X 轴刻度格式按**实际显示跨度**自适应（2026-09-03）。
-    // 原来这里无条件 `SimpleDateFormat("HH:mm")` 且 remember 不带 key，理由是"日期由卡片上方的
-    // 当前范围交代"。但那处只有 `yyyy-MM-dd ~ yyyy-MM-dd`，选近 7 天 / 近 30 天后三个刻度会显示成
-    // `13:26 … 01:26 … 13:26` —— 根本对不上是哪天的数据。
-    //
-    // 2026-09-04（X 轴错位修复）：跨度必须取 **tSpanAll**（= 绘图用的 tMin/tMax），
-    // 原来写的是 `points.last().t - points.first().t`（只看主 series）。单 series 时两者相等，
-    // 但多 series 取并集时就是两套边界 —— 刻度与曲线必须同源，这里不允许有第二个跨度定义。
-    val axisSpanMs = if (points.size >= 2) tSpanAll else 0L
-    val axisPattern = when {
-        // ≤36h：同一天或跨夜，时刻足够（也覆盖"今天"这一档）
-        axisSpanMs <= 36L * 3600_000L -> "HH:mm"
-        // ≤7 天：日期 + 时刻
-        axisSpanMs <= 7L * 86_400_000L -> "MM/dd HH:mm"
-        // 更长：只给日期，避免刻度互挤
-        else -> "MM/dd"
-    }
-    val axisTimeFmt = remember(axisPattern) { SimpleDateFormat(axisPattern, Locale.getDefault()) }
+    // X 轴刻度格式按**所选时间范围**判定（与 tooltip 同源，见上方 timeFmt）：
+    // "today" → 仅 HH:mm（不显示日期）；其它范围 → MM/dd HH:mm（显示日期）。
+    // 不再按「实际显示数据跨度」判定 —— 选了 7 天但设备早期无数据时，服务端会跳过空桶，
+    // 实际点集只跨 1 天，按跨度判定会误判为不跨天、仍不显示日期，与「选了别的区间就该显示日期」的预期相悖。
+    // tSpanAll 仍用于刻度在时间轴上的线性排布（chartXPx），仅格式不再依赖它。
     val selectedIndex = if (dragRatio >= 0f && points.size >= 2) {
         nearestIndexByTime(points, tMinAll + (tSpanAll * dragRatio.coerceIn(0f, 1f)).toLong())
     } else -1
@@ -393,7 +393,7 @@ fun UfiMonitorChart(
     // 2026-08-26 性能：5 次 textMeasurer.measure() 原来写在 composable 函数体里，
     // 每次重组（拖动、轮询、动画）都重测 5 遍文本；改为按「值域 + 小数位 + 单位」缓存。
     val density = LocalDensity.current
-    val yAxisWidth = remember(axisMinF, axisMaxF, yDecimals, yUnit, labelStyle, density) {
+    val yAxisWidth = remember(axisMinF, axisMaxF, yDecimals, yUnit, labelStyle, density, yAxisMinWidth) {
         with(density) {
             var maxW = 0
             for (i in 0..4) {
@@ -404,7 +404,7 @@ fun UfiMonitorChart(
                 ).size.width
                 if (w > maxW) maxW = w
             }
-            (maxW.toDp() + 4.dp).coerceAtLeast(32.dp)
+            (maxW.toDp() + 4.dp).coerceAtLeast(yAxisMinWidth)
         }
     }
     // 2026-08-24：图表与 Y 轴 / 卡片边框的内距减少 50%（4dp → 2dp），图表区更舒展。
@@ -950,7 +950,7 @@ fun UfiMonitorChart(
                 val tickStyle = labelStyle.copy(fontWeight = UfiWeight.Emphasis)
                 // (标签文本, 左上角 x) —— x 由 chartXPx 算出后减去半个文本宽做居中；
                 // 只对**文本框**做贴边夹取（首末标签不越出卡片），刻度本身的 x 不动。
-                val ticks = remember(rowWidth, plotStartPad, plotEndPad, tMinAll, tSpanAll, axisPattern, tickStyle, density) {
+                val ticks = remember(rowWidth, plotStartPad, plotEndPad, tMinAll, tSpanAll, timeFmt, tickStyle, density) {
                     with(density) {
                         val rowWidthPx = rowWidth.toPx()
                         val plotLeft = plotStartPad.toPx() + CHART_PLOT_INSET_PX
@@ -958,12 +958,12 @@ fun UfiMonitorChart(
                             2 * CHART_PLOT_INSET_PX).coerceAtLeast(1f)
                         // 同一 pattern 下各刻度文本等宽（HH:mm / MM/dd HH:mm 都是定长），测一个即可
                         val sampleWidth = textMeasurer.measure(
-                            AnnotatedString(axisTimeFmt.format(Date(tMinAll + tSpanAll))),
+                            AnnotatedString(timeFmt.format(Date(tMinAll + tSpanAll))),
                             style = tickStyle
                         ).size.width.toFloat()
                         val count = chartAxisTickCount(plotWidth, sampleWidth, gap = 8.dp.toPx())
                         chartAxisTickTimes(tMinAll, tSpanAll, count).map { t ->
-                            val label = axisTimeFmt.format(Date(t))
+                            val label = timeFmt.format(Date(t))
                             val w = textMeasurer.measure(AnnotatedString(label), style = tickStyle).size.width
                             val left = (chartXPx(t, tMinAll, tSpanAll, plotLeft, plotWidth) - w / 2f)
                                 .coerceIn(0f, (rowWidthPx - w).coerceAtLeast(0f))

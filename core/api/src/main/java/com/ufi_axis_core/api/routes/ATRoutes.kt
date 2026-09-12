@@ -2,6 +2,7 @@ package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.core.database.ConsoleHistoryRecord
 import io.ktor.http.*
 import io.ktor.server.application.call
 import io.ktor.server.request.*
@@ -17,7 +18,9 @@ import kotlinx.serialization.json.*
  * GET  /api/at/platform - 平台信息
  */
 class ATRoutes(
-    private val atChannel: ATChannel
+    private val atChannel: ATChannel,
+    /** 终端命令历史写入口：AT 与 Shell 共用一张表，两端共享同一份记录。 */
+    private val recorder: ConsoleHistoryRecorder
 ) {
     companion object {
         /**
@@ -44,6 +47,9 @@ class ATRoutes(
             post("/command") {
                 val params = call.receiveJsonObject()
                 val command = params["command"]?.jsonPrimitive?.contentOrNull ?: ""
+                // 发起端标识，仅用于历史列表展示；客户端自报，不参与任何判定。
+                val source = params["source"]?.jsonPrimitive?.contentOrNull
+                    ?: ConsoleHistoryRecord.SOURCE_UNKNOWN
 
                 if (command.isEmpty()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
@@ -53,6 +59,14 @@ class ATRoutes(
 
                 // ── 安全过滤：拦截危险 AT 命令 ──
                 if (isDangerousCommand(command)) {
+                    // 拦下的命令同样入库：审计里最该看的就是这部分。
+                    recorder.record(
+                        channel = ConsoleHistoryRecord.CHANNEL_AT,
+                        command = command,
+                        ok = false,
+                        stderr = "命令被安全策略拦截（可能导致基带崩溃或设备重启）",
+                        source = source
+                    )
                     call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
                         "Dangerous AT command blocked: $command",
                         mapOf("reason" to "This command may cause modem crash or device reboot"))
@@ -60,12 +74,26 @@ class ATRoutes(
                 }
 
                 if (!atChannel.isConnected) {
+                    // 通道没连上不入库：这不是一次"执行"，只是环境不满足，
+                    // 落库只会让历史里塞满一堆无信息量的失败行。
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "AT channel not connected")
                     return@post
                 }
 
+                val startedAt = System.currentTimeMillis()
                 val response = atChannel.sendCommand(command)
+                val elapsed = System.currentTimeMillis() - startedAt
+                // AT 没有退出码，exitCode 落 null（别用 0 顶替）；成败看有没有回响应。
+                recorder.record(
+                    channel = ConsoleHistoryRecord.CHANNEL_AT,
+                    command = command,
+                    ok = response != null,
+                    stdout = response ?: "",
+                    stderr = if (response == null) "无响应" else "",
+                    durationMs = elapsed,
+                    source = source
+                )
                 call.respond(toJsonElement(mapOf(
                     "command" to command,
                     "response" to (response ?: "No response"),

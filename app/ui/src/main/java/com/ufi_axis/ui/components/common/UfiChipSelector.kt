@@ -30,7 +30,6 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ResolvedPalette
@@ -287,6 +286,30 @@ private fun UfiSegment(
     }
 }
 
+/**
+ * 多选 chip 组（FlowRow 折行）。
+ *
+ * ## 2026-09-09：换掉 M3 FilterChip，补上与 [CategoryChip] 同款按压反馈
+ * 原实现是 M3 [FilterChip]，于是这一个组件成了全站唯一还带 **ripple、且按下毫无缩放**的 chip：
+ * [UfiSingleChipSelector] 2026-09-04 已改成分段控件 + `ufiPressScale`，[CategoryChip] 同档，
+ * 只有多选组还是安卓原生观感。同一页里（如清理弹窗）单选组和多选组并排时，一个会缩一个不会缩。
+ *
+ * 现在与 [CategoryChip] 完全同一套机制：
+ * - 按压：`ufiPressScale(PressScale.Chip)` + `tween(Duration.Micro)`，事件驱动编排，
+ *   短按也补播完"缩到位再弹回"（原因见 `ui/animation/PressFeedback.kt` 文件头）；
+ * - 选中/未选中的底色、描边、文字色各跑一条 `animateColorAsState(colorSwap)`，不再是硬切；
+ * - `indication = null`，去掉 ripple。
+ *
+ * **配色不变**（这是既有调用点的观感契约，不是这次要改的东西）：选中 = `chipSelectedBg`
+ * 淡底 + accent 文字 + accent 描边；未选中 = 透明底 + `chipUnselectedBorder` 描边。
+ * 传了 [accentColor] 时选中底改用该色 14%，与原 `FilterChipDefaults` 分支一致。
+ *
+ * 几何改为复用令牌（`SegmentHeight` + `Spacing.Medium`），与 [UfiSingleChipSelector] 的段等高 ——
+ * 原来靠 FilterChip 的默认 32dp 高，换掉实现后必须自己钉住，否则两种 chip 并排会差几个 dp。
+ *
+ * 公开签名与 2026-08-31 版一致（[F24] STABLE-UI-API），只换内部实现。
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun UfiMultiChipSelector(
     options: List<Pair<String, String>>,
@@ -302,25 +325,122 @@ fun UfiMultiChipSelector(
 ) {
     val palette = LocalResolvedPalette.current
     val accent = accentColor ?: palette.accent
+    // 选中底：自带语义色时用该色 14%，否则沿用全站 chip 的 chipSelectedBg（与旧 FilterChip 分支一致）
+    val selectedContainer = if (accentColor != null) accent.copy(alpha = 0.14f) else palette.chipSelectedBg
     FlowRow(
         modifier = modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(Spacing.Small),
         verticalArrangement = Arrangement.spacedBy(Spacing.Small)
     ) {
         options.forEach { (value, label) ->
-            val isSelected = value in selectedValues
-            FilterChip(
-                selected = isSelected,
-                onClick = { onToggle(value) },
-                label = { Text(label, style = MaterialTheme.typography.labelSmall) },
-                shape = UfiCardDefaults.chipShape,
-                border = BorderStroke(1.dp, if (isSelected) accent else palette.chipUnselectedBorder),
-                colors = FilterChipDefaults.filterChipColors(
-                    selectedContainerColor = if (accentColor != null) accent.copy(alpha = 0.14f) else palette.chipSelectedBg,
-                    selectedLabelColor = accent,
-                    selectedLeadingIconColor = accent
-                )
+            UfiMultiChip(
+                label = label,
+                selected = value in selectedValues,
+                accent = accent,
+                selectedContainer = selectedContainer,
+                onClick = { onToggle(value) }
             )
         }
+    }
+}
+
+/**
+ * 动作 chip 组（FlowRow 折行）—— 一排**互不相关的可点按钮**，没有选中态。
+ *
+ * 2026-09-11 新增。本文件原有的两个 chip 组都是**选择器**（[UfiSingleChipSelector] 单选、
+ * [UfiMultiChipSelector] 多选），语义都是"这几项里当前选了哪个"；
+ * 而"点一下就执行一次动作、点完这一排还长得一样"这类需求（如把占位符插到光标处）
+ * 用选择器表达就必须伪造一个永远为空的选中集，选中态动画也会误播。
+ * [UfiSettingsItem] 一项一行的做法在项数多时会摊成一长条列表，也不是这个语义。
+ *
+ * 视觉与按压反馈**完全复用 [CategoryChip] 的未选中态**（accent 12% 淡底 + accent 55% 描边
+ * + accent 文字 + `ufiPressScale(PressScale.Chip)`），所以这一排与全站其它 chip 同款，
+ * 本组件自身不画任何东西、只负责折行与间距。
+ *
+ * 间距与 [UfiMultiChipSelector] 逐字一致（两方向都是 [Spacing.Small]）——
+ * 同一页里动作 chip 与多选 chip 并排时不该差几个 dp。
+ *
+ * @param options `List<Pair<id, label>>`，与本文件另两个 chip 组同一形状；
+ *   `id` 回传给 [onClick]（label 常带装饰，如 `{{title}}`，不适合当标识）。
+ * @param onClick 点了哪一项，参数是该项的 `id`。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun UfiActionChipRow(
+    options: List<Pair<String, String>>,
+    onClick: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    FlowRow(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.Small),
+        verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+    ) {
+        options.forEach { (id, label) ->
+            // selected = false 恒定：本组无选中概念，CategoryChip 的未选中态就是"可点按钮"的样子。
+            CategoryChip(label = label, selected = false, onClick = { onClick(id) })
+        }
+    }
+}
+
+/**
+ * 多选组里的单个 chip。机制与 [CategoryChip] 一致（见 [UfiMultiChipSelector] 的 KDoc），
+ * 只有配色沿用多选组自己的契约（淡底 + accent 文字，而不是 CategoryChip 的 accent 实底 + 反色字）。
+ */
+@Composable
+private fun UfiMultiChip(
+    label: String,
+    selected: Boolean,
+    accent: Color,
+    selectedContainer: Color,
+    onClick: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val interactionSource = remember { MutableInteractionSource() }
+    val background by animateColorAsState(
+        targetValue = if (selected) selectedContainer else Color.Transparent,
+        animationSpec = ThemeMotion.colorSwap(),
+        label = "ufiMultiChipBg"
+    )
+    val borderColor by animateColorAsState(
+        targetValue = if (selected) accent else palette.chipUnselectedBorder,
+        animationSpec = ThemeMotion.colorSwap(),
+        label = "ufiMultiChipBorder"
+    )
+    val labelColor by animateColorAsState(
+        targetValue = if (selected) accent else palette.textSecondary,
+        animationSpec = ThemeMotion.colorSwap(),
+        label = "ufiMultiChipLabel"
+    )
+    Box(
+        modifier = Modifier
+            .height(Spacing.SegmentHeight)
+            .ufiPressScale(
+                interactionSource = interactionSource,
+                pressedScale = ThemeMotion.PressScale.Chip,
+                spec = tween(ThemeMotion.Duration.Micro)
+            )
+            .clip(UfiCardDefaults.chipShape)
+            .background(background, UfiCardDefaults.chipShape)
+            .border(
+                BorderStroke(UfiCardDefaults.hairlineBorderWidth, borderColor),
+                UfiCardDefaults.chipShape
+            )
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
+            .padding(horizontal = Spacing.Medium),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            // 与 UfiSegment 同款：两态同字重，避免选中时文本宽度变化导致 FlowRow 重排跳动
+            style = UfiTextStyles.captionEmphasis,
+            color = labelColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }

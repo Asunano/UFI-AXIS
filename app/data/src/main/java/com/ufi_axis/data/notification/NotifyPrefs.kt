@@ -45,8 +45,17 @@ object NotifyPrefs {
      * （也就是真正会写日志）之前就能拿到最新开关，无需为此额外唤醒进程。
      */
     private val MIRRORED_BOOL_KEYS: Map<String, Boolean> = mapOf(
+        // 2026-09-08：全局总闸与隧道分类都必须镜像 —— 状态栏通知由 `:ufi_notify` 发射，
+        // 它读不到主进程刚写的真源就会出现"关了还弹 / 开了不弹"。
+        NotificationCenter.KEY_NOTIFY_MASTER to false,
+        NotificationCenter.KEY_TUNNEL_NOTIF to false,
         NotificationCenter.KEY_ALERT_NOTIF to false,
         NotificationCenter.KEY_DND_ENABLED to false,
+        // 2026-09-10：「严重事件兜底」。`:ufi_notify` 是状态栏通知的唯一发射者，
+        // 而它的免打扰突破判据现在要过这个开关（NotificationCenter.notify 第 ④ 步）。
+        // 默认值 **true** —— 这一行是本 Map 里唯一非 false 的布尔，照抄上一行会让
+        // "从未同步过配置"的机器把兜底当成关，严重告警在静默时段被压成无声。
+        NotificationCenter.KEY_CRITICAL_OVERRIDE to NotificationCenter.DEFAULT_CRITICAL_OVERRIDE,
         NotificationCenter.KEY_GUARD_ENABLED to false,
         NotificationCenter.KEY_GUARD_FOREGROUND_KEEPALIVE to false,
         KEY_LOG_ENABLED to false,
@@ -77,7 +86,11 @@ object NotifyPrefs {
     private val MIRRORED_INT_KEYS: Map<String, Int> = mapOf(
         NotificationCenter.KEY_GUARD_INTERVAL_MINUTES to GuardScheduler.DEFAULT_INTERVAL_MINUTES,
         NotificationCenter.KEY_DND_START_HOUR to NotificationCenter.DEFAULT_DND_START_HOUR,
-        NotificationCenter.KEY_DND_END_HOUR to NotificationCenter.DEFAULT_DND_END_HOUR
+        NotificationCenter.KEY_DND_END_HOUR to NotificationCenter.DEFAULT_DND_END_HOUR,
+        // 2026-09-08：通知历史的两道保留上限。裁剪发生在写历史的那个进程（`:ufi_notify`），
+        // 不镜像的话用户改完设置要等到那个进程重启才生效。
+        NotificationCenter.KEY_HISTORY_MAX_ROWS to NotificationCenter.DEFAULT_HISTORY_MAX_ROWS,
+        NotificationCenter.KEY_HISTORY_MAX_AGE_DAYS to NotificationCenter.DEFAULT_HISTORY_MAX_AGE_DAYS
     )
 
     fun isNotifyProcess(): Boolean =

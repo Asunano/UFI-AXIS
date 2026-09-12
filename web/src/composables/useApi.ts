@@ -46,13 +46,17 @@ export function getApiClient(): AxiosInstance {
   });
 
   // 响应拦截器：鉴权失败 → 跳转登录。
-  // 444 是 core 自定义的鉴权失败码（见 AuthMiddleware.rejectAuth），必须和 401 同等处理，
-  // 否则 token 被吊销后前端只会一直报错而不会引导用户重新登录。
+  //
+  // **只有 444（吊销类）才丢凭据**。core AuthMiddleware：
+  // - 444 = token 无效 / 未配对 / 必须重新配对 → 清 token 回登录
+  // - 401 = 时间戳/签名/重放（可重试）→ 不能 clearAuth
+  // 旧实现把 401 也当吊销，测速等并发场景下一次签名竞态就会把用户踢下线
+  //（2026-09-08 / 2026-09-12 同类事故）。
   client.interceptors.response.use(
     (res) => res,
     (err) => {
       const status = err.response?.status;
-      if (status === 401 || status === 444) {
+      if (status === 444) {
         const appStore = useAppStore();
         appStore.clearAuth();
         router.push('/login');

@@ -10,9 +10,7 @@
       @update:value="(v: string) => emit('update:modelValue', v)"
       @keydown="onKeydown"
     />
-    <n-button type="primary" :loading="loading" :disabled="!modelValue.trim()" @click="emit('send')">
-      发送
-    </n-button>
+    <n-button type="primary" :loading="loading" :disabled="!modelValue.trim()" @click="emit('send')"> 发送 </n-button>
   </div>
 </template>
 

@@ -45,7 +45,7 @@ interface GoformGateway : Closeable {
     /** 重置登录态（含失败计数清零）。通常在用户改密码 / Core 重连成功后调用。 */
     fun resetLogin()
 
-    /** 更新 goform 管理密码并重置登录态。 */
+    /** 更新设备后台密码并重置登录态（符号名沿用 `goform*`：那是配置键的一部分）。 */
     fun updateGoformPassword(newPwd: String)
 
     /** 通用查询：批量 cmd，返回 JsonObject（TTL 缓存命中时直接返回）。 */

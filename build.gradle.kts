@@ -7,6 +7,29 @@ plugins {
     alias(libs.plugins.ksp) apply false
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// 签名凭据来源：仓库根 keystore.properties（已被 .gitignore 忽略，**严禁入库**）
+//
+// 为什么不写在 build.gradle.kts 里：此前 :app / :core 的 create("ufi") 把 keystore
+// 路径与两个口令写成字符串字面量。构建脚本是**提交候选**，一旦入库，口令就永久留在
+// git 历史里；而本项目的更新通道是 version.json.apkUrl 静默自动更新，签名私钥泄露
+// = 攻击者可签发验签通过的更新包。
+//
+// 这里在根项目读一次，子项目经 rootProject.extra["ufiKeystoreProps"] 取用。
+// 文件缺失时（CI 全新 checkout、新协作者）得到空 Properties：模块侧据此**不创建**
+// ufi 签名配置，benchmark 变体退化为未签名，构建本身不失败。
+//
+// 格式（四个键，storeFile 可用绝对路径）：
+//   ufi.storeFile=C:/Users/<you>/keystores/UFI-AXIS.jks
+//   ufi.storePassword=...
+//   ufi.keyAlias=UFI-AXIS
+//   ufi.keyPassword=...
+// ═════════════════════════════════════════════════════════════════════════════
+extra["ufiKeystoreProps"] = java.util.Properties().apply {
+    val propsFile = file("keystore.properties")
+    if (propsFile.exists()) propsFile.inputStream().use { load(it) }
+}
+
 // 注意：不要全局禁用 extractDebugAnnotations / extractReleaseAnnotations。
 // 在 AGP 9.x 中，syncDebugLibJars（同步 aar jar）把前者产出的 typedefs.txt
 // 列为必需输入；禁用后该文件永不存在，会导致所有 library 模块的 assemble 失败。
@@ -331,6 +354,20 @@ abstract class CheckLiteralBaselineTask : DefaultTask() {
                 "裸时长字面量（tween(数字) / durationMillis = 数字）",
                 Regex("""\btween\s*(?:<[^<>()]*>)?\s*\(\s*-?\d|\bdurationMillis\s*=\s*-?\d"""),
             ),
+            // 2026-09-07（P4f/P5 红线）：裸 M3 组件。业务页面应用自研 Ufi* 组件，
+            // 否则同一种按钮在不同页面长得不一样（G1 要消灭的正是这个）。
+            // `(?<![\w.])` 把 `UfiButton(` / `IconButton(` / `xxx.Card(` 全部排除掉 ——
+            // 只剩真正裸用的那 5 个 M3 名字。
+            //
+            // ⚠ 口径说明：本类**包含 app/ui 组件库内部**的合法使用（`UfiButton` 自己就得包 M3 `Button(`，
+            // 弹窗族要包 `AlertDialog(`）。之所以不按目录区分：Category 只有正则、没有路径过滤，
+            // 为一个类别加路径维度会把 task 复杂度翻一倍。总量不许上升同样能挡住"业务页面新增裸用"，
+            // 而库内部确需新增时按本文件既有规则（写理由 + 同 commit 上调基线）放行。
+            Category(
+                "m3",
+                "裸 M3 组件（Button / OutlinedButton / TextButton / Card / AlertDialog）",
+                Regex("""(?<![\w.])(?:OutlinedButton|TextButton|AlertDialog|Button|Card)\s*\("""),
+            ),
         )
 
         val BASELINE_HEADER = """
@@ -404,6 +441,21 @@ val checkLiteralBaseline = tasks.register<CheckLiteralBaselineTask>("checkLitera
     // 配置缓存友好：通过 providers 读取 -P 开关，Gradle 会把它记为构建输入
     updateBaseline.set(providers.gradleProperty("updateLiteralBaseline").map { true }.orElse(false))
     reportFile.set(layout.buildDirectory.file("reports/literal-baseline/literal-baseline-report.txt"))
+}
+
+// ⚠ 显式约束（2026-09-12）：本任务的输入是覆盖**仓库根目录**的 fileTree
+// （literalBaselineSources = fileTree(rootDir)），而 :core:network:copyWebDist 的产出目录
+// core/src/main/assets/web 正好在根下 —— 两个位置重叠却没有依赖边。后果是二者同处一次调用时
+// Gradle 会报 "uses this output of task ':core:network:copyWebDist' without declaring an
+// explicit or implicit dependency" 并**硬失败**（实测出现过一次；该问题对任务图形状 /
+// UP-TO-DATE 状态敏感，四种方式均未能稳定复现）。
+//
+// 与 core/build.gradle.kts 给 :core:merge*Assets 加 dependsOn 是同一问题的两种解：
+// 那边真的读 assets，必须 dependsOn；这边只需 mustRunAfter —— 仅约束顺序，
+// 不会让「只想查字面量」的人被迫跑一遍 npm build。
+// 注：CI 两条工作流都不跑本任务，故与发布链路无关，纯本地组合调用体验问题。
+checkLiteralBaseline.configure {
+    mustRunAfter(":core:network:copyWebDist")
 }
 
 // 挂 check 生命周期：`./gradlew check` 会带上它。

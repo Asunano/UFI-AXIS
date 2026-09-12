@@ -198,7 +198,7 @@ fun SettingsScreen(
                         trailing = { UfiSettingsChevron() }
                     )
                 }
-                // 关于设备
+                // 关于设备（备份与恢复的入口在其页内）
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Info,

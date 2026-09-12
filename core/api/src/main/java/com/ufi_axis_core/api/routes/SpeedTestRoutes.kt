@@ -11,21 +11,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
- * 测速端点：下行填充流、上行丢弃汇、零负载延迟探针。
+ * 测速端点：下行填充流、上行丢弃汇、零负载延迟探针、外网节点白名单转发。
  *
  * - `GET /api/speedtest?ckSize=N` — 按 N 个 1MiB 块流式吐填充数据（下行吞吐）。
  * - `POST /api/speedtest/upload` — 收下请求体后直接丢弃，只回报收到的字节数（上行吞吐）。
  * - `HEAD /api/speedtest` — 只回响应头，用于测延迟/抖动而不产生任何负载。
- *
- * 2026-08-26 加固：客户端在跑够时长后会直接关闭连接（这是正常流程，不是错误），
- * 原实现会让 `write` 抛 IOException 一路冒到 Ktor，日志里堆一片栈；同时 [limiter] 的
- * 令牌要等这次写彻底失败才释放。现在：读写失败即静默收尾，并加时间/字节预算，
- * 保证「慢客户端 + 大 ckSize」不会长时间占着并发位。
- *
- * 并发位从 6 提到 [MAX_CONCURRENT]：客户端改用多流并发测速（单方向 4 条），
- * 6 个位置会让「4 条下行 + web 端同时点一次」直接撞 429。
+ * - `GET|POST /api/speedtest/relay?url=` — **仅 Web**：把外网自建节点请求经 core 转发。
+ *   浏览器无法直连无 CORS 的测速站；App 仍直连节点，不走本端点。url 必须在白名单内。
  */
 class SpeedTestRoutes {
     private val tag = "SpeedTest"
@@ -35,7 +31,6 @@ class SpeedTestRoutes {
     fun register(route: Route) {
         route.route("/speedtest") {
             // ── 零负载延迟探针：只回头，不产生任何字节 ──
-            // 用 GET+立即断开来测延迟会白白搬运 1MiB，还会占一个并发位；HEAD 两者都不占。
             head {
                 call.response.headers.append(HttpHeaders.CacheControl, NO_STORE)
                 call.respond(HttpStatusCode.OK)
@@ -69,7 +64,6 @@ class SpeedTestRoutes {
                                 }
                                 flush()
                             } catch (e: IOException) {
-                                // 客户端测够了主动断开：正常路径，只记一行 debug，不要往上抛
                                 AppLogger.d(tag, "客户端提前断开，已发 $sent/$chunks MiB: ${e.message}")
                             }
                             if (sent < chunks) {
@@ -83,8 +77,6 @@ class SpeedTestRoutes {
             }
 
             // ── 上行：读完即丢，只回报字节数 ──
-            // 客户端按时间预算持续写（chunked，无 Content-Length），所以这里以「读到 EOF /
-            // 撞字节上限 / 撞时间预算」三者之一为终止条件，不依赖 Content-Length。
             post("/upload") {
                 if (!limiter.tryAcquire()) {
                     call.respond(HttpStatusCode.TooManyRequests, "请求频率过多")
@@ -107,12 +99,158 @@ class SpeedTestRoutes {
                         ContentType.Application.Json
                     )
                 } catch (e: IOException) {
-                    // 客户端跑够时长后直接掐掉上传连接：同下行，属正常收尾
                     AppLogger.d(tag, "上传连接提前断开，已收 $received 字节: ${e.message}")
                 } finally {
                     limiter.release()
                 }
             }
+
+            // ── Web 外网转发（白名单） ──
+            get("/relay") {
+                val target = resolveRelayTarget(call.request.queryParameters["url"])
+                if (target == null) {
+                    call.respond(HttpStatusCode.BadRequest, "Invalid speedtest url")
+                    return@get
+                }
+                val range = call.request.header(HttpHeaders.Range)
+                if (!limiter.tryAcquire()) {
+                    call.respond(HttpStatusCode.TooManyRequests, "请求频率过多")
+                    return@get
+                }
+                try {
+                    withContext(Dispatchers.IO) {
+                        val conn = openUpstream(target, "GET", range)
+                        try {
+                            val code = conn.responseCode
+                            if (code !in 200..299) {
+                                call.respond(HttpStatusCode.BadGateway, "Upstream HTTP $code")
+                                return@withContext
+                            }
+                            // 回传关键头，便于客户端识别 206 / 长度
+                            call.response.header(HttpHeaders.ContentType, "application/octet-stream")
+                            call.response.header(HttpHeaders.CacheControl, NO_STORE)
+                            conn.getHeaderField(HttpHeaders.ContentRange)?.let {
+                                call.response.header(HttpHeaders.ContentRange, it)
+                            }
+                            conn.getHeaderField(HttpHeaders.ContentLength)?.toLongOrNull()?.let {
+                                call.response.header(HttpHeaders.ContentLength, it.toString())
+                            }
+                            if (code == 206) {
+                                call.respondOutputStream(ContentType.Application.OctetStream, HttpStatusCode.PartialContent) {
+                                    relayCopy(conn, this)
+                                }
+                            } else {
+                                call.respondOutputStream(ContentType.Application.OctetStream) {
+                                    relayCopy(conn, this)
+                                }
+                            }
+                        } finally {
+                            conn.disconnect()
+                        }
+                    }
+                } catch (e: Exception) {
+                    AppLogger.w(tag, "relay GET failed: ${e.message}")
+                    runCatching { call.respond(HttpStatusCode.BadGateway, "Relay failed") }
+                } finally {
+                    limiter.release()
+                }
+            }
+
+            post("/relay") {
+                val target = resolveRelayTarget(call.request.queryParameters["url"])
+                if (target == null) {
+                    call.respond(HttpStatusCode.BadRequest, "Invalid speedtest url")
+                    return@post
+                }
+                if (!limiter.tryAcquire()) {
+                    call.respond(HttpStatusCode.TooManyRequests, "请求频率过多")
+                    return@post
+                }
+                var sent = 0L
+                try {
+                    withContext(Dispatchers.IO) {
+                        val conn = openUpstream(target, "POST", null)
+                        try {
+                            conn.doOutput = true
+                            conn.setRequestProperty(HttpHeaders.ContentType, "application/octet-stream")
+                            conn.outputStream.use { out ->
+                                val input = call.receiveStream()
+                                val sink = ByteArray(SINK_BUFFER_BYTES)
+                                val deadline = System.currentTimeMillis() + UPLOAD_RELAY_BUDGET_MS
+                                while (sent < UPLOAD_MAX_BYTES && System.currentTimeMillis() < deadline) {
+                                    val n = input.read(sink)
+                                    if (n == -1) break
+                                    out.write(sink, 0, n)
+                                    sent += n
+                                }
+                                out.flush()
+                            }
+                            val code = conn.responseCode
+                            if (code !in 200..299) {
+                                call.respond(HttpStatusCode.BadGateway, """{"success":false,"error":"Upstream HTTP $code","bytes":$sent}""")
+                                return@withContext
+                            }
+                            call.respondText(
+                                """{"success":true,"bytes":$sent}""",
+                                ContentType.Application.Json
+                            )
+                        } finally {
+                            conn.disconnect()
+                        }
+                    }
+                } catch (e: Exception) {
+                    AppLogger.w(tag, "relay POST failed: ${e.message}")
+                    runCatching {
+                        call.respond(
+                            HttpStatusCode.BadGateway,
+                            """{"success":false,"error":"Relay failed"}"""
+                        )
+                    }
+                } finally {
+                    limiter.release()
+                }
+            }
+        }
+    }
+
+    private fun resolveRelayTarget(raw: String?): URL? {
+        if (raw.isNullOrBlank()) return null
+        return try {
+            val url = URL(raw)
+            if (url.protocol != "https" && url.protocol != "http") return null
+            if (url.host.lowercase() !in ALLOWED_RELAY_HOSTS) return null
+            url
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun openUpstream(url: URL, method: String, range: String?): HttpURLConnection {
+        val conn = url.openConnection() as HttpURLConnection
+        conn.connectTimeout = 5_000
+        conn.readTimeout = 20_000
+        conn.instanceFollowRedirects = true
+        conn.requestMethod = method
+        conn.setRequestProperty(HttpHeaders.CacheControl, NO_STORE)
+        if (range != null) conn.setRequestProperty(HttpHeaders.Range, range)
+        return conn
+    }
+
+    private fun relayCopy(conn: HttpURLConnection, out: java.io.OutputStream) {
+        val input = conn.inputStream
+        val sink = ByteArray(SINK_BUFFER_BYTES)
+        val deadline = System.currentTimeMillis() + TRANSFER_BUDGET_MS
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                val n = input.read(sink)
+                if (n <= 0) break
+                out.write(sink, 0, n)
+            }
+            out.flush()
+        } catch (e: IOException) {
+            AppLogger.d(tag, "relay client closed: ${e.message}")
+        } finally {
+            runCatching { input.close() }
         }
     }
 
@@ -126,8 +264,13 @@ class SpeedTestRoutes {
         /** 上行单次最多接收 2 GiB，防止被当成免费丢弃汇无限灌 */
         const val UPLOAD_MAX_BYTES = 2L * 1024 * 1024 * 1024
 
+        const val UPLOAD_RELAY_BUDGET_MS = 30_000L
+
         const val SINK_BUFFER_BYTES = 64 * 1024
 
         const val NO_STORE = "no-store, no-cache, must-revalidate"
+
+        /** Web 外网转发白名单：与 App SpeedTestState.EXTERNAL_NODES 同源 */
+        val ALLOWED_RELAY_HOSTS = setOf("speedtestone.losn.cc")
     }
 }

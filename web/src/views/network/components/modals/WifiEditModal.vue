@@ -1,10 +1,5 @@
 <template>
-  <n-modal
-    v-model:show="show"
-    preset="dialog"
-    title="WiFi 设置"
-    style="width: 440px; max-width: calc(100vw - 32px)"
-  >
+  <n-modal v-model:show="show" preset="dialog" title="WiFi 设置" style="width: 440px; max-width: calc(100vw - 32px)">
     <n-form label-placement="left" label-width="80">
       <n-form-item label="SSID">
         <n-input v-model:value="wifiForm.ssid" />

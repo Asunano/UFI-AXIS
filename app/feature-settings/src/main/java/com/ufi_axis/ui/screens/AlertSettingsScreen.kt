@@ -1,15 +1,19 @@
 package com.ufi_axis.ui.screens
 
+import android.content.Context
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.BatteryStd
 import androidx.compose.material.icons.filled.DataUsage
+import androidx.compose.material.icons.filled.PieChart
 import androidx.compose.material.icons.filled.SignalCellularAlt
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material3.*
@@ -21,13 +25,19 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.AlertConfig
+import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis_core.contract.Alerts
 import kotlin.math.roundToInt
 
 /**
@@ -40,6 +50,10 @@ import kotlin.math.roundToInt
  * 2026-08-30：通知投递开关与免打扰时段已上移到 [NotificationsGuardScreen]（那是全局设置），
  * 本页只保留「哪些告警要检测、阈值多少」这类告警自身的配置。
  *
+ * 2026-09-08：本页**归属监控中心**（告警的产物就是监控中心的事件流），入口在监控中心顶栏；
+ * 「设备告警引擎」总开关同时迁回本页顶部 —— 通知页的 Hero 已经是客户端投递总闸
+ * `master_enabled`，两个不同层的开关不能共用一张 Hero。
+ *
  * 布局：UfiScreenScaffold + UfiPageBackground + UfiSettingsGroup 分组卡。
  */
 @OptIn(ExperimentalMaterial3Api::class)
@@ -50,8 +64,14 @@ fun AlertSettingsScreen(
 ) {
     val alertsState by viewModel.tools.alertsState.collectAsState()
     val alertPrefs by viewModel.alertPrefs.configFlow.collectAsState()
+    // 后三类的检测周期是监控采集调度的设置项（2026-09-08 起），副标要显示当前生效值 ——
+    // 写死数字会在用户改完之后变成谎话。
+    val monitorSettings by viewModel.monitorState.collectAsState()
     val config = alertPrefs ?: alertsState.config
     val palette = LocalResolvedPalette.current
+    val context = LocalContext.current
+    val prefs = remember { context.getSharedPreferences(NotificationCenter.PREFS_NAME, Context.MODE_PRIVATE) }
+
 
     // 总开关状态（core 端唯一真源镜像）：enabled=false → 引擎不检测/不入库/不广播
     // 2026-09-07：兜底由 `?: true` 改成 `?: false`，与 NotificationsGuardScreen.kt 的
@@ -65,9 +85,37 @@ fun AlertSettingsScreen(
     // 当前编辑的阈值类型（null = 弹窗关闭）
     var editingType by rememberSaveable { mutableStateOf<String?>(null) }
 
-    // 拉取最新配置（连接即拉取镜像）
+    // ── 二级闸门镜像（core `NotificationConfig` 的 traffic_80_enabled / device_events_enabled）──
+    //
+    // 这两个字段不只是"要不要弹通知"：`ComponentFactory` 拿它们当**取数闸门**
+    // （attachTrafficLimitProvider / attachDeviceEventWatcher 的 provider 返回 null），
+    // 关着时 core 连 goform 都不查，引擎自然也无从判定。所以套餐限额与设备接入/离开
+    // 这三类，只写 `perType` 是个假开关 —— 见下面 toggleTrafficLimitType / toggleDeviceEventType。
+    // 本地 prefs 是这两个字段的镜像（`NotificationConfigSync.applyRemote` 回写）。
+    var traffic80Gate by remember { mutableStateOf(prefs.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)) }
+    var deviceEventsGate by remember {
+        mutableStateOf(prefs.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false))
+    }
+
+    // 「日常通知」页写的是同两个字段，从那页返回后必须重读，否则本页显示的还是进页面那一刻的快照
+    // （与 NotificationsGuardScreen 的 ON_RESUME 重读同一个理由）。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                traffic80Gate = prefs.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)
+                deviceEventsGate = prefs.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // 拉取最新配置（连接即拉取镜像）。通知配置一起回读：上面两个闸门的真源在 core，
+    // 回显由 NotificationConfigSync 写进 prefs，ON_RESUME 那一遍就能读到。
     LaunchedEffect(Unit) {
         viewModel.tools.loadAlerts()
+        viewModel.tools.refreshNotificationConfig()
     }
 
     // 写总开关：经 AlertPrefsRepository（带 version 守门 + 409 重试）
@@ -83,6 +131,40 @@ fun AlertSettingsScreen(
         pushConfig { copy(perType = next) }
     }
 
+    /** 写二级闸门：本地镜像先落地（UI 立刻响应），再把那一个字段下发 core（真源）。 */
+    fun pushGate(coreField: String, prefsKey: String, on: Boolean) {
+        prefs.edit().putBoolean(prefsKey, on).apply()
+        viewModel.tools.updateNotificationConfig(mapOf(coreField to on))
+    }
+
+    /** 套餐限额预警：`perType[traffic_limit]` 与取数闸门 `traffic_80_enabled` 同开同关。 */
+    fun toggleTrafficLimitType(on: Boolean) {
+        if (config == null) return
+        togglePerType(Alerts.Type.TRAFFIC_LIMIT, on)
+        traffic80Gate = on
+        pushGate("traffic_80_enabled", NotificationCenter.KEY_TRAFFIC_80_NOTIF, on)
+    }
+
+    /**
+     * 设备接入 / 离开：两类共用同一道取数闸门 `device_events_enabled`（core 每 60s 比对
+     * station_list，一次取数供两个方向）。
+     *
+     * 打开任一类必须把闸门一起打开；关闭时**只有另一类也已关闭**才连闸门一起关 ——
+     * 否则关掉「设备接入提醒」会顺手把「设备离开提醒」的数据来源也掐掉。
+     */
+    fun toggleDeviceEventType(typeKey: String, on: Boolean) {
+        val current = config ?: return
+        val siblingKey =
+            if (typeKey == Alerts.Type.DEVICE_ONLINE) Alerts.Type.DEVICE_OFFLINE else Alerts.Type.DEVICE_ONLINE
+        togglePerType(typeKey, on)
+        val gate = on || (current.perType[siblingKey] ?: false)
+        if (gate != deviceEventsGate) {
+            deviceEventsGate = gate
+            pushGate("device_events_enabled", NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, gate)
+        }
+    }
+
+
 
     // 有效配置：**仅用于展示**（未加载时用本地默认值渲染，避免设置项空白）。
     // 写入路径一律走 pushConfig（内部 `config ?: return`），禁止用 effective 构造 PUT 载荷。
@@ -91,16 +173,38 @@ fun AlertSettingsScreen(
     UfiScreenScaffold(title = "告警设置", navController = navController, showBack = true) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
 
-            // ① 总开关已于 2026-08-30 从本页删除：[NotificationsGuardScreen] 的 Hero 卡
-            //   就是同一个 `AlertConfig.enabled`，两处摆同一个开关只会让人怀疑哪个才算数。
-            //   本页仍读它来决定各行是否可编辑（关闭时副标显示「总开关已关闭」）。
+            // ① 「设备告警引擎」总开关（2026-09-08 迁回本页）。
+            //
+            // 它 2026-08-30 曾被搬到「通知与守护」的 Hero 卡，但那页的 Hero 现在是**客户端投递
+            // 总闸** `master_enabled`（产生了要不要提醒你），而这个开关是 `AlertConfig.enabled`
+            // （设备端要不要产生告警）。两者不同层，摆在同一张 Hero 里必然有一个被读成另一个。
+            //
+            // 归属：告警的产物是**监控中心的事件流**，关掉它监控中心就一条事件都没有 ——
+            // 所以它属于监控中心，入口也开在那边（MonitorScreen 顶栏 + 事件列表的空态提示）。
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    title = "设备告警引擎",
+                    description = when {
+                        !configLoaded -> "配置加载中，暂不可修改"
+                        masterEnabled -> "设备按下方阈值检测并记录告警，事件出现在监控中心"
+                        else -> "已关闭 · 设备不再检测告警，监控中心不会有新事件"
+                    },
+                    trailing = {
+                        UfiSwitch(
+                            checked = masterEnabled,
+                            enabled = configLoaded,
+                            onCheckedChange = { on -> pushConfig { copy(enabled = on) } }
+                        )
+                    }
+                )
+            }
 
             // 镜像未拉到时的说明。原来夹在「免打扰」和「阈值配置」之间，
             // 但它解释的是整页为什么不可编辑，放到最上面才看得见。
             if (config == null) {
                 UfiSettingsGroup {
                     Text(
-                        text = alertsState.errorMessage?.let { "无法读取设备上的告警配置（$it）—— 下方显示默认值，暂不可修改，请检查连接后重试" }
+                        text = alertsState.errorMessage?.let { "无法读取设备上的告警配置（$it）。下方显示默认值，暂不可修改，请检查连接后重试" }
                             ?: "告警配置加载中... 下方显示默认值，暂不可修改",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.textSecondary
@@ -113,14 +217,19 @@ fun AlertSettingsScreen(
             //   （管的是"通道通不通"），不只服务于告警，放在告警页属于层级错位。
             //   免打扰（⑥）同理一并上移。
 
-            // ═══════════ ③ 告警类型与阈值（同一件事，2026-08-30 合并成一组） ═══════════
-            // 合并前是两张卡：「告警类型」只有开关、「阈值配置」只有入口，用户要在两张卡之间
-            // 来回对照才知道"温度告警开着、但阈值是多少"。现在一行搞定：
+            // ═══════════ ③ 各类告警：一类一张卡（2026-09-08 拆掉分组） ═══════════
+            //
+            // 2026-08-30 曾把「告警类型」与「阈值配置」两张卡合并成一组一行：
             //   右侧开关 = 这类要不要报；点整行 = 改阈值；副标 = 当前生效阈值。
-            // 连接性告警没有阈值可调（固定"断开超 1 分钟触发"），所以它不可点击。
-            // T13：镜像未加载完成时整组不可点（点开弹窗保存会把默认值写回设备）
-            UfiSettingsGroup {
-                UfiGroupHeader("告警类型与阈值")
+            // 那次合并解决的是"要在两张卡之间来回对照"，本次拆分解决的是另一件事：
+            // 八行挤在一张卡里，行与行之间只有一条隐形边界，而这八类彼此毫无关系
+            //（温度和"有人连了 WiFi"不是同一个话题）。一类一卡后每类的开关、阈值、
+            // 检测周期说明各自成块，扫一眼就知道边界在哪。
+            //
+            // 副标的写法：**有阈值的写当前阈值，没阈值的写检测周期**。后四类实时性差异很大
+            //（详见各行注释），不写出来用户只会以为"告警不灵"。
+            // T13：镜像未加载完成时全部不可点（点开弹窗保存会把默认值写回设备）
+            UfiSettingsRowCard {
                 AlertTypeRow(
                     label = "温度告警",
                     summary = "警告 ${fmt(effective.temperatureWarning)} °C · 严重 ${fmt(effective.temperatureCritical)} °C",
@@ -132,6 +241,8 @@ fun AlertSettingsScreen(
                     onCheckedChange = { togglePerType("temperature", it) },
                     onClick = { editingType = "temperature" }
                 )
+            }
+            UfiSettingsRowCard {
                 AlertTypeRow(
                     label = "电量告警",
                     summary = "警告 ${effective.batteryWarning} % · 严重 ${effective.batteryCritical} %",
@@ -143,6 +254,8 @@ fun AlertSettingsScreen(
                     onCheckedChange = { togglePerType("battery", it) },
                     onClick = { editingType = "battery" }
                 )
+            }
+            UfiSettingsRowCard {
                 AlertTypeRow(
                     label = "流量告警",
                     summary = "警告 ${FormatUtils.formatBytes(effective.trafficWarningMb * 1024 * 1024)} · 严重 ${FormatUtils.formatBytes(effective.trafficCriticalMb * 1024 * 1024)}",
@@ -154,6 +267,8 @@ fun AlertSettingsScreen(
                     onCheckedChange = { togglePerType("traffic", it) },
                     onClick = { editingType = "traffic" }
                 )
+            }
+            UfiSettingsRowCard {
                 AlertTypeRow(
                     label = "信号告警",
                     summary = "警告 ${effective.signalWarningRsrp} dBm · 严重 ${effective.signalCriticalRsrp} dBm",
@@ -165,9 +280,14 @@ fun AlertSettingsScreen(
                     onCheckedChange = { togglePerType("signal", it) },
                     onClick = { editingType = "signal" }
                 )
+            }
+            UfiSettingsRowCard {
+                // 连接性：确认窗口 `AlertEngine.CONNECTIVITY_CONFIRM_MS = 60_000L` 是硬编码，
+                // 不受「采集调度 → 告警扫描间隔」影响 —— 把扫描间隔调到 5 秒也还是要等满 60 秒
+                //（那样只是把"发现断开"的采样变密，地板仍是这一分钟）。所以不可点、也无阈值可调。
                 AlertTypeRow(
                     label = "连接性告警",
-                    summary = "断开超过 1 分钟触发 · 恢复后自动消警（无阈值可调）",
+                    summary = "断开持续满 60 秒才触发 · 恢复后自动消警（周期固定，无阈值可调）",
                     icon = Icons.Default.LinkOff,
                     checked = config?.perType?.get("connectivity") ?: false,
                     enabled = masterEnabled && configLoaded,
@@ -178,11 +298,70 @@ fun AlertSettingsScreen(
                 )
             }
 
+            // ── 以下三类 2026-09-07 补齐 ──
+            // core 的 AlertEngine 一直在检测它们（checkTrafficLimit / recordDeviceEvent），
+            // 但从来没有任何 UI 能把对应的 perType 键置 true，而 `typeEnabled` 的判据是
+            // `perType[type] == true`（缺键 = 关），于是这三类在实际使用中是**死的**。
+            // 类型常量取 core contract 的 `Alerts.Type`，避免与引擎的字面量分叉。
+            //
+            // 它们比上面 5 类多一道闸门（`traffic_80_enabled` / `device_events_enabled`），
+            // 开关一并写，见 toggleTrafficLimitType / toggleDeviceEventType 的说明。
+            //
+            // ★ 实时性（2026-09-08）：这三类的周期原来是 `DataScheduler` 里的编译期常量，
+            //   2026-09-03 那次把 flush/alertScan/idle/thermal 提到设置里时漏了它们，副标只能写
+            //   「周期固定」。现在两个常量已改成 `AppSettings.monitorTrafficLimitCheckSec` /
+            //   `monitorDeviceEventCheckSec`，副标改成读**当前生效值**并指向可改的地方 ——
+            //   写死一个数字就会在用户改完之后变成谎话。
+            UfiSettingsRowCard {
+                AlertTypeRow(
+                    label = "套餐限额预警",
+                    summary = "每 ${formatCheckInterval(monitorSettings.settings.trafficLimitCheckSec)}" +
+                        "查一次用量百分比（阈值取设备侧设置，默认 80%）· 周期在监控设置 → 采集调度里改",
+                    icon = Icons.Default.PieChart,
+                    checked = (config?.perType?.get(Alerts.Type.TRAFFIC_LIMIT) ?: false) && traffic80Gate,
+                    enabled = masterEnabled && configLoaded,
+                    configLoaded = configLoaded,
+                    masterEnabled = masterEnabled,
+                    onCheckedChange = { toggleTrafficLimitType(it) },
+                    onClick = null
+                )
+            }
+            UfiSettingsRowCard {
+                AlertTypeRow(
+                    label = "设备接入提醒",
+                    // 首轮只建基线不报事件，所以刚打开开关后第一条最迟要等两个周期（不是坏了）
+                    summary = "每 ${formatCheckInterval(monitorSettings.settings.deviceEventCheckSec)}" +
+                        "比对一次客户端列表 · 刚开启时首条最迟两个周期",
+                    icon = Icons.AutoMirrored.Filled.Login,
+                    checked = (config?.perType?.get(Alerts.Type.DEVICE_ONLINE) ?: false) && deviceEventsGate,
+                    enabled = masterEnabled && configLoaded,
+                    configLoaded = configLoaded,
+                    masterEnabled = masterEnabled,
+                    onCheckedChange = { toggleDeviceEventType(Alerts.Type.DEVICE_ONLINE, it) },
+                    onClick = null
+                )
+            }
+            UfiSettingsRowCard {
+                AlertTypeRow(
+                    label = "设备离开提醒",
+                    summary = "与接入提醒共用同一次比对，同样每 " +
+                        formatCheckInterval(monitorSettings.settings.deviceEventCheckSec),
+                    icon = Icons.AutoMirrored.Filled.Logout,
+                    checked = (config?.perType?.get(Alerts.Type.DEVICE_OFFLINE) ?: false) && deviceEventsGate,
+                    enabled = masterEnabled && configLoaded,
+                    configLoaded = configLoaded,
+                    masterEnabled = masterEnabled,
+                    onCheckedChange = { toggleDeviceEventType(Alerts.Type.DEVICE_OFFLINE, it) },
+                    onClick = null
+                )
+            }
+
 
             // ⑤ 原「日常通知」6 个场景已于 2026-08-30 迁到 [DailyNotifyScreen]
-
-            //   （Routes.DETAIL_DAILY_NOTIFY）。它们不看阈值、不入 alerts 表、不受本页
-            //   AlertConfig.enabled 约束，放在告警页只会拉长这一屏并造成"关总开关它们也停"的误解。
+            //   （Routes.DETAIL_DAILY_NOTIFY）。那边管的是"本机要不要弹这一类系统通知"，
+            //   与阈值无关，放在告警页只会拉长这一屏。
+            //   注意：其中连通性 / 流量限额 / 设备事件对应的是本页也有的告警分类，
+            //   两页各管一道闸门（这里管检测，那边管投递 + 取数），见 [DailyNotifyScreen] 的 KDoc。
 
 
             // ⑥ 免打扰同样上移到 [NotificationsGuardScreen]：它是全局静默时段，
@@ -634,4 +813,32 @@ private fun SliderValueChip(
 }
 
 private fun fmt(d: Double): String = if (d == d.toLong().toDouble()) d.toLong().toString() else d.toString()
+
+/**
+ * 检查周期的人话写法：整分钟说「N 分钟」，否则说「N 秒」。
+ *
+ * 值域是 15..3600 秒，全用秒会出现「每 1800 秒」这种没人算得清的写法，
+ * 全用分钟又表达不了 15 / 30 秒这两档。
+ */
+private fun formatCheckInterval(seconds: Int): String =
+    if (seconds >= 60 && seconds % 60 == 0) "${seconds / 60} 分钟" else "$seconds 秒"
+
+/**
+ * 三个带二级闸门的分类（套餐限额 / 设备接入 / 设备离开）当前闸门是否放行。
+ *
+ * 它们除 `perType` 外还受 core `NotificationConfig` 的 `traffic_80_enabled` /
+ * `device_events_enabled` 约束 —— `ComponentFactory` 用这两个字段决定**要不要向设备取数**，
+ * 关着时引擎连数据都拿不到。所以"这一类到底开着没"必须两者同时为真。
+ * 本地 prefs 是那两个字段的镜像（`NotificationConfigSync.applyRemote` 回写）。
+ *
+ * 供 [NotificationsGuardScreen] 的「N/M 类开启」摘要与本页那三行的 `checked` 共用同一判据 ——
+ * 分开写会让摘要与页面对不上。
+ */
+internal fun alertTypeGateEnabled(prefs: android.content.SharedPreferences, typeKey: String): Boolean =
+    when (typeKey) {
+        Alerts.Type.TRAFFIC_LIMIT -> prefs.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)
+        Alerts.Type.DEVICE_ONLINE, Alerts.Type.DEVICE_OFFLINE ->
+            prefs.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false)
+        else -> true
+    }
 

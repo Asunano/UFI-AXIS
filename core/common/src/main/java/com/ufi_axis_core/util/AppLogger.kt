@@ -75,8 +75,11 @@ object AppLogger {
      *
      * 布局：`<root>/<yyyy-MM-dd>/{app,at,error}.log`（+ 轮转出的 `.1`）——
      * 先按日期分目录、再按类型分文件，比原来 `app_2026-08-28.log` 平铺一堆更好翻。
+     *
+     * 路径取自 [LogPaths]（唯一真源）：这套目录同时被 DownloadLog / GoformSessionLog /
+     * UpdateManager / InstallService 与两个 shell 脚本使用，写字面量迟早漂移。
      */
-    private val USER_LOG_ROOT = File("/sdcard/Download/UFI-AXIS/log/core")
+    private val USER_LOG_ROOT = File(LogPaths.dir(LogPaths.Component.CORE))
 
     /**
      * 合法日志相对路径（防 `/api/debug-logs/files/{name}` 目录穿越）。

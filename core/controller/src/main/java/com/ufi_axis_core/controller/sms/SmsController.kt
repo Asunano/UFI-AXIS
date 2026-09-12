@@ -8,7 +8,9 @@ import com.ufi_axis_core.core.database.SmsReadStateDao
 import com.ufi_axis_core.core.database.SmsVerificationCode
 import com.ufi_axis_core.core.database.SmsVerificationCodeDao
 import com.ufi_axis_core.util.AppLogger
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
+
 
 /**
  * 短信控制器 —— 读取走 ContentResolver（学 UFI-TOOLS），写操作走 Goform 短会话。
@@ -27,7 +29,15 @@ class SmsController(
     private val context: Context? = null,
     private val smsClient: GoformSmsClient? = null,
     private val smsReadStateDao: SmsReadStateDao? = null,
-    private val vcDao: SmsVerificationCodeDao? = null
+    private val vcDao: SmsVerificationCodeDao? = null,
+    /**
+     * 拦截判定（2026-09-08）。读路径**只过滤、不写拦截记录** ——
+     * 记录只由三条写路径（邮件 / WS 推送 / 验证码入库）产生，否则每次下拉刷新列表
+     * 都会刷出一批重复记录，命中次数也会变成「你刷了几次列表」。
+     *
+     * null（降级装配）= 不过滤，与拦截功能上线前的行为一致。
+     */
+    private val ruleStore: SmsRuleStore? = null
 ) {
     private val tag = "SmsController"
 
@@ -65,7 +75,7 @@ class SmsController(
                             body = c.getString(2) ?: "",
                             date = c.getLong(3),
                             read = true, // 已读状态统一由本地 DB merge（与 goform 路径一致）
-                            direction = if (c.getInt(4) == 2) "sent" else "received"
+                            direction = smsDirectionFromType(c.getInt(4))
                         )
                     )
                 }
@@ -91,29 +101,110 @@ class SmsController(
         }
     }
 
+    /**
+     * 系统短信里**被拦截规则命中**的条数（null=不可用）。
+     *
+     * 为什么需要它：`getUnreadCount` 能靠 DB 解决（被拦的短信入库时就标了已读），
+     * 但「总数」的真源是系统 Provider，而关键词规则必须有正文才能判 —— DB 里没有正文。
+     * 所以只能真的扫一遍 `address + body` 两列。
+     *
+     * 代价可控：只在**存在启用规则时**才调用（[getTotalCount] / [getFilteredCount] 先短路），
+     * 而这两个方法挂在 `/api/sms/count` 这类按需 REST 上，不在 5s 轮询路径里。
+     */
+    private fun countBlockedLocal(phone: String? = null): Int? {
+        val ctx = context ?: return null
+        val store = ruleStore ?: return 0
+        return try {
+            val selection = if (phone.isNullOrBlank()) null else "address=?"
+            val args = if (phone.isNullOrBlank()) null else arrayOf(phone)
+            ctx.contentResolver.query(
+                Uri.parse("content://sms"), arrayOf("address", "body"), selection, args, null
+            )?.use { c ->
+                var blocked = 0
+                while (c.moveToNext()) {
+                    if (store.isBlocked(c.getString(0) ?: "", c.getString(1) ?: "")) blocked++
+                }
+                blocked
+            }
+        } catch (e: Exception) {
+            AppLogger.w(tag, "ContentResolver blocked-count failed: ${e.message}")
+            null
+        }
+    }
+
     suspend fun getAll(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms(null, limit, offset, phone)
     suspend fun getInbox(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms("inbox", limit, offset, phone)
     suspend fun getSent(limit: Int = 50, offset: Int = 0, phone: String? = null): List<SmsMessage> = readSms("sent", limit, offset, phone)
 
-    /** 按号码过滤的总数 */
+    /**
+     * **不经拦截过滤**的原始读取，供三条**写**路径使用（`DataScheduler` 的未读标记 /
+     * WS 推送 / 验证码扫描）。
+     *
+     * 为什么必须有这个口子：写路径的职责恰恰是「看到被拦的短信，然后决定不推、不入库、
+     * 标成已读，并写一条拦截记录」。如果它们也走过滤后的列表，被拦的短信对它们**根本不存在** ——
+     * 表现是拦截确实生效了，但「已拦截」列表永远是空的，用户完全无法自查自己漏了什么。
+     * （这个坑很隐蔽：过滤加在唯一读聚合点上看起来最干净，却顺手把记录来源也一起掐了。）
+     *
+     * 展示与计数路径**不要**用它 —— 用 [getAll] / [getInbox] / [getSent] / [getContactList]。
+     *
+     * @param fallbackOnEmpty ContentResolver **读到空列表**时是否再问一次 goform。
+     *   默认 false（列表/联系人等读路径保持原样：空就是空，绝不为此登录设备后台）；
+     *   邮件转发的扫窗口链路传 true —— 纯 goform 设备（短信只存在于 modem、不进系统
+     *   Provider）上 Provider 永远是空的，不兜底就等于邮件功能完全不工作。
+     */
+    suspend fun getAllUnfiltered(limit: Int = 50, fallbackOnEmpty: Boolean = false): List<SmsMessage> =
+        readSmsRaw(null, limit, fallbackOnEmpty = fallbackOnEmpty)
+
+    /**
+     * 按号码过滤的总数。
+     *
+     * 与 [readSms] **同口径**（都扣掉被拦截的）：不同口径的表现是界面上
+     * 「总数 50 却只列出 48 条」，用户会以为分页坏了。
+     */
     suspend fun getFilteredCount(phone: String?): Int {
         if (phone.isNullOrBlank()) return getTotalCount()
-        countSmsLocal(phone)?.let { return it }
+        countSmsLocal(phone)?.let { total ->
+            if (ruleStore?.hasActiveRules() != true) return total
+            return (total - (countBlockedLocal(phone) ?: 0)).coerceAtLeast(0)
+        }
         // goform 兜底
         try {
             smsClient?.let { gc ->
                 val smsData = gc.getSmsList(page = 0, perPage = 200) ?: return@let
                 val arr = smsData["messages"]?.jsonArray ?: return@let
+                val store = ruleStore
                 return arr.count { el ->
-                    (el.jsonObject["number"]?.jsonPrimitive?.contentOrNull) == phone
+                    val obj = el.jsonObject
+                    if ((obj["number"]?.jsonPrimitive?.contentOrNull) != phone) return@count false
+                    if (store?.hasActiveRules() != true) return@count true
+                    // 与读列表同口径：拦截判定要正文，所以这里也得解一次 base64
+                    val content = decodeB64(
+                        obj["content"]?.jsonPrimitive?.contentOrNull ?: "",
+                        obj["encode_type"]?.jsonPrimitive?.contentOrNull ?: "0"
+                    )
+                    !store.isBlocked(phone, content)
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(
+                tag,
+                "getFilteredCount goform fallback failed, returning 0: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+
+        }
         return 0
     }
 
+
     /**
      * 联系人聚合列表（ContentResolver 优先，已读状态从本地 DB 合并）。
+     *
+     * 拦截过滤由 [readSms] 统一完成 —— 这里不能不过滤：被拉黑的号码如果还留在联系人列表里，
+     * 会变成一个「点进去什么都没有」的空会话，比不过滤更让人困惑。
+     * 而 `unread` 是对过滤后的消息做内存聚合，所以联系人未读数与总未读数天然一致。
      */
     suspend fun getContactList(): List<Map<String, Any>> {
         try {
@@ -134,20 +225,13 @@ class SmsController(
                     }
                     .values.sortedByDescending { it["latestTimestamp"] as Long }
             }
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "getContactList failed, returning empty list: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return emptyList()
     }
-
-    /**
-     * 获取最新一条短信（用于轮询检测新短信）——ContentResolver 优先，零 goform 请求。
-     *
-     * @param fallbackOnEmpty ContentResolver **读到空列表**时是否再问一次 goform。
-     *   默认 false（列表/联系人等读路径保持原样：空就是空，绝不为此登录设备后台）。
-     *   邮件转发链路传 true —— 纯 goform 设备（短信只存在于 modem、不进系统 Provider）
-     *   上 Provider 永远是空的，不兜底就等于邮件功能完全不工作。
-     */
-    suspend fun getLatest(fallbackOnEmpty: Boolean = false): SmsMessage? =
-        readSms(null, 1, fallbackOnEmpty = fallbackOnEmpty).firstOrNull()
 
 
     suspend fun getById(id: Long): SmsMessage? {
@@ -166,7 +250,7 @@ class SmsController(
                             body = c.getString(2) ?: "",
                             date = c.getLong(3),
                             read = true,
-                            direction = if (c.getInt(4) == 2) "sent" else "received"
+                            direction = smsDirectionFromType(c.getInt(4))
                         )
                         return mergeReadState(listOf(msg)).firstOrNull()
                     }
@@ -195,19 +279,40 @@ class SmsController(
                     }
                 }
             }
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "getById goform fallback failed for id=$id: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return null
     }
+
 
     suspend fun delete(id: Long): Boolean {
         // ① ContentResolver 直删（Android 4.4+ 非默认短信应用通常被拒，静默降级）
         try {
             val ctx = context
             if (ctx != null && ctx.contentResolver.delete(Uri.parse("content://sms/$id"), null, null) > 0) {
-                try { vcDao?.deleteByMsgId(id) } catch (_: Exception) {}
+                try { vcDao?.deleteByMsgId(id) } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                    AppLogger.w(
+                        tag,
+                        "delete: vc cascade cleanup failed for id=$id: " +
+                            "${e.javaClass.simpleName}: ${e.message}"
+                    )
+                }
                 return true
             }
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 非默认短信应用被 Provider 拒绝是预期路径，这里只是把「为什么被拒」留个痕，随后照旧走 goform。
+            AppLogger.w(
+                tag,
+                "delete via ContentResolver failed for id=$id, falling back to goform: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        }
+
         // ② goform 删除：id 可能是系统 _id（ContentResolver 路径），先解析出 goform
         //    消息 id 再删（短会话写操作，用户显式动作）
         try {
@@ -215,13 +320,25 @@ class SmsController(
                 val goformId = resolveGoformSmsId(id) ?: return@let
                 if (gc.deleteSms(goformId.toString())) {
                     // 级联清理验证码缓存
-                    try { vcDao?.deleteByMsgId(id) } catch (_: Exception) {}
+                    try { vcDao?.deleteByMsgId(id) } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                        AppLogger.w(
+                            tag,
+                            "delete: vc cascade cleanup failed for id=$id: " +
+                                "${e.javaClass.simpleName}: ${e.message}"
+                        )
+                    }
                     return true
                 }
+
             }
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "delete via goform failed for id=$id: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return false
     }
+
 
     /**
      * 跨 ID 体系定位：id 为 goform id 时原样返回；为系统 _id 时按 address+date
@@ -254,12 +371,23 @@ class SmsController(
         return null
     }
 
+    // 已读状态的四个写入口 + 未读计数以前全是 `catch (_: Exception) {}`：
+    // DAO 写失败只表现为「点了已读，红点不消失」，日志里一个字都没有，
+    // 分不清是 Room 出错还是 dao 没接上。统一补 WARN（不改控制流：仍然 return false / 0）。
+    // 注意：都是 suspend 路径，CancellationException 必须原样抛出，
+    // 否则协程取消会被当成「标记失败」吞掉，调用方看到的是假的业务失败。
+
     /** 标记单条已读（本地 DB） */
+
     suspend fun markAsRead(id: Long): Boolean {
         try {
             smsReadStateDao?.markRead(id)
             return true
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "markAsRead failed for id=$id: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return false
     }
 
@@ -268,7 +396,11 @@ class SmsController(
         try {
             smsReadStateDao?.markUnread(id)
             return true
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "markAsUnread failed for id=$id: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return false
     }
 
@@ -277,7 +409,11 @@ class SmsController(
         try {
             smsReadStateDao?.markConversationRead(phone)
             return true
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "markConversationRead failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return false
     }
 
@@ -286,9 +422,14 @@ class SmsController(
         try {
             smsReadStateDao?.markAllRead()
             return true
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "markAllRead failed: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return false
     }
+
 
     /**
      * 发送短信。唯一通道是 goform `SEND_SMS`（见 `GoformSmsClient.sendSms`）——
@@ -309,7 +450,10 @@ class SmsController(
                 // 未确认不等于失败（设备可能只是慢），按成功回但把状态说清楚
                 GoformSmsClient.SendVerdict.PENDING -> SendResult(true, "已提交设备：${outcome.detail}")
                 GoformSmsClient.SendVerdict.FAILED -> SendResult(false, outcome.detail)
-                GoformSmsClient.SendVerdict.REJECTED -> SendResult(false, "发送失败：${outcome.detail}")
+                // 两档"没发成功"对手动发送是同一个结果（失败 + 说明），只是原因不同：
+                // REJECTED 是设备明确拒收、NO_RESPONSE 是拿不到设备表态（可能已发出，别盲目重发）。
+                GoformSmsClient.SendVerdict.REJECTED,
+                GoformSmsClient.SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
             }
         } catch (e: Exception) {
             AppLogger.e(tag, "send failed", e)
@@ -321,14 +465,58 @@ class SmsController(
     suspend fun getUnreadCount(): Int {
         try {
             return smsReadStateDao?.getUnreadCount() ?: 0
-        } catch (_: Exception) {}
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "getUnreadCount failed, reporting 0: ${e.javaClass.simpleName}: ${e.message}")
+        }
         return 0
     }
 
-    /** 总数（ContentResolver 优先，goform 兜底） */
-    suspend fun getTotalCount(): Int = countSmsLocal() ?: (smsClient?.getSmsMeta()?.total ?: 0)
 
+    /**
+     * 总数（ContentResolver 优先，goform 兜底）。与 [readSms] / [getFilteredCount] 同口径。
+     *
+     * 已知边界：ContentResolver 不可用时退回设备侧 `getSmsMeta().total`，那份元数据**没有正文**，
+     * 无法应用拦截过滤，所以纯 goform 设备上「总数」会包含被拦短信。
+     * 不为此改成「读一遍完整列表再数」——那会让每次 `/api/sms/count` 都登录一次设备后台。
+     */
+    suspend fun getTotalCount(): Int {
+        countSmsLocal()?.let { total ->
+            if (ruleStore?.hasActiveRules() != true) return total
+            return (total - (countBlockedLocal() ?: 0)).coerceAtLeast(0)
+        }
+        return smsClient?.getSmsMeta()?.total ?: 0
+    }
+
+    /**
+     * **唯一读聚合点**：全部读路径（列表 / 最新一条 / 联系人聚合）都从这里出。
+     *
+     * 拦截过滤放在这里而不是各个调用点，就是为了让「列表」和「计数」不可能出现两套口径 ——
+     * 界面上「总数 50 却只列出 48 条」的典型来源就是过滤散落在多处。
+     *
+     * 注意：过滤在**取够 limit 条之后**发生，所以命中拦截时返回条数会少于 limit。
+     * 这里刻意不做「补齐到 limit」：补齐要循环加深 offset 反复查 ContentResolver，
+     * 而调用方（列表分页）本来就按「返回条数 < limit 视为可能还有下一页」处理。
+     */
     private suspend fun readSms(
+        folder: String?,
+        limit: Int,
+        offset: Int = 0,
+        phone: String? = null,
+        fallbackOnEmpty: Boolean = false
+    ): List<SmsMessage> {
+        val raw = readSmsRaw(folder, limit, offset, phone, fallbackOnEmpty)
+        val store = ruleStore ?: return raw
+        if (raw.isEmpty() || !store.hasActiveRules()) return raw
+        val kept = raw.filterNot { store.isBlocked(it.address, it.body) }
+        if (kept.size != raw.size) {
+            AppLogger.d(tag, "readSms: 拦截规则滤掉 ${raw.size - kept.size} 条")
+        }
+        return kept
+    }
+
+    private suspend fun readSmsRaw(
         folder: String?,
         limit: Int,
         offset: Int = 0,
@@ -411,45 +599,28 @@ class SmsController(
     }
 
     /**
-     * 从单条短信中提取验证码。
-     * 扫描关键词，在附近 20 字符范围内查找 4 或 6 位数字。
+     * 从单条短信中提取验证码，命中则包装成可落库的 [SmsVerificationCode]。
+     *
+     * 匹配判据全部在 [SmsCodeExtractor] 里 —— 邮件路径（`MailTemplate.extractCode`）
+     * 用的是同一份，别在这里另加/另减提示词或位数，否则「这条算不算验证码」会随
+     * 调用路径漂移（那正是 2026-09-08 统一之前的故障形态，详见 SmsCodeExtractor 头注释）。
+     *
      * @return 提取结果，无匹配返回 null
      */
     fun extractCode(number: String, content: String, msgId: Long, timestamp: Long): SmsVerificationCode? {
-        val keywords = listOf("验证码", "校验码", "动态码", "确认码", "密码")
-        val digitPattern = Regex("""(?<!\d)(\d{4}|\d{6})(?!\d)""")
-
-        for (keyword in keywords) {
-            var searchStart = 0
-            while (true) {
-                val kwIndex = content.indexOf(keyword, searchStart)
-                if (kwIndex < 0) break
-
-                // 在关键词前后 20 字符范围内查找数字
-                val windowStart = (kwIndex - 20).coerceAtLeast(0)
-                val windowEnd = (kwIndex + keyword.length + 20).coerceAtMost(content.length)
-                val window = content.substring(windowStart, windowEnd)
-
-                val match = digitPattern.find(window)
-                if (match != null) {
-                    val code = match.groupValues[1]
-                    // snippet = 列表/通知用的 80 字预览；body = 原文全量（详情页要看全内容）。
-                    // 两份都存：只留 snippet 会逼客户端为了看全文再回查一次短信列表。
-                    val snippet = if (content.length > 80) content.take(80) + "..." else content
-                    return SmsVerificationCode(
-                        msg_id = msgId,
-                        code = code,
-                        source = number,
-                        snippet = snippet,
-                        timestamp = timestamp,
-                        keyword = keyword,
-                        body = content
-                    )
-                }
-                searchStart = kwIndex + keyword.length
-            }
-        }
-        return null
+        val match = SmsCodeExtractor.find(content) ?: return null
+        // snippet = 列表/通知用的 80 字预览；body = 原文全量（详情页要看全内容）。
+        // 两份都存：只留 snippet 会逼客户端为了看全文再回查一次短信列表。
+        val snippet = if (content.length > 80) content.take(80) + "..." else content
+        return SmsVerificationCode(
+            msg_id = msgId,
+            code = match.code,
+            source = number,
+            snippet = snippet,
+            timestamp = timestamp,
+            keyword = match.keyword,
+            body = content
+        )
     }
 
     /** 批量查询本地 DB 并合并到消息列表 */
@@ -502,7 +673,37 @@ class SmsController(
         return cal.timeInMillis
     }
 
-    /** tag映射方向: 0/1=received, 2/3=sent */
-    private fun smsDirectionFromTag(tag: String): String =
-        when (tag) { "2", "3" -> "sent"; else -> "received" }
+    /**
+     * 「这条短信是收到的还是本机发出的」——**全仓两处方向判据的唯一实现**。
+     *
+     * 抽成 companion 里的纯函数是为了能在没有设备的情况下断言
+     * （见 `SmsSelfSentDirectionTest`，做法同 `GoformSmsClient.buildSendParams`）。
+     *
+     * ## 为什么这两个函数值得一条专门的测试
+     *
+     * 三条「发现新短信」链路全都靠 `direction == "received"` 排除**设备自己发出去的**短信：
+     * - `BackendService.forwardLatestSmsIfNew`（邮件）
+     * - `DataScheduler.collectSmsCache`（WS 推送）
+     * - `DataScheduler.scanVerificationCodes`（验证码入库）
+     *
+     * 而 2026-09-09 起 core 自己会**主动发短信**（`LocalSmsChannel`，通知渠道之一）。
+     * 一旦这里把自己发出的短信判成 `received`，那条短信就会被当成"新短信"再触发一次通知
+     * → 再发一条短信 → **无限循环烧话费**。所以这两个映射不是格式化细节，是一道刹车。
+     */
+    companion object {
+        /** goform 信箱行的 tag：0/1 = 收到，2 = 已发送，3 = 发送失败（后两者都是本机发出的）。 */
+        internal fun smsDirectionFromTag(tag: String): String =
+            when (tag) { "2", "3" -> DIRECTION_SENT; else -> DIRECTION_RECEIVED }
+
+        /** 系统 SMS Provider 的 `type` 列：2 = MESSAGE_TYPE_SENT，其余按收到处理。 */
+        internal fun smsDirectionFromType(type: Int): String =
+            if (type == PROVIDER_TYPE_SENT) DIRECTION_SENT else DIRECTION_RECEIVED
+
+        /** `SmsMessage.direction` 的两个取值。三条新短信链路比对的就是这两个字符串。 */
+        internal const val DIRECTION_SENT = "sent"
+        internal const val DIRECTION_RECEIVED = "received"
+
+        /** `Telephony.Sms.MESSAGE_TYPE_SENT`。写常量是为了让上面那个 `== 2` 有名字。 */
+        private const val PROVIDER_TYPE_SENT = 2
+    }
 }

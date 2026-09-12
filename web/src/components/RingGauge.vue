@@ -1,13 +1,6 @@
 <template>
   <div class="ring-gauge" :style="{ width: size + 'px', height: size + 'px' }">
     <svg :width="size" :height="size" :viewBox="`0 0 ${size} ${size}`">
-      <defs>
-        <filter :id="gradientId" x="-50%" y="-50%" width="200%" height="200%">
-          <feGaussianBlur in="SourceGraphic" stdDeviation="2" result="blur" />
-          <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 18 -7" result="goo" />
-          <feComposite in="SourceGraphic" in2="goo" operator="atop" />
-        </filter>
-      </defs>
       <g :transform="`rotate(-90 ${size / 2} ${size / 2})`">
         <!-- 背景圆环 -->
         <circle
@@ -21,7 +14,6 @@
         />
         <!-- 进度圆环 -->
         <circle
-          ref="progressRef"
           class="ring-progress"
           :cx="size / 2"
           :cy="size / 2"
@@ -63,14 +55,13 @@ const props = withDefaults(
     max: 100,
     size: 140,
     strokeWidth: 10,
-    color: '#2080f0',
+    // 两个现有调用点都显式传 color，这个默认值实际用不到；给 var() 而不是写死 hex，
+    // 是为了以后有人不传时仍然跟着换肤走（SVG 的 stroke 认 CSS 变量）。
+    color: 'var(--accent-color)',
     round: true,
     trackColor: 'var(--border-subtle)',
   }
 );
-
-const progressRef = ref<SVGCircleElement | null>(null);
-const gradientId = `ring-glow-${Math.random().toString(36).slice(2, 9)}`;
 
 const ratio = computed(() => Math.min(1, Math.max(0, props.value / props.max)));
 const radius = computed(() => props.size / 2 - props.strokeWidth / 2 - 4);

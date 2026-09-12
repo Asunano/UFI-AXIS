@@ -102,6 +102,56 @@ object NetworkMode {
     /** band lock 的"解锁"= 锁全部频段（来自 `GoformNetworkClient`）。 */
     const val LTE_ALL_BANDS = "1,3,5,8,34,38,39,40,41"
     const val NR_ALL_BANDS = "1,5,8,28,41,78"
+
+    /**
+     * 切换制式后的「回读确认」预算（2026-09-11 真机缺陷修复）。
+     *
+     * ## 为什么需要它
+     *
+     * `POST /api/network/mode` 返回成功只代表**固件收下了**这条命令，不代表制式已经切完：
+     * 设备要重新注册网络，这期间 `GET /api/device/settings` 的 `BearerPreference`
+     * **仍然报旧值**。客户端只回读一次（web 是写完 600ms 一次，app 是压根没回读设备设置）
+     * 就把结果渲染上去，于是界面停在旧档位，直到别的地方偶然又拉了一次设置才自己变对
+     * —— 这正是用户看到的"切换生效了但界面还显示旧制式"。
+     *
+     * 正确做法是给一个「切换中」的中间态，然后**有上限地**轮询回读，直到设备报出目标档位
+     * 或预算用尽。上限是硬要求：设备在弱信号下可能十几秒都注册不上，无限轮询会一直打
+     * goform（每次回读都是一次设备侧查询），把 `GoformQoS` 的许可耗在这上面。
+     *
+     * ## 为什么放在 contract
+     *
+     * app（Kotlin）与 web（`web/src/api/contract.ts` 的 `NetworkModeSwitchProbe`）必须用
+     * 同一套节奏，否则两端"多久算超时"不一致，同一台设备在两个客户端上表现不同。
+     */
+    object SwitchProbe {
+
+        /**
+         * 下发成功后到第一次回读的等待。
+         * 设备 goform 写入到查询接口可见有约 600ms 延迟，立刻回读拿到的**一定**是旧值。
+         */
+        const val FIRST_DELAY_MS = 600L
+
+        /** 之后每次回读的间隔。 */
+        const val INTERVAL_MS = 1_500L
+
+        /** 回读次数上限（**含**第一次）。到顶还没读到目标档位就报超时，不许再读。 */
+        const val MAX_ATTEMPTS = 10
+
+        /** 总时长上限，= [FIRST_DELAY_MS] + (次数-1) × [INTERVAL_MS]，给文案与守卫用。 */
+        const val TOTAL_BUDGET_MS = FIRST_DELAY_MS + (MAX_ATTEMPTS - 1) * INTERVAL_MS
+
+        /**
+         * 还要不要再回读一次。
+         *
+         * @param attemptNo 刚刚完成的是第几次回读（从 1 开始）
+         * @param reachedTarget 这次回读到的档位是否已经等于目标档位
+         *
+         * 两个终止条件都是硬的：读到目标就停（成功），次数到顶就停（超时）。
+         * **不要**改成"按总时长判断"再叠一层 —— 两套上限并存时，谁先到谁生效会变成偶发行为。
+         */
+        fun shouldKeepProbing(attemptNo: Int, reachedTarget: Boolean): Boolean =
+            !reachedTarget && attemptNo < MAX_ATTEMPTS
+    }
 }
 
 /**
@@ -119,7 +169,20 @@ object Alerts {
         const val TRAFFIC = "traffic"
         const val SIGNAL = "signal"
         const val CONNECTIVITY = "connectivity"
-        val ALL: List<String> = listOf(TEMPERATURE, BATTERY, TRAFFIC, SIGNAL, CONNECTIVITY)
+
+        // 2026-09-07 补齐：以下三类 AlertEngine 一直在检测（checkTrafficLimit / recordDeviceEvent），
+        // 但从未出现在本清单里，于是 `AlertConfig.perType` 里也没有对应键。而 `typeEnabled` 的判据是
+        // `perType[type] == true`（缺键视为关闭），结果这三类**永远不会触发** —— 套餐限额预警、
+        // WiFi 客户端接入/离开在实际使用中是死的。补进来后 app / web 的分类开关才能真正打开它们。
+        /** 套餐限额百分比预警（≠ TRAFFIC 的绝对 MB 阈值） */
+        const val TRAFFIC_LIMIT = "traffic_limit"
+        const val DEVICE_ONLINE = "device_online"
+        const val DEVICE_OFFLINE = "device_offline"
+
+        val ALL: List<String> = listOf(
+            TEMPERATURE, BATTERY, TRAFFIC, SIGNAL, CONNECTIVITY,
+            TRAFFIC_LIMIT, DEVICE_ONLINE, DEVICE_OFFLINE
+        )
     }
 
     object Level {

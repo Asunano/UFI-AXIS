@@ -23,6 +23,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 公共动作分类/选择胶囊 (2026-08-18 提取自 TaskScreen.kt)。

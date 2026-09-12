@@ -103,7 +103,7 @@ object UfiCardDefaults {
         get() = RoundedCornerShape(chipCornerRadius)
 
     // ═══════ 微量/细线（进度条轨道、信号条等） ═══════
-    val hairlineCornerRadius: Dp = 1.dp
+    val hairlineCornerRadius: Dp = Spacing.CornerHairline
     val hairlineShape: RoundedCornerShape
         get() = RoundedCornerShape(hairlineCornerRadius)
 
@@ -157,10 +157,11 @@ object UfiCardDefaults {
     /** 控制台会话气泡（4 角不对称，尖角指向发言方）。 */
     fun consoleBubbleShape(isUser: Boolean): RoundedCornerShape {
         val r = Spacing.CornerBubble
+        val tip = Spacing.CornerBubbleTip
         return RoundedCornerShape(
             topStart = r, topEnd = r,
-            bottomStart = if (isUser) r else 4.dp,
-            bottomEnd = if (isUser) 4.dp else r
+            bottomStart = if (isUser) r else tip,
+            bottomEnd = if (isUser) tip else r
         )
     }
 
@@ -178,15 +179,16 @@ object UfiCardDefaults {
     // ═══════ 聊天气泡（4角不对称） ═══════
     fun chatBubbleShape(isReceived: Boolean): RoundedCornerShape {
         val r = Spacing.CornerChatBubble
+        val tip = Spacing.CornerBubbleTip
         return RoundedCornerShape(
             topStart = r, topEnd = r,
-            bottomStart = if (isReceived) 4.dp else r,
-            bottomEnd = if (isReceived) r else 4.dp
+            bottomStart = if (isReceived) tip else r,
+            bottomEnd = if (isReceived) r else tip
         )
     }
 
     // ═══════ 聊天输入框（刻意比基准更圆，接近胶囊） ═══════
-    val chatInputCornerRadius: Dp = 20.dp
+    val chatInputCornerRadius: Dp = Spacing.CornerChatInput
     val chatInputShape: RoundedCornerShape
         get() = RoundedCornerShape(chatInputCornerRadius)
 

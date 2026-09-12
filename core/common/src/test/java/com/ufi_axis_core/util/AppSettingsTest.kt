@@ -41,6 +41,8 @@ class AppSettingsTest {
         val map = AppSettings(context).toMap()
         assertFalse("toMap 不应含 token", map.containsKey("token"))
         assertFalse("toMap 不应含 secret", map.containsKey("secret"))
+        // goform_password 是明文凭据，只允许 ConfigRoutes 的 GET 自己 put 脱敏值
+        assertFalse("toMap 不应含 goform_password", map.containsKey("goform_password"))
     }
 
     // ───────────────────────────────────────────────────────────

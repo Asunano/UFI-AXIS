@@ -11,11 +11,16 @@
 #   - KEY_PASSWORD         : 密钥（key）密码
 #
 # 说明：
-#   - 本地开发者无需任何签名配置即可 `./gradlew :app:assembleRelease`
-#     （app/build.gradle.kts 与 core/build.gradle.kts 均无 signingConfigs）。
+#   - release 变体不挂任何 signingConfig（:app 与 :core 的 signingConfigs 里只有
+#     `debug` 与可选 `ufi`，后者仅供 benchmark 变体），因此本地与 CI 都能直接
+#     `./gradlew :app:assembleRelease`，产出未签名 APK。
+#   - `ufi` 签名配置从 **仓库根 gitignored 的 keystore.properties** 读取
+#     （见根 build.gradle.kts）。文件不存在则不创建该配置、benchmark 退化为未签名，
+#     构建不失败。CI 从不提供该文件，也从不读取它。
 #   - 本工作流在 CI 内由 r0adkll/sign-android-release 动作对「未签名」的
 #     release APK 执行 zipalign + v1/v2 签名，密钥仅来源于上述仓库 Secrets。
 #   - 触发方式：手动（workflow_dispatch）或推送 `v*` 标签时自动发布。
+#   - 首步有「签名凭据不许入库」守卫（git ls-files 检查），命中即中止发布。
 # =============================================================================
 
 name: Release APK (Build & Sign)
@@ -43,6 +48,41 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      # ── 安全守卫：签名凭据绝不允许入库（2026-09-12）──
+      # 这是发布链路上最关键的一道闸：私钥入库 + 静默更新通道 = 全量设备 RCE 的现成路径。
+      # 例外仅 app/debug.keystore（公开调试证书，用于统一 debug 签名），不含秘密。
+      # 置于最前，签名动作之前就拦住。
+      - name: Guard — signing secrets must not be tracked
+        run: |
+          tracked=$(git ls-files -- '*.jks' '*.keystore' 'keystore.properties' 'signing.properties' \
+            | grep -v '^app/debug\.keystore$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::检测到被跟踪的签名凭据文件，发布中止。请 git rm --cached 后重新打 tag："
+            echo "$tracked"
+            exit 1
+          fi
+          echo "OK: 未发现入库的签名凭据"
+
+      # ── 编码守卫：跟踪的文本文件必须是 UTF-8（2026-09-12）──
+      # FileShortcutRepository.kt 曾整文件以 GBK 入库并长期隐身：Kotlin 编译器只对
+      # **注释里**的非法编码静默容忍，构建不报错，IDE / GitHub / grep 下却是满屏乱码。
+      # 用扩展名白名单（core/src/main/assets/shell/ 的 ARM 二进制无扩展名，黑名单会误判）；
+      # 刻意不列 *.bat —— 安装脚本第 3 行 `chcp 936`，GBK 与代码页匹配才是对的。
+      - name: Guard — tracked text files must be UTF-8
+        run: |
+          bad=$(git ls-files '*.kt' '*.kts' '*.java' '*.aidl' '*.pro' '*.keep' \
+                  '*.ts' '*.vue' '*.mjs' '*.js' '*.json' '*.css' '*.html' '*.svg' \
+                  '*.xml' '*.md' '*.yml' '*.yaml' '*.toml' '*.properties' '*.py' '*.sh' \
+                | while read -r f; do
+                    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || echo "$f"
+                  done)
+          if [ -n "$bad" ]; then
+            echo "::error::以下跟踪文件不是 UTF-8，发布中止。请转码后再打 tag（iconv -f GBK -t UTF-8 <文件>）："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 跟踪的文本文件均为 UTF-8"
 
       # ── 单一版本源（2026-08-10 C4）：读根目录 version.json 双对象 → 校验 tag → 注入 gradle ──
       # 前端 App = version.json.frontend；后端 Core = version.json.backend（前后端分离管理）。
@@ -86,6 +126,12 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
+      # ── Gradle 缓存（2026-09-07）──
+      # 与 build.yml 同一套：缓存 ~/.gradle（依赖、wrapper、build-cache-1）。
+      # 发版跑两次 Gradle（测试门禁 + 打包），命中缓存后省掉依赖下载与大部分重编译。
+      - name: Setup Gradle (dependency & build cache)
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
@@ -119,14 +165,15 @@ jobs:
       # 再补一条纯 JVM 模块 :core:device-schema 的 test（它没有 debug 变体）。
       # F15 为 androidTest（MigrationTestHelper，需设备/模拟器），仍不在此处运行。
       - name: Run unit tests (release gate)
-        run: ./gradlew testDebugUnitTest :core:device-schema:test --no-daemon
+        run: ./gradlew testDebugUnitTest :core:device-schema:test
 
-      # 本地不配置签名（build.gradle.kts 无 signingConfigs），这里产出未签名 release APK
+      # release 变体不挂签名（signingConfigs 里的 `ufi` 只服务 benchmark 变体，
+      # 且需要本地 keystore.properties；CI 无此文件），这里产出未签名 release APK
       # 版本注入：前后端分离，-PufiFrontendVersionName/Code 与 -PufiBackendVersionName/Code
       # 分别来自根目录 version.json 的 frontend / backend 对象（单一版本源）
       - name: Build release APKs (unsigned)
         run: |
-          ./gradlew :app:assembleRelease :core:assembleRelease --no-daemon \
+          ./gradlew :app:assembleRelease :core:assembleRelease \
             -PufiFrontendVersionName=${{ steps.version.outputs.FRONTEND_VERSION }} \
             -PufiFrontendVersionCode=${{ steps.version.outputs.FRONTEND_VERSION_CODE }} \
             -PufiBackendVersionName=${{ steps.version.outputs.BACKEND_VERSION }} \

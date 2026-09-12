@@ -88,3 +88,45 @@ suspend fun ApplicationCall.respondRejected(outcome: WriteOutcome): Boolean {
     respondFail(HttpStatusCode.BadRequest, ErrorCode.OUT_OF_RANGE, reason)
     return true
 }
+
+/**
+ * 设备写操作失败的**完整**映射：把 [WriteOutcome] 的三种失败态各自映射成有明确含义的
+ * HTTP 状态码 + [ErrorCode] + 中文文案，[WriteOutcome.Ok] 时什么都不做。
+ *
+ * 与 [respondRejected] 的关系：那个只接管 `Rejected` 一态，剩下两态各端点历史上形状不一致
+ * （多数把设备写失败一律回 500 `{"success": false}`），所以它有意不碰。本函数是给**已经确认
+ * 客户端能读统一失败信封**的端点用的，目前是网络制式/承载偏好这条链路。
+ *
+ * 映射表与判据：
+ * - [WriteOutcome.Rejected] → 400 `OUT_OF_RANGE`：值域校验没过，**请求没发出去**，
+ *   改参数才有用，重试无用。
+ * - [WriteOutcome.Unavailable] → 503 `UNAVAILABLE`：命令没被固件受理（会话失效且重登重试
+ *   一次仍失败，或连不上设备）。**可重试**，所以不能回 500 —— 500 的语义是「core 自己出错」，
+ *   客户端只会显示"服务器内部错误"，用户无从判断该不该再点一次。
+ * - [WriteOutcome.Failed] → 502 `OPERATION_FAILED`：设备收下了命令并明确回了失败。
+ *   **不可重试**，同样的取值再发一次还是同样的结果；用 502 而不是 500，因为出错的是
+ *   上游设备而不是 core。
+ *
+ * @param failedMessage `Failed` 一态的中文文案（各端点业务语义不同，必须由调用方给）
+ * @param extra 附加回显字段（如 `mode` / `bearer`），失败响应里也带上便于客户端对齐状态
+ * @return true 表示已经写过响应，调用方必须立刻 return
+ */
+suspend fun ApplicationCall.respondWriteFailure(
+    outcome: WriteOutcome,
+    failedMessage: String,
+    extra: Map<String, Any?> = emptyMap()
+): Boolean = when (outcome) {
+    is WriteOutcome.Ok -> false
+    is WriteOutcome.Rejected -> {
+        respondFail(HttpStatusCode.BadRequest, ErrorCode.OUT_OF_RANGE, outcome.reason, extra)
+        true
+    }
+    is WriteOutcome.Unavailable -> {
+        respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE, outcome.reason, extra)
+        true
+    }
+    is WriteOutcome.Failed -> {
+        respondFail(HttpStatusCode.BadGateway, ErrorCode.OPERATION_FAILED, failedMessage, extra)
+        true
+    }
+}

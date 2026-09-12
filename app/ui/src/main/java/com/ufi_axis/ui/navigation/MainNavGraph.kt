@@ -44,7 +44,7 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
-import androidx.navigation.compose.rememberNavController
+import androidx.navigation.NavHostController
 import com.ufi_axis.ui.animation.blurEntrance
 import com.ufi_axis.ui.animation.page.UfiPage
 import com.ufi_axis.ui.animation.page.UfiPageSwitcher
@@ -59,7 +59,7 @@ import com.ufi_axis.ui.components.common.CapsuleInsetHolder
 import com.ufi_axis.ui.components.common.CapsuleTabItem
 import com.ufi_axis.ui.components.common.LocalCapsuleBottomInset
 import com.ufi_axis.ui.components.common.UfiCapsuleTabBar
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.UfiInheritUiScale
@@ -176,6 +176,7 @@ private fun AppBottomNavigation(
 fun MainNavGraph(
     screens: Map<String, AppScreen>,
     themeManager: ThemeManager,
+    navController: NavHostController,
     pendingSmsPhone: MutableState<String?> = mutableStateOf(null),
     pendingAlertDeepLink: MutableState<String?> = mutableStateOf(null)
 ) {
@@ -184,7 +185,6 @@ fun MainNavGraph(
     // 导致用户选的 Cube3D / Flip3D 等全部静默退化成渐入渐出。
     remember { registerBuiltInTransitions() }
 
-    val navController = rememberNavController()
     val palette = LocalResolvedPalette.current
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route

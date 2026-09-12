@@ -44,6 +44,10 @@ internal class GoformSettingWriter(
      * 多参数写操作，返回三态结果。
      *
      * 校验不通过时**直接返回，不发请求** —— 这既是正确性也是安全性（设备侧表单是字符串拼接）。
+     *
+     * 下发走 [GoformClient.goformPostIdempotent]：设置类命令对同一取值幂等，会话失效时
+     * 重登重试一次是安全的。不这么做的后果就是「切换网络制式第一次必定失败、再点一次才成」
+     * —— 读路径早有这套重试，写路径一直没有。
      */
     suspend fun writeChecked(key: SettingKey, params: Map<String, Any?>): WriteOutcome {
         val spec = profile.writeSpec(key)
@@ -58,8 +62,19 @@ internal class GoformSettingWriter(
         val body = LinkedHashMap<String, String>()
         body["goformId"] = spec.command
         body.putAll(spec.encode(params))
-        return if (client.isGoformSuccess(client.goformPost(body))) WriteOutcome.Ok
-        else WriteOutcome.Failed
+        return when (val result = client.goformPostIdempotent(body)) {
+            // 设备表过态：body 说成功就是成功，说失败就是**设备明确拒绝**（不可重试）。
+            is GoformWriteResult.Accepted ->
+                if (client.isGoformSuccess(result.body)) WriteOutcome.Ok else WriteOutcome.Failed
+            // 重登并重试一次后仍然会话失效：命令没进固件，属于可重试，别报成 500。
+            is GoformWriteResult.SessionLost ->
+                WriteOutcome.Unavailable("设备后台会话已失效，重新登录后仍未受理本次设置，请稍后重试")
+            // 连不上设备：detail 是英文原文，只进日志，不进给用户看的文案。
+            is GoformWriteResult.Unreachable -> {
+                AppLogger.w(TAG, "$key write unreachable: ${result.detail}")
+                WriteOutcome.Unavailable("与设备后台通信失败，请确认设备在线后重试")
+            }
+        }
     }
 
 

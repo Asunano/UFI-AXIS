@@ -11,17 +11,68 @@
   --text-muted: #999999;
   --border-subtle: #e8e8e8;
 
-  /* 功能色 */
-  --accent-color: #2080f0;
-  --accent-color-light: rgba(32, 128, 240, 0.08);
+  /* 功能色。
+     `--accent-color` 是品牌主色（naive 的 primary 由 naiveTheme.ts 从这里派生），
+     取 naive 默认绿 #18a058 —— 2026-09-08 改回默认绿。
+     注意它与 `--success` 同色：所以**图表/仪表的多系列配色不能用主色**，
+     否则「主色」与「成功」两种语义会画成同一根线（下行/上行、正常/充足会分不开）。
+     这类场景一律用下面的 `--info`（蓝），见 chartTheme.ts 的 ChartColors。 */
+  --accent-color: #18a058;
+  --accent-color-light: rgba(24, 160, 88, 0.08);
   --success: #18a058;
   --warning: #f0a020;
   --error: #d03050;
   --info: #2080f0;
 
+  /* 语义色的淡底档（徽标、日志行、告警条这类「一小块语义色背景 + 同色文字」）。
+     取值来自 2026-09-08 之前散落各处的 rgba 写法，实测只有两个梯度：
+     绿/黄 用 0.1，红/蓝 用 0.08；暗色档一律 +0.04（深色背景上要更实一点才看得出来）。
+     `--accent-color-light` 早就是这个模式（0.08 → 0.12），这三个是把它补齐。
+
+     已知限制：这里把语义色的 RGB 又写了一遍，所以换肤改了 `--success` 之后，
+     `--success-light` 不会跟着变。彻底的解法是 `color-mix(in srgb, var(--success) 10%, transparent)`，
+     但那需要 Chrome 111+ / Safari 16.2+，本项目还没定浏览器下限 —— 定了之后可以一次换掉这三个。 */
+  --success-light: rgba(24, 160, 88, 0.1);
+  --warning-light: rgba(240, 160, 32, 0.1);
+  --error-light: rgba(208, 48, 80, 0.08);
+
   /* 表面色 */
   --surface-hover: rgba(0, 0, 0, 0.03);
   --surface-elevated: #fafafa;
+  /* 代码块底色。中性灰 + 低透明度，明暗两态都自适应，故 .dark 无需覆盖。
+     2026-09-08 从 TunnelView 里那个从未定义过的 `var(--code-bg, rgba(128,128,128,.08))`
+     兜底值提上来 —— 取值逐字相同，只是变量从此真实存在、可被换肤覆盖。 */
+  --code-bg: rgba(128, 128, 128, 0.08);
+
+  /* ── 分类色（categorical palette）──
+     用于「同一层级、并列的若干类别」各占一色的场景（定时任务的动作类型徽标是第一个消费方）。
+     刻意按**色相**命名而不是按业务语义（不叫 --badge-wifi 之类）：这样换一批业务分类时
+     只改消费方的映射，不用动令牌；也避免 main.css 里堆业务名词。
+
+     每档是「淡底 + 深字」一对。暗色下不是把浅底调暗，而是换成「原色调低透明度底 + 同色系亮字」：
+     浅底深字在深色卡片上会变成一块刺眼的白斑（这正是 2026-09-08 之前 TasksView 的实际表现 ——
+     那 10 组 hex 只有浅色值，暗色下浅底深字直接压在 #1a1a20 的卡片上）。
+     暗色档的前景/底色对比度都按 WCAG 4.5:1 验算过，实测 6.55~8.91。 */
+  --cat-green-bg: #e8f5e9;
+  --cat-green-fg: #2e7d32;
+  --cat-blue-bg: #e3f2fd;
+  --cat-blue-fg: #1565c0;
+  --cat-red-bg: #fce4ec;
+  --cat-red-fg: #c62828;
+  --cat-orange-bg: #fff3e0;
+  --cat-orange-fg: #e65100;
+  --cat-brown-bg: #efebe9;
+  --cat-brown-fg: #4e342e;
+  --cat-yellow-bg: #fff9c4;
+  --cat-yellow-fg: #f57f17;
+  --cat-purple-bg: #f3e5f5;
+  --cat-purple-fg: #6a1b9a;
+  --cat-teal-bg: #e0f7fa;
+  --cat-teal-fg: #00695c;
+  --cat-indigo-bg: #e8eaf6;
+  --cat-indigo-fg: #283593;
+  --cat-neutral-bg: #f5f5f5;
+  --cat-neutral-fg: #424242;
 
   /* 圆角 */
   --radius-sm: 6px;
@@ -63,17 +114,66 @@
   --text-muted: #666666;
   --border-subtle: #2a2a30;
 
-  --accent-color-light: rgba(32, 128, 240, 0.12);
+  --accent-color-light: rgba(24, 160, 88, 0.12);
+  --success-light: rgba(24, 160, 88, 0.14);
+  --warning-light: rgba(240, 160, 32, 0.14);
+  --error-light: rgba(208, 48, 80, 0.12);
   --surface-hover: rgba(255, 255, 255, 0.04);
   --surface-elevated: #222228;
+
+  /* 分类色暗色档：原色低透明度底 + 同色系亮字（不是把浅底调暗）。
+     底色叠在 --card-bg(#1a1a20) 上的合成值与前景的对比度实测：
+     green 6.94 / blue 8.18 / red 6.89 / orange 7.78 / brown 6.86 /
+     yellow 8.91 / purple 6.55 / teal 7.62 / indigo 6.66 / neutral 7.39，全部 ≥4.5。
+     改这里的透明度就会破坏该结论，动之前先重算。 */
+  --cat-green-bg: rgba(46, 125, 50, 0.22);
+  --cat-green-fg: #81c784;
+  --cat-blue-bg: rgba(21, 101, 192, 0.22);
+  --cat-blue-fg: #90caf9;
+  --cat-red-bg: rgba(198, 40, 40, 0.22);
+  --cat-red-fg: #ef9a9a;
+  --cat-orange-bg: rgba(230, 81, 0, 0.22);
+  --cat-orange-fg: #ffb74d;
+  --cat-brown-bg: rgba(78, 52, 46, 0.35);
+  --cat-brown-fg: #bcaaa4;
+  --cat-yellow-bg: rgba(245, 127, 23, 0.2);
+  --cat-yellow-fg: #ffd54f;
+  --cat-purple-bg: rgba(106, 27, 154, 0.26);
+  --cat-purple-fg: #ce93d8;
+  --cat-teal-bg: rgba(0, 105, 92, 0.26);
+  --cat-teal-fg: #80cbc4;
+  --cat-indigo-bg: rgba(40, 53, 147, 0.3);
+  --cat-indigo-fg: #9fa8da;
+  --cat-neutral-bg: rgba(255, 255, 255, 0.08);
+  --cat-neutral-fg: #bdbdbd;
 }
+
+/* ── 配色主题（皮肤）──
+   上面的 `:root` / `.dark` 是**默认皮肤**。额外皮肤成对写在这里，靠 `<html data-theme="id">` 生效，
+   注册表在 `composables/themePresets.ts`（加皮肤要同时改两处，那份文件头写了完整口径）。
+
+   位置不能随便挪：`:root` 与 `[data-theme]` 特异性同为 0,1,0，靠**源码顺序**取胜，
+   所以皮肤块必须在 `:root` 之后。暗色档写 `.dark[data-theme='id']`（0,2,0），压过 `.dark`。
+
+   只覆盖颜色令牌。圆角 / 间距 / 字号属于版式，不随皮肤变。
+   示例（真要加皮肤时照这个形状写，不要只加浅色档）：
+
+     [data-theme='ocean'] {
+       --accent-color: #0f766e;
+       --accent-color-light: rgba(15, 118, 110, 0.08);
+     }
+     .dark[data-theme='ocean'] {
+       --accent-color: #2dd4bf;
+       --accent-color-light: rgba(45, 212, 191, 0.12);
+     }
+
+   目前只有默认皮肤，所以本小节没有任何规则 —— 这是预期状态，不是漏写。 */
 
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
-
 html,
 body,
 #app {
@@ -123,18 +223,46 @@ body,
    导致 900–1024 之间设置页仍双列而仪表盘/网络/监控已单列。现已统一到 1024。 */
 
 /* ── 设置类分栏的卡片栅格 ──
-   settings/panels 下 8 个面板都用这一种「auto-fit 卡片栅格 + full-width 通栏」，
+   settings/panels 下 8 个面板都用这一种「固定两列卡片栅格 + full-width 通栏」，
    原先 8 份 scoped 拷贝逐字相同（含 8 份 media query）。提到全局只留一份：
    改栅格/改断点只需动这里。scoped 组件里用这个类名不受 scope 影响（scope 只作用于组件自己声明的选择器）。
    注意：MonitorView 里语义不同的同名类已改名为 .monitor-prefs。 */
 .settings-panel {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  /* 固定 2 列，**不用 auto-fit**（2026-09-10 第二次改）。
+     两条理由，都不是审美：
+
+     ① 列数必须恒定，否则各面板的「等高配对」会被打乱。8 个面板的卡片是按
+        「2 列 × 若干行」配过对的（关于 4 卡 = 2×2、更新 3 卡 = 2+1 通栏、
+        配对 3 卡 = 1 通栏 + 2），前面那几个面板已把「同一行两卡的高度差 ≤ 1 行」
+        作为约束写进了各自模板顶部。auto-fit 在宽屏会摊出第 3、4 列 →
+        配对关系全失效，而且自动摊列正是当初那个「四张卡顶部对齐、底边参差、
+        下方一片空白」的成因（1650px 视口，见 NotifyPanel 头注释）。
+     ② max-width 上限已撤掉（见下），所以此时更依赖「列数固定」来兜底。
+
+     列宽下限不再需要写：固定 2 列 + minmax(0,1fr) 时，两个 1fr 自己会跟随容器，
+     窄屏由 1024 断点折成一列。*/
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-4);
   align-items: start;
+  /* 原先这里有一条 max-width: 1180px（理由是「铺满 21:9 会让每行文字长到读不动」）。
+     2026-09-10 用户反馈「没有铺满」并给了 1918px 视口的截图：内容区 1699px，
+     1180 上限在右侧留了 519px 空白 —— 观感就是「旁边空荡荡」，
+     与本次要修的那类问题同源。已撤掉上限改为一律铺满：
+       · 1920 视口 → 每列约 780px，仍在可读范围内；
+       · 若日后在超宽屏（2560+）上觉得每行过长，正确做法是加「内容内边距上限」
+         （如 .settings-panel { padding-inline: max(0px, (100% - 1680px) / 2) }），
+         而不是恢复 max-width —— 后者会让整块面板偏到左边、右边裸露。 */
 }
 
-.settings-panel > .full-width {
+/* 横跨两列的卡，两种来源：
+   · .full-width —— 面板显式声明的通栏卡（更新页的「手机 App 安装包」、
+     配对页的「配对管理」、通知页的「通知渠道」）；
+   · :only-child —— 只有一张卡的面板（通用 / 性能 / 日志）。auto-fit 时代它们靠
+     「折叠空轨道」天然铺满，换成固定 2 列后如果不显式通栏，卡片会只占左半、
+     右半裸露（2026-09-10 实测过这个回归）。 */
+.settings-panel > .full-width,
+.settings-panel > :only-child {
   grid-column: 1 / -1;
 }
 
@@ -156,4 +284,122 @@ body,
   justify-content: flex-end;
   gap: var(--space-2);
   margin-top: var(--space-3);
+}
+
+/* ── 卡片内的二级分区 ──
+   `GridCard` 里再分一层的描边块（指标格、状态块、内嵌表单区…）。2026-09-08 之前是 9 处各写一份，
+   padding 有 6 种取值、圆角 3 档（6/8/10）、背景 2 档（elevated / page-bg），同一层级三种观感。
+   按决策 D5 统一到这一份：12px 内距 + `--radius-sm` + `--surface-elevated`。
+
+   退役的两档圆角（8px / 10px）与「用 `--page-bg` 做凹陷」的写法都不要再出现 ——
+   本类是**抬升**语义（比卡片亮一档）。若某处确实需要凹陷，先回来改这条注释再加变体，
+   不要在页面里就地写一个 `background: var(--page-bg)` 把两种语义混回去。
+
+   不属于本类、**不要**套用的东西：`GridCard` 卡片本体、顶栏 `.dtb-bar`、tooltip、
+   `ValueBadge` 徽标、无内距的滚动列表容器（`.file-list` / `.log-list` / `.blocked-body`）、
+   登录卡、聊天气泡、列表项卡（`.code-item`）—— 它们只是恰好也有一条 `--border-subtle` 描边。 */
+.sub-panel {
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated);
+}
+
+/* ── 卡片内的两列配置栅格 ──
+   `GeneralPanel` / `ServicePanel` / `PerformancePanel` / `DownloadsView` 四个文件原先各写一份
+   `.config-grid` + `.config-item` + `.config-label`（含各自那份 768px 折单列的 media query），
+   四份逐字相同。提到全局只留一份，取值与原先完全一致（12/4px 间距、13px 次要色标签）。
+
+   这是与 `ToggleRow` **并列的第二种合法开关版式**，不要把它归并进 ToggleRow：
+     - `ToggleRow`   = 全宽堆叠的设置行，14px 标签 + 12px 说明 + 行间分隔线
+     - `.switch-item` = 两列栅格内的紧凑单元格，13px 标签、无说明、无分隔线
+   两者观感与信息密度不同，混用才是不一致。新代码按「有说明文字/占满整行」选 ToggleRow，
+   按「与输入框并排塞进两列栅格」选 .switch-item。
+
+   注意：`PairingPanel` 的 `.config-label` 刻意是 14px + text-primary（它那里是主标签而非
+   输入框上方的次要说明），scoped 选择器特异性高于本全局规则，会自然覆盖，无需在此加例外。 */
+.config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.config-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.config-label {
+  font-size: var(--font-base);
+  color: var(--text-secondary);
+}
+
+/* 开关单元格：标签左、控件右。`.full` 额外通栏（DownloadsView 的「启用智能节流」等） */
+.config-item.switch-item,
+.config-item.full {
+  flex-direction: row;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.config-item.full {
+  grid-column: 1 / -1;
+}
+
+/* 分区小标题：原先 GeneralPanel / ServicePanel / PerformancePanel 三份逐字相同 */
+.section-subtitle {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  margin-bottom: var(--space-2);
+  font-weight: 500;
+}
+
+/* ── 信息格：标签在上、值在下 ──
+   Dashboard 拆卡时提上来的：网络信息卡与 WiFi 信息卡各用一份，拆成两个 SFC 后
+   继续放在各自的 scoped 里就是第二份逐字相同的副本。
+   需要收窄成固定两列这类局部调整，在卡里加自己的类即可 ——
+   scoped 选择器是 (0,2,0)，天然压过这里的 (0,1,0)。 */
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 14px 20px;
+}
+.stat-cell {
+  display: flex;
+  flex-direction: column;
+  /* flex-start 而不是默认的 stretch：这一格的「值」可能是开关或按钮组，
+     拉伸会把它们撑成整格宽 */
+  align-items: flex-start;
+  gap: 3px;
+  min-width: 0;
+}
+.stat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.stat-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+
+/* 卡内「没有内容」的居中占位。WiFi 信息读取失败与设备列表为空共用一份 */
+.client-empty {
+  padding: 16px 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+@media (max-width: 768px) {
+  .config-grid {
+    grid-template-columns: 1fr;
+  }
+  /* 标签在上值在下本来就是竖排，2 列已是合适密度，这里只收紧行距免得卡片过高 */
+  .stat-grid {
+    gap: 10px 14px;
+  }
 }

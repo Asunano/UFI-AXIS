@@ -26,4 +26,12 @@ dependencies {
     // mail (for SmsForwardController - javax.mail)
     implementation(libs.javax.mail)
     implementation(libs.javax.activation)
+    // HTTP 客户端（WebhookChannel / HttpNotifier）。**不复用 GoformClient 那个实例**：
+    // 它的 base url 绑死内网设备、强制带 goform 的 Referer/Origin/Cookie，还要过 QoS 许可闸 ——
+    // 那三件事对"往用户填的公网 URL 发一条通知"全是错的。
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.cio)
+
+    // SmsCodeExtractor / WebhookDelivery 是纯函数（无 Android / 无 Room 依赖），单测只需要 junit。
+    testImplementation(libs.junit)
 }

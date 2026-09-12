@@ -13,7 +13,9 @@
         description="启用高性能模式，提升处理器运行频率"
         :model-value="controlSettings.performanceEnabled"
         :loading="toggleLoading.performance"
-        @update:model-value="(v: boolean) => postToggle('/api/device/performance', v, 'performance', 'performanceEnabled')"
+        @update:model-value="
+          (v: boolean) => postToggle('/api/device/performance', v, 'performance', 'performanceEnabled')
+        "
       />
       <ToggleRow
         label="Samba 共享"

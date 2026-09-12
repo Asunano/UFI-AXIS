@@ -97,4 +97,34 @@ class MonitorPreferencesTest {
         assertNotNull(reason)
         assertTrue(reason!!.contains("gpu"))
     }
+
+    // ── 2026-09-08 新增的两个调度参数 ──
+    // 下限刻意抬高（60 / 15 而不是 5）：这两个周期每轮都要向设备发 goform 请求，
+    // 与设备自带 Web UI 抢同一个会话。用例把这个边界钉住，避免以后有人"顺手对齐成 5"。
+
+    @Test
+    fun `trafficLimitCheckSec 越界被拒`() {
+        assertNull(MonitorRoutes.validatePreferences(MonitorPreferences(trafficLimitCheckSec = 60)))
+        assertNull(MonitorRoutes.validatePreferences(MonitorPreferences(trafficLimitCheckSec = 3600)))
+        assertNotNull(MonitorRoutes.validatePreferences(MonitorPreferences(trafficLimitCheckSec = 59)))
+        assertNotNull(MonitorRoutes.validatePreferences(MonitorPreferences(trafficLimitCheckSec = 3601)))
+    }
+
+    @Test
+    fun `deviceEventCheckSec 越界被拒`() {
+        assertNull(MonitorRoutes.validatePreferences(MonitorPreferences(deviceEventCheckSec = 15)))
+        assertNull(MonitorRoutes.validatePreferences(MonitorPreferences(deviceEventCheckSec = 600)))
+        assertNotNull(MonitorRoutes.validatePreferences(MonitorPreferences(deviceEventCheckSec = 14)))
+        assertNotNull(MonitorRoutes.validatePreferences(MonitorPreferences(deviceEventCheckSec = 601)))
+    }
+
+    @Test
+    fun `新增调度字段同样走字段级合并`() {
+        val current = MonitorPreferences(trafficLimitCheckSec = 900, deviceEventCheckSec = 30)
+        val merged = MonitorRoutes.mergePreferences(current, patch("""{"deviceEventCheckSec":120}"""))
+
+        assertEquals(120, merged.deviceEventCheckSec)
+        // 漏传的那个不能被重置成默认 300
+        assertEquals(900, merged.trafficLimitCheckSec)
+    }
 }

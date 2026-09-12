@@ -10,16 +10,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import com.ufi_axis_core.alert.AlertBus
 import com.ufi_axis_core.alert.AlertBusItem
-import com.ufi_axis.data.api.RetrofitClient
 import com.ufi_axis.data.model.AlertRecord
-import com.ufi_axis.data.model.SmsContact
-import com.ufi_axis.data.model.VerificationCode
-import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 import java.util.Calendar
 
 /**
@@ -29,8 +21,8 @@ import java.util.Calendar
  * - 统一管理 Channel（device_alerts_v2 / device_connectivity / device_sms /
  *   device_downloads / device_events），全部在 [ensureChannels] 一次创建；
  * - 统一开关/状态位持久化（`ufi_axis_prefs`），key 常量集中在本类 companion；
- * - 差异检测去重：`last_notified_alert_id`（告警）/ `last_sms_total`（短信）/
- *   `last_download_status_{taskId}`（下载）/ `traffic_80_notified`（流量 80%）；
+ * - 差异检测去重：`last_notified_alert_id`（告警游标）+ `recent_notified_sigs`（签名 TTL）；
+ *   短信 / 验证码 / 下载 / 隧道 / 流量 / 连通性的**事件判定全部在 core**，app 只渲染推送；
  * - 防骚扰：5min 限频（`last_notified_{type}_at`）+ 免打扰时段（起止小时可配，默认 23:00-07:00，
  *   仅 critical 告警突破）+ 多告警合并摘要（BigTextStyle）；
  * - 性能：所有通知入口第一行开关短路 return（轮询高频调用零开销）。
@@ -58,28 +50,145 @@ class NotificationCenter(context: Context) {
     // ═══════════════════════ Key / Channel 常量（统一收敛处） ═══════════════════════
 
     companion object {
-        /**
-         * 邮件转投用的常驻 IO scope。
-         *
-         * 放 companion 而非实例字段：NotificationCenter 在轮询链路里被反复 new，
-         * 每个实例各带一个 scope 会随实例数量线性堆积协程上下文。
-         * SupervisorJob 保证单次发信抛异常不会连带取消后续所有转投。
-         */
-        private val mailScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-
         /** 统一偏好文件（与 AppPreferences / AlertSettingsScreen 共用）。 */
         const val PREFS_NAME = "ufi_axis_prefs"
 
-        /** 系统通知推送总开关（告警族上层总闸：阈值告警 / 离线上线 / 流量 80% / 隧道失败）。 */
+        // ═══════════════════ 通知闸门层级（2026-09-08 定契约）═══════════════════
+        //
+        // 每一层只回答一个问题，键与写入方一一对应；判定实现只允许有一处。
+        //
+        //   L0 系统权限   areNotificationsEnabled()          只读，不落库，仅参与显示态
+        //   L1 全局总闸   KEY_NOTIFY_MASTER                  管**所有渠道**（状态栏 + 邮件）
+        //   L2 渠道       状态栏 = L1 且 L0 放行（不另设键）
+        //                 邮件   = core 的 mailEnabled（邮件通知页写，app 侧不存）
+        //   L3 分类       KEY_ALERT_NOTIF / KEY_CONNECTIVITY_NOTIF / KEY_SMS_NOTIF /
+        //                 KEY_VERIFICATION_NOTIF / KEY_DOWNLOAD_NOTIF /
+        //                 KEY_TRAFFIC_80_NOTIF / KEY_DEVICE_EVENTS_NOTIF / KEY_TUNNEL_NOTIF
+        //
+        // 独立轴（**不**挂在通知树上）：
+        //   免打扰   KEY_DND_ENABLED + 时段  —— 状态栏恒定遵守；邮件仅在 core 的
+        //                                      mailRespectDnd 打开时遵守
+        //   后台守护 KEY_GUARD_ENABLED       —— 巡检调度，与通知无关
+        //   保活     KEY_GUARD_FOREGROUND_KEEPALIVE
+        //
+        // 唯一出口：状态栏通知全部经 [notify]（[showNotification] 也是它的包装），
+        // L1 与 L3 的判定都只写在那一处；测试通知（[sendTestNotification]）刻意豁免 L1/L3。
+        //
+        // 病史：在此之前 KEY_ALERT_NOTIF 一个键同时兼任「全局总闸 + 告警分类 + 隧道分类 +
+        // 后台守护总闸 + 连接参数通报判据」，而短信 / 验证码 / 下载三条路径根本不读它 ——
+        // 于是"系统通知推送"关掉后短信照弹、后台守护却被静默停掉，界面文案也随之说谎。
+
+        /**
+         * **L1 全局通知总闸**（默认关）：管所有渠道 —— 状态栏与（经 core 镜像的）邮件。
+         *
+         * 2026-09-08 新增。升级迁移见 [migrateGateKeys]：老用户 [KEY_ALERT_NOTIF] = true
+         * 表示"通知本来是开的"，迁移后 master 置 true 且告警分类保持 true，观感不变。
+         */
+        const val KEY_NOTIFY_MASTER = "notification_master_enabled"
+
+        /** [migrateGateKeys] 的一次性标记，防止用户之后手动关掉 master 又被迁移改回来。 */
+        private const val KEY_GATE_MIGRATED = "notify_gate_migrated_v2"
+
+        /** **L3 告警分类**开关（阈值告警：温度 / 电量 / 流量 / 信号）。 */
         const val KEY_ALERT_NOTIF = "alert_notification_enabled"
 
         /**
-         * 设备离线/上线通知开关（默认开）。
+         * **L3 隧道分类**开关（默认关，2026-09-08 拆出）。
+         *
+         * 此前 `sceneEnabledKey(TUNNEL)` 直接映射到 [KEY_ALERT_NOTIF] —— 隧道在 app 侧
+         * 没有自己的键，想「只关隧道失败提醒、保留阈值告警」做不到。
+         * core 侧另有 `tunnel_notify_on_failure` 决定要不要推，两者是串联关系。
+         */
+        const val KEY_TUNNEL_NOTIF = "tunnel_notification_enabled"
+
+        /**
+         * 邮件是否也遵守免打扰时段（默认关，2026-09-08）。
+         *
+         * **判定不在 app**：邮件由 core 发，闸门是 `NotificationRoutes.mailAllowed`。
+         * 本键只是给「邮件通知」页显示与下发用的镜像 —— 与其余分类键一样走
+         * `NotificationConfigSync` 的 readLocal / applyRemote，不参与任何本机投递判据。
+         * 因此它既不在 [CATEGORY_KEYS] 里（它不是分类），也不必镜像给 `:ufi_notify`。
+         */
+        const val KEY_MAIL_RESPECT_DND = "mail_respect_dnd"
+
+        /**
+         * 「严重事件兜底」开关（**默认开**，2026-09-10）。
+         *
+         * 真源是 core 的 `NotificationConfig.critical_override_enabled`。它是那份配置里
+         * **唯一默认为 true** 的字段，所以本地镜像的默认值必须处处写 [DEFAULT_CRITICAL_OVERRIDE] ——
+         * 少写一处就是「UI 显示开着、实际按关处理」的假开关。
+         *
+         * 它能穿透什么：级别为 critical 的事件可越过免打扰时段、渠道未勾选的触发场景、
+         * 渠道的最低级别门槛。它**穿不过**总闸 [KEY_NOTIFY_MASTER]（关了一条都不发）、
+         * 渠道配置不完整、当日配额已用尽 —— 那三种是"发不出去"，不是"不想发"。
+         *
+         * app 侧唯一的本机判据在 [notify] 的免打扰分支（状态栏告警在静默时段能不能响铃）。
+         * 因此它必须镜像给 `:ufi_notify`（见 `NotifyPrefs.MIRRORED_BOOL_KEYS`）——
+         * 那个进程是状态栏通知的唯一发射者，读不到主进程刚写的真源。
+         */
+        const val KEY_CRITICAL_OVERRIDE = "critical_override_enabled"
+
+        /**
+         * [KEY_CRITICAL_OVERRIDE] 的默认值。
+         *
+         * 必须与 core `NotificationConfig.critical_override_enabled`、
+         * `NotificationConfigDto`、`NotificationConfigSync.readLocal` 与
+         * `NotifyPrefs.MIRRORED_BOOL_KEYS` 逐字一致。
+         */
+        const val DEFAULT_CRITICAL_OVERRIDE = true
+
+        /**
+         * **L3 分类键全集**（2026-09-08）。顺序即设置页展示顺序。
+         *
+         * 用途：UI 判断"总闸开着但一个分类都没开"（那种状态下一条通知都不会来，
+         * 必须在文案里说出来，否则又是一个"看着开了却收不到"）。
+         *
+         * 新增场景时必须同时补 [sceneEnabledKey] 与本集合 —— 由 `NotifyGateGuardTest` 守。
+         */
+        val CATEGORY_KEYS: List<String> = listOf(
+            KEY_ALERT_NOTIF,
+            KEY_CONNECTIVITY_NOTIF,
+            KEY_SMS_NOTIF,
+            KEY_VERIFICATION_NOTIF,
+            KEY_DOWNLOAD_NOTIF,
+            KEY_TRAFFIC_80_NOTIF,
+            KEY_DEVICE_EVENTS_NOTIF,
+            KEY_TUNNEL_NOTIF
+        )
+
+        /**
+         * 一次性升级迁移：把旧的"一键兼任总闸"语义拆到新键上。
+         *
+         * 老版本里 [KEY_ALERT_NOTIF] 同时是全局总闸与告警分类，且隧道借用它。迁移口径：
+         * - `master` ← 老 [KEY_ALERT_NOTIF]（老用户开着的话升级后照旧能收到通知，不会"升级即静音"）
+         * - 隧道分类 ← 若从未显式写过，取老 [KEY_ALERT_NOTIF]（保持原口径）
+         * - 告警分类 ← 原值不动
+         *
+         * 只在**主进程**执行（[PREFS_NAME] 是共享真源，只允许主进程写），且靠
+         * [KEY_GATE_MIGRATED] 标记保证只跑一次 —— 否则用户之后手动关掉 master，
+         * 下次冷启动又会被"迁移"改回来。
+         */
+        fun migrateGateKeys(context: Context) {
+            if (NotifyPrefs.isNotifyProcess()) return
+            val prefs = context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_GATE_MIGRATED, false)) return
+            val legacyOn = prefs.getBoolean(KEY_ALERT_NOTIF, false)
+            prefs.edit()
+                .putBoolean(KEY_NOTIFY_MASTER, legacyOn)
+                .putBoolean(KEY_TUNNEL_NOTIF, prefs.getBoolean(KEY_TUNNEL_NOTIF, legacyOn))
+                .putBoolean(KEY_GATE_MIGRATED, true)
+                .apply()
+        }
+
+        /**
+         * 设备离线/上线通知开关（默认**关**，与 [NotifyScene.CONNECTIVITY].defaultEnabled、
+         * core 的 `NotificationConfig.connectivity_enabled` 及 DailyNotifyScreen 逐字一致）。
          *
          * 2026-08-29 拆出：此前 CONNECTIVITY 场景与 ALERT 共用 [KEY_ALERT_NOTIF]，
-         * 想「只关离线提醒、保留温度告警提醒」做不到。默认取 true 是为了保持行为不变 ——
-         * 拆分前只要总开关开着就有离线通知，默认 false 会让升级用户的离线提醒突然消失。
-         * 仍受 [KEY_ALERT_NOTIF] 总闸约束（见 `notifyDeviceConnectivity`）。
+         * 想「只关离线提醒、保留温度告警提醒」做不到。
+         * 真正起作用的闸门是 [notifyConnectivity] → [notify] 的 `sceneEnabledKey(CONNECTIVITY)`。
+         * 仍受 [KEY_ALERT_NOTIF] 总闸约束（判定与总闸都在 core，app 只渲染推送）。
          */
         const val KEY_CONNECTIVITY_NOTIF = "connectivity_notification_enabled"
 
@@ -115,9 +224,28 @@ class NotificationCenter(context: Context) {
         const val KEY_GUARD_ENABLED = "guard_enabled"
         const val KEY_GUARD_INTERVAL_MINUTES = "guard_interval_minutes"
         const val KEY_GUARD_FOREGROUND_KEEPALIVE = "guard_foreground_keepalive_enabled"
-        const val KEY_GUARD_LAST_RUN_AT = "guard_last_run_at"
-        const val KEY_GUARD_NEXT_RUN_AT = "guard_next_run_at"
-        const val KEY_GUARD_LAST_RESULT = "guard_last_result"
+        // guard_last_run_at / guard_next_run_at / guard_last_result 已于 2026-09-08 删除：
+        // 它们只服务于「后台守护 → 后台任务状态」那张只读诊断卡，而三项都不可信
+        //（next_run_at 是本地估算值而非 WorkManager 排期，见 GuardScheduler.GuardState 的 KDoc）。
+
+        /**
+         * 通知历史保留条数（2026-09-08 新增设置项，默认 [DEFAULT_HISTORY_MAX_ROWS]）。
+         *
+         * 真源在 core 的 `NotificationConfig.history_max_rows`，**一个值同时管两张表**：
+         * 本机状态栏通知历史（`notify_history`）与设备端邮件投递记录（`mail_send_records`）。
+         * 必须镜像（见 `NotifyPrefs.MIRRORED_INT_KEYS`）—— 状态栏通知历史由 `:ufi_notify` 写，
+         * 那个进程读不到主进程刚写的真源。
+         */
+        const val KEY_HISTORY_MAX_ROWS = "notify_history_max_rows"
+
+        /**
+         * 通知历史保留天数（2026-09-08 新增设置项，默认 [DEFAULT_HISTORY_MAX_AGE_DAYS]，**0 = 不限**）。
+         *
+         * 与 [KEY_HISTORY_MAX_ROWS] 是「先到者生效」的两道上限。
+         * 之前这条规则是写死的 7 天常量，界面上看不见 —— 用户把条数调大也留不住，
+         * 现在两道都在设置里。真源同样在 core（`history_max_age_days`），同样必须镜像。
+         */
+        const val KEY_HISTORY_MAX_AGE_DAYS = "notify_history_max_age_days"
 
         /** 告警去重游标：已通知的最大告警 id。 */
         const val KEY_LAST_NOTIFIED_ALERT_ID = "last_notified_alert_id"
@@ -136,25 +264,6 @@ class NotificationCenter(context: Context) {
         /** 告警近期已通知签名集（"sig@expireTs" 逗号分隔，TTL 兜底去重，修复 G 爆发重复）。 */
         const val KEY_RECENT_NOTIFIED_SIGS = "recent_notified_sigs"
 
-        /** 设备离线/上线时间戳状态位（ms）。 */
-        const val KEY_LAST_DEVICE_OFFLINE_AT = "last_device_offline_at"
-        const val KEY_LAST_DEVICE_ONLINE_AT = "last_device_online_at"
-
-        /**
-         * 「离线通知已发出」状态位。
-         *
-         * 用它而不是靠场景限频来去重：限频是按场景记时间戳的，离线报完 5 分钟内恢复，
-         * 上线通知会被同一个窗口吞掉 —— 用户只看到「离线」、永远等不到「已恢复」。
-         * 有了这个状态位就能做到：离线只报一次、且只有报过离线才报恢复（成对）。
-         */
-        const val KEY_CONNECTIVITY_OFFLINE_NOTIFIED = "connectivity_offline_notified"
-
-        /** 短信未读总数基线（用于差异检测）。 */
-        const val KEY_LAST_SMS_TOTAL = "last_sms_total"
-
-        /** 验证码已通知游标（消息 id）。 */
-        const val KEY_LAST_NOTIFIED_VC_ID = "last_notified_vc_id"
-
         // ── Channel ──
         const val CHANNEL_ALERTS = "device_alerts_v2"
         const val CHANNEL_CONNECTIVITY = "device_connectivity"
@@ -169,6 +278,21 @@ class NotificationCenter(context: Context) {
         const val DEFAULT_DND_START_HOUR = 23
         const val DEFAULT_DND_END_HOUR = 7
 
+        /**
+         * 通知历史保留条数的默认值与允许区间。
+         *
+         * 与 core `NotificationRoutes.HISTORY_ROWS_MIN/MAX` 及 `NotificationConfig.history_max_rows`
+         * 的默认值逐字一致 —— 分叉会出现「设置页显示 500、实际按别的值裁剪」。
+         */
+        const val DEFAULT_HISTORY_MAX_ROWS = 500
+        const val MIN_HISTORY_MAX_ROWS = 100
+        const val MAX_HISTORY_MAX_ROWS = 5000
+
+        /** 保留天数的默认值与允许区间（**0 = 不按时间清理**，是合法值）。 */
+        const val DEFAULT_HISTORY_MAX_AGE_DAYS = 30
+        const val MIN_HISTORY_MAX_AGE_DAYS = 0
+        const val MAX_HISTORY_MAX_AGE_DAYS = 365
+
         private const val ID_ALERTS = 1000
         private const val ID_CONNECTIVITY_OFFLINE = 2001
         private const val ID_CONNECTIVITY_ONLINE = 2002
@@ -177,6 +301,9 @@ class NotificationCenter(context: Context) {
         private const val ID_SMS = 4001
         private const val ID_VERIFICATION_CODE = 4002
         private const val ID_DOWNLOAD = 5001
+
+        /** 隧道异常通知 id 基址（按「引擎类型|实例名」散列偏移，保证不同实例互不覆盖）。 */
+        private const val ID_TUNNEL_BASE = 9600
 
         /** Intent extra key：通知点击跳转到短信对话界面的手机号。 */
         const val EXTRA_SMS_PHONE = "extra_sms_phone"
@@ -244,6 +371,15 @@ class NotificationCenter(context: Context) {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
         return if (start < end) hour in start until end else hour >= start || hour < end
     }
+
+    /**
+     * 「严重事件兜底」是否开启（本进程口径：主进程读真源、`:ufi_notify` 读镜像）。
+     *
+     * 全 app 只有这一处读它 —— [notify] 的免打扰分支与设置页显示都走这里，
+     * 各自 `getBoolean` 一遍就会在默认值上分叉（这个字段默认 true，最容易漏）。
+     */
+    fun isCriticalOverrideEnabled(): Boolean =
+        switchOn(KEY_CRITICAL_OVERRIDE, DEFAULT_CRITICAL_OVERRIDE)
 
     /** 5min 限频查询（只读，不置位）。 */
     fun isRateLimited(type: String): Boolean = isRateLimited(type, RATE_LIMIT_MS)
@@ -334,18 +470,20 @@ class NotificationCenter(context: Context) {
         }
         if (distinct.isEmpty()) return
 
-        // 流量限额预警与设备事件各走各的安静通道，不跟温度/信号这类硬件告警
-        // 一起用 PRIORITY_MAX + CATEGORY_ALARM 响铃。
-        val (quiet, others) = distinct.partition {
-            it.type == "traffic_limit" || it.type == "device_online" || it.type == "device_offline"
+        // 连通性 / 流量限额预警 / 设备事件各走各自的 channel 与场景开关，不跟温度、信号
+        // 这类硬件告警一起用 PRIORITY_MAX + CATEGORY_ALARM 响铃。
+        val (routed, others) = distinct.partition {
+            it.type == "connectivity" ||
+                it.type == "traffic_limit" || it.type == "device_online" || it.type == "device_offline"
         }
-        if (quiet.isNotEmpty()) {
-            // 场景解析走 channel（CHANNEL_ALERTS → ALERT），所以 traffic80 的分场景开关要在这里判
-            quiet.lastOrNull { it.type == "traffic_limit" }?.let {
-                if (switchOn(KEY_TRAFFIC_80_NOTIF, false)) notifyTrafficLimit(it)
-            }
+        if (routed.isNotEmpty()) {
+            // 连通性：断开与恢复各一条（id 不同，见 notifyConnectivity），所以逐条渲染
+            routed.filter { it.type == "connectivity" }.forEach { notifyConnectivity(it) }
+            // 只渲染最新那条流量预警（旧的已被它取代，没必要叠一串）
+            routed.lastOrNull { it.type == "traffic_limit" }?.let { notifyTrafficLimit(it) }
             // 设备事件的开关由 notify() 按 DEVICE_EVENTS 场景自行判（CHANNEL_EVENTS → DEVICE_EVENTS）
-            quiet.filter { it.type != "traffic_limit" }.takeIf { it.isNotEmpty() }?.let { notifyDeviceEvents(it) }
+            routed.filter { it.type == "device_online" || it.type == "device_offline" }
+                .takeIf { it.isNotEmpty() }?.let { notifyDeviceEvents(it) }
         }
         if (others.isEmpty()) return
 
@@ -410,9 +548,6 @@ class NotificationCenter(context: Context) {
     /** 近期已通知签名 TTL（ms）：同签名在此窗口内不重复弹，兜底爆发重复（G 修复）。 */
     private val RECENT_NOTIFIED_TTL_MS = 10 * 60 * 1000L
 
-    /** 验证码新鲜度窗口（ms）：早于此的验证码只推游标不弹通知，见 [maybeNotifyVerificationCodes]。 */
-    private val VC_FRESH_WINDOW_MS = 30 * 60 * 1000L
-
     /** 告警签名：type|level|message（同内容重拉取可识别为重复）。 */
     private fun alertSignature(a: AlertRecord): String = "${a.type}|${a.level}|${a.message}"
 
@@ -445,79 +580,38 @@ class NotificationCenter(context: Context) {
         statePrefs.edit().putString(KEY_RECENT_NOTIFIED_SIGS, parts.joinToString(",")).apply()
     }
 
-    // ═══════════════════════ 设备离线/上线（N5 / N6） ═══════════════════════
+    // ═══════════════════════ 设备事件 / 流量预警（N5-N8） ═══════════════════════
 
     /**
-     * 设备连接状态通知（由 DashboardModule 连接状态机调用）。
+     * 连通性告警通知（NotifyScene.CONNECTIVITY → device_connectivity）。
      *
-     * 防抖/防重复/防误发的三层保证（限频窗口对本场景已关闭，见 [NotifyScene.CONNECTIVITY]）：
-     * 1. **调用方边沿**：DashboardModule 有 60s 离线确认窗口 + `wsEverConnected`，
-     *    短暂抖动和冷启动未连接过都不会走到这里；
-     * 2. **状态位成对**：[KEY_CONNECTIVITY_OFFLINE_NOTIFIED] 保证「离线只报一次」，
-     *    且**只有报过离线才报恢复** —— 避免用户只收到「已恢复」这种无头通知；
-     * 3. **发送结果驱动状态位**：只有 [notify] 真的发出去（返回 true）才置位，
-     *    否则（开关关闭 / 免打扰 / 通知权限被撤）不置位，权限恢复后不会出现
-     *    「没报离线却报了恢复」。
+     * 2026-09-07：此前 core 推来的 `connectivity` 告警和温度/信号一起落到
+     * [sendSystemNotification]（CHANNEL_ALERTS + ID_ALERTS），于是 CHANNEL_CONNECTIVITY /
+     * ID_CONNECTIVITY_* / [NotifyScene.CONNECTIVITY] 全都没人用，而用户开关
+     * [KEY_CONNECTIVITY_NOTIF] 什么都管不着 —— 把「设备离线/上线」关掉照样收得到，是个假开关。
+     * 现在走 [notify]，开关由 `sceneEnabledKey(CONNECTIVITY)` 判。
      *
-     * 注意不能靠场景限频去重：限频按场景记时间戳，离线报完 5 分钟内恢复的话，
-     * 上线通知会被同一个窗口吞掉。
+     * 判定全在 core 的 `AlertEngine.checkConnectivity`（边沿触发 + 60s 确认窗口 + 恢复消警），
+     * 这里只渲染：不做边沿检测、不记「只报一次」标志位。
      *
-     * 状态位是持久化的，所以 `offline = false` 分支的**清理动作不受任何开关约束** ——
-     * 否则「报了离线 → 用户关掉总开关 / 进程被杀」之后状态位会永久卡在 true，
-     * 之后真的离线也再也报不出来。上线通知本身仍受开关约束。
-     *
-     * @param offline true=离线（device_connectivity HIGH）；false=上线（DEFAULT 静默）
-     * @param durationMs 离线时长（ms），仅上线通知使用；<=0 时回退为
-     *                   `last_device_offline_at` 与当前时间差值。
+     * 方向取自告警自身的级别（core：恢复 = info，断网 = warning），两个方向用不同的通知 id ——
+     * 共用一个 id 时「网络已恢复」会把还挂在状态栏的「设备已断网」直接替换掉，
+     * 用户回头看不出刚才断过。
      */
-    fun notifyDeviceConnectivity(offline: Boolean, durationMs: Long = 0L) {
-        // 上层总闸：系统通知推送关掉时告警族一条都不发（分场景开关由 notify(CONNECTIVITY) 判断）
-        val masterOn = switchOn(KEY_ALERT_NOTIF, false)
-        val alreadyNotified = statePrefs.getBoolean(KEY_CONNECTIVITY_OFFLINE_NOTIFIED, false)
-        val offlineAt = statePrefs.getLong(KEY_LAST_DEVICE_OFFLINE_AT, 0L)
-        val now = System.currentTimeMillis()
-        if (offline) {
-            if (alreadyNotified) return        // 已报过离线 → 不重复推
-            // 先落离线时刻：总闸关 / 免打扰时段都不发通知，但恢复后仍要算得出离线时长
-            if (offlineAt == 0L) statePrefs.edit().putLong(KEY_LAST_DEVICE_OFFLINE_AT, now).apply()
-            // 不置位 → 总闸打开或出了免打扰时段后仍会补报
-            if (!masterOn || isDndActive()) return
-            val sent = notify(
-                scene = NotifyScene.CONNECTIVITY,
-                payload = NotifyPayload(
-                    title = "设备离线",
-                    message = "随身 WiFi 设备已断开连接",
-                    notificationId = ID_CONNECTIVITY_OFFLINE,
-                    priority = NotificationCompat.PRIORITY_HIGH,
-                    category = NotificationCompat.CATEGORY_STATUS
-                )
+    private fun notifyConnectivity(alert: AlertRecord) {
+        val online = alert.level == "info"
+        notify(
+            scene = NotifyScene.CONNECTIVITY,
+            payload = NotifyPayload(
+                title = alertTypeLabel(alert.type),
+                message = alert.message,
+                notificationId = if (online) ID_CONNECTIVITY_ONLINE else ID_CONNECTIVITY_OFFLINE,
+                // 恢复是"事后补一条"，静默；断网要看得见，用 channel 的 IMPORTANCE_HIGH 派生优先级
+                silent = online,
+                category = NotificationCompat.CATEGORY_STATUS,
+                onTap = alertDeepLinkIntent()
             )
-            if (sent) statePrefs.edit().putBoolean(KEY_CONNECTIVITY_OFFLINE_NOTIFIED, true).apply()
-        } else {
-            // 没有待清理的离线状态：每次 WS 连上都会调到这里，直接返回避免无谓写盘
-            if (!alreadyNotified && offlineAt == 0L) return
-            // 清状态优先于一切开关判断，让下一次离线能重新计一轮
-            statePrefs.edit()
-                .putBoolean(KEY_CONNECTIVITY_OFFLINE_NOTIFIED, false)
-                .putLong(KEY_LAST_DEVICE_OFFLINE_AT, 0L)
-                .putLong(KEY_LAST_DEVICE_ONLINE_AT, now)
-                .apply()
-            // 没报过离线就不报恢复：总闸关期间掉线、免打扰吞掉离线的情况都在这里挡住
-            if (!masterOn || !alreadyNotified) return
-            val duration = if (durationMs > 0L) durationMs else now - offlineAt
-            val minutes = (duration / 60_000L).coerceAtLeast(1L)
-            notify(
-                scene = NotifyScene.CONNECTIVITY,
-                payload = NotifyPayload(
-                    title = "设备已重新连接",
-                    message = "离线 $minutes 分钟",
-                    notificationId = ID_CONNECTIVITY_ONLINE,
-                    priority = NotificationCompat.PRIORITY_DEFAULT,
-                    category = NotificationCompat.CATEGORY_STATUS,
-                    silent = true
-                )
-            )
-        }
+        )
     }
 
     /**
@@ -545,51 +639,41 @@ class NotificationCenter(context: Context) {
 
 
     /**
-     * 流量限额预警通知（channel 复用 device_alerts_v2，DEFAULT 静默不响铃）。
+     * 流量限额预警通知（NotifyScene.TRAFFIC_80 → channel 复用 device_alerts_v2，静默不响铃）。
      *
      * 2026-08-31：判定逻辑已从 app 删除，唯一真源是 core 的
      * `AlertEngine.checkTrafficLimit`（type=`traffic_limit`，边沿触发天然只提醒一次）。
      * 手机不在线时 core 照样发邮件；这里只负责把 core 推来的那条告警显示成安静通知，
      * 而不是跟其他告警一起走 PRIORITY_MAX/CATEGORY_ALARM 的响铃通道。
+     *
+     * 2026-09-07：改走 [NotifyScene.TRAFFIC_80]。原来走 `showNotification(CHANNEL_ALERTS, …)`，
+     * 而 `channelToScene(CHANNEL_ALERTS)` 会映射成 [NotifyScene.ALERT] —— 于是闸门读的是总闸
+     * [KEY_ALERT_NOTIF]，用户的「流量限额预警」开关 [KEY_TRAFFIC_80_NOTIF] 在通知侧什么都管不着，
+     * TRAFFIC_80 这个场景也没人用。channel 与重要性两种写法完全一致（场景声明的就是
+     * CHANNEL_ALERTS + IMPORTANCE_DEFAULT），只是闸门终于对上了。
      */
     private fun notifyTrafficLimit(alert: AlertRecord) {
         if (isDndActive()) return
-        showNotification(
-            channelId = CHANNEL_ALERTS,
-            notificationId = ID_TRAFFIC_80,
-            title = "流量预警",
-            text = alert.message,
-            priority = NotificationCompat.PRIORITY_DEFAULT,
-            category = NotificationCompat.CATEGORY_STATUS,
-            silent = true,
-            onTap = alertDeepLinkIntent()
+        notify(
+            scene = NotifyScene.TRAFFIC_80,
+            payload = NotifyPayload(
+                title = "流量预警",
+                message = alert.message,
+                notificationId = ID_TRAFFIC_80,
+                priority = NotificationCompat.PRIORITY_DEFAULT,
+                silent = true,
+                category = NotificationCompat.CATEGORY_STATUS,
+                onTap = alertDeepLinkIntent()
+            )
         )
     }
 
     // ═══════════════════════ 新短信 / 验证码（N9 / N10） ═══════════════════════
 
-    /**
-     * 新短信差异检测：按联系人未读总数增量判断（[KEY_LAST_SMS_TOTAL] 基线）。
-     * 由 ToolsModule 在 WS sms_contacts 推送与轮询兜底路径调用。
-     */
-    fun maybeNotifyNewSms(contacts: List<SmsContact>) {
-        if (!switchOn(KEY_SMS_NOTIF, false)) return
-        val unreadTotal = contacts.sumOf { it.unread }
-        val lastTotal = statePrefs.getInt(KEY_LAST_SMS_TOTAL, -1)
-        if (lastTotal < 0) {
-            // 首次加载：只记录基线，不发通知（避免历史未读轰炸）
-            statePrefs.edit().putInt(KEY_LAST_SMS_TOTAL, unreadTotal).apply()
-            return
-        }
-        if (unreadTotal <= lastTotal) return
-        statePrefs.edit().putInt(KEY_LAST_SMS_TOTAL, unreadTotal).apply()
-        val newestUnread = contacts.filter { it.unread > 0 }.maxByOrNull { it.latestTimestamp } ?: return
-        notifyNewSms(newestUnread.phoneNumber, newestUnread.latestMsg)
-    }
-
     /** 新短信通知（device_sms，DEFAULT；点击跳转到该联系人对话界面）。 */
     fun notifyNewSms(sender: String, snippet: String) {
-        if (!switchOn(KEY_SMS_NOTIF, false)) return
+        // 开关判定不在这里：[notify] 里 sceneEnabledKey(SMS) 就是 KEY_SMS_NOTIF，
+        // 再查一遍属于"每个入口各自复查"，与总闸同一类坑（2026-09-08 删）。
         notify(
             scene = NotifyScene.SMS,
             payload = NotifyPayload(
@@ -606,7 +690,9 @@ class NotificationCenter(context: Context) {
 
     /** 验证码提取通知（device_sms，DEFAULT；点击跳转到该联系人对话界面）。 */
     fun notifyVerificationCode(sender: String, code: String) {
-        if (!switchOn(KEY_SMS_NOTIF, false)) return   // 验证码依附短信开关
+        // 2026-09-08：原来这里查的是 KEY_SMS_NOTIF（"验证码依附短信开关"），
+        // 于是「关短信通知、留验证码」做不到，而设置页明明有独立的验证码开关。
+        // 现在闸门只有一处：[notify] 里 sceneEnabledKey(VERIFICATION_CODE) = KEY_VERIFICATION_NOTIF。
         notify(
             scene = NotifyScene.VERIFICATION_CODE,
             payload = NotifyPayload(
@@ -621,71 +707,50 @@ class NotificationCenter(context: Context) {
         )
     }
 
-    /**
-     * 验证码差异检测（按消息 id 游标 + 新鲜度窗口去重）。
-     *
-     * 必须**整批**传入（而不是逐条调用），因为两道闸都需要全局视角：
-     * - **首次基线**：游标从未写过时只把水位推到当前最大 msgId、不发任何通知。
-     *   逐条调用做不到这件事 —— 游标默认 0，第一条历史码就 `msgId > 0` 成立，
-     *   于是把缓存里的旧码全弹一遍（2026-08-30 实测：进短信页弹出 4 小时前的验证码）。
-     * - **新鲜度窗口**：超过 [VC_FRESH_WINDOW_MS] 的验证码只推游标、不发通知。
-     *   验证码本身几分钟内就失效，迟到的通知没有价值，只会重复用户早就处理过的消息。
-     *   窗口取 30 分钟是为了兼容 [BackgroundGuardWorker] 的 15/30 分钟周期
-     *   （WorkManager 平台下限 15 分钟）；用户把间隔调到 60 分钟时会漏掉一部分，
-     *   那种配置本身就放弃了及时性。
-     */
-    fun maybeNotifyVerificationCodes(codes: List<VerificationCode>) {
-        if (codes.isEmpty()) return
-        if (!switchOn(KEY_VERIFICATION_NOTIF, false)) return
-        if (!switchOn(KEY_SMS_NOTIF, false)) return
-
-        val maxId = codes.maxOf { it.msgId }
-        if (!statePrefs.contains(KEY_LAST_NOTIFIED_VC_ID)) {
-            statePrefs.edit().putLong(KEY_LAST_NOTIFIED_VC_ID, maxId).apply()
-            return
-        }
-        val lastId = statePrefs.getLong(KEY_LAST_NOTIFIED_VC_ID, 0L)
-        if (maxId <= lastId) return
-        // 游标一次推到位：过期而没发通知的那些 id 也算处理过，否则下次调用会再评估一遍
-        statePrefs.edit().putLong(KEY_LAST_NOTIFIED_VC_ID, maxId).apply()
-
-        val now = System.currentTimeMillis()
-        codes.asSequence()
-            .filter { it.msgId > lastId && now - it.timestamp <= VC_FRESH_WINDOW_MS }
-            .sortedBy { it.msgId }
-            .forEach { notifyVerificationCode(it.source, it.code) }
-    }
-
     // ═══════════════════════ 下载完成/失败（N11 / N12） ═══════════════════════
 
     /**
-     * 下载任务状态差异检测：status 首次变为 completed/error 时通知一次
-     * （[last_download_status_{taskId}] 状态位）。由 DownloadModule.loadDownloads 对每个任务调用。
+     * 下载完成/失败通知（device_downloads，DEFAULT）—— 渲染 core 推来的 `download` 通知。
+     *
+     * 判定（终态跃迁、只提醒一次）唯一真源是 core 的 `DownloadManager.notifyTaskResult`，
+     * 标题/正文直接用推送里那份（core 那份带文件名、来源、大小、错误原因）。
+     *
+     * @param isError 推送 `extra.status == "error"`，只影响 category 与折叠态首行。
      */
-    fun checkDownloadTaskStatus(taskId: String, taskName: String, status: String, sizeMb: Long) {
-        if (!switchOn(KEY_DOWNLOAD_NOTIF, false)) return
-        if (status != "completed" && status != "error") return
-        val key = "last_download_status_$taskId"
-        val last = statePrefs.getString(key, null)
-        if (last == status) return
-        statePrefs.edit().putString(key, status).apply()
-        notifyDownloadResult(taskName, status, sizeMb)
-    }
-
-    /** 下载完成/失败通知（device_downloads，DEFAULT）。 */
-    fun notifyDownloadResult(task: String, status: String, sizeMb: Long) {
+    fun notifyDownloadResult(title: String, message: String, isError: Boolean) {
         if (isDndActive()) return
-        val isError = status == "error"
-        val title = if (isError) "下载失败" else "下载完成"
-        val text = if (isError) "$task 下载失败，点击重试" else "$task 已下载完成（${formatMb(sizeMb)}）"
         showNotification(
             channelId = CHANNEL_DOWNLOADS,
             notificationId = ID_DOWNLOAD,
             title = title,
-            text = text,
+            text = message.lineSequence().firstOrNull() ?: title,
             priority = NotificationCompat.PRIORITY_DEFAULT,
+            bigText = message,
             category = if (isError) NotificationCompat.CATEGORY_ERROR else NotificationCompat.CATEGORY_PROGRESS,
             silent = true
+        )
+    }
+
+    // ═══════════════════════ 内网穿透隧道异常（N13） ═══════════════════════
+
+    /**
+     * 隧道异常通知（NotifyScene.TUNNEL → device_events）—— 渲染 core 推来的 `tunnel` 通知。
+     *
+     * 判定（看护重连到达上限后放弃）与分场景开关 `tunnel_notify_on_failure` 都在 core 的
+     * `TunnelManager.notifyGiveUp`，推送到达即代表「该提醒」；app 侧只剩 [notify] 里的
+     * 上层总闸与免打扰。通知 id 由「引擎类型 + 实例名」一起派生：只用名字的话，
+     * 同名的 FRP 通道与 CF 隧道会算出同一个 id，后发的那条把前一条覆盖掉。
+     */
+    fun notifyTunnelFailure(kind: String, name: String, title: String, message: String) {
+        notify(
+            scene = NotifyScene.TUNNEL,
+            payload = NotifyPayload(
+                title = title,
+                message = message.lineSequence().firstOrNull() ?: title,
+                bigText = message,
+                notificationId = ID_TUNNEL_BASE + ("$kind|$name".hashCode() and 0x7FF),
+                groupKey = "tunnel_failure"
+            )
         )
     }
 
@@ -751,23 +816,57 @@ class NotificationCenter(context: Context) {
      *         否则权限恢复后会出现"没报离线却报了恢复"）。
      */
     fun notify(scene: NotifyScene, payload: NotifyPayload): Boolean {
-        // ① 开关短路（零开销：轮询高频调用直接 return；key=null 表示本场景没有本地开关）
+        // 每条通知的结果都要落历史（送达 / 被谁拦下），因为下面 5 个分支原本全是静默
+        // `return false` —— 用户报"收不到通知"时除了猜没有别的线索（release 只留 WARN/ERROR）。
+        // 写在本函数内部而不是各调用点：唯一出口就是这里，记录才不依赖调用方自觉。
+        fun blocked(reason: String): Boolean {
+            NotifyHistoryStore.record(
+                context = appContext,
+                sceneId = scene.sceneId,
+                title = payload.title,
+                message = payload.message,
+                delivered = false,
+                blockedBy = reason
+            )
+            return false
+        }
+
+        // ⓪ 全局总闸（L1，2026-09-08）：所有状态栏通知的唯一总出口都在本函数，
+        //    所以这一句就够了，不需要各投递路径各自复查（那正是短信/下载当年漏检的成因）。
+        //    测试通知不经本函数（[sendTestNotification] 直接调 NotificationManagerCompat），
+        //    因此排查链路时它照样能发 —— 这是刻意的豁免。
+        if (!switchOn(KEY_NOTIFY_MASTER, false)) return blocked(NotifyHistoryStore.REASON_MASTER)
+
+        // ① 分类开关短路（L3，零开销：轮询高频调用直接 return；key=null 表示本场景没有本地开关）
         val enabledKey = sceneEnabledKey(scene)
-        if (enabledKey != null && !switchOn(enabledKey, scene.defaultEnabled)) return false
+        if (enabledKey != null && !switchOn(enabledKey, scene.defaultEnabled)) {
+            return blocked(NotifyHistoryStore.REASON_CATEGORY)
+        }
 
         // ② 去重（同 key + value 已通知过 → 跳过）
         val dedupKey = payload.deDupKey
         if (dedupKey != null) {
             val dedupValue = payload.deDupValue
-            if (dedupValue != null && statePrefs.getString(dedupKey, null) == dedupValue) return false
+            if (dedupValue != null && statePrefs.getString(dedupKey, null) == dedupValue) {
+                return blocked(NotifyHistoryStore.REASON_DEDUP)
+            }
         }
 
         // ③ 限频（同场景 rateLimitMinutes 内只发 1 条；0=不限）
         val rateWindowMs = scene.rateLimitMinutes * 60_000L
-        if (isRateLimited(scene.sceneId, rateWindowMs)) return false
+        if (isRateLimited(scene.sceneId, rateWindowMs)) {
+            return blocked(NotifyHistoryStore.REASON_RATE_LIMIT)
+        }
 
         // ④ 免打扰（23:00-07:00：dndBreakthrough 场景可突破，其余强制静默）
-        val silent = payload.silent || (isDndActive() && !scene.dndBreakthrough)
+        //    注意它**不算拦截**：通知照样送达，只是不响铃震动，所以不记 blocked。
+        //
+        //    2026-09-10：突破权还要再过一道「严重事件兜底」开关（默认开）。
+        //    这是 app 侧唯一受该开关影响的本机判据 —— 用户把兜底关掉却仍在静默时段被
+        //    阈值告警吵醒，那个开关就是假的。口径与 core 一致：兜底只放宽"要不要响"，
+        //    从不放宽总闸（总闸在上面第 ① 步已经拦过）。
+        val silent = payload.silent ||
+            (isDndActive() && !(scene.dndBreakthrough && isCriticalOverrideEnabled()))
 
         // ⑤ 构建 + 发送
         ensureChannels()
@@ -776,7 +875,7 @@ class NotificationCenter(context: Context) {
         // 日志里一点线索都没有 —— 而这恰恰是最常见的原因（权限从未申请过）。
         if (!NotificationManagerCompat.from(appContext).areNotificationsEnabled()) {
             DebugLog.w("NotificationCenter", "系统通知被禁用（未授权 POST_NOTIFICATIONS 或系统设置里已关闭），场景 ${scene.sceneId} 丢弃")
-            return false
+            return blocked(NotifyHistoryStore.REASON_PERMISSION)
         }
         val pi = payload.onTap ?: defaultLaunchIntent()
         val builder = NotificationCompat.Builder(appContext, scene.channelId)
@@ -795,55 +894,28 @@ class NotificationCenter(context: Context) {
             NotificationManagerCompat.from(appContext).notify(payload.notificationId, builder.build())
         } catch (_: SecurityException) {
             // 权限被拒：静默失败，且不写去重/限频状态（否则权限恢复后这条永远不再发）
-            return false
+            return blocked(NotifyHistoryStore.REASON_PERMISSION)
         }
         // 发送成功后才记录去重 key 与限频时间戳
         if (dedupKey != null) {
             payload.deDupValue?.let { statePrefs.edit().putString(dedupKey, it).apply() }
         }
         if (rateWindowMs > 0L) markRateLimited(scene.sceneId)
-        forwardToMail(scene, payload)
+        NotifyHistoryStore.record(
+            context = appContext,
+            sceneId = scene.sceneId,
+            title = payload.title,
+            message = payload.message,
+            delivered = true
+        )
         return true
-    }
-
-    /**
-     * 把刚发出的系统通知转投邮件（邮件通知功能，2026-08-29）。
-     *
-     * 挂在 [notify] 成功路径末尾：本地通知的开关/去重/限频/免打扰全部先生效，
-     * 邮件只是同一条通知的第二个投递通道，不会绕过任何拦截规则。
-     *
-     * **是否真的发**由 core 决定：SMTP 凭据只存在 core（`/api/sms-forward/config`），
-     * 场景白名单（`scenes`）也只在 core 保存一份，app 侧不再复制一套开关 ——
-     * 否则两端各存一份必然出现"app 说开、core 说关"的不一致。
-     * 这里只负责把 (scene, title, body) 报给 core，由 core 判定 sendable + 场景命中。
-     *
-     * 全程 fire-and-forget：邮件失败绝不能影响本地通知已经成功的事实，
-     * 因此异常只落 DebugLog，不向上抛、不改 [notify] 的返回值。
-     */
-    private fun forwardToMail(scene: NotifyScene, payload: NotifyPayload) {
-        // 短信族由 core 的短信路径独占邮件投递（见 NotifyScene.mailForward），app 不重复发
-        if (!scene.mailForward) return
-        mailScope.launch {
-            try {
-                val api = RetrofitClient.getApiService(AppPreferences(appContext))
-                api.forwardNotificationMail(
-                    mapOf(
-                        "scene" to scene.sceneId,
-                        "title" to payload.title,
-                        "body" to (payload.bigText ?: payload.message)
-                    )
-                )
-            } catch (e: Exception) {
-                DebugLog.w("NotificationCenter", "邮件通知转投失败 scene=${scene.sceneId}", e)
-            }
-        }
     }
 
     /**
      * 场景 → 开关 key 映射（用户可在设置页逐场景关闭）。
      *
      * 全部场景都有开关：[NotifyScene.TUNNEL] 的**分场景**开关是 core 的
-     * `tunnel_notify_on_failure`（闸门在 `TunnelModule.maybeNotifyFailures`），
+     * `tunnel_notify_on_failure`（闸门在 core 的 `TunnelManager.notifyGiveUp`，推送前就已判过），
      * 这里返回的是它的**上层总闸**「系统通知推送」，与 ALERT / CONNECTIVITY 一致 ——
      * 总闸关掉就不该有任何告警类通知漏出来。
      */
@@ -855,7 +927,7 @@ class NotificationCenter(context: Context) {
         NotifyScene.DOWNLOAD -> KEY_DOWNLOAD_NOTIF
         NotifyScene.TRAFFIC_80 -> KEY_TRAFFIC_80_NOTIF
         NotifyScene.DEVICE_EVENTS -> KEY_DEVICE_EVENTS_NOTIF
-        NotifyScene.TUNNEL -> KEY_ALERT_NOTIF
+        NotifyScene.TUNNEL -> KEY_TUNNEL_NOTIF
     }
 
     private fun importanceToPriority(importance: Int): Int = when (importance) {
@@ -961,13 +1033,6 @@ class NotificationCenter(context: Context) {
         else -> "设备告警"
     }
 
-    /** MB → 可读单位。 */
-    private fun formatMb(mb: Long): String = when {
-        mb >= 1024L * 1024L -> "%.1f TB".format(mb / (1024.0 * 1024.0))
-        mb >= 1024L -> "%.1f GB".format(mb / 1024.0)
-        else -> "$mb MB"
-    }
-
 
     // ═══════════════════════ 测试通知（v20h 用户反馈"开了通知没一条"） ═══════════════════════
     //
@@ -1024,10 +1089,10 @@ class NotificationCenter(context: Context) {
         val builder = NotificationCompat.Builder(appContext, CHANNEL_ALERTS)
             .setSmallIcon(android.R.drawable.stat_notify_chat)  // 系统级 chat 图标（无 res 依赖，避免 mipmap 缺失）
             .setContentTitle("通知测试")
-            .setContentText("UFI-AXIS 通知系统正常工作 · 通道畅通")
+            .setContentText("UFI-AXIS 通知渠道正常 · 此条已成功送达")
             .setStyle(NotificationCompat.BigTextStyle().bigText(
-                "这是一条测试通知，用于验证通知开关 / 通道 / 权限链路是否正常工作。\n" +
-                "如能看到此通知，请放心开启告警；如看不到，请检查系统「应用通知」- UFI-AXIS - 是否被禁用。"
+                "这是一条测试通知，用于确认通知开关、通知渠道与系统权限是否都已放行。\n" +
+                "若未收到，请在系统设置的「应用通知」中检查 UFI-AXIS 是否被禁用。"
             ))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_STATUS)

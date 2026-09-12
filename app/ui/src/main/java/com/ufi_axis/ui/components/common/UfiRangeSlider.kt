@@ -32,6 +32,7 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 自定义双滑块 RangeSlider，完全自绘轨道 / 刻度 / thumb，避免 Material3 RangeSlider
@@ -58,6 +59,15 @@ import kotlin.math.roundToInt
  * @param endThumbColor 右端 thumb（=values.endInclusive，大值）颜色；缺省 accent
  * @param tickStep 刻度步长（值域单位）；<=0 不画刻度。实际间隔取它的整数倍，使刻度数≈6
  * @param tickLabelFormatter 刻度标签格式化；null 只画刻度点不写字
+ * @param invertedTrack 反相着色（2026-09-08）：着色区从「两 thumb 之间」变成**两端**
+ *   （`min..start` 与 `end..max`），中间画未选中底色。
+ *
+ *   加这个参数是为了免打扰时段：静默窗口最常用的是 23:00→次日 07:00，而标准区间滑块
+ *   两个 thumb 不能交叉（见 `applyValue` 的 coerce），根本表达不出 `start > end`。
+ *   反过来让 thumb 圈住「会提醒的时段」、两端着色代表静默，跨零点就成了自然形态。
+ *
+ *   代价（调用点必须知道）：这样只能表达**跨零点的静默**。不跨零点的静默（如午休
+ *   13:00-15:00）在这个形态下表达不了 —— 需要它时应换普通区间滑块（`invertedTrack = false`）。
  */
 @Composable
 fun UfiRangeSlider(
@@ -71,7 +81,8 @@ fun UfiRangeSlider(
     startThumbColor: Color? = null,
     endThumbColor: Color? = null,
     tickStep: Float = 0f,
-    tickLabelFormatter: ((Float) -> String)? = null
+    tickLabelFormatter: ((Float) -> String)? = null,
+    invertedTrack: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
     val startColor = startThumbColor ?: palette.accent
@@ -142,11 +153,21 @@ fun UfiRangeSlider(
             ticks = ticks,
             valueRange = valueRange,
             labelAlpha = labelAlpha,
-            // 着色区恒等于两滑块之间：这就是用户选的那段，没有第二种解读
-            activeFrom = minOf(dispStart, dispEnd),
-            activeTo = maxOf(dispStart, dispEnd),
-            activeBrush = { from, to ->
-                Brush.horizontalGradient(0f to startColor, 1f to endColor, startX = from, endX = to)
+            // 常态：着色区恒等于两滑块之间，这就是用户选的那段，没有第二种解读。
+            // 反相：着色区是两端，中间留空 —— 供"两 thumb 圈出的是例外时段"这类语义使用
+            // （免打扰：中间=会提醒，两端=静默）。两端各自用自己那侧 thumb 的颜色，
+            // 不跨段做渐变：两段之间隔着未着色的中间，渐变会看起来像两个不相关的色块。
+            activeSegments = if (invertedTrack) {
+                listOf(
+                    SliderSegment(0f, minOf(dispStart, dispEnd)) { _, _ -> solidBrush(startColor) },
+                    SliderSegment(maxOf(dispStart, dispEnd), 1f) { _, _ -> solidBrush(endColor) }
+                )
+            } else {
+                listOf(
+                    SliderSegment(minOf(dispStart, dispEnd), maxOf(dispStart, dispEnd)) { from, to ->
+                        Brush.horizontalGradient(0f to startColor, 1f to endColor, startX = from, endX = to)
+                    }
+                )
             },
             thumbs = listOf(dispStart to startColor, dispEnd to endColor),
             thumbScale = thumbScale,
@@ -251,9 +272,7 @@ fun UfiValueSlider(
             ticks = ticks,
             valueRange = valueRange,
             labelAlpha = labelAlpha,
-            activeFrom = 0f,
-            activeTo = dispValue,
-            activeBrush = { _, _ -> Brush.horizontalGradient(0f to color, 1f to color) },
+            activeSegments = listOf(SliderSegment(0f, dispValue) { _, _ -> solidBrush(color) }),
             thumbs = listOf(dispValue to color),
             thumbScale = thumbScale,
             trackColor = palette.accent.copy(alpha = if (enabled) 0.15f else 0.08f),
@@ -346,11 +365,22 @@ private fun buildSliderMetrics(
     )
 }
 
+/** 一段着色区：起止 fraction（0..1）+ 由像素起止 x 生成的画刷（渐变需要绝对坐标）。 */
+private class SliderSegment(
+    val from: Float,
+    val to: Float,
+    val brush: (Float, Float) -> Brush
+)
+
+/** 单色画刷。`horizontalGradient` 两端同色即纯色，省得为此再引一种 Brush 类型。 */
+private fun solidBrush(color: Color): Brush =
+    Brush.horizontalGradient(0f to color, 1f to color)
+
 /**
- * 画轨道 → 激活段 → 刻度点 → 刻度标签 → thumb（顺序即层级，thumb 必须压在最上面）。
+ * 画轨道 → 着色区 → 刻度点 → 刻度标签 → thumb（顺序即层级，thumb 必须压在最上面）。
  *
- * @param activeFrom / [activeTo] 激活段的起止 fraction（0..1）
- * @param activeBrush 由激活段的像素起止 x 生成画刷（渐变需要绝对坐标）
+ * @param activeSegments 着色区，可以有多段（反相着色时是"两端"两段）。
+ *   段内 `to <= from` 会被跳过 —— thumb 贴到轨道端点时那一段宽度为 0。
  * @param thumbs 每个 thumb 的 (fraction, 颜色)
  * @param thumbRingColor thumb 内圈环的颜色。环画在 thumb 实底**之内**
  *   （半径 `r - ringWidth/2`、线宽 `ringWidth`，即覆盖 `r-ringWidth..r`），
@@ -361,9 +391,7 @@ private fun DrawScope.drawUfiSlider(
     ticks: SliderTicks,
     valueRange: ClosedFloatingPointRange<Float>,
     labelAlpha: Float,
-    activeFrom: Float,
-    activeTo: Float,
-    activeBrush: (Float, Float) -> Brush,
+    activeSegments: List<SliderSegment>,
     thumbs: List<Pair<Float, Color>>,
     thumbScale: Float,
     trackColor: Color,
@@ -384,15 +412,17 @@ private fun DrawScope.drawUfiSlider(
         cornerRadius = corner
     )
 
-    val fromX = xOf(activeFrom)
-    val toX = xOf(activeTo)
-    if (toX > fromX) {
-        drawRoundRect(
-            brush = activeBrush(fromX, toX),
-            topLeft = Offset(fromX, trackTop),
-            size = Size(toX - fromX, metrics.trackHeightPx),
-            cornerRadius = corner
-        )
+    activeSegments.forEach { segment ->
+        val fromX = xOf(segment.from)
+        val toX = xOf(segment.to)
+        if (toX > fromX) {
+            drawRoundRect(
+                brush = segment.brush(fromX, toX),
+                topLeft = Offset(fromX, trackTop),
+                size = Size(toX - fromX, metrics.trackHeightPx),
+                cornerRadius = corner
+            )
+        }
     }
 
     val tickY = trackTop + metrics.trackHeightPx + metrics.tickRadiusPx + metrics.tickGapPx

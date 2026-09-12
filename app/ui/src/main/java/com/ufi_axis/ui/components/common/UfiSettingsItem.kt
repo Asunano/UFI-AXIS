@@ -47,30 +47,26 @@ fun UfiSettingsItem(
     descriptionMaxLines: Int = Int.MAX_VALUE
 ) {
     val palette = LocalResolvedPalette.current
-    // 未指定 iconTint 时的默认色 = [ResolvedPalette.textPrimary]。
+    // 未指定 iconTint 时的默认色 = [ResolvedPalette.accent]。
     //
-    // 2026-09-05：原先默认 `palette.accent`，深色下不可读 —— `default` 预设的
-    // `accentDark` 是 0xFF555555，压在 `cardBgDark`（0xFF2A2A2A）上 WCAG 对比度只有
-    // 约 1.9:1，远低于非文本图形 3:1 的下限，用户看到的就是"深灰图标糊在深灰卡上"。
+    // 2026-09-08：改回 accent。它曾在 2026-09-05 被单点改成 textPrimary 以绕开
+    // 「默认皮肤深色态 accentDark(#555555) 对卡面仅 1.9:1」的问题；那个根因已在
+    // ThemePresets.Default 修掉（accent 现在恒定落在当前明暗档的可读侧，深色态 6.6:1），
+    // 绕道反而造成「工具页/入口卡图标是主题色、设置页入口图标是白/黑」的不一致 ——
+    // 换成红、蓝等彩色皮肤时尤其明显：同一个 App 里两类入口一个跟随主题、一个不跟随。
     //
-    // 为什么改这里而不是把 `accentDark` 调成近白：`accent` 在本仓的语义是**实底色块**
-    // （主按钮 / FAB / 渐变 Hero / 进度条已填充段 / 选中态填充 / switch 滑块 /
-    // 聚焦输入框描边 / chip 选中底），全仓约 330 处消费。把它整体提到近白会同时
-    // 破坏那些位置：`onAccent` 默认是白色，近白 accent 底上的白字直接消失；
-    // 浅色卡上的近白进度条也会糊掉。图标 tint 只是它的**少数派用途**，不该由它定调。
-    //
-    // textPrimary 才是语义正确的槽：设置行的前导图标与同一行的标题是同一层级的信息，
-    // 标题走的就是 textPrimary，两者同色本身也更整齐。
-    // 对比度（对承载它的卡面）：深色 0xFFEEEEEE / 0xFF2A2A2A ≈ 12.4:1，
-    // 浅色 0xFF111111 / 0xFFFFFFFF ≈ 18.9:1，均远超 3:1（见 ColorTest 的钉桩测试）。
+    // 需要某一行不跟随主题（例如危险项走 error、状态项走 success）时由调用方显式传 iconTint。
     val effectiveIconTint = if (iconTint == Color.Unspecified) {
-        palette.textPrimary
+        palette.accent
     } else iconTint
     val titleColor = if (enabled) palette.textPrimary else palette.textSecondary.copy(alpha = 0.5f)
     val descriptionColor =
         if (enabled) palette.textSecondary else palette.textSecondary.copy(alpha = 0.35f)
     // 纵向 10dp：批 6 统一两套设置行时取自原 UfiSettingsRow（16sp 标题需要略多的呼吸空间）。
-    val mod = if (onClick != null) {
+    //
+    // 2026-09-08：`enabled = false` 时必须同时吞掉点击。此前只淡化了文字颜色而 clickable 照挂，
+    // 于是"置灰的入口还能点进去"——那正是本仓禁止的假开关的另一种形态（看起来不可用、实际可用）。
+    val mod = if (enabled && onClick != null) {
         modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 10.dp)
     } else {
         modifier.fillMaxWidth().padding(vertical = 10.dp)
@@ -156,26 +152,48 @@ fun UfiSettingsChevron() {
     )
 }
 
+/**
+ * 「值 + 右箭头」设置行 —— 二级页入口与"点开选一个档位"的标准写法。
+ *
+ * @param icon 前置图标（可选），直接透传给 [UfiSettingsItem]。
+ *        2026-09-08 新增：同一个 [UfiSettingsGroup] 里 [UfiSettingsToggle] 早就能带图标，
+ *        本组件不能 —— 于是「开关行有图标、值行没有」的分组左边缘对不齐（短信设置的验证码分组
+ *        三行就是这个样子）。带默认值的新增参数，全部既有调用点不受影响（[F24] 向后兼容口径）。
+ * @param enabled false 时整行置灰**且不可点击**（点击由 [UfiSettingsItem] 吞掉），
+ *        右侧箭头一并隐藏 —— 用于"上级开关关着，这个入口点进去也没用"的依赖关系。
+ *        2026-09-08 新增，理由：通知总闸关着时下面几个入口全是无效设置，
+ *        既然点进去改了也不生效，就不该让人点进去改。
+ */
 @Composable
 fun UfiSettingsValue(
     title: String,
     description: String? = null,
     value: String,
-    onClick: (() -> Unit)? = null
+    onClick: (() -> Unit)? = null,
+    icon: ImageVector? = null,
+    enabled: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
     UfiSettingsItem(
         title = title,
         description = description,
+        icon = icon,
         onClick = onClick,
+        enabled = enabled,
         trailing = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = value,
                     style = UfiTextStyles.body,
-                    color = palette.textSecondary
+                    color = if (enabled) {
+                        palette.textSecondary
+                    } else {
+                        palette.textSecondary.copy(alpha = 0.35f)
+                    }
                 )
-                if (onClick != null) {
+                // 箭头是"可以点进去"的视觉承诺：禁用时必须一并撤掉，否则灰着还带箭头，
+                // 用户只会以为是渲染问题而反复戳它。
+                if (onClick != null && enabled) {
                     Spacer(Modifier.width(4.dp))
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,

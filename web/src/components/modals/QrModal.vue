@@ -68,6 +68,8 @@ const show = computed({
   height: 200px;
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
+  /* 刻意写死纯白，**不要**接 --card-bg：二维码识别依赖码块与底色的高对比，
+     暗色模式下若跟着卡片变成 #1a1a20，摄像头基本扫不出来。 */
   background: #ffffff;
   overflow: hidden;
 }

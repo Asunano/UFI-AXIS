@@ -2,3 +2,7 @@ dist
 node_modules
 *.tsbuildinfo
 package-lock.json
+# unplugin-vue-components 每次构建都会重写它，格式化了也会被改回去 ——
+# 让它进门禁只会让 `npm run lint` 在每次 build 之后无条件变红
+src/components.d.ts
+

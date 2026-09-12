@@ -48,8 +48,8 @@ defineProps<{
 
 const emit = defineEmits<{
   'open-acl': [];
-  'block': [WifiClient];
-  'unblock': [string];
+  block: [WifiClient];
+  unblock: [string];
 }>();
 </script>
 
@@ -117,7 +117,7 @@ const emit = defineEmits<{
   cursor: pointer;
 }
 .acl-entry:hover {
-  border-color: var(--border-strong, var(--border-subtle));
+  border-color: var(--border-subtle);
 }
 .acl-entry-count {
   color: var(--text-muted);

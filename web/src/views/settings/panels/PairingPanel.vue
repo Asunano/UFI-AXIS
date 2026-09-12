@@ -6,8 +6,14 @@
 -->
 <template>
   <div class="settings-panel">
-    <!-- 配对状态卡片 -->
-    <GridCard title="配对管理">
+    <!-- 配对状态卡片
+         2026-09-10 改为通栏（.full-width）：这张卡的高度随「已配对设备数」变化（实测 0 台
+         286px、2 台 497px，且不封顶），无法与别的卡配成等高的一行。
+         同日第二轮：本页三张卡**全部**通栏 —— 因为另两张的高度也都随状态变
+         （密码卡 263 ↔ 476.9px；限制配置 106 ↔ 223px），同行差最大 370.9px。
+         三张都通栏后本页不再有配对，「同行等高」这个约束自然消失。
+         顺带收益：设备列表是「#序号 + 名称 + 指纹 + 两个按钮」的四段式，通栏后每段都宽一倍。 -->
+    <GridCard class="full-width" title="配对管理">
       <n-spin :show="loading">
         <div v-if="status" class="pairing-content">
           <div class="status-badge" :class="status.paired ? 'paired' : 'unpaired'">
@@ -55,10 +61,16 @@
       </n-spin>
     </GridCard>
 
-    <!-- 首次配对：设置管理员密码（设备仍使用默认/初始密码时显示） -->
-    <GridCard v-if="status?.has_default_password" title="设置管理员密码">
-      <n-alert type="warning" :bordered="false" style="margin-bottom: 16px">
-        设备仍使用默认或初始密码，存在安全风险，请尽快设置管理员密码。
+    <!-- 首次配对：设置配对密码（设备仍使用默认/初始密码时显示）
+         2026-09-10 第二轮改为通栏。原因是**运行时状态**：这张卡有两个变体 ——
+         首次（有默认密码）带安全告警 + Goform 子表单，实测 476.9px；设过密码后变体只有
+         三个输入框，263px。同时「配对限制配置」也随状态变（未启用限制时只剩 1 行，106px；
+         启用后 223px）。两个高度都随状态摆 2~3 倍，**同行配对本质上不成立**：
+         实测新设备（默认密码）状态下同行差 370.9px，就是一块整版空白。
+         所以本页三张卡全部通栏、不做配对 —— 这是唯一对状态免疫的排法。 -->
+    <GridCard v-if="isFirstRunPassword" class="full-width" title="设置配对密码">
+      <n-alert class="pwd-alert" type="warning" :bordered="false">
+        设备仍使用默认或初始密码，存在安全风险，请尽快设置配对密码。
       </n-alert>
       <div class="pwd-setup">
         <n-input
@@ -86,8 +98,24 @@
           class="pwd-input"
           @keyup.enter="setAdminPassword"
         />
-        <div class="goform-mini">
-          <div class="goform-mini-title">调制解调器后台 (Goform)</div>
+        <!-- 强度提示与登录页保持同一算法/同一呈现（evaluatePasswordStrength）。
+             顺序放在「确认新密码」之后而不是「新密码」之后：.pwd-setup 是 2 列栅格
+             （见该类的注释），三个输入框正好占满第 1 行，强度条与确认框配成第 2 行；
+             原来夹在新/确认之间会让第 2 行只剩一个元素、右边空一格。 -->
+        <div class="pw-strength">
+          <div class="pw-strength-bars">
+            <span
+              v-for="i in 4"
+              :key="i"
+              class="pw-bar"
+              :class="{ active: i <= passwordStrength.score }"
+              :style="i <= passwordStrength.score ? { background: passwordStrength.color } : {}"
+            ></span>
+          </div>
+          <span class="pw-strength-label">{{ passwordStrength.label }}</span>
+        </div>
+        <div class="goform-mini sub-panel pwd-full">
+          <div class="goform-mini-title">设备后台</div>
           <div class="goform-mini-grid">
             <n-input v-model:value="goformIp" placeholder="IP（默认 192.168.0.1）" class="pwd-input" />
             <n-input-number v-model:value="goformPort" :min="1" :max="65535" placeholder="端口" style="width: 120px" />
@@ -100,14 +128,71 @@
             class="pwd-input"
           />
         </div>
-        <div class="pwd-actions">
+        <div class="pwd-actions pwd-full">
           <n-button type="primary" :loading="settingPwd" @click="setAdminPassword">设置密码</n-button>
         </div>
       </div>
     </GridCard>
 
-    <!-- 配对限制配置卡片 -->
-    <GridCard title="配对限制配置">
+    <!--
+      已设过密码后的常驻入口：修改配对密码。
+      拆成两张卡是因为原来只有 has_default_password=true 的首次配对卡，
+      密码一旦设过 web 端就再也改不了（app 端没有这个限制）。
+      这里不重复 Goform 子表单 —— 设备后台密码在「通用设置」/「高级」里已有入口，
+      抄第二份会让同一个字段有两处来源。
+      通栏理由同上面那张：它与首次配对卡是同一个卡的两个变体，高度差一倍，
+      与「配对限制配置」同行必然留白（实测新设备状态 370.9px）。
+    -->
+    <GridCard v-else-if="status" class="full-width" title="修改配对密码">
+      <div class="pwd-setup">
+        <n-input
+          v-model:value="curPwd"
+          type="password"
+          show-password-on="click"
+          placeholder="当前密码"
+          :input-props="{ autocomplete: 'current-password' }"
+          class="pwd-input"
+        />
+        <n-input
+          v-model:value="newPwd"
+          type="password"
+          show-password-on="click"
+          placeholder="新密码（4-64 位）"
+          :input-props="{ autocomplete: 'new-password' }"
+          class="pwd-input"
+        />
+        <n-input
+          v-model:value="newPwd2"
+          type="password"
+          show-password-on="click"
+          placeholder="确认新密码"
+          :input-props="{ autocomplete: 'new-password' }"
+          class="pwd-input"
+          @keyup.enter="setAdminPassword"
+        />
+        <!-- 强度条放在确认框之后：理由见首次配对卡里同一处的注释（2 列栅格占满整行） -->
+        <div class="pw-strength">
+          <div class="pw-strength-bars">
+            <span
+              v-for="i in 4"
+              :key="i"
+              class="pw-bar"
+              :class="{ active: i <= passwordStrength.score }"
+              :style="i <= passwordStrength.score ? { background: passwordStrength.color } : {}"
+            ></span>
+          </div>
+          <span class="pw-strength-label">{{ passwordStrength.label }}</span>
+        </div>
+        <div class="pwd-actions pwd-full">
+          <n-button type="primary" :loading="settingPwd" @click="setAdminPassword">修改密码</n-button>
+        </div>
+      </div>
+    </GridCard>
+
+    <!-- 配对限制配置卡片。通栏：本卡高度也随状态变（未启用限制时只剩 1 行 106px，
+         启用后 3 个块 223px），与任何卡同行都会留白。三张卡通栏后本页不再有配对，
+         也就没有「同行等高」这个约束。 -->
+    <GridCard class="full-width" title="配对限制配置">
       <div class="config-section">
         <div class="config-row">
           <div class="config-label-group">
@@ -139,7 +224,7 @@
           <n-progress
             :percentage="Math.min(100, Math.round((pairedCount / configMaxDevices) * 100))"
             :height="6"
-            :color="pairedCount >= configMaxDevices ? '#d03050' : undefined"
+            :color="pairedCount >= configMaxDevices ? 'var(--error)' : undefined"
           />
         </div>
       </div>
@@ -151,6 +236,7 @@
 import { ref, computed, onMounted, onUnmounted, h } from 'vue';
 import { useMessage, useDialog, NInput } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
+import { evaluatePasswordStrength } from '@/composables/utils';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 
@@ -177,13 +263,23 @@ const configEnabled = ref(true);
 const configMaxDevices = ref(0);
 const pairedCount = computed(() => pairedDevices.value.length || (status.value?.paired_fingerprints?.length ?? 0));
 
-// 设置管理员密码（初次配对安全向导）
+// 配对密码表单。首次配对（has_default_password=true）与日常修改共用同一组 ref、
+// 同一个提交函数：两套输入框只在模板上分卡，逻辑（尤其是 8 个错误码分支）只有一份。
 const curPwd = ref('');
 const newPwd = ref('');
 const newPwd2 = ref('');
 const settingPwd = ref(false);
 
-// 初次配对时一并写入的 Goform 后台连接配置（默认值与设备出厂一致）
+/** true = 设备仍是默认/初始密码 → 首次配对向导；false = 已设过密码 → 常驻「修改配对密码」。 */
+const isFirstRunPassword = computed(() => status.value?.has_default_password === true);
+
+/** 新密码强度：与登录页共用 evaluatePasswordStrength，不另造算法。 */
+const passwordStrength = computed(() => evaluatePasswordStrength(newPwd.value));
+
+// 初次配对时一并写入的 Goform 后台连接配置（默认值与设备出厂一致）。
+// 注意：这三个值只在首次配对卡里出现，且**从不**从 core 读回 —— core 对
+// goform_password 是脱敏返回（12****78）并拒绝含 *** 的回写，见 GeneralPanel.vue:184。
+// 修改密码卡不含 Goform 子表单，也不会提交任何 goform_* 字段。
 const goformIp = ref('192.168.0.1');
 const goformPort = ref(8080);
 const goformPassword = ref('admin');
@@ -226,8 +322,20 @@ async function loadDevices() {
   }
 }
 
-/** 初次配对安全向导：设置管理员密码（对应 app 的“初次配对设置密码”）。 */
+/**
+ * 配对密码提交。两张卡（首次设置 / 日常修改）共用这一份实现：
+ * 端点、请求体字段名与 8 个错误码分支全部保持原样，只有「是否带 Goform 配置」按
+ * 首次配对与否分流 —— 修改密码卡里根本没有 Goform 输入框，绝不能提交那三个字段
+ * （否则会把硬编码的出厂默认值 192.168.0.1/8080/admin 写回设备）。
+ */
 async function setAdminPassword() {
+  const firstRun = isFirstRunPassword.value;
+  // 首次配对沿用原有行为：当前密码留空按出厂默认 admin 处理（输入框 placeholder 已说明）。
+  // 修改密码时必须显式输入当前密码，否则等于让 core 去猜。
+  if (!firstRun && !curPwd.value) {
+    message.error('请输入当前密码');
+    return;
+  }
   if (!newPwd.value) {
     message.error('请输入新密码');
     return;
@@ -240,25 +348,30 @@ async function setAdminPassword() {
     message.error('两次输入的新密码不一致');
     return;
   }
-  if (!goformIp.value.trim() || !goformPassword.value) {
-    message.error('请填写调制解调器后台地址与密码');
-    return;
-  }
-  const gp = Number(goformPort.value);
-  if (!Number.isInteger(gp) || gp < 1 || gp > 65535) {
-    message.error('后台端口需在 1-65535 之间');
-    return;
+  if (firstRun) {
+    if (!goformIp.value.trim() || !goformPassword.value) {
+      message.error('请填写设备后台地址与密码');
+      return;
+    }
+    const gp = Number(goformPort.value);
+    if (!Number.isInteger(gp) || gp < 1 || gp > 65535) {
+      message.error('后台端口需在 1-65535 之间');
+      return;
+    }
   }
   settingPwd.value = true;
   try {
-    await api.post('/pairing/change-password', {
-      old_password: curPwd.value || 'admin',
+    const payload: Record<string, any> = {
+      old_password: firstRun ? curPwd.value || 'admin' : curPwd.value,
       new_password: newPwd.value,
-      goform_ip: goformIp.value.trim(),
-      goform_port: Number(goformPort.value),
-      goform_password: goformPassword.value,
-    });
-    message.success('管理员密码已设置');
+    };
+    if (firstRun) {
+      payload.goform_ip = goformIp.value.trim();
+      payload.goform_port = Number(goformPort.value);
+      payload.goform_password = goformPassword.value;
+    }
+    await api.post('/pairing/change-password', payload);
+    message.success(firstRun ? '配对密码已设置' : '配对密码已修改');
     curPwd.value = '';
     newPwd.value = '';
     newPwd2.value = '';
@@ -273,7 +386,7 @@ async function setAdminPassword() {
     } else if (statusCode === 403) {
       message.error('配对接口仅允许同网段访问');
     } else if (code === 'INVALID_GOFORM_CONFIG') {
-      message.error('调制解调器后台配置无效（IP/端口/密码格式错误）');
+      message.error('设备后台配置无效（IP/端口/密码格式错误）');
     } else if (code === 'INVALID_NEW_PASSWORD' || statusCode === 400) {
       message.error('新密码格式不正确（需 4-64 位）');
     } else {
@@ -330,7 +443,7 @@ function confirmUnpair() {
   });
 }
 
-// core 的 DELETE /api/pairing/devices/{fp} 需要设备密码（双因素），
+// core 的 DELETE /api/pairing/devices/{fp} 需要配对密码（双因素），
 // 旧代码的 passwordInput 是个从未与任何输入框绑定的局部变量 → 永远发 password:undefined → 恒 401 MISSING_PASSWORD
 function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
   const pwd = ref('');
@@ -339,12 +452,12 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
     title: '移除设备',
     content: () =>
       h('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
-        h('span', `移除设备 "${label}" 的配对需要验证设备密码，移除后该客户端需重新配对。`),
+        h('span', `移除设备 "${label}" 的配对需要验证配对密码，移除后该客户端需重新配对。`),
         h(NInput, {
           value: pwd.value,
           type: 'password',
           showPasswordOn: 'click',
-          placeholder: '设备密码',
+          placeholder: '配对密码',
           'onUpdate:value': (v: string) => {
             pwd.value = v;
           },
@@ -354,7 +467,7 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
     negativeText: '取消',
     onPositiveClick: async () => {
       if (!pwd.value) {
-        message.error('请输入设备密码');
+        message.error('请输入配对密码');
         return false;
       }
       try {
@@ -366,8 +479,8 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
         loadStatus();
       } catch (e: any) {
         const code = e?.response?.data?.code;
-        if (code === 'MISSING_PASSWORD') message.error('需要提供设备密码');
-        else if (code === 'INVALID_PASSWORD') message.error('设备密码错误');
+        if (code === 'MISSING_PASSWORD') message.error('需要提供配对密码');
+        else if (code === 'INVALID_PASSWORD') message.error('配对密码错误');
         else if (code === 'PASSWORD_LOCKED') message.error('密码错误次数过多，请 15 分钟后重试');
         else if (code === 'DEVICE_NOT_FOUND') message.error('该设备已不在配对列表中');
         else message.error(e?.response?.data?.error || '操作失败');
@@ -444,12 +557,12 @@ onUnmounted(() => {
   margin-bottom: 20px;
 }
 .status-badge.paired {
-  background: rgba(24, 160, 88, 0.1);
-  color: #18a058;
+  background: var(--success-light);
+  color: var(--success);
 }
 .status-badge.unpaired {
-  background: rgba(208, 48, 80, 0.1);
-  color: #d03050;
+  background: var(--error-light);
+  color: var(--error);
 }
 .status-dot {
   width: 8px;
@@ -457,10 +570,10 @@ onUnmounted(() => {
   border-radius: 50%;
 }
 .status-dot.active {
-  background: #18a058;
+  background: var(--success);
 }
 .status-dot.inactive {
-  background: #d03050;
+  background: var(--error);
 }
 .info-grid {
   display: flex;
@@ -472,7 +585,7 @@ onUnmounted(() => {
   font-family: 'Courier New', monospace;
   font-size: 15px;
   letter-spacing: 2px;
-  background: var(--hover-color, #f5f5f5);
+  background: var(--surface-elevated);
   padding: 2px 8px;
   border-radius: 4px;
 }
@@ -496,7 +609,7 @@ onUnmounted(() => {
   align-items: center;
   padding: 8px 12px;
   border-radius: 8px;
-  background: var(--hover-color, #f5f5f5);
+  background: var(--surface-elevated);
 }
 .device-info {
   display: flex;
@@ -567,23 +680,65 @@ onUnmounted(() => {
   margin-bottom: 4px;
   display: block;
 }
+/* 密码表单栅格（2026-09-10 第二轮：flex 竖排 → 2 列栅格）。
+   改的原因：两张密码卡都改成通栏了（见模板顶部注释），卡片宽到 1180~1650，
+   竖排会让每个密码框拉成一千多像素宽。改成 2 列后三个输入框占满第 1 行、
+   强度条与确认框配第 2 行，宽度用得上、行数还少一半。
+   沿用 main.css 的 .config-grid 口径：2 列 + 768 折单列，不新增断点。
+   `.pwd-full` 是通栏项（Goform 子表单、按钮行）。 */
 .pwd-setup {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  align-items: start;
+}
+.pwd-setup > .pwd-full {
+  grid-column: 1 / -1;
+}
+/* 首次配对卡里的安全告警：在 .pwd-setup 之外，所以自己带下边距
+   （原来是内联 style="margin-bottom:16px"，改用栅格 gap 后统一收到这里） */
+.pwd-alert {
+  margin-bottom: var(--space-3);
 }
 .pwd-actions {
   display: flex;
   justify-content: flex-end;
 }
+/* 密码强度条：与 LoginView.vue 的同名类保持一致的观感（各自 scoped，故需本地一份） */
+.pw-strength {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: -4px 0 0;
+}
+@media (max-width: 768px) {
+  .pwd-setup {
+    grid-template-columns: 1fr;
+  }
+}
+.pw-strength-bars {
+  display: flex;
+  gap: 4px;
+  flex: 1;
+}
+.pw-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-subtle);
+  transition: background 0.2s;
+}
+.pw-strength-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 28px;
+  text-align: right;
+}
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel（见模板 class） */
 .goform-mini {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 14px;
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: var(--page-bg);
 }
 .goform-mini-title {
   font-size: 13px;

@@ -65,12 +65,12 @@ export default defineConfig(() => ({
     // 路由级 code-splitting 由 vue-router 自动处理
     rollupOptions: {
       output: {
-      manualChunks: {
-        // 不再强制 naive-ui 单独成块：移除 app.use(naive) 后，各组件会随所用路由
-        // 分片按需加载，首屏仅含首屏实际用到的子集（见 OPTIMIZATION-PLAN）。
-        echarts: ['echarts', 'vue-echarts'],
-        vendor: ['vue', 'vue-router', 'pinia', 'axios'],
-      },
+        manualChunks: {
+          // 不再强制 naive-ui 单独成块：移除 app.use(naive) 后，各组件会随所用路由
+          // 分片按需加载，首屏仅含首屏实际用到的子集。
+          echarts: ['echarts', 'vue-echarts'],
+          vendor: ['vue', 'vue-router', 'pinia', 'axios'],
+        },
       },
     },
   },

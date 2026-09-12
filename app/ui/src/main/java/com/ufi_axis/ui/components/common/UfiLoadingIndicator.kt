@@ -13,27 +13,33 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import kotlin.math.PI
 import kotlin.math.sin
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * A Canvas-based breathing arc loading indicator.
  *
- * Draws a full-circle track at 15% alpha of the accent color, with a rotating
+ * Draws a full-circle track at 15% alpha of [color], with a rotating
  * arc whose sweep angle oscillates between 270 and 330 degrees to produce a
  * "breathing" effect. Completes one full rotation per second.
+ *
+ * [color] 默认取主题强调色（独立使用时的常态）。放在**实底按钮里**时必须由调用方传入
+ * 该按钮的 `LocalContentColor`：accent 实底上的前景是 `onAccent`，转圈若仍画 accent
+ * 就成了"同色压同色"，且与紧邻的按钮文字不同色（见 [UfiButton] 的 loading 分支）。
  */
 @Composable
 fun UfiLoadingIndicator(
     modifier: Modifier = Modifier.size(40.dp),
-    strokeWidth: Float = 3f
+    strokeWidth: Float = 3f,
+    color: Color = LocalResolvedPalette.current.accent
 ) {
-    val palette = LocalResolvedPalette.current
-    val accentColor = palette.accent
+    val accentColor = color
     val trackColor = accentColor.copy(alpha = 0.15f)
 
     // Rotation animation: 0 -> 360 degrees, Duration.Orbit(1000ms) per revolution, linear, infinite

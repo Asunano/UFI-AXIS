@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 视频预览自定义 controller（沉浸式）：
+     去掉顶部标题栏（文件名/标题），仅保留右上角的关闭按钮，叠加在画面上方。
+     关闭按钮随默认控制条一起显示/隐藏，不再额外叠一层标题栏破坏沉浸感。
+     底部控制条沿用 media3 默认 exo_player_control_view。 -->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:layoutDirection="ltr">
+
+    <!-- media3 默认控制条（播放/暂停、进度、时间、底部按钮等）。 -->
+    <include layout="@layout/exo_player_control_view" />
+
+    <!-- 右上角关闭按钮：半透黑暗底圆，白色 ×，叠加在视频上方，始终可点。 -->
+    <ImageButton
+        android:id="@+id/ufi_preview_close"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="10dp"
+        android:background="@drawable/ufi_close_bg"
+        android:contentDescription="关闭"
+        android:padding="10dp"
+        android:scaleType="centerInside"
+        android:src="@drawable/ufi_ic_close" />
+
+</FrameLayout>

@@ -110,6 +110,8 @@
 
 - 邮件模板 HTML + 纯文本双份，不引用任何外部字体与图片（兼容 Outlook / Gmail，也不泄露阅读行为）
 - 验证码提取需先命中提示词（验证码/校验码/动态码/口令/code/OTP）才抓 4–8 位数字，避免把「余额 123456」当成验证码
+- **投递记录是三态**：每次投递逐条留档为「已发出 / 没发出 / 已跳过」，跳过带中文原因（免打扰、场景未勾选、级别不够、配额用尽）。失败数与跳过数分开统计、不相加。App 与 Web 控制台都能按渠道查看、筛选与清空
+
 
 
 ### 5. 设备身份认证
@@ -273,7 +275,7 @@ UFI-AXIS/
 │   └── src/views/               # 14 个页面 + settings 的 8 个子面板
 ├── config/literal-baseline.properties   # UI 字面量基线（只降不升）
 ├── scripts/verify-api-contract.mjs      # 双端契约一致性校验
-├── docs/                        # 全部项目文档：plans/（计划书）· design/（设计方案）· deliverables/（交付记录）· 主题令牌索引等
+├── docs/                        # 项目文档：设备侧接口参考 · 主题令牌索引
 ├── version.json                 # 单一版本源：frontend / backend / web / 二进制组件
 ├── package-web.sh · package-web.bat     # 独立 Web 更新包打包
 └── .github/workflows/           # build.yml · release.yml · component-versions.yml
@@ -290,11 +292,11 @@ UFI-AXIS/
 1. 从 [Releases](https://github.com/Asunano/UFI-AXIS/releases) 下载最新的 **core** 与 **app** 两个 APK
 2. 在设备上安装 core 并启动后端服务（常驻前台服务，默认端口 `8088`）
 3. 在手机上安装 app
-4. 手机连上该设备的 WiFi，打开 App 走首次配对：填写设备地址与端口 → 完成三步握手（首次会下发配对码并要求设置管理密码）
+4. 手机连上该设备的 WiFi，打开 App 走首次配对：填写设备地址与端口 → 完成三步握手（首次会下发配对码并要求设置配对密码）
 5. 配对成功后 App 生成设备私钥（存于 Android Keystore，不可导出），此后所有请求自动签名
 6. 也可以直接用浏览器访问 `http://<设备IP>:8088` 打开内置面板，同样需要配对与登录
 
-> 服务默认监听 `0.0.0.0`，同一局域网内均可访问。**请设置强管理密码**，不要把 `8088` 端口直接映射到公网。
+> 服务默认监听 `0.0.0.0`，同一局域网内均可访问。**请设置强配对密码**，不要把 `8088` 端口直接映射到公网。
 
 ### 从源码构建
 

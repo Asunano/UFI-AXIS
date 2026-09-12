@@ -1,7 +1,6 @@
 package com.ufi_axis.util
 
 import android.content.Context
-import android.os.Environment
 import java.io.File
 import java.io.FileWriter
 import java.io.PrintWriter
@@ -13,16 +12,20 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * 详细通信报错日志落盘（诊断「服务无法链接」的核心手段）。
  *
- * 根目录：`Download/UFI-AXIS/log`
- *   - 优先使用公共 Download 目录（用户可直接通过文件管理器查看）；
- *   - 不可用时回退到应用内部 `appContext.filesDir/ufi_axis_log`；
- *   - 目录不存在时 `mkdirs()`。
+ * 目录：`Download/UFI-AXIS/log/app/api-error/<yyyy-MM-dd>/`，路径与回退都取自 [UfiLogPaths]。
+ *   - 2026-09-11 之前这些文件**直接躺在 `log/` 根**，与 core / watchdog / keepalive 的组件
+ *     子目录并列，破掉了「按组件分子目录」这条约定；同时私有回退还自带一个
+ *     `filesDir/ufi_axis_log`，是 app 侧第二套回退目录。两者现在都归到 [UfiLogPaths]。
+ *   - 旧文件由 [migrateLegacyFilesOnce] 一次性搬到新目录（按各自 mtime 归日）。
  *
  * 每次失败写入：
  *   1. 个体文件 `api_error_<yyyy-MM-dd_HH-mm-ss>.log`（含完整字段 + 完整 stacktrace）；
  *   2. 追加到滚动文件 `api_error.log`（便于一次性翻看所有历史）。
  * 对 `api_error_` 个体文件按修改时间裁剪（上限 [MAX_INDIVIDUAL_FILES]，删最旧），
  * 滚动文件超 [ROLLING_MAX_BYTES] 时截掉头部只留尾部 [ROLLING_KEEP_BYTES]。
+ * 分日期目录后这两道闸门都变成**按天**生效 —— 与目录粒度一致，也不会再出现
+ * 「今天的失败把上周的证据顶掉」；代价是要再加一道 [pruneOldDays]（只留 [KEEP_DAYS] 天），
+ * 否则「每天最多 1MB、永不回收」。
  *
  * 同时 emit 一行 `DebugLog.e("ApiError", 摘要)` 便于 logcat 快速定位。
  *
@@ -41,11 +44,10 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object ApiErrorLogger {
 
-    private const val BASE_DIR_NAME = "UFI-AXIS"
-    private const val LOG_SUBDIR = "log"
-    private const val ROLLING_FILE = "api_error.log"
-    private const val INDIVIDUAL_PREFIX = "api_error_"
+    private const val ROLLING_FILE = UfiLogPaths.API_ERROR_ROLLING_FILE
+    private const val INDIVIDUAL_PREFIX = UfiLogPaths.API_ERROR_FILE_PREFIX
     private const val MAX_INDIVIDUAL_FILES = 20
+    private const val KEEP_DAYS = 7
     private const val RESPONSE_BODY_LIMIT = 2048
     private const val DEBOUNCE_MS = 60_000L
     private const val DEBOUNCE_MAP_MAX = 256
@@ -62,7 +64,10 @@ object ApiErrorLogger {
 
     /** 在 [android.app.Application.onCreate] 中尽早调用，提供 fallback 写盘所需的 Context。 */
     fun init(context: Context) {
-        runCatching { appContext = context.applicationContext }
+        runCatching {
+            appContext = context.applicationContext
+            migrateLegacyFilesOnce()
+        }
     }
 
     /** 阶段标签。 */
@@ -119,6 +124,7 @@ object ApiErrorLogger {
             writeFile(file, content)
             appendRolling(dir, now, content)
             trimIndividualFiles(dir)
+            pruneOldDays(dir)
         }
 
         DebugLog.e("ApiError", summary)
@@ -164,23 +170,46 @@ object ApiErrorLogger {
     // ───────────────────────── 目录与写盘 ─────────────────────────
 
     /**
-     * 解析日志根目录。
-     * @return 可用目录；若连 fallback 都无法准备则返回 null（调用方跳过文件写盘，仅走 DebugLog）。
+     * 解析当日日志目录（`log/app/api-error/<yyyy-MM-dd>/`）。
+     * @return 可用目录；若连回退都无法准备则返回 null（调用方跳过文件写盘，仅走 DebugLog）。
      */
-    private fun logDir(): File? {
-        val publicDir = runCatching {
-            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        }.getOrNull()
-        if (publicDir != null) {
-            val dir = File(publicDir, "$BASE_DIR_NAME${File.separator}$LOG_SUBDIR")
-            if (dir.exists() || dir.mkdirs()) return dir
+    private fun logDir(): File? = UfiLogPaths.apiErrorDir(
+        context = if (this::appContext.isInitialized) appContext else null
+    )
+
+    // ── 一次性搬迁：`log/` 根 → `log/app/api-error/<日期>/` ────────────────────────
+    // 幂等靠三件事：进程内 [legacyMigrated] 标志、判据只认旧文件名、搬完即删（renameTo 成功
+    // 源文件就不存在了，第二次跑自然什么都匹配不到）。
+    // 将来不再需要支持从 2026-09-11 之前的版本直升时，可以把这一段连同标志位一起删掉。
+
+    @Volatile
+    private var legacyMigrated = false
+
+    private fun migrateLegacyFilesOnce() {
+        if (legacyMigrated) return
+        legacyMigrated = true
+        runCatching {
+            val logRoot = UfiLogPaths.legacyLogRoot() ?: return@runCatching
+            // 只看 `log/` 的直接子**文件**且名字匹配旧 api-error 命名 ——
+            // `log/core/`、`log/app/`、`log/watchdog/`、`log/_archive/` 都是目录，天然不在范围内。
+            // 这一层的排除必须靠"只要文件"而不是排除名单：core 将来加子目录时不该来改这里。
+            val legacy = logRoot.listFiles { f ->
+                f.isFile && UfiLogPaths.isLegacyApiErrorFileName(f.name)
+            } ?: return@runCatching
+            for (file in legacy) {
+                // 按文件自己的 mtime 归日，而不是一股脑塞进今天 —— 否则升级当天的目录里
+                // 会混进上个月的报错，时间线就断了
+                val dir = UfiLogPaths.apiErrorDir(
+                    context = if (this::appContext.isInitialized) appContext else null,
+                    date = UfiLogPaths.today(Date(file.lastModified()))
+                ) ?: continue
+                var target = File(dir, file.name)
+                // 同名冲突只可能发生在滚动文件 api_error.log 上（个体文件名自带秒级时间戳）。
+                // 加前缀而不是覆盖：那边是本次运行刚写的，旧的也是证据，两份都留。
+                if (target.exists()) target = File(dir, "legacy_${file.name}")
+                if (!target.exists()) file.renameTo(target)
+            }
         }
-        if (this::appContext.isInitialized) {
-            val fallback = File(appContext.filesDir, "ufi_axis_log")
-            if (!fallback.exists()) fallback.mkdirs()
-            return fallback
-        }
-        return null
     }
 
     private fun buildContent(
@@ -257,6 +286,30 @@ object ApiErrorLogger {
             }?.sortedBy { it.lastModified() } ?: return
             val excess = files.size - MAX_INDIVIDUAL_FILES
             if (excess > 0) files.take(excess).forEach { runCatching { it.delete() } }
+        }
+    }
+
+    /**
+     * 删掉过期的日期目录（只保留最近 [KEEP_DAYS] 天）。
+     *
+     * 分日期目录之后，份数上限与滚动文件上限都变成了**按天**生效 —— 没有这一步，
+     * 设备长期离线就是「每天最多 1MB、永不回收」，等于把改造前刚修掉的无上限问题
+     * 换了个形态又请回来。天数与 [AppFileLogger] 的运行日志保留天数同档（7 天）。
+     *
+     * 按目录 mtime 而不是解析目录名判定：mtime 在这一天最后一次写入时更新，
+     * 表达的正是「这个目录多久没动过」。
+     */
+    private fun pruneOldDays(dayDir: File) {
+        runCatching {
+            val root = dayDir.parentFile ?: return@runCatching
+            val cutoff = System.currentTimeMillis() - KEEP_DAYS * 24L * 60 * 60 * 1000
+            root.listFiles()?.forEach { d ->
+                if (!d.isDirectory || !UfiLogPaths.isDateDirName(d.name)) return@forEach
+                if (d.lastModified() < cutoff) {
+                    d.listFiles()?.forEach { it.delete() }
+                    d.delete()
+                }
+            }
         }
     }
 

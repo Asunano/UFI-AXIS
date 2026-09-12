@@ -10,10 +10,19 @@
             <n-button v-if="unreadCount > 0" size="small" @click="markAllRead"> 全部已读 </n-button>
             <n-button size="small" type="primary" @click="showNewSms = true"> 新建短信 </n-button>
           </template>
-          <template v-else>
+          <template v-else-if="activeTab === 'codes'">
             <n-tag v-if="codes.length > 0" :bordered="false" size="small"> 共 {{ codes.length }} 条 </n-tag>
             <n-button size="small" :loading="codesLoading" @click="loadVerificationCodes"> 刷新 </n-button>
           </template>
+          <template v-else>
+            <n-tag v-if="blockedTotal > 0" :bordered="false" size="small"> 共 {{ blockedTotal }} 条 </n-tag>
+            <n-button size="small" :loading="blockedLoading" @click="loadBlocked()"> 刷新 </n-button>
+            <n-button v-if="blockedRecords.length > 0" size="small" type="error" @click="confirmClearBlocked">
+              清空
+            </n-button>
+          </template>
+          <!-- 拦截规则是设置而不是内容维度，所以放 header 动作区而不是第四个 tab -->
+          <n-button size="small" quaternary @click="filterModal.open()"> 拦截规则 </n-button>
         </n-space>
       </template>
 
@@ -42,6 +51,7 @@
                     class="contact-item"
                     :class="{ active: selectedPhone === c.phone }"
                     @click="selectContact(c.phone)"
+                    @contextmenu.prevent="openContactMenu($event, c)"
                   >
                     <div class="contact-main">
                       <div class="contact-phone">{{ c.phone }}</div>
@@ -54,6 +64,18 @@
                   </div>
                 </n-scrollbar>
               </n-spin>
+
+              <!-- 会话行右键菜单：与消息气泡同一套「单实例 n-dropdown + 手动定位」写法 -->
+              <n-dropdown
+                :show="!!contactMenuTarget"
+                :options="contactMenuOptions"
+                trigger="manual"
+                placement="bottom-start"
+                :x="contactDropdownX"
+                :y="contactDropdownY"
+                @select="handleContactAction"
+                @clickoutside="contactMenuTarget = null"
+              />
             </div>
 
             <!-- Right panel: conversation -->
@@ -165,6 +187,54 @@
             </n-spin>
           </div>
         </n-tab-pane>
+
+        <!-- 已拦截：与 app 的「已拦截」入口对齐；沿用 show:lazy 以保留滚动位置与已加载页 -->
+        <n-tab-pane name="blocked" display-directive="show:lazy">
+          <template #tab>
+            <span class="tab-label">
+              已拦截
+              <n-badge v-if="blockedUnviewed > 0" :value="blockedUnviewed" :max="99" type="info" />
+            </span>
+          </template>
+          <div class="blocked-body">
+            <n-spin :show="blockedLoading && blockedRecords.length === 0">
+              <n-scrollbar class="blocked-scroll">
+                <div v-if="blockedRecords.length === 0 && !blockedLoading" class="panel-empty">
+                  <n-empty description="暂无被拦截的短信" size="small" />
+                </div>
+                <div v-else class="blocked-list">
+                  <div v-for="r in blockedRecords" :key="r.id" class="blocked-item">
+                    <div class="blocked-head">
+                      <span class="blocked-sender">{{ r.sender || '未知号码' }}</span>
+                      <span class="blocked-time">{{ formatFullTime(r.blocked_at) }}</span>
+                    </div>
+                    <div class="blocked-snippet">{{ r.snippet || '（无正文预览）' }}</div>
+                    <div class="blocked-meta">
+                      <!-- 命中规则用记录里的快照字段，规则删了这条仍读得懂 -->
+                      <n-tag size="tiny" :bordered="false">命中：{{ r.rule_pattern }}</n-tag>
+                      <span>{{ ruleSnapshotLabel(r) }}</span>
+                      <span v-if="describeBlockedPath(r.blocked_path)">
+                        已拦下：{{ describeBlockedPath(r.blocked_path) }}
+                      </span>
+                    </div>
+                    <div class="blocked-actions">
+                      <n-button size="tiny" :disabled="!canDisableRule(r)" @click="confirmDisableRule(r)">
+                        不再按此规则拦截
+                      </n-button>
+                      <span v-if="ruleStateHint(r)" class="blocked-hint">{{ ruleStateHint(r) }}</span>
+                      <n-button size="tiny" quaternary type="error" @click="deleteBlocked(r)"> 删除 </n-button>
+                    </div>
+                  </div>
+                </div>
+                <div v-if="blockedHasMore" class="load-more-row">
+                  <n-button size="tiny" quaternary :loading="blockedLoadingMore" @click="loadBlocked(true)">
+                    加载更多
+                  </n-button>
+                </div>
+              </n-scrollbar>
+            </n-spin>
+          </div>
+        </n-tab-pane>
       </n-tabs>
     </GridCard>
 
@@ -205,6 +275,15 @@
         </div>
       </n-spin>
     </n-modal>
+
+    <!-- 拦截规则弹窗：懒加载，挂载与显隐分两拍（否则进出场动画丢） -->
+    <component
+      :is="filterComponent"
+      v-if="filterComponent"
+      :show="filterShow"
+      @update:show="filterModal.setShow"
+      @changed="onRulesChanged"
+    />
   </div>
 </template>
 
@@ -213,7 +292,16 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch, h } from 'vue';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
+import { useLazyModal } from '@/composables/useLazyModal';
 import { copyToClipboard } from '@/composables/utils';
+import {
+  Endpoints,
+  SmsRuleScopeLabels,
+  SmsRuleMatchLabels,
+  describeBlockedPath,
+  type SmsRuleItem,
+  type SmsBlockedRecord,
+} from '@/api/contract';
 
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
@@ -263,7 +351,7 @@ const optimisticMessages = ref<SmsMessage[]>([]);
 
 // ── 验证码 / 短信原文 ──
 // 验证码与短信同为页面主体，用页内 tab 切换
-const activeTab = ref<'messages' | 'codes'>('messages');
+const activeTab = ref<'messages' | 'codes' | 'blocked'>('messages');
 const codesLoading = ref(false);
 const codes = ref<VerificationCode[]>([]);
 const codesLoaded = ref(false);
@@ -272,10 +360,39 @@ const showRawSms = ref(false);
 const rawLoading = ref(false);
 const rawSms = ref<SmsMessage | null>(null);
 
+// ── 已拦截（core 命中就不推、不发、不返回；web 只渲染记录）──
+// 分页与告警列表同款：keyset 游标 + 「加载更多」，游标是 (blocked_at, id) 两个显式参数。
+const BLOCKED_PAGE = 50;
+/** 「已查看水位」：id 大于它的记录计入角标。与 app 的 `smsBlockedSeenId` 同语义。 */
+const LS_BLOCKED_SEEN_ID = 'ufi_axis_sms_blocked_seen_id';
+const blockedRecords = ref<SmsBlockedRecord[]>([]);
+const blockedLoading = ref(false);
+const blockedLoadingMore = ref(false);
+const blockedLoaded = ref(false);
+const blockedTotal = ref(0);
+const blockedCursorTs = ref<number | null>(null);
+const blockedCursorId = ref<number | null>(null);
+const blockedHasMore = ref(false);
+/** 已翻过页就不再自动刷新首页，否则会把用户加载出来的历史页清掉（同 AlertListPanel）。 */
+const blockedPaginated = ref(false);
+const blockedSeenId = ref(readBlockedSeenId());
+/** 规则集合只用来判断「命中的那条规则还在不在、是不是已经停用」，展示一律用记录里的快照。 */
+const rules = ref<SmsRuleItem[]>([]);
+
+// 规则管理弹窗（懒加载）
+const filterModal = useLazyModal(() => import('./components/modals/SmsFilterModal.vue'));
+const filterComponent = filterModal.component;
+const filterShow = filterModal.show;
+
 // ── Dropdown state ──
 const msgMenuTarget = ref<SmsMessage | null>(null);
 const msgDropdownX = ref(0);
 const msgDropdownY = ref(0);
+
+// 会话行右键菜单（与消息气泡同一套写法，只是菜单项不同）
+const contactMenuTarget = ref<Contact | null>(null);
+const contactDropdownX = ref(0);
+const contactDropdownY = ref(0);
 
 // 后端 /api/sms/list 的 limit 上限为 200
 const MAX_PAGE = 200;
@@ -315,6 +432,11 @@ const msgMenuOptions = computed(() => {
   });
   return options;
 });
+
+const contactMenuOptions = computed(() => [{ key: 'blacklist', label: '加入黑名单' }]);
+
+/** 角标 = 已加载记录里 id 大于「已查看水位」的条数（与 app 的 smsBlockedUnviewed 同口径）。 */
+const blockedUnviewed = computed(() => blockedRecords.value.filter((r) => r.id > blockedSeenId.value).length);
 
 // 原文弹窗里的方向文案
 const rawDirectionLabel = computed(() => (rawSms.value?.direction === 'outgoing' ? '已发送' : '已接收'));
@@ -582,6 +704,12 @@ async function loadVerificationCodes() {
 // 切到验证码 tab 时首次加载；之后由 10s 轮询接管
 watch(activeTab, (tab) => {
   if (tab === 'codes' && !codesLoaded.value) loadVerificationCodes();
+  if (tab === 'blocked') {
+    // 规则集合只在这个 tab 用得上（判断命中规则是否还在），进来再拉
+    loadRules();
+    if (!blockedLoaded.value) loadBlocked();
+    else markBlockedSeen();
+  }
 });
 
 async function copyCode(code: string) {
@@ -619,6 +747,205 @@ async function viewOriginal(msgId: number) {
   } finally {
     rawLoading.value = false;
   }
+}
+
+// ── 已拦截 ──
+
+function readBlockedSeenId(): number {
+  const raw = Number(localStorage.getItem(LS_BLOCKED_SEEN_ID) ?? '0');
+  return Number.isFinite(raw) && raw > 0 ? raw : 0;
+}
+
+/** 进入「已拦截」tab（或在该 tab 上刷新到新数据）即把水位抬到当前最大 id，角标归零。 */
+function markBlockedSeen() {
+  if (blockedRecords.value.length === 0) return;
+  const maxId = Math.max(...blockedRecords.value.map((r) => r.id));
+  if (maxId <= blockedSeenId.value) return;
+  blockedSeenId.value = maxId;
+  localStorage.setItem(LS_BLOCKED_SEEN_ID, String(maxId));
+}
+
+/**
+ * GET /api/sms/blocked —— 列表字段是 `records`，游标是 `cursor_ts` + `cursor_id`
+ * （两个必须成对带上，只带一个会漏记录或翻出重复）。
+ */
+async function loadBlocked(more = false) {
+  if (more) {
+    if (blockedLoadingMore.value || !blockedHasMore.value) return;
+    if (blockedCursorTs.value === null || blockedCursorId.value === null) return;
+    blockedLoadingMore.value = true;
+  } else {
+    blockedLoading.value = true;
+  }
+  try {
+    const params: Record<string, any> = { limit: BLOCKED_PAGE };
+    if (more) {
+      params.cursor_ts = blockedCursorTs.value;
+      params.cursor_id = blockedCursorId.value;
+    }
+    const { data } = await api.get(Endpoints.sms.blocked, { params });
+    // 组件卸载时请求被取消，data 为 undefined（见 useCancellableApi）
+    if (!data) return;
+    const list = (data.records || []) as SmsBlockedRecord[];
+    if (more) {
+      const existing = new Set(blockedRecords.value.map((r) => r.id));
+      blockedRecords.value = [...blockedRecords.value, ...list.filter((r) => !existing.has(r.id))];
+    } else {
+      blockedRecords.value = list;
+    }
+    blockedTotal.value = data.total ?? blockedRecords.value.length;
+    blockedCursorTs.value = data.next_cursor_ts ?? null;
+    blockedCursorId.value = data.next_cursor_id ?? null;
+    blockedHasMore.value = !!data.has_more && data.next_cursor_ts != null && data.next_cursor_id != null;
+    blockedPaginated.value = more;
+    blockedLoaded.value = true;
+    if (activeTab.value === 'blocked') markBlockedSeen();
+  } catch {
+    message.error(more ? '加载更多失败' : '加载拦截记录失败');
+  } finally {
+    blockedLoading.value = false;
+    blockedLoadingMore.value = false;
+  }
+}
+
+async function loadRules() {
+  try {
+    const { data } = await api.get(Endpoints.sms.rules);
+    if (!data) return;
+    rules.value = (data.rules || []) as SmsRuleItem[];
+  } catch {
+    /* silent：拿不到规则只会让「不再按此规则拦截」暂时禁用，不影响记录展示 */
+  }
+}
+
+function findRule(record: SmsBlockedRecord): SmsRuleItem | undefined {
+  return rules.value.find((r) => r.id === record.rule_id);
+}
+
+/** 只有「规则还在且仍启用」时才能停用它 */
+function canDisableRule(record: SmsBlockedRecord): boolean {
+  return !!findRule(record)?.enabled;
+}
+
+function ruleStateHint(record: SmsBlockedRecord): string {
+  const rule = findRule(record);
+  if (!rule) return '该规则已删除，无需再停用';
+  if (!rule.enabled) return '该规则已停用';
+  return '';
+}
+
+/** 命中规则的作用域 · 匹配方式，取记录里的快照字段。 */
+function ruleSnapshotLabel(record: SmsBlockedRecord): string {
+  const scope = SmsRuleScopeLabels[record.rule_scope as keyof typeof SmsRuleScopeLabels] ?? record.rule_scope;
+  const match = SmsRuleMatchLabels[record.rule_match as keyof typeof SmsRuleMatchLabels] ?? record.rule_match;
+  return `${scope} · ${match}`;
+}
+
+/**
+ * 误拦后只提供「停用规则」，**不做「恢复这条短信」**：
+ * 邮件已经没发、推送已经没推，事后补不回来。
+ */
+function confirmDisableRule(record: SmsBlockedRecord) {
+  const rule = findRule(record);
+  if (!rule || !rule.enabled) return;
+  dialog.warning({
+    title: '不再按此规则拦截',
+    content: `将停用规则「${rule.pattern}」。之后命中它的短信会正常提醒与转发；已经被拦下的短信不会补发。`,
+    positiveText: '停用规则',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        // 字段级合并：只传 enabled，pattern / scope 由 core 保留原值
+        await api.put(Endpoints.sms.rule(rule.id), { enabled: false });
+        message.success('规则已停用');
+        await loadRules();
+      } catch (e: any) {
+        message.error(e?.response?.data?.message || e?.response?.data?.error || '停用失败');
+      }
+    },
+  });
+}
+
+async function deleteBlocked(record: SmsBlockedRecord) {
+  try {
+    await api.delete(Endpoints.sms.blockedRecord(record.id));
+    blockedRecords.value = blockedRecords.value.filter((r) => r.id !== record.id);
+    blockedTotal.value = Math.max(0, blockedTotal.value - 1);
+    message.success('已删除');
+  } catch {
+    message.error('删除失败');
+  }
+}
+
+function confirmClearBlocked() {
+  dialog.warning({
+    title: '清空拦截记录',
+    content: '将删除全部拦截记录。规则不受影响，之后命中规则的短信仍会被拦下并重新记录。',
+    positiveText: '清空',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api.delete(Endpoints.sms.blocked);
+        blockedRecords.value = [];
+        blockedTotal.value = 0;
+        blockedCursorTs.value = null;
+        blockedCursorId.value = null;
+        blockedHasMore.value = false;
+        blockedPaginated.value = false;
+        message.success('已清空');
+      } catch {
+        message.error('清空失败');
+      }
+    },
+  });
+}
+
+/** 规则被增删改之后重新拉规则集合 —— 记录行的「不再按此规则拦截」是否可用要跟着变。 */
+function onRulesChanged() {
+  loadRules();
+  if (!blockedPaginated.value) loadBlocked();
+}
+
+// ── 会话行「加入黑名单」──
+
+function openContactMenu(e: MouseEvent, contact: Contact) {
+  contactDropdownX.value = e.clientX;
+  contactDropdownY.value = e.clientY;
+  contactMenuTarget.value = contact;
+}
+
+function handleContactAction(key: string) {
+  const contact = contactMenuTarget.value;
+  contactMenuTarget.value = null;
+  if (!contact || key !== 'blacklist') return;
+  dialog.warning({
+    title: '加入黑名单',
+    content:
+      `该号码（${contact.phone}）之后的短信不再提醒、不再转发，也不会出现在列表里，` +
+      '可在「已拦截」中查看。已收到的历史短信不受影响。',
+    positiveText: '加入黑名单',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        // 号码黑名单 = scope=sender + match_type=equals（只拦这个号码，不拦正文里提到它的短信）
+        await api.post(Endpoints.sms.rules, {
+          pattern: contact.phone,
+          scope: 'sender',
+          match_type: 'equals',
+        });
+        message.success('已加入黑名单');
+        if (selectedPhone.value === contact.phone) {
+          selectedPhone.value = '';
+          messages.value = [];
+        }
+        loadContacts();
+        loadCounts();
+        onRulesChanged();
+      } catch (e: any) {
+        message.error(e?.response?.data?.message || e?.response?.data?.error || '加入黑名单失败');
+      }
+    },
+  });
 }
 
 // ── Helpers ──
@@ -689,6 +1016,8 @@ onMounted(() => {
   window.addEventListener('resize', checkMobile);
   loadContacts();
   loadCounts();
+  // 首页拦截记录挂载即拉一次：角标要在用户还没点进「已拦截」时就能看到
+  loadBlocked();
 });
 
 useInterval(() => {
@@ -702,6 +1031,12 @@ useInterval(() => {
   // 只在验证码 tab 可见时刷新，避免无谓请求
   if (activeTab.value === 'codes') loadVerificationCodes();
 }, 10_000);
+
+// 拦截记录单独用更慢的节奏：它同时供角标使用，所以不能只在该 tab 可见时刷；
+// 已翻页时跳过，否则会把加载出来的历史页清掉（同 AlertListPanel 的 paginated 守卫）。
+useInterval(() => {
+  if (!blockedPaginated.value) loadBlocked();
+}, 30_000);
 
 onUnmounted(() => {
   window.removeEventListener('resize', checkMobile);
@@ -720,24 +1055,34 @@ onUnmounted(() => {
 
 /* tab 头 + pane 内边距约占 50px，主体高度相应下调，避免整页出现滚动条 */
 .sms-body,
-.codes-body {
+.codes-body,
+.blocked-body {
   display: flex;
   height: calc(100vh - 250px);
   min-height: 360px;
-  border: 1px solid var(--border-color, var(--border-subtle));
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
   overflow: hidden;
 }
 
-.codes-body {
+.codes-body,
+.blocked-body {
   flex-direction: column;
   background: var(--card-bg);
 }
 
-.codes-scroll {
+.codes-scroll,
+.blocked-scroll {
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
+}
+
+/* tab 标签里的角标（未查看的拦截记录数） */
+.tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 /* n-spin 包裹滚动区时默认不约束高度，导致内部滚动区高度坍塌无法滚动；
@@ -745,9 +1090,11 @@ onUnmounted(() => {
 .contacts-panel :deep(.n-spin-container),
 .conversation-panel :deep(.n-spin-container),
 .codes-body :deep(.n-spin-container),
+.blocked-body :deep(.n-spin-container),
 .contacts-panel :deep(.n-spin-content),
 .conversation-panel :deep(.n-spin-content),
-.codes-body :deep(.n-spin-content) {
+.codes-body :deep(.n-spin-content),
+.blocked-body :deep(.n-spin-content) {
   flex: 1 1 auto;
   min-height: 0;
   display: flex;
@@ -759,7 +1106,7 @@ onUnmounted(() => {
   width: 30%;
   min-width: 260px;
   max-width: 360px;
-  border-right: 1px solid var(--border-color, var(--border-subtle));
+  border-right: 1px solid var(--border-subtle);
   display: flex;
   flex-direction: column;
   background: var(--card-bg);
@@ -767,7 +1114,7 @@ onUnmounted(() => {
 
 .contacts-tabs {
   display: flex;
-  border-bottom: 1px solid var(--border-color, var(--border-subtle));
+  border-bottom: 1px solid var(--border-subtle);
   flex-shrink: 0;
 }
 
@@ -790,8 +1137,8 @@ onUnmounted(() => {
 }
 
 .tab-item.active {
-  color: #2080f0;
-  border-bottom-color: #2080f0;
+  color: var(--accent-color);
+  border-bottom-color: var(--accent-color);
   font-weight: 500;
 }
 
@@ -806,17 +1153,17 @@ onUnmounted(() => {
   align-items: center;
   padding: 12px 14px;
   cursor: pointer;
-  border-bottom: 1px solid var(--border-color, var(--border-subtle));
+  border-bottom: 1px solid var(--border-subtle);
   transition: background 0.15s;
   gap: 10px;
 }
 
 .contact-item:hover {
-  background: rgba(0, 0, 0, 0.04);
+  background: var(--surface-hover);
 }
 
 .contact-item.active {
-  background: rgba(32, 128, 240, 0.08);
+  background: var(--accent-color-light);
 }
 
 .contact-main {
@@ -868,7 +1215,7 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
   padding: 10px 16px;
-  border-bottom: 1px solid var(--border-color, var(--border-subtle));
+  border-bottom: 1px solid var(--border-subtle);
   background: var(--card-bg);
   flex-shrink: 0;
 }
@@ -943,11 +1290,14 @@ onUnmounted(() => {
   background: var(--card-bg);
   color: var(--text-primary);
   border-bottom-left-radius: 4px;
-  border: 1px solid var(--border-color, var(--border-subtle));
+  border: 1px solid var(--border-subtle);
 }
 
 .msg-row.outgoing .msg-bubble {
-  background: #2080f0;
+  background: var(--accent-color);
+  /* 强调实底上的前景色。web 侧还没有 `--on-accent` 这类令牌，
+     所以浅 accent 皮肤下这里的白字会偏淡 —— 与 Android 侧「语义实底 + 白前景」
+     那个待决策项是同一件事，等那边定了口径再一起补令牌。 */
   color: #fff;
   border-bottom-right-radius: 4px;
 }
@@ -977,7 +1327,7 @@ onUnmounted(() => {
   align-items: flex-end;
   gap: 8px;
   padding: 12px 16px;
-  border-top: 1px solid var(--border-color, var(--border-subtle));
+  border-top: 1px solid var(--border-subtle);
   background: var(--card-bg);
   flex-shrink: 0;
   position: sticky;
@@ -1032,7 +1382,7 @@ onUnmounted(() => {
 
 .code-item {
   padding: 12px 14px;
-  border: 1px solid var(--border-color, var(--border-subtle));
+  border: 1px solid var(--border-subtle);
   border-radius: 8px;
   background: var(--card-bg);
 }
@@ -1081,7 +1431,6 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
 }
-
 .raw-content {
   margin-top: 12px;
   padding: 12px;
@@ -1094,10 +1443,78 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
+/* ── 已拦截列表 ── */
+.blocked-list {
+  display: flex;
+  flex-direction: column;
+  padding: 4px 12px;
+}
+
+.blocked-item {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.blocked-item:last-child {
+  border-bottom: none;
+}
+
+.blocked-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.blocked-sender {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  word-break: break-all;
+}
+
+.blocked-time {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.blocked-snippet {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.blocked-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.blocked-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.blocked-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 /* ── Mobile responsive ── */
 @media (max-width: 768px) {
   .sms-body,
-  .codes-body {
+  .codes-body,
+  .blocked-body {
     height: calc(100vh - 230px);
     min-height: 300px;
   }

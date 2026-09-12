@@ -1,7 +1,7 @@
 <template>
   <div class="tab-grid">
-    <!-- 修改密码 -->
-    <GridCard title="修改密码">
+    <!-- 设备后台密码 -->
+    <GridCard title="设备后台密码">
       <div class="form-grid">
         <div class="form-item">
           <label>旧密码</label>
@@ -36,14 +36,14 @@
     </GridCard>
 
     <!-- Goform 原始数据 -->
-    <GridCard title="Goform 原始数据">
+    <GridCard title="设备后台原始数据">
       <template #extra>
         <n-button size="tiny" quaternary :loading="goformLoading" @click="loadGoform">
           {{ goformData ? '刷新' : '加载' }}
         </n-button>
       </template>
       <p class="danger-desc">
-        这是设备 goform 的完整快照，可能包含 IMSI / ICCID / MSISDN / WiFi 密码等敏感信息，截图或分享前请自行脱敏。
+        这是设备后台的完整快照，可能包含 IMSI / ICCID / MSISDN / WiFi 密码等敏感信息，截图或分享前请自行脱敏。
       </p>
       <div v-if="goformData">
         <n-button size="tiny" text style="margin-bottom: 8px" @click="goformExpanded = !goformExpanded">
@@ -51,7 +51,7 @@
         </n-button>
         <pre v-show="goformExpanded" class="goform-pre">{{ JSON.stringify(goformData, null, 2) }}</pre>
       </div>
-      <n-empty v-else-if="!goformLoading" description="点击加载按钮获取 Goform 数据" />
+      <n-empty v-else-if="!goformLoading" description="点击加载按钮获取设备后台数据" />
     </GridCard>
   </div>
 </template>
@@ -66,7 +66,7 @@ const message = useMessage();
 const dialog = useDialog();
 const api = useCancellableApi();
 
-// 修改密码
+// 设备后台密码
 const passwordLoading = ref(false);
 const passwordForm = reactive({ old_password: '', new_password: '' });
 
@@ -124,13 +124,14 @@ async function loadGoform() {
   try {
     const { data } = await api.get('/api/device/goform');
     goformData.value = data;
-    message.success('Goform 数据已加载');
+    message.success('设备后台数据已加载');
   } catch (e: any) {
     // 403 = core 侧 goform_dump_enabled 默认关闭（不是鉴权失败，不会被拦截器踢去登录页）
     if (e?.response?.status === 403) {
-      message.warning('设备原始字段 dump 已关闭，需要时在「设置 › 配置」里打开 goform_dump_enabled');
+      // 文案指向开关所在的分栏名，而不是配置键名：键名是内部契约，用户在界面上找不到它。
+      message.warning('设备原始字段 dump 已关闭，可在「设置 › 通用」里打开');
     } else {
-      message.error('加载 Goform 数据失败');
+      message.error('加载设备后台数据失败');
     }
   } finally {
     goformLoading.value = false;

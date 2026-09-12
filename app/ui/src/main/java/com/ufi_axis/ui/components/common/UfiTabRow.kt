@@ -26,6 +26,7 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 滑块样式页签（2026-08-10 优化：背景着色 + 滑块滑动动画 + 等宽居中）。

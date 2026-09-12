@@ -57,7 +57,7 @@ import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.components.common.UfiSettingsGroup
 import com.ufi_axis.ui.components.common.UfiStatItem
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults

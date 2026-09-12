@@ -9,19 +9,19 @@
       </template>
 
       <div class="summary-row">
-        <div class="stat-tile stat-critical">
+        <div class="stat-tile sub-panel stat-critical">
           <span class="stat-num">{{ levelCounts.critical }}</span>
           <span class="stat-label">严重</span>
         </div>
-        <div class="stat-tile stat-warning">
+        <div class="stat-tile sub-panel stat-warning">
           <span class="stat-num">{{ levelCounts.warning }}</span>
           <span class="stat-label">警告</span>
         </div>
-        <div class="stat-tile stat-info">
+        <div class="stat-tile sub-panel stat-info">
           <span class="stat-num">{{ levelCounts.info }}</span>
           <span class="stat-label">提示</span>
         </div>
-        <div class="stat-tile stat-unread">
+        <div class="stat-tile sub-panel stat-unread">
           <span class="stat-num">{{ unreadTotal }}</span>
           <span class="stat-label">未确认</span>
         </div>
@@ -213,6 +213,9 @@ function typeLabel(type: string): string {
     traffic: '流量',
     signal: '信号',
     connectivity: '连接',
+    traffic_limit: '套餐限额',
+    device_online: '设备接入',
+    device_offline: '设备离开',
   };
   return map[type] || type;
 }
@@ -364,15 +367,12 @@ useInterval(() => {
   gap: 10px;
   margin-bottom: 14px;
 }
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .stat-tile {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: 2px;
-  padding: 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid var(--border-subtle);
-  background: var(--surface-elevated);
 }
 .stat-num {
   font-size: 22px;
@@ -385,13 +385,13 @@ useInterval(() => {
   color: var(--text-muted);
 }
 .stat-critical .stat-num {
-  color: #d03050;
+  color: var(--error);
 }
 .stat-warning .stat-num {
-  color: #f0a020;
+  color: var(--warning);
 }
 .stat-info .stat-num {
-  color: #2080f0;
+  color: var(--accent-color);
 }
 .stat-unread .stat-num {
   color: var(--text-primary);
@@ -448,13 +448,13 @@ useInterval(() => {
   margin-top: 2px;
 }
 .level-critical {
-  color: #d03050;
+  color: var(--error);
 }
 .level-warning {
-  color: #f0a020;
+  color: var(--warning);
 }
 .level-info {
-  color: #2080f0;
+  color: var(--accent-color);
 }
 .alert-body {
   flex: 1;
@@ -488,7 +488,7 @@ useInterval(() => {
   margin-top: 2px;
 }
 .ack-check {
-  color: #18a058;
+  color: var(--success);
   opacity: 0.6;
 }
 

@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 底部输入栏的「卡壳」—— 圆角卡片 + 聚焦时描边转 accent、阴影抬升。

@@ -2,6 +2,10 @@ package com.ufi_axis_core.controller.system
 
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.notify.NotifyEvent
+import com.ufi_axis_core.notify.NotifyLevel
+import com.ufi_axis_core.notify.NotifyScenes
+import com.ufi_axis_core.notify.Notifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.Dispatchers
@@ -50,32 +54,56 @@ class TunnelManager(private val appContext: android.content.Context) {
     private val frpFailures = ConcurrentHashMap<String, Int>()
     private val cfFailures = ConcurrentHashMap<String, Int>()
 
-    // ── 邮件通知钩子（由 ComponentFactory 接到 SmsForwardController.sendSceneNotification("tunnel", …)）──
+    // ── 通知钩子（由 ComponentFactory 接到 NotificationDispatcher::emit）──
     // 隧道是 core 的能力，"看护重连到达上限、放弃"这个事实只有 core 知道。此前隧道异常邮件靠
-    // app 轮询 /api/tunnel/status 发现 Error 后回传（TunnelModule），app 不在线 = 没有邮件。
-    // 受 `tunnelNotifyOnFailure` 约束：用户关掉"失败提醒"就不发。
+    // app 轮询 /api/tunnel/status 发现 Error 后回传，app 不在线 = 没有邮件；推送则是另一个
+    // 单独的 attachPushService 钩子 —— 同一件事两个出口，加第三个渠道要再缝一遍。
+    // 2026-09-08 合成一个：投给哪些渠道由分发器的注册表决定。
     @Volatile
-    private var mailForwarder: (suspend (title: String, body: String) -> Unit)? = null
+    private var notifier: Notifier? = null
 
-    /** 装配邮件钩子；传 null 解除。 */
-    fun attachMailForwarder(forwarder: (suspend (title: String, body: String) -> Unit)?) {
-        mailForwarder = forwarder
+    /** 装配通知钩子；传 null 解除。 */
+    fun attachNotifier(n: Notifier?) {
+        notifier = n
     }
 
-    /** 看护放弃时发一封（fire-and-forget，失败只落日志）。 */
-    private fun mailGiveUp(kind: String, name: String, attempts: Int, lastError: String) {
-        val forwarder = mailForwarder ?: return
+    /** 看护放弃时通知一次（fire-and-forget）：走分发器，失败只落日志。 */
+    private fun notifyGiveUp(kind: String, name: String, attempts: Int, lastError: String) {
+        // 设备端要不要推的真源在这里（`tunnel_notify_on_failure`，隧道设置页那个开关写的就是它）：
+        // 关掉就既不推也不发。这不是"第二道闸门" —— 分发器管的是全局总闸与免打扰，
+        // 而这一位管的是"隧道这类事件本身要不要通报"，两者串联。
         if (!settings.tunnelNotifyOnFailure) return
+        val emit = notifier ?: return
+        val title = "隧道异常: $kind [$name]"
         val body = buildString {
             appendLine("隧道: $kind [$name]")
             appendLine("连续重连失败: $attempts 次，已停止重试")
             if (lastError.isNotBlank()) appendLine("最后错误: $lastError")
         }.trimEnd()
+
         guardScope.launch {
             try {
-                forwarder("隧道异常: $kind [$name]", body)
+                emit(
+                    NotifyEvent(
+                        scene = NotifyScenes.TUNNEL,
+                        level = NotifyLevel.WARNING,
+                        title = title,
+                        body = body,
+                        // extra 逐字沿用原 PushNotification.extra：app 侧
+                        // `NotifyService` 读 kind / name 拼通知，改一个键它就拿不到了。
+                        extra = mapOf(
+                            "kind" to kind,
+                            "name" to name,
+                            "status" to "error",
+                            "attempts" to attempts.toString(),
+                            "error" to lastError
+                        )
+                    )
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
-                AppLogger.w(TAG, "tunnel mail failed: ${e.message}")
+                AppLogger.w(TAG, "tunnel notify failed: ${e.message}")
             }
         }
     }
@@ -253,7 +281,7 @@ class TunnelManager(private val appContext: android.content.Context) {
                         TAG,
                         "Guard: giving up on FRP [$name] after $n attempts: ${frpEngine.lastErrorOf(name)}"
                     )
-                    mailGiveUp("FRP", name, n, frpEngine.lastErrorOf(name))
+                    notifyGiveUp("FRP", name, n, frpEngine.lastErrorOf(name))
                 }
             }
         }
@@ -284,7 +312,7 @@ class TunnelManager(private val appContext: android.content.Context) {
                         TAG,
                         "Guard: giving up on CF tunnel [$name] after $n attempts: ${cfEngine.lastErrorOf(name)}"
                     )
-                    mailGiveUp("Cloudflare", name, n, cfEngine.lastErrorOf(name))
+                    notifyGiveUp("Cloudflare", name, n, cfEngine.lastErrorOf(name))
                 }
             }
         }
@@ -338,6 +366,17 @@ class TunnelManager(private val appContext: android.content.Context) {
         "cloudflared" -> cfEngine.snapshot().any { it.running }
         else -> false
     }
+
+    /**
+     * 当前是否有任意隧道实例在运行（frpc 或 cloudflared）。
+     *
+     * 用途之一是「请求是否来自隧道」的判据：没有隧道在跑，回环接收地址只可能是本机直连
+     * （见 `PairingRoutes.isTunnelOrigin`）。
+     *
+     * 只反映**本 core 进程拉起**的实例：被系统杀掉后残留的孤儿进程不在其中，这也是
+     * init 阶段要 [reapOrphans] 的原因。
+     */
+    fun anyRunning(): Boolean = frpEngine.anyRunning() || cfEngine.anyRunning()
 
     /** 组件安装/卸载后调用：清掉两个引擎的版本缓存，让 /status 重新探测 */
     fun invalidateComponentCaches() {

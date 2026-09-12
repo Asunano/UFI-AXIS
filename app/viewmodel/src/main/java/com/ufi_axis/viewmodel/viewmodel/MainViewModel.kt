@@ -25,10 +25,15 @@ import com.ufi_axis.viewmodel.repository.AlertPrefsRepository
 import com.ufi_axis.viewmodel.state.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -36,6 +41,12 @@ import kotlinx.coroutines.launch
  * 全局错误的来源。决定重试动作与清除动作分派到哪个 module（见 [MainViewModel.retryGlobalError]）。
  */
 enum class GlobalErrorSource { DASHBOARD, NETWORK, MONITOR, TOOLS, SERVICE }
+
+/** 后端健康检查周期（毫秒）：周期访问 /health 维护在线状态。 */
+private const val HEALTH_CHECK_INTERVAL_MS = 30_000L
+
+/** 后端掉线提示去抖窗口（毫秒）：同一句错误在此窗口内不重复复查 /health。 */
+private const val BACKEND_DOWN_DEDUPE_MS = 10_000L
 
 /**
  * 全局错误：一条待展示的错误文案 + 它来自哪里。
@@ -47,6 +58,21 @@ enum class GlobalErrorSource { DASHBOARD, NETWORK, MONITOR, TOOLS, SERVICE }
 data class GlobalError(
     val message: String,
     val source: GlobalErrorSource
+)
+
+/**
+ * 后端掉线提示对话框状态。
+ *
+ * 由「数据加载出错 → 复查 /health 也失败」触发：此时基本可判定不是偶发网络抖动，而是后端
+ * 服务挂了 / 地址不可达。UI 据此弹出一个带「重试 / 进入服务器设置」的对话框，比笼统的
+ * 「加载失败」Toast 更有 actionable 的指引。
+ *
+ * @param errorMessage        最初触发此对话框的那条数据加载错误文案（主动探活路径为 null，无前置数据错误）
+ * @param healthErrorMessage 复查 /health 失败的细节（null = 未取到）
+ */
+data class BackendDownDialogState(
+    val errorMessage: String?,
+    val healthErrorMessage: String?
 )
 
 class MainViewModel(
@@ -66,6 +92,12 @@ class MainViewModel(
 
     val dashboard = DashboardModule(api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs)
 
+    /**
+     * 后端健康检查（周期探活 + 出错时即时复查）。[viewModelScope] 内常驻，供 UI 判断后端是否在线、
+     * 以及数据加载失败时是否因后端挂了。见 [HealthModule]。
+     */
+    val health = HealthModule(api, viewModelScope)
+
     // 跨模块错误事件汇聚点（eager 创建、开销极小）：NetworkModule / ToolsModule 构造时
     // 接收该 sink，其 events 转发到此。collectCrossModuleEvents 仅订阅本 sink，
     // 不会在构造期触发 network / tools 的 by lazy 求值（修复冷启动 eager 加载，风险 #6）。
@@ -77,6 +109,7 @@ class MainViewModel(
     val apps by lazy { AppManagerModule(api, appContext, viewModelScope) }
     val downloads by lazy { DownloadModule(appContext, viewModelScope) }
     val tunnel by lazy { TunnelModule(appContext, viewModelScope) }
+    val backup by lazy { BackupModule(api) }
 
     /**
      * 更新提示的唯一状态槽（2026-09-06）。
@@ -112,6 +145,8 @@ class MainViewModel(
     val dashboardBatteryInfo: StateFlow<BatteryInfo?> get() = dashboard.batteryInfoState
     val dashboardIsLoading: StateFlow<Boolean> get() = dashboard.isLoadingState
     val networkState: StateFlow<NetworkState> get() = network.networkState
+    /** 后端健康状态（周期探活 + 出错复查），UI 可据此展示"后端是否在线"。 */
+    val healthState: StateFlow<HealthState> get() = health.healthState
 
     // ── 实时连接状态转发（供 UI 展示 WS 连接状态，避免各屏重复订阅 repository，T01/UID-006） ──
     val wsConnectionState: StateFlow<ConnectionState>
@@ -127,6 +162,11 @@ class MainViewModel(
     val updatePromptState: StateFlow<UpdatePromptState> get() = updatePrompt.promptState
     val tasksState: StateFlow<TasksState> get() = tools.tasksState
     val smsForwardState: StateFlow<SmsForwardState> get() = tools.smsForwardState
+    /** 通用 Webhook 渠道（`/api/notify/webhook`）：推送渠道页与 Webhook 配置页共读这一份。 */
+    val webhookState: StateFlow<WebhookState> get() = tools.webhookState
+
+    /** 本机短信回发渠道（`/api/notify/sms`）：推送渠道页与本机短信配置页共读这一份。 */
+    val localSmsState: StateFlow<LocalSmsState> get() = tools.localSmsState
     val appManageState: StateFlow<AppManageState> get() = apps.state
     val deviceSettingsState: StateFlow<DeviceSettingsState> get() = network.deviceSettingsState
     val serviceState: StateFlow<ServiceControlState> get() = network.serviceState
@@ -147,6 +187,14 @@ class MainViewModel(
     init {
         // Start modules
         dashboard.init()
+
+        // 后端健康检查：周期探活（30s）+ 数据出错时复查（见 collectBackendDownSignal）
+        health.startPeriodicCheck(HEALTH_CHECK_INTERVAL_MS)
+        collectBackendDownSignal()
+        // 主动探活：healthState 一旦从「可达」转「不可达」立即弹窗，无需依赖页面切换或数据错误
+        //（globalError 是 distinctUntilChanged 的合并流，停留在同一页时错误文案不变、不再发新值，
+        // 旧实现因此只能切页才弹）。两条路径共享 lastBackendDownAt 去抖，互不刷屏。
+        collectHealthStatus()
 
         // 收集跨模块事件，统一分发
         collectCrossModuleEvents()
@@ -287,6 +335,135 @@ class MainViewModel(
             else -> null
         }
     }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, null)
+
+    // ── 后端掉线提示（2026-09-12）──
+    //
+    // 触发链：任意数据加载出错（globalError 非空）→ 即时复查 /health。
+    // 若探活也失败，说明不是偶发抖动、而是后端服务挂了 / 地址不可达，弹出带
+    // 「重试 / 进入服务器设置」的对话框；否则只走常规错误 Toast（后端其实在线，错误另有原因）。
+    //
+    // 去抖：对话框已弹出时不再重复触发；同一句错误 10s 内不重复复查，避免轮询失败把
+    // /health 打成一波随抖动走的轮询。
+    private val _backendDownDialog = MutableStateFlow<BackendDownDialogState?>(null)
+    val backendDownDialogState: StateFlow<BackendDownDialogState?> = _backendDownDialog.asStateFlow()
+
+    /** 后端掉线弹窗去抖时间戳：两条触发路径（数据错误 / 主动探活）共用，避免互相刷屏。 */
+    private var lastBackendDownAt = 0L
+
+    /** 关闭后端掉线提示（用户点了重试 / 服务器设置 / 返回键 / 点遮罩）。 */
+    fun dismissBackendDownDialog() {
+        _backendDownDialog.value = null
+    }
+
+    /**
+     * 「重试」：关闭对话框 + 清掉各模块的错误文案（下次轮询会重新拉取，若后端已恢复即正常），
+     * 并立刻复查一次健康状态——若仍不可达，下一次数据加载出错会再次弹窗；若已恢复则不再弹。
+     */
+    fun retryFromBackendDown() {
+        _backendDownDialog.value = null
+        clearError()
+        viewModelScope.launch { health.checkHealthNow() }
+    }
+
+    /**
+     * 订阅 globalError：出现新错误且对话框未弹出时，复查后端健康，失败则弹窗。
+     *
+     * ⚠️ 健壮性（2026-09-12 修复）：收集协程必须「长生不老」。
+     * 旧实现用 try/catch 把异常（含 viewModelScope 取消竞态导致的 NPE）吞掉后协程直接结束——
+     * 一旦在运行期（约 19s 的取消竞态）崩一次，之后所有后端掉线都不再弹窗，只剩 Toast 照常，
+     * 表现为「Toast 提示无法连接后端、对话框却不出现」。
+     * 现改用 while(isActive) 包住 collect：单次 collect 抛异常仅记日志并 delay 后重新订阅 globalError，
+     * 探测器始终在线；仅 CancellationException 原样上抛以正常结束协程。
+     * 顺带兜住初始化顺序潜在问题：若首轮 globalError 尚未就绪导致 collect 抛 NPE，重试时它已初始化。
+     */
+    private fun collectBackendDownSignal() {
+        viewModelScope.launch {
+            var lastHandledMessage: String? = null
+            while (isActive) {
+                try {
+                    globalError.collect { err ->
+                        if (err == null) {
+                            lastHandledMessage = null
+                            return@collect
+                        }
+                        if (_backendDownDialog.value != null) return@collect
+                        val now = System.currentTimeMillis()
+                        if (err.message == lastHandledMessage && now - lastBackendDownAt < BACKEND_DOWN_DEDUPE_MS) {
+                            return@collect
+                        }
+                        lastHandledMessage = err.message
+                        lastBackendDownAt = now
+                        val reachable = runCatching { health.checkHealthNow() }.getOrDefault(false)
+                        if (!reachable) {
+                            _backendDownDialog.value = BackendDownDialogState(
+                                errorMessage = err.message,
+                                healthErrorMessage = health.healthState.value.errorMessage
+                            )
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    DebugLog.w(
+                        "MainViewModel",
+                        "collectBackendDownSignal 收集异常（已忽略，1s 后重试）: ${e.message}"
+                    )
+                    delay(1000)
+                }
+            }
+        }
+    }
+
+    /**
+     * 主动探活驱动的后端掉线提示（2026-09-12 补充）。
+     *
+     * [collectBackendDownSignal] 依赖 globalError —— 但 globalError 是 distinctUntilChanged 的合并流，
+     * 后端掉线后若停留在同一页面、数据不再重新拉取，errorMessage 不再变化、也就不再发新值，
+     * 表现为「只有切页才弹窗」。这里改为直接订阅 [HealthModule.healthState]：
+     * 周期探活一旦发现后端从「可达」转成「不可达」，立即主动弹窗，无需依赖页面切换或数据错误。
+     *
+     * 去抖：用 [lastBackendDownAt] 与弹窗已弹出判定做闸门，避免两次连续探活都失败就刷屏；
+     * UNKNOWN 状态不翻转 [wasDown]，避免探活间隙的短暂 UNKNOWN 造成误判。
+     */
+    private fun collectHealthStatus() {
+        viewModelScope.launch {
+            var wasDown = false
+            while (isActive) {
+                try {
+                    health.healthState.collect { state ->
+                        when (state.status) {
+                            HealthStatus.UNREACHABLE -> {
+                                if (!wasDown) {
+                                    // 新一次掉线：主动弹窗（去抖，避免连续两次探活失败刷屏）。
+                                    val now = System.currentTimeMillis()
+                                    if (_backendDownDialog.value == null &&
+                                        now - lastBackendDownAt > BACKEND_DOWN_DEDUPE_MS
+                                    ) {
+                                        lastBackendDownAt = now
+                                        _backendDownDialog.value = BackendDownDialogState(
+                                            errorMessage = null,
+                                            healthErrorMessage = state.errorMessage
+                                        )
+                                    }
+                                }
+                                wasDown = true
+                            }
+                            HealthStatus.HEALTHY -> wasDown = false
+                            HealthStatus.UNKNOWN -> { /* 保持 wasDown 不变，避免短暂 UNKNOWN 误判 */ }
+                        }
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    DebugLog.w(
+                        "MainViewModel",
+                        "collectHealthStatus 收集异常（已忽略，1s 后重试）: ${e.message}"
+                    )
+                    delay(1000)
+                }
+            }
+        }
+    }
 
     /** 展示完毕后清掉该来源的错误，避免陈旧错误在切页 / 重组时被当成新错误再弹一次。 */
     fun dismissGlobalError(source: GlobalErrorSource) {

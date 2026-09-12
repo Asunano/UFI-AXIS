@@ -175,28 +175,36 @@ class NetworkRoutes(
             }
 
             // 网络模式 — 使用 SET_BEARER_PREFERENCE goformId (与参考项目一致)
+            //
+            // 失败不再一律回 500：设备侧的三种失败（参数越界 / 会话失效可重试 / 设备明确拒绝）
+            // 由 respondWriteFailure 映射成 400 / 503 / 502 + 明确的 ErrorCode + 中文文案。
+            // 之前一律 500 让客户端只能显示"服务器内部错误"，而真机上最常见的那一种
+            // （会话失效）其实是"再点一次就好"，用户完全无从判断 —— 这就是"第一次必定 500"
+            // 被当成 core 故障的由来。
             post("/mode") {
                 val client = networkClient
+                if (client == null) {
+                    // goform 不可用时无法设置网络模式（AT+ZPREFMOD 在此设备不支持）
+                    AppLogger.w("NetworkRoutes", "Goform client not available, cannot set network mode")
+                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
+                        "设备后台通道不可用，无法切换网络制式")
+                    return@post
+                }
                 val params = call.receiveJsonObject()
                 val mode = params["mode"]?.jsonPrimitive?.contentOrNull ?: NetworkMode.AUTO
                 // 别名 → BearerPreference 的映射唯一实现在 profile 的 WriteSpec 里（计划书 2.6），
                 // 这里只算一遍用于回显，不参与下发。
                 val bearerValue = NetworkMode.toBearer(mode)
-                val success = if (client != null) {
-                    val outcome = client.setBearerPreference(mode)
-                    if (call.respondRejected(outcome)) return@post
-                    outcome.ok
-                } else {
-                    // goform 不可用时无法设置网络模式（AT+ZPREFMOD 在此设备不支持）
-                    AppLogger.w("NetworkRoutes", "Goform client not available, cannot set network mode")
-                    false
-                }
-                if (success) cache?.invalidate("network:band-status")
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    // bearer = 实际下发给设备的值；mode 仍回显入参，便于客户端确认映射结果
-                    toJsonElement(mapOf("success" to success, "mode" to mode, "bearer" to bearerValue))
-                )
+                // bearer = 实际下发给设备的值；mode 仍回显入参，便于客户端确认映射结果。
+                // 失败响应也带上这两个字段：客户端的"切换中"中间态要靠它们对齐目标档位。
+                val echo = mapOf<String, Any?>("mode" to mode, "bearer" to bearerValue)
+                val outcome = client.setBearerPreference(mode)
+                if (call.respondWriteFailure(outcome, "设备拒绝了本次网络制式切换", echo)) return@post
+                cache?.invalidate("network:band-status")
+                call.respond(toJsonElement(buildMap<String, Any?> {
+                    put("success", true)
+                    putAll(echo)
+                }))
             }
 
 
@@ -205,28 +213,27 @@ class NetworkRoutes(
             // 与 /mode 的区别只有回显字段名，值域是同一套 NetworkMode 别名 ——
             // 映射到设备侧 BearerPreference（大小写敏感）由 profile 的 WriteSpec 负责，
             // 映射不出来就直接拒绝下发，不再把客户端猜的值原样丢给设备（计划书 2.6）。
+            // 失败映射与 /mode 共用 respondWriteFailure，两个端点的错误码保持一致。
             post("/bearer") {
                 val client = networkClient
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
+                        "设备后台通道不可用，无法切换承载偏好")
                     return@post
                 }
                 val params = call.receiveJsonObject()
                 val preference = params["preference"]?.jsonPrimitive?.contentOrNull ?: NetworkMode.AUTO
-                val bearerValue = NetworkMode.toBearer(preference)
-                val outcome = client.setBearerPreference(preference)
-                if (call.respondRejected(outcome)) return@post
-                val success = outcome.ok
-                if (success) cache?.invalidate("network:band-status")
-                call.respond(
-                    if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf(
-                        "success" to success,
-                        "preference" to preference,
-                        "bearer" to bearerValue,
-                    ))
+                val echo = mapOf<String, Any?>(
+                    "preference" to preference,
+                    "bearer" to NetworkMode.toBearer(preference)
                 )
+                val outcome = client.setBearerPreference(preference)
+                if (call.respondWriteFailure(outcome, "设备拒绝了本次承载偏好设置", echo)) return@post
+                cache?.invalidate("network:band-status")
+                call.respond(toJsonElement(buildMap<String, Any?> {
+                    put("success", true)
+                    putAll(echo)
+                }))
             }
 
             // 连接网络 (拨号)

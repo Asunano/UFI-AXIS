@@ -19,7 +19,21 @@ import kotlin.math.abs
 class GoformSmsClient(private val client: GoformClient) {
     private val tag = "GoformSms"
 
-    /** 发送结论。设备回 `success` 只代表受理，最终状态要回读信箱 `tag` 才知道。 */
+    /**
+     * 发送结论。设备回 `success` 只代表受理，最终状态要回读信箱 `tag` 才知道。
+     *
+     * ## 为什么 [REJECTED] 与 [NO_RESPONSE] 必须分成两档
+     *
+     * 上层（`LocalSmsDelivery.classify`）拿这个枚举决定**要不要重试**，而重试一条短信
+     * 等于可能再花一笔话费。判据只有一个：**我们知不知道设备没收到这条发送请求**。
+     * - 知道没收到（[REJECTED]）→ 重试安全，不会重复发；
+     * - 不知道（[NO_RESPONSE]）→ 请求可能已经落到固件里、短信可能已经发出去了，
+     *   重试就是第二条真短信、第二笔钱。
+     *
+     * 合成一档的代价是实测过的：`goformPost` 返回 null（请求没走完 / 响应读不出来）
+     * 与「设备明确回了一个失败结果」都落进 REJECTED，整档判可重试 → 后者安全、
+     * 前者会重复计费。所以分开的是"设备有没有表态"，不是"失败原因"。
+     */
     enum class SendVerdict {
         /** 信箱 tag=2：设备确认已发出 */
         SENT,
@@ -27,8 +41,21 @@ class GoformSmsClient(private val client: GoformClient) {
         FAILED,
         /** 设备已受理，但短时间内没给最终状态（不代表失败） */
         PENDING,
-        /** 设备直接拒收（参数不合法 / 未登录 / AD 失败） */
+        /**
+         * **设备明确拒收**：请求到了设备、设备也回了响应，只是结果是"没受理"
+         * （参数不合法、固件忙、或 SEND_SMS 根本没被投出去——如未登录）。
+         *
+         * 设备说了"我没收下"，所以重试不会重复发 → 这是唯一**可重试**的一档，
+         * 也是唯一**不计配额**的一档（两件事必须同时成立，见 `LocalSmsDelivery`）。
+         */
         REJECTED,
+        /**
+         * **拿不到设备的表态**：请求没走完 / 响应无法解析 / 超时（`goformPost` 返回 null）。
+         *
+         * 无法排除"设备其实已经收下并发出了"，所以**不可重试**（重试可能是第二笔话费），
+         * 而配额**要计**（宁可少发一条，也不要漏计导致真实发送超过用户设的上限）。
+         */
+        NO_RESPONSE,
     }
 
     data class SendOutcome(val verdict: SendVerdict, val detail: String)
@@ -73,6 +100,9 @@ class GoformSmsClient(private val client: GoformClient) {
      * 与"运营商真的发出去了"是两件事。2026-09-01 实测就出现过 `result=success` 但对端
      * 收不到。ZTE 把最终状态写在信箱行的 `tag` 上（`2`=已发送、`3`=发送失败、`4`=草稿），
      * 所以发完回读几次就能拿到真实结论，而不是让 UI 显示一个假的"发送成功"。
+     *
+     * **失败分两档**（判据见 [SendVerdict]）：设备回了响应但结果是拒绝 → [SendVerdict.REJECTED]；
+     * 请求没走完 / 响应读不出来 → [SendVerdict.NO_RESPONSE]（不知道设备有没有已经发出去）。
      */
     suspend fun sendSms(phoneNumber: String, message: String): SendOutcome {
         val number = phoneNumber.trim()
@@ -80,18 +110,39 @@ class GoformSmsClient(private val client: GoformClient) {
             AppLogger.w(tag, "sendSms rejected: number or body is empty")
             return SendOutcome(SendVerdict.REJECTED, "号码或内容为空")
         }
+        // 先确认会话：登录不上时 SEND_SMS **一个字节都没发出去**，属于"确定没收到" →
+        // REJECTED（可重试）。不先判的话它会和真正的"请求半路断了"一起变成 goformPost
+        // 返回 null，被迫按 NO_RESPONSE（不可重试）处理 —— 而 UFI 的会话被官方后台挤掉
+        // 是常态，那样一次会话抖动就会让 CRITICAL 通知永久丢失。
+        if (!client.ensureLogin()) {
+            AppLogger.w(tag, "sendSms rejected: not logged in, SEND_SMS never dispatched")
+            return SendOutcome(SendVerdict.REJECTED, "设备未登录，发送请求未发出（详见日志）")
+        }
         val params = buildSendParams(number, message, formatSmsTime())
         // 先记下发送前的最大信箱 id：回读时只认新出现的行，避免把历史同号短信当成本次结果
         val baselineId = maxSmsId()
         val resp = client.goformPost(params)
+        if (resp == null) {
+            // 拿不到设备的表态：会话中途失效 / AD 计算失败 / HTTP 非 200 / 网络异常。
+            // 请求**可能已经落到固件里**，所以这里绝不能报可重试 —— 重试就是可能的第二笔话费。
+            AppLogger.e(
+                tag,
+                "sendSms 无法确认结果: to=${maskNumber(number)} chars=${message.length} " +
+                    "sms_time=${params["sms_time"]} resp=null（看 NET/goform 与 GoformClient 日志）"
+            )
+            return SendOutcome(
+                SendVerdict.NO_RESPONSE,
+                "请求未走完 / 响应无法解析 / 超时，无法确认设备是否已发出"
+            )
+        }
         if (!client.isGoformSuccess(resp)) {
+            // 设备回了响应、结果是拒绝 —— 它明确说了"没收下"，所以重试不会重复发。
             AppLogger.w(
                 tag,
                 "sendSms rejected by device: to=${maskNumber(number)} chars=${message.length} " +
-                    "sms_time=${params["sms_time"]} " +
-                    "resp=${resp?.take(160) ?: "null（登录/AD/会话失败，看 NET/goform 与 GoformClient 日志）"}"
+                    "sms_time=${params["sms_time"]} resp=${resp.take(160)}"
             )
-            return SendOutcome(SendVerdict.REJECTED, "设备未受理（详见日志）")
+            return SendOutcome(SendVerdict.REJECTED, "设备明确拒收（详见日志）")
         }
         AppLogger.i(tag, "sendSms accepted by device: to=${maskNumber(number)} chars=${message.length}")
         val outcome = verifySend(number, baselineId)

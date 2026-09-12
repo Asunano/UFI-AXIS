@@ -576,37 +576,44 @@ class Aria2Engine(
                 put("params", buildJsonArray { fullParams.forEach { add(it) } })
             }
 
+            // disconnect 必须放在 finally：早期实现只在成功分支与非 200 分支调用它，
+            // 读超时 / IO 异常时连接和未关闭的流一起泄漏。本方法按活跃下载的轮询节奏调用，
+            // RPC 端点不可达或变慢时就是每轮漏一个连接。
             val conn = URL(rpcUrl).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 5000
-            conn.readTimeout = 10000
-            conn.setRequestProperty("Content-Type", "application/json")
+            try {
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.connectTimeout = 5000
+                conn.readTimeout = 10000
+                conn.setRequestProperty("Content-Type", "application/json")
 
-            OutputStreamWriter(conn.outputStream).use {
-                it.write(requestBody.toString())
-            }
+                OutputStreamWriter(conn.outputStream).use {
+                    it.write(requestBody.toString())
+                }
 
-            val code = conn.responseCode
-            if (code != 200) {
-                val errBody = try { conn.errorStream?.bufferedReader()?.readText() } catch (_: Exception) { null }
-                AppLogger.w(TAG, "RPC $method HTTP $code body=$errBody")
+                val code = conn.responseCode
+                if (code != 200) {
+                    val errBody = try {
+                        conn.errorStream?.bufferedReader()?.use { it.readText() }
+                    } catch (_: Exception) { null }
+                    AppLogger.w(TAG, "RPC $method HTTP $code body=$errBody")
+                    // aria2 把 addUri/addTorrent 的业务错误也用 HTTP 400 + JSON-RPC error 回，
+                    // 所以这里必须把 message 解出来，不能只当成传输失败。
+                    return null to (errBody?.let { extractRpcErrorMessage(it) } ?: "HTTP $code")
+                }
+
+                val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+
+                val response = json.parseToJsonElement(responseText).jsonObject
+                response["error"]?.let { error ->
+                    val message = error.jsonObject["message"]?.jsonPrimitive?.contentOrNull
+                    AppLogger.w(TAG, "RPC $method error: $message")
+                    return null to message
+                }
+                response["result"] to null
+            } finally {
                 conn.disconnect()
-                // aria2 把 addUri/addTorrent 的业务错误也用 HTTP 400 + JSON-RPC error 回，
-                // 所以这里必须把 message 解出来，不能只当成传输失败。
-                return null to (errBody?.let { extractRpcErrorMessage(it) } ?: "HTTP $code")
             }
-
-            val responseText = conn.inputStream.bufferedReader().readText()
-            conn.disconnect()
-
-            val response = json.parseToJsonElement(responseText).jsonObject
-            response["error"]?.let { error ->
-                val message = error.jsonObject["message"]?.jsonPrimitive?.contentOrNull
-                AppLogger.w(TAG, "RPC $method error: $message")
-                return null to message
-            }
-            response["result"] to null
         } catch (e: Exception) {
             // 所有方法都记录详细异常信息（之前 shutdown/getVersion 被静默吞掉导致无法诊断）
             AppLogger.w(TAG, "RPC $method failed: ${e.javaClass.simpleName}: ${e.message}")

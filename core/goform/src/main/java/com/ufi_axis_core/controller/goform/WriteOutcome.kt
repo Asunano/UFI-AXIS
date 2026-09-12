@@ -26,10 +26,25 @@ sealed interface WriteOutcome {
     data class Rejected(val reason: String) : WriteOutcome
 
     /**
-     * 命令发出去了但没成功：设备回了失败、网络错误，或 profile 没登记这个写入项
-     * （= 该设备不支持这一项）。
+     * 命令进了固件、设备**明确回了失败**（或 profile 没登记这个写入项 = 该设备不支持这一项）。
+     *
+     * 这一态**不可重试**：设备已经表过态，同样的取值再发一次还是同样的结果。
      */
     data object Failed : WriteOutcome
+
+    /**
+     * 命令**没有被设备受理**：会话失效（core 已按 [GoformWritePolicy] 重登并重试过一次，
+     * 仍然失效），或与设备的传输层就断了（连不上 / 超时）。
+     *
+     * 与 [Failed] 的分界是「固件有没有收下这条命令」，而不是「有没有报错」，
+     * 完整判据见 [GoformWriteResult]。这一态语义上**可重试** —— 用户稍后再操作一次是有
+     * 意义的 —— 所以 route 该回 503 `UNAVAILABLE`，不要回 500：500 在客户端只会显示成
+     * 「服务器内部错误」，用户无从判断该不该再点一次，这正是网络制式"第一次必失败"
+     * 被误报成服务端故障的原因。
+     *
+     * @param reason 面向用户的中文原因，可直接进响应文案（不含设备字段名与英文枚举）
+     */
+    data class Unavailable(val reason: String) : WriteOutcome
 
     /** 兼容既有 `Boolean` 调用点。 */
     val ok: Boolean get() = this is Ok

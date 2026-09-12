@@ -1,5 +1,8 @@
 package com.ufi_axis_core.controller.sms
 
+import com.ufi_axis_core.notify.NotifyScenes
+
+
 /**
  * 邮件 HTML 模板（2026-08-30 新增）。
  *
@@ -19,28 +22,48 @@ package com.ufi_axis_core.controller.sms
  */
 internal object MailTemplate {
 
-    /** 场景主色：邮件里唯一的视觉分类线索（收件箱按标题排序，颜色帮人一眼分辨类型）。 */
+    /**
+     * 场景主色：邮件里唯一的视觉分类线索（收件箱按标题排序，颜色帮人一眼分辨类型）。
+     *
+     * 键用 [NotifyScenes] 常量而不是字面量：漏登记会让新场景落到 [ACCENT_DEFAULT] 的蓝色 +
+     * "通知"徽标（与短信长得一模一样），而拼错的字面量连编译器都不会拦。
+     * "每个 [NotifyScenes.ALL] 里的场景在这两张表里都有条目"由 `MailTemplateSceneCoverageTest` 钉住。
+     */
     private val SCENE_COLORS = mapOf(
-        "sms" to "#2563eb",
-        "verification" to "#7c3aed",
-        "alert" to "#dc2626",
-        "connectivity" to "#ef4444",
-        "traffic80" to "#f59e0b",
-        "download" to "#0891b2",
-        "tunnel" to "#db2777",
-        "events" to "#64748b"
+        NotifyScenes.SMS to "#2563eb",
+        NotifyScenes.VERIFICATION to "#7c3aed",
+        NotifyScenes.ALERT to "#dc2626",
+        NotifyScenes.CONNECTIVITY to "#ef4444",
+        NotifyScenes.TRAFFIC_80 to "#f59e0b",
+        NotifyScenes.DOWNLOAD to "#0891b2",
+        NotifyScenes.TUNNEL to "#db2777",
+        NotifyScenes.EVENTS to "#64748b",
+        // 电池：绿色。2026-09-08 电池事件从"伪装成 SYSTEM 短信"改走自己的场景。
+        NotifyScenes.BATTERY to "#16a34a",
+        // 测试信：灰绿。刻意与所有真实场景都不同色 —— 收件箱里一眼能看出"这封是我自己点出来的"。
+        NotifyScenes.TEST to "#0f766e"
     )
 
     private val SCENE_LABELS = mapOf(
-        "sms" to "新短信",
-        "verification" to "验证码",
-        "alert" to "阈值告警",
-        "connectivity" to "连接状态",
-        "traffic80" to "流量预警",
-        "download" to "下载任务",
-        "tunnel" to "隧道异常",
-        "events" to "设备事件"
+        NotifyScenes.SMS to "新短信",
+        NotifyScenes.VERIFICATION to "验证码",
+        NotifyScenes.ALERT to "阈值告警",
+        NotifyScenes.CONNECTIVITY to "连接状态",
+        NotifyScenes.TRAFFIC_80 to "流量预警",
+        NotifyScenes.DOWNLOAD to "下载任务",
+        NotifyScenes.TUNNEL to "隧道异常",
+        NotifyScenes.EVENTS to "设备事件",
+        NotifyScenes.BATTERY to "电池状态",
+        NotifyScenes.TEST to "连通性测试"
     )
+
+    /** 已登记场景色的场景 id。只给 `MailTemplateSceneCoverageTest` 核对登记完整性用。 */
+    internal val registeredColorScenes: Set<String> get() = SCENE_COLORS.keys
+
+    /** 已登记场景名的场景 id。只给 `MailTemplateSceneCoverageTest` 核对登记完整性用。 */
+    internal val registeredLabelScenes: Set<String> get() = SCENE_LABELS.keys
+
+
 
     private const val ACCENT_DEFAULT = "#2563eb"
 
@@ -215,17 +238,16 @@ $deviceBlock
     }
 
     /**
-     * 从短信正文里抓验证码：4-8 位纯数字，且前后不能再接数字。
+     * 从短信正文里抓验证码。
      *
-     * 只在有"验证码/校验码/动态码/code"等提示词时才抓 —— 否则「余额 123456 元」
-     * 这种也会被当成验证码顶到高亮块里。
+     * 判据全部在 [SmsCodeExtractor] 里，与验证码入库路径（`SmsController.extractCode`）共用同一份。
+     *
+     * 2026-09-08 之前这里是独立实现，且**没有窗口约束** —— 只要正文含提示词就在全文里取
+     * 第一个 4-8 位数字，于是「您的余额 567890 元，验证码 1234」会把 567890 顶进邮件主题。
+     * 提示词集合也与入库路径不同，导致「确认码 xxxx」在这里抓不到码 → `forwardSms` 判成
+     * `sms` 场景 → 只勾了「验证码」的用户静默收不到邮件。两个坑都由统一实现修掉。
      */
-    fun extractCode(body: String): String? {
-        val hinted = listOf("验证码", "校验码", "动态码", "口令", "code", "OTP")
-            .any { body.contains(it, ignoreCase = true) }
-        if (!hinted) return null
-        return Regex("""(?<!\d)(\d{4,8})(?!\d)""").find(body)?.groupValues?.get(1)
-    }
+    fun extractCode(body: String): String? = SmsCodeExtractor.find(body)?.code
 
     private fun esc(s: String): String = s
         .replace("&", "&amp;")

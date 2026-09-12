@@ -6,6 +6,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 悬浮胶囊导航栏「整屏模糊 + 无切换动画」两个真机 bug 的**回归护栏**。

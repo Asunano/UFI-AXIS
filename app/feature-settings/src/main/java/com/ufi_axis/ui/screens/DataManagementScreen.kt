@@ -14,11 +14,18 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.MonitorStorageResponse
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
+import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 /**
  * 数据管理页（从监控中心迁出）：展示各历史表的占用情况，并提供
  * 「清理 7 天前」与「全部清空」操作。数据来自 monitorState.storageInfo。
+ *
+ * 2026-09-11 追加「编辑缓存」一节：文本编辑器打开超大文件时会整份下载到手机缓存
+ * （见 `FileManagerModule.fetchToEditorCache`），那是本页唯一不由历史表构成、
+ * 却同样会占手机空间的数据，所以清理入口放在这里。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -27,8 +34,18 @@ fun DataManagementScreen(viewModel: MainViewModel, navController: NavHostControl
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     var showClean7d by remember { mutableStateOf(false) }
     var showClearAll by remember { mutableStateOf(false) }
+    var showClearEditorCache by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) { viewModel.dashboard.loadMonitorStorage() }
+    // 只订阅缓存占用两项：直接 collect 整个 FileManagerState 会被下载进度
+    // （每 300ms 一次）带着整页重组。
+    val cacheUsage by remember {
+        viewModel.files.state.map { it.editorCacheBytes to it.editorCacheCount }.distinctUntilChanged()
+    }.collectAsState(initial = 0L to 0)
+
+    LaunchedEffect(Unit) {
+        viewModel.dashboard.loadMonitorStorage()
+        viewModel.files.refreshEditorCacheUsage()
+    }
 
     // 清理结果提示
     LaunchedEffect(monitorState.cleanMessage) {
@@ -79,6 +96,13 @@ fun DataManagementScreen(viewModel: MainViewModel, navController: NavHostControl
                                 onClearAll = { showClearAll = true }
                             )
                         }
+                        item {
+                            EditorCacheSection(
+                                usedBytes = cacheUsage.first,
+                                count = cacheUsage.second,
+                                onClear = { showClearEditorCache = true }
+                            )
+                        }
                     }
                 }
             }
@@ -110,6 +134,25 @@ fun DataManagementScreen(viewModel: MainViewModel, navController: NavHostControl
                 showClearAll = false
             },
             onDismiss = { showClearAll = false }
+        )
+    }
+
+    if (showClearEditorCache) {
+        UfiConfirmDialog(
+            title = "清理编辑缓存",
+            text = "将删除手机上所有「大文件编辑副本」。已经改动过但还没「另存到手机」的内容会一起丢失，" +
+                "设备端的原文件不受影响。",
+            confirmText = "清理",
+            destructive = true,
+            onConfirm = {
+                val (bytes, count) = viewModel.files.clearEditorCache()
+                toastMessage = ToastMessage(
+                    "已清理 $count 个副本，释放 ${FormatUtils.formatSize(bytes)}",
+                    ToastType.SUCCESS
+                )
+                showClearEditorCache = false
+            },
+            onDismiss = { showClearEditorCache = false }
         )
     }
 }
@@ -150,6 +193,51 @@ private fun StorageSection(storage: MonitorStorageResponse, onClean7d: () -> Uni
         UfiButtonRow {
             UfiButton(size = UfiButtonSize.Small, text = "清理 7 天前", onClick = onClean7d)
             UfiButton(size = UfiButtonSize.Small, text = "全部清空", onClick = onClearAll)
+        }
+    }
+}
+
+/**
+ * 编辑缓存一节。
+ *
+ * 与上面的历史表卡片并列但**不同于**它们：那些是 core 设备端的数据量，
+ * 这一项是**手机本地**的空间占用。所以副标题把话说清楚，避免用户以为清的是设备端文件。
+ */
+@Composable
+private fun EditorCacheSection(
+    usedBytes: Long,
+    count: Int,
+    onClear: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    UfiSettingsRowCard(contentPadding = PaddingValues(16.dp)) {
+        UfiSectionHeader(title = "编辑缓存（手机）")
+        Text(
+            text = "超过服务端单次可读上限的文本文件，会整份下载到手机缓存后再用编辑器打开。" +
+                "缓存按最后修改时间自动淘汰，总量上限 64MB；设备端的原文件不受影响。",
+            style = UfiTextStyles.caption,
+            color = palette.textSecondary
+        )
+        Spacer(Modifier.height(Spacing.Medium))
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = Spacing.InnerPadding),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("当前占用", modifier = Modifier.weight(1f), style = UfiTextStyles.body)
+            Text(
+                text = if (count == 0) "无" else "${FormatUtils.formatSize(usedBytes)} · $count 个文件",
+                style = UfiTextStyles.body.copy(fontWeight = UfiWeight.Emphasis),
+                color = if (count == 0) palette.textSecondary else palette.accent
+            )
+        }
+        Spacer(Modifier.height(Spacing.Medium))
+        UfiButtonRow {
+            UfiButton(
+                size = UfiButtonSize.Small,
+                text = "清理编辑缓存",
+                enabled = count > 0,
+                onClick = onClear
+            )
         }
     }
 }

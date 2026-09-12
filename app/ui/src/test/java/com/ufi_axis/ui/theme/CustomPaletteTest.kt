@@ -333,12 +333,9 @@ class CustomPaletteTest {
      *
      * 没有这条，上面所有 `violations.isEmpty()` 的断言都可能是因为判据实现坏了而恒真。
      *
-     * 对照组取 [ThemePresets.Rose] 而**不是** [ThemePresets.Default]：出厂默认皮肤的
-     * `accentSecondaryLight`（`#E5E5E5` 浅灰）对白卡只有 1.26:1，这是 `ThemePresets` 的
-     * 类 KDoc 里点名记录的**已知遗留**（`FileIcon` 拿 accentSecondary 当文件图标 tint，
-     * 所以默认皮肤下文件图标本来就偏淡；改它会动到出厂观感，本轮不修）。
-     * 换句话说 Default 会被本审计器如实判出那一条 —— 下面第三个断言就把这件事钉住，
-     * 免得将来有人以为是审计器写错了。
+     * 对照组取 [ThemePresets.Rose]：它自出厂起就是全项合格的一套。
+     * 2026-09-08 起 [ThemePresets.Default] 也全项合格（三个 accent 槽的明暗方向修正之后），
+     * 下面最后一个断言把这件事钉住 —— 它同时是「深色取色发灰」根因已修的回归护栏。
      */
     @Test
     fun `the contrast auditor actually rejects a bad palette`() {
@@ -358,19 +355,12 @@ class CustomPaletteTest {
             paletteContrastViolations(ThemePresets.Rose).isEmpty()
         )
         val defaultViolations = paletteContrastViolations(ThemePresets.Default)
-        assertEquals(
-            "出厂默认皮肤应当**只**在「次强调色对卡面」这一条上不合格，明暗各一项 —— " +
-                "浅色是 accentSecondaryLight `#E5E5E5` 对白卡 1.26:1（ThemePresets 类 KDoc 里" +
-                "点名记录的已知遗留：FileIcon 拿 accentSecondary 当文件图标 tint，" +
-                "所以默认皮肤下文件图标本来就偏淡，改它会动到出厂观感）；" +
-                "深色是 accentSecondaryDark `#555555` 对 `#2A2A2A` 1.93:1（同一个槽的另一态）。" +
-                "多出别的项说明默认皮肤真的退化了；一项都没有则说明审计器漏判。实际：$defaultViolations",
-            2,
-            defaultViolations.size
-        )
         assertTrue(
-            "默认皮肤的两项不合格必须都落在「次强调色对卡面」上：$defaultViolations",
-            defaultViolations.all { it.contains("次强调色对卡面") }
+            "出厂默认皮肤现在必须全项合格。2026-09-08 之前它在「次强调色对卡面」上明暗各挂一项" +
+                "（accentSecondaryLight `#E5E5E5` 对白卡 1.26:1、accentSecondaryDark `#555555` 对 " +
+                "`#2A2A2A` 1.93:1）—— 与「深色模式下图标文字发灰」是同一个根因：三个 accent 槽的" +
+                "明暗方向写反了。现已重标定为深色态取亮灰、浅色态取深灰。实际：$defaultViolations",
+            defaultViolations.isEmpty()
         )
     }
 

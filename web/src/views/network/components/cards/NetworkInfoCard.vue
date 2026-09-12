@@ -61,7 +61,7 @@
 
     <!-- 中段：3 个信号 metric 一行横排（margin-top 收敛 16→10，与上方紧凑） -->
     <div class="metric-strip">
-      <div v-for="m in signalMetrics" :key="m.key" class="metric-cell">
+      <div v-for="m in signalMetrics" :key="m.key" class="metric-cell sub-panel">
         <div class="metric-head">
           <span class="metric-dot" :style="{ background: m.color || 'var(--text-muted)' }"></span>
           <span class="metric-key">{{ m.key }}</span>
@@ -243,14 +243,11 @@ const signalMetrics = computed(() => {
   gap: 10px;
   margin-top: 10px;
 }
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .metric-cell {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  padding: 10px 12px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--surface-elevated);
 }
 .metric-head {
   display: flex;

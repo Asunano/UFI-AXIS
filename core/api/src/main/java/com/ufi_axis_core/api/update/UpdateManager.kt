@@ -6,6 +6,7 @@ import com.ufi_axis_core.lib_api.BuildConfig
 import com.ufi_axis_core.util.AdbShellExecutor
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.util.LogPaths
 import com.ufi_axis_core.util.ShellExecutor
 import com.ufi_axis_core.api.routes.statusToMap
 import kotlinx.coroutines.CoroutineScope
@@ -83,31 +84,26 @@ class UpdateManager(
 
     /** 分类目录：Core 侧更新日志统一写到 Download/UFI-AXIS/log/core/update.log（RESULT 备份也在此）。 */
     private fun coreLogDir(): File {
-        val candidates = listOf(
-            "/storage/emulated/0/Download/UFI-AXIS/log/core",
-            "/sdcard/Download/UFI-AXIS/log/core"
-        )
+        // 路径取自 LogPaths（唯一真源）；探测顺序与回退语义保持原样
+        val candidates = LogPaths.dirCandidates(LogPaths.Component.CORE)
         for (c in candidates) {
             val d = File(c)
             if (d.exists() || runCatching { d.mkdirs() }.getOrDefault(false)) return d
         }
-        return File("/sdcard/Download/UFI-AXIS/log/core")
+        return File(LogPaths.dir(LogPaths.Component.CORE))
     }
     private val CORE_UPDATE_LOG = "update.log"
 
     /** 启动/拉起调试日志：写入 Download/UFI-AXIS/log/core/launcher.log（与 ufi_update.sh 的 watchdog 日志同属分类目录）。 */
     private fun debugLogToFile(msg: String) {
         runCatching {
-            val candidates = listOf(
-                "/storage/emulated/0/Download/UFI-AXIS/log/core",
-                "/sdcard/Download/UFI-AXIS/log/core"
-            )
+            val candidates = LogPaths.dirCandidates(LogPaths.Component.CORE)
             var dir: File? = null
             for (c in candidates) {
                 val d = File(c)
                 if (d.exists() || runCatching { d.mkdirs() }.getOrDefault(false)) { dir = d; break }
             }
-            val f = File(dir ?: File("/sdcard/Download/UFI-AXIS/log/core"), "launcher.log")
+            val f = File(dir ?: File(LogPaths.dir(LogPaths.Component.CORE)), "launcher.log")
             val ts = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.ROOT).format(java.util.Date())
             f.appendText("[$ts] $msg\n")
         }
@@ -181,11 +177,14 @@ class UpdateManager(
     private val MAX_APK_BYTES = 50L * 1024 * 1024
     /** P1 E24：守护脚本固定执行副本 + 结果日志（shell 可写、普通 App 不可写） */
     private val SCRIPT_PATH = "/data/local/tmp/ufi_update.sh"
-    /** 脚本运行日志（分类目录 log/watchdog/watchdog.log）；双候选路径兼容 /sdcard 与 /storage/emulated/0 布局 */
-    private val WATCHDOG_LOG_CANDIDATES = listOf(
-        "/storage/emulated/0/Download/UFI-AXIS/log/watchdog/watchdog.log",
-        "/sdcard/Download/UFI-AXIS/log/watchdog/watchdog.log"
-    )
+    /**
+     * 脚本运行日志（分类目录 log/watchdog/watchdog.log）；双候选路径兼容 /sdcard 与 /storage/emulated/0 布局。
+     *
+     * 这个文件的**生产者是 `ufi_update.sh`**（它自己持有一份路径，见 [LogPaths] 的说明），
+     * 这里只是读它的 RESULT 行，所以路径必须与脚本逐字一致 —— 用真源拼接就是为了这个。
+     */
+    private val WATCHDOG_LOG_CANDIDATES =
+        LogPaths.fileCandidates(LogPaths.Component.WATCHDOG, "watchdog.log")
     private fun watchdogLogPath(): String {
         for (c in WATCHDOG_LOG_CANDIDATES) if (File(c).exists()) return c
         return WATCHDOG_LOG_CANDIDATES.last()

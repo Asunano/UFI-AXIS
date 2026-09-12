@@ -69,8 +69,8 @@ object AdbShellExecutor {
 
     /**
      * 执行单条命令（即用即取）。
-     * 任何失败/超时都返回 [ShellExecutor.ShellResult]（exitCode=-1），不会向上抛 CancellationException，
-     * 便于上层 [ShellExecutor.executeAsRoot] 回退到普通 shell。
+     * 真实的执行失败/超时都返回 [ShellExecutor.ShellResult]（exitCode=-1），便于上层
+     * [ShellExecutor.executeAsRoot] 回退到普通 shell；但**协程取消照常向上抛**。
      */
     suspend fun execute(
         command: String,
@@ -88,8 +88,11 @@ object AdbShellExecutor {
         try {
             runAdbShellCommand(adbPath, command, timeoutMs)
         } catch (e: CancellationException) {
-            // 上层 withTimeout 取消：转成结果而非抛异常，避免穿透到路由层 StatusPages
-            ShellExecutor.ShellResult(-1, "", "ADB shell cancelled")
+            // 取消必须重抛。早期实现把它转成 exitCode=-1 的普通结果，于是调用方的
+            // withTimeout / scheduler stop() 不再经由这一帧解栈，而且「设备拒绝」和
+            // 「我们正在关停」变得无法区分 —— 要不要回退到普通 shell 是调用方的决定，
+            // 不该由一个被丢弃的取消信号替它做。
+            throw e
         } catch (e: Exception) {
             ShellExecutor.ShellResult(-1, "", e.message ?: "unknown")
         }

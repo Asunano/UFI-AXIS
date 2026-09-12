@@ -16,6 +16,8 @@ import com.ufi_axis.data.api.RetrofitClient
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.data.model.ModeRequest
 import com.ufi_axis.data.model.WifiAclResponse
+// 制式别名 ↔ 设备 BearerPreference 的换算与「切换中」回读预算都在 contract，两端同源
+import com.ufi_axis_core.contract.NetworkMode
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
@@ -133,6 +135,14 @@ class NetworkModule(
     val pairingState: StateFlow<PairingState> = _pairingState.asStateFlow()
 
     private var refreshJob: Job? = null
+
+    /**
+     * 制式切换 +「切换中」回读的协程。
+     *
+     * 单独持有是为了让**连点两个档位**时前一次的回读立刻停掉：不取消的话两个循环会同时
+     * 往 `_deviceSettingsState` 写回读结果，界面会在两个目标档位之间跳。
+     */
+    private var modeSwitchJob: Job? = null
 
     // ── Cross-module Events ──
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 16)
@@ -359,14 +369,98 @@ class NetworkModule(
         }
     }
 
+    /**
+     * 切换网络制式。
+     *
+     * 三个约定，缺一个就会回到 2026-09-11 真机上那份表现：
+     * 1. **先进「切换中」**（[NetworkState.pendingNetworkMode]），界面立刻显示目标档位。
+     *    设备重新注册期间 `GET /api/device/settings` 仍报旧档位，拿回读值渲染就会
+     *    "点了 4G 界面还是仅 5G"。
+     * 2. **失败文案取 core 给的原因**。core 现在把设备侧失败映射成 503 / 502 + 中文 message
+     *    （会话失效 / 设备明确拒绝），只报"设置失败"等于把这份信息扔了。
+     * 3. **回读有上限**（[awaitNetworkModeApplied]）。等不到就明说，不静默停在旧值上。
+     */
     fun setNetworkMode(mode: String) {
-        scope.launch {
-            try {
-                val resp = api.setNetworkMode(ModeRequest(mode))
-                if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "设置失败")
-                waitForNetworkReady(); refreshNetwork()
-            } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "设置失败: ${e.message}") }
+        modeSwitchJob?.cancel()
+        modeSwitchJob = scope.launch {
+            _networkState.update {
+                it.copy(pendingNetworkMode = mode, modeSwitchTimedOut = false, errorMessage = null)
+            }
+            val failure = try {
+                if (api.setNetworkMode(ModeRequest(mode)).success) null else "设置失败"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                coreErrorMessage(e)
+            }
+            if (failure != null) {
+                _networkState.update { it.copy(pendingNetworkMode = null, errorMessage = failure) }
+                return@launch
+            }
+            awaitNetworkModeApplied(mode)
         }
+    }
+
+    /**
+     * 下发成功后，在 `NetworkMode.SwitchProbe` 的预算内回读设备设置，等它报出目标档位。
+     *
+     * 上限是硬的（次数由 `shouldKeepProbing` 判定）：设备在弱信号下可能十几秒都注册不上，
+     * 无上限轮询会一直打 goform 查询，把 core 侧的设置/查询许可耗在这一件事上。
+     * 预算内没等到就置 [NetworkState.modeSwitchTimedOut] 并给出中性文案 ——
+     * 静默退回旧档位会让用户以为切换没生效（实际上设备往往稍后就切过去了）。
+     */
+    private suspend fun awaitNetworkModeApplied(target: String) {
+        // 设备 goform 写入到查询接口可见有延迟，第一次回读必须等一会儿，否则拿到的一定是旧值
+        delay(NetworkMode.SwitchProbe.FIRST_DELAY_MS)
+        var attempt = 0
+        var reached = false
+        while (true) {
+            attempt++
+            val settings = try {
+                api.getDeviceSettings()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                DebugLog.w("Network", "制式回读失败 attempt=$attempt", e)
+                null
+            }
+            if (settings != null) {
+                _deviceSettingsState.update {
+                    DeviceSettingsState(settings = settings, loadVersion = System.currentTimeMillis())
+                }
+                // 设备回读的是 Bearer 取值域，比对前先换算成 contract 别名
+                reached = NetworkMode.fromBearer(settings.networkMode.orEmpty()) == target
+            }
+            if (!NetworkMode.SwitchProbe.shouldKeepProbing(attempt, reached)) break
+            delay(NetworkMode.SwitchProbe.INTERVAL_MS)
+        }
+        _networkState.update {
+            it.copy(
+                pendingNetworkMode = null,
+                modeSwitchTimedOut = !reached,
+                errorMessage = if (reached) it.errorMessage else "设备尚未完成切换，可稍后刷新查看"
+            )
+        }
+        refreshNetwork()
+    }
+
+    /**
+     * 把 core 的失败信封翻译成能给用户看的一句话。
+     *
+     * Retrofit 的 `HttpException.message` 是 `"HTTP 503 Service Unavailable"`，直接显示等于
+     * 把 core 写好的「设备后台会话已失效…」扔了。非 HTTP 异常（连不上 / 超时）没有错误体可取，
+     * 落到 `e.message`。
+     */
+    private fun coreErrorMessage(e: Exception): String {
+        if (e is retrofit2.HttpException) {
+            val body = runCatching { e.response()?.errorBody()?.string() }.getOrNull()
+            val reason = runCatching {
+                (AppJson.parseToJsonElement(body ?: "") as? JsonObject)
+                    ?.get("error")?.jsonPrimitive?.contentOrNull
+            }.getOrNull()
+            if (!reason.isNullOrBlank()) return reason
+        }
+        return "设置失败: ${e.message ?: "未知错误"}"
     }
 
     /** 统一锁定 LTE+NR 频段（goform + AT+SFUN 网络栈重启，无需设备重启） */
@@ -409,6 +503,21 @@ class NetworkModule(
                 _deviceSettingsState.update { DeviceSettingsState(settings = api.getDeviceSettings(), loadVersion = System.currentTimeMillis()) }
             }
             catch (e: Exception) { _deviceSettingsState.update { it.copy(errorMessage = "加载设备设置失败: ${e.message}", isLoading = false) } }
+        }
+    }
+
+    /**
+     * 拉取设备身份信息（`GET /api/device/identity`）：本机号码(msisdn) / IMEI 等。
+     * 只写 [NetworkState.deviceIdentity]，失败不影响其它网络数据（错误吞掉，UI 回落到 "—"）。
+     */
+    fun loadDeviceIdentity() {
+        scope.launch {
+            try {
+                val identity = api.getDeviceIdentity()
+                _networkState.update { it.copy(deviceIdentity = identity, loadVersion = System.currentTimeMillis()) }
+            } catch (e: Exception) {
+                DebugLog.w("Network", "设备身份信息加载失败: ${e.message}")
+            }
         }
     }
 
@@ -1778,7 +1887,7 @@ class NetworkModule(
         }
     }
 
-    // ── 配对设备管理（阶段3：2026-08-11，设备密码认证） ──
+    // ── 配对设备管理（阶段3：2026-08-11，配对密码认证） ──
 
     /** 加载已配对设备列表（GET /api/pairing/devices）。 */
     fun loadPairedDevices() {
@@ -1806,7 +1915,7 @@ class NetworkModule(
         }
     }
 
-    /** 移除已配对设备（DELETE /api/pairing/devices/{fp}，需设备密码）。
+    /** 移除已配对设备（DELETE /api/pairing/devices/{fp}，需配对密码）。
      * 最后一台移除会轮换 token：旧 token 失效 → 下一次请求 401 由 RetrofitClient 引导重新配对（预期行为）。 */
     fun removeDevice(fingerprint: String, password: String) {
         scope.launch {
@@ -1828,7 +1937,7 @@ class NetworkModule(
         }
     }
 
-    /** 修改设备密码（POST pairing/change-password，root 路径；旧密码即门禁）。 */
+    /** 修改配对密码（POST pairing/change-password，root 路径；旧密码即门禁）。 */
     fun changeDevicePassword(oldPw: String, newPw: String) {
         scope.launch {
             try {
@@ -1836,7 +1945,7 @@ class NetworkModule(
                 loadPairingStatus()
             } catch (e: Exception) {
                 DebugLog.e("Network", "changeDevicePassword failed", e)
-                _pairingState.update { it.copy(errorMessage = "修改设备密码失败: ${e.message}") }
+                _pairingState.update { it.copy(errorMessage = "修改配对密码失败: ${e.message}") }
             }
         }
     }

@@ -31,6 +31,36 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
+    // 本地调试 / 性能测量统一使用项目级 debug keystore（app/debug.keystore）。
+    // benchmark 变体单独用「UFI-AXIS 专属 keystore」签，因为真机已装包
+    // （com.ufi_axis_core）正是用该证书签的，只有同签名才能 `adb install -r` 覆盖。
+    // 必须在 android {} 求值阶段设置（早于 AGP 冻结 signingConfig）。
+    //
+    // ⚠ app/debug.keystore 必须入库（.gitignore 里有 `!app/debug.keystore` 例外）。
+    // 它是口令固定为 android / 别名 androiddebugkey 的**公开调试证书**，入库无安全风险；
+    // 一旦只留在本地，CI 全新 checkout 时 :core:validateSigningDebug 会直接失败。
+    //
+    // UFI-AXIS 正式签名凭据不在此文件里，来自根 keystore.properties（见根 build.gradle.kts）。
+    val ufiProps = rootProject.extra["ufiKeystoreProps"] as java.util.Properties
+    signingConfigs {
+        getByName("debug") {
+            storeFile = rootProject.file("app/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+        // 真机部署专用：与设备上已装包同签名，避免 UPDATE_INCOMPATIBLE。
+        // keystore.properties 缺失时不创建，benchmark 退化为未签名包（仅本地装机受影响）。
+        if (ufiProps.getProperty("ufi.storeFile") != null) {
+            create("ufi") {
+                storeFile = rootProject.file(ufiProps.getProperty("ufi.storeFile"))
+                storePassword = ufiProps.getProperty("ufi.storePassword")
+                keyAlias = ufiProps.getProperty("ufi.keyAlias")
+                keyPassword = ufiProps.getProperty("ufi.keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -41,14 +71,15 @@ android {
             )
         }
         // 性能测量专用（2026-09-01）：与 :app 的 benchmark 变体同款配方 ——
-        // 代码优化程度和 release 完全一致（R8 + 资源压缩 + 非 debuggable），但用 debug 签名，
-        // 因此可以直接 `adb install` 到真机，不需要正式 keystore。
+        // 代码优化程度和 release 完全一致（R8 + 资源压缩 + 非 debuggable），但用 UFI-AXIS 专属签名，
+        // 因此可以直接 `adb install -r` 覆盖真机已装包，不需要另配 keystore。
         //
-        // 签名与 :app:benchmark 一致（同为 debug 签名），两端之间的 signature 级权限
+        // 签名与 :app:benchmark 一致（同为 UFI-AXIS 签名），两端之间的 signature 级权限
         // 与 AIDL 调用不受影响。
         create("benchmark") {
             initWith(getByName("release"))
-            signingConfig = signingConfigs.getByName("debug")
+            // keystore.properties 缺失时 ufi 未创建 → 退化为未签名包（构建不失败）
+            signingConfig = signingConfigs.findByName("ufi")
             isDebuggable = false
             // 库模块（:core:* 等）没有 benchmark 变体，回落到它们的 release 变体。
             matchingFallbacks += listOf("release")

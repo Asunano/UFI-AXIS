@@ -1,31 +1,69 @@
 <template>
   <div class="settings-panel">
-    <!-- Card 1: 版本信息 -->
-    <GridCard title="版本信息">
+    <!--
+      卡片编排约束（2026-09-10 起，改这一页前先读）：
+      `.settings-panel` 是 2 列栅格，同一行的轨道等高、矮卡贴顶（main.css 的 align-items:start），
+      所以**同一行两张卡的高度差必须 ≤ 1 行**（InfoRow 一行 ≈ 38px），
+      否则矮卡下方会露出一整块页面底色 —— 改造前这里就有一块 263px 的空洞。
+      当前配对（DOM 顺序即栅格顺序，行优先）：
+        行 1 = 版本与来源(5 行) ｜ 运行与存储(4 行 + 进度条)
+        行 2 = 电池(5 行)        ｜ 诊断信息(5 行)
+      增删行之前先按这个约束重算，不要让单张卡独自变长。
+    -->
+    <!-- Card 1: 版本与来源 —— 原「版本信息」+「开源信息」合并。
+         合并的首要理由是排版：开源信息只有 2 行，独立成卡时它与「诊断信息」同行，
+         而 2 列栅格的同一行是**等高**的（main.css 的 .settings-panel），矮卡下方会
+         露出 147px 整块页面底色（2026-09-10 实测）。
+         其次两者语义同源：都是「这个版本从哪来、许可是什么」。 -->
+    <GridCard title="版本与来源">
       <InfoRow label="应用版本" :value="versionInfo.version" />
       <InfoRow label="最低客户端版本" :value="versionInfo.minClientVersion" />
-      <InfoRow label="更新地址" :value="versionInfo.updateUrl || '--'" />
+      <!-- 长 URL 单独一行并放开 InfoRow 默认的 65% 值宽 -->
+      <InfoRow class="row-url" label="更新地址">
+        <template #default>
+          <code class="url-text" :title="versionInfo.updateUrl || '--'">{{ versionInfo.updateUrl || '--' }}</code>
+        </template>
+      </InfoRow>
+      <InfoRow label="项目仓库">
+        <template #default>
+          <a :href="REPO_URL" target="_blank" rel="noopener noreferrer">github.com/Asunano/UFI-AXIS</a>
+        </template>
+      </InfoRow>
+      <!-- 为什么这一行必须在 core 侧界面上能点到：那几个预编译二进制
+           （aria2c / socat / adb / ttyd / curl / jq / sendat）是 **core APK** 打包并释放到
+           设备执行的，其中 aria2c / socat 属 GPL 系 —— 分发义务（附许可证 + 提供对应源码）
+           产生在 core 这一侧。app 端「关于」也放了同一个入口（AboutDeviceScreen 的「开源许可」），
+           两处指向同一份文件，不各写一份文案，避免漂移。 -->
+      <InfoRow label="开源许可">
+        <template #default>
+          <a :href="THIRD_PARTY_NOTICES_URL" target="_blank" rel="noopener noreferrer">第三方组件与许可证声明</a>
+        </template>
+      </InfoRow>
     </GridCard>
 
-    <!-- Card 1.2: 系统信息（core /api/system/*）
-         四个端点都无参数、恒 200、无失败信封；battery / storage 采集异常时返回 {}。
+    <!-- Card 1.2a: 运行与存储 / Card 1.2b: 电池 —— 原「系统信息」一卡 9 行拆成两张 5 行内外的卡。
+         拆的理由同样在排版：9 行让这张卡高达 420px，与同行的 3 行卡（173px）差 247px，
+         矮的那张下方整块空白（2026-09-10 实测该页空洞 263px）。
+         拆成两张后每张 4~5 行，与同行卡的高度差收敛到 1 行以内。
+         数据源不变（core /api/system/*）：四个端点都无参数、恒 200、无失败信封；
+         battery / storage 采集异常时返回 {}。
          刻意不轮询：设备只有 256MB 内存，仅在挂载与手动点「刷新」时各拉一次。 -->
-    <GridCard title="系统信息">
+    <GridCard title="运行与存储">
       <template #extra>
         <n-button size="tiny" quaternary :loading="sysLoading" @click="loadSystemInfo">刷新</n-button>
       </template>
-      <InfoRow label="Root 权限">
+      <!-- 标签说明：这个值来自 /api/system/root-check 的 hasRoot，判据是
+           ShellExecutor.hasRootAccess() —— 即「ADB 特权通道是否可用」（底层 ADB shell 是
+           uid 2000，不是 uid=0）。它与下面「诊断信息」里那个 Root（uid=0，来自 /api/diagnose
+           的真实执行结果）**不是同一个探针**，实测会出现「通道可用但 shell 不是 root」，
+           所以两个都保留、标签必须能区分开。 -->
+      <InfoRow label="ADB 特权通道">
         <template #default>
           <span :class="sysInfo.hasRoot ? 'text-success' : 'text-error'">{{ sysRootText }}</span>
         </template>
       </InfoRow>
       <InfoRow label="服务启动时间" :value="sysStartupTimeText" />
       <InfoRow label="已运行" :value="sysStartupUptimeText" />
-      <InfoRow label="电池电量" :value="sysBatteryPercentText" />
-      <InfoRow label="充电状态" :value="sysBatteryChargingText" />
-      <InfoRow label="电源类型" :value="sysBatteryPluggedText" />
-      <InfoRow label="电池温度" :value="sysBatteryTempText" />
-      <InfoRow label="电池电压" :value="sysBatteryVoltageText" />
       <InfoRow label="存储（已用 / 总量）" :value="sysStorageText" />
       <n-progress
         v-if="sysInfo.storageLoaded"
@@ -36,14 +74,28 @@
       />
     </GridCard>
 
-    <!-- Card 6: 诊断信息 -->
+    <GridCard title="电池">
+      <InfoRow label="电池电量" :value="sysBatteryPercentText" />
+      <InfoRow label="充电状态" :value="sysBatteryChargingText" />
+      <InfoRow label="电源类型" :value="sysBatteryPluggedText" />
+      <InfoRow label="电池温度" :value="sysBatteryTempText" />
+      <InfoRow label="电池电压" :value="sysBatteryVoltageText" />
+    </GridCard>
+
+    <!-- Card 6: 诊断信息
+         2026-09-10 去重两行：
+         · 「应用版本」删掉 —— 它与「版本与来源」的应用版本是同一件事（都读已安装包版本），
+           canonical 来源是 /api/config/version，diagnose 那份原本还写死过 "0.1"（见
+           HttpServer.kt 的注释），留着只会让人以为是两个数。
+         · 「Root 状态」保留但改名为「Root（uid=0）」—— 它与「运行与存储」的 ADB 特权通道
+           **不是同一探针**（这里是 executeAsRoot("id") 的真实结果，含 uid=0 才算），
+           原来两个都叫 Root 却给出相反结论（实测「已获取 / 未获取」同屏），所以要分开命名。 -->
     <GridCard title="诊断信息">
       <template #extra>
         <n-button size="tiny" quaternary @click="loadDiagnostics">刷新</n-button>
       </template>
       <InfoRow label="服务器时间" :value="diag.serverTime || '--'" />
-      <InfoRow label="应用版本" :value="diag.appVersion || '--'" />
-      <InfoRow label="Root 状态">
+      <InfoRow label="Root（uid=0）">
         <template #default>
           <span :class="diag.root ? 'text-success' : 'text-error'">{{ diag.root ? '已获取' : '未获取' }}</span>
         </template>
@@ -59,25 +111,6 @@
         </template>
       </InfoRow>
       <InfoRow label="网关" :value="diag.gateway || '--'" />
-    </GridCard>
-
-    <!-- Card 7: 开源信息
-         为什么 core 侧必须有：那几个预编译二进制（aria2c / socat / adb / ttyd / curl / jq / sendat）
-         是 **core APK** 打包并释放到设备执行的，其中 aria2c / socat 属 GPL 系 —— 分发义务
-         （附许可证 + 提供对应源码）产生在 core 这一侧，声明就得在 core 的界面里能点到。
-         app 端「关于」也放了同一个入口（AboutDeviceScreen 的「开源许可」），两处指向同一份文件，
-         不各写一份文案，避免漂移。 -->
-    <GridCard title="开源信息">
-      <InfoRow label="项目仓库">
-        <template #default>
-          <a :href="REPO_URL" target="_blank" rel="noopener noreferrer">github.com/Asunano/UFI-AXIS</a>
-        </template>
-      </InfoRow>
-      <InfoRow label="开源许可">
-        <template #default>
-          <a :href="THIRD_PARTY_NOTICES_URL" target="_blank" rel="noopener noreferrer">第三方组件与许可证声明</a>
-        </template>
-      </InfoRow>
     </GridCard>
   </div>
 </template>
@@ -143,7 +176,9 @@ function sysNumber(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-const sysRootText = computed(() => (sysInfo.rootLoaded ? (sysInfo.hasRoot ? '已获取' : '未获取') : '--'));
+// 「ADB 特权通道」用 可用/不可用 而不是 已获取/未获取：它判的是通道，
+// 不是 shell 的 uid（uid 那个在「诊断信息」的 Root（uid=0）里）。
+const sysRootText = computed(() => (sysInfo.rootLoaded ? (sysInfo.hasRoot ? '可用' : '不可用') : '--'));
 const sysStartupTimeText = computed(() =>
   sysInfo.startupTimeMs > 0 ? new Date(sysInfo.startupTimeMs).toLocaleString('zh-CN', { hour12: false }) : '--'
 );
@@ -174,9 +209,10 @@ const sysStorageText = computed(() =>
 const sysStoragePercent = computed(() => Number(Math.min(100, Math.max(0, sysInfo.storageUsagePercent)).toFixed(1)));
 
 // ── 诊断 ──
+// 刻意不收 app_version：它与「版本与来源」的应用版本同源（都读已安装包版本），
+// 展示两份只会制造「哪个是真的」的疑问。canonical 来源是 /api/config/version。
 const diag = reactive({
   serverTime: '',
-  appVersion: '',
   root: false,
   adbd: '',
   mobileData: '',
@@ -266,7 +302,6 @@ async function loadDiagnostics() {
     diag.serverTime = data.server_time
       ? new Date(Number(data.server_time)).toLocaleString('zh-CN', { hour12: false })
       : '--';
-    diag.appVersion = data.app_version || '--';
     diag.root = !!data.root;
     // adbd / mobile_data / gateway 都是 shell 输出的字符串（如 "running"/"stopped"/"1"/"0"/"unknown"），
     // 旧代码用 !! 判断 → "stopped"、"0"、"unknown" 全部被当成 true
@@ -294,11 +329,27 @@ onMounted(() => {
 <style scoped>
 /* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
 
+/* ── 更新地址行 ──
+   InfoRow 默认给值限了 65% 宽并省略号（InfoRow.vue 的 .info-value），对短值是对的，
+   但更新地址是本页唯一需要看清 / 抄走的长字符串，65% 会把它截成 "…/ma…"。
+   这里只对这一行放开到整行，并把字号降到 12px —— 实测同一条 URL 在 12px 下能整行放下。
+   不用 <code> 等宽：68 个字符在 12px 等宽下约 490px，会超出 482px 的可用宽。 */
+.row-url :deep(.info-value) {
+  max-width: 100%;
+}
+.url-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* ── Text helpers ── */
 .text-success {
-  color: #18a058;
+  color: var(--success);
 }
 .text-error {
-  color: #d03050;
+  color: var(--error);
 }
 </style>

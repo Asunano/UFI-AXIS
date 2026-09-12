@@ -1,5 +1,5 @@
 // R2+R3：监控页「总览 / 图表」双 Tab 总览面板局部组件（feature-monitor 模块内新增，不动任何公共组件）。
-// 设计依据：docs/ui-redesign.md §3（监控界面重构）。
+// 设计依据：监控界面重构方案。
 // 红线：不调用 MonitorScreen 的私有 MonitorSectionCard / UfiSectionHeader（跨文件不可见/公共冻结），
 //       本文件内私有复制同风格 OverviewCard 与降级卡内分区标题；不新增 Token（色值/字体/圆角）；
 //       不新增 30dp 尺寸；不新增路由（顶部 Tab 内联切换）。
@@ -94,7 +94,7 @@ import com.ufi_axis.viewmodel.state.MonitorState
 import com.ufi_axis.ui.animation.rememberUfiPressed
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.components.common.UfiCustomDialog
-import com.ufi_axis.ui.components.common.UfiMotion
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 // 2026-08-14 需求2：长按事件卡的「更多操作」菜单 —— 复用项目标准 UfiPopupMenu，
@@ -1120,54 +1120,8 @@ private fun formatAlertTimeSmart(ms: Long): String {
     return if (at.toLocalDate() == LocalDate.now(zone)) TIME_HM.format(at) else TIME_MD_HM.format(at)
 }
 
-@Composable
-private fun EmptyTimelineState(
-    modifier: Modifier = Modifier,
-    // 2026-08-14 需求1：空态主/副文案可定制，默认绿盾（无异常事件 / 设备运行平稳）。
-    title: String = "暂无异常事件",
-    subtitle: String = "设备运行平稳",
-    // 2026-08-21 v16-followup P3：空态图标/色调可定制。默认绿盾+success（真无异常）；
-    // 筛选/搜索无命中时由调用方传入 SearchOff + textSecondary（中性灰，表示"无结果"而非"成功平稳"）。
-    icon: ImageVector = Icons.Default.Shield,
-    iconTint: Color? = null
-) {
-    val palette = LocalResolvedPalette.current
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        // 2026-08-09 10:55 紧凑化：圆环 68→56dp + 盾牌 32→28dp + 副文案缩短。配合 MonitorScreen 去掉 weight(1f)，
-        // 整体空态卡高度从占满屏幕（500+dp）→ ~180dp，不再突兀巨大。
-        Box(
-            modifier = Modifier
-                .size(56.dp)
-                .clip(CircleShape)
-                .background(Brush.linearGradient(listOf(palette.accent.copy(alpha = 0.12f), palette.accentSecondary.copy(alpha = 0.18f)))),
-            contentAlignment = Alignment.Center
-        ) {
-            val tint = iconTint ?: palette.success
-            Icon(
-                imageVector = icon,
-                contentDescription = null,
-                tint = tint,
-                modifier = Modifier.size(28.dp)
-            )
-        }
-        Spacer(Modifier.height(Spacing.Small))
-        Text(
-            text = title,
-            style = UfiTextStyles.cardTitle,
-            color = palette.textPrimary
-        )
-        Spacer(Modifier.height(2.dp))
-        Text(
-            text = subtitle,
-            style = MaterialTheme.typography.bodySmall,
-            color = palette.textSecondary
-        )
-    }
-}
+// 2026-09-08：`EmptyTimelineState` 已删除 —— 它只服务于同日删掉的 MonitorEventList。
+// 事件中心的空态现在统一走公共 UfiEmptyState（与筛选无命中、本页无事件同一套观感）。
 
 /** 事件分类 type → 中文标签（时间轴卡片副文案） */
 fun alertTypeLabel(type: String): String = when (type) {
@@ -1782,41 +1736,8 @@ private fun alertThresholdLine(valueStr: String, thresholdStr: String, fallback:
     }
 }
 
-/**
- * v30 事件中心列表：扁平 Column（可被外层 verticalScroll 嵌套）+ MonitorEventCard，空态走
- * [EmptyTimelineState]。调用方在外面做分页，避免单页数百个 Composable 同步组合卡顿。
- *
- * 2026-08-26：删掉 `useColumn` / `groupByDay` / `bottomContentPadding` 与随之而来的 LazyColumn
- * 按天分组分支 —— 唯一调用点一直传 `useColumn = true`，那条分支从 v30 起就永远走不到，
- * 而且它把 groupAlertsByDay 的英文 key（today/yesterday/earlier）当标题直接显示，本身就是坏的。
- */
-@Composable
-fun MonitorEventList(
-    alerts: List<AlertRecord>,
-    onAckOne: (Long) -> Unit,
-    onDelete: ((Long) -> Unit)? = null,
-    modifier: Modifier = Modifier,
-    horizontalPadding: androidx.compose.ui.unit.Dp = 16.dp,
-    emptyTitle: String = "暂无符合条件的事件",
-    emptySubtitle: String = "调整筛选条件试试"
-) {
-    if (alerts.isEmpty()) {
-        EmptyTimelineState(
-            title = emptyTitle,
-            subtitle = emptySubtitle,
-            icon = Icons.Default.Shield,
-            modifier = modifier.fillMaxWidth().padding(horizontal = horizontalPadding)
-        )
-        return
-    }
-    Column(modifier = modifier.padding(top = 2.dp)) {
-        alerts.forEach { alert ->
-            MonitorEventCard(
-                alert = alert,
-                onAckOne = onAckOne,
-                onDelete = onDelete,
-                modifier = Modifier.padding(horizontal = horizontalPadding, vertical = 4.dp)
-            )
-        }
-    }
-}
+// 2026-09-08：`MonitorEventList`（扁平 Column + forEach）已删除 —— 事件中心改成 LazyColumn，
+// 每条事件是一个 items(...)，直接调 MonitorEventCard，空态由调用点的 UfiEmptyState 提供。
+// 那个包装正是它注释里想避免的问题本身：整页事件一次性全部组合。
+
+

@@ -1,13 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, shallowRef } from 'vue';
-import type {
-  DashboardData,
-  SignalInfo,
-  CpuInfo,
-  TrafficRealtime,
-  BatteryInfo,
-  MemoryInfo,
-} from '@/types';
+import type { DashboardData, SignalInfo, CpuInfo, TrafficRealtime, BatteryInfo, MemoryInfo } from '@/types';
 
 /** 实时推送频道 → 对应载荷类型（与 WsChannel 对齐）。 */
 type RealtimeType = 'signal' | 'cpu' | 'traffic' | 'battery' | 'memory';
@@ -29,10 +22,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     lastUpdated.value = Date.now();
   }
 
-  function updateRealtime(
-    type: RealtimeType,
-    data: SignalInfo | CpuInfo | TrafficRealtime | BatteryInfo | MemoryInfo,
-  ) {
+  function updateRealtime(type: RealtimeType, data: SignalInfo | CpuInfo | TrafficRealtime | BatteryInfo | MemoryInfo) {
     switch (type) {
       case 'signal':
         realtimeSignal.value = data as SignalInfo;

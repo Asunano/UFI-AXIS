@@ -8,6 +8,8 @@ import com.ufi_axis_core.core.database.AlertRecord
 import com.ufi_axis_core.core.database.TypeCount
 import com.ufi_axis_core.core.database.LevelCount
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.notify.NotificationDispatcher
+import com.ufi_axis_core.notify.PushChannel
 import com.ufi_axis_core.util.NotificationPushService
 import com.ufi_axis_core.util.PushNotification
 import kotlinx.coroutines.test.runTest
@@ -57,6 +59,8 @@ class AlertEngineDedupTest {
 
         override suspend fun getRecentAlerts(limit: Int): List<AlertRecord> =
             rows.sortedByDescending { it.timestamp }.take(limit)
+
+        override suspend fun getCount(): Int = rows.size
 
         override suspend fun getAlertsBetween(startTime: Long, endTime: Long): List<AlertRecord> =
             rows.filter { it.timestamp in startTime..endTime }.sortedByDescending { it.timestamp }
@@ -166,7 +170,7 @@ class AlertEngineDedupTest {
      */
     private class RecordingPushService : NotificationPushService {
         val pushed = mutableListOf<PushNotification>()
-        override fun push(notification: PushNotification) { pushed.add(notification) }
+        override fun push(notification: PushNotification, mirrorToAlertTopic: Boolean) { pushed.add(notification) }
     }
 
     /** 静默 WebSocketManager 实例（final class 不可继承，仅持有字段、无连接时无副作用）。 */
@@ -182,7 +186,14 @@ class AlertEngineDedupTest {
         ws = WebSocketManager(null)
         push = RecordingPushService()
         val settings = AppSettings(ApplicationProvider.getApplicationContext<Application>())
-        engine = AlertEngine(dao, ws, settings, push)
+        engine = AlertEngine(dao, ws, settings)
+        // 2026-09-08 阶段 1：投递改走分发器。这里注册一个只有 push 渠道的分发器，
+        // 断言仍观测 `push.pushed`（推送负载才是对外真实语义），顺带覆盖
+        // 「聚合更新只走 push、不走邮件」那条 channels 限定 —— 因为这里没注册 mail 渠道，
+        // 一旦哪天聚合路径改成投全部渠道，本类的断言不会变，但 NotificationDispatcherTest 会红。
+        val dispatcher = NotificationDispatcher()
+        dispatcher.register(PushChannel(push))
+        engine.attachNotifier { event -> dispatcher.emit(event) }
         // 2026-09-07：告警默认不开启（enabled=false，且 perType 缺键视为关闭）。
         // 本类测的是去重/聚合/环形上限语义，故显式把要用到的类型全部打开；
         // 「总开关关闭」的短路语义由 `enabled false shorts all checks` 单独覆盖。

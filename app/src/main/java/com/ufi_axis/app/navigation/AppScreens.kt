@@ -59,6 +59,11 @@ private fun rawAppScreens(
     Routes.DETAIL_SPEED_TEST to { _, nc -> SpeedTestScreen(viewModel, nc) },
     Routes.DETAIL_TRAFFIC_MGMT to { _, nc -> TrafficManagementScreen(viewModel, nc) },
     Routes.DETAIL_SMS to { _, nc -> SmsScreen(viewModel, nc) },
+    Routes.DETAIL_SMS_SETTINGS to { _, nc -> SmsSettingsScreen(viewModel, nc) },
+    // 拦截规则 / 已拦截：2026-09-08 从原来的双 Tab 页拆成两条无参路由，各自一个入口。
+    Routes.DETAIL_SMS_FILTER_RULES to { _, nc -> SmsFilterRulesScreen(viewModel, nc) },
+    Routes.DETAIL_SMS_BLOCKED to { _, nc -> SmsBlockedScreen(viewModel, nc) },
+
     Routes.DETAIL_APPS to { _, nc ->
         val ctx = LocalContext.current
         val prefs = remember { AppPreferences(ctx) }
@@ -66,16 +71,21 @@ private fun rawAppScreens(
     },
     Routes.DETAIL_TASKS to { _, nc -> TaskScreen(viewModel, nc) },
     Routes.DETAIL_EMAIL_NOTIFY to { _, nc -> EmailNotifyScreen(viewModel, nc) },
+    // 推送渠道总览 → Webhook 配置（2026-09-09 新增）。
+    // 渠道页里的「邮件」行指向上面同一个 EmailNotifyScreen，不做第二份。
+    Routes.DETAIL_PUSH_CHANNELS to { _, nc -> PushChannelsScreen(viewModel, nc) },
+    Routes.DETAIL_WEBHOOK_NOTIFY to { _, nc -> WebhookNotifyScreen(viewModel, nc) },
+    // 本机短信回发（2026-09-09 阶段 3）：唯一走信令网的渠道，按条计费。
+    Routes.DETAIL_LOCAL_SMS_NOTIFY to { _, nc -> LocalSmsNotifyScreen(viewModel, nc) },
     Routes.DETAIL_FILES to { _, nc -> FileManagerScreen(viewModel, nc) },
     Routes.DETAIL_DEBUG_LOG to { _, nc -> DebugLogScreen(viewModel, nc) },
     Routes.DETAIL_DIAGNOSE to { _, nc -> DiagnoseScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR to { _, nc -> MonitorScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR_SETTINGS to { _, nc -> MonitorSettingsScreen(viewModel, nc) },
-    // 监控设置的 5 个分组：2026-09-03 改成独立路由（与 设置→服务器→服务器配置 同构）
+    // 监控设置的分组：2026-09-03 改成独立路由（与 设置→服务器→服务器配置 同构）
+    // 2026-09-08 少了 metrics / behavior 两条（分别并入 collection 的弹窗与 storage 的导出区）
     Routes.DETAIL_MONITOR_COLLECTION to { _, nc -> MonitorCollectionSettingsScreen(viewModel, nc) },
-    Routes.DETAIL_MONITOR_METRICS to { _, nc -> MonitorMetricsSettingsScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR_CHART to { _, nc -> MonitorChartSettingsScreen(viewModel, nc) },
-    Routes.DETAIL_MONITOR_BEHAVIOR to { _, nc -> MonitorBehaviorSettingsScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR_SCHEDULER to { _, nc -> MonitorSchedulerSettingsScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR_STORAGE to { _, nc -> MonitorStorageSettingsScreen(viewModel, nc) },
     Routes.DETAIL_EVENTS to { _, nc -> EventsScreen(viewModel, nc) },
@@ -101,7 +111,17 @@ private fun rawAppScreens(
     Routes.DETAIL_ABOUT to { _, nc -> AboutDeviceScreen(viewModel, nc) },
     Routes.DETAIL_ALERT_SETTINGS to { _, nc -> AlertSettingsScreen(viewModel, nc) },
     Routes.DETAIL_DAILY_NOTIFY to { _, nc -> DailyNotifyScreen(viewModel, nc) },
+    // 通知管理：分类开关 / 免打扰 / 测试 / 设备告警 / 系统通知记录入口
+    Routes.DETAIL_NOTIFY_MANAGE to { _, nc -> NotifyManageScreen(viewModel, nc) },
+    // 两份记录各自独立成页（2026-09-08 从双 Tab 拆开）：
+    // 系统通知记录的入口在通知管理页，投递记录的入口在各条渠道自己的配置页
+    Routes.DETAIL_NOTIFY_HISTORY to { _, nc -> SystemNotifyHistoryScreen(viewModel, nc) },
+    // 投递记录：三条渠道共用一个 composable，channel 由路由参数带进来（缺省 mail）
+    Routes.DETAIL_DELIVERY_HISTORY to { entry, nc ->
+        DeliveryHistoryScreen(viewModel, nc, entry.arguments?.getString("channel") ?: "mail")
+    },
     Routes.DETAIL_BACKGROUND_GUARD to { _, nc -> BackgroundGuardScreen(viewModel, nc) },
+    Routes.DETAIL_BACKUP_RESTORE to { _, nc -> BackupRestoreScreen(viewModel, nc) },
     Routes.DETAIL_TUNNEL to { _, nc -> TunnelScreen(viewModel, nc) },
     // FIX-9：内网穿透三拆屏
     Routes.DETAIL_TUNNEL_FRP to { _, nc -> FrpDetailScreen(viewModel, nc) },
@@ -132,14 +152,5 @@ private fun rawAppScreens(
     Routes.FILE_EDITOR to { entry, nc ->
         val path = entry.arguments?.getString("path") ?: ""
         TextEditorScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
-    },
-    Routes.FILE_MEDIA to { entry, nc ->
-        val path = entry.arguments?.getString("path") ?: ""
-        val type = entry.arguments?.getString("type") ?: "video"
-        MediaScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"), type)
-    },
-    Routes.FILE_IMAGE to { entry, nc ->
-        val path = entry.arguments?.getString("path") ?: ""
-        ImageViewerScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
     }
 )

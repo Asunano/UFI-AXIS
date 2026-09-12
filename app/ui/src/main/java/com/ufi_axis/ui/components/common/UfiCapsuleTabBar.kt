@@ -29,7 +29,7 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import com.ufi_axis.ui.animation.UfiAnimSpecs
+import com.ufi_axis.ui.theme.UfiAnimSpecs
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.navigation.LocalUfiCapsuleSelectionProgress
 import com.ufi_axis.ui.navigation.ufiNavTransitionDurationMs
@@ -57,6 +57,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import com.ufi_axis.ui.theme.UfiMotion
 
 /**
  * 悬浮胶囊导航栏的单个 Tab 描述。
@@ -129,10 +130,13 @@ internal fun capsuleScaleOf(progress: Float): Float =
     COLLAPSED_SCALE + (1f - COLLAPSED_SCALE) * progress.coerceIn(0f, 1f)
 
 /**
- * 展开进度弹簧：临界阻尼（无过冲）+ 较高刚度，整段展开/收回约 0.25s。
+ * 展开进度弹簧：临界阻尼（无过冲），整段展开/收回约 0.3s。
  *
- * 2026-09-01 从 StiffnessMedium 提到 3000f：远程多页扫场已压到 ~320ms，
- * 原来 ~0.4s 的展开会比页面**晚**到位，观感就是「页面都换完了胶囊还在长大」。
+ * 2026-09-01 曾从 StiffnessMedium 提到 3000f（≈0.15s），理由是"别比页面转场晚到位"。
+ * 2026-09-08 回到 900f（≈0.3s）：3000f 让胶囊在 0.15s 内"咚"地长到位，而标签是
+ * [LABEL_FADE_IN_MS]=320ms 的 tween —— 一次交互被拆成"胶囊先跳、字后显影"两段，
+ * 这正是「文字显示消失太突兀」的来源。现在两条动画的时长同量级，读起来是一段运动。
+ * 仍然是 spring（护栏 `EXPAND_SPRING` 必须含字面 `spring(`，防止有人换成 snap）。
  */
 private val EXPAND_SPRING: AnimationSpec<Float> =
     spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = UfiAnimSpecs.CapsuleExpandStiffness)
@@ -481,6 +485,30 @@ private const val LABEL_FADE_OUT_MS: Int = 220
  * 文字若再自带 6dp，两段位移叠起来就是 13dp 的"窜动"。3dp 只作为文字相对整组的一点延迟感。
  */
 private val LABEL_RISE: Dp = 3.dp
+
+/**
+ * 标签淡入时的起始缩放（2026-09-08）。
+ *
+ * 只做 alpha 时，10sp 的小字在人眼里近似"有 / 无"两态 —— 用户说的"突兀"有一半来自这里。
+ * 0.92 是"看得出在长大、又不至于变形"的一档：字高 10sp ≈ 13px，8% 只有 1px 左右的尺度变化，
+ * 不会与胶囊整体缩放叠成明显形变（那正是 2026-09-03 撤掉图标独立缩放的原因）。
+ */
+private const val LABEL_SCALE_FROM: Float = 0.92f
+
+/**
+ * 收起态单个 Tab 的格宽（2026-09-08）。
+ *
+ * 展开态格宽是 [TAB_MIN_W]（62dp，要容下"仪表盘"这类三字标签）；收起态只剩一个 26dp 图标，
+ * 62dp 的格子让整条胶囊白占 ~340dp，观感是"一条横贯屏幕的长条"。收起时按本值把格宽收窄，
+ * 整条约 2×[PAD] + 5×46 + 4×[GAP] ≈ 260dp。
+ *
+ * 为什么不是"图标宽 + 内边距"（36dp）：格宽同时是**点击目标**宽度，且收起态还要再乘
+ * [COLLAPSED_SCALE]（0.86）。46dp × 0.86 ≈ 40dp 是仍可稳定命中的下限；36dp 会掉到 31dp。
+ *
+ * 插值进度用的是 [labelReveal] 而不是展开弹簧：格宽变化必须与标签的显隐同步，
+ * 否则字还在淡出、格子已经收窄，文字会被横向裁掉一半。
+ */
+private val COLLAPSED_TAB_WIDTH: Dp = 46.dp
 
 /**
  * 收起态胶囊底色的不透明度系数（2026-09-04）。
@@ -977,13 +1005,25 @@ fun UfiCapsuleTabBar(
                 val sliderMeasurable = measurables.first()
                 val tabMeasurables = measurables.drop(1)
 
-                val maxWidth = tabMeasurables.maxOf {
+                val expandedCellPx = tabMeasurables.maxOf {
                     it.maxIntrinsicWidth(Constraints.Infinity)
                 }.coerceAtLeast(minTabPx)
                     // 窄屏 / 放大 UI 缩放兜底：格宽加宽到 62dp 后整条约 340dp，
                     // 已经接近 360dp 窄屏的上限。窗口是 wrap-content，超出会被直接裁掉
                     //（本 Layout 原来完全无视入参约束），所以这里按可用宽度回收一次。
                     .coerceAtMost(availableTabPx(constraints, tabs.size, padPx, gapPx))
+
+                // 2026-09-08：格宽随标签显隐插值 —— 收起态收窄到 COLLAPSED_TAB_WIDTH，整条约 260dp
+                //（原来恒为展开宽 62dp × 5 ≈ 340dp，收起只是整体缩放 0.86，左右仍占满一条）。
+                // 进度取 labelReveal 而不是 expandProgress：格宽与文字必须同步，
+                // 否则字还在淡出、格子已经收窄，文字会被横向裁掉。
+                // 每帧重测只涉及 5 个 Tab，代价可忽略；滑块的步进 stepPx 也跟着一起变，
+                // 所以药丸永远对齐当前格心。
+                val revealForWidth = labelReveal.value.coerceIn(0f, 1f)
+                val collapsedCellPx = COLLAPSED_TAB_WIDTH.roundToPx().coerceAtMost(expandedCellPx)
+                val maxWidth = (collapsedCellPx + (expandedCellPx - collapsedCellPx) * revealForWidth)
+                    .roundToInt()
+                    .coerceAtLeast(1)
 
                 val placeables = tabMeasurables.map {
                     it.measure(Constraints.fixedWidth(maxWidth))
@@ -1018,7 +1058,12 @@ fun UfiCapsuleTabBar(
                     sliderCollapsedInsetPx = collapsedInset
                 }
 
-                val intrinsicSize = IntSize(totalWidth, totalHeight)
+                // 报给窗口宿主的"自然尺寸"恒取**展开态**宽度：窗口尺寸每帧改一次
+                // 会走 WindowManager.updateViewLayout（跨进程），而内容在窗口里是居中的，
+                // 收窄时留白即可，不需要窗口跟着缩。
+                val expandedTotalWidth =
+                    padPx * 2 + expandedCellPx * tabs.size + gapPx * (tabs.size - 1)
+                val intrinsicSize = IntSize(expandedTotalWidth, totalHeight)
                 if (naturalSize.value != intrinsicSize) {
                     naturalSize.value = intrinsicSize
                 }
@@ -1219,6 +1264,13 @@ private fun CapsuleTab(
                         val reveal = labelReveal().coerceIn(0f, 1f)
                         alpha = reveal
                         translationY = (1f - reveal) * LABEL_RISE.toPx()
+                        // 2026-09-08：补一点同步缩放。只靠 alpha 时文字是"整块变透明"，
+                        // 在 10sp 这种小字号上人眼几乎只看到"有/无"两态；配上 0.92→1 的缩放，
+                        // 淡入过程本身有了尺度变化，才读得出"长出来"而不是"被打开"。
+                        // 轴心放在文字中心（默认），所以左右同时向外展开，不会偏向一侧。
+                        val s = LABEL_SCALE_FROM + (1f - LABEL_SCALE_FROM) * reveal
+                        scaleX = s
+                        scaleY = s
                     }
             )
         }

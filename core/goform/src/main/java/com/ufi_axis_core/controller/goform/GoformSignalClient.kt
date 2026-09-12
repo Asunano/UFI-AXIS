@@ -22,10 +22,9 @@ import kotlinx.serialization.json.*
  *
  * 本类的返回值是**对外契约的一部分**：已迁移的方法返回 `DeviceFields` 里的 canonical key，
  * 设备侧字段名由 [profile] 吸收。加字段/换设备只改 profile，route 与客户端都不动。
- * 详见 `docs/plans/DEVICE-ADAPTER-PLAN.md`。
  *
- * [profile] 传 `null` 即整层短路成原样透传（一键回退，见计划书原则 11）。
- * 尚未迁移的方法仍是透传，迁移进度见计划书 §4。
+ * [profile] 传 `null` 即整层短路成原样透传（一键回退）。
+ * 尚未迁移的方法仍是透传。
  */
 class GoformSignalClient(
     private val client: GoformClient,

@@ -10,7 +10,6 @@ import com.ufi_axis.util.AppJson
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.decodeFromJsonElement
 import com.ufi_axis.data.repository.WebSocketRepository
-import com.ufi_axis.data.repository.ConnectionState
 import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.util.*
 import com.ufi_axis_core.util.UiFrameGate
@@ -120,12 +119,27 @@ class DashboardModule(
         )
     }
 
-    // ── 设备离线/上线状态机（T03, N5/N6） ──
-    // 规则：仅「曾连接成功」后启动离线计时器（防 App 重启误报）；
-    // 非 CONNECTED 持续 60s → 发一次离线通知；恢复 CONNECTED → 成对发上线通知（含离线时长）。
-    private var wsEverConnected = false          // 本次进程内是否曾 CONNECTED
-    private var offlineSinceMs: Long = 0L        // 进入非 CONNECTED 的时刻（0=未在离线）
-    private var offlineTimerJob: Job? = null     // 60s 离线确认计时器
+    /**
+     * 这条推送是不是「看着像告警但不是告警记录」的类型（`download` / `tunnel`）。
+     *
+     * 2026-09-07：这两种推送 core **不写 alert_records** —— 包进 [parsePushedAlert] 塞进
+     * `MonitorState.alerts` 只会让事件中心多出两条列表里查不到的"告警"，还会推进告警游标。
+     * 而它们的系统通知已经由 `:ufi_notify` 的 `NotifyService` 渲染
+     * （`notifyDownloadResult` / `notifyTunnelFailure`），再走 `maybeNotifyNewAlerts`
+     * 就是同一个事件渲染两遍：app 在前台时主进程还会把它转交给通知进程。
+     *
+     * 判定与「只提醒一次」的记账全在 core（`DownloadManager.notifyTaskResult` /
+     * `TunnelManager.notifyGiveUp`），app 这边只是丢弃，不做任何判断。
+     *
+     * 两条 WS 分支都要用它：`WebSocketPushService.push` 把同一份载荷同时广播到
+     * `notification` 与 `alert` 两个频道。将来若有页面需要跟着刷新（如下载列表），
+     * 单独接一条明确的路径，别再把它们塞回告警流。
+     */
+    private fun isNonAlertPush(dataObj: JsonObject?): Boolean =
+        when (dataObj?.get("type")?.jsonPrimitive?.content) {
+            "download", "tunnel" -> true
+            else -> false
+        }
 
     // ── Init ──
     fun init() {
@@ -136,7 +150,6 @@ class DashboardModule(
         }
         collectWebSocketMessages()
         observeNetworkState()
-        observeWsConnectionState()
         
         // 注册跨进程广播监听：由独立进程 :ufi_notify 驱动主进程实时 Toast
         // NOT_EXPORTED：ACTION_NEW_ALERTS 是应用内部 action，无需也不应接受外部应用投递
@@ -160,8 +173,6 @@ class DashboardModule(
         try { appContext.unregisterReceiver(alertReceiver) } catch (_: Exception) {}
         refreshJob?.cancel()
         saveDebounceJob?.cancel()
-        offlineTimerJob?.cancel()
-        offlineTimerJob = null
         webSocketRepository.disconnect()
         cacheManager.shutdown()
     }
@@ -320,17 +331,25 @@ class DashboardModule(
                             // 2026-08-25：优先尝试直接处理推送数据，失败则回退拉取列表
                             try {
                                 val dataObj = message.data as? JsonObject
-                                if (dataObj != null && dataObj.containsKey("message")) {
-                                    val pushedAlert = parsePushedAlert(dataObj)
-                                    // 直接更新本地列表状态（追加到最前面，并限制最大数量）
-                                    _monitorState.update { s ->
-                                        val next = (listOf(pushedAlert) + s.alerts.filter { it.id != pushedAlert.id }).take(500)
-                                        s.copy(alerts = next)
+                                when {
+                                    // 下载 / 隧道不是告警记录，见 [isNonAlertPush]。
+                                    // 这里也要挡：`WebSocketPushService.push` 把同一份载荷广播到
+                                    // `notification` **和** `alert` 两个频道，只挡下面那条分支拦不住。
+                                    isNonAlertPush(dataObj) -> Unit
+                                    dataObj != null && dataObj.containsKey("message") -> {
+                                        val pushedAlert = parsePushedAlert(dataObj)
+                                        // 直接更新本地列表状态（追加到最前面，并限制最大数量）
+                                        _monitorState.update { s ->
+                                            val next = (
+                                                listOf(pushedAlert) +
+                                                    s.alerts.filter { it.id != pushedAlert.id }
+                                                ).take(500)
+                                            s.copy(alerts = next)
+                                        }
+                                        // 触发系统通知/Toast
+                                        notificationCenter.maybeNotifyNewAlerts(listOf(pushedAlert))
                                     }
-                                    // 触发系统通知/Toast
-                                    notificationCenter.maybeNotifyNewAlerts(listOf(pushedAlert))
-                                } else {
-                                    loadAlerts(_monitorState.value.alertRange, silent = true)
+                                    else -> loadAlerts(_monitorState.value.alertRange, silent = true)
                                 }
                             } catch (e: Exception) {
                                 DebugLog.e("Dashboard", "Parse pushed alert failed", e)
@@ -357,6 +376,8 @@ class DashboardModule(
                                         val snippet = extra?.get("snippet")?.jsonPrimitive?.content ?: ""
                                         notificationCenter.notifyNewSms(sender, snippet)
                                     }
+                                } else if (isNonAlertPush(dataObj)) {
+                                    // 见 [isNonAlertPush]：下载 / 隧道不是告警记录，显式丢弃。
                                 } else if (dataObj != null) {
                                     val pushedAlert = parsePushedAlert(dataObj)
                                     _monitorState.update { s ->
@@ -385,41 +406,6 @@ class DashboardModule(
                         debounceSaveToCache()
                     }
                 } catch (e: Exception) { DebugLog.parseError("WS", "unknown", message.data?.toString() ?: "", e) }
-            }
-        }
-    }
-
-    // ── 设备离线/上线状态机（T03, N5/N6） ──
-    // 订阅 WebSocketRepository.connectionState：非 CONNECTED 持续 60s → 离线通知；
-    // 恢复 CONNECTED → 上线通知（离线时长）。计时器只在曾连接成功后启动。
-    private fun observeWsConnectionState() {
-        scope.launch {
-            webSocketRepository.connectionState.collect { state ->
-                val isConnected = state == ConnectionState.CONNECTED
-                if (isConnected) {
-                    // 恢复上线：取消计时器，成对发上线通知（含离线时长）
-                    val wasCountingOffline = offlineSinceMs > 0L
-                    offlineTimerJob?.cancel()
-                    offlineTimerJob = null
-                    // 无条件调用：成对判定与去重状态位都在 NotificationCenter 里（持久化的），
-                    // 这里的 offlineSinceMs 只是内存计时器 —— 进程被杀过就丢了，
-                    // 若按它闸门，上次"已报离线"的状态位就再没人清，之后真离线也报不出来。
-                    val durationMs = if (wasCountingOffline) System.currentTimeMillis() - offlineSinceMs else 0L
-                    offlineSinceMs = 0L
-                    notificationCenter.notifyDeviceConnectivity(offline = false, durationMs = durationMs)
-                    wsEverConnected = true
-                } else {
-                    if (!wsEverConnected) return@collect  // 从未连接成功：不误报
-                    if (offlineSinceMs == 0L) offlineSinceMs = System.currentTimeMillis()
-                    if (offlineTimerJob?.isActive == true) return@collect  // 计时中
-                    offlineTimerJob = scope.launch {
-                        delay(OFFLINE_CONFIRM_MS)
-                        // 60s 后仍非 CONNECTED → 离线通知（仅一次；NC 内部状态位去重）
-                        if (webSocketRepository.connectionState.value != ConnectionState.CONNECTED) {
-                            notificationCenter.notifyDeviceConnectivity(offline = true)
-                        }
-                    }
-                }
             }
         }
     }
@@ -627,11 +613,9 @@ class DashboardModule(
     companion object {
         /** 历史记录最大条数：360 ≈ 10秒间隔 × 1小时，UI 图表不需要完整24小时数据 */
         private const val MAX_HISTORY_RECORDS = 360
-        /** 离线确认时长（T03 N5）：WS 非 CONNECTED 持续此时间才发离线通知 */
-        private const val OFFLINE_CONFIRM_MS = 60_000L
         /** T12 告警页大小：core 把 limit 钳制在 1..200，传更大只会被静默截断 */
         private const val ALERT_PAGE_SIZE = com.ufi_axis_core.contract.Alerts.ListQuery.LIMIT_MAX
-        /** T12 翻页安全上限：10 × 200 = 2000 = AlertConfig.maxRows 默认值（core 环形表容量） */
+        /** T12 翻页安全上限：10 × 200 = 2000 = core 环形表 `MAX_ALERT_ROWS` 容量 */
         private const val ALERT_MAX_PAGES = 10
     }
 
@@ -784,6 +768,49 @@ class DashboardModule(
         }
     }
 
+    /**
+     * 按类批量清理（2026-09-09：存储管理的清理弹窗支持多选范围）。
+     *
+     * core 的 `POST /api/monitor/clean` 一次只吃一个 `type`，所以多类只能逐个发。这里刻意
+     * **在同一个协程里顺序发**，而不是让 UI 循环调 [cleanHistory]：
+     * - 那样会同时起 N 个协程 → N 个并发 POST 打向设备那台单线程 HTTP 服务；
+     * - 每个都会各自写一次 `cleanMessage`、各自触发一次历史 + 存储统计重载，
+     *   最后 toast 只剩最后一条、统计被刷 N 遍。
+     *
+     * 现在：逐个清完汇总成一条消息，历史与统计各只重载一次。
+     * 单类失败不中断后面的（用户选了 5 类，不该因为第 2 类超时就放弃剩下 3 类），
+     * 失败数量并入结果文案 —— 不能只报成功数，那会把"部分失败"说成全成功。
+     *
+     * **全选不要走这里**：调用方应短路成 `cleanHistory(type = "all")` 一个请求
+     *（是否"全选"取决于 UI 那份可清理表清单，本层不做判断）。
+     */
+    fun cleanHistoryBatch(types: List<String>, days: Int) {
+        if (types.isEmpty()) return
+        scope.launch {
+            _monitorState.update { it.copy(cleanMessage = null) }
+            var totalDeleted = 0
+            var failedCount = 0
+            types.forEach { type ->
+                try {
+                    totalDeleted += api.cleanHistory(CleanHistoryRequest(type, days)).deleted.values.sum()
+                } catch (_: Exception) {
+                    failedCount++
+                }
+            }
+            _monitorState.update {
+                it.copy(
+                    cleanMessage = if (failedCount == 0) {
+                        "已清理 $totalDeleted 条记录"
+                    } else {
+                        "已清理 $totalDeleted 条记录，$failedCount 类清理失败"
+                    }
+                )
+            }
+            loadMonitorHistory(_monitorState.value.selectedHours)
+            loadMonitorStorage()
+        }
+    }
+
     fun clearMonitorMessage() {
         _monitorState.update { it.copy(cleanMessage = null, errorMessage = null) }
     }
@@ -819,9 +846,9 @@ class DashboardModule(
      * core 把 `limit` 钳制在 1..200（`Alerts.ListQuery`），旧代码传 `limit = 5000` 时
      * **服务端静默截断成 200 条** —— "全量"其实只有 200 条，统计与列表都偏少。
      *
-     * 页大小取 contract 的 `LIMIT_MAX`，页数上限取 `AlertConfig.maxRows` 默认值 / 页大小：
-     * core 侧 alert_records 是环形表（超过 maxRows 自动淘汰最旧），所以 10 页 = 2000 条
-     * 已覆盖服务端可能保留的全部记录，本地按整表聚合的未读数/分类计数因此仍然准确
+     * 页大小取 contract 的 `LIMIT_MAX`，页数上限取 core 环形表容量 / 页大小：
+     * core 侧 alert_records 是环形表（超过 `AlertEngine.MAX_ALERT_ROWS` = 2000 自动淘汰最旧），
+     * 所以 10 页 = 2000 条已覆盖服务端可能保留的全部记录，本地按整表聚合的未读数/分类计数因此仍然准确
      * （这也是没有改用响应里 `counts` 的原因：UI 的计数还叠了客户端日期/已读过滤，
      * 直接换成服务端计数会改变语义；真正需要服务端计数的是 T40 的服务端过滤场景）。
      */
