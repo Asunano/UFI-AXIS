@@ -5,6 +5,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.update.SharedPreferencesCoreUpdatePersistence
 import com.ufi_axis.data.model.BatteryInfo
 import com.ufi_axis.data.model.CpuInfo
 import com.ufi_axis.data.model.MemoryInfo
@@ -90,6 +91,12 @@ class MainViewModel(
     // P2 多端同步：告警配置仓库（core 唯一真源镜像；连接即拉取，绝不推送默认）
     val alertPrefs = AlertPrefsRepository()
 
+    /**
+     * Core 自更新「进行中」标记持久化（[com.ufi_axis.data.update.CoreUpdatePersistence]）。
+     * 供 [tools] 写入（用户确认更新 Core 时）与 [updatePrompt] 读取（冷启动接管进度显示）。
+     */
+    private val coreUpdatePersistence = SharedPreferencesCoreUpdatePersistence(appContext)
+
     val dashboard = DashboardModule(api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs)
 
     /**
@@ -104,7 +111,7 @@ class MainViewModel(
     private val crossModuleEventSink = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
 
     val network by lazy { NetworkModule(api, appContext, viewModelScope, crossModuleEventSink) }
-    val tools by lazy { ToolsModule(api, appContext, viewModelScope, crossModuleEventSink, alertPrefs) }
+    val tools by lazy { ToolsModule(api, appContext, viewModelScope, crossModuleEventSink, alertPrefs, coreUpdatePersistence) }
     val files by lazy { FileManagerModule(api, appContext, FileShortcutRepository(appContext), viewModelScope) }
     val apps by lazy { AppManagerModule(api, appContext, viewModelScope) }
     val downloads by lazy { DownloadModule(appContext, viewModelScope) }
@@ -126,7 +133,9 @@ class MainViewModel(
             scope = viewModelScope,
             appUpdate = tools.frontendUpdateState,
             coreUpdate = dashboard.updateState,
-            coreInstallStatus = tools.updateDeviceState
+            coreInstallStatus = tools.updateDeviceState,
+            coreUpdatePersistence = coreUpdatePersistence,
+            onResumeCorePolling = { tools.startDeviceUpdatePolling() }
         )
     }
 

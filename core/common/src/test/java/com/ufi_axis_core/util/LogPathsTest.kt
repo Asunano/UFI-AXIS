@@ -77,6 +77,20 @@ class LogPathsTest {
         )
     }
 
+    /** 2026-09-12 新增的 core 分类子目录（update/launcher/goform/crash），参考 app 端 log/app/<分类>/。 */
+    @Test
+    fun `core 分类子目录路径`() {
+        assertEquals("/sdcard/Download/UFI-AXIS/log/core/update/update.log", LogPaths.updateLogPath())
+        assertEquals("/sdcard/Download/UFI-AXIS/log/core/launcher/launcher.log", LogPaths.launcherLogPath())
+        assertEquals("/sdcard/Download/UFI-AXIS/log/core/goform/goform.log", LogPaths.goformLogPath())
+        assertEquals("/sdcard/Download/UFI-AXIS/log/core/crash/crash.log", LogPaths.crashLogPath())
+        // 不能破坏旧契约：LogPaths.file(CORE,"update.log") 仍是平铺写法（供其它调用方），与新分类路径不同
+        assertEquals(
+            "/sdcard/Download/UFI-AXIS/log/core/update.log",
+            LogPaths.file(LogPaths.Component.CORE, "update.log")
+        )
+    }
+
     /**
      * 探测顺序：**emulated 在前、sdcard 在后**。
      *
@@ -114,7 +128,11 @@ class LogPathsTest {
     fun `拼出来的路径没有多余斜杠`() {
         val all = LogPaths.Component.entries.flatMap {
             LogPaths.dirCandidates(it) + LogPaths.fileCandidates(it, "x.log")
-        } + listOf(LogPaths.appRoot(), LogPaths.logRoot())
+        } + listOf(
+            LogPaths.appRoot(), LogPaths.logRoot(),
+            LogPaths.updateLogPath(), LogPaths.launcherLogPath(),
+            LogPaths.goformLogPath(), LogPaths.crashLogPath()
+        )
         for (p in all) {
             assertTrue("$p 含有 //", "//" !in p)
             assertTrue("$p 以斜杠结尾", !p.endsWith("/"))

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 日志落在 getExternalFilesDir(null)/log/ -->
+    <external-files-path
+        name="logs"
+        path="log/" />
+    <!-- 外存不可用时的回退位置 -->
+    <files-path
+        name="internal_logs"
+        path="log/" />
+    <!-- 解出的 APK 缓存（当前不分享，保留以便排查） -->
+    <cache-path
+        name="apk_cache"
+        path="ufi-axis-core/" />
+</paths>

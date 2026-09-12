@@ -26,6 +26,8 @@ import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import com.ufi_axis_core.util.ArchiveExtractors
 
 /**
  * 文件管理路由 — 无 root 的本地文件管理器（基础 NAS 能力）。
@@ -109,6 +111,18 @@ class FileRoutes {
                 .ifBlank { "download" }
             val encoded = URLEncoder.encode(fileName, "UTF-8").replace("+", "%20")
             return "$disposition; filename=\"$ascii\"; filename*=UTF-8''$encoded"
+        }
+
+        /** 由文件名判定可解压的归档类型；rar/7z 等需原生库，这里不支持。 */
+        internal fun archiveKindOf(name: String): String? {
+            val lower = name.lowercase()
+            return when {
+                lower.endsWith(".zip") -> "zip"
+                lower.endsWith(".tar.gz") || lower.endsWith(".tgz") -> "tgz"
+                lower.endsWith(".tar") -> "tar"
+                lower.endsWith(".gz") -> "gz"
+                else -> null
+            }
         }
     }
 
@@ -583,6 +597,148 @@ class FileRoutes {
                     call.respondFail(HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "Upload failed: ${e.message}")
                 }
             }
+
+            // ───────── 归档操作：解压 / 压缩 / 校验和 ─────────
+
+            /**
+             * 解压。支持 zip / tar / tar.gz(.tgz) / 单文件 gz。
+             * body: { path: 压缩包绝对路径, destination?: 解压目标目录（缺省 = 同目录下去扩展名的同名文件夹） }
+             * 所有源/目标路径都走 safeResolveForRead / safeResolve + isUserStoragePath 校验，防越权与 zip-slip。
+             */
+            post("/extract") {
+                val body = call.receiveJsonObject()
+                val archivePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                val destReq = body["destination"]?.jsonPrimitive?.contentOrNull
+                val realArchive = safeResolveForRead(archivePath) ?: run {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
+                    return@post
+                }
+                val src = File(realArchive)
+                if (!src.isFile) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "不是文件或不存在")
+                    return@post
+                }
+                val kind = archiveKindOf(src.name)
+                if (kind == null) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "不支持的压缩格式：${src.name}")
+                    return@post
+                }
+                val destDir = if (destReq.isNullOrBlank()) {
+                    File(src.parentFile ?: File(INTERNAL_STORAGE), src.nameWithoutExtension.ifBlank { src.name + "_extracted" })
+                } else {
+                    val r = safeResolve(destReq) ?: run {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid destination")
+                        return@post
+                    }
+                    File(r)
+                }
+                if (!isUserStoragePath(destDir.canonicalPath)) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "目标路径不在用户存储范围内")
+                    return@post
+                }
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        destDir.mkdirs()
+                        when (kind) {
+                            "zip" -> src.inputStream().buffered().use { ArchiveExtractors.extractZip(it, destDir) }
+                            "tgz", "tar" -> src.inputStream().buffered().use { ArchiveExtractors.extractTar(it, destDir, gzip = kind == "tgz") }
+                            "gz" -> ArchiveExtractors.extractGz(
+                                src, destDir,
+                                src.name.removeSuffix(".gz").removeSuffix(".GZ").ifBlank { src.name + ".out" }
+                            )
+                        }
+                        true
+                    }.getOrDefault(false)
+                }
+                if (!ok) {
+                    call.respondFail(HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "解压失败（可能格式损坏或含非法路径）")
+                    return@post
+                }
+                call.respond(toJsonElement(mapOf("success" to true, "destination" to destDir.absolutePath, "kind" to kind)))
+            }
+
+            /**
+             * 压缩。把一个或多个源打成一个 zip。
+             * body: { paths: [绝对路径...], destination?: 目标 zip 路径（缺省 = 首源同目录下 <首源名>.zip） }
+             * 目标已存在或与某源是同一文件时拒绝（避免覆盖/自包含）。
+             */
+            post("/compress") {
+                val body = call.receiveJsonObject()
+                val paths = body["paths"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }?.filter { it.isNotBlank() }.orEmpty()
+                val destReq = body["destination"]?.jsonPrimitive?.contentOrNull
+                if (paths.isEmpty()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "缺少源文件")
+                    return@post
+                }
+                val sources = paths.mapNotNull { safeResolveForRead(it) }
+                if (sources.size != paths.size) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "存在非法路径")
+                    return@post
+                }
+                val destFile = if (destReq.isNullOrBlank()) {
+                    val first = File(sources.first())
+                    File(first.parentFile ?: File(INTERNAL_STORAGE), "${first.nameWithoutExtension.ifBlank { "archive" }}.zip")
+                } else {
+                    val r = safeResolve(destReq) ?: run {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid destination")
+                        return@post
+                    }
+                    File(r)
+                }
+                if (!isUserStoragePath(destFile.canonicalPath)) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "目标路径不在用户存储范围内")
+                    return@post
+                }
+                if (destFile.exists()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "目标文件已存在")
+                    return@post
+                }
+                if (sources.any { File(it).canonicalPath == destFile.canonicalPath }) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "不能把压缩包压到自身")
+                    return@post
+                }
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        destFile.parentFile?.mkdirs()
+                        ArchiveExtractors.zipPaths(sources.map { File(it) }, destFile)
+                        destFile.exists()
+                    }.getOrDefault(false)
+                }
+                if (!ok) {
+                    call.respondFail(HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "压缩失败")
+                    return@post
+                }
+                call.respond(toJsonElement(mapOf("success" to true, "path" to destFile.absolutePath, "size" to destFile.length())))
+            }
+
+            /**
+             * 校验和。body: { path, algorithms? }；algorithms 缺省 [md5, sha1, sha256]，仅接受这四者（大小写不敏感）。
+             * 返回 { path, algorithms: { md5: "...", sha256: "..." } }。
+             */
+            post("/checksum") {
+                val body = call.receiveJsonObject()
+                val target = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                val requested = body["algorithms"]?.jsonArray?.mapNotNull { it.jsonPrimitive.contentOrNull }?.map { it.lowercase() }?.filter { it.isNotBlank() }
+                val algos = (requested?.takeIf { it.isNotEmpty() } ?: listOf("md5", "sha1", "sha256"))
+                    .distinct().filter { it in setOf("md5", "sha1", "sha256", "sha512") }
+                if (algos.isEmpty()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "不支持的算法")
+                    return@post
+                }
+                val real = safeResolveForRead(target) ?: run {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
+                    return@post
+                }
+                val f = File(real)
+                if (!f.isFile) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "不是文件或不存在")
+                    return@post
+                }
+                val results = withContext(Dispatchers.IO) {
+                    algos.associateWith { digestFile(f, it) }
+                }
+                call.respond(toJsonElement(mapOf("success" to true, "path" to real, "algorithms" to results)))
+            }
         }
     }
 
@@ -716,6 +872,27 @@ class FileRoutes {
             bytes >= kb -> String.format("%.0fK", bytes / kb)
             else -> "${bytes}B"
         }
+    }
+
+    /** 计算单文件指定算法的十六进制摘要（流式，不整文件入内存）。 */
+    private fun digestFile(f: File, algo: String): String {
+        val jvmName = when (algo) {
+            "md5" -> "MD5"
+            "sha1" -> "SHA-1"
+            "sha256" -> "SHA-256"
+            "sha512" -> "SHA-512"
+            else -> return ""
+        }
+        val md = MessageDigest.getInstance(jvmName)
+        f.inputStream().buffered(64 * 1024).use { ins ->
+            val buf = ByteArray(64 * 1024)
+            var n = ins.read(buf)
+            while (n > 0) {
+                md.update(buf, 0, n)
+                n = ins.read(buf)
+            }
+        }
+        return md.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun isSafePath(path: String): Boolean {

@@ -183,14 +183,30 @@ export function canPreview(f: FileEntry): boolean {
   return !f.isDirectory && previewKindOf(f.name || '') !== '';
 }
 
-/** 双击后的「打开」意图：媒体预览 → 文本编辑 → APK 安装 → 详情（不可在线打开） */
-export type OpenAction = 'preview' | 'text' | 'install' | 'info' | 'none';
+/** 双击后的「打开」意图：媒体预览 → 文本编辑 → APK 安装 → 解压 → 详情（不可在线打开） */
+export type OpenAction = 'preview' | 'text' | 'install' | 'extract' | 'info' | 'none';
+
+/** 归档类型：可解压的（zip/tar/tar.gz/单文件 gz）返回具体类型，rar/7z 等返回 null。 */
+export function archiveKindOf(name: string): 'zip' | 'tgz' | 'tar' | 'gz' | null {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.zip')) return 'zip';
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) return 'tgz';
+  if (lower.endsWith('.tar')) return 'tar';
+  if (lower.endsWith('.gz')) return 'gz';
+  return null;
+}
+
+/** 该文件能否被「解压」（rar/7z 需原生库，当前不支持，故为 false）。 */
+export function canExtract(f: FileEntry): boolean {
+  return !f.isDirectory && archiveKindOf(f.name) != null;
+}
 
 export function openActionOf(f: FileEntry): OpenAction {
   if (f.isDirectory) return 'none';
   if (canPreview(f)) return 'preview';
   if (isTextEditable(f)) return 'text';
   if (extOf(f.name) === 'apk') return 'install';
+  if (canExtract(f)) return 'extract';
   return 'info';
 }
 

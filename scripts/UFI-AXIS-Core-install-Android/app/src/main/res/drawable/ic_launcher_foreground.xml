@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Launcher icon foreground for the phone Core installer — a direct variant of
+  :core's launcher icon: the same donut mark (same scale / stroke weight) and
+  the same dark bottom badge strip, with the word "Install" in place of "Core".
+  Generated from the same badge geometry as :core (donut + strip copied
+  verbatim); only the glyph path differs (regenerated via fontTools, Arial,
+  centered at x=54 with cap height 6.43vp to match :core's "Core" placement).
+  Background strip + glyph colours live in ic_launcher_colors.xml (match :core).
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- badge strip, drawn first so the mark sits on top -->
+    <path
+        android:pathData="M0,78.4L108,78.4L108,108L0,108Z"
+        android:fillColor="@color/ic_launcher_glyph" />
+    <group
+        android:scaleX="2.5"
+        android:scaleY="2.5"
+        android:translateX="24.25"
+        android:translateY="24">
+        <path
+            android:pathData="M10,3.2a9,9 0 1,0 10.8,10.8a1,1 0 0,0 -1,-1h-3.8a4.1,4.1 0 1,1 -5,-5v-4a0.9,0.9 0 0,0 -1,-0.8"
+            android:strokeColor="@color/ic_launcher_glyph"
+            android:strokeWidth="1.25"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+        <path
+            android:pathData="M15,3.5a9,9 0 0,1 5.5,5.5h-4.5a9,9 0 0,0 -1,-1v-4.5"
+            android:strokeColor="@color/ic_launcher_glyph"
+            android:strokeWidth="1.25"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+    <!-- "Install" wordmark on the badge band (drawn in the background colour, inverse of the strip) -->
+    <group
+        android:scaleX="0.00432"
+        android:scaleY="-0.00432"
+        android:translateX="42.3548"
+        android:translateY="87.10643">
+        <path
+            android:pathData="M191.00 0.00V1466.00H385.00V0.00ZM704.00 0.00V1062.00H866.00V911.00Q983.00 1086.00 1204.00 1086.00Q1300.00 1086.00 1380.50 1051.50Q1461.00 1017.00 1501.00 961.00Q1541.00 905.00 1557.00 828.00Q1567.00 778.00 1567.00 653.00V0.00H1387.00V646.00Q1387.00 756.00 1366.00 810.50Q1345.00 865.00 1291.50 897.50Q1238.00 930.00 1166.00 930.00Q1051.00 930.00 967.50 857.00Q884.00 784.00 884.00 580.00V0.00ZM1771.00 317.00 1949.00 345.00Q1964.00 238.00 2032.50 181.00Q2101.00 124.00 2224.00 124.00Q2348.00 124.00 2408.00 174.50Q2468.00 225.00 2468.00 293.00Q2468.00 354.00 2415.00 389.00Q2378.00 413.00 2231.00 450.00Q2033.00 500.00 1956.50 536.50Q1880.00 573.00 1840.50 637.50Q1801.00 702.00 1801.00 780.00Q1801.00 851.00 1833.50 911.50Q1866.00 972.00 1922.00 1012.00Q1964.00 1043.00 2036.50 1064.50Q2109.00 1086.00 2192.00 1086.00Q2317.00 1086.00 2411.50 1050.00Q2506.00 1014.00 2551.00 952.50Q2596.00 891.00 2613.00 788.00L2437.00 764.00Q2425.00 846.00 2367.50 892.00Q2310.00 938.00 2205.00 938.00Q2081.00 938.00 2028.00 897.00Q1975.00 856.00 1975.00 801.00Q1975.00 766.00 1997.00 738.00Q2019.00 709.00 2066.00 690.00Q2093.00 680.00 2225.00 644.00Q2416.00 593.00 2491.50 560.50Q2567.00 528.00 2610.00 466.00Q2653.00 404.00 2653.00 312.00Q2653.00 222.00 2600.50 142.50Q2548.00 63.00 2449.00 19.50Q2350.00 -24.00 2225.00 -24.00Q2018.00 -24.00 1909.50 62.00Q1801.00 148.00 1771.00 317.00ZM3260.00 161.00 3286.00 2.00Q3210.00 -14.00 3150.00 -14.00Q3052.00 -14.00 2998.00 17.00Q2944.00 48.00 2922.00 98.50Q2900.00 149.00 2900.00 311.00V922.00H2768.00V1062.00H2900.00V1325.00L3079.00 1433.00V1062.00H3260.00V922.00H3079.00V301.00Q3079.00 224.00 3088.50 202.00Q3098.00 180.00 3119.50 167.00Q3141.00 154.00 3181.00 154.00Q3211.00 154.00 3260.00 161.00ZM4129.00 131.00Q4029.00 46.00 3936.50 11.00Q3844.00 -24.00 3738.00 -24.00Q3563.00 -24.00 3469.00 61.50Q3375.00 147.00 3375.00 280.00Q3375.00 358.00 3410.50 422.50Q3446.00 487.00 3561.00 565.00Q3561.00 565.00 3633.00 585.00Q3686.00 599.00 3793.00 612.00Q4011.00 638.00 4114.00 674.00Q4115.00 711.00 4115.00 721.00Q4115.00 831.00 4064.00 876.00Q3995.00 937.00 3859.00 937.00Q3732.00 937.00 3671.50 892.50Q3611.00 848.00 3582.00 735.00L3406.00 759.00Q3430.00 872.00 3485.00 941.50Q3540.00 1011.00 3644.00 1048.50Q3748.00 1086.00 3885.00 1086.00Q4021.00 1086.00 4106.00 1054.00Q4191.00 1022.00 4231.00 973.50Q4271.00 925.00 4287.00 851.00Q4296.00 805.00 4296.00 685.00V445.00Q4296.00 194.00 4307.50 127.50Q4319.00 61.00 4353.00 0.00H4165.00Q4137.00 56.00 4129.00 131.00ZM4114.00 533.00Q4016.00 493.00 3820.00 465.00Q3709.00 449.00 3663.00 429.00Q3617.00 409.00 3592.00 370.50Q3567.00 332.00 3567.00 285.00Q3567.00 213.00 3621.50 165.00Q3676.00 117.00 3781.00 117.00Q3885.00 117.00 3966.00 162.50Q4047.00 208.00 4085.00 287.00Q4114.00 348.00 4114.00 467.00ZM4571.00 0.00V1466.00H4751.00V0.00ZM5026.00 0.00V1466.00H5206.00V0.00Z"
+            android:fillColor="@color/ic_launcher_background" />
+    </group>
+</vector>

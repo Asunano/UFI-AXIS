@@ -133,8 +133,16 @@ internal object WebhookDelivery {
     /** Content-Type 是不是 JSON 类（决定 [renderBody] 走不走转义分支）。 */
     fun isJson(contentType: String): Boolean = contentType.contains("json", ignoreCase = true)
 
-    /** `{{key}}`。占位符定界符只有这一处，改法式样时不会有第二份。 */
-    private val PLACEHOLDER_TOKEN = Regex("""\{\{(\w+)}}""")
+    /**
+     * `{{key}}`。占位符定界符只有这一处，改法式样时不会有第二份。
+     *
+     * ⚠️ 右花括号必须转义（`\}\}` 而非 `}}`）：Kotlin/JVM 的 `java.util.regex` 容忍孤立的 `}`，
+     * 但 Android 端的 ICU 正则引擎（`com.android.icu.util.regex`）会把不成对的 `}` 判为
+     * 语法错误、抛 `PatternSyntaxException`。这一行在 `<clinit>` 阶段编译，ICU 报错会直接导致
+     * 本对象初始化失败、进而级联让引用它的 `WebhookConfig` 变成 `NoClassDefFoundError`，
+     * 表现为「下载完成后后端闪退 / Webhook 报后端不支持」。Desktop JVM 单测发现不了，只有真机崩。
+     */
+    private val PLACEHOLDER_TOKEN = Regex("""\{\{(\w+)\}\}""")
 
 
     /**

@@ -120,7 +120,7 @@ private val EXTENSION_KINDS: Map<String, FileKind> = buildMap {
         "html", "htm", "css", "js", "ts", "kt", "kts", "java", "gradle",
         "sh", "bash", "zsh", "py", "c", "cpp", "h", "hpp", "go", "rs", "sql", "env"
     ).forEach { put(it, FileKind.TEXT) }
-    listOf("zip", "tar", "gz", "bz2", "xz", "rar", "7z").forEach { put(it, FileKind.ARCHIVE) }
+    listOf("zip", "tgz", "tar", "gz", "bz2", "xz", "rar", "7z").forEach { put(it, FileKind.ARCHIVE) }
     put("apk", FileKind.APK)
     listOf("pdf", "doc", "docx", "odt", "xls", "xlsx", "ppt", "pptx")
         .forEach { put(it, FileKind.DOCUMENT) }

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 柔和灰影：近似参考设计稿 X:0 Y:4 模糊:16 #9CA4AC@30%，无模糊时以 2dp 下移的浅灰块近似 -->
+    <item
+        android:left="0dp"
+        android:top="2dp"
+        android:right="0dp"
+        android:bottom="0dp">
+        <shape android:shape="rectangle">
+            <solid android:color="@color/card_shadow" />
+            <corners android:radius="12dp" />
+        </shape>
+    </item>
+    <!-- 卡面：纯白 + 12dp 圆角 + 1dp 发丝描边（参考 ufiStandardCard） -->
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="@color/bg_card" />
+            <corners android:radius="12dp" />
+            <stroke
+                android:width="1dp"
+                android:color="@color/divider" />
+        </shape>
+    </item>
+</layer-list>

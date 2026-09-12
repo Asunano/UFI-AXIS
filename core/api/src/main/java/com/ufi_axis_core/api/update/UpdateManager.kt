@@ -71,7 +71,7 @@ class UpdateManager(
         runCatching { broadcaster("update", statusToMap()) }
     }
 
-    /** 将更新关键事件写入 Download/UFI-AXIS/log/core/update.log（便于手机端/ADB 取回排查）。 */
+    /** 将更新关键事件写入 Download/UFI-AXIS/log/core/update/update.log（便于手机端/ADB 取回排查）。 */
     private fun logUpdateFile(msg: String) {
         runCatching {
             val dir = coreLogDir()
@@ -82,25 +82,26 @@ class UpdateManager(
         }
     }
 
-    /** 分类目录：Core 侧更新日志统一写到 Download/UFI-AXIS/log/core/update.log（RESULT 备份也在此）。 */
+    /** 分类目录：Core 侧更新日志统一写到 Download/UFI-AXIS/log/core/update/update.log（RESULT 备份也在此）。 */
     private fun coreLogDir(): File {
-        // 路径取自 LogPaths（唯一真源）；探测顺序与回退语义保持原样
+        // 2026-09-12：更新日志收进 `log/core/update/`（分类子目录，见 [LogPaths]）。
+        // 仍保留 emulated→sdcard 的探测回退，只是目标目录多一级 `update`。
         val candidates = LogPaths.dirCandidates(LogPaths.Component.CORE)
         for (c in candidates) {
-            val d = File(c)
+            val d = File(c, "update")
             if (d.exists() || runCatching { d.mkdirs() }.getOrDefault(false)) return d
         }
-        return File(LogPaths.dir(LogPaths.Component.CORE))
+        return File(LogPaths.dir(LogPaths.Component.CORE), "update")
     }
     private val CORE_UPDATE_LOG = "update.log"
 
-    /** 启动/拉起调试日志：写入 Download/UFI-AXIS/log/core/launcher.log（与 ufi_update.sh 的 watchdog 日志同属分类目录）。 */
+    /** 启动/拉起调试日志：写入 Download/UFI-AXIS/log/core/launcher/launcher.log（与 ufi_update.sh 的 watchdog 日志同属分类目录）。 */
     private fun debugLogToFile(msg: String) {
         runCatching {
             val candidates = LogPaths.dirCandidates(LogPaths.Component.CORE)
             var dir: File? = null
             for (c in candidates) {
-                val d = File(c)
+                val d = File(c, "launcher")
                 if (d.exists() || runCatching { d.mkdirs() }.getOrDefault(false)) { dir = d; break }
             }
             val f = File(dir ?: File(LogPaths.dir(LogPaths.Component.CORE)), "launcher.log")
@@ -1061,7 +1062,7 @@ class UpdateManager(
                     }.getOrNull()
             if (fromScript != null) return fromScript
 
-            // 再查 core 日志（writeResultToLog 写入的位置，log/core/update.log）
+            // 再查 core 日志（writeResultToLog 写入的位置，log/core/update/update.log）
             val coreLogPath = File(coreLogDir(), CORE_UPDATE_LOG)
             if (coreLogPath.exists()) {
                 coreLogPath.readLines().asReversed()

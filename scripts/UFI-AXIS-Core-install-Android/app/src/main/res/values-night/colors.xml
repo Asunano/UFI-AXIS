@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ============ 夜间模式：对齐 UFI-AXIS「默认中性皮肤」暗态 ============ -->
+    <color name="bg_page">#FF1A1A1A</color>
+    <color name="bg_card">#FF2A2A2A</color>
+    <color name="bg_input">#FF242424</color>
+    <color name="divider">#FF333333</color>
+    <!-- 暗态阴影压成近黑、低透明度，避免浅色块发灰 -->
+    <color name="card_shadow">#40000000</color>
+
+    <color name="text_primary">#FFEEEEEE</color>
+    <color name="text_secondary">#FFBBBBBB</color>
+    <color name="text_hint">#FF8A9099</color>
+
+    <!-- 暗态 accent 翻亮（近白实底），其上的前景翻近黑 -->
+    <color name="brand">#FFB0B0B0</color>
+    <color name="brand_dark">#FF1A1A1A</color>
+    <color name="brand_disabled">#FF555555</color>
+    <color name="white_text">#FF1A1A1A</color>
+
+    <color name="log_bg">#FF111316</color>
+</resources>

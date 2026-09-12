@@ -117,7 +117,9 @@ class UfiAxisCoreApplication : Application() {
                 // 下面第 3 步那一份在 Download 下：用户能直接翻，但它是 append 到单个
                 // `crash.log`（[DownloadLog] 1MB 上限、超限只保尾部 200KB），
                 // 连续崩溃会把最早那几次挤掉，且依赖外部存储可用。
-                // 两者的失效场景与取回方式都不重叠，缺任一份都会丢掉一类崩溃现场。
+                // 逐次崩溃的**独立文件**则落在 `log/core/crash/crash_<ms>.txt`（见 2b），
+                // 与 app 的 `log/app/crash/` 同口径，文件管理器可直接取，不被滚动覆盖。
+                // 三者的失效场景与取回方式都不重叠，缺任一份都会丢掉一类崩溃现场。
                 val crashFile = File(dataDir, "logs/crash_${System.currentTimeMillis()}.txt")
                 crashFile.parentFile?.mkdirs()
                 try { crashFile.writeText(safeCrashLog) } catch (_: Exception) {}
@@ -125,6 +127,18 @@ class UfiAxisCoreApplication : Application() {
                 // 不在 AppLogger.cleanOldLogs() 的日期目录扫描范围内 —— 此前**完全没有上限**，
                 // 崩溃重启循环能把它们堆到磁盘满。
                 trimCrashFiles(File(dataDir, "logs"))
+                // 2b) 2026-09-13：同一份「逐次崩溃独立文件」也镜像到 Download，与 app 的
+                // `log/app/crash/<date>/crash_*.log` 同口径 —— 用户用文件管理器即可直接翻到
+                // 每一次崩溃的完整 dump，不必 root 也不必经 API。私有目录那份仍是可靠性底线
+                // （外部存储不可用时照常落盘），这里只在能写时写。
+                // 路径：`Download/UFI-AXIS/log/core/crash/crash_<ms>.txt`，同样 [MAX_CRASH_FILES] 份轮换。
+                runCatching {
+                    val dlCrashDir = File(com.ufi_axis_core.util.LogPaths.dir(com.ufi_axis_core.util.LogPaths.Component.CORE), "crash")
+                    if (dlCrashDir.mkdirs() || dlCrashDir.isDirectory) {
+                        File(dlCrashDir, "crash_${System.currentTimeMillis()}.txt").writeText(safeCrashLog)
+                        trimCrashFiles(dlCrashDir)
+                    }
+                }
                 // 3) 2026-08-22：镜像到用户可见的 Download 目录（完整堆栈，文件管理器直接查看）
                 com.ufi_axis_core.util.DownloadLog.append("crash.log", safeCrashLog.replace("\n", "\n    "))
                 // 4) 2026-09-04：留一个持久化标记，供 `GET /api/service/crash` 回读 ——

@@ -45,7 +45,7 @@
  * `searchInfo` 非空即表示「当前展示的是搜索结果」——
  * 空态文案要据此区分「无匹配结果」和「空目录」，用 files.length 判不出来。
  */
-import { canPreview, fileMeta, isTextEditable, type FileEntry } from '../filesShared';
+import { canExtract, canPreview, fileMeta, isTextEditable, type FileEntry } from '../filesShared';
 import FileKindIcon from './FileKindIcon.vue';
 import { EllipsisHorizontalOutline } from '@vicons/ionicons5';
 
@@ -85,7 +85,18 @@ function fileActions(f: FileEntry) {
     if (ext === 'apk') {
       opts.unshift({ label: '安装 APK', key: 'install' });
     }
+    if (canExtract(f)) {
+      opts.unshift({ label: '解压', key: 'extract' });
+    }
+    // 文件专属：校验和 + 压缩成本地 zip
+    opts.push({ label: '校验和', key: 'checksum' });
+    opts.push({ label: '压缩', key: 'compress' });
   }
+  // 文件夹也可整体压缩
+  if (f.isDirectory) {
+    opts.push({ label: '压缩', key: 'compress' });
+  }
+  opts.push({ label: '复制路径', key: 'copy-path' });
   opts.push({ label: '删除', key: 'delete' });
   return opts;
 }

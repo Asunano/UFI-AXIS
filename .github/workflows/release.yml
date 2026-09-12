@@ -227,7 +227,7 @@ jobs:
           name: core-release
           path: ${{ steps.rename.outputs.core }}
 
-      # ── Core 一键安装器（scripts/UFI-AXIS-Core-install）──
+      # ── Core 一键安装器（scripts/UFI-AXIS-Core-install-Windows，含 Windows .bat 与 Linux/macOS .sh）──
       # 目录随仓库带着 adb.exe + 两个 DLL、Windows 的 .bat 与 Linux/macOS 的 .sh，
       # 唯一缺的就是 APK。安装脚本按 `core/*.apk` 通配来装，所以这里只需把本次签名+改名后的
       # core 包丢进 core/，不需要与某个固定文件名对齐。
@@ -235,7 +235,7 @@ jobs:
       - name: Package Core one-click installer ZIP
         id: installer_zip
         run: |
-          INSTALLER_DIR="scripts/UFI-AXIS-Core-install"
+          INSTALLER_DIR="scripts/UFI-AXIS-Core-install-Windows"
           # 缺 adb.exe 就直接失败：装不了的安装器发出去比不发更糟
           if [ ! -f "$INSTALLER_DIR/adb.exe" ]; then
             echo "::error::$INSTALLER_DIR/adb.exe 缺失，一键安装器无法工作（是否漏提交？）"
@@ -245,11 +245,11 @@ jobs:
           # 清掉可能残留的旧包：脚本会安装 core/ 下**所有** apk，多一个就会多装一次
           rm -f "$INSTALLER_DIR"/core/*.apk
           cp "${{ steps.rename.outputs.core }}" "$INSTALLER_DIR/core/"
-          ZIP_NAME="UFI-AXIS-Core-install-${{ steps.version.outputs.BACKEND_VERSION }}.zip"
+          ZIP_NAME="UFI-AXIS-Core-install-Windows-Linux-${{ steps.version.outputs.BACKEND_VERSION }}.zip"
           # 从 scripts/ 起打包，让 zip 内保留一层目录名 —— 用户解压即得完整安装器目录，
           # 而不是把 adb.exe 和 bat 散落到下载目录里
           cd scripts
-          zip -r "../$ZIP_NAME" UFI-AXIS-Core-install -x 'UFI-AXIS-Core-install/log/*'
+          zip -r "../$ZIP_NAME" UFI-AXIS-Core-install-Windows -x 'UFI-AXIS-Core-install-Windows/log/*'
           cd ..
           echo "file=$ZIP_NAME" >> "$GITHUB_OUTPUT"
           unzip -l "$ZIP_NAME"
@@ -259,6 +259,51 @@ jobs:
         with:
           name: core-installer
           path: ${{ steps.installer_zip.outputs.file }}
+
+      # ── 手机版 Core 安装器（scripts/UFI-AXIS-Core-install-Android）──
+      # 独立嵌套 Gradle 工程（AGP 8.13 / Gradle 8.13，与主仓库代差大，故不并入主构建、单独编译）。
+      # 复用已签名改名的 core 包注入其 assets/ufi-axis-core/，再 assembleRelease + 复用 UFI-AXIS 密钥签名，
+      # 最终改名 UFI-AXIS-Core-install-Android-<backend 版本>.apk，与 PC 安装器 ZIP 同口径。
+      - name: Inject core APK into phone installer
+        run: |
+          INSTALLER="scripts/UFI-AXIS-Core-install-Android"
+          if [ ! -f "$INSTALLER/gradlew" ]; then
+            echo "::error::$INSTALLER 缺失，手机安装器无法构建（是否漏提交？）"
+            exit 1
+          fi
+          mkdir -p "$INSTALLER/app/src/main/assets/ufi-axis-core"
+          cp "${{ steps.rename.outputs.core }}" \
+             "$INSTALLER/app/src/main/assets/ufi-axis-core/ufi-axis-core-${{ steps.version.outputs.BACKEND_VERSION }}.apk"
+
+      - name: Build phone installer APK (unsigned)
+        working-directory: scripts/UFI-AXIS-Core-install-Android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease
+
+      - name: Sign phone installer APK
+        id: sign_installer
+        uses: r0adkll/sign-android-release@v1
+        with:
+          releaseDirectory: scripts/UFI-AXIS-Core-install-Android/app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.SIGNING_KEY }}
+          alias: ${{ secrets.ALIAS }}
+          keyStorePassword: ${{ secrets.KEY_STORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Rename phone installer APK
+        id: rename_installer
+        run: |
+          DIR="$(dirname "${{ steps.sign_installer.outputs.signedReleaseFile }}")"
+          NAME="UFI-AXIS-Core-install-Android-${{ steps.version.outputs.BACKEND_VERSION }}.apk"
+          mv "${{ steps.sign_installer.outputs.signedReleaseFile }}" "$DIR/$NAME"
+          echo "file=$DIR/$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload phone installer APK as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: phone-installer
+          path: ${{ steps.rename_installer.outputs.file }}
 
       # ── Web 前端独立更新包（供不重装 APK 单独更新 web 前端使用）──
       - name: Package web update ZIP
@@ -361,23 +406,82 @@ jobs:
               | while read -r id; do gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" || true; done
           fi
 
+      # ── 分类 Release 说明（2026-09-13）──
+      # 不再只用 backend changelog 当 body。改为：
+      #   1) App 更新日志（frontend.changelog）
+      #   2) Core 更新日志（backend.changelog）
+      #   3) Web 更新日志（web.changelog）
+      #   4) 一张 Markdown 下载表（5 个产物：App / Core / Web 更新包 / Windows-Linux 一键安装器 / Android 手机安装器）
+      # 写成 release-notes.md，由下方软属性 action 的 body_path 读取。
+      # 下载直链 = releases/download/<tag>/<实际产物文件名>，文件名取各 rename 步输出的 basename，
+      # 保证即使前后端版本号不同也不会拼出死链。
+      - name: Build categorized release notes
+        id: notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          REPO="${{ github.repository }}"
+          TAG="${{ github.ref_name }}"
+          APP_NAME="$(basename "${{ steps.rename.outputs.app }}")"
+          CORE_NAME="$(basename "${{ steps.rename.outputs.core }}")"
+          WEB_NAME="$(basename "${{ steps.web_zip.outputs.file }}")"
+          WIN_NAME="$(basename "${{ steps.installer_zip.outputs.file }}")"
+          INSTALLER_NAME="$(basename "${{ steps.rename_installer.outputs.file }}")"
+          APP_URL="https://github.com/$REPO/releases/download/$TAG/$APP_NAME"
+          CORE_URL="https://github.com/$REPO/releases/download/$TAG/$CORE_NAME"
+          WEB_URL="https://github.com/$REPO/releases/download/$TAG/$WEB_NAME"
+          WIN_URL="https://github.com/$REPO/releases/download/$TAG/$WIN_NAME"
+          INST_URL="https://github.com/$REPO/releases/download/$TAG/$INSTALLER_NAME"
+
+          # 镜像下载：在原始 GitHub 直链前拼接镜像域名前缀
+          MIRROR="https://mirror.drxian.qzz.io"
+          APP_MURL="$MIRROR/$APP_URL"
+          CORE_MURL="$MIRROR/$CORE_URL"
+          WEB_MURL="$MIRROR/$WEB_URL"
+          WIN_MURL="$MIRROR/$WIN_URL"
+          INST_MURL="$MIRROR/$INST_URL"
+
+          APP_LOG="$(jq -r .frontend.changelog version.json)"
+          CORE_LOG="$(jq -r .backend.changelog version.json)"
+          WEB_LOG="$(jq -r .web.changelog version.json)"
+
+          {
+            echo "## App 更新日志"
+            echo ""
+            echo "$APP_LOG"
+            echo ""
+            echo "## Core 更新日志"
+            echo ""
+            echo "$CORE_LOG"
+            echo ""
+            echo "## Web 更新日志"
+            echo ""
+            echo "$WEB_LOG"
+            echo ""
+            echo "## 下载"
+            echo ""
+            echo "| 包 | 说明 | 下载 | 镜像下载 |"
+            echo "| --- | --- | --- | --- |"
+            echo "| App（Android） | UFI-AXIS 主应用 | [下载]($APP_URL) | [镜像]($APP_MURL) |"
+            echo "| Core（管理后台） | 后端服务（含 Web 管理端） | [下载]($CORE_URL) | [镜像]($CORE_MURL) |"
+            echo "| Web 前端 | 独立更新包（免重装 APK） | [下载]($WEB_URL) | [镜像]($WEB_MURL) |"
+            echo "| Windows/Linux 一键安装器 | PC 端安装 Core（含 .bat 与 .sh） | [下载]($WIN_URL) | [镜像]($WIN_MURL) |"
+            echo "| Android 手机安装器 | 手机端安装 Core | [下载]($INST_URL) | [镜像]($INST_MURL) |"
+          } > release-notes.md
+          echo "release-notes.md 生成："; cat release-notes.md
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
-          # softprops 对同一 tag 已存在的 release 默认就是「create or update」，
-          # 无需额外开关（此前写的 allowUpdates 是 ncipollo/release-action 的入参，
-          # runner 不校验未知 with 键，等于一行死配置，已移除）。
-          # 它只会删除同名冲突的旧资产，不会清理不在 files 里的残留 —— 改名后的清理仍靠
-          # 上方 Clean stale release assets 步骤。
+          # 说明由上方「Build categorized release notes」生成到 release-notes.md，
+          # 此处用 body_path 读取：分类输出 App / Core / Web 更新日志 + 一张 Markdown 下载表。
           fail_on_unmatched_files: true
-          # release body 用后端 changelog（tag 基准为 backend）；如需同时展示两端，可改为拼接
-          # "## Frontend\n${{ steps.version.outputs.FRONTEND_CHANGELOG }}\n\n## Backend\n${{ steps.version.outputs.BACKEND_CHANGELOG }}"
-          body: ${{ steps.version.outputs.BACKEND_CHANGELOG }}
+          body_path: release-notes.md
           files: |
             ${{ steps.rename.outputs.app }}
             ${{ steps.rename.outputs.core }}
             web-update-*.zip
             ${{ steps.installer_zip.outputs.file }}
+            ${{ steps.rename_installer.outputs.file }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

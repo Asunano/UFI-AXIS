@@ -111,6 +111,14 @@ class WebSocketRepository(
                 _connectionState.value = ConnectionState.CONNECTED
                 retryCount = 0
                 subscribeToTopics(subscribedTopics)
+                // 2026-09-12：WS（重）连后主动补一次控制台历史对齐。
+                // 连上期间另一端的命令已通过 data_changed 实时同步；但若本次连接是「断线后重连」，
+                // 断连窗口内另一端敲的命令不会推过来，不补拉就会显示成「两端历史不一致」。
+                // 复用既有 data_changed → MainViewModel → smartRefresh 链路（console:at / console:shell 已接好）。
+                scope.launch {
+                    _dataChanged.emit("console:at")
+                    _dataChanged.emit("console:shell")
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {

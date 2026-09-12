@@ -18,6 +18,9 @@ build.old*/
 *.hprof
 # Gradle Wrapper jar 必须入库，否则 clone 后 ./gradlew 与 CI 全部失败
 !gradle/wrapper/gradle-wrapper.jar
+# 嵌套工程（scripts/UFI-AXIS-Core-install-Android）自带独立 Gradle wrapper，其 jar 同样必须入库，
+# 否则 clone 后该工程 ./gradlew 因缺 wrapper jar 失败；根级 !gradle/wrapper/... 只覆盖仓库根。
+!scripts/UFI-AXIS-Core-install-Android/gradle/wrapper/gradle-wrapper.jar
 # 本地 JDK 探测结果，随机器而异
 gradle/gradle-daemon-jvm.properties
 # Kotlin 增量编译缓存

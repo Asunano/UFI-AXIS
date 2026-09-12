@@ -157,6 +157,18 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
+    // 验证码（通知页签）同样需要实时刷新：自动复制验证码的触发点就在 loadVerificationCodes()
+    // 内部（ToolsModule.autoCopyNewestVerificationCode），不轮询则新到的验证码不会被拉取、
+    // 也就不会自动复制到剪贴板，表现为「自动复制功能失效」。仅「通知」页签且没打开对话时跑，
+    // 复用联系人轮询同样的间隔与生命周期（页面离开 / 切页签时 LaunchedEffect 自动取消）。
+    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
+        if (toolsState.smsTab != 1 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
+        while (true) {
+            delay(CONTACTS_AUTO_REFRESH_MS)
+            viewModel.tools.loadVerificationCodes()
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.tools.loadSmsContacts()
         viewModel.tools.refreshDeviceConfig()

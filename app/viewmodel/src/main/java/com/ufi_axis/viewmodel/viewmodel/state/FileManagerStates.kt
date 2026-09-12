@@ -2,6 +2,7 @@ package com.ufi_axis.viewmodel.state
 
 import com.ufi_axis.data.api.FileItem
 import com.ufi_axis.data.api.FileInfoResponse
+import com.ufi_axis.data.api.ArchiveChecksumResponse
 import com.ufi_axis.data.model.DiskUsageResponse
 import kotlinx.serialization.Serializable
 
@@ -158,5 +159,7 @@ data class FileManagerState(
     val editorFetching: Boolean = false,
     /** 0f~1f；-1f = 总量未知（无 Content-Length 且无 Range 头）。 */
     val editorFetchProgress: Float = -1f,
-    val editorFetchFileName: String = ""
+    val editorFetchFileName: String = "",
+    // ---- 校验和弹窗（2026-09-12）：checksumFile 成功后写入，UI 据此挂载 ChecksumDialog ----
+    val checksumResult: ArchiveChecksumResponse? = null
 )

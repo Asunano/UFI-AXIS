@@ -67,6 +67,9 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.InstallMobile
 import androidx.compose.material.icons.filled.Refresh
@@ -90,6 +93,7 @@ import com.ufi_axis.ui.screens.filemanager.components.FileRowCard
 import com.ufi_axis.ui.screens.filemanager.components.FileIcon
 import com.ufi_axis.ui.screens.filemanager.components.VolumeCard
 import com.ufi_axis.ui.screens.filemanager.dialogs.ApkInstallDialog
+import com.ufi_axis.ui.screens.filemanager.dialogs.ChecksumDialog
 import com.ufi_axis.ui.screens.filemanager.dialogs.DeleteConfirmDialog
 import com.ufi_axis.ui.screens.filemanager.dialogs.FileInfoDialog
 import com.ufi_axis.ui.screens.filemanager.dialogs.NewFolderDialog
@@ -207,6 +211,11 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
             viewModel.navigateToDir(f.path)
             return
         }
+        // 受支持的压缩包直接解压（与 web 端双击行为一致）；rar/7z/bz2/xz 等不支持的回落到详情。
+        if (canExtract(f.name)) {
+            viewModel.extractArchive(f.path, f.name)
+            return
+        }
         val encoded = URLEncoder.encode(f.path, "UTF-8")
         when (fileKindOf(f.name)) {
             // 图片/视频/音频：不再进独立导航页，改为在文件管理器之上叠加预览悬浮窗。
@@ -229,6 +238,10 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
             "rename" -> { renameTarget = f; showRename = true }
             "delete" -> { deleteTarget = f; showDelete = true }
             "install" -> { installTarget = f; showInstall = true }
+            "extract" -> viewModel.extractArchive(f.path, f.name)
+            "compress" -> viewModel.compressFiles(listOf(f.path))
+            "checksum" -> viewModel.checksumFile(f.path)
+            "copy-path" -> viewModel.copyPathToClipboard(f.path)
         }
     }
 
@@ -526,6 +539,14 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                                         if (item.name.endsWith(".apk", ignoreCase = true)) {
                                             add(UfiPopupOption("install", "安装APK", icon = Icons.Filled.InstallMobile) { handleAction("install", item) })
                                         }
+                                        if (canExtract(item.name)) {
+                                            add(UfiPopupOption("extract", "解压", icon = Icons.Filled.FolderZip) { handleAction("extract", item) })
+                                        }
+                                        if (!item.isDirectory) {
+                                            add(UfiPopupOption("checksum", "校验和", icon = Icons.Filled.Fingerprint) { handleAction("checksum", item) })
+                                        }
+                                        add(UfiPopupOption("compress", "压缩", icon = Icons.Filled.Archive) { handleAction("compress", item) })
+                                        add(UfiPopupOption("copy-path", "复制路径", icon = Icons.Filled.ContentCopy) { handleAction("copy-path", item) })
                                     }
                                     FileGridItem(
                                         item = item,
@@ -564,6 +585,14 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                                     if (item.name.endsWith(".apk", ignoreCase = true)) {
                                         add(UfiPopupOption("install", "安装APK", icon = Icons.Filled.InstallMobile) { handleAction("install", item) })
                                     }
+                                    if (canExtract(item.name)) {
+                                        add(UfiPopupOption("extract", "解压", icon = Icons.Filled.FolderZip) { handleAction("extract", item) })
+                                    }
+                                    if (!item.isDirectory) {
+                                        add(UfiPopupOption("checksum", "校验和", icon = Icons.Filled.Fingerprint) { handleAction("checksum", item) })
+                                    }
+                                    add(UfiPopupOption("compress", "压缩", icon = Icons.Filled.Archive) { handleAction("compress", item) })
+                                    add(UfiPopupOption("copy-path", "复制路径", icon = Icons.Filled.ContentCopy) { handleAction("copy-path", item) })
                                 }
                                 FileRowCard(
                                         item = item,
@@ -601,6 +630,7 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                     onSelectAll = { viewModel.selectAllFiles() },
                     onCopy = { viewModel.batchCopySelected() },
                     onCut = { viewModel.batchCutSelected() },
+                    onCompress = { viewModel.compressFiles(state.selectedPaths.toList()) },
                     onDelete = { viewModel.batchDeleteSelected() },
                     onCancel = { viewModel.toggleMultiSelectMode() },
                     modifier = Modifier
@@ -713,6 +743,15 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                 onDismiss = { showInstall = false; installTarget = null }
             )
 
+            // 校验和弹窗：checksumFile 成功后由 state.checksumResult 驱动挂载。
+            state.checksumResult?.let { cs ->
+                ChecksumDialog(
+                    visible = true,
+                    result = cs,
+                    onDismiss = { viewModel.clearChecksumResult() }
+                )
+            }
+
             // T14 — 搜索弹窗：关键词 + 搜索范围（1/2/3 层），确认后触发 viewModel.searchFiles 并关闭。
             SearchDialog(
                 visible = showSearch,
@@ -795,7 +834,18 @@ private fun FileRenderFooter() {
  * anything else falls back to the detail dialog.
  */
 private fun openActionLabel(item: FileItem): String =
-    fileKindOf(item.name, item.isDirectory).openActionLabel
+    if (!item.isDirectory && canExtract(item.name)) "解压"
+    else fileKindOf(item.name, item.isDirectory).openActionLabel
+
+/**
+ * 是否可被后端解压：zip / tar.gz / tgz / tar / gz（与 web 端 [canExtract] 一致）。
+ * rar/7z/bz2/xz 归档虽显示压缩包图标，但后端暂不支持解压，双击落到详情弹窗。
+ */
+private fun canExtract(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower.endsWith(".zip") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz") ||
+        lower.endsWith(".tar") || lower.endsWith(".gz")
+}
 
 // ===== 网格视图项（列表/网格切换） =====
 

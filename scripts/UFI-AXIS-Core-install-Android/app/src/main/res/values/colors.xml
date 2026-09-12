@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ============ 页面 / 表面（对齐 UFI-AXIS 的「默认中性皮肤」）============ -->
+    <!-- 中性灰阶：page 近白、card 纯白、divider 发丝灰；accent 为近黑实底。 -->
+    <color name="bg_page">#FFF8F8F8</color>
+    <color name="bg_card">#FFFFFFFF</color>
+    <color name="bg_input">#FFF1F3F5</color>
+    <color name="divider">#FFE5E5E5</color>
+    <!-- 卡片柔阴影：#9CA4AC @ 30%（设计稿 X:0 Y:4 模糊:16，统一灰环境光） -->
+    <color name="card_shadow">#4D9CA4AC</color>
+
+    <!-- ============ 文字 ============ -->
+    <color name="text_primary">#FF111111</color>
+    <color name="text_secondary">#FF444444</color>
+    <color name="text_hint">#FF8A9099</color>
+
+    <!-- ============ 主题色（默认中性皮肤：近黑实底 + 白字）============ -->
+    <color name="brand">#FF222222</color>
+    <color name="brand_dark">#FF1A1A1A</color>
+    <color name="brand_disabled">#FFC8CCD2</color>
+    <color name="white_text">#FFFFFFFF</color>
+
+    <!-- ============ 语义色 ============ -->
+    <color name="state_success">#FF16A34A</color>
+    <color name="state_error">#FFDC2626</color>
+    <color name="state_warning">#FFD97706</color>
+    <!-- 在线状态点绿（对齐主应用 StatusOnline 域色） -->
+    <color name="status_online">#FF4ADE80</color>
+
+    <!-- ============ 日志分级配色（终端风格） ============ -->
+    <color name="log_bg">#FF16191D</color>
+    <color name="log_info">#FFC9D1D9</color>
+    <color name="log_ok">#FF4ADE80</color>
+    <color name="log_warn">#FFBFBF24</color>
+    <color name="log_error">#FFF87171</color>
+</resources>

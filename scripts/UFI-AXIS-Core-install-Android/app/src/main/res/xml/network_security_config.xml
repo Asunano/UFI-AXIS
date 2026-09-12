@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  明文 HTTP 白名单。
+
+  注意：network_security_config 不支持 CIDR / 通配符网段，
+  只能逐个列举域名或 IP。设备地址由用户运行时输入，无法预先枚举，
+  因此这里用 cleartextTrafficPermitted="true" 全局放开明文流量。
+
+  风险评估：本应用的明文流量仅用于局域网内的
+  ① ADB 调试端口 5555 ② 健康检查端口 8088，
+  均为用户主动发起且目标由用户指定，不涉及第三方数据上报。
+  如需收紧，可在发布版改为动态校验 IP 段（在代码里拦截非私网地址）。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!-- 常见设备的默认地址，显式声明以便日后收紧 base-config -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">192.168.0.1</domain>
+        <domain includeSubdomains="false">192.168.1.1</domain>
+        <domain includeSubdomains="false">192.168.4.1</domain>
+        <domain includeSubdomains="false">192.168.8.1</domain>
+    </domain-config>
+</network-security-config>

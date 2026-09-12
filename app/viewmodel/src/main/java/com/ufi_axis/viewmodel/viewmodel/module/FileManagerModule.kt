@@ -537,6 +537,55 @@ class FileManagerModule(
         }
     }
 
+    // ── Archive ops: 解压 / 压缩 / 校验和 / 复制路径 ──
+    fun extractArchive(path: String, fileName: String) {
+        scope.launch {
+            try {
+                val resp = api.extractArchive(mapOf("path" to path))
+                if (resp.success) {
+                    evict(_state.value.currentPath)
+                    refreshFileList()
+                    _state.update { it.copy(operationMessage = "已解压到 ${resp.destination}") }
+                } else _state.update { it.copy(errorMessage = resp.error ?: "解压失败") }
+            } catch (e: Exception) { _state.update { it.copy(errorMessage = "解压失败: ${e.message}") } }
+        }
+    }
+
+    fun compressFiles(paths: List<String>) {
+        val safePaths = paths.filter { it.isNotBlank() }
+        if (safePaths.isEmpty()) return
+        scope.launch {
+            try {
+                val resp = api.compressFiles(mapOf("paths" to safePaths))
+                if (resp.success) {
+                    evict(_state.value.currentPath)
+                    refreshFileList()
+                    _state.update { it.copy(operationMessage = "已生成压缩包 ${resp.path}") }
+                } else _state.update { it.copy(errorMessage = resp.error ?: "压缩失败") }
+            } catch (e: Exception) { _state.update { it.copy(errorMessage = "压缩失败: ${e.message}") } }
+        }
+    }
+
+    fun checksumFile(path: String) {
+        scope.launch {
+            try {
+                val resp = api.checksumFile(mapOf("path" to path))
+                if (resp.success) _state.update { it.copy(checksumResult = resp) }
+                else _state.update { it.copy(errorMessage = resp.error ?: "校验失败") }
+            } catch (e: Exception) { _state.update { it.copy(errorMessage = "校验失败: ${e.message}") } }
+        }
+    }
+
+    fun clearChecksumResult() { _state.update { it.copy(checksumResult = null) } }
+
+    fun copyPathToClipboard(path: String) {
+        runCatching {
+            val cm = appContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("file-path", path))
+        }
+        _state.update { it.copy(operationMessage = "已复制路径") }
+    }
+
     // ── Disk Usage ──
     fun loadDiskUsage() {
         scope.launch {

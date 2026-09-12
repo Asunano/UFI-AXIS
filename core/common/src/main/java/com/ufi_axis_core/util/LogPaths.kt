@@ -16,18 +16,30 @@ package com.ufi_axis_core.util
  * <base>/Download/UFI-AXIS/                      ← [appRoot]，应用根目录（update/ 放安装包，不属日志）
  * └── log/                                       ← [logRoot]，所有日志的根
  *     ├── core/                                  ← [Component.CORE]
- *     │   ├── <yyyy-MM-dd>/app.log(.1)           AppLogger 应用日志（按天分目录，5MB 轮转）
- *     │   ├── <yyyy-MM-dd>/at.log(.1)            AppLogger AT 指令日志
- *     │   ├── <yyyy-MM-dd>/error.log(.1)         AppLogger 错误日志
- *     │   ├── update.log                         UpdateManager 更新关键事件
- *     │   ├── launcher.log                       UpdateManager 启动/拉起调试
- *     │   ├── crash.log                          DownloadLog（崩溃堆栈镜像）
- *     │   └── goform-session.log                 GoformSessionLog 会话诊断
+ *     │   ├── <yyyy-MM-dd>/                       AppLogger 运行时日志（按天分目录，5MB 轮转）
+ *     │   │   ├── app.log(.1)                     应用日志
+ *     │   │   ├── at.log(.1)                      AT 指令日志
+ *     │   │   └── error.log(.1)                   错误日志
+ *     │   ├── update/                            UpdateManager 更新关键事件 + RESULT 备份（固定文件名，更新恢复反查）
+ *     │   │   └── update.log
+ *     │   ├── launcher/                          UpdateManager 启动/拉起调试
+ *     │   │   └── launcher.log
+ *     │   ├── goform/                            GoformSessionLog 会话诊断
+ *     │   │   └── goform.log                     （旧名 goform-session.log）
+ *     │   └── crash/                             ← 崩溃现场（与 AppLogger 的日期目录平级，不参与每日清理）
+ *     │       ├── crash.log                      DownloadLog 崩溃堆栈滚动镜像
+ *     │       └── crash_<ms>.txt                 逐次崩溃独立 dump（文件管理器可直接取）
  *     ├── install/install.log                    ← [Component.INSTALL]，InstallService 安装诊断
  *     ├── watchdog/watchdog.log                  ← [Component.WATCHDOG]，ufi_update.sh 运行日志
  *     ├── keepalive/keepalive.log                ← [Component.KEEPALIVE]，ufi_keepalive.sh 运行日志
  *     └── _archive/                              ← [Component.ARCHIVE]，旧版散乱日志的归档目标
  * ```
+ *
+ * `log/core/` 根目录此前把 update.log / launcher.log / goform-session.log / crash.log 四份平铺文件
+ * 和 `<date>/` 日期目录混在一起，文件管理器里很乱。2026-09-12 起按 app 端 `log/app/<分类>/` 的思路，
+ * 把这些「运维类」日志各自收进子目录（见下方的 [updateLogPath] / [launcherLogPath] / [goformLogPath]
+ * / [crashLogPath]）。它们不参与每日轮转（`/api/debug-logs/files` 只读 `<date>/{app,at,error}.log`），
+ * 且 update.log 还要被更新恢复逻辑按固定文件名反查 RESULT 行，因此**不按天分目录**。
  *
  * 同一个 `log/` 下还有 `app/` 与 `export/` 两支，那是**手机 APP 侧**的地盘
  * （`UfiLogPaths`，见下），core 一律不碰，所以本对象的 [Component] 里没有它们。
@@ -113,4 +125,28 @@ object LogPaths {
     /** 文件探测顺序，与 [dirCandidates] 同序。 */
     fun fileCandidates(component: Component, fileName: String): List<String> =
         dirCandidates(component).map { "$it/$fileName" }
+
+    // ── Core 分类子目录（2026-09-12，整理 log/core 根目录的平铺文件）──
+    //
+    // 这些子目录都挂在 [Component.CORE] 下，与 `<date>/` 运行时日志平级，不再像旧版那样
+    // 把若干平铺文件堆在 `log/core/` 根目录（和日期目录混在一起，文件管理器里很乱）。
+    // 它们不参与每日轮转、也不被 `/api/debug-logs/files` 暴露（该接口只读 `<date>/{app,at,error}.log`）。
+    //
+    // 文件名刻意保持稳定（不按天分目录）：update.log 要被更新恢复逻辑按固定路径反查 RESULT 行，
+    // 一旦按天分目录，恢复启动时就会找不到「上一轮更新写的 RESULT」。
+
+    /** `log/core/update/update.log`：UpdateManager 更新关键事件 + RESULT 备份。文件名稳定（更新恢复反查）。 */
+    fun updateLogDir(base: String = SDCARD_BASE): String = "${dir(Component.CORE, base)}/update"
+    fun updateLogPath(base: String = SDCARD_BASE): String = "${updateLogDir(base)}/update.log"
+
+    /** `log/core/launcher/launcher.log`：UpdateManager 启动/拉起调试日志。 */
+    fun launcherLogPath(base: String = SDCARD_BASE): String = "${dir(Component.CORE, base)}/launcher/launcher.log"
+
+    /** `log/core/goform/goform.log`：GoformSessionLog 会话诊断（旧名 goform-session.log）。 */
+    fun goformLogDir(base: String = SDCARD_BASE): String = "${dir(Component.CORE, base)}/goform"
+    fun goformLogPath(base: String = SDCARD_BASE): String = "${goformLogDir(base)}/goform.log"
+
+    /** `log/core/crash/crash.log`：DownloadLog 崩溃堆栈滚动镜像（与 CrashHandler 逐次 dump 同目录）。 */
+    fun crashLogDir(base: String = SDCARD_BASE): String = "${dir(Component.CORE, base)}/crash"
+    fun crashLogPath(base: String = SDCARD_BASE): String = "${crashLogDir(base)}/crash.log"
 }

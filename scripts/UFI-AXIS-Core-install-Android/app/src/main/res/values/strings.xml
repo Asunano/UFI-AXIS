@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">UFI-AXIS Core 安装器</string>
+
+    <!-- ============ 副标题 ============ -->
+    <string name="subtitle_installer">命令行安装脚本的图形版：连接设备 → 推送安装 → 授权 → 启动 → 健康检查</string>
+
+    <!-- ============ 页面标题 ============ -->
+    <string name="title_device">目标设备</string>
+    <string name="title_status">安装进度</string>
+    <string name="title_log">运行日志</string>
+
+    <!-- ============ 输入区 ============ -->
+    <string name="hint_address">默认 192.168.0.1，未填端口自动补 5555</string>
+    <string name="label_address">设备：%1$s</string>
+    <string name="label_package">包名：%1$s</string>
+    <string name="apk_ready">内置 APK：%1$s（%2$s）</string>
+    <string name="apk_missing">未检测到内置 APK：assets/ufi-axis-core/ 为空，请先由发布流程注入</string>
+    <string name="apk_ambiguous">发现多个 APK，无法确定 core：%1$s</string>
+
+    <!-- ============ 按钮 ============ -->
+    <string name="action_start">开始安装</string>
+    <string name="action_cancel">取消安装</string>
+    <string name="action_confirm">确认安装</string>
+    <string name="action_retry">重新开始</string>
+    <string name="action_share_log">分享日志</string>
+    <string name="action_copy_log">复制日志</string>
+    <string name="action_show_log">展开日志</string>
+    <string name="action_hide_log">收起日志</string>
+
+    <!-- ============ 结果 ============ -->
+    <string name="result_success">安装完成，核心服务运行正常</string>
+    <string name="result_failed">安装未完成</string>
+
+    <!-- ============ 对话框 ============ -->
+    <string name="dialog_confirm_title">确认安装</string>
+    <string name="dialog_confirm_message">即将向 %3$s 安装：\n\n%1$s\n大小：%2$s\n\n安装参数与命令行版本一致（pm install -r -d），安装后会自动授予权限并启动服务。</string>
+
+    <!-- ============ 提示 ============ -->
+    <string name="toast_no_log_file">暂无日志文件可分享</string>
+    <string name="toast_no_log">暂无日志内容</string>
+    <string name="toast_log_copied">日志已复制到剪贴板</string>
+    <string name="toast_share_failed">分享失败：%1$s</string>
+    <string name="size_unknown">未知</string>
+
+    <!-- ============ 通知 ============ -->
+    <string name="notification_channel_name">安装进度</string>
+    <string name="notification_channel_desc">显示 UFI-AXIS 核心的安装进度</string>
+</resources>

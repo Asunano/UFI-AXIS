@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- ================= 基础主题（对齐 UFI-AXIS 默认中性皮肤） ================= -->
+    <style name="Theme.UfiAxisInstaller" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">@color/brand</item>
+        <item name="colorPrimaryDark">@color/brand_dark</item>
+        <item name="colorAccent">@color/brand</item>
+        <item name="android:windowBackground">@color/bg_page</item>
+        <item name="android:statusBarColor" tools:targetApi="21">@color/bg_page</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="23">true</item>
+    </style>
+
+    <!-- ================= 基样式（供 . 继承链使用） ================= -->
+    <style name="Button" parent="Widget.AppCompat.Button" />
+    <style name="Input" parent="Widget.AppCompat.EditText" />
+    <style name="Log" parent="Widget.AppCompat.TextView" />
+    <style name="Progress" parent="Widget.AppCompat.ProgressBar" />
+    <style name="Text" parent="Widget.AppCompat.TextView" />
+
+    <!-- ================= 文字（字号阶梯对齐参考 Type.kt） ================= -->
+    <!-- 页面大标题：22sp Bold（参考 headerTitle） -->
+    <style name="Text.Title">
+        <item name="android:textSize">22sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/text_primary</item>
+    </style>
+
+    <!-- 分组标题：14sp Bold + 字距（参考 cardTitle / sectionTitle） -->
+    <style name="Text.Section">
+        <item name="android:textSize">14sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/text_secondary</item>
+        <item name="android:letterSpacing">0.06</item>
+    </style>
+
+    <!-- 标准正文：14sp（参考 body） -->
+    <style name="Text.Body">
+        <item name="android:textSize">14sp</item>
+        <item name="android:textColor">@color/text_primary</item>
+    </style>
+
+    <!-- 次要正文 / 提示行：12sp（参考 note / bodySmall） -->
+    <style name="Text.Caption">
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/text_secondary</item>
+    </style>
+
+    <!-- 辅助说明：12sp 浅灰（参考 caption / labelSmall） -->
+    <style name="Text.Hint">
+        <item name="android:textSize">12sp</item>
+        <item name="android:textColor">@color/text_hint</item>
+    </style>
+
+    <!-- 大号状态文字：20sp Bold（参考 screenTitle） -->
+    <style name="Text.Stage">
+        <item name="android:textSize">20sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/text_primary</item>
+    </style>
+
+    <!-- ================= 容器（卡片：12dp 圆角 + 20dp 内距 + 16dp 外距） ================= -->
+    <style name="Card">
+        <item name="android:background">@drawable/bg_card</item>
+        <item name="android:padding">20dp</item>
+        <item name="android:layout_marginTop">16dp</item>
+    </style>
+
+    <!-- ================= 控件 ================= -->
+    <!-- 地址输入框：50dp 高、12dp 圆角、16sp（参考 InputHeight / CornerBase） -->
+    <style name="Input.Address">
+        <item name="android:background">@drawable/bg_input</item>
+        <item name="android:paddingStart">14dp</item>
+        <item name="android:paddingEnd">14dp</item>
+        <item name="android:paddingTop">12dp</item>
+        <item name="android:paddingBottom">12dp</item>
+        <item name="android:minHeight">50dp</item>
+        <item name="android:gravity">center_vertical</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:textColorHint">@color/text_hint</item>
+        <item name="android:singleLine">true</item>
+        <item name="android:inputType">textUri</item>
+        <item name="android:imeOptions">actionDone</item>
+    </style>
+
+    <!-- 主按钮：48dp 高、12dp 圆角、16sp 粗体白字（参考 ButtonHeight / CornerBase） -->
+    <style name="Button.Primary">
+        <item name="android:background">@drawable/bg_button_primary</item>
+        <item name="android:textSize">16sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">@color/white_text</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <!-- 次按钮：48dp 高、12dp 圆角、14sp（参考 ButtonHeight / CornerBase） -->
+    <style name="Button.Secondary">
+        <item name="android:background">@drawable/bg_button_secondary</item>
+        <item name="android:textSize">14sp</item>
+        <item name="android:textColor">@color/text_primary</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <!-- 文字按钮（展开/收起日志）：透明、13sp、accent 色 -->
+    <style name="Button.Ghost">
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:textSize">13sp</item>
+        <item name="android:textColor">@color/brand</item>
+        <item name="android:minHeight">36dp</item>
+        <item name="android:stateListAnimator">@null</item>
+    </style>
+
+    <style name="Progress.Install">
+        <item name="android:max">100</item>
+        <item name="android:progressTint">@color/brand</item>
+    </style>
+
+    <!-- ================= 日志区（终端风格） ================= -->
+    <style name="Log.Line">
+        <item name="android:textSize">11sp</item>
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:textColor">@color/log_info</item>
+        <item name="android:paddingTop">3dp</item>
+        <item name="android:paddingBottom">3dp</item>
+        <item name="android:lineSpacingMultiplier">1.15</item>
+    </style>
+</resources>

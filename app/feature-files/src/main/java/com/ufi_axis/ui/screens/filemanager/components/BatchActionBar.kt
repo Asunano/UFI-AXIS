@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentCut
@@ -47,6 +48,7 @@ import com.ufi_axis.ui.theme.ufiStandardCard
  * @param onSelectAll 点击「全选」
  * @param onCopy 点击「复制」
  * @param onCut 点击「剪切」
+ * @param onCompress 点击「压缩」（将选中项打包成单个 .zip）
  * @param onDelete 点击「删除」（warning 橙）
  * @param onCancel 点击「取消」（退出多选模式）
  * @param modifier 修饰符
@@ -57,6 +59,7 @@ fun BatchActionBar(
     onSelectAll: () -> Unit,
     onCopy: () -> Unit,
     onCut: () -> Unit,
+    onCompress: () -> Unit,
     onDelete: () -> Unit,
     onCancel: () -> Unit,
     modifier: Modifier = Modifier
@@ -102,6 +105,13 @@ fun BatchActionBar(
                     Icon(
                         imageVector = Icons.Filled.ContentCut,
                         contentDescription = "剪切",
+                        tint = palette.textSecondary
+                    )
+                }
+                IconButton(onClick = onCompress) {
+                    Icon(
+                        imageVector = Icons.Filled.Archive,
+                        contentDescription = "压缩",
                         tint = palette.textSecondary
                     )
                 }

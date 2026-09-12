@@ -7,15 +7,18 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 用户可见日志 — 输出到 /sdcard/Download/UFI-AXIS/log/core/（文件管理器可直接查看）。
+ * 用户可见日志 — 输出到 /sdcard/Download/UFI-AXIS/log/core/crash/（文件管理器可直接查看）。
  *
  * 与 AppLogger（应用私有目录 /data/.../logs/）互补：ERROR 级日志与崩溃堆栈镜像到
  * Download 目录，便于在设备上直接排查"服务无法链接"等问题。
+ *
+ * 2026-09-12 起崩溃堆栈镜像收进 `log/core/crash/crash.log`，与 [com.ufi_axis_core.UfiAxisCoreApplication]
+ * 的逐次崩溃 dump（crash/crash_<ms>.txt）同目录，不再平铺在 `log/core/` 根。
  */
 object DownloadLog {
 
-    // 目录取自 [LogPaths]（唯一真源），与 AppLogger 的日志根同一个父目录
-    private val dir = File(LogPaths.dir(LogPaths.Component.CORE))
+    // 2026-09-12：崩溃堆栈镜像收进 `log/core/crash/crash.log`（与 CrashHandler 逐次 dump 同目录，见 [LogPaths]）。
+    private val dir = File(LogPaths.crashLogDir())
 
     /** 单文件上限 1MB，超限保留尾部 200KB。 */
     private const val MAX_BYTES = 1_048_576L

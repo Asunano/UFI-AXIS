@@ -892,6 +892,19 @@ interface UfiAxisApi {
     @POST("api/files/touch")
     suspend fun touchFile(@Body body: Map<String, String>): SuccessResponse
 
+    // ── Archive ops ──
+    /** 解压压缩包：body { path, destination? }；支持 zip / tar.gz / tgz / tar / gz。 */
+    @POST("api/files/extract")
+    suspend fun extractArchive(@Body body: Map<String, String>): ArchiveExtractResponse
+
+    /** 压缩：body { paths:[...], destination? }；生成单个 .zip。 */
+    @POST("api/files/compress")
+    suspend fun compressFiles(@Body body: Map<String, @JvmSuppressWildcards Any>): ArchiveCompressResponse
+
+    /** 校验和：body { path, algorithms? }；默认 md5/sha1/sha256，可选 sha512。 */
+    @POST("api/files/checksum")
+    suspend fun checksumFile(@Body body: Map<String, String>): ArchiveChecksumResponse
+
     // ========== Monitor ==========
     // points 默认 240（2026-08-26 性能：原 360）——图表宽度只有约 1000px，
     // 更细的桶换不来任何可见精度，却要多付 JSON 解析与曲线几何构建的开销。
@@ -1253,4 +1266,35 @@ data class FileReadResponse(
      * 只上报、不自动切换：猜错编码比不猜更糟（GBK 误判会把中文变成乱码却"看起来能读"）。
      */
     val encoding_suspect: Boolean = false
+)
+
+@Serializable
+data class ArchiveExtractResponse(
+    val success: Boolean,
+    /** 解压目标目录（gz 为输出文件所在目录）。 */
+    val destination: String? = null,
+    /** 归档类型：zip / tgz / tar / gz。 */
+    val kind: String? = null,
+    val error: String? = null,
+    val message: String? = null
+)
+
+@Serializable
+data class ArchiveCompressResponse(
+    val success: Boolean,
+    /** 生成的 .zip 完整路径。 */
+    val path: String? = null,
+    val size: Long = 0,
+    val error: String? = null,
+    val message: String? = null
+)
+
+@Serializable
+data class ArchiveChecksumResponse(
+    val success: Boolean,
+    val path: String? = null,
+    /** 算法名(小写) → 十六进制摘要：md5 / sha1 / sha256 / sha512。 */
+    val algorithms: Map<String, String> = emptyMap(),
+    val error: String? = null,
+    val message: String? = null
 )

@@ -67,6 +67,18 @@
 # Keep Room DAOs
 -keep class com.ufi_axis_core.core.database.** { *; }
 
+# Keep 通知渠道控制器（controller.notify）
+# release / benchmark 包里 R8 会把 WebhookConfig 混淆成 aa2，并在其 companion <clinit>
+# （引用同包的 HttpNotifier.METHOD_NAMES / WebhookDelivery.PLACEHOLDERS）阶段抛
+# NoClassDefFoundError，导致后端每次投递通知都崩、Webhook 端点（/api/notify/webhook/*）
+# 报「后端不支持」。与 core.database / api.websocket 同口径：整包保留，防树摇 / 改名破坏
+# 跨类静态初始化链。这类问题表面是"类找不到"，根因是 R8 把只被 <clinit> 间接引用的
+# 内部类判断为可达性不足而剥掉 / 改名，与上方 Netty 那次同一类。
+-keep class com.ufi_axis_core.controller.notify.** { *; }
+# 通知核心域类型（WebhookConfig 的 companion 与 WebhookChannel 直接引用其中的 NotifyLevel /
+# ChannelRules 等）。同样整包保留，避免跨包引用在 R8 下被改名 / 剥离而连累上面的初始化链。
+-keep class com.ufi_axis_core.notify.** { *; }
+
 # SLF4J (used by Ktor/Netty, not needed on Android)
 -dontwarn org.slf4j.impl.StaticLoggerBinder
 -dontwarn org.slf4j.**

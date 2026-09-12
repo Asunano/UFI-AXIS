@@ -10,6 +10,7 @@ import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.data.model.*
+import com.ufi_axis.data.update.CoreUpdatePersistence
 import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.data.notification.NotifyHistoryStore
 import com.ufi_axis.util.AppJson
@@ -45,7 +46,8 @@ class ToolsModule(
     private val appContext: Context,
     private val scope: CoroutineScope,
     private val crossModuleEventSink: MutableSharedFlow<UiEvent>,
-    private val alertPrefs: AlertPrefsRepository
+    private val alertPrefs: AlertPrefsRepository,
+    private val coreUpdatePersistence: CoreUpdatePersistence
 ) {
     // ── State ──
     private val _toolsState = MutableStateFlow(ToolsState())
@@ -107,15 +109,23 @@ class ToolsModule(
     /** P0-7：轮询失败连续次数（Core 重启窗口 8088 不可达时累计；恢复后清零） */
     private var deviceUpdatePollFailures = 0
 
-    /** 触发后端检查更新（后端自动拉取+安装；状态经 [pollDeviceUpdateStatus] 轮询） */
+    /**
+     * 触发后端检查更新（后端自动拉取+安装；状态经 [pollDeviceUpdateStatus] 轮询）。
+     *
+     * 后置持久化标记：后端更新**脱离前端独立执行**（core 进程内 `scope.launch`），
+     * 置 `coreUpdateInProgress=true` 让前端冷启动能接管进度显示（见 [CoreUpdatePersistence]）。
+     * 触发失败（连不上 / 后端没起来）说明后端根本没开始，清回 false，避免冷启动误以为在更。
+     */
     fun triggerDeviceUpdate() {
         scope.launch {
             runCatching { api.triggerDeviceUpdate() }
                 .onSuccess {
+                    coreUpdatePersistence.setCoreUpdating(true)
                     _updateDeviceState.value = it
                     startDeviceUpdatePolling()
                 }
                 .onFailure { e ->
+                    coreUpdatePersistence.setCoreUpdating(false)
                     _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = "触发更新失败: ${e.message}")
                 }
         }

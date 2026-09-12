@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 夜间主题：沿用同一主题名，仅覆盖状态栏表现。
+         颜色全部由 values-night/colors.xml 解析，卡片/按钮/输入 drawable 自动跟随。 -->
+    <style name="Theme.UfiAxisInstaller" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">@color/brand</item>
+        <item name="colorPrimaryDark">@color/brand_dark</item>
+        <item name="colorAccent">@color/brand</item>
+        <item name="android:windowBackground">@color/bg_page</item>
+        <item name="android:statusBarColor" tools:targetApi="21">@color/bg_page</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="23">false</item>
+    </style>
+</resources>

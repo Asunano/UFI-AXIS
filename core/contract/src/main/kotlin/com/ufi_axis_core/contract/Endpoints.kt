@@ -288,6 +288,26 @@ object Endpoints {
         const val HISTORY_BY_ID = "$HISTORY/{id}"
     }
 
+    /**
+     * 文件管理（`FileRoutes`，2026-09-13 入 contract）。
+     *
+     * 归档操作三端点共用「仅用户存储范围 + 路径穿越防护」约定：[EXTRACT] / [COMPRESS]
+     * 都只接受 `/sdcard` / `/storage` / `/mnt/media_rw` 下的路径；[EXTRACT] 的解压目标
+     * 缺省为压缩包同名（去扩展名）文件夹，[COMPRESS] 的目标已存在或与源同一文件时直接拒绝。
+     */
+    object Files {
+        const val BASE = "$API/files"
+
+        /** `POST`：解压 zip / tar / tar.gz(.tgz) / 单文件 gz。 */
+        const val EXTRACT = "$BASE/extract"
+
+        /** `POST`：把一组路径打成 zip。 */
+        const val COMPRESS = "$BASE/compress"
+
+        /** `POST`：计算 MD5 / SHA1 / SHA256 / SHA512 校验和。 */
+        const val CHECKSUM = "$BASE/checksum"
+    }
+
     /** WebSocket 实时通道，订阅协议见 [WsChannel]。 */
     const val WS_REALTIME = "ws/realtime"
 }

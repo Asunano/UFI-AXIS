@@ -428,8 +428,9 @@ private const val CHANGELOG_COLLAPSED_LINES = 5
 /**
  * 统一更新提示弹窗：**同一时刻只有这一个更新弹窗**。
  *
- * App 与 Core 各占一块，两块互不阻塞（更新 App 时 Core 那块照样可点，反之亦然）；
- * 只有一项有更新时就只渲染那一项 —— 所以"合并"和"单独"共用同一个组件，没有两套 UI。
+ * App 与 Core **顺序独立**展示：通过 [UpdatePromptState] 的阶段标记同一时刻只渲染其一（core 优先），
+ * 双方都有更新时先弹 Core、Core 完成/跳过后再弹 App，避免同时更新互相打架；
+ * 只有一项有更新时就只渲染那一项 —— "单独用"和"顺序合并"共用同一个组件，没有两套 UI。
  *
  * 可见性来自 [UpdatePromptState.visible]（唯一真源在 `UpdatePromptModule`），
  * **调用方不要再自己 remember 一个布尔开关** —— 那正是原来两个弹窗会叠加的原因。
@@ -459,7 +460,6 @@ fun UnifiedUpdateDialog(
         visible = state.visible,
         onDismiss = onDismiss,
         title = when {
-            state.showAppSection && state.showCoreSection -> "发现新版本"
             state.showCoreSection -> "Core 有新版本"
             state.showAppSection -> "App 有新版本"
             else -> "检查更新"
@@ -473,7 +473,7 @@ fun UnifiedUpdateDialog(
             )
         }
     ) {
-        if (!state.showAppSection && !state.showCoreSection) {
+        if (!state.hasAnyUpdate) {
             Text(
                 text = "当前 App 与 Core 均已是最新版本",
                 style = MaterialTheme.typography.bodyMedium,
@@ -574,9 +574,8 @@ private fun UpdateTargetBlock(
  * App 项的操作区：完全沿用既有链路
  * `downloadFrontendApk()` → `installFrontendApk()`（[FrontendUpdateState] 状态机）。
  *
- * 下载进度这里用细条 [UfiCompactProgressBar] 而不是 [UpdateProgressRing]：
- * 合并弹窗里可能同时有两块，两个 116dp 的大环会把弹窗顶出屏幕。单独看某一项时
- * 走的也是同一套渲染，不为"只有一项"再开一档 UI。
+ * 下载进度用公共 [UpdateProgressRing]（116dp 圆环 + 中心百分比），与本地推送
+ * [ApkPushDialog]、Core 项统一同一套视觉。顺序弹窗下同时只渲染一块，无两环溢出风险。
  */
 @Composable
 private fun AppUpdateAction(
@@ -592,24 +591,11 @@ private fun AppUpdateAction(
             onClick = onDownload
         )
 
-        "downloading" -> Column(Modifier.fillMaxWidth()) {
-            Text(
-                text = "正在下载安装包 ${state.downloadProgress.coerceIn(0, 100)}%",
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.textPrimary
-            )
-            Spacer(Modifier.height(Spacing.Small))
-            UfiCompactProgressBar(
-                progress = state.downloadProgress.coerceIn(0, 100) / 100f,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(Modifier.height(Spacing.Small))
-            Text(
-                text = "请保持网络连接",
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary
-            )
-        }
+        "downloading" -> UpdateProgressRing(
+            progress = state.downloadProgress.coerceIn(0, 100) / 100f,
+            caption = "正在下载安装包",
+            subCaption = "请保持网络连接"
+        )
 
         "downloaded" -> UfiButton(
             size = UfiButtonSize.Small,
@@ -674,24 +660,19 @@ private fun CoreUpdateAction(
             val message = status?.message?.takeIf { it.isNotBlank() }
             val reconnecting = status?.reconnecting == true
             when (status?.state) {
-                "downloading", "verifying", "uploading" -> Column(Modifier.fillMaxWidth()) {
-                    Text(
-                        text = message ?: "Core 正在下载新版本 $progress%",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = palette.textPrimary
-                    )
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiCompactProgressBar(
-                        progress = progress / 100f,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+                // 有真实百分比（下载/校验/上传）→ 圆环 + 中心百分比；百分比已由环承担，
+                // caption 不再重复（与 ApkPushDialog 的上传态同款处理）。
+                "downloading", "verifying", "uploading" -> UpdateProgressRing(
+                    progress = progress / 100f,
+                    caption = "Core 正在下载并校验新版本",
+                    subCaption = "请保持设备供电与网络"
+                )
 
-                "installing" -> Text(
-                    text = if (reconnecting) "Core 重启中，等待恢复…（接口会中断十几秒）"
-                    else message ?: "Core 正在安装并即将重启…",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textPrimary
+                // 安装/重启拿不到进度 → 不确定态（环自转），与本地推送的安装态同款。
+                "installing" -> UpdateProgressRing(
+                    progress = null,
+                    caption = if (reconnecting) "Core 重启中，等待恢复…（接口会中断十几秒）"
+                    else message ?: "Core 正在安装并即将重启…"
                 )
 
                 "done" -> Text(
@@ -708,10 +689,9 @@ private fun CoreUpdateAction(
 
                 // null / idle：请求刚发出、core 还没写出状态。**明确说尚未完成**，
                 // 不要因为"请求成功返回"就显示成已更新。
-                else -> Text(
-                    text = "已触发更新，Core 正在后台下载并安装，完成后会自动重启（尚未完成）",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textSecondary
+                else -> UpdateProgressRing(
+                    progress = null,
+                    caption = "已触发更新，Core 正在后台下载并安装，完成后会自动重启（尚未完成）"
                 )
             }
         }

@@ -165,39 +165,42 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                         )
                     }
                 }
+            }
 
-                // 自动复制验证码：依赖系统无障碍服务（UfiNotifyAccessibilityService），未开启则禁用并引导去开启
-                UfiSettingsRowCard {
-                    UfiSettingsItem(
-                        title = "自动复制验证码",
-                        description = if (a11yEnabled) {
-                            "新解析到的验证码会自动复制到剪贴板（需保持软件在后台运行），无需手动点按"
-                        } else {
-                            "需在「后台守护」中开启无障碍服务，并保持软件在后台运行"
-                        },
-                        icon = Icons.Default.ContentCopy,
-                        enabled = a11yEnabled,
-                        trailing = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                UfiSwitch(
-                                    checked = toolsState.smsCodeAutoCopy,
-                                    enabled = a11yEnabled,
-                                    onCheckedChange = { viewModel.tools.setSmsCodeAutoCopy(it) }
+            // 自动复制验证码：依赖系统无障碍服务（UfiNotifyAccessibilityService），未开启则禁用并引导去开启。
+            // 与上方「自动解析验证码」(同步) 完全独立 —— 不再嵌套在同步开关内（2026-09-13 修复：
+            // 旧结构下两开关耦合，撤销无障碍会连带影响同步开关）。撤销无障碍只置灰本开关、绝不触碰
+            // 同步开关；状态保留（恢复权限后自动恢复），与用户预期一致。
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    title = "自动复制验证码",
+                    description = if (a11yEnabled) {
+                        "新解析到的验证码会自动复制到剪贴板（需保持软件在后台运行），无需手动点按"
+                    } else {
+                        "需在「后台守护」中开启无障碍服务，并保持软件在后台运行"
+                    },
+                    icon = Icons.Default.ContentCopy,
+                    enabled = a11yEnabled,
+                    trailing = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            UfiSwitch(
+                                checked = toolsState.smsCodeAutoCopy,
+                                enabled = a11yEnabled,
+                                onCheckedChange = { viewModel.tools.setSmsCodeAutoCopy(it) }
+                            )
+                            if (!a11yEnabled) {
+                                Spacer(Modifier.width(Spacing.Small))
+                                UfiButton(
+                                    size = UfiButtonSize.Small,
+                                    text = "去开启",
+                                    onClick = {
+                                        navController.navigate(Routes.DETAIL_BACKGROUND_GUARD)
+                                    }
                                 )
-                                if (!a11yEnabled) {
-                                    Spacer(Modifier.width(Spacing.Small))
-                                    UfiButton(
-                                        size = UfiButtonSize.Small,
-                                        text = "去开启",
-                                        onClick = {
-                                            navController.navigate(Routes.DETAIL_BACKGROUND_GUARD)
-                                        }
-                                    )
-                                }
                             }
                         }
-                    )
-                }
+                    }
+                )
             }
 
             UfiSettingsRowCard {

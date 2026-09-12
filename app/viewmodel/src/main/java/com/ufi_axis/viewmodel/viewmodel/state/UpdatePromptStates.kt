@@ -32,7 +32,11 @@ data class UpdatePromptState(
     val coreLatestVersion: String = "",
     val coreChangelog: String = "",
     val coreTriggered: Boolean = false,
-    val coreStatus: UpdateStatusResponse? = null
+    val coreStatus: UpdateStatusResponse? = null,
+    /** 顺序展示标记：core 优先，core 完成/跳过后再展示 app。同一时刻至多一段为 true
+     * （由 UpdatePromptModule 按阶段计算，UI 只负责按标记渲染对应那一块）。 */
+    val showCoreSection: Boolean = false,
+    val showAppSection: Boolean = false
 ) {
     /** App 侧有事可做：有新版可下 / 正在下 / 已下待装 / 正在装。 */
     val appHasUpdate: Boolean get() = app.state in APP_ACTIONABLE_STATES
@@ -42,12 +46,6 @@ data class UpdatePromptState(
 
     /** 是否有**任何**可提示的更新 —— 自动弹出的唯一判据。 */
     val hasAnyUpdate: Boolean get() = appHasUpdate || coreHasUpdate
-
-    /** 弹窗里是否渲染「App」那一块。 */
-    val showAppSection: Boolean get() = appHasUpdate || appFailed
-
-    /** 弹窗里是否渲染「Core」那一块（已触发更新时即便 has_update 翻回 false 也要留着看进度）。 */
-    val showCoreSection: Boolean get() = coreHasUpdate || coreTriggered
 
     companion object {
         /** App 侧「值得在弹窗里出现」的状态集合。 */

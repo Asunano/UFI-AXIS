@@ -71,6 +71,8 @@
 
     <FileInfoModal v-model:show="showInfoModal" :info="fileInfo" />
 
+    <ChecksumModal v-model:show="showChecksumModal" :result="checksumResult" />
+
     <!-- 懒加载弹窗一律走 useLazyModal，否则首帧 show 就是 true，进出场动画全丢 -->
     <component
       :is="previewComponent"
@@ -112,6 +114,7 @@ import FilesToolbar from './components/FilesToolbar.vue';
 import FileListPanel from './components/FileListPanel.vue';
 import NameInputModal from './components/modals/NameInputModal.vue';
 import FileInfoModal from './components/modals/FileInfoModal.vue';
+import ChecksumModal from './components/modals/ChecksumModal.vue';
 import {
   PREVIEW_MAX_BYTES,
   authHeaders,
@@ -141,6 +144,8 @@ const sortBy = ref('name');
 const disks = ref<any[]>([]);
 const actionLoading = ref(false);
 const fileInfo = ref<FileEntry | null>(null);
+const showChecksumModal = ref(false);
+const checksumResult = ref<{ path: string; algorithms: Record<string, string> } | null>(null);
 const clipboard = reactive({ path: '', name: '', mode: '' as '' | 'copy' | 'move' });
 const storageDenied = ref(false);
 
@@ -285,6 +290,9 @@ function openFile(f: FileEntry) {
     case 'install':
       installApk(f);
       break;
+    case 'extract':
+      extractArchive(f);
+      break;
     case 'info':
       message.info(`${f.name}：该类型暂不支持在线预览，请使用「下载」后本地打开`);
       showInfo(f);
@@ -351,6 +359,18 @@ function handleAction(key: string, f: FileEntry) {
       break;
     case 'info':
       showInfo(f);
+      break;
+    case 'extract':
+      extractArchive(f);
+      break;
+    case 'copy-path':
+      copyPath(f);
+      break;
+    case 'checksum':
+      openChecksum(f);
+      break;
+    case 'compress':
+      compressItem(f);
       break;
   }
 }
@@ -606,6 +626,52 @@ async function saveTextFile() {
     message.error('保存失败');
   } finally {
     actionLoading.value = false;
+  }
+}
+
+// ── 归档操作：解压 / 压缩 / 校验和 / 复制路径 ──
+function extractArchive(f: FileEntry) {
+  const m = message.loading('正在解压...', { duration: 0 });
+  api.post('/api/files/extract', { path: f.path })
+    .then(({ data }: any) => {
+      if (!data?.success) { message.error('解压失败'); return; }
+      message.success(`已解压到 ${data.destination}`);
+      loadFiles();
+    })
+    .catch((e: any) => message.error(e.response?.data?.error || '解压失败'))
+    .finally(() => m.destroy());
+}
+
+function compressItem(f: FileEntry) {
+  const m = message.loading('正在压缩...', { duration: 0 });
+  api.post('/api/files/compress', { paths: [f.path] })
+    .then(({ data }: any) => {
+      if (!data?.success) { message.error('压缩失败'); return; }
+      message.success(`已生成 ${data.path}`);
+      loadFiles();
+    })
+    .catch((e: any) => message.error(e.response?.data?.error || '压缩失败'))
+    .finally(() => m.destroy());
+}
+
+function copyPath(f: FileEntry) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(f.path)
+      .then(() => message.success('路径已复制'))
+      .catch(() => message.error('复制失败'));
+  } else {
+    message.error('当前环境不支持复制');
+  }
+}
+
+async function openChecksum(f: FileEntry) {
+  try {
+    const { data } = await api.post('/api/files/checksum', { path: f.path });
+    if (!data?.success) { message.error('校验和计算失败'); return; }
+    checksumResult.value = { path: data.path, algorithms: data.algorithms };
+    showChecksumModal.value = true;
+  } catch (e: any) {
+    message.error(e.response?.data?.error || '校验和失败');
   }
 }
 

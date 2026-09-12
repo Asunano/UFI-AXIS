@@ -96,7 +96,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useWebSocketStore } from '@/stores/websocket';
@@ -443,6 +443,17 @@ const unsubConsole = wsStore.on('data_changed', (payload: any) => {
   if (changed === 'console:at') loadHistory('at');
   else if (changed === 'console:shell') loadHistory('shell');
 });
+// 2026-09-12：WS（重）连后补一次历史对齐。连上期间另一端命令靠 data_changed 实时同步，
+// 但断线窗口内另一端敲的命令不会推过来，不补拉会显示成「两端历史不一致」。
+watch(
+  () => wsStore.status,
+  (s, old) => {
+    if (s === 'connected' && old && old !== 'connected') {
+      loadHistory('at');
+      loadHistory('shell');
+    }
+  }
+);
 onUnmounted(() => {
   activeControllers.forEach((c) => c.abort());
   activeControllers.clear();

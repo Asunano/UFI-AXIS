@@ -8,8 +8,9 @@ import java.util.Locale
 /**
  * Goform 会话事件日志 — 用户可直接查看（诊断"官方后台被挤下线"问题）。
  *
- * 写入 /sdcard/Download/UFI-AXIS/log/core/goform-session.log（区别于 AppLogger 的
- * 应用私有目录 /data/ufiaxis/logs/，文件管理器可直接访问）。
+ * 写入 /sdcard/Download/UFI-AXIS/log/core/goform/goform.log（2026-09-12 起由旧名
+ * goform-session.log 收进 goform/ 分类子目录；区别于 AppLogger 的应用私有目录
+ * /data/ufiaxis/logs/，文件管理器可直接访问）。
  *
  * 记录内容（不受 debugMode 影响，但受 [AppLogger.isLogEnabled] 总开关约束）：
  * - 服务启动标记（版本 + 安装时间，用于确认部署的构建）
@@ -23,9 +24,9 @@ import java.util.Locale
  */
 object GoformSessionLog {
 
-    // 目录取自 [LogPaths]（唯一真源）
-    private val dir = File(LogPaths.dir(LogPaths.Component.CORE))
-    private val logFile get() = File(dir, "goform-session.log")
+    // 2026-09-12：收进 `log/core/goform/goform.log`（分类子目录，见 [LogPaths]）。
+    private val dir = File(LogPaths.goformLogDir())
+    private val logFile get() = File(dir, "goform.log")
 
     /** 单文件上限 512KB，超限保留尾部 100KB（诊断场景足够，防止无限增长）。 */
     private const val MAX_BYTES = 512L * 1024
