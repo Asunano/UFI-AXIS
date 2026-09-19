@@ -19,6 +19,13 @@ dependencies {
     implementation(project(":app:viewmodel"))
     implementation(project(":app:data"))
     implementation(project(":app:ui"))
+    /*
+     * 播放器核心（2026-09-16 下沉到 :app:feature-media）。
+     *
+     * media3 依赖与 PlayerView 布局原来挂在本模块，媒体中心也要播之后，为了不留两份实现，
+     * 播放器搬到 feature-media，这里反过来依赖它 —— 文件预览浮层继续用同一个播放器组件。
+     */
+    implementation(project(":app:feature-media"))
 
     // FileManagerScreen 解析 kotlinx.serialization JsonElement（OkHttp 经 coil.network.okhttp 透传）
     implementation(libs.kotlinx.serialization.json)
@@ -38,10 +45,4 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.kotlinx.coroutines.android)
-
-    // 媒体播放（Media3 / ExoPlayer）
-    implementation(libs.media3.exoplayer)
-    implementation(libs.media3.ui)
-    implementation(libs.media3.extractor)
-    implementation(libs.media3.datasource.okhttp)
 }

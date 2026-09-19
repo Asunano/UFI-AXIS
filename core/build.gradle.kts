@@ -101,12 +101,6 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "META-INF/INDEX.LIST"
             excludes += "META-INF/io.netty.*"
-            // 这两个是 JavaMail 的 DataContentHandler 注册表，被排除后 javax.activation
-            // 查不到 text/html、multipart/* 的 handler，发信时抛 UnsupportedDataTypeException
-            // （IOException 子类），被 SMTPTransport 包成
-            // “MessagingException: IOException while sending message”。
-            // 排除保留（多依赖重复资源），改由 SmsForwardController.ensureMailcap() 在运行时
-            // 手动注册 MailcapCommandMap；两者必须成对存在，删任一边都会重现发信失败。
             excludes += "META-INF/mailcap"
             excludes += "META-INF/mimetypes.default"
             excludes += "META-INF/NOTICE.md"

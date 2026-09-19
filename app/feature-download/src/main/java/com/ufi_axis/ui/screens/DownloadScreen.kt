@@ -177,8 +177,8 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
                     // 「LazyColumn 恒定挂载 + 空态降级为一条 item」，见该文件内说明。
                     // 仍然看得见的"整屏动效"只剩下**公共层**两处，按约定不在本次改动范围内：
                     //   ① 路由转场：本页是 DETAIL 路由（AppScreens.kt: Routes.DETAIL_DOWNLOADS），
-                    //      MainNavGraph 给所有 DETAIL 页统一挂 `detailEnter()` =
-                    //      slideInHorizontally(initialOffsetX = { it }，**整屏**) + fadeIn（Navigation.kt:210-218），
+                    //      MainNavGraph 给所有 DETAIL 页统一挂 `detailSharedAxisEnter` =
+                    //      slideInHorizontally { it }（**整屏**，无 fade），
                     //      时长跟随「外观」页设置（默认 380ms）。2026-09-05 位移由半屏改成整屏以与退出对称，
                     //      观感就是"整页从右边刷进来"。进页面必播一次。
                     //   ② 标题栏：UfiScreenScaffold → UfiHeader 里标题有 350ms 的

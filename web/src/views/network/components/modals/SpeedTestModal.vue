@@ -14,8 +14,12 @@
           <div class="st-node">{{ nodeLabel }}</div>
 
           <div class="st-pills" :class="{ visible: showData }">
-            <span class="st-pill">PING <b>{{ formatMs(state.latencyMs) }}</b></span>
-            <span class="st-pill">JITTER <b>{{ formatMs(state.jitterMs) }}</b></span>
+            <span class="st-pill"
+              >PING <b>{{ formatMs(state.latencyMs) }}</b></span
+            >
+            <span class="st-pill"
+              >JITTER <b>{{ formatMs(state.jitterMs) }}</b></span
+            >
           </div>
 
           <div class="st-dial-slot">
@@ -32,13 +36,7 @@
                   :y2="t % 6 === 1 ? 22 : 18"
                 />
               </g>
-              <circle
-                class="dial-progress"
-                cx="100"
-                cy="100"
-                r="88"
-                :style="{ strokeDasharray: dialDash }"
-              />
+              <circle class="dial-progress" cx="100" cy="100" r="88" :style="{ strokeDasharray: dialDash }" />
               <g class="dial-needle" :transform="`rotate(${-120 + gaugeFraction * 240} 100 100)`">
                 <line x1="100" y1="36" x2="100" y2="52" />
                 <circle cx="100" cy="36" r="2.5" />
@@ -98,12 +96,7 @@
 
           <div class="st-actions">
             <n-button v-if="isRunning" secondary block @click="cancel">取消测速</n-button>
-            <n-button
-              v-else-if="state.phase === 'done' || state.phase === 'error'"
-              type="primary"
-              block
-              @click="start"
-            >
+            <n-button v-else-if="state.phase === 'done' || state.phase === 'error'" type="primary" block @click="start">
               重新测速
             </n-button>
           </div>
@@ -158,10 +151,18 @@
                   :paused="chartPaused"
                 />
                 <div class="st-stats">
-                  <div class="st-stat"><span>用时</span><b>{{ state.elapsedSec.toFixed(1) }}s</b></div>
-                  <div class="st-stat"><span>峰值</span><b>{{ fmtMbps(state.peakMbps) }}</b></div>
-                  <div class="st-stat"><span>已传</span><b>{{ formatBytes(state.totalBytes) }}</b></div>
-                  <div class="st-stat"><span>并发</span><b>{{ state.streams || '—' }}</b></div>
+                  <div class="st-stat">
+                    <span>用时</span><b>{{ state.elapsedSec.toFixed(1) }}s</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>峰值</span><b>{{ fmtMbps(state.peakMbps) }}</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>已传</span><b>{{ formatBytes(state.totalBytes) }}</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>并发</span><b>{{ state.streams || '—' }}</b>
+                  </div>
                 </div>
               </div>
               <div v-else key="empty" class="st-right-empty" />
@@ -279,9 +280,7 @@ const state = ref<SpeedState>({
 });
 
 const activeNode = computed(() => EXTERNAL_NODES.find((n) => n.id === targetId.value) || null);
-const isRunning = computed(() =>
-  ['connecting', 'latency', 'download', 'upload'].includes(state.value.phase)
-);
+const isRunning = computed(() => ['connecting', 'latency', 'download', 'upload'].includes(state.value.phase));
 /** 开始测速后才展示网络信息（对齐「点测试后才显示」） */
 const showData = computed(() => isRunning.value || state.value.phase === 'done' || state.value.phase === 'error');
 
@@ -785,16 +784,10 @@ async function runUploadPhase(
   uploadUrl: string | null,
   downloadBase: number
 ): Promise<{ avg: number; bytes: number; elapsed: number; streams: number } | null> {
-  const uri = uploadUrl
-    ? `/api/speedtest/relay?url=${encodeURIComponent(uploadUrl)}`
-    : '/api/speedtest/upload';
+  const uri = uploadUrl ? `/api/speedtest/relay?url=${encodeURIComponent(uploadUrl)}` : '/api/speedtest/upload';
   const url = `${appStore.baseUrl || ''}${uri}`;
   let headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
-  try {
-    headers = { ...(await speedHeaders('POST', uri)), ...headers };
-  } catch (e) {
-    throw e;
-  }
+  headers = { ...(await speedHeaders('POST', uri)), ...headers };
 
   // crypto.getRandomValues 单次上限 65536 字节：先取一块再重复拼满，内容不影响速率
   const seed = new Uint8Array(65536);
@@ -1123,7 +1116,9 @@ onUnmounted(() => {
 }
 .st-fade-enter-active,
 .st-fade-leave-active {
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
 }
 .st-fade-enter-from {
   opacity: 0;
@@ -1152,10 +1147,14 @@ onUnmounted(() => {
   }
 }
 .st-pills {
-  transition: opacity 0.25s ease, margin 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    margin 0.25s ease;
 }
 .st-dir-col {
-  transition: opacity 0.25s ease, color 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    color 0.25s ease;
 }
 .st-dial-slot {
   transition: opacity 0.25s ease;
@@ -1230,12 +1229,14 @@ onUnmounted(() => {
 }
 .dial-progress {
   fill: none;
-  stroke: var(--accent-color, #4f8cff);
+  stroke: var(--accent-color);
   stroke-width: 7;
   stroke-linecap: round;
   transform: rotate(150deg);
   transform-origin: 100px 100px;
-  filter: drop-shadow(0 0 6px rgba(79, 140, 255, 0.35));
+  /* 2026-09-15：这里原来是写死的蓝色光晕（旧主色残留），主色改绿之后
+     绿弧上罩着一层蓝光。改接 --accent-glow，跟着主色/皮肤走。 */
+  filter: drop-shadow(0 0 6px var(--accent-glow));
 }
 .dial-ticks line {
   stroke: var(--text-muted);
@@ -1243,12 +1244,12 @@ onUnmounted(() => {
   opacity: 0.45;
 }
 .dial-needle line {
-  stroke: var(--accent-color, #4f8cff);
+  stroke: var(--accent-color);
   stroke-width: 2.5;
   stroke-linecap: round;
 }
 .dial-needle circle {
-  fill: var(--accent-color, #4f8cff);
+  fill: var(--accent-color);
 }
 .st-dial-center {
   position: absolute;
@@ -1269,14 +1270,16 @@ onUnmounted(() => {
   font-size: 22px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: #fff;
-  background: var(--accent-color, #4f8cff);
-  box-shadow: 0 8px 24px rgba(79, 140, 255, 0.35);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  color: var(--on-accent);
+  background: var(--accent-color);
+  box-shadow: 0 8px 24px var(--accent-glow);
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
 }
 .st-go:hover {
   transform: scale(1.04);
-  box-shadow: 0 10px 28px rgba(79, 140, 255, 0.45);
+  box-shadow: 0 10px 28px var(--accent-glow);
 }
 .st-go:active {
   transform: scale(0.98);
@@ -1334,11 +1337,13 @@ onUnmounted(() => {
   align-items: center;
   gap: 2px;
   opacity: 0.45;
-  transition: opacity 0.25s ease, color 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    color 0.25s ease;
 }
 .st-dir-col.on {
   opacity: 1;
-  color: var(--accent-color, #4f8cff);
+  color: var(--accent-color);
 }
 .st-dir-ico {
   width: 18px;
@@ -1412,7 +1417,7 @@ onUnmounted(() => {
 }
 .st-error {
   font-size: 12px;
-  color: var(--error, #e88080);
+  color: var(--error);
   text-align: center;
 }
 .st-actions:empty {
@@ -1435,15 +1440,18 @@ onUnmounted(() => {
   cursor: pointer;
   text-align: left;
   color: inherit;
-  transition: border-color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    opacity 0.15s ease;
 }
 .st-target:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
 .st-target.active {
-  border-color: var(--accent-color, #4f8cff);
-  background: var(--accent-color-light, rgba(79, 140, 255, 0.1));
+  border-color: var(--accent-color);
+  background: var(--accent-color-light);
 }
 .st-target:hover {
   background: var(--surface-hover);
@@ -1474,7 +1482,7 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .st-target.active .st-t-dot {
-  border-color: var(--accent-color, #4f8cff);
-  background: var(--accent-color, #4f8cff);
+  border-color: var(--accent-color);
+  background: var(--accent-color);
 }
 </style>

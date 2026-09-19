@@ -158,6 +158,53 @@ data class TrafficAggregateBucket(
 )
 
 /**
+ * 每小时流量用量 DAO（[TrafficHourlyUsage]）。
+ *
+ * 写入只有 [addUsage] 一条路径：**累加**语义，不是覆盖。调用方给的是"这一次采样相对上一次
+ * 增加了多少"，同一小时内会被反复累加。
+ */
+@Dao
+interface TrafficHourlyDao {
+    /**
+     * 把一次增量累加进指定小时桶（桶不存在则创建）。
+     *
+     * 刻意不用 `INSERT … ON CONFLICT DO UPDATE`（SQLite 3.24+ 才支持，对应 Android 11+，
+     * 而 core 要跑在更老的设备上）。改成"先 UPDATE，影响行数为 0 才 INSERT"，
+     * 并整体放在一个事务里，避免两个写入方之间插进来导致丢增量。
+     */
+    @Transaction
+    suspend fun addUsage(hourStart: Long, rxDelta: Long, txDelta: Long, now: Long) {
+        val touched = incrementHour(hourStart, rxDelta, txDelta, now)
+        if (touched == 0) {
+            insertIgnore(TrafficHourlyUsage(hourStart, rxDelta, txDelta, now))
+        }
+    }
+
+    @Query(
+        "UPDATE traffic_hourly SET rxBytes = rxBytes + :rxDelta, txBytes = txBytes + :txDelta, " +
+            "updatedAt = :now WHERE hourStart = :hourStart"
+    )
+    suspend fun incrementHour(hourStart: Long, rxDelta: Long, txDelta: Long, now: Long): Int
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIgnore(row: TrafficHourlyUsage)
+
+    /** 半开区间 [startMs, endMs) 内的所有小时桶，按时间升序。 */
+    @Query(
+        "SELECT * FROM traffic_hourly WHERE hourStart >= :startMs AND hourStart < :endMs " +
+            "ORDER BY hourStart ASC"
+    )
+    suspend fun listBetween(startMs: Long, endMs: Long): List<TrafficHourlyUsage>
+
+    /** 最早一条记录的小时起点；表为空返回 null（用于告诉前端"历史从哪天开始有数据"）。 */
+    @Query("SELECT MIN(hourStart) FROM traffic_hourly")
+    suspend fun earliestHourStart(): Long?
+
+    @Query("SELECT COUNT(*) FROM traffic_hourly")
+    suspend fun getCount(): Int
+}
+
+/**
  * 信号历史 DAO
  */
 @Dao
@@ -713,6 +760,22 @@ interface MailSendRecordDao {
             "WHERE outcome = 'skipped' AND (:channel IS NULL OR channel = :channel)"
     )
     suspend fun countSkipped(channel: String?): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM mail_send_records " +
+            "WHERE outcome = 'sent' AND (:channel IS NULL OR channel = :channel)"
+    )
+    suspend fun countSent(channel: String?): Int
+
+    /** 最近一次成功投递时间戳；无记录时 Room 返回 null。 */
+    @Query(
+        "SELECT MAX(sent_at) FROM mail_send_records " +
+            "WHERE outcome = 'sent' AND (:channel IS NULL OR channel = :channel)"
+    )
+    suspend fun lastSentAt(channel: String?): Long?
+
+    @Query("DELETE FROM mail_send_records WHERE id = :id")
+    suspend fun deleteById(id: Long): Int
 
     @Query("DELETE FROM mail_send_records")
     suspend fun deleteAll()

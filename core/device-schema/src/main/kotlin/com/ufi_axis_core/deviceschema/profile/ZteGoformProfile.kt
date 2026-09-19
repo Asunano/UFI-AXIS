@@ -47,41 +47,33 @@ object ZteGoformProfile : DeviceProfile {
     override val displayName: String = "ZTE goform（F50 等）"
 
     /**
-     * 网络类型值映射（`"20"` → `"5G"`）。从 `GoformClient.NETWORK_TYPE_MAP` 逐条搬来。
+     * 网络类型数字码 → 可读文案。
      *
-     * **同一个字段名在不同命令里有两种编码，必须都认**：状态类命令直接回文本（如 `"5G"`），
-     * `network_information` 回数字码（如 `20`）。所以只有纯数字才查表，非数字原样透出——
-     * 早期无条件查表导致过「明明返回 5G 却显示 未知(5G)」。见 [NETWORK_TYPE_DECODER]。
+     * **同一个字段名在不同命令里有两种编码，必须都认**：状态类命令直接回文本（真机 2026-09-15
+     * 实测 `cmd=network_type,...` 回 `"5G"`），`network_information` 容器里回数字码。
+     * 所以只有纯数字才查表，非数字原样透出——早期无条件查表导致过「明明返回 5G 却显示 未知(5G)」。
+     * 见 [NETWORK_TYPE_DECODER]。
+     *
+     * ## 这张表为什么这么短（2026-09-15 修）
+     *
+     * 原表有 44 项，是从多套厂商编码拼起来的（`8/9` = LTE(FDD)/LTE(TDD)、`12` = LTE、
+     * `13` = TDSCDMA、`14/15` = TDD/FDD LTE、`16..22` 全是 5G 变体、`40..44` 又一套）。
+     * 真机上它把 4G/5G 报的 `13` 译成了 **TDSCDMA**，App 与 Web 都原样上屏 ——
+     * 因为客户端按契约不再做二次映射（`docs/UFI-AXIS-Core-API-Reference.md` 的
+     * 「客户端不要再做一次数字码→文案的映射」）。
+     *
+     * 现在只保留**有依据的**几项（依据同一份文档记录的真机对应关系：
+     * `20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G）。**不再猜**：没登记的数字码由
+     * [NETWORK_TYPE_DECODER] 输出 `未知(原值)`，在界面上一眼能看见、在响应里能直接取证，
+     * 补一项只需要一次真机对照。把没验证过的编码写进表里的代价，就是这次的 TDSCDMA。
      */
     private val NETWORK_TYPE_MAP: Map<String, String> = mapOf(
         "0" to "无服务",
-        "1" to "GSM",
-        "2" to "GPRS",
-        "3" to "EDGE",
-        "4" to "WCDMA",
-        "5" to "HSDPA",
-        "6" to "HSUPA",
-        "7" to "HSPA",
-        "8" to "LTE(FDD)",
-        "9" to "LTE(TDD)",
-        "10" to "CDMA",
-        "11" to "EVDO",
-        "12" to "LTE",
-        "13" to "TDSCDMA",
-        "14" to "TDD LTE",
-        "15" to "FDD LTE",
-        "16" to "5G(NR)",
-        "17" to "NR",
-        "18" to "NR-SA",
-        "19" to "NR-NSA",
+        "4" to "2G",
+        "9" to "3G",
+        "13" to "4G",
+        "19" to "5G NSA",
         "20" to "5G",
-        "21" to "5G-SA",
-        "22" to "5G-NSA",
-        "40" to "NR",
-        "41" to "LTE-TDD",
-        "42" to "LTE-FDD",
-        "43" to "NR-TDD",
-        "44" to "NR-FDD",
     )
 
     /**
@@ -1051,19 +1043,24 @@ object ZteGoformProfile : DeviceProfile {
     private val NUMERIC = Regex("^[0-9]+$")
 
     /**
-     * 制式名 → goform 的数字 RAT 码。取值域与 [NETWORK_TYPE_MAP] 是同一套编码
-     * （12 = LTE，16 = 5G(NR)）。
+     * 制式名 → 小区锁定命令的数字 RAT 码（`12` = LTE，`16` = NR）。
      *
-     * 也接受已经是数字码的入参：app 侧历史上直接发 `"12"` / `"16"`，
-     * 兼容期内不能把这些请求判成非法。
+     * **这是写侧的独立取值域**，与 [NETWORK_TYPE_MAP]（读侧的 `network_type` 数字码）不是
+     * 同一套编码 —— 2026-09-15 前这里拿 `NETWORK_TYPE_MAP.keys` 当白名单，等于把两套码
+     * 绑在一起，读侧表一改写侧校验就跟着漂。
+     *
+     * 也接受已经是数字码的入参：app 侧历史上直接发 `"12"` / `"16"`，兼容期内不能判成非法
+     * （契约见 `docs/UFI-AXIS-Core-API-Reference.md` 的 `/api/device/cell-lock`）。
      */
+    private val CELL_LOCK_RAT_CODES = setOf("12", "16")
+
     private fun ratCodeOrNull(v: Any?): String? {
         val raw = v?.toString()?.trim().orEmpty()
         if (raw.isEmpty()) return null
-        if (raw.matches(NUMERIC)) return raw.takeIf { it in NETWORK_TYPE_MAP.keys }
+        if (raw.matches(NUMERIC)) return raw.takeIf { it in CELL_LOCK_RAT_CODES }
         return when (raw.uppercase()) {
             "LTE", "4G", "FDD LTE", "TDD LTE" -> "12"
-            "NR", "5G", "5G(NR)", "NR-SA", "NR-NSA" -> "16"
+            "NR", "5G", "5G(NR)", "NR-SA", "NR-NSA", "5G NSA", "5G SA" -> "16"
             else -> null
         }
     }

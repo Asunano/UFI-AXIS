@@ -31,13 +31,21 @@ fun UfiAlertDialog(
         title = title,
         icon = icon
     ) {
-        Text(
-            text,
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textSecondary,
-            modifier = Modifier
-                .padding(top = Spacing.Medium, bottom = Spacing.Medium)
-        )
+        // 2026-09-19：正文包进 UfiDialogBody（12dp 节奏），并删掉 Text 自己的上下 8dp。
+        // 此前这三个标准弹窗是全库唯一不走 body 的一族：标题→正文 8dp、正文→按钮 8dp，
+        // 而其余弹窗都是 12dp —— 同一个 App 里两套节奏。
+        //
+        // DialogButtonRow 刻意放在 body **外面**：它是按钮区、不是内容，放进去会吃一份
+        // spacedBy(12dp) 再加上自己的 padding(top=12dp)，叠成 24dp。
+        UfiDialogBody {
+            Text(
+                text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textSecondary
+            )
+        }
+        // 关闭时序由 DialogButtonRow 统一接管（它内部经 LocalUfiDialogClose 排队），
+        // 这里**不能**再包一层 —— 双层 requestClose 会被 closing 闸门吞掉第二次调用。
         DialogButtonRow(
             confirmText = confirmText,
             onConfirm = onConfirm,
@@ -68,8 +76,10 @@ fun UfiConfirmDialog(
         scrimAlpha = if (destructive) 0.15f else 0.08f,
         titleColorOverride = if (destructive) warning else null
     ) {
-        Text(text, style = MaterialTheme.typography.bodyMedium, color = palette.textSecondary,
-            modifier = Modifier.padding(top = Spacing.Medium, bottom = Spacing.Medium))
+        // 同 UfiAlertDialog：正文进 body、按钮行留在 body 外（2026-09-19）
+        UfiDialogBody {
+            Text(text, style = MaterialTheme.typography.bodyMedium, color = palette.textSecondary)
+        }
         DialogButtonRow(
             confirmText = confirmText, onConfirm = onConfirm,
             dismissText = dismissText, onDismiss = onDismiss,
@@ -109,38 +119,37 @@ fun UfiInputDialog(
         title = title,
         icon = icon
     ) {
-        OutlinedTextField(
-            value = text,
-            onValueChange = { text = it; error = null },
-            placeholder = if (hint.isNotEmpty()) ({ Text(hint) }) else null,
-            singleLine = true,
-            isError = error != null,
-            supportingText = error?.let {
-                { Text(it, color = palette.error) }
-            },
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedBorderColor = palette.inputBorderFocused,
-                unfocusedBorderColor = palette.inputBorder,
-                cursorColor = palette.accent,
-                focusedTextColor = palette.textPrimary,
-                unfocusedTextColor = palette.textPrimary
-            ),
-            shape = UfiCardDefaults.inputShape,
-            // 2026-09-03 修复「弹窗内输入框左右边距与其它内容对不齐」：
-            // 这里原来写的是 `padding(horizontal = Spacing.DialogPaddingH, vertical = Spacing.Medium)`。
-            // 但 UfiDialogShell 的内容列（UfiDialogShell.kt: `.padding(horizontal = Spacing.DialogPaddingH)`）
-            // 已经给 title 行 / content / DialogButtonRow 统一提供了 18dp 横向内距，
-            // 于是输入框实际缩进 18+18=36dp —— 比同一弹窗里的标题和底部按钮各多缩 18dp，肉眼可见左右都窄一圈。
-            // 横向内距的唯一来源是弹窗壳，这里只保留纵向呼吸间距。
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = Spacing.Medium)
-        )
+        // 同 UfiAlertDialog：输入框进 body、按钮行留在 body 外（2026-09-19）
+        UfiDialogBody {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it; error = null },
+                placeholder = if (hint.isNotEmpty()) ({ Text(hint) }) else null,
+                singleLine = true,
+                isError = error != null,
+                supportingText = error?.let {
+                    { Text(it, color = palette.error) }
+                },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = palette.inputBorderFocused,
+                    unfocusedBorderColor = palette.inputBorder,
+                    cursorColor = palette.accent,
+                    focusedTextColor = palette.textPrimary,
+                    unfocusedTextColor = palette.textPrimary
+                ),
+                shape = UfiCardDefaults.inputShape,
+                // 横向内距的唯一来源是弹窗壳（18dp），纵向节奏的唯一来源是 UfiDialogBody（12dp）。
+                // 这里两个都不能再加：加横向会缩成 36dp（2026-09-03 修过），加纵向会与 body 叠。
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
         DialogButtonRow(
             confirmText = confirmText,
             onConfirm = {
                 val validationError = validator?.invoke(text)
                 if (validationError != null) {
+                    // 校验没过时**不关**弹窗。DialogButtonRow 会把这次点击交给
+                    // LocalUfiDialogClose，shell 发现弹窗仍然可见会把 backdrop 恢复回去。
                     error = validationError
                 } else {
                     onConfirm(text)

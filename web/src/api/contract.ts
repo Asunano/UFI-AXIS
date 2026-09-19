@@ -116,12 +116,21 @@ export const Endpoints = {
    * ② `DELETE` 的 `channel` 参数**不传就是全清**，所以按渠道的清空按钮必须带上它；
    * ③ `failed_total` 与 `skipped_total` 是两个独立计数，**不能相加**（跳过不是失败），
    *    且都是该渠道的全表计数，不随 `result` 筛选变化。
+   *
+   * `historyStats` 与 `historyRecord` 是三条渠道共用的另两条（core 侧一直存在，2026-09-19 web 接入）：
+   * ④ `historyStats` 的 `channel` **缺失或空 = 全渠道**（与 `history` / `DELETE history` 同口径），
+   *    回的是 `total` / `sent` / `failed` / `skipped` / `last_sent_at` —— 比列表响应多出
+   *    `sent` 与 `last_sent_at` 两项，且**不受 `result` 筛选影响**；
+   * ⑤ `historyRecord` 删单条，`deleted = 0`（行已不在）**仍回 `success: true`**：
+   *    客户端可直接把本地行摘掉，不要把"本来就没有"报成删除失败。
    */
   smsForward: {
     config: '/api/sms-forward/config',
     diagnose: '/api/sms-forward/diagnose',
     test: '/api/sms-forward/test',
     history: '/api/sms-forward/history',
+    historyStats: '/api/sms-forward/history/stats',
+    historyRecord: (id: number) => `/api/sms-forward/history/${id}`,
   },
   /**
    * 另两条通知渠道（2026-09-09 web 接入）：Webhook 与本机短信。
@@ -161,6 +170,101 @@ export const Endpoints = {
    */
   notifications: {
     config: '/api/notifications/config',
+  },
+  /**
+   * 流量统计（2026-09-19 进契约）。
+   *
+   * `usage` 的响应形状与取数封装在 [api/traffic.ts](../api/traffic.ts) 里，那份文件原先自己留了
+   * 一个路径字面量并注明"刻意不进契约表"——理由是"只有一半 traffic 路径会更糟"。
+   * 现在四条一起登记，那个理由不再成立。
+   *
+   * 三处坑：
+   * ① `realtime` 在调度器尚未预热时回的是 **HTTP 200 + 失败信封**（`code = NO_DATA_YET`），
+   *    不是 4xx —— 按 HTTP 码判断成功会把"还没数据"当成有数据，读到一堆 undefined；
+   * ② `history` 的 `records[]` 字段是 **camelCase**（`rxBytes` / `txSpeed` / `timestamp`），
+   *    直接序列化 Room 实体的结果，与全仓 snake_case 的惯例相反，别照别的端点抄；
+   * ③ `usage` 的 `range` / `anchor` **都不会回 400**：range 认不出 → `day`，anchor 解析不出 → now。
+   *    翻页锚点一律原样透传响应里的 `prev_anchor` / `next_anchor`，不要在前端做日历运算
+   *    （月长度、闰年、DST 都已经在 core 算对了）。
+   */
+  traffic: {
+    realtime: '/api/traffic/realtime',
+    history: '/api/traffic/history',
+    summary: '/api/traffic/summary',
+    usage: '/api/traffic/usage',
+  },
+  /**
+   * 天气（2026-09-19 web 接入；core 侧 `WeatherRoutes`，上游 Open-Meteo，**无需 API key**）。
+   *
+   * 四处坑：
+   * ① `GET /api/weather` 有**两种 200 形状**：未设城市时只回
+   *    `{configured: false, enabled, message}`，其余字段一个都没有 —— 见 [WeatherNow]。
+   *    直接读 `temperature` 会拿到 undefined，必须先判 `configured`；
+   * ② 上游不可达是 **502**（`OPERATION_FAILED`），不是 200 + 失败信封；
+   * ③ `weather_code` → 中文描述的映射在 **core** 里做好了（响应的 `description` 字段），
+   *    客户端不要再抄一张 WMO 码表 —— 那张表一分叉就会和手机端说两种天气；
+   * ④ `PUT /config` 是字段级 patch，但会**校验**：纬度 -90..90、经度 -180..180、
+   *    `unit` 只认 `celsius` / `fahrenheit`、`city` ≤ 64 字符，越界回 400。
+   *    `latitude = 0 && longitude = 0` 是"未设置"的哨兵，不是几内亚湾。
+   */
+  weather: {
+    now: '/api/weather',
+    search: '/api/weather/search',
+    config: '/api/weather/config',
+  },
+  /**
+   * 每日诗词（2026-09-19 web 接入；core 侧 `PoetryRoutes`，上游 jinrishici.com，**无需 API key**）。
+   *
+   * 两处坑：
+   * ① `refresh=1` 只绕过 **core 本地那 10 分钟缓存**，上游自己也有约 10 分钟的缓存 ——
+   *    所以"刷新"完全可能拿回同一首，这不是 bug，界面上不要承诺"换一首"；
+   * ② 没有 tag 参数：选哪首由上游按设备出口 IP 的地理位置、当地天气、时辰与节气决定，
+   *    命中的标签在响应的 `match_tags` 里回读。
+   */
+  poetry: {
+    now: '/api/poetry',
+    config: '/api/poetry/config',
+  },
+  /**
+   * 国家/地区探测（2026-09-19 进契约）。诗词与天气的上游选源都依赖它。
+   *
+   * `country` 是 ISO 3166-1 alpha-2，**空串 = 从未探测成功**；此时 `source` 一定是 `unknown`
+   * （即便刚刚真的发起过一次抓取），所以判"有没有结果"只看 `country` 是否非空。
+   * `POST /detect` 在三个地理源全部不可达时回 **502**，并保留上一次的结果不清空。
+   */
+  geo: {
+    root: '/api/geo',
+    detect: '/api/geo/detect',
+  },
+  /**
+   * 设备本机媒体库（core 侧 `MediaRoutes`）。**web 尚未实现对应界面**，
+   * 这里先登记端点以免契约表里缺一整组（校验器的"core 存在但无任何端引用"会报出来）。
+   *
+   * 五处坑，实现界面前必须读：
+   * ① 几乎每条都要 `type` ∈ `video` / `audio` / `image`，缺失或认不出回 400；
+   *    权限不足回的是 **403 但 code 仍是 `BAD_REQUEST`**（没有专用错误码），
+   *    带 `extra = {permission, type}`；
+   * ② `thumbnail` / `cover` 回的是**二进制图片**（带 ETag + `Cache-Control: private, max-age=86400`），
+   *    不是 JSON。浏览器里只能用 `<img>` + blob URL，因为 `<img src>` 带不上 Bearer 头与设备签名 ——
+   *    与 APK 下载同一个限制（见 [Endpoints.update] 的说明）；
+   * ③ `PUT /thumbnail` 的 body 是**裸 JPEG 字节**（不是 JSON、不是 multipart），
+   *    上限 512 KB，且必须以 `FF D8 FF` 开头，否则 400；
+   * ④ `browse` 在"配置了多个根目录且没传 path"时回的是**选根目录**的形状：
+   *    `path: ''` + `parent: null` + 非空 `roots` + 空 `folders`/`items`，不是"这个目录是空的"；
+   * ⑤ **播放字节流不在这一组**：走 `/api/files/stream?path=`，而浏览器带不上鉴权头，
+   *    所以要先 `POST /api/files/stream-ticket` 换一张只授权那一个文件、滑动过期 10 分钟的票据。
+   */
+  media: {
+    status: '/api/media/status',
+    list: '/api/media/list',
+    browse: '/api/media/browse',
+    ffmpegStatus: '/api/media/ffmpeg-status',
+    thumbnail: '/api/media/thumbnail',
+    cover: '/api/media/cover',
+    lyrics: '/api/media/lyrics',
+    tags: '/api/media/tags',
+    config: '/api/media/config',
+    rescan: '/api/media/rescan',
   },
   /**
    * SIM 卡（2026-08-27 web 接入）。
@@ -330,48 +434,94 @@ export const NetworkMode = {
   ONLY_WCDMA: 'WCDMA_ONLY',
 } as const;
 
-/** UI 档位（顺序即展示顺序），与 Kotlin `NetworkMode.UI_OPTIONS` 一致。 */
+/** UI 档位（顺序与中文名对齐 Kotlin `NetworkMode.UI_OPTIONS` / `LABELS`）。 */
 export const NetworkModeOptions: ReadonlyArray<{ label: string; value: string }> = [
-  { label: '自动', value: NetworkMode.AUTO },
-  { label: '仅 5G', value: NetworkMode.ONLY_5G },
-  { label: '5G 优先', value: NetworkMode.LTE_AND_5G },
-  { label: '仅 4G', value: NetworkMode.ONLY_LTE },
-  { label: '4G / 3G', value: NetworkMode.WCDMA_AND_LTE },
-  { label: '仅 3G', value: NetworkMode.ONLY_WCDMA },
+  { label: '5G/4G/3G', value: NetworkMode.AUTO },
+  { label: '5G NSA', value: NetworkMode.LTE_AND_5G },
+  { label: '5G SA', value: NetworkMode.ONLY_5G },
+  { label: '4G/3G', value: NetworkMode.WCDMA_AND_LTE },
+  { label: '仅4G', value: NetworkMode.ONLY_LTE },
+  { label: '仅3G', value: NetworkMode.ONLY_WCDMA },
 ];
 
-/** 设备回读的 BearerPreference → 别名（上面映射的反向）。 */
+/**
+ * 设备回读的 BearerPreference / net_select → 别名。
+ *
+ * 与 Kotlin `NetworkMode.fromBearer` 同步：真机/老固件会回 `NR5G_ONLY`、`LTE_NR5G`、
+ * `WCDMA_AND_LTE_AND_5G`、小写 `only_5g` 等写法，漏映射会让切换回读永远对不上目标档位。
+ * **查表统一走 [bearerToNetworkMode]**（先转大写），不要直接下标取值。
+ */
 export const BearerToNetworkMode: Record<string, string> = {
   WL_AND_5G: NetworkMode.AUTO,
-  Only_5G: NetworkMode.ONLY_5G,
+  AUTO: NetworkMode.AUTO,
+  // 真机默认档位（2026-09 F50）：语义等于 5G/4G/3G 自动
+  WCDMA_AND_LTE_AND_5G: NetworkMode.AUTO,
+  ONLY_5G: NetworkMode.ONLY_5G,
+  NR5G_ONLY: NetworkMode.ONLY_5G,
+  ONLY_NR5G: NetworkMode.ONLY_5G,
+  '5G_ONLY': NetworkMode.ONLY_5G,
   LTE_AND_5G: NetworkMode.LTE_AND_5G,
-  Only_LTE: NetworkMode.ONLY_LTE,
+  LTE_NR5G: NetworkMode.LTE_AND_5G,
+  LTE_AND_NR5G: NetworkMode.LTE_AND_5G,
+  NR5G_NSA: NetworkMode.LTE_AND_5G,
+  '5G_NSA': NetworkMode.LTE_AND_5G,
+  ONLY_LTE: NetworkMode.ONLY_LTE,
+  LTE_ONLY: NetworkMode.ONLY_LTE,
   WCDMA_AND_LTE: NetworkMode.WCDMA_AND_LTE,
-  Only_WCDMA: NetworkMode.ONLY_WCDMA,
+  LTE_WCDMA: NetworkMode.WCDMA_AND_LTE,
+  ONLY_WCDMA: NetworkMode.ONLY_WCDMA,
+  WCDMA_ONLY: NetworkMode.ONLY_WCDMA,
 };
+
+/**
+ * 设备回读值 → 别名（大小写不敏感，与 Kotlin `fromBearer` 的 `uppercase()` 对齐）。
+ *
+ * 设备侧同一档位有多种大小写写法（`Only_5G` / `only_5g`），原来靠在表里各列一遍，
+ * 少列一种就静默落到"未知"。认不出来的取值**原样返回**，不伪装成「自动」。
+ */
+export function bearerToNetworkMode(raw: string): string {
+  const key = String(raw ?? '').trim();
+  if (!key) return '';
+  return BearerToNetworkMode[key.toUpperCase()] || key;
+}
 
 /**
  * 切换制式后的「回读确认」预算，与 Kotlin `NetworkMode.SwitchProbe` 逐字对齐。
  *
  * 为什么需要：`POST /api/network/mode` 返回成功只代表**固件收下了**这条命令，设备还要重新
- * 注册网络，这期间 `GET /api/device/settings` 的 `BearerPreference` **仍报旧档位**。
+ * 注册网络，这期间 `GET /api/device/settings` 报的**仍是旧档位**。
  * 写完只回读一次就渲染，界面会停在切换前的档位，直到别处偶然又拉了一次设置才自己变对
  * —— 这正是 2026-09-11 真机上"切换生效了但界面还显示旧制式"。
  *
- * 上限是硬要求：设备在弱信号下可能十几秒都注册不上，无上限轮询会一直打 goform 查询。
+ * 上限是硬要求：每次回读都真打设备（core 写成功后会清 `device:settings` 缓存），
+ * 无上限轮询会把 goform 查询许可耗在这一件事上。
  */
 export const NetworkModeSwitchProbe = {
   /** 下发成功后到第一次回读的等待（设备写入到查询接口可见约 600ms）。 */
   firstDelayMs: 600,
-  /** 之后每次回读的间隔。 */
+  /** 快档间隔：前 `fastAttempts` 次用它。 */
   intervalMs: 1500,
-  /** 回读次数上限（**含**第一次）。 */
-  maxAttempts: 10,
+  /** 慢档间隔：设备重新注册期间降频。 */
+  slowIntervalMs: 3000,
+  /** 快档次数。 */
+  fastAttempts: 5,
+  /** 回读次数上限（**含**第一次）。13 次 ≈ 30.6s，覆盖真机十几到二十几秒的切换时间。 */
+  maxAttempts: 13,
 } as const;
 
+/** 第 attemptNo 次回读之后等多久再读。与 Kotlin `SwitchProbe.intervalMsAfter` 同一判据。 */
+export function modeProbeIntervalMs(attemptNo: number): number {
+  return attemptNo < NetworkModeSwitchProbe.fastAttempts
+    ? NetworkModeSwitchProbe.intervalMs
+    : NetworkModeSwitchProbe.slowIntervalMs;
+}
+
 /** 总时长上限，给文案用。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。 */
-export const NetworkModeSwitchBudgetMs =
-  NetworkModeSwitchProbe.firstDelayMs + (NetworkModeSwitchProbe.maxAttempts - 1) * NetworkModeSwitchProbe.intervalMs;
+export const NetworkModeSwitchBudgetMs = (() => {
+  let total = NetworkModeSwitchProbe.firstDelayMs;
+  for (let i = 1; i < NetworkModeSwitchProbe.maxAttempts; i += 1) total += modeProbeIntervalMs(i);
+  return total;
+})();
 
 /**
  * 还要不要再回读一次。与 Kotlin `SwitchProbe.shouldKeepProbing` 同一判据。
@@ -699,6 +849,27 @@ export interface MailHistoryResponse {
 
 /** 一条投递记录的三态结论。分类入口只有 [deliveryOutcomeOf] 一处。 */
 export type DeliveryOutcome = 'sent' | 'failed' | 'skipped';
+
+/**
+ * `GET /api/sms-forward/history/stats` 的响应（三条渠道共用，`channel` 缺失 = 全渠道）。
+ *
+ * 与 [MailHistoryResponse] 里那三个计数**是同一批数字的另一种切法**，多出来的是
+ * `sent` 与 `last_sent_at` —— 列表响应只给 total/failed/skipped，"已发出多少条"得自己减，
+ * 而 `total - failed - skipped` 在 core 尚未全量升到 DB v12 的设备上会算错
+ * （那种 core 不产生 skipped 行，减出来的数没错，但它也不回这个端点 —— 见下面那句）。
+ *
+ * **老固件没有这条端点**：404 时不要把整张记录视图判成失败，回落到列表响应里的三个计数即可
+ * （少显示 `sent` 与 `last_sent_at` 两项，其余功能不受影响）。
+ *
+ * `last_sent_at` 是全表最后一条记录的时间戳（ms），**不是"最后成功"的时间**；无记录时为 0。
+ */
+export interface DeliveryHistoryStats {
+  total: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  last_sent_at: number;
+}
 
 /**
  * 把 [MailSendRecord.outcome] 读成三态结论。**全 web 唯一一处分类判定。**
@@ -1078,6 +1249,71 @@ export const DeviceFields = {
    */
   unstableEndpoints: ['api/device/goform', 'api/device/goform/query', 'api/device/goform/set', 'api/wifi/module-info'],
 } as const;
+
+/** `GET /api/weather/config` 配置。`0, 0` 是"未设城市"的哨兵，不是几内亚湾。 */
+export const WeatherUnit = { CELSIUS: 'celsius', FAHRENHEIT: 'fahrenheit' } as const;
+export type WeatherUnit = (typeof WeatherUnit)[keyof typeof WeatherUnit];
+
+/**
+ * `GET /api/weather` 在**已配置**（`configured: true`）时的完整形状。
+ * 未配置时只有 `{ configured: false, enabled, message }`。
+ *
+ * `hourly_times` / `hourly_temperatures` 是等长的 24 点数组（index 0 = 当前小时）。
+ * `weather_code` 是 WMO 码；中文描述取 `description`，**不要在 web 侧再翻译一次**。
+ */
+export interface WeatherNow {
+  configured: boolean;
+  enabled?: boolean;
+  message?: string;
+  city?: string;
+  temperature?: number;
+  apparent_temperature?: number;
+  humidity?: number;
+  precipitation?: number;
+  wind_speed?: number;
+  weather_code?: number;
+  description?: string;
+  is_day?: boolean;
+  temp_max?: number;
+  temp_min?: number;
+  sunrise?: string;
+  sunset?: string;
+  hourly_times?: string[];
+  hourly_temperatures?: number[];
+  unit?: string;
+  timezone?: string;
+  updated_at?: number;
+}
+
+/** `GET /api/weather/search` 的响应。 */
+export interface WeatherSearchResult {
+  name: string;
+  latitude: number;
+  longitude: number;
+  country: string;
+  admin1?: string;
+  timezone?: string;
+}
+
+/** `GET /api/poetry` 的响应。 */
+export interface PoetryNow {
+  content: string;
+  title: string;
+  dynasty: string;
+  author: string;
+  full_content: string[];
+  translate: string[];
+  match_tags: string[];
+  popularity: number;
+  updated_at: number;
+}
+
+/** `GET /api/geo` 的响应。 */
+export interface GeoInfo {
+  country: string;
+  detected_at: number;
+  source: 'cache' | 'fresh' | 'unknown';
+}
 
 /** 设备侧布尔判定，与 Kotlin 侧 DeviceFields.Bool.isTrue 同语义。 */
 export const isDeviceTrue = (raw: unknown): boolean =>

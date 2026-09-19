@@ -81,6 +81,7 @@ object Routes {
     const val DETAIL_TOOLS_ADVANCED = "detail/tools-advanced"
     const val DETAIL_SPEED_TEST = "detail/speed-test"
     const val DETAIL_TRAFFIC_MGMT = "detail/traffic-management"
+    /** 流量历史页（2026-09-15 从流量管理页里的一张卡拆成独立页：明细最多 31 行，挤在一屏会把限额设置压到很下面）。 */
     const val DETAIL_SMS = "detail/sms"
     /** 短信设置页（2026-09-08 由短信页顶栏齿轮的弹窗改造成独立页面）。 */
     const val DETAIL_SMS_SETTINGS = "detail/sms-settings"
@@ -180,6 +181,22 @@ object Routes {
     const val DETAIL_ONLINE_DEVICES = "detail/online-devices"
     const val DETAIL_PAIRING = "detail/pairing"
     const val DETAIL_APPEARANCE = "detail/appearance"
+    /**
+     * 界面小功能（2026-09-17）：首页标题栏上的小挂件设置，第一个是天气。
+     *
+     * 与「外观」分开：那页管的是主题与配色（纯本机、无网络依赖），这里的东西要连 core
+     * 拉数据、有刷新周期与上游配额，两类混在一页只会越攒越乱。
+     */
+    const val DETAIL_UI_EXTRAS = "detail/ui-extras"
+    /**
+     * 今日天气（2026-09-18）：原先躺在 [DETAIL_UI_EXTRAS] 那一屏里的天气设置。
+     *
+     * 拆出来的原因：诗词落地后「界面小功能」要同时装两套「开关 + 内容预览 + 立即刷新」，
+     * 一屏里会出现两个长得一样的刷新按钮，分不清谁管谁。
+     */
+    const val DETAIL_WEATHER = "detail/weather"
+    /** 今日诗词（2026-09-18）：标题栏下方那行诗的开关、出处显示与全篇预览。拆分理由同 [DETAIL_WEATHER]。 */
+    const val DETAIL_POETRY = "detail/poetry"
     /** 组件画廊：共享组件按族铺开，用于发现重复与不一致（入口在「外观」页）。 */
     const val DETAIL_UI_GALLERY = "detail/ui-gallery"
     const val DETAIL_DEVICE_CONTROL = "detail/device-control"
@@ -232,8 +249,31 @@ object Routes {
     const val DETAIL_TASK_EDIT = "detail/task-edit?id={id}"
 
     const val FILE_EDITOR = "file/editor?path={path}"
-    const val FILE_MEDIA = "file/media?path={path}&type={type}"
-    const val FILE_IMAGE = "file/image?path={path}"
+
+    /**
+     * 媒体库：工具页三个入口（视频 / 音乐 / 图片）+ 各自的播放 / 查看页。
+     *
+     * 2026-09-16 下午改成三个独立列表页。原先是一条 `media/center`（一页三栏），
+     * 拆分理由与 `detail/sms-filter` 那次一样：三类各有各的扫描范围、授权状态与列表状态，
+     * 挤在一页里顶部要同时放分栏控件和范围条，读代码与用界面都要先问"我现在在哪一栏"。
+     * 扫描范围随之按类型各存一份（core `/api/media/config?type=`），每页因此是自洽的。
+     *
+     * 更早的 `file/media?path=&type=` 与 `file/image?path=` 是两条**孤儿路由**（对应的
+     * Screen 早已删除），已在上一轮一并清掉。
+     */
+    const val MEDIA_LIBRARY_VIDEO = "media/library/video"
+    const val MEDIA_LIBRARY_AUDIO = "media/library/audio"
+    const val MEDIA_LIBRARY_IMAGE = "media/library/image"
+
+    /**
+     * 视频页的设置（扫描目录 / 本机抽帧开关 / 封面缓存 / 下载队列与历史）。
+     *
+     * 单独一页而不是塞回视频页：这些是"配一次就不动"的东西，摆在浏览界面上只会挤掉内容。
+     */
+    const val MEDIA_VIDEO_SETTINGS = "media/library/video/settings"
+    const val MEDIA_VIDEO = "media/video?path={path}"
+    const val MEDIA_AUDIO = "media/audio?path={path}"
+    const val MEDIA_IMAGE = "media/image?path={path}"
 }
 
 /**
@@ -298,6 +338,9 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_ONLINE_DEVICES, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_PAIRING, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_APPEARANCE, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_UI_EXTRAS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_WEATHER, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_POETRY, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_UI_GALLERY, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DEVICE_CONTROL, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_ABOUT, TransitionType.DETAIL),
@@ -348,16 +391,26 @@ val appRoutes: List<AppRoute> = listOf(
             navArgument("path") { type = NavType.StringType; defaultValue = "" }
         )
     ),
+    AppRoute(Routes.MEDIA_LIBRARY_VIDEO, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_LIBRARY_AUDIO, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_LIBRARY_IMAGE, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_VIDEO_SETTINGS, TransitionType.DETAIL),
     AppRoute(
-        route = Routes.FILE_MEDIA,
+        route = Routes.MEDIA_VIDEO,
         transition = TransitionType.DETAIL,
         arguments = listOf(
-            navArgument("path") { type = NavType.StringType; defaultValue = "" },
-            navArgument("type") { type = NavType.StringType; defaultValue = "video" }
+            navArgument("path") { type = NavType.StringType; defaultValue = "" }
         )
     ),
     AppRoute(
-        route = Routes.FILE_IMAGE,
+        route = Routes.MEDIA_AUDIO,
+        transition = TransitionType.DETAIL,
+        arguments = listOf(
+            navArgument("path") { type = NavType.StringType; defaultValue = "" }
+        )
+    ),
+    AppRoute(
+        route = Routes.MEDIA_IMAGE,
         transition = TransitionType.DETAIL,
         arguments = listOf(
             navArgument("path") { type = NavType.StringType; defaultValue = "" }

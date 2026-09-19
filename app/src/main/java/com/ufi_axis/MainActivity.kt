@@ -10,9 +10,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -38,16 +36,20 @@ import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
 import com.ufi_axis.app.navigation.buildAppScreens
 import androidx.navigation.compose.rememberNavController
-import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiDialogBody
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.page.registerBuiltInTransitions
 import com.ufi_axis.ui.navigation.MainNavGraph
+import com.ufi_axis.ui.components.common.UfiNowPlayingSlot
+import com.ufi_axis.ui.media.UfiAudioNowPlayingChip
+import com.ufi_axis.ui.media.UfiAudioNowPlayingProbe
 import com.ufi_axis.ui.screens.SetupScreen
+import com.ufi_axis.ui.screens.UfiHeaderCaptionProbe
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.ThemeMode
@@ -193,10 +195,17 @@ class MainActivity : ComponentActivity() {
                 // 主动重新配对开关：由设置页「重新配对 / 切换设备」触发（UID-001，T05）。
                 var forceSetup by remember { mutableStateOf(false) }
 
-                // 主动重新配对：清空凭据 + 丢弃设备身份密钥，强制回到 SetupScreen（T05）。
+                // 主 UI 分支里创建的 VM：切换设备时要清它的会话缓存。
+                // 用 var 槽而不是把 lambda 放到 VM 之后 —— onRepairRequested 必须在
+                // if/else 之前就绪（SetupScreen 分支也要能用，且 appScreens 要记住稳定实例）。
+                var sessionVm by remember { mutableStateOf<MainViewModel?>(null) }
+
+                // 主动重新配对：清空凭据 + 丢弃设备身份密钥 + 丢掉上一台设备的会话缓存，
+                // 强制回到 SetupScreen（T05 / 2026-09 P1）。
                 // 必须连密钥一起删：留着旧密钥就等于留着旧设备身份，用户"换设备/重新配对"的
                 // 意图（尤其是把这台从设备列表里摘掉）就落不了地。
                 val onRepairRequested: () -> Unit = {
+                    sessionVm?.prepareDeviceSwitch()
                     prefs.token = ""
                     DeviceKeyStore.reset()
                     prefs.isSetupComplete = false
@@ -232,12 +241,26 @@ class MainActivity : ComponentActivity() {
                             prefs.token
                         )
                     }
-                    // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
                     val owner = LocalLifecycleOwner.current
-                    DisposableEffect(webSocketRepository) {
+                    val viewModel: MainViewModel = viewModel(
+                        factory = ConnectionBootstrap.mainViewModelFactory(
+                            api, webSocketRepository, networkMonitor, applicationContext
+                        )
+                    )
+                    sessionVm = viewModel
+                    // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
+                    // 2026-09：同时接健康检查前后台闸门 —— 后台停周期 /health，回前台静默探一次再恢复。
+                    DisposableEffect(webSocketRepository, viewModel) {
                         webSocketRepository.bindNetworkRecovery(applicationContext)
                         val observer = LifecycleEventObserver { _, event ->
-                            if (event == Lifecycle.Event.ON_RESUME) webSocketRepository.onAppForegrounded()
+                            when (event) {
+                                Lifecycle.Event.ON_RESUME -> {
+                                    webSocketRepository.onAppForegrounded()
+                                    viewModel.onAppForegrounded()
+                                }
+                                Lifecycle.Event.ON_PAUSE -> viewModel.onAppBackgrounded()
+                                else -> {}
+                            }
                         }
                         owner.lifecycle.addObserver(observer)
                         onDispose {
@@ -245,11 +268,6 @@ class MainActivity : ComponentActivity() {
                             webSocketRepository.unbindNetworkRecovery()
                         }
                     }
-                    val viewModel: MainViewModel = viewModel(
-                        factory = ConnectionBootstrap.mainViewModelFactory(
-                            api, webSocketRepository, networkMonitor, applicationContext
-                        )
-                    )
 
                     // 2026-08-25: 启动全局告警轮询（UI 进程），确保在非监控页也能弹出 Toast（应用内 banner）。
                     // 与独立进程 NotifyService 的后台轮询配合：独立进程管系统通知，UI 进程管前台 banner。
@@ -353,7 +371,14 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    // 保存连接前记住上一次端点，用于 P2「同机轻刷新 / 换机丢缓存」分流。
+                    var lastEndpoint by remember {
+                        mutableStateOf("${prefs.serverIp}:${prefs.serverPort}")
+                    }
                     val onServerConfigChanged: () -> Unit = {
+                        val next = "${prefs.serverIp}:${prefs.serverPort}"
+                        val hostChanged = next != lastEndpoint
+                        lastEndpoint = next
                         ConnectionBootstrap.recreateRetrofit(prefs)
                         // 刷新实时通道：更新 WS 连接参数（url/token）并重连，
                         // 避免停留在旧地址（本实例由 MainViewModel 长期持有，更新即作用于同一连接）。
@@ -361,7 +386,11 @@ class MainActivity : ComponentActivity() {
                             ConnectionBootstrap.rewriteWsUrl(prefs.baseUrl),
                             prefs.token
                         )
-                        viewModel.dashboard.refreshDashboard()
+                        sessionVm?.onServerEndpointChanged(hostChanged)
+                        // 通知守护进程（token/IP 变更时 prefs setter 已 dispatch；此处兜底再推一次快照）
+                        com.ufi_axis.data.notification.NotifyDispatchReceiver.dispatchConnectionChange(
+                            applicationContext, prefs.baseUrl, prefs.token
+                        )
                     }
 
                     CompositionLocalProvider(LocalUfiReduceMotion provides reduceMotion) {
@@ -382,6 +411,24 @@ class MainActivity : ComponentActivity() {
                             pendingSmsPhone = pendingSmsPhone,
                             pendingAlertDeepLink = pendingAlertDeepLink
                         )
+
+                        // ── 「正在播放」：常驻探测 + 注入到各页标题栏右侧 ──
+                        //
+                        // 音乐跑在前台服务里、离开播放页也不停，控制入口得跟着用户走。
+                        // 之前试过悬浮迷你条（底部/顶部都试了）—— 无论放哪都在遮内容，还得配
+                        // 最小化/上滑关闭/自动收起才不烦人，那是在给"遮挡"打补丁。改放标题栏
+                        // 右侧动作区：不占内容空间、不需要收起逻辑，每页位置一致。
+                        //
+                        // 探测器必须挂在这里（Activity 顶层）而不是控件内部：标题栏要先知道
+                        // "有没有东西要显示"才能决定版式，写在控件里就成了「不渲染 ⇒ 探测不到」的死结。
+                        UfiAudioNowPlayingProbe(viewModel)
+                        LaunchedEffect(navController) {
+                            UfiNowPlayingSlot.content.value =
+                                { UfiAudioNowPlayingChip(navController) }
+                        }
+                        // 标题栏「标题下方小字」：天气 + 今日诗词（2026-09-18）。
+                        // 天气原来在标题栏右侧、与正在播放抢位置，现在两者各有其位。
+                        UfiHeaderCaptionProbe(viewModel)
                         // 告警浮层：2026-08-30 起复用**普通 Toast**（UfiToastOverlay），
                         // 原来那套独立的应用内 banner（UfiAlertBanner* 三个文件）已删除 ——
                         // 两套都是"挂在 decorView 的顶部浮层"，没有理由维护两份。
@@ -436,18 +483,25 @@ class MainActivity : ComponentActivity() {
                                 dismissOnBackPress = false,
                                 title = "无法连接后端服务",
                                 confirmButton = {
+                                    // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，
+                                    // 见 LocalUfiDialogClose。local 必须在弹窗自己的 slot 内部读，
+                                    // 在弹窗外面读会拿到"直接执行"的默认实现。
+                                    val close = LocalUfiDialogClose.current
                                     UfiButton(
                                         text = "重试",
-                                        onClick = { viewModel.retryFromBackendDown() }
+                                        onClick = { close { viewModel.retryFromBackendDown() } }
                                     )
                                 },
                                 dismissButton = {
+                                    val close = LocalUfiDialogClose.current
                                     UfiButton(
                                         variant = UfiButtonVariant.Secondary,
                                         text = "服务器设置",
                                         onClick = {
-                                            viewModel.dismissBackendDownDialog()
-                                            navController.navigate(Routes.DETAIL_SERVER_CONFIG)
+                                            close {
+                                                viewModel.dismissBackendDownDialog()
+                                                navController.navigate(Routes.DETAIL_SERVER_CONFIG)
+                                            }
                                         }
                                     )
                                 }
@@ -459,7 +513,7 @@ class MainActivity : ComponentActivity() {
                                         color = LocalResolvedPalette.current.textSecondary
                                     )
                                     dialog.errorMessage?.let { em ->
-                                        Spacer(Modifier.height(Spacing.Small))
+                                        // 间距统一到 UfiDialogBody（12dp）
                                         Text(
                                             text = "原始错误：$em",
                                             style = MaterialTheme.typography.bodySmall,
@@ -467,7 +521,6 @@ class MainActivity : ComponentActivity() {
                                         )
                                     }
                                     dialog.healthErrorMessage?.let { he ->
-                                        Spacer(Modifier.height(Spacing.Small))
                                         Text(
                                             text = "健康检查：$he",
                                             style = MaterialTheme.typography.bodySmall,

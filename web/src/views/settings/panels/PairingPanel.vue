@@ -615,26 +615,38 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
+  /* 不给 min-width:0，flex 子项的最小尺寸是内容宽：设备名上限 32 字符（见保存时的校验），
+     32 个汉字 13px ≈ 416px，会把右侧「重命名 / 移除」顶出卡片右边界。 */
+  min-width: 0;
 }
 .device-idx {
   font-size: 12px;
   color: var(--text-muted);
   font-weight: 600;
+  flex-shrink: 0;
 }
 .device-name-block {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 .device-name {
   font-size: 13px;
   font-weight: 500;
   color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .device-fp {
   font-family: 'Courier New', monospace;
   font-size: 11px;
   color: var(--text-muted);
+  /* 16 位 hex + `...` 等宽 ≈110px，同样不可断词 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .device-actions {
   display: flex;

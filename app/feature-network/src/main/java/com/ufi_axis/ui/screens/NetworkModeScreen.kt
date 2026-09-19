@@ -35,8 +35,7 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
     val connModeJson = connModeOf(deviceSettingsState.settings)
     val netModeJson = netModeOf(deviceSettingsState.settings)
 
-    // T15：档位键统一为 contract 别名（标签与 NetworkModeDialog 共用 NETWORK_MODE_LABELS），
-    // 设备回读的 net_select 是 Bearer 取值域，比对前先经 fromBearer 换算。
+    // 制式键统一为 contract 别名；当前档位以 net_select 为准（见 netModeOf）。
     val currentMode = NetworkMode.fromBearer(netModeJson)
 
     // 2026-09-11：「切换中」优先于回读值 —— 设备重新注册期间 /api/device/settings 仍报旧档位，
@@ -107,7 +106,8 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                         Spacer(Modifier.height(14.dp))
 
                         Text(
-                            NETWORK_MODE_LABELS[displayMode] ?: netModeJson,
+                            deviceSettingsState.settings?.networkModeLabel
+                                ?: NetworkMode.label(displayMode),
                             style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
                             color = palette.textPrimary
                         )
@@ -188,21 +188,24 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                 showCloseButton = false
             ) {
                 UfiDialogBody {
+                    // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+                    // 必须在弹窗自己的 content lambda 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+                    val close = LocalUfiDialogClose.current
+                    // 间距统一到 UfiDialogBody（12dp）：grid 不再自带 bottom contentPadding
                     LazyVerticalGrid(
                         columns = GridCells.Fixed(2),
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
-                        contentPadding = PaddingValues(bottom = Spacing.Large),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         items(NetworkMode.UI_OPTIONS.size) { idx ->
                             val key = NetworkMode.UI_OPTIONS[idx]
-                            val label = NETWORK_MODE_LABELS[key] ?: key
+                            val label = NetworkMode.label(key)
                             val isSelected = key == displayMode
                             Box(
                                 Modifier
                                     .fillMaxWidth()
-                                    .clickable { viewModel.network.setNetworkMode(key); showSheet = false }
+                                    .clickable { close { viewModel.network.setNetworkMode(key); showSheet = false } }
                                     .border(
                                         width = if (isSelected) 1.5.dp else 1.dp,
                                         color = if (isSelected) palette.accent else palette.cardBorder,

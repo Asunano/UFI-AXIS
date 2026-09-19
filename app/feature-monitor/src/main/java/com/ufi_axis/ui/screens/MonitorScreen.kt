@@ -226,17 +226,11 @@ fun MonitorScreen(
         title = "监控中心",
         navController = navController,
         showBack = showBack,
-        actions = {
-            // 只留一个齿轮。「告警设置」是监控设置里的一个入口（2026-09-08 从这里挪进去）——
-            // 顶栏并排两个图标要用户先猜哪个是哪个，而它本身就属于"监控的设置"。
-            IconButton(onClick = { navController.navigate(Routes.DETAIL_MONITOR_SETTINGS) }) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "监控设置",
-                    tint = palette.textSecondary
-                )
-            }
-        }
+        // 首页 Tab：标题栏显示「正在播放」。
+        //
+        // 2026-09-17：原来这里还有一个齿轮（跳「监控设置」）。它和「正在播放」抢同一块右侧
+        // 空间，而它本身是"设置"性质的东西 —— 已移到设置页的入口列表里（SettingsScreen）。
+        showNowPlaying = true
     ) { padding ->
         UfiPageBackgroundBox(modifier = Modifier.padding(padding)) {
             Column(Modifier.fillMaxSize()) {
@@ -284,30 +278,39 @@ fun MonitorScreen(
         visible = pendingDeleteAlertId != null,
         onDismiss = { pendingDeleteAlertId = null },
         title = "删除事件",
+        // 2026-09-18：自写的确认/取消按钮统一经 LocalUfiDialogClose 排时序 —— 弹窗离场的
+        // backdrop（逐渐清晰）要在窗口销毁前播完，直接翻状态会让弹窗当帧卸载、动画没机会播。
+        // local 必须在 slot 内部读，在弹窗外读到的是"直接执行"的默认实现。
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(text = "删除", onClick = {
-                pendingDeleteAlertId?.let { id -> viewModel.dashboard.deleteAlert(id) }
-                pendingDeleteAlertId = null
+                close {
+                    pendingDeleteAlertId?.let { id -> viewModel.dashboard.deleteAlert(id) }
+                    pendingDeleteAlertId = null
+                }
             })
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { pendingDeleteAlertId = null })
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { pendingDeleteAlertId = null } })
         }
     ) {
-        Text(
-            text = "确定删除这条事件？删除后不可恢复。",
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textPrimary
-        )
-        pendingDeleteAlert?.let { a ->
-            Spacer(Modifier.height(Spacing.Small))
+        // 间距统一到 UfiDialogBody（12dp）
+        UfiDialogBody {
             Text(
-                text = a.message,
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis
+                text = "确定删除这条事件？删除后不可恢复。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textPrimary
             )
+            pendingDeleteAlert?.let { a ->
+                Text(
+                    text = a.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.textSecondary,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
         }
     }
 }
@@ -1425,29 +1428,34 @@ fun EventsCenterContent(viewModel: MainViewModel) {
             onDismiss = { pendingDeleteAlertId = null },
             title = "删除事件",
             confirmButton = {
+                val close = LocalUfiDialogClose.current
                 UfiButton(text = "删除", onClick = {
-                    pendingDeleteAlertId?.let { id -> viewModel.dashboard.deleteAlert(id) }
-                    pendingDeleteAlertId = null
+                    close {
+                        pendingDeleteAlertId?.let { id -> viewModel.dashboard.deleteAlert(id) }
+                        pendingDeleteAlertId = null
+                    }
                 })
             },
             dismissButton = {
-                UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { pendingDeleteAlertId = null })
+                val close = LocalUfiDialogClose.current
+                UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { pendingDeleteAlertId = null } })
             }
         ) {
-            Text(
-                text = "确定删除这条事件？删除后不可恢复。",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.textPrimary
-            )
-            pendingDeleteAlert?.let { a ->
-                Spacer(Modifier.height(Spacing.Small))
+            UfiDialogBody {
                 Text(
-                    text = a.message,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textSecondary,
-                    maxLines = 3,
-                    overflow = TextOverflow.Ellipsis
+                    text = "确定删除这条事件？删除后不可恢复。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.textPrimary
                 )
+                pendingDeleteAlert?.let { a ->
+                    Text(
+                        text = a.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.textSecondary,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
         }
 
@@ -1509,13 +1517,15 @@ private fun EventFilterDialog(
         onDismiss = onDismiss,
         title = "筛选事件",
         confirmButton = {
-            UfiButton(text = "确定", onClick = { onConfirm(draftLevel, draftType, draftRead, draftDateKey, draftCustomRange) })
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "确定", onClick = { close { onConfirm(draftLevel, draftType, draftRead, draftDateKey, draftCustomRange) } })
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        UfiDialogBody {
             Text("日期", style = MaterialTheme.typography.labelMedium, color = palette.textSecondary)
             UfiSingleChipSelector(
                 options = listOf(
@@ -2168,30 +2178,35 @@ private fun PageSizeSettingsDialog(
         onDismiss = onDismiss,
         title = "每页显示数量",
         confirmButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "完成", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "完成", onClick = { close(onDismiss) })
         }
     ) {
         val palette = LocalResolvedPalette.current
-        Text(
-            text = "选择列表每页显示的事件数量，重启应用后仍保留。",
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textSecondary
-        )
-        Spacer(Modifier.height(Spacing.Medium))
-        UfiOptionGrid(
-            options = EventsPageSizeOptions.map { size ->
-                UfiOptionItem(
-                    value = size,
-                    label = "$size / 页",
-                    trailing = if (size == current) {
-                        { Icon(Icons.Filled.CheckCircle, null) }
-                    } else null
-                )
-            },
-            selectedValue = current,
-            onSelect = { onConfirm(it) },
-            columns = 3
-        )
+        // 选中一档即提交并关闭（onConfirm 里带 showPageSizeDialog = false），
+        // 所以这里的点击也是"关闭动作"，同样要走离场时序。
+        val close = LocalUfiDialogClose.current
+        UfiDialogBody {
+            Text(
+                text = "选择列表每页显示的事件数量，重启应用后仍保留。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textSecondary
+            )
+            UfiOptionGrid(
+                options = EventsPageSizeOptions.map { size ->
+                    UfiOptionItem(
+                        value = size,
+                        label = "$size / 页",
+                        trailing = if (size == current) {
+                            { Icon(Icons.Filled.CheckCircle, null) }
+                        } else null
+                    )
+                },
+                selectedValue = current,
+                onSelect = { size -> close { onConfirm(size) } },
+                columns = 3
+            )
+        }
     }
 }
 
@@ -2210,9 +2225,11 @@ private fun JumpPageDialog(
         onDismiss = onDismiss,
         title = "跳转到指定页",
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(text = "跳转", onClick = {
                 val parsed = input.trim().toIntOrNull()
-                if (parsed != null && parsed in 1..pageCount) onConfirm(parsed)
+                // 只有校验通过（会真的关闭弹窗）那一支走 close；校验失败弹窗要留着，不能包。
+                if (parsed != null && parsed in 1..pageCount) close { onConfirm(parsed) }
                 else android.widget.Toast.makeText(
                     toastContext,
                     "请输入 1 到 $pageCount 的页码",
@@ -2221,10 +2238,11 @@ private fun JumpPageDialog(
             })
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
+        UfiDialogBody {
             Text(
                 text = "当前共 $pageCount 页。输入目标页码直接跳转：",
                 style = MaterialTheme.typography.bodyMedium,

@@ -198,6 +198,13 @@ data class ToolsState(
      */
     val deliveryHistoryResult: String? = null,
     /**
+     * 渠道投递统计（`GET history/stats`）。与列表 state 分开：统计卡进页就要，
+     * 且不依赖分页游标 / 筛选。
+     */
+    val deliveryStatsChannel: String? = null,
+    val deliveryStats: com.ufi_axis.data.model.MailHistoryStatsResponse? = null,
+    val deliveryStatsLoaded: Boolean = false,
+    /**
      * 当前装的是哪个渠道的记录（`"mail"` / `"webhook"` / `"local_sms"`，null = 全部渠道）。
      *
      * 三条渠道页共用同一个槽位，各自的入口行摘要必须先比对这个字段 ——
@@ -437,6 +444,53 @@ data class TrafficManagementState(
     val isSaving: Boolean = false,
     val errorMessage: String? = null,
     val successMessage: String? = null
+)
+
+/**
+ * 「流量历史」卡片状态（工具 → 流量管理，`GET /api/traffic/usage`）。
+ *
+ * ## 为什么按 range 各存一份，而不是一个 `data: TrafficUsageResponse?`
+ * range 是「选一个」的配置：切到「周」时若把「日」那份清掉，切回来必然白屏一次
+ * （请求最快也要一个 RTT）。按项目既有约定 —— 每份独立存、切换只改「当前选中」——
+ * 切换时先渲染已有的那份，再由后台刷新覆盖。[data] 就是「当前选中那一份」。
+ */
+data class TrafficHistoryState(
+    val range: String = TRAFFIC_HISTORY_RANGE_DAY,
+    /**
+     * 当前查看的锚点（epoch ms）；null = 当前这一段（今天 / 本周 / 本月 / 本年）。
+     *
+     * 左右滑动翻页时改这个值，用的是接口回的 `prev_anchor` / `next_anchor` ——
+     * 客户端不做月长度、闰年、DST 这些日历运算，core 已经算对了。
+     */
+    val anchor: Long? = null,
+    val dataByKey: Map<String, TrafficUsageResponse> = emptyMap(),
+    /** 只在**当前段还没有任何数据**时才为 true（有图时翻它不改变任何像素）。 */
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null
+) {
+    /** 缓存键：range 与 anchor 组合。同一 range 的不同天要各存一份，否则来回翻页每次都白拉。 */
+    val key: String get() = cacheKeyOf(range, anchor)
+
+    /** 当前段的数据；null = 这一段还没成功拉到过。 */
+    val data: TrafficUsageResponse? get() = dataByKey[key]
+
+    companion object {
+        fun cacheKeyOf(range: String, anchor: Long?): String = "$range@${anchor ?: 0L}"
+    }
+}
+
+/** 流量历史的四个区间标识，与 core `/api/traffic/usage` 的 `range` 参数取值一致。 */
+const val TRAFFIC_HISTORY_RANGE_DAY = "day"
+const val TRAFFIC_HISTORY_RANGE_WEEK = "week"
+const val TRAFFIC_HISTORY_RANGE_MONTH = "month"
+const val TRAFFIC_HISTORY_RANGE_YEAR = "year"
+
+/** 下拉菜单的展示文案。顺序即菜单顺序。 */
+val TRAFFIC_HISTORY_RANGES: List<Pair<String, String>> = listOf(
+    TRAFFIC_HISTORY_RANGE_DAY to "日",
+    TRAFFIC_HISTORY_RANGE_WEEK to "周",
+    TRAFFIC_HISTORY_RANGE_MONTH to "月",
+    TRAFFIC_HISTORY_RANGE_YEAR to "年"
 )
 
 // ========== Frontend App Update（2026-08-10 C5：前端 App 自更新） ==========

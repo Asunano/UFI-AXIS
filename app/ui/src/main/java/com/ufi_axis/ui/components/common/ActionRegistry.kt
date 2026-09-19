@@ -54,16 +54,9 @@ object ActionRegistry {
             listOf(ParamDef("enabled", "状态", ParamType.BOOLEAN, JsonPrimitive(true)))),
         ActionDef("network_mode", "network", "网络模式", Icons.Default.CellWifi,
             listOf(ParamDef("mode", "模式", ParamType.STRING, JsonPrimitive(NetworkMode.LTE_AND_5G),
-                // T15：取值必须是 contract 的**别名集**（core 侧 NetworkMode.toBearer 再映射成设备值）；
-                // 此前 ActionExecutorImpl 不做映射，选「仅 5G」下发 5G_ONLY 被设备忽略，静默失败。
-                options = listOf(
-                    NetworkMode.AUTO to "自动",
-                    NetworkMode.ONLY_5G to "仅 5G",
-                    NetworkMode.LTE_AND_5G to "5G 优先",
-                    NetworkMode.ONLY_LTE to "仅 4G",
-                    NetworkMode.WCDMA_AND_LTE to "4G / 3G",
-                    NetworkMode.ONLY_WCDMA to "仅 3G"
-                )))),
+                // 取值是 contract 别名；中文名与顺序来自 core NetworkMode，App 不再各译一份。
+                options = NetworkMode.UI_OPTIONS.map { it to NetworkMode.label(it) }
+            ))),
 
         // 系统类
         ActionDef("reboot", "system", "重启设备", Icons.Default.RestartAlt, emptyList()),

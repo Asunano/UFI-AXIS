@@ -65,7 +65,7 @@ fun PairingConfigScreen(
         showHeader = showHeader
     ) { padding ->
         // 入场动画统一收敛到 MainNavGraph 根节点（"app-launch"，只在冷启动播一次）。
-        // 二级页本来就有 NavHost 的 detailEnter 平移转场，再叠一层淡入+上移是双重动画。
+        // 二级页本来就有 NavHost 的 detailSharedAxisEnter 平移转场（无 fade），再叠一层淡入+上移是双重动画。
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             pairingState.errorMessage?.let { err ->
                 UfiErrorBanner(message = err, onRetry = { viewModel.network.loadPairingStatus() })

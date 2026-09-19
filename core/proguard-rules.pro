@@ -90,3 +90,10 @@
 -keep class javax.activation.** { *; }
 -keep class com.sun.activation.** { *; }
 -dontwarn javax.activation.**
+
+# FFmpegKit：Java 层随 APK 走（core:api 的 implementation(files("libs/ffmpeg-kit-classes.jar"))），
+# native 层（9 个 .so）是可选插件组件，运行时 System.load(绝对路径) 加载。
+# keep 是必需的：Java 类只被反射（Class.forName）引用，R8 找不到静态引用会整包剥掉；
+# 且 native 方法名/签名必须与 .so 里注册的一致，混淆会让 JNI 注册对不上。
+-keep class com.arthenica.ffmpegkit.** { *; }
+-dontwarn com.arthenica.ffmpegkit.**

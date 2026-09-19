@@ -1,5 +1,5 @@
 <template>
-  <div class="settings-shell">
+  <div ref="shellEl" class="settings-shell">
     <!--
       分类导航与「设备」页同款：naive-ui 的 segment 分段标签。
       value 绑 ?tab= 而不是本地 ref：刷新、收藏、以及从旧的 /pairing、/sms-forward
@@ -10,6 +10,11 @@
       不用 n-tabs 的 animated：它靠等高假设做横向位移过渡，而这里每个面板高度差很大、
       又是异步组件（挂载瞬间是空的），过渡期间会先塌成一小块再撑开，看起来就是闪一下。
       改用面板自己的淡入上浮（见 .n-tab-pane 的 pane-in），只动透明度和 4px 位移，不动布局。
+
+      窄屏（≤768px）下这 10 个页签装不下一行，rail 会横向滚动（规则在 main.css，
+      全站 segment 标签共用一份）。滚动带来一个新问题：靠 `?tab=backup` 直接进页面时，
+      激活页签可能在视野之外 —— 用户看到的是一条停在「通用」的标签条，而内容却是备份页。
+      所以挂载与切栏后都把激活项滚进视野，见 scrollActiveTabIntoView。
     -->
     <n-tabs type="segment" :value="activeKey" @update:value="select">
       <n-tab-pane v-for="c in CATEGORIES" :key="c.key" :name="c.key" :tab="c.label">
@@ -24,11 +29,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 
 const route = useRoute();
 const router = useRouter();
+
+const shellEl = ref<HTMLElement | null>(null);
 
 interface Category {
   key: string;
@@ -71,6 +78,12 @@ const CATEGORIES: Category[] = [
     component: defineAsyncComponent(() => import('./panels/NotifyPanel.vue')),
   },
   {
+    key: 'uiExtras',
+    label: '界面小功能',
+    desc: '顶栏天气与每日诗词。配置存在设备端，与手机端共用同一份',
+    component: defineAsyncComponent(() => import('./panels/UiExtrasPanel.vue')),
+  },
+  {
     key: 'pairing',
     label: '配对与授权',
     desc: '配对码、已配对设备与配对密码',
@@ -110,6 +123,33 @@ function select(key: string) {
   // replace 而不是 push：浏览器返回键应该离开设置页，而不是在分栏之间逐个回退
   router.replace({ name: 'settings', query: { ...route.query, tab: key } });
 }
+
+/**
+ * 把激活页签滚进视野。**只在 rail 真的可滚动时才动**（窄屏横向滚动形态）。
+ *
+ * 为什么必须有：窄屏下 rail 横向滚动（规则在 main.css），而靠 `?tab=backup` 直接进页面时
+ * 激活项可能排在第 9 位、完全在视野之外 —— 用户看到标签条停在「通用」、内容却是备份页，
+ * 只会以为标签条坏了。
+ *
+ * 用 `scrollLeft` 手算而不是 `scrollIntoView`：后者在某些浏览器上会顺带把**整页**纵向滚一下
+ * （元素在纵向也不完全可见时），进设置页就被莫名往下带一截。这里只改横向偏移，不碰纵向。
+ *
+ * `inline: 'center'` 的等价算法：把激活项中心对到 rail 可视区中心，再夹到合法滚动范围。
+ */
+async function scrollActiveTabIntoView() {
+  await nextTick();
+  const rail = shellEl.value?.querySelector<HTMLElement>('.n-tabs-rail');
+  // 不可滚动（宽屏铺满整行）时什么都不做
+  if (!rail || rail.scrollWidth <= rail.clientWidth) return;
+  const active = rail.querySelector<HTMLElement>('.n-tabs-tab--active');
+  if (!active) return;
+  const target = active.offsetLeft + active.offsetWidth / 2 - rail.clientWidth / 2;
+  rail.scrollTo({ left: Math.max(0, Math.min(target, rail.scrollWidth - rail.clientWidth)), behavior: 'smooth' });
+}
+
+onMounted(scrollActiveTabIntoView);
+// 切栏后也要跟一次：点最右侧那几个页签时，它本身只露出一半
+watch(activeKey, scrollActiveTabIntoView);
 </script>
 
 <style scoped>

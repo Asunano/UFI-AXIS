@@ -94,6 +94,8 @@ import com.ufi_axis.viewmodel.state.MonitorState
 import com.ufi_axis.ui.animation.rememberUfiPressed
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.UfiDialogBody
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
@@ -940,70 +942,81 @@ fun MonitorSortDialog(
         visible = visible,
         onDismiss = onDismiss,
         title = "事件排序",
+        // 2026-09-18：确认/取消都会关闭弹窗，动作交给 LocalUfiDialogClose 排时序 ——
+        // 直接翻状态会让弹窗当帧卸载，backdrop 的"逐渐清晰"没机会播。local 要在 slot 内部读。
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "确认",
                 onClick = {
-                    onSelect(draft)
-                    onDismiss()
+                    close {
+                        onSelect(draft)
+                        onDismiss()
+                    }
                 }
             )
         },
-        dismissButton = { UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss) }
+        dismissButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
+        }
     ) {
-        // v3：单行大按钮，每行一个排序选项，文字/图标更大、更易点击。
-        EventSortMode.entries.forEach { mode ->
-            val selected = mode == draft
-            val bg = if (selected) palette.accent else palette.cardBg
-            val content = if (selected) palette.onAccent else palette.textSecondary
-            val border = if (selected) palette.accent else palette.cardBorder.copy(alpha = 0.6f)
-            val interactionSource = remember { MutableInteractionSource() }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(48.dp)
-                    // 2026-09-04（P2d）：0.97 → UfiMotion.PressScale.Chip（值不变），可点列表行同档。
-                    // 2026-09-04（P2f 短按看不见）：改用 ufiPressScale。原写法（animateFloatAsState
-                    // 跟随 isPressed）在抬手瞬间就被拉回 1f，短按走不出可见幅度；弹窗里的按钮
-                    // 同样中招，正是用户实测反馈的"弹窗内的按钮也一样"。
-                    .ufiPressScale(
-                        interactionSource = interactionSource,
-                        pressedScale = UfiMotion.PressScale.Chip,
-                        spec = tween(UfiMotion.Duration.Micro)
-                    )
-                    .clip(UfiCardDefaults.shape)
-                    .background(bg)
-                    .border(1.dp, border, UfiCardDefaults.shape)
-                    .clickable(
-                        interactionSource = interactionSource,
-                        indication = null
-                    ) { draft = mode }
-                    .padding(horizontal = 14.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Icon(
-                    imageVector = if (mode.isAscending) Icons.Filled.ArrowUpward else Icons.Filled.ArrowDownward,
-                    contentDescription = null,
-                    tint = content,
-                    modifier = Modifier.size(20.dp)
-                )
-                Spacer(Modifier.width(12.dp))
-                Text(
-                    text = mode.label,
-                    style = UfiTextStyles.body.copy(fontWeight = if (selected) UfiWeight.Strong else UfiWeight.Medium),
-                    color = content,
-                    modifier = Modifier.weight(1f)
-                )
-                if (selected) {
+        // 间距统一到 UfiDialogBody（12dp）：行与行的间距由外壳排，行尾不再手写 Spacer
+        //（最后一行那个 8dp 还会和 footer 的内距叠起来）。
+        UfiDialogBody {
+            // v3：单行大按钮，每行一个排序选项，文字/图标更大、更易点击。
+            EventSortMode.entries.forEach { mode ->
+                val selected = mode == draft
+                val bg = if (selected) palette.accent else palette.cardBg
+                val content = if (selected) palette.onAccent else palette.textSecondary
+                val border = if (selected) palette.accent else palette.cardBorder.copy(alpha = 0.6f)
+                val interactionSource = remember { MutableInteractionSource() }
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        // 2026-09-04（P2d）：0.97 → UfiMotion.PressScale.Chip（值不变），可点列表行同档。
+                        // 2026-09-04（P2f 短按看不见）：改用 ufiPressScale。原写法（animateFloatAsState
+                        // 跟随 isPressed）在抬手瞬间就被拉回 1f，短按走不出可见幅度；弹窗里的按钮
+                        // 同样中招，正是用户实测反馈的"弹窗内的按钮也一样"。
+                        .ufiPressScale(
+                            interactionSource = interactionSource,
+                            pressedScale = UfiMotion.PressScale.Chip,
+                            spec = tween(UfiMotion.Duration.Micro)
+                        )
+                        .clip(UfiCardDefaults.shape)
+                        .background(bg)
+                        .border(1.dp, border, UfiCardDefaults.shape)
+                        .clickable(
+                            interactionSource = interactionSource,
+                            indication = null
+                        ) { draft = mode }
+                        .padding(horizontal = 14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Icon(
-                        imageVector = Icons.Filled.Check,
-                        contentDescription = "已选择",
+                        imageVector = if (mode.isAscending) Icons.Filled.ArrowUpward else Icons.Filled.ArrowDownward,
+                        contentDescription = null,
                         tint = content,
                         modifier = Modifier.size(20.dp)
                     )
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = mode.label,
+                        style = UfiTextStyles.body.copy(fontWeight = if (selected) UfiWeight.Strong else UfiWeight.Medium),
+                        color = content,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (selected) {
+                        Icon(
+                            imageVector = Icons.Filled.Check,
+                            contentDescription = "已选择",
+                            tint = content,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
-            Spacer(Modifier.height(8.dp))
         }
     }
 }

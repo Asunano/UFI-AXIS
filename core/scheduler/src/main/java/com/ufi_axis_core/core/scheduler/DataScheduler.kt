@@ -22,6 +22,7 @@ import kotlinx.serialization.json.contentOrNull
 import com.ufi_axis_core.core.database.CpuHistoryRecord
 import com.ufi_axis_core.core.database.SignalRecord
 import com.ufi_axis_core.core.database.TrafficRecord
+import com.ufi_axis_core.core.database.TrafficHourlyAccumulator
 import com.ufi_axis_core.core.database.MemoryHistoryRecord
 import com.ufi_axis_core.core.database.BatteryHistoryRecord
 import com.ufi_axis_core.util.AppLogger
@@ -394,6 +395,13 @@ class DataScheduler(
     //   · 日期变了才重建基线 → 每天 0 点自动重置。
     private val _todayTraffic = MutableStateFlow(0L to 0L)   // (rxBytes, txBytes)
     val todayTraffic: StateFlow<Pair<Long, Long>> = _todayTraffic
+
+    // ── 每小时流量用量采样器（流量历史）──
+    // 与上面的「今日基线」是两件事：那个是"今天从哪儿起算"，这个是"上一次看到的月累计"。
+    // 每小时用量 = 逐次采样的 (本次月累计 − 上次月累计) 累加进当前小时桶（traffic_hourly）。
+    // 判定逻辑全在 TrafficHourlyAccumulator 里（纯函数，可单测），这里只做载入 / 持久化 / 落库。
+    @Volatile private var hourlySamplerLoaded = false
+    @Volatile private var hourlySample: TrafficHourlyAccumulator.Sample? = null
 
     // 基线的内存副本：避免每个采集周期都读 SharedPreferences；首次使用时从 prefs 惰性载入。
     // settings 为 null（测试/降级装配）时退化为纯内存基线，重启即失效。
@@ -1075,6 +1083,9 @@ class DataScheduler(
                 if (rx > 0 || tx > 0) {
                     _goformTraffic.value = Pair(rx, tx)
                     advanceTodayTraffic(rx, tx)
+                    // 每小时用量落库（流量历史的唯一数据源）。与今日流量分开：今日只在内存里，
+                    // 而历史必须落库才可能回看。
+                    recordHourlyUsage(rx, tx)
                     // 冷数据：不通过 WebSocket 推送，前端通过 /api/dashboard/summary REST API 获取
                 }
                 // 实时吞吐量（Modem 固件直接上报，bytes/s）
@@ -1139,6 +1150,99 @@ class DataScheduler(
 
         _todayTraffic.value =
             (monthRx - baselineRx).coerceAtLeast(0) to (monthTx - baselineTx).coerceAtLeast(0)
+    }
+
+    /**
+     * 把「本次月累计 − 上次月累计」累加进当前小时桶（`traffic_hourly`），流量历史的唯一写入口。
+     *
+     * 判定全部委托给 [TrafficHourlyAccumulator.decide]（纯函数、可单测）：首次采样、时间倒流、
+     * 离线过久、计数器归零这四种情形只更新基准、不落增量 —— 宁可少一段，不能凭空多一段。
+     *
+     * 基准（上一次采样）持久化在 `AppSettings.trafficHourlySamplerJson`，否则 core 每次重启都会
+     * 丢掉"重启前最后一次采样 → 重启后第一次采样"之间的量。settings 为 null（测试/降级装配）时
+     * 退化为纯内存基准，重启即失效 —— 与今日基线同一取舍。
+     *
+     * 整个函数吞异常：流量历史是附加功能，它写不进去不能影响采集主链路。
+     *
+     * **调用不变量**：只由 [collectGoformTraffic] 调用，而后者只在采集主循环这一个协程里跑 ——
+     * 所以 `hourlySamplerLoaded` / `hourlySample` 的"读-判断-改"三步是串行的。
+     * 将来若出现第二个写入方，这两个字段必须改成 Mutex 保护或合并成一个 AtomicReference。
+     */
+    private suspend fun recordHourlyUsage(monthRx: Long, monthTx: Long) {
+        try {
+            if (!hourlySamplerLoaded) {
+                hourlySamplerLoaded = true
+                val stored = settings?.trafficHourlySamplerJson
+                if (stored != null) {
+                    try {
+                        val obj = kotlinx.serialization.json.Json.parseToJsonElement(stored).jsonObject
+                        val at = obj["at"]?.jsonPrimitive?.longOrNull
+                        val rx = obj["rx"]?.jsonPrimitive?.longOrNull
+                        val tx = obj["tx"]?.jsonPrimitive?.longOrNull
+                        hourlySample = if (at != null && rx != null && tx != null) {
+                            TrafficHourlyAccumulator.Sample(at, rx, tx)
+                        } else null
+                    } catch (e: Exception) {
+                        AppLogger.w(tag, "小时用量基准解析失败，按首次采样处理: ${e.message}")
+                        hourlySample = null
+                    }
+                }
+            }
+
+            val decision = TrafficHourlyAccumulator.decide(
+                prev = hourlySample,
+                nowMs = System.currentTimeMillis(),
+                monthRx = monthRx,
+                monthTx = monthTx,
+                zone = java.time.ZoneId.systemDefault()
+            )
+
+            val next = when (decision) {
+                is TrafficHourlyAccumulator.Decision.SkipDelta -> {
+                    // no-change 每个采样周期都会命中（没跑流量时），别在这条上刷日志
+                    if (decision.reason != TrafficHourlyAccumulator.NO_CHANGE_REASON) {
+                        AppLogger.d(tag, "小时用量丢弃本次增量: ${decision.reason}")
+                    }
+                    decision.next
+                }
+                is TrafficHourlyAccumulator.Decision.Record -> decision.next
+            }
+
+            // 内存基准每轮都前进：`at` 不前进的话，空闲 20 分钟后的第一笔真实增量会被
+            // 离线守卫（OFFLINE_GAP_MS）误判成"core 离线过久"而整块丢掉。
+            hourlySample = next
+
+            // 但**只在累计值真的动过时才落 prefs**：没跑流量时每个采集周期都是 no-change，
+            // 照写就是每十几秒一次无效的 SharedPreferences 落盘（纯白烧 IO 与闪存寿命）。
+            // 代价是空闲期间进程被杀后基准的 at 偏旧，重启后第一笔增量会被离线守卫丢掉一次 ——
+            // 方向是"少记"，可接受。
+            val cumulativeChanged =
+                decision !is TrafficHourlyAccumulator.Decision.SkipDelta ||
+                    decision.reason != TrafficHourlyAccumulator.NO_CHANGE_REASON
+            if (cumulativeChanged) {
+                settings?.trafficHourlySamplerJson = kotlinx.serialization.json.buildJsonObject {
+                    put("at", JsonPrimitive(next.atMs))
+                    put("rx", JsonPrimitive(next.rx))
+                    put("tx", JsonPrimitive(next.tx))
+                }.toString()
+            }
+
+            // 基准**先**落 prefs、再落库：顺序反过来的话，进程在"库已写、prefs 未写"之间被杀
+            // 且在 OFFLINE_GAP_MS 内重启，同一段增量会被再累加一次（图上凭空多一截）。
+            // 现在这个顺序最坏情况是丢一段（约一个采样间隔的量），肉眼不可见。
+            if (decision is TrafficHourlyAccumulator.Decision.Record) {
+                database.trafficHourlyDao().addUsage(
+                    hourStart = decision.hourStart,
+                    rxDelta = decision.rxDelta,
+                    txDelta = decision.txDelta,
+                    now = decision.next.atMs
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是失败，见 collectTraffic
+        } catch (e: Exception) {
+            AppLogger.w(tag, "小时用量落库失败: ${e.message}")
+        }
     }
 
     // ── SMS 已读状态管理 ──

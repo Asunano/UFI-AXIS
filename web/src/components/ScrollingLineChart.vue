@@ -718,7 +718,7 @@ watch(colors, () => draw());
   padding: 6px 8px;
   font-size: 12px;
   color: var(--text-primary);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  box-shadow: 0 2px 8px var(--shadow-color-soft);
   white-space: nowrap;
 }
 .slc-tip-time {

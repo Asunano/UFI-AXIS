@@ -36,7 +36,7 @@ private fun normalizedDistance(position: Float): Float = abs(position).coerceIn(
 /**
  * 渐入渐出（默认策略）。
  *
- * 观感复刻现有 `tabEnter`（`fadeIn(220) + scaleIn(0.98f)`），保证接入后**零视觉回归**。
+ * 观感复刻 `UfiPageTransitions.Fade`（`fadeIn(220) + scaleIn(0.98f)`），保证接入后**零视觉回归**。
  *
  * 映射：
  * - `alpha = (1 - |p| * 1.6) coerceIn 0..1` —— 系数 `1.6` 让淡出比位移更快结束，

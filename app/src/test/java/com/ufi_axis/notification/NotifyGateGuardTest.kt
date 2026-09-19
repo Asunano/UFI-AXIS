@@ -196,4 +196,33 @@ class NotifyGateGuardTest {
             body.contains("dispatchSwitchSnapshot(")
         )
     }
+
+    /**
+     * 2026-09-13 回归护栏：applyRemote 在 `if (local == remote) return` 早退分支内必须补 dispatchSwitchSnapshot。
+     *
+     * 不变量：日常通知分类 / 免打扰开关·时段 / 告警二级闸门等入口都在写本地 pref 之后走
+     * updateNotificationConfig → applyRemote，而 UI 已先写好新值使 local == remote、命中早退分支。
+     * 早退原本会跳过函数末尾的下发，导致 :ufi_notify 的 mirror_ 副本停在旧值、继续按旧值判闸
+     * （「本地开、系统通知不弹」的假开关）。早退分支内补一次下发即可修复。
+     */
+    @Test
+    fun applyRemoteEarlyReturnMustPushMirrorSnapshot() {
+        val body = functionBody(executableCode(source(configSyncPath)), "applyRemote")
+        val marker = "if (local == remote)"
+        val start = body.indexOf(marker)
+        assertTrue("applyRemote 应保留 `if (local == remote) return` 的早退优化", start >= 0)
+        val after = body.substring(start + marker.length)
+        // 早退分支体 = 从 if 到全量分支起点（NotifyPrefs.shared(...).edit()）之间的片段。
+        val fullBodyStart = after.indexOf("NotifyPrefs.shared(context).edit()")
+        val branch = if (fullBodyStart >= 0) after.substring(0, fullBodyStart) else after
+        assertTrue(
+            "applyRemote 的早退分支必须含 dispatchSwitchSnapshot(...)：否则 UI 已先写本地 pref 致 " +
+                "local == remote 时跳过镜像下发，`:ufi_notify` 仍按旧值判闸（假开关）。",
+            branch.contains("dispatchSwitchSnapshot(")
+        )
+        assertFalse(
+            "早退分支应只补一次镜像下发，不得再写共享 prefs / 重排守护（全量分支才做）。",
+            branch.contains("NotifyPrefs.shared(context).edit()")
+        )
+    }
 }

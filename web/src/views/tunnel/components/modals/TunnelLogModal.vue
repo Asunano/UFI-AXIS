@@ -3,7 +3,7 @@
     :show="show"
     preset="card"
     :title="`${kind === 'frp' ? 'FRP' : 'CF'} 日志 · ${name}`"
-    style="max-width: 900px"
+    style="width: 900px; max-width: calc(100vw - 32px)"
     @update:show="emit('update:show', $event)"
   >
     <n-space :size="8" align="center" style="margin-bottom: 8px">

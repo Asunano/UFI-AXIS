@@ -558,8 +558,12 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
             visible = filterDialogVisible,
             onDismiss = { filterDialogVisible = false },
             title = "筛选",
+            // 2026-09-18：「完成」会关闭弹窗，动作交给 LocalUfiDialogClose 排时序（离场 backdrop
+            // 要在窗口销毁前播完）；local 必须在 slot 内部读。
+            // 「重置」只清筛选条件、弹窗留着，所以不包。
             confirmButton = {
-                UfiButton(text = "完成", onClick = { filterDialogVisible = false })
+                val close = LocalUfiDialogClose.current
+                UfiButton(text = "完成", onClick = { close { filterDialogVisible = false } })
             },
             dismissButton = {
                 UfiButton(
@@ -625,7 +629,9 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
         },
         title = viewingName ?: if (isAppSide) "手机日志文件" else "设备日志文件",
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             if (viewingName != null) {
+                // 「返回列表」只是退回文件列表、弹窗还在，所以不走 close。
                 UfiButton(
                     text = "返回列表",
                     onClick = {
@@ -633,7 +639,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                     }
                 )
             } else {
-                UfiButton(text = "关闭", onClick = { logFilesDialogVisible = false })
+                UfiButton(text = "关闭", onClick = { close { logFilesDialogVisible = false } })
             }
         },
         dismissButton = if (viewingName == null && fileRows.isNotEmpty()) {

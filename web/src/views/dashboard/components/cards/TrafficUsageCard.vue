@@ -2,6 +2,8 @@
   <GridCard class="panel-card" title="流量使用情况">
     <template #extra>
       <n-tag size="small" :type="usageStatusType" :bordered="false" round>{{ usageStatusText }}</n-tag>
+      <!-- 「历史」与「设限额」并列：一个看过去、一个改规则，都是这张卡的下钻动作 -->
+      <n-button size="small" quaternary @click="showHistory = true">历史</n-button>
       <n-button size="small" quaternary type="primary" @click="emit('open-limit')">设限额</n-button>
     </template>
 
@@ -41,6 +43,11 @@
         <span class="usage-hero-label">本月总流量</span>
       </div>
     </div>
+
+    <!-- 流量历史：本卡的下钻浮层。它只读 /api/traffic/usage、不碰限额的写流程，
+         所以状态留在卡里而不是抬到页面级（限额相反，见 open-limit）。
+         弹窗自己在 after-enter 里才取数，常驻挂载不会白发请求。 -->
+    <TrafficHistoryModal v-model:show="showHistory" />
   </GridCard>
 </template>
 
@@ -52,16 +59,26 @@
  * 反过来把 traffic_summary / traffic_limit 当 props 传进来，只会多一层转发。
  * 限额的**写**留在父组件：保存后要 settleDelay + loadSummary，那是页面级的取数节奏。
  */
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useChartColors } from '@/composables/chartTheme';
 import { formatBytes, get } from '@/composables/utils';
 import GridCard from '@/components/GridCard.vue';
+import TrafficHistoryModal from '@/views/traffic/TrafficHistoryModal.vue';
 
 const emit = defineEmits<{ (e: 'open-limit'): void }>();
 
 const dashboardStore = useDashboardStore();
 const colors = useChartColors();
+
+/**
+ * 流量历史弹窗开关。
+ *
+ * 与「设限额」不同，这里不 emit 给父组件：限额是**写**操作，保存后还要
+ * settleDelay + 重新 loadSummary，那份节奏必须留在页面级；历史只读，
+ * 转发一层只是噪音。2026-09-15 从「push 到 traffic-history 路由」改为弹窗。
+ */
+const showHistory = ref(false);
 
 const trafficSummary = computed(() => get(dashboardStore.summary, 'traffic_summary', null));
 const trafficLimit = computed(() => get(dashboardStore.summary, 'traffic_limit', null));

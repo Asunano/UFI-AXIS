@@ -3,7 +3,7 @@
     :show="show"
     preset="card"
     :title="isNew ? '新建 FRP 通道' : `编辑 ${nameInput}`"
-    style="max-width: 720px"
+    style="width: 720px; max-width: calc(100vw - 32px)"
     @update:show="emit('update:show', $event)"
   >
     <n-space vertical :size="10">

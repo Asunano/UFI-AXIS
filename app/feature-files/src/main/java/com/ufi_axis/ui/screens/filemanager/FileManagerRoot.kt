@@ -211,11 +211,6 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
             viewModel.navigateToDir(f.path)
             return
         }
-        // 受支持的压缩包直接解压（与 web 端双击行为一致）；rar/7z/bz2/xz 等不支持的回落到详情。
-        if (canExtract(f.name)) {
-            viewModel.extractArchive(f.path, f.name)
-            return
-        }
         val encoded = URLEncoder.encode(f.path, "UTF-8")
         when (fileKindOf(f.name)) {
             // 图片/视频/音频：不再进独立导航页，改为在文件管理器之上叠加预览悬浮窗。
@@ -223,6 +218,8 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
             FileKind.VIDEO -> previewTarget = f
             FileKind.AUDIO -> previewTarget = f
             FileKind.TEXT -> navController.navigate("file/editor?path=" + encoded)
+            // 压缩包（含可解压的 zip/tar.gz）与 apk 都落这里：它们的动作会改设备文件系统，
+            // 单击这种一碰就触发、又没有确认的手势不该直接执行，交给详情弹窗的主操作按钮。
             else -> { infoTarget = f; showInfo = true }
         }
     }
@@ -529,7 +526,7 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                                 // 下标会整体错位，带下标 key 的 item 会被判定为"全换了一遍"。
                                 items(displayFiles, key = { it.path }) { item ->
                                     val fileOptions = buildList {
-                                        add(UfiPopupOption("open", openActionLabel(item), icon = Icons.AutoMirrored.Filled.Launch) { handleAction("open", item) })
+                                        add(UfiPopupOption("open", fileKindOf(item.name, item.isDirectory).openActionLabel, icon = Icons.AutoMirrored.Filled.Launch) { handleAction("open", item) })
                                         add(UfiPopupOption("download", "下载", icon = Icons.Filled.Download) { handleAction("download", item) })
                                         add(UfiPopupOption("info", "信息", icon = Icons.Filled.Info) { handleAction("info", item) })
                                         add(UfiPopupOption("copy", "复制", icon = Icons.Filled.ContentCopy) { handleAction("copy", item) })
@@ -539,7 +536,9 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                                         if (item.name.endsWith(".apk", ignoreCase = true)) {
                                             add(UfiPopupOption("install", "安装APK", icon = Icons.Filled.InstallMobile) { handleAction("install", item) })
                                         }
-                                        if (canExtract(item.name)) {
+                                        // canExtract 只看文件名，所以名字以 .zip 结尾的**目录**也会命中；
+                                        // 目录不可解压，必须显式排除，否则菜单里会长出一个点了必然失败的项。
+                                        if (!item.isDirectory && canExtract(item.name)) {
                                             add(UfiPopupOption("extract", "解压", icon = Icons.Filled.FolderZip) { handleAction("extract", item) })
                                         }
                                         if (!item.isDirectory) {
@@ -575,7 +574,7 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                             ) {
                                 items(displayFiles, key = { it.path }) { item ->
                                     val fileOptions = buildList {
-                                    add(UfiPopupOption("open", openActionLabel(item), icon = Icons.AutoMirrored.Filled.Launch) { handleAction("open", item) })
+                                    add(UfiPopupOption("open", fileKindOf(item.name, item.isDirectory).openActionLabel, icon = Icons.AutoMirrored.Filled.Launch) { handleAction("open", item) })
                                     add(UfiPopupOption("download", "下载", icon = Icons.Filled.Download) { handleAction("download", item) })
                                     add(UfiPopupOption("info", "信息", icon = Icons.Filled.Info) { handleAction("info", item) })
                                     add(UfiPopupOption("copy", "复制", icon = Icons.Filled.ContentCopy) { handleAction("copy", item) })
@@ -585,7 +584,9 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                                     if (item.name.endsWith(".apk", ignoreCase = true)) {
                                         add(UfiPopupOption("install", "安装APK", icon = Icons.Filled.InstallMobile) { handleAction("install", item) })
                                     }
-                                    if (canExtract(item.name)) {
+                                    // canExtract 只看文件名，所以名字以 .zip 结尾的**目录**也会命中；
+                                    // 目录不可解压，必须显式排除，否则菜单里会长出一个点了必然失败的项。
+                                    if (!item.isDirectory && canExtract(item.name)) {
                                         add(UfiPopupOption("extract", "解压", icon = Icons.Filled.FolderZip) { handleAction("extract", item) })
                                     }
                                     if (!item.isDirectory) {
@@ -728,7 +729,11 @@ fun FileManagerRoot(viewModel: FileManagerModule, navController: NavHostControll
                 FileInfoDialog(
                     visible = true,
                     file = f,
-                    onDismiss = { showInfo = false; infoTarget = null }
+                    onDismiss = { showInfo = false; infoTarget = null },
+                    // 弹窗内的操作按钮走同一个 handleAction，不另开分发路径：
+                    // 长按菜单点「删除」和详情弹窗点「删除」必须是同一段代码，否则两处会各自漂移。
+                    // 关弹窗的动作由 FileInfoDialog 自己在回调前完成（见其 KDoc），这里不用管顺序。
+                    onAction = { action -> handleAction(action, f) }
                 )
             }
 
@@ -828,24 +833,8 @@ private fun FileRenderFooter() {
     UfiSkeletonListItem(modifier = Modifier.padding(top = Spacing.CardBottomMargin))
 }
 
-/**
- * Dynamic label for the "open" action, chosen by file extension.
- * Folders open; known image/video/audio/text types map to view/play/edit;
- * anything else falls back to the detail dialog.
- */
-private fun openActionLabel(item: FileItem): String =
-    if (!item.isDirectory && canExtract(item.name)) "解压"
-    else fileKindOf(item.name, item.isDirectory).openActionLabel
-
-/**
- * 是否可被后端解压：zip / tar.gz / tgz / tar / gz（与 web 端 [canExtract] 一致）。
- * rar/7z/bz2/xz 归档虽显示压缩包图标，但后端暂不支持解压，双击落到详情弹窗。
- */
-private fun canExtract(name: String): Boolean {
-    val lower = name.lowercase()
-    return lower.endsWith(".zip") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz") ||
-        lower.endsWith(".tar") || lower.endsWith(".gz")
-}
+// canExtract 已搬到 FileKind.kt（同包，无需 import）：详情弹窗在另一个包里也要按
+// 「能否解压」决定按钮，两处各留一份后缀表迟早对不上。
 
 // ===== 网格视图项（列表/网格切换） =====
 

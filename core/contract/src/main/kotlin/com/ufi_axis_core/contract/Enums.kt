@@ -49,7 +49,17 @@ enum class ActionType(val wire: String) {
  */
 object NetworkMode {
 
-    /** 客户端可选的别名（大小写不敏感，core 侧 `uppercase()` 后匹配）。 */
+    /**
+     * 客户端可选的别名（大小写不敏感，core 侧 `uppercase()` 后匹配）。
+     *
+     * 含义与设备真机档位一一对应（2026-09 校准）：
+     * - [AUTO] → goform `WL_AND_5G`（5G/4G/3G）
+     * - [LTE_AND_5G] → `LTE_AND_5G`（5G NSA）
+     * - [ONLY_5G] → `Only_5G`（5G SA）
+     * - [WCDMA_AND_LTE] → `WCDMA_AND_LTE`（4G/3G）
+     * - [ONLY_LTE] → `Only_LTE`（仅4G）
+     * - [ONLY_WCDMA] → `Only_WCDMA`（仅3G）
+     */
     const val AUTO = "AUTO"
     const val ONLY_5G = "5G_ONLY"
     const val LTE_AND_5G = "LTE_AND_5G"
@@ -57,8 +67,32 @@ object NetworkMode {
     const val ONLY_WCDMA = "WCDMA_ONLY"
     const val WCDMA_AND_LTE = "WCDMA_AND_LTE"
 
-    /** 给 UI 用的别名清单（对用户暴露的档位，顺序即展示顺序）。 */
-    val UI_OPTIONS: List<String> = listOf(AUTO, ONLY_5G, LTE_AND_5G, ONLY_LTE, WCDMA_AND_LTE, ONLY_WCDMA)
+    /**
+     * 给 UI 用的别名清单（顺序即展示顺序，对齐真机 Web 面板档位顺序）。
+     * 5G/4G/3G → 5G NSA → 5G SA → 4G/3G → 仅4G → 仅3G
+     */
+    val UI_OPTIONS: List<String> = listOf(
+        AUTO, LTE_AND_5G, ONLY_5G, WCDMA_AND_LTE, ONLY_LTE, ONLY_WCDMA
+    )
+
+    /**
+     * 别名 → 用户可见中文名。**全仓唯一文案真源**（App / Web / 定时任务共用）。
+     * App 侧不要再维护第二份 map，否则改一处漏一处。
+     */
+    val LABELS: Map<String, String> = mapOf(
+        AUTO to "5G/4G/3G",
+        LTE_AND_5G to "5G NSA",
+        ONLY_5G to "5G SA",
+        WCDMA_AND_LTE to "4G/3G",
+        ONLY_LTE to "仅4G",
+        ONLY_WCDMA to "仅3G"
+    )
+
+    /** 别名 → 中文名；未登记时原样返回（避免界面空白）。 */
+    fun label(alias: String): String = LABELS[alias] ?: alias
+
+    /** 设备 BearerPreference（或等价写法）→ 中文名。 */
+    fun labelFromBearer(bearer: String): String = label(fromBearer(bearer))
 
     /** goform BearerPreference 实际取值（**大小写敏感**，设备只认这一组）。 */
     object Bearer {
@@ -71,13 +105,16 @@ object NetworkMode {
     }
 
     /**
-     * 别名 → BearerPreference。与 `NetworkRoutes.kt` 的 `when` 完全等价（含全部历史别名）。
+     * 别名 → BearerPreference。
+     *
+     * 入参同时接受：contract 别名、设备侧 BearerPreference、以及真机/老固件上
+     * 出现过的等价写法（`NR5G_ONLY` / `LTE_NR5G` 等）。对 Bearer 取值幂等。
      * 未识别的取值原样返回（保持 core 现有的"直接透传"行为，不在此处改变语义）。
      */
     fun toBearer(mode: String): String = when (mode.uppercase()) {
-        "AUTO", "WL_AND_5G" -> Bearer.WL_AND_5G
-        "5G_ONLY", "ONLY_5G", "5G_SA" -> Bearer.ONLY_5G
-        "5G_NSA", "LTE_AND_5G" -> Bearer.LTE_AND_5G
+        "AUTO", "WL_AND_5G", "WCDMA_AND_LTE_AND_5G" -> Bearer.WL_AND_5G
+        "5G_ONLY", "ONLY_5G", "5G_SA", "NR5G_ONLY", "ONLY_NR5G" -> Bearer.ONLY_5G
+        "5G_NSA", "LTE_AND_5G", "LTE_NR5G", "LTE_AND_NR5G", "NR5G_NSA" -> Bearer.LTE_AND_5G
         "LTE_ONLY", "ONLY_LTE", "4G_ONLY" -> Bearer.ONLY_LTE
         "WCDMA_ONLY", "ONLY_WCDMA" -> Bearer.ONLY_WCDMA
         "LTE_WCDMA", "WCDMA_AND_LTE" -> Bearer.WCDMA_AND_LTE
@@ -85,17 +122,22 @@ object NetworkMode {
     }
 
     /**
-     * BearerPreference → 别名（`toBearer` 的逆映射，与 web 的 `BearerToNetworkMode` 一一对应）。
-     * 设备回读的 `BearerPreference` 是 Bearer 取值域，UI 若用别名做选中比对必须先经此函数换算。
-     * 未识别的取值（例如老字段 `net_select` 可能回的 `AUTO`）原样返回。
+     * BearerPreference → contract 别名（`toBearer` 的逆映射）。
+     *
+     * 设备回读的 `BearerPreference` 不一定与写入值逐字相同：profile 测试与部分固件
+     * 会回 `NR5G_ONLY`、老字段 `net_select` 会回 `only_5g`。App 的切换回读确认
+     * （`awaitNetworkModeApplied`）拿这里的结果与 UI 目标别名比对，**漏一档就会
+     * 永远超时**——写入成功却提示「设备尚未完成切换」（2026-09 App 缺陷）。
+     *
+     * 未识别取值原样返回，避免把未知制式伪装成「自动」。
      */
     fun fromBearer(bearer: String): String = when (bearer.uppercase()) {
-        "WL_AND_5G" -> AUTO
-        "ONLY_5G" -> ONLY_5G
-        "LTE_AND_5G" -> LTE_AND_5G
-        "ONLY_LTE" -> ONLY_LTE
-        "ONLY_WCDMA" -> ONLY_WCDMA
-        "WCDMA_AND_LTE" -> WCDMA_AND_LTE
+        "WL_AND_5G", "WCDMA_AND_LTE_AND_5G" -> AUTO
+        "ONLY_5G", "NR5G_ONLY", "ONLY_NR5G" -> ONLY_5G
+        "LTE_AND_5G", "LTE_NR5G", "LTE_AND_NR5G", "NR5G_NSA", "5G_NSA" -> LTE_AND_5G
+        "ONLY_LTE", "LTE_ONLY" -> ONLY_LTE
+        "ONLY_WCDMA", "WCDMA_ONLY" -> ONLY_WCDMA
+        "WCDMA_AND_LTE", "LTE_WCDMA" -> WCDMA_AND_LTE
         else -> bearer
     }
 
@@ -131,14 +173,36 @@ object NetworkMode {
          */
         const val FIRST_DELAY_MS = 600L
 
-        /** 之后每次回读的间隔。 */
+        /** 之后每次回读的间隔（前 [FAST_ATTEMPTS] 次用它，见 [intervalMsAfter]）。 */
         const val INTERVAL_MS = 1_500L
 
-        /** 回读次数上限（**含**第一次）。到顶还没读到目标档位就报超时，不许再读。 */
-        const val MAX_ATTEMPTS = 10
+        /**
+         * 慢档间隔：设备开始重新注册后，回读频率降下来。
+         *
+         * 每次回读都是一次真打设备的 goform 查询（写成功后 core 会清 `device:settings` 缓存），
+         * 30 秒预算里用 1.5s 匀速就是 20 次查询，会把 `GoformQoS` 的查询许可耗在这一件事上。
+         */
+        const val SLOW_INTERVAL_MS = 3_000L
 
-        /** 总时长上限，= [FIRST_DELAY_MS] + (次数-1) × [INTERVAL_MS]，给文案与守卫用。 */
-        const val TOTAL_BUDGET_MS = FIRST_DELAY_MS + (MAX_ATTEMPTS - 1) * INTERVAL_MS
+        /** 前几次用快档间隔：多数切换在头几秒就完成，先给快反馈。 */
+        const val FAST_ATTEMPTS = 5
+
+        /**
+         * 回读次数上限（**含**第一次）。到顶还没读到目标档位就报「尚未完成」，不许再读。
+         *
+         * 2026-09-15 调整：原来是 10 次 × 1.5s = 14.1s，而真机弱信号下切制式要十几到二十几秒，
+         * 于是「切完了但仍提示未完成」变成常态。现在 13 次、前 5 次 1.5s 之后 3s，
+         * 总预算 [TOTAL_BUDGET_MS] = 30.6s。
+         */
+        const val MAX_ATTEMPTS = 13
+
+        /** 第 [attemptNo] 次回读之后要等多久再读下一次。 */
+        fun intervalMsAfter(attemptNo: Int): Long =
+            if (attemptNo < FAST_ATTEMPTS) INTERVAL_MS else SLOW_INTERVAL_MS
+
+        /** 总时长上限（首次等待 + 各次间隔之和），给文案与守卫用。 */
+        val TOTAL_BUDGET_MS: Long =
+            FIRST_DELAY_MS + (1 until MAX_ATTEMPTS).sumOf { intervalMsAfter(it) }
 
         /**
          * 还要不要再回读一次。

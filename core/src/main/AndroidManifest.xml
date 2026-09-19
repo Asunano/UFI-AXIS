@@ -25,12 +25,37 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
 
+    <!--
+      媒体库（媒体中心 /api/media/* 需要，2026-09-16）。
+
+      文件管理靠 MANAGE_EXTERNAL_STORAGE 直接走 java.io.File 就够了，但媒体中心是查
+      MediaStore（系统已经索引好的媒体库，免去自己递归遍历整卡）—— Android 13+ 起
+      MediaStore 查询按这三个细分权限授权，MANAGE_EXTERNAL_STORAGE 不等价。
+      三个各自独立：只给了视频权限时，音乐/图片分栏必须明说"未授权"而不是显示空列表。
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+
     <!-- 系统信息 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      精确闹钟（2026-09-14）：`BackendService.scheduleServiceRestart` 必须用精确闹钟。
+      Android 12+ 的「后台启动前台服务」豁免只给 setExact*；用 inexact 闹钟时到点的
+      startForegroundService 会被 AMS 拒，而异常发生在系统侧、应用侧看不到，
+      表现为「点了重启服务后设备彻底失联」。
+      USE_EXACT_ALARM（Android 13+，免用户授权，仅限闹钟/日程类用途）+
+      SCHEDULE_EXACT_ALARM（Android 12，需用户授权）两条都声明：
+      前者覆盖新系统，后者兼容 Android 12；拿不到时代码会退回 inexact，
+      恢复责任落在 shell 侧那一路（见 requestRestart 的双保险）。
+    -->
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
     <!-- 流量统计（NetworkStatsManager 需要，需用户在设置中授权） -->
     <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />

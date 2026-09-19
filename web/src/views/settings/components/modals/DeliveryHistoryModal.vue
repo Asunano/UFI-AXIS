@@ -41,6 +41,8 @@
       </span>
     </div>
     <span class="row-hint">失败与跳过是两组独立计数，不相加；两者统计该渠道的全部记录，不随下面的筛选变化。</span>
+    <!-- 最后一条记录的时间。只有 stats 端点回得出，老固件上这一行不出现 -->
+    <span v-if="lastSentAt > 0" class="row-hint">最后一条记录：{{ formatNotifyTime(lastSentAt) }}</span>
 
     <!--
       筛选走服务端 `result` 参数、换档从第一页重拉：只筛当前页会出现
@@ -62,13 +64,25 @@
           </template>
         </n-empty>
       </div>
-      <n-scrollbar v-else style="max-height: 420px">
+      <n-scrollbar v-else style="max-height: min(420px, 56vh)">
         <div class="history-list">
           <div v-for="r in records" :key="r.id" class="history-item">
             <div class="history-head">
               <span class="history-title">{{ r.subject || sceneLabel(r.scene) }}</span>
               <n-tag size="tiny" :bordered="false" :type="statusOf(r).tag">{{ statusOf(r).text }}</n-tag>
               <span class="history-time">{{ formatNotifyTime(r.sent_at) }}</span>
+              <!--
+                删单条。没有二次确认：删掉的是一条诊断记录（不含正文），
+                代价远小于为每一行弹一次对话框的打扰；清空整份才需要确认。
+              -->
+              <n-button
+                size="tiny"
+                quaternary
+                :loading="deletingId === r.id"
+                :disabled="deletingId !== null"
+                @click="deleteOne(r)"
+                >删除</n-button
+              >
             </div>
             <div class="history-meta">
               <span>{{ sceneLabel(r.scene) }}</span>
@@ -106,6 +120,7 @@ import {
   HistoryListLimits,
   HistoryResultFilter,
   deliveryOutcomeOf,
+  type DeliveryHistoryStats,
   type MailHistoryResponse,
   type MailSendRecord,
 } from '@/api/contract';
@@ -156,6 +171,11 @@ const cursorTs = ref<number | null>(null);
 const cursorId = ref<number | null>(null);
 const hasMore = ref(false);
 const filter = ref<string>(FILTER_ALL);
+/** stats 端点补充的两项：`sent`（在 summaryItems 里用）与 `last_sent_at`。 */
+const sentTotal = ref(0);
+const lastSentAt = ref(0);
+/** 正在删除的那一条记录的 id；同一时刻最多只有一条在飞。 */
+const deletingId = ref<number | null>(null);
 
 /**
  * 请求序号。**不用 ref**：它只在 [load] 内部比对，参与不了渲染，做成响应式反而会
@@ -167,6 +187,7 @@ const title = computed(() => CHANNEL_TITLES[props.channel] ?? '投递记录');
 
 const summaryItems = computed(() => [
   { label: '总计', value: total.value, tone: '' },
+  { label: '已发出', value: sentTotal.value, tone: '' },
   { label: '没发出', value: failedTotal.value, tone: failedTotal.value > 0 ? 'tone-failed' : '' },
   { label: '已跳过', value: skippedTotal.value, tone: skippedTotal.value > 0 ? 'tone-skipped' : '' },
 ]);
@@ -263,6 +284,44 @@ function reload() {
   cursorId.value = null;
   hasMore.value = false;
   load(false);
+  loadStats();
+}
+
+/**
+ * 读 stats 端点：比列表响应多 `sent` 与 `last_sent_at`。老固件 404 时静默忽略 ——
+ * 少两项摘要不影响列表浏览和清空操作。
+ */
+async function loadStats() {
+  try {
+    const { data } = await api.get<DeliveryHistoryStats>(Endpoints.smsForward.historyStats, {
+      params: { channel: props.channel },
+    });
+    if (data) {
+      sentTotal.value = data.sent ?? 0;
+      lastSentAt.value = data.last_sent_at ?? 0;
+    }
+  } catch {
+    /* 老固件 404 或网络抖动，静默 */
+  }
+}
+
+/**
+ * 删除单条记录。core 回 `{ success: true, deleted: N }`，`deleted = 0` 仍是成功
+ * （行已不在），直接从本地列表摘掉即可。删完重新取 stats 刷摘要。
+ */
+async function deleteOne(record: MailSendRecord) {
+  if (deletingId.value !== null) return;
+  deletingId.value = record.id;
+  try {
+    await api.delete(Endpoints.smsForward.historyRecord(record.id));
+    records.value = records.value.filter((r) => r.id !== record.id);
+    // 刷新摘要计数
+    loadStats();
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '删除失败');
+  } finally {
+    deletingId.value = null;
+  }
 }
 
 function onFilterChange(value: string) {
@@ -423,5 +482,29 @@ watch(
   gap: 12px;
   flex-wrap: wrap;
   width: 100%;
+}
+
+@media (max-width: 768px) {
+  /* 四个计数在 360px 上一行放不下（24px 列距 × 3 + 四组数字）。
+     两列栅格比 flex-wrap 稳：wrap 会排成 3+1，最后一个孤零零掉到第二行。 */
+  .summary {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px 12px;
+  }
+  /* 标题 + 状态标签 + 时间 + 删除四样挤一行必然折行，且 `margin-left:auto` 会把
+     时间甩到折行后的最右侧、与删除按钮分家。改成：标题独占一行，其余一行靠左排。 */
+  .history-title {
+    flex: 0 0 100%;
+  }
+  .history-time {
+    margin-left: 0;
+    /* 时间与删除按钮之间留出间隔，并把删除推到行尾 */
+    margin-right: auto;
+  }
+  /* 四档筛选按钮组在窄屏占满整行，刷新按钮另起一行右对齐 */
+  .filter-row {
+    align-items: stretch;
+  }
 }
 </style>

@@ -60,6 +60,11 @@ internal val SERVICE_INDEPENDENT_ROUTES: Set<String> = setOf(
     Routes.DETAIL_SERVER,
     Routes.DETAIL_PAIRING,
     Routes.DETAIL_APPEARANCE,
+    // 界面小功能：天气与诗词取数走 core 的 HTTP 服务（用户"停止服务"后它仍在跑），
+    // 与后台采集无关，所以停服时这几页照样该能进去改。
+    Routes.DETAIL_UI_EXTRAS,
+    Routes.DETAIL_WEATHER,
+    Routes.DETAIL_POETRY,
     Routes.DETAIL_DEBUG_LOG,
     Routes.DETAIL_DIAGNOSE,
     Routes.DETAIL_ABOUT,

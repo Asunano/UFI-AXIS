@@ -93,6 +93,9 @@ interface NotifyHistoryDao {
     @Query("DELETE FROM notify_history WHERE ts < :cutoff")
     suspend fun deleteOlderThan(cutoff: Long)
 
+    @Query("DELETE FROM notify_history WHERE id = :id")
+    suspend fun deleteById(id: Long): Int
+
     @Query("DELETE FROM notify_history")
     suspend fun clear()
 }
@@ -267,6 +270,22 @@ object NotifyHistoryStore {
     /** 历史总条数（列表页顶部的"共 N 条"）。 */
     suspend fun count(context: Context): Int =
         NotifyHistoryDatabase.getInstance(context.applicationContext).dao().count()
+
+    /**
+     * 按 id 删单条（详情弹窗「删除」）。主进程写，与 [clear] 同权限。
+     *
+     * @return true = 删到行或目标本就不存在（UI 可安全摘掉本地行）；false = IO 失败。
+     */
+    suspend fun deleteById(context: Context, id: Long): Boolean {
+        if (id <= 0L) return false
+        return try {
+            NotifyHistoryDatabase.getInstance(context.applicationContext).dao().deleteById(id)
+            true
+        } catch (e: Exception) {
+            DebugLog.w("NotifyHistory", "删除通知历史失败 id=$id: ${e.message}")
+            false
+        }
+    }
 
     /**
      * 清空整表。

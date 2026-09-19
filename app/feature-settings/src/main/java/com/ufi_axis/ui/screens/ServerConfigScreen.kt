@@ -170,8 +170,12 @@ fun ServerConfigScreen(
         showCloseButton = false
     ) {
         UfiDialogBody {
-            Text("配置 Core 后端的连接参数", style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary)
+            Text(
+                "配置 Core 后端的连接参数。\n换到另一台设备请先「切换设备 / 退出」再配对，" +
+                    "只改 IP 无法带上旧设备的登录凭据。",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary
+            )
             UfiDialogTextField(
                 label = "Core IP",
                 value = connIp,
@@ -202,6 +206,8 @@ fun ServerConfigScreen(
                     else -> {
                         displayIp = connIp; prefs.serverIp = connIp
                         displayPort = connPort; prefs.serverPort = p
+                        // P2：onServerConfigChanged 内部按「IP:端口是否变化」分流
+                        // （换机清缓存并重连，同机只轻刷新）。
                         onServerConfigChanged()
                         showConnectionDialog = false
                     }
@@ -280,7 +286,7 @@ fun ServerConfigScreen(
                 onTabSelected = { gwSelectedTab = it },
                 tabs = listOf("网关地址", "后台密码")
             )
-            Spacer(Modifier.height(Spacing.Medium))
+            // 间距统一到 UfiDialogBody（12dp）
 
             // 页签内容切换动画（方向感知：复用公共组件 UfiAnimatedTabContent，参考「关于-更新设置」弹窗）
             UfiAnimatedTabContent(targetState = gwSelectedTab) { tab ->
@@ -359,6 +365,10 @@ fun ServerConfigScreen(
         icon = rememberVectorPainter(Icons.Filled.Web),
         showCloseButton = false
     ) {
+        // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+        // 见 LocalUfiDialogClose。这里在 content 顶部读一次，给下方两个"关本弹窗再开二次确认"
+        // 的按钮用；「检查更新」「上传面板 ZIP」不关弹窗，故不包。
+        val close = LocalUfiDialogClose.current
         UfiDialogBody {
             UfiInfoRow("当前来源", if (webAsset.isOverride) "已上传（override）" else "APK 内置")
             UfiInfoRow("当前版本", webAsset.version ?: "未知")
@@ -406,14 +416,14 @@ fun ServerConfigScreen(
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "回滚上一版",
-                onClick = { showWebPanelDialog = false; showWebRollbackConfirm = true },
+                onClick = { close { showWebPanelDialog = false; showWebRollbackConfirm = true } },
                 enabled = webAsset.hasBackup && !webAsset.isBusy,
                 modifier = Modifier.fillMaxWidth()
             )
             UfiButton(
                 variant = UfiButtonVariant.Danger,
                 text = "恢复内置版本",
-                onClick = { showWebPanelDialog = false; showWebResetConfirm = true },
+                onClick = { close { showWebPanelDialog = false; showWebResetConfirm = true } },
                 enabled = webAsset.isOverride && !webAsset.isBusy,
                 modifier = Modifier.fillMaxWidth()
             )

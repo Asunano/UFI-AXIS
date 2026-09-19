@@ -175,6 +175,14 @@ data class NotifyPayload(
     val deDupValue: String? = null,
     /** 点击跳转 PendingIntent；null=打开 App 主界面 */
     val onTap: PendingIntent? = null,
+    /**
+     * 跨进程转交时的点击语义（PendingIntent 不能跨进程传递）。
+     * `"alert"`=事件中心；`"sms"`=短信对话（配合 [smsPhone]）；null=主界面。
+     * 仅主进程 → `:ufi_notify` 转交时使用。
+     */
+    val tapType: String? = null,
+    /** [tapType] 为 `"sms"` 时的手机号。 */
+    val smsPhone: String? = null,
     /** 通知优先级（NotificationCompat.PRIORITY_*）；null=按场景 importance 派生 */
     val priority: Int? = null,
     /** 强制静默（不响铃不震动）；免打扰命中时自动置 true */

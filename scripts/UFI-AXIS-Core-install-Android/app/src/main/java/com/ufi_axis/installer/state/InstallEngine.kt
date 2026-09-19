@@ -420,7 +420,9 @@ object InstallEngine {
 
                 update { it.copy(statusText = "连接失败，请选择下一步操作") }
                 InstallLogger.warn("请在界面上选择「重试」或「修改地址」")
+                update { it.copy(interaction = InstallInteraction.CONNECT_DECISION) }
                 val action = awaitConnectAction()
+                update { it.copy(interaction = InstallInteraction.NONE) }
                 when (action) {
                     ConnectAction.RETRY -> Unit
                     ConnectAction.CHANGE_ADDRESS -> {
@@ -512,7 +514,9 @@ object InstallEngine {
         // 3) 手动输入
         InstallLogger.warn("请在界面上手动输入包名")
         update { it.copy(statusText = "请手动输入包名") }
+        update { it.copy(interaction = InstallInteraction.MANUAL_PACKAGE) }
         val manual = awaitManualPackage()
+        update { it.copy(interaction = InstallInteraction.NONE) }
         if (manual.isBlank()) throw InstallException("未能确定包名")
         InstallLogger.info("用户输入包名：$manual")
         return manual
@@ -554,10 +558,12 @@ object InstallEngine {
     private suspend fun awaitAddressChange(): AddressParser.Parsed {
         val signal = CompletableDeferred<String>()
         addressChangeSignal.set(signal)
+        update { it.copy(interaction = InstallInteraction.ADDRESS_CHANGE) }
         val input = try {
             signal.await()
         } finally {
             addressChangeSignal.set(null)
+            update { it.copy(interaction = InstallInteraction.NONE) }
         }
         val parsed = AddressParser.parse(input)
         resolvedAddress = parsed

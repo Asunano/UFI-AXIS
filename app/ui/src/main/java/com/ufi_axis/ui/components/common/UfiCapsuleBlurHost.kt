@@ -376,6 +376,28 @@ object CapsuleInsetHolder {
 }
 
 /**
+ * 胶囊窗口**此刻是否应该接收触摸**的跨窗口开关（单例）。
+ *
+ * ## 为什么需要它（2026-09-16：二级页底部控件点不动）
+ * 胶囊自 2026-09-15 起「挂载后不再卸载」——二级页上只把内容 `scale/alpha` 动到 0，
+ * **窗口本身留着**。而 `FLAG_NOT_TOUCH_MODAL` 只放行窗口矩形**之外**的触摸：窗口矩形
+ * 依旧是胶囊的自然尺寸、依旧锚在底部（y = 系统预留区 + 间距 + 抬高），于是二级页里
+ * 屏幕底部那条带子上的一切控件都收不到事件 —— 表现就是「看得见、点不动、点偏了才响应」。
+ * 音乐播放页把进度条与播放键放在最底部，整排全落在这条带子里，问题最刺眼。
+ *
+ * 解法不是把窗口撤掉（那会带回窗口增删的闪帧，已被回退过），而是在隐藏期给窗口补
+ * `FLAG_NOT_TOUCHABLE`：窗口还在、像素不画、**触摸整块下发**给下面的页面。
+ * 与 [CapsuleInsetHolder] 同理走单例 —— CompositionLocal 不跨 Window。
+ *
+ * - **写**：`MainNavGraph` 按「当前是不是宿主目的地」写入（detail 页 = false）；
+ * - **读**：[CapsuleBlurHost]（Dialog 内）作为窗口属性的一部分下发。
+ */
+object CapsuleTouchGate {
+    /** true = 胶囊可点（停在宿主目的地）；false = 窗口不吃触摸（二级页）。 */
+    val interactive: MutableState<Boolean> = mutableStateOf(true)
+}
+
+/**
  * 查询当前设备/系统是否**真的**支持并开启了 cross-window blur。
  *
  * API < 31 直接 false。任何异常（部分 ROM 反射阉割过 WindowManager）都按 false 处理，
@@ -469,7 +491,8 @@ private fun Context.findHostActivity(): Activity? {
 private fun applyCapsuleWindowParams(
     window: Window,
     metrics: CapsuleWindowMetrics,
-    naturalSize: MutableState<IntSize>
+    naturalSize: MutableState<IntSize>,
+    interactive: Boolean
 ) {
     val desiredWidth: Int = if (naturalSize.value.width > 0) naturalSize.value.width
         else ViewGroup.LayoutParams.WRAP_CONTENT
@@ -482,8 +505,18 @@ private fun applyCapsuleWindowParams(
         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
 
     val params: WindowManager.LayoutParams = window.attributes
+    // 隐藏期（二级页）补 FLAG_NOT_TOUCHABLE：窗口留着不闪帧，但整块不吃触摸 ——
+    // FLAG_NOT_TOUCH_MODAL 只放行窗口矩形**之外**，光靠它二级页底部依旧点不动。
+    // 见 [CapsuleTouchGate]。
     val desiredFlags: Int =
-        (params.flags or CAPSULE_WINDOW_FLAGS_ON) and CAPSULE_WINDOW_FLAGS_OFF.inv()
+        ((params.flags or CAPSULE_WINDOW_FLAGS_ON) and CAPSULE_WINDOW_FLAGS_OFF.inv())
+            .let { base ->
+                if (interactive) {
+                    base and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
+                } else {
+                    base or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                }
+            }
 
     // ★ 相等则跳过：同值重复写也会触发 relayout（AOSP 的 setter 全部无条件派发）。
     val settled: Boolean = params.flags == desiredFlags &&
@@ -810,7 +843,8 @@ private fun applyWindowBlur(
     enabled: Boolean,
     metrics: CapsuleWindowMetrics,
     naturalSize: MutableState<IntSize>,
-    decorFitsApplied: MutableState<Boolean>
+    decorFitsApplied: MutableState<Boolean>,
+    interactive: Boolean
 ): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
 
@@ -825,7 +859,7 @@ private fun applyWindowBlur(
         //
         // 它排在 runCatching **之外**：触摸穿透是产品红线，绝不依赖下方「尽力而为、
         // 个别 ROM 可能抛异常」的装饰配置；后者整段失败也不会退化成吞点击的模态窗。
-        applyCapsuleWindowParams(dialogWindow, metrics, naturalSize)
+        applyCapsuleWindowParams(dialogWindow, metrics, naturalSize, interactive)
 
         // ── 装饰（导航栏底色 / 背景 / 阴影）：尽力而为，异常则降级 ──
         return runCatching {
@@ -1080,6 +1114,10 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // 仅在效应里读写、不参与组合，所以不会引起重组。
     val decorFitsApplied = remember(view) { mutableStateOf(false) }
 
+    // 胶囊此刻是否该吃触摸（宿主目的地 = 是，二级页 = 否）。见 [CapsuleTouchGate]。
+    // 读成 State 才能在翻转时让下面两个效应重跑，把 FLAG_NOT_TOUCHABLE 下发到窗口。
+    val capsuleInteractive: Boolean = CapsuleTouchGate.interactive.value
+
     // ── 胶囊底部遮挡总高（跨窗口共享单例）──
     // 2026-08-08 19:47 新增（方案 A 修订版）：监控页底部内容被胶囊遮挡（88dp 硬编码不足）。
     // 计算 = 未缩放固有高度（= 展开态 scale 1.0 最保守，天然覆盖收起 0.86 态；且不随动画
@@ -1161,26 +1199,33 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // key 里显式带上 capsuleLift / capsuleCorner：metrics 已随二者重算（见其 remember key），
     // 这里再列一次是为了让「用户拖动滑块 → 窗口属性重新下发」的因果关系在源码中显式可见，
     // 也防止将来有人重构 metrics 的 key 时静默切断实时联动。
-    DisposableEffect(view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner) {
+    DisposableEffect(
+        view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner, capsuleInteractive
+    ) {
         // 真模糊已移除，applyWindowBlur 恒返回 false；这里仍传 true，但 enabled=false 时
         // 窗口背景实际走 null 分支：胶囊纯透明、无定形 drawable、无系统 1px 描边，
         // 顺带完成 flags / gravity / 底边锚定的施加与重放。
         val wantBlur = false
         var disposed = false
-        blurSubmitted = applyWindowBlur(view, wantBlur, metrics, naturalSize, decorFitsApplied)
+        blurSubmitted = applyWindowBlur(
+            view, wantBlur, metrics, naturalSize, decorFitsApplied, capsuleInteractive
+        )
         realBlurActive = blurSubmitted && crossWindowBlurEnabled
 
         view.post {
             if (!disposed) {
-                blurSubmitted =
-                    applyWindowBlur(view, wantBlur, metrics, naturalSize, decorFitsApplied)
+                blurSubmitted = applyWindowBlur(
+                    view, wantBlur, metrics, naturalSize, decorFitsApplied, capsuleInteractive
+                )
                 realBlurActive = blurSubmitted && crossWindowBlurEnabled
             }
         }
 
         onDispose {
             disposed = true
-            applyWindowBlur(view, false, metrics, naturalSize, decorFitsApplied)
+            applyWindowBlur(
+                view, false, metrics, naturalSize, decorFitsApplied, capsuleInteractive
+            )
             blurSubmitted = false
             realBlurActive = false
         }
@@ -1195,11 +1240,15 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     //
     // ★ 这一拍恰好落在返回动画中段，是「阴影闪烁」最刺眼的一次。现在它只做校验：
     //   属性没被 DialogWrapper 改回去时全部命中相等性守卫，不写、不 relayout。
-    LaunchedEffect(view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner) {
+    LaunchedEffect(
+        view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner, capsuleInteractive
+    ) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@LaunchedEffect
         val wantBlur = false
         delay(100L)
-        blurSubmitted = applyWindowBlur(view, wantBlur, metrics, naturalSize, decorFitsApplied)
+        blurSubmitted = applyWindowBlur(
+            view, wantBlur, metrics, naturalSize, decorFitsApplied, capsuleInteractive
+        )
         realBlurActive = blurSubmitted && crossWindowBlurEnabled
     }
 

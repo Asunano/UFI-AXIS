@@ -25,8 +25,6 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.compositeOver
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -48,50 +46,33 @@ import com.ufi_axis.ui.theme.UfiMotion as ThemeMotion
  */
 
 /**
- * 选中段/滑块的填色浓度（accent 在 `cardBg` 上的混合比例）。
+ * 分段控件的轨道底色 —— 与 [UfiScrollableTabRow] 逐字一致的一份实底。
  *
- * 2026-09-05 由 `accentContainer`（accent 的 10%/20%）提到 30%：用户反馈"选中项着色太浅"。
- * 原值在浅色主题下几乎与卡面同色，选中态只能靠文字色分辨。30% 是"一眼看得出被选中、
- * 又不至于压过 accent 文字"的档位（accent 文字压在 30% 自混底上仍有足够明度差）；
- * 再配一道 [segmentSelectedBorder] 描边定形，不靠单一明度差撑可见性。
- */
-private const val SEGMENT_FILL_ALPHA: Float = 0.30f
-
-/**
- * 选中段/滑块的填色。
+ * 2026-09-15：本控件原来是「透明轨 + accent 30% 淡底 thumb + accent 文字」，
+ * 与 [UfiScrollableTabRow] 的「实心轨 + accent 实底 thumb + onAccent 文字」是同一语义
+ * （一排里选一个）的**两套观感**，同一个 App 里并存就是不一致。按用户要求统一到后者，
+ * 于是这里改成实底轨道：浅色用 textSecondary 低 alpha（明显深于近白的 divider），
+ * 深色用 divider 较高 alpha（营造下凹的深色轨道）。
  *
- * 半透明色直接铺在无实底的轨道上会透出页面内容而混色 —— 与 [UfiPagination] 按钮同一个坑、
- * 同一份解法：先 `compositeOver(cardBg)` 压成不透明实色，观感仍是"accent 淡底"，
- * 但不再受下层内容影响。全站保持同一份处理。
+ * 之所以不是把调用点逐个换成 [UfiScrollableTabRow]：本控件按 **value** 选中、
+ * 还带 `wrap` / `wrapContent` / `enabled` 三个形态，而 TabRow 按 index 选中且只有等宽单行。
+ * 改这里的观感 = 4 个调用点同时到位，且不用把"选中的是哪一项"改写成下标映射。
  */
-private val ResolvedPalette.segmentSelectedFill: Color
-    get() = accent.copy(alpha = SEGMENT_FILL_ALPHA).compositeOver(cardBg)
-
-/** 选中段描边：给滑块一个明确边界，不让可见性只押在填色明度上。 */
-private val ResolvedPalette.segmentSelectedBorder: Color
-    get() = accent.copy(alpha = 0.45f)
+private val ResolvedPalette.segmentTrackFill: Color
+    get() = if (isDark) divider.copy(alpha = 0.6f) else textSecondary.copy(alpha = 0.16f)
 
 /**
  * 单选分段控件（segmented control）。
  *
- * 2026-09-04 重做：原实现是 M3 [FilterChip]（`chipSelectedBg` 12% 淡底 + 1dp 描边 + ripple），
- * 观感是"一排安卓原生 chip"，与本项目"卡片 + 令牌化阴影 + 无 ripple 缩放反馈"的语言不一致。
- * 现在改成分段控件：
- * - 轨道：**完全透明**底 + 1dp [com.ufi_axis.ui.theme.ThemePalette.inputBorder] 描边 + `pillShape`
- *   + [Spacing.Small] 内边距；
- * - 选中段：`accentContainer.compositeOver(cardBg)` 实色 + `pillShape` + `accent` 文字
- *   + [UfiWeight.Emphasis]，**无阴影**；
- * - 未选中段：完全透明底 + `textSecondary` 常规字重；
- * - 按压：每段各一份 `MutableInteractionSource` + `ufiPressScale(PressScale.Chip)`，无 ripple。
+ * 2026-09-15：观感统一到 [UfiScrollableTabRow] —— **实心轨道 + accent 实底滑块 +
+ * onAccent 选中文字**。此前是"透明轨 + accent 30% 淡底滑块 + accent 文字"，
+ * 与 TabRow 各说一套（详见 [segmentTrackFill]）。几何、动画、按压反馈与公开签名都不动，
+ * 只换配色，所以 4 个调用点（流量历史、监控中心 ×2、外观设置）一次到位。
  *
- * ## 为什么轨道靠描边而不是实底（2026-09-04 可见性返工）
- * 上一版是"`surfaceMuted` 轨道 + `cardBg` 选中段"，两端主题下都看不清：浅色
- * `surfaceMuted == pageBg`（[com.ufi_axis.ui.theme.ThemePalette.surfaceMuted]），轨道与页面底同色，
- * 而选中段 `cardBg` 是白的，与卡面同色；深色 `surfaceMuted == cardBg × 0.7`，选中段与轨道只差一点
- * 透明度。这套配色的可见性全押在"明度差"上，而明度差在两端都被压掉了。现在改成**靠色相区分**：
- * 轨道用描边（描边在任何底色上都可见，不依赖 `surfaceMuted` 究竟等于哪个槽），选中段用带 accent
- * 色相的实色（与 [UfiPagination] 按钮完全同一份 `compositeOver` 处理，全站一致）。
- * 阴影一并去掉——轨道已无实底，"浮起"没有依托，阴影只会显脏。
+ * - 轨道：[segmentTrackFill] 实底 + `UfiCardDefaults.shape` + [Spacing.Small] 内边距；
+ * - 选中段：`accent` 实底 + `onAccent` 文字，**无描边、无阴影**（实底自己就是边界）；
+ * - 未选中段：透明底 + `textSecondary`；
+ * - 按压：每段各一份 `MutableInteractionSource` + `ufiPressScale(PressScale.Chip)`，无 ripple。
  *
  * 选中态的移动动画分两种（取决于布局形态）：
  * - 单行（`wrap = false`，无论等宽还是 `wrapContent` 内容宽）：真滑块 —— 段宽由布局回报，
@@ -119,9 +100,10 @@ fun UfiSingleChipSelector(
 ) {
     val palette = LocalResolvedPalette.current
     // wrapContent = true 表示「按内容宽度排布」，此时轨道也不必撑满
-    // 轨道无实底：只有 1dp inputBorder 描边（12% 黑/白），所以放在 pageBg 还是 cardBg 上都看得见轮廓。
+    // 轨道是实底（与 UfiScrollableTabRow 同一份），所以不再需要描边定形。
     val trackModifier = (if (wrapContent) modifier else modifier.fillMaxWidth())
-        .border(UfiCardDefaults.hairlineBorderWidth, palette.inputBorder, UfiCardDefaults.pillShape)
+        .clip(UfiCardDefaults.shape)
+        .background(palette.segmentTrackFill)
         .padding(Spacing.Small)
 
     when {
@@ -175,8 +157,8 @@ fun UfiSingleChipSelector(
                 }
             }
 
-            val fill = palette.segmentSelectedFill
-            val stroke = palette.segmentSelectedBorder
+            val fill = palette.accent
+            val thumbRadius = UfiCardDefaults.cornerRadius
             Row(
                 // 滑块走 drawBehind：只在绘制阶段读 Animatable，逐帧不重组也不重新布局
                 //（若改成 offset/width 的 Dp 状态，每帧都要重新测量整行）。
@@ -184,16 +166,12 @@ fun UfiSingleChipSelector(
                 modifier = trackModifier.drawBehind {
                     val w = thumbWidth.value
                     if (w <= 0f) return@drawBehind
-                    val radius = CornerRadius(size.height / 2f)
-                    val topLeft = Offset(thumbX.value, 0f)
-                    val thumbSize = Size(w, size.height)
-                    drawRoundRect(color = fill, topLeft = topLeft, size = thumbSize, cornerRadius = radius)
+                    // 与轨道同圆角（TabRow 的"胶囊内滑块"观感），不是全圆
                     drawRoundRect(
-                        color = stroke,
-                        topLeft = topLeft,
-                        size = thumbSize,
-                        cornerRadius = radius,
-                        style = Stroke(width = UfiCardDefaults.hairlineBorderWidth.toPx())
+                        color = fill,
+                        topLeft = Offset(thumbX.value, 0f),
+                        size = Size(w, size.height),
+                        cornerRadius = CornerRadius(thumbRadius.toPx())
                     )
                 }
             ) {
@@ -232,7 +210,7 @@ private fun UfiSegment(
     val interactionSource = remember { MutableInteractionSource() }
     val background by animateColorAsState(
         targetValue = if (selected && paintSelectedBackground) {
-            palette.segmentSelectedFill
+            palette.accent
         } else {
             Color.Transparent
         },
@@ -243,7 +221,9 @@ private fun UfiSegment(
         targetValue = when {
             // 整组置灰：不套 Modifier.alpha（那会连轨道底一起变淡），只压文字。
             !enabled -> palette.textSecondary.copy(alpha = 0.38f)
-            selected -> palette.accent
+            // accent 实底上的文字用 onAccent（与 UfiScrollableTabRow 一致）；
+            // 这里**不能**用 accent 自己 —— 同色叠同色等于看不见。
+            selected -> palette.onAccent
             else -> palette.textSecondary
         },
         animationSpec = ThemeMotion.colorSwap(),
@@ -252,9 +232,9 @@ private fun UfiSegment(
     Box(
         modifier = modifier
             .height(Spacing.SegmentHeight)
-            // 无阴影：轨道无实底，浮起感没有依托（见 UfiSingleChipSelector 的 KDoc）。
-            .clip(UfiCardDefaults.pillShape)
-            .background(background, UfiCardDefaults.pillShape)
+            // 无阴影：滑块与轨道是同一块实底上的两层，阴影只会显脏。
+            .clip(UfiCardDefaults.shape)
+            .background(background, UfiCardDefaults.shape)
             // 与 CategoryChip / UfiOptionCell 同一档：ufiPressScale 事件驱动，短按也能看到缩放。
             .ufiPressScale(
                 interactionSource = interactionSource,

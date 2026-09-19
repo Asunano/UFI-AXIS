@@ -57,6 +57,7 @@ include(":app:feature-network")    // 网络（Network + 二级页 + DHCP/WiFi �
 include(":app:feature-dashboard")  // 仪表盘（Dashboard + 5 详情子页）
 include(":app:feature-tools")      // 工具（Tools/Advanced/Console/SpeedTest/Traffic/Task/DebugLog）
 include(":app:feature-files")      // 文件管理（FileManager/Text/Image/Media）
+include(":app:feature-media")      // 媒体中心（视频/音乐/图片）+ 播放器核心（media3 依赖挂这里）
 include(":app:feature-download")   // 下载管理（Download）
 include(":app:feature-sms")        // 短信（Sms/SmsForward）
 include(":app:feature-apps")       // 应用管理（App/Adb）

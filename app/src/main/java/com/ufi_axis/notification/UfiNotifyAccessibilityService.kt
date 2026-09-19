@@ -2,6 +2,7 @@ package com.ufi_axis.notification
 
 import android.accessibilityservice.AccessibilityService
 import android.view.accessibility.AccessibilityEvent
+import com.ufi_axis.data.notification.BackgroundActionHelper
 import com.ufi_axis.util.DebugLog
 
 /**
@@ -23,6 +24,7 @@ class UfiNotifyAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        BackgroundActionHelper.registerAccessibilityContext(this)
         // 2026-08-10：无障碍服务已注册即获得系统级保活（国产 ROM 归类"特殊服务"豁免后台管理），
         // 无需再叠加前台服务（Android 12+ 后台启动 FGS 受限会抛异常）。
         DebugLog.i(TAG, "UfiNotifyAccessibilityService connected（系统级保活已生效）")
@@ -33,10 +35,15 @@ class UfiNotifyAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        // 空实现：无障碍服务被系统中断时无需处理
+        BackgroundActionHelper.unregisterAccessibilityContext()
     }
 
-    private companion object {
+    override fun onDestroy() {
+        super.onDestroy()
+        BackgroundActionHelper.unregisterAccessibilityContext()
+    }
+
+    companion object {
         const val TAG = "UfiNotifyAccessibility"
     }
 }

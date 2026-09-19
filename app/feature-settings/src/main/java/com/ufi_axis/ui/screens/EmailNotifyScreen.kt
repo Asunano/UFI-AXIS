@@ -195,70 +195,43 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
 
             val diagnose = state.diagnose
 
-            // ── ① 发送统计。数字来自 core 侧累计计数（只统计真正发起过 SMTP 投递的次数，
-            //    黑名单拦截 / 场景未勾选不计），所以"失败 > 0"确实代表 SMTP 有问题。
-            UfiSettingsGroup {
-                UfiSectionHeader(title = "发送统计")
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Medium),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    UfiStatItem(
-                        value = diagnose?.sent_total?.toString() ?: "--",
-                        label = "总发送",
-                        modifier = Modifier.weight(1f)
-                    )
-                    UfiStatItem(
-                        value = diagnose?.sent_success?.toString() ?: "--",
-                        label = "成功",
-                        modifier = Modifier.weight(1f)
-                    )
-                    UfiStatItem(
-                        value = diagnose?.sent_failed?.toString() ?: "--",
-                        label = "失败",
-                        modifier = Modifier.weight(1f)
+            // ── ① 发送统计（2026-09 精简）──
+            // 「最近成功」挂在标题行右侧；**不再**展示最近失败错误正文 ——
+            // 失败次数看「失败」格，原因走「最近投递」详情弹窗。
+            ChannelDeliveryStatsCard(
+                total = diagnose?.sent_total,
+                mid = diagnose?.sent_success,
+                failed = diagnose?.sent_failed,
+                lastSuccessTs = diagnose?.last_sent_at,
+                totalLabel = "总发送",
+                midLabel = "成功",
+                failedLabel = "失败",
+                loaded = diagnose != null,
+                testRow = {
+                    val testing = state.isLoading && pending == EmailNotifyAction.TEST
+                    val canTest = enabled && !testing
+                    UfiSettingsItem(
+                        title = "发送测试邮件",
+                        description = if (enabled) {
+                            "按「新短信」模板渲染，收到即说明 SMTP 通畅"
+                        } else {
+                            "需先启用邮件通知并填完 SMTP 配置"
+                        },
+                        enabled = canTest,
+                        modifier = Modifier.clickable(enabled = canTest) {
+                            pending = EmailNotifyAction.TEST
+                            viewModel.tools.testSmsForward()
+                        },
+                        trailing = {
+                            Text(
+                                text = if (testing) "发送中…" else "点击试发",
+                                style = UfiTextStyles.label,
+                                color = if (canTest) palette.accent else palette.textSecondary
+                            )
+                        }
                     )
                 }
-                UfiDivider()
-                UfiInfoRow(
-                    label = "最近成功",
-                    value = diagnose?.last_sent_at?.takeIf { it > 0 }?.let { formatMailTime(it) } ?: "暂无记录"
-                )
-                // 最近失败只在真的失败过时才占一行：常态下这行是空的，留着等于给用户一个"是不是坏了"的错觉
-                diagnose?.last_error?.takeIf { it.isNotBlank() }?.let { err ->
-                    UfiInfoRow(label = "最近失败", value = err)
-                }
-                UfiDivider()
-                // 试发放在统计卡末尾（2026-08-30 从页尾的独立按钮挪进来）：
-                // 点完就能在上面三个数字里看到 +1，"发了没有 / 成不成功"在同一张卡里闭环。
-                // 用行内触发而不是大按钮，跟本页其它行同一节奏，页尾也不再挂一个孤零零的按钮。
-                val testing = state.isLoading && pending == EmailNotifyAction.TEST
-                // 可用性**不看** `state.isLoading`：那是全页共享的 loading 位，进页面自动
-                // loadSmsForwardConfig 时它就是 true，于是本行一进来就是灰的，得等用户随手改个
-                // 开关（触发一次 save→reload）才恢复 —— 正是本文件上方注释里记过的坑①。
-                // 只用「本行自己的请求在飞」当禁用条件，别人的 loading 与它无关。
-                val canTest = enabled && !testing
-                UfiSettingsItem(
-                    title = "发送测试邮件",
-                    description = if (enabled) {
-                        "按「新短信」模板渲染，收到即说明 SMTP 通畅"
-                    } else {
-                        "需先启用邮件通知并填完 SMTP 配置"
-                    },
-                    enabled = canTest,
-                    modifier = Modifier.clickable(enabled = canTest) {
-                        pending = EmailNotifyAction.TEST
-                        viewModel.tools.testSmsForward()
-                    },
-                    trailing = {
-                        Text(
-                            text = if (testing) "发送中…" else "点击试发",
-                            style = UfiTextStyles.label,
-                            color = if (canTest) palette.accent else palette.textSecondary
-                        )
-                    }
-                )
-            }
+            )
 
             // ── ② 设置。输入项全部收进弹窗，列表行只显示摘要 + 右侧值。
             //
@@ -464,13 +437,17 @@ private fun SmtpConfigDialog(
         // 而 UfiScrollableDialog 的两个 weight(1f) Box **没有**固定高度（UfiCustomDialog 才有），
         // min 约束传不下去，于是出现「取消高 / 保存矮」的错位。全仓其余弹窗也都是 Primary+Secondary。
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose；必须在 slot 内部读才能拿到 shell 注入的实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "保存",
-                onClick = { onSave(host, port.toIntOrNull() ?: 465, user, pass, from, to) }
+                onClick = { close { onSave(host, port.toIntOrNull() ?: 465, user, pass, from, to) } }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {

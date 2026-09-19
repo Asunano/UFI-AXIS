@@ -23,6 +23,7 @@ import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
+import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.*
 // 本文件同时 star-import 了 ui.components.common 与 ui.theme，两边都有 `UfiMotion`
 // （前者是 P3a 留下的 @Deprecated 转发壳），星号导入同名会歧义。显式导入指向正本。
@@ -42,7 +43,9 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
     val palette = LocalResolvedPalette.current
     val state by viewModel.trafficManagementState.collectAsState()
 
-    LaunchedEffect(Unit) { viewModel.tools.loadTrafficLimit() }
+    LaunchedEffect(Unit) {
+        viewModel.tools.loadTrafficLimit()
+    }
 
     val cfg = state.limitConfig
 
@@ -67,6 +70,8 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
     // 弹窗控制
     var showLimitDialog by remember { mutableStateOf(false) }
     var showCalibrateDialog by remember { mutableStateOf(false) }
+    /** 流量历史弹窗（2026-09-15 由独立页改成弹窗，入口是下面那行「流量历史」） */
+    var showTrafficHistory by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.successMessage) {
         if (state.successMessage != null) {
@@ -293,6 +298,18 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
 
+                    // 流量历史是**弹窗**而不是独立页（2026-09-15 改）：内容只有
+                    // 「分段控件 + 一张图 + 一行合计」，撑不起一整页；弹窗看完直接回到限额设置。
+                    UfiSettingsValue(
+                        title = "流量历史",
+                        description = "按日 / 周 / 月 / 年查看用量",
+                        value = "查看",
+                        icon = Icons.Default.BarChart,
+                        onClick = { showTrafficHistory = true }
+                    )
+
+                    UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
+
                     UfiButtonRow(modifier = Modifier.padding(top = Spacing.Small)) {
                         UfiButton(
                             variant = UfiButtonVariant.Secondary,
@@ -313,6 +330,14 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
     }
 
     // ── 弹窗定义 ──
+    // 流量历史：内容较重（分段控件 + 柱状图），自身在 visible=false 时不组合内容，
+    // 所以常驻在这里挂着即可 —— 打开才取数（弹窗体内的 LaunchedEffect）。
+    TrafficHistoryDialog(
+        visible = showTrafficHistory,
+        viewModel = viewModel,
+        onDismiss = { showTrafficHistory = false }
+    )
+
     if (showLimitDialog) {
         // 暂存-确认：弹窗内改的是 draft，**不碰页面已生效值**，点「保存」才写回并发请求。
         // 之前弹窗直接编辑页面级 state，于是点「取消」后改动其实已经留在页面上，
@@ -504,22 +529,28 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
             title = "流量校准",
             icon = rememberVectorPainter(Icons.Filled.Tune),
             showCloseButton = false,
+            // 2026-09-18：自写的确认/取消按钮改经 LocalUfiDialogClose 排时序 —— 弹窗离场的
+            // backdrop（逐渐清晰）要在窗口销毁前播完；local 必须在 slot 内部读才能拿到 shell 的实现。
             confirmButton = {
+                val close = LocalUfiDialogClose.current
                 UfiButton(
                     text = "执行校准",
                     onClick = {
-                        if (calibrateValue.isNotBlank()) {
-                            val data = parseToBytes(calibrateValue, calibrateUnit).toString()
-                            viewModel.tools.calibrateFlow("data", data)
-                            calibrateValue = ""
+                        close {
+                            if (calibrateValue.isNotBlank()) {
+                                val data = parseToBytes(calibrateValue, calibrateUnit).toString()
+                                viewModel.tools.calibrateFlow("data", data)
+                                calibrateValue = ""
+                            }
+                            showCalibrateDialog = false
                         }
-                        showCalibrateDialog = false
                     },
                     enabled = calibrateValue.isNotBlank()
                 )
             },
             dismissButton = {
-                UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { showCalibrateDialog = false })
+                val close = LocalUfiDialogClose.current
+                UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { showCalibrateDialog = false } })
             }
         ) {
             UfiDialogBody {

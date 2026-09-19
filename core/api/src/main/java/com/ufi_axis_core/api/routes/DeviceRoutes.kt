@@ -1,7 +1,9 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.contract.NetworkMode
 import io.ktor.http.*
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
@@ -385,7 +387,19 @@ class DeviceRoutes(
             get("/settings") {
                 suspend fun f(): JsonElement {
                     val data = dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings()
-                    return toJsonElement(data ?: emptyMap<String, Any>())
+                    val map = (data ?: emptyMap()).toMutableMap()
+                    // 制式中文名由 contract 统一给出（App/Web 不再各译一份）。
+                    // 取 net_select（真机切换后变化的就是它），缺失才回落 BearerPreference；
+                    // 都空则不注入该 key。两端的回读口径与这里一致。
+                    val bearer = map[DeviceFields.DeviceSettings.NET_SELECT]
+                        ?.let { (it as? JsonPrimitive)?.contentOrNull }
+                        ?: map[DeviceFields.DeviceSettings.BEARER_PREFERENCE]
+                            ?.let { (it as? JsonPrimitive)?.contentOrNull }
+                    if (!bearer.isNullOrBlank()) {
+                        map["network_mode_label"] =
+                            JsonPrimitive(NetworkMode.labelFromBearer(bearer))
+                    }
+                    return toJsonElement(map)
                 }
                 call.respond(if (cache != null) cache.getOrPut("device:settings", CacheTTL.DEVICE_SETTINGS) { f() } else f())
             }
@@ -476,7 +490,9 @@ class DeviceRoutes(
             // 设备关机
             post("/shutdown") {
                 cache?.invalidate("*")
-                val success = deviceClient.shutdownDevice()
+                // 走 systemController 而不是直连 deviceClient：goform 失败时要有
+                // `svc power shutdown` 兜底，与 /reboot 同口径
+                val success = systemController.shutdown()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))

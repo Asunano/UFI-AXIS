@@ -4,7 +4,17 @@
       <n-button size="small" type="warning" @click="cleanModal.open()">清理数据</n-button>
     </template>
     <n-spin :show="loading">
-      <n-data-table :columns="columns" :data="data.tables" :bordered="false" :single-line="false" size="small" />
+      <!-- scroll-x 480：两个 120px 的固定列 + 名称列在 298px 的卡内会把
+           `traffic_records` 这类表名压成 60px（折 3 行）。给一个最小内容宽让表格
+           自己横向滚，而不是把内容压到读不出来。 -->
+      <n-data-table
+        :columns="columns"
+        :data="data.tables"
+        :bordered="false"
+        :single-line="false"
+        size="small"
+        :scroll-x="480"
+      />
       <div class="storage-total">总占用: {{ data.total_display }}</div>
       <p class="storage-note">
         大小为按行估算值，非数据库实际占用；alert_records / sms_records 的记录数由后端固定返回，仅作占位。

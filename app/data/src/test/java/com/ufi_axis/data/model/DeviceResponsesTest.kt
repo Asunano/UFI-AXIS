@@ -26,8 +26,9 @@ class DeviceResponsesTest {
 
     @Test
     fun `设备设置的键与 DeviceFields 逐字对齐`() {
+        val expected = DeviceFields.DeviceSettings.ALL + listOf("network_mode_label")
         assertEquals(
-            DeviceFields.DeviceSettings.ALL,
+            expected,
             DeviceSettingsResponse.serializer().descriptor.elementNames.toList(),
         )
     }
@@ -179,12 +180,18 @@ class DeviceResponsesTest {
     }
 
     @Test
-    fun `网络模式优先 BearerPreference 老固件才回退 net_select`() {
-        // 写入侧改的是 BearerPreference，net_select 取值域未经证实，只作回退
+    fun `网络模式优先 net_select 无 net_select 才回退 BearerPreference`() {
+        // 真机：切换后 goform 回读里变化的是 net_select；BearerPreference 是写入侧字段
+        assertEquals(
+            "LTE_ONLY",
+            AppJson.decodeFromString<DeviceSettingsResponse>(
+                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G","net_select":"LTE_ONLY"}"""
+            ).networkMode,
+        )
         assertEquals(
             "WCDMA_AND_LTE_AND_5G",
             AppJson.decodeFromString<DeviceSettingsResponse>(
-                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G","net_select":"LTE_ONLY"}"""
+                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G"}"""
             ).networkMode,
         )
         assertEquals(

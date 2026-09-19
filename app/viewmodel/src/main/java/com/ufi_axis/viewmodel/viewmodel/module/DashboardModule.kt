@@ -11,6 +11,7 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.decodeFromJsonElement
 import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyPrefs
 import com.ufi_axis.util.*
 import com.ufi_axis_core.util.UiFrameGate
 import com.ufi_axis.viewmodel.repository.AlertPrefsRepository
@@ -175,6 +176,16 @@ class DashboardModule(
         saveDebounceJob?.cancel()
         webSocketRepository.disconnect()
         cacheManager.shutdown()
+    }
+
+    /**
+     * 丢掉本机仪表盘 Room 缓存（切换/退出设备时）。
+     *
+     * 缓存是**全局一份**、不按设备分桶：换到另一台 Core 后若不清，
+     * 首屏会先 paint 上一台的 CPU/流量再被新数据盖掉，看起来像「数据串台」。
+     */
+    suspend fun clearDashboardCache() {
+        runCatching { cacheManager.clearCache() }
     }
 
     // ── Cache ──
@@ -357,34 +368,61 @@ class DashboardModule(
                             }
                         }
                         "notification" -> {
-                            // 2026-08-25：新公共通知服务推送，逻辑与 alert 兼容
+                            // 业务类推送（短信 / 验证码 / 下载 / 隧道）的**主进程入口**。
+                            //
+                            // 2026-09-14：主进程此前不订阅 `notification`（`WsChannel.UI_TOPICS` 把它剔除了），
+                            // 而短信 / 验证码只在这个频道广播（`PushChannel.SINGLE_TOPIC_SCENES`），
+                            // 唯一订阅方 `:ufi_notify` 又只在「前台服务保活」开启后才建 WS ——
+                            // 于是保活关着时这几类系统通知一条都发不出来（邮件由 core 自己发，照常）。
+                            // 现在主进程订上该频道并把载荷交给 NotificationCenter，由它的进程门
+                            // 转交 `:ufi_notify` 发射（显式广播会自动拉起那个进程）。
+                            //
+                            // 这里**只认业务类 type**：告警形状的载荷仍由 `alert` 分支独家处理，
+                            // 否则 core 的 `notification` + `alert` 双发会让同一条告警被处理两遍。
                             try {
                                 val dataObj = message.data as? JsonObject
-                                // 2026-09-04：短信 / 验证码分流，**不能**当告警处理。
-                                // core 的 DataScheduler 在"发现新短信"的边沿推 type=sms|verification；
-                                // 走 parsePushedAlert 会把短信塞进告警列表、并受告警总闸约束。
-                                // 这条分支管的是「app 在前台但不在短信页」的场景；
-                                // app 在后台/被回收时由 :ufi_notify 的 NotifyService 弹（同一份 payload）。
                                 val pushType = dataObj?.get("type")?.jsonPrimitive?.content
-                                if (pushType == "sms" || pushType == "verification") {
-                                    val extra = dataObj?.get("extra") as? JsonObject
-                                    val sender = extra?.get("sender")?.jsonPrimitive?.content ?: ""
-                                    if (pushType == "verification") {
-                                        val code = extra?.get("code")?.jsonPrimitive?.content ?: ""
-                                        if (code.isNotEmpty()) notificationCenter.notifyVerificationCode(sender, code)
-                                    } else {
-                                        val snippet = extra?.get("snippet")?.jsonPrimitive?.content ?: ""
-                                        notificationCenter.notifyNewSms(sender, snippet)
+                                // 保活开着时 `:ufi_notify` 已订阅同一条推送并直接发射，主进程再转交就是双发。
+                                // 判据复用保活的唯一闸门（KeepAliveGate），不引入第二套状态。
+                                if (pushType != null && NotifyPrefs.keepAliveShouldRun(appContext)) {
+                                    // 交给 :ufi_notify，本进程不处理
+                                } else when (pushType) {
+                                    "sms", "verification" -> {
+                                        val extra = dataObj?.get("extra") as? JsonObject
+                                        val sender = extra?.get("sender")?.jsonPrimitive?.content ?: ""
+                                        if (pushType == "verification") {
+                                            val code = extra?.get("code")?.jsonPrimitive?.content ?: ""
+                                            if (code.isNotEmpty()) notificationCenter.notifyVerificationCode(sender, code)
+                                        } else {
+                                            val snippet = extra?.get("snippet")?.jsonPrimitive?.content ?: ""
+                                            notificationCenter.notifyNewSms(sender, snippet)
+                                        }
                                     }
-                                } else if (isNonAlertPush(dataObj)) {
-                                    // 见 [isNonAlertPush]：下载 / 隧道不是告警记录，显式丢弃。
-                                } else if (dataObj != null) {
-                                    val pushedAlert = parsePushedAlert(dataObj)
-                                    _monitorState.update { s ->
-                                        val next = (listOf(pushedAlert) + s.alerts.filter { it.id != pushedAlert.id }).take(500)
-                                        s.copy(alerts = next)
+                                    // 终态判定（"这次才刚变成完成/失败"、"重连到达上限才放弃"）与隧道的
+                                    // `tunnel_notify_on_failure` 闸门都在 core，推送到达即代表该提醒；
+                                    // 这里只把 core 给的 title/message 渲染出来，不比状态。
+                                    // 它们也不进 `MonitorState.alerts` —— core 不写 alert_records，见 [isNonAlertPush]。
+                                    "download", "tunnel" -> {
+                                        val extra = dataObj?.get("extra") as? JsonObject
+                                        val title = dataObj?.get("title")?.jsonPrimitive?.content ?: ""
+                                        val body = dataObj?.get("message")?.jsonPrimitive?.content ?: ""
+                                        if (pushType == "download") {
+                                            notificationCenter.notifyDownloadResult(
+                                                title = title.ifBlank { "下载任务" },
+                                                message = body,
+                                                isError = extra?.get("status")?.jsonPrimitive?.content == "error"
+                                            )
+                                        } else {
+                                            notificationCenter.notifyTunnelFailure(
+                                                kind = extra?.get("kind")?.jsonPrimitive?.content ?: "",
+                                                name = extra?.get("name")?.jsonPrimitive?.content ?: "",
+                                                title = title.ifBlank { "隧道异常" },
+                                                message = body
+                                            )
+                                        }
                                     }
-                                    notificationCenter.maybeNotifyNewAlerts(listOf(pushedAlert))
+                                    // 其余（告警形状）忽略：由 `alert` 分支处理，见本分支开头注释。
+                                    else -> Unit
                                 }
                             } catch (e: Exception) {
                                 DebugLog.e("Dashboard", "Parse notification failed", e)
@@ -570,6 +608,20 @@ class DashboardModule(
      * 期间数据并不会变旧到看得出来：cpu / 内存 / 流量 / 信号四项走 WebSocket 实时推送，
      * 被跳过的只有 dashboard/summary 那批"分钟级才会变"的字段（设备信息 / 电池 / 存储 / 运行时长）。
      */
+    /**
+     * 周期取数暂停闸门（2026-09-14）。返回 true 时下面两个轮询**跳过本轮请求**、只 delay。
+     *
+     * 目前唯一的接线方是 `MainViewModel`，接的是「设备端 Core 正在更新」。
+     * 升级期间 HTTP 必然中断约 1 分钟，这两条轮询会持续失败并把 errorMessage 写进 state，
+     * 用户看到满屏「加载告警失败」「连接失败」。
+     *
+     * 为什么是「跳过一轮」而不是 cancel job：这两个 job 的启停归 UI 宿主
+     * （`MainActivity` 管告警轮询、`DashboardScreen` 管首页刷新），从这里 cancel 之后
+     * 谁负责重启就变成了一个需要跨层协调的问题 —— 而且很容易在 Activity 处于后台时
+     * 把轮询重新拉起来。跳过一轮则**零协调、自动恢复**：闸门一放开，下一轮自然继续。
+     */
+    var pollGate: () -> Boolean = { false }
+
     fun startAutoRefresh(intervalMs: Long = 5_000L) {
         stopAutoRefresh()
         autoRefreshJob = scope.launch {
@@ -580,7 +632,7 @@ class DashboardModule(
             )
             if (holdOff > 0L) delay(holdOff)
             while (isActive) {
-                refreshDashboardInternal()  // 直接 suspend，等待完成后才 delay
+                if (!pollGate()) refreshDashboardInternal()  // 直接 suspend，等待完成后才 delay
                 delay(intervalMs)
             }
         }
@@ -598,7 +650,8 @@ class DashboardModule(
         alertPollingJob = scope.launch {
             while (isActive) {
                 // 2026-08-25: 使用 silent=true 避免非监控页刷新时闪烁
-                loadAlerts(_monitorState.value.alertRange, silent = true)
+                // 注意 silent 只压 isLoading、压不住 errorMessage，所以更新期间必须靠 pollGate 跳过
+                if (!pollGate()) loadAlerts(_monitorState.value.alertRange, silent = true)
                 delay(intervalMs)
             }
         }

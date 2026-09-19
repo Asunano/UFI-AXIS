@@ -6,7 +6,9 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
@@ -16,37 +18,61 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
-import androidx.recyclerview.widget.LinearLayoutManager
 import com.ufi_axis.installer.core.AddressParser
 import com.ufi_axis.installer.core.AssetApkProvider
 import com.ufi_axis.installer.core.NotificationHelper
+import com.ufi_axis.installer.core.PermissionGranter
 import com.ufi_axis.installer.databinding.ActivityMainBinding
 import com.ufi_axis.installer.logging.InstallLogger
 import com.ufi_axis.installer.service.InstallerService
 import com.ufi_axis.installer.state.InstallEngine
+import com.ufi_axis.installer.state.InstallInteraction
 import com.ufi_axis.installer.state.InstallStage
 import com.ufi_axis.installer.state.InstallState
-import com.ufi_axis.installer.ui.LogAdapter
+import com.ufi_axis.installer.remoteadb.RemoteAdbActivity
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.util.Locale
 
 /**
- * 主界面：一屏搞定。
+ * 主界面：分屏向导式（4 屏）。
  *
- * 布局从上到下：
- * 1. 设备地址输入框 + 连接参数
- * 2. 大号状态卡（当前阶段 / 进度条 / 一句话状态）
- * 3. 操作按钮区（开始 / 取消 / 重试 / 分享日志）
- * 4. 可折叠的实时日志
+ * 屏 1 设备地址 → 屏 2 安装详情/确认 → 屏 3 安装过程 → 屏 4 结果。
+ * 日志改为独立界面：顶栏「日志」按钮或结果页「查看日志」跳转 LogActivity。
+ *
+ * 引擎状态仍单向流出，界面只读；唯一的改动是：
+ * 用户在「安装详情」页确认后，引擎内部的 CONFIRM 等待会被自动放行（[preConfirmed]）。
+ * 其余交互（连接失败重试 / 改地址 / 手动包名）仍由对话框叠加在过程屏之上。
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
-    private lateinit var logAdapter: LogAdapter
 
-    /** 待确认安装的 APK 信息，供确认弹窗使用（避免闭包捕获旧值） */
+    /** 界面需要弹出的交互对话框种类 */
+    private enum class DialogKind { CONFIRM, CONNECT_DECISION, ADDRESS_CHANGE, MANUAL_PACKAGE }
+
+    /** 当前正在展示的交互对话框类型，避免 render 反复重建同一对话框 */
     private var dialog: AlertDialog? = null
+    private var currentDialog: DialogKind? = null
+
+    /** 内置 APK 是否就绪：缺 APK 时禁用「继续」 */
+    private var apkReady = false
+
+    /** 用户在详情页是否已确认：用于自动放行引擎的 CONFIRM 等待 */
+    private var preConfirmed = false
+
+    /** 屏 1 录入、带到屏 2 展示并传给引擎的地址 */
+    private var pendingAddress: String = ""
+
+    /** 屏 2 展示、屏 4 结果复用的 APK 信息 */
+    private var apkName: String = "?"
+    private var apkSizeText: String = "?"
+
+    /** 安装开始时间，用于结果页计算耗时 */
+    private var installStartTime: Long = 0L
+
+    private val colorPending: Int by lazy { ContextCompat.getColor(this, R.color.text_hint) }
+    private val colorOnDot: Int by lazy { ContextCompat.getColor(this, R.color.white_text) }
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -63,7 +89,6 @@ class MainActivity : AppCompatActivity() {
 
         setupViews()
         observeEngine()
-        observeLogs()
         prefillAddress()
         checkAssetApk()
     }
@@ -73,41 +98,59 @@ class MainActivity : AppCompatActivity() {
     // ------------------------------------------------------------------
 
     private fun setupViews() {
-        logAdapter = LogAdapter()
-        binding.rvLogs.apply {
-            layoutManager = LinearLayoutManager(this@MainActivity)
-            adapter = logAdapter
-            itemAnimator = null // 日志追加频繁，关掉动画更流畅
+        // 屏 1 → 屏 2
+        binding.btnContinue.setOnClickListener { onContinue() }
+
+        // 屏 1 → 开启远程 ADB（引导）
+        binding.btnRemoteAdb.setOnClickListener {
+            startActivity(Intent(this, RemoteAdbActivity::class.java))
         }
 
-        binding.btnStart.setOnClickListener {
-            hideKeyboard()
-            val address = binding.etAddress.text?.toString().orEmpty()
-            InstallerService.startInstall(this, address)
+        // 屏 2 按钮
+        binding.btnBack.setOnClickListener {
+            preConfirmed = false
+            goScreen(0)
         }
+        binding.btnConfirm.setOnClickListener { onConfirm() }
 
-        binding.btnCancel.setOnClickListener {
-            InstallerService.cancel(this)
-        }
+        // 屏 3 取消
+        binding.btnCancel.setOnClickListener { InstallerService.cancel(this) }
 
+        // 屏 4 结果操作
         binding.btnRetry.setOnClickListener {
+            preConfirmed = false
+            installStartTime = 0L
             InstallEngine.reset()
-            binding.btnStart.performClick()
         }
-
         binding.btnShareLog.setOnClickListener { shareLog() }
-
         binding.btnCopyLog.setOnClickListener { copyLog() }
 
-        binding.btnToggleLog.setOnClickListener {
-            val visible = binding.rvLogs.visibility == android.view.View.VISIBLE
-            binding.rvLogs.visibility = if (visible) android.view.View.GONE else android.view.View.VISIBLE
-            binding.btnToggleLog.text = getString(
-                if (visible) R.string.action_show_log else R.string.action_hide_log
-            )
-        }
+        // 日志入口：跳转独立日志界面
+        binding.btnViewLog.setOnClickListener { openLog() }
+        binding.btnLogOpen.setOnClickListener { openLog() }
+    }
 
-        binding.rvLogs.visibility = android.view.View.GONE
+    private fun onContinue() {
+        hideKeyboard()
+        pendingAddress = binding.etAddress.text?.toString().orEmpty()
+        binding.tvDetailAddr.text = getString(
+            R.string.label_address,
+            pendingAddress.ifEmpty { AddressParser.DEFAULT_IP }
+        )
+        goScreen(1)
+    }
+
+    private fun onConfirm() {
+        preConfirmed = true
+        installStartTime = System.currentTimeMillis()
+        val addr = pendingAddress.ifEmpty { binding.etAddress.text?.toString().orEmpty() }
+        InstallerService.startInstall(this, addr)
+    }
+
+    /** 切到指定屏并同步顶栏步骤指示 */
+    private fun goScreen(n: Int) {
+        if (binding.flipper.displayedChild != n) binding.flipper.displayedChild = n
+        binding.tvStep.text = getString(R.string.step_indicator, n + 1)
     }
 
     private fun prefillAddress() {
@@ -117,31 +160,43 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * 启动时检查内置 APK。
-     * 如果 assets 是空的（release 工作流还没注入），直接把问题说清楚，
-     * 免得用户点了开始才失败。
+     * 启动时检查内置 APK，并把信息带到「安装详情」页。
+     * 缺 APK 时禁用「继续」，避免用户进了详情页才发现没法装。
      */
     private fun checkAssetApk() {
         val apks = AssetApkProvider.listApks(this)
+        apkReady = false
+        val permText = getString(R.string.detail_perm_count, PermissionGranter.PERMISSIONS.size)
+        binding.tvDetailPerm.text = permText
+
         if (apks.isEmpty()) {
             InstallLogger.warn("assets/${AssetApkProvider.ASSET_DIR}/ 为空，未检测到内置 APK")
             binding.tvApkInfo.text = getString(R.string.apk_missing)
             binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.state_error))
-            binding.btnStart.isEnabled = false
+            binding.btnContinue.isEnabled = false
+            apkName = "?"
+            apkSizeText = "?"
+            binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
+            binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
         } else {
             val core = AssetApkProvider.pickCore(apks)
-            binding.tvApkInfo.text = if (core != null) {
-                getString(R.string.apk_ready, core.name, formatSize(core.sizeBytes))
+            apkReady = core != null
+            binding.btnContinue.isEnabled = apkReady
+            if (core != null) {
+                apkName = core.name
+                apkSizeText = formatSize(core.sizeBytes)
+                binding.tvApkInfo.text = getString(R.string.apk_ready, apkName, apkSizeText)
+                binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
+                binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
+                binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
             } else {
-                getString(R.string.apk_ambiguous, apks.joinToString { it.name })
+                binding.tvApkInfo.text = getString(R.string.apk_ambiguous, apks.joinToString { it.name })
+                binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.state_warning))
+                apkName = "?"
+                apkSizeText = "?"
+                binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
+                binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
             }
-            binding.tvApkInfo.setTextColor(
-                ContextCompat.getColor(
-                    this,
-                    if (core != null) R.color.text_secondary else R.color.state_warning
-                )
-            )
-            binding.btnStart.isEnabled = core != null
         }
     }
 
@@ -165,84 +220,154 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun computeScreen(state: InstallState): Int = when {
+        state.stage == InstallStage.DONE || state.stage == InstallStage.FAILED -> 3
+        state.stage == InstallStage.CONFIRM && !preConfirmed -> 1
+        state.stage == InstallStage.IDLE -> if (preConfirmed) 2 else 0
+        else -> 2
+    }
+
     private fun render(state: InstallState) {
-        // 状态标题与文案
-        binding.tvStage.text = state.stage.title
-        binding.tvStatus.text = state.statusText
+        // 向导已在详情页确认过：自动放行引擎的 CONFIRM 等待
+        if (state.awaitingConfirm && preConfirmed) {
+            InstallEngine.confirmInstall()
+        }
+
+        // 切屏
+        val screen = computeScreen(state)
+        if (binding.flipper.displayedChild != screen) {
+            binding.flipper.displayedChild = screen
+        }
+        binding.tvStep.text = getString(R.string.step_indicator, screen + 1)
 
         // 环形进度：确定进度显示百分比，无百分比阶段进入旋转不确定态
         when {
             state.progress in 0..100 -> {
                 binding.ringProgress.setIndeterminate(false)
                 binding.ringProgress.setProgress(state.progress)
-                binding.ringProgress.visibility = android.view.View.VISIBLE
+                binding.ringProgress.visibility = View.VISIBLE
             }
             state.running -> {
                 binding.ringProgress.setIndeterminate(true)
-                binding.ringProgress.visibility = android.view.View.VISIBLE
+                binding.ringProgress.visibility = View.VISIBLE
             }
-            else -> binding.ringProgress.visibility = android.view.View.GONE
+            else -> binding.ringProgress.visibility = View.GONE
         }
 
-        // 关键信息：内容为空时隐藏整行，避免首屏出现两行空白
-        if (state.address.isNotEmpty()) {
-            binding.tvAddress.visibility = android.view.View.VISIBLE
-            binding.tvAddress.text = getString(R.string.label_address, state.address)
-        } else {
-            binding.tvAddress.visibility = android.view.View.GONE
-            binding.tvAddress.text = ""
-        }
-        if (state.packageName.isNotEmpty()) {
-            binding.tvPackage.visibility = android.view.View.VISIBLE
-            binding.tvPackage.text = getString(R.string.label_package, state.packageName)
-        } else {
-            binding.tvPackage.visibility = android.view.View.GONE
-            binding.tvPackage.text = ""
-        }
+        // 阶段文案
+        binding.tvStage.text = state.stage.title
+        binding.tvStatus.text = state.statusText
 
-        // 按钮可见性
-        binding.btnStart.isEnabled = !state.running && !state.finished
-        binding.btnStart.visibility =
-            if (state.finished) android.view.View.GONE else android.view.View.VISIBLE
-        binding.btnCancel.visibility =
-            if (state.running) android.view.View.VISIBLE else android.view.View.GONE
-        binding.btnRetry.visibility =
-            if (state.showResultActions) android.view.View.VISIBLE else android.view.View.GONE
-        binding.btnShareLog.visibility =
-            if (state.showResultActions) android.view.View.VISIBLE else android.view.View.GONE
-        binding.btnCopyLog.visibility =
-            if (state.showResultActions) android.view.View.VISIBLE else android.view.View.GONE
+        // 横向步骤指示
+        setStepIndicator(stageToStep(state.stage))
 
-        // 输入框运行中锁住
-        binding.etAddress.isEnabled = !state.running
-
-        // 结果横幅：背景与文字随成功 / 失败语义态切换
+        // 结果状态 + 信息卡
         when {
             state.stage == InstallStage.DONE -> {
-                binding.tvResult.visibility = android.view.View.VISIBLE
-                binding.tvResult.setBackgroundResource(R.drawable.bg_banner_success)
-                binding.tvResult.setTextColor(ContextCompat.getColor(this, R.color.state_success))
-                binding.tvResult.text = getString(R.string.result_success)
+                binding.tvResultIcon.setBackgroundResource(R.drawable.bg_result_icon_success)
+                binding.tvResultIcon.text = "✓"
+                binding.tvResultTitle.text = getString(R.string.result_success_title)
+                binding.tvResultSubtitle.text = getString(R.string.result_success_subtitle)
+                binding.tvResultSubtitle.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
+                setResultVisibility(true)
+                showResultCard(state)
             }
             state.stage == InstallStage.FAILED -> {
-                binding.tvResult.visibility = android.view.View.VISIBLE
-                binding.tvResult.setBackgroundResource(R.drawable.bg_banner_error)
-                binding.tvResult.setTextColor(ContextCompat.getColor(this, R.color.state_error))
-                binding.tvResult.text = state.errorMessage.ifEmpty {
-                    getString(R.string.result_failed)
-                }
+                binding.tvResultIcon.setBackgroundResource(R.drawable.bg_result_icon_error)
+                binding.tvResultIcon.text = "✕"
+                binding.tvResultTitle.text = getString(R.string.result_failed_title)
+                binding.tvResultSubtitle.text = state.errorMessage.ifEmpty { getString(R.string.result_failed_subtitle) }
+                binding.tvResultSubtitle.setTextColor(ContextCompat.getColor(this, R.color.state_error))
+                setResultVisibility(true)
+                showResultCard(state)
             }
-            else -> binding.tvResult.visibility = android.view.View.GONE
+            else -> {
+                setResultVisibility(false)
+                binding.cardResult.visibility = View.GONE
+            }
         }
 
-        // 需要用户回应时弹窗
-        if (state.awaitingConfirm && dialog?.isShowing != true) showConfirmDialog(state)
-        if (state.stage != InstallStage.CONFIRM && dialog?.isShowing == true) {
-            dialog?.dismiss()
+        // 统一驱动需要用户回应的对话框（连接/改地址/手动包名；确认已向导化）
+        syncDialog(state)
+    }
+
+    private fun showResultCard(state: InstallState) {
+        binding.cardResult.visibility = View.VISIBLE
+        binding.tvResultAddr.text = state.address.ifEmpty { "-" }
+        binding.tvResultPkg.text = state.packageName.ifEmpty { "-" }
+        binding.tvResultApkName.text = apkName
+        binding.tvResultApkSize.text = apkSizeText
+
+        val seconds = if (installStartTime > 0L) {
+            (System.currentTimeMillis() - installStartTime) / 1000.0
+        } else 0.0
+        binding.tvResultDuration.text = getString(R.string.duration_format, seconds)
+    }
+
+    private fun setResultVisibility(visible: Boolean) {
+        val v = if (visible) View.VISIBLE else View.GONE
+        binding.tvResultIcon.visibility = v
+        binding.tvResultTitle.visibility = v
+        binding.tvResultSubtitle.visibility = v
+    }
+
+    private fun stageToStep(stage: InstallStage): Int = when (stage) {
+        InstallStage.CHECK_ENV, InstallStage.PARSE_ADDR, InstallStage.PREFLIGHT -> 0
+        InstallStage.CONNECT -> 1
+        InstallStage.CONFIRM, InstallStage.READY, InstallStage.INSTALL,
+        InstallStage.RESOLVE_PKG, InstallStage.GRANT -> 2
+        InstallStage.LAUNCH, InstallStage.HEALTH -> 3
+        else -> -1
+    }
+
+    private fun setStepIndicator(active: Int) {
+        val dots = listOf(binding.hstep0, binding.hstep1, binding.hstep2, binding.hstep3)
+        dots.forEachIndexed { i, dot ->
+            when {
+                i < active -> {
+                    dot.setBackgroundResource(R.drawable.bg_step_dot_done)
+                    dot.setTextColor(colorOnDot)
+                }
+                i == active -> {
+                    dot.setBackgroundResource(R.drawable.bg_step_dot_active)
+                    dot.setTextColor(colorOnDot)
+                }
+                else -> {
+                    dot.setBackgroundResource(R.drawable.bg_step_dot)
+                    dot.setTextColor(colorPending)
+                }
+            }
         }
     }
 
-    /** 安装前确认：展示 APK 名与大小，与 bat 的 Y/N 提示等价 */
+    /**
+     * 依据 state 决定当前应展示哪种交互对话框，并在种类变化时切换，
+     * 避免每次 render 都重建同一个对话框、或遗漏引擎等待的输入。
+     * CONFIRM 已向导化：仅在没有预先确认时才退化为对话框（正常情况下不会走到）。
+     */
+    private fun syncDialog(state: InstallState) {
+        val want = when {
+            state.interaction == InstallInteraction.CONNECT_DECISION -> DialogKind.CONNECT_DECISION
+            state.interaction == InstallInteraction.ADDRESS_CHANGE -> DialogKind.ADDRESS_CHANGE
+            state.interaction == InstallInteraction.MANUAL_PACKAGE -> DialogKind.MANUAL_PACKAGE
+            state.awaitingConfirm && !preConfirmed -> DialogKind.CONFIRM
+            else -> null
+        }
+        if (want == currentDialog) return
+        dialog?.dismiss()
+        dialog = null
+        currentDialog = null
+        when (want) {
+            DialogKind.CONFIRM -> showConfirmDialog(state)
+            DialogKind.CONNECT_DECISION -> showConnectDecisionDialog()
+            DialogKind.ADDRESS_CHANGE -> showAddressDialog()
+            DialogKind.MANUAL_PACKAGE -> showManualPackageDialog()
+            null -> Unit
+        }
+        currentDialog = want
+    }
+
+    /** 安装前确认：展示 APK 名与大小，与 bat 的 Y/N 提示等价（仅未预先确认时启用） */
     private fun showConfirmDialog(state: InstallState) {
         dialog = AlertDialog.Builder(this)
             .setTitle(R.string.dialog_confirm_title)
@@ -260,34 +385,71 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    // ------------------------------------------------------------------
-    // 日志订阅
-    // ------------------------------------------------------------------
-
-    private fun observeLogs() {
-        lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
-                InstallLogger.lines.collect { line ->
-                    val current = logAdapter.currentList.toMutableList()
-                    current.add(line)
-                    // 界面上最多保留 500 行，避免长跑内存增长
-                    if (current.size > MAX_UI_LINES) current.removeAt(0)
-                    logAdapter.submitList(current) {
-                        binding.rvLogs.scrollToPosition(logAdapter.itemCount - 1)
-                    }
-                }
+    /** 连接失败：重试 / 修改地址 / 取消。对应引擎的 connectWithRetry 等待 */
+    private fun showConnectDecisionDialog() {
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.dialog_connect_title)
+            .setMessage(getString(R.string.dialog_connect_message, InstallEngine.state.value.address))
+            .setCancelable(false)
+            .setPositiveButton(R.string.action_retry_connect) { _, _ ->
+                InstallEngine.submitConnectAction(InstallEngine.ConnectAction.RETRY)
             }
-        }
+            .setNeutralButton(R.string.action_change_address) { _, _ ->
+                InstallEngine.submitConnectAction(InstallEngine.ConnectAction.CHANGE_ADDRESS)
+            }
+            .setNegativeButton(R.string.action_cancel) { _, _ ->
+                InstallEngine.submitConnectAction(InstallEngine.ConnectAction.CANCEL)
+            }
+            .show()
+    }
 
-        // 首次进入 / 旋转屏幕后回填已有日志（在订阅之后，避免漏掉新行）
-        if (logAdapter.currentList.isEmpty()) {
-            val history = InstallLogger.bufferedLines()
-            if (history.isNotEmpty()) logAdapter.submitList(history)
+    /** 修改设备地址：提交后引擎用新地址重连 */
+    private fun showAddressDialog() {
+        val input = EditText(this).apply {
+            setText(InstallEngine.state.value.address)
+            setSelection(text?.length ?: 0)
+            hint = getString(R.string.dialog_address_hint)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_URI
         }
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.dialog_address_title)
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton(R.string.action_confirm) { _, _ ->
+                InstallEngine.submitAddressChange(input.text?.toString().orEmpty())
+            }
+            .setNegativeButton(R.string.action_cancel) { _, _ -> InstallEngine.cancel() }
+            .show()
+    }
+
+    /** 包名识别兜底：手动输入 Core 包名 */
+    private fun showManualPackageDialog() {
+        val input = EditText(this).apply {
+            hint = getString(R.string.dialog_package_hint)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.dialog_package_title)
+            .setView(input)
+            .setCancelable(false)
+            .setPositiveButton(R.string.action_confirm) { _, _ ->
+                InstallEngine.submitManualPackage(input.text?.toString().orEmpty())
+            }
+            .setNegativeButton(R.string.action_cancel) { _, _ -> InstallEngine.cancel() }
+            .show()
     }
 
     // ------------------------------------------------------------------
-    // 日志导出
+    // 日志：跳转到独立日志界面（LogActivity）
+    // ------------------------------------------------------------------
+
+    private fun openLog() {
+        startActivity(Intent(this, LogActivity::class.java))
+    }
+
+    // ------------------------------------------------------------------
+    // 日志导出（结果页：分享 / 复制）
     // ------------------------------------------------------------------
 
     private fun shareLog() {
@@ -343,9 +505,5 @@ class MainActivity : AppCompatActivity() {
         bytes < 1024 -> "$bytes B"
         bytes < 1024 * 1024 -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
         else -> String.format(Locale.US, "%.1f MB", bytes / 1024.0 / 1024.0)
-    }
-
-    companion object {
-        private const val MAX_UI_LINES = 500
     }
 }

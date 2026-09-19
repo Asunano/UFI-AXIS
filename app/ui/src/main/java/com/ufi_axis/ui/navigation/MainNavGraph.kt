@@ -8,10 +8,18 @@ import androidx.compose.animation.core.EaseInOutCubic
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsBottomHeight
+import androidx.compose.foundation.layout.windowInsetsTopHeight
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.BarChart
 import androidx.compose.material.icons.outlined.GridView
@@ -57,8 +65,11 @@ import com.ufi_axis.ui.components.common.CAPSULE_SHADOW_ROOM
 import com.ufi_axis.ui.components.common.CapsuleBlurHost
 import com.ufi_axis.ui.components.common.CapsuleInsetHolder
 import com.ufi_axis.ui.components.common.CapsuleTabItem
+import com.ufi_axis.ui.components.common.CapsuleTouchGate
 import com.ufi_axis.ui.components.common.LocalCapsuleBottomInset
 import com.ufi_axis.ui.components.common.UfiCapsuleTabBar
+import com.ufi_axis.ui.components.common.ufiCapsuleBottomInset
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
@@ -215,35 +226,30 @@ fun MainNavGraph(
     val systemReduceMotion = LocalUfiReduceMotion.current
     val navTransitionMs = ufiNavTransitionDurationMs(transitionDurationMs, systemReduceMotion)
 
-    // ── 深度层次：本次转场里「谁是下层」 ─────────────────────────────────────
-    //
-    // ★ 2026-09-05 P0：这里**不再**用 `navController.visibleEntries` 的栈顶判角色。
-    //   旧写法是 `visibleEntries.value.lastOrNull()?.id == entry.id` 当「进场页」，
-    //   并断言「pop 时被关掉的那页仍在栈顶」—— 那条断言是错的：
-    //   navigation-runtime 2.8.0 `NavController.kt:1192 populateVisibleEntries()` 先收
-    //   `transitionsInProgress` 里 maxLifecycle < STARTED 的 entry（含已出栈、正在跑退场
-    //   动画的那页），再收 backQueue 里 >= STARTED 的，所以 pop 期间 `.last()` 是**宿主**。
-    //   `.last()` 的真实语义一直是「进场页」，pop 时进场页恰恰是**下层** ⇒ 角色判反。
-    //   完整依据（含 `NavHost.kt:551` 的交叉验证、为什么 `PostExit` 也不行）见
-    //   [UfiNavRecedeRole] 的 KDoc。
-    //
-    // 现在角色由**方向**决定，而方向信息本就在手上：navigation-compose 按方向决定调用
-    // 哪一组转场函数（`NavHost.kt:556-582`），所以「哪个函数被调用」就是方向信号。
-    // [detailExit]（push 的旧页）与 [detailPopEnter]（pop 回来的旧页）各自把 entry id
-    // 写进这个持有者，图层侧只做一次 id 比对。
-    //
-    // 它刻意是普通 `var`（不是 MutableState）：只在 graphicsLayer / drawWithContent 的
-    // lambda 里被读，不建立 snapshot 依赖 ⇒ 零重组。这一点与旧实现「不在组合期解引用
-    // visibleEntries」的初衷一致，但不再有判反的风险。
+    // Shared Axis 深度图层的「谁是下层」角色持有者。push/pop 在 exit / popEnter
+    // 里登记 entry id；图层侧用 `() -> Boolean` 比对，零重组。详见 UfiNavRecedeRole。
     val recedeRole = remember { UfiNavRecedeRole() }
 
-
+    // 只有停留在宿主目的地时才显示底部栏；detail 页仍然隐藏。
 
 
 
 
     // 只有停留在宿主目的地时才显示底部栏；detail 页仍然隐藏。
     val showBottomBar = currentRoute == Routes.MAIN
+
+    // ★ 2026-09-16（二级页底部控件点不动）：把「胶囊此刻该不该吃触摸」下发到窗口层。
+    //
+    // 胶囊窗口自 2026-09-15 起常驻（挂载后不再卸载，避免窗口增删闪帧），二级页只把内容
+    // scale/alpha 动到 0 —— 但**窗口矩形没缩**，而 FLAG_NOT_TOUCH_MODAL 只放行窗口
+    // 矩形之外的触摸。于是二级页里屏幕底部那条带子（≈胶囊高度 + 抬高量）上的控件全都
+    // 收不到事件：音乐播放页的进度条与播放键正好整排落在里面，表现为「点不动 / 点偏才响应」。
+    // 隐藏期改由 CapsuleTouchGate 给窗口补 FLAG_NOT_TOUCHABLE：窗口留着、像素不画、
+    // 触摸整块下发给页面。
+    LaunchedEffect(showBottomBar) {
+        CapsuleTouchGate.interactive.value = showBottomBar
+    }
+
 
     // SMS 通知深链接：点击短信/验证码通知后，跳转到短信对话界面。
     // pendingSmsPhone 由 MainActivity 从 Intent 中读取并写入，此处监听变化后导航。
@@ -337,33 +343,27 @@ fun MainNavGraph(
                     .blurEntrance("app-launch"),
                 contentAlignment = Alignment.BottomCenter      // 胶囊浮层锚定底部居中
             ) {
+            // 二级页：Material Shared Axis X（纯水平，无交叉淡入淡出）。
+            // Tab 之间仍由宿主内 UfiPageSwitcher 负责。
             NavHost(
                 navController = navController,
                 startDestination = Routes.MAIN,
-                // ★ NavHost 级默认必须显式给全，不能留空。
-                //   留空时库的兜底是 fadeIn(700ms) / fadeOut(700ms)：可预测性手势返回时
-                //   navigation-compose 会按手势进度 seek 这套淡入淡出（官方文档原话是
-                //   "automatically cross-fades between screens when the user swipes back"），
-                //   于是滑动过程中整页 alpha 被压低 —— 真机现象就是"滑动返回时界面逐渐淡化"。
-                //   这里把四个方向全部对齐到 detail/host 那套「只平移、不淡化」的定义，
-                //   任何没有单独覆盖的目的地也不会再走 700ms 淡入淡出。
-                enterTransition = { detailEnter(navTransitionMs) },
-                exitTransition = { detailExit(navTransitionMs, recedeRole) },
-                popEnterTransition = { detailPopEnter(navTransitionMs, recedeRole) },
-                popExitTransition = { detailPopExit(navTransitionMs) }
+                enterTransition = { detailSharedAxisEnter(navTransitionMs) },
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
+                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
+                popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
             ) {
             // ── Tab 宿主目的地：5 个 Tab 作为 UfiPageSwitcher 的 5 页
             composable(
                 route = Routes.MAIN,
-                enterTransition = { hostEnter() },
-                exitTransition = { hostExit(navTransitionMs, recedeRole) },
-                popEnterTransition = { hostPopEnter(navTransitionMs, recedeRole) },
-                popExitTransition = { hostPopExit() }
+                // 宿主与二级页同一套 Shared Axis，进/回二级页时两侧同步。
+                enterTransition = { detailSharedAxisEnter(navTransitionMs) },
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
+                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
+                popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
             ) { entry ->
-                // 宿主在两个方向上都是「下层」：push 去 detail 时它留在后面（hostExit 记 role），
-                // pop 回来时它也是回来的那一层（hostPopEnter 记 role）。仍按统一判据比对 role，
-                // 不硬写 `{ true }` —— 判定逻辑只留一处。
-                val recedeLayer = ufiNavRecedeLayer(
+                // 深度层：去二级页时宿主是下层（压暗+后退）；回宿主时宿主仍是下层。
+                val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
                     durationMillis = navTransitionMs,
                 )
@@ -410,16 +410,13 @@ fun MainNavGraph(
                             selectedIndex = mainTabIndex,
                             onSelectedIndexChange = { mainTabIndex = it },
                             onSelectionProgressChange = { capsuleSelectionProgressState.floatValue = it },
-                            // ★ 目的地自带不透明底色（见下方 detail 分支同款注释）：
-                            //   可预测性手势返回时，宿主页是「下面那一层」，透明会让 detail 页
-                            //   的缩放层直接透到 Scaffold 底色，观感是两层内容叠在一起。
-                            // ★ recedeLayer：宿主作为下层的「后退 + scrim」，进度与 detail 页的
-                            //   平移同源（见 ufiNavRecedeLayer）。必须在 background 之前 ——
-                            //   scrim 要压在底色与内容之上，缩放要连底色一起缩。
+                            // ★ 目的地自带不透明底色，必须放在 axisLayer **之前** —— 这样圆角
+                            //   clip 会把底色一并切成圆角（否则方形底色盖在裁剪层之上，圆角消失）。
+                            //   axisLayer 负责转场期圆角/scrim（进场新页圆角 20dp→0）。
                             modifier = Modifier
                                 .fillMaxSize()
-                                .then(recedeLayer)
-                                .background(palette.pageBg),
+                                .background(palette.pageBg)
+                                .then(axisLayer),
 
                             transition = UfiPageTransitions.byId(pageTransitionId),
                             swipeEnabled = true,
@@ -477,58 +474,36 @@ fun MainNavGraph(
                 }
             }
 
-            // ── 其余 detail 页：行为与迁移前完全一致
+            // ── 其余 detail 页：Shared Axis X（与 NavHost 默认一致，显式钉住防止未来改默认）
             appRoutes.filter { it.transition == TransitionType.DETAIL }.forEach { appRoute ->
                 composable(
                     route = appRoute.route,
                     arguments = appRoute.arguments,
-                    enterTransition = { detailEnter(navTransitionMs) },
-                    exitTransition = { detailExit(navTransitionMs, recedeRole) },
-                    popEnterTransition = { detailPopEnter(navTransitionMs, recedeRole) },
-                    popExitTransition = { detailPopExit(navTransitionMs) }
+                    enterTransition = { detailSharedAxisEnter(navTransitionMs) },
+                    exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
+                    popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
+                    popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
                 ) { entry ->
-                // 深度层次：detail 页在被 push 上来 / 被 pop 掉时是「上层」（不做任何变换、
-                // 满屏铺满），在被更深的 detail 覆盖 / 从更深的 detail 返回时是「下层」
-                // （缩放 + scrim）—— 角色由方向决定，见 [UfiNavRecedeRole]。
-                val recedeLayer = ufiNavRecedeLayer(
+                // 深度层：进二级页时上层圆角描边（满屏不缩放）；返回时 detail 是上层纯平移。
+                val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
                     durationMillis = navTransitionMs,
                 )
-
-                // ★ 每个 detail 目的地**自己画不透明底色**，不能只靠外层 Scaffold 的
-                //   containerColor。根因（2026-08-30 修）：targetSdk 36 上系统「可预测性手势
-                //   返回」默认开启，navigation-compose 在手势进行中会同时组合「即将退出的
-                //   detail 页」和「下面那一层」，并把 detail 页整体丢进 graphicsLayer 做
-                //   缩放/位移/淡出。该图层只包含本页**自己绘制的像素** —— 页面没有底色时，
-                //   卡片与图标之间全是透明区，手势中就直接看到下层内容，真机现象正是
-                //   「滑动返回时底层背景消失，只剩元素图标飘着」。
-                //
-                //   参考项目 UFITOOLS-Widget 是多 Activity 结构，底色画在
-                //   `window.decorView`（BackgroundUtil.applyBackground）上，窗口自带底色，
-                //   所以系统缩放整窗时背景天然跟随。单 Activity + Compose 导航下的等价做法，
-                //   就是让每个目的地这一层持有底色。
-                //
-                // ★ 2026-09-01 返回掉帧治理，两处改动：
-                //
-                //   1. RenderNode 边界（原为 `.graphicsLayer()` 空 lambda，现由 [recedeLayer] 承担）：
-                //      `detailPopExit` 是**纯 slideOut、不带 fadeOut**，而 Compose 只在有
-                //      alpha/scale 需求时才给出入页套 graphicsLayer。没有图层边界时，
-                //      平移是"改变放置位置"，每帧都要把这一整页的绘制指令按新偏移重新发一遍；
-                //      有了边界后每帧只改 RenderNode 的位移，页面像素直接复用 —— 这正是
-                //      「慢慢手势返回能看到掉帧」而「前进（带 fadeIn，本就有图层）不掉」的差异来源。
-                //      2026-09-04：recedeLayer 本身就是一层 graphicsLayer（关闭转场时是空 lambda，
-                //      与原写法逐字等价），故不再另挂一个，否则一页套两层白付一次离屏。
-                //
-                //   2. [UfiNavFrameGate]：转场（含手势 seek）期间举起帧闸门，让 WS 实时指标
-                //      的整屏重组攒到转场结束再刷 —— 慢速手势可能持续数秒，期间会撞上十几条推送。
+                // ★ 每个 detail 目的地**自己画不透明底色**（`.background(palette.pageBg)`，
+                //   且必须放在 axisLayer **之前**，否则圆角 clip 裁不到底色、圆角消失），
+                //   不能只靠外层 Scaffold 的 containerColor。根因（2026-08-30 修）：targetSdk 36
+                //   上系统「可预测性手势返回」默认开启，navigation-compose 在手势进行中会同时
+                //   组合「即将退出的 detail 页」和「下面那一层」，并把 detail 页整体丢进
+                //   graphicsLayer 做位移/圆角/scrim。该图层只包含本页**自己绘制的像素** ——
+                //   页面没有底色时，卡片与图标之间全是透明区，手势中就直接看到下层内容。
+                // ★ UfiNavFrameGate：转场/手势期间压住 WS 整屏重组（性能用，不是动画）。
                 UfiNavFrameGate {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .then(recedeLayer)
                         .background(palette.pageBg)
+                        .then(axisLayer)
                 ) {
-
                     screens[appRoute.route]?.invoke(entry, navController)
                 }
                 }
@@ -536,6 +511,9 @@ fun MainNavGraph(
             }
 
             }
+
+
+
 
             // 悬浮胶囊 overlay 浮层（不再占 innerPadding，避免遮挡页面内容）
             //
@@ -578,8 +556,23 @@ fun MainNavGraph(
                     // - 浮出 420 → UfiMotion.Duration.Emphatic（值不变）。收编前 420 在本文件与
                     //   SpeedTestScreen.PHASE_SWITCH_MS 各写了一遍，现在共用一个档。
                     // - 收起 360 走本文件的 [CAPSULE_HIDE_MS]（值不变，有意例外，理由见其注释）。
+                    //
+                    // ★★ 2026-09-15（返回二级页时"闪一下"）：浮出**延后一个转场时长** ★★
+                    // 胶囊活在 Dialog 里，那是一个**盖在 Activity 窗口之上**的独立窗口。
+                    // 返回时 `currentBackStackEntryAsState()` 在转场**开始**的那一帧就变成 MAIN，
+                    // 于是胶囊立刻开始浮出 —— 而此时正在右滑退场的二级页还铺满整屏，
+                    // 用户看到的就是"胶囊从二级页上面冒出来一下"。
+                    // 不能靠延后挂载来解（上面那段注释记着上一轮为什么回退）：挂载仍在同一帧，
+                    // 只把**可见性**推迟到页面落位。delay 走 ufiSharedAxisDurationMs，
+                    // 与页面平移读同一个函数，两边不会错开；关闭动效时它返回 0，行为不变。
                     if (showBottomBar) tween(
-                        durationMillis = UfiMotion.Duration.Emphatic,   // 显示：慢-快-慢，放慢
+                        // 2026-09-15 二次调整（"弹出晚了 0.5~1s"）：
+                        // 上一版是 delay = 整段转场(456ms) + 浮出 420ms ≈ 0.9s 才到位。
+                        // 现在 delay 降到转场的 55%、浮出换成 Sweeping(320)：
+                        // 页面滑过一半多就起浮，视觉上与页面一起落位，但仍晚于
+                        // "二级页还铺满整屏"的那段，不会从旧页上面冒出来。
+                        durationMillis = UfiMotion.Duration.Sweeping,
+                        delayMillis = ufiSharedAxisDurationMs(navTransitionMs) * 55 / 100,
                         easing = EaseInOutCubic,
                     )
                     else tween(
@@ -587,10 +580,15 @@ fun MainNavGraph(
                         easing = EaseInOutCubic,
                     )
                 )
-                // 卸载排在收起动画之后（这一侧的顺序本来就是对的）。
-                if (!showBottomBar) showCapsule.value = false
+                // ★★ 2026-09-15（返回时仍然闪一下）：挂载后**不再卸载** ★★
+                // 上一轮只把浮出动画延后，闪烁依旧 —— 因为闪的不是 alpha，而是**窗口本身**：
+                // 胶囊活在独立 Dialog Window 里，转场中途 addView/removeView 一个窗口会带来
+                // 一帧与 Activity 窗口不同步的合成（窗口测量、背景、系统栏对比层都在那一帧生效）。
+                // 现在窗口从第一次进入 MAIN 起常驻，导航过程中不再有窗口增删：
+                // 隐藏只把 p 动到 0（scale/alpha 归零、不绘制像素），窗口留着。
+                // 代价：detail 页上多一个 wrap-content 的透明小窗 —— 它带
+                // FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCH_MODAL（CapsuleBlurHost 施加），不吃触摸。
             }
-            val p = enterProgress.value
 
             if (showCapsule.value) {
                 // 用 Dialog（而非 Popup）承载胶囊：Dialog 才有 Window 对象，才能在窗口层
@@ -637,6 +635,13 @@ fun MainNavGraph(
                         ) {
                             Box(
                                 modifier = Modifier.graphicsLayer {
+                                    // ★ 2026-09-15：`enterProgress.value` 改在**这个 lambda 里**读。
+                                    // 原来是在 Scaffold content 顶层 `val p = enterProgress.value` ——
+                                    // 那是组合期读取，胶囊每动画帧都会让整个 Scaffold content
+                                    // （含 NavHost 调用点）失效一次；它与二级页转场时间重叠，
+                                    // 是转场期掉帧/抖动的一个来源。graphicsLayer 的 block 在图层阶段执行，
+                                    // 在这里读只订阅这一层，零重组。
+                                    val p = enterProgress.value
                                     scaleX = p
                                     scaleY = p
                                     // 渐入渐出：p=0 全透明 → p=1 不透明，叠加在缩放+位移上。

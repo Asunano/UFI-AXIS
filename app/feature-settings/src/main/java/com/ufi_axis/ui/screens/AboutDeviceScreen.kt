@@ -50,12 +50,10 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.AppPreferences
-import com.ufi_axis.util.GeoDetector
 import com.ufi_axis.util.UpdateSource
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.module.ToolsModule
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -125,10 +123,19 @@ fun AboutDeviceScreen(
     // 之前是无条件同步：每次点开再关就打一次设备写请求，还弹一次 toast；设备不在线时
     // 更是每次都弹「同步失败」，而用户其实什么都没改。
     var mirrorBaseOnOpen by remember { mutableStateOf("") }
+    // 「当前国家/地区」只做展示：真源在 core（启动时自动检测一次并落盘，见 `/api/geo`）。
+    // 初值取本地缓存，是为了 core 不可达时也有东西可显示。
     var lastCountry by remember { mutableStateOf(prefs.lastCountry) }
-    var detectingCountry by remember { mutableStateOf(false) }
     var autoCheckUpdate by remember { mutableStateOf(prefs.autoCheckUpdate) }
-    val scope = rememberCoroutineScope()
+
+
+    // 打开「更新设置」时向 core 问一次当前国家（core 不可达就保持缓存值）。
+    // 放在打开那一刻而不是进页面就拉：这一行只在弹窗的第二个页签里出现。
+    LaunchedEffect(showUpdateSettingsDialog) {
+        if (showUpdateSettingsDialog) {
+            lastCountry = UpdateSource.countryForDisplay(prefs)
+        }
+    }
 
     // 全局 Toast 反馈（UfiToastHost；本 Screen 持有 state，SAF/同步回调闭包内赋值）
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
@@ -161,6 +168,13 @@ fun AboutDeviceScreen(
     var versionClickLastTime by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(Unit) {
+        // 2026-09-14：更新期间这两件事都不能做。
+        // 用户在等设备升级时最可能停留的就是本页，而返回再进来会重跑这个 LaunchedEffect：
+        // - resetUpdateDeviceState() 会清掉进度状态并**停掉轮询** —— 那是「读到安装结果」的
+        //   唯一通道，掐掉之后设备端状态机就再没人能把它从 installing 里领出来
+        //   （详见 core 的 UpdateManager.selfHealStuckState）；
+        // - checkForUpdate() 此刻必然失败，只会多冒一句「检查更新失败」。
+        if (viewModel.tools.coreUpdating.value) return@LaunchedEffect
         // P0：进入关于页时重置推送状态，防止残留 uploading/installing 导致弹窗误显示
         viewModel.tools.resetUpdateDeviceState()
         // 补拉一次后端版本：UpdateState 是 ViewModel 级的，App 启动那次若后端不可达，
@@ -473,38 +487,39 @@ fun AboutDeviceScreen(
                 onDismiss = { showDonateDialog = false },
                 title = "赞赏"
             ) {
-                Text(
-                    text = "如果你喜欢这个软件，可以考虑请我喝一杯柠檬水哟~（狗头）下滑支持微信 / 支付宝 💰",
-                    style = UfiTextStyles.note,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Large))
-                if (donateQr != null) {
-                    Image(
-                        bitmap = donateQr,
-                        contentDescription = "赞赏码",
-                        contentScale = ContentScale.FillWidth,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(UfiCardDefaults.shape)
+                // 间距统一到 UfiDialogBody（12dp）
+                UfiDialogBody {
+                    Text(
+                        text = "如果你喜欢这个软件，可以考虑请我喝一杯柠檬水哟~（狗头）下滑支持微信 / 支付宝 💰",
+                        style = UfiTextStyles.note,
+                        color = palette.textSecondary
                     )
-                } else {
-                    // 解码在 IO 线程，首帧会空一下；居中放个指示器避免弹窗内容左上角空一块
-                    Box(
-                        modifier = Modifier.fillMaxWidth(),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        UfiLoadingIndicator()
+                    if (donateQr != null) {
+                        Image(
+                            bitmap = donateQr,
+                            contentDescription = "赞赏码",
+                            contentScale = ContentScale.FillWidth,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(UfiCardDefaults.shape)
+                        )
+                    } else {
+                        // 解码在 IO 线程，首帧会空一下；居中放个指示器避免弹窗内容左上角空一块
+                        Box(
+                            modifier = Modifier.fillMaxWidth(),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            UfiLoadingIndicator()
+                        }
                     }
+                    Text(
+                        text = "微信 / 支付宝 扫一扫",
+                        style = UfiTextStyles.caption,
+                        color = palette.textSecondary.copy(alpha = 0.5f),
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth()
+                    )
                 }
-                Spacer(Modifier.height(Spacing.Medium))
-                Text(
-                    text = "微信 / 支付宝 扫一扫",
-                    style = UfiTextStyles.caption,
-                    color = palette.textSecondary.copy(alpha = 0.5f),
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
 
             // ══════════ 更新弹窗（设置 / 推送 APK 进度）══════════
@@ -530,17 +545,6 @@ fun AboutDeviceScreen(
                         prefs.updateSourceMode = mode
                     },
                     lastCountry = lastCountry,
-                    detectingCountry = detectingCountry,
-                    onRedetectCountry = {
-                        detectingCountry = true
-                        scope.launch {
-                            GeoDetector.detectCountry()?.let { c ->
-                                lastCountry = c
-                                prefs.lastCountry = c
-                            }
-                            detectingCountry = false
-                        }
-                    },
                     autoCheck = autoCheckUpdate,
                     onAutoCheckChange = { checked ->
                         autoCheckUpdate = checked

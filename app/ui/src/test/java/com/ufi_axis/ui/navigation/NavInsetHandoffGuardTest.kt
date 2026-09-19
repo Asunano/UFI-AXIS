@@ -181,9 +181,8 @@ class NavInsetHandoffGuardTest {
      * `background(palette.pageBg)` 必须排在 `statusBarsPadding()` **之前**。
      *
      * 反过来（或干脆不画背景，让祖先兜底）会让状态栏 / 手势条那两条带子不属于本页像素：
-     * 转场中页面整体平移 + `ufiNavRecedeLayer` 的 `CompositingStrategy.Offscreen` 把内容裁到
-     * 图层边界，那两条带子露出的就是图层外的窗口底色 —— 真机是「上下各一道白框」，
-     * 卡片阴影让它更显眼。
+     * 转场中页面整体平移（不再缩放、不再离屏裁剪），那两条带子露出的就是祖先兜底的非本页
+     * 像素 —— 窗口底色，真机是「上下各一道白框」，卡片阴影让它更显眼。
      */
     @Test
     fun ufiScreenScaffold_mustPaintPageBgBeforeInsetPadding() {
@@ -838,28 +837,56 @@ class NavInsetHandoffGuardTest {
     }
 
 
-    // ── 返回时的「阴影闪烁」（2026-09-04） ────────────────────────────────────
+    // ── 转场深度层：不缩放、不离屏合成，深度只靠 scrim（2026-09-13） ──────────
 
     /**
-     * 下层的缩放图层必须在**缩放期间**离屏合成一次，且**静止时退回 `Auto`**。
+     * 下层图层**不得**缩放、**不得**离屏合成；圆角改用 in-place `clipPath`；深度感由 scrim 承担。
      *
-     * - 少了 `Offscreen`：子树里几十张 `ufiCardShadow` 卡片的阴影会随 `scale 0.96→1`
-     *   逐帧按新比例重新光栅化，边缘亮度抖动 —— 用户实测能看到的「阴影闪烁」。
-     * - 写成无条件 `Offscreen`：宿主页 99% 的时间静止，却常驻一张≈屏幕大小的离屏纹理
-     *   （1080×2340 ARGB8888 ≈ 10MB 显存），纯浪费。
+     * 2026-09-13 二次修订（对应问题 1/2/3/4 的修复）：
+     * - 一次修订把离场页的 `scale 0.96 + CompositingStrategy.Offscreen` 删掉，改成
+     *   `graphicsLayer { clip = true; shape = RoundedCornerShape }` 给进场页做圆角。但
+     *   `graphicsLayer` 一带**非矩形 shape** 就走 `clipToOutline`、**强制分配整屏离屏缓冲**：
+     *   该缓冲被父级 `slide` 平移时合成到错误偏移 → 整页「从下方/右下角飘上来」（问题 1/4，
+     *   多次返回必现）；圆角半径逐帧变化 → 缓冲每帧重分配 → 连续/快速返回掉帧（问题 2）；
+     *   缓冲在未铺满屏时被遮 → 「新页圆角完全没有」（问题 3）。
+     * - 二次修订：圆角改在 `DrawScope` 里用 `canvas.clipPath(roundRectPath)` **原地裁剪**
+     *   （不分配任何层），`graphicsLayer`/`CompositingStrategy.Offscreen`/`scaleX`/`scaleY`
+     *   全部不得出现；scrim 仍由 `drawRect` + `sharedAxisScrimAlpha()` 承担（问题「压暗看不见」落点）。
      */
     @Test
-    fun ufiNavRecedeLayer_mustCompositeOffscreenOnlyWhileScaling() {
+    fun ufiSharedAxisLayer_mustClipInPlaceNotOffscreenAndMustScrim() {
         val code = executableCode(source(navigationPath))
-        assertTrue(
-            "ufiNavRecedeLayer 的缩放图层必须在缩放期间用 CompositingStrategy.Offscreen：" +
-                "否则子树里的 ufiCardShadow 阴影会逐帧重光栅化，真机可见阴影闪烁。",
+        // 1) 离屏合成整段移除 —— 否则预测性返回掉帧 + 首帧飞角复发。
+        assertFalse(
+            "ufiSharedAxisLayer 不得再用 CompositingStrategy.Offscreen：" +
+                "非矩形 shape 的 graphicsLayer 会 clipToOutline 强制整屏离屏缓冲，" +
+                "被父级 slide 平移时合成到错误偏移（问题 1/4），且逐帧重分配致掉帧（问题 2）。",
             code.contains("CompositingStrategy.Offscreen")
         )
+        // 2) 不得再出现任何 graphicsLayer（避免再次引入离屏层）。
+        assertFalse(
+            "ufiSharedAxisLayer 不得再出现 graphicsLayer：" +
+                "它一旦带非矩形 shape 就强开整屏离屏缓冲，正是问题 1/2/4 的根因。",
+            code.contains("graphicsLayer")
+        )
+        // 3) 两层都不做缩放（不得再出现 scaleX / scaleY）。
+        assertFalse(
+            "receding / entering 两层都不得出现 scaleX / scaleY（不得再缩放）。",
+            code.contains("scaleX") || code.contains("scaleY")
+        )
+        // 4) 圆角改用 in-place clipPath（不分配离屏缓冲）。
         assertTrue(
-            "静止（scale == 1f）时必须退回 CompositingStrategy.Auto：常开离屏会白占约 10MB 显存。",
-            Regex("""scale\s*==\s*1f\s*\)?\s*CompositingStrategy\.Auto""")
-                .containsMatchIn(code.replace(Regex("""\s+"""), " "))
+            "进场新页圆角必须改用 canvas.clipPath 原地裁剪（不开离屏层），否则问题 1/2/4 复发。",
+            code.contains("clipPath")
+        )
+        // 5) scrim（压暗修复落点）必须仍在：drawRect + sharedAxisScrimAlpha。
+        assertTrue(
+            "深度感改由 scrim 承担，drawRect 必须在（否则压暗消失）。",
+            code.contains("drawRect")
+        )
+        assertTrue(
+            "scrim 浓度必须仍由 sharedAxisScrimAlpha() 读 token（落点：UfiMotion.NavRecede.ScrimAlpha）。",
+            code.contains("sharedAxisScrimAlpha")
         )
     }
 
@@ -918,7 +945,7 @@ class NavInsetHandoffGuardTest {
      * 于是 pop 期间角色整个判反：正整屏右滑出去的 detail 吃 `scale 1→0.96` + scrim，
      * 宿主则完全不变换、复位动画根本没播 —— 用户报的「退出偏快 / 卡顿跳帧 / 下层表现不对 /
      * 收尾没滑完就消失」都在这里。现在角色由**方向**决定（`UfiNavRecedeRole`：
-     * `detailExit` 记 `initialState.id`、`detailPopEnter` 记 `targetState.id`），
+     * `detailSharedAxisExit` 记 `initialState.id`、`detailSharedAxisPopEnter` 记 `targetState.id`），
      * 不再读 `visibleEntries`，顺带把手势返回「松手瞬间角色互换」也一并修掉。
      */
     @Test
@@ -937,15 +964,15 @@ class NavInsetHandoffGuardTest {
         )
         val navigation = executableCode(source(navigationPath))
         assertTrue(
-            "detailExit 必须把 push 方向的下层（留在后面的旧页 = initialState）记进 role。",
+            "detailSharedAxisExit 必须把 push 方向的下层（留在后面的旧页 = initialState）记进 role。",
             Regex("""role\.recedingEntryId\s*=\s*initialState\.id""").containsMatchIn(navigation)
         )
         assertTrue(
-            "detailPopEnter 必须把 pop 方向的下层（回来的旧页 = targetState）记进 role。",
+            "detailSharedAxisPopEnter 必须把 pop 方向的下层（回来的旧页 = targetState）记进 role。",
             Regex("""role\.recedingEntryId\s*=\s*targetState\.id""").containsMatchIn(navigation)
         )
         assertFalse(
-            "ufiNavRecedeLayer 的形参又叫回 `isFront` —— 语义已取反为 `isReceding`（本页是否是下层），" +
+            "ufiSharedAxisLayer 的形参又叫回 `isFront` —— 语义已取反为 `isReceding`（本页是否是下层），" +
                 "两套命名混用必然再判反一次。",
             navigation.contains("isFront")
         )

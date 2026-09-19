@@ -29,6 +29,7 @@ import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.ufi_axis.ui.components.common.DialogButtonRow
 import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiOptionGrid
 import com.ufi_axis.ui.components.common.UfiOptionItem
 import com.ufi_axis.ui.components.common.UfiPageBackground
@@ -194,25 +195,26 @@ fun DeviceControlScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "设置无数据传输后多久关闭 WiFi 节省电量。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                // 2026-08-18：私货回收为公共组件 UfiOptionGrid（视觉升级：橙描边+橙字+12% 浅橙底选中，
-                // 与 TaskScreen「模式」段完全一致；替代原先 30 行自绘 FilterChip 双栏 grid）
-                val wifiSleepOptions = listOf(
-                    "0" to "从不", "5" to "5 分钟", "10" to "10 分钟",
-                    "20" to "20 分钟", "30" to "30 分钟", "60" to "1 小时", "120" to "2 小时"
-                )
-                UfiOptionGrid(
-                    options = wifiSleepOptions.map { (value, label) -> UfiOptionItem(value = value, label = label) },
-                    selectedValue = wifiSleepDraft,
-                    onSelect = { wifiSleepDraft = it },
-                    columns = 2
-                )
-                Spacer(Modifier.height(Spacing.Medium))
+                // 间距统一到 UfiDialogBody（12dp）
+                UfiDialogBody {
+                    Text(
+                        "设置无数据传输后多久关闭 WiFi 节省电量。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
+                    )
+                    // 2026-08-18：私货回收为公共组件 UfiOptionGrid（视觉升级：橙描边+橙字+12% 浅橙底选中，
+                    // 与 TaskScreen「模式」段完全一致；替代原先 30 行自绘 FilterChip 双栏 grid）
+                    val wifiSleepOptions = listOf(
+                        "0" to "从不", "5" to "5 分钟", "10" to "10 分钟",
+                        "20" to "20 分钟", "30" to "30 分钟", "60" to "1 小时", "120" to "2 小时"
+                    )
+                    UfiOptionGrid(
+                        options = wifiSleepOptions.map { (value, label) -> UfiOptionItem(value = value, label = label) },
+                        selectedValue = wifiSleepDraft,
+                        onSelect = { wifiSleepDraft = it },
+                        columns = 2
+                    )
+                }
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {
@@ -243,41 +245,40 @@ fun DeviceControlScreen(
                 dismissButton = null,
                 showCloseButton = false
             ) {
-                Text(
-                    "开启后设备每日定时自动重启。",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Medium))
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("启用", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
-                    // 2026-08-31：M3 Switch + switchColors → 公共 UfiSwitch
-                    UfiSwitch(
-                        checked = restartOnDraft,
-                        onCheckedChange = { restartOnDraft = it }
+                UfiDialogBody {
+                    Text(
+                        "开启后设备每日定时自动重启。",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textSecondary
                     )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("启用", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                        // 2026-08-31：M3 Switch + switchColors → 公共 UfiSwitch
+                        UfiSwitch(
+                            checked = restartOnDraft,
+                            onCheckedChange = { restartOnDraft = it }
+                        )
+                    }
+                    if (restartOnDraft) {
+                        UfiTextField(
+                            value = restartTimeDraft,
+                            onValueChange = {
+                                restartTimeDraft = it
+                                timeError = if (it.isNotEmpty() && !timeRegex.matches(it))
+                                    "格式: HH:MM（00:00–23:59）" else null
+                            },
+                            label = "重启时间",
+                            placeholder = "00:00",
+                            isError = timeError != null,
+                            errorMessage = timeError
+                        )
+                        // v3（2026-08-11）：删除冗余"保存时间"按钮——点击底部"完成"统一触发保存+关闭
+                    }
                 }
-                if (restartOnDraft) {
-                    Spacer(Modifier.height(Spacing.Small))
-                    UfiTextField(
-                        value = restartTimeDraft,
-                        onValueChange = {
-                            restartTimeDraft = it
-                            timeError = if (it.isNotEmpty() && !timeRegex.matches(it))
-                                "格式: HH:MM（00:00–23:59）" else null
-                        },
-                        label = "重启时间",
-                        placeholder = "00:00",
-                        isError = timeError != null,
-                        errorMessage = timeError
-                    )
-                    // v3（2026-08-11）：删除冗余"保存时间"按钮——点击底部"完成"统一触发保存+关闭
-                }
-                Spacer(Modifier.height(Spacing.Medium))
                 DialogButtonRow(
                     confirmText = "确认",
                     onConfirm = {

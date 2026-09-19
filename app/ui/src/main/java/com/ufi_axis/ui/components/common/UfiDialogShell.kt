@@ -1,9 +1,7 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.components.common
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.EnterTransition
-import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.Animatable
 import com.ufi_axis.ui.R as UiR
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -16,6 +14,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -34,6 +34,7 @@ import android.view.View
 import android.view.ViewParent
 import android.view.Window
 import android.view.WindowManager
+import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -43,6 +44,7 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
 import com.ufi_axis.ui.theme.ufiCardShadow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 // FIX-7（2026-08-23）：shell 默认 × close 图标。
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
@@ -56,24 +58,83 @@ internal object UfiDialogAnim {
     /** System window background blur radius applied via FLAG_BLUR_BEHIND + blurBehindRadius (API 31+). */
     const val BlurRadius = 110
 
-    /** Exit target scale for the card content (AnimatedVisibility scaleOut). */
-    const val ExitScaleTarget = 0.92f
     /**
-     * Exit duration (ms) for the card content fade/scale-out.
+     * 变暗（`dimAmount`）的峰值 —— **能模糊时**。
      *
-     * 语义：退出要比入场略快但不能显得仓促。
+     * 2026-09-17：此前 dim 是**彻底关掉**的（`clearFlags(FLAG_DIM_BEHIND)` + 主题
+     * `backgroundDimEnabled=false`），理由是「遮罩由 shell 自己画」—— 但 shell 从来没画，
+     * 于是弹窗背后只有模糊、没有压暗，浅色页面上弹窗与背景的层级分不开。
+     * 现在改为由 [UfiDialogShell] 随模糊一起渐变施加。
      *
-     * 2026-09-04（P2b）：原为裸 `240`，注释写「刻意不在 UfiMotion.Duration 档位上」。
-     * 现在梯度里有了 [UfiMotion.Duration.Fluid]（250），语义恰好就是这条
-     * （"比进场快半拍但不仓促"，位于 Standard 220 与 Gentle 280 之间），
-     * 差 10ms 在吸附容差内，故并入该档 —— 目的是不让"离场时长"这一种手感在全库有两个数。
-     * 本对象不再是数值来源，只是把 token 转成 shell 内部的命名。
+     * 0.10 是刻意压得很低的：主力手段是模糊，dim 只负责把"糊过的背景"再压一档以拉开层级；
+     * 给大了会盖住模糊本身的质感，也会把 z 序更低的胶囊导航栏一起压黑。
+     * 主题里的 `backgroundDimEnabled=false` **保持不变**（那是平台默认 dim 的开关，
+     * 与这里按帧写入的 `dimAmount` 是两回事，且胶囊窗口的护栏测试盯着那个主题）。
      */
-    const val ExitDuration = UfiMotion.Duration.Fluid
+    const val DimWithBlur = 0.10f
+
+    /**
+     * 变暗峰值 —— **拿不到跨窗口模糊时**（2026-09-18）。
+     *
+     * 省电模式、开发者选项里关掉动画、以及低端机
+     * （`ro.surface_flinger.supports_background_blur=false`）都会让 `FLAG_BLUR_BEHIND`
+     * 静默失效。此前只判了 SDK 版本，于是在这些机器/状态上"背景什么都不会发生"——
+     * 模糊没有、dim 又只有 0.10，弹窗后面完全没有层次，看着像界面错位。
+     *
+     * 0.30 仍比平台默认（0.6）浅不少：这套弹窗的设计取向是轻压暗。
+     */
+    const val DimFallback = 0.30f
+
+    /**
+     * backdrop 渐变的**量化步数**（0..[BackdropSteps]）。
+     *
+     * 为什么要量化：每一步都会走 `Window.attributes =` → `WindowManager.updateViewLayout`
+     * → `ViewRootImpl.setLayoutParams` + `scheduleTraversals`。逐帧写（60/90/120fps）
+     * 等于每帧一次窗口 relayout，纯属浪费；而 blur 半径这种视觉量，12 档已经看不出台阶
+     * （110px / 12 ≈ 9px 一档）。同样的取舍在胶囊那侧是"相等则跳过"，见
+     * `applyCapsuleWindowParams` 的 KDoc。
+     */
+    const val BackdropSteps = 12
+
+    /**
+     * 卡片离场的目标缩放（1.0 → 0.92），沿用原 `res/anim/ufi_dialog_exit.xml` 的值。
+     *
+     * 离场之所以改由 Compose 驱动：平台窗口退出动画只在窗口**销毁那一刻**播，而那时
+     * 已经不能再写 `blurBehindRadius`（改一个正在 doDie 的窗口属性会崩）。
+     * 要做到"弹窗完全消失的那一刻背景刚好最清晰"，卡片就必须在窗口还活着的时候退场，
+     * 与背景共用同一条进度、同时到达端点。进场仍由平台窗口动画负责（480ms overshoot）。
+     */
+    const val CardExitScaleTo = 0.92f
 }
 
 // Logcat tag used by the debug-only blur diagnostics in [UfiDialogShell].
 private const val TAG = "UfiDialogShell"
+
+/**
+ * 「请求关闭当前弹窗」的注入口（2026-09-17）。
+ *
+ * 存在的理由：backdrop 的"逐渐清晰"要求**先跑完 ramp 再真正 dismiss**，而 shell 只能拦到
+ * 自己那三个关闭入口（点外部 / 返回键 / 右上角 ×）。弹窗内容里的按钮（确认 / 取消）是
+ * 调用方给的 lambda，一按就把上层状态翻掉、整个弹窗当帧卸载 —— 窗口没了，ramp 无从播。
+ * 全库 133 个弹窗调用点里有 85 个是 `if (show) { UfiXxxDialog(...) }` 这种硬挂载，
+ * 光靠 `visible` 参数覆盖不到它们；而**把关闭动作延后到 ramp 之后**对两种挂载方式都成立。
+ *
+ * 用法（内容侧）：
+ * ```
+ * val close = LocalUfiDialogClose.current
+ * UfiButton(text = "保存", onClick = { close { save(); showDialog = false } })
+ * ```
+ *
+ * 公共按钮行 [DialogButtonRow] / [UfiDialogActions] **已自动接入**，用它们的调用点无需改动。
+ *
+ * 默认实现是**直接执行**（不在 shell 内、或没接入时的退化行为），因此接入是可选的、
+ * 也不会因为组件被搬到弹窗外面而崩。
+ *
+ * 若交给它的动作**并没有真的关闭弹窗**（例如确认里做了校验决定留下），shell 会在下一帧
+ * 发现弹窗仍然可见，把 backdrop 恢复回去 —— 不会留下一个"淡出了却还在"的弹窗。
+ */
+val LocalUfiDialogClose: ProvidableCompositionLocal<(() -> Unit) -> Unit> =
+    staticCompositionLocalOf { { action: () -> Unit -> action() } }
 
 /**
  * True only for debuggable builds.
@@ -89,38 +150,73 @@ private fun isDebugBuild(context: Context): Boolean =
     (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
 
 /**
- * Applies the OS-native cross-window blur to a dialog's [Window] (API 31+).
+ * 按当前进度把 backdrop（窗口级模糊 + 变暗）写进弹窗的 [Window]。
  *
- * Uses **FLAG_BLUR_BEHIND + attributes.blurBehindRadius** — the path proven to
- * work in UFITOOLS-Widget. This blurs the content *behind* the window and does
- * NOT depend on the window's own background drawable, which is what makes it
- * reliable inside Compose's `DialogWrapper`.
+ * 用 **FLAG_BLUR_BEHIND + attributes.blurBehindRadius**（API 31+）—— 它模糊的是窗口
+ * **背后**已合成的画面，且不依赖窗口自身的背景 drawable，因此能活过 Compose
+ * `DialogWrapper.show()` 对窗口属性的重置。曾经试过 `Window.setBackgroundBlurRadius`：
+ * 它要靠半透明的窗口背景 drawable 界定模糊区域，而 `DialogWrapper.show()` 会把那张
+ * drawable 换成全透明的，模糊就静默消失了。
  *
- * `Window.setBackgroundBlurRadius` was tried before but failed here: it relies
- * on a translucent window background drawable to define the blur region, and
- * `DialogWrapper.show()` overwrites that drawable with a transparent one — so
- * the blur silently disappeared. `blurBehindRadius` is independent of the
- * window background and survives that reset.
+ * ## 四条不变量
+ * 1. **必须 `decorView.post`**：要排在 `DialogWrapper.show()` 重放窗口属性之后，
+ *    否则这次写入会被它覆盖掉。
+ * 2. **flags 只在首次写入时置上，之后不再翻**（2026-09-18 修"动画收尾闪一下"）：
+ *    原来按 `dim > 0` / `radius > 0` 反复 or/and flag，于是渐变的**第一步与最后一步**
+ *    各会多一次 flag 变更 —— 而 flag 变更是整窗 relayout，落在动画收尾那一帧上就是
+ *    肉眼可见的一闪。半径 0 / dimAmount 0 本身就等于"无效果"，不需要靠摘 flag 实现。
+ * 3. **值没变就不写**（同上，与 `applyCapsuleWindowParams` 的 `if (settled) return`
+ *    同一条经验）：AOSP 的 `Window.attributes =` 无条件派发 → `updateViewLayout` →
+ *    `setLayoutParams` + `scheduleTraversals`，同值重写照样是一次 relayout。量化后的
+ *    渐变本来就会连续给出相同档位，不守这一条等于白烧帧。
+ * 4. **不在 `onDispose` 里调用**：那时窗口已进入 `doDie()`，改 LayoutParams 会给一个
+ *    正在销毁的 ViewRootImpl 排新 traversal（2026-09-05 崩溃的成因，见下方 DisposableEffect）。
+ *    模糊的清除由「离场先跑完 ramp 再真正 dismiss」保证，不靠 dispose 兜底。
  *
- * The change is posted on [Window.getDecorView] so it runs *after*
- * `DialogWrapper.show()` re-applies the window attributes, otherwise the
- * blur flags/radius would be wiped. Safe to call repeatedly (idempotent);
- * a null window or pre-API-31 build is ignored.
+ * SDK < 31 或系统当下不支持跨窗口模糊（见 [canBlurBehind]）时 [blurCapable] 传 false：
+ * 只写 dim、不挂模糊 flag，渐变观感退化为"逐渐压暗"，不报错。
  */
-private fun applyDialogBackgroundBlur(window: Window?) {
-    if (window == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+private fun applyDialogBackdrop(
+    window: Window?,
+    blurRadius: Int,
+    dim: Float,
+    blurCapable: Boolean
+) {
+    if (window == null) return
     window.decorView.post {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@post
-        // Cross-window blur behind this window (independent of the window's own
-        // background drawable, so it survives DialogWrapper.show() resetting it).
-        window.addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-        // Keep dimming on Compose's own scrim (the full-screen Box); suppress the
-        // platform dim so it doesn't stack on top of it and over-darken.
-        window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-        window.attributes = window.attributes.apply {
-            blurBehindRadius = UfiDialogAnim.BlurRadius
+        val params = window.attributes ?: return@post
+        // flags 一次置上、全程不翻（不变量 2）
+        val desiredFlags = params.flags or WindowManager.LayoutParams.FLAG_DIM_BEHIND or
+            if (blurCapable) WindowManager.LayoutParams.FLAG_BLUR_BEHIND else 0
+        // 值没变就整个跳过（不变量 3）
+        val settled = params.flags == desiredFlags &&
+            params.dimAmount == dim &&
+            (!blurCapable || params.blurBehindRadius == blurRadius)
+        if (settled) return@post
+        window.attributes = params.apply {
+            flags = desiredFlags
+            dimAmount = dim
+            if (blurCapable) {
+                blurBehindRadius = blurRadius
+            }
         }
     }
+}
+
+/**
+ * 这台机器 / 这一刻支不支持跨窗口模糊（2026-09-18）。
+ *
+ * 只判 SDK 版本是不够的：`isCrossWindowBlurEnabled` 在**省电模式**、开发者选项里
+ * **关闭动画**、以及不支持后台模糊的低端机（`ro.surface_flinger.supports_background_blur`）
+ * 上都会是 false。此前漏了这一条，那些情况下 `blurBehindRadius` 写了也不生效，
+ * 而 dim 又按"有模糊"的 0.10 给 —— 结果是弹窗背后毫无变化。
+ *
+ * false 时调用方必须把 dim 提到 [UfiDialogAnim.DimFallback]。
+ */
+private fun Window.canBlurBehind(): Boolean {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
+    val manager = context.getSystemService(WindowManager::class.java) ?: return false
+    return manager.isCrossWindowBlurEnabled
 }
 
 // ─────────────────────────────────────────────────
@@ -169,23 +265,50 @@ internal fun UfiDialogShell(
     showCloseIcon: Boolean = false,
     content: @Composable ColumnScope.() -> Unit
 ) {
-    // Mounted-state pattern: keep the Dialog mounted while the exit animation
-    // plays, otherwise the scale-out + fade-out transition would never run.
+    // Mounted-state pattern：关闭时窗口必须多活一小会儿 —— backdrop 的"逐渐清晰"靠写
+    // 窗口属性实现，窗口一销毁就无从可写（也**不能**在 onDispose 里写，见下方
+    // DisposableEffect 的崩溃说明）。所以离场是：先跑 ramp，跑完才真正 dismiss / 卸载。
     var mounted by remember { mutableStateOf(visible) }
-    var shown by remember { mutableStateOf(visible) }
+
+    /** 正在离场。置位后所有新的关闭请求都被忽略（防连点导致 ramp 被打断重启）。 */
+    val closing = remember { mutableStateOf(false) }
+
+    /**
+     * ramp 跑完要执行的动作。
+     *
+     * - shell 自己的关闭入口（点外部 / 返回键 / 右上角 ×）→ 这里放 `onDismiss`，
+     *   因为调用方还不知道要关；
+     * - 调用方把 `visible` 翻成 false → 这里是 null，它自己已经关了，再回调一次会
+     *   变成"关两次"（有些调用方的 onDismiss 里带副作用）。
+     */
+    val closeAction = remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    /** backdrop 进度 0..1：模糊半径与 dim 都由它换算（见 [applyDialogBackdrop]）。 */
+    val backdrop = remember { Animatable(0f) }
+
+    val reduceMotion = LocalUfiReduceMotion.current
+
+    /** 离场协程要读**最新**的 visible（effect 捕获的是启动那一刻的值，会读到旧的）。 */
+    val visibleNow = rememberUpdatedState(visible)
+
+    /** 统一的关闭入口：先起离场 ramp，[closeAction] 留给 ramp 结束时调用。 */
+    val requestClose: (() -> Unit) -> Unit = remember {
+        { action ->
+            if (!closing.value) {
+                closeAction.value = action
+                closing.value = true
+            }
+        }
+    }
+
     LaunchedEffect(visible) {
         if (visible) {
-            // 进入交给平台 Window 动画（setWindowAnimations）整体淡入，
-            // 不再用 delay(16) 两阶段，避免 scrim 先出现一帧再弹卡片的闪烁。
+            // 重新打开：清掉上一轮的离场状态（Animatable 由下面的入场 ramp 从 0 拉起）
+            closing.value = false
+            closeAction.value = null
             mounted = true
-            shown = true
-        } else {
-            // 统一为 B 类观感：关闭时不做卡片级退出动画，整窗（卡片+遮罩）随平台
-            // ufi_dialog_exit 一同缩放淡出。关键：不能先 shown=false 让卡片单独消失再揭窗，
-            // 否则会出现「卡片瞬间消失、只剩遮罩随后淡出」的闪烁——卡片须保持可见，
-            // 随整窗一起在 ufi_dialog_exit 里平滑淡出。
-            delay(16L)
-            mounted = false
+        } else if (mounted && !closing.value) {
+            closing.value = true
         }
     }
     if (!mounted) return
@@ -196,7 +319,7 @@ internal fun UfiDialogShell(
     val titleColor = titleColorOverride ?: palette.textPrimary
 
     Dialog(
-        onDismissRequest = onDismiss,
+        onDismissRequest = { requestClose(onDismiss) },
         properties = DialogProperties(
             usePlatformDefaultWidth = false,
             dismissOnClickOutside = dismissOnClickOutside,
@@ -229,8 +352,20 @@ internal fun UfiDialogShell(
                 }
         }
 
-        // 平台 Window 进入动画：整个窗口（遮罩+卡片）统一缩放淡入，消除闪烁。
+        // 平台 Window 进出场动画：整个窗口（卡片）统一缩放淡入/淡出。
+        // 卡片的进出场**只由它负责**，Compose 侧不再叠一层 alpha/scale（2026-09-18 回退）——
+        // 那样会与这条动画抢同一份视觉变换，而这套 xml 的手感（480ms overshoot 进、
+        // 240ms 加速出）是既有设计。本轮只借鉴背景模糊的做法，不动弹窗的进出场。
         window?.setWindowAnimations(UiR.style.UfiDialogAnimation)
+
+        /**
+         * 这一刻能不能做跨窗口模糊。决定模糊半径写不写、以及 dim 给哪一档。
+         *
+         * `remember(window)` 就够：弹窗生命周期很短，不值得为"用户中途开省电模式"
+         * 去注册 `addCrossWindowBlurEnabledListener`（还得记得注销）。
+         */
+        val blurCapable = remember(window) { window?.canBlurBehind() == true }
+        val maxDim = if (blurCapable) UfiDialogAnim.DimWithBlur else UfiDialogAnim.DimFallback
 
         // [Debug-only] Diagnostic log: confirms whether the dialog Window was
         // resolved, the view/context class names, and the runtime SDK level.
@@ -240,6 +375,7 @@ internal fun UfiDialogShell(
                 Log.d(
                     TAG,
                     "windowResolved=${window != null} " +
+                        "blurCapable=$blurCapable " +
                         "view=${localView.javaClass.simpleName} " +
                         "ctx=${localView.context.javaClass.simpleName} " +
                         "sdkInt=${Build.VERSION.SDK_INT}"
@@ -247,21 +383,85 @@ internal fun UfiDialogShell(
             }
         }
 
-        // Apply the blur immediately, then re-apply after the next frames.
-        // Compose's Dialog internals may reset the window background after the
-        // composition commits, which would otherwise wipe our blur region — the
-        // delayed re-apply restores it. LaunchedEffect auto-cancels on dispose,
-        // so no stale blur survives (DisposableEffect clears it too).
+        // ── backdrop 渐变：出现时逐渐模糊、消失时逐渐清晰（2026-09-17 / 09-18）──
+        //
+        // 原来是「一次性硬设 blurBehindRadius=110」：弹窗一出现背景就是满模糊，一关就瞬间
+        // 清晰。现在由 Animatable 驱动，进场 400ms 糊上来、离场 220ms 化开。
+        //
+        // 只管背景：卡片的进出场仍由上面那条平台窗口动画负责。
+        //
+        // 先写一次 (0, 0f) 再起动画：平台可能已按主题给了默认值，不归零会闪一帧满 dim。
         LaunchedEffect(window) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && window != null) {
-                applyDialogBackgroundBlur(window)
-                if (isDebugBuild(localView.context)) {
-                    Log.d(TAG, "blur applied immediately (radius=${UfiDialogAnim.BlurRadius})")
+            applyDialogBackdrop(window, 0, 0f, blurCapable)
+            if (reduceMotion) {
+                backdrop.snapTo(1f)
+            } else {
+                backdrop.animateTo(1f, UfiMotion.dialogBackdropIn())
+            }
+            // 兜底重放：Compose 的 Dialog 内部可能在组合提交后重置窗口属性，把刚写好的
+            // 模糊抹掉。渐变过程本身已经写了十几次，这里只在收尾补一次满值 ——
+            // applyDialogBackdrop 有相等性守卫，值没被动过的话这次是空操作（不会 relayout）。
+            delay(100L)
+            if (!closing.value) {
+                applyDialogBackdrop(window, UfiDialogAnim.BlurRadius, maxDim, blurCapable)
+            }
+        }
+
+        // 进度 → 窗口：量化成 0..BackdropSteps 再写，避免逐帧 relayout（见 BackdropSteps）。
+        //
+        // [backdrop] 本身是**线性**进度（曲线不写在 spec 里），因为同一条进度还要驱动卡片
+        // 离场，而两者要"不同曲线、相同端点"。背景用 Standard（FastOutSlowIn，两头软、
+        // 中段均匀）—— 之前用 emphasized accelerate，七成变化挤在最后 30%，观感是
+        // "先挂着不动然后啪一下全没了"。
+        LaunchedEffect(window) {
+            snapshotFlow {
+                val eased = UfiMotion.Easing.Standard.transform(backdrop.value.coerceIn(0f, 1f))
+                (eased * UfiDialogAnim.BackdropSteps).toInt()
+            }
+                .distinctUntilChanged()
+                .collect { step ->
+                    val fraction = step / UfiDialogAnim.BackdropSteps.toFloat()
+                    applyDialogBackdrop(
+                        window = window,
+                        // 拿不到模糊时半径写 0（flag 也不会挂），层次全靠 DimFallback
+                        blurRadius = if (blurCapable) (UfiDialogAnim.BlurRadius * fraction).toInt() else 0,
+                        dim = maxDim * fraction,
+                        blurCapable = blurCapable
+                    )
                 }
-                delay(100L)
-                applyDialogBackgroundBlur(window)
-                if (isDebugBuild(localView.context)) {
-                    Log.d(TAG, "blur re-applied post-layout (radius=${UfiDialogAnim.BlurRadius})")
+        }
+
+        // ── 离场：ramp 到 0 → 执行关闭动作 → 卸载 / 或恢复 ──
+        //
+        // 顺序不能换：先卸载窗口的话，"逐渐清晰"就没有窗口可写了；而 onDispose 里补写
+        // 会给正在销毁的 ViewRootImpl 排 traversal（2026-09-05 崩溃），也不是出路。
+        //
+        // 三种收尾（2026-09-18）：
+        // 1. 动作真的把弹窗关了（硬挂载的调用点最常见）—— 整棵子树当帧移除，本协程随之
+        //    取消，后面的代码不会执行，天然正确；
+        // 2. 动作把 `visible` 翻成了 false —— 走下面 `!visible` 分支卸载；
+        // 3. 动作**没有**关闭弹窗（确认里做了校验决定留下）—— 恢复 backdrop，
+        //    否则会留下一个"淡出完了却还在屏幕上"的弹窗。
+        LaunchedEffect(closing.value) {
+            if (!closing.value) return@LaunchedEffect
+            if (reduceMotion) {
+                backdrop.snapTo(0f)
+            } else {
+                backdrop.animateTo(0f, UfiMotion.dialogBackdropOut())
+            }
+            val action = closeAction.value
+            closeAction.value = null
+            action?.invoke()
+            // 让调用方的状态变更走完一帧，再判断它到底关没关
+            withFrameNanos { }
+            if (!visibleNow.value) {
+                mounted = false
+            } else {
+                closing.value = false
+                if (reduceMotion) {
+                    backdrop.snapTo(1f)
+                } else {
+                    backdrop.animateTo(1f, UfiMotion.dialogBackdropIn())
                 }
             }
         }
@@ -302,6 +502,10 @@ internal fun UfiDialogShell(
         // 全局 UI 缩放补偿：Dialog 是独立 Window，Compose 会在这棵子组合根部重新
         // `LocalDensity provides owner.density`，把 UFIAXISTheme 覆盖的缩放 density 冲掉。
         // 所有 Ufi*Dialog 都经由本 Shell，故补在这一处即可让全部弹窗跟随全局缩放。
+        //
+        // 同时把 requestClose 下发给内容子树（见 [LocalUfiDialogCloseRequest]）：内容里的
+        // 确认/取消按钮据此走同一条离场时序，而不是当帧把窗口拆掉。
+        CompositionLocalProvider(LocalUfiDialogClose provides requestClose) {
         UfiInheritUiScale {
         Box(
             modifier = Modifier
@@ -313,7 +517,7 @@ internal fun UfiDialogShell(
                     // P2-1：scrim 声明 Button 角色，读屏用户可感知"点击外部关闭"
                     role = Role.Button,
                     onClickLabel = "点击空白处关闭弹窗"
-                ) { onDismiss() },
+                ) { requestClose(onDismiss) },
             contentAlignment = Alignment.Center
         ) {
             val maxDialogH = with(LocalConfiguration.current) {
@@ -325,12 +529,30 @@ internal fun UfiDialogShell(
                     .heightIn(max = maxDialogH)
                     .padding(horizontal = 16.dp)
             ) {
-                AnimatedVisibility(
-                    visible = shown,
-                    enter = EnterTransition.None,
-                    // 统一为 B 类观感：关闭时不做卡片级 scaleOut+fadeOut，仅由平台窗口
-                    // ufi_dialog_exit（240ms）承担整窗淡出，与 when 硬卸载的弹窗完全一致。
-                    exit = ExitTransition.None
+                // 卡片：**进场**由平台窗口动画负责（480ms overshoot，见 ufi_dialog_enter.xml）；
+                // **离场**由这里驱动（2026-09-18）。
+                //
+                // 为什么离场不能继续交给平台：那条 xml 只在窗口销毁那一刻播，而那时窗口已经
+                // 进入 doDie，再写 blurBehindRadius 会崩 —— 于是"弹窗完全消失时背景刚好最清晰"
+                // 就永远对不齐（原来的表现是背景先化开、卡片再单独淡出，两段串着走）。
+                // 现在卡片与背景共用同一条进度（240ms），曲线各自施加、端点同时到达：
+                // 卡片 alpha/缩放走 Accelerate（等价于原 xml 的 fast_out_linear_in），
+                // 背景走 Standard。
+                //
+                // ⚠️ compositingStrategy 必须是 ModulateAlpha：默认策略在 alpha < 1 时会把
+                // 整张卡片画进离屏缓冲，下面那道 ufiCardShadow 会因此换绘制路径而闪一下。
+                Box(
+                    modifier = Modifier.graphicsLayer {
+                        if (!closing.value) return@graphicsLayer
+                        // backdrop 是线性进度，离场时 1 → 0；这里换算成 0 → 1 的"退场完成度"
+                        val t = 1f - backdrop.value.coerceIn(0f, 1f)
+                        val e = UfiMotion.Easing.Accelerate.transform(t)
+                        alpha = 1f - e
+                        val s = 1f - (1f - UfiDialogAnim.CardExitScaleTo) * e
+                        scaleX = s
+                        scaleY = s
+                        compositingStrategy = CompositingStrategy.ModulateAlpha
+                    }
                 ) {
                     Box(
                         modifier = Modifier
@@ -353,8 +575,11 @@ internal fun UfiDialogShell(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = Spacing.DialogPaddingH)
-                                .padding(bottom = Spacing.Medium)
+                    .padding(horizontal = Spacing.DialogPaddingH)
+                    // 底部内边距 = 左右同值（2026-09-18，原为 Spacing.Medium 8dp）。
+                    // 这是弹窗"最后一块内容/按钮 → 下边框"的**唯一**来源：按钮区自己不再
+                    // 带 bottom padding，否则会叠成 20dp，看着像"离下边框比离左右远"。
+                    .padding(bottom = Spacing.DialogPaddingH)
                         ) {
                             if (title != null) {
                                 // 标题行：Box 包裹 —— 左侧 icon+title，右侧 trailingContent（右上角 X 关闭等自定义槽）。
@@ -402,13 +627,22 @@ internal fun UfiDialogShell(
                                     if (hasTrailing) {
                                         Box(modifier = Modifier.align(Alignment.CenterEnd)) { trailingContent!!() }
                                     } else if (effectiveCloseIcon) {
-                                        Box(modifier = Modifier.align(Alignment.CenterEnd)) {
-                                            // FIX-8（2026-08-23）：× 关闭按钮尺寸 32dp/18dp → 44dp/22dp（Material 标准触控区）。
-                                            // 用 cardBg 加透明圆背景，让按钮更显眼、可点击区域更直观。
+                                        // 关闭按钮 44dp，图标 22dp，按钮自身内边距 11dp。
+                                        // 外层 Column 已有 horizontal=DialogPaddingH，
+                                        // 所以按钮到右边框视觉距离 = 18+11=29dp，比标题到左边框的 18dp 多一截。
+                                        // 加 offset(x=11dp) 把按钮右推，让图标到边框 = 18dp，与标题对称。
+                                        // 同理 y=-11dp 上推，让按钮到上边框也是 ~18dp。
+                                        Box(modifier = Modifier
+                                            .align(Alignment.CenterEnd)
+                                            .offset(x = 11.dp, y = (-7).dp)
+                                        ) {
+                                            // FIX-8（2026-08-23）：× 关闭按钮 44dp 触控区 / 22dp 图标（Material 标准）。
+                                            // 2026-09-15：去掉底色。原来是 pageBg@0.85 的圆片，压在 cardBg 卡面上
+                                            // 就是一枚灰按钮，比标题还抢眼；44dp 的触控区不需要靠可见底色来提示。
                                             Surface(
-                                                onClick = onDismiss,
+                                                onClick = { requestClose(onDismiss) },
                                                 shape = androidx.compose.foundation.shape.CircleShape,
-                                                color = palette.pageBg.copy(alpha = 0.85f),
+                                                color = Color.Transparent,
                                                 modifier = Modifier.size(44.dp)
                                             ) {
                                                 Box(contentAlignment = Alignment.Center) {
@@ -436,6 +670,7 @@ internal fun UfiDialogShell(
             }
         } // Box (scrim)
         } // UfiInheritUiScale
+        } // CompositionLocalProvider（closeRequest）
     }
 }
 
@@ -460,6 +695,10 @@ fun DialogButtonRow(
     loading: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
+    // 2026-09-18：两个按钮的动作统一经 [LocalUfiDialogClose] 排时序 —— 弹窗离场的
+    // backdrop（逐渐清晰）必须在窗口销毁**之前**播完，而按钮一按就把上层状态翻掉、
+    // 弹窗当帧卸载。在 shell 之外使用本组件时该 local 是"直接执行"，行为不变。
+    val close = LocalUfiDialogClose.current
     // 2026-09-04：这两个按钮原来是裸 M3 OutlinedButton / Button，**没有按压缩放** ——
     // 只有 M3 默认 ripple。于是"弹窗里的按钮没反馈"成了全站最显眼的一处不一致：
     // 页面里的按钮（UfiButton / EventsSettingsButton…）都会缩，唯独最常用的弹窗确认/取消不缩。
@@ -472,16 +711,19 @@ fun DialogButtonRow(
         color = dividerColor ?: palette.divider.copy(alpha = 0.08f),
         modifier = Modifier.fillMaxWidth()
     )
+    // 2026-09-19：Row 的 vertical padding 从 12dp 改成只有 top 12dp，不带 bottom ——
+    // shell 的 padding(bottom=18dp) 已经是「最后一块内容 → 下边框」的唯一来源，
+    // Row 再带 bottom 12dp 就叠成 30dp。
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = Spacing.Large),
+            .padding(top = Spacing.Large),
         horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
         verticalAlignment = Alignment.CenterVertically
     ) {
         if (dismissText != null && onDismiss != null) {
             OutlinedButton(
-                onClick = onDismiss,
+                onClick = { close(onDismiss) },
                 border = BorderStroke(1.dp, outlineColor ?: palette.dialogBorder),
                 // 2026-09-08：原为 palette.textPrimary。同一个"取消"在两条路径上不同色 ——
                 // UfiDialogActions 走 UfiButton(Secondary) 是 accent，这里是 textPrimary，
@@ -490,6 +732,9 @@ fun DialogButtonRow(
                 shape = UfiCardDefaults.buttonShape,
                 enabled = enabled,
                 interactionSource = dismissInteraction,
+                // 长标签（如「退出并重新配对」）在 weight(1f) 的半行宽度里会折成两行，
+                // 而按钮高度是固定的 → 文字被切。给窄内距 + 单行不换行（2026-09-19）。
+                contentPadding = DIALOG_BUTTON_CONTENT_PADDING,
                 modifier = Modifier
                     .weight(1f)
                     .height(Spacing.DialogButtonHeight)
@@ -499,11 +744,17 @@ fun DialogButtonRow(
                         spec = UfiMotion.buttonPress()
                     )
             ) {
-                Text(dismissText, fontSize = fontSize, fontWeight = fontWeight)
+                Text(
+                    dismissText,
+                    fontSize = fontSize,
+                    fontWeight = fontWeight,
+                    maxLines = 1,
+                    softWrap = false
+                )
             }
         }
         Button(
-            onClick = onConfirm,
+            onClick = { close(onConfirm) },
             colors = ButtonDefaults.buttonColors(
                 containerColor = confirmColor,
                 contentColor = palette.onAccent
@@ -511,6 +762,7 @@ fun DialogButtonRow(
             shape = UfiCardDefaults.buttonShape,
             enabled = enabled,
             interactionSource = confirmInteraction,
+            contentPadding = DIALOG_BUTTON_CONTENT_PADDING,
             modifier = Modifier
                 .weight(1f)
                 .height(Spacing.DialogButtonHeight)
@@ -527,8 +779,23 @@ fun DialogButtonRow(
                     color = palette.onAccent
                 )
             } else {
-                Text(confirmText, fontSize = fontSize, fontWeight = fontWeight)
+                Text(
+                    confirmText,
+                    fontSize = fontSize,
+                    fontWeight = fontWeight,
+                    maxLines = 1,
+                    softWrap = false
+                )
             }
         }
     }
 }
+
+/**
+ * 弹窗底部两个按钮的内容内距（2026-09-19）。
+ *
+ * M3 默认是 24dp 横向，两个按钮各占半行时留给文字的宽度只剩不到一半 ——
+ * 「退出并重新配对」这种 7 字标签会折行，而按钮高度固定，折出来的第二行直接被切掉。
+ * 收窄到 8dp，配合 `maxLines = 1, softWrap = false`，长标签才排得下。
+ */
+private val DIALOG_BUTTON_CONTENT_PADDING = PaddingValues(horizontal = 8.dp, vertical = 0.dp)

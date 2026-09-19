@@ -40,8 +40,9 @@ import { normalizeWifiSettings, normalizeWifiClients } from '@/composables/utils
 import {
   NetworkMode,
   NetworkModeOptions,
-  BearerToNetworkMode,
+  bearerToNetworkMode,
   NetworkModeSwitchProbe,
+  modeProbeIntervalMs,
   shouldKeepProbingMode,
 } from '@/api/contract';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
@@ -159,11 +160,41 @@ export function useNetworkControls() {
    * 提交的一定是别名，core 负责映射成 BearerPreference。
    */
   const networkModes = NetworkModeOptions;
+
+  /**
+   * **设备当前真实档位**（别名）。空串 = 还没读到。
+   *
+   * 与 [selectedMode] 是两个语义不同的值，2026-09-19 拆开：
+   * 原来只有一个 `selectedMode`，而弹窗用 `v-model` 直接改它 —— 于是用户在弹窗里点一下
+   * （还没应用、甚至点了取消），"更多设置"卡上的制式标签就跟着变了，显示的是一个
+   * 设备上并不成立的档位。标签一律读这个，弹窗的待选项读 [selectedMode]。
+   */
+  const currentMode = ref('');
+  /**
+   * 设备当前档位的中文名，**取 core 下发的 `network_mode_label`**。
+   *
+   * core 的 `NetworkMode.LABELS` 是全仓唯一文案真源（`GET /api/device/settings` 会注入
+   * 这个 key）。老固件的 core 不回它时回落到本地 [networkModes] 查表。
+   */
+  const currentModeLabel = ref('');
+
+  /** 用户在弹窗里正要应用的档位。初值等设备读回来后由 [loadDeviceSettings] 同步。 */
   const selectedMode = ref<string>(NetworkMode.AUTO);
   const modeLoading = ref(false);
-  const modeLabel = computed(
-    () => networkModes.find((m) => m.value === selectedMode.value)?.label || selectedMode.value
-  );
+  /** 只为弹窗的「重新读取」按钮转圈 */
+  const modeRefreshing = ref(false);
+
+  /**
+   * 制式标签（"更多设置"卡上那一行）。**读设备真值，不读待选项** —— 见 [currentMode] 的注释。
+   *
+   * 优先用 core 给的中文名；没有时按别名查本地表；两者都没有才显示原始值。
+   */
+  const modeLabel = computed(() => {
+    if (currentModeLabel.value) return currentModeLabel.value;
+    const alias = currentMode.value;
+    if (!alias) return '--';
+    return networkModes.find((m) => m.value === alias)?.label || alias;
+  });
 
   /**
    * 正在切换中的**目标**制式；null = 没有进行中的切换。
@@ -195,8 +226,8 @@ export function useNetworkControls() {
 
   /**
    * 一次请求把 /api/device/settings 里用到的字段全取出来。
-   * 注意：网络模式/漫游在这个端点（BearerPreference / roam_setting_option / connection_mode），
-   * 而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
+   * 注意：网络模式/漫游在这个端点（net_select / BearerPreference / roam_setting_option /
+   * connection_mode），而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
    *
    * @returns 这次读到的网络制式别名（读失败返回 null），供切换回读确认比对目标档位。
    */
@@ -204,25 +235,38 @@ export function useNetworkControls() {
     try {
       const res = await api.get('/api/device/settings');
       // 请求被取消（组件卸载 / 路由切走）时 useCancellableApi resolve 成 { __canceled: true }，
-      // data 为 undefined。不显式识别的话 BearerPreference 会被读成 ''、回读值塌成 'AUTO'：
+      // data 为 undefined。不显式识别的话制式会被读成 ''、回读值塌成 'AUTO'：
       // 既会把选中项刷成"自动"，也会让切换回读把"没读到"误判成"已经到目标档位"。
       if ((res as { __canceled?: boolean })?.__canceled === true) return null;
       const data = res.data;
       if (data == null) return null;
-      const raw = String(data?.BearerPreference ?? '');
-      // 未知取值不静默显示成「自动」，直接透出原始值，避免误导
-      const readback = BearerToNetworkMode[raw] || raw || 'AUTO';
-      // 切换期间**不许**用回读值覆盖选中项：设备重新注册时报的还是旧档位，
-      // 覆盖就会把界面弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
-      if (switchingMode.value === null) selectedMode.value = readback;
+      // 制式回读**以 net_select 为准**，BearerPreference 只作回落 —— 与 app
+      // （DeviceSettingsResponse.networkMode）同一口径。原来只读 BearerPreference：
+      // 真机切换后变的是 net_select，而 BearerPreference 缺失时这里会塌成 'AUTO'，
+      // 于是 app 显示新档位、web 恒显示「5G/4G/3G」，回读确认也永远判超时。
+      const raw = String(data?.net_select || data?.BearerPreference || '');
+      // 未知取值不静默显示成「自动」，直接透出原始值，避免误导；空值也不当成 AUTO。
+      const readback = bearerToNetworkMode(raw);
+      if (readback) {
+        // 设备真值一律更新（**不受切换闸门影响**）：标签读的是它，而切换期间也该能看到
+        // 设备还停在旧档位这个事实。
+        currentMode.value = readback;
+        // 中文名优先用 core 注入的 network_mode_label（唯一文案真源）；老固件没有这个 key
+        // 时清空，由 modeLabel 回落到本地查表。
+        currentModeLabel.value = String(data?.network_mode_label || '');
+      }
+      // 待选项在切换期间**不许**被回读值覆盖：设备重新注册时报的还是旧档位，
+      // 覆盖就会把弹窗里的选择弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
+      if (switchingMode.value === null && readback) selectedMode.value = readback;
       const roam = String(data?.roam_setting_option ?? data?.dial_roam_setting_option ?? '');
       roamingEnabled.value = roam === 'on' || roam === '1';
       const mode = String(data?.connection_mode ?? '').toLowerCase();
-      connectionMode.value = ['manual', '1', 'hand'].includes(mode) ? 'manual' : 'auto';
+      connectionMode.value = ['manual', 'manual_dial', '1', 'hand'].includes(mode) ? 'manual' : 'auto';
       if (data?.sleep_sysIdleTimeToSleep != null) {
         sleepTime.value = Number(data.sleep_sysIdleTimeToSleep) || 0;
       }
-      return readback;
+      // 读到空串时返回 null（= 没读到），不要让回读确认把它当成一个档位去比对
+      return readback || null;
     } catch {
       /* 保持默认 */
       return null;
@@ -236,6 +280,23 @@ export function useNetworkControls() {
       await loadDeviceSettings();
     } finally {
       sleepLoading.value = false;
+    }
+  }
+
+  /**
+   * 给「网络模式」弹窗的手动重新读取（带自己的 loading）。
+   *
+   * 注意它**绕不过设备端的读缓存**：`GET /api/device/settings` 在 core 侧的 TTL 是 5 分钟
+   * （`CacheTTL.DEVICE_SETTINGS`），且只在 core 自己写入后才失效。从手机端或设备自带面板
+   * 改过档位时，这里点几次也仍会拿到同一份快照 —— 弹窗里那句提示就是为了把这件事说清楚，
+   * 而不是让用户以为按钮没生效。
+   */
+  async function refreshDeviceSettings() {
+    modeRefreshing.value = true;
+    try {
+      await loadDeviceSettings();
+    } finally {
+      modeRefreshing.value = false;
     }
   }
 
@@ -358,7 +419,7 @@ export function useNetworkControls() {
       attempt += 1;
       reached = (await loadDeviceSettings()) === target;
       if (!shouldKeepProbingMode(attempt, reached)) break;
-      await sleep(NetworkModeSwitchProbe.intervalMs);
+      await sleep(modeProbeIntervalMs(attempt));
     }
     switchingMode.value = null;
     modeSwitchTimedOut.value = !reached;
@@ -543,7 +604,12 @@ export function useNetworkControls() {
     // 网络模式
     networkModes,
     selectedMode,
+    // 设备真值 + core 给的中文名：制式标签一律读这两个，不读 selectedMode
+    currentMode,
+    currentModeLabel,
     modeLoading,
+    modeRefreshing,
+    refreshDeviceSettings,
     modeLabel,
     applyNetworkMode,
     // 「切换中」中间态：调用方据此显示"正在切换 / 尚未完成"，不要自己去猜回读值

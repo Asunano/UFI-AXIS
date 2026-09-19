@@ -93,6 +93,16 @@ object ErrorCode {
 
     /** 更新任务进行中，拒绝并发操作。 */
     const val UPDATE_IN_PROGRESS = "UPDATE_IN_PROGRESS"
+    /**
+     * 上传的 APK 不是 Core 自己（包名不匹配 / 无法解析包名），HTTP 400。
+     *
+     * 与 [BAD_REQUEST] 分开是为了让客户端给出**正确的下一步**：这类失败重试同一个包
+     * 永远不会成功，用户该做的是换一个包，而不是"稍后重试"。
+     *
+     * 2026-09-14 新增。背景：推错包会让 `adb install -r` 装上**别的 app**，
+     * core 自己没被替换、进程不死，状态机就卡在 `installing`，此后所有上传恒 409。
+     */
+    const val INVALID_PACKAGE = "INVALID_PACKAGE"
     /** 上游（镜像/下载源）不可用或返回非 2xx。 */
     const val UPSTREAM_FAILED = "UPSTREAM_FAILED"
 

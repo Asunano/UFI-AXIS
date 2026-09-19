@@ -50,13 +50,21 @@
     <WifiModal v-model:show="showWifiModal" :wifi-settings="wifiSettings" @save="saveWifiEdit" />
     <TrafficLimitModal v-model:show="showTrafficModal" :traffic-limit="trafficLimit" @save="saveTrafficLimit" />
 
-    <!-- 与网络页共用的弹窗（同一份组件、同一份 handler） -->
+    <!-- 与网络页共用的弹窗（同一份组件、同一份 handler）
+         switching / timed-out 必须传：不传的话仪表盘这份弹窗看不到「正在切换 / 尚未完成」，
+         同一个操作在两个页面上的反馈会不一致 -->
     <NetworkModeModal
       v-model:show="showModeModal"
       v-model:selected-mode="selectedMode"
       :mode-loading="modeLoading"
       :network-modes="networkModes"
+      :current-mode="currentMode"
+      :current-label="modeLabel"
+      :refreshing="modeRefreshing"
+      :switching="switchingMode !== null"
+      :timed-out="modeSwitchTimedOut"
       @apply="applyModeAndClose"
+      @refresh="refreshDeviceSettings"
     />
     <!-- 懒加载弹窗一律走 useLazyModal，否则首帧 show 就是 true，进出场动画全丢 -->
     <component :is="bandComponent" v-if="bandComponent" :show="bandShow" @update:show="bandModal.setShow" />
@@ -127,8 +135,15 @@ const {
   refreshNetworkStatus,
   networkModes,
   selectedMode,
+  currentMode,
   modeLoading,
+  modeRefreshing,
+  refreshDeviceSettings,
+  modeLabel,
   applyNetworkMode,
+  // 「切换中 / 尚未完成」中间态：与网络页共用同一份 composable 状态
+  switchingMode,
+  modeSwitchTimedOut,
   roamingEnabled,
   connectionMode,
   mobileDataSaving,

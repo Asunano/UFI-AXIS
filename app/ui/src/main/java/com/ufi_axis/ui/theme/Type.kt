@@ -240,15 +240,25 @@ object UfiTextStyles {
     // ---- 顶栏（原 Spacing.HeaderTitleSize / HeaderSubtitleSize，2026-09-01 从 Spacing 迁来）----
     // 注意：这两个刻意沿用 bodyLarge 派生，与迁移前逐像素一致；
     // 若日后想让顶栏用展示族（需先让 FontSet 的 display/body 真正不同），改这两行即可。
-    /** 顶栏标题（22sp Bold，字距 0.56） */
+    /** 顶栏标题（26sp Bold，字距 0.56） */
     val headerTitle: TextStyle
         get() = Typography.bodyLarge.copy(
-            fontSize = 22.sp,
+            // 2026-09-18：22sp → 26sp。与标题栏加高（UfiScaffold 的 HEADER_PADDING_*）一起改，
+            // 只加字号不加高度会让标题贴住上下边缘。
+            fontSize = 26.sp,
             fontWeight = UfiWeight.Strong,
             letterSpacing = 0.56.sp
         )
     /** 顶栏副标题（14sp 常规） */
     val headerSubtitle: TextStyle get() = Typography.bodyLarge.copy(fontSize = 14.sp)
+
+    /**
+     * 顶栏标题下方的小字（12sp 常规，2026-09-18）。
+     *
+     * 给天气 / 今日诗词这类**挂件**用，不是页面说明 —— 页面说明是 [headerSubtitle]。
+     * 比副标题再小一档：它是"顺带看一眼"的信息，不该和标题抢注意力。
+     */
+    val headerCaption: TextStyle get() = Typography.bodyLarge.copy(fontSize = 12.sp)
 
     // ---- 读数（仪表盘 / 首页大数字）----
     /** 大号读数（24sp Bold） */

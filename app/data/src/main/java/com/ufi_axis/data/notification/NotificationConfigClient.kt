@@ -170,6 +170,7 @@ class NotificationConfigClient {
         fun startKeepAlive(context: Context) {
             if (!NotifyPrefs.keepAliveShouldRun(context)) {
                 DebugLog.i(TAG, "startKeepAlive 跳过：「前台服务保活」未开启")
+                GuardScheduler.syncSchedule(context)
                 return
             }
             val intent = Intent().setClassName(context.packageName, SERVICE_CLASS_NAME)
@@ -177,6 +178,8 @@ class NotificationConfigClient {
                 .putExtra(NotifyDispatchReceiver.EXTRA_SWITCH_SNAPSHOT, NotifyPrefs.snapshot(context))
             try {
                 context.startForegroundService(intent)
+                // 保活已开：取消主进程 BackgroundGuardWorker（轮询归 :ufi_notify）
+                GuardScheduler.syncSchedule(context)
             } catch (e: Exception) {
                 // 后台 FGS 启动受限（Android 12+/14+）或服务未声明：静默失败
                 DebugLog.w(TAG, "startKeepAlive 失败: ${e.message}")
@@ -204,6 +207,8 @@ class NotificationConfigClient {
             } catch (e: Exception) {
                 DebugLog.w(TAG, "stopKeepAlive 失败: ${e.message}")
             }
+            // 保活已关：若「后台轮询」仍开着，重新 enqueue 主进程 Worker 作兜底。
+            GuardScheduler.syncSchedule(context)
         }
     }
 }

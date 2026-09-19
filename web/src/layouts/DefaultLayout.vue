@@ -56,7 +56,9 @@
       <n-layout-header bordered class="app-header">
         <div class="header-left">
           <n-button v-if="isMobile" quaternary circle class="header-menu-btn" @click="drawerVisible = true">
-            <template #icon><n-icon :size="20"><MenuOutline /></n-icon></template>
+            <template #icon
+              ><n-icon :size="20"><MenuOutline /></n-icon
+            ></template>
           </n-button>
           <span class="header-title">{{ currentTitle }}</span>
           <!-- 设备条占宽大，手机隐藏，避免标题被挤成多行 -->
@@ -66,6 +68,10 @@
           </div>
         </div>
         <div class="header-right">
+          <!-- 天气挂件（可选，在设置→界面小功能里配置）-->
+          <HeaderWeather />
+          <!-- 每日诗词（可选）-->
+          <HeaderPoem />
           <!-- WS 状态：颜色不随明暗切换，保证始终可读 -->
           <n-tooltip>
             <template #trigger>
@@ -85,7 +91,9 @@
             </template>
           </n-button>
           <n-button quaternary circle @click="handleLogout">
-            <template #icon><n-icon :size="18"><LogOutOutline /></n-icon></template>
+            <template #icon
+              ><n-icon :size="18"><LogOutOutline /></n-icon
+            ></template>
           </n-button>
         </div>
       </n-layout-header>
@@ -127,6 +135,18 @@
             </div>
             <span class="font-semibold text-base">UFI-AXIS</span>
           </div>
+          <!--
+            设备信息条在移动端搬到抽屉顶部（2026-09-19）。
+            之前它只在 `v-if="!isMobile"` 的顶栏里出现，手机上型号 / 在线状态 / 制式 / 信号
+            **一个都看不到** —— 而 DeviceTopBar 自己那段 `@media (max-width: 768px)` 也因此
+            成了永远匹配不到的死代码（组件在该宽度下根本不挂载）。
+            放顶栏不行：360px 的顶栏已经被汉堡钮、标题、天气、诗词、WS 状态和两颗圆钮占满，
+            而 `.app-header` 是 `overflow: hidden`，多出来的部分会被**静默裁掉**而不是滚动。
+            抽屉里有 240px 净宽且是纵向布局，放得下。
+          -->
+          <div class="drawer-device">
+            <DeviceTopBar />
+          </div>
           <div class="sider-menu-scroll">
             <n-menu
               :options="menuOptions"
@@ -152,6 +172,9 @@ import {
   HardwareChipOutline,
   FolderOpenOutline,
   DownloadOutline,
+  VideocamOutline,
+  MusicalNotesOutline,
+  ImageOutline,
   MenuOutline,
   SunnyOutline,
   MoonOutline,
@@ -169,9 +192,13 @@ import { useAppStore } from '@/stores/app';
 import { useWebSocketStore } from '@/stores/websocket';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useServiceStore } from '@/stores/service';
+import { useUiExtrasStore } from '@/stores/uiExtras';
+import { useIsMobile } from '@/composables/useIsMobile';
 import { useWsTopics } from '@/composables/useRealtime';
 import { getApiClient } from '@/composables/useApi';
 import DeviceTopBar from '@/components/DeviceTopBar.vue';
+import HeaderWeather from '@/components/HeaderWeather.vue';
+import HeaderPoem from '@/components/HeaderPoem.vue';
 import ServiceStoppedNotice from '@/components/ServiceStoppedNotice.vue';
 
 const router = useRouter();
@@ -180,6 +207,7 @@ const appStore = useAppStore();
 const wsStore = useWebSocketStore();
 const dashboardStore = useDashboardStore();
 const serviceStore = useServiceStore();
+const uiExtrasStore = useUiExtrasStore();
 const dialog = useDialog();
 
 /** 服务停止时仍完整可用的路由：设置页是把服务开回来的唯一入口。 */
@@ -204,7 +232,7 @@ useWsTopics({
 
 const collapsed = ref(false);
 const drawerVisible = ref(false);
-const isMobile = ref(false);
+const isMobile = useIsMobile();
 // 视口高度不足时压缩菜单项高度，让 14 个入口尽量一屏放下（不够仍可滚动）
 const shortViewport = ref(false);
 
@@ -214,7 +242,8 @@ const NARROW_BREAKPOINT = 1024;
 let wasNarrow: boolean | null = null;
 
 function checkMobile() {
-  isMobile.value = window.innerWidth < 768;
+  // isMobile 现在由 useIsMobile() composable 驱动（matchMedia），
+  // 这里只处理它管不了的两件事：短视口压缩、侧栏自动收起
   shortViewport.value = window.innerHeight < 720;
   const narrow = window.innerWidth < NARROW_BREAKPOINT;
   if (wasNarrow !== narrow) {
@@ -234,6 +263,9 @@ onMounted(() => {
   loadSummary();
   // core 崩溃提醒（崩溃后自动重启，前端否则完全无感）
   checkCoreCrash();
+  // 顶栏挂件（天气 / 诗词）的配置与数据。两者都默认关闭，关着时 init 不会发数据请求；
+  // 失败一律静默 —— 装饰性功能不该在顶栏弹错误。
+  uiExtrasStore.init();
 });
 
 function renderIcon(icon: any) {
@@ -255,6 +287,11 @@ const menuOptions = computed<MenuOption[]>(() => [
   { label: '应用', key: 'apps', icon: renderIcon(AppsOutline) },
   { label: '文件', key: 'files', icon: renderIcon(FolderOpenOutline) },
   { label: '下载', key: 'downloads', icon: renderIcon(DownloadOutline) },
+  // 媒体三个入口平铺而不是折叠成子菜单：与 app 一样是三个独立页面，
+  // 而折叠菜单会让"现在在看哪一类"多一层才看得见。
+  { label: '视频', key: 'media-video', icon: renderIcon(VideocamOutline) },
+  { label: '音乐', key: 'media-audio', icon: renderIcon(MusicalNotesOutline) },
+  { label: '图片', key: 'media-image', icon: renderIcon(ImageOutline) },
   { label: '内网穿透', key: 'tunnel', icon: renderIcon(GlobeOutline) },
   // 设置页自己有分栏导航（通用/性能/服务/更新/通知/配对与授权/日志/关于），
   // 所以这里不再挂折叠子菜单 —— 原来的「通用设置 / 配对与授权」两个子项已并入分栏。
@@ -455,7 +492,10 @@ onUnmounted(() => {
   flex: 0 0 auto;
 }
 
-/* WS 胶囊：明暗两套都用「淡底 + 深字」，避免暗色下白字糊在半透明底上 */
+/* WS 胶囊：明暗两套都用「淡底 + 深字」，避免暗色下白字糊在半透明底上。
+   2026-09-15：原来这里是 tailwind 调色板的浅色十六进制，**没有暗色档**，
+   于是暗色下浅底深字直接压在深色卡片上（上面这句注释当时是句空话）。
+   改用带暗色档的语义令牌后才真正成立。 */
 .ws-pill {
   display: inline-flex;
   align-items: center;
@@ -468,16 +508,16 @@ onUnmounted(() => {
   user-select: none;
 }
 .ws-pill.is-connected {
-  background: #dcfce7;
-  color: #166534;
+  background: var(--success-light);
+  color: var(--success);
 }
 .ws-pill.is-connecting {
-  background: #fef3c7;
-  color: #92400e;
+  background: var(--warning-light);
+  color: var(--warning);
 }
 .ws-pill.is-offline {
-  background: #f4f4f5;
-  color: #52525b;
+  background: var(--cat-neutral-bg);
+  color: var(--cat-neutral-fg);
 }
 .ws-dot {
   width: 6px;
@@ -486,13 +526,13 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .ws-dot.dot-ok {
-  background: #22c55e;
+  background: var(--success);
 }
 .ws-dot.dot-warn {
-  background: #eab308;
+  background: var(--warning);
 }
 .ws-dot.dot-muted {
-  background: #a1a1aa;
+  background: var(--text-muted);
 }
 .ws-text {
   white-space: nowrap;
@@ -542,6 +582,15 @@ onUnmounted(() => {
   /* 菜单滚到底后不要把外层页面一起带着滚 */
   overscroll-behavior: contain;
 }
+
+/* 抽屉顶部的设备信息条（仅移动端出现，见模板注释）。
+   与品牌区之间用一条分隔线断开：它是「当前连着哪台设备」的状态，不是导航项。 */
+.drawer-device {
+  padding: 0 12px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
 /* 220px 宽的侧栏里默认滚动条太占地方，收细并去掉轨道 */
 .sider-menu-scroll::-webkit-scrollbar {
   width: 4px;
@@ -551,18 +600,19 @@ onUnmounted(() => {
 }
 /* 滚动条滑块：刻意用中性灰半透明而不是 --border-subtle。
    它要同时压在浅色与深色侧栏上，中性灰叠加在两种底色上都能看见；
-   接 --border-subtle 反而会在暗色下和背景糊在一起（那个变量本身就是随明暗切换的低对比描边色）。 */
+   接 --border-subtle 反而会在暗色下和背景糊在一起（那个变量本身就是随明暗切换的低对比描边色）。
+   取值已提到 main.css 的 --scrollbar-thumb / --scrollbar-thumb-hover。 */
 .sider-menu-scroll::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.3);
+  background: var(--scrollbar-thumb);
   border-radius: 2px;
 }
 .sider-menu-scroll:hover::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.5);
+  background: var(--scrollbar-thumb-hover);
 }
 /* Firefox */
 .sider-menu-scroll {
   scrollbar-width: thin;
-  scrollbar-color: rgba(128, 128, 128, 0.3) transparent;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 
 /* 矮屏（笔记本 768p / 浏览器缩放 / 分屏）：压缩品牌区，把高度让给菜单 */

@@ -2,16 +2,13 @@ package com.ufi_axis.viewmodel.module
 
 import android.content.Context
 import android.content.Intent
-import android.accessibilityservice.AccessibilityServiceInfo
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.view.accessibility.AccessibilityManager
 import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.data.model.*
 import com.ufi_axis.data.update.CoreUpdatePersistence
 import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyDispatchReceiver
 import com.ufi_axis.data.notification.NotifyHistoryStore
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppLogBuffer
@@ -26,8 +23,12 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import com.ufi_axis_core.contract.ErrorCode
+import retrofit2.HttpException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -50,8 +51,51 @@ class ToolsModule(
     private val coreUpdatePersistence: CoreUpdatePersistence
 ) {
     // ── State ──
-    private val _toolsState = MutableStateFlow(ToolsState())
+    // 短信四项配置的初值取本地镜像（真源仍在 core，由 refreshDeviceConfig 回读覆盖）。
+    // 与下面 _logSwitchState 同一手法：不这么做，进程重建 + core 暂时连不上时开关会显示成
+    // 编译期默认值，用户看到的就是「自动解析验证码存不住」（2026-09-14）。
+    private val _toolsState = MutableStateFlow(
+        AppPreferences(appContext).let { p ->
+            ToolsState(
+                smsCodeEnabled = p.smsCodeEnabled,
+                smsCodeCleanupHours = p.smsCodeCleanupHours,
+                smsCodeAutoCopy = p.smsCodeAutoCopy,
+                smsFilterExemptVerificationCode = p.smsFilterExemptVerificationCode
+            )
+        }
+    )
     val toolsState: StateFlow<ToolsState> = _toolsState.asStateFlow()
+
+    /** 短信四项配置的写请求在飞数量，见 [putSmsConfig]。 */
+    private var smsConfigWritesInFlight = 0
+
+    // ── Core 更新中标记（2026-09-14 起对外可观测）──
+
+    private val _coreUpdating = MutableStateFlow(coreUpdatePersistence.isCoreUpdating())
+
+    /**
+     * 设备端 Core 是否正在更新。
+     *
+     * 之前这个状态只存在 SharedPreferences 里（[CoreUpdatePersistence]），只有「掉线弹窗豁免」
+     * 和「冷启动接管进度」两个消费者去**主动读**它 —— 没有任何取数链路知道自己该停下来。
+     * 于是升级期间 30s 全局告警轮询、5s 首页刷新、30s 探活、WS 重连风暴全都照跑，
+     * 用户看到满屏「加载告警失败」。
+     *
+     * 暴露成 StateFlow 之后，`MainViewModel` 能在**一个地方**同时做两件事：
+     * 更新期间静默全局错误 Toast，以及暂停 / 恢复周期取数。
+     */
+    val coreUpdating: StateFlow<Boolean> = _coreUpdating.asStateFlow()
+
+    /**
+     * 置位/清位「更新中」。**所有**改这个状态的地方都必须走这里。
+     *
+     * 落 SP 是为了「app 被杀后重启还能接管进度」；同时推 StateFlow 是为了让取数闸门
+     * 能实时响应。两者漏掉任何一个都会退化成之前那种「标记有了但没人听」。
+     */
+    private fun markCoreUpdating(updating: Boolean) {
+        coreUpdatePersistence.setCoreUpdating(updating)
+        _coreUpdating.value = updating
+    }
 
     private val _alertsState = MutableStateFlow(AlertsState())
     val alertsState: StateFlow<AlertsState> = _alertsState.asStateFlow()
@@ -120,12 +164,12 @@ class ToolsModule(
         scope.launch {
             runCatching { api.triggerDeviceUpdate() }
                 .onSuccess {
-                    coreUpdatePersistence.setCoreUpdating(true)
+                    markCoreUpdating(true)
                     _updateDeviceState.value = it
                     startDeviceUpdatePolling()
                 }
                 .onFailure { e ->
-                    coreUpdatePersistence.setCoreUpdating(false)
+                    markCoreUpdating(false)
                     _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = "触发更新失败: ${e.message}")
                 }
         }
@@ -145,6 +189,11 @@ class ToolsModule(
             .onSuccess {
                 deviceUpdatePollFailures = 0
                 _updateDeviceState.value = it.copy(reconnecting = false)
+                // 在线/本地任一路径到了终态都要清「更新中」标记，
+                // 否则健康检查会一直豁免掉线弹窗（见 MainViewModel.isCoreUpdateInterruptingBackend）。
+                if (it.state == "done" || it.state == "failed") {
+                    markCoreUpdating(false)
+                }
             }
             .onFailure {
                 deviceUpdatePollFailures++
@@ -158,6 +207,7 @@ class ToolsModule(
                                 message = "设备更新可能失败，请检查设备/ADB 恢复",
                                 reconnecting = false
                             )
+                        markCoreUpdating(false)
                     }
                     // P0-7 断连过渡态：保持 installing 语义，busy 轮询不中断
                     deviceUpdatePollFailures >= DEVICE_UPDATE_POLL_FAILURE_THRESHOLD -> {
@@ -219,7 +269,10 @@ class ToolsModule(
         runCatching {
             val resp = AppJson.decodeFromJsonElement<UpdateStatusResponse>(obj)
             _updateDeviceState.value = resp
-            if (resp.state == "done" || resp.state == "failed") stopDeviceUpdatePolling()
+            if (resp.state == "done" || resp.state == "failed") {
+                stopDeviceUpdatePolling()
+                markCoreUpdating(false)
+            }
         }
     }
 
@@ -227,6 +280,14 @@ class ToolsModule(
      *  @param onResult (ok: Boolean, message: String) 推送/安装结果回调（成功/失败均有返回） */
     fun pushApkAndInstall(apkFile: java.io.File, onResult: (Boolean, String) -> Unit = { _, _ -> }) {
         scope.launch {
+            // 上传前先本地粗筛包名：推错包会把别的应用装到设备上，而且设备不会重启 ——
+            // 设备端状态机因此卡在 installing，此后所有上传恒 409（详见 core 的 selfHealStuckState）。
+            // 权威判定在 core（精确比对自身 packageName），这里只为省掉几十 MB 的白等。
+            localApkRejectReason(apkFile)?.let { reason ->
+                _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = reason)
+                onResult(false, reason)
+                return@launch
+            }
             try {
                 _updateDeviceState.value = UpdateStatusResponse(state = "uploading", progress = 0, message = "正在上传 APK...")
                 val totalSize = apkFile.length()
@@ -268,6 +329,10 @@ class ToolsModule(
                 // 这是预期行为，并非安装失败。故安装调用异常时不直接判失败，而是进入
                 // 「设备重启中」过渡态并启动轮询，由重连后的 getDeviceUpdateStatus / WS 快照
                 // （statusToMap 终态）来判定真实结果，避免把「进程被杀重启」误报为「推送失败」。
+                //
+                // 与 triggerDeviceUpdate 一样置「更新中」标记：本地推送安装同样会让 Core
+                // 断联约 1 分钟，健康检查/掉线弹窗必须与在线更新同一套豁免。
+                markCoreUpdating(true)
                 _updateDeviceState.value = UpdateStatusResponse(
                     state = "installing",
                     message = "正在安装，设备即将重启…"
@@ -277,11 +342,15 @@ class ToolsModule(
                     if (install.ok) {
                         _updateDeviceState.value = install.status
                             ?: UpdateStatusResponse(state = "installing", message = "正在安装，等待设备重启...")
+                        if (install.status?.state in setOf("done", "failed")) {
+                            markCoreUpdating(false)
+                        }
                         onResult(true, "APK 推送安装成功，设备将自动重启生效")
                     } else {
                         // 后端在进程被杀前已明确返回失败（如 APK 不存在 / 安装被拒）→ 真实失败
                         val msg = "安装失败: ${install.status?.message ?: "未知错误"}"
                         _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = msg)
+                        markCoreUpdating(false)
                         onResult(false, msg)
                         return@launch
                     }
@@ -296,16 +365,71 @@ class ToolsModule(
                 // 无论 installLocalApk 成功返回还是因重启抛异常，都启动轮询等待真实终态（done/failed）
                 startDeviceUpdatePolling()
             } catch (e: Exception) {
-                val msg = "推送安装失败: ${e.message}"
+                // 2026-09-14：原来这里只有 "推送安装失败: ${e.message}"，而 Retrofit 对非 2xx
+                // 直接抛 HttpException —— 上面 `upload.ok` 那段分支对 409/400 **根本不可达**，
+                // core 精心写好的中文原因和 `code` 全被丢掉，用户只看到 "HTTP 409 Conflict"。
+                val msg = "推送安装失败: ${describePushFailure(e)}"
                 _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = msg)
+                markCoreUpdating(false)
                 onResult(false, msg)
             }
         }
     }
 
+    /**
+     * 把推送失败的异常翻译成人话。
+     *
+     * core 的失败信封是 `{ success:false, ok:false, error, message, code }`（`ResponseHelper`），
+     * 而 Retrofit 把非 2xx 变成 `HttpException`，`e.message` 只有 "HTTP 409 Conflict"。
+     * 这里把 `errorBody` 里的 `message` 取出来，并对两个已知 `code` 补上**下一步该做什么** ——
+     * 「稍后重试」和「换一个包」是完全不同的指引，混在一起用户只能瞎试。
+     */
+    private fun describePushFailure(e: Exception): String {
+        if (e !is HttpException) return e.message ?: "未知错误"
+        val body = runCatching { e.response()?.errorBody()?.string() }.getOrNull().orEmpty()
+        val obj = runCatching { AppJson.parseToJsonElement(body).jsonObject }.getOrNull()
+        val serverMsg = obj?.get("message")?.jsonPrimitive?.contentOrNull
+            ?: obj?.get("error")?.jsonPrimitive?.contentOrNull
+        val code = obj?.get("code")?.jsonPrimitive?.contentOrNull
+        val base = serverMsg?.takeIf { it.isNotBlank() } ?: "HTTP ${e.code()}"
+        return when (code) {
+            ErrorCode.UPDATE_IN_PROGRESS ->
+                "$base\n若设备端上一次安装卡住了（例如推错了包，设备不会重启），" +
+                    "可在本页「重置更新状态」后重试；15 分钟后设备端也会自动解除。"
+            ErrorCode.INVALID_PACKAGE ->
+                "$base\n重试同一个包不会成功，请重新选择 UFI-AXIS Core 的安装包。"
+            else -> base
+        }
+    }
+
+    /**
+     * 推包前的本地包名预检（2026-09-14）。
+     *
+     * core 侧有权威的精确校验（`UpdateManager.rejectReasonForApk` 比对自身 packageName），
+     * 这里只做一次**便宜的粗筛**：目的是别让用户白等几十 MB 上传完才被告知选错了包。
+     *
+     * 因此判据故意宽松 —— 只要包名以 core 的包名前缀开头就放行，
+     * 调试/渠道包（`com.ufi_axis_core.debug` 之类）不会被本地误拦，精确判定交给 core。
+     *
+     * @return null 表示可以继续上传；非 null 是给用户看的拒绝原因
+     */
+    private fun localApkRejectReason(apkFile: java.io.File): String? {
+        val info = runCatching {
+            appContext.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        }.getOrNull() ?: return "无法解析该 APK（文件损坏或不是有效的 Android 安装包）"
+        val pkg = info.packageName.orEmpty()
+        if (pkg.isBlank()) return "无法读取该 APK 的包名"
+        if (!pkg.startsWith(CORE_PACKAGE_PREFIX)) {
+            return "包名不匹配：该 APK 是「$pkg」，不是 UFI-AXIS Core 的安装包。\n" +
+                "推错包会把别的应用装到设备上，且设备不会重启，因此已阻止上传。"
+        }
+        return null
+    }
+
     /** 重置设备更新状态 */
     fun resetDeviceUpdate() {
         stopDeviceUpdatePolling()
+        markCoreUpdating(false)
         scope.launch {
             runCatching { api.resetDeviceUpdate() }
                 .onSuccess { _updateDeviceState.value = it }
@@ -1162,7 +1286,9 @@ class ToolsModule(
                         verificationCodesUnread = resp.codes.count { c -> c.msgId > seen }
                     )
                 }
-                autoCopyNewestVerificationCode(resp.codes)
+                // 2026-09-13 修复：自动复制已迁移至 `:ufi_notify` 进程后台触发，
+                // 且由 NotificationCenter 统一管控。此处原有的 UI 侧自动复制逻辑已删除，
+                // 避免在打开页面时与后台逻辑冲突产生双重复制。
             } catch (e: Exception) {
                 // 无感刷新：失败也不弹错误横幅打断阅读，只在日志留痕（列表仍显示上一次的数据）；
                 // 但"尝试过了"必须记下来，否则首屏骨架没有任何收场条件。
@@ -1173,70 +1299,57 @@ class ToolsModule(
     }
 
     /**
-     * 自动复制"新收到"的验证码到剪贴板。
-     *
-     * 仅在「自动复制开关开启」且「系统无障碍服务（UfiNotifyAccessibilityService）已启用」时生效 ——
-     * 这是产品硬性要求：无障碍未开启则功能不可用。无障碍可在运行期被用户关闭，因此这里每次都
-     * 重新探测，避免开着开关却因服务被关而静默失效。
-     *
-     * 只在真正新收到的验证码上触发：用 [lastAutoCopiedMsgId] 记录已处理到的最大 msgId，
-     * 仅当本次拉取的列表里出现比它更大的 msgId 才复制其中最新的一条，并推进基线。
-     * 首次观察（基线为 -1）只校准基线、不复制历史验证码；无障碍关闭期间到达的验证码也会被推进
-     * 基线消费掉，重新开启后不会把过期码补复制到剪贴板。
-     */
-    private var lastAutoCopiedMsgId = -1L
-
-    private fun autoCopyNewestVerificationCode(codes: List<com.ufi_axis.data.model.VerificationCode>) {
-        val maxId = codes.maxOfOrNull { it.msgId } ?: return
-        if (maxId <= lastAutoCopiedMsgId) return
-        if (lastAutoCopiedMsgId == -1L) {
-            lastAutoCopiedMsgId = maxId
-            return
-        }
-        val autoCopy = _toolsState.value.smsCodeAutoCopy
-        if (autoCopy && isAccessibilityServiceEnabled()) {
-            codes.filter { it.msgId > lastAutoCopiedMsgId }
-                .maxByOrNull { it.msgId }
-                ?.let { copyToClipboard(it.code) }
-        }
-        lastAutoCopiedMsgId = maxId
-    }
-
-    /** 本应用的无障碍服务（UfiNotifyAccessibilityService）是否已启用 */
-    private fun isAccessibilityServiceEnabled(): Boolean {
-        val am = appContext.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
-        val serviceName = "com.ufi_axis.notification.UfiNotifyAccessibilityService"
-        return am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-            .any {
-                it.resolveInfo.serviceInfo.packageName == appContext.packageName &&
-                    it.resolveInfo.serviceInfo.name == serviceName
-            }
-    }
-
-    private fun copyToClipboard(text: String) {
-        val cm = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
-        cm.setPrimaryClip(ClipData.newPlainText("验证码", text))
-        DebugLog.i("Sms", "自动复制验证码已写入剪贴板")
-    }
-
-    /**
-     * 验证码自动解析开关。
+     * 验证码开关。
      *
      * 乐观更新 + **失败回滚**。2026-09-08：原实现是 `catch (_: Exception) {}` ——
      * 请求失败时本地已经翻成新值、core 那边没变，下一次 [refreshDeviceConfig] 回读又把它
      * 拨回去，用户看到的就是「设置自己弹回来」而且中间没有任何提示。
+     *
+     * 2026-09-14：写成功后同步落 [AppPreferences] 镜像（见 [refreshDeviceConfig]），
+     * 否则进程重建 + core 连不上时会回到编译期默认值。
      */
     fun setSmsCodeEnabled(enabled: Boolean) {
         val previous = _toolsState.value.smsCodeEnabled
         _toolsState.update { it.copy(smsCodeEnabled = enabled, smsCodeOptInShown = true) }
         scope.launch {
-            try {
-                api.updateConfig(mapOf("sms_code_enabled" to enabled))
-                if (enabled) loadVerificationCodes()
-            } catch (e: Exception) {
+            if (!putSmsConfig("sms_code_enabled", enabled, "验证码解析开关保存失败")) {
                 _toolsState.update { it.copy(smsCodeEnabled = previous) }
-                emitNetworkError("验证码解析开关保存失败: ${e.message}")
+                return@launch
             }
+            AppPreferences(appContext).smsCodeEnabled = enabled
+            // 二级：拉验证码缓存。2026-09-13 修复——此前它与写核心同处一个 try，
+            // 拉缓存一旦抛异常会把主开关回滚到 previous(false)，尽管 core 早已写成 true，
+            // 表现为「开关存不住 / 自己弹回关」。现在独立 try，失败只兜底、绝不回滚主开关。
+            if (enabled) {
+                try {
+                    loadVerificationCodes()
+                } catch (e: Exception) {
+                    DebugLog.w("Sms", "开关已保存，但验证码缓存加载失败（不影响开关状态）: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 短信四项配置的 `PUT /api/config` 统一出口。
+     *
+     * 存在的理由是 [smsConfigWritesInFlight]：写请求在飞的这段时间里，WS 一次重连就会触发
+     * [refreshDeviceConfig]，它的 GET 可能抢在 PUT 落库之前返回旧值并把开关刷回去
+     * （用户看到的「开了一会儿又变回关」）。计数器让回读在此期间跳过这四项。
+     * 计数只在本模块的 `scope`（主 dispatcher）上增减，不需要原子类型。
+     *
+     * @return PUT 是否成功；失败已经 [emitNetworkError]，调用方只需回滚本地状态。
+     */
+    private suspend fun putSmsConfig(field: String, value: Any, errorPrefix: String): Boolean {
+        smsConfigWritesInFlight++
+        return try {
+            api.updateConfig(mapOf(field to value))
+            true
+        } catch (e: Exception) {
+            emitNetworkError("$errorPrefix: ${e.message}")
+            false
+        } finally {
+            smsConfigWritesInFlight--
         }
     }
 
@@ -1245,33 +1358,35 @@ class ToolsModule(
         val previous = _toolsState.value.smsCodeCleanupHours
         _toolsState.update { it.copy(smsCodeCleanupHours = hours) }
         scope.launch {
-            try {
-                api.updateConfig(mapOf("sms_code_cleanup_hours" to hours))
-            } catch (e: Exception) {
+            if (putSmsConfig("sms_code_cleanup_hours", hours, "清理间隔保存失败")) {
+                AppPreferences(appContext).smsCodeCleanupHours = hours
+            } else {
                 _toolsState.update { it.copy(smsCodeCleanupHours = previous) }
-                emitNetworkError("清理间隔保存失败: ${e.message}")
             }
         }
     }
 
     /**
-     * 自动复制验证码开关。乐观更新 + 失败回滚（同 [setSmsCodeEnabled]）。
+     * 自动复制开关（`sms_code_auto_copy`）。
      *
-     * 开启成功后重置自动复制基线（[lastAutoCopiedMsgId] = -1），避免把历史验证码当成"新"的
-     * 复制出去。该开关的可用性还依赖系统无障碍服务（UfiNotifyAccessibilityService），
-     * UI 会在未开启时禁用本开关并引导去开启；运行时若无障碍被关闭，[autoCopyNewestVerificationCode]
-     * 侧也会重新探测并跳过复制。
+     * 2026-09-13：功能已迁移至 `:ufi_notify` 进程后台触发，由 [NotificationCenter] 管控。
+     *
+     * 2026-09-14 修复：这里原来**只** PUT 给 core，而执行闸门
+     * `NotificationCenter.copyVerificationCodeToClipboard` 判的是本地 `ufi_axis_prefs` 里的
+     * 同名键 —— 全仓没有任何写入方，闸门恒为 false，开关是假的。现在写本地镜像
+     * （`AppPreferences.smsCodeAutoCopy` 用的就是 `NotificationCenter.KEY_SMS_CODE_AUTO_COPY`），
+     * 并把快照推给 `:ufi_notify`（该键在 `NotifyPrefs.MIRRORED_BOOL_KEYS` 里，
+     * 那个进程只认自己的 mirror_ 副本）。
      */
     fun setSmsCodeAutoCopy(enabled: Boolean) {
         val previous = _toolsState.value.smsCodeAutoCopy
         _toolsState.update { it.copy(smsCodeAutoCopy = enabled) }
         scope.launch {
-            try {
-                api.updateConfig(mapOf("sms_code_auto_copy" to enabled))
-                if (enabled) lastAutoCopiedMsgId = -1L
-            } catch (e: Exception) {
+            if (putSmsConfig("sms_code_auto_copy", enabled, "自动复制验证码保存失败")) {
+                AppPreferences(appContext).smsCodeAutoCopy = enabled
+                NotifyDispatchReceiver.dispatchSwitchSnapshot(appContext)
+            } else {
                 _toolsState.update { it.copy(smsCodeAutoCopy = previous) }
-                emitNetworkError("自动复制验证码保存失败: ${e.message}")
             }
         }
     }
@@ -1646,6 +1761,29 @@ class ToolsModule(
     }
 
     /**
+     * 拉某条渠道的投递统计（配置页统计卡）。与 [loadDeliveryHistory] 分离：
+     * 统计只读 count/MAX，换筛选/翻页不必重拉；渠道变了才清空旧数字。
+     */
+    fun loadDeliveryStats(channel: String?) {
+        if (channel.isNullOrBlank()) return
+        scope.launch {
+            try {
+                val stats = api.getMailHistoryStats(channel)
+                _toolsState.update {
+                    it.copy(
+                        deliveryStatsChannel = channel,
+                        deliveryStats = stats,
+                        deliveryStatsLoaded = true
+                    )
+                }
+            } catch (e: Exception) {
+                DebugLog.w("DeliveryStats", "投递统计加载失败 channel=$channel: ${e.message}")
+                // 失败不推进 loaded：UI 继续显示上一份或骨架，避免「0 条」假空态
+            }
+        }
+    }
+
+    /**
      * 读投递记录首页（换渠道或换筛选也走这里，两种都会重置游标）。
      *
      * 并发闸门与「换筛选放行」的理由同 [loadNotifyHistory]：同一组条件的重复请求丢掉，
@@ -1786,6 +1924,96 @@ class ToolsModule(
     }
 
     /**
+     * 删单条投递记录（详情弹窗「删除」）。
+     *
+     * 成功（含 deleted=0 的「本来就没有」）只做**本地移除**，不整页重拉：避免打乱 keyset 游标、
+     * 列表闪烁，也避免删一条触发触底加载。失败保持列表原样。
+     *
+     * @return 供 UI 弹 toast 的文案；null 表示成功。
+     */
+    suspend fun deleteDeliveryHistoryItem(id: Long): String? {
+        if (id <= 0L) return "记录无效"
+        if (!deliveryDeletingIds.add(id)) return null // 双击去重：第二次直接当成功忽略
+        return try {
+            val resp = api.deleteMailHistoryById(id)
+            if (!resp.success) {
+                deliveryDeletingIds.remove(id)
+                "删除失败，请重试"
+            } else {
+                removeDeliveryHistoryItemLocally(id)
+                deliveryDeletingIds.remove(id)
+                null
+            }
+        } catch (e: retrofit2.HttpException) {
+            deliveryDeletingIds.remove(id)
+            val code = e.code()
+            if (code == 404 || code == 405 || code == 501) {
+                "设备端不支持删除单条，请升级 Core"
+            } else {
+                DebugLog.w("DeliveryHistory", "删除投递记录失败 id=$id: HTTP $code")
+                "删除失败（HTTP $code）"
+            }
+        } catch (e: Exception) {
+            deliveryDeletingIds.remove(id)
+            DebugLog.w("DeliveryHistory", "删除投递记录失败 id=$id: ${e.message}")
+            "删除失败，请检查网络后重试"
+        }
+    }
+
+    /** 删除中的 id，防双击连删。 */
+    private val deliveryDeletingIds = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+
+    private fun removeDeliveryHistoryItemLocally(id: Long) {
+        _toolsState.update { s ->
+            // 命中不到就整段不动（连计数都不减）；命中了就说明这条确实在列表里，
+            // 后面不需要再判一次"是否存在"。
+            val target = s.deliveryHistory.firstOrNull { it.id == id } ?: return@update s
+            val outcome = target.deliveryOutcome
+            s.copy(
+                deliveryHistory = s.deliveryHistory.filterNot { it.id == id },
+                deliveryHistoryTotal = (s.deliveryHistoryTotal - 1).coerceAtLeast(0),
+                deliveryHistoryFailedTotal =
+                    if (outcome == DeliveryOutcome.FAILED) {
+                        (s.deliveryHistoryFailedTotal - 1).coerceAtLeast(0)
+                    } else s.deliveryHistoryFailedTotal,
+                deliveryHistorySkippedTotal =
+                    if (outcome == DeliveryOutcome.SKIPPED) {
+                        (s.deliveryHistorySkippedTotal - 1).coerceAtLeast(0)
+                    } else s.deliveryHistorySkippedTotal
+            )
+        }
+    }
+
+    /**
+     * 删单条系统通知历史（本机 Room）。成功本地移除；失败列表不动。
+     *
+     * @return toast 文案；null = 成功。
+     */
+    suspend fun deleteNotifyHistoryItem(id: Long): String? {
+        if (id <= 0L) return "记录无效"
+        return try {
+            val ok = NotifyHistoryStore.deleteById(appContext, id)
+            if (!ok) {
+                "删除失败，请重试"
+            } else {
+                _toolsState.update { s ->
+                    val existed = s.notifyHistory.any { it.id == id }
+                    s.copy(
+                        notifyHistory = s.notifyHistory.filterNot { it.id == id },
+                        notifyHistoryTotal =
+                            if (existed) (s.notifyHistoryTotal - 1).coerceAtLeast(0)
+                            else s.notifyHistoryTotal
+                    )
+                }
+                null
+            }
+        } catch (e: Exception) {
+            DebugLog.w("NotifyHistory", "删除通知历史失败 id=$id: ${e.message}")
+            "删除失败，请重试"
+        }
+    }
+
+    /**
      * 验证码豁免关键词拦截开关（走既有 `PUT /api/config`）。
      *
      * 乐观更新 + **失败回滚**：真源在 core，本地翻了而 core 没改的话，
@@ -1795,11 +2023,13 @@ class ToolsModule(
         val previous = _toolsState.value.smsFilterExemptVerificationCode
         _toolsState.update { it.copy(smsFilterExemptVerificationCode = enabled) }
         scope.launch {
-            try {
-                api.updateConfig(mapOf("sms_filter_exempt_verification_code" to enabled))
-            } catch (e: Exception) {
+            if (putSmsConfig(
+                    "sms_filter_exempt_verification_code", enabled, "验证码豁免开关保存失败"
+                )
+            ) {
+                AppPreferences(appContext).smsFilterExemptVerificationCode = enabled
+            } else {
                 _toolsState.update { it.copy(smsFilterExemptVerificationCode = previous) }
-                emitNetworkError("验证码豁免开关保存失败: ${e.message}")
             }
         }
     }
@@ -1817,22 +2047,54 @@ class ToolsModule(
      * 注意 `goform_password` 在 GET 里是脱敏值，不能回写本地，
      * 只能得到「是否已设置」——所以 goform 密码本地不再存明文，只存 [AppPreferences.goformPasswordSet]。
      */
-    fun refreshDeviceConfig() {        scope.launch {
-            val cfg = try {
-                api.getConfig()
-            } catch (e: Exception) {
-                DebugLog.w("Config", "回读 /api/config 失败，沿用本地缓存: ${e.message}")
+    fun refreshDeviceConfig() {
+        scope.launch {
+            // 冷启动首屏：设备连接/鉴权可能尚未就绪，首轮 GET 容易抛异常被静默吞掉、
+            // 本地镜像停在默认 false（表现为「彻底关 app 再开，解析开关变回关」）。
+            // 加一次退避重试兜底瞬时失败；两次都失败才沿用本地缓存（2026-09-13 修复）。
+            var cfg: com.ufi_axis.data.model.AppConfig? = null
+            for (attempt in 0..1) {
+                cfg = try {
+                    api.getConfig()
+                } catch (e: Exception) {
+                    DebugLog.w("Config", "回读 /api/config 失败（第 ${attempt + 1} 次）: ${e.message}")
+                    null
+                }
+                if (cfg != null) break
+                if (attempt == 0) kotlinx.coroutines.delay(800)
+            }
+            val safeCfg = cfg ?: run {
+                DebugLog.w("Config", "回读 /api/config 重试后仍失败，沿用本地镜像")
                 return@launch
             }
-            _toolsState.update {
-                it.copy(
-                    smsCodeEnabled = cfg.sms_code_enabled,
-                    smsCodeCleanupHours = cfg.sms_code_cleanup_hours,
-                    smsCodeAutoCopy = cfg.sms_code_auto_copy,
-                    // 验证码豁免：真源在 core，这里是镜像。默认值两端都是 true，
-                    // 所以「core 没返回这个键」与「core 说 true」等价，不会造出假开关。
-                    smsFilterExemptVerificationCode = cfg.sms_filter_exempt_verification_code
-                )
+            val prefs = AppPreferences(appContext)
+            // core 明确给了值才覆盖（这四项已改为可空，见 AppConfig）；同时把新值落进
+            // AppPreferences 镜像 —— 否则 app 进程重建 + core 暂时连不上时，ToolsState 会回到
+            // 编译期默认值，表现为「自动解析验证码开关存不住」（2026-09-14 修复）。
+            //
+            // 写请求在飞时整段跳过：本函数挂在「WS 每次进入 CONNECTED」上（含断线重连），
+            // 而开关是乐观更新 + 异步 PUT。GET 抢在 PUT 落库前返回旧值就会把开关刷回去 ——
+            // 用户报的「开了一会儿又变回关」正是这个窗口。
+            if (smsConfigWritesInFlight > 0) {
+                DebugLog.i("Config", "短信配置写请求在飞，本轮回读跳过这四项")
+            } else {
+                safeCfg.sms_code_enabled?.let { prefs.smsCodeEnabled = it }
+                safeCfg.sms_code_cleanup_hours?.let { prefs.smsCodeCleanupHours = it }
+                safeCfg.sms_code_auto_copy?.let { prefs.smsCodeAutoCopy = it }
+                safeCfg.sms_filter_exempt_verification_code?.let {
+                    prefs.smsFilterExemptVerificationCode = it
+                }
+                _toolsState.update {
+                    it.copy(
+                        smsCodeEnabled = prefs.smsCodeEnabled,
+                        smsCodeCleanupHours = prefs.smsCodeCleanupHours,
+                        smsCodeAutoCopy = prefs.smsCodeAutoCopy,
+                        // 验证码豁免：真源在 core，这里是镜像。两端默认值都是 true。
+                        smsFilterExemptVerificationCode = prefs.smsFilterExemptVerificationCode
+                    )
+                }
+                // 自动复制的执行闸门在 `:ufi_notify`，它只认自己那份 mirror_ 副本
+                NotifyDispatchReceiver.dispatchSwitchSnapshot(appContext)
             }
             // core 为真源：直接覆盖本地缓存。
             // 2026-09-04：日志四层开关改成「只有 core 明确给了值才覆盖」。
@@ -1840,11 +2102,10 @@ class ToolsModule(
             // 默认 true，「core 没返回」与「core 说 true」不可区分，于是老 core / 裁剪过的响应
             // 会把用户刚关掉的开关重新打开。其余字段沿用「有默认值也照写」的旧行为，
             // 因为它们不是开关、写错了不会产生持续的副作用（日志会一直写盘）。
-            val prefs = AppPreferences(appContext)
-            applyLogSwitchesFromCore(cfg)
-            prefs.goformPort = cfg.goform_port
-            prefs.updateMirrorCustom = cfg.update_mirror_base
-            prefs.goformPasswordSet = cfg.goform_password.isNotBlank()
+            applyLogSwitchesFromCore(safeCfg)
+            prefs.goformPort = safeCfg.goform_port
+            prefs.updateMirrorCustom = safeCfg.update_mirror_base
+            prefs.goformPasswordSet = safeCfg.goform_password.isNotBlank()
         }
     }
 
@@ -1960,6 +2221,15 @@ class ToolsModule(
     }
 
     companion object {
+        /**
+         * 设备端 Core 的包名前缀，用于推包前的**本地粗筛**（[localApkRejectReason]）。
+         *
+         * 用前缀而不是完整包名：调试/渠道包的 applicationId 可能带后缀
+         * （`com.ufi_axis_core.debug` 之类），本地不该把自家调试包拦掉。
+         * 精确比对由 core 侧 `UpdateManager.rejectReasonForApk` 负责（它拿自己的 packageName 比）。
+         */
+        private const val CORE_PACKAGE_PREFIX = "com.ufi_axis_core"
+
         private const val CONVERSATION_PAGE_SIZE = 100
 
         /**
@@ -3018,6 +3288,159 @@ class ToolsModule(
 
     fun clearTrafficMessage() {
         _trafficManagementState.value = _trafficManagementState.value.copy(errorMessage = null, successMessage = null)
+    }
+
+    // ── Traffic History（流量历史卡片：柱状图 + 日/周/月/年 + 明细）──
+
+    private val _trafficHistoryState = MutableStateFlow(TrafficHistoryState())
+    val trafficHistoryState: StateFlow<TrafficHistoryState> = _trafficHistoryState.asStateFlow()
+
+    /**
+     * 各 range **各自**最近一次成功读取的时刻（单调时钟；缺键 = 本进程内从未成功）。
+     *
+     * 为什么是 map 而不是 [trafficLimitSuccessElapsed] 那样的单个字段：四个 range 是四份
+     * 互不相干的数据。用一个字段的话，刚拉完「日」再切到「月」会被判成"新鲜"而跳过请求 ——
+     * 月那份根本还没拉过，卡片会一直空着。
+     */
+    private val trafficHistorySuccessElapsed = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * 切换「日 / 周 / 月 / 年」。
+     *
+     * 只改"当前选中"，**不清除**其它段已拉到的数据 —— 切回去时立刻有图、不白屏。
+     * 同时把 anchor 复位到 null（当前段）：从"上周三"切到「月」时，用户要的是本月而不是
+     * 上周三所在的那个月。切换后立刻 `force = true` 重拉。
+     */
+    fun setTrafficHistoryRange(range: String) {
+        if (_trafficHistoryState.value.range == range) return
+        _trafficHistoryState.value = _trafficHistoryState.value.copy(
+            range = range,
+            anchor = null,
+            errorMessage = null
+        )
+        loadTrafficHistory(force = true)
+    }
+
+    /**
+     * 左右翻页：[forward] 为 false 看上一段（前一天/周/月/年），为 true 看下一段。
+     *
+     * 锚点直接取接口回的 `prev_anchor` / `next_anchor`，不在客户端做日历运算 ——
+     * 月有 28~31 天、闰年、DST 这些坑 core 侧已经用 `java.time` 处理过一遍了。
+     * 往未来翻在 `has_next` 为 false 时被挡住：翻过去只有一屏空柱，不如不动。
+     */
+    fun shiftTrafficHistory(forward: Boolean) {
+        val current = _trafficHistoryState.value.data ?: return
+        if (forward && !current.has_next) return
+        val next = if (forward) current.next_anchor else current.prev_anchor
+        if (next <= 0L) return
+        _trafficHistoryState.value = _trafficHistoryState.value.copy(anchor = next, errorMessage = null)
+        loadTrafficHistory(force = true)
+    }
+
+    /** 回到当前段（今天 / 本周 / 本月 / 本年）。 */
+    fun resetTrafficHistoryAnchor() {
+        if (_trafficHistoryState.value.anchor == null) return
+        _trafficHistoryState.value = _trafficHistoryState.value.copy(anchor = null, errorMessage = null)
+        loadTrafficHistory(force = true)
+    }
+
+    /**
+     * 读当前段的流量历史（`GET /api/traffic/usage`）。
+     *
+     * ## [force] 与新鲜度闸门（与 [loadTrafficLimit] 同一套，理由同源）
+     * 进页面的 `LaunchedEffect` 每次都会调它，而"昨天/上周用了多少"在一个新鲜窗口内
+     * 不会有意义的变化 —— 默认走闸门，只有用户显式切段 / 翻页才 `force = true`。
+     *
+     * ## loading 态只在"这一段还没有数据"时写
+     * 卡片判据是 `isLoading && data == null`。已经有图时翻 `isLoading` 不改变任何像素，
+     * 只是白付一次重组；翻页时旧图还在屏幕上，翻它反而让人以为图丢了。
+     */
+    fun loadTrafficHistory(force: Boolean = false) {
+        val snapshot = _trafficHistoryState.value
+        val range = snapshot.range
+        val anchor = snapshot.anchor
+        val key = snapshot.key
+        if (!force &&
+            snapshot.dataByKey[key] != null &&
+            isForegroundDataFresh(trafficHistorySuccessElapsed[key] ?: 0L, SystemClock.elapsedRealtime())
+        ) {
+            return
+        }
+        scope.launch {
+            _trafficHistoryState.value = _trafficHistoryState.value.let { s ->
+                if (s.dataByKey[key] == null) s.copy(isLoading = true, errorMessage = null)
+                // 结构相等时 MutableStateFlow 不发射，所以"已有数据 + 无错误"这条路径零重组。
+                else s.copy(errorMessage = null)
+            }
+            try {
+                val result = api.getTrafficUsage(range, anchor)
+                // 刻意用**请求时的** key（而不是回包里的 range）：万一 core 回错了段，
+                // 按回包存会让当前段永远是空的、每次进页面都白拉一遍。
+                _trafficHistoryState.value = _trafficHistoryState.value.let { s ->
+                    s.copy(
+                        dataByKey = s.dataByKey + (key to result),
+                        // 只有"当前还停在发起时那一段"才收 loading。否则用户已经翻走了，
+                        // 这里收 loading 会把新段的骨架屏提前抹掉。
+                        isLoading = if (s.key == key) false else s.isLoading
+                    )
+                }
+                // 只在成功落地后记新鲜度基准，失败不记（否则一次失败会把后续重拉全跳过）
+                trafficHistorySuccessElapsed[key] = SystemClock.elapsedRealtime()
+            } catch (e: Exception) {
+                // 同理：上一段的失败不该显示在用户已经翻到的这一段上，也不该抹掉它的骨架。
+                if (_trafficHistoryState.value.key == key) {
+                    _trafficHistoryState.value = _trafficHistoryState.value.copy(
+                        isLoading = false,
+                        errorMessage = "加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun clearTrafficHistoryError() {
+        _trafficHistoryState.value = _trafficHistoryState.value.copy(errorMessage = null)
+    }
+
+    /**
+     * 预热**其余三个区间**的当前段（2026-09-16）。
+     *
+     * 为什么要预热：四个区间各存一份数据（[trafficHistorySuccessElapsed] 的注释解释了为什么
+     * 不能共用一个新鲜度戳），于是"没打开过的区间"第一次切过去时 `data == null` ——
+     * 界面会先掉成"—" + 空图，等接口回来再填一次，用户看到的是**两跳**而不是一次滚动。
+     * 打开弹窗时顺手把另外三个拉回来，切过去就是现成的。
+     *
+     * 三条刻意的约束：
+     * - **只预热 anchor = null 的当前段**。翻页的历史段是无穷多的，预热它们没有边界。
+     * - **走闸门、串行发**（`force = false`）：新鲜窗口内反复开关弹窗不会重复请求；
+     *   串行是为了不和用户正在等的那一个请求抢连接（core 侧是 DB 聚合查询）。
+     * - **不碰 `isLoading` / `errorMessage`**：预热失败就当没发生，绝不能让后台请求
+     *   在用户面前弹出错误条。所以这里没有 try 之外的任何状态写入。
+     */
+    fun prefetchTrafficHistory() {
+        val current = _trafficHistoryState.value.range
+        val now = SystemClock.elapsedRealtime()
+        val targets = TRAFFIC_HISTORY_RANGES.map { it.first }.filter { it != current }
+        scope.launch {
+            for (range in targets) {
+                val key = TrafficHistoryState.cacheKeyOf(range, null)
+                val state = _trafficHistoryState.value
+                if (state.dataByKey[key] != null &&
+                    isForegroundDataFresh(trafficHistorySuccessElapsed[key] ?: 0L, now)
+                ) {
+                    continue
+                }
+                try {
+                    val result = api.getTrafficUsage(range, null)
+                    _trafficHistoryState.value = _trafficHistoryState.value.let { s ->
+                        s.copy(dataByKey = s.dataByKey + (key to result))
+                    }
+                    trafficHistorySuccessElapsed[key] = SystemClock.elapsedRealtime()
+                } catch (e: Exception) {
+                    // 预热失败静默：用户没在等这一份，切过去时会再拉一次（那次才报错）
+                }
+            }
+        }
     }
 
     // ── Config Sync ──

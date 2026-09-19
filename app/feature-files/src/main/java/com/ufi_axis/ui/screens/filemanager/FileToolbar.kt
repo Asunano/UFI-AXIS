@@ -1,32 +1,13 @@
 package com.ufi_axis.ui.screens.filemanager
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.automirrored.filled.Sort
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -34,14 +15,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.IntRect
-import androidx.compose.ui.unit.dp
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.components.common.UfiListToolbar
 import com.ufi_axis.ui.components.common.UfiPopupMenu
 import com.ufi_axis.ui.components.common.UfiPopupOption
+import com.ufi_axis.ui.components.common.UfiSortAction
 import com.ufi_axis.ui.components.common.UfiToolbarAction
+import com.ufi_axis.ui.components.common.UfiViewModeAction
 import com.ufi_axis.ui.theme.LocalResolvedPalette
-import androidx.compose.material.icons.automirrored.filled.ViewList
-import androidx.compose.material.icons.filled.ViewModule
 import com.ufi_axis.viewmodel.state.FileViewMode
 
 /**
@@ -51,7 +32,11 @@ import com.ufi_axis.viewmodel.state.FileViewMode
  * 图标着色为 [com.ufi_axis.ui.theme.LocalResolvedPalette.textSecondary]，
  * 并均设置 contentDescription 以保证无障碍。
  *
- * 底部用一条细 [com.ufi_axis.ui.theme.LocalResolvedPalette.divider] 分隔线收口。
+ * 2026-09-16：外壳（48dp 行高、右对齐动作、底部 1dp 分隔线）与「视图 / 排序」两颗按钮
+ * 转发公共层（[UfiListToolbar] / [UfiViewModeAction] / [UfiSortAction]）——媒体库拆页后
+ * 也要同一条工具条，形状与图标语义只该有一份。本文件保留的是**文件管理器专属**的部分：
+ * 返回上一级、粘贴板、更多菜单。
+ *
  * 组件完全无状态：所有行为通过回调上抛。
  *
  * @param viewMode 当前视图模式（列表/网格）
@@ -84,88 +69,63 @@ fun FileToolbar(
     var moreExpanded by remember { mutableStateOf(false) }
     var moreAnchorBounds by remember { mutableStateOf(IntRect.Zero) }
 
-    // 核心操作工具栏：与 BreadcrumbBar 分离，避免多重路径导致布局异常。
-    // 每个操作以「图标 + 文字标签」垂直排列，提升可识别性。
-    Box(modifier = modifier.fillMaxWidth().height(48.dp)) {
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // 返回上一级（非根目录显示）
-            if (canBack) {
+    UfiListToolbar(
+        modifier = modifier,
+        leading = if (!canBack) {
+            null
+        } else {
+            {
                 UfiToolbarAction(
                     icon = Icons.AutoMirrored.Filled.ArrowBack,
                     label = "返回",
                     onClick = onBack
                 )
             }
+        }
+    ) {
+        // 高频操作：视图切换 / 排序 / 搜索（常驻）
+        UfiViewModeAction(grid = viewMode == FileViewMode.GRID, onToggle = onToggleViewMode)
+        UfiSortAction(onClick = onSort)
+        UfiToolbarAction(
+            icon = Icons.Filled.Search,
+            label = "搜索",
+            onClick = onSearch
+        )
 
-            // 左侧占位，把操作按钮整体推到右侧。
-            Box(modifier = Modifier.weight(1f))
-
-            // 高频操作：视图切换 / 排序 / 搜索（常驻）
+        // 粘贴：仅在剪贴板存在时显示，直接暴露为工具栏按钮。
+        if (canPaste) {
             UfiToolbarAction(
-                icon = if (viewMode == FileViewMode.GRID) Icons.AutoMirrored.Filled.ViewList else Icons.Filled.ViewModule,
-                label = "视图",
-                onClick = onToggleViewMode
+                icon = Icons.Filled.ContentPaste,
+                label = "粘贴",
+                onClick = onPaste,
+                tint = palette.accent
             )
-            UfiToolbarAction(
-                icon = Icons.AutoMirrored.Filled.Sort,
-                label = "排序",
-                onClick = onSort
-            )
-            UfiToolbarAction(
-                icon = Icons.Filled.Search,
-                label = "搜索",
-                onClick = onSearch
-            )
-
-            // 粘贴：仅在剪贴板存在时显示，直接暴露为工具栏按钮。
-            if (canPaste) {
-                UfiToolbarAction(
-                    icon = Icons.Filled.ContentPaste,
-                    label = "粘贴",
-                    onClick = onPaste,
-                    tint = palette.accent
-                )
-            }
-
-            // 更多：低频操作（多选/新建/上传/刷新/存储权限）收入浮出菜单。
-            Box(
-                modifier = Modifier.onGloballyPositioned { coords ->
-                    val r = coords.boundsInWindow()
-                    moreAnchorBounds = IntRect(
-                        r.left.roundToInt(),
-                        r.top.roundToInt(),
-                        r.right.roundToInt(),
-                        r.bottom.roundToInt()
-                    )
-                }
-            ) {
-                UfiToolbarAction(
-                    icon = Icons.Filled.MoreVert,
-                    label = "更多",
-                    onClick = { moreExpanded = !moreExpanded }
-                )
-                UfiPopupMenu(
-                    visible = moreExpanded,
-                    onDismiss = { moreExpanded = false },
-                    anchorBounds = moreAnchorBounds,
-                    options = moreMenuOptions
-                )
-            }
         }
 
-        // 细底部分隔线收口。
+        // 更多：低频操作（多选/新建/上传/刷新/存储权限）收入浮出菜单。
         Box(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .height(1.dp)
-                .background(palette.divider)
-        )
+            modifier = Modifier.onGloballyPositioned { coords ->
+                val r = coords.boundsInWindow()
+                moreAnchorBounds = IntRect(
+                    r.left.roundToInt(),
+                    r.top.roundToInt(),
+                    r.right.roundToInt(),
+                    r.bottom.roundToInt()
+                )
+            }
+        ) {
+            UfiToolbarAction(
+                icon = Icons.Filled.MoreVert,
+                label = "更多",
+                onClick = { moreExpanded = !moreExpanded }
+            )
+            UfiPopupMenu(
+                visible = moreExpanded,
+                onDismiss = { moreExpanded = false },
+                anchorBounds = moreAnchorBounds,
+                options = moreMenuOptions
+            )
+        }
     }
 }
 

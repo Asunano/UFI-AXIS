@@ -75,7 +75,18 @@ class HttpServer(
     /** 终端命令历史（AT / Shell 两端共享），可空只为兼容尚未装配它的调用方。 */
     private val consoleRoutes: com.ufi_axis_core.api.routes.ConsoleRoutes? = null,
     /** 配置备份导出 / 恢复，可空同上。 */
-    private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null
+    private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null,
+    /**
+     * 媒体中心（`/api/media` 下的一组端点，2026-09-16）：查系统媒体库 + 缩略图 + 扫描目录配置。
+     * 可空只为兼容尚未装配它的调用方；播放字节流仍由 [fileRoutes] 的 `/api/files/stream` 提供。
+     */
+    private val mediaRoutes: com.ufi_axis_core.api.routes.MediaRoutes? = null,
+    /** 天气（`/api/weather`，2026-09-17）：代理 Open-Meteo + TTL 缓存。可空同上。 */
+    private val weatherRoutes: com.ufi_axis_core.api.routes.WeatherRoutes? = null,
+    /** 今日诗词（`/api/poetry`，2026-09-18）：代理 jinrishici v2 + TTL 缓存。可空同上。 */
+    private val poetryRoutes: com.ufi_axis_core.api.routes.PoetryRoutes? = null,
+    /** 出网国家/地区（`/api/geo`，2026-09-18）：结果存 settings，检测由 core 启动时触发。可空同上。 */
+    private val geoRoutes: com.ufi_axis_core.api.routes.GeoRoutes? = null
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB（普通路由：防滥用 + 内存安全）
@@ -555,6 +566,7 @@ class HttpServer(
                 consoleRoutes?.register(this)
                 backupRoutes?.register(this)
                 fileRoutes.register(this)
+                mediaRoutes?.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)
                 smsForwardRoutes?.register(this)
@@ -570,12 +582,22 @@ class HttpServer(
                 serviceRoutes?.register(this)
                 tunnelRoutes?.register(this)
                 componentRoutes?.register(this)
+                weatherRoutes?.register(this)
+                poetryRoutes?.register(this)
+                geoRoutes?.register(this)
                 webUpdateRoutes.register(this)
             }
 
             webSocket("/ws/realtime") {
                 webSocketManager.handleConnection(this)
             }
+
+            // 凭票流式播放（2026-09-14）：刻意挂在 `/api` **之外**。
+            // 浏览器的 <audio src> / <video src> 无法附加鉴权头，拿不到 /api/files/stream；
+            // 而把「带 ticket 就放行」做成 AuthMiddleware 的例外会给唯一鉴权闸门开口子。
+            // 票据由 POST /api/files/stream-ticket 签发（走正常头部鉴权），
+            // 只授权那一个已通过路径校验的文件，滑动过期 10 分钟。见 FileRoutes.registerPublic。
+            fileRoutes.registerPublic(this)
         }
     }
 }

@@ -78,8 +78,14 @@
               />
             </div>
 
-            <!-- Right panel: conversation -->
-            <div class="conversation-panel" :class="{ visible: selectedPhone || isMobile }">
+            <!-- Right panel: conversation
+
+                 `visible` 只在 ≤768px 生效（基础样式里对话面板本来就是 display:flex，
+                 只有移动端那段把它设成 none）。所以判据就是「选了联系人」——
+                 2026-09-19 修：原来写的是 `selectedPhone || isMobile`，移动端未选联系人时
+                 它恒为真 ⇒ 对话面板显示，而联系人面板的 `hidden`（要求 selectedPhone && isMobile）
+                 又不成立 ⇒ 两块同时出现在同一个 flex 行里，100% + flex:1 直接把页面撑出横向滚动。 -->
+            <div class="conversation-panel" :class="{ visible: selectedPhone }">
               <template v-if="selectedPhone">
                 <!-- Conversation header -->
                 <div class="conv-header">
@@ -293,6 +299,7 @@ import { useInterval } from '@/composables/useRealtime';
 import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useLazyModal } from '@/composables/useLazyModal';
+import { useIsMobile } from '@/composables/useIsMobile';
 import { copyToClipboard } from '@/composables/utils';
 import {
   Endpoints,
@@ -343,7 +350,7 @@ const conversationCount = ref(0);
 const showNewSms = ref(false);
 const newPhone = ref('');
 const newSmsContent = ref('');
-const isMobile = ref(false);
+const isMobile = useIsMobile();
 const scrollbarRef = ref<any>(null);
 
 // 已发送但后端尚未确认的乐观消息（发送后即时显示，避免界面不刷新）
@@ -1007,7 +1014,7 @@ function scrollToBottom() {
 }
 
 function checkMobile() {
-  isMobile.value = window.innerWidth <= 768;
+  // isMobile 已改由 useIsMobile() composable 驱动，不再需要手动同步
 }
 
 // ── Lifecycle ──
@@ -1053,12 +1060,15 @@ onUnmounted(() => {
   margin-top: 4px;
 }
 
-/* tab 头 + pane 内边距约占 50px，主体高度相应下调，避免整页出现滚动条 */
+/* tab 头 + pane 内边距约占 50px，主体高度相应下调，避免整页出现滚动条。
+   dvh 跟随移动端浏览器地址栏伸缩（Safari/Chrome 的 100vh 解析为大视口，
+   内容会比可视区高出地址栏那一截）。vh 是不支持 dvh 的旧浏览器回落。 */
 .sms-body,
 .codes-body,
 .blocked-body {
   display: flex;
   height: calc(100vh - 250px);
+  height: calc(100dvh - 250px);
   min-height: 360px;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
@@ -1295,10 +1305,7 @@ onUnmounted(() => {
 
 .msg-row.outgoing .msg-bubble {
   background: var(--accent-color);
-  /* 强调实底上的前景色。web 侧还没有 `--on-accent` 这类令牌，
-     所以浅 accent 皮肤下这里的白字会偏淡 —— 与 Android 侧「语义实底 + 白前景」
-     那个待决策项是同一件事，等那边定了口径再一起补令牌。 */
-  color: #fff;
+  color: var(--on-accent);
   border-bottom-right-radius: 4px;
 }
 
@@ -1516,6 +1523,7 @@ onUnmounted(() => {
   .codes-body,
   .blocked-body {
     height: calc(100vh - 230px);
+    height: calc(100dvh - 230px);
     min-height: 300px;
   }
 

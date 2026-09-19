@@ -95,6 +95,10 @@ fun LocalSmsNotifyScreen(viewModel: MainViewModel, navController: NavHostControl
     LaunchedEffect(Unit) {
         viewModel.tools.loadLocalSmsConfig()
         viewModel.tools.loadDeliveryHistory(DELIVERY_CHANNEL_LOCAL_SMS)
+        viewModel.tools.loadDeliveryStats(DELIVERY_CHANNEL_LOCAL_SMS)
+    }
+    rememberResumeRefresh {
+        viewModel.tools.loadDeliveryStats(DELIVERY_CHANNEL_LOCAL_SMS)
     }
 
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
@@ -130,6 +134,56 @@ fun LocalSmsNotifyScreen(viewModel: MainViewModel, navController: NavHostControl
     UfiScreenScaffold(title = "本机短信通知", navController = navController, showBack = true) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             state.errorMessage?.let { err -> UfiErrorBanner(message = err) }
+
+            run {
+                val st = toolsState.deliveryStats
+                val ready = toolsState.deliveryStatsLoaded &&
+                    toolsState.deliveryStatsChannel == DELIVERY_CHANNEL_LOCAL_SMS
+                val smsCfg = state.config
+                val canTest = smsCfg?.enabled == true && smsCfg.configured && !state.testing
+                ChannelDeliveryStatsCard(
+                    total = st?.total,
+                    mid = st?.failed,
+                    failed = st?.skipped,
+                    lastSuccessTs = st?.lastSentAt,
+                    totalLabel = "总投递",
+                    midLabel = "投递失败",
+                    failedLabel = "已拦截",
+                    loaded = ready,
+                    testRow = {
+                        UfiSettingsItem(
+                            title = "发送测试短信",
+                            description = when {
+                                smsCfg == null || !smsCfg.enabled -> "需先启用本机短信通知"
+                                !smsCfg.configured -> "需先填写合法的目标号码"
+                                smsCfg.quota_remaining?.let { it <= 0 } == true ->
+                                    "今日配额已用尽，暂时无法发送测试短信"
+                                else -> "将发送一条真实短信，产生短信费用并占用一条今日配额"
+                            },
+                            enabled = canTest,
+                            // 真发短信：必须先确认（pendingTest → UfiConfirmDialog），不能一键烧钱
+                            modifier = Modifier.clickable(enabled = canTest) { pendingTest = true },
+                            trailing = {
+                                Text(
+                                    text = if (state.testing) "发送中…" else "点击试发",
+                                    style = UfiTextStyles.label,
+                                    color = if (canTest) palette.accent else palette.textSecondary
+                                )
+                            }
+                        )
+                    }
+                )
+                state.lastTest?.let { result ->
+                    UfiSettingsRowCard {
+                        UfiSettingsValue(
+                            title = "最近测试结果",
+                            description = summarizeLocalSmsTestOutcome(result),
+                            value = verdictLabel(result),
+                            onClick = { dialog = LocalSmsDialog.TestResult }
+                        )
+                    }
+                }
+            }
 
             val cfg = state.config
             if (cfg == null) {
@@ -235,43 +289,7 @@ fun LocalSmsNotifyScreen(viewModel: MainViewModel, navController: NavHostControl
                 )
             }
 
-            // ── ⑧ 发送测试 + 最近结果 ──
-            UfiSettingsGroup {
-                UfiSectionHeader(title = "测试")
-                // 只看本行自己的请求在飞，不看别人的 loading（邮件页踩过的坑）。
-                // 未启用时不给点：core 的 /test 在 `!enabled` 时直接回错。
-                val canTest = cfg.enabled && cfg.configured && !state.testing
-                UfiSettingsItem(
-                    title = "发送测试短信",
-                    description = when {
-                        !cfg.enabled -> "需先启用本机短信通知"
-                        !cfg.configured -> "需先填写合法的目标号码"
-                        // quota_remaining 现在是 Int?（null = 不限）。本渠道的 daily_limit_min
-                        // 是 1，拿不到 null；仍然显式判空，别让"不限"被当成"用尽"。
-                        cfg.quota_remaining?.let { it <= 0 } == true ->
-                            "今日配额已用尽，暂时无法发送测试短信"
-                        else -> "将发送一条真实短信，产生短信费用并占用一条今日配额"
-                    },
-                    enabled = canTest,
-                    modifier = Modifier.clickable(enabled = canTest) { pendingTest = true },
-                    trailing = {
-                        Text(
-                            text = if (state.testing) "发送中…" else "点击试发",
-                            style = UfiTextStyles.label,
-                            color = if (canTest) palette.accent else palette.textSecondary
-                        )
-                    }
-                )
-                state.lastTest?.let { result ->
-                    UfiDivider()
-                    UfiSettingsValue(
-                        title = "最近测试结果",
-                        description = summarizeLocalSmsTestOutcome(result),
-                        value = verdictLabel(result),
-                        onClick = { dialog = LocalSmsDialog.TestResult }
-                    )
-                }
-            }
+            // 测试入口已并入顶部「发送统计」卡（与邮件页同构）；最近结果单独一行。
 
             // ── ⑨ 最近投递。位置与另两条渠道页一致（测试之后、页尾之前）：
             //    先给"能不能发出"，再给"实际发了几条"。花钱的渠道，这一行还兼作对账入口 ──
@@ -400,14 +418,18 @@ private fun TargetNumberDialog(
         onDismiss = onDismiss,
         title = "目标号码",
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose；必须在 slot 内部读才能拿到 shell 注入的实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "保存",
                 enabled = error == null && !saving,
-                onClick = { onSave(trimmed) }
+                onClick = { close { onSave(trimmed) } }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {

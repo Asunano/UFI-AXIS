@@ -32,6 +32,37 @@ class SystemController(
     }
 
     /**
+     * 关机
+     * 优先 Goform，失败后 fallback 到 `svc power shutdown`（通过 ADB shell）。
+     *
+     * 为什么用 `svc power shutdown` 而不是 `reboot -p`：
+     * `svc power` 走的是 PowerManager（ADB shell 的 uid 2000 有权限），
+     * 而 `reboot -p` 需要真正的 root，本项目已不依赖 su（见 ShellExecutor.executeAsRoot 注释）。
+     *
+     * 兜底命中与否都打日志：goform 侧失败会塌缩成 false（超时 / 会话失效 / 设备回登录页
+     * 都是同一个 false），没有日志就分不清"设备没收到指令"和"收到了但没关"。
+     */
+    suspend fun shutdown(): Boolean {
+        AppLogger.i(tag, "Shutting down device")
+
+        // 方式1: Goform
+        if (deviceClient.shutdownDevice()) {
+            AppLogger.i(tag, "Shutdown issued via goform")
+            return true
+        }
+        AppLogger.w(tag, "Goform shutdown failed, falling back to shell")
+
+        // 方式2: svc power shutdown (via ADB shell)
+        val result = ShellExecutor.executeAsRoot("svc power shutdown")
+        if (result.isSuccess) {
+            AppLogger.i(tag, "Shutdown issued via svc power")
+        } else {
+            AppLogger.e(tag, "Shutdown failed: exit=${result.exitCode} err=${result.stderr.take(200)}")
+        }
+        return result.isSuccess
+    }
+
+    /**
      * 获取设备型号信息
      */
     suspend fun getDeviceModel(): Map<String, String> {

@@ -4,11 +4,13 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.media.MediaTicketStore
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.MimeTypes
 
 import io.ktor.http.*
 import io.ktor.http.content.*
+import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.request.*
 import io.ktor.server.response.*
@@ -124,7 +126,58 @@ class FileRoutes {
                 else -> null
             }
         }
+
+        /**
+         * 凭票流式播放的**公开**路径（不在 `/api` 下，见 [registerPublic]）。
+         *
+         * 刻意放在 `/api` 之外：若把「带 ticket 就放行」做成 `AuthMiddleware` 的例外，
+         * 那道唯一鉴权闸门就开了口子，将来任何人加一个 `/api` 端点都得先想清楚会不会被这条例外命中。
+         * 独立路径 + `isPublic` 白名单只加 `/media/`，边界一眼可见。
+         */
+        const val MEDIA_STREAM_PATH = "/media/stream"
+
+        /**
+         * 流式传输缓冲区。
+         *
+         * 2026-09-14 由 8KB 提到 64KB：1080p 视频约 5-15 Mbps，8KB 意味着每秒上千次
+         * read/write syscall，而 core 常跑在随身 WiFi 这类弱设备上，CPU 全花在系统调用上。
+         * 64KB 是「一次 syscall 搬更多字节」与「不为小文件白占内存」之间的常规折中。
+         */
+        private const val STREAM_BUFFER_SIZE = 64 * 1024
     }
+
+    /**
+     * 播放票据存储。
+     *
+     * 挂在实例上而不是 companion：`HttpServer` 全程复用同一个 [FileRoutes] 对象，
+     * [register]（签发）与 [registerPublic]（校验）因此共享同一份票据表；
+     * 放 companion 会让"多实例时票据串台"变成一个只在测试里才暴露的隐患。
+     */
+    private val mediaTicketStore = MediaTicketStore()
+
+    /**
+     * 注册**免鉴权**的凭票流式端点。必须由 `HttpServer` 挂在 `/api` **之外**的顶层 routing 上。
+     *
+     * 安全边界只有一条：票据里存的是签发时**已通过 `safeResolveForRead` 的真实路径**，
+     * 这里不接受、也不解析任何用户给的 path —— 所以本端点没有路径穿越面。
+     */
+    fun registerPublic(route: Route) {
+        route.get(MEDIA_STREAM_PATH) {
+            val realPath = mediaTicketStore.resolve(call.request.queryParameters["ticket"]) ?: run {
+                // 票据无效/过期一律 403 而不是 401：这里没有"补个头重试"的语义，
+                // 客户端该做的是回去重新换票。
+                call.respondFail(HttpStatusCode.Forbidden, ErrorCode.UNAUTHORIZED, "票据无效或已过期")
+                return@get
+            }
+            val f = File(realPath)
+            if (!f.isFile) {
+                call.respondFail(HttpStatusCode.NotFound, ErrorCode.NOT_FOUND, "文件不存在")
+                return@get
+            }
+            call.respondFileStream(f)
+        }
+    }
+
 
     fun register(route: Route) {
         route.route("/files") {
@@ -471,66 +524,46 @@ class FileRoutes {
                     call.respondFail(HttpStatusCode.NotFound, ErrorCode.NOT_FOUND, "文件不存在")
                     return@get
                 }
-                val fileName = f.name
-                val mimeType = MimeTypes.fromFileName(fileName)
-                val fileSize = f.length()
-                val rangeHeader = call.request.header(HttpHeaders.Range)
-
-                if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
-                    val firstRange = rangeHeader.removePrefix("bytes=").split(",")[0].trim()
-                    val parts = firstRange.split("-")
-                    val isSuffix = parts[0].isBlank()
-                    val start = if (isSuffix) {
-                        // bytes=-500 → 取末尾 500 字节
-                        val suffix = parts.getOrNull(1)?.toLongOrNull() ?: 0L
-                        (fileSize - suffix).coerceAtLeast(0L)
-                    } else {
-                        parts[0].toLongOrNull() ?: 0L
-                    }
-                    val end = if (isSuffix) fileSize - 1 else (parts.getOrNull(1)?.toLongOrNull() ?: (fileSize - 1))
-                    val safeEnd = minOf(end, fileSize - 1)
-                    if (start < 0 || start > safeEnd) {
-                        call.respondFail(HttpStatusCode.RequestedRangeNotSatisfiable,
-                            ErrorCode.BAD_REQUEST, "range not satisfiable")
-                        return@get
-                    }
-                    val contentLength = safeEnd - start + 1
-                    call.response.header(HttpHeaders.AcceptRanges, "bytes")
-                    call.response.header(HttpHeaders.ContentRange, "bytes $start-$safeEnd/$fileSize")
-                    call.response.header(HttpHeaders.ContentLength, contentLength.toString())
-                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
-                    call.respondOutputStream(ContentType.parse(mimeType), HttpStatusCode.PartialContent) {
-                        withContext(Dispatchers.IO) {
-                            f.inputStream().use { input ->
-                                // InputStream.skip 不保证一次跳过全部字节，必须循环补齐
-                                var skipped = 0L
-                                while (skipped < start) {
-                                    val n = input.skip(start - skipped)
-                                    if (n <= 0L) break
-                                    skipped += n
-                                }
-                                if (skipped < start) return@withContext
-                                val buffer = ByteArray(8192)
-                                var remaining = contentLength
-                                while (remaining > 0) {
-                                    val toRead = minOf(buffer.size.toLong(), remaining).toInt()
-                                    val read = input.read(buffer, 0, toRead)
-                                    if (read <= 0) break
-                                    write(buffer, 0, read)
-                                    remaining -= read
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    call.response.header(HttpHeaders.AcceptRanges, "bytes")
-                    call.response.header(HttpHeaders.ContentLength, fileSize.toString())
-                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
-                    call.respondOutputStream(ContentType.parse(mimeType)) {
-                        withContext(Dispatchers.IO) { f.inputStream().use { it.copyTo(this@respondOutputStream) } }
-                    }
-                }
+                call.respondFileStream(f)
             }
+
+            /**
+             * 签发媒体流播放票据（2026-09-14）。
+             *
+             * 只给 **web 端**用：浏览器的 `<audio src>` / `<video src>` 无法附加鉴权头，
+             * 拿不到 `/api/files/stream`，此前只能 `fetch` 整个文件成 blob 再播
+             * （100MB 上限 + 必须下载完 + 电影进不了预览）。本端点走正常头部鉴权换一张短时票据，
+             * 之后浏览器用 `/media/stream?ticket=…` 直接流式播放，Range 与 seek 全由浏览器负责。
+             *
+             * app 端**不需要**它：ExoPlayer 走 OkHttp，能带头，继续用 `/api/files/stream`。
+             *
+             * 票据语义见 [MediaTicketStore]：可重复使用（否则第二个 Range 请求就断）、
+             * 滑动过期、只授权这一个文件。
+             */
+            post("/stream-ticket") {
+                val body = call.receiveJsonObject()
+                val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                // 校验必须在签发前跑完：票据只存解析后的真实路径，`/media/stream` 不再解析用户输入
+                val realPath = safeResolveForRead(filePath) ?: run {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
+                    return@post
+                }
+                val f = File(realPath)
+                if (!f.isFile) {
+                    call.respondFail(HttpStatusCode.NotFound, ErrorCode.NOT_FOUND, "文件不存在")
+                    return@post
+                }
+                val ticket = mediaTicketStore.issue(realPath)
+                call.respond(toJsonElement(mapOf(
+                    "ticket" to ticket,
+                    // 直接把可用 URL 给出去，省得客户端各自拼（拼错一次就是"能放不能 seek"这类怪问题）
+                    "url" to "$MEDIA_STREAM_PATH?ticket=${URLEncoder.encode(ticket, "UTF-8")}",
+                    "expires_in" to mediaTicketStore.ttlSeconds,
+                    "size" to f.length(),
+                    "mime" to MimeTypes.fromFileName(f.name)
+                )))
+            }
+
 
             post("/upload") {
                 try {
@@ -743,6 +776,85 @@ class FileRoutes {
     }
 
     // ───────────────────────── 内部工具 ─────────────────────────
+
+    /**
+     * Range 流式响应 —— `/api/files/stream`（头部鉴权，app 端）与 [MEDIA_STREAM_PATH]
+     * （票据鉴权，web 端）**共用同一份实现**。
+     *
+     * 抽出来的理由很实际：两个入口的鉴权方式不同，但「怎么把字节吐出去」必须逐字节一致。
+     * 各写一份的话，将来只在其中一处修 Range 边界或缓冲，就会出现「app 能 seek、web 不能」
+     * 这类只在一端复现的问题。
+     *
+     * 语义：
+     * - 带 `Range: bytes=…` → 206 + `Content-Range` + `Accept-Ranges`（支持 `bytes=-500` 后缀式）；
+     * - 不带 → 200 全量，但仍声明 `Accept-Ranges: bytes`，让播放器知道可以 seek；
+     * - `Content-Disposition: inline` —— 不能是 attachment，否则浏览器会当下载处理。
+     */
+    private suspend fun ApplicationCall.respondFileStream(f: File) {
+        val fileName = f.name
+        val mimeType = MimeTypes.fromFileName(fileName)
+        val fileSize = f.length()
+        val rangeHeader = request.header(HttpHeaders.Range)
+
+        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+            val firstRange = rangeHeader.removePrefix("bytes=").split(",")[0].trim()
+            val parts = firstRange.split("-")
+            val isSuffix = parts[0].isBlank()
+            val start = if (isSuffix) {
+                // bytes=-500 → 取末尾 500 字节
+                val suffix = parts.getOrNull(1)?.toLongOrNull() ?: 0L
+                (fileSize - suffix).coerceAtLeast(0L)
+            } else {
+                parts[0].toLongOrNull() ?: 0L
+            }
+            val end = if (isSuffix) fileSize - 1 else (parts.getOrNull(1)?.toLongOrNull() ?: (fileSize - 1))
+            val safeEnd = minOf(end, fileSize - 1)
+            if (start < 0 || start > safeEnd) {
+                respondFail(
+                    HttpStatusCode.RequestedRangeNotSatisfiable,
+                    ErrorCode.BAD_REQUEST, "range not satisfiable"
+                )
+                return
+            }
+            val contentLength = safeEnd - start + 1
+            response.header(HttpHeaders.AcceptRanges, "bytes")
+            response.header(HttpHeaders.ContentRange, "bytes $start-$safeEnd/$fileSize")
+            response.header(HttpHeaders.ContentLength, contentLength.toString())
+            response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
+            respondOutputStream(ContentType.parse(mimeType), HttpStatusCode.PartialContent) {
+                withContext(Dispatchers.IO) {
+                    f.inputStream().use { input ->
+                        // InputStream.skip 不保证一次跳过全部字节，必须循环补齐
+                        var skipped = 0L
+                        while (skipped < start) {
+                            val n = input.skip(start - skipped)
+                            if (n <= 0L) break
+                            skipped += n
+                        }
+                        if (skipped < start) return@withContext
+                        val buffer = ByteArray(STREAM_BUFFER_SIZE)
+                        var remaining = contentLength
+                        while (remaining > 0) {
+                            val toRead = minOf(buffer.size.toLong(), remaining).toInt()
+                            val read = input.read(buffer, 0, toRead)
+                            if (read <= 0) break
+                            write(buffer, 0, read)
+                            remaining -= read
+                        }
+                    }
+                }
+            }
+        } else {
+            response.header(HttpHeaders.AcceptRanges, "bytes")
+            response.header(HttpHeaders.ContentLength, fileSize.toString())
+            response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", fileName))
+            respondOutputStream(ContentType.parse(mimeType)) {
+                withContext(Dispatchers.IO) {
+                    f.inputStream().use { it.copyTo(this@respondOutputStream, STREAM_BUFFER_SIZE) }
+                }
+            }
+        }
+    }
 
     /** 解析并校验路径：仅允许内部存储与 SD 卡，拒绝任何系统目录。 */
     /**

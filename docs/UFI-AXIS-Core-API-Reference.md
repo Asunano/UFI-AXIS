@@ -26,6 +26,10 @@
 - [AT 命令 /api/at](#at-命令-apiat)
 - [告警管理 /api/alerts](#告警管理-apialerts)
 - [通知配置 /api/notifications](#通知配置-apinotifications)
+- [媒体中心 /api/media](#媒体中心-apimedia)
+- [天气 /api/weather](#天气-apiweather)
+- [今日诗词 /api/poetry](#今日诗词-apipoetry)
+- [地理位置 /api/geo](#地理位置-apigeo)
 - [WiFi 控制 /api/wifi](#wifi-控制-apiwifi)
 - [短信管理 /api/sms](#短信管理-apisms)
 - [文件管理 /api/files](#文件管理-apifiles)
@@ -1248,8 +1252,8 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 | `restart_schedule_switch`  | 定时重启开关，`"1"` = 开                                       |
 | `restart_time`             | 定时重启时间，`"HH:mm"`                                       |
 | `sleep_sysIdleTimeToSleep` | WiFi 休眠空闲分钟数，`"0"` = 不休眠                               |
-| `BearerPreference`         | 网络模式（承载偏好），设备侧枚举串                                      |
-| `net_select`               | 老固件的网络模式字段，`BearerPreference` 缺失时的回退                   |
+| `BearerPreference`         | 网络模式（承载偏好）的**写入侧**字段，设备侧枚举串；回读可能为空或停留在未应用的值            |
+| `net_select`               | 网络模式的**回读真源**（真机切换后变化的是它）；缺失时才回落 `BearerPreference`      |
 | `connection_mode`          | 连接模式，`"auto"` / `"manual"`；部分固件填 `"1"` / `"hand"` 表示手动 |
 | `roam_setting_option`      | 数据漫游，`"1"` 或 `"on"` = 开                                |
 | `dial_roam_setting_option` | 拨号漫游，`roam_setting_option` 的同义字段（部分固件只填这个）             |
@@ -1746,9 +1750,13 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 | `operator`     | 设备侧 provider，为空时退回 Android `getOperatorName()`                                                                        |
 | `network_type` | **已经是可读文案**（`"5G"` / `"4G"`…），设备数字码在 core 的 profile 解码器里翻译完了                                                          |
 
-> 客户端**不要再做一次数字码→文案的映射**：core 侧 `NETWORK_TYPE_DECODER` 已经翻译过，  
-> 原来两端各有一份 `mapNetworkType()` 已删。参考对应关系（仅供排查设备原始响应用）：  
-> `20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G。
+> 客户端**不要再做一次数字码→文案的映射**：core 侧 `NETWORK_TYPE_DECODER` 已经翻译过，
+> 原来两端各有一份 `mapNetworkType()` 已删。
+> 状态类命令直接回文本（真机 2026-09-15：`cmd=network_type,...` 回 `"5G"`），非数字**原样透出**；
+> 纯数字才查表，表里只有**已验证**的对应关系：`20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G、`0`→无服务。
+> 没验证过的数字码一律输出 `未知(原值)` —— 补表前先真机对照一次。
+> （2026-09-15 前那张 44 项表是多套厂商编码拼的，把 `13` 译成 `TDSCDMA`，4G/5G 驻网时两端界面
+> 都显示 TDSCDMA。别再凭猜往表里加。）
 
 #### `GET /api/network/band-status`
 
@@ -1882,7 +1890,12 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 
 #### `POST /api/network/mode`
 
-设置网络模式。失效 `network:band-status` 缓存。
+设置网络模式。写成功后失效三个读缓存：`device:settings`、`network:band-status`、`hub:network-type-info`。
+
+> **2026-09-15 修**：原来只失效 `network:band-status`，而客户端确认切换是否生效读的是
+> `GET /api/device/settings`（TTL 5 分钟）与 `GET /api/network/status`（TTL 30 秒）。
+> 两者不清，回读在整个预算窗口内拿到的都是**写入前的快照**，于是「设备其实切完了，界面仍报
+> 未完成切换」。改缓存策略时**三个 key 一起清**，少一个就会复现。
 
 **请求体：**
 
@@ -1910,6 +1923,13 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 
 - `mode` 回显入参；`bearer` 是实际下发给设备的值（T15 新增），客户端可据此确认映射结果。
 - 定时任务 / 自动化规则的 `network_mode` 动作走同一套映射（`ActionExecutorImpl`），参数同样填**别名**。
+
+**返回成功 ≠ 已切换完成。** 只代表固件收下了命令：设备要重新注册网络，真机上要十几到二十几秒。
+客户端应按 contract 的回读预算确认（Kotlin `NetworkMode.SwitchProbe` / web `NetworkModeSwitchProbe`
+是同一套节奏）：首次等 600ms，前 5 次间隔 1.5s、之后 3s，共 13 次 ≈ **30.6s**；到顶还没读到目标
+档位就报「尚未完成切换」，不要静默停在旧值上。
+回读读 `GET /api/device/settings`，**以 `net_select` 为准、`BearerPreference` 回落**（真机切换后
+变化的是前者），值经 `fromBearer()` 换算成别名再与目标比对。
 
 #### `POST /api/network/bearer`
 
@@ -1946,15 +1966,19 @@ goform 客户端不可用 → `503 UNAVAILABLE`；设备写失败 → `500` + `s
 
 #### `POST /api/network/connection-mode`
 
-设置连接模式。
+设置拨号模式（自动 / 手动）。写成功后失效 `device:settings`（`connection_mode` 就在那个端点里）。
 
 **请求体：**
 
 ```json
-{ "mode": "AUTO" }
+{ "mode": "auto" }
 ```
 
-**响应：** `{ "success": true, "mode": "AUTO" }`
+**入参归一化在 core**（2026-09-15）：`manual` / `manual_dial` / `hand` / `1` → 设备值 `manual_dial`，
+其余一律 `auto_dial`。原来是原样透传，于是 app 发的 `auto`/`manual` 静默无效（设备只认 `*_dial`），
+缺省值还写着 `AUTO`。客户端不需要再各自映射一份。
+
+**响应：** `{ "success": true, "mode": "auto_dial" }` —— `mode` 回显的是**实际下发的设备值**。
 
 ---
 
@@ -2179,6 +2203,73 @@ Root 权限检查。
 - 「今日」不是设备字段（goform 只给当月累计），由 `DataScheduler` 用「当月累计 − 当日基线」  
   自算，基线持久化，所以重启不归零、跨天自动重置；
 - `*_display` 是 1024 进制、GB 两位小数 / MB·KB 一位小数（`TrafficSummaryMapper.formatBytes`）。
+
+#### `GET /api/traffic/usage`
+
+日 / 周 / 月 / 年**用量分桶**，给图表直接用。数据源是 `traffic_hourly` 表（每小时**增量**，由
+`DataScheduler` 用「当月累计 − 上次采样的当月累计」累加，判据见 `TrafficHourlyAccumulator`），
+与 `/summary` 的设备当月累计不是同一条链路。
+
+**查询参数：**
+
+| 参数     | 默认  | 说明                                                                                   |
+| -------- | ----- | -------------------------------------------------------------------------------------- |
+| `range`  | `day` | `day` / `week` / `month` / `year`。**非法值回落 `day`，不回 400**                        |
+| `anchor` | now   | 锚点时间戳（epoch ms），窗口 = 锚点所在的自然日/周/月/年。**非数字回落 now，不回 400**  |
+
+**响应：**
+
+```json
+{
+  "range": "day",
+  "range_start": 1789315200000,
+  "range_end": 1789401600000,
+  "label": "9月14日 周一",
+  "bucket_unit": "hour",
+  "buckets": [
+    { "index": 0, "start": 1789315200000, "label": "0", "rx_bytes": 12582912, "tx_bytes": 2097152, "total_bytes": 14680064 },
+    { "index": 1, "start": 1789318800000, "label": "1", "rx_bytes": 0, "tx_bytes": 0, "total_bytes": 0 }
+  ],
+  "total_rx_bytes": 12582912,
+  "total_tx_bytes": 2097152,
+  "total_bytes": 14680064,
+  "peak_bytes": 14680064,
+  "earliest_data_at": 1789315200000
+}
+```
+
+- `range_start` 含、`range_end` **不含**（半开区间）；时区一律**设备本地时区**，与写入侧
+  `TrafficHourlyAccumulator.hourStartOf` 同一口径；
+- `buckets` **每个桶都出现**，按时间升序、`index` 从 0 连续，没数据的桶三个字节数全 0 ——
+  前端靠它画完整 X 轴，缺桶会让「还没到的日子」和「那天没用流量」长得一样；
+- `peak_bytes` = 所有桶 `total_bytes` 的最大值，核心侧算好，省得两端各写一遍 Y 轴峰值逻辑；
+- `earliest_data_at` = 表里最早的小时起点，**表为空时是 `null`（不是 0）**。用它提示
+  「历史从 X 月 X 日起才有数据」，别把上线前的空桶当成「那天真的没用流量」；
+- 窗口**不截断到今天**：本周/本月还没到的桶照常返回，值为 0。
+
+**四种 range 的桶数与文案：**
+
+| range   | `bucket_unit` | 桶数                     | 窗口 `label` 示例  | 桶 `label`          |
+| ------- | ------------- | ------------------------ | ------------------ | ------------------- |
+| `day`   | `hour`        | 24（见下方 DST 说明）    | `9月14日 周一`     | `"0"` … `"23"`      |
+| `week`  | `day`         | 7（**周日 → 周六**）     | `9月13日-9月19日`  | `"周日"` … `"周六"` |
+| `month` | `day`         | 当月实际天数 28/29/30/31 | `2026年9月`        | `"1"` … `"31"`      |
+| `year`  | `month`       | 12                       | `2026年`           | `"1"` … `"12"`      |
+
+> 周的起点是**周日**，且是整周（不是「最近 7 天」，也不是「到今天为止」）。桶起点由日历推导，
+> 所以在有 DST 的时区 `day` 会得到 23 或 25 个桶、桶 label 取当地墙上时钟的小时数（秋季回拨那天
+> 会出现两个同名桶）—— 这是正确行为，国内无 DST 不受影响。
+
+**两条必须知道的限制：**
+
+1. **历史无法回填。** `traffic_hourly` 是本功能上线时新建的表（`AppDatabase` v14 的纯建表迁移），
+   上线之前的每小时用量从未被记录，往前查只会得到空桶。判断「哪天起才有数据」看
+   `earliest_data_at`。
+2. **core 离线期间的流量整块丢弃。** 两次采样间隔超过 `TrafficHourlyAccumulator.OFFLINE_GAP_MS`
+   （10 分钟，意味着服务被杀 / 关机 / 深度休眠）时，这段增量**无法归属到具体小时**，会被丢掉而不是
+   补记到重启后的那一个小时 —— 否则柱状图会长出一根「几天流量挤在一小时」的假柱子。因此长时间
+   断电后，本接口的当天/当月合计可能**小于**运营商账单，也可能小于 `/summary` 的设备当月累计
+   （后者读 Modem 计数器，不依赖 core 是否在跑）。
 
 ---
 
@@ -2551,6 +2642,705 @@ AT 通道状态。
 
 - **隧道有两个开关，各管一件事**：`tunnel_enabled`（本组，本机要不要弹状态栏）与 `AppSettings.tunnelNotifyOnFailure`（`PUT /api/tunnel/settings` 的 `notify_on_failure`，设备端要不要推）串联，不是同一概念的两份真源。
 - 本组只管「是否发通知」，**告警阈值本身在 `/api/alerts/config`**。两组的交集已在 2026-09-08 消除：`AlertConfig.notifyEnabled` 已删除（它自称"投递总闸"，实际全 core 只有邮件转发读它），邮件是否放行改由本组的 `master_enabled` + `mail_respect_dnd` 决定；**本组没有 `mail_enabled`** —— 邮件通道开不开的真源是 `/api/sms-forward/config` 的 `enabled` + SMTP 必填项。
+
+---
+
+## 媒体中心 /api/media
+
+数据源是**系统媒体库（MediaStore）**，core 不自建索引：系统已经把整卡的媒体索引好了（时长、分辨率、专辑、艺术家，还有缓存好的缩略图），
+再写一套扫描器 + 索引表等于把增量与失效逻辑重做一遍，而且会与系统媒体库长期两份数据打架。
+core 只做三件事：查 MediaStore、按该类型配置的扫描目录过滤、把缩略图转成 JPEG 发出去。
+
+**不复用 `/api/files/list` 与 `/api/files/search`**：前者只能单层列目录，后者按**文件名**子串递归找且有 50 条硬顶、深度 ≤ 8、10s 墙钟。
+拿它们凑「这台设备上所有视频 / 音乐 / 图片」要么漏要么慢到不可用。
+
+**播放与查看仍走 `GET /api/files/stream`**（支持 Range、`inline`、无大小上限），本组不提供第二条取字节流的路径；
+缩略图与封面是唯一例外 —— 那是 core 生成的 JPEG，不是原文件。
+
+三类媒体（`video` / `audio` / `image`）在 Android 13+ 起按 `READ_MEDIA_VIDEO` / `READ_MEDIA_AUDIO` / `READ_MEDIA_IMAGES` **分别**授权
+（13 以下统一看 `READ_EXTERNAL_STORAGE`，另外「所有文件访问」`MANAGE_EXTERNAL_STORAGE` 也算放行）。
+所以未授权时端点回 403 而不是空列表：显示「设备里没有视频」是在骗用户。
+
+本组**没有服务端 TTL 缓存**（MediaStore 查询是本地的，缓存反而会让新拷进来的文件迟迟不出现）；
+唯一的缓存口径在两类图片端点上，靠强 ETag + `Cache-Control: private, max-age=86400` 让客户端与 Coil 磁盘缓存复用。
+
+### GET /api/media/status
+
+三类媒体各自的授权状态 + 当前扫描目录。客户端据此决定「这个分栏显示列表还是显示未授权引导」。
+
+**查询参数：** 无
+
+**响应：**
+
+```json
+{
+  "all_files_access": true,
+  "granted": { "video": true, "audio": true, "image": false },
+  "scan_dirs": {
+    "video": ["/storage/emulated/0/Movies"],
+    "audio": ["/storage/emulated/0/Music"],
+    "image": []
+  },
+  "sdk_int": 33
+}
+```
+
+`scan_dirs` 自 2026-09-16 起**按类型各存一份**（媒体中心拆成三个独立页，每页只改自己那一份，所以三页都有可写入口也不会互相覆盖）；
+某一类为空数组 = 这一类不限目录，列整个媒体库里的该类型。
+
+**错误：** 无失败分支 —— 权限不足不是错误，它就在 `granted` 里逐类回报。
+
+### GET /api/media/list
+
+列某一类媒体（整库平铺 + 分页）。分页、排序、目录过滤全在 SQL 侧完成，不把整表拉进内存。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| type | 是 | `video` / `audio` / `image` |
+| sort | 否 | `date`（默认，按 `DATE_MODIFIED`）/ `name` / `size` |
+| order | 否 | `desc`（默认）/ `asc` |
+| limit | 否 | 默认 100，夹取到 1..500 |
+| offset | 否 | 默认 0，负数按 0 处理 |
+
+**响应（`type=audio`）：**
+
+```json
+{
+  "type": "audio",
+  "items": [
+    {
+      "id": 10231,
+      "name": "带我走-杨丞琳.flac",
+      "path": "/storage/emulated/0/Music/带我走-杨丞琳.flac",
+      "size": 31457280,
+      "date_modified": 1757990000000,
+      "mime": "audio/flac",
+      "duration_ms": 245000,
+      "album": "半熟宣言",
+      "artist": "杨丞琳",
+      "title": "带我走"
+    }
+  ],
+  "total": 412,
+  "limit": 100,
+  "offset": 0,
+  "scan_dirs": ["/storage/emulated/0/Music"]
+}
+```
+
+`total` 是**符合条件的总数**（同 selection 再数一次，只取 `_ID`），客户端用它算「还有没有下一页」；`items.size` 只说明这一页有多少。
+
+`date_modified` 是**毫秒**：MediaStore 存的是秒，core 已经换算过，客户端不必再猜单位。
+`duration_ms` 对图片不返回、`width`/`height` 对音频不返回 —— 缺字段的含义是「这个类型没有这个概念」，不是「这一项没有时长」。
+
+**`title` 为什么可能是空串**：MediaStore 在文件没有内嵌标签时会把**去掉扩展名的文件名**填进 `MediaStore.Audio.Media.TITLE`。
+原样透出去，客户端就会把 `带我走 - 杨丞琳` 当成曲名显示，还压掉了「按分隔符拆成歌名 + 歌手」的兜底。
+所以 core 用 `realTitleOf` 比对：与文件名一致时按「没有标签」处理、回空串，由客户端决定怎么兜底。
+同理 `artist` / `album` 里的 `<unknown>` 是 MediaStore 的占位符，会被清成空串。
+
+列表这一层**刻意不逐首解字节**（一页几十首就是几十次开文件）；需要精确标签时走 `GET /api/media/tags`（单首、可缓存）。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不是 `video` / `audio` / `image` |
+| 403 | 该类型媒体权限未授权（响应里带 `permission` 与 `type`，客户端据此跳系统授权页） |
+
+MediaStore 查询本身失败时不报错，而是回空 `items` + `total: 0` 并在 core 日志留 WARN —— 分页接口半途抛错会让界面卡在加载态。
+
+### GET /api/media/browse
+
+按目录列一层（媒体库的「文件夹视图」）：子目录 + 这一层的媒体文件，不分页。
+
+与 `/list` 的分工：那个是「整库平铺 + 分页」，这个是「这一层里有什么」。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| type | 是 | `video` / `audio` / `image` |
+| path | 否 | 要列的目录；留空时由 core 决定起点（见下） |
+| sort | 否 | `date`（默认）/ `name` / `size`，只作用于本层文件 |
+| order | 否 | `desc`（默认）/ `asc` |
+
+`path` 留空时：该类型只配了一个扫描目录就**直接进那一个**（多包一层「根目录」没有意义），配了多个则回一份 `roots` 让客户端先选，一个都没配就用外置存储根。
+
+**响应：**
+
+```json
+{
+  "type": "video",
+  "path": "/storage/emulated/0/Movies",
+  "parent": null,
+  "roots": ["/storage/emulated/0/Movies"],
+  "folders": [
+    { "name": "纪录片", "path": "/storage/emulated/0/Movies/纪录片", "count": 12, "cover_id": 20488, "date_modified": 1757900000000 }
+  ],
+  "items": [ { "id": 20501, "name": "trip.mp4", "...": "同 /list 的 item 形状" } ]
+}
+```
+
+`items` 与 `/list` 是**同一种**形状（由同一个 `itemOf` 产出）：两边各写一份的话，加字段时总会漏一处，客户端就会出现「列表模式有时长、文件夹模式没有」这种莫名差异。
+
+`folders[].count` 是**整棵子树**里该类型的文件数（所以「里面有 12 个」是准的），`cover_id` 是子树里最新那一个文件的 MediaStore id ——
+文件夹卡片直接拿它当封面，不必为目录另造一套缩略图。该类型一个文件都没有的目录直接不列出（点进去只会是一片空白）。
+`parent` 为 `null` 表示已经在根上，界面不该再显示「返回上一级」。
+
+**为什么子目录走文件系统而文件走 MediaStore**：目录本身不在 MediaStore 里（它只索引文件），而文件要的是 id / 时长 / 尺寸这些**只有媒体库才有**的字段，两边各取所长。
+子目录数量有上限（200）：每个子目录都要一次 count 查询，一层几百个目录就是几百次查询，给上限比让它一直转更诚实。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不合法 |
+| 403 | 该类型媒体权限未授权 |
+| 403 | `path` 不在允许范围内（响应里带 `path` 与 `roots`） |
+| 404 | 目录不存在或不可读 |
+
+范围校验是本端点的唯一防线：`path` 来自客户端，先取 `canonicalPath` 再比根目录前缀，否则 `..` 能爬出去 —— 那等于把整机目录结构开放给了客户端。
+
+### GET /api/media/thumbnail
+
+缩略图（JPEG）。**三级回退：客户端回传的缓存 → 系统缩略图（`loadThumbnail`）→ core 自行生成**（视频抽第 1 秒关键帧、图片降采样解码、音频取内嵌封面）。
+
+缓存排第一是因为 core 跑的随身 WiFi 用的是精简 ROM，**可能根本解不出视频画面**：`MediaProvider` 与 `MediaMetadataRetriever` 走同一套 codec，实测双双失败。
+这种设备上唯一能出图的办法是让有解码能力的客户端抽好帧回传（`PUT /api/media/thumbnail`），core 只管存与发。
+
+视频不取第 0 帧：很多视频首帧是黑场或渐入，抽出来是一张纯黑图，那和没有缩略图没区别。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| type | 是 | `video` / `audio` / `image` |
+| id | 是 | MediaStore 行 id |
+| size | 否 | 最长边像素，默认 256，夹取到 96..1024；命中回传缓存时该参数被忽略 |
+
+`size` 上限 2026-09-16 由 512 提到 1024：音乐播放页的封面容器是 260dp，在 xxhdpi 上约 780 物理像素，请求 512 会被放大 1.5 倍 —— 这就是「封面很模糊」的原因。
+
+**响应：** `200` + `image/jpeg` 字节流，带强 ETag（`"media-<type>-<id>-<size>"`，命中回传缓存时是 `"media-<type>-<id>-c<mtime>"`）与 `Cache-Control: private, max-age=86400`。
+带 `If-None-Match` 且一致时回 `304`。
+
+回传缓存的文件名只按 `(type, id)` 编、**不含 size**：客户端交上来的是一张够大的图，列表要 256、网格要 108 都能用它缩；按 size 分开存会让同一个视频存出好几份，把 64MB 的缓存上限很快撑满。
+缓存超限时按修改时间从旧到新删，**不做 LRU**（读命中不 touch 文件：一 touch，基于 `lastModified` 的 ETag 就跟着变，客户端缓存全部作废）。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不合法，或缺少 `id` |
+| 403 | 该类型媒体权限未授权 |
+| 404 | 三级都拿不到图，`message` 与 `reason` 里带**两级各自的失败原因**（异常类名 + 消息） |
+
+404 带原因是 2026-09-16 补的可观测性：设备端日志要连 ADB 才看得到，而客户端原来只拿到一句「缩略图不可用」——
+权限被拒、解码栈缺失、文件损坏在两侧长得完全一样。原因里不含路径与凭据。
+**绝不回一张破图或空 200**：客户端据 404 画占位图标。
+
+### PUT /api/media/thumbnail
+
+接收客户端抽好的缩略图（请求体是 **raw JPEG 字节**，不是 JSON、不是 multipart）。
+
+存在的理由就是上一条里那台解不出画面的设备：手机端的解码栈是完整的，「谁有解码能力谁干活」。
+回传一次之后 `GET /api/media/thumbnail` 的第一级直接命中，**Web 端与第二台手机也就一并有了缩略图** —— 这是选它而不是「只在 app 本地缓存」的唯一理由。
+同一个 id 再传一次会覆盖（客户端可能抽到更好的一帧）。
+
+**查询参数：** `type`（必填）、`id`（必填）
+
+**请求体：** JPEG 字节流，`Content-Type: image/jpeg`
+
+**响应：**
+
+```json
+{ "success": true, "type": "video", "id": 20501, "size": 48213 }
+```
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不合法 / 缺少 `id` / 请求体不是 JPEG（魔数不是 `FF D8 FF`） |
+| 404 | 媒体库里没有这一项（`type`/`id` 对不上任何行） |
+| 413 | 超过单张上限 512KB |
+| 500 | 写入缓存目录失败 |
+
+这不是「允许客户端随便塞图」：四条校验（type/id 合法、id 真实存在、≤512KB、必须是 JPEG）加上 `/api` 本身的设备签名鉴权，
+攻击面就是「已配对设备可以给自己库里的某个媒体塞一张 ≤512KB 的 JPEG」，与它本来就能改文件的权限相比没有放大。
+写入用「先写 `.tmp` 再 rename」：中途断开不会留下半张图被当成缓存命中。
+
+### GET /api/media/cover
+
+音频封面。先取**内嵌封面原图字节**（ID3 APIC / FLAC PICTURE，**不重新编码** → 能拿到的最高画质），取不到再退回 `loadThumbnail(1024)`。
+
+与 `/thumbnail` 分开的理由：列表要的是「小而快」（256px、可缓存、能糊），播放页要的是「尽量清楚」。
+
+**查询参数：** `id`（必填，音频的 MediaStore id）
+
+**响应：** `200` + `image/jpeg` 或 `image/png` 字节流（内嵌封面按魔数判类型，不一律声明成 JPEG），带 ETag `"media-cover-<id>"` 与 `Cache-Control: private, max-age=86400`；`If-None-Match` 命中回 `304`。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 缺少 `id` |
+| 403 | 音频权限未授权 |
+| 404 | 两条路都没拿到封面（客户端画占位图标） |
+
+### GET /api/media/lyrics
+
+旁挂歌词（同目录同名的 `.lrc` / `.txt`，大小 ≤ 256KB）。
+
+**只找旁挂文件**：MediaStore 不索引歌词，`MediaMetadataRetriever` 也没有歌词字段，想读 ID3 的 USLT 帧就得在 core 里再塞一个解析器 —— 那是另一件事。
+时间轴解析（`[mm:ss.xx]`）留在客户端：那是纯展示格式化，且高亮要跟着播放进度走。
+
+**查询参数：** `id`（必填，音频的 MediaStore id）
+
+**响应：**
+
+```json
+{ "found": true, "source": "带我走-杨丞琳.lrc", "text": "[00:00.00]带我走\n[00:12.35]..." }
+```
+
+找不到时回 **200** + `{ "found": false, "source": "", "text": "" }`，不是 404 ——「这首没有歌词」是正常状态，客户端照实显示「没有歌词」，不拿文件名假装一行歌词。
+`source` 是命中的文件名，用于在界面上说明歌词来自哪里。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 缺少 `id` |
+| 403 | 音频权限未授权 |
+
+### GET /api/media/tags
+
+单首音频的标签（曲名 / 艺术家 / 专辑 / 时长）。
+
+`/list` 已经带了 MediaStore 那份（系统扫描时解析的），绝大多数文件够用。这一条是**缺失时的补强**：
+MediaStore 偶尔会漏（刚拷进来还没扫到、或某些 FLAC/APE 只填了部分列），此时客户端只能退回文件名。
+本端点在服务端直接对文件本身取一次标签，让客户端「进页面就能显示正确的歌名」，而不是等播放器解出容器元数据才更新。
+
+**三级回退，从可信到不可信：**
+
+1. `AudioTagReader`：**自己解容器头部的字节**（FLAC 的 `fLaC` 魔数 + METADATA_BLOCK 链里的 `VORBIS_COMMENT`；MP3 的 ID3v2 帧 `TIT2/TPE1/TALB`，v2.2 是 `TT2/TP1/TAL`）。
+   标签是纯字节结构、不需要任何解码能力，所以在解不出视频画面的定制 ROM 上照样准 —— 这正是 2026-09-16 加它的原因：
+   此前只用 `MediaMetadataRetriever`，FLAC 上经常拿回空标签，表现就是「改了接口，歌名还是 `带我走 - 杨丞琳`」。
+   只读文件头（≤1MB），不为了标签把几十 MB 的无损文件拉进内存；文本编码按 UTF-8 → GBK → Latin-1 严格嗅探（一堆国产工具在标注成 Latin-1 的帧里塞 GBK）。
+2. `MediaMetadataRetriever`：第 1 级不认识的容器（m4a、老格式）还能捞一把，只补第 1 级仍然缺的字段。
+3. `MediaStore` 的 `title/artist/album`：系统扫描的结果，作为兜底。
+
+高优先级的结果覆盖低优先级，`<unknown>` 与「与文件名相同的 title」都按「没有」处理。
+
+**查询参数：** `id`（必填，音频的 MediaStore id）
+
+**响应：**
+
+```json
+{
+  "id": 10231,
+  "name": "带我走-杨丞琳.flac",
+  "path": "/storage/emulated/0/Music/带我走-杨丞琳.flac",
+  "title": "带我走",
+  "artist": "杨丞琳",
+  "album": "半熟宣言",
+  "duration_ms": 245000
+}
+```
+
+带 `Cache-Control: private, max-age=86400`：同一 id 的标签只随文件改动而变。
+取不到的字段是**空串** —— core 不拿文件名冒充曲名，兜底显示策略由 UI 层决定。
+
+歌词不在这里：那是独立的 `GET /api/media/lyrics`（旁挂文件），两件事不要混。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 缺少 `id` |
+| 403 | 音频权限未授权 |
+| 404 | 音频库里没有这个 id |
+
+### GET /api/media/config
+
+读某一类的扫描目录。
+
+**查询参数：** `type`（必填）
+
+**响应：**
+
+```json
+{ "type": "audio", "dirs": ["/storage/emulated/0/Music"] }
+```
+
+空数组 = 这一类不限目录（列整个媒体库里的该类型）。配置解析失败时也按「不限目录」处理并留 WARN，不报错。
+
+**错误：** 400 `type` 不合法。
+
+### PUT /api/media/config
+
+写某一类的扫描目录。
+
+**查询参数：** `type`（必填）
+
+**请求体：**
+
+```json
+{ "dirs": ["/storage/emulated/0/Music", "/storage/1A2B-3C4D/音乐"] }
+```
+
+**响应：**
+
+```json
+{ "success": true, "type": "audio", "dirs": ["/storage/emulated/0/Music", "/storage/1A2B-3C4D/音乐"] }
+```
+
+校验三条：必须落在用户存储白名单内（`/storage/`、`/sdcard`、`/mnt/media_rw/`，与文件接口同一口径且不含 `..`）、去重、不超过 16 条。
+**不要求目录当前存在** —— SD 卡拔出时配置不该被清掉。
+按类型各存一份，视频页改视频的、音乐页改音乐的，互不覆盖；三类指向同一个目录也没问题，MediaStore 本来就是分表查的。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不合法 |
+| 400 | 缺少 `dirs` 数组 |
+| 400 | 某个目录不在用户存储范围内（`message` 里带第一个非法项） |
+| 400 | 超过 16 个目录 |
+
+### POST /api/media/rescan
+
+请**系统扫描器**重新收录某一类的目录。
+
+这是给「媒体库漏收」兜底的：`.nomedia` 屏蔽的目录、刚 `adb push` 进来的文件，MediaStore 里查不到。
+core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收录完成后照常走 `/list`。
+
+**查询参数：** `type`（必填）
+
+**请求体：**
+
+```json
+{ "dirs": [] }
+```
+
+目录三级回退：请求体 `dirs` → 该类型已配置的扫描目录 → 主外置存储根。
+第三级是 2026-09-16 补的：`/list` 的口径是「未配置目录 = 整个媒体库」，而 rescan 原来在这种情况下直接回 400「请先选择目录」——
+于是默认状态下这颗按钮点下去必然报错，等于一颗假按钮。既然列表不限目录，重扫的默认范围就该是整卡。
+
+**响应：**
+
+```json
+{ "success": true, "type": "video", "dirs": ["/storage/emulated/0"], "submitted": 1873, "truncated": false }
+```
+
+只提交**本类型**的文件（按扩展名推 MIME 前缀）：在视频页点重扫就该只重扫视频，顺手把同目录的音乐图片也塞给扫描器会让这颗按钮的语义变成「整卡重扫」。
+单次上限 5000 个文件、递归深度 12，撞上限时 `truncated: true`，客户端应提示再点一次或缩小范围。
+
+收录是**异步**的：提交给扫描器就返回（它自己排队，可能几十秒），所以 `success: true` 不代表 `/list` 立刻就能查到新文件。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不合法 |
+| 400 | 没有可扫描的目录（外置存储不可用且未指定目录） |
+
+---
+
+## 天气 /api/weather
+
+上游为 Open-Meteo（`api.open-meteo.com` / `geocoding-api.open-meteo.com`），**无需 API key**。
+由 core 统一出网并缓存：多端各自直连会成倍消耗免费额度，且位置属于设备级配置而非某个客户端的本地偏好。
+
+上游域名写死在 `WeatherRoutes` 内且强制 https，**不做成可配置 URL**（可填 URL 等于把 core 变成任意外网请求的代理）。
+`/api` 下没有限流，对上游的唯一保护是 TTL 缓存：当前天气 15 分钟（`CacheTTL.WEATHER_NOW`）、城市搜索 1 天（`CacheTTL.WEATHER_GEOCODE`）。
+
+### GET /api/weather
+
+当前天气 + 今日最高/最低。默认使用已保存的坐标，`lat`/`lon`/`city` 仅用于「设置页选了城市、保存前先看一眼」的预览。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| lat | 否 | 临时覆盖纬度（-90..90） |
+| lon | 否 | 临时覆盖经度（-180..180） |
+| city | 否 | 临时覆盖回显的城市名 |
+
+**响应（已设置城市）：**
+
+```json
+{
+  "configured": true,
+  "city": "北京 · 北京市 · 中国",
+  "temperature": 24.3,
+  "apparent_temperature": 25.1,
+  "humidity": 62,
+  "precipitation": 0.0,
+  "wind_speed": 8.6,
+  "weather_code": 2,
+  "description": "多云",
+  "is_day": true,
+  "temp_max": 28.0,
+  "temp_min": 18.4,
+  "sunrise": "2026-09-17T05:52",
+  "sunset": "2026-09-17T18:32",
+  "unit": "celsius",
+  "timezone": "Asia/Shanghai",
+  "updated_at": 1758100000000
+}
+```
+
+**响应（尚未设置城市）：**
+
+```json
+{ "configured": false, "enabled": false, "message": "尚未设置城市" }
+```
+
+「没配过位置」不是错误态，故回 200 —— 客户端据此显示「去设置城市」，而不是一个红色报错。判据是坐标为 `0,0`（几内亚湾公海，用作哨兵值，省掉一个会与坐标分叉的 `configured` 存储字段）。
+
+`weather_code` 是 WMO 天气代码，**中文文案 `description` 由 core 翻译**：各端各译一份必然分叉。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 502 | 上游无响应 / 超时（8s）/ 上游回 `{"error": true}` |
+
+### GET /api/weather/search
+
+城市搜索（Open-Meteo Geocoding 代理），结果缓存 1 天。
+
+**查询参数：** `name`（必填，≥1 字符）、`lang`（默认 `zh`）
+
+**响应：**
+
+```json
+{
+  "results": [
+    {
+      "name": "北京",
+      "latitude": 39.9075,
+      "longitude": 116.39723,
+      "country": "中国",
+      "admin1": "北京市",
+      "timezone": "Asia/Shanghai"
+    }
+  ],
+  "total": 1
+}
+```
+
+`admin1` 是省/州，用于区分同名城市。
+
+**错误：** 400 搜索词为空；502 上游失败。
+
+### GET /api/weather/config
+
+未写入过或 JSON 损坏时回落默认值（不报错）。
+
+```json
+{
+  "enabled": false,
+  "city": "",
+  "latitude": 0.0,
+  "longitude": 0.0,
+  "unit": "celsius"
+}
+```
+
+### PUT /api/weather/config
+
+字段级合并（body 是上述字段的任意子集），与 `PUT /api/notifications/config` 同语义。
+写入成功后会清掉 `weather:now:*` 缓存。
+
+**请求体（示例：只改城市）：**
+
+```json
+{ "city": "上海 · 上海市 · 中国", "latitude": 31.2222, "longitude": 121.4581 }
+```
+
+**响应：**
+
+```json
+{ "success": true, "config": { "...": "合并后的完整配置" } }
+```
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 请求体不是合法 JSON 对象，或字段类型不匹配 |
+| 400 | 纬度不在 -90..90 / 经度不在 -180..180 |
+| 400 | `unit` 不是 `celsius` 或 `fahrenheit` |
+
+**边界说明：**
+
+- `enabled` 只管「客户端要不要在标题栏显示天气」。**即便关掉，本组接口仍可访问** —— 设置页要能在关闭状态下先搜城市、看一眼读数再决定打开。
+- 配置存在 `AppSettings.weather_config`（单 key 整份 JSON），已进备份白名单：城市与坐标是「这台设备放在哪」，换设备仍成立。
+- 客户端侧另有 10 分钟节流（`WeatherModule.MIN_REFRESH_INTERVAL_MS`），且**没有周期任务**：刷新时机是进首页 Tab / 回前台 / 改城市。
+
+---
+
+## 今日诗词 /api/poetry
+
+上游为[今日诗词](https://www.jinrishici.com/doc/)的 v2 接口（`v2.jinrishici.com`），**无需注册、无需 API key**。
+域名写死在 `PoetryRoutes` 内且强制 https，理由同天气（可填 URL 等于把 core 变成任意外网请求的代理）。
+`/api` 下没有限流，对上游的唯一保护是 TTL 缓存：10 分钟（`CacheTTL.POETRY`）。
+
+**智能推荐是上游做的，不是我们做的。** 它按**发起请求的 IP** 解析地区、抓当地实时天气，再结合北京时间与农历日期匹配标签
+（气象：晴/雨/雪/寒冷/炎热…；时间：日出/正午/晚上/凌晨…；日期：春夏秋冬/节日…；地理：华南/江南/长安…），命中的标签在 `match_tags` 里回传。
+所以「夏天只出夏天的诗」这件事**不需要也无法传 tag**（v2 接口没有该参数），而是必须保证请求从**设备**发出 ——
+这也正是把它放在 core 而不是让 app 直连的理由：app 直连时出网 IP 虽然也经设备，但地区解析与 token 归属都会随客户端漂移。
+
+**为什么客户端不需要调 token 端点。** 裸调 `one.json` 也能成功，但上游会**每次都新签一个 token**，
+而同一 IP 签出多个 token 会让它认为是多个用户、拉低推荐质量。core 的做法是：首次请求不带 token，
+从**首次响应里收割** `token` 字段存进 `AppSettings.poetryToken`（永久有效），之后每次请求都带 `X-User-Token` 头。
+收割发生在解析成功之后 —— 失败响应里的 token 不值得存。上游的 `/token` 端点因此完全不必调用，本手册也不暴露对应的 core 端点。
+
+### GET /api/poetry
+
+当前推荐的一句诗。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| refresh | 否 | 传 `1` 时先清掉 core 的本地缓存再取 |
+
+**响应：**
+
+```json
+{
+  "content": "何当共剪西窗烛，却话巴山夜雨时。",
+  "title": "夜雨寄北",
+  "dynasty": "唐代",
+  "author": "李商隐",
+  "full_content": ["君问归期未有期，巴山夜雨涨秋池。", "何当共剪西窗烛，却话巴山夜雨时。"],
+  "translate": ["你问我什么时候回家，我没有定下归期……"],
+  "match_tags": ["夜", "雨", "秋"],
+  "popularity": 1200000,
+  "updated_at": 1758150000000
+}
+```
+
+`content` 是推荐的那一句（标题栏下方小字显示的就是它）；`full_content` 是全篇原文、可能多段，详情页用；
+`translate` 只有部分诗词才有，没有时是空数组。`match_tags` 可直接当「推荐理由」显示。
+`updated_at` 是 core 生成这份响应的时间（epoch ms），不是上游的 `cacheAt`。
+
+**`refresh=1` 不保证换一句**：上游对每个 token 预生成并缓存推荐结果、约 10 分钟更新一次（响应里的 `cacheAt`），
+所以 TTL 取同一档 —— 更短只是重复拿到同一句、白打请求。短时间内连续刷到同一句是上游的机制，不是失败。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 502 | 上游无响应 / 超时（8s）/ 上游 `status` 不是 `success` / 响应缺 `data` 字段（`code` 为 `OPERATION_FAILED`，`message` 带上游原因） |
+
+### GET /api/poetry/config
+
+未写入过或 JSON 损坏时回落默认值（不报错）。
+
+```json
+{ "enabled": false, "show_origin": true }
+```
+
+只有两个开关，**没有「选标签」这类选项** —— 标签由上游按地区/天气/时间自动匹配，我们无从指定。
+
+### PUT /api/poetry/config
+
+字段级合并（body 是上述字段的任意子集），与 `PUT /api/weather/config` 同语义：`null` 值的字段视为「不改」。
+
+**请求体（示例：只打开显示）：**
+
+```json
+{ "enabled": true }
+```
+
+**响应：**
+
+```json
+{ "success": true, "config": { "enabled": true, "show_origin": true } }
+```
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 请求体不是合法 JSON 对象，或字段类型不匹配（`code` 为 `BAD_REQUEST`） |
+
+**边界说明：**
+
+- `enabled` 只管「客户端要不要在标题栏下方显示诗句」。**即便关掉，本组接口仍可访问** —— 设置页要能在关闭状态下先看一眼再决定打开（与天气同口径）。
+- `show_origin` 关闭时客户端只显示诗句本身，不显示 `《题目》· 朝代 · 作者` 那一行。这是纯展示开关，不影响响应字段。
+- 配置存在 `AppSettings.poetry_config`（单 key 整份 JSON）；token 存在 `AppSettings.poetryToken`，**属于设备身份而非用户偏好**，换设备后重新签一个即可。
+
+---
+
+## 地理位置 /api/geo
+
+> 需要认证。这台设备的**出网国家/地区**。
+
+依次尝试三个免费地理源（每个超时 8s，任一成功即返回）：`api.ip.sb/geoip` 的 `country_code`
+→ `my.ippure.com/v1/info` 的 `countryCode` → `ping0.cc/geo` 纯文本第 2 行的中文国家名（映射表在 `GeoDetector` 里）。
+域名写死且强制 https，理由同天气与诗词（可填 URL 等于把 core 变成任意外网请求的代理）。
+
+**为什么放在 core。** 检测靠的是**出网 IP 的归属**，而设备才是真正的出网点。app 走设备热点时出网 IP 虽然也一样，
+但把检测放在 app 会让每个客户端各存一份结果、彼此可能不一致（换 WiFi、开代理都会让某一端测出别的答案）。
+放在 core 只有一份真源，两端读同一个值。目前唯一消费方是 app 的更新源自动选择（`CN` → 走镜像，其余直连）。
+
+**检测何时发生。** 只有事件触发，**没有任何定时器**：
+1. **core 启动时**自动测一次 —— 且只在"没测过、或距上次超过 7 天"时才真的出网，否则直接跳过；
+   失败不重试、不阻塞启动（只留一条 WARN），等下次重启再试。挂在 HTTP 服务就绪之后，
+   因为串三个上游最坏 24s，放进组件初始化会顶到初始化看门狗（15s 心跳 / 超时杀进程自愈）。
+2. `GET /api/geo` 发现结果缺失或已过 7 天时顺手补一次（core 启动那次失败时这里就是自愈点）。
+3. `POST /api/geo/detect` 显式强制重测。
+
+**结果存哪。** `AppSettings.geo_country` + `geo_detected_at`。前者进备份白名单（换设备通常还在同一地区），
+后者**不进** —— 那是"这台设备什么时候测的"，还原过去只会让新设备以为刚测过；它缺省为 0 正好等于"没测过"。
+
+### GET /api/geo
+
+读当前结果。缺失或超过 7 天时会先补测一次（此时响应可能慢几秒）。
+
+**响应：**
+
+```json
+{
+  "country": "CN",
+  "detected_at": 1758150000000,
+  "source": "cache"
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| country | ISO 3166-1 alpha-2（如 `CN` / `US` / `HK`）；`""` = 没测出结果 |
+| detected_at | 上次**成功**检测的时刻（epoch ms），0 = 从未测过 |
+| source | `cache` 直接读的落盘结果；`fresh` 本次响应前刚出网测过；`unknown` 从未测出过结果（`country` 必为 `""`） |
+
+检测失败在这里**不是错误**：回 200 + `country: ""` + `source: "unknown"`，客户端据此显示「未检测」。
+更新源为 `auto` 的客户端拿不到国家时应**退化为直连** —— 直连在任何地区都能用，镜像只是在国内更快。
+
+### POST /api/geo/detect
+
+强制重测，忽略 7 天过期判定。请求体为空。成功时响应形状与 `GET /api/geo` 相同（`source` 恒为 `fresh`）。
+
+失败**不会**擦掉已保存的值：一次网络抖动不该把"上次测出来的 CN"变成"未检测"。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 502 | 三个地理源都不可达 / 都没给出国家码（`code` 为 `OPERATION_FAILED`；已保留上次结果） |
+
+**边界说明：**
+
+- 与 `GET /api/geo` 的分工：那个是"读"（顺带自愈），这个是"重测"。客户端正常展示只需要调前者。
+- 同一时刻只会有一次检测在跑（`GeoDetector` 内部串行化），启动自动检测与本端点撞上不会打两轮上游请求。
+- 本接口**不提供写入国家的入口**：那是一个"自称在哪"的旋钮，只会让镜像选择被随手改错。想强制走镜像请用
+  app 侧的更新源模式（`mirror` / `direct`），那才是用户意图该表达的地方。
 
 ---
 
@@ -6479,7 +7269,7 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 | /api/pairing (认证)    | 4   |
 | /api/pairing/devices | 3   |
 | /pairing (免认证)       | 4   |
-| /api/traffic         | 3   |
+| /api/traffic         | 4   |
 | /api/cache           | 3   |
 | /api/monitor         | 6   |
 | /api/at              | 3   |

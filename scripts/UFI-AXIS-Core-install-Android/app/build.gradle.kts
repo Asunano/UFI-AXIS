@@ -58,6 +58,7 @@ kotlin {
 
 dependencies {
     implementation(project(":adbcore"))
+    implementation(project(":goform"))
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)

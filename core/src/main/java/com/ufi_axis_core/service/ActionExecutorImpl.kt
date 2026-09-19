@@ -50,7 +50,7 @@ class ActionExecutorImpl(
                 ActionResult(true, "设备重启中...")
             }
             "shutdown" -> {
-                deviceClient.shutdownDevice()
+                systemController.shutdown()
                 ActionResult(true, "设备关机中...")
             }
             "led_toggle" -> {
@@ -80,9 +80,9 @@ class ActionExecutorImpl(
                 // 值域校验失败时把原因带进任务结果，别让用户只看到"切换失败"
                 val rejected = (outcome as? WriteOutcome.Rejected)?.reason
                 ActionResult(ok, when {
-                    ok -> "网络模式已切换为 $bearer"
+                    ok -> "网络模式已切换为 ${NetworkMode.label(mode)}"
                     rejected != null -> "网络模式参数被拒绝：$rejected"
-                    else -> "网络模式切换失败（$mode → $bearer）"
+                    else -> "网络模式切换失败（${NetworkMode.label(mode)} → $bearer）"
                 })
             }
             "custom_shell" -> {

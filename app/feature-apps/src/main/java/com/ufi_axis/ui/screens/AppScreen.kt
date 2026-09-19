@@ -156,16 +156,20 @@ private fun InstallAppDialog(
         title = "安装应用",
         showCloseButton = false,
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+            // local 必须在弹窗自己的 slot 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "安装",
                 enabled = !isLoading && ((useUrl && url.isNotBlank()) || (!useUrl && path.isNotBlank())),
                 onClick = {
-                    if (useUrl) onInstallUrl(url) else onInstallPath(path)
+                    close { if (useUrl) onInstallUrl(url) else onInstallPath(path) }
                 }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -178,13 +182,12 @@ private fun InstallAppDialog(
                 style = MaterialTheme.typography.bodyMedium,
                 color = LocalResolvedPalette.current.textPrimary
             )
-            Spacer(Modifier.height(6.dp))
+            // 间距统一到 UfiDialogBody（12dp）
             UfiScrollableTabRow(
                 selectedTabIndex = sourceIndex,
                 onTabSelected = { useUrl = sourceValues[it] == "url" },
                 tabs = sourceTabs
             )
-            Spacer(Modifier.height(12.dp))
             if (useUrl) {
                 UfiDialogTextField(
                     label = "APK 下载 URL",
@@ -340,7 +343,9 @@ private fun AppDetailDialog(
                     }
                 }
                 // v17：右上角 X 关闭（替代突兀的全宽"关闭"按钮）；v18：主题 accent 着色
-                IconButton(onClick = onDismiss) {
+                // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+                val closeDetail = LocalUfiDialogClose.current
+                IconButton(onClick = { closeDetail(onDismiss) }) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = "关闭",
@@ -348,7 +353,6 @@ private fun AppDetailDialog(
                     )
                 }
             }
-            Spacer(Modifier.height(16.dp))
             // 版本：v15 优化 — versionName 为空时仅显示 versionCode
             val versionLabel = if (detail.versionName.isBlank()) "${detail.versionCode}" else "${detail.versionName} (${detail.versionCode})"
             UfiDialogInfoRow("版本", versionLabel)

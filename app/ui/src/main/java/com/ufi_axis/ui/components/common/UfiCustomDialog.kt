@@ -99,14 +99,14 @@ fun UfiCustomDialog(
             // 自定义确认/取消按钮：放在 content 之后。
             // 对齐旧 Material AlertDialog 习惯：dismissButton 居左、confirmButton 居右。
             confirmButton != null -> {
-                // 2026-09-04：内容→按钮的间距原为 DialogPaddingH(18) + Row 的 vertical 12 = 30dp，
-                // 而标题→内容只有 12dp，同一个弹窗里两处"块间距"差了 2.5 倍。
-                // 现在统一成 Spacing.Large(12dp)：标题→内容、内容→按钮同值，按钮下方再留 12dp。
+                // 纵向节奏（2026-09-18 统一）：标题→内容 12dp（shell 的 Spacer）、
+                // 内容内部 12dp（UfiDialogBody 的 spacedBy）、内容→按钮 12dp（下面这个 Spacer）、
+                // 按钮→下边框 18dp（由 shell 的 bottom padding 统一提供，与左右 18dp 同值）。
+                // 本组件**不再**自带按钮区底部 padding —— 那会和 shell 的叠成 20dp，
+                // 表现为"按钮离下边框比离左右都远"。
                 Spacer(Modifier.height(Spacing.Large))
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = Spacing.Large),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -136,11 +136,10 @@ fun UfiCustomDialog(
             // 仅 dismissButton（无 confirmButton）：全宽展示 + 底部留白。
             // FIX-7：底部关闭按钮已迁到右上角 ×（showCloseIcon），故此处不再补默认"关闭"。
             dismissButton != null -> {
-                Spacer(Modifier.height(Spacing.DialogPaddingH))
+                // 与上面同一套节奏：内容→按钮 12dp，按钮→下边框交给 shell。
+                Spacer(Modifier.height(Spacing.Large))
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center
                 ) {
                     dismissButton()
@@ -274,10 +273,12 @@ fun UfiScrollableDialog(
                 Spacer(Modifier.height(Spacing.Medium))
                 val palette = LocalResolvedPalette.current
                 HorizontalDivider(color = palette.divider.copy(alpha = 0.08f))
+                // 2026-09-19：只留 top padding。按钮→下边框由 shell 的 18dp 统一提供，
+                // 这里再带 bottom 12dp 会叠成 30dp（与 UfiCustomDialog 的按钮区不一致）。
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                        .padding(top = Spacing.Large),
                     horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
                 ) {
                     // 各包入 weight(1f) Box：按钮内部 fillMaxWidth 仅填满半行 Box，
@@ -304,7 +305,7 @@ fun UfiScrollableDialog(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                        .padding(top = Spacing.Large),
                     horizontalArrangement = Arrangement.Center
                 ) {
                     dismissButton()

@@ -47,6 +47,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -94,9 +95,13 @@ import okhttp3.Request
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.data.api.FileItem
 import com.ufi_axis.data.api.RetrofitClient
+import com.ufi_axis.data.media.UfiAudioLyrics
 import com.ufi_axis.util.AppPreferences
-import com.ufi_axis.util.OkHttpClientProvider
-import com.ufi_axis.feature.files.R
+// 播放器核心在 :app:feature-media（2026-09-16 下沉）：带设备签名的 OkHttp、PlayerView 布局、
+// 全屏副作用都在那边，本文件只负责浮层的组织方式。R 也指向那个模块（布局搬过去了）。
+import com.ufi_axis.ui.media.UfiFullscreenSystemUiEffect
+import com.ufi_axis.ui.media.UfiStreamHttpClient
+import com.ufi_axis.feature.media.R
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -108,75 +113,14 @@ import kotlin.math.min
 private const val MINIMUM_LOADABLE_RETRY_COUNT = 4
 
 /**
- * 视频/音频流专用 OkHttpClient。
+ * 音频预览右上角关闭按钮的直径，以及为它在内容区顶部预留的高度。
  *
- * 必须签名的 `/api/files/stream`  endpoint 挂载在 AuthMiddleware 之后，因此 ExoPlayer 必须用
- * 带 [RetrofitClient.authInterceptor] 的客户端。以前每开一次预览就 `newBuilder().build()` 一次并
- * 在释放时 `shutdown()` 其 dispatcher，但 `newBuilder()` 默认复用 [OkHttpClientProvider.shared]
- * 的同一个 dispatcher，结果把全局调度器关掉 → 后续所有网络请求报 "executor rejected"。
- *
- * 修正为**单例缓存**：一个应用生命周期内只建一次，复用 shared 的连接池/调度器，且永不 shutdown，
- * 既避免 per-Player 线程泄漏，也不会误伤其他接口。
+ * 2026-09-14：这个按钮原来是 40dp、直接叠在内容之上，而音频布局的右列正好是歌词 ——
+ * 按钮压在歌词首行/「暂无歌词」文案上。现在缩到 32dp 并**在内容区顶部留出一条空白带**，
+ * 让按钮落在带子里而不是盖在歌词上。留白必须 ≥ 按钮直径 + 上边距，否则又会重叠。
  */
-private object StreamHttpClient {
-    @Volatile
-    private var client: okhttp3.OkHttpClient? = null
-
-    fun get(appContext: Context): okhttp3.OkHttpClient {
-        return client ?: synchronized(this) {
-            client ?: OkHttpClientProvider.shared.newBuilder()
-                // 视频走设备 WiFi 直连，首帧/大文件读取可能较慢，放宽超时避免被误判连接失败（2001）。
-                .connectTimeout(20, TimeUnit.SECONDS)
-                .readTimeout(180, TimeUnit.SECONDS)
-                .addInterceptor(RetrofitClient.authInterceptor { AppPreferences(appContext) })
-                .build()
-                .also { client = it }
-        }
-    }
-}
-
-/**
- * 从 Context 链中找出宿主 Activity（与 UfiToastOverlay 同款，避免 `LocalContext as? Activity` 失败）。
- */
-private fun findActivity(context: Context): Activity? {
-    var current = context
-    while (current is ContextWrapper) {
-        if (current is Activity) return current
-        current = current.baseContext
-    }
-    return null
-}
-
-/**
- * 沉浸式全屏 Side Effect：隐藏状态栏/导航栏、强制横屏、保持亮屏。
- * 退出/Dispose 时自动恢复原始方向和系统栏显示状态。
- */
-@Composable
-private fun FullscreenSystemUiEffect(enabled: Boolean) {
-    val context = LocalContext.current
-    DisposableEffect(enabled) {
-        if (!enabled) return@DisposableEffect onDispose { }
-
-        val activity = findActivity(context) ?: return@DisposableEffect onDispose { }
-        val window = activity.window
-        val controller = WindowInsetsControllerCompat(window, window.decorView)
-        val originalOrientation = activity.requestedOrientation
-        val originalKeepScreenOn = (window.attributes.flags and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) != 0
-
-        activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-        controller.hide(WindowInsetsCompat.Type.systemBars())
-        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        onDispose {
-            activity.requestedOrientation = originalOrientation
-            controller.show(WindowInsetsCompat.Type.systemBars())
-            if (!originalKeepScreenOn) {
-                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            }
-        }
-    }
-}
+private val AUDIO_CLOSE_BUTTON_SIZE = 32.dp
+private val AUDIO_CLOSE_STRIP_HEIGHT = 38.dp
 
 /**
  * 文件预览悬浮窗（卡片式）。
@@ -241,7 +185,7 @@ fun FilePreviewOverlay(
         LaunchedEffect(target) {
             if (target == null) videoFullscreen = false
         }
-        FullscreenSystemUiEffect(enabled = kind == FileKind.VIDEO && videoFullscreen)
+        UfiFullscreenSystemUiEffect(enabled = kind == FileKind.VIDEO && videoFullscreen)
 
         // scrim：轻量主题化遮罩（非纯黑），点空白关闭。真正「模糊」由 FileManagerRoot
         // 在预览打开时把文件管理器内容做 blur 实现，此处只负责压暗，让卡片更聚焦。
@@ -336,13 +280,17 @@ fun FilePreviewOverlay(
                     FileKind.AUDIO -> {
                         // 沉浸式：去掉顶部文件名标题栏，仅把关闭按钮浮在卡片右上角。
                         // 歌曲信息（标题/艺人/专辑）已由下方 SongMeta 展示，顶栏标题冗余。
+                        //
+                        // 按钮虽然是叠放的，但音频内容自己在顶部留了 AUDIO_CLOSE_STRIP_HEIGHT
+                        // 的空白带（见 AudioPreviewContent 的 padding），所以不会压到右列歌词。
                         Box(modifier = Modifier.fillMaxWidth()) {
                             key(item.path) { MediaPreviewContent(item.path, "audio", playing = target != null) }
                             PreviewCloseButton(
                                 onDismiss,
                                 modifier = Modifier
                                     .align(Alignment.TopEnd)
-                                    .padding(top = Spacing.Small, end = Spacing.DialogPaddingH)
+                                    .padding(top = Spacing.Small, end = Spacing.DialogPaddingH),
+                                size = AUDIO_CLOSE_BUTTON_SIZE
                             )
                         }
                     }
@@ -354,7 +302,11 @@ fun FilePreviewOverlay(
 }
 
 @Composable
-private fun PreviewCloseButton(onDismiss: () -> Unit, modifier: Modifier = Modifier) {
+private fun PreviewCloseButton(
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+    size: Dp = 40.dp
+) {
     val palette = LocalResolvedPalette.current
     // 关闭按钮底色对齐公共弹窗 UfiDialogShell：pageBg(0.85) 而非 surfaceMuted，
     // 让灰圈几乎融入卡片、不抢视觉；图标走 textSecondary。
@@ -362,14 +314,14 @@ private fun PreviewCloseButton(onDismiss: () -> Unit, modifier: Modifier = Modif
         onClick = onDismiss,
         shape = CircleShape,
         color = palette.pageBg.copy(alpha = 0.85f),
-        modifier = modifier.size(40.dp)
+        modifier = modifier.size(size)
     ) {
         Box(contentAlignment = Alignment.Center) {
             Icon(
                 imageVector = Icons.Default.Close,
                 contentDescription = "关闭",
                 tint = palette.textSecondary,
-                modifier = Modifier.size(20.dp)
+                modifier = Modifier.size(size / 2)
             )
         }
     }
@@ -552,7 +504,7 @@ private fun MediaPreviewContent(
     //   - 不能裸 DefaultHttpDataSource：它无法逐请求重签，第二个 Range 请求会因 nonce 复用被拒（2004）；
     //   - 也不能只塞静态 Bearer：缺签名同样被 401/444 拒。
     // OkHttpDataSource 每发一个分片请求都过拦截器，自动带最新签名 + 时间戳 + nonce，并自带 401 重签重试。
-    val mediaHttpClient = remember { StreamHttpClient.get(appContext) }
+    val mediaHttpClient = remember { UfiStreamHttpClient.get(appContext) }
     val exoPlayer = remember(filePath) {
         val dataSourceFactory = OkHttpDataSource.Factory(mediaHttpClient)
         val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
@@ -767,8 +719,8 @@ private fun MediaPreviewContent(
  * 音频预览播放器（重构版）：音乐播放器样式。
  * - 元数据：取自 ExoPlayer 解析出的 [MediaMetadata]（标题/艺术家/专辑/内嵌封面），
  *   无标签时回退到文件名（去扩展名）。
- * - 歌词：优先尝试同目录同名 `.lrc` 兄弟文件（经现有 `/api/files/stream` 拉取并解析 LRC 时间轴），
- *   缺失/解析失败则显示「暂无歌词」。无需改动 core。
+ * - 歌词：走公共实现 [UfiAudioLyrics]（同目录同名 `.lrc` → 内嵌 ID3 USLT/SYLT 或 FLAC LYRICS），
+ *   与音乐播放页共用同一份；都取不到则显示「暂无歌词」。
  * - 播放控制：自建 播放/暂停 + 进度条 + 当前/总时长，替代默认 PlayerView 控制器（避免音频 SurfaceView 在
  *   退场动画里重合成掉帧，也统一为音乐播放器观感）。
  */
@@ -783,7 +735,7 @@ private fun AudioPlayerUi(
     palette: ResolvedPalette
 ) {
     var metadata by remember { mutableStateOf<MediaMetadata?>(null) }
-    var lyrics by remember { mutableStateOf<List<Pair<Long, String>>?>(null) }
+    var lyrics by remember { mutableStateOf<List<UfiAudioLyrics.Line>?>(null) }
     var lyricsLoading by remember { mutableStateOf(true) }
 
     // 播放态（进度/时长/是否播放）单一数据源：内部 250ms 轮询，仅被控件/歌词子项读取 .value，
@@ -816,42 +768,84 @@ private fun AudioPlayerUi(
         onDispose { exoPlayer.removeListener(listener) }
     }
 
-    // 歌词：先试同目录同名 .lrc，失败再抽 mp3 内嵌的 USLT/SYLT 帧（见 loadLyrics）。
+    // 歌词：走公共实现 [UfiAudioLyrics]（同目录 .lrc → 内嵌 USLT/SYLT/FLAC LYRICS），
+    // 与音乐播放页共用同一份取词与解析。
+    // api / mediaId 传 null：文件管理器里的文件不一定在音频库里（没扫到就没有 id），
+    // 问 core 的 /api/media/lyrics 也无从下手，直接从这两级按路径找。
     LaunchedEffect(filePath) {
         lyricsLoading = true
         lyrics = null
-        lyrics = loadLyrics(httpClient, prefs, filePath)
+        lyrics = UfiAudioLyrics.load(
+            api = null,
+            mediaId = null,
+            httpClient = httpClient,
+            prefs = prefs,
+            filePath = filePath
+        )?.lines
         lyricsLoading = false
     }
+
+    // sidecar 封面（2026-09-14 新增，与 web 端同口径）：
+    // ExoPlayer 只给内嵌封面（artworkData），而大量 FLAC / 整轨是外挂封面 ——
+    // 同目录躺着 cover.jpg 却显示音符占位，是这次双端对齐要补的一处。
+    // 只在内嵌封面确实缺失时才去探：有内嵌就不该多发请求。
+    var sidecarCover by remember(filePath) { mutableStateOf<ByteArray?>(null) }
+    LaunchedEffect(filePath, metadata?.artworkData == null) {
+        if (metadata?.artworkData != null) {
+            sidecarCover = null
+            return@LaunchedEffect
+        }
+        sidecarCover = loadSidecarCover(httpClient, prefs, filePath)
+    }
+
+    // 歌词区高度必须与左列（封面 + 歌曲信息）**逐像素一致**：上边界对齐封面上沿，
+    // 下边界对齐歌曲信息下沿。左列内容是固定高度（封面 150dp + 间距 + 三行文字），
+    // 所以由左列实测高度反向约束歌词列，而不是两边各自 fillMaxHeight 后靠 Row 居中"看起来差不多"。
+    var lyricsColumnHeightPx by remember { mutableIntStateOf(0) }
+    val density = LocalDensity.current
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(Brush.verticalGradient(colors = listOf(palette.accentContainer, palette.cardBg)))
             // 内边距对齐公共弹窗 UfiDialogShell（DialogPaddingH 18dp）；纵向收紧，避免上下过空。
-            .padding(horizontal = Spacing.DialogPaddingH, vertical = Spacing.Medium),
+            // top 用 AUDIO_CLOSE_STRIP_HEIGHT：给右上角关闭按钮留一条空白带，
+            // 否则按钮会压在右列歌词的首行上（2026-09-14 修复）。
+            .padding(
+                start = Spacing.DialogPaddingH,
+                end = Spacing.DialogPaddingH,
+                top = AUDIO_CLOSE_STRIP_HEIGHT,
+                bottom = Spacing.Medium
+            ),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // 上半区：左列控件（封面+歌名）/ 右列歌词，50/50 横排；高度封顶，避免卡片被纵向拉得过长。
+        //
+        // 2026-09-14 第二轮：在上一轮 −15%（200→170 / 300→255）之上再收 10% → 153 / 230。
+        // 顶对齐（Alignment.Top）而非居中：居中会让左列内容上下各留一段空白，
+        // 而歌词列是 fillMaxHeight，结果歌词比"封面上沿→信息下沿"这一段高出去 ——
+        // 那正是"显示区域没固定住"的观感来源。
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .heightIn(min = 200.dp, max = 300.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .heightIn(min = 153.dp, max = 230.dp),
+            verticalAlignment = Alignment.Top
         ) {
-            // 左列：封面 + 歌曲信息
+            // 左列：封面 + 歌曲信息。不再 fillMaxHeight —— 它自己的内容高度就是这一区的基准，
+            // 实测值上报给歌词列使用。
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxHeight(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+                    .onSizeChanged { lyricsColumnHeightPx = it.height },
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                CoverArtwork(metadata?.artworkData, palette)
+                // 内嵌封面优先，没有才用同目录 sidecar 图（与 web 端回退顺序一致）
+                CoverArtwork(metadata?.artworkData ?: sidecarCover, palette)
                 Spacer(Modifier.height(Spacing.Medium))
                 SongMeta(metadata, fileName, palette)
             }
-            // 右列：歌词（随进度滚动高亮当前行，当前行居中）
+            // 右列：歌词（随进度滚动高亮当前行，当前行居中）。
+            // 高度锁到左列实测值；首帧还没测到时先不给固定高度（避免 0dp 一帧闪烁）。
             LyricsPanel(
                 lyrics = lyrics,
                 lyricsLoading = lyricsLoading,
@@ -860,7 +854,15 @@ private fun AudioPlayerUi(
                 positionMs = positionMs,
                 scrubbing = scrubbing,
                 scrubPos = scrubPos,
-                modifier = Modifier.weight(1f)
+                modifier = Modifier
+                    .weight(1f)
+                    .then(
+                        if (lyricsColumnHeightPx > 0) {
+                            Modifier.height(with(density) { lyricsColumnHeightPx.toDp() })
+                        } else {
+                            Modifier.fillMaxHeight()
+                        }
+                    )
             )
         }
         Spacer(Modifier.height(Spacing.Small))
@@ -878,223 +880,47 @@ private fun AudioPlayerUi(
 }
 
 /**
- * 解析 LRC 文本为「时间戳(ms) → 歌词」列表（按时间升序）。
- * - 支持一行多时间戳、[offset:N] 全局偏移、BOM、毫秒 1~3 位。
- * - 纯文本（无时间标签）返回空列表，由调用方判断是否回退内嵌/无歌词。
+ * 同目录 sidecar 封面（2026-09-14 新增，与 web 端 `trySidecarCover` 同口径）。
+ *
+ * ExoPlayer 只给内嵌封面；无内嵌图的文件（大量 FLAC、整轨）在同目录会躺着一张图。
+ * 候选顺序照常见播放器：同名图优先，再看整张专辑共用的 cover / folder / front。
+ *
+ * 每个候选先用 `Range: bytes=0-0` 花 1 个字节探存在，命中后才整取 ——
+ * 盲目整取会在每次打开一首没封面的歌时白拉 5 次几百 KB。
  */
-private fun parseLrc(text: String): List<Pair<Long, String>> {
-    val clean = text.replace("\uFEFF", "")
-    val tagRegex = Regex("""\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?]""")
-    val offsetRegex = Regex("""\[offset:\s*(-?\d+)\s*]""")
-    var offsetMs = 0L
-    val out = mutableListOf<Pair<Long, String>>()
-    for (raw in clean.lineSequence()) {
-        // [offset:N] 全局时间偏移（毫秒），单独处理，不计入歌词行。
-        val off = offsetRegex.find(raw.lowercase())
-        if (off != null) {
-            offsetMs = off.groupValues[1].toLongOrNull() ?: 0L
-            continue
-        }
-        val times = tagRegex.findAll(raw).toList()
-        if (times.isEmpty()) continue
-        val content = raw.replace(tagRegex, "").trim()
-        if (content.isEmpty()) continue
-        for (tm in times) {
-            val min = tm.groupValues[1].toLongOrNull() ?: 0L
-            val sec = tm.groupValues[2].toLongOrNull() ?: 0L
-            val frac = tm.groupValues[3].let { fs ->
-                if (fs.isNotEmpty()) (fs + "000").take(3).toLongOrNull() ?: 0L else 0L
-            }
-            out.add(((min * 60 + sec) * 1000 + frac + offsetMs) to content)
+private suspend fun loadSidecarCover(
+    httpClient: okhttp3.OkHttpClient,
+    prefs: AppPreferences,
+    filePath: String
+): ByteArray? {
+    val base = filePath.substringBeforeLast('.', missingDelimiterValue = filePath)
+    val dir = filePath.substringBeforeLast('/', missingDelimiterValue = "")
+    val candidates = buildList {
+        listOf("jpg", "jpeg", "png", "webp").forEach { add("$base.$it") }
+        listOf("cover.jpg", "cover.png", "folder.jpg", "front.jpg").forEach {
+            add(if (dir.isEmpty()) it else "$dir/$it")
         }
     }
-    return out.sortedBy { it.first }
-}
-
-/**
- * 加载歌词：
- *  1) 优先同目录同名 `.lrc` 兄弟文件（经 /api/files/download 全量拉取并解析 LRC，core 无需改动）；
- *  2) 回退到音频内嵌歌词（ID3 USLT/SYLT 帧）—— 很多歌曲（如本例《九万字》）歌词直接嵌在 mp3 里，
- *     没有独立 .lrc 文件，旧实现只查兄弟 .lrc 故永远「暂无歌词」。
- * 两者都失败返回 null（UI 显示「暂无歌词」）。
- */
-private suspend fun loadLyrics(
-    httpClient: okhttp3.OkHttpClient,
-    prefs: AppPreferences,
-    filePath: String
-): List<Pair<Long, String>>? {
-    trySiblingLrc(httpClient, prefs, filePath)?.let { return it }
-    return tryEmbeddedLyrics(httpClient, prefs, filePath)
-}
-
-/** 尝试同目录同名的 .lrc 兄弟文件。 */
-private suspend fun trySiblingLrc(
-    httpClient: okhttp3.OkHttpClient,
-    prefs: AppPreferences,
-    filePath: String
-): List<Pair<Long, String>>? {
-    val lrcPath = filePath.substringBeforeLast('.', missingDelimiterValue = filePath) + ".lrc"
-    if (lrcPath.equals(filePath, ignoreCase = true)) return null
-    val encoded = URLEncoder.encode(lrcPath, "UTF-8")
-    val url = "http://${prefs.effectiveHost}:${prefs.serverPort}/api/files/download?path=$encoded"
-    return try {
-        val resp = withContext(Dispatchers.IO) {
-            httpClient.newCall(Request.Builder().url(url).build()).execute()
-        }
-        // 必须 use{}：非 2xx 直接返回 null 时响应体既不读也不关，连接会一直挂在
-        // OkHttp 连接池里（没配 .lrc 是常态，这个分支命中率很高）。
-        resp.use { r ->
-            if (r.isSuccessful) {
-                parseLrc(r.body?.string().orEmpty()).takeIf { it.isNotEmpty() }
-            } else null
-        }
-    } catch (_: Exception) { null }
-}
-
-/**
- * 从音频文件自身抽取内嵌歌词：经 /api/files/stream 用 Range 只读 ID3 标签段（不拉整首），
- * 解析 USLT/SYLT 帧得到 LRC 文本再交给 parseLrc。
- * 文本帧（TIT2/TPE1/.../USLT）通常排在封面 APIC 之前，故先读 64KB 一般就能取到；
- * 若 64KB 内没找到且标签更大，再按标签大小补取一次（封顶 4MB）。
- * 仅对可能含 ID3 的音频格式（mp3/flac）尝试，避免对其它文件无意义请求。
- */
-private suspend fun tryEmbeddedLyrics(
-    httpClient: okhttp3.OkHttpClient,
-    prefs: AppPreferences,
-    filePath: String
-): List<Pair<Long, String>>? {
-    if (!filePath.endsWith(".mp3", ignoreCase = true) &&
-        !filePath.endsWith(".flac", ignoreCase = true)) return null
-    val encoded = URLEncoder.encode(filePath, "UTF-8")
-    val base = "http://${prefs.effectiveHost}:${prefs.serverPort}/api/files/stream?path=$encoded"
-    return try {
-        val headBytes = withContext(Dispatchers.IO) {
-            httpClient.newCall(
-                Request.Builder().url(base).header("Range", "bytes=0-65535").build()
-            ).execute().body?.bytes()
-        } ?: return null
-        val tagSize = id3TagSize(headBytes) ?: return null
-        // 先在 64KB 内找（常见布局已足够，且不会拉到巨大的 APIC 封面）
-        val fromHead = extractEmbeddedLyrics(headBytes)
-        if (fromHead != null) return parseLrc(fromHead).takeIf { it.isNotEmpty() }
-        // 64KB 内未命中且标签更大 → 补取整段标签再找一次
-        if (tagSize > 65536) {
-            val end = (tagSize - 1).coerceAtMost(4 * 1024 * 1024 - 1)
-            val fullBytes = withContext(Dispatchers.IO) {
+    val host = "http://${prefs.effectiveHost}:${prefs.serverPort}/api/files/stream?path="
+    for (candidate in candidates) {
+        val url = host + URLEncoder.encode(candidate, "UTF-8")
+        val exists = try {
+            withContext(Dispatchers.IO) {
                 httpClient.newCall(
-                    Request.Builder().url(base).header("Range", "bytes=0-$end").build()
-                ).execute().body?.bytes()
-            } ?: return null
-            val fromFull = extractEmbeddedLyrics(fullBytes)
-            if (fromFull != null) return parseLrc(fromFull).takeIf { it.isNotEmpty() }
-        }
-        null
-    } catch (_: Exception) { null }
-}
-
-/** 读 ID3v2 标签声明大小（synchsafe 整数）。非 ID3v2 返回 null。 */
-private fun id3TagSize(bytes: ByteArray): Int? {
-    if (bytes.size < 10) return null
-    if (!isId3v2(bytes)) return null
-    return ((bytes[6].toInt() and 0x7F) shl 21) or
-           ((bytes[7].toInt() and 0x7F) shl 14) or
-           ((bytes[8].toInt() and 0x7F) shl 7) or
-           (bytes[9].toInt() and 0x7F)
-}
-
-private fun isId3v2(bytes: ByteArray): Boolean =
-    bytes.size >= 3 && (bytes[0].toInt() and 0xFF) == 'I'.code &&
-    (bytes[1].toInt() and 0xFF) == 'D'.code && (bytes[2].toInt() and 0xFF) == '3'.code
-
-/**
- * 从 ID3v2 标签字节中找 USLT/SYLT 帧并解出歌词文本。
- * - v2.3 帧大小 4 字节大端；v2.4 帧大小用 synchsafe。
- * - USLT/SYLT 帧体 = [编码字节][语言3字节][描述符(同编码,以\0(或\0\0)结尾)][歌词文本]；
- *   描述符之后才是真正的歌词（UTF-16 歌词自带 BOM），解码时跳过描述符即可。
- */
-private fun extractEmbeddedLyrics(bytes: ByteArray): String? {
-    if (bytes.size < 10 || !isId3v2(bytes)) return null
-    val major = bytes[3].toInt() and 0xFF
-    val tagSize = id3TagSize(bytes) ?: return null
-    val end = (10 + tagSize).coerceAtMost(bytes.size)
-    val idLen = if (major == 2) 3 else 4
-    var pos = 10
-    while (pos + idLen + 6 <= end) {
-        val id = runCatching { String(bytes, pos, idLen, Charsets.ISO_8859_1) }.getOrDefault("")
-        if (id.isBlank() || id[0] == '\u0000') break
-        val frameSize: Int
-        val bodyOffset: Int
-        when (major) {
-            2 -> {
-                frameSize = ((bytes[pos + 3].toInt() and 0xFF) shl 16) or
-                    ((bytes[pos + 4].toInt() and 0xFF) shl 8) or
-                    (bytes[pos + 5].toInt() and 0xFF)
-                bodyOffset = pos + 6
+                    Request.Builder().url(url).header("Range", "bytes=0-0").build()
+                ).execute().use { it.isSuccessful && (it.body?.bytes()?.isNotEmpty() == true) }
             }
-            3 -> {
-                frameSize = ((bytes[pos + 4].toInt() and 0xFF) shl 24) or
-                    ((bytes[pos + 5].toInt() and 0xFF) shl 16) or
-                    ((bytes[pos + 6].toInt() and 0xFF) shl 8) or
-                    (bytes[pos + 7].toInt() and 0xFF)
-                bodyOffset = pos + 10
+        } catch (_: Exception) { false }
+        if (!exists) continue
+        val data = try {
+            withContext(Dispatchers.IO) {
+                httpClient.newCall(Request.Builder().url(url).build())
+                    .execute().use { if (it.isSuccessful) it.body?.bytes() else null }
             }
-            4 -> {
-                frameSize = ((bytes[pos + 4].toInt() and 0x7F) shl 21) or
-                    ((bytes[pos + 5].toInt() and 0x7F) shl 14) or
-                    ((bytes[pos + 6].toInt() and 0x7F) shl 7) or
-                    (bytes[pos + 7].toInt() and 0x7F)
-                bodyOffset = pos + 10
-            }
-            else -> return null
-        }
-        if (frameSize <= 0 || bodyOffset + frameSize > end) break
-        if (id == "USLT" || id == "SYLT") {
-            val text = decodeLyricsFrame(bytes.copyOfRange(bodyOffset, bodyOffset + frameSize))
-            if (text != null) return text
-        }
-        pos = bodyOffset + frameSize
+        } catch (_: Exception) { null }
+        if (data != null && data.size > 32) return data
     }
     return null
-}
-
-/** 解出 USLT/SYLT 帧体内的歌词文本，跳过描述符段。 */
-private fun decodeLyricsFrame(body: ByteArray): String? {
-    if (body.size < 4) return null
-    val enc = body[0].toInt() and 0xFF
-    var textStart = -1
-    when (enc) {
-        // UTF-16：描述符以 \0\0 终止（文本字符为 XX 00，不会误命中两个连续 0）
-        1, 2 -> {
-            var j = 4
-            while (j + 1 < body.size) {
-                if ((body[j].toInt() and 0xFF) == 0 && (body[j + 1].toInt() and 0xFF) == 0) {
-                    textStart = j + 2
-                    break
-                }
-                j += 2
-            }
-        }
-        // 0 = ISO-8859-1，3 = UTF-8：描述符以单个 \0 终止
-        else -> {
-            var j = 4
-            while (j < body.size) {
-                if ((body[j].toInt() and 0xFF) == 0) {
-                    textStart = j + 1
-                    break
-                }
-                j++
-            }
-        }
-    }
-    if (textStart < 0 || textStart >= body.size) return null
-    val textBytes = body.copyOfRange(textStart, body.size)
-    val charset = when (enc) {
-        1, 2 -> Charsets.UTF_16
-        3 -> Charsets.UTF_8
-        else -> Charsets.ISO_8859_1
-    }
-    val text = String(textBytes, charset)
-    return text.takeIf { it.isNotBlank() }
 }
 
 /** 毫秒格式化为 m:ss。 */
@@ -1283,7 +1109,7 @@ private fun PlayerButton(
  */
 @Composable
 private fun LyricsPanel(
-    lyrics: List<Pair<Long, String>>?,
+    lyrics: List<UfiAudioLyrics.Line>?,
     lyricsLoading: Boolean,
     exoPlayer: ExoPlayer,
     palette: ResolvedPalette,
@@ -1294,26 +1120,32 @@ private fun LyricsPanel(
 ) {
     val listState = rememberLazyListState()
     val density = LocalDensity.current
+    // 是否带时间轴：纯文本歌词（时间戳为负）不高亮、不自动滚动、不可点击跳转，
+    // 只当作可手动滚动的静态文本渲染 —— 否则会假装"当前行"骗人。
+    val synced = lyrics?.any { it.timeMs >= 0L } == true
     // 上下留白：取「(视口高 − 单行高)/2」，使首尾行也能滚动到正中（否则首行最多贴顶）。
     var centerPad by remember { mutableStateOf(0.dp) }
     // 拖拽时跟随草稿位置（与进度条同一份 scrub 状态），松手恢复轮询位置。
     // 位置在首句之前时默认指向第 0 行 → 开局即居中第一句（而非空在顶部）。
     val currentPositionMs = if (scrubbing.value) scrubPos.value.toLong() else positionMs.value
-    val currentLine = remember(lyrics, currentPositionMs) {
-        val idx = lyrics?.indexOfLast { it.first <= currentPositionMs } ?: -1
-        if (idx < 0) 0 else idx
+    val currentLine = remember(lyrics, currentPositionMs, synced) {
+        if (!synced) -1
+        else {
+            val idx = lyrics?.indexOfLast { it.timeMs <= currentPositionMs } ?: -1
+            if (idx < 0) 0 else idx
+        }
     }
     // 进度变化 → 当前行滚动到居中（contentPadding 已保证首/尾行可居中）。
     // 拖拽中（scrubbing）用瞬时 scrollToItem 跟随手指 1:1，避免动画追着移动目标导致发顿；
     // 正常播放推进用 animateScrollToItem 平滑归位。
     LaunchedEffect(currentLine) {
-        if (lyrics.isNullOrEmpty()) return@LaunchedEffect
+        if (lyrics.isNullOrEmpty() || currentLine < 0) return@LaunchedEffect
         if (scrubbing.value) listState.scrollToItem(currentLine)
         else listState.animateScrollToItem(currentLine)
     }
     // 首帧布局完成后：测量单行高，算出上下留白并把初始当前行平滑居中（开局视口为 0 时避免贴顶）。
     LaunchedEffect(lyrics) {
-        if (lyrics.isNullOrEmpty()) return@LaunchedEffect
+        if (lyrics.isNullOrEmpty() || !synced) return@LaunchedEffect
         val info = snapshotFlow { listState.layoutInfo }
             .first { it.viewportSize.height > 0 && it.visibleItemsInfo.isNotEmpty() }
         val vp = info.viewportSize.height
@@ -1349,7 +1181,7 @@ private fun LyricsPanel(
                 ) {
                     items(lyrics.size) { i ->
                         val (t, line) = lyrics[i]
-                        val active = i == currentLine
+                        val active = synced && i == currentLine
                         // 渐入渐出（强化）：当前行清晰高亮，其余行淡出并轻微缩放，切换平滑过渡；去掉模糊。
                         val activeAnim = animateFloatAsState(
                             targetValue = if (active) 1f else 0f,
@@ -1375,7 +1207,8 @@ private fun LyricsPanel(
                                     scaleY = lineScale
                                 }
                                 .padding(vertical = Spacing.Medium)
-                                .clickable { exoPlayer.seekTo(t) }
+                                // 无时间轴时不挂点击：跳 t=-1 只会把播放位置甩到开头。
+                                .then(if (synced) Modifier.clickable { exoPlayer.seekTo(t) } else Modifier)
                         )
                     }
                 }

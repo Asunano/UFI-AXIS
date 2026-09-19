@@ -63,6 +63,38 @@ class AdbClient(
     fun getState(): String = if (isConnected) "device" else "offline"
 
     // ------------------------------------------------------------------
+    // 网络 ADB 切换
+    // ------------------------------------------------------------------
+
+    /**
+     * 让设备端 adbd 切换到 TCP 监听模式，等价于在 PC 上执行 `adb tcpip <port>`。
+     *
+     * 通过打开设备侧 `tcpip:<port>` 服务实现：设备会返回形如
+     * `restarting in TCP mode port: 5555` 的文本后关闭通道。调用前需已建立连接。
+     */
+    fun tcpip(port: Int = AdbConnection.DEFAULT_PORT): String {
+        val conn = requireConnection()
+        val stream = conn.openStream("tcpip:$port")
+        return try {
+            val out = java.io.ByteArrayOutputStream()
+            val deadline = System.currentTimeMillis() + 15_000L
+            while (true) {
+                val remain = deadline - System.currentTimeMillis()
+                if (remain <= 0) break
+                if (stream.available() == 0) {
+                    if (stream.isClosed) break
+                    if (!stream.awaitData(remain)) break
+                }
+                out.write(stream.readAvailable())
+                if (stream.isClosed && stream.available() == 0) break
+            }
+            String(out.toByteArray(), Charsets.UTF_8).trim()
+        } finally {
+            try { stream.close() } catch (_: Exception) { }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 设备就绪检测
     // ------------------------------------------------------------------
 

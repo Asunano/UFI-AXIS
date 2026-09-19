@@ -157,10 +157,10 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 验证码（通知页签）同样需要实时刷新：自动复制验证码的触发点就在 loadVerificationCodes()
-    // 内部（ToolsModule.autoCopyNewestVerificationCode），不轮询则新到的验证码不会被拉取、
-    // 也就不会自动复制到剪贴板，表现为「自动复制功能失效」。仅「通知」页签且没打开对话时跑，
-    // 复用联系人轮询同样的间隔与生命周期（页面离开 / 切页签时 LaunchedEffect 自动取消）。
+    // 验证码（通知页签）实时刷新：
+    // 2026-09-13 修复：自动复制验证码已迁移至 `:ufi_notify` 进程后台触发（见 NotificationCenter），
+    // 不再依赖本页面的 UI 轮询。这里的轮询仅用于「通知」页签列表刷新和未读角标计算。
+    // 仅「通知」页签且没打开对话时跑，复用联系人轮询同样的间隔与生命周期。
     LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
         if (toolsState.smsTab != 1 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
         while (true) {
@@ -315,7 +315,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     val enteringConversation = targetState != null
                     // 2026-09-04（P2b）：下面两处 `fadeOut(tween(240))` → Duration.Fluid（250，+10ms，
                     // 在吸附容差内）。240 与梯度上的 250 是同一种「离场比进场快半拍」的手感，
-                    // 全库不该保留两个数；顺带与弹窗离场（UfiDialogAnim.ExitDuration）走了同一档。
+                    // 全库不该保留两个数；顺带与弹窗离场（UfiMotion.Duration.Fluid）走了同一档。
                     val transform = if (enteringConversation) {
                         // push：新页整幅宽度滑入压在上面，旧页只走 1/4 宽做视差（M3 的做法，
                         // 两页等速对滑会像"翻牌"，视差才有层级）
@@ -620,15 +620,21 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
                 // 跳转走公共 UfiButton（variant = Secondary）：原来是 M3 原生 TextButton 挤在标题行右侧，
                 // 既不是公共组件、点击区域也只有文字那么大。
+                //
+                // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+                // 这个 local 必须在弹窗自己的 lambda 内部读，在外面读会拿到"直接执行"的默认实现。
+                val closeDetail = LocalUfiDialogClose.current
                 UfiButton(
                     variant = UfiButtonVariant.Secondary,
                     text = "查看原对话",
                     onClick = {
-                        // 暂存当前这条：对话关掉后弹窗自动回来，不切页签也不丢滚动位置。
-                        // 同时把 msgId 带过去 —— 对话打开后直接滚到并高亮这条验证码短信。
-                        reopenCodeAfterConversation = vc
-                        codeDetail = null
-                        viewModel.tools.openVerificationCodeSource(vc.source, vc.msgId)
+                        closeDetail {
+                            // 暂存当前这条：对话关掉后弹窗自动回来，不切页签也不丢滚动位置。
+                            // 同时把 msgId 带过去 —— 对话打开后直接滚到并高亮这条验证码短信。
+                            reopenCodeAfterConversation = vc
+                            codeDetail = null
+                            viewModel.tools.openVerificationCodeSource(vc.source, vc.msgId)
+                        }
                     }
                 )
             }

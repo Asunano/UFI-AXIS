@@ -225,11 +225,15 @@ fun BackupRestoreScreen(
                 )
             },
             dismissButton = {
+                // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+                // 见 LocalUfiDialogClose。必须在 slot 内部读，弹窗外读到的是"直接执行"的默认实现。
+                // 「导出」不包：它只是起协程并进入 loading，弹窗要留到导出结束才关。
+                val close = LocalUfiDialogClose.current
                 UfiButton(
                     text = "取消",
                     variant = UfiButtonVariant.Secondary,
                     enabled = !exporting,
-                    onClick = { exportDialogOpen = false }
+                    onClick = { close { exportDialogOpen = false } }
                 )
             }
         ) {
@@ -319,11 +323,13 @@ fun BackupRestoreScreen(
                 )
             },
             dismissButton = {
+                // 同上：只有「取消」是纯关闭动作；「检查备份包/开始恢复」要留在弹窗里跑异步。
+                val close = LocalUfiDialogClose.current
                 UfiButton(
                     text = "取消",
                     variant = UfiButtonVariant.Secondary,
                     enabled = !importBusy,
-                    onClick = { importDialogOpen = false }
+                    onClick = { close { importDialogOpen = false } }
                 )
             }
         ) {

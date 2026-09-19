@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  feature-media 的清单片段（2026-09-16）。
+
+  只声明**音乐播放服务**及其必需权限：MediaSession 的通知、锁屏与耳机按键都依赖一个
+  前台服务（`mediaPlayback` 类型）。放在本模块而不是 app 主清单里，是因为服务与它的
+  播放器实现、鉴权 DataSource 是一体的 —— 模块搬走时不该在主清单留一条孤儿声明。
+
+  POST_NOTIFICATIONS 已在 app 主清单声明（通知中心也要用），这里不重复。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+
+    <application>
+        <service
+            android:name="com.ufi_axis.ui.media.UfiAudioPlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService" />
+            </intent-filter>
+        </service>
+    </application>
+
+</manifest>

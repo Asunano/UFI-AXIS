@@ -36,6 +36,57 @@
     <string name="dialog_confirm_title">确认安装</string>
     <string name="dialog_confirm_message">即将向 %3$s 安装：\n\n%1$s\n大小：%2$s\n\n安装参数与命令行版本一致（pm install -r -d），安装后会自动授予权限并启动服务。</string>
 
+    <!-- 连接失败：重试 / 修改地址 / 取消 -->
+    <string name="dialog_connect_title">连接失败</string>
+    <string name="dialog_connect_message">无法连接到 %1$s。\n\n请选择：重试连接、修改设备地址，或取消安装。</string>
+    <string name="action_retry_connect">重试</string>
+    <string name="action_change_address">修改地址</string>
+
+    <!-- 修改设备地址 -->
+    <string name="dialog_address_title">修改设备地址</string>
+    <string name="dialog_address_hint">输入新的设备地址（可带 :端口，缺省自动补 5555）</string>
+
+    <!-- 手动输入包名 -->
+    <string name="dialog_package_title">手动输入包名</string>
+    <string name="dialog_package_hint">未能自动识别 Core 包名，请手动输入（如 com.ufi_axis_core）</string>
+
+    <!-- ============ 分屏向导 ============ -->
+    <string name="step_indicator">第 %1$d / 4 步</string>
+    <string name="screen_address_title">连接你的设备</string>
+    <string name="screen_address_sub">通过无线调试把 UFI-AXIS 核心服务安装到设备。</string>
+    <string name="title_confirm">确认安装</string>
+    <string name="subtitle_confirm">请核对以下安装信息，确认后将自动完成后续流程。</string>
+    <string name="title_installing">正在安装</string>
+    <string name="subtitle_installing">请勿关闭此界面，安装完成后会自动进入结果页。</string>
+    <string name="action_continue">继续</string>
+    <string name="action_back">返回</string>
+    <string name="action_view_log">查看日志</string>
+    <string name="detail_install_params">安装参数：pm install -r -d</string>
+    <string name="detail_perm_count">权限数量：%1$d</string>
+    <string name="detail_steps_title">将依次执行</string>
+    <string name="detail_step_1">检查内置 APK 并选定 core</string>
+    <string name="detail_step_2">解析地址 / 探测端口 / 连接设备</string>
+    <string name="detail_step_3">推送安装 APK、识别包名、授予权限</string>
+    <string name="detail_step_4">启动服务并轮询健康检查</string>
+    <string name="label_install_pkg">安装包：%1$s</string>
+    <string name="label_install_size">大小：%1$s</string>
+    <string name="label_package_name">包名</string>
+    <string name="label_apk_name">安装包</string>
+    <string name="label_apk_size">大小</string>
+    <string name="label_duration">耗时</string>
+    <string name="duration_format">%.1f 秒</string>
+    <string name="result_success_title">安装完成</string>
+    <string name="result_success_subtitle">核心服务运行正常</string>
+    <string name="result_failed_title">安装失败</string>
+    <string name="result_failed_subtitle">请查看日志定位原因</string>
+    <string name="step_env">检查环境</string>
+    <string name="step_connect">连接设备</string>
+    <string name="step_install">安装授权</string>
+    <string name="step_launch">启动检查</string>
+    <string name="result_addr">目标地址：%1$s</string>
+    <string name="result_pkg">包名：%1$s</string>
+    <string name="action_log">日志</string>
+
     <!-- ============ 提示 ============ -->
     <string name="toast_no_log_file">暂无日志文件可分享</string>
     <string name="toast_no_log">暂无日志内容</string>
@@ -46,4 +97,28 @@
     <!-- ============ 通知 ============ -->
     <string name="notification_channel_name">安装进度</string>
     <string name="notification_channel_desc">显示 UFI-AXIS 核心的安装进度</string>
+
+    <!-- ============ 开启远程 ADB（引导） ============ -->
+    <string name="remote_adb_title">开启远程 ADB</string>
+    <string name="remote_adb_sub">通过设备后台开启 ADB over TCP，便于电脑无线调试。</string>
+    <string name="remote_adb_label_address">设备后台地址（IP:端口）</string>
+    <string name="remote_adb_hint_address">默认 192.168.0.1:8080</string>
+    <string name="remote_adb_label_password">后台密码</string>
+    <string name="remote_adb_hint_password">默认 admin</string>
+    <string name="remote_adb_start">开启远程 ADB（引导）</string>
+    <string name="remote_adb_wire_title">请确认有线连接</string>
+    <string name="remote_adb_wire_message">无法连接，请确保是有线连接！\n\n请确认物理连接正常（设备已用数据线连接电脑，且与电脑在同一局域网）。</string>
+    <string name="remote_adb_wire_confirm">确认</string>
+    <string name="remote_adb_reboot_title">是否尝试重启设备</string>
+    <string name="remote_adb_reboot_message">连接仍未建立。是否确认重启设备以重新拉起 ADB 端口？\n\n重启后将自动重试连接。</string>
+    <string name="remote_adb_reboot_confirm">确认重启</string>
+    <string name="remote_adb_reboot_cancel">取消</string>
+    <string name="remote_adb_success_title">远程 ADB 已开启</string>
+    <string name="remote_adb_success_sub">电脑端可执行下方命令进行无线调试。</string>
+    <string name="remote_adb_failed_title">开启失败</string>
+    <string name="remote_adb_failed_sub">已多次重试仍未连通，请检查设备后重试。</string>
+    <string name="remote_adb_cmd_hint">在电脑上执行：</string>
+    <string name="remote_adb_cancel">取消</string>
+    <string name="remote_adb_retry">重新开始</string>
+    <string name="remote_adb_entry">远程 ADB</string>
 </resources>

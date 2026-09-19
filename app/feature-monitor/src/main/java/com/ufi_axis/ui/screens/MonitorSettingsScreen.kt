@@ -396,9 +396,16 @@ private fun MetricTypesDialog(
         visible = true,
         onDismiss = onDismiss,
         title = "采集指标",
-        confirmButton = { UfiButton(text = "确认", onClick = { onSave(draft) }) },
+        // 2026-09-18：自写的确认/取消按钮统一经 LocalUfiDialogClose 排时序 —— 弹窗离场的
+        // backdrop（逐渐清晰）要在窗口销毁前播完；local 必须在 slot 内部读，弹窗外读到的是
+        // "直接执行"的默认实现，等于没接。
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "确认", onClick = { close { onSave(draft) } })
+        },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -693,9 +700,13 @@ private fun SchedulerValueDialog(
         visible = true,
         onDismiss = onDismiss,
         title = field.title,
-        confirmButton = { UfiButton(text = "确认", onClick = { onConfirm(draft) }) },
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "确认", onClick = { close { onConfirm(draft) } })
+        },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {

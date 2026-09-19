@@ -1,14 +1,50 @@
 package com.ufi_axis.ui.screens
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.ufi_axis.data.model.DeliveryOutcome
+import com.ufi_axis.data.model.MailSendRecord
+import com.ufi_axis.data.notification.NotifyHistoryEntity
+import com.ufi_axis.data.notification.NotifyHistoryStore
+import com.ufi_axis.ui.components.common.UfiBadge
+import com.ufi_axis.ui.components.common.UfiBadgeType
+import com.ufi_axis.ui.components.common.UfiDivider
 import com.ufi_axis.ui.components.common.UfiLoadingIndicator
+import com.ufi_axis.ui.components.common.UfiSectionHeader
+import com.ufi_axis.ui.components.common.UfiSettingsGroup
+import com.ufi_axis.ui.components.common.UfiStatItem
+import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
+import com.ufi_axis.util.FormatUtils
 
 // ════════════════════════════════════════════════════
 // 记录页的共用件
@@ -70,8 +106,8 @@ internal fun deliveryHistorySummary(
     skippedTotal: Int
 ): String = when {
     !ready -> "加载中"
-    failedTotal > 0 -> "$failedTotal 条没发出"
-    skippedTotal > 0 -> "$skippedTotal 条已跳过"
+    failedTotal > 0 -> "$failedTotal 条投递失败"
+    skippedTotal > 0 -> "$skippedTotal 条已拦截"
     else -> "共 $total 条"
 }
 
@@ -101,3 +137,220 @@ internal fun LazyListScope.historyLoadMoreRow() {
  */
 internal fun historyRetentionSummary(rows: Int, ageDays: Int): String =
     if (ageDays <= 0) "最多 $rows 条 · 不限时长" else "最多 $rows 条 · 最近 $ageDays 天"
+
+// ════════════════════════════════════════════════════
+// 列表精简 / 详情弹窗 共用映射（2026-09 记录页增强）
+// ════════════════════════════════════════════════════
+//
+// 只提供文案与 Badge 类型映射，**不**新建公共 Dialog 组件 —— 详情壳一律用
+// UfiScrollableDialog + UfiDialogBody + UfiDialogInfoRow + UfiDialogActions。
+// 列表 description 禁止再拼 error / message 全文（护栏 HistoryUiGuardTest 守）。
+
+/** 投递三态 → 列表/详情 Badge。文案统一用书面口径，与筛选 chip / 详情「结果」一致。 */
+@Composable
+internal fun DeliveryOutcomeBadge(outcome: DeliveryOutcome) {
+    val (text, type) = when (outcome) {
+        DeliveryOutcome.SENT -> "已送达" to UfiBadgeType.SUCCESS
+        DeliveryOutcome.FAILED -> "投递失败" to UfiBadgeType.ERROR
+        DeliveryOutcome.SKIPPED -> "已拦截" to UfiBadgeType.WARNING
+    }
+    UfiBadge(text = text, type = type)
+}
+
+/** 系统通知两态 Badge。 */
+@Composable
+internal fun SystemHistoryOutcomeBadge(delivered: Boolean) {
+    if (delivered) {
+        UfiBadge(text = "已提醒", type = UfiBadgeType.SUCCESS)
+    } else {
+        UfiBadge(text = "未提醒", type = UfiBadgeType.WARNING)
+    }
+}
+
+/** 投递列表副文：时间 · 场景（结果走 trailing Badge，不进 description）。 */
+internal fun deliveryListSubtitle(record: MailSendRecord): String =
+    "${FormatUtils.formatTimestamp(record.sentAt)} · ${sceneLabel(record.scene)}"
+
+/** 系统通知列表副文：时间 · 场景。 */
+internal fun systemListSubtitle(record: NotifyHistoryEntity): String =
+    "${FormatUtils.formatTimestamp(record.ts)} · ${sceneLabel(record.sceneId)}"
+
+/** 拦截原因用户可读文案（与历史页共用，未知值原样带出）。 */
+internal fun historyBlockedReasonText(reason: String?): String = when (reason) {
+    NotifyHistoryStore.REASON_MASTER -> "通知总开关关着"
+    NotifyHistoryStore.REASON_CATEGORY -> "这一类通知关着"
+    NotifyHistoryStore.REASON_PERMISSION -> "系统设置里没允许本应用发通知"
+    NotifyHistoryStore.REASON_DEDUP -> "刚提醒过一样的内容"
+    NotifyHistoryStore.REASON_RATE_LIMIT -> "同类提醒太密，这条跳过了"
+    null -> "原因未记录"
+    else -> reason
+}
+
+/** 投递结果中文（详情弹窗 / 筛选 chip 共用）。 */
+internal fun deliveryOutcomeLabel(outcome: DeliveryOutcome): String = when (outcome) {
+    DeliveryOutcome.SENT -> "已送达"
+    DeliveryOutcome.FAILED -> "投递失败"
+    DeliveryOutcome.SKIPPED -> "已拦截"
+}
+
+/** 投递渠道中文。 */
+internal fun deliveryChannelLabel(channel: String): String = when (channel) {
+    DELIVERY_CHANNEL_MAIL -> "邮件"
+    DELIVERY_CHANNEL_WEBHOOK -> "Webhook"
+    DELIVERY_CHANNEL_LOCAL_SMS -> "本机短信"
+    else -> channel
+}
+
+/**
+ * 列表标题展示用：超长截断（下载文件名等），完整文案只进详情弹窗。
+ *
+ * 与 [UfiSettingsItem] 的 `titleMaxLines=1` + Ellipsis 叠加：Compose 省略号按字形截断，
+ * 这里再按字符上限收一刀，避免极长无空格串把行高顶歪。
+ */
+internal fun historyListTitle(raw: String, maxChars: Int = 48): String {
+    val t = raw.trim()
+    if (t.length <= maxChars) return t
+    return t.take(maxChars) + "…"
+}
+
+/**
+ * 三渠道配置页共用「发送/投递统计」卡（模块内组件，不进公共 UI 库）。
+ *
+ * 布局对齐邮件页既有统计：
+ * - 标题行右侧：最近成功（紧凑 MM-dd HH:mm）
+ * - 三格：由调用方给标签与数字（邮件=总发送/成功/失败；Webhook/短信=总投递/投递失败/已拦截）
+ * - **不展示错误正文** —— 失败详情走「最近投递」详情弹窗
+ * - 可选底部「发送测试」行
+ */
+@Composable
+internal fun ChannelDeliveryStatsCard(
+    total: Int?,
+    mid: Int?,
+    failed: Int?,
+    lastSuccessTs: Long?,
+    totalLabel: String,
+    midLabel: String,
+    failedLabel: String,
+    loaded: Boolean,
+    testRow: (@Composable () -> Unit)? = null
+) {
+    val palette = LocalResolvedPalette.current
+    UfiSettingsGroup {
+        UfiSectionHeader(
+            title = "发送统计",
+            trailing = {
+                Text(
+                    text = "最近成功 · " + (
+                        lastSuccessTs?.takeIf { it > 0 }?.let { formatStatsTime(it) } ?: "暂无"
+                        ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.textSecondary
+                )
+            }
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Medium),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            UfiStatItem(
+                value = if (loaded) total?.toString() ?: "0" else "--",
+                label = totalLabel,
+                modifier = Modifier.weight(1f)
+            )
+            UfiStatItem(
+                value = if (loaded) mid?.toString() ?: "0" else "--",
+                label = midLabel,
+                modifier = Modifier.weight(1f)
+            )
+            UfiStatItem(
+                value = if (loaded) failed?.toString() ?: "0" else "--",
+                label = failedLabel,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        if (testRow != null) {
+            UfiDivider()
+            testRow()
+        }
+    }
+}
+
+internal fun formatStatsTime(ts: Long): String =
+    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+        .format(java.util.Date(ts))
+
+/**
+ * 详情弹窗内的「长文本面板」：浅底 + 可选描边，标题与复制按钮都在面板内。
+ *
+ * 用途：失败异常链 / 通知正文 / 拦截原因。极长文本内部滚动（heightIn 上限），
+ * 避免把 UfiScrollableDialog 撑成整屏滚动条。
+ * 只用基础 Compose + 主题 token，不新增公共 UI API。
+ */
+@Composable
+internal fun HistoryDetailTextPanel(
+    title: String,
+    text: String,
+    onCopy: (() -> Unit)? = null,
+    emphasis: Boolean = false,
+    copyContentDescription: String = "复制",
+) {
+    val palette = LocalResolvedPalette.current
+    val shape = UfiCardDefaults.subtleShape
+    val bg = if (emphasis) {
+        palette.error.copy(alpha = 0.08f)
+    } else {
+        palette.surfaceMuted
+    }
+    val borderColor = if (emphasis) {
+        palette.error.copy(alpha = if (palette.isDark) 0.35f else 0.22f)
+    } else {
+        palette.cardBorder.copy(alpha = 0.6f)
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(bg)
+            .border(BorderStroke(1.dp, borderColor), shape)
+            .padding(horizontal = Spacing.Medium, vertical = Spacing.Small)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelLarge,
+                color = if (emphasis) palette.error else palette.textSecondary,
+                modifier = Modifier.weight(1f)
+            )
+            if (onCopy != null) {
+                IconButton(onClick = onCopy, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        imageVector = Icons.Filled.ContentCopy,
+                        contentDescription = copyContentDescription,
+                        tint = palette.textSecondary,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = HISTORY_DETAIL_PANEL_MAX_HEIGHT)
+                .verticalScroll(rememberScrollState())
+        ) {
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textPrimary,
+                textAlign = TextAlign.Start,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+    }
+}
+
+/** 长文本面板最大高度：再长也在面板内滚，不把整张详情弹窗拉成超长页。 */
+private val HISTORY_DETAIL_PANEL_MAX_HEIGHT = 180.dp

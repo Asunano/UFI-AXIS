@@ -21,3 +21,4 @@ rootProject.name = "ufi-axis-installer"
 
 include(":app")
 include(":adbcore")
+include(":goform")

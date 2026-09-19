@@ -198,10 +198,13 @@ watch(show, (v) => {
   font-weight: 600;
   color: var(--text-secondary);
 }
+/* 4 段（PCI 52 + EARFCN 86 + RSRP 95 + 锁定钮 28）+ 3×12 间距 ≈ 297px，
+   而弹窗内可用 ~280px ⇒ 必溢出。允许换行，并把锁定钮推到行尾。 */
 .neighbor-item {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   padding: 6px 0;
   border-bottom: 1px solid var(--border-subtle);
   font-size: 13px;

@@ -160,7 +160,9 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
     // 顶栏不放手动刷新：本页已有 10s 轮询 + WebSocket 推送 + 回前台重取三条自动刷新路径，
     // 出错时错误横幅本身带「重试」入口，手动按钮属于重复能力。
     UfiScreenScaffold(
-        title = greeting
+        title = greeting,
+        // 首页 5 个 Tab 的标题栏才显示「正在播放」：这几页标题栏只有一个标题、位置最富余
+        showNowPlaying = true
     ) { padding ->
         // 原来是 `PullToRefreshBox(isRefreshing = false, onRefresh = refreshDashboard(force))`：
         // 永不显示指示器的下拉手势 —— 用户下拉时得不到任何反馈，却要和整页滚动抢纵向手势。
@@ -218,7 +220,9 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                     )
                 }
 
-                Spacer(Modifier.height(Spacing.Large))
+                // 底部为胶囊导航栏留白（2026-09-17）：Tab 页上胶囊可交互，只留 12dp 会让
+                // 最后一块卡片落进那条带子里、点不动。与监控页同一套 Modifier。
+                Spacer(Modifier.ufiCapsuleBottomInset(Spacing.Medium))
             }
         }
     }

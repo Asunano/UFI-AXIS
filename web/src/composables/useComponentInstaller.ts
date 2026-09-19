@@ -40,6 +40,14 @@ export interface ComponentItem {
 export interface UseComponentInstallerOptions {
   /** 安装/卸载/上传落地后调用，用于让调用方重拉自己那边受影响的状态 */
   onChanged?: () => void | Promise<void>;
+  /**
+   * 只关心这几个组件 id（不传 = 全都要）。
+   *
+   * `/api/components` 是通用端点，清单里混着服务不同功能的组件
+   * （frpc / cloudflared 给内网穿透，ffmpeg 给视频封面抽帧）。
+   * 隧道页列出 ffmpeg 会让用户以为"装了才能用隧道"，所以调用方按需收窄。
+   */
+  only?: string[];
 }
 
 export function useComponentInstaller(options: UseComponentInstallerOptions = {}) {
@@ -78,7 +86,8 @@ export function useComponentInstaller(options: UseComponentInstallerOptions = {}
     if (refresh) comp.refreshing = true;
     try {
       const { data } = await api.get('/api/components', { params: refresh ? { refresh: 'true' } : {} });
-      comp.items = data?.components || [];
+      const all: ComponentItem[] = data?.components || [];
+      comp.items = options.only?.length ? all.filter((c) => options.only!.includes(c.id)) : all;
       applyComponentStatus(data);
       if (refresh && comp.manifestError) message.warning(comp.manifestError);
     } catch (e: any) {

@@ -14,7 +14,8 @@ import java.io.File
  * 存储路径: /data/ufiaxis/db/
  *
  * 数据表:
- * - traffic_records: 流量记录
+ * - traffic_records: 流量记录（速率采样 + 当月累计快照）
+ * - traffic_hourly: 每小时流量用量增量（流量历史的数据源，不受 retentionDays 清理）
  * - signal_history: 信号历史
  * - alert_records: 告警记录
  * - sms_records: 短信记录
@@ -30,6 +31,7 @@ import java.io.File
 @Database(
     entities = [
         TrafficRecord::class,
+        TrafficHourlyUsage::class,
         SignalRecord::class,
         AlertRecord::class,
         SmsRecord::class,
@@ -43,12 +45,13 @@ import java.io.File
         MailSendRecord::class,
         ConsoleHistoryRecord::class
     ],
-    version = 13,
+    version = 14,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
 
     abstract fun trafficDao(): TrafficDao
+    abstract fun trafficHourlyDao(): TrafficHourlyDao
     abstract fun signalDao(): SignalDao
     abstract fun alertDao(): AlertDao
     abstract fun smsDao(): SmsDao
@@ -396,6 +399,36 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v13→v14：新增 `traffic_hourly`（每小时流量用量增量，「流量历史」的数据源）。
+         *
+         * 纯建表，既有数据不受影响。主键就是 `hourStart`，**不额外建索引** ——
+         * SQLite 里 `INTEGER PRIMARY KEY` 就是 rowid 别名，按它做范围查询本身就走主键 B 树；
+         * 而且 Room 只按实体上声明的 `indices` 比对 TableInfo，这里凭手感多建一个
+         * `index_traffic_hourly_hourStart` 反而会让 schema 校验报 expected/found 不符。
+         *
+         * `AUTOINCREMENT` 这里用不上（hourStart 是业务主键，不是自增 id），
+         * 所以不涉及本文件末尾那条"AUTOINCREMENT 只能写在列上"的坑。
+         *
+         * 这张表刻意**不接入 `DataScheduler.cleanOldData` 的 retentionDays 清理**：
+         * 一年 8760 行、体积可忽略，而这是"年"维度能成立的前提（见 [TrafficHourlyUsage] 头注释）。
+         */
+        @VisibleForTesting
+        internal val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `traffic_hourly` (
+                        `hourStart` INTEGER PRIMARY KEY NOT NULL,
+                        `rxBytes` INTEGER NOT NULL,
+                        `txBytes` INTEGER NOT NULL,
+                        `updatedAt` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
          * 全部迁移，按版本递增排列。**新增迁移只追加到这个数组末尾。**
          *
          * 2026-09-08：生产装配与两个 androidTest 此前各手抄一份迁移列表。DB 从 8 一路涨到 10
@@ -425,7 +458,7 @@ abstract class AppDatabase : RoomDatabase() {
         internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
             MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
-            MIGRATION_11_12, MIGRATION_12_13
+            MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14
         )
 
         /**

@@ -479,10 +479,38 @@ class GoformClient(
         // 重试**必须**在 set 许可归还之后发起（goformPostOnce 内部的 withSetPermit 已退出），
         // 理由与 queryInternal 那段注释一致：持一个许可再去申请第二个，在许可被自适应调节
         // 压到 1 时就是永久挂死。上限由 GoformWritePolicy.MAX_ATTEMPTS 兜，不会无界重试。
-        while (retryOnSessionLost && GoformWritePolicy.shouldRetry(attemptNo, result)) {
-            attemptNo++
-            AppLogger.w(tag, "[goform_set] session lost, re-login and retry (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
+        //
+        // 两种可重试的失败（互斥，按顺序问一次）：
+        //  ① 会话失效：登录页 / 非 200 / AD 算不出来；
+        //  ② 设备回 200 但业务体说失败：固件在会话陈旧时也会走这一路，历史上被当成
+        //     「设备明确拒绝」直接 502，表现为「冷启动后第一次切制式必失败，再点一次就好」。
+        while (retryOnSessionLost && attemptNo < GoformWritePolicy.MAX_ATTEMPTS) {
+            val acceptedBody = (result as? GoformWriteResult.Accepted)?.body
+            if (GoformWritePolicy.shouldRetry(attemptNo, result)) {
+                attemptNo++
+                AppLogger.w(tag, "[goform_set] session lost, re-login and retry (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
+            } else if (GoformWritePolicy.shouldRetryBusinessFailure(
+                    attemptNo, result, acceptedBody?.let { isGoformSuccess(it) } ?: true)
+            ) {
+                attemptNo++
+                // 这条是 WARN 而不是 DEBUG：release/benchmark 包只保留 WARN 以上，
+                // 而「第一次为什么被拒」只能靠设备回的这段 body 定性。
+                AppLogger.w(tag, "[goform_set] device returned business failure for " +
+                        "goformId=${params["goformId"]}, body=${acceptedBody?.take(200)}; " +
+                        "re-login and retry once (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
+                // 陈旧会话是这一路最常见的成因，重发前先把会话作废，让 goformPostOnce 重登。
+                invalidateSession()
+            } else {
+                break
+            }
             result = goformPostOnce(params)
+        }
+        // 重试后仍是业务失败 = 设备真的拒绝了这次取值，留一条 WARN 作为最终判据。
+        (result as? GoformWriteResult.Accepted)?.body?.let { body ->
+            if (!isGoformSuccess(body)) {
+                AppLogger.w(tag, "[goform_set] rejected after $attemptNo attempt(s): " +
+                        "goformId=${params["goformId"]} body=${body.take(200)}")
+            }
         }
         val cost = System.currentTimeMillis() - start
         // 任何写操作都会让 GoformQoS 的 2 秒查询快照过时。不清的话，写完立刻回读会命中

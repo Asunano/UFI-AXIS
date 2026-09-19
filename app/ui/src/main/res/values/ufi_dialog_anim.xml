@@ -1,7 +1,23 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <!--
+      弹窗窗口动画。**只有进场**。
+
+      2026-09-18：原来还有 windowExitAnimation（@anim/ufi_dialog_exit，240ms
+      fast_out_linear_in）。它被移除的原因不是观感，而是时序：平台窗口退出动画只在窗口
+      **销毁那一刻**播，而那时窗口已进入 doDie，再写 blurBehindRadius 会崩 —— 于是
+      「弹窗完全消失的那一刻背景刚好最清晰」这条永远对不齐（实际表现是背景先化开、
+      卡片再单独淡出，两段串着走）。
+
+      离场改由 UfiDialogShell 在 Compose 侧驱动，与背景模糊共用同一条 240ms 进度、
+      曲线各自施加、端点同时到达；原 xml 的数值（240ms / fast_out_linear_in / 1.0→0.92）
+      原样搬到了 UfiMotion.Duration.DialogExit + UfiDialogAnim.CardExitScaleTo。
+
+      进场保持在这里：它不涉及窗口销毁，平台动画的 overshoot 手感也照旧。
+      ⚠️ ufi_dialog_enter.xml 的 duration 必须与 UfiMotion.Duration.DialogEnter 相等，
+      背景模糊靠这一点在进场结束的同一刻达到最浓。
+    -->
     <style name="UfiDialogAnimation">
         <item name="android:windowEnterAnimation">@anim/ufi_dialog_enter</item>
-        <item name="android:windowExitAnimation">@anim/ufi_dialog_exit</item>
     </style>
 </resources>

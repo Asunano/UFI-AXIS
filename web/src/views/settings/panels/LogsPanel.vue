@@ -231,4 +231,33 @@ onUnmounted(() => {
   color: var(--text-muted);
   font-size: 13px;
 }
+
+@media (max-width: 768px) {
+  /* 一条日志 4 段：级别(48) + 标签(60) + 时间(66) + 3×8 间距 + 20 内距 = 218px 固定占用，
+     正文在 298px 的卡内只剩 ~80px ⇒ 6~7 字一行，一条堆栈能撑成几十行。
+     窄屏改成两行：第一行是「级别 · 标签 · 时间」的元信息，第二行是整宽正文。 */
+  .log-entry {
+    flex-wrap: wrap;
+    gap: 4px 8px;
+  }
+  .log-time {
+    /* 时间跟在级别与标签后面，与它们同处第一行 */
+    order: 1;
+    margin-left: auto;
+  }
+  .log-message {
+    /* flex-basis:100% 强制换行到第二行并占满整宽 */
+    order: 2;
+    flex: 1 0 100%;
+  }
+  .log-tag {
+    /* 60px 下限在窄屏没必要，标签自己有多宽就多宽 */
+    min-width: 0;
+  }
+  /* 400px 的内滚区在 640px 高的手机上几乎占满剩余屏，形成页面+列表双层滚动，
+     触屏滑动容易被内层吃掉。降到 60vh 让外层页面仍有可抓的边。 */
+  .log-list {
+    max-height: 60vh;
+  }
+}
 </style>

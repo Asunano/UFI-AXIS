@@ -494,12 +494,26 @@ useInterval(() => {
 
 /* ── 响应式 ── */
 @media (max-width: 768px) {
+  /* 4 列在 298px 卡内每格只剩 67.5px，扣掉 .sub-panel 的 12px 双边内距后
+     内容区仅 43px —— 22px 的三位数计数就已经顶满，四位数直接溢出。折成 2×2。 */
+  .summary-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+  .stat-num {
+    font-size: 18px;
+  }
   .list-toolbar {
     flex-wrap: wrap;
     gap: 8px;
   }
   .alert-item {
     flex-wrap: wrap;
+  }
+  /* 类型标签 + 次数 + 已恢复 + 相对时间四样约 230px，标签一长就溢出 */
+  .alert-top {
+    flex-wrap: wrap;
+    gap: 4px 8px;
   }
   .alert-action {
     width: 100%;

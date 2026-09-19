@@ -84,7 +84,9 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     UfiScreenScaffold(
         title = "网络设置",
         navController = navController,
-        showBack = false
+        showBack = false,
+        // 首页 Tab：标题栏显示「正在播放」
+        showNowPlaying = true
     ) { padding ->
         // 原来这里是 `PullToRefreshBox(isRefreshing = false, onRefresh = refreshNetwork)` ——
         // 一个**永远不显示指示器**的下拉手势。既然没有任何视觉反馈，用户下拉时无从知道
@@ -194,7 +196,10 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                     }
                 }
 
-                Spacer(Modifier.height(8.dp))
+                // 底部为胶囊导航栏留白（2026-09-17）：Tab 页上胶囊可交互，原来只有 8dp，
+                // 最后那张「在线设备」入口卡正好落进胶囊那条带子里、点不动。
+                // （2026-08-30 把在线设备列表拆成二级页时绕过的是同一个问题，这次修在根上。）
+                Spacer(Modifier.ufiCapsuleBottomInset(Spacing.Medium))
             }
 
             // WiFi 热点设置弹窗（替代原独立页面跳转）

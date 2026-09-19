@@ -2,6 +2,13 @@ package com.ufi_axis.app.navigation
 
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import com.ufi_axis.ui.media.MediaAudioPlayerScreen
+import com.ufi_axis.ui.media.MediaAudioScreen
+import com.ufi_axis.ui.media.MediaImageScreen
+import com.ufi_axis.ui.media.MediaImageViewerScreen
+import com.ufi_axis.ui.media.MediaVideoPlayerScreen
+import com.ufi_axis.ui.media.MediaVideoScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsScreen
 import com.ufi_axis.ui.navigation.AppScreen
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.screens.*
@@ -105,6 +112,10 @@ private fun rawAppScreens(
     Routes.DETAIL_ONLINE_DEVICES to { _, nc -> OnlineDevicesScreen(viewModel, nc) },
     Routes.DETAIL_PAIRING to { _, nc -> PairingConfigScreen(viewModel, nc) },
     Routes.DETAIL_APPEARANCE to { _, nc -> AppearanceSettingsScreen(viewModel, nc) },
+    // 界面小功能（2026-09-17）：2026-09-18 起只是入口页，天气与诗词各自一页
+    Routes.DETAIL_UI_EXTRAS to { _, nc -> UiExtrasSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_WEATHER to { _, nc -> WeatherSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_POETRY to { _, nc -> PoetrySettingsScreen(viewModel, nc) },
     // 组件画廊：纯 UI 预览，不需要 viewModel（组件本身在 :app:ui，画廊也放在那）
     Routes.DETAIL_UI_GALLERY to { _, nc -> UfiGalleryScreen(nc) },
     Routes.DETAIL_DEVICE_CONTROL to { _, nc -> DeviceControlScreen(viewModel, nc) },
@@ -135,7 +146,9 @@ private fun rawAppScreens(
         CfTunnelScreen(viewModel, nc, entry.arguments?.getString("name") ?: "")
     },
     Routes.DETAIL_TUNNEL_SETTINGS to { _, nc -> TunnelSettingsScreen(viewModel, nc) },
-    Routes.DETAIL_SERVER to { _, nc -> ServerScreen(viewModel, onServerConfigChanged, nc) },
+    Routes.DETAIL_SERVER to { _, nc ->
+        ServerScreen(viewModel, onServerConfigChanged, nc, onRepairRequested)
+    },
     Routes.DETAIL_NOTIFICATIONS_GUARD to { _, nc -> NotificationsGuardScreen(viewModel, nc) },
 
     // 条件规则编辑器：id 空=新建，非空=编辑；编辑器从 viewModel.tasksState 读规则数据
@@ -152,5 +165,31 @@ private fun rawAppScreens(
     Routes.FILE_EDITOR to { entry, nc ->
         val path = entry.arguments?.getString("path") ?: ""
         TextEditorScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
+    },
+
+    // 媒体库：工具页三个入口（视频 / 音乐 / 图片）+ 各自的播放 / 查看页（2026-09-16）
+    Routes.MEDIA_LIBRARY_VIDEO to { _, nc ->
+        MediaVideoScreen(viewModel, nc)
+    },
+    Routes.MEDIA_LIBRARY_AUDIO to { _, nc ->
+        MediaAudioScreen(viewModel, nc)
+    },
+    Routes.MEDIA_LIBRARY_IMAGE to { _, nc ->
+        MediaImageScreen(viewModel, nc)
+    },
+    Routes.MEDIA_VIDEO_SETTINGS to { _, nc ->
+        MediaVideoSettingsScreen(viewModel, nc)
+    },
+    Routes.MEDIA_VIDEO to { entry, nc ->
+        val path = entry.arguments?.getString("path") ?: ""
+        MediaVideoPlayerScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
+    },
+    Routes.MEDIA_AUDIO to { entry, nc ->
+        val path = entry.arguments?.getString("path") ?: ""
+        MediaAudioPlayerScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
+    },
+    Routes.MEDIA_IMAGE to { entry, nc ->
+        val path = entry.arguments?.getString("path") ?: ""
+        MediaImageViewerScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
     }
 )

@@ -27,6 +27,9 @@
     <!-- 在线状态点绿（对齐主应用 StatusOnline 域色） -->
     <color name="status_online">#FF4ADE80</color>
 
+    <!-- 开启远程 ADB：蓝色强调（区别于安装主操作的近黑实底） -->
+    <color name="accent_blue">#FF3B82F6</color>
+
     <!-- ============ 日志分级配色（终端风格） ============ -->
     <color name="log_bg">#FF16191D</color>
     <color name="log_info">#FFC9D1D9</color>

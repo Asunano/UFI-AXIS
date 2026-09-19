@@ -52,7 +52,9 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.components.common.UfiButton
+import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.components.common.UfiSettingsGroup
@@ -479,16 +481,24 @@ fun SpeedTestScreen(viewModel: MainViewModel, navController: NavHostController) 
             onDismiss = { showTargetPicker = false },
             title = "测速目标"
         ) {
-            TargetSelector(
-                options = targets,
-                selectedIndex = selectedTarget,
-                onSelect = { index ->
-                    val t = targets[index]
-                    mode = t.mode
-                    if (t.nodeId != null) nodeId = t.nodeId
-                    showTargetPicker = false
-                }
-            )
+            // 间距统一到 UfiDialogBody（12dp）：标题↔列表的呼吸由外壳给，这里不再手写 Spacer。
+            UfiDialogBody {
+                // 2026-09-18：点行即生效并关闭，所以这个"关闭动作"要经 LocalUfiDialogClose 排时序 ——
+                // 直接翻 showTargetPicker 会让弹窗当帧卸载，离场的背景渐清没机会播。local 在 content 内读。
+                val close = LocalUfiDialogClose.current
+                TargetSelector(
+                    options = targets,
+                    selectedIndex = selectedTarget,
+                    onSelect = { index ->
+                        close {
+                            val t = targets[index]
+                            mode = t.mode
+                            if (t.nodeId != null) nodeId = t.nodeId
+                            showTargetPicker = false
+                        }
+                    }
+                )
+            }
         }
     }
 }

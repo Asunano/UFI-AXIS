@@ -61,11 +61,14 @@ import com.ufi_axis.ui.theme.Spacing
  */
 @Composable
 fun UfiDialogBody(content: @Composable ColumnScope.() -> Unit) {
-    // 水平 padding 由 UfiDialogShell 内容列统一提供（单一来源 DialogPaddingH），这里只留垂直节奏
+    // 水平 padding 由 UfiDialogShell 内容列统一提供（单一来源 DialogPaddingH）。
+    //
+    // 2026-09-18：这里原来还有 padding(top = Spacing.Large)。但 shell 在标题之后**已经**
+    // 给了一个 Spacer(Spacing.Large)，两者叠成 24dp —— 于是"标题→内容"24dp、
+    // "内容→按钮"12dp，同一个弹窗上下两段块间距差一倍。现在纵向节奏只剩一处来源：
+    // 块与块之间一律 spacedBy(12dp)，上下边距由 shell 负责。
     Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(top = Spacing.Large),
+        modifier = Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(Spacing.Large),
         horizontalAlignment = Alignment.Start
     ) {
@@ -394,8 +397,16 @@ fun UfiDialogActions(
     dismissDestructive: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
-    Spacer(Modifier.height(Spacing.DialogPaddingH))
-    // 水平 padding 由 UfiDialogShell 内容列统一提供，这里对齐即可
+    // 2026-09-18：两侧动作统一经 [LocalUfiDialogClose] 排时序 —— 弹窗离场的 backdrop
+    // （逐渐清晰）必须在窗口销毁**之前**播完，而按钮一按就把上层状态翻掉、弹窗当帧卸载。
+    // 若某个 onConfirm 其实不关闭弹窗（做了校验决定留下），shell 会把 backdrop 恢复回去。
+    // 在 shell 之外使用本组件时该 local 是"直接执行"，行为不变。
+    val close = LocalUfiDialogClose.current
+    // 2026-09-18：这里原来有一个 Spacer(DialogPaddingH = 18dp)。
+    // 弹窗内容普遍改走 UfiDialogBody（spacedBy 12dp）之后，它会和 body 的间距叠成 30dp ——
+    // 「内容 → 底部按钮」比「标题 → 内容」宽了一倍半，典型症状就是更新设置弹窗那一处。
+    // 现在"内容→按钮"这一段由 body 的 spacedBy 唯一提供，本组件不再自带上间距。
+    // 水平 padding 同理：唯一来源是 UfiDialogShell 的内容列（18dp）。
     Row(
         modifier = Modifier
             .fillMaxWidth(),
@@ -415,7 +426,7 @@ fun UfiDialogActions(
                 UfiButton(
                     variant = UfiButtonVariant.Danger,
                     text = dismissText,
-                    onClick = onDismiss,
+                    onClick = { close(onDismiss) },
                     modifier = Modifier.weight(1f),
                     enabled = dismissEnabled
                 )
@@ -423,7 +434,7 @@ fun UfiDialogActions(
                 UfiButton(
                     variant = UfiButtonVariant.Secondary,
                     text = dismissText,
-                    onClick = onDismiss,
+                    onClick = { close(onDismiss) },
                     modifier = Modifier.weight(1f),
                     enabled = dismissEnabled
                 )
@@ -435,21 +446,23 @@ fun UfiDialogActions(
             UfiButton(
                 variant = UfiButtonVariant.Danger,
                 text = confirmText,
-                onClick = onConfirm,
+                onClick = { close(onConfirm) },
                 modifier = Modifier.weight(1f),
                 enabled = enabled
             )
         } else {
             UfiButton(
                 text = confirmText,
-                onClick = onConfirm,
+                onClick = { close(onConfirm) },
                 modifier = Modifier.weight(1f),
                 enabled = enabled,
                 loading = loading
             )
         }
     }
-    Spacer(Modifier.height(Spacing.DialogActionsBottom))
+    // 2026-09-19：移除 Spacer(DialogActionsBottom=22dp)。
+    // 按钮→下边框的唯一来源是 shell 的 padding(bottom=18dp)，这里再加 22dp 就是 40dp。
+    // 用它的弹窗有 32 处，全部"按钮离下边框特别远"，典型就是更新设置弹窗。
 }
 
 // ══════════════════════════════════════════════════════════════

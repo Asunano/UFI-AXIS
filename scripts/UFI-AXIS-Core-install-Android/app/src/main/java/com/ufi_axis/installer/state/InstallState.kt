@@ -8,8 +8,18 @@ import com.ufi_axis.adbcore.AdbClient
  * 界面只读这个对象，不持有任何 ADB 引用 —— 这是把 UI 和协议层解耦的关键：
  * 协议层出问题不会让界面崩溃，界面重建也不会影响正在跑的安装。
  */
+/**
+ * 当前需要用户在界面上回应的交互类型。
+ * 引擎在挂起等待用户输入前把它置为对应值，界面据此弹出对应的对话框；
+ * 用户回应后引擎把它复位为 [NONE]。
+ */
+enum class InstallInteraction { NONE, CONFIRM, CONNECT_DECISION, ADDRESS_CHANGE, MANUAL_PACKAGE }
+
 data class InstallState(
     val stage: InstallStage = InstallStage.IDLE,
+
+    /** 需要用户在界面上回应的交互类型，NONE 表示无需回应 */
+    val interaction: InstallInteraction = InstallInteraction.NONE,
 
     /** 进度条：0..100；-1 表示不确定进度（转圈） */
     val progress: Int = -1,

@@ -86,9 +86,13 @@
       v-model:selected-mode="selectedMode"
       :mode-loading="modeLoading"
       :network-modes="networkModes"
+      :current-mode="currentMode"
+      :current-label="modeLabel"
+      :refreshing="modeRefreshing"
       :switching="switchingMode !== null"
       :timed-out="modeSwitchTimedOut"
       @apply="applyModeAndClose"
+      @refresh="refreshDeviceSettings"
     />
 
     <!-- 懒加载弹窗：组件本体与显隐都由 useLazyModal 管，
@@ -174,7 +178,10 @@ const {
   refreshNetworkStatus,
   networkModes,
   selectedMode,
+  currentMode,
   modeLoading,
+  modeRefreshing,
+  refreshDeviceSettings,
   modeLabel,
   applyNetworkMode,
   switchingMode,

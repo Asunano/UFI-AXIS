@@ -14,6 +14,11 @@ import com.ufi_axis.util.DebugLog
  * 1. 开关短路：后台轮询关闭 **或** 全局通知总闸关闭 → 直接成功返回（零网络开销）；
  * 2. `GET /api/alerts/list` → [NotificationCenter.maybeNotifyNewAlerts]（与前台轮询/WS 共用去重）。
  *
+ * **进程边界（2026-09 收束）**：本 Worker 跑在**主进程**。因此
+ * [GuardScheduler.syncSchedule] 在「前台服务保活」开启时会**取消**本任务 ——
+ * 那时轮询由 `:ufi_notify` 的 `NotifyService` 负责，后台不应再周期拉起主进程。
+ * 仅在保活关闭、用户仍打开「后台轮询」时作为无 FGS 的兜底路径存在。
+ *
  * 短信 / 验证码**不在这里拉**：到达判定在 core（持久化水位 + ContentObserver 事件驱动），
  * core 直接推 `notification`（type=sms|verification），`:ufi_notify` 收到即渲染。
  * 让 Worker 再拉一遍等于把同一个事实判两次，而且 15 分钟的平台下限做不到及时。

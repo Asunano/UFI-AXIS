@@ -573,25 +573,32 @@ private fun ThresholdEditDialog(
         title = title,
         icon = rememberVectorPainter(Icons.Filled.Notifications),
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose。必须在 slot 内部读，否则拿到的是"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
             // 保存前校验：两个值都必须是有效数字（parse 非 null）
             // 用 variant = Primary + 默认 Standard 档，与 dismiss 位的 Secondary 等高（都是 ButtonHeight）；
             // 换成 size = Small 会更矮，两者并排会一高一矮。
             UfiButton(
                 text = "保存",
                 onClick = {
-                    if (parseWarn(warnText) != null && parseAlert(alertText) != null) onSave(warnText, alertText)
+                    close {
+                        if (parseWarn(warnText) != null && parseAlert(alertText) != null) onSave(warnText, alertText)
+                    }
                 }
             )
         },
         dismissButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "取消",
-                onClick = onDismiss
+                onClick = { close(onDismiss) }
             )
         }
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+        // 间距统一到 UfiDialogBody（12dp）
+        UfiDialogBody {
             // 当前值双标签（左=小值端，右=大值端；角色随阈值类型而变）
             val warnF = parseWarn(warnText)?.toFloat() ?: sliderRange.start
             val alertF = parseAlert(alertText)?.toFloat() ?: sliderRange.start
@@ -719,21 +726,23 @@ private fun TrafficThresholdDialog(
         title = "流量阈值",
         icon = rememberVectorPainter(Icons.Filled.DataUsage),
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "保存",
                 enabled = canSave,
-                onClick = { if (canSave) onSave(warnMb!!, criticalMb!!) }
+                onClick = { close { if (canSave) onSave(warnMb!!, criticalMb!!) } }
             )
         },
         dismissButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "取消",
-                onClick = onDismiss
+                onClick = { close(onDismiss) }
             )
         }
     ) {
-        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+        UfiDialogBody {
             UfiDialogValueUnitField(
                 label = "警告阈值",
                 value = warnText,

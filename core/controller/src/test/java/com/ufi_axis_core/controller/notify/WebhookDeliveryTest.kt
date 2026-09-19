@@ -328,7 +328,7 @@ class WebhookDeliveryTest {
     fun `每个 JSON 类预设在注入载荷下都仍是合法 JSON`() {
         val ev = event(title = NASTY_TITLE, body = NASTY_MESSAGE)
         val jsonPresets = WebhookPreset.entries.filter { WebhookDelivery.isJson(it.defaultContentType) }
-        assertEquals("JSON 类预设的个数变了，先确认新预设是否也该走转义分支", 6, jsonPresets.size)
+        assertEquals("JSON 类预设的个数变了，先确认新预设是否也该走转义分支", 7, jsonPresets.size)
 
         for (preset in jsonPresets) {
             val body = WebhookDelivery.renderBody(preset.defaultBody, ev, json = true)
@@ -516,7 +516,7 @@ class WebhookDeliveryTest {
         )
         assertEquals(
             "URL 档的预设个数变了，先确认新预设的密钥到底在哪一处",
-            5,
+            6,
             WebhookPreset.entries.count { it.secretTarget == SecretTarget.URL }
         )
     }

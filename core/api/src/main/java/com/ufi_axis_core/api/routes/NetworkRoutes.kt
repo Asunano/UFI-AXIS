@@ -195,12 +195,16 @@ class NetworkRoutes(
                 // 别名 → BearerPreference 的映射唯一实现在 profile 的 WriteSpec 里（计划书 2.6），
                 // 这里只算一遍用于回显，不参与下发。
                 val bearerValue = NetworkMode.toBearer(mode)
-                // bearer = 实际下发给设备的值；mode 仍回显入参，便于客户端确认映射结果。
-                // 失败响应也带上这两个字段：客户端的"切换中"中间态要靠它们对齐目标档位。
-                val echo = mapOf<String, Any?>("mode" to mode, "bearer" to bearerValue)
+                // bearer = 实际下发给设备的值；mode 仍回显入参；mode_label = contract 中文名
+                // （App/Web 展示统一读它，不再各存一份文案表）。
+                val echo = mapOf<String, Any?>(
+                    "mode" to mode,
+                    "bearer" to bearerValue,
+                    "mode_label" to NetworkMode.label(mode)
+                )
                 val outcome = client.setBearerPreference(mode)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次网络制式切换", echo)) return@post
-                cache?.invalidate("network:band-status")
+                invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
                     put("success", true)
                     putAll(echo)
@@ -229,7 +233,7 @@ class NetworkRoutes(
                 )
                 val outcome = client.setBearerPreference(preference)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次承载偏好设置", echo)) return@post
-                cache?.invalidate("network:band-status")
+                invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
                     put("success", true)
                     putAll(echo)
@@ -277,11 +281,22 @@ class NetworkRoutes(
                     return@post
                 }
                 val params = call.receiveJsonObject()
-                val mode = params["mode"]?.jsonPrimitive?.contentOrNull ?: "AUTO"
-                val success = client.setConnectionMode(mode)
+                val requested = params["mode"]?.jsonPrimitive?.contentOrNull
+                // 设备侧 ConnectionMode 只认 auto_dial / manual_dial。两端历史上各发一套
+                // （web 发 auto_dial/manual_dial，app 发 auto/manual），而这里原来原样透传，
+                // 于是 app 那条静默无效；缺省值还写着 "AUTO"，同样不是设备取值。
+                // 归一化只放这一处（core 负责业务判定，客户端不必再各自映射）。
+                val deviceMode = when (requested?.trim()?.lowercase()) {
+                    "manual", "manual_dial", "hand", "1" -> "manual_dial"
+                    else -> "auto_dial"
+                }
+                val success = client.setConnectionMode(deviceMode)
+                // connection_mode 就在 device:settings 里，写完必须清，否则客户端回读到的是
+                // 最长 5 分钟前的旧值（与制式切换同一个坑）。
+                if (success) cache?.invalidate("device:settings")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "mode" to mode))
+                    toJsonElement(mapOf("success" to success, "mode" to deviceMode))
                 )
             }
 
@@ -319,5 +334,22 @@ class NetworkRoutes(
             }
 
         }
+    }
+
+    /**
+     * 制式/承载偏好写成功后要清掉的读缓存。
+     *
+     * 2026-09-15 缺陷：原来只清了 `network:band-status`，而客户端确认切换是否生效读的是
+     * `GET /api/device/settings`（`device:settings`，TTL 5 分钟）与 `GET /api/network/status`
+     * （`hub:network-type-info`，TTL 30 秒）。两者都没清，于是 App/Web 的回读确认在整个
+     * 预算窗口内拿到的都是**写入前的快照**，必然报「设备尚未完成切换」，而设备其实早切完了，
+     * 等缓存自然过期界面才自己变对 —— 这就是用户看到的「切换成功却提示失败」。
+     *
+     * 三个 key 一起清是硬要求：少清任何一个，对应那个端点就会继续回旧值。
+     */
+    private suspend fun invalidateAfterModeWrite() {
+        cache?.invalidate("device:settings")
+        cache?.invalidate("network:band-status")
+        cache?.invalidateAny("hub:network-type-info")
     }
 }

@@ -316,7 +316,7 @@ const signalMetrics = computed(() => {
 @media (max-width: 768px) {
   .conn-horizontal {
     grid-template-columns: 1fr;
-    justify-items: center;
+    /* justify-items:center 会让 ctrl-bar / conn-facts 不铺满 → 删掉 */
   }
   .ctrl-bar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -330,6 +330,16 @@ const signalMetrics = computed(() => {
   .footer-mode-select {
     width: 100%;
     max-width: 100%;
+  }
+  /* footer 竖排：select 占一行，3 按钮占一行并可换行 */
+  .footer-row {
+    flex-wrap: wrap;
+  }
+  .footer-actions {
+    flex-shrink: 1;
+    flex-wrap: wrap;
+    width: 100%;
+    justify-content: flex-end;
   }
 }
 </style>

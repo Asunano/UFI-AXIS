@@ -132,6 +132,7 @@ private fun UpdateProgressRing(
  *
  * @param sourceMode 当前更新源模式（UpdateSource.MODE_AUTO / MODE_MIRROR / MODE_DIRECT）。
  * @param onSourceModeChange 模式变更回调（写入 AppPreferences.updateSourceMode）。
+ * @param lastCountry core 给出的出网国家码（只读展示；检测由 core 启动时自动做，app 不再自己测）。
  * @param autoCheck 启动时自动检查更新开关状态。
  * @param onAutoCheckChange 开关变更回调（写入 AppPreferences.autoCheckUpdate）。
  * @param onPushApk 点击「选择 APK」触发 SAF 文件选择（调用方负责）。
@@ -144,8 +145,6 @@ fun UpdateSettingsDialog(
     sourceMode: String,
     onSourceModeChange: (String) -> Unit,
     lastCountry: String,
-    detectingCountry: Boolean,
-    onRedetectCountry: () -> Unit,
     autoCheck: Boolean,
     onAutoCheckChange: (Boolean) -> Unit,
     onPushApk: () -> Unit,
@@ -157,101 +156,101 @@ fun UpdateSettingsDialog(
         onDismiss = onDismiss,
         title = "更新设置",
         icon = rememberVectorPainter(Icons.Filled.Update),
-        showCloseButton = false
+        showCloseButton = false,
+        // 更新相关弹窗一律禁止点外部关闭（2026-09-18）：这页有多个"改完立刻生效"的开关与
+        // 输入框，误触空白处关掉会让用户以为没保存；与下面两个更新弹窗保持同一口径。
+        dismissOnClickOutside = false
     ) {
-        // ── 分层（2026-08-10 设置项过多）：更新源 / 守护与操作 两个页签 ──
-        var settingsTab by remember { mutableStateOf(0) }
-        UfiScrollableTabRow(
-            selectedTabIndex = settingsTab,
-            onTabSelected = { settingsTab = it },
-            tabs = listOf("更新源", "守护与操作")
-        )
-        Spacer(Modifier.height(Spacing.Medium))
-
-        // ── 页签内容切换动画（方向感知：复用公共组件 UfiAnimatedTabContent）──
-        UfiAnimatedTabContent(targetState = settingsTab) { tab ->
+        // 间距统一到 UfiDialogBody（12dp）
+        UfiDialogBody {
+            // 关闭动作交给 shell 排时序：离场 backdrop（逐渐清晰）要播完才卸载窗口，
+            // 见 LocalUfiDialogClose。这里在 content 顶部读一次，供下方「选择 APK」使用
+            // （它会先关掉本弹窗再拉起 SAF）。
+            val close = LocalUfiDialogClose.current
+            // ── 分层（2026-08-10 设置项过多）：更新源 / 守护与操作 两个页签 ──
+            var settingsTab by remember { mutableStateOf(0) }
+            UfiScrollableTabRow(
+                selectedTabIndex = settingsTab,
+                onTabSelected = { settingsTab = it },
+                tabs = listOf("更新源", "守护与操作")
+            )
+            // ── 页签内容切换动画（方向感知：复用公共组件 UfiAnimatedTabContent）──
+            UfiAnimatedTabContent(targetState = settingsTab) { tab ->
                 when (tab) {
                     0 -> {
-                // ═══ Tab1 更新源：模式（自动/镜像/直连，按国家检测智能选镜像） ═══
-                Text(
-                    text = "更新源",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = palette.textSecondary
-                )
-                UfiScrollableTabRow(
-                    selectedTabIndex = when (sourceMode) {
-                        UpdateSource.MODE_AUTO -> 0
-                        UpdateSource.MODE_MIRROR -> 1
-                        else -> 2
-                    },
-                    onTabSelected = { idx ->
-                        onSourceModeChange(
-                            when (idx) {
-                                0 -> UpdateSource.MODE_AUTO
-                                1 -> UpdateSource.MODE_MIRROR
-                                else -> UpdateSource.MODE_DIRECT
+                        // ═══ Tab1 更新源：模式（自动/镜像/直连，按国家检测智能选镜像） ═══
+                        Text(
+                            text = "更新源",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = palette.textSecondary
+                        )
+                        UfiScrollableTabRow(
+                            selectedTabIndex = when (sourceMode) {
+                                UpdateSource.MODE_AUTO -> 0
+                                UpdateSource.MODE_MIRROR -> 1
+                                else -> 2
+                            },
+                            onTabSelected = { idx ->
+                                onSourceModeChange(
+                                    when (idx) {
+                                        0 -> UpdateSource.MODE_AUTO
+                                        1 -> UpdateSource.MODE_MIRROR
+                                        else -> UpdateSource.MODE_DIRECT
+                                    }
+                                )
+                            },
+                            tabs = listOf("自动", "镜像", "直连")
+                        )
+                        Text(
+                            text = "自动按国家选源；其他模式强制生效。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                    }
+                    else -> {
+                        // ═══ Tab2 守护与操作：国家展示 + 自动检查 + 推送 APK ═══
+                        // 「当前国家/地区」是**只读**的：检测在 core（启动时自动做一次，
+                        // 结果存设备侧），app 这边没有"重新检测"按钮也没有"检测中"状态。
+                        UfiSettingsItem(
+                            title = "当前国家/地区",
+                            description = when (lastCountry) {
+                                "CN" -> "中国大陆（自动模式将走镜像）"
+                                "US" -> "美国（自动模式直连）"
+                                "" -> "未检测（自动模式默认直连）"
+                                else -> lastCountry
                             }
                         )
-                    },
-                    tabs = listOf("自动", "镜像", "直连")
-                )
-                Text(
-                    text = "自动按国家选源；其他模式强制生效。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textSecondary
-                )
-            }
-            else -> {
-                // ═══ Tab2 守护与操作：国家检测 + 自动检查 + 推送 APK ═══
-                UfiSettingsItem(
-                    title = "当前国家/地区",
-                    description = when (lastCountry) {
-                        "CN" -> "中国大陆（自动模式将走镜像）"
-                        "US" -> "美国（自动模式直连）"
-                        "" -> "未检测（自动模式默认直连）"
-                        else -> lastCountry
-                    },
-                    trailing = {
-                        UfiButton(
-                            variant = UfiButtonVariant.Subtle, size = UfiButtonSize.Small,
-                            text = if (detectingCountry) "检测中…" else "重新检测",
-                            onClick = onRedetectCountry,
-                            enabled = !detectingCountry
+                        UfiSettingsItem(
+                            title = "启动时自动检查更新",
+                            description = "进入更新中心时自动检查前端更新（24h 节流）",
+                            trailing = {
+                                UfiSwitch(
+                                    checked = autoCheck,
+                                    onCheckedChange = onAutoCheckChange
+                                )
+                            }
+                        )
+                        // 同步到设备精简：移除「同步」按钮行——关闭弹窗时由调用方按需同步（改过才发）
+                        // 推送 APK 更新（兜底）
+                        UfiSettingsItem(
+                            title = "推送 APK 更新（备用方式）",
+                            description = "选择本地 APK 手动推送到设备安装（后端无法自下载时）",
+                            trailing = {
+                                UfiButton(variant = UfiButtonVariant.Subtle, size = UfiButtonSize.Small, text = "选择 APK", onClick = { close(onPushApk) })
+                            }
                         )
                     }
-                )
-
-                UfiSettingsItem(
-                    title = "启动时自动检查更新",
-                    description = "进入更新中心时自动检查前端更新（24h 节流）",
-                    trailing = {
-                        UfiSwitch(
-                            checked = autoCheck,
-                            onCheckedChange = onAutoCheckChange
-                        )
-                    }
-                )
-
-                // 同步到设备精简：移除「同步」按钮行——关闭弹窗时由调用方按需同步（改过才发）
-                // 推送 APK 更新（兜底）
-                UfiSettingsItem(
-                    title = "推送 APK 更新（备用方式）",
-                    description = "选择本地 APK 手动推送到设备安装（后端无法自下载时）",
-                    trailing = {
-                        UfiButton(variant = UfiButtonVariant.Subtle, size = UfiButtonSize.Small, text = "选择 APK", onClick = onPushApk)
-                    }
-                )
+                }
             }
-            }
-    }
 
-        // 底部标准操作区：取消（描边）+ 完成（主色填充），等宽双按钮（完成时调用方自动同步到设备）
-        UfiDialogActions(
-            onDismiss = onDismiss,
-            onConfirm = onDismiss,
-            confirmText = "完成",
-            dismissText = "取消"
-        )
+            // 底部标准操作区：取消（描边）+ 完成（主色填充），等宽双按钮（完成时调用方自动同步到设备）
+            UfiDialogActions(
+                onDismiss = onDismiss,
+                onConfirm = onDismiss,
+                confirmText = "完成",
+                dismissText = "取消"
+            )
+        }
     }
 }
 
@@ -297,83 +296,94 @@ fun ApkPushDialog(
         onDismiss = onDismiss,
         title = title,
         icon = rememberVectorPainter(Icons.Filled.Cloud),
+        // 禁止点外部关闭（2026-09-18）：推送过程中误触空白处会把进度弹窗关掉，
+        // 用户以为推送被取消了（其实还在传）。要离开请按「后台运行」。
+        dismissOnClickOutside = false,
         confirmButton = {
+            // 关闭动作交给 shell 排时序（见 LocalUfiDialogClose）。「重试」不包：
+            // 它重新发起一次推送，弹窗要留着继续显示进度。
+            val close = LocalUfiDialogClose.current
             when (s) {
-                "done" -> UfiButton(text = "完成", onClick = onDismiss)
+                "done" -> UfiButton(text = "完成", onClick = { close(onDismiss) })
                 "failed" -> UfiButton(text = "重试", onClick = onRetry)
-                else -> UfiButton(text = "后台运行", onClick = onDismiss)
+                else -> UfiButton(text = "后台运行", onClick = { close(onDismiss) })
             }
         },
         // 只有失败态需要第二个按钮（重试 / 知道了）；进行中与成功态单按钮即可
         dismissButton = if (s == "failed") {
-            { UfiButton(variant = UfiButtonVariant.Secondary, text = "知道了", onClick = onDismiss) }
+            {
+                val close = LocalUfiDialogClose.current
+                UfiButton(variant = UfiButtonVariant.Secondary, text = "知道了", onClick = { close(onDismiss) })
+            }
         } else {
             null
         }
     ) {
-        when (s) {
-            "uploading" -> {
-                // 上传有真实百分比（后端 progress 0..100）→ 环里显示数字，环下方只讲阶段。
-                // 2026-09-04：caption 原来直接用 state.message，而后端/ViewModel 生成的 message 是
-                // "正在上传 APK… 42%" —— 百分比和环里的数字重复了。改成固定文案，百分比只由环承担。
-                UpdateProgressRing(
-                    progress = (state?.progress ?: 0).coerceIn(0, 100) / 100f,
-                    caption = "正在上传安装包",
-                    subCaption = "请保持与设备的连接"
-                )
-            }
-
-            "installing" -> {
-                // 安装由设备端 pm/PI 完成，拿不到进度 → 不确定态（环停在 0 + 中心转圈）。
-                UpdateProgressRing(
-                    progress = null,
-                    caption = state?.message?.takeIf { it.isNotBlank() } ?: "正在安装…"
-                )
-            }
-
-            "done" -> {
-                // 2026-09-04：去掉前置的 Icons.Default.CheckCircle —— 实心圆底 + 白勾在弹窗里
-                // 看着像贴了个 emoji ✅，与全站线性图标风格不一致；成功语义已由标题「安装成功」
-                // 与右侧「完成」按钮表达，这里不需要再来一个图标。
-                Text(
-                    text = state?.message?.takeIf { it.isNotBlank() }
-                        ?: "APK 已推送安装，设备将自动重启生效",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = palette.textPrimary
-                )
-            }
-
-            "failed" -> {
-                // 错误分类：原因 + 建议（2026-08-10 增强错误反馈）
-                val (cause, hint) = classifyPushError(state?.message)
-                Row(verticalAlignment = Alignment.Top) {
-                    Icon(
-                        Icons.Default.Error,
-                        null,
-                        tint = palette.error,
-                        modifier = Modifier.size(24.dp)
+        UfiDialogBody {
+            when (s) {
+                "uploading" -> {
+                    // 上传有真实百分比（后端 progress 0..100）→ 环里显示数字，环下方只讲阶段。
+                    // 2026-09-04：caption 原来直接用 state.message，而后端/ViewModel 生成的 message 是
+                    // "正在上传 APK… 42%" —— 百分比和环里的数字重复了。改成固定文案，百分比只由环承担。
+                    UpdateProgressRing(
+                        progress = (state?.progress ?: 0).coerceIn(0, 100) / 100f,
+                        caption = "正在上传安装包",
+                        subCaption = "请保持与设备的连接"
                     )
-                    Spacer(Modifier.width(Spacing.Medium))
-                    Column {
-                        Text(
-                            text = "原因：$cause",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = palette.error
+                }
+
+                "installing" -> {
+                    // 安装由设备端 pm/PI 完成，拿不到进度 → 不确定态（环停在 0 + 中心转圈）。
+                    UpdateProgressRing(
+                        progress = null,
+                        caption = state?.message?.takeIf { it.isNotBlank() } ?: "正在安装…"
+                    )
+                }
+
+                "done" -> {
+                    // 2026-09-04：去掉前置的 Icons.Default.CheckCircle —— 实心圆底 + 白勾在弹窗里
+                    // 看着像贴了个 emoji ✅，与全站线性图标风格不一致；成功语义已由标题「安装成功」
+                    // 与右侧「完成」按钮表达，这里不需要再来一个图标。
+                    Text(
+                        text = state?.message?.takeIf { it.isNotBlank() }
+                            ?: "APK 已推送安装，设备将自动重启生效",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.textPrimary
+                    )
+                }
+
+                "failed" -> {
+                    // 错误分类：原因 + 建议（2026-08-10 增强错误反馈）
+                    val (cause, hint) = classifyPushError(state?.message)
+                    Row(verticalAlignment = Alignment.Top) {
+                        Icon(
+                            Icons.Default.Error,
+                            null,
+                            tint = palette.error,
+                            modifier = Modifier.size(24.dp)
                         )
-                        Spacer(Modifier.height(Spacing.Small))
-                        Text(
-                            text = "建议：$hint",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.textSecondary
-                        )
+                        Spacer(Modifier.width(Spacing.Medium))
+                        Column {
+                            Text(
+                                text = "原因：$cause",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = palette.error
+                            )
+                            Spacer(Modifier.height(Spacing.Small))
+                            Text(
+                                text = "建议：$hint",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.textSecondary
+                            )
+                        }
                     }
                 }
-            }
 
-            else -> {}
+                else -> {}
+            }
+            // 2026-09-04：这里原来手写了 `Spacer(Spacing.Medium)` 补内容与按钮之间的间距。
+            // 现在 UfiDialogBody 统一给了 12dp（与标题→内容同值），手写的这一段会叠成 20dp，故删。
         }
-        // 2026-09-04：这里原来手写了 `Spacer(Spacing.Medium)` 补内容与按钮之间的间距。
-        // 现在 UfiCustomDialog 统一给了 12dp（与标题→内容同值），手写的这一段会叠成 20dp，故删。
     }
 }
 
@@ -465,58 +475,65 @@ fun UnifiedUpdateDialog(
             else -> "检查更新"
         },
         icon = rememberVectorPainter(Icons.Filled.SystemUpdate),
+        // 禁止点外部关闭（2026-09-18，用户反馈"更新 core 时弹窗被点掉导致更新异常"）：
+        // 「更新 Core」按下之后 core 会自己下载→安装→重启，这个弹窗是唯一的进度与状态出口；
+        // 误触空白处把它关掉，用户既看不到进度、也可能在设备重启期间重复触发更新。
+        // 要离开只能按「稍后」（它同时是取消入口）。返回键仍然放行 —— 那是 Android 的
+        // 系统级退出手势，屏蔽它会让人以为界面卡死。
+        dismissOnClickOutside = false,
         dismissButton = {
+            // 关闭动作交给 shell 排时序（见 LocalUfiDialogClose）。内容里的
+            // 「下载 / 安装 / 更新 Core / 确认更新 Core」都在弹窗内继续展示进度，所以都不包。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "稍后",
-                onClick = onDismiss
+                onClick = { close(onDismiss) }
             )
         }
     ) {
-        if (!state.hasAnyUpdate) {
-            Text(
-                text = "当前 App 与 Core 均已是最新版本",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.textPrimary
-            )
-        }
-
-        if (state.showAppSection) {
-            UpdateTargetBlock(
-                name = "UFI-AXIS App（手机端）",
-                currentVersion = state.app.currentVersion,
-                latestVersion = state.app.latestVersion,
-                changelog = state.app.changelog
-            ) {
-                AppUpdateAction(
-                    state = state.app,
-                    onDownload = onDownloadApp,
-                    onInstall = onInstallApp
+        UfiDialogBody {
+            if (!state.hasAnyUpdate) {
+                Text(
+                    text = "当前 App 与 Core 均已是最新版本",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.textPrimary
                 )
             }
-        }
 
-        if (state.showAppSection && state.showCoreSection) {
-            Spacer(Modifier.height(Spacing.XLarge))
-        }
+            if (state.showAppSection) {
+                UpdateTargetBlock(
+                    name = "UFI-AXIS App（手机端）",
+                    currentVersion = state.app.currentVersion,
+                    latestVersion = state.app.latestVersion,
+                    changelog = state.app.changelog
+                ) {
+                    AppUpdateAction(
+                        state = state.app,
+                        onDownload = onDownloadApp,
+                        onInstall = onInstallApp
+                    )
+                }
+            }
 
-        if (state.showCoreSection) {
-            UpdateTargetBlock(
-                name = "UFI-AXIS Core（设备端）",
-                currentVersion = state.coreCurrentVersion,
-                latestVersion = state.coreLatestVersion,
-                changelog = state.coreChangelog
-            ) {
-                CoreUpdateAction(
-                    state = state,
-                    confirming = coreConfirming,
-                    onRequestConfirm = { coreConfirming = true },
-                    onCancelConfirm = { coreConfirming = false },
-                    onConfirmed = {
-                        coreConfirming = false
-                        onCoreUpdateConfirmed()
-                    }
-                )
+            if (state.showCoreSection) {
+                UpdateTargetBlock(
+                    name = "UFI-AXIS Core（设备端）",
+                    currentVersion = state.coreCurrentVersion,
+                    latestVersion = state.coreLatestVersion,
+                    changelog = state.coreChangelog
+                ) {
+                    CoreUpdateAction(
+                        state = state,
+                        confirming = coreConfirming,
+                        onRequestConfirm = { coreConfirming = true },
+                        onCancelConfirm = { coreConfirming = false },
+                        onConfirmed = {
+                            coreConfirming = false
+                            onCoreUpdateConfirmed()
+                        }
+                    )
+                }
             }
         }
     }

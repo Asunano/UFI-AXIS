@@ -6,11 +6,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 幂等写的重试与分类策略（2026-09-11 网络制式缺陷修复）。
+ * 幂等写的重试与分类策略（2026-09-11 网络制式缺陷修复，2026-09-15 补业务失败一路）。
  *
- * 钉住的是缺陷本身的三条判据，而不是实现细节：
+ * 钉住的是缺陷本身的判据，而不是实现细节：
  *  1. 会话失效 → **重试一次**（原来一次都不重试，于是"第一次点必失败"）；
- *  2. 设备明确拒绝 → **不重试**（重发只是白等一个往返）；
+ *  2. 设备回 200 + 业务失败体 → 幂等写**重登重试一次**（固件在会话陈旧时也走这一路，
+ *     原来被当成「设备明确拒绝」直接 502，表现为"冷启动后第一次切制式必失败"）；
  *  3. 重试**有上限**（无界重试会把设备登录退避一路叠满，历史上表现为长时间断连）。
  */
 class GoformWritePolicyTest {
@@ -31,11 +32,39 @@ class GoformWritePolicyTest {
         assertFalse(GoformWritePolicy.shouldRetry(2, GoformWriteResult.SessionLost))
     }
 
-    // ── 2. 明确拒绝不重试 ──
+    // ── 2. 业务失败：重登重试一次，仍失败才算真拒绝 ──
 
     @Test
-    fun `设备明确回失败不重试`() {
+    fun `设备回失败体不算会话失效`() {
+        // shouldRetry 只管「命令没被固件受理」，业务体失败归 shouldRetryBusinessFailure
         assertFalse(GoformWritePolicy.shouldRetry(1, deviceRejected))
+    }
+
+    @Test
+    fun `设备回失败体的幂等写要重登重试一次`() {
+        assertTrue(GoformWritePolicy.shouldRetryBusinessFailure(1, deviceRejected, bodySuccess = false))
+    }
+
+    @Test
+    fun `业务失败也只重试一次`() {
+        assertFalse(GoformWritePolicy.shouldRetryBusinessFailure(2, deviceRejected, bodySuccess = false))
+    }
+
+    @Test
+    fun `body 说成功就不重试`() {
+        assertFalse(GoformWritePolicy.shouldRetryBusinessFailure(1, deviceOk, bodySuccess = true))
+    }
+
+    @Test
+    fun `会话失效与连不上不走业务失败这条重试`() {
+        assertFalse(
+            GoformWritePolicy.shouldRetryBusinessFailure(1, GoformWriteResult.SessionLost, bodySuccess = false)
+        )
+        assertFalse(
+            GoformWritePolicy.shouldRetryBusinessFailure(
+                1, GoformWriteResult.Unreachable("connect timed out"), bodySuccess = false
+            )
+        )
     }
 
     @Test

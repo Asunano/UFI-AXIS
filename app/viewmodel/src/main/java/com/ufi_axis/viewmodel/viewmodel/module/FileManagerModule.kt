@@ -7,14 +7,13 @@ import android.os.Environment
 import android.os.SystemClock
 import com.ufi_axis.data.api.FileItem
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.AppInstallRequest
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.DebugLog
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.put
 import com.ufi_axis.util.AppHttpClient
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.state.*
@@ -22,7 +21,6 @@ import com.ufi_axis.viewmodel.persistence.FileShortcutRepository
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.File
 import java.util.UUID
 
@@ -909,29 +907,29 @@ class FileManagerModule(
     }
 
     // ── Install APK ──
+    // 2026-09-14：改走 Retrofit（api.installApp）。原实现在这里手搓了一份 OkHttp 调用 ——
+    // 自己拼 `http://host:port/api/apps/install`、自己 addHeader("Authorization", "Bearer …")、
+    // 自己 parseToJsonElement 取 success/message，而 UfiAxisApi 早就有这个端点的声明。
+    // 问题不在于它跑不通，而在于它绕开了 Retrofit 客户端统一持有的鉴权头与 baseUrl 解析：
+    // 换 token 形态、改 effectiveHost/端口拼法、调超时或统一错误处理时，这条手搓路径不会跟着变，
+    // 属于"同一个请求两套写法"里那份迟早漏改的。响应模型 AppInstallResponse 本身就有
+    // success/message 两个字段，手写 JSON 解析连带的 toBoolean() 兜底也一并没了。
     fun installApk(path: String) {
         scope.launch {
             try {
                 _state.update { it.copy(operationMessage = "正在安装 APK 到设备...") }
-                val prefs = AppPreferences(appContext)
-                val url = "http://${prefs.effectiveHost}:${prefs.serverPort}/api/apps/install"
-                val result = withContext(Dispatchers.IO) {
-                    val client = AppHttpClient.instance
-                    val json = buildJsonObject { put("path", path) }
-                    val mediaType = "application/json".toMediaTypeOrNull()!!
-                    val body = json.toString().toRequestBody(mediaType)
-                    val request = okhttp3.Request.Builder().url(url).post(body).addHeader("Authorization", "Bearer ${prefs.token}").build()
-                    val response = client.newCall(request).execute()
-                    AppJson.parseToJsonElement(response.body?.string() ?: "{}").jsonObject
-                }
-                val success = result["success"]?.jsonPrimitive?.content?.toBoolean() ?: false
-                val message = result["message"]?.jsonPrimitive?.content ?: "未知结果"
-                _state.update { it.copy(operationMessage = if (success) "安装成功: $message" else null, errorMessage = if (!success) "安装失败: $message" else null) }
+                // Retrofit 的 suspend 方法自带 IO 调度，不必再包 withContext(Dispatchers.IO)
+                val result = api.installApp(AppInstallRequest(path))
+                _state.update { it.copy(
+                    operationMessage = if (result.success) "安装成功: ${result.message}" else null,
+                    errorMessage = if (!result.success) "安装失败: ${result.message}" else null
+                ) }
             } catch (e: Exception) {
                 _state.update { it.copy(operationMessage = null, errorMessage = "安装失败: ${e.localizedMessage ?: e.javaClass.simpleName}") }
             }
         }
     }
+
 
     // ── Misc ──
     fun clearFileOperationMessage() { _state.update { it.copy(operationMessage = null) } }

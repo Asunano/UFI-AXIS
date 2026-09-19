@@ -161,8 +161,10 @@ const guardShow = guardModal.show;
 
 // 组件安装的状态与 1s 进度轮询挂在页面上（弹窗关了也要继续），只把展示交给 ComponentsModal。
 // onChanged：组件装好/卸掉后 installed 与版本号变了，隧道侧的 status 得重拉。
+// only：/api/components 里还有 ffmpeg（视频封面抽帧用，入口在媒体 → 视频设置），
+// 本页只列隧道自己的两个二进制。
 const { comp, progressActive, loadComponents, installComponent, confirmUninstall, uploadComponent } =
-  useComponentInstaller({ onChanged: () => loadStatus() });
+  useComponentInstaller({ onChanged: () => loadStatus(), only: ['frpc', 'cloudflared'] });
 
 // ── 编辑与日志弹窗的目标 ──
 // 两个编辑器共用一个 editorName：同一时刻只可能开一个（由 tunnelKind 决定开哪个）。

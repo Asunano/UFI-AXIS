@@ -176,26 +176,35 @@ fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostControll
         onDismiss = { confirmBlock = null },
         title = "拉黑设备",
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { confirmBlock = null }, modifier = Modifier)
+            // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+            // local 必须在弹窗自己的 slot 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { confirmBlock = null } }, modifier = Modifier)
         },
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 size = UfiButtonSize.Small,
                 text = "拉黑",
                 modifier = Modifier,
                 onClick = {
-                    pending?.let { viewModel.network.blockDevice(it.mac, it.hostname) }
-                    confirmBlock = null
+                    close {
+                        pending?.let { viewModel.network.blockDevice(it.mac, it.hostname) }
+                        confirmBlock = null
+                    }
                 }
             )
         }
     ) {
-        Text(
-            text = "将「${pending?.hostname?.ifEmpty { "未知设备" } ?: ""}」（${pending?.mac?.uppercase() ?: ""}）" +
-                "加入 WiFi 黑名单？该设备会立刻断开，之后无法再连接本热点。",
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textSecondary
-        )
+        // 间距统一到 UfiDialogBody（12dp）
+        UfiDialogBody {
+            Text(
+                text = "将「${pending?.hostname?.ifEmpty { "未知设备" } ?: ""}」（${pending?.mac?.uppercase() ?: ""}）" +
+                    "加入 WiFi 黑名单？该设备会立刻断开，之后无法再连接本热点。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textSecondary
+            )
+        }
     }
 
     BlockedDevicesDialog(
@@ -241,15 +250,15 @@ private fun BlockedDevicesDialog(
             }
         }
     ) {
-        if (blocked.isEmpty()) {
-            Text(
-                text = "还没有拉黑任何设备。在下方在线设备列表里点「拉黑」即可。",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.textSecondary
-            )
-            return@UfiScrollableDialog
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        UfiDialogBody {
+            if (blocked.isEmpty()) {
+                Text(
+                    text = "还没有拉黑任何设备。在下方在线设备列表里点「拉黑」即可。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.textSecondary
+                )
+                return@UfiDialogBody
+            }
             blocked.forEachIndexed { index, entry ->
                 if (index > 0) UfiDivider()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {

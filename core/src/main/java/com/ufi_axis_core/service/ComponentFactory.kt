@@ -526,6 +526,18 @@ object ComponentFactory {
         val appRoutes = AppRoutes(appManager)
         val shellRoutes = ShellRoutes(consoleRecorder)
         val fileRoutes = FileRoutes()
+        // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
+        // 播放仍走 fileRoutes 的 /api/files/stream，这里不碰字节流。
+        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(context, settings)
+        // 天气（2026-09-17）：代理 Open-Meteo，位置存在 settings，结果走 responseCache 的 TTL。
+        val weatherRoutes = com.ufi_axis_core.api.routes.WeatherRoutes(settings, responseCache)
+        // 今日诗词（2026-09-18）：代理 jinrishici v2，token 存在 settings、结果走 responseCache 的 TTL。
+        val poetryRoutes = com.ufi_axis_core.api.routes.PoetryRoutes(settings, responseCache)
+        // 出网国家/地区（2026-09-18）：结果就存在 settings 的 geo_country / geo_detected_at 两个键上，
+        // 所以不接 responseCache —— "多久之内不重测"由落盘时间戳表达，再叠内存 TTL 会造出第二个口径。
+        // 启动时的自动检测不在这里触发（build() 是阻塞的，出网最坏 24s 会顶到初始化看门狗），
+        // 见 BackendService 里 HTTP 服务就绪之后那段。
+        val geoRoutes = com.ufi_axis_core.api.routes.GeoRoutes(settings)
         val rootSmsRoutes = RootSmsRoutes(smsController, scheduler, smsRuleStore)
         val smsForwardRoutes = SmsForwardRoutes(controller.smsForwardController, notifier)
         // Webhook 渠道（阶段 2）：配置 + 测试。gate 传的是同一个谓词（按 webhook 渠道绑好
@@ -618,6 +630,10 @@ object ComponentFactory {
             appRoutes = appRoutes,
             shellRoutes = shellRoutes,
             fileRoutes = fileRoutes,
+            mediaRoutes = mediaRoutes,
+            weatherRoutes = weatherRoutes,
+            poetryRoutes = poetryRoutes,
+            geoRoutes = geoRoutes,
             rootSmsRoutes = rootSmsRoutes,
             smsForwardRoutes = smsForwardRoutes,
             webhookRoutes = webhookRoutes,

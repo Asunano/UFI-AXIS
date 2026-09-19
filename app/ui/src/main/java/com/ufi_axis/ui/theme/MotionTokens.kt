@@ -231,6 +231,25 @@ object UfiMotion {
         const val Sweeping = 320
         /** 400ms — 首屏 / 强调型入场 */
         const val Deliberate = 400
+
+        /**
+         * 480ms — 弹窗进场（卡片 overshoot 缩放淡入 + 背景模糊糊上来）。
+         *
+         * ⚠️ 与 `app/ui/src/main/res/anim/ufi_dialog_enter.xml` 的 `android:duration`
+         * **必须相等**：背景模糊要在卡片进场动画结束的那一刻刚好达到最浓，靠的就是两者
+         * 同时到达端点。改一处就要改另一处（跨 Kotlin/xml 没法用同一个常量，只能靠这条注释）。
+         */
+        const val DialogEnter = 480
+
+        /**
+         * 240ms — 弹窗离场（卡片缩小淡出 + 背景模糊化开）。
+         *
+         * 沿用原 `res/anim/ufi_dialog_exit.xml` 的时长与曲线（fast_out_linear_in →
+         * [Easing.Accelerate]）。2026-09-18 起卡片离场改由 Compose 驱动（见
+         * `UfiDialogShell` 的说明：平台窗口退出动画只在窗口销毁那一刻播，而那时已经
+         * 没法再写模糊半径，"弹窗完全消失时背景刚好最清晰"就无从对齐）。
+         */
+        const val DialogExit = 240
         /**
          * 420ms — 强调型入场，比 [Deliberate] 慢半拍：胶囊导航浮出、测速阶段切换。
          *
@@ -293,39 +312,33 @@ object UfiMotion {
     /**
      * 二级页转场「离场页后退」的幅度档位（`com.ufi_axis.ui.navigation` 的 detail 转场专用）。
      *
-     * 2026-09-04：二级页转场原来只有水平平移，单一图层在动 = 没有层次感。现在叠加
-     * 「离场页退到后面去」的两件套（缩放 + 遮罩），本对象只定义**幅度**，播放进度与时长由
-     * [com.ufi_axis.ui.navigation.UfiNavRecedeProfile] / `ufiNavTransitionDurationMs`
-     * 唯一给出（跟随 [ThemeManager] 的用户设置 150..600，`0` = 关闭）。
+     * 深度感**只由 scrim 承担**：下层（退到后面那页）被进场页逐步覆盖时叠一层压暗，
+     * 表达「退到后面去」的层次。播放进度与时长由
+     * [com.ufi_axis.ui.navigation.ufiSharedAxisLayer]（幅度经 `sharedAxisScrimAlpha()` 读本对象）/
+     * `ufiNavTransitionDurationMs` 唯一给出（跟随 [ThemeManager] 的用户设置 150..600，`0` = 关闭）。
      *
-     * ## ⚠ 只作用于「离场页」，进场页一律不缩放
-     * 同日二次修订删掉了原来的 `CardScaleFrom`（进场页 0.94 → 1 的「卡片浮起」）。
-     * 原因不是幅度不合适，而是这个 App 的 chrome（状态栏色带 / 底部胶囊窗口）**不在
-     * 转场动画容器里**：进场页只要 `scale < 1`，四周立刻露出那些静止的 chrome，
-     * 观感是"顶部和底部各有一块不动的区域"。进场页必须满屏铺满，深度感全部交给下层。
+     * ## ⚠ 只作用于「离场页」，进场页一律不缩放、不压暗
+     * 同日二次修订删掉了原来的 `CardScaleFrom`（进场页 0.94 → 1 的「卡片浮起」），
+     * 又于 2026-09-13 删掉了离场页的 `scale 1 → 0.96` + 离屏合成。原因：
+     * 1. 进场页只要 `scale < 1`，四周立刻露出静止的 chrome（状态栏色带 / 底部胶囊窗口）
+     *    —— 本 App 的 chrome 不在转场容器里，观感是"顶部和底部各有一块不动的区域"；
+     * 2. 离场页缩放 + `CompositingStrategy.Offscreen` 在预测性返回逐帧 seek 时会把整块
+     *    全屏纹理反复重渲染（掉帧），且与圆角 clip 叠加在首帧渲染到错误偏移（新页飞角）。
      * 详细论证见 `navigation/Navigation.kt` 文件头的铁律 A / B。
      *
-     * ## 取值理由
-     * 幅度刻意**很小**：整屏元素的缩放感知强度与面积成正比，同样 4% 的缩放放在
-     * 一个按钮上几乎看不见、放在整屏上已经是"明显推远"。参照 [PressScale] 的同一条规律
-     * （面积越大缩得越少），整屏这一量级只能落在 0.94~0.97 区间。
+     * ## 取值理由（scrim）
+     * 原 0.12 在真机上几乎看不出压暗（还被不透明的进场页进一步遮住），用户报"完全没有
+     * 暗的效果"，故 2026-09-13 提到 0.30；同日二次反馈仍嫌不够，2026-09-13 再提到 0.50：
+     * 退后一档的层级更明确（scrim 色本身已是弹窗遮罩强度，不至于黑成一片）。
      */
     object NavRecede {
         /**
-         * 0.96 — 离场页「退到后面去」的缩放终点。
+         * 0.50 — 离场页遮罩（`palette.scrim`）的**峰值**不透明度。
          *
-         * 只退 4%：离场页在下层且被进场页逐步遮住，退太多会在进场页尚未覆盖的那一侧
-         * 露出页面外的容器底色（真机上就是边缘一条缝）。
+         * 0.12 在真机上几乎看不出压暗（还被不透明的进场页进一步遮住），用户报"完全没有
+         * 暗的效果"；0.30 仍嫌不够，2026-09-13 二次提到 0.50：退后一档的层级更明确。
          */
-        const val ScaleTo = 0.96f
-
-        /**
-         * 0.12 — 离场页遮罩（`palette.scrim`）的**峰值**不透明度。
-         *
-         * scrim 色本身是弹窗遮罩强度（黑 35% / 50%），整屏转场只需要"压暗一档"表达层级，
-         * 直接用原强度会让返回过程中下层黑成一片。0.12 是仍能看出压暗、又不至于抢戏的下限。
-         */
-        const val ScrimAlpha = 0.12f
+        const val ScrimAlpha = 0.50f
     }
 
     /** 缓动曲线集合：业务不要直接 import Compose 的 easing 常量。 */
@@ -402,6 +415,33 @@ object UfiMotion {
 
     /** 滑块轨道跟随 */
     fun <T> sliderTrack(): SpringSpec<T> = UfiAnimSpecs.sliderTrack()
+
+    // ===== 弹窗背景（backdrop：窗口级模糊 + 变暗）的渐变 =====
+    //
+    // 为什么用 tween 而不是 spring：这两条曲线驱动的是**窗口属性**（blurBehindRadius /
+    // dimAmount），每一步都要过一次 WindowManager。spring 的收尾是长尾渐近，会在肉眼
+    // 已经看不出差别的区间里继续派发若干次窗口更新；tween 有确定的终点与时长，
+    // 步数可控（见 UfiDialogShell 的 BackdropSteps 量化）。
+    //
+    // ## 为什么这两条是 Linear
+    // 2026-09-18：同一条进度还要驱动卡片的离场（见 UfiDialogShell），而背景与卡片要用
+    // **不同曲线、相同端点** —— 所以 Animatable 走线性，曲线在各消费处用
+    // `Easing.transform()` 施加。若把曲线写在 spec 里，两个消费者就只能共用一条。
+    //
+    // ## 时长为什么等于 res/anim 里的值
+    // 需求是"进场动画结束的那一刻模糊刚好最浓、弹窗完全消失的那一刻背景刚好最清晰"，
+    // 也就是背景与卡片必须**同时到达端点**。卡片进场由 `res/anim/ufi_dialog_enter.xml`
+    // （480ms）负责，所以入场这条也必须是 480ms；离场同理对齐 240ms。
+    // ⚠️ 改这两个数就必须同步改那两个 xml，反之亦然。
+
+    /** 弹窗 backdrop 入场：0 → 满模糊/满变暗。时长对齐 `ufi_dialog_enter.xml`。 */
+    fun dialogBackdropIn(): TweenSpec<Float> =
+        tween(Duration.DialogEnter, easing = Easing.Linear)
+
+    /** 弹窗 backdrop 离场：满 → 0。时长对齐弹窗卡片的离场（240ms）。 */
+    fun dialogBackdropOut(): TweenSpec<Float> =
+        tween(Duration.DialogExit, easing = Easing.Linear)
+
 
     /**
      * 标题模糊入场时长（`UfiHeader` 的标题 `RenderEffect` 模糊 8→0），毫秒。

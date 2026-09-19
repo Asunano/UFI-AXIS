@@ -70,6 +70,9 @@ class UpdateRoutes(
                 }
                 var savedPath: String? = null
                 var uploadError: String? = null
+                // 包名不匹配与「上传失败」要分开报：前者是用户选错了包，重试同一个包没有意义，
+                // 客户端需要据此提示"换一个包"而不是"稍后重试"
+                var packageRejected = false
                 try {
                     try {
                         val multipart = call.receiveMultipart()
@@ -81,6 +84,14 @@ class UpdateRoutes(
                                             File(UPDATE_DIR).mkdirs()
                                             val partFile = File(UPDATE_DIR, "ufi-core-uploaded.apk.part")
                                             val target = File(UPDATE_DIR, "ufi-core-uploaded.apk")
+                                            // 先清掉上一次遗留：失败态刻意不清理残留（保留供重试），
+                                            // 于是错包会一直占着这个固定文件名。每次上传开头先删，
+                                            // 保证"这次上传要么放上新包、要么这里什么都没有"，
+                                            // 不会出现"以为推上去了、其实装的是上次那个旧包"。
+                                            if (target.exists() && !target.delete()) {
+                                                AppLogger.w("UpdateRoutes", "旧上传包删除失败: ${target.absolutePath}")
+                                            }
+                                            if (partFile.exists()) partFile.delete()
                                             part.streamProvider().use { input ->
                                                 // APK magic 头校验：PK\x03\x04（ZIP 魔数）
                                                 val header = ByteArray(4)
@@ -104,6 +115,17 @@ class UpdateRoutes(
                                                         out.write(buf, 0, n)
                                                     }
                                                 }
+                                            }
+                                            // 包名校验必须在 rename **之前**：magic 头只能证明"是个 ZIP"，
+                                            // 证明不了"是 core 自己"。装错包的后果是 adb install -r 把**别的 app**
+                                            // 装上去，core 不会被替换、进程不死，状态机就卡在 INSTALLING，
+                                            // 此后所有上传恒 409（见 UpdateManager.selfHealStuckState）。
+                                            // 拦在这里，错包连落地成固定文件名的机会都没有，也就不存在占位。
+                                            val reject = updateManager.rejectReasonForApk(partFile)
+                                            if (reject != null) {
+                                                partFile.delete()
+                                                packageRejected = true
+                                                throw IllegalArgumentException(reject)
                                             }
                                             // 原子提交：.part → 最终文件名（并发上传只会写各自的 .part，rename 覆盖）
                                             if (target.exists()) target.delete()
@@ -134,7 +156,11 @@ class UpdateRoutes(
                 if (savedPath != null) {
                     call.respond(toJsonElement(mapOf("ok" to true, "apk_path" to savedPath)))
                 } else {
-                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, (uploadError ?: "未收到 APK 文件"))
+                    call.respondFail(
+                        HttpStatusCode.BadRequest,
+                        if (packageRejected) ErrorCode.INVALID_PACKAGE else ErrorCode.BAD_REQUEST,
+                        (uploadError ?: "未收到 APK 文件")
+                    )
                 }
             }
 

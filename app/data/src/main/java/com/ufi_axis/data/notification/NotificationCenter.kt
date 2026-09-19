@@ -27,6 +27,10 @@ import java.util.Calendar
  *   仅 critical 告警突破）+ 多告警合并摘要（BigTextStyle）；
  * - 性能：所有通知入口第一行开关短路 return（轮询高频调用零开销）。
  *
+ * **进程边界（2026-09 收束）**：状态栏通知**只允许** `:ufi_notify` 发射。
+ * [notify] / [sendTestNotification] 在非通知进程一律经 [NotifyDispatchReceiver] 转交；
+ * 主进程只负责应用内 banner（[handleInAppToast]）与配置真源写入。
+ *
  * 禁止在各 feature/viewmodel 模块散写 NotificationCompat —— 一律经本类出口。
  *
  * @param context 任意 Context（内部统一取 applicationContext，避免泄漏）。
@@ -143,6 +147,10 @@ class NotificationCenter(context: Context) {
          * 用途：UI 判断"总闸开着但一个分类都没开"（那种状态下一条通知都不会来，
          * 必须在文案里说出来，否则又是一个"看着开了却收不到"）。
          *
+         * 只放**通知分类**键。[KEY_SMS_CODE_AUTO_COPY] 曾被误加进来（2026-09-13）——
+         * 它管的是"验证码通知发出后要不要顺手复制"，不是一类通知，算进摘要会让
+         * "所有分类都关了、只开着自动复制"被判成"还有分类开着"。
+         *
          * 新增场景时必须同时补 [sceneEnabledKey] 与本集合 —— 由 `NotifyGateGuardTest` 守。
          */
         val CATEGORY_KEYS: List<String> = listOf(
@@ -200,6 +208,14 @@ class NotificationCenter(context: Context) {
 
         /** 下载完成/失败通知开关（默认开，P1 日常价值场景）。 */
         const val KEY_DOWNLOAD_NOTIF = "download_notification_enabled"
+
+        /**
+         * 验证码自动复制开关（默认关，2026-09-13）。
+         *
+         * 2026-09-13 修复：此前逻辑在 UI 层轮询（SmsScreen），后台不生效且受 Android 10+ 限制。
+         * 现在迁移至 `:ufi_notify` 进程，由 [NotifyService] 在 WS 推送边沿触发。
+         */
+        const val KEY_SMS_CODE_AUTO_COPY = "sms_code_auto_copy"
 
         /** 流量 80% 限额预警开关（默认开，复用告警 channel，仅 DEFAULT 不响铃）。 */
         const val KEY_TRAFFIC_80_NOTIF = "traffic_80_notification_enabled"
@@ -308,6 +324,12 @@ class NotificationCenter(context: Context) {
         /** Intent extra key：通知点击跳转到短信对话界面的手机号。 */
         const val EXTRA_SMS_PHONE = "extra_sms_phone"
 
+        /** 跨进程转交：点击打开事件中心。 */
+        const val TAP_ALERT = "alert"
+
+        /** 跨进程转交：点击打开短信对话（配合 [NotifyPayload.smsPhone]）。 */
+        const val TAP_SMS = "sms"
+
         /** P3（应用内通知）：Intent extra key：告警系统通知点击跳转到事件中心的标记。 */
         const val EXTRA_ALERT_DEEPLINK = "extra_alert_deeplink"
 
@@ -327,6 +349,14 @@ class NotificationCenter(context: Context) {
 
         /** 单次跨进程转交的最大告警条数（防 Intent 超过 Binder 事务上限）。 */
         const val DISPATCH_MAX_ALERTS = 50
+
+        /**
+         * 自动复制验证码时写入的 ClipData label。
+         *
+         * 回读校验只比这个 label（[copyVerificationCodeToClipboard]）——
+         * 比明文等于把验证码再写一遍日志。
+         */
+        private const val CLIP_LABEL_VERIFICATION = "UFI-AXIS 验证码"
     }
 
     // ═══════════════════════ 开关读写（供 UI 使用） ═══════════════════════
@@ -534,6 +564,8 @@ class NotificationCenter(context: Context) {
             category = NotificationCompat.CATEGORY_ALARM,
             onTap = alertDeepLinkIntent()
         )
+        // showNotification → notify()：本方法只在 :ufi_notify 内被调用（consumeDispatchedAlerts /
+        // NotifyService WS/轮询），不会触发跨进程转交。
     }
 
     private fun isMainProcess(): Boolean {
@@ -609,7 +641,8 @@ class NotificationCenter(context: Context) {
                 // 恢复是"事后补一条"，静默；断网要看得见，用 channel 的 IMPORTANCE_HIGH 派生优先级
                 silent = online,
                 category = NotificationCompat.CATEGORY_STATUS,
-                onTap = alertDeepLinkIntent()
+                onTap = alertDeepLinkIntent(),
+                tapType = TAP_ALERT
             )
         )
     }
@@ -635,6 +668,13 @@ class NotificationCenter(context: Context) {
             silent = true,
             onTap = alertDeepLinkIntent()
         )
+    }
+
+    /** 供 `:ufi_notify` 跨进程接收端重建 PendingIntent（见 [NotifyDispatchReceiver]）。 */
+    internal fun resolveOnTap(tapType: String?, smsPhone: String?): PendingIntent? = when (tapType) {
+        TAP_ALERT -> alertDeepLinkIntent()
+        TAP_SMS -> if (smsPhone.isNullOrBlank()) null else smsDeepLinkIntent(smsPhone)
+        else -> null
     }
 
 
@@ -663,7 +703,8 @@ class NotificationCenter(context: Context) {
                 priority = NotificationCompat.PRIORITY_DEFAULT,
                 silent = true,
                 category = NotificationCompat.CATEGORY_STATUS,
-                onTap = alertDeepLinkIntent()
+                onTap = alertDeepLinkIntent(),
+                tapType = TAP_ALERT
             )
         )
     }
@@ -681,6 +722,8 @@ class NotificationCenter(context: Context) {
                 message = "$sender：${snippet.take(60)}",
                 notificationId = ID_SMS,
                 onTap = smsDeepLinkIntent(sender),
+                tapType = TAP_SMS,
+                smsPhone = sender,
                 priority = NotificationCompat.PRIORITY_DEFAULT,
                 silent = true,
                 category = NotificationCompat.CATEGORY_MESSAGE
@@ -700,11 +743,75 @@ class NotificationCenter(context: Context) {
                 message = "$sender：$code",
                 notificationId = ID_VERIFICATION_CODE,
                 onTap = smsDeepLinkIntent(sender),
+                tapType = TAP_SMS,
+                smsPhone = sender,
                 priority = NotificationCompat.PRIORITY_DEFAULT,
                 silent = true,
                 category = NotificationCompat.CATEGORY_MESSAGE
             )
         )
+
+        // 2026-09-13 修复：后台自动复制验证码逻辑。
+        // 原本在 SmsScreen/ToolsModule 里的逻辑只能在前台刷新时生效，且无法在后台通过 ClipboardManager 写入。
+        // 这里在通知发出后尝试触发自动复制。
+        copyVerificationCodeToClipboard(code)
+    }
+
+    /**
+     * 自动复制验证码到剪贴板 —— **尽力而为，不保证成功**。
+     *
+     * ## 触发位置
+     * 放在通知发出之后：本方法只在 `:ufi_notify`（状态栏通知的唯一发射进程）里跑，
+     * 无论 UI 是否存活都会执行；原来那份实现挂在 `SmsScreen` / `ToolsModule` 的轮询上，
+     * 只有前台打开短信页时才生效。
+     *
+     * ## 关于 Android 10+ 的后台剪贴板限制（2026-09-14 纠正）
+     * 这里**没有**绕过限制的办法。`setPrimaryClip` 的放行判据是「调用进程是否持有焦点窗口、
+     * 或是否为默认输入法」，与用哪个 [Context] 实例无关 —— 之前的注释声称
+     * 「无障碍服务 Context 拥有更高权限，能绕过剪贴板写入限制」，那是错的。
+     * 仍然优先用 [BackgroundActionHelper.getPrivilegedContext]（活跃的无障碍服务）：
+     * 部分国产 ROM 对已授权无障碍的应用放宽，属于**碰运气的加分项**，不是机制保证。
+     *
+     * 因此写完必须**回读校验**并如实记 WARN：系统拒绝时 `setPrimaryClip` 不抛异常、不返回值，
+     * 一路静默 —— 原来这里无条件打 INFO「已后台自动复制」，用户报「没复制上」时日志反而
+     * 在撒谎。回读本身在后台同样受限，拿不到内容时只能记「无法确认」，不能算成功。
+     *
+     * 兜底：验证码本身就在通知正文里（`notifyVerificationCode` 的 message = `发件人：验证码`），
+     * 复制失败时用户仍可从通知栏长按复制。
+     */
+    private fun copyVerificationCodeToClipboard(code: String) {
+        if (!switchOn(KEY_SMS_CODE_AUTO_COPY, false)) return
+
+        try {
+            val privilegedContext = BackgroundActionHelper.getPrivilegedContext()
+            val via = if (privilegedContext != null) "无障碍服务 Context" else "应用 Context"
+            val cm = (privilegedContext ?: appContext)
+                .getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
+            if (cm == null) {
+                DebugLog.w("SmsCodeCopy", "ClipboardManager 不可用，放弃自动复制")
+                return
+            }
+
+            cm.setPrimaryClip(android.content.ClipData.newPlainText(CLIP_LABEL_VERIFICATION, code))
+
+            // 回读校验：只比 label，不读明文（验证码不该再进一次日志）
+            when (cm.primaryClipDescription?.label) {
+                CLIP_LABEL_VERIFICATION ->
+                    DebugLog.i("SmsCodeCopy", "验证码已复制到剪贴板（via $via）")
+                null -> DebugLog.w(
+                    "SmsCodeCopy",
+                    "无法确认剪贴板写入结果（via $via）：Android 10+ 后台读写均受限，" +
+                        "验证码仍可从通知栏长按复制"
+                )
+                else -> DebugLog.w(
+                    "SmsCodeCopy",
+                    "剪贴板写入被系统拒绝（via $via）：当前内容不是本次写入的，" +
+                        "验证码仍可从通知栏长按复制"
+                )
+            }
+        } catch (e: Exception) {
+            DebugLog.e("SmsCodeCopy", "后台自动复制失败", e)
+        }
     }
 
     // ═══════════════════════ 下载完成/失败（N11 / N12） ═══════════════════════
@@ -816,6 +923,13 @@ class NotificationCenter(context: Context) {
      *         否则权限恢复后会出现"没报离线却报了恢复"）。
      */
     fun notify(scene: NotifyScene, payload: NotifyPayload): Boolean {
+        // ★ 进程收束（2026-09）：状态栏通知**只允许** `:ufi_notify` 发射。
+        // 主进程（UI / WorkManager / 前台 WS）一律转交，避免：
+        // 1. 双发（主进程与 :ufi_notify 各弹一条，限频/去重又各自本地不共享）；
+        // 2. 游标/历史写进主进程私有状态，破坏「单写者」。
+        if (!isNotifyProcess()) {
+            return NotifyDispatchReceiver.dispatchScene(appContext, scene, payload)
+        }
         // 每条通知的结果都要落历史（送达 / 被谁拦下），因为下面 5 个分支原本全是静默
         // `return false` —— 用户报"收不到通知"时除了猜没有别的线索（release 只留 WARN/ERROR）。
         // 写在本函数内部而不是各调用点：唯一出口就是这里，记录才不依赖调用方自觉。
@@ -1054,7 +1168,18 @@ class NotificationCenter(context: Context) {
      * 测试通知发送结果（业务层 UI 用作 Toast 文案分发）。
      */
     sealed class TestResult {
+        /** 本进程（`:ufi_notify`）已把通知交给系统 `NotificationManager`。 */
         object Success : TestResult()
+
+        /**
+         * 已转交 `:ufi_notify`，**发射结果未知**。
+         *
+         * 2026-09-14：主进程原来在转交成功后直接返回 [Success]，于是被免打扰 / channel 被用户
+         * 关掉 / ROM 限频拦下时 UI 仍然报「已发送」—— 那是假阳性。发射发生在另一个进程、异步完成，
+         * 主进程拿不到真实结果，就必须如实说「已转交，请看通知栏」，而不是替系统打包票。
+         */
+        object Dispatched : TestResult()
+
         data class PermissionDenied(val permission: String) : TestResult()
         data class Failed(val error: String) : TestResult()
     }
@@ -1065,6 +1190,26 @@ class NotificationCenter(context: Context) {
     fun lastTestNotificationId(): Int = lastTestNotificationId
 
     fun sendTestNotification(): TestResult {
+        // 主进程侧仍做权限预检（用户在设置页点击时立刻得到反馈），真正发射转交 :ufi_notify。
+        if (!isNotifyProcess()) {
+            if (!NotificationManagerCompat.from(appContext).areNotificationsEnabled()) {
+                return TestResult.PermissionDenied(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                    appContext, android.Manifest.permission.POST_NOTIFICATIONS
+                ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                if (!granted) {
+                    return TestResult.PermissionDenied(android.Manifest.permission.POST_NOTIFICATIONS)
+                }
+            }
+            // 只能报「已转交」：真实发射在 :ufi_notify 内异步完成，见 [TestResult.Dispatched]
+            return if (NotifyDispatchReceiver.dispatchTest(appContext)) {
+                TestResult.Dispatched
+            } else {
+                TestResult.Failed("转交通知进程失败")
+            }
+        }
         // 幂等 channel 重建（用户从 settings 进来时大部分情况下 channel 已存在）
         ensureChannels()
         // 系统级「应用通知」总开关：部分国产 ROM 即使已授予运行时权限也会在此被关，

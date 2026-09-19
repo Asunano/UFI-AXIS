@@ -70,6 +70,196 @@ interface UfiAxisApi {
     @GET("api/traffic/summary")
     suspend fun getTrafficSummary(): TrafficSummary
 
+    /**
+     * 分段流量用量（「流量管理 → 流量历史」卡片）。
+     *
+     * 与 [getTrafficHistory] 的分工：后者回**原始速率采样**（近 N 小时逐条），
+     * 本端点回**按段聚合后的完整桶序列** + 中文文案，见 [TrafficUsageResponse]。
+     *
+     * @param range `day` / `week` / `month` / `year`（core 对非法值回落到 day，不回 400）
+     * @param anchor 锚点时刻（epoch ms）；null = core 按"当前所在的那一段"取
+     */
+    @GET("api/traffic/usage")
+    suspend fun getTrafficUsage(
+        @Query("range") range: String,
+        @Query("anchor") anchor: Long? = null
+    ): TrafficUsageResponse
+
+    // ========== Media Center（媒体中心，2026-09-16）==========
+    //
+    // core 侧查系统媒体库（MediaStore）。**播放 / 查看仍走 `/api/files/stream?path=`**，
+    // 这里不出现第二条取字节流的路径；缩略图是唯一的例外（它是 core 生成的 JPEG，不是原文件）。
+
+    /** 三类媒体各自的授权状态 + 当前扫描目录。某类未授权时界面要显示引导，不许显示空列表。 */
+    @GET("api/media/status")
+    suspend fun getMediaStatus(): MediaStatusResponse
+
+    /**
+     * 列某一类媒体（分页）。
+     *
+     * @param type [MEDIA_TYPE_VIDEO] / [MEDIA_TYPE_AUDIO] / [MEDIA_TYPE_IMAGE]
+     * @param sort `date`（默认）/ `name` / `size`
+     * @param order `desc`（默认）/ `asc`
+     */
+    @GET("api/media/list")
+    suspend fun getMediaList(
+        @Query("type") type: String,
+        @Query("sort") sort: String? = null,
+        @Query("order") order: String? = null,
+        @Query("limit") limit: Int? = null,
+        @Query("offset") offset: Int? = null
+    ): MediaListResponse
+
+    /**
+     * 按目录列一层（媒体库的文件夹视图）：子目录 + 这一层的媒体文件。
+     *
+     * 与 [getMediaList] 的分工：那个是整库平铺分页，这个是"这一层有什么"（不分页）。
+     * [path] 留空时由 core 决定起点：只配了一个扫描目录就直接进那一个，配了多个则回
+     * `roots` 让用户先选。
+     */
+    @GET("api/media/browse")
+    suspend fun browseMedia(
+        @Query("type") type: String,
+        @Query("path") path: String? = null,
+        @Query("sort") sort: String? = null,
+        @Query("order") order: String? = null
+    ): MediaBrowseResponse
+
+    /**
+     * 设备端 ffmpeg 自检。
+     *
+     * 传 [path] 时 core 会**真的对那个文件抽一帧**并计时（不落缓存），用来判断
+     * "设备自己生成缩略图" 这条路是否实用；不传就只回库的可用性与版本。
+     */
+    @GET("api/media/ffmpeg-status")
+    suspend fun getMediaFfmpegStatus(
+        @Query("path") path: String? = null
+    ): MediaFfmpegStatusResponse
+
+    /** 读某一类的扫描目录。 */
+    @GET("api/media/config")
+    suspend fun getMediaConfig(@Query("type") type: String): MediaConfigResponse
+    /**
+     * 写某一类的扫描目录。空数组 = 这一类不限目录（列整个媒体库里的该类型）。
+     *
+     * 按类型分开存（2026-09-16 媒体中心拆成三页）：视频页只改视频那一份，
+     * 所以三页各有可写入口也不会互相覆盖。
+     */
+    @PUT("api/media/config")
+    suspend fun putMediaConfig(
+        @Query("type") type: String,
+        @Body body: MediaDirsRequest
+    ): MediaConfigResponse
+
+    /**
+     * 请系统重新收录某一类的目录（`dirs` 为空时用该类型已配置的目录）。
+     * 只提交该类型的文件；收录是异步的：成功返回不代表 [getMediaList] 立刻能查到新文件。
+     */
+    @POST("api/media/rescan")
+    suspend fun rescanMedia(
+        @Query("type") type: String,
+        @Body body: MediaDirsRequest
+    ): MediaRescanResponse
+
+    /**
+     * 旁挂歌词（同名 `.lrc` / `.txt`）。没有歌词时回 `found = false`（不是 404）。
+     *
+     * 封面走 `api/media/cover?id=`（原始内嵌图，播放页用），**不在这里声明** ——
+     * 那是给 Coil 直接吃的图片 URL，不经 Retrofit。
+     */
+    @GET("api/media/lyrics")
+    suspend fun getMediaLyrics(@Query("id") id: Long): MediaLyricsResponse
+
+    /**
+     * 单首音频的标签（曲名 / 艺术家 / 专辑 / 时长）。
+     *
+     * `/list` 里已经带了同名字段（来自系统扫描），这一条是**缺失时的补强**：
+     * core 会直接对文件再读一次标签。播放页进页面就能拉到正确的歌名，
+     * 不必等播放器解出容器元数据才更新。
+     */
+    @GET("api/media/tags")
+    suspend fun getMediaTags(@Query("id") id: Long): MediaTagsResponse
+
+    /**
+     * 换一张免鉴权播放票据（`/media/stream?ticket=…`）。
+     *
+     * 手机端给「设备解不出画面」的视频抽缩略图时要用：`MediaMetadataRetriever` 自己发 HTTP
+     * 请求、加不了签名头，而签名的 nonce 是一次性的，多个 Range 请求必然从第二个起被拒。
+     */
+    @POST("api/files/stream-ticket")
+    suspend fun createStreamTicket(@Body body: StreamTicketRequest): StreamTicketResponse
+
+    // ========== Weather（2026-09-17，core 代理 Open-Meteo）==========
+
+    /**
+     * 当前天气。默认用设备上保存的坐标；[lat]/[lon] 只在「设置页里选了城市、想先看一眼」
+     * 时传（保存前的预览），正常显示不要传。
+     */
+    @GET("api/weather")
+    suspend fun getWeatherNow(
+        @Query("lat") lat: Double? = null,
+        @Query("lon") lon: Double? = null,
+        @Query("city") city: String? = null
+    ): WeatherNowResponse
+
+    /** 城市搜索（core 侧缓存 1 天）。 */
+    @GET("api/weather/search")
+    suspend fun searchWeatherCity(
+        @Query("name") name: String,
+        @Query("lang") lang: String = "zh"
+    ): WeatherSearchResponse
+
+    @GET("api/weather/config")
+    suspend fun getWeatherConfig(): WeatherConfigResponse
+
+    /** 字段级合并：只传要改的字段。 */
+    @PUT("api/weather/config")
+    suspend fun updateWeatherConfig(@Body body: WeatherConfigRequest): WeatherConfigUpdateResponse
+
+    // ========== 今日诗词（2026-09-18，core 代理 jinrishici v2）==========
+
+    /**
+     * 当前推荐的一句诗。标签匹配由上游按设备 IP 自动完成（季节/天气/时辰/地理），
+     * 命中的标签在 `match_tags` 里回传。
+     *
+     * @param refresh 传 `"1"` 绕过 core 的本地缓存；上游对同一 token 有约 10 分钟的
+     *   预生成缓存，所以短时间内仍可能是同一句 —— 这是它的机制，不是失败。
+     */
+    @GET("api/poetry")
+    suspend fun getPoetry(@Query("refresh") refresh: String? = null): PoetryResponse
+
+    @GET("api/poetry/config")
+    suspend fun getPoetryConfig(): PoetryConfigResponse
+
+    /** 字段级合并：只传要改的字段。 */
+    @PUT("api/poetry/config")
+    suspend fun updatePoetryConfig(@Body body: PoetryConfigRequest): PoetryConfigUpdateResponse
+
+    // ========== 出网国家/地区（2026-09-18，检测在 core）==========
+
+    /**
+     * 设备的出网国家/地区。**app 不再自己做地理检测** —— 判据是出网 IP 的归属，
+     * 而设备才是出网点；每端各测一次只会得到几份可能不一致的结果。
+     *
+     * core 在自己启动时已经测过一次并落盘，这里通常是直接读那份结果（`source=cache`）；
+     * 结果缺失或超过 7 天时 core 会顺手重测（`source=fresh`），故本调用偶尔会慢几秒。
+     */
+    @GET("api/geo")
+    suspend fun getGeo(): GeoResponse
+
+    /**
+     * 把手机端抽好的缩略图交给 core 缓存（raw JPEG 字节）。
+     *
+     * core 侧 `/api/media/thumbnail` 的第一级就是这份缓存，所以传一次之后
+     * **Web 端和其它客户端也能看到**这张缩略图 —— 这正是"抽完要回传"而不是只存本地的理由。
+     */
+    @PUT("api/media/thumbnail")
+    suspend fun putMediaThumbnail(
+        @Query("type") type: String,
+        @Query("id") id: Long,
+        @Body body: okhttp3.RequestBody
+    ): MediaThumbUploadResponse
+
     // ========== Network ==========
     @GET("api/network/signal")
     suspend fun getSignalInfo(): SignalInfo
@@ -647,6 +837,22 @@ interface UfiAxisApi {
     suspend fun clearMailHistory(
         @Query("channel") channel: String? = null
     ): SmsForwardSaveResponse
+
+    /**
+     * 删单条投递记录（详情弹窗「删除」）。
+     *
+     * 旧 core 无此端点会回 404/405，调用方需按「设备端不支持」提示，不要当网络故障重试刷屏。
+     */
+    @DELETE("api/sms-forward/history/{id}")
+    suspend fun deleteMailHistoryById(
+        @Path("id") id: Long
+    ): MailHistoryDeleteResponse
+
+    /** 三渠道配置页统计卡（总投递 / 失败 / 拦截 / 最近成功）。 */
+    @GET("api/sms-forward/history/stats")
+    suspend fun getMailHistoryStats(
+        @Query("channel") channel: String
+    ): MailHistoryStatsResponse
 
     // ========== 通用 Webhook 通知渠道 ==========
     /**

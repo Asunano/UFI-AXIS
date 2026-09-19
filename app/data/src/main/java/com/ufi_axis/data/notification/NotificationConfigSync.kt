@@ -149,7 +149,17 @@ object NotificationConfigSync {
             return
         }
         val local = readLocal(context)
-        if (local == remote) return
+        if (local == remote) {
+            // 本地已与远端一致，但 :ufi_notify 的 mirror_ 副本是独立拷贝，读不到主进程刚写的
+            // 共享文件（MODE_PRIVATE 无跨进程 reload）。日常通知 / 告警二级闸门 / 免打扰 /
+            // 严重事件兜底等开关都在写本地 pref 之后经 updateNotificationConfig 走到这里，
+            // UI 已先写好新值使得 local == remote，若不推快照，那个进程会继续按旧值判闸 ——
+            // 表现为「本地开、系统通知却不弹」的假开关。与各处显式 dispatchSwitchSnapshot
+            // 同一动机；此处兜底覆盖所有走 applyRemote 的调用方（含 NotifyManageScreen 的
+            // 免打扰开关、AlertSettingsScreen 的二级闸门等此前漏推的入口）。
+            NotifyDispatchReceiver.dispatchSwitchSnapshot(context)
+            return
+        }
 
         NotifyPrefs.shared(context).edit()
             .putBoolean(NotificationCenter.KEY_NOTIFY_MASTER, remote.master_enabled)

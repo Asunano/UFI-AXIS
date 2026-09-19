@@ -57,6 +57,18 @@ dependencies {
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
 
+    // FFmpeg-kit（maintained fork，free71 变体，仅 arm64）——**只要 Java 层**
+    //
+    // 这里入库的是从上游 aar 里抽出来的 classes.jar（57KB），不是整份 aar（10MB）：
+    //  · Java 层（FFmpegKit / FFmpegSession…）必须在 APK 里 —— native 方法是注册在
+    //    这些类上的，缺了它就算 .so 装好也拿不到入口（ClassNotFoundException）；
+    //  · native 层（9 个 .so，解包后约 22MB）走插件式组件按需下载，装到
+    //    filesDir/components/ffmpeg/，运行时 System.load(绝对路径) 按依赖顺序加载。
+    //
+    // 为什么不直接依赖 aar：aar 被 .gitignore 挡在仓库外（体积），CI 全新 checkout
+    // 会因找不到 artifact 直接编译失败；jar 小到可以入库，且天然不带 jni/ 目录。
+    implementation(files("libs/ffmpeg-kit-classes.jar"))
+
     // ===== 单元测试（QA 新增，仅 test 作用域，不影响正式构建） =====
     testImplementation(libs.junit)
     testImplementation(libs.robolectric)

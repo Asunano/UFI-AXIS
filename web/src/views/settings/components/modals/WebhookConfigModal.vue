@@ -984,5 +984,22 @@ watch(
   .form-grid {
     grid-template-columns: 1fr;
   }
+  /*
+    自定义请求头用的是 `n-dynamic-input preset="pair"`：一行里塞「名称框 + 值框 + 删除/上移」，
+    操作区 `flex-shrink: 0` 不可压缩（约 68px），弹窗内可用仅 ~280px ⇒ 两个输入框各剩约 100px。
+    填 `Authorization` 已经看不全字段名，值是 token 时完全没法核对 —— 而这一格正是凭据编辑区。
+    把 pair 的内层 flex 转成 column，两个框各得整宽。
+    类名取自 naive 的 `dynamic-input/src/styles/index.cssr.mjs`：
+    `.n-dynamic-input-preset-pair` 是那条 flex 行，内部两个 `.n-dynamic-input-pair-input`
+    靠 `:first-child { margin-right: 12px }` 分隔 —— 竖排后那条右边距要归零，间距交给 gap。
+  */
+  :deep(.n-dynamic-input-preset-pair) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+  :deep(.n-dynamic-input-pair-input:first-child) {
+    margin-right: 0;
+  }
 }
 </style>

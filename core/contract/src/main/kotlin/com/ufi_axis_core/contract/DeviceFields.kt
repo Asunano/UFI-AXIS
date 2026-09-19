@@ -69,12 +69,17 @@ object DeviceFields {
         const val WIFI_SLEEP_IDLE_MINUTES = "sleep_sysIdleTimeToSleep"
 
         /**
-         * 网络模式（承载偏好）。值域是设备侧的 BearerPreference 字符串，
+         * 网络模式（承载偏好）的**写入侧**字段。值域是设备侧的 BearerPreference 字符串，
          * 双向映射见 [NetworkMode.toBearer] / [NetworkMode.fromBearer]。
+         *
+         * 回读时它可能为空或停留在未应用的值，**判断切换是否完成要读 [NET_SELECT]**。
          */
         const val BEARER_PREFERENCE = "BearerPreference"
 
-        /** 老固件的网络模式字段，[BEARER_PREFERENCE] 缺失时的回退。 */
+        /**
+         * 网络模式的**回读真源**（2026-09 真机：切换后变化的是它，形如 `WL_AND_5G` / `Only_5G`，
+         * 老固件回小写）。缺失时才回落 [BEARER_PREFERENCE]。
+         */
         const val NET_SELECT = "net_select"
 
         /** 连接模式。`"auto"` 或 `"manual"`；部分固件填 `"1"` / `"hand"` 表示手动。 */

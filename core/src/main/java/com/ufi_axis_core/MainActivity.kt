@@ -40,14 +40,30 @@ class MainActivity : Activity() {
         private const val REQUEST_CODE_NOTIFICATION = 1001
         private const val REQUEST_CODE_CORE_PERMISSIONS = 1002
 
-        /** 后端运行所需的全部运行时权限 */
-        val REQUIRED_PERMISSIONS = arrayOf(
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION,
-            android.Manifest.permission.READ_PHONE_STATE,
-            android.Manifest.permission.READ_SMS,
-            android.Manifest.permission.SEND_SMS
-        )
+        /**
+         * 后端运行所需的全部运行时权限。
+         *
+         * 2026-09-16 补 `READ_MEDIA_VIDEO/AUDIO/IMAGES`：manifest 里早就声明了，但从没在运行时
+         * 申请过 —— 于是 Android 13+ 上 `checkSelfPermission(READ_MEDIA_VIDEO)` 恒为 DENIED，
+         * `/api/media` 下的那组端点全靠「所有文件访问」那条短路活着。而 **MediaProvider 交付缩略图
+         * 时按细分媒体读权限判，不看 All Files Access**，`contentResolver.loadThumbnail()` 因此一直
+         * 失败，表现就是"列表有、缩略图全是占位图标"。
+         *
+         * 三个权限只在 API 33+ 存在；低版本上申请一个不存在的权限会被系统直接拒，
+         * 所以按版本拼数组。
+         */
+        val REQUIRED_PERMISSIONS: Array<String> = buildList {
+            add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+            add(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+            add(android.Manifest.permission.READ_PHONE_STATE)
+            add(android.Manifest.permission.READ_SMS)
+            add(android.Manifest.permission.SEND_SMS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(android.Manifest.permission.READ_MEDIA_VIDEO)
+                add(android.Manifest.permission.READ_MEDIA_AUDIO)
+                add(android.Manifest.permission.READ_MEDIA_IMAGES)
+            }
+        }.toTypedArray()
     }
 
     private val refreshRunnable = object : Runnable {

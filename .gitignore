@@ -21,6 +21,9 @@ build.old*/
 # 嵌套工程（scripts/UFI-AXIS-Core-install-Android）自带独立 Gradle wrapper，其 jar 同样必须入库，
 # 否则 clone 后该工程 ./gradlew 因缺 wrapper jar 失败；根级 !gradle/wrapper/... 只覆盖仓库根。
 !scripts/UFI-AXIS-Core-install-Android/gradle/wrapper/gradle-wrapper.jar
+# ffmpeg-kit 的 Java 层（57KB，从上游 aar 抽出）必须入库：core:api 用 implementation(files(...))
+# 依赖它，缺了 CI 全新 checkout 直接编译失败。对应的 .so（约 22MB）不入库，走插件式按需下载。
+!core/api/libs/ffmpeg-kit-classes.jar
 # 本地 JDK 探测结果，随机器而异
 gradle/gradle-daemon-jvm.properties
 # Kotlin 增量编译缓存

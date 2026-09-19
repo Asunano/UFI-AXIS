@@ -5,7 +5,7 @@
     :show="show"
     preset="card"
     title="组件管理"
-    style="max-width: 760px"
+    style="width: 760px; max-width: calc(100vw - 32px)"
     @update:show="emit('update:show', $event)"
   >
     <div v-if="comp.manifestError" class="inst-err">

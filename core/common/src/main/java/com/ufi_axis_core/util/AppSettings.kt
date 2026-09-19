@@ -42,10 +42,21 @@ class AppSettings(context: Context) {
         private const val KEY_ADB_AUTO_START = "adb_auto_start_on_boot"
         private const val KEY_ALERT_CONFIG = "alert_config"
         private const val KEY_TRAFFIC_DAILY_BASELINE = "traffic_daily_baseline"
+        private const val KEY_TRAFFIC_HOURLY_SAMPLER = "traffic_hourly_sampler"
         private const val KEY_TRAFFIC_AUTO_OFF_CONFIG = "traffic_auto_off_config"
         private const val KEY_TRAFFIC_AUTO_OFF_STATE = "traffic_auto_off_state"
         private const val KEY_MONITOR_PREFERENCES = "monitor_preferences"
         private const val KEY_NOTIFICATION_CONFIG = "notification_config"
+        private const val KEY_WEATHER_CONFIG = "weather_config"
+        private const val KEY_POETRY_CONFIG = "poetry_config"
+        // 今日诗词的用户 token：上游用它区分用户，永久有效。同一设备必须固定一个 ——
+        // 裸调会让它每次新签一个，同 IP 多 token 会被判成多用户、拉低推荐质量。
+        private const val KEY_POETRY_TOKEN = "poetry_token"
+        // 出网国家/地区检测结果（2026-09-18，`/api/geo`）：值 + 检测时刻分两个键存 ——
+        // "什么时候测的" 决定要不要重测，跟"测出来是哪"是两件事，合成一个字符串就没法各自备份。
+        private const val KEY_GEO_COUNTRY = "geo_country"
+        private const val KEY_GEO_DETECTED_AT = "geo_detected_at"
+        private const val KEY_MEDIA_SCAN_DIRS = "media_scan_dirs"
         private const val KEY_ARIA2_RPC_SECRET = "aria2_rpc_secret"
 
         // ── 更新通道（2026-08-10：后端自拉取更新）──
@@ -161,6 +172,15 @@ class AppSettings(context: Context) {
             BackupField(KEY_TRAFFIC_AUTO_OFF_CONFIG, BackupValueType.STRING),
             BackupField(KEY_MONITOR_PREFERENCES, BackupValueType.STRING),
             BackupField(KEY_NOTIFICATION_CONFIG, BackupValueType.STRING),
+            // 天气（城市与坐标是"这台设备放在哪"，换设备仍成立，故在列）
+            BackupField(KEY_WEATHER_CONFIG, BackupValueType.STRING),
+            // 今日诗词（只有开关与展示偏好；token 不备份 —— 它是"这台设备在上游的身份"，
+            // 换设备应重新签发，跟着备份走反而会让两台设备共用一个 token）
+            BackupField(KEY_POETRY_CONFIG, BackupValueType.STRING),
+            // 出网国家/地区（`/api/geo`）：换设备通常还在同一地区，还原过去能省掉一次出网检测。
+            // 检测时刻 `geo_detected_at` **不在列** —— 那是"这台设备什么时候测的"，跟着备份走
+            // 只会让新设备以为刚测过、迟迟不重测；它缺省为 0 正好等于"没测过"，会立刻重测一次。
+            BackupField(KEY_GEO_COUNTRY, BackupValueType.STRING),
             // 更新源
             BackupField(KEY_UPDATE_URL, BackupValueType.STRING),
             BackupField(KEY_UPDATE_MIRROR_BASE, BackupValueType.STRING),
@@ -873,6 +893,24 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
+    // --- 每小时流量用量采样器的"上一次月累计"（流量历史） ---
+    //
+    // 与 [trafficDailyBaselineJson] 不同：那个是"今天从哪儿起算"，这个是"上一次看到的月累计是多少"。
+    // 每小时用量 = 逐次采样的 (本次月累计 − 上次月累计) 累加进当前小时桶（traffic_hourly 表）。
+    //
+    // 必须持久化，否则 core 每次重启都要丢掉"重启前最后一次采样到重启后第一次采样"之间的量。
+    // 同时存 at（上次采样时刻），用来识别"core 离线了很久"——离线期间产生的流量无法归属到
+    // 具体小时，只能整块丢弃，否则会把几天的量全堆到重启后的那一个小时上。
+    // 形如 {"at":1757800000000,"rx":123,"tx":456}；置 null 即为重置（下一次采样只记基线、不计增量）。
+    var trafficHourlySamplerJson: String?
+        get() = prefs.getString(KEY_TRAFFIC_HOURLY_SAMPLER, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_TRAFFIC_HOURLY_SAMPLER, value)
+            else editor.remove(KEY_TRAFFIC_HOURLY_SAMPLER)
+            editor.apply()
+        }
+
     // --- 到达限额自动关闭移动数据（core 自制功能，不是设备字段） ---
     //
     // 拆成两个 key 是刻意的：**配置由客户端写、运行状态由 core 写**。
@@ -918,6 +956,30 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
+    // --- Media Scan Dirs（视频 / 音乐 / 图片各自的扫描目录，两端共享的设备配置） ---
+    //
+    // 2026-09-16：媒体中心从"一页三栏"拆成三个独立页（视频 / 音乐 / 图片），扫描范围随之
+    // **按类型各存一份** —— 每页只改自己那一份，所以三页各有可写入口也不会出现
+    //「同一份配置三处能改」。三类扫同一个目录不冲突：MediaStore 本来就是分表查的。
+    //
+    // 每份的形状不变：`["/storage/emulated/0/Movies", ...]`
+    //   空数组 / 缺省 = 这一类不限目录，列整个媒体库里的该类型；
+    //   非空时只列这些目录**及其子目录**下的该类型媒体（core 侧转成 MediaStore 路径前缀条件）。
+    //
+    // 放在 core 而不是各客户端：这是「这台设备的媒体库范围」，app 与 web 必须看到同一份。
+    // 而「列表还是网格」「按名称还是按时间」这类纯展示偏好留在各客户端本地，不进这里。
+    //
+    // @param type `video` / `audio` / `image`（core 侧 MediaRoutes 的 Kind.key，与 API 取值一致）
+    fun mediaScanDirsJson(type: String): String? =
+        prefs.getString("${KEY_MEDIA_SCAN_DIRS}_$type", null)
+
+    fun setMediaScanDirsJson(type: String, value: String?) {
+        val editor = prefs.edit()
+        val key = "${KEY_MEDIA_SCAN_DIRS}_$type"
+        if (value != null) editor.putString(key, value) else editor.remove(key)
+        editor.apply()
+    }
+
     // --- Notification Config（客户端通知渠道开关，两端共享的设备配置） ---
     //
     // 与 monitorPreferencesJson 同构：单 key 存整份 JSON。
@@ -934,8 +996,74 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
-    // --- SMS 已读状态（本地管理） ---
+    // --- Weather Config（标题栏天气小功能，两端共享的设备配置） ---
+    //
+    // 与 notificationConfigJson 同构：单 key 存整份 JSON（开关 / 城市名 / 坐标 / 单位）。
+    // 【为什么是设备级而不是各客户端本地】位置说的是"这台随身 WiFi 现在在哪"，
+    // 两端看到的应当是同一个城市；坐标存两份必然分叉。
+    var weatherConfigJson: String?
+        get() = prefs.getString(KEY_WEATHER_CONFIG, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_WEATHER_CONFIG, value)
+            else editor.remove(KEY_WEATHER_CONFIG)
+            editor.apply()
+        }
 
+    // --- 今日诗词（标题栏下方小字，两端共享的设备配置） ---
+    //
+    // 与 weatherConfigJson 同构：单 key 存整份 JSON（开关 / 是否显示出处）。
+    // 没有"选标签"这类字段 —— 标签由上游按地区/天气/时辰/农历自动匹配，我们无从指定。
+    var poetryConfigJson: String?
+        get() = prefs.getString(KEY_POETRY_CONFIG, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_POETRY_CONFIG, value)
+            else editor.remove(KEY_POETRY_CONFIG)
+            editor.apply()
+        }
+
+    /**
+     * 今日诗词的用户 token（上游签发，永久有效）。
+     *
+     * 由 `PoetryRoutes` 在**首次请求的响应里收割**后写入，此后每次请求都带上它。
+     * 不参与备份：它是"这台设备在上游的身份"，两台设备共用一个会让推荐互相干扰。
+     */
+    var poetryToken: String?
+        get() = prefs.getString(KEY_POETRY_TOKEN, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_POETRY_TOKEN, value)
+            else editor.remove(KEY_POETRY_TOKEN)
+            editor.apply()
+        }
+
+    // --- 出网国家/地区（`/api/geo`，2026-09-18）---
+    //
+    // 【为什么在 core】判据是**出网 IP 的归属**，而设备才是真正的出网点。app 走设备热点时
+    // 出网 IP 与这里相同，但把检测放在各客户端会让每端各存一份、结果可能不一致。
+    // 目前唯一消费方是 app 的更新源自动选择（CN → 走镜像，其余直连）。
+
+    /**
+     * ISO 3166-1 alpha-2 国家码（如 `CN` / `US`）；`""` = 从未测出结果。
+     *
+     * 写入方只有 `GeoDetector.detectAndSave`。进备份白名单：换设备通常还在同一地区。
+     */
+    var geoCountry: String
+        get() = prefs.getString(KEY_GEO_COUNTRY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_GEO_COUNTRY, value).apply()
+
+    /**
+     * 上次成功检测的时刻（epoch ms），0 = 从未测过。
+     *
+     * 只用来回答"要不要重测"（见 `GeoDetector.isStale`）。**不进备份**：它描述的是这台设备的
+     * 检测进度，还原到新设备会让它以为刚测过。
+     */
+    var geoDetectedAt: Long
+        get() = prefs.getLong(KEY_GEO_DETECTED_AT, 0L)
+        set(value) = prefs.edit().putLong(KEY_GEO_DETECTED_AT, value).apply()
+
+    // --- SMS 已读状态（本地管理） ---
     /** 已处理的最大 goform 消息 ID，用于检测新短信 */
     var smsHighWaterMark: Long
         get() = prefs.getLong(KEY_SMS_HIGH_WATER_MARK, 0L)

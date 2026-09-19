@@ -520,7 +520,10 @@ function handleNetworkError(e: any) {
 
 <style scoped>
 .login-page {
+  /* dvh 跟随移动端浏览器地址栏伸缩；100vh 在 Chrome/Safari 上解析为「大视口」，
+     居中的卡片会被地址栏顶下去一截。vh 那行是不支持 dvh 的旧浏览器的回落。 */
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -660,5 +663,26 @@ function handleNetworkError(e: any) {
 .goform-field label {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+@media (max-width: 768px) {
+  /* 360px 视口：页面 16px 内距 → 卡 328px；卡再吃掉左右各 32px 只剩 264px，
+     `.goform-section`（.sub-panel，12px 内距）里再降到 240px，
+     于是 `1fr 110px` 的 IP 格只有 120px，连 `192.168.0.1` 这个占位符都显示不全。
+     两条一起改：卡片内距收到 24px/20px，GoForm 栅格折单列。 */
+  .login-page {
+    padding: 12px;
+  }
+  .login-card {
+    padding: 24px 20px;
+    border-radius: 14px;
+  }
+  .login-header {
+    margin-bottom: 24px;
+  }
+  .goform-grid {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
 }
 </style>

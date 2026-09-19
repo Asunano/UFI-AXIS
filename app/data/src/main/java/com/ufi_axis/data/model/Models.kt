@@ -148,6 +148,63 @@ data class TrafficSummary(
 )
 
 /**
+ * 分段流量用量（`GET /api/traffic/usage?range=day|week|month|year&anchor=<epochMs>`）。
+ *
+ * 契约要点（core 侧保证，app **不自己算文案、也不补桶**）：
+ * - [buckets] 一定是完整的（日 24 / 周 7 / 月 28~31 / 年 12），没数据的桶三个字节数都是 0，
+ *   [TrafficUsageBucket.index] 从 0 连续、按时间升序 —— 客户端不需要"补空桶"这类逻辑。
+ *   注意日桶在 DST 切换日是 23 / 25 个（core 的 `TrafficUsageWindow` 明确如此，硬凑 24 会让
+ *   切换点之后每小时的流量错位一格），所以界面**不得假设恒 24**。
+ * - [label] 是这一段的中文文案（"9月14日 周一" / "9月13日-9月19日" / "2026年9月" / "2026年"），
+ *   [TrafficUsageBucket.label] 是 X 轴刻度文案，两者都直接展示。同一份文案两端各拼一遍的
+ *   下场见 [TrafficLimitConfig] 的注释。
+ * - [peak_bytes] = 所有桶 [TrafficUsageBucket.total_bytes] 的最大值（Y 轴峰值用）。
+ * - [earliest_data_at] **可空**：null = 表里还没有任何记录。非 null 且晚于 [range_start] 时
+ *   界面必须明说，否则用户会把"没记录"读成"那天没用流量"。
+ */
+@Serializable
+data class TrafficUsageResponse(
+    val range: String = "day",
+    val range_start: Long = 0,
+    val range_end: Long = 0,
+    val label: String = "",
+    /** 桶粒度：`hour` / `day` / `month`。 */
+    val bucket_unit: String = "hour",
+    val buckets: List<TrafficUsageBucket> = emptyList(),
+    val total_rx_bytes: Long = 0,
+    val total_tx_bytes: Long = 0,
+    val total_bytes: Long = 0,
+    val peak_bytes: Long = 0,
+    /** 上一段的锚点（本段起点前 1ms）。左右翻页直接用它，客户端不做日历运算。 */
+    val prev_anchor: Long = 0,
+    /** 下一段的锚点（本段终点）。 */
+    val next_anchor: Long = 0,
+    /** 下一段是否已经开始。false 时不该让用户往未来翻 —— 翻过去只有一屏空柱。 */
+    val has_next: Boolean = false,
+    /** 有记录的最早时刻；null = 一条记录都还没有（**不是** 0，别拿 0 当哨兵）。 */
+    val earliest_data_at: Long? = null
+)
+
+/** [TrafficUsageResponse] 的单个时间桶。 */
+@Serializable
+data class TrafficUsageBucket(
+    val index: Int = 0,
+    /** 桶起点（epoch ms，含）。 */
+    val start: Long = 0,
+    /** X 轴刻度文案，**带单位**（"12时" / "周一" / "14日" / "11月"），core 算好，直接用。 */
+    val label: String = "",
+    /**
+     * 浮层与明细行用的完整文案（"12时" / "9月14日 周一" / "9月14日" / "2026年11月"）。
+     *
+     * 与 [label] 分开的理由见 core 的 `TrafficUsageBucket`：轴上要短，浮层里要能独立看懂。
+     */
+    val title: String = "",
+    val rx_bytes: Long = 0,
+    val tx_bytes: Long = 0,
+    val total_bytes: Long = 0
+)
+
+/**
  * 流量限额配置（`GET /api/device/traffic-limit`）。
  *
  * core 已经把设备侧的复合串（`"470_1024"` = 470 GB）拆成 [limit_value] +
@@ -292,7 +349,8 @@ data class ModeRequest(
 @Serializable
 data class ModeResponse(
     val success: Boolean,
-    val mode: String
+    /** 回显入参别名；旧 core 可能不带，给默认空串避免整包解析失败。 */
+    val mode: String = ""
 )
 
 // ========== SIM / SMS ==========
@@ -923,20 +981,25 @@ data class AppConfig(
     val qos_cache_ttl_ms: Int = 2000,
     val qos_goform_query_max: Int = 4,
     val qos_goform_set_max: Int = 2,
-    val sms_code_enabled: Boolean = false,
-    val sms_code_cleanup_hours: Int = 24,
+    // ── 短信四项（2026-09-14 全部改为可空，理由同下面的日志四层开关）──
+    // 这四项真源在 core，`refreshDeviceConfig()` 会用它们覆盖本地镜像。原来非空 + 有默认值，
+    // 于是「core 响应里没有这个 key」与「core 明确说它是这个值」不可区分 —— 老 core / 裁剪过的
+    // 响应会把用户刚开的开关按默认值刷回去。null 现在的语义是「core 没给，别动本地镜像」。
+    val sms_code_enabled: Boolean? = null,
+    val sms_code_cleanup_hours: Int? = null,
     /** 自动复制验证码到剪贴板（需先开启系统无障碍服务，否则不生效） */
-    val sms_code_auto_copy: Boolean = false,
+    val sms_code_auto_copy: Boolean? = null,
     /**
      * 验证码豁免关键词拦截（core 真源 `AppSettings.smsFilterExemptVerificationCode`，默认 **true**）。
      *
      * 语义：被判定为验证码的短信跳过 `scope=body` 的关键词规则，但**仍受 `scope=sender`
      * 的号码黑名单约束** —— 拉黑号码是明确意图，不该被豁免绕过。
      *
-     * 默认值必须与 core 一致（true）：不一致会让开关一进页面就显示成关，
+     * 本地镜像的默认值在 `AppPreferences.smsFilterExemptVerificationCode`（true），
+     * 必须与 core 一致：不一致会让开关一进页面就显示成关，
      * 用户「打开」它其实什么都没改，正是「假开关」。
      */
-    val sms_filter_exempt_verification_code: Boolean = true,
+    val sms_filter_exempt_verification_code: Boolean? = null,
     // ── 日志四层开关（2026-09-04 全部改为可空）──
     // 为什么可空：这四个字段的唯一真源在 core，app 侧 `refreshDeviceConfig()` 会用它们**覆盖**
     // 本地缓存。原来它们是非空 + 默认 true，于是「core 响应里没有这个 key」和
@@ -1067,6 +1130,29 @@ data class SmsForwardConfig(
 
 @Serializable
 data class SmsForwardSaveResponse(val success: Boolean)
+
+/** 删单条投递记录响应（`DELETE /api/sms-forward/history/{id}`）。 */
+@Serializable
+data class MailHistoryDeleteResponse(
+    val success: Boolean = false,
+    /** 受影响行数：0 = 目标已不存在（仍视为 success）。 */
+    val deleted: Int = 0
+)
+
+/**
+ * 渠道投递统计（`GET /api/sms-forward/history/stats?channel=`）。
+ *
+ * 与邮件 `/diagnose` 的 `sent_*` 不同：这里**含 skipped**，口径与投递记录列表一致，
+ * 给三条渠道配置页的统计卡用。
+ */
+@Serializable
+data class MailHistoryStatsResponse(
+    val total: Int = 0,
+    val sent: Int = 0,
+    val failed: Int = 0,
+    val skipped: Int = 0,
+    @SerialName("last_sent_at") val lastSentAt: Long = 0L
+)
 
 // ========== Scheduled Tasks ==========
 
@@ -1406,3 +1492,379 @@ data class BackupImportResponse(
 const val BACKUP_CLIENT_APP = "app"
 const val BACKUP_MODE_MERGE = "merge"
 const val BACKUP_MODE_REPLACE = "replace"
+
+// ========== Media Center（媒体中心，2026-09-16）==========
+//
+// 数据全部由 core 的 `/api/media` 一组端点给出（它查系统媒体库 MediaStore）。
+// **播放 / 查看仍走 `/api/files/stream?path=`** —— 那条链路已经支持 Range 与签名鉴权，
+// 本组模型里不出现第二种取字节流的方式。
+
+/** 媒体类型（与 core 的 `type` 参数取值一致）。 */
+const val MEDIA_TYPE_VIDEO = "video"
+const val MEDIA_TYPE_AUDIO = "audio"
+const val MEDIA_TYPE_IMAGE = "image"
+
+/**
+ * 媒体库里的一项。
+ *
+ * 刻意叫 `MediaLibraryItem` 而不是 `MediaItem`：后者是 media3 的核心类型
+ * （`androidx.media3.common.MediaItem`），播放页里两者会同时出现。
+ *
+ * [id] 是 MediaStore 的行 id，缩略图接口按它取（`/api/media/thumbnail?id=`）；
+ * [path] 是设备上的真实路径，播放 / 跳文件管理器按它走。
+ * [durationMs] 对图片恒为 0，[width]/[height] 对音频恒为 0 —— core 按类型只回有意义的字段，
+ * 缺的字段由这里的默认值补上（不是"该项没有时长"，而是"这个类型没有这个概念"）。
+ */
+@Serializable
+data class MediaLibraryItem(
+    val id: Long = 0,
+    val name: String = "",
+    val path: String = "",
+    val size: Long = 0,
+    /** 修改时间（**毫秒**；core 已把 MediaStore 的秒换算过了）。 */
+    val date_modified: Long = 0,
+    val mime: String = "",
+    val duration_ms: Long = 0,
+    val width: Int = 0,
+    val height: Int = 0,
+    val album: String = "",
+    val artist: String = "",
+    /**
+     * 内嵌标签里的曲名（**仅音频**，core 从 `MediaStore.Audio.Media.TITLE` 取）。
+     *
+     * 与 [name] 的区别：[name] 是文件名（`带我走-杨丞琳.flac`），这个才是歌名（`带我走`）。
+     * 取不到时是空串 —— core 不拿文件名冒充曲名，兜底显示由客户端决定
+     * （见 `audioDisplayTitle`）。
+     */
+    val title: String = ""
+)
+
+/** `GET /api/media/list` 的一页。[total] 是**符合条件的总数**，不是这一页的条数。 */
+@Serializable
+data class MediaListResponse(
+    val type: String = MEDIA_TYPE_VIDEO,
+    val items: List<MediaLibraryItem> = emptyList(),
+    val total: Int = 0,
+    val limit: Int = 0,
+    val offset: Int = 0,
+    val scan_dirs: List<String> = emptyList()
+)
+
+/**
+ * 媒体库文件夹视图里的一个子目录（`GET /api/media/browse`）。
+ *
+ * [count] 是**整棵子树**里该类型的文件数（不只这一层），所以"里面有 12 个"这种文案是准的；
+ * [cover_id] 是子树里最新那一个文件的 MediaStore id —— 文件夹卡片直接拿它当封面，
+ * 不必再为目录另造一套缩略图。没有可用封面时是 null。
+ */
+@Serializable
+data class MediaFolderEntry(
+    val name: String = "",
+    val path: String = "",
+    val count: Int = 0,
+    val cover_id: Long? = null,
+    val date_modified: Long = 0
+)
+
+/**
+ * `GET /api/media/browse?type=&path=`：某一层目录里的子目录 + 媒体文件。
+ *
+ * 与 [MediaListResponse] 的分工：那个是"整库平铺 + 分页"，这个是"这一层有什么"（不分页，
+ * 单层条数有上限）。[parent] 为 null 表示已经在根上，界面不该再显示"返回上一级"。
+ * [roots] 非空且 [path] 为空 = 配了多个扫描目录，先让用户选一个根。
+ */
+@Serializable
+data class MediaBrowseResponse(
+    val type: String = MEDIA_TYPE_VIDEO,
+    val path: String = "",
+    val parent: String? = null,
+    val roots: List<String> = emptyList(),
+    val folders: List<MediaFolderEntry> = emptyList(),
+    val items: List<MediaLibraryItem> = emptyList()
+)
+
+/**
+ * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。 *
+ * [granted] 与 [scan_dirs] 的 key 都是 [MEDIA_TYPE_VIDEO] 等。某一类 granted 为 false 时
+ * 对应页面必须显示未授权引导 —— 显示空列表等于告诉用户"设备里没有视频"。
+ *
+ * [scan_dirs] 自 2026-09-16 起**按类型各一份**（媒体中心拆成三个独立页，每页管自己的范围）；
+ * 某一类为空数组 = 这一类不限目录。
+ */
+@Serializable
+data class MediaStatusResponse(
+    val all_files_access: Boolean = false,
+    val granted: Map<String, Boolean> = emptyMap(),
+    val scan_dirs: Map<String, List<String>> = emptyMap(),
+    val sdk_int: Int = 0
+)
+
+/** `GET/PUT /api/media/config?type=`：某一类的扫描目录（空 = 这一类不限目录）。 */
+@Serializable
+data class MediaConfigResponse(
+    val success: Boolean = false,
+    val type: String = MEDIA_TYPE_VIDEO,
+    val dirs: List<String> = emptyList()
+)
+
+/** `PUT /api/media/config` 与 `POST /api/media/rescan` 的请求体。 */
+@Serializable
+data class MediaDirsRequest(
+    val dirs: List<String> = emptyList()
+)
+
+/**
+ * `POST /api/media/rescan`：请系统重新收录这些目录。
+ *
+ * [submitted] 是提交给系统扫描器的文件数；[truncated] 为 true 说明撞到了 core 的单次上限，
+ * 需要再点一次或缩小目录范围。收录是异步的 —— 返回成功不代表 `/list` 立刻就能查到。
+ */
+@Serializable
+data class MediaRescanResponse(
+    val success: Boolean = false,
+    val type: String = MEDIA_TYPE_VIDEO,
+    val dirs: List<String> = emptyList(),
+    val submitted: Int = 0,
+    val truncated: Boolean = false
+)
+
+/**
+ * `GET /api/media/lyrics`：旁挂歌词文件（同名 `.lrc` / `.txt`）。
+ *
+ * [found] 为 false 时 [text] 是空串 —— 播放页要显示"没有歌词"，不许拿别的文本凑。
+ * [source] 是命中的文件名（例如 `xxx.lrc`），用于在界面上说明歌词来自哪里。
+ */
+@Serializable
+data class MediaLyricsResponse(
+    val found: Boolean = false,
+    val source: String = "",
+    val text: String = ""
+)
+
+/**
+ * `GET /api/media/tags` 的响应：单首音频的标签。
+ *
+ * core 端已经把「MediaStore 那份 + 直接读文件解出来的」合并过了（文件里的优先），
+ * 所以客户端拿到就能显示，不必等播放器解容器。取不到的字段是空串 ——
+ * **不拿文件名冒充曲名**，兜底显示由 UI 层决定。
+ */
+@Serializable
+data class MediaTagsResponse(
+    val id: Long = 0,
+    val name: String = "",
+    val path: String = "",
+    val title: String = "",
+    val artist: String = "",
+    val album: String = "",
+    val duration_ms: Long = 0
+)
+
+/** `POST /api/files/stream-ticket` 的请求体。 */
+@Serializable
+data class StreamTicketRequest(val path: String)
+
+/**
+ * `POST /api/files/stream-ticket`：换一张**免鉴权**的播放票据。
+ *
+ * 用途（2026-09-16）：手机端给设备解不出画面的视频抽缩略图时，要把地址交给
+ * `MediaMetadataRetriever`，而它自己发 HTTP 请求、**加不了签名头**；签名里的 nonce 又是
+ * 一次性的，多个 Range 请求必然从第二个开始被拒。票据正是为这种客户端准备的：
+ * 可重复使用、滑动过期、只授权这一个文件。
+ *
+ * [url] 是 core 给出的相对路径（`/media/stream?ticket=…`），客户端拼上 host:port 即可。
+ */
+@Serializable
+data class StreamTicketResponse(
+    val ticket: String = "",
+    val url: String = "",
+    val expires_in: Long = 0,
+    val size: Long = 0,
+    val mime: String = ""
+)
+
+/** `PUT /api/media/thumbnail`：客户端把抽好的缩略图交给 core 缓存。 */
+@Serializable
+data class MediaThumbUploadResponse(
+    val success: Boolean = false,
+    val type: String = MEDIA_TYPE_VIDEO,
+    val id: Long = 0,
+    val size: Int = 0
+)
+
+/**
+ * `GET /api/media/ffmpeg-status[?path=]`：设备端 ffmpeg 自检结果。
+ *
+ * 分两层看：
+ *  · [available] = 这个 core 构建里有没有打包 ffmpeg-kit（false 时其余字段无意义）；
+ *  · [native_ok] = native 库能不能加载并跑起来（`ffmpeg -version` 成功）。
+ *
+ * 带 `path` 请求时才有 `probe_*`：那是**真的对这个文件抽了一帧**，
+ * [probe_elapsed_ms] 就是设备端生成一张缩略图的真实耗时 —— 用它判断这条路实不实用。
+ */
+@Serializable
+data class MediaFfmpegStatusResponse(
+    val available: Boolean = false,
+    val native_ok: Boolean = false,
+    val version: String = "",
+    val reason: String = "",
+    val probe_path: String = "",
+    val probe_ok: Boolean = false,
+    val probe_elapsed_ms: Long = 0,
+    val probe_bytes: Int = 0,
+    val probe_error: String = ""
+)
+
+// ══════════════════════════ 天气（2026-09-17）══════════════════════════
+//
+// core 侧代理 Open-Meteo，app 只做展示。字段口径与 WeatherRoutes.parseForecast 一一对应，
+// **描述文案与 weather_code → 中文的映射都在 core**，app 不再自己翻一份。
+
+/**
+ * `GET /api/weather`。
+ *
+ * [configured]=false 表示设备还没设置城市 —— 这不是错误态，UI 该引导去设置而不是报错，
+ * 此时除 [enabled] / [message] 外其余字段都是默认值。
+ */
+@Serializable
+data class WeatherNowResponse(
+    val configured: Boolean = false,
+    val enabled: Boolean = false,
+    val message: String = "",
+    val city: String = "",
+    val temperature: Double = 0.0,
+    val apparent_temperature: Double = 0.0,
+    val humidity: Int = 0,
+    val precipitation: Double = 0.0,
+    val wind_speed: Double = 0.0,
+    /** WMO 天气代码，用于选图标；文案直接用 [description]。 */
+    val weather_code: Int = -1,
+    val description: String = "",
+    val is_day: Boolean = true,
+    val temp_max: Double = 0.0,
+    val temp_min: Double = 0.0,
+    /** ISO8601 本地时间字符串（`2026-09-17T05:42`），core 已按设备时区换算。 */
+    val sunrise: String = "",
+    val sunset: String = "",
+    /** 逐小时温度曲线（从当前小时起的 24 个点，ISO8601 本地时间戳）。 */
+    val hourly_times: List<String> = emptyList(),
+    /** 逐小时温度（与 [hourly_times] 等长，单位跟随 [unit]）。 */
+    val hourly_temperatures: List<Double> = emptyList(),
+    val unit: String = "celsius",
+    val timezone: String = "",
+    val updated_at: Long = 0
+)
+
+/** `GET /api/weather/config` / `PUT /api/weather/config`。坐标 `0,0` = 未设置。 */
+@Serializable
+data class WeatherConfigResponse(
+    val enabled: Boolean = false,
+    val city: String = "",
+    val latitude: Double = 0.0,
+    val longitude: Double = 0.0,
+    val unit: String = "celsius"
+)
+
+/** `PUT /api/weather/config` 的请求体：字段级合并，只传要改的。 */
+@Serializable
+data class WeatherConfigRequest(
+    val enabled: Boolean? = null,
+    val city: String? = null,
+    val latitude: Double? = null,
+    val longitude: Double? = null,
+    val unit: String? = null
+)
+
+/** `PUT /api/weather/config` 的响应。 */
+@Serializable
+data class WeatherConfigUpdateResponse(
+    val success: Boolean = false,
+    val config: WeatherConfigResponse = WeatherConfigResponse()
+)
+
+/** `GET /api/weather/search` 的一条结果。[admin1] 是省/州，用来区分同名城市。 */
+@Serializable
+data class WeatherCity(
+    val name: String = "",
+    val latitude: Double = 0.0,
+    val longitude: Double = 0.0,
+    val country: String = "",
+    val admin1: String = "",
+    val timezone: String = ""
+)
+
+/** `GET /api/weather/search?name=`。 */
+@Serializable
+data class WeatherSearchResponse(
+    val results: List<WeatherCity> = emptyList(),
+    val total: Int = 0
+)
+
+// ══════════════════════════ 今日诗词（2026-09-18）══════════════════════════
+//
+// core 侧代理 jinrishici v2。标签匹配（季节 / 天气 / 时辰 / 地理）由**上游按设备 IP
+// 自动完成**，命中的标签在 [PoetryResponse.match_tags] 里回传 —— 我们既不传 tag、
+// 也不自己算季节，v2 接口本身没有 tag 参数。
+
+/** `GET /api/poetry`。 */
+@Serializable
+data class PoetryResponse(
+    /** 推荐的那一句：标题栏下方小字显示的就是它。 */
+    val content: String = "",
+    val title: String = "",
+    val dynasty: String = "",
+    val author: String = "",
+    /** 全篇原文，可能多段。详情用。 */
+    val full_content: List<String> = emptyList(),
+    /** 整诗翻译，部分诗词才有。 */
+    val translate: List<String> = emptyList(),
+    /** 上游据此推荐的标签，可当"推荐理由"显示，如 `["桂花","秋","晚上"]`。 */
+    val match_tags: List<String> = emptyList(),
+    val popularity: Int = 0,
+    val updated_at: Long = 0
+) {
+    /** `《夜雨寄北》· 唐代 · 李商隐`；出处字段缺失时自动省略那一段。 */
+    val originLine: String
+        get() = listOfNotNull(
+            title.takeIf { it.isNotBlank() }?.let { "《$it》" },
+            dynasty.takeIf { it.isNotBlank() },
+            author.takeIf { it.isNotBlank() }
+        ).joinToString(" · ")
+}
+
+/** `GET /api/poetry/config` / `PUT /api/poetry/config`。 */
+@Serializable
+data class PoetryConfigResponse(
+    val enabled: Boolean = false,
+    val show_origin: Boolean = true
+)
+
+/** `PUT /api/poetry/config` 的请求体：字段级合并，只传要改的。 */
+@Serializable
+data class PoetryConfigRequest(
+    val enabled: Boolean? = null,
+    val show_origin: Boolean? = null
+)
+
+/** `PUT /api/poetry/config` 的响应。 */
+@Serializable
+data class PoetryConfigUpdateResponse(
+    val success: Boolean = false,
+    val config: PoetryConfigResponse = PoetryConfigResponse()
+)
+
+// ══════════════════════════ 出网国家/地区（2026-09-18）══════════════════════════
+//
+// 检测在 core（`/api/geo`）：判据是出网 IP 的归属，而设备才是出网点。app 只读结果，
+// 唯一消费方是更新源自动选择（见 [com.ufi_axis.util.UpdateSource]）。
+
+/** `GET /api/geo` / `POST /api/geo/detect`。 */
+@Serializable
+data class GeoResponse(
+    /** ISO 3166-1 alpha-2（如 `CN` / `US`）；`""` = core 也没测出来。 */
+    val country: String = "",
+    /** 上次成功检测的时刻（epoch ms），0 = 从未测过。 */
+    val detected_at: Long = 0,
+    /** `cache`（读的是落盘结果）/ `fresh`（本次刚出网测过）/ `unknown`（从未测出结果）。 */
+    val source: String = ""
+)
+

@@ -7,8 +7,10 @@ import android.util.Log
 import androidx.work.Configuration
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
+import coil3.disk.DiskCache
 import coil3.memory.MemoryCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
+import okio.Path.Companion.toOkioPath
 import com.ufi_axis.BuildConfig
 import com.ufi_axis.crash.CrashHandler
 import com.ufi_axis.data.api.RetrofitClient
@@ -18,6 +20,14 @@ import com.ufi_axis.util.AppHttpClient
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.util.OkHttpClientProvider
+
+/**
+ * Coil 磁盘缓存上限。
+ *
+ * 128MB：媒体库缩略图是 256~512px 的 JPEG（几十 KB 一张），这个额度够放上千张，
+ * 又不至于在 64GB 的手机上显眼。目录在 `cacheDir` 下，系统缺存储时可以整份回收。
+ */
+private const val IMAGE_DISK_CACHE_BYTES = 128L * 1024 * 1024
 
 class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configuration.Provider {
 
@@ -130,6 +140,20 @@ class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configur
             .memoryCache {
                 MemoryCache.Builder()
                     .maxSizePercent(context, 0.25)
+                    .build()
+            }
+            /*
+             * 磁盘缓存（2026-09-16 补）。
+             *
+             * Coil3 **不显式配置就没有磁盘缓存**，于是每次冷启动、每次退出再进媒体库，
+             * 缩略图都要重新走一遍网络 —— 而这些图来自随身 WiFi 上的 core，那台设备
+             * 生成一张缩略图的代价远高于一次普通请求（解码器残缺时还要靠手机抽帧回传）。
+             * 128MB 是"上千张 256~512px JPEG"的量级；目录放 cacheDir 下，系统缺存储时可回收。
+             */
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(context.cacheDir.resolve("image-cache").toOkioPath())
+                    .maxSizeBytes(IMAGE_DISK_CACHE_BYTES)
                     .build()
             }
             .build()

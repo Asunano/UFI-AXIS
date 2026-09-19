@@ -428,11 +428,17 @@ class NetworkModule(
                 _deviceSettingsState.update {
                     DeviceSettingsState(settings = settings, loadVersion = System.currentTimeMillis())
                 }
-                // 设备回读的是 Bearer 取值域，比对前先换算成 contract 别名
-                reached = NetworkMode.fromBearer(settings.networkMode.orEmpty()) == target
+                // 真机：切换完成后变化的是 net_select（如 WL_AND_5G / Only_5G）。
+                // 两个字段都换算成 contract 别名再比对；任一命中即视为已切换 ——
+                // 只盯 BearerPreference 会在它为空/滞后时永远判超时。
+                val fromNetSelect = settings.netSelect?.takeIf { it.isNotBlank() }
+                    ?.let { NetworkMode.fromBearer(it) }
+                val fromBearerPref = settings.bearerPreference?.takeIf { it.isNotBlank() }
+                    ?.let { NetworkMode.fromBearer(it) }
+                reached = target == fromNetSelect || target == fromBearerPref
             }
             if (!NetworkMode.SwitchProbe.shouldKeepProbing(attempt, reached)) break
-            delay(NetworkMode.SwitchProbe.INTERVAL_MS)
+            delay(NetworkMode.SwitchProbe.intervalMsAfter(attempt))
         }
         _networkState.update {
             it.copy(
@@ -1388,7 +1394,19 @@ class NetworkModule(
         }
     }
 
-    /** 完全重启后端服务：HTTP 会中断约 10 秒，期间所有请求都会失败，这是预期行为。 */
+    /**
+     * 完全重启后端服务：HTTP 会中断约 10 秒，期间所有请求都会失败，这是预期行为。
+     *
+     * ## 2026-09-14：从「固定等 13s 回读一次」改成「带超时的重连轮询」
+     * 原来是 `delay(13_000)` 之后只 `loadServiceStatus()` 一次。设备端稍慢一点（或者
+     * core 侧的重启闹钟被系统拒了）就会落在这一次之外，于是 `restarting` 被清成 false、
+     * `enabled` 还是上次那个旧的 true，UI **既不提示停止也不提示失败**，就地卡住 ——
+     * 用户看到的「点了之后断联」有一半是这个 UI 假象。
+     *
+     * 现在：每 2s 探一次直到 [RESTART_PROBE_TIMEOUT_MS]；成功即刷新并给出成功提示，
+     * 超时则明确报失败并告知补救方式（core 侧仍有 shell + 闹钟两路在尝试，见
+     * `BackendService.requestRestart`，所以文案是"仍未恢复"而不是"重启失败"）。
+     */
     fun restartBackendService() {
         scope.launch {
             _serviceState.value = _serviceState.value.copy(isBusy = true, restarting = true, errorMessage = null)
@@ -1401,10 +1419,37 @@ class NetworkModule(
                 emitDashboardError("后端服务正在重启，约 10 秒后恢复")
             }
             _serviceState.value = _serviceState.value.copy(isBusy = false)
-            // 服务由 AlarmManager 在约 10s 后拉起（core 的 RESTART_DELAY_MS）；留 3s 余量再回读，
-            // 顺带把 restarting 标记清掉（loadServiceStatus 成功时会置 false）
-            delay(13_000)
-            loadServiceStatus()
+
+            // core 侧闹钟延迟约 10s、shell 侧约 4s；先等一段再开始探，避免探到"还没停下来"的旧实例
+            delay(RESTART_PROBE_INITIAL_DELAY_MS)
+            val deadline = SystemClock.elapsedRealtime() + RESTART_PROBE_TIMEOUT_MS
+            var recovered = false
+            while (SystemClock.elapsedRealtime() < deadline) {
+                val ok = runCatching { api.getServiceStatus() }.getOrNull()
+                if (ok != null) {
+                    _serviceState.value = _serviceState.value.copy(
+                        loaded = true,
+                        enabled = ok.enabled,
+                        collecting = ok.collecting,
+                        uptimeMs = ok.uptimeMs,
+                        autoStartOnBoot = ok.autoStartOnBoot,
+                        restarting = false,
+                        errorMessage = null
+                    )
+                    recovered = true
+                    emitDashboardError("后端服务已恢复")
+                    break
+                }
+                delay(RESTART_PROBE_INTERVAL_MS)
+            }
+            if (!recovered) {
+                _serviceState.value = _serviceState.value.copy(
+                    restarting = false,
+                    errorMessage = "后端服务在 ${RESTART_PROBE_TIMEOUT_MS / 1000} 秒内仍未恢复。" +
+                        "设备端仍在自行重试（shell + 定时器两路）；" +
+                        "若持续无响应，请在设备上手动打开 UFI-AXIS Core。"
+                )
+            }
         }
     }
 
@@ -1975,6 +2020,21 @@ fun parsePairedDevices(el: JsonElement?): List<PairedDeviceItem> {
         )
     }
 }
+
+// ── 重启后端服务的恢复探测参数（2026-09-14，见 NetworkModule.restartBackendService）──
+//
+// core 侧有两路拉起：shell 约 4s、闹钟约 10s（`BackendService.SHELL_RESTART_DELAY_SEC` /
+// `RESTART_DELAY_MS`），备份闹钟在 30s。所以探测窗口必须覆盖到备份闹钟之后 ——
+// 45s 是「等得住最慢那一路」与「别让用户对着转圈干等」之间的折中。
+
+/** 先等这么久再开始探：太早会探到还没停下来的旧实例，误判成"根本没重启"。 */
+private const val RESTART_PROBE_INITIAL_DELAY_MS = 5_000L
+
+/** 探测间隔。 */
+private const val RESTART_PROBE_INTERVAL_MS = 2_000L
+
+/** 总超时。超时不等于失败 —— core 侧仍在重试，所以文案是"仍未恢复"。 */
+private const val RESTART_PROBE_TIMEOUT_MS = 45_000L
 
 // ── 安全 JSON 取值辅助（kotlinx.serialization.json API） ──
 

@@ -738,6 +738,39 @@ class SmsForwardController(
         return Triple(dao.countAll(channel), dao.countFailed(channel), dao.countSkipped(channel))
     }
 
+    /**
+     * 三渠道共用的投递统计（渠道配置页 Hero / 发送统计卡）。
+     *
+     * 口径与 [listMailHistory] 的 `mail_send_records` 一致，**含 skipped**——
+     * 与邮件 `/diagnose` 里那套「只计发起过 SMTP 的 success/failed」不同：
+     * 配置页要回答「一共记了多少条、多少失败、多少被闸门拦下」。
+     *
+     * @param channel 必填语义由路由保证；null = 全表（一般不给用户看）。
+     */
+    suspend fun deliveryHistoryStats(channel: String?): DeliveryHistoryStats {
+        val dao = mailHistoryDao ?: return DeliveryHistoryStats()
+        val total = dao.countAll(channel)
+        val failed = dao.countFailed(channel)
+        val skipped = dao.countSkipped(channel)
+        val sent = dao.countSent(channel)
+        val lastSentAt = dao.lastSentAt(channel) ?: 0L
+        return DeliveryHistoryStats(
+            total = total,
+            sent = sent,
+            failed = failed,
+            skipped = skipped,
+            lastSentAt = lastSentAt
+        )
+    }
+
+    data class DeliveryHistoryStats(
+        val total: Int = 0,
+        val sent: Int = 0,
+        val failed: Int = 0,
+        val skipped: Int = 0,
+        val lastSentAt: Long = 0L
+    )
+
 
     /**
      * 清空投递记录。
@@ -748,6 +781,17 @@ class SmsForwardController(
     suspend fun clearMailHistory(channel: String? = null) {
         val dao = mailHistoryDao ?: return
         if (channel == null) dao.deleteAll() else dao.deleteByChannel(channel)
+    }
+
+    /**
+     * 按 id 删单条投递记录。
+     *
+     * @return 受影响行数（0 = 目标已不存在）。调用方仍应回 success，避免客户端把「本来就没有」
+     *   当成故障重试。
+     */
+    suspend fun deleteMailHistoryById(id: Long): Int {
+        if (id <= 0L) return 0
+        return mailHistoryDao?.deleteById(id) ?: 0
     }
 
 

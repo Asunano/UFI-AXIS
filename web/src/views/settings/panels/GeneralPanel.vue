@@ -120,7 +120,7 @@
       v-model:show="resetModalOpen"
       preset="card"
       title="恢复默认配置"
-      style="max-width: 460px"
+      style="width: 460px; max-width: calc(100vw - 32px)"
       :mask-closable="!resetting"
     >
       <n-space vertical :size="12">

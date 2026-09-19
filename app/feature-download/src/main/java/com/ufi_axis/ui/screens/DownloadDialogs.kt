@@ -43,18 +43,22 @@ internal fun NewDownloadDialog(
         icon = rememberVectorPainter(Icons.Filled.Download),
         showCloseButton = false,
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+            // local 必须在弹窗自己的 slot 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "开始下载",
-                onClick = onStartClick,
+                onClick = { close(onStartClick) },
                 enabled = url.isNotBlank(),
                 modifier = Modifier.fillMaxWidth()
             )
         },
         dismissButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "取消",
-                onClick = onDismiss,
+                onClick = { close(onDismiss) },
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -88,35 +92,37 @@ internal fun NewDownloadDialog(
             // AnimatedVisibility 在这里还有个副作用 —— 它自带 expand/shrink 会让弹窗高度做补间，
             // 展开过程中对话框整体尺寸每帧都在变，输入框跟着抖；直接 if 是一帧到位。
             if (showAdvanced) {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    UfiDialogTextField("文件名 (可选)", fileName, { fileName = it }, placeholder = "自动检测")
-                    UfiDialogTextField("保存路径 (可选)", savePath, { savePath = it }, placeholder = config.saveDir)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Box(Modifier.weight(1f)) {
-                            UfiDialogField("限速 (MB/s)") {
-                                UfiTextField(
-                                    value = speedLimitText, onValueChange = { speedLimitText = it },
-                                    label = "", placeholder = "不限", singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                                )
-                            }
+                // 2026-09-18：原来这里还套了一层 `Column(verticalArrangement = spacedBy(8.dp))`，
+                // 于是"高级选项"里的字段间距是 8dp、而它与上面的链接/按钮之间是 UfiDialogBody 的
+                // 12dp —— 同一个弹窗里两种节奏，展开后看着像多塞了一道空隙。
+                // 直接摊进 UfiDialogBody 的 Column（12dp）即可，间距只有一个来源。
+                UfiDialogTextField("文件名 (可选)", fileName, { fileName = it }, placeholder = "自动检测")
+                UfiDialogTextField("保存路径 (可选)", savePath, { savePath = it }, placeholder = config.saveDir)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    // 横向这条是并排两个字段的列间距，与纵向节奏无关，保留
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(Modifier.weight(1f)) {
+                        UfiDialogField("限速 (MB/s)") {
+                            UfiTextField(
+                                value = speedLimitText, onValueChange = { speedLimitText = it },
+                                label = "", placeholder = "不限", singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
                         }
-                        Box(Modifier.weight(1f)) {
-                            UfiDialogField("连接数") {
-                                UfiTextField(
-                                    value = connectionsText, onValueChange = { connectionsText = it },
-                                    label = "", placeholder = "默认", singleLine = true,
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                                )
-                            }
+                    }
+                    Box(Modifier.weight(1f)) {
+                        UfiDialogField("连接数") {
+                            UfiTextField(
+                                value = connectionsText, onValueChange = { connectionsText = it },
+                                label = "", placeholder = "默认", singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
                         }
                     }
                 }
             }
-
         }
     }
 }
@@ -137,17 +143,19 @@ internal fun RenameDownloadDialog(
         icon = rememberVectorPainter(Icons.Filled.Edit),
         showCloseButton = false,
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "确定",
-                onClick = { if (trimmed.isNotBlank()) onConfirm(trimmed) },
+                onClick = { if (trimmed.isNotBlank()) close { onConfirm(trimmed) } },
                 enabled = trimmed.isNotBlank()
             )
         },
         dismissButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
                 text = "取消",
-                onClick = onDismiss
+                onClick = { close(onDismiss) }
             )
         }
     ) {

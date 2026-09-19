@@ -14,6 +14,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,6 +23,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +39,97 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiMotion
 
 /**
+ * 标题两侧为动作位预留的宽度（左返回键 / 右 actions 都是 48dp 触区）。
+ *
+ * 之所以是常量而不是"有返回键才留"：`actions` 是一个 `@Composable` lambda，组合前无法判断它
+ * 是否真的画了东西；左右不对称留白又会让居中标题偏轴。留固定值最省心，代价只是极长标题
+ * 早一点出现省略号。
+ */
+private val HEADER_TITLE_SIDE_RESERVE = 52.dp
+
+/*
+ * 标题栏上下内边距（2026-09-17 放大约 20%；2026-09-18 再放大一档，与标题字号
+ * 22sp → 26sp 同步）。
+ *
+ * 原来是 4 / 8dp，标题挤在状态栏与内容之间。字号与高度必须一起改：只加字号会让标题
+ * 贴住上下边缘，只加高度则显得空。
+ *
+ * 带「正在播放」的那一套更高：右侧是双行（曲名·歌手 + 歌词），需要更多竖向空间。
+ */
+private val HEADER_PADDING_TOP = 12.dp
+private val HEADER_PADDING_BOTTOM = 16.dp
+private val HEADER_PADDING_TOP_NOW_PLAYING = 16.dp
+private val HEADER_PADDING_BOTTOM_NOW_PLAYING = 22.dp
+
+/**
+ * 标题栏右侧「正在播放」区的注入口（2026-09-17）。
+ *
+ * ## 为什么是全局单例而不是形参
+ * 这块内容要出现在**每一个**页面的标题栏上（音乐在后台放着，用户走到哪都该能控制），
+ * 而它的实现要连 MediaSession（在 `:app:feature-media`）—— 本模块不依赖那一层。
+ * 逐个页面传形参等于改几十处调用；所以留一个注入口：`:app` 启动时把实现塞进来，
+ * 页壳只管渲染。与 [CapsuleInsetHolder] / [CapsuleTouchGate] 是同一种做法。
+ *
+ * ## [active] 为什么必须单独给
+ * `content` 是个 `@Composable` lambda，**组合前无法知道它会不会真的画东西**（没在播时它
+ * 什么都不画）。而标题栏版式要据此切换：有内容时标题靠左、右侧让位；没有时标题保持居中。
+ * 所以由内容侧显式告知"我现在有东西要显示"。
+ */
+object UfiNowPlayingSlot {
+    /** 标题栏右侧的内容（由 `:app` 注入，实现在 `:app:feature-media`）。 */
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+
+    /** 此刻是否真的有东西要显示（由内容侧写入）。false = 标题栏保持原来的居中版式。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+/**
+ * 标题栏右侧「今日天气」区的注入口（2026-09-17）。
+ *
+ * 与 [UfiNowPlayingSlot] 共用同一块位置（标题栏右侧），**优先级低于它**：
+ * 正在放歌时那块地给播放控制，没在放才显示天气。理由是播放态是可操作的、且转瞬即变，
+ * 天气是纯展示、慢变量 —— 让可操作的那个赢。两个都想占位的话就成了会互相盖住的假开关。
+ *
+ * 实现放在 `:app:feature-settings`（那边有 viewModel 与设置页），`:app` 启动时注入。
+ */
+/**
+ * 标题栏**右侧天气**的注入口（2026-09-18 第二版）。
+ *
+ * 位置演化说明（别再来回搬）：
+ * - 09-17 天气在右侧，与「正在播放」抢同一块地、靠优先级互相让位；
+ * - 09-18 上午挪到标题下方小字，与诗词并排 —— 但两个都开时一行小字塞不下；
+ * - 09-18 现在：**天气回到右侧（信息可以更全）、诗词占标题下方小字**，各有其位。
+ *
+ * 与 [UfiNowPlayingSlot] 仍然共用右侧那块地，取舍不变：**放歌时播放控制优先**，
+ * 天气暂时隐藏。理由是播放态可操作、且转瞬即变，天气是纯展示的慢变量。
+ */
+object UfiWeatherSlot {
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+
+    /** 开关开着、城市设过、且已取到数据时才为 true（由内容侧写入）。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+/**
+ * 标题栏**标题下方小字**的注入口（2026-09-18）。
+ *
+ * ## 它和 subtitle 不是一回事
+ * [UfiHeader] 的 `subtitle` 是**页面说明**（属于这个页面本身，如二级页的"连接模式 · 网络制式"）；
+ * 这里的 caption 是**挂件**（今日诗词），与页面内容无关、随设置开关出现或消失，
+ * 而且要出现在很多页面上。两者语义不同，所以不复用同一个参数：
+ * 让页面把诗词当"页面说明"传进来，就等于每个页面都要知道诗词功能的存在。
+ *
+ * 与 [UfiNowPlayingSlot] / [UfiWeatherSlot] 同一种做法：`:app` 启动时注入实现，页壳只渲染。
+ */
+object UfiHeaderCaptionSlot {
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+
+    /** 此刻是否真的有东西要显示（由内容侧写入）。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+
+/**
  * Custom header bar matching UFITOOLSWidget style:
  * Centered title (28sp bold) + optional subtitle, back button on the left, actions on the right.
  *
@@ -46,9 +140,18 @@ import com.ufi_axis.ui.theme.UfiMotion
 private fun UfiHeader(
     title: String,
     subtitle: String? = null,
+    /**
+     * 标题下方的小字（天气 / 今日诗词）。由 [UfiHeaderCaptionSlot] 注入，
+     * **不是页面说明** —— 页面说明是 [subtitle]。
+     */
+    caption: (@Composable () -> Unit)? = null,
     showBack: Boolean = false,
     onBack: (() -> Unit)? = null,
     navigationIcon: @Composable (() -> Unit)? = null,
+    /**
+     * 标题栏右侧的「正在播放」区（[UfiNowPlayingSlot] 注入，非 null 时标题改为左对齐）。
+     */
+    nowPlaying: (@Composable () -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {}
 ) {
     val palette = LocalResolvedPalette.current
@@ -60,7 +163,26 @@ private fun UfiHeader(
             // 状态栏安全区由 [UfiScreenScaffold] 的根 Column 统一消费一次
             // （`statusBarsPadding()`，2026-09-04 由宿主 Scaffold 移交至此），
             // header 只保留 4.dp 的视觉顶间距。两处都加会把标题往下推两倍状栏高。
-            .padding(top = 4.dp, bottom = 8.dp)
+            //
+            // 带「正在播放」时整条**加高**：右侧那块是双行（曲名/歌手 + 歌词），
+            // 按原来的高度会挤到标题栏边缘。
+            //
+            // 2026-09-17：两套高度整体再放大约 20%（全局）—— 原来的标题栏偏紧，
+            // 标题基线离状态栏与内容区都太近。这里只加内边距、不动文字样式，
+            // 所以标题与右侧动作的对齐关系不变。
+            .then(
+                if (nowPlaying != null) {
+                    Modifier.padding(
+                        top = HEADER_PADDING_TOP_NOW_PLAYING,
+                        bottom = HEADER_PADDING_BOTTOM_NOW_PLAYING
+                    )
+                } else {
+                    Modifier.padding(
+                        top = HEADER_PADDING_TOP,
+                        bottom = HEADER_PADDING_BOTTOM
+                    )
+                }
+            )
             .padding(horizontal = Spacing.HeaderPaddingH)
     ) {
         // Back button (left) — 优先使用自定义 navigationIcon（如带文字的"退出"按钮），
@@ -112,8 +234,35 @@ private fun UfiHeader(
             titleBlur.animateTo(0f, tween(UfiMotion.HEADER_TITLE_BLUR_MS))
         }
         Column(
-            modifier = Modifier.align(Alignment.Center),
-            horizontalAlignment = Alignment.CenterHorizontally
+            modifier = Modifier
+                // 有「正在播放」区时标题改**左对齐**（右侧要让出位置给它）；否则保持居中。
+                .align(if (nowPlaying != null) Alignment.CenterStart else Alignment.Center)
+                // 2026-09-16：标题是**居中绝对定位**，原来没给两侧留位置 —— 于是长标题
+                // （视频播放页的文件名）会直接压在左侧返回键和右侧 actions 上面。
+                // 这里给两边各留一个动作位的宽度（48dp 触区 + 4dp 呼吸），标题超长就省略号，
+                // 而不是叠字。左右对称留白是为了让标题保持真正居中。
+                .then(
+                    if (nowPlaying != null) {
+                        // 左对齐：有返回键才让开它的 48dp，否则直接从页面边距起排。
+                        // 宽度封到 [HEADER_TITLE_WIDTH_WITH_NOW_PLAYING] —— 剩下的留给右侧那块。
+                        Modifier
+                            .padding(
+                                start = if (showBack || navigationIcon != null) {
+                                    HEADER_TITLE_SIDE_RESERVE
+                                } else {
+                                    0.dp
+                                }
+                            )
+                            .fillMaxWidth(HEADER_TITLE_WIDTH_WITH_NOW_PLAYING)
+                    } else {
+                        Modifier.padding(horizontal = HEADER_TITLE_SIDE_RESERVE)
+                    }
+                ),
+            horizontalAlignment = if (nowPlaying != null) {
+                Alignment.Start
+            } else {
+                Alignment.CenterHorizontally
+            }
         ) {
             Text(
                 text = title,
@@ -121,7 +270,7 @@ private fun UfiHeader(
                 color = palette.textPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
+                textAlign = if (nowPlaying != null) TextAlign.Start else TextAlign.Center,
                 modifier = Modifier.graphicsLayer {
                     val r = titleBlur.value
                     if (r > 0.5f) {
@@ -143,17 +292,28 @@ private fun UfiHeader(
                     modifier = Modifier.padding(top = 2.dp)
                 )
             }
+            // 标题下方小字（天气 / 今日诗词，2026-09-18）。排在 subtitle 之下：
+            // 页面说明是页面自己的属性、优先靠近标题；挂件是外挂信息，垫在最后一行。
+            if (caption != null) {
+                Box(modifier = Modifier.padding(top = 3.dp)) { caption() }
+            }
         }
 
-        // Actions (right)
+        // Actions (right) —— 「正在播放」区排在页面自己的 actions 之前（更靠左），
+        // 这样各页面右上角原有按钮的位置不会因为音乐在放而左右跳动。
         Row(
             modifier = Modifier.align(Alignment.CenterEnd),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            content = actions
-        )
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            nowPlaying?.invoke()
+            actions()
+        }
     }
 }
+
+/** 有「正在播放」区时标题占的宽度比例：另一半留给它。 */
+private const val HEADER_TITLE_WIDTH_WITH_NOW_PLAYING = 0.5f
 
 /**
  * Screen scaffold with custom UfiHeader (no TopAppBar).
@@ -221,6 +381,23 @@ fun UfiScreenScaffold(
     navController: NavHostController? = null,
     showBack: Boolean = false,
     showHeader: Boolean = true,  // 2026-08-11：新增，子页面被外层 Tab 嵌套调用时传 false 避免多重标题栏
+    /**
+     * 整页底色的额外一层渐变（2026-09-16 新增，默认 null = 只用 `pageBg`）。
+     *
+     * 加它是因为「顶栏与内容不同色」：音乐播放页的内容区自己画了一层 accent 渐变，
+     * 而标题栏在本壳里、只有 `pageBg`，于是标题栏与下方内容之间有一道明显的色阶。
+     * 传进来的画刷会铺满**整壳**（含标题栏与状态栏区域），页面内容区因此不必再自己画背景。
+     */
+    backgroundBrush: Brush? = null,
+    /**
+     * 是否在本页标题栏显示「正在播放」区（默认 **不显示**）。
+     *
+     * 默认关掉是因为它会改变标题栏版式（标题左对齐 + 整条加高）：二级页的标题栏往上下都塞满了
+     * 东西（返回键、长文件名、页面自己的动作），跟着一起变会把那些页面的布局挤坏。
+     * 现在只有首页那 5 个 Tab（仪表盘 / 网络设置 / 监控中心 / 工具 / 设置）显式打开它 ——
+     * 那几页的标题栏本来就只有一个标题，位置最富余。
+     */
+    showNowPlaying: Boolean = false,
     navigationIcon: @Composable (() -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {},
     onBack: (() -> Unit)? = null,
@@ -238,14 +415,17 @@ fun UfiScreenScaffold(
             // 2026-09-04（转场中上下各一道白框）：上一轮把 `statusBarsPadding()` 加到这里时
             // **没有**给本 Column 铺底色，页面底色完全靠祖先（目的地 Box / 宿主 Scaffold
             // 的 containerColor / `window` 背景）兜底。于是状态栏与手势条那两条带子并不是
-            // 「本页自己的像素」——转场中本页整体平移 / 缩放（`ufiNavRecedeLayer` 的
-            // `CompositingStrategy.Offscreen` 会把内容裁到图层边界）时，那两条带子露出的是
-            // 图层外的窗口底色，真机观感就是「上下各一道白框，且因卡片阴影更明显」。
+            // 「本页自己的像素」——转场中本页整体平移（不再缩放、不再离屏裁剪）时，
+            // 那两条带子露出的就是祖先兜底的非本页像素 —— 窗口底色，真机观感就是
+            // 「上下各一道白框，且因卡片阴影更明显」。
             //
             // 现在本壳自持底色：`background` 排在 `statusBarsPadding()` **之前**，
             // 所以底色铺到屏幕物理边缘、inset 只收内容 —— 无论祖先画不画、图层怎么裁，
             // 这两条带子永远是页面底色。
             .background(palette.pageBg)
+            // 页面自带的渐变（可选）：铺在 pageBg 之上、inset 之前，所以标题栏与状态栏区域
+            // 都会被它盖住 —— 这正是"顶栏与内容同色"的做法。
+            .then(if (backgroundBrush != null) Modifier.background(backgroundBrush) else Modifier)
             // ★ 状态栏安全区的唯一落点（2026-09-04 从 MainNavGraph 的 Scaffold innerPadding
             //   移交至此，理由见本函数 KDoc）。用 statusBarsPadding() 而不是
             //   windowInsetsPadding(safeDrawing)：底部由下面那个内容 Box 单独处理
@@ -275,6 +455,17 @@ fun UfiScreenScaffold(
                     else -> null
                 },
                 navigationIcon = navigationIcon,
+                // 标题栏右侧：正在播放优先，其次今日天气（2026-09-18 天气回到右侧）。
+                // 两者共用同一块地：播放态可操作、且转瞬即变，所以它赢；天气是慢变量，
+                // 放歌期间暂时隐藏。右侧一旦有内容，标题就改为**左对齐**（见 UfiHeader）。
+                nowPlaying = if (!showNowPlaying) null else {
+                    UfiNowPlayingSlot.content.value?.takeIf { UfiNowPlayingSlot.active.value }
+                        ?: UfiWeatherSlot.content.value?.takeIf { UfiWeatherSlot.active.value }
+                },
+                // 标题下方小字：今日诗词。与右侧插槽互不影响，两个功能各占一处。
+                caption = if (!showNowPlaying) null else {
+                    UfiHeaderCaptionSlot.content.value?.takeIf { UfiHeaderCaptionSlot.active.value }
+                },
                 actions = actions
             )
         }
@@ -308,6 +499,10 @@ fun UfiScreenScaffold(
                 }
         ) {
             content(PaddingValues(0.dp))
+
+            // 2026-09-19：天气下拉浮层（覆盖在内容上方、带遮罩、从顶部滑入）。
+            // 放在 content 之后（同一个 Box 内）使它叠在内容上面。
+            UfiHeaderDrawerHost()
         }
     }
 }

@@ -352,4 +352,33 @@ onMounted(() => {
 .text-error {
   color: var(--error);
 }
+
+@media (max-width: 768px) {
+  /* 上面那条「12px 下能整行放下」的实测是按 482px 列宽算的；360px 视口下卡内只有
+     ~298px，68 个字符 12px 非等宽 ≈410px ⇒ 约 1/4 被静默切掉。
+     而 `.url-text` 是 inline 元素（原先是 <code>），**inline 上 overflow / ellipsis 无效**，
+     只有 nowrap 生效 —— 所以连省略号都没有，用户看不出被截过。
+     窄屏改成整行换行显示：这条 URL 的用途就是抄走，宁可占 2~3 行也不能少字符。 */
+  /* `.row-url` 是传给 InfoRow 的 class，Vue 把它合并到组件根节点上 ——
+     也就是说这个元素同时带 `.info-row` 与 `.row-url`，直接写 `.row-url` 即可，
+     不需要（也不能用）后代选择器去找 `.info-row`。 */
+  .row-url {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .row-url :deep(.info-value) {
+    text-align: left;
+    max-width: 100%;
+    /* InfoRow 基础样式在 .info-value 上写了 nowrap + ellipsis，这里放开 */
+    white-space: normal;
+    overflow: visible;
+  }
+  .url-text {
+    display: block;
+    white-space: normal;
+    word-break: break-all;
+    overflow: visible;
+  }
+}
 </style>

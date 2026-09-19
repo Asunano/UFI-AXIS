@@ -60,8 +60,8 @@ fun Modifier.blurEntrance(
  * 为什么需要它：Navigation Compose 在目的地离屏后会 dispose 它的组合。从二级页
  * （`detail/…` 那一组路由）返回时，Tab 宿主 [com.ufi_axis.ui.navigation.Routes.MAIN] 整个重新组合，
  * `remember { Animatable(0f) }` 全部重建 → 入场动画从 alpha=0 / +12px 再走一遍，
- * 观感就是「返回主界面抖动一下」。NavHost 层的 `hostPopEnter` 已经是
- * `EnterTransition.None`，所以剩下的抖动全部来自页面内部这层入场动画。
+ * 观感就是「返回主界面抖动一下」。Tab 宿主目的地在返回时会被重新组合（NavHost 层对宿主返回走
+ * `detailSharedAxisPopEnter` 视差转场），页面内部这层入场动画若不做跨组合保存就会随重组重播。
  *
  * `rememberSaveable` 挂在 `NavBackStackEntry` 的 `SaveableStateHolder` 上：组合被 dispose
  * 时保存、重建时还原，因此能把「播过了」这件事带过去。

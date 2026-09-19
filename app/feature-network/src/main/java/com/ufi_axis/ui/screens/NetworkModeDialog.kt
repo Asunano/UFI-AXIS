@@ -18,18 +18,11 @@ import com.ufi_axis_core.contract.NetworkMode
 
 
 /**
- * 网络制式档位的中文标签。键是 **contract 别名**（`NetworkMode.UI_OPTIONS`），
- * 顺序由 `UI_OPTIONS` 决定；下发走别名，core 侧 `toBearer()` 负责换算成设备取值。
- * `NetworkModeScreen` 与 `NetworkModeDialog` 共用这一份，避免两处漂移。
+ * 网络制式中文标签：**不再在 App 维护第二份**。
+ * 文案真源是 core `NetworkMode.LABELS`；下发走 contract 别名，core `toBearer()` 换算设备值。
+ * 优先读 API 回的 `network_mode_label`，缺省时用 contract 映射。
  */
-internal val NETWORK_MODE_LABELS: Map<String, String> = mapOf(
-    NetworkMode.AUTO to "自动 (4G/5G)",
-    NetworkMode.ONLY_5G to "5G SA",
-    NetworkMode.LTE_AND_5G to "4G/5G NSA",
-    NetworkMode.ONLY_LTE to "仅 4G",
-    NetworkMode.WCDMA_AND_LTE to "4G/3G",
-    NetworkMode.ONLY_WCDMA to "仅 3G"
-)
+internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
 
 /** 连接模式 & 网络制式设置弹窗 */
 @Composable
@@ -72,7 +65,8 @@ fun NetworkModeDialog(
                     modifier = Modifier.weight(1f)
                 )
                 UfiStatItem(
-                    value = NETWORK_MODE_LABELS[displayMode] ?: netModeJson,
+                    value = deviceSettingsState.settings?.networkModeLabel
+                        ?: NetworkMode.label(displayMode),
                     label = if (switching) "网络制式（切换中）" else "网络制式",
                     modifier = Modifier.weight(1f),
                     valueColor = when (displayMode) {
@@ -122,7 +116,7 @@ fun NetworkModeDialog(
                 Text(
                     when {
                         // 切换中：说清"设备在搜网"，让用户知道要等
-                        switching -> "正在切换到「${NETWORK_MODE_LABELS[displayMode] ?: displayMode}」，设备重新搜网需要一点时间"
+                        switching -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间"
                         // 回读预算用尽仍未报出目标档位：明说，不静默停在旧值上
                         state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看"
                         else -> "切换后设备将重新搜网"
@@ -133,7 +127,7 @@ fun NetworkModeDialog(
                 Spacer(Modifier.height(8.dp))
                 Column(Modifier.fillMaxWidth()) {
                     NetworkMode.UI_OPTIONS.forEach { key ->
-                        val label = NETWORK_MODE_LABELS[key] ?: key
+                        val label = NetworkMode.label(key)
                         val isSelected = key == displayMode
                         val chipColor = when {
                             isSelected -> palette.accent
@@ -191,11 +185,14 @@ internal fun connModeOf(settings: DeviceSettingsResponse?): String =
     if (settings?.manualConnection == true) "manual" else "auto"
 
 /**
- * 读取设备当前档位。**优先 `BearerPreference`**：写入侧（`POST /api/network/mode` → goform
- * `SET_BEARER_PREFERENCE`）改的就是这个字段，web 的 `NetworkView` 也读它；`net_select` 是老字段，
- * 取值域未经证实，仅作回退（优先级判断在 [DeviceSettingsResponse.networkMode] 里）。
- * 交给 `NetworkMode.fromBearer()` 换算（未识别值原样返回，因此老设备回 `AUTO` 这类
- * 别名同名值时仍能正确高亮）。
+ * 读取设备当前档位。
+ *
+ * 优先 **`net_select`**（2026-09 真机：切换后 goform 回读里真正变化的是它，
+ * 形如 `WL_AND_5G` / `Only_5G`）。`BearerPreference` 是写入侧字段，可能为空或未应用，
+ * 仅在 net_select 缺失时回退。再经 [NetworkMode.fromBearer] 换成 contract 别名。
  */
-internal fun netModeOf(settings: DeviceSettingsResponse?): String =
-    settings?.networkMode ?: NetworkMode.AUTO
+internal fun netModeOf(settings: DeviceSettingsResponse?): String {
+    val netSelect = settings?.netSelect?.takeIf { it.isNotBlank() }
+    if (netSelect != null) return netSelect
+    return settings?.bearerPreference?.takeIf { it.isNotBlank() } ?: NetworkMode.AUTO
+}

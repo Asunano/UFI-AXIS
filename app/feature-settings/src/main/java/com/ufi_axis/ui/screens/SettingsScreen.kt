@@ -41,7 +41,8 @@ fun SettingsScreen(
     val serviceState by viewModel.serviceState.collectAsState()
     LaunchedEffect(Unit) { viewModel.network.loadServiceStatus() }
 
-    UfiScreenScaffold(title = "设置") { padding ->
+    // showNowPlaying：首页 5 个 Tab 的标题栏才显示「正在播放」
+    UfiScreenScaffold(title = "设置", showNowPlaying = true) { padding ->
         // 入场动画已上移到 MainNavGraph 根节点（"app-launch"），只在冷启动播一次；
         // 页面级 blurEntrance / staggeredEntrance 会在切 Tab、从二级页返回时重播，观感是抖动。
         UfiPageBackground(modifier = Modifier.padding(padding)) {
@@ -174,7 +175,31 @@ fun SettingsScreen(
                         icon = Icons.Default.Palette,
                         title = "外观",
                         description = "主题、深色模式、配色预设",
-                        onClick = { navController?.navigate("detail/appearance") },
+                        onClick = { navController?.navigate(Routes.DETAIL_APPEARANCE) },
+                        trailing = { UfiSettingsChevron() }
+                    )
+                }
+                // 界面小功能（2026-09-17）：首页标题栏上的小挂件入口页（天气 / 今日诗词）。
+                // 不并入「外观」：那页是纯本机的主题/配色，这里要连 core 取数、有刷新周期。
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.WbSunny,
+                        title = "界面小功能",
+                        description = "标题栏天气 · 今日诗词",
+                        onClick = { navController?.navigate(Routes.DETAIL_UI_EXTRAS) },
+                        trailing = { UfiSettingsChevron() }
+                    )
+                }
+                // 监控设置（2026-09-17 从监控中心标题栏的齿轮挪到这里）
+                //
+                // 那个齿轮和标题栏右侧的「正在播放」抢同一块地方，而它本身就是"设置"性质的
+                // 二级入口 —— 设置页才是找它的地方。
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.Insights,
+                        title = "监控设置",
+                        description = "数据采集 · 图表显示 · 调度 · 存储",
+                        onClick = { navController?.navigate(Routes.DETAIL_MONITOR_SETTINGS) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -239,7 +264,16 @@ fun SettingsScreen(
                 )
             }
 
-            Spacer(Modifier.height(Spacing.Large))
+            // 底部为胶囊导航栏留白（2026-09-17）。
+            //
+            // 原来只留 Spacing.Large(12dp) —— 而首页 5 个 Tab 上胶囊是**可交互**的窗口，
+            // 底部那条带子上的控件收不到事件。设置页加了「界面小功能」这张卡之后，
+            // 「关于设备」正好被顶到那条带子里，表现就是"看得见、点不动"。
+            //
+            // 用 ufiCapsuleBottomInset 而不是写死 dp：胶囊实测高度 + 系统预留区由胶囊窗口
+            // 回写到 CapsuleInsetHolder，手势导航/三键导航、不同机型的值都不一样。
+            // 它在 layout 阶段读快照（不在组合期），见 UfiCapsuleBlurHost 的 KDoc。
+            Spacer(Modifier.ufiCapsuleBottomInset(Spacing.Medium))
         }
     }
 }

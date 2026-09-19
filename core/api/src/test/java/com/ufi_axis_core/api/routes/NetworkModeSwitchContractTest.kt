@@ -151,10 +151,28 @@ class NetworkModeSwitchContractTest {
     @Test
     fun `总时长预算与次数间隔自洽`() {
         val probe = NetworkMode.SwitchProbe
-        assertEquals(
-            probe.FIRST_DELAY_MS + (probe.MAX_ATTEMPTS - 1) * probe.INTERVAL_MS,
-            probe.TOTAL_BUDGET_MS,
+        val expected = probe.FIRST_DELAY_MS + (1 until probe.MAX_ATTEMPTS).sumOf { probe.intervalMsAfter(it) }
+        assertEquals(expected, probe.TOTAL_BUDGET_MS)
+    }
+
+    @Test
+    fun `预算覆盖真机十几到二十几秒的切换时间`() {
+        // 2026-09-15：原来 10 次 × 1.5s = 14.1s，短于真机实际切换时间，
+        // 于是「切完了却提示未完成」变成常态。预算不许再退回 20s 以下。
+        assertTrue(
+            "回读预算 ${NetworkMode.SwitchProbe.TOTAL_BUDGET_MS}ms 不足以覆盖真机切换时间",
+            NetworkMode.SwitchProbe.TOTAL_BUDGET_MS >= 25_000L,
         )
+    }
+
+    @Test
+    fun `回读间隔先快后慢`() {
+        val probe = NetworkMode.SwitchProbe
+        // 前几次给快反馈，之后降频——每次回读都真打设备，匀速快档会把 goform 查询许可耗光
+        assertEquals(probe.INTERVAL_MS, probe.intervalMsAfter(1))
+        assertEquals(probe.INTERVAL_MS, probe.intervalMsAfter(probe.FAST_ATTEMPTS - 1))
+        assertEquals(probe.SLOW_INTERVAL_MS, probe.intervalMsAfter(probe.FAST_ATTEMPTS))
+        assertEquals(probe.SLOW_INTERVAL_MS, probe.intervalMsAfter(probe.MAX_ATTEMPTS - 1))
     }
 
     private companion object {

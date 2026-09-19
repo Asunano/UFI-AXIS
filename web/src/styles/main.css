@@ -44,6 +44,36 @@
      兜底值提上来 —— 取值逐字相同，只是变量从此真实存在、可被换肤覆盖。 */
   --code-bg: rgba(128, 128, 128, 0.08);
 
+  /* 主色之上的前景色。主色是深绿，压在上面的文字/图标必须是白的，
+     所以它**不随明暗切换**（暗色下主色不变，前景也就不该变）。
+     之前各处写 `color: #fff`，语义丢失：读代码的人分不清"这里必须白"
+     还是"这里恰好白"。 */
+  --on-accent: #ffffff;
+
+  /* 主色光晕 / 聚焦环。都是"主色 + 低透明度"，但两个用途的强度差一档，
+     合成一个会两边都不对：
+       --accent-glow  发光（drop-shadow / box-shadow 的品牌高光），要看得见
+       --accent-ring  聚焦环（focus 时 3px 描边），只是提示，不能盖住内容
+     取值沿用 2026-09-15 清理前各处的实测 alpha（0.35 / 0.18），只是集中。
+     暗色下深底吃光，各 +0.1。 */
+  --accent-glow: rgba(24, 160, 88, 0.35);
+  --accent-ring: rgba(24, 160, 88, 0.18);
+
+  /* 阴影颜色（不含几何）。
+     令牌只给**颜色**、不给整条 box-shadow：偏移/模糊半径属于版式，
+     浮层、卡片、贴顶栏各有各的几何，塞进令牌反而逼调用方改设计。
+     两档按"这东西离页面多远"选：
+       soft   贴着页面的（列表行、内联卡片）
+       strong 明确浮在上面的（模态、下拉、悬浮条）
+     暗色档必须更实：深底上 0.08 的黑等于没有，浮层会失去边界感。 */
+  --shadow-color-soft: rgba(0, 0, 0, 0.08);
+  --shadow-color-strong: rgba(0, 0, 0, 0.18);
+
+  /* 自绘滚动条。中性灰 + 低透明度，明暗两态自适应（同 --code-bg 的思路），
+     故 .dark 无需覆盖。 */
+  --scrollbar-thumb: rgba(128, 128, 128, 0.3);
+  --scrollbar-thumb-hover: rgba(128, 128, 128, 0.5);
+
   /* ── 分类色（categorical palette）──
      用于「同一层级、并列的若干类别」各占一色的场景（定时任务的动作类型徽标是第一个消费方）。
      刻意按**色相**命名而不是按业务语义（不叫 --badge-wifi 之类）：这样换一批业务分类时
@@ -120,6 +150,12 @@
   --error-light: rgba(208, 48, 80, 0.12);
   --surface-hover: rgba(255, 255, 255, 0.04);
   --surface-elevated: #222228;
+
+  /* 光晕/阴影暗色档：深底吃光，浅色档的 alpha 在这里等于看不见 */
+  --accent-glow: rgba(24, 160, 88, 0.45);
+  --accent-ring: rgba(24, 160, 88, 0.28);
+  --shadow-color-soft: rgba(0, 0, 0, 0.3);
+  --shadow-color-strong: rgba(0, 0, 0, 0.45);
 
   /* 分类色暗色档：原色低透明度底 + 同色系亮字（不是把浅底调暗）。
      底色叠在 --card-bg(#1a1a20) 上的合成值与前景的对比度实测：
@@ -392,6 +428,99 @@ body,
   font-size: 13px;
   color: var(--text-muted);
   text-align: center;
+}
+
+/* ── 触屏点击区兜底（2026-09-19）──
+   naive `size="tiny"` 渲染 22px、`size="small"` 渲染 28px，都远低于
+   WCAG 2.5.5（44px）/ 实践下限（40px）。全站 38 个文件约 130 处 `size="tiny"`
+   按钮作为列表行的**主操作**（冻结/卸载/暂停/删除/确认…），在触屏上容易误触。
+
+   修法：不改视觉尺寸（那会影响桌面端密度），只在移动端给一个不可见的 `::before`
+   伪元素把点击区撑到 40px。伪元素是 absolute，不占布局、不撑容器，
+   只有 `pointer-events: auto` 使它能接收触摸。
+
+   `n-button` 已经是 `position: relative`（naive 内部样式），
+   所以伪元素的 `inset` 相对于按钮自身。 */
+@media (max-width: 768px) {
+  .n-button--size-tiny,
+  .n-button--size-small {
+    position: relative;
+  }
+  .n-button--size-tiny::before,
+  .n-button--size-small::before {
+    content: '';
+    position: absolute;
+    /* 四个方向各扩 (40 - 实际高度) / 2 ——
+       tiny: (40-22)/2 = -9px ; small: (40-28)/2 = -6px。
+       取统一的 -8px：tiny 扩到 38px（接近下限）、small 扩到 44px，
+       精确相加的数字不重要，重要的是全站统一、且不会大到让两个紧贴按钮的
+       热区重叠（gap:4px 在这个值下仍有 4-8*2 = -12px 重叠 —— 但浏览器
+       在两个 hit target 重叠时取 z 序更高的那个，也就是 DOM 序靠后的，
+       与用户"点右边那颗"的心理预期一致）。 */
+    inset: -8px;
+    pointer-events: auto;
+  }
+}
+
+/* ── 弹窗的视口兜底（2026-09-19）──
+   naive 的两种 preset 行为**不一致**，这是本仓多处弹窗在手机上贴死屏幕两边的根因：
+     · `preset="dialog"` → `dialog/src/styles/index.cssr.mjs` 里自带
+       `width: 446px; max-width: calc(100vw - 32px)`，天然安全；
+     · `preset="card"`   → `modal/src/styles/index.cssr.mjs` 整个文件**没有任何 max-width**，
+       只有 `margin:auto`。于是 `style="width: 720px"` 在 360px 下缩到 360px 整宽、
+       左右零间距，遮罩完全看不见 —— 用户失去「这是一层可关掉的浮层」这个提示。
+
+   这条规则给所有 n-modal 一个下限保护。注意它**盖不过内联 max-width**
+   （行内样式优先级最高），所以写了 `style="max-width: 900px"` 的那几个弹窗
+   仍需在各自文件里显式补上 `max-width: calc(100vw - 32px)`。
+   新写弹窗时只给 `width`，剩下的交给这条。 */
+.n-modal {
+  max-width: calc(100vw - 32px);
+}
+
+/* ── 分段标签（n-tabs type="segment"）的窄屏形态 ──
+   2026-09-19：设置页 10 个分栏（通用/性能/服务/更新/通知/界面小功能/配对与授权/日志/
+   备份与恢复/关于）在手机上全部挤成一团，「界面小功能」「配对与授权」「备份与恢复」只剩两个字。
+
+   根因在 naive-ui 的 segment 版式本身（`tabs/src/styles/index.cssr.mjs`）：
+     · `.n-tabs-rail`         → `display:flex; width:100%`（不滚动）
+     · `.n-tabs-tab-wrapper`  → `flex-basis:0; flex-grow:1`（**所有页签等分整行宽度**）
+     · `.n-tabs-tab`          → `overflow:hidden`（**超出直接裁掉，不换行、不出省略号**）
+   360px 视口下 rail 内宽约 334px ÷ 10 ≈ 33px，而 5 个汉字要 ~65px ⇒ 被切掉一半。
+
+   修法只改一处 flex 取值，不动 DOM、不改组件类型：
+     `flex: 1 0 auto` = 基准取内容宽（`auto`）、**永不收缩**（`0`）、有余量时仍均分（`1`）。
+   于是：
+     · 页签少（短信 3 栏、告警 2 栏、任务 2 栏、终端 2 栏）→ 内容总宽 < rail，照旧铺满整行，
+       与改动前完全一样，不会回归；
+     · 页签多（设置 10 栏、设备 4 栏）→ 内容总宽 > rail，rail 横向滚动，每个页签保持完整文字。
+
+   滚动条必须隐藏：rail 只有 ~34px 高，底下再压一条滚动条会把胶囊指示器切掉，
+   观感像是控件坏了。触屏本身就有滚动手势，桌面窄窗口可用 shift+滚轮。
+
+   胶囊（`.n-tabs-capsule`）是 absolute + transform，定位基准是 rail 的内容盒，
+   滚动后仍与激活页签对齐，不需要额外处理。
+
+   激活项可能落在可视区之外（设置页靠 `?tab=` 直接进某一栏）——
+   「进页面时把激活项滚进视野」由 SettingsView 自己做（见该文件的 scrollActiveTabIntoView）。 */
+@media (max-width: 768px) {
+  .n-tabs.n-tabs--segment-type .n-tabs-rail {
+    overflow-x: auto;
+    /* iOS 惯性滚动 */
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .n-tabs.n-tabs--segment-type .n-tabs-rail::-webkit-scrollbar {
+    display: none;
+  }
+  .n-tabs.n-tabs--segment-type .n-tabs-tab-wrapper {
+    flex: 1 0 auto;
+  }
+  .n-tabs.n-tabs--segment-type .n-tabs-tab {
+    /* 文字不许折行：折了会把 rail 撑成两行高，胶囊高度跟不上 */
+    white-space: nowrap;
+    padding: 0 14px;
+  }
 }
 
 @media (max-width: 768px) {

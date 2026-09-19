@@ -75,9 +75,17 @@
             android:exported="false"
             android:stopWithTask="false"
             android:foregroundServiceType="dataSync" />
+        <!-- WorkManager 的前台服务（媒体下载 Worker 用它把自己提到前台）。
+             Android 14+ 要求前台服务显式声明类型，而 androidx.work 的清单里没有写 ——
+             不在这里 merge 一条 dataSync，`setForeground()` 在 14+ 会抛
+             MissingForegroundServiceTypeException，下载任务一进前台就崩。 -->
         <service
-            android:name=".notification.UfiNotifyAccessibilityService"
-            android:process=":ufi_notify"
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge" />
+
+        <service
+            android:name=".notification.UfiNotifyAccessibilityService"            android:process=":ufi_notify"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
             android:exported="true">
             <intent-filter>

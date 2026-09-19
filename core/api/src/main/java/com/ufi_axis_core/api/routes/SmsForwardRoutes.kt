@@ -274,6 +274,42 @@ class SmsForwardRoutes(
                 smsForwardController.clearMailHistory(channel)
                 call.respond(toJsonElement(mapOf("success" to true)))
             }
+
+            // 渠道配置页「发送/投递统计」共用端点（2026-09）。三条渠道同一张记录表，
+            // 统计只读 count/MAX，不碰分页游标。
+            //
+            // channel 口径与本组 `GET /history`、`DELETE /history` 一致：**缺失或空 = 全渠道**。
+            // 2026-09-14：这里原来缺失即 400，而 controller 的 `deliveryHistoryStats(channel: String?)`
+            // 和 DAO 都支持 null（全渠道）—— 同一组端点出现两种 channel 语义，
+            // 全渠道统计实现了却取不到。
+            get("/history/stats") {
+                val channel = call.request.queryParameters["channel"]?.takeIf { it.isNotBlank() }
+                val s = smsForwardController.deliveryHistoryStats(channel)
+                call.respond(
+                    toJsonElement(
+                        mapOf(
+                            "total" to s.total,
+                            "sent" to s.sent,
+                            "failed" to s.failed,
+                            "skipped" to s.skipped,
+                            "last_sent_at" to s.lastSentAt
+                        )
+                    )
+                )
+            }
+
+            // 删单条（App 详情弹窗「删除」）。挂在 AuthMiddleware 覆盖的 /api 下，不进免鉴权区。
+            delete("/history/{id}") {
+                val id = call.parameters["id"]?.toLongOrNull()
+                if (id == null || id <= 0L) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "invalid id")
+                    return@delete
+                }
+                val deleted = smsForwardController.deleteMailHistoryById(id)
+                // deleted=0（行已不在）仍回 success：与 SmsBlocked 删单条同口径，
+                // 客户端可安全把本地行摘掉，不会把「本来就没有」报成删除失败。
+                call.respond(toJsonElement(mapOf("success" to true, "deleted" to deleted)))
+            }
         }
     }
 

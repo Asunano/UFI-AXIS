@@ -148,7 +148,19 @@ class UpdateManager(
         val message: String = "",
         val currentVersion: String = "",
         val latestVersion: String? = null,
-        val apkPath: String? = null
+        val apkPath: String? = null,
+        /**
+         * 进入当前 [state] 的时刻（`System.currentTimeMillis()`）。
+         *
+         * 2026-09-14 新增，用途只有一个：[selfHealStuckState] 的超时判据。
+         * 之前 UpdateStatus 不带时间，于是 `INSTALLING` 一旦卡住就**永久**卡住 ——
+         * 而 [tryBeginUpload] 看的正是 `state in BUSY_STATES`，用户此后每次推包都恒 409。
+         *
+         * 注意用 `copy()` 改状态时**不会**自动更新它（copy 保留原值），这是有意的：
+         * 同一阶段内的进度刷新不该重置超时计时。真正的阶段跃迁一律走
+         * `UpdateStatus(...)` 全量构造，那时它自然取新的 now。
+         */
+        val stateSince: Long = System.currentTimeMillis()
     )
 
     @Volatile
@@ -161,21 +173,27 @@ class UpdateManager(
         private set
 
     /**
-     * /api/update/upload 动态请求体上限（2026-08-10）：
-     * 优先取清单 apkSize × 1.2 + 10MB 缓冲（比实际 APK 略大，兼容签名后体积微增）；
-     * 清单未知时回落 100MB 兜底；下限 20MB（防小文件时上限过小）。
+     * /api/update/upload 动态请求体上限（2026-08-10，2026-09-19 上调）：
+     *
+     * 优先取清单 apkSize × 1.5 + 20MB 缓冲；清单未知时回落 200MB 兜底。
+     *
+     * 2026-09-19 上调理由：集成 ffmpeg-kit 后 core APK 从 15MB 涨到 25MB+，
+     * 原先的 `× 1.2 + 10MB` 在清单记录的是老版本体积时会被收紧到不够用的值，
+     * 而 `未知回落 100MB` 也只留了 3~4 倍余量。改为 `× 1.5 + 20MB` / `回落 200MB`，
+     * 兼顾 debug 包（比 release 大 2~3 倍）和未来进一步增长的空间。
+     * 下限也从 20MB 提到 50MB（当前 benchmark 包就 25MB，20MB 下限已经不安全）。
      */
     fun uploadLimitBytes(): Long {
-        val size = backendApkSizeBytes ?: return 100L * 1024 * 1024
-        val buffered = (size * 1.2).toLong() + 10L * 1024 * 1024
-        return buffered.coerceAtLeast(20L * 1024 * 1024)
+        val size = backendApkSizeBytes ?: return 200L * 1024 * 1024
+        val buffered = (size * 1.5).toLong() + 20L * 1024 * 1024
+        return buffered.coerceAtLeast(50L * 1024 * 1024)
     }
 
     private val UPDATE_DIR = "/sdcard/Download/UFI-AXIS/update"
     private val APK_FILE = "$UPDATE_DIR/ufi-core.apk"
     private val APK_PART_FILE = "$UPDATE_DIR/ufi-core.apk.part"
     private val CORE_PACKAGE = "com.ufi_axis_core"
-    private val MAX_APK_BYTES = 50L * 1024 * 1024
+    private val MAX_APK_BYTES = 200L * 1024 * 1024
     /** P1 E24：守护脚本固定执行副本 + 结果日志（shell 可写、普通 App 不可写） */
     private val SCRIPT_PATH = "/data/local/tmp/ufi_update.sh"
     /**
@@ -599,8 +617,60 @@ class UpdateManager(
 
     // ── P1 A3/E25：上传互斥（UpdateRoutes.upload 调用）──
 
+    /**
+     * `INSTALLING` 卡死的超时阈值。
+     *
+     * 取 15 分钟：守护脚本自己的校验超时是 600s（10 分钟），留 5 分钟缓冲，
+     * 确保「脚本还在正常跑」绝不会被误判成卡死。
+     */
+    private val INSTALL_STUCK_TIMEOUT_MS = 15 * 60 * 1000L
+
+    /**
+     * 卡死状态自愈（2026-09-14）。
+     *
+     * ## 为什么必须有
+     * `installLocalApk` 是 fire-and-forget：起一个线程装包，然后把 state 置成 `INSTALLING`
+     * 就返回。此后复位只有三条路 —— core 被替换并重启、前端轮询到日志里的 RESULT 行、
+     * 或有人 POST `/api/update/reset`。
+     *
+     * **推错包会同时切断前两条**：装上去的是别的 app，core 自己没被替换、进程不死、不重启；
+     * 而 watchdog 比对的是 core 的版本基线，10 分钟内不会写 RESULT 行。前端这边
+     * `AboutDeviceScreen` 每次进关于页都会停掉轮询且**不调后端 reset**，于是
+     * 「推错包 → 返回 → 再进来重推」之后 `INSTALLING` 永久驻留 ——
+     * 而 [tryBeginUpload] 看的正是 `state in BUSY_STATES`，用户此后每次推包都恒 409。
+     *
+     * ## 为什么放在这里而不是起个定时器
+     * 这是**惰性判定**：只在真正有人要用这个状态机时（上传/安装/查状态）检查一次。
+     * 常驻定时器会为一个罕见分支持续占用调度资源，与本仓「事件驱动、不常驻」的取向相悖。
+     *
+     * @return 是否发生了自愈（调用方一般不关心，仅日志/测试用）
+     */
+    private fun selfHealStuckState(reason: String): Boolean {
+        val s = status
+        if (s.state != State.INSTALLING) return false
+        val elapsed = System.currentTimeMillis() - s.stateSince
+        if (elapsed <= INSTALL_STUCK_TIMEOUT_MS) return false
+        AppLogger.w(
+            TAG,
+            "检测到安装状态卡死（已 ${elapsed / 1000}s，阈值 ${INSTALL_STUCK_TIMEOUT_MS / 1000}s），" +
+                "自动置为失败并清理残留 [$reason]"
+        )
+        status = UpdateStatus(
+            state = State.FAILED,
+            message = "上一次安装超过 ${INSTALL_STUCK_TIMEOUT_MS / 60000} 分钟未返回结果，已自动重置。" +
+                "若推送的不是 UFI-AXIS Core 的安装包，设备不会重启，这是正常现象。",
+            currentVersion = currentVersionName()
+        )
+        // pendingUpdate 留着会让下次启动恢复逻辑拿它当"待确认的安装"，必须一起清
+        runCatching { settings.pendingUpdate = null }
+        cleanupInstallArtifacts("self-heal-stuck-install")
+        return true
+    }
+
     /** 尝试进入上传态：check/install 进行中或已有上传占用 → false（路由返回 409） */
     fun tryBeginUpload(): Boolean {
+        // 先给卡死状态一次自愈机会，否则「上一次推错包」会让此后所有上传恒 409
+        selfHealStuckState("tryBeginUpload")
         if (status.state in BUSY_STATES) {
             AppLogger.i(TAG, "tryBeginUpload 拒绝：更新进行中 (state=${status.state})")
             return false
@@ -609,8 +679,51 @@ class UpdateManager(
             AppLogger.i(TAG, "tryBeginUpload 拒绝：已有上传占用")
             return false
         }
-        status = status.copy(state = State.UPLOADING, message = "正在接收 APK 上传...")
+        status = UpdateStatus(
+            state = State.UPLOADING,
+            message = "正在接收 APK 上传...",
+            currentVersion = status.currentVersion.ifBlank { currentVersionName() },
+            latestVersion = status.latestVersion
+        )
         return true
+    }
+
+    /**
+     * 校验一个 APK 是不是 UFI-AXIS Core 自己。
+     *
+     * ## 为什么必须在「落地成固定文件名之前」做
+     * 上传落盘用的是固定路径 `ufi-core-uploaded.apk`，而失败态**刻意不清理**残留
+     * （保留供重试）。所以一旦错包被 rename 成那个名字，它就永久占住那个位置。
+     * 校验放在 rename 之前 + 失败即删 `.part`，错包连落地的机会都没有。
+     *
+     * ## 为什么装错包的后果值得一道硬闸
+     * 安装走的是 `adb install -r`，包名不同 ⇒ 系统装的是**那个 app**，core 没被替换，
+     * 于是状态机卡在 `INSTALLING`（见 [selfHealStuckState]），用户还会以为"更新成功了"。
+     *
+     * @return null 表示校验通过；非 null 是给用户看的拒绝原因
+     */
+    fun rejectReasonForApk(apkFile: File): String? {
+        val ctx = appContext ?: run {
+            // 拿不到 Context 就无法解析包名。此时不硬拦（否则在没有 Context 的部署形态下
+            // 连正常更新都推不上去），但要留下明确日志，便于回溯"这台设备没做包名校验"。
+            AppLogger.w(TAG, "无 appContext，跳过 APK 包名校验")
+            return null
+        }
+        val info = runCatching {
+            ctx.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        }.getOrNull()
+            ?: return "无法解析该 APK（文件损坏或不是有效的 Android 安装包）"
+        val pkg = info.packageName.orEmpty()
+        val selfPkg = ctx.packageName
+        if (pkg.isBlank()) return "无法读取该 APK 的包名"
+        // 与运行中的 core 自身包名比对，而不是与写死的常量：调试/渠道包的 applicationId
+        // 可能带后缀，用常量会把自己的调试包也拦掉。CORE_PACKAGE 仅作兜底。
+        val expected = selfPkg.ifBlank { CORE_PACKAGE }
+        if (pkg != expected) {
+            return "包名不匹配：该 APK 是「$pkg」，而设备端 Core 是「$expected」。" +
+                "请选择 UFI-AXIS Core 的安装包。"
+        }
+        return null
     }
 
     /** 上传结束释放互斥；成功时把落地路径写进 status，失败置 FAILED 展示原因 */
@@ -626,9 +739,12 @@ class UpdateManager(
         }
     }
 
-    /** 重置状态（UI 关闭/重试前） */
+    /** 重置状态（UI 关闭/重试前）。同时清掉上传残留，避免固定文件名被旧包占位。 */
     fun reset() {
         status = UpdateStatus(currentVersion = currentVersionName())
+        // reset 的语义就是"回到干净状态"，此时 state 已是 IDLE，cleanupInstallArtifacts
+        // 的 BUSY_STATES 闸门不会挡住它
+        cleanupInstallArtifacts("manual-reset")
     }
 
     // ── 前端 App 更新信息（2026-08-10 C5：Core 转发给前端 App）──
@@ -991,9 +1107,15 @@ class UpdateManager(
     /**
      * 运行中轮询刷新（P1 B2）：status 处于 INSTALLING 时，前端 GET /status 顺带读日志 RESULT 行，
      * 使「脚本已失败但 Core 未重启」的场景也能及时反映（旧版完好，可直接重试）。
+     *
+     * 2026-09-14：读日志之前先跑一次 [selfHealStuckState]。日志里没有 RESULT 行时
+     * `recoverResultFromLog` 什么都不做 —— 推错包正是这种情况（core 没被替换、watchdog
+     * 也还没写结果），于是状态永久停在 INSTALLING。有了超时自愈，前端只要还在轮询，
+     * 15 分钟后就能自己走出来。
      */
     suspend fun refreshResultFromLogIfInstalling() {
         if (status.state != State.INSTALLING) return
+        if (selfHealStuckState("refreshResultFromLogIfInstalling")) return
         recoverResultFromLog()
     }
 

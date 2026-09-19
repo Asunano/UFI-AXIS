@@ -3,7 +3,7 @@
     :show="show"
     preset="card"
     :title="isNew ? '新建 Cloudflare 隧道' : `编辑 ${nameInput}`"
-    style="max-width: 560px"
+    style="width: 560px; max-width: calc(100vw - 32px)"
     @update:show="emit('update:show', $event)"
   >
     <n-space vertical :size="10">

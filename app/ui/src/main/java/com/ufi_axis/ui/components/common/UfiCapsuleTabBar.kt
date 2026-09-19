@@ -226,7 +226,7 @@ private val INDICATOR_SPEC: AnimationSpec<Float> = UfiMotion.tabSlider()
  *   并与系统「降低动效」合并），`coerceAtLeast(1)` 与 `MainNavGraph` 逐字一致
  *   —— 关闭档（0）时 tween 的时长必须合法；
  * - 曲线：[UfiMotion.Easing.Standard]（FastOutSlowIn）就是 `CubicBezierEasing(0.4, 0, 0.2, 1)`，
- *   `Navigation.kt` 的 `ufiNavTransitionSpec` 也用它，全站三处同一条曲线。
+ *   `Navigation.kt` 的二级页转场（`sharedAxisSpec`）也用它，全站三处同一条曲线。
  *
  * 不写裸字面量：改转场时长时滑块自动跟上，不会再出现「页面 380、滑块 500 刚度」这种失联。
  */

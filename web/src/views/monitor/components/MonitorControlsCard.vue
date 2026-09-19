@@ -185,10 +185,14 @@ async function setCollect(enabled: boolean) {
 </script>
 
 <style scoped>
+/* 4 档区间按钮组（152px）+ 刷新（48px）+ 监控设置（76px）+ 24px 间距 ≈ 300px，
+   正好顶到 298px 卡内宽的上限：文案换成「收起设置」就多一个字宽，320px 设备更是必溢出。
+   允许换行。 */
 .controls-bar {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
 }
 
 /* 原名 .settings-panel —— 与 settings/panels 的同名栅格类语义完全不同（那边是 auto-fit 卡片栅格，
@@ -224,5 +228,13 @@ async function setCollect(enabled: boolean) {
 .settings-hint {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+@media (max-width: 768px) {
+  /* 96px 的标签下限在 298px 内会把「开启采集/停止采集 + 长提示」压到 204px，
+     提示折成 5 行。窄屏改成标签独占一行。 */
+  .settings-label {
+    min-width: 100%;
+  }
 }
 </style>

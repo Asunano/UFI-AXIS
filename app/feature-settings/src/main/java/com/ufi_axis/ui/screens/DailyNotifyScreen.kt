@@ -1,6 +1,7 @@
 package com.ufi_axis.ui.screens
 
 import android.content.Context
+import android.content.SharedPreferences
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -10,6 +11,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavHostController
 import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyDispatchReceiver
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -52,7 +54,7 @@ fun DailyNotifyScreen(
     // L1 全局通知总闸（2026-09-08）：本页每一项都在它下游 —— 总闸关着时这些分类
     // 即使为 true 也一条都不会发（判定在 NotificationCenter.notify）。所以统一置灰，
     // 不置灰就是"能开但没用"。真源与「通知与守护」页同一个键，那页负责改它。
-    val masterOn = remember { prefs.getBoolean(NotificationCenter.KEY_NOTIFY_MASTER, false) }
+    val masterOn by rememberPrefsBoolean(prefs, NotificationCenter.KEY_NOTIFY_MASTER, false)
 
     LaunchedEffect(Unit) { viewModel.tools.refreshNotificationConfig() }
 
@@ -187,7 +189,8 @@ internal fun NotificationScenarioSwitch(
     gateOn: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
-    var enabled by remember { mutableStateOf(prefs.getBoolean(key, defaultEnabled)) }
+    val context = LocalContext.current
+    var enabled by rememberPrefsBoolean(prefs, key, defaultEnabled)
     UfiSettingsItem(
         title = title,
         description = if (gateOn) subtitle else "请先在「通知与守护」中开启「全局通知」",
@@ -199,6 +202,13 @@ internal fun NotificationScenarioSwitch(
                 onCheckedChange = {
                     enabled = it
                     prefs.edit().putBoolean(key, it).apply()
+                    // `:ufi_notify` 只读自己那份 mirror_ 副本，不推快照它会继续按旧值判闸：
+                    // 本地 UI 写的是 ufi_axis_prefs 真源，那个进程读不到（MODE_PRIVATE 无跨进程
+                    // reload），于是出现「本地已开、系统通知却不弹」的假开关。测试通知走
+                    // sendTestNotification 直接 notify、不经分类闸，所以照常；但真实业务通知
+                    // （短信 / 验证码 / 下载等）会被漏掉。这里与 NotifyManageScreen 的告警开关、
+                    // NotificationsGuardScreen 的全局总闸保持一致，显式推一次快照。
+                    NotifyDispatchReceiver.dispatchSwitchSnapshot(context)
                     onSync(coreField, it)
                 }
             )
@@ -222,3 +232,37 @@ internal val DAILY_NOTIFY_SCENES: List<Pair<String, Boolean>> = listOf(
     NotificationCenter.KEY_DOWNLOAD_NOTIF to false,
     NotificationCenter.KEY_TUNNEL_NOTIF to false
 )
+
+/**
+ * 跟随 prefs 变化的布尔开关状态（2026-09-14）。
+ *
+ * 为什么不能用 `remember { prefs.getBoolean(...) }`：这些键的真源在 core，本页
+ * `LaunchedEffect` 里的 `refreshNotificationConfig()` 是**异步**的，回来之后
+ * `NotificationConfigSync.applyRemote` 会用远端值**无条件覆盖**本地 prefs。
+ * 一次性快照读的是进页面那一刻的值，于是出现「屏幕上显示开、闸门读到的已是关」——
+ * 本仓明令禁止的「假开关」，也是用户报「开关明明是开的却收不到通知」时最难自证的一种。
+ *
+ * 监听器覆盖所有写入方（本页 UI、applyRemote、另一端改配置后的回灌），比在若干
+ * 生命周期回调里各补一次重读更难漏。
+ */
+@Composable
+private fun rememberPrefsBoolean(
+    prefs: SharedPreferences,
+    key: String,
+    default: Boolean
+): MutableState<Boolean> {
+    val state = remember(key) { mutableStateOf(prefs.getBoolean(key, default)) }
+    DisposableEffect(prefs, key) {
+        // 进入/重组时先对齐一次：注册前发生的改动监听器收不到
+        state.value = prefs.getBoolean(key, default)
+        // changedKey 为 null 表示整体被清空（clear()），也要重读
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { p, changedKey ->
+            if (changedKey == null || changedKey == key) {
+                state.value = p.getBoolean(key, default)
+            }
+        }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+    return state
+}

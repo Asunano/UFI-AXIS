@@ -42,6 +42,19 @@
             </intent-filter>
         </activity>
 
+        <!-- 独立日志界面：由主界面顶栏「日志」或结果页「查看日志」跳转 -->
+        <activity
+            android:name=".LogActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false" />
+
+        <!-- 开启远程 ADB（引导）：由安装器首页蓝色按钮进入 -->
+        <activity
+            android:name=".remoteadb.RemoteAdbActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|uiMode"
+            android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+
         <!--
           安装前台服务。
           exported=false：只有本应用能触发，避免被外部滥用拉起前台服务。

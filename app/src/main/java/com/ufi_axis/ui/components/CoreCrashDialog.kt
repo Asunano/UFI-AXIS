@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.components.common.ToastMessage
 import com.ufi_axis.ui.components.common.ToastType
 import com.ufi_axis.ui.components.common.UfiDialogBody
@@ -79,13 +80,17 @@ fun CoreCrashDialog(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.End
             ) {
+                // 「知道了」会关掉本弹窗，关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载
+                // 窗口，见 LocalUfiDialogClose。必须在弹窗自己的 content lambda 内部读，
+                // 在弹窗外面读会拿到"直接执行"的默认实现。「复制」不关闭弹窗，因此不包。
+                val close = LocalUfiDialogClose.current
                 TextButton(onClick = {
                     val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     cm.setPrimaryClip(ClipData.newPlainText("UFI-AXIS core crash", detail))
                     onToast(ToastMessage("已复制崩溃信息", ToastType.SUCCESS))
                 }) { Text("复制") }
                 Spacer(Modifier.width(8.dp))
-                TextButton(onClick = onDismiss) { Text("知道了") }
+                TextButton(onClick = { close(onDismiss) }) { Text("知道了") }
             }
         }
     }

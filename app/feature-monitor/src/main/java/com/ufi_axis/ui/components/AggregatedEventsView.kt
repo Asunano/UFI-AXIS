@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.AlertRecord
 import com.ufi_axis.ui.components.common.UfiPagination
 import com.ufi_axis.ui.components.common.UfiPaginationVariant
+import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiScrollableDialog
 import com.ufi_axis.ui.components.common.ufiPageCount
 import com.ufi_axis.ui.theme.LocalResolvedPalette
@@ -262,23 +263,29 @@ fun AlertTypeDetailDialog(
         confirmButton = null,
         dismissButton = null
     ) {
-        // content() 滚动区：只放具体事件卡片列，不含 tag row / 分页条。
-        if (filtered.isEmpty()) {
-            Text(
-                text = "暂无具体事件",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.textSecondary,
-                modifier = Modifier.padding(vertical = 24.dp).fillMaxWidth()
-            )
-        } else {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                slice.forEach { record ->
-                    MonitorEventCard(
-                        alert = record,
-                        onAckOne = onAckOne,
-                        onDelete = onDeleteOne,
-                        modifier = Modifier.padding(vertical = 4.dp)
-                    )
+        // 间距统一到 UfiDialogBody（12dp）：subtitle↔卡片列的呼吸由外壳给，
+        // 卡片列自己是一个语义分组，组内沿用 8dp（= 原先每张卡上下各 4dp 的等效间距）。
+        UfiDialogBody {
+            // content() 滚动区：只放具体事件卡片列，不含 tag row / 分页条。
+            if (filtered.isEmpty()) {
+                Text(
+                    text = "暂无具体事件",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.textSecondary,
+                    modifier = Modifier.padding(vertical = 24.dp).fillMaxWidth()
+                )
+            } else {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                ) {
+                    slice.forEach { record ->
+                        MonitorEventCard(
+                            alert = record,
+                            onAckOne = onAckOne,
+                            onDelete = onDeleteOne
+                        )
+                    }
                 }
             }
         }

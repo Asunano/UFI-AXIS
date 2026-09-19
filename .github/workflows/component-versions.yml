@@ -1,27 +1,37 @@
 # =============================================================================
-# 可选二进制组件版本跟踪（frpc / cloudflared）
+# 可选二进制组件版本跟踪（frpc / cloudflared / ffmpeg）
 # =============================================================================
 # 背景：2026-09-01 起 frpc 与 cloudflared 不再随 core APK 分发（两者解压后合计约 50MB，
-# 曾占 APK 压缩体积的一半）。改为由设备端按需从**上游官方 release 直链**下载，
+# 曾占 APK 压缩体积的一半）；2026-09-19 起 ffmpeg-kit 的 native 层（9 个 .so，约 22MB）
+# 也按同一套机制下发。改为由设备端按需从**上游官方 release 直链**下载，
 # 直链与校验和写在根目录 version.json 的 `components` 段里，由本工作流每天刷新。
 #
 # 为什么不需要配置个人 token（PAT）：
 #   - 匿名调 GitHub API 是「每 IP 每小时 60 次」，而 GitHub 托管 runner 的出口 IP 是共享的，
 #     匿名会偶发 403；
 #   - Actions 自带的 `secrets.GITHUB_TOKEN` 是「每仓库每小时 1000 次」，而本工作流一天只用
-#     2 次请求，绰绰有余。只有在 main 开了分支保护、禁止 GITHUB_TOKEN 推送时才需要换成 PAT。
+#     几次请求，绰绰有余。只有在 main 开了分支保护、禁止 GITHUB_TOKEN 推送时才需要换成 PAT。
 #
-# 校验和来源（组件是要被 execve 执行的二进制，无校验的公网下载一律拒绝安装）：
+# 校验和来源（组件是要被执行/dlopen 的二进制，无校验的公网下载一律拒绝安装）：
 #   - frp     ：官方 release 自带 `frp_sha256_checksums.txt`，直接解析，**不下载二进制**；
 #   - cloudflared：官方没有稳定的校验和文件，只能下载后 sha256sum 自算（约 36MB，几秒）。
-#     注意：这里只算哈希，不重打包也不转存，version.json 里写的仍是上游直链。
+#   - ffmpeg  ：同 cloudflared，下载 aar（约 10MB）后自算。
+#     注意：这三者都只算哈希，不重打包也不转存，version.json 里写的仍是上游直链。
+#
+# ⚠ ffmpeg 与另两个组件的**关键差异**：它是"半个组件"——
+#   Java 层（`core/api/libs/ffmpeg-kit-classes.jar`，57KB）随 APK 分发、在仓库里；
+#   native 层（.so）才走本工作流下发。两层版本必须对齐，否则 JNI 注册对不上。
+#   因此 ffmpeg **不自动跟随上游最新版**：version.json 里的 `version` 是人工 pin 的，
+#   本工作流只负责校验该版本的直链仍然有效并回填 sha256/size；上游出了新版只发提醒，
+#   要升级得先手动换 classes.jar（从新版 aar 里取），再改 version.json 的 version。
 #
 # 设备端消费方式见 core/api/.../components/ComponentManager.kt：
 #   拉 version.json → components.<id> → 镜像前缀（大陆加速）→ 流式下载 + SHA-256 →
-#   tar.gz 则提取 entry → ELF(aarch64) 体检 → 原子安装到 filesDir/components/。
+#   tar.gz 提取 entry / aar 提取 jni/arm64-v8a/*.so → ELF(aarch64) 体检 →
+#   原子安装到 filesDir/components/。
 # =============================================================================
 
-name: Component Versions (frp / cloudflared)
+name: Component Versions (frp / cloudflared / ffmpeg)
 
 on:
   schedule:
@@ -142,6 +152,61 @@ jobs:
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "cloudflared → $VERSION ($ACTUAL_SIZE bytes, 声明 $SIZE)"
 
+      # ── ffmpeg：版本人工 pin（与仓库内 classes.jar 对齐），本步只校验直链 + 回填 sha256 ──
+      #
+      # 与上面两个组件的流程差异见文件头注释：ffmpeg 的 Java 层在仓库里，
+      # 自动升级 .so 会让两层版本错位，所以这里**不读上游 latest 来决定版本**，
+      # 只读 version.json 里 pin 的 version，去拼 tag 与资产名。
+      - name: Track ffmpeg (pinned)
+        run: |
+          set -euo pipefail
+          VERSION="$(jq -r '.components.ffmpeg.version // ""' version.json)"
+          if [ -z "$VERSION" ]; then
+            echo "::error::version.json 缺少 components.ffmpeg.version（这个字段是人工 pin 的，不能为空）"
+            exit 1
+          fi
+          TAG="v${VERSION}-lts-android"
+          NAME="ffmpeg-kit-free71-${VERSION}-arm64-v8a.aar"
+          REL="$(gh api "repos/ffmpegkit-maintained/ffmpeg/releases/tags/${TAG}")"
+          ASSET="$(jq -c --arg n "$NAME" '.assets[] | select(.name == $n)' <<<"$REL" | head -n1)"
+          if [ -z "$ASSET" ]; then
+            echo "::error::$TAG 里没有资产 $NAME（上游改了命名或撤了这个版本）"
+            exit 1
+          fi
+          URL="$(jq -r '.browser_download_url' <<<"$ASSET")"
+
+          CUR_SHA="$(jq -r '.components.ffmpeg.sha256 // ""' version.json)"
+          CUR_URL="$(jq -r '.components.ffmpeg.url // ""' version.json)"
+          if [ -n "$CUR_SHA" ] && [ "$CUR_URL" = "$URL" ]; then
+            echo "ffmpeg 已 pin 在 $VERSION 且 sha256 已回填，跳过下载"
+          else
+            curl -fsSL "$URL" -o /tmp/ffmpeg-kit.aar
+            # 体检：aar 本质是 zip，必须含 arm64-v8a 的 .so，否则设备端解包会拿到空列表
+            SO_COUNT="$(unzip -Z1 /tmp/ffmpeg-kit.aar 'jni/arm64-v8a/*.so' 2>/dev/null | wc -l)"
+            echo "aar 内 arm64-v8a .so 数量：$SO_COUNT"
+            if [ "$SO_COUNT" -lt 1 ]; then
+              echo "::error::aar 内没有 jni/arm64-v8a/*.so（下载到的不是预期产物？）"
+              exit 1
+            fi
+            SHA="$(sha256sum /tmp/ffmpeg-kit.aar | awk '{print $1}')"
+            ACTUAL_SIZE="$(stat -c %s /tmp/ffmpeg-kit.aar)"
+            rm -f /tmp/ffmpeg-kit.aar
+            jq --arg u "$URL" --arg s "$SHA" --argjson z "$ACTUAL_SIZE" \
+              '.components.ffmpeg.url = $u
+               | .components.ffmpeg.sha256 = $s
+               | .components.ffmpeg.size = $z
+               | .components.ffmpeg.archive = "aar"
+               | .components.ffmpeg.entry = "jni/arm64-v8a"' \
+              version.json > version.json.tmp && mv version.json.tmp version.json
+            echo "ffmpeg → $VERSION ($ACTUAL_SIZE bytes, $SO_COUNT 个 .so)"
+          fi
+
+          # 上游有更新只提醒，不自动写入：升级必须连带换掉仓库里的 classes.jar
+          LATEST_TAG="$(gh api repos/ffmpegkit-maintained/ffmpeg/releases/latest --jq '.tag_name' 2>/dev/null || echo "")"
+          if [ -n "$LATEST_TAG" ] && [ "$LATEST_TAG" != "$TAG" ]; then
+            echo "::notice::上游 ffmpeg-kit 最新为 $LATEST_TAG，当前 pin 在 $TAG。升级步骤：从新版 aar 里取 classes.jar 覆盖 core/api/libs/ffmpeg-kit-classes.jar，再把 version.json 的 components.ffmpeg.version 改成新版本号并清空 sha256，本工作流下次运行会自动回填。"
+          fi
+
       - name: Commit version.json if changed
         run: |
           set -euo pipefail
@@ -156,7 +221,8 @@ jobs:
           git add version.json
           FRP_V="$(jq -r '.components.frpc.version' version.json)"
           CF_V="$(jq -r '.components.cloudflared.version' version.json)"
-          git commit -m "ci: 更新可选组件版本（frpc $FRP_V / cloudflared $CF_V）"
+          FF_V="$(jq -r '.components.ffmpeg.version' version.json)"
+          git commit -m "ci: 更新可选组件版本（frpc $FRP_V / cloudflared $CF_V / ffmpeg $FF_V）"
           # 期间可能有人推了别的提交，rebase 后再推
           git pull --rebase origin main
           git push origin HEAD:main

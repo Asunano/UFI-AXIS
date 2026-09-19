@@ -781,6 +781,25 @@ class ZteGoformProfileTest {
         assertNull("空串视为字段缺失", canonicalOnly(FieldGroup.SIGNAL, "network_type" to "")[DeviceFields.Signal.RAT])
     }
 
+    /**
+     * 2026-09-15 真机缺陷：`13` 曾被译成 `TDSCDMA`（原来那张 44 项表是多套厂商编码拼的），
+     * 而客户端按契约不再做二次映射，于是 4G/5G 驻网时界面上直接显示 TDSCDMA。
+     * 现在只留有依据的对应关系，其余数字码走 `未知(原值)` —— 不许再凭猜补表。
+     */
+    @Test
+    fun `network_type 数字码只认已验证的对应关系`() {
+        fun rat(raw: String) = canonicalOnly(FieldGroup.SIGNAL, "network_type" to raw)[DeviceFields.Signal.RAT]
+        assertEquals(JsonPrimitive("4G"), rat("13"))
+        assertEquals(JsonPrimitive("3G"), rat("9"))
+        assertEquals(JsonPrimitive("2G"), rat("4"))
+        assertEquals(JsonPrimitive("5G NSA"), rat("19"))
+        assertEquals(JsonPrimitive("5G"), rat("20"))
+        assertEquals(JsonPrimitive("无服务"), rat("0"))
+        // 没验证过的编码不许猜：显示成 未知(n) 才能一眼看见并补对
+        assertEquals(JsonPrimitive("未知(12)"), rat("12"))
+        assertEquals(JsonPrimitive("未知(16)"), rat("16"))
+    }
+
     @Test
     fun `cell_id 保持字符串以容纳超 Int 的 NCI`() {
         val out = canonicalOnly(FieldGroup.SIGNAL, "Nr_cell_id" to "1234567890123", "cell_id" to "999")

@@ -276,14 +276,26 @@ class WebSocketRepository(
 
     companion object {
         /**
-         * UI 进程默认订阅频道 —— 直接用契约的 [WsChannel.UI_TOPICS]（= core 广播全集去掉
-         * `notification`，因为 core 对同一告警会 `notification` + `alert` 双发，UI 只认 `alert`）。
+         * UI 进程默认订阅频道 = 契约的 [WsChannel.UI_TOPICS] **加上** `notification`。
+         *
+         * 为什么必须加回 `notification`（2026-09-14）：短信 / 验证码这两类推送 core 只广播到
+         * `notification` 一个频道（`PushChannel.SINGLE_TOPIC_SCENES`，不镜像到 `alert`），
+         * 而订阅了 `notification` 的只有 `:ufi_notify`，那个进程又只在「前台服务保活」开启后
+         * 才建 WS（`NotifyService.onStartCommand` 的闸门在 `startBackgroundChannelsIfNeeded` 之前）。
+         * 于是保活关着时短信 / 验证码 / 下载完成的系统通知**一条都发不出来**，而邮件由 core 自己
+         * 发、完全正常 —— 用户看到的就是「开关全开却只有邮件」。主进程订上这个频道后，
+         * 业务类推送经 `NotificationCenter.notify` 的进程门转交给 `:ufi_notify` 发射
+         * （广播会自动拉起那个进程），不再依赖保活。
+         *
+         * 不会造成告警双处理：core 对告警是 `notification` + `alert` 双发，而
+         * `DashboardModule` 的 `notification` 分支**只认业务类** type（sms / verification /
+         * download / tunnel），告警形状的载荷一概忽略，仍由 `alert` 分支独家处理。
          *
          * 注意：core 侧按订阅索引广播（`WebSocketManager.broadcast` 无订阅即静默丢弃），
          * 且采集循环会在 `getConnectionCount() > 0` 时从 60s 提速到 3s —— 订阅越多、连接越久，
          * 设备端采集负载越高，因此后台进程应改用 [NOTIFY_TOPICS]。
          */
-        val DEFAULT_TOPICS = WsChannel.UI_TOPICS
+        val DEFAULT_TOPICS = WsChannel.UI_TOPICS + WsChannel.NOTIFICATION
 
         /**
          * 通知守护进程（`:ufi_notify`）专用频道：只要告警推送（见 [WsChannel.NOTIFY_TOPICS]）。

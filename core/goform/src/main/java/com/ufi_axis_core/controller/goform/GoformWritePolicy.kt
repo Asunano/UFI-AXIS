@@ -19,18 +19,35 @@ internal object GoformWritePolicy {
     const val MAX_ATTEMPTS = 2
 
     /**
-     * 这一次结果要不要再试一次。
+     * 这一次结果要不要因为**会话失效**再试一次。
      *
      * @param attemptNo 刚刚结束的是第几次尝试（从 1 开始）
      *
-     * 判据只有一条：**命令没被固件受理**才重试，也就是只有
-     * [GoformWriteResult.SessionLost]。
-     *  - [GoformWriteResult.Accepted]：设备已经表过态（哪怕 body 里是失败）→ 明确拒绝，
-     *    同样的取值再发一次还是同样的结果，重试只是白等一个往返；
-     *  - [GoformWriteResult.Unreachable]：连不上设备，重试解决不了，应该把真因报给用户。
+     * 判据：命令没被固件受理，也就是只有 [GoformWriteResult.SessionLost]。
+     *  - [GoformWriteResult.Unreachable]：连不上设备，重试解决不了，应该把真因报给用户；
+     *  - [GoformWriteResult.Accepted]：设备已经表过态，body 说失败的那一路由
+     *    [shouldRetryBusinessFailure] 单独判（两者互斥，调用方按顺序问一次）。
      */
     fun shouldRetry(attemptNo: Int, result: GoformWriteResult): Boolean =
         attemptNo < MAX_ATTEMPTS && result is GoformWriteResult.SessionLost
+
+    /**
+     * 幂等写在「设备回了 200 业务体、但 body 说失败」时，要不要重登后再试一次。
+     *
+     * 2026-09-15：原来这一路被无条件当成「设备明确拒绝」，直接 502 +「设备拒绝了本次
+     * 网络制式切换」，不重登也不重试。真机上**每次冷启动后第一次切制式必然命中**它 ——
+     * 固件在会话陈旧时并不总回登录页/非 200，也会回 200 + 业务失败体，于是
+     * [classify] 把它归到 [GoformWriteResult.Accepted]，`isAuthFailure` 也认不出来。
+     * 第二次点就好，正是因为第一次写已经顺带刷新了会话与 goform 快照。
+     *
+     * 为什么重发是安全的：本判定只服务 `goformPostIdempotent`，也就是 `SET_*` 这类
+     * **对同一取值幂等**的设置命令；发短信等非幂等命令走 `goformPost`，压根不进这个循环。
+     *
+     * 上限仍是 [MAX_ATTEMPTS]：真的是参数被拒时，第二次会拿到同样的失败体，然后如实报错。
+     */
+    fun shouldRetryBusinessFailure(attemptNo: Int, result: GoformWriteResult, bodySuccess: Boolean): Boolean =
+        attemptNo < MAX_ATTEMPTS && result is GoformWriteResult.Accepted && !bodySuccess
+
 
     /**
      * HTTP 层结果 → [GoformWriteResult]。

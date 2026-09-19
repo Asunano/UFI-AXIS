@@ -95,6 +95,95 @@ export function breadcrumbSegments(path: string): Crumb[] {
   });
 }
 
+/** 去掉尾部斜杠（`/a/b/` → `/a/b`；根 `/` 保持 `/`）。 */
+export function trimTrailingSlash(p: string): string {
+  const t = p.replace(/\/+$/, '');
+  return t === '' ? '/' : t;
+}
+
+/**
+ * 当前路径所属**卷**的根：内部存储 → `/storage/emulated/0`；SD 卡 → `/storage/XXXX-XXXX`。
+ *
+ * 搜索的「整个存储」档要以卷根为起点（core 的 `/search` 是 `root.walkTopDown()`），
+ * 用 `/` 或 `/storage` 作起点会被 core 的 `safeResolve` 拒绝（不在用户存储白名单内）。
+ */
+export function volumeRootOf(path: string): string {
+  const n = normalizePath(path);
+  if (isPrimaryStoragePath(n)) return PRIMARY_STORAGE;
+  const m = n.match(/^(\/storage\/[^/]+|\/mnt\/media_rw\/[^/]+)/);
+  return m?.[1] ?? PRIMARY_STORAGE;
+}
+
+/** 路径的父目录（与 core `parentOf` 同口径：末段去掉；已到根则返回自身）。 */
+export function parentPathOf(path: string): string {
+  const p = trimTrailingSlash(path);
+  const idx = p.lastIndexOf('/');
+  if (idx < 0) return p;
+  return idx === 0 ? '/' : p.slice(0, idx);
+}
+
+/** 路径末段（显示名）。 */
+export function baseNameOf(path: string): string {
+  const p = trimTrailingSlash(path);
+  const idx = p.lastIndexOf('/');
+  return idx < 0 ? p : p.slice(idx + 1);
+}
+
+/**
+ * 隐藏文件（以 `.` 开头）。
+ *
+ * core `/files/list` 不过滤隐藏项，开关只能做在客户端 —— 所以「显示隐藏文件」
+ * 必须作用在**列表渲染**这一层，而不是重新请求。
+ */
+export function isHiddenName(name: string): boolean {
+  return name.startsWith('.') && name !== '.' && name !== '..';
+}
+
+/**
+ * 在目标目录里挑一个不冲突的名字：`a.txt` → `a (2).txt`。
+ *
+ * 必须做在客户端：core 的 `/copy` 用 `REPLACE_EXISTING` 静默覆盖，
+ * `/move` 遇到已存在直接返回 `success:false`（"目标已存在"）——
+ * 两者都不改名，直接粘贴就会「要么丢数据、要么失败」。
+ *
+ * @param existing 目标目录**当前已有**的名字集合（粘贴过程中新增的也要并入）
+ */
+export function uniqueChildName(existing: Iterable<string>, name: string): string {
+  const taken = new Set(existing);
+  if (!taken.has(name)) return name;
+  // 隐藏文件 `.gitignore` 这类「点在第 0 位」不该被当成扩展名分隔符
+  const dot = name.lastIndexOf('.');
+  const hasExt = dot > 0;
+  const base = hasExt ? name.slice(0, dot) : name;
+  const ext = hasExt ? name.slice(dot) : '';
+  for (let i = 2; i < 1000; i++) {
+    const cand = `${base} (${i})${ext}`;
+    if (!taken.has(cand)) return cand;
+  }
+  return `${base} (${Date.now()})${ext}`;
+}
+
+/**
+ * 搜索结果**所在目录**相对当前目录的展示文案 —— 多级目录下「这个结果到底在哪」的答案。
+ *
+ * 三档刻意分开表述，因为同名文件在不同层级很常见，只说文件名等于没说：
+ *   · 就在当前目录        → 「当前目录」
+ *   · 在当前目录之下      → 相对路径（`Backup` / `Archive/2024`）
+ *   · 在当前目录之上      → `↑ DCIM`（指向上级分支，避免误读成子目录）
+ *   · 不同分支（换了卷）  → `…/两级目录名`
+ */
+export function relativeDirLabel(dir: string, currentPath: string): string {
+  const d = trimTrailingSlash(normalizePath(dir));
+  const c = trimTrailingSlash(normalizePath(currentPath));
+  if (d === c) return '当前目录';
+  if (d.startsWith(`${c}/`)) return d.slice(c.length + 1);
+  if (c.startsWith(`${d}/`)) {
+    return d === PRIMARY_STORAGE ? '↑ 内部存储' : `↑ ${baseNameOf(d)}`;
+  }
+  const parts = d.split('/').filter(Boolean);
+  return `…/${parts.slice(-2).join('/')}`;
+}
+
 export function formatDate(ts: number): string {
   if (!ts) return '--';
   return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
@@ -118,15 +207,52 @@ export function fileMeta(f: FileEntry): string {
 export type FileIconKind = 'dir' | 'image' | 'video' | 'audio' | 'text' | 'archive' | 'apk' | 'doc' | 'file';
 
 const EXT_ICON_KIND: Record<string, FileIconKind> = {
-  jpg: 'image', jpeg: 'image', png: 'image', gif: 'image', svg: 'image', webp: 'image', bmp: 'image',
-  mp4: 'video', mkv: 'video', mov: 'video', m4v: 'video', webm: 'video',
-  mp3: 'audio', wav: 'audio', flac: 'audio', ogg: 'audio', aac: 'audio', m4a: 'audio', opus: 'audio',
-  pdf: 'doc', doc: 'doc', docx: 'doc', xls: 'doc', xlsx: 'doc',
-  zip: 'archive', tar: 'archive', gz: 'archive', rar: 'archive', '7z': 'archive',
+  jpg: 'image',
+  jpeg: 'image',
+  png: 'image',
+  gif: 'image',
+  svg: 'image',
+  webp: 'image',
+  bmp: 'image',
+  mp4: 'video',
+  mkv: 'video',
+  mov: 'video',
+  m4v: 'video',
+  webm: 'video',
+  mp3: 'audio',
+  wav: 'audio',
+  flac: 'audio',
+  ogg: 'audio',
+  aac: 'audio',
+  m4a: 'audio',
+  opus: 'audio',
+  pdf: 'doc',
+  doc: 'doc',
+  docx: 'doc',
+  xls: 'doc',
+  xlsx: 'doc',
+  zip: 'archive',
+  tar: 'archive',
+  gz: 'archive',
+  rar: 'archive',
+  '7z': 'archive',
   apk: 'apk',
-  txt: 'text', log: 'text', json: 'text', md: 'text', yaml: 'text', yml: 'text', toml: 'text',
-  conf: 'text', cfg: 'text', ini: 'text', sh: 'text', py: 'text', js: 'text', ts: 'text',
-  kt: 'text', java: 'text',
+  txt: 'text',
+  log: 'text',
+  json: 'text',
+  md: 'text',
+  yaml: 'text',
+  yml: 'text',
+  toml: 'text',
+  conf: 'text',
+  cfg: 'text',
+  ini: 'text',
+  sh: 'text',
+  py: 'text',
+  js: 'text',
+  ts: 'text',
+  kt: 'text',
+  java: 'text',
 };
 
 function extOf(name: string): string {
@@ -143,10 +269,41 @@ export function fileIconKind(f: FileEntry): FileIconKind {
  * 与 app `FileKind` 的 TEXT 档对齐（svg 单独走图片预览，不在此表）。
  */
 export const TEXT_EDIT_EXTS = [
-  'txt', 'log', 'md', 'csv', 'ini', 'conf', 'cfg', 'prop', 'properties',
-  'json', 'xml', 'yaml', 'yml', 'toml',
-  'html', 'htm', 'css', 'js', 'ts', 'kt', 'kts', 'java', 'gradle',
-  'sh', 'bash', 'zsh', 'py', 'c', 'cpp', 'h', 'hpp', 'go', 'rs', 'sql', 'env',
+  'txt',
+  'log',
+  'md',
+  'csv',
+  'ini',
+  'conf',
+  'cfg',
+  'prop',
+  'properties',
+  'json',
+  'xml',
+  'yaml',
+  'yml',
+  'toml',
+  'html',
+  'htm',
+  'css',
+  'js',
+  'ts',
+  'kt',
+  'kts',
+  'java',
+  'gradle',
+  'sh',
+  'bash',
+  'zsh',
+  'py',
+  'c',
+  'cpp',
+  'h',
+  'hpp',
+  'go',
+  'rs',
+  'sql',
+  'env',
 ];
 
 export function isTextEditable(f: FileEntry): boolean {
@@ -183,8 +340,14 @@ export function canPreview(f: FileEntry): boolean {
   return !f.isDirectory && previewKindOf(f.name || '') !== '';
 }
 
-/** 双击后的「打开」意图：媒体预览 → 文本编辑 → APK 安装 → 解压 → 详情（不可在线打开） */
-export type OpenAction = 'preview' | 'text' | 'install' | 'extract' | 'info' | 'none';
+/**
+ * 双击后的「打开」意图：媒体预览 → 文本编辑 → APK 安装 → 详情（不可在线打开）。
+ *
+ * 刻意**没有** `extract`：压缩包双击只开详情弹窗。解压会改设备文件系统，
+ * 双击这种一碰就触发、又没有确认的手势不该直接执行 —— 与 app 侧
+ * `FileManagerRoot.resolveOpenRoute` 同一条口径（那边 2026-09-15 已改）。
+ */
+export type OpenAction = 'preview' | 'text' | 'install' | 'info' | 'none';
 
 /** 归档类型：可解压的（zip/tar/tar.gz/单文件 gz）返回具体类型，rar/7z 等返回 null。 */
 export function archiveKindOf(name: string): 'zip' | 'tgz' | 'tar' | 'gz' | null {
@@ -206,8 +369,76 @@ export function openActionOf(f: FileEntry): OpenAction {
   if (canPreview(f)) return 'preview';
   if (isTextEditable(f)) return 'text';
   if (extOf(f.name) === 'apk') return 'install';
-  if (canExtract(f)) return 'extract';
+  // 压缩包 / 文档 / 未知扩展名都落这里：详情弹窗里再由主操作按钮触发解压
   return 'info';
+}
+
+/** 「打开」这个动作对该类型的说法，用于菜单首项与详情弹窗主按钮（与 app `openActionLabel` 对齐） */
+export function openActionLabelOf(f: FileEntry): string {
+  if (f.isDirectory) return '进入';
+  switch (previewKindOf(f.name || '')) {
+    case 'image':
+      return '查看图片';
+    case 'video':
+      return '播放视频';
+    case 'audio':
+      return '播放音频';
+  }
+  if (isTextEditable(f)) return '查看 / 编辑';
+  return '详情';
+}
+
+/** 详情弹窗右侧的唯一主操作。`null` = 这个类型没有成立的主操作，弹窗退化成单个「关闭」。 */
+export interface PrimaryFileAction {
+  /** 与 `FilesView.handleAction` 的 key 同一套 */
+  action: string;
+  label: string;
+}
+
+/**
+ * 主操作判定。分支顺序照抄 app 的 `primaryFileAction`：
+ * `canExtract` 在 apk 之前（按文件名后缀判），apk 不给 `open`（那只会把本弹窗再开一次）。
+ *
+ * 不可解压的 rar/7z、pdf 这类文档、未知扩展名一律返回 null：
+ * 宁可少一个按钮，也不放一个点了只会重新挂起同一个弹窗的假按钮。
+ */
+export function primaryFileActionOf(f: FileEntry): PrimaryFileAction | null {
+  if (f.isDirectory) return { action: 'open', label: '进入' };
+  if (canExtract(f)) return { action: 'extract', label: '解压' };
+  if (extOf(f.name) === 'apk') return { action: 'install', label: '安装 APK' };
+  if (canPreview(f) || isTextEditable(f)) return { action: 'open', label: openActionLabelOf(f) };
+  return null;
+}
+
+// ── 搜索范围 ──
+/**
+ * 三档搜索范围。**深度直接映射 core `/search` 的 `depth` 参数**（不是客户端翻目录）：
+ * core 侧 `root.walkTopDown().maxDepth(depth)`，root 自身算第 0 层，所以
+ * depth=1 恰好等于「只看当前目录的直接子项」。
+ *
+ * 上限是 core 的 `MAX_SEARCH_DEPTH = 8`，超出会被夹取 —— 所以「整个存储」用 8，
+ * 而不是想当然的 99。另有两个 core 侧硬限制要如实告知用户：
+ * 单次最多 `MAX_SEARCH_RESULTS = 50` 条、墙钟 `SEARCH_TIMEOUT_MS = 10s`（超时返回已找到的部分）。
+ */
+export type SearchScope = 'dir' | 'sub' | 'volume';
+
+export const SEARCH_SCOPES: { key: SearchScope; label: string; depth: number; hint: string }[] = [
+  { key: 'dir', label: '当前目录', depth: 1, hint: '只看本层' },
+  { key: 'sub', label: '含子目录', depth: 3, hint: '向下 3 层' },
+  { key: 'volume', label: '整个存储', depth: 8, hint: '全卷，最多 50 条' },
+];
+
+/** core `/search` 的两条硬限制，UI 需要如实提示而不是假装没有。 */
+export const SEARCH_MAX_RESULTS = 50;
+export const SEARCH_MAX_DEPTH = 8;
+
+/**
+ * 搜索起点：按范围取「当前目录」或「当前卷根」。
+ * 注意 core 的 `/search?path=` 也会 `safeResolve`，起点不合法会被 400 拒掉，
+ * 所以这里必须给卷根而不是 `/`。
+ */
+export function searchRootFor(scope: SearchScope, currentPath: string): string {
+  return scope === 'volume' ? volumeRootOf(currentPath) : normalizePath(currentPath);
 }
 
 /**

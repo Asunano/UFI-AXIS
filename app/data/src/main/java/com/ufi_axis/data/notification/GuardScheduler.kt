@@ -97,9 +97,14 @@ class GuardScheduler(context: Context, @Suppress("unused") api: com.ufi_axis.dat
      * （闸门读 prefs，顺序反了会被自己刚要打开的开关挡掉）；
      * 关 → `NotificationConfigClient` 实例的 `setForegroundKeepAlive(false)`（撤常驻通知）
      * + `stopKeepAlive`。
+     *
+     * 写完立刻 [syncSchedule]：保活开着时必须取消主进程 Worker（见 syncSchedule），
+     * 关掉时若「后台轮询」仍开着则重新 enqueue。
      */
     fun setForegroundKeepAlive(enabled: Boolean) {
         NotifyPrefs.putSwitch(appContext, NotificationCenter.KEY_GUARD_FOREGROUND_KEEPALIVE, enabled)
+        syncSchedule(appContext)
+        _state.value = readState()
     }
 
     fun isForegroundKeepAlive(): Boolean =
@@ -120,7 +125,14 @@ class GuardScheduler(context: Context, @Suppress("unused") api: com.ufi_axis.dat
         const val MAX_INTERVAL_MINUTES = 60
 
         /**
-         * 按当前偏好把周期任务排上或取消 —— **排期条件是「后台轮询开关 AND 全局通知总闸」**。
+         * 按当前偏好把周期任务排上或取消。
+         *
+         * ## 排期条件
+         * 1. **前台保活开启 → 一律 cancel**：Worker 跑在**主进程**，周期 enqueue 会在后台
+         *    反复拉起主进程（Application 全量初始化 + 内存占用）。保活开着时轮询由
+         *    `:ufi_notify` 的 `NotifyService` 负责（60s/5min），后台不需要主进程。
+         * 2. 保活关闭时：「后台轮询开关 AND 全局通知总闸」才 enqueue（无 FGS 的兜底路径，
+         *    代价是 WorkManager 会唤醒主进程 —— 界面文案已说明「更省电请开前台保活」）。
          *
          * ## 为什么总闸要参与（2026-09-08）
          * 守护的唯一产物就是通知。总闸关着时 Worker 照样每 15/30/60 分钟联网拉 50 条告警，
@@ -130,7 +142,7 @@ class GuardScheduler(context: Context, @Suppress("unused") api: com.ufi_axis.dat
          * ## 为什么做成"每次重算"而不是加一个 `paused_by_master` 持久位
          * 只 `cancel()` 不改 `guard_enabled` 会被自动复活：本类的 `init`、
          * `NotifyService.reloadConfig` 都会按 `guard_enabled` 幂等补 enqueue。
-         * 把两个条件的 AND 收敛到这唯一一处 enqueue/cancel 入口，任何一端改开关后
+         * 把条件收敛到这唯一一处 enqueue/cancel 入口，任何一端改开关后
          * 只要再调一次本方法，结果就是对的，不需要额外状态、也不会互相覆盖。
          *
          * 做成静态是因为 `NotificationConfigSync.applyRemote` 那条路径拿不到实例
@@ -141,6 +153,14 @@ class GuardScheduler(context: Context, @Suppress("unused") api: com.ufi_axis.dat
         fun syncSchedule(context: Context) {
             val app = context.applicationContext
             val workManager = WorkManager.getInstance(app)
+            // 保活开启：轮询归属 :ufi_notify，禁止 WorkManager 周期拉起主进程。
+            val keepAliveOn = NotifyPrefs.switchOn(
+                app, NotificationCenter.KEY_GUARD_FOREGROUND_KEEPALIVE, false
+            )
+            if (keepAliveOn) {
+                workManager.cancelUniqueWork(WORK_NAME)
+                return
+            }
             val guardOn = NotifyPrefs.switchOn(app, NotificationCenter.KEY_GUARD_ENABLED, false)
             val masterOn = NotifyPrefs.switchOn(app, NotificationCenter.KEY_NOTIFY_MASTER, false)
             if (!guardOn || !masterOn) {

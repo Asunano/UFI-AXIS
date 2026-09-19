@@ -47,9 +47,7 @@
         <n-button size="small" quaternary :disabled="readOnly" @click="copyAll">复制全文</n-button>
         <div class="actions-right">
           <n-button @click="emit('update:show', false)">关闭</n-button>
-          <n-button v-if="!readOnly" type="primary" :loading="saving" @click="emit('save')">
-            保存
-          </n-button>
+          <n-button v-if="!readOnly" type="primary" :loading="saving" @click="emit('save')"> 保存 </n-button>
         </div>
       </div>
     </template>
@@ -184,7 +182,8 @@ watch(
   font-variant-numeric: tabular-nums;
 }
 .meta-chip.dirty {
-  color: var(--warning-color, #d4a017);
+  /* --warning-color 从未定义过，此前一直是兜底值在生效，且没有暗色档 */
+  color: var(--warning);
 }
 .meta-hint {
   margin-left: auto;
@@ -198,12 +197,15 @@ watch(
   display: flex;
   width: 100%;
   height: 52vh;
-  min-height: 280px;
+  /* 横屏手机（360×640 → 640×360）下 52vh = 187px，被 280px 下限兜住后
+     280 + 弹窗 chrome ~150px = 430px > 360px 视口 → 整个弹窗溢出。
+     min-height 在横屏降到 180px：虽然只剩 10 行，但至少不会撑出视口。 */
+  min-height: 180px;
   max-height: 640px;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
   overflow: hidden;
-  background: var(--bg-color, #fff);
+  background: var(--surface-elevated);
 }
 
 .gutter {

@@ -121,6 +121,10 @@ media3-extractor = { group = "androidx.media3", name = "media3-extractor", versi
 # 不能用 DefaultHttpDataSource + 静态签名头：/stream 走 AuthMiddleware 校验 X-Nonce 反重放，
 # 静态头会让第二个 Range 请求因 nonce 复用被拒（ExoPlayer 报 2004）。
 media3-datasource-okhttp = { group = "androidx.media3", name = "media3-datasource-okhttp", version.ref = "media3" }
+# MediaSession：音乐播放要向系统广播"正在播什么"（锁屏/通知栏/快捷设置的媒体控制、耳机按键）。
+# 走 media3-session 的 MediaSessionService 而不是自己发 MediaStyle 通知：通知、播放状态同步、
+# 媒体按键路由都由它维护，自己搓一份必然与播放器状态漂移。
+media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
 
 # ── LeakCanary (App, debug-only) ──
 leakcanary-android = { group = "com.squareup.leakcanary", name = "leakcanary-android", version.ref = "leakcanary" }

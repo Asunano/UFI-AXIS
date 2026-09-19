@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.*
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -111,8 +112,12 @@ fun UfiPasswordField(
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
-        label = { if (label.isNotBlank()) Text(label) },
-        placeholder = placeholder?.let { { Text(it) } },
+        // 空 label 必须是真 null，否则 placeholder 在未聚焦时被 M3 隐藏（详见 UfiTextField）
+        label = if (label.isNotBlank()) ({ Text(label) }) else null,
+        // placeholder 永远单行（理由见 UfiTextField 里同一处注释）
+        placeholder = placeholder?.let {
+            { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        },
         singleLine = true,
         isError = isError,
         enabled = enabled,
@@ -188,8 +193,18 @@ fun UfiTextField(
         OutlinedTextField(
             value = value,
             onValueChange = onValueChange,
-            label = { if (label.isNotBlank()) Text(label) },
-            placeholder = placeholder?.let { { Text(it) } },
+            // ⚠️ label 为空时必须传**真 null**，不能传"什么都不画的 lambda"（2026-09-18 修）：
+            // M3 判定"这个字段有浮动 label"看的是 `label != null`，而不是 label 里有没有内容。
+            // 传非空 lambda 时 `showExpandedLabel = true`，于是
+            // `placeholderOpacity(UnfocusedEmpty) = 0f` —— 表现就是"框空着看不到提示，
+            // 一聚焦提示才冒出来"。项目里标签一律由 UfiDialogField 画在框外（label = ""），
+            // 所以这条影响所有弹窗输入框。
+            label = if (label.isNotBlank()) ({ Text(label) }) else null,
+            // placeholder 永远单行：它是提示而不是正文，换行会把输入框顶高、
+            // 在窄容器（如搜索行里 weight(1f) 的输入框）里还会把整行布局撑乱（2026-09-19）。
+            placeholder = placeholder?.let {
+                { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+            },
             singleLine = singleLine,
             minLines = minLines,
             maxLines = maxLines,
@@ -218,8 +233,12 @@ fun UfiTextField(
             if (next.text != value) onValueChange(next.text)
             onSelectionChange(next.selection)
         },
-        label = { if (label.isNotBlank()) Text(label) },
-        placeholder = placeholder?.let { { Text(it) } },
+        // 同上：空 label 必须是真 null，否则 placeholder 在未聚焦时被 M3 隐藏
+        label = if (label.isNotBlank()) ({ Text(label) }) else null,
+        // placeholder 永远单行（理由见 UfiTextField 里同一处注释）
+        placeholder = placeholder?.let {
+            { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        },
         singleLine = singleLine,
         minLines = minLines,
         maxLines = maxLines,
@@ -257,8 +276,12 @@ fun UfiDigitField(
     OutlinedTextField(
         value = value,
         onValueChange = { onValueChange(it.filter { c -> c.isDigit() }.take(maxLength)) },
-        label = { if (label.isNotBlank()) Text(label) },
-        placeholder = placeholder?.let { { Text(it) } },
+        // 空 label 必须是真 null，否则 placeholder 在未聚焦时被 M3 隐藏（详见 UfiTextField）
+        label = if (label.isNotBlank()) ({ Text(label) }) else null,
+        // placeholder 永远单行（理由见 UfiTextField 里同一处注释）
+        placeholder = placeholder?.let {
+            { Text(it, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+        },
         trailingIcon = trailingIcon,
         singleLine = true,
         isError = isError,

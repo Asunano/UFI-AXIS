@@ -68,7 +68,16 @@ object NotifyPrefs {
         // 这个进程还会继续弹。默认值与 `NotifyScene.SMS/VERIFICATION_CODE.defaultEnabled` 一致（2026-09-07 起同为 false）。
         // 2026-09-07：两者默认改为 false（用户要求日常通知不默认开启）。
         NotificationCenter.KEY_SMS_NOTIF to false,
-        NotificationCenter.KEY_VERIFICATION_NOTIF to false
+        NotificationCenter.KEY_VERIFICATION_NOTIF to false,
+        // 2026-09-13：验证码自动复制开关。必须镜像给 `:ufi_notify`，
+        // 否则该进程在 WebSocket 收到验证码时不知道该不该执行后台复制逻辑。
+        NotificationCenter.KEY_SMS_CODE_AUTO_COPY to false,
+        // 2026-09 收束：状态栏通知唯一发射进程。其余分类开关也必须镜像，
+        // 否则主进程改完开关后 :ufi_notify 仍按旧值/默认值判闸。
+        NotificationCenter.KEY_CONNECTIVITY_NOTIF to false,
+        NotificationCenter.KEY_DOWNLOAD_NOTIF to false,
+        NotificationCenter.KEY_TRAFFIC_80_NOTIF to false,
+        NotificationCenter.KEY_DEVICE_EVENTS_NOTIF to false
     )
 
     /** 日志开关 key（与 `com.ufi_axis.util.AppPreferences` / core `AppSettings` 逐字一致）。 */

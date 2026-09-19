@@ -98,6 +98,10 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                     modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
                 )
             }
+            // 只显示隧道自己的组件：`/api/components` 是通用端点，里面还有 ffmpeg 这种
+            // 服务其它功能的组件，它们的安装入口在各自的功能设置页（ffmpeg → 媒体 → 视频设置），
+            // 混在这里会让用户以为"装了才能用隧道"。
+            val tunnelComponents = state.components.filter { it.id in TUNNEL_COMPONENT_IDS }
             UfiSettingsGroup {
                 // 「检查更新」放标题右侧：它是这一组的次要动作，摆在卡片底部当通栏按钮
                 // 会被误认成主操作，而且卡片越长它离标题越远。
@@ -115,14 +119,14 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                         )
                     }
                 }
-                if (state.components.isEmpty()) {
+                if (tunnelComponents.isEmpty()) {
                     Text(
                         if (manifestLoading) "正在获取组件清单…" else "没读到组件信息，可点右上角「检查更新」重试；未安装 frpc / cloudflared 前对应隧道无法启动。",
                         style = UfiTextStyles.note,
                         color = palette.textSecondary
                     )
                 }
-                state.components.forEachIndexed { index, c ->
+                tunnelComponents.forEachIndexed { index, c ->
                     if (index > 0) UfiDivider()
                     UfiSettingsItem(
                         title = c.name,
@@ -310,6 +314,14 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
         )
     }
 }
+
+/**
+ * 本页「核心组件」只管隧道自己的二进制。
+ *
+ * `/api/components` 是通用端点，清单里还有服务其它功能的组件（ffmpeg → 视频封面抽帧），
+ * 它们的安装入口在各自的功能设置页，不在这里露出。
+ */
+private val TUNNEL_COMPONENT_IDS = setOf("frpc", "cloudflared")
 
 /**
  * 组件副标题：已装看占用与来源，未装看需下载多少。
