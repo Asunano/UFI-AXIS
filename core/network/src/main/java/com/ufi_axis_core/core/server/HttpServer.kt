@@ -81,20 +81,60 @@ class HttpServer(
      * 可空只为兼容尚未装配它的调用方；播放字节流仍由 [fileRoutes] 的 `/api/files/stream` 提供。
      */
     private val mediaRoutes: com.ufi_axis_core.api.routes.MediaRoutes? = null,
+    /**
+     * 音频歌单（`/api/playlists`，2026-09-21）：歌单本身的 CRUD + 曲目增删/重排。
+     * 曲目回查依赖 [mediaRoutes]（它实现了 `AudioItemLookup`），所以装配顺序上要在它之后。
+     */
+    private val playlistRoutes: com.ufi_axis_core.api.routes.PlaylistRoutes? = null,
     /** 天气（`/api/weather`，2026-09-17）：代理 Open-Meteo + TTL 缓存。可空同上。 */
     private val weatherRoutes: com.ufi_axis_core.api.routes.WeatherRoutes? = null,
     /** 今日诗词（`/api/poetry`，2026-09-18）：代理 jinrishici v2 + TTL 缓存。可空同上。 */
     private val poetryRoutes: com.ufi_axis_core.api.routes.PoetryRoutes? = null,
     /** 出网国家/地区（`/api/geo`，2026-09-18）：结果存 settings，检测由 core 启动时触发。可空同上。 */
-    private val geoRoutes: com.ufi_axis_core.api.routes.GeoRoutes? = null
+    private val geoRoutes: com.ufi_axis_core.api.routes.GeoRoutes? = null,
+    /**
+     * 远程存储源管理（`/api/storage/sources`，阶段 2-4）：FTP / WebDAV 配置的 CRUD + 连接测试。
+     * 文件操作本身仍走 [fileRoutes]（路径带 `remote:<sourceId>/` 前缀由 FileProviderRegistry 分发），
+     * 这里只管配置与 provider 注册，可空同上。
+     */
+    private val storageSourceRoutes: com.ufi_axis_core.api.routes.StorageSourceRoutes? = null
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB（普通路由：防滥用 + 内存安全）
-        private const val FILE_UPLOAD_BODY_SIZE = 200L * 1024 * 1024  // 文件管理器上传上限 200MB
+
+        /**
+         * 文件管理器上传上限。**引用 [com.ufi_axis_core.api.routes.FileRoutes.UPLOAD_BODY_LIMIT]，
+         * 不另写字面量** —— 理由与下面 [BACKUP_UPLOAD_BODY_SIZE] 完全一致（见其 KDoc）。
+         * 2026-09-19 从这里的 200MB 字面量改成引用：`/api/files/status` 现在会把这个值
+         * 下发给客户端做入队前预检，三处（HTTP 层 / 路由层 / 客户端）必须是同一个数。
+         */
+        private val FILE_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.FileRoutes.UPLOAD_BODY_LIMIT
+
+        /**
+         * 单个上传分片的上限。同样引用路由层常量：分片大小由 `/files/status` 下发，
+         * 客户端按它切片，HTTP 层的闸门必须留在同一侧。
+         */
+        private val CHUNK_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.FileRoutes.CHUNK_BODY_LIMIT
+
         private const val FALLBACK_UPLOAD_BODY_SIZE = 100L * 1024 * 1024  // 兜底 100MB（清单未知时）
-        private const val WEB_UPDATE_BODY_SIZE = 50L * 1024 * 1024  // Web 资源 ZIP 上传上限 50MB
-        // 可选二进制组件本地上传上限：cloudflared 裸二进制约 36MB，留足余量
-        private const val COMPONENT_UPLOAD_BODY_SIZE = 96L * 1024 * 1024
+
+        /**
+         * Web 资源 ZIP 上传上限。**引用 [com.ufi_axis_core.api.routes.WebUpdateRoutes.MAX_ZIP_UPLOAD]**，
+         * 不再自己写一份 50MB —— 2026-09-19 修：两处各存一个数早晚分叉，理由同下面的
+         * [BACKUP_UPLOAD_BODY_SIZE]（见其 KDoc 里那段"路由层按 8MB 设计、HTTP 层按 512KB 拦"）。
+         */
+        private val WEB_UPDATE_BODY_SIZE =
+            com.ufi_axis_core.api.routes.WebUpdateRoutes.MAX_ZIP_UPLOAD
+
+        /**
+         * 可选二进制组件本地上传上限。同样改为引用路由层常量
+         * （[com.ufi_axis_core.api.routes.ComponentRoutes.MAX_UPLOAD_BYTES]），
+         * 该值现在也经 `GET /api/components` 下发给客户端做入队前预检，三处必须是同一个数。
+         */
+        private val COMPONENT_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.ComponentRoutes.MAX_UPLOAD_BYTES
 
         /**
          * backup 前缀下各端点的请求体上限。
@@ -135,6 +175,9 @@ class HttpServer(
             val limit = when {
                 path.startsWith("/api/update/upload") -> updateRoutes.uploadLimitBytes()
                 path.startsWith("/api/web/update") -> WEB_UPDATE_BODY_SIZE
+                // 分片必须排在 /api/files/upload 之前：后者是前缀，会把 chunk 也吞掉，
+                // 那样单片就被按 200MB 放行了（虽然不至于出错，但闸门形同虚设）
+                path.startsWith("/api/files/upload/chunk") -> CHUNK_UPLOAD_BODY_SIZE
                 path.startsWith("/api/files/upload") -> FILE_UPLOAD_BODY_SIZE
                 path.startsWith("/api/backup") -> BACKUP_UPLOAD_BODY_SIZE
                 path.startsWith("/api/components/") && path.endsWith("/upload") -> COMPONENT_UPLOAD_BODY_SIZE
@@ -566,7 +609,9 @@ class HttpServer(
                 consoleRoutes?.register(this)
                 backupRoutes?.register(this)
                 fileRoutes.register(this)
+                storageSourceRoutes?.register(this)
                 mediaRoutes?.register(this)
+                playlistRoutes?.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)
                 smsForwardRoutes?.register(this)

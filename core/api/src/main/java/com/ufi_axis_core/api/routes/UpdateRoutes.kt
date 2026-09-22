@@ -32,7 +32,13 @@ import java.net.URL
 class UpdateRoutes(
     private val updateManager: UpdateManager
 ) {
-    /** 上传接口动态请求体上限（透传 UpdateManager：清单 apkSize×1.2+10MB 缓冲，未知回落 100MB） */
+    /**
+     * 上传接口动态请求体上限（透传 [UpdateManager.uploadLimitBytes]）。
+     *
+     * 当前口径：清单 apkSize × 1.5 + 20MB，下限 50MB，清单未知时回落 200MB。
+     * 具体数字与调整理由见那个方法的 KDoc —— **不要在这里重复写数字**，
+     * 2026-09-19 就是因为两处各写一份，这里的注释还停在早已改掉的 `×1.2+10MB / 100MB`。
+     */
     fun uploadLimitBytes(): Long = updateManager.uploadLimitBytes()
 
     private val UPDATE_DIR = "/sdcard/Download/UFI-AXIS/update"
@@ -331,12 +337,23 @@ class UpdateRoutes(
     }
 }
 
-/** UpdateStatus → JSON map（供路由与前端展示；state 统一小写以匹配前端状态机约定） */
+/**
+ * UpdateStatus → JSON map（供路由与前端展示；state 统一小写以匹配前端状态机约定）
+ *
+ * `upload_limit_bytes`（2026-09-19 新增）：APK 上传上限是**动态值**
+ * （[UpdateManager.uploadLimitBytes] 按清单 apkSize 算），客户端无法硬编码。
+ *
+ * 不下发的后果是前端只能盲传。服务端的 413 虽然在 `onCall` 阶段就抛、并没有真的收下
+ * 整个包，但 HTTP 的现实是客户端在没有 `Expect: 100-continue` 协商时请求头发出后就无条件
+ * 开始推 body，而浏览器要等 body 发完才去处理响应 —— 于是进度条一路跑到 100% 才报错，
+ * 几十 MB 的上行带宽白烧。下发之后前端在**选文件时**就能挡住。
+ */
 fun UpdateManager.statusToMap(): Map<String, Any?> = mapOf(
     "state" to status.state.name.lowercase(),
     "progress" to status.progress,
     "message" to status.message,
     "current_version" to status.currentVersion,
     "latest_version" to status.latestVersion,
-    "apk_path" to status.apkPath
+    "apk_path" to status.apkPath,
+    "upload_limit_bytes" to uploadLimitBytes()
 )

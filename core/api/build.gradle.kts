@@ -56,18 +56,19 @@ dependencies {
     // Room Database (for AppDatabase subclasses)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
-
-    // FFmpeg-kit（maintained fork，free71 变体，仅 arm64）——**只要 Java 层**
-    //
-    // 这里入库的是从上游 aar 里抽出来的 classes.jar（57KB），不是整份 aar（10MB）：
-    //  · Java 层（FFmpegKit / FFmpegSession…）必须在 APK 里 —— native 方法是注册在
-    //    这些类上的，缺了它就算 .so 装好也拿不到入口（ClassNotFoundException）；
-    //  · native 层（9 个 .so，解包后约 22MB）走插件式组件按需下载，装到
-    //    filesDir/components/ffmpeg/，运行时 System.load(绝对路径) 按依赖顺序加载。
-    //
-    // 为什么不直接依赖 aar：aar 被 .gitignore 挡在仓库外（体积），CI 全新 checkout
-    // 会因找不到 artifact 直接编译失败；jar 小到可以入库，且天然不带 jni/ 目录。
-    implementation(files("libs/ffmpeg-kit-classes.jar"))
+    // OkHttp (for WebDAV provider)
+    implementation(libs.okhttp.core)
+    // Apache Commons Net (for FTP provider)
+    implementation("commons-net:commons-net:3.11.1")
+    // smbj (for SMB/CIFS provider) —— 与 commons-net 同口径用字面量声明，未进版本目录
+    // 排掉 bouncycastle：smbj 自带 bcprov-jdk18on:1.75，而 :core:common 的 jcifs-ng 已经带了
+    // bcprov-jdk15on:1.69，两个 artifact 装的是同一批 org.bouncycastle 类，同时进包会在
+    // checkBenchmarkDuplicateClasses 直接失败（几千条 Duplicate class）。
+    // 保留旧的那份而不是反过来：1.69 是 jcifs-ng 验证过的版本，而 smbj 只用到 crypto 原语
+    // （MD4/MD5/HMac/AES-CCM/GCM），1.69 全都有，让新依赖去适配存量比反过来安全。
+    implementation("com.hierynomus:smbj:0.13.0") {
+        exclude(group = "org.bouncycastle")
+    }
 
     // ===== 单元测试（QA 新增，仅 test 作用域，不影响正式构建） =====
     testImplementation(libs.junit)

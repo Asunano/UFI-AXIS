@@ -1,5 +1,6 @@
 package com.ufi_axis.data.api
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import com.ufi_axis.data.model.*
@@ -27,6 +28,18 @@ interface UfiAxisApi {
 
     @GET("api/device/version")
     suspend fun getDeviceVersion(): DeviceVersionResponse
+
+    /**
+     * EPS 承载 QoS（QCI / 上下行 AMBR，2026-09-22）。
+     *
+     * core 侧走 `AT+CGEQOSRDP`，5 分钟缓存。**不要放进仪表盘的 10s 轮询** ——
+     * AT 通道全局互斥，抢锁超时会把整张仪表盘一起拖住。进页面静默拉一次就够
+     * （`DashboardModule.loadDeviceQosSilently`，与固件版本同一手法）。
+     *
+     * AT 不可用时仍回 200 + `available = false`，不抛异常。
+     */
+    @GET("api/device/qos")
+    suspend fun getDeviceQos(): DeviceQosResponse
 
     @GET("api/device/model")
     suspend fun getDeviceModel(): DeviceModel
@@ -100,6 +113,20 @@ interface UfiAxisApi {
      * @param type [MEDIA_TYPE_VIDEO] / [MEDIA_TYPE_AUDIO] / [MEDIA_TYPE_IMAGE]
      * @param sort `date`（默认）/ `name` / `size`
      * @param order `desc`（默认）/ `asc`
+     * @param album 只列这个专辑（**仅音频**，取 [getMediaGroups] 回的 key 原值）
+     * @param artist 只列这个歌手（**仅音频**）
+     * @param dir 只列这个目录（**仅音频**，目录绝对路径）
+     *
+     * 后三个是 2026-09-20 为音频分组回查加的，与 core 侧的扫描目录过滤是 **AND** 关系
+     * （超出扫描范围的专辑筛不出东西是预期行为）。传空串等于没传 —— core 按"参数缺失"处理，
+     * 会回整库，所以分组里 key 为空串的那一组不能走这条路回查。
+     *
+     * ## 后三个必须传**已编码**的值（`encoded = true`，2026-09-21 修"专辑里没有歌"）
+     * Retrofit 默认会帮忙编码，但它底层的 OkHttp 在 query 里**不编码 `+`** ——
+     * 而 Ktor 解 query 时按 form 语义把 `+` 当空格。于是专辑名 `万岁2001 新曲+精选`
+     * 传到 core 变成 `万岁2001 新曲 精选`，一条曲目都匹配不上。
+     * 现在由调用方用 `encodeUriComponent` 编好（它把 `+` 编成 `%2B`、空格编成 `%20`），
+     * 这里只负责原样带上。调用点见 `MediaModule.groupFilters`。
      */
     @GET("api/media/list")
     suspend fun getMediaList(
@@ -107,8 +134,25 @@ interface UfiAxisApi {
         @Query("sort") sort: String? = null,
         @Query("order") order: String? = null,
         @Query("limit") limit: Int? = null,
-        @Query("offset") offset: Int? = null
+        @Query("offset") offset: Int? = null,
+        @Query("album", encoded = true) album: String? = null,
+        @Query("artist", encoded = true) artist: String? = null,
+        @Query("dir", encoded = true) dir: String? = null
     ): MediaListResponse
+
+    /**
+     * 按专辑 / 歌手 / 文件夹聚合音频（`type` 只支持 [MEDIA_TYPE_AUDIO]）。
+     *
+     * 与 [getMediaList] 的分工：这个回"有哪些组"（不分页，core 一次算完），
+     * 点进某一组再用 [getMediaList] 的 album / artist / dir 回查组内曲目。
+     *
+     * @param by [MEDIA_GROUP_ALBUM] / [MEDIA_GROUP_ARTIST] / [MEDIA_GROUP_FOLDER]
+     */
+    @GET("api/media/groups")
+    suspend fun getMediaGroups(
+        @Query("type") type: String,
+        @Query("by") by: String
+    ): MediaGroupsResponse
 
     /**
      * 按目录列一层（媒体库的文件夹视图）：子目录 + 这一层的媒体文件。
@@ -124,17 +168,6 @@ interface UfiAxisApi {
         @Query("sort") sort: String? = null,
         @Query("order") order: String? = null
     ): MediaBrowseResponse
-
-    /**
-     * 设备端 ffmpeg 自检。
-     *
-     * 传 [path] 时 core 会**真的对那个文件抽一帧**并计时（不落缓存），用来判断
-     * "设备自己生成缩略图" 这条路是否实用；不传就只回库的可用性与版本。
-     */
-    @GET("api/media/ffmpeg-status")
-    suspend fun getMediaFfmpegStatus(
-        @Query("path") path: String? = null
-    ): MediaFfmpegStatusResponse
 
     /** 读某一类的扫描目录。 */
     @GET("api/media/config")
@@ -171,6 +204,46 @@ interface UfiAxisApi {
     suspend fun getMediaLyrics(@Query("id") id: Long): MediaLyricsResponse
 
     /**
+     * 某个视频可用的**外挂字幕**（`.srt` / `.ass` / `.vtt` …）。
+     *
+     * [scope]：
+     *  · 省略或 `matched` —— 只回按文件名判定属于这个视频的，用于"打开就自动挂上字幕"；
+     *  · `folder` —— 回同目录**全部**字幕，用于"手动选字幕文件"的列表
+     *    （现实里字幕名常和视频名对不上：压制组命名、单独下载的字幕包）。
+     *
+     * 匹配规则写在 core（`subtitleBelongsTo`），客户端不复制一份 —— 两个播放入口
+     * 各写一遍必然分叉。
+     *
+     * 字幕**内容**不在这里取：见 `api/media/subtitle?path=`，那条会把 GB18030/Big5
+     * 统一转成 UTF-8（播放器只认 UTF-8），所以必须走 core 而不是直接拉 `/files/stream`。
+     */
+    @GET("api/media/subtitles")
+    suspend fun getMediaSubtitles(
+        @Query("path") path: String,
+        @Query("scope") scope: String? = null
+    ): MediaSubtitlesResponse
+
+    /**
+     * 清空**设备侧**的缩略图缓存。
+     *
+     * ## 为什么必须有这一条
+     * 缩略图一共三层缓存，缺了它就有一层永远清不掉：
+     *  1. 图片加载库（磁盘 + 内存，按 URL 命中）；
+     *  2. App 自己抽帧的成果（`media-thumbs/`）；
+     *  3. **设备上客户端回传的成果**（core 的 `filesDir/thumbs/`）← 本条清的是这层。
+     *
+     * `/thumbnail` 是"缓存命中就直接返回"，而 URL 只含 (type, id) 不含内容指纹。
+     * 于是一张算错的图（典型：抽到黑场）会一直被原样发下去 ——
+     * 只清前两层的话，再次请求又被设备上的旧图命中，表现就是"怎么清都还是那张黑图"。
+     *
+     * [type] 省略清全部；给了只清那一类（换抽帧策略时通常只需重算 video）。
+     */
+    @DELETE("api/media/thumbnail-cache")
+    suspend fun clearMediaThumbnailCache(
+        @Query("type") type: String? = null
+    ): JsonElement
+
+    /**
      * 单首音频的标签（曲名 / 艺术家 / 专辑 / 时长）。
      *
      * `/list` 里已经带了同名字段（来自系统扫描），这一条是**缺失时的补强**：
@@ -188,6 +261,78 @@ interface UfiAxisApi {
      */
     @POST("api/files/stream-ticket")
     suspend fun createStreamTicket(@Body body: StreamTicketRequest): StreamTicketResponse
+
+    // ========== 音频歌单（2026-09-21）==========
+    //
+    // 歌单存在 core，app 与 web 看同一份。曲目以**真实路径**为标识（MediaStore id 重扫会变，
+    // 拿它存歌单等于存一个会失效的引用），所以写操作传的都是 paths。
+
+    /** 全部歌单（不含曲目明细）。 */
+    @GET("api/playlists")
+    suspend fun getPlaylists(): PlaylistsResponse
+
+    /**
+     * 某个歌单的曲目。
+     *
+     * 回的 item 与 [getMediaList] 的完全同构（多一个 `missing`），所以曲目列表组件可以直接复用。
+     * **顺序就是播放顺序** —— 不要再按音乐页的排序偏好重排；已失效的条目照样在列表里
+     * （`missing = true`，`id = 0`），画占位而不是隐藏。
+     */
+    @GET("api/playlists/{id}/items")
+    suspend fun getPlaylistItems(@Path("id") id: String): PlaylistItemsResponse
+
+    /** 新建歌单。id 由 core 生成 —— 客户端传 id 不被接受。 */
+    @POST("api/playlists")
+    suspend fun createPlaylist(@Body body: PlaylistNameRequest): PlaylistCreateResponse
+
+    /** 重命名。同名（忽略大小写）会被 core 以 409 `ALREADY_EXISTS` 拒绝。 */
+    @PUT("api/playlists/{id}")
+    suspend fun renamePlaylist(
+        @Path("id") id: String,
+        @Body body: PlaylistNameRequest
+    ): JsonElement
+
+    @DELETE("api/playlists/{id}")
+    suspend fun deletePlaylist(@Path("id") id: String): JsonElement
+
+    /**
+     * 加歌。不在媒体库里的路径会被 core 跳过并计入 `skipped`（不会变成一条坏数据）。
+     * `position` 省略即追加到尾部。
+     */
+    @POST("api/playlists/{id}/items")
+    suspend fun addPlaylistItems(
+        @Path("id") id: String,
+        @Body body: PlaylistPathsRequest
+    ): PlaylistAddResponse
+
+    /**
+     * 移出曲目。
+     *
+     * 走**重复 query 参数**（`?path=a&path=b`）而不是 DELETE 带 body：Retrofit 的 `@DELETE`
+     * 不允许 `@Body`（要加就得换成 `@HTTP(hasBody=true)`），而带 body 的 DELETE 在部分代理上
+     * 还会被丢掉。core 两种写法都收（web 侧用的是 body）。
+     *
+     * `paths` 必须是**已编码**的值（`encoded = true`），理由同 [getMediaList] 的 album/artist/dir：
+     * OkHttp 在 query 里不编码 `+`，而 Ktor 解 query 时把 `+` 当空格 —— 路径含 `+` 的曲目
+     * （`C++.mp3`、`新曲+精选/…`）会因此永远移不掉，只回「已移出 0 首」。
+     * 调用方用 `encodeUriComponent` 编好再传。
+     */
+    @DELETE("api/playlists/{id}/items")
+    suspend fun removePlaylistItems(
+        @Path("id") id: String,
+        @Query("path", encoded = true) paths: List<String>
+    ): PlaylistRemoveResponse
+
+    /**
+     * 整表重排：`paths` 是新的完整顺序。
+     *
+     * 语义是「只调顺序，不增不删」—— 不在歌单里的 path 被忽略，没提到的条目留在尾部。
+     */
+    @PUT("api/playlists/{id}/items")
+    suspend fun reorderPlaylistItems(
+        @Path("id") id: String,
+        @Body body: PlaylistPathsRequest
+    ): JsonElement
 
     // ========== Weather（2026-09-17，core 代理 Open-Meteo）==========
 
@@ -540,6 +685,14 @@ interface UfiAxisApi {
     // ========== SMS / SIM Actions ==========
     @POST("api/sms/delete")
     suspend fun deleteSms(@Body body: Map<String, String>): SmsActionResponse
+
+    /** 按号码删除整段会话（2026-09-21）。 */
+    @POST("api/sms/delete-conversation")
+    suspend fun deleteConversation(@Body body: Map<String, String>): SmsActionResponse
+
+    /** 批量删除多条短信（2026-09-21）。 */
+    @POST("api/sms/delete-batch")
+    suspend fun deleteBatch(@Body body: Map<String, @JvmSuppressWildcards Any>): SmsActionResponse
 
     @POST("api/sms/read")
     suspend fun markSmsRead(@Body body: Map<String, String>): SmsActionResponse
@@ -1111,6 +1264,58 @@ interface UfiAxisApi {
     @POST("api/files/checksum")
     suspend fun checksumFile(@Body body: Map<String, String>): ArchiveChecksumResponse
 
+    // ── 远端上传的第二阶段：core 暂存 → 外部存储源 ──
+    // 第一阶段（手机 → core）走 `upload/session|chunk|complete`，那条链路是裸 OkHttp
+    // （要按偏移切片、逐字节推进度，见 ChunkedFileUploader）。第二阶段只是查状态与下指令，
+    // 走 Retrofit 即可，不必再手搓。
+
+    /** 列出推送作业（新的在前，含 6 小时内的已完成/失败记录）。UI 靠轮询它驱动任务面板。 */
+    @GET("api/files/remote-push")
+    suspend fun listRemotePushJobs(): RemotePushListResponse
+
+    /** 取消在途作业。已结束的作业回 `success:false`（正常竞态，不是错误）。 */
+    @DELETE("api/files/remote-push")
+    suspend fun cancelRemotePushJob(@Query("job") jobId: String): SuccessResponse
+
+    /** 重试失败/已取消的作业：body { job_id }。暂存文件已被清理时 core 回 409。 */
+    @POST("api/files/remote-push/retry")
+    suspend fun retryRemotePushJob(@Body body: Map<String, String>): SuccessResponse
+
+    /** 清掉所有已结束的记录（失败作业的暂存文件一并删除）。 */
+    @POST("api/files/remote-push/clear")
+    suspend fun clearRemotePushJobs(): SuccessResponse
+
+    // ========== External Storage Sources ==========
+    //
+    // 外部存储源（FTP / WebDAV）的增删改查。这里**只管配置**：真正的列目录 / 读写
+    // 仍然走上面那套 `/api/files/*`，路径写成 `remote:<sourceId>/<相对路径>`，
+    // core 侧按前缀派发给对应 provider。也就是说 app 不需要第二套文件 API，
+    // 远端与本地在文件层面是同一条链路（见 [FileItem.source]）。
+
+    @GET("api/storage/sources")
+    suspend fun listStorageSources(): StorageSourcesResponse
+
+    @GET("api/storage/sources/{id}")
+    suspend fun getStorageSource(@Path("id") id: String): StorageSourceInfo
+
+    @POST("api/storage/sources")
+    suspend fun addStorageSource(@Body body: StorageSourceRequest): StorageSourceMutationResponse
+
+    /** 改配置。`password` 传 `"********"` 表示「不动原密码」（core 侧约定，响应里也从不回密码）。 */
+    @PUT("api/storage/sources/{id}")
+    suspend fun updateStorageSource(@Path("id") id: String, @Body body: StorageSourceRequest): SuccessResponse
+
+    @DELETE("api/storage/sources/{id}")
+    suspend fun deleteStorageSource(@Path("id") id: String): SuccessResponse
+
+    /** 测已保存的源（用库里那份密码）。 */
+    @POST("api/storage/sources/{id}/test")
+    suspend fun testStorageSource(@Path("id") id: String): StorageSourceTestResponse
+
+    /** 测还没保存的配置（整份配置进 body），供「先测通再保存」。 */
+    @POST("api/storage/sources/test")
+    suspend fun testStorageSourceConfig(@Body body: StorageSourceRequest): StorageSourceTestResponse
+
     // ========== Monitor ==========
     // points 默认 240（2026-08-26 性能：原 360）——图表宽度只有约 1000px，
     // 更细的桶换不来任何可见精度，却要多付 JSON 解析与曲线几何构建的开销。
@@ -1417,6 +1622,40 @@ data class MagiskStatus(
     val version: String
 )
 
+/**
+ * 一条「core 暂存 → 远端存储源」的推送作业（`GET /api/files/remote-push` 的 `jobs` 项）。
+ *
+ * 字段名与 core 的 `FileRoutes.pushJobJson` 一一对应，snake_case 直接映射，不做重命名 ——
+ * 两端对不上时报的是"字段缺失默认值"这种静默错误，改名只会让它更难查。
+ *
+ * @param state `queued` / `pushing` / `success` / `failed` / `cancelled`
+ * @param retryable 失败/取消后还能重试吗（暂存文件还在才行）
+ */
+@Serializable
+data class RemotePushJobInfo(
+    val id: String = "",
+    val file_name: String = "",
+    val source_id: String = "",
+    val source_label: String = "",
+    val dest_path: String = "",
+    val state: String = "",
+    val progress: Float = -1f,
+    val sent_bytes: Long = 0,
+    val total_bytes: Long = 0,
+    val error: String? = null,
+    /** 完整错误详情（异常链 + 推送上下文），供「错误详情」弹窗展示与一键复制。 */
+    val error_detail: String? = null,
+    val created_at: Long = 0,
+    val finished_at: Long = 0,
+    val retryable: Boolean = false
+)
+
+@Serializable
+data class RemotePushListResponse(
+    val jobs: List<RemotePushJobInfo> = emptyList(),
+    val active_count: Int = 0
+)
+
 @Serializable
 data class FileItem(
     val name: String,
@@ -1425,8 +1664,111 @@ data class FileItem(
     val size: Long = 0,
     val lastModified: Long = 0,
     val permissions: String = "",
-    val isSymlink: Boolean = false
+    val isSymlink: Boolean = false,
+    /**
+     * 这一条来自哪个存储源：本地是 `"local"`，远端是 `"<protocol>:<sourceId>"`（如 `ftp:abc123`）。
+     *
+     * 本地响应**不带**这个字段，所以缺省值必须是 `"local"` —— 少了缺省，历史 core 的
+     * 本地列表会直接解析失败（而不是"少个字段"这么温和）。
+     */
+    val source: String = "local"
 )
+
+// ── 外部存储源（FTP / WebDAV / SMB / S3）配置模型 ──
+// 契约要点：响应里**永远没有** password 字段（core 不回传密码）；
+// 改配置时把 password 传成 "********" 表示沿用原密码。
+// S3 复用凭据字段：username = Access Key，password = Secret Key。
+
+@Serializable
+data class StorageSourcesResponse(
+    val sources: List<StorageSourceInfo> = emptyList()
+)
+
+/**
+ * 一个已保存的外部存储源。
+ *
+ * @param capabilities core 报告的能力清单（`LIST` / `READ` / `WRITE` / `DELETE` / `RENAME` /
+ *   `MKDIR` / `UPLOAD` / `DOWNLOAD` …）。UI 必须据此隐藏做不到的动作 —— FTP / WebDAV 都没有
+ *   「解压 / 压缩 / 校验和」这类需要在设备本地跑计算的能力，菜单里留着就是点了必然失败的项。
+ */
+@Serializable
+data class StorageSourceInfo(
+    val id: String = "",
+    val label: String = "",
+    val protocol: String = "",
+    val host: String = "",
+    val port: Int = 0,
+    /**
+     * 用户名 / Access Key。**会回显**——它不是秘密，而且不回显的话编辑弹窗一保存
+     * 就把它清成空串（密码靠 `"********"` 占位兜住，用户名没有等价机制）。
+     */
+    val username: String = "",
+    val basePath: String = "/",
+    val useTls: Boolean = false,
+    val passive: Boolean = true,
+    val encoding: String = "UTF-8",
+    val trustAllCerts: Boolean = false,
+    /** SMB 专用：Windows 域 / 工作组，留空表示无域。 */
+    val domain: String = "",
+    /** SMB 专用：共享名（NAS 上的共享文件夹名）。 */
+    val share: String = "",
+    /** S3 专用：Bucket 名。 */
+    val bucket: String = "",
+    /** S3 专用：Region（MinIO 等自建服务用 us-east-1 即可）。 */
+    val region: String = "us-east-1",
+    /** S3 专用：自定义 endpoint 主机名（不含协议前缀），留空走 AWS 官方地址。 */
+    val endpoint: String = "",
+    /** S3 专用：路径式寻址（MinIO 必须开启）。 */
+    val pathStyle: Boolean = true,
+    val timeoutSec: Int = 15,
+    val enabled: Boolean = true,
+    val capabilities: List<String> = emptyList()
+)
+
+/** 新增 / 修改 / 试连的请求体（三处共用一份，字段集完全一致）。 */
+@Serializable
+data class StorageSourceRequest(
+    val label: String,
+    val protocol: String,
+    val host: String,
+    val port: Int,
+    val username: String = "",
+    val password: String = "",
+    val basePath: String = "/",
+    val useTls: Boolean = false,
+    val passive: Boolean = true,
+    val encoding: String = "UTF-8",
+    val trustAllCerts: Boolean = false,
+    /** SMB 专用：Windows 域 / 工作组，留空表示无域。 */
+    val domain: String = "",
+    /** SMB 专用：共享名（NAS 上的共享文件夹名）。SMB 源必填。 */
+    val share: String = "",
+    /** S3 专用：Bucket 名。S3 源必填。 */
+    val bucket: String = "",
+    /** S3 专用：Region（MinIO 等自建服务用 us-east-1 即可）。 */
+    val region: String = "us-east-1",
+    /** S3 专用：自定义 endpoint 主机名（不含协议前缀），留空走 AWS 官方地址。 */
+    val endpoint: String = "",
+    /** S3 专用：路径式寻址（MinIO 必须开启）。 */
+    val pathStyle: Boolean = true,
+    val timeoutSec: Int = 15,
+    val enabled: Boolean = true
+)
+
+@Serializable
+data class StorageSourceMutationResponse(
+    val success: Boolean = false,
+    val source: StorageSourceInfo? = null,
+    val message: String? = null
+)
+
+@Serializable
+data class StorageSourceTestResponse(
+    val success: Boolean = false,
+    val message: String = "",
+    @SerialName("latency_ms") val latencyMs: Long = 0
+)
+
 
 @Serializable
 data class FileListResponse(

@@ -19,60 +19,61 @@
           </svg>
         </div>
         <h1 class="login-title">UFI-AXIS</h1>
-        <p class="login-subtitle">{{ hasDefaultPassword ? '首次配对 · 请设置配对密码' : '随身 WiFi 管理平台' }}</p>
+        <p class="login-subtitle">{{ hasDefaultPassword ? '首次配对' : '随身 WiFi 管理平台' }}</p>
       </div>
-
-      <!-- 只有首次配对（hasDefaultPassword=true）才分两步：0=设置配对密码，1=GoForm 后台设置。
-           与 app 的 SetupScreen.confirmStep 语义一致 —— 两步都只是 UI 分屏，
-           中间不发任何请求，最终仍由 handleLogin() 一次性 POST /pairing/confirm 提交。
-           普通登录模式只有密码一屏，不渲染步骤条。 -->
-      <n-steps v-if="hasDefaultPassword" :current="pairStep + 1" size="small" class="pair-steps">
-        <n-step title="设置配对密码" />
-        <n-step title="GoForm 后台设置" />
-      </n-steps>
 
       <!-- 无 formRef：提交校验在 handleLogin 里手写（覆盖面比 rules 更广，含 Goform 字段），
            rules 仅用于各字段 blur 时的即时提示。原先这里挂了 ref="formRef"，
            而 <script setup> 中并没有同名变量 —— 是个永远绑不上的死属性。 -->
       <n-form :model="form" :rules="rules" label-placement="left" label-width="0">
-        <!-- 第 1 步「设置配对密码」。普通登录模式下这也是唯一一屏。 -->
-        <div v-if="!hasDefaultPassword || pairStep === 0" class="step-pane">
-          <!-- 同源模式：自动检测服务器地址，无需手动输入 -->
-          <div v-if="isSameOrigin" class="server-hint">
-            <n-icon :size="14" style="color: var(--text-muted)"><GlobeOutline /></n-icon>
-            <span>{{ currentOrigin }}</span>
-          </div>
+        <!-- 首次配对（hasDefaultPassword=true）走三步向导：配对密码 → 设备后台 → 确认。
+             三步都只是本地填写，中间不发任何请求；最终仍由 handleLogin() 一次性
+             POST /pairing/confirm 提交 —— 与 app 的 SetupScreen 语义一致。
+             能不能离开某步由 pairSteps[i].validate 回答，不再是"填错了到提交才说"。 -->
+        <StepWizard
+          v-if="hasDefaultPassword"
+          v-model:current="pairStep"
+          :steps="pairSteps"
+          finish-text="设置并进入"
+          :finish-loading="loading"
+          @finish="handleLogin"
+          @blocked="onStepBlocked"
+        >
+          <template #password>
+            <!-- 同源模式：自动检测服务器地址，无需手动输入 -->
+            <div v-if="isSameOrigin" class="server-hint">
+              <n-icon :size="14" style="color: var(--text-muted)"><GlobeOutline /></n-icon>
+              <span>{{ currentOrigin }}</span>
+            </div>
 
-          <!-- 跨域模式：手动输入服务器地址 -->
-          <n-form-item v-else path="serverUrl">
-            <n-input
-              v-model:value="form.serverUrl"
-              placeholder="设备地址，如 http://192.168.0.1:8088"
-              :input-props="{ autocomplete: 'url' }"
-            >
-              <template #prefix>
-                <n-icon :size="16"><GlobeOutline /></n-icon>
-              </template>
-            </n-input>
-          </n-form-item>
+            <!-- 跨域模式：手动输入服务器地址 -->
+            <n-form-item v-else path="serverUrl">
+              <n-input
+                v-model:value="form.serverUrl"
+                placeholder="设备地址，如 http://192.168.0.1:8088"
+                :input-props="{ autocomplete: 'url' }"
+              >
+                <template #prefix>
+                  <n-icon :size="16"><GlobeOutline /></n-icon>
+                </template>
+              </n-input>
+            </n-form-item>
 
-          <n-form-item path="password">
-            <n-input
-              v-model:value="form.password"
-              type="password"
-              show-password-on="click"
-              :placeholder="hasDefaultPassword ? '请设置配对密码（4-64 位）' : '配对密码'"
-              :input-props="{ autocomplete: hasDefaultPassword ? 'new-password' : 'current-password' }"
-              @keyup.enter="submitPasswordStep"
-            >
-              <template #prefix>
-                <n-icon :size="16"><KeyOutline /></n-icon>
-              </template>
-            </n-input>
-          </n-form-item>
+            <n-form-item path="password">
+              <n-input
+                v-model:value="form.password"
+                type="password"
+                show-password-on="click"
+                placeholder="请设置配对密码（4-64 位）"
+                :input-props="{ autocomplete: 'new-password' }"
+                @keyup.enter="goNextStep"
+              >
+                <template #prefix>
+                  <n-icon :size="16"><KeyOutline /></n-icon>
+                </template>
+              </n-input>
+            </n-form-item>
 
-          <!-- 初次配对：设置配对密码（第 1 步专有） -->
-          <template v-if="hasDefaultPassword">
             <div class="pw-strength">
               <div class="pw-strength-bars">
                 <span
@@ -93,7 +94,7 @@
                 show-password-on="click"
                 placeholder="确认配对密码"
                 :input-props="{ autocomplete: 'new-password' }"
-                @keyup.enter="submitPasswordStep"
+                @keyup.enter="goNextStep"
               >
                 <template #prefix>
                   <n-icon :size="16"><KeyOutline /></n-icon>
@@ -101,17 +102,10 @@
               </n-input>
             </n-form-item>
           </template>
-        </div>
 
-        <!-- 第 2 步「GoForm 后台设置」：仅配对模式存在。字段仍分开（IP / 端口 / 密码），
-             端口用 n-input-number 自带范围校验，不合并成 app 那样的单个「IP:端口」文本框。 -->
-        <div v-else class="step-pane">
-          <!-- 初次配对：同时配置 Goform 后台（调制解调器原生管理界面）连接 -->
-          <div class="goform-section sub-panel">
-            <div class="goform-title">设备后台</div>
-            <p class="goform-desc">
-              设备经此地址访问自带的网页后台，默认通常为 192.168.0.1:8080、密码 admin。一般无需修改。
-            </p>
+          <!-- 字段仍分开（IP / 端口 / 密码），端口用 n-input-number 自带范围校验，
+               不合并成 app 那样的单个「IP:端口」文本框。 -->
+          <template #goform>
             <div class="goform-grid">
               <div class="goform-field">
                 <label>IP 地址</label>
@@ -119,7 +113,7 @@
                   v-model:value="goformIp"
                   placeholder="192.168.0.1"
                   :input-props="{ inputmode: 'numeric' }"
-                  @keyup.enter="handleLogin"
+                  @keyup.enter="goNextStep"
                 />
               </div>
               <div class="goform-field">
@@ -140,48 +134,71 @@
                 type="password"
                 show-password-on="click"
                 placeholder="admin"
-                @keyup.enter="handleLogin"
+                @keyup.enter="goNextStep"
               />
             </div>
+          </template>
+
+          <!-- 确认页不另造组件：GridCard + InfoRow 拼起来就是（见 StepWizard 的注释）。
+               密码只回显位数与强度 —— 前两步的输入框才是改它的地方，这里抄一遍明文
+               既没用又多一处泄露面。 -->
+          <template #review>
+            <GridCard title="将写入设备" density="compact">
+              <InfoRow label="设备地址" :value="isSameOrigin ? currentOrigin : form.serverUrl" />
+              <InfoRow label="配对密码" :value="passwordReview" />
+              <InfoRow label="设备后台" :value="`${goformIp.trim()}:${goformPort ?? ''}`" />
+              <InfoRow label="后台密码" :value="maskSecret(goformPassword)" />
+            </GridCard>
+          </template>
+        </StepWizard>
+
+        <!-- 普通登录：单屏，行为保持原样（设备已设过密码，没有可分的步） -->
+        <template v-else>
+          <div class="step-pane">
+            <div v-if="isSameOrigin" class="server-hint">
+              <n-icon :size="14" style="color: var(--text-muted)"><GlobeOutline /></n-icon>
+              <span>{{ currentOrigin }}</span>
+            </div>
+
+            <n-form-item v-else path="serverUrl">
+              <n-input
+                v-model:value="form.serverUrl"
+                placeholder="设备地址，如 http://192.168.0.1:8088"
+                :input-props="{ autocomplete: 'url' }"
+              >
+                <template #prefix>
+                  <n-icon :size="16"><GlobeOutline /></n-icon>
+                </template>
+              </n-input>
+            </n-form-item>
+
+            <n-form-item path="password">
+              <n-input
+                v-model:value="form.password"
+                type="password"
+                show-password-on="click"
+                placeholder="配对密码"
+                :input-props="{ autocomplete: 'current-password' }"
+                @keyup.enter="handleLogin"
+              >
+                <template #prefix>
+                  <n-icon :size="16"><KeyOutline /></n-icon>
+                </template>
+              </n-input>
+            </n-form-item>
           </div>
 
-          <n-alert type="info" :bordered="false" class="login-hint">
-            首次使用，请设置配对密码。该密码用于后续登录与管理设备，请务必牢记。
-          </n-alert>
-        </div>
-
-        <!-- 配对第 1 步：只跑本地校验后切到第 2 步，不发任何请求 -->
-        <n-button
-          v-if="hasDefaultPassword && pairStep === 0"
-          type="primary"
-          block
-          :disabled="loading"
-          style="margin-top: 8px"
-          @click="goNextStep"
-        >
-          下一步
-        </n-button>
-
-        <!-- 配对第 2 步：上一步（保留已填内容）/ 真正提交 -->
-        <div v-else-if="hasDefaultPassword" class="step-actions">
-          <n-button :disabled="loading" @click="goPrevStep">上一步</n-button>
-          <n-button type="primary" :loading="loading" :disabled="loading" style="flex: 1" @click="handleLogin">
-            设置并进入
+          <n-button
+            type="primary"
+            block
+            :loading="loading"
+            :disabled="loading"
+            style="margin-top: 8px"
+            @click="handleLogin"
+          >
+            登录
           </n-button>
-        </div>
-
-        <!-- 普通登录：单屏，行为保持原样 -->
-        <n-button
-          v-else
-          type="primary"
-          block
-          :loading="loading"
-          :disabled="loading"
-          style="margin-top: 8px"
-          @click="handleLogin"
-        >
-          登录
-        </n-button>
+        </template>
       </n-form>
 
       <div v-if="error" class="login-error">
@@ -196,6 +213,9 @@ import { ref, reactive, computed, onMounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useMessage } from 'naive-ui';
 import { GlobeOutline, KeyOutline } from '@vicons/ionicons5';
+import GridCard from '@/components/GridCard.vue';
+import InfoRow from '@/components/InfoRow.vue';
+import StepWizard, { type WizardStep } from '@/components/StepWizard.vue';
 import { useAppStore } from '@/stores/app';
 import { getApiClient, resetApiClient } from '@/composables/useApi';
 import { evaluatePasswordStrength } from '@/composables/utils';
@@ -255,12 +275,12 @@ const loading = ref(false);
 const error = ref('');
 const hasDefaultPassword = ref(false);
 
-// 首次配对的分步下标：0=设置配对密码，1=GoForm 后台设置（对应 app SetupScreen 的 confirmStep）。
-// 普通登录模式不使用它（模板里第 1 步的 pane 对 hasDefaultPassword=false 恒显示）。
+// 首次配对的分步下标：0=配对密码，1=设备后台，2=确认（对应 app SetupScreen 的 confirmStep）。
+// 普通登录模式不使用它（那一侧不渲染向导）。
 const pairStep = ref(0);
 
 // 模式变化（fetchPairingInfo 刷新后 true→false 或反向）时回到第 1 步：
-// 否则可能停在一个已经不该存在的 GoForm 步上。提交失败不会走到这里，
+// 否则可能停在一个已经不该存在的步上。提交失败不会走到这里，
 // 用户已填的密码/GoForm 内容原样保留。
 watch(hasDefaultPassword, () => {
   pairStep.value = 0;
@@ -268,6 +288,45 @@ watch(hasDefaultPassword, () => {
 
 // 密码强度（仅初次配对时展示）
 const passwordStrength = computed(() => evaluatePasswordStrength(form.password));
+
+/** 确认页上的密码回显：位数 + 强度，不回显明文（改它的地方是第 1 步的输入框）。 */
+const passwordReview = computed(() =>
+  form.password
+    ? `${maskSecret(form.password)}（${form.password.length} 位 · ${passwordStrength.value.label}）`
+    : '未设置'
+);
+
+function maskSecret(value: string): string {
+  if (!value) return '未填写';
+  return '•'.repeat(Math.min(value.length, 12));
+}
+
+/**
+ * 首次配对的三步。heading 写成「这一步要回答什么」，
+ * validate 决定能不能离开本步 —— 由 StepWizard 在 computed 里求值，所以边打字边生效。
+ */
+const pairSteps = computed<WizardStep[]>(() => [
+  {
+    key: 'password',
+    label: '配对密码',
+    heading: '设置配对密码',
+    description: '这台设备今后凭它登录与管理，请务必牢记。设备当前还是出厂默认密码。',
+    validate: validatePasswordStep,
+  },
+  {
+    key: 'goform',
+    label: '设备后台',
+    heading: '设备自带的网页后台怎么连',
+    description: '设备经此地址访问它自带的管理界面，默认通常是 192.168.0.1:8080、密码 admin，一般无需修改。',
+    validate: validateGoformStep,
+  },
+  {
+    key: 'review',
+    label: '确认',
+    heading: '核对后写入设备',
+    description: '前两步只在本地填写；点「设置并进入」才会真正提交给设备。',
+  },
+]);
 
 // 同源模式：挂载即拉取配对信息，用于判断是否处于初次配对（与主登录流程解耦）
 onMounted(async () => {
@@ -303,10 +362,9 @@ async function fetchPairingInfoWithRetry(): Promise<string | null> {
 }
 
 /**
- * 第 1 步「设置配对密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次一致。
- * 通过返回 null，否则返回错误文案。
- * 「下一步」按钮与 handleLogin() 共用这一份——分步不削弱最终门禁，
- * handleLogin() 在此之后还会继续校验 Goform 字段。
+ * 第 1 步「配对密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次一致。
+ * 通过返回 null，否则返回**拦下的原因**（由 StepWizard 渲染在按钮上方）。
+ * 普通登录模式下这份校验也在 handleLogin() 里跑 —— 分步不削弱最终门禁。
  */
 function validatePasswordStep(): string | null {
   if (!isSameOrigin.value && !form.serverUrl) return '请输入设备地址';
@@ -321,34 +379,35 @@ function validatePasswordStep(): string | null {
   return null;
 }
 
-/** 配对模式：第 1 步 → 第 2 步。纯本地校验，不发请求（与 app 的「下一步」一致）。 */
+/** 第 2 步「设备后台」的校验。默认值即设备出厂值，一般直接通过。 */
+function validateGoformStep(): string | null {
+  if (!goformIp.value.trim()) return '请填写设备后台 IP 地址';
+  if (!goformPassword.value) return '请填写设备后台密码';
+  const port = Number(goformPort.value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return '后台端口需在 1-65535 之间';
+  return null;
+}
+
+/**
+ * 输入框上的回车 = 点一下主按钮：当前步合法就往下走，最后一步则提交。
+ * 向导自己的按钮走 StepWizard 的 @finish / v-model:current，不经过这里。
+ */
 function goNextStep() {
-  const err = validatePasswordStep();
+  const err = pairSteps.value[pairStep.value]?.validate?.() ?? null;
   if (err) {
     error.value = err;
     message.error(err);
     return;
   }
   error.value = '';
-  pairStep.value = 1;
+  if (pairStep.value < pairSteps.value.length - 1) pairStep.value += 1;
+  else void handleLogin();
 }
 
-/** 配对模式：第 2 步 → 第 1 步。只切屏，已填内容（含 Goform）全部保留。 */
-function goPrevStep() {
+/** 点步骤条往前跳被拦下时的提示（原因由 StepWizard 组好）。 */
+function onStepBlocked(reason: string) {
   error.value = '';
-  pairStep.value = 0;
-}
-
-/**
- * 第 1 步输入框上的回车：配对模式走「下一步」，普通登录直接提交。
- * 第 2 步的 Goform 输入框回车则直接绑 handleLogin。
- */
-function submitPasswordStep() {
-  if (hasDefaultPassword.value) {
-    goNextStep();
-    return;
-  }
-  void handleLogin();
+  message.warning(reason);
 }
 
 /**
@@ -371,13 +430,10 @@ async function handleLogin() {
   }
   if (hasDefaultPassword.value) {
     // Goform 后台连接配置校验（与设备出厂默认值一致，一般无需改动）
-    if (!goformIp.value.trim() || !goformPassword.value) {
-      error.value = '请填写设备后台地址与密码';
-      return;
-    }
-    const gp = Number(goformPort.value);
-    if (!Number.isInteger(gp) || gp < 1 || gp > 65535) {
-      error.value = '后台端口需在 1-65535 之间';
+    const goformErr = validateGoformStep();
+    if (goformErr) {
+      error.value = goformErr;
+      pairStep.value = 1;
       return;
     }
   }
@@ -579,17 +635,8 @@ function handleNetworkError(e: any) {
   font-size: 13px;
   color: var(--text-secondary);
 }
-.login-hint {
-  margin-top: 4px;
-  margin-bottom: 4px;
-  font-size: 12px;
-  line-height: 1.5;
-}
-.pair-steps {
-  margin-bottom: 20px;
-}
-/* 切步骤时面板淡入并轻微上浮，写法同 SettingsView 的 .pane-in：
-   只动 opacity/transform，不参与布局，所以两步高度不同也不会闪一下。 */
+/* 普通登录那一屏的入场动效，写法同 SettingsView 的 .pane-in：
+   只动 opacity/transform，不参与布局。配对向导的切步动效在 StepWizard 里。 */
 .step-pane {
   animation: step-pane-in 0.22s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -602,11 +649,6 @@ function handleNetworkError(e: any) {
     opacity: 1;
     transform: none;
   }
-}
-.step-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 8px;
 }
 .pw-strength {
   display: flex;
@@ -632,22 +674,6 @@ function handleNetworkError(e: any) {
   min-width: 28px;
   text-align: right;
 }
-/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
-.goform-section {
-  margin: 4px 0 8px;
-}
-.goform-title {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  margin-bottom: 4px;
-}
-.goform-desc {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-muted);
-  margin: 0 0 10px;
-}
 .goform-grid {
   display: grid;
   grid-template-columns: 1fr 110px;
@@ -667,8 +693,7 @@ function handleNetworkError(e: any) {
 
 @media (max-width: 768px) {
   /* 360px 视口：页面 16px 内距 → 卡 328px；卡再吃掉左右各 32px 只剩 264px，
-     `.goform-section`（.sub-panel，12px 内距）里再降到 240px，
-     于是 `1fr 110px` 的 IP 格只有 120px，连 `192.168.0.1` 这个占位符都显示不全。
+     于是 `1fr 110px` 的 IP 格只有 140px，连 `192.168.0.1` 这个占位符都显示不全。
      两条一起改：卡片内距收到 24px/20px，GoForm 栅格折单列。 */
   .login-page {
     padding: 12px;

@@ -258,6 +258,16 @@ object ComponentFactory {
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
         scheduler.attachConditionEngine(controller.conditionEngine)
 
+        // 任务 / 规则集合变更推送（2026-09-21）：两个调度器都在 buildControllerGraph 里构造，
+        // 那一层拿不到 wsManager，所以走 attach。不挂的话任务列表是纯 REST 拉取、
+        // 零失效通知 —— web 端建完任务，app 必须退出页面再进才看得见。
+        controller.taskScheduler.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.TASK_LIST)
+        }
+        controller.conditionEngine.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.TASK_RULES)
+        }
+
         // 邮件路径的拦截判定（2026-09-08）：SmsForwardController 在 buildControllerGraph 里构造，
         // 那一层拿不到 AppDatabase，所以规则 store 走 attach 注入。
         controller.smsForwardController.attachRuleStore(smsRuleStore)
@@ -525,10 +535,30 @@ object ComponentFactory {
         val updateRoutes = com.ufi_axis_core.api.routes.UpdateRoutes(updateManager)
         val appRoutes = AppRoutes(appManager)
         val shellRoutes = ShellRoutes(consoleRecorder)
-        val fileRoutes = FileRoutes()
+        val fileProviderRegistry = com.ufi_axis_core.api.files.FileProviderRegistry()
+        fileProviderRegistry.register(com.ufi_axis_core.api.files.LocalFileProvider())
+        val fileRoutes = FileRoutes(fileProviderRegistry)
+        // 远程存储源（阶段 2-4）：FTP / WebDAV 配置存在 settings 的 storage_sources 键上，
+        // 启动时把已启用的源注册进 registry —— FileRoutes 的 `remote:<id>/...` 路径解析靠它。
+        // 建连失败不阻塞启动：initializeProviders 内部按源吞异常并记 WARN。
+        val storageSourceManager = com.ufi_axis_core.api.files.StorageSourceManager(
+            settings, fileProviderRegistry
+        )
+        storageSourceManager.initializeProviders()
+        val storageSourceRoutes = com.ufi_axis_core.api.routes.StorageSourceRoutes(storageSourceManager)
         // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
         // 播放仍走 fileRoutes 的 /api/files/stream，这里不碰字节流。
-        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(context, settings)
+        // responseCache 只给 /media/groups 用（整表聚合，客户端会来回切三个分组视图）。
+        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(context, settings, responseCache)
+        // 音频歌单（2026-09-21）：歌单本身存 prefs（曲目只记路径），曲目回查复用 mediaRoutes
+        // 的 MediaStore 查询（它实现了 AudioItemLookup）——「路径 → 曲目」只在 core 存在一份，
+        // app 与 web 都不必自己拼。集合变更走 data_changed，否则一端加歌另一端要退页面才看得见。
+        val playlistStore = com.ufi_axis_core.api.media.PlaylistStore(context)
+        playlistStore.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
+        }
+        val playlistRoutes =
+            com.ufi_axis_core.api.routes.PlaylistRoutes(playlistStore, mediaRoutes)
         // 天气（2026-09-17）：代理 Open-Meteo，位置存在 settings，结果走 responseCache 的 TTL。
         val weatherRoutes = com.ufi_axis_core.api.routes.WeatherRoutes(settings, responseCache)
         // 今日诗词（2026-09-18）：代理 jinrishici v2，token 存在 settings、结果走 responseCache 的 TTL。
@@ -630,7 +660,9 @@ object ComponentFactory {
             appRoutes = appRoutes,
             shellRoutes = shellRoutes,
             fileRoutes = fileRoutes,
+            storageSourceRoutes = storageSourceRoutes,
             mediaRoutes = mediaRoutes,
+            playlistRoutes = playlistRoutes,
             weatherRoutes = weatherRoutes,
             poetryRoutes = poetryRoutes,
             geoRoutes = geoRoutes,

@@ -28,6 +28,9 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -91,6 +94,22 @@ private const val CONTACTS_AUTO_REFRESH_MS = 10_000L
 fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val palette = LocalResolvedPalette.current
     val toolsState by viewModel.toolsState.collectAsState()
+
+    // ── lifecycle 门控（2026-09-21）──
+    // 不轮询时在后台白打 HTTP；本页不是底部 Tab 页，不需要 pageForeground。
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     // 一次性动作（如「全部标为已读」）用它起协程等结果再弹 Toast，不进 ViewModel 状态。
     val scope = rememberCoroutineScope()
     var isComposing by remember { mutableStateOf(false) }
@@ -105,6 +124,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 提到屏幕层持有而不是放在行里：确认结果要弹 Toast，而 UfiToastHost 挂在这一层；
     // 放在行内的话，列表刷新（10s 静默轮询）重组时那一行连带弹窗会被整块换掉。
     var pendingBlacklistPhone by remember { mutableStateOf<String?>(null) }
+    var pendingDeleteConversationPhone by remember { mutableStateOf<String?>(null) }
     // 「查看原对话」跳走前暂存的那条：对话关闭后原样弹回来，让用户回到点跳转之前的状态
     var reopenCodeAfterConversation by remember { mutableStateOf<VerificationCode?>(null) }
     // 两个列表的滚动位置提到屏幕级持有。对话页是根 AnimatedContent 的另一层，
@@ -149,7 +169,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 会话列表自动刷新：设备收到新短信、或短信从别处发出，都不会主动推给 app ——
     // 不轮询的话列表要等用户下拉 / 重进页面才更新。静默刷新，不点亮下拉指示器。
     // 只在「消息」页签且没打开对话时跑：对话层有自己的刷新路径，页面离开时 LaunchedEffect 自动取消。
-    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
+    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 0 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
         while (true) {
             delay(CONTACTS_AUTO_REFRESH_MS)
@@ -161,7 +182,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 2026-09-13 修复：自动复制验证码已迁移至 `:ufi_notify` 进程后台触发（见 NotificationCenter），
     // 不再依赖本页面的 UI 轮询。这里的轮询仅用于「通知」页签列表刷新和未读角标计算。
     // 仅「通知」页签且没打开对话时跑，复用联系人轮询同样的间隔与生命周期。
-    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
+    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 1 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
         while (true) {
             delay(CONTACTS_AUTO_REFRESH_MS)
@@ -403,6 +425,19 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                                         else ToastMessage("操作失败，请重试", ToastType.ERROR)
                                                     }
                                                 },
+                                                onMarkUnread = { phone ->
+                                                    // 把该会话最新一条**收到的**短信标未读 —— 会话行的未读角标
+                                                    // 数的就是收到方未读数，标发出方不会让角标亮起来。
+                                                    val latest = toolsState.smsList
+                                                        .filter { it.phoneNumber == phone && it.direction == "received" }
+                                                        .maxByOrNull { it.timestamp }
+                                                    if (latest != null) {
+                                                        viewModel.tools.markSmsUnread(latest.id)
+                                                    } else {
+                                                        toastMessage = ToastMessage("没有可标记的短信", ToastType.ERROR)
+                                                    }
+                                                },
+                                                onRequestDeleteConversation = { pendingDeleteConversationPhone = it },
                                                 onRequestBlacklist = { pendingBlacklistPhone = it }
                                             )
                                         }
@@ -670,6 +705,22 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 条数 / 全部标为已读）+ 一个「打开时才拉 /api/sms/count」的 LaunchedEffect。
     // 整段已搬到独立页面 SmsSettingsScreen（齿轮改为 navigate），弹窗与状态一并删除 ——
     // 同一个设置留两个入口，改了一边另一边就是错的。
+
+    // ── 会话行长按「删除整段会话」的二次确认 ──
+    pendingDeleteConversationPhone?.let { phone ->
+        UfiConfirmDialog(
+            visible = true,
+            title = "删除整段会话",
+            text = "将删除与 $phone 的全部短信记录，此操作不可恢复。",
+            confirmText = "删除全部",
+            destructive = true,
+            onDismiss = { pendingDeleteConversationPhone = null },
+            onConfirm = {
+                pendingDeleteConversationPhone = null
+                viewModel.tools.deleteConversation(phone)
+            }
+        )
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -700,6 +751,10 @@ private fun SmsConversationList(
     onMarkAllRead: () -> Unit,
     /** 长按菜单「标记已读」：整段会话标已读，结果由屏幕层弹 Toast。 */
     onMarkRead: (String) -> Unit,
+    /** 长按菜单「标记未读」：把该会话最新一条收到的短信标未读（2026-09-21）。 */
+    onMarkUnread: (String) -> Unit,
+    /** 长按菜单「删除整段会话」：只上报意图，二次确认与删除在屏幕层做（2026-09-21）。 */
+    onRequestDeleteConversation: (String) -> Unit,
     /** 长按菜单「加入黑名单」：只上报意图，二次确认与写入在屏幕层做。 */
     onRequestBlacklist: (String) -> Unit
 ) {
@@ -767,6 +822,8 @@ private fun SmsConversationList(
                 contact = contact,
                 onClick = { viewModel.tools.openConversation(contact.phoneNumber) },
                 onMarkRead = { onMarkRead(contact.phoneNumber) },
+                onMarkUnread = { onMarkUnread(contact.phoneNumber) },
+                onDeleteConversation = { onRequestDeleteConversation(contact.phoneNumber) },
                 onRequestBlacklist = { onRequestBlacklist(contact.phoneNumber) }
             )
         }
@@ -800,6 +857,8 @@ private fun SmsConversationRow(
     contact: SmsContact,
     onClick: () -> Unit,
     onMarkRead: () -> Unit,
+    onMarkUnread: () -> Unit,
+    onDeleteConversation: () -> Unit,
     onRequestBlacklist: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -968,7 +1027,7 @@ private fun SmsConversationRow(
                         }
                     )
                 )
-                // 没有未读时不给这一项：点了也是白发一次请求。
+                // 没有未读时不给「标记已读」；反过来有未读时不给「标记未读」
                 if (hasUnread) {
                     add(
                         UfiPopupOption(
@@ -981,8 +1040,32 @@ private fun SmsConversationRow(
                             }
                         )
                     )
+                } else {
+                    add(
+                        UfiPopupOption(
+                            id = "unread",
+                            label = "标记未读",
+                            icon = Icons.Default.MarkEmailUnread,
+                            onClick = {
+                                onMarkUnread()
+                                showActions = false
+                            }
+                        )
+                    )
                 }
                 add(UfiPopupOption.divider())
+                add(
+                    UfiPopupOption(
+                        id = "delete-conversation",
+                        label = "删除整段会话",
+                        icon = Icons.Default.DeleteOutline,
+                        isDestructive = true,
+                        onClick = {
+                            onDeleteConversation()
+                            showActions = false
+                        }
+                    )
+                )
                 add(
                     UfiPopupOption(
                         id = "blacklist",

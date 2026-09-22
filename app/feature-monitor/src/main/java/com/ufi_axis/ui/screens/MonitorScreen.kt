@@ -493,7 +493,10 @@ private fun MonitorOverviewTabContent(
                         modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
                     )
                 }
-            } else if (todayAlerts.isEmpty() && !monitorState.isLoading) {
+            // 空态门看 alertsLoaded（告警成功读到过）而不是 !isLoading：
+            // 后者被图表那三个 loader 共用，它们和告警无关却能提前把位清掉，
+            // 于是告警请求还在飞的时候就宣布"今日无告警"。
+            } else if (todayAlerts.isEmpty() && monitorState.alertsLoaded) {
                 item(key = "empty") {
                     // fillParentMaxSize() 会让这条提示自己占满一屏——它上面还有 hero + 6 格 + chips，
                     // 结果「今日暂无异常事件」被整屏空白顶到折叠以下，要再滚一屏才看得到。
@@ -1305,7 +1308,8 @@ fun EventsCenterContent(viewModel: MainViewModel) {
             // 列表本体：每条事件一个 LazyColumn item，滚到才组合。
             // 2026-09-08：翻页的 AnimatedContent（淡入 + 0.98→1 微缩放）已删除 —— 翻页是"换一批
             // 数据"而不是导航转场，内容淡入会让首屏可见时间多等一个 Duration.Smooth，观感就是刷新动画。
-            if (filteredAlerts.isEmpty() && !monitorState.isLoading) {
+            // 同上：看 alertsLoaded，不看被图表 loader 共用的 isLoading
+            if (filteredAlerts.isEmpty() && monitorState.alertsLoaded) {
                 item(key = "emptyAll") {
                     UfiEmptyState(
                         icon = Icons.Default.Inbox,

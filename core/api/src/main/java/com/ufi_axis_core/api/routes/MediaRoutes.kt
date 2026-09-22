@@ -18,9 +18,10 @@ import android.util.Size
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.media.AudioTagReader
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.core.cache.CacheTTL
+import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
-import com.ufi_axis_core.util.BinaryComponentStore
 import com.ufi_axis_core.util.MimeTypes
 import io.ktor.http.*
 import io.ktor.server.application.call
@@ -38,6 +39,10 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.Charset
+import java.util.Locale
 
 /**
  * 媒体库路由 —— 「媒体中心」的数据源（2026-09-16 新增）。
@@ -68,8 +73,16 @@ class MediaRoutes(
      * 同名会在 `get("/list") { ... }` 里把它遮蔽掉，然后 `context.contentResolver` 无法解析。
      */
     private val appContext: Context,
-    private val settings: AppSettings
-) {
+    private val settings: AppSettings,
+    /**
+     * `/groups` 的聚合结果缓存。
+     *
+     * 分组要**整表扫一遍**（几千首就是几千行游标推进），而客户端在音乐页里会反复来回切
+     * 专辑 / 歌手 / 文件夹三个视图 —— 每次切换都重扫一遍是纯浪费。
+     * 只有聚合类端点用它：`/list` 是分页查询，SQL 侧就把工作量限住了，不需要再叠一层内存缓存。
+     */
+    private val cache: ResponseCache
+) : com.ufi_axis_core.api.media.AudioItemLookup {
 
     companion object {
         private const val TAG = "MediaRoutes"
@@ -90,12 +103,26 @@ class MediaRoutes(
         private const val THUMB_JPEG_QUALITY = 82
 
         /**
-         * 自行抽帧时取的时间点（1 秒）。
+         * 自行抽帧的候选位置（占片长的比例，2026-09-20 重写）。
          *
-         * 不取 0：很多视频首帧是黑场或渐入，抽出来是一张纯黑图 —— 那和没有缩略图没区别。
-         * 比视频还短时 `getFrameAtTime` 会退到最近的关键帧，不会失败。
+         * 原来固定抽**第 1 秒**，抽出来基本都是黑的：淡入、发行商 logo 前的黑场、
+         * 番剧的黑底标题卡全在前几秒 —— 原注释说的「不取第 0 帧」只躲开了最表层那一下，
+         * 1 秒和 0 秒在这件事上没有本质区别。
+         *
+         * 现在按片长比例取中段，并对抽到的帧做亮度检测（[averageLuma]），太暗就换下一个比例。
+         * 与 app 侧 `MediaThumbnailBuilder` 同一套口径，只是那边的首选点还按 URL 哈希
+         * 做了"每个视频取不同位置"，core 这条是备用路径（本机 ROM 解不出画面），不值得加。
          */
-        private const val VIDEO_FRAME_POSITION_US = 1_000_000L
+        private val VIDEO_FRAME_RATIOS = floatArrayOf(0.40f, 0.55f, 0.25f, 0.70f, 0.85f)
+
+        /** 读不到时长时的兜底抽帧点。取 10 秒而不是 1 秒 —— 理由同上。 */
+        private const val VIDEO_FRAME_FALLBACK_US = 10_000_000L
+
+        /** 判定黑帧的平均亮度阈值（0~255）。纯黑 0~3，噪点黑场 ~10，夜戏画面普遍 25+。 */
+        private const val DARK_LUMA_THRESHOLD = 18
+
+        /** 亮度采样网格边长：16×16 = 256 点，够判断"整屏是不是黑的"，比逐像素快两个数量级。 */
+        private const val LUMA_SAMPLE_GRID = 16
 
         /**
          * 缩略图缓存目录（`filesDir` 下）。
@@ -121,6 +148,43 @@ class MediaRoutes(
         private val LYRICS_EXTENSIONS = listOf("lrc", "txt")
         private const val MAX_LYRICS_BYTES = 256 * 1024
 
+        /**
+         * 外挂字幕的后缀 → MIME（`/subtitles` 与 `/subtitle` 共用）。
+         *
+         * 分两类，**都列出来**但标记清楚，理由见 `/subtitles` 的 KDoc：
+         *  · 键在 [PLAYABLE_SUBTITLE_MIMES] 里的 = 客户端播放器（media3）能解析；
+         *  · 其余（MicroDVD `.sub`、SAMI `.smi`）能被发现、能被下载，但播放器解不了，
+         *    回给客户端时 `supported = false`，让它显示"格式不支持"而不是装作没这个文件。
+         *
+         * `.sub` 的歧义：既可能是 MicroDVD 文本，也可能是 VobSub 的二进制图形字幕
+         * （配 `.idx`）。两者都不被 media3 的外挂字幕路径支持，所以统一算不支持。
+         */
+        private val PLAYABLE_SUBTITLE_MIMES = mapOf(
+            "srt" to "application/x-subrip",
+            "ass" to "text/x-ssa",
+            "ssa" to "text/x-ssa",
+            "vtt" to "text/vtt",
+            "webvtt" to "text/vtt",
+            "ttml" to "application/ttml+xml",
+            "dfxp" to "application/ttml+xml",
+            "xml" to "application/ttml+xml"
+        )
+
+        /** 会被当成字幕列出的全部后缀（含 media3 解不了的，见 [PLAYABLE_SUBTITLE_MIMES]）。 */
+        private val SUBTITLE_EXTENSIONS =
+            PLAYABLE_SUBTITLE_MIMES.keys + setOf("sub", "smi", "sami", "idx")
+
+        /**
+         * 单个字幕文件的大小上限。
+         *
+         * 一部两小时电影的 ASS 带全套特效也就几百 KB；8MB 已经宽松到只会挡住
+         * "后缀写成 .srt 的其它东西"（比如被误命名的视频），而那种文件转码会吃光内存。
+         */
+        private const val MAX_SUBTITLE_BYTES = 8L * 1024 * 1024
+
+        /** `/subtitles?scope=folder` 单次返回条数上限：目录里字幕再多也不该一口气全推给客户端。 */
+        private const val MAX_SUBTITLE_ENTRIES = 100
+
         /** 扫描目录条数上限：这是"选几个目录"，不是"把整卡加进来"。 */
         private const val MAX_SCAN_DIRS = 16
 
@@ -136,9 +200,68 @@ class MediaRoutes(
          */
         private const val MAX_BROWSE_FOLDERS = 200
 
+        /**
+         * [audioItemsByPaths] 单次查询绑定的路径条数上限。
+         *
+         * SQLite 的绑定变量硬顶是 999（`SQLITE_MAX_VARIABLE_NUMBER`），超了整条查询直接抛异常。
+         * 取 200 而不是贴着上限：`DATA IN (...)` 的 OR 展开在几百项时已经开始拖慢，分批反而更稳，
+         * 而歌单上限 2000 首也就是 10 批。
+         */
+        private const val PATH_LOOKUP_CHUNK = 200
+
 
         /** 允许作为扫描目录的前缀：与 FileRoutes 的用户存储白名单同一口径。 */
         private val ALLOWED_DIR_PREFIXES = listOf("/storage/", "/sdcard", "/mnt/media_rw/")
+
+        // ─────────────────── 音频分组聚合（/groups，2026-09-20） ───────────────────
+
+        /**
+         * `/groups` 的缓存 key 前缀。
+         *
+         * 带 `media:` 域前缀是为了能被 `invalidate("media:*")` 一次性清掉（`ResponseCache`
+         * 的模式失效按 `域:子键` 匹配），重扫媒体库之后不需要逐个 key 去点。
+         */
+        private const val GROUPS_CACHE_PREFIX = "media:groups"
+
+        /**
+         * 分组取不到封面时回的 id。
+         *
+         * 用 0 而不是 null：`_ID` 在 MediaStore 里从 1 开始，0 天然是"无效 id"，
+         * 客户端只要判 `cover_id > 0` 就知道该画占位图，不必再处理一种 nullable 分支。
+         */
+        private const val NO_COVER_ID = 0L
+
+        /**
+         * 空标签的展示名。
+         *
+         * MediaStore 对没有内嵌标签的文件会把 ALBUM/ARTIST 填成空串或 `<unknown>`，
+         * 直接透给客户端会得到一个"没有名字的分组"。展示名在 core 侧统一兜底，
+         * 免得 app 与 Web 端各写一份、两边文案还不一样。
+         */
+        private const val UNKNOWN_ALBUM_TITLE = "未知专辑"
+        private const val UNKNOWN_ARTIST_TITLE = "未知歌手"
+
+        /**
+         * MediaStore 对未知标签写入的占位值。
+         *
+         * 它是**字面量字符串**（不是 null），所以必须显式识别，否则会出现一个叫
+         * `<unknown>` 的专辑分组和一个叫"未知专辑"的分组并存。
+         */
+        private const val MEDIASTORE_UNKNOWN = "<unknown>"
+
+        /**
+         * `/groups` 的 projection：只取聚合真正用得到的四列。
+         *
+         * 不复用 `projectionOf(AUDIO)`：那份为了列表项带上了 SIZE / DURATION / TITLE 等，
+         * 而分组要**整表扫一遍**，每多一列就是几千行乘一次取值。这里的四列各有用途 ——
+         * `_ID` 给 `cover_id`、`ALBUM`/`ARTIST` 是分组维度与副标题、`DATA` 用来推目录。
+         */
+        private val GROUPS_PROJECTION = arrayOf(
+            MediaStore.MediaColumns._ID,
+            MediaStore.Audio.Media.ALBUM,
+            MediaStore.Audio.Media.ARTIST,
+            MediaStore.MediaColumns.DATA
+        )
     }
 
     /**
@@ -218,6 +341,70 @@ class MediaRoutes(
         return "($clause)" to args
     }
 
+    /**
+     * 查询串里的可选过滤值。空白 = 没传。
+     *
+     * 前端清空一个输入框 / 退出专辑详情时，参数往往还挂在 URL 上但值是空串。
+     * 把空串当成"筛一个名字为空的专辑"会得到一个永远空的列表，那看起来就是接口坏了。
+     */
+    private fun filterParam(raw: String?): String? = raw?.trim()?.takeIf { it.isNotBlank() }
+
+    /**
+     * `/list` 的完整 selection：扫描目录过滤 **AND** 音频维度过滤（album / artist / dir）。
+     *
+     * 两者是"并且"而不是"替换"：扫描目录是用户在设置里划定的媒体库边界，专辑 / 歌手 / 目录
+     * 只是在这个边界内再筛一层 —— 让 `album=` 绕过边界，等于从"用户没加进媒体库的目录"
+     * 里往外吐文件。
+     *
+     * 值一律走 `?` 占位 + selectionArgs，不拼进 SQL 字符串：这三个参数直接来自查询串，
+     * 而 MediaStore 的 selection 最终由 SQLite 解析，拼串就是一个注入点。
+     *
+     * @param dir 只要**直接位于**该目录下的文件。`DATA LIKE '<dir>/%'` 会把整棵子树都捞出来，
+     *   所以再叠一条 `NOT LIKE '<dir>/%/%'` 排掉更深的层级 —— 客户端的"文件夹分组"点进去
+     *   要的是这一层的曲目，不是子目录里的。
+     */
+    private fun listSelection(
+        kind: Kind,
+        album: String?,
+        artist: String?,
+        dir: String?
+    ): Pair<String?, Array<String>?> {
+        val clauses = mutableListOf<String>()
+        val args = mutableListOf<String>()
+
+        val (dirClause, dirArgs) = dirSelection(scanDirs(kind))
+        if (dirClause != null && dirArgs != null) {
+            clauses += dirClause
+            args += dirArgs
+        }
+
+        // 三个过滤只对音频生效。ALBUM / ARTIST 是 `MediaStore.Audio` 独有的列，
+        // 拿去查 video / image 表会直接抛「unknown column」。
+        //
+        // 这里选择**忽略**而不是报错：媒体中心三个分栏共用同一套请求构造，从"专辑详情"
+        // 切到视频页时参数可能还挂在 URL 上 —— 为一个无害的多余参数让整页 400，是把
+        // 客户端的状态残留升级成故障。忽略之后返回的仍是"这一类的完整列表"，语义没错。
+        if (kind == Kind.AUDIO) {
+            if (album != null) {
+                clauses += "${MediaStore.Audio.Media.ALBUM} = ?"
+                args += album
+            }
+            if (artist != null) {
+                clauses += "${MediaStore.Audio.Media.ARTIST} = ?"
+                args += artist
+            }
+            if (dir != null) {
+                clauses += "(${MediaStore.MediaColumns.DATA} LIKE ? AND " +
+                    "${MediaStore.MediaColumns.DATA} NOT LIKE ?)"
+                args += "$dir/%"
+                args += "$dir/%/%"
+            }
+        }
+
+        if (clauses.isEmpty()) return null to null
+        return clauses.joinToString(" AND ") to args.toTypedArray()
+    }
+
     private fun sortColumnOf(sort: String?): String = when (sort) {
         "name" -> MediaStore.MediaColumns.DISPLAY_NAME
         "size" -> MediaStore.MediaColumns.SIZE
@@ -231,7 +418,11 @@ class MediaRoutes(
      * 两边各写一份的话，加字段时总会漏一处，客户端就会出现"列表模式有时长、
      * 文件夹模式没有"这种莫名差异。
      */
-    private fun itemOf(c: Cursor, kind: Kind): Map<String, Any?> {
+    private fun itemOf(
+        c: Cursor,
+        kind: Kind,
+        subtitleCache: MutableMap<String, List<String>>? = null
+    ): Map<String, Any?> {
         val path = c.stringOr(MediaStore.MediaColumns.DATA)
         val name = c.stringOr(MediaStore.MediaColumns.DISPLAY_NAME)
             .ifBlank { path.substringAfterLast('/') }
@@ -258,6 +449,16 @@ class MediaRoutes(
                 // 列表这一层刻意不逐首解字节 —— 一页几十首就是几十次开文件；
                 // 需要精确标签的场合走 `/api/media/tags`（单首、可缓存）。
                 put("title", realTitleOf(c.stringOr(MediaStore.Audio.Media.TITLE), name))
+            }
+            // 视频：有几个外挂字幕（给列表打"CC"标用，客户端不必逐条问 /subtitles）。
+            // 只在调用方传了 [subtitleCache] 时才算 —— 那个 map 让同一目录只 listFiles 一次，
+            // 否则一层里几十个视频就是几十次目录扫描。
+            if (kind == Kind.VIDEO && subtitleCache != null && path.isNotBlank()) {
+                val file = File(path)
+                val base = file.nameWithoutExtension
+                val count = subtitleNamesIn(file.parentFile, subtitleCache)
+                    .count { subtitleBelongsTo(it, base) }
+                put("subtitle_count", count)
             }
         }
     }
@@ -308,6 +509,61 @@ class MediaRoutes(
             }
         }
         return base.toTypedArray()
+    }
+
+    // ─────────────────── AudioItemLookup（供 PlaylistRoutes 回查歌单曲目） ───────────────────
+
+    override fun audioReadable(): Boolean = isGranted(Kind.AUDIO)
+
+    /**
+     * 按绝对路径批量回查音频曲目。
+     *
+     * ## 为什么不叠扫描目录过滤（与 `/list` 不同）
+     * `/list` 是"列媒体库"，扫描目录是用户划定的库边界，必须遵守。这里是"用户点名要的这几首"——
+     * 歌加进歌单时就已经在库里了，之后用户去设置里把扫描范围收窄，不代表这些歌该显示成"已失效"。
+     * 拿边界去过滤会让歌单莫名少一半，而用户完全不知道是哪一步造成的。
+     *
+     * 安全上不需要这层过滤兜底：路径能进歌单是因为 `PlaylistRoutes` 在加歌时用本方法验证过
+     * 它确实是 MediaStore 里的一行音频，而 MediaStore 只索引外置存储上的媒体文件，
+     * 任意路径（`/data/...`）根本查不出结果；真正的取流仍由 `/api/files/stream-ticket`
+     * 的 `safeResolveForRead` 把关。
+     *
+     * @return 只包含**查到的**路径；查不到的一律不出现，调用方据此判 `missing`。
+     */
+    override suspend fun audioItemsByPaths(paths: List<String>): Map<String, Map<String, Any?>> {
+        val wanted = paths.filter { it.isNotBlank() }.distinct()
+        if (wanted.isEmpty()) return emptyMap()
+        return withContext(Dispatchers.IO) {
+            val uri = contentUriOf(Kind.AUDIO)
+            val resolver = appContext.contentResolver
+            val projection = projectionOf(Kind.AUDIO)
+            val out = HashMap<String, Map<String, Any?>>(wanted.size)
+            wanted.chunked(PATH_LOOKUP_CHUNK).forEach { batch ->
+                val placeholders = batch.joinToString(",") { "?" }
+                val args = Bundle().apply {
+                    putString(
+                        ContentResolver.QUERY_ARG_SQL_SELECTION,
+                        "${MediaStore.MediaColumns.DATA} IN ($placeholders)"
+                    )
+                    putStringArray(
+                        ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                        batch.toTypedArray()
+                    )
+                }
+                runCatching {
+                    resolver.query(uri, projection, args, null)?.use { c ->
+                        while (c.moveToNext()) {
+                            val item = itemOf(c, Kind.AUDIO)
+                            val path = item["path"] as? String ?: continue
+                            out[path] = item
+                        }
+                    }
+                }.onFailure {
+                    AppLogger.w(TAG, "按路径回查音频失败(${batch.size} 条): ${it.message}")
+                }
+            }
+            out
+        }
     }
 
     private fun Cursor.longOr(column: String, fallback: Long = 0L): Long {
@@ -384,9 +640,9 @@ class MediaRoutes(
     private data class ThumbnailAttempt(val bytes: ByteArray?, val reason: String)
 
     /**
-     * 缩略图字节（JPEG）。三级：系统缩略图 → MediaMetadataRetriever → **ffmpeg-kit 软解**。
+     * 缩略图字节（JPEG）。两级：系统缩略图 → MediaMetadataRetriever。
      *
-     * 2026-09-16 加第二级，2026-09-19 加第三级。原来只调 `contentResolver.loadThumbnail()`，
+     * 2026-09-16 加第二级。原来只调 `contentResolver.loadThumbnail()`，
      * 失败就 404，而且异常被 `runCatching{}.getOrNull()` 整个吞掉、一行日志都没有 ——
      * 表现就是"列表有内容、缩略图全是占位图标"，且从任何一侧都查不出是哪一层挂了。
      *
@@ -398,11 +654,24 @@ class MediaRoutes(
      *  · 定制 ROM（随身 WiFi 这类精简系统）的 codec 栈桥接不到硬件 VPU —— 实测本机
      *    `getFrameAtTime` 恒返回 null，所以第二级也出不了图。
      *
-     * 第二级不依赖 MediaProvider 但仍依赖系统 codec；**第三级（仅视频）用 ffmpeg 自带的
-     * 软解码器**，完全绕开系统 codec 栈，这是在本机唯一能出图的路。三级都失败才回 404，
-     * 此时由手机端抽帧回传（`PUT /thumbnail`）兜底。
+     * 第二级不依赖 MediaProvider 但仍依赖系统 codec。两级都失败就回 404，
+     * 此时由**手机端抽帧回传**（`PUT /thumbnail`）兜底 —— 这是本机视频封面唯一可靠的来路。
      *
-     * 三级都慢（读文件 + 软解一帧），但**只在前一级失败时才走**，
+     * ## 决策：core 侧不做 ffmpeg 软解（2026-09-19 放弃，代码已移除）
+     * 曾把 ffmpeg-kit 作为第三级（插件式下发 .so），**不要再直接重试这条路** ——
+     * 现有预编译产物（arthenica 原版已从 Maven 下架，maintained fork 全系列）的 .so
+     * 都按 16KB page size 链接（`PT_LOAD p_align = 16384`），而本机是 Android 12 / 4KB 页，
+     * linker 给 RELRO 段做 mprotect 时会落到未映射区间，报
+     * `can't enable GNU RELRO protection: Out of memory`。
+     *
+     * 这个报错极具误导性：与内存余量、加载方式（APK 内 mmap / 磁盘绝对路径 `System.load`）
+     * 都无关，换版本也无效 —— 排查成本很高，所以把结论留在这里。
+     *
+     * **重启条件**：拿到按 `-Wl,-z,max-page-size=4096` 重编的 .so，或设备升到 16KB 页的
+     * Android 版本。在那之前投入产出不划算 —— 手机 CPU 抽帧本来就比这台设备快得多，
+     * 所以封面兜底走 `PUT /thumbnail`（手机端抽帧回传）。
+     *
+     * 第二级慢（读文件 + 解一帧），但**只在第一级失败时才走**，
      * 且结果有强 ETag + `max-age=86400`，同一张只会算一次。
      */
     private fun thumbnailBytes(kind: Kind, id: Long, size: Int): ThumbnailAttempt {
@@ -431,44 +700,59 @@ class MediaRoutes(
             ?.let { "自行生成 ${it.javaClass.simpleName}: ${it.message}" }
             ?: "自行生成返回空（解码器没吐出画面）"
 
-        // 第三级（仅视频）：ffmpeg-kit 软解抽帧。
-        // 系统 API 和 MMR 都拿不到画面时，靠 ffmpeg 的内建软解码器绕过 ROM 的缺陷。
-        if (kind == Kind.VIDEO) {
-            val path = runCatching {
-                appContext.contentResolver.query(
-                    uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null
-                )?.use { c ->
-                    if (c.moveToFirst()) c.stringOr(MediaStore.MediaColumns.DATA) else null
-                }
-            }.getOrNull()
-            if (!path.isNullOrBlank()) {
-                val ffResult = ffmpegFrameThumbnail(path, size)
-                ffResult.getOrNull()?.let { return ThumbnailAttempt(it, "") }
-                val ffReason = ffResult.exceptionOrNull()
-                    ?.let { "ffmpeg-kit ${it.javaClass.simpleName}: ${it.message}" }
-                    ?: "ffmpeg-kit 返回空"
-                val reason = listOfNotNull(systemReason, generatedReason, ffReason).joinToString(" / ")
-                AppLogger.w(TAG, "缩略图三级全部失败(${kind.key}/$id): $reason")
-                return ThumbnailAttempt(null, reason)
-            }
-        }
-
         val reason = listOfNotNull(systemReason, generatedReason).joinToString(" / ")
         AppLogger.w(TAG, "缩略图生成失败(${kind.key}/$id): $reason")
         return ThumbnailAttempt(null, reason)
     }
 
-    /** 视频：抽第 1 秒附近的关键帧（首帧常是黑场），再按 [size] 等比缩小。 */
+    /**
+     * 视频：在片长中段抽一帧，黑屏就换位置重试，再按 [size] 等比缩小。
+     *
+     * 位置选取与黑帧判定见 [VIDEO_FRAME_RATIOS] / [DARK_LUMA_THRESHOLD]。
+     * 所有候选都偏暗时交**最亮的那张** —— 宁可给一张暗图，也比给纯黑或干脆没有强。
+     */
     private fun videoFrameThumbnail(uri: android.net.Uri, size: Int): Result<ByteArray?> = runCatching {
         appContext.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
             val retriever = MediaMetadataRetriever()
             try {
                 retriever.setDataSource(pfd.fileDescriptor)
-                val frame = retriever.getFrameAtTime(
-                    VIDEO_FRAME_POSITION_US,
-                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-                ) ?: retriever.frameAtTime
-                frame?.scaledDown(size)?.toJpegBytes(THUMB_JPEG_QUALITY)
+                val durationUs = retriever
+                    .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull()
+                    ?.takeIf { it > 0 }
+                    ?.times(1_000L)
+
+                val positions = if (durationUs == null) {
+                    longArrayOf(VIDEO_FRAME_FALLBACK_US)
+                } else {
+                    LongArray(VIDEO_FRAME_RATIOS.size) { i ->
+                        (durationUs * VIDEO_FRAME_RATIOS[i]).toLong()
+                    }
+                }
+
+                var best: Bitmap? = null
+                var bestLuma = -1
+                for (positionUs in positions) {
+                    val frame = retriever.getFrameAtTime(
+                        positionUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    ) ?: continue
+                    val scaled = frame.scaledDown(size)
+                    val luma = scaled.averageLuma()
+                    if (luma >= DARK_LUMA_THRESHOLD) {
+                        best?.recycle()
+                        return@use scaled.toJpegBytes(THUMB_JPEG_QUALITY)
+                    }
+                    if (luma > bestLuma) {
+                        best?.recycle()
+                        best = scaled
+                        bestLuma = luma
+                    } else {
+                        scaled.recycle()
+                    }
+                }
+                best?.toJpegBytes(THUMB_JPEG_QUALITY)
+                    ?: retriever.frameAtTime?.scaledDown(size)?.toJpegBytes(THUMB_JPEG_QUALITY)
             } finally {
                 retriever.release()
             }
@@ -476,107 +760,29 @@ class MediaRoutes(
     }
 
     /**
-     * 视频抽帧第三级：用 ffmpeg-kit 软解一帧。
+     * 网格采样的平均亮度（0~255），用来判断"这帧是不是黑屏"。
      *
-     * 2026-09-19 新增。展锐 VPU 虽然在 `/vendor/lib/modules/` 里，但 ROM 层的
-     * `MediaMetadataRetriever` 桥接不到它（`getFrameAtTime` 返回 null），ffmpeg 的纯软解码
-     * 不依赖系统 codec 栈，所以成了最后一条能出图的路。
-     *
-     * 思路：`ffmpeg -ss 1 -i <path> -frames:v 1 -q:v 2 <output.jpg>` ——
-     * 同步执行，抽一帧就停，输出 JPEG 文件再读进来。
-     *
-     * 放在 [thumbnailBytes] 链路里，位置在系统 API 和 MMR 之后：
-     * 系统 API → MMR → **ffmpeg-kit** → 404（让手机端抽帧回传）。
-     *
-     * .so 加载策略（插件化后）：优先从 `filesDir/components/ffmpeg/` 按绝对路径
-     * `System.load()`，不再依赖 `System.loadLibrary()`。
+     * 用感知加权 `(2R + 5G + B) / 8` 而不是简单平均：人眼对绿最敏感，
+     * 简单平均会把纯绿画面算偏暗、纯蓝画面算偏亮。
+     * 只采 [LUMA_SAMPLE_GRID]² 个点 —— 判断整屏明暗，均匀采样与全量统计结论一致。
      */
-    private fun ffmpegFrameThumbnail(path: String, size: Int): Result<ByteArray?> = runCatching {
-        // 先确保 native 库已加载（插件式：从组件目录按绝对路径加载）
-        if (!ensureFfmpegLoaded()) {
-            AppLogger.d(TAG, "FFmpegKit 不可用（.so 未安装或加载失败），跳过 ffmpeg 抽帧")
-            return@runCatching null
-        }
-
-        // 守卫：反射确认 Java 类存在（compileOnly 在编译期可见，运行时靠 classes.jar 或反射）
-        val kitClass = try {
-            Class.forName("com.arthenica.ffmpegkit.FFmpegKit")
-        } catch (e: ClassNotFoundException) {
-            AppLogger.d(TAG, "FFmpegKit 不可用（类未加载），跳过 ffmpeg 抽帧")
-            return@runCatching null
-        }
-
-        val output = File(thumbCacheDir(), "ffkit_tmp_${System.nanoTime()}.jpg")
-        try {
-            // -y 覆盖输出; -ss 1 seek 到 1s; -frames:v 1 只取一帧; -vf scale 按最长边缩放
-            val cmd = "-y -ss 1 -i \"$path\" -frames:v 1 " +
-                "-vf \"scale='if(gt(iw,ih),$size,-2)':'if(gt(iw,ih),-2,$size)'\" " +
-                "-q:v 2 \"${output.absolutePath}\""
-
-            AppLogger.i(TAG, "ffmpeg-kit 抽帧: $cmd")
-
-            // FFmpegKit.execute(String) 返回 FFmpegSession
-            val executeMethod = kitClass.getMethod("execute", String::class.java)
-            val session = executeMethod.invoke(null, cmd)
-
-            // session.getReturnCode().isValueSuccess()
-            val getReturnCode = session.javaClass.getMethod("getReturnCode")
-            val returnCode = getReturnCode.invoke(session)
-            val isSuccess = returnCode?.javaClass?.getMethod("isValueSuccess")?.invoke(returnCode) as? Boolean ?: false
-
-            if (!isSuccess) {
-                // 取日志看看怎么失败的
-                val getAllLogs = session.javaClass.getMethod("getAllLogsAsString")
-                val logs = (getAllLogs.invoke(session) as? String)?.takeLast(500) ?: "无日志"
-                AppLogger.w(TAG, "ffmpeg-kit 抽帧失败(rc=$returnCode): $logs")
-                return@runCatching null
+    private fun Bitmap.averageLuma(): Int {
+        val stepX = (width / LUMA_SAMPLE_GRID).coerceAtLeast(1)
+        val stepY = (height / LUMA_SAMPLE_GRID).coerceAtLeast(1)
+        var sum = 0L
+        var count = 0
+        var y = 0
+        while (y < height) {
+            var x = 0
+            while (x < width) {
+                val p = getPixel(x, y)
+                sum += (((p shr 16) and 0xFF) * 2 + ((p shr 8) and 0xFF) * 5 + (p and 0xFF)) / 8
+                count++
+                x += stepX
             }
-
-            if (!output.isFile || output.length() <= 0) {
-                AppLogger.w(TAG, "ffmpeg-kit 抽帧命令成功但输出文件为空")
-                return@runCatching null
-            }
-
-            output.readBytes()
-        } finally {
-            output.delete()
+            y += stepY
         }
-    }
-
-    // ── ffmpeg-kit .so 加载（插件式：从 filesDir/components/ffmpeg/ 按绝对路径加载）──
-
-    /** 依赖顺序：前面的库是后面的前提 */
-    private val FFMPEG_SO_LOAD_ORDER = listOf(
-        "libavutil.so", "libswresample.so", "libavcodec.so", "libavformat.so",
-        "libswscale.so", "libavfilter.so", "libavdevice.so",
-        "libffmpegkit_abidetect.so", "libffmpegkit.so"
-    )
-
-    @Volatile
-    private var ffmpegSoLoaded = false
-
-    /** 尝试从组件目录加载所有 .so，成功返回 true。已加载过直接返回缓存结果。 */
-    @Synchronized
-    private fun ensureFfmpegLoaded(): Boolean {
-        if (ffmpegSoLoaded) return true
-        val soDir = File(appContext.filesDir, "components/${BinaryComponentStore.ID_FFMPEG}")
-        if (!soDir.isDirectory) return false
-        try {
-            for (soName in FFMPEG_SO_LOAD_ORDER) {
-                val soFile = File(soDir, soName)
-                if (!soFile.exists()) {
-                    AppLogger.w(TAG, "ffmpeg .so 缺失: $soName")
-                    return false
-                }
-                System.load(soFile.absolutePath)
-            }
-            ffmpegSoLoaded = true
-            AppLogger.i(TAG, "ffmpeg-kit .so 全部加载成功（从 ${soDir.absolutePath}）")
-            return true
-        } catch (e: Throwable) {
-            AppLogger.w(TAG, "ffmpeg .so 加载失败: ${e.javaClass.simpleName}: ${e.message}")
-            return false
-        }
+        return if (count > 0) (sum / count).toInt() else 0
     }
 
     /**
@@ -639,6 +845,165 @@ class MediaRoutes(
             if (c.moveToFirst()) c.stringOr(MediaStore.MediaColumns.DATA).ifBlank { null } else null
         }
     }.getOrNull()
+
+    // ── 外挂字幕（2026-09-19）──────────────────────────────────────────────
+
+    /**
+     * 目录 → 该目录下的字幕文件名列表。
+     *
+     * 存在的理由：`/list` 和 `/browse` 要给每条视频算 `subtitle_count`，一层里几十个视频
+     * 如果各自 `listFiles()` 一遍，同一个目录就被扫了几十次。按目录缓存后每目录只扫一次。
+     *
+     * **只在单次请求内有效**：调用方自己建 map 传进来，不做跨请求缓存 ——
+     * 用户随时可能往目录里拷字幕，缓存住反而要处理失效。
+     */
+    private fun subtitleNamesIn(dir: File?, cache: MutableMap<String, List<String>>): List<String> {
+        val key = dir?.absolutePath ?: return emptyList()
+        cache[key]?.let { return it }
+        val names = runCatching {
+            dir.listFiles()
+                ?.asSequence()
+                ?.filter { it.isFile }
+                ?.map { it.name }
+                ?.filter { it.substringAfterLast('.', "").lowercase(Locale.ROOT) in SUBTITLE_EXTENSIONS }
+                ?.toList()
+                .orEmpty()
+        }.getOrDefault(emptyList())
+        cache[key] = names
+        return names
+    }
+
+    /**
+     * 判断字幕文件名是否属于某个视频。
+     *
+     * 规则：字幕名去掉后缀后，必须等于视频名（`movie.srt`），
+     * 或以「视频名 + 分隔符」开头（`movie.zh.srt`、`movie.chs&eng.ass`、`movie - 中文.srt`）。
+     *
+     * 为什么不用 `startsWith(base)` 了事：那会让 `movie2.srt` 命中 `movie`，
+     * 同一目录下有 `movie.mp4` / `movie2.mp4` 时字幕就串台了。必须卡住紧跟其后的分隔符。
+     */
+    private fun subtitleBelongsTo(subtitleName: String, videoBase: String): Boolean {
+        val stem = subtitleName.substringBeforeLast('.', subtitleName)
+        if (!stem.startsWith(videoBase, ignoreCase = true)) return false
+        if (stem.length == videoBase.length) return true
+        return stem[videoBase.length] in charArrayOf('.', '_', '-', ' ', '[', '(')
+    }
+
+    /**
+     * 从字幕文件名里猜语言标记：`movie.zh-CN.srt` → `zh-CN`，`movie.srt` → 空串。
+     *
+     * 只是给客户端在字幕轨列表里显示个标签用，猜错了不影响播放（播放看的是 mime）。
+     * 不做语言码白名单校验：`chs` / `简体` / `forced` 这些都是现实中存在的标记，
+     * 一律原样带出去比"认不出就丢掉"有用。
+     */
+    private fun subtitleLabelOf(subtitleName: String, videoBase: String): String {
+        val stem = subtitleName.substringBeforeLast('.', subtitleName)
+        if (stem.length <= videoBase.length) return ""
+        return stem.substring(videoBase.length).trim('.', '_', '-', ' ', '[', ']', '(', ')')
+    }
+
+    /**
+     * 这个字幕文件 core 认不认（能给出 MIME 且大小在范围内）。
+     *
+     * 抽出来是因为它有两个调用方且必须同口径：[subtitleEntryOf] 的 `supported` 字段，
+     * 与 `/subtitles` 的排序（能解析的排前面，见那里的注释）。
+     */
+    private fun subtitlePlayable(file: File): Boolean {
+        val ext = file.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        return PLAYABLE_SUBTITLE_MIMES.containsKey(ext) && file.length() in 1..MAX_SUBTITLE_BYTES
+    }
+
+    /**
+     * 一条字幕条目的对外形状（`/subtitles` 的 items 元素）。
+     *
+     * ## `supported` 的确切语义 —— 客户端**不能**直接拿它当"我能播"
+     * 它的含义是「**core 能把这个文件转成 UTF-8 文本并给出字幕 MIME**」，
+     * 判据是 [PLAYABLE_SUBTITLE_MIMES] + 大小范围，对齐的是 **app 端 media3** 的解析能力。
+     *
+     * 各端的真实能力并不一致，客户端必须按自身情况**再过一层**：
+     *  · app（media3）：srt / ass / ssa / vtt / ttml 都能解 —— 与 `supported` 基本等价；
+     *  · web（浏览器 `<track>`）：**只认 WebVTT**。srt 要靠播放器内部转换（ArtPlayer 会），
+     *    ass/ssa 要额外的渲染插件（libass），ttml 则没有通用方案。
+     *
+     * 所以 web 侧另有一份自己的能力映射（`web/src/composables/subtitleFormat.ts`），
+     * 与这里**刻意不同**。不要为了"统一"把两边合成一份 —— 合了之后必然有一端在说谎：
+     * 要么 web 把 ttml 当能播（选了却什么都不显示），要么 app 把能播的 ass 标成不支持。
+     */
+    private fun subtitleEntryOf(file: File, videoBase: String): Map<String, Any?> {
+        val ext = file.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+        val mime = PLAYABLE_SUBTITLE_MIMES[ext]
+        return mapOf(
+            "name" to file.name,
+            "path" to file.absolutePath,
+            "ext" to ext,
+            "size" to file.length(),
+            // supported = core 认这个格式（见 KDoc）。false 的仍然列出来，
+            // 否则用户看到目录里明明有 .sub 却在 App 里查无此文件，只会以为是 bug。
+            "supported" to subtitlePlayable(file),
+            "mime" to (mime ?: ""),
+            "label" to subtitleLabelOf(file.name, videoBase)
+        )
+    }
+
+    /**
+     * 把客户端给的路径收敛成"确实在用户存储里的真实文件"。
+     *
+     * 两道关必须都过：
+     *  1. canonical 化（解掉 `..` 与符号链接）**之后**再比前缀 —— 只查原始字符串的话，
+     *     `/sdcard/../data/data/...` 这种能骗过前缀检查；
+     *  2. 前缀白名单与 [ALLOWED_DIR_PREFIXES] 同口径，和 `/config` 那边保持一致。
+     *
+     * 返回 null = 不合法或不存在，调用方一律回 400/404，不区分（区分了就是在告诉
+     * 外部"这个路径存在但你不能访问"，等于送出一个目录探测器）。
+     */
+    private fun safeUserFile(path: String?): File? {
+        val raw = path?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val file = runCatching { File(raw).canonicalFile }.getOrNull() ?: return null
+        val abs = file.absolutePath
+        if (!ALLOWED_DIR_PREFIXES.any { abs.startsWith(it) }) return null
+        return file.takeIf { it.isFile }
+    }
+
+    /**
+     * 把字幕文件读成 UTF-8 文本。
+     *
+     * ## 为什么必须由 core 转码
+     * 客户端播放器（media3）的字幕解析器按 **UTF-8** 解字节，而中文字幕现实中大量是
+     * GB18030/Big5 —— 直接把原始文件喂给播放器，出来的就是一屏乱码，且播放器不提供
+     * "换个编码重试"的入口。core 在这里一次转干净，客户端永远只见 UTF-8。
+     *
+     * 探测顺序（没有第三方依赖，靠解码器自身的合法性判定）：
+     *  1. BOM：UTF-8 / UTF-16LE / UTF-16BE 直接认（BOM 是明示，不用猜）；
+     *  2. 严格 UTF-8（`REPORT` 而非默认的 `REPLACE`）：能整段解通就是 UTF-8。
+     *     这一步必须严格 —— 默认的替换模式会把非法字节变成 `�` 然后"成功"，
+     *     于是所有 GBK 文件都会被误判成 UTF-8；
+     *  3. GB18030：单/双/四字节全覆盖，是 GBK/GB2312 的超集，中文场景命中率最高；
+     *  4. Big5：繁体字幕；
+     *  5. 兜底 Latin-1（永不失败，至少时间轴和数字还能用）。
+     */
+    private fun decodeSubtitleText(file: File): String {
+        val bytes = file.readBytes()
+        // BOM
+        if (bytes.size >= 3 && bytes[0] == 0xEF.toByte() && bytes[1] == 0xBB.toByte() && bytes[2] == 0xBF.toByte()) {
+            return String(bytes, 3, bytes.size - 3, Charsets.UTF_8)
+        }
+        if (bytes.size >= 2 && bytes[0] == 0xFF.toByte() && bytes[1] == 0xFE.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16LE)
+        }
+        if (bytes.size >= 2 && bytes[0] == 0xFE.toByte() && bytes[1] == 0xFF.toByte()) {
+            return String(bytes, 2, bytes.size - 2, Charsets.UTF_16BE)
+        }
+        for (name in listOf("UTF-8", "GB18030", "Big5")) {
+            val decoded = runCatching {
+                val decoder = Charset.forName(name).newDecoder()
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                decoder.decode(ByteBuffer.wrap(bytes)).toString()
+            }.getOrNull()
+            if (decoded != null) return decoded
+        }
+        return String(bytes, Charsets.ISO_8859_1)
+    }
 
     /**
      * 单首音频的标签：**自己解字节的结果优先**，MediaStore 那份只作为底。
@@ -805,6 +1170,164 @@ class MediaRoutes(
         }.getOrNull()?.takeIf { it.isNotEmpty() }?.let { it to ContentType.Image.JPEG }
     }
 
+    // ═══════════════════ 音频分组聚合（/groups，2026-09-20） ═══════════════════
+
+    /**
+     * 分组维度。
+     *
+     * 只有音频有这三个维度：album / artist 来自内嵌标签，folder 来自路径。
+     * 视频与图片没有等价的标签层（"文件夹视图"它们走 `/browse`），所以 `/groups` 不收其它类型。
+     */
+    private enum class GroupBy(val key: String) {
+        ALBUM("album"), ARTIST("artist"), FOLDER("folder");
+
+        companion object {
+            fun of(raw: String?): GroupBy? = entries.firstOrNull { it.key == raw }
+        }
+    }
+
+    /**
+     * 聚合过程中的可变累加器。
+     *
+     * 一次游标遍历就把三种维度需要的东西都攒齐，**不对每个分组再回查一次库** ——
+     * 那是 N+1：500 个专辑就是 501 次 MediaStore 查询，在这台设备上是秒级的事。
+     */
+    private class GroupAccumulator {
+        var count = 0
+        var coverId = NO_COVER_ID
+
+        /**
+         * album 维度用：组内每个 artist 出现了几次。
+         * 副标题要的是"这张专辑的主要歌手"，而合辑里每首的 artist 都不同 ——
+         * 取第一首会随排序漂移，所以按出现次数投票。
+         */
+        val artistHistogram = HashMap<String, Int>()
+
+        /** artist 维度用：组内出现过的专辑名，去重后的个数就是"N 张专辑"的 N。 */
+        val albums = HashSet<String>()
+    }
+
+    /** 一个分组的最终形态。用具名类型而不是 Map，是为了让排序键不必到处强转。 */
+    private data class AudioGroup(
+        val key: String,
+        val title: String,
+        val subtitle: String,
+        val count: Int,
+        val coverId: Long
+    ) {
+        fun toMap(): Map<String, Any?> = mapOf(
+            "key" to key,
+            "title" to title,
+            "subtitle" to subtitle,
+            "count" to count,
+            "cover_id" to coverId
+        )
+    }
+
+    /**
+     * 标签归一化：去首尾空白，并把 MediaStore 的 [MEDIASTORE_UNKNOWN] 占位当成"没有标签"。
+     *
+     * 不做这一步会同时出现一个叫 `<unknown>` 的分组和一个叫「未知专辑」的分组，
+     * 而它们本来就是同一堆没有标签的文件。
+     */
+    private fun normalizedTag(raw: String): String =
+        raw.trim().takeUnless { it.equals(MEDIASTORE_UNKNOWN, ignoreCase = true) } ?: ""
+
+    /**
+     * 按 [by] 把音频表聚合成分组列表。
+     *
+     * 目录过滤沿用 [scanDirs]（与 `/list` 同一口径）：分组视图与列表视图看到的必须是同一个
+     * 媒体库范围，否则会出现"分组里有 12 首、点进去只有 8 首"。
+     *
+     * 排序在 Kotlin 侧做（count 降序 → title 升序），不交给 SQL：`GROUP BY` 的结果集在
+     * MediaStore 的 `QUERY_ARG_SQL_*` 上并不保证可用（各 ROM 的 MediaProvider 对
+     * 分组语句支持不一），而这里的数据量本来就是"几百个分组"级别，内存排序毫无压力。
+     */
+    private fun audioGroupsPayload(by: GroupBy): Map<String, Any?> {
+        val (selection, selectionArgs) = dirSelection(scanDirs(Kind.AUDIO))
+        val buckets = HashMap<String, GroupAccumulator>()
+
+        runCatching {
+            val queryArgs = Bundle().apply {
+                if (selection != null) {
+                    putString(ContentResolver.QUERY_ARG_SQL_SELECTION, selection)
+                    putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS, selectionArgs)
+                }
+            }
+            appContext.contentResolver.query(
+                contentUriOf(Kind.AUDIO), GROUPS_PROJECTION, queryArgs, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val album = normalizedTag(c.stringOr(MediaStore.Audio.Media.ALBUM))
+                    val artist = normalizedTag(c.stringOr(MediaStore.Audio.Media.ARTIST))
+                    val path = c.stringOr(MediaStore.MediaColumns.DATA)
+                    val key = when (by) {
+                        GroupBy.ALBUM -> album
+                        GroupBy.ARTIST -> artist
+                        // folder 的 key 是目录**绝对路径**：客户端要拿它去 `/list?dir=` 回查，
+                        // 目录名会重名（几十个 Music/xxx 都叫 Download），只有全路径唯一。
+                        GroupBy.FOLDER -> path.substringBeforeLast('/', "")
+                    }
+                    // 推不出目录（DATA 为空或不含分隔符）时直接跳过：key 是要回查的，
+                    // 一个空 key 的文件夹分组点进去必然是空列表 —— 不如不给。
+                    if (by == GroupBy.FOLDER && key.isBlank()) continue
+
+                    val bucket = buckets.getOrPut(key) { GroupAccumulator() }
+                    bucket.count++
+                    // 组内任意一首都能当封面来源（同专辑/同目录的内嵌封面基本一致），
+                    // 所以第一个有效 id 就收手，不为"挑一张最好的"再去读文件。
+                    if (bucket.coverId == NO_COVER_ID) {
+                        bucket.coverId = c.longOr(MediaStore.MediaColumns._ID)
+                    }
+                    when (by) {
+                        GroupBy.ALBUM -> if (artist.isNotBlank()) {
+                            bucket.artistHistogram[artist] =
+                                (bucket.artistHistogram[artist] ?: 0) + 1
+                        }
+                        GroupBy.ARTIST -> if (album.isNotBlank()) bucket.albums += album
+                        GroupBy.FOLDER -> Unit
+                    }
+                }
+            }
+        }.onFailure {
+            AppLogger.w(TAG, "音频分组聚合失败(by=${by.key}): ${it.message}")
+        }
+
+        val groups = buckets.map { (key, bucket) ->
+            AudioGroup(
+                key = key,
+                title = when (by) {
+                    // folder 展示目录名就够了（父路径放 subtitle），全路径会把列表撑爆
+                    GroupBy.FOLDER -> key.substringAfterLast('/').ifBlank { key }
+                    GroupBy.ALBUM -> key.ifBlank { UNKNOWN_ALBUM_TITLE }
+                    GroupBy.ARTIST -> key.ifBlank { UNKNOWN_ARTIST_TITLE }
+                },
+                subtitle = when (by) {
+                    GroupBy.ALBUM -> bucket.artistHistogram.maxByOrNull { it.value }?.key ?: ""
+                    GroupBy.ARTIST -> "${bucket.albums.size} 张专辑"
+                    // 父路径：同名目录（两张卡各有一个 Music）靠它区分
+                    GroupBy.FOLDER -> key.substringBeforeLast('/', "")
+                },
+                count = bucket.count,
+                coverId = bucket.coverId
+            )
+        }.sortedWith(
+            // count 降序（听得最多的专辑通常也是曲目最全的那张），同数量再按 title 升序 ——
+            // 少了第二级排序，同 count 的分组顺序会跟着 HashMap 的迭代顺序随机漂移，
+            // 客户端每次刷新看到的排列都不一样。
+            compareByDescending<AudioGroup> { it.count }.thenBy { it.title }
+        )
+
+        return mapOf(
+            "type" to Kind.AUDIO.key,
+            "by" to by.key,
+            "groups" to groups.map { it.toMap() },
+            // total 是**分组总数**（不是曲目总数，曲目数在每组的 count 里）：
+            // 客户端用它显示"共 37 张专辑"，也用来判断是不是一个都没聚合出来。
+            "total" to groups.size
+        )
+    }
+
     fun register(route: Route) {
         route.route("/media") {
 
@@ -833,6 +1356,14 @@ class MediaRoutes(
              *
              * `total` 单独数一次（同 selection、只取 _ID）：客户端要用它算"还有没有下一页"，
              * 而 `items.size` 只能说明这一页有多少。
+             *
+             * ## 可选过滤：album / artist / dir（2026-09-20）
+             * 给「音频分组」用的回查入口 —— `/groups` 给出分组的 `key`，客户端把它原样送回
+             * 对应参数就能拿到组内曲目，core 侧不需要为"专辑详情"再开一个端点。
+             * 三个参数只对 `type=audio` 生效（理由见 [listSelection]），与扫描目录过滤是 AND。
+             *
+             * 本端点不走 [ResponseCache]：它是分页查询，工作量已经被 SQL 的 LIMIT 限住了，
+             * 叠内存缓存只会多出一份要失效的状态 —— 所以过滤参数也不存在"串缓存"的问题。
              */
             get("/list") {
                 val kind = Kind.of(call.request.queryParameters["type"]) ?: run {
@@ -857,7 +1388,12 @@ class MediaRoutes(
                     .coerceAtLeast(0)
                 val sortColumn = sortColumnOf(call.request.queryParameters["sort"])
                 val desc = call.request.queryParameters["order"]?.lowercase() != "asc"
-                val (selection, selectionArgs) = dirSelection(scanDirs(kind))
+                val albumFilter = filterParam(call.request.queryParameters["album"])
+                val artistFilter = filterParam(call.request.queryParameters["artist"])
+                // 末尾斜杠要去掉：客户端可能传 `/sdcard/Music/`，不去掉会拼出 `//%` 而一条都匹配不上
+                val dirFilter = filterParam(call.request.queryParameters["dir"])?.trimEnd('/')
+                val (selection, selectionArgs) =
+                    listSelection(kind, albumFilter, artistFilter, dirFilter)
 
                 withContext(Dispatchers.IO) {
                     val uri = contentUriOf(kind)
@@ -897,9 +1433,12 @@ class MediaRoutes(
                             putInt(ContentResolver.QUERY_ARG_LIMIT, limit)
                             putInt(ContentResolver.QUERY_ARG_OFFSET, offset)
                         }
+                        // 字幕计数的目录缓存：只活在这一次查询内（用户随时会往目录拷字幕，
+                        // 跨请求缓存就得处理失效，不值得）
+                        val subtitleCache = mutableMapOf<String, List<String>>()
                         resolver.query(uri, projectionOf(kind), args, null)?.use { c ->
                             while (c.moveToNext()) {
-                                items += itemOf(c, kind)
+                                items += itemOf(c, kind, subtitleCache)
                             }
                         }
                     }.onFailure {
@@ -919,6 +1458,61 @@ class MediaRoutes(
                         )
                     )
                 }
+            }
+
+            /**
+             * 音频分组聚合：按专辑 / 歌手 / 文件夹把整个音乐库归堆。
+             *
+             * ## 为什么放在 core 而不是客户端自己分
+             * 客户端要分组就得先把**整库**拉下来（`/list` 分页拉完几千首）才能统计，
+             * 而它真正想显示的只是"37 张专辑"这一屏。聚合在 core 做，一次游标遍历就够，
+             * 网络上只走分组结果；app 与 Web 两端也不必各写一份口径可能不同的统计逻辑。
+             *
+             * ## 只支持音频
+             * album / artist 是 `MediaStore.Audio` 独有的标签维度，视频与图片没有等价物
+             * （它们的"文件夹视图"走 `/browse`）。所以其它 type 一律 400，而不是回一个空分组列表
+             * —— 空列表会被客户端理解成"这台设备没有视频"。
+             *
+             * ## 客户端怎么用回查
+             * 拿 `groups[].key` 送回 `/list`：album → `?album=`、artist → `?artist=`、
+             * folder → `?dir=`。封面走 `/thumbnail?type=audio&id=<cover_id>`。
+             */
+            get("/groups") {
+                // 先判 type：非 audio 的语义是"这个维度不存在"，比 by 的取值问题更靠前
+                val kind = Kind.of(call.request.queryParameters["type"])
+                if (kind != Kind.AUDIO) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "分组仅支持音频：type 必须是 audio"
+                    )
+                    return@get
+                }
+                val by = GroupBy.of(call.request.queryParameters["by"]) ?: run {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "by 必须是 album / artist / folder"
+                    )
+                    return@get
+                }
+                // 未授权的处理与 /list 一致：明确告诉客户端缺哪个权限，让它去引导授权，
+                // 而不是回一个空列表假装"设备里没有音乐"
+                if (!isGranted(kind)) {
+                    call.respondFail(
+                        HttpStatusCode.Forbidden, ErrorCode.BAD_REQUEST,
+                        "媒体权限未授权：${permissionOf(kind)}",
+                        mapOf("permission" to permissionOf(kind), "type" to kind.key)
+                    )
+                    return@get
+                }
+
+                // 缓存 key 含 type 与 by（三个视图各存一份，否则切换维度会拿到上一次的分组），
+                // 再含扫描目录 —— 用户在设置里改了媒体库范围之后，同一个 by 已经不是同一份数据了。
+                val cacheKey = "$GROUPS_CACHE_PREFIX:${kind.key}:${by.key}:" +
+                    scanDirs(kind).joinToString("|")
+                val payload = cache.getOrPut(cacheKey, CacheTTL.MEDIA_GROUPS) {
+                    withContext(Dispatchers.IO) { toJsonElement(audioGroupsPayload(by)) }
+                }
+                call.respond(payload)
             }
 
             /**
@@ -1026,8 +1620,10 @@ class MediaRoutes(
                             )
                             putInt(ContentResolver.QUERY_ARG_LIMIT, MAX_PAGE_SIZE)
                         }
+                        // 本层是同一个目录，字幕的 listFiles 只会发生一次
+                        val subtitleCache = mutableMapOf<String, List<String>>()
                         resolver.query(uri, projectionOf(kind), args, null)?.use { c ->
-                            while (c.moveToNext()) items += itemOf(c, kind)
+                            while (c.moveToNext()) items += itemOf(c, kind, subtitleCache)
                         }
                     }.onFailure {
                         AppLogger.w(TAG, "目录列表查询失败(${kind.key}, $canonical): ${it.message}")
@@ -1098,121 +1694,6 @@ class MediaRoutes(
                             )
                         )
                     )
-                }
-            }
-
-            /**
-             * ffmpeg-kit 自检（2026-09-19）。
-             *
-             * 存在的理由：设备端日志要连 ADB 才看得到，而"缩略图出不来"在客户端只表现为一个
-             * 占位图标。这个端点把三件事一次说清：库有没有打进来、ffmpeg 能不能跑、
-             * 对某个具体文件抽帧要多久。
-             *
-             * 带 `path` 参数时真的抽一帧并计时（不落盘、不写缓存），只回报结果与耗时；
-             * 不带就只回库的可用性与版本。
-             */
-            get("/ffmpeg-status") {
-                val soDir = File(appContext.filesDir, "components/${BinaryComponentStore.ID_FFMPEG}")
-                val soInstalled = soDir.isDirectory && (soDir.listFiles()?.isNotEmpty() == true)
-
-                // 先尝试加载 .so
-                val loaded = ensureFfmpegLoaded()
-
-                val kitAvailable = loaded && runCatching {
-                    Class.forName("com.arthenica.ffmpegkit.FFmpegKit")
-                    true
-                }.getOrDefault(false)
-
-                if (!soInstalled) {
-                    call.respond(
-                        toJsonElement(
-                            mapOf(
-                                "available" to false,
-                                "reason" to "FFmpeg 组件未安装（请在「可选组件」页面安装）"
-                            )
-                        )
-                    )
-                    return@get
-                }
-
-                if (!kitAvailable) {
-                    call.respond(
-                        toJsonElement(
-                            mapOf(
-                                "available" to false,
-                                "reason" to if (!loaded) "FFmpeg .so 加载失败" else "FFmpegKit 类不在 classpath"
-                            )
-                        )
-                    )
-                    return@get
-                }
-
-                val path = call.request.queryParameters["path"]?.trim()?.takeIf { it.isNotBlank() }
-
-                withContext(Dispatchers.IO) {
-                    // .so 已经由 ensureFfmpegLoaded 从组件目录加载完毕，逐个报告状态
-                    var version = ""
-                    var versionOk = false
-                    val loadReport = StringBuilder()
-                    for (soName in FFMPEG_SO_LOAD_ORDER) {
-                        val soFile = File(soDir, soName)
-                        if (soFile.exists()) {
-                            loadReport.appendLine("  ${soName.removeSuffix(".so").removePrefix("lib")}: OK (${soFile.length()} bytes)")
-                        } else {
-                            loadReport.appendLine("  ${soName.removeSuffix(".so").removePrefix("lib")}: MISSING")
-                        }
-                    }
-
-                    // 调 FFmpegKit.execute("-version") 取版本
-                    runCatching {
-                        val kitClass = Class.forName("com.arthenica.ffmpegkit.FFmpegKit")
-                        val session = kitClass.getMethod("execute", String::class.java)
-                            .invoke(null, "-version")
-                        val rc = session.javaClass.getMethod("getReturnCode").invoke(session)
-                        versionOk = rc?.javaClass?.getMethod("isValueSuccess")
-                            ?.invoke(rc) as? Boolean ?: false
-                        version = (session.javaClass.getMethod("getAllLogsAsString")
-                            .invoke(session) as? String)
-                            ?.lineSequence()
-                            ?.firstOrNull { it.contains("ffmpeg version", ignoreCase = true) }
-                            ?.trim()
-                            .orEmpty()
-                    }.onFailure { e ->
-                        val real = if (e is java.lang.reflect.InvocationTargetException) {
-                            e.targetException ?: e.cause ?: e
-                        } else {
-                            e
-                        }
-                        version = "execute 失败: ${real.javaClass.simpleName}: ${real.message}"
-                        if (real is ExceptionInInitializerError) {
-                            real.cause?.let { root ->
-                                version += " → ${root.javaClass.simpleName}: ${root.message}"
-                            }
-                        }
-                    }
-
-                    val result = mutableMapOf<String, Any?>(
-                        "available" to true,
-                        "native_ok" to versionOk,
-                        "version" to version,
-                        "load_report" to loadReport.toString().trim(),
-                        "so_dir" to soDir.absolutePath
-                    )
-
-                    if (path != null) {
-                        val started = System.currentTimeMillis()
-                        val attempt = ffmpegFrameThumbnail(path, DEFAULT_THUMB_SIZE)
-                        val elapsed = System.currentTimeMillis() - started
-                        result["probe_path"] = path
-                        result["probe_elapsed_ms"] = elapsed
-                        result["probe_ok"] = attempt.getOrNull() != null
-                        result["probe_bytes"] = attempt.getOrNull()?.size ?: 0
-                        attempt.exceptionOrNull()?.let {
-                            result["probe_error"] = "${it.javaClass.simpleName}: ${it.message}"
-                        }
-                    }
-
-                    call.respond(toJsonElement(result))
                 }
             }
 
@@ -1389,6 +1870,63 @@ class MediaRoutes(
             }
 
             /**
+             * 清空**设备侧**的缩略图缓存（2026-09-20）。
+             *
+             * ## 为什么必须有这条
+             * 缩略图一共有三层缓存，缺了这条就有一层永远清不掉：
+             *  1. 客户端的图片加载库（磁盘 + 内存，按 URL 命中）；
+             *  2. 客户端自己抽帧的成果（App 的 `media-thumbs/`）；
+             *  3. **本目录**（`filesDir/thumbs/`，客户端回传的成果）。
+             *
+             * `/thumbnail` 是"缓存命中就直接返回"，而 URL 只含 (type, id) 不含内容指纹 ——
+             * 于是一旦某张图算错了（典型：抽到黑场），它会一直被原样发下去。
+             * 之前客户端只能清掉第 2 层，清完再请求又被本层的旧图命中，
+             * 表现就是"怎么清都还是那张黑图"。
+             *
+             * `type` 省略则清全部；给了就只清那一类（换了抽帧策略时通常只需要重算视频）。
+             */
+            delete("/thumbnail-cache") {
+                val typeParam = call.request.queryParameters["type"]?.trim().orEmpty()
+                val kind = if (typeParam.isBlank()) null else Kind.of(typeParam)
+                if (typeParam.isNotBlank() && kind == null) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "type 只能是 video / audio / image"
+                    )
+                    return@delete
+                }
+                val result = withContext(Dispatchers.IO) {
+                    val prefix = kind?.let { "${it.key}_" }
+                    var removed = 0
+                    var freed = 0L
+                    thumbCacheDir().listFiles()?.forEach { f ->
+                        if (!f.isFile) return@forEach
+                        if (prefix != null && !f.name.startsWith(prefix)) return@forEach
+                        val len = f.length()
+                        if (f.delete()) {
+                            removed++
+                            freed += len
+                        }
+                    }
+                    removed to freed
+                }
+                AppLogger.i(
+                    TAG,
+                    "已清空缩略图缓存(${kind?.key ?: "全部"}): ${result.first} 张, ${result.second / 1024} KB"
+                )
+                call.respond(
+                    toJsonElement(
+                        mapOf(
+                            "success" to true,
+                            "type" to (kind?.key ?: ""),
+                            "removed" to result.first,
+                            "freed_bytes" to result.second
+                        )
+                    )
+                )
+            }
+
+            /**
              * 音频封面（原始内嵌图，取不到时回退到大尺寸缩略图）。
              *
              * 与 `/thumbnail` 分开的理由：列表要的是"小而快"（256px、可缓存、能糊），
@@ -1462,6 +2000,158 @@ class MediaRoutes(
                             "text" to (text ?: "")
                         )
                     )
+                )
+            }
+
+            /**
+             * 某个视频可用的**外挂字幕列表**（2026-09-19）。
+             *
+             * ## 为什么必须由 core 来列
+             * `/list` 与 `/browse` 的数据来自 MediaStore 的视频集合，而 `.srt` 不是视频，
+             * **永远不会出现在那个集合里** —— 客户端靠媒体库接口发现不了字幕。
+             * 而 `/files/list` 虽然能看见真实目录条目，却要客户端自己把"哪个字幕属于哪个视频"
+             * 的匹配规则实现一遍（还得在两个播放入口各写一份）。判定放在 core，客户端只渲染。
+             *
+             * ## 两种取法
+             *  · `scope=matched`（默认）：只回**按文件名判定属于这个视频**的（见 [subtitleBelongsTo]），
+             *    给"打开就自动挂上字幕"用；
+             *  · `scope=folder`：回同目录下**所有**字幕文件，给"手动选字幕文件"的列表用 ——
+             *    现实里字幕名和视频名经常对不上（压制组命名、单独下载的字幕包）。
+             *
+             * `supported = false` 的条目照样返回（MicroDVD `.sub`、SAMI `.smi`）：
+             * 让客户端显示"格式不支持"，而不是让用户对着目录里明明存在的文件怀疑 App 瞎了。
+             */
+            get("/subtitles") {
+                val videoPath = call.request.queryParameters["path"]
+                if (!isGranted(Kind.VIDEO)) {
+                    call.respondFail(
+                        HttpStatusCode.Forbidden, ErrorCode.BAD_REQUEST,
+                        "媒体权限未授权：${permissionOf(Kind.VIDEO)}"
+                    )
+                    return@get
+                }
+                // 远端存储源（`remote:<id>/…`）：回**空列表**而不是 400。
+                // 2026-09-21：播放器打开任何视频都会先探一次字幕，远端路径过不了
+                // `safeUserFile`（它只认本机用户存储），于是每次播远端视频都在日志里
+                // 留一条 `HTTP 400 path 必须是用户存储内的真实文件` —— 那看起来像是
+                // 播放失败的原因，实际只是探测本身不适用，真正的失败在别处。
+                // 远端字幕要能用，得先有"读远端字幕内容"的链路（`/media/subtitle` 同样只认本地），
+                // 那是另一件事；在它到位之前，诚实地回"没有可用字幕"。
+                if (videoPath?.startsWith("remote:") == true) {
+                    call.respond(
+                        toJsonElement(
+                            mapOf(
+                                "path" to videoPath,
+                                "scope" to "matched",
+                                "items" to emptyList<Any>(),
+                                "remote_unsupported" to true
+                            )
+                        )
+                    )
+                    return@get
+                }
+                val video = safeUserFile(videoPath) ?: run {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "path 必须是用户存储内的真实文件"
+                    )
+                    return@get
+                }
+                val folderScope = call.request.queryParameters["scope"]
+                    .equals("folder", ignoreCase = true)
+
+                val items = withContext(Dispatchers.IO) {
+                    val base = video.nameWithoutExtension
+                    val dir = video.parentFile
+                    subtitleNamesIn(dir, mutableMapOf())
+                        .asSequence()
+                        .filter { folderScope || subtitleBelongsTo(it, base) }
+                        .mapNotNull { name -> File(dir, name).takeIf { it.isFile } }
+                        // 排序三档，顺序不能换：
+                        //  1. **能解析的优先** —— 客户端"打开就自动挂第一条"，如果让
+                        //     `movie.sub`（MicroDVD，supported=false）靠同名排到第一，
+                        //     自动挂上的就是一条放不出来的字幕，用户只会以为字幕功能坏了；
+                        //  2. 同名优先 —— `movie.srt` 比 `movie.zh.srt` 更贴切；
+                        //  3. 名字字典序 —— 让同批次多语言字幕的顺序稳定。
+                        .sortedWith(
+                            compareByDescending<File> { subtitlePlayable(it) }
+                                .thenByDescending { it.nameWithoutExtension.equals(base, true) }
+                                .thenBy { it.name.lowercase(Locale.ROOT) }
+                        )
+                        .take(MAX_SUBTITLE_ENTRIES)
+                        .map { subtitleEntryOf(it, base) }
+                        .toList()
+                }
+                call.respond(
+                    toJsonElement(
+                        mapOf(
+                            "path" to video.absolutePath,
+                            "scope" to (if (folderScope) "folder" else "matched"),
+                            "items" to items
+                        )
+                    )
+                )
+            }
+
+            /**
+             * 字幕文件内容，**统一转成 UTF-8** 后原样输出（2026-09-19）。
+             *
+             * ## 为什么不让客户端直接拉 `/files/stream`
+             * 那样拿到的是原始字节，而 media3 的字幕解析器按 UTF-8 解 ——
+             * 中文字幕大量是 GB18030/Big5，结果就是一屏乱码，且播放器没有"换编码重试"的入口。
+             * 这条端点把编码探测与转码收在服务端（见 [decodeSubtitleText]），
+             * 客户端把本 URL 直接塞进播放器的字幕轨配置即可，永远只会见到 UTF-8。
+             *
+             * Content-Type 按后缀给准确的字幕 MIME（播放器靠它选解析器），
+             * 并显式带 `charset=utf-8` —— 这是本端点存在的全部意义，不能省。
+             *
+             * 缓存：字幕文件内容只随文件本身变，给一天的 `max-age`；
+             * 不做 ETag —— 字幕就几十 KB，省的那点带宽不值得多一轮条件请求。
+             */
+            get("/subtitle") {
+                if (!isGranted(Kind.VIDEO)) {
+                    call.respondFail(
+                        HttpStatusCode.Forbidden, ErrorCode.BAD_REQUEST,
+                        "媒体权限未授权：${permissionOf(Kind.VIDEO)}"
+                    )
+                    return@get
+                }
+                val file = safeUserFile(call.request.queryParameters["path"]) ?: run {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "path 必须是用户存储内的真实文件"
+                    )
+                    return@get
+                }
+                val ext = file.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
+                val mime = PLAYABLE_SUBTITLE_MIMES[ext] ?: run {
+                    call.respondFail(
+                        HttpStatusCode.UnsupportedMediaType, ErrorCode.BAD_REQUEST,
+                        "不支持的字幕格式：.$ext"
+                    )
+                    return@get
+                }
+                if (file.length() !in 1..MAX_SUBTITLE_BYTES) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "字幕文件大小异常（${file.length()} 字节，上限 ${MAX_SUBTITLE_BYTES / 1024 / 1024}MB）"
+                    )
+                    return@get
+                }
+                val text = withContext(Dispatchers.IO) {
+                    runCatching { decodeSubtitleText(file) }.getOrNull()
+                }
+                if (text == null) {
+                    call.respondFail(
+                        HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR,
+                        "字幕读取失败"
+                    )
+                    return@get
+                }
+                call.response.header(HttpHeaders.CacheControl, "private, max-age=86400")
+                call.respondText(
+                    text = text,
+                    contentType = ContentType.parse(mime).withCharset(Charsets.UTF_8)
                 )
             }
 

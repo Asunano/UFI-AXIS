@@ -50,6 +50,26 @@ object RetrofitClient {
     @Volatile
     var onUnauthorized: (() -> Unit)? = null
 
+    /**
+     * 「传输层打不通」回调（2026-09-21）。
+     *
+     * 任何业务 `/api/` 请求在 OkHttp 层抛 [IOException]（连接被拒 / 超时 / DNS / SSL）时触发一次。
+     * 由 `ConnectionBootstrap` 接到 `HealthModule.notifyTransportFailure()`，让**任何一个域**的
+     * 网络失败都能立刻驱动一次 `/health` 探活。
+     *
+     * 为什么需要它：此前「失败 → 探活 → 弹提示」这条链只由 5 个 state 的 `errorMessage`
+     * combine 触发（dashboard/network/monitor/tools/service）。文件、媒体、下载、隧道、
+     * 应用管理这些域的失败**完全不在链上**，于是设备离线时用户只看到一堆行内红条，
+     * 永远等不到那句「设备未连接」。
+     *
+     * 约束：
+     * - 只在业务 `/api/` 上触发。`/health` 自己走的是非 `/api/` 路径，因此**不会递归**；
+     * - 回调跑在 OkHttp 的网络线程上，实现方必须立刻返回（丢进 scope，不要阻塞）；
+     * - 去抖在 `HealthModule` 里做（一个页面并发 6 个请求也只探一次）。
+     */
+    @Volatile
+    var onTransportFailure: (() -> Unit)? = null
+
     fun getApiService(prefs: AppPreferences): UfiAxisApi {
         if (apiService == null) {
             synchronized(this) {
@@ -139,7 +159,12 @@ object RetrofitClient {
             } catch (e: IOException) {
                 // 传输层失败（连接被拒 / 超时 / DNS / SSL）= core 不可达或正在重启。
                 // 这**不是**被吊销，而且要给策略打上标记：紧跟其后的那次拒绝同样不算数。
-                if (businessApi) AuthRejectionPolicy.onTransportFailure()
+                if (businessApi) {
+                    AuthRejectionPolicy.onTransportFailure()
+                    // 立刻驱动一次 /health 探活（去抖在 HealthModule 里）。
+                    // runCatching：回调实现出错绝不能改变这里抛出的原始异常。
+                    runCatching { onTransportFailure?.invoke() }
+                }
                 throw e
             }
             if (!businessApi) return response

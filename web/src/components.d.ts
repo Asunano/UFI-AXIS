@@ -68,8 +68,6 @@ declare module 'vue' {
     NSlider: typeof import('naive-ui')['NSlider']
     NSpace: typeof import('naive-ui')['NSpace']
     NSpin: typeof import('naive-ui')['NSpin']
-    NStep: typeof import('naive-ui')['NStep']
-    NSteps: typeof import('naive-ui')['NSteps']
     NSwitch: typeof import('naive-ui')['NSwitch']
     NTab: typeof import('naive-ui')['NTab']
     NTable: typeof import('naive-ui')['NTable']
@@ -84,7 +82,9 @@ declare module 'vue' {
     RouterView: typeof import('vue-router')['RouterView']
     ScrollingLineChart: typeof import('./components/ScrollingLineChart.vue')['default']
     ServiceStoppedNotice: typeof import('./components/ServiceStoppedNotice.vue')['default']
+    StepWizard: typeof import('./components/StepWizard.vue')['default']
     ToggleRow: typeof import('./components/ToggleRow.vue')['default']
     ValueBadge: typeof import('./components/ValueBadge.vue')['default']
+    VideoPlayer: typeof import('./components/VideoPlayer.vue')['default']
   }
 }

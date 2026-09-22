@@ -47,14 +47,22 @@ object UfiAlertToastRules {
      */
     fun durationMs(level: String): Long = if (isCritical(level)) 6000L else 3000L
 
-    /** 告警类型 → 中文标签（与 NotificationCenter.alertTypeLabel 对齐，避免跨模块依赖）。 */
+    /**
+     * 告警类型 → 中文标签。
+     *
+     * 2026-09-21 对齐 `AlertEngine` 实际的 8 个 type：删掉 `cpu_temp` / `disk`
+     * （引擎里从来没有这两个 type，是早期设计残留），补上 `temperature` / `traffic_limit` /
+     * `device_online` / `device_offline`。未登记的 type 回落成 type 本身。
+     */
     fun alertTypeLabel(type: String): String = when (type) {
-        "cpu_temp" -> "CPU 温度"
+        "temperature" -> "设备温度"
         "battery" -> "电池"
         "signal" -> "信号"
         "traffic" -> "流量"
+        "traffic_limit" -> "套餐用量"
         "connectivity" -> "连接"
-        "disk" -> "存储"
+        "device_online" -> "设备接入"
+        "device_offline" -> "设备离开"
         else -> type
     }
 }

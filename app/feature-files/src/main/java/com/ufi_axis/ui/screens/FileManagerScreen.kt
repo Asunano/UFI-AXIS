@@ -19,6 +19,9 @@ import com.ufi_axis.viewmodel.MainViewModel
 fun FileManagerScreen(viewModel: MainViewModel, navController: NavHostController) {
     FileManagerRoot(
         viewModel = viewModel.files,
+        // 存储源的增删改查（长按存储行 → 编辑 / 测试 / 删除）在文件管理器首屏完成，
+        // 所以把那个模块也传进去。2026-09-21 起独立的「外部存储」列表页已删除。
+        sourceModule = viewModel.storageSources,
         navController = navController
     )
 }

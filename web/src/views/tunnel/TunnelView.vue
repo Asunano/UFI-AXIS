@@ -8,8 +8,11 @@
       2026-09-08 拆分：卡片与弹窗各自成文件（本文件原 1188 行）。这里只留
       数据装配 + 动作编排 —— 也就是那些必须在页面层持有的东西：
       轮询、act() 的统一错误处理、以及组件安装进度（见 useComponentInstaller 的文件头）。
+
+      2026-09-21：概览卡换成 TunnelRunBar（一条 ~70px 的运行态条，不再是卡），
+      理由与取舍写在那个组件的文件头。
     -->
-    <TunnelOverviewCard
+    <TunnelRunBar
       :components="overviewComponents"
       :local-port="status.localPort"
       :loading="loading"
@@ -23,6 +26,7 @@
     <TunnelListCard
       :kind="tunnelKind"
       :group="activeGroup"
+      :counts="kindCounts"
       :installed="activeInstalled"
       :binary="activeBinary"
       :busy="busy"
@@ -91,7 +95,7 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useComponentInstaller } from '@/composables/useComponentInstaller';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { errText, type Instance } from './tunnelShared';
-import TunnelOverviewCard from './components/cards/TunnelOverviewCard.vue';
+import TunnelRunBar from './components/cards/TunnelRunBar.vue';
 import TunnelListCard from './components/cards/TunnelListCard.vue';
 // 五个弹窗都是按需加载，组件本体与显隐时序由 useLazyModal 管（见下方 componentsModal 等）。
 
@@ -133,7 +137,14 @@ const stopAllOfKind = () => (isFrp.value ? stopAllFrp() : stopAllCf());
 const activeInstalled = computed(() => (isFrp.value ? status.frpInstalled : status.cfInstalled));
 const activeBinary = computed(() => (isFrp.value ? 'frpc' : 'cloudflared'));
 
-/** 概览里的两个组件行；「本机服务端口」不属于组件，写在卡片模板里 */
+/** 两类各自的「在跑 / 总数」，挂在列表卡那两颗切换按钮上：
+    不切过去也知道另一边有几条在跑。running 是名字数组，长度即条数。 */
+const kindCounts = computed(() => ({
+  frp: { running: frp.running.length, total: frp.items.length },
+  cf: { running: cf.running.length, total: cf.items.length },
+}));
+
+/** 运行态条里的两个组件读数；「回源端口」不属于组件，写在那个组件的模板里 */
 const overviewComponents = computed(() => [
   {
     key: 'frp',
@@ -151,7 +162,7 @@ const overviewComponents = computed(() => [
   },
 ]);
 
-// 组件管理与看护设置从常驻卡片改成弹窗，入口在概览卡头
+// 组件管理与看护设置从常驻卡片改成弹窗，入口在运行态条的 ⋯ 菜单
 const componentsModal = useLazyModal(() => import('./components/modals/ComponentsModal.vue'));
 const guardModal = useLazyModal(() => import('./components/modals/GuardSettingsModal.vue'));
 const componentsComponent = componentsModal.component;
@@ -161,10 +172,8 @@ const guardShow = guardModal.show;
 
 // 组件安装的状态与 1s 进度轮询挂在页面上（弹窗关了也要继续），只把展示交给 ComponentsModal。
 // onChanged：组件装好/卸掉后 installed 与版本号变了，隧道侧的 status 得重拉。
-// only：/api/components 里还有 ffmpeg（视频封面抽帧用，入口在媒体 → 视频设置），
-// 本页只列隧道自己的两个二进制。
 const { comp, progressActive, loadComponents, installComponent, confirmUninstall, uploadComponent } =
-  useComponentInstaller({ onChanged: () => loadStatus(), only: ['frpc', 'cloudflared'] });
+  useComponentInstaller({ onChanged: () => loadStatus() });
 
 // ── 编辑与日志弹窗的目标 ──
 // 两个编辑器共用一个 editorName：同一时刻只可能开一个（由 tunnelKind 决定开哪个）。

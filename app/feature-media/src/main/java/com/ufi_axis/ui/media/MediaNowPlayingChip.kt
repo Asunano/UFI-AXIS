@@ -18,9 +18,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
@@ -38,8 +40,6 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -54,10 +54,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -70,6 +72,7 @@ import com.ufi_axis.data.media.UfiAudioLyrics
 import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiNowPlayingSlot
+import com.ufi_axis.ui.components.common.UfiSlider
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
@@ -110,6 +113,14 @@ internal object UfiNowPlayingState {
     /** 循环模式与随机开关：迷你控制器要把这两个真实能力摆出来（见 [Player.RepeatMode]）。 */
     val repeatMode: MutableState<Int> = mutableStateOf(Player.REPEAT_MODE_OFF)
     val shuffleEnabled: MutableState<Boolean> = mutableStateOf(false)
+    /**
+     * 当前这句歌词还会停留多久（毫秒）。
+     *
+     * 给标题栏那行长歌词做"按时间横向跑"用：跑完的时间对上这句唱完的时间，
+     * 而不是用固定速度的跑马灯 —— 后者要么没跑完就换句、要么跑完还在原地绕圈。
+     * 0 = 不知道（没歌词 / 没时间轴），此时不跑。
+     */
+    val lyricHoldMs: MutableState<Long> = mutableStateOf(0L)
 }
 
 /**
@@ -133,6 +144,18 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
     var mediaId by remember { mutableStateOf("") }
     var positionMs by remember { mutableStateOf(0L) }
 
+    /*
+     * 标题栏这块地要不要继续占着 —— 三个输入，判定在下面那个 LaunchedEffect 里。
+     *
+     * 2026-09-20：原来只看"队列非空"，于是暂停、甚至整张歌单放完之后挂件仍然赖在标题栏，
+     * 天气永远被压着。现在改成"还在放 / 刚暂停一会儿"才占着。
+     */
+    var hasContent by remember { mutableStateOf(false) }
+    var playing by remember { mutableStateOf(false) }
+    var ended by remember { mutableStateOf(false) }
+    /** 队列跑到底：没有下一首、且不循环 —— 单曲/列表循环都会继续放，不算放完。 */
+    var queueExhausted by remember { mutableStateOf(false) }
+
     DisposableEffect(controller) {
         val c = controller
         UfiNowPlayingState.controller.value = c
@@ -141,7 +164,6 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             return@DisposableEffect onDispose { }
         }
         fun sync() {
-            val hasQueue = c.mediaItemCount > 0
             mediaId = c.currentMediaItem?.mediaId.orEmpty()
             meta = c.mediaMetadata
             UfiNowPlayingState.isPlaying.value = c.isPlaying
@@ -151,7 +173,10 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             UfiNowPlayingState.repeatMode.value = c.repeatMode
             UfiNowPlayingState.shuffleEnabled.value = c.shuffleModeEnabled
             // 队列空 = 这次进程里还没播过任何东西：标题栏不该为它改版式
-            UfiNowPlayingSlot.active.value = hasQueue && mediaId.isNotBlank()
+            hasContent = c.mediaItemCount > 0 && mediaId.isNotBlank()
+            playing = c.isPlaying
+            ended = c.playbackState == Player.STATE_ENDED
+            queueExhausted = !c.hasNextMediaItem() && c.repeatMode == Player.REPEAT_MODE_OFF
         }
         sync()
         val listener = object : Player.Listener {
@@ -169,6 +194,32 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             UfiNowPlayingState.controller.value = null
             UfiNowPlayingSlot.active.value = false
         }
+    }
+
+    /*
+     * 标题栏右侧这块地的占用判定（2026-09-20 新增让位规则）。
+     *
+     * - 还在放 → 一直占着；**一按播放立刻回来**（这个 effect 会因 playing 变化立即重跑）
+     * - 播完最后一首且不循环 → 立刻让位：已经没有"待续"了，留着只是挡住天气
+     *   （单曲/列表循环时 queueExhausted 为 false —— 那只是这一首结束，歌还会继续）
+     * - 暂停 → 给 [NOW_PLAYING_PAUSE_YIELD_MS] 的缓冲再让位：
+     *   随手暂停几秒又继续很常见，立刻让位会让标题栏来回跳版式
+     */
+    LaunchedEffect(hasContent, playing, ended, queueExhausted) {
+        if (!hasContent) {
+            UfiNowPlayingSlot.active.value = false
+            return@LaunchedEffect
+        }
+        if (playing) {
+            UfiNowPlayingSlot.active.value = true
+            return@LaunchedEffect
+        }
+        if (ended && queueExhausted) {
+            UfiNowPlayingSlot.active.value = false
+            return@LaunchedEffect
+        }
+        delay(NOW_PLAYING_PAUSE_YIELD_MS)
+        UfiNowPlayingSlot.active.value = false
     }
 
     // 位置轮询：只用来挑"当前是哪一句歌词"，1s 足够
@@ -213,15 +264,29 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
         )?.lines.orEmpty()
     }
 
-    // 第二行只放**歌词**：歌手已经拼在第一行了，这里再退回歌手就是同一句话说两遍。
-    // 没歌词（或还没解析出来）就留空，第二行自然消失。
+    // 第二行只放**歌词**：歌手已经单独占一行了，这里再退回歌手就是同一句话说两遍。
+    // 没歌词（或还没解析出来）就留空，这一行自然消失。
     LaunchedEffect(lyrics, positionMs) {
-        val line = ufiLyricIndexAt(lyrics, positionMs)
-            .takeIf { it >= 0 }
+        val idx = ufiLyricIndexAt(lyrics, positionMs)
+        val line = idx.takeIf { it >= 0 }
             ?.let { lyrics.getOrNull(it)?.text }
             ?.takeIf { it.isNotBlank() }
         UfiNowPlayingState.subtitle.value = line.orEmpty()
         UfiNowPlayingState.subtitleIsLyric.value = line != null
+        /*
+         * 这一句还会停留多久 = 下一句的时间戳 − 当前播放位置。
+         * 最后一句没有"下一句"，退回整首的剩余时长。
+         *
+         * 精度受位置轮询（1s）限制，够用：这个值只用来定"横向跑多快"，
+         * 差个几百毫秒看不出来，但比固定速度的跑马灯准得多。
+         */
+        UfiNowPlayingState.lyricHoldMs.value = if (idx < 0) {
+            0L
+        } else {
+            val end = lyrics.getOrNull(idx + 1)?.timeMs
+                ?: UfiNowPlayingState.durationMs.value.takeIf { it > 0 }
+            (end?.minus(positionMs) ?: 0L).coerceAtLeast(0L)
+        }
     }
 }
 
@@ -246,16 +311,33 @@ fun UfiAudioNowPlayingChip(navController: NavHostController) {
     val hasPrev = UfiNowPlayingState.hasPrev.value
     val artwork = UfiNowPlayingState.artworkUrl.value
     val artistLine = UfiNowPlayingState.artist.value
-    val headline = if (artistLine.isBlank()) title else "$title · $artistLine"
 
     var dialogOpen by remember { mutableStateOf(false) }
 
+    /*
+     * 2026-09-21：去掉整块的 clip + background + 横向内边距 + 纵向内边距。
+     *
+     * 底色与横向内边距：原来是一个半透明圆角块（surfaceMuted @ 0.55）+ 8dp 内边距。
+     * 块的外边缘确实落在 16dp（HeaderPaddingH），但**块里最靠右的是 48dp 封面** ——
+     * 封面距屏幕边缘 16 + 8 = 24dp，比左侧标题文字的 16dp 多 8dp，看着就是整块偏左。
+     * 而天气挂件本来就没有底色，两者轮流占同一个位置却一个有块一个没块，切换时也不齐。
+     *
+     * 纵向那 2dp：它让挂件内容的上下沿各比左侧标题列内缩 2dp，"顶底对齐"就做不到
+     * （与天气挂件同一处理，见 UfiHeaderWeather）。文字不会贴到标题栏边缘 ——
+     * 标题栏自己有 HEADER_PADDING_TOP/BOTTOM_NOW_PLAYING。
+     *
+     * 现在与天气挂件、左侧标题统一：无底色、无内边距，内容直接从 16dp 起排。
+     * 封面自己仍有圆角与底色（见下面那个 Box），所以不会看起来"裸"。
+     */
     Row(
         modifier = Modifier
-            .clip(RoundedCornerShape(CHIP_CORNER))
-            .background(palette.surfaceMuted.copy(alpha = CHIP_BG_ALPHA))
-            .padding(horizontal = Spacing.Small, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+            // 撑满页壳给右侧插槽的高度 —— 那个高度是**左侧"标题 + 诗句"反推**出来的
+            // （页壳用 Row + height(IntrinsicSize.Min) 做的，见 UfiHeader 里那段说明），
+            // 所以这里不需要任何写死的 dp，改字号也不会错位。
+            .fillMaxHeight(),
+        // 内容**贴底**而不是居中：左侧最后一行是诗句、它的底沿就是标题列的底沿，
+        // 右侧两行加起来比左侧矮，居中的话最后一行会浮在诗句上方一截。
+        verticalAlignment = Alignment.Bottom,
         horizontalArrangement = Arrangement.spacedBy(Spacing.Small)
     ) {
         Column(
@@ -266,36 +348,59 @@ fun UfiAudioNowPlayingChip(navController: NavHostController) {
                 .padding(horizontal = 2.dp),
             horizontalAlignment = Alignment.End
         ) {
+            // 第一行：歌名
             AnimatedContent(
-                targetState = subtitle,
+                targetState = title,
                 transitionSpec = { chipTextTransition() },
-                label = "nowPlayingLyric"
-            ) { text ->
-                if (text.isNotBlank()) {
-                    Text(
-                        text,
-                        style = UfiTextStyles.caption,
-                        color = if (isLyric) palette.accent else palette.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.End
-                    )
-                }
-            }
-            AnimatedContent(
-                targetState = headline,
-                transitionSpec = { chipTextTransition() },
-                label = "nowPlayingHeadline"
+                label = "nowPlayingTitle"
             ) { text ->
                 Text(
                     text,
-                    style = UfiTextStyles.caption,
+                    style = UfiTextStyles.headerSubtitle,
                     color = palette.textPrimary,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.End
                 )
             }
+            // 第二行：歌手（比歌名小一档 —— 一眼先看到的应该是歌名）。
+            // 前缀一个「- 」把它与上面的歌名区分开，不然两行同色小字读起来像一句被折行了。
+            // 颜色比 textSecondary 再浅一档（[CHIP_ARTIST_ALPHA]）：三行要有三级层级，
+            // 歌手与歌词同用 textSecondary 时中间那一档等于不存在。
+            AnimatedContent(
+                targetState = artistLine,
+                transitionSpec = { chipTextTransition() },
+                label = "nowPlayingArtist"
+            ) { text ->
+                if (text.isNotBlank()) {
+                    Text(
+                        "- $text",
+                        style = UfiTextStyles.caption,
+                        color = palette.textSecondary.copy(alpha = CHIP_ARTIST_ALPHA),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End
+                    )
+                }
+            }
+            /*
+             * 第三行：当前歌词。与上面的歌手之间留一道 [CHIP_LYRIC_GAP] ——
+             * 上两行是"这首歌是什么"（慢变量），这一行是"唱到哪了"（快变量），
+             * 挨在一起会读成三行同类信息。
+             *
+             * 换句动效与长句横向滚动都在 [MediaLyricTickerText] 里（音乐页迷你条第一行
+             * 用的是同一个组件）。非歌词的副标题（目前只有"没解析出歌词"这一种情况，
+             * 此时 subtitle 为空）不会走到这里，所以颜色恒用 accent 之外还留了 textSecondary
+             * 兜底，语义与改动前一致。
+             */
+            MediaLyricTickerText(
+                text = subtitle,
+                holdMs = UfiNowPlayingState.lyricHoldMs.value,
+                style = UfiTextStyles.headerCaption,
+                color = if (isLyric) palette.accent else palette.textSecondary,
+                textAlign = TextAlign.End,
+                modifier = Modifier.padding(top = CHIP_LYRIC_GAP),
+            )
         }
 
         // 封面：点击打开迷你播放器弹窗
@@ -414,14 +519,29 @@ private fun NowPlayingMiniDialog(
     val palette = LocalResolvedPalette.current
 
     /*
-     * 拖动中不让轮询回来的 positionMs 把滑块拽走：dragging 为真时用手上的 dragFraction，
-     * 松手才 onSeek 并交还给播放器。少这一层，拖的过程每秒会被打断一次。
+     * 滑块显示值的三级优先：拖动中 > 刚 seek 完还没回读 > 播放器回读。
+     *
+     * 中间那一级是为了修掉"松手回弹一下再跳过去"：位置是 1s 轮询回来的，松手瞬间
+     * positionMs 还是旧值，只按它算就会先弹回原处、下一次轮询才跳到目标。
+     * 所以 seek 之后把目标位置暂存在 pendingSeekMs，显示用它顶住，等轮询追上再交还。
      */
     var dragging by remember { mutableStateOf(false) }
     var dragFraction by remember { mutableFloatStateOf(0f) }
-    val playedFraction =
-        if (durationMs > 0) (positionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
-    val shownFraction = if (dragging) dragFraction else playedFraction
+    var pendingSeekMs by remember { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(pendingSeekMs) {
+        if (pendingSeekMs == null) return@LaunchedEffect
+        // 比一个轮询周期（1s）多留半秒余量，到点时 positionMs 已经是新位置了
+        delay(1_500)
+        pendingSeekMs = null
+    }
+
+    val shownPositionMs = when {
+        dragging && durationMs > 0 -> (dragFraction * durationMs).toLong()
+        else -> pendingSeekMs ?: positionMs
+    }
+    val shownFraction =
+        if (durationMs > 0) (shownPositionMs.toFloat() / durationMs).coerceIn(0f, 1f) else 0f
 
     UfiCustomDialog(
         visible = visible,
@@ -429,58 +549,196 @@ private fun NowPlayingMiniDialog(
         title = null,
         showCloseButton = false
     ) {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(DIALOG_SECTION_GAP)
-        ) {
-            // ① 封面 + 歌名/歌手 + 展开入口
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
-                modifier = Modifier.clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = onGoToPlayer
-                )
+        // Box 而不是直接 Column：右上角那颗"去播放页"要按**弹窗边框**定位
+        // （与标准关闭按钮同一口径），不能跟着第一行文字走。
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(DIALOG_SECTION_GAP)
             ) {
-                Box(
+                /*
+                 * ① 封面（左）+ 歌名/歌手/进度（右），整块高度锁死成封面边长。
+                 *
+                 * 右侧三行的高度预算：`UfiSlider` 的轨道行有 44dp 的触摸下限（见该组件的
+                 * `minTrackRowHeight`，不是随便能压的），歌名 bodyEmphasis ≈ 20dp、
+                 * 歌手 caption ≈ 16dp，加两道 2dp 行距 ≈ 84dp —— 所以封面定 88dp，
+                 * 三行刚好装得下，余量由 SpaceBetween 摊到两端。
+                 *
+                 * 封面尺寸与这个预算是**绑死**的：调小封面就得同时压字号或换掉滑块，
+                 * 只改一边必然出现"第三行被挤出封面下沿"。
+                 */
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier
-                        .size(DIALOG_COVER)
-                        .clip(RoundedCornerShape(DIALOG_COVER_CORNER))
-                        .background(palette.surfaceMuted),
-                    contentAlignment = Alignment.Center
+                        .fillMaxWidth()
+                        .height(DIALOG_COVER)
                 ) {
-                    Icon(
-                        Icons.Default.MusicNote,
-                        contentDescription = null,
-                        tint = palette.textSecondary,
-                        modifier = Modifier.size(DIALOG_COVER_PLACEHOLDER_ICON)
-                    )
-                    if (artwork != null) {
-                        AsyncImage(
-                            model = artwork,
+                    Box(
+                        modifier = Modifier
+                            .size(DIALOG_COVER)
+                            .clip(RoundedCornerShape(DIALOG_COVER_CORNER))
+                            .background(palette.surfaceMuted)
+                            .clickable(
+                                indication = null,
+                                interactionSource = remember { MutableInteractionSource() },
+                                onClick = onGoToPlayer
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.MusicNote,
                             contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                            tint = palette.textSecondary,
+                            modifier = Modifier.size(DIALOG_COVER_PLACEHOLDER_ICON)
                         )
+                        if (artwork != null) {
+                            AsyncImage(
+                                model = artwork,
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight(),
+                        verticalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = title.ifBlank { "未知曲目" },
+                            style = UfiTextStyles.bodyEmphasis,
+                            color = palette.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            // 只有歌名这一行要给右上角那颗图标让位；
+                            // 进度条不让，否则滑块右端会莫名短一截
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(end = DIALOG_TRAILING_RESERVE)
+                                .clickable(
+                                    indication = null,
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    onClick = onGoToPlayer
+                                )
+                        )
+                        Text(
+                            text = artist.ifBlank { "未知歌手" },
+                            style = UfiTextStyles.caption,
+                            color = palette.textSecondary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        // 进度：左已播 — 公共滑块 — 右总时长（时间贴在滑块两端，不另起一行）
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(Spacing.Small)
+                        ) {
+                            Text(
+                                text = formatDuration(shownPositionMs),
+                                style = UfiTextStyles.caption,
+                                color = palette.textSecondary,
+                                maxLines = 1
+                            )
+                            UfiSlider(
+                                value = shownFraction,
+                                onValueChange = {
+                                    dragging = true
+                                    dragFraction = it
+                                },
+                                onValueChangeFinished = {
+                                    dragging = false
+                                    if (durationMs > 0) {
+                                        val target = (dragFraction * durationMs).toLong()
+                                        pendingSeekMs = target
+                                        onSeek(target)
+                                    }
+                                },
+                                // 时长未知时（还没 prepare 好）不给拖，拖了也算不出目标毫秒
+                                enabled = durationMs > 0,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = formatDuration(durationMs),
+                                style = UfiTextStyles.caption,
+                                color = palette.textSecondary,
+                                maxLines = 1
+                            )
+                        }
                     }
                 }
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = title.ifBlank { "未知曲目" },
-                        style = UfiTextStyles.bodyLeadStrong,
-                        color = palette.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+
+                // ③ 五键等距，各带文字：循环 / 上一首 / 播放暂停 / 下一首 / 随机
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.Top
+                ) {
+                    MiniControlAction(
+                        icon = if (repeatMode == Player.REPEAT_MODE_ONE) {
+                            Icons.Default.RepeatOne
+                        } else {
+                            Icons.Default.Repeat
+                        },
+                        label = when (repeatMode) {
+                            Player.REPEAT_MODE_OFF -> "不循环"
+                            Player.REPEAT_MODE_ALL -> "列表循环"
+                            else -> "单曲循环"
+                        },
+                        iconSize = DIALOG_SIDE_ICON,
+                        active = repeatMode != Player.REPEAT_MODE_OFF,
+                        modifier = Modifier.weight(1f),
+                        onClick = onCycleRepeat
                     )
-                    Text(
-                        text = artist.ifBlank { "未知歌手" },
-                        style = UfiTextStyles.caption,
-                        color = palette.textSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                    MiniControlAction(
+                        icon = Icons.Default.SkipPrevious,
+                        label = "上一首",
+                        iconSize = DIALOG_SKIP_ICON,
+                        enabled = hasPrev,
+                        modifier = Modifier.weight(1f),
+                        onClick = onPrev
+                    )
+                    MiniControlAction(
+                        icon = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                        label = if (isPlaying) "暂停" else "播放",
+                        iconSize = DIALOG_PLAY_ICON,
+                        filled = true,
+                        modifier = Modifier.weight(1f),
+                        onClick = onToggle
+                    )
+                    MiniControlAction(
+                        icon = Icons.Default.SkipNext,
+                        label = "下一首",
+                        iconSize = DIALOG_SKIP_ICON,
+                        enabled = hasNext,
+                        modifier = Modifier.weight(1f),
+                        onClick = onNext
+                    )
+                    MiniControlAction(
+                        icon = Icons.Default.Shuffle,
+                        label = if (shuffleEnabled) "随机：开" else "随机：关",
+                        iconSize = DIALOG_SIDE_ICON,
+                        active = shuffleEnabled,
+                        modifier = Modifier.weight(1f),
+                        onClick = onToggleShuffle
                     )
                 }
+            }
+
+            /*
+             * 右上角"去播放页"：与标准弹窗关闭按钮同一口径 —— 触控区 44dp、图标 22dp，
+             * 用 offset 把触控区多出来的那 11dp padding 抵消掉，让**图标**（不是触控区）
+             * 到右/上边框的距离与内容边距一致。
+             */
+            IconButton(
+                onClick = onGoToPlayer,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .offset(x = DIALOG_TRAILING_INSET, y = -DIALOG_TRAILING_INSET)
+                    .size(DIALOG_TRAILING_TOUCH)
+            ) {
                 Icon(
                     Icons.Default.OpenInFull,
                     contentDescription = "打开播放页",
@@ -488,129 +746,74 @@ private fun NowPlayingMiniDialog(
                     modifier = Modifier.size(DIALOG_TRAILING_ICON)
                 )
             }
-
-            // ② 可拖动进度 + 左已播 / 右总时长
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Slider(
-                    value = shownFraction,
-                    onValueChange = {
-                        dragging = true
-                        dragFraction = it
-                    },
-                    onValueChangeFinished = {
-                        dragging = false
-                        if (durationMs > 0) onSeek((dragFraction * durationMs).toLong())
-                    },
-                    // 时长未知时（还没 prepare 好）不给拖，拖了也算不出目标毫秒
-                    enabled = durationMs > 0,
-                    colors = SliderDefaults.colors(
-                        thumbColor = palette.accent,
-                        activeTrackColor = palette.accent,
-                        inactiveTrackColor = palette.textPrimary.copy(alpha = DIALOG_TRACK_ALPHA)
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(DIALOG_SLIDER_HEIGHT)
-                )
-                Row(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        text = formatDuration(if (dragging) (dragFraction * durationMs).toLong() else positionMs),
-                        style = UfiTextStyles.caption,
-                        color = palette.textSecondary
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Text(
-                        text = formatDuration(durationMs),
-                        style = UfiTextStyles.caption,
-                        color = palette.textSecondary
-                    )
-                }
-            }
-
-            // ③ 五键等距：循环 / 上一首 / 播放暂停 / 下一首 / 随机
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(onClick = onCycleRepeat, modifier = Modifier.size(DIALOG_SIDE_BUTTON)) {
-                    Icon(
-                        if (repeatMode == Player.REPEAT_MODE_ONE) {
-                            Icons.Default.RepeatOne
-                        } else {
-                            Icons.Default.Repeat
-                        },
-                        contentDescription = when (repeatMode) {
-                            Player.REPEAT_MODE_OFF -> "不循环"
-                            Player.REPEAT_MODE_ALL -> "列表循环"
-                            else -> "单曲循环"
-                        },
-                        tint = if (repeatMode == Player.REPEAT_MODE_OFF) {
-                            palette.textSecondary
-                        } else {
-                            palette.accent
-                        },
-                        modifier = Modifier.size(DIALOG_SIDE_ICON)
-                    )
-                }
-                IconButton(
-                    onClick = onPrev,
-                    enabled = hasPrev,
-                    modifier = Modifier.size(DIALOG_BUTTON)
-                ) {
-                    Icon(
-                        Icons.Default.SkipPrevious,
-                        contentDescription = "上一首",
-                        tint = if (hasPrev) {
-                            palette.textPrimary
-                        } else {
-                            palette.textSecondary.copy(alpha = DIALOG_DISABLED_ALPHA)
-                        },
-                        modifier = Modifier.size(DIALOG_SKIP_ICON)
-                    )
-                }
-                // 播放键是**实心** accent 圆：整块弹窗里它是唯一的主操作，
-                // 跟旁边四个描边图标拉开一整级对比度，不用看图标也知道该点哪个。
-                IconButton(
-                    onClick = onToggle,
-                    modifier = Modifier
-                        .size(DIALOG_PLAY_BUTTON)
-                        .clip(CircleShape)
-                        .background(palette.accent)
-                ) {
-                    Icon(
-                        if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                        contentDescription = if (isPlaying) "暂停" else "播放",
-                        tint = palette.onAccent,
-                        modifier = Modifier.size(DIALOG_PLAY_ICON)
-                    )
-                }
-                IconButton(
-                    onClick = onNext,
-                    enabled = hasNext,
-                    modifier = Modifier.size(DIALOG_BUTTON)
-                ) {
-                    Icon(
-                        Icons.Default.SkipNext,
-                        contentDescription = "下一首",
-                        tint = if (hasNext) {
-                            palette.textPrimary
-                        } else {
-                            palette.textSecondary.copy(alpha = DIALOG_DISABLED_ALPHA)
-                        },
-                        modifier = Modifier.size(DIALOG_SKIP_ICON)
-                    )
-                }
-                IconButton(onClick = onToggleShuffle, modifier = Modifier.size(DIALOG_SIDE_BUTTON)) {
-                    Icon(
-                        Icons.Default.Shuffle,
-                        contentDescription = if (shuffleEnabled) "随机：开" else "随机：关",
-                        tint = if (shuffleEnabled) palette.accent else palette.textSecondary,
-                        modifier = Modifier.size(DIALOG_SIDE_ICON)
-                    )
-                }
-            }
         }
+    }
+}
+
+/**
+ * 迷你控制器里的一颗按钮：图标在上、文字在下，整格宽度由调用方 `weight(1f)` 给定。
+ *
+ * 用 weight 等分而不是 `SpaceEvenly`：文字会随状态变长变短（"不循环" ↔ "列表循环"、
+ * "随机：开" ↔ "随机：关"），靠排布算间距会让整排图标左右横跳。等分之后文字只在自己
+ * 那一格里伸缩，图标的横向位置钉死。
+ *
+ * @param filled 主操作（播放/暂停）用实心 accent 圆底，与旁边四个描边图标拉开一整级对比。
+ */
+@Composable
+private fun MiniControlAction(
+    icon: ImageVector,
+    label: String,
+    iconSize: Dp,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    active: Boolean = false,
+    filled: Boolean = false,
+    onClick: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val tint = when {
+        !enabled -> palette.textSecondary.copy(alpha = DIALOG_DISABLED_ALPHA)
+        filled -> palette.onAccent
+        active -> palette.accent
+        else -> palette.textPrimary
+    }
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(Spacing.Medium))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = Spacing.Small),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier
+                .size(DIALOG_ACTION_SLOT)
+                .then(
+                    if (filled) {
+                        Modifier.clip(CircleShape).background(palette.accent)
+                    } else {
+                        Modifier
+                    }
+                ),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                icon,
+                contentDescription = label,
+                tint = tint,
+                modifier = Modifier.size(iconSize)
+            )
+        }
+        Spacer(Modifier.height(Spacing.Small))
+        Text(
+            text = label,
+            style = UfiTextStyles.caption,
+            color = if (enabled) palette.textSecondary else {
+                palette.textSecondary.copy(alpha = DIALOG_DISABLED_ALPHA)
+            },
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center
+        )
     }
 }
 
@@ -622,30 +825,82 @@ private fun formatDuration(ms: Long): String {
 
 /**
  * 标题栏那两行文字的切换动画：淡入 + 从下方轻微上移。
+ *
+ * 位移只给 1/3 行高（歌词那行走满一整行，见 [MediaLyricTickerText]）：标题栏里这两行挨得近，
+ * 挪多了会互相撞。
  */
 private fun AnimatedContentTransitionScope<String>.chipTextTransition(): ContentTransform =
     (fadeIn(tween(CHIP_MOTION_MS)) + slideInVertically(tween(CHIP_MOTION_MS)) { it / 3 }) togetherWith
         (fadeOut(tween(CHIP_MOTION_MS)) + slideOutVertically(tween(CHIP_MOTION_MS)) { -it / 3 })
 
-private val CHIP_CORNER = 14.dp
-private val CHIP_COVER = 30.dp
-private val CHIP_TEXT_MAX_WIDTH = 132.dp
-private const val CHIP_BG_ALPHA = 0.55f
+/**
+ * 2026-09-20 封面 38dp → 48dp、两行文字 caption(11sp) → headerCaption(12sp)/headerSubtitle(14sp)。
+ * 挂件块的高度早就与左侧标题列对齐了，但里面的字还是 11sp，整块看着"空而小"。
+ * 文字最大宽度跟着放到 150dp，否则字号一大就立刻省略号。
+ *
+ * [CHIP_TEXT_MAX_WIDTH] 这个上限要留着：挂件宽度必须与歌词长短**无关**，
+ * 否则每换一行歌词整条标题栏的分配就变一次，左侧标题与诗句会跟着来回伸缩。
+ * 长句由 `MediaLyricTickerText` 在 150dp 内横向滚动，不靠加宽解决。
+ */
+private val CHIP_COVER = 48.dp
+private val CHIP_TEXT_MAX_WIDTH = 150.dp
+/**
+ * 歌手那一行的文字不透明度（叠在 `textSecondary` 上）。
+ *
+ * 2026-09-20：三行原来只有两级颜色 —— 歌名 `textPrimary`、歌手与兜底副标题都是
+ * `textSecondary`，于是中间那一档在视觉上不存在。想要的层级是
+ * 歌名（最重）> 歌手（说明）> 歌词（accent，另一套语义），所以歌手要比 secondary 再退一档。
+ *
+ * 为什么不加 `textTertiary` 令牌：调色板（[com.ufi_axis.ui.theme.ResolvedPalette]）只有
+ * `textPrimary` / `textSecondary` 两级正文色，加第三级要给全部 7 套预设各配两个新值
+ * （明暗各一），成本远超"标题栏挂件第二行"这一个用途。
+ *
+ * 0.65 是能同时满足两件事的档：比 secondary 明显浅一档看得出层级，又不低到让 12sp 小字
+ * 在浅色主题的卡面上糊掉（secondary 本身在浅色态是接近 #444 的深色，乘 0.65 后
+ * 对 pageBg 仍在 4:1 以上）。再往下（0.5）暗色主题里就开始发灰不可读。
+ */
+private const val CHIP_ARTIST_ALPHA = 0.65f
 private const val CHIP_MOTION_MS = 220
+/**
+ * 暂停后还占着标题栏多久才让位给天气。
+ *
+ * 30s：短到不会长期挡着天气，长到足以覆盖"暂停一下接个话又继续"这种常见动作 ——
+ * 立刻让位会让标题栏在几秒内来回换两次版式。
+ */
+private const val NOW_PLAYING_PAUSE_YIELD_MS = 30_000L
+/** 歌词与上方"歌手"之间的间隔：把"唱到哪了"与"这是什么歌"隔开一档。 */
+private val CHIP_LYRIC_GAP = 3.dp
 
 // 弹窗内尺寸（迷你控制器）
-private val DIALOG_SECTION_GAP = 14.dp
-private val DIALOG_COVER = 64.dp
+/**
+ * 三段之间的间距。
+ *
+ * 2026-09-19 从 14dp 收到 4dp：`UfiSlider` 底下的 M3 Slider 自带 48dp 触控高度，
+ * 轨道居中放在里面，上下已经各有十几 dp 的空白。再叠 14dp 的段间距，看着就是
+ * "进度条孤零零悬在中间"。
+ */
+private val DIALOG_SECTION_GAP = 4.dp
+/**
+ * 封面边长，同时也是"歌名 + 歌手 + 进度"这一列的**高度上限**。
+ *
+ * 88dp 不是随手挑的：`UfiSlider` 的轨道行有 44dp 触摸下限，歌名 bodyEmphasis ≈ 20dp、
+ * 歌手 caption ≈ 16dp，三行合计 ≈ 84dp。再小就装不下第三行，再大封面会开始抢版面
+ * （上一版让封面跟着内容长到 110dp，弹窗宽度被吃掉一小半）。
+ */
+private val DIALOG_COVER = 88.dp
 private val DIALOG_COVER_CORNER = 14.dp
 private val DIALOG_COVER_PLACEHOLDER_ICON = 24.dp
-private val DIALOG_TRAILING_ICON = 20.dp
-private val DIALOG_SLIDER_HEIGHT = 24.dp
-private const val DIALOG_TRACK_ALPHA = 0.12f
-private val DIALOG_BUTTON = 44.dp
-private val DIALOG_SKIP_ICON = 28.dp
-private val DIALOG_SIDE_BUTTON = 40.dp
-private val DIALOG_SIDE_ICON = 22.dp
-private val DIALOG_PLAY_BUTTON = 56.dp
-private val DIALOG_PLAY_ICON = 32.dp
+/** 右上角图标：触控区 44dp / 图标 22dp，与标准弹窗关闭按钮同一口径。 */
+private val DIALOG_TRAILING_TOUCH = 44.dp
+private val DIALOG_TRAILING_ICON = 22.dp
+/** 触控区比图标多出来的单边留白，用它做 offset 才能让**图标**对齐边框。 */
+private val DIALOG_TRAILING_INSET = 11.dp
+/** 第一行右侧给这颗图标让出的宽度（触控区宽度，避免长歌名钻到图标底下）。 */
+private val DIALOG_TRAILING_RESERVE = 44.dp
+/** 每颗控制键的图标槽：五键等宽时槽位一致，图标大小不同也不会让文字基线错开。 */
+private val DIALOG_ACTION_SLOT = 40.dp
+private val DIALOG_SKIP_ICON = 26.dp
+private val DIALOG_SIDE_ICON = 20.dp
+private val DIALOG_PLAY_ICON = 26.dp
 private const val DIALOG_DISABLED_ALPHA = 0.4f
 

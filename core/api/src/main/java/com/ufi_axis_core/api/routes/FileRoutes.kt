@@ -4,6 +4,11 @@ import android.os.Build
 import android.os.Environment
 import android.os.StatFs
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.files.FileProvider
+import com.ufi_axis_core.api.files.FileProviderRegistry
+import com.ufi_axis_core.api.files.LocalFileProvider
+import com.ufi_axis_core.api.files.RemotePushManager
+import com.ufi_axis_core.api.files.UploadSessionStore
 import com.ufi_axis_core.api.media.MediaTicketStore
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.MimeTypes
@@ -36,19 +41,81 @@ import com.ufi_axis_core.util.ArchiveExtractors
  *
  * 全部操作基于 java.io.File / java.nio.file，不再调用 su / ShellExecutor。
  * 仅允许访问用户存储（内部存储 + SD 卡），任何指向系统目录的路径都被拒绝。
+ *
+ * [registry] 提供存储提供者的解析与分发能力。路径以 `remote:` 开头时
+ * 路由到对应的远程提供者；否则走本地逻辑（行为与引入 registry 之前完全一致）。
  */
-class FileRoutes {
+class FileRoutes(private val registry: FileProviderRegistry) {
+
+    /**
+     * 便捷访问本地提供者。所有原有的本地逻辑继续通过 FileRoutes 自身的私有方法执行，
+     * 此属性仅在需要通过 provider 接口调用本地操作时使用。
+     */
+    val local: LocalFileProvider
+        get() = registry.get(FileProviderRegistry.LOCAL_ID) as LocalFileProvider
 
     companion object {
         private const val MAX_READ_SIZE = 512 * 1024 // 512 KB 文本读取上限
         private const val MAX_DOWNLOAD_SIZE = 50L * 1024 * 1024 // 50 MB 下载上限
         private const val INTERNAL_STORAGE = "/storage/emulated/0"
 
+        /**
+         * 整体上传（`POST /upload`）的请求体上限，**HTTP 层与路由层共用这一个常量**。
+         *
+         * 定义在这里而不是 `HttpServer`：那边的 `RequestBodyLimit` 插件按路径前缀分流，
+         * 上限必须与实现这条路由的类保持一致。这正是仓库已有的做法 ——
+         * `HttpServer` 同样引用 `BackupRoutes.MAX_UPLOAD_BYTES`，而且代码里写明了理由：
+         * 「两处漂移的后果是路由层按 8MB 设计、HTTP 层按 512KB 拦」，表现为
+         * 「小文件能传、稍大的莫名 413」这种极难定位的问题。
+         */
+        const val UPLOAD_BODY_LIMIT = 200L * 1024 * 1024
+
+        /**
+         * 单个分片的请求体上限。给 [UPLOAD_CHUNK_SIZE] 留一倍余量 ——
+         * 客户端必须用服务端下发的 chunk_size，超过这个值只可能是客户端有 bug。
+         */
+        const val CHUNK_BODY_LIMIT = 8L * 1024 * 1024
+
+        /**
+         * 分片大小，**由服务端决定并下发**，客户端不得自定。
+         *
+         * 客户端各自定会导致切片边界不一致，续传时 `received / chunk_size` 算出的
+         * 下一片序号就对不上，表现为"续传后文件损坏"。
+         *
+         * 4MB 的取值：5MB/s 上行下约 1 秒一片，单片失败重传代价小；再小则 HTTP 往返
+         * 与**每片都要重算的设备签名**开销占比过高。
+         */
+        const val UPLOAD_CHUNK_SIZE = 4L * 1024 * 1024
+
+        /**
+         * 分片上传的单文件上限 2GB。
+         *
+         * 真正的约束不是这个数，而是**目标卷的剩余空间** —— 开会话时就用 StatFs 查一次
+         * 并直接拒，比传到一半 ENOSPC 好。这个常量只是防住"声明一个荒谬的 size"。
+         */
+        const val MAX_CHUNKED_UPLOAD_BYTES = 2L * 1024 * 1024 * 1024
+
+        /**
+         * 开会话时要求的空闲空间余量：`声明大小 + 这个值`。
+         * 不留余量的话，传完正好把卡写满，之后连 rename 的元数据都可能写不进去。
+         */
+        private const val FREE_SPACE_HEADROOM = 64L * 1024 * 1024
+
+        /** 在途分片占用的总量上限（闸门 4）。超了拒绝新会话，避免"垃圾还没清完磁盘已满"。 */
+        private const val PART_QUOTA_BYTES = 4L * 1024 * 1024 * 1024
+
+        /**
+         * 远端自动改名的最大探测次数。比本地的 9999 小三个数量级 ——
+         * 每次探测是一次 FTP/WebDAV 往返，几百次就是分钟级的等待。
+         */
+        private const val REMOTE_RENAME_PROBES = 20
+
         /** `/search` 的深度与规模上限：depth 由调用方给，必须夹取，否则一次请求能走遍整卡 */
         private const val DEFAULT_SEARCH_DEPTH = 3
         private const val MAX_SEARCH_DEPTH = 8
         private const val MAX_SEARCH_RESULTS = 50
         private const val SEARCH_TIMEOUT_MS = 10_000L
+
 
         /**
          * `/read` 的统一响应。
@@ -156,6 +223,30 @@ class FileRoutes {
     private val mediaTicketStore = MediaTicketStore()
 
     /**
+     * 分片上传的会话表。与 [mediaTicketStore] 同样是**实例字段而不是 companion**：
+     * 会话绑定这一份路由实例，多实例时互不干扰。
+     */
+    private val uploadSessions = UploadSessionStore()
+
+    /**
+     * 远端上传的暂存根目录。
+     *
+     * 用 `java.io.tmpdir`（在 Android 上就是本应用的 cache 目录）而不是注入 Context：
+     * [FileRoutes] 全程没有 Context（见 [UploadSessionStore] 类注释里记录的同一个约束），
+     * 而整体上传那条路径本来就在用 `File.createTempFile`，落点完全一致。
+     * 放 cache 目录的额外好处是系统在存储紧张时能自己回收 —— 推送失败留下的暂存文件
+     * 即便 TTL 没到也不会把设备写满。
+     */
+    private val remoteStagingRoot: File =
+        File(System.getProperty("java.io.tmpdir") ?: "/data/local/tmp", RemotePushManager.STAGING_DIR_NAME)
+
+    /**
+     * 「core 暂存 → 远端存储源」的推送作业表。同样是实例字段：作业与这一份路由实例同生命周期。
+     */
+    private val remotePush = RemotePushManager(registry, remoteStagingRoot)
+
+
+    /**
      * 注册**免鉴权**的凭票流式端点。必须由 `HttpServer` 挂在 `/api` **之外**的顶层 routing 上。
      *
      * 安全边界只有一条：票据里存的是签发时**已通过 `safeResolveForRead` 的真实路径**，
@@ -188,11 +279,57 @@ class FileRoutes {
                 } else {
                     true
                 }
-                call.respond(toJsonElement(mapOf("isExternalStorageManager" to granted)))
+                call.respond(toJsonElement(mapOf(
+                    "isExternalStorageManager" to granted,
+                    // ── 上传能力位（2026-09-19）──
+                    // 客户端据此决定走整体还是分片，并且**不再硬编码上限**。
+                    // 老固件不回这些 key，客户端回落到自己那份保守常量即可。
+                    "max_upload_bytes" to UPLOAD_BODY_LIMIT,
+                    "supports_chunked_upload" to true,
+                    "chunk_size" to UPLOAD_CHUNK_SIZE,
+                    "max_chunked_upload_bytes" to MAX_CHUNKED_UPLOAD_BYTES,
+                    "upload_session_ttl_seconds" to uploadSessions.ttlSeconds,
+                    // 远端上传（手机 → core 暂存 → 外部存储源）。老 app 不认这个 key，
+                    // 于是继续按"远端不能上传"隐藏入口，不会点到一个必然 400 的动作。
+                    "supports_remote_upload" to true,
+                    // ── 存储源列表（Phase 1）──
+                    "sources" to registry.listSources().map { mapOf(
+                        "id" to it.id, "label" to it.label, "protocol" to it.protocol,
+                        "enabled" to it.enabled
+                    ) }
+                )))
             }
 
             get("/list") {
                 val path = call.request.queryParameters["path"] ?: INTERNAL_STORAGE
+                // ── remote: 前缀路由（Phase 1）──
+                if (path.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try {
+                        registry.resolve(path)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@get
+                    }
+                    val result = provider.list(remotePath)
+                    // 路径必须还原成 `remote:<id>/…` 再交给客户端：provider 只认自己那套
+                    // 相对路径，原样返回的话客户端拿 `/Server/` 回传就被当成本地绝对路径，
+                    // 撞白名单 400，而且它会以为自己在本地、连返回上一级都走错分支。
+                    val sourceId = registry.sourceIdOf(path) ?: ""
+                    call.respond(toJsonElement(mapOf(
+                        "files" to result.files.map { mapOf(
+                            "name" to it.name,
+                            "path" to registry.toClientPath(sourceId, it.path),
+                            "isDirectory" to it.isDirectory, "size" to it.size,
+                            "lastModified" to it.lastModified, "permissions" to it.permissions,
+                            "isSymlink" to it.isSymlink,
+                            "source" to it.source
+                        ) },
+                        "path" to registry.toClientPath(sourceId, result.path),
+                        "parent" to registry.parentClientPath(sourceId, result.path),
+                        "truncated" to result.truncated
+                    )))
+                    return@get
+                }
                 val realPath = safeResolve(path) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@get
@@ -206,7 +343,19 @@ class FileRoutes {
                     return@get
                 }
                 withContext(Dispatchers.IO) {
-                    val files = dir.listFiles().orEmpty()
+                    val raw = dir.listFiles().orEmpty()
+                    // ── 分片残留清理（清理闸门 3）──
+                    // 这是覆盖「core 被杀 / 设备断电」的那一道：内存里的会话表全丢之后，
+                    // 磁盘上的 `.ufipart` 没有任何人知道它存在。选在列目录时顺手清，
+                    // 是因为这里已经拿到了 listFiles() 的结果 —— 零额外 IO，
+                    // 且不需要定时器、不需要启动扫描、不需要全卷 walk。
+                    // 代价：没人访问过的目录里的残留会一直留着。由开会话时的配额闸门兜住，
+                    // 而且那种残留本身无害。
+                    purgeStaleParts(raw.toList())
+                    val files = raw
+                        // 分片文件对用户不可见：它是传输中间态，不是"文件"。
+                        // 过滤掉之后，`.ufipart` 放在目标目录这个选择对用户就完全透明了。
+                        .filter { !it.name.endsWith(UploadSessionStore.PART_SUFFIX) }
                         .sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
                         .map { entryToFileMap(it, realPath) }
                     call.respond(toJsonElement(mapOf(
@@ -215,8 +364,28 @@ class FileRoutes {
                 }
             }
 
+
             get("/info") {
                 val filePath = call.request.queryParameters["path"] ?: ""
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try {
+                        registry.resolve(filePath)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@get
+                    }
+                    val info = provider.info(remotePath)
+                    val sourceId = registry.sourceIdOf(filePath) ?: ""
+                    call.respond(toJsonElement(mapOf(
+                        "name" to info.name,
+                        "path" to registry.toClientPath(sourceId, info.path),
+                        "isDirectory" to info.isDirectory, "size" to info.size,
+                        "lastModified" to info.lastModified, "permissions" to info.permissions,
+                        "owner" to "", "group" to "",
+                        "isSymlink" to info.isSymlink
+                    )))
+                    return@get
+                }
                 val realPath = safeResolveForRead(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@get
@@ -241,6 +410,20 @@ class FileRoutes {
                 val body = call.receiveJsonObject()
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
                 val charset = charsetOf(body["encoding"]?.jsonPrimitive?.contentOrNull)
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try {
+                        registry.resolve(filePath)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val result = provider.read(remotePath, body["encoding"]?.jsonPrimitive?.contentOrNull)
+                    call.respond(readResponse(
+                        result.content, result.size, result.truncated,
+                        encoding = result.encoding, reason = result.reason, suspect = result.encodingSuspect
+                    ))
+                    return@post
+                }
                 val realPath = safeResolveForRead(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -289,6 +472,20 @@ class FileRoutes {
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
                 val content = body["content"]?.jsonPrimitive?.contentOrNull ?: ""
                 val charset = charsetOf(body["encoding"]?.jsonPrimitive?.contentOrNull)
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try {
+                        registry.resolve(filePath)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val ok = runCatching {
+                        provider.write(remotePath, content, body["encoding"]?.jsonPrimitive?.contentOrNull)
+                        true
+                    }.getOrDefault(false)
+                    call.respond(toJsonElement(mapOf("success" to ok)))
+                    return@post
+                }
                 val realPath = safeResolve(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -307,6 +504,17 @@ class FileRoutes {
             post("/delete") {
                 val body = call.receiveJsonObject()
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try {
+                        registry.resolve(filePath)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val ok = runCatching { provider.delete(remotePath) }.getOrDefault(false)
+                    call.respond(toJsonElement(mapOf("success" to ok, "deleted" to ok)))
+                    return@post
+                }
                 val realPath = safeResolve(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -332,6 +540,20 @@ class FileRoutes {
                 val body = call.receiveJsonObject()
                 val oldPath = body["old_path"]?.jsonPrimitive?.contentOrNull ?: ""
                 val newPath = body["new_path"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (oldPath.startsWith(FileProviderRegistry.REMOTE_PREFIX) || newPath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    // 远程 rename：两个路径必须属于同一个 provider
+                    val (provider, remoteOld) = try { registry.resolve(oldPath) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val (_, remoteNew) = try { registry.resolve(newPath) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val ok = runCatching { provider.rename(remoteOld, remoteNew) }.getOrDefault(false)
+                    call.respond(toJsonElement(mapOf("success" to ok)))
+                    return@post
+                }
                 val safeOld = safeResolve(oldPath)
                 val safeNew = safeResolve(newPath)
                 if (safeOld == null || safeNew == null) {
@@ -351,6 +573,19 @@ class FileRoutes {
                 val body = call.receiveJsonObject()
                 val source = body["source"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dest = body["destination"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (source.startsWith(FileProviderRegistry.REMOTE_PREFIX) || dest.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remoteSrc) = try { registry.resolve(source) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val (_, remoteDst) = try { registry.resolve(dest) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val result = runCatching { provider.move(remoteSrc, remoteDst) }.getOrDefault(mapOf("success" to false, "error" to "remote move failed"))
+                    call.respond(toJsonElement(result))
+                    return@post
+                }
                 val safeSource = safeResolve(source)
                 val safeDest = safeResolve(dest)
                 if (safeSource == null || safeDest == null) {
@@ -388,6 +623,19 @@ class FileRoutes {
                 val body = call.receiveJsonObject()
                 val source = body["source"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dest = body["destination"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (source.startsWith(FileProviderRegistry.REMOTE_PREFIX) || dest.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remoteSrc) = try { registry.resolve(source) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val (_, remoteDst) = try { registry.resolve(dest) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val ok = runCatching { provider.copy(remoteSrc, remoteDst) }.getOrDefault(false)
+                    call.respond(toJsonElement(mapOf("success" to ok)))
+                    return@post
+                }
                 val safeSource = safeResolve(source)
                 val safeDest = safeResolve(dest)
                 if (safeSource == null || safeDest == null) {
@@ -403,6 +651,15 @@ class FileRoutes {
             post("/mkdir") {
                 val body = call.receiveJsonObject()
                 val dirPath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (dirPath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try { registry.resolve(dirPath) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@post
+                    }
+                    val ok = runCatching { provider.mkdir(remotePath) }.getOrDefault(false)
+                    call.respond(toJsonElement(mapOf("success" to ok)))
+                    return@post
+                }
                 val realPath = safeResolve(dirPath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@post
@@ -422,6 +679,23 @@ class FileRoutes {
                     .coerceIn(1, MAX_SEARCH_DEPTH)
                 if (query.isBlank()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "empty query")
+                    return@get
+                }
+                if (path.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try { registry.resolve(path) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@get
+                    }
+                    val results = provider.search(remotePath, query, maxDepth)
+                    val sourceId = registry.sourceIdOf(path) ?: ""
+                    call.respond(toJsonElement(mapOf(
+                        "files" to results.map { mapOf(
+                            "name" to it.name,
+                            "path" to registry.toClientPath(sourceId, it.path),
+                            "isDirectory" to it.isDirectory
+                        ) },
+                        "query" to query, "timed_out" to false
+                    )))
                     return@get
                 }
                 val realPath = safeResolve(path) ?: run {
@@ -490,6 +764,20 @@ class FileRoutes {
 
             get("/download") {
                 val filePath = call.request.queryParameters["path"] ?: ""
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    val (provider, remotePath) = try { registry.resolve(filePath) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@get
+                    }
+                    val stream = provider.downloadStream(remotePath)
+                    val name = remotePath.substringAfterLast('/')
+                    val mimeType = MimeTypes.fromFileName(name).ifBlank { "application/octet-stream" }
+                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("attachment", name))
+                    call.respondOutputStream(ContentType.parse(mimeType)) {
+                        withContext(Dispatchers.IO) { stream.use { it.copyTo(this@respondOutputStream) } }
+                    }
+                    return@get
+                }
                 val realPath = safeResolveForRead(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@get
@@ -515,6 +803,41 @@ class FileRoutes {
 
             get("/stream") {
                 val filePath = call.request.queryParameters["path"] ?: ""
+                if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
+                    // ── 远端流式播放（2026-09-21 补上 Range）──
+                    //
+                    // 之前这里**忽略客户端的 Range 头**，每次都向远端发一个不带 Range 的整文件 GET。
+                    // 两个后果：① 播放器无法 seek；② 相当多的网盘 / 反代对"不带 Range 的大文件 GET"
+                    // 直接回 502，于是视频根本放不出来（ExoPlayer 报 2004），而目录列表却是好的 ——
+                    // 现象上很像"远端存储坏了"，实际只差一个头。
+                    val (provider, remotePath) = try { registry.resolve(filePath) } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
+                        return@get
+                    }
+                    val name = remotePath.substringAfterLast('/')
+                    val mimeType = MimeTypes.fromFileName(name).ifBlank { "application/octet-stream" }
+                    // 总大小：206 必须回 Content-Range，播放器靠它算总时长与可 seek 范围。
+                    // 取不到（provider 不给 size / 一次网络失败）时退回 200 全量，功能降级但不报错。
+                    val total = try { provider.info(remotePath).size } catch (_: Exception) { -1L }
+                    val start = parseRangeStart(call.request.header(HttpHeaders.Range))
+                    call.response.header(HttpHeaders.AcceptRanges, "bytes")
+                    call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", name))
+                    if (start != null && start > 0L && total > 0L && start < total) {
+                        val stream = provider.downloadStream(remotePath, start)
+                        call.response.header(HttpHeaders.ContentRange, "bytes $start-${total - 1}/$total")
+                        call.response.header(HttpHeaders.ContentLength, (total - start).toString())
+                        call.respondOutputStream(ContentType.parse(mimeType), HttpStatusCode.PartialContent) {
+                            withContext(Dispatchers.IO) { stream.use { it.copyTo(this@respondOutputStream) } }
+                        }
+                        return@get
+                    }
+                    val stream = provider.downloadStream(remotePath, 0L)
+                    if (total > 0L) call.response.header(HttpHeaders.ContentLength, total.toString())
+                    call.respondOutputStream(ContentType.parse(mimeType)) {
+                        withContext(Dispatchers.IO) { stream.use { it.copyTo(this@respondOutputStream) } }
+                    }
+                    return@get
+                }
                 val realPath = safeResolveForRead(filePath) ?: run {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
                     return@get
@@ -631,7 +954,454 @@ class FileRoutes {
                 }
             }
 
+            // ───────── 分片上传（2026-09-19）─────────
+            //
+            // 为什么要它：整体上传断了从零重来，2GB 视频按 5MB/s 算 400 秒，
+            // 任何一次抖动全废；而且老实现先落 app 内部存储的临时文件再 Files.copy 到目标，
+            // 峰值占用 2× 文件大小、目标在 SD 卡时还是跨卷复制。
+            //
+            // 三个端点 + 一个删除。语义与所有边缘情况见 [UploadSessionStore] 的类注释。
+            // `/upload`（整体）**保留不动**：老客户端与小文件继续走它，不需要多一次往返。
+
+            /**
+             * 开会话。同时承担四件事：路径校验、自动改名、空间/配额检查、续传探测。
+             *
+             * body: `{ path: 目标目录, name: 文件名, size: 总字节数 }`
+             * 返回: `{ session_id, chunk_size, received, file_name, renamed, next_index, remote, dest_path }`
+             *
+             * `renamed` 为 true 时 `file_name` 是自动改名后的结果（`video (1).mp4`）——
+             * 客户端**必须**把它显示出来，否则用户以为覆盖了原文件。
+             *
+             * ## 目标是远端存储源时（`path` 以 `remote:` 开头）
+             * `.ufipart` 不能落在目标目录（那在另一台机器上，而且 FTP/WebDAV/SMB/S3 都没有
+             * 「按偏移补一块」的原语），改落 core 的**暂存目录**
+             * （`<cache>/ufi-remote-upload/<sourceId>/<base64url(远端目录)>`）。
+             * 分片与续传逻辑完全不变 —— 它们只认会话里那个已校验过的真实目录。
+             * 收尾（`/upload/complete`）时再由 [RemotePushManager] 把整份文件推到远端。
+             */
+            post("/upload/session") {
+                val body = call.receiveJsonObject()
+                val dirReq = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
+                val nameReq = body["name"]?.jsonPrimitive?.contentOrNull ?: ""
+                val size = body["size"]?.jsonPrimitive?.longOrNull ?: -1L
+
+                // 只取文件名，剔掉客户端可能传来的路径分隔符与遍历片段
+                val safeName = File(nameReq).name.ifBlank { "" }
+                if (safeName.isEmpty()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "文件名不合法")
+                    return@post
+                }
+                // 不允许客户端自己造 `.ufipart`：那会让分片文件与真实文件混淆
+                if (safeName.endsWith(UploadSessionStore.PART_SUFFIX)) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "文件名后缀不被允许")
+                    return@post
+                }
+                if (size <= 0 || size > MAX_CHUNKED_UPLOAD_BYTES) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.OUT_OF_RANGE,
+                        "文件大小超出范围（上限 ${MAX_CHUNKED_UPLOAD_BYTES / 1024 / 1024} MB）"
+                    )
+                    return@post
+                }
+
+                val isRemote = dirReq.startsWith(FileProviderRegistry.REMOTE_PREFIX)
+                var remoteProvider: FileProvider? = null
+                var remoteSourceId = ""
+                var remoteRelDir = ""
+                // 路径校验在这里一次做完，之后 chunk/complete 只认会话里的真实路径。
+                // 这是整套设计的安全前提，与 stream-ticket 同一个模式。
+                val realDir: String = if (isRemote) {
+                    val resolved = try {
+                        registry.resolve(dirReq)
+                    } catch (e: FileProvider.ProviderException) {
+                        call.respondFail(
+                            HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                            e.message ?: "Invalid remote path"
+                        )
+                        return@post
+                    }
+                    val provider = resolved.first
+                    if (FileProvider.Capability.UPLOAD !in provider.capabilities) {
+                        call.respondFail(
+                            HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                            "存储源「${provider.label}」不支持上传"
+                        )
+                        return@post
+                    }
+                    val sourceId = registry.sourceIdOf(dirReq)
+                    if (sourceId.isNullOrEmpty()) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "远程路径缺少 sourceId")
+                        return@post
+                    }
+                    remoteProvider = provider
+                    remoteSourceId = sourceId
+                    remoteRelDir = resolved.second
+                    // 顺手清一次孤儿暂存文件（core 被杀 / 断电后的残留），同惰性清理的口径
+                    withContext(Dispatchers.IO) { remotePush.purgeStaleStaging() }
+                    remotePush.stagingDirFor(sourceId, resolved.second).absolutePath
+                } else {
+                    safeResolve(dirReq) ?: run {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Invalid path")
+                        return@post
+                    }
+                }
+                val dirFile = File(realDir)
+                if (!withContext(Dispatchers.IO) { dirFile.isDirectory || dirFile.mkdirs() }) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        if (isRemote) "无法创建暂存目录" else "目标目录不存在且无法创建"
+                    )
+                    return@post
+                }
+
+                // 先探续传：命中就直接返回，不做改名（名字在首次开会话时已经定下来了）
+                val resumed = withContext(Dispatchers.IO) {
+                    uploadSessions.findResumable(realDir, safeName, size)
+                }
+                if (resumed != null) {
+                    call.respond(toJsonElement(mapOf(
+                        "session_id" to resumed.id,
+                        "chunk_size" to UPLOAD_CHUNK_SIZE,
+                        "received" to resumed.received,
+                        "next_index" to resumed.nextIndex(UPLOAD_CHUNK_SIZE),
+                        "file_name" to resumed.fileName,
+                        "renamed" to (resumed.fileName != safeName),
+                        "resumed" to true,
+                        "remote" to isRemote,
+                        "dest_path" to if (isRemote) {
+                            registry.toClientPath(
+                                remoteSourceId,
+                                RemotePushManager.joinRemote(remoteRelDir, resumed.fileName)
+                            )
+                        } else {
+                            File(realDir, resumed.fileName).absolutePath
+                        }
+                    )))
+                    return@post
+                }
+
+                // 空间检查：留出余量，否则传完正好写满、连 rename 的元数据都可能写不下。
+                // 远端上传查的是**暂存所在的内部存储**，不是远端服务器 —— 远端的余量我们查不到，
+                // 那种失败只能在第二阶段（推送）暴露，所以推送失败必须是可见、可重试的。
+                val free = withContext(Dispatchers.IO) { freeSpaceOf(realDir) }
+                if (free in 1 until (size + FREE_SPACE_HEADROOM)) {
+                    call.respondFail(
+                        HttpStatusCode(507, "Insufficient Storage"), ErrorCode.OPERATION_FAILED,
+                        if (isRemote) {
+                            "设备暂存空间不足（需要 ${formatSize(size + FREE_SPACE_HEADROOM)}，可用 ${formatSize(free)}）"
+                        } else {
+                            "目标存储剩余空间不足（需要 ${formatSize(size + FREE_SPACE_HEADROOM)}，可用 ${formatSize(free)}）"
+                        }
+                    )
+                    return@post
+                }
+                // 配额闸门：在途分片总量有上限，避免"垃圾还没清完磁盘先满"。
+                // 远端走暂存目录的总占用（含还没推完的整文件），本地走会话表。
+                val inflight = if (isRemote) {
+                    withContext(Dispatchers.IO) { remotePush.stagedBytes() }
+                } else {
+                    uploadSessions.activeBytes()
+                }
+                if (inflight + size > PART_QUOTA_BYTES) {
+                    call.respondFail(
+                        HttpStatusCode.Conflict, ErrorCode.CONFLICT,
+                        "同时进行的上传占用过多，请等已有任务完成后再试"
+                    )
+                    return@post
+                }
+
+                // 自动改名（用户已确认的策略 B）：目标已存在时落成 `video (1).mp4`，不静默覆盖。
+                // 传大文件时覆盖掉的可能是几 GB 的东西，静默覆盖的风险远高于小文件。
+                val provider = remoteProvider
+                val finalName = if (isRemote && provider != null) {
+                    uniqueRemoteName(provider, remoteRelDir, dirFile, safeName)
+                } else {
+                    withContext(Dispatchers.IO) { uniqueChildName(dirFile, safeName) }
+                }
+                val session = uploadSessions.open(realDir, finalName, size)
+                call.respond(toJsonElement(mapOf(
+                    "session_id" to session.id,
+                    "chunk_size" to UPLOAD_CHUNK_SIZE,
+                    "received" to 0L,
+                    "next_index" to 0L,
+                    "file_name" to finalName,
+                    "renamed" to (finalName != safeName),
+                    "resumed" to false,
+                    "remote" to isRemote,
+                    "dest_path" to if (isRemote) {
+                        registry.toClientPath(
+                            remoteSourceId,
+                            RemotePushManager.joinRemote(remoteRelDir, finalName)
+                        )
+                    } else {
+                        File(realDir, finalName).absolutePath
+                    }
+                )))
+            }
+
+            /**
+             * 收一个分片。**body 是裸二进制**，不是 multipart。
+             *
+             * 不用 multipart 的两个理由：每片都要解 boundary；而且 Ktor 的 multipart
+             * 会把 part 再落一次临时文件 —— 分片方案的全部意义就是避免那次落盘。
+             *
+             * query: `session`、`index`
+             *
+             * - `index < next` ⇒ **幂等 200**（客户端因超时重发了已收的片，不能重复追加）
+             * - `index > next` ⇒ 409 + 回 `next_index`，客户端据此纠正
+             * - 会话不存在/已过期 ⇒ **410 Gone**（不是 404 —— 404 会被客户端误判成
+             *   "端点不存在"进而回落到整体上传，那是错的恢复动作）
+             */
+            put("/upload/chunk") {
+                val id = call.request.queryParameters["session"] ?: ""
+                val index = call.request.queryParameters["index"]?.toLongOrNull() ?: -1L
+                val session = uploadSessions.find(id) ?: run {
+                    call.respondFail(HttpStatusCode.Gone, ErrorCode.NOT_FOUND, "上传会话不存在或已过期")
+                    return@put
+                }
+                if (index < 0) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "index 缺失或非法")
+                    return@put
+                }
+                val next = session.nextIndex(UPLOAD_CHUNK_SIZE)
+                if (index < next) {
+                    // 已经收过：直接回当前进度，不追加。少了这一条，一次网络重传就会
+                    // 把同一片写两遍，最终文件比声明大小长一截。
+                    call.respond(toJsonElement(mapOf(
+                        "success" to true, "received" to session.received,
+                        "next_index" to next, "duplicate" to true
+                    )))
+                    return@put
+                }
+                if (index > next) {
+                    call.respondFail(
+                        HttpStatusCode.Conflict, ErrorCode.CONFLICT, "分片顺序不匹配",
+                        mapOf("next_index" to next, "received" to session.received)
+                    )
+                    return@put
+                }
+
+                val part = session.partFile
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        part.parentFile?.mkdirs()
+                        // append = true：顺序追加。只支持顺序写是刻意的取舍 ——
+                        // 随机写要预分配整个文件 + 维护已收位图，而串行上传本来就是顺序的。
+                        java.io.FileOutputStream(part, true).use { out ->
+                            call.receiveStream().use { input -> input.copyTo(out) }
+                        }
+                        part.length()
+                    }
+                }
+                val written = result.getOrNull()
+                if (written == null) {
+                    val cause = result.exceptionOrNull()
+                    // 磁盘中途被别的进程写满：507 且**保留 `.ufipart`** ——
+                    // 用户清出空间后可以接着传，这里删掉反而毁了他唯一的补救机会
+                    val noSpace = cause?.message?.contains("ENOSPC", ignoreCase = true) == true ||
+                        cause?.message?.contains("No space", ignoreCase = true) == true
+                    if (noSpace) {
+                        call.respondFail(
+                            HttpStatusCode(507, "Insufficient Storage"), ErrorCode.OPERATION_FAILED,
+                            "存储空间不足，已保留进度，清理空间后可继续",
+                            mapOf("received" to session.received)
+                        )
+                    } else {
+                        call.respondFail(
+                            HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR,
+                            "分片写入失败：${cause?.message ?: "未知错误"}"
+                        )
+                    }
+                    return@put
+                }
+                // 写过头说明客户端切片与服务端 chunk_size 不一致 —— 继续下去只会拼出坏文件
+                if (written > session.declaredSize) {
+                    uploadSessions.discard(session.id)
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "累计大小超过声明值，已中止本次上传"
+                    )
+                    return@put
+                }
+                call.respond(toJsonElement(mapOf(
+                    "success" to true,
+                    "received" to written,
+                    "next_index" to session.nextIndex(UPLOAD_CHUNK_SIZE),
+                    "complete" to (written == session.declaredSize)
+                )))
+            }
+
+            /**
+             * 收尾：校验总大小后 `renameTo` 目标名。
+             *
+             * body: `{ session_id }`
+             *
+             * **幂等**：会话已被删但存在"最近完成"记录时回同样的 success。
+             * 少了这一条，客户端的一次重传会看到 410，表现为"明明传好了却报失败"。
+             */
+            post("/upload/complete") {
+                val body = call.receiveJsonObject()
+                val id = body["session_id"]?.jsonPrimitive?.contentOrNull ?: ""
+                val session = uploadSessions.find(id)
+                if (session == null) {
+                    val done = uploadSessions.findCompleted(id)
+                    if (done != null) {
+                        call.respond(toJsonElement(mapOf(
+                            "success" to true, "path" to done.path, "size" to done.size, "duplicate" to true,
+                            // 远端会话的完成记录里存的是 `remote:<id>/…` 形态，据此回 staged ——
+                            // 少了这一位，客户端的一次重传就会把"只到了设备"误报成"上传成功"。
+                            // 这里给不出 push_job_id（记录里没存），客户端改用列表接口找那条作业。
+                            "staged" to done.path.startsWith(FileProviderRegistry.REMOTE_PREFIX)
+                        )))
+                        return@post
+                    }
+                    call.respondFail(HttpStatusCode.Gone, ErrorCode.NOT_FOUND, "上传会话不存在或已过期")
+                    return@post
+                }
+
+                val part = session.partFile
+                val actual = withContext(Dispatchers.IO) { if (part.isFile) part.length() else -1L }
+                if (actual != session.declaredSize) {
+                    // 成因：客户端切片 bug，或用户在上传途中改了源文件。
+                    // 保留半个文件没有意义（用户无从判断它是否完整），直接删。
+                    uploadSessions.discard(session.id)
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "大小校验失败：已接收 $actual，声明 ${session.declaredSize}"
+                    )
+                    return@post
+                }
+
+                val dest = session.destFile
+                val renamed = withContext(Dispatchers.IO) {
+                    runCatching {
+                        dest.parentFile?.mkdirs()
+                        // 同目录 rename：元数据操作，瞬时完成、零额外空间。
+                        // 这正是把 `.ufipart` 放在目标目录（而不是内部存储）换来的收益。
+                        part.renameTo(dest)
+                    }.getOrDefault(false)
+                }
+                if (!renamed) {
+                    // 目标目录在上传期间被删掉是最常见的成因。留着 `.ufipart` 只是垃圾
+                    // （用户没有可行的补救动作），所以删掉并把原因说清。
+                    uploadSessions.discard(session.id)
+                    call.respondFail(
+                        HttpStatusCode.InternalServerError, ErrorCode.OPERATION_FAILED,
+                        "落盘失败：目标目录可能已被删除或不可写"
+                    )
+                    return@post
+                }
+                val result = uploadSessions.complete(session.id, dest.absolutePath, actual)
+
+                // ── 第二阶段：远端目标的话，这里只是"到了 core"，还没到远端 ──
+                // 暂存目录自带 sourceId 与远端相对目录（编码进路径），所以不需要在会话里加字段。
+                val staging = remotePush.parseStagingDir(session.dir)
+                if (staging != null) {
+                    val (sourceId, relDir) = staging
+                    val label = registry.listSources().firstOrNull { it.id == sourceId }?.label ?: sourceId
+                    val destClient = registry.toClientPath(
+                        sourceId, RemotePushManager.joinRemote(relDir, session.fileName)
+                    )
+                    val job = remotePush.enqueue(
+                        sourceId = sourceId,
+                        sourceLabel = label,
+                        fileName = session.fileName,
+                        relDir = relDir,
+                        destPath = destClient,
+                        stagedFile = dest,
+                        totalBytes = actual
+                    )
+                    // `staged: true` 是给客户端的关键信号：**别提示"上传完成"**，
+                    // 这时候文件只在 core 上，真正的落点还要看推送作业。
+                    call.respond(toJsonElement(mapOf(
+                        "success" to true,
+                        "path" to destClient,
+                        "size" to actual,
+                        "staged" to true,
+                        "push_job_id" to job.id,
+                        "push_state" to job.state.name
+                    )))
+                    return@post
+                }
+                call.respond(toJsonElement(mapOf(
+                    "success" to true, "path" to result.path, "size" to result.size
+                )))
+            }
+
+            /**
+             * 取消会话并删除 `.ufipart`（清理闸门 1）。
+             *
+             * 客户端在"用户点取消"和"页面卸载"两处调它。页面卸载那处必须用
+             * `fetch(..., { keepalive: true })` 而不是 `navigator.sendBeacon`：
+             * sendBeacon 设不了自定义头，而 `/api` 强制要设备签名。
+             *
+             * 会话本来就不存在时也回 success：客户端要的是"确保没了"，
+             * 报错只会让它误以为清理失败。
+             */
+            delete("/upload/session") {
+                val id = call.request.queryParameters["session"] ?: ""
+                withContext(Dispatchers.IO) { uploadSessions.discard(id) }
+                call.respond(toJsonElement(mapOf("success" to true)))
+            }
+
+            // ───────── 远端推送作业（core 暂存 → 外部存储源，2026-09-21）─────────
+            //
+            // 这四个端点存在的唯一理由：**第二阶段必须可见、可管理**。
+            // 手机那一段有进度条，而「core → 远端」发生在之后、在设备上、可能排队几分钟，
+            // 如果不暴露出来，用户看到"上传完成"却在远端找不到文件，也没有任何补救入口。
+
+            /**
+             * 列出全部推送作业（新的在前，含 6 小时内的已完成/失败记录）。
+             * 客户端**轮询**这个端点驱动任务面板。
+             */
+            get("/remote-push") {
+                val jobs = remotePush.list()
+                call.respond(toJsonElement(mapOf(
+                    "jobs" to jobs.map { pushJobJson(it) },
+                    "active_count" to jobs.count { it.active }
+                )))
+            }
+
+            /**
+             * 取消一个在途作业（含删暂存文件）。
+             *
+             * 已结束的作业返回 `success:false` 而不是报错 —— 客户端拿到的列表可能是 1 秒前的，
+             * 点到一个刚刚成功的作业是正常竞态，不该弹错误。
+             */
+            delete("/remote-push") {
+                val id = call.request.queryParameters["job"] ?: ""
+                val ok = remotePush.cancel(id)
+                call.respond(toJsonElement(mapOf("success" to ok)))
+            }
+
+            /**
+             * 重试失败/已取消的作业。
+             *
+             * 暂存文件还在才可能重试 —— 那省掉的正是最贵的一段（手机到 core）。
+             * 已被清理时回 409，客户端据此提示"请重新上传"。
+             */
+            post("/remote-push/retry") {
+                val body = call.receiveJsonObject()
+                val id = body["job_id"]?.jsonPrimitive?.contentOrNull ?: ""
+                val job = remotePush.retry(id)
+                if (job == null) {
+                    call.respondFail(
+                        HttpStatusCode.Conflict, ErrorCode.CONFLICT,
+                        "暂存文件已清理或作业不存在，请重新上传"
+                    )
+                    return@post
+                }
+                call.respond(toJsonElement(mapOf("success" to true, "job" to pushJobJson(job))))
+            }
+
+            /** 清掉所有已结束的记录（失败作业的暂存文件一并删除）。 */
+            post("/remote-push/clear") {
+                val removed = withContext(Dispatchers.IO) { remotePush.clearFinished() }
+                call.respond(toJsonElement(mapOf("success" to true, "removed" to removed)))
+            }
+
             // ───────── 归档操作：解压 / 压缩 / 校验和 ─────────
+
 
             /**
              * 解压。支持 zip / tar / tar.gz(.tgz) / 单文件 gz。
@@ -776,6 +1546,126 @@ class FileRoutes {
     }
 
     // ───────────────────────── 内部工具 ─────────────────────────
+
+    /**
+     * 清掉这一批 `listFiles()` 结果里过期的 `.ufipart`（清理闸门 3）。
+     *
+     * 判据是 **mtime**，不是内存里的会话时间戳：core 被杀或断电之后内存表全丢，
+     * 文件的修改时间是唯一还活着的活动痕迹。
+     *
+     * 只删"过期的"：正在传的分片 mtime 一直在刷新，不会被误删。
+     */
+    private fun purgeStaleParts(entries: List<File>) {
+        val now = System.currentTimeMillis()
+        for (f in entries) {
+            if (!f.isFile || !f.name.endsWith(UploadSessionStore.PART_SUFFIX)) continue
+            if (UploadSessionStore.isStalePart(f, now, UploadSessionStore.DEFAULT_TTL_MS)) {
+                runCatching { f.delete() }
+            }
+        }
+    }
+
+    /**
+     * 目标路径所在卷的可用字节数；拿不到返回 -1（调用方据此跳过检查而不是误判为 0）。
+     *
+     * 用 `StatFs(目录)` 而不是固定查内部存储：目标可能在 SD 卡上，两个卷的余量毫无关系。
+     */
+    private fun freeSpaceOf(dir: String): Long =
+        runCatching { StatFs(dir).availableBytes }.getOrDefault(-1L)
+
+    /**
+     * 从 `Range` 头里取起始字节。只认 `bytes=<start>-...` 这一种形态。
+     *
+     * 返回 null 表示"没有 Range / 认不出来"，调用方据此回 200 全量 —— 对播放器来说
+     * 200 全量是可用的降级（只是不能 seek），而胡乱解析一个 start 会直接放出错位数据。
+     * 多段 Range（`bytes=0-99,200-299`）也走 null：那是极少用到的形态，
+     * 假装支持比明确不支持更糟。
+     */
+    private fun parseRangeStart(header: String?): Long? {
+        val raw = header?.trim() ?: return null
+        if (!raw.startsWith("bytes=", ignoreCase = true)) return null
+        val spec = raw.removePrefix("bytes=").removePrefix("BYTES=").trim()
+        if (spec.contains(',')) return null
+        val dash = spec.indexOf('-')
+        if (dash <= 0) return null // `-500`（末尾若干字节）也不支持，交给 200 全量
+        return spec.substring(0, dash).trim().toLongOrNull()?.takeIf { it >= 0 }
+    }
+
+    /** 推送作业的 JSON 形态。`state` 用小写，与 app 侧的状态字符串口径一致。 */
+    private fun pushJobJson(job: RemotePushManager.PushJob): Map<String, Any?> = mapOf(
+        "id" to job.id,
+        "file_name" to job.fileName,
+        "source_id" to job.sourceId,
+        "source_label" to job.sourceLabel,
+        "dest_path" to job.destPath,
+        "state" to job.state.name.lowercase(),
+        "progress" to job.progress,
+        "sent_bytes" to job.sentBytes,
+        "total_bytes" to job.totalBytes,
+        "error" to job.error,
+        "error_detail" to job.errorDetail,
+        "created_at" to job.createdAt,
+        "finished_at" to job.finishedAt,
+        "retryable" to job.retryable
+    )
+
+    /**
+     * 远端目录里不冲突的文件名。与本地的 [uniqueChildName] 同一个策略（`name (1).ext`），
+     * 但每次探测都是一次**网络往返**，所以上限只有 [REMOTE_RENAME_PROBES] 次。
+     *
+     * 同时也要避开暂存目录里的同名文件：那意味着有一个还没推完的作业正打算占用这个名字，
+     * 撞上去会让两个作业互相覆盖暂存文件。
+     *
+     * 探测失败（网络不通等）一律当"不存在"：这时候真正的报错该由第二阶段的推送给出，
+     * 在开会话时因为探测失败就拒绝上传反而让用户无从下手。
+     */
+    private suspend fun uniqueRemoteName(
+        provider: FileProvider,
+        relDir: String,
+        stagingDir: File,
+        name: String
+    ): String {
+        suspend fun taken(candidate: String): Boolean {
+            if (File(stagingDir, candidate).exists()) return true
+            return runCatching {
+                provider.info(RemotePushManager.joinRemote(relDir, candidate))
+                true
+            }.getOrDefault(false)
+        }
+        if (!taken(name)) return name
+        val dot = name.lastIndexOf('.')
+        val stem = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        for (i in 1..REMOTE_RENAME_PROBES) {
+            val candidate = "$stem ($i)$ext"
+            if (!taken(candidate)) return candidate
+        }
+        return "$stem (${System.currentTimeMillis()})$ext"
+    }
+
+    /**
+     * 目标目录里不冲突的文件名。已存在时按 `name (1).ext` 递增。
+     *
+     * 这是用户选定的「自动改名」策略：传大文件时静默覆盖的代价远高于小文件
+     * （覆盖掉的可能是几 GB 的东西），而弹确认又会打断流程。
+     *
+     * 扩展名按**最后一个点**切分，且点在首位时不算扩展名（`.bashrc` 应该变成
+     * `.bashrc (1)` 而不是 ` (1).bashrc`）。
+     *
+     * 上限 9999 次：真撞到那么多同名就直接用带随机后缀的名字，避免死循环。
+     */
+    private fun uniqueChildName(dir: File, name: String): String {
+        if (!File(dir, name).exists()) return name
+        val dot = name.lastIndexOf('.')
+        val stem = if (dot > 0) name.substring(0, dot) else name
+        val ext = if (dot > 0) name.substring(dot) else ""
+        for (i in 1..9999) {
+            val candidate = "$stem ($i)$ext"
+            if (!File(dir, candidate).exists()) return candidate
+        }
+        return "$stem (${System.currentTimeMillis()})$ext"
+    }
+
 
     /**
      * Range 流式响应 —— `/api/files/stream`（头部鉴权，app 端）与 [MEDIA_STREAM_PATH]

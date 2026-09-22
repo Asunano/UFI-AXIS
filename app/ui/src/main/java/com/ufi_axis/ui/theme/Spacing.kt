@@ -203,6 +203,44 @@ object Spacing {
      */
     val NoticeBorderWidth = 1.dp
 
+    // Wizard metrics（2026-09-21 引导式表单 UfiWizard）
+    // 放令牌层而不是组件里写死：checkLiteralBaseline 的 dp 基线只许下降，
+    // 组件里写字面量会顶穿基线；而"步骤圆点多大"本身就该全站一致。
+    /**
+     * 步骤条圆点的直径。
+     *
+     * 32dp 的依据：比 [ChipHeight]（36dp）小一档 —— 圆点是**状态指示**而不是主操作按钮，
+     * 不该和同页的 chip 抢视觉重量；同时又要容得下 [WizardStepCheck] 的勾选图标 + 两位序号。
+     * 点击命中区由整列（含下方标签）承担，所以圆点本身小于 48dp 不影响可点性。
+     */
+    val WizardStepDot = 32.dp
+    /** 步骤之间连接线的粗细，同时用作步骤圆点的描边宽度（两者同源才看得出是"一条线串起来的点"）。 */
+    val WizardStepConnector = 2.dp
+    /** 步骤圆点内「已完成」勾选图标的尺寸。比 [IconSizeSmall]（18dp）小一档，留出圆点内的呼吸空间。 */
+    val WizardStepCheck = 16.dp
+    /**
+     * 向导页顶部品牌行的图标尺寸。
+     *
+     * 向导把「步骤条 + 面板 + 固定底栏」三段都塞进一屏，顶部品牌区必须收成一行 ——
+     * 48dp 与 [ButtonHeight] 同高，图标与右侧两行标题的视觉重量刚好持平；
+     * 落地页那种 120dp 居中大图标在向导里会把面板挤没。
+     */
+    val WizardHeaderIcon = 48.dp
+    /**
+     * 当前步圆点的阴影高度。
+     *
+     * 当前步与已完成步同为 accent 实底（整条已走过的链路要连贯），区分靠「序号 vs 勾选」+ 缩放 + 这层阴影。
+     * 取 6dp：比普通卡片（4dp）高一档 —— 它是页面上唯一需要"浮起来"的小元素。
+     */
+    val WizardActiveDotElevation = 6.dp
+    /**
+     * 向导确认页信息卡的描边宽度。
+     *
+     * 与 [NoticeBorderWidth] 同值（1dp）但**不复用** —— 本文件的"一个 token 只服务一个语义"原则：
+     * 改提示卡的框不该连带改确认页的卡。
+     */
+    val WizardCardBorder = 1.dp
+
     // Text editor metrics（2026-09-11 文本预览/编辑重写）
     // 行号列的宽度是**算出来的**（位数 × 字宽 + 间距），不是写死值 ——
     // 原实现固定 48sp，1000 行以内浪费，10 万行时行号被挤掉。

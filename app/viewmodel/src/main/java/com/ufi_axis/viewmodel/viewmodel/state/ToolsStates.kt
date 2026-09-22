@@ -224,6 +224,25 @@ data class AlertsState(
 
 // ========== Tasks ==========
 
+/**
+ * 定时任务页状态（任务 + 条件规则双 Tab 共用）。
+ *
+ * ## 为什么 in-flight 位要分四个（2026-09-20 重构）
+ * 原来只有一个 `isLoading`，而 `loadTaskList` 与 `loadRuleList` 是**并发**发起的
+ * （`TaskScreen` 同一个 `LaunchedEffect` 里连着调两下），两边都写那一位、也都清那一位。
+ * 于是谁先回来谁就把"还在读"这件事宣布结束 —— 界面的
+ * `if (tasks.isEmpty() && !isLoading)` 当即认定"没有任务"并画出空态，
+ * 而任务请求其实还在路上。用户看到的就是"Web 端新建的任务，App 第一次进去看不到，
+ * 退出再进才有"（第二次进去读到的是第一次那个迟到响应）。
+ *
+ * 形状照 [WebhookState] —— 那边三位分开是同一个教训的产物（见其 KDoc）。
+ *
+ * ## 为什么还要 `*Loaded` 闩锁
+ * 只看 `!loading` 不足以决定"该不该画空态"：请求失败、或者还没发出去时它也是 false。
+ * `tasksLoaded` / `rulesLoaded` 是**单调闩锁**（只 false→true，成功读到才置位），
+ * 空态只在闩锁置位后才显示。这是 SMS 那几个页面已经在用的写法
+ * （`smsContactsLoaded` / `verificationCodesLoaded`…）。
+ */
 data class TasksState(
     val tasks: List<ScheduledTask> = emptyList(),
     val taskLogs: Map<String, List<ExecutionLog>> = emptyMap(),
@@ -231,9 +250,19 @@ data class TasksState(
     val rules: List<AutomationRule> = emptyList(),
     // 历史遗留字段名 taskLogs；规则日志单独存，避免与 task 日志混淆
     val ruleLogs: Map<String, List<ExecutionLog>> = emptyMap(),
-    val isLoading: Boolean = false,
+    /** 任务列表在读。**只有 `loadTaskList` 能动它**。 */
+    val tasksLoading: Boolean = false,
+    /** 规则列表在读。**只有 `loadRuleList` 能动它**。 */
+    val rulesLoading: Boolean = false,
+    /** 任务列表成功读到过至少一次。空态门看它，不看 loading。 */
+    val tasksLoaded: Boolean = false,
+    /** 规则列表成功读到过至少一次。 */
+    val rulesLoaded: Boolean = false,
     val errorMessage: String? = null
-)
+) {
+    /** 有任何一侧在读（只给"页面整体转圈"这种粗粒度场景用，别拿它当空态门）。 */
+    val isLoading: Boolean get() = tasksLoading || rulesLoading
+}
 
 // ========== SMS Forward ==========
 
@@ -249,7 +278,19 @@ data class SmsForwardState(
     val loaded: Boolean = false,
     /** `GET /api/sms-forward/diagnose` 的结果；null = 还没成功读到过（UI 不画诊断区）。 */
     val diagnose: SmsForwardDiagnose? = null,
-    val isLoading: Boolean = false,
+    /**
+     * 正在读配置。**只有 `loadSmsForwardConfig` 能动它。**
+     *
+     * 2026-09-20：三个位从原来共用的一个 `isLoading` 拆开。
+     * 共用那一位正是 [WebhookState] KDoc 里点名的反面教材 ——
+     * "刚进页面自动加载"把测试按钮置灰、"点测试"让保存按钮转圈。
+     * 那边早就改成三位分开，这一侧一直没迁移。
+     */
+    val loading: Boolean = false,
+    /** 正在写配置。用于禁用重复提交。 */
+    val saving: Boolean = false,
+    /** 正在发测试信。 */
+    val testing: Boolean = false,
     /**
      * 最近一次「测试发送」返回的 `auto_notify_enabled`；null = 本次会话还没测过。
      *
@@ -259,9 +300,16 @@ data class SmsForwardState(
      */
     val lastTestAutoNotifyEnabled: Boolean? = null,
     val errorMessage: String? = null
-)
-
-// ========== Webhook 通知渠道 ==========
+) {
+    /**
+     * 有任何一个动作在进行中。
+     *
+     * 给"页面级别的忙碌"用（`EmailNotifyScreen` 靠它的下降沿 + `pending` 归属做结算提示）。
+     * **别拿它控制单个按钮的禁用/转圈** —— 那是共用一位的老毛病，
+     * 保存时测试按钮跟着转圈。按钮各读 [loading] / [saving] / [testing]。
+     */
+    val isLoading: Boolean get() = loading || saving || testing
+}
 
 /**
  * 通用 Webhook 渠道的页面状态（`/api/notify/webhook/…`）。

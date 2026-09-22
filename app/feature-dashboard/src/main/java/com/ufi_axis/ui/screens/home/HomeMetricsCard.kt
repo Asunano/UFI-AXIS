@@ -12,12 +12,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.UfiRingProgress
+import com.ufi_axis.ui.components.common.UfiRollingText
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
+import com.ufi_axis.ui.theme.UfiMotion
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.viewmodel.state.DashboardState
@@ -169,22 +170,30 @@ private fun MetricRingCard(
         ) {
             // 环形进度（环内显示数值）
             // 2026-08-31：原为本文件自绘 Canvas + 两条 drawArc，已改用公共 UfiRingProgress
-            // （animate = false 保持"跟随轮询的即时读数"手感，centerContent 保留原 titleMedium 数值文字，
-            //  trackColor 传实色 palette.divider —— 三项对齐后与自绘版本像素一致）。
+            // （trackColor 传实色 palette.divider）。
+            // 2026-09-21：环内数值换成公共 UfiRollingText —— 百分比是两位定长纯数字、
+            // 轮询 10s 一跳，正好是滚轮动画的目标场景。
+            //
+            // 2026-09-21（同日二次修订）：环**打开补间**（原来 animate = false 是瞬跳）。
+            // 当初关掉的理由是默认 800ms（Duration.Languid）配 10s 轮询像"环在慢慢爬"，
+            // 抖动的读数还会来回摇 —— 那是**时长**选错，不是不该有动画。
+            // 现在显式传 Duration.Smooth（300ms，档位定义正是"数据刷新后的内容淡入"）：
+            // 看得出扫过去的运动感，又不拖。首帧绘入由 UfiRingProgress 自己处理。
             UfiRingProgress(
                 progress = percent,
                 size = 56.dp,
                 strokeWidth = stroke,
                 color = color,
                 trackColor = palette.divider,
-                animate = false,
+                animate = true,
+                animationDurationMillis = UfiMotion.Duration.Smooth,
                 centerContent = {
-                    Text(
+                    // UfiRollingText 宽度 = 字形实测和、没有 textAlign；
+                    // 居中靠 UfiRingProgress 自己那层 Box(contentAlignment = Center)。
+                    UfiRollingText(
                         text = valueText,
                         style = UfiTextStyles.panelTitleStrong,
-                        color = palette.textPrimary,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1
+                        color = palette.textPrimary
                     )
                 }
             )

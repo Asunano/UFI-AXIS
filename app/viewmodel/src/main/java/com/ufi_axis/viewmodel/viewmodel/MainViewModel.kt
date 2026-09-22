@@ -15,7 +15,9 @@ import com.ufi_axis.data.model.TrafficRealtime
 import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.data.repository.ConnectionState
 import com.ufi_axis.data.notification.GuardScheduler
+import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis.util.AppJson
+import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.BackgroundManager
 import kotlinx.serialization.json.decodeFromJsonElement
 import com.ufi_axis.util.DebugLog
@@ -94,6 +96,39 @@ data class BackendDownDialogState(
     val healthErrorMessage: String?
 )
 
+/**
+ * 全局连接态。**app 里判断「能不能用」只看这一个枚举**。
+ *
+ * 语义分工（这是本类型存在的全部理由 —— 三个旧信号各说各话正是"连不上却不提示"的根因）：
+ * - [CHECKING]：还没探出结论（冷启动首屏）。**不要显示任何错误提示**，否则每次开 app 都先红一下。
+ * - [ONLINE]：`/health` 探通。这是唯一能证明 core 可达的证据。
+ * - [NO_LOCAL_NETWORK]：手机压根没连网络（`NetworkMonitor.hasNetwork` 为 false）。
+ * - [NOT_CONFIGURED]：还没配过设备地址（`serverIp` 为空）。
+ * - [UNREACHABLE]：手机有网、地址也配了，但 `/health` 确证探不通 —— 设备离线 / core 没跑 / 不在同一网。
+ *
+ * 注意后三者都是**已确证不可达之后**的归因，不是独立的判定条件。
+ */
+enum class ConnectivityStatus {
+    CHECKING, ONLINE, NO_LOCAL_NETWORK, NOT_CONFIGURED, UNREACHABLE
+}
+
+/**
+ * @param title  一句话病因（横幅主文案）；[ConnectivityStatus.ONLINE]/[ConnectivityStatus.CHECKING] 时为 null
+ * @param detail 下一步动作的指引（横幅副文案）
+ */
+data class ConnectivityUiState(
+    val status: ConnectivityStatus,
+    val title: String? = null,
+    val detail: String? = null
+) {
+    /** 是否应该显示离线横幅。CHECKING 不显示 —— 没结论就别吓用户。 */
+    val showBanner: Boolean
+        get() = status != ConnectivityStatus.ONLINE && status != ConnectivityStatus.CHECKING
+
+    /** 是否是「配都没配」——UI 可据此把按钮从「重试」换成「去配对」。 */
+    val needsSetup: Boolean get() = status == ConnectivityStatus.NOT_CONFIGURED
+}
+
 class MainViewModel(
     private val api: UfiAxisApi,
     private val webSocketRepository: WebSocketRepository,
@@ -115,6 +150,9 @@ class MainViewModel(
      */
     private val coreUpdatePersistence = SharedPreferencesCoreUpdatePersistence(appContext)
 
+    /** 只用来读「设备地址配过没有」（[connectivity] 的归因分支）。构造一次，别在 combine 里反复 new。 */
+    private val appPrefs = AppPreferences(appContext)
+
     val dashboard = DashboardModule(api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs)
 
     /**
@@ -131,6 +169,10 @@ class MainViewModel(
     val network by lazy { NetworkModule(api, appContext, viewModelScope, crossModuleEventSink) }
     val tools by lazy { ToolsModule(api, appContext, viewModelScope, crossModuleEventSink, alertPrefs, coreUpdatePersistence) }
     val files by lazy { FileManagerModule(api, appContext, FileShortcutRepository(appContext), viewModelScope) }
+    // 外部存储源（FTP / WebDAV）配置：只管 /api/storage/sources 这组 CRUD，
+    // 源里的列目录与读写仍由 files 走 remote: 前缀路径完成（core 侧派发）。
+    // by lazy：绝大多数用户一个源都不配，不该在 ViewModel 构造时就占一份 state。
+    val storageSources by lazy { StorageSourceModule(api, viewModelScope) }
     // 媒体中心（工具 → 媒体中心，2026-09-16）：列设备端的视频 / 音乐 / 图片。
     // 数据来自 core 的 /api/media（它查系统媒体库），播放仍走 /api/files/stream。
     val media by lazy { MediaModule(api, appContext, viewModelScope) }
@@ -192,6 +234,60 @@ class MainViewModel(
     /** 后端健康状态（周期探活 + 出错复查），UI 可据此展示"后端是否在线"。 */
     val healthState: StateFlow<HealthState> get() = health.healthState
 
+    // ── 全局连接态（2026-09-21）────────────────────────────────────────────────
+    //
+    // 在这之前 app 有三个互不相干的信号，没有一个是「手机能不能到 core」的权威态：
+    //   · healthState        —— 唯一正确的那个，但**零 UI 消费者**（注释里写着"供 UI 展示"，没人展示）
+    //   · wsConnectionState  —— WS 通道状态，只有仪表盘读
+    //   · dashboardState.isOffline —— 其实是「手机有没有外网」，却被首页渲染成"后端服务未连接"
+    //
+    // 后者是「连不上设备却没有任何提示」的直接原因：手机连着设备热点但 core 没跑时，
+    // 手机的 INTERNET 能力通常仍为 true → isOffline=false → 永不提示；
+    // 反过来连了个没外网的热点又会误报"后端服务未连接"。
+    //
+    // 现在收敛成一个权威态：**可达性只信 /health 探活**，[NetworkMonitor] 与「地址是否配过」
+    // 只用来给失败**归因**，不参与"是否可达"的判定。
+    val connectivity: StateFlow<ConnectivityUiState> = combine(
+        health.healthState,
+        networkMonitor.hasNetwork
+    ) { hs, hasNet ->
+        when {
+            hs.status == HealthStatus.HEALTHY -> ConnectivityUiState(ConnectivityStatus.ONLINE)
+            // 还没探出结论（冷启动首屏）→ 不显示任何横幅，避免"打开就报错"的观感
+            hs.status == HealthStatus.UNKNOWN -> ConnectivityUiState(ConnectivityStatus.CHECKING)
+            // 已确证不可达，下面只是给原因排序：手机没网 > 没配地址 > 摸不到设备
+            !hasNet -> ConnectivityUiState(
+                ConnectivityStatus.NO_LOCAL_NETWORK,
+                "手机未连接网络",
+                "请连接设备的 WiFi 热点后重试"
+            )
+            // isConfigValid 之前是死代码（定义了但全仓无调用），这里给它一个真实用途：
+            // serverIp 为空时 baseUrl 会静默回落到 gatewayIp(192.168.0.1)，
+            // 探不通的真正原因是"压根没配过地址"，不能笼统说"设备离线"。
+            !appPrefs.isConfigValid -> ConnectivityUiState(
+                ConnectivityStatus.NOT_CONFIGURED,
+                "未配置设备地址",
+                "请先完成设备配对"
+            )
+            else -> ConnectivityUiState(
+                ConnectivityStatus.UNREACHABLE,
+                "无法连接到设备",
+                hs.errorMessage ?: "请确认已连上设备热点、且后台服务在运行"
+            )
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, ConnectivityUiState(ConnectivityStatus.CHECKING))
+
+    /** 供 UI 的「重试」按钮调用：立刻探一次活。 */
+    fun retryConnectivity() {
+        viewModelScope.launch { runCatching { health.checkHealthNow() } }
+    }
+
+    /**
+     * 接到 `RetrofitClient.onTransportFailure`：任何业务请求在传输层失败都立刻驱动一次探活。
+     * 去抖在 [HealthModule.notifyTransportFailure] 里。
+     */
+    fun onApiTransportFailure() = health.notifyTransportFailure()
+
     // ── 实时连接状态转发（供 UI 展示 WS 连接状态，避免各屏重复订阅 repository，T01/UID-006） ──
     val wsConnectionState: StateFlow<ConnectionState>
         get() = webSocketRepository.connectionState
@@ -216,6 +312,8 @@ class MainViewModel(
     val serviceState: StateFlow<ServiceControlState> get() = network.serviceState
     val speedTestState: StateFlow<SpeedTestState> get() = network.speedTestState
     val fileManagerState: StateFlow<FileManagerState> get() = files.state
+    /** 外部存储源配置页（文件管理器 → 更多 → 外部存储）的状态槽。 */
+    val storageSourceState: StateFlow<StorageSourceState> get() = storageSources.state
     val debugLogState: StateFlow<DebugLogState> get() = tools.debugLogState
     val diagnoseState: StateFlow<DiagnoseState> get() = tools.diagnoseState
     val trafficManagementState: StateFlow<TrafficManagementState> get() = tools.trafficManagementState
@@ -309,15 +407,30 @@ class MainViewModel(
             webSocketRepository.dataChanged.collect { changedType ->
                 when {
                     // Dashboard: 设备信息类变更
-                    changedType.startsWith("device:") -> {
+                    changedType.startsWith(WsDataTopic.PREFIX_DEVICE) -> {
                         dashboard.smartRefresh(changedType)
                         network.smartRefresh(changedType)
                         tools.smartRefresh(changedType)
                     }
                     // Network: WiFi / 网络类变更
-                    changedType.startsWith("wifi:") ||
-                    changedType.startsWith("network:") -> {
+                    changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
+                    changedType.startsWith(WsDataTopic.PREFIX_NETWORK) -> {
                         network.smartRefresh(changedType)
+                    }
+                    // Tools: 定时任务 / 自动化规则（core 侧增删改、以及任务自己触发后写日志）、
+                    // 控制台历史（另一端敲了命令）。
+                    // 2026-09-21：这两组分支原来**完全不存在** —— core 一直在推，app 这边
+                    // 分发层直接丢掉，`ToolsModule.smartRefresh` 的 console 分支从没被调用过。
+                    changedType.startsWith(WsDataTopic.PREFIX_TASK) ||
+                    changedType.startsWith(WsDataTopic.PREFIX_CONSOLE) -> {
+                        tools.smartRefresh(changedType)
+                    }
+                    // Media: 音频歌单（另一端 —— 通常是 web —— 建了 / 改了 / 删了歌单）。
+                    // 2026-09-21：与上面那两组一样，core 侧 PlaylistStore 一直在推
+                    // `media:playlists`，但这里原来没有分支 —— web 改完歌单，app 必须
+                    // 退出页面再进才看得见。
+                    changedType.startsWith(WsDataTopic.PREFIX_MEDIA) -> {
+                        media.smartRefresh(changedType)
                     }
                 }
             }

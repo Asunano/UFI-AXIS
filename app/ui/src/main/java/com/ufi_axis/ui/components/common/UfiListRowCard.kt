@@ -1,9 +1,11 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.components.common
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -42,7 +44,20 @@ import com.ufi_axis.ui.theme.ufiStandardCard
  * @param onClick null = 纯展示行，不给点击反馈
  * @param leading 前置槽（缩略图容器自己决定尺寸；本组件不钉尺寸）
  * @param trailing 后置槽（时长、勾选框、更多按钮…）
+ * @param onLongClick 长按回调（2026-09-20 追加）。
+ *
+ *   ## 为什么是参数，而不是让调用方在 [modifier] 里自己包一层 `combinedClickable`
+ *   1. **手势必须落在圆角裁剪之后**：卡面的 `clip(shape)` 是本组件内部 `ufiStandardCard()`
+ *      做的，而 [modifier] 处在整条链的最前面。调用方在那里挂手势，按压水波纹就画在
+ *      裁剪之外 —— 同一个列表里"能长按的行"是方角波纹、"只能单击的行"是圆角波纹。
+ *   2. **两个手势检测器会互相吃事件**：调用方包了 `combinedClickable` 还照常传 [onClick]
+ *      的话，同一个节点上叠两层可点击修饰符，内层先消费掉按下事件、长按就永远不触发。
+ *      要避开只能约定"用长按时不许传 onClick"，那是个**隐式**契约，比多一个参数更难守。
+ *
+ *   为 null 时行为与从前逐字相同（走 [onClick] 那条 `clickable`），
+ *   所以 [F24] 的向后兼容要求成立：参数带默认值、追加在最末、现有调用点一行都不用改。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun UfiListRowCard(
     title: String,
@@ -51,7 +66,8 @@ fun UfiListRowCard(
     selected: Boolean = false,
     onClick: (() -> Unit)? = null,
     leading: @Composable (() -> Unit)? = null,
-    trailing: @Composable (() -> Unit)? = null
+    trailing: @Composable (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null
 ) {
     val palette = LocalResolvedPalette.current
     Box(
@@ -67,7 +83,19 @@ fun UfiListRowCard(
                     Modifier
                 }
             )
-            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .then(
+                // 三档互斥：有长按 → combinedClickable（onClick 缺省时给个空实现，
+                // 否则纯长按的行连"按下"反馈都没有）；只有单击 → 原来的 clickable；
+                // 都没有 → 纯展示行，一个手势修饰符都不挂。
+                when {
+                    onLongClick != null -> Modifier.combinedClickable(
+                        onClick = onClick ?: {},
+                        onLongClick = onLongClick
+                    )
+                    onClick != null -> Modifier.clickable(onClick = onClick)
+                    else -> Modifier
+                }
+            )
             .padding(horizontal = Spacing.Medium, vertical = Spacing.Medium)
     ) {
         Row(

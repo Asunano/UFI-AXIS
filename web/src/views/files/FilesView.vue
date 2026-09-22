@@ -24,8 +24,25 @@
       />
     </div>
 
-    <!-- 列表滚动区：顶栏下方独立滚动，内容不会再钻到顶栏底下 -->
-    <div class="files-body">
+    <!-- 列表滚动区：顶栏下方独立滚动，内容不会再钻到顶栏底下
+
+         同时是拖拽上传的投放区。三件事必须一起做对：
+         · `dragover` 必须 `preventDefault()`，否则浏览器不认这是投放区（drop 根本不触发）；
+         · 用**计数器**而不是布尔量跟踪拖入/拖出 —— 拖过子元素时 dragleave/dragenter
+           会成对冒泡，用布尔量会让高亮疯狂闪烁；
+         · 只在真的拖着文件时才高亮（`dataTransfer.types` 含 `Files`），
+           否则页内选中文本随便一拖就亮一片。 -->
+    <div
+      class="files-body"
+      :class="{ 'is-drop-target': dropActive }"
+      @dragenter="onDragEnter"
+      @dragover.prevent
+      @dragleave="onDragLeave"
+      @drop.prevent="onDrop"
+    >
+      <!-- 提示层：pointer-events:none，不能挡住 drop 事件本身 -->
+      <div v-if="dropActive" class="drop-hint">松开即上传到当前目录</div>
+
       <n-alert v-if="storageDenied" type="warning" :show-icon="false" class="perm-alert">
         Core 未获得「所有文件访问权限」，文件列表可能为空或操作失败。请在设备端 UFI-AXIS 应用中授予该权限后点刷新。
       </n-alert>
@@ -125,6 +142,7 @@
       :done-count="uploadDone"
       :failed-count="uploadFailed"
       :percent-of="upload.percentOf"
+      :limit-label="uploadLimitText"
       @cancel="upload.cancel"
       @cancel-all="upload.cancelAll"
       @clear="upload.clearFinished"
@@ -169,6 +187,8 @@ import { useFileUpload } from './useFileUpload';
 import {
   PREVIEW_MAX_BYTES,
   authHeaders,
+  effectiveUploadLimit,
+  uploadLimitLabel,
   breadcrumbSegments,
   canPreview,
   isAllowedRoot,
@@ -896,6 +916,22 @@ const upload = useFileUpload({
     loadFiles();
     loadDiskUsage();
   },
+  // 超限文件在入队前就被拦下（一个字节都没发），这里给一条即时提示 ——
+  // 只靠面板里那行红字的话，用户可能正盯着文件选择器刚关闭的位置
+  onRejected: (rejected) => {
+    const limit = uploadLimitLabel(effectiveUploadLimit(upload.caps.value));
+    const names = rejected.map((t) => t.name).join('、');
+    message.warning(
+      rejected.length === 1
+        ? `${names} 超过单文件上限 ${limit}，未上传`
+        : `${rejected.length} 个文件超过单文件上限 ${limit}，未上传：${names}`
+    );
+  },
+  onRenamed: (task) => {
+    if (task.finalName && task.finalName !== task.name) {
+      message.info(`目标已存在，自动保存为 ${task.finalName}`);
+    }
+  },
   onAllSettled: ({ done, failed, canceled }) => {
     if (failed > 0) {
       message.error(`上传结束：成功 ${done}，失败 ${failed}`);
@@ -911,9 +947,77 @@ const uploadPercent = upload.overallPercent;
 const uploadDone = upload.doneCount;
 const uploadFailed = upload.failedCount;
 
+const uploadLimitText = computed(() => uploadLimitLabel(effectiveUploadLimit(upload.caps.value)));
+
 function onPickUpload(files: File[]) {
   upload.enqueue(files);
 }
+
+// ── 拖拽上传 ──
+
+/**
+ * 拖入层级计数，不是布尔量。
+ *
+ * 拖着文件在列表里移动时会不断穿过子元素，每次都成对冒泡 `dragleave`+`dragenter`；
+ * 用布尔量就会在"离开子元素"的那一刻把高亮关掉，表现为疯狂闪烁。
+ * 记层级、归零才算真的离开。
+ */
+const dragDepth = ref(0);
+const dropActive = computed(() => dragDepth.value > 0);
+
+/** 只认"拖的是文件"。不判的话，页内选中一段文字随手一拖也会亮一片。 */
+function isFileDrag(e: DragEvent): boolean {
+  const types = e.dataTransfer?.types;
+  return !!types && Array.from(types).includes('Files');
+}
+
+function onDragEnter(e: DragEvent) {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth.value++;
+}
+
+function onDragLeave(e: DragEvent) {
+  if (!isFileDrag(e)) return;
+  dragDepth.value = Math.max(0, dragDepth.value - 1);
+}
+
+/**
+ * 投放：取出文件并入队。
+ *
+ * **必须过滤目录**。拖一个文件夹进来时 `dataTransfer.files` 里会出现一个
+ * size 为 0、type 为空的 File，直接传上去会在设备端落一个 0 字节的同名文件 ——
+ * 比报错更糟。用 `webkitGetAsEntry().isDirectory` 判（Chrome/Safari/Firefox 都支持），
+ * 拿不到 entry 时用「size 0 且无 type」兜底。
+ *
+ * 目录上传要递归展开 + 在设备端建目录树，是另一个功能，这里只如实告诉用户跳过了。
+ */
+function onDrop(e: DragEvent) {
+  dragDepth.value = 0;
+  const dt = e.dataTransfer;
+  if (!dt) return;
+
+  const items = Array.from(dt.items || []);
+  const files = Array.from(dt.files || []);
+  const accepted: File[] = [];
+  let skippedDirs = 0;
+
+  files.forEach((file, i) => {
+    // items 与 files 同序（规范如此），据此拿到对应的 entry
+    const entry = items[i]?.webkitGetAsEntry?.();
+    const isDir = entry ? entry.isDirectory : file.size === 0 && !file.type;
+    if (isDir) skippedDirs++;
+    else accepted.push(file);
+  });
+
+  if (skippedDirs > 0) {
+    message.warning(`已跳过 ${skippedDirs} 个文件夹：暂不支持上传整个目录`);
+  }
+  if (accepted.length > 0) upload.enqueue(accepted);
+}
+
+/** 页面卸载时让设备端删在途的 .ufipart。*/
+let removeUnloadGuard: (() => void) | null = null;
 
 function refreshAll() {
   loadStorageStatus();
@@ -1023,10 +1127,17 @@ function onKeydown(e: KeyboardEvent) {
 
 onMounted(() => {
   window.addEventListener('keydown', onKeydown);
-
+  removeUnloadGuard = upload.installUnloadGuard();
+  // 能力探测 + 加载 L2 续传线索
+  upload.ensureCaps().then((c) => upload.loadResumeHints(c.sessionTtlSeconds));
   loadStorageStatus();
   loadFiles();
   loadDiskUsage();
+});
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown);
+  removeUnloadGuard?.();
 });
 
 onUnmounted(() => {
@@ -1067,6 +1178,28 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 10px;
   padding-bottom: 4px;
+  /* 拖拽投放区的定位基准（提示层是 absolute） */
+  position: relative;
+}
+/* 拖着文件悬停时：虚线描边 + 轻微底色。不用实线，避免和列表卡片的边框混淆 */
+.files-body.is-drop-target {
+  outline: 2px dashed var(--accent-color);
+  outline-offset: -4px;
+  border-radius: var(--radius-md);
+  background: var(--accent-color-light);
+}
+.drop-hint {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--accent-color);
+  /* 关键：不能吃掉 drop 事件，否则松手时事件落在提示层上、而它没有 drop 处理 */
+  pointer-events: none;
 }
 .clipboard-bar {
   display: flex;

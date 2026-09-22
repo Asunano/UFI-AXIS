@@ -2,6 +2,7 @@ package com.ufi_axis.ui.media
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -67,9 +68,12 @@ import com.ufi_axis.viewmodel.state.MediaTabState
  * 目录与重扫收成两颗 [UfiToolbarAction]，与文件管理器的工具条同形。
  *
  * ## 首屏骨架的红线（与文件管理器一致，别改）
- * 只有「正在加载 **且** 一条数据都没有」时显示骨架；已有列表时的刷新不换骨架，
+ * 只有「**还没拉到过结果**」（`!loadedOnce`）时显示骨架；已有列表时的刷新不换骨架，
  * 否则每次刷新都把已渲染内容整块替换成灰块，观感就是闪一下。
+ * 2026-09-20：判据从 `isEmpty && isLoading` 收紧成 `!loadedOnce` —— 前者在"请求还没发出去"
+ * 的第一帧两个条件都不成立，于是空态会先闪一帧（落点见下方 `when` 的注释）。
  * 骨架的形状还要跟着视图模式走：列表态用行骨架、网格态用格子骨架。
+
  *
  * ## 两条不许破的规矩（从媒体中心继承）
  * 1. **未授权就明说**：core 按 `READ_MEDIA_VIDEO/AUDIO/IMAGES` 三类分别授权，
@@ -80,8 +84,18 @@ import com.ufi_axis.viewmodel.state.MediaTabState
  * @param listSkeletonLeadingHeight 列表骨架前置槽高
  * @param showViewToggle 是否显示"列表 ⇄ 网格"按钮。**只有真的两种画法都实现了才传 true** ——
  *   音乐页只有列表、图片页只有网格，给它们摆一颗按不动的按钮就是假按钮。
- * @param gridColumns 网格态列数（骨架要与真实网格同列数）
- * @param gridCellHeight 网格态格高
+ * @param showDirAction 工具条上是否显示「目录」那颗（以及空态里的「改扫描目录」）。
+ *   音乐页传 false —— 它把扫描目录搬进了独立的设置页（[MediaAudioSettingsScreen]），
+ *   两处都留一个入口会出现"改完这边那边不知道"的错觉；图片页仍然只有工具条这一个入口。
+ * @param actions 标题栏右侧动作（透传给 [UfiScreenScaffold]）。音乐页用它放齿轮，
+ *   图片页不传、行为与改造前完全一致。
+ * @param topContent 工具条与内容四态**之间**的常驻区域（音乐页的四个分类 Tab）。
+ *   为什么给它单开一个槽而不让调用方塞进 [content]：[content] 只在"已授权且有数据"那一态
+ *   被调用，把分类切页放进去会让权限引导与空态里 Tab 直接消失 —— 而那两种状态下用户
+ *   最需要的恰恰是"换一个分类看看"。默认空实现，图片页不传、版式与改造前一致。
+ * @param bottomBar 内容区**下方**的常驻区域（音乐页的迷你控制条）。
+ *   放在页壳里而不是塞进 [content]：它要与内容区平级、不随列表滚动，
+ *   而且系统手势条的避让只该做一次（由调用方在这个槽里自己加 `navigationBarsPadding()`）。
  * @param content 内容区：拿到本类型的状态，自己决定画列表还是网格
  */
 @Composable
@@ -93,8 +107,12 @@ internal fun MediaLibraryPage(
     listSkeletonLeadingWidth: Dp = 40.dp,
     listSkeletonLeadingHeight: Dp = 40.dp,
     showViewToggle: Boolean = false,
+    showDirAction: Boolean = true,
     gridColumns: Int = 3,
     gridCellHeight: Dp = 108.dp,
+    actions: @Composable RowScope.() -> Unit = {},
+    topContent: @Composable () -> Unit = {},
+    bottomBar: @Composable () -> Unit = {},
     content: @Composable (MediaTabState) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -109,7 +127,12 @@ internal fun MediaLibraryPage(
     var showDirPicker by remember { mutableStateOf(false) }
     var showSortSheet by remember { mutableStateOf(false) }
 
-    UfiScreenScaffold(title = title, navController = navController, showBack = true) { padding ->
+    UfiScreenScaffold(
+        title = title,
+        navController = navController,
+        showBack = true,
+        actions = actions
+    ) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -123,11 +146,13 @@ internal fun MediaLibraryPage(
                     )
                 }
                 UfiSortAction(onClick = { showSortSheet = true })
-                UfiToolbarAction(
-                    icon = Icons.Default.FolderOpen,
-                    label = "目录",
-                    onClick = { showDirPicker = true }
-                )
+                if (showDirAction) {
+                    UfiToolbarAction(
+                        icon = Icons.Default.FolderOpen,
+                        label = "目录",
+                        onClick = { showDirPicker = true }
+                    )
+                }
                 UfiToolbarAction(
                     icon = Icons.Default.Refresh,
                     label = if (tab.isRescanning) "提交中" else "重扫",
@@ -135,6 +160,11 @@ internal fun MediaLibraryPage(
                     enabled = !tab.isRescanning
                 )
             }
+
+            // 工具条正下方：调用方自备的常驻控件（音乐页的分类 Tab）。
+            // 位置刻意在错误条与提示文案**之前** —— 它是"我在看哪一类"的导航，
+            // 排在临时性的报错下面会让 Tab 随报错出现/消失上下跳。
+            topContent()
 
             (tab.errorMessage ?: state.errorMessage)?.let { err ->
                 Spacer(Modifier.height(Spacing.Small))
@@ -175,7 +205,20 @@ internal fun MediaLibraryPage(
                         }
                     )
 
-                    tab.isEmpty && tab.isLoading -> if (tab.gridView) {
+                    /*
+                     * 首屏骨架：判据是「**还没拉到过结果**」，不是「正在加载且列表为空」。
+                     *
+                     * 原来写的是 `tab.isEmpty && tab.isLoading`，漏掉了进页第一帧：那一帧
+                     * `loadFirstPage` 还没被 LaunchedEffect 发出去，isLoading 仍是 false，
+                     * 于是先掉进下面的"空态"——用户看到的是「媒体库里没有音乐」闪一下再变成骨架。
+                     *
+                     * 不会卡在骨架上：`loadFirstPage` 无论成功、失败还是 403 都会把
+                     * loadedOnce 置 true（403 还会把 granted 落成 false，切到上面那条引导）。
+                     *
+                     * 「已有列表时的刷新不换骨架」这条红线仍然成立 —— 那时 loadedOnce 已经是
+                     * true，重扫 / 改排序都不会再走到这里。
+                     */
+                    !tab.loadedOnce -> if (tab.gridView) {
                         UfiGridLoadingState(
                             columns = gridColumns,
                             cellHeight = gridCellHeight
@@ -188,6 +231,7 @@ internal fun MediaLibraryPage(
                         )
                     }
 
+
                     tab.isEmpty -> UfiListEmptyState(
                         text = if (tab.scanDirs.isEmpty()) {
                             "媒体库里没有${mediaTypeLabel(type)}"
@@ -195,7 +239,9 @@ internal fun MediaLibraryPage(
                             "所选目录下没有${mediaTypeLabel(type)}"
                         },
                         icon = mediaTypeIcon(type),
-                        action = if (tab.scanDirs.isEmpty()) {
+                        // 没有目录入口的页面（音乐）不在这里放一颗按了没反应的按钮，
+                        // 它的扫描目录在设置页里
+                        action = if (tab.scanDirs.isEmpty() || !showDirAction) {
                             null
                         } else {
                             {
@@ -212,6 +258,8 @@ internal fun MediaLibraryPage(
                     else -> content(tab)
                 }
             }
+
+            bottomBar()
         }
     }
 

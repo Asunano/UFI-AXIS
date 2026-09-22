@@ -781,10 +781,15 @@ data class AlertConfig(
     // WS 推送与入库都无条件执行。邮件是否放行改由 NotificationConfig 的
     // master_enabled + mail_respect_dnd 决定（判定只在 core 的 mailAllowed 一处）。
     val perType: Map<String, Boolean> = emptyMap(), // 分类开关 type->enabled
-    val minIntervalSec: Int = 1800,              // 同 (type,level) 最小聚合间隔
+    // 2026-09-21：删掉 minIntervalSec —— 它自称「同 (type,level) 最小聚合间隔秒」，
+    // 但 core 的聚合走 `bumpExisting`（同 type+level 未确认行就累加），压根没有时间窗，
+    // 引擎从来不读这个字段。第三个被清掉的假开关（前两个是 edgeTriggeredOnly / maxRows）。
     val configVersion: Long = 1L,                // 多端同步版本号（单调递增）
-    val temperatureWarning: Double = 45.0,
-    val temperatureCritical: Double = 55.0,
+    // 温度阈值 2026-09-21 从 45/55 重定为 65/75：旧值与 core 温控熔断的
+    // monitorThermalWarnC=70 自相矛盾，而 Unisoc 稳态就在 50~60°C（开机后即恒 critical）。
+    // 必须与 core AlertEngine.AlertConfig 逐字一致 —— 这份是镜像，不是第二真源。
+    val temperatureWarning: Double = 65.0,
+    val temperatureCritical: Double = 75.0,
     val batteryWarning: Int = 20,
     val batteryCritical: Int = 10,
     val trafficWarningMb: Long = 1024,    // 1 GB
@@ -1377,6 +1382,36 @@ data class DeviceVersionResponse(
     val wa_inner_version: String = ""
 )
 
+/**
+ * EPS 承载 QoS（`GET /api/device/qos`，2026-09-22）。
+ *
+ * core 侧用 `AT+CGEQOSRDP` 查当前承载协商到的 QoS，取默认承载（优先 cid=1）。
+ * 仅供仪表盘设备信息卡显示。
+ *
+ * ## 失败也是 200
+ * AT 通道在很多设备上根本不存在（非展锐平台 / HAL 被裁），那是预期状态而不是错误。
+ * 此时 core 回的仍是这个形状，只是 [available] = false 且各值为 0/空 ——
+ * UI 只需要显示占位，不必写第二套分支。
+ *
+ * @param available AT 通道可用（false = 这台设备不支持，不是"这次查失败了"）。
+ * @param cid 承载 id。排查"为什么 QCI 是 5 不是 8"时要靠它确认取的是哪条承载。
+ * @param downlink_display / uplink_display 展示文案由 **core 生成**（如 `500 Mbps`）——
+ *   两端各写一份 kbps→Mbps 换算迟早出现"一个 500 一个 500.0"。
+ */
+@Serializable
+data class DeviceQosResponse(
+    val available: Boolean = false,
+    val cid: Int = 0,
+    val qci: Int = 0,
+    val downlink_kbps: Long = 0,
+    val uplink_kbps: Long = 0,
+    val downlink_display: String = "",
+    val uplink_display: String = ""
+) {
+    /** 有没有真正解析出一条承载。QCI 合法值从 1 起，0 表示没查到。 */
+    val hasData: Boolean get() = available && qci > 0
+}
+
 // ========== Monitor ==========
 
 typealias DownsampledPoint = com.ufi_axis_core.util.DownsampledPoint
@@ -1505,6 +1540,16 @@ const val MEDIA_TYPE_AUDIO = "audio"
 const val MEDIA_TYPE_IMAGE = "image"
 
 /**
+ * 音频分组维度（`GET /api/media/groups` 的 `by` 取值）。
+ *
+ * 只对 [MEDIA_TYPE_AUDIO] 有效 —— 视频 / 图片在 MediaStore 里没有专辑、歌手这类标签，
+ * core 侧对其它 type 直接拒绝，所以不必为它们留取值。
+ */
+const val MEDIA_GROUP_ALBUM = "album"
+const val MEDIA_GROUP_ARTIST = "artist"
+const val MEDIA_GROUP_FOLDER = "folder"
+
+/**
  * 媒体库里的一项。
  *
  * 刻意叫 `MediaLibraryItem` 而不是 `MediaItem`：后者是 media3 的核心类型
@@ -1536,7 +1581,59 @@ data class MediaLibraryItem(
      * 取不到时是空串 —— core 不拿文件名冒充曲名，兜底显示由客户端决定
      * （见 `audioDisplayTitle`）。
      */
-    val title: String = ""
+    val title: String = "",
+    /**
+     * 这个视频有几个外挂字幕（**仅视频**，core 按文件名判定，见 `/api/media/subtitles`）。
+     *
+     * 只用来在列表上打个"CC"标 —— 想知道具体有哪些、走哪个 URL，得单独问 `/subtitles`。
+     * 0 不等于"一定没字幕"：内嵌在容器里的字幕轨不算在这里（那个由播放器自己发现）。
+     */
+    val subtitle_count: Int = 0,
+    /**
+     * 这一项在媒体库里**已经查不到了**（仅出现在歌单曲目响应里，见 [PlaylistItemsResponse]）。
+     *
+     * 歌单存的是路径，文件被删 / 卡没插 / 还没被系统扫到时 core 就回不出完整信息，
+     * 于是带上这个标记 + 加入歌单时的快照字段（[title]/[artist]/[album]/[duration_ms]），
+     * 此时 [id] 恒为 0。UI 要画"已失效"占位并禁止播放，**不要自动帮用户移出** ——
+     * 拔一次卡就清空歌单是不可接受的。
+     *
+     * 其它端点（`/list`、`/browse`）永远是 false。
+     */
+    val missing: Boolean = false
+)
+
+/**
+ * 一条外挂字幕（`GET /api/media/subtitles` 的 items 元素）。
+ *
+ * [supported] = 播放器能不能解析这个格式。false 的条目 core 也会返回
+ * （MicroDVD `.sub`、SAMI `.smi`）—— 目录里明明有文件却在界面上查无此项，
+ * 用户只会以为 App 瞎了，所以照常列出但标成"格式不支持"。
+ *
+ * [label] 是从文件名里猜的语言/版本标记（`movie.zh-CN.srt` → `zh-CN`），
+ * 猜错了不影响播放（播放看 [mime]），只影响字幕轨列表上显示的那个名字。
+ */
+@Serializable
+data class MediaSubtitleEntry(
+    val name: String = "",
+    val path: String = "",
+    val ext: String = "",
+    val size: Long = 0,
+    val supported: Boolean = false,
+    val mime: String = "",
+    val label: String = ""
+)
+
+/**
+ * `GET /api/media/subtitles` 的结果。
+ *
+ * [scope] 回显请求的取法：`matched` = 只有判定属于该视频的（自动挂载用），
+ * `folder` = 同目录全部字幕（手动选择用）。
+ */
+@Serializable
+data class MediaSubtitlesResponse(
+    val path: String = "",
+    val scope: String = "matched",
+    val items: List<MediaSubtitleEntry> = emptyList()
 )
 
 /** `GET /api/media/list` 的一页。[total] 是**符合条件的总数**，不是这一页的条数。 */
@@ -1581,6 +1678,45 @@ data class MediaBrowseResponse(
     val roots: List<String> = emptyList(),
     val folders: List<MediaFolderEntry> = emptyList(),
     val items: List<MediaLibraryItem> = emptyList()
+)
+
+/**
+ * 一个音频分组（`GET /api/media/groups` 的 groups 元素）。
+ *
+ * [key] 是**回查用的原值**，不是给人看的：album / artist 是标签原始字符串，folder 是目录
+ * 绝对路径。要列这一组的曲目，就把它按维度送回 `/api/media/list` 的 album / artist / dir。
+ *
+ * [key] 为**空串**的那一组是"无标签文件的聚合"（[title] 会是"未知专辑"这类兜底文案）：
+ * 它**只能展示、不能回查** —— 空串送回 `/list` 会被当成"没传这个参数"，结果是整库而不是
+ * 这一组，所以界面上不该让它可点。
+ *
+ * [count] 是这一组里的曲目数；[cover_id] 是组内某一首的 MediaStore id，分组卡片直接拿它
+ * 当封面（走 `/api/media/cover?id=`），0 表示没有可用封面。
+ */
+@Serializable
+data class MediaGroupEntry(
+    val key: String = "",
+    val title: String = "",
+    val subtitle: String = "",
+    val count: Int = 0,
+    val cover_id: Long = 0
+)
+
+/**
+ * `GET /api/media/groups?type=audio&by=`：按专辑 / 歌手 / 文件夹聚合的分组列表。
+ *
+ * [total] 是**分组总数**，不是曲目总数 —— 拿它显示"共 N 首"是错的（那要把
+ * [MediaGroupEntry.count] 累加）。
+ *
+ * 不分页：core 一次算完整库的聚合结果，所以这里没有 limit / offset。
+ * 与 [MediaListResponse] 的分工：那个是"某一组/整库里有哪些曲目（分页）"，这个是"有哪些组"。
+ */
+@Serializable
+data class MediaGroupsResponse(
+    val type: String = MEDIA_TYPE_AUDIO,
+    val by: String = MEDIA_GROUP_ALBUM,
+    val groups: List<MediaGroupEntry> = emptyList(),
+    val total: Int = 0
 )
 
 /**
@@ -1659,10 +1795,100 @@ data class MediaTagsResponse(
     val duration_ms: Long = 0
 )
 
+// ========== 音频歌单（2026-09-21）==========
+//
+// core 侧 `PlaylistRoutes`（`/api/playlists`）。歌单**存在 core**，两端看到同一份。
+// 曲目以真实路径为标识（不是 MediaStore id —— 那个重扫会变，歌单会整份失效），
+// 所有写操作的 body 都是 `{ paths: [...] }`。
+
+/** 歌单列表里的一项（不含曲目明细）。 */
+@Serializable
+data class PlaylistEntry(
+    val id: String = "",
+    val name: String = "",
+    /** 曲目数，**含已失效的** —— 拔一次卡不该让"共 23 首"变少。 */
+    val count: Int = 0,
+    /**
+     * 首曲的 MediaStore id，给封面用（走 `/api/media/cover?id=`）。
+     * 0 = 没有可用封面（空歌单，或首曲已不在媒体库）。与 [MediaGroupEntry.cover_id] 同一约定。
+     */
+    val cover_id: Long = 0,
+    val created_at: Long = 0,
+    val updated_at: Long = 0
+)
+
+/** `GET /api/playlists`：全部歌单。 */
+@Serializable
+data class PlaylistsResponse(
+    val playlists: List<PlaylistEntry> = emptyList(),
+    val count: Int = 0
+)
+
+/**
+ * `GET /api/playlists/{id}/items`：歌单曲目。
+ *
+ * [items] 的顺序**就是播放顺序**（用户手排的）—— 不要再按音乐页的排序偏好重排一次。
+ * 已失效的条目照样在列表里，带 [MediaLibraryItem.missing] = true，[missing_count] 是它们的条数。
+ */
+@Serializable
+data class PlaylistItemsResponse(
+    val id: String = "",
+    val name: String = "",
+    val items: List<MediaLibraryItem> = emptyList(),
+    val total: Int = 0,
+    val missing_count: Int = 0,
+    val created_at: Long = 0,
+    val updated_at: Long = 0
+)
+
+/** `POST /api/playlists`（新建）与 `PUT /api/playlists/{id}`（重命名）的请求体。 */
+@Serializable
+data class PlaylistNameRequest(val name: String)
+
+/** `POST /api/playlists`：新建成功后回的 id。 */
+@Serializable
+data class PlaylistCreateResponse(
+    val success: Boolean = false,
+    val id: String = "",
+    val name: String = ""
+)
+
+/**
+ * 歌单曲目的写请求体：加歌 / 移出 / 整表重排共用。
+ *
+ * [position] 只对加歌有效（null = 追加到尾部）。移出与重排忽略它。
+ */
+@Serializable
+data class PlaylistPathsRequest(
+    val paths: List<String>,
+    val position: Int? = null
+)
+
+/**
+ * 加歌的结果。
+ *
+ * 三个计数对应三种"没进去"的原因，客户端据此给准确文案：
+ * [added] 真加进去的、[skipped] 已在歌单里**或**不在媒体库里的、[truncated] 撞到单歌单条数上限。
+ */
+@Serializable
+data class PlaylistAddResponse(
+    val success: Boolean = false,
+    val added: Int = 0,
+    val skipped: Int = 0,
+    val truncated: Boolean = false,
+    val total: Int = 0
+)
+
+/** 移出曲目的结果。[removed] = 实际命中并移出的条数。 */
+@Serializable
+data class PlaylistRemoveResponse(
+    val success: Boolean = false,
+    val removed: Int = 0
+)
+
 /** `POST /api/files/stream-ticket` 的请求体。 */
 @Serializable
 data class StreamTicketRequest(val path: String)
-
 /**
  * `POST /api/files/stream-ticket`：换一张**免鉴权**的播放票据。
  *
@@ -1689,29 +1915,6 @@ data class MediaThumbUploadResponse(
     val type: String = MEDIA_TYPE_VIDEO,
     val id: Long = 0,
     val size: Int = 0
-)
-
-/**
- * `GET /api/media/ffmpeg-status[?path=]`：设备端 ffmpeg 自检结果。
- *
- * 分两层看：
- *  · [available] = 这个 core 构建里有没有打包 ffmpeg-kit（false 时其余字段无意义）；
- *  · [native_ok] = native 库能不能加载并跑起来（`ffmpeg -version` 成功）。
- *
- * 带 `path` 请求时才有 `probe_*`：那是**真的对这个文件抽了一帧**，
- * [probe_elapsed_ms] 就是设备端生成一张缩略图的真实耗时 —— 用它判断这条路实不实用。
- */
-@Serializable
-data class MediaFfmpegStatusResponse(
-    val available: Boolean = false,
-    val native_ok: Boolean = false,
-    val version: String = "",
-    val reason: String = "",
-    val probe_path: String = "",
-    val probe_ok: Boolean = false,
-    val probe_elapsed_ms: Long = 0,
-    val probe_bytes: Int = 0,
-    val probe_error: String = ""
 )
 
 // ══════════════════════════ 天气（2026-09-17）══════════════════════════

@@ -33,8 +33,16 @@ import com.ufi_axis.ui.theme.UfiMotion
  * @param label 百分比下方的小字标签（如 "已用 2.3 GB"）
  * @param color 进度弧颜色
  * @param trackColor 轨道颜色
- * @param animate 是否播放进度补间动画。2026-08-31 新增：首页指标环是"跟随轮询刷新的即时读数"，
- *   每次刷新都跑一遍 800ms 补间反而抖，故它传 false。
+ * @param animate 是否播放进度补间动画。
+ *   为 true 时还会做**首帧绘入**：初值 0、组合后的第一帧才开始扫向 [progress]，
+ *   于是进页面能看到环"画出来"而不是凭空画满。
+ * @param animationDurationMillis 补间时长，默认 [UfiMotion.Duration.Languid]（800ms，
+ *   "慢而稳的自绘动画"那一档）。
+ *
+ *   2026-09-21 新增这个入参：首页那四个指标环原来传 `animate = false`，因为 800ms 配
+ *   10s 轮询的即时读数观感是"环在慢慢爬"，抖动的读数还会来回摇。现在它们改传
+ *   [UfiMotion.Duration.Smooth]（300ms）—— 看得出扫过去的运动感，又不拖。
+ *   带默认值，不破坏本文件顶部那条 STABLE-UI-API 冻结约定。
  * @param centerContent 中心内容槽位。2026-08-31 新增：默认仍是「百分比 + [label]」，
  *   传入时完全替换中心内容（首页指标环要显示 "2.3/8.0 GB" 这类原文而非百分比）。
  */
@@ -48,17 +56,30 @@ fun UfiRingProgress(
     color: Color = LocalResolvedPalette.current.accent,
     trackColor: Color = LocalResolvedPalette.current.divider.copy(alpha = 0.15f),
     animate: Boolean = true,
+    animationDurationMillis: Int = UfiMotion.Duration.Languid,
     centerContent: (@Composable () -> Unit)? = null
 ) {
     val palette = LocalResolvedPalette.current
+    val target = progress.coerceIn(0f, 1f)
+
+    /*
+     * 首帧绘入（2026-09-21）。
+     *
+     * `animateFloatAsState` 把**第一次**传入的 targetValue 当作初值，所以直接传 progress
+     * 的话首屏是一次性画满、只有之后的变化才有补间 —— 进页面看不到"画出来"的过程。
+     * 这里第一帧先给 0，`LaunchedEffect` 在组合之后把 entered 翻成 true，动画才从 0 起跑。
+     *
+     * 数据晚到（先 0 后有值）也走同一条路：环停在 0，值到了再扫过去，不需要额外分支。
+     */
+    var entered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { entered = true }
+
     val animatedProgress by animateFloatAsState(
-        targetValue = progress.coerceIn(0f, 1f),
-        // 2026-09-04（P2b）：原为裸 `tween(durationMillis = 800)`。800 本来就等于
-        // Duration.Languid（"慢而稳的自绘动画"正是这一档的定义），纯换 token，零观感变化。
-        animationSpec = tween(durationMillis = UfiMotion.Duration.Languid),
+        targetValue = if (entered) target else 0f,
+        animationSpec = tween(durationMillis = animationDurationMillis),
         label = "ringProgress"
     )
-    val shownProgress = if (animate) animatedProgress else progress.coerceIn(0f, 1f)
+    val shownProgress = if (animate) animatedProgress else target
     val percentText = "${(shownProgress * 100).toInt()}%"
 
     Box(

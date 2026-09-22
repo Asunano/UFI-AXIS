@@ -274,8 +274,15 @@ class ResponseCache(
         // 通知 WebSocket 客户端数据已变更
         if (removed > 0 && onInvalidate != null) {
             try {
-                val changedType = pattern.substringBefore(":")
-                onInvalidate.invoke(changedType)
+                // 2026-09-21 修复：这里原来是 `pattern.substringBefore(":")`，
+                // 于是 `invalidate("device:traffic-limit")` 上线变成 `changed:"device"`。
+                // 两端的消费者都是按**完整** key 匹配的（app 侧 `MainViewModel` 要求
+                // `startsWith("device:")`、`ToolsModule.smartRefresh` 要求
+                // `== "device:traffic-limit"`），截断后的 `"device"` 两个条件都不满足
+                // —— 结果整条 data_changed 链路端到端是死的（流量上限、LAN 设置、
+                // 设备设置、小区信息的精准刷新从来没生效过）。现在原样透传 pattern，
+                // 通配形式（`wifi:*`）也能被 `startsWith("wifi:")` 命中。
+                onInvalidate.invoke(pattern)
             } catch (_: Exception) {}
         }
     }
@@ -502,6 +509,16 @@ object CacheTTL {
     /** 设备固件版本 — 几乎不变，30分钟（原10分钟） */
     const val DEVICE_VERSION = 1_800_000L
 
+    /**
+     * EPS 承载 QoS（`AT+CGEQOSRDP` 的 QCI / 上下行 AMBR）— 5 分钟。
+     *
+     * 2026-09-22 新增。比 [DEVICE_VERSION] 短得多是因为它**会变**：重新驻网、切换制式、
+     * 换 APN 都会重新协商。但也不该短 —— AT 通道是全局互斥的（`ATChannel` 有 500ms 最小间隔
+     * 与失败退避），查得勤会和网络栈重启、控制台透传那些 AT 用途抢锁。
+     * 5 分钟是"用户重进页面看到的是新鲜值，又不会把 AT 通道占住"的折中。
+     */
+    const val DEVICE_QOS = 300_000L
+
     // ════════════════════════════════════════════════════════
     // 【实时数据】— 变化快，短 TTL 维持不变
     // ════════════════════════════════════════════════════════
@@ -534,4 +551,17 @@ object CacheTTL {
      * 取同一档：更短只是重复拿到同一句、白打请求。
      */
     const val POETRY = 600_000L
+
+    // ════════════════════════════════════════════════════════
+    // 【本机媒体库】— 聚合类查询，TTL 要盖住"来回切视图"又不能盖住重扫
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * 音频分组聚合（`GET /api/media/groups`）— 60 秒。
+     *
+     * 一次分组要整表扫一遍游标，而客户端在音乐页里会反复切专辑 / 歌手 / 文件夹三个视图，
+     * 所以必须缓存。上限压在 1 分钟：媒体库平时不怎么变，但 `POST /api/media/rescan`
+     * 之后用户就等着看到新收录的歌 —— TTL 再长会让人以为扫描没生效。
+     */
+    const val MEDIA_GROUPS = 60_000L
 }

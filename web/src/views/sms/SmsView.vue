@@ -440,7 +440,11 @@ const msgMenuOptions = computed(() => {
   return options;
 });
 
-const contactMenuOptions = computed(() => [{ key: 'blacklist', label: '加入黑名单' }]);
+const contactMenuOptions = computed(() => [
+  { key: 'delete-conversation', label: '删除整段会话' },
+  { type: 'divider', key: 'd-contact' },
+  { key: 'blacklist', label: '加入黑名单' },
+]);
 
 /** 角标 = 已加载记录里 id 大于「已查看水位」的条数（与 app 的 smsBlockedUnviewed 同口径）。 */
 const blockedUnviewed = computed(() => blockedRecords.value.filter((r) => r.id > blockedSeenId.value).length);
@@ -924,7 +928,34 @@ function openContactMenu(e: MouseEvent, contact: Contact) {
 function handleContactAction(key: string) {
   const contact = contactMenuTarget.value;
   contactMenuTarget.value = null;
-  if (!contact || key !== 'blacklist') return;
+  if (!contact) return;
+
+  if (key === 'delete-conversation') {
+    dialog.warning({
+      title: '删除整段会话',
+      content: `将删除与 ${contact.phone} 的全部短信记录，此操作不可恢复。`,
+      positiveText: '删除全部',
+      negativeText: '取消',
+      onPositiveClick: async () => {
+        try {
+          await api.post('/api/sms/delete-conversation', { phone: contact.phone });
+          message.success('已删除');
+          loadContacts();
+          // 如果当前正在看这段会话，关闭它
+          if (selectedPhone.value === contact.phone) {
+            selectedPhone.value = '';
+            messages.value = [];
+            optimisticMessages.value = [];
+          }
+        } catch {
+          message.error('删除失败');
+        }
+      },
+    });
+    return;
+  }
+
+  if (key !== 'blacklist') return;
   dialog.warning({
     title: '加入黑名单',
     content:

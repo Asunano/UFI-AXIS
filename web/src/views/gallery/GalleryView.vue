@@ -209,6 +209,38 @@
         </template>
       </n-modal>
     </GridCard>
+
+    <!-- ── 9. 分步向导 ── -->
+    <GridCard title="9. 分步引导表单（唯一实现：components/StepWizard.vue）">
+      <p class="gallery-desc">
+        三处要在这里验收：① 已完成/当前两态圆点都是 accent 实底 —— 出现空心圈就说明底色又变半透明，
+        步骤条的细线会从圆点里透出来；② 第 2 步留空时「下一步」置灰**且**上方写出理由，
+        置灰而不说理由等于「点了没反应」；③ 点第 3 个圆点会被拦回第 2 步并弹提示 ——
+        往前跳只在被跳过的每一步都合法时才成立。
+      </p>
+      <StepWizard
+        v-model:current="wizardStep"
+        :steps="wizardSteps"
+        finish-text="完成"
+        exit-text="取消"
+        @finish="wizardStep = 0"
+        @exit="wizardStep = 0"
+        @blocked="(reason: string) => (wizardBlocked = reason)"
+      >
+        <template #one>
+          <InfoRow label="这一步没有必填项" value="所以「下一步」直接可点" />
+        </template>
+        <template #two>
+          <n-input v-model:value="wizardName" placeholder="随便填点什么，空着就会被拦下" />
+        </template>
+        <template #three>
+          <GridCard title="确认页就是 GridCard + InfoRow" density="compact">
+            <InfoRow label="名称" :value="wizardName || '（空）'" />
+            <InfoRow label="最近一次拦下" :value="wizardBlocked || '无'" />
+          </GridCard>
+        </template>
+      </StepWizard>
+    </GridCard>
   </div>
 </template>
 
@@ -222,6 +254,7 @@ import InfoRow from '@/components/InfoRow.vue';
 import ValueBadge from '@/components/ValueBadge.vue';
 import RingGauge from '@/components/RingGauge.vue';
 import GaugeChart from '@/components/GaugeChart.vue';
+import StepWizard, { type WizardStep } from '@/components/StepWizard.vue';
 
 // 明暗切换刻意复用全站那一个开关（appStore + <html class="dark">），
 // 不在本页另建一套预览态 —— 否则画廊看着对、真实页面却不对。
@@ -256,6 +289,22 @@ const demoNumber = ref(30);
 const demoText = ref('');
 const gaugeValue = ref(42);
 const modalVisible = ref(false);
+
+// 分步向导的演示态。第 2 步刻意设成必填，用来验收"拦下时必须写出理由"。
+const wizardStep = ref(0);
+const wizardName = ref('');
+const wizardBlocked = ref('');
+const wizardSteps = computed<WizardStep[]>(() => [
+  { key: 'one', label: '第一步', heading: '没有必填项的一步' },
+  {
+    key: 'two',
+    label: '第二步',
+    heading: '这一步必须填点什么',
+    description: '空着时「下一步」置灰，理由写在按钮上方。',
+    validate: () => (wizardName.value.trim() ? null : '请填写名称'),
+  },
+  { key: 'three', label: '确认', heading: '核对', description: '确认页用 GridCard + InfoRow 拼，不另造组件。' },
+]);
 </script>
 
 <style scoped>

@@ -4,6 +4,7 @@ import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldNormalizer
 import com.ufi_axis_core.deviceschema.FieldSpec
+import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.Sensitivity
 import com.ufi_axis_core.deviceschema.ServingCell
 import com.ufi_axis_core.deviceschema.SettingKey
@@ -1289,11 +1290,250 @@ class ZteGoformProfileTest {
     }
 
 
+    // ───────── 阶段 0 批 1：补齐的动作类 / 设置类写命令 ─────────
+
     @Test
-    fun `已登记的写入项 command 不重复且非空`() {
-        val cmds = SettingKey.entries.mapNotNull { ZteGoformProfile.writeSpec(it) }.map { it.command }
-        assertTrue(cmds.all { it.isNotBlank() })
-        assertEquals(cmds.distinct(), cmds)
+    fun `重启与关机与恢复出厂都是无参命令`() {
+        val reboot = ZteGoformProfile.writeSpec(SettingKey.REBOOT)!!
+        assertEquals("REBOOT_DEVICE", reboot.command)
+        assertEquals(emptyMap<String, String>(), reboot.encode(emptyMap()))
+        val shutdown = ZteGoformProfile.writeSpec(SettingKey.SHUTDOWN)!!
+        assertEquals("SHUTDOWN_DEVICE", shutdown.command)
+        assertEquals(emptyMap<String, String>(), shutdown.encode(emptyMap()))
+        val reset = ZteGoformProfile.writeSpec(SettingKey.FACTORY_RESET)!!
+        assertEquals("FACTORY_RESET", reset.command)
+        assertEquals(emptyMap<String, String>(), reset.encode(emptyMap()))
+        // isTest=false 由 GoformCodec.buildSetFormBody 统一补，encode 不该再发一份
+        assertFalse(reboot.encode(emptyMap()).containsKey("isTest"))
+    }
+
+    @Test
+    fun `后台口令只做字段名映射_哈希不在 profile 里做`() {
+
+        val spec = ZteGoformProfile.writeSpec(SettingKey.BACKEND_PASSWORD)!!
+        assertEquals("CHANGE_PASSWORD", spec.command)
+        // 假 hash：encode 必须原样搬过去。哈希算法与登录握手共用 GoformClient.sha256Hex，
+        // 在这里再实现一份就是第二个真源（登录侧换算法时这里不报错、只会静默登不上）。
+        val oldHash = "A".repeat(64)
+        val newHash = "B".repeat(64)
+        val out = spec.encode(mapOf("old_hash" to oldHash, "new_hash" to newHash))
+        assertEquals(oldHash, out["oldPassword"])
+        assertEquals(newHash, out["newPassword"])
+        assertEquals(setOf("oldPassword", "newPassword"), out.keys)
+        assertNull(spec.validate(mapOf("old_hash" to oldHash, "new_hash" to newHash)))
+        // 忘了哈希 = 明文口令会被原样发给设备，必须在下发前挡住
+        assertNotNull(spec.validate(mapOf("old_hash" to "admin", "new_hash" to newHash)))
+        assertNotNull(spec.validate(mapOf("old_hash" to oldHash, "new_hash" to "admin")))
+        // 设备侧要大写十六进制（现有调用点是 sha256Hex(x).uppercase()），小写没实测过
+        assertNotNull(spec.validate(mapOf("old_hash" to "a".repeat(64), "new_hash" to newHash)))
+        // 拒绝文案里不许出现参数值（它会进 GoformSettingWriter 的 warn 日志）
+        val reason = spec.validate(mapOf("old_hash" to "secret-plain", "new_hash" to newHash))!!
+        assertFalse(reason.contains("secret-plain"))
+    }
+
+    @Test
+    fun `连接模式与漫游共用一条设备命令但参数集不同`() {
+        val mode = ZteGoformProfile.writeSpec(SettingKey.CONNECTION_MODE)!!
+        val roam = ZteGoformProfile.writeSpec(SettingKey.ROAM)!!
+        assertEquals("SET_CONNECTION_MODE", mode.command)
+        assertEquals("共用同一条设备命令是设备侧事实，不是抄错", roam.command, mode.command)
+        assertEquals(
+            mapOf("ConnectionMode" to "manual_dial"),
+            mode.encode(mapOf("value" to "manual_dial")),
+        )
+        // 漫游那一项额外带两个 roam 参数，所以两者不能合并成一个 key
+        assertTrue(roam.encode(mapOf("value" to true)).containsKey("dial_roam_setting_option"))
+        assertFalse(mode.encode(mapOf("value" to "auto_dial")).containsKey("roam_setting_option"))
+        assertNull(mode.validate(mapOf("value" to "auto_dial")))
+        // 设备大小写敏感，认不出的值不猜一个下发
+        assertNotNull(mode.validate(mapOf("value" to "AUTO_DIAL")))
+        assertNotNull(mode.validate(mapOf("value" to "auto")))
+        assertNotNull(mode.validate(mapOf("value" to "auto_dial&goformId=FACTORY_RESET")))
+    }
+
+    @Test
+    fun `WiFi 功率档位沿用 route 现有的 0 到 2 值域`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_POWER)!!
+        assertEquals("SET_WIFI_POWER", spec.command)
+        assertEquals("1", spec.encode(mapOf("value" to 1))["wifiPowerLevel"])
+        assertNull(spec.validate(mapOf("value" to 0)))
+        assertNull(spec.validate(mapOf("value" to 2)))
+        assertNotNull(spec.validate(mapOf("value" to 3)))
+        assertNotNull(spec.validate(mapOf("value" to "high")))
+    }
+
+    // ───────── 阶段 0 批 1b：开/关是两条命令的写入项（WriteSpec.commandOf）─────────
+
+    @Test
+    fun `WiFi 总开关按取值选命令并给对应参数集`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ENABLED)!!
+        assertNotNull("开/关是两条命令，必须由 commandOf 表达", spec.commandOf)
+        val commandOf = spec.commandOf!!
+        // 开：逐字对齐 GoformWifiClient.setWifiEnabled 的 true 分支
+        assertEquals("switchWiFiChip", commandOf(mapOf("value" to true)))
+        assertEquals(
+            mapOf("ChipEnum" to "chip1", "GuestEnable" to "0"),
+            spec.encode(mapOf("value" to true)),
+        )
+        // 关：false 分支走的是另一条命令，参数集也完全不同
+        assertEquals("switchWiFiModule", commandOf(mapOf("value" to false)))
+        assertEquals(mapOf("SwitchOption" to "0"), spec.encode(mapOf("value" to false)))
+        // command 是默认命令名 / 日志标识，取"开"那条
+        assertEquals("switchWiFiChip", spec.command)
+        // isTest=false 由 GoformCodec.buildSetFormBody 统一补
+        assertFalse(spec.encode(mapOf("value" to true)).containsKey("isTest"))
+        // 关的时候不许带 ChipEnum（带了就是把两个分支的参数混在一起发）
+        assertFalse(spec.encode(mapOf("value" to false)).containsKey("ChipEnum"))
+    }
+
+    @Test
+    fun `移动数据开关的主命令按取值选并带 notCallback`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.MOBILE_DATA)!!
+        assertNotNull(spec.commandOf)
+        val commandOf = spec.commandOf!!
+        assertEquals("CONNECT_NETWORK", commandOf(mapOf("value" to true)))
+        assertEquals("DISCONNECT_NETWORK", commandOf(mapOf("value" to false)))
+        // 两个分支的参数集相同：只有约定参数 notCallback=true（现有客户端逐字如此）
+        assertEquals(mapOf("notCallback" to "true"), spec.encode(mapOf("value" to true)))
+        assertEquals(mapOf("notCallback" to "true"), spec.encode(mapOf("value" to false)))
+        assertEquals("默认命令名取'开'那条", "CONNECT_NETWORK", spec.command)
+    }
+
+    @Test
+    fun `移动数据的备用命令是 SET_DATA_ENABLED 且参数与现有代码逐字一致`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.MOBILE_DATA)!!
+        assertNotNull(
+            "主命令失败再发 SET_DATA_ENABLED 是设备事实，不许退回客户端里的 if",
+            spec.fallback,
+        )
+        val fallback = spec.fallback!!
+        assertEquals("SET_DATA_ENABLED", fallback.command)
+        // 现有代码第二条命令**不带** notCallback，只有 data=1/0（多带一个参数就是行为变更）
+        assertEquals(mapOf("data" to "1"), fallback.encode(mapOf("value" to true)))
+        assertEquals(mapOf("data" to "0"), fallback.encode(mapOf("value" to false)))
+        // 备用命令只有一个命令名，不需要 commandOf
+        assertNull(fallback.commandOf)
+        // 备用命令没有再套一层备用
+        assertNull(fallback.fallback)
+    }
+
+    @Test
+    fun `拨号入口与移动数据同命令但没有兜底`() {
+        val dial = ZteGoformProfile.writeSpec(SettingKey.PPP_DIAL)!!
+        val data = ZteGoformProfile.writeSpec(SettingKey.MOBILE_DATA)!!
+        assertNotNull(dial.commandOf)
+        val commandOf = dial.commandOf!!
+        assertEquals("CONNECT_NETWORK", commandOf(mapOf("value" to true)))
+        assertEquals("DISCONNECT_NETWORK", commandOf(mapOf("value" to false)))
+        assertEquals(mapOf("notCallback" to "true"), dial.encode(mapOf("value" to true)))
+        assertEquals(mapOf("notCallback" to "true"), dial.encode(mapOf("value" to false)))
+        // 这是两个 key 存在的全部理由：connectNetwork() / disconnectNetwork() 没有兜底命令。
+        // 合并成一个 key 会给这两个入口偷偷加上 SET_DATA_ENABLED —— 行为变更。
+        assertNull("拨号入口不许有兜底命令", dial.fallback)
+        assertNotNull("移动数据必须保留兜底命令", data.fallback)
+    }
+
+    @Test
+    fun `commandOf 为 null 时命令名就是 command`() {
+        // 新字段不许影响现有项：除了上面三项，其余写入项都不登记 commandOf。
+        val withCommandOf = SettingKey.entries.filter { ZteGoformProfile.writeSpec(it)?.commandOf != null }
+        assertEquals(
+            "只有'开/关是两条命令'的项才该登记 commandOf，多出来的那项大概率是复制粘贴带进去的",
+            setOf(SettingKey.WIFI_ENABLED, SettingKey.MOBILE_DATA, SettingKey.PPP_DIAL),
+            withCommandOf.toSet(),
+        )
+        // 其余项照旧只有一个命令名，取值变了也不会变命令（抽两个有代表性的：单值 + 多参数）
+        val led = ZteGoformProfile.writeSpec(SettingKey.LED)!!
+        assertNull(led.commandOf)
+        assertEquals("INDICATOR_LIGHT_SETTING", led.command)
+        assertEquals("0", led.encode(mapOf("value" to false))["indicator_light_switch"])
+        val acl = ZteGoformProfile.writeSpec(SettingKey.WIFI_ACL)!!
+        assertNull(acl.commandOf)
+        assertEquals("setDeviceAccessControlList", acl.command)
+    }
+
+
+    // ───────── 重试语义（计划书 §11.1）─────────
+
+    @Test
+    fun `每个写入项的重试策略都是显式决定的`() {
+        // 这张表就是"重试语义"的基线：设置类命令原本走 goformPostIdempotent（会话失效重登重试
+        // 一次），漏标一项就把「切换网络制式第一次必定失败」那个已修的 bug 放回去；
+        // 动作类 / 改口令反过来不能重试（重启两次、拿旧口令再登一次）。
+        val expected = mapOf(
+            SettingKey.LED to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.PERFORMANCE_MODE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.WIFI_SLEEP_IDLE_MINUTES to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.WIFI_ACL to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.RESTART_SCHEDULE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.ROAM to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.SAMBA to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.USB_PORT to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.NETWORK_MODE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.BAND_LOCK_LTE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.BAND_LOCK_NR to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.TRAFFIC_LIMIT to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.LAN_DHCP to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.FOTA_AUTO_UPDATE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.CELL_LOCK to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.CELL_UNLOCK to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.SIM_SLOT to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.FLOW_CALIBRATION to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.CONNECTION_MODE to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.WIFI_POWER to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.WIFI_ENABLED to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.MOBILE_DATA to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.PPP_DIAL to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            SettingKey.REBOOT to RetryPolicy.NEVER,
+            SettingKey.SHUTDOWN to RetryPolicy.NEVER,
+            SettingKey.FACTORY_RESET to RetryPolicy.NEVER,
+            SettingKey.BACKEND_PASSWORD to RetryPolicy.NEVER,
+        )
+        assertEquals(
+            "新增 SettingKey 时必须在这张表里显式写出重试语义，不许靠默认值蒙过去",
+            SettingKey.entries.toSet(), expected.keys,
+        )
+        expected.forEach { (key, policy) ->
+            assertEquals(key.name, policy, ZteGoformProfile.writeSpec(key)!!.retry)
+        }
+    }
+
+    @Test
+    fun `只有 MOBILE_DATA 有备用命令且参数正确`() {
+        // 批 1 说"还没有任何项登记备用命令"——批 1b 进了 MOBILE_DATA，所以断言更新成精确冻结。
+        val withFallback = SettingKey.entries.filter { ZteGoformProfile.writeSpec(it)?.fallback != null }
+        assertEquals(
+            "只有 MOBILE_DATA 有兜底（CONNECT_NETWORK 失败再发 SET_DATA_ENABLED），其它项不该有",
+            listOf(SettingKey.MOBILE_DATA), withFallback,
+        )
+        val fb = ZteGoformProfile.writeSpec(SettingKey.MOBILE_DATA)!!.fallback!!
+        assertEquals("SET_DATA_ENABLED", fb.command)
+        assertEquals(mapOf("data" to "1"), fb.encode(mapOf("value" to true)))
+        assertEquals(mapOf("data" to "0"), fb.encode(mapOf("value" to false)))
+        // fallback 的重试策略独立判定，不继承主命令（两条命令副作用可以完全不同）
+        assertEquals(RetryPolicy.RETRY_ON_SESSION_LOSS, fb.retry)
+    }
+
+    @Test
+    fun `已登记的写入项 command 非空_重复必须是刻意的复用`() {
+        val byCommand = SettingKey.entries.mapNotNull { key ->
+            ZteGoformProfile.writeSpec(key)?.let { key to it.command }
+        }
+        assertTrue(byCommand.all { it.second.isNotBlank() })
+        // 原断言是「command 互不重复」。CONNECTION_MODE 登记之后它不再成立，而不成立的原因是
+        // 设备事实不是抄错：ZTE 把「漫游开关」塞进了 SET_CONNECTION_MODE（见 ROAM 的 WriteSpec
+        // 注释），两个设置项共用一条命令、参数集不同。所以判据收紧成「重复必须在白名单里」——
+        // 复制粘贴抄错另一条命令名的情形照样会红。
+        val deliberate = mapOf(
+            "SET_CONNECTION_MODE" to setOf(SettingKey.ROAM, SettingKey.CONNECTION_MODE),
+            // MOBILE_DATA 与 PPP_DIAL 的默认命令名相同是刻意的：两者的命令与参数完全一样，
+            // 唯一区别是 MOBILE_DATA 多一条 SET_DATA_ENABLED 兜底（见两者的 KDoc）。
+            "CONNECT_NETWORK" to setOf(SettingKey.MOBILE_DATA, SettingKey.PPP_DIAL),
+        )
+        val duplicated = byCommand.groupBy({ it.second }, { it.first })
+            .filterValues { it.size > 1 }
+            .mapValues { it.value.toSet() }
+        assertEquals("出现未登记的命令复用 = 大概率抄错了命令名", deliberate, duplicated)
     }
 
     // ───────────────────────── profile 元信息 ─────────────────────────

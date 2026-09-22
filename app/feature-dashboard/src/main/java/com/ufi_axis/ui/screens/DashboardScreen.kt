@@ -42,6 +42,10 @@ import java.util.Calendar
 fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.dashboardState.collectAsState()
     val wsState by viewModel.wsConnectionState.collectAsState()
+    // 2026-09-21：这里原来读 state.isOffline —— 那个字段其实是「手机有没有外网」，
+    // 被首页渲染成"后端服务未连接"，两个方向都是错的（连着设备热点但 core 没跑时永不提示；
+    // 连了没外网的公共 WiFi 时误报）。改读权威连接态：可达性只信 /health 探活。
+    val connectivity by viewModel.connectivity.collectAsState()
     // 本月流量数据源：与「工具-流量管理」同源（getTrafficLimit 端点），避免用仪表盘 summary 不可靠的 traffic_limit 字段。
     val trafficMgmt by viewModel.trafficManagementState.collectAsState()
     val palette = LocalResolvedPalette.current
@@ -190,7 +194,7 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                     wifiSsid = wifiSsid,
                     wifiBand = wifiBand,
                     wifiClientCount = wifiClientCount,
-                    backendOffline = state.isOffline,
+                    backendOffline = connectivity.showBanner,
                     lastUpdatedText = state.lastUpdated?.let {
                         com.ufi_axis.util.FormatUtils.formatRelativeTime(it)
                     },

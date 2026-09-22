@@ -4,6 +4,9 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -44,15 +47,26 @@ import kotlinx.coroutines.delay
 @Composable
 fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.tunnelState.collectAsState()
-    val context = LocalContext.current
     val palette = LocalResolvedPalette.current
+    val context = LocalContext.current
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     var showClearLogDialog by remember { mutableStateOf(false) }
     var pendingUninstall by remember { mutableStateOf<String?>(null) }
 
-    // 设置以后端 AppSettings 为准，进页面拉一次（否则显示的可能是上一次会话的默认值）
-    // 组件列表也在这里"直接加载"：core 侧 refresh=false 只读本地安装状态，不再同步打外网，
-    // 所以这次请求是快的，进页面立刻就能看到 frpc / cloudflared 两行。
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.tunnel.clearError()
         viewModel.tunnel.loadTunnelSettings()
@@ -60,15 +74,15 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
     }
     // 懒加载：远端清单（最新版本 / 下载体积 / 是否有新版）由 core 在后台拉，
     // 这里每 1.5s 回读一次直到拿到 —— 用户不需要手动点「检查更新」才看到内容。
-    LaunchedEffect(state.componentManifestLoading) {
-        while (state.componentManifestLoading) {
+    LaunchedEffect(state.componentManifestLoading, lifecycleResumed) {
+        while (state.componentManifestLoading && lifecycleResumed) {
             delay(1500)
             viewModel.tunnel.loadComponents()
         }
     }
     // 安装进度：只在有任务时 1s 轮询，任务落终态后 refreshComponentTask 会自己补拉列表
-    LaunchedEffect(state.componentTask.active) {
-        while (state.componentTask.active) {
+    LaunchedEffect(state.componentTask.active, lifecycleResumed) {
+        while (state.componentTask.active && lifecycleResumed) {
             delay(1000)
             viewModel.tunnel.refreshComponentTask()
         }
@@ -98,10 +112,6 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                     modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
                 )
             }
-            // 只显示隧道自己的组件：`/api/components` 是通用端点，里面还有 ffmpeg 这种
-            // 服务其它功能的组件，它们的安装入口在各自的功能设置页（ffmpeg → 媒体 → 视频设置），
-            // 混在这里会让用户以为"装了才能用隧道"。
-            val tunnelComponents = state.components.filter { it.id in TUNNEL_COMPONENT_IDS }
             UfiSettingsGroup {
                 // 「检查更新」放标题右侧：它是这一组的次要动作，摆在卡片底部当通栏按钮
                 // 会被误认成主操作，而且卡片越长它离标题越远。
@@ -119,14 +129,14 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                         )
                     }
                 }
-                if (tunnelComponents.isEmpty()) {
+                if (state.components.isEmpty()) {
                     Text(
                         if (manifestLoading) "正在获取组件清单…" else "没读到组件信息，可点右上角「检查更新」重试；未安装 frpc / cloudflared 前对应隧道无法启动。",
                         style = UfiTextStyles.note,
                         color = palette.textSecondary
                     )
                 }
-                tunnelComponents.forEachIndexed { index, c ->
+                state.components.forEachIndexed { index, c ->
                     if (index > 0) UfiDivider()
                     UfiSettingsItem(
                         title = c.name,
@@ -314,14 +324,6 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
         )
     }
 }
-
-/**
- * 本页「核心组件」只管隧道自己的二进制。
- *
- * `/api/components` 是通用端点，清单里还有服务其它功能的组件（ffmpeg → 视频封面抽帧），
- * 它们的安装入口在各自的功能设置页，不在这里露出。
- */
-private val TUNNEL_COMPONENT_IDS = setOf("frpc", "cloudflared")
 
 /**
  * 组件副标题：已装看占用与来源，未装看需下载多少。

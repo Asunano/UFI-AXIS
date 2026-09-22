@@ -423,6 +423,27 @@ class DownloadModule(
         }
     }
 
+    /**
+     * 目录选择器用：列出某个目录下的**子目录**，顺带回它的父目录。
+     *
+     * 为什么在这里再写一份而不是复用 `MediaModule.browseDirs`：下载模块不该为了"选个目录"
+     * 去持有媒体模块（那是另一条业务线，依赖方向会变成 feature-download → 媒体）；
+     * 而这件事本身只是 `/api/files/list` 的一次"只留目录"过滤，没有业务逻辑可共享。
+     *
+     * 这里浏览的是**设备文件系统**，与下载保存目录的语义一致 —— core 的
+     * `DownloadManager` 拿 `saveDir` 直接 `File(...)` / `smartMkdir(...)` 落盘，
+     * 它是设备侧绝对路径，不是手机本机路径。
+     *
+     * 失败回空列表 + null 父目录：让弹窗显示"这个目录读不到"，不抛到全局错误浮层 ——
+     * 浏览失败是一次性的，没必要污染整页的 errorMessage。
+     */
+    suspend fun browseDirs(path: String): Pair<List<String>, String?> = try {
+        val resp = withContext(Dispatchers.IO) { api().listFiles(path) }
+        resp.files.filter { it.isDirectory }.map { it.path }.sorted() to resp.parent
+    } catch (e: Exception) {
+        emptyList<String>() to null
+    }
+
     fun refreshTrackers() {
         scope.launch {
             try {

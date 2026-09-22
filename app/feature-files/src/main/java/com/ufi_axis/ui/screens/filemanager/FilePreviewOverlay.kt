@@ -101,6 +101,10 @@ import com.ufi_axis.util.AppPreferences
 // 全屏副作用都在那边，本文件只负责浮层的组织方式。R 也指向那个模块（布局搬过去了）。
 import com.ufi_axis.ui.media.UfiFullscreenSystemUiEffect
 import com.ufi_axis.ui.media.UfiStreamHttpClient
+import com.ufi_axis.ui.media.UfiVideoSource
+import com.ufi_axis.ui.media.applyUfiSubtitleStyle
+import com.ufi_axis.ui.media.loadUfiSubtitleTracks
+import com.ufi_axis.ui.media.setUfiSources
 import com.ufi_axis.feature.media.R
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -538,6 +542,24 @@ private fun MediaPreviewContent(
         onDispose { exoPlayer.release() }
     }
 
+    // 外挂字幕（2026-09-19）。
+    //
+    // 为什么不在上面 `remember(filePath)` 里一起装：拉字幕是网络请求，放进 remember 会
+    // 卡住首帧。这里先让视频正常起播，字幕拉到之后再重装 MediaItem 并 seek 回原位置 ——
+    // MediaItem 的字幕配置是 setMediaItem 时定死的，不重装播放器就永远看不到这条轨。
+    //
+    // 只有视频需要：音频预览没有字幕的概念。
+    LaunchedEffect(filePath, mediaType) {
+        if (mediaType != "video") return@LaunchedEffect
+        val tracks = loadUfiSubtitleTracks(appContext, filePath)
+        if (tracks.isEmpty()) return@LaunchedEffect
+        val position = exoPlayer.currentPosition
+        val wasPlaying = exoPlayer.isPlaying
+        exoPlayer.setUfiSources(listOf(UfiVideoSource(streamUrl, tracks)), 0)
+        if (position > 0) exoPlayer.seekTo(position)
+        exoPlayer.playWhenReady = wasPlaying
+    }
+
     // 关闭预览（退场动画期间）暂停播放：避免视频帧在 exit 动画里继续解码，与 scrim 淡出 / 背景模糊 snap
     // 抢 GPU，导致掉帧卡顿（播放中关闭尤为明显）。playing 仅在 target 置空前为 true；退场期间置 false 即暂停。
     LaunchedEffect(playing) {
@@ -618,6 +640,8 @@ private fun MediaPreviewContent(
                         playerView.setRepeatToggleModes(PlayerControlView.DEFAULT_REPEAT_TOGGLE_MODES)
                         // 字幕：视频含内嵌字幕轨时显示字幕按钮；无字幕轨自动隐藏（不占空间）。
                         playerView.setShowSubtitleButton(true)
+                        // 字幕外观与媒体中心播放页共用同一处配置，免得两边各调一套然后慢慢分叉。
+                        playerView.applyUfiSubtitleStyle()
                         // 缓冲指示器：设备流式加载时显示缓冲转圈，弱网/首帧可观测（仅播放中缓冲时显示）。
                         playerView.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
                         // 倍速：media3 设置弹窗（exo_settings 齿轮）随 Player 速度能力自动出现，

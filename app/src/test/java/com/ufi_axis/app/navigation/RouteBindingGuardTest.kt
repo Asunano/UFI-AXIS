@@ -39,19 +39,23 @@ class RouteBindingGuardTest {
     }
 
     /**
-     * `appRoutes` 里所有 DETAIL 路由的常量名。
+     * `appRoutes` 里所有**页面级**路由（DETAIL 与 RISE）的常量名。
      *
      * 两种书写形态都要认：单行 `AppRoute(Routes.X, TransitionType.DETAIL)`，
      * 与带 navArgument 的多行 `AppRoute(route = Routes.X, transition = TransitionType.DETAIL, ...)`。
+     *
+     * RISE（2026-09-20 起的升起面板，目前只有音乐播放页）必须一起认：它和 DETAIL 一样是
+     * `screens[appRoute.route]?.invoke(...)` 取内容的可空调用，漏登记同样是白屏。
+     * 只写 DETAIL 的话，把一条路由改成 RISE 就等于把它从这道护栏里摘出去了。
      */
     private fun detailRouteNames(): Set<String> {
         val code = source(navScreensPath)
         val block = code.substringAfter("val appRoutes")
         val names = mutableSetOf<String>()
-        Regex("""AppRoute\(\s*Routes\.(\w+)\s*,\s*TransitionType\.DETAIL""")
+        Regex("""AppRoute\(\s*Routes\.(\w+)\s*,\s*TransitionType\.(?:DETAIL|RISE)""")
             .findAll(block)
             .forEach { names += it.groupValues[1] }
-        Regex("""AppRoute\(\s*route\s*=\s*Routes\.(\w+)\s*,\s*transition\s*=\s*TransitionType\.DETAIL""")
+        Regex("""AppRoute\(\s*route\s*=\s*Routes\.(\w+)\s*,\s*transition\s*=\s*TransitionType\.(?:DETAIL|RISE)""")
             .findAll(block)
             .forEach { names += it.groupValues[1] }
         return names

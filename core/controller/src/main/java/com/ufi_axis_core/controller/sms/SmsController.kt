@@ -288,6 +288,82 @@ class SmsController(
     }
 
 
+    /**
+     * 按号码删除整段会话（2026-09-21）。
+     *
+     * ContentResolver 优先（`content://sms` WHERE address=phone）；ContentResolver 失败时
+     * 走 goform 兜底——先拉列表定位全部 goform id，再逐条删除。
+     * 级联清理：本地已读状态 + 验证码缓存。
+     *
+     * @return 删除的短信数量，-1 表示全部失败
+     */
+    suspend fun deleteConversation(phone: String): Int {
+        if (phone.isBlank()) return -1
+        // ① ContentResolver 批量删（address=phone 的全部行）
+        try {
+            val ctx = context
+            if (ctx != null) {
+                // 先收集该号码下全部 id（供级联清理验证码缓存用）
+                val ids = mutableListOf<Long>()
+                ctx.contentResolver.query(
+                    Uri.parse("content://sms"), arrayOf("_id"),
+                    "address=?", arrayOf(phone), null
+                )?.use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
+
+                val rows = ctx.contentResolver.delete(
+                    Uri.parse("content://sms"), "address=?", arrayOf(phone)
+                )
+                if (rows > 0) {
+                    // 级联清理验证码缓存
+                    ids.forEach { id ->
+                        try { vcDao?.deleteByMsgId(id) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                    }
+                    AppLogger.i(tag, "deleteConversation($phone): deleted $rows via ContentResolver")
+                    return rows
+                }
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            AppLogger.w(tag, "deleteConversation via ContentResolver failed for phone=$phone: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // ② goform 兜底：拉列表 → 按号码过滤 → 逐条删
+        try {
+            smsClient?.let { gc ->
+                val smsData = gc.getSmsList(perPage = 500) ?: return@let
+                val arr = smsData["messages"]?.jsonArray ?: return@let
+                val targetIds = arr.mapNotNull { el ->
+                    val obj = el.jsonObject
+                    val num = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
+                    if (num == phone) obj["id"]?.jsonPrimitive?.longOrNull else null
+                }
+                if (targetIds.isEmpty()) return 0
+                var deleted = 0
+                for (gfId in targetIds) {
+                    if (gc.deleteSms(gfId.toString())) deleted++
+                }
+                AppLogger.i(tag, "deleteConversation($phone): deleted $deleted/${targetIds.size} via goform")
+                return deleted
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            AppLogger.w(tag, "deleteConversation via goform failed for phone=$phone: ${e.javaClass.simpleName}: ${e.message}")
+        }
+        return -1
+    }
+
+    /**
+     * 批量删除多条短信（2026-09-21）。逐条调 [delete]。
+     * @return 成功删除的数量
+     */
+    suspend fun deleteBatch(ids: List<Long>): Int {
+        var deleted = 0
+        for (id in ids) {
+            if (delete(id)) deleted++
+        }
+        return deleted
+    }
+
     suspend fun delete(id: Long): Boolean {
         // ① ContentResolver 直删（Android 4.4+ 非默认短信应用通常被拒，静默降级）
         try {

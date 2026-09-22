@@ -571,6 +571,15 @@ class DashboardModule(
                 if (_dashboardState.value.deviceVersion == null) {
                     loadDeviceVersionSilently()
                 }
+                // 2026-09-22：EPS 承载 QoS（AT+CGEQOSRDP）同样走独立端点。
+                //
+                // 只在**还没拿到**时拉，绝不跟着 10s 轮询走：AT 通道全局互斥，
+                // core 侧虽然有 5 分钟缓存挡着，但缓存过期那一次仍要真发 AT，
+                // 落在 summary 的关键路径上就可能把整张仪表盘拖住。
+                // 重新驻网后的新值靠用户重进页面（或 App 重启）刷新，够用。
+                if (_dashboardState.value.deviceQos == null) {
+                    loadDeviceQosSilently()
+                }
             } catch (e: Exception) {
                 // 更加鲁棒的取消判定：只要 coroutine 被取消，或者 OkHttp 抛出 Canceled 异常，均视为正常取消。
                 val isCancelled = e is CancellationException || 
@@ -713,17 +722,25 @@ class DashboardModule(
                 val info = runCatching { api.getBackendUpdateInfo() }
                     .onFailure { DebugLog.w("Dashboard", "core backend-info 不可用: ${it.message}") }
                     .getOrNull()
-                _updateState.value = UpdateState(
-                    hasUpdate = info?.has_update == true,
-                    // current_version 由 core 从自身 packageInfo 读；拿不到时回退 config/version
-                    serverVersion = info?.current_version?.takeIf { it.isNotBlank() } ?: versionInfo.version,
-                    latestVersion = info?.latest_version?.takeIf { it.isNotBlank() },
-                    changelog = info?.changelog.orEmpty(),
-                    updateUrl = versionInfo.update_url,
-                    checking = false
-                )
+                _updateState.update {
+                    it.copy(
+                        hasUpdate = info?.has_update == true,
+                        // current_version 由 core 从自身 packageInfo 读；拿不到时回退 config/version
+                        serverVersion = info?.current_version?.takeIf { v -> v.isNotBlank() } ?: versionInfo.version,
+                        latestVersion = info?.latest_version?.takeIf { v -> v.isNotBlank() },
+                        changelog = info?.changelog.orEmpty(),
+                        updateUrl = versionInfo.update_url,
+                        checking = false,
+                        errorMessage = null
+                    )
+                }
             } catch (e: Exception) {
-                _updateState.value = UpdateState(checking = false, errorMessage = "检查更新失败: ${e.message}")
+                // 只写失败原因，**不要构造新 state** —— 构造会把上一次成功读到的
+                // serverVersion/latestVersion/changelog 全部清空，等于设备临时不可达一次
+                // 就把关于页那行「Core x.y.z」也一起打掉（与本函数 KDoc 的降级约定相反）。
+                _updateState.update {
+                    it.copy(checking = false, errorMessage = "检查更新失败: ${e.message}")
+                }
             }
         }
     }
@@ -740,6 +757,23 @@ class DashboardModule(
             _dashboardState.update { it.copy(deviceVersion = ver) }
         } catch (_: Exception) {
             // 静默：版本加载失败仅留空，不影响首页其余信息
+        }
+    }
+
+    /**
+     * 静默加载 EPS 承载 QoS（`AT+CGEQOSRDP` → QCI / 上下行 AMBR），2026-09-22。
+     *
+     * 与 [loadDeviceVersionSilently] 同一手法：非关键展示字段，失败只留空，不弹错误条。
+     *
+     * core 侧已经保证「AT 不可用」回的是 200 + `available = false`，所以这里 catch 到的
+     * 只会是真正的网络/序列化异常。两者最终都表现为卡片上显示"—"，UI 不需要区分。
+     */
+    private suspend fun loadDeviceQosSilently() {
+        try {
+            val qos = api.getDeviceQos()
+            _dashboardState.update { it.copy(deviceQos = qos) }
+        } catch (_: Exception) {
+            // 静默：AT 通道在很多设备上本就不存在，这不是错误
         }
     }
 
@@ -947,7 +981,7 @@ class DashboardModule(
     fun loadAlerts(range: MonitorTimeRange = MonitorTimeRange.today(), silent: Boolean = false) {
         scope.launch {
             if (!silent) {
-                _monitorState.update { it.copy(isLoading = true) }
+                _monitorState.update { it.copy(alertsLoading = true) }
             }
             val start = range.queryStartMs
             val end = range.queryEndMs
@@ -962,11 +996,18 @@ class DashboardModule(
                 }
             }.getOrElse { e ->
                 DebugLog.e("Dashboard", "loadAlerts failed", e)
-                _monitorState.update { s -> s.copy(errorMessage = "加载告警失败: ${e.message}", isLoading = false) }
+                _monitorState.update { s -> s.copy(errorMessage = "加载告警失败: ${e.message}", alertsLoading = false) }
                 return@launch
             }
             DebugLog.d("Dashboard", "loadAlerts first page: ${firstPage.alerts.size} hasMore=${firstPage.hasMore}")
-            _monitorState.update { s -> s.copy(alerts = firstPage.alerts, alertRange = range, isLoading = false) }
+            _monitorState.update { s ->
+                s.copy(
+                    alerts = firstPage.alerts,
+                    alertRange = range,
+                    alertsLoading = false,
+                    alertsLoaded = true
+                )
+            }
             // 2026-08-25: 修复多进程去重逻辑后，在此处触发主进程 Toast
             notificationCenter.maybeNotifyNewAlerts(firstPage.alerts)
 

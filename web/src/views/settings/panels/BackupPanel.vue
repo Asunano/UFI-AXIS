@@ -153,6 +153,7 @@ import { useMessage, useDialog } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useAppStore } from '@/stores/app';
 import { useIsMobile } from '@/composables/useIsMobile';
+import { readByteLimit, uploadSizeError } from '@/composables/uploadLimit';
 import ToggleRow from '@/components/ToggleRow.vue';
 
 /**
@@ -185,6 +186,14 @@ const appStore = useAppStore();
 const PASSPHRASE_HEADER = 'X-Backup-Passphrase';
 
 const minPassphrase = ref(12);
+/**
+ * 备份包上传上限（`/api/backup/info` 的 `max_upload_bytes`，core 侧 8MB）。
+ *
+ * 0 = 还没读到，此时放行交给服务端拦（见 `uploadLimit.uploadSizeError`）。
+ * 这一条尤其必要：下面 `onFileSelected` 会 `file.arrayBuffer()` 把整个文件读进内存，
+ * 不预检的话用户选一个 100MB 的文件会先吃 100MB 内存、再被服务端 413 拒掉。
+ */
+const maxUploadBytes = ref(0);
 const origin = ref<'lan' | 'tunnel'>('lan');
 /** 隧道来源且当前是 http：内容与口令在链路上是明文的 */
 const insecureRemote = computed(() => origin.value === 'tunnel' && window.location.protocol === 'http:');
@@ -215,6 +224,7 @@ onMounted(async () => {
     if (typeof data?.min_passphrase_length === 'number') {
       minPassphrase.value = data.min_passphrase_length;
     }
+    maxUploadBytes.value = readByteLimit(data, 'max_upload_bytes');
   } catch {
     /* 拿不到就按默认提示，不阻塞面板 */
   }
@@ -325,6 +335,14 @@ async function onFileSelected(e: Event) {
   // 立刻清空，否则同一个文件选第二次不会触发 change
   input.value = '';
   if (!file) return;
+
+  // 预检必须在 arrayBuffer() **之前**：那一步会把整个文件读进内存，
+  // 选一个 100MB 的文件就会先吃 100MB，然后才被服务端 413 拒掉
+  const tooBig = uploadSizeError(file, maxUploadBytes.value);
+  if (tooBig) {
+    message.warning(tooBig);
+    return;
+  }
 
   fileName.value = file.name;
   fileBuffer.value = await file.arrayBuffer();

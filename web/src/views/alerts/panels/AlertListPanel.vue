@@ -142,7 +142,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage } from 'naive-ui';
 import {
@@ -154,6 +154,7 @@ import {
 } from '@vicons/ionicons5';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { Endpoints } from '@/api/contract';
+import { useWebSocketStore } from '@/stores/websocket';
 import GridCard from '@/components/GridCard.vue';
 
 const message = useMessage();
@@ -342,7 +343,7 @@ async function deleteAlert(id: number) {
   }
 }
 
-// ── 挂载即拉；自动刷新 (15 秒，已翻页时不刷新避免清空历史页) ──
+// ── 挂载即拉；WS 实时 + 15s 轮询兜底 ──
 // useInterval 在组件卸载时自动 stop（见 useRealtime），告警页切到「配置」Tab 即停止轮询。
 onMounted(() => {
   loadAlerts();
@@ -351,6 +352,15 @@ onMounted(() => {
 useInterval(() => {
   if (!paginated.value) loadAlerts();
 }, 15000);
+
+// 2026-09-21：web 此前**完全没有实时告警** —— `websocket.ts` 订阅了 `alert` topic，
+// 但全仓没有任何组件为它注册 handler，新告警只能等下一次 15s 轮询。
+// 现在收到即重拉（已翻页时不动，避免把用户正在看的历史页清掉）。
+const wsStore = useWebSocketStore();
+const unsubAlert = wsStore.on('alert', () => {
+  if (!paginated.value) loadAlerts();
+});
+onUnmounted(() => unsubAlert());
 </script>
 
 <style scoped>

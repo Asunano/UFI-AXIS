@@ -19,6 +19,7 @@ import { useDialog, useMessage } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useInterval } from '@/composables/useRealtime';
 import { formatBytes } from '@/composables/utils';
+import { readByteLimit, uploadSizeError } from '@/composables/uploadLimit';
 import { errText } from '@/views/tunnel/tunnelShared';
 
 export interface ComponentItem {
@@ -40,14 +41,6 @@ export interface ComponentItem {
 export interface UseComponentInstallerOptions {
   /** 安装/卸载/上传落地后调用，用于让调用方重拉自己那边受影响的状态 */
   onChanged?: () => void | Promise<void>;
-  /**
-   * 只关心这几个组件 id（不传 = 全都要）。
-   *
-   * `/api/components` 是通用端点，清单里混着服务不同功能的组件
-   * （frpc / cloudflared 给内网穿透，ffmpeg 给视频封面抽帧）。
-   * 隧道页列出 ffmpeg 会让用户以为"装了才能用隧道"，所以调用方按需收窄。
-   */
-  only?: string[];
 }
 
 export function useComponentInstaller(options: UseComponentInstallerOptions = {}) {
@@ -60,6 +53,11 @@ export function useComponentInstaller(options: UseComponentInstallerOptions = {}
     progress: { id: '', state: 'idle', percent: 0, message: '' },
     manifestError: '',
     refreshing: false,
+    /** 本地上传的体积上限（`GET /api/components` 的 `max_upload_bytes`，core 侧 96MB） */
+    maxUploadBytes: 0,
+    /** 本地上传的本地进度（0-100）。cloudflared ~36MB，设备 Wi-Fi 下要十几秒 */
+    uploadPercent: 0,
+    uploading: false,
   });
 
   /** 安装任务是否在进行中：进行中要禁掉所有安装/卸载按钮（core 侧同一时刻只允许一个任务） */
@@ -86,8 +84,10 @@ export function useComponentInstaller(options: UseComponentInstallerOptions = {}
     if (refresh) comp.refreshing = true;
     try {
       const { data } = await api.get('/api/components', { params: refresh ? { refresh: 'true' } : {} });
-      const all: ComponentItem[] = data?.components || [];
-      comp.items = options.only?.length ? all.filter((c) => options.only!.includes(c.id)) : all;
+      comp.items = data?.components || [];
+      // 老 core 不回这个字段时保留已读到的值，别用 0 覆盖（否则预检退化成放行一切）
+      const limit = readByteLimit(data, 'max_upload_bytes');
+      if (limit > 0) comp.maxUploadBytes = limit;
       applyComponentStatus(data);
       if (refresh && comp.manifestError) message.warning(comp.manifestError);
     } catch (e: any) {
@@ -135,14 +135,32 @@ export function useComponentInstaller(options: UseComponentInstallerOptions = {}
    */
   async function uploadComponent(id: string, file: File) {
     if (!id || !file) return;
+    // 选文件时就挡住超限：36MB 白传一遍才看到 413 是最没必要的等待
+    // （浏览器要把 body 全推完才读响应，详见 composables/uploadLimit.ts）
+    const tooBig = uploadSizeError(file, comp.maxUploadBytes);
+    if (tooBig) {
+      message.warning(tooBig);
+      return;
+    }
+    comp.uploading = true;
+    comp.uploadPercent = 0;
     try {
       await api.post(`/api/components/${encodeURIComponent(id)}/upload`, file, {
         headers: { 'Content-Type': 'application/octet-stream' },
+        // 没有进度时只有一个转圈按钮，36MB 传十几秒期间用户分不清"在传"和"卡死了"。
+        // e.total 在个别浏览器/代理下缺失，回落到 file.size（与 APK 上传同一处理）。
+        onUploadProgress: (ev: { loaded: number; total?: number }) => {
+          const total = ev.total || file.size;
+          if (!total) return;
+          comp.uploadPercent = Math.floor((Math.min(ev.loaded, total) / total) * 100);
+        },
       });
       message.success(`${id} 已安装`);
     } catch (e: any) {
       message.error(errText(e, '上传安装失败'));
     } finally {
+      comp.uploading = false;
+      comp.uploadPercent = 0;
       await loadComponents();
       await notifyChanged();
     }

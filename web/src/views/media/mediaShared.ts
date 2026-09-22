@@ -131,6 +131,41 @@ export interface MediaLyricsResponse {
   text: string;
 }
 
+/** `GET /api/media/tags` 的响应（core `audioTagsOf`）。缺失的字段是**空串**而不是 undefined。 */
+export interface MediaTagsResponse {
+  id: number;
+  name: string;
+  path: string;
+  title: string;
+  artist: string;
+  album: string;
+  duration_ms: number;
+}
+
+/**
+ * 单首音频的精确标签。取不到返回 null。
+ *
+ * ## 为什么要多问这一条，而不是在前端解字节
+ * `/list` 的 `title/artist/album` 来自 MediaStore，**会漏**（刚拷进来还没扫、
+ * 某些 FLAC/APE 只填了部分列）。此时正确的做法是问 core 的 `/tags` ——
+ * 它内部先用自己的 `AudioTagReader` 解文件字节（ID3 / FLAC，最准），
+ * 还缺才用 `MediaMetadataRetriever` 兜一次。
+ *
+ * **不要照搬文件管理器那套前端字节解析**（`views/files/audioMetaProbe.ts` 的
+ * `probeTagsAndCover`）：文件管理器走 `/api/files/*`，那条路上没有标签端点，只能自己解；
+ * 音乐页有 `/tags` 可用，在前端再解一遍就是把同一个解析器实现两份，
+ * 而且 web 那份**不支持 MP4/M4A**（只认 ID3 与 FLAC 魔数），比 core 的还弱。
+ */
+export async function fetchAudioTags(api: MediaApiClient, id: number): Promise<MediaTagsResponse | null> {
+  try {
+    const { data } = await api.get<MediaTagsResponse>(Endpoints.media.tags, { params: { id } });
+    return data ?? null;
+  } catch {
+    // 404（这首不在库里了）/ 403（权限）都退回 /list 那份，静默
+    return null;
+  }
+}
+
 /**
  * 取旁挂歌词文件（`.lrc` / `.txt`）的内容。没有就返回空串。
  *
@@ -231,4 +266,37 @@ export function trackTitleOf(item: MediaItem): string {
 /** 艺人显示名。空标签统一成「未知艺人」——三处列表都要同一种说法。 */
 export function trackArtistOf(item: MediaItem): string {
   return item.artist || '未知艺人';
+}
+
+// ──────────────────────────── 本机偏好 ────────────────────────────
+
+/**
+ * 音乐页音量的 localStorage 键。
+ *
+ * 单开一个键、不塞进 `ufi.video.prefs`：那个文件的语义是"视频播放器偏好"
+ * （字幕外观、字幕轨记忆都在里面），把音频音量混进去只会让两边都不好读。
+ * 音量是**这台浏览器上的**习惯，不写回 core —— 手机想小声、电脑想大声，
+ * 同步反而互相覆盖。
+ */
+const LS_AUDIO_VOLUME = 'ufi.audio.volume';
+
+/** 默认音量。不用 1.0：满音量开场对耳机用户是一次惊吓。 */
+const DEFAULT_AUDIO_VOLUME = 0.85;
+
+export function readAudioVolume(): number {
+  try {
+    const v = Number(localStorage.getItem(LS_AUDIO_VOLUME));
+    return Number.isFinite(v) && v >= 0 && v <= 1 ? v : DEFAULT_AUDIO_VOLUME;
+  } catch {
+    return DEFAULT_AUDIO_VOLUME;
+  }
+}
+
+export function writeAudioVolume(v: number) {
+  if (!Number.isFinite(v) || v < 0 || v > 1) return;
+  try {
+    localStorage.setItem(LS_AUDIO_VOLUME, String(v));
+  } catch {
+    /* 隐私模式下不可写，丢了只是回默认值 */
+  }
 }

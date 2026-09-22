@@ -27,6 +27,8 @@ data class DashboardState(
     val cpuHistory: List<CpuHistoryRecord> = emptyList(),
     val signalHistory: List<SignalHistoryRecord> = emptyList(),
     val deviceVersion: DeviceVersionResponse? = null,
+    /** EPS 承载 QoS（QCI / 上下行 AMBR），2026-09-22，独立端点静默拉取。 */
+    val deviceQos: DeviceQosResponse? = null,
     val isLoading: Boolean = false,
     val errorMessage: String? = null,
     val isOffline: Boolean = false,
@@ -47,7 +49,28 @@ data class MonitorState(
     val batteryHistory: List<DownsampledPoint> = emptyList(),
     val temperatureHistory: List<DownsampledPoint> = emptyList(),
     val storageInfo: MonitorStorageResponse? = null,
+    /**
+     * **图表区**在读（历史 / 区间 / 按类型懒加载共用）。
+     *
+     * 这三个 loader 服务同一块图表，共用一位是合理的：没有任何 `isEmpty && !isLoading`
+     * 门读它，最坏情况只是转圈提前消失一下。告警那一侧不能这么共用，见 [alertsLoading]。
+     */
     val isLoading: Boolean = false,
+    /**
+     * **告警列表**在读。只有 `loadAlerts` 能动它（2026-09-20 从 [isLoading] 拆出来）。
+     *
+     * 拆的原因：事件中心有两个空态门读加载位
+     * （`MonitorScreen` 的「今日无告警」与筛选后的「无匹配告警」），
+     * 而 `loadMonitorHistory` / `loadMonitorHistoryRange` / `loadMonitorTypes`
+     * 也在写同一位 —— 它们和告警毫无关系，却能在告警请求还在飞的时候把位清掉，
+     * 于是界面当即画出"没有告警"。这和定时任务页那个 bug 是同一个形状。
+     */
+    val alertsLoading: Boolean = false,
+    /**
+     * 告警列表成功读到过至少一次。**空态门看它，不看 loading**
+     * —— 后者在"还没发请求"和"请求失败了"时都是 false。
+     */
+    val alertsLoaded: Boolean = false,
     val errorMessage: String? = null,
     val cleanMessage: String? = null,
     // ── 后端软件开启记录的日期（UTC epoch ms）── 2026-08-08 12:09 新增：监控页"自定义时间范围"对话框 minDateMs 来源

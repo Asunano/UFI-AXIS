@@ -15,18 +15,35 @@ import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.viewmodel.state.DownloadConfigItem
 
+/**
+ * 新建下载任务。
+ *
+ * 保存目录**点选不手打**（2026-09-20）：原来这里是一个自由文本框，用户得自己背出
+ * `/storage/emulated/0/...` 这种绝对路径，打错一个字符 core 就落到别处或创建失败。
+ * 现在复用公共件 [UfiDirectoryPickerDialog] 浏览设备目录树选一个。
+ *
+ * @param browse 列目录的能力（`DownloadModule.browseDirs`）。公共件在 `:app:ui`，
+ *   不能依赖 viewmodel，所以取数一路由外面注入到这里。
+ */
 @Composable
 internal fun NewDownloadDialog(
     config: DownloadConfigItem,
+    browse: suspend (String) -> Pair<List<String>, String?>,
     onDismiss: () -> Unit,
     onConfirm: (url: String, fileName: String?, savePath: String?, speedLimit: Long?, connections: Int?) -> Unit
 ) {
+    val palette = LocalResolvedPalette.current
     var url by remember { mutableStateOf("") }
     var fileName by remember { mutableStateOf("") }
+    // 空串 = 不指定，交给 core 用引擎配置里的默认保存目录（onConfirm 传 null）。
     var savePath by remember { mutableStateOf("") }
     var speedLimitText by remember { mutableStateOf("") }
     var connectionsText by remember { mutableStateOf("") }
     var showAdvanced by remember { mutableStateOf(false) }
+    var showDirPicker by remember { mutableStateOf(false) }
+
+    /** 这次任务实际会落到哪 —— 没选过就是配置里的默认目录，界面上要显示的是这个值。 */
+    val effectiveSaveDir = savePath.ifBlank { config.saveDir }
 
     val onStartClick = {
         if (url.isNotBlank()) {
@@ -36,7 +53,31 @@ internal fun NewDownloadDialog(
         }
     }
 
+    // 目录选择器与本弹窗**互斥渲染**（而不是叠在它上面再开一层窗口）：
+    // UfiDialogShell 会对宿主 window 做 dim / 模糊处理，两层同时在场时遮罩叠加、返回键
+    // 落到哪一层都不好控。上面那些 remember 都在这条分支之前声明，所以选目录期间
+    // 已经填好的链接 / 文件名 / 限速不会丢，选完回来原样还在。
+    if (showDirPicker) {
+        UfiDirectoryPickerDialog(
+            visible = true,
+            title = "选择保存目录",
+            root = UFI_DEVICE_STORAGE_ROOT,
+            // 从当前生效的目录起手，让人一眼看到"现在会存到哪"，而不是从零开始翻。
+            initialSelection = listOf(effectiveSaveDir),
+            multiSelect = false,
+            confirmText = "使用此目录",
+            browse = browse,
+            onDismiss = { showDirPicker = false },
+            onConfirm = { dirs ->
+                dirs.firstOrNull()?.let { savePath = it }
+                showDirPicker = false
+            }
+        )
+        return
+    }
+
     UfiCustomDialog(
+
         visible = true,
         onDismiss = onDismiss,
         title = "新建下载",
@@ -97,7 +138,50 @@ internal fun NewDownloadDialog(
                 // 12dp —— 同一个弹窗里两种节奏，展开后看着像多塞了一道空隙。
                 // 直接摊进 UfiDialogBody 的 Column（12dp）即可，间距只有一个来源。
                 UfiDialogTextField("文件名 (可选)", fileName, { fileName = it }, placeholder = "自动检测")
-                UfiDialogTextField("保存路径 (可选)", savePath, { savePath = it }, placeholder = config.saveDir)
+                UfiDialogField("保存目录") {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        // 整行可点：目标是"点一下就去选"，让用户找到那颗小按钮才算命中太苛刻。
+                        UfiListRowCard(
+                            title = effectiveSaveDir.substringAfterLast('/').ifBlank { effectiveSaveDir },
+                            // 副行给完整路径：同名末级目录（Download、UFI）在设备上到处都有，
+                            // 只显示末级名字根本分不清落到了哪一个。
+                            subtitle = effectiveSaveDir,
+                            onClick = { showDirPicker = true },
+                            leading = {
+                                Icon(
+                                    Icons.Default.Folder,
+                                    contentDescription = null,
+                                    tint = palette.textSecondary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            },
+                            trailing = {
+                                UfiButton(
+                                    text = "浏览",
+                                    onClick = { showDirPicker = true },
+                                    variant = UfiButtonVariant.Subtle,
+                                    size = UfiButtonSize.Small
+                                )
+                            }
+                        )
+                        Text(
+                            if (savePath.isBlank()) "未指定，使用下载设置里的默认目录" else "仅本次任务使用此目录",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                        // 选错了要能退回默认：不给这颗键的话，用户只能靠自己翻回默认目录，
+                        // 而默认目录是配置项、随时可能被改，手动找回来就成了猜。
+                        if (savePath.isNotBlank()) {
+                            UfiButton(
+                                text = "恢复默认目录",
+                                onClick = { savePath = "" },
+                                variant = UfiButtonVariant.Subtle,
+                                size = UfiButtonSize.Small
+                            )
+                        }
+                    }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     // 横向这条是并排两个字段的列间距，与纵向节奏无关，保留

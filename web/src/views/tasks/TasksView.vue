@@ -91,13 +91,17 @@
 /**
  * 定时任务 / 自动化规则页：只留状态、取数与写操作，列表行与预设条拆到 components/。
  *
- * 两类数据的取数是**各自独立**的（`/api/tasks` 与 `/api/rules`），但轮询放在一起：
- * 执行日志和「一次性任务触发后被后端置为 disabled」都只能靠轮询同步回来。
+ * 两类数据的取数是**各自独立**的（`/api/tasks` 与 `/api/rules`）。
+ * 同步有两条路：
+ * - 实时：core 在增删改 / 任务触发写日志 / 一次性任务自动禁用时推
+ *   `data_changed:{task:list|task:rules}`（2026-09-21 新增），收到就重拉；
+ * - 兜底：30s 轮询，覆盖断线窗口内的变化。
  */
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
+import { useWebSocketStore } from '@/stores/websocket';
 import GridCard from '@/components/GridCard.vue';
 import PresetChips from './components/PresetChips.vue';
 import TaskCard from './components/TaskCard.vue';
@@ -116,11 +120,12 @@ import {
   type Task,
   type TaskPreset,
 } from './tasksShared';
-import { Endpoints } from '@/api/contract';
+import { Endpoints, WsDataTopic } from '@/api/contract';
 
 const message = useMessage();
 const dialog = useDialog();
 const api = useCancellableApi();
+const wsStore = useWebSocketStore();
 
 // ── 状态 ──
 const activeTab = ref<'scheduled' | 'rules'>('scheduled');
@@ -321,6 +326,14 @@ useInterval(() => {
   loadTasks();
   loadRules();
 }, 30_000);
+
+// 实时：core 侧集合变更（含另一端操作、任务到点执行、一次性任务自动禁用）立即对齐
+const unsubTasks = wsStore.on('data_changed', (payload: any) => {
+  const changed = String(payload?.changed ?? '');
+  if (changed === WsDataTopic.TASK_LIST) loadTasks();
+  else if (changed === WsDataTopic.TASK_RULES) loadRules();
+});
+onUnmounted(() => unsubTasks());
 </script>
 
 <style scoped>

@@ -1,6 +1,8 @@
 package com.ufi_axis.ui.media
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -14,9 +16,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
-import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Videocam
@@ -28,8 +30,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import com.ufi_axis.data.model.MediaLibraryItem
@@ -57,6 +62,13 @@ import java.io.File
  * ## 顶部"最近播放"
  * 横向一条，最多 6 条（[AppPreferences.mediaRecentPlays]，本地记录）。它是**整片网格的第一项**
  * （占满一行的 span），而不是外面套一层 Column —— 后者会让它常驻屏幕、把海报墙压成一条窄缝。
+ *
+ * @param gridState 滚动位置由调用方持有（[MediaVideoScreen]）。两栏切换换的是一棵子树，
+ *   建在本函数里的 `rememberLazyGridState()` 会随子树销毁，从媒体库切回来就回到顶部。
+ * @param onLongPress 长按某一格：把这次长按的上下文（[MediaVideoMenuTarget]）上报给页壳，
+ *   菜单与弹窗都由它出（理由见 `MediaVideoItemMenu.kt` 的文件 KDoc）。
+ *   **最近播放那一条不挂长按** —— 它只有 path/name/id 三个字段（本地记的，不是媒体库记录），
+ *   菜单里的大小/时长/分辨率会整片是空的，"文件信息"点开等于一张空表。
  */
 @Composable
 internal fun MediaVideoHome(
@@ -65,11 +77,12 @@ internal fun MediaVideoHome(
     onNearEnd: () -> Unit,
     onOpen: (MediaLibraryItem) -> Unit,
     onThumbMissing: (suspend (MediaLibraryItem) -> File?)? = null,
-    onOpenRecent: (path: String, name: String, id: Long) -> Unit
+    onOpenRecent: (path: String, name: String, id: Long) -> Unit,
+    gridState: LazyGridState,
+    onLongPress: (MediaVideoMenuTarget) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
     val context = LocalContext.current
-    val gridState = rememberLazyGridState()
     MediaNearEndEffect(gridState, tab.items.size, onNearEnd)
 
     // 最近播放：每次进这一栏读一次（它由播放页写入，不走 ViewModel 状态）
@@ -78,8 +91,13 @@ internal fun MediaVideoHome(
         recent = runCatching { AppPreferences(context).mediaRecentPlays() }.getOrDefault(emptyList())
     }
 
+    /*
+     * 骨架的判据是「**还没拉到过结果**」，不是「空且正在加载」（2026-09-20 改，与
+     * [MediaLibraryPage] 同一口径）：进页第一帧 `loadFirstPage` 还没被 LaunchedEffect 发出去，
+     * isLoading 仍是 false，于是旧判据会先掉进下面的空态 —— 用户看到"媒体库里没有视频"闪一下。
+     */
     if (tab.isEmpty) {
-        if (tab.isLoading) {
+        if (!tab.loadedOnce) {
             UfiGridLoadingState(
                 columns = POSTER_COLUMNS,
                 cellHeight = POSTER_SKELETON_CELL_HEIGHT
@@ -92,6 +110,7 @@ internal fun MediaVideoHome(
         }
         return
     }
+
 
     LazyVerticalGrid(
         columns = GridCells.Fixed(POSTER_COLUMNS),
@@ -141,7 +160,11 @@ internal fun MediaVideoHome(
                 item = item,
                 thumbUrl = thumbUrl(item),
                 onClick = { onOpen(item) },
-                onThumbMissing = onThumbMissing?.let { build -> { build(item) } }
+                onThumbMissing = onThumbMissing?.let { build -> { build(item) } },
+                // 首页没有"当前目录"，下载的镜像子目录只能是空串（理由见 MediaVideoMenuTarget）
+                onLongPress = { bounds, point ->
+                    onLongPress(MediaVideoMenuTarget(item, bounds, point, downloadSubDir = ""))
+                }
             )
         }
 
@@ -159,15 +182,26 @@ internal fun MediaVideoHome(
  * 不用 [com.ufi_axis.ui.components.common.UfiListRowCard]：那是"横向一行"的形态，
  * 这里要的是"图在上、字在下"。共用的只有缩略图容器（[MediaThumb]）。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PosterCell(
     item: MediaLibraryItem,
     thumbUrl: String,
     onClick: () -> Unit,
-    onThumbMissing: (suspend () -> File?)? = null
+    onThumbMissing: (suspend () -> File?)? = null,
+    onLongPress: (IntRect, IntOffset) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
-    Column(modifier = Modifier.clickable(onClick = onClick)) {
+    // 这一格的窗口矩形：菜单要靠它把自己 clamp 进屏幕，也是长按落点的来源
+    var bounds by remember { mutableStateOf(IntRect.Zero) }
+    Column(
+        modifier = Modifier
+            .onGloballyPositioned { coords -> bounds = mediaVideoAnchorRect(coords) }
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = { onLongPress(bounds, mediaVideoAnchorCenter(bounds)) }
+            )
+    ) {
         MediaThumb(
             url = thumbUrl,
             fallback = Icons.Default.Videocam,

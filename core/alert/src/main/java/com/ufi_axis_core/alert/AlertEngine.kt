@@ -49,7 +49,87 @@ class AlertEngine(
     // 边沿触发缓存: alertType -> 上次评估的级别（normal/warning/critical）。
     // 仅当级别发生跃迁（normal→warning、warning→normal 等）时才触发告警，
     // 替代旧的电平触发 + 5 分钟防抖（稳态下仍会 288 条/天堆积）。
+    //
+    // 2026-09-21 改为**持久化**：此前是纯内存 Map，缺省 normal，于是每次 core 启动
+    // （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当成
+    // normal→warning 跃迁重报一遍 —— 用户看到的是一批莫名其妙的重复告警。
     private val lastLevelByType = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    init {
+        restoreLevelState()
+    }
+
+    /** 从 SharedPreferences 恢复边沿状态。解析失败按空处理（退化为旧的"全部 normal"行为）。 */
+    private fun restoreLevelState() {
+        val json = appSettings.alertLevelStateJson?.takeIf { it.isNotBlank() } ?: return
+        try {
+            ConfigJson.parseToJsonElement(json).jsonObject.forEach { (type, el) ->
+                val lvl = el.toString().trim('"')
+                if (lvl in setOf("normal", "warning", "critical", "info")) lastLevelByType[type] = lvl
+            }
+            AppLogger.i(tag, "Alert level state restored: ${lastLevelByType.size} types")
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Failed to restore alert level state: ${e.message}")
+        }
+    }
+
+    /** 边沿状态落盘。只在真的发生跃迁时调用（稳态不写盘）。 */
+    private fun persistLevelState() {
+        try {
+            val obj = kotlinx.serialization.json.buildJsonObject {
+                lastLevelByType.forEach { (type, lvl) ->
+                    put(type, kotlinx.serialization.json.JsonPrimitive(lvl))
+                }
+            }
+            appSettings.alertLevelStateJson = obj.toString()
+        } catch (e: Exception) {
+            AppLogger.w(tag, "Failed to persist alert level state: ${e.message}")
+        }
+    }
+
+    /**
+     * 带回差（hysteresis）的三档判级，**「越大越坏」**方向（温度 / 流量 / 使用百分比）。
+     *
+     * 升级用原阈值，降级要求回落到 `阈值 - band` 以下。
+     *
+     * 为什么必须有回差：边沿触发 + 零回差的组合下，指标在阈值上下微抖会让级别每个采集周期
+     * 都跃迁一次 —— 每次进 warning 推一条、首条还发邮件/Webhook/短信，每次回 normal 又把
+     * `resolvedAt` 写上、下一次 `bumpExisting` 再清掉。表现是「一条告警次数无限上涨、
+     * 已恢复标记反复闪烁」，并烧光通知配额。信号常年在 -100 附近、温度在阈值附近都会踩到。
+     *
+     * 「越小越坏」的指标（RSRP / 电量）取负后复用同一套判据，见 [checkSignal] / [checkBattery]。
+     */
+    private fun leveledWithHysteresis(
+        value: Double,
+        warning: Double,
+        critical: Double,
+        band: Double,
+        prev: String
+    ): String {
+        val warnExit = warning - band
+        val critExit = critical - band
+        return when (prev) {
+            "critical" -> when {
+                value >= critExit -> "critical"
+                value >= warnExit -> "warning"
+                else -> "normal"
+            }
+            "warning" -> when {
+                value >= critical -> "critical"
+                value >= warnExit -> "warning"
+                else -> "normal"
+            }
+            else -> when {
+                value >= critical -> "critical"
+                value >= warning -> "warning"
+                else -> "normal"
+            }
+        }
+    }
+
+    /** 某类型上一次评估出的级别（供带回差的判级使用）。 */
+    private fun prevLevelOf(type: String): String = lastLevelByType[type] ?: "normal"
+
 
     // 环形上限：alert_records 最多保留最近 MAX_ALERT_ROWS 条，超出自动淘汰最旧。
     private val MAX_ALERT_ROWS = 2000
@@ -61,12 +141,6 @@ class AlertEngine(
      * 而真断网（拔卡、欠费、信号丢失）会持续远超 60s。窗口再大会让真断网的告警来得太迟。
      */
     private val CONNECTIVITY_CONFIRM_MS = 60_000L
-
-    /**
-     * 测试观测钩子：记录最近一次 [triggerAlert] 广播的 payload（含 aggregated 标志）。
-     * 生产代码不读取；便于单元测试断言 WS 广播语义而无需 spy final 的 WebSocketManager。
-     */
-    @Volatile var lastBroadcast: Map<String, Any?>? = null
 
     /**
      * 通知投递钩子（装配层接到 `NotificationDispatcher::emit`）。
@@ -193,17 +267,21 @@ class AlertEngine(
         val enabled: Boolean = false,
         // ── 分类开关：type -> 是否启用该类型告警（缺键视为**关闭**，见 typeEnabled） ──
         val perType: Map<String, Boolean> = emptyMap(),
-        // ── 同 (type,level) 最小聚合间隔秒（窗口内只累加 count，不新插入） ──
-        val minIntervalSec: Int = 1800,
-        // 2026-09-07 删除两个假开关：
-        // - `edgeTriggeredOnly`：只被持久化/同步，引擎从来不读它 —— 无论真假都一律走 evaluate() 边沿触发；
-        // - `maxRows`：同样从来不读，环形裁剪写死用 MAX_ALERT_ROWS。
-        // 留着只会让人以为改了有效果。真要做成可配，得先让 triggerAlert 读它。
+        // 2026-09-07 / 2026-09-21 累计删除三个假开关（只被持久化 / 同步，引擎从来不读）：
+        // - `edgeTriggeredOnly`：无论真假都一律走 evaluate() 边沿触发；
+        // - `maxRows`：环形裁剪写死用 MAX_ALERT_ROWS；
+        // - `minIntervalSec`（2026-09-21 删）：号称「同 (type,level) 最小聚合间隔秒」，
+        //   但聚合走的是 `bumpExisting`（同 type+level 未确认行就累加），压根没有时间窗；
+        //   web 的注释还把它当成真配置在展示。留着只会让人以为改了有效果。
+        // 真要做成可配，得先让 triggerAlert 读它。
         // ── 多端同步版本号（单调递增；PUT 守门用） ──
         val configVersion: Long = 1L,
-        // ── 阈值（保持向后兼容） ──
-        val temperatureWarning: Double = 45.0,
-        val temperatureCritical: Double = 55.0,
+        // ── 阈值（2026-09-21：重定温度阈值以适配 Unisoc 随身WiFi 实测）──
+        // 旧默认 45/55 与温控熔断 `monitorThermalWarnC=70` 自相矛盾；
+        // Unisoc 稳态 50~60°C，45 开机后很快就恒 critical。
+        // 新值 65/75 留出稳态余量，且与温控熔断量级一致。
+        val temperatureWarning: Double = 65.0,
+        val temperatureCritical: Double = 75.0,
         val batteryWarning: Int = 20,
         val batteryCritical: Int = 10,
         val trafficWarningMb: Long = 1024,      // 1GB
@@ -337,6 +415,17 @@ class AlertEngine(
          */
         private const val PUSH_TITLE = "设备告警"
 
+        // ── 回差（hysteresis）带宽 ──
+        // 见 leveledWithHysteresis 的注释：零回差 + 边沿触发 = 阈值附近微抖导致的告警风暴。
+        /** 温度：3°C。Unisoc 热区读数的正常抖动在 1~2°C。 */
+        private const val TEMP_HYSTERESIS_C = 3.0
+        /** RSRP：3 dBm。固定位置设备常年在阈值附近 ±2 dBm 波动。 */
+        private const val SIGNAL_HYSTERESIS_DBM = 3.0
+        /** 电量：3%。充放电边界的读数抖动。 */
+        private const val BATTERY_HYSTERESIS_PCT = 3.0
+        /** 套餐用量百分比：2%。月累计单调递增，回差只在月初重置时起作用。 */
+        private const val TRAFFIC_LIMIT_HYSTERESIS_PCT = 2.0
+
         /**
          * 告警配置对外（HTTP 响应 / WS 广播 / 合并基线）的序列化器。
          *
@@ -396,11 +485,10 @@ class AlertEngine(
     suspend fun checkTemperature(temperature: Double) {
         val cfg = _config.value
         if (!typeEnabled(cfg, "temperature")) return
-        val level = when {
-            temperature >= cfg.temperatureCritical -> "critical"
-            temperature >= cfg.temperatureWarning -> "warning"
-            else -> "normal"
-        }
+        val level = leveledWithHysteresis(
+            temperature, cfg.temperatureWarning, cfg.temperatureCritical,
+            TEMP_HYSTERESIS_C, prevLevelOf("temperature")
+        )
         evaluate("temperature", level, mapOf(
             "warning" to "设备温度偏高: ${temperature}°C",
             "critical" to "设备温度严重过高: ${temperature}°C"
@@ -408,16 +496,16 @@ class AlertEngine(
     }
 
     /**
-     * 检查电池告警（边沿触发）
+     * 检查电池告警（边沿触发 + 回差）
      */
     suspend fun checkBattery(level: Int, isCharging: Boolean) {
         val cfg = _config.value
         if (!typeEnabled(cfg, "battery") || isCharging) return
-        val lvl = when {
-            level <= cfg.batteryCritical -> "critical"
-            level <= cfg.batteryWarning -> "warning"
-            else -> "normal"
-        }
+        // 电量是「越小越坏」→ 取负后复用「越大越坏」的判据
+        val lvl = leveledWithHysteresis(
+            -level.toDouble(), -cfg.batteryWarning.toDouble(), -cfg.batteryCritical.toDouble(),
+            BATTERY_HYSTERESIS_PCT, prevLevelOf("battery")
+        )
         evaluate("battery", lvl, mapOf(
             "warning" to "电池电量偏低: $level%",
             "critical" to "电池电量极低: $level%"
@@ -465,13 +553,12 @@ class AlertEngine(
         if (limitBytes <= 0L) return
         val warnPercent = normalizeAlertPercent(alertPercent)
         val percent = trafficUsagePercent(usedBytes, limitBytes)
-        val level = when {
-            percent >= 100.0 -> "critical"
-            percent >= warnPercent -> "warning"
-            else -> "normal"
-        }
         val shown = formatUsagePercent(percent)
         val detail = "${formatDataSize(usedBytes)} / ${formatDataSize(limitBytes)}"
+        val level = leveledWithHysteresis(
+            percent, warnPercent.toDouble(), 100.0,
+            TRAFFIC_LIMIT_HYSTERESIS_PCT, prevLevelOf("traffic_limit")
+        )
         evaluate("traffic_limit", level, mapOf(
             "warning" to "流量已用 $shown%（$detail）",
             "critical" to "流量已达套餐限额（$detail）"
@@ -484,11 +571,12 @@ class AlertEngine(
     suspend fun checkSignal(rsrp: Int) {
         val cfg = _config.value
         if (!typeEnabled(cfg, "signal")) return
-        val level = when {
-            rsrp <= cfg.signalCriticalRsrp -> "critical"
-            rsrp <= cfg.signalWarningRsrp -> "warning"
-            else -> "normal"
-        }
+        // RSRP 是「越小越坏」（-115 比 -100 差）→ 取负后复用「越大越坏」的判据。
+        // 回差尤其必要：固定位置的设备常年在 -100 附近微抖，零回差会反复穿越阈值。
+        val level = leveledWithHysteresis(
+            -rsrp.toDouble(), -cfg.signalWarningRsrp.toDouble(), -cfg.signalCriticalRsrp.toDouble(),
+            SIGNAL_HYSTERESIS_DBM, prevLevelOf("signal")
+        )
         evaluate("signal", level, mapOf(
             "warning" to "信号较差: RSRP=${rsrp}dBm",
             "critical" to "信号极差: RSRP=${rsrp}dBm"
@@ -525,12 +613,30 @@ class AlertEngine(
         // 单日几万条一字不差的日志，而"没有变化"本身没有任何排障价值 —— 直接删掉。
         if (currentLevel == prev) return
         lastLevelByType[type] = currentLevel
+        persistLevelState()
         if (currentLevel == "normal") {
             val updated = alertDao.markResolved(type, System.currentTimeMillis())
             AppLogger.i(tag, "Alert $type recovered (markResolved=$updated)")
+            // 2026-09-21：critical → normal 额外发一条 info「已恢复」通知。
+            // 只对 critical 发、不对 warning 发：warning 的恢复本身不值得再打扰一次
+            // （事件中心的「已恢复」标记足够），而 critical 曾经把用户从睡梦中叫起来过，
+            // 不告诉他"好了"就等于逼他自己去翻界面确认。
+            if (prev == "critical") {
+                triggerAlert(type, "info", "${recoveryLabel(type)}已恢复正常", value, threshold)
+            }
             return
         }
         triggerAlert(type, currentLevel, messages[currentLevel] ?: "告警: $type", value, threshold)
+    }
+
+    /** 「已恢复」文案里的指标名。未登记的 type 回落成 type 本身（不会发不出去）。 */
+    private fun recoveryLabel(type: String): String = when (type) {
+        "temperature" -> "设备温度"
+        "battery" -> "电池电量"
+        "traffic" -> "流量用量"
+        "traffic_limit" -> "套餐用量"
+        "signal" -> "信号质量"
+        else -> type
     }
 
     /**

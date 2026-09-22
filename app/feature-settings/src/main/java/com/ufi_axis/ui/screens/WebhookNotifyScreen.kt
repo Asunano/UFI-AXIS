@@ -289,6 +289,21 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
                 )
             }
 
+            // ── ①.5 还没配好时给一条引导路（2026-09-21）──
+            // 本页是日常微调面板：十张卡各自独立、改完立即下发，从 0 配起时"先干哪一步"没人告诉你。
+            // 所以在 configured=false 时加一个入口，指向分步向导（选预设 → 密钥 → 规则 → 保存并启用）。
+            // 配好之后这张卡自动消失，日常调整仍在本页 —— 不是把本页替换掉。
+            if (!cfg.configured) {
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.VpnKey,
+                        title = "用引导配置",
+                        description = "分 4 步问清：推到哪个服务、那串密钥、推什么级别与场景，填完直接启用",
+                        onClick = { navController.navigate(Routes.DETAIL_WEBHOOK_SETUP) }
+                    )
+                }
+            }
+
             // ── ② 预设。选中态走 UfiPopupOption.isSelected（组件自带 ✓ + accent），
             //    不在 label 里手拼「（当前）」—— 那会让选中态在不同页面长得不一样。
             //
@@ -1331,8 +1346,13 @@ private const val HIGHLIGHT_RISK_NOTE =
 private const val PRESET_ISOLATION_NOTE =
     "每个预设的请求地址与请求体模板各自保存，切换不会丢"
 
-/** 当前 url / 模板与预设默认结构不同时的说明（此时不给简易输入框，见 [resolveSecretField]）。 */
-private const val SECRET_DETACHED_NOTE =
+/**
+ * 当前 url / 模板与预设默认结构不同时的说明（此时不给简易输入框，见 [resolveSecretField]）。
+ *
+ * `internal` 而不是 `private`：首次配置向导（`WebhookSetupWizardScreen`）会走到同一个分支，
+ * 同一件事在两条路径上必须是同一句话 —— 各写一份就会漂。
+ */
+internal const val SECRET_DETACHED_NOTE =
     "当前配置与预设默认结构不同（请求地址或请求体模板被改过），无法只改这一段。" +
         "请在「请求体模板」或「高级设置 → 请求配置」中直接编辑。"
 

@@ -2,6 +2,7 @@ package com.ufi_axis.viewmodel.module
 
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.util.DebugLog
+import com.ufi_axis.util.NetworkErrorClassifier
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -42,7 +43,14 @@ data class HealthState(
     val lastCheckedAt: Long = 0L,
     val errorMessage: String? = null,
     /** 当前连续失败次数（诊断用；成功后归 0）。 */
-    val consecutiveFailures: Int = 0
+    val consecutiveFailures: Int = 0,
+    /**
+     * 最近一次失败是否为**传输层**失败（连不上 / 超时 / DNS），而不是 core 回了个错误码。
+     *
+     * 用来给提示文案归因：传输层失败 = 摸不到设备；非传输层 = 摸到了但它不高兴
+     * （多半是 core 正在启动或升级）。
+     */
+    val lastFailureWasTransport: Boolean = false
 )
 
 class HealthModule(
@@ -62,6 +70,9 @@ class HealthModule(
     private var failStreak = 0
     private var failStreakStartedAt = 0L
 
+    /** [notifyTransportFailure] 的去抖时刻（受 [failLock] 保护）。 */
+    private var lastTransportProbeAt = 0L
+
     /** 回前台后短时间内的探活失败只记 streak，不立刻把状态打成 UNREACHABLE（见 [onAppForegrounded]）。 */
     @Volatile
     private var suppressDownFlipUntil = 0L
@@ -76,51 +87,65 @@ class HealthModule(
         return try {
             api.getHealth()
             if (countTowardDownFlip) clearFailStreak()
-            val prev = _healthState.value
             _healthState.value = HealthState(
                 status = HealthStatus.HEALTHY,
                 lastCheckedAt = System.currentTimeMillis(),
                 errorMessage = null,
-                consecutiveFailures = 0
+                consecutiveFailures = 0,
+                lastFailureWasTransport = false
             )
-            // 静默路径也要在成功时清掉掉线态（回前台探通了，别留着旧 UNREACHABLE）
-            if (!countTowardDownFlip && prev.status == HealthStatus.UNREACHABLE) {
-                // 上面已写成 HEALTHY
-            }
             true
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             DebugLog.w("HealthModule", "health probe failed: ${e.message}")
             val now = System.currentTimeMillis()
-            val (streak, streakStart) = if (countTowardDownFlip) {
-                synchronized(failLock) {
-                    if (failStreak == 0) failStreakStartedAt = now
-                    failStreak++
-                    failStreak to failStreakStartedAt
-                }
-            } else {
-                // 静默失败：只记日志，不动 streak，也不把状态打成 UNREACHABLE
+            val transport = NetworkErrorClassifier.isTransportFailure(e)
+            if (!countTowardDownFlip) {
+                // 静默失败（回前台首探）：只记日志，不动 streak、不动状态
                 return false
+            }
+            val (streak, streakStart) = synchronized(failLock) {
+                if (failStreak == 0) failStreakStartedAt = now
+                failStreak++
+                failStreak to failStreakStartedAt
             }
             val confirmed = streak >= CONFIRM_FAILURE_COUNT &&
                 (now - streakStart) >= CONFIRM_FAILURE_SPAN_MS &&
                 now >= suppressDownFlipUntil
+            val prev = _healthState.value.status
             _healthState.value = HealthState(
-                status = if (confirmed) HealthStatus.UNREACHABLE else {
-                    // 未确证时：若原本 HEALTHY，保持 HEALTHY（避免一次超时就把状态打脏）
-                    if (_healthState.value.status == HealthStatus.UNREACHABLE) {
-                        HealthStatus.UNREACHABLE
-                    } else {
-                        HealthStatus.HEALTHY
-                    }
-                },
+                // 未确证时**保持原状态不动**。
+                // 2026-09-21 修正：旧实现在未确证分支里把非 UNREACHABLE 一律写成 HEALTHY，
+                // 于是冷启动时（status=UNKNOWN）第一次探活失败反而会被记成「健康」——
+                // 一个从未成功过的连接被标成正常，这是错的。
+                status = if (confirmed) HealthStatus.UNREACHABLE else prev,
                 lastCheckedAt = now,
-                errorMessage = e.message ?: "无法连接到后端服务",
-                consecutiveFailures = streak
+                errorMessage = NetworkErrorClassifier.describe(e) ?: e.message ?: "无法连接到后端服务",
+                consecutiveFailures = streak,
+                lastFailureWasTransport = transport
             )
             false
         }
+    }
+
+    /**
+     * 「某个业务请求在传输层失败了」的通知入口（由 `RetrofitClient.onTransportFailure` 驱动）。
+     *
+     * 立刻补一次探活，让状态翻转不必等周期循环的 30s。带去抖：一个页面并发发 6 个请求
+     * 会连着抛 6 个 IOException，不去抖就会打出 6 次 `/health`（而且每次都超时，
+     * 反而把确证阈值瞬间凑满 —— 那就退化成「单次网络抖动即定罪」了）。
+     *
+     * 后台期间（[paused]）不探：Doze/冻结下的请求只会制造假 UNREACHABLE。
+     */
+    fun notifyTransportFailure() {
+        if (paused) return
+        val now = System.currentTimeMillis()
+        synchronized(failLock) {
+            if (now - lastTransportProbeAt < TRANSPORT_PROBE_DEBOUNCE_MS) return
+            lastTransportProbeAt = now
+        }
+        scope.launch { runCatching { checkHealthNow() } }
     }
 
     /** 后台：停周期探活（Doze/冻结下的请求只会制造假 UNREACHABLE）。 */
@@ -175,5 +200,14 @@ class HealthModule(
 
         /** 回前台后的宽限期：此窗口内业务路径的探活失败也先不定罪。 */
         private const val RESUME_GRACE_MS = 2_000L
+
+        /**
+         * [notifyTransportFailure] 的最小间隔。
+         *
+         * 取 1.5s 是算过的：配合 [CONFIRM_FAILURE_COUNT] = 2 与 [CONFIRM_FAILURE_SPAN_MS] = 3s，
+         * core 真的离线时需要 ≥3 次探活（0s / 1.5s / 3s）才确证 —— 约 3 秒出提示，
+         * 既不会被一次网络抖动误判，也不用等周期循环那 30s。
+         */
+        private const val TRANSPORT_PROBE_DEBOUNCE_MS = 1_500L
     }
 }

@@ -518,6 +518,12 @@ class TunnelManager(private val appContext: android.content.Context) {
 
     // ── CF 隧道 CRUD ──
 
+    /** legacy token 迁移只跑一次的闸门（见 [migrateLegacyCfToken]）。 */
+    @Volatile private var legacyCfMigrated = false
+
+    /** CF token 的格式校验（供 API 层在 PUT 时返回具体拒绝原因）。null = 通过。 */
+    fun cfTokenRejectReason(rawToken: String): String? = cfEngine.tokenRejectReason(rawToken)
+
     /** 当前选中的 CF 隧道（自愈规则同 FRP） */
     fun activeCfTunnel(): String {
         migrateLegacyCfToken()
@@ -530,19 +536,29 @@ class TunnelManager(private val appContext: android.content.Context) {
     }
 
     /**
-     * 一次性迁移旧版单隧道 token：prefs 里的 token → tunnels/default.token，成功后清空 prefs。
+     * 一次性迁移旧版单隧道 token：prefs 里的 token → tunnels/default.token，之后**无条件**清空 prefs。
+     *
+     * 2026-09-21 两处修正：
+     * 1. 进程内只跑一次（[legacyCfMigrated]）。此前它被 [activeCfTunnel] 每次调用都跑一遍，
+     *    也就是每个 `GET /api/tunnel/cf/tunnels` 都跑 —— 一旦 `tunnel_cf_token` 被备份恢复
+     *    写回 prefs，下一次列表刷新就会凭那个陈旧 token 凭空重建一条叫 `default` 的隧道，
+     *    还可能把「当前选中」顶成它。这是"选中异常 + 启动报 token 无效"的一条真实路径。
+     * 2. 无论保存成功与否都清空 prefs。`saveTunnel` 现在会做结构校验，陈旧/损坏的 legacy token
+     *    会被拒绝；若沿用旧的"仅成功才清空"，这条坏 token 会永久留在 prefs 里反复重试。
      */
     fun migrateLegacyCfToken() {
+        if (legacyCfMigrated) return
+        legacyCfMigrated = true
         val legacy = settings.tunnelCfToken
         if (legacy.isBlank()) return
-        if (cfEngine.tunnelExists("default")) {
-            settings.tunnelCfToken = ""
-            return
-        }
+        // 先清 prefs：后面无论走哪条分支都不该再留着它
+        settings.tunnelCfToken = ""
+        if (cfEngine.tunnelExists("default")) return
         if (cfEngine.saveTunnel("default", legacy)) {
-            settings.tunnelCfToken = ""
             if (settings.tunnelCfActiveTunnel.isBlank()) settings.tunnelCfActiveTunnel = "default"
             AppLogger.i(TAG, "Migrated legacy CF token into tunnels/default.token")
+        } else {
+            AppLogger.w(TAG, "Legacy CF token rejected by validation; dropped (no tunnel created)")
         }
     }
 

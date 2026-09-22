@@ -76,6 +76,29 @@ class TaskScheduler(
     private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
     private val minuteFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
 
+    /**
+     * 「任务集合变了」的推送回调，由 [attachChangeBroadcaster] 注入。
+     *
+     * 为什么走 attach 而不是构造参数：本类在 `ComponentFactory.buildControllerGraph` 里构造，
+     * 那一层拿不到 `WebSocketManager`（同 `attachConditionEngine` / `attachRuleStore` 的处境）。
+     * null = 不推（单测、或 WS 还没装配好），调度本身照跑。
+     *
+     * 谁需要它：web 端新建任务后，app 只有重新进页面才看得到 —— 因为任务列表是纯 REST
+     * 拉取、没有任何失效通知。现在每次集合变化都推一帧，两端收到就重拉。
+     */
+    @Volatile
+    private var onTasksChanged: (suspend () -> Unit)? = null
+
+    fun attachChangeBroadcaster(broadcaster: suspend () -> Unit) {
+        onTasksChanged = broadcaster
+    }
+
+    /** 非 suspend 调用点用：丢进自己的 scope 发，绝不让推送失败影响增删改的返回值。 */
+    private fun notifyTasksChanged() {
+        val cb = onTasksChanged ?: return
+        scope.launch { runCatching { cb() } }
+    }
+
     init {
         loadTasks()
         AppLogger.i(tag, "Loaded ${tasks.size} tasks, scheduling...")
@@ -95,6 +118,7 @@ class TaskScheduler(
         tasks[task.id] = task
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "Task added: ${task.name} (${task.id}) at ${"%02d".format(task.hour)}:${"%02d".format(task.minute)}")
         return true
     }
@@ -104,6 +128,7 @@ class TaskScheduler(
         triggeredToday.remove(id)
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "Task removed: $id")
         return true
     }
@@ -114,6 +139,7 @@ class TaskScheduler(
         triggeredToday.remove(task.id)
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         return true
     }
 
@@ -122,6 +148,7 @@ class TaskScheduler(
         triggeredToday.clear()
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "All tasks cleared")
     }
 
@@ -262,6 +289,8 @@ class TaskScheduler(
                     val updatedLogs = (tasks[task.id]?.logs ?: emptyList()) + log
                     tasks[task.id] = task.copy(logs = updatedLogs.takeLast(50))
                     saveTasks()
+                    // 执行日志也属于"任务集合变了"：两端的任务详情直接读 task.logs
+                    runCatching { onTasksChanged?.invoke() }
                     AppLogger.i(tag, "Task '${task.name}' ${if (result.success) "succeeded" else "failed"}: ${result.message}")
                 } catch (e: Exception) {
                     val log = ExecutionLog(
@@ -272,6 +301,7 @@ class TaskScheduler(
                     val updatedLogs = (tasks[task.id]?.logs ?: emptyList()) + log
                     tasks[task.id] = task.copy(logs = updatedLogs.takeLast(50))
                     saveTasks()
+                    runCatching { onTasksChanged?.invoke() }
                     AppLogger.e(tag, "Task '${task.name}' exception: ${e.message}")
                 }
             }
@@ -284,7 +314,12 @@ class TaskScheduler(
             shouldPersist = true
         }
 
-        if (shouldPersist) saveTasks()
+        if (shouldPersist) {
+            saveTasks()
+            // 一次性任务触发后自动禁用 —— 这是**无用户操作**的状态变化，不推的话
+            // 两端的开关会一直显示"已启用"，直到用户手动离开再回来。
+            notifyTasksChanged()
+        }
     }
 
     // ──────────── 持久化 ────────────

@@ -44,6 +44,9 @@ import com.ufi_axis.util.DebugLog
 import com.ufi_axis.viewmodel.state.MEDIA_KINDS
 import kotlinx.coroutines.launch
 import java.io.File
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
 
 /**
  * 视频 / 音乐 / 图片三个页面共用的零件（2026-09-16）。
@@ -125,6 +128,32 @@ internal fun MediaThumb(
                 }
             },
             modifier = Modifier.fillMaxSize()
+        )
+    }
+}
+
+/**
+ * 只有占位图标的缩略图槽位（**不发图片请求**）。
+ *
+ * 给"明知没有图可取"的行用：歌单里已失效的条目 `id` 是 0，拼出来的 URL 注定 404，
+ * 走 [MediaThumb] 会让每一行都往日志里写一条 WARN（与 `MediaAudioGroupList` 里
+ * 空封面分组避开的是同一件事）。形状与 [MediaThumb] 的底层完全一致，两种行不会一高一低。
+ */
+@Composable
+internal fun MediaThumbPlaceholder(icon: ImageVector, size: Dp) {
+    val palette = LocalResolvedPalette.current
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(UfiCardDefaults.shape)
+            .background(palette.surfaceMuted),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            icon,
+            contentDescription = null,
+            tint = palette.textSecondary,
+            modifier = Modifier.size(20.dp)
         )
     }
 }
@@ -252,5 +281,115 @@ internal fun splitFileNameTitleArtist(base: String): Pair<String, String?> {
     if (left.isEmpty() || right.isEmpty()) return name to null
     return left to right
 }
+
+/*
+ * ───────── 按日期分段（时间轴，2026-09-20）─────────
+ *
+ * 只有图片页在用，但放在本文件而不是 `MediaImageGrid.kt`：分段是"按 date_modified 折成天"
+ * 这件与画法无关的事，视频海报墙将来要同样的段头时不该再抄一份。
+ *
+ * **分段只在客户端做**：core 的 `/list` 已经按 `sort/order` 排好序，客户端要的只是
+ * "把相邻的同一天圈起来"，为此新加一个聚合接口等于把排序口径拆到两处。
+ */
+
+/**
+ * 一段（= 同一天）的条目。
+ *
+ * @param key 这一天的 epochDay，用作 Lazy 列表里段头的稳定 key（文案会随"今天/昨天"变，
+ *   拿文案当 key 会在跨午夜时撞键）。没有时间信息的那一段用 [NO_DATE_SECTION_KEY]。
+ */
+internal data class MediaDateSection(
+    val key: Long,
+    val label: String,
+    val items: List<MediaLibraryItem>
+)
+
+/** [MediaDateSection.key] 的哨兵值：这一段里的文件没有可用的修改时间。 */
+internal const val NO_DATE_SECTION_KEY = Long.MIN_VALUE
+
+/**
+ * 把**已按时间排好序**的条目折成按天的分段。
+ *
+ * 不在这里重新排序：顺序是 core 按当前 `sort/order` 给的，客户端再排一次会在"按名称排序"
+ * 时得到一份与列表不一致的分段。所以本函数只做"相邻同一天归一段" ——
+ * 时间倒序进来就是倒序的段，正序进来就是正序的段。
+ *
+ * 分页追加（`loadMore`）也因此天然正确：新来的一页接在尾部，最多只影响最后一段。
+ * 调用方应当用 `remember(items)` 包住本函数，别每次重组都重算整份。
+ */
+internal fun groupMediaByDay(
+    items: List<MediaLibraryItem>,
+    today: LocalDate = LocalDate.now()
+): List<MediaDateSection> {
+    if (items.isEmpty()) return emptyList()
+    val zone = ZoneId.systemDefault()
+    val sections = mutableListOf<MediaDateSection>()
+    var currentKey = NO_DATE_SECTION_KEY
+    var currentLabel = ""
+    var bucket = mutableListOf<MediaLibraryItem>()
+
+    fun flush() {
+        if (bucket.isNotEmpty()) {
+            sections += MediaDateSection(currentKey, currentLabel, bucket)
+        }
+    }
+
+    items.forEachIndexed { index, item ->
+        val day = if (item.date_modified > 0L) {
+            Instant.ofEpochMilli(item.date_modified).atZone(zone).toLocalDate()
+        } else {
+            null
+        }
+        val key = day?.toEpochDay() ?: NO_DATE_SECTION_KEY
+        if (index == 0 || key != currentKey) {
+            flush()
+            currentKey = key
+            currentLabel = day?.let { mediaDateSectionLabel(it, today) } ?: NO_DATE_SECTION_LABEL
+            bucket = mutableListOf()
+        }
+        bucket += item
+    }
+    flush()
+    return sections
+}
+
+/**
+ * 段头文案：越近越口语化。
+ *
+ * "今天 / 昨天"是用户真正在找的那两天；同年只写月日（年份是冗余信息）；
+ * 跨年才补上年份。**不**做"3 天前"这类相对文案 —— 翻到半年前的照片时它毫无定位作用。
+ */
+internal fun mediaDateSectionLabel(day: LocalDate, today: LocalDate): String = when {
+    day == today -> "今天"
+    day == today.minusDays(1) -> "昨天"
+    day.year == today.year -> "${day.monthValue}月${day.dayOfMonth}日"
+    else -> "${day.year}年${day.monthValue}月${day.dayOfMonth}日"
+}
+
+/**
+ * 没有修改时间时的段头。
+ *
+ * 不拿"今天"冒充：`date_modified` 为 0 的文件是媒体库里确实没记时间的那些，
+ * 把它们混进今天会让时间轴撒谎。
+ */
+private const val NO_DATE_SECTION_LABEL = "没有时间信息"
+
+/**
+ * 时间轴的段头。
+ *
+ * 不用 [com.ufi_axis.ui.components.common.UfiSectionHeader]：那是设置页里"一组设置"的标题
+ * （字号与上下留白都按卡片组调的），压在网格里会把两段之间撑出一大块空白。
+ */
+@Composable
+internal fun MediaDateSectionHeader(label: String) {
+    val palette = LocalResolvedPalette.current
+    Text(
+        label,
+        style = UfiTextStyles.cardTitle,
+        color = palette.accent,
+        modifier = Modifier.padding(top = Spacing.Medium, bottom = Spacing.Small)
+    )
+}
+
 
 

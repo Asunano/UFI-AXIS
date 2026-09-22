@@ -110,21 +110,27 @@ class CloudflareTunnelEngine(private val appContext: android.content.Context) {
 
     /**
      * 保存（新建或更新）某条隧道的 token。
-     * token 内部含空白字符必然不是合法 token（多半是把整条 `cloudflared ... --token X` 命令粘进来了），
-     * 直接拒绝比让 cloudflared 秒退更好定位。写入用唯一命名的临时文件 + rename 原子提交。
+     *
+     * token 会先经 [normalizeToken] 归一化（剥引号 / `--token=` 前缀 / 零宽字符），
+     * 再经 [validateToken] 做**结构校验**（base64 解出的 JSON 必须含 a/t/s 三键）。
+     * 写入用唯一命名的临时文件 + rename 原子提交。
+     *
+     * 2026-09-21 加结构校验的原因：此前只挡「空串」和「内部含空白」，于是带引号的
+     * `"eyJ..."`、`--token=eyJ...`、误填的 Tunnel ID(UUID) 或隧道名全都能存盘，
+     * 然后 cloudflared 秒退（exit=255）只留一句 `Provided Tunnel token is not valid.`，
+     * 而失败时日志文件还被删掉 —— 用户拿不到任何可定位的信息。校验放在写入口，
+     * 错误能直接以 400 + 具体原因返回。
      */
     fun saveTunnel(name: String, token: String): Boolean {
         if (!FrpEngine.isValidName(name)) {
             AppLogger.w(TAG, "Reject CF tunnel name [$name]: illegal characters")
             return false
         }
-        val clean = token.trim()
-        if (clean.isEmpty()) {
-            AppLogger.w(TAG, "Reject CF tunnel [$name]: empty token")
-            return false
-        }
-        if (clean.any { it.isWhitespace() }) {
-            AppLogger.w(TAG, "Reject CF tunnel [$name]: token contains whitespace")
+        val clean = normalizeToken(token)
+        val reject = validateToken(clean)
+        if (reject != null) {
+            // 不要把 token 本体写进日志，只记原因
+            AppLogger.w(TAG, "Reject CF tunnel [$name]: $reject")
             return false
         }
         var tmp: File? = null
@@ -151,6 +157,68 @@ class CloudflareTunnelEngine(private val appContext: android.content.Context) {
             try { tmp?.delete() } catch (_: Exception) {}
             false
         }
+    }
+
+    // ── Token 归一化 + 格式校验（2026-09-21） ──
+
+    /**
+     * 供 API 层使用：判断一个用户输入的 token 能否被接受。
+     * @return null = 通过（[saveTunnel] 会存归一化后的值）；非 null = 可直接回给客户端的拒绝原因。
+     */
+    fun tokenRejectReason(rawToken: String): String? = validateToken(normalizeToken(rawToken))
+
+    /**
+     * 用户在粘贴 token 时经常连同周围的引号、前缀、零宽字符一起带进来。
+     * 归一化**在 [validateToken] 之前**跑：先剥壳，再判结构。
+     */
+    internal fun normalizeToken(raw: String): String {
+        var s = raw.trim()
+        // 剥引号（单/双/中文左右引号）
+        while (s.length >= 2 && s.first() in "\"\'\u201C\u201D\u2018\u2019" && s.last() in "\"\'\u201C\u201D\u2018\u2019") {
+            s = s.substring(1, s.length - 1).trim()
+        }
+        // 剥 `--token=` / `TUNNEL_TOKEN=` 等常见前缀
+        val prefixes = arrayOf("--token=", "--token ", "TUNNEL_TOKEN=")
+        for (p in prefixes) {
+            if (s.startsWith(p, ignoreCase = true)) {
+                s = s.removeRange(0, p.length).trim()
+                break
+            }
+        }
+        // 剥零宽字符（Unicode category Cf：ZWJ/ZWNJ/BOM/SOFT_HYPHEN/...）
+        s = s.filter { it.category != CharCategory.FORMAT }
+        return s
+    }
+
+    /**
+     * 校验归一化后的 token 是否能被 cloudflared 接受。
+     * 合法 token = base64 编码的 JSON，至少含 `a`(accountTag) / `t`(tunnelID) / `s`(tunnelSecret)。
+     * @return null = 通过；非 null = 拒绝原因（可直接放进 400 body）。
+     */
+    internal fun validateToken(clean: String): String? {
+        if (clean.isEmpty()) return "token 为空"
+        if (clean.any { it.isWhitespace() }) return "token 中包含空白字符，请检查是否误粘了命令行"
+        // UUID 形态的误粘（Tunnel ID）
+        if (clean.matches(Regex("[0-9a-fA-F-]{36}"))) return "看起来是 Tunnel ID（UUID），不是 Tunnel Token"
+        // base64 解码（兼容 std + url-safe，有无 padding 都行）
+        val decoded = try {
+            android.util.Base64.decode(clean, android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP)
+        } catch (_: Exception) {
+            try { android.util.Base64.decode(clean, android.util.Base64.DEFAULT or android.util.Base64.NO_WRAP) }
+            catch (_: Exception) { null }
+        }
+        if (decoded == null) return "token 不是有效的 base64 编码"
+        // JSON 结构
+        val json = try {
+            kotlinx.serialization.json.Json.parseToJsonElement(String(decoded))
+        } catch (_: Exception) {
+            return "token base64 解码后不是有效的 JSON"
+        }
+        val obj = (json as? kotlinx.serialization.json.JsonObject)
+            ?: return "token 解码后不是 JSON 对象"
+        val missing = listOf("a", "t", "s").filter { it !in obj }
+        if (missing.isNotEmpty()) return "token 缺少必需的字段: ${missing.joinToString()}"
+        return null
     }
 
     /** 只删磁盘上的 token 文件；槽位处置由 [stopAndDelete] 在实例锁内负责 */
@@ -247,8 +315,11 @@ class CloudflareTunnelEngine(private val appContext: android.content.Context) {
                     s.status = FrpEngine.TunnelStatus.Error
                     s.lastError = "cloudflared 启动后立即退出（exit=$exit）：${tail(s)}"
                     AppLogger.w(TAG, "cloudflared [$target] ${s.lastError}")
-                    // 没起来就不算"运行期"：关掉刚打开的日志文件并删掉
-                    closeLogFile(s, delete = true)
+                    // 2026-09-21：**启动失败的日志必须留下**。此前这里 delete = true，
+                    // 于是秒退后 `GET .../log?full=1` 必然是空的，用户能拿到的全部信息
+                    // 只有 tail() 那 3 行 —— 这正是「token 无效」最难定位的原因。
+                    // 现在只关闭 writer、保留文件；下次 openLogFile 会截断重建，不会堆积。
+                    closeLogFile(s, delete = false)
                     return@withLock false
                 }
 
@@ -260,7 +331,7 @@ class CloudflareTunnelEngine(private val appContext: android.content.Context) {
                 AppLogger.e(TAG, "Failed to start cloudflared [$target]: ${e.message}", e)
                 s.status = FrpEngine.TunnelStatus.Error
                 s.lastError = "启动 cloudflared 失败：${e.message}"
-                closeLogFile(s, delete = true)
+                closeLogFile(s, delete = false)
                 false
             }
         }

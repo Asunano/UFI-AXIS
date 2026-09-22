@@ -201,7 +201,11 @@ class AppSettings(context: Context) {
             BackupField(KEY_TUNNEL_CF_ACTIVE, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_FRP_DESIRED, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_CF_DESIRED, BackupValueType.STRING),
-            BackupField(KEY_TUNNEL_CF_TOKEN, BackupValueType.STRING, sensitive = true),
+            // 2026-09-21 移除 KEY_TUNNEL_CF_TOKEN：它是旧版单隧道时代的**全局** token 槽，
+            // 现在 token 每条隧道一个文件（由 BackupAssembler 按文件备份）。留在这里的后果是
+            // 恢复备份会把陈旧 token 写回 prefs，而 migrateLegacyCfToken 会凭它凭空重建一条
+            // 叫 `default` 的隧道、还可能顶掉「当前选中」—— 一个全局槽能伪造出一条隧道，
+            // 正是「多目标配置各存一份」要禁掉的形态。
             // 采集调度（范围与各自 getter 的夹取一致）
             BackupField(KEY_MON_RETENTION_DAYS, BackupValueType.INT, 1, 90),
             BackupField(KEY_MON_FLUSH_SEC, BackupValueType.INT, 5, 300),
@@ -254,6 +258,8 @@ class AppSettings(context: Context) {
         private const val KEY_MON_THERMAL_WARN_C = "monitor_thermal_warn_c"
         private const val KEY_MON_THERMAL_CRIT_C = "monitor_thermal_critical_c"
         private const val KEY_MON_THERMAL_PAUSE_SEC = "monitor_thermal_pause_sec"
+        private const val KEY_MON_BOOT_GRACE_MS = "monitor_boot_grace_ms"
+        private const val KEY_ALERT_LEVEL_STATE = "alert_level_state_json"
         // 2026-09-08 补齐：这两个是 2026-09-03 那次改造漏掉的最后两个编译期常量
         private const val KEY_MON_TRAFFIC_LIMIT_CHECK_SEC = "monitor_traffic_limit_check_sec"
         private const val KEY_MON_DEVICE_EVENT_CHECK_SEC = "monitor_device_event_check_sec"
@@ -1216,6 +1222,29 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_MON_ALERT_SCAN_SEC, 15).coerceIn(5, 300)
         set(value) = prefs.edit().putInt(KEY_MON_ALERT_SCAN_SEC, value.coerceIn(5, 300)).apply()
 
+    /**
+     * 开机预热期（毫秒），10_000..300_000。
+     *
+     * 预热期内 DataScheduler 的 CPU / 内存 / 信号 / 电池数据**不写入 DB**（WS 实时推送照常），
+     * 且 `scanLocalAlerts()` 整条本地告警扫描（温度 / 电量 / 联网）**不判不报** ——
+     * 避免系统初始化阶段的虚高数据污染历史图表并产生误报。
+     * Unisoc + Android 13 + 1.5GB RAM 实测 ~60s 后系统服务基本稳定，默认 90s。
+     */
+    var monitorBootGraceMs: Long
+        get() = prefs.getLong(KEY_MON_BOOT_GRACE_MS, 90_000L).coerceIn(10_000L, 300_000L)
+        set(value) = prefs.edit().putLong(KEY_MON_BOOT_GRACE_MS, value.coerceIn(10_000L, 300_000L)).apply()
+
+    /**
+     * 告警边沿状态快照（`{"temperature":"warning", ...}`，2026-09-21）。
+     *
+     * `AlertEngine.lastLevelByType` 的持久化载体。不落盘的话每次 core 启动
+     * （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当成
+     * normal→warning 跃迁重报一遍。null / 空串 = 无历史，退化为全部 normal。
+     */
+    var alertLevelStateJson: String?
+        get() = prefs.getString(KEY_ALERT_LEVEL_STATE, null)
+        set(value) = prefs.edit().putString(KEY_ALERT_LEVEL_STATE, value).apply()
+
     /** 无前端连接时的采集间隔（秒），10..600。有连接时走 QoS 自适应，不受这里影响 */
     var monitorIdleIntervalSec: Int
         get() = prefs.getInt(KEY_MON_IDLE_SEC, 60).coerceIn(10, 600)
@@ -1396,6 +1425,16 @@ class AppSettings(context: Context) {
             needsRestart = applied.any { it == KEY_PORT || it == KEY_DEVICE_PROFILE_ID }
         )
     }
+
+    // ────────────────────────────────────────────────────────────
+    // 通用原始键读写（供 StorageSourceManager 等外部模块直接操作自定义键）
+    // ────────────────────────────────────────────────────────────
+
+    /** 读取任意字符串键的原始值（不经属性封装），不存在时返回 null。 */
+    fun getRawString(key: String): String? = prefs.getString(key, null)
+
+    /** 写入任意字符串键的原始值（不经属性封装）。 */
+    fun setRawString(key: String, value: String) = prefs.edit().putString(key, value).apply()
 
     /**
      * 恢复默认配置。

@@ -27,6 +27,7 @@
 - [告警管理 /api/alerts](#告警管理-apialerts)
 - [通知配置 /api/notifications](#通知配置-apinotifications)
 - [媒体中心 /api/media](#媒体中心-apimedia)
+- [音频歌单 /api/playlists](#音频歌单-apiplaylists)
 - [天气 /api/weather](#天气-apiweather)
 - [今日诗词 /api/poetry](#今日诗词-apipoetry)
 - [地理位置 /api/geo](#地理位置-apigeo)
@@ -1058,6 +1059,74 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
   "wa_inner_version": "V1.0.0"
 }
 ```
+
+#### `GET /api/device/qos`
+
+当前 EPS 承载协商到的 QoS（QCI 与上下行 AMBR）。**全仓唯一以 AT 指令作为数据源的读端点**。
+缓存 5 分钟（`CacheTTL.DEVICE_QOS`）。实现见 `DeviceRoutes` 的 `/qos` 与
+`core/collector/.../at/CgeqosrdpParser.kt`。
+
+**数据来源与解析**
+
+底层发 `AT+CGEQOSRDP`（3GPP TS 27.007），一条承载一行：
+
+```
++CGEQOSRDP: 1,8,0,0,0,0,500000,100000
++CGEQOSRDP: 11,5,0,0,0,0,30000,30000
+```
+
+字段顺序（**全部 kbps**）：`<cid>,<QCI>,<DL_GBR>,<UL_GBR>,<DL_MBR>,<UL_MBR>,<DL_AMBR>,<UL_AMBR>`。
+
+取**默认承载**：优先 `cid = 1`，取不到才退回第一条（有些设备的默认承载不是 1）。
+上例即 QCI 8、下行 500000 kbps = 500 Mbps、上行 100000 kbps = 100 Mbps。
+
+解析是宽容的：非 `+CGEQOSRDP:` 的行（回显、`OK`、空行）跳过；前缀允许被回显污染
+（实测见过 `Q+CGEQOSRDP:` 这种吃掉一个字符的形态）；单行字段不足或关键位非数字只丢那一行，
+不会让一行坏数据毁掉整次解析。
+
+**响应：**
+
+```json
+{
+  "available": true,
+  "cid": 1,
+  "qci": 8,
+  "downlink_kbps": 500000,
+  "uplink_kbps": 100000,
+  "downlink_display": "500 Mbps",
+  "uplink_display": "100 Mbps"
+}
+```
+
+- `available`：**AT 通道本身可用**。`false` = 这台设备没有 AT 能力（非展锐平台、HAL 被裁、
+  `ATChannel` 已熔断），不是"这次查失败了"。
+- `cid`：取的是哪条承载。排查"为什么 QCI 是 5 不是 8"只能靠它说清。
+- `*_display`：展示文案由 **core 生成**（`500 Mbps` / `1.5 Mbps` / `100 Kbps`，0 给空串）。
+  两端各写一份 kbps→Mbps 换算迟早出现"一个 500 一个 500.0"。原始 `*_kbps` 一并给出，
+  客户端要自己换算或画图时不必重新解析。
+
+**失败一律 200，不回 4xx/5xx。** AT 通道在很多设备上根本不存在，那是预期状态而不是错误 ——
+回错误码只会让客户端弹一个没法处理的提示。此时字段**一个不少**（只是 0 / 空串），
+客户端不需要为"AT 不可用"写第二套解析分支：
+
+```json
+{
+  "available": false,
+  "cid": 0, "qci": 0,
+  "downlink_kbps": 0, "uplink_kbps": 0,
+  "downlink_display": "", "uplink_display": ""
+}
+```
+
+`available: true` 但 `qci: 0` 表示"通道在、命令发出去了，但没解出可用记录"——
+这一种值得看日志（core 会记一条 WARN 带原始响应前 120 字符）。
+
+**调用方约定**
+
+不要放进高频轮询。AT 通道是全局互斥的（`ATChannel` 有 500ms 最小间隔、失败指数退避、
+连续 20 次失败熔断），抢锁超时是 10s；落在仪表盘 10s 轮询的关键路径上会把整页拖住。
+app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSilently`，与
+`/api/device/version` 同一手法），重新驻网后的新值靠重进页面刷新。
 
 #### `GET /api/device/model`
 
@@ -2375,10 +2444,9 @@ AT 通道状态。
 {
   "enabled": false,
   "perType": {},
-  "minIntervalSec": 1800,
   "configVersion": 1,
-  "temperatureWarning": 45.0,
-  "temperatureCritical": 55.0,
+  "temperatureWarning": 65.0,
+  "temperatureCritical": 75.0,
   "batteryWarning": 20,
   "batteryCritical": 10,
   "trafficWarningMb": 1024,
@@ -2661,8 +2729,9 @@ core 只做三件事：查 MediaStore、按该类型配置的扫描目录过滤�
 （13 以下统一看 `READ_EXTERNAL_STORAGE`，另外「所有文件访问」`MANAGE_EXTERNAL_STORAGE` 也算放行）。
 所以未授权时端点回 403 而不是空列表：显示「设备里没有视频」是在骗用户。
 
-本组**没有服务端 TTL 缓存**（MediaStore 查询是本地的，缓存反而会让新拷进来的文件迟迟不出现）；
-唯一的缓存口径在两类图片端点上，靠强 ETag + `Cache-Control: private, max-age=86400` 让客户端与 Coil 磁盘缓存复用。
+本组**基本没有服务端 TTL 缓存**（MediaStore 查询是本地的，缓存反而会让新拷进来的文件迟迟不出现）：
+列表类端点每次都现查，唯一的例外是 `GET /api/media/groups`（整表聚合，60s TTL，见该节）；
+图片端点则靠强 ETag + `Cache-Control: private, max-age=86400` 让客户端与 Coil 磁盘缓存复用。
 
 ### GET /api/media/status
 
@@ -2703,6 +2772,20 @@ core 只做三件事：查 MediaStore、按该类型配置的扫描目录过滤�
 | order | 否 | `desc`（默认）/ `asc` |
 | limit | 否 | 默认 100，夹取到 1..500 |
 | offset | 否 | 默认 0，负数按 0 处理 |
+| album | 否 | **仅 `type=audio` 生效**：精确匹配 `MediaStore.Audio.Media.ALBUM` |
+| artist | 否 | **仅 `type=audio` 生效**：精确匹配 `MediaStore.Audio.Media.ARTIST` |
+| dir | 否 | **仅 `type=audio` 生效**：只要**直接位于**该目录下的文件（不含子目录），传绝对路径 |
+
+`album` / `artist` / `dir` 是给 `GET /api/media/groups` 做回查用的（把分组的 `key` 原样送回来），2026-09-20 新增：
+
+- 三个参数**只对 `type=audio` 生效**，传给 `video` / `image` 时被**忽略**而不是报错 —— `ALBUM` / `ARTIST` 是
+  `MediaStore.Audio` 独有的列，拿去查另外两张表会直接「unknown column」；而媒体中心三个分栏共用同一套请求构造，
+  从专辑详情切到视频页时参数可能还挂在 URL 上，为一个无害的残留参数让整页 400 是把状态残留升级成故障。
+- 与该类型配置的**扫描目录过滤是 AND 关系**，不是替换：扫描目录是用户划定的媒体库边界，`album=` 不能绕过它。
+- 空字符串等于没传（前端清空输入框时传的就是空串）。
+- `dir` 的实现是 `DATA LIKE '<dir>/%' AND DATA NOT LIKE '<dir>/%/%'`，末尾斜杠会被去掉；
+  值一律走 `?` 占位 + `selectionArgs`，不拼进 SQL 字符串。
+- 本端点**不走服务端缓存**（分页查询的工作量已被 SQL 的 `LIMIT` 限住），所以不同专辑之间不存在串缓存的问题。
 
 **响应（`type=audio`）：**
 
@@ -2750,6 +2833,75 @@ core 只做三件事：查 MediaStore、按该类型配置的扫描目录过滤�
 | 403 | 该类型媒体权限未授权（响应里带 `permission` 与 `type`，客户端据此跳系统授权页） |
 
 MediaStore 查询本身失败时不报错，而是回空 `items` + `total: 0` 并在 core 日志留 WARN —— 分页接口半途抛错会让界面卡在加载态。
+
+### GET /api/media/groups
+
+音频分组聚合：按**专辑 / 歌手 / 文件夹**把整个音乐库归堆，一次请求拿到「共 37 张专辑，每张几首、封面取哪首」。
+
+**为什么放在 core**：客户端要自己分组就得先把整库拉下来（`/list` 分页拉完几千首）才能统计，
+而它真正要显示的只是一屏分组。聚合在 core 做只需一次游标遍历，网络上只走分组结果，
+app 与 Web 两端也不必各写一份口径可能不同的统计逻辑。
+
+**为什么只支持音频**：`album` / `artist` 是 `MediaStore.Audio` 独有的标签维度，视频与图片没有等价物
+（它们的「文件夹视图」走 `GET /api/media/browse`）。其它 `type` 一律 400，而不是回一个空分组列表 —— 空列表会被理解成「这台设备没有视频」。
+
+**查询参数：**
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| type | 是 | 只支持 `audio`，其它值回 400（分组仅支持音频） |
+| by | 是 | `album` / `artist` / `folder` |
+
+**响应（`type=audio&by=album`）：**
+
+```json
+{
+  "type": "audio",
+  "by": "album",
+  "groups": [
+    { "key": "摩登蔷薇", "title": "摩登蔷薇", "subtitle": "杨丞琳", "count": 12, "cover_id": 10345 }
+  ],
+  "total": 37
+}
+```
+
+**字段语义：**
+
+| 字段 | 说明 |
+| --- | --- |
+| key | 用于回查的值。`album` / `artist` 是原始标签字符串；`folder` 是**目录绝对路径** |
+| title | 展示名。`folder` 取目录名（路径最后一段）；`album` / `artist` 同 `key`，为空时回 `未知专辑` / `未知歌手`（`folder` 不会为空） |
+| subtitle | `album`：该专辑的主要歌手（组内出现最多的 `artist`，合辑靠它避免"取第一首"随排序漂移）；`artist`：`N 张专辑`；`folder`：目录的父路径 |
+| count | 组内曲目数 |
+| cover_id | 组内任意一首的 `_ID`，客户端拿它去 `GET /api/media/thumbnail?type=audio&id=<cover_id>` 取封面；取不到填 `0`（`_ID` 从 1 开始，所以 `0` 天然表示"没有"） |
+| total | **分组总数**（不是曲目总数，曲目数在每组的 `count` 里） |
+
+**排序**：`count` 降序 → `title` 升序，在 Kotlin 侧排（不依赖 SQL 的 `GROUP BY`，各 ROM 的 MediaProvider 对分组语句支持不一）。
+第二级排序不能省：否则同 `count` 的分组顺序跟着 HashMap 迭代顺序漂移，每次刷新看到的排列都不一样。
+
+**目录过滤**沿用该类型配置的扫描目录（`audio` 那一份），与 `/list` **同一口径** —— 否则会出现「分组里 12 首、点进去只有 8 首」。
+
+**客户端怎么回查组内曲目：** 把 `key` 原样送回 `/api/media/list`：
+
+- `by=album` → `GET /api/media/list?type=audio&album=<key>`
+- `by=artist` → `GET /api/media/list?type=audio&artist=<key>`
+- `by=folder` → `GET /api/media/list?type=audio&dir=<key>`
+
+**缓存**：走服务端 `ResponseCache`，TTL 60s（`CacheTTL.MEDIA_GROUPS`），key 含 `type`、`by` 与当前扫描目录 ——
+三个视图各存一份，改了媒体库范围就是另一份数据。1 分钟的上限是为了让 `POST /api/media/rescan` 之后新收录的歌能较快出现。
+
+**注意**：`album` / `artist` 没有标签的文件会聚成一个 `key` 为空串的分组（`title` 显示为「未知专辑」/「未知歌手」）。
+它的 `key` 送回 `/list` 时会被当成「没传」而返回整库 —— 客户端对这一组应当只做展示，或改用 `by=folder` 进入。
+MediaStore 的 `<unknown>` 占位值已在 core 侧归一成空串，不会出现一个 `<unknown>` 分组和一个「未知专辑」分组并存。
+
+**错误：**
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | `type` 不是 `audio`（分组仅支持音频），或 `by` 不是 `album` / `artist` / `folder` |
+| 403 | 音频媒体权限未授权（与 `/list` 同一口径，响应里带 `permission` 与 `type`） |
+
+MediaStore 查询失败时不报错，而是回空 `groups` + `total: 0` 并在 core 日志留 WARN —— 与 `/list` 的处理一致。
 
 ### GET /api/media/browse
 
@@ -3045,6 +3197,151 @@ core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收�
 | --- | --- |
 | 400 | `type` 不合法 |
 | 400 | 没有可扫描的目录（外置存储不可用且未指定目录） |
+
+---
+
+## 音频歌单 /api/playlists
+
+用户自己整理的音乐清单，**存在 core**（`PlaylistStore`，SharedPreferences 单键 JSON），
+app 与 web 看的是同一份。实现见 `core/api/.../routes/PlaylistRoutes.kt`。
+
+### 三条必须先知道的约定
+
+**① 曲目以真实路径为标识，不是 MediaStore 的 `id`。**
+`id` 是媒体库的行号，重扫 / 换卡之后同一个文件会拿到新的 id —— 拿它存歌单等于存一个会失效的
+引用。所以所有写操作的 body 都是 `{ "paths": [...] }`。路径也正是播放链路
+（`POST /api/files/stream-ticket` → `/media/stream`）的既有标识，不需要两种标识互相翻译。
+
+**② `GET /api/playlists/{id}/items` 回的 item 与 `/api/media/list` 的 `items[]` 形状完全一致**，
+只多一个 `missing`。两端的曲目列表组件可以零改动复用，也不必各写一份"路径 → 曲目"的拼装
+（回查在 core 做，一次批量 `DATA IN (...)` 查询，分批上限 200 条以避开 SQLite 的绑定变量硬顶）。
+
+**③ `missing: true` 的条目照样返回**（文件被删 / 卡没插 / 还没被系统扫到），此时 `id` 为 0、
+其余字段取加入歌单时的快照。客户端要画"已失效"占位并禁止播放，**不要自动帮用户移出** ——
+拔一次卡就清空歌单是不可接受的。
+
+### 顺序即播放顺序
+
+`items` 的顺序由用户排定（追加 / 插入 / 整表重排），core 原样给出。
+客户端**不要**再按音乐页的 sort/order 重排一次。
+
+### 上限与失败码
+
+歌单数 ≤ 100、单歌单曲目 ≤ 2000、名称 ≤ 64 字符（超长截断，不报错）。
+失败码全部复用通用码：`NOT_FOUND` / `BLANK_VALUE` / `ALREADY_EXISTS` / `OUT_OF_RANGE` / `FORBIDDEN`。
+
+### 集合变更推送
+
+任何写操作成功后 core 广播 `data_changed`，`data.changed = "media:playlists"`
+（`WsDataTopic.MEDIA_PLAYLISTS`）。两端收到就重拉 —— 否则一端加歌，另一端要退出页面再进才看得见。
+
+---
+
+#### `GET /api/playlists`
+
+全部歌单（不含曲目明细）。
+
+```json
+{
+  "playlists": [
+    { "id": "a1b2c3d4", "name": "通勤", "count": 23, "cover_id": 1042,
+      "created_at": 1758400000000, "updated_at": 1758460000000 }
+  ],
+  "count": 1
+}
+```
+
+- `count`：曲目数，**含已失效的** —— 拔一次卡不该让"共 23 首"变少。
+- `cover_id`：首曲的 MediaStore id，封面走 `GET /api/media/cover?id=`。
+  `0` = 空歌单或首曲已失效，此时客户端不要发封面请求（与 `/api/media/groups` 同一约定）。
+
+#### `GET /api/playlists/{id}`
+
+单个歌单的元信息（形状同上面 `playlists[]` 的一项），给"重命名"弹窗回填用。
+不存在回 404 `NOT_FOUND`。
+
+#### `GET /api/playlists/{id}/items`
+
+歌单曲目。
+
+```json
+{
+  "id": "a1b2c3d4",
+  "name": "通勤",
+  "items": [
+    { "id": 1042, "name": "带我走.flac", "path": "/storage/emulated/0/Music/带我走.flac",
+      "size": 31457280, "date_modified": 1758300000000, "mime": "audio/flac",
+      "duration_ms": 241000, "album": "点水", "artist": "杨丞琳", "title": "带我走",
+      "missing": false }
+  ],
+  "total": 1,
+  "missing_count": 0,
+  "created_at": 1758400000000,
+  "updated_at": 1758460000000
+}
+```
+
+无媒体读取权限时回 **403** `FORBIDDEN`（带 `type: "audio"`）——
+**不会**回一份全是 `missing` 的列表，那等于告诉用户"你的歌全丢了"。
+
+#### `POST /api/playlists`
+
+新建。body `{ "name": "通勤" }` → `{ "success": true, "id": "a1b2c3d4", "name": "通勤" }`。
+
+id 由服务端生成（8 位十六进制），**不接受客户端传 id**。
+
+| 状态码 | code | 场景 |
+| --- | --- | --- |
+| 400 | `BLANK_VALUE` | 名称去空白后为空 |
+| 409 | `ALREADY_EXISTS` | 已有同名歌单（忽略大小写） |
+| 400 | `OUT_OF_RANGE` | 歌单数量已达 100（响应带 `max`） |
+
+#### `PUT /api/playlists/{id}`
+
+重命名。body `{ "name": "新名字" }` → `{ "success": true, "name": "新名字" }`。
+失败码同 `POST`，另加 404 `NOT_FOUND`。
+
+#### `DELETE /api/playlists/{id}`
+
+删除歌单。`{ "success": true }`；不存在回 404 + `{ "success": false }`。
+**只删清单，不删文件**。
+
+#### `POST /api/playlists/{id}/items`
+
+加歌。body `{ "paths": ["/storage/.../a.flac"], "position": 0 }`（`position` 省略 = 追加到尾部）。
+
+```json
+{ "success": true, "added": 1, "skipped": 0, "truncated": false, "total": 24 }
+```
+
+加之前 core 会逐条确认"这确实是媒体库里的一首音频"：不在库里的路径不会入库，而是计入
+`skipped`。三个计数分别对应三种"没进去"的原因，客户端应如实说出来 ——
+用户选了 20 首只进 3 首时，一句笼统的"已加入"会被当成 App 丢了歌。
+
+- `added`：真加进去的条数
+- `skipped`：已在本歌单里 **或** 不在媒体库里的条数
+- `truncated`：是否撞到单歌单 2000 条上限而被截断
+
+#### `DELETE /api/playlists/{id}/items`
+
+移出曲目。body `{ "paths": [...] }` **或** 查询串 `?path=a&path=b`（两种都收：带 body 的
+DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下删不掉"）。
+
+```json
+{ "success": true, "removed": 1 }
+```
+
+#### `PUT /api/playlists/{id}/items`
+
+整表重排。body `{ "paths": [...] }` = 新的完整顺序 → `{ "success": true, "total": 24 }`。
+
+语义刻意定成「**只调顺序，不增不删**」：
+- 传进来但不在歌单里的 path 一律忽略 —— 重排接口能顺手加歌的话，客户端一次误传
+  （把整库列表当成歌单提交）就会灌进几千首；
+- 歌单里有、但本次没提及的条目**保留并追加到尾部**，不是删掉 —— 拖拽 UI 常常只提交
+  可见的那一屏，按"没提到就删"处理等于滚动一下就丢歌。
+
+真要删就调 `DELETE`，那是一个有明确名字的操作。
 
 ---
 

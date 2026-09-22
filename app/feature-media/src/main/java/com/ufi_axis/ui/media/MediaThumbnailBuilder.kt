@@ -92,10 +92,57 @@ internal object MediaThumbnailBuilder {
     val activeCount: StateFlow<Int> = _activeCount.asStateFlow()
 
     /**
-     * 抽帧取的时间点（1 秒）。与 core 侧同一口径：首帧常是黑场，抽出来跟没有一样。
-     * 比视频还短时 `getFrameAtTime` 会退到最近的关键帧。
+     * 抽帧位置在片长中的候选比例（2026-09-20 重写）。
+     *
+     * ## 原来为什么全是黑屏
+     * 之前固定抽**第 1 秒**。那个位置在现实片源里几乎注定是黑的：
+     * 淡入、发行商 logo 前的黑场、番剧的黑底标题卡、录屏的启动瞬间 —— 全在前几秒。
+     * 原注释说的「不取第 0 帧因为首帧常是黑场」只躲开了最表层那一下，
+     * 1 秒和 0 秒在这件事上没有本质区别。
+     *
+     * ## 现在的做法
+     * 首选位置落在**中段**（[FRAME_PICK_RANGE_START] ~ [FRAME_PICK_RANGE_END]），
+     * 具体偏移由 URL 哈希决定 —— 于是不同视频取到片长的不同处（看起来是"随机"的），
+     * 而**同一个视频永远取同一处**。
+     *
+     * 为什么不用真随机：清一次缓存封面就会换一张，而且随机本身并不能避开黑场
+     * （夜戏、转场、片尾黑屏同样黑）。真正解决黑屏的是下面的亮度检测。
      */
-    private const val FRAME_POSITION_US = 1_000_000L
+    private const val FRAME_PICK_RANGE_START = 0.30f
+    private const val FRAME_PICK_RANGE_END = 0.65f
+
+    /** 首选点太暗时依次重试的比例。覆盖前中后段，仍然避开片头片尾。 */
+    private val FRAME_FALLBACK_RATIOS = floatArrayOf(0.50f, 0.25f, 0.70f, 0.40f, 0.85f)
+
+    /**
+     * 判定"这帧是黑屏"的平均亮度阈值（0~255）。
+     *
+     * 18 是保守值：纯黑场 0~3，带噪点的黑场 10 上下，而真正的夜戏画面即便很暗也普遍在 25 以上。
+     * 定高了会把正常暗调画面误判成黑屏、白白多抽几次帧（每次都是一轮 Range 请求 + 解码）。
+     */
+    private const val DARK_LUMA_THRESHOLD = 18
+
+    /** 亮度采样网格边长：16×16 = 256 点。对 512px 的帧足够，比逐像素快两个数量级。 */
+    private const val LUMA_SAMPLE_GRID = 16
+
+    /** 读不到时长时的兜底抽帧点。取 10 秒而不是 1 秒 —— 理由同上。 */
+    private const val FRAME_FALLBACK_POSITION_US = 10_000_000L
+
+    /**
+     * 亮度恰为 0 视为「解码器根本没填充缓冲区」，不是「这一帧很黑」。
+     *
+     * 实测依据（VCB-Studio 的 `[Ma10p_1080p][x265]`，HEVC Main10）：6 个不同时间点
+     * 采样出来的亮度**全是 0**，编出的 JPEG 只有 1.6KB。而真实画面即便是黑幕也不会绝对为 0
+     * —— YUV limited range 的黑是 16，转 RGB 后有偏移，再加编码噪点，实拍黑场落在 2~8。
+     *
+     * 这类帧**绝不能当结果交出去**：之前它被当成"最亮的那张"上传到设备并写进缓存，
+     * 于是"清了缓存还是黑"——清完立刻又抽一张纯黑图存回去。
+     * 判为 0 就当抽帧失败（显示占位图标），而不是硬交一张纯黑图当封面。
+
+     */
+    private const val BLANK_LUMA = 0
+
+
 
     // ── 批量任务（设置页入口）──
 
@@ -198,12 +245,17 @@ internal object MediaThumbnailBuilder {
             markFailed(context, type, item.id)
             return null
         }
+        // 抽帧只走 MediaMetadataRetriever。
+        // 它对 10-bit/HEVC（VCB-Studio 那类 Ma10p 压制）会返回全零帧，那种情况下
+        // extractFrameJpeg 回 null 而不是交黑图 —— 宁可显示占位图标，也不给一张假封面。
         val bytes = extractFrameJpeg(url)
         if (bytes == null) {
-            DebugLog.w("MediaThumb", "本机抽帧也失败: ${item.name}")
+            DebugLog.w("MediaThumb", "本机抽帧失败: ${item.name}")
             markFailed(context, type, item.id)
             return null
         }
+
+
         val target = cacheFile(context, type, item.id)
         val saved = runCatching {
             val tmp = File(target.parentFile, "${target.name}.tmp")
@@ -316,18 +368,102 @@ internal object MediaThumbnailBuilder {
     /**
      * 从 HTTP 地址抽一帧并编码成 JPEG。
      *
-     * `MediaMetadataRetriever` 内部会按需发 Range 请求，只拉到 moov 与目标关键帧附近的数据，
+     * `MediaMetadataRetriever` 内部会按需发 Range 请求，只拉到索引与目标关键帧附近的数据，
      * 不会把整个文件下完 —— 前提是服务端支持 Range（core 的流式端点支持）。
+     *
+     * 抽帧位置的选取见 [FRAME_PICK_RANGE_START]：先按 URL 哈希在中段取一个点，
+     * 抽出来太暗就顺着 [FRAME_FALLBACK_RATIOS] 往下试，全都暗则留最亮的那张
+     * （宁可给一张暗图，也比给纯黑或干脆没有强）。
+     *
+     * ## 为什么要记录每个位置的亮度（2026-09-20）
+     * MP4 正常、MKV 全黑，指向**容器的网络 seek 能力**而不是位置选取：
+     * MP4 的关键帧表（`stss`）在 faststart 时位于文件开头，MMR 一开始就能拿到全部偏移；
+     * 而 MKV 的 `Cues` 索引绝大多数压制在**文件末尾**，MMR 对 HTTP 源往往不会回头去读，
+     * 拿不到索引就放弃 seek、从头顺序解 —— 于是不管传 30% 还是 70%，回来的都是开头那一帧。
+     *
+     * 判据很干净：**seek 若无效，几个不同位置抽出的帧必然是同一张，亮度完全相同**。
+     * 所以这里把每个位置的实测亮度记下来，最后一次性 WARN 出来；
+     * 全部相同就直接判定"容器不支持网络随机访问"。用 WARN 而不是 DEBUG ——
+     * benchmark/release 包只留 WARN/ERROR，DEBUG 级的诊断在真机上抓不到。
      */
     private fun extractFrameJpeg(url: String): ByteArray? = runCatching {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(url, emptyMap())
-            val frame = retriever.getFrameAtTime(
-                FRAME_POSITION_US,
-                MediaMetadataRetriever.OPTION_CLOSEST_SYNC
-            ) ?: retriever.frameAtTime
-            frame?.scaledDown(TARGET_SIZE)?.toJpeg(JPEG_QUALITY)
+            val durationUs = retriever
+                .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull()
+                ?.takeIf { it > 0 }
+                ?.times(1_000L)
+
+            val positions = framePositionsFor(url, durationUs)
+            var best: Bitmap? = null
+            var bestLuma = -1
+            // 诊断用：每个候选位置的实测亮度，用来判断 seek 到底有没有生效
+            val probes = mutableListOf<Pair<Long, Int>>()
+
+            for ((index, positionUs) in positions.withIndex()) {
+                // 首个位置若拿回偏暗的帧，用 OPTION_CLOSEST 在**同一位置**再试一次：
+                // SYNC 只跳关键帧，CLOSEST 会解码到精确时间点 —— 某些容器上后者才真的动了。
+                var frame = retriever.getFrameAtTime(
+                    positionUs,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                )
+                var scaled = frame?.scaledDown(TARGET_SIZE)
+                var luma = scaled?.averageLuma() ?: -1
+                if (index == 0 && luma in 0 until DARK_LUMA_THRESHOLD) {
+                    val exact = retriever.getFrameAtTime(
+                        positionUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST
+                    )?.scaledDown(TARGET_SIZE)
+                    val exactLuma = exact?.averageLuma() ?: -1
+                    if (exactLuma > luma) {
+                        scaled?.recycle()
+                        scaled = exact
+                        luma = exactLuma
+                    } else {
+                        exact?.recycle()
+                    }
+                }
+                if (scaled == null) continue
+
+                probes += positionUs / 1000 to luma
+                if (luma >= DARK_LUMA_THRESHOLD) {
+                    best?.recycle()
+                    return@runCatching scaled.toJpeg(JPEG_QUALITY)
+                }
+                // 全零帧不参与"最亮的那张"竞争：它不是暗画面，是解码失败的产物，
+                // 交出去等于把纯黑图写进三层缓存（见 BLANK_LUMA）。
+                if (luma > BLANK_LUMA && luma > bestLuma) {
+                    best?.recycle()
+                    best = scaled
+                    bestLuma = luma
+                } else {
+                    scaled.recycle()
+                }
+            }
+
+            // 到这儿说明没拿到够亮的帧。把实测数据一次性报出来，供定位用。
+            val allBlank = probes.isNotEmpty() && probes.all { it.second <= BLANK_LUMA }
+            DebugLog.w(
+                "MediaThumb",
+                buildString {
+                    append("抽帧未取到有效画面 url=").append(url.substringAfterLast('/').take(60))
+                    append(" duration=").append(durationUs?.div(1_000_000) ?: -1).append("s")
+                    append(" probes=").append(probes.joinToString { "${it.first}ms:${it.second}" })
+                    if (allBlank) {
+                        append(" → 全是空白帧（解码器未填充），")
+                        append("多为 10-bit/HEVC（Ma10p 那类压制）在 MediaMetadataRetriever 上的已知缺陷")
+                    }
+                }
+            )
+
+            // 全空白 = MMR 这条路对该编码无效。**不能**把 best（仍是纯黑）交出去 ——
+            // 返回 null 让调用方走 markFailed，界面显示占位图标，比一张假封面诚实。
+            if (allBlank) return@runCatching null
+
+
+            best?.toJpeg(JPEG_QUALITY)
         } finally {
             retriever.release()
         }
@@ -335,6 +471,63 @@ internal object MediaThumbnailBuilder {
         DebugLog.w("MediaThumb", "抽帧异常: ${e.javaClass.simpleName}: ${e.message}")
         null
     }
+
+    /**
+     * 抽帧候选位置（微秒），按尝试顺序排列。
+
+     *
+     * 首选点由 [url] 的哈希在中段内定位：同一个视频恒定（封面不会因为重建缓存而变），
+     * 不同视频各取各处（避免"一个文件夹里所有封面都是同一时间点的构图"）。
+     *
+     * 时长未知时（流式容器读不到 duration）退化为一个固定点，
+     * 由 `getFrameAtTime` 自己找最近的关键帧。
+     */
+
+
+    private fun framePositionsFor(url: String, durationUs: Long?): LongArray {
+        if (durationUs == null || durationUs <= 0) {
+            return longArrayOf(FRAME_FALLBACK_POSITION_US)
+        }
+        // 取 hash 的低位映射到 [START, END)，Int.MIN_VALUE 取绝对值会溢出，先转 Long
+        val span = FRAME_PICK_RANGE_END - FRAME_PICK_RANGE_START
+        val hashFraction = (url.hashCode().toLong() and 0xFFFF) / 0xFFFF.toFloat()
+        val primary = FRAME_PICK_RANGE_START + span * hashFraction
+
+        val ratios = floatArrayOf(primary, *FRAME_FALLBACK_RATIOS.toTypedArray().toFloatArray())
+        return LongArray(ratios.size) { i -> (durationUs * ratios[i]).toLong() }
+    }
+
+    /**
+     * 网格采样的平均亮度（0~255）。
+     *
+     * 用感知加权 `(2R + 5G + B) / 8` 而不是简单平均：人眼对绿色最敏感，
+     * 简单平均会把纯绿画面算得偏暗、纯蓝画面算得偏亮。
+     *
+     * 只采 [LUMA_SAMPLE_GRID]² 个点：512×288 的帧有 14 万像素，逐像素读是纯浪费 ——
+     * 判断"整屏是不是黑的"这件事上，256 个均匀分布的采样点和全量统计结论一致。
+     */
+    private fun Bitmap.averageLuma(): Int {
+        val stepX = (width / LUMA_SAMPLE_GRID).coerceAtLeast(1)
+        val stepY = (height / LUMA_SAMPLE_GRID).coerceAtLeast(1)
+        var sum = 0L
+        var count = 0
+        var y = 0
+        while (y < height) {
+            var x = 0
+            while (x < width) {
+                val p = getPixel(x, y)
+                val r = (p shr 16) and 0xFF
+                val g = (p shr 8) and 0xFF
+                val b = p and 0xFF
+                sum += (r * 2 + g * 5 + b) / 8
+                count++
+                x += stepX
+            }
+            y += stepY
+        }
+        return if (count > 0) (sum / count).toInt() else 0
+    }
+
 
     /** 等比缩到最长边 = [size]（本来更小就不动，放大只会更糊还更大）。 */
     private fun Bitmap.scaledDown(size: Int): Bitmap {

@@ -13,6 +13,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.unit.dp
+
 import com.ufi_axis.data.model.TrafficUsageResponse
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
@@ -254,11 +256,17 @@ private fun TrafficHistoryDialogBody(viewModel: MainViewModel) {
                     color = palette.textSecondary,
                     modifier = Modifier.weight(1f)
                 )
-                Text(
-                    shown?.let { FormatUtils.formatSize(it.total_bytes) } ?: "--",
+                // 2026-09-21：右侧字节数也接上滚轮（左边的 label 早就是 UfiRollingText）。
+                // formatSize 会自适应单位，所以走 UfiRollingMetric 把 "MB"/"GB" 剥成独立 Text，
+                // 换档时只有单位跳一下，数字段照样逐位滚。
+                UfiRollingMetric(
+                    text = shown?.let { FormatUtils.formatSize(it.total_bytes) } ?: "--",
                     style = UfiTextStyles.bodyEmphasis,
-                    color = palette.textPrimary
+                    unitStyle = UfiTextStyles.bodyEmphasis,
+                    color = palette.textPrimary,
+                    unitSpacing = 3.dp
                 )
+
             }
         }
     }

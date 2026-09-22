@@ -5,6 +5,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -28,6 +31,20 @@ fun FrpChannelScreen(viewModel: MainViewModel, navController: NavHostController,
     val state by viewModel.tunnelState.collectAsState()
     val clipboard = LocalClipboardManager.current
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
+
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
 
     var tomlText by remember { mutableStateOf("") }
     // 已把哪个通道的文本灌进编辑器：frpConfigText 是全局共享 state，
@@ -57,15 +74,16 @@ fun FrpChannelScreen(viewModel: MainViewModel, navController: NavHostController,
     }
 
     // 启动后轮询日志（每 2 秒）
-    LaunchedEffect(logPolling, channelName) {
-        while (logPolling) {
+    LaunchedEffect(logPolling, channelName, lifecycleResumed) {
+        while (logPolling && lifecycleResumed) {
             viewModel.tunnel.refreshFrpLog(channelName)
             delay(2000)
         }
     }
 
     // 状态兜底轮询：frpc 可能自己退出或被别处停掉，不轮询会一直显示"运行中"
-    LaunchedEffect(channelName) {
+    LaunchedEffect(channelName, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         while (true) {
             delay(5000)
             viewModel.tunnel.loadStatus()

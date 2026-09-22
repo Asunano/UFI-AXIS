@@ -4,11 +4,15 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -19,6 +23,9 @@ import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiMotion
@@ -48,10 +55,14 @@ import kotlin.math.max
  *
  * ## 不做什么
  * - **不接亚秒级读数**。`SpeedTestScreen` 的注释已经写明「数值不能放进 Crossfade ——
- *   它每 150ms 更新一次，会变成持续闪烁」；`UfiChart` 也刻意删掉了 count-up、
- *   `HomeMetricsCard` 显式 `animate = false`。本组件是给**低频**文案用的
- *   （切区间 / 翻页 / 轮询间隔 ≥ 数秒），高频读数请继续用 [Text] 直出。
- * - 只支持**单行**：几何按"一行字形"算，不处理换行与省略号。
+ *   它每 150ms 更新一次，会变成持续闪烁」。本组件的适用区间是**轮询间隔 ≥ 1 秒**
+ *   （切区间 / 翻页 / 10s 仪表盘轮询 / WS 秒级推送），150ms 级读数请继续用 [Text] 直出。
+ * - 只支持**单行**：几何按"一行字形"算，不处理换行与省略号。也没有 `textAlign` ——
+ *   宽度就是字形实测和，要居中请在外层套 `Box(contentAlignment = …)`。
+ * - **不做格式化**。串由调用方给（`FormatUtils` 负责）。自适应单位的串
+ *   （`"998 KB/s"` → `"1.0 MB/s"`）请走 [UfiRollingMetric] 把单位剥出去，
+ *   否则换档时变化槽位超阈值会退化成整句滚动。
+
  *
  * ## 几何
  * 字形在组合期预测量并缓存（key 含 style + density + **fontScale**，系统字体大小一改立刻重算）。
@@ -149,6 +160,62 @@ fun UfiRollingText(
             x += slotWidth
         }
     }
+}
+
+/**
+ * 「数值 + 单位」读数：数字段走 [UfiRollingText] 滚动，单位段是普通 [Text]。
+ *
+ * 为什么要拆：自适应单位的格式化函数（`FormatUtils.formatRate` / `formatSize`）在换档时
+ * 整串都变（`"998.0 KB/s"` → `"1.0 MB/s"`），变化槽位一超阈值就退化成"整句滚动"，
+ * 动画收益归零。把单位剥出去之后，换档只是单位那个 [Text] 跳一下，数字段仍然逐位滚。
+ *
+ * 拆分规则见 [ufiSplitReadout]：从末尾剥掉非数字后缀。
+ *
+ * @param unitStyle 单位段样式；默认 [UfiTextStyles.label]，比数字小一号做层级
+ * @param alignment 数字段与单位段的纵向对齐；默认 [Alignment.Bottom]（单位坐在数字基线上）
+ */
+@Composable
+fun UfiRollingMetric(
+    text: String,
+    modifier: Modifier = Modifier,
+    style: TextStyle = UfiTextStyles.metricValue,
+    unitStyle: TextStyle = UfiTextStyles.label,
+    color: Color = LocalResolvedPalette.current.textPrimary,
+    unitColor: Color = color,
+    unitSpacing: Dp = 4.dp,
+    alignment: Alignment.Vertical = Alignment.Bottom,
+    stepDurationMillis: Int = UfiMotion.Duration.Standard,
+    staggerMillis: Long = UfiMotion.STAGGER_DELAY_MS
+) {
+    val parts = remember(text) { ufiSplitReadout(text) }
+    Row(modifier = modifier, verticalAlignment = alignment) {
+        UfiRollingText(
+            text = parts.first,
+            style = style,
+            color = color,
+            stepDurationMillis = stepDurationMillis,
+            staggerMillis = staggerMillis
+        )
+        val unit = parts.second
+        if (unit != null) {
+            Spacer(Modifier.width(unitSpacing))
+            Text(text = unit, style = unitStyle, color = unitColor, maxLines = 1)
+        }
+    }
+}
+
+/**
+ * 把一条读数拆成「数字段 + 单位段」：`"12.3 MB/s"` → `"12.3"` + `"MB/s"`、
+ * `"84%"` → `"84"` + `"%"`、`"3.2/8.0 GB"` → `"3.2/8.0"` + `"GB"`。
+ *
+ * 做法是找到**最后一个数字**，其后的内容去空白即单位。串里没有数字时（`"--"` / `"—"`）
+ * 整串当数字段返回、单位为 `null` —— 占位符不该被当成单位甩到右边去。
+ */
+fun ufiSplitReadout(text: String): Pair<String, String?> {
+    val lastDigit = text.indexOfLast { it.isDigit() }
+    if (lastDigit < 0) return text to null
+    val unit = text.substring(lastDigit + 1).trim()
+    return text.substring(0, lastDigit + 1) to unit.takeIf { it.isNotEmpty() }
 }
 
 private fun DrawScope.drawGlyph(

@@ -31,6 +31,16 @@ class ComponentRoutes(
 
     companion object {
         private const val TAG = "ComponentRoutes"
+
+        /**
+         * 本地上传组件二进制的上限。cloudflared 裸二进制约 36MB，留足余量。
+         *
+         * **HTTP 层与路由层共用这一个常量**：`HttpServer` 的 `RequestBodyLimit` 引用它，
+         * 而不是自己再写一份 96MB。两处各存一个数早晚分叉，而分叉的表现是
+         * "小包能传、稍大的莫名 413"，极难定位 —— 仓库对 `BackupRoutes.MAX_UPLOAD_BYTES`
+         * 已经踩过一次同样的坑。
+         */
+        const val MAX_UPLOAD_BYTES = 96L * 1024 * 1024
     }
 
     fun register(route: Route) {
@@ -38,8 +48,17 @@ class ComponentRoutes(
             get {
                 val refresh = call.request.queryParameters["refresh"]?.equals("true", true) == true
                 val list = withContext(Dispatchers.IO) { componentManager.listComponents(refresh) }
-                call.respond(toJsonElement(mapOf("components" to list) + componentManager.statusToMap()))
+                // max_upload_bytes：前端据此在**选文件时**就挡掉超限的二进制。
+                // 不下发只能盲传，而 413 要等 body 全推完才被浏览器读到
+                // （见 UpdateRoutes.statusToMap 的说明），36MB 上行白烧一遍。
+                call.respond(
+                    toJsonElement(
+                        mapOf("components" to list, "max_upload_bytes" to MAX_UPLOAD_BYTES) +
+                            componentManager.statusToMap()
+                    )
+                )
             }
+
 
             get("/status") {
                 call.respond(toJsonElement(componentManager.statusToMap()))

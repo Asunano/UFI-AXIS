@@ -1,5 +1,7 @@
 package com.ufi_axis.ui.navigation
 
+import android.graphics.RenderEffect
+import android.graphics.Shader
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.tween
@@ -13,7 +15,11 @@ import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.asComposeRenderEffect
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.util.lerp
+import com.ufi_axis.ui.components.common.UfiDialogAnim
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.UfiMotion
@@ -44,6 +50,57 @@ private const val SHARED_AXIS_ENTER_CORNER_DP = 36f
 
 /** 下层压暗幅度：与 [UfiMotion.NavRecede] 同一套 token。深度感由 scrim 承担，本页不做缩放。 */
 private fun sharedAxisScrimAlpha(): Float = UfiMotion.NavRecede.ScrimAlpha
+
+
+// ── 下层背景模糊（2026-09-20，只服务升起面板）─────────────────────────────────
+//
+// 为什么这条链路与公共弹窗（[UfiDialogShell]）**实现不同但取值同源**：
+// 弹窗是独立 Window，能用 `FLAG_BLUR_BEHIND + blurBehindRadius` 让系统去模糊
+// **它背后那个 Window**；而导航转场的两页在**同一个 Window** 里，跨窗口模糊这条路
+// 根本不通 —— 只能在绘制期对下层那棵子树自己做一次离屏模糊。
+// 所以观感口径（峰值半径、量化档数）直接读弹窗那两个常量，实现方式各自为政。
+//
+// 半径单位对得上，不需要换算：弹窗的 [UfiDialogAnim.BlurRadius] 是写进
+// `WindowManager.LayoutParams.blurBehindRadius` 的**设备像素**，而
+// `RenderEffect.createBlurEffect` 收的也是**像素**。（若改用 `Modifier.blur(Dp)`
+// 就必须先除以 density —— 那条路这里没走，理由见 [ufiSharedAxisLayer] 的 blurUnderlay。）
+//
+// API 门槛：`RenderEffect` 需要 API 31，而全库 minSdk 就是 31，所以不存在
+// "低版本静默失效、只剩 scrim" 的退化分支要写。
+
+/**
+ * 把 0..1 的模糊进度量化成 0..[UfiDialogAnim.BackdropSteps] 档。
+ *
+ * 量化的动机与弹窗那边同源（见 [UfiDialogAnim.BackdropSteps]）：半径这种视觉量 12 档
+ * 已经看不出台阶，而**逐帧新半径**意味着逐帧 `createBlurEffect`（JNI + 原生对象分配）——
+ * 页面切换那侧早就为此加过缓存（见 `UfiPageSwitcherHost` 的 `blurEffectCache`）。
+ * 量化之后整段转场最多命中 12 个不同半径，配合 [underlayBlurEffect] 的缓存即为零分配。
+ */
+private fun underlayBlurStep(fraction: Float): Int =
+    (fraction.coerceIn(0f, 1f) * UfiDialogAnim.BackdropSteps).roundToInt()
+
+/**
+ * 量化档 → 模糊 `RenderEffect` 的缓存。
+ *
+ * `RenderEffect` 不可变，跨帧 / 跨图层复用安全；只在**绘制期**（主线程）访问，
+ * 因此用普通 `HashMap` 不加锁。键是档位而不是半径浮点数：浮点数当键迟早因为
+ * 末位误差把缓存打成每帧新建。
+ */
+private val underlayBlurEffects = HashMap<Int, androidx.compose.ui.graphics.RenderEffect>()
+
+/**
+ * 取某一档的模糊效果；第 0 档返回 `null` —— 调用方据此**整段跳过离屏图层**。
+ *
+ * 半径按档位线性插到 [UfiDialogAnim.BlurRadius]，第 1 档已经约 9px，
+ * 不存在"小到看不见却照付一次离屏渲染"的区间，所以这里不需要额外的最小半径守卫。
+ */
+private fun underlayBlurEffect(step: Int): androidx.compose.ui.graphics.RenderEffect? {
+    if (step <= 0) return null
+    return underlayBlurEffects.getOrPut(step) {
+        val radius = UfiDialogAnim.BlurRadius.toFloat() * step / UfiDialogAnim.BackdropSteps
+        RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP).asComposeRenderEffect()
+    }
+}
 
 /**
  * 二级页转场相对「转场时长」滑块的放慢系数（2026-09-15）。
@@ -97,6 +154,9 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detail
     role: UfiNavRecedeRole,
 ): ExitTransition {
     role.recedingEntryId = initialState.id
+    // 普通二级页当下层：只压暗，不模糊。这一行是**复位**而不是冗余 —— 角色对象跨转场复用，
+    // 上一次若是给升起面板垫底（置过 true），不写回 false 就会让下一次普通转场继承模糊。
+    role.recedingBlur = false
     if (durationMillis <= 0) return ExitTransition.None
     return slideOutHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
         -it / SHARED_AXIS_X_PARALLAX
@@ -113,6 +173,8 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detail
     role: UfiNavRecedeRole,
 ): EnterTransition {
     role.recedingEntryId = targetState.id
+    // 与 [detailSharedAxisExit] 同理：普通二级页的下层不模糊，且必须显式复位。
+    role.recedingBlur = false
     if (durationMillis <= 0) return EnterTransition.None
     return slideInHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
         -it / SHARED_AXIS_X_PARALLAX
@@ -123,6 +185,221 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detail
 fun detailSharedAxisPopExit(durationMillis: Int): ExitTransition {
     if (durationMillis <= 0) return ExitTransition.None
     return slideOutHorizontally(animationSpec = sharedAxisSpec(durationMillis)) { it }
+}
+
+
+// === 升起面板：音乐播放页专用（2026-09-20）=====================================
+//
+// 为什么这一页要从共用的横向共享轴里摘出来：迷你控制条的封面到播放页封面是一条共享元素
+// （[UFI_SHARED_KEY_AUDIO_COVER]），它的行程几乎是纯竖直的"原地长大"。页面同时整屏横移，
+// 等于让同一块封面同时被两个方向拽 —— 观感就是两个动画在打架。改成"面板自迷你条上沿升起 /
+// 落回那条线"后（起点见 [riseStartOffset]），页面位移与共享元素同向，封面看起来是被它所在的
+// 面板一起带上来的。
+//
+// ★ 一次转场里两页各自登记的函数不是对称的，改这里前务必看清（navigation-compose 语义）：
+//   - 进场 / popExit 取**正在进来或正在被关掉**的那一页自己登记的函数；
+//   - exit / popEnter 取**对端**（留在下面那一页）登记的函数。
+//   所以 `risePanel*` 这四个只描述**播放页自己**的四种处境；而"面板升起时下层的音乐列表
+//   怎么动"落在列表页的 DETAIL 登记上，由 [riseUnderlayExit] / [riseUnderlayPopEnter]
+//   通过 [isUfiRiseRoute] 识别对端后接管。
+//
+// ★ 2026-09-20 二次修订：**升起语义只在有起点时才成立**。
+//   这套动画的起点是迷你控制条的上沿（[riseStartOffset]），前提是那条线此刻真的在屏上 ——
+//   也就是只有从挂着迷你条的页面（[isUfiMiniBarHostRoute]）进来才成立。从别处进播放页
+//   （Tab 页标题栏的「正在播放」挂件）时没有这个起点，面板会从屏幕外整整一屏下方飞上来；
+//   那条路径两端也没挂共享元素，连"跟着封面走"这条理由都不存在。所以那些来源退回
+//   [detailSharedAxisEnter] / [detailSharedAxisPopExit]（横向共享轴 + 圆角）。
+//   二选一在**登记处**按 `initialState` / `targetState` 挑函数（见 `MainNavGraph` 的 RISE 循环），
+//   不给播放页开第二条路由 —— 同一个页面只该有一条路由，否则返回栈与深链接都要各维护一份。
+//
+// 面板仍然套 [ufiSharedAxisLayer]（scrim 那部分要 —— 从播放页再往里进一层时它是下层），
+// 但**圆角裁剪要关掉**（登记处传 `clipCorners = false`）：36dp→0 的圆角是"卡片从旁边推进来"
+// 的语言，而这块面板贴着屏幕下沿升起、左右始终顶到屏幕边缘，加圆角会变成"一张圆角卡片
+// 浮在屏幕上"，与"贴底长出来的一整块"互相矛盾。DETAIL / HOST 那两套照旧带圆角。
+
+/**
+ * 面板升起 / 落回的曲线与时长。
+ *
+ * 时长复用 [ufiSharedAxisDurationMs]（同一个用户滑块、同一个放慢系数）不是省事：
+ * [ufiSharedAxisLayer] 内那条圆角进度动画用的是 `sharedAxisSpec`，位移一旦与它不同长，
+ * 圆角就会在面板还没落位时提前抹平、或落位后还挂着一圈。两条必须同起同落。
+ *
+ * 仍然独立成一个函数而不是直接调 `sharedAxisSpec`：两者语义不同（横向共享轴 / 竖向面板），
+ * 日后单独调其中一条时不该牵连另一条。
+ *
+ * 曲线取 [UfiMotion.Easing.Standard]，**没有**用 `EmphasizedIn/Out`：`sharedAxisSpec` 的
+ * 注释里记着 2026-09-15 那次回退 —— emphasized 系列会把七成行程压进前四分之一时间，
+ * 在**整屏尺度**的位移上观感是"猛地弹到位、最后几像素再慢慢爬"。面板行程是整屏高度，
+ * 与那次是同一类，没有理由再试一遍。
+ */
+private fun <T> riseSpec(durationMillis: Int) =
+    tween<T>(ufiSharedAxisDurationMs(durationMillis), easing = UfiMotion.Easing.Standard)
+
+/**
+ * 面板淡入淡出占总时长的比例。
+ *
+ * 为什么只给 0.4 而不是与位移同长：本文件「只平移、不改 alpha」那条约定的理由是半透明的
+ * 上层会把下层内容透出来（返回途中尤其明显）。面板这里仍要一点 alpha —— 纯位移的整屏面板
+ * 在起步几帧像"凭空贴上来的一块板"—— 但把它压在**贴近屏幕外**的那一段：升起时前 40% 就淡完，
+ * 落回时最后 40% 才开始淡，半透明只发生在面板大半已经在屏幕外的时候。
+ */
+private const val RISE_FADE_FRACTION = 0.4f
+
+/** 面板淡入淡出的实际时长；至少 1ms（`tween` 不接受 0）。 */
+private fun riseFadeMs(durationMillis: Int): Int =
+    (ufiSharedAxisDurationMs(durationMillis) * RISE_FADE_FRACTION).roundToInt().coerceAtLeast(1)
+
+/**
+ * 面板**作为下层**时的竖向视差分母：整屏高度的 1/12。
+ *
+ * 用在"从播放页再往里进一层"（例如播放页 → 某个设置页）的场景：那时候播放页变成下层，
+ * 深度感主要由 scrim 承担（见 [UfiNavRecedeRole]），位移只需要一点点、且必须**竖向** ——
+ * 横向位移会让人以为面板被推走 / 关掉了。比 `SHARED_AXIS_X_PARALLAX`（1/6）更小，
+ * 因为屏幕高度远大于宽度，同样的分母换成竖向会是明显大得多的位移。
+ */
+private const val RISE_UNDER_PARALLAX = 12
+
+/**
+ * 面板「贴着迷你条上沿」的竖向起点 / 终点偏移（像素）。
+ *
+ * `fullHeight` 是**转场容器的整屏高度**（`slideInVertically` 的入参）。直接用它意味着
+ * 面板的**顶边**从屏幕外下方整整一屏处起步 —— 观感是"一块板从屏幕外飞进来"。
+ * 减掉迷你条高度之后，起始位置正好落在迷你条的**上沿**（也就是那条 2dp 进度线所在的 y），
+ * 于是面板的顶边是从这条线往上展开的：用户点的那条线，就是页面长出来的地方。
+ * 同一个偏移也用在关闭方向，面板会收回到同一条线上，去/回是同一段行程。
+ *
+ * 迷你条高度为 0（没在播放、或不是从挂着迷你条的页面进来的）时结果就是 `fullHeight`，
+ * 即"自屏幕下沿升起"的原行为 —— 这是正确的兜底，不需要额外分支。
+ *
+ * `coerceAtLeast(0)`：只防迷你条高度因为某次异常测量大过屏高时算出负数
+ * （负偏移会让面板从屏幕**上方**掉下来，方向整个反掉）。
+ */
+private fun riseStartOffset(fullHeight: Int): Int =
+    (fullHeight - UfiMiniPlayerBarMetrics.heightPx).coerceAtLeast(0)
+
+/**
+ * 打开播放页：整屏面板自迷你条上沿升起（起点见 [riseStartOffset]）。上层，只平移 + 贴近屏外那段淡入。
+ *
+ * ⚠ 只在**来源是迷你条宿主页**（[isUfiMiniBarHostRoute]）时使用 —— 起点那条线得真的在屏上。
+ * 其他来源由登记处换成 [detailSharedAxisEnter]，理由见本节开头的"二次修订"。
+ */
+fun risePanelEnter(durationMillis: Int): EnterTransition {
+    if (durationMillis <= 0) return EnterTransition.None
+    return slideInVertically(animationSpec = riseSpec(durationMillis)) { riseStartOffset(it) } +
+        fadeIn(
+            animationSpec = tween(
+                durationMillis = riseFadeMs(durationMillis),
+                easing = UfiMotion.Easing.Standard,
+            )
+        )
+}
+
+/**
+ * 从播放页再往里进一层：面板退作下层。
+ *
+ * 只登记「谁是下层」+ 一点竖向视差，**不横移、不淡出**：面板横着滑走会被读成"面板关了"，
+ * 而淡出会把下一页还没铺满时的空隙透出来（本文件开头第 1 条）。深度交给 scrim。
+ *
+ * 赋值排在 `<= 0` 早退之前，保证关闭档也刷新角色（与 [detailSharedAxisExit] 同理）。
+ */
+fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.risePanelExit(
+    durationMillis: Int,
+    role: UfiNavRecedeRole,
+): ExitTransition {
+    role.recedingEntryId = initialState.id
+    // 面板退作下层时也吃模糊：它此刻的角色与"给面板垫底的列表页"完全一样 —— 被上层盖住的那层。
+    role.recedingBlur = true
+    if (durationMillis <= 0) return ExitTransition.None
+    return slideOutVertically(animationSpec = riseSpec(durationMillis)) { -it / RISE_UNDER_PARALLAX }
+}
+
+/**
+ * 从更深一层返回播放页：面板作为下层回到原位（[risePanelExit] 的逆过程，同一条视差）。
+ *
+ * 注意它**不是**"关掉播放页"那一步 —— 那一步走的是 [risePanelPopExit]。
+ */
+fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.risePanelPopEnter(
+    durationMillis: Int,
+    role: UfiNavRecedeRole,
+): EnterTransition {
+    role.recedingEntryId = targetState.id
+    role.recedingBlur = true
+    if (durationMillis <= 0) return EnterTransition.None
+    return slideInVertically(animationSpec = riseSpec(durationMillis)) { -it / RISE_UNDER_PARALLAX }
+}
+
+/**
+ * 关闭播放页：面板落回迷你条上沿（终点见 [riseStartOffset]）。淡出压在最后 [RISE_FADE_FRACTION] 段，理由见该常量。
+ *
+ * ⚠ 只在**去向是迷你条宿主页**（[isUfiMiniBarHostRoute]）时使用 —— 落点那条线得真的会回到屏上。
+ * 去向是别处（Tab 页等）时由登记处换成 [detailSharedAxisPopExit]：去与回必须是同一段行程的正反，
+ * 否则会出现"横着滑进来、竖着落下去"。
+ *
+ * ⚠ 已知退化：面板打开期间，下层那张挂着迷你条的列表页已经离开组合，
+ * [UfiMiniPlayerBarMetrics.heightPx] 因此是 0；下层重新组合并测量与本函数读值发生在
+ * 同一帧，谁先谁后取决于 `AnimatedContent` 的子节点测量顺序。读到 0 时本函数退化成
+ * "落回屏幕下沿"（也就是改动前的行为），不会出现错误几何。
+ */
+fun risePanelPopExit(durationMillis: Int): ExitTransition {
+    if (durationMillis <= 0) return ExitTransition.None
+    val total = ufiSharedAxisDurationMs(durationMillis)
+    val fade = riseFadeMs(durationMillis)
+    return slideOutVertically(animationSpec = riseSpec(durationMillis)) { riseStartOffset(it) } +
+        fadeOut(
+            animationSpec = tween(
+                durationMillis = fade,
+                delayMillis = (total - fade).coerceAtLeast(0),
+                easing = UfiMotion.Easing.Standard,
+            )
+        )
+}
+
+/**
+ * 面板升起时的**下层**：留在原位，吃 scrim + 逐渐模糊。
+ *
+ * 由下层自己那条 DETAIL 登记调用（对端是 RISE 时），不是播放页调用的。
+ * 下层不动是有意的：上层面板正在往上长，下层再横滑就成了两层往两个方向晃 ——
+ * 这正是本轮要修掉的观感；而"被面板逐渐盖住"本身已经是足够的层次反馈，
+ * 深度由 [ufiSharedAxisLayer] 的 scrim **与背景模糊**表达（所以这里仍要登记 [UfiNavRecedeRole]）。
+ *
+ * ★ 2026-09-20：这里把 [UfiNavRecedeRole.recedingBlur] 置 true，图层侧据此才会给这一页
+ *   上模糊。判据刻意与登记入口绑在一起 —— 只有"我正在给一个升起的面板当垫底"这一种
+ *   处境才会走到本函数（DETAIL 登记处的 `isUfiRiseRoute(对端)` 分支），
+ *   普通详情页当垫底走的是 [detailSharedAxisExit]，那条把标志复位成 false。
+ *
+ * ★ `targetAlpha = 1f` 的淡出是一条**零视觉效果**的动画，唯一作用是给退场页一个明确的
+ *   时长。别因为"看起来没用"把它删成 [ExitTransition.None]：AnimatedContent 只在所有
+ *   动画跑完后才回收退场内容，没有任何动画的那一侧会在第一帧就被回收掉 ——
+ *   面板升起时底下会露出 Scaffold 的空底色而不是那张列表。
+ */
+fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUnderlayExit(
+    durationMillis: Int,
+    role: UfiNavRecedeRole,
+): ExitTransition {
+    role.recedingEntryId = initialState.id
+    role.recedingBlur = true
+    if (durationMillis <= 0) return ExitTransition.None
+    return fadeOut(animationSpec = riseSpec(durationMillis), targetAlpha = 1f)
+}
+
+/**
+ * 面板落回时的**下层**：完全不动地露出来，模糊由峰值化开到 0。
+ *
+ * 同样由下层那条 DETAIL 登记在"对端是 RISE"时调用。这里可以放心用 [EnterTransition.None]：
+ * 要活到转场结束的是**上层**那张正在往下落的面板（[risePanelPopExit] 自带位移动画），
+ * 下层是进场页，本来就会一直留在屏上。
+ *
+ * ⚠ [EnterTransition.None] 只是说"本页自己不平移、不淡入"，**不影响**
+ *   [ufiSharedAxisLayer] 里那条 `transition.animateFloat` —— 它是挂在本页
+ *   `Transition<EnterExitState>` 上自己加的一条动画，照旧从 0 走到 1。
+ *   所以 scrim 与模糊都会随面板落回平滑化开，而不是瞬间消失。
+ */
+fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUnderlayPopEnter(
+    role: UfiNavRecedeRole,
+): EnterTransition {
+    role.recedingEntryId = targetState.id
+    role.recedingBlur = true
+    return EnterTransition.None
 }
 
 /**
@@ -151,16 +428,69 @@ fun detailSharedAxisPopExit(durationMillis: Int): ExitTransition {
  * 落位瞬间收成整屏矩形。圆角外的补集**不填任何颜色**，露出的就是下层页面。
  *
  * 进度挂在本目的地的 [AnimatedVisibilityScope.transition] 上，可被预测性返回 seek。
- * 只在 `drawWithContent` 里读 progress / [isReceding]，零重组、零离屏缓冲。
+ * 只在 `drawWithContent` 里读 progress / [isReceding]，零重组。
+ *
+ * 离屏缓冲同样是零 —— **除了** [blurUnderlay] 打开且这一次真的要给升起面板垫底那种情形：
+ * 模糊不可能不落地成一张离屏图层，那条例外的代价与闸门写在 [blurUnderlay] 的说明里。
  *
  * @param isReceding 本页是否是本次转场的下层（旧页）。判据见 [UfiNavRecedeRole]。
  * @param durationMillis 与位移同一时长；`<= 0` 时只留空 RenderNode 边界。
+ * @param clipCorners 这**一次**转场里，要不要给**上层**叠 [SHARED_AXIS_ENTER_CORNER_DP]→0 的
+ *                    圆角裁剪。返回 `false` 时整段 clipPath 分支被跳过（scrim 不受影响，那是下层的事）。
+ *                    圆角是"一张卡片从旁边推进来"的语言：它要让人看出上层是有边界的一块、
+ *                    盖在下层之上。而升起面板（[risePanelEnter]）是从屏幕下沿贴着长上来、
+ *                    左右两边始终贴屏幕边缘，给它加圆角会读成"一张圆角卡片浮在屏幕上"，
+ *                    与"贴底升起的整块面板"这个语义冲突 —— 所以只有走升起语义那一次才返回 false。
+ *
+ *   ## 为什么是 `() -> Boolean` 而不是 Boolean（2026-09-20 二次修订）
+ *   播放页**同一条路由**现在有两种转场语义：来源挂着迷你条时升起（不要圆角），从别处进来时
+ *   退回横向共享轴（要圆角，否则那条路径会变成"方角整屏硬切"）。而"来源是谁"只有**转场发生
+ *   的那一刻**才知道，本函数却是在**目的地登记处**调用的（一个目的地一份、组合期就定了）。
+ *   做成绘制期才问的 lambda，判定就能来自 [UfiNavRecedeRole]（由登记函数按来源写入），
+ *   与 [isReceding] / [underlayBlurActive] 同一套路：零重组，只失效绘制。
+
+ * @param blurUnderlay 本页**作为下层时**是否允许叠背景模糊（默认关，现有页面的转场一字不变）。
+ *
+ *   ## 为什么它只是"允许"，真正的判定还要看 [underlayBlurActive]
+ *   本形参是**登记期**的常量（每个目的地一个值），只承担与具体那一次转场无关的三道闸门：
+ *   用户的「过渡模糊」开关、设备能否扛住满屏模糊（`UfiPageSwitcherDefaults.isBlurSupported`）、
+ *   以及"这个目的地压根不参与"。它同时决定**要不要分配那张离屏图层** ——
+ *   所以必须是编译期就定下来的 Boolean，不能是 lambda。
+ *
+ *   而"这一次转场的下层该不该模糊"是**运行期**才知道的：同一张音乐列表页既可能给升起的
+ *   播放面板垫底（要模糊），也可能给普通详情页垫底（不模糊）。那一层判定走
+ *   [underlayBlurActive]。
+ *
+ *   ## 为什么不用 `Modifier.blur()`
+ *   它收 `Dp` 且是**组合期**参数：半径要跟着进度走就得每帧重组一次本函数的调用点，
+ *   而调用点是 NavHost 的目的地 content lambda —— 那是整页重组，比模糊本身贵得多。
+ *   改成录一层 [rememberGraphicsLayer] 再给它设 `renderEffect`：半径只在**绘制期**变，
+ *   零重组（与本文件"只在 drawWithContent 里读 progress"的既有约定一致）。
+ *
+ *   ## 与 2026-09-13 那次"禁止离屏合成"的关系（这条别误读成推翻）
+ *   当时删掉的是 `CompositingStrategy.Offscreen` + `graphicsLayer{非矩形 shape}`：
+ *   前者给**每一次**二级页转场的下层都开整屏纹理，后者因为圆角半径逐帧变化导致
+ *   **缓冲逐帧重分配**，且被父级 slide 平移时合成到错误偏移。这里三条都不成立：
+ *   (a) 只有升起面板这一种转场、且要额外通过用户开关与机型闸门；
+ *   (b) 图层尺寸全程不变，只换 `renderEffect`，不重分配；
+ *   (c) `record` 是在当前 DrawScope 的坐标里录制、`drawLayer` 原地画回，
+ *       与 `UfiPageSwitcherHost` 那张快照层同一套用法，不存在偏移问题。
+ *   模糊在本质上必须有一张离屏缓冲 —— 这是"下层像弹窗背景那样糊掉"的最小代价，
+ *   所以代价被限制在一种转场里，而不是放回到所有转场上。
+ * @param underlayBlurActive 这**一次**转场的下层该不该模糊，只在 [blurUnderlay] 为真时被问。
+ *   判据的唯一来源是 [UfiNavRecedeRole.recedingBlur]（由登记函数按方向写入），
+ *   与 [isReceding] 一样做成 lambda 是为了**在绘制期**读、不建立快照依赖 ⇒ 零重组。
+ *   默认 `{ true }`：只翻 [blurUnderlay] 的调用方会立刻看到效果，
+ *   而不是掉进"开关开了却什么都没发生"的坑。
  */
 @OptIn(ExperimentalAnimationApi::class)
 @Composable
 fun AnimatedVisibilityScope.ufiSharedAxisLayer(
     isReceding: () -> Boolean,
     durationMillis: Int,
+    clipCorners: () -> Boolean = { true },
+    blurUnderlay: Boolean = false,
+    underlayBlurActive: () -> Boolean = { true },
 ): Modifier {
     if (durationMillis <= 0) return Modifier
 
@@ -169,14 +499,43 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
         label = "ufiSharedAxisProgress",
     ) { state -> if (state == EnterExitState.Visible) 1f else 0f }
 
+    // 图层只分配给"可能用到模糊"的目的地（DETAIL / RISE 两条登记，且用户开关与机型闸门都放行）。
+    // 一个空的 GraphicsLayer 只是一个未录制的 RenderNode，不占离屏缓冲；真正的开销在
+    // record + renderEffect，那两步只在下面判定通过的那些帧才执行。
+    // 条件分支里的 remember 在这里是安全的：[blurUnderlay] 是登记期常量，
+    // 同一个调用点的取值不会在重组之间翻转（用户改开关会让整个 MainNavGraph 重建这条链）。
+    val blurLayer = if (blurUnderlay) rememberGraphicsLayer() else null
+
     val scrimColor: Color = LocalResolvedPalette.current.scrim
     return Modifier.drawWithContent {
         val p = progress.value.coerceIn(0f, 1f)
         val receding = isReceding()
 
         if (receding) {
-            // 下层：只画内容 + 压暗 scrim，零变换、零裁剪。
-            drawContent()
+            // 下层：内容（可能带模糊）+ 压暗 scrim，零变换、零裁剪。
+            //
+            // ★ 层次顺序是有意的：模糊只包住 `drawContent()`，scrim 画在**模糊之后**。
+            //   反过来（先画 scrim 再一起模糊）会把那层压暗也糊开，观感是"脏了一层"
+            //   而不是"背景糊了"，而且 scrim 的边界会随半径溢出到屏幕外。
+            //
+            // 进度用的就是 scrim 那一条 `p`（不另开 animateFloat，否则两条进度会错步）：
+            // 下层的 `1f - p` 语义是"被盖住的程度" —— 面板升起时 0→1、落回时 1→0，
+            // 所以模糊与压暗天然同起同落，落位（p == 1）时两者都精确归零。
+            val blurStep = if (blurLayer != null && underlayBlurActive()) {
+                underlayBlurStep(1f - p)
+            } else {
+                0
+            }
+            val effect = underlayBlurEffect(blurStep)
+            if (blurLayer != null && effect != null) {
+                blurLayer.renderEffect = effect
+                blurLayer.record { this@drawWithContent.drawContent() }
+                drawLayer(blurLayer)
+            } else {
+                // 第 0 档（静止、或这一次转场不该模糊）走这里：**一行都不碰图层** ——
+                // 不录制、不合成，树上不留任何常驻的模糊节点，开销与改动前完全一致。
+                drawContent()
+            }
             val alpha = (1f - p) * sharedAxisScrimAlpha()
             if (alpha > 0f) drawRect(color = scrimColor.copy(alpha = alpha))
             return@drawWithContent
@@ -192,9 +551,14 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
         // `p` 在两个方向上的语义都是"落位程度"（1 = 严丝合缝铺满、0 = 完全离屏），
         // 所以同一条公式对进场与离场都成立：只要没落位就有圆角。
         // 峰值保持到 75%（原 60%）再抹平，圆角在整段位移里都看得见。
+        //
+        // clipCorners() == false（这一次走升起语义）时整段跳过：那一页要的是"贴着屏幕下沿
+        // 长上来的一整块"，圆角会把它读成浮在屏上的卡片。**但同一条路由退化成横向共享轴的
+        // 那一次（来源没有迷你条）必须照常带圆角** —— 所以这里是绘制期问一次，不是登记期常量。
+        // 理由详见形参注释。
         val cornerT = ((p - 0.75f) / 0.25f).coerceIn(0f, 1f)
         val cornerDp = lerp(SHARED_AXIS_ENTER_CORNER_DP, 0f, cornerT)
-        if (cornerDp > 0.5f) {
+        if (cornerDp > 0.5f && clipCorners()) {
             val r = cornerDp * density
             val path = Path().apply {
                 addRoundRect(RoundRect(0f, 0f, size.width, size.height, CornerRadius(r, r)))
@@ -381,6 +745,48 @@ fun ufiNavTransitionDurationMs(rawMs: Int, systemReduceMotion: Boolean): Int = w
 class UfiNavRecedeRole {
     /** 本次转场里扮演「下层」的那个 `NavBackStackEntry.id`；尚无转场时为 `null`。 */
     var recedingEntryId: String? = null
+
+    /**
+     * 本次转场的下层要不要**背景模糊**（2026-09-20）。
+     *
+     * 为什么这条判定必须活在角色对象里、而不是图层的形参里：图层是在**目的地登记处**
+     * 构造的（一个目的地一份），而"下层是在给升起面板垫底、还是在给普通详情页垫底"
+     * 只有**转场发生的那一刻**才知道 —— 那正是登记函数被调用的时刻，
+     * 而登记函数手上已经有这个 role 对象了（它本来就靠这条通道传"谁是下层"）。
+     *
+     * 写入点与 [recedingEntryId] 严格一一对应，两者永远同时赋值：
+     * - [riseUnderlayExit] / [riseUnderlayPopEnter]（给升起面板垫底）⇒ `true`；
+     * - [risePanelExit] / [risePanelPopEnter]（面板自己退作下层）⇒ `true`；
+     * - [detailSharedAxisExit] / [detailSharedAxisPopEnter]（普通二级页）⇒ `false`。
+     *
+     * 最后那条是**必须写的复位**：角色对象跨转场复用，漏写会让下一次普通转场继承上一次的
+     * `true`，于是"只有升起面板才模糊"这条约束会在第二次转场时静默失效。
+     *
+     * 与 [recedingEntryId] 同理用普通 `var`：只在 `drawWithContent` 里被读，零重组。
+     */
+    var recedingBlur: Boolean = false
+
+    /**
+     * 本次转场里，**播放页作为上层**时走的是不是「升起语义」（2026-09-20 二次修订）。
+     *
+     * 只有一个消费者：[ufiSharedAxisLayer] 的 `clipCorners` —— 升起语义要方角（贴底长出来的
+     * 一整块），退化成横向共享轴时要照常带圆角（从旁边推进来的卡片）。
+     *
+     * 为什么这条也得走角色对象、而不是图层的形参：判据是「来源/去向是不是迷你条宿主页」
+     * （[isUfiMiniBarHostRoute]），只有**转场发生的那一刻**才知道；而图层是在**目的地登记处**
+     * 构造的（一个目的地一份、组合期就定了）。与 [recedingBlur] 是同一个时序问题、同一个解法。
+     *
+     * ★ 与 [recedingBlur] 不同，它描述的是**上层**，所以写入点也不同：只有 RISE 那条登记的
+     *   `enterTransition` / `popExitTransition`（播放页自己当上层的两个方向）会写它，
+     *   而那两个方向必然在播放页被当作上层绘制之前刚刚跑过，所以不需要任何复位 ——
+     *   其他页面的登记函数一律不碰这个字段（它们的 `clipCorners` 用默认的恒 true）。
+     *
+     * 默认 `false`（= 带圆角的普通语义）：万一哪天有条路径绕过了那两个写入点，
+     * 退化结果是"和其他二级页一样"，而不是"莫名其妙的方角整屏"。
+     *
+     * 与 [recedingEntryId] 同理用普通 `var`：只在 `drawWithContent` 里被读，零重组。
+     */
+    var upperIsRisePanel: Boolean = false
 }
 
 

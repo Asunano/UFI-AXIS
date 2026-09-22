@@ -87,6 +87,8 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
     val logFilesState by viewModel.tools.coreLogFilesState.collectAsState()
 
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
+    var showClearRealtimeConfirm by remember { mutableStateOf(false) }
+    var showDeleteAllFilesConfirm by remember { mutableStateOf(false) }
 
     // ── 筛选态（纯展示，留在 UI；rememberSaveable 只存可入 Bundle 的基本类型）──
     var sourceIndex by rememberSaveable { mutableIntStateOf(0) }
@@ -375,15 +377,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                                 label = if (source == LogSource.APP) "清空实时日志（内存）" else "清空实时日志（core 缓冲）",
                                 icon = Icons.Default.Delete,
                                 isDestructive = true,
-                                onClick = {
-                                    if (source == LogSource.APP) {
-                                        AppLogBuffer.clear()
-                                        tick++
-                                        toastMessage = ToastMessage("已清空 APP 日志", ToastType.SUCCESS)
-                                    } else {
-                                        viewModel.tools.clearDebugLogs()
-                                    }
-                                }
+                                onClick = { showClearRealtimeConfirm = true }
                             )
                         )
                     }
@@ -577,7 +571,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                 )
             }
         ) {
-            UfiDialogBody {
+        UfiDialogBody {
                 UfiTextField(
                     value = query,
                     onValueChange = { query = it },
@@ -603,6 +597,27 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
 
         UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
+
+        // ── 二次确认弹窗：清空实时日志 ──
+        if (showClearRealtimeConfirm) {
+            UfiConfirmDialog(
+                title = "清空实时日志",
+                text = if (source == LogSource.APP) "将清空内存中的 APP 日志缓冲，此操作不可恢复。" else "将清空 core 侧日志缓冲，此操作不可恢复。",
+                confirmText = "清空",
+                destructive = true,
+                onDismiss = { showClearRealtimeConfirm = false },
+                onConfirm = {
+                    showClearRealtimeConfirm = false
+                    if (source == LogSource.APP) {
+                        AppLogBuffer.clear()
+                        tick++
+                        toastMessage = ToastMessage("已清空 APP 日志", ToastType.SUCCESS)
+                    } else {
+                        viewModel.tools.clearDebugLogs()
+                    }
+                }
+            )
+        }
     }
 
     // 落盘日志文件浏览：列表 → 点开看尾部正文。
@@ -619,6 +634,32 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
     val fileTotalBytes = if (isAppSide) appLogTotalBytes else logFilesState.totalBytes
     val fileDir = if (isAppSide) AppFileLogger.dirPath() else logFilesState.dir
     val filesLoading = if (isAppSide) false else logFilesState.isLoading
+
+    // ── 二次确认：全部删除日志文件 ──
+    if (showDeleteAllFilesConfirm) {
+        UfiConfirmDialog(
+            title = "删除全部日志文件",
+            text = "将删除 ${if (isAppSide) "手机端" else "设备端"} 全部 ${fileRows.size} 个日志文件（${FormatUtils.formatBytes(fileTotalBytes)}），此操作不可恢复。",
+            confirmText = "全部删除",
+            destructive = true,
+            onDismiss = { showDeleteAllFilesConfirm = false },
+            onConfirm = {
+                showDeleteAllFilesConfirm = false
+                if (isAppSide) {
+                    scope.launch {
+                        val freed = withContext(Dispatchers.IO) { AppFileLogger.deleteAll() }
+                        appFilesReloadTick++
+                        toastMessage = ToastMessage(
+                            "已删除手机日志文件，释放 ${FormatUtils.formatBytes(freed)}",
+                            ToastType.SUCCESS
+                        )
+                    }
+                } else {
+                    viewModel.tools.deleteCoreLogFiles()
+                }
+            }
+        )
+    }
 
     UfiCustomDialog(
         visible = logFilesDialogVisible,
@@ -647,20 +688,7 @@ fun DebugLogScreen(viewModel: MainViewModel, navController: NavHostController) {
                 UfiButton(
                     variant = UfiButtonVariant.Secondary,
                     text = "全部删除",
-                    onClick = {
-                        if (isAppSide) {
-                            scope.launch {
-                                val freed = withContext(Dispatchers.IO) { AppFileLogger.deleteAll() }
-                                appFilesReloadTick++
-                                toastMessage = ToastMessage(
-                                    "已删除手机日志文件，释放 ${FormatUtils.formatBytes(freed)}",
-                                    ToastType.SUCCESS
-                                )
-                            }
-                        } else {
-                            viewModel.tools.deleteCoreLogFiles()
-                        }
-                    }
+                    onClick = { showDeleteAllFilesConfirm = true }
                 )
             }
         } else null

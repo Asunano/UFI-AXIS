@@ -225,6 +225,8 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
     if (showNewDialog) {
         NewDownloadDialog(
             config = state.config,
+            // 目录选择器的取数：公共件在 :app:ui 不能碰 viewmodel，能力从这里注入。
+            browse = viewModel.downloads::browseDirs,
             onDismiss = { showNewDialog = false },
             onConfirm = { url, fileName, savePath, speedLimit, connections ->
                 viewModel.downloads.createDownload(url, fileName, savePath, speedLimit, connections)

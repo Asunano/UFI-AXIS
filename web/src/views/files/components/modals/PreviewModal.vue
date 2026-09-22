@@ -34,20 +34,17 @@
         </div>
       </div>
 
-      <!-- ── 视频：只用原生 controls（进度 / 音量 / 全屏 / 播放齐全），底部不再叠重复按钮 ── -->
+      <!-- ── 视频：统一走 VideoPlayer（格式分档 / customType / 字幕 / 错误兜底都在它里面）──
+           此前是裸 `<video controls>`：解不了的容器只会显示一个黑框。
+           不再在下面叠一行文件名 —— 弹窗标题已经有了，播放时重复一遍只是挤压播放区。 -->
       <div v-else-if="kind === 'video'" class="preview-stage video-stage">
-        <video
-          ref="videoEl"
-          class="preview-video"
-          controls
-          playsinline
-          preload="metadata"
-          :src="url"
-          @error="onMediaError"
+        <VideoPlayer
+          :url="url"
+          :name="file?.name || ''"
+          :path="file?.path || ''"
+          can-download
+          @download="downloadCurrent"
         />
-        <div class="video-meta">
-          <span>{{ file?.name }}</span>
-        </div>
       </div>
 
       <!-- ── 音频：Apple Music 式「左封面/信息/控制 + 右歌词」 ──
@@ -235,19 +232,12 @@
  * 图标一律用 inline SVG，全站禁止 emoji。
  */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue';
+import VideoPlayer from '@/components/VideoPlayer.vue';
 import { useMessage } from 'naive-ui';
 import { useAppStore } from '@/stores/app';
 import { authHeaders, previewKindOf, type FileEntry, type PreviewKind } from '../../filesShared';
-import {
-  LYRIC_TIME_UNSYNCED,
-  decodeTextBytes,
-  extractAudioArtwork,
-  extractAudioLyrics,
-  extractAudioTags,
-  flacArtworkRequiredBytes,
-  id3TagBodySize,
-  parseLyrics,
-} from '../../id3Lyrics';
+import { LYRIC_TIME_UNSYNCED } from '../../id3Lyrics';
+import { probeAudioMeta } from '../../audioMetaProbe';
 
 const props = defineProps<{
   show: boolean;
@@ -255,6 +245,21 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{ (e: 'update:show', v: boolean): void }>();
+
+/**
+ * 「下载此文件」——VideoPlayer 在 C 档（浏览器解不了的容器）里给出的出路。
+ *
+ * 直接用手里的票据 URL + `<a download>`：票据地址挂在 `/api` 之外的免鉴权区，
+ * 裸 GET 就能取（而 `/api/files/download` 要签名头，`<a>` 带不上）。
+ * 这样不用新增 emit、也不用把下载逻辑透传回 FilesView。
+ */
+function downloadCurrent() {
+  if (!url.value || !props.file) return;
+  const a = document.createElement('a');
+  a.href = url.value;
+  a.download = props.file.name;
+  a.click();
+}
 
 const message = useMessage();
 const appStore = useAppStore();
@@ -603,10 +608,8 @@ async function requestStreamUrl(path: string): Promise<string> {
 /**
  * 音频元数据 + 封面 + 歌词。
  *
- * 三条链路的回退顺序（与 app 端 `FilePreviewOverlay` 对齐）：
- * - 标题/艺人/专辑：内嵌标签（ID3 或 FLAC VORBIS_COMMENT，按魔数分流）→ 文件名兜底（UI 层）
- * - 封面：内嵌图（ID3 APIC / FLAC PICTURE）→ 同目录 sidecar 图 → 占位符
- * - 歌词：同目录 `.lrc` → 内嵌（ID3 USLT/SYLT 或 FLAC LYRICS）→「暂无歌词」
+ * 取字节与回退顺序都在 `../../audioMetaProbe`（音乐页复用同一份，见那里的说明），
+ * 这里只负责把结果写进本组件的 state 并处理"过期结果丢弃"。
  */
 async function loadAudioMetaAndLyrics(path: string, fileSize?: number) {
   audioLoadPath = path;
@@ -617,11 +620,22 @@ async function loadAudioMetaAndLyrics(path: string, fileSize?: number) {
   id3Album.value = '';
   if (coverUrl.value) URL.revokeObjectURL(coverUrl.value);
   coverUrl.value = '';
-  await loadAudioId3(path, fileSize);
-  // 内嵌封面没有才去同目录找：大量 FLAC / 整轨都是外挂封面
-  await trySidecarCover(path);
-  if (await trySiblingLrc(path)) return;
-  await tryEmbeddedLyrics(path, fileSize);
+  await probeAudioMeta(path, fileSize, {
+    isStale: () => audioLoadStale(path),
+    hasCover: () => !!coverUrl.value,
+    onTags: (tags) => {
+      if (tags.title) id3Title.value = tags.title;
+      if (tags.artist) id3Artist.value = tags.artist;
+      if (tags.album) id3Album.value = tags.album;
+    },
+    // 探测器只负责生成 objectURL，释放在 release() / 下一次加载开头
+    onCover: (u) => {
+      coverUrl.value = u;
+    },
+    onLyrics: (lines) => {
+      lyrics.value = lines;
+    },
+  });
 }
 
 /** 当前这条音频元数据加载链对应的文件路径，用于识别过期结果（见 [audioLoadStale]）。 */
@@ -636,183 +650,6 @@ let audioLoadPath = '';
  */
 function audioLoadStale(path: string): boolean {
   return !props.show || kind.value !== 'audio' || audioLoadPath !== path;
-}
-
-/** 头部探测长度：文本标签几乎总在这段里，够小以免每首歌都白拉几百 KB。 */
-const HEAD_PROBE_BYTES = 64 * 1024;
-
-/**
- * 为拿完整封面而追加读取的**硬上限**。
- *
- * 注意这不是「猜要读多少」——需要读多少由 `flacArtworkRequiredBytes`（FLAC）或
- * `10 + tagSize`（ID3）**精确算出**。这个常量只用来否决"大到不值得为预览拉"的情况
- * （无损专辑的内嵌封面能到好几 MB）。超过就干脆不取，交给 sidecar 图或占位符 ——
- * **取一半比不取更糟**：截断的 JPEG 会渲染成上半张图 + 下半露底色。
- */
-const COVER_FETCH_HARD_LIMIT_BYTES = 4 * 1024 * 1024;
-
-/**
- * 补取内嵌歌词时的读取上限。
- *
- * 歌词是文本，即便截断也只是少几行、不会产生"半张图"那种视觉错觉，
- * 所以这里保留固定上限即可。
- */
-const LYRICS_PROBE_MAX_BYTES = 1024 * 1024;
-
-async function trySiblingLrc(path: string): Promise<boolean> {
-  if (!path.includes('.')) return false;
-  const lrcPath = path.replace(/\.[^.]+$/, '') + '.lrc';
-  if (lrcPath === path) return false;
-  const uri = `/api/files/stream?path=${encodeURIComponent(lrcPath)}`;
-  try {
-    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { headers: await authHeaders(uri) });
-    if (!res.ok) return false;
-    // 取字节而非 res.text()：后者按 Content-Type 的 charset（octet-stream → UTF-8）硬解，
-    // GBK 编码的 .lrc 会整篇变乱码。与 app 端 decodeTextBytes 同一口径。
-    const text = decodeTextBytes(new Uint8Array(await res.arrayBuffer()));
-    if (audioLoadStale(path)) return false;
-    const parsed = parseLyrics(text);
-    if (parsed.length) {
-      lyrics.value = parsed;
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-async function fetchRange(path: string, start: number, end: number): Promise<Uint8Array | null> {
-  const uri = `/api/files/stream?path=${encodeURIComponent(path)}`;
-  try {
-    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, {
-      headers: { ...(await authHeaders(uri)), Range: `bytes=${start}-${end}` },
-    });
-    if (!res.ok && res.status !== 206) return null;
-    return new Uint8Array(await res.arrayBuffer());
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 读音频元数据（标题/艺人/专辑 + 内嵌封面）。
- *
- * 2026-09-14：
- * - 去掉 `.mp3`/`.flac` 扩展名白名单 —— 容器由**魔数**判（`extractAudioTags` 内部分流
- *   ID3 / FLAC），扩展名白名单只会让 `.m4a`/`.ogg` 这类连尝试的机会都没有；
- * - 补取上限对 FLAC 也生效：FLAC 的 PICTURE block 不在 ID3 tag 里，`id3TagBodySize` 恒为 null，
- *   原来那条补取分支对 FLAC 完全不触发 ⇒ 大封面永远读不到。
- */
-async function loadAudioId3(path: string, fileSize?: number): Promise<void> {
-  const head = await fetchRange(path, 0, HEAD_PROBE_BYTES - 1);
-  if (!head || audioLoadStale(path)) return;
-  applyId3(head);
-
-  if (coverUrl.value) return;
-  // 还没拿到封面：按容器算出"到底还需要读多少字节"，而不是猜一个上限。
-  // 猜小了会拿到**被截断的图片数据** —— 浏览器对半截 JPEG 会只渲染上半部分、下半留空，
-  // 空白处露出 .cover-box 的 var(--surface-hover) 底色，看起来就是
-  // 「封面下半被一层随深浅模式变色的遮罩挡住」（2026-09-14 修复的正是这个）。
-  // - FLAC：PICTURE block 头里有精确的数据长度，直接算出绝对终点；
-  // - ID3：APIC 在 tag 内，读满 `10 + tagSize` 就一定完整。
-  const flacNeed = flacArtworkRequiredBytes(head);
-  const tagSize = id3TagBodySize(head);
-  const wanted = flacNeed ?? (tagSize != null ? 10 + tagSize : null);
-  if (wanted == null || wanted <= head.length) return;
-  if (wanted > COVER_FETCH_HARD_LIMIT_BYTES) {
-    // 封面大到不值得为预览拉下来（多为无损专辑的超大内嵌图）。
-    // 不取胜过取一半 —— 交给 sidecar 图或占位符。
-    return;
-  }
-  const end = Math.min(wanted - 1, (fileSize ?? wanted) - 1);
-  if (end < head.length) return;
-  const more = await fetchRange(path, 0, end);
-  if (more && props.show && kind.value === 'audio') applyId3(more);
-}
-
-function applyId3(bytes: Uint8Array) {
-  // 统一入口按魔数分流 ID3 / FLAC —— 与 app 端 ExoPlayer 一视同仁给出 MediaMetadata 对齐
-  const tags = extractAudioTags(bytes);
-  if (tags.title) id3Title.value = tags.title;
-  if (tags.artist) id3Artist.value = tags.artist;
-  if (tags.album) id3Album.value = tags.album;
-
-  if (!coverUrl.value) {
-    const art = extractAudioArtwork(bytes);
-    if (art && art.data.length > 0) {
-      const blob = new Blob([art.data], { type: art.mime });
-      coverUrl.value = URL.createObjectURL(blob);
-    }
-  }
-}
-
-/**
- * 同目录 sidecar 封面探测（2026-09-14 新增，双端同口径）。
- *
- * 无内嵌封面的文件（大量 FLAC、外挂封面的整轨）在同目录会躺着一张图。
- * 候选顺序照常见播放器：同名图优先（`歌名.jpg`），再看整张专辑共用的 `cover`/`folder`/`front`。
- *
- * 实现上先用 `Range: bytes=0-0` 花 1 个字节探存在、命中后才整取 —— 盲目整取会在
- * 每次打开一首没封面的歌时白拉 5 次几百 KB。
- */
-async function trySidecarCover(path: string): Promise<void> {
-  if (coverUrl.value) return;
-  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-  const dir = slash >= 0 ? path.slice(0, slash) : '';
-  const base = path.replace(/\.[^.\\/]+$/, '');
-  const candidates: string[] = [];
-  for (const ext of ['jpg', 'jpeg', 'png', 'webp']) candidates.push(`${base}.${ext}`);
-  for (const name of ['cover.jpg', 'cover.png', 'folder.jpg', 'front.jpg']) {
-    candidates.push(dir ? `${dir}/${name}` : name);
-  }
-  for (const candidate of candidates) {
-    if (audioLoadStale(path) || coverUrl.value) return;
-    const probe = await fetchRange(candidate, 0, 0);
-    if (!probe || probe.length === 0) continue;
-    const uri = `/api/files/stream?path=${encodeURIComponent(candidate)}`;
-    try {
-      const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { headers: await authHeaders(uri) });
-      if (!res.ok) continue;
-      const blob = await res.blob();
-      if (audioLoadStale(path) || coverUrl.value) return;
-      coverUrl.value = URL.createObjectURL(blob);
-      return;
-    } catch {
-      // 单个候选失败就试下一个：这条链路是"锦上添花"，任何失败都不该冒泡成预览失败
-    }
-  }
-}
-
-async function tryEmbeddedLyrics(path: string, fileSize?: number): Promise<boolean> {
-  // 容器由魔数判（extractAudioLyrics 内部分流 ID3 USLT/SYLT 与 FLAC LYRICS），不再看扩展名
-  const head = await fetchRange(path, 0, HEAD_PROBE_BYTES - 1);
-  if (!head) return false;
-  if (!props.show || kind.value !== 'audio') return false;
-  applyId3(head);
-
-  const fromHead = extractAudioLyrics(head);
-  if (fromHead) {
-    const parsed = parseLyrics(fromHead);
-    if (parsed.length) {
-      lyrics.value = parsed;
-      return true;
-    }
-  }
-
-  // 头部没有：ID3 有显式 tag 长度可用，FLAC 没有（VORBIS_COMMENT 是独立 block）→ 用固定上限兜
-  const tagSize = id3TagBodySize(head);
-  const wanted = tagSize != null ? tagSize : LYRICS_PROBE_MAX_BYTES;
-  if (wanted <= HEAD_PROBE_BYTES) return false;
-  const end = Math.min(wanted - 1, (fileSize ?? wanted) - 1, LYRICS_PROBE_MAX_BYTES - 1);
-  const full = await fetchRange(path, 0, end);
-  if (!full || audioLoadStale(path)) return false;
-  const fromFull = extractAudioLyrics(full);
-  if (!fromFull) return false;
-  const parsed = parseLyrics(fromFull);
-  if (!parsed.length) return false;
-  lyrics.value = parsed;
-  return true;
 }
 
 // ── 播放控制 ──

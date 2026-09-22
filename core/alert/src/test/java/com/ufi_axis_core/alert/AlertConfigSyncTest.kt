@@ -145,19 +145,19 @@ class AlertConfigSyncTest {
         // 先让当前配置带上"别端设置过"的非默认值
         val base = engine.getConfig().copy(
             perType = mapOf("temperature" to false),
-            minIntervalSec = 60
+            temperatureWarning = 60.0
         )
         // 只传 {enabled, configVersion}（旧语义下会把上面几个字段全部重置为默认值）
         val merged = AlertEngine.mergeConfigPatch(base, patch("""{"enabled":false,"configVersion":1}"""))
 
         assertFalse(merged.enabled)                                  // 显式字段生效
         assertEquals(mapOf("temperature" to false), merged.perType)   // 未传字段保持原值
-        assertEquals(60, merged.minIntervalSec)
+        assertEquals(60.0, merged.temperatureWarning, 0.001)
     }
 
     @Test
     fun `mergeConfigPatch treats explicit null and empty body as not provided`() = runTest {
-        val base = engine.getConfig().copy(perType = mapOf("battery" to false), minIntervalSec = 90)
+        val base = engine.getConfig().copy(perType = mapOf("battery" to false), temperatureWarning = 90.0)
 
         val withNull = AlertEngine.mergeConfigPatch(base, patch("""{"perType":null,"enabled":false}"""))
         assertEquals(mapOf("battery" to false), withNull.perType)   // JSON null 不当成"清空"

@@ -161,6 +161,123 @@ enum class SettingKey {
      * 这份"补零"规则属于设备侧，不该让调用方拼。
      */
     FLOW_CALIBRATION,
+    // ───────── 以下为计划书阶段 0 批 1 补齐的动作类/设置类写命令 ─────────
+    // 这些项此前散在 GoformDeviceClient / GoformNetworkClient / GoformWifiClient 里硬编码，
+    // 命令名与参数键逐字搬进 profile（调用点改走 writer 是下一批的事）。
+
+    /**
+     * 重启设备。无参数。
+     *
+     * 动作类：重发一次就是再重启一次，所以 retry 必须是 [RetryPolicy.NEVER]。
+     */
+    REBOOT,
+
+    /**
+     * 关机。无参数。
+     *
+     * 比 [REBOOT] 更不可重试 —— 关机成功后设备已经不可达，这时候的"会话失效"是正常现象，
+     * 重登重试只会在日志里留一串误导人的失败。
+     */
+    SHUTDOWN,
+
+    /**
+     * 恢复出厂设置。无参数。
+     *
+     * 破坏性动作，且执行后设备的后台口令会回到出厂值 —— 重试的前提（同一会话同一口令）不成立。
+     */
+    FACTORY_RESET,
+
+    /**
+     * 后台管理口令修改。params: `old_hash` + `new_hash`，两个都是**已经哈希过**的值。
+
+     *
+     * 为什么 profile 不做哈希：设备要的是 `SHA256` 大写十六进制，而这套算法与登录握手
+     * 共用 `GoformClient.sha256Hex` —— 在 profile 里复制第二份实现就有了两个真源，
+     * 哪天登录侧换算法这里不会报错、只会静默登不上。顺带一个好处是明文口令根本不进
+     * device-schema，少一处泄露面。encode 只做字段名映射（`old_hash` → `oldPassword`）。
+     *
+     * **副作用 WriteSpec 表达不了**：改成功后调用点必须紧接着
+     * `updateGoformPassword()` + `resetLogin()`，否则下一次请求还拿旧口令登录（见计划书 §11.3）。
+     */
+    BACKEND_PASSWORD,
+
+    /**
+     * 连接模式（自动拨号 / 手动拨号）。value: String（设备侧原值 `auto_dial` / `manual_dial`）。
+     *
+     * 注意它与 [ROAM] **共用同一条设备命令** `SET_CONNECTION_MODE` —— 那不是抄错，
+     * 是设备侧把"漫游开关"塞进了连接模式这条命令里（见 ZteGoformProfile 中 ROAM 的注释）。
+     * 两者的参数集不同，所以必须是两个 key，不能合并。
+     */
+    CONNECTION_MODE,
+
+    /**
+     * WiFi 发射功率档位。value: Int。
+     *
+     * 值域 0~2 不是这里发明的：`WifiRoutes.kt` 的入参校验（`level must be 0-2`）
+     * 早就是这个判据，搬进 profile 是为了让"档位上限"这件设备事实只有一份。
+     */
+    WIFI_POWER,
+
+    /**
+     * WiFi 总开关。value: Boolean。
+     *
+     * 设备侧把「开 WiFi」和「关 WiFi」做成了**两条不同的命令**，两边的参数还都是固定常量：
+     * - 开：`switchWiFiChip` + `ChipEnum=chip1` + `GuestEnable=0`
+     * - 关：`switchWiFiModule` + `SwitchOption=0`
+     *
+     * 所以它不是通用的「切芯片 / 关模块」能力，而就是「开关 WiFi」一个动作
+     * —— 唯一的调用形态是 `GoformWifiClient.setWifiEnabled(enabled)` 的两个分支。
+     * 命令选择在 [WriteSpec.commandOf] 里，参数集在 [WriteSpec.encode] 里按取值给。
+     *
+     * **实测边界**（批 1 的提示在这里更新过一次）：真机只验过上面这两种组合。
+     * `switchWiFiModule` 在本项目里**只用于「关」**，它的 `SwitchOption=1`（开）从未发过、
+     * 没有实测依据；同样地 `switchWiFiChip` 也从未用来关过 WiFi。要改动这两个分支的
+     * 命令/参数，先在真机上验一次，不要按「对称性」推测另一半。
+     *
+     * 将来真要支持「多芯片机型选芯片」这种数量型能力时，按计划书 §11.12 用 `limits` 表达，
+     * 不要把 `chip` 参数塞回这个 key —— 那会让「开关 WiFi」重新变成半个通用命令。
+     */
+    WIFI_ENABLED,
+
+    /**
+     * 移动数据开关。value: Boolean。
+     *
+     * 设备侧的两条事实都由 [WriteSpec] 承担，调用点只传一个布尔：
+     * 1. 开/关是**两条不同的命令**（开 `CONNECT_NETWORK`、关 `DISCONNECT_NETWORK`），
+     *    由 [WriteSpec.commandOf] 按取值选；
+     * 2. 主命令失败时还要发一条老命令 `SET_DATA_ENABLED`（`data=1/0`）兜底，
+     *    由 [WriteSpec.fallback] 表达（计划书 §11.3：「主失败换备用命令」属于设备事实）。
+     *
+     * 与 [PPP_DIAL] 的区别**只有第 2 条**。两者不能合并，理由写在 [PPP_DIAL]。
+     */
+    MOBILE_DATA,
+
+    /**
+     * 手动拨号 / 挂断。value: Boolean（true = 拨号，false = 挂断）。
+     *
+     * 对应 `GoformNetworkClient.connectNetwork()` / `disconnectNetwork()` 两个独立入口
+     * （route 侧是 `POST /api/network/connect` 与 `/disconnect`）。命令名与 [MOBILE_DATA]
+     * 的主命令完全相同（`CONNECT_NETWORK` / `DISCONNECT_NETWORK`），参数也一样。
+     *
+     * **它与 [MOBILE_DATA] 的区别只在于没有兜底命令，不要合并**：现有这两个方法失败就是失败，
+     * 不会再发 `SET_DATA_ENABLED`。合并等于给这两个入口偷偷加上一条它们从来没发过的命令
+     * —— 用户点「连接」失败后，设备的数据开关会被额外改一次。那是行为变更，不是重构。
+     */
+    PPP_DIAL,
+}
+
+/**
+ * 会话失效时能不能重发这条命令。
+ *
+ * 为什么不叫 `idempotent: Boolean`：「幂等」是数学性质，这里真正要表达的是
+ * 「会话失效重登后能不能把同一条命令再发一次」；而且将来要加「重试几次/退避多久」时有地方放。
+ */
+enum class RetryPolicy {
+    /** 会话失效时重登并重试一次。只给「同一取值幂等」的设置类命令。 */
+    RETRY_ON_SESSION_LOSS,
+
+    /** 永不重试。动作类 / 计费类 / 有副作用的命令（重发一次可能发两条短信、扣两次费）。 */
+    NEVER,
 }
 
 /**
@@ -175,9 +292,38 @@ enum class SettingKey {
  * @param validate 值域校验：返回错误描述则拒绝下发（route 回 `OUT_OF_RANGE` 等），
  *   返回 null 表示通过。**在这里挡住非法值，既是正确性也是安全性**——
  *   设备侧的表单拼接对特殊字符没有防护。
+ *   返回的文案**不许包含参数值**（口令 / PIN / APN 凭据都会走这里并被写进日志），只说违反了哪条规则。
+ * @param retry 会话失效时是否重发。默认取安全侧（[RetryPolicy.NEVER]）是因为**漏标的代价不对称**：
+ *   默认重试时漏标 → 重复发短信 / 重复计费，用户看不见也撤不回；默认不重试时漏标 → 少一次
+ *   自动重试，用户再点一次即可。所以设置类命令必须**显式**标 [RetryPolicy.RETRY_ON_SESSION_LOSS]
+ *   （漏标就会复发「切换网络制式第一次必定失败」那个 bug，见 `GoformSettingWriter` 的注释）。
+ * @param fallback 主命令返回 `Failed` 时再试一次的备用命令；默认 null = 没有备用命令。
+ *   存在的理由：个别动作在设备侧就是"先试新命令、不认再发老命令"（老固件不认新 goformId），
+ *   这属于设备事实，不该在客户端留一个 if。
+ *   **fallback 的 [retry] 独立判定，不继承主命令的** —— 主命令可重试不代表备用命令也可重试
+ *   （两条命令的副作用可以完全不同）。
+ * @param commandOf **按取值选命令名**；默认 null = 该项只有一个命令名（[command]）。
+ *
+ *   为什么需要它：个别设备把「同一个用户动作的开 / 关」做成了**两条不同的命令** ——
+ *   ZTE 的移动数据开 = `CONNECT_NETWORK`、关 = `DISCONNECT_NETWORK`；
+ *   WiFi 开 = `switchWiFiChip`、关 = `switchWiFiModule`。不给这个字段，调用点就得写
+ *   `if (enabled) keyA else keyB`：那段设备知识就漏在 profile 外面（换设备时会静默发错命令），
+ *   而且 [SettingKey] 会为此长出一整个 `*_OFF` 系列（`MOBILE_DATA_OFF` / `WIFI_OFF`…），
+ *   对外的「一个动作」在内部裂成两个 key。
+ *
+ *   优先级：`commandOf` 非空时**覆盖** [command]。[command] 仍然必填，作为默认命令名
+ *   与日志 / 断言用的标识（所以它**不改成可空** —— 一个 spec 永远能说出自己叫什么）。
+ *
+ *   硬限制：只许「按取值选 command」。**禁止**在里面做 I/O、读全局状态、做多步编排、
+ *   产生任何副作用。它和 [encode] 一样必须是**纯函数**：同一份 params 进去，永远得到
+ *   同一个命令名。需要「先读回再决定」或「成功后还要做点别的」的，那不是 commandOf
+ *   能表达的东西，留在调用点（计划书 §11.3）。
  */
 data class WriteSpec(
     val command: String,
     val encode: (Map<String, Any?>) -> Map<String, String>,
     val validate: (Map<String, Any?>) -> String? = { null },
+    val retry: RetryPolicy = RetryPolicy.NEVER,
+    val fallback: WriteSpec? = null,
+    val commandOf: ((Map<String, Any?>) -> String)? = null,
 )

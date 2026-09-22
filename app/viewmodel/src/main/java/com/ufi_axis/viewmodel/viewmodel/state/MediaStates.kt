@@ -1,10 +1,15 @@
 package com.ufi_axis.viewmodel.state
 
+import com.ufi_axis.data.model.MEDIA_GROUP_ALBUM
+import com.ufi_axis.data.model.MEDIA_GROUP_ARTIST
+import com.ufi_axis.data.model.MEDIA_GROUP_FOLDER
 import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.data.model.MEDIA_TYPE_IMAGE
 import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import com.ufi_axis.data.model.MediaFolderEntry
+import com.ufi_axis.data.model.MediaGroupEntry
 import com.ufi_axis.data.model.MediaLibraryItem
+import com.ufi_axis.data.model.PlaylistEntry
 
 /** 媒体列表的排序字段与方向（与 core `/api/media/list` 的 `sort` / `order` 取值一致）。 */
 const val MEDIA_SORT_DATE = "date"
@@ -64,8 +69,85 @@ data class MediaTabState(
 }
 
 /**
- * 文件夹视图的状态（媒体库那一栏；`GET /api/media/browse` 的镜像）。
+ * 音频分组（专辑 / 歌手 / 文件夹）的列表状态。
  *
+ * 与 [MediaTabState] 分开：分组是一次性全量聚合（core 侧算好），没有分页，
+ * 塞进 MediaTabState 会让那边的 offset/isAppending 出现"用不到但必须维护"的字段。
+ *
+ * @param groups 分组条目。其中 [MediaGroupEntry.key] 为空串的那一组（无标签文件的兜底组）
+ *   只能展示不能点进去 —— 空 key 回查 `/api/media/list` 会被当成没传参数，结果是整库。
+ */
+data class MediaGroupState(
+    val by: String = MEDIA_GROUP_ALBUM,
+    val groups: List<MediaGroupEntry> = emptyList(),
+    val isLoading: Boolean = false,
+    val loadedOnce: Boolean = false,
+    val errorMessage: String? = null
+)
+
+/**
+ * 音频分组维度及其中文名，顺序即界面上切换控件的顺序。
+ *
+ * 文案与合法取值都收在这一处：页面不各写一份，取数层判定 `by` 合法性也用这份，
+ * 免得两边各有一套"支持哪几种分组"。
+ */
+val MEDIA_GROUP_KINDS: List<Pair<String, String>> = listOf(
+    MEDIA_GROUP_ALBUM to "专辑",
+    MEDIA_GROUP_ARTIST to "歌手",
+    MEDIA_GROUP_FOLDER to "文件夹"
+)
+
+/**
+ * `MediaLibraryState.audioGroupItems` 的键：把分组维度和组内 key 拼在一起。
+ *
+ * 拼成一个 String 而不是嵌套两层 Map：状态更新时只需要一次 `+`，也不用为"这个维度还没有
+ * 任何组被打开过"准备空壳。取值只写不读回（没有反向解析），所以分隔符不需要转义。
+ */
+fun mediaGroupItemsKey(by: String, key: String): String = "$by:$key"
+
+/**
+ * 音频歌单列表的状态（`GET /api/playlists` 的镜像）。
+ *
+ * 歌单本体存在 core，两端看同一份 —— 所以这里是纯镜像，没有本地增删改的中间态。
+ * 不分页：歌单数有上限（core 侧 100），一次拉完。
+ *
+ * @param message 一次性提示（"已加入 12 首"/"有 3 首不在媒体库"），由页面消费后清空。
+ */
+data class MediaPlaylistState(
+    val playlists: List<PlaylistEntry> = emptyList(),
+    val isLoading: Boolean = false,
+    val loadedOnce: Boolean = false,
+    val errorMessage: String? = null,
+    val message: String? = null
+)
+
+/**
+ * 一个歌单的曲目（`GET /api/playlists/{id}/items` 的镜像）。
+ *
+ * 不复用 [MediaTabState]（分组详情页那样）：歌单曲目**不分页**（core 一次给全量，顺序是用户
+ * 排定的），把它塞进那个类会多出 total/isAppending/hasMore 这些"必须维护但永远用不到"的字段，
+ * 而真正需要的 [missingCount] 又没有位置。
+ *
+ * @param items 顺序即播放顺序。已失效的条目照样在里面（`missing = true`），不要过滤掉。
+ * @param missingCount 已失效条目数，用来在页头提示"3 首已失效"。
+ */
+data class MediaPlaylistDetailState(
+    val id: String = "",
+    val name: String = "",
+    val items: List<MediaLibraryItem> = emptyList(),
+    val missingCount: Int = 0,
+    val isLoading: Boolean = false,
+    val loadedOnce: Boolean = false,
+    val errorMessage: String? = null
+) {
+    val isEmpty: Boolean get() = items.isEmpty()
+
+    /** 可播放的曲目（把已失效的排掉）——装播放队列时只能用这一份。 */
+    val playable: List<MediaLibraryItem> get() = items.filterNot { it.missing }
+}
+
+/**
+ * 文件夹视图的状态（媒体库那一栏；`GET /api/media/browse` 的镜像）。
  * 与 [MediaTabState] **并存**而不是合并：平铺列表与文件夹视图是两份互不相同的数据
  * （一个分页、一个按层），合进去会出现"进文件夹之后平铺列表被冲掉、退出来又要重拉"。
  *
@@ -102,20 +184,49 @@ data class MediaLibraryState(
     },
     /** 文件夹视图（按类型各一份，目前只有视频页用）。 */
     val browse: Map<String, MediaBrowseState> = emptyMap(),
+    /**
+     * 音频分组列表，**每个维度各存一份**（key 是 [MEDIA_GROUP_ALBUM] 等）。
+     *
+     * 切换维度只改界面上"当前选的是哪个"，不清除另外两份已加载的结果 —— 在专辑/歌手之间
+     * 来回切是很常见的操作，每切一次重拉一遍网络没有道理（与 [tabs] 同一条理由）。
+     */
+    val audioGroups: Map<String, MediaGroupState> = emptyMap(),
+    /**
+     * 「某一组里的曲目」列表，键由 [mediaGroupItemsKey] 拼出。
+     *
+     * 直接复用 [MediaTabState]：组内曲目走的就是 `/api/media/list`（带 album/artist/dir 过滤），
+     * 同样要分页、同样要区分首屏与追加，再造一个几乎一样的类只会多一处要同步维护的地方。
+     * 其中 `scanDirs` / `isRescanning` / `gridView` 这些字段在这里用不上（分组详情页不改配置），
+     * 保持默认值即可。
+     *
+     * 离开分组详情页时由 `clearGroupItems` 移除对应那一份：专辑动辄上百个，
+     * 逛一圈下来全留在内存里没有意义。
+     */
+    val audioGroupItems: Map<String, MediaTabState> = emptyMap(),
+    /** 歌单列表（`/api/playlists`）。音乐页的第四个视图。 */
+    val playlists: MediaPlaylistState = MediaPlaylistState(),
+    /**
+     * 歌单曲目，按歌单 id 各存一份。
+     *
+     * 与 [audioGroupItems] 同一策略：离开详情页时由 `clearPlaylistItems` 移除对应那一份，
+     * 逛一圈下来全留在内存里没有意义。
+     */
+    val playlistItems: Map<String, MediaPlaylistDetailState> = emptyMap(),
     val allFilesAccess: Boolean = false,
     val statusLoaded: Boolean = false,
-    /**
-     * FFmpeg 可选组件状态（`GET /api/components` 里 id=ffmpeg 那一条）。
-     *
-     * 放在媒体状态里而不是隧道状态里：FFmpeg 只服务视频封面抽帧，
-     * 安装入口也只在媒体设置页，和内网穿透那两个组件没有任何关系。
-     * null = 还没拉到（或 core 版本过旧没有这个组件）。
-     */
-    val ffmpegComponent: ComponentInfo? = null,
-    /** FFmpeg 组件的安装任务进度（core 侧同一时刻只允许一个组件任务） */
-    val ffmpegTask: ComponentTask = ComponentTask(),
     val errorMessage: String? = null
 ) {
     fun tab(type: String): MediaTabState = tabs[type] ?: MediaTabState(type = type)
     fun folderView(type: String): MediaBrowseState = browse[type] ?: MediaBrowseState()
+
+    /** 某个分组维度的列表；没拉过时回一个带正确 [MediaGroupState.by] 的空态。 */
+    fun group(by: String): MediaGroupState = audioGroups[by] ?: MediaGroupState(by = by)
+
+    /** 某一组里的曲目；没打开过时回空态（type 恒为音频 —— 分组只对音频有效）。 */
+    fun groupItems(by: String, key: String): MediaTabState =
+        audioGroupItems[mediaGroupItemsKey(by, key)] ?: MediaTabState(type = MEDIA_TYPE_AUDIO)
+
+    /** 某个歌单的曲目；没打开过时回一个带正确 id 的空态。 */
+    fun playlistDetail(id: String): MediaPlaylistDetailState =
+        playlistItems[id] ?: MediaPlaylistDetailState(id = id)
 }

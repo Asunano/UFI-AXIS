@@ -341,13 +341,8 @@ class GoformWifiClient(
         return client.isGoformSuccess(client.goformPost(params))
     }
 
-    suspend fun setWifiPower(level: Int): Boolean {
-
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_WIFI_POWER",
-            "wifiPowerLevel" to level.toString()
-        )))
-    }
+    /** @param level 发射功率档位（值域 0~2 的判据在 profile 的 validate 里，与 WifiRoutes 同一份事实）。 */
+    suspend fun setWifiPower(level: Int): Boolean = writer.write(SettingKey.WIFI_POWER, level)
 
     suspend fun setWifiSSID(ssid: String): Boolean {
 
@@ -368,19 +363,15 @@ class GoformWifiClient(
         return client.isGoformSuccess(client.goformPost(params))
     }
 
-    suspend fun setWifiEnabled(enabled: Boolean): Boolean {
-        return if (enabled) {
-            client.isGoformSuccess(client.goformPost(mapOf(
-                "isTest" to "false", "goformId" to "switchWiFiChip",
-                "ChipEnum" to "chip1", "GuestEnable" to "0"
-            )))
-        } else {
-            client.isGoformSuccess(client.goformPost(mapOf(
-                "isTest" to "false", "goformId" to "switchWiFiModule",
-                "SwitchOption" to "0"
-            )))
-        }
-    }
+    /**
+     * WiFi 总开关。
+     *
+     * 设备侧开/关是**两条不同的命令**（开 `switchWiFiChip` + `ChipEnum=chip1&GuestEnable=0`，
+     * 关 `switchWiFiModule` + `SwitchOption=0`），命令选择与参数集都在
+     * [SettingKey.WIFI_ENABLED] 的 WriteSpec 里 —— 这里不再留 if。
+     */
+    suspend fun setWifiEnabled(enabled: Boolean): Boolean =
+        writer.write(SettingKey.WIFI_ENABLED, enabled)
 
     suspend fun setWifiPassword(password: String): Boolean {
         val current = getCurrentWifiConfig()

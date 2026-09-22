@@ -10,6 +10,9 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,6 +50,20 @@ import kotlinx.serialization.json.contentOrNull
 fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
 
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.network.refreshWifi()
         viewModel.network.loadWifiAcl()
@@ -54,13 +71,13 @@ fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostControll
 
     // 设备上下线是随时发生的，只在进页面拉一次会让列表一直停在进来那一刻的快照
     // （之前必须退出重进才刷新）。5s 轮询，与 TunnelScreen / CfTunnelScreen 同一套做法；
-    // 离开页面时 LaunchedEffect 随组合销毁自动取消，不会在后台一直打设备。
-    // 名单不跟着轮询：它只会被本 App 改，每次写完 core 都回读并覆盖，没必要 5s 一次。
+    // 2026-09-21：加 lifecycleResumed 门控——后台不继续打设备。
     //
     // 2026-09-05：`force = true` 是必须的 —— `refreshWifi` 默认带 10s 新鲜度闸门
     // （为了消掉首页横滑落定后那次无谓重拉），不绕过它这条 5s 轮询会被节流成 10s，
     // 等于降级本页「设备上下线随时可见」的产品要求。
-    LaunchedEffect(Unit) {
+    LaunchedEffect(lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         while (true) {
             delay(5_000)
             viewModel.network.refreshWifi(force = true)

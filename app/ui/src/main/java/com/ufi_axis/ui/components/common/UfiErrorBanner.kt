@@ -197,6 +197,69 @@ fun UfiOfflineBanner(
 }
 
 /**
+ * 全局连接态横幅（2026-09-21）。
+ *
+ * 与 [UfiOfflineBanner] 的区别，以及为什么不复用它：后者的文案写死成「后端服务未连接」、
+ * 副文案只能传「最后更新时间」、也没有动作按钮。而现在需要表达**三种不同病因**
+ * （手机没联网 / 没配设备地址 / 连着网但摸不到设备）并各自给出下一步动作，
+ * 把这些塞进旧签名只会让它变成一个什么都能是的万能横幅。
+ *
+ * 本组件是**行内**的（不是 Popup）：它表达的是"整个 app 现在都用不了"这种持续状态，
+ * 必须常驻占位、不能被内容盖住，也不该像错误 toast 那样自动消失。
+ *
+ * @param title      一句话病因；为 null 时整个横幅不渲染
+ * @param detail     下一步动作的指引；为 null 时只显示标题
+ * @param actionLabel 动作按钮文案；为 null 时不显示按钮
+ * @param onAction   动作按钮回调
+ */
+@Composable
+fun UfiConnectivityBanner(
+    title: String?,
+    detail: String? = null,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null,
+    modifier: Modifier = Modifier
+) {
+    if (title == null) return
+    val palette = LocalResolvedPalette.current
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        shape = UfiCardDefaults.shape,
+        colors = CardDefaults.cardColors(containerColor = palette.error.copy(alpha = 0.10f)),
+        border = BorderStroke(1.dp, palette.error.copy(alpha = 0.28f))
+    ) {
+        Row(
+            Modifier.padding(Spacing.InnerPadding),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Default.Warning,
+                contentDescription = null,
+                tint = palette.error,
+                modifier = Modifier.size(Spacing.IconSizeMedium)
+            )
+            Spacer(Modifier.width(Spacing.Medium))
+            Column(Modifier.weight(1f)) {
+                Text(title, style = UfiTextStyles.bodyEmphasis, color = palette.error)
+                if (detail != null) {
+                    Text(
+                        detail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.textSecondary
+                    )
+                }
+            }
+            if (actionLabel != null && onAction != null) {
+                Spacer(Modifier.width(Spacing.Small))
+                TextButton(onClick = onAction) {
+                    Text(actionLabel, color = palette.error)
+                }
+            }
+        }
+    }
+}
+
+/**
  * 实时连接状态横幅（UID-006）。
  *
  * 入参为 [String?] 而非 `ConnectionState` 枚举，确保 `app/ui` 不依赖 `app/data`，

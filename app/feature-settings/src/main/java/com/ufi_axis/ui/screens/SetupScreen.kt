@@ -29,8 +29,11 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Dns
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Router
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -91,6 +94,17 @@ import com.ufi_axis.ui.theme.UfiMotion
  *   - DISCOVER 阶段进度指示+文字改为 Row(Icon + Text) 水平排列 + 小间距
  *   - 路由器呼吸脉冲：周期 1200ms → 900ms，scale 0.92-1.08 → 0.88-1.12，幅度更明显
  *   - 标题淡入 800ms → 600ms 加快节奏；外圈光环 alpha 上限 0.18 → 0.24
+ *
+ * 2026-09-21（配对段接入公共向导 [UfiWizard]）：
+ *   本屏现在是**两套布局**：
+ *     - 落地（DISCOVER / CANDIDATES / MANUAL）：原样保留 —— 大图标居中 + 单卡片 + 整页滚动；
+ *     - 配对（CONFIRM 且已拿到 /pairing/info）：换成 [UfiWizard] 整页骨架，
+ *       首次配对 3 步「设置密码 → GoForm → 确认」，登录已配置设备 2 步「输入密码 → 确认」。
+ *   为什么不是在卡片里换内容：向导自带固定底部操作栏，必须吃满屏高；
+ *   塞进落地布局那条 `verticalScroll` 里高度约束是无限，底栏会被推到屏幕外。
+ *   替换掉的旧物：手搓的 `confirmStep` 两步子向导 + 一行「第 1 步 / 共 2 步 · …」文字提示、
+ *   以及那个「下一步」按钮里的轻校验（校验口径现在由每步的 `validate` 承担，拦下会说明原因）。
+ *   新增确认页：密码与 GoForm 都是这台设备之后长期生效的配置，提交前给一次核对机会。
  */
 
 /** 后端默认监听端口（来自 AppSettings.DEFAULT_PORT / HttpServer 默认 8088），用于网关探测与手动兜底。 */
@@ -431,6 +445,284 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         // （`windowInsetsPadding` 会消费掉 inset，故不会与任何外层重复叠加）。
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { padding ->
+        // App 品牌标记（2026-08-11 v3：静态呈现，移除所有缩放/呼吸/光环/淡入动画）
+        // 用户反馈"标题顶部的图标不要动来动去"——保持克制安静，依赖纯视觉权重传达品牌
+        // 2026-09-07：改为直接渲染「应用自己的启动图标」，不再用手抄的矢量副本 + tint。
+        // 旧写法（ic_app_logo.xml 副本 + Icon(tint = accent) + 12% 强调色圆底）有两个问题：
+        //   ① Icon 会把矢量按 alpha 整体重染成单色，图标自带配色全部丢失；
+        //   ② 再叠一层低不透明度强调色圆底，观感就是「灰底 + 单色线条」，不是真正的应用图标。
+        // 为什么走 PackageManager 而不是 painterResource：本屏在 :app:feature-settings（library）
+        // 模块里，依赖方向是 :app → :app:feature-settings，反向拿不到 :app 的 @mipmap/ic_launcher。
+        // getApplicationIcon() 取的正是 manifest android:icon 指向的那份 adaptive-icon
+        // （背景层 + 前景层都在），所以换图标时这里自动跟随，不需要再维护任何副本。
+        //
+        // 2026-09-21：位图提到 Scaffold 内容的最外层 —— 落地布局（大图标居中）与配对向导布局
+        // （品牌行收成一行）两套都要用它，`remember(iconSizePx)` 因此只解码一次。
+        val iconSizePx = with(LocalDensity.current) { 120.dp.roundToPx() }
+        val appIconBitmap = remember(iconSizePx) {
+            val drawable = context.packageManager.getApplicationIcon(context.applicationInfo)
+            val bitmap = Bitmap.createBitmap(iconSizePx, iconSizePx, Bitmap.Config.ARGB_8888)
+            drawable.setBounds(0, 0, iconSizePx, iconSizePx)
+            drawable.draw(Canvas(bitmap))
+            bitmap.asImageBitmap()
+        }
+
+        /** 回到设备选择：CONFIRM 的第 1 步没有"上一步"可去，左键让给这个动作（见 UfiWizard.onExit）。 */
+        fun backToDeviceChoice() {
+            phase = if (candidates.isNotEmpty()) SetupPhase.CANDIDATES else SetupPhase.MANUAL
+            selected = null
+            pairingInfo = null
+        }
+
+        // ── 两套布局 ──────────────────────────────────────────────────────────
+        // 落地（发现 / 选择 / 手动输入）：保持原样 —— 大图标居中 + 单卡片 + 整页滚动。
+        // 配对（设置密码 / GoForm / 确认）：换成公共向导 [UfiWizard]，它是 fillMaxSize 的整页骨架
+        //   （步骤条固定在上、操作栏固定在下、只有面板滚动），**塞不进上面那条 verticalScroll**
+        //   —— 滚动容器给的是无限高度约束，固定底栏会被推到屏幕外。所以这里是两套布局而不是
+        //   在卡片里换内容。
+        //
+        // 为什么配对阶段值得换：原来这一段是手搓的两步子向导（`confirmStep` + 一行
+        // 「第 1 步 / 共 2 步 · 设置配对密码」文字），没有步骤条、不能跳步、也没有确认页；
+        // 而"设备密码"和"GoForm 后台"是这台设备之后长期生效的两组配置，值得在提交前核对一遍。
+        val wizardInfo = pairingInfo
+        if (phase == SetupPhase.CONFIRM && wizardInfo != null) {
+            val needsGoformSetupNow = wizardInfo.hasDefaultPassword
+            val deviceLabel = wizardInfo.deviceName.ifBlank { wizardInfo.deviceId }
+            val deviceAddress = selected?.let { "${it.host}:${it.port}" }.orEmpty()
+
+            /** 密码步能否离开。留空（默认态）= 使用 admin，是合法选择，所以不报错。 */
+            fun passwordError(): String? = if (needsGoformSetupNow) {
+                when {
+                    password.isBlank() && confirmPassword.isBlank() -> null
+                    password.length !in 4..64 -> "密码长度需为 4-64 位"
+                    password != confirmPassword -> "两次输入的密码不一致"
+                    else -> null
+                }
+            } else {
+                if (password.isBlank()) "请输入配对密码" else null
+            }
+
+            /** GoForm 步能否离开。地址留空 = 跳过，后端不会覆盖已有值，所以也不报错。 */
+            fun goformError(): String? {
+                val parts = goformAddress.split(":")
+                val ip = parts.getOrNull(0)?.trim().orEmpty()
+                val port = parts.getOrNull(1)?.trim()?.toIntOrNull()
+                if (ip.isBlank()) return null
+                return if (!isValidIpv4(ip) || port == null || port !in 1..65535) {
+                    "格式应为 IP:端口，例如 192.168.0.1:8080"
+                } else {
+                    null
+                }
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .windowInsetsPadding(WindowInsets.safeDrawing)
+            ) {
+                // 品牌行：图标 + 应用名 + 「正在配对的设备」。设备名放在这里常驻，
+                // 就不必在每一步的面板里各贴一遍"你正在配哪台设备"。
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Spacing.CardHorizontalMargin, vertical = Spacing.Large),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
+                ) {
+                    Image(
+                        bitmap = appIconBitmap,
+                        contentDescription = null,
+                        modifier = Modifier
+                            .size(Spacing.WizardHeaderIcon)
+                            .clip(CircleShape)
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (needsGoformSetupNow) "配对新设备" else "登录设备",
+                            style = UfiTextStyles.panelTitleStrong,
+                            color = palette.textPrimary
+                        )
+                        Text(
+                            text = listOf(deviceLabel, deviceAddress)
+                                .filter { it.isNotBlank() }
+                                .joinToString(" · "),
+                            style = UfiTextStyles.note,
+                            color = palette.textSecondary
+                        )
+                    }
+                }
+
+                UfiWizard(
+                    modifier = Modifier.weight(1f),
+                    steps = buildList {
+                        if (needsGoformSetupNow) {
+                            add(
+                                UfiWizardStep(
+                                    label = "设置密码",
+                                    heading = "给这台设备设一个配对密码",
+                                    description = "以后在别的手机上登录同一台设备要用它。留空则使用默认密码 admin。",
+                                    validate = ::passwordError
+                                ) {
+                                    var passwordFormatError by remember { mutableStateOf<String?>(null) }
+                                    var confirmPasswordFormatError by remember { mutableStateOf<String?>(null) }
+                                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                        UfiPasswordField(
+                                            value = password,
+                                            onValueChange = { input ->
+                                                if (input.all { it.code in 33..126 }) {
+                                                    password = input.take(64)
+                                                    passwordFormatError = null
+                                                } else {
+                                                    passwordFormatError = "密码仅限英文、数字和符号"
+                                                }
+                                            },
+                                            label = "新密码（4-64 位，留空用 admin）",
+                                            isError = passwordFormatError != null,
+                                            errorMessage = passwordFormatError,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        UfiPasswordField(
+                                            value = confirmPassword,
+                                            onValueChange = { input ->
+                                                if (input.all { it.code in 33..126 }) {
+                                                    confirmPassword = input.take(64)
+                                                    confirmPasswordFormatError = null
+                                                } else {
+                                                    confirmPasswordFormatError = "密码仅限英文、数字和符号"
+                                                }
+                                            },
+                                            label = "确认新密码",
+                                            isError = confirmPasswordFormatError != null ||
+                                                (confirmPassword.isNotEmpty() && confirmPassword != password),
+                                            errorMessage = confirmPasswordFormatError
+                                                ?: if (confirmPassword.isNotEmpty() && confirmPassword != password) {
+                                                    "两次输入的密码不一致"
+                                                } else {
+                                                    null
+                                                },
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
+                                }
+                            )
+                            add(
+                                UfiWizardStep(
+                                    label = "GoForm",
+                                    heading = "要不要接设备原厂后台",
+                                    description = "填了就能读到更详细的网络/信号数据（GoForm 是设备自带的后台接口）。" +
+                                        "已按常见配置预填，直接下一步即可；地址留空则跳过，不改动设备上的现有设置。",
+                                    validate = ::goformError
+                                ) {
+                                    val error = goformError()
+                                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                        UfiTextField(
+                                            value = goformAddress,
+                                            onValueChange = { goformAddress = it; goformAddressError = null },
+                                            label = "GoForm 地址 (IP:端口)",
+                                            placeholder = "192.168.0.1:8080",
+                                            isError = error != null,
+                                            errorMessage = error,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                        UfiPasswordField(
+                                            value = goformPassword,
+                                            onValueChange = { goformPassword = it; goformPasswordError = null },
+                                            label = "GoForm 密码（留空则沿用设备现有密码）",
+                                            isError = goformPasswordError != null,
+                                            errorMessage = goformPasswordError,
+                                            modifier = Modifier.fillMaxWidth()
+                                        )
+                                    }
+                                }
+                            )
+                        } else {
+                            add(
+                                UfiWizardStep(
+                                    label = "输入密码",
+                                    heading = "输入这台设备的配对密码",
+                                    description = "这台设备已经配置过了，输入密码即可登录；密码与 GoForm 设置都保持设备上的现值。",
+                                    validate = ::passwordError
+                                ) {
+                                    var normalPasswordFormatError by remember { mutableStateOf<String?>(null) }
+                                    UfiPasswordField(
+                                        value = password,
+                                        onValueChange = { input ->
+                                            if (input.all { it.code in 33..126 }) {
+                                                password = input.take(64)
+                                                normalPasswordFormatError = null
+                                            } else {
+                                                normalPasswordFormatError = "密码仅限英文、数字和符号"
+                                            }
+                                        },
+                                        label = "配对密码",
+                                        isError = normalPasswordFormatError != null,
+                                        errorMessage = normalPasswordFormatError,
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+                            )
+                        }
+                        add(
+                            UfiWizardStep(
+                                label = "确认",
+                                heading = if (needsGoformSetupNow) "核对一遍再配对" else "核对一遍再登录",
+                                description = "需要改动时点「上一步」，或直接点上方步骤条跳到任意一步。"
+                            ) {
+                                Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                    UfiWizardReviewCard(
+                                        title = "设备",
+                                        icon = Icons.Filled.Router,
+                                        rows = listOf(
+                                            UfiWizardReviewRow("设备名", deviceLabel.ifBlank { "未知" }),
+                                            UfiWizardReviewRow("地址", deviceAddress.ifBlank { "未知" })
+                                        )
+                                    )
+                                    UfiWizardReviewCard(
+                                        title = "配对密码",
+                                        icon = Icons.Filled.Lock,
+                                        rows = listOf(
+                                            UfiWizardReviewRow(
+                                                "密码",
+                                                when {
+                                                    password.isNotBlank() -> "已设置（${password.length} 位）"
+                                                    needsGoformSetupNow -> "使用默认密码 admin"
+                                                    else -> "未输入"
+                                                }
+                                            )
+                                        )
+                                    )
+                                    if (needsGoformSetupNow) {
+                                        UfiWizardReviewCard(
+                                            title = "GoForm 后台",
+                                            icon = Icons.Filled.Dns,
+                                            rows = listOf(
+                                                UfiWizardReviewRow(
+                                                    "地址",
+                                                    goformAddress.ifBlank { "不配置" }
+                                                ),
+                                                UfiWizardReviewRow(
+                                                    "密码",
+                                                    if (goformPassword.isBlank()) "沿用设备现值" else "已设置"
+                                                )
+                                            )
+                                        )
+                                    }
+                                }
+                            }
+                        )
+                    },
+                    currentStep = confirmStep,
+                    onStepChange = { confirmStep = it },
+                    onFinish = { doPair() },
+                    finishText = if (needsGoformSetupNow) "完成配对" else "登录",
+                    finishLoading = busy,
+                    exitText = "选别的设备",
+                    onExit = { backToDeviceChoice() },
+                    onStepBlocked = { toastMessage = ToastMessage(it, ToastType.WARNING) }
+                )
+            }
+        } else {
         Column(
             modifier = Modifier.fillMaxWidth()
                 // `padding` 现在四边恒为 0，保留它是 Scaffold 契约的一部分
@@ -447,27 +739,6 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         ) {
             Spacer(Modifier.height(Spacing.XLarge))
 
-            // App 品牌标记（2026-08-11 v3：静态呈现，移除所有缩放/呼吸/光环/淡入动画）
-            // 用户反馈"标题顶部的图标不要动来动去"——保持克制安静，依赖纯视觉权重传达品牌
-            // 2026-09-06：从 Icons.Default.CellTower 换成 App 自己的图标（launcher 前景层同一份几何，
-            // 见 res/drawable/ic_app_logo.xml）。尺寸取 100dp 而非 56dp：那份矢量沿用 adaptive-icon
-            // 的 108dp 画布，图形本体只占中间约 60/108，不放大会比原来的 CellTower 明显小一圈。
-            // 2026-09-07：改为直接渲染「应用自己的启动图标」，不再用手抄的矢量副本 + tint。
-            // 旧写法（ic_app_logo.xml 副本 + Icon(tint = accent) + 12% 强调色圆底）有两个问题：
-            //   ① Icon 会把矢量按 alpha 整体重染成单色，图标自带配色全部丢失；
-            //   ② 再叠一层低不透明度强调色圆底，观感就是「灰底 + 单色线条」，不是真正的应用图标。
-            // 为什么走 PackageManager 而不是 painterResource：本屏在 :app:feature-settings（library）
-            // 模块里，依赖方向是 :app → :app:feature-settings，反向拿不到 :app 的 @mipmap/ic_launcher。
-            // getApplicationIcon() 取的正是 manifest android:icon 指向的那份 adaptive-icon
-            // （背景层 + 前景层都在），所以换图标时这里自动跟随，不需要再维护任何副本。
-            val iconSizePx = with(LocalDensity.current) { 120.dp.roundToPx() }
-            val appIconBitmap = remember(iconSizePx) {
-                val drawable = context.packageManager.getApplicationIcon(context.applicationInfo)
-                val bitmap = Bitmap.createBitmap(iconSizePx, iconSizePx, Bitmap.Config.ARGB_8888)
-                drawable.setBounds(0, 0, iconSizePx, iconSizePx)
-                drawable.draw(Canvas(bitmap))
-                bitmap.asImageBitmap()
-            }
             Image(
                 bitmap = appIconBitmap,
                 contentDescription = null,
@@ -518,8 +789,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                 SetupPhase.DISCOVER -> "自动发现中"
                                 SetupPhase.CANDIDATES -> "选择设备"
                                 SetupPhase.MANUAL -> "连接设备"
-                                // 已初始化设备 = 登录（仅密码）；初始化态设备 = 配对（两步向导）
-                                SetupPhase.CONFIRM -> if (pairingInfo?.hasDefaultPassword == false) "登录设备" else "配对"
+                                // 拿到 /pairing/info 之后这一阶段就交给上面的配对向导了，
+                                // 留在卡片里的只有"正在获取设备信息"这段等待态。
+                                SetupPhase.CONFIRM -> "连接设备"
                             }
                             Text(
                                 text = phaseTitle,
@@ -633,225 +905,28 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                 }
                             }
 
+                            // 拿到 /pairing/info 之前的等待态。拿到之后本分支不再被渲染
+                            // （外层已切到配对向导布局）。保留一个「返回」是为了请求久久不回时不至于卡死。
                             SetupPhase.CONFIRM -> {
-                                val info = pairingInfo
-                                if (info != null) {
-                                    // needsGoformSetup 派生自 info.hasDefaultPassword（后端权威字段）。
-                                    //   true=初始化：后端从未被任何客户端首次设置过，需要引导走两步（密码→GoForm）。
-                                    //   false=正常：后端已被配置过（密码+GoForm 都在），仅验证密码即可完成配对。
-                                    val needsGoformSetup = info.hasDefaultPassword
-                                    // 步骤指示器：初始化两步 / 正常仅密码
-                                    Text(
-                                        when {
-                                            needsGoformSetup && confirmStep == 0 -> "第 1 步 / 共 2 步 · 设置配对密码"
-                                            needsGoformSetup && confirmStep == 1 -> "第 2 步 / 共 2 步 · GoForm 后台设置"
-                                            else -> "重新连接设备 · 输入配对密码"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = palette.accent,
-                                        textAlign = TextAlign.Center,
-                                        modifier = Modifier.fillMaxWidth().padding(bottom = Spacing.Small)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(20.dp),
+                                        strokeWidth = 2.dp
                                     )
-                                    Text(
-                                        text = info.deviceName.ifBlank { info.deviceId },
-                                        style = UfiTextStyles.screenTitle,
-                                        color = palette.textPrimary,
-                                        textAlign = TextAlign.Center,
-                                        modifier = Modifier.fillMaxWidth()
-                                    )
-                                    Text(
-                                        if (needsGoformSetup) "正在与该设备配对" else "设备已配置过，输入配对密码即可登录",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = palette.textSecondary,
-                                        textAlign = TextAlign.Center,
-                                        modifier = Modifier.fillMaxWidth().padding(bottom = Spacing.Small)
-                                    )
-
-                                    when {
-                                        // 初始化步 0：默认态留空自动用 admin；非默认态单框必填
-                                        needsGoformSetup && confirmStep == 0 -> {
-                                            if (info.hasDefaultPassword) {
-                                                Text(
-                                                    "设置配对密码（留空使用默认 admin）",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = palette.textSecondary,
-                                                    textAlign = TextAlign.Center,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                                var passwordFormatError by remember { mutableStateOf<String?>(null) }
-                                                var confirmPasswordFormatError by remember { mutableStateOf<String?>(null) }
-                                                UfiPasswordField(
-                                                    value = password,
-                                                    onValueChange = { input ->
-                                                        if (input.all { it.code in 33..126 }) {
-                                                            password = input.take(64)
-                                                            passwordFormatError = null
-                                                        } else {
-                                                            passwordFormatError = "密码仅限英文、数字和符号"
-                                                        }
-                                                    },
-                                                    label = "新密码（4-64 位，留空用 admin）",
-                                                    isError = passwordFormatError != null,
-                                                    errorMessage = passwordFormatError,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                                UfiPasswordField(
-                                                    value = confirmPassword,
-                                                    onValueChange = { input ->
-                                                        if (input.all { it.code in 33..126 }) {
-                                                            confirmPassword = input.take(64)
-                                                            confirmPasswordFormatError = null
-                                                        } else {
-                                                            confirmPasswordFormatError = "密码仅限英文、数字和符号"
-                                                        }
-                                                    },
-                                                    label = "确认新密码",
-                                                    isError = confirmPasswordFormatError != null || (confirmPassword.isNotEmpty() && confirmPassword != password),
-                                                    errorMessage = confirmPasswordFormatError
-                                                        ?: if (confirmPassword.isNotEmpty() && confirmPassword != password) "两次输入的密码不一致" else null,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                            } else {
-                                                Text(
-                                                    "输入配对密码后点击下一步",
-                                                    style = MaterialTheme.typography.labelSmall,
-                                                    color = palette.textSecondary,
-                                                    textAlign = TextAlign.Center,
-                                                    modifier = Modifier.fillMaxWidth().padding(bottom = Spacing.Small)
-                                                )
-                                                var nonDefaultPasswordFormatError by remember { mutableStateOf<String?>(null) }
-                                                UfiPasswordField(
-                                                    value = password,
-                                                    onValueChange = { input ->
-                                                        if (input.all { it.code in 33..126 }) {
-                                                            password = input.take(64)
-                                                            nonDefaultPasswordFormatError = null
-                                                        } else {
-                                                            nonDefaultPasswordFormatError = "密码仅限英文、数字和符号"
-                                                        }
-                                                    },
-                                                    label = "配对密码",
-                                                    isError = nonDefaultPasswordFormatError != null,
-                                                    errorMessage = nonDefaultPasswordFormatError,
-                                                    modifier = Modifier.fillMaxWidth()
-                                                )
-                                            }
-                                        }
-                                        // 初始化步 1：GoForm 后台配置（首次配对一并提交给后端；升级为独立第二步）
-                                        needsGoformSetup && confirmStep == 1 -> {
-                                            Text(
-                                                "如需通过 GoForm 接口（设备原厂后台）读取更详细的网络/信号数据，请填写其地址与密码。已按常见配置预填，可直接使用。",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = palette.textSecondary,
-                                                textAlign = TextAlign.Center,
-                                                modifier = Modifier.fillMaxWidth().padding(bottom = Spacing.Small)
-                                            )
-                                            val gfParts = goformAddress.split(":")
-                                            val gfIpPreview = gfParts.getOrNull(0)?.trim().orEmpty()
-                                            val gfPortPreview = gfParts.getOrNull(1)?.trim()?.toIntOrNull()
-                                            val gfValidPreview = gfIpPreview.isBlank() || (isValidIpv4(gfIpPreview) && gfPortPreview != null && gfPortPreview in 1..65535)
-                                            UfiTextField(
-                                                value = goformAddress,
-                                                onValueChange = { goformAddress = it; goformAddressError = null },
-                                                label = "GoForm 地址 (IP:端口)",
-                                                placeholder = "192.168.0.1:8080",
-                                                isError = goformAddressError != null || !gfValidPreview,
-                                                errorMessage = goformAddressError
-                                                    ?: if (!gfValidPreview) "格式应为 IP:端口，例如 192.168.0.1:8080" else null,
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
-                                            UfiPasswordField(
-                                                value = goformPassword,
-                                                onValueChange = { goformPassword = it; goformPasswordError = null },
-                                                label = "GoForm 密码",
-                                                isError = goformPasswordError != null,
-                                                errorMessage = goformPasswordError,
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
-                                        }
-                                        // 正常状态：仅密码步（单框必填，跳过 GoForm 步）
-                                        else -> {
-                                            Text(
-                                                "输入配对密码后点击配对",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = palette.textSecondary,
-                                                textAlign = TextAlign.Center,
-                                                modifier = Modifier.fillMaxWidth().padding(bottom = Spacing.Small)
-                                            )
-                                            var normalPasswordFormatError by remember { mutableStateOf<String?>(null) }
-                                            UfiPasswordField(
-                                                value = password,
-                                                onValueChange = { input ->
-                                                    if (input.all { it.code in 33..126 }) {
-                                                        password = input.take(64)
-                                                        normalPasswordFormatError = null
-                                                    } else {
-                                                        normalPasswordFormatError = "密码仅限英文、数字和符号"
-                                                    }
-                                                },
-                                                label = "配对密码",
-                                                isError = normalPasswordFormatError != null,
-                                                errorMessage = normalPasswordFormatError,
-                                                modifier = Modifier.fillMaxWidth()
-                                            )
-                                        }
-                                    }
-                                } else {
-                                    // 加载动画居中显示
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.Center
-                                    ) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(20.dp),
-                                            strokeWidth = 2.dp
-                                        )
-                                        Spacer(Modifier.width(Spacing.Medium))
-                                        Text("正在获取设备信息…", style = MaterialTheme.typography.bodyMedium)
-                                    }
+                                    Spacer(Modifier.width(Spacing.Medium))
+                                    Text("正在获取设备信息…", style = MaterialTheme.typography.bodyMedium)
                                 }
-                                // 按钮行：根据 needsGoformSetup 与 confirmStep 决定文案与下一步行为
-                                //   needsGoformSetup && confirmStep == 0 → 返回/下一步
-                                //   其它（含正常状态/初始化步 1）→ 返回/配对
-                                val infoNow = pairingInfo
-                                val needsGoformSetupNow = infoNow?.hasDefaultPassword ?: true
                                 UfiButtonRow {
-                                    UfiButton(variant = UfiButtonVariant.Secondary, text = "返回", onClick = {
-                                        if (needsGoformSetupNow && confirmStep == 1) {
-                                            confirmStep = 0
-                                        } else {
-                                            phase = if (candidates.isNotEmpty()) SetupPhase.CANDIDATES else SetupPhase.MANUAL
-                                            selected = null
-                                            pairingInfo = null
-                                        }
-                                    }, modifier = Modifier.weight(1f))
-                                    if (needsGoformSetupNow && confirmStep == 0) {
-                                        UfiButton(text = "下一步", onClick = {
-                                            // 轻校验密码：默认态留空即 admin；其余（一致/长度 4-64）由最终 配对 时 doPair 兜底，这里只拦明显非法
-                                            val ok = if (infoNow?.hasDefaultPassword == true) {
-                                                (password.isBlank() && confirmPassword.isBlank()) ||
-                                                    (password == confirmPassword && password.length in 4..64)
-                                            } else {
-                                                password.isNotBlank()
-                                            }
-                                            if (!ok) {
-                                                toastMessage = ToastMessage(
-                                                    "请检查密码：两次输入需一致且长度 4-64 位（或留空使用默认 admin）",
-                                                    ToastType.WARNING
-                                                )
-                                                return@UfiButton
-                                            }
-                                            confirmStep = 1
-                                        }, enabled = !busy && infoNow != null, modifier = Modifier.weight(1f))
-                                    } else {
-                                        // 初始化态（第 2 步）→ 配对；已配置设备 → 登录（仅密码）
-                                        UfiButton(
-                                            text = if (needsGoformSetupNow) "配对" else "登录",
-                                            onClick = { doPair() },
-                                            enabled = !busy && infoNow != null, loading = busy, modifier = Modifier.weight(1f)
-                                        )
-                                    }
+                                    UfiButton(
+                                        variant = UfiButtonVariant.Secondary,
+                                        text = "返回",
+                                        onClick = { backToDeviceChoice() },
+                                        modifier = Modifier.weight(1f)
+                                    )
                                 }
                             }
 
@@ -906,6 +981,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             // 如需主动触发 Toast：toastMessage = ToastMessage(..., ToastType.XXX)
 
             Spacer(Modifier.height(Spacing.XLarge))
+        }
         }
 
         // v3（2026-08-11）：Toast 反馈宿主（搜索超时提示等）

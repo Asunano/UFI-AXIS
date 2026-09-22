@@ -9,7 +9,7 @@ import com.ufi_axis_core.deviceschema.SettingKey
  *
  * 从 GoformClient 拆分，负责：
  * - 重启/关机/恢复出厂
- * - USB 模式/ADB 调试
+ * - ADB 调试开关（USB 调试端口）
  * - 指示灯/性能模式
  * - Samba 文件共享
  * - 定时重启
@@ -31,32 +31,16 @@ class GoformDeviceClient(
 
     // ==================== 系统控制 ====================
 
-    suspend fun rebootDevice(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "REBOOT_DEVICE"
-        )))
-    }
+    // 三个动作类命令在 profile 里都是 retry = NEVER，所以 writer 走的仍然是
+    // 不重试的 goformPost —— 与改造前逐字一致（重发一次 = 再重启一次 / 第二次擦除）。
 
-    suspend fun factoryReset(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "FACTORY_RESET"
-        )))
-    }
+    suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, emptyMap())
 
-    suspend fun shutdownDevice(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SHUTDOWN_DEVICE"
-        )))
-    }
+    suspend fun factoryReset(): Boolean = writer.write(SettingKey.FACTORY_RESET, emptyMap())
+
+    suspend fun shutdownDevice(): Boolean = writer.write(SettingKey.SHUTDOWN, emptyMap())
 
     // ==================== USB/ADB ====================
-
-    suspend fun setUsbMode(mode: Int): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_USB_NETWORK_PROTOCAL",
-            "usb_network_protocal" to mode.toString()
-        )))
-    }
 
     // 2026-08-22：setUsbPortSwitch 已删除——USB_PORT_SETTING 自动切换功能废弃
     // （切换会重启 adbd，打断用户正在进行的 adb 操作）。setDebugMode 保留为
@@ -80,13 +64,27 @@ class GoformDeviceClient(
 
     // ==================== 密码/FOTA ====================
 
-    suspend fun changePassword(oldPassword: String, newPassword: String): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "CHANGE_PASSWORD",
-            "oldPassword" to client.sha256Hex(oldPassword).uppercase(),
-            "newPassword" to client.sha256Hex(newPassword).uppercase()
-        )))
-    }
+    /**
+     * 修改设备后台管理口令。
+     *
+     * **哈希留在这里**：设备要的是 SHA256 大写十六进制，而这套算法与登录握手共用
+     * [GoformClient.sha256Hex] —— 在 profile 里抄第二份实现就有了两个真源，哪天登录侧
+     * 换算法这里不报错、只会静默登不上。顺带明文口令不进 device-schema，少一处泄露面。
+     * profile 的 validate 会挡住"忘了哈希直接传明文"（必须是 64 位大写十六进制）。
+     *
+     * retry 是 `NEVER`：改完口令旧会话必然失效，重登会拿着旧口令再登一次（必然失败），
+     * 还会多发一次改密请求。
+     *
+     * **副作用不在本方法里**：改成功后的 `updateGoformPassword()`（内部会 `resetLogin()`）
+     * 由调用点 `DeviceRoutes` 的 `POST /api/device/password` 做，它同时还要写
+     * `settings.goformPassword` 与清缓存 —— 那三件事是一组，搬一件进来只会让真源变两份。
+     * 这里逐字保持现状，不新增副作用。
+     */
+    suspend fun changePassword(oldPassword: String, newPassword: String): Boolean =
+        writer.write(SettingKey.BACKEND_PASSWORD, mapOf(
+            "old_hash" to client.sha256Hex(oldPassword).uppercase(),
+            "new_hash" to client.sha256Hex(newPassword).uppercase(),
+        ))
 
     /**
      * @param enabled true = 允许 FOTA 自动升级（正向语义）。

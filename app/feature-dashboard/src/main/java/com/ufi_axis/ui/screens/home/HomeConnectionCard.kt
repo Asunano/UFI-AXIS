@@ -17,6 +17,8 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.TrafficLimitConfig
 import com.ufi_axis.ui.components.common.UfiGradientSignalBar
+import com.ufi_axis.ui.components.common.UfiRollingMetric
+import com.ufi_axis.ui.components.common.UfiRollingText
 import com.ufi_axis.ui.components.common.signalBars
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.StatusOnline
@@ -284,11 +286,14 @@ fun HomeConnectionCard(
                         maxLines = 1
                     )
                     Spacer(Modifier.height(2.dp))
-                    Text(
+                    // 2026-09-21：滚轮读数。gb() 单位固定 GB、只有小数位在动 ⇒ 变化槽位 1~2 个，
+                    // 是全库最理想的接入点（不必走 UfiRollingMetric 拆单位，"GB"本来就不变）。
+                    UfiRollingMetric(
                         text = "${gb(usedBytes)} GB",
                         style = UfiTextStyles.metricValue,
+                        unitStyle = UfiTextStyles.metricValue,
                         color = palette.onGradient,  // 原 Color.White：本月流量大数字
-                        maxLines = 1
+                        unitSpacing = 5.dp
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
@@ -323,11 +328,10 @@ fun HomeConnectionCard(
                     )
                     Spacer(Modifier.height(2.dp))
                     Row(verticalAlignment = Alignment.Bottom) {
-                        Text(
+                        UfiRollingText(
                             text = wifiClientCount?.toString() ?: "—",
                             style = UfiTextStyles.metricValue,
-                            color = palette.onGradient,  // 原 Color.White：设备数大数字
-                            maxLines = 1
+                            color = palette.onGradient  // 原 Color.White：设备数大数字
                         )
                         Spacer(Modifier.width(4.dp))
                         Text(
@@ -400,12 +404,17 @@ private fun SpeedCapsule(
                 modifier = Modifier.size(13.dp)
             )
             Spacer(Modifier.width(5.dp))
-            Text(
+            // 2026-09-21：实时速率接滚轮动画。这里必须走 UfiRollingMetric 而不是 UfiRollingText ——
+            // formatRate 会自适应单位（"998.0 KB/s" → "1.0 MB/s"），单位留在同一串里会让
+            // 变化槽位超阈值、退化成"整句滚动"，动画收益归零。剥出单位后换档只是右边那个
+            // Text 跳一下，左边的数字段仍然逐位滚。
+            UfiRollingMetric(
                 text = value,
                 style = UfiTextStyles.bodyStrong,
+                unitStyle = UfiTextStyles.bodyStrong,
                 color = palette.onGradient,  // 原 Color.White：速率数值
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                unitSpacing = 3.dp,
+                alignment = Alignment.CenterVertically
             )
         }
     }

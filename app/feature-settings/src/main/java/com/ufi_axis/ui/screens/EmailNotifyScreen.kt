@@ -208,7 +208,10 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
                 failedLabel = "失败",
                 loaded = diagnose != null,
                 testRow = {
-                    val testing = state.isLoading && pending == EmailNotifyAction.TEST
+                    // 直接读 testing 而不是 `isLoading && pending == TEST`：
+                    // 三个 in-flight 位拆开后（2026-09-20），"正在测试"有了自己的信号，
+                    // 不必再靠 pending 去猜聚合位属于哪个动作。
+                    val testing = state.testing
                     val canTest = enabled && !testing
                     UfiSettingsItem(
                         title = "发送测试邮件",

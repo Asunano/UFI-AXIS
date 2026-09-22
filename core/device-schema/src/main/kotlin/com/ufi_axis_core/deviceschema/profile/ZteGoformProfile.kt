@@ -8,6 +8,7 @@ import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldNormalizer
 import com.ufi_axis_core.deviceschema.FieldSpec
+import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.Sensitivity
 import com.ufi_axis_core.deviceschema.WriteSpec
@@ -612,6 +613,11 @@ object ZteGoformProfile : DeviceProfile {
     // ───────────────────────── 写入侧 ─────────────────────────
     // 阶段 2 逐项迁移。已登记的这几项是从 GoformDeviceClient / GoformWifiClient /
     // GoformNetworkClient 原样搬来的（cmd 名与参数键逐字符照抄），未登记的返回 null。
+    //
+    // retry 必须逐项显式写出（[WriteSpec.retry] 的默认值是安全侧的 NEVER）：
+    // 下面这些设置类命令原本走的就是 GoformSettingWriter 的 goformPostIdempotent，
+    // 漏标一项等于把「切换网络制式第一次必定失败、再点一次才成」那个已修的 bug 放回去
+    // （GoformSettingWriter 的类注释记着这次事故）。动作类 / 改口令的命令反过来必须是 NEVER。
 
     override fun writeSpec(key: SettingKey): WriteSpec? = WRITE_SPECS[key]
 
@@ -619,10 +625,12 @@ object ZteGoformProfile : DeviceProfile {
         SettingKey.LED to WriteSpec(
             command = "INDICATOR_LIGHT_SETTING",
             encode = { p -> mapOf("indicator_light_switch" to bool01(p["value"])) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.PERFORMANCE_MODE to WriteSpec(
             command = "PERFORMANCE_MODE_SETTING",
             encode = { p -> mapOf("performance_mode" to bool01(p["value"])) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.WIFI_SLEEP_IDLE_MINUTES to WriteSpec(
             command = "SET_WIFI_SLEEP_INFO",
@@ -631,6 +639,7 @@ object ZteGoformProfile : DeviceProfile {
                 val v = (p["value"] as? Int) ?: p["value"]?.toString()?.toIntOrNull()
                 if (v == null || v < 0) "休眠时间必须是非负整数（分钟）" else null
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // WiFi 接入控制名单（拉黑）。参数照 2026-08-30 真机抓包：
         //   goformId=setDeviceAccessControlList&AclMode=2&WhiteMacList=&BlackMacList=2a:ed:87:b3:e8:29;
@@ -652,6 +661,7 @@ object ZteGoformProfile : DeviceProfile {
                 )
             },
             validate = { p -> validateAcl(p) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 频段锁定：值是逗号分隔的频段号；空串 = 解锁。
         // validate 挡住非数字字符 —— 设备侧表单是字符串拼接，未做转义，
@@ -660,11 +670,13 @@ object ZteGoformProfile : DeviceProfile {
             command = "LTE_BAND_LOCK",
             encode = { p -> mapOf("lte_band_lock" to (p["value"]?.toString() ?: "")) },
             validate = { p -> validateBandList(p["value"]?.toString()) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.BAND_LOCK_NR to WriteSpec(
             command = "NR_BAND_LOCK",
             encode = { p -> mapOf("nr_band_lock" to (p["value"]?.toString() ?: "")) },
             validate = { p -> validateBandList(p["value"]?.toString()) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 定时重启：两个参数（开关 + "HH:mm"），所以走 params 而不是单个 value。
         SettingKey.RESTART_SCHEDULE to WriteSpec(
@@ -676,14 +688,17 @@ object ZteGoformProfile : DeviceProfile {
                 )
             },
             validate = { p -> validateClockTime(p["time"]?.toString()) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.SAMBA to WriteSpec(
             command = "SAMBA_SETTING",
             encode = { p -> mapOf("samba_switch" to bool01(p["value"])) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.USB_PORT to WriteSpec(
             command = "USB_PORT_SETTING",
             encode = { p -> mapOf("usb_port_switch" to bool01(p["value"])) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 漫游是"另一套布尔编码"的代表：同一个设备，这条命令要 "on"/"off"，
         // 上面几条要 "1"/"0"。统一了设备会静默忽略（返回 200 但值没变），
@@ -699,6 +714,7 @@ object ZteGoformProfile : DeviceProfile {
                     "dial_roam_setting_option" to v,
                 )
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 流量限额：唯一有可选参数的写操作（计划书 2.4）。
         // 复合串 `"470_1024"` 只在这里拼 —— 对外只有 limit_value + limit_unit
@@ -732,6 +748,7 @@ object ZteGoformProfile : DeviceProfile {
                 out
             },
             validate = { p -> validateTrafficLimit(p) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
 
 
@@ -755,6 +772,7 @@ object ZteGoformProfile : DeviceProfile {
                 )
             },
             validate = { p -> validateDhcp(p) },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // FOTA 自动升级（计划书 2.7）。
         // 这里是**正向**语义：value=true → UpgMode=1（允许自动升级）。
@@ -771,6 +789,7 @@ object ZteGoformProfile : DeviceProfile {
                     "UpgRoamPermission" to "0",
                 )
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 基站锁定（计划书 2.6）：对外收制式名，设备侧要数字 RAT 码。
         // 这个值域此前直接漏在 API 入参上，两个客户端各猜了一套：
@@ -795,10 +814,12 @@ object ZteGoformProfile : DeviceProfile {
                     else -> null
                 }
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         SettingKey.CELL_UNLOCK to WriteSpec(
             command = "UNLOCK_ALL_CELL",
             encode = { emptyMap() },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // SIM 卡槽（计划书 2.6）：对外是 1 起的序号或 "external"，
         // 设备侧的 0/1/2/11 是运营商预置位，映射只在这里。
@@ -808,6 +829,7 @@ object ZteGoformProfile : DeviceProfile {
             validate = { p ->
                 if (simSlotOrNull(p["value"]) == null) "卡槽只支持 1~3 或 \"external\"" else null
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 流量手动校准（计划书 2.6）：对外只有"校准哪个量 + 校准成多少"，
         // 设备侧要 data 与 time 两个字段同时在场（未校准的填 "0"），补零规则在这里。
@@ -831,6 +853,7 @@ object ZteGoformProfile : DeviceProfile {
                     else -> null
                 }
             },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
         // 网络模式 / 承载偏好（计划书 2.6）：对外是 contract 的别名（大小写不敏感），
         // 设备侧只认 BearerPreference 那 6 个**大小写敏感**的值。
@@ -843,6 +866,133 @@ object ZteGoformProfile : DeviceProfile {
                 if (bearer in BEARER_VALUES) null
                 else "网络模式 ${p["value"]} 无法映射到设备支持的 BearerPreference"
             },
+            // 这一项就是「缺重试」那个 bug 的当事人（切制式第一次必定失败），不能是 NEVER
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
+
+        // ───────── 阶段 0 批 1 新登记的项（命令名/参数键逐字抄自现有客户端） ─────────
+
+        // 三个动作类命令：设备侧都是无参，只有 goformId。
+        // retry = NEVER 不是"顺手"：重启/关机/恢复出厂重发一次的后果分别是再重启一次、
+        // 在已经断电的设备上白等一轮、以及在出厂口令下的第二次擦除。
+        SettingKey.REBOOT to WriteSpec(
+            command = "REBOOT_DEVICE",
+            encode = { emptyMap() },
+            retry = RetryPolicy.NEVER,
+        ),
+        SettingKey.FACTORY_RESET to WriteSpec(
+            command = "FACTORY_RESET",
+            encode = { emptyMap() },
+            retry = RetryPolicy.NEVER,
+        ),
+        SettingKey.SHUTDOWN to WriteSpec(
+            command = "SHUTDOWN_DEVICE",
+            encode = { emptyMap() },
+            retry = RetryPolicy.NEVER,
+        ),
+        // 后台口令修改。
+        // **哈希不在这里做**：设备要的 SHA256 大写十六进制与登录握手共用 GoformClient.sha256Hex，
+        // 在 profile 里抄第二份实现就有两个真源（登录侧哪天换算法，这里不报错、只是静默登不上）；
+        // 而且明文口令不进 device-schema 少一处泄露面。所以 encode 只做字段名映射。
+        // validate 挡住"忘了哈希直接传明文"——那会把明文口令原样发给设备，是安全问题不是格式问题。
+        // 校验文案里不许出现参数值（它会进 GoformSettingWriter 的 warn 日志）。
+        // 调用点的副作用（updateGoformPassword() + resetLogin()）WriteSpec 表达不了，见 §11.3。
+        SettingKey.BACKEND_PASSWORD to WriteSpec(
+            command = "CHANGE_PASSWORD",
+            encode = { p ->
+                mapOf(
+                    "oldPassword" to (p["old_hash"]?.toString()?.trim() ?: ""),
+                    "newPassword" to (p["new_hash"]?.toString()?.trim() ?: ""),
+                )
+            },
+            validate = { p ->
+                when {
+                    !isSha256UpperHex(p["old_hash"]) -> "旧口令必须是调用方算好的 SHA256 大写十六进制"
+                    !isSha256UpperHex(p["new_hash"]) -> "新口令必须是调用方算好的 SHA256 大写十六进制"
+                    else -> null
+                }
+            },
+            // 改完口令旧会话必然失效，重试只会拿着旧口令再登一次（必然失败），还会多发一次改密请求
+            retry = RetryPolicy.NEVER,
+        ),
+        // 连接模式：与 ROAM 共用 SET_CONNECTION_MODE（设备侧把漫游开关塞进了这条命令），
+        // 但参数集不同——这里只发 ConnectionMode，不带 roam_setting_option。
+        // 取值域照 NetworkRoutes 现有的归一结果（auto_dial / manual_dial），
+        // 设备大小写敏感，所以不做大小写兼容，认不出直接拒（也顺带挡住表单注入）。
+        SettingKey.CONNECTION_MODE to WriteSpec(
+            command = "SET_CONNECTION_MODE",
+            encode = { p -> mapOf("ConnectionMode" to (p["value"]?.toString()?.trim() ?: "")) },
+            validate = { p ->
+                val v = p["value"]?.toString()?.trim()
+                if (v in CONNECTION_MODES) null else "连接模式只支持 auto_dial / manual_dial"
+            },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
+        // WiFi 发射功率。0~2 这个值域不是新发明的：WifiRoutes 的入参校验（level must be 0-2）
+        // 一直是这个判据，搬进来是为了让"档位上限"这件设备事实只有一份。
+        SettingKey.WIFI_POWER to WriteSpec(
+            command = "SET_WIFI_POWER",
+            encode = { p -> mapOf("wifiPowerLevel" to (p["value"]?.toString()?.trim() ?: "0")) },
+            validate = { p ->
+                val v = (p["value"] as? Int) ?: p["value"]?.toString()?.trim()?.toIntOrNull()
+                if (v == null || v !in 0..2) "WiFi 功率档位只支持 0~2" else null
+            },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
+        // ───── 阶段 0 批 1b：开/关是两条命令的写入项（方案 b：WriteSpec.commandOf）─────
+        //
+        // 下面三项的共同点：一个用户动作（开/关），设备侧却是两条不同的 goformId。
+        // 命令选择写在 commandOf 里，调用点只传一个布尔 —— 不给这个字段的话，
+        // "开发 A 命令、关发 B 命令"这段设备知识就会以 if 的形式漏在客户端里。
+
+        // WiFi 总开关：逐字对齐 GoformWifiClient.setWifiEnabled 的两个分支
+        //   开 → goformId=switchWiFiChip & ChipEnum=chip1 & GuestEnable=0
+        //   关 → goformId=switchWiFiModule & SwitchOption=0
+        // 两边的参数都是固定常量（没有任何来自调用方的自由文本），所以不需要 validate ——
+        // 这也是批 1 的 WIFI_CHIP / WIFI_MODULE 合并成一项的依据：它不是"切芯片"能力，
+        // 而就是"开关 WiFi"一个动作。
+        // 实测边界：switchWiFiModule 只在"关"的时候用到，SwitchOption=1（开）本项目从未发过、
+        // 没有实测依据；switchWiFiChip 也从未用来关 WiFi。要改任一分支先上真机验。
+        SettingKey.WIFI_ENABLED to WriteSpec(
+            command = "switchWiFiChip",
+            commandOf = { p -> if (isOn(p["value"])) "switchWiFiChip" else "switchWiFiModule" },
+            encode = { p ->
+                if (isOn(p["value"])) mapOf("ChipEnum" to "chip1", "GuestEnable" to "0")
+                else mapOf("SwitchOption" to "0")
+            },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
+        // 移动数据：逐字对齐 GoformNetworkClient.setMobileData
+        //   主命令 → goformId=CONNECT_NETWORK（开）/ DISCONNECT_NETWORK（关）& notCallback=true
+        //   主命令失败才发 → goformId=SET_DATA_ENABLED & data=1/0（**不带** notCallback，照现有代码）
+        // notCallback=true 这个约定参数进 encode 的输出，不塞进 GoformSettingWriter 的公共 body
+        // （计划书 §4：只有这几条命令带它，塞进公共 body 等于给所有写命令都加上）。
+        // isTest=false 由 GoformCodec.buildSetFormBody 统一补，两条 spec 都不该再发一份。
+        SettingKey.MOBILE_DATA to WriteSpec(
+            command = "CONNECT_NETWORK",
+            commandOf = { p -> if (isOn(p["value"])) "CONNECT_NETWORK" else "DISCONNECT_NETWORK" },
+            encode = { mapOf("notCallback" to "true") },
+            // 同一取值幂等（已经连上了再发一次连接无害，已断开再断一次也无害），而且这一项接进
+            // writer 后走的就是 goformPostIdempotent 那条路径 —— 标 NEVER 才是行为变更。
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+            fallback = WriteSpec(
+                command = "SET_DATA_ENABLED",
+                encode = { p -> mapOf("data" to bool01(p["value"])) },
+                // 独立判定（不继承主命令）：它是"把数据开关设成 1/0"的纯设置类命令，
+                // 同值幂等、无计费副作用，与主命令同走 goformPostIdempotent，所以同样可重试。
+                retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+            ),
+        ),
+        // 手动拨号 / 挂断：GoformNetworkClient.connectNetwork() / disconnectNetwork()。
+        // 命令名与参数与 MOBILE_DATA 的主命令完全一样，**但没有 SET_DATA_ENABLED 兜底** ——
+        // 这两个方法现在失败就是失败。合并进 MOBILE_DATA 等于给这两个入口偷偷加一条
+        // 它们从来没发过的命令（见 SettingKey.PPP_DIAL 的 KDoc），那是行为变更。
+        SettingKey.PPP_DIAL to WriteSpec(
+            command = "CONNECT_NETWORK",
+            commandOf = { p -> if (isOn(p["value"])) "CONNECT_NETWORK" else "DISCONNECT_NETWORK" },
+            encode = { mapOf("notCallback" to "true") },
+            // 与 MOBILE_DATA 主命令同一条命令、同样幂等，重试判据也一样
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
     )
 
@@ -859,6 +1009,32 @@ object ZteGoformProfile : DeviceProfile {
 
     /** 另一套设备侧布尔编码：漫游/自动清零这组命令只认 `"on"` / `"off"`。 */
     private fun boolOnOff(v: Any?): String = if (bool01(v) == "1") "on" else "off"
+
+    /**
+     * 「这个取值是不是开」——只给 [WriteSpec.commandOf] 与按取值分叉的 encode 用。
+     *
+     * 复用 [bool01] 的判定而不是另写一套 `v == true`：命令选择与参数编码必须看同一个判据，
+     * 否则会出现「按 chip1 的参数发给 switchWiFiModule」这种错位（两边各自判断布尔的后果）。
+     */
+    private fun isOn(v: Any?): Boolean = bool01(v) == "1"
+
+    /** 设备侧 `ConnectionMode` 的取值域（大小写敏感，认不出不许猜一个下发）。 */
+    private val CONNECTION_MODES = setOf("auto_dial", "manual_dial")
+
+
+    private val SHA256_UPPER_HEX = Regex("^[0-9A-F]{64}$")
+
+    /**
+     * 口令字段必须是**调用方算好的** SHA256 大写十六进制。
+     *
+     * 这条校验的真正目的不是格式而是安全：万一调用点忘了哈希，明文口令会被原样拼进
+     * goform 表单发出去，而且设备只会回一个"失败"，没人能从日志里看出泄露已经发生。
+     * 大写是设备侧事实（现有调用点是 `client.sha256Hex(x).uppercase()`），小写没实测过，
+     * 因此一并挡住 —— 与其静默失败，不如在下发前就拒。
+     */
+    private fun isSha256UpperHex(v: Any?): Boolean =
+        v?.toString()?.trim()?.matches(SHA256_UPPER_HEX) == true
+
 
     /** 取字符串参数，缺失/空白用 [fallback]。 */
     private fun strOr(v: Any?, fallback: String): String =

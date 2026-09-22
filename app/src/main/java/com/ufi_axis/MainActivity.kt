@@ -11,10 +11,14 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.lifecycle.Lifecycle
@@ -32,6 +36,7 @@ import com.ufi_axis.ui.components.UnifiedUpdateDialog
 import com.ufi_axis.ui.components.common.ToastMessage
 import com.ufi_axis.ui.components.common.ToastType
 import com.ufi_axis.ui.components.common.UfiAlertToastBridge
+import com.ufi_axis.ui.components.common.UfiConnectivityBanner
 import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
 import com.ufi_axis.app.navigation.buildAppScreens
@@ -252,6 +257,11 @@ class MainActivity : ComponentActivity() {
                     // 2026-09：同时接健康检查前后台闸门 —— 后台停周期 /health，回前台静默探一次再恢复。
                     DisposableEffect(webSocketRepository, viewModel) {
                         webSocketRepository.bindNetworkRecovery(applicationContext)
+                        // 2026-09-21：任何业务请求在传输层失败都立刻驱动一次 /health 探活。
+                        // 这条桥接与"是哪个域失败"无关，补上了只覆盖 5 个 state 的旧触发链。
+                        ConnectionBootstrap.registerTransportFailureHandler {
+                            viewModel.onApiTransportFailure()
+                        }
                         val observer = LifecycleEventObserver { _, event ->
                             when (event) {
                                 Lifecycle.Event.ON_RESUME -> {
@@ -266,6 +276,7 @@ class MainActivity : ComponentActivity() {
                         onDispose {
                             owner.lifecycle.removeObserver(observer)
                             webSocketRepository.unbindNetworkRecovery()
+                            ConnectionBootstrap.unregisterTransportFailureHandler()
                         }
                     }
 
@@ -411,6 +422,35 @@ class MainActivity : ComponentActivity() {
                             pendingSmsPhone = pendingSmsPhone,
                             pendingAlertDeepLink = pendingAlertDeepLink
                         )
+
+                        // ── 全局连接态横幅（2026-09-21）────────────────────────────
+                        //
+                        // 这是 `healthState` 的**第一个** UI 消费者。此前它只在
+                        // MainViewModel 的注释里被写成"供 UI 展示"，实际全仓零读取点：
+                        // 设备离线时 app 照常打开、各页各自弹一堆"加载失败"，
+                        // 没有任何一处告诉用户「根本没连上设备」。
+                        //
+                        // 挂在 Activity 顶层而不是某个页面里：这条信息对**所有页面**都成立，
+                        // 写进页面就会变成"只有仪表盘知道离线"（那正是旧 isOffline 的处境）。
+                        // 用 Box 顶部对齐叠在导航图之上，不参与页面布局、不触发页面重排。
+                        val connectivity by viewModel.connectivity.collectAsState()
+                        if (connectivity.showBanner) {
+                            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+                                UfiConnectivityBanner(
+                                    title = connectivity.title,
+                                    detail = connectivity.detail,
+                                    // 没配过地址 → 直接送去配对；其余情况 → 重试探活
+                                    actionLabel = if (connectivity.needsSetup) "去配对" else "重试",
+                                    onAction = {
+                                        if (connectivity.needsSetup) forceSetup = true
+                                        else viewModel.retryConnectivity()
+                                    },
+                                    modifier = Modifier
+                                        .statusBarsPadding()
+                                        .padding(horizontal = 12.dp, vertical = 8.dp)
+                                )
+                            }
+                        }
 
                         // ── 「正在播放」：常驻探测 + 注入到各页标题栏右侧 ──
                         //

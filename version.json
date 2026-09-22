@@ -47,15 +47,6 @@
       "size": 37466252,
       "archive": "raw",
       "entry": ""
-    },
-    "ffmpeg": {
-      "upstream": "ffmpegkit-maintained/ffmpeg",
-      "version": "7.1.5",
-      "url": "https://github.com/ffmpegkit-maintained/ffmpeg/releases/download/v7.1.5-lts-android/ffmpeg-kit-free71-7.1.5-arm64-v8a.aar",
-      "sha256": "78b57215ca8790264cf48ea755ca4629ccebe79660d37ab14f41d8077e9dece7",
-      "size": 10849436,
-      "archive": "aar",
-      "entry": "jni/arm64-v8a"
     }
   }
 }

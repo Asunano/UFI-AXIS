@@ -216,11 +216,19 @@ class AlertEngineDedupTest {
         assertEquals(1, temps.first().count)
     }
 
+    // 2026-09-21：温度用例改为**从配置推导**测试值，不再写死 50 / 60。
+    // 上一版写死的是当时的默认阈值（45/55），阈值一改（现为 65/75）整批用例就红 ——
+    // 测的是「跃迁语义」而不是「阈值取值」，取值必须跟着 getConfig() 走。
+    // 回差（leveledWithHysteresis）也要照顾到：回落必须低于 `warning - band`。
+    private fun warnTemp() = engine.getConfig().temperatureWarning + 1.0
+    private fun critTemp() = engine.getConfig().temperatureCritical + 1.0
+    private fun normalTemp() = engine.getConfig().temperatureWarning - 20.0
+
     @Test
     fun `edge trigger - level transition normal to warning then critical produces 2 rows`() = runTest {
-        engine.checkTemperature(30.0) // normal
-        engine.checkTemperature(50.0) // warning 跃迁
-        engine.checkTemperature(60.0) // critical 跃迁
+        engine.checkTemperature(normalTemp()) // normal
+        engine.checkTemperature(warnTemp())  // warning 跃迁
+        engine.checkTemperature(critTemp())  // critical 跃迁
         val temps = dao.rows.filter { it.type == "temperature" }
         assertEquals(2, temps.size)
         assertTrue(temps.any { it.level == "warning" })
@@ -229,8 +237,8 @@ class AlertEngineDedupTest {
 
     @Test
     fun `recovery - type back to normal marks resolvedAt`() = runTest {
-        engine.checkTemperature(60.0) // critical 跃迁
-        engine.checkTemperature(30.0) // normal 恢复
+        engine.checkTemperature(critTemp())   // critical 跃迁
+        engine.checkTemperature(normalTemp()) // normal 恢复
         val crit = dao.rows.first { it.type == "temperature" && it.level == "critical" }
         assertNotNull("恢复后原 critical 行应标记 resolvedAt", crit.resolvedAt)
     }
@@ -267,13 +275,13 @@ class AlertEngineDedupTest {
      * 断言改动说明（2026-08-26）：
      * 原用例读 `engine.lastBroadcast`（Map<String,Any?>）断言 `payload["aggregated"] == false`。
      * 主源码已把告警下发改道到公共组件 NotificationPushService.pushAlert()，
-     * aggregated 以字符串 "false"/"true" 放进 PushNotification.extra；
-     * `lastBroadcast` 字段虽仍存在，但 triggerAlert 已不再写它（恒为 null）。
+     * aggregated 以字符串 "false"/"true" 放进 PushNotification.extra。
      * 因此断言改为观测推送负载 —— 这是当前主源码真实的对外语义。
+     * （`lastBroadcast` 字段已于 2026-09-21 从主源码删除：它恒为 null，是第四个死钩子。）
      */
     @Test
     fun `push payload carries aggregated flag on new alert`() = runTest {
-        engine.checkTemperature(60.0) // 新行
+        engine.checkTemperature(critTemp()) // 新行
         assertEquals("新告警应推送 1 条", 1, push.pushed.size)
         val notification = push.pushed.first()
         assertEquals("temperature", notification.type)
@@ -289,7 +297,7 @@ class AlertEngineDedupTest {
     @Test
     fun `push payload carries aggregated true when existing row is bumped`() = runTest {
         dao.insert(AlertRecord(type = "temperature", level = "critical", message = "old", value = "", threshold = ""))
-        engine.checkTemperature(60.0) // normal→critical 跃迁，但已有未确认 critical 行 → 聚合
+        engine.checkTemperature(critTemp()) // normal→critical 跃迁，但已有未确认 critical 行 → 聚合
         assertEquals("聚合路径不应插入新行", 1, dao.rows.size)
         assertEquals(2, dao.rows.first().count)
         assertEquals("true", push.pushed.single().extra["aggregated"])

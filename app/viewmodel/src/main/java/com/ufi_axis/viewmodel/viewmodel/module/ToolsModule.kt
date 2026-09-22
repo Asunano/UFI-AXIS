@@ -28,6 +28,7 @@ import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.contract.WsDataTopic
 import retrofit2.HttpException
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -495,14 +496,29 @@ class ToolsModule(
                 // （空串解析成 [] → 全按 0 → 恒判定"有新版"），宁可不提示也不能误导用户重复安装
                 val hasUpdate = latest.isNotBlank() && current.isNotBlank() &&
                     compareVersions(latest, current) > 0
-                _frontendUpdateState.value = FrontendUpdateState(
-                    state = if (hasUpdate) "available" else "no_update",
-                    currentVersion = current,
-                    latestVersion = latest,
-                    changelog = info.changelog,
-                    latestApkUrl = info.apkUrl,
-                    latestSha256 = info.apkSha256.trim().lowercase()
-                )
+                _frontendUpdateState.update { prev ->
+                    // 同一版本的下载成果要保留：原来这里是 `FrontendUpdateState(...)` 构造调用，
+                    // 会把 downloadProgress/downloadedApkPath 一起清 0/清 null，于是
+                    // 「下载完 → 再点一次检查更新 → 安装」直接报"APK 未下载"。
+                    // 反过来版本变了就必须丢弃旧路径，否则"安装"会把旧包装回去。
+                    val sameVersion = latest.isNotBlank() && prev.latestVersion == latest
+                    val keptApk = if (sameVersion) prev.downloadedApkPath else null
+                    prev.copy(
+                        state = when {
+                            keptApk != null -> "downloaded"
+                            hasUpdate -> "available"
+                            else -> "no_update"
+                        },
+                        currentVersion = current,
+                        latestVersion = latest,
+                        changelog = info.changelog,
+                        latestApkUrl = info.apkUrl,
+                        latestSha256 = info.apkSha256.trim().lowercase(),
+                        downloadProgress = if (keptApk != null) prev.downloadProgress else 0,
+                        downloadedApkPath = keptApk,
+                        errorMessage = null
+                    )
+                }
             } catch (e: Exception) {
                 _frontendUpdateState.value = _frontendUpdateState.value.copy(
                     state = "error",
@@ -2333,6 +2349,52 @@ class ToolsModule(
     }
 
     /**
+     * 删除整段会话（按号码，2026-09-21）。
+     * 成功后从联系人列表移除该号码、清空当前对话（如果恰好在看这段会话）。
+     */
+    fun deleteConversation(phone: String) {
+        scope.launch {
+            try {
+                api.deleteConversation(mapOf("phone" to phone))
+                _toolsState.update { state ->
+                    state.copy(
+                        smsContacts = state.smsContacts.filter { it.phoneNumber != phone },
+                        // 如果当前正在看这段会话，也一起清掉
+                        conversationMessages = if (state.conversationPhone == phone) emptyList() else state.conversationMessages,
+                        conversationTotal = if (state.conversationPhone == phone) 0 else state.conversationTotal
+                    )
+                }
+                loadSmsContacts()
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(errorMessage = "删除会话失败: ${e.message}") }
+            }
+        }
+    }
+
+    /**
+     * 标记单条短信为未读（2026-09-21）。
+     * API 已有 `POST /api/sms/read` 支持 `read=false`，UI 原来没入口。
+     */
+    fun markSmsUnread(id: Long) {
+        scope.launch {
+            try {
+                api.markSmsRead(mapOf("id" to id.toString(), "read" to "false"))
+                // 更新本地状态
+                _toolsState.update { state ->
+                    state.copy(
+                        conversationMessages = state.conversationMessages.map {
+                            if (it.id == id) it.copy(read = false) else it
+                        }
+                    )
+                }
+                loadSmsContacts()
+            } catch (e: Exception) {
+                _toolsState.update { it.copy(errorMessage = "标记未读失败: ${e.message}") }
+            }
+        }
+    }
+
+    /**
      * 切换 SIM 卡槽（当前无 UI 调用点，暂不启用）。
      *
      * 停用原因：① 当前实测设备本身没有多卡槽功能；② core 也没有「当前卡槽」的稳定查询接口
@@ -2385,7 +2447,7 @@ class ToolsModule(
      *
      * T13 守卫：**镜像未加载完成时一律不 PUT**。此前 UI 在 `config == null` 时用
      * `AlertConfig()`（本地默认值 + configVersion=1）提交，若设备当前 version 恰为 1 就会守门通过，
-     * 把别端设置的 `perType` / `minIntervalSec` / `notifyEnabled` 一并写成默认值 —— 正是
+     * 把别端设置的 `perType` / 阈值 / `notifyEnabled` 一并写成默认值 —— 正是
      * `AlertEngine` 注释里点名禁止的"连接即写默认"回弹。C02 的合并语义只能防"漏传键"，
      * 防不住"显式带默认值提交"，所以这道守卫不可省。
      */
@@ -2440,21 +2502,21 @@ class ToolsModule(
 
     fun loadSmsForwardConfig() {
         scope.launch {
-            _smsForwardState.value = _smsForwardState.value.copy(isLoading = true)
+            _smsForwardState.update { it.copy(loading = true) }
             // 用 copy 而不是新建 SmsForwardState：diagnose 是另一个端点的产物，
             // 整体替换会在每次重载配置（含保存后的自动重载）时把它清空，UI 上是诊断区一闪就没。
             try {
-                _smsForwardState.value = _smsForwardState.value.copy(
-                    config = api.getSmsForwardConfig(), loaded = true,
-                    isLoading = false, errorMessage = null
-                )
+                val cfg = api.getSmsForwardConfig()
+                _smsForwardState.update {
+                    it.copy(config = cfg, loaded = true, loading = false, errorMessage = null)
+                }
             } catch (e: Exception) {
                 // loaded 也要置位：它的语义是"尝试过一次"而不是"成功过一次"。
                 // 只在成功时置位的话，读失败时界面分不出"还在读"与"读不到"，
                 // 于是永远停在「加载中」（口径同 WebhookState / LocalSmsState 的 loaded）。
-                _smsForwardState.value = _smsForwardState.value.copy(
-                    loaded = true, isLoading = false, errorMessage = "加载失败: ${e.message}"
-                )
+                _smsForwardState.update {
+                    it.copy(loaded = true, loading = false, errorMessage = "加载失败: ${e.message}")
+                }
             }
         }
     }
@@ -2487,34 +2549,46 @@ class ToolsModule(
      */
     fun saveSmsForwardConfig(config: SmsForwardConfig) {
         scope.launch {
-            _smsForwardState.value = _smsForwardState.value.copy(isLoading = true, errorMessage = null)
+            _smsForwardState.update { it.copy(saving = true, errorMessage = null) }
             try {
                 val result = api.saveSmsForwardConfig(config)
-                if (result.success) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false); loadSmsForwardConfig() }
-                else _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "保存失败：服务器返回失败")
+                if (result.success) {
+                    _smsForwardState.update { it.copy(saving = false) }
+                    loadSmsForwardConfig()
+                } else {
+                    _smsForwardState.update {
+                        it.copy(saving = false, errorMessage = "保存失败：服务器返回失败")
+                    }
+                }
             } catch (e: Exception) {
-                _smsForwardState.value = _smsForwardState.value.copy(
-                    isLoading = false, errorMessage = "保存失败：${coreErrorMessage(e)}"
-                )
+                _smsForwardState.update {
+                    it.copy(saving = false, errorMessage = "保存失败：${coreErrorMessage(e)}")
+                }
             }
         }
     }
 
     fun testSmsForward() {
         scope.launch {
-            _smsForwardState.value = _smsForwardState.value.copy(isLoading = true, errorMessage = null)
+            _smsForwardState.update { it.copy(testing = true, errorMessage = null) }
             try {
                 val result = api.testSmsForward()
                 val success = result.success
                 val error = result.error
                 // auto_notify_enabled 必须落进 state：只看 success 会让"SMTP 通了但总开关关着"
                 // 显示成纯成功，用户之后一条自动通知都收不到却以为配好了。
-                _smsForwardState.value = _smsForwardState.value.copy(
-                    isLoading = false,
-                    lastTestAutoNotifyEnabled = result.auto_notify_enabled,
-                    errorMessage = if (success) null else (error ?: "测试发送失败")
-                )
-            } catch (e: Exception) { _smsForwardState.value = _smsForwardState.value.copy(isLoading = false, errorMessage = "测试失败: ${e.message}") }
+                _smsForwardState.update {
+                    it.copy(
+                        testing = false,
+                        lastTestAutoNotifyEnabled = result.auto_notify_enabled,
+                        errorMessage = if (success) null else (error ?: "测试发送失败")
+                    )
+                }
+            } catch (e: Exception) {
+                _smsForwardState.update {
+                    it.copy(testing = false, errorMessage = "测试失败: ${e.message}")
+                }
+            }
         }
     }
 
@@ -2714,11 +2788,33 @@ class ToolsModule(
     }
 
     // ── Scheduled Tasks ──
+    /**
+     * 拉任务列表。
+     *
+     * 三件事都是 2026-09-20 修的，原因同一个 bug（Web 端新建任务，App 第一次进页面看不到）：
+     *
+     * 1. **只动 `tasksLoading`**，不再碰规则那一位 —— 两个加载是并发发起的，
+     *    共用一位会让先回来的那个把"还在读"宣布结束，界面当即画出空态；
+     * 2. **`update { it.copy(...) }` 而不是 `value = TasksState(...)`** ——
+     *    构造新对象会把 `rules` / `ruleLogs` / `taskLogs` 一起清零。这不只是启动竞态：
+     *    每次改任务（开关、编辑、删除）都会走到这里，于是**动一下任务开关，
+     *    规则 Tab 就空了**；
+     * 3. **失败不再清空已有数据** —— 原来错误路径也是新建 `TasksState`，
+     *    一次网络抖动就把两个 Tab 全打空。列表留着，错误单独挂在 `errorMessage` 上。
+     */
     fun loadTaskList() {
         scope.launch {
-            _tasksState.value = _tasksState.value.copy(isLoading = true)
-            try { _tasksState.value = TasksState(tasks = api.getTaskList().tasks) }
-            catch (e: Exception) { _tasksState.value = TasksState(errorMessage = "加载失败: ${e.message}") }
+            _tasksState.update { it.copy(tasksLoading = true) }
+            try {
+                val list = api.getTaskList().tasks
+                _tasksState.update {
+                    it.copy(tasks = list, tasksLoading = false, tasksLoaded = true, errorMessage = null)
+                }
+            } catch (e: Exception) {
+                _tasksState.update {
+                    it.copy(tasksLoading = false, errorMessage = "加载失败: ${e.message}")
+                }
+            }
         }
     }
 
@@ -2804,11 +2900,26 @@ class ToolsModule(
     // 与 Scheduled Tasks 同模式：镜像 load/create/update/delete/clear/loadLogs。
     // 后端 ConditionEngine 持久化在 SharedPreferences "automation_rules"，与 TaskScheduler 解耦。
 
+    /**
+     * 拉条件规则列表。只动 `rulesLoading` —— 理由见 [loadTaskList]。
+     *
+     * 失败也不再把 `rules` 清空：原来失败路径写 `rules = emptyList()`，
+     * 于是一次网络抖动就把已经显示出来的规则抹掉，而错误提示一闪而过之后
+     * 界面看起来就像"规则真的没了"。
+     */
     fun loadRuleList() {
         scope.launch {
-            _tasksState.value = _tasksState.value.copy(isLoading = true)
-            try { _tasksState.value = _tasksState.value.copy(rules = api.getRuleList().rules, isLoading = false) }
-            catch (e: Exception) { _tasksState.value = _tasksState.value.copy(rules = emptyList(), isLoading = false, errorMessage = "加载规则失败: ${e.message}") }
+            _tasksState.update { it.copy(rulesLoading = true) }
+            try {
+                val list = api.getRuleList().rules
+                _tasksState.update {
+                    it.copy(rules = list, rulesLoading = false, rulesLoaded = true, errorMessage = null)
+                }
+            } catch (e: Exception) {
+                _tasksState.update {
+                    it.copy(rulesLoading = false, errorMessage = "加载规则失败: ${e.message}")
+                }
+            }
         }
     }
 
@@ -2929,11 +3040,17 @@ class ToolsModule(
             _coreLogFilesState.value = _coreLogFilesState.value.copy(isLoading = true, errorMessage = null)
             try {
                 val resp = api.getDebugLogFiles()
-                _coreLogFilesState.value = CoreLogFilesState(
-                    files = resp.files,
-                    totalBytes = resp.total_bytes,
-                    dir = resp.dir
-                )
+                // 必须 copy 而不是构造新 state：构造会把 viewingName/viewingText 一起清掉，
+                // 于是「正在看某个日志文件时列表刷新一次」= 查看器被凭空关掉。
+                _coreLogFilesState.update {
+                    it.copy(
+                        files = resp.files,
+                        totalBytes = resp.total_bytes,
+                        dir = resp.dir,
+                        isLoading = false,
+                        errorMessage = null
+                    )
+                }
             } catch (e: Exception) {
                 _coreLogFilesState.value = _coreLogFilesState.value.copy(
                     isLoading = false,
@@ -3487,6 +3604,10 @@ class ToolsModule(
             changedType == "console:${CONSOLE_CHANNEL_AT}" -> refreshConsoleHistory(CONSOLE_CHANNEL_AT)
             // core 明确说了"这个值变了"，必须绕过新鲜度闸门
             changedType == "device:traffic-limit" -> loadTrafficLimit(force = true)
+            // web 端增删改任务 / 任务自己到点执行写了日志 / 一次性任务触发后自动禁用。
+            // 这是「在任务页不动、也能看到变化」的唯一来源 —— 任务列表没有轮询。
+            changedType == WsDataTopic.TASK_LIST -> loadTaskList()
+            changedType == WsDataTopic.TASK_RULES -> loadRuleList()
         }
     }
 }

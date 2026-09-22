@@ -354,6 +354,45 @@ object WsChannel {
 }
 
 /**
+ * `data_changed` 帧里 `data.changed` 的取值表（**不是**频道名，频道只有
+ * [WsChannel.DATA_CHANGED] 一个）。
+ *
+ * 为什么需要这张表：这里的值是 core 广播方和两端消费方之间**唯一**的约定，而两边
+ * 都是裸字符串字面量。2026-09-21 就踩过一次：`ResponseCache.invalidate` 把
+ * `"device:traffic-limit"` 截成了 `"device"`，而 app/web 全按完整 key 匹配 ——
+ * 整条精准刷新链路端到端静默失效，没有任何报错。新增取值请一律加到这里，
+ * 广播端和消费端都引用常量，别再写字面量。
+ *
+ * 约定格式 `namespace:key`：消费端既可精确匹配（`== TASK_LIST`），
+ * 也可按前缀分流（`startsWith("task:")`）。
+ */
+object WsDataTopic {
+    /** 定时任务集合变了（增删改 / 触发后写执行日志 / 一次性任务触发后自动禁用）。 */
+    const val TASK_LIST = "task:list"
+
+    /** 自动化规则集合变了（增删改 / 规则触发后写执行日志）。 */
+    const val TASK_RULES = "task:rules"
+
+    /** 控制台历史变了，`console:<channel>`，channel = `at` / `shell`。 */
+    const val CONSOLE_AT = "console:at"
+    const val CONSOLE_SHELL = "console:shell"
+
+    /** 流量上限 / 流量校准写入成功。 */
+    const val DEVICE_TRAFFIC_LIMIT = "device:traffic-limit"
+
+    /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
+    const val MEDIA_PLAYLISTS = "media:playlists"
+
+    /** 前缀：按命名空间分流用。 */
+    const val PREFIX_TASK = "task:"
+    const val PREFIX_CONSOLE = "console:"
+    const val PREFIX_DEVICE = "device:"
+    const val PREFIX_NETWORK = "network:"
+    const val PREFIX_WIFI = "wifi:"
+    const val PREFIX_MEDIA = "media:"
+}
+
+/**
  * `api/config` 各字段的取值范围。
  *
  * 权威来源：`core/api/.../ConfigRoutes.kt` 的区间判断。

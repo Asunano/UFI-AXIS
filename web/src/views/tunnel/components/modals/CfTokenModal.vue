@@ -46,17 +46,22 @@ const token = ref('');
 const saving = ref(false);
 const isNew = computed(() => !props.name);
 
+// 2026-09-21：watch 依赖从只看 show 改为 [show, name]。
+// 只看 show 时，快速「关 A → 开 B」会命中 useLazyModal 的 350ms 保活窗口 ——
+// A 的迟到 GET 把 A 的 token 填进标题写着 B 的输入框，一按保存就把 A 的 token 写到 B 上。
 watch(
-  () => props.show,
-  async (v) => {
+  () => [props.show, props.name] as const,
+  async ([v, name]) => {
     if (!v) return;
-    nameInput.value = props.name;
+    nameInput.value = name;
     token.value = '';
     saving.value = false;
-    if (!props.name) return;
+    if (!name) return;
     try {
       // core 的 PUT 强制 token 非空，无法「留空表示不修改」，所以必须回读预填
-      const { data } = await api.get(`/api/tunnel/cf/tunnel/${encodeURIComponent(props.name)}`);
+      const { data } = await api.get(`/api/tunnel/cf/tunnel/${encodeURIComponent(name)}`);
+      // 名字变了 → 这次 GET 的结果已过期（show 从没变过 false）
+      if (nameInput.value !== name) return;
       token.value = data?.token || '';
     } catch (e: any) {
       message.error(errText(e, '读取隧道失败'));
@@ -77,6 +82,17 @@ async function save() {
   }
   saving.value = true;
   try {
+    // 2026-09-21 新建查重：core 的 PUT 是无条件 upsert，没有存在性检查，
+    // 用一个已存在的名字「新建」会**静默覆盖那条隧道的 token**。
+    // app 端本来就查重（CfDetailScreen），web 这边缺了。以服务端列表为准，不信父组件的缓存。
+    if (isNew.value) {
+      const { data } = await api.get('/api/tunnel/cf/tunnels');
+      const exists = (data?.tunnels ?? []).some((t: any) => String(t?.name ?? '').toLowerCase() === name.toLowerCase());
+      if (exists) {
+        message.error(`隧道「${name}」已存在，请改用编辑`);
+        return;
+      }
+    }
     await api.put(`/api/tunnel/cf/tunnel/${encodeURIComponent(name)}`, { token: token.value });
     message.success('隧道已保存');
     emit('update:show', false);

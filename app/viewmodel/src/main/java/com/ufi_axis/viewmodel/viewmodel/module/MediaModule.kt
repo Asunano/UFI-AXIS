@@ -2,35 +2,40 @@ package com.ufi_axis.viewmodel.module
 
 import android.content.Context
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.MEDIA_GROUP_ALBUM
+import com.ufi_axis.data.model.MEDIA_GROUP_ARTIST
+import com.ufi_axis.data.model.MEDIA_GROUP_FOLDER
+import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import com.ufi_axis.data.model.MediaDirsRequest
-import com.ufi_axis.data.model.MediaFfmpegStatusResponse
 import com.ufi_axis.data.model.MediaLibraryItem
+import com.ufi_axis.data.model.MediaSubtitleEntry
 import com.ufi_axis.data.model.MediaTagsResponse
+import com.ufi_axis.data.model.PlaylistAddResponse
+import com.ufi_axis.data.model.PlaylistNameRequest
+import com.ufi_axis.data.model.PlaylistPathsRequest
 import com.ufi_axis.data.model.StreamTicketRequest
 import com.ufi_axis.util.AppPreferences
-import com.ufi_axis.viewmodel.state.ComponentInfo
-import com.ufi_axis.viewmodel.state.ComponentTask
+import com.ufi_axis.util.encodeUriComponent
+import com.ufi_axis_core.contract.WsDataTopic
+import com.ufi_axis.viewmodel.state.AudioQueueScope
+import com.ufi_axis.viewmodel.state.MEDIA_GROUP_KINDS
 import com.ufi_axis.viewmodel.state.MEDIA_KINDS
 import com.ufi_axis.viewmodel.state.MEDIA_ORDER_DESC
 import com.ufi_axis.viewmodel.state.MEDIA_SORT_DATE
 import com.ufi_axis.viewmodel.state.MediaBrowseState
+import com.ufi_axis.viewmodel.state.MediaGroupState
 import com.ufi_axis.viewmodel.state.MediaLibraryState
+import com.ufi_axis.viewmodel.state.MediaPlaylistDetailState
+import com.ufi_axis.viewmodel.state.MediaPlaylistState
 import com.ufi_axis.viewmodel.state.MediaTabState
+import com.ufi_axis.viewmodel.state.mediaGroupItemsKey
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.longOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
@@ -65,8 +70,14 @@ class MediaModule(
         /** [allItems] 的枚举上限：批量抽帧一次处理上万项本身就不合理。 */
         const val ALL_ITEMS_LIMIT = 2000
 
-        /** FFmpeg 可选组件的 id（与 core `BinaryComponentStore.ID_FFMPEG` 一致） */
-        const val COMPONENT_FFMPEG = "ffmpeg"
+        /**
+         * 点了"无标签"那一组时给用户的说法。
+         *
+         * core 侧把没有专辑/歌手标签的文件聚成 key 为空串的一组，而空 key 送回
+         * `/api/media/list` 会被当成"没传过滤条件"—— 那样点进去看到的是整库，比报错更糟。
+         * 所以这里拦下来并解释原因，而不是静默什么都不做（用户只会以为 App 卡了）。
+         */
+        const val GROUP_KEY_MISSING_MESSAGE = "这一组没有标签信息，无法单独查看"
     }
 
     private val _state = MutableStateFlow(initialState())
@@ -229,118 +240,6 @@ class MediaModule(
     }
 
     /**
-     * 设备端 ffmpeg 自检（设置页那颗「检测」按钮）。
-     *
-     * [path] 非空时 core 会**真的对那个文件抽一帧并计时** —— 这是判断
-     * "设备自己生成封面" 这条路实不实用的唯一可靠依据（能不能出图 + 一帧要多久）。
-     *
-     * 失败回 null 而不是抛：老版本 core 没有这个端点（404），那不是错误而是
-     * "这个 core 不支持"，由调用方显示对应文案。
-     */
-    suspend fun ffmpegStatus(path: String? = null): MediaFfmpegStatusResponse? = try {
-        api.getMediaFfmpegStatus(path)
-    } catch (e: Exception) {
-        null
-    }
-
-    // ── FFmpeg 可选组件（GET/POST /api/components，只取 id=ffmpeg 那一条）──
-    //
-    // 为什么不复用 TunnelModule 那套：那里的组件列表是"内网穿透的核心依赖"，
-    // 语义上和媒体无关；FFmpeg 只服务视频封面抽帧，安装入口也只在媒体设置页。
-    // 两边调的是同一组通用端点，各自只关心自己那一条，互不干扰。
-
-    /**
-     * 拉 FFmpeg 组件状态。
-     *
-     * [refresh] = true 时让 core 重新拉 version.json（会打外网，「检查更新」用）；
-     * 省略则用 core 进程内缓存。core 版本过旧（没有 ffmpeg 组件）时留 null。
-     */
-    fun loadFfmpegComponent(refresh: Boolean = false) {
-        scope.launch {
-            try {
-                val element = api.listComponents(if (refresh) "true" else null)
-                val obj = element as? JsonObject ?: return@launch
-                val info = obj["components"]?.jsonArray
-                    ?.mapNotNull { parseComponent(it) }
-                    ?.firstOrNull { it.id == COMPONENT_FFMPEG }
-                _state.update {
-                    it.copy(ffmpegComponent = info, ffmpegTask = parseComponentTask(obj))
-                }
-            } catch (e: Exception) {
-                // 拉不到不报错：老 core 没有这个端点，UI 显示"不可用"即可
-            }
-        }
-    }
-
-    /** 只刷新安装进度（任务进行中时高频轮询，落终态后补拉一次完整状态） */
-    fun refreshFfmpegTask() {
-        scope.launch {
-            try {
-                val obj = api.getComponentStatus() as? JsonObject ?: return@launch
-                val task = parseComponentTask(obj)
-                val was = _state.value.ffmpegTask.active
-                _state.update { it.copy(ffmpegTask = task) }
-                if (was && !task.active) loadFfmpegComponent()
-            } catch (e: Exception) {
-                // 轮询失败静默
-            }
-        }
-    }
-
-    /** 触发下载安装（core 侧异步执行，进度经 [refreshFfmpegTask] 轮询） */
-    fun installFfmpegComponent() {
-        scope.launch {
-            try {
-                val obj = api.installComponent(COMPONENT_FFMPEG) as? JsonObject
-                if (obj != null) _state.update { it.copy(ffmpegTask = parseComponentTask(obj)) }
-            } catch (e: Exception) {
-                _state.update { it.copy(errorMessage = "触发 FFmpeg 安装失败: ${e.message}") }
-            }
-        }
-    }
-
-    /** 卸载 FFmpeg 组件（core 侧会删掉 filesDir/components/ffmpeg 整个目录） */
-    fun uninstallFfmpegComponent() {
-        scope.launch {
-            try {
-                api.uninstallComponent(COMPONENT_FFMPEG)
-            } catch (e: Exception) {
-                _state.update { it.copy(errorMessage = "卸载 FFmpeg 失败: ${e.message}") }
-            } finally {
-                loadFfmpegComponent()
-            }
-        }
-    }
-
-    private fun parseComponent(element: JsonElement): ComponentInfo? {
-        val obj = element as? JsonObject ?: return null
-        val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: return null
-        return ComponentInfo(
-            id = id,
-            name = obj["name"]?.jsonPrimitive?.contentOrNull ?: id,
-            description = obj["description"]?.jsonPrimitive?.contentOrNull ?: "",
-            installed = obj["installed"]?.jsonPrimitive?.booleanOrNull ?: false,
-            installedVersion = obj["installed_version"]?.jsonPrimitive?.contentOrNull ?: "",
-            installedSize = obj["installed_size"]?.jsonPrimitive?.longOrNull ?: 0L,
-            source = obj["source"]?.jsonPrimitive?.contentOrNull ?: "",
-            latestVersion = obj["latest_version"]?.jsonPrimitive?.contentOrNull ?: "",
-            downloadSize = obj["download_size"]?.jsonPrimitive?.longOrNull ?: 0L,
-            available = obj["available"]?.jsonPrimitive?.booleanOrNull ?: false,
-            updateAvailable = obj["update_available"]?.jsonPrimitive?.booleanOrNull ?: false,
-            upstream = obj["upstream"]?.jsonPrimitive?.contentOrNull ?: ""
-        )
-    }
-
-    private fun parseComponentTask(obj: JsonObject) = ComponentTask(
-        id = obj["id"]?.jsonPrimitive?.contentOrNull ?: "",
-        state = obj["state"]?.jsonPrimitive?.contentOrNull ?: "idle",
-        percent = obj["percent"]?.jsonPrimitive?.intOrNull ?: 0,
-        message = obj["message"]?.jsonPrimitive?.contentOrNull ?: ""
-    )
-
-
-
-    /**
      * 把某一类**整库**拉齐（分页循环），给"批量生成缩略图"这种要先知道全集的操作用。
      *
      * 不进 [state]：这是一次性的枚举结果，塞进列表状态会和分页浏览打架
@@ -359,6 +258,59 @@ class MediaModule(
                     order = tab.order,
                     limit = PAGE_SIZE,
                     offset = offset
+                )
+            } catch (e: Exception) {
+                break
+            }
+            if (resp.items.isEmpty()) break
+            collected += resp.items
+            offset += resp.items.size
+            if (offset >= resp.total) break
+        }
+        return collected.distinctBy { it.id }
+    }
+
+    /**
+     * 取某个**播放作用域**下的全部曲目（拉齐所有分页），供装载播放队列用。
+     *
+     * 与 [loadGroupItems] 的区别：后者只拉一页、写进 `audioGroupItems` 给**浏览**用；
+     * 这里要的是"这个范围里到底有哪些歌"，必须拉齐 —— 否则专辑第 101 首之后的歌
+     * 进不了队列，「下一首」会在第 100 首处莫名停下。
+     *
+     * 排序沿用音乐页的排序偏好（与 [loadGroupItems] 同口径）：从列表点进专辑，
+     * 曲目顺序突然换一套只会让人困惑。
+     *
+     * 失败或范围为空时回空列表 —— 调用方（播放页）自己有单曲兜底分支。
+     */
+    suspend fun queueItemsOf(scope: AudioQueueScope): List<MediaLibraryItem> {
+        if (scope.isAll) return allItems(MEDIA_TYPE_AUDIO)
+        // 歌单必须在分组判定之前：它不走 `/api/media/list`，顺序也不是音乐页那套排序偏好，
+        // 而是用户在歌单里排定的顺序（core 原样给出）。已失效的条目排掉 ——
+        // 它们没有可播地址，留在队列里会让播放器在那一首上报错卡住。
+        if (scope.isPlaylist) {
+            return try {
+                api.getPlaylistItems(scope.key).items.filterNot { it.missing }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+        if (!scope.isGroup) return emptyList()
+
+        val (album, artist, dir) = groupFilters(scope.kind, scope.key)
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        val collected = mutableListOf<MediaLibraryItem>()
+        var offset = 0
+        while (collected.size < ALL_ITEMS_LIMIT) {
+            val resp = try {
+                api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = offset,
+                    album = album,
+                    artist = artist,
+                    dir = dir
                 )
             } catch (e: Exception) {
                 break
@@ -406,6 +358,435 @@ class MediaModule(
                     it.copy(isAppending = false, errorMessage = "加载更多失败: ${e.message}")
                 }
             }
+        }
+    }
+
+    // ── 音频分组（专辑 / 歌手 / 文件夹）──
+    //
+    // 聚合由 core 一次算完（`/api/media/groups`），app 不在本地对整库做 groupBy ——
+    // 那要先把上千首全拉下来，且分组口径会和 core / Web 端对不上。
+    // 点进某一组之后列曲目仍走 `/api/media/list`（带 album/artist/dir 过滤），
+    // 不新造"列某组曲目"的接口。
+
+    private fun updateGroup(by: String, transform: (MediaGroupState) -> MediaGroupState) {
+        _state.update { s ->
+            s.copy(audioGroups = s.audioGroups + (by to transform(s.group(by))))
+        }
+    }
+
+    private fun updateGroupItems(
+        by: String,
+        key: String,
+        transform: (MediaTabState) -> MediaTabState
+    ) {
+        _state.update { s ->
+            val slot = mediaGroupItemsKey(by, key)
+            s.copy(audioGroupItems = s.audioGroupItems + (slot to transform(s.groupItems(by, key))))
+        }
+    }
+
+    /** `by` 是不是 core 支持的分组维度。非法值一律当"没这个功能"，不发请求。 */
+    private fun isGroupBy(by: String): Boolean = MEDIA_GROUP_KINDS.any { (value, _) -> value == by }
+
+    /**
+     * 把组的 key 翻成 `/api/media/list` 的过滤参数。
+     *
+     * 三个维度对应三个不同的 query，映射只写在这一处：写在调用点会在"加载首页"和"加载更多"
+     * 各来一份，改起来必然漏一个。
+     *
+     * ## 值要**先编码**（2026-09-21 修"专辑里没有歌"）
+     * `getMediaList` 的这三个参数声明成 `encoded = true`，因为 Retrofit/OkHttp 在 query 里
+     * 不编码 `+`，而 Ktor 解 query 时把 `+` 当空格 —— 专辑名 `万岁2001 新曲+精选`
+     * 会在服务端变成 `万岁2001 新曲 精选`，一条都匹配不上。
+     * [encodeUriComponent] 把 `+` 编成 `%2B`、空格编成 `%20`，两端就对得上了。
+     */
+    private fun groupFilters(by: String, key: String): Triple<String?, String?, String?> {
+        val encoded = encodeUriComponent(key)
+        return when (by) {
+            MEDIA_GROUP_ALBUM -> Triple(encoded, null, null)
+            MEDIA_GROUP_ARTIST -> Triple(null, encoded, null)
+            MEDIA_GROUP_FOLDER -> Triple(null, null, encoded)
+            else -> Triple(null, null, null)
+        }
+    }
+
+    /**
+     * 取某个维度的分组列表（专辑 / 歌手 / 文件夹）。
+     *
+     * 不分页：core 一次给全量分组。[force] = false 且已经拉过就跳过 —— 分组页会随着
+     * 维度切换反复进入，每次都打一次网络没有必要（媒体库变了由下拉刷新 force 重来）。
+     */
+    fun loadGroups(by: String, force: Boolean = false) {
+        if (!isGroupBy(by)) return
+        val current = _state.value.group(by)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updateGroup(by) { it.copy(by = by, isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getMediaGroups(MEDIA_TYPE_AUDIO, by)
+                updateGroup(by) {
+                    it.copy(
+                        by = by,
+                        groups = resp.groups,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroup(by) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "加载分组失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 取某一组里的第一页曲目。
+     *
+     * 排序沿用音乐页的排序偏好：从列表点进专辑，曲目顺序突然换一套只会让人困惑。
+     * [key] 为空串（无标签兜底组）时不发请求，改成给一条能看懂的提示 —— 见
+     * [GROUP_KEY_MISSING_MESSAGE]。
+     */
+    fun loadGroupItems(by: String, key: String, force: Boolean = false) {
+        if (!isGroupBy(by)) return
+        if (key.isEmpty()) {
+            updateGroupItems(by, key) {
+                it.copy(isLoading = false, loadedOnce = true, errorMessage = GROUP_KEY_MISSING_MESSAGE)
+            }
+            return
+        }
+        val current = _state.value.groupItems(by, key)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        updateGroupItems(by, key) { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val (album, artist, dir) = groupFilters(by, key)
+                val resp = api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = 0,
+                    album = album,
+                    artist = artist,
+                    dir = dir
+                )
+                updateGroupItems(by, key) {
+                    it.copy(
+                        items = resp.items,
+                        total = resp.total,
+                        isLoading = false,
+                        loadedOnce = true,
+                        granted = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroupItems(by, key) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 组内曲目的下一页。守卫与 [loadMore] 一致：首屏加载中、正在追加、已到底都不发请求。 */
+    fun loadMoreGroupItems(by: String, key: String) {
+        if (!isGroupBy(by) || key.isEmpty()) return
+        val current = _state.value.groupItems(by, key)
+        if (current.isLoading || current.isAppending || !current.hasMore) return
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        updateGroupItems(by, key) { it.copy(isAppending = true) }
+        scope.launch {
+            try {
+                val (album, artist, dir) = groupFilters(by, key)
+                val resp = api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = current.items.size,
+                    album = album,
+                    artist = artist,
+                    dir = dir
+                )
+                updateGroupItems(by, key) { slot ->
+                    // 与 loadMore 同理：翻页期间媒体库可能增删，offset 会错位，按 id 去重
+                    val existing = slot.items.mapTo(HashSet()) { it.id }
+                    slot.copy(
+                        items = slot.items + resp.items.filter { it.id !in existing },
+                        total = resp.total,
+                        isAppending = false
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroupItems(by, key) {
+                    it.copy(isAppending = false, errorMessage = "加载更多失败: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 丢掉某一组的曲目缓存（离开分组详情页时调）。
+     *
+     * 分组列表本身留着（那只有几十条，且切回来就要用），但"每个逛过的专辑都留一份曲目"
+     * 会在内存里堆出几十份没人再看的列表。
+     */
+    fun clearGroupItems(by: String, key: String) {
+        _state.update { s ->
+            s.copy(audioGroupItems = s.audioGroupItems - mediaGroupItemsKey(by, key))
+        }
+    }
+
+    // ── 音频歌单（2026-09-21）──
+    //
+    // 歌单存在 core（`/api/playlists`），app 只做展示与转发：这里没有任何"哪首歌该在哪个
+    // 歌单里"的判定，去重、上限、失效标记全在 core 算完。写操作成功后重拉受影响的那一份，
+    // 不在本地拼乐观更新 —— 加歌的实际结果（跳过了几条、截断没截断）只有 core 知道。
+
+    private fun updatePlaylists(transform: (MediaPlaylistState) -> MediaPlaylistState) {
+        _state.update { s -> s.copy(playlists = transform(s.playlists)) }
+    }
+
+    private fun updatePlaylistDetail(
+        id: String,
+        transform: (MediaPlaylistDetailState) -> MediaPlaylistDetailState
+    ) {
+        _state.update { s ->
+            s.copy(playlistItems = s.playlistItems + (id to transform(s.playlistDetail(id))))
+        }
+    }
+
+    /**
+     * 拉歌单列表。
+     *
+     * [force] = false 且已经拉过就跳过（同 [loadGroups]：音乐页会反复在几个视图间切换）。
+     * 写操作与 WS 的 `media:playlists` 信号都走 force = true。
+     */
+    fun loadPlaylists(force: Boolean = false) {
+        val current = _state.value.playlists
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updatePlaylists { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getPlaylists()
+                updatePlaylists {
+                    it.copy(
+                        playlists = resp.playlists,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updatePlaylists {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "歌单加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 拉某个歌单的曲目。不分页 —— core 一次给全量，顺序就是用户排定的顺序。 */
+    fun loadPlaylistItems(id: String, force: Boolean = false) {
+        if (id.isBlank()) return
+        val current = _state.value.playlistDetail(id)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updatePlaylistDetail(id) { it.copy(id = id, isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getPlaylistItems(id)
+                updatePlaylistDetail(id) {
+                    it.copy(
+                        id = resp.id.ifBlank { id },
+                        name = resp.name,
+                        items = resp.items,
+                        missingCount = resp.missing_count,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updatePlaylistDetail(id) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "歌单曲目加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 丢掉某个歌单的曲目缓存（离开歌单详情页时调）。理由同 [clearGroupItems]。 */
+    fun clearPlaylistItems(id: String) {
+        _state.update { s -> s.copy(playlistItems = s.playlistItems - id) }
+    }
+
+    /**
+     * 新建歌单，可选地立刻把 [thenAddPaths] 加进去。
+     *
+     * 两步合成一个入口是为了「新建歌单并加入」那个常见动作：拆成两次调用会让页面自己去串
+     * "创建成功 → 拿到 id → 再加歌"，而中途失败时用户会得到一个空歌单却不知道歌没进去。
+     */
+    fun createPlaylist(name: String, thenAddPaths: List<String> = emptyList()) {
+        if (name.isBlank()) return
+        scope.launch {
+            try {
+                val created = api.createPlaylist(PlaylistNameRequest(name.trim()))
+                if (thenAddPaths.isNotEmpty() && created.id.isNotBlank()) {
+                    val added = api.addPlaylistItems(
+                        created.id,
+                        PlaylistPathsRequest(thenAddPaths)
+                    )
+                    updatePlaylists { it.copy(message = addResultMessage(created.name, added)) }
+                } else {
+                    updatePlaylists { it.copy(message = "已创建歌单「${created.name}」") }
+                }
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("创建歌单", e)) }
+            }
+        }
+    }
+
+    fun renamePlaylist(id: String, name: String) {
+        if (id.isBlank() || name.isBlank()) return
+        scope.launch {
+            try {
+                api.renamePlaylist(id, PlaylistNameRequest(name.trim()))
+                updatePlaylists { it.copy(message = "已重命名为「${name.trim()}」") }
+                loadPlaylists(force = true)
+                // 详情页的标题也要跟着变；没打开过的歌单不会有这一份，force 重拉是安全的
+                if (_state.value.playlistItems.containsKey(id)) loadPlaylistItems(id, force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("重命名", e)) }
+            }
+        }
+    }
+
+    /**
+     * 删除歌单。
+     *
+     * **不动播放器**：正在播的队列已经在 `MediaSessionService` 里，删掉歌单不该让音乐停下来
+     * （用户只是整理列表）。下一次进播放页时作用域取不到曲目，会自然落到单曲兜底分支。
+     */
+    fun deletePlaylist(id: String) {
+        if (id.isBlank()) return
+        scope.launch {
+            try {
+                api.deletePlaylist(id)
+                clearPlaylistItems(id)
+                updatePlaylists { it.copy(message = "歌单已删除") }
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("删除歌单", e)) }
+            }
+        }
+    }
+
+    /** 把曲目加进歌单。跳过与截断的口径由 core 给出，这里只把结果翻成一句话。 */
+    fun addToPlaylist(playlistId: String, paths: List<String>) {
+        if (playlistId.isBlank() || paths.isEmpty()) return
+        scope.launch {
+            try {
+                val resp = api.addPlaylistItems(playlistId, PlaylistPathsRequest(paths))
+                val name = _state.value.playlists.playlists
+                    .firstOrNull { it.id == playlistId }?.name ?: "歌单"
+                updatePlaylists { it.copy(message = addResultMessage(name, resp)) }
+                loadPlaylists(force = true)
+                if (_state.value.playlistItems.containsKey(playlistId)) {
+                    loadPlaylistItems(playlistId, force = true)
+                }
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("加入歌单", e)) }
+            }
+        }
+    }
+
+    /** 把曲目移出歌单。已失效的条目也走这条 —— 用户手动清理，不是 App 自动删。 */
+    fun removeFromPlaylist(playlistId: String, paths: List<String>) {
+        if (playlistId.isBlank() || paths.isEmpty()) return
+        scope.launch {
+            try {
+                // path 必须先编码：这条走的是重复 query 参数，Retrofit 声明成 encoded = true
+                // （OkHttp 不编码 `+`，Ktor 又把 `+` 当空格 —— 不编的话含 `+` 的曲目移不掉）
+                val resp = api.removePlaylistItems(playlistId, paths.map(::encodeUriComponent))
+                updatePlaylists { it.copy(message = "已移出 ${resp.removed} 首") }
+                loadPlaylistItems(playlistId, force = true)
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("移出歌单", e)) }
+            }
+        }
+    }
+
+    /** 页面显示过提示/错误之后调用，避免重组时反复弹同一条。 */
+    fun clearPlaylistMessage() {
+        updatePlaylists { it.copy(message = null, errorMessage = null) }
+    }
+
+    /**
+     * WS `data_changed` 的精准刷新入口（由 `MainViewModel.collectDataChangedEvents` 分发）。
+     *
+     * 目前只认 [WsDataTopic.MEDIA_PLAYLISTS]：另一端（通常是 web）建 / 改 / 删歌单、加歌移歌
+     * 都会推这一条。已经打开过的歌单曲目一并重拉 —— 只刷列表的话，正在看的那个歌单
+     * 里被另一端加的歌不会出现。
+     *
+     * 认不出的 topic 直接忽略：媒体库本身（`/api/media/list`）不走 WS，core 也没在推。
+     */
+    fun smartRefresh(changedType: String) {
+        if (changedType != WsDataTopic.MEDIA_PLAYLISTS) return
+        loadPlaylists(force = true)
+        _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+    }
+
+    /**
+     * 加歌结果 → 一句话。
+     *
+     * 把 `skipped` / `truncated` 说出来而不是只报"已加入"：用户选了 20 首却只进去 3 首时，
+     * 一句笼统的成功提示会让人以为是 App 丢了歌。
+     */
+    private fun addResultMessage(playlistName: String, resp: PlaylistAddResponse): String {
+        val head = "已加入「$playlistName」${resp.added} 首"
+        val tail = buildList {
+            if (resp.skipped > 0) add("${resp.skipped} 首已在歌单里或不在媒体库")
+            if (resp.truncated) add("歌单条数已达上限")
+        }
+        return if (tail.isEmpty()) head else "$head（${tail.joinToString("，")}）"
+    }
+
+    /**
+     * 歌单写操作的失败文案。
+     *
+     * 409 与 400 各有明确的下一步（换个名字 / 删几个歌单），所以不能都说成"操作失败"。
+     * 判据用 HTTP 状态码而不是 core 的 message —— 后者是给人看的，会改。
+     */
+    private fun playlistErrorText(action: String, e: Exception): String {
+        val code = (e as? retrofit2.HttpException)?.code()
+        return when (code) {
+            409 -> "已有同名歌单，换个名字再试"
+            404 -> "歌单不存在（可能已在别处被删除）"
+            403 -> "媒体权限未授权，无法读取歌单曲目"
+            else -> "$action 失败: ${e.message}"
         }
     }
 
@@ -546,6 +927,60 @@ class MediaModule(
         val prefs = AppPreferences(appContext)
         return "http://${prefs.effectiveHost}:${prefs.serverPort}" +
             "/api/media/thumbnail?type=$type&id=$id&size=$size"
+    }
+
+    /**
+     * 字幕内容 URL，**直接塞给播放器**（`MediaItem.SubtitleConfiguration`）。
+     *
+     * 为什么不用 [streamUrl]（`/api/files/stream`）：那条给的是原始字节，而播放器的字幕
+     * 解析器按 UTF-8 解 —— 中文字幕大量是 GB18030/Big5，直接喂过去就是一屏乱码，
+     * 且播放器没有"换编码重试"的入口。`/api/media/subtitle` 在服务端统一转好 UTF-8，
+     * 并按后缀给准确的字幕 MIME。
+     *
+     * 鉴权：这条 URL 由播放器的 OkHttpDataSource 拉取，那个 client 带了设备签名拦截器
+     * （见 `UfiStreamHttpClient`），所以和视频流走同一套鉴权，不需要额外的票据。
+     */
+    fun subtitleUrl(path: String): String {
+        val prefs = AppPreferences(appContext)
+        return "http://${prefs.effectiveHost}:${prefs.serverPort}" +
+            "/api/media/subtitle?path=${URLEncoder.encode(path, "UTF-8")}"
+    }
+
+    /**
+     * 拉某个视频的外挂字幕列表。
+     *
+     * [folderScope] = true 时回同目录全部字幕（"手动选字幕文件"用）；
+     * 否则只回 core 判定属于这个视频的（自动挂载用）。
+     *
+     * 失败回空列表而不是抛：字幕是增强项，拉不到就当没有，不该把播放页搞崩。
+     */
+    suspend fun subtitlesOf(path: String, folderScope: Boolean = false): List<MediaSubtitleEntry> =
+        try {
+            api.getMediaSubtitles(path, if (folderScope) "folder" else null).items
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+    /**
+     * 让**设备侧**丢掉已缓存的缩略图。
+     *
+     * ## 为什么需要这个
+     * 缩略图有三层缓存，只清一层等于没清：
+     *  1. 图片加载库（按 URL 命中的磁盘 + 内存缓存）；
+     *  2. 本机抽帧的成果（`MediaThumbnailBuilder` 的目录）；
+     *  3. **设备上客户端回传的成果** ← 本方法清的是这层。
+     *
+     * `/thumbnail` 的 URL 只含 (type, id)、不含内容指纹，命中即原样返回。
+     * 所以一张算错的图（典型：抽到黑场）会一直被发下去；只清 1、2 层的话，
+     * 下一次请求立刻被设备上的旧图命中，用户看到的是"清了没反应"。
+     *
+     * 失败回 false 不抛：清缓存是便利操作，设备没响应不该让界面崩。
+     */
+    suspend fun clearRemoteThumbnails(type: String? = null): Boolean = try {
+        api.clearMediaThumbnailCache(type)
+        true
+    } catch (e: Exception) {
+        false
     }
 
     /**

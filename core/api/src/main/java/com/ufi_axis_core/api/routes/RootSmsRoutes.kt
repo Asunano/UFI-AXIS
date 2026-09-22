@@ -112,6 +112,30 @@ class RootSmsRoutes(
                 call.respond(toJsonElement(mapOf("success" to success, "id" to id)))
             }
 
+            // 按号码删除整段会话（2026-09-21）
+            post("/delete-conversation") {
+                val body = call.receiveJsonObject()
+                val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (phone.isBlank()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "phone required")
+                    return@post
+                }
+                val deleted = smsController.deleteConversation(phone)
+                call.respond(toJsonElement(mapOf("success" to (deleted >= 0), "phone" to phone, "deleted" to deleted)))
+            }
+
+            // 批量删除多条短信（2026-09-21）
+            post("/delete-batch") {
+                val body = call.receiveJsonObject()
+                val ids = body["ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.longOrNull } ?: emptyList()
+                if (ids.isEmpty()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "ids required (array of numbers)")
+                    return@post
+                }
+                val deleted = smsController.deleteBatch(ids)
+                call.respond(toJsonElement(mapOf("success" to (deleted > 0), "deleted" to deleted, "requested" to ids.size)))
+            }
+
             post("/read") {
                 val body = call.receiveJsonObject()
                 // 兼容字符串和数字类型的 ID

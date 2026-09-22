@@ -9,6 +9,8 @@
         <n-button size="tiny" quaternary @click="emit('close')">收起</n-button>
       </div>
     </div>
+    <!-- 上限如实写在面板里：用户在这里才第一次意识到"有上限"这件事。 -->
+    <div class="up-limit">单文件上限 {{ limitLabel }}</div>
 
     <!-- 整批进度按字节加权（见 useFileUpload.overallPercent）：按文件数算会长时间卡在同一格 -->
     <n-progress
@@ -68,6 +70,8 @@ const props = defineProps<{
   doneCount: number;
   failedCount: number;
   percentOf: (t: UploadTask) => number;
+  /** 上限文案（如"2 GB"），由外部传入以跟随设备端下发的能力位。 */
+  limitLabel: string;
 }>();
 
 const emit = defineEmits<{
@@ -150,6 +154,13 @@ function subText(t: UploadTask): string {
   font-weight: 600;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+}
+
+/* 上限说明：贴在头部下方，与列表之间不另加分隔线（头部那条已经断开了） */
+.up-limit {
+  padding: 6px 12px 0;
+  font-size: var(--font-xs, 11px);
+  color: var(--text-muted);
 }
 
 .up-head-actions {

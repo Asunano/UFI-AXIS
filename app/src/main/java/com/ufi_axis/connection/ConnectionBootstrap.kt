@@ -61,6 +61,26 @@ object ConnectionBootstrap {
         RetrofitClient.recreate(prefs)
     }
 
+    /**
+     * 注册「任何业务请求传输层失败 → 立刻探活」的桥接（2026-09-21）。
+     *
+     * 为什么必须有这一条：原来「失败 → 探活 → 提示」只由 5 个 state 的 `errorMessage`
+     * combine 触发，文件 / 媒体 / 下载 / 隧道 / 应用管理这些域的失败压根不在链上，
+     * 于是设备离线时用户看到一堆行内红条却永远等不到那句「设备未连接」。
+     * 现在从 OkHttp 拦截器直接出信号，**与是哪个域无关**。
+     *
+     * 回调跑在 OkHttp 的网络线程上，所以这里只做转发；去抖与协程调度都在
+     * `HealthModule.notifyTransportFailure()` 里。
+     */
+    fun registerTransportFailureHandler(onTransportFailure: () -> Unit) {
+        RetrofitClient.onTransportFailure = onTransportFailure
+    }
+
+    /** 解绑（Activity 销毁时调用，避免持有已死的 VM）。 */
+    fun unregisterTransportFailureHandler() {
+        RetrofitClient.onTransportFailure = null
+    }
+
     /** 构造 MainViewModel 的 factory（原 MainActivity 手写 VM factory 提取）。 */
     fun mainViewModelFactory(
         api: UfiAxisApi,

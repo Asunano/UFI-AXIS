@@ -423,6 +423,25 @@ class DataScheduler(
     // 而字节增量上的 coerceAtLeast(0) 只兜住了分子，兜不住分母。
     @Volatile private var lastMonthlyElapsedMs: Long = 0L
 
+    /**
+     * 开机预热期（boot grace period，2026-09-21）。
+     *
+     * Unisoc + Android 13 + 1.5GB RAM 的设备，开机后 ~60s 系统服务才基本稳定
+     * （zygote / AMS / PMS / dex2oat 等初始化会打满全部 CPU 核心）。
+     * grace period 内：
+     * - CPU / 内存 / 信号 / 电池的 **WS 实时推送照常**（前端要看到实时值）；
+     * - **不写入 DB**（不污染历史图表）；
+     * - **不触发告警**（温度 / 联网等边沿触发不会被开机瞬态误触）。
+     *
+     * 用 `SystemClock.elapsedRealtime()`（单调时钟，从开机起算），不受 NTP 校时影响。
+     * 值来自 `AppSettings.monitorBootGraceMs`；首次启动（旧版 core 无此配置）默认 90s。
+     */
+    private val bootGraceMs: Long get() = settings?.monitorBootGraceMs ?: BOOT_GRACE_DEFAULT_MS
+
+    /** grace period 是否已过。**每次采集都查**（elapsedRealtime 很便宜，纳秒级）。 */
+    private fun isBootGracePassed(): Boolean =
+        android.os.SystemClock.elapsedRealtime() >= bootGraceMs
+
     fun start() {
         if (isRunning) return
         isRunning = true
@@ -560,12 +579,23 @@ class DataScheduler(
      * 三段各自 try/catch：任一数据源读失败（例如某些设备没有 thermal_zone）不能拖累另外两段。
      * 不写缓冲区、不广播 WS —— 纯粹为了让 [AlertEngine] 早点看到值；
      * 入库/推送由 AlertEngine 在真的发生级别跃迁时自己做。
+     *
+     * 2026-09-21：**这条循环才是全部本地告警的真正入口**（温度 / 电量 / 联网三类都从这里出），
+     * 所以 boot grace 的闸必须开在这里 —— 之前只加在 collectCpu/collectMemory/collectSignal/
+     * collectBattery 上，而这四个函数里的告警调用要么被本函数抢先、要么节拍慢得多，
+     * 开机瞬态照样能在 15 秒内穿过这条路径触发温度与断网告警。
      */
     private suspend fun scanLocalAlerts() {
         val engine = alertEngine ?: return
+        // 开机预热期内一律不判告警：此刻全核满载、热区飙高、还没搜到网都是系统行为。
+        if (!isBootGracePassed()) return
 
         try {
-            // readMaxCpuTemp() 返回毫摄氏度（与 THERMAL_*_THRESHOLD 同单位），告警阈值用摄氏度
+            // readMaxCpuTemp() 返回毫摄氏度（与 THERMAL_*_THRESHOLD 同单位），告警阈值用摄氏度。
+            // 2026-09-21：这里是 temperature 告警的**唯一**入口（collectCpu 那条已移除）——
+            // 两个来源取值不同（这里取全热区最大值、那边只读 zone0，Unisoc 上稳定差数度），
+            // 同一个边沿状态机被两个值驱动会在 warning↔normal 之间每 10~15 秒来回跃迁，
+            // 表现是「次数无限上涨 + 已恢复标记反复闪烁」，还会烧光邮件/短信配额。
             val milli = readMaxCpuTemp()
             if (milli > 0) engine.checkTemperature(milli / 1000.0)
         } catch (e: Exception) {
@@ -576,7 +606,10 @@ class DataScheduler(
             val battery = systemCollector.getBatteryInfo()
             val level = (battery["percent"] as? Int)
                 ?: (battery["level"] as? Number)?.toInt()
-            if (level != null) {
+            // level < 0 = 这台设备取不到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
+            // 少了这道判断会被当成「电量 -1%」，每 15s 触发一次 critical 低电量告警 ——
+            // collectBattery 早就挡了这个值（见那里的注释），这条路径 2026-09-21 才补上。
+            if (level != null && level >= 0) {
                 engine.checkBattery(level, battery["is_charging"] as? Boolean ?: false)
             }
         } catch (e: Exception) {
@@ -803,8 +836,8 @@ class DataScheduler(
                 ))
             }
 
-            // 告警检查: 流量超额
-            if (rxBytes > 0 || txBytes > 0) {
+            // 告警检查: 流量超额（grace 期内不判 —— 与其余告警入口保持同一口径）
+            if ((rxBytes > 0 || txBytes > 0) && isBootGracePassed()) {
                 val totalMb = (rxBytes + txBytes) / (1024 * 1024)
                 alertEngine?.checkTraffic(totalMb)
                 checkTrafficLimitThrottled(rxBytes + txBytes, now)
@@ -946,6 +979,9 @@ class DataScheduler(
                 webSocketManager.broadcast("signal", cleanSignalInfo)
             }
 
+            // Boot grace period 内不写 DB、不触发告警（信号在开机初期可能还没注册上网络）
+            if (!isBootGracePassed()) return
+
             val rsrp = (signalInfo["rsrp"] as? Number)?.toInt() ?: 0
             if (rsrp != 0) {
                 alertEngine?.checkSignal(rsrp)
@@ -975,15 +1011,7 @@ class DataScheduler(
             val cpuInfo = systemCollector.getCpuInfo()
             _latestCpu.value = CpuInfoLite(cpuInfo.usage_percent, cpuInfo.core_count, cpuInfo.temperature)
 
-            val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
-            val cpuRecord = CpuHistoryRecord(
-                usagePercent = cpuInfo.usage_percent,
-                coreCount = cpuInfo.core_count,
-                maxFreqMhz = maxFreq,
-                temperature = cpuInfo.temperature
-            )
-            cpuBuffer.offerBounded(cpuRecord, cpuBufferSize)
-
+            // WS 实时推送照常（前端要看到实时值，即使在 grace period 内）
             if (realtimePushEnabled) {
                 webSocketManager.broadcast("cpu", mapOf(
                     "usage_percent" to cpuInfo.usage_percent,
@@ -993,8 +1021,23 @@ class DataScheduler(
                 ))
             }
 
-            // 告警检查: CPU 温度
-            alertEngine?.checkTemperature(cpuInfo.temperature)
+            // Boot grace period 内不写 DB、不触发告警 —— 开机初始化阶段 CPU 100% / 高温
+            // 是系统行为而非用户负载，写入会污染历史图表，告警会误报。
+            if (!isBootGracePassed()) return
+
+            val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
+            val cpuRecord = CpuHistoryRecord(
+                usagePercent = cpuInfo.usage_percent,
+                coreCount = cpuInfo.core_count,
+                maxFreqMhz = maxFreq,
+                temperature = cpuInfo.temperature
+            )
+            cpuBuffer.offerBounded(cpuRecord, cpuBufferSize)
+
+            // 2026-09-21 移除 `alertEngine?.checkTemperature(cpuInfo.temperature)`：
+            // temperature 告警的唯一入口收敛到 scanLocalAlerts()（那里用 readMaxCpuTemp 取
+            // 全热区最大值）。这里读的是 zone0，与那边取值不同 —— 同一个边沿状态机被两个值
+            // 驱动会永久抖动，详见 scanLocalAlerts 的注释。温度仍然照常入库与 WS 推送。
         } catch (e: CancellationException) {
             throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
@@ -1016,6 +1059,9 @@ class DataScheduler(
                 return
             }
             val isCharging = batteryInfo["is_charging"] as? Boolean ?: false
+
+            // Boot grace period 内不写 DB、不触发告警
+            if (!isBootGracePassed()) return
 
             // 持久化电池历史 — 使用 buffer 批量写入，与其他采集器统一
             val record = BatteryHistoryRecord(
@@ -1044,14 +1090,6 @@ class DataScheduler(
             val memoryInfo = systemCollector.getMemoryInfo()
             _latestMemory.value = memoryInfo
 
-            // 缓冲内存历史记录，批量写入减少 I/O
-            memoryBuffer.offerBounded(MemoryHistoryRecord(
-                total = memoryInfo.total,
-                used = memoryInfo.used,
-                available = memoryInfo.available,
-                usagePercent = memoryInfo.usage_percent
-            ), memoryBufferSize)
-
             if (realtimePushEnabled) {
                 webSocketManager.broadcast("memory", mapOf(
                     "total" to memoryInfo.total,
@@ -1063,6 +1101,17 @@ class DataScheduler(
                     "usage_percent" to memoryInfo.usage_percent
                 ))
             }
+
+            // Boot grace period 内不写 DB（内存在开机初期同样虚高）
+            if (!isBootGracePassed()) return
+
+            // 缓冲内存历史记录，批量写入减少 I/O
+            memoryBuffer.offerBounded(MemoryHistoryRecord(
+                total = memoryInfo.total,
+                used = memoryInfo.used,
+                available = memoryInfo.available,
+                usagePercent = memoryInfo.usage_percent
+            ), memoryBufferSize)
         } catch (e: CancellationException) {
             throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
@@ -1815,6 +1864,8 @@ class DataScheduler(
         get() = (settings?.monitorDeviceEventCheckSec ?: 60) * 1000L
 
     private companion object {
+        /** 默认 boot grace = 90 秒。Unisoc 实测 ~60s 稳定，留 30s 余量。 */
+        const val BOOT_GRACE_DEFAULT_MS = 90_000L
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s
         const val BATTERY_COLLECTION_INTERVAL_MS = 60_000L
         // 刷写间隔 / 空闲采集间隔 / 告警扫描间隔 / 保留天数 / 温控档位

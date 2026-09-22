@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavHostController
@@ -46,6 +47,11 @@ import kotlinx.serialization.json.put
  * 因此流程固定为「选择文件 → 预览清单 → 确认 → 写入」。`/api/backup/preview` 只读不写，
  * 加密包在预览阶段即可发现口令错误，不会在写入时才失败。
  *
+ * 2026-09-21：上面这条流程原来是一个弹窗内按 `preview == null` 切两半，现在由公共向导
+ * [UfiWizard] 显式承载三步（备份包 → 清单 → 写入），恢复态下整页换成向导布局。
+ * 换的原因：段清单随包变化可达十余行，弹窗 82% 屏高装不下，用户既看不全清单也可能够不到
+ * 底部按钮；而"预览是否通过"现在就是第 2 步的 `validate`，没过就走不到写入步。
+ *
  * ## 明文导出
  * 加密为默认值，但允许关闭，便于在其他工具中查看备份内容。关闭时弹窗给出的是风险提示块
  * （[UfiDialogWarning]）而非普通说明：明文包中包含通知渠道密码等凭据。
@@ -73,7 +79,13 @@ fun BackupRestoreScreen(
     var exporting by remember { mutableStateOf(false) }
 
     // ── 恢复 ──
-    var importDialogOpen by remember { mutableStateOf(false) }
+    // 2026-09-21：从「一个弹窗内按 preview 是否为空切两半」改成公共向导 [UfiWizard]。
+    // 原实现的问题（注释就写在旧弹窗上）：段清单随包变化可达十余行，加上恢复方式与三条条件
+    // 提示，高度必然超过弹窗的 82% 屏高上限 —— 用户既看不到完整清单，也可能够不到底部的
+    // 「开始恢复」。而 `preview == null` 本来就是个事实上的步骤位（它决定主按钮文案在
+    // 「检查备份包 / 开始恢复」之间切、也决定内容画哪一半），只是没有步骤条把它显出来。
+    var restoreWizardOpen by remember { mutableStateOf(false) }
+    var restoreStep by remember { mutableStateOf(0) }
     var importBytes by remember { mutableStateOf<ByteArray?>(null) }
     var importPass by remember { mutableStateOf("") }
     var importReplace by remember { mutableStateOf(false) }
@@ -114,11 +126,213 @@ fun BackupRestoreScreen(
             importReplace = false
             preview = null
             importError = null
-            importDialogOpen = true
+            restoreStep = 0
+            restoreWizardOpen = true
         }
     }
 
-    UfiScreenScaffold(title = "备份与恢复", navController = navController, showBack = true) { padding ->
+    /** 真正的写入动作，只由向导末步的主按钮触发。 */
+    fun doImport() {
+        val bytes = importBytes ?: return
+        importBusy = true
+        importError = null
+        scope.launch {
+            viewModel.backup.import(bytes, importReplace, importPass)
+                .onSuccess { report ->
+                    report.client_app?.let { applyAppSection(it, themeManager, prefs) }
+                    restoreWizardOpen = false
+                    importBytes = null
+                    preview = null
+                    toastMessage = ToastMessage(
+                        buildString {
+                            append("已恢复 ${report.applied.size} 段")
+                            if (report.failed.isNotEmpty()) {
+                                append("，${report.failed.size} 段失败")
+                            }
+                            if (report.needs_restart) append("；部分设置需重启服务后生效")
+                        },
+                        if (report.failed.isEmpty()) ToastType.SUCCESS else ToastType.WARNING,
+                        durationMs = 5000L
+                    )
+                }
+                .onFailure { importError = it.message }
+            importBusy = false
+        }
+    }
+
+    UfiScreenScaffold(
+        title = if (restoreWizardOpen) "从备份恢复" else "备份与恢复",
+        navController = navController,
+        showBack = true
+    ) { padding ->
+        val pv = preview
+
+        // ── 恢复向导（整页）与落地列表两套布局 ──
+        // 向导是 fillMaxSize 骨架（步骤条 + 面板 + 固定底部操作栏），塞不进 UfiPageBackground
+        // 那条滚动列，所以这里分两套，而不是在页面里换一块内容。
+        if (restoreWizardOpen && importBytes != null) {
+            // 进入「清单」步时自动校验一次备份包。
+            // 为什么把异步挂在步号上：向导的「下一步」只负责换步，不跑任务；而"预览是否通过"
+            // 正好可以表达成第 2 步的 validate —— 没过就走不到写入步，判据和状态提示是同一处。
+            LaunchedEffect(restoreStep) {
+                if (restoreStep != 1 || preview != null || importBusy) return@LaunchedEffect
+                val bytes = importBytes ?: return@LaunchedEffect
+                importBusy = true
+                importError = null
+                viewModel.backup.preview(bytes, importPass)
+                    .onSuccess { preview = it }
+                    .onFailure { importError = it.message ?: "备份包校验失败" }
+                importBusy = false
+            }
+
+            Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+                UfiWizard(
+                    steps = listOf(
+                        UfiWizardStep(
+                            label = "备份包",
+                            heading = "确认备份包与口令",
+                            description = "下一步只校验备份包并列出其中内容，不会修改任何配置。"
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                UfiDialogInfoRow("文件大小", "${(importBytes?.size ?: 0) / 1024} KB")
+                                UfiDialogPasswordField(
+                                    label = "口令（未加密的备份留空）",
+                                    value = importPass,
+                                    // 改口令意味着上一次的预览结果作废，清掉它逼下一步重新校验
+                                    onValueChange = { importPass = it; importError = null; preview = null },
+                                    enabled = !importBusy
+                                )
+                                UfiButton(
+                                    text = "重新选择文件",
+                                    variant = UfiButtonVariant.Subtle,
+                                    size = UfiButtonSize.Small,
+                                    enabled = !importBusy,
+                                    onClick = { pickLauncher.launch(arrayOf("*/*")) }
+                                )
+                            }
+                        },
+                        UfiWizardStep(
+                            label = "清单",
+                            heading = "备份包里有什么",
+                            description = "这一步只读不写。口令不对会在这里就报错，不会等到写入时才失败。",
+                            validate = {
+                                when {
+                                    importBusy -> "正在校验备份包…"
+                                    preview == null ->
+                                        importError?.let { "校验失败：$it" } ?: "请返回上一步重新校验"
+                                    else -> null
+                                }
+                            }
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                when {
+                                    importBusy -> Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                                    ) {
+                                        CircularProgressIndicator(modifier = Modifier.size(Spacing.IconSizeMedium))
+                                        Text("正在校验备份包…", style = UfiTextStyles.note)
+                                    }
+                                    importError != null -> UfiDialogWarning(importError.orEmpty())
+                                    pv != null -> {
+                                        UfiDialogInfoRow("导出时间", formatBackupTime(pv.created_at))
+                                        UfiDialogInfoRow("加密", if (pv.encrypted) "是" else "否")
+                                        UfiDialogSectionTitle("包含内容")
+                                        pv.sections.forEach { s ->
+                                            UfiDialogInfoRow(
+                                                label = s.label,
+                                                value = "${s.items} 项" +
+                                                    if (s.sensitive_items > 0) " · 含敏感信息" else ""
+                                            )
+                                        }
+                                        if (!pv.same_device) {
+                                            UfiDialogNote("该备份来自另一台设备，与硬件相关的配置恢复后可能需要重新调整。")
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        UfiWizardStep(
+                            label = "写入",
+                            heading = "决定怎么写入",
+                            description = "点下方按钮后才会真正改动配置。"
+                        ) {
+                            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
+                                // chip 只承载档位名，说明另起一行：整句文案会把 chip 轨道撑满并折行，
+                                // 与全站 chip（15/30/60、自动/浅色/深色）的形态不一致。
+                                UfiDialogChipSelector(
+                                    label = "恢复方式",
+                                    options = listOf("merge" to "合并", "replace" to "替换"),
+                                    selectedValue = if (importReplace) "replace" else "merge",
+                                    onSelect = { importReplace = it == "replace" }
+                                )
+                                if (importReplace) {
+                                    UfiDialogWarning("替换会清除本机上备份中不存在的项，例如新增的通知渠道或定时任务。")
+                                } else {
+                                    UfiDialogNote("合并只覆盖备份中存在的项，其余配置保持不变。")
+                                }
+                                UfiWizardReviewCard(
+                                    title = "将要恢复",
+                                    icon = Icons.Default.Restore,
+                                    rows = buildList {
+                                        add(
+                                            UfiWizardReviewRow(
+                                                "导出时间",
+                                                pv?.created_at?.let { formatBackupTime(it) } ?: "未知"
+                                            )
+                                        )
+                                        add(
+                                            UfiWizardReviewRow(
+                                                "内容",
+                                                pv?.let { "${it.sections.size} 段 · 共 ${it.sections.sumOf { s -> s.items }} 项" }
+                                                    ?: "未知"
+                                            )
+                                        )
+                                        add(
+                                            UfiWizardReviewRow(
+                                                "敏感信息",
+                                                if (pv?.sections?.any { it.sensitive_items > 0 } == true) "包含" else "不包含"
+                                            )
+                                        )
+                                        add(
+                                            UfiWizardReviewRow(
+                                                "来源",
+                                                if (pv?.same_device == true) "本机" else "其他设备"
+                                            )
+                                        )
+                                        add(
+                                            UfiWizardReviewRow(
+                                                "写入方式",
+                                                if (importReplace) "替换（清除备份中不存在的项）"
+                                                else "合并（只覆盖备份中存在的项）"
+                                            )
+                                        )
+                                    }
+                                )
+                                // 写入失败时错误留在这一步，用户可以直接改恢复方式重试
+                                importError?.let { UfiDialogWarning(it) }
+                            }
+                        }
+                    ),
+                    currentStep = restoreStep,
+                    onStepChange = { restoreStep = it },
+                    onFinish = { doImport() },
+                    finishText = if (importReplace) "替换并恢复" else "合并恢复",
+                    finishLoading = importBusy,
+                    // 本页的返回键会把整页弹掉（连带丢掉已读入内存的备份包），所以第 1 步
+                    // 的左键必须给一个"只退出向导"的出口。
+                    exitText = "取消",
+                    onExit = {
+                        restoreWizardOpen = false
+                        importBytes = null
+                        preview = null
+                        importError = null
+                    },
+                    onStepBlocked = { toastMessage = ToastMessage(it, ToastType.WARNING) }
+                )
+            }
+        } else {
         UfiPageBackground(modifier = Modifier.padding(padding)) {
 
             // 仅隧道来源提示，局域网不提示：局域网虽然同为明文 HTTP，范围限于用户自己的网段。
@@ -176,6 +390,7 @@ fun BackupRestoreScreen(
             }
 
             Spacer(Modifier.height(Spacing.Large))
+        }
         }
 
         // ── 导出弹窗 ──
@@ -268,108 +483,6 @@ fun BackupRestoreScreen(
                     )
                 }
                 UfiDialogNote("导出位置：$BACKUP_DIR_LABEL")
-            }
-        }
-
-        // ── 恢复弹窗 ──
-        // 必须用 UfiScrollableDialog：内容是「段清单」（随包变化，可达十余行）+ 恢复方式，
-        // 高度会超过屏幕 82%。UfiCustomDialog 不带滚动，超出部分会被直接裁掉 ——
-        // 用户既看不到完整清单，也可能够不到底部的「开始恢复」，属于会把功能卡死的裁切。
-        val pv = preview
-        UfiScrollableDialog(
-            visible = importDialogOpen,
-            onDismiss = { if (!importBusy) importDialogOpen = false },
-            title = "从备份恢复",
-            confirmButton = {
-                UfiButton(
-                    // 预览通过前只能执行检查，写入必然发生在清单确认之后
-                    text = if (pv == null) "检查备份包" else "开始恢复",
-                    loading = importBusy,
-                    enabled = !importBusy,
-                    onClick = {
-                        val bytes = importBytes ?: return@UfiButton
-                        importBusy = true
-                        importError = null
-                        scope.launch {
-                            if (pv == null) {
-                                viewModel.backup.preview(bytes, importPass)
-                                    .onSuccess { preview = it }
-                                    .onFailure { importError = it.message }
-                                importBusy = false
-                                return@launch
-                            }
-                            viewModel.backup.import(bytes, importReplace, importPass)
-                                .onSuccess { report ->
-                                    report.client_app?.let { applyAppSection(it, themeManager, prefs) }
-                                    importDialogOpen = false
-                                    importBytes = null
-                                    preview = null
-                                    toastMessage = ToastMessage(
-                                        buildString {
-                                            append("已恢复 ${report.applied.size} 段")
-                                            if (report.failed.isNotEmpty()) {
-                                                append("，${report.failed.size} 段失败")
-                                            }
-                                            if (report.needs_restart) append("；部分设置需重启服务后生效")
-                                        },
-                                        if (report.failed.isEmpty()) ToastType.SUCCESS else ToastType.WARNING,
-                                        durationMs = 5000L
-                                    )
-                                }
-                                .onFailure { importError = it.message }
-                            importBusy = false
-                        }
-                    }
-                )
-            },
-            dismissButton = {
-                // 同上：只有「取消」是纯关闭动作；「检查备份包/开始恢复」要留在弹窗里跑异步。
-                val close = LocalUfiDialogClose.current
-                UfiButton(
-                    text = "取消",
-                    variant = UfiButtonVariant.Secondary,
-                    enabled = !importBusy,
-                    onClick = { close { importDialogOpen = false } }
-                )
-            }
-        ) {
-            UfiDialogBody {
-                if (pv == null) {
-                    UfiDialogNote("先校验备份包是否可读并列出其中内容，此步骤不会修改任何配置。")
-                    UfiDialogPasswordField(
-                        label = "口令（未加密的备份留空）",
-                        value = importPass,
-                        onValueChange = { importPass = it },
-                        enabled = !importBusy
-                    )
-                } else {
-                    UfiDialogInfoRow("导出时间", formatBackupTime(pv.created_at))
-                    UfiDialogInfoRow("加密", if (pv.encrypted) "是" else "否")
-                    UfiDialogSectionTitle("包含内容")
-                    pv.sections.forEach { s ->
-                        UfiDialogInfoRow(
-                            label = s.label,
-                            value = "${s.items} 项" + if (s.sensitive_items > 0) " · 含敏感信息" else ""
-                        )
-                    }
-                    // chip 只承载档位名，说明另起一行：整句文案会把 chip 轨道撑满并折行，
-                    // 与全站 chip（15/30/60、自动/浅色/深色）的形态不一致。
-                    UfiDialogChipSelector(
-                        label = "恢复方式",
-                        options = listOf("merge" to "合并", "replace" to "替换"),
-                        selectedValue = if (importReplace) "replace" else "merge",
-                        onSelect = { importReplace = it == "replace" }
-                    )
-                    if (importReplace) {
-                        UfiDialogWarning("替换会清除本机上备份中不存在的项，例如新增的通知渠道或定时任务。")
-                    } else {
-                        UfiDialogNote("合并只覆盖备份中存在的项，其余配置保持不变。")
-                    }
-                    if (!pv.same_device) {
-                        UfiDialogNote("该备份来自另一台设备，与硬件相关的配置恢复后可能需要重新调整。")
-                    }
-                }
-                importError?.let { UfiDialogWarning(it) }
             }
         }
 

@@ -5,6 +5,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -68,19 +69,23 @@ private val LYRIC_IDLE_LINE_HEIGHT = 28.sp
 /** 非当前句缩到这个比例：与颜色一起表达"不是这一句"，比只变灰更清楚。 */
 private const val LYRIC_INACTIVE_SCALE = 0.94f
 
-/** 行间距与视口上下留白：留白大一点，当前句滚到中部时上下都有呼吸空间。 */
+/**
+ * 整屏歌词的行间距。
+ *
+ * 视口上下留白不再是常量：改成运行时取**半个视口**（见 [MediaLyricsFullView]），
+ * 这样第一句与最后一句也能被滚到正中。原来那个 40dp 的 `LYRIC_VIEWPORT_PADDING` 已删除。
+ */
 private val LYRIC_LINE_GAP = 18.dp
-private val LYRIC_VIEWPORT_PADDING = 40.dp
 
 /**
- * 封面下方歌词预览的固定高度（约三行）。
+ * 封面下方歌词预览的单行高度与行距。
  *
- * 写死高度是刻意的：预览区在封面与进度条之间，高度一变整页版式就跟着跳。
- *
- * 2026-09-19 从 80dp 加到 96dp：三行 `body` 每行约 22dp、行间 [Spacing.Small]，80dp
- * 放不下第三行 —— 表现为"上一行 1 行、下面 2 行且第二行被切一半"。
+ * 视口 = `3 × 行高 + 2 × 行距`，恰好三行；当前行的滚动偏移 = `−(行高 + 行距)`。
+ * 两个值都写死是刻意的：预览区夹在封面与进度条之间，高度一变整页版式就跟着跳；
+ * 而且滚动居中靠的就是这两个常量，改成"按实测尺寸算"会在首帧量不到而失准。
  */
-private val LYRIC_PREVIEW_HEIGHT = 96.dp
+private val LYRIC_PREVIEW_ROW_HEIGHT = 26.dp
+private val LYRIC_PREVIEW_ROW_GAP = 4.dp
 
 
 /** 当前播放位置对应的行下标；-1 = 还没到第一行，或这份歌词没有时间轴。 */
@@ -100,8 +105,14 @@ internal fun ufiLyricIndexAt(lines: List<UfiAudioLyrics.Line>, positionMs: Long)
  * 只在**有时间轴**且已经进到第一句之后才显示内容：三行预览的全部意义就是"现在唱到这儿"，
  * 没有依据时显示三行随机歌词只会误导。
  *
- * 2026-09-19：改为微型 LazyColumn 滚动切换（与全屏歌词页 [MediaLyricsFullView] 同感觉），
- * 当前行用 `animateScrollToItem` 滚到中间，亮色高亮，其他行暗色。
+ * ## 为什么行高写死
+ * 2026-09-19：视口固定成**恰好三行**（`3 × 行高 + 2 × 行距`），当前行永远落在正中间 ——
+ * 于是滚动偏移是个常量 `−(行高 + 行距)`，不需要去 `layoutInfo` 里量。
+ * 之前按实测 item 尺寸算居中，首帧 `visibleItemsInfo` 还是空的、量不到，就退化成
+ * "上一行、下两行且最后一行被裁"。行高写死之后这个时序问题不存在。
+ *
+ * 行高统一（当前行也不放大字号，只改字重与颜色）：字号一变，三行的总高就会跟着变，
+ * 视口高度与滚动偏移这两个常量当场失效。
  */
 @Composable
 internal fun MediaLyricsPreview(
@@ -115,26 +126,35 @@ internal fun MediaLyricsPreview(
     val current = index.coerceAtLeast(0)
     val listState = rememberLazyListState()
 
+    /*
+     * 居中偏移是 0，不是 −(行高 + 行距)。
+     *
+     * `scrollToItem(i, off)` 最终把 item 顶端放在 `beforeContentPadding − off`。
+     * 这里的 contentPadding 上方正好垫了一行（行高 + 行距），所以 off = 0 时
+     * item 顶端就落在第二行的位置 —— 三行视口的正中。
+     *
+     * 2026-09-20 修：加了 contentPadding 之后还在用旧的 −(行高 + 行距)，
+     * 于是 item 被推到 `2 × (行高 + 行距)`，当前句跑到了最下面那一行。
+     */
     LaunchedEffect(current) {
-        if (current < 0) return@LaunchedEffect
-        // 居中公式见 MediaLyricsFullView 里的说明：scrollOffset = 半个 item − 半个视口
-        val info = listState.layoutInfo
-        val viewportH = info.viewportEndOffset - info.viewportStartOffset
-        val itemSize = info.visibleItemsInfo.firstOrNull { it.index == current }?.size
-            ?: info.visibleItemsInfo.firstOrNull()?.size
-            ?: 0
-        listState.animateScrollToItem(current, (itemSize / 2) - (viewportH / 2))
+        listState.animateScrollToItem(current, 0)
     }
 
     LazyColumn(
         state = listState,
         modifier = modifier
             .fillMaxWidth()
-            .height(LYRIC_PREVIEW_HEIGHT)
+            .height(LYRIC_PREVIEW_ROW_HEIGHT * 3 + LYRIC_PREVIEW_ROW_GAP * 2)
             .clickable(onClick = onClick),
+        // 首尾各垫一行：第一句/最后一句也能落在中间那一行，而不是贴着顶或底
+        contentPadding = PaddingValues(
+            vertical = LYRIC_PREVIEW_ROW_HEIGHT + LYRIC_PREVIEW_ROW_GAP
+        ),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(Spacing.Small),
-        userScrollEnabled = false
+        verticalArrangement = Arrangement.spacedBy(LYRIC_PREVIEW_ROW_GAP),
+        // 2026-09-20 放开手动滚动：之前锁死成"只能看"的容器，想往前/后翻几句只能进整屏歌词页。
+        // 放开之后自动跟播仍然生效（下一句到点时 animateScrollToItem 把视口拉回当前句）。
+        userScrollEnabled = true
     ) {
         itemsIndexed(lines) { i, line ->
             val active = i == current && index >= 0
@@ -142,15 +162,22 @@ internal fun MediaLyricsPreview(
                 targetValue = if (active) palette.textPrimary else palette.textSecondary.copy(alpha = 0.6f),
                 label = "previewColor"
             )
-            Text(
-                text = line.text,
-                style = if (active) UfiTextStyles.bodyLeadStrong else UfiTextStyles.body,
-                color = color,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(LYRIC_PREVIEW_ROW_HEIGHT),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = line.text,
+                    style = if (active) UfiTextStyles.bodyLeadStrong else UfiTextStyles.bodyLead,
+                    color = color,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
     }
 }
@@ -195,34 +222,47 @@ internal fun MediaLyricsFullView(
     LaunchedEffect(index) {
         if (index < 0) return@LaunchedEffect
         /*
-         * 当前句滚到视口**正中**（2026-09-19 再修）。
+         * 当前句滚到视口**正中**（2026-09-20 再修）。
          *
-         * `animateScrollToItem(index, scrollOffset)` 的语义是"把该 item 的顶端放到
-         * 视口起点 + scrollOffset"。所以要让它垂直居中，偏移量必须是
-         *   scrollOffset = itemSize / 2 − viewportHeight / 2
-         * （负值，等于把 item 往下推到中线上）。
+         * `scrollToItem(index, off)` 最终把该 item 的顶端放在
+         *   `beforeContentPadding − off`
+         * 这一页的 contentPadding 上方是**半个视口**（H/2），要让 item 居中就得把顶端放在
+         * `H/2 − itemSize/2`，代入得
+         *   off = H/2 − (H/2 − itemSize/2) = itemSize / 2
          *
-         * 之前写的是 `-(viewportHeight / 3)`：那只是"顶端落在视口 1/3 处"，与行高无关，
-         * 行一高一低当前句就偏上或偏下 —— 不是居中。itemSize 取不到当前行时退而用任意
-         * 一行的高度（歌词行高度相近），再不行按 0 处理（退化成顶端对齐视口中线）。
+         * 之前写的是 `itemSize/2 − viewportH/2`，且 viewportH 取的是
+         * `viewportEndOffset − viewportStartOffset` —— 那个差值**含 contentPadding**
+         * （= H + H/2 + H/2 = 2H），于是多滚了整整一个 H，当前句被推到视口底部。
+         *
+         * itemSize 取不到当前行时退而用任意一行（歌词行高度相近），再不行按 0 处理
+         * （退化成顶端贴中线，略偏下但不会跑飞）。
          */
         val info = listState.layoutInfo
-        val viewportH = info.viewportEndOffset - info.viewportStartOffset
         val itemSize = info.visibleItemsInfo.firstOrNull { it.index == index }?.size
             ?: info.visibleItemsInfo.firstOrNull()?.size
             ?: 0
-        listState.animateScrollToItem(index, (itemSize / 2) - (viewportH / 2))
+        listState.animateScrollToItem(index, itemSize / 2)
     }
     Column(modifier = modifier.fillMaxSize()) {
-        LazyColumn(
-            state = listState,
+        /*
+         * 用 BoxWithConstraints 拿到视口高度，把 contentPadding 定成**半个视口**。
+         *
+         * 2026-09-20：原来是固定 40dp 的上下留白 —— 于是刚开播（index=0）时第一句只能贴在
+         * 距顶 40dp 处、结尾最后一句也到不了中线，只有中间那些句子才真的居中。
+         * 首尾各垫半个视口之后，任何一句（含第一句、最后一句）都能被滚到正中。
+         */
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f),
-            contentPadding = PaddingValues(vertical = LYRIC_VIEWPORT_PADDING),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(LYRIC_LINE_GAP)
+                .weight(1f)
         ) {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(vertical = maxHeight / 2),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(LYRIC_LINE_GAP)
+            ) {
             itemsIndexed(lines) { i, line ->
                 val active = i == index
                 val color by animateColorAsState(
@@ -268,6 +308,7 @@ internal fun MediaLyricsFullView(
                         )
                         .padding(vertical = Spacing.Small)
                 )
+                }
             }
         }
         if (source.isNotBlank()) {

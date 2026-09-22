@@ -253,24 +253,33 @@ class TunnelRoutes(private val tunnelManager: TunnelManager) {
                     }
                 }
 
-                /** 新建/更新单条隧道（body: {token}）；名字非法或 token 为空 → 400 */
+                /**
+                 * 新建/更新单条隧道（body: {token}）；名字非法 / token 不合法 → 400。
+                 *
+                 * 2026-09-21：token 改为**结构校验**（base64 解出的 JSON 必须含 a/t/s 三键），
+                 * 拒绝原因逐字回给客户端。此前只挡空串，带引号的 `"eyJ..."`、`--token=eyJ...`、
+                 * 误填的 Tunnel ID(UUID) 都能存盘，然后 cloudflared 秒退（exit=255）只留一句
+                 * `Provided Tunnel token is not valid.`，用户完全无从定位。
+                 */
                 put("/tunnel/{name}") {
                     val name = call.parameters["name"] ?: ""
                     val body = call.receiveJsonObject()
-                    val token = body["token"]?.jsonPrimitive?.contentOrNull ?: ""
+                    // as? JsonPrimitive：token 传成对象/数组时要 400 而不是抛异常兜底成 500
+                    val token = (body["token"] as? JsonPrimitive)?.contentOrNull ?: ""
                     if (name.isBlank()) {
                         call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "name is required")
                         return@put
                     }
-                    if (token.isBlank()) {
-                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "token is required")
+                    val reject = tunnelManager.cfTokenRejectReason(token)
+                    if (reject != null) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, reject)
                         return@put
                     }
                     val ok = withContext(Dispatchers.IO) { tunnelManager.saveCfTunnel(name, token) }
                     if (!ok) {
                         call.respondFail(
                             HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
-                            "invalid tunnel name or save failed"
+                            "隧道名不合法或写入失败"
                         )
                         return@put
                     }

@@ -41,27 +41,15 @@ fun ToolsScreen(viewModel: MainViewModel, navController: NavHostController) {
             // 与同文件下方那条 isLoading 漏显 bug 同一个成因。现在错误统一由 Activity 级
             // 全局浮层展示（MainActivity 读 viewModel.globalError）。
 
-            // 工具入口：11 个 UfiGridCard 单组平铺（用户要求去掉分组标题，卡片保留）。
-            // 2026-09-16：原「媒体中心」一张卡（一页三栏）拆成视频 / 音乐 / 图片三张 ——
-            // 三类各有各的扫描范围与授权状态，合在一页里挤，且要先选栏才能看。
-            FlowRow(
-                Modifier.fillMaxWidth().padding(horizontal = Spacing.PagePadding),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-                maxItemsInEachRow = 2
-            ) {
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "文件管理", icon = Icons.Default.FolderOpen, description = "浏览/复制/移动/上传", onClick = { navController.navigate("detail/files") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "视频", icon = Icons.Default.Videocam, description = "设备里的视频", onClick = { navController.navigate(Routes.MEDIA_LIBRARY_VIDEO) })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "音乐", icon = Icons.Default.MusicNote, description = "播放 · 系统媒体控制", onClick = { navController.navigate(Routes.MEDIA_LIBRARY_AUDIO) })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "图片", icon = Icons.Default.Image, description = "缩略图 · 缩放查看", onClick = { navController.navigate(Routes.MEDIA_LIBRARY_IMAGE) })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "下载管理", icon = Icons.Default.CloudDownload, description = "远程下载/aria2", onClick = { navController.navigate("detail/downloads") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "高级控制台", icon = Icons.Default.Terminal, description = "AT 指令 · Shell", onClick = { navController.navigate("detail/tools-advanced") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "应用管理", icon = Icons.Default.Apps, description = "安装/卸载", onClick = { navController.navigate("detail/apps") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "定时任务", icon = Icons.Default.Schedule, description = "脚本调度", onClick = { navController.navigate("detail/tasks") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "短信", icon = Icons.Default.Sms, description = "收发短信", onClick = { navController.navigate("detail/sms") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "流量管理", icon = Icons.Default.DataUsage, description = "限额与统计", onClick = { navController.navigate("detail/traffic-management") })
-                UfiGridCard(modifier = Modifier.weight(1f, fill = true), title = "内网穿透", icon = Icons.Default.VpnLock, description = "FRP · CF Tunnel", onClick = { navController.navigate("detail/tunnel") })
-            }
+            // 工具入口：日常七项 + 「进阶工具」，八格两列正好四行。
+            //
+            // 2026-09-20 拆页：原来 11 张卡平铺，内网穿透 / 定时任务 / 应用管理 / 高级控制台
+            // 这四项是"低频 + 需要先懂点什么才敢点"的东西，混在日常入口里既把常用的挤到下面，
+            // 也让人误以为随便点都安全。它们搬到 [ToolsExtraScreen]，清单见 TOOLS_EXTRA。
+            //
+            // 卡片数据放在 ToolsExtraScreen.kt 的 TOOLS_PRIMARY_GRID / TOOLS_EXTRA ——
+            // 之前是 11 次写死的调用，6 个用裸字符串路由、3 个用 Routes.* 常量，连同一页都不统一。
+            ToolGrid(entries = TOOLS_PRIMARY_GRID, navController = navController)
 
             // 2026-09-04 删掉 `UfiLoadingBox(isLoading = state.isLoading) {}`
             // ——「进短信页每次都转圈」的真正来源，圆圈画在**工具页**上而不是短信页里。

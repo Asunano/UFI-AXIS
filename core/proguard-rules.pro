@@ -91,9 +91,27 @@
 -keep class com.sun.activation.** { *; }
 -dontwarn javax.activation.**
 
-# FFmpegKit：Java 层随 APK 走（core:api 的 implementation(files("libs/ffmpeg-kit-classes.jar"))），
-# native 层（9 个 .so）是可选插件组件，运行时 System.load(绝对路径) 加载。
-# keep 是必需的：Java 类只被反射（Class.forName）引用，R8 找不到静态引用会整包剥掉；
-# 且 native 方法名/签名必须与 .so 里注册的一致，混淆会让 JNI 注册对不上。
--keep class com.arthenica.ffmpegkit.** { *; }
--dontwarn com.arthenica.ffmpegkit.**
+# Apache Commons Net（FTP 存储源，阶段 5）
+# DefaultFTPFileEntryParserFactory 对非内置 SYST 关键字走 Class.forName(key) 反射实例化
+# 目录解析器（NT / OS400 / MVS / Netware / VMS 等）。R8 看不到这条引用会把它们剥掉，
+# 表现为「连上服务器但列目录恒空」—— 与上面 Netty 那次同一类问题（反射面不可达即被删）。
+# 整包保留：FTP 解析器一共十来个类，体积代价远低于排查成本。
+-keep class org.apache.commons.net.** { *; }
+-dontwarn org.apache.commons.net.**
+
+# smbj（SMB/CIFS 存储源）：内部大量用反射解析 SMB 消息结构体与 NtStatus 枚举，
+# R8 看不到这些引用；不 keep 的话混淆包能连上但解析响应时抛 NoSuchMethodException。
+-keep class com.hierynomus.** { *; }
+-dontwarn com.hierynomus.**
+# smbj 依赖 bouncycastle 做 NTLM / SMB3 加密。注意：smbj 自带的 bcprov-jdk18on 已在
+# core/api/build.gradle.kts 里排掉（与 jcifs-ng 的 bcprov-jdk15on 重类），运行期用的是
+# jcifs-ng 那份，smbj 通过 Class.forName("org.bouncycastle.crypto.Digest") 探测后启用
+# BCSecurityProvider —— 探测失败会退回 JCE，而 Android 的 JCE 没有 MD4，NTLM 直接不可用。
+-dontwarn org.bouncycastle.**
+# smbj 用 mbassador 当内部事件总线（连接/会话关闭事件），它按 @Handler 注解反射派发，
+# 混淆掉方法名就收不到事件；整包保留（库本身很小）。
+-keep class net.engio.mbassy.** { *; }
+-dontwarn net.engio.mbassy.**
+# mbassador 的 EL 过滤器引用 javax.el（Java EE 可选依赖，Android 上不存在）。
+# 我们不用表达式过滤，dontwarn 即可 —— 不加这条 R8 直接以 Missing class 失败。
+-dontwarn javax.el.**

@@ -33,14 +33,15 @@ class GoformNetworkClient(
 
     // ==================== 移动数据 ====================
 
-    suspend fun setMobileData(enabled: Boolean): Boolean {
-        val primaryId = if (enabled) "CONNECT_NETWORK" else "DISCONNECT_NETWORK"
-        if (client.isGoformSuccess(client.goformPost(mapOf("isTest" to "false", "notCallback" to "true", "goformId" to primaryId)))) return true
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_DATA_ENABLED",
-            "data" to if (enabled) "1" else "0"
-        )))
-    }
+    /**
+     * 开关移动数据。
+     *
+     * 两件设备事实都在 [SettingKey.MOBILE_DATA] 的 WriteSpec 里：开/关是两条不同的 goformId
+     * （`commandOf`），主命令不成功还要发一条 `SET_DATA_ENABLED` 兜底（`fallback`）。
+     * 所以这里没有 if —— 兜底的触发条件覆盖「非 Ok 的全部分支」，与改造前「第一条返回
+     * 不成功或 null 就发第二条」等价（见 [GoformSettingWriter.writeChecked]）。
+     */
+    suspend fun setMobileData(enabled: Boolean): Boolean = writer.write(SettingKey.MOBILE_DATA, enabled)
 
     // ==================== 承载/连接 ====================
 
@@ -58,24 +59,21 @@ class GoformNetworkClient(
     suspend fun setBearerPreference(preference: String): WriteOutcome =
         writer.writeChecked(SettingKey.NETWORK_MODE, preference)
 
-    suspend fun connectNetwork(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "notCallback" to "true", "goformId" to "CONNECT_NETWORK"
-        )))
-    }
+    /**
+     * 手动拨号。
+     *
+     * 走 [SettingKey.PPP_DIAL] 而不是 [SettingKey.MOBILE_DATA]：命令名与参数完全相同，
+     * 但这一项**没有 `SET_DATA_ENABLED` 兜底** —— 现状这两个入口失败就是失败。
+     * 合并进 MOBILE_DATA 等于给它们偷偷加一条从来没发过的命令（会额外改一次数据开关）。
+     */
+    suspend fun connectNetwork(): Boolean = writer.write(SettingKey.PPP_DIAL, true)
 
-    suspend fun disconnectNetwork(): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "notCallback" to "true", "goformId" to "DISCONNECT_NETWORK"
-        )))
-    }
+    /** 挂断。与 [connectNetwork] 同一个 key，由 `commandOf` 按取值选 `DISCONNECT_NETWORK`。 */
+    suspend fun disconnectNetwork(): Boolean = writer.write(SettingKey.PPP_DIAL, false)
 
-    suspend fun setConnectionMode(mode: String): Boolean {
-        return client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_CONNECTION_MODE",
-            "ConnectionMode" to mode
-        )))
-    }
+    /** @param mode 设备侧原值 `auto_dial` / `manual_dial`（取值域校验在 profile 的 validate 里）。 */
+    suspend fun setConnectionMode(mode: String): Boolean =
+        writer.write(SettingKey.CONNECTION_MODE, mode)
 
     // ==================== 频段锁定 ====================
 

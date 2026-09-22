@@ -40,22 +40,22 @@
       </div>
     </n-spin>
 
-    <n-modal
-      :show="!!playingItem"
-      preset="card"
-      :title="playingItem?.name || ''"
-      style="width: 960px; max-width: calc(100vw - 32px)"
-      @update:show="close"
-    >
-      <!-- autoplay 只在有 src 时才有意义；src 为空时 <video> 会立刻抛 error -->
-      <video v-if="streamUrl" :src="streamUrl" controls autoplay class="player-video" />
+    <!-- 播放弹窗只装播放器本身：不要卡片外壳、标题栏与文件详情表。
+         播放时那些信息没人看，反而把播放器挤小、在手机上更明显。
+         文件名/路径/分辨率这些在列表页与文件管理器里都查得到。 -->
+    <n-modal :show="!!playingItem" :style="{ width: '960px', maxWidth: 'calc(100vw - 32px)' }" @update:show="close">
+      <!-- 播放器统一走 VideoPlayer：格式分档、customType、字幕、错误兜底都在它里面。
+           url 为空（还在换票据）时它自己不建实例，所以这里不用再判 -->
+      <VideoPlayer
+        v-if="playingItem"
+        :url="streamUrl"
+        :name="playingItem.name"
+        :path="playingItem.path"
+        :poster="thumbs[playingItem.id] || ''"
+        can-download
+        @download="downloadPlaying"
+      />
       <div v-else class="player-loading"><n-spin size="small" /></div>
-      <div v-if="playingItem" class="detail-grid">
-        <div v-for="row in detailRows" :key="row.label" class="detail-row">
-          <span class="detail-label">{{ row.label }}</span>
-          <span class="detail-value">{{ row.value }}</span>
-        </div>
-      </div>
     </n-modal>
   </div>
 </template>
@@ -64,9 +64,10 @@
 import { computed, onMounted, ref } from 'vue';
 import { useMessage } from 'naive-ui';
 import { VideocamOutline } from '@vicons/ionicons5';
-import { fetchStreamUrl, formatDuration, formatMediaDate, formatMediaSize, type MediaItem } from './mediaShared';
+import { fetchStreamUrl, formatDuration, formatMediaSize, type MediaItem } from './mediaShared';
 import { useMediaLibrary } from './useMediaLibrary';
 import MediaEmptyState from './components/MediaEmptyState.vue';
+import VideoPlayer from '@/components/VideoPlayer.vue';
 
 const message = useMessage();
 const { api, items, total, loading, loadingMore, permissionDenied, failed, thumbs, hasMore, reload, loadMore } =
@@ -90,19 +91,6 @@ const headSub = computed(() => {
   return total.value ? `共 ${total.value} 个` : '';
 });
 
-const detailRows = computed(() => {
-  const v = playingItem.value;
-  if (!v) return [];
-  const rows = [
-    { label: '路径', value: v.path },
-    { label: '大小', value: formatMediaSize(v.size) },
-  ];
-  if (v.width && v.height) rows.push({ label: '分辨率', value: `${v.width}×${v.height}` });
-  if (v.duration_ms) rows.push({ label: '时长', value: formatDuration(v.duration_ms) });
-  rows.push({ label: '修改时间', value: formatMediaDate(v.date_modified) });
-  return rows;
-});
-
 async function open(v: MediaItem) {
   playingItem.value = v;
   streamUrl.value = '';
@@ -117,7 +105,23 @@ async function open(v: MediaItem) {
 function close() {
   playingItem.value = null;
   // 清空 src 让浏览器立刻停止拉流：只关弹窗的话 <video> 可能还在后台缓冲
+  // （VideoPlayer 自己也会在 unmount 时 destroy，这里是双保险）
   streamUrl.value = '';
+}
+
+/**
+ * 放不了的格式给一条下载出路。
+ *
+ * 用票据 URL + `download` 属性触发浏览器下载：票据地址在 `/api` 之外的免鉴权区，
+ * `<a download>` 这种裸 GET 正好能用（`/api/files/download` 要签名头，`<a>` 带不上）。
+ */
+function downloadPlaying() {
+  const item = playingItem.value;
+  if (!item || !streamUrl.value) return;
+  const a = document.createElement('a');
+  a.href = streamUrl.value;
+  a.download = item.name;
+  a.click();
 }
 
 onMounted(reload);

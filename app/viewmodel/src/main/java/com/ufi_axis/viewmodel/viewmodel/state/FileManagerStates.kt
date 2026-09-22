@@ -3,6 +3,8 @@ package com.ufi_axis.viewmodel.state
 import com.ufi_axis.data.api.FileItem
 import com.ufi_axis.data.api.FileInfoResponse
 import com.ufi_axis.data.api.ArchiveChecksumResponse
+import com.ufi_axis.data.api.StorageSourceInfo
+import com.ufi_axis.data.api.RemotePushJobInfo
 import com.ufi_axis.data.model.DiskUsageResponse
 import kotlinx.serialization.Serializable
 
@@ -24,13 +26,24 @@ data class CachedListing(
 
 // ========== Storage Volume ==========
 
+/**
+ * 一个可进入的存储位置。
+ *
+ * 2026-09-21：加了 [protocol] / [sourceId] 两项以容纳外部存储源（FTP / WebDAV）。
+ * 本地卷两项都是 `"local"` —— 缺省值就是本地，既有构造点（[com.ufi_axis.viewmodel.module.FileManagerModule.loadDiskUsage]
+ * 里那几处）一行都不用改。
+ */
 data class StorageVolume(
     val label: String,     // "内部存储" / "SD卡" / "U盘"
     val mountPath: String, // "/storage/emulated/0"
     val totalSize: String,
     val usedSize: String,
     val availSize: String,
-    val usePercent: String
+    val usePercent: String,
+    /** `"local"` / `"ftp"` / `"webdav"` / `"smb"`。 */
+    val protocol: String = "local",
+    /** 远端源 id；本地恒为 `"local"`。 */
+    val sourceId: String = "local"
 )
 
 // ========== Phone Download History ==========
@@ -116,6 +129,17 @@ data class FileManagerState(
     val isUploading: Boolean = false,
     val uploadProgress: Float = -1f,
     val uploadFileName: String = "",
+    /**
+     * 本批共几个文件、已传完几个（2026-09-19 支持多选上传后加的）。
+     *
+     * `uploadProgress` / `uploadFileName` 仍然只描述**当前这一个**文件 ——
+     * 进度条要反映单文件的推进，否则 10 个小文件会让条子来回跳。
+     * 批次进度靠这两个计数在文案里体现（「上传中：xxx (3/7)」）。
+     *
+     * 0 表示没有批次在跑；单文件上传时是 1，界面据此不显示 (1/1) 这种废话。
+     */
+    val uploadTotalCount: Int = 0,
+    val uploadDoneCount: Int = 0,
     val isDownloading: Boolean = false,
     val downloadProgress: Float = -1f,
     val downloadFileName: String = "",
@@ -136,6 +160,43 @@ data class FileManagerState(
     val phoneStorageGranted: Boolean = false,
     val diskUsage: DiskUsageResponse? = null,
     val storageVolumes: List<StorageVolume> = emptyList(),
+    /**
+     * 可用的外部存储源快照（只含 `enabled` 的那些）。
+     *
+     * 文件管理器用它做两件事：虚拟根里列出「外部存储」入口、按 `capabilities` 决定
+     * 当前目录该隐藏哪些动作。拉不到时保持空表 —— 远端源列表不该拖垮本地文件管理。
+     * 配置页有自己那份全量列表（[StorageSourceState.sources]，含停用的）。
+     */
+    val remoteSources: List<StorageSourceInfo> = emptyList(),
+
+    /**
+     * **全部**外部存储源（含已停用的），供「选存储」那一层做管理用。
+     *
+     * 与 [remoteSources] 的区别：那一份只有启用的，语义是"可以进去浏览的源"；
+     * 这一份是"配置里有的源"。独立的外部存储列表页已删除，管理职责搬到了存储列表，
+     * 所以这一层必须能看到停用的源 —— 否则它既不能被重新启用、也不能被删掉。
+     */
+    val allRemoteSources: List<StorageSourceInfo> = emptyList(),
+
+
+    /**
+     * 远端上传第二阶段（core 暂存 → 外部存储源）的作业列表，来自
+     * `GET /api/files/remote-push` 的轮询快照，新的在前。
+     *
+     * 为什么它必须在 state 里、而不是"传完就算了"：手机那一段传完之后，文件只在 core 上，
+     * 真正落到远端还要排队 + 整份推送。不把这一段暴露出来，用户会看到"上传完成"
+     * 却在远端找不到文件，而且没有任何取消 / 重试入口。
+     */
+    val remotePushJobs: List<RemotePushJobInfo> = emptyList(),
+
+    /**
+     * 设备端是否支持远端上传（`/api/files/status` 的 `supports_remote_upload`）。
+     *
+     * 默认 false：老固件没有这条链路，远端目录里的上传入口必须整个撤掉。
+     */
+    val remotePushSupported: Boolean = false,
+
+
     val storageRoot: String = "",  // Navigation floor: can't go above this
     val searchResults: List<FileItem>? = null,
     val sortBy: String = "name",

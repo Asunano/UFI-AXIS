@@ -102,6 +102,8 @@ import com.ufi_axis.ui.components.common.UfiButtonVariant
 // 2026-08-14 需求2：长按事件卡的「更多操作」菜单 —— 复用项目标准 UfiPopupMenu，
 // 不用 M3 原生 DropdownMenu（见 UfiDialogParts 注释：原生在部分机型不继承自定义 colorScheme 会白底）
 import com.ufi_axis.ui.components.common.UfiPopupMenu
+import com.ufi_axis.ui.components.common.UfiRollingText
+
 import com.ufi_axis.ui.components.common.UfiScrollableTabRow
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ResolvedPalette
@@ -1498,11 +1500,13 @@ private fun PeakMetricTile(item: PeakMetricItem) {
         }
         Spacer(Modifier.height(6.dp))
         // 峰值大数字 + 单位
+        // 2026-09-21：主数字换成公共 UfiRollingText。语义是"今日峰值"，只在出现新极值时才动，
+        // 且单位已经在隔壁独立 Text 里（不会因为自适应单位换档把整串滚一遍）。
         Row(
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            Text(
+            UfiRollingText(
                 text = item.valueText,
                 style = UfiTextStyles.valueStrong,
                 color = numberColor
@@ -1511,6 +1515,7 @@ private fun PeakMetricTile(item: PeakMetricItem) {
                 Text(item.unit, style = MaterialTheme.typography.labelSmall, color = palette.textSecondary)
             }
         }
+
         if (!isOk) {
             Spacer(Modifier.height(6.dp))
             Text(
@@ -1573,11 +1578,12 @@ private fun StatCard(
             Text(label, style = MaterialTheme.typography.labelMedium, color = palette.textSecondary)
         }
         Spacer(Modifier.height(6.dp))
-        Text(
-            value.toString(),
+        UfiRollingText(
+            text = value.toString(),
             style = UfiTextStyles.heroValue.copy(fontWeight = UfiWeight.Strong),
             color = dotColor
         )
+
     }
 }
 

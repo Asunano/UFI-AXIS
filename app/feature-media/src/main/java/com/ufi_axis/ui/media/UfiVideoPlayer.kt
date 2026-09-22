@@ -24,8 +24,11 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
+import androidx.media3.ui.SubtitleView
 import com.ufi_axis.data.api.RetrofitClient
+import com.ufi_axis.data.model.MediaSubtitleEntry
 import com.ufi_axis.feature.media.R
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.OkHttpClientProvider
@@ -153,6 +156,7 @@ fun UfiVideoSurface(
             view.setShowSubtitleButton(true)
             view.setShowShuffleButton(false)
             view.setShowBuffering(PlayerView.SHOW_BUFFERING_WHEN_PLAYING)
+            view.applyUfiSubtitleStyle()
             view
         },
         update = { view ->
@@ -174,6 +178,51 @@ fun UfiVideoSurface(
         }
     )
 }
+
+/**
+ * 统一字幕外观（2026-09-20）。
+ *
+ * 在此之前字幕层完全没配过，用的是 media3 的库默认值 —— 表现是字偏小、外挂 SRT 与
+ * 内嵌 ASS 两套观感不一致。两个播放入口（媒体中心播放页、文件管理器预览浮层）都调这一处，
+ * 免得两边各调一套参数然后慢慢分叉。
+ *
+ * ## 为什么关掉 applyEmbeddedStyles
+ * 开着的话，字幕文件自带的样式优先 —— 而 media3 对 ASS 样式的支持是**部分**的：
+ * 字号/位置/颜色时灵时不灵，常见结果是一行大一行小、或者跑到画面中间。
+ * 关掉之后所有字幕走同一套外观，可读性稳定；代价是丢掉 ASS 里本来正确的那部分
+ * （比如双语字幕上下分色）。
+ * 在"看得清"和"尽量还原样式"之间，这里选前者 —— 真要完整 ASS 特效，media3 也给不了，
+ * 那要换到带 libass 的内核。
+ *
+ * ## 为什么白字黑边而不是取主题色
+ * 字幕压在视频画面上，而画面不随 App 主题变。半透明底框会挡画面，纯白无描边在亮场景
+ * （雪地、白墙）里会糊掉 —— 描边是唯一在任何画面上都成立的方案。
+ */
+@OptIn(UnstableApi::class)
+fun PlayerView.applyUfiSubtitleStyle() {
+    val view = subtitleView ?: return
+    view.setApplyEmbeddedStyles(false)
+    view.setStyle(
+        CaptionStyleCompat(
+            /* foregroundColor = */ android.graphics.Color.WHITE,
+            /* backgroundColor = */ android.graphics.Color.TRANSPARENT,
+            /* windowColor = */ android.graphics.Color.TRANSPARENT,
+            /* edgeType = */ CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+            /* edgeColor = */ android.graphics.Color.BLACK,
+            /* typeface = */ null
+        )
+    )
+    // 默认 0.0533（≈ 屏高的 5.3%）在手机上偏小，尤其横屏时。放大到 1.25 倍。
+    view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * SUBTITLE_TEXT_SCALE)
+    // 抬离底边：控制条弹出时会盖住最底部那行字
+    view.setBottomPaddingFraction(SUBTITLE_BOTTOM_PADDING_FRACTION)
+}
+
+/** 字幕字号相对 media3 默认值的放大倍数。 */
+private const val SUBTITLE_TEXT_SCALE = 1.25f
+
+/** 字幕底部留白占视图高度的比例（默认 0.08 会被控制条盖住）。 */
+private const val SUBTITLE_BOTTOM_PADDING_FRACTION = 0.10f
 
 /** 从 Context 链里找宿主 Activity（`LocalContext as? Activity` 在 Compose 里经常失败）。 */
 private fun findActivity(context: Context): Activity? {
@@ -219,10 +268,106 @@ fun UfiFullscreenSystemUiEffect(enabled: Boolean) {
 
 /** 把一串播放地址装进播放器（playlist），从 [startIndex] 开始。 */
 fun ExoPlayer.setUfiPlaylist(urls: List<String>, startIndex: Int) {
-    if (urls.isEmpty()) return
+    setUfiSources(urls.map { UfiVideoSource(it) }, startIndex)
+}
+
+/**
+ * 播放器要挂的一条外挂字幕轨。
+ *
+ * [mimeType] 必须准确（`application/x-subrip` / `text/x-ssa` / `text/vtt` …）——
+ * media3 靠它选解析器，给错了就是"有这条轨但一个字都不出"。值由 core 的
+ * `/api/media/subtitles` 给出，客户端不自己按后缀猜。
+ *
+ * [url] 应指向 `/api/media/subtitle?path=`（core 已转成 UTF-8），
+ * **不要**直接指向 `/api/files/stream` 的原始文件：GB18030/Big5 字幕会整屏乱码。
+ */
+data class UfiSubtitleTrack(
+    val url: String,
+    val mimeType: String,
+    val label: String = "",
+    val language: String? = null
+)
+
+/** 一条视频 + 它的外挂字幕。 */
+data class UfiVideoSource(
+    val url: String,
+    val subtitles: List<UfiSubtitleTrack> = emptyList()
+)
+
+/**
+ * core 给的字幕条目 → 播放器要的字幕轨。
+ *
+ * [urlOf] 由调用方传（通常是 `MediaModule::subtitleUrl`）：播放器核心只认 data 层的模型，
+ * 不去依赖 viewmodel 层，否则这一份"全站唯一的播放器"就被拽进业务依赖里了。
+ *
+ * `language` 传 null 而不是 [MediaSubtitleEntry.label]：label 是从文件名猜的
+ * （`chs`、`简体`、`forced` 都可能），塞进 language 会让 media3 按 BCP-47 去解析并可能丢弃；
+ * 显示用 label，语言偏好这件事交给用户在菜单里点。
+ */
+fun MediaSubtitleEntry.toTrack(urlOf: (String) -> String): UfiSubtitleTrack = UfiSubtitleTrack(
+    url = urlOf(path),
+    mimeType = mime,
+    label = label.ifBlank { name },
+    language = null
+)
+
+/**
+ * 直接拉某个视频的可播放外挂字幕轨（不经 viewmodel）。
+ *
+ * 给**没有 viewModel 可用**的调用方用 —— 文件管理器的预览浮层是个纯 Composable，
+ * 参数链上没有 MainViewModel，为了字幕把 viewModel 一路传进去不划算。
+ * 有 viewModel 的地方（媒体中心播放页）仍然走 `MediaModule.subtitlesOf`。
+ *
+ * 失败回空列表：字幕是增强项，拉不到就当没有，不该让预览浮层报错。
+ */
+suspend fun loadUfiSubtitleTracks(appContext: Context, videoPath: String): List<UfiSubtitleTrack> =
+    try {
+        val prefs = AppPreferences(appContext)
+        val base = "http://${prefs.effectiveHost}:${prefs.serverPort}"
+        RetrofitClient.getApiService(prefs)
+            .getMediaSubtitles(videoPath, null)
+            .items
+            .filter { it.supported }
+            .map { entry ->
+                entry.toTrack { path ->
+                    "$base/api/media/subtitle?path=" +
+                        java.net.URLEncoder.encode(path, "UTF-8")
+                }
+            }
+    } catch (e: Exception) {
+        emptyList()
+    }
+
+/**
+ * 把一串「视频 + 外挂字幕」装进播放器。
+ *
+ * 为什么不和 [setUfiPlaylist] 同名重载：`List<String>` 与 `List<UfiVideoSource>`
+ * 在 JVM 上擦除后签名相同，编译不过。
+ *
+ * 第一条字幕带 `SELECTION_FLAG_DEFAULT` —— core 已把"和视频同名"的排在首位，
+ * 所以这条就是最贴切的那个，打开即生效；其余走 media3 齿轮里的字幕轨菜单切换。
+ * 不给 default 的话"自动匹配"就成了摆设：用户每次还得自己去菜单点一下。
+ */
+@OptIn(UnstableApi::class)
+fun ExoPlayer.setUfiSources(sources: List<UfiVideoSource>, startIndex: Int) {
+    if (sources.isEmpty()) return
     setMediaItems(
-        urls.map { MediaItem.fromUri(it) },
-        startIndex.coerceIn(0, urls.lastIndex),
+        sources.map { source ->
+            MediaItem.Builder()
+                .setUri(source.url)
+                .setSubtitleConfigurations(
+                    source.subtitles.mapIndexed { index, track ->
+                        MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(track.url))
+                            .setMimeType(track.mimeType)
+                            .setLabel(track.label.ifBlank { null })
+                            .setLanguage(track.language)
+                            .setSelectionFlags(if (index == 0) C.SELECTION_FLAG_DEFAULT else 0)
+                            .build()
+                    }
+                )
+                .build()
+        },
+        startIndex.coerceIn(0, sources.lastIndex),
         /* startPositionMs = */ 0L
     )
     prepare()

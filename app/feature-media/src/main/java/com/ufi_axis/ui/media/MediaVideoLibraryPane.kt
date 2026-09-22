@@ -11,8 +11,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Download
@@ -30,6 +30,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import com.ufi_axis.data.model.MediaLibraryItem
@@ -63,13 +65,21 @@ import java.io.File
  * ## 下载按钮在这一栏，而不是首页
  * 下载要决定"落到手机的哪个子目录"，而这个答案来自**当前所在的目录层级**
  * （见 [subDirOf]）。首页是平铺的，那里没有"目录"这个上下文。
+ *
+ * @param listState 滚动位置由调用方持有（[MediaVideoScreen]），理由同 [MediaVideoHome]：
+ *   两栏切换换的是一棵子树，建在本函数里的状态会随子树销毁。
+ * @param onLongPress 长按某一行视频：上报 [MediaVideoMenuTarget]（含按当前目录算好的
+ *   镜像子目录），菜单与弹窗都由页壳出。**文件夹那几行不挂长按** ——
+ *   菜单里全是针对单个文件的操作（重命名一个目录得走文件管理器，那里有整套目录操作）。
  */
 @Composable
 internal fun MediaVideoLibraryPane(
     viewModel: MainViewModel,
     onOpen: (MediaLibraryItem) -> Unit,
     onDownload: (MediaLibraryItem, String) -> Unit,
-    onThumbMissing: (suspend (MediaLibraryItem) -> File?)? = null
+    onThumbMissing: (suspend (MediaLibraryItem) -> File?)? = null,
+    listState: LazyListState,
+    onLongPress: (MediaVideoMenuTarget) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
     val media = viewModel.media
@@ -82,7 +92,7 @@ internal fun MediaVideoLibraryPane(
 
     var showSortSheet by remember { mutableStateOf(false) }
     var showDirPicker by remember { mutableStateOf(false) }
-    val listState = rememberLazyListState()
+
 
     Column(modifier = Modifier.fillMaxSize()) {
         UfiListToolbar(
@@ -129,11 +139,14 @@ internal fun MediaVideoLibraryPane(
                 .padding(horizontal = Spacing.Medium)
         ) {
             when {
-                view.isEmpty && view.isLoading -> UfiListLoadingState(
+                // 骨架判据同 [MediaLibraryPage]：看"还没拉到过结果"，不看"空且正在加载" ——
+                // 切到本栏的第一帧 browse 还没发出去，旧判据会让空态先闪一帧
+                !view.loadedOnce -> UfiListLoadingState(
                     leadingWidth = MEDIA_VIDEO_THUMB_WIDTH,
                     leadingHeight = MEDIA_VIDEO_THUMB_HEIGHT,
                     leadingCircle = false
                 )
+
 
                 // 配了多个扫描目录、还没选进哪一个：把根目录列出来让用户选
                 view.path.isBlank() && view.roots.size > 1 -> LazyColumn(
@@ -202,8 +215,16 @@ internal fun MediaVideoLibraryPane(
                     }
 
                     items(view.items, key = { it.id }) { item ->
+                        // 这一行的窗口矩形：长按菜单要靠它定位。采集放在 modifier 上、
+                        // 手势交给 UfiListRowCard 的 onLongClick（它挂在卡面圆角裁剪之内，
+                        // 按压反馈与只支持单击的行一致）。
+                        var rowBounds by remember { mutableStateOf(IntRect.Zero) }
+                        val subDir = subDirOf(item.path, view.roots, view.path)
                         UfiListRowCard(
                             title = item.name,
+                            modifier = Modifier.onGloballyPositioned { coords ->
+                                rowBounds = mediaVideoAnchorRect(coords)
+                            },
                             subtitle = listOf(
                                 formatMediaDuration(item.duration_ms),
                                 FormatUtils.formatSize(item.size)
@@ -220,9 +241,7 @@ internal fun MediaVideoLibraryPane(
                             },
                             trailing = {
                                 IconButton(
-                                    onClick = {
-                                        onDownload(item, subDirOf(item.path, view.roots, view.path))
-                                    }
+                                    onClick = { onDownload(item, subDir) }
                                 ) {
                                     Icon(
                                         Icons.Default.Download,
@@ -231,6 +250,16 @@ internal fun MediaVideoLibraryPane(
                                         modifier = Modifier.size(20.dp)
                                     )
                                 }
+                            },
+                            onLongClick = {
+                                onLongPress(
+                                    MediaVideoMenuTarget(
+                                        item = item,
+                                        anchorBounds = rowBounds,
+                                        anchorPoint = mediaVideoAnchorCenter(rowBounds),
+                                        downloadSubDir = subDir
+                                    )
+                                )
                             }
                         )
                     }

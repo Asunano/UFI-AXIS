@@ -237,10 +237,10 @@ export const Endpoints = {
     detect: '/api/geo/detect',
   },
   /**
-   * 设备本机媒体库（core 侧 `MediaRoutes`）。**web 尚未实现对应界面**，
-   * 这里先登记端点以免契约表里缺一整组（校验器的"core 存在但无任何端引用"会报出来）。
+   * 设备本机媒体库（core 侧 `MediaRoutes`）。
+   * web 侧界面在 `views/media/`（视频 / 音乐 / 图片三个独立页面）与文件预览弹窗。
    *
-   * 五处坑，实现界面前必须读：
+   * 六处坑，改动前必须读：
    * ① 几乎每条都要 `type` ∈ `video` / `audio` / `image`，缺失或认不出回 400；
    *    权限不足回的是 **403 但 code 仍是 `BAD_REQUEST`**（没有专用错误码），
    *    带 `extra = {permission, type}`；
@@ -251,20 +251,78 @@ export const Endpoints = {
    *    上限 512 KB，且必须以 `FF D8 FF` 开头，否则 400；
    * ④ `browse` 在"配置了多个根目录且没传 path"时回的是**选根目录**的形状：
    *    `path: ''` + `parent: null` + 非空 `roots` + 空 `folders`/`items`，不是"这个目录是空的"；
-   * ⑤ **播放字节流不在这一组**：走 `/api/files/stream?path=`，而浏览器带不上鉴权头，
-   *    所以要先 `POST /api/files/stream-ticket` 换一张只授权那一个文件、滑动过期 10 分钟的票据。
+   * ⑤ **播放字节流不在这一组**：走 `/media/stream?ticket=…`（挂在 `/api` 之外的免鉴权区），
+   *    要先 `POST /api/files/stream-ticket` 换一张只授权那一个文件、滑动过期 10 分钟的票据；
+   *    **必须用响应里的 `url`**，别自己拼；
+   * ⑥ `subtitles` 的 `supported` 字段**不能直接当"我能播"** —— 见该字段的说明。
    */
   media: {
     status: '/api/media/status',
     list: '/api/media/list',
     browse: '/api/media/browse',
-    ffmpegStatus: '/api/media/ffmpeg-status',
     thumbnail: '/api/media/thumbnail',
     cover: '/api/media/cover',
     lyrics: '/api/media/lyrics',
     tags: '/api/media/tags',
     config: '/api/media/config',
     rescan: '/api/media/rescan',
+    /**
+     * 某个视频可用的**外挂字幕列表**。
+     *
+     * 为什么必须由 core 来列：`.srt` 不是视频，**永远不会出现在 MediaStore 的视频集合里**，
+     * 所以 `/list` 与 `/browse` 都发现不了它；而"哪个字幕属于哪个视频"的匹配规则
+     * （同名、`movie.zh.srt`、`movie - 中文.srt`…）放到客户端就得在每个播放入口各写一遍。
+     *
+     * query：`path`（视频真实路径）、`scope`
+     *  · `matched`（默认）：只回按文件名判定属于该视频的 → 打开就自动挂载用；
+     *  · `folder`：同目录**所有**字幕 → 手动选字幕用（现实里字幕名和视频名经常对不上）。
+     *
+     * ⚠️ **`supported` 不等于"客户端能播"**：它的语义是「core 能转码并给出字幕 MIME」，
+     * 对齐的是 **app 端 media3** 的解析能力。浏览器 `<track>` **只认 WebVTT** ——
+     * srt 靠播放器内部转换、ass/ssa 要额外渲染插件、ttml 没有通用方案。
+     * 所以 web 侧另有一份自己的能力映射（`composables/subtitleFormat.ts`），
+     * 两份**刻意不同**，不要为了"统一"合并 —— 合了必然有一端在说谎。
+     *
+     * `supported: false` 的条目**照样返回**（MicroDVD `.sub`、SAMI `.smi`）：
+     * 让客户端显示"格式不支持"，而不是让用户对着目录里明明存在的文件怀疑程序瞎了。
+     */
+    subtitles: '/api/media/subtitles',
+    /**
+     * 字幕文件内容，**已由 core 统一转成 UTF-8**（响应头显式带 `charset=utf-8`）。
+     *
+     * 为什么不直接拉字节流：字幕解析器按 UTF-8 解，而中文字幕现实中大量是 GB18030/Big5，
+     * 直接喂原始字节出来就是一屏乱码，且播放器不提供"换编码重试"的入口。
+     * core 把探测与转码收在服务端（BOM → **严格** UTF-8 → GB18030 → Big5 → Latin-1 兜底），
+     * 客户端永远只会见到 UTF-8。**这是本端点存在的全部意义。**
+     *
+     * query：`path`（字幕真实路径）。后缀不认回 **415**，读取失败回 500。
+     */
+    subtitle: '/api/media/subtitle',
+  },
+  /**
+   * 音频歌单（core 侧 `PlaylistRoutes`，2026-09-21）。
+   * web 侧界面是音乐页里的歌单面板（`views/media/components/PlaylistPanel.vue`）。
+   *
+   * 四处必须知道的约定：
+   * ① **曲目以真实路径为标识**，不是 MediaStore 的 id —— id 重扫会变，歌单会整份失效。
+   *    所有加歌 / 移出 / 重排的 body 都是 `{ paths: string[] }`；
+   * ② `GET {root}/:id/items` 回的 item 与 media.list 的 `items[]` **形状完全一致**，
+   *    额外多一个 `missing` 布尔。`missing: true` 的条目 `id` 为 0（媒体库里查不到，
+   *    文件被删 / 卡没插 / 还没被扫到），要画"已失效"占位并禁止播放，
+   *    **不要自动帮用户移出** —— 拔一次卡就清空歌单是不可接受的；
+   * ③ `items` 的顺序就是播放顺序，由用户决定。前端不要再按时间 / 名称排一次；
+   * ④ 移出用 DELETE。body 与 `?path=` 都支持（部分代理会丢 DELETE 的 body），
+   *    axios 侧走 `{ data: { paths } }`。
+   *
+   * 失败码全部复用通用码：歌单不存在 404 `NOT_FOUND`、名称空 400 `BLANK_VALUE`、
+   * 同名 409 `ALREADY_EXISTS`、数量到顶 400 `OUT_OF_RANGE`、无媒体权限 403 `FORBIDDEN`。
+   */
+  playlists: {
+    root: '/api/playlists',
+    /** 某个歌单的曲目集合：GET 取、POST 加、DELETE 移出、PUT 整表重排。 */
+    items: (id: string) => `/api/playlists/${id}/items`,
+    /** 单个歌单本体：GET 取元信息、PUT 重命名、DELETE 删除。 */
+    one: (id: string) => `/api/playlists/${id}`,
   },
   /**
    * SIM 卡（2026-08-27 web 接入）。
@@ -415,6 +473,24 @@ export const WsChannel = {
 } as const;
 
 export const WS_CHANNELS_ALL: string[] = Object.values(WsChannel);
+
+/**
+ * `data_changed` 帧里 `data.changed` 的取值表（对齐 Kotlin `WsDataTopic`）。
+ * 注意这些**不是**频道名，频道只有 `data_changed` 一个。
+ *
+ * 消费端一律按完整 key 匹配（或按 `namespace:` 前缀分流）。2026-09-21 踩过：
+ * core 的 `ResponseCache.invalidate` 把 `device:traffic-limit` 截成了 `device`，
+ * 两端的精准刷新全部静默失效。新增取值请同步 Kotlin 侧。
+ */
+export const WsDataTopic = {
+  TASK_LIST: 'task:list',
+  TASK_RULES: 'task:rules',
+  CONSOLE_AT: 'console:at',
+  CONSOLE_SHELL: 'console:shell',
+  DEVICE_TRAFFIC_LIMIT: 'device:traffic-limit',
+  /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
+  MEDIA_PLAYLISTS: 'media:playlists',
+} as const;
 
 /**
  * 网络模式（T15）：与 Kotlin `NetworkMode` 对齐。

@@ -1,7 +1,10 @@
 package com.ufi_axis.ui.navigation
 
+import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.ExperimentalSharedTransitionApi
+import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.EaseInOutCubic
@@ -44,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -56,6 +60,7 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.ui.animation.blurEntrance
 import com.ufi_axis.ui.animation.page.UfiPage
 import com.ufi_axis.ui.animation.page.UfiPageSwitcher
+import com.ufi_axis.ui.animation.page.UfiPageSwitcherDefaults
 import com.ufi_axis.ui.animation.page.LocalUfiBlurEnabled
 import com.ufi_axis.ui.animation.page.UfiPageTransitions
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
@@ -184,6 +189,9 @@ private fun AppBottomNavigation(
  * @param themeManager 提供 `pageTransition` 设置项（用户在设置页选择的切换动画 id）。
  */
 @Composable
+// SharedTransitionLayout / SharedTransitionScope 仍是实验 API（androidx.compose.animation 1.10）。
+// 只在本函数开口，不给整个文件加 @file:OptIn —— 免得以后别处误用实验 API 也被静默放行。
+@OptIn(ExperimentalSharedTransitionApi::class)
 fun MainNavGraph(
     screens: Map<String, AppScreen>,
     themeManager: ThemeManager,
@@ -229,6 +237,28 @@ fun MainNavGraph(
     // Shared Axis 深度图层的「谁是下层」角色持有者。push/pop 在 exit / popEnter
     // 里登记 entry id；图层侧用 `() -> Boolean` 比对，零重组。详见 UfiNavRecedeRole。
     val recedeRole = remember { UfiNavRecedeRole() }
+
+    // ── 下层背景模糊（2026-09-20，只服务升起面板）的两道**与页面无关**的闸门 ────────
+    //
+    // 1. 用户在「设置 → 外观」里的「过渡模糊」开关。这个开关原来只管 Tab 切页
+    //    （下发给 UfiPageSwitcher 的 LocalUfiBlurEnabled），但用户读到的是"转场要不要模糊"——
+    //    新加的这条转场模糊如果不听它，那就是个只管一半的开关。所以这里把 collect 从
+    //    宿主目的地内部**上提到本函数**：一处取值、两处使用（provide 给 Tab 宿主 +
+    //    喂给二级页的深度图层）。代价是开关一变会重组整个 MainNavGraph，
+    //    而它是"用户在设置页按一下"级别的事件，不在任何动画帧上。
+    // 2. 设备扛不扛得住满屏 GPU 模糊：直接复用页面切换那套判定
+    //    （UfiPageSwitcherDefaults.isBlurSupported），不另立一套"什么叫低端机"的标准。
+    //    结果在进程内恒定，按 context 记一次。
+    val blurEnabled by themeManager.blurEnabled.collectAsState()
+    val context = LocalContext.current
+    val blurSupported = remember(context) { UfiPageSwitcherDefaults.isBlurSupported(context) }
+    val underlayBlurAllowed = blurEnabled && blurSupported
+
+    // 「这一次转场的下层该不该模糊」只有登记函数知道（对端是不是升起面板），结论在
+    // recedeRole 上。做成 remember 住的 lambda：图层在**绘制期**读，既不订阅快照、
+    // 也不会因为换了个新 lambda 实例让 modifier 链每帧失效。
+    val underlayBlurActive: () -> Boolean = remember { { recedeRole.recedingBlur } }
+
 
     // 只有停留在宿主目的地时才显示底部栏；detail 页仍然隐藏。
 
@@ -343,6 +373,19 @@ fun MainNavGraph(
                     .blurEntrance("app-launch"),
                 contentAlignment = Alignment.BottomCenter      // 胶囊浮层锚定底部居中
             ) {
+            // 共享元素的宿主。★ 必须在 NavHost **外面** ★
+            //
+            // 两个理由，都不能绕：
+            // 1. 共享元素要跨两个目的地，而两个目的地只在 NavHost 之上才有共同祖先；
+            // 2. 转场期每个目的地都套着 `ufiSharedAxisLayer`，那一层用 clipPath 对整页做圆角裁剪
+            //    （见 Navigation.kt）。共享元素默认 renderInOverlayDuringTransition = true，
+            //    会被提到 SharedTransitionLayout 的 overlay 层绘制，从而绕开那层裁剪 ——
+            //    overlay 属于本布局，所以本布局必须在裁剪层之上。
+            //
+            // 没有任何页面用共享元素时，这一层的开销只是一个 LookaheadScope 容器；
+            // 它不改变子树的测量结果，因此对现有页面是透明的。
+            SharedTransitionLayout {
+            CompositionLocalProvider(LocalUfiSharedTransitionScope provides this) {
             // 二级页：Material Shared Axis X（纯水平，无交叉淡入淡出）。
             // Tab 之间仍由宿主内 UfiPageSwitcher 负责。
             NavHost(
@@ -362,6 +405,13 @@ fun MainNavGraph(
                 popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
                 popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
             ) { entry ->
+                // 先把导航层的 AnimatedVisibilityScope 抓在手里：下面要在几层 lambda 内部
+                // provide 它，而那些 lambda 里的 `this` 已经是别的 receiver 了。
+                //
+                // Tab 宿主目前没有任何页面用共享元素，仍然 provide：漏掉这一处的后果是
+                // 「将来从某个 Tab 页挂 ufiSharedElement 时它静默失效」——读到 null 就退化成
+                // 不共享，既不报错也没动画，排查成本远高于现在多写一行。
+                val navAnimatedScope: AnimatedVisibilityScope = this
                 // 深度层：去二级页时宿主是下层（压暗+后退）；回宿主时宿主仍是下层。
                 val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
@@ -384,9 +434,12 @@ fun MainNavGraph(
                 // 而返回时宿主正在重新组合 5 个 Tab 页，两者叠在平移的同几帧里。
                 UfiNavFrameGate {
                 CompositionLocalProvider(
-                    LocalUfiMainTabController provides { targetIndex -> mainTabIndex = targetIndex }
+                    LocalUfiMainTabController provides { targetIndex -> mainTabIndex = targetIndex },
+                    LocalUfiNavAnimatedScope provides navAnimatedScope
                 ) {
-                    val blurEnabled by themeManager.blurEnabled.collectAsState()
+                    // blurEnabled 已上提到本函数顶部（见那里的说明：同一个用户开关现在同时
+                    // 管 Tab 切页与二级页的下层模糊，取值只能有一处）。
+
                     // P2f（2026-09-04）：转场时长滑块的下端新增「0 = 关闭转场」。
                     // 落地方式刻意**不是**去传 tween(0)：那样两页仍会走一遍 AnimatedContent /
                     // Pager 的组合与模糊管线，只是时长为 0，白付开销还可能闪一帧。改为把「关闭」
@@ -475,20 +528,57 @@ fun MainNavGraph(
             }
 
             // ── 其余 detail 页：Shared Axis X（与 NavHost 默认一致，显式钉住防止未来改默认）
+            //
+            // exit / popEnter 多了一个分支：这两个方向描述的是**下层**（留在后面 / 重新露出的
+            // 那一页），而对端可能是升起面板（音乐播放页，TransitionType.RISE）。面板竖着升起时
+            // 下层再横滑，就是"两层往两个方向晃"—— 正是 RISE 要修掉的观感，所以对端是 RISE 时
+            // 换成不动的下层处理。其余任何两页之间的转场一字未动。
+            //
+            // ★ 2026-09-20 二次修订：判据从"对端是 RISE 路由"收紧成"对端是 RISE 路由 **且**
+            //   本页自己挂着迷你条"（[isUfiMiniBarHostRoute]）。原因是播放页的进场动画现在按
+            //   **来源**二选一（见下面 RISE 循环）：来源没有迷你条时它退回横向共享轴。上下两层
+            //   必须用同一条判据，否则会出现"上层横着滑进来、下层却静止 + 模糊"这种半套动画。
+            //   目前 DETAIL 循环里能跳到播放页的只有音乐列表页与分组页（两者都挂迷你条），
+            //   所以这一条现在不改变任何实际表现；它是为"日后又有 DETAIL 页能进播放页"准备的 ——
+            //   那一页若没有迷你条，会自动跟着上层一起退回普通横向转场。
             appRoutes.filter { it.transition == TransitionType.DETAIL }.forEach { appRoute ->
                 composable(
                     route = appRoute.route,
                     arguments = appRoute.arguments,
                     enterTransition = { detailSharedAxisEnter(navTransitionMs) },
-                    exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
-                    popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
+                    exitTransition = {
+                        if (isUfiMiniBarHostRoute(appRoute.route) &&
+                            isUfiRiseRoute(targetState.destination.route)
+                        ) {
+                            riseUnderlayExit(navTransitionMs, recedeRole)
+                        } else {
+                            detailSharedAxisExit(navTransitionMs, recedeRole)
+                        }
+                    },
+                    popEnterTransition = {
+                        if (isUfiMiniBarHostRoute(appRoute.route) &&
+                            isUfiRiseRoute(initialState.destination.route)
+                        ) {
+                            riseUnderlayPopEnter(recedeRole)
+                        } else {
+                            detailSharedAxisPopEnter(navTransitionMs, recedeRole)
+                        }
+                    },
                     popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
                 ) { entry ->
                 // 深度层：进二级页时上层圆角描边（满屏不缩放）；返回时 detail 是上层纯平移。
+                //
+                // blurUnderlay：本页作为下层时**允许**背景模糊，但只在"对端是升起面板"那种
+                // 处境才真的模糊 —— 那条判定由 underlayBlurActive 在绘制期问 recedeRole，
+                // 与上面 exitTransition / popEnterTransition 里的 isUfiRiseRoute 分支同源
+                // （那两条分支就是写入方）。普通详情页当垫底时一如既往只压暗。
                 val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
                     durationMillis = navTransitionMs,
+                    blurUnderlay = underlayBlurAllowed,
+                    underlayBlurActive = underlayBlurActive,
                 )
+
                 // ★ 每个 detail 目的地**自己画不透明底色**（`.background(palette.pageBg)`，
                 //   且必须放在 axisLayer **之前**，否则圆角 clip 裁不到底色、圆角消失），
                 //   不能只靠外层 Scaffold 的 containerColor。根因（2026-08-30 修）：targetSdk 36
@@ -497,6 +587,11 @@ fun MainNavGraph(
                 //   graphicsLayer 做位移/圆角/scrim。该图层只包含本页**自己绘制的像素** ——
                 //   页面没有底色时，卡片与图标之间全是透明区，手势中就直接看到下层内容。
                 // ★ UfiNavFrameGate：转场/手势期间压住 WS 整屏重组（性能用，不是动画）。
+                // ★ LocalUfiNavAnimatedScope：把**导航层**的 AnimatedVisibilityScope 下发给页面。
+                //   必须包住 `screens[...].invoke`，共享元素（Modifier.ufiSharedElement）才找得到
+                //   它要跨的那次转场；页面内部自己的 AnimatedContent 提供的同类型 scope 不能用，
+                //   那是页内动画、对端不在另一个目的地上。
+                CompositionLocalProvider(LocalUfiNavAnimatedScope provides this) {
                 UfiNavFrameGate {
                 Box(
                     modifier = Modifier
@@ -507,10 +602,106 @@ fun MainNavGraph(
                     screens[appRoute.route]?.invoke(entry, navController)
                 }
                 }
+                }
+            }
+            }
+
+            // ── 升起面板（TransitionType.RISE）：目前只有音乐播放页。
+            //
+            // 与上面那个 DETAIL 循环**互斥**：那边 filter 的是 `== TransitionType.DETAIL`，
+            // RISE 路由不会被它捞进去，同一条 route 不会登记两次（登记两次会让
+            // NavHost 抛 IllegalArgumentException，不是静默问题，但也别指望靠崩溃来发现）。
+            //
+            // ★ 2026-09-20 二次修订：升起动画**按来源二选一**，不是无条件。
+            //   这套动画是"底部迷你控制条长成整页"，起点是那条控制条的上沿；只有从挂着迷你条的
+            //   页面（[isUfiMiniBarHostRoute]：音乐列表页 / 音乐分组页）进来时那条线才在屏上。
+            //   从别处（仪表盘等 Tab 页点标题栏的「正在播放」挂件）进来时没有起点，升起会读成
+            //   "页面凭空从屏幕外飞进来"，那条路径也压根没挂共享元素 —— 所以退回原来的横向
+            //   shared-axis。**不给播放页再开第二条路由**：`AnimatedContentTransitionScope`
+            //   已经把 `initialState` / `targetState` 递到手上，来源信息本来就在这儿。
+            //   exit / popEnter 不分支：那两个方向描述的是"播放页自己当下层"（它往更深一层去、
+            //   或从更深一层返回），此刻它的形态与"从哪来"无关，照旧是面板语义。
+            //
+            // 结构与 DETAIL 循环逐行对齐。三件事必须原样保留：
+            //   1. LocalUfiNavAnimatedScope 包住 `screens[...].invoke` —— 迷你条封面到播放页
+            //      封面那条共享元素靠它找到对端；
+            //   2. ufiSharedAxisLayer —— scrim 那部分仍要（从播放页再往里进一层时面板是下层）；
+            //      圆角裁剪按语义开关（见下方 `clipCorners`）：升起时关、退化成横向时照常开。
+            //   3. UfiNavFrameGate —— 转场期压住 WS 整屏重组。
+            appRoutes.filter { it.transition == TransitionType.RISE }.forEach { appRoute ->
+                composable(
+                    route = appRoute.route,
+                    arguments = appRoute.arguments,
+                    enterTransition = {
+                        // 来源挂着迷你条 ⇒ 升起有起点。同时把这次的语义记进 recedeRole，
+                        // 供下面的 clipCorners 在**绘制期**读（组合期还不知道来源是谁）。
+                        val fromMiniBarHost = isUfiMiniBarHostRoute(initialState.destination.route)
+                        recedeRole.upperIsRisePanel = fromMiniBarHost
+                        if (fromMiniBarHost) {
+                            risePanelEnter(navTransitionMs)
+                        } else {
+                            detailSharedAxisEnter(navTransitionMs)
+                        }
+                    },
+                    exitTransition = { risePanelExit(navTransitionMs, recedeRole) },
+                    popEnterTransition = { risePanelPopEnter(navTransitionMs, recedeRole) },
+                    popExitTransition = {
+                        // 回哪去决定怎么关：落回迷你条上沿只在那条线会回到屏上时成立。
+                        // 去与回必须是同一段行程的正反，否则会出现"横着进来、竖着落下去"。
+                        val toMiniBarHost = isUfiMiniBarHostRoute(targetState.destination.route)
+                        recedeRole.upperIsRisePanel = toMiniBarHost
+                        if (toMiniBarHost) {
+                            risePanelPopExit(navTransitionMs)
+                        } else {
+                            detailSharedAxisPopExit(navTransitionMs)
+                        }
+                    }
+                ) { entry ->
+                val axisLayer = ufiSharedAxisLayer(
+                    isReceding = { recedeRole.recedingEntryId == entry.id },
+                    durationMillis = navTransitionMs,
+                    // 圆角：升起语义下不要（贴底长出来的一整块，加圆角会读成浮在屏上的卡片），
+                    // 退化成横向 shared-axis 时要（横着推进来的卡片本来就该有圆角，
+                    // 少了它这条路径会变成方角整屏硬切）。
+                    //
+                    // ⚠ 这里必须是**绘制期**才问的 lambda，不能在组合期算：图层是本目的地
+                    //   登记时构造的一份，而"来源是谁"只有上面 enter / popExit 被调用的那一刻
+                    //   才知道 —— 那两处已经把结论写进了 recedeRole，且它们必然在本页作为上层
+                    //   被画之前跑过。读普通 var 不建立快照依赖 ⇒ 零重组（与 isReceding 同一套）。
+                    clipCorners = { !recedeRole.upperIsRisePanel },
+                    // 面板自己退作下层时（从播放页再往里进一层）也吃模糊：此刻它的角色与
+                    // "给面板垫底的列表页"完全一样。判定仍走 recedeRole（risePanelExit /
+                    // risePanelPopEnter 写 true），不在这里另立标准。
+                    //
+                    // blurUnderlay 保持恒 true（只受用户开关与机型闸门约束）：它是**组合期**
+                    // 常量、决定要不要给这个目的地备那张离屏图层，而"这一次该不该真模糊"
+                    // 由绘制期的 underlayBlurActive 回答。两者的时序差正是这样拆开的。
+                    // 至于"从 Tab 页横着进来那次下层不该模糊"—— 那条已经天然成立：
+                    // 下层是 MAIN 宿主，它登记的 detailSharedAxisExit 会把 recedingBlur 复位成
+                    // false，于是 underlayBlurActive 在那一次返回 false。这里不需要额外做什么。
+                    blurUnderlay = underlayBlurAllowed,
+                    underlayBlurActive = underlayBlurActive,
+                )
+
+                CompositionLocalProvider(LocalUfiNavAnimatedScope provides this) {
+                UfiNavFrameGate {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(palette.pageBg)
+                        .then(axisLayer)
+                ) {
+                    screens[appRoute.route]?.invoke(entry, navController)
+                }
+                }
+                }
             }
             }
 
             }
+            } // LocalUfiSharedTransitionScope
+            } // SharedTransitionLayout
+
 
 
 

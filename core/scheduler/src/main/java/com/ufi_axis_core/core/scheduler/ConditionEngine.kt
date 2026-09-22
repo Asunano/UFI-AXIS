@@ -44,6 +44,23 @@ class ConditionEngine(
 
     init { loadRules() }
 
+    /**
+     * 「规则集合变了」的推送回调，由 [attachChangeBroadcaster] 注入（同 [TaskScheduler] 的处境：
+     * 本类在 `buildControllerGraph` 里构造，那一层拿不到 `WebSocketManager`）。
+     * null = 不推，评估照跑。
+     */
+    @Volatile
+    private var onRulesChanged: (suspend () -> Unit)? = null
+
+    fun attachChangeBroadcaster(broadcaster: suspend () -> Unit) {
+        onRulesChanged = broadcaster
+    }
+
+    private fun notifyRulesChanged() {
+        val cb = onRulesChanged ?: return
+        scope.launch { runCatching { cb() } }
+    }
+
     // ──────────── 查询 ────────────
 
     fun list(): List<AutomationRule> = rules.values.sortedBy { it.createdAt }
@@ -56,6 +73,7 @@ class ConditionEngine(
         if (!ActionExecutor.VALID_ACTION_TYPES.contains(rule.actionType)) return false
         rules[rule.id] = rule
         saveRules()
+        notifyRulesChanged()
         AppLogger.i(tag, "Rule added: '${rule.name}' (${rule.id}) trigger=${rule.triggerType} action=${rule.actionType}")
         return true
     }
@@ -65,6 +83,7 @@ class ConditionEngine(
         armed.remove(id)
         lastFiredAt.remove(id)
         saveRules()
+        notifyRulesChanged()
         AppLogger.i(tag, "Rule removed: $id")
         return true
     }
@@ -75,6 +94,7 @@ class ConditionEngine(
         rules[rule.id] = rule
         armed.remove(rule.id) // 参数变更后重置武装位，避免残留
         saveRules()
+        notifyRulesChanged()
         return true
     }
 
@@ -83,6 +103,7 @@ class ConditionEngine(
         armed.clear()
         lastFiredAt.clear()
         saveRules()
+        notifyRulesChanged()
         AppLogger.i(tag, "All rules cleared")
     }
 
@@ -233,6 +254,8 @@ class ConditionEngine(
         val updated = rule.copy(logs = (rule.logs + log).takeLast(50))
         rules[ruleId] = updated
         saveRules()
+        // 规则自己触发写了执行日志 → 两端的规则详情要能看到，不能只靠用户重进页面
+        notifyRulesChanged()
     }
 
     private fun fmt(bytes: Long): String {

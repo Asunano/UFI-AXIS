@@ -410,6 +410,85 @@ export function primaryFileActionOf(f: FileEntry): PrimaryFileAction | null {
   return null;
 }
 
+// ── 上传 ──
+/**
+ * 单文件上传体积上限的**保守回落值**。
+ *
+ * 真值由设备端下发（`GET /api/files/status` 的 `max_upload_bytes`，对应 core 的
+ * `FileRoutes.UPLOAD_BODY_LIMIT`），见 [fetchUploadCaps]。这里留一份只为两种情况：
+ * ① 老固件不回那些 key；② 能力探测失败。
+ *
+ * 为什么必须在客户端挡而不是只依赖服务端 413：
+ * 服务端确实在 `onCall` 阶段读 `Content-Length` 就抛 413，**并没有真的收下整个文件**；
+ * 但 HTTP 的现实是客户端在没有 `Expect: 100-continue` 协商时，请求头发出后就无条件
+ * 开始推 body，而浏览器要等 body 发完才去处理响应 —— 于是 `xhr.upload.onprogress`
+ * 一路跑到 100%，`onload` 才拿到 413。用户看到「进度跑满才提示超限」，
+ * 而这中间的上行带宽是白烧的。
+ */
+export const UPLOAD_MAX_BYTES_FALLBACK = 200 * 1024 * 1024;
+
+/** 分片上传的能力位（`GET /api/files/status`）。老固件只回 `isExternalStorageManager`。 */
+export interface UploadCaps {
+  /** 整体上传（`POST /upload`）的请求体上限 */
+  maxUploadBytes: number;
+  /** 设备端是否支持分片上传（三端点 + 续传） */
+  supportsChunked: boolean;
+  /**
+   * 分片大小。**必须用设备端给的这个值切片** ——
+   * 自己定会让 `received / chunk_size` 算出的下一片序号对不上，续传拼出坏文件。
+   */
+  chunkSize: number;
+  /** 分片上传的单文件上限 */
+  maxChunkedBytes: number;
+  /** 上传会话的无活动超时（秒），用于判断本地续传线索是否还有效 */
+  sessionTtlSeconds: number;
+}
+
+/** 探测失败 / 老固件时的能力位：只走整体上传，上限用保守回落值。 */
+export function fallbackUploadCaps(): UploadCaps {
+  return {
+    maxUploadBytes: UPLOAD_MAX_BYTES_FALLBACK,
+    supportsChunked: false,
+    chunkSize: 0,
+    maxChunkedBytes: UPLOAD_MAX_BYTES_FALLBACK,
+    sessionTtlSeconds: 0,
+  };
+}
+
+/**
+ * 读设备端的上传能力位。任何异常都回落到 [fallbackUploadCaps]（不抛）——
+ * 探测失败不该让"上传"这个功能整体不可用，降级成整体上传仍然能传小文件。
+ */
+export async function fetchUploadCaps(api: { get: (u: string) => Promise<{ data?: any }> }): Promise<UploadCaps> {
+  try {
+    const { data } = await api.get('/api/files/status');
+    const max = Number(data?.max_upload_bytes);
+    const chunk = Number(data?.chunk_size);
+    const maxChunked = Number(data?.max_chunked_upload_bytes);
+    return {
+      maxUploadBytes: Number.isFinite(max) && max > 0 ? max : UPLOAD_MAX_BYTES_FALLBACK,
+      supportsChunked: data?.supports_chunked_upload === true && Number.isFinite(chunk) && chunk > 0,
+      chunkSize: Number.isFinite(chunk) && chunk > 0 ? chunk : 0,
+      maxChunkedBytes: Number.isFinite(maxChunked) && maxChunked > 0 ? maxChunked : UPLOAD_MAX_BYTES_FALLBACK,
+      sessionTtlSeconds: Number(data?.upload_session_ttl_seconds) || 0,
+    };
+  } catch {
+    return fallbackUploadCaps();
+  }
+}
+
+/** 单文件实际可传的上限：支持分片时取分片上限，否则取整体上限。 */
+export function effectiveUploadLimit(caps: UploadCaps): number {
+  return caps.supportsChunked ? caps.maxChunkedBytes : caps.maxUploadBytes;
+}
+
+/** 上限的人类可读写法，用于提示文案。 */
+export function uploadLimitLabel(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024)
+    return `${(bytes / 1024 / 1024 / 1024).toFixed(bytes % (1024 * 1024 * 1024) === 0 ? 0 : 1)} GB`;
+  return `${Math.round(bytes / 1024 / 1024)} MB`;
+}
+
 // ── 搜索范围 ──
 /**
  * 三档搜索范围。**深度直接映射 core `/search` 的 `depth` 参数**（不是客户端翻目录）：

@@ -30,10 +30,10 @@ class BinaryComponentStore(private val appContext: Context) {
 
     private fun metaFile(id: String): File = File(dir, "${requireValidId(id)}.json")
 
-    /** 组件是否已安装（文件存在且非空，或目录型组件的子目录存在且非空） */
+    /** 组件是否已安装（文件存在且非空） */
     fun isInstalled(id: String): Boolean = try {
         val f = binaryFile(id)
-        if (f.isDirectory) (f.listFiles()?.isNotEmpty() == true) else (f.exists() && f.length() > 0)
+        f.exists() && f.length() > 0
     } catch (_: Exception) {
         false
     }
@@ -48,43 +48,6 @@ class BinaryComponentStore(private val appContext: Context) {
     } catch (e: Exception) {
         AppLogger.w(TAG, "readMeta[$id] 失败: ${e.message}")
         null
-    }
-
-    /**
-     * 安装目录型组件（如 ffmpeg：多个 .so 文件组成一个目录）。
-     *
-     * [srcFiles] 是已下载/已解包好的文件列表，全部移入 `<dir>/<id>/` 子目录。
-     * 元数据写到 `<id>.json`，与单文件组件一致。size 取子目录总大小。
-     */
-    fun installDirectory(id: String, srcFiles: List<File>, meta: BinaryComponentMeta): Result<Unit> = runCatching {
-        val validId = requireValidId(id)
-        require(srcFiles.isNotEmpty()) { "安装源文件列表为空" }
-
-        val targetDir = File(dir, validId)
-        val tmpDir = File(dir, "$validId.installing_dir")
-        tmpDir.deleteRecursively()
-        tmpDir.mkdirs()
-
-        for (src in srcFiles) {
-            require(src.exists() && src.length() > 0) { "安装源文件不存在或为空: ${src.name}" }
-            val dest = File(tmpDir, src.name)
-            if (!src.renameTo(dest)) {
-                src.copyTo(dest, overwrite = true)
-                src.delete()
-            }
-            dest.setReadable(true, false)
-        }
-
-        // 原子替换：先删旧目录再 rename
-        targetDir.deleteRecursively()
-        if (!tmpDir.renameTo(targetDir)) {
-            tmpDir.copyRecursively(targetDir, overwrite = true)
-            tmpDir.deleteRecursively()
-        }
-
-        val totalSize = targetDir.listFiles()?.sumOf { it.length() } ?: 0L
-        writeMeta(validId, meta.copy(id = validId, size = totalSize))
-        AppLogger.i(TAG, "目录型组件已安装: $validId v${meta.version} (${srcFiles.size} 文件, $totalSize bytes)")
     }
 
     /**
@@ -125,22 +88,16 @@ class BinaryComponentStore(private val appContext: Context) {
             .onFailure { AppLogger.w(TAG, "updateMeta[$id] 失败: ${it.message}") }
     }
 
-    /** 卸载：删二进制（或目录）+ 元数据。删除失败即视为失败 */
+    /** 卸载：删二进制 + 元数据。二进制删除失败即视为失败（元数据留着更能反映真实状态） */
     fun remove(id: String): Boolean {
         val validId = requireValidId(id)
         val bin = binaryFile(validId)
-        val ok = if (!bin.exists()) {
-            true
-        } else if (bin.isDirectory) {
-            bin.deleteRecursively()
-        } else {
-            bin.delete()
-        }
+        val ok = !bin.exists() || bin.delete()
         if (ok) {
             metaFile(validId).delete()
             AppLogger.i(TAG, "组件已卸载: $validId")
         } else {
-            AppLogger.w(TAG, "组件卸载失败（删除被拒）: $validId")
+            AppLogger.w(TAG, "组件卸载失败（二进制删除被拒）: $validId")
         }
         return ok
     }
@@ -148,18 +105,17 @@ class BinaryComponentStore(private val appContext: Context) {
     /** 临时下载目录（与组件目录同文件系统，保证 rename 原子） */
     fun tempFile(name: String): File = File(dir, ".tmp_$name")
 
-    /** 清理遗留的临时文件/目录（服务启动时调用，避免上次中断的下载常驻占盘） */
+    /** 清理遗留的临时文件（服务启动时调用，避免上次中断的下载常驻占盘） */
     fun cleanupTemp() {
         runCatching {
-            dir.listFiles { f ->
-                f.name.startsWith(".tmp_") || f.name.endsWith(".installing") || f.name.endsWith(".installing_dir")
-            }?.forEach { if (it.isDirectory) it.deleteRecursively() else it.delete() }
+            dir.listFiles { f -> f.isFile && (f.name.startsWith(".tmp_") || f.name.endsWith(".installing")) }
+                ?.forEach { it.delete() }
         }
     }
 
-    /** 组件目录占用总字节数（供前端展示，含子目录） */
+    /** 组件目录占用总字节数（供前端展示） */
     fun totalBytes(): Long = runCatching {
-        dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+        dir.listFiles()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
     }.getOrDefault(0L)
 
     private fun writeMeta(id: String, meta: BinaryComponentMeta) {
@@ -180,8 +136,6 @@ class BinaryComponentStore(private val appContext: Context) {
         /** 组件 id（同时是磁盘文件名与可执行文件名） */
         const val ID_FRPC = "frpc"
         const val ID_CLOUDFLARED = "cloudflared"
-        /** ffmpeg-kit：目录型组件（9 个 .so），id 对应子目录而非单个文件 */
-        const val ID_FFMPEG = "ffmpeg"
 
         /** 元数据 source 取值 */
         const val SOURCE_REMOTE = "remote"

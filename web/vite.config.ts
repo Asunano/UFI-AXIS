@@ -70,6 +70,11 @@ export default defineConfig(() => ({
           // 分片按需加载，首屏仅含首屏实际用到的子集。
           echarts: ['echarts', 'vue-echarts'],
           vendor: ['vue', 'vue-router', 'pinia', 'axios'],
+          // 播放器内核单独成块（~50KB gzip）：只有视频页与文件预览会用到它。
+          // mpegts.js / hls.js **刻意不列在这里** —— 它们在 VideoPlayer 里是
+          // 动态 import()，让 Vite 自然切成独立 chunk，只在真遇到 flv/m3u8 时才下载。
+          // 列进来反而会把它们合进这个必加载的块里，白增 200KB。
+          player: ['artplayer'],
         },
       },
     },

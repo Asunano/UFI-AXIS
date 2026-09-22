@@ -32,7 +32,16 @@ class WebUpdateRoutes(
 
     companion object {
         private const val TAG = "WebUpdateRoutes"
-        private const val MAX_ZIP_UPLOAD = 50L * 1024 * 1024  // 50MB
+
+        /**
+         * 前端 ZIP 上传上限 50MB。**HTTP 层与路由层共用这一个常量**。
+         *
+         * 2026-09-19 从 private 改为对外可见：`HttpServer` 那边原本自己写了一份
+         * `WEB_UPDATE_BODY_SIZE = 50MB`，两处各存一个数就早晚会分叉 —— 而分叉的后果
+         * （路由层按 50MB 设计、HTTP 层按别的值拦）表现为"小包能传、稍大的莫名 413"，
+         * 极难定位。仓库对 `BackupRoutes.MAX_UPLOAD_BYTES` 已经踩过一次同样的坑。
+         */
+        const val MAX_ZIP_UPLOAD = 50L * 1024 * 1024
     }
 
     fun register(route: Route) {
@@ -44,7 +53,14 @@ class WebUpdateRoutes(
             }
 
             get("/status") {
-                call.respond(toJsonElement(webUpdateManager.statusToMap()))
+                // max_upload_bytes：前端据此在**选文件时**就挡掉超限的 ZIP。
+                // 不下发的话只能盲传，而 413 要等 body 全推完才被浏览器读到（见
+                // UpdateRoutes.statusToMap 的说明），几十 MB 上行白烧。
+                call.respond(
+                    toJsonElement(
+                        webUpdateManager.statusToMap() + mapOf("max_upload_bytes" to MAX_ZIP_UPLOAD)
+                    )
+                )
             }
 
             get("/version") {

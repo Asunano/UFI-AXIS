@@ -25,7 +25,6 @@ import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.ZipInputStream
 
 /**
  * 可选二进制组件管理器（2026-09-01：frpc / cloudflared 不再随 APK 分发）。
@@ -107,11 +106,6 @@ class ComponentManager(
             BinaryComponentStore.ID_CLOUDFLARED,
             "cloudflared",
             "Cloudflare Tunnel 客户端，用于通过 Cloudflare 边缘网络暴露本机服务"
-        ),
-        CatalogItem(
-            BinaryComponentStore.ID_FFMPEG,
-            "FFmpeg",
-            "FFmpeg 软解码库，用于视频缩略图抽帧（设备系统解码器不可用时的兜底方案）"
         )
     )
 
@@ -147,10 +141,7 @@ class ComponentManager(
                 "description" to item.description,
                 "installed" to installed,
                 "installed_version" to current,
-                "installed_size" to (if (installed) {
-                    val f = store.binaryFile(item.id)
-                    if (f.isDirectory) f.walkTopDown().filter { it.isFile }.sumOf { it.length() } else f.length()
-                } else 0L),
+                "installed_size" to (if (installed) store.binaryFile(item.id).length() else 0L),
                 "source" to (meta?.source ?: ""),
                 "installed_at" to (meta?.installedAt ?: 0L),
                 "latest_version" to latest,
@@ -206,17 +197,15 @@ class ComponentManager(
             ?: throw Exception("更新源缺少 components.$id（${manifestError.ifBlank { "清单未包含该组件" }}）")
         val url = m.url?.takeIf { it.isNotBlank() } ?: throw Exception("components.$id 缺少 url")
         // sha256 必填：组件是要被执行的二进制，无校验的公网下载不可接受（与 UpdateManager 同一条硬规则）
-        // ffmpeg 条目的 sha256 在上游 release 确认后回填；空串时暂跳过校验（首次部署）
         val expectedSha = m.sha256?.trim()?.takeIf { it.isNotBlank() }
+            ?: throw Exception("components.$id 缺少 sha256，已拒绝安装")
         val isArchive = m.archive.equals("tar.gz", ignoreCase = true)
-        val isAar = m.archive.equals("aar", ignoreCase = true)
-        val entry = if (isArchive) (m.entry?.takeIf { it.isNotBlank() } ?: id) else m.entry
+        val entry = if (isArchive) (m.entry?.takeIf { it.isNotBlank() } ?: id) else null
         requireSecureUrl(url, "组件下载地址")
 
-        // 磁盘预检：tar.gz 峰值 = 压缩包 + 解出的二进制，按 3 倍声明体积预留；aar 同理
+        // 磁盘预检：tar.gz 峰值 = 压缩包 + 解出的二进制，按 3 倍声明体积预留
         val declared = m.size ?: 0L
-        val multiplier = if (isArchive || isAar) 3 else 2
-        val need = if (declared > 0) declared * multiplier else 96L * 1024 * 1024
+        val need = if (declared > 0) declared * (if (isArchive) 3 else 2) else 96L * 1024 * 1024
         val free = store.dir.usableSpace
         if (free in 1 until need) {
             throw Exception("磁盘空间不足：需要约 ${need / 1024 / 1024}MB，可用 ${free / 1024 / 1024}MB")
@@ -224,108 +213,42 @@ class ComponentManager(
 
         val download = store.tempFile("$id.download")
         val extracted = store.tempFile("$id.bin")
-        val extractDir = File(store.dir, ".tmp_${id}_so")
         try {
             progress = Progress(id, State.DOWNLOADING, 0, "正在下载 $id v${m.version ?: "?"}...")
             val actualSha = downloadTo(applyMirrorToUrl(url), download) { pct ->
                 progress = progress.copy(state = State.DOWNLOADING, percent = pct)
             }
 
-            if (expectedSha != null) {
-                progress = Progress(id, State.VERIFYING, 100, "正在校验 SHA-256...")
-                if (!actualSha.equals(expectedSha.lowercase(Locale.ROOT), ignoreCase = true)) {
-                    throw Exception("SHA-256 校验失败：期望 $expectedSha，实际 $actualSha")
-                }
+            progress = Progress(id, State.VERIFYING, 100, "正在校验 SHA-256...")
+            if (!actualSha.equals(expectedSha.lowercase(Locale.ROOT), ignoreCase = true)) {
+                throw Exception("SHA-256 校验失败：期望 $expectedSha，实际 $actualSha")
             }
 
-            if (isAar) {
-                // aar = zip，提取 entry 前缀目录下的所有 .so 文件
-                progress = Progress(id, State.EXTRACTING, 100, "正在从 AAR 提取 .so 文件...")
-                val prefix = entry?.trimEnd('/') ?: "jni/arm64-v8a"
-                val soFiles = extractSoFromAar(download, prefix, extractDir)
-                if (soFiles.isEmpty()) throw Exception("AAR 内未找到 $prefix/*.so 文件")
-
-                progress = Progress(id, State.INSTALLING, 100, "正在安装 ${soFiles.size} 个 .so 文件...")
-                store.installDirectory(
-                    id, soFiles,
-                    BinaryComponentMeta(
-                        id = id,
-                        version = m.version?.trim().orEmpty(),
-                        sha256 = expectedSha?.lowercase(Locale.ROOT).orEmpty(),
-                        source = BinaryComponentStore.SOURCE_REMOTE,
-                        installedAt = System.currentTimeMillis()
-                    )
-                ).getOrThrow()
+            val binary = if (isArchive) {
+                progress = Progress(id, State.EXTRACTING, 100, "正在从压缩包提取 $entry...")
+                TarGzExtractor.extractEntry(download, entry!!, extracted, MAX_BINARY_BYTES).getOrThrow()
+                extracted
             } else {
-                val binary = if (isArchive) {
-                    progress = Progress(id, State.EXTRACTING, 100, "正在从压缩包提取 $entry...")
-                    TarGzExtractor.extractEntry(download, entry!!, extracted, MAX_BINARY_BYTES).getOrThrow()
-                    extracted
-                } else {
-                    download
-                }
-
-                progress = Progress(id, State.INSTALLING, 100, "正在安装...")
-                store.install(
-                    id, binary,
-                    BinaryComponentMeta(
-                        id = id,
-                        version = m.version?.trim().orEmpty(),
-                        sha256 = (expectedSha ?: actualSha).lowercase(Locale.ROOT),
-                        source = BinaryComponentStore.SOURCE_REMOTE,
-                        installedAt = System.currentTimeMillis()
-                    )
-                ).getOrThrow()
+                download
             }
+
+            progress = Progress(id, State.INSTALLING, 100, "正在安装...")
+            store.install(
+                id, binary,
+                BinaryComponentMeta(
+                    id = id,
+                    version = m.version?.trim().orEmpty(),
+                    sha256 = expectedSha.lowercase(Locale.ROOT),
+                    source = BinaryComponentStore.SOURCE_REMOTE,
+                    installedAt = System.currentTimeMillis()
+                )
+            ).getOrThrow()
             progress = Progress(id, State.DONE, 100, "$id v${m.version ?: ""} 已安装")
             AppLogger.i(TAG, "组件安装完成: $id v${m.version}")
         } finally {
             download.delete()
             extracted.delete()
-            extractDir.deleteRecursively()
         }
-    }
-
-    /**
-     * 从 AAR/ZIP 中提取指定前缀目录下的所有 .so 文件到 [outDir]。
-     * 返回提取出的文件列表（basename 去重，只取第一个同名文件）。
-     *
-     * 安全约定与 [TarGzExtractor] 一致：绝不使用包内路径做输出路径，
-     * 只取 basename 写入调用方指定的目录，天然免疫 zip-slip。
-     */
-    private fun extractSoFromAar(aarFile: File, prefix: String, outDir: File): List<File> {
-        outDir.deleteRecursively()
-        outDir.mkdirs()
-        val results = mutableListOf<File>()
-        val seen = mutableSetOf<String>()
-        var totalBytes = 0L
-        ZipInputStream(aarFile.inputStream().buffered()).use { zis ->
-            var ze = zis.nextEntry
-            while (ze != null) {
-                val name = ze.name
-                if (!ze.isDirectory && name.startsWith("$prefix/") && name.endsWith(".so")) {
-                    val basename = name.substringAfterLast('/')
-                    if (basename.isNotBlank() && seen.add(basename)) {
-                        val out = File(outDir, basename)
-                        out.outputStream().use { os ->
-                            val buf = ByteArray(64 * 1024)
-                            while (true) {
-                                val n = zis.read(buf)
-                                if (n < 0) break
-                                totalBytes += n
-                                if (totalBytes > MAX_BINARY_BYTES) throw Exception("解包体积超过 ${MAX_BINARY_BYTES / 1024 / 1024}MB 限制")
-                                os.write(buf, 0, n)
-                            }
-                        }
-                        out.setReadable(true, false)
-                        results.add(out)
-                    }
-                }
-                zis.closeEntry()
-                ze = zis.nextEntry
-            }
-        }
-        return results
     }
 
     // ── 本地上传兜底 ──
@@ -344,7 +267,6 @@ class ComponentManager(
         if (!busy.compareAndSet(false, true)) throw Exception("已有组件正在安装中，请稍候")
         val upload = store.tempFile("$validId.upload")
         val extracted = store.tempFile("$validId.bin")
-        val extractDir = File(store.dir, ".tmp_${validId}_upload_so")
         try {
             progress = Progress(validId, State.INSTALLING, 0, "正在接收上传...")
             val sha = MessageDigest.getInstance("SHA-256")
@@ -362,60 +284,38 @@ class ComponentManager(
             }
             require(total > 0) { "上传内容为空" }
 
-            val head = upload.inputStream().use { ins -> ByteArray(4).also { ins.read(it) } }
+            val head = upload.inputStream().use { ins -> ByteArray(2).also { ins.read(it) } }
             val isGzip = head[0] == 0x1F.toByte() && head[1] == 0x8B.toByte()
-            // PK\x03\x04 = ZIP/AAR 文件头
-            val isZip = head[0] == 0x50.toByte() && head[1] == 0x4B.toByte() && head[2] == 0x03.toByte() && head[3] == 0x04.toByte()
-            val shaHex = sha.digest().joinToString("") { "%02x".format(it) }
-
-            if (isZip) {
-                // AAR 上传：提取 jni/arm64-v8a/*.so
-                progress = Progress(validId, State.EXTRACTING, 50, "正在从 AAR 提取 .so 文件...")
-                val soFiles = extractSoFromAar(upload, "jni/arm64-v8a", extractDir)
-                if (soFiles.isEmpty()) throw Exception("AAR 内未找到 jni/arm64-v8a/*.so 文件")
-                progress = Progress(validId, State.INSTALLING, 90, "正在安装 ${soFiles.size} 个 .so 文件...")
-                store.installDirectory(
-                    validId, soFiles,
-                    BinaryComponentMeta(
-                        id = validId,
-                        version = "",
-                        sha256 = shaHex,
-                        source = BinaryComponentStore.SOURCE_MANUAL,
-                        installedAt = System.currentTimeMillis()
-                    )
-                ).getOrThrow()
+            val binary = if (isGzip) {
+                progress = Progress(validId, State.EXTRACTING, 50, "正在从压缩包提取 $validId...")
+                TarGzExtractor.extractEntry(upload, validId, extracted, MAX_BINARY_BYTES).getOrThrow()
+                extracted
             } else {
-                val binary = if (isGzip) {
-                    progress = Progress(validId, State.EXTRACTING, 50, "正在从压缩包提取 $validId...")
-                    TarGzExtractor.extractEntry(upload, validId, extracted, MAX_BINARY_BYTES).getOrThrow()
-                    extracted
-                } else {
-                    upload
-                }
-                progress = Progress(validId, State.INSTALLING, 90, "正在安装...")
-                store.install(
-                    validId, binary,
-                    BinaryComponentMeta(
-                        id = validId,
-                        version = "",
-                        sha256 = shaHex,
-                        source = BinaryComponentStore.SOURCE_MANUAL,
-                        installedAt = System.currentTimeMillis()
-                    )
-                ).getOrThrow()
-                // 手动上传没有版本信息，只能安装后现场探测
-                val probed = probeVersion(validId)
-                if (!probed.isNullOrBlank()) store.updateMeta(validId) { it.copy(version = probed) }
+                upload
             }
-            progress = Progress(validId, State.DONE, 100, "$validId 已安装（本地上传）")
-            ""
+
+            progress = Progress(validId, State.INSTALLING, 90, "正在安装...")
+            store.install(
+                validId, binary,
+                BinaryComponentMeta(
+                    id = validId,
+                    version = "",
+                    sha256 = sha.digest().joinToString("") { "%02x".format(it) },
+                    source = BinaryComponentStore.SOURCE_MANUAL,
+                    installedAt = System.currentTimeMillis()
+                )
+            ).getOrThrow()
+            // 手动上传没有版本信息，只能安装后现场探测
+            val probed = probeVersion(validId)
+            if (!probed.isNullOrBlank()) store.updateMeta(validId) { it.copy(version = probed) }
+            progress = Progress(validId, State.DONE, 100, "$validId 已安装（本地上传${if (probed.isNullOrBlank()) "" else " v$probed"}）")
+            probed.orEmpty()
         } catch (e: Exception) {
             progress = Progress(validId, State.FAILED, progress.percent, e.message ?: "上传安装失败")
             throw e
         } finally {
             upload.delete()
             extracted.delete()
-            extractDir.deleteRecursively()
             busy.set(false)
         }
     }

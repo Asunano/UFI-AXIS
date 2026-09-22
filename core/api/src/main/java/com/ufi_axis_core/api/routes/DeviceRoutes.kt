@@ -14,6 +14,7 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.core.cache.CacheTTL
+import com.ufi_axis_core.collector.at.CgeqosrdpParser
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 
 import com.ufi_axis_core.util.AppLogger
@@ -30,6 +31,26 @@ import kotlinx.coroutines.withContext
 class DeviceRoutes(
     private val ctx: RouteContext
 ) {
+    private companion object {
+        /**
+         * `/device/qos` 查不到时的响应骨架。
+         *
+         * 字段**一个不少**（只是空值），这样客户端不需要为"AT 不可用"写第二套解析分支。
+         * `available = false` 专指"这台设备没有 AT 通道"（非展锐平台 / HAL 被裁 / 熔断）；
+         * 通道在但解不出记录时会把它改成 true —— 两种情况的下一步完全不同，
+         * 前者是"这台设备不支持"，后者值得看日志。
+         */
+        val QOS_UNAVAILABLE: Map<String, Any> = mapOf(
+            "available" to false,
+            "cid" to 0,
+            "qci" to 0,
+            "downlink_kbps" to 0L,
+            "uplink_kbps" to 0L,
+            "downlink_display" to "",
+            "uplink_display" to ""
+        )
+    }
+
     // ── 反向兼容 getter，使已有方法无需修改 ──
     private val systemCollector get() = ctx.systemCollector
     private val telephonyCollector get() = ctx.telephonyCollector
@@ -227,6 +248,56 @@ class DeviceRoutes(
             get("/model") {
                 call.respond(toJsonElement(systemController.getDeviceModel()))
             }
+
+            /**
+             * EPS 承载 QoS（`AT+CGEQOSRDP`，2026-09-22）。
+             *
+             * 返回默认承载（优先 cid=1）协商到的 QCI 与上下行 AMBR，供仪表盘设备信息卡显示。
+             *
+             * ## 为什么是独立端点而不是塞进 /api/dashboard/summary
+             * summary 是仪表盘 10s 一次的主链路。AT 通道全局互斥、有 500ms 最小间隔与失败退避，
+             * 一次抢锁超时（`ATChannel` 里是 10s）就会把整张仪表盘一起拖住。独立端点 + 5 分钟缓存
+             * 之后，AT 最多每 5 分钟走一次，summary 完全不受影响。
+             *
+             * ## 失败一律回 200 + 空字段，不回 4xx/5xx
+             * AT 通道在很多设备上根本不可用（非展锐平台、HAL 名字不同、被厂商裁掉），
+             * 那是**预期状态**而不是错误。回错误码会让客户端弹一个没法处理的提示；
+             * 回空字段客户端只需要显示"—"。`available` 标明到底是"没这能力"还是"查出来是空"。
+             */
+            get("/qos") {
+                suspend fun fetch(): JsonElement {
+                    if (!atChannel.isConnected || atChannel.isDisabled) {
+                        AppLogger.w("DeviceRoutes", "AT channel unavailable, QoS skipped")
+                        return toJsonElement(QOS_UNAVAILABLE)
+                    }
+                    // 查询类给 5s（ATChannel 默认 3s 偏短，与 NetworkController 的 AT 调用同口径）
+                    val raw = atChannel.sendCommand("AT+CGEQOSRDP", 5000)
+                    val bearer = CgeqosrdpParser.pickPrimary(raw)
+                    if (bearer == null) {
+                        AppLogger.w("DeviceRoutes", "AT+CGEQOSRDP 无可解析记录: ${raw?.take(120)}")
+                        return toJsonElement(QOS_UNAVAILABLE + mapOf("available" to true))
+                    }
+                    return toJsonElement(
+                        mapOf(
+                            "available" to true,
+                            "cid" to bearer.cid,
+                            "qci" to bearer.qci,
+                            // 原始 kbps 一并给出：客户端要换算单位、或以后要画图都不必重新解析
+                            "downlink_kbps" to bearer.downlinkKbps,
+                            "uplink_kbps" to bearer.uplinkKbps,
+                            // 展示文案在 core 生成：两端各写一份换算逻辑迟早对不上
+                            // （一个显示 500 Mbps 一个显示 500.0 Mbps 这种）
+                            "downlink_display" to (CgeqosrdpParser.formatRate(bearer.downlinkKbps) ?: ""),
+                            "uplink_display" to (CgeqosrdpParser.formatRate(bearer.uplinkKbps) ?: "")
+                        )
+                    )
+                }
+                call.respond(
+                    if (cache != null) cache.getOrPut("device:qos", CacheTTL.DEVICE_QOS) { fetch() }
+                    else fetch()
+                )
+            }
+
 
             get("/magisk") {
                 call.respond(toJsonElement(systemController.getMagiskStatus()))

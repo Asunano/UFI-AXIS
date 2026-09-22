@@ -45,13 +45,18 @@ import java.util.Locale
  * @param file 文件数据（[com.ufi_axis.data.api.FileItem]）
  * @param onDismiss 关闭回调
  * @param onAction 动作回调，参数是 `FileManagerRoot.handleAction` 认识的 action 字符串
+ * @param actionAvailable 该 action 在**当前目录所在的存储源**上是否真的可用。
+ *   调用方直接用长按菜单的清单来回答（菜单里没有这项 = 做不成），所以远端源里的
+ *   zip 不会长出一个点了回 400 的「解压」按钮、远端的 apk 不会长出「安装APK」。
+ *   默认全可用，便于预览与测试。
  */
 @Composable
 fun FileInfoDialog(
     visible: Boolean,
     file: FileItem,
     onDismiss: () -> Unit,
-    onAction: (String) -> Unit
+    onAction: (String) -> Unit,
+    actionAvailable: (String) -> Boolean = { true }
 ) {
     UfiCustomDialog(
         visible = visible,
@@ -69,7 +74,7 @@ fun FileInfoDialog(
             UfiDialogInfoRow("权限", file.permissions)
             UfiDialogInfoRow("符号链接", if (file.isSymlink) "是" else "否")
         }
-        val primary = primaryFileAction(file)
+        val primary = primaryFileAction(file)?.takeIf { actionAvailable(it.action) }
         if (primary != null) {
             UfiDialogActions(
                 onDismiss = onDismiss,

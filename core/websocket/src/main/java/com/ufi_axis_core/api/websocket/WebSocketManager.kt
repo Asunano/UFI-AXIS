@@ -76,8 +76,25 @@ class WebSocketManager(
     private val connections = ConcurrentHashMap<WebSocketSession, MutableSet<String>>()
     private val maxConnections = com.ufi_axis_core.contract.WsChannel.MAX_CONNECTIONS  // 支持 App + Web 多客户端同时连接（契约常量，双端共用）
 
-    // 广播序列化缓存：同类型 500ms 内复用预序列化的 JSON 文本
-    private val broadcastCache = ConcurrentHashMap<String, Pair<String, Long>>()
+    // 广播序列化缓存：同类型 + **同 payload** 在 500ms 内复用预序列化的 JSON 文本。
+    // payload 必须参与命中判断 —— 见 [BroadcastCacheEntry]。
+    private val broadcastCache = ConcurrentHashMap<String, BroadcastCacheEntry>()
+
+    /**
+     * 一条已序列化好的广播帧。
+     *
+     * 2026-09-21 修复：这里原来是 `Pair<String, Long>`（只有文本 + 时间戳），命中条件仅看
+     * type 和 TTL。对 cpu/memory 这种"一个频道只有一种含义"的周期推送没问题，但对
+     * `data_changed` 是**实打实的丢消息**：`{"changed":"task:list"}` 之后 500ms 内再推
+     * `{"changed":"device:traffic-limit"}`，第二帧会原样复用第一帧的文本，流量上限的
+     * 刷新信号就凭空消失了。现在把 payload 一起存下来，只有 payload 相等才复用。
+     * 缓存仍以 type 为 key，所以条目数被频道数限死，不会因 payload 变化而无界增长。
+     */
+    private data class BroadcastCacheEntry(
+        val text: String,
+        val timestamp: Long,
+        val data: Map<String, Any?>
+    )
 
     // 按订阅类型分组的连接索引，避免广播时遍历所有连接检查订阅类型
     private val subscriptions = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
@@ -262,9 +279,9 @@ class WebSocketManager(
 
         val now = System.currentTimeMillis()
 
-        // 100ms 内同类型广播复用上次序列化结果
-        val text = broadcastCache[type]?.let { (cachedText, ts) ->
-            if (now - ts < BROADCAST_CACHE_TTL_MS) cachedText else null
+        // 同类型 + 同 payload 且在 TTL 内 → 复用上次序列化结果
+        val text = broadcastCache[type]?.let { cached ->
+            if (now - cached.timestamp < BROADCAST_CACHE_TTL_MS && cached.data == data) cached.text else null
         } ?: run {
             val message = buildJsonObject {
                 put("type", JsonPrimitive(type))
@@ -277,7 +294,7 @@ class WebSocketManager(
                 put("timestamp", JsonPrimitive(now))
             }
             json.encodeToString(JsonElement.serializer(), message).also {
-                broadcastCache[type] = Pair(it, now)
+                broadcastCache[type] = BroadcastCacheEntry(it, now, data)
             }
         }
 
