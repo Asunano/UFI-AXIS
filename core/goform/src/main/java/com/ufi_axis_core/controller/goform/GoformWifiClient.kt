@@ -3,6 +3,7 @@ package com.ufi_axis_core.controller.goform
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.SettingKey
+import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
@@ -27,7 +28,9 @@ class GoformWifiClient(
     profile: DeviceProfile?,
 ) {
     private val tag = "GoformWifi"
-    private val fields = GoformFieldMapper(profile)
+    // 双 profile：可空那份管归一化（排障开关关掉就是 null），非空那份管命令表。
+    // 口径与同文件下一行的 GoformSettingWriter 一致 —— 它内部也是 `profile ?: ZteGoformProfile`。
+    private val fields = GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)
     private val writer = GoformSettingWriter(client, profile)
 
     // ==================== WiFi 查询 ====================

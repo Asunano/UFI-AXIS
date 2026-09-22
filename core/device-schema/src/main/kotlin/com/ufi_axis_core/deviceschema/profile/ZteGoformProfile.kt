@@ -430,11 +430,21 @@ object ZteGoformProfile : DeviceProfile {
 
         FieldGroup.CONNECTION -> listOf("network_type", "network_provider", "ppp_status")
 
-        // 与 GoformWifiClient.getWifiSettingsMerged 一致：前 8 个是扁平字段查询，
-        // 后 2 个是 module-info（`queryAccessPointInfo` 是**容器命令**，返回 `ResponseList` 数组，
-        // 由 structuralDecoder(WIFI_SETTINGS) 挑出生效 AP 后提到顶层）。
+        // 与 GoformWifiClient.getWifiSettingsMerged 一致，顺序也照它实际发送的顺序写：
+        // 前 12 个是 `getWifiSettings()` 的扁平字段查询，后 2 个是 `getWifiModuleInfo()`
+        // 的 module-info（`queryAccessPointInfo` 是**容器命令**，返回 `ResponseList` 数组，
+        // 由 structuralDecoder(WIFI_SETTINGS) = liftActiveAccessPoint 挑出生效 AP 后提到顶层）。
+        // 顺序与客户端逐字对齐是为了 0.4 删并行查询路径时能直接比对，不用再讨论顺序。
+        //
+        // **`WiFiModuleSwitch` 不能出现在这里**（2026-09-21 修正，原来它排在第 2 位）：
+        // 它是设备的**响应键**，是 MODULE_SWITCH 别名链的首项（见上面 readSpecs），
+        // 由 `queryWiFiModuleSwitch` 这条容器命令返回 —— 它本身不是可发的 cmd 名，
+        // 发出去就是白发一次无效查询。真正该发的是链上另外两个扁平 cmd
+        // （`wifi_enable` / `wifi_onoff_state`），少了它们会让覆盖率报告里
+        // `module_switch` 永远 missing（诊断误报，不是功能缺陷 —— 线上走的是客户端那 12+2 项）。
         FieldGroup.WIFI_SETTINGS -> listOf(
-            "wifi_chip1_ssid1_ssid", "WiFiModuleSwitch",
+            "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
+            "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
             "wifi_chip1_ssid1_passphrase", "wifi_chip",
             "wifi_chip1_ssid1_auth_mode", "wifi_chip1_ssid1_encryp_type",
             "wifi_chip1_ssid1_max_sta_num", "wifi_chip1_ssid1_broadcast_ssid",

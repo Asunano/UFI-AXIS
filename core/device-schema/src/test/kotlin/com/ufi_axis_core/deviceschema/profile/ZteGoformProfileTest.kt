@@ -745,8 +745,50 @@ class ZteGoformProfileTest {
         )
     }
 
-    // ───────────────────────── 信号（阶段 1.9 / 1.10） ─────────────────────────
+    /**
+     * WIFI_SETTINGS 的命令表冻结：逐字 + 顺序，与 `GoformWifiClient.getWifiSettingsMerged()`
+     * 实际发出的两次查询对齐 —— 前 12 项是 `getWifiSettings()` 的扁平字段，
+     * 后 2 项是 `getWifiModuleInfo()` 的容器命令。
+     *
+     * 顺序也断言，是为了 0.4 删客户端并行查询路径时能逐字比对，不用再讨论顺序。
+     */
+    @Test
+    fun `cmdsFor WIFI_SETTINGS 与 getWifiSettingsMerged 的两次查询一致`() {
+        assertEquals(
+            listOf(
+                "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
+                "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
+                "wifi_chip1_ssid1_passphrase", "wifi_chip",
+                "wifi_chip1_ssid1_auth_mode", "wifi_chip1_ssid1_encryp_type",
+                "wifi_chip1_ssid1_max_sta_num", "wifi_chip1_ssid1_broadcast_ssid",
+                "queryWiFiModuleSwitch", "queryAccessPointInfo",
+            ),
+            ZteGoformProfile.cmdsFor(FieldGroup.WIFI_SETTINGS),
+        )
+    }
 
+    /**
+     * `WiFiModuleSwitch` 是**响应键不是命令名** —— 它是 MODULE_SWITCH 别名链的首项，
+     * 由容器命令 `queryWiFiModuleSwitch` 返回。曾被误登记进命令表（2026-09-21 修正），
+     * 后果是白发一次无效查询，且覆盖率报告里 `module_switch` 永远 missing。
+     * 这条断言专门拦「看到别名链首项又把它抄回命令表」。
+     */
+    @Test
+    fun `WIFI_SETTINGS 命令表不含响应键 WiFiModuleSwitch`() {
+        assertFalse(
+            "WiFiModuleSwitch 是响应键（MODULE_SWITCH 别名链首项），不是可发的 cmd",
+            ZteGoformProfile.cmdsFor(FieldGroup.WIFI_SETTINGS).contains("WiFiModuleSwitch"),
+        )
+        // 该发的是别名链上另外两个扁平 cmd：少了它们 module_switch 在覆盖率报告里永远 missing
+        assertTrue(
+            "wifi_enable / wifi_onoff_state 是 module_switch 真正能被查到的两个 cmd",
+            ZteGoformProfile.cmdsFor(FieldGroup.WIFI_SETTINGS)
+                .containsAll(listOf("wifi_enable", "wifi_onoff_state")),
+        )
+    }
+
+
+    // ───────────────────────── 信号（阶段 1.9 / 1.10） ─────────────────────────
     /** SIGNAL 分组的 canonical 集合冻结：少一个 = 有端点会突然不返回字段。 */
     @Test
     fun `SIGNAL 分组登记了第 1 层全部字段`() {

@@ -758,6 +758,11 @@ object ComponentFactory {
         // profile 由调用方选好后注入（计划书 3.2）。
         // 此前每个客户端的构造参数各带一个 `= ZteGoformProfile` 默认值 —— 等于选型逻辑
         // 散在 6 个签名里，换设备要改 6 处且漏一处不会报错。
+        // 这两个客户端里的 GoformFieldMapper 已改成双 profile（阶段 0.4a）：这里仍然只传
+        // **可空**的那一份 —— 排障开关关掉归一化时它就是 null，`enabled` / `profileId`
+        // （→ /api/diagnose 的 normalization_enabled）靠的就是这个 null。
+        // 命令表那一份非空 profile 由客户端内部 `?: DeviceProfiles.DEFAULT` 补，
+        // 与 GoformSettingWriter 的既有做法同一处口径，不在这里多铺一层。
         val signalClient = GoformSignalClient(goform, profile)
         val wifiClient = GoformWifiClient(goform, profile)
         val networkClient = GoformNetworkClient(goform, profile)

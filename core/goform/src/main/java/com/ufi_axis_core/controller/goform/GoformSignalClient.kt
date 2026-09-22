@@ -2,6 +2,7 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
+import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
 import kotlinx.serialization.json.*
 
 /**
@@ -31,7 +32,10 @@ class GoformSignalClient(
     profile: DeviceProfile?,
 ) {
 
-    private val fields = GoformFieldMapper(profile)
+    // 归一化用可空的那份（排障开关 → null → 原样透传），命令表用非空的那份：
+    // 「字段归一化可以关，命令表不能关」，口径同 GoformSettingWriter / GoformSmsClient。
+    // 这里的 `?:` 不是新造的回落逻辑，是把 writer 已有的那一行照抄到读侧。
+    private val fields = GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)
 
     /** 生效中的 profile id；null = 归一化已关（诊断用，见计划书 10.2）。 */
     val profileId: String? get() = fields.profileId
@@ -109,12 +113,7 @@ class GoformSignalClient(
      * cmds 不动（少查一个字段并不省一次 HTTP，而改查询会改变设备侧请求形状）。
      */
     suspend fun getDeviceIdentity(): JsonObject? {
-        val data = client.query(fields.cmds(FieldGroup.IDENTITY, listOf(
-            "msisdn", "imei", "imsi", "iccid", "sim_imsi",
-            "hardware_version", "web_version", "wa_version", "cr_version", "wa_inner_version",
-            "lan_ipaddr", "mac_address", "wan_ipaddr", "ipv6_wan_ipaddr", "LocalDomain",
-            "ppp_status", "network_type", "rssi", "pdp_type", "opms_wan_mode"
-        ))) ?: return null
+        val data = client.query(fields.cmds(FieldGroup.IDENTITY, IDENTITY_FALLBACK_CMDS)) ?: return null
         return fields.normalize(FieldGroup.IDENTITY, data)?.ifEmpty { null }
     }
 
@@ -258,12 +257,7 @@ class GoformSignalClient(
      * 它自己不对外透出（NR 字段走 `signal` 频道与 `/api/network/signal`）。
      */
     suspend fun getCellInfo(): JsonObject? {
-        val data = client.query(fields.cmds(FieldGroup.CELL_INFO, listOf(
-            "neighbor_cell_info", "locked_cell_info", "network_information",
-            "network_type",
-            "Lte_pci", "Lte_fcn", "Lte_bands",
-            "lte_rsrp", "lte_rsrq", "lte_snr"
-        ))) ?: return null
+        val data = client.query(fields.cmds(FieldGroup.CELL_INFO, CELL_INFO_FALLBACK_CMDS)) ?: return null
         return fields.normalize(FieldGroup.CELL_INFO, data)?.ifEmpty { null }
     }
 
@@ -288,10 +282,7 @@ class GoformSignalClient(
      * "读到后自己 ×3600"，在这里换算会变成双重换算。
      */
     suspend fun getLanSettings(): JsonObject? {
-        val cmds = fields.cmds(FieldGroup.LAN_SETTINGS, listOf(
-            "lan_ipaddr", "lan_netmask", "mac_address", "dhcpEnabled",
-            "dhcpStart", "dhcpEnd", "dhcpLease_hour", "mtu", "tcp_mss"
-        ))
+        val cmds = fields.cmds(FieldGroup.LAN_SETTINGS, LAN_SETTINGS_FALLBACK_CMDS)
         return fields.normalize(FieldGroup.LAN_SETTINGS, client.query(cmds))
     }
 
@@ -309,16 +300,7 @@ class GoformSignalClient(
      * cmd 仍保留在查询里，避免改动设备侧的请求形状。
      */
     suspend fun queryDeviceSettings(): Map<String, JsonElement>? {
-        val cmds = fields.cmds(FieldGroup.DEVICE_SETTINGS, listOf(
-            "indicator_light_switch", "performance_mode",
-            "roam_setting_option", "dial_roam_setting_option",
-            "net_select", "lte_band_lock", "nr_band_lock",
-            "usb_port_switch", "samba_switch",
-            "restart_schedule_switch", "restart_time",
-            "sleep_sysIdleTimeToSleep",
-            "usb_network_protocal", "BearerPreference", "connection_mode",
-            "UpgMode"
-        ))
+        val cmds = fields.cmds(FieldGroup.DEVICE_SETTINGS, DEVICE_SETTINGS_FALLBACK_CMDS)
         return fields.normalize(FieldGroup.DEVICE_SETTINGS, client.query(cmds))
     }
 
@@ -330,7 +312,7 @@ class GoformSignalClient(
      * 值原样透出 —— `"0"` / `"all"` 表示未锁定，客户端的 `parseBands()` 已固化这个解析。
      */
     suspend fun getBandLockStatus(): JsonObject? {
-        val cmds = fields.cmds(FieldGroup.BAND_STATUS, listOf("lte_band_lock", "nr_band_lock"))
+        val cmds = fields.cmds(FieldGroup.BAND_STATUS, BAND_STATUS_FALLBACK_CMDS)
         return fields.normalize(FieldGroup.BAND_STATUS, client.query(cmds))
     }
 
@@ -344,14 +326,93 @@ class GoformSignalClient(
      * 上层不再见到复合串，也不需要知道单位藏在乘数里。开关值统一成 `"1"`/`"0"`。
      */
     suspend fun getDataUsage(): JsonObject? {
-        val cmds = fields.cmds(FieldGroup.TRAFFIC_LIMIT, listOf(
+        val cmds = fields.cmds(FieldGroup.TRAFFIC_LIMIT, TRAFFIC_LIMIT_FALLBACK_CMDS)
+        return fields.normalize(FieldGroup.TRAFFIC_LIMIT, client.query(cmds))
+    }
+
+    /**
+     * 6 处 `fields.cmds(group, fallback)` 的 fallback 列表。
+     *
+     * ## 为什么搬进 companion（0.4a，**只挪位置、不改内容**）
+     *
+     * 这些列表是「关掉字段归一化时唯一的命令来源」（见 [GoformFieldMapper.cmds]），
+     * 同时也是 `ZteGoformProfile.cmdsFor()` 的对照物。写成方法体里的字面量时，
+     * 「两份表有没有分叉」只能靠人眼比对 —— 而分叉的后果是**排障模式与正常模式发出不同的
+     * cmd**，两种模式下的响应差异会被误判成设备问题。
+     *
+     * 搬成具名常量之后 `GoformCommandTableGuardTest` 可以逐组比对，新增分叉立刻红。
+     * 做法与 [GoformSettingWriter] / [GoformWifiClient] 的 companion 纯函数一致
+     * （具体类挡住了端到端注入，就把可断言的部分抽出来）。
+     *
+     * **列表内容一个字符都不许改**：改了就是改设备侧请求形状，属行为变更而非结构调整。
+     */
+    internal companion object {
+
+        /** [getDeviceIdentity]：含 13 个不在登记表里的字段，见该方法的 allowlist 副作用注释。 */
+        internal val IDENTITY_FALLBACK_CMDS = listOf(
+            "msisdn", "imei", "imsi", "iccid", "sim_imsi",
+            "hardware_version", "web_version", "wa_version", "cr_version", "wa_inner_version",
+            "lan_ipaddr", "mac_address", "wan_ipaddr", "ipv6_wan_ipaddr", "LocalDomain",
+            "ppp_status", "network_type", "rssi", "pdp_type", "opms_wan_mode"
+        )
+
+        /**
+         * [getCellInfo]。
+         *
+         * 末项是**小写** `lte_snr`，而 `ZteGoformProfile.cmdsFor(CELL_INFO)` 是大写 `Lte_snr` ——
+         * 这是两份表目前唯一的分叉（待办池 P0-3），**未定性之前不许统一**。
+         */
+        internal val CELL_INFO_FALLBACK_CMDS = listOf(
+            "neighbor_cell_info", "locked_cell_info", "network_information",
+            "network_type",
+            "Lte_pci", "Lte_fcn", "Lte_bands",
+            "lte_rsrp", "lte_rsrq", "lte_snr"
+        )
+
+        /** [getLanSettings]。 */
+        internal val LAN_SETTINGS_FALLBACK_CMDS = listOf(
+            "lan_ipaddr", "lan_netmask", "mac_address", "dhcpEnabled",
+            "dhcpStart", "dhcpEnd", "dhcpLease_hour", "mtu", "tcp_mss"
+        )
+
+        /** [queryDeviceSettings]。 */
+        internal val DEVICE_SETTINGS_FALLBACK_CMDS = listOf(
+            "indicator_light_switch", "performance_mode",
+            "roam_setting_option", "dial_roam_setting_option",
+            "net_select", "lte_band_lock", "nr_band_lock",
+            "usb_port_switch", "samba_switch",
+            "restart_schedule_switch", "restart_time",
+            "sleep_sysIdleTimeToSleep",
+            "usb_network_protocal", "BearerPreference", "connection_mode",
+            "UpgMode"
+        )
+
+        /** [getBandLockStatus]。 */
+        internal val BAND_STATUS_FALLBACK_CMDS = listOf("lte_band_lock", "nr_band_lock")
+
+        /** [getDataUsage]。 */
+        internal val TRAFFIC_LIMIT_FALLBACK_CMDS = listOf(
             "flux_data_volume_limit_switch", "data_volume_limit_switch",
             "data_volume_limit_unit", "data_volume_limit_size",
             "data_volume_alert_percent",
             "monthly_tx_bytes", "monthly_rx_bytes", "monthly_time",
             "wan_auto_clear_flow_data_switch", "traffic_clear_date"
-        ))
-        return fields.normalize(FieldGroup.TRAFFIC_LIMIT, client.query(cmds))
+        )
+
+        /**
+         * 本类里全部走 `fields.cmds(group, fallback)` 的分组 → fallback 列表。
+         *
+         * 守门测试拿它与 `cmdsFor()` 逐组比对；**新加一处 `fields.cmds` 必须同时登记到这里**，
+         * 否则那一组的分叉不会被任何测试发现（测试里有一条断言钉住了这份清单的规模）。
+         */
+        internal val FALLBACK_CMDS: Map<FieldGroup, List<String>> = mapOf(
+            FieldGroup.IDENTITY to IDENTITY_FALLBACK_CMDS,
+            FieldGroup.CELL_INFO to CELL_INFO_FALLBACK_CMDS,
+            FieldGroup.LAN_SETTINGS to LAN_SETTINGS_FALLBACK_CMDS,
+            FieldGroup.DEVICE_SETTINGS to DEVICE_SETTINGS_FALLBACK_CMDS,
+            FieldGroup.BAND_STATUS to BAND_STATUS_FALLBACK_CMDS,
+            FieldGroup.TRAFFIC_LIMIT to TRAFFIC_LIMIT_FALLBACK_CMDS,
+        )
     }
 }
 
