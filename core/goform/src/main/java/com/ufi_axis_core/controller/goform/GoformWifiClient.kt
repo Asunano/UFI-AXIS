@@ -312,6 +312,17 @@ class GoformWifiClient(
     // ==================== WiFi 设置 ====================
 
 
+    /**
+     * 改整份 WiFi 热点配置。三个写入口里唯一「调用方可以逐项指定」的那个。
+     *
+     * 读回条件保持原样：只要 [authMode] 或 [ssid] 有一个没给，就得先 [getCurrentWifiConfig]
+     * 把当前值捞回来 —— 设备侧 `setAccessPointInfo` 是**整表替换**，漏发一个键那一项就按
+     * 设备默认值走（仓库为此出过两次事故，见 [SettingKey.WIFI_AP_CONFIG] 的 KDoc）。
+     * 两个都给了就不读：那是「用户在设置页把两项都填了」的路径，省一次查询。
+     *
+     * 合并规则本身在 [mergeApConfigParams]（纯函数，可单测）；base64 编码 / `ApIsolate` /
+     * `AccessPointIndex` 这些设备侧细节现在全在 profile 的 encode 里，本文件不再重复一份。
+     */
     suspend fun setWifiConfig(
         ssid: String? = null,
         authMode: String? = null,
@@ -321,69 +332,34 @@ class GoformWifiClient(
         broadcastDisabled: Int? = null,
         chipIndex: String? = null
     ): Boolean {
-        val params = mutableMapOf("isTest" to "false", "goformId" to "setAccessPointInfo")
         val current = if (authMode == null || ssid == null) getCurrentWifiConfig() else emptyMap()
-
-        val effectiveSsid = ssid?.trim() ?: current["SSID"]?.trim()
-        effectiveSsid?.let { params["SSID"] = it }
-
-        val effectiveAuth = authMode ?: current["AuthMode"]
-        if (effectiveAuth != null) {
-            params["AuthMode"] = effectiveAuth
-            if (effectiveAuth == "OPEN") {
-                params["EncrypType"] = "NONE"
-            } else {
-                params["EncrypType"] = encrypType ?: current["EncrypType"] ?: "CCMP"
-            }
-        } else {
-            params["AuthMode"] = "WPA2PSK"
-            params["EncrypType"] = encrypType ?: "CCMP"
-        }
-
-        val effectiveEncryp = params["EncrypType"]
-        if (effectiveAuth != "OPEN" && effectiveEncryp != "NONE") {
-            // 2026-09-21：这里原来写的是 `current["Password"]?.let { client.base64Decode(it) }`。
-            // 为什么错：getCurrentWifiConfig() 返回的 Password 已经是明文，再解一次 base64 等于
-            // 对明文做解码 —— 明文不是合法 base64 时 base64Decode 会返回空串，于是这条
-            // 「只改 SSID / 加密方式、不传 passphrase」的路径会把设备侧口令清空；
-            // 侥幸能解的情况下也是拿垃圾字节当口令写回去。current 已是明文，直接用。
-            val effectivePwd = passphrase ?: current["Password"]
-            effectivePwd?.let { params["Password"] = client.base64Encode(it) }
-        }
-
-        maxStaNum?.let { params["ApMaxStationNumber"] = it.toString() }
-        params["ApBroadcastDisabled"] = (broadcastDisabled ?: current["ApBroadcastDisabled"]?.toIntOrNull() ?: 0).toString()
-        params["ApIsolate"] = "0"
-        params["AccessPointIndex"] = "0"
-        params["ChipIndex"] = chipIndex ?: current["ChipIndex"] ?: "0"
-        AppLogger.i(tag, "setWifiConfig: SSID=${params["SSID"]} Auth=${params["AuthMode"]} Enc=${params["EncrypType"]}")
-        return client.isGoformSuccess(client.goformPost(params))
+        val params = mergeApConfigParams(
+            current = current,
+            ssid = ssid,
+            authMode = authMode,
+            encrypType = encrypType,
+            passphrase = passphrase,
+            maxStaNum = maxStaNum,
+            broadcastDisabled = broadcastDisabled,
+            chipIndex = chipIndex,
+        )
+        // 只打三个非敏感键：口令（哪怕是编码后的）不进日志
+        AppLogger.i(
+            tag,
+            "setWifiConfig: SSID=${params["ssid"]} Auth=${params["auth_mode"]} Enc=${params["encrypt_type"]}"
+        )
+        return writer.write(SettingKey.WIFI_AP_CONFIG, params)
     }
 
     /** @param level 发射功率档位（值域 0~2 的判据在 profile 的 validate 里，与 WifiRoutes 同一份事实）。 */
     suspend fun setWifiPower(level: Int): Boolean = writer.write(SettingKey.WIFI_POWER, level)
 
+    /**
+     * 只改 SSID —— 其余 AP 配置必须从设备读回后原样带上（整表替换，见 [mergeApSsidParams]）。
+     */
     suspend fun setWifiSSID(ssid: String): Boolean {
-
         val current = getCurrentWifiConfig()
-        val authMode = current["AuthMode"] ?: "WPA2PSK"
-        val encrypType = current["EncrypType"] ?: "CCMP"
-        val chipIndex = current["ChipIndex"] ?: "0"
-        val params = mutableMapOf(
-            "isTest" to "false", "goformId" to "setAccessPointInfo",
-            "SSID" to ssid.trim(), "AuthMode" to authMode, "EncrypType" to encrypType,
-            "AccessPointIndex" to "0", "ChipIndex" to chipIndex,
-            "ApBroadcastDisabled" to (current["ApBroadcastDisabled"] ?: "0"),
-            "ApIsolate" to "0"
-        )
-        if (authMode != "OPEN" && encrypType != "NONE") {
-            // 2026-09-21：这里原来是 `params["Password"] = it`（明文直发）。
-            // 为什么错：current["Password"] 是明文，而设备侧 setAccessPointInfo 的 Password
-            // 收的是 base64 —— 明文直发等于让设备把「明文串按 base64 解出来的东西」当新口令，
-            // 于是「只改 SSID」这个动作会顺手把 WiFi 口令写坏（用户下次连不上）。
-            current["Password"]?.let { params["Password"] = client.base64Encode(it) }
-        }
-        return client.isGoformSuccess(client.goformPost(params))
+        return writer.write(SettingKey.WIFI_AP_CONFIG, mergeApSsidParams(current, ssid))
     }
 
     /**
@@ -396,25 +372,153 @@ class GoformWifiClient(
     suspend fun setWifiEnabled(enabled: Boolean): Boolean =
         writer.write(SettingKey.WIFI_ENABLED, enabled)
 
+    /**
+     * 只改口令 —— 其余 AP 配置从设备读回后原样带上（整表替换，见 [mergeApPasswordParams]）。
+     */
     suspend fun setWifiPassword(password: String): Boolean {
         val current = getCurrentWifiConfig()
-        val authMode = current["AuthMode"] ?: "WPA2PSK"
-        val encrypType = if (authMode == "OPEN") "NONE" else (current["EncrypType"] ?: "CCMP")
-        val chipIndex = current["ChipIndex"] ?: "0"
-        val params = mutableMapOf(
-            "isTest" to "false", "goformId" to "setAccessPointInfo",
-            "Password" to client.base64Encode(password),
-            "AuthMode" to authMode, "EncrypType" to encrypType,
-            "ApBroadcastDisabled" to (current["ApBroadcastDisabled"] ?: "0"),
-            "ApIsolate" to "0", "AccessPointIndex" to "0",
-            "ChipIndex" to chipIndex
-        )
-        current["SSID"]?.let { params["SSID"] = it }
-        return client.isGoformSuccess(client.goformPost(params))
+        return writer.write(SettingKey.WIFI_AP_CONFIG, mergeApPasswordParams(current, password))
     }
 
     suspend fun setWifiSleep(time: String): WriteOutcome =
         writer.writeChecked(SettingKey.WIFI_SLEEP_IDLE_MINUTES, time)
+
+    /**
+     * 「读回当前值 → 合并 → 交给 [SettingKey.WIFI_AP_CONFIG] 的 encode」这一段的纯函数部分。
+     *
+     * ## 为什么抽成 companion 的纯函数
+     *
+     * 本类持有的是**具体类** [GoformClient]（阶段 1 才接口化），端到端路径注入不了假对象，
+     * 于是「current + 入参 → canonical params」这段判断以前只能靠真机验证。抽出来之后
+     * 三个入口各自放哪几个键就能逐字断言（`GoformWifiApParamsTest`）——
+     * 设备侧 `setAccessPointInfo` 是整表替换，多一个键 / 少一个键都会改掉 AP 的某一项配置，
+     * 这里错一个键是「读取毫无影响、写入静默改坏设备」的错误。做法同
+     * [GoformSettingWriter] 的 companion 纯函数。
+     *
+     * ## 三个入口共用的契约（值全是**明文 / 原值**，设备侧编码由 profile 负责）
+     *
+     * - 键不放 == 放 null → 该项不发（`auth_mode` / `encrypt_type` / `broadcast_disabled` /
+     *   `chip_index` 有 profile 侧缺省值，不发就是走缺省）
+     * - `passphrase` 只要**键在**就会发 `Password`（空串也发），所以「不想动口令」必须不放这个键
+     * - `ApIsolate` / `AccessPointIndex` / base64 编码 / `OPEN` 时强制 `NONE`：全在 profile
+     */
+    internal companion object {
+
+        /** 设备读不到 `AuthMode` 时最终生效的值（与 profile 的缺省档一致，用于本地算口令发送条件）。 */
+        private const val AUTH_DEFAULT = "WPA2PSK"
+
+        /** 开放热点。 */
+        private const val AUTH_OPEN = "OPEN"
+
+        /** 读不到 `EncrypType` 时最终生效的值（同上）。 */
+        private const val ENCRYP_DEFAULT = "CCMP"
+
+        /** [AUTH_OPEN] 下唯一合法的加密方式。 */
+        private const val ENCRYP_NONE = "NONE"
+
+        /**
+         * [setWifiConfig] 的参数合并。
+         *
+         * 口令的发送条件按「**最终会生效的**认证 / 加密方式」算，不是按入参算 ——
+         * 入参为 null 时生效的是 profile 缺省（WPA2PSK / CCMP），此时口令是要带上的；
+         * 这是改造前那段 `effectiveAuth != "OPEN" && effectiveEncryp != "NONE"` 的原义，逐字保住。
+         *
+         * 2026-09-21 修过的坑别再踩：[getCurrentWifiConfig] 返回的 `Password` **已经是明文**，
+         * 这里原来还会再 `base64Decode` 一次 —— 明文不是合法 base64 时解码返回空串，
+         * 于是「只改 SSID / 加密方式、不传 passphrase」会把设备侧口令清空。
+         * 现在明文直接进 `passphrase`，base64(UTF-8) 由 profile 的 encode 做，只编一次。
+         */
+        internal fun mergeApConfigParams(
+            current: Map<String, String>,
+            ssid: String?,
+            authMode: String?,
+            encrypType: String?,
+            passphrase: String?,
+            maxStaNum: Int?,
+            broadcastDisabled: Int?,
+            chipIndex: String?,
+        ): Map<String, Any?> {
+            val params = LinkedHashMap<String, Any?>()
+            // trim 在调用方这一侧做：profile 明确不猜「要不要去空格」
+            (ssid?.trim() ?: current["SSID"]?.trim())?.let { params["ssid"] = it }
+            val auth = authMode ?: current["AuthMode"]
+            auth?.let { params["auth_mode"] = it }
+            val encryp = encrypType ?: current["EncrypType"]
+            encryp?.let { params["encrypt_type"] = it }
+
+            val effectiveAuth = auth ?: AUTH_DEFAULT
+            val effectiveEncryp =
+                if (effectiveAuth == AUTH_OPEN) ENCRYP_NONE else (encryp ?: ENCRYP_DEFAULT)
+            if (effectiveAuth != AUTH_OPEN && effectiveEncryp != ENCRYP_NONE) {
+                (passphrase ?: current["Password"])?.let { params["passphrase"] = it }
+            }
+
+            maxStaNum?.let { params["max_sta_num"] = it }
+            params["broadcast_disabled"] =
+                broadcastDisabled ?: current["ApBroadcastDisabled"]?.toIntOrNull() ?: 0
+            (chipIndex ?: current["ChipIndex"])?.let { params["chip_index"] = it }
+            return params
+        }
+
+        /**
+         * [setWifiSSID] 的参数合并：只有 SSID 是新值，其余全是读回来的原值。
+         *
+         * `max_sta_num` **永不放**：改造前这个入口也没发 `ApMaxStationNumber`
+         * （设备侧不发就保持原值，发一个自己猜的值才是改坏配置）。
+         *
+         * ## 一处刻意的行为变更（2026-09-21 由用户裁决，选方案 A）
+         *
+         * 改造前这里把 `current["EncrypType"]` 原样发出去，即使 `AuthMode == "OPEN"` ——
+         * 于是可能发出 `AuthMode=OPEN` + `EncrypType=CCMP`。走 profile 之后
+         * `OPEN` 会被**强制**改成 `NONE`，这是本次唯一一处设备侧报文差异。
+         *
+         * 裁决理由：`OPEN` + 非 `NONE` 在设备侧本身是矛盾组合（开放热点没有加密算法），
+         * 另两个入口（改整份配置 / 只改口令）改造前就都强制 `NONE`，只有这里漏了，属笔误。
+         * 统一成 profile 的一份判断，而不是把笔误抄进 profile。
+         */
+        internal fun mergeApSsidParams(current: Map<String, String>, ssid: String): Map<String, Any?> {
+            val params = LinkedHashMap<String, Any?>()
+            params["ssid"] = ssid.trim()
+            val auth = current["AuthMode"]
+            auth?.let { params["auth_mode"] = it }
+            val encryp = current["EncrypType"]
+            encryp?.let { params["encrypt_type"] = it }
+            // 口令按「最终生效值」判：读不到就是 profile 缺省 WPA2PSK / CCMP，那种情况要带上口令
+            if ((auth ?: AUTH_DEFAULT) != AUTH_OPEN && (encryp ?: ENCRYP_DEFAULT) != ENCRYP_NONE) {
+                // current["Password"] 是**明文**，base64 由 profile 编一次（改造前这里直发明文，
+                // 等于让设备把「明文按 base64 解出来的字节」当新口令 —— 改 SSID 把口令写坏的那个 bug）
+                current["Password"]?.let { params["passphrase"] = it }
+            }
+            current["ApBroadcastDisabled"]?.toIntOrNull()?.let { params["broadcast_disabled"] = it }
+            current["ChipIndex"]?.let { params["chip_index"] = it }
+            return params
+        }
+
+        /**
+         * [setWifiPassword] 的参数合并：只有口令是新值，其余全是读回来的原值。
+         *
+         * `passphrase` **无条件放**（`OPEN` 也放）：这是「只改口令」这个入口的**意图** ——
+         * 用户点的就是改口令，不能因为当前是开放热点就把他输入的值悄悄丢掉。
+         * 所以这个条件不能搬进 profile 的 encode（另两处是有条件的），见
+         * [SettingKey.WIFI_AP_CONFIG] 的 KDoc。
+         *
+         * `max_sta_num` 同样永不放；`SSID` 不 trim —— 读回来的原值原样送回去。
+         */
+        internal fun mergeApPasswordParams(
+            current: Map<String, String>,
+            password: String,
+        ): Map<String, Any?> {
+            val params = LinkedHashMap<String, Any?>()
+            current["SSID"]?.let { params["ssid"] = it }
+            current["AuthMode"]?.let { params["auth_mode"] = it }
+            // OPEN 时 profile 会强制 NONE —— 与改造前这个入口的行为一致
+            current["EncrypType"]?.let { params["encrypt_type"] = it }
+            params["passphrase"] = password
+            current["ApBroadcastDisabled"]?.toIntOrNull()?.let { params["broadcast_disabled"] = it }
+            current["ChipIndex"]?.let { params["chip_index"] = it }
+            return params
+        }
+    }
 }
 
 /** 接入控制名单里的一台设备。`name` 可能为空串（设备侧名单允许只有 MAC）。 */

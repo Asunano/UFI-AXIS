@@ -94,22 +94,60 @@ object ZteGoformProfile : DeviceProfile {
     }
 
     /**
-     * WiFi 密码解码器。ZTE 把密码按 **base64(GBK)** 存放（中文密码固件行为），
-     * 从 `GoformClient.base64Decode` 搬来。
+     * WiFi 密码解码器：base64 解出字节后 **先试 UTF-8，UTF-8 不合法才回落 GBK**。
      *
      * 放这里而不是留在 `DataHub`：编码方式是设备特性，换一款设备就换一套。
      * 解不开或解出空串时返回 null（= 省略 key）；原实现返回 `""`，客户端两边都写
      * `?? ''` / `?: ""`，省略更符合"缺失即省略"的契约。
+     *
+     * ## 为什么 2026-09-22 把"只用 GBK"改成"UTF-8 优先"
+     *
+     * 写侧是 **UTF-8**（[base64Utf8] 与 `GoformClient.base64Encode` 都是），读侧却只用 GBK
+     * —— 这个不对称会在「读回当前口令 → 原样 base64 编码写回」这条路径上把非 ASCII 口令改坏
+     * （`GoformWifiClient.setWifiSSID` / `setWifiConfig` 走的就是这条路）。四种情形：
+     * - ASCII 口令：两种字符集结果一致，无影响；
+     * - 设备存 UTF-8：修好了（原来会被 GBK 解成乱码）；
+     * - 设备存 GBK（老固件）：UTF-8 解不合法 → 回落 GBK → **与改动前逐字一致**；
+     * - 两者都解不出可读文本：仍然走 GBK 那一支（GBK 解码用替换字符，不抛异常），语义不变。
+     *
+     * ## 判据是"能否无损往返"，不是"有没有替换字符"
+     *
+     * 判 `String(bytes, UTF_8).toByteArray(UTF_8) == bytes`：合法 UTF-8 往返后字节完全相同，
+     * 非法序列会被换成 U+FFFD（编码回去是 `EF BF BD`）从而不相等。用"结果里有没有 U+FFFD"
+     * 当判据是错的 —— 口令本身就可以包含这个字符，那样会把合法口令误判成非法。
+     *
+     * **GBK 双字节偶有恰好是合法 UTF-8 序列的可能，这是刻意接受的权衡：先 UTF-8 是因为写侧是
+     * UTF-8，保证「读回再写回」无损优先于兼容一个尚未观测到的边缘固件。**
+     *
+     * ⚠ 另一份同类实现在 `GoformClient.base64Decode`（读侧），**两者的判据必须一致**
+     * （P2 同轮修）。两份判据不一致时，`/api/wifi/settings` 读出来的口令和写回去的口令会不同，
+     * 而且没有任何测试能同时看见两边。
      */
     private val WIFI_PASSWORD_DECODER: (JsonElement) -> JsonElement? = Decoders.ofString { raw ->
         if (raw.isBlank()) return@ofString null
-        try {
-            String(java.util.Base64.getDecoder().decode(raw), java.nio.charset.Charset.forName("GBK"))
-                .takeIf { it.isNotBlank() }
+        val bytes = try {
+            java.util.Base64.getDecoder().decode(raw)
         } catch (_: Exception) {
-            null
+            // 不是合法 base64：保持现有语义，返回 null（省略 key）。
+            // **不要**改成返回空串 —— 空串会被下游当成"口令为空"，那是另一件事。
+            return@ofString null
         }
+        decodeWifiPassword(bytes).takeIf { it.isNotBlank() }
     }
+
+    /**
+     * base64 解出的字节 → 明文口令。UTF-8 能无损往返就用 UTF-8，否则按 GBK 解（老固件）。
+     *
+     * 判据与权衡见 [WIFI_PASSWORD_DECODER] 的 KDoc。
+     */
+    private fun decodeWifiPassword(bytes: ByteArray): String {
+        val utf8 = String(bytes, Charsets.UTF_8)
+        if (utf8.toByteArray(Charsets.UTF_8).contentEquals(bytes)) return utf8
+        return String(bytes, GBK)
+    }
+
+    /** 老固件把中文口令按 GBK 存（[WIFI_PASSWORD_DECODER] 的回落分支）。 */
+    private val GBK: java.nio.charset.Charset = java.nio.charset.Charset.forName("GBK")
 
     /**
      * 芯片标识解码器：两种编码都要认。
@@ -994,7 +1032,80 @@ object ZteGoformProfile : DeviceProfile {
             // 与 MOBILE_DATA 主命令同一条命令、同样幂等，重试判据也一样
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
+
+        // ───── 阶段 0 批 3：整份 WiFi 热点配置（setAccessPointInfo）─────
+        //
+        // 设备侧这条命令是**整表替换**：漏发一个键，那一项就按设备默认值走。仓库里已经为此出过
+        // 两次事故（改 SSID 把口令写成明文串、"不传口令改配置" 把口令清空），所以这里的原则是
+        // 「该发的键一个都不能少、不该发的键一个都不能多」，每一条缺省值都写在下面。
+        //
+        // 读-改-写留在 GoformWifiClient（计划书 §11.3）：profile 只收**合并后的完整参数集**。
+        // 三个入口（改整份配置 / 只改 SSID / 只改口令）的差异全在「往 params 里放哪几个键」。
+        //
+        // Password 的发送条件**只看 passphrase 键在不在**，不在这里判 auth/encryp ——
+        // 「只改口令」那个入口对 OPEN 也发 Password，那是调用方的意图而不是设备事实。
+        // 把那个条件写进 encode，三处就共用不了同一份实现（见 SettingKey.WIFI_AP_CONFIG 的 KDoc）。
+        //
+        // 没有 validate：SSID 与口令允许任意字符（含 & 和 =），body 由 GoformCodec 统一 URL 编码；
+        // 在这里加一条值域校验会把现在能设的 SSID 变成 Rejected，那是对外行为变更，不属于搬运。
+        SettingKey.WIFI_AP_CONFIG to WriteSpec(
+            command = "setAccessPointInfo",
+            encode = { p ->
+                val out = LinkedHashMap<String, String>()
+                // SSID 不做 trim：调用方已经 trim 过，profile 再 trim 一次就有两份"要不要去空格"的判断
+                p["ssid"]?.let { out["SSID"] = it.toString() }
+                val auth = p["auth_mode"]?.toString() ?: AP_AUTH_DEFAULT
+                out["AuthMode"] = auth
+                // OPEN 必须配 NONE：设备侧"开放热点 + 有加密算法"这个组合不成立
+                out["EncrypType"] =
+                    if (auth == AP_AUTH_OPEN) AP_ENCRYP_NONE
+                    else (p["encrypt_type"]?.toString() ?: AP_ENCRYP_DEFAULT)
+                // base64(UTF-8)：与 GoformClient.base64Encode 逐字等价（标准字母表、带 = 填充）。
+                // 写侧是 UTF-8，所以读侧解码也必须先试 UTF-8（见 WIFI_PASSWORD_DECODER）。
+                p["passphrase"]?.let { out["Password"] = base64Utf8(it.toString()) }
+                // 最大接入数是唯一"没传就真的不发"的可选项（现有客户端只有改整份配置时会带它）
+                p["max_sta_num"]?.let { out["ApMaxStationNumber"] = it.toString() }
+                out["ApBroadcastDisabled"] = p["broadcast_disabled"]?.toString() ?: "0"
+                // 两个恒发的固定值：现有三个调用点都写死 "0"，不是可配置项
+                out["ApIsolate"] = "0"
+                out["AccessPointIndex"] = "0"
+                out["ChipIndex"] = p["chip_index"]?.toString() ?: AP_CHIP_INDEX_DEFAULT
+                out
+            },
+            // 设置类命令、同一取值幂等（同一份配置发两次结果一样），与其余 18 项一致
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
     )
+
+    // ────────────────────── WiFi 热点配置的设备侧缺省值 ──────────────────────
+    // 这四个常量就是"调用方没给值时设备侧要收到什么"，逐字抄自 GoformWifiClient 的三个调用点。
+    // 提成常量而不是内联字面量：encode 与测试引用同一份，改缺省值时不会只改一处。
+
+    /** 认证方式缺省档：现有三个调用点在读不到当前值时都填这个。 */
+    private const val AP_AUTH_DEFAULT = "WPA2PSK"
+
+    /** 开放热点（无密码）的认证方式取值。 */
+    private const val AP_AUTH_OPEN = "OPEN"
+
+    /** 加密方式缺省档。 */
+    private const val AP_ENCRYP_DEFAULT = "CCMP"
+
+    /** [AP_AUTH_OPEN] 时唯一合法的加密方式。 */
+    private const val AP_ENCRYP_NONE = "NONE"
+
+    /** 芯片序号缺省值（单芯片机型恒为 "0"）。 */
+    private const val AP_CHIP_INDEX_DEFAULT = "0"
+
+    /**
+     * WiFi 口令的写侧编码：base64(UTF-8)。
+     *
+     * 与 `GoformClient.base64Encode` 逐字等价（标准字母表、带 `=` 填充、UTF-8）——
+     * device-schema 是纯 JVM 模块，可以直接用 `java.util.Base64`。
+     * 读侧的解码在 [WIFI_PASSWORD_DECODER]，**两者的字符集必须一致**，否则非 ASCII 口令
+     * 会在「读回当前值 → 再编码写回」这条路径上被改坏。
+     */
+    private fun base64Utf8(plain: String): String =
+        java.util.Base64.getEncoder().encodeToString(plain.toByteArray(Charsets.UTF_8))
 
 
 

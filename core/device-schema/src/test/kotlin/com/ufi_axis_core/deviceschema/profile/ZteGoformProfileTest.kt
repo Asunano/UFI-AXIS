@@ -15,6 +15,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -507,6 +508,61 @@ class ZteGoformProfileTest {
         val out = wifiSettings(accessPointInfo(mapOf("AccessPointSwitchStatus" to "1", "Password" to "!!!not base64!!!")))
         assertFalse(out.containsKey(DeviceFields.WifiSettings.PASSPHRASE))
     }
+
+    // ───── 口令解码的字符集（2026-09-22 批 3：写侧 UTF-8 / 读侧 GBK 的不对称已修）─────
+
+    private val gbk: java.nio.charset.Charset = java.nio.charset.Charset.forName("GBK")
+
+    private fun base64Of(s: String, charset: java.nio.charset.Charset) =
+        java.util.Base64.getEncoder().encodeToString(s.toByteArray(charset))
+
+    private fun decodedPassphrase(base64: String) =
+        wifiSettings(accessPointInfo(mapOf("AccessPointSwitchStatus" to "1", "Password" to base64)))[
+            DeviceFields.WifiSettings.PASSPHRASE,
+        ]
+
+    /**
+     * 设备存 UTF-8 时必须解对。
+     *
+     * 这就是这次改动的理由：写侧（`WIFI_AP_CONFIG` 的 `Password` 与 `GoformClient.base64Encode`）
+     * 是 UTF-8，读侧原来只用 GBK —— 非 ASCII 口令走「读回当前值再编码写回」那条路径会被改坏。
+     */
+    @Test
+    fun `非 ASCII 口令按 UTF-8 解码`() {
+        val plain = "密码abc123"
+        // 固定夹具：base64(UTF-8 字节)。写死字面量是为了让"字符集"这件事在测试里看得见
+        assertEquals("5a+G56CBYWJjMTIz", base64Of(plain, Charsets.UTF_8))
+        assertEquals(JsonPrimitive(plain), decodedPassphrase("5a+G56CBYWJjMTIz"))
+    }
+
+    /**
+     * 老固件存 GBK 时回落解对 —— 这一条保证改动对既有设备**逐字无变化**。
+     *
+     * `"中文"` 的 GBK 字节是 `D6 D0 CE C4`，`D6` 之后跟的不是 UTF-8 续字节，
+     * 所以 UTF-8 往返判据不成立 → 走 GBK 分支。
+     */
+    @Test
+    fun `GBK 口令在 UTF-8 解不出时回落`() {
+        val plain = "中文"
+        assertEquals("1tDOxA==", base64Of(plain, gbk))
+        assertEquals(JsonPrimitive(plain), decodedPassphrase("1tDOxA=="))
+    }
+
+    /** ASCII 口令两种字符集结果一致 —— 绝大多数真机口令走这条路，必须没有任何变化。 */
+    @Test
+    fun `ASCII 口令不受字符集优先级影响`() {
+        assertEquals(base64Of("secret", Charsets.UTF_8), base64Of("secret", gbk))
+        assertEquals(JsonPrimitive("secret"), decodedPassphrase("c2VjcmV0"))
+    }
+
+    /** 非法 base64 仍然返回 null（省略 key），不是空串 —— 空串会被当成「口令为空」。 */
+    @Test
+    fun `非法 base64 返回 null 而不是空串`() {
+        assertNull(decodedPassphrase("!!!not base64!!!"))
+        // 空值同样省略（原实现的语义，别改成空串）
+        assertNull(decodedPassphrase("   "))
+    }
+
 
     /** 只有扁平查询成功（module-info 超时）时必须照常工作。 */
     @Test
@@ -1453,6 +1509,224 @@ class ZteGoformProfileTest {
     }
 
 
+    // ───────── 阶段 0 批 3：整份 WiFi 热点配置（setAccessPointInfo）─────────
+    //
+    // 这 6 条覆盖三个调用点合并后的全部形态。都是**逐字断言整份输出 map**（不是只挑几个 key
+    // 断言）—— 因为设备侧这条命令是整表替换：多一个键、少一个键都会改掉 AP 的某一项配置。
+    // 仓库里已经为此出过两次事故（改 SSID 把口令写坏、不传口令把口令清空）。
+
+    private val apSpec = ZteGoformProfile.writeSpec(SettingKey.WIFI_AP_CONFIG)!!
+
+    @Test
+    fun `AP 配置的命令名与重试策略`() {
+        assertEquals("setAccessPointInfo", apSpec.command)
+        assertEquals(RetryPolicy.RETRY_ON_SESSION_LOSS, apSpec.retry)
+        // 整份配置只有一条命令、没有兜底命令
+        assertNull(apSpec.commandOf)
+        assertNull(apSpec.fallback)
+    }
+
+    /** 形态 1：全参数（对应 `setWifiConfig` 把七个入参都填满）。 */
+    @Test
+    fun `AP 配置全参数时逐字发出全部设备键`() {
+        assertEquals(
+            mapOf(
+                "SSID" to "MyAP",
+                "AuthMode" to "WPA2PSK",
+                "EncrypType" to "AES",
+                "Password" to "c2VjcmV0", // base64("secret")
+                "ApMaxStationNumber" to "16",
+                "ApBroadcastDisabled" to "1",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "1",
+            ),
+            apSpec.encode(
+                mapOf(
+                    "ssid" to "MyAP",
+                    "auth_mode" to "WPA2PSK",
+                    "encrypt_type" to "AES",
+                    "passphrase" to "secret",
+                    "max_sta_num" to 16,
+                    "broadcast_disabled" to 1,
+                    "chip_index" to "1",
+                ),
+            ),
+        )
+    }
+
+    /**
+     * 形态 2：只改 SSID —— 其余项是调用方读回来的当前值（模拟 `setWifiSSID` 合并后的参数集）。
+     *
+     * 关键点：`ApMaxStationNumber` **不发**（这个入口从来不带它），而 `Password` 要发 ——
+     * 只改 SSID 也必须把口令一起回写，否则设备会把口令按默认值处理。
+     */
+    @Test
+    fun `AP 配置只改 SSID 时把读回的其余项一起回写`() {
+        assertEquals(
+            mapOf(
+                "SSID" to "NewName",
+                "AuthMode" to "WPA2PSK",
+                "EncrypType" to "CCMP",
+                "Password" to "c2VjcmV0",
+                "ApBroadcastDisabled" to "0",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "0",
+            ),
+            apSpec.encode(
+                mapOf(
+                    "ssid" to "NewName",
+                    "auth_mode" to "WPA2PSK",
+                    "encrypt_type" to "CCMP",
+                    "passphrase" to "secret",
+                    "broadcast_disabled" to 0,
+                    "chip_index" to "0",
+                ),
+            ),
+        )
+    }
+
+    /**
+     * 形态 3：只改口令，且当前是 **OPEN** —— `setWifiPassword` 对 OPEN 也发 `Password`。
+     *
+     * 这一条就是「`Password` 的发送条件只看 `passphrase` 键在不在」的存在理由：
+     * 如果 encode 里再判一次 `auth != OPEN`，这个入口发出去的报文就会少一个键。
+     */
+    @Test
+    fun `AP 配置在 OPEN 下也发口令_只要调用方给了 passphrase`() {
+        assertEquals(
+            mapOf(
+                "SSID" to "OpenAP",
+                "AuthMode" to "OPEN",
+                "EncrypType" to "NONE",
+                "Password" to "c2VjcmV0",
+                "ApBroadcastDisabled" to "0",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "0",
+            ),
+            apSpec.encode(
+                mapOf(
+                    "ssid" to "OpenAP",
+                    "auth_mode" to "OPEN",
+                    // 调用方即使传了 encrypt_type，OPEN 也强制 NONE
+                    "encrypt_type" to "CCMP",
+                    "passphrase" to "secret",
+                ),
+            ),
+        )
+    }
+
+    /** 形态 4：OPEN 且没传 passphrase → 不发 `Password`，`EncrypType` 强制 `NONE`。 */
+    @Test
+    fun `AP 配置 OPEN 且没给口令时不发 Password`() {
+        val out = apSpec.encode(mapOf("ssid" to "OpenAP", "auth_mode" to "OPEN"))
+        assertEquals(
+            mapOf(
+                "SSID" to "OpenAP",
+                "AuthMode" to "OPEN",
+                "EncrypType" to "NONE",
+                "ApBroadcastDisabled" to "0",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "0",
+            ),
+            out,
+        )
+        assertFalse("没给 passphrase 就不许发 Password（发空串 = 把口令清空）", out.containsKey("Password"))
+    }
+
+    /** 形态 5：加密热点但没传 passphrase → 同样不发 `Password`，其余键照常。 */
+    @Test
+    fun `AP 配置没给口令时其余键照常发出`() {
+        val out = apSpec.encode(
+            mapOf(
+                "ssid" to "MyAP",
+                "auth_mode" to "WPA2PSK",
+                "encrypt_type" to "AES",
+                "max_sta_num" to 8,
+                "broadcast_disabled" to 1,
+                "chip_index" to "1",
+            ),
+        )
+        assertEquals(
+            mapOf(
+                "SSID" to "MyAP",
+                "AuthMode" to "WPA2PSK",
+                "EncrypType" to "AES",
+                "ApMaxStationNumber" to "8",
+                "ApBroadcastDisabled" to "1",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "1",
+            ),
+            out,
+        )
+        assertFalse(out.containsKey("Password"))
+    }
+
+    /** 形态 6：只传 SSID，其余全走缺省 —— 这条冻结的是"缺省值"这件设备事实。 */
+    @Test
+    fun `AP 配置只传 SSID 时其余项走设备缺省值`() {
+        val out = apSpec.encode(mapOf("ssid" to "MyAP"))
+        assertEquals(
+            mapOf(
+                "SSID" to "MyAP",
+                "AuthMode" to "WPA2PSK",
+                "EncrypType" to "CCMP",
+                "ApBroadcastDisabled" to "0",
+                "ApIsolate" to "0",
+                "AccessPointIndex" to "0",
+                "ChipIndex" to "0",
+            ),
+            out,
+        )
+        // isTest 由 GoformCodec.buildSetFormBody 统一补并去重，现有项一律不发
+        assertFalse("isTest 由 GoformCodec 统一补，发了就是重复", out.containsKey("isTest"))
+        assertFalse("没给最大接入数就不发这个键", out.containsKey("ApMaxStationNumber"))
+        assertFalse(out.containsKey("Password"))
+        // goformId 也不进 encode 的输出（命令名在 command 里）
+        assertFalse(out.containsKey("goformId"))
+    }
+
+    /** ssid 为 null / 不传时不发 SSID —— `setWifiConfig` 在读不到当前 SSID 时就是这个形态。 */
+    @Test
+    fun `AP 配置没有 SSID 时不发这个键`() {
+        val out = apSpec.encode(mapOf("passphrase" to "secret"))
+        assertFalse("SSID 缺失时不发这个键（发空串会把热点名清掉）", out.containsKey("SSID"))
+        assertEquals("c2VjcmV0", out["Password"])
+        // 显式传 null 与不传等价
+        assertEquals(out, apSpec.encode(mapOf("ssid" to null, "passphrase" to "secret")))
+    }
+
+    /**
+     * 口令的 base64 必须是 **UTF-8** 字节 —— 用含非 ASCII 的口令把字符集钉死。
+     *
+     * 读侧（`WIFI_PASSWORD_DECODER`）也是 UTF-8 优先，两边必须一致：否则「读回当前口令
+     * → 再编码写回」会把非 ASCII 口令改坏。
+     */
+    @Test
+    fun `AP 配置的口令按 base64 UTF-8 编码`() {
+        val plain = "密码abc123"
+        val expected = java.util.Base64.getEncoder().encodeToString(plain.toByteArray(Charsets.UTF_8))
+        assertEquals("5a+G56CBYWJjMTIz", expected)
+        assertEquals(expected, apSpec.encode(mapOf("passphrase" to plain))["Password"])
+        // GBK 编码的结果不同 —— 这条断言的作用是防止字符集被改回 GBK 而测试仍然绿
+        assertNotEquals(
+            java.util.Base64.getEncoder().encodeToString(plain.toByteArray(gbk)),
+            apSpec.encode(mapOf("passphrase" to plain))["Password"],
+        )
+    }
+
+    /** 空串口令与"没给口令"是两件事：调用方显式给了空串就照发（清空口令是一个合法动作）。 */
+    @Test
+    fun `AP 配置的空串口令照发而不是省略`() {
+        val out = apSpec.encode(mapOf("ssid" to "MyAP", "passphrase" to ""))
+        assertTrue("空串是调用方的明确意图，不许在 profile 里改成'不发'", out.containsKey("Password"))
+        assertEquals("", out["Password"])
+    }
+
     // ───────── 重试语义（计划书 §11.1）─────────
 
     @Test
@@ -1484,6 +1758,8 @@ class ZteGoformProfileTest {
             SettingKey.WIFI_ENABLED to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.MOBILE_DATA to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.PPP_DIAL to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            // 整份 AP 配置：同一份参数发两次结果一样（整表替换），与其余设置类命令同档
+            SettingKey.WIFI_AP_CONFIG to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.REBOOT to RetryPolicy.NEVER,
             SettingKey.SHUTDOWN to RetryPolicy.NEVER,
             SettingKey.FACTORY_RESET to RetryPolicy.NEVER,

@@ -264,6 +264,38 @@ enum class SettingKey {
      * —— 用户点「连接」失败后，设备的数据开关会被额外改一次。那是行为变更，不是重构。
      */
     PPP_DIAL,
+
+    /**
+     * WiFi 热点配置（SSID / 加密方式 / 口令 / 广播 / 最大接入数）。
+     *
+     * params（**全部可选**，某项为 null 或不存在 → 不发对应设备键，固定值除外）：
+     * - `ssid: String?` —— SSID。**调用方负责 trim**（profile 不猜「要不要去空格」）
+     * - `auth_mode: String?` —— 认证方式，缺省 `"WPA2PSK"`
+     * - `encrypt_type: String?` —— 加密方式，缺省 `"CCMP"`；`auth_mode == "OPEN"` 时**强制** `"NONE"`
+     * - `passphrase: String?` —— **明文**口令，由 encode 做 base64(UTF-8)
+     * - `max_sta_num: Int?` —— 最大接入设备数
+     * - `broadcast_disabled: Int?` —— 隐藏 SSID，缺省 `0`
+     * - `chip_index: String?` —— 芯片序号，缺省 `"0"`
+     *
+     * ## 为什么只有一个 key（而不是 WIFI_SSID + WIFI_PASSPHRASE 两个）
+     *
+     * 设备侧 `setAccessPointInfo` 是**整份 AP 配置替换**：漏发一个键，那一项就按设备默认值走
+     * （已经出过两次事故 —— 改 SSID 把口令写坏、不传口令把口令清空，见 `fix(wifi)` 那个提交）。
+     * 拆成两个 key 等于让「哪些键必须一起发」这条设备事实散在两处。
+     *
+     * ## 读-改-写留在调用方（计划书 §11.3）
+     *
+     * 「先读回当前值再合并」不是纯函数（要发一次查询），所以它留在 `GoformWifiClient`；
+     * profile 只收**调用方合并后的完整参数集**。三个入口（改整份配置 / 只改 SSID / 只改口令）
+     * 的差异全部体现在「往 params 里放哪几个键」，encode 这一份对三者通用。
+     *
+     * ## `Password` 的发送条件只看 `passphrase` 键在不在
+     *
+     * **不要**在 encode 里再判 `auth != OPEN && encryp != NONE`：三个入口的条件并不相同
+     * （「只改口令」这个入口对 OPEN 也发 Password）。那个条件是**调用方的意图**、
+     * 不是设备事实 —— 把它写进 encode，三处就再也共用不了同一份实现。
+     */
+    WIFI_AP_CONFIG,
 }
 
 /**
