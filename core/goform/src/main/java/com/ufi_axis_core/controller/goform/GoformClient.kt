@@ -862,23 +862,27 @@ class GoformClient(
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
+    // 写侧字符集固定 UTF-8。读侧（base64Decode）必须先试 UTF-8 才对称 —— 见
+    // [decodeDeviceText] 的注释。**不要**把这里改成 GBK 去「迁就」读侧。
     internal fun base64Encode(input: String): String =
         java.util.Base64.getEncoder().encodeToString(input.toByteArray(Charsets.UTF_8))
 
-    override fun base64Decode(input: String): String {
-        return try {
-            val bytes = java.util.Base64.getDecoder().decode(input)
-            val decoded = String(bytes, Charset.forName("GBK"))
-            try {
-                String(decoded.toByteArray(Charsets.UTF_8), Charsets.UTF_8)
-            } catch (_: Exception) {
-                decoded
-            }
-        } catch (e: Exception) {
-            AppLogger.e(tag, "base64Decode failed", e)
-            ""
-        }
-    }
+    /**
+     * 解 base64 并把字节按设备文本字符集还原成字符串。
+     *
+     * 失败语义（**刻意保留，不要改**）：input 不是合法 base64 时打一条 ERROR 后返回**空串**，
+     * 不抛异常、不返回 null。`/api/wifi/settings` 的读路径
+     * （`GoformWifiClient.getCurrentWifiConfig`）依赖这条。
+     * 既有陷阱：空串会被上层当成「口令为空」而不是「解码失败」——
+     * 这个坑在 `getCurrentWifiConfig` 的 KDoc 里也记了一条；要改得单独一轮，
+     * 连带上层的「空 vs 失败」区分一起改，别混在字符集这一轮里。
+     *
+     * 本方法只负责「怎么报错」；解码逻辑在纯函数 [base64DecodeOrEmpty] / [decodeDeviceText]，
+     * 单测打在那两个上面（这个类一构造就起 Ktor client，[AppLogger] 又依赖 android.util.Log，
+     * 实例方法在 JVM 单测里不可用 —— 所以是**测委托目标**，不是为了可测性改生产类型）。
+     */
+    override fun base64Decode(input: String): String =
+        base64DecodeOrEmpty(input) { e -> AppLogger.e(tag, "base64Decode failed", e) }
 
     override fun close() {
 
@@ -906,5 +910,61 @@ class GoformClient(
     // `ZteGoformProfile.NETWORK_TYPE_MAP` / `NETWORK_TYPE_DECODER`（逐条搬过去、语义一致，
     // 含"纯数字才查表、非数字原样透出"这条踩过坑的规则）。
     // 读侧的 `network_type` 在归一化时就已经是可读文案，调用方不需要再翻译一次。
+
+    companion object {
+        /** 老固件（以及备份版实现）假定的设备文本字符集。只作为 UTF-8 不成立时的回落。 */
+        private val GBK: Charset = Charset.forName("GBK")
+
+        /**
+         * 把设备返回的字节按「先 UTF-8，不合法才 GBK」还原成字符串。
+         *
+         * 2026-09-22：修字符集不对称。改前写侧是 [base64Encode] = UTF-8，读侧却无条件
+         * `String(bytes, GBK)` —— 写 UTF-8 / 读 GBK。ASCII 下两者一致所以一直没暴露，
+         * 但 2026-09-21 修完 `setWifiSSID` / `setWifiConfig` 那两个 Password bug 后，
+         * 「读回明文 → base64Encode 写回」成了常规路径，非 ASCII（中文）口令会在一次
+         * 「读回再写回」里被改坏。改成先试 UTF-8 后：
+         *  - ASCII：两种字符集编码相同，无任何行为变化；
+         *  - 设备存 UTF-8：修好了（改前被 GBK 解错）；
+         *  - 设备存 GBK（老固件）：UTF-8 解不合法 → 回落 GBK → 与改前一致。
+         *
+         * 判据是「**能否无损往返**」：UTF-8 解出来再编回去，字节与原字节逐一相等才算
+         * 「这堆字节本来就是 UTF-8」。为什么不用「解出来含不含 U+FFFD 替换字符」：
+         *  - 漏判：JDK 的 `String(bytes, UTF_8)` 对非法序列**不抛异常**，只替换成 U+FFFD，
+         *    所以「有没有异常」根本不是判据；
+         *  - 误判：设备真存了一个 U+FFFD（EF BF BD）时，那是**合法** UTF-8，
+         *    按「含替换字符就算失败」会被错误地回落 GBK。
+         *  往返判据同时覆盖这两种情况：替换过的字节必然编回成 EF BF BD 而与原字节不等，
+         *  真 U+FFFD 则往返相等。
+         *
+         * 刻意接受的权衡：GBK 双字节序列偶有恰好也是合法 UTF-8 的可能，这种输入会被判成
+         * UTF-8 而解错。接受它是因为**写侧是 UTF-8**：保证「读回再写回」无损，
+         * 优先于兼容一个尚未在真机上观测到的边缘固件。反过来（先 GBK）则会让每一个
+         * UTF-8 口令的回写都损坏 —— 那是已经能复现的问题。
+         */
+        internal fun decodeDeviceText(bytes: ByteArray): String {
+            val asUtf8 = String(bytes, Charsets.UTF_8)
+            if (asUtf8.toByteArray(Charsets.UTF_8).contentEquals(bytes)) return asUtf8
+            return String(bytes, GBK)
+        }
+
+        /**
+         * [base64Decode] 的纯函数体：合法 base64 → [decodeDeviceText] 的结果；
+         * 非法 base64 → 调一次 [onError] 后返回**空串**（与改造前逐字同义）。
+         *
+         * 「怎么报错」用参数传进来，是为了让这段逻辑能在 JVM 单测里跑：
+         * 实例方法传的是 `AppLogger.e`（依赖 android.util.Log），单测传默认的空实现。
+         * 这样测的就是生产路径本身，不需要构造 [GoformClient]（构造即起 Ktor client）。
+         */
+        internal inline fun base64DecodeOrEmpty(
+            input: String,
+            onError: (Exception) -> Unit = {}
+        ): String =
+            try {
+                decodeDeviceText(java.util.Base64.getDecoder().decode(input))
+            } catch (e: Exception) {
+                onError(e)
+                ""
+            }
+    }
 }
 

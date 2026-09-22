@@ -149,6 +149,20 @@ class GoformWifiClient(
     /**
      * 获取当前 WiFi 热点配置（AuthMode/EncrypType/Password/SSID 等），
      * 用于修改单项参数时保留其他参数不被重置
+     *
+     * **返回值契约（读明文 / 写 base64 的不对称，改本函数前先读计划书 §11.3）**：
+     * 返回的 `Password` 是**明文**（设备侧是 base64，这里已经解过一次）。
+     * 而 `setAccessPointInfo` 的 `Password` 字段要的是 **base64** ——
+     * 所以任何拿这个值回写设备的地方**必须自己 `client.base64Encode(...)`**，
+     * 既不能原样发（会把口令写成明文串），也不能再 `base64Decode` 一次（明文不是合法
+     * base64 时会拿到空串）。这个不对称就是 2026-09-21 修的那两处 Password bug 的根因。
+     *
+     * 其余键（SSID/AuthMode/EncrypType/ChipIndex/Ap*）都是设备原值，回写时原样透传。
+     *
+     * 陷阱：[GoformClient.base64Decode] 解码失败时**返回空串**而不是抛异常
+     * （`GoformClient.kt:868`，catch 里只打日志后 `return ""`），所以下面那个 try/catch
+     * 的 fallback 基本不会命中 —— 非法 base64 走的是「`config["Password"] = ""`」这条路。
+     * **不要改它的行为**：`/api/wifi/settings` 的读路径依赖现有语义。
      */
     internal suspend fun getCurrentWifiConfig(): Map<String, String> {
         val info = getWifiModuleInfo()
@@ -328,7 +342,12 @@ class GoformWifiClient(
 
         val effectiveEncryp = params["EncrypType"]
         if (effectiveAuth != "OPEN" && effectiveEncryp != "NONE") {
-            val effectivePwd = passphrase ?: current["Password"]?.let { client.base64Decode(it) }
+            // 2026-09-21：这里原来写的是 `current["Password"]?.let { client.base64Decode(it) }`。
+            // 为什么错：getCurrentWifiConfig() 返回的 Password 已经是明文，再解一次 base64 等于
+            // 对明文做解码 —— 明文不是合法 base64 时 base64Decode 会返回空串，于是这条
+            // 「只改 SSID / 加密方式、不传 passphrase」的路径会把设备侧口令清空；
+            // 侥幸能解的情况下也是拿垃圾字节当口令写回去。current 已是明文，直接用。
+            val effectivePwd = passphrase ?: current["Password"]
             effectivePwd?.let { params["Password"] = client.base64Encode(it) }
         }
 
@@ -358,7 +377,11 @@ class GoformWifiClient(
             "ApIsolate" to "0"
         )
         if (authMode != "OPEN" && encrypType != "NONE") {
-            current["Password"]?.let { params["Password"] = it }
+            // 2026-09-21：这里原来是 `params["Password"] = it`（明文直发）。
+            // 为什么错：current["Password"] 是明文，而设备侧 setAccessPointInfo 的 Password
+            // 收的是 base64 —— 明文直发等于让设备把「明文串按 base64 解出来的东西」当新口令，
+            // 于是「只改 SSID」这个动作会顺手把 WiFi 口令写坏（用户下次连不上）。
+            current["Password"]?.let { params["Password"] = client.base64Encode(it) }
         }
         return client.isGoformSuccess(client.goformPost(params))
     }
