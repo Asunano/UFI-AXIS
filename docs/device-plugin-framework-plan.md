@@ -110,12 +110,13 @@
 
 **B. 读命令表只搬了一半**
 
-> **状态（2026-09-22 批 12 之后）**：**0.4 已拆成 0.4a（已完成，`9fa0473`）/ 0.4b（未开始，
-> 但 **前置条件 P0-3 已解除**，状态由「受阻」改为「就绪」）**。
-> 0.4a 做的是**结构准备**：mapper 改双 profile、6 处 fallback 提成具名常量、加守门测试 ——
-> **取值行为一字未变**（`cmds()` 仍读 `normalizeProfile`）。
-> 0.4b 才是「删并行路径」那一半；原先卡它的 P0-3 已由 `d15c368` 修掉（两份命令表现在逐字一致），
-> 剩下的任务与验收见 §4 的 0.4b。
+> **状态（2026-09-22 批 13 之后）**：**0.4a（`9fa0473`）与 0.4b（`680fbae`）均已落地** ——
+> 0.4a 做的是**结构准备**：mapper 改双 profile、6 处 fallback 提成具名常量、加守门测试，
+> **取值行为一字未变**；0.4b 才是「删并行路径」那一半 —— `cmds()` 切到 `commandProfile`、
+> **6 个 fallback 常量与汇总表全部删除**、`getSignalInfo()` 的 16 项与 `getFullStatus()` 的 96 项
+> 收进 profile。**这一类欠账在代码层面已清完**，剩下的 7 处硬编码查询是**刻意保留**的
+> 轻量/分批查询（各处已加注释说明），2 处 `querySingle` 未动。
+> 0.4b 标 `[~]` 而不是 `[x]`，卡的是第 3 层（无真机，要重抓 `field_coverage`），见 §4 的 0.4b。
 > 本节标题的「只搬了一半」这个说法仍不准确（工作性质是删并行路径，不是搬），见下面那段 2026-09-21 的修正。
 
 > **2026-09-21 按真机基线修正**：这个标题不准确。§16 显示 10 个 `FieldGroup` 的
@@ -130,15 +131,18 @@
 > 源码里的注释本身也不准 —— KDoc 写「75+ 字段」、批内注释写 `(30 字段)` / `(28 字段)` / `(30+ 字段)`，
 > 只有第一批对得上。改这一项时按实际数字走，别照抄任何一处注释）。
 
-- `GoformSignalClient.kt:59` 信号 16 个 cmd；`:90` `network_information,Lte_ca_status`；
-  `:96` 身份 5 个；`:128` 版本 3 个；`:146` 流量；`:168/180/193` `getFullStatus()` 三批共 **96** 个字段名
-  （30 / 29 / 37）；`:270` `neighbor_cell_info`
-- 兜底列表（profile 没登记时用）：**0.4a 起已提成具名常量**，不再是方法体里的字面量 ——
-  `internal companion object`（`:349-415`）里的 `IDENTITY_FALLBACK_CMDS` / `CELL_INFO_FALLBACK_CMDS` /
-  `LAN_SETTINGS_FALLBACK_CMDS` / `DEVICE_SETTINGS_FALLBACK_CMDS` / `BAND_STATUS_FALLBACK_CMDS` /
-  `TRAFFIC_LIMIT_FALLBACK_CMDS`，外加一张 `FALLBACK_CMDS: Map<FieldGroup, List<String>>` 汇总表；
-  6 个消费点是 `:116 / :260 / :285 / :303 / :315 / :329` 的 `fields.cmds(group, fallback)`。
-  实测 profile 都登记了 → 这些 fallback 在归一化开启时**已是死代码**，但**不能直接删**（见 §4 的 0.4b）
+- `GoformSignalClient.kt:59` 信号 16 个 cmd（→ **0.4b 已收进 `cmdsFor(SIGNAL)`**）；
+  `:90` `network_information,Lte_ca_status`；`:96` 身份 5 个；`:128` 版本 3 个；`:146` 流量；
+  `:168/180/193` `getFullStatus()` 三批共 **96** 个字段名（30 / 29 / 37，
+  → **0.4b 已收进 `DeviceProfile.fullStatusCmds()`**）；`:270` `neighbor_cell_info`
+  （未标注的几处是**刻意保留**的轻量查询，见 §4 的 0.4b）
+- 兜底列表（profile 没登记时用）：0.4a 曾提成 `internal companion object` 里的 6 个具名常量
+  （`IDENTITY_FALLBACK_CMDS` / `CELL_INFO_FALLBACK_CMDS` / `LAN_SETTINGS_FALLBACK_CMDS` /
+  `DEVICE_SETTINGS_FALLBACK_CMDS` / `BAND_STATUS_FALLBACK_CMDS` / `TRAFFIC_LIMIT_FALLBACK_CMDS`）
+  + 一张 `FALLBACK_CMDS: Map<FieldGroup, List<String>>` 汇总表。
+  → **2026-09-22 批 13（`680fbae`）全部删除**（companion object 整块移除，6 处传参一并去掉）。
+  删除前用脚本逐组按 token 序列比对过，六组逐字含顺序一致，所以**删掉不改变任何实际发出的 cmd**。
+  现在命令表只有一份（profile 的 `cmdsFor()`），由 `GoformCommandTableGuardTest` 的**内容冻结**守门
 - `GoformWifiClient.kt:39` `queryWiFiModuleSwitch,queryAccessPointInfo`；`:205` 12 个 `wifi_*`；
   `:252` `station_list`（走 `client.querySingle`）；`:278` `queryDeviceAccessControlList`（同）
 - `GoformSmsClient.kt:68 / 217` 短信列表的全部查询参数（`mem_store=1&tags=10&order_by=...`）
@@ -348,10 +352,12 @@ class DeviceRuntime private constructor(
 
 ### 任务
 
-> 状态口径（**2026-09-22 批 12 执行完后复核**）：
+> 状态口径（**2026-09-22 批 13（0.4b，`680fbae`）执行完后复核**）：
 > 每一条都按当天的代码现查现写，不照抄上一轮。行号一律以符号名为准。
-> 阶段 0 现在只剩 **0.4b** 未开始（**前置条件 P0-3 已解除，状态由「受阻」改为「就绪」**）
-> + **0.8 的真机那一半**没法做。
+> 阶段 0 的**代码工作已全部落地**，但**没有一条可以标 `[x]`**：0.4b 的第 1、2 层已过、
+> **第 3 层（接口快照）未验**（无真机）→ 按 §14.3 最后一段与 §14.6 的纪律标 `[~]`。
+> 剩下的是 **0.5 的两项（已裁决推阶段 2）**、**0.8 的装配层与真机那一半**，
+> 以及一份**真机验证待办清单** —— 见 §9 末尾新增的「**阶段 0 收尾盘点**」。
 
 - `[x]` 0.1 `SettingKey` 补齐写命令（`core/device-schema/.../DeviceProfile.kt`）
   → 实测 `SettingKey` 现为 **28 项**（18 原有 + 10 新增；`USB_MODE` 已删、`WIFI_SSID`/`WIFI_PASSPHRASE`
@@ -385,44 +391,83 @@ class DeviceRuntime private constructor(
     非空回落 `?: DeviceProfiles.DEFAULT` 放在两个客户端内部
     （`GoformSignalClient.kt:38` / `GoformWifiClient.kt:33`），口径同 `GoformSettingWriter`
 
-- `[ ]` 0.4b（**就绪，不再受阻**）读命令表**真正切过去**：`cmds()` / `queryGroup()` 里的 `soloCmds`
-  改读 `commandProfile`、删掉 `cmds()` 的 `fallback` 参数与客户端那 6 个常量、把 11 处
-  `client.query(listOf(...))` 的字面量收进 `cmdsFor()`、`getFullStatus()` 走一个新的
-  `fullStatusCmds()`（或新 `FieldGroup`）
+- `[~]` 0.4b **读命令表已真正切到 `commandProfile`，fallback 全部删除**（`680fbae`，2026-09-22 批 13）
+  —— **代码层面完成，但第 3 层（接口快照）未验，所以是 `[~]` 不是 `[x]`**（§14.3 最后一段）。
 
-  **前置条件已解除（2026-09-22 批 12）**：P0-3 的分叉已修（`d15c368`，客户端 fallback 的
-  `lte_snr` → 设备真名 `Lte_snr`）。现在**两份命令表逐字一致** ——
-  `GoformSignalClient.CELL_INFO_FALLBACK_CMDS`（`:373-378`）与 `cmdsFor(CELL_INFO)`
-  （`ZteGoformProfile.kt:466-470`）同序同字；守门测试的 `knownDivergentGroups` 已清空为
-  `emptySet()`（`GoformCommandTableGuardTest.kt:89`）且仍绿。
-  **所以删 fallback 不会改变任何实际发出的 cmd**，「设备对 cmd 名是否大小写敏感」这个未证问题
-  也就不再是 0.4b 的前置条件（两条路发的已经是同一个串，敏不敏感都一样）。
+  **做了什么**（每条都已回代码核过，按符号名找）：
+  - `GoformFieldMapper.cmds(group)` **删掉 `fallback` 参数**，实现改成
+    `commandProfile.cmdsFor(group)`（`GoformFieldMapper.kt:115`）；
+    新增 `fullStatusCmds(): List<List<String>>` 同样只读 `commandProfile`（`:123`）
+  - `GoformSignalClient` 的 6 个 `*_FALLBACK_CMDS` 常量 + `FALLBACK_CMDS` 汇总表 + 6 处传参
+    **全部删除**（`internal companion object` 整块移除；现在全仓 `core/**` 里再 grep `FALLBACK`
+    只剩三处无关命名 + 守门测试注释里的历史说明）。删之前用脚本逐组按 token 序列比对过：
+    IDENTITY 20 / CELL_INFO 10 / LAN_SETTINGS 9 / DEVICE_SETTINGS 16 / BAND_STATUS 2 /
+    TRAFFIC_LIMIT 10 —— **六组全部逐字含顺序一致**，所以删掉不改变任何实际发出的 cmd
+  - `getSignalInfo()` 的 16 个字面量 → `fields.cmds(FieldGroup.SIGNAL)`
+    （`GoformSignalClient.kt:62`，16 项逐字同序核对过）
+  - `DeviceProfile` 新增 `fun fullStatusCmds(): List<List<String>> = emptyList()`
+    （`DeviceProfile.kt:63`），`ZteGoformProfile` 用私有 `FULL_STATUS_CMD_BATCHES` 实现
+    （`ZteGoformProfile.kt:501` / `:510`）
+  - `getFullStatus()` 改成 `for (batch in fields.fullStatusCmds())` 逐批发
+    （`GoformSignalClient.kt:180-186`），三批实测 **30 / 29 / 37 = 96**
 
-  **还剩什么**（2026-09-22 实测，按符号名找，别照抄数字）：
-  - `core/goform/src/main` 里 `client.query(listOf(` 仍有 **11 处**
-    （`GoformSignalClient` 9 + `GoformWifiClient` 2）；另有 2 处走 `client.querySingle`
-    （`station_list` / `queryDeviceAccessControlList`，`GoformWifiClient` 里），该 pattern 抓不到
-  - `cmds()` 仍是 `normalizeProfile?.cmdsFor(group)?.takeIf{…} ?: fallback`
-    （`GoformFieldMapper.kt:117-118`）→ 切成 `commandProfile.cmdsFor(group)`
-  - `queryGroup()` 的 `soloCmds` 取自传进来的 `normalizeProfile`（`GoformFieldMapper.kt:188-199`）
-    → 必须与 `cmds()` **同一批**切，否则「发哪些 cmd」与「哪些 cmd 不能合并发」来自两份 profile
-  - `GoformSignalClient` 的 6 个 `*_FALLBACK_CMDS` 常量 + `FALLBACK_CMDS` 汇总表（`:349-423`）删掉，
-    守门测试改成直接比对 `cmdsFor()` 与**收进 profile 后的唯一一份**
-  - 顺手做掉 **P1-20**（`GoformWifiClient` 两处 cmd 字面量提成 companion 常量、
-    测试引用真身而不是手抄拷贝）与 **P1-21**（`SIGNAL` / `CONNECTION` / `WIFI_CLIENTS`
-    三组纳入守门比对）
-  - `getFullStatus()` 的 **96** 项（三批 30 / 29 / 37，`GoformSignalClient.kt:168/180/193`）
-    收进 `fullStatusCmds()` 或新 `FieldGroup`（P1-22）
-  - 逐组核一遍 `cmdsFor()` 有没有同类「响应键当 cmd」的误登记（**P2-1**）——
-    两份表合成一份的那一刻正是做这件事的时机
+  **两个设计裁决（理由要留着，别下次又想改）**：
+  - **签名用外层列表表达批次边界**（`List<List<String>>` 而不是扁平 `List<String>`）：
+    批次边界是**设备事实** —— 一次发 96 项会被设备截断/返回空，本仓已有 `station_list`
+    因合并查询被设备吞掉的先例（见 `DeviceProfile.soloCmds`）。用扁平列表调用点就得自己切片
+    = 把刚搬走的设备知识又搬回客户端。
+  - **不做成新的 `FieldGroup`**：`coverageReport()` 遍历 `FieldGroup.entries`
+    （`GoformFieldMapper.kt:158`），加一个枚举值会让 `/api/diagnose?fields=1` 的 `field_coverage`
+    **多一个块**，直接冲掉 §16 的 2026-09-22 基线与 §14.3 的判据 1（`registered` 逐组不变）
+    / 判据 2（`queried` 全 true —— 全量批次没有登记 canonical，新组只会是 `registered=0`）。
+    理由整段写进了 `DeviceProfile.fullStatusCmds` 的 KDoc。
 
-  **验收（除本节通用条目外，这一条是硬判据）**：改完**重抓一份 `field_coverage`**，
+  **顺手更正的两处过期注释**：搬运前源码写 `30 / 28 / 30+`、KDoc 写「75+ 字段」，**两个都不准**，
+  实测就是 30 / 29 / 37 = 96（现已由守门测试冻结住数量与内容）。
+
+  **其余 7 处硬编码查询刻意不动**，各加了一行注释说明「刻意的轻量/分批查询，不走 profile 命令表；
+  字段名核对依据是 §16 的真机基线（2026-09-22）」——
+  `getNetworkInformation`（2 项，无对应组）、`getDeviceInfo`（5 项，IDENTITY 有 20 项）、
+  `getDeviceVersion`（3 项）、`getTrafficStats`（6 项，含 TRAFFIC_LIMIT 不管的 `realtime_*`）、
+  `getNeighborCellInfo`（1 项）、`GoformWifiClient.getWifiSettings`（12 项）与
+  `getWifiModuleInfo`（2 项）。后两者**合起来**才等于 `cmdsFor(WIFI_SETTINGS)` 的 14 项，
+  但线上是**两次独立请求**，合成一次会改变设备侧请求形状（见 §15 的 P1-20 修订）。
+
+  **诊断路径刻意仍走 `normalizeProfile`**：`coverageReport()` 回答的是「**当前生效的那份 profile**
+  登记了什么、命中了什么」，产出要与 §16 的 `registered` / `hit_source` 逐字比对，
+  所以必须是生效那份；`normalizeProfile == null` 时它整段短路（一条查询都不发）。
+  **0.4a 担心的「命令表来自 A、分批规则来自 B」在这个结构下不成立** ——
+  `queryGroup()` 的 `cmds` 与 `solo` 都来自同一个入参 `p`（`GoformFieldMapper.kt:205-215`），
+  内部同源。理由整段写进了 `queryGroup` 的 KDoc。
+
+  **守门测试转型**：`GoformCommandTableGuardTest` 从「客户端 fallback vs `cmdsFor`」的一致性比对
+  改成**命令表内容冻结** —— 比对对象随 fallback 删除而消失，只把 fallback 换成 `cmdsFor()`
+  会变成 `cmdsFor(g) == cmdsFor(g)` 的恒真式空转。现有 **9 条**（实测 `@Test` 计数 = 9）：
+  ① 冻结表覆盖全部 `FieldGroup`；② `cmdsFor` 10 组逐字含顺序；③ `soloCmds` 只有 `WIFI_CLIENTS`
+  的 `station_list`；④ `fullStatusCmds` 三批逐字（30/29/37，合计 96）；⑤ **任何组都不许出现小写
+  `lte_snr`**（防「两侧同时抄错成同一个错名」——整组逐字冻结拦不住这种）；
+  ⑥ `cmds` 取 `commandProfile` 而非 `normalizeProfile`（用 marker profile 正面证明）；
+  ⑦ 关掉归一化后 `cmds` 仍非空且等于 `commandProfile` 的登记表；
+  ⑧ 关掉归一化时 `coverageReport` 一条查询都不发；
+  ⑨ `coverageReport` 走 `normalizeProfile` 的命令表（断言发出的 cmd 里没有 marker，
+  且 `groups` 块数 == `FieldGroup.entries.size` —— 这条同时把 §16 的组数钉住了）。
+
+  **`ComponentFactory` 未动**（两个客户端的构造签名没变，`:766` / `:767` 不在本 commit 的文件清单里）。
+
+  **校验**：第 1 层 ✓（`:core:api:compileDebugKotlin` / `:core:compileDebugKotlin`）/
+  第 2 层 ✓（`:core:device-schema:test` / `:core:goform:test`，守门测试 9 条真实执行、
+  不是 up-to-date 跳过）/ **第 3 层 ✗、第 4 层 ✗（无真机）**。
+
+  **解锁条件（把 `[~]` 变成 `[x]` 要做的事）**：**重抓一份 `field_coverage`**，
   按 §14.3 的四条判据与 §16 的 2026-09-22 基线比对 ——
   `registered` **逐组不变**（合计 **85**）、`queried` **全 true**、
   `hit_source` **逐字不变**、`hit` **只增不减**（≥ **67**）。
   任何一条不满足且解释不清 → P0，先回滚再查。
-  ⚠ 若这一批同时新增了 `FieldGroup`（`FULL_STATUS` / `SMS_META`），
-  `registered` 合计必然变 —— 那就要**先抓基线、再改**，并在 §16 追加一份新基线（见 §16 末尾）。
+  **本轮没有新增 `FieldGroup`**（这是上面第二个裁决的直接目的），所以 `registered` 的组数与合计
+  **按设计不变**，§16 也**不需要追加第二份基线**。
+  判据 1 / 2 在代码层面已由守门测试第 ① 条（冻结表键集 == `FieldGroup.entries`）与第 ⑨ 条
+  （`groups` 块数 == `FieldGroup.entries.size`，且发的是真 profile 的 cmd）**间接钉住**；
+  但**判据 3 / 4 只能真机验** —— `hit_source` 与 `hit` 是设备返回值的函数，单测替身给不出来。
 
 - `[~]` 0.5 设备值域（频段全集 / WiFi 固定枚举 / base64 编码方向 / 二维码文件名）搬进 profile
   → **部分完成**：WiFi 固定枚举（`WPA2PSK` / `CCMP` / `ApIsolate=0` / `AccessPointIndex=0` /
@@ -446,7 +491,7 @@ class DeviceRuntime private constructor(
   → 已有：`ZteGoformProfileTest`（**117** 条 `@Test`，批 10 新增 2 条）、`ProfileContractTest`（8）、
   `ZteSmsSpecTest`（23）、`FieldNormalizerTest`（30）、`ZteGoformRawCaptureTest`（2）、
   `GoformSettingWriterDecisionTest`（20）、`GoformWifiApParamsTest`（19）、
-  `GoformWritePolicyTest`（15）、`GoformCommandTableGuardTest`（**8**，批 11 新增）、
+  `GoformWritePolicyTest`（15）、`GoformCommandTableGuardTest`（**9**，批 11 新增 8 条、批 13 转型后 9 条）、
   `GoformBase64CharsetTest`（7）、`GoformCodecFormBodyTest`（8）、`GoformSmsSendParamsTest`（1）。
   差的是**装配层**（writer × 真实 `GoformClient`，要等阶段 1 接口化）
   与**真机**那一半（§14.3 / §14.4，无真机）
@@ -521,6 +566,10 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 （见 `GoformSignalClient.kt:116/260/285/303/315/329` 的 6 处用法）。把各处 `client.query(listOf(...))`
 的字面量搬进 `ZteGoformProfile.cmdsFor()` 对应分组，调用点改成 `fields.cmds(group)`。
 
+> **以下三段是 0.4a/0.4b 之前的过程记录，`fallback` 参数已于 `680fbae`（批 13）删除。**
+> 保留原文是为了留住「为什么当初不许直接删」这条决策链 —— 删的前提是双 profile 先落地
+> 且两份表被证明逐字一致，不是「后来发现可以删」。最终形态见上面 0.4b 那一条。
+
 > **不要直接删 fallback 参数**（2026-09-21 修正，原方案在这里是错的）。
 > `GoformFieldMapper.cmds()` 是 `normalizeProfile?.cmdsFor(group)?.takeIf{…} ?: fallback`，
 > 而 `normalizeProfile` 在 `fieldNormalizationEnabled=false` 时是 null —— 此时
@@ -528,7 +577,7 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 >
 > 正确做法：照抄写侧已有的结论（`GoformSettingWriter.kt:14`「字段归一化可以关，写命令表不能关」），
 > 把 mapper 改成**双 profile** —— **这一步 2026-09-22 已落地（0.4a，`9fa0473`）**，
-> 实际签名如下（`fallback` 参数本轮**保留**，`cmds()` 的取值行为一字未变）：
+> 实际签名如下（`fallback` 参数 0.4a 当轮**保留**，`cmds()` 的取值行为一字未变）：
 > ```kotlin
 > internal class GoformFieldMapper(
 >     private val normalizeProfile: DeviceProfile?,   // 可空：归一化/脱敏/覆盖率，决定 enabled 与 profileId
@@ -538,15 +587,17 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 > // 0.4a 现状（未切）：
 > fun cmds(group: FieldGroup, fallback: List<String>): List<String> =
 >     normalizeProfile?.cmdsFor(group)?.takeIf { it.isNotEmpty() } ?: fallback
-> // 0.4b 目标：
+> // 0.4b 目标 —— 2026-09-22 `680fbae` 已落地，现在就是这一行（`GoformFieldMapper.kt:115`）：
 > fun cmds(group: FieldGroup): List<String> = commandProfile.cmdsFor(group)
 > ```
 > **`enabled` / `profileId` 的语义必须保持不变**：`/api/diagnose` 的 `normalization_enabled`
 > 是从 `activeProfile != null` 推出来的（`HttpServer.kt:570`（**该文件在 `core/network`**）
 > ← `DataHub.kt:225`（`core/api`）← `GoformSignalClient.kt:41` ← `mapper.profileId`）。顺手把 `profileId`
 > 改成非空，排障开关的可观测性就没了 —— 它会永远报 `true`。
-> 这条纪律 0.4a 已经写进 `GoformFieldMapper` 的类注释，并由
-> `GoformCommandTableGuardTest.关掉归一化时 cmds 仍然返回 fallback` 钉住。
+> 这条纪律 0.4a 已经写进 `GoformFieldMapper` 的类注释；0.4b 之后由
+> `GoformCommandTableGuardTest.关掉归一化后 cmds 仍然非空且等于 commandProfile 的登记表`
+> 钉住（该测试 0.4a 时叫「关掉归一化时 cmds 仍然返回 fallback」，
+> **保护的不变量一字未变**，只是比对对象从 fallback 换成了 `commandProfile` 的登记表）。
 >
 > **0.4b 必须连 `soloCmds` 一起切**（2026-09-22 修正，原方案这句写错了）：
 > mapper 上**没有** `soloCmds()` 方法。唯一使用点是私有的 `queryGroup()`
@@ -556,6 +607,15 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 > 「发哪些 cmd」与「哪些 cmd 不能合并发」是同一件设备事实。
 > 实测 `ZteGoformProfile.soloCmds()`（`:480-481`）只对 `WIFI_CLIENTS` 返回 `["station_list"]`，
 > 其余分组一律空。
+>
+> **⚠ 上面这条「必须一起切」的判断在 0.4b 落地时被推翻了（2026-09-22 批 13，按语义重新判定）**：
+> 两条路径回答的是两个不同的问题 —— 业务查询（`cmds()`）问「现在要向设备发哪些 cmd」，
+> 命令表不能关 → 取非空的 `commandProfile`；覆盖率诊断（`coverageReport()` → `queryGroup()`）
+> 问「**当前生效的那份 profile** 登记了什么、命中了什么」，产出要与 §16 的 `registered` /
+> `hit_source` 逐字比对 → 必须取生效那份，也就是 `normalizeProfile`。
+> **原文担心的错配也不成立**：`queryGroup()` 的 `cmds` 与 `solo` 都来自同一个入参 `p`
+> （`GoformFieldMapper.kt:205-215`），内部同源；错配只会出现在「一边取 `p`、一边取 `commandProfile`」
+> 的写法上，那种写法现在没有、也不要加。理由整段写进了 `queryGroup` 的 KDoc。
 
 `getFullStatus()` 那 **96** 个字段名（三批 30 / 29 / 37，**实测**；原文写的 88 与源码注释写的
 `30 / 28 / 30+`、KDoc 的「75+ 字段」都不准）建议新增一个 `FieldGroup.FULL_STATUS`
@@ -563,6 +623,14 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 不要塞进已有分组 —— 它是「一次拉全量」的专用批次，与按需查询的分组语义不同。
 注意加枚举值会影响穷举逻辑：`GoformFieldMapper.coverageReport()` 遍历 `FieldGroup.entries`
 （`:153`），新组没登记 cmd 时会多出一个 `queried=false` 的块，`ProfileContractTest` 的相关断言要跟着改。
+
+> **⚠ 这条建议在 0.4b 落地时被否了（2026-09-22 批 13 裁决，理由就是上面那句「注意」）**：
+> 加 `FieldGroup` 会让 `field_coverage` 多一个块，`registered` 的组数与合计必然变，
+> 直接冲掉 §16 的基线与 §14.3 的判据 1/2 —— 而 0.4b 的验收**恰恰是拿那份基线比对**。
+> 实际做法是在 `DeviceProfile` 上新开一个 `fullStatusCmds(): List<List<String>>`
+> （默认 `emptyList()` = 该设备不提供全量 dump），外层列表表达**批次边界**。
+> 全量 dump 与「按需查询的分组」语义本来也不同：它**不参与归一化**，只是把设备后台有什么原样捞一份看。
+> 完整理由在 `DeviceProfile.fullStatusCmds` 的 KDoc 与上面 0.4b 那一条。
 
 
 **0.5** `LTE_ALL_BANDS` / `NR_ALL_BANDS` 移到 profile 的 `BAND_LOCK_*` WriteSpec 内部（解锁时用），
@@ -600,28 +668,50 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
     所以真实的「绕过 profile 的写命令」总数 = grep 数字 **+ 2**（现在是 4 + 2 = 6）。
     要一次抓全就同时 grep `goformId`（不带 ` to`）—— 别再按前一个数字下结论。
 
-- 读命令（**0.4b 的判据**）：`core/goform/src/main` 里 `client.query(listOf(` 为 0。
-  **2026-09-22 实测修正两点**：
-  - 该 pattern 现在**不会**命中 `GoformFieldMapper` —— 它的分批查询走的是构造进来的 lambda
-    （`queryGroup()` 里的 `query(it)` / `query(listOf(cmd))`，`:196/:197`），不是 `client.query`。
+- 读命令（**0.4b 的判据 —— 2026-09-22 批 13 按实测修正，原先写的「应从 11 降到 9」是错的**）：
+
+  **两个口径不要再混，分别写清**（两个数字都对，只是分母不同）：
+
+  | 口径 | 0.4b 之前 | 0.4b 之后（`680fbae` 实测） | 说明 |
+  | --- | --- | --- | --- |
+  | A. `client.query(listOf(` 的处数 | 11 | **7** | = SignalClient 9 + WifiClient 2，本轮拿掉 `getSignalInfo` 1 处 + `getFullStatus` 3 处 = 4 |
+  | B. **绕过 profile 的读入口总数** | 13 | **9** | = 口径 A 的 7 处 + 2 处 `client.querySingle(`（`station_list` / `queryDeviceAccessControlList`，本轮未动） |
+
+  **我在 0.4b 的 brief 里把这两个口径算混了**（写成「`client.query(listOf(` 从 11 降到 9」）：
+  把 WiFi 那 2 处算了两遍 —— 11 里本来就含 WifiClient 的 2 处，不该在减完 4 处之后又补回来。
+  **口径 A 的正确答案是 7，口径 B 的正确答案是 9。** 下次核这个数字时**先说清问的是哪个口径**。
+
+  **剩下这 7 + 2 处都是刻意保留的**，不是漏改（各处方法体上都有一行注释写明理由与核对依据）：
+  刻意的轻量查询（`getNetworkInformation` / `getDeviceInfo` / `getDeviceVersion` /
+  `getTrafficStats` / `getNeighborCellInfo`）、刻意的分批查询
+  （`getWifiSettings` 12 项 + `getWifiModuleInfo` 2 项 = 两次独立请求）、
+  以及两处 `querySingle`。所以**「该 pattern 归零」这个原判据已经不适用** ——
+  归零意味着把这些轻量/分批查询强行换成整组命令表，那是设备侧请求形状的变更。
+  **新判据：口径 A 恰好 7 处、口径 B 恰好 9 处，且每一处都有注释说明为什么不走 profile。**
+
+  **2026-09-22 早前实测已修正的两点（保留）**：
+  - 该 pattern **不会**命中 `GoformFieldMapper` —— 它的分批查询走的是构造进来的 lambda
+    （`queryGroup()` 里的 `query(it)` / `query(listOf(cmd))`），不是 `client.query`。
     原方案那句「判据要排除 `GoformFieldMapper.kt`」已经不必要，但**结论仍然成立**：
     那两行是引擎自身按 solo / 非 solo 分批，是正确代码，不是硬编码命令表
-  - **光看这个 pattern 会漏两处**：`GoformWifiClient.kt:252` `client.querySingle("station_list")`
-    与 `:278` `client.querySingle("queryDeviceAccessControlList")`。
-    要一次抓全就同时 grep `client.querySingle(` —— 别再按 11 这个数字下结论
+  - **光看这个 pattern 会漏两处**：`GoformWifiClient` 的 `client.querySingle("station_list")`
+    与 `client.querySingle("queryDeviceAccessControlList")`。
+    要一次抓全就同时 grep `client.querySingle(` —— 那就是口径 B
 - **route 层的两个裸命令端点是刻意的例外，不许动**：`DeviceRoutes.kt:147`
   `POST /api/device/goform/query` 与 `:178` `POST /api/device/goform/set` 的 cmd / goformId
   来自 HTTP 请求体，由 `goform_command_enabled` 开关守门（`AppSettings.kt:32`）。
   它们是排障通道，**不进 profile**；阶段 3 再给它们加能力门禁（见 §11.5）
 - `ZteGoformProfileTest` 新增断言：`SettingKey.values()` 全部有 `writeSpec`（现有测试已有这条，
   新增 key 会自动被它覆盖 —— 先跑一次确认它真的会失败，再补 spec）
-- **排障开关回归**：把 `field_normalization_enabled` 设成 false 重启后台服务，
-  仪表盘/网络/WiFi 三个页面仍有数据（验证 0.4b 切 `commandProfile` 之后没把只读面打瘫），
-  且 `/api/diagnose` 的 `device_profile.normalization_enabled` 为 `false`。
-  **0.4a 起这条已有单测替身**：`GoformCommandTableGuardTest` 的
-  「关掉归一化时 `cmds` 仍然返回 fallback」+「关掉归一化时 `coverageReport` 不向设备发查询」
-  两条，把「关掉归一化不会打瘫只读面」与「关掉归一化不会开始真打设备」都钉住了；
-  真机那一遍仍要做，单测替身只覆盖取值不覆盖端到端
+- **排障开关回归**（**0.4b 之后这条从「预防性检查」升级为必做项** —— `cmds()` 现在真的走
+  `commandProfile` 了）：把 `field_normalization_enabled` 设成 false 重启后台服务，
+  仪表盘/网络/WiFi 三个页面仍有数据，且 `/api/diagnose` 的
+  `device_profile.normalization_enabled` 为 `false`。
+  **单测替身（0.4a 起有，0.4b 已随 fallback 删除同步改名）**：`GoformCommandTableGuardTest` 的
+  「关掉归一化后 `cmds` 仍然非空且等于 `commandProfile` 的登记表」
+  +「关掉归一化时 `coverageReport` 不向设备发查询」两条，把「关掉归一化不会打瘫只读面」
+  与「关掉归一化不会开始真打设备」都钉住了（0.4a 时前者叫「…仍然返回 fallback」，
+  **保护的不变量一字未变**）。真机那一遍仍要做，单测替身只覆盖取值不覆盖端到端
 - 真机回归（无真机则标 `[!]`）：重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 /
   **手动拨号与挂断**（`PPP_DIAL`，与「开关移动数据」是不同的 key、不同的失败路径，必须分开点）/
   切连接模式 / 改 SSID / 改密码 / 改功率 / **开关 WiFi**（`WIFI_ENABLED`，开与关走两条不同命令，
@@ -887,6 +977,23 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   与 **P1-24**（约 30 个清单未收录字段待多态 dump 验证，附取证方法）；
   §9 追加执行记录批 12。
   本轮**不改任何代码**、**没有重跑 Gradle**（另一个代理在改 `web/**`、用户在改 `scripts/**` 与 `app/**`）。
+- 2026-09-22 **0.4b（`680fbae`）落地后按实测同步本文档（批 13 文档轮）**：
+  §2.2 B 类的状态块与 fallback 那一条按实测重写（6 个常量 + 汇总表**已全部删除**，
+  命令表现在只有一份）；**§4 的 0.4b 由 `[ ]` 改成 `[~]`**（不是 `[x]` —— 第 3 层无真机未验）
+  并写清做了什么 / 两个设计裁决 / 7 处刻意保留 / 解锁条件；
+  §4 任务清单的状态口径块重写；**§4 验收的读命令判据按两个口径分别写清**
+  （`client.query(listOf(` = **7**；绕过 profile 的读入口总数 = **9**）并记下「我把两个口径算混了」
+  这个错误；§4 验收的排障开关那条更新守门测试名（随 fallback 删除改名，不变量未变）；
+  §4「怎么做」的 0.4 段把「不要直接删 fallback」「必须连 soloCmds 一起切」「建议新增 FieldGroup」
+  三段**保留原文并各加一段落地注记**（后两条在 0.4b 落地时按语义被推翻/被否，理由写清）；
+  §4 0.8 的守门测试条数 8 → **9**；§9 追加执行记录批 13 与**新增「阶段 0 收尾盘点」一节**；
+  §14.4 的真机清单条数 12 → **14**（逐项数过）；
+  §15 **P1-21 结案**（三组已纳入冻结表，10 组全覆盖）、**P1-22 结案**（`fullStatusCmds()` 已落地）、
+  **P1-20 修订**（不变量现在只由注释维系，彻底解决要给 `DeviceProfile` 加「分批读」表达 → 阶段 2）、
+  **P2-1 修订**（本轮只核了「fallback vs cmdsFor」的一致性，**没有**逐个验 cmd 名在设备上真可发）、
+  新增 **P1-25**（`getFullStatus()` 的 96 项里相当一部分没有登记 canonical）；
+  §16 末尾补一条「0.4b 已落地且**未新增 `FieldGroup`**，所以不需要追加第二份基线」。
+  本轮**不改任何代码**、**没有重跑 Gradle**（用户正在并行改 `scripts/**` / `app/**` / `web/src/**`）。
 
 
 ### 执行记录
@@ -1062,6 +1169,137 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
     抢构建锁只会拿到一份混合状态的结果（§13.3 最后一条）。
     第3层：**这一轮第一次真正做了** —— 拿到真机 `field_coverage` 并写进 §16 作为后续比对基准；
     第4层（写操作真机回归）仍未做。
+- 2026-09-22 **阶段 0 批 13**（0.4b：命令表收敛到 `commandProfile`，删掉全部 fallback）完成，
+  commit `680fbae`。改了 6 个文件（`DeviceProfile.kt` / `ZteGoformProfile.kt` /
+  `GoformFieldMapper.kt` / `GoformSignalClient.kt` / `GoformWifiClient.kt` / 守门测试），
+  `+428 / -323`。**`ComponentFactory` 不在改动清单里**（两个客户端的构造签名没变）。
+  1. **`GoformFieldMapper.cmds(group)` 删掉 `fallback` 参数**，实现改成
+     `commandProfile.cmdsFor(group)`；新增 `fullStatusCmds()` 同样只读 `commandProfile`。
+  2. **`GoformSignalClient` 的 6 个 `*_FALLBACK_CMDS` 常量 + `FALLBACK_CMDS` 汇总表 + 6 处传参
+     全部删除**（`internal companion object` 整块移除）。**删之前用脚本逐组按 token 序列比对过**：
+     IDENTITY 20 / CELL_INFO 10 / LAN_SETTINGS 9 / DEVICE_SETTINGS 16 / BAND_STATUS 2 /
+     TRAFFIC_LIMIT 10，**六组全部逐字含顺序一致** → 删除不改变任何实际发出的 cmd。
+  3. `getSignalInfo()` 的 16 个字面量 → `fields.cmds(FieldGroup.SIGNAL)`（16 项逐字同序核对过）。
+  4. `DeviceProfile` 新增 `fun fullStatusCmds(): List<List<String>> = emptyList()`，
+     `ZteGoformProfile` 用私有 `FULL_STATUS_CMD_BATCHES` 实现。
+     **签名用外层列表表达批次边界**，理由：批次边界是**设备事实** —— 一次发 96 项会被截断，
+     本仓有 `station_list` 因合并查询被设备吞掉的先例；用扁平 `List<String>` 调用点就得自己切片
+     = 把刚搬走的设备知识搬回客户端。
+     **不做成 `FieldGroup`** 的理由：`coverageReport()` 遍历 `FieldGroup.entries`，
+     加枚举值会让 `field_coverage` 多一个块，直接冲掉 §16 基线与 §14.3 的判据 1/2 ——
+     而 0.4b 的验收恰恰是拿那份基线比对。
+  5. `getFullStatus()` 三批实测 **30 / 29 / 37 = 96**，搬运做了**机器验证**（序列逐字相同）。
+     **顺手更正了两处过期注释**：源码原写 `30/28/30+`、KDoc 写「75+ 字段」，两个都不准。
+  6. **其余 7 处硬编码查询刻意不动**，各加一行注释「刻意的轻量/分批查询，不走 profile 命令表；
+     字段名核对依据是 §16 的真机基线（2026-09-22）」：`getNetworkInformation`（2 项，无对应组）、
+     `getDeviceInfo`（5 项，IDENTITY 有 20 项）、`getDeviceVersion`（3 项，注释明写「刻意的轻量查询」）、
+     `getTrafficStats`（6 项，含 realtime_*）、`getNeighborCellInfo`（1 项）、
+     `GoformWifiClient.getWifiSettings`（12 项）与 `getWifiModuleInfo`（2 项）——
+     后两者**合起来**才等于 `cmdsFor(WIFI_SETTINGS)` 的 14 项，但它们是**两次独立请求**，
+     合成一次会改变请求形状。
+  7. **`coverageReport()` 路径继续用 `normalizeProfile`**（诊断语义：报告「**当前生效的那份** profile
+     登记了什么」，产出要与 §16 的 `registered` / `hit_source` 逐字比对）；
+     `queryGroup()` 的 `cmds` 与 `solo` 都来自**同一个入参**，**内部同源** ——
+     **0.4a 担心的「命令表来自 A、分批规则来自 B」在这个结构下不成立**（原判断已按语义推翻，
+     理由写进 `queryGroup` 的 KDoc 与 §4「怎么做」的注记）。
+  8. **守门测试 `GoformCommandTableGuardTest` 转型**：从「客户端 fallback vs `cmdsFor`」的一致性比对
+     改成**命令表内容冻结** —— 比对对象随 fallback 删除而消失，只换成 `cmdsFor()` 会变成恒真式空转。
+     现有 **9 条**：① 冻结表覆盖全部 `FieldGroup`；② `cmdsFor` 10 组逐字含顺序；
+     ③ `soloCmds` 只有 `WIFI_CLIENTS` 的 `station_list`；④ `fullStatusCmds` 三批逐字（30/29/37/合计 96）；
+     ⑤ **任何组都不许出现小写 `lte_snr`**（防两侧同时抄错成同一个错名）；
+     ⑥ `cmds` 取 `commandProfile` 而非 `normalizeProfile`（marker profile 正面证明）；
+     ⑦ 关掉归一化后 `cmds` 仍非空且等于 `commandProfile` 的登记表；
+     ⑧ 关掉归一化时 `coverageReport` 不发查询；
+     ⑨ `coverageReport` 走 `normalizeProfile` 的命令表（断言发出的 cmd 里没有 marker，
+     且 `groups` 块数 == `FieldGroup.entries.size`）。
+  9. 第1层 ✓ / 第2层 ✓ —— 四条 gradle 全绿（`:core:device-schema:test` / `:core:goform:test` /
+     `:core:api:compileDebugKotlin` / `:core:compileDebugKotlin`），**守门测试 9 条真实执行**
+     （不是 up-to-date 跳过）。**第3层 ✗ / 第4层 ✗（无真机）** → 0.4b 标 `[~]`。
+  - **本轮在 brief 里给错的一个数字（写下来，避免下次再错）**：brief 写「`client.query(listOf(`
+    应从 11 降到 9」，**实际降到 7**。错因是**把 WiFi 那 2 处算了两遍** ——
+    11 = SignalClient 9 + WifiClient 2，本轮拿掉 `getSignalInfo` 1 处 + `getFullStatus` 3 处 = 4 → **7**。
+    另一种能凑出 9 的算法是「**绕过 profile 的读入口总数**」= 7 处 `client.query(listOf(`
+    + 2 处 `client.querySingle(`（`station_list` / `queryDeviceAccessControlList`，本轮未动）= **9**，
+    这个数字本身是对的，只是分母不同。§4 的验收判据已按这两个口径分别写清。
+- 2026-09-22 **文档同步（批 13 文档轮，不改代码）**：按 `680fbae` 的实际结果核对并更新
+  §2.2 / §4 / §9 / §14.4 / §15 / §16，并新增下面的「阶段 0 收尾盘点」。
+  核对方式是逐条回代码里查（`cmds()` 的实现、`FALLBACK` 全仓 grep、守门测试 `@Test` 计数 = 9、
+  三批数量逐项数过 = 30/29/37、7 处注释逐处打开确认、`ComponentFactory` 用 `git show --stat` 确认未动），
+  **不照抄 brief 里的数字** —— 也正因此抓到了上面那个 11→9 的算错。
+  第1、2 层的 ✓ 沿用 `680fbae` 的自报结果，本文档轮**没有重跑 Gradle**（用户正在并行改
+  `scripts/**` / `app/**` / `web/src/**`，抢构建锁只会拿到一份混合状态的结果，见 §13.3 最后一条）。
+
+
+### 阶段 0 收尾盘点（2026-09-22，批 13 之后）
+
+**结论先写**：阶段 0 的**代码工作已经全部落地**，但**阶段 0 还不能算完成** ——
+四项真机验证一项都没做（§14.3 第 3 层与 §14.4 第 4 层），按 §14.6 的纪律
+「四层里有任何一层没过就不能把阶段标 `[x]`」，整个阶段 0 只能标 `[~]`。
+
+#### 0.1 ~ 0.8 的最终状态与对应 commit
+
+| 子项 | 状态 | commit | 备注 |
+| --- | --- | --- | --- |
+| 0.1 `SettingKey` 补齐写命令 | `[x]` | 批 1 / 批 1b（`36fa526` 之前的登记轮） | 最终 **28 项**（`USB_MODE` 已删，SSID/口令合并为 `WIFI_AP_CONFIG`） |
+| 0.2 新增 key 登记 `WriteSpec` | `[x]` | 同上 | `writeSpecs` 与 `SettingKey` 逐项对齐 28 : 28，无孤立 key |
+| 0.3 写调用点改走 writer | `[x]` | `36fa526`（11 处）+ `118ed84`（WiFi 3 处） | `core/goform/src/main` 里 `"goformId" to` 只剩 `LOGOUT` 1 处（归阶段 1）；另有 2 处字符串形态的登录命令该 pattern 抓不到 |
+| 0.4a mapper 双 profile + 守门测试 | `[x]` | `9fa0473` | 纯结构准备、**零行为变化**；守门测试当轮 8 条 |
+| 0.4b 命令表真正切过去 + 删 fallback | **`[~]`** | `680fbae` | 第1、2 层 ✓；**第 3 层未验（无真机）** → 解锁条件见 §4 的 0.4b |
+| 0.5 设备值域搬进 profile | `[~]` | `090fcad` + `118ed84` + `858a9c9` | WiFi 固定枚举与 base64 方向已搬；**频段全集（P0-1）与二维码文件名模板（P1-5）已裁决推阶段 2** |
+| 0.6 `WriteSpec.retry` | `[x]` | 批 1 | 原 18 项显式标 `RETRY_ON_SESSION_LOSS`；4 项破坏性动作为 `NEVER` |
+| 0.7 短信走 `smsSpec()` | `[x]` | `2d92e05`（立契约）+ 客户端接线 | 六处走 spec，goform 侧旧实现已删；短信**不进** `SettingKey`（§11.2） |
+| 0.8 补测试 | `[~]` | 跨多轮 | 单测已全面（见 §4 的 0.8 清单，守门测试现 **9** 条）；差**装配层**（等阶段 1 接口化）与**真机**那一半 |
+
+顺带产出的、不在原任务清单里但属于阶段 0 的修复：
+`44dec16`（WiFi 口令管线两个 bug）、`858a9c9`（设备文本解码字符集）、
+`d435fa4`（`cmdsFor(WIFI_SETTINGS)` 的响应键误登记）、`d15c368`（`lte_snr` → `Lte_snr`）、
+`913ff27` + `190691a`（web / app 的字段覆盖率入口 —— §14.3 判据的取数工具）。
+
+#### 阶段 0 尚未完成的真机验证清单（**交给用户的待办**）
+
+四项都需要真机，我做不了。每项后面写清「不验的后果」，因为这四项**都不是形式主义** ——
+其中两项对应的是已经发生的行为变更。
+
+1. **`44dec16` 的 WiFi 口令修复 6 步回归**（第 4 层）
+   - ① 改 SSID **不带密码** → 改完用**原密码**能连上；
+     ② 改配置**不传 `passphrase`** → 口令不变（原来这条会把口令清空）；
+     ③ 单独改密码；④ 同时改 SSID + 密码；⑤ 扫码直连（二维码是设备按当前 SSID/口令实时生成的）；
+     ⑥ 中文/非 ASCII 口令（可选，验 `858a9c9` 的 UTF-8 优先判据）。
+   - **不验的后果**：这一批是**真正的行为变更**（`44dec16` 的 commit 说明就标了「需真机验证」），
+     且改的是「写口令」这条路径 —— 错了的表现是**用户连不上自己的 WiFi**，
+     而单测只能证明参数表拼对了，证明不了设备接受。
+2. **重抓一份 `field_coverage` 与 §16 基线比对**（第 3 层，**0.4b 的解锁条件**）
+   - 入口：真机 web「设置 › 关于 › 诊断信息 › 字段覆盖率」或 `GET /api/diagnose?fields=1`；
+     **先记设备状态**（驻网制式 / `ppp_status` / WiFi 接入数 / 定时重启开关），再看数字。
+   - 四条判据（§14.3）：`registered` 逐组不变（合计 **85**）、`queried` 全 true、
+     `hit_source` 逐字不变、`hit` 只增不减（≥ **67**）。
+     **本轮没有新增 `FieldGroup`**，所以组数与 `registered` 合计按设计不变，
+     §16 **不需要**追加第二份基线。
+   - **不验的后果**：0.4b 删掉了「排障模式下唯一的命令来源」并把 96 项 dump 搬进了 profile。
+     脚本级的逐字比对能证明**搬运没抄错**，但证明不了**设备照旧应答** ——
+     真出问题的表现是某些字段悄悄变 missing（不报错、不崩溃），这正是 §14.3 判据 3/4 的用途。
+3. **`field_normalization_enabled=false` 的端到端回归**（第 4 层）
+   - 把开关设成 false、**重启后台服务**（该值只在构造组件图时读一次），然后：
+     仪表盘 / 网络 / WiFi **三个页面仍有数据**，且 `/api/diagnose` 的
+     `device_profile.normalization_enabled` 为 **false**。
+   - **不验的后果**：这是 0.4b 风险最集中的一处 —— 排障模式下 `normalizeProfile = null`，
+     命令表全靠 `commandProfile` 顶着。切错了的表现是**关掉归一化就整个只读面变空**，
+     而那正是排障时最需要它工作的时刻。单测替身（守门测试第 ⑦⑧ 条）只覆盖取值、不覆盖端到端。
+4. **写操作真机回归清单**（第 4 层，**14 条**，见 §4 验收最后一条）
+   - 重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 / **手动拨号**与**挂断** /
+     切连接模式 / 改 SSID / 改密码 / 改功率 / **开 WiFi** 与**关 WiFi** / 发短信 / 删短信 / 标已读。
+     每条按 §14.4 做三次观察（点之前记状态 → 点并看返回码与文案 → 点之后确认设备状态真的变了）；
+     异常路径另见 §14.4（会话失效重试、值域拒绝、设备离线、短信只发一条数收到几条）。
+   - **不验的后果**：0.3 把 **14 个**写调用点的报文构造全换成了 `writeSpec.encode` ——
+     整表替换命令多一个键 / 少一个键都会**静默改掉设备配置**；破坏性动作
+     （重启 / 关机 / 恢复出厂）更是只有真机能验。
+
+> **阶段 0 在这四项验完之前不能算完成。**
+> 第 1、2 层证明的是「代码自洽」，第 3、4 层证明的是「设备照旧」——
+> 这一阶段的全部目标恰恰是**行为不变**，而「行为」只在真机上存在。
+> 另外按 §14.3 最后一句：**阶段 0 的写操作在没有真机验证的情况下不允许合进主线**
+> —— 现在这些 commit 都只在本地，没有推送（也符合「未经指令不得自动推送」的口径）。
+
 
 
 
@@ -1596,7 +1834,9 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 ### 14.4 第 4 层：真机手工回归
 
-写操作没有自动化替代品。阶段 0 的清单（12 条，见 §4 验收）每条要做三次观察：
+写操作没有自动化替代品。阶段 0 的清单（**14 条**，见 §4 验收最后一条；
+**2026-09-22 批 13 逐项数过 —— 原文写「12 条」与另一处口述的「13 条」都不对**）
+每条要做三次观察：
 
 1. 点之前：记下当前状态（从 app 或 `/api/diagnose` 读）
 2. 点：观察返回码与提示文案（区分 200 / 400 `OUT_OF_RANGE` / 501 `NOT_SUPPORTED` / 503 `UNAVAILABLE`）
@@ -1788,6 +2028,10 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   `实测不一致的组必须恰好等于已登记的例外` 是双向相等，任一组新出现分叉都会立刻红」；
   另新增一条**字符级**断言「`CELL_INFO` 两侧末项都必须是设备真名 `Lte_snr`」（`:144-145`）。
   实测该类现有 **8** 条 `@Test`，commit 说明自报全绿（本轮没有重跑 Gradle，见 §13.3 最后一条）。
+  ⚠ **2026-09-22 批 13 更新**：`knownDivergentGroups` 与那条双向相等断言**已随 `680fbae` 删除** ——
+  fallback 删掉之后比对对象不存在了，守门测试转型成**命令表内容冻结**（现 **9** 条）。
+  上面这段描述保留作历史，别照它去找代码。那条字符级断言**仍在**，且扩展成了
+  「任何组都不许出现小写 `lte_snr`」的全组黑名单。
 - **设备命名规律（记下来，下次别再当笔误）**：小区参数首字母大写
   （`Lte_pci` / `Lte_fcn` / `Lte_bands` / `Lte_cell_id` / `Lte_signal_strength` / `Lte_snr`，
   `Nr_*` 侧对称），信号质量指标全小写（`lte_rsrp` / `lte_rsrq` / `lte_rssi`，`nr_*` 同）。
@@ -2003,19 +2247,44 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 #### 批 10/11 顺带查清、刻意不在 0.4a 修的（P1-20 ~ P2-2）
 
-**P1-20 `GoformWifiClient` 的两处 cmd 字面量没提成常量，守门测试里是手抄拷贝**
+**P1-20 `GoformWifiClient` 的两处 cmd 字面量没提成常量，守门测试里是手抄拷贝
+（2026-09-22 批 13 **修订：0.4b 没做这一条，原因与新形态见下**）**
 
-- 事实：`getWifiSettings()`（`:205-211`，12 项）与 `getWifiModuleInfo()`（`:39`，2 项）的 cmd
-  仍是方法体里的字面量，不像 `GoformSignalClient` 那 6 组已经提进 `internal companion object`。
-- 事实：`GoformCommandTableGuardTest` 里的 `wifiSettingsClientCmds`（`:57-66`）是**手抄的一份拷贝**，
-  测试自己的注释就写明了这件事。
-- 判断：手抄拷贝**现在**被「`cmdsFor(WIFI_SETTINGS)` 与它逐字一致」+「`ZteGoformProfileTest`
-  的 14 项冻结」双向钉住，所以不会静默过期；但它**仍然是第二份事实** ——
-  三处（客户端 / profile / 测试）里改任意一处都要人来判断另外两处。
-- 建议归属：**0.4b 顺手提成 companion 常量**并让测试引用真身。
-  0.4a 没做是因为那一轮的范围只允许改 `GoformSignalClient`（`GoformWifiClient` 只改了 mapper 构造调用）。
+- 事实（原文，仍成立）：`getWifiSettings()`（12 项）与 `getWifiModuleInfo()`（2 个容器命令）的 cmd
+  仍是方法体里的字面量。
+- **2026-09-22 批 13 实测的新状态**：
+  - 0.4b **没有**把这两处提成 companion 常量 —— `GoformSignalClient` 那 6 组是**删掉**了
+    （命令表收进 profile），不是提成常量；WiFi 这两处是**刻意保留**的分批查询，
+    本轮只给它们各加了一行注释（`GoformWifiClient.kt:39-42` / `:209-211`）。
+  - 守门测试里那份**手抄拷贝已经不存在了**：`wifiSettingsClientCmds` 随转型删除，
+    现在是 `frozenCmdTables[WIFI_SETTINGS]` 的 14 项冻结值（前 12 项 = `getWifiSettings()`，
+    后 2 项 = `getWifiModuleInfo()`），并由「冻结表覆盖全部 `FieldGroup`」与
+    「`cmdsFor` 逐组逐字」两条钉住。
+- **所以这一条的形态变了**：不再是「三处事实（客户端 / profile / 测试）」，而是**两处** ——
+  客户端那两个字面量，与 profile 的 `cmdsFor(WIFI_SETTINGS)`。
+  维系「**两次请求的并集 == `cmdsFor(WIFI_SETTINGS)`**」这条不变量的**只有注释**
+  （两个方法上各写了一句），**没有任何测试能断言它** ——
+  测试冻结的是 profile 那一份，客户端改了 12 项里的任何一项都不会红。
+- **为什么 0.4b 不顺手收掉**：收掉就得让客户端走 `fields.cmds(WIFI_SETTINGS)`，
+  那会把**两次独立请求合成一次** —— 改变设备侧请求形状，本仓有 `station_list`
+  因合并查询被设备吞掉的先例，无真机不许赌。
+- **彻底解决的形态（新结论）**：要让这条不变量可断言，得给 `DeviceProfile` 加一个
+  「**分批读**」的表达，形状同 `fullStatusCmds()`（外层列表 = 批次边界），
+  让 `WIFI_SETTINGS` 的 12 + 2 由 profile 表达成两批，客户端逐批发。
+  这是**新开一个 SPI 面**，按「不要自己发明 API」的纪律不在阶段 0 临时加。
+- 归属：**阶段 2**（与插件聚合根一起设计那个分批读 API 面）。
 
-**P1-21 `SIGNAL` / `CONNECTION` / `WIFI_CLIENTS` 三组的客户端 cmd 仍是裸字面量，未进守门比对**
+**P1-21 `SIGNAL` / `CONNECTION` / `WIFI_CLIENTS` 三组的客户端 cmd 仍是裸字面量，未进守门比对
+（2026-09-22 批 13 **已结案**：三组已纳入命令表冻结，`680fbae`）**
+
+- **结案依据**：`GoformCommandTableGuardTest` 转型后的 `frozenCmdTables` **覆盖全部 10 个
+  `FieldGroup`**（含这三组），并由「冻结表必须覆盖全部 `FieldGroup`」那条断言**双向**钉住键集 ——
+  以后新增一个组却忘了登记期望值会直接红。`SIGNAL` 的 16 项现在既在冻结表里、
+  也是 `getSignalInfo()` 实际发出的那一份（客户端已改走 `fields.cmds(SIGNAL)`），
+  「今天的一致是巧合级别的保障」这个问题不存在了。
+- 附带收益：新增的「**任何组都不许出现小写 `lte_snr`**」黑名单断言覆盖 10 组，
+  拦的是「整组逐字冻结拦不住的那一类」—— 期望值与实现**同时**被抄成同一个错名。
+- 下面是原文事实，保留作历史：
 
 - 事实：`getSignalInfo()`（`:59-65`，16 项）、`getConnectionInfo()`（复用 `getSignalInfo` 那一次查询，
   自己没有 cmd 列表）、`getStationList()`（`:252` `client.querySingle("station_list")`）
@@ -2025,7 +2294,17 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   但**没有任何测试断言这件事** —— 今天的一致是巧合级别的保障。
 - 建议归属：0.4b。把这三组一起纳入守门比对，比「先切 `cmds()` 再说」安全得多。
 
-**P1-22 `getFullStatus()` 的三批查询在守门比对之外**
+**P1-22 `getFullStatus()` 的三批查询在守门比对之外
+（2026-09-22 批 13 **已结案**：收进 `DeviceProfile.fullStatusCmds()`，`680fbae`）**
+
+- **结案依据**：三批 96 项已搬进 `ZteGoformProfile.FULL_STATUS_CMD_BATCHES`
+  （由 `fullStatusCmds()` 暴露），守门测试第 ④ 条冻结了**批次数（3）、逐批数量（30/29/37）、
+  合计（96）与逐字内容**；第 ⑥⑦ 条另外钉住「它也来自 `commandProfile`」。
+- **建议里「或新 `FieldGroup`」那半句被否了**（理由见 §4 的 0.4b 与 `DeviceProfile.fullStatusCmds`
+  的 KDoc）：加枚举值会让 `field_coverage` 多一个块、`registered` 组数与合计必变，
+  而 0.4b 的验收恰恰是拿 §16 的基线比对。**正因为没加，所以 §16 不需要追加第二份基线。**
+- 顺手把两处过期注释更正了（源码 `30/28/30+`、KDoc「75+ 字段」都不准）。
+- 下面是原文事实，保留作历史：
 
 - 事实：`:168` / `:180` / `:193` 三批共 **96** 个字段名（30 / 29 / 37），
   既没有 `FieldGroup`、也没有 `cmdsFor()` 对应物，自然不在任何比对里。
@@ -2034,7 +2313,18 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 建议归属：与 0.4b 的 `fullStatusCmds()` / 新 `FieldGroup` 一起做；
   注意加 `FieldGroup` 会改 §16 的 `registered` 基线（85 会变），**必须和重抓基线一起做**。
 
-**P2-1 `cmdsFor()` 里可能还有同类误登记 —— 本次只查了 `WIFI_SETTINGS`**
+**P2-1 `cmdsFor()` 里可能还有同类误登记 —— 本次只查了 `WIFI_SETTINGS`
+（2026-09-22 批 13 **修订：仍未做，把范围说准**）**
+
+> **0.4b 没有完成这一条，不要当它已经清了。** 本轮做的是「**fallback 与 `cmdsFor` 的一致性**」
+> 逐组核对（六组按 token 序列逐字含顺序比对，全部一致）—— 那证明的是
+> **「两份表没有分叉」**，**不是**「表里每个 cmd 在设备上真的是可发的 cmd 名」。
+> 这两件事不同：两份表**同时**把一个响应键当成 cmd，一致性比对照样全绿。
+> 已知的两例都已修（`WiFiModuleSwitch` → `d435fa4`、`lte_snr` → `d15c368`），
+> **其余需要真机 dump 才能定性**，与 P1-24 是同一批工作。
+> 唯一的新增保护是守门测试第 ⑤ 条（小写 `lte_snr` 全组黑名单），那只挡住了已知的那一个名字。
+
+- 下面是原文事实，全部仍然成立：
 
 - 事实：批 10 修的是「把只作为**响应键**存在的名字抄进命令表」这一类错误。
   其它分组**没有逐项核过**是否也混进了同类名字。
@@ -2054,8 +2344,15 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 判断：这一类错误的后果与 `WIFI_SETTINGS` 那次相同 —— **只影响覆盖率诊断**
   （白发一次无效查询 + 报告里那一项永远 missing），线上活路径走客户端硬编码列表，
   所以是 P2 不是 P0。
-- 建议归属：0.4b 删并行路径时**必然要逐组核一遍**（那时两份表要合成一份），顺势清掉。
-  在那之前**不要单独去「顺手核对」**——§13.1 第 2 条。
+  ⚠ **2026-09-22 批 13 起这句话要改口径**：0.4b 之后 `cmdsFor()` **就是线上活路径的命令表**
+  （`getSignalInfo` / `getDeviceIdentity` / `getCellInfo` / `getLanSettings` /
+  `queryDeviceSettings` / `getBandLockStatus` / `getDataUsage` 都走它）。
+  所以同类误登记的后果**不再只限于诊断** —— 误登记的那一项会让**业务查询**白发一次无效 cmd、
+  对应字段悄悄没值。级别仍留 P2 是因为**没有证据表明还存在第二例**，
+  但一旦发现就按 P0 处理，不要再套用「只影响诊断」这句旧结论。
+- 建议归属：**0.4b 未做**（0.4b 只核了两份表的一致性）。真正要做的是**逐个 cmd 拿真机 dump
+  定性**「这是可发的 cmd 名，不是响应键」—— 那需要真机，与 **P1-24** 是同一批工作
+  （做法见 P1-24 的「怎么才能验完」）。在拿到 dump 之前**不要单独去「顺手核对」**——§13.1 第 2 条。
 
 **P2-2 API Reference 里「已不再输出」容易被误读成「这两个名字全仓都不该出现」**
 
@@ -2113,6 +2410,29 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - **用户裁决（2026-09-22，原话口径）**：「**不允许漏修埋坑**」——
   所以这批不是「算了不管」，是**登记为待验**，拿到新状态的 dump 就要接着核。
 - 归属：真机可用时逐条验；与 0.4b 的「两份表合成一份」那一步天然是同一批工作（见 P2-1）。
+
+#### 批 13 新登记（P1-25）
+
+**P1-25 `getFullStatus()` 的 96 项里相当一部分没有登记 canonical，`readSpecs()` 覆盖不到**
+
+- 事实：0.4b 把三批 96 个字段名收进了 `ZteGoformProfile.FULL_STATUS_CMD_BATCHES`
+  （`fullStatusCmds()` 暴露），但这份 dump 的调用点是 `getFullStatus()` / `getFullStatusMasked()`，
+  **不过归一化** —— 它的用途就是「看设备后台到底有什么字段」（`GET /api/device/goform`，§9.2）。
+- 事实：所以这 96 项里**相当一部分没有登记 canonical**（`readSpecs()` 里没有对应 `FieldSpec`），
+  典型如 `battery_*` / `sms_*` / `wifi_chip2_*` / `m_SSID2` / `station_ip_addr` / `loginfo` 等。
+  这是**刻意的**，`fullStatusCmds` 的 KDoc 已写明「不要拿 `readSpecs()` 去对它」。
+  ⚠ **我没有逐项点数「没登记的到底有多少个」** —— 那要把 96 项与 `readSpecs()` 的全部 canonical
+  与别名链交叉比一遍，属于新的核对工作量，本轮未做。**结论只到「相当一部分」，别写具体数字。**
+- 事实：这批字段的值**不过 allowlist**，脱敏靠 `FieldNormalizer.maskDump`
+  （登记过的按 `Sensitivity`、没登记的按字段名兜底），所以**今天不存在泄露口**。
+- 判断：这一条不是缺陷，是一个**将来会挡路的决定点** —— 若将来想让诊断 dump 也走 allowlist
+  （只输出登记过的字段），就**必须先决定这批未登记字段的去向**：
+  ① 逐个补 `FieldSpec`（会改 §16 的 `registered` 基线，得先抓基线）；
+  ② 承认 dump 是「不过 allowlist 的例外出口」，把这条写成显式契约（现状，只是没写成契约）；
+  ③ 给 dump 单独一张「允许原样透出」的白名单（第三份事实，不推荐）。
+- 归属：**阶段 2 或更晚**，与「诊断出口要不要统一走 allowlist」一起定。
+  在那之前**不要顺手给它们补 `FieldSpec`** —— 那会动 `registered`，
+  而 `registered` 逐组不变是 §14.3 判据 1 的基石。
 
 
 
@@ -2377,6 +2697,11 @@ TRAFFIC_LIMIT 也因此拿到 10 / 10 满分。
 4. **0.4b 若新增 `FieldGroup`**（`FULL_STATUS`，或 P1-16 的 `SMS_META`），
    `registered` 合计与组数**必然**变 —— 那一步要**先抓基线、再改**，
    并在 §16 追加一份新基线而不是覆盖这一份（两份对照才能说明差异来自新增组）。
+   ✅ **2026-09-22 批 13 更新：0.4b（`680fbae`）已落地，并且刻意**没有**新增 `FieldGroup`** ——
+   `getFullStatus()` 的 96 项走的是新开的 `DeviceProfile.fullStatusCmds()`（不是枚举值），
+   正是为了不动这份基线。所以：**组数仍是 10、`registered` 合计仍应是 85，
+   本节不需要追加第二份基线**，重抓的那一份直接按上面四条判据与这一份逐字比。
+   `SMS_META`（P1-16）仍未做，那一条的警告继续有效。
 
 
 

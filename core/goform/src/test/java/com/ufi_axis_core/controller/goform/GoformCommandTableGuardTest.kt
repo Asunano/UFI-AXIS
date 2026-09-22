@@ -16,212 +16,291 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 守门测试：**客户端的 fallback 命令表与 `ZteGoformProfile.cmdsFor()` 必须一致**。
+ * 守门测试：**读命令表的内容冻结** + **排障开关不打瘫只读面**。
  *
- * ## 为什么需要这条测试（阶段 0.4a 的核心价值）
+ * ## 为什么从「两份表比对」转型成「内容冻结」（阶段 0.4b）
  *
- * 读命令表现在有**两份**：
+ * 0.4a 时读命令表有**两份**：客户端里的 `*_FALLBACK_CMDS`（关掉归一化时唯一的命令来源）
+ * 与 profile 的 `cmdsFor(group)`。本类当时的职责是逐组比对这两份、把分叉钉出来 ——
+ * 因为分叉的后果是**同一个端点在排障模式与正常模式下向设备发不同的 cmd**。
  *
- * - 客户端里的 fallback（[GoformSignalClient.FALLBACK_CMDS]）——
- *   排障开关 `field_normalization_enabled=false` 时**它是唯一的命令来源**；
- * - profile 的 `cmdsFor(group)` —— 归一化开着时用的那份。
+ * 0.4b 已经把 `GoformFieldMapper.cmds()` 切到非空的 `commandProfile`，并删掉了
+ * 客户端那 6 个 fallback 常量与 `FALLBACK_CMDS` 汇总表 —— **比对对象消失了**。
+ * 如果只是把旧断言里的 fallback 换成 `cmdsFor()`，那就变成 `cmdsFor(g) == cmdsFor(g)` 的恒真式，
+ * 是一条空转的测试。
  *
- * 两份分叉的后果不是编译错误，而是**同一个端点在排障模式与正常模式下向设备发不同的 cmd**，
- * 于是响应差异会被误判成「设备变了」。0.4b 要把 `cmds()` 切到 `commandProfile` 并删掉 fallback，
- * 而「切过去不改变行为」的**前提**就是两份表逐字一致 —— 这条测试就是那个前提的看门人。
+ * 所以改成**内容冻结**：把每一组的 cmd 列表（含**顺序**）逐字写死在本文件里。
+ * 这样收益有两层：
  *
- * ## 断言形状（照 `ZteGoformProfileTest` 的「重复必须是刻意的」白名单手法）
+ * 1. 命令表现在只有一份，没有「谁跟谁分叉」的问题了，但「有人手滑改了一个 cmd 名」
+ *    仍然是静默的设备侧行为变更（发错 cmd 不会编译失败、不会抛异常，只会让某个字段悄悄没值）。
+ *    冻结期望值是这类改动唯一的自动拦截手段。
+ * 2. 期望值必须**显式更新**才能让测试重新变绿 —— 而更新的那一刻，改动者就被迫想一下
+ *    「计划书 §16 的真机基线（2026-09-22，85 registered / 67 hit）要不要重抓」。
+ *    命令表变了，`queried` / `hit` / `hit_source` 就可能跟着变，那是 §14.3 的判据 2/3/4。
  *
- * ```
- * 实测不一致的组 == 已登记的例外集合
- * ```
+ * ## 冻结值的来源
  *
- * 双向相等，所以：① 新增分叉立刻红；② 登记过的例外是**显式登记**而不是被掩盖；
- * ③ 例外被修好之后测试会红，提醒把它从集合里删掉 —— 删完仍绿就是 0.4b 可以安全删 fallback 的信号。
+ * 这些列表就是 0.4b 搬运**之前**客户端实际发出去的那几份（`*_FALLBACK_CMDS` 与
+ * `getSignalInfo()` / `getFullStatus()` 的字面量），已在搬运前逐组逐字核对与 `cmdsFor()` 一致。
+ * 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
  *
- * **2026-09-22：例外集合已清空**（`CELL_INFO` 的 `lte_snr`/`Lte_snr` 分叉按真机 dump 修好），
- * 即「两份表当前逐字一致」。这是 0.4b 的硬前置条件，不是可以顺手改回去的装饰。
+ * **看到像 bug 的东西先读 profile 的注释**，尤其这两处（掰回去就是把功能改坏，见 §16）：
+ * - `CELL_INFO` / `SIGNAL` 里的 `Lte_snr` 是**设备真名**；小写 `lte_snr` 是 core 自有的
+ *   canonical（`DeviceFields.CellInfo.LTE_SNR`），**不许抄进任何 cmd 列表**（P0-3 就是这么来的）。
+ * - `WIFI_SETTINGS` 里**没有** `WiFiModuleSwitch`：那是设备的**响应键**，不是可发的 cmd。
  */
 class GoformCommandTableGuardTest {
 
     /**
-     * 客户端侧 `WIFI_SETTINGS` 的命令表。
+     * 全部 10 个 [FieldGroup] 的 cmd 列表冻结值（顺序即发送顺序）。
      *
-     * 这一组**不走** `fields.cmds(group, fallback)`：`GoformWifiClient` 的
-     * `getWifiSettings()`（12 个扁平字段）与 `getWifiModuleInfo()`（2 个容器命令）各自持有字面量，
-     * 由 `getWifiSettingsMerged()` 合并后一起过 `WIFI_SETTINGS` 的归一化 —— 所以「客户端这一组
-     * 实际会发的 cmd」就是这两份的并集，顺序与合并顺序一致（先扁平、后 module-info）。
-     *
-     * **这里是手抄的一份拷贝**：0.4a 的范围只允许把 `GoformSignalClient` 的 6 处 fallback 提成常量
-     * （`GoformWifiClient` 本轮仅改 mapper 的构造调用），所以没法像那 6 组一样直接引用常量。
-     * 把 `GoformWifiClient` 的两个字面量也提成 companion 常量、让本测试引用真身，是待办池里的一条
-     * （手抄拷贝会过期；现在它至少被本测试与 `cmdsFor()` 双向钉住了）。
+     * 新增 `FieldGroup` 时这张表必须同步（下面有一条断言双向钉住键集），
+     * 且**新增枚举值会让 `/api/diagnose?fields=1` 的 `field_coverage` 多一个块** ——
+     * 那一步要先抓基线再改，见 `DeviceProfile.fullStatusCmds` 的 KDoc 与计划书 §16 末尾。
      */
-    private val wifiSettingsClientCmds = listOf(
-        // GoformWifiClient.getWifiSettings()
-        "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
-        "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
-        "wifi_chip1_ssid1_passphrase", "wifi_chip",
-        "wifi_chip1_ssid1_auth_mode", "wifi_chip1_ssid1_encryp_type",
-        "wifi_chip1_ssid1_max_sta_num", "wifi_chip1_ssid1_broadcast_ssid",
-        // GoformWifiClient.getWifiModuleInfo()
-        "queryWiFiModuleSwitch", "queryAccessPointInfo",
+    private val frozenCmdTables: Map<FieldGroup, List<String>> = mapOf(
+        FieldGroup.DEVICE_SETTINGS to listOf(
+            "indicator_light_switch", "performance_mode",
+            "roam_setting_option", "dial_roam_setting_option",
+            "net_select", "lte_band_lock", "nr_band_lock",
+            "usb_port_switch", "samba_switch",
+            "restart_schedule_switch", "restart_time",
+            "sleep_sysIdleTimeToSleep",
+            "usb_network_protocal", "BearerPreference", "connection_mode",
+            "UpgMode",
+        ),
+        FieldGroup.LAN_SETTINGS to listOf(
+            "lan_ipaddr", "lan_netmask", "mac_address", "dhcpEnabled",
+            "dhcpStart", "dhcpEnd", "dhcpLease_hour", "mtu", "tcp_mss",
+        ),
+        FieldGroup.BAND_STATUS to listOf("lte_band_lock", "nr_band_lock"),
+        FieldGroup.TRAFFIC_LIMIT to listOf(
+            "flux_data_volume_limit_switch", "data_volume_limit_switch",
+            "data_volume_limit_unit", "data_volume_limit_size",
+            "data_volume_alert_percent",
+            "monthly_tx_bytes", "monthly_rx_bytes", "monthly_time",
+            "wan_auto_clear_flow_data_switch", "traffic_clear_date",
+        ),
+        FieldGroup.IDENTITY to listOf(
+            "msisdn", "imei", "imsi", "iccid", "sim_imsi",
+            "hardware_version", "web_version", "wa_version", "cr_version", "wa_inner_version",
+            "lan_ipaddr", "mac_address", "wan_ipaddr", "ipv6_wan_ipaddr", "LocalDomain",
+            "ppp_status", "network_type", "rssi", "pdp_type", "opms_wan_mode",
+        ),
+        FieldGroup.CONNECTION to listOf("network_type", "network_provider", "ppp_status"),
+        // 前 12 项 = GoformWifiClient.getWifiSettings()，后 2 项 = getWifiModuleInfo() 的容器命令。
+        // 线上仍是**两次独立请求**（合成一次会改请求形状，见那两个方法上的注释）；
+        // 这里的并集是覆盖率诊断实际发出的那一份。
+        FieldGroup.WIFI_SETTINGS to listOf(
+            "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
+            "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
+            "wifi_chip1_ssid1_passphrase", "wifi_chip",
+            "wifi_chip1_ssid1_auth_mode", "wifi_chip1_ssid1_encryp_type",
+            "wifi_chip1_ssid1_max_sta_num", "wifi_chip1_ssid1_broadcast_ssid",
+            "queryWiFiModuleSwitch", "queryAccessPointInfo",
+        ),
+        FieldGroup.WIFI_CLIENTS to listOf("station_list"),
+        FieldGroup.CELL_INFO to listOf(
+            "neighbor_cell_info", "locked_cell_info", "network_information",
+            "network_type",
+            "Lte_pci", "Lte_fcn", "Lte_bands",
+            "lte_rsrp", "lte_rsrq", "Lte_snr",
+        ),
+        FieldGroup.SIGNAL to listOf(
+            "network_type", "network_provider", "rssi", "signalbar", "ppp_status",
+            "network_information",
+            "lte_rsrp", "Lte_snr", "lte_rsrq", "lte_rssi",
+            "cell_id", "Lte_pci", "neighbor_cell_info", "Lte_ca_status",
+            "realtime_tx_thrpt", "realtime_rx_thrpt",
+        ),
     )
 
-    /** 参与比对的全部分组：6 处 `fields.cmds` 的 fallback + WiFi 那一组的并集。 */
-    private val clientCmdTables: Map<FieldGroup, List<String>> =
-        GoformSignalClient.FALLBACK_CMDS + mapOf(FieldGroup.WIFI_SETTINGS to wifiSettingsClientCmds)
+    /**
+     * `getFullStatus()` 的三批冻结值（0.4b 从 `GoformSignalClient` 搬进
+     * `ZteGoformProfile.fullStatusCmds()`，逐字照搬）。
+     *
+     * 外层是**批次**：线上是三次独立请求，一次发 96 项会被设备截断/返回空。
+     */
+    private val frozenFullStatusBatches: List<List<String>> = listOf(
+        listOf(
+            "network_signalbar", "network_rssi", "network_type", "network_provider",
+            "ppp_status", "lan_ipaddr", "mac_address", "imei", "imsi", "iccid",
+            "wifi_onoff_state", "wifi_access_sta_num", "cr_version",
+            "msisdn", "sim_msisdn", "sim_imsi", "ipv6_wan_ipaddr",
+            "hardware_version", "web_version", "wa_version", "wa_inner_version",
+            "LocalDomain", "wan_ipaddr", "static_wan_ipaddr",
+            "pdp_type", "pdp_type_ui", "ipv6_pdp_type", "ipv6_pdp_type_ui",
+            "opms_wan_mode", "opms_wan_auto_mode",
+        ),
+        listOf(
+            "realtime_tx_bytes", "realtime_rx_bytes", "monthly_tx_bytes", "monthly_rx_bytes",
+            "realtime_time", "monthly_time", "realtime_rx_thrpt", "realtime_tx_thrpt",
+            "battery_value", "battery_vol_percent", "battery_charging",
+            "sms_received_flag", "sms_unread_num", "sms_sim_unread_num",
+            "data_volume_limit_switch", "data_volume_alert_percent", "data_volume_limit_size",
+            "loginfo", "pin_status", "simcard_roam", "usb_port_switch",
+            "wifi_chip1_ssid1_ssid", "wifi_5g_enable", "roam_setting_option",
+            "Lte_ca_status", "new_version_state", "current_upgrade_state",
+            "sim_slot", "dual_sim_support",
+        ),
+        listOf(
+            "Z5g_rsrp", "Z5g_snr", "Z5g_SINR", "rssi", "rscp",
+            "wan_lte_ca", "lte_ca_pcell_band", "lte_ca_pcell_bandwidth",
+            "lte_ca_scell_band", "lte_ca_scell_bandwidth",
+            "lte_ca_pcell_arfcn", "lte_ca_scell_arfcn", "lte_multi_ca_scell_info",
+            "wan_active_band",
+            "apn_interface_version",
+            "wifi_chip1_ssid1_max_access_num", "wifi_chip1_ssid1_auth_mode",
+            "wifi_chip1_ssid1_password_encode", "wifi_chip1_ssid1_switch_onoff",
+            "wifi_chip1_ssid1_wifi_coverage",
+            "wifi_chip2_ssid1_ssid", "wifi_chip2_ssid1_auth_mode",
+            "wifi_chip2_ssid1_password_encode", "wifi_chip2_ssid1_max_access_num",
+            "wifi_chip2_ssid1_switch_onoff",
+            "wifi_chip1_ssid2_ssid", "wifi_chip2_ssid2_ssid",
+            "wifi_chip1_ssid2_max_access_num", "wifi_chip2_ssid2_max_access_num",
+            "wifi_chip1_ssid2_switch_onoff", "wifi_chip2_ssid2_switch_onoff",
+            "m_ssid_enable", "m_SSID2", "m_HideSSID",
+            "wifi_lbd_enable", "guest_switch",
+            "station_ip_addr",
+        ),
+    )
+
+    // ─────────────────── 1. 命令表内容冻结 ───────────────────
 
     /**
-     * **已知不一致的组 —— 现在是空的。**
-     *
-     * 2026-09-22：`CELL_INFO`（待办池 P0-3）已按真机 dump 修好 —— 客户端 fallback 末项从小写
-     * `lte_snr` 改成大写 `Lte_snr`，与 `ZteGoformProfile.cmdsFor(CELL_INFO)` 逐字一致。
-     * 依据：当日真机 4G 驻网小区信息返回 `Lte_snr`，设备上不存在 `lte_snr` 这个键
-     * （小写那个是 core 自有 canonical `DeviceFields.CellInfo.LTE_SNR`）。
-     *
-     * `WIFI_SETTINGS` **曾经也在这个集合里**（`cmdsFor()` 把响应键 `WiFiModuleSwitch` 当成 cmd、
-     * 少 5 个真 cmd），2026-09-22 同一轮由另一个代理在 `core/device-schema` 侧修好。
-     *
-     * 空集合**不等于这条断言空转**：`实测不一致的组必须恰好等于已登记的例外` 是双向相等，
-     * 任何一组新出现分叉都会让实测集合非空从而立刻红。要再往里加东西，必须同时写清移除条件。
+     * 冻结表必须覆盖**全部** `FieldGroup`：新增一个组却忘了登记期望值，
+     * 那一组的命令表就没有任何冻结保护。
      */
-    private val knownDivergentGroups = emptySet<FieldGroup>()
-
-    // ───────────────────────── 1. 两份表的一致性 ─────────────────────────
+    @Test
+    fun `冻结表必须覆盖全部 FieldGroup`() {
+        assertEquals(
+            "新增 FieldGroup 必须同步本测试的冻结表；同时注意它会改变 field_coverage 的组数（§16）",
+            FieldGroup.entries.toSet(),
+            frozenCmdTables.keys,
+        )
+    }
 
     /**
-     * 比对清单本身要被钉住：新加一处 `fields.cmds(group, fallback)` 却忘了登记进
-     * `FALLBACK_CMDS`，那一组的分叉就不会被任何测试发现。
+     * 逐组逐字（含顺序）冻结 `cmdsFor()`。
+     *
+     * 红了怎么办：**先判断改动是不是刻意的**。是刻意的 → 更新本文件的期望值，
+     * 并按计划书 §14.3 重抓一份 `field_coverage` 与 §16 基线比对（判据 2/3/4）；
+     * 不是刻意的 → 那就是手滑改了要发给设备的 cmd 名，回滚。
      */
     @Test
-    fun `参与比对的分组清单必须是登记过的那 7 组`() {
-        assertEquals(
-            "新增/删除 fields.cmds 调用点时必须同步 GoformSignalClient.FALLBACK_CMDS",
-            setOf(
-                FieldGroup.IDENTITY,
-                FieldGroup.CELL_INFO,
-                FieldGroup.LAN_SETTINGS,
-                FieldGroup.DEVICE_SETTINGS,
-                FieldGroup.BAND_STATUS,
-                FieldGroup.TRAFFIC_LIMIT,
-            ),
-            GoformSignalClient.FALLBACK_CMDS.keys,
-        )
-        assertEquals(7, clientCmdTables.size)
-    }
-
-    @Test
-    fun `实测不一致的组必须恰好等于已登记的例外`() {
-        val divergent = clientCmdTables
-            .filter { (group, clientCmds) -> clientCmds != ZteGoformProfile.cmdsFor(group) }
-            .keys
-        assertEquals(
-            "客户端 fallback 与 cmdsFor() 出现了未登记的分叉（或已登记的那处已修好）—— " +
-                "分叉的后果是排障模式与正常模式向设备发不同的 cmd，见本类注释",
-            knownDivergentGroups,
-            divergent,
-        )
-    }
-
-    @Test
-    fun `逐字一致的那几组必须继续逐字一致`() {
-        // 不用「不在例外集合里就跳过」的写法：逐组给出可读的差异，红的时候一眼看出是哪一组
-        for ((group, clientCmds) in clientCmdTables) {
-            if (group in knownDivergentGroups) continue
-            assertEquals("$group 的客户端 fallback 与 cmdsFor() 不一致", ZteGoformProfile.cmdsFor(group), clientCmds)
+    fun `cmdsFor 逐组逐字冻结`() {
+        for ((group, expected) in frozenCmdTables) {
+            assertEquals("$group 的命令表变了（含顺序）—— 这是设备侧请求形状的变更", expected, ZteGoformProfile.cmdsFor(group))
         }
     }
 
     /**
-     * 把 `CELL_INFO` 钉到**字符级**：两侧末项都必须是设备真名 `Lte_snr`。
-     *
-     * 这条测试原来钉的是「只许差这一个大小写」；2026-09-22 分叉修好后改成钉「两边都是 `Lte_snr`」，
-     * 保留字符级粒度的理由不变 —— 只靠上面那条「分组级一致」的断言，
-     * 在这一组里把两侧**同时**抄错成同一个错名不会红。
-     * `lte_snr` 是 core 自有 canonical（`DeviceFields.CellInfo.LTE_SNR`），设备上没有这个键。
+     * `soloCmds()` 也要冻结：它表达「哪些 cmd 不能与同组其它 cmd 合并发」，
+     * 改错的后果是设备对那一批返回空（`station_list` 就是这个先例）。
      */
     @Test
-    fun `CELL_INFO 两侧末项都必须是设备真名 Lte_snr`() {
-        val client = GoformSignalClient.CELL_INFO_FALLBACK_CMDS
-        val profile = ZteGoformProfile.cmdsFor(FieldGroup.CELL_INFO)
-        assertEquals("Lte_snr", client.last())
-        assertEquals("Lte_snr", profile.last())
-        assertFalse("设备上不存在小写 lte_snr 这个 cmd", "lte_snr" in client)
-        assertFalse("设备上不存在小写 lte_snr 这个 cmd", "lte_snr" in profile)
-        assertEquals("CELL_INFO 两份表必须逐字一致", profile, client)
+    fun `soloCmds 只有 WIFI_CLIENTS 的 station_list`() {
+        for (group in FieldGroup.entries) {
+            val expected = if (group == FieldGroup.WIFI_CLIENTS) listOf("station_list") else emptyList()
+            assertEquals("$group 的 soloCmds 变了", expected, ZteGoformProfile.soloCmds(group))
+        }
     }
 
-    // ───────────────── 2. 关掉归一化不会把只读面打瘫 ─────────────────
-
     /**
-     * 排障开关关掉归一化（`normalizeProfile = null`）时：
-     * 诊断口径如实反映「已关」，但 `cmds()` 仍然返回非空的 fallback。
+     * `fullStatusCmds()` 的三批冻结：数量 **30 / 29 / 37 = 96**，内容与顺序逐字。
      *
-     * 这就是计划书 §4 那段「不要直接删 fallback」的可执行版本 ——
-     * 删了 fallback 这条测试会直接红（cmds 返回空 = 一条查询都发不出去）。
+     * 这条同时钉住了 0.4b 的搬运是**逐字**的（搬运前的字面量就是这份期望值）。
      */
     @Test
-    fun `关掉归一化时 cmds 仍然返回 fallback`() {
+    fun `fullStatusCmds 三批逐字冻结`() {
+        val actual = ZteGoformProfile.fullStatusCmds()
+        assertEquals("批次数变了 = 设备侧请求次数变了", 3, actual.size)
+        assertEquals(listOf(30, 29, 37), actual.map { it.size })
+        assertEquals(96, actual.sumOf { it.size })
+        assertEquals(frozenFullStatusBatches, actual)
+    }
+
+    /**
+     * 把 `CELL_INFO` / `SIGNAL` 钉到**字符级**：两组末位的 SNR cmd 都必须是设备真名 `Lte_snr`。
+     *
+     * 只靠上面「整组逐字」的断言，在**同时**把期望值与实现抄错成同一个错名时不会红；
+     * 而 `lte_snr` 恰好是个极易抄错的名字 —— 它是 core 自有的 canonical
+     * （`DeviceFields.CellInfo.LTE_SNR`），设备上**没有**这个键（P0-3 的根因，见 §16）。
+     */
+    @Test
+    fun `命令表里不许出现小写 lte_snr`() {
+        val cellInfo = ZteGoformProfile.cmdsFor(FieldGroup.CELL_INFO)
+        val signal = ZteGoformProfile.cmdsFor(FieldGroup.SIGNAL)
+        assertEquals("Lte_snr", cellInfo.last())
+        assertTrue("SIGNAL 也必须发设备真名 Lte_snr", "Lte_snr" in signal)
+        for (group in FieldGroup.entries) {
+            assertFalse(
+                "$group 的 cmd 列表里出现了小写 lte_snr —— 那是 core 的 canonical，设备上没有这个键",
+                "lte_snr" in ZteGoformProfile.cmdsFor(group),
+            )
+        }
+    }
+
+    // ───────────── 2. 命令表真的切到 commandProfile 了 ─────────────
+
+    /**
+     * `cmds()` 取的是 [commandProfile] —— 0.4b 的核心行为变更，这条正面证明它切过去了。
+     *
+     * 手法：给 `commandProfile` 传一个能被认出来的假 profile，`normalizeProfile` 那边传真的。
+     * 结果必须是假 profile 的 cmd —— 如果拿到 `ZteGoformProfile` 那份，说明 `cmds()` 又被
+     * 接回 `normalizeProfile` 了（那会让关掉归一化时只读面全哑）。
+     */
+    @Test
+    fun `cmds 取 commandProfile 而不是 normalizeProfile`() {
+        val marker = MarkerProfile()
+        val mapper = GoformFieldMapper(normalizeProfile = ZteGoformProfile, commandProfile = marker)
+        for (group in FieldGroup.entries) {
+            assertEquals(
+                "$group 的 cmds 没有来自 commandProfile",
+                listOf(MarkerProfile.MARKER_CMD),
+                mapper.cmds(group),
+            )
+        }
+        assertEquals(
+            "fullStatusCmds 也必须来自 commandProfile",
+            listOf(listOf(MarkerProfile.MARKER_FULL_STATUS_CMD)),
+            mapper.fullStatusCmds(),
+        )
+    }
+
+    /**
+     * 排障开关回归（`field_normalization_enabled=false` → `normalizeProfile = null`）：
+     * 诊断口径如实报「已关」，**但 `cmds()` 仍然非空** —— 只读面不许被打瘫。
+     *
+     * 这就是计划书 §4「字段归一化可以关，命令表不能关」的可执行版本。
+     * 0.4a 时这条断言的形状是「仍然返回客户端 fallback」，fallback 删掉之后改成
+     * 「仍然返回 `commandProfile` 的登记表」—— 保护的不变量一字未变。
+     */
+    @Test
+    fun `关掉归一化后 cmds 仍然非空且等于 commandProfile 的登记表`() {
         val mapper = GoformFieldMapper(normalizeProfile = null, commandProfile = ZteGoformProfile)
         assertFalse("normalizeProfile=null 就是「归一化已关」", mapper.enabled)
         assertNull("profileId 必须跟着报 null，否则 /api/diagnose 会永远报 true", mapper.profileId)
-        for ((group, fallback) in GoformSignalClient.FALLBACK_CMDS) {
-            val cmds = mapper.cmds(group, fallback)
+        for (group in FieldGroup.entries) {
+            val cmds = mapper.cmds(group)
             assertTrue("$group 关归一化后拿不到 cmd = 该端点直接哑掉", cmds.isNotEmpty())
-            assertEquals("$group 关归一化后必须原样用客户端 fallback", fallback, cmds)
-        }
-    }
-
-    /**
-     * 归一化开着时 `cmds()` 取 profile 的登记表 —— 本轮**取值行为一字不变**。
-     *
-     * `CELL_INFO` 这一组特意断言拿到的是 `Lte_snr`：这里曾是「现在就把 cmds() 切到
-     * commandProfile 也不会被发现」的那处静默差异（fallback 是小写），2026-09-22 两侧已统一到
-     * 设备真名，断言留着是为了钉住「不管从哪份表取，发出去的都是 `Lte_snr`」。
-     */
-    @Test
-    fun `开着归一化时 cmds 取 profile 的登记表`() {
-        val mapper = GoformFieldMapper(
-            normalizeProfile = ZteGoformProfile,
-            commandProfile = ZteGoformProfile,
-        )
-        for ((group, fallback) in GoformSignalClient.FALLBACK_CMDS) {
-            assertEquals(ZteGoformProfile.cmdsFor(group), mapper.cmds(group, fallback))
+            assertEquals("$group 关归一化后必须走 commandProfile 的命令表", ZteGoformProfile.cmdsFor(group), cmds)
         }
         assertEquals(
-            "Lte_snr",
-            mapper.cmds(FieldGroup.CELL_INFO, GoformSignalClient.CELL_INFO_FALLBACK_CMDS).last(),
-        )
-    }
-
-    /**
-     * `commandProfile` 本轮**不参与** `cmds()` 的取值 —— 0.4a 是纯结构准备，零行为变化。
-     *
-     * 传一个能被识别出来的假 profile 进 `commandProfile`：它的 cmd 一次都不该出现在结果里。
-     */
-    @Test
-    fun `commandProfile 本轮不参与 cmds 的取值`() {
-        val marker = MarkerProfile()
-        val withNormalize = GoformFieldMapper(normalizeProfile = ZteGoformProfile, commandProfile = marker)
-        val withoutNormalize = GoformFieldMapper(normalizeProfile = null, commandProfile = marker)
-        val fallback = GoformSignalClient.BAND_STATUS_FALLBACK_CMDS
-        assertEquals(
-            ZteGoformProfile.cmdsFor(FieldGroup.BAND_STATUS),
-            withNormalize.cmds(FieldGroup.BAND_STATUS, fallback),
-        )
-        assertEquals(fallback, withoutNormalize.cmds(FieldGroup.BAND_STATUS, fallback))
-        assertFalse(
-            "commandProfile 的 cmd 出现在结果里 = cmds() 已经切过去了，那是 0.4b 的事",
-            MarkerProfile.MARKER_CMD in withoutNormalize.cmds(FieldGroup.BAND_STATUS, fallback),
+            "关归一化后诊断 dump 也不许发不出去",
+            ZteGoformProfile.fullStatusCmds(),
+            mapper.fullStatusCmds(),
         )
     }
 
     /**
      * 关掉归一化时 `coverageReport()` 的短路必须保留：**一条查询都不许发**。
      *
-     * 这个方法会逐组向设备发查询，改成拿 `commandProfile` 兜底的话，排障模式下
-     * `/api/diagnose?fields=1` 会开始真打设备 —— 那是行为变更（今天它只回一句 hint）。
+     * 覆盖率报告的语义是「**当前生效的那份 profile** 登记了什么、命中了什么」，所以它
+     * （以及它内部的 `soloCmds` 分批）走的是 `normalizeProfile`，与业务查询路径分开 ——
+     * 见 `GoformFieldMapper.queryGroup` 的 KDoc。改成拿 `commandProfile` 兜底的话，
+     * 排障模式下 `/api/diagnose?fields=1` 会开始真打设备，那是行为变更。
      */
     @Test
     fun `关掉归一化时 coverageReport 不向设备发查询`() {
@@ -237,7 +316,32 @@ class GoformCommandTableGuardTest {
     }
 
     /**
-     * 只为「区分两个 profile」而存在的假 profile：`cmdsFor` 一律返回一个不可能来自真设备的 cmd。
+     * 开着归一化时 `coverageReport()` 用的是 `normalizeProfile` 的命令表（诊断语义），
+     * 与 `cmds()` 用 `commandProfile`（业务语义）分属两条路径。
+     *
+     * 手法：`commandProfile` 塞假 profile，真 profile 放 `normalizeProfile`；
+     * 发出去的 cmd 里**不该**出现 marker，且组数必须仍是 `FieldGroup` 的数量
+     * （组数 = `/api/diagnose?fields=1` 里 `field_coverage` 的块数，是 §16 基线的硬判据）。
+     */
+    @Test
+    fun `coverageReport 走 normalizeProfile 的命令表`() {
+        val mapper = GoformFieldMapper(normalizeProfile = ZteGoformProfile, commandProfile = MarkerProfile())
+        val sent = mutableListOf<String>()
+        val report: JsonObject = runBlocking {
+            mapper.coverageReport { cmds -> sent += cmds; null }
+        }
+        assertFalse("覆盖率诊断把 commandProfile 的 cmd 发出去了", MarkerProfile.MARKER_CMD in sent)
+        assertTrue("覆盖率诊断该发真 profile 的 cmd", "station_list" in sent)
+        val groups = report["groups"] as? JsonObject
+        assertEquals(
+            "field_coverage 的组数变了 —— 直接冲掉 §16 的真机基线",
+            FieldGroup.entries.size,
+            groups?.size,
+        )
+    }
+
+    /**
+     * 只为「区分两个 profile」而存在的假 profile：命令表一律返回不可能来自真设备的 cmd。
      * 其余成员都是 [DeviceProfile] 的必填项，按最小实现填。
      */
     private class MarkerProfile : DeviceProfile {
@@ -245,10 +349,12 @@ class GoformCommandTableGuardTest {
         override val displayName: String = "仅用于测试的标记 profile"
         override fun readSpecs(): List<FieldSpec> = emptyList()
         override fun cmdsFor(group: FieldGroup): List<String> = listOf(MARKER_CMD)
+        override fun fullStatusCmds(): List<List<String>> = listOf(listOf(MARKER_FULL_STATUS_CMD))
         override fun writeSpec(key: SettingKey): WriteSpec? = null
 
         companion object {
             const val MARKER_CMD = "__marker_cmd__"
+            const val MARKER_FULL_STATUS_CMD = "__marker_full_status_cmd__"
         }
     }
 }

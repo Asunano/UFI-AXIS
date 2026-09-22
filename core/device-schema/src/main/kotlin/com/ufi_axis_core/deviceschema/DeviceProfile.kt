@@ -37,6 +37,32 @@ interface DeviceProfile {
     fun soloCmds(group: FieldGroup): List<String> = emptyList()
 
     /**
+     * 「一次拉全量设备状态」的字段名批次（诊断 dump 用，见 `GoformSignalClient.getFullStatus`）。
+     *
+     * ## 为什么**不**做成一个新的 [FieldGroup]（阶段 0.4b 的裁决）
+     *
+     * [FieldGroup] 是穷举枚举，`GoformFieldMapper.coverageReport()` 遍历 `FieldGroup.entries`
+     * 逐组向设备查一次。加一个枚举值会让 `/api/diagnose?fields=1` 的 `field_coverage`
+     * 多出一个块（`registered` 合计与组数**必然**变），直接冲掉计划书 §16 的 2026-09-22 真机基线
+     * 与 §14.3 的判据 1（`registered` 逐组不变）/ 判据 2（`queried` 全 true —— 全量批次没有
+     * 登记 canonical，那个新组只会是 `registered=0`）。全量 dump 与「按需查询的分组」语义本来
+     * 也不同：它不参与归一化，只是把设备后台有什么原样捞一份出来看。
+     *
+     * ## 为什么返回值是 `List<List<String>>`（外层 = 批次）而不是 `List<String>`
+     *
+     * 「分几批发」是**设备事实**而不是实现细节：ZTE F50 上这份 dump 是**三次独立请求**
+     * （30 / 29 / 37 项），一次发 96 项设备会截断/返回空。用扁平 `List<String>` 表达不了批次边界，
+     * 调用点就得自己重新切片 —— 那等于把刚搬走的设备知识又搬回客户端。
+     * 本仓已有过合并查询被设备吞掉的先例（`station_list`，见 [soloCmds]），所以批次边界必须可表达。
+     *
+     * 与 [soloCmds] 的分工：[soloCmds] 描述「某个 cmd 不能和同组别人一起发」，
+     * 这里描述「一整份 dump 天生分成哪几批」，两者都不是可以随手合并的调参项。
+     *
+     * 默认空列表 = 该设备不提供全量 dump（调用点自然一条查询都不发）。
+     */
+    fun fullStatusCmds(): List<List<String>> = emptyList()
+
+    /**
      * 结构解码器：把**嵌套/非扁平**的设备响应摊平成扁平 JsonObject，供后续的字段归一化使用。
      *
      * 为什么需要它：[FieldSpec] 只能表达"顶层扁平键的别名链"。个别设备把一组字段塞进

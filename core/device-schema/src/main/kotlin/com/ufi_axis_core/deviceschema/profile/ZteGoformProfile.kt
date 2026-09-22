@@ -486,6 +486,83 @@ object ZteGoformProfile : DeviceProfile {
     override fun soloCmds(group: FieldGroup): List<String> =
         if (group == FieldGroup.WIFI_CLIENTS) listOf("station_list") else emptyList()
 
+    /**
+     * 全量状态 dump 的三批查询（阶段 0.4b 从 `GoformSignalClient.getFullStatus()` **逐字搬来**）。
+     *
+     * **三批的内容与顺序一个字都不许动**：这是 F50 上实际发出的三次请求，
+     * 改内容 = 改设备侧请求形状，改分批 = 赌设备能一次吃下 96 项（本仓已有合并查询被吞的先例）。
+     * 实测数量 **30 / 29 / 37 = 96**（搬运前源码注释写的 `30 / 28 / 30+` 与 KDoc 的「75+ 字段」
+     * 都不准，2026-09-22 逐项数过）。
+     *
+     * 这份 dump **不过归一化**（调用点是 `getFullStatus()` / `getFullStatusMasked()`，
+     * 给诊断端点看设备后台到底有什么），所以这里出现的字段名有相当一部分**没有**登记 canonical ——
+     * 那是刻意的，不要拿 `readSpecs()` 去对它。
+     */
+    override fun fullStatusCmds(): List<List<String>> = FULL_STATUS_CMD_BATCHES
+
+    /**
+     * [fullStatusCmds] 的真身。外层三个元素 = 三次**独立**的 goform 查询，顺序即发送顺序
+     * （调用点按顺序 `putAll`，所以后一批的同名键会盖前一批 —— 搬运前就是这个语义，不要改顺序）。
+     *
+     * 批内分行方式与原客户端代码保持一致，方便逐字比对；`GoformCommandTableGuardTest`
+     * 把三批的数量（30 / 29 / 37）与内容整体冻结住了。
+     */
+    private val FULL_STATUS_CMD_BATCHES: List<List<String>> = listOf(
+        // Batch 1: 设备身份 + 网络基础 (30 字段)
+        listOf(
+            "network_signalbar", "network_rssi", "network_type", "network_provider",
+            "ppp_status", "lan_ipaddr", "mac_address", "imei", "imsi", "iccid",
+            "wifi_onoff_state", "wifi_access_sta_num", "cr_version",
+            "msisdn", "sim_msisdn", "sim_imsi", "ipv6_wan_ipaddr",
+            "hardware_version", "web_version", "wa_version", "wa_inner_version",
+            "LocalDomain", "wan_ipaddr", "static_wan_ipaddr",
+            "pdp_type", "pdp_type_ui", "ipv6_pdp_type", "ipv6_pdp_type_ui",
+            "opms_wan_mode", "opms_wan_auto_mode"
+        ),
+        // Batch 2: 流量/电池/短信/设置 (29 字段)
+        listOf(
+            "realtime_tx_bytes", "realtime_rx_bytes", "monthly_tx_bytes", "monthly_rx_bytes",
+            "realtime_time", "monthly_time", "realtime_rx_thrpt", "realtime_tx_thrpt",
+            "battery_value", "battery_vol_percent", "battery_charging",
+            "sms_received_flag", "sms_unread_num", "sms_sim_unread_num",
+            "data_volume_limit_switch", "data_volume_alert_percent", "data_volume_limit_size",
+            "loginfo", "pin_status", "simcard_roam", "usb_port_switch",
+            "wifi_chip1_ssid1_ssid", "wifi_5g_enable", "roam_setting_option",
+            "Lte_ca_status", "new_version_state", "current_upgrade_state",
+            "sim_slot", "dual_sim_support"
+        ),
+        // Batch 3: WiFi 芯片 / CA / 信号 / APN 补充 (37 字段)
+        listOf(
+            // 5G/LTE 信号补充
+            "Z5g_rsrp", "Z5g_snr", "Z5g_SINR", "rssi", "rscp",
+            // CA (载波聚合)
+            "wan_lte_ca", "lte_ca_pcell_band", "lte_ca_pcell_bandwidth",
+            "lte_ca_scell_band", "lte_ca_scell_bandwidth",
+            "lte_ca_pcell_arfcn", "lte_ca_scell_arfcn", "lte_multi_ca_scell_info",
+            "wan_active_band",
+            // APN 版本
+            "apn_interface_version",
+            // WiFi Chip1
+            "wifi_chip1_ssid1_max_access_num", "wifi_chip1_ssid1_auth_mode",
+            "wifi_chip1_ssid1_password_encode", "wifi_chip1_ssid1_switch_onoff",
+            "wifi_chip1_ssid1_wifi_coverage",
+            // WiFi Chip2
+            "wifi_chip2_ssid1_ssid", "wifi_chip2_ssid1_auth_mode",
+            "wifi_chip2_ssid1_password_encode", "wifi_chip2_ssid1_max_access_num",
+            "wifi_chip2_ssid1_switch_onoff",
+            // SSID2 (访客)
+            "wifi_chip1_ssid2_ssid", "wifi_chip2_ssid2_ssid",
+            "wifi_chip1_ssid2_max_access_num", "wifi_chip2_ssid2_max_access_num",
+            "wifi_chip1_ssid2_switch_onoff", "wifi_chip2_ssid2_switch_onoff",
+            // SSID 高级
+            "m_ssid_enable", "m_SSID2", "m_HideSSID",
+            // 其他 WiFi
+            "wifi_lbd_enable", "guest_switch",
+            // IP
+            "station_ip_addr"
+        ),
+    )
+
     // ───────────────────────── 结构解码器 ─────────────────────────
 
     override fun structuralDecoder(group: FieldGroup): ((JsonObject) -> JsonObject)? = when (group) {

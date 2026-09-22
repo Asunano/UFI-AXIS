@@ -67,7 +67,7 @@ internal class GoformFieldMapper(
      */
     private val normalizeProfile: DeviceProfile?,
     /**
-     * 非空：命令表的最终归宿（0.4b 起 [cmds] 会切到它）。
+     * 非空：命令表的最终归宿 —— [cmds] / [fullStatusCmds] 都只读它（0.4b 已切过来）。
      * 口径同 `GoformSettingWriter`——「字段归一化可以关，命令表不能关」。
      */
     private val commandProfile: DeviceProfile,
@@ -100,22 +100,27 @@ internal class GoformFieldMapper(
     /**
      * 该分组要查的 cmd 列表。
      *
-     * profile 没登记（返回空）时用 [fallback]，即调用处原有的硬编码列表 ——
-     * 保证迁移过程中任何一步都不会把查询打空。
+     * ## 0.4b：已切到 [commandProfile]（命令表的最终归宿）
      *
-     * ## 本轮（0.4a）**取值行为一字不变**：仍然只看 [normalizeProfile]
+     * 为什么不再走 [normalizeProfile]：
+     * - 归一化可以关（排障开关 → `normalizeProfile = null`），但「查哪些字段」不能跟着关 ——
+     *   否则关掉归一化等于把整个只读面打瘫（一条查询都发不出去）。
+     * - [commandProfile] **非空**，口径与写侧 `GoformSettingWriter`（「字段归一化可以关，写命令表不能关」）
+     *   完全一致。现在排障模式（关归一化）下的只读面照常运行：命令来自 [commandProfile]。
      *
-     * 0.4b 会把这里切到 [commandProfile]（那才是「命令表不能关」的落点），但前提是
-     * **先让 `cmdsFor()` 与各客户端的 fallback 逐字一致** —— 目前 `CELL_INFO` 还差一个
-     * 大小写（客户端 fallback 末项是 `lte_snr`，profile 是 `Lte_snr`；见待办池 P0-3
-     * 与 `GoformCommandTableGuardTest`）。
-     *
-     * 现在就切等于**静默改变排障模式下发出的 cmd**：关掉归一化时今天发的是客户端 fallback
-     * （小写），切过去之后发的是 profile 那份（大写）。设备对 cmd 名是否大小写敏感**未证**，
-     * 所以这一步要等真机定性，不能顺手做。
+     * 0.4a 的 fallback 参数已删除：在那之前 fallback 是 `normalizeProfile = null` 时唯一的命令来源，
+     * 而 0.4a 的 `GoformCommandTableGuardTest` 逐组证明了 fallback 与 `cmdsFor()` 逐字一致，
+     * 所以删掉 fallback 不改变任何实际发出的 cmd。
      */
-    fun cmds(group: FieldGroup, fallback: List<String>): List<String> =
-        normalizeProfile?.cmdsFor(group)?.takeIf { it.isNotEmpty() } ?: fallback
+    fun cmds(group: FieldGroup): List<String> = commandProfile.cmdsFor(group)
+
+    /**
+     * 「一次拉全量状态」的分批命令表（`GoformSignalClient.getFullStatus()` 用）。
+     *
+     * 与 [cmds] 同一个归属：命令表来自非空的 [commandProfile]，所以关掉归一化时诊断 dump
+     * 也照常能发出去。外层是**批次**——批次边界是设备事实，见 `DeviceProfile.fullStatusCmds`。
+     */
+    fun fullStatusCmds(): List<List<String>> = commandProfile.fullStatusCmds()
 
     /**
      * 给原始 dump 打码（计划书 9.2），用于 `GET /api/device/goform` 这类**不过 allowlist**的出口。
@@ -180,10 +185,22 @@ internal class GoformFieldMapper(
     /**
      * 覆盖率诊断里「把一组 cmd 按 solo / 非 solo 分批发出去」的那一步。
      *
-     * `solo` 取自**传进来的那份 profile**（调用方是 [coverageReport]，传的是 [normalizeProfile]）——
-     * 本轮不改。0.4b 把 [cmds] 切到 [commandProfile] 时，`soloCmds` 要跟着一起切：
-     * 「哪些 cmd 不能合并发」与「发哪些 cmd」是同一件设备事实，分开放在两个 profile 上
-     * 会出现「命令表来自 A、分批规则来自 B」的错配。
+     * ## 为什么这里（诊断路径）用 [normalizeProfile]，而 [cmds]（业务路径）用 [commandProfile]
+     *
+     * 0.4a 留的注释说「切 `cmds()` 时必须同步切 `soloCmds`」，0.4b 落地时按语义重新判定，
+     * **结论是分开**，理由是两条路径回答的是两个不同的问题：
+     *
+     * - **业务查询路径**（[cmds]）回答「现在要向设备发哪些 cmd」。命令表不能关，所以取
+     *   非空的 [commandProfile]。
+     * - **覆盖率诊断路径**（[coverageReport] → 本方法）回答「**当前生效的那份 profile**
+     *   登记了什么、命中了什么」。它的产出（`/api/diagnose?fields=1` 的 `field_coverage`）
+     *   是拿来跟 `registered` / `hit_source` 基线逐字比对的，比对对象必须是生效那份；
+     *   `normalizeProfile == null` 时它整段短路（一条查询都不发），就更不该去碰 [commandProfile]。
+     *
+     * 所以**不存在 0.4a 担心的那种错配**：本方法的 `cmds` 与 `solo` 都来自同一个入参 `p`
+     * （= [coverageReport] 传进来的 [normalizeProfile]），「发哪些 cmd」与「哪些 cmd 不能合并发」
+     * 在这条路径内部仍然同源。错配只会发生在「一边取 `p`、一边取 [commandProfile]」的写法上 ——
+     * 那种写法这里没有，也不要加。
      */
     private suspend fun queryGroup(
         p: DeviceProfile,

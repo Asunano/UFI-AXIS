@@ -36,6 +36,10 @@ class GoformWifiClient(
     // ==================== WiFi 查询 ====================
 
     suspend fun getWifiModuleInfo(): JsonObject? {
+        // 刻意的**分批**查询，不走 profile 命令表：这 2 个容器命令 + [getWifiSettings] 的 12 个扁平 cmd
+        // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**。
+        // 合成一次会改变设备侧请求形状 —— 本仓有过 `station_list` 因合并查询被设备吞掉的先例。
+        // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
         return client.query(listOf("queryWiFiModuleSwitch", "queryAccessPointInfo"))
     }
 
@@ -202,6 +206,9 @@ class GoformWifiClient(
     }
 
     suspend fun getWifiSettings(): JsonObject? {
+        // 刻意的**分批**查询，不走 profile 命令表：本方法的 12 项 + [getWifiModuleInfo] 的 2 个容器命令
+        // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**（见 getWifiModuleInfo）。
+        // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
         return client.query(listOf(
             "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
             "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
