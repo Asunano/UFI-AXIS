@@ -81,13 +81,31 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
 
     LaunchedEffect(Unit) { viewModel.tools.loadDiagnostics() }
 
+    // 归一化开关的真值走 GET /api/config（不在上面五个诊断端点里），所以单独回读一次。
+    // 必须每次进页面都读：别端（web / 另一台手机）可能刚改过，本机镜像会是旧的。
+    LaunchedEffect(Unit) { viewModel.tools.loadFieldNormalizationSwitch() }
+
+    // 开关回读 / 下发失败统一走 toast，并立刻清掉 state 里的错误，否则每次重组都会再弹一次
+    // （与 DebugLogScreen 对日志开关的处理同一写法）。
+    LaunchedEffect(state.fieldNormalizationError) {
+        state.fieldNormalizationError?.let {
+            toastMessage = ToastMessage(it, ToastType.ERROR)
+            viewModel.tools.clearFieldNormalizationError()
+        }
+    }
+
     UfiScreenScaffold(
         title = "运行诊断",
         navController = navController,
         showBack = true,
         actions = {
             IconButton(
-                onClick = { viewModel.tools.loadDiagnostics() },
+                onClick = {
+                    viewModel.tools.loadDiagnostics()
+                    // 刷新按钮也带上这一项：否则页面上「配置值」永远停在进页面那一刻的快照，
+                    // 用户在 web 端改完回来点刷新会以为没生效。
+                    viewModel.tools.loadFieldNormalizationSwitch()
+                },
                 enabled = !state.isLoading
             ) { Icon(Icons.Default.Refresh, contentDescription = "刷新") }
         }
@@ -148,6 +166,70 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     )
                                 }
                             }
+                        }
+                    }
+
+                    // ═════ 字段归一化开关（2026-09-22）═════
+                    // 刻意紧贴在「字段覆盖率」**上方**：两张卡是同一个排障动作的两半 ——
+                    // 覆盖率看「归一化后命中了什么」，这个开关用来关掉归一化、回到设备原始字段名做对照。
+                    //
+                    // 三件事必须同时说清，否则它就是个误导用户的开关：
+                    // 1. 配置值（GET /api/config）与**运行时实际值**（/api/diagnose 的 device_profile）
+                    //    是两回事 —— core 只在构造组件图时读一次，改完到重启之间两者不同；
+                    // 2. 生效条件（重启后台服务）必须写在界面上。PUT 响应的 needs_restart
+                    //    **不含**这个键（那份清单只覆盖认证/端口），靠它提示等于不提示；
+                    // 3. 老 core 的 GET 里没有这个键 → 开关禁用并说明原因，不给一个拖了没用的假开关。
+                    DiagnoseCard(title = "字段归一化") {
+                        val normConfig = state.fieldNormalizationEnabled
+                        val normRuntime = state.diagnose?.device_profile?.normalization_enabled
+                        // 可写 = 读到过真值 且 没有 PUT 在飞。两个条件缺一个都会产生假开关：
+                        // 前者是"拖了 core 收不到"，后者是"连点产生互相覆盖的并发 PUT"。
+                        val normWritable = normConfig != null && !state.fieldNormalizationSaving
+                        UfiSettingsItem(
+                            title = "启用字段归一化",
+                            description = when {
+                                normConfig == null && !state.fieldNormalizationRead ->
+                                    "还没从设备读到这一项（正在读，或连不上 core）。" +
+                                        "开关位置不代表设备状态，此时不可修改。"
+                                normConfig == null ->
+                                    "当前 core 不在 GET /api/config 里返回 field_normalization_enabled，" +
+                                        "因此读不到也改不动（需要升级 core）。" +
+                                        "下面一行是 /api/diagnose 报的运行时实际状态。"
+                                else ->
+                                    // 下发中只**追加**一句，不替换整段：把说明换成「正在下发…」会让
+                                    // 那条重启提示在用户刚点完开关、最需要看到它的那一刻消失。
+                                    "关掉后 core 读侧不再按 profile 归一化，原样透出设备原始字段名，" +
+                                        "用来与下面的覆盖率结果做对照排障。" +
+                                        "需重启后台服务生效 —— core 只在启动时读一次这一项。" +
+                                        if (state.fieldNormalizationSaving) "（正在下发…）" else ""
+                            },
+                            enabled = normWritable,
+                            trailing = {
+                                UfiSwitch(
+                                    // 读不到配置值时退一步显示**运行时实际值**（两者都没有才是 false，
+                                    // 那一支的说明文案已明说"位置不代表设备状态"）。
+                                    // 绝不写 `?: true` 拿 core 的默认值冒充：开关可拖但改不动 = 假开关。
+                                    checked = normConfig ?: normRuntime ?: false,
+                                    enabled = normWritable,
+                                    onCheckedChange = { viewModel.tools.setFieldNormalizationEnabled(it) }
+                                )
+                            }
+                        )
+                        if (normRuntime != null) {
+                            UfiInfoRow(
+                                "运行时实际状态",
+                                if (normRuntime) "归一化生效中" else "已关闭 · 原样透传设备字段"
+                            )
+                        }
+                        // 配置值与运行时不一致 = 用户已经改过、但还没重启。这一条是"改了为什么没反应"
+                        // 的唯一答案，比上面那句通用提示更要紧，所以用 warning 色单独一行。
+                        if (normConfig != null && normRuntime != null && normConfig != normRuntime) {
+                            Text(
+                                "配置已是「${normSwitchLabel(normConfig)}」，当前运行的组件图仍是" +
+                                    "「${normSwitchLabel(normRuntime)}」—— 重启后台服务后才会生效。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.warning
+                            )
                         }
                     }
 
@@ -339,6 +421,14 @@ private fun boolLabel(v: Boolean?): String = when (v) {
     false -> "否"
     null -> "未知（读取失败）"
 }
+
+/**
+ * 归一化开关的「开启 / 关闭」措辞。
+ *
+ * 不复用 [boolLabel]（是/否）：那条文案对比的是**两个开关位置**（配置值 vs 运行时实际值），
+ * 写成「配置已是『是』」根本读不出说的是开还是关。
+ */
+private fun normSwitchLabel(enabled: Boolean): String = if (enabled) "开启" else "关闭"
 
 /**
  * `device_profile.status` 四态中文化。

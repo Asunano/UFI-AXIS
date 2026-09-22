@@ -107,6 +107,33 @@ private const val SPEED_UPLOAD_EXTERNAL_POST_BYTES = 32L * 1024 * 1024
 private const val DOWNLOAD_PROGRESS_SPAN = 0.7f
 private val SPEED_UPLOAD_MEDIA_TYPE = "application/octet-stream".toMediaType()
 
+/**
+ * 改 WiFi 热点配置**会踢掉当前连接**的提示文案（2026-09-22）。
+ *
+ * 只有一份，因为同一句话要出现在两个地方：保存**之前**弹窗里常驻的警告块，和保存成功后
+ * Toast 的副标题。两处各写一遍必然会漂，而这句话的准确性直接决定用户会不会把"设备掉线"
+ * 当成"保存失败"。
+ *
+ * 为什么必须在**点击之前**就说：用户很可能正通过这个热点连着设备 —— 热点一重启，
+ * 后续的失败提示物理上就送不到他眼前了。
+ */
+const val WIFI_RESTART_DISCONNECT_HINT =
+    "保存后热点会重启，当前通过这个 WiFi 连接的设备（包括本机）会短暂断开"
+
+/**
+ * 切换 WiFi 频段（`POST /api/wifi/band`）的后果说明（2026-09-22）。
+ *
+ * 与 [WIFI_RESTART_DISCONNECT_HINT] 分成两条而不是复用一条：这条动作的后果**多一项** ——
+ * 设备命令 `switchWiFiChip&ChipEnum=X&GuestEnable=0` 的语义是「**在该频段上启用 WiFi**」，
+ * 所以除了断连，原本关着的 WiFi 还会被打开。把这一项混进"保存热点配置"的提示里，
+ * 要么漏掉、要么让只改 SSID 的用户以为自己会把 WiFi 打开。
+ *
+ * 只有一份，因为同一句话要出现在两个地方：切换**之前**的确认弹窗正文，和切换成功后的
+ * Toast 副标题。用户很可能正通过这个热点连着设备 —— 提示必须在他点下去之前就到位。
+ */
+const val WIFI_BAND_SWITCH_DISCONNECT_HINT =
+    "这会重启设备的 WiFi 模块并在该频段上打开 WiFi，当前通过 WiFi 连接的设备（包括本机）会断开，需要重新连接"
+
 class NetworkModule(
     private val api: UfiAxisApi,
     private val appContext: Context,
@@ -161,11 +188,90 @@ class NetworkModule(
         _events.tryEmit(UiEvent.ShowDashboardError(msg))
     }
 
+    /**
+     * 写操作成功提示（2026-09-22）。走跨模块事件 → MainViewModel 的 writeNotice 流 →
+     * Activity 级 Toast 宿主，与失败提示同一个出口。
+     *
+     * 文案要说清**是哪一项**生效了：一个界面上往往有多个写操作，「保存成功」这种泛化文案
+     * 让用户分不清生效的是哪个。
+     */
+    private fun emitWriteNotice(message: String, subtitle: String? = null) {
+        _events.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    }
+
+    /** 清设备设置的错误（全局错误浮层收起时由 MainViewModel.dismissGlobalError 分派过来）。 */
+    fun clearDeviceSettingsError() {
+        _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = null)
+    }
+
     // ── Network ──
-    fun refreshNetwork() {
+
+    /**
+     * 网络页整套数据最近一次**完整成功**落地的时刻（单调时钟，`0` = 本进程内从未成功）。
+     * 判据窗口是 [NETWORK_ALL_FRESH_MS]。单调时钟的理由见 `DataFreshness.kt`。
+     */
+    @Volatile private var networkAllSuccessElapsed: Long = 0L
+
+    /**
+     * 网络页需要的那一整套数据（6 个请求）。
+     *
+     * ## 为什么这个扇出在 module 而不在页面里
+     * 原来它是 `NetworkScreen` 里的私有 `loadNetworkAll(viewModel)`，页面每次 `pageForeground`
+     * 翻 true 就无条件发 6 个请求。现在预加载协调器也要发同一批，判据（新鲜度戳）只能有一份，
+     * 而戳存在 module 里才能跨组合存活 —— 放在 composable 的 `remember` 里换页往复就丢了。
+     *
+     * ## [force] 与 [silent]
+     * - [force]：绕过新鲜度窗口。写后回读、用户手动重试走这条。
+     * - [silent]：失败**不写** `errorMessage`。预加载专用 —— 那一批请求发生在用户没看着的页面上，
+     *   把失败写进 `networkState.errorMessage` 会经 `MainViewModel.rawGlobalError` 冒成全局 Toast，
+     *   表现为"刚开 app 就莫名弹一句加载失败"。页面自己的调用一律 `silent = false`。
+     *
+     * 新鲜度只看 `signalInfo`：它由 [refreshNetwork] 这条主请求产出，也是本页 hero 卡的主数据。
+     * 其余 5 项任一失败时字段保持 null，页面那条"出错 5s 后重试"的效应会补。
+     */
+    fun loadNetworkAll(force: Boolean = false, silent: Boolean = false) {
+        if (!force &&
+            _networkState.value.signalInfo != null &&
+            isForegroundDataFresh(
+                networkAllSuccessElapsed,
+                SystemClock.elapsedRealtime(),
+                NETWORK_ALL_FRESH_MS
+            )
+        ) {
+            return
+        }
+        refreshNetwork(silent = silent)
+        loadBandStatus(silent = silent)
+        loadCellInfo(silent = silent)
+        loadDeviceSettings()
+        loadLanSettings()
+        loadDeviceIdentity()
+    }
+
+    /**
+     * 换设备 / 换地址后丢掉所有新鲜度基准。
+     *
+     * 不清就会出现"新设备的页面因为旧设备的戳还在新鲜窗口内而跳过请求"，
+     * 屏幕上留着上一台的信号与 WiFi 名。与 `DashboardModule.clearDashboardCache()` 同一批调用。
+     */
+    fun resetFreshness() {
+        networkAllSuccessElapsed = 0L
+        wifiSuccessElapsed = 0L
+        serviceStatusSuccessElapsed = 0L
+    }
+
+    fun refreshNetwork(silent: Boolean = false) {
         refreshJob?.cancel()
         refreshJob = scope.launch {
-            _networkState.value = _networkState.value.copy(isLoading = true, errorMessage = null)
+            // 「有数据时不写 loading 态」（同 DashboardModule.refreshDashboardInternal 的判据）：
+            // isLoading 在本页没有任何可见用途，有数据时翻成 true 只是白付一次整页重组。
+            _networkState.update { current ->
+                when {
+                    current.signalInfo == null -> current.copy(isLoading = true, errorMessage = null)
+                    current.errorMessage != null -> current.copy(errorMessage = null)
+                    else -> current
+                }
+            }
             try {
                 val sig = async { runCatching { api.getSignalInfo() } }
                 val net = async { runCatching { api.getNetworkStatus() } }
@@ -190,18 +296,28 @@ class NetworkModule(
                     wifiSettings = wifiSettings,
                     wifiClients = rClients.getOrNull(), wifiEnabled = wifiSettings?.enabled ?: false,
                     mobileDataEnabled = netStatus?.mobile_data ?: false, isLoading = false,
-                    errorMessage = failures
+                    errorMessage = if (silent) _networkState.value.errorMessage else failures
                 )
+                // 只在**全部成功**时记新鲜度基准：部分失败时字段是缺的，
+                // 记了戳会让下一次前台化跳过重拉、把缺字段固化成"新鲜"。
+                if (failures == null) {
+                    networkAllSuccessElapsed = SystemClock.elapsedRealtime()
+                    wifiSuccessElapsed = SystemClock.elapsedRealtime()
+                }
             } catch (e: Exception) {
                 if (e is CancellationException) {
                     _networkState.value = _networkState.value.copy(isLoading = false)
                     throw e
                 }
                 DebugLog.e("Network", "refreshNetwork failed", e)
-                _networkState.value = _networkState.value.copy(isLoading = false, errorMessage = "加载失败: ${e.message}")
+                _networkState.value = _networkState.value.copy(
+                    isLoading = false,
+                    errorMessage = if (silent) _networkState.value.errorMessage else "加载失败: ${e.message}"
+                )
             }
         }
     }
+
 
     /**
      * 开 / 关移动数据（`POST /api/network/mobile-data`）。
@@ -447,6 +563,10 @@ class NetworkModule(
                 errorMessage = if (reached) it.errorMessage else "设备尚未完成切换，可稍后刷新查看"
             )
         }
+        // 2026-09-22 补成功提示：**放在这里而不是下发成功之后** —— 制式切换的"成功"是
+        // 设备真的报出了目标档位（上面这段回读的判据），下发只是被受理。
+        // 超时那一支已经写了 errorMessage，不能也弹一条绿色的。
+        if (reached) emitWriteNotice("网络制式已切换为 ${NetworkMode.label(target)}")
         refreshNetwork()
     }
 
@@ -457,7 +577,17 @@ class NetworkModule(
      * 把 core 写好的「设备后台会话已失效…」扔了。非 HTTP 异常（连不上 / 超时）没有错误体可取，
      * 落到 `e.message`。
      */
-    private fun coreErrorMessage(e: Exception): String {
+    private fun coreErrorMessage(e: Exception): String =
+        coreRejectReason(e) ?: "设置失败: ${e.message ?: "未知错误"}"
+
+    /**
+     * 只取 core 失败信封里的 `error` 字段（没有就是 null）。
+     *
+     * 独立出来是为了让调用方自己拼前缀：失败提示要说清**是哪一项**没保存成功（§4.15），
+     * 而 [coreErrorMessage] 的兜底前缀是通用的"设置失败"，套在具体文案外面会变成
+     * 「WiFi 热点保存失败：设置失败: …」这种两层前缀。
+     */
+    private fun coreRejectReason(e: Exception): String? {
         if (e is retrofit2.HttpException) {
             val body = runCatching { e.response()?.errorBody()?.string() }.getOrNull()
             val reason = runCatching {
@@ -466,7 +596,7 @@ class NetworkModule(
             }.getOrNull()
             if (!reason.isNullOrBlank()) return reason
         }
-        return "设置失败: ${e.message ?: "未知错误"}"
+        return null
     }
 
     /** 统一锁定 LTE+NR 频段（goform + AT+SFUN 网络栈重启，无需设备重启） */
@@ -492,12 +622,14 @@ class NetworkModule(
         }
     }
 
-    fun loadBandStatus() {
+    /** @param silent 失败不写 `errorMessage`（预加载专用，见 [loadNetworkAll]）。 */
+    fun loadBandStatus(silent: Boolean = false) {
         scope.launch {
             try {
                 _networkState.update { it.copy(bandStatus = api.getBandStatus(), loadVersion = System.currentTimeMillis()) }
             } catch (e: Exception) {
-                _networkState.update { it.copy(errorMessage = "频段状态加载失败: ${e.message}") }
+                if (silent) DebugLog.w("Network", "频段状态加载失败（静默）: ${e.message}")
+                else _networkState.update { it.copy(errorMessage = "频段状态加载失败: ${e.message}") }
             }
         }
     }
@@ -559,11 +691,16 @@ class NetworkModule(
         }
     }
 
+    /**
+     * 自动 / 手动拨号。2026-09-22 补成功提示：这一项改完界面上**什么都不变**
+     *（选中态是本地 radio 的即时反应，不等回包），静默成功等于没反馈。
+     */
     fun setConnectionMode(mode: String) {
         scope.launch {
             try {
                 val resp = api.setConnectionMode(mapOf("mode" to mode))
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "设置失败")
+                else emitWriteNotice(if (mode == "auto") "已切换为自动拨号" else "已切换为手动拨号")
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "设置失败: ${e.message}") }
         }
     }
@@ -1272,7 +1409,8 @@ class NetworkModule(
      * 当前服务小区（NR 优先的 `band_label` / `pci` / `arfcn`）在 `/api/network/signal`
      * 的服务小区统一字段里（计划书 1.10）。少拉一个，5G 驻网时基站页会显示 4G 的 PCI/频点。
      */
-    fun loadCellInfo() {
+    /** @param silent 失败不写 `errorMessage`（预加载专用，见 [loadNetworkAll]）。 */
+    fun loadCellInfo(silent: Boolean = false) {
         scope.launch {
             try {
                 val cell = async { runCatching { api.getCellInfo() } }
@@ -1287,12 +1425,16 @@ class NetworkModule(
                     cellInfo = rCell.getOrNull() ?: it.cellInfo,
                     signalInfo = rSignal.getOrNull() ?: it.signalInfo,
                     neighborCells = rNeighbor.getOrNull() ?: it.neighborCells,
-                    errorMessage = rCell.exceptionOrNull()?.let { e -> "基站信息查询失败: ${e.message}" }
-                        ?: it.errorMessage,
+                    errorMessage = if (silent) it.errorMessage else {
+                        rCell.exceptionOrNull()?.let { e -> "基站信息查询失败: ${e.message}" } ?: it.errorMessage
+                    },
                     loadVersion = System.currentTimeMillis()
                 ) }
             }
-            catch (e: Exception) { _networkState.update { it.copy(errorMessage = "基站信息查询失败: ${e.message}") } }
+            catch (e: Exception) {
+                if (silent) DebugLog.w("Network", "基站信息查询失败（静默）: ${e.message}")
+                else _networkState.update { it.copy(errorMessage = "基站信息查询失败: ${e.message}") }
+            }
         }
     }
 
@@ -1323,11 +1465,25 @@ class NetworkModule(
         }
     }
 
+    /**
+     * 下发 DHCP / LAN 设置。
+     *
+     * 失败路径与 `resp.success` 校验本来就做对了（它是 §4.4 的范本），2026-09-22 只补成功提示：
+     * 在这之前保存成功是静默的 —— 写后回读 500ms 才回来，那期间界面上什么都不变，
+     * 用户分不清"点了没反应"和"存进去了"。
+     */
     fun setDhcpSetting(lanIp: String, lanNetmask: String, dhcpType: String, dhcpStart: String, dhcpEnd: String, dhcpLease: String) {
         scope.launch {
             try {
                 val resp = api.setDhcpSetting(mapOf("lan_ip" to lanIp, "lan_netmask" to lanNetmask, "dhcp_type" to dhcpType, "dhcp_start" to dhcpStart, "dhcp_end" to dhcpEnd, "dhcp_lease" to dhcpLease))
-                if (resp.success) { delay(500); loadLanSettings() }
+                if (resp.success) {
+                    emitWriteNotice(
+                        "DHCP 设置已保存",
+                        // 改 LAN 网段会让已连设备的租约失效，这是用户会观察到的副作用
+                        subtitle = "已连接的设备可能需要重新获取 IP"
+                    )
+                    delay(500); loadLanSettings()
+                }
                 else _networkState.value = _networkState.value.copy(errorMessage = "DHCP设置失败")
             } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "DHCP设置失败: ${e.message}") }
         }
@@ -1337,7 +1493,27 @@ class NetworkModule(
     // 停/启的是后端"后台采集服务"（core 的 DataScheduler），HTTP 服务始终在跑，
     // 所以停止之后仍然能远程再启动。"重启服务"才是进程级完全重启。
 
-    fun loadServiceStatus() {
+    /** 服务状态最近一次成功读取的时刻（单调时钟，`0` = 本进程内从未成功）。 */
+    @Volatile private var serviceStatusSuccessElapsed: Long = 0L
+
+    /**
+     * 读后台采集服务状态（`GET /api/service/status`，core 侧只读本机设置、无设备 I/O）。
+     *
+     * 加新鲜度闸门的原因：这一个调用在冷启动时至少发两次 —— `DashboardScreen` 与
+     * `SettingsScreen` 各有一条 `LaunchedEffect(Unit)`，再加预加载协调器就是三次。
+     * 请求本身很轻，但重复调用会把 Logcat 里的真实请求数搅浑，排查冷启动时序时碍事。
+     *
+     * @param force  绕过新鲜度窗口。写后回读（开关服务 / 重启服务）必须传 true。
+     * @param silent 失败不写 `errorMessage`（预加载专用）。`serviceState.errorMessage`
+     *   会经 `MainViewModel.rawGlobalError` 冒成全局 Toast。
+     */
+    fun loadServiceStatus(force: Boolean = false, silent: Boolean = false) {
+        if (!force &&
+            _serviceState.value.loaded &&
+            isForegroundDataFresh(serviceStatusSuccessElapsed, SystemClock.elapsedRealtime())
+        ) {
+            return
+        }
         scope.launch {
             try {
                 val s = api.getServiceStatus()
@@ -1350,11 +1526,13 @@ class NetworkModule(
                     restarting = false,
                     errorMessage = null
                 )
+                serviceStatusSuccessElapsed = SystemClock.elapsedRealtime()
             } catch (e: Exception) {
                 // restarting 一并清掉：否则重启后若服务还没起来，徽标会永久卡在"重启中"
                 _serviceState.value = _serviceState.value.copy(
                     restarting = false,
-                    errorMessage = "服务状态读取失败: ${e.message}"
+                    errorMessage = if (silent) _serviceState.value.errorMessage
+                    else "服务状态读取失败: ${e.message}"
                 )
             }
         }
@@ -1377,7 +1555,7 @@ class NetworkModule(
                 emitDashboardError(if (s.enabled) "后台服务已启动" else "后台服务已停止（HTTP 服务仍在运行）")
             } catch (e: Exception) {
                 _serviceState.value = _serviceState.value.copy(isBusy = false, errorMessage = "操作失败: ${e.message}")
-                loadServiceStatus()
+                loadServiceStatus(force = true)
             }
         }
     }
@@ -1389,7 +1567,7 @@ class NetworkModule(
                 _serviceState.value = _serviceState.value.copy(loaded = true, autoStartOnBoot = s.autoStartOnBoot)
             } catch (e: Exception) {
                 _serviceState.value = _serviceState.value.copy(errorMessage = "设置失败: ${e.message}")
-                loadServiceStatus()
+                loadServiceStatus(force = true)
             }
         }
     }
@@ -1650,20 +1828,125 @@ class NetworkModule(
         }
     }
 
-    fun changePassword(oldPwd: String, newPwd: String) {
-        scope.launch {
-            try { api.changePassword(mapOf("old_password" to oldPwd, "new_password" to newPwd)) }
-            catch (e: Exception) { emitDashboardError("修改密码失败: ${e.message}") }
+    /**
+     * 改设备自带网页后台的登录密码。
+     *
+     * ## 2026-09-22：改成等结果并返回（阶段 3.2）
+     * 原来是 fire-and-forget，而调用方（`ServerConfigScreen` 的「设备后台」弹窗）在调用完
+     * 立刻 `prefs.goformPasswordSet = true` + 关窗 + 弹「已保存」。旧密码填错时 core 会拒，
+     * 界面却已经关掉并且本地记成"密码已设置" —— 假成功还带一条错误的本地状态。
+     *
+     * @return true = core 已接受新密码。调用方据此决定关不关弹窗、要不要写本地标记。
+     */
+    suspend fun changePassword(oldPwd: String, newPwd: String): Boolean = scope.async {
+        try {
+            val resp = api.changePassword(mapOf("old_password" to oldPwd, "new_password" to newPwd))
+            if (!resp.success) {
+                _networkState.update { it.copy(errorMessage = "设备后台密码修改失败：设备未接受（请确认当前密码）") }
+                return@async false
+            }
+            emitWriteNotice("设备后台密码已修改")
+            true
+        } catch (e: Exception) {
+            // 带上 core 回的原因（如「原密码不正确」），否则用户只看到 HTTP 4xx/5xx
+            val reason = coreRejectReason(e) ?: e.message ?: "未知错误"
+            _networkState.update { it.copy(errorMessage = "设备后台密码修改失败：$reason") }
+            false
         }
-    }
+    }.await()
 
     // ── WiFi Config ──
-    fun setWifiConfig(config: Map<String, Any>) {
-        scope.launch {
-            try { api.setWifiConfig(config) }
-            catch (e: Exception) { emitDashboardError("WiFi设置失败: ${e.message}") }
-        }
-    }
+
+    /**
+     * 保存整份 WiFi 热点配置（`POST /api/wifi/config`）。
+     *
+     * @param willDisconnect 本次改动是否会让设备重启热点（SSID / 密码 / 加密方式 / 频段 /
+     *   隐藏 SSID 任一变化）。true 时把 [WIFI_RESTART_DISCONNECT_HINT] 挂成成功提示的副标题 ——
+     *   用户很可能正**通过这个热点**连着设备，得让他知道随之而来的掉线是预期的、不是出错。
+     *   只改最大连接数时传 false：那一项不断连，无差别恐吓会让警告被忽略。
+     * @return true = 设备已接受这份配置。调用方（弹窗）据此决定关不关窗。
+     *
+     * 为什么整段跑在本模块的 [scope]（viewModelScope）而不是调用方的协程里：调用方是弹窗，
+     * 成功后弹窗会被卸载、它的 `rememberCoroutineScope` 随之取消。`async` + `await` 之后
+     * "取消等待"只停掉等待方，写入 / 回读 / 成功提示照样跑完 —— 请求在飞时关掉弹窗
+     * 不会留下"写了一半没人收尾"的状态，成功提示也仍然走全局宿主到得了用户眼前。
+     */
+    suspend fun setWifiConfig(config: Map<String, Any>, willDisconnect: Boolean = false): Boolean =
+        scope.async {
+            try {
+                val resp = api.setWifiConfig(config)
+                // 独立检查 success：core 目前把 false 与 500 绑在一起，所以这条分支现在踩不到；
+                // 但「200 + success:false」在契约上随时可能出现，不检查就是一个等着被踩的
+                // 假成功（口径同 setDhcpSetting）。
+                if (!resp.success) {
+                    _networkState.update {
+                        it.copy(errorMessage = "WiFi 热点保存失败：设备未接受这份配置")
+                    }
+                    return@async false
+                }
+                emitWriteNotice(
+                    "WiFi 热点已保存",
+                    subtitle = if (willDisconnect) WIFI_RESTART_DISCONNECT_HINT else null
+                )
+                // 主动回读，不等 WS 推送：推送有三个会丢的缺口（core 缓存里没有 wifi:* 条目时
+                // 不发、WS 掉线期间丢且重连只补 console:*、降级轮询还有 30s 新鲜度闸门）。
+                // 500ms 是留给设备应用新配置的时间，0ms 大概率读回旧值，而这一轮之后不会有第二次。
+                delay(500)
+                refreshWifi(force = true)
+                true
+            } catch (e: Exception) {
+                // 带上 core 回的原因（如 profile 校验的「密码长度…」），否则用户只看到 HTTP 400/500
+                val reason = coreRejectReason(e) ?: e.message ?: "未知错误"
+                _networkState.update { it.copy(errorMessage = "WiFi 热点保存失败：$reason") }
+                false
+            }
+        }.await()
+
+    /**
+     * 切换 WiFi 频段（`POST /api/wifi/band`，`chip1` = 2.4G / `chip2` = 5G）。
+     *
+     * **为什么是独立的一次下发、不跟 `/config` 合并**：频段不属于热点配置的一部分 ——
+     * 设备只认 `switchWiFiChip&ChipEnum=X&GuestEnable=0` 这条命令，语义是「在该频段上启用
+     * WiFi」。曾经走 `/config` 的 `chip_index`（落到 `setAccessPointInfo → ChipIndex`）
+     * **设备不认**，那就是用户实测「频段改了没反应」的根因，别再合回去。
+     *
+     * 调用方必须自己先跟用户确认（后果见 [WIFI_BAND_SWITCH_DISCONNECT_HINT]）：本方法
+     * 与 core 的路由都不带确认语义。顺序上也要放在 `/config` **之后** —— 这条命令会重启
+     * WiFi 模块顶掉连接，先发它，SSID / 密码就没机会落到设备上了。
+     *
+     * @return true = 设备已接受。失败原因（core 对非法取值回的 400 + 原因）落到全局错误通道，
+     *   不压成一句「失败」；调用方据此决定关不关窗。
+     *
+     * 跑在本模块的 [scope] 而不是调用方协程：理由同 [setWifiConfig] —— 弹窗关掉后
+     * 回读与提示仍要跑完。
+     */
+    suspend fun setWifiBand(chip: String): Boolean =
+        scope.async {
+            try {
+                val resp = api.setWifiBand(mapOf("chip" to chip))
+                // 独立检查 success：口径同 setWifiConfig，「200 + success:false」在契约上
+                // 随时可能出现，不检查就是一个等着被踩的假成功。
+                if (!resp.success) {
+                    _networkState.update {
+                        it.copy(errorMessage = "WiFi 频段切换失败：设备未接受这个频段")
+                    }
+                    return@async false
+                }
+                emitWriteNotice("WiFi 频段已切换", subtitle = WIFI_BAND_SWITCH_DISCONNECT_HINT)
+                // 主动回读（force 绕过新鲜度闸门）：这一次要把两件事都反映出来 ——
+                // 新的生效频段（wifi_chip），以及「WiFi 被这条命令打开」这个副作用（moduleSwitch）。
+                // 500ms 同 setWifiConfig：给设备应用配置的时间，0ms 大概率读回旧值。
+                delay(500)
+                refreshWifi(force = true)
+                true
+            } catch (e: Exception) {
+                // 带上 core 回的原因（取值域非法时 profile 的 validate 会回 400 + 原因），
+                // 否则用户只看到一句 HTTP 400
+                val reason = coreRejectReason(e) ?: e.message ?: "未知错误"
+                _networkState.update { it.copy(errorMessage = "WiFi 频段切换失败：$reason") }
+                false
+            }
+        }.await()
 
     fun setWifiPower(level: Int) {
         scope.launch {
@@ -1696,6 +1979,32 @@ class NetworkModule(
         }
     }
 
+    // ── 设备设置类写操作的统一收尾（2026-09-22）────────────────────────────────
+    //
+    // 这 7 项（FOTA / 性能模式 / 指示灯 / 漫游 / WiFi 休眠 / Samba / 定时重启）原来是
+    // **完全静默**的：成功没提示，失败把文案写进 `_deviceSettingsState.errorMessage` ——
+    // 而那个字段全仓零消费，等于没写。现在成功走 ShowWriteNotice，失败走已接入全局
+    // 错误通道的 errorMessage（见 MainViewModel.rawGlobalError）。
+    //
+    // 失败**也要回读**：UI 上的开关已经被用户拨过去了，而 `settings` 没变 →
+    // `LaunchedEffect(settings)` 不会重新同步，开关就停在错误位置
+    //（NetworkFeaturesScreen / DeviceControlScreen 都是这个写法）。回读让 settings 变化，
+    // 开关自己弹回设备真值。
+
+    /** 写成功：报出**具体哪一项**生效了，再等设备落地后回读真实回显。 */
+    private suspend fun deviceSettingSucceeded(message: String) {
+        emitWriteNotice(message)
+        // 500ms 是给设备应用配置的时间：立刻回读大概率拿到旧值，而这一轮之后不会再有第二次回读
+        delay(500)
+        loadDeviceSettings()
+    }
+
+    /** 写失败：文案交给全局错误通道，并立刻回读把界面拉回设备真值（失败时不必等 500ms）。 */
+    private suspend fun deviceSettingFailed(message: String) {
+        _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = message)
+        loadDeviceSettings()
+    }
+
     /**
      * 设置 FOTA。入参 disable 沿用 UI 语义（true = 禁用运营商自动升级），
      * 发给 core 时翻转成契约的正向字段 auto_update（旧反向字段 enabled core 仍兼容但已打 WARN）。
@@ -1707,9 +2016,14 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setFotaDisabled(mapOf("auto_update" to !disable))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "FOTA设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "FOTA设置失败: ${e.message}") }
+                if (resp.success) {
+                    deviceSettingSucceeded(
+                        if (disable) "已关闭运营商自动升级" else "已开启运营商自动升级"
+                    )
+                } else {
+                    deviceSettingFailed("FOTA设置失败")
+                }
+            } catch (e: Exception) { deviceSettingFailed("FOTA设置失败: ${e.message}") }
         }
     }
 
@@ -1717,9 +2031,9 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setPerformanceMode(mapOf("mode" to mode))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "性能模式设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "性能模式设置失败: ${e.message}") }
+                if (resp.success) deviceSettingSucceeded("性能模式已切换为 $mode")
+                else deviceSettingFailed("性能模式设置失败")
+            } catch (e: Exception) { deviceSettingFailed("性能模式设置失败: ${e.message}") }
         }
     }
 
@@ -1727,9 +2041,9 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setLedEnabled(mapOf("enabled" to enabled))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "指示灯设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "指示灯设置失败: ${e.message}") }
+                if (resp.success) deviceSettingSucceeded(if (enabled) "指示灯已开启" else "指示灯已关闭")
+                else deviceSettingFailed("指示灯设置失败")
+            } catch (e: Exception) { deviceSettingFailed("指示灯设置失败: ${e.message}") }
         }
     }
 
@@ -1737,9 +2051,9 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setRoamingEnabled(mapOf("enabled" to enabled))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "漫游设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "漫游设置失败: ${e.message}") }
+                if (resp.success) deviceSettingSucceeded(if (enabled) "数据漫游已开启" else "数据漫游已关闭")
+                else deviceSettingFailed("漫游设置失败")
+            } catch (e: Exception) { deviceSettingFailed("漫游设置失败: ${e.message}") }
         }
     }
 
@@ -1747,9 +2061,15 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setWifiSleep(mapOf("time" to time))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "WiFi休眠设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "WiFi休眠设置失败: ${e.message}") }
+                // 不在文案里写单位：设备侧 time 的取值语义由固件定义，猜错单位比不写更糟
+                if (resp.success) {
+                    deviceSettingSucceeded(
+                        if (time == "0") "已关闭 WiFi 休眠" else "WiFi 休眠时间已更新"
+                    )
+                } else {
+                    deviceSettingFailed("WiFi休眠设置失败")
+                }
+            } catch (e: Exception) { deviceSettingFailed("WiFi休眠设置失败: ${e.message}") }
         }
     }
 
@@ -1757,9 +2077,9 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setSambaSetting(mapOf("enabled" to enabled))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "Samba设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "Samba设置失败: ${e.message}") }
+                if (resp.success) deviceSettingSucceeded(if (enabled) "Samba 已开启" else "Samba 已关闭")
+                else deviceSettingFailed("Samba设置失败")
+            } catch (e: Exception) { deviceSettingFailed("Samba设置失败: ${e.message}") }
         }
     }
 
@@ -1767,9 +2087,14 @@ class NetworkModule(
         scope.launch {
             try {
                 val resp = api.setRestartSchedule(mapOf("enabled" to enabled, "time" to time))
-                if (!resp.success) _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "定时重启设置失败")
-                else { delay(500); loadDeviceSettings() }
-            } catch (e: Exception) { _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = "定时重启设置失败: ${e.message}") }
+                if (resp.success) {
+                    deviceSettingSucceeded(
+                        if (enabled) "定时重启已设为 $time" else "定时重启已关闭"
+                    )
+                } else {
+                    deviceSettingFailed("定时重启设置失败")
+                }
+            } catch (e: Exception) { deviceSettingFailed("定时重启设置失败: ${e.message}") }
         }
     }
 
@@ -1893,6 +2218,10 @@ class NetworkModule(
         }
     }
 
+    // 2026-09-22（阶段 3.5）：下面这组写操作补成功提示。
+    // 失败路径不动 —— 它们写 `pairingState.errorMessage`，`PairingConfigScreen` 已经在渲染
+    // （UfiErrorBanner），不是"写了没人读"那一类，不需要改道全局通道。
+
     fun updatePairingConfig(enabled: Boolean, maxDevices: Int) {
         scope.launch {
             try {
@@ -1901,6 +2230,10 @@ class NetworkModule(
                     "pairing_max_devices" to maxDevices
                 ))
                 loadPairingStatus()
+                emitWriteNotice(
+                    if (enabled) "已允许新设备配对" else "已停止接受新设备配对",
+                    subtitle = if (enabled) "上限 $maxDevices 台" else null
+                )
             } catch (e: Exception) {
                 DebugLog.e("Network", "updatePairingConfig failed", e)
                 _pairingState.value = _pairingState.value.copy(errorMessage = "保存失败: ${e.message}")
@@ -1913,6 +2246,7 @@ class NetworkModule(
             try {
                 api.unpairAll()
                 loadPairingStatus()
+                emitWriteNotice("已解除全部设备的配对", subtitle = "所有客户端需要重新配对")
             } catch (e: Exception) {
                 DebugLog.e("Network", "unpairAll failed", e)
                 _pairingState.value = _pairingState.value.copy(errorMessage = "解除配对失败: ${e.message}")
@@ -1925,6 +2259,7 @@ class NetworkModule(
             try {
                 api.unpairFingerprint(fingerprint)
                 loadPairingStatus()
+                emitWriteNotice("已解除该设备的配对")
             } catch (e: Exception) {
                 DebugLog.e("Network", "unpairFingerprint failed", e)
                 _pairingState.value = _pairingState.value.copy(errorMessage = "移除设备失败: ${e.message}")
@@ -1953,6 +2288,7 @@ class NetworkModule(
             try {
                 api.renamePairedDevice(fingerprint, mapOf("device_name" to name))
                 loadPairedDevices()
+                emitWriteNotice("设备名称已改为「$name」")
             } catch (e: Exception) {
                 DebugLog.e("Network", "renameDevice failed", e)
                 _pairingState.update { it.copy(errorMessage = "重命名失败: ${e.message}") }
@@ -1974,6 +2310,9 @@ class NetworkModule(
                     RetrofitClient.onUnauthorized?.invoke()
                 } else {
                     loadPairingStatus()
+                    // 移除的是本机时**不发**成功提示：那一支会立刻退回配对页，
+                    // 一条"已移除"的绿色 Toast 盖在配对引导上只会让人以为哪里出错了。
+                    emitWriteNotice("已移除该设备")
                 }
             } catch (e: Exception) {
                 DebugLog.e("Network", "removeDevice failed", e)
@@ -1988,6 +2327,7 @@ class NetworkModule(
             try {
                 api.changeDevicePassword(mapOf("old_password" to oldPw, "new_password" to newPw))
                 loadPairingStatus()
+                emitWriteNotice("配对密码已修改")
             } catch (e: Exception) {
                 DebugLog.e("Network", "changeDevicePassword failed", e)
                 _pairingState.update { it.copy(errorMessage = "修改配对密码失败: ${e.message}") }

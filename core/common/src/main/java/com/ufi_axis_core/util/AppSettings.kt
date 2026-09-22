@@ -65,6 +65,11 @@ class AppSettings(context: Context) {
         // ── 更新镜像前缀（2026-08-12：可配置，空串=直连）──
         private const val KEY_UPDATE_MIRROR_BASE = "update_mirror_base"
 
+        // ── 更新下载方式（2026-09-22：决策下沉 core，见 docs/update-source-core-plan.md）──
+        // 这是**唯一决策字段**；KEY_UPDATE_MIRROR_BASE 自此降级为「自定义前缀覆盖」，
+        // 不再表达「用不用镜像」。
+        private const val KEY_UPDATE_SOURCE_MODE = "update_source_mode"
+
         // ── 更新状态持久化（2026-08-10 P0-4/P0-2：RESULT 机制最小版）──
         private const val KEY_PENDING_UPDATE = "pending_update"
         private const val KEY_PENDING_LOCAL_INSTALL_LUT = "pending_local_install_lut"
@@ -184,6 +189,8 @@ class AppSettings(context: Context) {
             // 更新源
             BackupField(KEY_UPDATE_URL, BackupValueType.STRING),
             BackupField(KEY_UPDATE_MIRROR_BASE, BackupValueType.STRING),
+            // 下载方式（2026-09-22）：还原到另一台设备时 `auto` 最安全 —— 它按新设备的地区重判
+            BackupField(KEY_UPDATE_SOURCE_MODE, BackupValueType.STRING),
             // 短信
             BackupField(KEY_SMS_CODE_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_SMS_CODE_CLEANUP_HOURS, BackupValueType.INT, 1, 720),
@@ -304,6 +311,22 @@ class AppSettings(context: Context) {
 
         /** 默认更新镜像前缀（与旧写死行为一致：设备在国内访问 GitHub 时自动加速） */
         const val DEFAULT_UPDATE_MIRROR_BASE = "https://mirror.drxian.qzz.io/"
+
+        // ── 更新下载方式（2026-09-22）──
+        // 三端（core / app / web）共用这三个取值；core 是唯一决策方。
+        const val UPDATE_MODE_AUTO = "auto"
+        const val UPDATE_MODE_MIRROR = "mirror"
+        const val UPDATE_MODE_DIRECT = "direct"
+
+        /** 合法取值集合。收到集合外的值一律回落 [UPDATE_MODE_AUTO] 并打 WARN。 */
+        val UPDATE_MODES = setOf(UPDATE_MODE_AUTO, UPDATE_MODE_MIRROR, UPDATE_MODE_DIRECT)
+
+        /**
+         * 默认下载方式。
+         * `auto` 而不是 `mirror`：镜像只在国内更快，海外走 gh-proxy 往往更慢甚至不可达，
+         * 所以「不知道设备在哪」时的正确默认是让 core 自己去看地区。
+         */
+        const val DEFAULT_UPDATE_SOURCE_MODE = UPDATE_MODE_AUTO
 
         // 默认 goform 口令的只读访问器（非 const val，避免被调用方字节码内联）。
         val defaultGoformPassword: String get() = DEFAULT_GOFORM_PASSWORD
@@ -790,12 +813,68 @@ class AppSettings(context: Context) {
 
     /**
      * 更新镜像前缀（gh-proxy 风格，直接拼接在 GitHub 完整 URL 前；2026-08-12 由写死常量改为可配置）。
-     * 默认 `https://mirror.drxian.qzz.io/` 维持现有自动镜像行为；设为空串 = 直连 GitHub。
-     * 仅对 GitHub 相关域名生效（见 UpdateManager.GITHUB_HOSTS），非 GitHub 域名不受影响。
+     *
+     * **2026-09-22 起语义变更**：它不再表达「用不用镜像」——那由 [updateSourceMode] 决定。
+     * 这里只是「自定义前缀覆盖」：非空且不在内置列表里时，作为候选列表的第一个
+     * （见 `MirrorResolver`）。老配置里的自定义前缀因此不会失效。
+     * 仅对 GitHub 相关域名生效，非 GitHub 域名不受影响。
      */
     var updateMirrorBase: String
         get() = prefs.getString(KEY_UPDATE_MIRROR_BASE, DEFAULT_UPDATE_MIRROR_BASE) ?: DEFAULT_UPDATE_MIRROR_BASE
         set(value) = prefs.edit().putString(KEY_UPDATE_MIRROR_BASE, value).apply()
+
+    /**
+     * 更新下载方式：`auto` / `mirror` / `direct`（2026-09-22，决策下沉 core）。
+     *
+     * 这是**唯一决策字段**，app 与 web 只读写它。取值非法时回落 [DEFAULT_UPDATE_SOURCE_MODE]
+     * 并打 WARN —— 静默当成 auto 会让「客户端写错了值」这件事永远查不出来。
+     */
+    var updateSourceMode: String
+        get() {
+            val raw = prefs.getString(KEY_UPDATE_SOURCE_MODE, DEFAULT_UPDATE_SOURCE_MODE)
+                ?: DEFAULT_UPDATE_SOURCE_MODE
+            if (raw in UPDATE_MODES) return raw
+            AppLogger.w("AppSettings", "update_source_mode 取值非法($raw)，按 $DEFAULT_UPDATE_SOURCE_MODE 处理")
+            return DEFAULT_UPDATE_SOURCE_MODE
+        }
+        set(value) {
+            val normalized = if (value in UPDATE_MODES) value else DEFAULT_UPDATE_SOURCE_MODE
+            if (normalized != value) {
+                AppLogger.w("AppSettings", "拒绝写入非法 update_source_mode($value)，已存 $normalized")
+            }
+            prefs.edit().putString(KEY_UPDATE_SOURCE_MODE, normalized).apply()
+        }
+
+    /** 下载方式这个键是否已经落过盘（用来区分「从未迁移」和「用户主动选了 auto」）。 */
+    val hasUpdateSourceMode: Boolean
+        get() = prefs.contains(KEY_UPDATE_SOURCE_MODE)
+
+    /**
+     * 老配置迁移（2026-09-22）：没有 [KEY_UPDATE_SOURCE_MODE] 的设备一律置为 `auto`，
+     * 由 core 自己按地区决定走不走镜像。
+     *
+     * **刻意不按 `update_mirror_base` 推断**（空→direct / 非空→mirror）：那样会把
+     * 「老 web 上随手清空过前缀」当成用户的长期意图。统一 auto 的代价是——曾经刻意
+     * 设成直连的国内设备迁移后会变成走镜像，所以这里必须打一条日志把原值写出来，
+     * 否则用户会遇到一次无法解释的行为变化。
+     *
+     * 判据是「键是否存在」而不是「值是否等于默认」：后者分不清「没迁移过」和「主动选了 auto」。
+     * 迁移只发生一次——写入后键就存在了。
+     *
+     * @return true 表示本次真的迁移了
+     */
+    fun migrateUpdateSourceModeIfAbsent(): Boolean {
+        if (hasUpdateSourceMode) return false
+        val legacyBase = prefs.getString(KEY_UPDATE_MIRROR_BASE, null)
+        prefs.edit().putString(KEY_UPDATE_SOURCE_MODE, DEFAULT_UPDATE_SOURCE_MODE).apply()
+        AppLogger.i(
+            "AppSettings",
+            "更新下载方式迁移：统一置为 $DEFAULT_UPDATE_SOURCE_MODE（原 update_mirror_base=" +
+                (if (legacyBase == null) "<未设置>" else if (legacyBase.isBlank()) "<空串=直连>" else legacyBase) +
+                "）。国内设备若原先是直连，之后会改走镜像；可在设置里改回直连。"
+        )
+        return true
+    }
 
     // ── 更新状态持久化（2026-08-10 P0-4：RESULT 机制最小版）──
     // pendingUpdate：安装前置位（目标版本）。安装中被杀/断电后，新进程启动时据此恢复状态：
@@ -1313,6 +1392,12 @@ class AppSettings(context: Context) {
         "app_log_enabled" to appLogEnabled,
         "goform_dump_enabled" to goformDumpEnabled,
         "goform_command_enabled" to goformCommandEnabled,
+        // 2026-09-22：本键就是下面那段「漏一个键 = 开关永远显示默认值」的实例 —— KEY 常量、
+        // 读写属性、BACKUP_FIELDS 都齐了，只漏了这一行，于是只有「导入备份」改得动它，
+        // web/app 侧永远读回默认 true。补登记。
+        // 注意它与上面两个排障开关不同：**不热生效**，只在构造组件图时读一次
+        // （ComponentFactory.kt:802，调用点 ComponentFactory.kt:152），改完要重启后台服务。
+        "field_normalization_enabled" to fieldNormalizationEnabled,
         "qos_enabled" to qosEnabled,
         "qos_shell_max_concurrent" to qosShellMaxConcurrent,
         "qos_cache_ttl_ms" to qosCacheTtlMs,
@@ -1328,7 +1413,9 @@ class AppSettings(context: Context) {
         "sms_filter_exempt_verification_code" to smsFilterExemptVerificationCode,
         "sms_filter_store_full_body" to smsFilterStoreFullBody,
         "update_url" to updateUrl,
-        "update_mirror_base" to updateMirrorBase
+        "update_mirror_base" to updateMirrorBase,
+        // 下载方式（2026-09-22）：客户端靠 GET 回读当前值做基线，漏了它 web 的差量提交就永远发不出去
+        "update_source_mode" to updateSourceMode
     )
 
     // ────────────────────────────────────────────────────────────

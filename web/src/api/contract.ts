@@ -715,6 +715,50 @@ export function isWifiMaxStaNumAcceptable(v: number | null | undefined): boolean
   return Number.isInteger(v) && v >= WifiMaxStaNumRange.min && v <= WifiMaxStaNumRange.max;
 }
 
+// ────────────────────────────────────────────────────────────
+// WiFi 频段 —— POST /api/wifi/band
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 频段的**传输取值域**，用设备自己的词汇。
+ *
+ * 设备侧只有一条命令能真的换频段：
+ * `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`（2026-09-22 真机抓包，
+ * chip1 = 2.4G、chip2 = 5G），core 把它包成 `POST /api/wifi/band` 收 `{ chip }`。
+ *
+ * 曾经走的 `POST /api/wifi/config` 的 `chip_index` 落到设备的 `setAccessPointInfo` →
+ * `ChipIndex`，**设备不认这条路**，用户实测「改了没反应」—— 那条映射已经从
+ * [buildWifiConfigPayload] 里摘掉，不要再加回来。
+ *
+ * 只认 `chip1` / `chip2`：**不要**另造 `'1'` / `'2'`（那是读侧展示字段 `chip_index` 的编码）
+ * 或 `'2.4G'` / `'5G'`（那是界面文案）作为传输值，core 侧 profile 的 validate 会直接 400。
+ */
+export const WifiBands = ['chip1', 'chip2'] as const;
+export type WifiBand = (typeof WifiBands)[number];
+
+/** 读不到设备当前频段时的兜底值（设备只有单频段在跑，2.4G 是出厂档）。 */
+export const WIFI_BAND_DEFAULT: WifiBand = 'chip1';
+
+/**
+ * 频段选择器的选项。文案是人话（「2.4 GHz」），value 是设备词汇（`chip1`）——
+ * 界面上看到什么与线上发出去什么在这里一次对齐，免得组件里各写一份字面量。
+ */
+export const WifiBandOptions: ReadonlyArray<{ label: string; value: WifiBand }> = [
+  { label: '2.4 GHz', value: 'chip1' },
+  { label: '5 GHz', value: 'chip2' },
+];
+
+/**
+ * 读侧字段 `chip_index`（`'1'` / `'2'`，由 `normalizeWifiSettings` 从 `wifi_chip` 归一出来，
+ * **只用于展示**）→ 写侧取值域 [WifiBand]。
+ *
+ * 表单要拿「设备当前频段」和用户的选择比对才知道要不要下发，而它手上只有展示字段，
+ * 这个翻译必须有且只有一处：读侧编码一旦改动，跟着改这里就够了。
+ */
+export function wifiBandFromChipIndex(chipIndex: string | null | undefined): WifiBand {
+  return chipIndex === '2' ? 'chip2' : WIFI_BAND_DEFAULT;
+}
+
 /** 表单侧的 WiFi 配置输入，由 [buildWifiConfigPayload] 翻成 `POST /api/wifi/config` 的报文。 */
 export interface WifiConfigFormInput {
   ssid: string;
@@ -725,8 +769,6 @@ export interface WifiConfigFormInput {
   maxStaNum: number | null;
   /** true = **隐藏** SSID，对应 `broadcast_disabled=1` */
   hidden: boolean;
-  /** 写接口的 `chip_index`（`"0"` = chip1/2.4G，`"1"` = chip2/5G）；不传则不下发 */
-  chipIndex?: string;
   /** 设备回读的 `encryp_type`，仅在 authMode 是表外写法时作为透传兜底 */
   fallbackEncrypType?: string;
 }
@@ -748,7 +790,8 @@ export function buildWifiConfigPayload(input: WifiConfigFormInput): Record<strin
     // 语义是「隐藏」：1 = 隐藏（不广播），0 = 广播。别按字面当成「广播开关」。
     broadcast_disabled: input.hidden ? 1 : 0,
   };
-  if (input.chipIndex !== undefined) payload.chip_index = input.chipIndex;
+  // 频段**不在这里**：`chip_index` 走 setAccessPointInfo，设备不认（用户实测「改了没反应」），
+  // 真正换频段要发 `POST /api/wifi/band`，取值域见 [WifiBands]。
   // 留空 / 越界都不下发：core 不传时保持设备现值，比下发一个设备会拒的值安全。
   // 判定复用 [isWifiMaxStaNumAcceptable]（它对 null 返回 true，所以还要排掉 null）——
   // 在这里另写一遍区间比较，两处迟早会漂移（原来这里写的是 `> 0`，与守门条件各说各话）。

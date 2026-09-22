@@ -472,6 +472,9 @@ data class CoreCrashNotice(
  *   旧版本 core 缺某个端点就会让页面顶部常驻一条红条。
  * - [fieldCoverageRequested] 记住用户是否点过「检测字段覆盖率」：那条路径会逐分组向设备发查询
  *   （最多 10 组），绝不能随页面刷新自动带上。
+ *
+ * 唯一的**可写**项是字段归一化开关那几个字段（2026-09-22）—— 它与覆盖率卡是同一个排障场景
+ * （覆盖率看归一化后的结果，开关关掉归一化去比对设备原始字段），所以放进同一份状态。
  */
 data class DiagnoseState(
     val diagnose: DiagnoseResponse? = null,
@@ -482,6 +485,25 @@ data class DiagnoseState(
     val isLoading: Boolean = false,
     val isBusy: Boolean = false,
     val fieldCoverageRequested: Boolean = false,
+    /**
+     * `field_normalization_enabled` 的**配置值**（`GET /api/config` 回来的那一个）。
+     *
+     * `null` 的两种来源都必须让 UI 把开关**禁用**：还没读到，或 core 的响应里根本没这个键
+     * （2026-09-22 之前的 core 没把它登记进 `AppSettings.toMap()`）。两者靠
+     * [fieldNormalizationRead] 区分。**绝不能 `?: true` 冒充默认值** —— 那正是本仓禁止的假开关：
+     * 开关能拖，但那台 core 收不到、也不返回这个键。
+     *
+     * 它也**不等于运行时的实际闸门**：core 只在构造组件图时读一次，所以从改完到重启之间，
+     * 这个值与 `diagnose.device_profile.normalization_enabled`（运行时实际值）会不一致，
+     * UI 要把这层差异显式说出来。
+     */
+    val fieldNormalizationEnabled: Boolean? = null,
+    /** 是否**成功读过一次** `GET /api/config`（用来区分「还没读到」与「读到了但没这个键」）。 */
+    val fieldNormalizationRead: Boolean = false,
+    /** 正在 PUT：期间禁用开关，防连点产生互相覆盖的并发请求（同 [LogSwitchState.isSaving] 口径）。 */
+    val fieldNormalizationSaving: Boolean = false,
+    /** 归一化开关回读/下发失败的原因，由 UI 弹一次 toast 后清掉；与下面的 [errorMessage] 分开。 */
+    val fieldNormalizationError: String? = null,
     val errorMessage: String? = null
 )
 

@@ -3744,11 +3744,36 @@ WiFi 开关。
 
 **响应：** `{ "success": true, "enabled": true }`
 
-> ⚠ **`enabled: true` 会把 WiFi 开在 2.4G 上。** 设备侧「开 WiFi」与「切频段」是同一条命令
-> （`switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`，2026-09-22 真机抓包），而本端点只收一个布尔、
-> 不收频段，core 侧因此走缺省频段 `chip1` —— 设备原本在 5G 时，开一次 WiFi 就会被切到 2.4G。
-> 「关」走的是另一条命令（`switchWiFiModule&SwitchOption=0`），不受影响。
-> **目前没有独立的切频段端点**：profile 侧已有 `SettingKey.WIFI_BAND`，但客户端与 route 尚未接线。
+> ⚠ **`enabled: true` 会开在「设备当前的频段」上，不是固定 2.4G。** 设备侧「开 WiFi」与「切频段」
+> 是同一条命令（`switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`，2026-09-22 真机抓包），
+> 本端点只收一个布尔，core 会先回读 `wifi_chip` 再下发；**读不到或读到域外值才退回 `chip1`**
+> （此时日志有一条 WARN，表现是 5G 下开 WiFi 被切到 2.4G）。
+> 「关」走的是另一条命令（`switchWiFiModule&SwitchOption=0`），不读频段、不受影响。
+> 要显式指定频段用下面的 `POST /api/wifi/band`。
+
+#### `POST /api/wifi/band`
+
+切换 WiFi 频段。
+
+**请求体：**
+
+```json
+{ "chip": "chip2" }
+```
+
+`chip` 只接受 `"chip1"`（2.4 GHz）/ `"chip2"`（5 GHz），**大小写敏感**；
+不接受 `"2.4G"` / `"5G"` / `"0"` / `"1"` 这类界面词汇或读侧编码。
+取值域判定在 `SettingKey.WIFI_BAND` 的 `validate` 里，非法值回 `400` 并带原因。
+
+**响应：** `{ "success": true }`
+
+> ⚠ **这条命令同时会把 WiFi 打开**（与 `POST /api/wifi/enable` 的「开」是同一条设备命令），
+> 并且会**重启设备的 WiFi 模块** —— 正通过 WiFi 连接的客户端（包括发起请求的那一台）会断开。
+> 客户端**必须**在调用前让用户确认并说明后果。
+>
+> 不要用 `POST /api/wifi/config` 的 `chip_index` 切频段：那个参数落到设备的
+> `setAccessPointInfo` → `ChipIndex`，**实测无效**（这是「WiFi 频段修改无效」的根因）。
+> 写侧已不再发它；读侧看当前频段用 `GET /api/wifi/settings` 的 `wifi_chip`。
 
 #### `POST /api/wifi/ssid`
 
@@ -3798,6 +3823,10 @@ WiFi 开关。
   "chip_index": "chip1"
 }
 ```
+
+> ⚠ **`chip_index` 切不了频段，别再发它。** 它落到设备的 `setAccessPointInfo` → `ChipIndex`，
+> 实测无效（这就是「WiFi 频段修改无效」的根因）。core 仍然接受这个参数（老客户端兼容，
+> 不传就走设备现值），但 web / app 写侧已经不发了。要切频段用 `POST /api/wifi/band`。
 
 所有字段可选。**值域是设备事实，不合法的值在下发前就被拒**（`400 OUT_OF_RANGE` + 中文原因，
 请求根本没发到设备）：
@@ -7648,6 +7677,7 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 - `POST /api/wifi/adv-config`、`POST /api/wifi/guest`
   - 信道/模式/国家码、访客网络均无后端能力。
 - `POST /api/wifi/chip`
-  - 没有独立的切芯片端点；用 `/api/wifi/config`（POST）的 `chip_index`（`"chip1"` / `"chip2"`）。
+  - 没有这个路径名。切频段的能力已经有了，见「WiFi 控制」一节的频段端点（2026-09-22 起）。
+    **不要**用 `/api/wifi/config` 的 `chip_index` —— 那个参数实测切不了频段。
 
 **约束：** 新增端点必须先落到 `core/`，再更新本手册与客户端；`scripts/verify-api-contract.mjs` 的 P0 列表必须为空。

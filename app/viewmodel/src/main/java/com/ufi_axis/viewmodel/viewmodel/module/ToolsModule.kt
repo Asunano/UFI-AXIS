@@ -445,21 +445,37 @@ class ToolsModule(
     }
 
     /**
-     * 同步更新源/镜像前缀到设备端 Core（2026-08-12：config PUT update_url + update_mirror_base）。
-     * @param updateUrl 后端版本清单 URL（前端写 ToolsModule.RAW_VERSION_URL）
-     * @param mirrorBase 镜像前缀；空串 = 直连（Core UpdateManager 据此决定是否拼前缀）
-     * @param onResult 设备在线且写入成功 → true；网络失败/设备未连接 → false
+     * 同步「下载方式」到设备端 core（2026-09-22：core 成为唯一决策方）。
+     *
+     * 只发 `update_source_mode`。**老 core 兼容**：它不认这个键，`updated_fields` 里不会有它，
+     * 此时回退成老口径（写 `update_mirror_base`：direct → 空串，其余 → 第一个内置前缀）。
+     * 不做这层回退，用户升级 app 后设备会静默失去镜像、且查不出原因。
+     *
+     * @param mode `auto` / `mirror` / `direct`
+     * @param onResult 设备在线且写入成功（含回退成功）→ true；网络失败/设备未连接 → false
      */
-    fun syncUpdateSourceToDevice(updateUrl: String, mirrorBase: String, onResult: (Boolean) -> Unit = {}) {
+    fun syncUpdateModeToDevice(mode: String, onResult: (Boolean) -> Unit = {}) {
         scope.launch {
+            val newKeyAccepted = runCatching {
+                api.updateUpdateSource(mapOf("update_source_mode" to mode))
+            }.fold(
+                onSuccess = { it.updated_fields.contains("update_source_mode") },
+                onFailure = { e ->
+                    DebugLog.w("Tools", "同步下载方式到设备失败: ${e.message}")
+                    onResult(false)
+                    return@launch
+                }
+            )
+            if (newKeyAccepted) {
+                onResult(true)
+                return@launch
+            }
+            val legacyBase = if (mode == UpdateSource.MODE_DIRECT) "" else UpdateSource.MIRROR_PREFIXES.first()
             runCatching {
-                api.updateUpdateSource(mapOf(
-                    "update_url" to updateUrl,
-                    "update_mirror_base" to mirrorBase
-                ))
+                api.updateUpdateSource(mapOf("update_mirror_base" to legacyBase))
             }.onSuccess { onResult(true) }
                 .onFailure { e ->
-                    DebugLog.w("Tools", "同步更新源到设备失败: ${e.message}")
+                    DebugLog.w("Tools", "老 core 回退写 update_mirror_base 失败: ${e.message}")
                     onResult(false)
                 }
         }
@@ -723,6 +739,100 @@ class ToolsModule(
         }
     }
 
+    // ══════════════ 字段归一化排障开关（2026-09-22） ══════════════
+    // 归属这一节而不是「日志开关」那一节：它与上面的字段覆盖率诊断是**同一个排障场景** ——
+    // 覆盖率卡看的是归一化后的命中情况，这个开关关掉归一化去比对设备原始字段。
+    //
+    // 走的路与日志四层开关（见 pushLogSwitches）逐步相同：
+    //   1. GET /api/config 回读真值 → 镜像（读不到就是 null，UI 据此禁用开关，不拿默认值冒充）；
+    //   2. PUT 单键 → 校验 updated_fields 真的含它（core 的 boolField 会把非法值放进
+    //      rejected_fields 但仍回 success:true，只看 HTTP 200 会把「被拒」当成「成功」）；
+    //   3. 成功才更新镜像；失败镜像不动（开关自然停回旧位置）+ 原因抛给 UI。
+    //
+    // 与日志开关的两点差异，都刻意为之：
+    // - **不落 AppPreferences**：这是 core 侧的排障开关，app 自己没有任何闸门读它，
+    //   多存一份本地缓存只会多一个可能与 core 分叉的副本；
+    // - **不热生效**：core 只在构造组件图时读一次（`ComponentFactory.resolveDeviceProfile()`），
+    //   PUT 成功只代表「配置已改」，真正生效要重启后台服务。而 PUT 响应的 `needs_restart`
+    //   **不含**这个键（那份清单只覆盖认证/端口），客户端不能靠它提示 —— 提示写死在 UI 里。
+
+    /** `GET/PUT /api/config` 里这一项的键名；回读与下发、以及校验 `updated_fields` 都用它。 */
+    private val FIELD_NORMALIZATION_KEY = "field_normalization_enabled"
+
+    /**
+     * 回读字段归一化开关（进诊断页 / 点右上角刷新时调用）。
+     *
+     * 失败只写 [DiagnoseState.fieldNormalizationError]（UI 弹一次 toast），
+     * 不动已有的镜像值 —— 连不上设备时把开关改掉毫无道理。
+     */
+    fun loadFieldNormalizationSwitch() {
+        scope.launch {
+            val cfg = try {
+                api.getConfig()
+            } catch (e: Exception) {
+                DebugLog.w("Tools", "回读字段归一化开关失败: ${e.message}")
+                _diagnoseState.value = _diagnoseState.value.copy(
+                    fieldNormalizationError = "读取字段归一化开关失败：${e.message}"
+                )
+                return@launch
+            }
+            // 有 PUT 在飞时丢弃这份回读：它是**下发之前**的快照，写进镜像会把开关弹回旧位置，
+            // 看起来就像"我刚拖的开关自己跳回去了"。PUT 自己会在成功/失败后更新镜像。
+            // （刷新按钮与下发可以同时发生 —— 刷新按钮只受 isLoading 约束。）
+            if (_diagnoseState.value.fieldNormalizationSaving) return@launch
+            // 直接取可空值、**不做 `?: 上一次的值`**：core 没返回这个键（老版本）就必须如实记成
+            // null 让 UI 禁用开关；沿用上一次的值会让换一台设备连过去时显示前一台的状态。
+            _diagnoseState.value = _diagnoseState.value.copy(
+                fieldNormalizationEnabled = cfg.field_normalization_enabled,
+                fieldNormalizationRead = true,
+                fieldNormalizationError = null
+            )
+        }
+    }
+
+    /**
+     * 下发字段归一化开关（`PUT /api/config` 单键）。
+     *
+     * **只改配置、不改运行时行为**：调用方（UI）必须同时告诉用户「需重启后台服务生效」。
+     */
+    fun setFieldNormalizationEnabled(enabled: Boolean) {
+        val current = _diagnoseState.value
+        // 还没读到真值（老 core 不返回这个键 / 连不上设备）时一律不写：那会把 app 的默认想象
+        // 当成用户意图发出去。UI 已经把开关禁用了，这里是第二道闸 —— 闸门只写在 UI 上，
+        // 换个调用点就绕过去了。isSaving 期间忽略新点击，理由同 pushLogSwitches。
+        if (current.fieldNormalizationEnabled == null || current.fieldNormalizationSaving) return
+        _diagnoseState.value = current.copy(
+            fieldNormalizationSaving = true,
+            fieldNormalizationError = null
+        )
+        scope.launch {
+            try {
+                val resp = api.updateConfig(mapOf(FIELD_NORMALIZATION_KEY to enabled))
+                if (FIELD_NORMALIZATION_KEY !in resp.updated_fields) {
+                    val rejected = resp.rejected_fields
+                        .firstOrNull { it.field == FIELD_NORMALIZATION_KEY }?.describe()
+                    error(rejected ?: "设备未接受该设置（$FIELD_NORMALIZATION_KEY）")
+                }
+                _diagnoseState.value = _diagnoseState.value.copy(
+                    fieldNormalizationEnabled = enabled,
+                    fieldNormalizationSaving = false,
+                    fieldNormalizationError = null
+                )
+            } catch (e: Exception) {
+                DebugLog.w("Tools", "下发字段归一化开关失败: ${e.message}")
+                _diagnoseState.value = _diagnoseState.value.copy(
+                    fieldNormalizationSaving = false,
+                    fieldNormalizationError = "设置未生效（设备未收到）：${e.message}"
+                )
+            }
+        }
+    }
+
+    /** 用户已看到错误提示后清掉，避免每次重组都再弹一次（同 [clearLogSwitchError]）。 */
+    fun clearFieldNormalizationError() {
+        _diagnoseState.value = _diagnoseState.value.copy(fieldNormalizationError = null)
+    }
+
     /**
      * 清空 core 的全部响应缓存。
      *
@@ -791,6 +901,17 @@ class ToolsModule(
 
     private fun emitNetworkError(msg: String?) {
         _events.tryEmit(UiEvent.ShowNetworkError(msg))
+    }
+
+    /**
+     * 写操作成功提示（2026-09-22）。走跨模块事件 → `MainViewModel.writeNotice` →
+     * Activity 级 Toast 宿主，与失败提示同一个出口（同 `NetworkModule.emitWriteNotice`）。
+     *
+     * 文案要说清**是哪一项**生效了：tools 域一个页面上往往有十几个开关，
+     * 「保存成功」这种泛化文案让用户分不清落地的是哪个。
+     */
+    private fun emitWriteNotice(message: String, subtitle: String? = null) {
+        _events.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
     }
 
     /**
@@ -2120,7 +2241,8 @@ class ToolsModule(
             // 因为它们不是开关、写错了不会产生持续的副作用（日志会一直写盘）。
             applyLogSwitchesFromCore(safeCfg)
             prefs.goformPort = safeCfg.goform_port
-            prefs.updateMirrorCustom = safeCfg.update_mirror_base
+            // core 是下载方式的真源；空串 = 老 core 没这个字段，此时保持本地缓存不动
+            safeCfg.update_source_mode.takeIf { it.isNotBlank() }?.let { prefs.updateSourceMode = it }
             prefs.goformPasswordSet = safeCfg.goform_password.isNotBlank()
         }
     }
@@ -2210,25 +2332,42 @@ class ToolsModule(
      * 下发通知配置改动（字段级 patch），并以服务端回显为准落地。
      *
      * 只传改动的键：core 做字段级合并，整体回传会把别端刚改的项用本地值覆盖掉。
-     * 失败写 `DebugLog.w` 而不弹 UI —— 但必须留痕，否则本地已改、真源未改，
-     * 下次回读又变回去，用户只会看到「我改的设置自己弹回来了」。
+     *
+     * ## 2026-09-22：失败不再只打日志（阶段 3.4）
+     * 原来失败只 `DebugLog.w`，于是「告警设置 → 套餐限额 / 设备接入 / 设备离开」这三项的
+     * 二级取数闸门（`traffic_80_enabled` / `device_events_enabled`）是**完全静默**的：
+     * 本地 prefs 已改、core 没改，下次回读又弹回去。现在失败写 `toolsState.errorMessage`
+     *（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast），并**回读 core 真值**把本地
+     * 镜像拉回去（§4.11）——`applyRemote` 会重写 prefs，跟着 prefs 的 UI 自己就回到真值。
+     *
+     * **不要**把失败写进 `alertsState.errorMessage`：那个字段的唯一消费点
+     *（`AlertSettingsScreen`）固定把它包装成「无法读取设备上的告警配置…」，
+     * 保存失败写进去会显示成"读不到"，属于误导（§4.12）。
+     *
+     * @param successNotice 非 null 时，成功后发一条全局成功提示。
+     *   **默认 null 是刻意的**：本方法有 6 个调用页，其中邮件 / Webhook / 本机短信 /
+     *   通知与守护那几页已各自有完整的双向反馈，无条件发 notice 会让它们一次保存弹两条。
+     *   只有原本静默的入口（告警二级闸门）才传它。
      */
     fun updateNotificationConfig(
         patch: Map<String, Any>,
-        guard: com.ufi_axis.data.notification.GuardScheduler? = null
+        guard: com.ufi_axis.data.notification.GuardScheduler? = null,
+        successNotice: String? = null
     ) {
         if (patch.isEmpty()) return
         scope.launch {
             val result = runCatching { api.updateNotificationConfig(patch) }
             val echoed = result.getOrNull()?.takeIf { it.success }?.config
             if (echoed == null) {
-                DebugLog.w(
-                    "NotifyConfig",
-                    "通知配置下发失败，本地已改但 core 未更新: ${result.exceptionOrNull()?.message}"
-                )
+                val reason = result.exceptionOrNull()?.message ?: "设备未接受这次修改"
+                DebugLog.w("NotifyConfig", "通知配置下发失败，本地已改但 core 未更新: $reason")
+                _toolsState.update { it.copy(errorMessage = "通知设置保存失败：$reason") }
+                // 本地 prefs 已经被乐观地改过了，回读 core 真值把它盖回去
+                refreshNotificationConfig(guard)
                 return@launch
             }
             com.ufi_axis.data.notification.NotificationConfigSync.applyRemote(appContext, echoed, guard)
+            successNotice?.let { emitWriteNotice(it) }
         }
     }
 
@@ -3189,10 +3328,12 @@ class ToolsModule(
     private fun pushLogSwitch(
         field: String,
         value: Boolean,
+        successNotice: String,
         applyLocal: (AppPreferences, Boolean) -> Unit,
         mirror: (LogSwitchState, Boolean) -> LogSwitchState
     ) = pushLogSwitches(
         fields = mapOf(field to value),
+        successNotice = successNotice,
         applyLocal = { prefs -> applyLocal(prefs, value) },
         mirror = { s -> mirror(s, value) }
     )
@@ -3202,9 +3343,14 @@ class ToolsModule(
      *
      * 需要它是因为「打开总开关时连带打开详细」不能拆成两次调用 —— [isSaving] 会把第二次直接吞掉。
      * 只要有任一字段未被 core 采纳就整体算失败，不做部分成功（本地与 core 半同步比整体失败更难查）。
+     *
+     * 2026-09-22：补 [successNotice]。这四个开关原来只有失败提示（`LogSwitchState.errorMessage`
+     * 由日志页消费），成功是静默的 —— 而它们改的是**设备侧**行为，界面上除了开关本身没有
+     * 任何变化可看，用户无法确认 core 到底收下了没有。
      */
     private fun pushLogSwitches(
         fields: Map<String, Boolean>,
+        successNotice: String,
         applyLocal: (AppPreferences) -> Unit,
         mirror: (LogSwitchState) -> LogSwitchState
     ) {
@@ -3221,6 +3367,7 @@ class ToolsModule(
                 applyLocal(AppPreferences(appContext))
                 _logSwitchState.value = mirror(_logSwitchState.value)
                     .copy(loaded = true, isSaving = false, errorMessage = null)
+                emitWriteNotice(successNotice)
             } catch (e: Exception) {
                 DebugLog.w("Tools", "下发日志开关 $fields 失败: ${e.message}")
                 _logSwitchState.value = _logSwitchState.value.copy(
@@ -3247,6 +3394,12 @@ class ToolsModule(
                 put("log_enabled", enabled)
                 if (alsoVerbose) put("debug_mode", true)
             },
+            // 连带打开了详细就要说出来，否则用户下次看到"详细"是开的会以为自己记错了
+            successNotice = when {
+                !enabled -> "日志记录已关闭"
+                alsoVerbose -> "日志记录已开启（含详细级别）"
+                else -> "日志记录已开启"
+            },
             applyLocal = { prefs ->
                 prefs.logEnabled = enabled
                 if (alsoVerbose) prefs.debugMode = true
@@ -3263,6 +3416,7 @@ class ToolsModule(
     fun syncAppLogEnabled(enabled: Boolean) = pushLogSwitch(
         field = "app_log_enabled",
         value = enabled,
+        successNotice = if (enabled) "App 日志已开启" else "App 日志已关闭",
         applyLocal = { prefs, v ->
             prefs.appLogEnabled = v
             if (!v) AppLogBuffer.clear()
@@ -3274,6 +3428,7 @@ class ToolsModule(
     fun syncCoreLogEnabled(enabled: Boolean) = pushLogSwitch(
         field = "core_log_enabled",
         value = enabled,
+        successNotice = if (enabled) "Core 日志已开启" else "Core 日志已关闭",
         applyLocal = { prefs, v -> prefs.coreLogEnabled = v },
         mirror = { s, v -> s.copy(coreLogEnabled = v) }
     )
@@ -3282,6 +3437,7 @@ class ToolsModule(
     fun syncDebugMode(enabled: Boolean) = pushLogSwitch(
         field = "debug_mode",
         value = enabled,
+        successNotice = if (enabled) "详细级别已开启" else "详细级别已关闭",
         applyLocal = { prefs, v -> prefs.debugMode = v },
         mirror = { s, v -> s.copy(debugMode = v) }
     )
@@ -3566,9 +3722,20 @@ class ToolsModule(
      *
      * [password] 为 null/空白时**不发送该字段** —— core 的 `PUT /api/config` 对缺失键是
      * `?: return` 跳过，所以不传就等于「保持 core 现有密码不变」。这样本地就不需要留明文副本。
+     *
+     * ## 2026-09-22：改成等结果并返回（阶段 3.2）
+     * 原来是 fire-and-forget、失败只 `DebugLog.w`，而调用方（`ServerConfigScreen` 的
+     * 「设备后台」弹窗）在调用完就关窗 + 弹绿色「设备后台配置已保存」—— 典型的假成功：
+     * core 没起来、地址被拒，界面照样说保存好了。
+     *
+     * `rejected_fields` 命中我们这次发的键也算失败：core 会返回 `success:true` 但把该字段
+     * 放进 `rejected_fields`（口径同 [pushLogSwitches] 的 `updated_fields` 校验），
+     * 只看 HTTP 200 就是把"被拒"读成"成功"。
+     *
+     * @return true = core 已收下这份配置。调用方据此决定关不关弹窗。
      */
-    fun syncGatewayConfig(ip: String, port: Int = 8080, password: String? = null) {
-        scope.launch {
+    suspend fun syncGatewayConfig(ip: String, port: Int = 8080, password: String? = null): Boolean =
+        scope.async {
             try {
                 DebugLog.d("Config", "syncing goform: ip=$ip port=$port pw=${if (password.isNullOrBlank()) "(unchanged)" else "(new)"}")
                 val body = buildMap<String, Any> {
@@ -3577,17 +3744,24 @@ class ToolsModule(
                     if (!password.isNullOrBlank()) put("goform_password", password)
                 }
                 val res = api.updateConfig(body)
-                // C03：core 不再静默丢弃被拒字段，落日志便于定位"看着保存成功但没生效"
-                if (res.rejected_fields.isNotEmpty()) {
-                    DebugLog.w("Config", "goform 配置部分未生效: " +
-                        res.rejected_fields.joinToString("; ") { it.describe() })
+                val rejected = res.rejected_fields.filter { it.field in body.keys }
+                if (rejected.isNotEmpty()) {
+                    val reason = rejected.joinToString("; ") { it.describe() }
+                    DebugLog.w("Config", "goform 配置部分未生效: $reason")
+                    _toolsState.update { it.copy(errorMessage = "设备后台地址保存失败：$reason") }
+                    return@async false
                 }
-                if (!password.isNullOrBlank() && res.rejected_fields.none { it.field == "goform_password" }) {
+                if (!password.isNullOrBlank()) {
                     AppPreferences(appContext).goformPasswordSet = true
                 }
-            } catch (e: Exception) { DebugLog.w("Config", "syncGatewayConfig failed", e) }
-        }
-    }
+                emitWriteNotice("设备后台地址已保存", subtitle = "$ip:$port")
+                true
+            } catch (e: Exception) {
+                DebugLog.w("Config", "syncGatewayConfig failed", e)
+                _toolsState.update { it.copy(errorMessage = "设备后台地址保存失败：${e.message}") }
+                false
+            }
+        }.await()
 
     /** 清空指定 Tab 的控制台对话（"at" 或 "shell"）。历史在 core，两端同时生效。 */
     fun clearConsole(tab: String) {

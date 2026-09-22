@@ -24,9 +24,11 @@
         />
       </n-form-item>
       <n-form-item label="频段">
-        <n-radio-group v-model:value="wifiForm.chip_index">
-          <n-radio value="1">2.4 GHz</n-radio>
-          <n-radio value="2">5 GHz</n-radio>
+        <!-- 选项（含要发出去的 chip1/chip2）来自 contract.WifiBandOptions：
+             界面写「2.4 GHz」，线上发的必须是设备词汇 chip1/chip2。
+             频段是独立动作：走 POST /api/wifi/band，会重启 WiFi 模块，所以保存时单独确认（见 saveWifi） -->
+        <n-radio-group v-model:value="wifiForm.band">
+          <n-radio v-for="opt in WifiBandOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</n-radio>
         </n-radio-group>
       </n-form-item>
       <n-form-item label="隐藏 SSID">
@@ -43,16 +45,19 @@
 
 <script setup lang="ts">
 import { reactive, ref, computed, watch } from 'vue';
-import { useMessage } from 'naive-ui';
+import { useDialog, useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import {
   WIFI_AUTH_MODE_DEFAULT,
+  WifiBandOptions,
   WifiMaxStaNumRange,
   buildWifiConfigPayload,
   isWifiMaxStaNumAcceptable,
+  wifiBandFromChipIndex,
   wifiSecurityNeedsPassphrase,
   wifiSecurityOptions,
 } from '@/api/contract';
+import type { WifiBand } from '@/api/contract';
 import type { WifiSettings } from '@/types';
 
 const props = defineProps<{ show: boolean; wifiSettings: WifiSettings | null }>();
@@ -64,6 +69,7 @@ const show = computed({
 });
 
 const message = useMessage();
+const dialog = useDialog();
 const api = getApiClient();
 
 const wifiForm = reactive({
@@ -72,7 +78,8 @@ const wifiForm = reactive({
   auth_mode: WIFI_AUTH_MODE_DEFAULT,
   /** null = 留空，语义是「不修改」 */
   maxStaNum: null as number | null,
-  chip_index: '1',
+  /** 设备词汇：chip1 = 2.4G、chip2 = 5G。要发出去的就是这个值（见 contract.WifiBands） */
+  band: 'chip1' as WifiBand,
   broadcastHidden: false,
 });
 const wifiSaving = ref(false);
@@ -81,6 +88,12 @@ const wifiSaving = ref(false);
 // 设备回读的写法不在表里时由 wifiSecurityOptions 置顶并入，避免 select 空白 / 顺手改坏
 const authModeOptions = computed(() => wifiSecurityOptions(props.wifiSettings?.auth_mode));
 const needsPassphrase = computed(() => wifiSecurityNeedsPassphrase(wifiForm.auth_mode));
+
+/**
+ * 设备当前频段。读侧只有展示字段 `chip_index`（'1'/'2'），翻成写侧取值域由 contract 负责。
+ * 「有没有变」按**设备现值**判，不按打开弹窗那一刻的快照：期间被回读刷新过也不会误发。
+ */
+const currentBand = computed(() => wifiBandFromChipIndex(props.wifiSettings?.chip_index));
 
 // 打开弹窗时按当前设备配置回填表单
 watch(
@@ -93,7 +106,7 @@ watch(
     wifiForm.auth_mode = s?.auth_mode || WIFI_AUTH_MODE_DEFAULT;
     // 0 / NaN 都当「读不到」处理：填 0 进去会在保存时下发一个不合法的最大连接数
     wifiForm.maxStaNum = Number(s?.max_sta_num) > 0 ? Number(s?.max_sta_num) : null;
-    wifiForm.chip_index = s?.chip_index || '1';
+    wifiForm.band = currentBand.value;
     wifiForm.broadcastHidden = s?.broadcast_disabled === 1;
   },
   { immediate: true }
@@ -107,11 +120,36 @@ async function saveWifi() {
     );
     return;
   }
+  // 频段没动就直接保存：切频段会踢掉所有 WiFi 客户端，不能每次保存 SSID 都顺带来一次
+  if (wifiForm.band === currentBand.value) {
+    await submit(false);
+    return;
+  }
+  const label = WifiBandOptions.find((o) => o.value === wifiForm.band)?.label ?? wifiForm.band;
+  dialog.warning({
+    title: '切换 WiFi 频段',
+    content:
+      `将把 WiFi 切换到 ${label}。这条命令会重启设备的 WiFi 模块并在该频段上打开 WiFi，` +
+      '当前通过 WiFi 连接的设备（包括你自己）会短暂断开，需要重新连接。' +
+      '其余改动（SSID / 密码等）会在切换前一起保存。',
+    positiveText: '切换并保存',
+    negativeText: '暂不执行',
+    onPositiveClick: () => submit(true),
+    // 「暂不执行」= 一个字段都不发。半套下发（存了 SSID 却没换频段）会让弹窗上的频段
+    // 显示成一个设备并不在用的值 —— 那就是假开关。
+    onNegativeClick: () => message.info('已取消，本次没有修改任何设置'),
+  });
+}
+
+/**
+ * 真正下发。顺序是先 `/api/wifi/config` 再 `/api/wifi/band`：
+ * 换频段会重启 WiFi 模块并顶掉连接，把它放最后，SSID/密码这些才有机会先落到设备上。
+ */
+async function submit(switchBand: boolean) {
   wifiSaving.value = true;
   try {
     // 报文由 buildWifiConfigPayload 统一拼（passphrase 的 OPEN 特例、encryp_type 的
     // 配对/透传、broadcast_disabled 的方向都在那里，两个 WiFi 表单共用同一份规则）。
-    // chip_index 在写接口里是 "0"/"1"（chip1=2.4G → "0"，chip2=5G → "1"）
     await api.post(
       '/api/wifi/config',
       buildWifiConfigPayload({
@@ -120,17 +158,23 @@ async function saveWifi() {
         passphrase: wifiForm.password,
         maxStaNum: wifiForm.maxStaNum,
         hidden: wifiForm.broadcastHidden,
-        chipIndex: wifiForm.chip_index === '2' ? '1' : '0',
         fallbackEncrypType: props.wifiSettings?.encryp_type,
       })
     );
-    message.success('WiFi 设置已保存');
+    if (switchBand) {
+      // 取值域非法时 core 回 400 + 原因，直接把原因显示出来，别压成一句「保存失败」
+      await api.post('/api/wifi/band', { chip: wifiForm.band });
+      message.success('WiFi 设置已保存，正在切换频段（WiFi 会重启）');
+    } else {
+      message.success('WiFi 设置已保存');
+    }
     show.value = false;
     // 设备写入到查询接口可见有延迟，二维码按当前 SSID/密码实时生成，配置一改旧图就是错的：
-    // 由父组件在 saved 事件里统一回读设置 + 丢弃旧二维码缓存并视情况重拉
+    // 由父组件在 saved 事件里统一回读设置（新频段、以及「WiFi 被打开」这个副作用都靠这次回读
+    // 反映到界面）+ 丢弃旧二维码缓存并视情况重拉
     emit('saved');
-  } catch {
-    message.error('保存失败');
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '保存失败');
   } finally {
     wifiSaving.value = false;
   }

@@ -44,6 +44,7 @@ import {
   NetworkModeSwitchProbe,
   modeProbeIntervalMs,
   shouldKeepProbingMode,
+  wifiBandFromChipIndex,
 } from '@/api/contract';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
 
@@ -520,7 +521,7 @@ export function useNetworkControls() {
     qrError.value = '';
     qrLoading.value = true;
     try {
-      const chip = wifiSettings.value?.chip_index === '2' ? 'chip2' : 'chip1';
+      const chip = wifiBandFromChipIndex(wifiSettings.value?.chip_index);
       const { data } = await api.get('/api/wifi/qrcode', {
         params: { chip, ssid_index: 1 },
         responseType: 'blob',

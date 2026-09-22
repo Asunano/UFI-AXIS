@@ -11,6 +11,7 @@ import io.ktor.server.application.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 
 class WifiRoutes(
@@ -70,10 +71,13 @@ class WifiRoutes(
                 val maxStaNum = p["max_sta_num"]?.jsonPrimitive?.intOrNull
                 val broadcastDisabled = p["broadcast_disabled"]?.jsonPrimitive?.intOrNull
                 val chipIndex = p["chip_index"]?.jsonPrimitive?.contentOrNull
-                val success = wifiClient.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                val outcome = wifiClient.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                // 设备拒绝（密码位数 / 加密组合非法这类）回 400 + 原因，与 /sleep、/acl/* 同口径。
+                // 原来这里把三态压成 Boolean 再一律回 500，客户端只能显示一句 HTTP 500。
+                if (call.respondRejected(outcome)) return@post
+                val success = outcome.ok
                 if (success) dataHub?.invalidateWifi()
-                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success)))
+                call.respondWifiConfigResult(success)
             }
 
             // WiFi 发射功率
@@ -144,6 +148,26 @@ class WifiRoutes(
                 if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "time" to time)))
+            }
+
+            // WiFi 频段切换（chip1 = 2.4G / chip2 = 5G）。
+            //
+            // 设备侧这条命令（switchWiFiChip&ChipEnum=X&GuestEnable=0）等于「在该频段上启用
+            // WiFi」—— 与「打开 WiFi」是同一条命令，会重启 WiFi 模块，**正连着 WiFi 的客户端
+            // 会掉线**。要不要先跟用户确认是 UI 侧的事，这里不加确认语义。
+            //
+            // 取值域判断只有一份：SettingKey.WIFI_BAND 的 validate（只收 chip1 / chip2，
+            // 不收 2.4G / 5G / 0 / 1）。所以缺参数也照样往下传 —— 空串过不了 validate，
+            // 由 respondRejected 回 400 + 原因，与 /config、/sleep、/acl/* 同口径。
+            post("/band") {
+                val p = call.receiveJsonObject()
+                val chip = p["chip"]?.jsonPrimitive?.contentOrNull ?: ""
+                val outcome = wifiClient.setWifiBand(chip)
+                if (call.respondRejected(outcome)) return@post
+                val success = outcome.ok
+                if (success) dataHub?.invalidateWifi()
+                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
+                    toJsonElement(mapOf("success" to success)))
             }
 
             get("/clients") {
@@ -238,6 +262,40 @@ class WifiRoutes(
     private suspend fun ApplicationCall.respondAclResult(success: Boolean) {
         val latest = if (success) wifiClient.getAccessControlList() else null
         val body = (latest?.toResponseMap() ?: emptyMap()) + mapOf("success" to success)
+        respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError, toJsonElement(body))
+    }
+
+    /**
+     * 写完立刻回读，返回**设备的真实 WiFi 配置**而不是我们以为写进去的那份（同 [respondAclResult]）。
+     *
+     * 字段名与 `GET /api/wifi/settings` 是同一套（两边都是
+     * [com.ufi_axis_core.controller.goform.GoformWifiClient.getWifiSettingsMerged] 的归一化结果），
+     * 所以客户端可以直接拿这份响应刷新界面，少一个来回。
+     *
+     * 刻意**绕开 dataHub**：`dataHub.getWifiSettingsMerged()` 会把结果写进 30s 缓存，而此刻设备
+     * 可能还没应用完新配置 —— 把这份"读回来还是旧值"的结果缓存起来，客户端随后的回读会在
+     * 整个 TTL 内一直拿到旧值（表现就是"保存成功但界面还是旧 SSID"）。这里只用它填响应体，
+     * 上面刚 `invalidateWifi()` 清掉的缓存保持失效状态。
+     *
+     * 回读本身失败不影响写结果：写已经成功了，这时把整个请求变成 500 是谎报。
+     */
+    private suspend fun ApplicationCall.respondWifiConfigResult(success: Boolean) {
+        val latest = if (success) {
+            try {
+                wifiClient.getWifiSettingsMerged()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                AppLogger.w("WifiRoutes", "WiFi 配置写入成功但回读失败：${e.message}")
+                null
+            }
+        } else {
+            null
+        }
+        val body = buildJsonObject {
+            latest?.forEach { (k, v) -> put(k, v) }
+            put("success", success)
+        }
         respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError, toJsonElement(body))
     }
 }

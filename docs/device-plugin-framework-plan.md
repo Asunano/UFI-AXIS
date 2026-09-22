@@ -101,7 +101,7 @@
   → 已完成（`36fa526`，与下一条合并成 `WIFI_ENABLED` 的 `commandOf`）
   ⚠ **2026-09-22 真机抓包后重新定性**：`switchWiFiChip` 不是「开 WiFi」，而是「**在频段 X 上启用 WiFi**」，
   与「切频段」是同一条命令。据此新增 `SettingKey.WIFI_BAND`，`WIFI_ENABLED` 的「开」分支改成收可选
-  `chip` 参数（见 §15 的 **P1-26**：profile 已拆完，客户端与 route **尚未接线**）。
+  `chip` 参数（见 §15 的 **P1-26**：profile + 客户端 + route + 两端 UI 均已接线，只剩真机验证）。
 - `GoformWifiClient.kt:379` `switchWiFiModule`（`SwitchOption`）→ 同上
   ⚠ 只用于「关」（`SwitchOption=0`）。`SwitchOption=1` 本项目从未发过、抓包里也没有 ——
   **无实测依据，不许写进代码**（P1-26 记了这条判断的来龙去脉）。
@@ -1009,6 +1009,15 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   `06e7bfa`（web WiFi 表单补加密方式与最大连接数）、`ee145ae`（app WiFi 弹窗同上），
   以及本轮未提交的四批改动（device-schema 的 `WIFI_BAND` 与 `1..10`、
   core 的 `field_normalization_enabled` 读写登记、web / app 的归一化开关与上限收紧）。
+- 2026-09-22 **批 15 同步**（频段接线完成）：§2 的 `switchWiFiChip` 条目改成「已接线」；
+  §14.4 写操作真机清单 14 → **15 条**（新增「切 WiFi 频段」，并写明要连带验的三件事）；
+  §15 **P1-26 结案**（只剩真机验证）。
+  API 手册新增 `POST /api/wifi/band` 一节，重写 `/api/wifi/enable` 的警告
+  （不再是「固定开在 2.4G」，而是「开在设备当前频段，读不到才退回 chip1」），
+  `/api/wifi/config` 的 `chip_index` 标注为「切不了频段，别再发」，
+  §「负面清单」里 `POST /api/wifi/chip` 那条改成指向频段端点。
+  `node scripts/verify-api-contract.mjs` 五项 P0 全空、P1「负面清单已过期」由 1 → 0。
+  对应代码：`0892412`（device-schema）、`6033f91`（core 接线）、`78692b7`（web）、`1c71fa9`（app）。
 
 
 ### 执行记录
@@ -1306,9 +1315,12 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
    - **不验的后果**：这是 0.4b 风险最集中的一处 —— 排障模式下 `normalizeProfile = null`，
      命令表全靠 `commandProfile` 顶着。切错了的表现是**关掉归一化就整个只读面变空**，
      而那正是排障时最需要它工作的时刻。单测替身（守门测试第 ⑦⑧ 条）只覆盖取值、不覆盖端到端。
-4. **写操作真机回归清单**（第 4 层，**14 条**，见 §4 验收最后一条）
+4. **写操作真机回归清单**（第 4 层，**15 条**，见 §4 验收最后一条）
    - 重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 / **手动拨号**与**挂断** /
      切连接模式 / 改 SSID / 改密码 / 改功率 / **开 WiFi** 与**关 WiFi** / 发短信 / 删短信 / 标已读。
+   - 第 15 条是新增的 **切 WiFi 频段**（`POST /api/wifi/band`，P1-26）。这一条要连带验三件事：
+     ① 设备真的换到了目标频段（回读 `wifi_chip`）；② WiFi 是**开着**的（这条命令带「打开」语义）；
+     ③ 在 5G 下点「打开 WiFi」不会被切回 2.4G（`setWifiEnabled` 现在会先读当前频段）。
      每条按 §14.4 做三次观察（点之前记状态 → 点并看返回码与文案 → 点之后确认设备状态真的变了）；
      异常路径另见 §14.4（会话失效重试、值域拒绝、设备离线、短信只发一条数收到几条）。
    - **不验的后果**：0.3 把 **14 个**写调用点的报文构造全换成了 `writeSpec.encode` ——
@@ -2466,7 +2478,8 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 #### 批 14 新登记（P1-26 ~ P1-27）
 
-**P1-26 `WIFI_BAND` 在 profile 里拆完了，客户端 / route / UI 三层都还没接线**
+**P1-26 `WIFI_BAND` 拆分 + 三层接线** —— **已完成（2026-09-22），只剩真机验证**
+
 
 - 抓包事实（2026-09-22，用户提供，逐字）：
 
@@ -2482,22 +2495,28 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   `SwitchOption=0|1`，删掉 `commandOf`」。真机证明「开」走的是 `switchWiFiChip`，
   `SwitchOption=1` 本项目从未发过、这次抓包里也没有 —— **至今无实测依据，不许写进代码**。
   当时刻意不按对称性猜、坚持等抓包，事后证明是对的；这段判断过程本身留档，不要只留结论。
-- 已落地（device-schema）：`SettingKey` 28 → 29，新增 `WIFI_BAND`（`value` 只收设备词汇
+- 已落地（device-schema，`0892412`）：`SettingKey` 28 → 29，新增 `WIFI_BAND`（`value` 只收设备词汇
   `"chip1"` / `"chip2"`，`2.4G` / `5G` / `0` / `1` 一律拒）；`WIFI_ENABLED` 的「开」分支改成读
   可选参数 `chip`，缺失时退回 `chip1`。`:core:device-schema:test` 185 → 188 全绿。
   除「带 `chip` 时的 `ChipEnum`」一格外，四种情况（开+chip2 / 开+chip1 / 开+无 chip / 关）
   的报文逐字未变。
-- **未做：接线**。`GoformWifiClient.setWifiEnabled` 仍只传布尔（不读当前频段），没有 `setWifiBand`，
-  没有频段 route，web/app 的「频段」选择器仍在往 `POST /api/wifi/config` 的 `chip_index` 写 ——
-  那条路**实测无效**，也就是用户报的「WiFi 频段修改无效」。
-  所以今天「打开 WiFi」在 5G 下仍会被切到 2.4G，只是原因从「写死 chip1」变成「调用方没传」。
-- 阻塞原因：`core/goform/.../GoformWifiClient.kt` 与 `core/api/.../routes/WifiRoutes.kt`
-  当前正被用户本人改（`git status` 为 `M`，改动就落在 WiFi 开关那一段），
-  为避免与 in-flight 改动冲突本轮不碰。
-- 接线时要一并决定的两件事：① `setWifiEnabled(true)` 从哪里取当前频段
-  （`wifi_chip` 已是登记字段、已在 `cmdsFor(WIFI_SETTINGS)` 里，读得到）；
-  ② 切频段会重启 WiFi 模块、**会把正通过 WiFi 连着的用户踢下线**，
-  按「破坏性动作必须用户确认且写清后果」的口径要给确认弹窗并留「暂不执行」出口。
+- 已落地（core 接线，`6033f91`）：`setWifiEnabled(true)` 先复用 `getWifiSettingsMerged()` 读
+  `wifi_chip` 再下发（**不新增 cmd**，否则 `GoformCommandTableGuardTest` 会红），读不到或读到域外值
+  才退回 `chip1` 并打 WARN；关分支一次读都不做。新增 `setWifiBand(chip): WriteOutcome` 与
+  `POST /api/wifi/band`（`{"chip":"chip1"|"chip2"}`，取值域判定只在 profile 的 validate 里，
+  route 走 `respondRejected` 回 400 + 原因）。新增 `GoformWifiBandParamsTest` 7 例，
+  `:core:goform:test` 79 → 86 全绿，守门测试 9 例未动。
+- 已落地（UI 接线，`78692b7` web / `1c71fa9` app）：两端频段选择器都从 `POST /api/wifi/config` 的
+  `chip_index` 改走 `/api/wifi/band`，写侧 `chip_index` 摘掉（读侧展示映射保持不动）。
+  频段是独立动作，**只有真变了才下发**，顺序固定为「配置先落 → 频段最后」；
+  切换前弹确认（web `useDialog().warning`、app 既有 `UfiConfirmDialog(destructive = true)`），
+  写明会重启 WiFi 模块并在该频段上打开 WiFi、本机会断开，留「暂不执行」出口；取消一个字段都不发。
+  两端基线均未增（web 26/40，app 五类字面量逐位相同）。
+- **剩余：真机验证**。命令本身有抓包依据，但「切频段 → 设备真的换到该频段且 WiFi 是开的」
+  只有真机能证。已加进 §14.4 的写操作清单。
+- 接线时定下的两件事（留档）：① 当前频段来源是已登记字段 `wifi_chip`，已在
+  `cmdsFor(WIFI_SETTINGS)` 里，不必新增查询；② 切频段属于破坏性动作，确认弹窗与后果文案是硬要求。
+
 
 **P1-27 `needs_restart` 不覆盖 `field_normalization_enabled`（要重启但接口不说）**
 

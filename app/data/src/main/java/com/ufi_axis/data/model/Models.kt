@@ -1018,17 +1018,35 @@ data class AppConfig(
     val app_log_enabled: Boolean? = null,
     /** 调试日志开关（core 端真源；app 侧 `AppPreferences.debugMode` 只是它的缓存） */
     val debug_mode: Boolean? = null,
+    /**
+     * 字段归一化总开关（core 真源 `AppSettings.fieldNormalizationEnabled`，默认 **true**）。
+     *
+     * 关掉 = core 读侧不再按 profile 归一化，原样透传设备原始字段名（决策 D7 的排障回退开关）。
+     *
+     * **可空且没有默认值兜底**（语义：`null` = core 的 `GET /api/config` 里没有这个键）。
+     * 这一点对本项尤其关键：core 是 2026-09-22 才把它补进 `AppSettings.toMap()` 的，
+     * 之前的版本读回来一定是 null。若在这里写成 `Boolean = true`，
+     * 「老 core 没这个键」与「core 说它是 true」就不可区分，UI 只能展示一个拖了也不生效的
+     * 假开关（本仓明令禁止）。app 侧据此把开关置为禁用态并说明原因，见 `DiagnoseScreen`。
+     *
+     * **不热生效**：core 只在构造组件图时读一次（`ComponentFactory.resolveDeviceProfile()`），
+     * 改完必须重启后台服务；而 `PUT /api/config` 的 `needs_restart` **不含**这个键
+     * （那份清单只覆盖认证/端口），所以重启提示必须由 UI 自己写死。
+     */
+    val field_normalization_enabled: Boolean? = null,
     // 2026-08-12：后端更新源 / 镜像前缀（GET /api/config 返回；AppJson ignoreUnknownKeys 下缺省安全）
     val update_url: String = "",
-    val update_mirror_base: String = ""
+    val update_mirror_base: String = "",
+    // 2026-09-22：下载方式（auto/mirror/direct）。**core 是这一项的真源**，app 只读回来显示，
+    // 并在 core 不可达时作为选源兜底。空串 = 老 core 没这个字段，此时保持本地缓存不动。
+    val update_source_mode: String = ""
 )
 
 /**
  * `PUT /api/config` 被拒字段（C03）。
  * reason 取值见 core `ErrorCode`：OUT_OF_RANGE（带 min/max）/ MASKED_VALUE / BLANK_VALUE / WRONG_TYPE。
  * 改造前这些字段是"静默丢弃 + success:true"，客户端只能靠 updated_fields 反推且拿不到原因。
- */
-@Serializable
+ */@Serializable
 data class ConfigRejectedField(
     val field: String,
     val reason: String,
@@ -1057,6 +1075,18 @@ data class ConfigUpdateResponse(
 data class ConfigResetResponse(
     val success: Boolean,
     val message: String
+)
+
+/**
+ * `GET /api/update/source`：core 给出的更新源决策（2026-09-22 决策下沉 core）。
+ * app 不再自己判断走不走镜像，只按这份结果拼 URL 下载自己的 APK。
+ */
+@Serializable
+data class UpdateSourceInfo(
+    val mode: String = "auto",
+    val country: String = "",
+    val use_mirror: Boolean = false,
+    val mirror_prefixes: List<String> = emptyList()
 )
 
 // ========== 邮件通知（路径仍是 /api/sms-forward，见 SmsForwardRoutes 说明） ==========

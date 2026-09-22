@@ -547,6 +547,23 @@ interface UfiAxisApi {
     @POST("api/wifi/config")
     suspend fun setWifiConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
+    /**
+     * WiFi 频段切换（`POST /api/wifi/band`，body `{ "chip": "chip1" | "chip2" }`）。
+     *
+     * **和 `/config` 是两条路**：频段不能塞进 `setWifiConfig` 的 `chip_index` —— 那一项落到
+     * 设备的 `setAccessPointInfo → ChipIndex`，**设备不认**（用户实测「改了没反应」）。
+     * 真正换频段的设备命令是 `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`
+     * （2026-09-22 真机抓包，chip1 = 2.4G、chip2 = 5G），core 把它包成本端点。
+     *
+     * 取值只认 `chip1` / `chip2`：`"0"`/`"1"`（读侧编码）与 `"2.4G"`/`"5G"`（界面文案）都不是
+     * 传输值，core 侧 profile 的 validate 会直接回 400 + 原因。
+     *
+     * **副作用**：这条命令等于「在该频段上启用 WiFi」—— 会重启 WiFi 模块，正通过 WiFi 连着的
+     * 客户端（包括本机）会掉线，且原本关着的 WiFi 会被打开。调用前必须让用户确认。
+     */
+    @POST("api/wifi/band")
+    suspend fun setWifiBand(@Body body: Map<String, String>): SuccessResponse
+
     @POST("api/wifi/power")
     suspend fun setWifiPower(@Body body: Map<String, Int>): SuccessResponse
 
@@ -879,6 +896,13 @@ interface UfiAxisApi {
      */
     @PUT("api/config")
     suspend fun updateUpdateSource(@Body body: Map<String, @JvmSuppressWildcards Any>): ConfigUpdateResponse
+
+    /**
+     * core 的更新源决策（2026-09-22）。app 的 APK 自更新刻意不走 core 代理
+     * （core 挂了也得能更新自己），所以只取决策、自己拼 URL 下载。
+     */
+    @GET("api/update/source")
+    suspend fun getUpdateSource(): UpdateSourceInfo
 
     @POST("api/config/reset")
     suspend fun resetConfig(): ConfigResetResponse

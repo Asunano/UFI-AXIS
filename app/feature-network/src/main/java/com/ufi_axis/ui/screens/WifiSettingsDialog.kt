@@ -27,6 +27,9 @@ import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.module.WIFI_BAND_SWITCH_DISCONNECT_HINT
+import com.ufi_axis.viewmodel.module.WIFI_RESTART_DISCONNECT_HINT
+import kotlinx.coroutines.launch
 
 
 /**
@@ -58,14 +61,48 @@ private val WIFI_AUTH_PRESETS = listOf(
 )
 
 /**
+ * 「最大连接数」的合法区间：**闭区间 `1..10`**。
+ *
+ * 依据：**用户对中兴 F50 的规格结论 —— 最大支持 10 个（2026-09-22）**。在此之前本页刻意不设
+ * 上限（注释写的是「真机见过 7 与 10，本页不替固件设限」），那条依据已被上述结论取代。
+ *
+ * 与 core 同一份事实：`ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 拒 1..10 之外的值）。
+ * 客户端仍要自己守一道，理由是文案 —— 越界在本页就能说清「该填什么」，
+ * 而走到 core 才被拒，用户看到的只是一条下发失败。
+ */
+private val WIFI_MAX_STA_RANGE = 1..10
+
+/**
+ * 频段选项：**界面文案 ↔ 传输取值**，一次对齐（2026-09-22）。
+ *
+ * 传输值只能是设备词汇 `chip1`（2.4G）/ `chip2`（5G）—— 这是
+ * `goformId=switchWiFiChip&ChipEnum=…` 的取值域（真机抓包），core 侧 profile 的 validate
+ * 只认这两个。**不要**拿 `"0"` / `"1"`（读侧 `chip_index` 的展示编码）或界面文案
+ * `"2.4 GHz"` / `"5 GHz"` 去下发，那些会被 core 直接 400。
+ *
+ * 收成一份表是因为这两个字符串要出现在三处：页签文案、确认弹窗正文、二维码区说明。
+ * 各写一遍迟早漂成"页签说 5 GHz、确认弹窗说 2.4 GHz"。列表顺序 = 页签顺序。
+ */
+private val WIFI_BAND_OPTIONS = listOf("chip1" to "2.4 GHz", "chip2" to "5 GHz")
+
+/** 频段传输值 → 界面文案。读到表外的值时按 2.4G 兜底（与 `WifiSettingsResponse.activeChip` 同口径）。 */
+private fun wifiBandLabel(chip: String): String =
+    WIFI_BAND_OPTIONS.firstOrNull { it.first == chip }?.second ?: WIFI_BAND_OPTIONS.first().second
+
+/**
  * WiFi 热点设置弹窗 — 网络名称 / 加密方式 / 连接密码 / 最大连接数 / 隐藏 SSID / 频段 + 连接二维码。
  *
  * 全部使用 [UfiDialogParts] 中的统一快捷组件，零重复样式代码。
  *
- * **本弹窗是表单式**（草稿 + 「保存配置」一次性 POST），不是即时生效式。
+ * **本弹窗是表单式**（草稿 + 「保存配置」才下发），不是即时生效式。
  * 2026-09-22 补进来的三项（加密方式 / 最大连接数 / 隐藏 SSID）刻意沿用同一语义 ——
  * 同一个表单里混"改完立刻下发"和"点保存才下发"，用户没法判断哪一项已经落地；
  * 而且这几项和 SSID/密码本来就该一起变更（改加密方式必然要连带确认密码）。
+ *
+ * **但频段是两条请求里的第二条**（2026-09-22）：它不属于 `POST /api/wifi/config`，
+ * 换频段只能发 `POST /api/wifi/band`（设备命令 `switchWiFiChip`）。原来把它塞进
+ * `/config` 的 `chip_index` 是**假入口** —— 那一项落到设备的 `setAccessPointInfo`，
+ * 设备不认，用户实测「频段改了没反应」。点「保存配置」时的下发顺序与闸门见 `submit`。
  */
 @Composable
 fun WifiSettingsDialog(
@@ -78,7 +115,8 @@ fun WifiSettingsDialog(
     val wifi = state.wifiSettings
     var ssid by remember(wifi?.ssid) { mutableStateOf(wifi?.ssid ?: "") }
     var pwd by remember(wifi?.passphrase) { mutableStateOf(wifi?.passphrase ?: "") }
-    // 频段选择改为本地状态，仅在确认时一起提交（避免切换频段立即发请求导致 WiFi 断联）
+    // 频段是草稿状态，点「保存配置」并二次确认后才走 POST /api/wifi/band 下发
+    // （切换频段会重启 WiFi 模块顶掉连接，不能拨一下页签就立刻发）
     var selectedChip by remember(wifi?.activeChip) { mutableStateOf(wifi?.activeChip ?: "chip1") }
 
     // ── 加密方式（2026-09-22）──
@@ -101,10 +139,9 @@ fun WifiSettingsDialog(
     val isOpenAuth = selectedAuth == "OPEN"
 
     // ── 最大连接数（2026-09-22）──
-    // 空串 = 不下发这一项（设备没报，或用户主动清空）。**上限刻意不校验**：
-    // 真机见过 7 与 10，真实上限由固件决定，编一个数只会把合法值挡在门外。
+    // 空串 = 不下发这一项（设备没报，或用户主动清空）。上限见 [WIFI_MAX_STA_RANGE]（F50 最大 10 个）。
     var maxSta by remember(wifi?.maxStaNum) { mutableStateOf(wifi?.maxStaNum?.trim().orEmpty()) }
-    val maxStaValue = maxSta.takeIf { it.isNotEmpty() }?.toIntOrNull()?.takeIf { it > 0 }
+    val maxStaValue = maxSta.takeIf { it.isNotEmpty() }?.toIntOrNull()?.takeIf { it in WIFI_MAX_STA_RANGE }
     val maxStaInvalid = maxSta.isNotEmpty() && maxStaValue == null
 
     // ── 隐藏 SSID（2026-09-22）──
@@ -118,11 +155,91 @@ fun WifiSettingsDialog(
     // 此时放过提交，设备会拿空密码建一个连不上的加密热点。拦下来并写明原因。
     val pwdMissing = !isOpenAuth && selectedAuth.isNotEmpty() && pwd.isEmpty()
 
+    // ── 会不会把当前连接踢下线（2026-09-22）──
+    // 判据：草稿与**设备当前值**逐项比，只看真正会让设备重启热点的那几项。
+    // 「最大连接数」刻意不算：改它不断连，把它也算进去就是无差别恐吓 ——
+    // 每次保存都弹同一条警告，用户很快就不看了，真要断连的那次也一起被忽略。
+    // 「保持不变」档（selectedAuth 为空 = 还没读到设备设置）同样不算：那一档连 auth_mode
+    // 都不下发，没有任何改动可言。
+    // **频段也不在这里**：它已经不走 `/config` 了（见 [bandChanged]），后果由它自己的确认弹窗
+    // 与 WIFI_BAND_SWITCH_DISCONNECT_HINT 说明。留在这里会让"只改频段"时 /config 的成功
+    // Toast 挂上一条它并不负责的断连提示。
+    val willDisconnect =
+        ssid != (wifi?.ssid ?: "") ||
+            pwd != (wifi?.passphrase ?: "") ||
+            (selectedAuth.isNotEmpty() && selectedAuth != wifi?.authMode?.trim().orEmpty()) ||
+            hideSsid != (wifi?.broadcastSsid?.trim() == "1")
+
+    // ── 频段是**独立动作**（2026-09-22）──
+    // 只有草稿与设备生效频段真的不同才下发：这条命令会重启 WiFi 模块顶掉所有客户端，
+    // 不能每次保存 SSID 都顺带来一次。相等时连请求都不发（见 submit 的 switchBand 参数）。
+    val bandChanged = selectedChip != (wifi?.activeChip ?: "chip1")
+
+    // 请求在飞时的闸门。成功才关窗，所以这个状态活得比原来的"发完就关"长。
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    /**
+     * 「切换 WiFi 频段」二次确认弹窗的开关。
+     *
+     * 以 [visible] 为 key：本弹窗关掉时 WifiSettingsDialog 并没有离开组合（只是 visible=false），
+     * 不重置的话上一次没点完的确认会在下次打开时直接冒出来。
+     */
+    var bandConfirmVisible by remember(visible) { mutableStateOf(false) }
+
+    /**
+     * 真正下发。顺序固定「配置先落、频段最后」：换频段会重启 WiFi 模块并顶掉连接，
+     * 放在前面的话 SSID / 密码就没机会落到设备上。
+     *
+     * `/config` 失败时**不发**频段：半套下发（频段换了但 SSID 没保存）会让用户下次打开弹窗
+     * 看到一份和设备不一致的草稿。失败一律留在弹窗里让他接着改（原因已由全局错误通道给出）。
+     */
+    fun submit(switchBand: Boolean) {
+        // 频段不在这份 payload 里：`chip_index` 落到设备的 setAccessPointInfo → ChipIndex，
+        // **设备不认**（用户实测「频段改了没反应」的根因）。真正换频段走 POST /api/wifi/band。
+        val preset = authPresets.firstOrNull { it.authMode == selectedAuth }
+        val payload = buildMap<String, Any> {
+            put("ssid", ssid)
+            // auth_mode / encryp_type 是一对，要么都带要么都不带。
+            // 「保持不变」档（authMode 为空）出现在还没回读到 WiFi 设置时 ——
+            // 此刻发任何一档都是替用户瞎猜，所以两个键一起省掉。
+            preset?.takeIf { it.authMode.isNotEmpty() }?.let { p ->
+                put("auth_mode", p.authMode)
+                if (p.encrypType.isNotEmpty()) put("encryp_type", p.encrypType)
+            }
+            // 开放模式**不带 passphrase**（真机口径）：OPEN + 密码是矛盾组合，
+            // 带上会让整条请求失败，而失败原因设备不会告诉我们。
+            if (!isOpenAuth) put("passphrase", pwd)
+            // Int 而不是 String：这两个键在 WifiRoutes 里按 intOrNull 读，
+            // 契约类型就是数字；converter 会把 Number 写成 JSON 数字。
+            maxStaValue?.let { put("max_sta_num", it) }
+            put("broadcast_disabled", if (hideSsid) 1 else 0)
+        }
+        saving = true
+        scope.launch {
+            // 等结果：原来这里发完请求就 onDismiss()，弹窗在请求还在飞的时候就关了，
+            // 用户既看不到"在发"，也无从知道设备到底收没收。
+            val configOk = viewModel.network.setWifiConfig(
+                payload,
+                willDisconnect = willDisconnect
+            )
+            val ok = if (configOk && switchBand) {
+                viewModel.network.setWifiBand(selectedChip)
+            } else {
+                configOk
+            }
+            saving = false
+            // 成功才关窗；失败**留在弹窗里**让用户接着改（原因已由全局 Toast 给出，
+            // 关了窗再提示等于让他重新打开、重新填一遍）。
+            if (ok) onDismiss()
+        }
+    }
+
     // 用 UfiScrollableDialog 而不是 UfiCustomDialog（2026-08-30）：
     // UfiCustomDialog 的 content 不滚动也不设高度上限，二维码展开后这一列高度直接超过弹窗，
     // Column 只能把各子项按比例压缩 —— 表现就是"弹窗被挤变形、底部按钮变扁"。
     // UfiScrollableDialog 会给内容区 clamp 出 maxScrollH 并让它滚动，
-    // 同时把 actions 放到滚动区**之外**的固定位置（footer 预算 120dp），按钮高度不再被内容抢走。
+    // 同时把 actions 放到滚动区**之外**的固定位置（footer 预算 120dp）。
     UfiScrollableDialog(
         visible = visible,
         onDismiss = onDismiss,
@@ -133,33 +250,19 @@ fun WifiSettingsDialog(
             UfiDialogActions(
                 onDismiss = onDismiss,
                 onConfirm = {
-                    val preset = authPresets.firstOrNull { it.authMode == selectedAuth }
-                    viewModel.network.setWifiConfig(
-                        buildMap<String, Any> {
-                            put("ssid", ssid)
-                            // auth_mode / encryp_type 是一对，要么都带要么都不带。
-                            // 「保持不变」档（authMode 为空）出现在还没回读到 WiFi 设置时 ——
-                            // 此刻发任何一档都是替用户瞎猜，所以两个键一起省掉。
-                            preset?.takeIf { it.authMode.isNotEmpty() }?.let { p ->
-                                put("auth_mode", p.authMode)
-                                if (p.encrypType.isNotEmpty()) put("encryp_type", p.encrypType)
-                            }
-                            // 开放模式**不带 passphrase**（真机口径）：OPEN + 密码是矛盾组合，
-                            // 带上会让整条请求失败，而失败原因设备不会告诉我们。
-                            if (!isOpenAuth) put("passphrase", pwd)
-                            // Int 而不是 String：这两个键在 WifiRoutes 里按 intOrNull 读，
-                            // 契约类型就是数字；converter 会把 Number 写成 JSON 数字。
-                            maxStaValue?.let { put("max_sta_num", it) }
-                            put("broadcast_disabled", if (hideSsid) 1 else 0)
-                            put("chip_index", if (selectedChip == "chip2") "1" else "0")
-                        }
-                    )
-                    onDismiss()
+                    // 频段变了 → 先确认再下发（本仓硬约定：破坏性动作要用户点头）。
+                    // 没变 → 直接保存配置，一个频段字段都不发。
+                    if (bandChanged) bandConfirmVisible = true else submit(switchBand = false)
                 },
                 confirmText = "保存配置",
+                // 会断连时按危险操作渲染（红），与其它"会把用户自己踢下线"的动作同一观感。
+                // 换频段同样会断连，所以它也算进来。
+                confirmDestructive = willDisconnect || bandChanged,
                 // 校验不通过时禁用确认键，原因写在对应字段下面（errorMessage / 警告块），
                 // 不做"点了没反应"的静默失败。
-                enabled = !maxStaInvalid && !pwdMissing
+                // saving 也要进 enabled：loading 只是视觉，单靠它挡不住重复提交。
+                enabled = !saving && !maxStaInvalid && !pwdMissing,
+                loading = saving
             )
         }
     ) {
@@ -199,9 +302,15 @@ fun WifiSettingsDialog(
                     onValueChange = { maxSta = it },
                     label = "",
                     placeholder = "留空 = 不修改",
+                    // 两位就够（上限 10），可以少一次「打了 3 位再被拒」的往返。
+                    // 但它**不是**数值守门：两位仍能打出 99，所以 maxStaInvalid 必须留着 ——
+                    // UfiDigitField 只有 maxLength（限位数）没有数值 max，而为这一处单点需求
+                    // 改公共组件签名不值得。
+                    maxLength = 2,
                     isError = maxStaInvalid,
                     errorMessage = if (maxStaInvalid) {
-                        "必须是大于 0 的整数。上限由固件决定（真机见过 7 与 10），本页不替它设限。"
+                        "必须是 ${WIFI_MAX_STA_RANGE.first}~${WIFI_MAX_STA_RANGE.last} 的整数" +
+                            "（中兴 F50 最大支持 ${WIFI_MAX_STA_RANGE.last} 个）。"
                     } else {
                         null
                     }
@@ -217,16 +326,55 @@ fun WifiSettingsDialog(
             }
             // 频段是严格二选一，用「胶囊内滑块」页签（与高级控制台的 AT/Shell 切换同一组件），
             // 而不是两个独立 chip：一个轨道切两段更贴"二选一"语义，且全 App 切换器外观统一。
-            // 下标映射固定：0 → chip1(2.4G)，1 → chip2(5G)。
+            // 文案与传输取值都来自 [WIFI_BAND_OPTIONS]，页签下标 = 该表下标。
             UfiDialogField(label = "WiFi 频段") {
                 UfiScrollableTabRow(
-                    selectedTabIndex = if (selectedChip == "chip2") 1 else 0,
-                    onTabSelected = { selectedChip = if (it == 1) "chip2" else "chip1" },
-                    tabs = listOf("2.4 GHz", "5 GHz")
+                    selectedTabIndex = WIFI_BAND_OPTIONS.indexOfFirst { it.first == selectedChip }
+                        .coerceAtLeast(0),
+                    onTabSelected = { selectedChip = WIFI_BAND_OPTIONS[it].first },
+                    tabs = WIFI_BAND_OPTIONS.map { it.second }
                 )
             }
+            // 频段与本表单其余各项**不是同一次下发**：它走 POST /api/wifi/band，点「保存配置」时
+            // 会先弹确认。先把这件事说清楚，用户才不会以为改完页签就已经生效了
+            // （这正是旧实现的问题：塞进 /config 的 chip_index 设备根本不认）。
+            if (bandChanged) {
+                UfiDialogNote("频段会在配置保存后单独切换，点「保存配置」时会先请你确认。")
+            }
             WifiQrCodeSection(viewModel = viewModel, chip = wifi?.activeChip ?: "chip1")
+            // 断连警告必须在**点击之前**给：用户很可能正通过这个热点连着设备，保存后热点重启，
+            // 失败/成功提示物理上都送不到他眼前 —— 那时才提示等于没提示。
+            // 放在内容最后（紧贴底部按钮）而不是顶部：本弹窗内容是可滚动的，
+            // 顶部那条在用户滚到"保存配置"时已经划出屏幕了。
+            if (willDisconnect) {
+                UfiDialogWarning(WIFI_RESTART_DISCONNECT_HINT)
+            }
         }
+    }
+
+    // ── 切换频段的二次确认（本仓硬约定：破坏性动作必须用户点头且写清后果）──
+    // 用公共 UfiConfirmDialog(destructive = true)，与重启设备 / 恢复出厂那几处同一套观感，
+    // 不另造布局。渲染在 UfiScrollableDialog **之外**：它是独立的一层弹窗，
+    // 叠在热点设置弹窗上面（同 MediaVideoDownloadHistoryScreen 的 `if (flag) { … }` 写法）。
+    if (bandConfirmVisible) {
+        UfiConfirmDialog(
+            title = "切换 WiFi 频段",
+            text = "将把 WiFi 切换到 ${wifiBandLabel(selectedChip)}。$WIFI_BAND_SWITCH_DISCONNECT_HINT。" +
+                "其余改动（网络名称 / 密码等）会在切换前先保存。",
+            confirmText = "切换并保存",
+            // 「暂不执行」而不是「取消」：这里要留的是"我不做这个动作"的出口，
+            // 而不是"关掉整个设置"—— 点它只收起本确认框，热点设置弹窗还在，草稿都留着。
+            dismissText = "暂不执行",
+            destructive = true,
+            onConfirm = {
+                bandConfirmVisible = false
+                submit(switchBand = true)
+            },
+            // 「暂不执行」= **一个字段都不发**（连 /config 都不发）。
+            // 半套下发（存了 SSID 却没换频段）会让弹窗上的频段显示成设备并不在用的值 ——
+            // 那就是假开关。要只存配置，用户可以把页签拨回原频段再点保存。
+            onDismiss = { bandConfirmVisible = false }
+        )
     }
 }
 
@@ -299,7 +447,7 @@ private fun WifiQrCodeSection(viewModel: MainViewModel, chip: String) {
                     )
                 }
                 Text(
-                    text = "扫码即可连接 ${if (chip == "chip2") "5 GHz" else "2.4 GHz"} 热点",
+                    text = "扫码即可连接 ${wifiBandLabel(chip)} 热点",
                     style = MaterialTheme.typography.labelSmall,
                     color = palette.textSecondary
                 )

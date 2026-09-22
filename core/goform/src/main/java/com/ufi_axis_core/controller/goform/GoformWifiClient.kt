@@ -332,6 +332,11 @@ class GoformWifiClient(
      *
      * 合并规则本身在 [mergeApConfigParams]（纯函数，可单测）；base64 编码 / `ApIsolate` /
      * `AccessPointIndex` 这些设备侧细节现在全在 profile 的 encode 里，本文件不再重复一份。
+     *
+     * 返回 [WriteOutcome] 而不是 `Boolean`（与 [setWifiSleep] / [setAccessControlList] 同口径）：
+     * `Boolean` 把「参数被值域校验拒绝」「设备明确回失败」「命令没被受理」压成同一个 false，
+     * 路由只能一律回 500，用户看到的就只剩一句 `HTTP 500` —— 密码几位、加密组合不合法这类
+     * **改一下入参就能过**的原因传不出来。三态保留后由 `respondRejected` 把理由带回客户端。
      */
     suspend fun setWifiConfig(
         ssid: String? = null,
@@ -341,7 +346,7 @@ class GoformWifiClient(
         maxStaNum: Int? = null,
         broadcastDisabled: Int? = null,
         chipIndex: String? = null
-    ): Boolean {
+    ): WriteOutcome {
         val current = if (authMode == null || ssid == null) getCurrentWifiConfig() else emptyMap()
         val params = mergeApConfigParams(
             current = current,
@@ -358,7 +363,7 @@ class GoformWifiClient(
             tag,
             "setWifiConfig: SSID=${params["ssid"]} Auth=${params["auth_mode"]} Enc=${params["encrypt_type"]}"
         )
-        return writer.write(SettingKey.WIFI_AP_CONFIG, params)
+        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, params)
     }
 
     /** @param level 发射功率档位（值域 0~2 的判据在 profile 的 validate 里，与 WifiRoutes 同一份事实）。 */
@@ -375,32 +380,74 @@ class GoformWifiClient(
     /**
      * WiFi 总开关。
      *
-     * 设备侧开/关是**两条不同的命令**（开 `switchWiFiChip` + `ChipEnum=chip1&GuestEnable=0`，
+     * 设备侧开/关是**两条不同的命令**（开 `switchWiFiChip` + `ChipEnum=<当前频段>&GuestEnable=0`，
      * 关 `switchWiFiModule` + `SwitchOption=0`），命令选择与参数集都在
      * [SettingKey.WIFI_ENABLED] 的 WriteSpec 里 —— 这里不再留 if。
      *
-     * ## ⚠ 这个方法的「开」语义是错的（2026-09-22 真机抓包确认，本轮刻意不修）
+     * ## 「开」要带上设备**当前**频段（2026-09-22 真机抓包 + 用户实测的真 bug）
      *
-     * **已确认的事实**：`switchWiFiChip` 是**切换 WiFi 频段**，不是「开 WiFi」——
-     * `ChipEnum=chip1` = 2.4G、`ChipEnum=chip2` = 5G（抓包原文：
-     * `goformId=switchWiFiChip&isTest=false&ChipEnum=chip1&GuestEnable=0`）。
+     * `switchWiFiChip&ChipEnum=X&GuestEnable=0` 的语义是**「在频段 X 上启用 WiFi」** ——
+     * 「开」与「切频段」是同一条命令（`chip1` = 2.4G、`chip2` = 5G）。所以「开」必须把
+     * 设备此刻所在的频段一起发出去：不发就会命中 profile 的兜底 `chip1`，用户在 5G 下点
+     * 「打开 WiFi」会被静默切到 2.4G（实测过的现象）。
      *
-     * **当前的问题**：`setWifiEnabled(true)` 发出去的其实是「切到 2.4G」；而真正的频段切换
-     * **没有任何入口**（用户实测现象是「WiFi 频段修改无效」）。`setWifiEnabled(false)` 那条
-     * `switchWiFiModule&SwitchOption=0` 没有被这次抓包否定。
+     * 频段取值走**已有的读路径** [getWifiSettingsMerged] 的归一化字段 `wifi_chip`
+     * （已登记在 `cmdsFor(FieldGroup.WIFI_SETTINGS)` 里）——**不许**为此新造 ad-hoc 查询：
+     * `GoformCommandTableGuardTest` 逐字冻结命令表，新增查询就是一次未被记录的请求形状变更。
      *
-     * **为什么不在这一轮修**：修法是把它拆成「真开关」+「切频段」两件事，而前提是知道
-     * 「开 WiFi」那条命令到底发什么。对称地猜 `switchWiFiModule&SwitchOption=1` 是很自然的，
-     * 但本项目从未发过这条、这次抓包里也没有它 —— **在拿到那条抓包之前不许按对称性猜**
-     * （[SettingKey.WIFI_ENABLED] 的 WriteSpec 注释里「实测边界」那段早就警告过一次）。
+     * 读失败 / 读到的值不在 `{chip1, chip2}` 内时退回 `chip1` 并打 WARN（决策见
+     * [wifiEnableParams]）—— 不静默：这条路径会把设备切到 2.4G，必须在日志里留痕。
+     * 「关」分支**不做任何读取**：`switchWiFiModule` 只认 `SwitchOption`。
      *
-     * **拆分后这里要改成什么**：本方法只保留「真开关」语义（`switchWiFiModule`，
-     * `SwitchOption=0|1`）；另加一个 `setWifiBand(...)` 走新的 `SettingKey.WIFI_BAND`
-     * （`switchWiFiChip` + `ChipEnum=chip1|chip2` + `GuestEnable=0`）。命令与参数照旧全在
-     * profile 里，这里仍然不留 if。完整方案写在 [SettingKey.WIFI_ENABLED] 的 WriteSpec 注释。
+     * 独立的频段切换入口是 [setWifiBand]。
      */
-    suspend fun setWifiEnabled(enabled: Boolean): Boolean =
-        writer.write(SettingKey.WIFI_ENABLED, enabled)
+    suspend fun setWifiEnabled(enabled: Boolean): Boolean = writer.write(
+        SettingKey.WIFI_ENABLED,
+        wifiEnableParams(
+            enabled = enabled,
+            readChip = { readCurrentWifiChip() },
+            warn = { AppLogger.w(tag, it) },
+        )
+    )
+
+    /**
+     * 切换 WiFi 频段（`chip1` = 2.4G、`chip2` = 5G）。
+     *
+     * ## ⚠ 这条命令等于「在该频段上启用 WiFi」
+     *
+     * 设备侧没有「只切频段、不动开关」的形态：它与 [setWifiEnabled] 的「开」分支是**同一条**
+     * 命令（`goformId=switchWiFiChip&ChipEnum=<chip>&GuestEnable=0`），所以 WiFi 原本是关的
+     * 时候发这条会把它打开。
+     *
+     * **会重启 WiFi 模块 —— 此刻正通过 WiFi 连着的客户端（包括发起这次请求的那台）会掉线。**
+     * 要不要在动作前跟用户确认由 UI 侧决定，本方法与 `POST /api/wifi/band` 都不加确认语义。
+     *
+     * 取值域校验在 [SettingKey.WIFI_BAND] 的 validate 里（只收设备词汇 `chip1` / `chip2`，
+     * 不收 `2.4G` / `5G` / `0` / `1`），非法取值**不下发**并以 [WriteOutcome.Rejected] 返回原因。
+     *
+     * @return 三态结果（同 [setWifiSleep] / [setAccessControlList] / [setWifiConfig]）：
+     *   `Boolean` 会把「取值非法」「设备明确回失败」「命令没被受理」压成同一个 false，
+     *   路由就只能一律回 500，用户看不到「改一下入参就能过」这件事。
+     */
+    suspend fun setWifiBand(chip: String): WriteOutcome =
+        writer.writeChecked(SettingKey.WIFI_BAND, chip)
+
+    /**
+     * 设备当前所在频段（归一化字段 `wifi_chip`），读不到返回 null。
+     *
+     * 复用 [getWifiSettingsMerged]（`cmdsFor(WIFI_SETTINGS)` 里已有 `wifi_chip`），
+     * 不发任何额外命令。异常不外抛：调用方（[setWifiEnabled] 的「开」分支）在读不到时
+     * 有兜底路径，让一次查询失败把「打开 WiFi」整个动作打断反而更糟。
+     */
+    private suspend fun readCurrentWifiChip(): String? = try {
+        (getWifiSettingsMerged()[WIFI_CHIP_FIELD] as? JsonPrimitive)
+            ?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        AppLogger.w(tag, "读取当前 WiFi 频段失败：${e.message}")
+        null
+    }
 
     /**
      * 只改口令 —— 其余 AP 配置从设备读回后原样带上（整表替换，见 [mergeApPasswordParams]）。
@@ -433,6 +480,53 @@ class GoformWifiClient(
      * - `ApIsolate` / `AccessPointIndex` / base64 编码 / `OPEN` 时强制 `NONE`：全在 profile
      */
     internal companion object {
+
+        /**
+         * 归一化后的「当前频段」字段名（`DeviceFields.WifiSettings.CHIP` 的值，取值 `chip1` / `chip2`）。
+         *
+         * 这里是字面量而不是引用常量：`:core:contract` 对本模块是**传递依赖**
+         * （`:core:device-schema` 用 `implementation` 引它），不在 goform 的编译类路径上。
+         * 与 `cmdsFor(FieldGroup.WIFI_SETTINGS)` 里的 `wifi_chip` 是同一个键（见 [getWifiSettings]）。
+         */
+        internal const val WIFI_CHIP_FIELD = "wifi_chip"
+
+        /** `ChipEnum` / `wifi_chip` 的取值域：`chip1` = 2.4G、`chip2` = 5G（2026-09-22 抓包）。 */
+        private val WIFI_CHIPS = setOf("chip1", "chip2")
+
+        /** 读不到当前频段时「开」用的频段。会把设备切到 2.4G，所以必须带 WARN 日志。 */
+        internal const val WIFI_CHIP_FALLBACK = "chip1"
+
+        /**
+         * [setWifiEnabled] 交给 [SettingKey.WIFI_ENABLED] 的参数。
+         *
+         * - **关**：只有 `value`，[readChip] 一次都不调 —— `switchWiFiModule` 只认 `SwitchOption`，
+         *   为「关」去读一次当前频段是纯浪费的请求。
+         * - **开**：`value` + `chip`（设备当前频段）。读不到 / 读到的值不在 `{chip1, chip2}` 内
+         *   时退回 [WIFI_CHIP_FALLBACK] 并 [warn]：这条路径会把用户从 5G 切到 2.4G，
+         *   静默走过去就是 2026-09-22 之前那个「在 5G 下点开 WiFi 被切到 2.4G」的 bug 再现一次。
+         *
+         * 抽成以 lambda 收读路径与日志出口的 companion 函数，理由同 [mergeApConfigParams]：
+         * 本类持有具体类 [GoformClient]，注入不了假对象，只有这样才能逐字断言
+         * 「读到 chip2 就发 chip2 / 读失败退回 chip1 / 关分支不读」。
+         *
+         * @param readChip 当前频段的读取出口（生产是 [readCurrentWifiChip]，失败给 null）
+         */
+        internal suspend fun wifiEnableParams(
+            enabled: Boolean,
+            readChip: suspend () -> String?,
+            warn: (String) -> Unit,
+        ): Map<String, Any?> {
+            if (!enabled) return mapOf("value" to false)
+            val read = readChip()
+            val chip = read?.takeIf { it in WIFI_CHIPS } ?: run {
+                warn(
+                    "没读到当前 WiFi 频段（wifi_chip=${read ?: "缺失"}），按 2.4G" +
+                        "（$WIFI_CHIP_FALLBACK）开 WiFi —— 设备若在 5G 会被切到 2.4G"
+                )
+                WIFI_CHIP_FALLBACK
+            }
+            return mapOf("value" to true, "chip" to chip)
+        }
 
         /** 设备读不到 `AuthMode` 时最终生效的值（与 profile 的缺省档一致，用于本地算口令发送条件）。 */
         private const val AUTH_DEFAULT = "WPA2PSK"

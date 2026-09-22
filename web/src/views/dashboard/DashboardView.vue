@@ -198,7 +198,7 @@ async function saveWifiEdit(payload: WifiSavePayload) {
     const cur = payload.cur;
     // 报文里 passphrase 的 OPEN 特例、encryp_type 的配对/透传、broadcast_disabled 的方向
     // 都在 buildWifiConfigPayload 里（与网络页的 WifiEditModal 共用同一份规则）。
-    // chip_index 在写接口里是 "0"/"1"（chip1=2.4G → "0"，chip2=5G → "1"）
+    // 频段不在这个表单里（本弹窗没有频段控件），换频段是 POST /api/wifi/band 的独立动作
     await api.post(
       '/api/wifi/config',
       buildWifiConfigPayload({
@@ -207,7 +207,6 @@ async function saveWifiEdit(payload: WifiSavePayload) {
         passphrase: payload.password,
         maxStaNum: payload.maxStaNum,
         hidden: payload.broadcastHidden,
-        chipIndex: cur?.chip_index === '2' ? '1' : '0',
         fallbackEncrypType: cur?.encryp_type,
       })
     );
