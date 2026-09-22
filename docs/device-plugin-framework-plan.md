@@ -61,36 +61,58 @@
 | 传输契约 `GoformGateway` | `core/goform/.../GoformGateway.kt:27` | 登录 / 查询 / POST / QoS（14 个方法） |
 | AT 通道契约 `AtTransport` | `core/collector/.../at/AtTransport.kt:10` | `probe()` / `sendCommand()` / `reset()` |
 | 归一化引擎 + 覆盖率诊断 | `core/device-schema/.../FieldNormalizer.kt` | `normalize()` / `coverage()` / 脱敏 |
-| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（1099 行） | 10 个 FieldGroup、18 个 `SettingKey`、5 个结构解码器 |
+| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（撰写时 1099 行；2026-09-22 已 1396 行） | 10 个 FieldGroup、`SettingKey` 撰写时 18 个 → **现 28 个**、5 个结构解码器 |
 
 ### 2.2 欠账清单（这就是阶段 0~4 要清的）
 
 **A. 写命令绕过 profile —— 19 个调用点**（去重后约 15 个命令）
 
-- `GoformDeviceClient.kt:36` `REBOOT_DEVICE`
-- `GoformDeviceClient.kt:42` `FACTORY_RESET`
-- `GoformDeviceClient.kt:48` `SHUTDOWN_DEVICE`
+> **2026-09-22 阶段 0 执行完一轮后的实际归属**（条目一条不删 —— 决策痕迹要留着）。
+> 「19」这个数字本身没数错，错的是它隐含的假设「19 个调用点 = 19 个 `writer.write`」：
+>
+> - **11 处改走 writer**（`36fa526`，Device / Network / Wifi 三个客户端）→ **已完成**
+> - **WiFi 的 3 处 `setAccessPointInfo` 合并成一个 `WIFI_AP_CONFIG`**（`090fcad` 登记 + `118ed84` 接线）
+>   → **已完成**。它们是**同一条设备命令的三种调用意图**，不是三个命令
+> - **短信 3 处走 `profile.smsSpec()`**（`2d92e05` 立契约）→ **profile 侧已完成，客户端接线进行中**
+> - **`SET_USB_NETWORK_PROTOCAL` 整条删除**（`0f3f504`）→ **已完成（删除，不是迁移）**
+> - **登录 / 登出 3 处**留给阶段 1（传输层握手）→ **未开始，按原计划不属阶段 0**
+
+- `GoformDeviceClient.kt:36` `REBOOT_DEVICE` → 已完成（`36fa526`，`SettingKey.REBOOT`）
+- `GoformDeviceClient.kt:42` `FACTORY_RESET` → 已完成（`36fa526`）
+- `GoformDeviceClient.kt:48` `SHUTDOWN_DEVICE` → 已完成（`36fa526`）
 - `GoformDeviceClient.kt:56` `SET_USB_NETWORK_PROTOCAL`（参数 `usb_network_protocal`）
   → **2026-09-22 批 3 已删除**：`setUsbMode` 全仓零调用（无 route、无 app 入口），
   按「没用了就彻底删」的纪律连 `SettingKey.USB_MODE` + WriteSpec 一起删掉，见 §15。
 
-- `GoformDeviceClient.kt:85` `CHANGE_PASSWORD`（`oldPassword`/`newPassword` = SHA256 大写）
+- `GoformDeviceClient.kt:85` `CHANGE_PASSWORD`（`oldPassword`/`newPassword` = SHA256 大写）→ 已完成（`36fa526`）
 - `GoformNetworkClient.kt:38` `CONNECT_NETWORK` / `DISCONNECT_NETWORK`（变量 `primaryId` 拼出来的）
+  → 已完成（`36fa526`，`MOBILE_DATA` 的 `commandOf`）
 - `GoformNetworkClient.kt:40` `SET_DATA_ENABLED`（`data`=1/0，是上一条的兜底）
-- `GoformNetworkClient.kt:63` `CONNECT_NETWORK`
-- `GoformNetworkClient.kt:69` `DISCONNECT_NETWORK`
-- `GoformNetworkClient.kt:75` `SET_CONNECTION_MODE`（参数 `ConnectionMode`）
+  → 已完成（`36fa526`，`MOBILE_DATA.fallback`）
+- `GoformNetworkClient.kt:63` `CONNECT_NETWORK` → 已完成（`36fa526`，`PPP_DIAL`）
+- `GoformNetworkClient.kt:69` `DISCONNECT_NETWORK` → 已完成（同上）
+- `GoformNetworkClient.kt:75` `SET_CONNECTION_MODE`（参数 `ConnectionMode`）→ 已完成（`36fa526`）
 - `GoformWifiClient.kt:310 / 359 / 391` `setAccessPointInfo`（三个调用点，参数集不同）
-- `GoformWifiClient.kt:347` `SET_WIFI_POWER`（`wifiPowerLevel`）
+  → **已完成（合并，不是三份搬迁）**：`SettingKey.WIFI_AP_CONFIG` 一份 `WriteSpec`
+  + 客户端三个 `internal` 纯函数只管「往 params 里放哪几个键」（`090fcad` / `118ed84`）。
+  合并的前提是先修掉 `Password` 管线的 bug，见 §15 的 P0-2「已解除」。
+- `GoformWifiClient.kt:347` `SET_WIFI_POWER`（`wifiPowerLevel`）→ 已完成（`36fa526`）
 - `GoformWifiClient.kt:374` `switchWiFiChip`（`ChipEnum` / `GuestEnable`）
-- `GoformWifiClient.kt:379` `switchWiFiModule`（`SwitchOption`）
-- `GoformSmsClient.kt:200` `DELETE_SMS`
-- `GoformSmsClient.kt:206` `SET_MSG_READ`
-- `GoformSmsClient.kt:264` `SEND_SMS`
+  → 已完成（`36fa526`，与下一条合并成 `WIFI_ENABLED` 的 `commandOf`）
+- `GoformWifiClient.kt:379` `switchWiFiModule`（`SwitchOption`）→ 同上
+- `GoformSmsClient.kt:200` `DELETE_SMS` → `SmsSpec.deleteParams`（`2d92e05`），客户端接线进行中
+- `GoformSmsClient.kt:206` `SET_MSG_READ` → `SmsSpec.markReadParams`（`2d92e05`），同上
+- `GoformSmsClient.kt:264` `SEND_SMS` → `SmsSpec.sendParams`（`2d92e05`），同上
+  ⚠ 这三处的行号已经漂了（`GoformSmsClient` 正在接线中，现为 `:251` / `:257` / `:317`）——
+  按符号名找，别信行号（§0 的纪律）。
 
 登录/登出三处（`GoformClient.kt:275 / 290 / 786`）**不进 `SettingKey`** —— 它们属于传输层握手，归阶段 1。
 
 **B. 读命令表只搬了一半**
+
+> **状态（2026-09-22）**：**未开始**。本节标题的修正已经在上一轮（2026-09-21 第三轮，见下面这段）
+> 做完了 —— 那一次修的是「工作性质」的认识（不是搬，而是删并行路径），
+> 代码一行没动。真正的搬迁属 0.4，是阶段 0 现在唯一还没动的子项。
 
 > **2026-09-21 按真机基线修正**：这个标题不准确。§16 显示 10 个 `FieldGroup` 的
 > `queried` **全部为 true**，说明 `cmdsFor()` 每一组都已经登记了命令 ——
@@ -113,13 +135,27 @@
 
 **C. 设备值域写死在客户端**
 
+> **状态（2026-09-22）：部分完成。** 四项里两项已搬、一项已裁决推后、一项需要新 API 面。
+
 - `GoformNetworkClient.kt:28-31` `LTE_ALL_BANDS` / `NR_ALL_BANDS`（注释写的是 **ZTE MU300** 的频段表）
   → **2026-09-22 批 3 实测：这两个常量被跨模块引用，不是简单搬迁**（`NetworkController.kt:122/127`），
   而且 `core/contract/Enums.kt:145-146` 还有第三份同值拷贝。升 P0-1，见 §15。
+  → **已裁决：推到阶段 2**（用户裁决，与 `NetworkController` 的设备知识一起清）。
+  2026-09-22 复核仍然成立：常量在 `GoformNetworkClient.kt:29/31`、本文件用它的地方在 `:92/:93`
+  （`unlockAllBands`），`NetworkController.kt:122/127` 跨模块直读，`Enums.kt:145-146` 第三份拷贝仍零引用。
 
 - `GoformWifiClient.kt:310-341` `AuthMode=WPA2PSK` / `EncrypType=CCMP` / `ApIsolate=0` / `AccessPointIndex=0`
+  → **已完成**（`090fcad`）：四个缺省值成了 `ZteGoformProfile` 的 `AP_AUTH_DEFAULT` /
+  `AP_ENCRYP_DEFAULT` / `AP_CHIP_INDEX_DEFAULT` 与 encode 里恒发的 `ApIsolate=0` /
+  `AccessPointIndex=0`，客户端里已经没有这些字面量。
 - WiFi 密码：写 base64(UTF-8)、读 base64(GBK)（`GoformClient.kt:865 / 868`）
+  → **已完成**（写侧 `090fcad` 进 `WIFI_AP_CONFIG.encode` 的 `base64Utf8`；
+  读侧的字符集不对称由 `858a9c9` 一并修掉，两边判据都改成「UTF-8 优先、GBK 回落」）。
+  ⚠ 但**两份解码器仍各写一份**（`GoformClient.decodeDeviceText` 与
+  `ZteGoformProfile.WIFI_PASSWORD_DECODER`），合并是另一件事，见 §15。
 - 二维码文件名模板 `{chip}_ssid{n}_qrcode_wifikey`（`GoformWifiClient.kt:69`）
+  → **未搬**：`DeviceProfile` 没有「文件路径模板」这个 API 面，临时加一个方法违反
+  「不要自己发明 API」的纪律。**归阶段 2**，见 §15 的 P1-5。
 
 **D. 传输层无法替换**
 
@@ -269,32 +305,80 @@ class DeviceRuntime private constructor(
 2. `deviceProfileId` 非空 → 按 id 取；取不到 → 默认插件 + WARN（**认不出不能导致整个不工作**）；
 3. `deviceProfileId` 为空 → 采一次 `ProbeEnv`，取 `probe()` 最高分；全 0 → 默认插件 + WARN。
 
+### 3.4 阶段 2 的设计方向：跨模块收不动的，允许各设备独立持有（2026-09-22 用户裁决）
+
+用户原话：
+
+> **如果某些功能无法做到跨模块的话就独立吧，独立不同的设备**
+
+这条话定的是**抽象的边界**：不强求所有设备知识都收进一套统一抽象。判据是「收敛的代价」——
+当一处设备知识为了进统一抽象必须把依赖拉到别的模块（典型例子：频段全集 `LTE_ALL_BANDS` /
+`NR_ALL_BANDS` 被 `core/controller` 的 `NetworkController` 直读，见 §15 的 P0-1），
+那就允许它**由各设备插件各自独立持有一份**，而不是为了「统一」制造一条新的跨模块耦合。
+
+- 允许：同一类设备知识在两个插件里各写一份（重复是显式的、每份都只服务自己那台设备）。
+- 不允许：为了让两个插件共用一份，把 `core/controller` / `core/collector` 拉进
+  `device-spi` 的依赖里（那是 §11.7 已经判过死刑的成环方向）。
+- 判据落地成一条问题：**「这处知识换设备时会一起换吗？」** 会 → 进插件（哪怕重复）；
+  不会（是我们自己的策略）→ 留在上层，别往插件里塞。
+
+这条不是「以后再说」的备注，而是阶段 2 拆 `DevicePlugin` 时的取舍依据：
+遇到收不动的，按本条独立，不记 P0、不停手。
+
 ---
 
 ## 4. 阶段 0 — 补齐命令表（无新概念，纯搬运）
 
 **为什么先做**：只要还有命令绕过 profile，插件化就是假的 —— 换设备时那些命令会**静默发错**。
-这一阶段不引入任何新类型，风险最低，且有 1325 行的 `ZteGoformProfileTest` 兜底。
+这一阶段不引入任何新类型，风险最低，且有 `ZteGoformProfileTest` 兜底
+（撰写时 1325 行；2026-09-22 已 1841 行 / 115 条 `@Test`）。
 
 ### 任务
 
-> 状态口径（2026-09-22 批 3 更新）：批 1 / 1b / 2 已完成的子项标 `[x]`，
-> 还差一部分的标 `[~]`，被 P0 拦住的标 `[!]`。
+> 状态口径（**2026-09-22 阶段 0 全部 8 个 commit 执行完后复核**）：
+> 每一条都按当天的代码现查现写，不照抄上一轮。行号一律以符号名为准。
+> 阶段 0 现在只剩 **0.4** 一整项未开始 + **0.7 的客户端接线**在做 + **0.8 的真机那一半**没法做。
 
-- `[x]` 0.1 `SettingKey` 补齐写命令（`core/device-schema/.../DeviceProfile.kt:70`）
+- `[x]` 0.1 `SettingKey` 补齐写命令（`core/device-schema/.../DeviceProfile.kt`）
+  → 实测 `SettingKey` 现为 **28 项**（18 原有 + 10 新增；`USB_MODE` 已删、`WIFI_SSID`/`WIFI_PASSPHRASE`
+  最终合并为一个 `WIFI_AP_CONFIG`，理由写在该 key 的 KDoc 里）
 - `[x]` 0.2 `ZteGoformProfile` 为新增 key 登记 `WriteSpec`
-- `[~]` 0.3 4 个客户端的硬编码调用点改走 `writer.writeChecked(...)`
-  → 批 2 完成 11 处；**剩 `GoformWifiClient` 的 3 处 `setAccessPointInfo`**（批 3 受 P0-2 阻塞）
-  与短信 3 处（归 0.7）
+  → 实测 `writeSpecs` 与 `SettingKey` 逐项对齐（28 : 28），无孤立 key
+- `[x]` 0.3 4 个客户端的硬编码调用点改走 `writer.write(Checked)(...)`
+  → **11 处**（`36fa526`）+ WiFi 的 3 处 `setAccessPointInfo`（`118ed84`，走 `WIFI_AP_CONFIG`）。
+  短信 3 处按 §11.2 走 `smsSpec`、不进 `SettingKey`（归 0.7）。
+  实测 `core/goform/src/main` 里 `"goformId" to` 只剩 **1** 处：
+  `GoformClient` 的 `LOGOUT`（归阶段 1）。另有 2 处字符串形态的登录命令
+  （`GoformClient.kt:275/290` 的 `setBody("isTest=false&goformId=LOGIN…")`），该 pattern 抓不到
 - `[ ]` 0.4 读命令表收进 `cmdsFor()` / `soloCmds()`，**mapper 改双 profile**（见下）
-- `[!]` 0.5 设备值域（频段全集 / WiFi 固定枚举 / base64 编码方向 / 二维码文件名）搬进 profile
-  → 阻塞原因：频段全集被跨模块引用（P0-1）、WiFi 三处的合并规则不等价（P0-2）、
-  二维码文件名需要新的 profile 读侧 API 面（待裁决，见 §15）
+  → **未开始，是阶段 0 最后一项**。实测判据：`core/goform/src/main` 里 `client.query(listOf(`
+  仍有 **11 处**（`GoformSignalClient` 9 + `GoformWifiClient` 2；`GoformFieldMapper` 那两处不算，
+  见验收）。它也是唯一会碰到「关掉归一化会不会把只读面打瘫」的子项，
+  动手前重读本节那段「不要直接删 fallback」
+- `[~]` 0.5 设备值域（频段全集 / WiFi 固定枚举 / base64 编码方向 / 二维码文件名）搬进 profile
+  → **部分完成**：WiFi 固定枚举（`WPA2PSK` / `CCMP` / `ApIsolate=0` / `AccessPointIndex=0` /
+  `ChipIndex` 缺省）与 base64 写侧编码已进 `WIFI_AP_CONFIG`（`090fcad` + `118ed84`），
+  读侧字符集不对称一并修掉（`858a9c9`）。
+  **未搬**：① 频段全集 `LTE_ALL_BANDS` / `NR_ALL_BANDS` —— 被 `core/controller` 的
+  `NetworkController.kt:122/127` 跨模块引用、`core/contract/Enums.kt:145-146` 还有第三份零引用拷贝，
+  **已裁决推阶段 2**（§15 的 P0-1，按 §3.4 的口径处理）；
+  ② 二维码文件名模板 —— 需要 `DeviceProfile` 上新开一个读侧 API 面，**归阶段 2**（§15 的 P1-5）
 - `[x]` 0.6 `WriteSpec` 加 `retry: RetryPolicy`，现有 18 项显式标 `RETRY_ON_SESSION_LOSS`
-- `[ ]` 0.7 短信三项走 `smsSpec()`，**不进** `SettingKey`（见 §11.2）
+  → 实测原 18 项全部显式标注；新增 10 项里 `REBOOT` / `SHUTDOWN` / `FACTORY_RESET` /
+  `BACKEND_PASSWORD` 为 `NEVER`，其余（含 `MOBILE_DATA.fallback` 独立判定）为 `RETRY_ON_SESSION_LOSS`
+- `[x]` 0.7 短信三项走 `smsSpec()`，**不进** `SettingKey`（见 §11.2）
+  → **profile 侧**（`2d92e05`：`SmsSpec` 接口 + `ZteSmsSpec` + `ZteGoformProfile.smsSpec()`）
+  与**客户端接线**均已完成：`GoformSmsClient` 收非空 `profile` 构造参数（无默认值，口径同 §11.12），
+  `sendSms` / `getSmsList` / `getSmsMeta` / `deleteSms` / `markSmsRead` / `verifySend` 六处走 spec，
+  goform 侧的 `buildSendParams` / `toUcs2Hex` / `formatSmsTime` / `TAG_SENT` / `TAG_SEND_FAILED` 已删，
+  `GoformSmsSendParamsTest` 5 → 1 条（只留 `maskNumber` 那条，脱敏是日志规范不属 profile）。
+  读时钟上移到调用点（`System.currentTimeMillis()` / `TimeZone.getDefault()` 在 `sendSms` 里）
 - `[~]` 0.8 补测试：新增 key 的 encode/validate 逐条断言；`SettingKey` 全覆盖断言
-  → 已有的部分：`ZteGoformProfileTest` + `GoformSettingWriterDecisionTest`（189 条全绿）；
-  差 WiFi 整份 AP 配置与短信两块
+  → 已有：`ZteGoformProfileTest`（115 条 `@Test`）、`ProfileContractTest`（8）、
+  `ZteSmsSpecTest`（23）、`GoformSettingWriterDecisionTest`（20）、`GoformWifiApParamsTest`（19）、
+  `GoformWritePolicyTest`（15）、`GoformBase64CharsetTest`（7）、`GoformCodecFormBodyTest`（8）、
+  `GoformSmsSendParamsTest`（5）。差的是**装配层**（writer × 真实 `GoformClient`，要等阶段 1 接口化）
+  与**真机**那一半（§14.3 / §14.4，无真机）
 
 
 
@@ -312,8 +396,10 @@ enum class SettingKey {
 
     MOBILE_DATA,         // CONNECT_NETWORK / DISCONNECT_NETWORK + SET_DATA_ENABLED 兜底
     CONNECTION_MODE,     // SET_CONNECTION_MODE，value: String
-    WIFI_SSID,           // setAccessPointInfo 的一组参数
-    WIFI_PASSPHRASE,     // setAccessPointInfo（密码 base64 方向在 encode 里）
+    WIFI_AP_CONFIG,      // setAccessPointInfo 的整份参数集（2026-09-22 实际落地的形态）
+                         // 原方案写的是 WIFI_SSID + WIFI_PASSPHRASE 两个 key，实际合成了一个：
+                         // 设备侧这条命令是整表替换，拆成两个 key 等于让「哪些键必须一起发」
+                         // 这条设备事实散在两处。理由见该 key 的 KDoc 与 §11.3。
     WIFI_POWER,          // SET_WIFI_POWER，value: Int
     WIFI_ENABLED,        // 开→switchWiFiChip(ChipEnum=chip1,GuestEnable=0)，关→switchWiFiModule(SwitchOption=0)
     PPP_DIAL,            // connectNetwork / disconnectNetwork，与 MOBILE_DATA 的区别是**无兜底**
@@ -400,6 +486,12 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 > 阶段 0 范围外）直接读 `GoformNetworkClient.LTE_ALL_BANDS`，
 > 且 `core/contract/Enums.kt:145-146` 还有第三份同值拷贝。
 > 删 companion 会连带改 `core/controller`，那超出「纯搬运」的风险边界 —— 等裁决。
+>
+> **2026-09-22 裁决：推到阶段 2，阶段 0 不动。** 理由有两层：
+> ①「空串 = 不发限制」与「空串 = 下发全频段」是两种不同的对外语义，换过来是行为变更而不是搬运；
+> ② 常量被 `core/controller` 直读，在阶段 0 改它就等于把阶段 0 的影响面扩到 controller 层。
+> 阶段 2 收 `NetworkController` 的设备知识时一起清，并按 §3.4 的口径 ——
+> 如果那时发现「收进统一抽象」仍然要拉跨模块依赖，就允许各插件独立持有一份频段全集。
 
 
 ### 验收
@@ -407,14 +499,15 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 - `:core:device-schema:test` 与 `:core:goform:test` 全绿
 - 写命令：`core/goform/src/main` 里 `"goformId" to` 的剩余数量
   **（2026-09-22 批 2/批 3 实测修正，原判据「只剩 GoformClient 的登录/登出 3 处」是错的）**：
-  - **现状 = 7**：`GoformWifiClient.kt:310/354/382`（`setAccessPointInfo` ×3）
-    + `GoformSmsClient.kt:200/206/264`（`DELETE_SMS` / `SET_MSG_READ` / `SEND_SMS`）
-    + `GoformClient.kt:786`（`LOGOUT`）
-  - 0.3 的 WiFi 3 处做完 → **4**；0.7 短信三项做完 → **1**（只剩 LOGOUT，归阶段 1）
+  - 批 3 当时 = 7：`GoformWifiClient`（`setAccessPointInfo` ×3）
+    + `GoformSmsClient`（`DELETE_SMS` / `SET_MSG_READ` / `SEND_SMS`）+ `GoformClient`（`LOGOUT`）
+  - **2026-09-22 阶段 0 执行完后实测 = 4**：WiFi 3 处已并入 `WIFI_AP_CONFIG`（`118ed84`），
+    只剩短信 3 处（`GoformSmsClient`，0.7 接线中）+ `LOGOUT`（归阶段 1）
+  - 0.7 的客户端接线做完 → **1**（只剩 `LOGOUT`）
   - ⚠ **`"goformId" to` 这个 pattern 抓不到字符串形态的登录命令**：
     `GoformClient.kt:275` 与 `:290` 是 `setBody("isTest=false&goformId=LOGIN_MULTI_USER&…")`
     / `setBody("isTest=false&goformId=LOGIN&…")`，整条 body 是一个字符串字面量。
-    所以真实的「绕过 profile 的写命令」总数 = grep 数字 **+ 2**。
+    所以真实的「绕过 profile 的写命令」总数 = grep 数字 **+ 2**（现在是 4 + 2 = 6）。
     要一次抓全就同时 grep `goformId`（不带 ` to`）—— 别再按前一个数字下结论。
 
 - 读命令：`core/goform/src/main` 里 `client.query(listOf(` 为 0。
@@ -657,6 +750,15 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   0.5 补一段「原方案做不通」的说明、**验收的 grep 判据由「只剩 3 处」改成「现状 7 处 + 2 处
   字符串形态抓不到」**；§11.1 的 retry 建议表删 `USB_MODE`；§11.3 补 WiFi 三处 `Password`
   管线不一致的事实。原 §4 验收那条数字是撰写时的推断，与实测不符（见 §9 执行记录批 2/批 3）。
+- 2026-09-22 阶段 0 跑到批 8 之后按实测同步本文档：§2.2 三类欠账逐条标注
+  「已完成 / 部分完成 / 已裁决推后」并附 commit 号（**条目一条不删** —— 决策痕迹要留着）；
+  新增 §3.4（跨模块收不动的允许各设备独立持有，用户裁决原话）；
+  §4 任务清单与验收 grep 判据按实测重写（`"goformId" to` 由 7 改成 **4**，真实绕过数 = 4 + 2）；
+  §9 追加批 4~8 的执行记录；§11.2 的 `SmsSpec` 代码块改成**与实现逐字一致**
+  （`markReadParams` 多一个 `read` 参数、`SET_MSG_READ` 无 `notCallback`、`sendParams` 含 `isTest=false`）；
+  §11.3 的 WiFi 段落整段改写（原文描述的三条 `Password` 管线已经不存在了）；
+  §15 的 P0-2 结案为「已解除」、P0-1 改为「已裁决推阶段 2」，并新增 P1-6~P1-19；
+  §16 补一条「阶段 0 完成后必须重抓基线」。
 
 
 ### 执行记录
@@ -709,6 +811,71 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   - 第1层 ✓（`:core:goform:compileDebugKotlin` / `:core:api:compileDebugKotlin` /
     `:core:compileDebugKotlin` 全绿，证明删除没有打断任何下游）/ 第2层 ✓（189 条）/
     第3、4层 未跑（本批不改任何下发报文，且无真机）。
+  - 落地 commit：`0f3f504`（含本文档 10 处同步；批 3 的两个 P0 就是在这一轮记进 §15 的）。
+- 2026-09-22 **阶段 0 批 4**（先修 WiFi 口令 bug）完成，commit `44dec16`。
+  **裁决（用户）：先单独一个 commit 修 bug，再做三处合并** —— 不允许把 bug 修复夹在搬运 commit 里，
+  否则出问题时分不清是「搬错了」还是「修错了」（§13.1 第 1 条）。
+  改了什么：`getCurrentWifiConfig()` 返回的 `Password` 是**已解码的明文**，而设备侧
+  `setAccessPointInfo` 的 `Password` 要 base64 —— 两处误用一起修：
+  `setWifiSSID` 明文直发（会把设备口令写成「明文当 base64 解出来的字节」）、
+  `setWifiConfig` 对已是明文的值又 `base64Decode` 一次（解码失败返回空串 →
+  「只改加密方式不传口令」把口令**清空**）。统一成「读明文 / 写 base64」单向管线，
+  并把这条契约写进 `getCurrentWifiConfig` 的 KDoc（下一个人不读代码也能看到）。
+  第1层 ✓ / **第2层：本轮没有新单测** —— commit 说明里写明「回归保障待下一步把 Password 管线
+  收进 `WriteSpec.encode` 后补」，那是批 6/7 的 `GoformWifiApParamsTest`；
+  第3、4层 未跑（**这一批是真正的行为变更，commit 说明已标注「需真机验证」**）。
+  这一批同时解开了 P0-2 的阻塞事实（见 §15 P0-2「已解除」）。
+- 2026-09-22 **阶段 0 批 5**（设备文本解码字符集）完成，commit `858a9c9`。
+  **裁决（用户）：字符集不对称现在就修（选项 b）**，不推后 —— 因为批 4 修完之后
+  「读回明文 → base64 写回」变成了**常规路径**，不对称会让每一个非 ASCII 口令在一次
+  「读回再写回」里被改坏。
+  改了什么：`GoformClient.decodeDeviceText` 从无条件 GBK 改成「**UTF-8 优先、GBK 回落**」，
+  判据是**无损往返**（UTF-8 解出来再编回去与原字节逐一相等）而不是「解出来含不含 U+FFFD」——
+  JDK 对非法 UTF-8 不抛异常只替换，且口令本身可以真的含 U+FFFD，两种情况只有往返判据都覆盖。
+  顺带发现原实现里那层「再做一次 UTF-8 往返」是**死代码**（在已解好的 `String` 上再编再解 = 恒等变换），
+  一并删除。解码彻底失败**仍返回空串**（`/api/wifi/settings` 的读路径依赖该语义，刻意不动）。
+  第1层 ✓ / 第2层 ✓（新增 `GoformBase64CharsetTest` **7** 条）/ 第3、4层 未跑（无真机）。
+- 2026-09-22 **阶段 0 批 6**（WiFi AP 配置进 profile）完成，commit `090fcad`。
+  新增 `SettingKey.WIFI_AP_CONFIG`（`command = "setAccessPointInfo"`）：7 个 canonical 入参
+  （`ssid` / `auth_mode` / `encrypt_type` / `passphrase` / `max_sta_num` / `broadcast_disabled` /
+  `chip_index`）+ 恒发的 `ApIsolate=0` / `AccessPointIndex=0`，`Password` = base64(明文, UTF-8)。
+  **裁决：`Password` 的发送条件只看 `passphrase` 键在不在**，不在 encode 里判
+  `auth != OPEN && encryp != NONE` —— 三个调用方的条件本来就不同（「只改口令」连 OPEN 也发），
+  那是**调用方意图**不是设备事实；写进 encode 就再也共用不了一份实现。
+  同一个 commit 里把 `WIFI_PASSWORD_DECODER` 也改成 UTF-8 优先（与批 5 的判据一致）——
+  代价是**回滚本 commit 会同时撤掉 profile 侧的字符集修复**，这一点记在 commit 说明里。
+  第1层 ✓ / 第2层 ✓（`ZteGoformProfileTest` 101 → **115** 条）/ 第3、4层 未跑（无真机）。
+  注意：这一步之后 `WIFI_AP_CONFIG` 暂时**没有消费方**（接线在批 7），这是刻意的中间状态。
+- 2026-09-22 **阶段 0 批 7**（三处 `setAccessPointInfo` 接线）完成，commit `118ed84`。
+  `setWifiConfig` / `setWifiSSID` / `setWifiPassword` 的方法体收成「读回当前值 → 合并纯函数 →
+  一次 `writer.write(SettingKey.WIFI_AP_CONFIG, …)`」，**签名与返回类型一字未动**。
+  合并逻辑抽成三个 `internal` 纯函数（`mergeApConfigParams` / `mergeApSsidParams` /
+  `mergeApPasswordParams`）放在 companion：本类持有的是具体类 `GoformClient`，端到端注入不了假对象，
+  抽出来才能逐字断言「三个入口各放哪几个键」—— 整表替换命令多一个键 / 少一个键都会静默改掉设备配置。
+  **唯一刻意的行为变更（用户裁决）**：`setWifiSSID` 在 `AuthMode == "OPEN"` 时原先照发
+  非 `NONE` 的 `EncrypType`，现由 profile 强制 `NONE`。裁决理由：`OPEN` + 有加密算法在设备侧
+  本身是矛盾组合，另两个入口改造前就都强制 `NONE`，**只有这里漏了，属笔误** ——
+  统一成 profile 的一份判断，而不是把笔误抄进 profile。
+  第1层 ✓ / 第2层 ✓（新增 `GoformWifiApParamsTest` **19** 条）/ 第3、4层 未跑（无真机）。
+- 2026-09-22 **阶段 0 批 8**（短信规则立契约）完成，commit `2d92e05`。
+  新增 `SmsSpec` 接口 + `ZteSmsSpec` 实现 + `DeviceProfile.smsSpec()`（默认 `null` = 不支持短信，
+  不是「忘了实现」）。短信不进 `SettingKey` 的三条理由见 §11.2，三条都在这一轮复核过仍然成立。
+  与 §11.2 原先列的签名有**两处偏差，以实现为准**（§13.2 的 P1，已在 §11.2 更正）：
+  `markReadParams` 多一个 `read: Boolean = true`、`SET_MSG_READ` 的参数集**不含** `notCallback`。
+  时间戳与时区改成**由调用方传入**，实现里不读时钟 —— 否则整张参数表没法断言，
+  而「缺 `sms_time` / 格式不对」恰恰是「短信能收不能发」的历史根因。
+  第1层 ✓ / 第2层 ✓（新增 `ZteSmsSpecTest` **23** 条，其中 `sendParams` 的期望值与 goform 侧
+  `GoformSmsSendParamsTest` 逐字对齐 —— 这是下一轮删旧实现的依据）/ 第3、4层 未跑（无真机）。
+  **本轮是刻意的暂时重复**：`GoformSmsClient` 里那份实现（`buildSendParams` / `toUcs2Hex` /
+  `formatSmsTime` + 两个 tag 常量）下一轮接线时删，两份并存是预期状态、不是漏改。
+- 2026-09-22 **文档同步（本轮，不改代码）**：按上面 8 个 commit 的实际结果核对并更新
+  §2.2 / §3.4 / §4 / §9 / §11.2 / §11.3 / §15 / §16。
+  核对方式是逐条回代码里查（`SettingKey` 28 项、`writeSpecs` 28 项逐项对齐、
+  `"goformId" to` 剩 4 处、`markReadParams` 的 `read` 参数在 `app/viewmodel/.../ToolsModule.kt`
+  确有 `read=false` 的调用点），**不照抄上一轮的数字**。
+  两层校验的说明：第1、2 层的 ✓ 沿用各轮 commit 说明里的自报结果 ——
+  本轮**没有重跑 Gradle**，因为另一个代理正在并行改 `core/goform/**` 与 `core/src/**`，
+  抢构建锁会既拖慢他也让我拿到一份混合状态的结果（§13.3 最后一条）。
 
 
 
@@ -766,9 +933,11 @@ data class WriteSpec(
 
 新增项的建议取值（动手时逐条复核，不要照抄）：
 - `RETRY_ON_SESSION_LOSS`：`CONNECTION_MODE` / `WIFI_ENABLED` / `WIFI_POWER` /
-  `WIFI_SSID` / `WIFI_PASSPHRASE` / `MOBILE_DATA` / `PPP_DIAL`（设置类，同值幂等）。
+  `WIFI_AP_CONFIG`（原方案写的 `WIFI_SSID` / `WIFI_PASSPHRASE` 最终合成了这一个 key）/
+  `MOBILE_DATA` / `PPP_DIAL`（设置类，同值幂等）。
   `MOBILE_DATA.fallback`（`SET_DATA_ENABLED`）亦为 `RETRY_ON_SESSION_LOSS`，**独立判定**
   （`USB_MODE` 原也在这张表里，2026-09-22 批 3 已随 `setUsbMode` 一起删除）
+  → **2026-09-22 实测：全部按此落地**，且原有 18 项一项没漏（`writeSpecs` 28 项逐条核过）
 
 - `NEVER`：`REBOOT` / `SHUTDOWN` / `FACTORY_RESET` / `BACKEND_PASSWORD`（改完密码旧会话必然失效，
   重试会用新密码登不上）/ 短信三项（走 §11.2 的 `smsSpec`，本来就不经 writer）
@@ -792,7 +961,8 @@ data class WriteSpec(
 3. 编码是短信专有的：`MessageBody` 要 UCS2（UTF-16BE 小写 hex，无 BOM）、`encode_type=UNICODE`、
    `ID=-1`、`sms_time` 是 `yy;MM;dd;HH;mm;ss;+TZ` 且 TZ 是**小时**偏移（半小时制给 `+5.5`）。
 
-**决定**：在 `DeviceProfile` 上开一组短信专用契约，每设备各自实现：
+**决定**：在 `DeviceProfile` 上开一组短信专用契约，每设备各自实现。
+**以下代码块是 2026-09-22（`2d92e05`）落地后的实际签名**，与原方案有三处差异，逐条写在下面：
 
 ```kotlin
 interface DeviceProfile {
@@ -802,13 +972,14 @@ interface DeviceProfile {
 }
 
 interface SmsSpec {
-    /** 下发参数。时间戳由调用方传入 —— 不许在实现里读时钟（否则没法断言）。 */
-    fun sendParams(number: String, message: String, atMillis: Long, zone: TimeZone): Map<String, String>
-    /** 列表查询的 cmd 与分页参数。 */
+    /** 下发参数。时间戳与时区由调用方传入 —— 不许在实现里读时钟（否则没法断言）。 */
+    fun sendParams(number: String, message: String, atMillis: Long, zone: java.util.TimeZone): Map<String, String>
+    /** 列表查询的 cmd 与分页参数（只放短信专有键，通用键由客户端补）。 */
     fun listQuery(page: Int, perPage: Int): Map<String, String>
-    /** 删除 / 标已读。 */
+    /** 删除。 */
     fun deleteParams(ids: List<String>): Map<String, String>
-    fun markReadParams(ids: List<String>): Map<String, String>
+    /** 标记已读 / 未读。`read` 有默认值，但**必须存在** —— 见下面第 1 条。 */
+    fun markReadParams(ids: List<String>, read: Boolean = true): Map<String, String>
     /** 信箱行的 tag 语义 —— 「已发送 / 发送失败」的判据按设备而异。 */
     fun sentTag(): String
     fun failedTag(): String
@@ -816,6 +987,24 @@ interface SmsSpec {
     fun encodeBody(message: String): String
 }
 ```
+
+**与原方案的三处差异**（都是「以代码为准、回头改计划」，§13.1 第 3 条）：
+
+1. **`markReadParams` 多一个 `read: Boolean = true`**。原方案漏了这个参数，只表达「标已读」——
+   那会**静默丢掉一半既有行为**：对外 `POST /api/sms/read` 支持 `read=false`，
+   `GoformSmsClient.markSmsRead(msgId, read)` 的两个分支都在被调用。
+   已核实的调用点：`app/viewmodel/.../ToolsModule.kt` 会发
+   `api.markSmsRead(mapOf("id" to …, "read" to "false"))`（把消息标回未读的 UI 动作），
+   设备侧对应 `tag=1`。ZTE 的取值是 `tag`：`0` = 已读、`1` = 未读
+   （与信箱行 tag 的 `2`=已发送 / `3`=发送失败**不是同一套值域**，只是共用了 `tag` 这个键名）。
+2. **`SET_MSG_READ` 的参数集不含 `notCallback`**。原方案（§4 0.1 那段「Network 3 处、Sms 2 处」）
+   假定它有 —— 实测 `GoformSmsClient.markSmsRead` 就没发：`DELETE_SMS` 有 `notCallback=true`、
+   `SET_MSG_READ` 没有。看着像漏了，但**没有实测依据说明补上是安全的**，所以照抄现状，
+   要不要补进 §15 单独记一条（真机验一次再决定）。
+3. **`sendParams` 的输出含 `isTest=false`**，与写侧 `WriteSpec.encode` 一律不发 `isTest` 的口径不同。
+   这**不是漏改**：短信走 `GoformSmsClient` 直接 `goformPost`，**不经 writer / `GoformCodec`**，
+   而 `isTest` 是 `GoformCodec.buildSetFormBody` 统一补的 —— 两条路径补通用参数的位置不同而已。
+   将来若把短信也收进 codec，这一项要与去重逻辑一起处理（§15 已记）。
 
 回读确认的**循环**留在 `GoformSmsClient`（它是流程，不是设备事实），
 但循环里用的**判据**（`sentTag` / `failedTag`）来自 spec。
@@ -825,15 +1014,35 @@ interface SmsSpec {
 
 `WriteSpec.encode` 是纯函数 `(Map)->Map`，下面这些都**不满足**，必须留在客户端：
 
-- **读-改-写**：`GoformWifiClient.setWifiConfig`（`:311` 先 `getCurrentWifiConfig()`，
-  `:331` 还要 `base64Decode` 解出当前密码再重新编码）、`setWifiSSID`（`:354`）、
-  `WIFI_ACL`（整表替换，`DeviceProfile.kt:84` 已写明「读-改-写收敛在 core」）。
-  → profile 只收**合并后的完整参数集**，「先读回」这一步是客户端的职责。
+- **读-改-写**：`GoformWifiClient.setWifiConfig` / `setWifiSSID` / `setWifiPassword`
+  （都要先 `getCurrentWifiConfig()`）、`WIFI_ACL`（整表替换，
+  `DeviceProfile` 的 `WIFI_ACL` KDoc 已写明「读-改-写收敛在 core」）。
+  → **这条结论保留：profile 只收合并后的完整参数集，「先读回」是客户端的职责。**
+  理由不是「不好写」，而是 `WriteSpec.encode` 的类型就是纯函数 `(Map)->Map` ——
+  读回要发一次查询（`suspend` + 可能失败 + 会话失效），塞进 encode 等于让 profile 变成能做 I/O 的东西，
+  「没有设备也能断言」这条底线就没了。
 
-  > **2026-09-22 批 3 补充（P0-2，见 §15）**：「先读回留客户端 + profile 只收完整参数集」
-  > 这条口径本身没问题，但三个方法**不能共用一份 `encode`** —— 它们对 `Password`
-  > 这一个字段有三条不同的管线，其中 `setWifiSSID` 发的是**明文**（没有 base64 编码）。
-  > 一份把 `passphrase` 统一 base64 编码的 encode 会改变 `setWifiSSID` 实际发出的报文。
+  > **2026-09-22 批 6/7 后的实际形态（原先这里写的已过期）**：
+  > 三个入口现在**共用同一份 `encode`**（`SettingKey.WIFI_AP_CONFIG`）。
+  > 原文说的「三条不同的 `Password` 管线、`setWifiSSID` 发明文所以共用不了」**已经不成立** ——
+  > 那个「发明文」是 bug，`44dec16` 修掉了；现在三处都是「客户端给明文 `passphrase`，
+  > profile 的 encode 做唯一一次 `base64(UTF-8)`」。
+  >
+  > 读-改-写留在客户端的那部分是 `GoformWifiClient` companion 里的**三个 `internal` 纯函数**：
+  > `mergeApConfigParams` / `mergeApSsidParams` / `mergeApPasswordParams`。
+  > 三个入口的差异**全部收敛成「往 params 里放哪几个键」**，没有一处再判设备侧细节：
+  >
+  > - 键不放（或放 null）→ 该项不发；`auth_mode` / `encrypt_type` / `broadcast_disabled` /
+  >   `chip_index` 不发就走 profile 的缺省档（`WPA2PSK` / `CCMP` / `0` / `0`）
+  > - `passphrase` **只要键在就发** `Password`（空串也发）→ 「不想动口令」必须不放这个键。
+  >   这个条件不进 encode 是刻意的：「只改口令」那个入口对 `OPEN` 也发口令，
+  >   那是**调用方意图**而不是设备事实
+  > - `ApIsolate=0` / `AccessPointIndex=0` / base64 编码 / `OPEN` 强制 `NONE`：全在 profile
+  >
+  > 为什么把合并抽成纯函数而不是留在 `suspend` 方法体里：本类持有的是具体类 `GoformClient`
+  > （阶段 1 才接口化），端到端注入不了假对象，抽出来才有 `GoformWifiApParamsTest` 这 19 条断言。
+  > 设备侧 `setAccessPointInfo` 是**整表替换**，多一个键 / 少一个键都会静默改掉 AP 的某一项 ——
+  > 这是「读取毫无影响、写入静默改坏设备」的一类错误，必须有逐字断言兜着。
 
 - **有副作用的动作**：`CHANGE_PASSWORD` 成功后必须 `updateGoformPassword()` + `resetLogin()`，
   否则下一次请求还在用旧密码登录。副作用留在调用点，spec 只管参数与哈希。
@@ -1119,7 +1328,8 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 这两个套件就是本次改造的**语义基线**，尤其：
 
-- `ZteGoformProfileTest`（1325 行）冻结了 F50 每个分组的字段名、别名回退顺序、
+- `ZteGoformProfileTest`（撰写时 1325 行；2026-09-22 已 **1841 行 / 115 条 `@Test`**）冻结了
+  F50 每个分组的字段名、别名回退顺序、
   结构解码器行为、以及全部写入项的 encode + validate。**阶段 0 搬命令表时它必须全绿** ——
   搬运不该改变任何映射结果。
 - `ProfileContractTest` 是多 profile 契约测试，阶段 2 新增插件后它应当自动覆盖新插件
@@ -1251,7 +1461,12 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 归属：同 P1-1。先确认是「固件没有」还是「别名没登记」—— 前者不该改，
   后者补别名。判据是裸命令 `POST /api/device/goform/query` 抓一份原始响应看有没有这个 key。
 
-**P0-1 `LTE_ALL_BANDS` / `NR_ALL_BANDS` 被跨模块引用，且全仓有三份同值拷贝（批 3 停手项）**
+**P0-1 `LTE_ALL_BANDS` / `NR_ALL_BANDS` 被跨模块引用，且全仓有三份同值拷贝
+（批 3 停手项 → 2026-09-22 已裁决：推阶段 2）**
+
+**裁决（用户）**：不在阶段 0 动，**推到阶段 2** 与 `NetworkController` 的设备知识一起清，
+并适用 §3.4 的口径（那时若仍然收不动，允许各插件独立持有一份频段全集，不为了统一制造跨模块耦合）。
+下面的事实 2026-09-22 复核**全部仍然成立**，一条没变，保留原文：
 
 - 事实：`GoformNetworkClient.kt:28-31` 声明这两个 `const`，本文件内 `unlockAllBands()`（`:91-95`）用它们。
 - 事实：`core/controller/.../NetworkController.kt:122` 与 `:127` 直接读
@@ -1269,13 +1484,34 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   `NetworkController` 的两处改成不传值。但那会把「空串 = 解锁」从「不发限制」变成
   「下发全频段」**在 profile 内部**生效，`lockBands` 里「未选 LTE → 空串清空该 RAT 限制」
   （`:124` 注释）这条语义会跟着变 —— 那是行为变更，不是搬运。
-- 归属：需要裁决。要么（a）扩范围到 `core/controller` 单独一个 commit，
-  要么（b）推到阶段 2 与 `NetworkController` 的设备知识一起清。阶段 0 不擅自改 `core/controller`。
+- 归属：**已裁决 → 阶段 2**（原有两个选项里取（b））。阶段 0 不擅自改 `core/controller`。
+  裁决理由：「空串 = 不发限制」改成「空串 = encode 里下发全频段」是**对外语义变更**，
+  不是搬运；而常量被 `core/controller` 直读，在阶段 0 改它等于把阶段 0 的影响面扩到 controller 层
+  （§4「影响面」写的是不碰 controller）。`Enums.kt` 那份零引用拷贝一并留到阶段 2 处理 ——
+  现在删它虽然安全，但 `core/contract` 是冻结区，删东西要按 §11.4 的纪律先标废弃。
 
-**P0-2 三个 `setAccessPointInfo` 调用点无法用一份 `encode` 表达（批 3 停手项）**
+**P0-2 三个 `setAccessPointInfo` 调用点无法用一份 `encode` 表达
+（批 3 停手项 → 2026-09-22 **已解除**）**
 
-现状基线（`GoformWifiClient.kt`，`current` = `getCurrentWifiConfig()` 的返回，
-其中 `current["Password"]` 已经是 `base64Decode` 过的**明文**）：
+**结论：阻塞已解除，三处已按方案 (b) 合并。** 经过：
+
+1. **阻塞事实被证明是两个 bug，不是设备约束**。原判定「共用不了一份 encode」建立在
+   「`setWifiSSID` 发明文 `Password`」这条事实上，而 base64 编码是单射的 ——
+   一份统一编码的 encode 表达不出「明文」。批 4（`44dec16`）确认这就是 **bug**：
+   设备侧要的是 base64，发明文等于让设备把「明文按 base64 解出来的字节」当新口令；
+   同一批还修了 `setWifiConfig` 对已解码明文再 `base64Decode` 一次（失败返回空串 → **清空口令**）。
+2. **按用户裁决取方案 (b)**：先单独一个 commit 修 bug（`44dec16`），再做合并 ——
+   不把 bug 修复夹在搬运里，否则出问题时分不清是搬错还是修错（§13.1 第 1 条）。
+3. **修完之后三条管线自动合并成一条**：客户端一律给**明文** `passphrase`，
+   `WIFI_AP_CONFIG.encode` 做唯一一次 `base64(UTF-8)`（`090fcad`），
+   三个入口只剩「放哪几个键」的差异（`118ed84` 的三个 `internal` 纯函数）。
+4. **连带修掉的第三件事**：读侧 `base64Decode` 是 GBK、写侧是 UTF-8 —— bug 修完后
+   「读回明文 → 编码写回」成了常规路径，这个不对称会改坏非 ASCII 口令，
+   于是按用户裁决「现在就修（选项 b）」，`858a9c9` 把两边都改成「UTF-8 优先、GBK 回落」。
+
+**下面这张表是批 3 当时的现状基线，保留作历史对照** —— 它描述的是 `44dec16` **之前**的行为，
+`Password` 那一行的三种管线今天已经不存在了。表里 `current` = `getCurrentWifiConfig()` 的返回，
+其中 `current["Password"]` 已经是 `base64Decode` 过的**明文**（行号也是当时的，早已漂移）：
 
 | 设备侧参数 | `setWifiConfig(...)`（:301） | `setWifiSSID(ssid)`（:347） | `setWifiPassword(pass)`（:376） |
 | --- | --- | --- | --- |
@@ -1308,10 +1544,15 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   标准 decoder + **GBK** 解码（再做一次 UTF-8 往返）。**写 UTF-8 / 读 GBK 的不对称是既有事实**。
   搬进 device-schema 时用 `java.util.Base64.getEncoder().encodeToString(s.toByteArray(UTF_8))`
   即逐字等价（纯 JVM，device-schema 可用）；`base64Decode` 属读侧，不搬。
-- 归属：需要裁决三条路中的哪一条 ——
-  （a）encode 收两个入参（`passphrase` 明文 + `passphrase_encoded` 已编码值），逐字保住现状；
-  （b）承认 `setWifiSSID` 是 bug，单独一个 commit 修，然后三处共用一份 encode；
-  （c）本阶段只收敛 `setWifiConfig` + `setWifiPassword`，`setWifiSSID` 留到修 bug 那一批。
+- 归属：**已裁决取（b）并已执行完**（`44dec16` → `090fcad` → `118ed84`）。三条候选路留在这里
+  是为了记住为什么没选另两条：
+  （a）encode 收两个入参（`passphrase` 明文 + `passphrase_encoded` 已编码值），逐字保住现状
+  —— 会把一个 bug 固化成契约的一部分，且第二台设备要继承这个畸形入参；
+  （b）承认 `setWifiSSID` 是 bug，单独一个 commit 修，然后三处共用一份 encode ← **选这条**；
+  （c）本阶段只收敛 `setWifiConfig` + `setWifiPassword`，`setWifiSSID` 留到修 bug 那一批
+  —— 会留下「三处里两处走 profile、一处还在硬编码」的中间态，下一个人看不出那是刻意的。
+- **未做完的部分（新事实，接着往下看 P1-6 ~ P1-11）**：合并本身完成了，但这一轮顺带查清了
+  6 条**没在这一轮修**的东西，各自单列一条，别再埋在 P0-2 里。
 
 **P1-3 `setUsbMode` 已按用户裁决删除（已处理，保留决策痕迹）**
 
@@ -1327,6 +1568,9 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   `ZteGoformProfile` 的 `WIFI_POWER.validate` 也判 `0..2`。
 - 事实：`setWifiPower` 返回 `Boolean`（`writer.write`），profile 的 `Rejected` 会被压成
   `false` → route 回 **500**。所以现在删掉 route 那一份 **会把 400 变成 500**，是对外行为变更。
+- 2026-09-22 复核仍然成立：`WifiRoutes.kt:84-87` 判 `level !in 0..2` 回 400、`:90` 在
+  `success == false` 时回 `InternalServerError`；`ZteGoformProfile` 的 `WIFI_POWER` 注释也写明
+  「0~2 不是这里发明的，与 WifiRoutes 是同一份事实」。与 P1-8 是同一件事的两个入口。
 - 归属：范围外。要清就得先把 `setWifiPower` 改成返回 `WriteOutcome`（签名变更），
   连同 route 一起改 —— 属阶段 2「route 只认 SettingKey + 三态」那一步。
 
@@ -1340,6 +1584,162 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 归属：需要新增 SPI 面（形如 `fun qrCodeFileNames(chip, index): List<String>` 或更通用的
   「文件资源」契约），按 §13.4「不要自己发明 API」的纪律，**等裁决**；建议归阶段 2
   与插件聚合根一起设计，不在阶段 0 临时加一个方法。
+
+#### 批 4~8 顺带查清、刻意不在阶段 0 修的（P1-6 ~ P1-19）
+
+> 每条按「现象 / 事实 / 猜测 / 建议归属」写，**事实与猜测分开**。
+> 行号是 2026-09-22 当日的位置；`GoformSmsClient` 正在接线中，那几条按符号名找。
+
+**P1-6 `base64Decode` 解码失败返回空串 —— 「口令为空」与「解码失败」不可分**
+
+- 现象：设备侧存了一个非法 base64 的 `Password` 时，「只改 SSID」仍然会把口令写成空串。
+- 事实：`GoformClient.base64Decode`（`:884` → 纯函数 `base64DecodeOrEmpty` `:958`）
+  非法输入时打一条 ERROR 后**返回空串**，不抛、不返回 null；KDoc（`:873-878`）写明这是
+  **刻意保留**的语义，`/api/wifi/settings` 的读路径依赖它。
+- 事实：`GoformWifiClient.getCurrentWifiConfig` 的 KDoc（`:162-164`）也记了这条 ——
+  非法 base64 走的是「`config["Password"] = ""`」这条路，所以后面 `?:` 那种 fallback 基本不会命中。
+- 事实：`mergeApSsidParams` 会把 `current["Password"]`（此时是空串）原样当 `passphrase` 发出去，
+  于是设备口令被写成空。
+- 猜测（未验证）：真机上出现非法 base64 的概率很低（口令都是我们自己写进去的），
+  所以这条一直没暴露。
+- 建议归属：**不属阶段 0**（要改的是「空 vs 失败」的表达，牵动 `getCurrentWifiConfig`、
+  `/api/wifi/settings` 的返回、以及前端对「空口令」的渲染，三处一起改）。
+  改法方向：读侧返回 `String?` 或带一个显式的 `decode_failed` 标记，而不是用空串兼表两义。
+
+**P1-7 `setWifiConfig` 在 `authMode != null && ssid != null` 时不读回 current**
+
+- 现象：走「设置页把 SSID 和认证方式都填了」这条路径时，下发的参数表里**永远没有**
+  `Password` / `ChipIndex` / 广播位 —— 全靠设备自己保留原值。
+- 事实：`GoformWifiClient.kt:335` 是
+  `val current = if (authMode == null || ssid == null) getCurrentWifiConfig() else emptyMap()`；
+  KDoc（`:318-321`）写明「两个都给了就不读，省一次查询」是**刻意保持原样**的。
+- 事实：`setAccessPointInfo` 是**整表替换**命令，`mergeApConfigParams` 在 `current` 为空时
+  `passphrase` / `chip_index` 都不会进 params（`broadcast_disabled` 会落到 `0`）。
+- 猜测（未验证）：ZTE 固件对**没发**的键保留原值（否则这条路径早就把口令清空了，而它是设置页的主路径）——
+  但「整表替换命令依赖设备保留未发键」这件事本身没有文档依据，换固件/换设备就未必成立。
+- 建议归属：**不属阶段 0**。改成「一律读回」是**行为变更**（多一次查询、且会把设备当前值显式回写），
+  要么阶段 2 连 route 的入参语义一起想清楚，要么等真机能验「不发某个键会怎样」。
+
+**P1-8 三个 WiFi 写入口返回 `Boolean`，`Failed` 与 `Unavailable` 不可分**
+
+- 现象：改 WiFi 配置失败时，前端分不出「设备拒绝了这个值」和「会话失效 / 连不上」。
+- 事实：`setWifiConfig`（`:326`）/ `setWifiSSID`（`:360`）/ `setWifiPassword`（`:378`）
+  都返回 `Boolean`（走 `writer.write`），而 `WIFI_ACL` 那条（`:294`）已经用 `writer.writeChecked`
+  返回 `WriteOutcome`（三态）。
+- 事实：`GoformSettingWriter` 内部本来就有三态，`write` 只是把它压成 `Boolean`。
+- 建议归属：阶段 2「route 只认 `SettingKey` + 三态」那一步，与 P1-4 是同一件事的不同入口 ——
+  改签名会连带改 route 的状态码（现在 false → 500，三态后应是 503 / 400 分开）。
+
+**P1-9 残缺响应下 `encrypt_type` 的取值变了（已发生的行为差异，P1 记录）**
+
+- 现象：设备只回了 `EncrypType` 但**没回** `AuthMode` 时，改前发 `CCMP`、改后沿用设备原值。
+- 事实（改后）：`mergeApConfigParams`（`:444-451`）`auth = authMode ?: current["AuthMode"]` 为 null
+  时不放 `auth_mode`，但 `encryp = encrypType ?: current["EncrypType"]` 仍会放 `encrypt_type`；
+  profile 侧 `auth` 缺省成 `WPA2PSK`（非 OPEN），于是 `EncrypType` = 设备原值。
+- 事实（改前）：已用 `git show 44dec16^:…/GoformWifiClient.kt` 逐字核对 ——
+  `if (effectiveAuth != null) { … } else { params["AuthMode"] = "WPA2PSK";
+  params["EncrypType"] = encrypType ?: "CCMP" }`，即 `AuthMode` 读不到时发 `CCMP`，
+  **完全不看设备回的 `EncrypType`**。
+- 判断：新行为更保守（沿用设备原值而不是硬塞 `CCMP`），且只在「设备返回残缺」这种本来就不该发生的
+  响应下才有差异，所以**不回退**，只在这里留痕。
+- 建议归属：无需单独处理；真机回归时如果遇到 WiFi 加密方式莫名变化，先回头看这条。
+
+**P1-10 `broadcast_disabled` 改走 Int 通道，非数字字符串会落到 profile 缺省**
+
+- 事实：三个合并函数都用 `current["ApBroadcastDisabled"]?.toIntOrNull()`
+  （`:457-458` / `:492` / `:517`），非数字时该键不进 params；
+  profile 的 encode 再 `?: "0"`（`ZteGoformProfile.kt:1078`）。
+- 事实：改前是 `current[...] ?: "0"`（字符串直传 + 空则 `"0"`）——
+  所以「非数字字符串」这一种输入的结果**与改前同档**（都成 `"0"`），只是路径不同。
+- 猜测（未验证）：设备不会返回非数字的 `ApBroadcastDisabled`（真机一直是 `0` / `1`）。
+- 建议归属：不用改。留这条是为了下次有人看到「Int 通道」时不要以为漏了字符串分支。
+
+**P1-11 `WIFI_AP_CONFIG` 没有 `validate`（SSID / 口令原样进表单）**
+
+- 事实：`ZteGoformProfile.kt:1059-1061` 的注释写明**刻意不加** ——
+  SSID 与口令允许任意字符（含 `&` 和 `=`），body 由 `GoformCodec` 统一 URL 编码；
+  在这里加值域校验会把「现在能设的 SSID」变成 `Rejected`。
+- 事实：其它 17 项里有 validate 的（如 `WIFI_POWER` / `LAN_DHCP` / `TRAFFIC_LIMIT`）
+  都是**本来就有** route 层同义校验的项，加 validate 不改变对外可接受的取值集合。
+- 建议归属：阶段 2「route 只认 `SettingKey` + 三态」那一步。补校验是**对外行为变更**
+  （原来能设的名字变成 400），要与 route 的入参校验一起定，并且要先想清楚「WPA2 口令 8~63 位」
+  这类规则是设备事实还是标准 —— 前者进 profile，后者进 route。
+
+**P1-12 批量 `msg_id`（`"5;6;7;"`）从未经真机验证**
+
+- 事实：`ZteSmsSpec.joinIds` 的 KDoc（`:133-141`）写明：单条 `"5;"` 与现状逐字相同，
+  **多条形态未经真机验证**，签名收 `List<String>` 是为将来批量操作留的。
+- 事实：现在**没有**批量路径 —— `SmsController.kt:343` 与 `:397` 都是循环里一条一条删
+  （`gc.deleteSms(id)`），`markSmsRead` 同样只收单个 id。
+- 建议归属：第一次真做批量删除 / 批量标记之前，先抓一次包确认固件接受 `"5;6;7;"`。
+  在那之前不要写「批量」入口 —— 参数拼得出来不等于设备认。
+
+**P1-13 `order_by=order+by+id+desc` 里的 `+` 是空格，不许再 urlEncode**
+
+- 事实：`ZteSmsSpec.listQuery`（`:93`）输出的值是字面量 `order+by+id+desc`；
+  客户端拼信箱查询 URL 时是**直接字符串拼接**（`GoformSmsClient` 拼 URL 那处的注释也写明「故意不过 encoder」）。
+- 事实：query string 里的 `+` 就是空格，urlEncode 会把它编成 `%2B` → 设备收到字面加号
+  → **排序静默失效**（不报错，只是顺序不对，前端看起来像「新短信没排在最前」）。
+- 建议归属：任何「参数 map → 逐个 urlEncode → 拼 URL」的统一构造器（阶段 1 传输层接口化时很可能会写）
+  **必须带一条针对这个键的编码断言**。要改成真空格就得先真机验一次。
+
+**P1-14 `SET_MSG_READ` 该不该补 `notCallback`**
+
+- 事实：`DELETE_SMS` 发 `notCallback=true`，`SET_MSG_READ` **不发**
+  （`ZteSmsSpec.markReadParams` `:117-122` 照抄 `GoformSmsClient.markSmsRead` 的现状）。
+- 猜测（未验证）：`notCallback` 的作用是让固件不回调 web 前端刷新，补上应该是安全的、
+  甚至更一致 —— 但**没有实测依据**，而「看着像漏了就顺手对齐」正是 §13.1 第 2 条禁止的。
+- 建议归属：真机验一次（发一条、标已读、看前端与设备侧行为有无差异）再决定。不验就不动。
+
+**P1-15 `verifySend` 的号码比对规则是设备事实，现在留在客户端**
+
+- 事实：`GoformSmsClient.verifySend` 用 `number.takeLast(6)` 比对信箱行回填的号码，
+  注释写明理由是「设备回填的号码可能带 `+86` 前缀，全等比对会漏」。
+- 判断：这是**设备事实**（回填格式按固件而异），不是流程 —— 但它现在在客户端。
+- 建议归属：第二台设备接入时若回填格式不同（如带国家码但格式不一样、或返回 E.164），
+  就该进 `SmsSpec`，形如 `fun matchesNumber(rowNumber: String, sentTo: String): Boolean`。
+  现在只有一台设备，加抽象无从验证，所以只登记。
+
+**P1-16 `getSmsMeta` 读的是**读字段**，却硬编码在客户端**
+
+- 事实：`GoformSmsClient.getSmsMeta` 直接取 `json["sms_nv_rev_total"]` 与 `json["sms_unread_num"]`
+  两个设备侧字段名。
+- 判断：按 profile 的分工，读字段应该走 `readSpecs()` + 一个 `FieldGroup`（如 `SMS_META`），
+  由 `FieldNormalizer` 归一化并进 coverage 诊断 —— 现在它们完全不在覆盖率视野里。
+- 建议归属：与 0.4（读命令表）同批做，或阶段 2。注意加 `FieldGroup` 会影响
+  `coverageReport()` 的穷举与 §16 的 `registered` 基线（85 会变），所以**必须和重抓基线一起做**。
+
+**P1-17 `mem_store=1` / `tags=10` 的语义无文档依据**
+
+- 事实：`ZteSmsSpec.listQuery` 的 KDoc（`:73-74`）写明这两项是抄下来的固定值，
+  「真机上一直这么发」，`getSmsList` 与 `getSmsMeta` 两处 URL 除分页外完全一致。
+- 猜测（未验证）：`mem_store=1` 大概是「存储位 = 模块 NV」，`tags=10` 大概是 tag 过滤掩码 ——
+  **都没有证据**，别把猜测写进代码注释。
+- 建议归属：第二台设备接入时考证（同型号不同固件先对比一次）。在那之前照抄。
+
+**P1-18 两份设备文本解码器判据已一致，但仍是两份实现**
+
+- 事实：`GoformClient.decodeDeviceText`（`:944-948`）与
+  `ZteGoformProfile.WIFI_PASSWORD_DECODER`（`:127` → `utf8OrGbk`，`:140` 起）
+  现在判据相同（UTF-8 无损往返优先、否则 GBK），是 `858a9c9` + `090fcad` 两轮分别改的。
+- 事实：**契约不同** —— 客户端那份解码彻底失败返回**空串**（`/api/wifi/settings` 依赖），
+  profile 那份返回 **null（省略该 key）**（`:132` 的注释写明「保持现有语义」）。
+- 建议归属：合并前先把「空串 vs null」这条差异定下来（它就是 P1-6 那件事的另一半）。
+  合并的落点应该是 device-schema（纯 JVM，客户端可以依赖过去），但**不要在 P1-6 之前合** ——
+  否则会把两种失败语义强行并成一种。
+
+**P1-19 安装器仓有一份同样的解码实现（只登记，本轮不改）**
+
+- 事实：`scripts/UFI-AXIS-Core-install-Android/goform/src/main/java/com/ufi_axis/installer/goform/GoformClient.kt:614-627`
+  的 `base64Decode` 是 **`858a9c9` 之前**的形态：无条件 `String(bytes, GBK)`，
+  外面套着那层「再做一次 UTF-8 往返」的死代码，失败同样返回空串。
+- 事实（与主仓不同，别照抄结论）：这份文件里**没有** `base64Encode`、也没有 `setAccessPointInfo`
+  —— 安装器不写 WiFi 配置。所以那里**不存在**「写 UTF-8 / 读 GBK」的不对称，
+  只是读侧实现停留在旧版；非 ASCII 的设备文本会被 GBK 解错。
+- 事实：那份代码**仍在维护** —— 本次改造期间用户正在并行修改整个
+  `scripts/UFI-AXIS-Core-install-Android/**`（含这个文件），所以不能按「废弃代码」处理。
+- 建议归属：**本轮只登记，不许动**（那是另一个仓的范围，且有人正在改）。
+  等用户那一轮改完后单独确认：要不要把主仓 `decodeDeviceText` 的判据同步过去。
 
 
 ---
@@ -1391,6 +1791,17 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - **CONNECTION**：3 / 3 / 0 ✓ 满分
 
 ### 这份基线怎么用
+
+> **2026-09-22 提醒（阶段 0 已改到批 8）**：**阶段 0 完成后必须重新抓一份**，
+> 按 §14.3 的四条判据与这份 85 / 66 / 19 逐条对比 —— 阶段 0 改的是写路径与命令表，
+> 按设计**不应该**动 `readSpecs()`，所以 `registered` 合计仍应是 85、逐组数字不变；
+> 变了就说明改到了不该改的地方。
+> 特别注意两件事：
+> ① 本轮 WiFi 口令的读侧解码器换了字符集（`858a9c9` / `090fcad`）——
+> 它影响的是**值**不是**键**，所以 `hit` / `hit_source` 都不该变；真变了要能解释清楚。
+> ② 0.4 若按建议新增 `FieldGroup`（`FULL_STATUS`，或 P1-16 的 `SMS_META`），
+> `registered` 合计与组数**必然**变 —— 那一步要**先抓基线、再改**，并在 §16 追加一份新基线，
+> 不要直接覆盖这一份（两份对照才能说明差异是新增组带来的）。
 
 - 阶段 0 / 1 做完后重新抓一份，按 §14.3 的四条判据比对
 - `registered` 合计必须还是 **85**、逐组数字不变 → 证明没动 `readSpecs()`

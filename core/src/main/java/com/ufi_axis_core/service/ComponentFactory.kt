@@ -762,7 +762,9 @@ object ComponentFactory {
         val wifiClient = GoformWifiClient(goform, profile)
         val networkClient = GoformNetworkClient(goform, profile)
         val deviceClient = GoformDeviceClient(goform, profile)
-        val smsClient = GoformSmsClient(goform)
+        // 短信客户端要非空 profile：字段归一化可以关（排障开关 → profile = null），
+        // 但短信命令表不能关（没有参数表就发不出短信），口径同 GoformSettingWriter。
+        val smsClient = GoformSmsClient(goform, profile ?: DeviceProfiles.DEFAULT)
         val simClient = GoformSimClient(goform, profile)
         AppLogger.i(TAG, "[4] Goform clients initialized")
 

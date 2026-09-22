@@ -11,6 +11,7 @@ import com.ufi_axis_core.deviceschema.FieldSpec
 import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.Sensitivity
+import com.ufi_axis_core.deviceschema.SmsSpec
 import com.ufi_axis_core.deviceschema.WriteSpec
 import com.ufi_axis_core.deviceschema.fieldOf
 import kotlinx.serialization.json.Json
@@ -658,6 +659,15 @@ object ZteGoformProfile : DeviceProfile {
     // （GoformSettingWriter 的类注释记着这次事故）。动作类 / 改口令的命令反过来必须是 NEVER。
 
     override fun writeSpec(key: SettingKey): WriteSpec? = WRITE_SPECS[key]
+
+    /**
+     * 短信规则在单独的 [ZteSmsSpec] 里（本文件已经 1300+ 行，而短信那套规则自成一体）。
+     *
+     * 为什么不进 [WRITE_SPECS]：`sms_time` 让 encode 不纯、下发后还要回读确认、
+     * 编码是短信专有的 —— 三条理由见计划书 §11.2。
+     */
+    override fun smsSpec(): SmsSpec? = ZteSmsSpec
+
 
     private val WRITE_SPECS: Map<SettingKey, WriteSpec> = mapOf(
         SettingKey.LED to WriteSpec(

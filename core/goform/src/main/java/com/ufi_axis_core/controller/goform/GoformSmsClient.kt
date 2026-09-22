@@ -1,13 +1,12 @@
 package com.ufi_axis_core.controller.goform
 
+import com.ufi_axis_core.deviceschema.DeviceProfile
+import com.ufi_axis_core.deviceschema.SmsSpec
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.serialization.json.*
-import java.util.Calendar
-import java.util.Locale
 import java.util.TimeZone
-import kotlin.math.abs
 
 /**
  * Goform SMS 客户端
@@ -15,9 +14,63 @@ import kotlin.math.abs
  * 从 GoformClient 拆分，负责：
  * - 短信列表查询
  * - 发送/删除/已读标记
+ *
+ * ## 设备事实全在 [SmsSpec] 里，这里只剩流程
+ *
+ * 参数表 / 正文编码 / `sms_time` 格式 / 信箱 tag 取值都来自 `profile.smsSpec()`
+ * （ZTE 的实现见 `ZteSmsSpec`，实测依据也写在那边，**不在这里抄第二份**）。
+ * 留在本类的是流程与调参：登录前置判断、发完回读确认的循环、回读次数与间隔、
+ * 响应体大小上限、日志脱敏。
+ *
+ * ## 为什么 [profile] 是非空的
+ *
+ * 与 [GoformSettingWriter] 同一口径：字段归一化可以关（排障开关 → profile = null），
+ * **写命令表不能关** —— 没有参数表就发不出短信。所以本类要求调用方（`ComponentFactory`）
+ * 先把 profile 定下来，构造参数也**不给默认值**：默认值等于把选型逻辑散进每个客户端的签名，
+ * 换设备要改 N 处且漏一处不报错。
  */
-class GoformSmsClient(private val client: GoformClient) {
+class GoformSmsClient(
+    private val client: GoformClient,
+    profile: DeviceProfile,
+) {
     private val tag = "GoformSms"
+
+    /**
+     * 本机型的短信规则；`null` = 该设备不声明短信能力（`Capability.SMS` 缺失）。
+     *
+     * 为 null 时每个方法**保持自己原有的「失败」返回形态**（null / false / REJECTED）并打一行 WARN，
+     * 不抛异常、不改签名 —— 上层已有的失败分支就是这条路的处理方式。ZTE profile 返回非 null，
+     * 所以线上走不到这里；这条分支是为第二台设备准备的。
+     */
+    private val spec: SmsSpec? = profile.smsSpec()
+
+    /** 取 spec，为空时打一行能看出是哪个入口的 WARN。 */
+    private fun specOrNull(caller: String): SmsSpec? {
+        val s = spec
+        if (s == null) {
+            AppLogger.w(tag, "$caller: 当前设备 profile 未声明短信支持（smsSpec() = null），本次操作不下发")
+        }
+        return s
+    }
+
+    /**
+     * 拼信箱查询 URL：短信专有键来自 [SmsSpec.listQuery]，通用键在这里补。
+     *
+     * `isTest=false` / `multi_data=1` 对 goform 的每一次 GET 都一样，`_=<毫秒>` 是防缓存且依赖时钟，
+     * 三者都不属于设备的短信知识，所以不在 spec 里（见 `SmsSpec.listQuery` 的注释）。
+     *
+     * ## ⚠ 这里**故意**是直接字符串拼接，不许过 URL encoder
+     *
+     * `order_by` 的值是字面量 `order+by+id+desc` —— query string 里的 `+` 代表**空格**，
+     * 设备侧拿到的是 `order by id desc` 这条 SQL 片段。一旦对参数逐个 urlEncode，
+     * `+` 会变成 `%2B`，设备收到字面加号，排序**静默失效**（不报错、只是顺序不对，
+     * 而回读确认依赖 id 降序）。改这段前先真机抓包。
+     */
+    private fun buildSmsListUrl(spec: SmsSpec, page: Int, perPage: Int): String {
+        val smsQuery = spec.listQuery(page, perPage).entries.joinToString("&") { "${it.key}=${it.value}" }
+        return "${client.baseUrl()}/goform/goform_get_cmd_process?isTest=false&multi_data=1&" +
+            "$smsQuery&_=${System.currentTimeMillis()}"
+    }
 
     /**
      * 发送结论。设备回 `success` 只代表受理，最终状态要回读信箱 `tag` 才知道。
@@ -62,10 +115,10 @@ class GoformSmsClient(private val client: GoformClient) {
 
 
     suspend fun getSmsList(page: Int = 0, perPage: Int = 50): JsonObject? {
+        val spec = specOrNull("getSmsList") ?: return null
         if (!client.ensureLogin()) return null
         return try {
-            val base = client.baseUrl()
-            val url = "$base/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=sms_data_total&page=$page&data_per_page=$perPage&mem_store=1&tags=10&order_by=order+by+id+desc&_=${System.currentTimeMillis()}"
+            val url = buildSmsListUrl(spec, page, perPage)
             val response = client.httpGet(url)
             val responseBody = response.bodyAsText()
 
@@ -90,16 +143,16 @@ class GoformSmsClient(private val client: GoformClient) {
     /**
      * 发送短信（goform `SEND_SMS`）+ **回读设备信箱确认真实结果**。
      *
-     * 参数集按 ZTE 固件的实际要求给全：
-     * 1. `sms_time`（固件必填，缺了直接判失败，格式见 [formatSmsTime]）；
-     * 2. `encode_type=UNICODE` 与 UCS2 正文配套（固件只认 `UNICODE` / `GSM7_default`
-     *    这两个枚举，早期写成数值 `0` 属于无效值）；
-     * 3. `notCallback=true`，与删除 / 标记已读保持一致。
+     * 参数表（命令名 / 键名 / `sms_time` 格式 / 正文编码）来自 [SmsSpec.sendParams]，
+     * 那四条设备事实与它们的实测依据都写在 profile 侧（ZTE 见 `ZteSmsSpec`）。
+     * **时钟在这里读**：`System.currentTimeMillis()` + 本机时区由调用点传进 spec ——
+     * spec 必须是纯函数才能在没有设备的情况下被断言，而「缺 `sms_time` / 格式不对」
+     * 正是"短信能收不能发"的历史根因。
      *
      * **为什么必须回读**：`{"result":"success"}` 只表示固件把这条短信**收进发送队列**，
      * 与"运营商真的发出去了"是两件事。2026-09-01 实测就出现过 `result=success` 但对端
-     * 收不到。ZTE 把最终状态写在信箱行的 `tag` 上（`2`=已发送、`3`=发送失败、`4`=草稿），
-     * 所以发完回读几次就能拿到真实结论，而不是让 UI 显示一个假的"发送成功"。
+     * 收不到。ZTE 把最终状态写在信箱行的 `tag` 上（判据取自 [SmsSpec.sentTag] /
+     * [SmsSpec.failedTag]），所以发完回读几次就能拿到真实结论，而不是让 UI 显示一个假的"发送成功"。
      *
      * **失败分两档**（判据见 [SendVerdict]）：设备回了响应但结果是拒绝 → [SendVerdict.REJECTED]；
      * 请求没走完 / 响应读不出来 → [SendVerdict.NO_RESPONSE]（不知道设备有没有已经发出去）。
@@ -110,6 +163,12 @@ class GoformSmsClient(private val client: GoformClient) {
             AppLogger.w(tag, "sendSms rejected: number or body is empty")
             return SendOutcome(SendVerdict.REJECTED, "号码或内容为空")
         }
+        // profile 不声明短信支持 → 一个字节都没发出去，与"未登录"同一判据（设备确定没收到）→
+        // REJECTED。这台设备重试也不会成功，但至少不会重复计费、也不会误计配额。
+        val spec = specOrNull("sendSms") ?: return SendOutcome(
+            SendVerdict.REJECTED,
+            "当前设备 profile 未声明短信支持，发送请求未发出（详见日志）"
+        )
         // 先确认会话：登录不上时 SEND_SMS **一个字节都没发出去**，属于"确定没收到" →
         // REJECTED（可重试）。不先判的话它会和真正的"请求半路断了"一起变成 goformPost
         // 返回 null，被迫按 NO_RESPONSE（不可重试）处理 —— 而 UFI 的会话被官方后台挤掉
@@ -118,7 +177,8 @@ class GoformSmsClient(private val client: GoformClient) {
             AppLogger.w(tag, "sendSms rejected: not logged in, SEND_SMS never dispatched")
             return SendOutcome(SendVerdict.REJECTED, "设备未登录，发送请求未发出（详见日志）")
         }
-        val params = buildSendParams(number, message, formatSmsTime())
+        // 时钟只在这里读一次（spec 里读不了，见上面的 KDoc）
+        val params = spec.sendParams(number, message, System.currentTimeMillis(), TimeZone.getDefault())
         // 先记下发送前的最大信箱 id：回读时只认新出现的行，避免把历史同号短信当成本次结果
         val baselineId = maxSmsId()
         val resp = client.goformPost(params)
@@ -145,7 +205,7 @@ class GoformSmsClient(private val client: GoformClient) {
             return SendOutcome(SendVerdict.REJECTED, "设备明确拒收（详见日志）")
         }
         AppLogger.i(tag, "sendSms accepted by device: to=${maskNumber(number)} chars=${message.length}")
-        val outcome = verifySend(number, baselineId)
+        val outcome = verifySend(spec, number, baselineId)
         when (outcome.verdict) {
             SendVerdict.SENT -> AppLogger.i(tag, "sendSms confirmed sent: to=${maskNumber(number)}")
             SendVerdict.FAILED -> AppLogger.e(tag, "sendSms 设备侧发送失败: to=${maskNumber(number)} ${outcome.detail}")
@@ -164,8 +224,11 @@ class GoformSmsClient(private val client: GoformClient) {
      * 回读设备信箱，找本次发送对应的新行并按 `tag` 判定结果。
      *
      * 号码用后 6 位比对：设备回填的号码可能带 `+86` 前缀，全等比对会漏。
+     *
+     * 循环本身是**流程**（留在客户端），循环里的**判据** tag 取值是设备事实，
+     * 所以由调用方把 [spec] 传进来（换设备 tag 会变，循环不变）。
      */
-    private suspend fun verifySend(number: String, baselineId: Long): SendOutcome {
+    private suspend fun verifySend(spec: SmsSpec, number: String, baselineId: Long): SendOutcome {
         val suffix = number.takeLast(6)
         repeat(VERIFY_ATTEMPTS) {
             kotlinx.coroutines.delay(VERIFY_INTERVAL_MS)
@@ -177,13 +240,13 @@ class GoformSmsClient(private val client: GoformClient) {
                 val num = row["number"]?.jsonPrimitive?.contentOrNull.orEmpty()
                 if (suffix.isNotEmpty() && !num.endsWith(suffix)) continue
                 when (row["tag"]?.jsonPrimitive?.contentOrNull) {
-                    TAG_SENT -> return SendOutcome(SendVerdict.SENT, "设备已发出")
-                    TAG_SEND_FAILED -> return SendOutcome(
+                    spec.sentTag() -> return SendOutcome(SendVerdict.SENT, "设备已发出")
+                    spec.failedTag() -> return SendOutcome(
                         SendVerdict.FAILED,
-                        "设备侧发送失败（信箱 tag=3）：常见原因是短信中心号码(SMSC)未设置、SIM 未开通短信、" +
+                        "设备侧发送失败（信箱 tag=${spec.failedTag()}）：常见原因是短信中心号码(SMSC)未设置、SIM 未开通短信、" +
                             "欠费/未实名或被运营商拦截"
                     )
-                    // tag=4 是草稿/待发，继续等下一轮
+                    // 其它 tag（ZTE 上 4 = 草稿/待发）继续等下一轮
                 }
             }
         }
@@ -195,26 +258,25 @@ class GoformSmsClient(private val client: GoformClient) {
 
 
 
-    suspend fun deleteSms(msgId: String): Boolean =
-        client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "DELETE_SMS",
-            "msg_id" to "$msgId;", "notCallback" to "true"
-        )))
+    suspend fun deleteSms(msgId: String): Boolean {
+        val spec = specOrNull("deleteSms") ?: return false
+        return client.isGoformSuccess(client.goformPost(spec.deleteParams(listOf(msgId))))
+    }
 
-    suspend fun markSmsRead(msgId: String, read: Boolean = true): Boolean =
-        client.isGoformSuccess(client.goformPost(mapOf(
-            "isTest" to "false", "goformId" to "SET_MSG_READ",
-            "msg_id" to "$msgId;", "tag" to if (read) "0" else "1"
-        )))
+    suspend fun markSmsRead(msgId: String, read: Boolean = true): Boolean {
+        val spec = specOrNull("markSmsRead") ?: return false
+        return client.isGoformSuccess(client.goformPost(spec.markReadParams(listOf(msgId), read)))
+    }
 
     /** Goform 短信元数据（总数 / 未读），用于替代 ContentResolver 计数 */
     data class SmsMeta(val total: Int, val unread: Int)
 
     suspend fun getSmsMeta(): SmsMeta? {
+        val spec = specOrNull("getSmsMeta") ?: return null
         if (!client.ensureLogin()) return null
         return try {
-            val base = client.baseUrl()
-            val url = "$base/goform/goform_get_cmd_process?isTest=false&multi_data=1&cmd=sms_data_total&page=0&data_per_page=1&mem_store=1&tags=10&order_by=order+by+id+desc&_=${System.currentTimeMillis()}"
+            // 只要计数，不要数据行：page=0 / data_per_page=1（其余键与 getSmsList 完全一致）
+            val url = buildSmsListUrl(spec, page = 0, perPage = 1)
             val response = client.httpGet(url)
             val responseBody = response.bodyAsText()
             if (response.status == HttpStatusCode.OK && responseBody.isNotEmpty() && !client.isAuthFailure(responseBody)) {
@@ -244,60 +306,14 @@ class GoformSmsClient(private val client: GoformClient) {
     companion object {
         private const val MAX_RESPONSE_BODY = 262_144
 
-        /** ZTE 信箱行的 tag 语义（0/1=收到，2=已发送，3=发送失败，4=草稿） */
-        private const val TAG_SENT = "2"
-        private const val TAG_SEND_FAILED = "3"
-
-        /** 发送后回读确认：3 次 × 1.2s，最多给请求加约 3.6s（用户显式操作，可接受） */
+        /**
+         * 发送后回读确认：3 次 × 1.2s，最多给请求加约 3.6s（用户显式操作，可接受）。
+         *
+         * 这是按 ZTE 实测出来的时间预算，属于调参而不是设备命令表，所以**不进 [SmsSpec]**
+         * （阶段 4 归 `DeviceTuning`）。
+         */
         private const val VERIFY_ATTEMPTS = 3
         private const val VERIFY_INTERVAL_MS = 1_200L
-
-
-        /**
-         * `SEND_SMS` 的参数表（抽出来是为了能在没有设备的情况下断言，见 GoformSmsSendParamsTest）。
-         *
-         * `AD` 不在这里 —— 它由 `GoformClient.computeAd` 统一追加（与参数值无关）。
-         */
-        internal fun buildSendParams(number: String, message: String, smsTime: String): Map<String, String> =
-            linkedMapOf(
-                "isTest" to "false",
-                "goformId" to "SEND_SMS",
-                "notCallback" to "true",
-                "Number" to number,
-                "sms_time" to smsTime,
-                "MessageBody" to toUcs2Hex(message),
-                "ID" to "-1",
-                "encode_type" to "UNICODE",
-            )
-
-        /** UCS2：UTF-16BE 大端字节的小写 hex，无 BOM、无长度前缀。 */
-        internal fun toUcs2Hex(message: String): String =
-            message.toByteArray(Charsets.UTF_16BE).joinToString("") { "%02x".format(it) }
-
-        /**
-         * `sms_time` = `yy;MM;dd;HH;mm;ss;+TZ`，TZ 是相对 UTC 的**小时**偏移（东八区 → `+8`）。
-         *
-         * 用设备时区无从得知，取本机时区（core 跑在这台设备上，和固件同一个时钟源）；
-         * 半小时制时区给成 `+5.5` 这种小数形式。
-         */
-        internal fun formatSmsTime(millis: Long = System.currentTimeMillis(), zone: TimeZone = TimeZone.getDefault()): String {
-            val cal = Calendar.getInstance(zone).apply { timeInMillis = millis }
-            val offsetMin = (cal.get(Calendar.ZONE_OFFSET) + cal.get(Calendar.DST_OFFSET)) / 60_000
-            val sign = if (offsetMin < 0) "-" else "+"
-            val absMin = abs(offsetMin)
-            val tz = if (absMin % 60 == 0) "$sign${absMin / 60}"
-            else sign + String.format(Locale.US, "%.1f", absMin / 60.0)
-            return String.format(
-                Locale.US, "%02d;%02d;%02d;%02d;%02d;%02d;%s",
-                cal.get(Calendar.YEAR) % 100,
-                cal.get(Calendar.MONTH) + 1,
-                cal.get(Calendar.DAY_OF_MONTH),
-                cal.get(Calendar.HOUR_OF_DAY),
-                cal.get(Calendar.MINUTE),
-                cal.get(Calendar.SECOND),
-                tz,
-            )
-        }
 
         /** 日志里的号码只留前 3 后 2（发送失败要看是不是号码串错了，但不该把完整号码写进日志）。 */
         internal fun maskNumber(number: String): String =

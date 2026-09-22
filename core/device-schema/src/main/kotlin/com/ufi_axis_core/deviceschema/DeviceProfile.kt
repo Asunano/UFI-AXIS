@@ -59,6 +59,118 @@ interface DeviceProfile {
 
     /** 写操作规则；不支持该项则返回 null（route 应回 `NOT_SUPPORTED`）。 */
     fun writeSpec(key: SettingKey): WriteSpec?
+
+    /**
+     * 短信规则。不支持短信的设备返回 null（对应 `Capability.SMS` 缺失）。
+     *
+     * ## 为什么短信不走 [SettingKey] + [WriteSpec]（计划书 §11.2，已决）
+     *
+     * 三条理由，任一都足以否掉「塞进通用写入表」：
+     * 1. [WriteSpec.encode] 必须是纯函数，而短信参数里有 `sms_time` —— 原实现的默认参数是
+     *    `System.currentTimeMillis()` + `TimeZone.getDefault()`，藏进 `encode` 就没法断言；
+     * 2. 下发之后还有**回读确认**（轮询信箱看 `tag`）。`WriteSpec` 只能表达「发一条命令」，
+     *    表达不了「发完再查」；
+     * 3. 编码是短信专有的（UCS2 正文 / `encode_type` / `ID=-1` / `sms_time` 的分号串格式），
+     *    放进通用写入表等于让一个 key 带一套只有它用的编码规则。
+     *
+     * 默认返回 null 而不是抛异常：新 profile 不写短信支持时应当是「没有这个能力」，
+     * 不是「忘了实现」——上层按 null 回 `NOT_SUPPORTED` 即可。
+     */
+    fun smsSpec(): SmsSpec? = null
+}
+
+/**
+ * 一类设备的短信规则。
+ *
+ * ## 边界：这里只放「设备事实」，不放流程与调参
+ *
+ * - **流程留在客户端**：发完回读确认的那个循环（`GoformSmsClient.verifySend`）是流程，
+ *   不是设备事实；但循环里的**判据**（[sentTag] / [failedTag]）必须来自本接口 ——
+ *   换一台设备，tag 的取值就会变，而循环结构不变。
+ * - **实测调参不进本接口**：回读的次数与间隔（ZTE 上是 3 次 × 1.2s）属于按机型实测出来的
+ *   时间预算，归计划书 §3.2 的 `DeviceTuning`（阶段 4），不要往这里加 `verifyAttempts()`。
+ * - **全部成员必须是纯函数**：同样的入参永远得到同样的输出。不读时钟、不读全局状态、
+ *   不做 I/O。这是「没有设备也能断言」的前提，也是整个 profile 抽象的底线约束。
+ */
+interface SmsSpec {
+
+    /**
+     * 下发一条短信的参数表。
+     *
+     * 为什么在契约里：命令名（`goformId`）、参数键名、正文编码、时间格式**全部**按设备而异，
+     * 这四件事凑在一起就是「怎么发一条短信」这条设备知识的全部内容。
+     *
+     * **不许读系统时钟**：时间戳与时区由调用方传入。现有 `GoformSmsClient.formatSmsTime`
+     * 之所以能被单测覆盖，正是因为 `buildSendParams(number, message, smsTime)` 把时间作为
+     * **入参**；一旦实现里去取 `System.currentTimeMillis()`，这张参数表就再也没法断言，
+     * 而「缺 `sms_time` / 格式不对」恰恰是「短信能收不能发」的历史根因。
+     *
+     * @param number 目标号码，**已 trim**（是否 trim 属于调用方意图，不是设备事实）。
+     * @param message 正文明文。编码由 [encodeBody] 做。
+     * @param atMillis 发送时刻（epoch 毫秒）。
+     * @param zone 渲染 `sms_time` 用的时区。
+     * @return 设备侧参数表。实现应返回**有序** map（`linkedMapOf`）：个别固件对表单字段顺序敏感，
+     *   顺序本身就是抄下来的事实之一。
+     */
+    fun sendParams(number: String, message: String, atMillis: Long, zone: java.util.TimeZone): Map<String, String>
+
+    /**
+     * 信箱列表查询的 cmd 与分页参数。
+     *
+     * 为什么在契约里：查信箱这件事在 goform 上是 `cmd=sms_data_total` 加一串分页/排序/存储位
+     * 参数，换一套后台就完全是另一组键 —— 上层只应该说「要第几页、每页几条」。
+     *
+     * 实现只返回**短信专有**的键。传输层通用的那几个（goform 的 `isTest` / `multi_data` /
+     * 防缓存的 `_=时间戳`）由客户端统一追加：它们对每一次读取都一样，而 `_` 还依赖时钟，
+     * 放进来就破坏纯函数。
+     */
+    fun listQuery(page: Int, perPage: Int): Map<String, String>
+
+    /**
+     * 删除若干条短信的参数表。
+     *
+     * 为什么在契约里：id 的**参数名与拼接方式**是设备事实（goform 是 `msg_id` + 分号分隔，
+     * 且末尾也要带一个分号），不是调用方该知道的东西。
+     */
+    fun deleteParams(ids: List<String>): Map<String, String>
+
+    /**
+     * 标记若干条短信的已读状态。
+     *
+     * 为什么在契约里：同上 —— 参数名、id 拼法、以及「已读/未读」在设备侧的取值都按设备而异。
+     *
+     * `read` 有默认值是为了让契约的主用法保持 `markReadParams(ids)` 这一种形状；
+     * 但它**必须存在** —— 对外 `POST /api/sms/read` 支持 `read=false`（标回未读），
+     * 现有 `GoformSmsClient.markSmsRead(msgId, read)` 的两个分支都在被调用，
+     * 只表达「标已读」会静默丢掉一半既有行为（计划书 §11.2 列的签名里漏了这个参数，
+     * 见报告里的 P1 说明）。
+     */
+    fun markReadParams(ids: List<String>, read: Boolean = true): Map<String, String>
+
+    /**
+     * 信箱行上「已发送」的 tag 取值。
+     *
+     * 为什么在契约里：设备回 `success` 只代表**受理**，真实结果写在信箱行的 `tag` 上，
+     * 而这个编码是纯粹的设备约定（ZTE 是 `2`）。判据放进 spec，回读循环留在客户端。
+     */
+    fun sentTag(): String
+
+    /**
+     * 信箱行上「发送失败」的 tag 取值。
+     *
+     * 为什么和 [sentTag] 分成两个成员：上层拿它决定「要不要重试 / 要不要计费」，
+     * 「失败」与「还没出结果」必须能分开 —— 合并成一个「终态集合」就分不出来了。
+     */
+    fun failedTag(): String
+
+    /**
+     * 正文编码（UCS2 / GSM7 / 明文…）。
+     *
+     * 为什么在契约里：编码方式与 [sendParams] 里声明编码的那个键是**配套**的一对
+     * （goform 上是 UCS2 正文 + `encode_type=UNICODE`）。拆开就会出现「按 UCS2 编码却
+     * 声明成另一种」这类**读取毫无影响、但发不出去**的错误。
+     */
+    fun encodeBody(message: String): String
 }
 
 /**
