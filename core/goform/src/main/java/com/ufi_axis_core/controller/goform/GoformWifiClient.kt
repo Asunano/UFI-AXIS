@@ -378,6 +378,26 @@ class GoformWifiClient(
      * 设备侧开/关是**两条不同的命令**（开 `switchWiFiChip` + `ChipEnum=chip1&GuestEnable=0`，
      * 关 `switchWiFiModule` + `SwitchOption=0`），命令选择与参数集都在
      * [SettingKey.WIFI_ENABLED] 的 WriteSpec 里 —— 这里不再留 if。
+     *
+     * ## ⚠ 这个方法的「开」语义是错的（2026-09-22 真机抓包确认，本轮刻意不修）
+     *
+     * **已确认的事实**：`switchWiFiChip` 是**切换 WiFi 频段**，不是「开 WiFi」——
+     * `ChipEnum=chip1` = 2.4G、`ChipEnum=chip2` = 5G（抓包原文：
+     * `goformId=switchWiFiChip&isTest=false&ChipEnum=chip1&GuestEnable=0`）。
+     *
+     * **当前的问题**：`setWifiEnabled(true)` 发出去的其实是「切到 2.4G」；而真正的频段切换
+     * **没有任何入口**（用户实测现象是「WiFi 频段修改无效」）。`setWifiEnabled(false)` 那条
+     * `switchWiFiModule&SwitchOption=0` 没有被这次抓包否定。
+     *
+     * **为什么不在这一轮修**：修法是把它拆成「真开关」+「切频段」两件事，而前提是知道
+     * 「开 WiFi」那条命令到底发什么。对称地猜 `switchWiFiModule&SwitchOption=1` 是很自然的，
+     * 但本项目从未发过这条、这次抓包里也没有它 —— **在拿到那条抓包之前不许按对称性猜**
+     * （[SettingKey.WIFI_ENABLED] 的 WriteSpec 注释里「实测边界」那段早就警告过一次）。
+     *
+     * **拆分后这里要改成什么**：本方法只保留「真开关」语义（`switchWiFiModule`，
+     * `SwitchOption=0|1`）；另加一个 `setWifiBand(...)` 走新的 `SettingKey.WIFI_BAND`
+     * （`switchWiFiChip` + `ChipEnum=chip1|chip2` + `GuestEnable=0`）。命令与参数照旧全在
+     * profile 里，这里仍然不留 if。完整方案写在 [SettingKey.WIFI_ENABLED] 的 WriteSpec 注释。
      */
     suspend fun setWifiEnabled(enabled: Boolean): Boolean =
         writer.write(SettingKey.WIFI_ENABLED, enabled)

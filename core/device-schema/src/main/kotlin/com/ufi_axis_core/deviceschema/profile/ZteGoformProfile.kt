@@ -1082,24 +1082,71 @@ object ZteGoformProfile : DeviceProfile {
         ),
         // ───── 阶段 0 批 1b：开/关是两条命令的写入项（方案 b：WriteSpec.commandOf）─────
         //
-        // 下面三项的共同点：一个用户动作（开/关），设备侧却是两条不同的 goformId。
+        // 下面三项（WIFI_ENABLED / MOBILE_DATA / PPP_DIAL）的共同点：一个用户动作（开/关），
+        // 设备侧却是两条不同的 goformId。
         // 命令选择写在 commandOf 里，调用点只传一个布尔 —— 不给这个字段的话，
         // "开发 A 命令、关发 B 命令"这段设备知识就会以 if 的形式漏在客户端里。
+        // （WIFI_BAND 夹在中间但**不属于这一类**：它只有一条命令，放这里是因为它与
+        //   WIFI_ENABLED 的"开"分支是同一条设备命令，两项要并排读才看得懂。）
 
-        // WiFi 总开关：逐字对齐 GoformWifiClient.setWifiEnabled 的两个分支
-        //   开 → goformId=switchWiFiChip & ChipEnum=chip1 & GuestEnable=0
-        //   关 → goformId=switchWiFiModule & SwitchOption=0
-        // 两边的参数都是固定常量（没有任何来自调用方的自由文本），所以不需要 validate ——
-        // 这也是批 1 的 WIFI_CHIP / WIFI_MODULE 合并成一项的依据：它不是"切芯片"能力，
-        // 而就是"开关 WiFi"一个动作。
-        // 实测边界：switchWiFiModule 只在"关"的时候用到，SwitchOption=1（开）本项目从未发过、
-        // 没有实测依据；switchWiFiChip 也从未用来关 WiFi。要改任一分支先上真机验。
+        // WiFi 总开关：开与关是两条不同的命令，参数集也完全不同。
+        // 2026-09-22 真机抓包（**权威、逐字**）：
+        //   关闭 WiFi：goformId=switchWiFiModule&isTest=false&SwitchOption=0&AD=...
+        //   开启 WiFi：goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0&AD=...
+        // 抓包时用户设备在 5G，所以"开"发的是 chip2。结合已确认的 chip1=2.4G / chip2=5G，
+        // switchWiFiChip&ChipEnum=X&GuestEnable=0 的语义是**「在频段 X 上启用 WiFi」** ——
+        // 既是"开"也是"切频段"，同一条命令。切频段的独立入口是 SettingKey.WIFI_BAND（下一项）。
+        //
+        // chip 参数（可选，取值 chip1 / chip2 —— 设备自己的词汇，与读侧 wifi_chip 的取值域一致）：
+        //   有值 → 原样作 ChipEnum 下发；
+        //   缺失 → 退回 chip1。这是**调用方没告诉我当前频段时的兜底，会把设备切到 2.4G**，
+        //          属于已知的不理想分支：调用方（GoformWifiClient）有责任传设备当前频段。
+        //          在 2026-09-22 之前这里是**硬编码 chip1**，后果是用户在 5G 下点"打开 WiFi"
+        //          被静默切到 2.4G（真 bug）；现在硬编码只剩"缺参数"这一条路径。
+        //   关分支**不读 chip**：switchWiFiModule 只认 SwitchOption，传了 chip 也无害、
+        //          不影响编码结果（所以调用方不必为"关"特意去读当前频段）。
+        //
+        // ── 注释归档：原「拆分方案」的第 2 步已被上面这份抓包否定 ──
+        // 2026-09-22 之前这里记着一个拆分方案，其第 2 步写的是「WIFI_ENABLED 只保留
+        // switchWiFiModule，SwitchOption=0|1，删掉 commandOf」。**那一步是错的**：开 WiFi 用的是
+        // switchWiFiChip（带频段），不是 switchWiFiModule&SwitchOption=1。
+        // **SwitchOption=1 本项目从未发过、抓包里也没有，至今无任何实测依据 —— 不许出现在代码里。**
+        // 这条记录留着是因为当时的克制是对的：那段注释明确写了「在拿到那条抓包之前不许按对称性猜」，
+        // 也正因此没把 SwitchOption=1 写进代码 —— 否则今天线上就是一条设备可能根本不认的
+        // 静默失败命令。事实部分不变：switchWiFiChip 不是纯开关，而是「带频段启用」。
         SettingKey.WIFI_ENABLED to WriteSpec(
             command = "switchWiFiChip",
             commandOf = { p -> if (isOn(p["value"])) "switchWiFiChip" else "switchWiFiModule" },
             encode = { p ->
-                if (isOn(p["value"])) mapOf("ChipEnum" to "chip1", "GuestEnable" to "0")
+                if (isOn(p["value"])) mapOf(
+                    "ChipEnum" to (p["chip"]?.toString() ?: WIFI_CHIP_FALLBACK),
+                    "GuestEnable" to "0",
+                )
                 else mapOf("SwitchOption" to "0")
+            },
+            // 只校验 chip（value 是布尔语义，沿用 isOn 的宽松判定 —— 与 commandOf/encode 同一判据）。
+            // 不 trim：encode 发的是 toString() 原值，校验若 trim 就会放过 " chip1" 再原样下发。
+            validate = { p ->
+                val chip = p["chip"]?.toString()
+                if (chip != null && chip !in WIFI_CHIPS) WIFI_CHIP_REJECT_REASON else null
+            },
+            retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
+        ),
+        // WiFi 频段选择：与上一项的"开"分支是**同一条命令**（switchWiFiChip），
+        // 所以它**同时会把 WiFi 打开** —— 设备侧没有"只切频段不动开关"的形态。
+        // 取值只收设备词汇 chip1 / chip2：不接受界面文案（2.4G / 5G），也不接受读侧
+        // ChipIndex 的原始编码（0 / 1）—— 收了别名就是让三套取值域在这里互相透传。
+        // 没有 fallback：这条命令没有"老固件不认换一条"的实测依据。
+        SettingKey.WIFI_BAND to WriteSpec(
+            command = "switchWiFiChip",
+            encode = { p ->
+                mapOf(
+                    "ChipEnum" to (p["value"]?.toString() ?: ""),
+                    "GuestEnable" to "0",
+                )
+            },
+            validate = { p ->
+                if (p["value"]?.toString() in WIFI_CHIPS) null else WIFI_CHIP_REJECT_REASON
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
@@ -1149,8 +1196,10 @@ object ZteGoformProfile : DeviceProfile {
         // 「只改口令」那个入口对 OPEN 也发 Password，那是调用方的意图而不是设备事实。
         // 把那个条件写进 encode，三处就共用不了同一份实现（见 SettingKey.WIFI_AP_CONFIG 的 KDoc）。
         //
-        // 没有 validate：SSID 与口令允许任意字符（含 & 和 =），body 由 GoformCodec 统一 URL 编码；
-        // 在这里加一条值域校验会把现在能设的 SSID 变成 Rejected，那是对外行为变更，不属于搬运。
+        // validate 只覆盖 auth_mode 与 max_sta_num（2026-09-22 真机抓包给出了权威取值表，
+        // 见 validateApConfig）。**SSID 与口令仍然不校验**：它们允许任意字符（含 & 和 =），
+        // body 由 GoformCodec 统一 URL 编码；在这里给 SSID / 口令加格式校验会把现在能设的值
+        // 变成 Rejected，那是对外行为变更 —— 这也是当初整项没有 validate 的原始理由，仍然成立。
         SettingKey.WIFI_AP_CONFIG to WriteSpec(
             command = "setAccessPointInfo",
             encode = { p ->
@@ -1175,6 +1224,7 @@ object ZteGoformProfile : DeviceProfile {
                 out["ChipIndex"] = p["chip_index"]?.toString() ?: AP_CHIP_INDEX_DEFAULT
                 out
             },
+            validate = ::validateApConfig,
             // 设置类命令、同一取值幂等（同一份配置发两次结果一样），与其余 18 项一致
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
@@ -1198,6 +1248,68 @@ object ZteGoformProfile : DeviceProfile {
 
     /** 芯片序号缺省值（单芯片机型恒为 "0"）。 */
     private const val AP_CHIP_INDEX_DEFAULT = "0"
+
+    /**
+     * `AuthMode` 的完整取值域（2026-09-22 真机抓包，界面四个选项逐条对齐设备参数）：
+     *
+     * | 界面选项 | AuthMode | EncrypType | Password |
+     * |---|---|---|---|
+     * | `OPEN` | `OPEN` | `NONE` | **不发** |
+     * | `WPA2(AES)-PSK` | `WPA2PSK` | `CCMP` | 发 |
+     * | `WPA3-PSK` | `WPA3PSK` | `CCMP` | 发 |
+     * | `WPA2-PSK/WPA3-PSK` | `WPA2PSKWPA3PSK` | `CCMP` | 发 |
+     *
+     * 设备**大小写敏感**，所以这里不做大小写兼容（`wpa2psk` 直接拒）。
+     * 缺省档 [AP_AUTH_DEFAULT] 必须在这张表里 —— 所以它是这个集合的成员而不是另写一个字面量：
+     * 调用方不传 `auth_mode` 时 encode 会填缺省档，缺省档掉出白名单就成了「校验放过、设备拒收」。
+     */
+    private val AP_AUTH_MODES = setOf(AP_AUTH_OPEN, AP_AUTH_DEFAULT, "WPA3PSK", "WPA2PSKWPA3PSK")
+
+    /**
+     * `max_sta_num` 的合法区间：**闭区间 `1..10`**。
+     *
+     * 依据：**用户对中兴 F50 的实测/规格结论 —— 最大支持 10 个（2026-09-22）**。
+     * 在此之前这里刻意不设上限（注释写的是「真机见过 7 与 10，固件真实上限未知」）；
+     * 现在上限有了权威来源，超过 10 就该在下发前拒掉，而不是让设备静默按自己的上限截断。
+     */
+    private val AP_MAX_STA_NUM_RANGE = 1..10
+
+    /**
+     * WiFi 热点配置的值域校验：**只管 `auth_mode` 与 `max_sta_num`**。
+     *
+     * ## 为什么只管这两项
+     *
+     * 只有这两项有权威取值依据（[AP_AUTH_MODES] 那张真机表 / [AP_MAX_STA_NUM_RANGE] 那条 F50 结论）。
+     * SSID 与 `passphrase` **一个都不校验**：它们允许任意字符（含 `&` 和 `=`），
+     * 加格式校验会把现在能设的值变成 Rejected。
+     *
+     * ## 三条刻意的选择
+     *
+     * 1. **null == 不传**（不是「传了个空值」）：与 encode 的 `p["auth_mode"]?.toString() ?: 缺省`
+     *    逐字一致。用 `containsKey` 判会让「显式传 null」被拒，而那条路径今天是走缺省值的。
+     * 2. **不 trim**：encode 发的是 `toString()` 原值，这里 trim 后比对就会让 `" WPA2PSK "`
+     *    通过校验、再被原样发给设备 —— 校验与下发必须看同一个字符串。
+     * 3. `max_sta_num` 判**闭区间 [AP_MAX_STA_NUM_RANGE]**（`1..10`）：上限 10 来自用户对
+     *    中兴 F50 的实测/规格结论（2026-09-22）。越界在下发前就拒，比让设备按自己的上限
+     *    静默截断要好 —— 用户能看见原因。
+     *
+     * 返回文案**不含参数值**（计划书 §11.3）：这份 params 里有明文口令，被拒原因会进日志。
+     */
+    private fun validateApConfig(p: Map<String, Any?>): String? {
+        p["auth_mode"]?.let { raw ->
+            if (raw.toString() !in AP_AUTH_MODES) {
+                return "认证方式只支持 OPEN / WPA2PSK / WPA3PSK / WPA2PSKWPA3PSK（大小写敏感）"
+            }
+        }
+        p["max_sta_num"]?.let { raw ->
+            val n = raw.toString().toIntOrNull()
+            if (n == null || n !in AP_MAX_STA_NUM_RANGE) {
+                return "最大接入设备数必须是 1~10 的整数（中兴 F50 最大支持 10 个）"
+            }
+        }
+        return null
+    }
+
 
     /**
      * WiFi 口令的写侧编码：base64(UTF-8)。
@@ -1234,6 +1346,29 @@ object ZteGoformProfile : DeviceProfile {
 
     /** 设备侧 `ConnectionMode` 的取值域（大小写敏感，认不出不许猜一个下发）。 */
     private val CONNECTION_MODES = setOf("auto_dial", "manual_dial")
+
+    // ────────────────────── WiFi 频段（switchWiFiChip 的 ChipEnum） ──────────────────────
+
+    /**
+     * `ChipEnum` 的取值域：`chip1` = 2.4G、`chip2` = 5G（2026-09-22 真机抓包）。
+     *
+     * 这套词汇与读侧 canonical 字段 `wifi_chip` 的取值域**逐字一致**（见 WIFI_CHIP_DECODER：
+     * `ChipIndex=0` → `chip1`、`1` → `chip2`）。刻意不收 `"2.4G"` / `"5G"`（界面文案）与
+     * `"0"` / `"1"`（读侧原始编码）：一旦收别名，读侧编码就会被当设备值透传。
+     */
+    private val WIFI_CHIPS = setOf("chip1", "chip2")
+
+    /**
+     * [SettingKey.WIFI_ENABLED] 的「开」分支在**调用方没给 chip** 时用的兜底频段。
+     *
+     * 它会把设备切到 2.4G —— 是已知的不理想分支，不是推荐路径（调用方有责任传当前频段）。
+     * 2026-09-22 之前这个值是 encode 里的硬编码字面量，现在只剩"缺参数"这一条路径会用到它。
+     */
+    private const val WIFI_CHIP_FALLBACK = "chip1"
+
+    /** 频段取值被拒的统一文案（不含参数值：被拒原因会进日志）。 */
+    private const val WIFI_CHIP_REJECT_REASON = "WiFi 频段只支持 chip1（2.4G）/ chip2（5G）"
+
 
 
     private val SHA256_UPPER_HEX = Regex("^[0-9A-F]{64}$")

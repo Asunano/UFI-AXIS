@@ -360,6 +360,13 @@ export const Endpoints = {
     frontendInfo: '/api/update/frontend-info',
     /** 只检查 core 自身版本：{ current_version, latest_version, has_update, changelog, apk_url, apk_size, sha256 } */
     backendInfo: '/api/update/backend-info',
+    /**
+     * 更新源决策快照（2026-09-22，只读、无入参）：
+     * `{ mode, country, use_mirror, mirror_prefixes }`。
+     * 给 app 用（它的 APK 自更新不走 core 代理，只取决策自己拼 URL）；web 目前不需要它，
+     * 因为 web 不下载任何东西 —— 登记在这里是为了让契约完整、不被当成"野端点"。
+     */
+    source: '/api/update/source',
   },
   webAssets: {
     check: '/api/web/check',
@@ -610,6 +617,148 @@ export const NetworkModeSwitchBudgetMs = (() => {
  */
 export function shouldKeepProbingMode(attemptNo: number, reachedTarget: boolean): boolean {
   return !reachedTarget && attemptNo < NetworkModeSwitchProbe.maxAttempts;
+}
+
+// ────────────────────────────────────────────────────────────
+// WiFi 安全模式 —— POST /api/wifi/config 的 auth_mode + encryp_type
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 界面上「加密方式」的一档 = 设备侧 **两个**参数（`auth_mode` + `encryp_type`）。
+ *
+ * 取值来自 2026-09-22 真机抓包。core 侧 `WifiRoutes.kt` 的 `/wifi/config` 只是把
+ * `auth_mode` / `encryp_type` 原样透传给 goform（仅对 OPEN 特判），所以**配对关系由客户端负责**。
+ *
+ * 为什么绑成一档而不给两个下拉：这两个参数在设备侧必须配对下发，分开选就能造出
+ * 「WPA3PSK + NONE」这种设备收下了却不生效的组合 —— 又一个假开关。
+ *
+ * 注意字段名是 `encryp_type`（**不是** `encrypt_type`），与设备后台同名。
+ */
+export interface WifiSecurityPreset {
+  /** 下拉显示名 */
+  label: string;
+  /** 下拉 value，同时就是要下发的 `auth_mode`（设备参数值即键，省掉一层映射） */
+  value: string;
+  /** 与 value 配对下发的 `encryp_type` */
+  encrypType: string;
+  /** false = 开放网络，提交时**不带** `passphrase` */
+  needsPassphrase: boolean;
+}
+
+export const WifiSecurityPresets: ReadonlyArray<WifiSecurityPreset> = [
+  { label: '开放（无密码）', value: 'OPEN', encrypType: 'NONE', needsPassphrase: false },
+  { label: 'WPA2(AES)-PSK', value: 'WPA2PSK', encrypType: 'CCMP', needsPassphrase: true },
+  { label: 'WPA3-PSK', value: 'WPA3PSK', encrypType: 'CCMP', needsPassphrase: true },
+  { label: 'WPA2-PSK/WPA3-PSK', value: 'WPA2PSKWPA3PSK', encrypType: 'CCMP', needsPassphrase: true },
+];
+
+/** 读不到设备当前值时的兜底档位，与 core 缺省写的 `WPA2PSK` 一致。 */
+export const WIFI_AUTH_MODE_DEFAULT = 'WPA2PSK';
+
+/** 按 `auth_mode` 找预设。找不到 = 设备用了表外写法（老固件/别的型号），返回 undefined。 */
+export function findWifiSecurityPreset(authMode: string | undefined | null): WifiSecurityPreset | undefined {
+  const key = String(authMode ?? '').trim();
+  if (!key) return undefined;
+  return WifiSecurityPresets.find((p) => p.value === key);
+}
+
+/**
+ * 这一档要不要密码框。
+ *
+ * 表外写法按「要密码」处理：宁可多留一个输入框，也不要把一个已加密的网络
+ * 当成开放网络提交（那会把密码丢掉，所有已连设备立刻掉线）。
+ */
+export function wifiSecurityNeedsPassphrase(authMode: string | undefined | null): boolean {
+  return findWifiSecurityPreset(authMode)?.needsPassphrase ?? true;
+}
+
+/**
+ * 下拉选项 = 4 个权威档位 +（设备当前值如果是表外写法就置顶并入）。
+ *
+ * 并入当前值是必须的：不然 select 对一台回读 `WPAPSK` 的设备显示空白，
+ * 用户随手一保存就把加密方式改成了别的档 —— 他并没有要求改这一项。
+ *
+ * 返回**可变数组**：naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，
+ * 给 readonly 会在 vue-tsc 里报 TS4104。
+ */
+export function wifiSecurityOptions(currentAuthMode?: string | null): Array<{ label: string; value: string }> {
+  const base = WifiSecurityPresets.map((p) => ({ label: p.label, value: p.value }));
+  const cur = String(currentAuthMode ?? '').trim();
+  if (cur && !findWifiSecurityPreset(cur)) {
+    return [{ label: `${cur}（设备当前值，保持不变）`, value: cur }, ...base];
+  }
+  return base;
+}
+
+/**
+ * `max_sta_num` 的合法闭区间 `[1, 10]`。
+ *
+ * 上限 10 来自用户对**中兴 F50** 的规格结论（2026-09-22），与 core 侧
+ * `ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 用它拒 1..10 之外的值）对齐。
+ * 导出是为了让两个 WiFi 表单的 `n-input-number :min/:max` 与本文件的提交守门共用同一份取值，
+ * 而不是各写一个字面量。
+ */
+export const WifiMaxStaNumRange = { min: 1, max: 10 } as const;
+
+/**
+ * `max_sta_num` 是否可提交。
+ *
+ * `null` = 留空，语义是「不修改」（core 不传时压根不下发 ApMaxStationNumber）。
+ * 其余必须是 [WifiMaxStaNumRange] 闭区间内的整数：越界值 core 侧 `validateApConfig`
+ * 会直接 Rejected，在这里先拦下来，用户才看得到原因而不是一句「保存失败」。
+ *
+ * 这一层是**必须**的：`n-input-number` 的 `:max` 只在用步进器时硬夹，
+ * 用户手打 `99` 仍会落进 form。
+ */
+export function isWifiMaxStaNumAcceptable(v: number | null | undefined): boolean {
+  if (v === null || v === undefined) return true;
+  return Number.isInteger(v) && v >= WifiMaxStaNumRange.min && v <= WifiMaxStaNumRange.max;
+}
+
+/** 表单侧的 WiFi 配置输入，由 [buildWifiConfigPayload] 翻成 `POST /api/wifi/config` 的报文。 */
+export interface WifiConfigFormInput {
+  ssid: string;
+  /** 加密方式下拉的 value，即要下发的 `auth_mode` */
+  authMode: string;
+  passphrase: string;
+  /** null = 留空不修改 */
+  maxStaNum: number | null;
+  /** true = **隐藏** SSID，对应 `broadcast_disabled=1` */
+  hidden: boolean;
+  /** 写接口的 `chip_index`（`"0"` = chip1/2.4G，`"1"` = chip2/5G）；不传则不下发 */
+  chipIndex?: string;
+  /** 设备回读的 `encryp_type`，仅在 authMode 是表外写法时作为透传兜底 */
+  fallbackEncrypType?: string;
+}
+
+/**
+ * 拼 `POST /api/wifi/config` 的报文。**两个 WiFi 设置表单共用这一份**。
+ *
+ * 为什么收敛到这里：OPEN 档不能带 `passphrase`、`encryp_type` 不传会被 core 硬写成 CCMP，
+ * 这两条规则抄两份就一定会有一份漏掉（原来两个表单各自拼报文，`encryp_type` 也各写了一遍）。
+ */
+export function buildWifiConfigPayload(input: WifiConfigFormInput): Record<string, unknown> {
+  const preset = findWifiSecurityPreset(input.authMode);
+  const payload: Record<string, unknown> = {
+    ssid: input.ssid,
+    auth_mode: input.authMode,
+    // 预设档用配对值；表外写法把设备回读值原样带回去。
+    // 都不传时 core 会把 EncrypType 硬写成 CCMP，等于改 SSID 顺手改坏了加密方式。
+    encryp_type: preset ? preset.encrypType : input.fallbackEncrypType || undefined,
+    // 语义是「隐藏」：1 = 隐藏（不广播），0 = 广播。别按字面当成「广播开关」。
+    broadcast_disabled: input.hidden ? 1 : 0,
+  };
+  if (input.chipIndex !== undefined) payload.chip_index = input.chipIndex;
+  // 留空 / 越界都不下发：core 不传时保持设备现值，比下发一个设备会拒的值安全。
+  // 判定复用 [isWifiMaxStaNumAcceptable]（它对 null 返回 true，所以还要排掉 null）——
+  // 在这里另写一遍区间比较，两处迟早会漂移（原来这里写的是 `> 0`，与守门条件各说各话）。
+  if (input.maxStaNum !== null && isWifiMaxStaNumAcceptable(input.maxStaNum)) {
+    payload.max_sta_num = input.maxStaNum;
+  }
+  // 开放网络**不带** passphrase：真机 OPEN 档只发 AuthMode=OPEN + EncrypType=NONE，
+  // 多带一个密码字段会让设备按「有密码」处理，结果是选了开放却连不上。
+  if (preset ? preset.needsPassphrase : true) payload.passphrase = input.passphrase;
+  return payload;
 }
 
 /**
@@ -1001,6 +1150,23 @@ export const ConfigLimits = {
   qosGoformSetMax: [1, 4],
   smsCodeCleanupHours: [0, 720],
 } as const;
+
+/**
+ * 更新下载方式（2026-09-22：决策下沉 core，见 `docs/update-source-core-plan.md`）。
+ *
+ * `update_source_mode` 是**唯一决策字段**，客户端只读写它；「用不用镜像 / 用哪个镜像 /
+ * 失败怎么换源」全部由 core 的 `MirrorResolver` 决定。`update_url` 与 `update_mirror_base`
+ * 自此是 core 的实现细节（清单地址 + 自定义前缀覆盖），**web 只读不写** ——
+ * 写了就等于又多出一个决策方，而那正是这次改造要消除的东西。
+ */
+export const UpdateSourceMode = {
+  /** 按设备出口地区：`CN` 走镜像，其他地区与「未测出」都直连 */
+  AUTO: 'auto',
+  MIRROR: 'mirror',
+  DIRECT: 'direct',
+} as const;
+
+export type UpdateSourceModeValue = (typeof UpdateSourceMode)[keyof typeof UpdateSourceMode];
 
 /** `PUT /api/config` 响应 `rejected_fields[].reason`，与 Kotlin `ErrorCode` 同名同值。 */
 export const ConfigRejectReason = {

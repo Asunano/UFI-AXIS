@@ -98,6 +98,7 @@ import { useInterval } from '@/composables/useRealtime';
 import { useNetworkControls } from '@/composables/useNetworkControls';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { get } from '@/composables/utils';
+import { buildWifiConfigPayload } from '@/api/contract';
 import TrafficUsageCard from './components/cards/TrafficUsageCard.vue';
 import NetworkInfoCard from './components/cards/NetworkInfoCard.vue';
 import SystemStatusCard from './components/cards/SystemStatusCard.vue';
@@ -182,31 +183,34 @@ function applyModeAndClose() {
   });
 }
 
-// ── WiFi 设置保存（逻辑保持原样：带 encryp_type / max_sta_num / chip_index 当前值，避免改 SSID 顺手改坏）──
+// ── WiFi 设置保存（报文统一由 contract.buildWifiConfigPayload 拼，规则见那里）──
 interface WifiSavePayload {
   enabled: boolean;
   ssid: string;
   password: string;
   auth_mode: string;
+  maxStaNum: number | null;
   broadcastHidden: boolean;
   cur: WifiSettings | null;
 }
 async function saveWifiEdit(payload: WifiSavePayload) {
   try {
     const cur = payload.cur;
-    // core WifiRoutes.kt 读的是 passphrase（不是 password）；encryp_type / max_sta_num 不传时
-    // core 会把 EncrypType 硬写成 CCMP 且完全不下发 ApMaxStationNumber
-    // （GoformWifiClient.kt:108,121），所以带上设备当前值，别让改 SSID 顺手改掉这两项。
+    // 报文里 passphrase 的 OPEN 特例、encryp_type 的配对/透传、broadcast_disabled 的方向
+    // 都在 buildWifiConfigPayload 里（与网络页的 WifiEditModal 共用同一份规则）。
     // chip_index 在写接口里是 "0"/"1"（chip1=2.4G → "0"，chip2=5G → "1"）
-    await api.post('/api/wifi/config', {
-      ssid: payload.ssid,
-      passphrase: payload.password,
-      auth_mode: payload.auth_mode,
-      encryp_type: cur?.encryp_type || undefined,
-      max_sta_num: cur?.max_sta_num || undefined,
-      chip_index: cur?.chip_index === '2' ? '1' : '0',
-      broadcast_disabled: payload.broadcastHidden ? 1 : 0,
-    });
+    await api.post(
+      '/api/wifi/config',
+      buildWifiConfigPayload({
+        ssid: payload.ssid,
+        authMode: payload.auth_mode,
+        passphrase: payload.password,
+        maxStaNum: payload.maxStaNum,
+        hidden: payload.broadcastHidden,
+        chipIndex: cur?.chip_index === '2' ? '1' : '0',
+        fallbackEncrypType: cur?.encryp_type,
+      })
+    );
     // 开关是独立接口，只有真的变了才下发，避免每次保存都重启一遍 WiFi 模块
     if (cur && payload.enabled !== cur.enabled) {
       await api.post('/api/wifi/enable', { enabled: payload.enabled });

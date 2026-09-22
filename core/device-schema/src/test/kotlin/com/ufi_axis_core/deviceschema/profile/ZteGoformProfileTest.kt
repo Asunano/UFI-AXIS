@@ -1467,15 +1467,22 @@ class ZteGoformProfileTest {
         val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ENABLED)!!
         assertNotNull("开/关是两条命令，必须由 commandOf 表达", spec.commandOf)
         val commandOf = spec.commandOf!!
-        // 开：逐字对齐 GoformWifiClient.setWifiEnabled 的 true 分支
+        // 开：2026-09-22 抓包原文 goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0
+        // —— 这条命令的语义是「在频段 X 上启用 WiFi」，所以 chip 由调用方给
         assertEquals("switchWiFiChip", commandOf(mapOf("value" to true)))
         assertEquals(
+            mapOf("ChipEnum" to "chip2", "GuestEnable" to "0"),
+            spec.encode(mapOf("value" to true, "chip" to "chip2")),
+        )
+        assertEquals(
             mapOf("ChipEnum" to "chip1", "GuestEnable" to "0"),
-            spec.encode(mapOf("value" to true)),
+            spec.encode(mapOf("value" to true, "chip" to "chip1")),
         )
         // 关：false 分支走的是另一条命令，参数集也完全不同
         assertEquals("switchWiFiModule", commandOf(mapOf("value" to false)))
         assertEquals(mapOf("SwitchOption" to "0"), spec.encode(mapOf("value" to false)))
+        // SwitchOption=1 至今无实测依据，"关"以外的分支不许发 switchWiFiModule
+        assertEquals("switchWiFiChip", commandOf(mapOf("value" to true, "chip" to "chip1")))
         // command 是默认命令名 / 日志标识，取"开"那条
         assertEquals("switchWiFiChip", spec.command)
         // isTest=false 由 GoformCodec.buildSetFormBody 统一补
@@ -1483,6 +1490,85 @@ class ZteGoformProfileTest {
         // 关的时候不许带 ChipEnum（带了就是把两个分支的参数混在一起发）
         assertFalse(spec.encode(mapOf("value" to false)).containsKey("ChipEnum"))
     }
+
+    /**
+     * `chip` 缺失时退回 `chip1` —— **已知的不理想分支**，不是推荐路径。
+     *
+     * 它会把设备切到 2.4G（这条命令是"在频段 X 上启用 WiFi"）。调用方（`GoformWifiClient`）
+     * 有责任把设备当前频段传进来；这条断言冻结的是"没传时到底发什么"，
+     * 顺带保证「不带 chip」这一种请求体与 2026-09-22 之前**逐字一致**（老调用方不受影响）。
+     */
+    @Test
+    fun `WiFi 总开关没给 chip 时退回 chip1`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ENABLED)!!
+        assertEquals(
+            mapOf("ChipEnum" to "chip1", "GuestEnable" to "0"),
+            spec.encode(mapOf("value" to true)),
+        )
+        // 显式传 null 与不传等价（与其余项的 ?: 缺省逐字一致）
+        assertEquals(
+            spec.encode(mapOf("value" to true)),
+            spec.encode(mapOf("value" to true, "chip" to null)),
+        )
+    }
+
+    @Test
+    fun `WiFi 总开关的 chip 取值域被校验_关分支不受影响`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ENABLED)!!
+        assertNull(spec.validate(mapOf("value" to true, "chip" to "chip1")))
+        assertNull(spec.validate(mapOf("value" to true, "chip" to "chip2")))
+        // 不传 / 显式 null → 走兜底，不拒
+        assertNull(spec.validate(mapOf("value" to true)))
+        assertNull(spec.validate(mapOf("value" to true, "chip" to null)))
+        // 界面文案与读侧 ChipIndex 的原始编码都不是设备值，一律拒
+        assertNotNull(spec.validate(mapOf("value" to true, "chip" to "5G")))
+        assertNotNull(spec.validate(mapOf("value" to true, "chip" to "2.4G")))
+        assertNotNull(spec.validate(mapOf("value" to true, "chip" to "1")))
+        // 不 trim：encode 发的是原值，校验若 trim 就会放过一个带空格的值再原样下发
+        assertNotNull(spec.validate(mapOf("value" to true, "chip" to " chip1")))
+        assertNotNull(spec.validate(mapOf("value" to true, "chip" to "chip1&goformId=FACTORY_RESET")))
+        // 关分支不读 chip：传了也无害，但**不影响编码结果**
+        assertEquals(
+            mapOf("SwitchOption" to "0"),
+            spec.encode(mapOf("value" to false, "chip" to "chip2")),
+        )
+    }
+
+    /**
+     * WiFi 频段选择：与 [SettingKey.WIFI_ENABLED] 的"开"分支是**同一条命令**，
+     * 所以它同时会把 WiFi 打开（设备侧没有"只切频段"的形态）。
+     *
+     * 取值只收设备词汇：`"2.4G"` / `"5G"`（界面文案）与 `"0"` / `"1"`（读侧 `ChipIndex`
+     * 原始编码）都必须被拒 —— 收了别名就是让三套取值域在 profile 里互相透传。
+     */
+    @Test
+    fun `WiFi 频段只收设备词汇 chip1 与 chip2`() {
+        val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_BAND)!!
+        assertEquals("switchWiFiChip", spec.command)
+        // 只有一个命令名（不像开关那样按取值分叉），也没有兜底命令
+        assertNull(spec.commandOf)
+        assertNull(spec.fallback)
+        assertEquals(RetryPolicy.RETRY_ON_SESSION_LOSS, spec.retry)
+        // 抓包原文的参数集：ChipEnum + GuestEnable=0（isTest 由 GoformCodec 统一补）
+        assertEquals(
+            mapOf("ChipEnum" to "chip1", "GuestEnable" to "0"),
+            spec.encode(mapOf("value" to "chip1")),
+        )
+        assertEquals(
+            mapOf("ChipEnum" to "chip2", "GuestEnable" to "0"),
+            spec.encode(mapOf("value" to "chip2")),
+        )
+        assertFalse(spec.encode(mapOf("value" to "chip2")).containsKey("isTest"))
+        assertNull(spec.validate(mapOf("value" to "chip1")))
+        assertNull(spec.validate(mapOf("value" to "chip2")))
+        for (bad in listOf("2.4G", "5G", "0", "1", "chip3", "CHIP1", " chip1", "")) {
+            assertNotNull("别名/界面文案不许当设备值透传：$bad", spec.validate(mapOf("value" to bad)))
+        }
+        // 缺值也是拒（这一项没有缺省频段可言 —— 猜一个等于把用户切到另一个频段）
+        assertNotNull(spec.validate(emptyMap()))
+        assertNotNull(spec.validate(mapOf("value" to null)))
+    }
+
 
     @Test
     fun `移动数据开关的主命令按取值选并带 notCallback`() {
@@ -1769,6 +1855,115 @@ class ZteGoformProfileTest {
         assertEquals("", out["Password"])
     }
 
+    // ───────── AP 配置的值域校验（2026-09-22 真机抓包给出的取值表）─────────
+
+    /**
+     * 四个合法 `auth_mode` 各一条 —— 这四个值来自真机界面四个选项的抓包，
+     * 少一个就会把设备本来支持的加密方式挡在门外（表在 `ZteGoformProfile.AP_AUTH_MODES`）。
+     */
+    @Test
+    fun `AP 配置的四个真机认证方式都通过校验`() {
+        for (auth in listOf("OPEN", "WPA2PSK", "WPA3PSK", "WPA2PSKWPA3PSK")) {
+            assertNull(auth, apSpec.validate(mapOf("ssid" to "MyAP", "auth_mode" to auth)))
+        }
+        // 不传 auth_mode 时 encode 会填缺省档，缺省档必须也在白名单里（否则校验放过、设备拒收）
+        assertNull(apSpec.validate(mapOf("ssid" to "MyAP")))
+        assertEquals("WPA2PSK", apSpec.encode(mapOf("ssid" to "MyAP"))["AuthMode"])
+        // 显式 null == 不传（与 encode 的 ?: 缺省逐字一致）
+        assertNull(apSpec.validate(mapOf("ssid" to "MyAP", "auth_mode" to null)))
+    }
+
+    /** 白名单外的 `auth_mode` 一律拒：设备大小写敏感，猜一个下发等于把加密方式静默改坏。 */
+    @Test
+    fun `AP 配置的认证方式不在白名单时被拒`() {
+        // "WPA2" 是真机没有的档（界面那一项发出去的是 WPA2PSK）
+        assertNotNull(apSpec.validate(mapOf("auth_mode" to "WPA2")))
+        // 小写不做兼容：设备大小写敏感，认不出就拒而不是替它 uppercase
+        assertNotNull(apSpec.validate(mapOf("auth_mode" to "open")))
+        assertNotNull(apSpec.validate(mapOf("auth_mode" to "wpa2psk")))
+        // 表单注入也顺带被挡（body 的百分号编码是第一道，这是第二道）
+        assertNotNull(apSpec.validate(mapOf("auth_mode" to "WPA2PSK&goformId=FACTORY_RESET")))
+        // 不 trim：encode 发的是 toString() 原值，校验若 trim 就会放过一个带空格的值再原样下发
+        assertNotNull(apSpec.validate(mapOf("auth_mode" to " WPA2PSK")))
+    }
+
+    /**
+     * `max_sta_num` 判**闭区间 `1..10`** —— 上限 10 来自用户对中兴 F50 的实测/规格结论
+     * （2026-09-22）。这条断言同时钉住两头：11 起被拒（别放过设备不支持的值），
+     * 1 与 10 必须通过（别把设备支持的边界值挡在门外）。
+     */
+    @Test
+    fun `AP 配置的最大接入数必须是 1 到 10`() {
+        assertNull("下边界", apSpec.validate(mapOf("max_sta_num" to 1)))
+        assertNull(apSpec.validate(mapOf("max_sta_num" to 7)))   // 真机抓包见过
+        assertNull("上边界 = F50 的最大支持数", apSpec.validate(mapOf("max_sta_num" to 10)))
+        assertNull("字符串形式的整数也接受（route 可能透传字符串）", apSpec.validate(mapOf("max_sta_num" to "10")))
+        assertNotNull("11 超过 F50 的上限", apSpec.validate(mapOf("max_sta_num" to 11)))
+        assertNotNull(apSpec.validate(mapOf("max_sta_num" to 64)))
+        assertNotNull("0 台接入是无效配置", apSpec.validate(mapOf("max_sta_num" to 0)))
+        assertNotNull(apSpec.validate(mapOf("max_sta_num" to -1)))
+        assertNotNull(apSpec.validate(mapOf("max_sta_num" to "abc")))
+        // 被拒文案必须说清上限是 10（用户要能从原因里知道该填什么）
+        assertTrue(apSpec.validate(mapOf("max_sta_num" to 11))!!.contains("10"))
+        // 不传 / 显式 null 都不拒（这个键是"没传就真的不发"的可选项）
+        assertNull(apSpec.validate(mapOf("ssid" to "MyAP")))
+        assertNull(apSpec.validate(mapOf("max_sta_num" to null)))
+    }
+
+
+    /**
+     * 拒绝文案不许带参数值（计划书 §11.3）：这份 params 会经过**明文口令**，
+     * 而被拒原因会被 `GoformSettingWriter` 写进日志。
+     *
+     * 只断言"不含 SSID / 口令"，不断言"不含那个非法 auth 值"：文案里列的是**白名单**
+     * （`OPEN / WPA2PSK / …`），而非法输入 `"WPA2"` 恰好是白名单某一项的前缀 ——
+     * 断言"不含输入值"会把一条正确的文案判红。
+     */
+    @Test
+    fun `AP 配置的拒绝文案不含参数值`() {
+        val secret = "s3cr3t-passphrase"
+        val ssid = "MySecretAP"
+        val authReason = apSpec.validate(
+            mapOf("ssid" to ssid, "auth_mode" to "wpa2psk", "passphrase" to secret)
+        )
+        assertNotNull(authReason)
+        assertFalse("口令不许进被拒原因（原因会被写进日志）", authReason!!.contains(secret))
+        assertFalse(authReason.contains(ssid))
+        assertFalse("小写原文也算参数值", authReason.contains("wpa2psk"))
+
+        val staReason = apSpec.validate(
+            mapOf("ssid" to ssid, "max_sta_num" to -1, "passphrase" to secret)
+        )
+        assertNotNull(staReason)
+        assertFalse(staReason!!.contains(secret))
+        assertFalse(staReason.contains(ssid))
+        assertFalse(staReason.contains("-1"))
+    }
+
+    /**
+     * OPEN + 调用方给了 `passphrase` → **仍然发 `Password`**（冻结现状）。
+     *
+     * 真机的 OPEN 请求里**没有** `Password` 字段，但 encode 的规则是「`passphrase` 键非 null
+     * 就发」：删掉它会让「只改口令」那个入口在 OPEN 下静默丢掉用户的输入。所以
+     * 「OPEN 不要传 `passphrase`」是**调用方的责任** —— 见 [SettingKey.WIFI_AP_CONFIG] KDoc 的
+     * 「调用方须知：`auth_mode == "OPEN"` 时不应该传 `passphrase`」那一节。
+     *
+     * 新加的 validate 不参与这件事：OPEN 在白名单里，带不带口令都放行（口令**不校验**）。
+     */
+    @Test
+    fun `AP 配置 OPEN 带口令时 encode 仍然发 Password_这是调用方的意图`() {
+        val withPass = mapOf("ssid" to "OpenAP", "auth_mode" to "OPEN", "passphrase" to "secret")
+        assertNull("OPEN 在白名单里，带口令也不该被 validate 拦", apSpec.validate(withPass))
+        val out = apSpec.encode(withPass)
+        assertEquals("c2VjcmV0", out["Password"])
+        // 对照：不放 passphrase 才是与真机 OPEN 报文逐字一致的那一份（没有 Password）
+        val realDevice = apSpec.encode(mapOf("ssid" to "OpenAP", "auth_mode" to "OPEN"))
+        assertFalse(realDevice.containsKey("Password"))
+        assertEquals("NONE", realDevice["EncrypType"])
+        assertEquals(realDevice, out - "Password")
+    }
+
+
     // ───────── 重试语义（计划书 §11.1）─────────
 
     @Test
@@ -1798,6 +1993,8 @@ class ZteGoformProfileTest {
             SettingKey.CONNECTION_MODE to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.WIFI_POWER to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.WIFI_ENABLED to RetryPolicy.RETRY_ON_SESSION_LOSS,
+            // 切频段：同一取值发两次结果一样（都是"在这个频段上启用 WiFi"）
+            SettingKey.WIFI_BAND to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.MOBILE_DATA to RetryPolicy.RETRY_ON_SESSION_LOSS,
             SettingKey.PPP_DIAL to RetryPolicy.RETRY_ON_SESSION_LOSS,
             // 整份 AP 配置：同一份参数发两次结果一样（整表替换），与其余设置类命令同档
@@ -1847,6 +2044,10 @@ class ZteGoformProfileTest {
             // MOBILE_DATA 与 PPP_DIAL 的默认命令名相同是刻意的：两者的命令与参数完全一样，
             // 唯一区别是 MOBILE_DATA 多一条 SET_DATA_ENABLED 兜底（见两者的 KDoc）。
             "CONNECT_NETWORK" to setOf(SettingKey.MOBILE_DATA, SettingKey.PPP_DIAL),
+            // WIFI_ENABLED 的"开"分支与 WIFI_BAND 是同一条设备命令（switchWiFiChip
+            // &ChipEnum=X&GuestEnable=0 = 「在频段 X 上启用 WiFi」，2026-09-22 抓包）。
+            // 两个 key 是对外的两个用户动作（开关 / 选频段），设备侧的事实只有一条。
+            "switchWiFiChip" to setOf(SettingKey.WIFI_ENABLED, SettingKey.WIFI_BAND),
         )
         val duplicated = byCommand.groupBy({ it.second }, { it.first })
             .filterValues { it.size > 1 }

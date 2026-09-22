@@ -67,9 +67,11 @@
             <n-switch v-model:value="generalForm.debugMode" :disabled="!generalLoaded || !generalForm.logEnabled" />
           </div>
         </div>
-        <!-- 两个排障开关都走 ToggleRow + 即时保存（见 saveProbeSwitch）：
-             它们需要说明位（端点名 + 危险警示 + 「立即生效」），而上面两列栅格里的
-             .switch-item 那一种没有说明位，硬塞会把警示挤成第二个标签。 -->
+        <!-- 三个排障开关都走 ToggleRow + 即时保存（见 saveProbeSwitch）：
+             它们需要说明位（端点名 + 危险警示 + 生效时机），而上面两列栅格里的
+             .switch-item 那一种没有说明位，硬塞会把警示挤成第二个标签。
+             注意第三个「字段归一化」与前两个的生效时机不同：它要重启后台服务，
+             见 PROBE_NEEDS_RESTART。 -->
         <ToggleRow
           label="设备原始字段 dump（排障用，默认关，改动立即生效）"
           :description="probeDescription('goform_dump_enabled', PROBE_DUMP_DESC)"
@@ -85,6 +87,14 @@
           :loading="probeSaving.goform_command_enabled"
           :disabled="probeSwitchDisabled('goform_command_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('goform_command_enabled', v)"
+        />
+        <ToggleRow
+          label="字段归一化（默认开，改完需重启后台服务）"
+          :description="probeDescription('field_normalization_enabled', PROBE_FIELD_NORMALIZATION_DESC)"
+          :model-value="generalForm.fieldNormalizationEnabled"
+          :loading="probeSaving.field_normalization_enabled"
+          :disabled="probeSwitchDisabled('field_normalization_enabled')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('field_normalization_enabled', v)"
         />
       </div>
       <n-divider style="margin: 10px 0" />
@@ -111,18 +121,30 @@
         <div class="section-subtitle">更新配置</div>
         <div class="config-grid">
           <div class="config-item">
-            <span class="config-label">更新源 URL</span>
-            <n-input v-model:value="generalForm.updateUrl" placeholder="https://example.com/update.json" size="small" />
-          </div>
-          <div class="config-item">
-            <span class="config-label">镜像基地址</span>
-            <n-input
-              v-model:value="generalForm.updateMirrorBase"
-              placeholder="https://mirror.example.com"
+            <span class="config-label">下载方式</span>
+            <n-select
+              :value="updateMode"
+              :options="UPDATE_MODE_OPTIONS"
+              :loading="detectingGeo"
               size="small"
+              :disabled="!generalLoaded"
+              @update:value="onUpdateModeChange"
             />
           </div>
+          <div class="config-item">
+            <span class="config-label">设备出口地区</span>
+            <div style="display: flex; align-items: center; gap: 8px; min-height: 28px">
+              <span style="font-size: 13px">{{ geoText }}</span>
+              <n-button size="tiny" :loading="detectingGeo" :disabled="!generalLoaded" @click="detectGeo(true)">
+                重新检测
+              </n-button>
+            </div>
+          </div>
         </div>
+        <span class="row-hint" style="display: block; margin-top: 4px">
+          「自动」由设备按出口 IP 所在地区决定：中国大陆走镜像加速，其他地区（含未测出）直连。
+          镜像节点与失败换源都由设备侧处理，这里只需要选一个方式，改完点下方「保存」。
+        </span>
       </div>
       <div class="card-actions">
         <n-button type="primary" size="small" :loading="savingGeneral" :disabled="!generalLoaded" @click="saveGeneral"
@@ -163,12 +185,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
-import { ConfigLimits, describeConfigReject, type ConfigRejectedField } from '@/api/contract';
+import { ConfigLimits, Endpoints, describeConfigReject, type ConfigRejectedField } from '@/api/contract';
 import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
 
 const message = useMessage();
@@ -200,10 +222,14 @@ const generalForm = reactive({
   // 默认 false 与 core 一致，而且必须是 false：set 绕过 profile 的 WriteSpec 值域校验、
   // 返回值也不脱敏，默认打开等于把「无校验写设备 + 明文回读」长期挂在网上。
   goformCommandEnabled: false,
+  // 字段归一化总开关，core 侧默认 **true**
+  // （AppSettings.fieldNormalizationEnabled 的 getter：prefs.getBoolean(KEY, true)）。
+  // 默认值必须与 core 一致：这里写 false 会让「还没读到配置」时显示成关闭 —— 假状态。
+  // 关掉它是排障后门（读侧原样透传设备字段），而且**改完要重启后台服务**才生效。
+  fieldNormalizationEnabled: true,
   smsCodeEnabled: false,
   smsCodeCleanupHours: 24,
-  updateUrl: '',
-  updateMirrorBase: '',
+  updateSourceMode: 'auto',
 });
 
 async function loadGeneralConfig() {
@@ -220,10 +246,10 @@ async function loadGeneralConfig() {
       debug_mode: 'debugMode',
       goform_dump_enabled: 'goformDumpEnabled',
       goform_command_enabled: 'goformCommandEnabled',
+      field_normalization_enabled: 'fieldNormalizationEnabled',
       sms_code_enabled: 'smsCodeEnabled',
       sms_code_cleanup_hours: 'smsCodeCleanupHours',
-      update_url: 'updateUrl',
-      update_mirror_base: 'updateMirrorBase',
+      update_source_mode: 'updateSourceMode',
     };
     for (const [apiKey, formKey] of Object.entries(mapping)) {
       if (data[apiKey] !== undefined) {
@@ -249,7 +275,8 @@ async function loadGeneralConfig() {
  * 表单字段 ↔ core 配置键。提到函数外是因为「有没有未保存改动」的判断也要用它
  * （见 [hasUnsavedChanges]），放在 saveGeneral 里就得抄第二份。
  *
- * **两个排障开关刻意不在这里**（goform_dump_enabled / goform_command_enabled）：
+ * **三个排障开关刻意不在这里**（goform_dump_enabled / goform_command_enabled /
+ * field_normalization_enabled）：
  * 它们改走即时保存（见 saveProbeSwitch）。留在这张表里会被差量提交再处理一遍 ——
  * 即时保存已经把 generalOriginal 同步成新值，差量比较虽然不会重复 PUT，
  * 但一旦只同步了 form 没同步 original（或反过来）就会双写；而且 hasUnsavedChanges
@@ -268,28 +295,109 @@ const GENERAL_FORM_KEYS: Record<string, string> = {
   debugMode: 'debug_mode',
   smsCodeEnabled: 'sms_code_enabled',
   smsCodeCleanupHours: 'sms_code_cleanup_hours',
-  updateUrl: 'update_url',
-  updateMirrorBase: 'update_mirror_base',
+  // 下载方式是 web 唯一会写的更新相关字段。
+  // update_url / update_mirror_base 刻意不在这里：2026-09-22 起它们是 core 的实现细节
+  // （清单地址 + 自定义前缀覆盖），web 只读不写，写了就等于又多出一个决策方。
+  updateSourceMode: 'update_source_mode',
 };
 
 function hasUnsavedChanges(): boolean {
   return Object.keys(buildChangedPayload(GENERAL_FORM_KEYS, generalForm, generalOriginal)).length > 0;
 }
 
-// ── 两个排障开关：即时生效 ──
+// ── 更新配置：只给下载方式三档，不暴露地址 ──
+//
+// 2026-09-22 决策下沉 core（docs/update-source-core-plan.md）：唯一真源是 core 的
+// `update_source_mode`，web 只读写它。`update_url` / `update_mirror_base` 都是实现细节，
+// 做成输入框只会让人填错，而填错要等到去「更新」页点检查更新时才以 502 的形式暴露。
+// 「用不用镜像」「用哪个镜像」「失败怎么降级」全部由 core 的 MirrorResolver 决定。
 
-type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled';
+type UpdateMode = 'auto' | 'mirror' | 'direct';
+
+const UPDATE_MODE_OPTIONS = [
+  { label: '自动（按设备出口地区）', value: 'auto' },
+  { label: '镜像加速（中国大陆推荐）', value: 'mirror' },
+  { label: '直连 GitHub', value: 'direct' },
+];
+
+/** 下拉当前值。`auto` 现在是 core 的持久模式，可以正常显示，不再是「瞬时动作」。 */
+const updateMode = computed<UpdateMode>(() => generalForm.updateSourceMode as UpdateMode);
+
+function onUpdateModeChange(mode: UpdateMode) {
+  generalForm.updateSourceMode = mode;
+  // 选了自动但还没测过地区：顺手测一次，让用户立刻看到判定依据。
+  // 测不出来也不改模式 —— core 侧「地区未知」按直连走，且会在检查更新时自己重试。
+  if (mode === 'auto' && !geoCountry.value) detectGeo(true);
+}
+
+// ── 设备出口地区：core 的 GeoDetector 探出网 IP 归属，core 的 auto 判定用的就是它 ──
+
+const geoCountry = ref('');
+const detectingGeo = ref(false);
+
+const geoText = computed(() => {
+  if (!geoCountry.value) return '未检测';
+  return geoCountry.value === 'CN' ? '中国大陆（CN）' : geoCountry.value;
+});
+
+/**
+ * 读取/重测出口地区。
+ * @param force true = 强制重测（POST detect，三源全挂回 502）；false = 只读 core 的缓存快照
+ * @returns 国家码；空串 = 没测出来（**不等于海外**）
+ */
+async function detectGeo(force: boolean): Promise<string> {
+  detectingGeo.value = true;
+  try {
+    const { data } = force ? await api.post(Endpoints.geo.detect) : await api.get(Endpoints.geo.root);
+    // country 为空串 = 从未探测成功，此时 source 恒为 unknown
+    geoCountry.value = String(data?.country || '').trim();
+    if (force) {
+      if (geoCountry.value) message.success(`已检测到出口地区：${geoText.value}`);
+      else message.warning('三个地理源都不可达，未能测出地区');
+    }
+    return geoCountry.value;
+  } catch {
+    if (force) message.error('地区检测失败，设备可能不可达');
+    return '';
+  } finally {
+    detectingGeo.value = false;
+  }
+}
+
+// ── 三个排障开关：单键即时保存（生效时机各自不同，见 PROBE_NEEDS_RESTART）──
+
+type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled' | 'field_normalization_enabled';
 
 /** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
-const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled'> = {
-  goform_dump_enabled: 'goformDumpEnabled',
-  goform_command_enabled: 'goformCommandEnabled',
+const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled' | 'fieldNormalizationEnabled'> =
+  {
+    goform_dump_enabled: 'goformDumpEnabled',
+    goform_command_enabled: 'goformCommandEnabled',
+    field_normalization_enabled: 'fieldNormalizationEnabled',
+  };
+
+/**
+ * 改完要不要重启后台服务。
+ *
+ * 为什么写死在前端：`PUT /api/config` 的 `needs_restart` 只覆盖
+ * port / goform_ip / goform_port / goform_password（ConfigRoutes.kt:264），
+ * `field_normalization_enabled` **不在**那张清单里，所以靠响应判断不出来。
+ *
+ * 为什么它确实需要重启：core 只在构造组件图时读一次这个开关
+ * （ComponentFactory.resolveDeviceProfile()），之后 profile 被固化进各设备客户端；
+ * 前两个键是每次请求现读 prefs，所以是即时的。别把三个键当同一种生效语义。
+ */
+const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
+  goform_dump_enabled: false,
+  goform_command_enabled: false,
+  field_normalization_enabled: true,
 };
 
-/** 各自独立的 loading：两个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
+/** 各自独立的 loading：三个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
 const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
   goform_dump_enabled: false,
   goform_command_enabled: false,
+  field_normalization_enabled: false,
 });
 
 const PROBE_DUMP_DESC =
@@ -299,14 +407,19 @@ const PROBE_COMMAND_DESC =
   '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
   '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +
   '改动立即生效，不需要点下方「保存」；只在排障时临时打开，看完立刻关回去。';
+const PROBE_FIELD_NORMALIZATION_DESC =
+  '开=按设备 profile 的登记表把设备字段归一化成统一字段名（默认，正常使用就该开着）；' +
+  '关=读侧原样透传设备原始字段，仅排障用（此时信号数据会变空、字段名对比页没有登记表可比对）。' +
+  '改完需重启后台服务才生效：配置值立刻就能读回来，但 core 只在构造组件图时读一次这个开关，' +
+  '不重启的话归一化行为不会变。';
 
 /**
  * 禁用时把**原因**说出来，而不是只灰着。
  *
- * 为什么必须说：这两个键比其它字段新，最常见的情形就是「设备上的 core 比 web 旧、
+ * 为什么必须说：这三个键比其它字段新，最常见的情形就是「设备上的 core 比 web 旧、
  * GET /api/config 里没有这个键」。只灰掉的话用户只会以为界面坏了或权限不够，
  * 于是去翻别的开关；写明「当前 core 版本不支持」他才知道该去升 core。
- * 这也顺带补上了移出 GENERAL_FORM_KEYS 后 findUnbaselinedKeys 不再覆盖这两键的告知职责。
+ * 这也顺带补上了移出 GENERAL_FORM_KEYS 后 findUnbaselinedKeys 不再覆盖这三键的告知职责。
  */
 function probeDescription(apiKey: ProbeApiKey, base: string): string {
   if (!generalLoaded.value) return `${base}（配置尚未从设备读取，暂不可修改）`;
@@ -315,13 +428,17 @@ function probeDescription(apiKey: ProbeApiKey, base: string): string {
 }
 
 /**
- * 两个排障开关走「即时生效」而不是表单式差量提交。
+ * 三个排障开关走「即时保存」而不是表单式差量提交。
  *
  * 为什么与本卡其它字段不一样：① 全仓页面里的 ToggleRow 都是即时语义
  *    （ControlTab 的 LED/Samba、AlertConfigPanel 全部…），表单式只用在弹窗表单里；
  *    放一个表单式开关在这里，用户拖完不点保存就走 = 假开关（刷新回默认、全程零反馈）。
- * ② 它们是**排障动作**不是配置项：打开的动机就是「现在就要看 dump / 现在就要发裸命令」，
- *    用完立刻关回去，不该跟 IP/端口/密码一起攒着提交。
+ * ② 它们是**排障动作**不是配置项：打开的动机就是「现在就要看 dump / 现在就要发裸命令 /
+ *    现在就要看设备原始字段名」，用完立刻关回去，不该跟 IP/端口/密码一起攒着提交。
+ *
+ * 注意「即时保存」≠「即时生效」：`field_normalization_enabled` 的写入是即时的
+ * （回读立刻能拿到新值），但归一化行为要重启后台服务才变 —— 成功提示按
+ * PROBE_NEEDS_RESTART 分两种文案，不能一律说「立即生效」。
  *
  * 写法照 ControlTab.postToggle：只在**确认生效后**才置位（ToggleRow 是完全受控组件，
  * 父组件不回写它就不动，所以失败路径写回原值即回滚），期间 :loading 挡住重复点。
@@ -349,7 +466,10 @@ async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
     // onVisible 的回读被永久跳过（手机端改了也看不到）。
     generalForm[formKey] = value;
     generalOriginal[apiKey] = value;
-    message.success(value ? '已开启，立即生效' : '已关闭，立即生效');
+    const verb = value ? '已开启' : '已关闭';
+    // 需重启的那一项用 warning 而不是 success：说「保存成功」会让用户以为行为已经变了。
+    if (PROBE_NEEDS_RESTART[apiKey]) message.warning(`${verb}，需重启后台服务才会生效`);
+    else message.success(`${verb}，立即生效`);
   } catch (e: any) {
     generalForm[formKey] = previous;
     message.error(e?.response?.data?.error || '保存失败，开关已回滚');
@@ -359,13 +479,16 @@ async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
 }
 
 /**
- * 两个排障开关（`goform_dump_enabled` / `goform_command_enabled`）的禁用判定。
+ * 三个排障开关（`goform_dump_enabled` / `goform_command_enabled` /
+ * `field_normalization_enabled`）的禁用判定。
  *
  * 为什么只有它们要多一层判断：它们是最近才加进 core 的键，最容易撞上「设备上的 core 比
  * web 旧、GET /api/config 里根本没这个键」。此时 generalOriginal 缺基线 —— 开关拖得动、
- * PUT 上去也不会进 updated_fields，即典型的假开关。而这两个偏偏是排障入口，
+ * PUT 上去也不会进 updated_fields，即典型的假开关。而这几个偏偏是排障入口，
  * 用户正指望靠它们看设备真实状态，显示成可用最误导人，所以直接禁用，
  * 并由 probeDescription 说明禁用原因。
+ *
+ * 这条判定**不能为了「看起来可用」而放宽**：旧 core 上禁用是正确行为，不是 bug。
  *
  * 其余字段不做这个处理：它们都是老键，且保存时的 findUnbaselinedKeys 提示已经够用。
  */
@@ -454,6 +577,8 @@ function onVisible() {
 
 onMounted(() => {
   loadGeneralConfig();
+  // 只读缓存快照，不强制出网重测：进设置页不该为了显示一行地区去打三个地理源
+  detectGeo(false);
   document.addEventListener('visibilitychange', onVisible);
 });
 

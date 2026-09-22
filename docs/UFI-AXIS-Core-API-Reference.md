@@ -118,9 +118,12 @@
 **排障开关：** `field_normalization_enabled` 置 false，读侧会退回原样透传设备字段  
 （写入命令表与 `/api/network/signal` 不受影响）。此时容器字段可能是"数组的 JSON 字符串"而不是数组 ——  
 客户端解容器时两种形态都要能吃（见 `/api/wifi/clients`）。  
-两个注意点：它**不在 `/api/config` 的可读写字段里**（`GET /api/config` 看不到、`PUT /api/config` 也改不了，  
-只能改 core 进程的 SharedPreferences），而且**只在构造组件图时读一次，改完要重启后台服务才生效**。  
-同一开关族的 `device_profile_id` 同理。
+两个注意点：它**可读可写**（2026-09-22 起 `AppSettings.toMap()` 与 `PUT /api/config` 都登记了这个键，  
+所以 `GET` 看得到、`PUT` 改得动），但**只在构造组件图时读一次，改完必须重启后台服务才生效**；  
+且 `PUT` 响应的 `needs_restart` 清单**不含**这个键（只有 port / goform_* 那四个），  
+客户端不能靠响应判断，要自己在界面上写明"需重启后台服务"。  
+同一开关族的 `device_profile_id` **仍然不在**可读写字段里（`GET` 看不到、`PUT` 也改不了，  
+只能改 core 进程的 SharedPreferences），但"读一次、改完要重启"这条与本键相同。
 
 #### 旧字段 → 新字段对照（照这张表改客户端）
 
@@ -3741,6 +3744,12 @@ WiFi 开关。
 
 **响应：** `{ "success": true, "enabled": true }`
 
+> ⚠ **`enabled: true` 会把 WiFi 开在 2.4G 上。** 设备侧「开 WiFi」与「切频段」是同一条命令
+> （`switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`，2026-09-22 真机抓包），而本端点只收一个布尔、
+> 不收频段，core 侧因此走缺省频段 `chip1` —— 设备原本在 5G 时，开一次 WiFi 就会被切到 2.4G。
+> 「关」走的是另一条命令（`switchWiFiModule&SwitchOption=0`），不受影响。
+> **目前没有独立的切频段端点**：profile 侧已有 `SettingKey.WIFI_BAND`，但客户端与 route 尚未接线。
+
 #### `POST /api/wifi/ssid`
 
 设置 WiFi 名称和密码。
@@ -3781,16 +3790,26 @@ WiFi 开关。
 ```json
 {
   "ssid": "MyWiFi",
-  "auth_mode": "WPA2-PSK",
-  "encryp_type": "AES",
+  "auth_mode": "WPA2PSK",
+  "encryp_type": "CCMP",
   "passphrase": "12345678",
-  "max_sta_num": 32,
+  "max_sta_num": 10,
   "broadcast_disabled": false,
   "chip_index": "chip1"
 }
 ```
 
-所有字段可选。
+所有字段可选。**值域是设备事实，不合法的值在下发前就被拒**（`400 OUT_OF_RANGE` + 中文原因，
+请求根本没发到设备）：
+
+| 字段            | 取值                                                              |
+| ------------- | --------------------------------------------------------------- |
+| `auth_mode`   | 只接受 `OPEN` / `WPA2PSK` / `WPA3PSK` / `WPA2PSKWPA3PSK`，**大小写敏感** |
+| `encryp_type` | 与 `auth_mode` 成对：`OPEN` → `NONE`（core 强制），其余 → `CCMP`           |
+| `max_sta_num` | 闭区间 **1..10**（中兴 F50 最大支持 10 个），不传 = 不修改                        |
+
+`auth_mode` 为 `OPEN` 时**不要**带 `passphrase`（开放热点没有口令）；`ssid` 与 `passphrase`
+**不做任何格式校验**（允许任意字符，含 `&` 与 `=`）。
 
 **响应：** `{ "success": true }`
 
@@ -5108,7 +5127,8 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 **响应字段**（`AppSettings.toMap()` 的全部键）：`port`、`auto_start_on_boot`、`goform_ip`、  
 `goform_port`、`goform_password`、`debug_mode`、`log_enabled`、`core_log_enabled`、  
-`app_log_enabled`、`goform_dump_enabled`、`goform_command_enabled`、`qos_enabled`、  
+`app_log_enabled`、`goform_dump_enabled`、`goform_command_enabled`、`field_normalization_enabled`、  
+`qos_enabled`、  
 `qos_shell_max_concurrent`、`qos_cache_ttl_ms`、`qos_goform_query_max`、`qos_goform_set_max`、  
 `adb_auto_start_on_boot`、`sms_code_enabled`、`sms_code_cleanup_hours`、  
 `sms_filter_exempt_verification_code`、`sms_filter_store_full_body`、`update_url`、  
@@ -5137,6 +5157,7 @@ web 存在 `localStorage['ufi.console.history']`）。
   "debug_mode": false,
   "goform_dump_enabled": false,
   "goform_command_enabled": false,
+  "field_normalization_enabled": true,
   "qos_enabled": true,
   "qos_shell_max_concurrent": 5,
   "qos_cache_ttl_ms": 5000,
@@ -5153,8 +5174,9 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 所有字段可选。**上面没列出的键会被静默忽略**（不进 `updated_fields` 也不进 `rejected_fields`）——  
 `token` / `secret` 已不再是配置项，传了也是被忽略；`GET /api/config` 回的  
-`adb_auto_start_on_boot` 属于"只读不可写"；`device_profile_id` / `field_normalization_enabled`  
-连 GET 都不返回（见「设备字段契约 › 排障开关」）。  
+`adb_auto_start_on_boot` 属于"只读不可写"；`device_profile_id` 连 GET 都不返回  
+（见「设备字段契约 › 排障开关」）。  
+`field_normalization_enabled` **已经可读可写**（2026-09-22 起），但它不热生效 —— 见下面 `needs_restart` 那一段。  
 字段被拒时**不会**写入，且会出现在响应的 `rejected_fields` 里（C03）：
 
 - `OUT_OF_RANGE` —— 越界，附带 `min` / `max`：`port` 1024..65535、`goform_port` 1..65535、`qos_shell_max_concurrent` 1..10、`qos_cache_ttl_ms` 500..30000、`qos_goform_query_max` 1..8、`qos_goform_set_max` 1..4、`sms_code_cleanup_hours` 0..720；
@@ -5162,7 +5184,16 @@ web 存在 `localStorage['ufi.console.history']`）。
 - `BLANK_VALUE` —— `goform_password` / `goform_ip` / `update_url` 不允许空串（`update_mirror_base` 允许空串 = 直连）；
 - `WRONG_TYPE` —— 键存在但值类型不对（如 `"port": "8088"`）。
 
-`needs_restart` 为 true 的字段：`port` / `goform_ip` / `goform_port` / `goform_password`。
+`needs_restart` 为 true 的字段：`port` / `goform_ip` / `goform_port` / `goform_password`。  
+`hint` 文案也只针对这四个（固定为「修改了认证或端口配置，需重启服务生效」）。
+
+> ⚠ **`field_normalization_enabled` 是一个"要重启但 `needs_restart` 不会告诉你"的字段。**  
+> 它写进 prefs 是即时的，但唯一的读取点在组件图构造时（`ComponentFactory.resolveDeviceProfile()`），  
+> 之后 profile 被固化进各设备客户端与 SignalCollector，所以**不重启后台服务就不会变**。  
+> 而它不在上面那份清单里，`needs_restart` 会回 `false`、`hint` 是空串 ——  
+> 客户端必须自己在界面上写明"需重启后台服务"，不能靠响应推断。  
+> 另外两个排障开关（`goform_dump_enabled` / `goform_command_enabled`）是每次请求现读 prefs，  
+> PUT 完下一个请求就生效，**别按它们类推**。
 
 日志相关开关是**分三层**的，客户端不要当成同一个（都是「与」关系）：
 

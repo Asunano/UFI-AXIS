@@ -357,25 +357,45 @@ enum class SettingKey {
     WIFI_POWER,
 
     /**
-     * WiFi 总开关。value: Boolean。
+     * WiFi 总开关。params: `value: Boolean` + `chip: String?`（**可选**，`"chip1"` / `"chip2"`）。
      *
-     * 设备侧把「开 WiFi」和「关 WiFi」做成了**两条不同的命令**，两边的参数还都是固定常量：
-     * - 开：`switchWiFiChip` + `ChipEnum=chip1` + `GuestEnable=0`
-     * - 关：`switchWiFiModule` + `SwitchOption=0`
+     * 设备侧把「开 WiFi」和「关 WiFi」做成了**两条不同的命令**（2026-09-22 真机抓包，逐字）：
+     * - 关：`goformId=switchWiFiModule&isTest=false&SwitchOption=0&AD=…`
+     * - 开：`goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0&AD=…`
      *
-     * 所以它不是通用的「切芯片 / 关模块」能力，而就是「开关 WiFi」一个动作
-     * —— 唯一的调用形态是 `GoformWifiClient.setWifiEnabled(enabled)` 的两个分支。
-     * 命令选择在 [WriteSpec.commandOf] 里，参数集在 [WriteSpec.encode] 里按取值给。
+     * 抓包时用户设备在 5G，所以「开」发的是 `chip2`。结合已确认的 `chip1` = 2.4G / `chip2` = 5G，
+     * `switchWiFiChip&ChipEnum=X&GuestEnable=0` 的语义是**「在频段 X 上启用 WiFi」** ——
+     * 既是「开」也是「切频段」，同一条命令。「切频段」这个独立动作是 [WIFI_BAND]。
      *
-     * **实测边界**（批 1 的提示在这里更新过一次）：真机只验过上面这两种组合。
-     * `switchWiFiModule` 在本项目里**只用于「关」**，它的 `SwitchOption=1`（开）从未发过、
-     * 没有实测依据；同样地 `switchWiFiChip` 也从未用来关过 WiFi。要改动这两个分支的
-     * 命令/参数，先在真机上验一次，不要按「对称性」推测另一半。
+     * 所以「开」分支必须能收一个频段：`chip` 的取值域是**设备自己的词汇**
+     * （`chip1` / `chip2`，与读侧 canonical 字段 `wifi_chip` 的取值域完全一致），
+     * 不用 `"2.4G"` / `"5G"` 这种界面词汇。
+     * - `chip` 有值 → 原样作 `ChipEnum` 下发，不在取值域内直接拒；
+     * - `chip` 缺失 → 退回 `"chip1"`。这是**调用方没告诉我当前频段时的兜底，会把设备切到 2.4G**，
+     *   属于已知的不理想分支：调用方（`GoformWifiClient`）有责任把设备当前频段传进来。
+     * - 「关」分支**不读** `chip`（传了也无害、不影响编码结果）：`switchWiFiModule` 只认 `SwitchOption`。
      *
-     * 将来真要支持「多芯片机型选芯片」这种数量型能力时，按计划书 §11.12 用 `limits` 表达，
-     * 不要把 `chip` 参数塞回这个 key —— 那会让「开关 WiFi」重新变成半个通用命令。
+     * **实测边界**：`switchWiFiModule` 在本项目里只用于「关」，它的 `SwitchOption=1`（开）
+     * 从未发过、抓包里也没有 —— **至今无任何实测依据，不许出现在代码里**。
+     * 完整的事实与「原拆分方案第 2 步被证伪」的归档记在 `ZteGoformProfile` 里这一项的
+     * WriteSpec 注释上 —— 改这一项前先读那段。
      */
     WIFI_ENABLED,
+
+    /**
+     * WiFi 频段选择。value: String —— 取值只有 `"chip1"`（2.4G）/ `"chip2"`（5G），其余一律拒。
+     *
+     * **副作用：这条命令同时会把 WiFi 打开。** 设备侧
+     * `goformId=switchWiFiChip&isTest=false&ChipEnum=chip1|chip2&GuestEnable=0` 的语义是
+     * 「在频段 X 上启用 WiFi」，没有「只切频段、不动开关」这种形态（2026-09-22 真机抓包）。
+     * 它与 [WIFI_ENABLED] 的「开」分支是**同一条命令**：两个 key 只是对外的两个用户动作
+     * （开关 WiFi / 选频段），设备侧的事实只有一条。
+     *
+     * 取值域刻意用设备自己的词汇，与读侧 canonical 字段 `wifi_chip` 一致：**不接受**
+     * `"2.4G"` / `"5G"`（界面文案），也**不接受** `"0"` / `"1"`（读侧 `ChipIndex` 的原始编码）。
+     * 收了别名就等于让「界面词汇 / 读侧编码 / 设备值」三套取值域在这里悄悄互相透传。
+     */
+    WIFI_BAND,
 
     /**
      * 移动数据开关。value: Boolean。
@@ -408,12 +428,18 @@ enum class SettingKey {
      *
      * params（**全部可选**，某项为 null 或不存在 → 不发对应设备键，固定值除外）：
      * - `ssid: String?` —— SSID。**调用方负责 trim**（profile 不猜「要不要去空格」）
-     * - `auth_mode: String?` —— 认证方式，缺省 `"WPA2PSK"`
+     * - `auth_mode: String?` —— 认证方式，缺省 `"WPA2PSK"`；**取值域**（2026-09-22 真机抓包，
+     *   大小写敏感）：`OPEN` / `WPA2PSK` / `WPA3PSK` / `WPA2PSKWPA3PSK`，其余值被 validate 拒
      * - `encrypt_type: String?` —— 加密方式，缺省 `"CCMP"`；`auth_mode == "OPEN"` 时**强制** `"NONE"`
      * - `passphrase: String?` —— **明文**口令，由 encode 做 base64(UTF-8)
-     * - `max_sta_num: Int?` —— 最大接入设备数
+     * - `max_sta_num: Int?` —— 最大接入设备数。**闭区间 `1..10`**，越界被 validate 拒
+     *   （上限 10 = 用户对中兴 F50 的实测/规格结论，2026-09-22）
      * - `broadcast_disabled: Int?` —— 隐藏 SSID，缺省 `0`
      * - `chip_index: String?` —— 芯片序号，缺省 `"0"`
+     *
+     * 校验只覆盖 `auth_mode` 与 `max_sta_num`；**SSID 与 `passphrase` 不做任何校验**
+     * （允许任意字符，加格式校验会把现在能设的值变成 Rejected）。
+
      *
      * ## 为什么只有一个 key（而不是 WIFI_SSID + WIFI_PASSPHRASE 两个）
      *
@@ -432,6 +458,15 @@ enum class SettingKey {
      * **不要**在 encode 里再判 `auth != OPEN && encryp != NONE`：三个入口的条件并不相同
      * （「只改口令」这个入口对 OPEN 也发 Password）。那个条件是**调用方的意图**、
      * 不是设备事实 —— 把它写进 encode，三处就再也共用不了同一份实现。
+     *
+     * ## 调用方须知：`auth_mode == "OPEN"` 时**不应该**传 `passphrase`
+     *
+     * 2026-09-22 真机抓包里，界面选 `OPEN` 发出的请求**没有 `Password` 字段**
+     * （`…&AuthMode=OPEN&ApBroadcastDisabled=0&ApMaxStationNumber=10&EncrypType=NONE&AD=…`）。
+     * 但 encode 的规则是上面那条「`passphrase` 键非 null 就发」，**所以这件事由调用方负责** ——
+     * profile 不会替你把它删掉（删了就会让「只改口令」那个入口在 OPEN 下静默丢掉用户的输入）。
+     * 想发出与真机逐字一致的 OPEN 报文，就**不要放 `passphrase` 这个键**。
+
      */
     WIFI_AP_CONFIG,
 }

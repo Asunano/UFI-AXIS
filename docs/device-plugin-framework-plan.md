@@ -99,7 +99,12 @@
 - `GoformWifiClient.kt:347` `SET_WIFI_POWER`（`wifiPowerLevel`）→ 已完成（`36fa526`）
 - `GoformWifiClient.kt:374` `switchWiFiChip`（`ChipEnum` / `GuestEnable`）
   → 已完成（`36fa526`，与下一条合并成 `WIFI_ENABLED` 的 `commandOf`）
+  ⚠ **2026-09-22 真机抓包后重新定性**：`switchWiFiChip` 不是「开 WiFi」，而是「**在频段 X 上启用 WiFi**」，
+  与「切频段」是同一条命令。据此新增 `SettingKey.WIFI_BAND`，`WIFI_ENABLED` 的「开」分支改成收可选
+  `chip` 参数（见 §15 的 **P1-26**：profile 已拆完，客户端与 route **尚未接线**）。
 - `GoformWifiClient.kt:379` `switchWiFiModule`（`SwitchOption`）→ 同上
+  ⚠ 只用于「关」（`SwitchOption=0`）。`SwitchOption=1` 本项目从未发过、抓包里也没有 ——
+  **无实测依据，不许写进代码**（P1-26 记了这条判断的来龙去脉）。
 - `GoformSmsClient.kt:200` `DELETE_SMS` → `SmsSpec.deleteParams`（`2d92e05`），客户端接线进行中
 - `GoformSmsClient.kt:206` `SET_MSG_READ` → `SmsSpec.markReadParams`（`2d92e05`），同上
 - `GoformSmsClient.kt:264` `SEND_SMS` → `SmsSpec.sendParams`（`2d92e05`），同上
@@ -994,6 +999,16 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   新增 **P1-25**（`getFullStatus()` 的 96 项里相当一部分没有登记 canonical）；
   §16 末尾补一条「0.4b 已落地且**未新增 `FieldGroup`**，所以不需要追加第二份基线」。
   本轮**不改任何代码**、**没有重跑 Gradle**（用户正在并行改 `scripts/**` / `app/**` / `web/src/**`）。
+- 2026-09-22 **批 14 同步**（真机 WiFi 测试后的三轮修复 + 抓包定性）：
+  §2 命令清单里 `switchWiFiChip` / `switchWiFiModule` 两条**重新定性**（带频段启用 / 仅用于关）；
+  §4 阶段 0 实机验证第 3 项补「入口 2026-09-22 起才存在」与「验完要改回 true 并再重启」；
+  §15 **P1-11 部分结案**（`WIFI_AP_CONFIG` 现在有 `validate`，SSID / 口令仍刻意不校验）、
+  新增 **P1-26**（`WIFI_BAND` 已在 profile 拆完、三层未接线，附抓包原文与阻塞原因）
+  与 **P1-27**（`needs_restart` 不覆盖 `field_normalization_enabled`）。
+  对应代码：`86be1f3`（AuthMode 白名单 + `switchWiFiChip` 语义误用注释）、
+  `06e7bfa`（web WiFi 表单补加密方式与最大连接数）、`ee145ae`（app WiFi 弹窗同上），
+  以及本轮未提交的四批改动（device-schema 的 `WIFI_BAND` 与 `1..10`、
+  core 的 `field_normalization_enabled` 读写登记、web / app 的归一化开关与上限收紧）。
 
 
 ### 执行记录
@@ -1279,9 +1294,15 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
      脚本级的逐字比对能证明**搬运没抄错**，但证明不了**设备照旧应答** ——
      真出问题的表现是某些字段悄悄变 missing（不报错、不崩溃），这正是 §14.3 判据 3/4 的用途。
 3. **`field_normalization_enabled=false` 的端到端回归**（第 4 层）
-   - 把开关设成 false、**重启后台服务**（该值只在构造组件图时读一次），然后：
+   - **入口 2026-09-22 起才存在**：此前这个键没进 `AppSettings.toMap()`、`PUT /api/config` 也没登记，
+     只有「导入备份」改得动，所以这一项一直做不了。现在两处都补齐了，
+     web 在「设置 › 通用」第三个排障开关、app 在「诊断信息 › 字段覆盖率」卡上方。
+   - 把开关设成 false、**重启后台服务**（该值只在构造组件图时读一次；
+     `needs_restart` 不会提示这一点，见 §15 的 **P1-27** —— 漏了重启这一步测出来的结果是假的），然后：
      仪表盘 / 网络 / WiFi **三个页面仍有数据**，且 `/api/diagnose` 的
-     `device_profile.normalization_enabled` 为 **false**。
+     `device_profile.normalization_enabled` 为 **false**（app 的卡片会把这个值作为
+     「运行时实际状态」直接显示，不必手动调接口）。
+   - 验完记得改回 true 并再重启一次 —— 否则后续所有只读面都停在排障形态。
    - **不验的后果**：这是 0.4b 风险最集中的一处 —— 排障模式下 `normalizeProfile = null`，
      命令表全靠 `commandProfile` 顶着。切错了的表现是**关掉归一化就整个只读面变空**，
      而那正是排障时最需要它工作的时刻。单测替身（守门测试第 ⑦⑧ 条）只覆盖取值、不覆盖端到端。
@@ -2158,14 +2179,23 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 猜测（未验证）：设备不会返回非数字的 `ApBroadcastDisabled`（真机一直是 `0` / `1`）。
 - 建议归属：不用改。留这条是为了下次有人看到「Int 通道」时不要以为漏了字符串分支。
 
-**P1-11 `WIFI_AP_CONFIG` 没有 `validate`（SSID / 口令原样进表单）**
+**P1-11 `WIFI_AP_CONFIG` 没有 `validate`（SSID / 口令原样进表单）** —— **部分结案（2026-09-22）**
 
-- 事实：`ZteGoformProfile.kt:1059-1061` 的注释写明**刻意不加** ——
-  SSID 与口令允许任意字符（含 `&` 和 `=`），body 由 `GoformCodec` 统一 URL 编码；
+- 已补（`86be1f3` + 本轮）：`WIFI_AP_CONFIG` 现在有 `validate = ::validateApConfig`，管两件事 ——
+  ① `auth_mode` 白名单，只收真机实测到的 4 个值（`OPEN` / `WPA2PSK` / `WPA3PSK` /
+  `WPA2PSKWPA3PSK`，**大小写敏感、不 trim**）；② `max_sta_num` 闭区间 `1..10`
+  （`AP_MAX_STA_NUM_RANGE`，依据是用户对中兴 F50 的规格结论，2026-09-22）。
+  此前「不设上限，真机见过 7 与 10，固件真实上限未知」的措辞已作废，三层（core / web / app）
+  同步收紧到同一个区间。
+- **仍然刻意不校验 SSID 与口令**，理由不变（见下）—— 这一条只结掉「完全没有 validate」那半，
+  「SSID / 口令的值域」那半仍在阶段 2。
+- 事实：`ZteGoformProfile.kt` 的注释写明 SSID 与口令**刻意不校验** ——
+  允许任意字符（含 `&` 和 `=`），body 由 `GoformCodec` 统一 URL 编码；
   在这里加值域校验会把「现在能设的 SSID」变成 `Rejected`。
-- 事实：其它 17 项里有 validate 的（如 `WIFI_POWER` / `LAN_DHCP` / `TRAFFIC_LIMIT`）
+- 事实：其它项里有 validate 的（如 `WIFI_POWER` / `LAN_DHCP` / `TRAFFIC_LIMIT`）
   都是**本来就有** route 层同义校验的项，加 validate 不改变对外可接受的取值集合。
-- 建议归属：阶段 2「route 只认 `SettingKey` + 三态」那一步。补校验是**对外行为变更**
+  `auth_mode` / `max_sta_num` 这两项属于同一类：web/app 两端本来就只让用户从固定选项里选。
+- 剩余部分的归属：阶段 2「route 只认 `SettingKey` + 三态」那一步。补 SSID / 口令校验是**对外行为变更**
   （原来能设的名字变成 400），要与 route 的入参校验一起定，并且要先想清楚「WPA2 口令 8~63 位」
   这类规则是设备事实还是标准 —— 前者进 profile，后者进 route。
 
@@ -2433,6 +2463,56 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 归属：**阶段 2 或更晚**，与「诊断出口要不要统一走 allowlist」一起定。
   在那之前**不要顺手给它们补 `FieldSpec`** —— 那会动 `registered`，
   而 `registered` 逐组不变是 §14.3 判据 1 的基石。
+
+#### 批 14 新登记（P1-26 ~ P1-27）
+
+**P1-26 `WIFI_BAND` 在 profile 里拆完了，客户端 / route / UI 三层都还没接线**
+
+- 抓包事实（2026-09-22，用户提供，逐字）：
+
+  ```
+  关闭 WiFi：goformId=switchWiFiModule&isTest=false&SwitchOption=0&AD=…
+  开启 WiFi：goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0&AD=…
+  ```
+
+  由此定下的语义模型：`switchWiFiChip&ChipEnum=X&GuestEnable=0` = **在频段 X 上启用 WiFi**
+  （「开」与「切频段」是同一条命令，chip1=2.4G / chip2=5G）；
+  `switchWiFiModule&SwitchOption=0` = 关闭 WiFi 模块。
+- **原拆分方案第 2 步已被这份抓包否定**：那一步写的是「`WIFI_ENABLED` 只保留 `switchWiFiModule`，
+  `SwitchOption=0|1`，删掉 `commandOf`」。真机证明「开」走的是 `switchWiFiChip`，
+  `SwitchOption=1` 本项目从未发过、这次抓包里也没有 —— **至今无实测依据，不许写进代码**。
+  当时刻意不按对称性猜、坚持等抓包，事后证明是对的；这段判断过程本身留档，不要只留结论。
+- 已落地（device-schema）：`SettingKey` 28 → 29，新增 `WIFI_BAND`（`value` 只收设备词汇
+  `"chip1"` / `"chip2"`，`2.4G` / `5G` / `0` / `1` 一律拒）；`WIFI_ENABLED` 的「开」分支改成读
+  可选参数 `chip`，缺失时退回 `chip1`。`:core:device-schema:test` 185 → 188 全绿。
+  除「带 `chip` 时的 `ChipEnum`」一格外，四种情况（开+chip2 / 开+chip1 / 开+无 chip / 关）
+  的报文逐字未变。
+- **未做：接线**。`GoformWifiClient.setWifiEnabled` 仍只传布尔（不读当前频段），没有 `setWifiBand`，
+  没有频段 route，web/app 的「频段」选择器仍在往 `POST /api/wifi/config` 的 `chip_index` 写 ——
+  那条路**实测无效**，也就是用户报的「WiFi 频段修改无效」。
+  所以今天「打开 WiFi」在 5G 下仍会被切到 2.4G，只是原因从「写死 chip1」变成「调用方没传」。
+- 阻塞原因：`core/goform/.../GoformWifiClient.kt` 与 `core/api/.../routes/WifiRoutes.kt`
+  当前正被用户本人改（`git status` 为 `M`，改动就落在 WiFi 开关那一段），
+  为避免与 in-flight 改动冲突本轮不碰。
+- 接线时要一并决定的两件事：① `setWifiEnabled(true)` 从哪里取当前频段
+  （`wifi_chip` 已是登记字段、已在 `cmdsFor(WIFI_SETTINGS)` 里，读得到）；
+  ② 切频段会重启 WiFi 模块、**会把正通过 WiFi 连着的用户踢下线**，
+  按「破坏性动作必须用户确认且写清后果」的口径要给确认弹窗并留「暂不执行」出口。
+
+**P1-27 `needs_restart` 不覆盖 `field_normalization_enabled`（要重启但接口不说）**
+
+- 事实：`field_normalization_enabled` 2026-09-22 起可读可写（`AppSettings.toMap()` +
+  `ConfigRoutes` 的 `boolField`），但唯一读取点在 `ComponentFactory.resolveDeviceProfile()`
+  （`core/src/.../service/ComponentFactory.kt:802`，调用点 `:152`），只在构造组件图时读一次
+  —— **不重启后台服务不生效**，与 §11.10「运行期不允许热换插件」一致。
+- 事实：`ConfigRoutes` 的 `needs_restart` 清单只有 `port` / `goform_ip` / `goform_port` /
+  `goform_password`，`hint` 文案也写死成「修改了认证或端口配置」。
+  所以 PUT 这个键会回 `needs_restart:false`，客户端**无法**靠接口判断要重启。
+- 现状的补法：web（`GeneralPanel.vue`）与 app（`DiagnoseScreen.kt`）各自在 UI 文案里硬编码
+  「需重启后台服务生效」；app 另外把 `/api/diagnose` 的 `device_profile.normalization_enabled`
+  作为「运行时实际值」显示出来，与配置值不一致时给提示 —— 这是两端都能自证的做法，不是假开关。
+- 归属：要把它算进 `needs_restart` 就得同时改 `hint` 的语义（现在是「认证或端口」一句话），
+  属于对外响应语义变更，与 route 层的其它整理一起做。**在那之前不许把 UI 文案改成依赖 `needs_restart`。**
 
 
 
