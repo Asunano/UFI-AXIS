@@ -110,10 +110,12 @@
 
 **B. 读命令表只搬了一半**
 
-> **状态（2026-09-22 批 10/11 之后）**：**0.4 已拆成 0.4a（已完成，`9fa0473`）/ 0.4b（未开始，被 P0-3 卡着）**。
+> **状态（2026-09-22 批 12 之后）**：**0.4 已拆成 0.4a（已完成，`9fa0473`）/ 0.4b（未开始，
+> 但 **前置条件 P0-3 已解除**，状态由「受阻」改为「就绪」）**。
 > 0.4a 做的是**结构准备**：mapper 改双 profile、6 处 fallback 提成具名常量、加守门测试 ——
 > **取值行为一字未变**（`cmds()` 仍读 `normalizeProfile`）。
-> 0.4b 才是「删并行路径」那一半，前置条件见 §15 的 P0-3。
+> 0.4b 才是「删并行路径」那一半；原先卡它的 P0-3 已由 `d15c368` 修掉（两份命令表现在逐字一致），
+> 剩下的任务与验收见 §4 的 0.4b。
 > 本节标题的「只搬了一半」这个说法仍不准确（工作性质是删并行路径，不是搬），见下面那段 2026-09-21 的修正。
 
 > **2026-09-21 按真机基线修正**：这个标题不准确。§16 显示 10 个 `FieldGroup` 的
@@ -346,9 +348,10 @@ class DeviceRuntime private constructor(
 
 ### 任务
 
-> 状态口径（**2026-09-22 批 11 执行完后复核**）：
+> 状态口径（**2026-09-22 批 12 执行完后复核**）：
 > 每一条都按当天的代码现查现写，不照抄上一轮。行号一律以符号名为准。
-> 阶段 0 现在只剩 **0.4b** 未开始（被 P0-3 卡着）+ **0.8 的真机那一半**没法做。
+> 阶段 0 现在只剩 **0.4b** 未开始（**前置条件 P0-3 已解除，状态由「受阻」改为「就绪」**）
+> + **0.8 的真机那一半**没法做。
 
 - `[x]` 0.1 `SettingKey` 补齐写命令（`core/device-schema/.../DeviceProfile.kt`）
   → 实测 `SettingKey` 现为 **28 项**（18 原有 + 10 新增；`USB_MODE` 已删、`WIFI_SSID`/`WIFI_PASSPHRASE`
@@ -382,20 +385,44 @@ class DeviceRuntime private constructor(
     非空回落 `?: DeviceProfiles.DEFAULT` 放在两个客户端内部
     （`GoformSignalClient.kt:38` / `GoformWifiClient.kt:33`），口径同 `GoformSettingWriter`
 
-- `[ ]` 0.4b 读命令表**真正切过去**：`cmds()` / `queryGroup()` 里的 `soloCmds` 改读 `commandProfile`、
-  删掉 `cmds()` 的 `fallback` 参数与客户端那 6 个常量、把 11 处 `client.query(listOf(...))`
-  的字面量收进 `cmdsFor()`、`getFullStatus()` 走一个新的 `fullStatusCmds()`（或新 `FieldGroup`）
+- `[ ]` 0.4b（**就绪，不再受阻**）读命令表**真正切过去**：`cmds()` / `queryGroup()` 里的 `soloCmds`
+  改读 `commandProfile`、删掉 `cmds()` 的 `fallback` 参数与客户端那 6 个常量、把 11 处
+  `client.query(listOf(...))` 的字面量收进 `cmdsFor()`、`getFullStatus()` 走一个新的
+  `fullStatusCmds()`（或新 `FieldGroup`）
 
-  **还剩什么**：实测 `core/goform/src/main` 里 `client.query(listOf(` 仍有 **11 处**
-  （`GoformSignalClient` 9 + `GoformWifiClient` 2）；另有 2 处走 `client.querySingle`
-  （`station_list` / `queryDeviceAccessControlList`，`GoformWifiClient.kt:252/278`），
-  该 pattern 抓不到，别按 11 这个数字下结论。
+  **前置条件已解除（2026-09-22 批 12）**：P0-3 的分叉已修（`d15c368`，客户端 fallback 的
+  `lte_snr` → 设备真名 `Lte_snr`）。现在**两份命令表逐字一致** ——
+  `GoformSignalClient.CELL_INFO_FALLBACK_CMDS`（`:373-378`）与 `cmdsFor(CELL_INFO)`
+  （`ZteGoformProfile.kt:466-470`）同序同字；守门测试的 `knownDivergentGroups` 已清空为
+  `emptySet()`（`GoformCommandTableGuardTest.kt:89`）且仍绿。
+  **所以删 fallback 不会改变任何实际发出的 cmd**，「设备对 cmd 名是否大小写敏感」这个未证问题
+  也就不再是 0.4b 的前置条件（两条路发的已经是同一个串，敏不敏感都一样）。
 
-  **前置条件（硬）**：§15 的 **P0-3** 定性 —— `CELL_INFO` 两份表差一个大小写
-  （客户端 `lte_snr` / profile `Lte_snr`），设备对 cmd 名是否大小写敏感未证。
-  敏感 → 这一组的 fallback **不能删**，要作为永久例外保留；不敏感 → 可删。
-  守门测试里那条「例外集合恰好等于 `{CELL_INFO}`」就是这个前置条件的看门人：
-  删干净之后把它从集合里移除、测试仍绿，才是「可以安全删 fallback」的信号
+  **还剩什么**（2026-09-22 实测，按符号名找，别照抄数字）：
+  - `core/goform/src/main` 里 `client.query(listOf(` 仍有 **11 处**
+    （`GoformSignalClient` 9 + `GoformWifiClient` 2）；另有 2 处走 `client.querySingle`
+    （`station_list` / `queryDeviceAccessControlList`，`GoformWifiClient` 里），该 pattern 抓不到
+  - `cmds()` 仍是 `normalizeProfile?.cmdsFor(group)?.takeIf{…} ?: fallback`
+    （`GoformFieldMapper.kt:117-118`）→ 切成 `commandProfile.cmdsFor(group)`
+  - `queryGroup()` 的 `soloCmds` 取自传进来的 `normalizeProfile`（`GoformFieldMapper.kt:188-199`）
+    → 必须与 `cmds()` **同一批**切，否则「发哪些 cmd」与「哪些 cmd 不能合并发」来自两份 profile
+  - `GoformSignalClient` 的 6 个 `*_FALLBACK_CMDS` 常量 + `FALLBACK_CMDS` 汇总表（`:349-423`）删掉，
+    守门测试改成直接比对 `cmdsFor()` 与**收进 profile 后的唯一一份**
+  - 顺手做掉 **P1-20**（`GoformWifiClient` 两处 cmd 字面量提成 companion 常量、
+    测试引用真身而不是手抄拷贝）与 **P1-21**（`SIGNAL` / `CONNECTION` / `WIFI_CLIENTS`
+    三组纳入守门比对）
+  - `getFullStatus()` 的 **96** 项（三批 30 / 29 / 37，`GoformSignalClient.kt:168/180/193`）
+    收进 `fullStatusCmds()` 或新 `FieldGroup`（P1-22）
+  - 逐组核一遍 `cmdsFor()` 有没有同类「响应键当 cmd」的误登记（**P2-1**）——
+    两份表合成一份的那一刻正是做这件事的时机
+
+  **验收（除本节通用条目外，这一条是硬判据）**：改完**重抓一份 `field_coverage`**，
+  按 §14.3 的四条判据与 §16 的 2026-09-22 基线比对 ——
+  `registered` **逐组不变**（合计 **85**）、`queried` **全 true**、
+  `hit_source` **逐字不变**、`hit` **只增不减**（≥ **67**）。
+  任何一条不满足且解释不清 → P0，先回滚再查。
+  ⚠ 若这一批同时新增了 `FieldGroup`（`FULL_STATUS` / `SMS_META`），
+  `registered` 合计必然变 —— 那就要**先抓基线、再改**，并在 §16 追加一份新基线（见 §16 末尾）。
 
 - `[~]` 0.5 设备值域（频段全集 / WiFi 固定枚举 / base64 编码方向 / 二维码文件名）搬进 profile
   → **部分完成**：WiFi 固定枚举（`WPA2PSK` / `CCMP` / `ApIsolate=0` / `AccessPointIndex=0` /
@@ -845,6 +872,21 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   删掉 `module_switch` 那句的「待核」（已核清：OCR 是对的、文档的猜测错了），
   并加一条「重抓基线时 `WiFiModuleSwitch` 可能仍然 missing」的预判。
   本轮**不改任何代码**、**没有重跑 Gradle**（用户正在并行改 `scripts/**`，见 §13.3 最后一条）。
+- 2026-09-22 **拿到真机「字段覆盖率」界面基线后按实测同步本文档（批 12 文档轮）**：
+  **§16 整节重写** —— 用可逐字比对的真基线（85 / **67** / **18**）取代 2026-09-21 的 OCR 转录版，
+  写明来源与废弃理由、保留「抓取时设备状态」、**18 个 missing 逐条归因且结论是「无一是适配缺陷」**、
+  新增「两条不许动的映射」与「结构解码器已验证」两节、
+  **撤销**「合并查询可能让 `WiFiModuleSwitch` 仍 missing」那条预判（基线证明它命中且 source 是自己，
+  容器命令与扁平命令合并成一次请求没被设备吞掉）；
+  **§4 的 0.4b 由「受阻」改成「就绪」**（前置条件 P0-3 已解除）并把任务清单与验收写实
+  （验收 = 重抓一份 `field_coverage` 按 §14.3 四条判据比对本基线）；
+  §14.3 的 missing 数 19 → **18**、判据 3 标注「本轮起真的可用」、判据 4 补两类「任何状态都 missing」的项；
+  §15 **P0-3 结案**（`d15c368`，并写清「不是为大小写统一而改，是修一个查不到值的字段名」）、
+  **P1-2 结案**（固件不给 5G 带宽）、**P1-1 改写**（原猜测「大小写」被排除，真因是 CELL_INFO 那几条
+  没有 decoder、空值也算命中）、新增 **P1-23**（web 复制按钮失效，推断根因 + 另一个代理正在修）
+  与 **P1-24**（约 30 个清单未收录字段待多态 dump 验证，附取证方法）；
+  §9 追加执行记录批 12。
+  本轮**不改任何代码**、**没有重跑 Gradle**（另一个代理在改 `web/**`、用户在改 `scripts/**` 与 `app/**`）。
 
 
 ### 执行记录
@@ -991,6 +1033,35 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   而是「**任一侧变动都会立刻暴露**」—— 也正是 0.4b 判断「能不能安全删 fallback」的依据。
   **用户裁决（原话）**：「**不要自己为了大小写而改动**」「按照原来的就行了」——
   `CELL_INFO` 的 `lte_snr` / `Lte_snr` 两侧字面量**都保持现状，不统一**，登记为 P0-3。
+- 2026-09-22 **阶段 0 批 12**（字段名全仓核对与修复 + 覆盖率入口补齐）完成，
+  三个 commit：`d15c368`（core）+ `913ff27`（web）+ `190691a`（app）。
+  - **`d15c368`：`CELL_INFO` fallback 的 `lte_snr` 改成设备真名 `Lte_snr`。**
+    改了 3 个文件（`ZteGoformProfile.kt` +6 注释 / `GoformSignalClient.kt` / 守门测试），
+    客户端那份列表除末项外一个字符未动。**这是 P0-3 的结案**，与批 11 的「不要为大小写而改动」
+    不冲突：真机 dump 证明 `lte_snr` 这个键**在设备上不存在**（4G 驻网回 `Lte_snr`），
+    所以改的不是「大小写风格」，是**一个查不到值的字段名** —— 排障模式下该项此前永远查不到东西；
+    正常模式走 `cmdsFor(CELL_INFO)` 本来就发 `Lte_snr`，**对外行为不变**。
+    守门测试的 `knownDivergentGroups` 随之清空为 `emptySet()` 且仍绿
+    （那条双向相等断言对**新增**分叉依然有效），另加一条字符级断言钉住两侧末项。
+  - **全仓核对范围（这一轮的主要工作量，不是那一行改动）**：`cmdsFor()` 的 **10 个分组**、
+    `readSpecs()` 的**全部别名链**、客户端**所有硬编码 cmd 列表**（含 `getFullStatus()` 的
+    **96** 项：三批 30 / 29 / 37，`GoformSignalClient.kt:168/180/193`）。
+    结论：**凡在真机 dump 里出现过的字段名，全部逐字一致，只有 `lte_snr` 一处错。**
+  - **约 30 个「清单未收录」的字段一律未动**（真机 dump 里没出现过，无从判断对错），
+    **列入待真机验证** → §15 的 **P1-24**，那一条写明了取证方法
+    （在不同设备状态下多抓几份 dump：开启定时重启、锁一次频段 / 切 4G 驻网 等，
+    每份都用裸命令抓不过归一化的原始响应）。
+    **用户裁决：「不允许漏修埋坑」** —— 这批不是放过，是登记为待验，拿到新 dump 就接着核。
+  - `913ff27`（web）给「设置 › 关于 › 诊断信息」加「字段覆盖率」入口 + 弹窗 + 复制 JSON；
+    `190691a`（app）给诊断页那张覆盖率卡补复制按钮、逐组 `命中/登记` + missing + `hit_source`、
+    并把 `queried=false` 单独标成「未登记命令」（它与「查了 0 命中」是两件事）。
+    **这两个入口就是 §14.3 判据的取数工具** —— 有了它们，§16 才拿到第一份**可逐字比对**的基线。
+  - 副产物：web 的「复制 JSON」按钮实测**点了没反应**（基线是手动复制出来的）→ §15 **P1-23**。
+  - 第1层 / 第2层：沿用三个 commit 说明里的自报结果（`d15c368` 自报守门测试全绿）；
+    **本文档轮没有重跑 Gradle** —— 另一个代理正在改 `web/**`、用户在并行改 `scripts/**` 与 `app/**`，
+    抢构建锁只会拿到一份混合状态的结果（§13.3 最后一条）。
+    第3层：**这一轮第一次真正做了** —— 拿到真机 `field_coverage` 并写进 §16 作为后续比对基准；
+    第4层（写操作真机回归）仍未做。
 
 
 
@@ -1481,10 +1552,10 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 **判据（2026-09-21 按真机基线重写）**：
 
-原方案写的是「`field_coverage` 必须逐项一致」—— **那是错的**。实测基线（§16）有 19 项 missing，
+原方案写的是「`field_coverage` 必须逐项一致」—— **那是错的**。实测基线（§16）有 18 项 missing，
 而这些 missing 会随设备状态、固件版本、功能开关状态变化：驻 NR 时 `lte_*` 全 missing、
 驻 LTE 时反过来 `nr_*` 全 missing；定时重启没开就没有 `restart_time`；
-老固件没有 `BearerPreference`（`ZteGoformProfile.kt:149` 的注释早写了）。
+老固件没有 `BearerPreference`（`ZteGoformProfile.kt:189` 的注释早写了）。
 按「逐项一致」判，每次都不一致 → 这条判据会被忽略，等于没有。
 
 改成四条，从硬到软：
@@ -1497,8 +1568,13 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 3. **`hit_source` 的映射关系不变**：对同时出现在两份快照里的 canonical，
    `hit_source` 的值必须逐字相同。这才是「映射没变」的直接证明，且与设备状态无关
    （状态只影响某个字段有没有值，不影响它命中的是哪个 source）。
-4. **hit 集合只许增不许减**。少掉的每一项都必须能用第 1 步记录的设备状态解释；
+   **2026-09-22 起这条判据真的可用了** —— §16 换成了从界面原文复制的基线；
+   在那之前基准是 OCR 转录稿，逐字比对无从谈起。
+4. **hit 集合只许增不许减**（基线合计 67）。少掉的每一项都必须能用第 1 步记录的设备状态解释；
    解释不了 → P0。
+   注意两类**不受状态影响、任何时候都 missing** 的项（§16 已逐条归因）：
+   `dhcpLease` / `lan_station_list` / `Language` 是「刻意不在覆盖率命令表里、由别的查询提供」，
+   `nr_band_width` 是「这台固件不填」—— 它们不是回归。
 
 另外两条与 coverage 无关但同样要比：
 
@@ -1506,10 +1582,11 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 裸命令的原始响应一致 → 说明设备侧没变，差异都是我们引入的
 
 **看 coverage 报告时的一条纪律**：`hit_source` 里看起来像 bug 的映射，**先去读 profile 的注释**。
-基线里 `monthly_rx_bytes → monthly_tx_bytes`、`monthly_tx_bytes → monthly_rx_bytes` 是上下行**交叉**的，
-看着像接反 —— 实际是 `ZteGoformProfile.kt:215-226` 刻意为之：ZTE 固件的 `monthly_rx/tx` 是
+基线里 `monthly_rx_bytes ← monthly_tx_bytes`、`monthly_tx_bytes ← monthly_rx_bytes` 是上下行**交叉**的，
+看着像接反 —— 实际是 `ZteGoformProfile.kt:255-266` 刻意为之：ZTE 固件的 `monthly_rx/tx` 是
 「从模块看 PC」的视角，2026-09-01 真机实测 `monthly_tx_bytes`=7.0GB 才是下载，
 所以在唯一的适配层一次性掰正。**把它「修正」回来就是把功能改坏。**
+§16 末尾把这类「不许动的映射」单列了一节，改之前先读那一节。
 
 **差异不为空且解释不清 → P0。**
 
@@ -1560,22 +1637,44 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 动手过程中发现但**刻意不在当前阶段修**的东西记在这里。格式：
 `P<级别>-<序号> 现象 / 事实 / 猜测 / 建议归属阶段`。
 
-**P1-1 同一类数据在 SIGNAL 与 CELL_INFO 两组的命中结果不一致**
+**P1-1 同一类数据在 SIGNAL 与 CELL_INFO 两组的命中结果不一致
+（2026-09-22 按新基线重写：**原猜测「大小写」已被排除**，真因是 decoder 不同）**
 
-- 事实（来自 §16 基线）：CELL_INFO 组的 `lte_rsrq` → `lte_rsrq`、`lte_snr` → `Lte_snr` **命中**；
-  而 SIGNAL 组的 `lte_snr` **missing**。两组 `cmdsFor()` 的列表不同。
-- 事实：CELL_INFO 的 missing 只有 `lte_rsrp`，SIGNAL 的 missing 含 7 个 `lte_*`。
-- 猜测（未验证）：SIGNAL 组查的是 `lte_snr` 这个小写名，而设备只返回 `Lte_snr`（首字母大写），
-  CELL_INFO 组恰好登记了大写别名 → 补一条别名链就能修。
-- 归属：**不属于阶段 0**（阶段 0 只搬运、不改映射结果）。建议在阶段 0 完成、
-  基线对齐之后单独一个 commit 处理，并用 §14.3 的判据验证「只增不减」。
+- 事实（来自 §16 的 2026-09-22 基线）：CELL_INFO 组 `lte_rsrq ← lte_rsrq`、`lte_snr ← Lte_snr`、
+  `Lte_pci ← Lte_pci`、`Lte_fcn ← Lte_fcn`、`Lte_bands ← Lte_bands` **全部命中**；
+  而 SIGNAL 组的 `lte_snr` / `lte_pci` / `lte_arfcn` / `lte_band` **全部 missing**。
+- 事实：两组查的是**同一批设备键** —— `cmdsFor(CELL_INFO)`（`ZteGoformProfile.kt:466-470`）与
+  `cmdsFor(SIGNAL)`（`:477-483`）都含 `Lte_pci` / `Lte_snr` / `lte_rsrp` / `lte_rsrq`，
+  且两组的 cmd 名**大小写完全相同**（`Lte_snr` 两处都是大写 L）。
+- 事实：**差别在 decoder**。CELL_INFO 那几条 spec 没写 `decode`，走默认 `Decoders.AS_IS`
+  （`:336-347`，`FieldSpec.kt:96`），**空串照样算命中**；SIGNAL 的同名量是
+  `Decoders.NUMERIC` / `NON_BLANK`（`:386-392`），空值一律返回 null → `resolve()` 跳过 → missing
+  （`FieldNormalizer.kt:100-108`）。
+- 推论（由基线 + 代码逐字推出，未看到 dump）：设备在**驻 5G** 时仍然返回这些 LTE 键，
+  但**值是空的**。所以 CELL_INFO 的「命中」是**空值命中**，SIGNAL 的 missing 才是实情。
+- 结论：**这不是缺陷，也不需要补别名链** —— 原猜测「SIGNAL 查的是小写 `lte_snr`、
+  设备只回 `Lte_snr`」已被 `d15c368` 的全仓核对与本基线双重排除（两份表现在都是 `Lte_snr`）。
+  唯一值得记的是**诊断口径**：CELL_INFO 组的 hit 数在驻 5G 时偏高，
+  比对基线时要看 `hit_source` 而不是 hit 数（已写进 §16「这份基线怎么用」第 2 条）。
+- 归属：**降级为口径问题，不需要改代码**。若将来要让两组口径一致
+  （给 CELL_INFO 那几条也加 `NON_BLANK`），那是**对外行为变更**（响应里会少几个空串字段），
+  要与 web 的 `parseCellArray` / `mapNeighbors` 一起定，归阶段 2。
 
-**P1-2 `nr_band_width` 在驻留 NR 时仍然 missing**
+**P1-2 `nr_band_width` 在驻留 NR 时仍然 missing（2026-09-22 **已结案：固件不给，不改**）**
 
-- 事实（§16）：SIGNAL 组驻 NR 状态下 `nr_*` 系列全部命中，唯独 `nr_band_width` missing。
-- 猜测（未验证）：这台固件不返回该字段，或它的设备侧名字不是登记的那个。
-- 归属：同 P1-1。先确认是「固件没有」还是「别名没登记」—— 前者不该改，
-  后者补别名。判据是裸命令 `POST /api/device/goform/query` 抓一份原始响应看有没有这个 key。
+- 事实（§16 的 2026-09-22 基线）：SIGNAL 组驻 5G，`nr_*` 系列全部命中，唯独 `nr_band_width` missing。
+- 事实：source 只有一个 `Nr_band_widths`，decoder 是 `Decoders.NUMERIC`
+  （`ZteGoformProfile.kt:379`）—— 空串解析不出 Long 就返回 null，算缺失（`FieldSpec.kt:114-117`）。
+- 事实（用户提供的真机 dump）：5G 小区信息里 `"Nr_band_widths": ""` 是**空串**。
+  → 所以是「**固件不填这个值**」，不是别名没登记、也不是名字抄错。
+  ⚠ 该 dump 不在本仓，**我未能逐字复核**；但仓内有两处独立佐证，结论不依赖 dump：
+  - `core/contract/.../DeviceFields.kt:360`：「服务小区带宽 kHz。**设备经常不填**
+    （`Nr_band_widths` / `Lte_bands_widths` 多为空），缺失即省略该 key。」
+  - `ZteGoformProfileTest:1023-1034` 有专门用例「带宽为空时不输出 `band_width`」，
+    夹具就是 `"Nr_band_widths" to ""`；`ServingCell.kt:27` 的注释也写着同一件事。
+- **结论：结案，不改。** 名字与 profile 注释里的固件原文一致（`:355`：NR 侧是
+  `Nr_fcn` / `Nr_band_widths`，LTE 侧多一个 s 是 `Lte_bands_widths`），
+  「缺失即省略 key」是刻意语义。重抓基线时它仍然 missing 属**预期**，不要当回归。
 
 **P0-1 `LTE_ALL_BANDS` / `NR_ALL_BANDS` 被跨模块引用，且全仓有三份同值拷贝
 （批 3 停手项 → 2026-09-22 已裁决：推阶段 2）**
@@ -1671,42 +1770,49 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   6 条**没在这一轮修**的东西，各自单列一条，别再埋在 P0-2 里。
 
 **P0-3 `CELL_INFO` 的命令表两份差一个大小写（`lte_snr` / `Lte_snr`）—— 0.4b 的前置条件
-（批 11 登记 → 2026-09-22 **已裁决：两侧都不改**）**
+（批 11 登记 → 2026-09-22 批 12 **已结案：客户端改成设备真名 `Lte_snr`**，commit `d15c368`）**
 
-- **现象**：客户端 fallback 的末项是**小写** `"lte_snr"`
-  （`GoformSignalClient.CELL_INFO_FALLBACK_CMDS`，`:365-370`），
-  `ZteGoformProfile.cmdsFor(CELL_INFO)` 的末项是**大写** `"Lte_snr"`（`:460-464`）。
-  所以**今天这两条路发出去的 cmd 就是不同的**：归一化开 → `Lte_snr`；
-  归一化关（排障模式，fallback 是唯一命令来源）→ `lte_snr`。
-- 事实：`ZteGoformProfile` 的 SIGNAL 段注释断言设备原名是 `Lte_snr`
-  （`lte_snr` 是 core 自有的小写 canonical，长得像设备原名而已）。
-- 事实：`CELL_INFO.LTE_SNR` 的别名链**两个名字都登记了**，所以**读侧解析**两种大小写都能命中
-  （`ZteGoformProfileTest:679-680` 两条断言钉着）—— 这处分叉**今天不造成功能缺陷**。
-- 事实（为什么一直没被发现）：`ZteGoformProfileTest` 里那条测试名叫
-  **「`cmdsFor CELL_INFO 与 getCellInfo 的查询一致`」**（`:736-746`），
-  但它**只断言了 profile 自己的那份列表、从头到尾没碰过客户端** —— 测试名在撒谎。
-  批 11 的 `GoformCommandTableGuardTest` 才是真的两侧比对。
-- **未证的猜测**：设备对 **cmd 名**是否大小写敏感。
-- **用户裁决（2026-09-22，原话）**：「**不要自己为了大小写而改动**」「按照原来的就行了」。
-  所以处理口径是：
-  - **两侧字面量都保持现状，不统一。**
-  - 真机验证的目的**不是**「决定改哪一边」，而是**判断 0.4b 能不能安全删 fallback**：
-    - 设备对 cmd 名**大小写不敏感** → 两条路等价 → 删 fallback
-      **不改变任何实际发出的命令** → 0.4b 可做；
-    - 设备**大小写敏感** → 两条路发的是不同命令（其中一条查不到东西）→
-      **不能删 `CELL_INFO` 的 fallback**，0.4b 要把这一组作为**永久例外**保留，
-      并在代码注释里登记原因。
-- **验证方法**（写在这里供将来复现）：
+**最终结论（与批 11 的裁决不冲突，务必连起来读）**：
+用户批 11 裁决过「**不要自己为了大小写而改动**」「按照原来的就行了」。
+批 12 改了，**不是推翻那条裁决，而是因为那条裁决的前提被真机 dump 否掉了**：
+`lte_snr` 这个键**在设备上不存在** —— 4G 驻网时设备返回的是 `Lte_snr`（大写 L）。
+所以这不是「为了大小写统一而改」，是**修一个查不到值的字段名**：
+排障模式（归一化关掉走 fallback）下那一项此前永远查不到东西。
+正常模式走 `cmdsFor(CELL_INFO)`，本来就发 `Lte_snr`，**对外行为不变**。
+
+- **已修**：`GoformSignalClient.CELL_INFO_FALLBACK_CMDS` 末项 `"lte_snr"` → `"Lte_snr"`
+  （`:373-378`，其余 9 项一个字符没动），改动理由整段写进了该常量的 KDoc（`:360-372`）。
+- **基线确认生效**：§16 的 2026-09-22 基线里 `lte_snr ← Lte_snr` 命中。
+- **守门测试**：`knownDivergentGroups` 已清空为 `emptySet<FieldGroup>()`
+  （`GoformCommandTableGuardTest.kt:89`），注释写明「空集合**不等于**这条断言空转 ——
+  `实测不一致的组必须恰好等于已登记的例外` 是双向相等，任一组新出现分叉都会立刻红」；
+  另新增一条**字符级**断言「`CELL_INFO` 两侧末项都必须是设备真名 `Lte_snr`」（`:144-145`）。
+  实测该类现有 **8** 条 `@Test`，commit 说明自报全绿（本轮没有重跑 Gradle，见 §13.3 最后一条）。
+- **设备命名规律（记下来，下次别再当笔误）**：小区参数首字母大写
+  （`Lte_pci` / `Lte_fcn` / `Lte_bands` / `Lte_cell_id` / `Lte_signal_strength` / `Lte_snr`，
+  `Nr_*` 侧对称），信号质量指标全小写（`lte_rsrp` / `lte_rsrq` / `lte_rssi`，`nr_*` 同）。
+  小写 `lte_snr` 是 core 自有 canonical（`DeviceFields.kt:242`），
+  `ZteGoformProfile.kt:341-347` 的注释写明它**只作读侧容错、不许抄进任何 cmd 列表**。
+- **「设备对 cmd 名是否大小写敏感」这个猜测不必再验**：两份表现在发的是同一个串，
+  敏不敏感都不改变实际报文。原先写在这里的验证步骤（裸命令各发一次 `lte_snr` / `Lte_snr`）
+  **保留在下面**，因为它对**排查别的字段**仍然是有效手段。
+- **为什么一直没被发现**（原始记录保留）：`ZteGoformProfileTest` 里那条测试名叫
+  「`cmdsFor CELL_INFO 与 getCellInfo 的查询一致`」，但它**只断言了 profile 自己的那份列表、
+  从头到尾没碰过客户端** —— 测试名在撒谎。批 11 的 `GoformCommandTableGuardTest` 才是真的两侧比对。
+- **对 0.4b 的影响**：前置条件解除，**fallback 可以删**（删了不改变任何实际发出的 cmd）。
+  见 §4 的 0.4b。
+
+**验证方法**（保留：将来排查「某个 cmd 名是不是设备真名」时照这个做）：
   1. `PUT /api/config` 把 `goform_command_enabled` 设为 `true`
      （`ConfigRoutes.kt:163`，默认 false；关着时 `POST /api/device/goform/query` 回 **403**，
-     见 `DeviceRoutes.kt:71-78` 的 `rejectIfCommandDisabled`）；
-  2. `POST /api/device/goform/query`，body `{"cmd":"lte_snr"}` 与 `{"cmd":"Lte_snr"}` **各发一次**；
+     见 `DeviceRoutes.kt` 的 `rejectIfCommandDisabled`）；
+  2. `POST /api/device/goform/query`，body `{"cmd":"<小写名>"}` 与 `{"cmd":"<大写名>"}` **各发一次**；
   3. 比较返回的**原始 JSON** 里有没有对应键、值是否相同；
   4. **验完把开关关回去** —— 那个通道不脱敏。
-- 与 **P1-1** 的关系：P1-1 记的是 SIGNAL 组 `lte_snr` missing 而 CELL_INFO 组命中，
-  猜测同样落在大小写上。同一次真机定性可以一起回答两条，但**处理口径不同**：
-  P1-1 是「要不要补别名/改查询」（读侧命中），P0-3 是「能不能删 fallback」（发侧一致性）。
-- 归属：**0.4b 的硬前置条件**。没真机就卡在这里，不允许「先切了再说」。
+
+- 与 **P1-1** 的关系：P1-1 原先猜测 SIGNAL 组的 missing 也落在大小写上，
+  **这条猜测已被排除**（两组 cmd 大小写本来就相同，真因是 decoder），见改写后的 P1-1。
+- 归属：**已结案**。保留本条是为了留下「裁决 → 新证据 → 改口径」这条决策链，别删。
 
 **P1-3 `setUsbMode` 已按用户裁决删除（已处理，保留决策痕迹）**
 
@@ -1964,101 +2070,313 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 建议：在那一行加半句区分「**不再输出 ≠ 不再查询**」。
   **本轮只登记，不改那个文件**（它不在本轮的独占文件范围内）。
 
+#### 批 12 新登记（P1-23 ~ P1-24）
+
+**P1-23 web「复制 JSON」按钮点了没反应（用户实测，只能手动选中复制）**
+
+- 现象（**用户实测**）：「设置 › 关于 › 诊断信息 › 字段覆盖率」弹窗里的「复制 JSON」按钮无效，
+  §16 这份基线是**手动选中复制**出来的。
+- **推断的根因（未实测，标明是推断）**：`copyToClipboard` 的 `execCommand` 回退把临时 textarea
+  插到 `document.body`，而覆盖率结果显示在 `n-modal` 里。naive-ui 的 modal 默认 `trap-focus`，
+  焦点陷阱在捕获阶段监听 `document` 的 `focus`，只要拿焦点的元素不在弹窗子树里就立刻把焦点抢回去 ——
+  弹窗内容是 teleport 到 body 的**兄弟**节点，所以 body 上那个 textarea 每次都被判成「外面」，
+  `select()` 的选区在同一拍内被夺走，`execCommand('copy')` 抄到空。
+- 事实：局域网 HTTP（`http://<局域网IP>:8088`）下 `navigator.clipboard` 是 **undefined**，
+  所以**必然**走回退路径 —— 这解释了为什么在 https/localhost 下试不出来。
+- 事实（**另一个代理正在修，我读到的是进行中的状态，别按这个下结论**）：
+  `web/src/composables/utils.ts` 的 `copyToClipboard` 已加第二个参数
+  `container?: HTMLElement | null`（缺省仍是 `document.body`），KDoc 把上面那条焦点陷阱的机理写全了；
+  `AboutPanel.vue` 的弹窗里已挂了 `coverageBodyRef`。
+  我核对时**调用点还没把 `container` 传进去**（`copyCoverageJson()` 仍是 `copyToClipboard(json)`）。
+- 双保险方向（他那轮在做）：① 修焦点处理（textarea 插到弹窗子树里）；
+  ② 弹窗里加一个只读文本框保底 —— 回退再失败也能手动全选。
+- 归属：**web，不在本轮范围**。本条只登记，等他那轮落地后确认一次
+  （判据：局域网 HTTP 下从弹窗点一次「复制 JSON」，粘贴出来与屏幕上的 JSON 逐字相同）。
+
+**P1-24 约 30 个「清单未收录」的字段名无法判断对错，待真机多态 dump**
+
+- 事实：批 12 全仓核对字段名时，凡在真机 dump 里**出现过**的名字都逐字核过（只有 `lte_snr`
+  一处错，已修）；但真机 dump 里**没出现过**的名字（约 **30** 个，数量以 commit `d15c368`
+  的说明为准 —— 该 dump 不在本仓，**我未能逐一点数复核**）**无从判断**：
+  它们可能名字就是对的（只是当时设备不返回），也可能像 `lte_snr` 那样从来查不到值。
+- 事实：这批字段一律**未动** —— 按 §13.1 第 2 条，没有证据就不改。
+- 事实：典型分布是「只在某个功能开着 / 某个制式下才返回」的那些：
+  `restart_time`（定时重启开着才有）、LTE 侧的 `Lte_*`（驻 4G 才有）、
+  `Nr_band_widths`（这台固件从不给，已由 P1-2 结案）、`UpgMode` / `sleep_sysIdleTimeToSleep` 等。
+- **怎么才能验完**（这就是获取判据的方法）：在**不同设备状态下多抓几份 dump**，
+  每份都记状态，然后与命令表逐字对：
+  1. **开启定时重启** → 再抓一份，看 `restart_time` 有没有值（验 DEVICE_SETTINGS 那几项）；
+  2. **锁一次频段 / 切到 4G 驻网** → 抓一份，验 LTE 侧的 `Lte_*` 与 SIGNAL 组的 7 个 `lte_*`；
+  3. **开启 FOTA 自动更新 / WiFi 休眠** → 验 `UpgMode` / `sleep_sysIdleTimeToSleep`；
+  4. 每份都用裸命令 `POST /api/device/goform/query`（`goform_command_enabled` 打开，**验完关回去**）
+     抓**原始响应**——它不过归一化，才能区分「设备没这个键」与「我们的映射没命中」。
+- **用户裁决（2026-09-22，原话口径）**：「**不允许漏修埋坑**」——
+  所以这批不是「算了不管」，是**登记为待验**，拿到新状态的 dump 就要接着核。
+- 归属：真机可用时逐条验；与 0.4b 的「两份表合成一份」那一步天然是同一批工作（见 P2-1）。
+
 
 
 ---
 
-## 16. 真机基线（2026-09-21）
+## 16. 真机基线（2026-09-22，逐字可比对）
 
-来源：真机 `GET /api/diagnose?fields=1` 的 `field_coverage`。
-**注意**：这份数字是从一段无法复制、经 OCR 转录的输出里整理的，
-各组的 `registered` / `hit` 数可信（相互能对上），**逐个 missing 字段名可能有转录误差** ——
-有复制按钮时应重新抓一份逐字覆盖本节。
+**这是可逐字比对的真基线。** 来源：真机 web 界面「**设置 › 关于 › 诊断信息 › 字段覆盖率**」入口
+（`GET /api/diagnose?fields=1` 的 `field_coverage`），**2026-09-22** 抓取，
+由用户从界面**手动复制**（当时「复制 JSON」按钮点了没反应，见 §15 的 **P1-23**）。
+
+> **2026-09-21 那份 OCR 转录版本已废弃，本节整体取代它** —— 不保留两份数字互相打架。
+> 废弃理由不是数字错：旧版的组数、逐组 `registered` 与合计 85 与本节一致，
+> 差异只在 hit（66 → 67，`d435fa4` 的预期效果）。真正的问题是旧版的 `hit_source`
+> 是 OCR 转录的、**不可逐字比对**，而 §14.3 的判据 3 恰恰要求 `hit_source` 逐字不变 ——
+> 拿一份转录稿当基准，等于这条判据从来没法用。
+> 本节的 `hit_source` 是从界面原文复制的，判据 3 从现在起可用。
+
+数字自洽性（本轮逐组相加核过）：`registered` 合计 **85**、`hit` 合计 **67**、`missing` 合计 **18**，
+10 个组 `queried` 全为 true。逐组 `registered` 与 `ZteGoformProfile.readSpecs()` 的登记数逐组相符
+（DEVICE_SETTINGS 13 / LAN 10 / WIFI_SETTINGS 8 / WIFI_CLIENTS 2 / BAND_STATUS 2 / CELL_INFO 8 /
+IDENTITY 7 / TRAFFIC_LIMIT 10 / SIGNAL 22 / CONNECTION 3，`ZteGoformProfile.kt:172-398`）。
 
 抓取时的设备状态（重要，覆盖率差异只能靠它解释）：
-- `profile_id` = `zte-goform`，`normalization_enabled` = true
-- 驻网制式：**NR**（`nr_*` 系列命中、`lte_*` 系列大面积 missing 可反推）
-- 老固件：有 `net_select`、无 `BearerPreference`（见 `ZteGoformProfile.kt:149` 的注释）
-- 定时重启：未开启（`restart_time` missing）
-- 其余状态（WiFi 客户端数、`ppp_status`）**未记录** —— 下次抓基线时补上
+- `profile_id` = `zte-goform`（ZTE goform（F50 等）），`normalization_enabled` = true
+- 驻网制式：**5G**（`network_type: "5G"`，`nr_*` 系列全命中）
+- 老固件：有 `net_select`、无 `BearerPreference`（见 `ZteGoformProfile.kt:189` 的注释）
+- 定时重启：**未开启**
+- WiFi：有 **1 个**客户端接入（`wifi_access_sta_num: "1"`）
 
-### 总计
+### 基线全文（逐字照录，不要改写）
 
-- 10 个组全部 `queried: true`
-- **2026-09-21 实测**：`registered` 合计 **85**，`hit` 合计 **66**，`missing` 合计 **19**
-- **2026-09-22 批 10（`d435fa4`）之后的预期值**：`registered` 合计仍 **85**、
-  `hit` 合计 **67**、`missing` 合计 **18** —— 唯一变化来自 WIFI_SETTINGS（见下）。
-  **这是推算不是实测**（无真机），重抓时以实测为准；按 §14.3 判据 4「hit 只许增不许减」，
-  方向正确且原因可解释（就是 `d435fa4` 把 `module_switch` 那一项从「白发无效查询」改成
-  「发真 cmd」）。判据 1「`registered` 逐组不变」不受影响 —— 批 10 只动 `cmdsFor()`、没动 `readSpecs()`。
+```
+profile：zte-goform（ZTE goform（F50 等））
+合计命中 67 / 登记 85
 
-### 逐组
+DEVICE_SETTINGS  命中 8 / 登记 13
+  missing: restart_time、sleep_sysIdleTimeToSleep、UpgMode、BearerPreference、dial_roam_setting_option
+  hit_source:
+    indicator_light_switch ← indicator_light_switch
+    performance_mode ← performance_mode
+    samba_switch ← samba_switch
+    usb_port_switch ← usb_port_switch
+    restart_schedule_switch ← restart_schedule_switch
+    net_select ← net_select
+    connection_mode ← dial_mode
+    roam_setting_option ← roam_setting_option
 
-- **DEVICE_SETTINGS**：13 registered / 8 hit / 5 missing
-  - missing：`restart_time`、`sleep_sysIdleTimeToSleep`、`UpgMode`、`BearerPreference`、`dial_roam_setting_option`
-  - 命中里有一条**别名链生效的实例**：`connection_mode` → `dial_mode`（这台固件用 `dial_mode`）
-  - 这 5 项的 cmd **确实在 `cmdsFor()` 里**（`ZteGoformProfile.kt:358-367`），是设备没返回 → 不是命令表缺失
-- **LAN_SETTINGS**：10 / 9 / 1
-  - missing：`dhcpLease`（而 `dhcpLease_hour` 命中 → 这台固件只给小时制那个）
-- **WIFI_SETTINGS**：**8 registered / 7 hit / 1 missing**（`d435fa4` 之后的预期值；
-  2026-09-21 实测是 8 / 6 / 2）
-  - missing 只剩 `wifi_chip1_ssid1_encryp_type`
-  - 原来那一项 `WiFiModuleSwitch` 的「待核」**已核清 —— OCR 是对的、文档当时的猜测错了**：
-    canonical 名本身就是驼峰串 `WiFiModuleSwitch`（`core/contract/.../DeviceFields.kt:168`
-    的 `const val MODULE_SWITCH = "WiFiModuleSwitch"`），而覆盖率报告输出的是 **canonical**，
-    所以 missing 里本来就该显示它。**仓库里不存在 `module_switch` 这个字符串**
-    （2026-09-22 全仓 grep 复核：只在本计划书与几处中文注释的叙述里出现过）。
-    它 missing 的真因是 `cmdsFor(WIFI_SETTINGS)` 把这个响应键当成了 cmd、
-    反而没发真正能查到它的 `wifi_enable` / `wifi_onoff_state` —— 已由 `d435fa4` 修掉。
-  - ⚠ **一条待验证的预判（重抓基线前必读，避免误判）**：`coverageReport()` 的 `queryGroup()`
-    把这 14 项**合并成一次请求**发（`ZteGoformProfile.soloCmds()` 只对 `WIFI_CLIENTS` 返回
-    `station_list`，WIFI_SETTINGS 没有 solo 项），而**线上是两次独立请求**
-    （`getWifiSettings()` 12 项一次、`getWifiModuleInfo()` 2 项一次，由
-    `getWifiSettingsMerged()` 合并结果）。这个仓库有先例 —— `station_list` 就是因为合并查询
-    被设备吞掉才靠 `soloCmds` 隔离。**所以真机重抓时 `WiFiModuleSwitch` 可能仍然 missing**；
-    若如此，方向是给 WIFI_SETTINGS 的两个 `query*` 容器命令加 `soloCmds`，
-    **而不是再动命令表**（命令表现在与客户端逐字一致，是 0.4b 的前提，动了就白做）。
-  - 命中的那几项来自结构解码器 `liftActiveAccessPoint` 摊平后的键
-- **WIFI_CLIENTS**：2 / 1 / 1
-  - missing：`lan_station_list`（`station_list` 命中）
-- **BAND_STATUS**：2 / 2 / 0 ✓ 满分
-- **CELL_INFO**：8 / 7 / 1
-  - missing：`lte_rsrp`
-- **IDENTITY**：7 / 6 / 1
-  - missing：`Language`（`cr_version` / `wa_inner_version` 均命中）
-- **TRAFFIC_LIMIT**：10 / 10 / 0 ✓ 满分
-  - 含刻意交叉：`monthly_rx_bytes` → `monthly_tx_bytes`、`monthly_tx_bytes` → `monthly_rx_bytes`
-    （`ZteGoformProfile.kt:215-226`，**不要「修正」**）
-- **SIGNAL**：22 / 14 / 8
-  - missing：`nr_band_width`、`lte_arfcn`、`lte_band`、`lte_band_width`、`lte_signal_strength`、
-    `lte_snr`、`lte_pci`、`lte_cell_id`
-  - 其中 7 项是 `lte_*`，可用「驻 NR」解释；**`nr_band_width` 解释不了** → 记为 P1-2
-- **CONNECTION**：3 / 3 / 0 ✓ 满分
+LAN_SETTINGS  命中 9 / 登记 10
+  missing: dhcpLease
+  hit_source:
+    lan_ipaddr ← lan_ipaddr / lan_netmask ← lan_netmask / mac_address ← mac_address
+    dhcpEnabled ← dhcpEnabled / dhcpStart ← dhcpStart / dhcpEnd ← dhcpEnd
+    dhcpLease_hour ← dhcpLease_hour / mtu ← mtu / tcp_mss ← tcp_mss
+
+WIFI_SETTINGS  命中 7 / 登记 8
+  missing: wifi_chip1_ssid1_encryp_type
+  hit_source:
+    wifi_chip ← ChipIndex
+    wifi_chip1_ssid1_ssid ← SSID
+    wifi_chip1_ssid1_passphrase ← Password
+    wifi_chip1_ssid1_auth_mode ← AuthMode
+    wifi_chip1_ssid1_broadcast_ssid ← ApBroadcastDisabled
+    wifi_chip1_ssid1_max_sta_num ← ApMaxStationNumber
+    WiFiModuleSwitch ← WiFiModuleSwitch
+
+WIFI_CLIENTS  命中 1 / 登记 2
+  missing: lan_station_list
+  hit_source: station_list ← station_list
+
+BAND_STATUS  命中 2 / 登记 2
+  hit_source: lte_band_lock ← lte_band_lock / nr_band_lock ← nr_band_lock
+
+CELL_INFO  命中 7 / 登记 8
+  missing: lte_rsrp
+  hit_source:
+    neighbor_cell_info ← neighbor_cell_info / locked_cell_info ← locked_cell_info
+    Lte_pci ← Lte_pci / Lte_fcn ← Lte_fcn / Lte_bands ← Lte_bands
+    lte_rsrq ← lte_rsrq / lte_snr ← Lte_snr
+
+IDENTITY  命中 6 / 登记 7
+  missing: Language
+  hit_source:
+    msisdn ← msisdn / imei ← imei / imsi ← imsi / iccid ← iccid
+    cr_version ← cr_version / wa_inner_version ← wa_inner_version
+
+TRAFFIC_LIMIT  命中 10 / 登记 10
+  hit_source:
+    enabled ← data_volume_limit_switch
+    limit_value ← limit_value
+    limit_unit_display ← limit_unit_display
+    limit_bytes ← limit_bytes
+    alert_percent ← data_volume_alert_percent
+    auto_clear ← wan_auto_clear_flow_data_switch
+    clear_date ← traffic_clear_date
+    monthly_rx_bytes ← monthly_tx_bytes
+    monthly_tx_bytes ← monthly_rx_bytes
+    monthly_time ← monthly_time
+
+SIGNAL  命中 14 / 登记 22
+  missing: nr_band_width、lte_arfcn、lte_band、lte_band_width、lte_signal_strength、lte_snr、lte_pci、lte_cell_id
+  hit_source:
+    rsrp ← nr_rsrp / sinr ← Nr_snr / rsrq ← nr_rsrq / rssi ← Nr_signal_strength
+    rat ← network_type / cell_id ← Nr_cell_id / operator ← network_provider
+    nr_arfcn ← Nr_fcn / nr_band ← Nr_bands / nr_signal_strength ← Nr_signal_strength
+    nr_snr ← Nr_snr / nr_pci ← Nr_pci / nr_cell_id ← Nr_cell_id
+    lte_ca_status ← Lte_ca_status
+
+CONNECTION  命中 3 / 登记 3
+  hit_source: ppp_status ← ppp_status / network_type ← network_type / network_provider ← network_provider
+```
+
+### 18 个 missing 全部归因 —— **无一是适配缺陷**
+
+判定口径先说清：覆盖率的「命中」= `FieldNormalizer.resolve()` 在别名链上找到一个
+**存在、非 JSON null、且 decode 不返回 null** 的 source（`FieldNormalizer.kt:100-108`）。
+所以 missing 有三种成因，都不是「映射写错了」：
+① 设备根本没返回这个键；② 设备返回了**空串**而该字段的 decoder 把空值当缺失
+（`Decoders.NON_BLANK` / `NUMERIC`，`FieldSpec.kt:99-117`）；
+③ 该字段**刻意不在覆盖率的命令表里**（由别的查询提供，线上活路径照常有值）。
+
+**DEVICE_SETTINGS 的 5 项 —— 全是「查了，设备没给」（成因 ①/②）。**
+这 5 个 cmd **确实都在 `cmdsFor(DEVICE_SETTINGS)` 里**（`ZteGoformProfile.kt:404-413`：
+`restart_time` `:409`、`sleep_sysIdleTimeToSleep` `:410`、`BearerPreference` `:411`、
+`UpgMode` `:412`、`dial_roam_setting_option` `:406`），客户端 fallback 逐字相同
+（`GoformSignalClient.DEVICE_SETTINGS_FALLBACK_CMDS`，`:387-396`）——
+**命令表没问题，是设备没返回键或返回了空值**（`BOOL_01` 对空串与不认识的值同样返回 null，
+`FieldSpec.kt:125-133`）。
+
+- `restart_time`：定时重启未开启（`restart_schedule_switch` 命中，说明这条查询本身是通的）
+- `sleep_sysIdleTimeToSleep`：这台固件不填（decoder 是 `NON_BLANK`，`:185`，空串也算缺失）
+- `UpgMode`：同上（`:188`，`BOOL_01`）
+- `BearerPreference`：**老固件**。`ZteGoformProfile.kt:189` 的注释写明「新固件填
+  `BearerPreference`，老固件只有 `net_select`」，而基线里 `net_select ← net_select` **命中了** ——
+  两条都登记就是为了这件事（`:191-194`），一台设备命中其中一条即正常
+- `dial_roam_setting_option`：这台固件只填 `roam_setting_option`（它命中了，`:198-201` 两个
+  canonical 各自独立登记）
+
+**`dhcpLease` —— 成因 ③，不是设备缺字段。**
+`cmdsFor(LAN_SETTINGS)`（`:415-418`）与客户端 fallback（`GoformSignalClient.kt:381-384`）
+都**只发 `dhcpLease_hour`**，没有 `dhcpLease`。这台固件给的就是小时制那份（`dhcpLease_hour` 命中），
+秒级值由客户端 ×3600（`ZteGoformProfile.kt:220-223` 的注释写明「不在归一化里换算」）。
+`ZteGoformProfileTest` 的「每个字段都能被 `cmdsFor` 查到」把它列进 `knownGaps` 白名单并写明理由
+（`:109`、`:116`）—— 也就是说**它在覆盖率报告里必然 missing，这是登记态，不是缺陷**。
+
+**`wifi_chip1_ssid1_encryp_type` —— 成因 ②：设备返回空串。**
+真机 `queryAccessPointInfo` 的两个 AP 都是 `"EncrypType": ""`（**依据来自用户提供的真机 dump，
+该 dump 不在本仓，我未能逐字复核**），别名链是 `"EncrypType", "wifi_chip1_ssid1_encryp_type"`
++ `Decoders.NON_BLANK`（`ZteGoformProfile.kt:315-316`），空串 → 返回 null → 两个 source 都不算命中。
+同组另外 6 项命中的 source 全是容器里提上来的驼峰名，说明容器本身解析正常。
+
+**`lan_station_list` —— 成因 ③。**
+`cmdsFor(WIFI_CLIENTS)` 只有 `station_list`（`:461`，且它是唯一的 `soloCmds` 项，`:486-487`），
+`lan_station_list` 由 DataHub 合并的另一份响应提供 —— 同样在测试的 `knownGaps` 白名单里
+（`ZteGoformProfileTest:111`、`:118`）。抓取时确有 1 个客户端接入，`station_list` 命中。
+
+**CELL_INFO 的 `lte_rsrp` + SIGNAL 的 7 个 `lte_*` —— 成因 ①/②：驻 5G。**
+profile 注释写明这是设计：「5G(NR) 专属：只在 NR 有值时出现，缺失即表示当前不在 5G」
+（`:376`），LTE 侧「语义与上面完全对称」（`:385`）。抓取时 `network_type: "5G"`、
+`nr_*` 全命中，所以 LTE 侧缺失**正是预期**。
+
+> ⚠ 但这两组的**表现不对称，原因不是大小写**（这条推翻了 §15 P1-1 的原猜测，详见那一条）：
+> CELL_INFO 的 `Lte_pci` / `Lte_fcn` / `Lte_bands` / `lte_rsrq` / `lte_snr` **命中了**，
+> 而 SIGNAL 的 `lte_pci` / `lte_arfcn` / `lte_band` / `lte_snr` **missing**，
+> 两组查的是同一批设备键（`cmdsFor(CELL_INFO)` `:466-470` 与 `cmdsFor(SIGNAL)` `:477-483`
+> 都含 `Lte_pci` / `Lte_snr` / `lte_rsrp`…）。差别在 **decoder**：
+> CELL_INFO 那几条**没有 decoder**（默认 `AS_IS`，`:336-347`），空串照样算命中；
+> SIGNAL 同名字段是 `NUMERIC` / `NON_BLANK`（`:386-392`），空串一律算缺失。
+> 推论（由基线 + 代码逐字推出，未看到 dump）：设备在驻 5G 时**返回了这些 LTE 键但值是空的**。
+> 副作用：**驻 5G 时 CELL_INFO 的 `hit` 数偏高**（有 4~5 项是「空值命中」），
+> 比对基线时别把它当成「LTE 侧有数据」。
+
+**SIGNAL 的 `nr_band_width` —— 成因 ②：这台固件不给 5G 带宽。原 P1-2 据此结案。**
+source 是 `Nr_band_widths` + `Decoders.NUMERIC`（`:379`），空串解析不出 Long → 缺失。
+真机 5G 小区信息里 `"Nr_band_widths": ""`（**依据同样来自用户的真机 dump，本仓无该文件**），
+但仓内有两处独立佐证：`DeviceFields.kt:360` 写着「**设备经常不填**（`Nr_band_widths` /
+`Lte_bands_widths` 多为空），缺失即省略该 key」，`ZteGoformProfileTest:1023-1034`
+有一条专门的用例「带宽为空时不输出 `band_width`」，夹具就是 `"Nr_band_widths" to ""`。
+**结论：固件不给，不是别名没登记 → 不改。**
+
+**`Language` —— 成因 ③。**
+`cmdsFor(IDENTITY)`（`:430-435`）里**没有** `Language`；它由 `getDeviceVersion()` 那组查询提供
+（`GoformSignalClient.kt:128`：`client.query(listOf("Language", "cr_version", "wa_inner_version"))`），
+而覆盖率报告只发 `cmdsFor()`。同组的 `cr_version` / `wa_inner_version` 命中是因为它们
+**同时**在 `cmdsFor(IDENTITY)` 里。也在测试的 `knownGaps` 白名单里（`ZteGoformProfileTest:110`、`:117`）。
+线上 `/api/device/info` 的 `language` 字段照常有值（`DeviceRoutes.kt:240` 直接读 `Language`）。
+
+**小结**：18 项里 ①「设备没返回 / 返回空」= 15 项（DEVICE_SETTINGS 5 + encryp_type 1 +
+`lte_rsrp` 1 + SIGNAL 8），③「刻意不在覆盖率命令表里、由别的查询提供」= 3 项
+（`dhcpLease` / `lan_station_list` / `Language`，三项都已在单测白名单里登记过理由）。
+**没有一项是映射写错、别名漏登记或命令表搬丢。**
+
+### ~~预判：`coverageReport` 的合并查询可能让 `WiFiModuleSwitch` 仍然 missing~~ —— **已撤销，预判不成立**
+
+上一版 §16 留了一条预判：`coverageReport()` 的 `queryGroup()` 把 WIFI_SETTINGS 的 14 项
+**合并成一次请求**发（`soloCmds()` 只对 `WIFI_CLIENTS` 返回 `station_list`，
+`ZteGoformProfile.kt:486-487`），而线上是两次独立请求（`getWifiSettings()` 12 项
++ `getWifiModuleInfo()` 2 项，`GoformWifiClient.kt:38-40`）；因为仓里有 `station_list`
+被合并查询吞掉的先例，所以担心 `WiFiModuleSwitch` 重抓时仍然 missing。
+
+**基线证明这条不成立，明确划掉**：
+
+- 基线里 `WiFiModuleSwitch ← WiFiModuleSwitch` **命中了**，而且 source 就是它自己。
+  它是 `MODULE_SWITCH` 别名链的首项、也是设备的**响应键**
+  （`ZteGoformProfile.kt:322-323`，canonical 本身就是驼峰串 `WiFiModuleSwitch`，
+  `DeviceFields.kt:168`）—— 它只可能来自容器命令 `queryWiFiModuleSwitch` / `queryAccessPointInfo`
+  的**响应顶层**，别的路径给不出这个键。
+- 也就是说：**容器命令与 12 个扁平 cmd 合并成一次请求，没有被设备吞掉**。
+  `station_list` 那个先例不具普适性，不要再据此给 WIFI_SETTINGS 加 `soloCmds`。
+- 同组另外 6 项的 source（`ChipIndex` / `SSID` / `Password` / `AuthMode` /
+  `ApBroadcastDisabled` / `ApMaxStationNumber`）全是 `liftActiveAccessPoint`
+  从 `queryAccessPointInfo` 的 `ResponseList` 提到顶层的键（`:305-321`），
+  同样证明容器命令在合并请求里正常返回。
+- 顺带确认批 10（`d435fa4`）的修复生效：WIFI_SETTINGS 由 6 命中变 7，
+  与当时的推算一致（判据 4「hit 只增不减」方向正确、原因可解释）。
+
+### 两条「不许动」的映射（看着像 bug，掰回去就是把功能改坏）
+
+1. **`monthly_rx_bytes ← monthly_tx_bytes` 与 `monthly_tx_bytes ← monthly_rx_bytes` 是刻意交叉。**
+   `ZteGoformProfile.kt:255-266` 有整段注释 + 2026-09-01 真机实测依据：ZTE 固件的
+   `monthly_rx/tx` 是「从模块看 PC」的视角，实测同一台 F50 `monthly_tx_bytes` = 7.0 GB 才是**下载**。
+   在唯一的适配层一次性掰正，上层拿到的 canonical `rx` 就是下载。
+   `ZteGoformRawCaptureTest:61-65` 用真机夹具把这个交叉钉住了。
+   **基线里看到它像接反 —— 掰回去就是把流量统计改坏。**
+2. **`lte_snr ← Lte_snr`：canonical 小写、设备 source 大写，这是设备命名规律，不是笔误。**
+   ZTE 的规律是**小区参数首字母大写**（`Lte_pci` / `Lte_fcn` / `Lte_bands` / `Lte_snr`，`Nr_*` 对称）、
+   **信号质量指标全小写**（`lte_rsrp` / `lte_rsrq` / `lte_rssi`）。
+   小写的 `lte_snr` 是 core 自有的 canonical（`DeviceFields.CellInfo.LTE_SNR` == `"lte_snr"`，
+   `DeviceFields.kt:242`），长得像设备原名而已 —— `ZteGoformProfile.kt:341-347` 的注释写明
+   「**不许把它抄进任何 cmd 列表**」，P0-3 就是这么来的。
+
+### 结构解码器已验证在真机上工作
+
+TRAFFIC_LIMIT 的 `limit_value ← limit_value`、`limit_unit_display ← limit_unit_display`、
+`limit_bytes ← limit_bytes` 三项，**source 名等于 canonical 名** —— 这不是巧合也不是自反映射：
+它们是结构解码器 `splitDataVolumeLimit`（`ZteGoformProfile.kt:1301-1318`）从复合串
+`data_volume_limit_size`（如 `"470_1024"` = 470 GB）拆出来的派生键，**派生键刻意直接用 canonical 名**
+（`:1293-1296` 的注释：这样过渡期 `KEEP_PRESENT` 不会把复合串当别名再透出一份）。
+`ZteGoformProfileTest` 的 `derivedByDecoder` 白名单（`:123-127`）登记的正是这三项。
+**基线里三项全部命中 → `structuralDecoder` 这条机制在真机上工作正常**，
+TRAFFIC_LIMIT 也因此拿到 10 / 10 满分。
 
 ### 这份基线怎么用
 
-> **2026-09-22 提醒（阶段 0 已改到批 11）**：**阶段 0 完成后必须重新抓一份**，
-> 按 §14.3 的四条判据与这份 85 / 66 / 19（批 10 之后的预期是 85 / **67** / **18**）逐条对比 ——
-> 阶段 0 改的是写路径与命令表，
-> 按设计**不应该**动 `readSpecs()`，所以 `registered` 合计仍应是 85、逐组数字不变；
-> 变了就说明改到了不该改的地方。
-> 特别注意三件事：
-> ① 本轮 WiFi 口令的读侧解码器换了字符集（`858a9c9` / `090fcad`）——
-> 它影响的是**值**不是**键**，所以 `hit` / `hit_source` 都不该变；真变了要能解释清楚。
-> ② 批 10（`d435fa4`）改了 `cmdsFor(WIFI_SETTINGS)`，这是**唯一一处刻意让 hit 变化**的改动：
-> WIFI_SETTINGS 的 hit 应 6 → 7。**但先读上面 WIFI_SETTINGS 那条「合并查询」的预判** ——
-> 仍然 missing 也是可能的，那不是改错了。
-> ③ 0.4b 若按建议新增 `FieldGroup`（`FULL_STATUS`，或 P1-16 的 `SMS_META`），
-> `registered` 合计与组数**必然**变 —— 那一步要**先抓基线、再改**，并在 §16 追加一份新基线，
-> 不要直接覆盖这一份（两份对照才能说明差异是新增组带来的）。
+> **阶段 0 完成后（尤其是 0.4b 落地后）必须重抓一份**，按 §14.3 的四条判据与本节这份
+> **85 / 67 / 18** 逐条对比。阶段 0 改的是写路径与命令表，按设计**不动 `readSpecs()`**，
+> 所以 `registered` 逐组与合计都应不变；变了就说明改到了不该改的地方。
 
-- 阶段 0 / 1 做完后重新抓一份，按 §14.3 的四条判据比对
-- `registered` 合计必须还是 **85**、逐组数字不变 → 证明没动 `readSpecs()`
-- `queried` 必须还是 10 组全 true → 证明没搬丢整组命令
-- `hit_source` 的每一条映射逐字不变 → 证明映射没变
-  （例外：WIFI_SETTINGS 的 `WiFiModuleSwitch` 这一项若从 missing 变成命中，
-  `hit_source` 会**新增**一条 —— 那是 `d435fa4` 的预期效果，不是映射变了）
-- hit 合计 ≥ **66**（批 10 之后期望 **67**）；少掉的每一项都要能用当时的设备状态解释
+- `registered` 逐组不变、合计仍是 **85** → 证明没动 `readSpecs()`
+- `queried` 仍是 10 组全 true → 证明没搬丢整组命令
+- `hit_source` 的每一条映射**逐字不变** → 证明映射没变（本节起这条真的可比对了）
+- `hit` 只增不减（≥ **67**）；少掉的每一项都要能用当时的设备状态解释，解释不清 → P0
+
+重抓时特别注意四件事：
+
+1. **先记设备状态再看数字**：本节这份是**驻 5G**、定时重启关、1 个 WiFi 客户端、老固件。
+   换成驻 4G 会整体翻面（`lte_*` 命中、`nr_*` missing），那不是改坏了。
+2. **CELL_INFO 的 hit 数在驻 5G 下偏高**（那几条 spec 没有 decoder，空值也算命中，见上面的归因）。
+   跨制式比对时用 `hit_source` 逐字比，不要只看 hit 数。
+3. **上面那 3 项「命令表里本来就没有」的 missing**（`dhcpLease` / `lan_station_list` / `Language`）
+   在任何设备状态下都会 missing。它们是登记态，别在重抓后当成回归。
+4. **0.4b 若新增 `FieldGroup`**（`FULL_STATUS`，或 P1-16 的 `SMS_META`），
+   `registered` 合计与组数**必然**变 —— 那一步要**先抓基线、再改**，
+   并在 §16 追加一份新基线而不是覆盖这一份（两份对照才能说明差异来自新增组）。
 
 
 

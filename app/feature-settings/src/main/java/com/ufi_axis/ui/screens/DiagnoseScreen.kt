@@ -1,5 +1,8 @@
 package com.ufi_axis.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -11,18 +14,40 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiStandardCard
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+
+
+
+/**
+ * 复制用的 JSON 缩进器。
+ *
+ * 只服务「复制原始 JSON」那个按钮：`field_coverage` 是十个分组的嵌套对象，
+ * `JsonElement.toString()` 会挤成一行，贴进文档做逐字比对时根本看不出差在哪一组。
+ * 放文件级而不是 remember：它无状态，每次重组新建一个 Json 实例纯属浪费。
+ */
+private val prettyJson = Json { prettyPrint = true }
 
 /**
  * 运行诊断页（2026-08-30）。
+
  *
  * 把 core 侧五个只读排障端点聚到一处：`/api/diagnose`、`/api/qos/status`、`/api/cache/stats`、
  * `/api/system/root-check`、`/api/shell/root`，另外挂上缓存的两个动作（清空 / 按规则失效）。
@@ -36,6 +61,10 @@ import kotlinx.coroutines.launch
  *   「检测字段覆盖率」时才开，并由 ViewModel 记住该选择。
  * - 读取失败不在页面顶部挂常驻错误条，只有动作（清缓存/失效）失败才弹 Toast ——
  *   排障页的价值在于「把还能读到的都显示出来」。
+ *
+ * 2026-09-22：字段覆盖率那张卡从「一行 `toString()`」改成「分组摘要 + 复制原始 JSON」。
+ * 动机是它现在是设备适配改造的验收工具（计划书 §14.3 要求改造前后各抓一份逐字比对），
+ * 而一行挤在一起的 JSON 既读不出「哪组没命中」，也没法可靠地贴进文档对账。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -43,6 +72,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.diagnoseState.collectAsState()
     val palette = LocalResolvedPalette.current
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     var showClearCacheConfirm by remember { mutableStateOf(false) }
     var showInvalidateDialog by remember { mutableStateOf(false) }
@@ -121,29 +152,50 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                     }
 
                     // ═════ 字段覆盖率（按需，会打设备） ═════
+                    // 这一块是「设备适配改造」的验收工具（计划书 §14.3）：改造前后各抓一份逐字比对，
+                    // 就能证明读侧行为没变。所以摘要（给眼睛看）与**原始 JSON**（给比对用）两者都要有 ——
+                    // 只有摘要的话，贴进文档对账时会因为排版差异误判成「行为变了」。
                     DiagnoseCard(title = "字段覆盖率") {
                         val coverage = state.diagnose?.field_coverage
-                        if (coverage == null) {
-                            Text(
-                                "检测会逐分组向设备发查询（最多 10 组），比较慢，所以默认不做。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
-                            )
+                        Text(
+                            "检测会逐分组向设备发查询（最多 10 组），比较慢，所以默认不做；" +
+                                "只在做设备适配、需要前后对账时点一次。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                        if (coverage != null) FieldCoverageDetail(coverage)
+                        UfiButton(
+                            variant = UfiButtonVariant.Secondary,
+                            text = if (coverage == null) "检测字段覆盖率" else "重新检测（再打一次设备）",
+                            onClick = { viewModel.tools.loadDiagnostics(withFieldCoverage = true) },
+                            enabled = !state.isLoading,
+                            loading = state.isLoading,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (coverage != null) {
                             UfiButton(
-                                variant = UfiButtonVariant.Secondary,
-                                text = "检测字段覆盖率",
-                                onClick = { viewModel.tools.loadDiagnostics(withFieldCoverage = true) },
-                                enabled = !state.isLoading,
-                                loading = state.isLoading,
+                                variant = UfiButtonVariant.Subtle,
+                                text = "复制原始 JSON",
+                                onClick = {
+                                    // 复用 app 里既有的剪贴板写法（ClipboardManager + ClipData，同
+                                    // DeliveryHistoryScreen / DebugLogScreen），不引第二套；
+                                    // 复制的是**缩进后的 field_coverage 原文**而不是屏幕上的摘要，
+                                    // 摘要漏掉了 queried 等字段，逐字比对会对不上。
+                                    runCatching {
+                                        val cm = context
+                                            .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(
+                                            ClipData.newPlainText(
+                                                "field_coverage",
+                                                prettyJson.encodeToString(JsonElement.serializer(), coverage)
+                                            )
+                                        )
+                                        toastMessage = ToastMessage("已复制 field_coverage", ToastType.SUCCESS)
+                                    }.onFailure {
+                                        toastMessage = ToastMessage("复制失败", ToastType.ERROR)
+                                    }
+                                },
                                 modifier = Modifier.fillMaxWidth()
-                            )
-                        } else {
-                            // 形状随 core 演进（失败时会退化成 {"error": "..."} 但仍 200），
-                            // 所以原样展示而不是按固定字段解 —— 排障页要的是原文。
-                            Text(
-                                coverage.toString(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
                             )
                         }
                     }
@@ -299,3 +351,100 @@ private fun profileStatusLabel(status: String): String = when (status) {
     "disabled" -> "归一化已关闭"
     else -> status.ifBlank { "未知" }
 }
+
+/**
+ * `field_coverage` 的逐分组摘要（2026-09-22）。
+ *
+ * 为什么手写 JSON 遍历而不给它建 data class：这一块的形状**按 core 版本漂移**，而且有三种
+ * 退化形态（见下），强类型解析一旦遇到新键就整块空白，正好在排障时最不该空白。这里只认
+ * 「能认出来的键」，认不出的原样保留在「复制原始 JSON」里 —— 摘要给眼睛，原文给对账。
+ *
+ * 三种形态都必须如实显示，不能统一渲染成「没有数据」：
+ * - `{"error": "..."}` —— 统计自身失败，HTTP 仍是 200；
+ * - `{"normalization_enabled": false, "hint": "..."}` —— 归一化总开关关了，core 压根没查设备；
+ * - 正常形态 `{normalization_enabled, profile_id, profile_name, groups{...}}`。
+ */
+@Composable
+private fun FieldCoverageDetail(coverage: JsonElement) {
+    val palette = LocalResolvedPalette.current
+    val obj = coverage as? JsonObject
+    if (obj == null) {
+        // core 只会回对象；真回了别的（数组 / 裸串）也照原文贴出来，不吞掉。
+        Text(coverage.toString(), style = UfiTextStyles.monoNote, color = palette.textSecondary)
+        return
+    }
+
+    obj.coverageString("error")?.let {
+        Text("统计失败：$it", style = UfiTextStyles.note, color = palette.error)
+        return
+    }
+
+    // 关掉归一化时 core 只回一句 hint。那不是「检测失败」也不是「没有数据」，
+    // 而是「没有登记表可比对」—— 原文显示出来，用户才知道要去打开 field_normalization_enabled。
+    val enabled = (obj["normalization_enabled"] as? JsonPrimitive)?.booleanOrNull ?: false
+    if (!enabled) {
+        Text(
+            obj.coverageString("hint") ?: "core 回了 normalization_enabled=false，但没带 hint。",
+            style = UfiTextStyles.note,
+            color = palette.warning
+        )
+        return
+    }
+
+    UfiInfoRow("生效 profile", obj.coverageString("profile_id") ?: "未知")
+    obj.coverageString("profile_name")?.let { UfiInfoRow("profile 名称", it) }
+
+    val groups = obj["groups"] as? JsonObject
+    if (groups.isNullOrEmpty()) {
+        Text(
+            "core 回了 normalization_enabled=true 但没有 groups —— core 版本可能比 app 旧。",
+            style = UfiTextStyles.note,
+            color = palette.warning
+        )
+        return
+    }
+
+    for ((name, raw) in groups) {
+        val group = raw as? JsonObject ?: continue
+        val registered = group.coverageInt("registered") ?: 0
+        val hit = group.coverageInt("hit") ?: 0
+        // queried=false = 这个 profile 没给该分组登记命令表，core 一次设备查询都没发；
+        // 它与「查了但 0 命中」是两件事，混成同一句会把「表没写」误判成「设备不支持」。
+        val queried = (group["queried"] as? JsonPrimitive)?.booleanOrNull ?: false
+        val missing = (group["missing"] as? JsonArray)
+            ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }
+            .orEmpty()
+        val hitSource = (group["hit_source"] as? JsonObject)
+            ?.mapNotNull { (canonical, source) ->
+                (source as? JsonPrimitive)?.contentOrNull?.let { "$canonical ← $it" }
+            }
+            .orEmpty()
+
+        Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+            UfiInfoRow(name, if (queried) "命中 $hit / 登记 $registered" else "未登记命令")
+            if (missing.isNotEmpty()) {
+                // missing 就是适配新设备时的 TODO 清单，所以用 warning 色单独一行列出来。
+                Text(
+                    "未命中：${missing.joinToString("、")}",
+                    style = UfiTextStyles.monoNote,
+                    color = palette.warning
+                )
+            }
+            if (hitSource.isNotEmpty()) {
+                Text(
+                    "命中来源：${hitSource.joinToString("、")}",
+                    style = UfiTextStyles.monoNote,
+                    color = palette.textSecondary
+                )
+            }
+        }
+    }
+}
+
+/** 只认字符串型的键：core 把数字/布尔放进来时不要拿它的字面量当文案显示。 */
+private fun JsonObject.coverageString(key: String): String? =
+    (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.contentOrNull?.takeIf { it.isNotBlank() }
+
+/** 只认数字型的键：缺键 / 类型不对时回 null，由调用点决定显示成什么，不静默当 0。 */
+private fun JsonObject.coverageInt(key: String): Int? = (this[key] as? JsonPrimitive)?.intOrNull
+

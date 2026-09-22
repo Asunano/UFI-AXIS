@@ -359,14 +359,22 @@ class GoformSignalClient(
         /**
          * [getCellInfo]。
          *
-         * 末项是**小写** `lte_snr`，而 `ZteGoformProfile.cmdsFor(CELL_INFO)` 是大写 `Lte_snr` ——
-         * 这是两份表目前唯一的分叉（待办池 P0-3），**未定性之前不许统一**。
+         * 末项曾是**小写** `lte_snr`（待办池 P0-3 的那处分叉），2026-09-22 已改成大写 `Lte_snr`：
+         * 当日真机 dump 里 4G 驻网的小区信息返回的是 `Lte_snr`（与 `Lte_fcn` / `Lte_bands` /
+         * `Lte_pci` / `Lte_cell_id` 同一规律：小区参数首字母大写，信号质量指标
+         * `lte_rsrp` / `lte_rsrq` / `lte_rssi` 全小写），**设备上没有 `lte_snr` 这个键**。
+         * 小写那个是 core 自有的 canonical（`DeviceFields.CellInfo.LTE_SNR`），长得像设备原名而已。
+         *
+         * 改这里修掉的是「排障模式（归一化关）与正常模式向设备发不同 cmd」——
+         * 正常模式走 `cmdsFor(CELL_INFO)`，本来就发的是 `Lte_snr`，所以对外行为不变。
+         *
+         * 其余列表内容仍然一个字符都不许改：改了就是改设备侧请求形状。
          */
         internal val CELL_INFO_FALLBACK_CMDS = listOf(
             "neighbor_cell_info", "locked_cell_info", "network_information",
             "network_type",
             "Lte_pci", "Lte_fcn", "Lte_bands",
-            "lte_rsrp", "lte_rsrq", "lte_snr"
+            "lte_rsrp", "lte_rsrq", "Lte_snr"
         )
 
         /** [getLanSettings]。 */

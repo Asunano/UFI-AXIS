@@ -66,11 +66,26 @@
             <span class="config-label">详细日志（Debug）</span>
             <n-switch v-model:value="generalForm.debugMode" :disabled="!generalLoaded || !generalForm.logEnabled" />
           </div>
-          <div class="config-item switch-item">
-            <span class="config-label">设备原始字段 dump（排障用，默认关）</span>
-            <n-switch v-model:value="generalForm.goformDumpEnabled" :disabled="!generalLoaded" />
-          </div>
         </div>
+        <!-- 两个排障开关都走 ToggleRow + 即时保存（见 saveProbeSwitch）：
+             它们需要说明位（端点名 + 危险警示 + 「立即生效」），而上面两列栅格里的
+             .switch-item 那一种没有说明位，硬塞会把警示挤成第二个标签。 -->
+        <ToggleRow
+          label="设备原始字段 dump（排障用，默认关，改动立即生效）"
+          :description="probeDescription('goform_dump_enabled', PROBE_DUMP_DESC)"
+          :model-value="generalForm.goformDumpEnabled"
+          :loading="probeSaving.goform_dump_enabled"
+          :disabled="probeSwitchDisabled('goform_dump_enabled')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('goform_dump_enabled', v)"
+        />
+        <ToggleRow
+          label="裸 goform 命令通道（排障用，默认关，改动立即生效）"
+          :description="probeDescription('goform_command_enabled', PROBE_COMMAND_DESC)"
+          :model-value="generalForm.goformCommandEnabled"
+          :loading="probeSaving.goform_command_enabled"
+          :disabled="probeSwitchDisabled('goform_command_enabled')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('goform_command_enabled', v)"
+        />
       </div>
       <n-divider style="margin: 10px 0" />
       <div class="config-section">
@@ -152,8 +167,9 @@ import { ref, reactive, onMounted, onUnmounted } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
-import { ConfigLimits } from '@/api/contract';
-import { buildChangedPayload, commitConfigSave } from '@/views/settings/settingsShared';
+import ToggleRow from '@/components/ToggleRow.vue';
+import { ConfigLimits, describeConfigReject, type ConfigRejectedField } from '@/api/contract';
+import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
 
 const message = useMessage();
 const api = getApiClient();
@@ -179,6 +195,11 @@ const generalForm = reactive({
   debugMode: false,
   // GET /api/device/goform（设备原始 dump）的开关，core 侧默认关，关着时该端点回 403
   goformDumpEnabled: false,
+  // 裸 goform 命令通道开关，管 POST /api/device/goform/query 与 POST /api/device/goform/set
+  // （core 侧 rejectIfCommandDisabled，关着时两个端点都回 403）。
+  // 默认 false 与 core 一致，而且必须是 false：set 绕过 profile 的 WriteSpec 值域校验、
+  // 返回值也不脱敏，默认打开等于把「无校验写设备 + 明文回读」长期挂在网上。
+  goformCommandEnabled: false,
   smsCodeEnabled: false,
   smsCodeCleanupHours: 24,
   updateUrl: '',
@@ -198,6 +219,7 @@ async function loadGeneralConfig() {
       app_log_enabled: 'appLogEnabled',
       debug_mode: 'debugMode',
       goform_dump_enabled: 'goformDumpEnabled',
+      goform_command_enabled: 'goformCommandEnabled',
       sms_code_enabled: 'smsCodeEnabled',
       sms_code_cleanup_hours: 'smsCodeCleanupHours',
       update_url: 'updateUrl',
@@ -226,6 +248,14 @@ async function loadGeneralConfig() {
 /**
  * 表单字段 ↔ core 配置键。提到函数外是因为「有没有未保存改动」的判断也要用它
  * （见 [hasUnsavedChanges]），放在 saveGeneral 里就得抄第二份。
+ *
+ * **两个排障开关刻意不在这里**（goform_dump_enabled / goform_command_enabled）：
+ * 它们改走即时保存（见 saveProbeSwitch）。留在这张表里会被差量提交再处理一遍 ——
+ * 即时保存已经把 generalOriginal 同步成新值，差量比较虽然不会重复 PUT，
+ * 但一旦只同步了 form 没同步 original（或反过来）就会双写；而且 hasUnsavedChanges
+ * 会把「刚刚已经生效的开关」算成未保存改动，让 onVisible 的回读被永久跳过。
+ * 它们的读映射仍保留在 loadGeneralConfig 里：开关必须显示设备真实状态，
+ * 且 probeSwitchDisabled 依赖 `apiKey in generalOriginal` 判断基线在不在。
  */
 const GENERAL_FORM_KEYS: Record<string, string> = {
   goformIp: 'goform_ip',
@@ -236,7 +266,6 @@ const GENERAL_FORM_KEYS: Record<string, string> = {
   coreLogEnabled: 'core_log_enabled',
   appLogEnabled: 'app_log_enabled',
   debugMode: 'debug_mode',
-  goformDumpEnabled: 'goform_dump_enabled',
   smsCodeEnabled: 'sms_code_enabled',
   smsCodeCleanupHours: 'sms_code_cleanup_hours',
   updateUrl: 'update_url',
@@ -247,10 +276,113 @@ function hasUnsavedChanges(): boolean {
   return Object.keys(buildChangedPayload(GENERAL_FORM_KEYS, generalForm, generalOriginal)).length > 0;
 }
 
+// ── 两个排障开关：即时生效 ──
+
+type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled';
+
+/** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
+const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled'> = {
+  goform_dump_enabled: 'goformDumpEnabled',
+  goform_command_enabled: 'goformCommandEnabled',
+};
+
+/** 各自独立的 loading：两个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
+const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
+  goform_dump_enabled: false,
+  goform_command_enabled: false,
+});
+
+const PROBE_DUMP_DESC =
+  '控制 GET /api/device/goform（设备原始字段 dump，不走 profile 归一化也不脱敏），关着时该端点回 403。' +
+  '改动立即生效，不需要点下方「保存」。';
+const PROBE_COMMAND_DESC =
+  '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
+  '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +
+  '改动立即生效，不需要点下方「保存」；只在排障时临时打开，看完立刻关回去。';
+
+/**
+ * 禁用时把**原因**说出来，而不是只灰着。
+ *
+ * 为什么必须说：这两个键比其它字段新，最常见的情形就是「设备上的 core 比 web 旧、
+ * GET /api/config 里没有这个键」。只灰掉的话用户只会以为界面坏了或权限不够，
+ * 于是去翻别的开关；写明「当前 core 版本不支持」他才知道该去升 core。
+ * 这也顺带补上了移出 GENERAL_FORM_KEYS 后 findUnbaselinedKeys 不再覆盖这两键的告知职责。
+ */
+function probeDescription(apiKey: ProbeApiKey, base: string): string {
+  if (!generalLoaded.value) return `${base}（配置尚未从设备读取，暂不可修改）`;
+  if (!(apiKey in generalOriginal)) return `${base}（当前 core 版本不支持此项，已禁用）`;
+  return base;
+}
+
+/**
+ * 两个排障开关走「即时生效」而不是表单式差量提交。
+ *
+ * 为什么与本卡其它字段不一样：① 全仓页面里的 ToggleRow 都是即时语义
+ *    （ControlTab 的 LED/Samba、AlertConfigPanel 全部…），表单式只用在弹窗表单里；
+ *    放一个表单式开关在这里，用户拖完不点保存就走 = 假开关（刷新回默认、全程零反馈）。
+ * ② 它们是**排障动作**不是配置项：打开的动机就是「现在就要看 dump / 现在就要发裸命令」，
+ *    用完立刻关回去，不该跟 IP/端口/密码一起攒着提交。
+ *
+ * 写法照 ControlTab.postToggle：只在**确认生效后**才置位（ToggleRow 是完全受控组件，
+ * 父组件不回写它就不动，所以失败路径写回原值即回滚），期间 :loading 挡住重复点。
+ * 与 postToggle 的区别是这里不整卡回读 —— loadGeneralConfig 会把用户正在编辑的
+ * IP / 端口 / 密码一起冲掉，所以只同步这一个键的 form 与 original。
+ */
+async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
+  if (probeSaving[apiKey]) return;
+  const formKey = PROBE_FORM_KEY[apiKey];
+  const previous = generalForm[formKey];
+  probeSaving[apiKey] = true;
+  try {
+    const { data } = await api.put('/api/config', { [apiKey]: value });
+    const updated: string[] = data?.updated_fields || [];
+    if (!updated.includes(apiKey)) {
+      // 没进 updated_fields 就是没生效（老 core 没有 rejected_fields，只能这样推断），
+      // 此时 UI 必须回到原值，否则开关显示的是一个设备并不认的状态。
+      generalForm[formKey] = previous;
+      const rejected: ConfigRejectedField[] = data?.rejected_fields || [];
+      const detail = rejected.find((r) => r.field === apiKey);
+      message.error(detail ? `未生效 —— ${describeConfigReject(detail)}` : `${apiKey} 未生效，设备未接受此项改动`);
+      return;
+    }
+    // form 与 original 两处都要更新：original 不更新的话 hasUnsavedChanges 会一直是 true，
+    // onVisible 的回读被永久跳过（手机端改了也看不到）。
+    generalForm[formKey] = value;
+    generalOriginal[apiKey] = value;
+    message.success(value ? '已开启，立即生效' : '已关闭，立即生效');
+  } catch (e: any) {
+    generalForm[formKey] = previous;
+    message.error(e?.response?.data?.error || '保存失败，开关已回滚');
+  } finally {
+    probeSaving[apiKey] = false;
+  }
+}
+
+/**
+ * 两个排障开关（`goform_dump_enabled` / `goform_command_enabled`）的禁用判定。
+ *
+ * 为什么只有它们要多一层判断：它们是最近才加进 core 的键，最容易撞上「设备上的 core 比
+ * web 旧、GET /api/config 里根本没这个键」。此时 generalOriginal 缺基线 —— 开关拖得动、
+ * PUT 上去也不会进 updated_fields，即典型的假开关。而这两个偏偏是排障入口，
+ * 用户正指望靠它们看设备真实状态，显示成可用最误导人，所以直接禁用，
+ * 并由 probeDescription 说明禁用原因。
+ *
+ * 其余字段不做这个处理：它们都是老键，且保存时的 findUnbaselinedKeys 提示已经够用。
+ */
+function probeSwitchDisabled(apiKey: ProbeApiKey): boolean {
+  return !generalLoaded.value || !(apiKey in generalOriginal);
+}
+
 async function saveGeneral() {
   if (!generalLoaded.value) {
     message.warning('配置尚未从设备读取，保存已阻止');
     return;
+  }
+  // 无条件提示（不看用户改没改过）：缺基线的控件显示的是前端默认值而不是设备真实状态，
+  // 哪怕没动过，「界面上有这个开关、设备却不认它」本身就得说出来。
+  const unbaselined = findUnbaselinedKeys(GENERAL_FORM_KEYS, generalOriginal);
+  if (unbaselined.length > 0) {
+    message.warning(`以下配置项当前 core 版本不支持，已忽略：${unbaselined.join('、')}`);
   }
   const payload = buildChangedPayload(GENERAL_FORM_KEYS, generalForm, generalOriginal);
   if (Object.keys(payload).length === 0) {

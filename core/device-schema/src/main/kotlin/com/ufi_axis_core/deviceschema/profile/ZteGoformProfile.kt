@@ -338,6 +338,12 @@ object ZteGoformProfile : DeviceProfile {
         add(fieldOf(DeviceFields.CellInfo.LTE_BANDS, FieldGroup.CELL_INFO, "Lte_bands"))
         add(fieldOf(DeviceFields.CellInfo.LTE_RSRP, FieldGroup.CELL_INFO, "lte_rsrp"))
         add(fieldOf(DeviceFields.CellInfo.LTE_RSRQ, FieldGroup.CELL_INFO, "lte_rsrq"))
+        // ⚠️ LTE_SNR 的别名链第一项 `lte_snr` **不是设备原名**，是 canonical 自身
+        // （`DeviceFields.CellInfo.LTE_SNR` == "lte_snr"）。设备原名只有大写 `Lte_snr`
+        // （2026-09-22 真机 dump：4G 驻网回 `Lte_snr`，小区参数首字母大写、
+        // 信号质量指标 `lte_rsrp`/`lte_rsrq`/`lte_rssi` 全小写）。
+        // 留着它只是**读侧**容错（归一化过的输入再进一次也能命中），
+        // **不许把它抄进任何 cmd 列表** —— P0-3 就是这么来的（fallback 发了一个设备上不存在的 cmd）。
         add(fieldOf(DeviceFields.CellInfo.LTE_SNR, FieldGroup.CELL_INFO, "lte_snr", "Lte_snr"))
 
         // ───────── 信号（FieldGroup.SIGNAL） ─────────

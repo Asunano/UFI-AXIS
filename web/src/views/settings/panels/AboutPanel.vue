@@ -92,6 +92,11 @@
            原来两个都叫 Root 却给出相反结论（实测「已获取 / 未获取」同屏），所以要分开命名。 -->
     <GridCard title="诊断信息">
       <template #extra>
+        <!-- 「字段覆盖率」入口放头部动作区、结果放弹窗，两件事都是被排版逼出来的：
+             · 卡内新增行 / footer 会让这张卡比同行的「电池」卡高出一截（footer ≈45px > 1 行 38px），
+               违反文件头那条编排约束，电池卡下方会露出页面底色；头部动作区不吃卡体高度。
+             · 10 个分组的 hit_source 是几十条映射，塞进 5 行的卡里根本读不了。 -->
+        <n-button size="tiny" quaternary :loading="coverageLoading" @click="openCoverage">字段覆盖率</n-button>
         <n-button size="tiny" quaternary @click="loadDiagnostics">刷新</n-button>
       </template>
       <InfoRow label="服务器时间" :value="diag.serverTime || '--'" />
@@ -112,18 +117,107 @@
       </InfoRow>
       <InfoRow label="网关" :value="diag.gateway || '--'" />
     </GridCard>
+
+    <!-- 字段覆盖率（GET /api/diagnose?fields=1）——「设备适配改造」的验收工具，计划书 §14.3。
+         改造前后各抓一份逐字比对，是「行为没变」的直接证据。以前 web 上没有入口，
+         抓基线得手调 API —— 麻烦到这一步就会被跳过，所以这里补一个按钮。
+         分组视图与原始 JSON 两份都给：视图用来当场看 missing，
+         「复制 JSON」给的是 core 原文，只有原文能贴进文档逐字 diff（渲染后的文字 diff 不出东西）。
+         n-modal 会传送到 body，不参与本页 2 列栅格，所以不影响上面那条等高约束。 -->
+    <n-modal
+      v-model:show="coverageOpen"
+      preset="card"
+      title="字段覆盖率"
+      style="width: 720px; max-width: calc(100vw - 32px)"
+    >
+      <!-- 这个 ref 不是为了取值，是给 copyToClipboard 当挂载容器用：
+           n-modal 默认 trap-focus，插在 document.body 上的临时 textarea 会被焦点陷阱判为「外面」
+           并被立刻夺走焦点，execCommand('copy') 于是抄到空（详见 utils.copyToClipboard 的注释）。
+           容器随便指到弹窗子树里的哪个元素都行，所以直接借用这条已有的按钮栏，不额外套 div。 -->
+      <div ref="coverageBodyRef" class="cov-bar">
+        <n-button size="small" :loading="coverageLoading" @click="loadFieldCoverage">
+          {{ coverageRaw ? '重新抓取' : '抓取' }}
+        </n-button>
+        <n-button size="small" :disabled="!coverageJson" @click="copyCoverageJson">复制 JSON</n-button>
+        <!-- 这句不是客套话：core 会逐个 FieldGroup 向设备发一次查询（最多 10 组），
+             设备只有 256MB 内存，这个按钮不能当刷新用。 -->
+        <span class="cov-bar-note">会真向设备发查询（逐分组，最多 10 组），只在需要抓基线时点。</span>
+      </div>
+
+      <!-- 加载态用文字而不是 n-spin 遮罩：首次抓取时下面还没有内容可覆盖，遮罩会塌成一条线 -->
+      <div v-if="coverageLoading && !coverageRaw" class="cov-note">正在逐分组向设备查询，可能要十几秒…</div>
+      <div v-else-if="coverageNote" class="cov-note cov-note--warn">{{ coverageNote }}</div>
+      <!-- core 自己统计失败时是 200 + {"error": …}（不是 HTTP 错误），必须单独认出来，
+           否则会掉进「groups 为空 ⇒ 显示没有数据」那条分支，把 core 给的原因吞掉 -->
+      <div v-else-if="coverageError" class="cov-note cov-note--warn">core 统计覆盖率失败：{{ coverageError }}</div>
+      <!-- 排障开关关掉时 core 短路返回 {normalization_enabled:false, hint:…}：照抄它的 hint 原文。
+           显示成「没有数据」会让人以为这个入口坏了，而真实原因是开关被人关掉了。 -->
+      <div v-else-if="coverageDisabledHint" class="cov-note cov-note--warn">{{ coverageDisabledHint }}</div>
+      <template v-else-if="coverageGroups.length">
+        <div class="cov-summary">
+          <span>profile：{{ coverageProfile }}</span>
+          <span>合计命中 {{ coverageTotal.hit }} / 登记 {{ coverageTotal.registered }}</span>
+        </div>
+        <div v-for="g in coverageGroups" :key="g.name" class="cov-group">
+          <div class="cov-group-head">
+            <code class="cov-group-name">{{ g.name }}</code>
+            <span :class="g.hit >= g.registered ? 'text-success' : 'cov-partial'">
+              命中 {{ g.hit }} / 登记 {{ g.registered }}
+            </span>
+            <!-- queried=false 表示这一组在命令表里没有 cmd，一条查询都没发过 ——
+                 与「查了但全没命中」是两件事，混在一起看会把缺命令误判成缺字段 -->
+            <span v-if="!g.queried" class="cov-partial">未发查询（这一组没有登记命令）</span>
+          </div>
+          <div v-if="g.missing.length" class="cov-kv">
+            <span class="cov-kv-key">missing</span>
+            <code class="cov-kv-val">{{ g.missing.join('、') }}</code>
+          </div>
+          <div v-if="g.hitSource.length" class="cov-kv">
+            <span class="cov-kv-key">hit_source</span>
+            <div class="cov-map">
+              <code v-for="h in g.hitSource" :key="h.canonical" class="cov-map-item"
+                >{{ h.canonical }} ← {{ h.source }}</code
+              >
+            </div>
+          </div>
+        </div>
+      </template>
+      <div v-else class="cov-note">尚未抓取。</div>
+
+      <!-- 原始 JSON 的只读框 —— 这不是「顺便也展示一下」，是「复制按钮的退路」。
+           剪贴板这条路有两处不由我们控制：安全上下文（http://<局域网IP> 下 navigator.clipboard
+           直接不存在）与 execCommand（已废弃 API，各浏览器随时可以拿掉）。两条都断的时候，
+           用户还得拿到这份原文去做逐字 diff，所以必须有一个能 Ctrl+A 的地方。
+           因此**默认展开、不做折叠**：折起来的退路等于没有退路。
+           放在分组视图之下：分组视图是"当场看 missing"的主路径，不能被这个框挤到折叠线以下。
+           等宽字体走 style 而不是新增 scoped class：n-input 内部 textarea-el 是 `font-family: inherit`
+           （naive-ui input.cssr.mjs），挂在根节点上就能继承，省掉一条只为改字体存在的样式类。 -->
+      <template v-if="coverageJson">
+        <div class="cov-note">原始 JSON（复制按钮失效时在这里 Ctrl+A 全选复制）</div>
+        <n-input
+          :value="coverageJson"
+          type="textarea"
+          readonly
+          :rows="10"
+          style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: var(--font-sm)"
+        />
+      </template>
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue';
+import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
-import { formatBytes } from '@/composables/utils';
+import { copyToClipboard, formatBytes } from '@/composables/utils';
 import { formatUptime } from '@/views/settings/settingsShared';
+import { Endpoints } from '@/api/contract';
 
 const api = getApiClient();
+const message = useMessage();
 
 // ── 开源信息（单一真源在仓库里，这里只做跳转）──
 const REPO_URL = 'https://github.com/Asunano/UFI-AXIS';
@@ -227,6 +321,80 @@ const mobileDataLabel = computed(() => {
   return mobileDataOn.value ? '已开启' : '已关闭';
 });
 
+// ── 字段覆盖率（GET /api/diagnose?fields=1）──
+// 真实结构读自 core（只读，没改）：HttpServer.kt 的 /diagnose 分支 +
+// GoformFieldMapper.coverageReport()。正常形态：
+//   { normalization_enabled: true, profile_id, profile_name,
+//     groups: { <FieldGroup>: { queried, registered, hit, missing: [...], hit_source: {canonical: source} } } }
+// 还有两种退化形态，**都是 HTTP 200**，都必须认：
+//   · core 统计自身抛异常  → { error: "<原因>" }（HttpServer 的 catch 分支）
+//   · 归一化开关被关掉     → { normalization_enabled: false, hint: "…" }（mapper 开头的短路）
+// 所以这里不给它定强类型、也不按固定字段解，按未知形状小心取值 —— 形状随 core 演进，
+// 而"能复制出原文"这件事不能跟着一起坏。
+const coverageOpen = ref(false);
+const coverageLoading = ref(false);
+const coverageRaw = ref<Record<string, any> | null>(null);
+/**
+ * 弹窗内容的容器，只用来给 `copyToClipboard` 当临时 textarea 的挂载点。
+ * n-modal 的 trap-focus 会把插在 body 上的 textarea 判成弹窗外元素并夺回焦点，
+ * 那样 execCommand('copy') 抄到的是空选区 —— 这就是 2026-09-22 实测「点了复制没反应」的成因。
+ */
+const coverageBodyRef = ref<HTMLElement | null>(null);
+/** 拿不到 field_coverage 这个块本身的原因（传输失败 / core 没回它），与 core 自己的 error 分开 */
+const coverageNote = ref('');
+// api 客户端默认 15s 是按"一次普通查询"定的，这里串行发最多 10 次设备查询，放宽到 60s。
+const COVERAGE_TIMEOUT_MS = 60_000;
+
+interface CoverageGroupView {
+  name: string;
+  queried: boolean;
+  registered: number;
+  hit: number;
+  missing: string[];
+  hitSource: { canonical: string; source: string }[];
+}
+
+const coverageJson = computed(() => (coverageRaw.value ? JSON.stringify(coverageRaw.value, null, 2) : ''));
+const coverageError = computed(() => {
+  const e = coverageRaw.value?.error;
+  return typeof e === 'string' ? e : '';
+});
+const coverageDisabledHint = computed(() => {
+  const raw = coverageRaw.value;
+  // 只认显式的 false：缺这个键（例如退化成 {error}）不等于"开关被关了"
+  if (!raw || raw.normalization_enabled !== false) return '';
+  // hint 照抄 core 原文；万一哪天 core 只回 false 不回 hint，也不能显示成空白
+  return String(raw.hint ?? '字段归一化已关闭，core 侧没有登记表可比对。');
+});
+const coverageProfile = computed(() => {
+  const raw = coverageRaw.value;
+  const id = String(raw?.profile_id ?? '');
+  const name = String(raw?.profile_name ?? '');
+  return name ? `${id}（${name}）` : id || '--';
+});
+const coverageGroups = computed<CoverageGroupView[]>(() => {
+  const groups = coverageRaw.value?.groups;
+  if (!groups || typeof groups !== 'object') return [];
+  // 刻意不排序：core 是按 FieldGroup 的声明顺序输出的，两份快照顺序一致才好逐字比对
+  return Object.entries(groups as Record<string, any>).map(([name, g]) => ({
+    name,
+    queried: !!g?.queried,
+    registered: Number(g?.registered ?? 0),
+    hit: Number(g?.hit ?? 0),
+    missing: Array.isArray(g?.missing) ? g.missing.map((m: any) => String(m)) : [],
+    hitSource: Object.entries((g?.hit_source ?? {}) as Record<string, any>).map(([canonical, source]) => ({
+      canonical,
+      source: String(source),
+    })),
+  }));
+});
+const coverageTotal = computed(() =>
+  coverageGroups.value.reduce((acc, g) => ({ registered: acc.registered + g.registered, hit: acc.hit + g.hit }), {
+    registered: 0,
+    hit: 0,
+  })
+);
+
 // ══════════════════════════════════════════════
 //  Data Loading
 // ══════════════════════════════════════════════
@@ -297,19 +465,75 @@ async function loadSystemInfo() {
 
 async function loadDiagnostics() {
   try {
-    const { data } = await api.get('/api/diagnose');
-    // server_time 是 epoch 毫秒；旧代码直接渲染原始数字
-    diag.serverTime = data.server_time
-      ? new Date(Number(data.server_time)).toLocaleString('zh-CN', { hour12: false })
-      : '--';
-    diag.root = !!data.root;
-    // adbd / mobile_data / gateway 都是 shell 输出的字符串（如 "running"/"stopped"/"1"/"0"/"unknown"），
-    // 旧代码用 !! 判断 → "stopped"、"0"、"unknown" 全部被当成 true
-    diag.adbd = String(data.adbd ?? '').trim();
-    diag.mobileData = String(data.mobile_data ?? '').trim();
-    diag.gateway = String(data.gateway ?? '').trim();
+    const { data } = await api.get(Endpoints.diagnose);
+    applyDiagnostics(data);
   } catch {
     /* silent */
+  }
+}
+
+/** 解析 /api/diagnose 的基础字段。抽出来是因为带 `fields=1` 的那次请求回的是同一份信封。 */
+function applyDiagnostics(data: any) {
+  // server_time 是 epoch 毫秒；旧代码直接渲染原始数字
+  diag.serverTime = data.server_time
+    ? new Date(Number(data.server_time)).toLocaleString('zh-CN', { hour12: false })
+    : '--';
+  diag.root = !!data.root;
+  // adbd / mobile_data / gateway 都是 shell 输出的字符串（如 "running"/"stopped"/"1"/"0"/"unknown"），
+  // 旧代码用 !! 判断 → "stopped"、"0"、"unknown" 全部被当成 true
+  diag.adbd = String(data.adbd ?? '').trim();
+  diag.mobileData = String(data.mobile_data ?? '').trim();
+  diag.gateway = String(data.gateway ?? '').trim();
+}
+
+/** 开弹窗顺带抓第一份；已经有结果就不再自动抓 —— 回看旧快照不该再向设备发 10 次查询。 */
+function openCoverage() {
+  coverageOpen.value = true;
+  if (!coverageRaw.value && !coverageLoading.value) loadFieldCoverage();
+}
+
+async function loadFieldCoverage() {
+  coverageLoading.value = true;
+  coverageNote.value = '';
+  try {
+    // 用 params 而不是手拼 URL：请求签名走的是 client.getUri(config)（见 useApi.ts 的注释），
+    // 手拼的 query 与签名用的 URI 不是同一套序列化时会 100% 验签失败。
+    const { data } = await api.get(Endpoints.diagnose, { params: { fields: 1 }, timeout: COVERAGE_TIMEOUT_MS });
+    // 同一份响应里带着基础诊断字段，顺手刷新：那几行是 root shell 跑出来的，能省一趟就省一趟
+    applyDiagnostics(data);
+    const cov = data?.field_coverage;
+    if (cov && typeof cov === 'object') {
+      coverageRaw.value = cov;
+    } else {
+      // core 只在 `fields=1` 时才塞这个块；真缺了说明这版 core 不认这个参数，
+      // 如实说出来，不要让它长得像"设备一个字段都没命中"
+      coverageRaw.value = null;
+      coverageNote.value = '响应里没有 field_coverage —— 这版 core 可能还不认 ?fields=1。';
+    }
+  } catch (e: any) {
+    coverageRaw.value = null;
+    coverageNote.value = `抓取失败：${e?.message || '未知错误'}`;
+  } finally {
+    coverageLoading.value = false;
+  }
+}
+
+/**
+ * 复制 core 原文的格式化 JSON。
+ * 复制的必须是原始 JSON 而不是上面渲染出来的文字：验收要做的是两份快照逐字 diff，
+ * 渲染文本（"命中 9 / 登记 10"）diff 不出 hit_source 那一层的变化。
+ * 复制实现复用 composables/utils 的 copyToClipboard（它带 execCommand 兜底 ——
+ * 本面板常从 http://<局域网IP>:8088 打开，那里 navigator.clipboard 是 undefined）。
+ * 第二个参数是关键：这里是 n-modal 内部，兜底用的临时 textarea 必须挂在弹窗子树里，
+ * 否则 trap-focus 会把焦点抢走，复制到的是空内容（2026-09-22 实测的 bug）。
+ */
+async function copyCoverageJson() {
+  if (!coverageJson.value) return;
+  if (await copyToClipboard(coverageJson.value, coverageBodyRef.value)) {
+    message.success('已复制 field_coverage 原始 JSON');
+  } else {
+    // 指路到下面那个只读框，而不是笼统说"手动复制"——用户得知道手动复制该去哪一块
+    message.error('复制失败，请在下方「原始 JSON」框里 Ctrl+A 全选复制');
   }
 }
 
@@ -351,6 +575,90 @@ onMounted(() => {
 }
 .text-error {
   color: var(--error);
+}
+
+/* ── 字段覆盖率弹窗 ──
+   全部走令牌：这一页的 <style> 里一个写死颜色都没有，check-ui-baseline 的
+   scopedColorLiterals 只卡增量，本文件要保持 0。
+   n-modal 会把内容传送到 body，但 scoped 属性是渲染时打在元素上的，跟着一起走，
+   所以这些选择器在弹窗里依然生效。 */
+.cov-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.cov-bar-note {
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+}
+.cov-note {
+  font-size: var(--font-base);
+  color: var(--text-secondary);
+  padding: 8px 0;
+}
+.cov-note--warn {
+  color: var(--warning);
+}
+.cov-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+}
+.cov-group {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.cov-group:last-child {
+  border-bottom: none;
+}
+.cov-group-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+}
+.cov-group-name {
+  font-size: var(--font-base);
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.cov-partial {
+  color: var(--warning);
+}
+.cov-kv {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: var(--font-sm);
+}
+.cov-kv-key {
+  flex: 0 0 68px;
+  color: var(--text-muted);
+}
+/* 这些字段名是拿去逐字比对的，宁可折行占高也不能省略号截断（对照 .url-text 那条）*/
+.cov-kv-val,
+.cov-map {
+  min-width: 0;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+.cov-map {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+.cov-map-item {
+  padding: 0 4px;
+  border-radius: var(--radius-sm);
+  background: var(--code-bg);
 }
 
 @media (max-width: 768px) {

@@ -36,8 +36,11 @@ import org.junit.Test
  * 实测不一致的组 == 已登记的例外集合
  * ```
  *
- * 双向相等，所以：① 新增分叉立刻红；② 已知那两处是**显式登记**而不是被掩盖；
+ * 双向相等，所以：① 新增分叉立刻红；② 登记过的例外是**显式登记**而不是被掩盖；
  * ③ 例外被修好之后测试会红，提醒把它从集合里删掉 —— 删完仍绿就是 0.4b 可以安全删 fallback 的信号。
+ *
+ * **2026-09-22：例外集合已清空**（`CELL_INFO` 的 `lte_snr`/`Lte_snr` 分叉按真机 dump 修好），
+ * 即「两份表当前逐字一致」。这是 0.4b 的硬前置条件，不是可以顺手改回去的装饰。
  */
 class GoformCommandTableGuardTest {
 
@@ -70,26 +73,20 @@ class GoformCommandTableGuardTest {
         GoformSignalClient.FALLBACK_CMDS + mapOf(FieldGroup.WIFI_SETTINGS to wifiSettingsClientCmds)
 
     /**
-     * **已知不一致的组 —— 唯一允许的例外，移除条件必须写清。**
+     * **已知不一致的组 —— 现在是空的。**
      *
-     * `CELL_INFO`（待办池 P0-3）：客户端 fallback 末项是小写 `lte_snr`，
-     * `ZteGoformProfile.cmdsFor(CELL_INFO)` 是大写 `Lte_snr`。
+     * 2026-09-22：`CELL_INFO`（待办池 P0-3）已按真机 dump 修好 —— 客户端 fallback 末项从小写
+     * `lte_snr` 改成大写 `Lte_snr`，与 `ZteGoformProfile.cmdsFor(CELL_INFO)` 逐字一致。
+     * 依据：当日真机 4G 驻网小区信息返回 `Lte_snr`，设备上不存在 `lte_snr` 这个键
+     * （小写那个是 core 自有 canonical `DeviceFields.CellInfo.LTE_SNR`）。
      *
-     * - **已确认的事实**：`ZteGoformProfile.kt` 的 SIGNAL 段注释断言设备原名是 `Lte_snr`
-     *   （`lte_snr` 是 core 自有的小写 canonical，看着像设备原名而已）；
-     *   `CELL_INFO` 的 `LTE_SNR` 别名链两个名字都登记了（`"lte_snr", "Lte_snr"`），
-     *   所以**读侧解析**两种大小写都能命中，这一处分叉今天不会造成功能缺陷。
-     * - **未证的猜测**：设备对 **cmd 名**是否大小写敏感。
-     * - 移除条件：真机用 `POST /api/device/goform/query` 分别发 `lte_snr` 与 `Lte_snr` 各一次定性，
-     *   再统一成设备真正接受的那个。**定性之前不许统一**（用户裁决：保持原有 goform 命令不变）。
-     *   统一之后本测试会红 —— 那时把这一项从集合里删掉，测试仍绿就是「0.4b 可以安全删 fallback」
-     *   的信号。
+     * `WIFI_SETTINGS` **曾经也在这个集合里**（`cmdsFor()` 把响应键 `WiFiModuleSwitch` 当成 cmd、
+     * 少 5 个真 cmd），2026-09-22 同一轮由另一个代理在 `core/device-schema` 侧修好。
      *
-     * `WIFI_SETTINGS` **曾经在这个集合里**（`cmdsFor()` 把响应键 `WiFiModuleSwitch` 当成 cmd、
-     * 少 5 个真 cmd），同一轮由另一个代理在 `core/device-schema` 侧修好了，实测已逐字一致，
-     * 因此不再登记为例外 —— 它现在由「逐字一致的那几组」那条断言看着。
+     * 空集合**不等于这条断言空转**：`实测不一致的组必须恰好等于已登记的例外` 是双向相等，
+     * 任何一组新出现分叉都会让实测集合非空从而立刻红。要再往里加东西，必须同时写清移除条件。
      */
-    private val knownDivergentGroups = setOf(FieldGroup.CELL_INFO)
+    private val knownDivergentGroups = emptySet<FieldGroup>()
 
     // ───────────────────────── 1. 两份表的一致性 ─────────────────────────
 
@@ -137,21 +134,22 @@ class GoformCommandTableGuardTest {
     }
 
     /**
-     * 把 `CELL_INFO` 的分叉**钉到字符级**：只许差这一个大小写。
+     * 把 `CELL_INFO` 钉到**字符级**：两侧末项都必须是设备真名 `Lte_snr`。
      *
-     * 只登记「这一组不一致」是不够的 —— 那样在这一组里再抄错一个 cmd 名也不会红。
+     * 这条测试原来钉的是「只许差这一个大小写」；2026-09-22 分叉修好后改成钉「两边都是 `Lte_snr`」，
+     * 保留字符级粒度的理由不变 —— 只靠上面那条「分组级一致」的断言，
+     * 在这一组里把两侧**同时**抄错成同一个错名不会红。
+     * `lte_snr` 是 core 自有 canonical（`DeviceFields.CellInfo.LTE_SNR`），设备上没有这个键。
      */
     @Test
-    fun `CELL_INFO 的分叉只许是 lte_snr 的大小写`() {
+    fun `CELL_INFO 两侧末项都必须是设备真名 Lte_snr`() {
         val client = GoformSignalClient.CELL_INFO_FALLBACK_CMDS
         val profile = ZteGoformProfile.cmdsFor(FieldGroup.CELL_INFO)
-        assertEquals("lte_snr", client.last())
+        assertEquals("Lte_snr", client.last())
         assertEquals("Lte_snr", profile.last())
-        assertEquals(
-            "CELL_INFO 除 lte_snr/Lte_snr 的大小写之外不许有别的差异",
-            profile,
-            client.dropLast(1) + "Lte_snr",
-        )
+        assertFalse("设备上不存在小写 lte_snr 这个 cmd", "lte_snr" in client)
+        assertFalse("设备上不存在小写 lte_snr 这个 cmd", "lte_snr" in profile)
+        assertEquals("CELL_INFO 两份表必须逐字一致", profile, client)
     }
 
     // ───────────────── 2. 关掉归一化不会把只读面打瘫 ─────────────────
@@ -178,8 +176,9 @@ class GoformCommandTableGuardTest {
     /**
      * 归一化开着时 `cmds()` 取 profile 的登记表 —— 本轮**取值行为一字不变**。
      *
-     * `CELL_INFO` 这一组特意断言拿到的是**大写** `Lte_snr`：这正是「现在就把 cmds() 切到
-     * commandProfile 也不会被发现」的那处静默差异，钉在这里，0.4b 动手时必须正面处理它。
+     * `CELL_INFO` 这一组特意断言拿到的是 `Lte_snr`：这里曾是「现在就把 cmds() 切到
+     * commandProfile 也不会被发现」的那处静默差异（fallback 是小写），2026-09-22 两侧已统一到
+     * 设备真名，断言留着是为了钉住「不管从哪份表取，发出去的都是 `Lte_snr`」。
      */
     @Test
     fun `开着归一化时 cmds 取 profile 的登记表`() {
