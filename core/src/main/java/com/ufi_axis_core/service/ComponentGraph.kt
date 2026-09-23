@@ -48,8 +48,8 @@ data class ComponentGraph(
 
 /** 网络相关：全部 Goform 客户端 + 网络 / SIM 控制器。 */
 data class NetworkGraph(
-    /** 防腐层接口（F9）：子图对外只暴露 [GoformGateway]，具体实现只有 ComponentFactory 知道。 */
-    val goformClient: GoformGateway,
+    /** 防腐层接口（F9）：子图对外只暴露 [DeviceTransport]，具体实现只有 ComponentFactory 知道。 */
+    val goformClient: DeviceTransport,
     val signalClient: GoformSignalClient,
     val wifiClient: GoformWifiClient,
     val networkClient: GoformNetworkClient,

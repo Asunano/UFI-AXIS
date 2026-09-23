@@ -165,7 +165,7 @@ class DeviceRoutes(
                     return@post
                 }
                 AppLogger.w("DeviceRoutes", "goform/query 裸命令: ${cmds.joinToString(",")}")
-                val data = goformClient.query(cmds)
+                val data = goformClient.read(cmds)
                 if (data == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
@@ -196,7 +196,7 @@ class DeviceRoutes(
                     "DeviceRoutes",
                     "goform/set 裸命令: goformId=$goformId params=[${extraParams.keys.joinToString(",")}]"
                 )
-                val response = goformClient.goformPost(mapOf("goformId" to goformId) + extraParams)
+                val response = goformClient.write(mapOf("goformId" to goformId) + extraParams)
                 if (response == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,

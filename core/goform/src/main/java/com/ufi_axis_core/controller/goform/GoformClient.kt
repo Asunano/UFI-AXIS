@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicReference
  * Goform 客户端（ZTE 设备私有协议防腐层实现）。
  *
  * 认证模型（与 UFI-TOOLS 对齐，已在备份版本验证可用）：
- *  - 每次 query / querySingle / goformPost 前都先 ensureLogin()；
+ *  - 每次 read / readOne / write 前都先 ensureLogin()；
  *  - 登录优先 goformId=LOGIN_MULTI_USER（带 IP=localhost），失败则回退 LOGIN；
  *  - 加密口令：encPwd = sha256( sha256(password) + LD )，均为大写十六进制；
  *  - 写操作需在 body 附带 AD = sha256( sha256(wa+cr) + RD )，均为大写；
@@ -50,7 +50,7 @@ class GoformClient(
     // 而它会被**原样**当作 sha256Hex(password) 的输入，与 AppSettings.DEFAULT_GOFORM_PASSWORD
     // （明文 "admin"）算出的 hash 不一致 —— 依赖默认值的调用方会静默登录失败。
     private val password: String
-) : GoformGateway {
+) : GoformTransport {
 
     private val tag = "GoformClient"
 
@@ -130,10 +130,10 @@ class GoformClient(
     /**
      * 解析出真正可达的 base url（`http://192.168.0.1:8080` / `http://127.0.0.1:8080` / …）。
      *
-     * internal：文件类端点（二维码等）不走 [ensureLogin]，但同样要先把 base url 定下来，
-     * 否则 [baseUrl] 只能返回未验证的拼装值，端口/宿主不对就直接连不上。
+     * 上 [GoformTransport]（module 内可见）：文件类端点（二维码等）不走 [ensureLogin]，
+     * 但同样要先把 base url 定下来，否则 [baseUrl] 只能返回未验证的拼装值，端口/宿主不对就直接连不上。
      */
-    internal suspend fun ensureBaseUrlResolved() {
+    override suspend fun ensureBaseUrlResolved() {
         if (baseUrlResolved) return
         resolveMutex.withLock {
             if (baseUrlResolved) return
@@ -178,9 +178,9 @@ class GoformClient(
      * **必须带 session Cookie**：设备的 `goform_get_file_process` 与 goform_get/set 一样受
      * session 保护，不带 Cookie 时不会返回 401，而是回一个 200 的登录页 HTML ——
      * 调用方按图片解析就得到"坏图"。这里漏带 Cookie 曾让 WiFi 分享二维码一直是错的
-     * （query/goformPost 两条路径都带，只有本方法忘了）。
+     * （read/write 两条路径都带，只有本方法忘了）。
      */
-    internal suspend fun httpGet(url: String): HttpResponse {
+    override suspend fun httpGet(url: String): HttpResponse {
         val base = baseUrl()
         return httpClient.get(url) {
             header("Referer", "$base/index.html")
@@ -188,7 +188,7 @@ class GoformClient(
         }
     }
 
-    internal fun parseJson(body: String): JsonObject? = try {
+    override fun parseJson(body: String): JsonObject? = try {
         json.parseToJsonElement(body).jsonObject
     } catch (e: CancellationException) { throw e } catch (e: Exception) {
         AppLogger.w(tag, "parseJson failed: ${e.message}")
@@ -413,7 +413,7 @@ class GoformClient(
      * 判 HTML 走子串这一路是常态而非异常，所以只在「看起来像 JSON」时才调 parseJson，
      * 免得 HTML 每次都在日志里刷一条 parseJson failed。
      */
-    internal fun isAuthFailure(body: String): Boolean {
+    override fun isAuthFailure(body: String): Boolean {
         if (body.isBlank()) return false
         val trimmed = body.trimStart()
         if (trimmed.startsWith("<")) return true
@@ -451,14 +451,14 @@ class GoformClient(
 
     // ============ POST ============
 
-    override suspend fun goformPost(params: Map<String, String>): String? =
+    override suspend fun write(params: Map<String, String>): String? =
         (postMeasured(params, retryOnSessionLost = false) as? GoformWriteResult.Accepted)?.body
 
     /**
      * **幂等**写操作专用入口：会话失效时重登并只重试一次，并把
      * 「会话失效 / 连不上 / 设备表过态」三件事分开返回（判据见 [GoformWriteResult]）。
      *
-     * 为什么不让 [goformPost] 一律重试：`SEND_SMS` 这类命令**非幂等**，重发一次可能就是
+     * 为什么不让 [write] 一律重试：`SEND_SMS` 这类命令**非幂等**，重发一次可能就是
      * 第二笔话费（见 `GoformSmsClient.sendSms` 的 `NO_RESPONSE` 判据）。重试与否必须由
      * 调用方按命令语义显式选择，所以这里另开一条路，而不是把重试塞进公共 POST。
      *
@@ -466,7 +466,7 @@ class GoformClient(
      * 重发安全 —— 这也是修「切换网络制式第一次必定失败」的落点：读路径早就有这套重试
      * （见 [queryInternal]），写路径一直没有，于是一次会话抖动就等于一次用户可见的失败。
      */
-    internal suspend fun goformPostIdempotent(params: Map<String, String>): GoformWriteResult =
+    override suspend fun writeIdempotent(params: Map<String, String>): GoformWriteResult =
         postMeasured(params, retryOnSessionLost = true)
 
     private suspend fun postMeasured(
@@ -490,7 +490,7 @@ class GoformClient(
                 attemptNo++
                 AppLogger.w(tag, "[goform_set] session lost, re-login and retry (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
             } else if (GoformWritePolicy.shouldRetryBusinessFailure(
-                    attemptNo, result, acceptedBody?.let { isGoformSuccess(it) } ?: true)
+                    attemptNo, result, acceptedBody?.let { isSuccess(it) } ?: true)
             ) {
                 attemptNo++
                 // 这条是 WARN 而不是 DEBUG：release/benchmark 包只保留 WARN 以上，
@@ -507,7 +507,7 @@ class GoformClient(
         }
         // 重试后仍是业务失败 = 设备真的拒绝了这次取值，留一条 WARN 作为最终判据。
         (result as? GoformWriteResult.Accepted)?.body?.let { body ->
-            if (!isGoformSuccess(body)) {
+            if (!isSuccess(body)) {
                 AppLogger.w(tag, "[goform_set] rejected after $attemptNo attempt(s): " +
                         "goformId=${params["goformId"]} body=${body.take(200)}")
             }
@@ -594,7 +594,7 @@ class GoformClient(
 
     // ============ Query ============
 
-    override suspend fun query(commands: List<String>): JsonObject? {
+    override suspend fun read(commands: List<String>): JsonObject? {
         if (!ensureLogin()) return null
         return queryInternal(commands, retry = true)
     }
@@ -684,7 +684,7 @@ class GoformClient(
     }
 
 
-    override suspend fun querySingle(command: String): JsonElement? {
+    override suspend fun readOne(command: String): JsonElement? {
         if (!ensureLogin()) return null
         return querySingleInternal(command, retry = true)
     }
@@ -781,7 +781,7 @@ class GoformClient(
 
     override suspend fun logout(): Boolean {
         return try {
-            val resp = goformPost(
+            val resp = write(
                 mapOf(
                     "goformId" to "LOGOUT",
                     "isTest" to "false"
@@ -798,7 +798,7 @@ class GoformClient(
 
     // ============ Success / Failure helpers ============
 
-    internal fun isGoformSuccess(body: String?): Boolean {
+    override fun isSuccess(body: String?): Boolean {
         if (body.isNullOrBlank()) return false
         val b = body.trim()
         if (b.startsWith("<") || b.contains("login.html")) return false
@@ -856,14 +856,14 @@ class GoformClient(
 
     // ============ crypto ============
 
-    internal fun sha256Hex(input: String): String {
+    override fun sha256Hex(input: String): String {
         val md = MessageDigest.getInstance("SHA-256")
         val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    // 写侧字符集固定 UTF-8。读侧（base64Decode）必须先试 UTF-8 才对称 —— 见
-    // [decodeDeviceText] 的注释。**不要**把这里改成 GBK 去「迁就」读侧。
+    // 写侧字符集固定 UTF-8。读侧（[decodeDeviceText]）必须先试 UTF-8 才对称 —— 见
+    // companion 的 [Companion.decodeDeviceText] 的注释。**不要**把这里改成 GBK 去「迁就」读侧。
     internal fun base64Encode(input: String): String =
         java.util.Base64.getEncoder().encodeToString(input.toByteArray(Charsets.UTF_8))
 
@@ -877,11 +877,12 @@ class GoformClient(
      * 这个坑在 `getCurrentWifiConfig` 的 KDoc 里也记了一条；要改得单独一轮，
      * 连带上层的「空 vs 失败」区分一起改，别混在字符集这一轮里。
      *
-     * 本方法只负责「怎么报错」；解码逻辑在纯函数 [base64DecodeOrEmpty] / [decodeDeviceText]，
+     * 本方法只负责「怎么报错」；解码逻辑在纯函数 [Companion.base64DecodeOrEmpty] /
+     * [Companion.decodeDeviceText]，
      * 单测打在那两个上面（这个类一构造就起 Ktor client，[AppLogger] 又依赖 android.util.Log，
      * 实例方法在 JVM 单测里不可用 —— 所以是**测委托目标**，不是为了可测性改生产类型）。
      */
-    override fun base64Decode(input: String): String =
+    override fun decodeDeviceText(input: String): String =
         base64DecodeOrEmpty(input) { e -> AppLogger.e(tag, "base64Decode failed", e) }
 
     override fun close() {
@@ -948,7 +949,7 @@ class GoformClient(
         }
 
         /**
-         * [base64Decode] 的纯函数体：合法 base64 → [decodeDeviceText] 的结果；
+         * 实例方法 `decodeDeviceText(String)` 的纯函数体：合法 base64 → [decodeDeviceText] 的结果；
          * 非法 base64 → 调一次 [onError] 后返回**空串**（与改造前逐字同义）。
          *
          * 「怎么报错」用参数传进来，是为了让这段逻辑能在 JVM 单测里跑：

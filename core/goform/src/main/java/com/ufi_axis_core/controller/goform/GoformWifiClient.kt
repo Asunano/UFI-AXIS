@@ -24,7 +24,7 @@ import kotlinx.serialization.json.*
  * @param profile 字段映射表；传 null 关闭归一化（原样透传设备字段，见 [GoformFieldMapper]）
  */
 class GoformWifiClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
     private val tag = "GoformWifi"
@@ -40,7 +40,7 @@ class GoformWifiClient(
         // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**。
         // 合成一次会改变设备侧请求形状 —— 本仓有过 `station_list` 因合并查询被设备吞掉的先例。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        return client.query(listOf("queryWiFiModuleSwitch", "queryAccessPointInfo"))
+        return client.read(listOf("queryWiFiModuleSwitch", "queryAccessPointInfo"))
     }
 
     /**
@@ -160,13 +160,13 @@ class GoformWifiClient(
      * **返回值契约（读明文 / 写 base64 的不对称，改本函数前先读计划书 §11.3）**：
      * 返回的 `Password` 是**明文**（设备侧是 base64，这里已经解过一次）。
      * 而 `setAccessPointInfo` 的 `Password` 字段要的是 **base64** ——
-     * 所以任何拿这个值回写设备的地方**必须自己 `client.base64Encode(...)`**，
-     * 既不能原样发（会把口令写成明文串），也不能再 `base64Decode` 一次（明文不是合法
+     * 所以任何拿这个值回写设备的地方**必须自己做一次 base64(UTF-8) 编码**，
+     * 既不能原样发（会把口令写成明文串），也不能再 `decodeDeviceText` 一次（明文不是合法
      * base64 时会拿到空串）。这个不对称就是 2026-09-21 修的那两处 Password bug 的根因。
      *
      * 其余键（SSID/AuthMode/EncrypType/ChipIndex/Ap*）都是设备原值，回写时原样透传。
      *
-     * 陷阱：[GoformClient.base64Decode] 解码失败时**返回空串**而不是抛异常
+     * 陷阱：[DeviceTransport.decodeDeviceText] 解码失败时**返回空串**而不是抛异常
      * （`GoformClient.kt:868`，catch 里只打日志后 `return ""`），所以下面那个 try/catch
      * 的 fallback 基本不会命中 —— 非法 base64 走的是「`config["Password"] = ""`」这条路。
      * **不要改它的行为**：`/api/wifi/settings` 的读路径依赖现有语义。
@@ -189,7 +189,7 @@ class GoformWifiClient(
                     ap["Password"]?.jsonPrimitive?.contentOrNull?.let { pwd ->
                         try {
                             // 尝试 Base64 解码，如果成功则返回明文密码
-                            val decodedPwd = client.base64Decode(pwd)
+                            val decodedPwd = client.decodeDeviceText(pwd)
                             config["Password"] = decodedPwd
                         } catch (e: Exception) {
                             // 如果解码失败，可能是明文密码或未设置密码
@@ -209,7 +209,7 @@ class GoformWifiClient(
         // 刻意的**分批**查询，不走 profile 命令表：本方法的 12 项 + [getWifiModuleInfo] 的 2 个容器命令
         // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**（见 getWifiModuleInfo）。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        return client.query(listOf(
+        return client.read(listOf(
             "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
             "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
             "wifi_chip1_ssid1_passphrase", "wifi_chip",
@@ -223,7 +223,7 @@ class GoformWifiClient(
      *
      * 为什么在这一层合并：两份响应互补（扁平查询给 `wifi_*` 键，module-info 给
      * `ResponseList` 里的 AP 对象），而归一化必须一次看到全部输入才能按别名链定优先级。
-     * 原来这段在 `DataHub.getWifiSettingsMerged` 里，还要路由把 `base64Decode` 传进来 —
+     * 原来这段在 `DataHub.getWifiSettingsMerged` 里，还要路由把 `decodeDeviceText` 传进来 —
      * 现在密码解码由 profile 的 `WIFI_PASSWORD_DECODER` 负责，上层不再碰设备字段。
      *
      * @return 只含 [DeviceFields.WifiSettings] 登记字段的对象；两个查询都失败时返回空对象。
@@ -256,7 +256,7 @@ class GoformWifiClient(
      * `hostname`/`ip_addr`/`mac_addr`（见 `ZteGoformProfile.normalizeStationLists`）。
      */
     suspend fun getConnectedClients(): JsonObject? {
-        val raw = client.querySingle("station_list")?.let {
+        val raw = client.readOne("station_list")?.let {
             when (it) {
                 is JsonObject -> it
                 is JsonArray -> JsonObject(mapOf("station_list" to it))
@@ -282,7 +282,7 @@ class GoformWifiClient(
      * 写侧是**整表替换**，所以调用方每次都得先读这个再改。
      */
     suspend fun getAccessControlList(): AclSnapshot? {
-        val obj = client.querySingle("queryDeviceAccessControlList") as? JsonObject ?: return null
+        val obj = client.readOne("queryDeviceAccessControlList") as? JsonObject ?: return null
         fun str(key: String) = (obj[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
         return AclSnapshot(
             mode = str("AclMode").ifEmpty { ZteGoformProfile.ACL_MODE_BLACKLIST },
@@ -465,8 +465,8 @@ class GoformWifiClient(
      *
      * ## 为什么抽成 companion 的纯函数
      *
-     * 本类持有的是**具体类** [GoformClient]（阶段 1 才接口化），端到端路径注入不了假对象，
-     * 于是「current + 入参 → canonical params」这段判断以前只能靠真机验证。抽出来之后
+     * 本类持有的是接口 [GoformTransport]（阶段 1 已接口化），端到端路径**可以**注入假对象了，
+     * 但「current + 入参 → canonical params」这段判断在接口化之前只能靠真机验证。抽出来之后
      * 三个入口各自放哪几个键就能逐字断言（`GoformWifiApParamsTest`）——
      * 设备侧 `setAccessPointInfo` 是整表替换，多一个键 / 少一个键都会改掉 AP 的某一项配置，
      * 这里错一个键是「读取毫无影响、写入静默改坏设备」的错误。做法同
@@ -506,7 +506,8 @@ class GoformWifiClient(
          *   静默走过去就是 2026-09-22 之前那个「在 5G 下点开 WiFi 被切到 2.4G」的 bug 再现一次。
          *
          * 抽成以 lambda 收读路径与日志出口的 companion 函数，理由同 [mergeApConfigParams]：
-         * 本类持有具体类 [GoformClient]，注入不了假对象，只有这样才能逐字断言
+         * 本类持有的是接口 [GoformTransport]（阶段 1 已接口化，可以注入假对象了），
+         * 而这种写法能不经过传输层就逐字断言
          * 「读到 chip2 就发 chip2 / 读失败退回 chip1 / 关分支不读」。
          *
          * @param readChip 当前频段的读取出口（生产是 [readCurrentWifiChip]，失败给 null）

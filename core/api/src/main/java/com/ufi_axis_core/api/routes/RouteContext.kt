@@ -4,8 +4,8 @@ import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
+import com.ufi_axis_core.controller.goform.DeviceTransport
 import com.ufi_axis_core.controller.goform.GoformDeviceClient
-import com.ufi_axis_core.controller.goform.GoformGateway
 import com.ufi_axis_core.controller.goform.GoformNetworkClient
 import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.controller.goform.GoformSimClient
@@ -44,8 +44,8 @@ data class RouteContext(
     val telephonyCollector: TelephonyCollector get() = collector.telephonyCollector
     val atChannel: ATChannel get() = collector.atChannel
 
-    // F9 防腐层：以 GoformGateway 接口暴露（示范迁移，首个调用方）
-    val goformClient: GoformGateway get() = network.goformClient
+    // F9 防腐层：以 DeviceTransport 接口暴露（示范迁移，首个调用方）
+    val goformClient: DeviceTransport get() = network.goformClient
     val signalClient: GoformSignalClient get() = network.signalClient
     val networkClient: GoformNetworkClient get() = network.networkClient
     val deviceClient: GoformDeviceClient get() = network.deviceClient
@@ -73,8 +73,8 @@ data class CollectorDeps(
 
 /** 网络依赖：全部 Goform 客户端 + 网络控制器。 */
 data class NetworkDeps(
-    // F9 防腐层：以 GoformGateway 接口暴露
-    val goformClient: GoformGateway,
+    // F9 防腐层：以 DeviceTransport 接口暴露
+    val goformClient: DeviceTransport,
     val signalClient: GoformSignalClient,
     val networkClient: GoformNetworkClient,
     val deviceClient: GoformDeviceClient,

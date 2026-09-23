@@ -11,7 +11,7 @@ import com.ufi_axis_core.deviceschema.SettingKey
  * - SIM 卡槽切换
  */
 class GoformSimClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
     private val writer = GoformSettingWriter(client, profile)

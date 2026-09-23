@@ -23,7 +23,7 @@ import com.ufi_axis_core.deviceschema.SettingKey
  */
 
 class GoformDeviceClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
     private val writer = GoformSettingWriter(client, profile)
@@ -68,7 +68,7 @@ class GoformDeviceClient(
      * 修改设备后台管理口令。
      *
      * **哈希留在这里**：设备要的是 SHA256 大写十六进制，而这套算法与登录握手共用
-     * [GoformClient.sha256Hex] —— 在 profile 里抄第二份实现就有了两个真源，哪天登录侧
+     * [GoformTransport.sha256Hex] —— 在 profile 里抄第二份实现就有了两个真源，哪天登录侧
      * 换算法这里不报错、只会静默登不上。顺带明文口令不进 device-schema，少一处泄露面。
      * profile 的 validate 会挡住"忘了哈希直接传明文"（必须是 64 位大写十六进制）。
      *

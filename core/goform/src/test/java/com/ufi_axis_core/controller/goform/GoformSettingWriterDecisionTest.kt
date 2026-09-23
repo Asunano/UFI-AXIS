@@ -20,8 +20,9 @@ import org.junit.Test
  * 「实际会发出去的 body」「走的是哪条传输层方法」「结果怎么收敛」「什么时候换备用命令」。
  * 传输层用 lambda 假发送器注入。
  *
- * **没有覆盖**：`GoformSettingWriter` 与真实 [GoformClient] 之间的装配（构造参数是具体类，
- * 阶段 1 接口化后才能注入假 client），以及 `GoformCodec.buildSetFormBody` 之后的报文。
+ * **没有覆盖**：`GoformSettingWriter` 与真实 [GoformClient] 之间的装配（构造参数已是接口
+ * [GoformTransport]，可以注入假 client，但本轮只做接口化、不新增测试），
+ * 以及 `GoformCodec.buildSetFormBody` 之后的报文。
  *
  * ## 为什么值得有
  *

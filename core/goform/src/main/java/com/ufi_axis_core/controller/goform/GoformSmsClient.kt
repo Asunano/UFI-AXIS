@@ -30,7 +30,7 @@ import java.util.TimeZone
  * 换设备要改 N 处且漏一处不报错。
  */
 class GoformSmsClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile,
 ) {
     private val tag = "GoformSms"
@@ -181,7 +181,7 @@ class GoformSmsClient(
         val params = spec.sendParams(number, message, System.currentTimeMillis(), TimeZone.getDefault())
         // 先记下发送前的最大信箱 id：回读时只认新出现的行，避免把历史同号短信当成本次结果
         val baselineId = maxSmsId()
-        val resp = client.goformPost(params)
+        val resp = client.write(params)
         if (resp == null) {
             // 拿不到设备的表态：会话中途失效 / AD 计算失败 / HTTP 非 200 / 网络异常。
             // 请求**可能已经落到固件里**，所以这里绝不能报可重试 —— 重试就是可能的第二笔话费。
@@ -195,7 +195,7 @@ class GoformSmsClient(
                 "请求未走完 / 响应无法解析 / 超时，无法确认设备是否已发出"
             )
         }
-        if (!client.isGoformSuccess(resp)) {
+        if (!client.isSuccess(resp)) {
             // 设备回了响应、结果是拒绝 —— 它明确说了"没收下"，所以重试不会重复发。
             AppLogger.w(
                 tag,
@@ -260,12 +260,12 @@ class GoformSmsClient(
 
     suspend fun deleteSms(msgId: String): Boolean {
         val spec = specOrNull("deleteSms") ?: return false
-        return client.isGoformSuccess(client.goformPost(spec.deleteParams(listOf(msgId))))
+        return client.isSuccess(client.write(spec.deleteParams(listOf(msgId))))
     }
 
     suspend fun markSmsRead(msgId: String, read: Boolean = true): Boolean {
         val spec = specOrNull("markSmsRead") ?: return false
-        return client.isGoformSuccess(client.goformPost(spec.markReadParams(listOf(msgId), read)))
+        return client.isSuccess(client.write(spec.markReadParams(listOf(msgId), read)))
     }
 
     /** Goform 短信元数据（总数 / 未读），用于替代 ContentResolver 计数 */

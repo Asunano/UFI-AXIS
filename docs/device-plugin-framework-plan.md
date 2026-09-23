@@ -19,7 +19,18 @@
   - `[x]` 已完成（必须同时满足该阶段「验收」全部条目）
   - `[!]` 受阻（后面追一行 `→ 阻塞原因`）
   - `[-]` 已放弃（后面追一行 `→ 放弃理由`）
-- 阶段之间是**硬依赖**：前一阶段没到 `[x]`，不要开下一阶段。唯一例外是阶段 3（能力集）可以与阶段 4 并行。
+- 阶段之间是**硬依赖**：前一阶段没到 `[x]`，不要开下一阶段。**两条例外**：
+  1. 阶段 3 的 **3A（设备侧能力）可以与阶段 4 并行**，**3B（平台侧能力）必须等阶段 4**
+     —— `BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 的取值来自 `PlatformAdapter`。
+     （本行原文是「唯一例外是阶段 3 可以与阶段 4 并行」，§7 已按这条拆开更正，此处同步。）
+  2. **「无真机」例外（2026-09-23 用户裁决）**：前一阶段**只卡在 §14 的第 3/4 层、且原因确实是
+     「没有真机」**（第 1、2 层全绿、该阶段的代码工作已全部落地）时，允许开下一阶段。三条前提：
+     - 该阶段仍标 `[~]` 并写明卡在第几层，**不许标 `[x]`**（§14.6 未变）；
+     - **涉及写操作的 commit 一律不合主线**（§14.3 最后一句原本只是纪律，这里升成「开下一阶段」的前置条件）；
+     - 真机待办留在 §9「阶段 0 收尾盘点」那类清单里，拿到真机后**按原判据**补验；
+       补验不过 → 按 §13.2 的 P0 停手，**先回滚再查**，不许就着已经堆上去的下一阶段改。
+     这条**只对「无真机」生效**：卡在第 1/2 层（编译 / 单测不过），或第 3/4 层**已经验出差异且解释不清**，
+     仍然不许开下一阶段。
 - 每完成一个阶段，在「9. 变更记录」追一行。
 - 本文件里的 `文件:行号` 是撰写时（2026-09-21）的位置，代码动过之后按符号名找，不要盲信行号。
 
@@ -46,6 +57,18 @@
 - **不改对外 HTTP 契约**（`core/contract` 的 `DeviceFields` / `Endpoints` / `ErrorCode` 冻结）。
   唯一新增是一个只读的能力集端点。
 - **不动 app / web 的既有页面结构**，阶段 3 只在已有开关上加「不支持 → 灰掉 + 说明」。
+- **安装器不纳入插件化**（`scripts/UFI-AXIS-Core-install-Android/**`，**2026-09-23 用户裁决**）。
+  那里有一份**独立的第二套 goform 实现**（自己的 `GoformClient` / `GoformGateway` /
+  `GoformWritePolicy` / `GoformCodec` / `GoformWriteResult`，包名 `com.ufi_axis.installer.goform`，
+  另有 `RemoteAdbEngine` 直发 goform），**零 profile 抽象**。裁决是**整份独立维护、不做任何共享** ——
+  不上 SPI、不共用 profile、连「设备文本解码」「写成功判据」这两处也不抽公共实现。
+  - 判据：安装器是**一次性装机流程**，与后台服务不共享组件图、不共享生命周期、不参与归一化与覆盖率诊断；
+    为了「少一份重复」把它拉进 `device-spi` 的依赖，换来的是装机路径被插件选型的失败模式拖累。
+  - **明确接受的后果**：① 接一台新设备时，安装器要**另写一套**，§1 目标里「1~3 个文件」的成本
+    **只对后台服务成立**，不覆盖装机链路；② 解码/判据这类逻辑会长期存在两份甚至三份，
+    **这是刻意的重复，不再当欠账登记**（§15 的 P1-19 据此结案）。
+  - 例外只有一种：安装器与 core **共享持久化键或对外报文格式**时（如 `persist.adb.tcp.port`、
+    配对协议），那属于契约，仍以 `core/contract` 与 API 手册为唯一真源 —— 不许各写一份。
 
 ---
 
@@ -61,7 +84,7 @@
 | 传输契约 `GoformGateway` | `core/goform/.../GoformGateway.kt:27` | 登录 / 查询 / POST / QoS（14 个方法） |
 | AT 通道契约 `AtTransport` | `core/collector/.../at/AtTransport.kt:10` | `probe()` / `sendCommand()` / `reset()` |
 | 归一化引擎 + 覆盖率诊断 | `core/device-schema/.../FieldNormalizer.kt` | `normalize()` / `coverage()` / 脱敏 |
-| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（撰写时 1099 行；2026-09-22 已 1396 行） | 10 个 FieldGroup、`SettingKey` 撰写时 18 个 → **现 28 个**、5 个结构解码器 |
+| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（撰写时 1099 行；**2026-09-23 实测 1623 行**） | 10 个 FieldGroup、`SettingKey` 撰写时 18 个 → **现 29 个**（2026-09-23 实测；批 14/15 新增 `WIFI_BAND` 之前一直写 28）、5 个结构解码器 |
 
 ### 2.2 欠账清单（这就是阶段 0~4 要清的）
 
@@ -200,7 +223,6 @@
 **F. 没有能力集概念**
 
 - 全仓没有 capability / supported 的表达。`NetworkRoutes.kt:186` 那句「AT+ZPREFMOD 在此设备不支持」只是注释。
-- `/api/diagnose` 下发 `device_profile` 四态（configured / default / fallback / disabled，
 - `/api/diagnose` 下发 `device_profile` 四态（configured / default / fallback / disabled，
   `HttpServer.kt:566`，该文件在 **`core/network`**（`core/network/.../core/server/HttpServer.kt`）
   **不是** `core/api`），但不下发能力集，所以 app / web 无法提前灰掉不支持项 ——
@@ -353,7 +375,7 @@ class DeviceRuntime private constructor(
 
 **为什么先做**：只要还有命令绕过 profile，插件化就是假的 —— 换设备时那些命令会**静默发错**。
 这一阶段不引入任何新类型，风险最低，且有 `ZteGoformProfileTest` 兜底
-（撰写时 1325 行；2026-09-22 已 **1883 行 / 117 条 `@Test`**）。
+（撰写时 1325 行；**2026-09-23 实测 2083 行 / 125 条 `@Test`**）。
 
 ### 任务
 
@@ -365,10 +387,12 @@ class DeviceRuntime private constructor(
 > 以及一份**真机验证待办清单** —— 见 §9 末尾新增的「**阶段 0 收尾盘点**」。
 
 - `[x]` 0.1 `SettingKey` 补齐写命令（`core/device-schema/.../DeviceProfile.kt`）
-  → 实测 `SettingKey` 现为 **28 项**（18 原有 + 10 新增；`USB_MODE` 已删、`WIFI_SSID`/`WIFI_PASSPHRASE`
-  最终合并为一个 `WIFI_AP_CONFIG`，理由写在该 key 的 KDoc 里）
+  → **2026-09-23 实测 `SettingKey` 现为 29 项**（18 原有 + 11 新增；`USB_MODE` 已删、`WIFI_SSID`/`WIFI_PASSPHRASE`
+  最终合并为一个 `WIFI_AP_CONFIG`，理由写在该 key 的 KDoc 里）。
+  ⚠ 本文档此前一直写 **28** —— 那是批 14/15 新增 `WIFI_BAND`（§15 的 P1-26）**之前**的数字，
+  P1-26 结案时漏回填到这里。按 28 去核会得出「多了一个孤立 key」的错误结论
 - `[x]` 0.2 `ZteGoformProfile` 为新增 key 登记 `WriteSpec`
-  → 实测 `writeSpecs` 与 `SettingKey` 逐项对齐（28 : 28），无孤立 key
+  → 实测 `writeSpecs` 与 `SettingKey` 逐项对齐（**29 : 29**），无孤立 key
 - `[x]` 0.3 4 个客户端的硬编码调用点改走 `writer.write(Checked)(...)`
   → **11 处**（`36fa526`）+ WiFi 的 3 处 `setAccessPointInfo`（`118ed84`，走 `WIFI_AP_CONFIG`）。
   短信 3 处按 §11.2 走 `smsSpec`、不进 `SettingKey`（归 0.7）。
@@ -480,10 +504,11 @@ class DeviceRuntime private constructor(
   读侧字符集不对称一并修掉（`858a9c9`）。
   **未搬**：① 频段全集 `LTE_ALL_BANDS` / `NR_ALL_BANDS` —— 被 `core/controller` 的
   `NetworkController.kt:122/127` 跨模块引用、`core/contract/Enums.kt:145-146` 还有第三份零引用拷贝，
-  **已裁决推阶段 2**（§15 的 P0-1，按 §3.4 的口径处理）；
-  ② 二维码文件名模板 —— 需要 `DeviceProfile` 上新开一个读侧 API 面，**归阶段 2**（§15 的 P1-5）
+  **已裁决推阶段 2 = 任务 2.9**（§15 的 P0-1，按 §3.4 的口径处理）；
+  ② 二维码文件名模板 —— 需要 `DeviceProfile` 上新开一个读侧 API 面，
+  **归阶段 2 = 任务 2.10**（§15 的 P1-5）
 - `[x]` 0.6 `WriteSpec` 加 `retry: RetryPolicy`，现有 18 项显式标 `RETRY_ON_SESSION_LOSS`
-  → 实测原 18 项全部显式标注；新增 10 项里 `REBOOT` / `SHUTDOWN` / `FACTORY_RESET` /
+  → 实测原 18 项全部显式标注；新增 **11** 项里 `REBOOT` / `SHUTDOWN` / `FACTORY_RESET` /
   `BACKEND_PASSWORD` 为 `NEVER`，其余（含 `MOBILE_DATA.fallback` 独立判定）为 `RETRY_ON_SESSION_LOSS`
 - `[x]` 0.7 短信三项走 `smsSpec()`，**不进** `SettingKey`（见 §11.2）
   → **profile 侧**（`2d92e05`：`SmsSpec` 接口 + `ZteSmsSpec` + `ZteGoformProfile.smsSpec()`）
@@ -493,7 +518,8 @@ class DeviceRuntime private constructor(
   `GoformSmsSendParamsTest` 5 → 1 条（只留 `maskNumber` 那条，脱敏是日志规范不属 profile）。
   读时钟上移到调用点（`System.currentTimeMillis()` / `TimeZone.getDefault()` 在 `sendSms` 里）
 - `[~]` 0.8 补测试：新增 key 的 encode/validate 逐条断言；`SettingKey` 全覆盖断言
-  → 已有：`ZteGoformProfileTest`（**117** 条 `@Test`，批 10 新增 2 条）、`ProfileContractTest`（8）、
+  → 已有：`ZteGoformProfileTest`（**2026-09-23 实测 125 条 `@Test`**；批 10 之后又随 `WIFI_BAND`
+  等新增了若干条，此前写的 117 已过期）、`ProfileContractTest`（8）、
   `ZteSmsSpecTest`（23）、`FieldNormalizerTest`（30）、`ZteGoformRawCaptureTest`（2）、
   `GoformSettingWriterDecisionTest`（20）、`GoformWifiApParamsTest`（19）、
   `GoformWritePolicyTest`（15）、`GoformCommandTableGuardTest`（**9**，批 11 新增 8 条、批 13 转型后 9 条）、
@@ -526,6 +552,9 @@ enum class SettingKey {
                          // 这条设备事实散在两处。理由见该 key 的 KDoc 与 §11.3。
     WIFI_POWER,          // SET_WIFI_POWER，value: Int
     WIFI_ENABLED,        // 开→switchWiFiChip(ChipEnum=chip1,GuestEnable=0)，关→switchWiFiModule(SwitchOption=0)
+    WIFI_BAND,           // 批 14 真机抓包后才拆出来的第 11 项（原方案没有它）：
+                         // switchWiFiChip 不是「开 WiFi」而是「在频段 X 上启用 WiFi」，
+                         // 「切频段」与「开 WiFi」是同一条设备命令。来龙去脉见 §15 的 P1-26
     PPP_DIAL,            // connectNetwork / disconnectNetwork，与 MOBILE_DATA 的区别是**无兜底**
 }
 ```
@@ -725,10 +754,11 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
   **保护的不变量一字未变**）。这两条替身**没有也不可能**发现上面那个 P0 ——
   它们钉的是「命令还发得出去」，而坏掉的是「发回来的值怎么解」，
   所以 `45b86ff` 另补了 `GoformNormalizeAlwaysTest`（9 例，见 §11.13）
-- 真机回归（无真机则标 `[!]`）：重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 /
+- 真机回归（无真机则标 `[!]`）**共 15 条**（条数口径见 §14.4）：重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 /
   **手动拨号与挂断**（`PPP_DIAL`，与「开关移动数据」是不同的 key、不同的失败路径，必须分开点）/
   切连接模式 / 改 SSID / 改密码 / 改功率 / **开关 WiFi**（`WIFI_ENABLED`，开与关走两条不同命令，
-  两个方向都要点）/ 发短信 / 删短信 / 标已读，逐条点一遍
+  两个方向都要点）/ **切 WiFi 频段**（`WIFI_BAND`，批 15 新增，连带要验的三件事见 §9 收尾盘点第 4 项）/
+  发短信 / 删短信 / 标已读，逐条点一遍
 
 
 
@@ -741,16 +771,97 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 
 ## 5. 阶段 1 — 传输层接口化
 
-**为什么**：`GoformSettingWriter.kt:27` 和 6 个客户端吃具体类 `GoformClient`，
+**为什么**：`GoformSettingWriter.kt:45` 与 6 个客户端吃具体类 `GoformClient`，
 这是「第二个协议实现进不来」的直接原因。
+
+### 开工前的实测更正（2026-09-23，必读）
+
+原任务清单假设「1.3 = 把 7 处构造参数的类型换掉」。**实测不成立** ——
+6 个客户端 + writer 用到的 `GoformClient` 成员**比现有 `GoformGateway` 接口多 7 个，且全是 `internal`**：
+
+- `ensureBaseUrlResolved()`（`GoformClient.kt:136`）← `GoformWifiClient:71`
+- `httpGet(url): HttpResponse`（`:183`）← `GoformWifiClient:107`、`GoformSmsClient:122/280`
+- `parseJson(body): JsonObject?`（`:191`）← `GoformSmsClient:131/283`
+- `isAuthFailure(body)`（`:416`）← `GoformSmsClient:130/282`
+- `goformPostIdempotent(params): GoformWriteResult`（`:469`）← `GoformSettingWriter:83`
+- `isGoformSuccess(body)`（`:801`）← `GoformSettingWriter:85`、`GoformSmsClient:198/263/268`
+- `sha256Hex(input)`（`:859`）← `GoformDeviceClient:85/86`
+
+Kotlin 的接口成员**不能标 `internal`**，所以「把这 7 个塞进公开的 `DeviceTransport`」等于
+**把 7 个 module 内部成员一次性提成跨模块公开 API**（还会把 Ktor `HttpResponse` 与
+`GoformWriteResult` 拖进公开契约）。这不是行为变更，但是一次不小的对外面扩大，
+而且跨模块**没有任何人需要它们**。
+
+**2026-09-23 裁决过程（两轮，第一轮被 Kotlin 的可见性规则推翻，两轮都留着）。**
+
+**第一轮（方案 A）**：`DeviceTransport` public 保持 14 个方法不变，
+新增 **`internal interface GoformTransport : DeviceTransport`** 容纳那 7 个成员，客户端与 writer 吃它 ——
+公开面零扩大。**落地时编译不过**，逐字原文 6 条：
+
+```
+e: GoformDeviceClient.kt:26:5 'public' function exposes its 'internal' parameter type 'GoformTransport'.
+（GoformNetworkClient / GoformSignalClient / GoformSimClient / GoformSmsClient / GoformWifiClient 同）
+```
+
+- 挡住方案 A 的**不是**「internal 接口继承 public 接口」（那是合法的，别把结论记错），
+  而是「**public 构造函数的参数类型不能是 internal**」这条检查。
+- 这 6 个客户端必须是 public：`ComponentGraph.NetworkGraph` 与 `RouteContext` 跨模块持有它们，
+  构造点在 `:core` 的 `ComponentFactory.buildNetworkGraph`。所以类、构造函数都不能标 `internal`。
+- `GoformSettingWriter` 是 `internal class`，它**没有**这个问题。
+- 唯一能编过的绕法是 `@Suppress("EXPOSED_PARAMETER_TYPE")`，而编译器对它明确不背书：
+  `This code uses error suppression ... the compiler behavior is UNSPECIFIED and WILL NOT BE PRESERVED`。
+  **这种东西不许留在主线上**（子代理第一版就是这么过的编译，已撤掉）。
+
+**第二轮（方案 B，最终形态，用户裁决）**：
+
+- **`DeviceTransport`（public）** = 现有 `GoformGateway` 的 **14 个方法**按下面的映射改名。
+  跨模块面（`RouteContext.goformClient` / `NetworkDeps` / `ComponentGraph.NetworkGraph`）**一个不多一个不少**。
+- **`GoformTransport`（public，但只许 `core/goform` 内部用）`: DeviceTransport`** = 追加那 7 个成员。
+  6 个客户端与 writer 的构造参数吃**这个**类型。
+- 「不对外」从**语言约束**降级成**纪律**，纪律由守门测试 `GoformTransportVisibilityGuardTest` 钉住：
+  扫 `core` 目录下所有 `.kt`，断言 **`core/goform` 之外零引用 `GoformTransport`**
+  （另有一条反向自检，防止符号改名后上一条变成恒真式空转）。**挡不住编译器的，就挡在 CI 上。**
+- **退出条件**：阶段 2 把这 6 个客户端连同传输层收进插件 module、它们整体变 `internal` 之后，
+  `GoformTransport` 才能真正收窄成 `internal` —— 那时删掉守门测试与它 KDoc 里的这段说明。
+- 命名诚实：那 7 个成员里 `isAuthFailure` / `isSuccess` / `writeIdempotent` / `sha256Hex`
+  **本来就是 goform 协议事实**，所以第二层叫 `GoformTransport` 而不是硬起一个中立名字。
 
 ### 任务
 
-- `[ ]` 1.1 `GoformGateway` → `DeviceTransport`，方法名去 goform 味
-- `[ ]` 1.2 成功判据从 `GoformClient` 移到 `DeviceTransport.isSuccess(body)`
-- `[ ]` 1.3 `GoformSettingWriter` + 6 个客户端的构造参数换成接口
-- `[ ]` 1.4 登录握手（LOGIN_MULTI_USER / LOGIN / LOGOUT / LD / RD / AD 签名）收敛为 transport 内部实现细节
-- `[ ]` 1.5 `ComponentFactory.buildNetworkGraph` 改为「从插件拿 transport」的形状（此时插件还没有，先留一个工厂函数）
+- `[~]` 1.1 `GoformGateway` → `DeviceTransport`（public，14 个方法按映射改名）
+  → **代码已落地**（文件改名 `GoformGateway.kt` → `DeviceTransport.kt`，方法数实测 14）
+- `[~]` 1.2 新增 `interface GoformTransport : DeviceTransport`，把上面 7 个 `internal` 成员
+  提成接口成员（含 `isSuccess`）
+  → **代码已落地**，但**不是原定的 `internal`**：按第二轮裁决改成 public + 守门测试（理由见上一节）
+- `[~]` 1.3 `GoformSettingWriter` + 6 个客户端的构造参数由 `GoformClient` 换成 `GoformTransport`
+  → **代码已落地**（7 处，`core/goform/src/main` 里作为类型标注的 `GoformClient` 实测 0 次）
+- `[x]` 1.4 登录握手（LOGIN_MULTI_USER / LOGIN / LOGOUT / LD / RD / AD 签名）收敛为 transport 内部实现细节
+  → **2026-09-23 核查：代码层面本来就成立，没有一行需要搬**。
+  `ensureSession`（`GoformClient.kt:220`）/ `validateSession`（`:345`）/ `computeAd`（`:753`）/
+  `storeCookie` / `markLoggedOut` / `isReachable` / `AUTH_FAILURE_RESULTS` **全是 `private`**；
+  LD / LOGIN / LOGIN_MULTI_USER / RD 的字面量只出现在这些私有方法体里。
+  接口上只有**会话生命周期动作**（`ensureLogin` / `invalidateSession` / `resetLogin` /
+  `logout` / `updateGoformPassword`）——换协议时这五个动作还在、取值方式全变。
+  本项实际做的是**把这条边界写进 `DeviceTransport` 的 KDoc**（原来没写，下一个人看不出这是刻意的），
+  并写明唯一的刻意例外：`sha256Hex` 上了 `GoformTransport` 那一层，
+  因为改后台密码要与登录握手共用同一份哈希真源（`DeviceProfile.kt` 的 `BACKEND_PASSWORD` 注释）。
+  **无代码行为改动，所以不受第 3/4 层约束，直接标 `[x]`。**
+- `[~]` 1.5 `ComponentFactory.buildNetworkGraph` 改为「从工厂函数拿 transport」的形状
+  → **已落地**：新增 `private fun createTransport(settings, gatewayIp)`，
+  `buildNetworkGraph` 里那 6 行 `GoformClient(...)` 收成一行调用（`val goformIp` 临时变量一并消掉）。
+  ⚠ **返回类型按实测改成具体类 `GoformClient`，不是原方案写的 `DeviceTransport`**：
+  6 个客户端的构造参数是 `GoformTransport`（多 7 个协议成员），用 `DeviceTransport` 接编译不过；
+  而 `ComponentFactory` 在 `:core`，**不许**直接写 `GoformTransport` 这个类型名（守门测试拦）。
+  所以这个文件保持它既有的角色 —— **唯一知道具体实现类型的地方**。
+  阶段 2 换成 `plugin.createTransport()` 时只改这一个函数体。
+- `[~]` 1.6 **删掉 `GoformClientGateway`**（19 行的 `GoformGateway by client` 空壳）。
+  §11.12 定的是「阶段 1 要么用它做委托点、要么删掉」——`GoformClient` 直接实现接口，
+  它就是死代码。**2026-09-23 已 grep 确认全仓零引用**（只有它自己与几处注释提到），按 §13.4 的纪律可以删
+  → **已删除**
+
+> **为什么四个 `[~]` 不是 `[x]`**：第 1、2 层已过（见下面「验收」），
+> **第 3、4 层无真机未验**。按 §0 的例外 2 与 §14.6，这不阻塞继续做 1.4 / 1.5，
+> 但阶段 1 在真机接口快照对比之前不能标 `[x]`，相关 commit 也不合主线。
 
 ### 怎么做
 
@@ -759,11 +870,24 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 - `baseUrl()` → 保留
 - `base64Decode(input)` → `decodeDeviceText(input)`（GBK/UTF-8 兼容是 ZTE 的事实，接口上只说「解码设备文本」）
 - `query(cmds)` / `querySingle(cmd)` / `goformPost(params)` → `read(keys)` / `readOne(key)` / `write(params)`
-- `isGoformSuccess(body)`（现在是 `GoformClient` 的公开方法，**不在接口上**）→ 上接口，名字 `isSuccess(body)`
+- ~~`isGoformSuccess(body)`（现在是 `GoformClient` 的公开方法，**不在接口上**）→ 上接口，名字 `isSuccess(body)`~~
+  → **两处更正（2026-09-23 实测 + 裁决）**：① 它是 **`internal`** 不是公开方法（`GoformClient.kt:801`）；
+  ② 按上面的方案 A，它上的是 **`GoformTransport`（internal 那层）**，不是 public 的 `DeviceTransport`
+  —— 跨模块没人用它，上公开面是白扩大。名字仍叫 `isSuccess(body)`
 - QoS 三个方法（`adjustQoS` / `getQosStatus` / `setQosEnabled`）保留原名，它们是我们自己的概念
 - **`updateGoformPassword(newPwd)` 不改名**：`GoformGateway.kt:48` 已经写明「符号名沿用 `goform*`：
   那是配置键的一部分」。持久化键 `goform_password`（`AppSettings.kt:28`）不能改（改了丢用户配置），
   符号名跟着键名走是刻意的。原方案想把它改成 `updateCredential` —— 撤销该项。
+
+1.2 那 7 个成员的命名（**只有一个改名，其余保留** —— 保留是因为它们表达的动作本身不带协议味，
+改名只会让「这一行原来是哪个方法」变难核对）：
+
+- `goformPostIdempotent(params)` → **`writeIdempotent(params)`**（与 `write` 对齐，返回类型 `GoformWriteResult` 不动）
+- `isGoformSuccess(body)` → **`isSuccess(body)`**
+- `ensureBaseUrlResolved()` / `httpGet(url)` / `parseJson(body)` / `isAuthFailure(body)` / `sha256Hex(input)`
+  → **一律保留原名**。特别是 `sha256Hex` 不许改名也不许在别处复制：
+  `DeviceProfile.kt:333` 与 `GoformDeviceClient.kt:71` 都记了「与登录握手共用同一份真源」这条结论
+
 
 
 1.4 注意：`ensureLogin` / `invalidateSession` / `resetLogin` 的**语义注释必须整段搬过去** ——
@@ -773,22 +897,58 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
 1.5 先加一个临时工厂函数（阶段 2 会被 `DevicePlugin.createTransport` 取代）：
 
 ```kotlin
-// ComponentFactory.kt
-private fun createTransport(settings: AppSettings, gatewayIp: String): DeviceTransport =
+// ComponentFactory.kt —— 2026-09-23 实际落地形态（返回类型按实测改成具体类，理由见任务 1.5）
+private fun createTransport(settings: AppSettings, gatewayIp: String): GoformClient =
     GoformClient(deviceIp = settings.goformIp.ifBlank { gatewayIp },
                  port = settings.goformPort, password = settings.goformPassword)
 ```
 
 ### 验收
 
-- `:core` 全量编译通过（`gradlew :core:assembleBenchmark`）
-- `grep -rn 'GoformClient' core --include=*.kt` 在 `core/goform` 之外只剩 `ComponentFactory.kt` 一处
-- `:core:goform:test` 全绿
-- 行为零变化：这一阶段**不许**改任何请求内容，diff 里不该出现新的 URL / 参数 / 判据
+- 第 1 层：`gradlew :core:goform:compileDebugKotlin` + `:core:api:compileDebugKotlin` +
+  `:core:compileDebugKotlin`（与用户并行改仓库时只编自己动过的 module，见 §14.1）；
+  阶段收尾再 `gradlew :core:assembleBenchmark`
+- 第 2 层：`:core:goform:test` 与 `:core:device-schema:test` 全绿。
+  这一阶段**不许改任何既有测试断言** —— 断言变了就说明不是纯改名。
+  **唯一允许新增的是守门测试**（本轮加了 `GoformTransportVisibilityGuardTest` 2 条，
+  `:core:goform:test` 95 → **97**；它不断言任何设备行为，只钉「`GoformTransport` 不跨模块」这条纪律）
+- **跨模块面零扩大**：`DeviceTransport` 的方法数 **== 14**（与改名前的 `GoformGateway` 逐个对应）；
+  `GoformTransport` 虽然是 public，但 **`core/goform` 之外零引用**，由守门测试钉住
+  （原判据写的是「那 7 个成员只出现在 internal 接口上」，随方案 B 作废）
+- **具体类彻底退出客户端**：`core/goform/src/main` 里 `: GoformClient`（作为类型标注）出现 **0 次**
+  —— 只剩 `GoformClient.kt` 自己的 `class GoformClient` 声明与 `ComponentFactory` 的 `new`
+  - ⚠ **原判据「`grep GoformClient` 在 `core/goform` 之外只剩 `ComponentFactory.kt` 一处」现在就已经成立**
+    （跨模块早在 2026-08-29 走完接口了，见 `GoformGateway.kt:19-21`），所以它验不出任何东西，作废
+- **不许留 `@Suppress("EXPOSED_PARAMETER_TYPE")`**（或任何编译器声明「行为不保证」的抑制）
+- `GoformClientGateway.kt` 已删除，全仓 `grep GoformClientGateway` 只剩 §5 / §11.12 的文档说明
+- 行为零变化：diff 里不该出现新的 URL / 参数 / 判据；`git diff` 里除改名与类型标注外**不应有逻辑行变动**
+- **第 3 / 4 层（真机）**：接口快照按 §14.3 的四条判据比对 §16 基线；写操作按 §14.4 的 15 条点一遍。
+  **与阶段 0 的四项真机待办合并成一次窗口做**（§0 例外 2 的前提：不验完不标 `[x]`、不合主线）
+
+### 实测结论（2026-09-23，1.1 / 1.2 / 1.3 / 1.6 落地后）
+
+- 第 1 层 ✓：`:core:goform:compileDebugKotlin` / `:core:api:compileDebugKotlin` /
+  `:core:compileDebugKotlin` 全通过（未跑全量 `assembleBenchmark` —— 用户正在并行改
+  `core/api` 的媒体与更新相关文件，见 §13.3 最后一条）
+- 第 2 层 ✓：`:core:goform:test` **97/97**（含守门测试 2 条，`skipped=0` —— 逐个 XML 核过，
+  不是 up-to-date 跳过）、`:core:device-schema:test` **188/188**
+- 第 3、4 层 ✗（无真机）
+- **`ComponentFactory.kt` 的那行注释改动没有进本轮 commit**：该文件同时有用户并行改的
+  `FileRoutes` / `MediaExclusionStore` 装配代码，按「只 stage 自己改过的文件」的纪律整文件跳过 ——
+  注释留在工作区，由用户那一轮带走。所以 1.5 做的时候要顺手确认这一行是否还在
 
 ### 影响面
 
-约 9 个文件的签名 + `ComponentFactory` 1 处。不碰 route / app / web。
+- `core/goform`：`GoformGateway.kt`（改名 → `DeviceTransport.kt`）、新增 `GoformTransport`、
+  `GoformClient.kt`（`override` 修饰符 + 7 个成员从 `internal` 变接口实现）、
+  6 个客户端 + `GoformSettingWriter` 的构造参数、删 `GoformClientGateway.kt` —— 约 10 个文件
+- `core/src` `ComponentFactory.kt`：1 处（`createTransport()`）
+- **`core/api` 会碰 2 行**（原文写「不碰 route」，**2026-09-23 实测更正**）：
+  跨模块调用点实测只有 6 处，其中 `DeviceRoutes.kt:168` `goformClient.query(cmds)` →`read`、
+  `:199` `goformClient.goformPost(...)` → `write` 必须跟着改名；
+  另外 4 处是 `updateGoformPassword`（3 处，不改名）与 `BackendService.kt:1134` 的 `close()`（不改名）。
+  这 2 行正是 §11.5 的裸命令端点，**只改方法名，不动语义与守门开关**
+- 不碰 app / web
 
 ---
 
@@ -805,6 +965,20 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): DeviceTra
   避免 `SignalCollector` 等直接 import `ZteGoformProfile` 的地方一次性全改
 - `[ ]` 2.7 守门测试 `PluginContractTest`
 - `[ ]` 2.8 `/api/diagnose` 的 `device_profile` 块补 `plugin_id` 与 `selection`
+- `[ ]` 2.9 **清 `NetworkController` 的设备知识 + 频段全集三份拷贝**（阶段 0 的 0.5 裁决推过来的，§15 的 **P0-1**）
+  → `GoformNetworkClient.kt:29/31` 的 `LTE_ALL_BANDS` / `NR_ALL_BANDS`、
+  `NetworkController.kt:122/127` 的跨模块直读、`core/contract/Enums.kt:145-146` 的第三份零引用拷贝。
+  按 §3.4 判：若收进统一抽象仍要拉跨模块依赖，就允许各插件独立持有一份，**不为「统一」造新耦合**。
+  ⚠ 「空串 = 不发限制」与「空串 = 下发全频段」是两种对外语义，换过来是**行为变更**，不是搬运
+- `[ ]` 2.10 **二维码文件名模板进 profile 读侧 API 面**（0.5 未做的那一半，§15 的 **P1-5**）
+  → `GoformWifiClient.kt:69` 的 `{chip}_ssid{n}_qrcode_wifikey`。
+  阶段 0 没做的理由是「`DeviceProfile` 上没有『文件路径模板』这个 API 面，临时加一个违反
+  『不要自己发明 API』」——阶段 2 本来就要动 SPI 形状，在这里一起定
+- `[ ]` 2.11 **`checkDeviceEvents()` 容忍 `station_list` 的两种形态**（§15 的 **P1-29**，2026-09-23 裁决）
+  → 真数组 / 「数组的 JSON 字符串」都要能解（对外 API 手册已经这么要求客户端了，我们自己没照做），
+  并把现在那个静默 catch 改成至少打一行 WARN。
+  **不许**改成往 `NORMALIZE_ALWAYS` 里加 WIFI_CLIENTS —— 那是 §11.13 第 3 节明令禁止的方向，
+  `GoformNormalizeAlwaysTest` 会拦下来
 
 ### 怎么做
 
@@ -845,6 +1019,13 @@ contract  ←  device-schema  ←  device-spi  ←  device-plugins  ←  core（
 - `grep -rn 'ZteGoformProfile\|DeviceProfiles' core --include=*.kt` 只出现在
   `core/device-plugins` 与 `core/device-schema`（过渡期允许 `SignalCollector` 一处，记在这里）
 - `PluginContractTest` 全绿
+- **2.9**：`core/contract/Enums.kt:145-146` 的零引用拷贝已删，`NetworkController` 不再直读
+  `GoformNetworkClient` 的常量；`unlockAllBands` / `lockBands` 的**对外语义未变**
+  （空串仍是「不发限制」，除非另有裁决）—— 这条按 §14.4 的「值域拒绝」与真机频段锁回归各点一遍
+- **2.10**：`GoformWifiClient` 里不再出现 `_qrcode_wifikey` 字面量，扫码直连在真机上仍能连上
+- **2.11**：`device_events_enabled` 打开、`field_normalization_enabled` **设成 false** 并重启后台服务，
+  接入 / 断开一台 WiFi 设备仍能产生事件；若仍解不出来，日志里**必须有一行 WARN**（不许静默）。
+  验完把两个开关都改回原值并再重启一次（排查性改动要还原）
 - `GET /api/diagnose` 返回里能看到 `plugin_id=zte-f50` 与 `selection=default`
 - 真机冒烟：启动后台服务，仪表盘 / 网络 / WiFi / 短信四个页面数据与改造前一致
 
@@ -1043,6 +1224,97 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   （用户在并行改 `app/**` / `web/**`，见 §13.3 最后一条）；`45b86ff` 的
   「`:core:goform:test` 86 → 95 全绿、守门测试仍 9 例」沿用该 commit 的自报结果，
   本轮只核了 `@Test` 计数与代码逻辑。
+- 2026-09-23 **批 17 同步（纯文档复审轮，只修「过期数字 / 重复段落 / 清单条数不一致 / 裁决没落成任务」四类）**：
+  - **`SettingKey` 28 → 29**（§2.1 表、§4 的 0.1 / 0.2 / 0.6、§9 收尾盘点表）。
+    根因是 §15 的 **P1-26 结案时只改了 P1-26 自己，没回填计数处** ——
+    批 14/15 新增的 `WIFI_BAND` 一直没进这几个数字。29 : 29 逐项对齐**已按 2026-09-23 实测核过**，
+    并在 §4 的 0.1 代码块里把 `WIFI_BAND` 补成第 11 个新增 key（原方案没有它）。
+    按 28 去核 0.2 的验收判据会得出「多了一个孤立 key」的错误结论，所以这条不是排版问题。
+  - **`ZteGoformProfile` 1396 → 1623 行**、**`ZteGoformProfileTest` 1883 行 / 117 条 → 2083 行 / 125 条**
+    （§2.1 表、§4 开头、§4 的 0.8）。同轮复核 `:core:goform:test` 合计 **95** 与
+    `:core:device-schema:test` 其余四个文件的条数（8 / 23 / 30 / 2）**均与文档一致，未改**。
+  - **§2.2 F 类删掉一行重复**（`/api/diagnose` 四态那句原本连写了两遍）。
+  - **真机写操作清单条数统一为 15 条**，并把**唯一真源定在 §14.4**：
+    §12 的「12 条」、§13.4 的「12 条」、§14.4 的「14 条」三处改齐，
+    §4 验收那条补上批 15 新增的「切 WiFi 频段」并标明总数（此前它只列了 14 项、与 §9 收尾盘点第 4 项对不上）。
+  - **阶段 2 任务清单新增 2.9 / 2.10**：把 0.5 裁决推过来的 **P0-1**（频段全集三份拷贝 +
+    `NetworkController` 跨模块直读）与 **P1-5**（二维码文件名模板需要新的读侧 API 面）落成正式任务，
+    并在 §4 的 0.5、§15 的 P0-1 / P1-5 三处加上双向指引。此前这两项只有裁决、任务清单里没有条目，
+    按 2.1~2.8 执行阶段 2 会整条漏掉。
+  本轮**不改任何代码**、**没有重跑 Gradle**；所有数字均为 2026-09-23 对当日代码的实测（grep / 逐文件计数）。
+  **未处理**（等裁决，不在本轮授权范围）：安装器 `scripts/UFI-AXIS-Core-install-Android/` 那份
+  **第二套 goform 实现**（独立 `GoformClient` / `GoformGateway` / `GoformWritePolicy` / `GoformCodec`，
+  零 profile 抽象，`RemoteAdbEngine` 也直发 goform）既不在 §1 非目标里、也没有阶段归属 ——
+  §15 只用 P1-19 登记了「解码器有第三份」，覆盖不住整个客户端；
+  以及 §0「前一阶段没到 `[x]` 不开下一阶段」与「阶段 0 卡点全是无真机」之间的死锁口径；
+  以及 §11.13 末尾 `checkDeviceEvents()` / `station_list` 那条**无编号、无阶段归属**的隐患。
+- 2026-09-23 **批 18 同步（三项口径裁决落地，纯文档）**：批 17 末尾列的三项「未处理」全部有了裁决，逐条写进正文：
+  - **安装器不纳入插件化**（裁决：**整份独立维护、不做任何共享**）→ §1 非目标新增一条，
+    写明判据（一次性装机流程、不共享组件图/生命周期）与**明确接受的后果**
+    （接新设备时安装器要另写一套，§1 目标的「1~3 个文件」只对后台服务成立；
+    解码/判据长期两三份是**刻意重复**）。唯一例外：共享持久化键与对外报文格式仍以 `core/contract`
+    与 API 手册为唯一真源。据此 **§15 的 P1-19 结案**（不同步、不合并、不再跟踪），
+    并给 **P1-18** 补一句「两份都在主仓 core 内，与 P1-19 无关，仍是欠账」以防两条被混成一件。
+  - **「无真机」死锁开例外** → §0 的纪律从「唯一例外是阶段 3 与阶段 4 并行」改成**两条例外**：
+    ① 顺手更正了那句与 §7 冲突的旧话（正确口径是 **3A 可并行、3B 必须等阶段 4**）；
+    ② 新增「无真机」例外 —— 只卡第 3/4 层且第 1、2 层全绿时允许开下一阶段，
+    前提是**该阶段保持 `[~]`、写操作 commit 不合主线、真机待办一条不销**，补验不过按 P0 回滚。
+    §14.6 与 §9 收尾盘点的结语同步写上这条，并明确**阶段 1 现在可以开始**。
+  - **§11.13 那条尾注登记为 P1-29，归阶段 2** → §15 新增「批 18 新登记（P1-29）」一节
+    （事实 / 为什么不走 `NORMALIZE_ALWAYS` / 修法 / 为什么不许在阶段 0/1 顺手改），
+    §6 任务清单新增 **2.11** 与对应验收条目，§11.13 的尾注改成指向 P1-29。
+  本轮**不改任何代码**、**没有重跑 Gradle**。
+  **下一步**：开阶段 1（传输层接口化，§5 的 1.1~1.5）。
+- 2026-09-23 **批 19：阶段 1 的 1.1 / 1.2 / 1.3 / 1.6 落地**（子代理实现 + 我复核与收口，未 push）：
+  - **开工前先改了 §5**：实测发现 1.3 不是「换 7 处类型」那么简单 ——
+    6 个客户端与 writer 用到的 `GoformClient` 成员比 `GoformGateway` **多 7 个且全是 `internal`**
+    （`ensureBaseUrlResolved` / `httpGet` / `parseJson` / `isAuthFailure` /
+    `goformPostIdempotent` / `isGoformSuccess` / `sha256Hex`）。§5 补了这份清单、两层接口的形状、
+    7 个成员的命名（只有 `writeIdempotent` 与 `isSuccess` 改名）、以及新的验收判据
+    （原判据「`GoformClient` 在 `core/goform` 之外只剩一处」**现在就已成立**，验不出东西，作废）。
+  - **方案 A 落地时被 Kotlin 推翻**：`internal interface` + public 客户端构造函数 →
+    `'public' function exposes its 'internal' parameter type`（6 条）。子代理第一版用
+    `@Suppress("EXPOSED_PARAMETER_TYPE")` 压掉，而编译器明确声明该抑制**行为不保证**，
+    我把它全部撤掉并升级为裁决项。**用户裁决方案 B**：`GoformTransport` 改 public，
+    「不对外」由新增守门测试 `GoformTransportVisibilityGuardTest`（2 条）钉住 ——
+    扫 `core` 下所有 `.kt`，断言 `core/goform` 之外零引用，外加一条反向自检防恒真式空转。
+    退出条件写进了它的 KDoc（阶段 2 客户端整体 `internal` 后收窄并删掉守门测试）。
+  - 代码：`GoformGateway.kt` → `DeviceTransport.kt`（14 个方法，`query`/`querySingle`/`goformPost`/
+    `base64Decode` → `read`/`readOne`/`write`/`decodeDeviceText`）、新增 `GoformTransport.kt`、
+    7 处构造参数换接口、删掉零引用空壳 `GoformClientGateway.kt`、
+    跨模块 6 处跟着改名（`RouteContext` 2 处类型 + `ComponentGraph` 1 处 + `DeviceRoutes` 的
+    裸命令端点 2 行 —— 只改方法名，守门开关与语义未动）。
+    `invalidateSession` 那段「不递增退避计数」的坑注释整段保留。
+  - 校验：第 1 层 ✓（三个 module 编译）、第 2 层 ✓（`:core:goform:test` 95 → **97/97**、
+    `:core:device-schema:test` **188/188**，逐个 XML 核过 `skipped=0`）、第 3/4 层 ✗（无真机）。
+    所以 1.1/1.2/1.3/1.6 标 `[~]` 不是 `[x]`；按 §0 例外 2 继续做 1.4 / 1.5。
+  - **`ComponentFactory.kt` 未纳入 commit**：它同时有用户并行改的媒体/文件装配代码，
+    按「只 stage 自己改过的文件」整文件跳过（本轮只该文件有一行注释改动，留在工作区）。
+  - 登记给后续：`base64Encode` 现在是事实上的死代码（只有注释引用）；
+    `GoformClient` 里 `decodeDeviceText` 出现了「实例方法(String) + companion(ByteArray)」同名重载
+    （合法重载、行为零变化，已在 KDoc 消歧）；一批注释里仍写着旧符号名（不影响编译）。
+    这三项都不在阶段 1 的范围里，谁要动谁单独一轮。
+- 2026-09-23 **批 20：阶段 1 的 1.4 / 1.5 收尾**（我自己改，未 push）：
+  - **1.4 核查结论是「本来就成立」** —— 握手全链（`ensureSession` / `validateSession` / `computeAd` /
+    `storeCookie` / `markLoggedOut` / `AUTH_FAILURE_RESULTS`）**全是 `private`**，
+    LD / LOGIN / LOGIN_MULTI_USER / RD 的字面量只在私有方法体里；接口上只有会话生命周期动作。
+    所以本项**没搬一行代码**，只把这条边界与唯一例外（`sha256Hex` 与登录握手共用哈希真源）
+    写进 `DeviceTransport` 的 KDoc。无行为改动 → 标 `[x]`。
+  - **复核抓到一处过期描述**（批 19 留下的）：`DeviceTransport` 的 KDoc 还写着
+    「goform 协议成员在 `GoformTransport`（**internal 那一层**）」—— 方案 B 之后它已是 public，
+    这句话变成错的。已改成「靠纪律 + 守门测试维持，不是靠语言约束」。
+  - **1.5 落地**：`ComponentFactory` 新增 `private fun createTransport(settings, gatewayIp)`，
+    `buildNetworkGraph` 里 6 行构造收成一行。**返回类型按实测改成具体类 `GoformClient`**
+    （原方案写 `DeviceTransport`，但客户端要的是 `GoformTransport`，用前者接编译不过；
+    而本文件又不许写 `GoformTransport` —— 守门测试拦着）。理由整段写进了该函数的 KDoc。
+  - 校验：第 1 层 ✓（`:core:goform` / `:core` 编译）、第 2 层 ✓（`:core:goform:test` 97/97，
+    守门测试仍绿 —— 反证了 `ComponentFactory` 没有引用 `GoformTransport`）、第 3/4 层 ✗（无真机）。
+  - ⚠ **1.5 的代码改动留在工作区、没有进 commit**：`ComponentFactory.kt` 同时有用户并行改的
+    媒体 / 文件装配代码（`FileRoutes` 新参数、`MediaExclusionStore`），整文件 add 就等于替他提交
+    半成品。本轮 commit 只含 `DeviceTransport.kt` 的 KDoc 与本文档。
+    **`createTransport()` 那段在用户那批改动落地后再补一个 commit**（或由他一起带走）。
+  - **阶段 1 的代码工作到此全部落地**，整阶段仍是 `[~]`：1.1/1.2/1.3/1.5/1.6 卡第 3/4 层（无真机），
+    与阶段 0 的四项真机待办**合并成一次窗口**做。下一步按 §0 例外 2 可以开阶段 2。
 
 
 ### 执行记录
@@ -1340,12 +1612,12 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
 
 | 子项 | 状态 | commit | 备注 |
 | --- | --- | --- | --- |
-| 0.1 `SettingKey` 补齐写命令 | `[x]` | 批 1 / 批 1b（`36fa526` 之前的登记轮） | 最终 **28 项**（`USB_MODE` 已删，SSID/口令合并为 `WIFI_AP_CONFIG`） |
-| 0.2 新增 key 登记 `WriteSpec` | `[x]` | 同上 | `writeSpecs` 与 `SettingKey` 逐项对齐 28 : 28，无孤立 key |
+| 0.1 `SettingKey` 补齐写命令 | `[x]` | 批 1 / 批 1b（`36fa526` 之前的登记轮）+ 批 14/15（`WIFI_BAND`） | 最终 **29 项**（2026-09-23 实测；`USB_MODE` 已删，SSID/口令合并为 `WIFI_AP_CONFIG`，`WIFI_BAND` 由 P1-26 新增） |
+| 0.2 新增 key 登记 `WriteSpec` | `[x]` | 同上 | `writeSpecs` 与 `SettingKey` 逐项对齐 **29 : 29**，无孤立 key |
 | 0.3 写调用点改走 writer | `[x]` | `36fa526`（11 处）+ `118ed84`（WiFi 3 处） | `core/goform/src/main` 里 `"goformId" to` 只剩 `LOGOUT` 1 处（归阶段 1）；另有 2 处字符串形态的登录命令该 pattern 抓不到 |
 | 0.4a mapper 双 profile + 守门测试 | `[x]` | `9fa0473` | 纯结构准备、**零行为变化**；守门测试当轮 8 条 |
 | 0.4b 命令表真正切过去 + 删 fallback | **`[~]`** | `680fbae` | 第1、2 层 ✓；**第 3 层未验（无真机）** → 解锁条件见 §4 的 0.4b |
-| 0.5 设备值域搬进 profile | `[~]` | `090fcad` + `118ed84` + `858a9c9` | WiFi 固定枚举与 base64 方向已搬；**频段全集（P0-1）与二维码文件名模板（P1-5）已裁决推阶段 2** |
+| 0.5 设备值域搬进 profile | `[~]` | `090fcad` + `118ed84` + `858a9c9` | WiFi 固定枚举与 base64 方向已搬；**频段全集（P0-1）与二维码文件名模板（P1-5）已裁决推阶段 2，对应任务 2.9 / 2.10** |
 | 0.6 `WriteSpec.retry` | `[x]` | 批 1 | 原 18 项显式标 `RETRY_ON_SESSION_LOSS`；4 项破坏性动作为 `NEVER` |
 | 0.7 短信走 `smsSpec()` | `[x]` | `2d92e05`（立契约）+ 客户端接线 | 六处走 spec，goform 侧旧实现已删；短信**不进** `SettingKey`（§11.2） |
 | 0.8 补测试 | `[~]` | 跨多轮 | 单测已全面（见 §4 的 0.8 清单，守门测试现 **9** 条）；差**装配层**（等阶段 1 接口化）与**真机**那一半 |
@@ -1424,6 +1696,12 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
 > 这一阶段的全部目标恰恰是**行为不变**，而「行为」只在真机上存在。
 > 另外按 §14.3 最后一句：**阶段 0 的写操作在没有真机验证的情况下不允许合进主线**
 > —— 现在这些 commit 都只在本地，没有推送（也符合「未经指令不得自动推送」的口径）。
+>
+> **但阶段 1 可以开始（2026-09-23 用户裁决，口径见 §0 的例外 2 与 §14.6）**：
+> 阶段 0 卡的是「没有真机」这个物理条件，不是代码问题（第 1、2 层全绿）。
+> 所以阶段 0 保持 `[~]`、上面四项真机待办**一条不销**、写操作 commit 继续留本地不合主线，
+> 同时开阶段 1。等真机窗口到了，按原判据一次补验阶段 0 的四项；
+> 补验不过就按 §13.2 的 P0 停手回滚 —— **不许因为阶段 1 已经堆在上面而将就**。
 
 
 
@@ -1813,7 +2091,8 @@ IDENTITY / LAN_SETTINGS / DEVICE_SETTINGS / BAND_STATUS，加上 SIGNAL（它本
   它没在实机验证里暴露，因为 `device_events_enabled` 默认关着。
   **不按本条处理**：WIFI_CLIENTS 是透传出口（键名就是设备原名），加进 `NORMALIZE_ALWAYS`
   正是第 3 节禁止的事；真要修就是让消费端容忍两种形态（API 手册已经这么要求客户端了）。
-  登记在这里，动 scheduler 时再定。
+  → **已登记为 §15 的 P1-29，归阶段 2（任务 2.11）**（2026-09-23 裁决）。
+  这里不再留无编号尾注 —— 无编号的观察在待办池里搜不到，是最容易丢的一类。
 
 ---
 
@@ -1821,7 +2100,8 @@ IDENTITY / LAN_SETTINGS / DEVICE_SETTINGS / BAND_STATUS，加上 SIGNAL（它本
 
 每个阶段都要能独立回滚，且回滚不依赖「记得改回某个配置」：
 
-- **阶段 0**：纯搬运，`git revert` 即可。风险点是真机行为，所以验收里的 12 条手工回归是硬要求。
+- **阶段 0**：纯搬运，`git revert` 即可。风险点是真机行为，所以验收里的 **15 条**手工回归是硬要求
+  （条数以 §14.4 为准；本文档此前写的 12 / 13 / 14 都是旧数字）。
 - **阶段 1**：只改签名与改名，`git revert`。若已进入阶段 2 才发现问题，先 revert 阶段 2。
 - **阶段 2**：新增两个 module。回滚 = revert + 从 `settings.gradle.kts` 去掉 include。
   `DeviceProfiles` 保持可用（见 2.6），所以阶段 2 回滚后老路径立刻恢复。
@@ -1911,7 +2191,7 @@ IDENTITY / LAN_SETTINGS / DEVICE_SETTINGS / BAND_STATUS，加上 SIGNAL（它本
 下面这些动作在**做之前**就要先写一条验证方案，不要做完再想怎么验：
 
 - 改动任何**写路径**（19 个调用点、`GoformSettingWriter`、`WriteSpec.retry`）
-  → 先按 §14.4 把真机 12 条写操作清单列出来，一条一条点，改前改后各点一遍
+  → 先按 §14.4 把真机 **15 条**写操作清单列出来，一条一条点，改前改后各点一遍
 - 改动**登录 / 签名 / 会话**（阶段 1.4）
   → 先确认 `ensureLogin` / `invalidateSession` / `resetLogin` 三段语义注释整段搬过去了（§5 1.4），
   再验「连续 30 分钟轮询不掉线」（退避计数被误递增的症状是长会话后前端全被拦）
@@ -1955,7 +2235,7 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 这两个套件就是本次改造的**语义基线**，尤其：
 
-- `ZteGoformProfileTest`（撰写时 1325 行；2026-09-22 已 **1883 行 / 117 条 `@Test`**）冻结了
+- `ZteGoformProfileTest`（撰写时 1325 行；**2026-09-23 实测 2083 行 / 125 条 `@Test`**）冻结了
   F50 每个分组的字段名、别名回退顺序、
   结构解码器行为、以及全部写入项的 encode + validate。**阶段 0 搬命令表时它必须全绿** ——
   搬运不该改变任何映射结果。
@@ -2037,8 +2317,9 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 
 ### 14.4 第 4 层：真机手工回归
 
-写操作没有自动化替代品。阶段 0 的清单（**14 条**，见 §4 验收最后一条；
-**2026-09-22 批 13 逐项数过 —— 原文写「12 条」与另一处口述的「13 条」都不对**）
+写操作没有自动化替代品。阶段 0 的清单（**15 条 —— 本文档的唯一真源就是这里**，
+明细见 §4 验收最后一条与 §9 收尾盘点第 4 项；
+**批 13 逐项数过是 14 条，批 15 新增「切 WiFi 频段」后为 15 条；此前写过的 12 / 13 都不对**）
 每条要做三次观察：
 
 1. 点之前：记下当前状态（从 app 或 `/api/diagnose` 读）
@@ -2072,6 +2353,11 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 ```
 
 **四层里有任何一层没过就不能把阶段标 `[x]`**，标 `[~]` 并写明卡在哪一层。
+
+**但「不能标 `[x]`」不等于「不能往下做」**（2026-09-23 用户裁决，完整口径见 §0 的例外 2）：
+只卡在第 3/4 层、且原因是**没有真机**时，允许开下一阶段 —— 代价是该阶段一直挂 `[~]`、
+**写操作相关 commit 不合主线**、真机待办按原判据补验。
+反过来说，第 1/2 层不过，或第 3/4 层**已验出差异且解释不清**，就是 §13.2 的 P0：停手，不许往下做。
 
 ---
 
@@ -2142,7 +2428,7 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   `NetworkController` 的两处改成不传值。但那会把「空串 = 解锁」从「不发限制」变成
   「下发全频段」**在 profile 内部**生效，`lockBands` 里「未选 LTE → 空串清空该 RAT 限制」
   （`:124` 注释）这条语义会跟着变 —— 那是行为变更，不是搬运。
-- 归属：**已裁决 → 阶段 2**（原有两个选项里取（b））。阶段 0 不擅自改 `core/controller`。
+- 归属：**已裁决 → 阶段 2，已落成任务 2.9**（原有两个选项里取（b））。阶段 0 不擅自改 `core/controller`。
   裁决理由：「空串 = 不发限制」改成「空串 = encode 里下发全频段」是**对外语义变更**，
   不是搬运；而常量被 `core/controller` 直读，在阶段 0 改它等于把阶段 0 的影响面扩到 controller 层
   （§4「影响面」写的是不碰 controller）。`Enums.kt` 那份零引用拷贝一并留到阶段 2 处理 ——
@@ -2289,8 +2575,8 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 - 事实：`DeviceProfile` 现在**没有**任何「文件端点 / 路径模板」的契约面 ——
   `readSpecs` / `cmdsFor` / `writeSpec` / `structuralDecoder` 都表达不了它。
 - 归属：需要新增 SPI 面（形如 `fun qrCodeFileNames(chip, index): List<String>` 或更通用的
-  「文件资源」契约），按 §13.4「不要自己发明 API」的纪律，**等裁决**；建议归阶段 2
-  与插件聚合根一起设计，不在阶段 0 临时加一个方法。
+  「文件资源」契约），按 §13.4「不要自己发明 API」的纪律，**等裁决**；
+  **已落成阶段 2 的任务 2.10**，与插件聚合根一起设计，不在阶段 0 临时加一个方法。
 
 #### 批 4~8 顺带查清、刻意不在阶段 0 修的（P1-6 ~ P1-19）
 
@@ -2433,7 +2719,8 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   **都没有证据**，别把猜测写进代码注释。
 - 建议归属：第二台设备接入时考证（同型号不同固件先对比一次）。在那之前照抄。
 
-**P1-18 两份设备文本解码器判据已一致，但仍是两份实现**
+**P1-18 两份设备文本解码器判据已一致，但仍是两份实现**（**两份都在主仓 `core` 内，与 P1-19 无关** ——
+P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍是欠账）
 
 - 事实：`GoformClient.decodeDeviceText`（`:944-948`）与
   `ZteGoformProfile.WIFI_PASSWORD_DECODER`（`:127` → `utf8OrGbk`，`:140` 起）
@@ -2444,7 +2731,12 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   合并的落点应该是 device-schema（纯 JVM，客户端可以依赖过去），但**不要在 P1-6 之前合** ——
   否则会把两种失败语义强行并成一种。
 
-**P1-19 安装器仓有一份同样的解码实现（只登记，本轮不改）**
+**P1-19 安装器仓有一份同样的解码实现** —— **2026-09-23 结案：按裁决不合并，这份重复是刻意的**
+
+> **裁决（用户，2026-09-23）**：安装器**整份独立维护、不做任何共享**（口径写进 §1 非目标）。
+> 所以本条**不是欠账**，不再等「用户那一轮改完后同步判据」—— 主仓改解码判据时**不需要**同步安装器，
+> 安装器改了也不需要回主仓。下面的事实保留，作为「那边现在是什么形态」的记录，不作为待办。
+> ⚠ 唯一例外见 §1 非目标最后一条：共享持久化键 / 对外报文格式仍以 contract 与 API 手册为真源。
 
 - 事实：`scripts/UFI-AXIS-Core-install-Android/goform/src/main/java/com/ufi_axis/installer/goform/GoformClient.kt:614-627`
   的 `base64Decode` 是 **`858a9c9` 之前**的形态：无条件 `String(bytes, GBK)`，
@@ -2454,8 +2746,10 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   只是读侧实现停留在旧版；非 ASCII 的设备文本会被 GBK 解错。
 - 事实：那份代码**仍在维护** —— 本次改造期间用户正在并行修改整个
   `scripts/UFI-AXIS-Core-install-Android/**`（含这个文件），所以不能按「废弃代码」处理。
-- 建议归属：**本轮只登记，不许动**（那是另一个仓的范围，且有人正在改）。
-  等用户那一轮改完后单独确认：要不要把主仓 `decodeDeviceText` 的判据同步过去。
+- ~~建议归属：**本轮只登记，不许动**（那是另一个仓的范围，且有人正在改）。
+  等用户那一轮改完后单独确认：要不要把主仓 `decodeDeviceText` 的判据同步过去。~~
+  → **已作废（2026-09-23 裁决）**：不同步、不合并、不再跟踪。那边的形态由安装器自己负责；
+  真要改也只是安装器自己的 bug 修复，与本计划无依赖关系。
 
 #### 批 10/11 顺带查清、刻意不在 0.4a 修的（P1-20 ~ P2-2）
 
@@ -2728,6 +3022,27 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
      起止判断错了会把正确的行也掰反，比现在更糟；
   ③ 删掉那段时间的小时行 —— 与「宁可少一段，不能凭空多一段」的既有取舍一致，最不容易做错。
 - 归属：**不属于阶段 0~5 的任何一步**，是一次性的数据处置。裁决前不要顺手写迁移脚本。
+
+#### 批 18 新登记（P1-29）
+
+**P1-29 关掉归一化时「设备接入 / 离开」事件静默停摆（`checkDeviceEvents()` 直读 `station_list`）**
+—— **2026-09-23 裁决：登记并归阶段 2（任务 2.11），按「消费端容忍两种形态」修，不进 `NORMALIZE_ALWAYS`**
+
+- 事实：`DataScheduler.checkDeviceEvents()` 直接取 `json["station_list"]?.jsonArray`，
+  而把设备那种「数组的 JSON 字符串」双重编码拉平成真数组的是 WIFI_CLIENTS 的 `structuralDecoder`
+  （`normalizeStationLists`）。`field_normalization_enabled=false` 时这一步没了，
+  那行取值会抛 → 被 catch 吞掉 → 基线清空，**设备接入/离开事件不报也不报错**。
+- 事实：它**没有**在 2026-09-22 的实机验证里暴露，因为 `device_events_enabled` 默认是关的。
+  所以这条是「读代码读出来的」，不是「实测出来的」—— 真机上还没验过它到底抛在哪一行。
+- 为什么**不**按 §11.13 的豁免处理：WIFI_CLIENTS 是**透传出口**（canonical 名就是设备原名），
+  往 `NORMALIZE_ALWAYS` 里加它正是 §11.13 第 3 节禁止的事 ——
+  每加一组，排障开关就少一块可观察面。`GoformNormalizeAlwaysTest`
+  「豁免没有扩散到其它组」那条会直接拦下这种改法（它断言除 TRAFFIC_LIMIT 外每组 `assertSame(入参, 出参)`）。
+- 修法（归阶段 2 任务 2.11）：让**消费端容忍两种形态** —— `station_list` 可能是真数组、
+  也可能是「数组的 JSON 字符串」。API 手册对外部客户端已经是这个要求，我们自己的 scheduler 没照做。
+  顺带把那个 catch 改成**至少打一行 WARN**：现在它把解析失败和「没有接入设备」压成了同一种表现。
+- 归属：阶段 2（任务 2.11）。**不要在阶段 0/1 顺手改** —— 它改的是 scheduler 的行为，
+  不属于「搬命令表」与「换签名」这两件行为不变的事（§13.1 第 2 条）。
 
 
 

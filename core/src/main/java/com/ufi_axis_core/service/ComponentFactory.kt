@@ -1,5 +1,5 @@
 // 防腐层（F9）：本文件是**唯一**知道 GoformClient 具体类型的地方——它负责 new 出实现；
-// 组件图对外只暴露 GoformGateway 接口（见 ComponentGraph.NetworkGraph.goformClient）。
+// 组件图对外只暴露 DeviceTransport 接口（见 ComponentGraph.NetworkGraph.goformClient）。
 package com.ufi_axis_core.service
 
 import android.content.Context
@@ -537,7 +537,10 @@ object ComponentFactory {
         val shellRoutes = ShellRoutes(consoleRecorder)
         val fileProviderRegistry = com.ufi_axis_core.api.files.FileProviderRegistry()
         fileProviderRegistry.register(com.ufi_axis_core.api.files.LocalFileProvider())
-        val fileRoutes = FileRoutes(fileProviderRegistry)
+        // context / responseCache 是给 POST /api/files/delete 用的：走 MediaStore 删除才能
+        // 把媒体索引一起清掉（File.delete 会留下指向不存在文件的僵尸条目），
+        // 删完再失效 media:* 缓存，客户端刷出来才是新的
+        val fileRoutes = FileRoutes(fileProviderRegistry, context, responseCache)
         // 远程存储源（阶段 2-4）：FTP / WebDAV 配置存在 settings 的 storage_sources 键上，
         // 启动时把已启用的源注册进 registry —— FileRoutes 的 `remote:<id>/...` 路径解析靠它。
         // 建连失败不阻塞启动：initializeProviders 内部按源吞异常并记 WARN。
@@ -549,7 +552,17 @@ object ComponentFactory {
         // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
         // 播放仍走 fileRoutes 的 /api/files/stream，这里不碰字节流。
         // responseCache 只给 /media/groups 用（整表聚合，客户端会来回切三个分组视图）。
-        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(context, settings, responseCache)
+        // 「从音乐库移除」的排除名单（2026-09-23）：单文件级，扫描目录管不了单首。
+        // 它被 MediaRoutes.listSelection 用来在 SQL 里排掉那些路径 ——
+        // 所以必须先建它再建 mediaRoutes。名单变更走 data_changed，
+        // 否则在一端移除、另一端要退页面才看得见。
+        val mediaExclusions = com.ufi_axis_core.api.media.MediaExclusionStore(context)
+        mediaExclusions.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
+        }
+        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(
+            context, settings, responseCache, mediaExclusions
+        )
         // 音频歌单（2026-09-21）：歌单本身存 prefs（曲目只记路径），曲目回查复用 mediaRoutes
         // 的 MediaStore 查询（它实现了 AudioItemLookup）——「路径 → 曲目」只在 core 存在一份，
         // app 与 web 都不必自己拼。集合变更走 data_changed，否则一端加歌另一端要退页面才看得见。
@@ -739,6 +752,27 @@ object ComponentFactory {
         )
     }
 
+    /**
+     * 造设备传输层实现（阶段 1.5）。
+     *
+     * 目的只有一个：把「new 哪个协议实现」收到**一处**。阶段 2 这里会被
+     * `DevicePlugin.createTransport(cfg)` 取代，届时只改这个函数体，[buildNetworkGraph]
+     * 的装配代码一行都不用动。
+     *
+     * ⚠ 返回类型是**具体类** [GoformClient]，不是 `DeviceTransport`（计划书 §5 的 1.5 原本写的是后者，
+     * 落地时按实测改了）：6 个 goform 客户端的构造参数是 `GoformTransport`（`core/goform` 内部那一层，
+     * 比 `DeviceTransport` 多 7 个协议成员），用 `DeviceTransport` 接会编译不过；
+     * 而本文件**不许**直接写 `GoformTransport` 这个类型名 —— 那是 `core/goform` 的内部契约，
+     * 由 `GoformTransportVisibilityGuardTest` 守着「`core/goform` 之外零引用」。
+     * 所以这里保持本文件既有的角色：**唯一知道具体实现类型的地方**（见文件头的 F9 注释）。
+     */
+    private fun createTransport(settings: AppSettings, gatewayIp: String): GoformClient =
+        GoformClient(
+            deviceIp = settings.goformIp.ifBlank { gatewayIp },
+            port = settings.goformPort,
+            password = settings.goformPassword
+        )
+
     /** 网络子图：Goform 客户端层 + NetworkController（原步骤 4-5）。
      * 注意：SystemController 依赖 deviceClient，归入 [buildControllerGraph]。 */
     private fun buildNetworkGraph(
@@ -749,12 +783,7 @@ object ComponentFactory {
         context: Context,
         profile: DeviceProfile?
     ): NetworkGraph {
-        val goformIp = settings.goformIp.ifBlank { gatewayIp }
-        val goform = GoformClient(
-            deviceIp = goformIp,
-            port = settings.goformPort,
-            password = settings.goformPassword
-        )
+        val goform = createTransport(settings, gatewayIp)
         // profile 由调用方选好后注入（计划书 3.2）。
         // 此前每个客户端的构造参数各带一个 `= ZteGoformProfile` 默认值 —— 等于选型逻辑
         // 散在 6 个签名里，换设备要改 6 处且漏一处不会报错。

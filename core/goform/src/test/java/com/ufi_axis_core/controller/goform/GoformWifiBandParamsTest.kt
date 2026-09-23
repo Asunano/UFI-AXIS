@@ -20,8 +20,8 @@ import org.junit.Test
  * `chip1`，把在 5G 上的设备静默切到 2.4G —— 用户实测过的真 bug。这里断言的正是
  * 「读到 chip2 就发 chip2 / 读失败退回 chip1 并留 WARN / 关分支一次都不读」。
  *
- * 读路径与日志出口用 lambda 替身注入（本类持有具体类 [GoformClient]，注入不了假对象），
- * 风格照 `GoformSettingWriterDecisionTest`。
+ * 读路径与日志出口用 lambda 替身注入（本类持有的是接口 [GoformTransport]，已经可以注入假对象，
+ * 但这种写法不经过传输层就能断言），风格照 `GoformSettingWriterDecisionTest`。
  */
 class GoformWifiBandParamsTest {
 

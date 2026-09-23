@@ -28,7 +28,7 @@ import kotlinx.serialization.json.*
  * 尚未迁移的方法仍是透传。
  */
 class GoformSignalClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
 
@@ -59,7 +59,7 @@ class GoformSignalClient(
      * 核对通过后收进命令表，这里只留取值。
      */
     suspend fun getSignalInfo(): JsonObject? {
-        return client.query(fields.cmds(FieldGroup.SIGNAL))
+        return client.read(fields.cmds(FieldGroup.SIGNAL))
     }
 
     /**
@@ -87,7 +87,7 @@ class GoformSignalClient(
         // 刻意的轻量查询，**不走 profile 命令表**：这 2 项没有对应的 FieldGroup（NR 字段归 SIGNAL，
         // 但 SIGNAL 是 16 项），换成 fields.cmds 会把 2 项变 16 项。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        return client.query(listOf("network_information", "Lte_ca_status"))
+        return client.read(listOf("network_information", "Lte_ca_status"))
     }
 
     // ==================== 设备信息 ====================
@@ -95,7 +95,7 @@ class GoformSignalClient(
     suspend fun getDeviceInfo(): JsonObject? {
         // 刻意的轻量查询，**不走 profile 命令表**：IDENTITY 分组有 20 个 cmd，换过去会从 5 项变 20 项。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        return client.query(listOf("imei", "imsi", "iccid", "lan_ipaddr", "mac_address"))
+        return client.read(listOf("imei", "imsi", "iccid", "lan_ipaddr", "mac_address"))
     }
 
     /**
@@ -115,7 +115,7 @@ class GoformSignalClient(
      * cmds 不动（少查一个字段并不省一次 HTTP，而改查询会改变设备侧请求形状）。
      */
     suspend fun getDeviceIdentity(): JsonObject? {
-        val data = client.query(fields.cmds(FieldGroup.IDENTITY)) ?: return null
+        val data = client.read(fields.cmds(FieldGroup.IDENTITY)) ?: return null
         return fields.normalize(FieldGroup.IDENTITY, data)?.ifEmpty { null }
     }
 
@@ -130,7 +130,7 @@ class GoformSignalClient(
         // 刻意的轻量查询，**不走 profile 命令表**（IDENTITY 是 20 项，这里只要 3 项；
         // 注意 `Language` 刻意只在这条查询里，不在 cmdsFor(IDENTITY) 里 —— 所以它在覆盖率报告里
         // 必然 missing，那是登记态不是缺陷）。字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        val data = client.query(listOf("Language", "cr_version", "wa_inner_version")) ?: return null
+        val data = client.read(listOf("Language", "cr_version", "wa_inner_version")) ?: return null
         return fields.normalize(FieldGroup.IDENTITY, data)
     }
 
@@ -151,7 +151,7 @@ class GoformSignalClient(
         // 刻意的轻量查询，**不走 profile 命令表**：TRAFFIC_LIMIT 是 10 项且**不含** realtime_*，
         // 换过去会既多查限额配置又丢掉实时吞吐（本方法在 15s 轮询路径上）。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        val raw = client.query(listOf(
+        val raw = client.read(listOf(
             "monthly_rx_bytes", "monthly_tx_bytes",
             "realtime_time", "monthly_time",
             "realtime_tx_thrpt", "realtime_rx_thrpt"
@@ -180,7 +180,7 @@ class GoformSignalClient(
     suspend fun getFullStatus(): JsonObject? {
         val merged = mutableMapOf<String, JsonElement>()
         for (batch in fields.fullStatusCmds()) {
-            client.query(batch)?.let { merged.putAll(it) }
+            client.read(batch)?.let { merged.putAll(it) }
         }
         return if (merged.isEmpty()) null else JsonObject(merged)
     }
@@ -201,7 +201,7 @@ class GoformSignalClient(
      * **会逐分组向设备发查询**（最多 10 组，soloCmd 另发），因此只适合按需调用，
      * 不要放进任何轮询路径。输出只含字段名不含值。
      */
-    suspend fun diagnoseFieldCoverage(): JsonObject = fields.coverageReport { client.query(it) }
+    suspend fun diagnoseFieldCoverage(): JsonObject = fields.coverageReport { client.read(it) }
 
 
 
@@ -219,7 +219,7 @@ class GoformSignalClient(
      * 它自己不对外透出（NR 字段走 `signal` 频道与 `/api/network/signal`）。
      */
     suspend fun getCellInfo(): JsonObject? {
-        val data = client.query(fields.cmds(FieldGroup.CELL_INFO)) ?: return null
+        val data = client.read(fields.cmds(FieldGroup.CELL_INFO)) ?: return null
         return fields.normalize(FieldGroup.CELL_INFO, data)?.ifEmpty { null }
     }
 
@@ -231,7 +231,7 @@ class GoformSignalClient(
     suspend fun getNeighborCellInfo(): JsonArray? {
         // 刻意的轻量查询，**不走 profile 命令表**：CELL_INFO 是 10 项，换过去会把「单字段快速刷新」
         // 变成 10 字段查询。字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
-        val data = client.query(listOf("neighbor_cell_info")) ?: return null
+        val data = client.read(listOf("neighbor_cell_info")) ?: return null
         val normalized = fields.normalize(FieldGroup.CELL_INFO, data) ?: return null
         return normalized["neighbor_cell_info"] as? JsonArray
     }
@@ -247,7 +247,7 @@ class GoformSignalClient(
      */
     suspend fun getLanSettings(): JsonObject? {
         val cmds = fields.cmds(FieldGroup.LAN_SETTINGS)
-        return fields.normalize(FieldGroup.LAN_SETTINGS, client.query(cmds))
+        return fields.normalize(FieldGroup.LAN_SETTINGS, client.read(cmds))
     }
 
     // ==================== 设备设置状态查询 ====================
@@ -265,7 +265,7 @@ class GoformSignalClient(
      */
     suspend fun queryDeviceSettings(): Map<String, JsonElement>? {
         val cmds = fields.cmds(FieldGroup.DEVICE_SETTINGS)
-        return fields.normalize(FieldGroup.DEVICE_SETTINGS, client.query(cmds))
+        return fields.normalize(FieldGroup.DEVICE_SETTINGS, client.read(cmds))
     }
 
     /**
@@ -277,7 +277,7 @@ class GoformSignalClient(
      */
     suspend fun getBandLockStatus(): JsonObject? {
         val cmds = fields.cmds(FieldGroup.BAND_STATUS)
-        return fields.normalize(FieldGroup.BAND_STATUS, client.query(cmds))
+        return fields.normalize(FieldGroup.BAND_STATUS, client.read(cmds))
     }
 
     // ==================== 流量限额 ====================
@@ -291,7 +291,7 @@ class GoformSignalClient(
      */
     suspend fun getDataUsage(): JsonObject? {
         val cmds = fields.cmds(FieldGroup.TRAFFIC_LIMIT)
-        return fields.normalize(FieldGroup.TRAFFIC_LIMIT, client.query(cmds))
+        return fields.normalize(FieldGroup.TRAFFIC_LIMIT, client.read(cmds))
     }
 }
 

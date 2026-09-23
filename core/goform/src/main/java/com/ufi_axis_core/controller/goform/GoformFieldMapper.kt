@@ -194,7 +194,7 @@ internal class GoformFieldMapper(
     /**
      * 字段覆盖率报告（计划书 10.1）——适配新设备时的 TODO 清单。
      *
-     * 逐个 [FieldGroup] 向设备查一次（[query] 就是 `GoformClient::query`），比对登记表，
+     * 逐个 [FieldGroup] 向设备查一次（[query] 就是 `DeviceTransport::read`），比对登记表，
      * 输出"登记了几个 / 命中了几个 / 哪些一个 source 都没命中 / 命中的是哪个 source"。
      *
      * **输出里没有任何字段值**，只有字段名，因此不需要再脱敏（值的脱敏见 [maskDump]）。

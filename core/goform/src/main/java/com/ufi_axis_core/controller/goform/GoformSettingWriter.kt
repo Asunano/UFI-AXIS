@@ -36,13 +36,13 @@ import com.ufi_axis_core.util.AppLogger
  *
  * ## 为什么决策逻辑全在 companion 的函数里
  *
- * 本类的构造参数是**具体类** [GoformClient]（阶段 1 才接口化），端到端路径注入不了假对象。
- * 所以「选命令 / 拼 body / 选重试路径 / 把传输层结果收成三态 / 要不要兜底」这几件事都抽成了
+ * 本类的构造参数是接口 [GoformTransport]（阶段 1 已接口化），端到端路径**可以**注入假对象了。
+ * 而「选命令 / 拼 body / 选重试路径 / 把传输层结果收成三态 / 要不要兜底」这几件事都抽成了
  * 以 lambda 收传输层与日志出口的 internal 函数：生产路径传 [client] 的方法，单测传假发送器
  * （`GoformSettingWriterDecisionTest`）。这样 HTTP 之外的整条写路径都能被断言。
  */
 internal class GoformSettingWriter(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
     private val profile: DeviceProfile = profile ?: ZteGoformProfile
@@ -80,9 +80,9 @@ internal class GoformSettingWriter(
                 key = key,
                 spec = each,
                 params = params,
-                postIdempotent = { body -> client.goformPostIdempotent(body) },
-                postPlain = { body -> client.goformPost(body) },
-                isSuccess = { body -> client.isGoformSuccess(body) },
+                postIdempotent = { body -> client.writeIdempotent(body) },
+                postPlain = { body -> client.write(body) },
+                isSuccess = { body -> client.isSuccess(body) },
                 warn = warn,
             )
         }
@@ -177,15 +177,15 @@ internal class GoformSettingWriter(
          *
          * ## 重试路径由 spec 说了算
          *
-         * - [RetryPolicy.RETRY_ON_SESSION_LOSS] → [GoformClient.goformPostIdempotent]
+         * - [RetryPolicy.RETRY_ON_SESSION_LOSS] → [GoformTransport.writeIdempotent]
          *   （会话失效时重登并重试一次）。漏标这一项就会复发「切换网络制式第一次必定失败、
          *   再点一次才成」那个 bug —— 读路径早有这套重试，写路径一直没有。
-         * - [RetryPolicy.NEVER] → [GoformClient.goformPost]（**不重试**）。动作类 / 有副作用的
+         * - [RetryPolicy.NEVER] → [DeviceTransport.write]（**不重试**）。动作类 / 有副作用的
          *   命令（重启、关机、恢复出厂、改后台口令）重发一次的后果分别是再重启一次、在断电设备上
          *   白等一轮、出厂口令下的第二次擦除、拿旧口令再登一次。
          *
          * 两条路径的返回类型不同（[GoformWriteResult] vs `String?`），`NEVER` 分支也必须收敛成
-         * 同样的三态：`null` 是「会话失效 / 连不上 / AD 算不出」被 [GoformClient.goformPost] 压平
+         * 同样的三态：`null` 是「会话失效 / 连不上 / AD 算不出」被 [DeviceTransport.write] 压平
          * 后的同一个值，无法再分开，所以统一报 `Unavailable` 且用与 `Unreachable` **相同**的文案
          * —— 在这里猜是哪一种就是编造信息。
          */
@@ -212,7 +212,7 @@ internal class GoformSettingWriter(
             }
         }
 
-        /** 可重试路径（[GoformClient.goformPostIdempotent]）的结果 → 三态。 */
+        /** 可重试路径（[GoformTransport.writeIdempotent]）的结果 → 三态。 */
         fun interpretRetryable(
             result: GoformWriteResult,
             isSuccess: (String) -> Boolean,
@@ -225,7 +225,7 @@ internal class GoformSettingWriter(
             is GoformWriteResult.Unreachable -> WriteOutcome.Unavailable(UNREACHABLE_MESSAGE)
         }
 
-        /** 不重试路径（[GoformClient.goformPost]）的结果 → 三态。`null` 只能报成不可用。 */
+        /** 不重试路径（[DeviceTransport.write]）的结果 → 三态。`null` 只能报成不可用。 */
         fun interpretPlain(body: String?, isSuccess: (String) -> Boolean): WriteOutcome = when {
             body == null -> WriteOutcome.Unavailable(UNREACHABLE_MESSAGE)
             isSuccess(body) -> WriteOutcome.Ok

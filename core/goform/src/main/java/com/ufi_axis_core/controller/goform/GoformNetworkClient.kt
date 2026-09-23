@@ -18,7 +18,7 @@ import com.ufi_axis_core.deviceschema.SettingKey
  * - 漫游设置
  */
 class GoformNetworkClient(
-    private val client: GoformClient,
+    private val client: GoformTransport,
     profile: DeviceProfile?,
 ) {
     private val writer = GoformSettingWriter(client, profile)
