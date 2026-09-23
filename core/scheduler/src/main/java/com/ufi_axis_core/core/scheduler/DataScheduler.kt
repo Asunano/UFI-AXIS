@@ -1126,7 +1126,11 @@ class DataScheduler(
                 signalClient?.getTrafficStats()
             }
             if (stats != null && stats.isNotEmpty()) {
-                // 月累计（canonical：rx=下载、tx=上传，方向已由 profile 掰正，见 ZteGoformProfile）
+                // 月累计（canonical：rx=下载、tx=上传，方向已由 profile 掰正，见 ZteGoformProfile）。
+                // 这个不变量**连排障模式也成立**：TRAFFIC_LIMIT 在 GoformFieldMapper.NORMALIZE_ALWAYS
+                // 清单里，所以 field_normalization_enabled=false 时这一组仍然归一化（其余组才透传）。
+                // 靠的就是那份清单 —— 把 TRAFFIC_LIMIT 从清单里拿掉，下面两行就会拿到设备原值，
+                // 而设备把上下行报反，recordHourlyUsage() 会把颠倒的月累计落库且不可回滚。
                 val rx = stats["monthly_rx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 val tx = stats["monthly_tx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 if (rx > 0 || tx > 0) {

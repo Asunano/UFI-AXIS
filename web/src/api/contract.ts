@@ -715,6 +715,74 @@ export function isWifiMaxStaNumAcceptable(v: number | null | undefined): boolean
   return Number.isInteger(v) && v >= WifiMaxStaNumRange.min && v <= WifiMaxStaNumRange.max;
 }
 
+/**
+ * 「保持不变」档的文案。选项首项用它 —— 「不下发 `max_sta_num`」在界面上只有这一种说法。
+ *
+ * 与 app 侧 `WifiSettingsDialog.kt` 的 `optionLabel = { it?.toString() ?: "保持不变" }` 同字。
+ */
+export const WIFI_MAX_STA_NUM_KEEP_LABEL = '保持不变';
+
+/**
+ * 「保持不变」档在**选择器控件层**的取值（哨兵）。
+ *
+ * 为什么不是 `null`：naive-ui 的 `n-select` 在 `value === null` 时直接判「无选中」
+ *（`_internal/select-menu/src/SelectOption.mjs` 的 `if (value === null) return false`
+ * 与 `select/src/Select.mjs` 的 `selectedOptionRef`），那一档既不高亮也不打勾，
+ * 只能靠 placeholder 假装 —— 而 app 侧同一个弹窗的「保持不变」是能正常高亮的
+ *（`UfiDropdown` 按值比较，`Int?` 的 `null` 正常选中），两端观感必须一致。
+ *
+ * 为什么用 `0` 而不另造一个哨兵：`0` 本来就已经被 [isWifiMaxStaNumAcceptable] 判为不合法
+ *（区间是 `[1, 10]`），也就是说这个哨兵**不需要额外的守门**，任何把它当真值下发的路径
+ * 都会被既有判据挡住。
+ *
+ * 它只活在控件层：过边界要先经 [wifiMaxStaNumForPayload] 折成 `null`，
+ * **不许**泄漏到 [WifiConfigFormInput] 之外。
+ */
+export const WIFI_MAX_STA_NUM_KEEP_VALUE = 0;
+
+/**
+ * 「最大连接数」下拉的选项 = 「保持不变」([WIFI_MAX_STA_NUM_KEEP_VALUE]) + [WifiMaxStaNumRange]
+ * 闭区间内每个整数。
+ *
+ * 2026-09-22 用户裁决：选择类控件统一成下拉。十选一的值域由**选项本身**守，
+ * 用户打不出 `99`，也就没有「打完再被拒」这条路径（`n-input-number` 的 `:max`
+ * 只在用步进器时硬夹，手打仍会落进 form）。提交守门 [isWifiMaxStaNumAcceptable]
+ * 仍然留着，它同时管「不下发」这个语义，**不许放宽**。
+ *
+ * 首项是**显式**的「保持不变」而不是 `clearable`：与 app 侧
+ * `WifiSettingsDialog.kt` 的 `maxStaOptions = listOf<Int?>(null) + WIFI_MAX_STA_RANGE`
+ * 两端同构，且显式选项比清除按钮更容易被发现。
+ *
+ * 值域唯一来源仍是 [WifiMaxStaNumRange]：改上限只改那一处，这里跟着变，
+ * 两个 WiFi 弹窗共用这一份，不存在第二份 1..10。
+ *
+ * 保持 `ReadonlyArray`（取值域常量不该被外部 push / 改写）。naive-ui 的
+ * `n-select :options` 形参是 `SelectMixedOption[]`，直接喂 readonly 会报 TS4104 ——
+ * 妥协放在调用点：组件里 `[...WifiMaxStaNumOptions]` 浅拷贝一次（setup 里算一次，
+ * 不在模板表达式里拷，免得每次渲染都重建 treemate）。
+ */
+export const WifiMaxStaNumOptions: ReadonlyArray<{ label: string; value: number }> = [
+  { label: WIFI_MAX_STA_NUM_KEEP_LABEL, value: WIFI_MAX_STA_NUM_KEEP_VALUE },
+  ...Array.from({ length: WifiMaxStaNumRange.max - WifiMaxStaNumRange.min + 1 }, (_, i) => {
+    const n = WifiMaxStaNumRange.min + i;
+    return { label: String(n), value: n };
+  }),
+];
+
+/**
+ * 选择器控件层取值 → [WifiConfigFormInput.maxStaNum]（`null` = 不下发）。
+ *
+ * 唯一的折算处，两个 WiFi 弹窗共用：哨兵 `0`（「保持不变」）以及任何**不可提交**的值
+ * 一律折成 `null`。判据直接复用 [isWifiMaxStaNumAcceptable]，这里不另写一遍区间比较
+ * —— 抄第二份迟早与守门漂移。
+ *
+ * 结论：经过这一步之后，`0` 不可能出现在 `max_sta_num` 上（[buildWifiConfigPayload]
+ * 还会再判一次），控件层的哨兵到不了 HTTP 报文。
+ */
+export function wifiMaxStaNumForPayload(selected: number): number | null {
+  return isWifiMaxStaNumAcceptable(selected) ? selected : null;
+}
+
 // ────────────────────────────────────────────────────────────
 // WiFi 频段 —— POST /api/wifi/band
 // ────────────────────────────────────────────────────────────
@@ -742,6 +810,11 @@ export const WIFI_BAND_DEFAULT: WifiBand = 'chip1';
 /**
  * 频段选择器的选项。文案是人话（「2.4 GHz」），value 是设备词汇（`chip1`）——
  * 界面上看到什么与线上发出去什么在这里一次对齐，免得组件里各写一份字面量。
+ *
+ * 保持 `ReadonlyArray`：这是**取值域常量**，不该被外部 push / 改写。
+ * naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，直接喂 readonly 会报
+ * TS4104，妥协放在调用点 —— 组件里 `[...WifiBandOptions]` 浅拷贝一次（同
+ * [WifiMaxStaNumOptions]、[wifiSecurityOptions] 的处理）。
  */
 export const WifiBandOptions: ReadonlyArray<{ label: string; value: WifiBand }> = [
   { label: '2.4 GHz', value: 'chip1' },

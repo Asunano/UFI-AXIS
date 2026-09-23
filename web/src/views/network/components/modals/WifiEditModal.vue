@@ -5,6 +5,8 @@
         <n-input v-model:value="wifiForm.ssid" />
       </n-form-item>
       <n-form-item label="加密方式">
+        <!-- size 跟随本弹窗其它控件（这里是默认尺寸，与相邻 n-input 对齐），
+             **不与仪表盘 WifiModal 的 size="small" 对齐** —— 不是漏改。选项来源两边共用。 -->
         <n-select v-model:value="wifiForm.auth_mode" :options="authModeOptions" />
       </n-form-item>
       <!-- 开放网络没有密码可填：这一项隐藏，提交时也不带 passphrase（见 buildWifiConfigPayload）。
@@ -14,22 +16,20 @@
       </n-form-item>
       <n-form-item label="最大连接数">
         <!-- 上限 10：用户对中兴 F50 的规格结论（2026-09-22），与 core 的 validateApConfig（1~10）一致。
-             :max 只在用步进器时硬夹，手打 99 仍会落进 form —— 提交守门在 isWifiMaxStaNumAcceptable。 -->
-        <n-input-number
-          v-model:value="wifiForm.maxStaNum"
-          :min="WifiMaxStaNumRange.min"
-          :max="WifiMaxStaNumRange.max"
-          :precision="0"
-          placeholder="留空 = 不修改"
-        />
+             2026-09-22 用户裁决改用下拉：十选一的值域由选项本身守，用户打不出 99
+             （原 n-input-number 的 :max 只在用步进器时硬夹，手打仍会落进 form）。
+             首项「保持不变」的控件取值是哨兵 0（不是 null）：n-select 对 null 一律判「无选中」，
+             那一档就不会高亮打勾；0 本来就被 isWifiMaxStaNumAcceptable 判为不合法，
+             过报文边界时由 wifiMaxStaNumForPayload 折成 null（= 不下发 max_sta_num）。
+             选项与文案来自 contract，两个弹窗共用一份。永远有选中项，所以不需要 placeholder。 -->
+        <n-select v-model:value="wifiForm.maxStaNum" :options="maxStaNumOptions" />
       </n-form-item>
       <n-form-item label="频段">
         <!-- 选项（含要发出去的 chip1/chip2）来自 contract.WifiBandOptions：
              界面写「2.4 GHz」，线上发的必须是设备词汇 chip1/chip2。
-             频段是独立动作：走 POST /api/wifi/band，会重启 WiFi 模块，所以保存时单独确认（见 saveWifi） -->
-        <n-radio-group v-model:value="wifiForm.band">
-          <n-radio v-for="opt in WifiBandOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</n-radio>
-        </n-radio-group>
+             频段是独立动作：走 POST /api/wifi/band，会重启 WiFi 模块，所以保存时单独确认（见 saveWifi）。
+             2026-09-22 用户裁决：由一排 n-radio 改为下拉，弹窗内只留一种选择交互 —— 只换控件，逻辑不动。 -->
+        <n-select v-model:value="wifiForm.band" :options="bandOptions" />
       </n-form-item>
       <n-form-item label="隐藏 SSID">
         <!-- 开=隐藏（broadcast_disabled=1），关=广播。别按"广播开关"理解，值是反的 -->
@@ -49,11 +49,15 @@ import { useDialog, useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import {
   WIFI_AUTH_MODE_DEFAULT,
+  WIFI_MAX_STA_NUM_KEEP_LABEL,
+  WIFI_MAX_STA_NUM_KEEP_VALUE,
   WifiBandOptions,
+  WifiMaxStaNumOptions,
   WifiMaxStaNumRange,
   buildWifiConfigPayload,
   isWifiMaxStaNumAcceptable,
   wifiBandFromChipIndex,
+  wifiMaxStaNumForPayload,
   wifiSecurityNeedsPassphrase,
   wifiSecurityOptions,
 } from '@/api/contract';
@@ -76,13 +80,22 @@ const wifiForm = reactive({
   ssid: '',
   password: '',
   auth_mode: WIFI_AUTH_MODE_DEFAULT,
-  /** null = 留空，语义是「不修改」 */
-  maxStaNum: null as number | null,
+  /**
+   * 选择器控件层取值：`WIFI_MAX_STA_NUM_KEEP_VALUE`（0）= 「保持不变」= 提交时不带 max_sta_num。
+   * 报文边界上由 wifiMaxStaNumForPayload 折成 null，0 不会离开这个组件。
+   */
+  maxStaNum: WIFI_MAX_STA_NUM_KEEP_VALUE as number,
   /** 设备词汇：chip1 = 2.4G、chip2 = 5G。要发出去的就是这个值（见 contract.WifiBands） */
   band: 'chip1' as WifiBand,
   broadcastHidden: false,
 });
 const wifiSaving = ref(false);
+
+// 选项来源只有 contract 那两份常量（取值域，readonly）。这里各浅拷贝一次：
+// naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，readonly 数组会报 TS4104。
+// 拷贝放在 setup 而不是模板表达式里 —— 写成 `:options="[...X]"` 会每次渲染都重建 treemate。
+const maxStaNumOptions = [...WifiMaxStaNumOptions];
+const bandOptions = [...WifiBandOptions];
 
 // 加密方式的 4 个档位与 auth_mode/encryp_type 的配对关系是设备契约，统一放在 contract.ts；
 // 设备回读的写法不在表里时由 wifiSecurityOptions 置顶并入，避免 select 空白 / 顺手改坏
@@ -104,8 +117,13 @@ watch(
     wifiForm.ssid = s?.ssid || '';
     wifiForm.password = s?.password || '';
     wifiForm.auth_mode = s?.auth_mode || WIFI_AUTH_MODE_DEFAULT;
-    // 0 / NaN 都当「读不到」处理：填 0 进去会在保存时下发一个不合法的最大连接数
-    wifiForm.maxStaNum = Number(s?.max_sta_num) > 0 ? Number(s?.max_sta_num) : null;
+    // 读不到（0 / 空 / NaN）或设备报了个 1..10 之外的值，都落到「保持不变」档（哨兵 0）：
+    // 不替固件猜一个数，也不把越界值当草稿带回去。落成哨兵而不是 null，是为了让下拉真正
+    // **高亮打勾**在「保持不变」那一行（n-select 对 null 一律判无选中）。
+    // 判定复用 contract 的 isWifiMaxStaNumAcceptable —— 这里传进去的一定是 number
+    //（Number(undefined) = NaN、Number(null) = 0，都判 false），不会撞上它对 null 返回 true 的分支。
+    const readMaxSta = Number(s?.max_sta_num);
+    wifiForm.maxStaNum = isWifiMaxStaNumAcceptable(readMaxSta) ? readMaxSta : WIFI_MAX_STA_NUM_KEEP_VALUE;
     wifiForm.band = currentBand.value;
     wifiForm.broadcastHidden = s?.broadcast_disabled === 1;
   },
@@ -113,10 +131,13 @@ watch(
 );
 
 async function saveWifi() {
-  // 拦下来要说原因：静默丢掉这一项会变成「填了 0 点保存，提示成功，设备没变」
-  if (!isWifiMaxStaNumAcceptable(wifiForm.maxStaNum)) {
+  // 守门保留（**不许放宽**）：判据仍是 contract 的 isWifiMaxStaNumAcceptable，这里只额外放过
+  // 「保持不变」档（哨兵 0 本来就不合法，但它的语义是「不下发」而不是「值填错了」）。
+  // 下拉之后正常路径已经打不出越界值，这一层还挡着回填 / 契约漂移 —— 真拦下来时要说原因，
+  // 静默丢掉一个用户看得见的值会变成「点了保存、提示成功、设备没变」。
+  if (wifiForm.maxStaNum !== WIFI_MAX_STA_NUM_KEEP_VALUE && !isWifiMaxStaNumAcceptable(wifiForm.maxStaNum)) {
     message.warning(
-      `最大连接数必须是 ${WifiMaxStaNumRange.min}~${WifiMaxStaNumRange.max} 的整数（中兴 F50 最大支持 10 个），留空表示不修改`
+      `最大连接数必须是 ${WifiMaxStaNumRange.min}~${WifiMaxStaNumRange.max} 的整数（中兴 F50 最大支持 10 个），选「${WIFI_MAX_STA_NUM_KEEP_LABEL}」表示不修改`
     );
     return;
   }
@@ -156,7 +177,9 @@ async function submit(switchBand: boolean) {
         ssid: wifiForm.ssid,
         authMode: wifiForm.auth_mode,
         passphrase: wifiForm.password,
-        maxStaNum: wifiForm.maxStaNum,
+        // 控件层的哨兵 0（「保持不变」）在这里折成 null = 不下发 max_sta_num。
+        // 折算只有 contract.wifiMaxStaNumForPayload 一处，0 不会越过这个边界。
+        maxStaNum: wifiMaxStaNumForPayload(wifiForm.maxStaNum),
         hidden: wifiForm.broadcastHidden,
         fallbackEncrypType: props.wifiSettings?.encryp_type,
       })

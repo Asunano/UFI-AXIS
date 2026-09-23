@@ -116,8 +116,21 @@
 默认关闭（配置项 `goform_command_enabled`）。
 
 **排障开关：** `field_normalization_enabled` 置 false，读侧会退回原样透传设备字段  
-（写入命令表与 `/api/network/signal` 不受影响）。此时容器字段可能是"数组的 JSON 字符串"而不是数组 ——  
-客户端解容器时两种形态都要能吃（见 `/api/wifi/clients`）。  
+（写入命令表不受影响；`/api/network/signal` 与 WS `signal` 频道也不受影响 —— 信号的归一化不在  
+goform 客户端层，用的是另一份非空 profile）。此时容器字段可能是"数组的 JSON 字符串"而不是数组 ——  
+客户端解容器时两种形态都要能吃（见 `/api/wifi/clients`）。
+
+**哪些端点会变回设备原名**（2026-09-22 起逐组核实，共 9 组）：`/api/wifi/settings`、  
+`/api/wifi/clients`、`/api/network/cell-info` 与 `/api/network/neighbor-cells`、  
+`/api/network/band-status`、`/api/device/identity`、`/api/device/lan-settings`、  
+`/api/device/settings`，以及 `ppp_status` / `network_type` 那一组连接状态字段。  
+**唯一的例外是流量限额**：`/api/device/traffic-limit` 与 `/api/dashboard/summary` 的 `traffic_limit`  
+**不受这个开关影响**（2026-09-22 起），原因见该端点一节 —— 简单说，它的字段是 core  
+**按 canonical 重组**出来的（值要拆、上下行方向要掰、三个键在设备上根本不存在），  
+跟着降级不会得到"设备原样"，只会得到一份没有报错但值全错的响应。  
+要看设备原始字段名请走 `POST /api/device/goform`（原始 dump）或 `GET /api/diagnose?fields=1`  
+（逐组列出 canonical ← 命中的设备原名）。
+
 两个注意点：它**可读可写**（2026-09-22 起 `AppSettings.toMap()` 与 `PUT /api/config` 都登记了这个键，  
 所以 `GET` 看得到、`PUT` 改得动），但**只在构造组件图时读一次，改完必须重启后台服务才生效**；  
 且 `PUT` 响应的 `needs_restart` 清单**不含**这个键（只有 port / goform_* 那四个），  
@@ -1307,6 +1320,23 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 > （乘数 `1=MB / 1024=GB / 1048576=TB`），而 `data_volume_limit_unit` 恒为 `"MB"` 不代表真实单位 ——  
 > 这两个坑现在完全被 core 吃掉，复合串只存在于 profile 的 `WriteSpec.encode`。  
 > 写入侧（`POST /api/device/data-limit`）收 `limit_value` + `limit_unit`。
+
+> ⚠ **本端点不受排障开关 `field_normalization_enabled` 影响（2026-09-22 起）。**  
+> 其余读端点关掉那个开关会变回设备原名，**这一个不会** ——「本月已用」「限额」「告警百分比」  
+> 照旧是上面那套 canonical 字段。原因是这里不是透传出口，而是**按 canonical 重组**的派生出口：  
+> `limit_value` / `limit_unit_display` / `limit_bytes` 是 core 从复合串拆出来的派生键，  
+> **设备上不存在任何同名字段**；`monthly_rx_bytes` / `monthly_tx_bytes` 的方向是 core 掰正的  
+> （固件把上下行报反）。  
+> 2026-09-22 实测过跟着降级的后果，所以这个例外是刻意的：  
+> ① `limit_bytes` 等三个键谁都兜不到，响应会退化成默认值（`enabled:false`、`limit_value:""`、  
+> `limit_unit_display:"GB"`、`limit_bytes:0`、`alert_percent:"80"`、`clear_date:"1"`），  
+> **字段一个不缺、HTTP 200、没有任何错误码，但值全错**；  
+> ② core 内部的流量预警与「到阈值自动关闭移动数据」读的是同一份数据，拿到 `limit_bytes: 0`  
+> 会直接跳过判定，**静默失效**；  
+> ③ 上下行方向不掰正时，每小时用量会按颠倒的方向落库，**把开关改回来也修不回历史数据**。  
+> 要看设备原始字段名请走 `POST /api/device/goform`（原始 dump）或 `GET /api/diagnose?fields=1`。  
+> 注意 `/api/diagnose` 的 `device_profile.normalization_enabled` 仍然如实报 `false` ——  
+> 这个例外只作用在流量限额这一组的取值上，不影响开关自身的可观测性。
 
 #### `GET /api/device/settings`
 

@@ -67,8 +67,9 @@ private val WIFI_AUTH_PRESETS = listOf(
  * 上限（注释写的是「真机见过 7 与 10，本页不替固件设限」），那条依据已被上述结论取代。
  *
  * 与 core 同一份事实：`ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 拒 1..10 之外的值）。
- * 客户端仍要自己守一道，理由是文案 —— 越界在本页就能说清「该填什么」，
- * 而走到 core 才被拒，用户看到的只是一条下发失败。
+ * 客户端仍要自己守一道，但 2026-09-22 用户裁决把守门方式从"校验"换成了**穷举**：
+ * 本页把这个区间直接铺成下拉选项（见「最大连接数」一节），越界值在界面上根本选不出来，
+ * 所以不再需要错误文案去解释「该填什么」。这个区间因此是**唯一**的值域来源 —— 改上限只改这里。
  */
 private val WIFI_MAX_STA_RANGE = 1..10
 
@@ -80,8 +81,8 @@ private val WIFI_MAX_STA_RANGE = 1..10
  * 只认这两个。**不要**拿 `"0"` / `"1"`（读侧 `chip_index` 的展示编码）或界面文案
  * `"2.4 GHz"` / `"5 GHz"` 去下发，那些会被 core 直接 400。
  *
- * 收成一份表是因为这两个字符串要出现在三处：页签文案、确认弹窗正文、二维码区说明。
- * 各写一遍迟早漂成"页签说 5 GHz、确认弹窗说 2.4 GHz"。列表顺序 = 页签顺序。
+ * 收成一份表是因为这两个字符串要出现在三处：下拉文案、确认弹窗正文、二维码区说明。
+ * 各写一遍迟早漂成"下拉说 5 GHz、确认弹窗说 2.4 GHz"。列表顺序 = 下拉选项顺序。
  */
 private val WIFI_BAND_OPTIONS = listOf("chip1" to "2.4 GHz", "chip2" to "5 GHz")
 
@@ -139,10 +140,18 @@ fun WifiSettingsDialog(
     val isOpenAuth = selectedAuth == "OPEN"
 
     // ── 最大连接数（2026-09-22）──
-    // 空串 = 不下发这一项（设备没报，或用户主动清空）。上限见 [WIFI_MAX_STA_RANGE]（F50 最大 10 个）。
-    var maxSta by remember(wifi?.maxStaNum) { mutableStateOf(wifi?.maxStaNum?.trim().orEmpty()) }
-    val maxStaValue = maxSta.takeIf { it.isNotEmpty() }?.toIntOrNull()?.takeIf { it in WIFI_MAX_STA_RANGE }
-    val maxStaInvalid = maxSta.isNotEmpty() && maxStaValue == null
+    // `null` = 「保持不变」档 = **不下发这一项**。三种来源都落到 null：设备没报、设备报了个
+    // [WIFI_MAX_STA_RANGE] 之外的值（不替固件猜该显示几，也不把越界值当草稿带回去）、用户主动选它。
+    //
+    // 2026-09-22 用户裁决改用下拉后，草稿状态**直接就是 Int?**，不再有字符串中间态 ——
+    // 于是原来的「非法输入」状态（maxStaInvalid）、`maxLength = 2`、越界错误文案一并删除：
+    // 十选一的值域由选项本身守，用户打不出 99，也就没有"打完再被拒"这条路径。
+    var maxStaValue by remember(wifi?.maxStaNum) {
+        mutableStateOf(wifi?.maxStaNum?.trim()?.toIntOrNull()?.takeIf { it in WIFI_MAX_STA_RANGE })
+    }
+    // 选项 = 「保持不变」(null) + 区间内每个整数。值域唯一来源仍是 [WIFI_MAX_STA_RANGE]：
+    // 改上限只改那一处，这里跟着变，不存在第二份 1..10。
+    val maxStaOptions = remember { listOf<Int?>(null) + WIFI_MAX_STA_RANGE.toList() }
 
     // ── 隐藏 SSID（2026-09-22）──
     // 读侧 `wifi_chip1_ssid1_broadcast_ssid` 与写侧 `broadcast_disabled` 语义一致：
@@ -212,6 +221,8 @@ fun WifiSettingsDialog(
             if (!isOpenAuth) put("passphrase", pwd)
             // Int 而不是 String：这两个键在 WifiRoutes 里按 intOrNull 读，
             // 契约类型就是数字；converter 会把 Number 写成 JSON 数字。
+            // `?.let` 这一层就是提交守门，**不许放宽**：maxStaValue 为 null（「保持不变」档）时
+            // 整个键都不进 payload —— 不下发 ≠ 下发 0/空串，后者会被设备/core 当成一次真实改动。
             maxStaValue?.let { put("max_sta_num", it) }
             put("broadcast_disabled", if (hideSsid) 1 else 0)
         }
@@ -258,10 +269,13 @@ fun WifiSettingsDialog(
                 // 会断连时按危险操作渲染（红），与其它"会把用户自己踢下线"的动作同一观感。
                 // 换频段同样会断连，所以它也算进来。
                 confirmDestructive = willDisconnect || bandChanged,
-                // 校验不通过时禁用确认键，原因写在对应字段下面（errorMessage / 警告块），
+                // 校验不通过时禁用确认键，原因写在对应字段下面（警告块），
                 // 不做"点了没反应"的静默失败。
+                // 2026-09-22：原来这里还有 `!maxStaInvalid`。最大连接数改成下拉后**不存在非法值**
+                // （选项只有 null 与 WIFI_MAX_STA_RANGE 内的整数），那个条件恒真，留着只会让人以为
+                // 还有一条越界路径要防。真正的数值守门在 submit：null 时整个 max_sta_num 键都不下发。
                 // saving 也要进 enabled：loading 只是视觉，单靠它挡不住重复提交。
-                enabled = !saving && !maxStaInvalid && !pwdMissing,
+                enabled = !saving && !pwdMissing,
                 loading = saving
             )
         }
@@ -273,14 +287,21 @@ fun WifiSettingsDialog(
                 onValueChange = { ssid = it },
                 placeholder = "请输入网络名称"
             )
-            UfiDialogChipSelector(
-                label = "加密方式",
-                options = authPresets.map { it.authMode to it.label },
-                selectedValue = selectedAuth,
-                onSelect = { selectedAuth = it },
-                // 四档（含追加档时五档）一行放不下，弹窗宽度比设置行更窄
-                wrap = true
-            )
+            // 2026-09-22 用户裁决：本弹窗三个选择控件（加密方式 / 最大连接数 / WiFi 频段）统一走
+            // 公共下拉 [UfiDropdown]，弹窗内只留一种选择交互。原为 UfiDialogChipSelector 分段胶囊
+            //（四档、含追加档时五档，靠 `wrap = true` 折行放下）。
+            // 取值域仍是 [authPresets] 的 authMode（含「保持不变」档与透传档），显示文案由
+            // optionLabel 从**同一份** authPresets 取：值与文案没有第二个来源。
+            // modifier 不给 —— UfiDropdown 内部触发器已 fillMaxWidth，横向内距的唯一来源是弹窗壳
+            //（UfiDateRangePickerDialog.kt:630 记过"自带一层 padding 导致左右缩进比别的字段多 18dp"）。
+            UfiDialogField(label = "加密方式") {
+                UfiDropdown(
+                    selectedValue = selectedAuth,
+                    options = authPresets.map { it.authMode },
+                    onValueSelected = { selectedAuth = it },
+                    optionLabel = { mode -> authPresets.firstOrNull { it.authMode == mode }?.label ?: mode }
+                )
+            }
             // 选「开放」时密码框**直接不渲染**而不是置灰：置灰留着会让人以为"密码还在、
             // 只是暂时不能改"，而开放热点根本没有密码这一项，提交时也不带 passphrase。
             if (isOpenAuth) {
@@ -296,24 +317,18 @@ fun WifiSettingsDialog(
                     UfiDialogWarning("加密热点必须设密码 —— 从「开放」切过来时密码是空的，请先填写。")
                 }
             }
+            // 2026-09-22 用户裁决：十选一不该让用户手打再校验，改用公共下拉 [UfiDropdown]。
+            // 原为 UfiDigitField（手打 + maxLength=2 + 越界红字），那套把一个硬性值域拆成了
+            // "输入 → 校验 → 报错"三步，而值域本来就只有 10 个合法值。
+            // 「保持不变」= 列表首项（null），选它就等于旧实现里的"留空"：提交时不带 max_sta_num。
+            // 11 项超过 UfiDropdown 的默认 7 项可见高度，由它自己限高滚动并在打开时滚到选中项 ——
+            // 不显式传 maxVisibleItems：让弹层长到 11 项高会在小屏上顶满内容区。
             UfiDialogField(label = "最大连接数") {
-                UfiDigitField(
-                    value = maxSta,
-                    onValueChange = { maxSta = it },
-                    label = "",
-                    placeholder = "留空 = 不修改",
-                    // 两位就够（上限 10），可以少一次「打了 3 位再被拒」的往返。
-                    // 但它**不是**数值守门：两位仍能打出 99，所以 maxStaInvalid 必须留着 ——
-                    // UfiDigitField 只有 maxLength（限位数）没有数值 max，而为这一处单点需求
-                    // 改公共组件签名不值得。
-                    maxLength = 2,
-                    isError = maxStaInvalid,
-                    errorMessage = if (maxStaInvalid) {
-                        "必须是 ${WIFI_MAX_STA_RANGE.first}~${WIFI_MAX_STA_RANGE.last} 的整数" +
-                            "（中兴 F50 最大支持 ${WIFI_MAX_STA_RANGE.last} 个）。"
-                    } else {
-                        null
-                    }
+                UfiDropdown(
+                    selectedValue = maxStaValue,
+                    options = maxStaOptions,
+                    onValueSelected = { maxStaValue = it },
+                    optionLabel = { it?.toString() ?: "保持不变" }
                 )
             }
             UfiDialogSwitchField(
@@ -324,19 +339,33 @@ fun WifiSettingsDialog(
             if (hideSsid) {
                 UfiDialogNote("隐藏后手机搜不到这个热点，必须手动输入网络名称才能连接（二维码仍可用）。")
             }
-            // 频段是严格二选一，用「胶囊内滑块」页签（与高级控制台的 AT/Shell 切换同一组件），
-            // 而不是两个独立 chip：一个轨道切两段更贴"二选一"语义，且全 App 切换器外观统一。
-            // 文案与传输取值都来自 [WIFI_BAND_OPTIONS]，页签下标 = 该表下标。
+            // ── 频段控件选型：一次**决策变更**，不是手滑（保留原判断以便追溯）──
+            //
+            // 原判断（2026-09-22，裁决之前）：
+            //   「频段是严格二选一，用『胶囊内滑块』页签（UfiScrollableTabRow，与高级控制台的
+            //   AT/Shell 切换同一组件），而不是两个独立 chip：一个轨道切两段更贴"二选一"语义，
+            //   且全 App 切换器外观统一。」
+            //
+            // 被推翻：2026-09-22 用户裁决 —— 本弹窗的三个选择控件（频段 / 加密方式 / 最大连接数）
+            //   一律改用公共下拉 [UfiDropdown]，弹窗内部只保留一种选择交互。
+            //
+            // 由此接受的取舍（明知而为，别再"优化"回去）：
+            //   1. 二选一用下拉要多一次点击：滑块是一击切换，下拉得先展开弹层再点选项；
+            //   2. 与全 App 其它切换器（AT/Shell 等页签）的外观不再统一 ——
+            //      这里判定"同一个弹窗内三个选择控件长一样"优先于"跨页切换器长一样"。
+            //
+            // 文案与传输取值仍然**只**来自 [WIFI_BAND_OPTIONS]：options 取 `chip1`/`chip2`
+            //（= 真正发出去的值），显示文案由 wifiBandLabel 从同一张表取，界面文案永远不当传输值。
             UfiDialogField(label = "WiFi 频段") {
-                UfiScrollableTabRow(
-                    selectedTabIndex = WIFI_BAND_OPTIONS.indexOfFirst { it.first == selectedChip }
-                        .coerceAtLeast(0),
-                    onTabSelected = { selectedChip = WIFI_BAND_OPTIONS[it].first },
-                    tabs = WIFI_BAND_OPTIONS.map { it.second }
+                UfiDropdown(
+                    selectedValue = selectedChip,
+                    options = WIFI_BAND_OPTIONS.map { it.first },
+                    onValueSelected = { selectedChip = it },
+                    optionLabel = ::wifiBandLabel
                 )
             }
             // 频段与本表单其余各项**不是同一次下发**：它走 POST /api/wifi/band，点「保存配置」时
-            // 会先弹确认。先把这件事说清楚，用户才不会以为改完页签就已经生效了
+            // 会先弹确认。先把这件事说清楚，用户才不会以为改完下拉就已经生效了
             // （这正是旧实现的问题：塞进 /config 的 chip_index 设备根本不认）。
             if (bandChanged) {
                 UfiDialogNote("频段会在配置保存后单独切换，点「保存配置」时会先请你确认。")
@@ -372,7 +401,7 @@ fun WifiSettingsDialog(
             },
             // 「暂不执行」= **一个字段都不发**（连 /config 都不发）。
             // 半套下发（存了 SSID 却没换频段）会让弹窗上的频段显示成设备并不在用的值 ——
-            // 那就是假开关。要只存配置，用户可以把页签拨回原频段再点保存。
+            // 那就是假开关。要只存配置，用户可以把频段下拉选回原频段再点保存。
             onDismiss = { bandConfirmVisible = false }
         )
     }

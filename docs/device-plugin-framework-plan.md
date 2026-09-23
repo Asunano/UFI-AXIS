@@ -497,7 +497,10 @@ class DeviceRuntime private constructor(
   `ZteSmsSpecTest`（23）、`FieldNormalizerTest`（30）、`ZteGoformRawCaptureTest`（2）、
   `GoformSettingWriterDecisionTest`（20）、`GoformWifiApParamsTest`（19）、
   `GoformWritePolicyTest`（15）、`GoformCommandTableGuardTest`（**9**，批 11 新增 8 条、批 13 转型后 9 条）、
-  `GoformBase64CharsetTest`（7）、`GoformCodecFormBodyTest`（8）、`GoformSmsSendParamsTest`（1）。
+  `GoformBase64CharsetTest`（7）、`GoformCodecFormBodyTest`（8）、`GoformSmsSendParamsTest`（1）、
+  `GoformWifiBandParamsTest`（7，批 15 新增 —— 批 15 漏记在这张表里，2026-09-22 批 16 补上）、
+  `GoformNormalizeAlwaysTest`（**9**，批 16 新增，见 §11.13）。
+  `:core:goform:test` 的 `@Test` 合计 **95**（79 → 86 → 95，逐文件数过）。
   差的是**装配层**（writer × 真实 `GoformClient`，要等阶段 1 接口化）
   与**真机**那一半（§14.3 / §14.4，无真机）
 
@@ -708,15 +711,20 @@ suspend fun rebootDevice(): Boolean = writer.write(SettingKey.REBOOT, null)
   它们是排障通道，**不进 profile**；阶段 3 再给它们加能力门禁（见 §11.5）
 - `ZteGoformProfileTest` 新增断言：`SettingKey.values()` 全部有 `writeSpec`（现有测试已有这条，
   新增 key 会自动被它覆盖 —— 先跑一次确认它真的会失败，再补 spec）
-- **排障开关回归**（**0.4b 之后这条从「预防性检查」升级为必做项** —— `cmds()` 现在真的走
-  `commandProfile` 了）：把 `field_normalization_enabled` 设成 false 重启后台服务，
-  仪表盘/网络/WiFi 三个页面仍有数据，且 `/api/diagnose` 的
-  `device_profile.normalization_enabled` 为 `false`。
+- **排障开关回归 —— 2026-09-22 已实机执行，结论「通过」**（**0.4b 之后这条从「预防性检查」
+  升级为必做项** —— `cmds()` 现在真的走 `commandProfile` 了）：把 `field_normalization_enabled`
+  设成 false 重启后台服务，**仪表盘 / 网络 / WiFi 三页仍有数据**，`/api/diagnose` 的
+  `device_profile` 报「归一化已关闭」+「生效 profile：无」，app 诊断页的「运行时实际状态」
+  显示「已关闭 · 原样透传设备字段」——「关掉归一化不会打瘫只读面」这条不变量在真机上成立。
+  **但同一次验证暴露了一个 P0**：唯一失效的功能是**流量限额**（不是显示不对，是静默错数据 +
+  不可回滚的落库），已由 `45b86ff` 修掉 —— 详见下面 §11.13 与 §15 的 P1-28。
   **单测替身（0.4a 起有，0.4b 已随 fallback 删除同步改名）**：`GoformCommandTableGuardTest` 的
   「关掉归一化后 `cmds` 仍然非空且等于 `commandProfile` 的登记表」
   +「关掉归一化时 `coverageReport` 不向设备发查询」两条，把「关掉归一化不会打瘫只读面」
   与「关掉归一化不会开始真打设备」都钉住了（0.4a 时前者叫「…仍然返回 fallback」，
-  **保护的不变量一字未变**）。真机那一遍仍要做，单测替身只覆盖取值不覆盖端到端
+  **保护的不变量一字未变**）。这两条替身**没有也不可能**发现上面那个 P0 ——
+  它们钉的是「命令还发得出去」，而坏掉的是「发回来的值怎么解」，
+  所以 `45b86ff` 另补了 `GoformNormalizeAlwaysTest`（9 例，见 §11.13）
 - 真机回归（无真机则标 `[!]`）：重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 /
   **手动拨号与挂断**（`PPP_DIAL`，与「开关移动数据」是不同的 key、不同的失败路径，必须分开点）/
   切连接模式 / 改 SSID / 改密码 / 改功率 / **开关 WiFi**（`WIFI_ENABLED`，开与关走两条不同命令，
@@ -1018,6 +1026,23 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   §「负面清单」里 `POST /api/wifi/chip` 那条改成指向频段端点。
   `node scripts/verify-api-contract.mjs` 五项 P0 全空、P1「负面清单已过期」由 1 → 0。
   对应代码：`0892412`（device-schema）、`6033f91`（core 接线）、`78692b7`（web）、`1c71fa9`（app）。
+- 2026-09-22 **批 16 同步**（排障开关实机验证 + 验出的 P0 修复 + WiFi 三个选择控件统一下拉）：
+  §4 验收的「排障开关回归」那条标**已实机执行 / 通过**并写清「同一次验证暴露一个 P0」；
+  §4 0.8 的测试清单补 `GoformWifiBandParamsTest`（批 15 漏记）与 `GoformNormalizeAlwaysTest`，
+  `:core:goform:test` 合计写实为 **95**；§9 追加执行记录批 16；
+  §9「阶段 0 收尾盘点」的真机验证清单第 3 项改成**已执行 / 通过**（原文保留 + 结论与 P0 写在下面），
+  开头那句「四项一项都没做」改成「第 3 项已过，剩三项」；
+  **新增 §11.13**（「按 canonical 重组的派生出口」这个新认识 + 排障开关作用域的准确口径 +
+  两处我之前说错的更正）；§15 新增 **P1-28**（那个 P0 的**剩余风险**：真机库里那段时间的
+  小时级流量行上下行是反的，**是否清理待用户裁决**，本轮没有动数据库）。
+  对应代码：`45b86ff`（core：`GoformFieldMapper` 的 `NORMALIZE_ALWAYS` 豁免 + `DataScheduler`
+  两处注释 + 新增 `GoformNormalizeAlwaysTest`）、`b5df249`（app WiFi 弹窗三控件统一 `UfiDropdown`）、
+  `8421a19`（web WiFi 弹窗改 `n-select`，并改掉 `GeneralPanel.vue` 里一句写错的影响面文案）。
+  `node scripts/verify-api-contract.mjs` 五项 P0 全空、P1「负面清单已过期」= 0（未新增）。
+  本轮**不改代码**（上面三个 commit 是前序，本轮只同步文档）、**没有重跑 Gradle**
+  （用户在并行改 `app/**` / `web/**`，见 §13.3 最后一条）；`45b86ff` 的
+  「`:core:goform:test` 86 → 95 全绿、守门测试仍 9 例」沿用该 commit 的自报结果，
+  本轮只核了 `@Test` 计数与代码逻辑。
 
 
 ### 执行记录
@@ -1252,13 +1277,64 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   **不照抄 brief 里的数字** —— 也正因此抓到了上面那个 11→9 的算错。
   第1、2 层的 ✓ 沿用 `680fbae` 的自报结果，本文档轮**没有重跑 Gradle**（用户正在并行改
   `scripts/**` / `app/**` / `web/src/**`，抢构建锁只会拿到一份混合状态的结果，见 §13.3 最后一条）。
+- 2026-09-22 **阶段 0 批 16**（排障开关实机验证 → 验出 P0 → `45b86ff` 修复）。
+  1. **实机验证（用户做的，第 4 层）**：`field_normalization_enabled=false` + 重启后台服务，
+     仪表盘 / 网络 / WiFi 三页**仍有数据**，`/api/diagnose` 的 `device_profile` 报「归一化已关闭」
+     +「生效 profile：无」，app 诊断页「运行时实际状态」显示「已关闭 · 原样透传设备字段」。
+     → 收尾盘点第 3 项**通过**。**唯一失效的功能是流量限额**（用户原话：
+     「关闭后目前只发现流量限额相关的功能失效异常」）。
+  2. **那个 P0 的真实爆炸半径**（三条都回代码核过，比「显示不对」严重得多）：
+     - `monthly_rx_bytes ← monthly_tx_bytes` 是 `ZteGoformProfile.kt:255-266` 的**刻意交叉绑定**
+       （ZTE 固件把上下行报反，2026-09-01 实测值写在那段注释里）。豁免之前关掉开关，
+       `DataScheduler.collectGoformTraffic()`（`:1122-1148`）拿到的是设备原值，
+       随后 `recordHourlyUsage(rx, tx)`（`:1224`）→ `trafficHourlyDao().addUsage(...)`（`:1287`）
+       **把颠倒的上下行落库** —— 开关改回 true 也修不回来。
+     - `limit_bytes` / `limit_value` / `limit_unit_display` 是 `splitDataVolumeLimit`
+       （`ZteGoformProfile.kt:1513-1530`）从复合串 `data_volume_limit_size`（形如 `"470_1024"`）
+       拆出来的**派生键，设备上不存在任何同名字段**，所以关掉归一化后哪一层都兜不到。
+     - `TrafficLimitMapper`（`core/api/.../TrafficLimitMapper.kt:32-45`）取不到就填默认值
+       （`enabled=false` / `limit_value=""` / `limit_unit_display="GB"` / `limit_bytes=0` /
+       `alert_percent="80"` / `auto_clear=false` / `clear_date="1"`）→ 症状是
+       「**字段一个不缺、没有报错、值全错**」；`DataScheduler.checkTrafficLimitThrottled()`
+       （`:868-890`）拿到 `limit_bytes=0` 后 `if (limitBytes <= 0L) return`（`:881`）
+       → **流量预警与到阈值自动关网静默失效，一行日志都不打**。
+  3. **修法（`45b86ff`，改 3 个文件）**：`GoformFieldMapper.normalize()` 的闸门
+     （`:112-116`）加 `NORMALIZE_ALWAYS` 清单（`:331`，当前只有 `FieldGroup.TRAFFIC_LIMIT`），
+     命中时经 `normalizeAlwaysProfile()`（`:137-150`）回落到**非空的 `commandProfile`** 继续归一化，
+     其余 9 组照旧 `return raw`。豁免生效时**按组打一次 WARN**（`ConcurrentHashMap.newKeySet()`
+     的 `add` 返回值当原子判据；这条路在 15s 流量循环上，每次都打会灌满 `app.log` 并挤干
+     `AppLogger` 那 500 条崩溃现场缓冲）。WARN 出口做成可注入参数，理由与
+     `GoformClient.base64DecodeOrEmpty` 的 `onError` 同一条（`AppLogger` 在 JVM 单测里直接抛）。
+     判断依据与被否决的两个替代方案见 **§11.13**。
+  4. **测试**：新增 `GoformNormalizeAlwaysTest` **9 例**（豁免组真的归一化 3 条 / 非豁免组逐字透传
+     2 条 / WARN 打且只打一次 2 条 / `enabled`·`profileId`·`coverageReport`·`maskDump` 不受影响 2 条），
+     夹具复用 `core/device-schema/src/test/resources/zte_f50_goform_traffic_raw.json`（跨模块按路径找，
+     刻意不复制第二份）。`:core:goform:test` **86 → 95 全绿**，`GoformCommandTableGuardTest`
+     仍 **9 例**未动（本轮 `@Test` 计数逐文件数过 = 95）。
+  5. **同一批的 UI 轮**（与 P0 无关，用户裁决）：app `b5df249` 把 WiFi 弹窗的频段
+     （原 `UfiScrollableTabRow`）、加密方式（原 `UfiDialogChipSelector`）、最大连接数
+     （原 `UfiDigitField`）**统一换成公共下拉 `UfiDropdown`**；最大连接数选项 =
+     `listOf<Int?>(null) + 1..10`，`null` 显示「保持不变」，草稿类型 `String → Int?`，
+     随之删掉 `maxStaInvalid` / `maxLength=2` / 越界文案。
+     **原来「二选一用胶囊滑块」那条设计决策被推翻**，`WifiSettingsDialog.kt:345-350`
+     保留了原判断 + 推翻事实 + 接受的取舍。
+     web `8421a19` 把频段 `n-radio-group → n-select`、最大连接数 `n-input-number → n-select`，
+     「留空 = 不修改」改成显式「保持不变」档与 app 对齐；因为 naive-ui 对 `value: null`
+     **不会高亮选中项**，控件层用哨兵 `0`、在报文边界由 `wifiMaxStaNumForPayload`
+     （`web/src/api/contract.ts:782`）折成 `null`，`0` 进不了请求体。
+     **发出去的值仍是 `chip1`/`chip2` 与数字，界面文案不参与传输；两端基线均未增。**
+  6. 本轮文档同步的核对方式：逐条回代码查（闸门实现、`NORMALIZE_ALWAYS` 的内容、
+     `FieldGroup` 共 10 组、`@Test` 逐文件计数、`TrafficLimitMapper` 的七个默认值、
+     `checkTrafficLimitThrottled` 的 `return`、两端 WiFi 控件的实际组件名），
+     **不照抄 brief** —— 也正因此抓到了下面两处措辞要改（见 §11.13 第 4 节）。
 
 
 ### 阶段 0 收尾盘点（2026-09-22，批 13 之后）
 
 **结论先写**：阶段 0 的**代码工作已经全部落地**，但**阶段 0 还不能算完成** ——
-四项真机验证一项都没做（§14.3 第 3 层与 §14.4 第 4 层），按 §14.6 的纪律
-「四层里有任何一层没过就不能把阶段标 `[x]`」，整个阶段 0 只能标 `[~]`。
+四项真机验证**只过了第 3 项**（2026-09-22 实机执行，结论「通过」，但同时验出一个 P0，
+已由 `45b86ff` 修掉，剩余风险见 §15 的 P1-28），另外三项一项都没做（§14.3 第 3 层与 §14.4 第 4 层），
+按 §14.6 的纪律「四层里有任何一层没过就不能把阶段标 `[x]`」，整个阶段 0 只能标 `[~]`。
 
 #### 0.1 ~ 0.8 的最终状态与对应 commit
 
@@ -1283,6 +1359,8 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
 
 四项都需要真机，我做不了。每项后面写清「不验的后果」，因为这四项**都不是形式主义** ——
 其中两项对应的是已经发生的行为变更。
+**第 3 项 2026-09-22 已执行并通过，而且当场验出一个 P0**（见该项下的结论）——
+这本身就是「不验的后果」那一栏最好的证据：单测四条替身全绿，坏的那块一条都没碰到。
 
 1. **`44dec16` 的 WiFi 口令修复 6 步回归**（第 4 层）
    - ① 改 SSID **不带密码** → 改完用**原密码**能连上；
@@ -1303,6 +1381,7 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
      脚本级的逐字比对能证明**搬运没抄错**，但证明不了**设备照旧应答** ——
      真出问题的表现是某些字段悄悄变 missing（不报错、不崩溃），这正是 §14.3 判据 3/4 的用途。
 3. **`field_normalization_enabled=false` 的端到端回归**（第 4 层）
+   —— **`[x]` 2026-09-22 已执行，结论「通过」**（唯一失效项是流量限额，已修，见下面「实测结论」）
    - **入口 2026-09-22 起才存在**：此前这个键没进 `AppSettings.toMap()`、`PUT /api/config` 也没登记，
      只有「导入备份」改得动，所以这一项一直做不了。现在两处都补齐了，
      web 在「设置 › 通用」第三个排障开关、app 在「诊断信息 › 字段覆盖率」卡上方。
@@ -1312,9 +1391,22 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
      `device_profile.normalization_enabled` 为 **false**（app 的卡片会把这个值作为
      「运行时实际状态」直接显示，不必手动调接口）。
    - 验完记得改回 true 并再重启一次 —— 否则后续所有只读面都停在排障形态。
+   - **实测结论（2026-09-22）**：上面三条判据**全部满足** —— 三页有数据、`device_profile` 报
+     「归一化已关闭」+「生效 profile：无」、app 的「运行时实际状态」显示
+     「已关闭 · 原样透传设备字段」。所以 0.4b 最担心的那个后果（关掉归一化 → 只读面全空）
+     **没有发生**，`commandProfile` 顶命令表这条设计在真机上成立。
+   - **但验出一个 P0（已修，`45b86ff`）**：唯一失效的功能是**流量限额** ——
+     不是「显示不对」，而是①字段一个不缺、没有报错、值全错（派生键在设备上不存在，
+     `TrafficLimitMapper` 全填默认值）；②流量预警与到阈值自动关网**静默失效**
+     （`limit_bytes=0` → `checkTrafficLimitThrottled` 直接 `return`，一行日志都不打）；
+     ③最严重的一条：上下行交叉绑定失效后，颠倒的月累计被 `recordHourlyUsage()` **落库**，
+     **开关改回 true 也修不回来**。完整判断依据、被否决的替代方案与「往豁免清单加组的门槛」
+     见 **§11.13**；库里那段历史数据怎么处理见 **§15 的 P1-28（待用户裁决）**。
    - **不验的后果**：这是 0.4b 风险最集中的一处 —— 排障模式下 `normalizeProfile = null`，
      命令表全靠 `commandProfile` 顶着。切错了的表现是**关掉归一化就整个只读面变空**，
-     而那正是排障时最需要它工作的时刻。单测替身（守门测试第 ⑦⑧ 条）只覆盖取值、不覆盖端到端。
+     而那正是排障时最需要它工作的时刻。单测替身（守门测试第 ⑦⑧ 条）只覆盖取值、不覆盖端到端
+     —— 这一项实测过后可以补一句**更硬的教训**：那两条替身钉的是「命令还发得出去」，
+     真正坏掉的是「发回来的值怎么解」，所以它们全绿也拦不住上面那个 P0。
 4. **写操作真机回归清单**（第 4 层，**15 条**，见 §4 验收最后一条）
    - 重启 / 关机 / 恢复出厂 / 改后台密码 / 开关移动数据 / **手动拨号**与**挂断** /
      切连接模式 / 改 SSID / 改密码 / 改功率 / **开 WiFi** 与**关 WiFi** / 发短信 / 删短信 / 标已读。
@@ -1644,6 +1736,84 @@ DB 里的 signal / traffic 历史按 canonical 字段存，换设备后它们混
   若与 goform 重名会互相命中。阶段 2 给 key 加 `plugin_id` 前缀
 - 数量型能力（WiFi 有几个 chip、几个卡槽）用布尔集合表达不了。需要时加
   `DevicePlugin.limits: Map<String, Int>`，**不要**用 `WIFI_CHIP2` 这种带序号的布尔堆
+
+### 11.13 「按 canonical 重组的派生出口」不跟排障开关降级（已决，2026-09-22 批 16）
+
+这一条是第 3 项实机验证（见 §9 收尾盘点）当场验出来的，代码修在 `45b86ff`。
+它是一个**新认识**，不只是一个 bug：**将来任何一组 canonical 开始做重命名，都会掉进同一个坑。**
+
+#### 1. 出口分两类，排障开关只对一类有意义
+
+`field_normalization_enabled` 的语义是「读侧**原样透传**设备字段名，供排障时对照设备后台」。
+但读侧出口实际有两类：
+
+- **透传出口**：canonical 名基本就是设备原名，归一化只做 allowlist + 值解码。
+  关掉开关后响应里变回设备原名 —— 这正是排障想看的。
+  WiFi / 小区 / LAN / 身份 / 连接 / 频段 / 设备设置这几组都是。
+- **按 canonical 重组的派生出口**：值被拆过、方向被掰过、或者**键在设备上根本不存在**。
+  关掉开关它不会变成「设备原样」，只会变成「**错的**」——
+  字段一个不缺、没有任何报错、值全错，最难排的那一类。
+  今天只有 `FieldGroup.TRAFFIC_LIMIT`（`GET /api/device/traffic-limit`、
+  `/api/dashboard/summary` 的 `traffic_limit`、以及 `DataScheduler` 的落库路径）。
+
+所以豁免落在闸门本体：`GoformFieldMapper.normalize()` 的 `normalizeProfile ?: return raw`
+那一行前面先查一张 `NORMALIZE_ALWAYS` 清单，命中就回落到**非空的** `commandProfile`
+继续归一化（口径同 `cmds()`：字段归一化可以关，命令表不能关），其余 9 组照旧 `return raw`。
+豁免生效时**按组打一次 WARN**，指明组名、开关名、理由，并告诉排障的人真正该走哪个出口。
+
+#### 2. 为什么是「闸门本体」而不是 `TrafficLimitMapper`
+
+TRAFFIC_LIMIT 有**两个**调用点：`GoformSignalClient.getDataUsage()`（REST 出口，经
+`DataHub.getTrafficLimit()` 的 10s 缓存，也是 `DataScheduler` 的限额供给器）与
+`getTrafficStats()`（`DataScheduler` 的 15s 落库路径）。
+插在 mapper 里只能救 REST 那一条，**修不到落库那条路** —— 而落库才是不可逆的后果
+（`recordHourlyUsage()` → `trafficHourlyDao().addUsage()`，把上下行颠倒的增量写进小时桶，
+开关改回 true 也修不回来）。落在闸门上一处同时覆盖两个调用点。
+
+#### 3. 明确否决：给 `TrafficLimitMapper` 加「原始名兜底 + 复合串兜底解析」
+
+那等于把 `splitDataVolumeLimit` 这份**设备知识**（复合串怎么拆、乘数怎么映射单位、
+上下行是反的）在 `:core:api` 复制第二份，直接违反「设备知识只在 profile 里有一份」。
+两份迟早漂移，而漂移的表现又是静默错数字 —— 比原来的 bug 更难查。
+`TrafficLimitMapper` 的文件头写着「本文件不认识任何设备字段名」，那句话要继续成立。
+
+**往 `NORMALIZE_ALWAYS` 加组的门槛**：只有「按 canonical 重组的派生出口」才有资格。
+**纯透传出口一律不许加** —— 每加一个，这个排障开关就少一块可观察面，加满了它本身就废了。
+这条门槛由 `GoformNormalizeAlwaysTest`「豁免没有扩散到其它组」逐组守住
+（除 TRAFFIC_LIMIT 外每一组都必须 `assertSame(入参, 出参)`）。
+
+豁免后开关仍然覆盖 **9 组**：WIFI_SETTINGS / WIFI_CLIENTS / CELL_INFO / CONNECTION /
+IDENTITY / LAN_SETTINGS / DEVICE_SETTINGS / BAND_STATUS，加上 SIGNAL（它本来就与这个开关无关，
+见下面第 4 节）。`maskDump()`（原始 dump 只脱敏不归一化）与 `/api/diagnose` 的
+`enabled` / `profileId` / `coverageReport()` **一律不在豁免范围内**，
+§4 验收里那两条判据（`normalization_enabled` 为 false、`coverageReport` 短路不发查询）未动。
+
+#### 4. 两处以前说错 / 说窄了的措辞（更正）
+
+- **「`TrafficLimitMapper` 是 core 里唯一按 canonical 重组的服务端 mapper」—— 不对。**
+  至少还有两处：`NetworkRoutes.kt:120-129`（`/api/network/band-status` 按
+  `DeviceFields.BandStatus.*` 重组，缺失补 `""`）与 `DeviceRoutes.kt:458-475`
+  （`/api/device/settings` 注入派生键 `network_mode_label`）。
+  准确表述是：**它是唯一一个「按 canonical 重组」且「该组的 canonical 名与设备原名大面积不同」
+  的出口**。前两处之所以关掉开关也不坏，是因为它们读的 canonical 名恰好等于设备原名
+  （`lte_band_lock` / `nr_band_lock` / `net_select`），或者派生键只是在原值旁边**追加**一个标签。
+  → 这条要记住：**哪一组开始做重命名，这一组的重组出口就会掉进同一个坑。**
+- **`DataScheduler.kt:121-123` 那句「字段归一化的回退开关不覆盖这里」的作用域比字面窄。**
+  它只对注入的 `deviceProfile`（非空，默认 `ZteGoformProfile` → `SignalCollector`）成立，
+  所以**信号**确实不吃这个开关（`getSignalInfo()` 根本不调 `normalize()`，归一化在
+  `SignalCollector` 里用那份非空 profile 做）。但 scheduler 还有几条路是**吃**这个开关的：
+  经注入的 `signalClient` 走 `getTrafficStats()`（TRAFFIC_LIMIT，本条豁免后已不受影响）、
+  经注入 lambda 走 `dataHub.getTrafficLimit()`（同组）与
+  `wifiClient.getConnectedClients()`（WIFI_CLIENTS，**仍然吃**）。
+  本计划书此前没有引用过那句话，所以没有可改的正文；写在这里是为了下次别再照着那句话推结论。
+  ⚠ 顺带一个**尚未处置**的观察：`checkDeviceEvents()` 直接取 `json["station_list"]?.jsonArray`，
+  而 WIFI_CLIENTS 的 `structuralDecoder`（`normalizeStationLists`）才负责把设备的
+  「数组的 JSON 字符串」这种双重编码拉平成真数组。关掉归一化时这一步没了，
+  那行取值会抛 → 被 catch 吞掉、基线清空，**设备接入/离开事件静默停摆**。
+  它没在实机验证里暴露，因为 `device_events_enabled` 默认关着。
+  **不按本条处理**：WIFI_CLIENTS 是透传出口（键名就是设备原名），加进 `NORMALIZE_ALWAYS`
+  正是第 3 节禁止的事；真要修就是让消费端容忍两种形态（API 手册已经这么要求客户端了）。
+  登记在这里，动 scheduler 时再定。
 
 ---
 
@@ -2532,6 +2702,32 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
   作为「运行时实际值」显示出来，与配置值不一致时给提示 —— 这是两端都能自证的做法，不是假开关。
 - 归属：要把它算进 `needs_restart` 就得同时改 `hint` 的语义（现在是「认证或端口」一句话），
   属于对外响应语义变更，与 route 层的其它整理一起做。**在那之前不许把 UI 文案改成依赖 `needs_restart`。**
+
+#### 批 16 新登记（P1-28）
+
+**P1-28 排障开关那次实测期间，库里的小时级流量行上下行是反的（`45b86ff` 的**剩余风险**，
+清不清**待用户裁决**）**
+
+- 前提：根因已修（§11.13 / `45b86ff`），**这条只讲已经写进数据库的历史数据**。
+  本轮**没有动数据库**，一行都没删没改。
+- 事实：`field_normalization_enabled=false` 且尚未打豁免的那段时间里，
+  `DataScheduler.collectGoformTraffic()` 拿到的是设备原值（ZTE 把上下行报反），
+  `recordHourlyUsage()` → `trafficHourlyDao().addUsage(hourStart, rxDelta, txDelta)`
+  按那个方向落库。所以那段时间的小时行**每行的 rx / tx 互换了**。
+- 事实：**总量是对的**，错的只有方向 —— `rxDelta + txDelta` 不受交换影响。
+  所以「今日 / 本月用量」「限额百分比」这些看合计的地方没受影响，
+  受影响的只有**按上下行分开看**的图表与明细。
+- 事实（自愈边界，已按代码核过）：基准存在 `AppSettings.trafficHourlySamplerJson` 里，
+  切回正确方向后的第一次采样会命中 `TrafficHourlyAccumulator.decide` 的
+  `counter-reset`（`monthTx < prev.tx`，因为原 tx 是大的那个）或 `offline-gap`（重启超过 10 分钟）
+  → **丢弃这一次增量**。也就是说切换瞬间**不会**在图上长出一根假柱，
+  代价是丢一段（一个采样间隔）。所以污染范围严格限于「开关关着的那段时间」的小时行。
+- 三个选项（**要用户定**，我不动数据）：
+  ① 不管 —— 只有分方向的图会看出异常，且只有那几个小时；
+  ② 把那段时间的行 `rx`/`tx` 互换回来 —— 需要**准确的起止时刻**（开关关掉那一刻到改回并重启那一刻），
+     起止判断错了会把正确的行也掰反，比现在更糟；
+  ③ 删掉那段时间的小时行 —— 与「宁可少一段，不能凭空多一段」的既有取舍一致，最不容易做错。
+- 归属：**不属于阶段 0~5 的任何一步**，是一次性的数据处置。裁决前不要顺手写迁移脚本。
 
 
 
