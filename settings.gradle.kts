@@ -27,6 +27,8 @@ include(":app")   // 前端
 // ★ Phase 1 模块化重构：低风险模块抽取
 include(":core:contract")   // 双端共享契约常量（纯 JVM，无任何依赖）
 include(":core:device-schema") // 设备字段映射注册表（纯 JVM，仅依赖 contract）
+include(":core:device-spi")  // 设备 SPI（插件契约层，不含任何具体协议）
+include(":core:device-plugins")  // 设备插件实现（一个 module、每设备一个 package）
 include(":core:common")     // 工具类 + 基础设施（无依赖）
 include(":core:database")   // Room 数据库（无 common 依赖）
 include(":core:goform")     // Goform 协议客户端（依赖 common）

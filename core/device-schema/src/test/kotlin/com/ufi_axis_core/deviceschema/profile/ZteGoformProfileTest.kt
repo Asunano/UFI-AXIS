@@ -1086,6 +1086,77 @@ class ZteGoformProfileTest {
         assertNotNull(nr.validate(mapOf("value" to "n78")))
     }
 
+    /**
+     * 频段全集掩码的**逐字冻结**（阶段 2 批 D1 / 任务 2.9）。
+     *
+     * 这两串是设备事实（原注释写的是「ZTE MU300 全 LTE / NR 频段（解锁时使用）」），
+     * 2.9 之前它们是 `GoformNetworkClient` 的 companion 常量、外加 `core/contract` 的一份
+     * 零引用拷贝，共三份同值。收进 profile 之后这里是唯一真源，所以取值被改动时必须红 ——
+     * 「解锁全部频段」发出去的 `lte_band_lock` / `nr_band_lock` 就是这两串。
+     *
+     * 断言返回**非空**也是判据之一：`null` 在契约里是「该设备不下发全集」（见
+     * `DeviceProfile.lteAllBandsMask` 的 KDoc），对 ZTE 而言那会静默改掉解锁行为。
+     */
+    @Test
+    fun `频段全集掩码逐字冻结`() {
+        assertEquals("1,3,5,8,34,38,39,40,41", ZteGoformProfile.lteAllBandsMask())
+        assertEquals("1,5,8,28,41,78", ZteGoformProfile.nrAllBandsMask())
+        // 全集串自己必须过得了同一条值域校验（否则「解锁」会被 validate 拒掉、根本不发请求）
+        assertNull(
+            ZteGoformProfile.writeSpec(SettingKey.BAND_LOCK_LTE)!!
+                .validate(mapOf("value" to ZteGoformProfile.lteAllBandsMask()))
+        )
+        assertNull(
+            ZteGoformProfile.writeSpec(SettingKey.BAND_LOCK_NR)!!
+                .validate(mapOf("value" to ZteGoformProfile.nrAllBandsMask()))
+        )
+    }
+
+    /**
+     * WiFi 二维码文件名候选的**逐字冻结**（阶段 2 任务 2.10 / 计划书 §15 的 P1-5）。
+     *
+     * 这两个名字与它们的先后顺序是设备事实：2.10 之前写死在 `GoformWifiClient` 的一段
+     * `linkedSetOf` 里，搬进 profile 之后这里是唯一真源。拼错一个字符、或者把兜底挪到前面，
+     * 用户「扫码直连」就会拿不到图 / 拿到另一个频段那一张 —— 而这条路径**没有真机测不出来**
+     * （它走的是文件端点、返回图片字节流），所以取值被改动时必须红。
+     *
+     * 第一条断言刻意取 `chip1` + 第 1 个 SSID：那是**主候选与兜底重名**的情形。契约要求
+     * 实现方自己去重（调用方按返回顺序原样逐个发请求、不做过滤），漏了去重就是对同一个文件
+     * 多发一次 HTTP。
+     */
+    @Test
+    fun `二维码文件名候选逐字冻结`() {
+        // chip1 + 第 1 个 SSID：主候选与兜底同名，去重后只剩一项
+        assertEquals(
+            listOf("chip1_ssid1_qrcode_wifikey"),
+            ZteGoformProfile.qrCodeFileNames("chip1", 1)
+        )
+        // 5G：主候选在前、兜底（已知一定会生成的那一张）在后
+        assertEquals(
+            listOf("chip2_ssid1_qrcode_wifikey", "chip1_ssid1_qrcode_wifikey"),
+            ZteGoformProfile.qrCodeFileNames("chip2", 1)
+        )
+        // 第 2 个 SSID：序号进主候选的名字，兜底仍是 chip1 的第 1 个
+        assertEquals(
+            listOf("chip1_ssid2_qrcode_wifikey", "chip1_ssid1_qrcode_wifikey"),
+            ZteGoformProfile.qrCodeFileNames("chip1", 2)
+        )
+        assertEquals(
+            listOf("chip2_ssid2_qrcode_wifikey", "chip1_ssid1_qrcode_wifikey"),
+            ZteGoformProfile.qrCodeFileNames("chip2", 2)
+        )
+        // 契约里的两条硬约束：实现方自己去重、且 ZTE 永远不返回空列表
+        // （空列表在契约里是「该设备不支持从后台取二维码图」，对 ZTE 而言那是行为变更）
+        for (chip in listOf("chip1", "chip2")) {
+            for (i in 1..3) {
+                val names = ZteGoformProfile.qrCodeFileNames(chip, i)
+                assertEquals("$chip / 第 $i 个 SSID 的候选里有重复项", names.distinct(), names)
+                assertTrue("$chip / 第 $i 个 SSID 的候选不该为空", names.isNotEmpty())
+            }
+        }
+    }
+
+
     @Test
     fun `WiFi 休眠时间只接受非负整数`() {
         val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_SLEEP_IDLE_MINUTES)!!

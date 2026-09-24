@@ -18,7 +18,10 @@ import org.robolectric.annotation.Config
  *
  * 因此这里钉两件事：
  * 1. **进程内初值不得比持久化默认值更宽松**（[初值不放行 DEBUG]）；
- * 2. [AppLogger.restoreSwitches] 三层都要真的生效（[恢复三层]、[总闸关掉后一条不记]）。
+ * 2. [AppLogger.restoreSwitches] 三层都要真的生效（[恢复三层]）。
+ *
+ * 2026-09-24 又加第三件（计划书 §15 P1-32）：总闸关掉时 **WARN/ERROR 仍须落地、INFO/DEBUG 不落地**
+ * （[总闸关掉后 INFO 与 DEBUG 不记但 WARN 与 ERROR 仍记]、[shouldEmit 的判定表]）。
  *
  * 刻意**不调用** `AppLogger.init()`：init 会去 `/sdcard/Download/...` 建目录，
  * 单测不该在开发机上留文件。不 init → `logDir == null` → `writeToFile` 直接返回，
@@ -111,21 +114,86 @@ class AppLoggerSwitchTest {
     }
 
     @Test
-    fun `总闸关掉后一条不记`() {
+    fun `总闸关掉后 INFO 与 DEBUG 不记但 WARN 与 ERROR 仍记`() {
+        // 2026-09-24（计划书 §15 P1-32，用户裁决方案 ①）：WARN/ERROR 无视日志总开关始终落地。
+        //
+        // 为什么必须这样：log_enabled 的持久化默认值是 false（AppSettings.DEFAULT_LOG_ENABLED），
+        // 而 log() 第一步就按总闸提前返回 —— 于是「不许静默失败」这条纪律在**默认部署下不成立**：
+        // 排障级 WARN（未登记写入项 / 掩码缺失 / profile 回落）一条都不落地，
+        // 用户得先开开关、重启 core、再复现一次。
+        //
+        // 断言只覆盖内存缓冲：本测试刻意没 init()（不想在开发机上建 /sdcard 目录），
+        // 落盘那条路由 writeToFile 负责，不在断言范围内。缓冲与文件共用同一个总闸判定
+        // （AppLogger.shouldEmit），所以缓冲进得去 = 文件那条路也不会被总闸拦住。
         AppLogger.restoreSwitches(logEnabled = false, coreLogEnabled = true, debugMode = true)
         AppLogger.clearBuffer()
         AppLogger.d("SwitchTest", "master-off-debug")
+        AppLogger.i("SwitchTest", "master-off-info")
+        AppLogger.w("SwitchTest", "master-off-warn")
         AppLogger.e("SwitchTest", "master-off-error")
-        assertTrue("log_enabled=false 必须连 ERROR 都不记", AppLogger.getBufferedLogs().isEmpty())
+        val logs = AppLogger.getBufferedLogs()
+        assertTrue("总闸关掉后 DEBUG 不该落地（噪音与存储：INFO/DEBUG 仍受开关管）", logs.none { "master-off-debug" in it })
+        assertTrue("总闸关掉后 INFO 不该落地（刻意没把 INFO 一起放行）", logs.none { "master-off-info" in it })
+        assertTrue("总闸关掉后 WARN 必须落地 —— 否则默认部署下排障 WARN 一条都没有", logs.any { "master-off-warn" in it })
+        assertTrue("总闸关掉后 ERROR 必须落地 —— 不许静默失败", logs.any { "master-off-error" in it })
+        // isLogEnabled() 仍是「两个开关都开」的与语义（GoformSessionLog 用它决定要不要写会话诊断文件），
+        // 不因为 WARN/ERROR 放行而改变。
         assertEquals(false, AppLogger.isLogEnabled())
+    }
+
+    @Test
+    fun `shouldEmit 的判定表`() {
+        // 把「是否落地」抽成纯函数后可以直接钉判定表，不依赖单例状态、不碰落盘代码。
+        // 口径：core 子开关是硬闸（它有独立语义 —— 只关 core 这一侧、保留手机端日志，
+        // 且默认 true，不存在「用户没碰过开关就拿不到线索」的问题）；
+        // 总闸只管 INFO/DEBUG。
+        for (level in AppLogger.LogLevel.entries) {
+            assertTrue(
+                "两个开关都开时 $level 必须落地",
+                AppLogger.shouldEmit(level, loggingEnabled = true, coreLogEnabled = true)
+            )
+            assertEquals(
+                "core 子开关关掉时 $level 一律不落地（它的语义是按侧静音，没有被放行）",
+                false,
+                AppLogger.shouldEmit(level, loggingEnabled = true, coreLogEnabled = false)
+            )
+            assertEquals(
+                "core 子开关关掉时 $level 不因总闸而放行",
+                false,
+                AppLogger.shouldEmit(level, loggingEnabled = false, coreLogEnabled = false)
+            )
+        }
+        assertEquals(
+            "总闸关掉时 DEBUG 不落地",
+            false,
+            AppLogger.shouldEmit(AppLogger.LogLevel.DEBUG, loggingEnabled = false, coreLogEnabled = true)
+        )
+        assertEquals(
+            "总闸关掉时 INFO 不落地",
+            false,
+            AppLogger.shouldEmit(AppLogger.LogLevel.INFO, loggingEnabled = false, coreLogEnabled = true)
+        )
+        assertTrue(
+            "总闸关掉时 WARN 必须落地（§6 验收 2.11 的判据就是「必须有一行 WARN」）",
+            AppLogger.shouldEmit(AppLogger.LogLevel.WARN, loggingEnabled = false, coreLogEnabled = true)
+        )
+        assertTrue(
+            "总闸关掉时 ERROR 必须落地",
+            AppLogger.shouldEmit(AppLogger.LogLevel.ERROR, loggingEnabled = false, coreLogEnabled = true)
+        )
     }
 
     @Test
     fun `core 子开关关掉后 core 侧不记`() {
         AppLogger.restoreSwitches(logEnabled = true, coreLogEnabled = false, debugMode = true)
         AppLogger.clearBuffer()
+        AppLogger.w("SwitchTest", "core-off-warn")
         AppLogger.e("SwitchTest", "core-off-error")
-        assertTrue("core_log_enabled=false 时 core 侧不该再记录", AppLogger.getBufferedLogs().isEmpty())
+        assertTrue(
+            "core_log_enabled=false 时 core 侧不该再记录 —— WARN/ERROR 只无视总闸，不无视这一个",
+            AppLogger.getBufferedLogs().isEmpty()
+        )
         assertEquals(false, AppLogger.isLogEnabled())
     }
 }
+

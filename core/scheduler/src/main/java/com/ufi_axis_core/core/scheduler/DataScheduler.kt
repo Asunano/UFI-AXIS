@@ -16,7 +16,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.contentOrNull
 import com.ufi_axis_core.core.database.CpuHistoryRecord
@@ -29,6 +28,8 @@ import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
+import com.ufi_axis_core.util.StationListShape
+import com.ufi_axis_core.util.parseStationList
 import com.ufi_axis_core.notify.NotifyEvent
 import com.ufi_axis_core.notify.NotifyLevel
 import com.ufi_axis_core.notify.NotifyScenes
@@ -897,7 +898,13 @@ class DataScheduler(
      *   全当成「刚接入」报一遍；
      * - 供给器返回 null（开关关闭或查询失败）时**丢弃基线**，下一次成功查询重新建基线 ——
      *   宁可漏报一轮，也不要因为中间断了几分钟而把一批设备误判成上下线；
-     * - MAC 统一小写去空白后作键，设备在不同接口里大小写不一致。
+     * - MAC 统一小写去空白后作键，设备在不同接口里大小写不一致；
+     * - **`station_list` 解析不出来时保留基线、不产生任何事件**（2.11 / P1-29）：
+     *   设备对这个字段有两种形态（真数组 / 数组的 JSON 字符串），排障开关关掉归一化时
+     *   会原样透出后者。此前这里直读 `jsonArray` 会抛 → 被下面的 catch 吞掉 → 基线清空，
+     *   于是「设备接入/离开」在整个排障期间**不报也不报错**。
+     *   刻意**不**在这条路径上清基线：那种场景每轮都失败，清了就等于永久静默停摆；
+     *   保留基线则解析一恢复就能和失败前的集合做差，把这段时间真实的上下线补报出来。
      */
     private suspend fun checkDeviceEvents() {
         val provider = stationListProvider ?: return
@@ -908,7 +915,22 @@ class DataScheduler(
                 knownStations = null
                 return
             }
-            val list = json["station_list"]?.jsonArray ?: return
+            val list = when (val shape = parseStationList(json["station_list"])) {
+                is StationListShape.Available -> shape.stations
+                // 设备没给这个字段：正常形态之一，静默跳过（打 WARN 会每分钟刷一条无用日志）
+                StationListShape.Missing -> return
+                // 有值但解不出数组：真解析失败，必须留痕。文案逐字固定，
+                // 好让 AppLogger.repeatGate 按「级别+tag+完整消息」折叠成 1 条/分钟 ——
+                // 不许把设备数据拼进来（那会让基数无界、折叠失效）。
+                StationListShape.Malformed -> {
+                    AppLogger.w(
+                        tag,
+                        "station_list 解析失败：既不是数组、也不是数组的 JSON 字符串" +
+                            " —— 本轮跳过设备事件判定，基线保留（这不是「没有接入设备」）"
+                    )
+                    return
+                }
+            }
             val current = LinkedHashMap<String, String>()
             for (element in list) {
                 val row = element.jsonObject

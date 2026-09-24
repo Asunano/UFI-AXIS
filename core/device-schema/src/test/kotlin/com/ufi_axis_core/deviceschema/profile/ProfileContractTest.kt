@@ -112,6 +112,13 @@ class ProfileContractTest {
 
     // ───────────────────────── 注册表 ─────────────────────────
 
+    // 下面两条**刻意保留**对已废弃的 [DeviceProfiles] 的引用（计划书 §6 的 2.6）：
+    // 旧注册表在阶段 2 批 C 只标了 @Deprecated、实现一行未动，而它仍是线上兜底的来源
+    // （`SignalCollector` / `DataScheduler` 那两处 `= ZteGoformProfile` 默认参数还没改成
+    // 从 `DeviceRuntime` 取）。没删之前它的行为就得有测试守着 —— 为了消 warning 删掉断言
+    // 等于在真正删掉它之前先把守门测试删了。等 2.6 的收尾把那两处改完、本类连同旧注册表一起删。
+    // 新口径的对应断言在 `PluginContractTest`（`:core:device-plugins`）。
+    @Suppress("DEPRECATION")
     @Test
     fun `注册表按 id 查得到且认不出时返回 null`() {
         assertEquals(ZteGoformProfile, DeviceProfiles.byId("zte-goform"))
@@ -123,6 +130,7 @@ class ProfileContractTest {
         assertEquals(ZteGoformProfile, DeviceProfiles.DEFAULT)
     }
 
+    @Suppress("DEPRECATION")
     @Test
     fun `注册表里的 id 不重复`() {
         val ids = DeviceProfiles.ALL.map { it.id }

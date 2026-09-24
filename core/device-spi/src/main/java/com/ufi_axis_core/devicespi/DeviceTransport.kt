@@ -1,4 +1,4 @@
-package com.ufi_axis_core.controller.goform
+package com.ufi_axis_core.devicespi
 
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -12,7 +12,8 @@ import java.io.Closeable
  *
  * 约定：
  * - 仅声明**跨模块**真正用到的公开实例方法（共 14 个，含 [Closeable.close]）。
- *   `core/goform` 内部才需要的 goform 协议成员在 [GoformTransport] 那一层，不上这里。
+ *   `core/goform` 内部才需要的 goform 协议成员在 [GoformTransport] 那一层，不上这里
+ *   （[GoformTransport] 在 `:core:goform`，本接口所在的 `:core:device-spi` 不依赖它）。
  *   ⚠ [GoformTransport] 因为 Kotlin 的 `EXPOSED_PARAMETER_TYPE` 检查**不得不是 public**
  *   （6 个客户端是 public class、构造点在 `:core`），所以「不上这里」现在靠**纪律 + 守门测试**
  *   （`GoformTransportVisibilityGuardTest`）维持，不是靠语言约束。详见 [GoformTransport] 的 KDoc。
@@ -26,7 +27,8 @@ import java.io.Closeable
  *   所以它上了 module 内那一层，而不是留成 private。
  * - 没有 companion 静态工具需要暴露：原来挂在 [GoformClient] companion 上的
  *   `mapNetworkType()` 已于 2026-08-29 删除（值映射搬进 `ZteGoformProfile`，见计划书 13.2.4）。
- * - 实现见 [GoformClient]（经 [GoformTransport] 直接实现本接口）。
+ * - 实现见 [GoformClient]（经 [GoformTransport] 直接实现本接口）——
+ *   [GoformClient] 与 [GoformTransport] 都在 `:core:goform`。
  *
  * 迁移状态（2026-08-29，设备适配层计划书 3.3 已完成）：跨模块调用点全部走接口 ——
  * `RouteContext.goformClient` / `NetworkDeps.goformClient` / `ComponentGraph.NetworkGraph.goformClient`

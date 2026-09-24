@@ -3,7 +3,6 @@ package com.ufi_axis_core.controller.goform
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.SettingKey
-import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
@@ -22,16 +21,43 @@ import kotlinx.serialization.json.*
  * - WiFi 连接二维码
  *
  * @param profile 字段映射表；传 null 关闭归一化（原样透传设备字段，见 [GoformFieldMapper]）
+ * @param commandProfile 命令表来源，非空；由装配层传选中插件的 profile
+ *
+ * ## 两份 profile 的分工
+ *
+ * - [profile]（**可空**）只管**字段归一化**：`null` = 排障开关关掉了归一化。
+ *   它决定 `GoformFieldMapper.enabled` / `profileId`，而那个 `profileId` 一路传到
+ *   `/api/diagnose` 的 `device_profile.normalization_enabled`（链路见 [GoformSignalClient]），
+ *   所以**不许**在本类里给它补非空兜底 —— 那个排障开关会永远报 `true`。
+ * - [commandProfile]（**非空**）只喂**命令表**：字段归一化可以关，命令表不能关 ——
+ *   没有 cmd 列表连一条 WiFi 查询都发不出去。
+ *
+ * ## 为什么 [commandProfile] 没有默认值、也不许在本类里兜底
+ *
+ * 这里原来写的是 `GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)` ——
+ * 命令表由客户端自己回落到**注册表默认插件**的 profile。单插件时两者同值；
+ * 接第二台设备之后，「用户打开排障开关（关归一化）」就会顺带把命令表悄悄换成
+ * **默认设备**的命令表 —— 排障模式下向 B 设备发 A 设备的 cmd。
+ * 一个排障开关不该改变「往设备发什么命令」（同一条判据见 `DeviceRuntime.commandProfile`）。
+ *
+ * 所以命令表那一份由调用方（`ComponentFactory`，传 `runtime.commandProfile` =
+ * **选中插件**的 profile）定下来，构造参数**不给默认值**：默认值等于把选型逻辑散进每个
+ * 客户端的签名，换设备要改 N 处且漏一处不报错。口径与 [GoformSmsClient] 一致。
  */
 class GoformWifiClient(
     private val client: GoformTransport,
     profile: DeviceProfile?,
+    private val commandProfile: DeviceProfile,
 ) {
     private val tag = "GoformWifi"
     // 双 profile：可空那份管归一化（排障开关关掉就是 null），非空那份管命令表。
-    // 口径与同文件下一行的 GoformSettingWriter 一致 —— 它内部也是 `profile ?: ZteGoformProfile`。
-    private val fields = GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)
-    private val writer = GoformSettingWriter(client, profile)
+    // 命令表**不在这里兜底** —— 兜底会让排障模式下的命令表悄悄换成默认设备的（见类 KDoc）。
+    private val fields = GoformFieldMapper(profile, commandProfile)
+    // 写侧同理吃非空那份（阶段 2 批 D1，P1-31）：原来传的是可空 profile，
+    // 由 writer 内部 `?: ZteGoformProfile` 兜底 —— 那会让排障模式下的**写命令表**
+    // 悄悄换成默认设备的（读侧换字段名是排障想要的，写侧发错命令不是）。
+    private val writer = GoformSettingWriter(client, commandProfile)
+
 
     // ==================== WiFi 查询 ====================
 
@@ -47,7 +73,9 @@ class GoformWifiClient(
      * 获取 WiFi 连接二维码图片。
      *
      * 与其它 goform 调用不同，这个端点返回的是**图片字节流**而不是 JSON：
-     * `/goform/goform_get_file_process/{chip}_ssid{index}_qrcode_wifikey`。
+     * `/goform/goform_get_file_process/<文件名>`，而**文件名由 profile 给**
+     * （[DeviceProfile.qrCodeFileNames]，阶段 2 任务 2.10 / 计划书 §15 的 P1-5）——
+     * 本文件只负责拼路径、发请求、验字节头。
      * 图片由设备按当前 SSID/密码实时生成，所以改完 WiFi 配置重新拉一次就是新的。
      *
      * @return (图片字节, Content-Type)；非 2xx、空响应、拿到非图片内容都返回 null。
@@ -70,13 +98,24 @@ class GoformWifiClient(
         // 否则 baseUrl() 只是未验证的拼装值（端口/宿主不对就直接连不上）。
         client.ensureBaseUrlResolved()
 
-        // 候选文件名：先按请求的频段/序号，失败再退回已知可用的 chip1_ssid1。
-        // 有些固件只生成 2.4G 那一张（chip2_ssid1_… 直接 404），此时给用户一张能用的
-        // 比什么都不显示更有意义 —— 二维码内容是 SSID/密码，两个频段通常同密码。
-        val names = linkedSetOf(
-            "${chip}_ssid${ssidIndex}_qrcode_wifikey",
-            "chip1_ssid1_qrcode_wifikey"
-        )
+        // 候选文件名与它们的尝试顺序由 profile 给（阶段 2 任务 2.10）：「先按请求的频段/序号取、
+        // 取不到退回已知一定会生成的那一张」整条都是**设备事实**，不是本客户端的策略
+        // （理由与去重约定见 [DeviceProfile.qrCodeFileNames]）。
+        //
+        // 取**非空**的 [commandProfile]：这条读取与命令表同一侧 —— 排障开关（关掉字段归一化）
+        // 不该改变「向设备请求哪个文件」，口径同 [GoformNetworkClient] 的两个频段全集方法。
+        val names = commandProfile.qrCodeFileNames(chip, ssidIndex)
+        if (names.isEmpty()) {
+            // 空列表 = 该 profile 没登记二维码文件名（契约里「空列表 ≠ 文件不存在」）。
+            // 行为与「所有候选都取不到」**完全一致**：下面的循环一条请求都不发，
+            // [lastQrCodeFailure] 落成空串、走同一句 WARN、返回 null（route 于是回不带真因的 503）。
+            // 刻意不抛异常：用户点一下「显示二维码」不该崩在读路径上。
+            AppLogger.w(
+                tag,
+                "${commandProfile.id} 未登记 WiFi 二维码文件名（chip=$chip, ssidIndex=$ssidIndex），" +
+                    "本次不发任何文件请求 —— 按「所有候选都取不到」处理"
+            )
+        }
         val failures = mutableListOf<String>()
         for (name in names) {
             val url = "${client.baseUrl()}/goform/goform_get_file_process/$name"

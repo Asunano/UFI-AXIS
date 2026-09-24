@@ -9,12 +9,23 @@ import com.ufi_axis_core.deviceschema.SettingKey
  *
  * 从 GoformClient 拆分，负责：
  * - SIM 卡槽切换
+ *
+ * @param commandProfile 写命令表来源，**非空、无默认值**；由装配层传选中插件的 profile。
+ *   理由（含「为什么不能在 writer 里兜底」）见 [GoformSettingWriter] 的类 KDoc。
+ *
+ * ## 为什么不收可空 `profile`
+ *
+ * 本类**目前没有读侧归一化路径**（不持有 [GoformFieldMapper]），可空 profile 的语义
+ * 「排障开关关掉了字段归一化」在这里无从生效，留着只会让人误以为归一化在本类里起作用。
+ * 将来长出读侧字段时，按 [GoformSignalClient] 的形状把可空 `profile` 加回来。
  */
 class GoformSimClient(
     private val client: GoformTransport,
-    profile: DeviceProfile?,
+    commandProfile: DeviceProfile,
 ) {
-    private val writer = GoformSettingWriter(client, profile)
+
+    private val writer = GoformSettingWriter(client, commandProfile)
+
 
     /**
      * 切换 SIM 卡槽。

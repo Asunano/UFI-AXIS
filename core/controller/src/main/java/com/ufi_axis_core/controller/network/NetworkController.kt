@@ -118,16 +118,21 @@ class NetworkController(
         unlockAll: Boolean = false
     ): BandLockResult {
         // unlockAll：同时发全频段 = 解除所有限制
+        // 全频段串从 networkClient 取（它再问自己的非空 commandProfile）—— 原来这里直读
+        // `GoformNetworkClient.LTE_ALL_BANDS` / `NR_ALL_BANDS` 两个 companion 常量，
+        // 那是 core/controller 对 core/goform 的跨模块直读，且全仓有三份同值拷贝
+        // （计划书 §15 的 P0-1 / 任务 2.9）。**取值逐字未变**：ZTE profile 返回的就是原来那两个串。
         val lteValue = when {
-            unlockAll -> GoformNetworkClient.LTE_ALL_BANDS
+            unlockAll -> networkClient.lteAllBands()
             lteBands != null -> lteBands
             else -> ""   // 未选 LTE → 清空该 RAT 限制（参考项目：lte_bands.join(',') 空数组→空串）
         }
         val nrValue = when {
-            unlockAll -> GoformNetworkClient.NR_ALL_BANDS
+            unlockAll -> networkClient.nrAllBands()
             nrBands != null -> nrBands
             else -> ""   // 未选 NR → 清空该 RAT 限制
         }
+
 
         if (!unlockAll && lteValue.isEmpty() && nrValue.isEmpty())
             return BandLockResult(false, "no_bands", false)

@@ -141,12 +141,9 @@ object NetworkMode {
         else -> bearer
     }
 
-    /** band lock 的"解锁"= 锁全部频段（来自 `GoformNetworkClient`）。 */
-    const val LTE_ALL_BANDS = "1,3,5,8,34,38,39,40,41"
-    const val NR_ALL_BANDS = "1,5,8,28,41,78"
-
     /**
      * 切换制式后的「回读确认」预算（2026-09-11 真机缺陷修复）。
+
      *
      * ## 为什么需要它
      *

@@ -742,6 +742,48 @@ object ZteGoformProfile : DeviceProfile {
     // 派生规则与设备无关（输入是已归一化的 canonical 字段），所以放在
     // com.ufi_axis_core.deviceschema.ServingCell 而不是这里 —— 否则每个新 profile 都要抄一遍。
 
+    // ───────────────── WiFi 连接二维码的文件名（读侧） ─────────────────
+
+    /**
+     * 二维码图片文件名的公共后缀。
+     *
+     * 整个名字的形状是 `<频段>_ssid<序号>` + 本后缀，由 goform 侧拼进
+     * `/goform/goform_get_file_process/<名字>`（路径前缀在传输层，不在本文件）。
+     */
+    private const val QR_CODE_FILE_SUFFIX = "_qrcode_wifikey"
+
+    /**
+     * 「已知一定会生成」的那一张二维码对应的频段 + SSID 序号，用作第二候选。
+     *
+     * 取值与 [WIFI_CHIP_FALLBACK] 的 `chip1` 同值但**不是同一件事**，刻意不合并成一个常量：
+     * 那个是写侧「开 WiFi 时读不到当前频段的兜底」，这个是读侧「取二维码图取不到时退回哪一张」。
+     * 合成一份会让两条互不相干的判据被同一次修改牵动。
+     */
+    private const val QR_CODE_FALLBACK_STEM = "chip1_ssid1"
+
+    /**
+     * WiFi 二维码图片的文件名候选（阶段 2 任务 2.10 / 计划书 §15 的 P1-5）。
+     *
+     * 两个候选与它们的顺序逐字照搬 `GoformWifiClient.getWifiQrCode` 改造前那段 `linkedSetOf`：
+     * 1. `<chip>_ssid<ssidIndex>` + [QR_CODE_FILE_SUFFIX] —— 调用方要的那一张；
+     * 2. [QR_CODE_FALLBACK_STEM] + [QR_CODE_FILE_SUFFIX] —— 兜底。有些固件只生成 2.4G 那一张
+     *    （`chip2_ssid1_…` 直接 404），此时给用户一张能用的比什么都不显示更有意义：
+     *    二维码内容是 SSID / 口令，两个频段通常同口令。
+     *
+     * `chip == "chip1" && ssidIndex == 1` 时两个候选是同一个名字，**必须去重**（这里用
+     * `linkedSetOf` 保序去重）—— 契约规定调用方按返回顺序原样逐个发请求、不做任何过滤，
+     * 列表里重复一项就是对同一个文件多发一次 HTTP。改造前的去重也在这一层（同一个
+     * `linkedSetOf`），所以搬家后请求的文件名序列逐字不变。
+     *
+     * **刻意不校验取值域**：`chip` 不在 `{chip1, chip2}` 内时照样拼出一个名字（与改造前一致）。
+     * 那一道校验在 `WifiRoutes` 的 `chip must be chip1 or chip2`；在这里再加一道会把
+     * 「取不到那张图」变成「返回空列表 = 该设备不支持取二维码」，语义就错了。
+     */
+    override fun qrCodeFileNames(chip: String, ssidIndex: Int): List<String> = linkedSetOf(
+        "${chip}_ssid${ssidIndex}$QR_CODE_FILE_SUFFIX",
+        "$QR_CODE_FALLBACK_STEM$QR_CODE_FILE_SUFFIX",
+    ).toList()
+
     // ───────────────────────── 写入侧 ─────────────────────────
     // 阶段 2 逐项迁移。已登记的这几项是从 GoformDeviceClient / GoformWifiClient /
     // GoformNetworkClient 原样搬来的（cmd 名与参数键逐字符照抄），未登记的返回 null。
@@ -752,6 +794,24 @@ object ZteGoformProfile : DeviceProfile {
     // （GoformSettingWriter 的类注释记着这次事故）。动作类 / 改口令的命令反过来必须是 NEVER。
 
     override fun writeSpec(key: SettingKey): WriteSpec? = WRITE_SPECS[key]
+
+    /**
+     * 「解锁全部频段」时下发的频段全集。
+     *
+     * 取值是从 `GoformNetworkClient` 的 companion 常量**逐字**搬过来的
+     * （原注释写的是「ZTE MU300 全 LTE 频段（解锁时使用）」），一个频段号都没动 ——
+     * 搬家的目的是消掉「同一串值三份拷贝 + `core/controller` 跨模块直读」
+     * （计划书 §15 的 P0-1 / 任务 2.9），不是重新核对频段表。
+     *
+     * 注意这**不是** `BAND_LOCK_LTE` 的 encode 的一部分：`encode` 仍然只做
+     * `value → lte_band_lock` 的字段名映射，空串仍然被 `validateBandList` 当「解锁」放过
+     * （= 不发限制）。把全集塞进 encode 会让「空串」从「不发限制」变成「下发全频段」,
+     * 那是对外语义变更。
+     */
+    override fun lteAllBandsMask(): String = "1,3,5,8,34,38,39,40,41"
+
+    /** 全 NR 频段（解锁时使用）。取值与搬家理由同 [lteAllBandsMask]。 */
+    override fun nrAllBandsMask(): String = "1,5,8,28,41,78"
 
     /**
      * 短信规则在单独的 [ZteSmsSpec] 里（本文件已经 1300+ 行，而短信那套规则自成一体）。

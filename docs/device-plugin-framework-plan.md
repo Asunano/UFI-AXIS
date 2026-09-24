@@ -84,7 +84,15 @@
 | 传输契约 `GoformGateway` | `core/goform/.../GoformGateway.kt:27` | 登录 / 查询 / POST / QoS（14 个方法） |
 | AT 通道契约 `AtTransport` | `core/collector/.../at/AtTransport.kt:10` | `probe()` / `sendCommand()` / `reset()` |
 | 归一化引擎 + 覆盖率诊断 | `core/device-schema/.../FieldNormalizer.kt` | `normalize()` / `coverage()` / 脱敏 |
-| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（撰写时 1099 行；**2026-09-23 实测 1623 行**） | 10 个 FieldGroup、`SettingKey` 撰写时 18 个 → **现 29 个**（2026-09-23 实测；批 14/15 新增 `WIFI_BAND` 之前一直写 28）、5 个结构解码器 |
+| F50 实现 | `core/device-schema/.../profile/ZteGoformProfile.kt`（撰写时 1099 行，之后一直在长） | 10 个 FieldGroup、`SettingKey` 撰写时 18 个 → **现 29 个**（2026-09-23 实测；批 14/15 新增 `WIFI_BAND` 之前一直写 28）、5 个结构解码器 |
+
+> **关于行数与测试条数**：这类数字每批都会变，逐轮回填必漏（批 17 就是这么出的错）。
+> **本文档不再在正文里写死它们** —— 要用的时候现场数：
+> 行数看文件本身，测试条数看 `build/test-results/**/*.xml` 里的 `tests=` 属性。
+> 需要被**冻结**的不是数字，而是判据：`writeSpecs` 与 `SettingKey` **逐项对齐**（0.2）、
+> 既有断言**一条不许改**（阶段 1 起的纪律）、新增只许是守门测试。
+> 2026-09-23 收工时的实测值（仅作参考，不作判据）：`:core:goform:test` **103**、
+> `:core:device-schema:test` **190**、`:core:device-spi:test` **11**、`:core:device-plugins:test` **8**。
 
 ### 2.2 欠账清单（这就是阶段 0~4 要清的）
 
@@ -954,31 +962,143 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): GoformCli
 
 ## 6. 阶段 2 — 插件聚合根与中间控制层
 
+### 开工前的三个决定（2026-09-23，动手前先读）
+
+**① `DeviceTransport` 必须上移到 `core/device-spi`。**
+它现在在 `core/goform`（阶段 1 落地的位置）。但 `DevicePlugin.createTransport(cfg): DeviceTransport`
+在 device-spi 上 —— 如果接口留在 goform，device-spi 就得依赖 `:core:goform`，
+那正是 2.1 明令禁止的「SPI 不能知道任何具体协议」。所以：
+`DeviceTransport.kt` 移到 device-spi（包名换 `com.ufi_axis_core.devicespi`），
+`core/goform` 改为依赖 device-spi 并**用 `api(...)` 而不是 `implementation(...)`**
+（`ComponentGraph` / `RouteContext` 的字段类型就是它，`implementation` 会让跨模块看不见）。
+`GoformTransport` 留在 `core/goform` —— 它是协议专有的那一层。
+
+**② `PlatformAdapter` 不在阶段 2 落地，连同 `AtTransport` 上移一起归阶段 4。**
+原 2.1 写的是「device-spi 依赖 `:core:collector`（要 `AtTransport`）」——**这条会成环**：
+`collector` 依赖 `goform`（`settings.gradle.kts:33`），而决定 ① 之后 `goform` 依赖 `device-spi`，
+再让 `device-spi` 依赖 `collector` 就是 `goform → device-spi → collector → goform`。
+§11.7 本来就定了「阶段 4 把 `AtTransport` 上移到 device-spi」，那一步做完环才不存在。
+所以阶段 2 的 SPI **只落不需要 `AtTransport` 的部分**；`DevicePlugin` 到阶段 4 再加 `platform()`
+（那时只有 1 个插件，加方法的成本可以忽略）。
+
+**③ `capabilities` 字段也不在阶段 2 加。**
+`Capability` 定在 `core/contract` 是阶段 3 的 3.1，阶段 2 提前引它等于把冻结区的定义提前，
+违反「冻结区宁可晚定」。阶段 2 的 `DevicePlugin` 先不带这个字段，阶段 3 再加。
+
+### 批次划分（阶段 2 不要一口气做完）
+
+- **批 A（2.1 + 2.2 + 2.3 + 2.4 的一半）**：建两个 module、`DeviceTransport` 上移、
+  落 `DevicePlugin` / `TransportConfig` / `DeviceTuning` / `ProbeEnv`、写 `ZteF50Plugin` 与
+  `PluginRegistry`。**不接线**（`ComponentFactory` 一行不动），可编译、可单测。
+- **批 B（2.4 的另一半 + 2.5 + 2.8）**：`DeviceRuntime.resolve()` 接进 `ComponentFactory`，
+  删 `resolveDeviceProfile()`，`/api/diagnose` 补 `plugin_id` / `selection`。这一批才动装配。
+- **批 C（2.6 + 2.7）**：`DeviceProfiles` 标废弃 + `PluginContractTest`。
+- **批 D（2.9 / 2.10 / 2.11）**：三条从阶段 0 推过来的欠账，各自独立 commit。
+
 ### 任务
 
-- `[ ]` 2.1 新建 module `core/device-spi`（Android library）+ 6 个 SPI 文件
-- `[ ]` 2.2 新建 module `core/device-plugins`，package `zte/f50/`
-- `[ ]` 2.3 写 `ZteF50Plugin`：组装现有零件（profile / transport / platform 暂时直接 new 现有实现）
-- `[ ]` 2.4 写 `PluginRegistry`（编译期 `listOf(ZteF50Plugin)`）+ `DeviceRuntime.resolve()`
-- `[ ]` 2.5 `ComponentFactory` 只留 `DeviceRuntime.resolve()` 一处，删掉 `resolveDeviceProfile()`
+
+- `[~]` 2.1 新建 module `core/device-spi`（Android library）+ SPI 文件
+  → **批 A 已落地**：`DeviceTransport`（从 `core/goform` 上移）+ `DevicePlugin` / `TransportConfig` /
+  `DeviceTuning` / `ProbeEnv`（含 `BuildInfo`）。`PlatformAdapter` 按决定 ② 归阶段 4。
+  依赖实测形态：`api(:core:contract)` + `api(:core:device-schema)`（`profile()` 的返回类型）
+  + `api(libs.kotlinx.serialization.json)`（`read()` / `readOne()` 的返回类型）
+  + `implementation(libs.kotlinx.coroutines.android)`；**`ktor.client.core` 整行不要**
+  —— 最终签名里没有任何 Ktor 类型（`HttpResponse` 留在 `core/goform` 的 `GoformTransport`）。
+  判据一句话：**只有公开签名里出现的类型才需要进依赖、才需要是 `api`**。
+  `core/goform` 加 `api(project(":core:device-spi"))` —— 必须 `api`，
+  因为 `ComponentGraph.NetworkGraph.goformClient` / `RouteContext.goformClient` 的字段类型就是它
+- `[~]` 2.2 新建 module `core/device-plugins`，package `zte/f50/`
+  → **批 A 已落地**（`api(:core:device-spi)` + `implementation(:core:device-schema)`
+  + `implementation(:core:goform)`）
+- `[~]` 2.3 写 `ZteF50Plugin`：组装现有零件（profile / transport / platform 暂时直接 new 现有实现）
+  → **批 A 已落地**，**没有新增任何设备知识**：`profile()` → `ZteGoformProfile`、
+  `createTransport(cfg)` → `GoformClient`、`tuning()` → 四处实测常量原值（75/85/3/90_000/5）。
+  `probe()` 的判据只用两项**有实测依据**的：`goformLdReachable`（60 分，唯一准入条件）、
+  `cpuInfoPlatform` 含 `sprd`/`spreadtrum`/`unisoc`（+20，只加分 —— 同平台别家设备也会命中）。
+  **`Build.*` 特征匹配刻意不写**：全仓找不到 F50 的 `BRAND`/`MODEL`/`DEVICE`/`MANUFACTURER`
+  实测取值（`SystemController` 只是原样下发、`CrashHandler` 只是打进日志，没有一处记过真机取值），
+  没依据就编字符串匹配只会得到一条恒不命中的死代码、或者更糟——命中别家设备
+- `[~]` 2.4 写 `PluginRegistry`（编译期 `listOf(ZteF50Plugin)`）+ `DeviceRuntime.resolve()`
+  → **批 A 落 `PluginRegistry`、批 B 落 `DeviceRuntime`**（`plugin` / `profile`（可空）/
+  `commandProfile`（非空）/ `selection` 四态 + 10 条单测）。
+  三处与原方案不同、**动手前必须知道**：
+  - **签名里没有 `AppSettings` / `Context`**（§3.3 原写 `resolve(settings, ctx)`）：那会让 device-spi
+    依赖 `:core:common` 与 Android，单测就得起 Android。取值由 `ComponentFactory` 取好传进来。
+  - **不是 `suspend`**：本批不做 probe、零 I/O。阶段 5 接 probe 时再改签名（`build()` 本身是 suspend，
+    不构成结构问题），§11.8 的时间预算那时才用得上。
+  - **`configuredId` 必须同时认 plugin id 与 profile id**：实测 `ZteF50Plugin.id = "zte-f50"`，
+    而 `ZteGoformProfile.id = "zte-goform"`，配置键 `device_profile_id` 存的是**后者**、还会原样
+    下发到 `/api/diagnose` 的 `configured`。只按 plugin id 匹配 = 已填 `zte-goform` 的部署突然
+    「认不出 → 回落」，那是行为变更。匹配顺序：先 plugin id，再 profile id（命中后者打 INFO 说明）
+- `[~]` 2.5 `ComponentFactory` 只留 `DeviceRuntime.resolve()` 一处，删掉 `resolveDeviceProfile()`
+  → **批 B 已落地**：`resolveDeviceProfile()` 与阶段 1.5 那个临时 `createTransport()` 双双删除，
+  传输层改由 `runtime.plugin.createTransport(TransportConfig(...))` 造（三个取值逐字一致）；
+  6 个客户端继续吃 `runtime.profile`（**可空**，排障开关语义不变），
+  `GoformSmsClient` 与 `DataScheduler` 那两处 `?: DeviceProfiles.DEFAULT` 改成 `runtime.commandProfile`。
+  ⚠ 装配处多了一次**向下转型**（`transport as? GoformClient ?: error(...)`）：
+  `createTransport()` 返回 `DeviceTransport`（14 个方法），而 6 个客户端要的是 goform 内部那一层
+  （多 7 个成员），且本文件不许写那个类型名。用 `as?` + `error()` 而不是硬 `as` ——
+  失败的真实含义是「选中的插件不是 goform 系」，写成一句话比 ClassCastException 有用。
+  **阶段 5/6 把 6 个客户端也收进插件后这次转型才能消掉。**
 - `[ ]` 2.6 `DeviceProfiles`（旧注册表）标为 `@Deprecated` 并让它委托给 `PluginRegistry`，
   避免 `SignalCollector` 等直接 import `ZteGoformProfile` 的地方一次性全改
 - `[ ]` 2.7 守门测试 `PluginContractTest`
-- `[ ]` 2.8 `/api/diagnose` 的 `device_profile` 块补 `plugin_id` 与 `selection`
+- `[~]` 2.8 `/api/diagnose` 的 `device_profile` 块补 `plugin_id` 与 `selection`
+  → **批 B2 已落地（只新增、不修正）**。`plugin_id` = 选中插件 id（**恒非空** —— 与 `active` 不同源：
+  关掉归一化时 `active` 会空、`plugin_id` 照样有值）；`selection` 值域**一次定稳**四个：
+  `configured` / `probed` / `default` / `fallback`（`probed` 当前不会出现，但值域现在就是最终值域，
+  免得阶段 5 再扩一次对外值域）。
+  - 枚举 → 对外字符串的映射做在 `Selection.wire` 上，**不在下发处 `name.lowercase()`** ——
+    那等于把 Kotlin 标识符变成对外契约，改名即静默改线上值域。`DeviceRuntimeTest` 加了
+    一条守门断言把四个 wire 取值写死 + 值域大小 == 4（10 条 → **11 条**）
+  - 递到 `DataHub` 的是**两个不可变 String**，不是整个 `DeviceRuntime` 对象
+    （否则 `core/api` 要依赖 `:core:device-spi`，还把选型对象的生命周期扩散到数据层）
+  - ⚠ **已知不一致，用户裁决刻意不修**：填了 plugin id（`zte-f50`）时选型是成功的
+    （`selection=configured`），但 `active` 是 profile id、`configured != active` → `status` 仍判 `fallback`。
+    两端 UI 现在都按 `status` 显示「型号填错」。**看选型结果以 `selection` 为准**；
+    `status` 的显示口径连同 UI 一起归**阶段 3**
 - `[ ]` 2.9 **清 `NetworkController` 的设备知识 + 频段全集三份拷贝**（阶段 0 的 0.5 裁决推过来的，§15 的 **P0-1**）
   → `GoformNetworkClient.kt:29/31` 的 `LTE_ALL_BANDS` / `NR_ALL_BANDS`、
   `NetworkController.kt:122/127` 的跨模块直读、`core/contract/Enums.kt:145-146` 的第三份零引用拷贝。
   按 §3.4 判：若收进统一抽象仍要拉跨模块依赖，就允许各插件独立持有一份，**不为「统一」造新耦合**。
   ⚠ 「空串 = 不发限制」与「空串 = 下发全频段」是两种对外语义，换过来是**行为变更**，不是搬运
-- `[ ]` 2.10 **二维码文件名模板进 profile 读侧 API 面**（0.5 未做的那一半，§15 的 **P1-5**）
-  → `GoformWifiClient.kt:69` 的 `{chip}_ssid{n}_qrcode_wifikey`。
-  阶段 0 没做的理由是「`DeviceProfile` 上没有『文件路径模板』这个 API 面，临时加一个违反
-  『不要自己发明 API』」——阶段 2 本来就要动 SPI 形状，在这里一起定
-- `[ ]` 2.11 **`checkDeviceEvents()` 容忍 `station_list` 的两种形态**（§15 的 **P1-29**，2026-09-23 裁决）
-  → 真数组 / 「数组的 JSON 字符串」都要能解（对外 API 手册已经这么要求客户端了，我们自己没照做），
-  并把现在那个静默 catch 改成至少打一行 WARN。
-  **不许**改成往 `NORMALIZE_ALWAYS` 里加 WIFI_CLIENTS —— 那是 §11.13 第 3 节明令禁止的方向，
-  `GoformNormalizeAlwaysTest` 会拦下来
+- `[~]` 2.10 **二维码文件名模板进 profile 读侧 API 面**（0.5 未做的那一半，§15 的 **P1-5**）
+  → **批 D2 已落地**：`DeviceProfile` 新增 `qrCodeFileNames(chip, ssidIndex): List<String> = emptyList()`，
+  `ZteGoformProfile` 实现（两个候选：`{chip}_ssid{n}_qrcode_wifikey` 与兜底 `chip1_ssid1_qrcode_wifikey`，
+  仍用同一个 `linkedSetOf` 去重），`GoformWifiClient` 改从非空 `commandProfile` 取。
+  `_qrcode_wifikey` 字面量在 `core/goform` **实测 0 次**（唯一真源是 `ZteGoformProfile.QR_CODE_FILE_SUFFIX`）。
+  - `ssidIndex` 是 **1-based**（三处代码交叉确认：`WifiRoutes` 的 `?: 1`、客户端缺省值 `= 1`、
+    设备扁平字段 `wifi_chip1_ssid1_*`，设备侧不存在 `ssid0`）
+  - 契约写明**去重责任在实现方**：调用方按顺序原样逐个发、不做过滤
+    （客户端不再加 `distinct()` —— 那等于把设备事实的一部分又留回客户端）；
+    device-schema 侧有一条 `distinct` 断言防这个
+  - 空列表 = **该设备不支持从后台取二维码图**，行为与「所有候选都取不到」逐行相同
+    （一条文件请求都不发、`lastQrCodeFailure` 为空串、原 WARN 照打、返回 null），**不抛异常**
+- `[~]` 2.11 **`checkDeviceEvents()` 容忍 `station_list` 的两种形态**（§15 的 **P1-29**，2026-09-23 裁决）
+  → **2026-09-24 已落地**。容错解析放在 `core/common` 的 `StationListShape.kt`
+  （`parseStationList()` + `Available` / `Missing` / `Malformed` 三态），`DataScheduler` 改用它。
+  - **放 `core/common` 而不是 `DataScheduler` 的 private 函数**：`core/scheduler` **没有测试源集**，
+    放进去就测不到，而新建 `src/test` 要动它的 `build.gradle.kts`；
+    `core/scheduler` 已经依赖 `core/common`、后者已有 kotlinx-serialization 与 junit，
+    **零新增依赖边、零构建改动**。这条容错也不是设备知识（是消费端的取值纪律），所以不进 device-schema。
+  - **返回值刻意不是 `JsonArray?`**：`null` 既能表示「缺失」又容易被下游手滑写成 `?: emptyList()`，
+    而 `Missing` / `Malformed` **不携带列表** —— 调用方无从构造「当前 MAC 集合」，
+    「解析失败被当成所有设备都离开了」这条误报路径**在类型上不可表达**。
+  - **解析失败时保留基线**（不再像原来的 catch 那样 `knownStations = null`）：
+    清基线虽然也不误报离开，但「归一化关着 + 固件双重编码」是**每轮都失败**的场景，
+    清了就等于设备事件功能**永久静默停摆**（P1-29 的原始症状）；保留基线则解析一恢复
+    就能和失败前的集合做差、把这段时间真实的上下线补报出来。
+  - **`Missing` 静默、只有 `Malformed` 打 WARN**：字段缺失/空串是正常形态，
+    打 WARN 会在默认部署下每分钟刷一条无用日志（批 27 之后 WARN 始终落地）。
+  - WARN 文案**逐字固定、不拼任何设备数据**，好让 `AppLogger.repeatGate`
+    按「级别+tag+完整消息」折叠成 1 条/分钟。顺带治掉一个日志膨胀隐患：
+    原来那条 `checkDeviceEvents failed: ${e.message}` 在这个场景下的 message 是
+    `Element <整个双重编码字符串> is not a JsonArray`，把设备数据拼进了消息、基数无界、折叠完全失效。
+  - 归一化**开着**时逐路不变：真数组 → `Available(原数组)` → 走原路径，
+    `current` 构造、首轮建基线、两个 for 的判定全部未改；字段缺失原来是 `?: return`（静默、保留基线），
+    现在是 `Missing → return`（同）。**唯一变的是原本「抛异常 → catch → 清基线」那条失败路径。**
+  - 校验：`:core:common:test` **176/176**（171 + 新增 5）、`:core:scheduler` 与 `:core` 编译通过。
 
 ### 怎么做
 
@@ -1315,6 +1435,204 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
     **`createTransport()` 那段在用户那批改动落地后再补一个 commit**（或由他一起带走）。
   - **阶段 1 的代码工作到此全部落地**，整阶段仍是 `[~]`：1.1/1.2/1.3/1.5/1.6 卡第 3/4 层（无真机），
     与阶段 0 的四项真机待办**合并成一次窗口**做。下一步按 §0 例外 2 可以开阶段 2。
+- 2026-09-23 **批 21：阶段 2 的批 A 落地**（子代理实现 + 我复核收口，未 push）：
+  - **开工前先给 §6 补了三个决定**：① `DeviceTransport` 必须上移到 device-spi
+    （否则 SPI 要依赖 `:core:goform`，违反「SPI 不能知道任何具体协议」）；
+    ② `PlatformAdapter` 连同 `AtTransport` 上移一起归阶段 4 ——
+    **原 2.1 写的「device-spi 依赖 `:core:collector`」会成环**
+    （`collector → goform → device-spi → collector`），计划原文没意识到这点；
+    ③ `capabilities` 不在阶段 2 加（冻结区宁可晚定）。另加了批 A~D 的划分。
+  - 代码：新建 `:core:device-spi` 与 `:core:device-plugins` 两个 module、
+    `DeviceTransport.kt` 上移（package → `com.ufi_axis_core.devicespi`，**14 个方法与 KDoc 一字未动**）、
+    新增 `DevicePlugin` / `TransportConfig` / `DeviceTuning` / `ProbeEnv`、
+    `ZteF50Plugin` + `PluginRegistry`；`core/goform` 加 `api(:core:device-spi)`；
+    `RouteContext` 与 `ComponentGraph` 各改一处 import（后者原来靠通配 import 拿到该类型）。
+    **`ComponentFactory` 一行未动**（接线归批 B）。
+  - **守门测试暴露了它自己的两个缺陷（我造成的，已修）**：
+    ① 判据太粗 —— 原本是 `readText().contains("GoformTransport")`，于是
+    `ComponentFactory.createTransport()` 的 KDoc 里那句「本文件**不许**直接写 `GoformTransport`」
+    被当成了「用了」。注释里提符号名不仅正常、而且必要（不写下来别人不知道这条边界是刻意的），
+    判据要盯的是**代码引用**。已改成**剥掉注释后再扫**（块注释按深度计数，字符串字面量保留）。
+    ② **Gradle 不把被扫的别 module 源码当输入** —— 阶段 1.5 那轮 `:core:goform:test` 报全绿，
+    其实是 `UP-TO-DATE` 没重跑（`ComponentFactory` 不在输入里）。
+    已把这条局限写进测试 KDoc，纪律是**阶段收尾用 `--rerun-tasks` 强制跑一次**。
+  - 校验：第 1 层 ✓（`:core:device-spi` / `:core:device-plugins` / `:core:goform` / `:core:api` /
+    `:core` 五处编译）、第 2 层 ✓（`--rerun-tasks` 下 `:core:goform:test` **97/97**，
+    守门测试 2 条 `skipped=0`、`:core:device-schema:test` 188/188）、第 3/4 层 ✗（无真机）。
+  - 顺带修掉子代理的一处笔误：`DevicePlugin.createTransport` 的 KDoc 写「阶段 6 才接线」，
+    实际是阶段 2 的批 B。
+- 2026-09-23 **批 22：阶段 2 的批 B 落地（第一次真正动装配）**（子代理实现 + 我复核收口，未 push）：
+  - 新增 `DeviceRuntime`（device-spi）+ `DeviceRuntimeTest`（**10 条**）；
+    `ComponentFactory` 接线、删 `resolveDeviceProfile()` 与阶段 1.5 那个临时 `createTransport()`；
+    `core/build.gradle.kts` 加 `implementation(:core:device-plugins)`（装配层是唯一知道「有哪些插件」的地方）。
+  - **行为等价性逐条核过**（子代理给了对照表，我复核了每条）：排障 WARN 文案逐字一致且仍在最前面、
+    空 id 不打日志、命中时的 INFO 前缀保留原文案、回落 WARN 前半句逐字一致。
+    `/api/diagnose` 的 `configured` / `active` / `normalization_enabled` / `status` **取值全不变**
+    —— 本批没碰 `HttpServer` / `DataHub` / 任何 route。
+  - **唯一的结构差异**：排障模式（关归一化）下**现在也照样选插件**（原实现直接 `return null`、
+    根本没有选型这回事）。后果只有一个：那条 WARN 之后会多一行选型日志（INFO 或回落 WARN），
+    **只进 logcat，不进任何对外 JSON**。这是「传输层与写命令表不能关」的必然产物。
+  - **`configuredId` 兼容旧口径**：先按 plugin id（`zte-f50`）、再按 profile id（`zte-goform`）匹配，
+    命中后者打 INFO 说明「两种写法都支持」。没有这一条，已填 `zte-goform` 的部署会变「认不出 → 回落」。
+    回落 WARN 的「可选」清单现在同时列两种 id。
+  - **我改了子代理的一处实现**：装配处的硬 `as GoformClient` 换成 `as? GoformClient ?: error(...)`
+    —— 硬转型失败只留一行没有上下文的 ClassCastException，而这里失败的真实含义是
+    「选中的插件不是 goform 系」，值得写成一句话。
+  - 校验：`:core:device-spi:compileDebugKotlin` ✓ / `:core:device-spi:test` **10/10** ✓ /
+    `:core:compileDebugKotlin` ✓ / `:core:goform:test --rerun-tasks` **97/97** ✓ /
+    `:core:device-schema:test` 188/188 ✓；第 3/4 层 ✗（无真机 —— 这一批**改了装配**，
+    真机冒烟（仪表盘/网络/WiFi/短信四页数据与改造前一致）是它的解锁条件，见 §6 验收）。
+  - **新登记 P1-30**（子代理发现的潜伏问题）：`GoformSignalClient` / `GoformWifiClient` 内部的
+    命令表兜底仍是 `GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)` ——
+    装配层这一侧已经用 `runtime.commandProfile` 修正，但这两个客户端**内部**仍会在关归一化时
+    把命令表退回「默认设备」。当前只有一个插件、两者同值，属潜伏。见 §15。
+- 2026-09-23 **批 23：阶段 2 的批 C（2.6 + 2.7 + P1-30）**（子代理实现 + 我复核，未 push）：
+  - **P1-30 已修**：`GoformSignalClient` / `GoformWifiClient` 各加一个**非空、无默认值**的
+    `commandProfile` 参数（口径照抄 `GoformSmsClient`），内部 `?: DeviceProfiles.DEFAULT` 删除，
+    装配层传 `runtime.commandProfile`。**可空那份 `profile` 的名字、位置、语义一律没动** ——
+    `/api/diagnose` 的 `active` / `normalization_enabled` 取值链路一行未碰，今天取值逐值相同。
+  - **2.6 已落**：`DeviceProfiles` 标 `@Deprecated(WARNING)`，**实现体一行未动**
+    （委托 `PluginRegistry` 是反向依赖，编译不过 —— 理由与「什么时候能真正删」写进了它的 KDoc）。
+    全仓确认没有 `allWarningsAsErrors`，warning 不会变 error。
+    剩余引用只有 device-schema 自己测试里的两处，加了 `@Suppress("DEPRECATION")` + 保留理由。
+  - **2.7 已落**：`PluginContractTest`（**8 条**）：id/displayName 非空且唯一、`DEFAULT` 是 `ALL` 里
+    那个对象（identity）、`byId` 往返同一对象、`profile()` 多次调用返回同一对象（钉住「别在里面 new」）、
+    `tuning()` 值域自洽（`warn < critical` 等，防换设备时把阈值填反）、
+    `goformLdReachable=false` 时 `probe` 必返 0、同一 env 多次 probe 结果相同（纯函数）。
+    刻意不测两条并写明理由：`capabilities`（阶段 3 才有）、`createTransport()`
+    （会 `new GoformClient` → 起 Ktor + `android.util.Log`，单测里只会拿到 `Stub!`，靠真机冒烟覆盖）。
+  - **子代理更正了我契约里的一处错**：我让它给 `SignalCollector` / `DataScheduler` 的过渡引用加
+    `@Suppress("DEPRECATION")`，但那两处 import 的是 **`ZteGoformProfile` 而不是 `DeviceProfiles`**
+    —— 没标废弃、零 warning、不需要 `@Suppress`。所以「标废弃能提醒这两处欠账」这个预期是错的：
+    2.6 的收尾（把它们改成从 `DeviceRuntime` 取）**没有任何编译期提醒**盯着，
+    要靠 `DeviceProfiles` KDoc 里那段文字或将来另加一条守门测试。
+  - 顺手加了 `testImplementation(libs.kotlinx.coroutines.android)` 到 device-plugins
+    （`runBlocking` 调 suspend 的 `probe`；选 `coroutines.android` 而非 `coroutines.test`，只要 `runBlocking`）。
+  - 校验：8 条命令全绿 —— 四处编译 + `:core:device-plugins:test` **8/8**、
+    `:core:goform:test --rerun-tasks` **97/97**、`:core:device-schema:test` 188/188、
+    `:core:device-spi:test` 10/10。第 3/4 层 ✗（无真机）。
+  - **新登记 P1-31**：`GoformSettingWriter.kt:48` 的 `profile ?: ZteGoformProfile` 是同一形态的
+    **写侧**兜底（比读侧更危险）。同批顺手 grep 确认 `GoformNetworkClient` / `GoformDeviceClient` /
+    `GoformSimClient` **没有**同类兜底，所以这一形态全仓只剩 writer 一处。见 §15。
+- 2026-09-23 **批 24：阶段 2 的批 B2（2.8）**（子代理实现 + 我复核，未 push）：
+  - `DeviceRuntime.Selection` 加 `wire`（四个对外取值）、`DataHub` 加两个只读 String 属性
+    （**不给默认值**，逼唯一装配点显式接线）、`ComponentFactory` 把
+    `runtime.plugin.id` / `runtime.selection.wire` 递进去、`HttpServer` 的 `device_profile` 块加两个键。
+    `:core:api` **没有**新增对 `:core:device-spi` 的依赖。
+  - **现有四键取值未变**，逐键核过：`active` / `normalization_enabled` 的链路
+    （`GoformSignalClient.profileId` → `GoformFieldMapper.normalizeProfile?.id`）一个字符没碰；
+    `configured` 仍是 `settings.deviceProfileId` 原值；`status` 那个 `when` 四个分支逐字未改
+    （唯一字符变化是 `mapOf` 要继续加项、`}` 后面多了个逗号）。
+  - **两端兼容性核过**：app 走 `AppJson`（`ignoreUnknownKeys = true`，`AppJsonTest` 里本来就有一条
+    「容忍服务端多余字段」在守）；web 的 `contract.ts` 只登记路径、无 schema，
+    `AboutPanel.vue` 是逐字段挑（连 `device_profile` 都没读），全仓无 zod/ajv/yup。
+    所以新增键对旧客户端安全 —— 代价是**两端现在都不会显示新字段**，归阶段 3。
+  - **新字段没有自动化断言**：`core/network` 没有 test 源集、`core/api/src/test` 是空目录
+    （按「没有测试基础设施就不新建」的口径没动）。所以这两个键**只能靠真机 `GET /api/diagnose` 验**：
+    零配置应得 `selection=default`、填 `zte-goform` 或 `zte-f50` 应得 `configured`、填错应得 `fallback`。
+  - ⚠ **待补进 API 手册**（`docs/UFI-AXIS-Core-API-Reference.md` 的 `GET /api/diagnose` 一节）：
+    响应示例加这两个键；正文补一段说明 —— `plugin_id` 恒非空且与 `active` / 配置键 `device_profile_id`
+    都**不一定相等**（那个键存 profile id，两种写法 core 都认）；`selection` 值域固定四个、
+    客户端请按四个实现（`probed` 当前不出现但值域已定稳）；以及上面那条
+    「`selection` 与 `status` 可能互相矛盾，看选型以 `selection` 为准」的已知不一致。
+    本轮没动手册**是因为用户正在并行改它**。
+- 2026-09-23 **批 25：阶段 2 的批 D1（2.9 + P1-31）**（子代理实现 + 我裁决收口，未 push）：
+  - **2.9 频段全集三份 → 一份**：`DeviceProfile` 新增两个读侧 API 面
+    `lteAllBandsMask(): String? = null` / `nrAllBandsMask(): String? = null`（刻意用两个方法而不是
+    带 RAT 枚举的一个方法 —— 不为这件小事往冻结区加类型）；`ZteGoformProfile` 实现并返回原常量的
+    逐字取值；`GoformNetworkClient` 的两个 companion 常量删除、改从 profile 取，并新增
+    `lteAllBands()` / `nrAllBands()` 作为**唯一**的 null 折叠 + WARN 归属地；
+    `NetworkController` 改调这两个方法（**跨模块直读彻底消失**）；
+    `core/contract/Enums.kt` 的第三份零引用拷贝删除。
+  - **对外语义未变**（逐字对照过）：`unlockAllBands()` 发的还是
+    `lte_band_lock=1,3,5,8,34,38,39,40,41` / `nr_band_lock=1,5,8,28,41,78`；
+    `unlockAll == false` 的两条分支（`lteBands ?: ""`）**完全没碰** ——
+    「空串 = 不发限制」仍在调用方那一侧，**没有**把全集塞进 `encode`
+    （那正是 P0-1 裁决禁止的「把空串从『不发限制』改成『下发全频段』」）。
+  - **mask == null 的行为**：折叠成空串（与「不发限制」同侧）+ 一行 WARN，**不抛异常、不把空串当全集**。
+    该分支今天不可达（唯一插件两个掩码都非空），已用假 profile 的 3 条单测覆盖。
+  - **P1-31 已修**：`GoformSettingWriter` 由 `profile ?: ZteGoformProfile` 改成收非空
+    `commandProfile`（它只用 profile 做两件事：`writeSpec(key)` 与日志里的 `id`，不参与归一化判断）。
+    构造链查清了：writer 的 4 个 new 点全在 `core/goform`（Wifi / Network / Device / Sim 四个客户端），
+    装配层只有 `ComponentFactory` 一处。**同形态的第三处**也一起修了 ——
+    `GoformWifiClient` 批 C 已拿到非空 `commandProfile`，但它 new writer 时还在传可空那份。
+  - **我裁决的三件事**：
+    1. `core/contract` 那两行**直接删、不先标废弃**。§11.4 的纪律针对「有人在用的冻结区符号」，
+       而它是全仓（含 app / web / scripts、两种命名风格）确认过的零引用项 ——
+       标废弃是给消费者迁移窗口，没有消费者就没有窗口要给。**也不留墓碑注释。**
+    2. `GoformNetworkClient` / `GoformSimClient` / `GoformDeviceClient` 的**可空 `profile` 参数删掉**
+       （它们不持有 `GoformFieldMapper`，原来只是拿去喂 writer，现在成了死参数）。
+       死参数会让下一个人以为「字段归一化在这三个类里生效」，那是错的。
+       三处 KDoc 各写明「将来长出读侧字段时按 `GoformSignalClient` 的形状加回」。
+       `GoformWifiClient` / `GoformSignalClient` 的可空 `profile` **必须留**（`active` /
+       `normalization_enabled` 靠它）。
+    3. 补 `mask == null` 分支的测试 + 在 `ZteGoformProfileTest` 冻结两个掩码的逐字取值
+       （并顺带断言「全集串本身过得了 `validateBandList`」—— 否则「解锁」会变成 `Rejected`、
+       连请求都不发，那种失败在真机上极难归因）。
+  - 校验：六处编译 + `:core:goform:test --rerun-tasks` **100/100**（97 + 新增 3）、
+    `:core:device-schema:test` **189/189**（188 + 1）、`:core:device-spi:test` 11/11、
+    `:core:device-plugins:test` 8/8。**点名的两套没改一条断言**：
+    `GoformWifiBandParamsTest` 7/7、`GoformSettingWriterDecisionTest` 20/20。第 3/4 层 ✗（无真机）。
+  - **新登记 P1-32（重要）**：子代理查 `AppLogger` 时发现**日志总开关默认关**，
+    导致所有 WARN 在默认部署下都不落地 —— 它直接卡住 2.11 的验收判据。见 §15。
+- 2026-09-23 **批 26：阶段 2 的批 D2（2.10）**（子代理实现 + 我验收，未 push）：
+  - `DeviceProfile` 新增 `qrCodeFileNames(chip, ssidIndex)`，`ZteGoformProfile` 实现，
+    `GoformWifiClient` 改从非空 `commandProfile` 取。请求的文件名序列逐入参对照过、**逐字相同**
+    （含 `chip1`+ 第 1 个 SSID 时两候选重名、`linkedSetOf` 去重后只发 1 次这个细节）。
+  - 我复验：`_qrcode_wifikey` 在 `core/goform` **0 次**、文件头无残留垃圾、无 BOM、
+    `:core:goform:test` 与 `:core:device-schema:test` 在 `--rerun-tasks` 下全绿。
+  - ⚠ **过程事故（必须登记）**：该子代理会话里 `edit_file` / `write_file`
+    **报成功但一个字节都没落盘**（它做了四路交叉验证：`read_file` / `Select-String` /
+    `git status` / 文件 mtime 全部显示未变，`write_file` 写探针文件后 `Test-Path` 为 `False`）。
+    它改用 `run_command` + `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` 落盘，
+    过程中一度把诊断字符串写进了 `GoformWifiClient.kt` 文件头（`names anchor_count=1 …`），
+    同轮自查后剥除。**我事后复验过该文件首行是 `package ...`、全仓无 `anchor_count` 残留、
+    编码 UTF-8 无 BOM、行尾仍是 CRLF。**
+    → 教训写进纪律：**子代理改完文件后，验收方必须自己 grep 一次文件头与关键字面量**，
+    不能只看子代理的自述（它自述「写成功」的那四次其实一个字节都没写）。
+  - 三处刻意不做：profile 侧不校验 `chip` 取值域（校验在 `WifiRoutes`，再加一道会把
+    「取不到那张图」变成「该设备不支持」）、`QR_CODE_FALLBACK_STEM` 不与写侧的 `WIFI_CHIP_FALLBACK`
+    合并（都是 `chip1` 但语义无关，合并会让两条判据被同一次修改牵动）、客户端不加 `distinct()`。
+  - **2.11 仍未做**（卡 P1-32 的日志口径，批 E 解锁后再做）。
+- 2026-09-24 **批 27：P1-32 落地（全局日志行为变更，不属于设备插件化的任何一步）**
+  （子代理调查 + 实现，我复核收口，未 push）：
+  - `AppLogger` 新增纯函数 `shouldEmit(level, loggingEnabled, coreLogEnabled)`，
+    `log()` 与 `e()` 的第一行由 `if (!active) return` 换成它。
+    **只无视总开关 `log_enabled`（默认 false），保留 `core_log_enabled`（默认 true）作为硬闸** ——
+    两个开关语义不同（前者全局、后者按侧静音），详见 §15 的 P1-32。
+  - 三条落地路（logcat / 文件 / 内存缓冲）**全放行**；`GoformSessionLog` 那条全量会话诊断
+    **刻意仍受总开关管**。成本估算 ≈3.4MB/天，被 `repeatGate` 60s 折叠 + 5MB/40MB/7 天预算夹住。
+  - 连带修：logcat 的 `when` 块包 `try/catch`（WARN 放行后，任何不用 Robolectric 的单测
+    路过一条 WARN 都会炸 `android.util.Log` 的桩）。我复核了实现：只包 logcat、
+    catch 后静默且不再调 `Log`，文件与缓冲两条路在它**之后**、照常执行。
+  - **改了一条既有断言**（`总闸关掉后一条不记` → 断言反转）。这违反「既有断言一条不许改」，
+    但它断言的正是被裁决推翻的旧口径，属于 §13 里「断言本来就在断言一个错误行为」那一类。
+    **显式登记在此**，不许当成「测试都绿了」一带而过。
+  - 校验：`:core:common:compileDebugKotlin` / `:core:compileDebugKotlin` 通过；
+    `:core:common:test` **171/171**（170 + 净 1）、`:core:goform:test --rerun-tasks` **103/103**、
+    device-schema 190、device-spi 11、device-plugins 8。我复跑了 common 与 goform 两套。
+    文件头、无 BOM、UTF-8、`grep '/\*[^*]'` 零命中都自查过（上一批出过写盘事故，这批逐项核）。
+  - **落盘那一段只能真机验**（单测不落盘）：总开关关、core 日志开、详细日志关 → 重启 core →
+    触发一条排障 WARN（最省事是把 `field_normalization_enabled` 关掉再读一次设备）→
+    看 `log/core/<今天>/app.log` 里有那行 WARN、且没有新的 `[INFO]` / `[DEBUG]`；
+    web 日志面板同样只看到 WARN。反向再验一次：把 core 日志也关掉 → 应当一行都不新增。
+- 2026-09-24 **批 28：2.11 落地（阶段 2 的任务清单到此全部打完）**（子代理出方案、我落盘与验收，未 push）：
+  - 细节见 §6 的 2.11 条目。要点：容错解析进 `core/common`（可测 + 零新增依赖边）、
+    三态类型让「解析失败被当成所有设备都离开了」**在类型上不可表达**、
+    解析失败**保留基线**（清了会永久静默停摆）、只有 `Malformed` 打 WARN 且文案逐字固定。
+  - ⚠ **写入通道事故第二次发生**：这个子代理的 `write_file` / `edit_file` **报成功但一个字节都没落盘**
+    （它做了四路交叉验证：`read_file` 回 `File does not exist`、`glob_path` 全仓 0 命中、
+    `git status` 的 `??` 列表里没有它、同一批的另一个 edit 反被判 `Stale context`）。
+    **它按纪律停手、没有自己绕**（上一个子代理是绕了、用 PowerShell 写盘并一度写坏文件头），
+    只把成品代码贴回来。**我自己落盘**（我这一侧的写入正常），并按自己的口径精简了类型
+    （`Unavailable(Reason)` 两层 → `Missing` / `Malformed` 两个 object，when 分支更直接）。
+    它给的根因线索：会话 env 里的工作区路径显示成 `d:\AndroidStudioProjects` + 换行 + `ew\UFI-AXIS`
+    —— `\new\` 的 `\n` 被当转义吃了；读侧传绝对路径没事，写侧若内部拼过一次工作区根就会落到错的根上。
+    → **纪律追加**：子代理报「写成功」不等于落盘，验收方必须自己 `git status` / `grep` 复核；
+    子代理遇到这种情况**就该停手报告**，不要自己找旁路。
+  - **新登记 P1-35**：`checkDeviceEvents` 的兜底 catch 仍把 `e.message` 拼进日志（基数无界、
+    绕过 `repeatGate`），且会吞掉普通 `CancellationException`（与同文件其它多处的写法不一致）。见 §15。
+  - 校验：`:core:common:test` **176/176**（171 + 5）、`:core:scheduler` 与 `:core` 编译通过。
 
 
 ### 执行记录
@@ -1692,6 +2010,23 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
      （重启 / 关机 / 恢复出厂）更是只有真机能验。
 
 > **阶段 0 在这四项验完之前不能算完成。**
+
+> **2026-09-24 第一份真机证据到手（装的是带阶段 0~2 全部改动的最新 app + core）** ——
+> 用户给了一份 `field_coverage`：`normalization_enabled=true`、`profile_id=zte-goform`，
+> **10 个组全部 `queried=true`**，`TRAFFIC_LIMIT` 10/10、`CONNECTION` 3/3、`BAND_STATUS` 2/2 满命中，
+> `LAN_SETTINGS` 9/10、`WIFI_SETTINGS` 7/8、`IDENTITY` 6/7、`CELL_INFO` 7/8、
+> `DEVICE_SETTINGS` 8/13、`SIGNAL` 14/22（NR 驻网，`lte_*` 大面积 missing 属正常）、`WIFI_CLIENTS` 1/2。
+> **结论：归一化链路在真机上是工作的**，没有大面积失效 —— 这是阶段 0~2 第 4 层的第一块实证。
+>
+> ⚠ **但 §14.4 原来那条判据「每组 hit 数与改造前一致」按原样执行不了**：
+> **没有人在改造前抓过 `field_coverage`**，没有对照物。所以这条判据**就地改成**：
+> ① 10 个组全部 `queried=true`（没有整组失联）；
+> ② 每组 missing 的每一项都能给出解释（驻网制式 / 功能未开启 / 字段名不对）；
+> ③ 解释不了的一律登记成待办，不许当噪音放过。
+> 按这条口径，本次抓取的产物就是 **P1-33**（死注册项）与 **P1-34**（三个设置项读不回状态）。
+>
+> **仍未验的**：接口快照那四条判据（`/api/dashboard` 等的键集与形状）、§14.4 的 **15 条写操作**。
+> 所以阶段 0 / 1 / 2 **仍然是 `[~]`** —— 读侧有实证了，写侧一条都没点过。
 > 第 1、2 层证明的是「代码自洽」，第 3、4 层证明的是「设备照旧」——
 > 这一阶段的全部目标恰恰是**行为不变**，而「行为」只在真机上存在。
 > 另外按 §14.3 最后一句：**阶段 0 的写操作在没有真机验证的情况下不允许合进主线**
@@ -3022,6 +3357,132 @@ P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍�
      起止判断错了会把正确的行也掰反，比现在更糟；
   ③ 删掉那段时间的小时行 —— 与「宁可少一段，不能凭空多一段」的既有取舍一致，最不容易做错。
 - 归属：**不属于阶段 0~5 的任何一步**，是一次性的数据处置。裁决前不要顺手写迁移脚本。
+
+**P1-35 `checkDeviceEvents()` 的兜底 catch 仍有两处隐患**
+
+- 事实（2026-09-24 做 2.11 时顺手核出，**本轮刻意不改**）：
+  - `catch (e: Exception)` 的文案是 `checkDeviceEvents failed: ${e.message}` ——
+    **把异常消息拼进了日志**。2.11 把 `station_list` 形态这一类从它手里拿走了，
+    但别的异常（尤其元素循环里的）仍可能带设备数据，基数无界 → 绕过 `repeatGate` 的折叠。
+  - 它会**吞掉普通 `CancellationException`**（`TimeoutCancellationException` 先被上一个 catch 接走，
+    但 scope 取消时的 Cancellation 会落到这里被当普通异常处理）。
+    同一文件里其它多处（`:848` / `:1002` / `:1041` / `:1081` / `:1115` / `:1294` / `:1557` / `:1643` 等）
+    都是 `catch (e: CancellationException)` 先行重抛 —— **本函数与它们写法不一致**。
+- 另一处相关事实：元素循环里 `element.jsonObject` / `row["mac_addr"]?.jsonPrimitive`
+  对非对象 / 非原始值**仍会抛**，落到那个兜底 catch → 清基线。
+  改成 `as? JsonObject ?: continue` 会把「某个元素坏了」变成「跳过它继续算差异」——
+  那会改变**归一化开着时**的失败路径行为，超出 2.11 的范围。
+- 归属：与「日志文案不许拼无界内容」一起单独一批；别混进设备插件化。
+
+**P1-33 `field_coverage` 实测暴露出「永远命中不了」的重复注册项**
+
+- 证据：2026-09-23 用户给的一份真机 `field_coverage`（NR 驻网、`normalization_enabled=true`、
+  `profile_id=zte-goform`）。`missing` 列出的是**设备侧字段名**（与 `hit_source` 的 value 同口径）。
+- `SIGNAL` 组 22 注册 / 14 命中。8 个 missing 里 **`lte_snr`（小写）** 与
+  `CELL_INFO` 组命中的 **`Lte_snr`（大写 L）** 是**同一个物理量** —— 设备只返回大写那个，
+  所以 `SIGNAL` 那条是死注册项。同组 `lte_arfcn` / `lte_band` / `lte_pci` / `lte_cell_id`
+  与 `CELL_INFO` 命中的 `Lte_fcn` / `Lte_bands` / `Lte_pci` 也是**名字不同的同一物理量**
+  （`arfcn` vs `fcn`、`band` vs `bands`）。
+- `DEVICE_SETTINGS` 组同型：missing 的 `dial_roam_setting_option` 与命中的 `roam_setting_option`
+  是同一物理量，设备用后者。
+- ⚠ **不能只看这一份就删**：这份是 **NR 驻网**，`lte_*` 大面积 missing 本身正常；
+  而 `CELL_INFO` 里**同时**出现小写 `lte_rsrq` 与大写 `Lte_snr`，说明 ZTE 的混合命名确实存在。
+- 下一步（**需要真机**）：在 **LTE 驻网**下再抓一份做对比 —— **两份都 missing 的才是真死注册项**，
+  才可以删或改名。归属阶段 5（`ZteF50Plugin` 字段表清理）；**在拿到第二份抓取前不要动 `readSpecs()`**。
+
+**P1-34 三个设置项读不到当前状态 —— 与「开关不许是假开关」直接冲突**
+
+- 证据：同一份 `field_coverage` 的 `DEVICE_SETTINGS` 组，missing 里有
+  **`UpgMode`**（FOTA 自动更新）、**`sleep_sysIdleTimeToSleep`**（WiFi 休眠空闲分钟）、
+  **`BearerPreference`**，以及 `restart_time`（定时重启的时间 —— 注意
+  `restart_schedule_switch` 本身是**命中**的）。
+- 后果：这几项对应的 UI 开关/输入框**拿不到设备当前值**，只能显示本地缓存或默认值 ——
+  正是「开关不许是假开关」要防的形态。`SettingKey` 里 `FOTA_AUTO_UPDATE` /
+  `WIFI_SLEEP_IDLE_MINUTES` 有写侧 `WriteSpec` 却读不回状态，属于**写得进、读不出**。
+- 待查（**需要真机**），三种可能要分清：
+  ① 只在**对应功能开启后**才出现在设备返回里（`restart_time` 很可能是这种）；
+  ② 注册的字段名本身不对（同 P1-33）；
+  ③ 要用**另一条命令**查（`cmdsFor(DEVICE_SETTINGS)` 没带上它）。
+- 按哪一种定归属：①→ UI 侧按「读不到 = 不知道」显示，**不许假装是关**；
+  ②→ 归阶段 5；③→ 改 `cmdsFor` 是低风险修复，可以单独一批。
+
+#### 批 25 新登记（P1-32）
+
+**P1-32 `AppLogger` 的日志总开关默认关 —— 所有 WARN 在默认部署下都不落地**
+
+- 事实（2026-09-23 批 D1 查 `AppLogger` 时发现）：`log()` 第一行是 `if (!active) return`，
+  `active = loggingEnabled && coreLogEnabled`，而 `loggingEnabled` 的**持久化默认值是 false**
+  （`AppSettings.DEFAULT_LOG_ENABLED`，`AppSettings.kt:297` 一带；`coreLogEnabled` 默认 true）。
+- 后果：**用户没主动打开日志总开关时，WARN 一条都不落地**。受影响的至少有：
+  - 批 D1 新加的「profile 未提供 X 频段全集掩码」；
+  - 早就存在的「未登记写入项 $key，忽略本次写入」「主命令未成功，改发备用命令」；
+  - `resolveDeviceProfile` / `DeviceRuntime` 的「未知 deviceProfileId，回落」与排障开关那条；
+  - §6 验收 **2.11** 明确要求的「若仍解不出来，日志里**必须有一行 WARN**（不许静默）」。
+- 所以「不许静默失败」这条纪律在**默认部署下不成立**：排障时用户得先打开日志开关、重启服务、
+  再复现一次 —— 而「掩码缺失」「写入项未登记」这类事件往往就在复现前已经过去了。
+- **这是既有属性，不是插件化引入的**，批 D1 没有改任何日志方式。
+- 待裁决的口径（**用户拍板**）：① WARN/ERROR 是否应当无视总开关始终落地
+  （与「release 只留 WARN/ERROR + 崩溃 dump 缓冲」的既定口径一致）；
+  ② 还是把这类「判据级」事件改走 `AlertBus` / `/api/diagnose` 而不是日志；
+  ③ 还是维持现状、只在文档里写明「排障前先开日志」。
+- **2026-09-23 用户裁决：方案 ①** —— **WARN/ERROR 无视日志总开关始终落地，INFO/DEBUG 继续受开关管**。
+  → **2026-09-24 批 27 已落地**，最终形态与两条实测结论：
+  - **只无视 `loggingEnabled`（总开关），不无视 `coreLogEnabled`**。
+    调查发现两个开关语义不同：`log_enabled` 是**全局硬开关**（默认 **false**，两端一起管），
+    而 `core_log_enabled` 是**按侧静音**（默认 true，「只关后端日志、保留手机端」，
+    因为 core 常驻写盘是体积增长的那一侧）。裁决原文与验收判据说的都是「总开关」，
+    默认部署里 `core_log_enabled = true`，所以只无视前者就完整满足验收，
+    而且保住了「真要静音后端」这个出口。判定抽成纯函数 `shouldEmit(level, logging, core)`。
+  - **三条路全放行**（logcat + 文件 + 内存缓冲），不是只放行 logcat。
+    理由：这台 F50 没 root、拿不到 logcat，只放行 logcat 等于线索仍然取不回来。
+    成本实测：WARN 频率被三层既有闸门夹住（`repeatGate` 同文本 60s 折叠 1 条、
+    `e()` 的 5 分钟错误去重、5MB 单文件 + 40MB 目录 + 7 天清理），
+    离线场景下高频 WARN 文本逐 tick 一字不差、正好被折叠，估算 ≈3.4MB/天，在预算内。
+  - **连带修（超出「只做分流」）**：logcat 那个 `when` 块包了 `try/catch`。
+    WARN 不再被总闸拦在门外之后，**任何不用 Robolectric 的单测只要路过一条 WARN，
+    就会从被测业务代码里炸出 `android.util.Log` 的 `not mocked` 桩异常**
+    （实测 `NotificationDispatcherTest` 6 个用例栈顶是 `AppLogger.log`）。
+    取舍：日志设施不该把调用方搞崩；真机上 `Log.*` 不抛、这个 catch 生产里永不触发；
+    即使触发，文件与缓冲两条路在它之后、照样收到这一行。
+    没选「给多个模块加 `isReturnDefaultValues`」是因为那会让所有 Android API 静默返回默认值，
+    掩盖面比吞掉一次 logcat 调用大得多。
+  - ⚠ **改了一条既有断言**（阶段 1 起的纪律是「既有断言一条不许改」）：
+    `AppLoggerSwitchTest.总闸关掉后一条不记` 断言的正是**被这次裁决推翻的旧口径**
+    （`assertTrue("log_enabled=false 必须连 ERROR 都不记", ...)`）。
+    按 §13 的口径这属于「断言本来就在断言一个错误行为」，所以改名 + 改断言是对的，
+    **但必须显式记在这里**，不能混在「测试都绿了」里一带而过。
+  - `GoformSessionLog` 那条路（全量会话诊断）**刻意仍完整受总开关管** ——
+    它不是按级别的排障日志，放行它等于默认部署下常驻写会话 dump。
+- ⚠ 它原本卡住 2.11 的验收（判据是「必须有一行 WARN」）—— **现在已解锁**。
+
+#### 批 23 新登记（P1-31）
+
+- 事实：`private val profile: DeviceProfile = profile ?: ZteGoformProfile` —— 与 P1-30 同形态，
+  只不过兜的是**写命令表**（`writeSpec()`），比读侧更危险：排障模式下会向 B 设备发 A 设备的写命令。
+- 事实（2026-09-23 批 C 顺手 grep 到）：`GoformNetworkClient` / `GoformDeviceClient` / `GoformSimClient`
+  **没有**同类兜底（它们不持有 `GoformFieldMapper`），所以这一形态全仓只剩 writer 这一处。
+- 修法：同 P1-30 —— 收非空 `commandProfile`（无默认值），装配层传 `runtime.commandProfile`。
+  ⚠ 它是 `internal class`，构造点不在 `ComponentFactory` 而在 `core/goform` 内部，
+  改之前要先把「谁 new 它」查清（别顺手把非空性推给一个自己也在兜底的调用方）。
+- 归属：与 P1-30 同批做最省事，但批 C 的契约只点了两个读侧客户端，所以**留到下一批**。
+
+#### 批 22 新登记（P1-30）
+
+**P1-30 `GoformSignalClient` / `GoformWifiClient` 内部的命令表兜底仍是「默认设备」**
+
+- 事实：两个客户端内部都是 `GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)`
+  （非空那份由客户端自己补，口径是阶段 0.4a 定的）。
+- 事实：批 B 之后装配层这一侧已经用 `runtime.commandProfile`（= **选中插件**的 profile）修正了
+  `GoformSmsClient` 与 `DataScheduler` 两处，但这两个客户端**内部**那句 `?: DeviceProfiles.DEFAULT`
+  仍然指向注册表默认值。
+- 后果（**当前无害、将来有害**）：关掉字段归一化时，这两个客户端的**命令表**会退回
+  「默认设备的命令表」而不是「选中插件的命令表」。现在只有一个插件、两者同值，看不出来；
+  接第二台设备后就是「排障模式下向 B 设备发 A 设备的 cmd」。
+- 修法：给这两个客户端加第二个构造参数（非空 `commandProfile`），口径同 `GoformSmsClient`
+  —— 装配层传 `runtime.commandProfile`，客户端内部不再自己兜底。
+- 归属：**2.6 或阶段 3**（它改的是 `core/goform` 两个公开构造签名，不属批 B 的「只接线」范围）。
+  ⚠ 改的时候注意：可空那份 `profile` 的语义**不许动**
+  （`/api/diagnose` 的 `normalization_enabled` 就是从它的 null 推出来的）。
 
 #### 批 18 新登记（P1-29）
 

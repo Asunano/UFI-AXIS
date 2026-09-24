@@ -20,13 +20,24 @@ import com.ufi_axis_core.deviceschema.SettingKey
  * 已迁进 [DeviceProfile.writeSpec] 的写操作（指示灯、性能模式、Samba、USB 调试、
  * 定时重启）在这里只剩一行转发 —— 命令名、参数键与布尔编码都在 profile 里，
  * 换设备只改 profile（计划书阶段 2）。
+ *
+ * @param commandProfile 写命令表来源，**非空、无默认值**；由装配层传选中插件的 profile。
+ *   理由（含「为什么不能在 writer 里兜底」）见 [GoformSettingWriter] 的类 KDoc。
+ *
+ * ## 为什么不收可空 `profile`
+ *
+ * 本类**目前没有读侧归一化路径**（不持有 [GoformFieldMapper]），可空 profile 的语义
+ * 「排障开关关掉了字段归一化」在这里无从生效，留着只会让人误以为归一化在本类里起作用。
+ * 将来长出读侧字段时，按 [GoformSignalClient] 的形状把可空 `profile` 加回来。
  */
 
 class GoformDeviceClient(
     private val client: GoformTransport,
-    profile: DeviceProfile?,
+    commandProfile: DeviceProfile,
 ) {
-    private val writer = GoformSettingWriter(client, profile)
+
+    private val writer = GoformSettingWriter(client, commandProfile)
+
 
 
     // ==================== 系统控制 ====================

@@ -60,12 +60,39 @@ import kotlinx.serialization.json.*
  *
  * `signalQuery { }` / `wifiQuery { }` 仍然保留，但它们只是"无缓存地调一次客户端方法"，
  * 不代表可以把原始字段直接返回 —— 归一化的责任在被调用的那个客户端方法里。
+ *
+ * ## 设备选型的三个诊断字段为什么是「值」而不是一个对象
+ *
+ * `/api/diagnose` 的 `device_profile` 块要的三样东西都从本类取：
+ * [deviceProfileId]（生效中的可空 profile id）、[devicePluginId]、[deviceSelection]。
+ * 前者是既有链路（来自 `GoformSignalClient.profileId`），后两个是阶段 2 的 2.8 新加的。
+ *
+ * 后两个**刻意只传两个不可变的 String**，而不是把装配层的 `DeviceRuntime` 整个塞进来：
+ *
+ * 1. 传对象会让 `:core:api` 依赖 `:core:device-spi` —— 数据层要为「诊断显示」这一个用途
+ *    多背一条模块依赖；
+ * 2. `DeviceRuntime` 是**选型对象**，它的生命周期属于装配层（构造组件图时定一次）。
+ *    把它交给数据层等于把这个生命周期扩散出去，后面很容易演化成「从 DataHub 拿 plugin
+ *    去发请求」，而取数该走的是已注入的那几个客户端。
+ *
+ * 两个值在组件图构造时就定死、之后不会变（换设备要重启后台服务），所以传值不丢信息。
  */
 class DataHub(
     private val scheduler: DataScheduler,
     private val signalClient: GoformSignalClient,
     private val wifiClient: GoformWifiClient,
-    private val responseCache: ResponseCache
+    private val responseCache: ResponseCache,
+    /**
+     * 选中插件的 id（如 `zte-f50`）。**恒非空**：认不出设备也会回落到默认插件。
+     * 只为 `/api/diagnose` 的 `device_profile.plugin_id` 存在，不参与任何取数逻辑。
+     */
+    val devicePluginId: String,
+    /**
+     * 本次选型是怎么定下来的，**已经是对外的小写 snake 取值**
+     * （`configured` / `probed` / `default` / `fallback`）。
+     * 只为 `/api/diagnose` 的 `device_profile.selection` 存在。
+     */
+    val deviceSelection: String
 ) {
     companion object {
         private const val TAG = "DataHub"

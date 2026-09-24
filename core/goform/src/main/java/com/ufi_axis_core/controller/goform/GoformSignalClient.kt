@@ -2,7 +2,6 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
-import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
 import kotlinx.serialization.json.*
 
 /**
@@ -26,16 +25,43 @@ import kotlinx.serialization.json.*
  *
  * [profile] 传 `null` 即整层短路成原样透传（一键回退）。
  * 尚未迁移的方法仍是透传。
+ *
+ * ## 两份 profile 的分工
+ *
+ * - [profile]（**可空**）只管**字段归一化**：`null` = 排障开关关掉了归一化。
+ *   它决定 `GoformFieldMapper.enabled` / `profileId`，而 `profileId` 一路传到
+ *   `/api/diagnose` 的 `device_profile.normalization_enabled`
+ *   （链路：`GoformFieldMapper.profileId` → [profileId] → `DataHub.deviceProfileId` →
+ *   `HttpServer` 的 `activeProfile != null`）。所以**不许**在本类里给它补非空兜底 ——
+ *   那个排障开关会永远报 `true`。
+ * - [commandProfile]（**非空**）只喂**命令表**（`cmds` / `fullStatusCmds`）：
+ *   字段归一化可以关，命令表不能关 —— 没有 cmd 列表连一条查询都发不出去。
+ *
+ * ## 为什么 [commandProfile] 没有默认值、也不许在本类里兜底
+ *
+ * 这里原来写的是 `GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)` ——
+ * 命令表由客户端自己回落到**注册表默认插件**的 profile。单插件时两者同值，看不出问题；
+ * 接第二台设备之后，「用户打开排障开关（关归一化）」就会顺带把命令表悄悄换成
+ * **默认设备**的命令表 —— 排障模式下向 B 设备发 A 设备的 cmd。
+ * 一个排障开关不该改变「往设备发什么命令」（同一条判据见 `DeviceRuntime.commandProfile`）。
+ *
+ * 所以命令表那一份由调用方（`ComponentFactory`，传 `runtime.commandProfile` =
+ * **选中插件**的 profile）定下来，构造参数**不给默认值**：默认值等于把选型逻辑散进每个
+ * 客户端的签名，换设备要改 N 处且漏一处不报错。口径与 [GoformSmsClient] 一致。
+ *
+ * @param profile 字段映射表；传 null 关闭归一化（原样透传设备字段，见 [GoformFieldMapper]）
+ * @param commandProfile 命令表来源，非空；由装配层传选中插件的 profile
  */
 class GoformSignalClient(
     private val client: GoformTransport,
     profile: DeviceProfile?,
+    commandProfile: DeviceProfile,
 ) {
 
     // 归一化用可空的那份（排障开关 → null → 原样透传），命令表用非空的那份：
     // 「字段归一化可以关，命令表不能关」，口径同 GoformSettingWriter / GoformSmsClient。
-    // 这里的 `?:` 不是新造的回落逻辑，是把 writer 已有的那一行照抄到读侧。
-    private val fields = GoformFieldMapper(profile, profile ?: DeviceProfiles.DEFAULT)
+    // 命令表**不在这里兜底** —— 兜底会让排障模式下的命令表悄悄换成默认设备的（见类 KDoc）。
+    private val fields = GoformFieldMapper(profile, commandProfile)
 
     /** 生效中的 profile id；null = 归一化已关（诊断用，见计划书 10.2）。 */
     val profileId: String? get() = fields.profileId

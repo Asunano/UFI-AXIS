@@ -83,8 +83,83 @@ interface DeviceProfile {
      */
     fun structuralDecoder(group: FieldGroup): ((kotlinx.serialization.json.JsonObject) -> kotlinx.serialization.json.JsonObject)? = null
 
+    /**
+     * WiFi 连接二维码图片在设备后台的**文件名候选**，按尝试顺序排列。
+     *
+     * 调用方拿这些名字去拼自己那套文件端点（goform 是
+     * `/goform/goform_get_file_process/<名字>`）：路径前缀属于**传输层**、不在本契约里，
+     * 这里只回答「那张图在设备上叫什么」。
+     *
+     * ## 语义：空列表 ≠ 文件不存在
+     *
+     * 返回**空列表** = **该设备不支持从后台取二维码图**（根本没有这个文件）。
+     * 调用方遇到空列表时的行为与「所有候选都取不到」**完全一致**：一条文件请求都不发、
+     * 返回「取不到」、并留一行 WARN（见 `GoformWifiClient.getWifiQrCode`）。
+     * **不许**把空列表读成「文件不存在 / 这一次没取到」—— 那是两件事：
+     * 前者是设备事实（这台设备永远取不到），后者是一次运行时结果（下一次可能就有了）。
+     * 也**不许**在调用方给空列表补一个兜底文件名：那等于把刚搬走的设备知识搬回客户端。
+     *
+     * ## 为什么返回 `List` 而不是单个 `String`
+     *
+     * 现状本来就有**多个候选 + 兜底**，而「先试哪个、取不到退回哪个」是**设备事实**的一部分：
+     * 有些固件只生成 2.4G 那一张，5G 的直接 404，此时退回一张能用的比什么都不显示更有意义
+     * （二维码内容是 SSID / 口令，两个频段通常同口令）。返回单个 `String` 表达不了
+     * 「还有兜底、且兜底排第二」，调用点就只能自己再补一份 `if` —— 同 [fullStatusCmds]
+     * 用 `List<List<String>>` 表达批次边界的理由。
+     *
+     * 实现方**必须自己去重**：调用方按返回顺序逐个发请求、不做任何过滤，
+     * 主候选与兜底撞上同一个名字时（`chip1` + 第 1 个 SSID）列表里重复一项就是多发一次 HTTP。
+     *
+     * @param chip 频段的**设备词汇**（`"chip1"` = 2.4G / `"chip2"` = 5G，与读侧 canonical
+     *   字段 `wifi_chip`、写侧 [SettingKey.WIFI_BAND] 的取值域一致），不是 `"2.4G"` 这种界面词汇。
+     * @param ssidIndex SSID 序号，**1 起**（对外 `GET /api/wifi/qrcode` 的 `ssid_index` 缺省就是 1，
+     *   ZTE 的扁平字段也是 `wifi_chip1_ssid1_…`）。
+     *
+     * 默认实现返回空列表：新 profile 不写这一项时应当是「该设备没有这个能力」，
+     * 不是「忘了实现」—— 同 [smsSpec] / [lteAllBandsMask] 的口径。
+     */
+    fun qrCodeFileNames(chip: String, ssidIndex: Int): List<String> = emptyList()
+
     /** 写操作规则；不支持该项则返回 null（route 应回 `NOT_SUPPORTED`）。 */
     fun writeSpec(key: SettingKey): WriteSpec?
+
+    /**
+     * 「解锁全部 LTE 频段」时要下发的频段全集掩码（逗号分隔的频段号，如 `"1,3,5,8"`）。
+     *
+     * ## 语义：`null` ≠ 空串
+     *
+     * - 返回**非空串** = 该设备的「解锁」动作要显式下发这一串全频段。
+     * - 返回 `null` = **该设备不需要 / 不支持显式下发「全频段」掩码**。
+     *   调用方遇到 `null` 时的行为是**不下发该 RAT 的全集**（与「空串 = 不发限制」同一侧），
+     *   并留一行 WARN；见 `GoformNetworkClient` 里那两个同名读取方法。
+     *   **不许把 `null` 当空串用**：这两件事在对外语义上是两回事 ——
+     *   「空串 = 不发限制」与「空串 = 下发全频段」换过来就是行为变更，不是搬运
+     *   （计划书 §15 的 P0-1 已就这一点裁决过）。
+     *
+     * ## 为什么它在**写侧**（命令表范畴）而不是读侧的归一化范畴
+     *
+     * 频段全集是 [SettingKey.BAND_LOCK_LTE] 这条写命令的**参数值域**：
+     * 「字段归一化可以关，命令表不能关」。所以调用方必须从**非空**的那份 profile
+     * （装配层传下来的 `commandProfile`）取它，不能从可空的归一化 profile 取。
+     *
+     * ## 为什么是两个方法而不是 `allBandsMask(rat: SomeEnum)`
+     *
+     * 刻意不为这件小事新造一个 RAT 枚举：`core/contract` 是冻结区，新增对外类型的门槛要高，
+     * 而目前需要表达的只有 LTE / NR 两档。真到了需要第三档时再引入枚举，那时才有足够依据
+     * 决定它的值域该怎么定。
+     *
+     * 默认实现返回 `null`：新 profile 不写这一项时应当是「没有这条设备事实」，
+     * 不是「忘了实现」—— 同 [smsSpec] 的口径。
+     */
+    fun lteAllBandsMask(): String? = null
+
+    /**
+     * 「解锁全部 NR 频段」时要下发的频段全集掩码。
+     *
+     * 语义、`null` 的含义、以及「为什么是两个方法而不是带 RAT 参数的一个方法」
+     * 全部同 [lteAllBandsMask]，不在这里重复一遍。
+     */
+    fun nrAllBandsMask(): String? = null
 
     /**
      * 短信规则。不支持短信的设备返回 null（对应 `Capability.SMS` 缺失）。

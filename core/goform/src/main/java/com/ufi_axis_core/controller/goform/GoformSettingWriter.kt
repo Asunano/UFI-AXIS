@@ -4,8 +4,8 @@ import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.WriteSpec
-import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import com.ufi_axis_core.util.AppLogger
+
 
 /**
  * 写入侧的 profile 接入点 —— [GoformFieldMapper] 的对称物（计划书阶段 2）。
@@ -13,8 +13,21 @@ import com.ufi_axis_core.util.AppLogger
  * ## 为什么写入侧没有"透传"回退
  *
  * 读侧的 kill switch 是 `profile = null` → 原样透传，这有意义：不归一化也能吐数据。
- * 写侧没有这个概念 —— 没有 `goformId` 就发不出请求。所以本类持有**非空** profile，
- * 调用方传 null 时回落到 [ZteGoformProfile]：字段归一化可以关，写命令表不能关。
+ * 写侧没有这个概念 —— 没有 `goformId` 就发不出请求。所以本类持有**非空** profile：
+ * 字段归一化可以关，写命令表不能关。
+ *
+ * ## 为什么 [commandProfile] 非空、无默认值，且本类内部**不再兜底**（阶段 2 批 D1，P1-31）
+ *
+ * 这里原来写的是 `profile: DeviceProfile?` + `profile ?: ZteGoformProfile` ——
+ * 与读侧批 C 修掉的 P1-30 同形态，但兜的是**写命令表**，比读侧更危险：
+ * 「用户打开排障开关（关归一化）」会顺带把写命令表悄悄换成 `ZteGoformProfile` 的，
+ * 接第二台设备之后就是**排障模式下向 B 设备发 A 设备的写命令**。
+ * 一个排障开关不该改变「往设备发什么命令」（同一条判据见 `DeviceRuntime.commandProfile`）。
+ *
+ * 所以命令表那一份由装配层定下来：`ComponentFactory` 传 `runtime.commandProfile`
+ * （= **选中插件**的 profile，不是注册表默认插件）→ 各 goform 客户端的 `commandProfile`
+ * 构造参数 → 本类。构造参数**不给默认值**：默认值等于把选型逻辑散进每个签名，
+ * 换设备要改 N 处且漏一处不报错。口径与 [GoformSignalClient] / [GoformSmsClient] 一致。
  *
  * profile 没登记某个 [SettingKey] 时返回 false 并打日志（等价于"该设备不支持这一项"），
  * 而不是发一个空命令出去。
@@ -40,12 +53,15 @@ import com.ufi_axis_core.util.AppLogger
  * 而「选命令 / 拼 body / 选重试路径 / 把传输层结果收成三态 / 要不要兜底」这几件事都抽成了
  * 以 lambda 收传输层与日志出口的 internal 函数：生产路径传 [client] 的方法，单测传假发送器
  * （`GoformSettingWriterDecisionTest`）。这样 HTTP 之外的整条写路径都能被断言。
+ *
+ * @param commandProfile 写命令表来源，**非空、无默认值**，由装配层给定（见上）。
  */
 internal class GoformSettingWriter(
     private val client: GoformTransport,
-    profile: DeviceProfile?,
+    private val commandProfile: DeviceProfile,
 ) {
-    private val profile: DeviceProfile = profile ?: ZteGoformProfile
+
+
 
     /** 单值写操作（`value` 是约定的参数名）。 */
     suspend fun write(key: SettingKey, value: Any?): Boolean = write(key, mapOf("value" to value))
@@ -65,9 +81,10 @@ internal class GoformSettingWriter(
      * 下发与兜底的判据见 [writeWithFallback] / [sendBySpec]。
      */
     suspend fun writeChecked(key: SettingKey, params: Map<String, Any?>): WriteOutcome {
-        val spec = profile.writeSpec(key)
+        val spec = commandProfile.writeSpec(key)
         if (spec == null) {
-            AppLogger.w(TAG, "${profile.id} 未登记写入项 $key，忽略本次写入")
+            AppLogger.w(TAG, "${commandProfile.id} 未登记写入项 $key，忽略本次写入")
+
             return WriteOutcome.Failed
         }
         spec.validate(params)?.let { reason ->

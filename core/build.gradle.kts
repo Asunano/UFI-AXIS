@@ -153,6 +153,10 @@ dependencies {
     implementation(project(":core:goform"))
     // 设备适配层：profile 选型在 ComponentFactory 里做（计划书 3.2）
     implementation(project(":core:device-schema"))
+    // 设备插件注册表。**装配层是唯一知道「有哪些插件」的地方**（计划书 3.3）：
+    // 中间控制层 DeviceRuntime 与上层一律只依赖 :core:device-spi（契约），
+    // 谁都不许 import 具体插件 —— 这条依赖只许出现在本模块。
+    implementation(project(":core:device-plugins"))
     implementation(project(":core:collector"))
     // ★ Phase 2
     implementation(project(":core:cache"))

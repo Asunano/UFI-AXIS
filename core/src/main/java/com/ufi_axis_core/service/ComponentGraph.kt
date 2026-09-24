@@ -21,6 +21,7 @@ import com.ufi_axis_core.core.scheduler.ConditionEngine
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.scheduler.TaskScheduler
 import com.ufi_axis_core.core.server.HttpServer
+import com.ufi_axis_core.devicespi.DeviceTransport
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.WebResourceManager

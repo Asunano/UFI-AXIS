@@ -4,7 +4,6 @@ import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.DeviceTransport
 import com.ufi_axis_core.controller.goform.GoformDeviceClient
 import com.ufi_axis_core.controller.goform.GoformNetworkClient
 import com.ufi_axis_core.controller.goform.GoformSignalClient
@@ -16,6 +15,7 @@ import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.scheduler.DataScheduler
+import com.ufi_axis_core.devicespi.DeviceTransport
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.DynamicThreadPool
 

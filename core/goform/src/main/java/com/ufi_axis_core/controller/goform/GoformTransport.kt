@@ -1,5 +1,6 @@
 package com.ufi_axis_core.controller.goform
 
+import com.ufi_axis_core.devicespi.DeviceTransport
 import io.ktor.client.statement.HttpResponse
 import kotlinx.serialization.json.JsonObject
 

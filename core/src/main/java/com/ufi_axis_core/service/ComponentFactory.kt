@@ -18,8 +18,9 @@ import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.core.database.AppDatabase
-import com.ufi_axis_core.deviceschema.DeviceProfile
-import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
+import com.ufi_axis_core.deviceplugins.PluginRegistry
+import com.ufi_axis_core.devicespi.DeviceRuntime
+import com.ufi_axis_core.devicespi.TransportConfig
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.server.HttpServer
 import com.ufi_axis_core.util.AppLogger
@@ -148,9 +149,18 @@ object ComponentFactory {
         val collector = buildCollectorGraph(context)
 
         // ── 4-5. 网络子图（Goform 客户端层 + 网络/ SIM 控制器） ──
-        // 设备 profile 在整个组件图里只选一次（计划书 3.2），网络子图与 SignalCollector 共用。
-        val deviceProfile = resolveDeviceProfile(settings)
-        val network = buildNetworkGraph(settings, gatewayIp, collector.atChannel, database, context, deviceProfile)
+        // 设备插件与 profile 在整个组件图里只选一次（计划书 3.2 / 3.3），网络子图与 SignalCollector 共用。
+        // 取值（配置项两条）在这里读、传进 resolve() —— :core:device-spi 是纯契约层，
+        // 不依赖 AppSettings / Context（理由写在 DeviceRuntime 的 KDoc 上）。
+        val runtime = DeviceRuntime.resolve(
+            plugins = PluginRegistry.ALL,
+            default = PluginRegistry.DEFAULT,
+            configuredId = settings.deviceProfileId,
+            normalizationEnabled = settings.fieldNormalizationEnabled,
+            warn = { AppLogger.w(TAG, it) },
+            info = { AppLogger.i(TAG, it) },
+        )
+        val network = buildNetworkGraph(settings, gatewayIp, collector.atChannel, database, context, runtime)
 
         // ── 5.5 配对设备存储 + 设备请求验证器 ──
         // 位置提前到 WebSocket 之前：WS 握手与 /api 请求都要按 token 哈希查设备、用记录里的
@@ -229,8 +239,8 @@ object ComponentFactory {
             smsController = smsController,
             ruleStore = smsRuleStore,
             // SignalCollector 的字段映射表。它不吃"关归一化"那个开关（第 1 层就是归一化），
-            // 所以关闭时也回落默认 profile。
-            deviceProfile = deviceProfile ?: DeviceProfiles.DEFAULT
+            // 所以关闭时也回落非空那份（命令表口径，来自选中的插件）。
+            deviceProfile = runtime.commandProfile
         )
         AppLogger.i(TAG, "[9] DataScheduler initialized")
 
@@ -403,7 +413,16 @@ object ComponentFactory {
 
 
         // ── 12.5 DataHub: 统一请求数据中心（集中管理所有 goform 查询缓存，消除路由间重复请求）──
-        val dataHub = DataHub(scheduler, network.signalClient, network.wifiClient, responseCache)
+        // 后两个参数（2.8）只供 /api/diagnose 的 device_profile 块显示：传**值**不传 runtime，
+        // 理由写在 DataHub 的类 KDoc（不让 :core:api 依赖 :core:device-spi、
+        // 不把选型对象的生命周期扩散到数据层）。
+        // selection 在这里就转成对外的小写 snake（Selection.wire），数据层与 route 层都不做映射 ——
+        // 「枚举 → 线上取值」的唯一定义点在枚举自己身上。
+        val dataHub = DataHub(
+            scheduler, network.signalClient, network.wifiClient, responseCache,
+            devicePluginId = runtime.plugin.id,
+            deviceSelection = runtime.selection.wire,
+        )
         AppLogger.i(TAG, "[12.5] DataHub initialized")
 
         // 流量套餐限额预警（2026-08-31 从 app 侧下沉）：判定在 AlertEngine，取数走 DataHub 的 10s 缓存。
@@ -752,54 +771,70 @@ object ComponentFactory {
         )
     }
 
-    /**
-     * 造设备传输层实现（阶段 1.5）。
-     *
-     * 目的只有一个：把「new 哪个协议实现」收到**一处**。阶段 2 这里会被
-     * `DevicePlugin.createTransport(cfg)` 取代，届时只改这个函数体，[buildNetworkGraph]
-     * 的装配代码一行都不用动。
-     *
-     * ⚠ 返回类型是**具体类** [GoformClient]，不是 `DeviceTransport`（计划书 §5 的 1.5 原本写的是后者，
-     * 落地时按实测改了）：6 个 goform 客户端的构造参数是 `GoformTransport`（`core/goform` 内部那一层，
-     * 比 `DeviceTransport` 多 7 个协议成员），用 `DeviceTransport` 接会编译不过；
-     * 而本文件**不许**直接写 `GoformTransport` 这个类型名 —— 那是 `core/goform` 的内部契约，
-     * 由 `GoformTransportVisibilityGuardTest` 守着「`core/goform` 之外零引用」。
-     * 所以这里保持本文件既有的角色：**唯一知道具体实现类型的地方**（见文件头的 F9 注释）。
-     */
-    private fun createTransport(settings: AppSettings, gatewayIp: String): GoformClient =
-        GoformClient(
-            deviceIp = settings.goformIp.ifBlank { gatewayIp },
-            port = settings.goformPort,
-            password = settings.goformPassword
-        )
-
     /** 网络子图：Goform 客户端层 + NetworkController（原步骤 4-5）。
-     * 注意：SystemController 依赖 deviceClient，归入 [buildControllerGraph]。 */
+     * 注意：SystemController 依赖 deviceClient，归入 [buildControllerGraph]。
+     *
+     * [runtime] 由 [build] 选好后注入（计划书 3.2 / 3.3）：本函数**不再自己读 settings 里的选型配置**，
+     * 「当前是哪台设备」全仓只有一处答案。 */
     private fun buildNetworkGraph(
         settings: AppSettings,
         gatewayIp: String,
         atChannel: ATChannel,
         database: AppDatabase,
         context: Context,
-        profile: DeviceProfile?
+        runtime: DeviceRuntime
     ): NetworkGraph {
-        val goform = createTransport(settings, gatewayIp)
+        // 传输层由插件造（阶段 2 批 B 取代了原先的私有 createTransport()）。三个取值与此前逐字一致：
+        // 设备 IP 仍是 `goformIp` 空则回落网关，端口与密码仍直取配置项（符号名中立、配置键仍叫 goform*，
+        // 见 TransportConfig 的 KDoc）。
+        //
+        // ⚠ 这里要**向下转型**到具体类 [GoformClient]：6 个客户端的构造参数是 `core/goform` 模块内部
+        // 那一层传输接口（比 `DeviceTransport` 多 7 个协议成员），用 `DeviceTransport` 接会编译不过；
+        // 而本文件**不许**直接写那个内部接口的类型名（`GoformTransportVisibilityGuardTest` 守着
+        // 「`core/goform` 之外零引用」）。所以沿用本文件既有的角色：**唯一知道具体实现类型的地方**
+        // （见文件头的 F9 注释）。真正消掉这次转型要等阶段 5/6 把 6 个客户端也收进插件，
+        // 那时装配层只认 `DeviceTransport`。
+        //
+        // 用 `as?` + `error()` 而不是硬 `as`：硬转型失败抛的是 ClassCastException，
+        // 在组件图构造这条启动路径上只会留下一行没有上下文的堆栈。这里失败的真实含义是
+        // 「选中的插件不是 goform 系」，把它写成一句话，下一个接非 goform 设备的人就不用猜。
+        val transport = runtime.plugin.createTransport(
+            TransportConfig(
+                deviceIp = settings.goformIp.ifBlank { gatewayIp },
+                port = settings.goformPort,
+                password = settings.goformPassword
+            )
+        )
+        val goform = transport as? GoformClient ?: error(
+            "插件 ${runtime.plugin.id} 造出的传输层不是 GoformClient —— " +
+                "6 个 goform 客户端要到阶段 5/6 才收进插件，在那之前装配层只支持 goform 系插件"
+        )
         // profile 由调用方选好后注入（计划书 3.2）。
         // 此前每个客户端的构造参数各带一个 `= ZteGoformProfile` 默认值 —— 等于选型逻辑
         // 散在 6 个签名里，换设备要改 6 处且漏一处不会报错。
-        // 这两个客户端里的 GoformFieldMapper 已改成双 profile（阶段 0.4a）：这里仍然只传
-        // **可空**的那一份 —— 排障开关关掉归一化时它就是 null，`enabled` / `profileId`
-        // （→ /api/diagnose 的 normalization_enabled）靠的就是这个 null。
-        // 命令表那一份非空 profile 由客户端内部 `?: DeviceProfiles.DEFAULT` 补，
-        // 与 GoformSettingWriter 的既有做法同一处口径，不在这里多铺一层。
-        val signalClient = GoformSignalClient(goform, profile)
-        val wifiClient = GoformWifiClient(goform, profile)
-        val networkClient = GoformNetworkClient(goform, profile)
-        val deviceClient = GoformDeviceClient(goform, profile)
+        // 这两个客户端里的 GoformFieldMapper 是双 profile（阶段 0.4a）：
+        // **可空**的那一份（`runtime.profile`）管归一化 —— 排障开关关掉归一化时它就是 null，
+        // `enabled` / `profileId`（→ /api/diagnose 的 normalization_enabled）靠的就是这个 null；
+        // **非空**的那一份（`runtime.commandProfile`）管命令表。阶段 2 批 C（P1-30）之前，
+        // 命令表那一份是客户端内部 `?: DeviceProfiles.DEFAULT` 兜的 —— 兜的是**注册表默认插件**，
+        // 于是排障开关会顺带把命令表换成默认设备的（接第二台设备就是「向 B 发 A 的 cmd」）。
+        // 现在两份都由这里传，命令表那份是**选中插件**的 profile（理由见 DeviceRuntime.commandProfile）。
+        //
+        // 阶段 2 批 D1（P1-31）起，**写**命令表也走同一条口径：`GoformSettingWriter` 内部
+        // 原来是 `?: ZteGoformProfile`，比读侧更危险（排障模式下会向 B 设备发 A 设备的写命令）。
+        // 于是 network / device / sim 三个**纯写**客户端改成只收非空 `commandProfile` ——
+        // 它们不持有 GoformFieldMapper，可空 profile 在那里无从生效，留一个死参数只会让人
+        // 误以为「字段归一化在这三个类里起作用」（见各自的类 KDoc）。
+        val signalClient = GoformSignalClient(goform, runtime.profile, runtime.commandProfile)
+        val wifiClient = GoformWifiClient(goform, runtime.profile, runtime.commandProfile)
+        val networkClient = GoformNetworkClient(goform, runtime.commandProfile)
+        val deviceClient = GoformDeviceClient(goform, runtime.commandProfile)
         // 短信客户端要非空 profile：字段归一化可以关（排障开关 → profile = null），
         // 但短信命令表不能关（没有参数表就发不出短信），口径同 GoformSettingWriter。
-        val smsClient = GoformSmsClient(goform, profile ?: DeviceProfiles.DEFAULT)
-        val simClient = GoformSimClient(goform, profile)
+        // `commandProfile` 就是这条口径的唯一出口 —— 它兜的是**选中插件**的 profile，
+        // 不是注册表默认值（理由见 DeviceRuntime.commandProfile 的 KDoc）。
+        val smsClient = GoformSmsClient(goform, runtime.commandProfile)
+        val simClient = GoformSimClient(goform, runtime.commandProfile)
         AppLogger.i(TAG, "[4] Goform clients initialized")
 
         val networkController = NetworkController(context, atChannel, networkClient, wifiClient)
@@ -815,33 +850,6 @@ object ComponentFactory {
             simClient = simClient,
             networkController = networkController
         )
-    }
-
-    /**
-     * 选设备 profile（计划书 3.2 / 10.2）。
-     *
-     * - `fieldNormalizationEnabled = false` → 返回 null，设备客户端层退回原样透传（决策 D7 的回退开关）。
-     * - `deviceProfileId` 为空 → 注册表默认值（现有部署零配置继续工作）。
-     * - 填了但注册表里没有 → **仍然回落默认值** + WARN。型号不认识不能导致整个不工作。
-     *
-     * 只在构造组件图时读一次；改了配置要重启后台服务。这样"切换后缓存里还躺着上一种形状的
-     * 数据"（计划书 1.0.2）在设计上就不成立 —— 组件图重建时各级缓存都是新的。
-     */
-    private fun resolveDeviceProfile(settings: AppSettings): DeviceProfile? {
-        if (!settings.fieldNormalizationEnabled) {
-            AppLogger.w(TAG, "字段归一化已关闭（排障开关），设备字段将原样透传，对外字段名会变回设备原名")
-            return null
-        }
-        val id = settings.deviceProfileId
-        if (id.isBlank()) return DeviceProfiles.DEFAULT
-        val picked = DeviceProfiles.byId(id)
-        if (picked == null) {
-            AppLogger.w(TAG, "未知的 deviceProfileId=$id，回落 ${DeviceProfiles.DEFAULT.id}" +
-                "（可选：${DeviceProfiles.ALL.joinToString { it.id }}）")
-            return DeviceProfiles.DEFAULT
-        }
-        AppLogger.i(TAG, "设备 profile: ${picked.id}（${picked.displayName}）")
-        return picked
     }
 
     /** 存储子图：settings + database + responseCache（原步骤 1 + 8）。 */

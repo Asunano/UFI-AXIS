@@ -566,6 +566,25 @@ class HttpServer(
                     // 设备 profile 状态（计划书 10.2）：便宜的元信息，不发设备查询。
                     // status 的四态是排障用的：型号填错时 core 会静默回落默认 profile，
                     // 没有这一行就只能去翻启动日志里的 WARN。
+                    //
+                    // plugin_id / selection 是阶段 2 的 2.8 新增的两个键（只新增，上面四个键的
+                    // 推导逻辑一个字符都没动）：
+                    //
+                    // - plugin_id：**选中插件**的 id（如 zte-f50）。恒非空 —— 认不出设备也会回落到
+                    //   默认插件，所以它和 active 不同，不会因为排障开关而空掉。
+                    // - selection：这次选型是怎么定下来的，值域固定四个小写 snake：
+                    //   configured（配置项命中）/ probed（probe 打分选出）/ default（没配，用注册表默认）/
+                    //   fallback（配了但匹配不上，已回落）。
+                    //   probed 在当前版本**不会出现**（probe 选型是计划书阶段 5），但值域现在就定稳了 ——
+                    //   对外值域二次扩张要两端一起改，所以客户端请按四个值实现。
+                    //
+                    // ⚠ 已知不一致（**本批刻意不修**）：selection 与 status 可以互相矛盾。
+                    // 典型场景：device_profile_id 填的是 plugin id（zte-f50），选型命中 →
+                    // selection=configured；但 active 走的是 profile id（zte-goform），于是
+                    // configured != active，status 按上面那个 when 判成 fallback，看上去像「型号填错了」。
+                    // status 的这套判据是既有行为，改它就是行为变更，所以这里只如实下发 selection。
+                    // 显示口径（status 与 selection 谁说了算、app/web 的诊断页怎么写）统一到阶段 3
+                    // 连 UI 一起改；在那之前**以 selection 为准**看选型结果。
                     val configuredProfile = ctx.settings.deviceProfileId
                     val activeProfile = ctx.dataHub.deviceProfileId
                     diag["device_profile"] = mapOf(
@@ -577,7 +596,10 @@ class HttpServer(
                             configuredProfile.isBlank() -> "default"   // 没配，用注册表默认
                             configuredProfile == activeProfile -> "configured"
                             else -> "fallback"                          // 配了但注册表里没有，已回落
-                        }
+                        },
+                        // 2.8 新增：取值在装配层就定死了（DeviceRuntime → DataHub），这里不做任何推导
+                        "plugin_id" to ctx.dataHub.devicePluginId,
+                        "selection" to ctx.dataHub.deviceSelection
                     )
 
                     // 字段覆盖率（计划书 10.1）：只在显式要求时算，它会逐分组向设备发查询。
