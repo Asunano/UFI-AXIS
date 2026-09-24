@@ -47,4 +47,11 @@ dependencies {
     //   （HttpResponse 只出现在 :core:goform 自己的那一层传输接口上，没有上到 DeviceTransport）。
     //   判据就一条：只有公开签名里出现的类型才需要进依赖、才需要是 api。
     testImplementation(libs.junit)
+    // `DeviceRuntimeTest` 要调 `DeviceRuntime.resolve()`（阶段 5 的 5.2 起是 suspend，
+    // 因为它会调 `DevicePlugin.probe()`）→ 需要 `runBlocking`。
+    // 上面那条协程依赖是 implementation，**不会**传到测试编译 classpath 上，所以这里显式声明一次
+    // （同一条已经写在 `:core:device-plugins` 的 build.gradle.kts 里）。
+    // 刻意不用 coroutines-test：本模块的单测里没有任何需要虚拟时间的等待 ——
+    // 假插件的 probe() 是纯函数，`runBlocking` 一跑就完。
+    testImplementation(libs.kotlinx.coroutines.android)
 }

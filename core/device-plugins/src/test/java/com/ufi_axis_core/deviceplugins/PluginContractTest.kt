@@ -151,17 +151,26 @@ class PluginContractTest {
     fun `tuning 的值域自洽`() {
         plugins.forEach { plugin ->
             val t = plugin.tuning()
-            // 防的是「换设备时把两个温控阈值填反」：warn >= critical 会让告警永远先按 critical 判
+            // 防的是「换设备时把两个下载限速阈值填反」：warn >= critical 会让限速永远先按 critical 判。
+            // ⚠ 这两条只管**下载限速**，与 AlertEngine 的告警阈值、AppSettings 的采集降频阈值无关
+            //   （三套阈值撞名的经过记在 DeviceTuning 的文件头，§8 裁决 ②）。
             assertTrue(
-                "${plugin.id}: thermalWarnC(${t.thermalWarnC}) 必须小于 thermalCriticalC(${t.thermalCriticalC})",
-                t.thermalWarnC < t.thermalCriticalC,
+                "${plugin.id}: downloadThrottleWarnC(${t.downloadThrottleWarnC}) 必须小于 " +
+                    "downloadThrottleCriticalC(${t.downloadThrottleCriticalC})",
+                t.downloadThrottleWarnC < t.downloadThrottleCriticalC,
+            )
+            // 第 4 档（强制全部暂停）是 critical + 本偏移量。填 0 会让「暂停」与「最狠限速」同温触发，
+            // 等于把第 3 档删掉；填负数更糟 —— 暂停会比限速先发生。
+            assertTrue(
+                "${plugin.id}: downloadThrottleForcePauseOffsetC 必须为正",
+                t.downloadThrottleForcePauseOffsetC > 0f,
             )
             // 零回差 + 边沿触发 = 阈值附近微抖导致的告警风暴（判据见 DeviceTuning.thermalJitterC）
             assertTrue("${plugin.id}: thermalJitterC 必须为正", t.thermalJitterC > 0f)
             // 预热期 <= 0 等于没有预热期，开机瞬间的抖动会直接入库并判告警
             assertTrue("${plugin.id}: bootGraceMs 必须为正", t.bootGraceMs > 0L)
-            // 许可数 <= 0 会让所有 root shell 直接排队到死
-            assertTrue("${plugin.id}: rootShellPermits 必须为正", t.rootShellPermits > 0)
+            // `rootShellPermits > 0` 那条随字段一起删掉（§8 裁决 ③）：
+            // 它是 ShellQoS 的配置默认值、不是设备事实，而且实测用户默认值是 3 不是 5。
         }
     }
 

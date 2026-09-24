@@ -2,6 +2,8 @@
 package com.ufi_axis_core.controller.system
 
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.devicespi.DeviceTuning
+import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.notify.NotifyEvent
 import com.ufi_axis_core.notify.NotifyLevel
 import com.ufi_axis_core.notify.NotifyScenes
@@ -30,9 +32,18 @@ import java.util.concurrent.ConcurrentHashMap
  * 所有任务统一由 aria2c 子进程（JSON-RPC）驱动，支持
  * HTTP/HTTPS/FTP/magnet/torrent/metalink（多连接、P2P）。
  * 文件读写、传感器采集均走 Java File I/O / 系统 API，不依赖 root。
+ *
+ * @param platform 平台适配层（阶段 4 的 4.3）。本类只用它的
+ *   [PlatformAdapter.readTemperature] —— 热区读法已经从本类搬进 `SprdPlatform`。
+ *   装配层递的是 `ComponentFactory` 里那**一份共享实例**（不要自己 `platform(ctx)` 再造一个）。
+ * @param tuning 本设备的实测阈值调参（阶段 4 的 4.5）。只用于**两个地方**：
+ *   「第一次创建配置」时的温度阈值初值、以及 `migrateConfig()` 抬升存量配置时的**目标值**。
+ *   ⚠ **用户已经写进 `config.json` 的值仍然优先** —— tuning 不覆盖它们。
  */
 class DownloadManager(
-    private val appContext: android.content.Context
+    private val appContext: android.content.Context,
+    private val platform: PlatformAdapter,
+    private val tuning: DeviceTuning
 ) {
     companion object {
         private const val TAG = "DownloadManager"
@@ -57,6 +68,78 @@ class DownloadManager(
         )
         // 外置存储根，MediaStore RELATIVE_PATH 需要相对它计算
         private const val EXTERNAL_ROOT = "/storage/emulated/0"
+
+        /**
+         * 存量配置的温度阈值**地板判据**，摄氏度。
+         *
+         * ⚠ **这两个数与「抬到多少」不是同一个数**：地板判据回答「旧到什么程度才算需要迁移」，
+         * 目标值回答「抬到多少」。`migrateConfig()` 的原文是
+         * `< 70f` → `75f`、`< 80f` → `85f`，两侧各是一个独立的数。
+         *
+         * 4.5 只把**目标值**接到了 [DeviceTuning]（`downloadThrottleWarnC` / `downloadThrottleCriticalC`），
+         * 这两条地板判据**保持字面量** —— [DeviceTuning] 里**没有承载它们的字段**，
+         * 拿目标值去当判据会静默改掉迁移的触发范围（例如目标值 75 当判据，
+         * 就会把用户自己设成 72 的 warn 也抬到 75）。
+         *
+         * 登记：地板判据同样是「换设备要重新量」的设备知识，但 tuning 现在装不下它。
+         * 要不要给 [DeviceTuning] 加两个字段是独立的一次契约变更（会动 `PluginContractTest`）。
+         */
+        private const val LEGACY_TEMP_WARN_FLOOR_C = 70f
+        private const val LEGACY_TEMP_CRITICAL_FLOOR_C = 80f
+
+        /**
+         * **第一次创建配置**（`config.json` 还不存在）时的初值：两个温度阈值取插件的实测值。
+         *
+         * ⚠ 只有这一条路径吃 tuning。文件已存在时走 `loadConfig()` 的反序列化，
+         * 本函数造出来的对象会被整个替换掉 —— 也就是**用户已写的配置优先**。
+         *
+         * ⚠ 还有一条**没有**吃 tuning 的兜底：json 里**缺字段**时，
+         * kotlinx 会用 [DownloadConfig] 的字段默认值（仍是字面量 75f / 85f）。
+         * 今天与 F50 的 tuning 取值相同所以无差别；登记在此，不在本批改
+         * （改它要给 [DownloadConfig] 换一套构造方式，属于序列化层的变更）。
+         */
+        internal fun initialConfig(tuning: DeviceTuning): DownloadConfig = DownloadConfig(
+            throttleTempWarn = tuning.downloadThrottleWarnC,
+            throttleTempCritical = tuning.downloadThrottleCriticalC
+        )
+
+        /**
+         * 老配置迁移的**纯逻辑**，原地改 [config]，返回「有没有改动」。
+         *
+         * 从 `migrateConfig()` 原样抽出来（控制流、判据、顺序一字未改），只为可单测 ——
+         * 落盘与日志仍在 `migrateConfig()` 里。两处温度迁移的**目标值**改成读 [tuning]，
+         * **地板判据**仍是 [LEGACY_TEMP_WARN_FLOOR_C] / [LEGACY_TEMP_CRITICAL_FLOOR_C]。
+         */
+        internal fun migrateConfigInPlace(config: DownloadConfig, tuning: DeviceTuning): Boolean {
+            var changed = false
+            if (config.saveDir in LEGACY_PUBLIC_DOWNLOAD_DIRS) {
+                config.saveDir = PUBLIC_DOWNLOAD_DIR
+                changed = true
+            }
+            if (config.throttleTempWarn < LEGACY_TEMP_WARN_FLOOR_C) {
+                config.throttleTempWarn = tuning.downloadThrottleWarnC; changed = true
+            }
+            if (config.throttleTempCritical < LEGACY_TEMP_CRITICAL_FLOOR_C) {
+                config.throttleTempCritical = tuning.downloadThrottleCriticalC; changed = true
+            }
+            return changed
+        }
+
+        /**
+         * 温度等级（0 / 2 / 3 / 4），从 `checkAndThrottle()` 原样抽出来，只为可单测。
+         *
+         * 四档的判据、比较符、顺序一字未改；唯一的变化是第 4 档那个裸字面量 `+ 10`
+         * 换成了 [DeviceTuning.downloadThrottleForcePauseOffsetC]（F50 实测同样是 10f）。
+         *
+         * ⚠ 两条线仍然**都取自 `config`**（用户可配），不是取自 tuning ——
+         * tuning 只在「配置初值」与「迁移目标值」两处出现，运行时判档一律看用户配置。
+         */
+        internal fun computeTempLevel(temp: Float, config: DownloadConfig, tuning: DeviceTuning): Int = when {
+            temp >= config.throttleTempCritical + tuning.downloadThrottleForcePauseOffsetC -> 4  // 极端高温
+            temp >= config.throttleTempCritical -> 3
+            temp >= config.throttleTempWarn -> 2
+            else -> 0
+        }
     }
 
     @Serializable
@@ -112,6 +195,8 @@ class DownloadManager(
         var smartThrottle: Boolean = true,
         // 2026-09-02：warn 原本是 55°C，而 F50 这类 UFI 空载就 64~66°C —— 等于开机即限速
         // （1000KB/s + 并发砍半）且永不退出。按实测空载温度上调到 75/85。
+        // 2026-09-24（4.5）：**第一次创建配置**时这两个值由插件的 DeviceTuning 供给
+        // （见 initialConfig）；下面这两个字面量只剩一个用途 —— 反序列化时 json 缺字段的兜底。
         var throttleTempWarn: Float = 75f,
         var throttleTempCritical: Float = 85f,
         var throttleCpuWarn: Int = 60,
@@ -131,7 +216,11 @@ class DownloadManager(
 
     val aria2 = Aria2Engine(appContext)
     val trackerManager = TrackerManager(appContext)
-    @Volatile var config = DownloadConfig()
+    /**
+     * 当前配置。初值 = 插件实测值（4.5）；`init` 里的 `loadConfig()` 会在 `config.json`
+     * 存在时把它整个换成盘上的那份 —— **用户已写的配置优先**。
+     */
+    @Volatile var config = initialConfig(tuning)
         private set
 
     private var aria2PollJob: Job? = null
@@ -347,8 +436,12 @@ class DownloadManager(
     private suspend fun checkAndThrottle() {
         // ── 采集传感器数据（直接读取，DataScheduler 在主 core 模块尚未抽取）──
 
-        // 温度: 直接读取 thermal zone
-        val temp = readMaxTemp()
+        // 温度: 由平台适配层读（4.3，读法已搬进 SprdPlatform.readTemperature）。
+        // ⚠ `?: 0f` 不是随手写的兜底：原来的 readMaxTemp() 返回 Float，「一个热区都读不到」
+        // 就是 0f，而 0f 在下面的分档里落到 else 分支（= 0 档，温度不参与限速），
+        // 同时 throttleTemp 对外显示 0。adapter 改成用 null 表示读不到（不许返回 0），
+        // 所以这里把 null 折回 0f —— **读不到时的行为与改造前逐路一致**。
+        val temp = platform.readTemperature() ?: 0f
 
         // CPU: 直接读取 /proc/stat 差值计算
         val cpu = readCpuUsage()
@@ -408,13 +501,8 @@ class DownloadManager(
         }
 
         // ── 计算各项指标等级 ──
-        // 温度等级
-        val tempLevel = when {
-            temp >= config.throttleTempCritical + 10 -> 4  // 极端高温
-            temp >= config.throttleTempCritical -> 3
-            temp >= config.throttleTempWarn -> 2
-            else -> 0
-        }
+        // 温度等级（判据原文见 computeTempLevel，第 4 档的偏移量来自 DeviceTuning）
+        val tempLevel = computeTempLevel(temp, config, tuning)
         // CPU 等级
         val cpuLevel = when {
             cpu >= config.throttleCpuCritical + 10 -> 4
@@ -516,27 +604,9 @@ class DownloadManager(
 
     // ─── 传感器读取 ──────────────────────────────────────────
 
-    /** 读取所有 thermal zone 取最大温度 */
-    private suspend fun readMaxTemp(): Float {
-        return try {
-            var maxTemp = 0f
-            // 优先用 Java File I/O（无需 fork 进程，更快）
-            val thermalDir = File("/sys/class/thermal")
-            if (thermalDir.exists()) {
-                thermalDir.listFiles()?.filter { it.name.startsWith("thermal_zone") }?.forEach { zone ->
-                    try {
-                        val tempFile = File(zone, "temp")
-                        if (tempFile.canRead()) {
-                            val milli = tempFile.readText().trim().toLongOrNull() ?: 0L
-                            val tempC = milli / 1000f
-                            if (tempC > maxTemp) maxTemp = tempC
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-            maxTemp
-        } catch (_: Exception) { 0f }
-    }
+    // 温度读法（原 readMaxTemp()）已于 4.3 搬进 SprdPlatform.readTemperature()：
+    // 遍历 /sys/class/thermal/thermal_zone* 取最大值那段逐字搬走，本类改为经 platform 调用。
+    // CPU / 电池 / 内存三处读法本批未动（4.3 的其余部分）。
 
     /** 读取 CPU 使用率（直接读 /proc/stat，无需 shell） */
     private suspend fun readCpuUsage(): Int {
@@ -1779,16 +1849,12 @@ class DownloadManager(
      * 老配置迁移。config.json 里的值优先级高于默认值，所以光改默认值对已有设备无效：
      * - saveDir 还指着旧的 "Downloads/UFI"（MediaStore 实际写 "Download/UFI"，两个目录）
      * - 温度阈值还是 55/70，在空载 65°C 的 UFI 上等于永久限速
+     *
+     * 判据与控制流见 [migrateConfigInPlace]（4.5 起**抬升的目标值**来自 [DeviceTuning]，
+     * **地板判据仍是字面量**，两者不是同一个数）。本方法只留「有改动才记日志 + 落盘」。
      */
     private fun migrateConfig() {
-        var changed = false
-        if (config.saveDir in LEGACY_PUBLIC_DOWNLOAD_DIRS) {
-            config.saveDir = PUBLIC_DOWNLOAD_DIR
-            changed = true
-        }
-        if (config.throttleTempWarn < 70f) { config.throttleTempWarn = 75f; changed = true }
-        if (config.throttleTempCritical < 80f) { config.throttleTempCritical = 85f; changed = true }
-        if (changed) {
+        if (migrateConfigInPlace(config, tuning)) {
             AppLogger.i(TAG, "config migrated: saveDir=${config.saveDir}, " +
                 "tempWarn=${config.throttleTempWarn}, tempCritical=${config.throttleTempCritical}")
             saveConfig()

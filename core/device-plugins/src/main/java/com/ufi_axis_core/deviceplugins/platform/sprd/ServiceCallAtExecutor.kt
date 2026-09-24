@@ -1,6 +1,7 @@
-package com.ufi_axis_core.collector.at
+package com.ufi_axis_core.deviceplugins.platform.sprd
 
 import android.os.Build
+import com.ufi_axis_core.devicespi.AtTransport
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.decodeServiceCallText
 import kotlinx.coroutines.Dispatchers
@@ -9,6 +10,12 @@ import java.util.concurrent.TimeUnit
 
 /**
  * AT 通道 —— 直接调 `/system/bin/service call`，不再依赖外部 `sendat` 二进制。
+ *
+ * 2026-09-24（阶段 4 批 F）从 `:core:collector` 的 `at/` 包**整体搬到这里**：
+ * 它是**展锐平台的设备知识**（服务名、事务码、API 等级分档全是展锐 HAL 的事实），
+ * 不是我们的策略。策略层 `ATChannel`（全局互斥、500ms 最小间隔、指数退避、20 次熔断）
+ * **留在 collector**，它现在通过注入拿到本类的实例，不再自己 `new`。
+ * 搬迁时**一行逻辑都没改**，`name` 取值尤其没动（见下）。
  *
  * ## 为什么自己写
  * 原先打包的 `sendat` 是 UFI-TOOLS 的 Go 二进制（UPX 压缩），它内部做的事就是
@@ -37,11 +44,23 @@ import java.util.concurrent.TimeUnit
  * `ATChannel` 的历史注释记着：在 app 进程里直连这套 HAL 会撞 `sprd_ipc_probe` 驱动竞态，
  * 要 30s 防抖；改成独立进程后问题消失。这里执行的 `service` 命令**本身就是独立进程**，
  * 与 sendat 的差别只是少了一层 Go wrapper（sendat 自己也是 fork `service`），竞态特性一致。
+ *
+ * ## 登记：[sdkInt] 这个默认参数是本类唯一的 Android 依赖（本批刻意不改）
+ * 阶段 4 开工前的盘点建议把它改成从 `ProbeEnv.androidBuild.sdkInt` 取 ——
+ * 那样本类就成了纯 JVM 可测的类，`buildArgv()` 的两套分档终于能写单测。
+ * **本批不动**：`ProbeEnv` 的采集实现要到阶段 5.1 才有，现在改会把 probe 链路一起牵动，
+ * 而本批的判据是「搬迁 + 定义，不改行为」。这条机会登记在此，做 5.1 时一并处理。
  */
 class ServiceCallAtExecutor(
     private val sdkInt: Int = Build.VERSION.SDK_INT
 ) : AtTransport {
 
+    /**
+     * ⚠ **对外可见的字符串，不许改**：它是 `/api/at/status` 与 `/api/at/platform` 的
+     * `method` 字段（`ATChannel.getPlatformInfo()` 直接取 `transport?.name`），
+     * app 侧 `getPlatformInfo()` 在消费。当前全仓只有本类一个 [AtTransport] 实现，
+     * 所以该字段恒为 `"service-call"`。
+     */
     override val name: String = "service-call"
 
     private val tag = "ServiceCallAt"

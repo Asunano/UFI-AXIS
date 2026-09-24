@@ -29,14 +29,15 @@ import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
 import com.ufi_axis_core.util.StationListShape
+import com.ufi_axis_core.util.celsiusToMilliC
 import com.ufi_axis_core.util.parseStationList
+import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.notify.NotifyEvent
 import com.ufi_axis_core.notify.NotifyLevel
 import com.ufi_axis_core.notify.NotifyScenes
 import com.ufi_axis_core.notify.Notifier
 import com.ufi_axis_core.notify.PushChannel
 import com.ufi_axis_core.api.websocket.WebSocketManager
-import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -98,6 +99,16 @@ class DataScheduler(
     private val telephonyCollector: TelephonyCollector,
     private val database: AppDatabase,
     private val webSocketManager: WebSocketManager,
+    /**
+     * 平台适配层（阶段 4 的 4.3 / 批 I）—— 本类唯一的热区读数来源，见 [readMaxCpuTemp]。
+     *
+     * **不接受 null**：温控熔断与温度告警都挂在它上面，给一个「读不到」的默认实现
+     * 等于让热保护默默失效，而那正是 [PlatformAdapter.readTemperature] 第 1 条硬约束要防的事。
+     *
+     * ⚠ 装配层必须传**整个组件图共享的那一份**实例（`ComponentFactory.build()` 里的 `val platform`），
+     * 不要在这里现场 `plugin.platform(ctx)` 再造一个 —— 理由见那行的注释。
+     */
+    private val platform: PlatformAdapter,
     private val signalClient: GoformSignalClient? = null,
     private val smsClient: GoformSmsClient? = null,
     private val alertEngine: com.ufi_axis_core.alert.AlertEngine? = null,
@@ -1849,24 +1860,56 @@ class DataScheduler(
     }
 
     /**
-     * 读取 CPU 最高温度（毫摄氏度）
-     * 从 /sys/class/thermal/ 下所有 thermal_zone 的 temp 文件读取，返回最大值
-     * 直接读取 sysfs，无需 root 权限，避免 shell fork 开销
+     * 读取 CPU 最高温度（**毫摄氏度**）—— 阶段 4 的 4.3（批 I）起改由
+     * [PlatformAdapter.readTemperature] 供值，本类不再自己遍历 `/sys/class/thermal`。
+     *
+     * 单位换算走 `core/common` 的 [celsiusToMilliC]（℃ Float? → 毫℃ Int，有单测）。
+     * **必须 `roundToInt()`，不许 `toInt()`**：截断会让一部分毫度值往返后少 1
+     * （实测 20~100°C 的 80001 个值里有 555 个，最小的是 32002 → 32.002f → 32001.998f → 32001；
+     * `roundToInt()` 则是 0 个不匹配）。依据与数字记在 [celsiusToMilliC] 的 KDoc 里。
+     *
+     * ## 这不是等价搬迁 —— 四点语义变更（用户已裁决接受）
+     *
+     * 原实现与 adapter 的读法有四处差异，收拢后本方法的行为随 adapter 变：
+     *
+     * 1. **多了目录与文件守卫**：adapter 先 `thermalDir.exists()`、每个 `temp` 先 `canRead()`。
+     *    原实现两者都没有，但**「没有 thermal 目录」这一种情形取值不变**：
+     *    `listFiles()` 对不存在的目录返回 `null`，整条 `?.` 链短路到 `?: 0` —— 原来也是 0，
+     *    而且**原来是静默的**（外层 `catch` 根本没被触发）。
+     *    唯一的行为差别是：这种设备现在每轮会多一条 WARN（折叠后 1 条/分钟，见下）。
+     *    这是刻意的 —— 「热区读不到 ⇒ 温控熔断失效」本来就该留痕。
+     * 2. **异常粒度从「整轮」细化到「每热区」**：原实现只有一层外层 `try`，
+     *    任一热区 `readText()` 抛异常（权限 / EIO / 热区消失）→ 整轮退化成 `0` 并记一条 WARN；
+     *    adapter 是每热区独立 `try` + `canRead()` 预检，坏的跳过、其余照算。
+     *    → **「部分热区损坏」时本方法现在给出其余热区的真实最大值，而不是 0**。这是改善，
+     *    也是本批唯一一处**会改变熔断判定**的差异（原来那种情形会误判成「最凉」）。
+     *    全部热区都读不动时仍然是 `null` → 0 + WARN，与原来一致。
+     * 3. **负数被地板夹成 0**：原实现的 `maxOrNull()` 能返回负数，adapter 的 max 从 `0f` 起。
+     *    负数只会出现在「热区未就绪写了 -1 之类」的场景，而它在下游本来也只与 `> 0` /
+     *    `> 70000` 比较 —— 负数与 0 在三条降频档和熔断 `when` 上判定完全相同，
+     *    唯一的差别在 `scanLocalAlerts()` 的 `if (milli > 0)`，而那里负数与 0 同样都不进。
+     * 4. **不可解析内容**：原实现 `mapNotNull` 跳过，adapter 是 `toLongOrNull() ?: 0L` 当 0 参与 max
+     *    —— max 从 0 起、0 不会抬升结果，**运行时等价**。
+     *
+     * ## 「读不到」仍然打一条 WARN
+     *
+     * 失败判定搬到 adapter 里了（返 `null`），但**不许静默** —— 温控熔断失效是必须留痕的事。
+     * 文案**逐字固定、不拼任何每次都变的内容**（异常消息、热区名、时间…）：
+     * `AppLogger.repeatGate` 按「级别 + tag + **完整消息**」折叠成 1 条/分钟，
+     * 拼了变量就会让 key 基数无界、折叠失效（计划书 §15 的 P1-35）。
+     * 这也是原文案去掉 `e.message` 插值的原因 —— 顺带把原来那条的折叠也修好了。
+     *
+     * ## 调度器
+     *
+     * 不再自己 `withContext(Dispatchers.IO)`：adapter 内部已经包了一层
+     * （见 `SprdPlatform.readTemperature` 的「调度器」段），这里再包一层是空切换。
      */
-    private suspend fun readMaxCpuTemp(): Int = withContext(Dispatchers.IO) {
-        try {
-            val thermalDir = File("/sys/class/thermal")
-            thermalDir.listFiles()
-                ?.filter { it.name.startsWith("thermal_zone") }
-                ?.mapNotNull { zone ->
-                    File(zone, "temp").readText().trim().toIntOrNull()
-                }
-                ?.maxOrNull() ?: 0
-        } catch (e: Exception) {
-            // 不再静默吞掉：温度读取失败会影响温控熔断判定，至少记录日志以便诊断
-            AppLogger.w(tag, "Failed to read CPU temperature, defaulting to 0: ${e.message}")
-            0
+    private suspend fun readMaxCpuTemp(): Int {
+        val celsius = platform.readTemperature()
+        if (celsius == null) {
+            AppLogger.w(tag, "Failed to read CPU temperature, defaulting to 0")
         }
+        return celsiusToMilliC(celsius)
     }
 
     // ── 采集调度参数（2026-09-03）──

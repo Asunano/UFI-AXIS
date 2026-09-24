@@ -27,6 +27,11 @@ dependencies {
     implementation(project(":core:controller"))
     implementation(project(":core:goform"))
     implementation(project(":core:device-schema"))
+    // 插件契约层。阶段 4 的 4.3（批 I）起 `PlatformAdapter` 出现在 `DataScheduler` 的构造签名上
+    // （热区读法住在适配层，本模块只做「摄氏度 → 毫摄氏度」换算与降频/熔断判定）。
+    // 技术上它已经经 `:core:goform` 的 `api(":core:device-spi")` 传递到本模块的编译 classpath，
+    // 但那是**别人的实现细节** —— 直接依赖的模块要显式声明，口径同 `:core:controller` 里的同一行。
+    implementation(project(":core:device-spi"))
     implementation(project(":core:websocket"))
     implementation(project(":core:alert"))
     implementation(libs.kotlinx.serialization.json)

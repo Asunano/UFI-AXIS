@@ -18,6 +18,12 @@ dependencies {
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
     implementation(project(":core:collector"))
+    // 插件契约层。阶段 4 的 4.4 起 `PlatformAdapter` 出现在 `NetworkController` 的构造签名上
+    // （网络栈重启的设备知识住在适配层）。
+    // 技术上它已经经 `:core:goform` 的 `api(":core:device-spi")` 传递到本模块的编译 classpath，
+    // 但那是**别人的实现细节**：goform 哪天把那行改成 implementation，本模块就会莫名编译不过。
+    // 直接依赖的模块要显式声明 —— 口径同 `:core:device-plugins` 里显式声明协程那一条。
+    implementation(project(":core:device-spi"))
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)

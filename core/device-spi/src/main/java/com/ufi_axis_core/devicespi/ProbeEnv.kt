@@ -5,24 +5,36 @@ package com.ufi_axis_core.devicespi
  *
  * ## 谁来采、采几次
  *
- * 由中间控制层（`DeviceRuntime`，阶段 4 落地）**采一次后共享**给所有插件 ——
- * 不让每个插件各自去读。理由有两条：
+ * 由**装配层** `ComponentFactory.build()` 在选型之前**采一次后共享**给所有插件
+ * （5.1 落地时的实际形态；批 A 的原话是「由中间控制层 `DeviceRuntime` 采」——
+ * 采集需要 `Context` / `AppSettings` / 网络，而 [DeviceRuntime] 在纯契约层拿不到这些，
+ * 所以采集点落在装配层，`DeviceRuntime` 只负责**拿到**它）—— 不让每个插件各自去读。
+ * 理由有两条：
  * 1. 每个插件各读一遍 `/proc/cpuinfo` / 各探一次设备，插件数一多选型就变成一串 I/O；
  * 2. 各插件读到的值必须**一致**，否则打分之间没有可比性。
  *
  * 对应的纪律写在 [DevicePlugin.probe] 上：插件只许读本对象，**不许自己发起任何 I/O**。
  *
- * ## 本批（阶段 2 批 A）只定义类型，**不写采集器**
+ * ## 采集器（阶段 5 的 5.1）已落地，**不在本模块**
  *
- * 采集实现（读 `/proc/cpuinfo`、填 [BuildInfo]、探一次 `LD`）是**阶段 5 的 5.1**。
- * 本批落的是契约，所以这里没有任何 `fun collect()`。
+ * 实现是 `ProbeEnvCollector`（`:core:device-plugins` 的 `probe/`）：读 `/proc/cpuinfo`、
+ * 填 [BuildInfo]、裸 HTTP 探一次 `LD`。**刻意不放本模块**：那三件事全是 I/O
+ * （其中两件要 Android 与网络），而本模块是纯契约层，单测必须不起 Android 就能跑。
+ * 所以这里仍然没有任何 `fun collect()`。
+ *
+ * 唯一留在本模块的是**判据常量与纯函数** [CpuInfoPlatform]（零 I/O），
+ * 理由见它自己的 KDoc：它有两个消费者，分处两个互不可见的 module。
  */
 class ProbeEnv(
     /**
-     * `/proc/cpuinfo` 里的平台串，**已转小写**；读不到时为 null。
+     * `/proc/cpuinfo` 的内容，**已 trim 并转小写**；读不到时为 null。
      *
-     * 现成判据参考 `ATChannel.detectPlatform()`（`:core:collector`）：它就是读这个文件，
-     * 按 `Spreadtrum` / `sprd` 判展锐、按 `Qualcomm` / `qcom` 判高通。
+     * ⚠ 取值是**全文**而不是抽出来的某一行 —— 判据必须与 `ATChannel.detectPlatform()`
+     * 改造前的「对全文做 contains」逐位等价，理由写在 [CpuInfoPlatform.normalize] 上。
+     * 它只进内存，**不进日志、不下发**。
+     *
+     * 判据不要自己写：用 [CpuInfoPlatform.isSpreadtrum] / [CpuInfoPlatform.isQualcomm]
+     * （4.6 之前这里有两份不一致的 marker 列表，那正是本字段最容易被抄错的地方）。
      */
     val cpuInfoPlatform: String?,
 

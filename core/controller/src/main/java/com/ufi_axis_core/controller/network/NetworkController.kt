@@ -7,9 +7,9 @@ import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.controller.goform.GoformNetworkClient
 import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.controller.goform.WriteOutcome
+import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.withLock
 
 /**
@@ -20,7 +20,17 @@ class NetworkController(
     private val context: Context,
     private val atChannel: ATChannel,
     private val networkClient: GoformNetworkClient,
-    private val wifiClient: GoformWifiClient
+    private val wifiClient: GoformWifiClient,
+    /**
+     * 平台适配层（阶段 4 的 4.4）：网络栈重启「发哪几条命令」这份**设备知识**住在它那里。
+     *
+     * 由装配层（`ComponentFactory.buildNetworkGraph`）传 `runtime.plugin.platform(context)` ——
+     * 本类**不许**自己 new 插件或问 `PluginRegistry`：那会让「当前是哪台设备」在仓里出现第二个答案
+     * （唯一答案是 `DeviceRuntime.resolve()` 的结果，见 `ComponentFactory` 里那段注释）。
+     *
+     * 参数排在最后是为了让现有调用点不必改实参顺序（全仓只有一处 `NetworkController(...)`）。
+     */
+    private val platform: PlatformAdapter
 ) {
     private val tag = "NetworkController"
     // 网络栈重启互斥锁 — 防止并发 AT+SFUN 调用
@@ -176,37 +186,23 @@ class NetworkController(
     /**
      * 重启网络协议栈（AT+SFUN=5→延时→AT+SFUN=4）
      *
-     * 参考 UFI-TOOLS-REF: networkStackSwitch()
-     * AT+SFUN=5 关闭网络栈 → 等待芯片重新加载配置 → AT+SFUN=4 重启
-     * 这使得 goform 写入的频段限制无需设备重启即可生效。
+     * 阶段 4 的 4.4 起，「发哪几条命令、什么顺序、中间等多久、怎么判成功」这份**设备知识**
+     * 搬到了 [PlatformAdapter.restartNetworkStack]（F50 那份在
+     * `:core:device-plugins` 的 `SprdPlatform`，命令 / 顺序 / 等待 / 判据 / 日志文案逐字未改）。
+     * 本方法只剩**策略**这两件事：
      *
-     * 安全措施：
-     * - 互斥锁防止并发 AT+SFUN 调用
-     * - 重启后额外 2s 等待 modem 完全稳定
+     * - **互斥锁防止并发 AT+SFUN 调用** —— 留在这里，理由见下；
+     * - **执行通道与超时** —— 由本类注入：它本来就持有 [ATChannel]（限流 / 退避 / 熔断那一层），
+     *   超时值仍是原来的 5000ms。
+     *
+     * 为什么锁不跟着搬：`DevicePlugin.platform(ctx)` 每次调用都新建一个适配层实例
+     * （插件不缓存），锁放在适配层就是「每个实例各锁自己」= 等于没锁；
+     * 而且「同一时刻只许一次 AT+SFUN」是我们的策略，不是这台设备的事实。
+     *
+     * 重启后额外 2s 等待 modem 完全稳定这一步在适配层里（它是设备事实）。
      */
     suspend fun restartNetworkStack(): Boolean = stackRestartMutex.withLock {
-        AppLogger.i(tag, "Restarting network stack (AT+SFUN=5/4)...")
-        try {
-            val off = atChannel.sendCommand("AT+SFUN=5", 5000)
-            if (off?.contains("OK") != true) {
-                AppLogger.w(tag, "AT+SFUN=5 failed: $off, stack restart skipped")
-                return false
-            }
-            AppLogger.i(tag, "Network stack off, waiting 500ms...")
-            delay(500)
-            val on = atChannel.sendCommand("AT+SFUN=4", 5000)
-            if (on?.contains("OK") != true) {
-                AppLogger.w(tag, "AT+SFUN=4 failed: $on")
-                return false
-            }
-            AppLogger.i(tag, "Network stack restarted, waiting 2s for modem stabilization...")
-            delay(2000)
-            AppLogger.i(tag, "Network stack restart complete")
-            return true
-        } catch (e: Exception) {
-            AppLogger.e(tag, "Network stack restart exception: ${e.message}")
-            return false
-        }
+        platform.restartNetworkStack { cmd -> atChannel.sendCommand(cmd, 5000) }
     }
 
     /**

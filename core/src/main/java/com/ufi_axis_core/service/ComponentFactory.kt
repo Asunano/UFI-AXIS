@@ -19,7 +19,11 @@ import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.deviceplugins.PluginRegistry
+import com.ufi_axis_core.deviceplugins.probe.ProbeEnvCollector
+import com.ufi_axis_core.devicespi.AtTransport
 import com.ufi_axis_core.devicespi.DeviceRuntime
+import com.ufi_axis_core.devicespi.PlatformAdapter
+import com.ufi_axis_core.devicespi.ProbeEnv
 import com.ufi_axis_core.devicespi.TransportConfig
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.server.HttpServer
@@ -145,22 +149,56 @@ object ComponentFactory {
         val database = AppDatabase.getInstance(context)
         AppLogger.i(TAG, "[1] Database initialized")
 
-        // ── 2-3. 采集器子图（AT 通道 + system/telephony 采集器） ──
-        val collector = buildCollectorGraph(context)
-
-        // ── 4-5. 网络子图（Goform 客户端层 + 网络/ SIM 控制器） ──
-        // 设备插件与 profile 在整个组件图里只选一次（计划书 3.2 / 3.3），网络子图与 SignalCollector 共用。
+        // ── 2. 设备插件选型 ──
+        // 设备插件与 profile 在整个组件图里只选一次（计划书 3.2 / 3.3），
+        // 网络子图、SignalCollector 与 AT 通道共用同一个结果。
         // 取值（配置项两条）在这里读、传进 resolve() —— :core:device-spi 是纯契约层，
         // 不依赖 AppSettings / Context（理由写在 DeviceRuntime 的 KDoc 上）。
+        //
+        // ⚠ 位置在 buildCollectorGraph 之前（阶段 4 批 F 起）：AT 通道的下发实现现在由
+        // 插件的 PlatformAdapter 提供，ATChannel 自己不 new 具体实现，所以必须先有 runtime。
+        //
+        // 2026-09-24（阶段 5 的 5.1）：**先采一份 ProbeEnv**，位置在 resolve() 之前。
+        // 口径同下面那个 `val platform` —— 组件图只造/只采一份，全程共享：
+        //   - ATChannel 的平台判定（4.6，见 buildCollectorGraph）；
+        //   - 插件选型的 probe 打分（5.2，下面 resolve() 的 probeEnv 参数）。
+        // 两个消费者吃的必须是**同一个对象**：各采一份就会有两套指纹，
+        // 「AT 判成展锐、probe 却按另一份打分」这种不一致在真机上几乎无法归因。
+        // 设备 IP 与端口的口径与传输层完全一致（`goformIp` 空则回落网关），
+        // 所以这个表达式**只写一处**、同时喂给探测与 TransportConfig（见 buildNetworkGraph 的入参）。
+        val deviceIp = settings.goformIp.ifBlank { gatewayIp }
+        val probeEnv = ProbeEnvCollector.collect(deviceIp = deviceIp, port = settings.goformPort)
+        AppLogger.i(TAG, "[1.5] Probe env collected (goform_ld_reachable=${probeEnv.goformLdReachable})")
+
+        // 2026-09-24（阶段 5 的 5.2/5.3/5.4）：resolve() 现在是 suspend 且收 probeEnv ——
+        // 配置项为空时它会逐个插件 probe() 打分（选型规则与对外影响写在 DeviceRuntime 的 KDoc 上）。
+        // 本函数早就是 suspend，所以这次改签名在装配层只多了一行实参。
         val runtime = DeviceRuntime.resolve(
             plugins = PluginRegistry.ALL,
             default = PluginRegistry.DEFAULT,
             configuredId = settings.deviceProfileId,
             normalizationEnabled = settings.fieldNormalizationEnabled,
+            probeEnv = probeEnv,
             warn = { AppLogger.w(TAG, it) },
             info = { AppLogger.i(TAG, it) },
         )
-        val network = buildNetworkGraph(settings, gatewayIp, collector.atChannel, database, context, runtime)
+
+        // 平台适配层：**整个组件图只造一份**。
+        // `DevicePlugin.platform(ctx)` 每次调用都新建实例，所以「调两次」就是两个对象 ——
+        // 今天 SprdPlatform 无状态所以无害，但那是定时炸弹：哪天 adapter 缓存了热区路径
+        // 或探测结果，两个实例就会各探一次、各缓存一份，行为还不一致。
+        // 共享一份也让「互斥锁能不能放进 adapter」这个问题直接消失（见 NetworkController 的构造参数注释）。
+        val platform = runtime.plugin.platform(context)
+
+        // ── 2-3. 采集器子图（AT 通道 + system/telephony 采集器） ──
+        // probeEnv 传的是上面那份**共享的**指纹：ATChannel 的平台判定（4.6）现在从它派生，
+        // 不再自己读 /proc/cpuinfo。
+        val collector = buildCollectorGraph(context, platform.atTransports(), probeEnv)
+
+        // ── 4-5. 网络子图（Goform 客户端层 + 网络/ SIM 控制器） ──
+        // deviceIp 由 [build] 算好传进来（`goformIp` 空则回落网关）：LD 探测与传输层必须是
+        // **同一个地址**，否则「探到了 A、连的是 B」会让 5.2 的打分对不上实际连的设备。
+        val network = buildNetworkGraph(settings, deviceIp, collector.atChannel, database, context, runtime, platform)
 
         // ── 5.5 配对设备存储 + 设备请求验证器 ──
         // 位置提前到 WebSocket 之前：WS 握手与 /api 请求都要按 token 哈希查设备、用记录里的
@@ -228,6 +266,9 @@ object ComponentFactory {
             telephonyCollector = collector.telephonyCollector,
             database = database,
             webSocketManager = wsManager,
+            // 热区读数（4.3 / 批 I）：`readMaxCpuTemp()` 已改为调 platform.readTemperature()。
+            // 传的是上面那份**共享实例**，不是现场新造的（见 `val platform` 那行的注释）。
+            platform = platform,
             signalClient = network.signalClient,
             smsClient = network.smsClient,
             alertEngine = alert,
@@ -262,7 +303,9 @@ object ComponentFactory {
             networkController = network.networkController,
             wifiClient = network.wifiClient,
             networkClient = network.networkClient,
-            smsRuleStore = smsRuleStore
+            smsRuleStore = smsRuleStore,
+            platform = platform,
+            tuning = runtime.plugin.tuning()
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
@@ -758,11 +801,22 @@ object ComponentFactory {
 
     // ==================== 子图 builders（Phase 2 #2 拆分） ====================
 
-    /** 采集器子图：AT 通道 + system / telephony 采集器（原步骤 2-3）。 */
-    private suspend fun buildCollectorGraph(context: Context): CollectorGraph {
+    /** 采集器子图：AT 通道 + system / telephony 采集器（原步骤 2-3）。
+     *
+     * [atTransports] 由调用方从 `runtime.plugin.platform(ctx).atTransports()` 取来
+     * （阶段 4 批 F）：`ATChannel` 是策略层（限流/退避/熔断），**不认识任何具体实现** ——
+     * `ServiceCallAtExecutor` 现在住在 `:core:device-plugins` 的 `platform/sprd/`。
+     *
+     * [probeEnv] 同理（阶段 4 的 4.6）：`ATChannel` 不再自己读 `/proc/cpuinfo`，
+     * 平台判定从这份**组件图唯一的**指纹派生。 */
+    private suspend fun buildCollectorGraph(
+        context: Context,
+        atTransports: List<AtTransport>,
+        probeEnv: ProbeEnv
+    ): CollectorGraph {
         val atChannel = ATChannel()
         val atConnected = try {
-            withTimeoutOrNull(10_000L) { atChannel.init() } ?: false
+            withTimeoutOrNull(10_000L) { atChannel.init(atTransports, probeEnv) } ?: false
         } catch (e: Exception) {
             AppLogger.e(TAG, "AT channel init exception", e); false
         }
@@ -786,15 +840,17 @@ object ComponentFactory {
      * 「当前是哪台设备」全仓只有一处答案。 */
     private fun buildNetworkGraph(
         settings: AppSettings,
-        gatewayIp: String,
+        deviceIp: String,
         atChannel: ATChannel,
         database: AppDatabase,
         context: Context,
-        runtime: DeviceRuntime
+        runtime: DeviceRuntime,
+        platform: PlatformAdapter
     ): NetworkGraph {
         // 传输层由插件造（阶段 2 批 B 取代了原先的私有 createTransport()）。三个取值与此前逐字一致：
-        // 设备 IP 仍是 `goformIp` 空则回落网关，端口与密码仍直取配置项（符号名中立、配置键仍叫 goform*，
-        // 见 TransportConfig 的 KDoc）。
+        // 设备 IP 仍是 `goformIp` 空则回落网关（2026-09-24 起那个表达式移到 [build]，
+        // 与 ProbeEnv 的 LD 探测共用同一份 —— 两处各算一遍就会有两个口径），
+        // 端口与密码仍直取配置项（符号名中立、配置键仍叫 goform*，见 TransportConfig 的 KDoc）。
         //
         // ⚠ 这里要**向下转型**到具体类 [GoformClient]：6 个客户端的构造参数是 `core/goform` 模块内部
         // 那一层传输接口（比 `DeviceTransport` 多 7 个协议成员），用 `DeviceTransport` 接会编译不过；
@@ -808,7 +864,7 @@ object ComponentFactory {
         // 「选中的插件不是 goform 系」，把它写成一句话，下一个接非 goform 设备的人就不用猜。
         val transport = runtime.plugin.createTransport(
             TransportConfig(
-                deviceIp = settings.goformIp.ifBlank { gatewayIp },
+                deviceIp = deviceIp,
                 port = settings.goformPort,
                 password = settings.goformPassword
             )
@@ -845,7 +901,16 @@ object ComponentFactory {
         val simClient = GoformSimClient(goform, runtime.commandProfile)
         AppLogger.i(TAG, "[4] Goform clients initialized")
 
-        val networkController = NetworkController(context, atChannel, networkClient, wifiClient)
+        // 平台适配层由装配层给（阶段 4 的 4.4）：`NetworkController.restartNetworkStack()`
+        // 现在只留策略（互斥锁 + 注入执行通道与 5000ms 超时），
+        // 「AT+SFUN=5 / AT+SFUN=4 怎么发」那份设备知识在 PlatformAdapter 里。
+        // `platform` 由 [build] 造好一份传进来（整个组件图共享同一个实例，理由见那里的注释）。
+        // 与第 167 行取 atTransports() 时那次调用是**两个实例** —— `platform(ctx)` 按
+        // `DevicePlugin.platform` 的纪律每次新建，适配层无跨调用状态（网络栈重启的互斥锁
+        // 留在 NetworkController，理由见它的构造参数注释）。
+        val networkController = NetworkController(
+            context, atChannel, networkClient, wifiClient, platform
+        )
         AppLogger.i(TAG, "[5] Controllers initialized")
 
         return NetworkGraph(
@@ -873,7 +938,11 @@ object ComponentFactory {
         )
     }
 
-    /** 控制器子图：System / ADB / SMS 转发 / 任务 / 下载 控制器（原步骤 5 的 SystemController + 11-12）。 */
+    /** 控制器子图：System / ADB / SMS 转发 / 任务 / 下载 控制器（原步骤 5 的 SystemController + 11-12）。
+     *
+     * [platform] / [tuning] 只服务 `DownloadManager`（阶段 4 的 4.3 + 4.5）：
+     * 热区读法收进了 `PlatformAdapter.readTemperature()`，下载限速的两个温度阈值初值
+     * 与迁移目标值收进了 `DeviceTuning`。[platform] 递的是 `build()` 里那**一份共享实例**。 */
     private fun buildControllerGraph(
         context: Context,
         deviceClient: GoformDeviceClient,
@@ -882,7 +951,9 @@ object ComponentFactory {
         wifiClient: GoformWifiClient,
         networkClient: GoformNetworkClient,
         /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
-        smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore
+        smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore,
+        platform: PlatformAdapter,
+        tuning: com.ufi_axis_core.devicespi.DeviceTuning
     ): ControllerGraph {
         // SystemController 依赖 deviceClient，与原步骤 5 同阶段构造
         val systemController = SystemController(deviceClient)
@@ -897,7 +968,9 @@ object ComponentFactory {
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
         val conditionEngine = com.ufi_axis_core.core.scheduler.ConditionEngine(context, actionExecutor)
-        val downloadManager = com.ufi_axis_core.controller.system.DownloadManager(context.applicationContext)
+        val downloadManager = com.ufi_axis_core.controller.system.DownloadManager(
+            context.applicationContext, platform, tuning
+        )
         val tunnelManager = com.ufi_axis_core.controller.system.TunnelManager(context.applicationContext)
         AppLogger.i(TAG, "[12] Extended components initialized")
 

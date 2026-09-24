@@ -1,22 +1,27 @@
 package com.ufi_axis_core.deviceplugins.zte.f50
 
+import android.content.Context
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.goform.GoformClient
+import com.ufi_axis_core.deviceplugins.platform.sprd.SprdPlatform
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
+import com.ufi_axis_core.devicespi.CpuInfoPlatform
 import com.ufi_axis_core.devicespi.DevicePlugin
 import com.ufi_axis_core.devicespi.DeviceTransport
 import com.ufi_axis_core.devicespi.DeviceTuning
+import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.devicespi.ProbeEnv
 import com.ufi_axis_core.devicespi.TransportConfig
 
 /**
  * ZTE F50（Unisoc 平台随身 WiFi）插件 —— 本仓的首个 [DevicePlugin] 实现，也是默认插件。
  *
- * 它把已经存在的三样东西聚到一起，**没有新增任何设备知识**：
+ * 它把已经存在的四样东西聚到一起，**没有新增任何设备知识**：
  * - [profile] → `ZteGoformProfile`（`:core:device-schema`）；
  * - [createTransport] → `GoformClient`（`:core:goform`）；
- * - [tuning] → 四处实测常量的原值（来源逐条记在 [DeviceTuning] 的字段 KDoc 上）。
+ * - [platform] → [SprdPlatform]（同模块的 `platform/sprd/`，阶段 4 批 F）；
+ * - [tuning] → 实测常量的原值（来源逐条记在 [DeviceTuning] 的字段 KDoc 上）。
  *
  * [capabilities] 同理：10 个域逐一对着「`ZteGoformProfile` 里有没有那条 `WriteSpec`」+
  * 「core 侧有没有那个写 route」核过（2026-09-24 阶段 3.2），不是照 [Capability] 的清单抄一遍。
@@ -73,13 +78,33 @@ object ZteF50Plugin : DevicePlugin {
     override fun createTransport(cfg: TransportConfig): DeviceTransport =
         GoformClient(deviceIp = cfg.deviceIp, port = cfg.port, password = cfg.password)
 
-    /** 取值与来源见 [DeviceTuning] 各字段的 KDoc（本批只搬数值，四处调用点一行未动）。 */
+    /**
+     * F50 跑在展锐（Unisoc）平台上 → [SprdPlatform]。
+     *
+     * ⚠ [ctx] 目前**用不到**（[SprdPlatform] 只需要 `ProcessBuilder` 与 `/sys` 文件读，
+     * 两者都不要 `Context`），所以这里没往下传。签名保留它是因为 4.3 收电池读法时
+     * 大概会需要（`BatteryManager` 要 `Context`）—— 契约里留着比到时候改签名便宜。
+     * 每次调用新建一个：口径与 [createTransport] 一致，插件自己不缓存（见 [DevicePlugin.platform]）。
+     */
+    override fun platform(ctx: Context): PlatformAdapter = SprdPlatform()
+
+    /**
+     * 取值与来源见 [DeviceTuning] 各字段的 KDoc（本批仍然只搬数值，四处调用点一行未动）。
+     *
+     * 2026-09-24 阶段 4 批 F 随字段改名同步改了三处，**数值一个没变**：
+     * - `thermalWarnC` / `thermalCriticalC` → [DeviceTuning.downloadThrottleWarnC] /
+     *   [DeviceTuning.downloadThrottleCriticalC]（75 / 85 只服务下载限速，§8 裁决 ②）；
+     * - 新增 [DeviceTuning.downloadThrottleForcePauseOffsetC]`= 10f` ——
+     *   `DownloadManager` 第 4 档 `temp >= critical + 10`（→ 95°C 全部暂停）此前是个裸字面量；
+     * - 删掉 `rootShellPermits` —— 它是 QoS 配置默认值不是设备事实，
+     *   而且实测用户默认值是 3 不是 5（§8 裁决 ③）。
+     */
     override fun tuning(): DeviceTuning = DeviceTuning(
-        thermalWarnC = 75f,
-        thermalCriticalC = 85f,
+        downloadThrottleWarnC = 75f,
+        downloadThrottleCriticalC = 85f,
+        downloadThrottleForcePauseOffsetC = 10f,
         thermalJitterC = 3f,
         bootGraceMs = 90_000L,
-        rootShellPermits = 5,
     )
 
     /**
@@ -92,9 +117,12 @@ object ZteF50Plugin : DevicePlugin {
      *    要么不是 goform 后台的设备、要么后台不可达 —— 两种情况下本插件都不该自称匹配。
      *    `LD` 免登录、免 profile，这也是 `DeviceProfiles` 记的「鸡生蛋」问题的唯一绕法。
      * 2. **`cpuInfoPlatform` 含展锐特征（+20 分）** —— 有实测依据：
-     *    `ATChannel.detectPlatform()` 就是按 `/proc/cpuinfo` 里的 `Spreadtrum` / `sprd`
-     *    判展锐平台，F50 走的正是那条展锐 HAL 路径。`unisoc` 是同一家的现用品牌名，
-     *    一并匹配（大小写不敏感，不依赖调用方是否已转小写）。
+     *    F50 走的正是展锐 HAL 那条路径。判据**不在本文件里写**，
+     *    统一走 [CpuInfoPlatform.isSpreadtrum]（阶段 4 的 4.6）：
+     *    本插件此前自己抄了一份 marker 列表，与 `ATChannel.detectPlatform()` 那一份
+     *    **不一致**（这边多一个 `unisoc`），两份分处两个 module、改一处忘一处是必然。
+     *    合并取并集之后（`sprd` / `spreadtrum` / `unisoc`），本方法的打分**没有变化** ——
+     *    本来就是这三个串。
      *    它只是**加分项**而不是准入条件：同平台的别家设备也会命中这一条。
      * 3. **`androidBuild` 的 F50 特征匹配 —— 本批刻意不写。**
      *    全仓找不到任何 F50 的 `Build.BRAND` / `MODEL` / `DEVICE` / `MANUFACTURER` 实测取值：
@@ -114,8 +142,7 @@ object ZteF50Plugin : DevicePlugin {
     override suspend fun probe(env: ProbeEnv): Int {
         if (!env.goformLdReachable) return 0
         var score = SCORE_GOFORM_REACHABLE
-        val platform = env.cpuInfoPlatform
-        if (platform != null && SPREADTRUM_MARKERS.any { platform.contains(it, ignoreCase = true) }) {
+        if (CpuInfoPlatform.isSpreadtrum(env.cpuInfoPlatform)) {
             score += SCORE_SPREADTRUM_PLATFORM
         }
         return score
@@ -126,7 +153,4 @@ object ZteF50Plugin : DevicePlugin {
 
     /** 展锐平台的加分权重（同平台别家设备也会命中，所以只是加分）。 */
     private const val SCORE_SPREADTRUM_PLATFORM = 20
-
-    /** `/proc/cpuinfo` 里的展锐特征串，取值同 `ATChannel.detectPlatform()`（`unisoc` 是现用品牌名）。 */
-    private val SPREADTRUM_MARKERS = listOf("sprd", "spreadtrum", "unisoc")
 }

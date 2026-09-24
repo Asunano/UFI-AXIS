@@ -1238,6 +1238,70 @@ SAMBA, USB_DEBUG, FOTA, PERFORMANCE_MODE, TRAFFIC_LIMIT
 
 ## 8. 阶段 4 / 5
 
+### 阶段 4 开工前的实测与三条裁决（2026-09-24）
+
+**开工前做了一次 very thorough 盘点，三个发现直接改了这一阶段的做法。**
+
+**① `AtTransport` 上移是零成本的**：接口 36 行、**零 import、零 Android 类型、零 `Context`**
+（`suspend` 只要 stdlib），搬到 `core/device-spi` **不需要新增任何依赖**，也不成环
+（`collector` 其实已经能看到 device-spi —— 经 `goform` 的 `api` 传递）。
+`ATChannel`（策略层：全局互斥、500ms 最小间隔、指数退避、20 次熔断）**留在 collector**，
+只有 `ServiceCallAtExecutor`（唯一实现）跟着 `SprdPlatform` 走。
+另核实：`detectPlatform()` 的结果**确实只用于上报**（4 个读取点全是 `/api/at/*` 与仪表盘），
+不参与任何选型 —— 所以 4.6 不是「把枚举接过去」，而是「把读 `/proc/cpuinfo` 这一步上移、枚举退化成 adapter 内部细节」。
+⚠ `ZteF50Plugin.probe()` 已经自己抄了一份 marker 列表（还多了 `unisoc`），**这是第二份判据**，4.6 要合掉。
+
+**② 4.5 不是搬运，`DeviceTuning` 的字段名本身有问题（裁决 A）。**
+实测 `thermalWarnC/CriticalC` 撞了**三套完全不同**的阈值：
+
+- **下载限速** 75/85（`DownloadManager.Config.throttleTempWarn/Critical`，Float，改 aria2 并发与限速，
+  还有一个 `+10` 的第 4 档 95°C `forcePauseAll`）
+- **采集降频/熔断** 70/80（`AppSettings.monitorThermalWarnC/CriticalC`，**Int 毫摄氏度**，
+  调 ShellQoS/GoformQoS 许可、拉长 cache TTL、`delay` 暂停采集）
+- **用户告警** 65/75（`AlertEngine.AlertConfig.temperatureWarning/Critical`，Double，**带 3°C 回差**，
+  写 alert_records + 推送）
+
+三者的动作、类型、温度单位、可配路径、有无回差全不同 —— **是三件事，不是一件事的三套阈值**。
+⚠ **最容易踩的坑**：`DeviceTuning.thermalWarnC = 75f` 与 `AlertEngine.temperatureCritical = 75.0`
+**数值相同、语义相反**。谁看到「两边都是 75」就接线，会静默改掉告警行为，**单测不会红**。
+
+裁决：**字段改名说实话** —— `downloadThrottleWarnC` / `downloadThrottleCriticalC`，
+并补上 `downloadThrottleForcePauseOffsetC = 10`（那个第 4 档也是实测出来的设备知识，原来没有任何常量承载它）。
+**采集降频与用户告警两套不进 `DeviceTuning`**：它们是**用户可配的策略**，不是设备事实。
+
+**③ `rootShellPermits` 从 `DeviceTuning` 删掉（裁决 A）。**
+实测它记错了适用范围：用户默认是 **3**（`ShellQoS.DEFAULT_QOS_SHELL_MAX`），
+一旦用户写过任何一次配置，生效值就是 3 —— 5 只在「从没写过」时成立。
+它是 **QoS 配置默认值，不是设备事实**，放在插件里只会让人以为它说算。
+
+**④ 4.2 降级为文档任务（裁决 A）。**
+实测提权只有**一条**实际路径：**ADB 自连 localhost:5555（uid 2000）**，
+`ShellExecutor.executeAsRoot()` 全走它，回落是普通 `sh -c`（无特权）。
+`su -c` 已彻底移除（只剩几处过期注释）。**Samba `root preexec` 那条：部署与 60s 保活都在跑，
+但执行入口没人调用 —— 是死代码。**
+所以「`SambaPreexecStrategy` + `AdbOnlyStrategy`」是**为一条不存在的路径造抽象**，不做。
+改为：把「`hasRootAccess()` 的真实语义是『ADB 通道可用』而不是 uid=0」写进文档，
+Samba 那条登记成待定项（见 §15 的 P1-38）。
+
+**⑤ 4.4 的环怎么破（2026-09-24 定，批 G 执行）：`restartNetworkStack` 收一个执行器参数。**
+批 F 落地后发现：`SprdPlatform.restartNetworkStack()` 要真干活就得能发 AT 命令，
+而唯一的执行通道 `ATChannel` 在 `core/collector`，方向是 `ATChannel → SprdPlatform` ——
+让 adapter 反过来持有 `ATChannel` 是把**策略层**（限流 / 退避 / 熔断）塞进**平台实现**，倒置。
+所以把 §3.2 骨架里的无参签名改成：
+
+```kotlin
+suspend fun restartNetworkStack(at: suspend (String) -> String?): Boolean
+```
+
+adapter 只提供「**这台设备怎么重启网络栈**」的知识（发哪几条命令、什么顺序、中间等多久、怎么判成功），
+**执行通道由调用方注入**（`NetworkController` 本来就持有 `ATChannel`）。
+收益：`device-plugins` 不需要依赖 `collector`，也不引入可变状态或 setter；
+这个函数还因此变得可单测（传一个假执行器即可）。
+
+### 阶段 4 任务
+
+
+
 ### 阶段 4 — 平台适配层
 
 - `[ ]` 4.1 `PlatformAdapter` 实现 `SprdPlatform`：收 `ServiceCallAtExecutor` 的选型逻辑
@@ -1695,6 +1759,48 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   - **新登记 P1-36**：`TaskRoutes.kt:176` 是全仓唯一的旧 501，配的却是 `ErrorCode.UNAVAILABLE`
     —— 正是 §11.6 说的「三种不可用混成一个码」。它与能力集无关（core 自己的组件没装配、可恢复），
     本批没动。见 §15。
+- 2026-09-24 **批 30：阶段 4 的批 F（`AtTransport` 上移 + `PlatformAdapter` / `SprdPlatform` +
+  `DeviceTuning` 字段改名）**（子代理实现，我复核，未 push）。三条开工裁决与实测见 §8 开头。要点：
+  - `AtTransport` 整文件移到 device-spi（零 import、零 Android 类型，**不需要新增任何依赖、不成环**）；
+    `ATChannel` 留在 collector（策略层），`init()` 改成接收注入的 `List<AtTransport>`。
+  - `ServiceCallAtExecutor` 搬到 `device-plugins` 的 **`platform/sprd/`**（不放 `zte/f50/` ——
+    类里没有一个字节是 ZTE 知识，塞进 zte 包会逼第二台 Unisoc 设备 `import zte.f50.SprdPlatform`）。
+    带走 `AppLogger` 与 `decodeServiceCallText`，所以 device-plugins 加了 `:core:common` 依赖
+    （后者绕不过去：它是 service call 协议解码器、有自己的单测，复制一份就是两份各自演化）。
+  - `SprdPlatform.name = "SPREADTRUM"` 而不是 `"sprd"`：4.6 会用它替掉 `detectPlatform()` 的结果，
+    而那个结果**现在就在** `/api/at/platform` 下发、取值是大写 —— 填 `sprd` 等于让对外取值在 4.6 那天静默变化。
+  - `PlatformAdapter` **刻意只有四个成员**，不设 `privilegeEscalation()`（裁决 ④）与 `readBattery()`（归 3B）。
+  - `DeviceTuning` 改名 `downloadThrottle*` + 新增 `downloadThrottleForcePauseOffsetC`（承载原本裸字面量的
+    `+10` 第 4 档 95°C）+ **删掉 `rootShellPermits`**。每个字段 KDoc 写明「哪些近名阈值不归它管」。
+    **`DownloadManager` / `AppSettings` / `AlertEngine` / `ShellQoS` 一行未动** —— 接线是后续批次。
+  - 一处结构影响：`buildCollectorGraph` 现在需要 runtime，`resolve()` 因此上移到它之前，
+    **启动日志顺序变了**（设备 profile 那几行现在打在 `[2] AT channel:` 之前），对外 API 零变化。
+  - 校验：五处编译 + device-spi 11 + device-plugins 11 + contract 11 + goform 103 + api 235 + common 176，
+    各套与基线逐条一致。
+- 2026-09-24 **批 31：阶段 4 的 4.4（`restartNetworkStack` 收进 adapter）**（子代理实现，我复核 + 一处收口，未 push）：
+  - 签名按 §8 的 ⑤ 改成收执行器（`at: suspend (String) -> String?`）；`SprdPlatform` 里那段**逐字搬迁**
+    （命令、`delay(500)`、`delay(2000)`、`contains("OK")` 判据、三条 INFO 与两条 WARN 文案全未改）；
+    `NetworkController` 退化成一行委派，加第 5 个构造参数 `platform`。
+  - **两样刻意没搬**：① **互斥锁留在 `NetworkController`** ——
+    `DevicePlugin.platform(ctx)` 每次调用新建实例，锁放 adapter 就是「每个实例各锁自己」= 等于没锁；
+    ② **5000ms 超时留在调用方** —— `at` 签名里没有超时参数，超时属于通道策略。
+  - **实测澄清两件事**：① 全仓**没有** `/api/network/restart` 端点，`restartNetworkStack` 唯一调用点是
+    `lockBands()`，对外判据落在 `POST /api/network/band` 的 `network_restarted`；
+    ② `ATRoutes.DANGEROUS_AT_PATTERNS` 拉黑 `AT+SFUN=` 那道闸**只在 route 层**
+    （`POST /api/at/command` 命中即审计 + 403，根本不碰 `atChannel`），内部路径从不经过 `ATRoutes`
+    —— 所以「**对外禁止、内部照发**」这组契约搬迁后原样成立。
+  - `false` 的两义（「不支持」还是「这次失败」）**现状分不开**，按现状实现 + KDoc 写明局限：
+    唯一调用点把它原样塞进 `network_restarted`（布尔两态），要分开就得改端点响应形状 + 两端解析。
+  - 单测 `SprdPlatformTest` **10 条**，假执行器 + `runTest` 虚拟时钟把 500/2000 断到精确值
+    （成功 `currentTime == 2500`、第二条失败 `== 500`、第一条就失败 `== 0`），
+    **没有为了测试动生产代码的时序**。
+  - **我的一处收口**：装配层原来调了 `platform(context)` **两次**（造两个实例）。
+    改成 `build()` 里造**一份**、`buildCollectorGraph` 与 `buildNetworkGraph` 共享。
+    今天 `SprdPlatform` 无状态所以无害，但那是定时炸弹 —— 哪天 adapter 缓存了热区路径或探测结果，
+    两个实例会各探一次、各缓存一份、行为还不一致。共享一份也让「锁能不能放 adapter」这个问题彻底消失。
+  - 校验：四处编译 + `:core:device-plugins:test` **21**（11 + 10）、device-spi 11、api 235、
+    goform 103（`--rerun-tasks`）。第 3/4 层 ✗ —— **这一批改的是写路径**，
+    真机判据是 `POST /api/network/band` 锁频段后 `network_restarted` 那一位。
 
 
 ### 执行记录
@@ -3420,7 +3526,63 @@ P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍�
   ③ 删掉那段时间的小时行 —— 与「宁可少一段，不能凭空多一段」的既有取舍一致，最不容易做错。
 - 归属：**不属于阶段 0~5 的任何一步**，是一次性的数据处置。裁决前不要顺手写迁移脚本。
 
-**P1-36 `TaskRoutes` 的 501 配的是 `UNAVAILABLE` —— §11.6 点名的「三种不可用混成一个码」**
+**P1-41 `DataScheduler` 的行内注释写 85°C / 75°C，而实际默认阈值是 80 / 70**
+
+- 事实：`adaptiveRootPermits` 与温度熔断 `when` 的行内注释还写着 `85°C+` / `75°C`，
+  而 2026-09-03 改成读 `AppSettings.monitorThermalCriticalC/WarnC`（默认 **80 / 70**）之后没跟着改注释。
+- 批 33 刻意没动 —— 改它要碰阈值那几行的上下文，而那一批的硬约束是「阈值一个字都不许碰」。
+- 低优先，但排障时会误导人（注释比代码显眼）。
+
+**P1-40 `migrateConfig()` 的「地板判据」是设备知识，但 `DeviceTuning` 没有承载它**
+
+- 事实：`DownloadManager.migrateConfig()` 是
+  `if (throttleTempWarn < 70f) { = 75f }` / `if (throttleTempCritical < 80f) { = 85f }`
+  —— **地板判据（70/80）与抬升目标（75/85）不是同一个数**。
+- 批 32 只把**目标值**接到了 `tuning.downloadThrottle*`，**地板判据仍是字面量** 70f / 80f。
+  所以换设备时：目标值跟着插件走，而「低于多少才抬」还是 F50 的经验值。
+- 为什么没顺手加字段：地板判据的语义是「**旧配置低到什么程度就认为它是历史遗留、该被抬**」，
+  这与「这台设备的合适阈值是多少」是两件事；给 `DeviceTuning` 加第 6、7 个字段
+  会让本来就容易被误接的这组阈值更难读（见 P1-37）。
+- 待裁决：① 加两个字段（`downloadThrottleWarnFloorC` / `CriticalFloorC`）；
+  ② 按「目标值 − 5」派生；③ 维持字面量并在 KDoc 写明它只对 F50 这一代配置有意义。
+
+**P1-37 三套温度阈值撞名，其中一对「数值相同、语义相反」**
+
+- 事实（2026-09-24 阶段 4 盘点）：同一个「温度阈值」概念在三个模块里是**三件不同的事** ——
+  下载限速 75/85（`DownloadManager.Config`，Float，改 aria2 并发与限速，另有 `+10` 的第 4 档 95°C
+  `forcePauseAll`）、采集降频/熔断 70/80（`AppSettings.monitorThermal*`，**Int 毫摄氏度**，
+  调 QoS 许可 / 拉长 cache TTL / `delay` 暂停采集）、用户告警 65/75
+  （`AlertEngine.AlertConfig`，Double，**带 3°C 回差**，写 alert_records + 推送）。
+- ⚠ **陷阱**：`DeviceTuning.downloadThrottleWarnC = 75f` 与 `AlertEngine.temperatureCritical = 75.0`
+  **数值相同、语义相反**（一个是限速的下沿，一个是告警的上沿）。
+  看到「两边都是 75」就接线 = 静默改掉告警行为，**单测不会红**。
+- 已做（批 30）：`DeviceTuning` 字段改名成 `downloadThrottle*` 说实话，
+  每个字段的 KDoc 写明「哪些近名阈值不归它管」，并新增 `downloadThrottleForcePauseOffsetC`
+  承载那个原本裸字面量的 `+10`。
+- 未做：三套阈值仍散在三处，**这是刻意的**（裁决 A：采集降频与用户告警是用户可配策略，不是设备事实）。
+  真正要防的是「有人顺手统一」——靠 KDoc 与本条登记。
+
+**P1-38 Samba `root preexec` 提权链路的执行入口是死代码**
+
+- 事实：`SambaRootShell` 的 `deploy()`（写 `smb.conf` 的 `root preexec` + 提取 socat）与
+  `BackendService` 的 60s/300s 保活循环**都在跑**，但**没有任何代码通过那个 socket 执行命令** ——
+  全仓 `ShellExecutor.executeAsRoot()` 都走 **ADB 自连 localhost:5555（uid 2000）**，
+  回落是普通 `sh -c`（无特权）。`su -c` 已彻底移除（只剩几处过期注释）。
+- 所以 `hasRootAccess()` 的真实语义是「**ADB 通道可用**」，不是 uid=0。
+  `SystemController` 与 `ShellRoutes` 两处上报的 else 分支文案还不一致（`"none"` vs `"shell"`）。
+- 待裁决：① 把 Samba 那条接上（它能给到真 uid=0，是 ADB 不可用时的唯一兜底）；
+  ② 删掉部署与保活（省一条常驻链路与一次 `smb.conf` 改写）；③ 维持现状并在文档写明它是预留。
+  ⚠ 这条涉及提权，**不许顺手删** —— 它可能是刻意留的伏兵。
+- 已做（批 30）：`PlatformAdapter` **刻意不设 `privilegeEscalation()`**，不为不存在的路径造抽象。
+
+**P1-39 app 侧下载限速阈值是一份陈旧镜像（55f / 70f）**
+
+- 事实：`DownloadStates.kt` 的默认值与 `DownloadModule.kt` 的解析 fallback 都是 **55f / 70f**，
+  而 core 侧 2026-09-02 已上调到 **75f / 85f**（理由：F50 空载就 64~66°C，55 等于开机即限速且永不退出）。
+- 现在看不出问题，因为 core 每次都下发真值；但「core 拿不到配置时 app 显示 55/70」这条路径一直存在。
+- 归属：app 侧单独一批（本轮全程没碰 `app/**`）。
+
+
 
 - 事实（2026-09-24 批 29 调查时核出，**本批没动**）：`TaskRoutes.kt:176` 是全仓**唯一**的旧 501
   出口（条件引擎未装配），配的错误码却是 `ErrorCode.UNAVAILABLE`。
@@ -3584,6 +3746,17 @@ P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍�
 ---
 
 ## 16. 真机基线（2026-09-22，逐字可比对）
+
+> ⚠ **2026-09-24 批 34 起有一处对外取值变化，比对基线时要知道**：
+> `/api/at/platform`、`/api/at/status`、`/api/dashboard` 的 at 块、`/api/device` 的 at 块
+> （四处同源于 `ATChannel.getPlatformInfo()`）——
+> 展锐判据的 marker 从 `[sprd, spreadtrum]` 合并成并集 `[sprd, spreadtrum, unisoc]`。
+> 影响面：`/proc/cpuinfo` 里**只有 `unisoc`、没有 `sprd` / `spreadtrum`** 的机型上，
+> `platform` 由 `"UNKNOWN"` 变成 `"SPREADTRUM"`。
+> **在用的 F50 不受影响**（它的 cpuinfo 带 `Spreadtrum`），高通机型不受影响，
+> `connected=false` 时本来就不下发 `platform`。
+> 合并的目的是消掉第二份判据（`ZteF50Plugin.probe()` 原本自带 `unisoc`、`ATChannel` 没带），
+> 方向是「认得更准」，但它**是一次对外取值变化，不是等价搬迁**。
 
 **这是可逐字比对的真基线。** 来源：真机 web 界面「**设置 › 关于 › 诊断信息 › 字段覆盖率**」入口
 （`GET /api/diagnose?fields=1` 的 `field_coverage`），**2026-09-22** 抓取，

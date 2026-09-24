@@ -1,5 +1,6 @@
 package com.ufi_axis_core.devicespi
 
+import android.content.Context
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.deviceschema.DeviceProfile
 
@@ -7,24 +8,24 @@ import com.ufi_axis_core.deviceschema.DeviceProfile
  * 设备插件（聚合根）—— **适配一台新设备 = 新增一个本接口的实现**。
  *
  * 一个插件把「换设备时会一起换掉」的东西聚在一起：字段/命令映射（[profile]）、
- * 协议传输（[createTransport]）、实测调参（[tuning]）、能力集（[capabilities]），
- * 以及自我识别（[probe]）。
+ * 协议传输（[createTransport]）、平台适配（[platform]）、实测调参（[tuning]）、
+ * 能力集（[capabilities]），以及自我识别（[probe]）。
  * 上层（route / collector / controller / scheduler）不认识任何具体插件，
  * 只经中间控制层拿到这几样东西。
  *
- * ## 本接口目前**没有**的那个成员
+ * ## 成员已全部到齐（2026-09-24 阶段 4 批 F）
  *
- * 计划书 §3.2 的骨架里还有 `platform(ctx)`，这里**故意不带**，不是漏了：
+ * 计划书 §3.2 的骨架里有两个成员曾经刻意缺席，现在都落地了：
  *
- * - **`fun platform(ctx: Context): PlatformAdapter`** —— `PlatformAdapter` 的
- *   `atTransports()` 返回 `AtTransport`，而 `AtTransport` 现在在 `:core:collector`。
- *   让 `:core:device-spi` 依赖 collector 会直接成环
- *   （collector → goform → device-spi → collector）。所以它必须等 `AtTransport`
- *   先上移到本模块，两件事一起归**阶段 4**。
- *
- * 另一个曾经缺席的成员 [capabilities] 已于**阶段 3**（2026-09-24）落地：
- * 当时推迟的理由是「`Capability` 要进 `:core:contract` 这个双端冻结区，宁可晚定也不要
- * 定错再改」，现在那 10 个域已经按真机实测定稳，见 [Capability] 的文件头。
+ * - **[platform] —— 本批（阶段 4 批 F）落地。** 原先缺席的理由是
+ *   `PlatformAdapter.atTransports()` 返回 [AtTransport]，而 [AtTransport] 当时住在
+ *   `:core:collector`：让 `:core:device-spi` 依赖 collector 会直接成环
+ *   （collector → goform → device-spi → collector）。
+ *   本批先把 [AtTransport] 上移到本模块（零 import、零 Android 类型，不需要新增任何依赖），
+ *   环就不存在了，`platform()` 随即补齐。
+ * - **[capabilities] —— 阶段 3（2026-09-24）落地。** 当时推迟的理由是
+ *   「`Capability` 要进 `:core:contract` 这个双端冻结区，宁可晚定也不要定错再改」，
+ *   现在那 10 个域已经按真机实测定稳，见 [Capability] 的文件头。
  */
 interface DevicePlugin {
 
@@ -69,6 +70,21 @@ interface DevicePlugin {
      * 传输层持有会话与 HTTP 连接池，生命周期跟组件图，不跟插件对象（插件通常是 `object`）。
      */
     fun createTransport(cfg: TransportConfig): DeviceTransport
+
+    /**
+     * 本设备的平台适配层（AT 通道 / 热区读数 / 网络栈重启），见 [PlatformAdapter]。
+     *
+     * 谁来调：装配层（`ComponentFactory`）。与 [createTransport] 同一条纪律 ——
+     * **插件自己不缓存返回值**：适配层可能持有进程、句柄一类的东西，
+     * 生命周期跟组件图，不跟插件对象（插件通常是 `object`）。
+     *
+     * @param ctx 平台适配需要的 Android 上下文（读 `/sys` 之外的东西时要它）。
+     *   本模块**刻意是 Android library 而不是纯 JVM**，正是为了这个参数
+     *   （理由写在 `build.gradle.kts` 的约束 2 上，比这一步早了两个阶段定下来）。
+     *   ⚠ 传 `applicationContext` 或 Service Context，不要传 Activity ——
+     *   适配层的寿命跟后台服务一样长。
+     */
+    fun platform(ctx: Context): PlatformAdapter
 
     /** 本设备的实测阈值调参。见 [DeviceTuning] 对「本批只定义、不替换调用点」的说明。 */
     fun tuning(): DeviceTuning
