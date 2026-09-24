@@ -31,6 +31,24 @@ object ErrorCode {
     const val INTERNAL_ERROR = "INTERNAL_ERROR"
     /** 依赖的下层能力不可用（设备/goform/root shell/上游），HTTP 502/503 或 200+success:false。 */
     const val UNAVAILABLE = "UNAVAILABLE"
+
+    /**
+     * **当前设备不支持该功能**（HTTP 501），由能力集门禁产生（计划书 §7 / §11.6）。
+     *
+     * 2026-09-24 阶段 3 新增。与另两种「不可用」严格分开 —— 三者混成一个码的直接后果是
+     * 客户端无法决定下一步：
+     * - 本码（501）= **不可恢复**：换台设备才有用，前端应把开关灰掉并写明原因，**不要重试**；
+     * - [UNAVAILABLE]（503）= 设备离线 / 会话失效 / 提权失败，**同一台设备换个时机就可能成功**，
+     *   应退避重试，绝不能报成「不支持」；
+     * - [OUT_OF_RANGE]（400）= 取值非法，改参数才有用。
+     *
+     * 产生位置只有一处：route 层门禁抛 `CapabilityMissing`（`:core:api`），
+     * 由 `HttpServer` 的 `StatusPages` 统一映射。**不要在 handler 里就地回这个码** ——
+     * 那就等于把「设备支持什么」这件事散到每个 handler 里各判一次。
+     *
+     * 能力域的值域见 [Capability]。
+     */
+    const val NOT_SUPPORTED = "NOT_SUPPORTED"
     /** 操作被设备或系统拒绝（命令执行失败、goform 返回失败）。 */
     const val OPERATION_FAILED = "OPERATION_FAILED"
     /** 数据尚未就绪（采集未预热），如 `/api/traffic/realtime`。 */

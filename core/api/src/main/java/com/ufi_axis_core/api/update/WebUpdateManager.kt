@@ -75,14 +75,6 @@ class WebUpdateManager(
         @JsonNames("apkSize") val apk_size: Long? = null
     )
 
-    /** GitHub 相关域名（命中即走镜像） */
-    private val GITHUB_HOSTS = listOf(
-        "github.com",
-        "raw.githubusercontent.com",
-        "objects.githubusercontent.com",
-        "codeload.github.com"
-    )
-
     private val MAX_WEB_ZIP_BYTES = 50L * 1024 * 1024
 
     /** 触发检查 + 自动更新（异步；立即返回当前状态，进度经 [status] 轮询） */
@@ -98,11 +90,13 @@ class WebUpdateManager(
                 val current = currentWebVersion()
                 status = UpdateStatus(State.DOWNLOADING, 0, "正在检查 Web 更新源...", current)
 
-                // ① 拉取版本清单（update_url → version.json）；GitHub 域名自动拼镜像前缀
-                val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                requireSecureUrl(manifestUrl, "更新源")
-                val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                    ?: throw NeedPushException("更新源不可达: $manifestUrl")
+                // ① 拉取版本清单（update_url → version.json）；镜像决策见 MirrorResolver，失败逐候选降级
+                MirrorResolver.prepare(settings)
+                val manifestJson = try {
+                    fetchManifestWithFallback()
+                } catch (e: Exception) {
+                    throw NeedPushException(e.message ?: "更新源不可达")
+                }
                 val root = try {
                     json.parseToJsonElement(manifestJson).jsonObject
                 } catch (e: Exception) {
@@ -130,12 +124,11 @@ class WebUpdateManager(
                 }
                 status = UpdateStatus(State.DOWNLOADING, 0, "发现新版 Web v$latest，开始下载...", current, latest)
 
-                // ③ 下载 ZIP（写临时文件 + 流式 SHA-256 计算）
-                requireSecureUrl(apkUrl, "Web 下载地址")
+                // ③ 下载 ZIP（写临时文件 + 流式 SHA-256 计算）；候选逐个降级
                 val tmpFile = File(context.filesDir, "web_update.tmp.zip")
                 tmpFile.delete()
                 val actualSha = try {
-                    downloadWebZip(applyMirrorToUrl(apkUrl), tmpFile)
+                    downloadWebZipWithFallback(apkUrl, tmpFile)
                 } catch (e: Exception) {
                     tmpFile.delete()
                     throw NeedPushException("Web ZIP 下载失败: ${e.message}")
@@ -191,17 +184,50 @@ class WebUpdateManager(
 
     // ── 工具（与 backend UpdateManager 一致）──
 
-    /** GitHub 域名 URL 前拼接 [AppSettings.updateMirrorBase]；非 GitHub 原样返回；空串=直连 */
-    private fun applyMirrorToUrl(urlStr: String): String {
-        if (urlStr.isBlank()) return urlStr
-        val base = settings.updateMirrorBase.trim().trimEnd('/')
-        if (base.isEmpty()) return urlStr
-        val host = try { URL(urlStr).host?.lowercase() } catch (e: Exception) { return urlStr }
-        if (host.isNullOrBlank()) return urlStr
-        if (host in GITHUB_HOSTS || host.endsWith(".githubusercontent.com")) {
-            return "$base/$urlStr"
+    /**
+     * 逐候选拉取清单（2026-09-22：镜像决策统一到 [MirrorResolver]，并支持失败降级）。
+     * 原来这里是 `applyMirrorToUrl` 单地址 —— 与 UpdateManager / ComponentManager 各抄一份，
+     * 现在三处共用一个解析器。
+     */
+    private fun fetchManifestWithFallback(timeoutMs: Int = 15_000): String {
+        val candidates = MirrorResolver.candidates(settings, settings.updateUrl)
+        if (candidates.isEmpty()) throw Exception("更新源未配置（update_url 为空）")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "更新源")
+                val text = fetchUrl(url, timeoutMs)
+                if (text != null) {
+                    if (index > 0) AppLogger.i(TAG, "更新源第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                    return text
+                }
+                "不可达"
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
         }
-        return urlStr
+        throw Exception("更新源全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
+    }
+
+    /** 逐候选下载 Web ZIP，返回 SHA-256。换候选前清掉半截临时文件。 */
+    private fun downloadWebZipWithFallback(rawUrl: String, target: File): String {
+        val candidates = MirrorResolver.candidates(settings, rawUrl)
+        if (candidates.isEmpty()) throw Exception("Web 下载地址为空")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "Web 下载地址")
+                val sha = downloadWebZip(url, target)
+                if (index > 0) AppLogger.i(TAG, "Web ZIP 第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                return sha
+            } catch (e: Exception) {
+                target.delete()
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
+        }
+        throw Exception("Web ZIP 下载全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
     }
 
     /** GET URL 返回文本（版本清单） */

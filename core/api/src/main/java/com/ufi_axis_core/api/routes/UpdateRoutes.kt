@@ -62,6 +62,12 @@ class UpdateRoutes(
                 call.respond(toJsonElement(updateManager.statusToMap()))
             }
 
+            // 更新源决策快照（2026-09-22，只读、无入参）：mode / country / use_mirror / mirror_prefixes。
+            // app 的 APK 自更新不走 core 代理（core 挂了也得能更新自己），所以它从这里取决策后自己拼 URL。
+            get("/source") {
+                call.respond(toJsonElement(updateManager.updateSourceSnapshot()))
+            }
+
             // 兜底：前端推送 APK（multipart，field=file）——用法与 FileRoutes /upload 完全一致
             // P0-8：增加 50MB 大小限制 + APK magic 头（PK\x03\x04）校验，防上传接口滥用/非 APK 文件
             // P1 A3/E25：上传互斥（download/install 进行中返回 409）+ 写临时名 .part 完成后 rename 原子提交

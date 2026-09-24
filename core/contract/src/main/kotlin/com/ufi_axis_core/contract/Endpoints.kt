@@ -117,6 +117,25 @@ object Endpoints {
         const val CONNECTION_MODE = "$BASE/connection-mode"
     }
 
+    /**
+     * 设备（`DeviceRoutes`）。**只登记本次改到的那一个** ——
+     * `/device` 下还有二十多个端点未搬进来，按本文件的规则不追求一次性覆盖。
+     */
+    object Device {
+        const val BASE = "$API/device"
+
+        /**
+         * 设备能力集（2026-09-24 阶段 3.4 新增）：`{ plugin_id, capabilities: ["sms", …] }`。
+         *
+         * 取值域是 [Capability] 的 `wire` 名。**刻意不并入 [DIAGNOSE]**：
+         * 能力集是画开关时要读的业务数据，不该让前端为了渲染一个开关去拉排障端点。
+         *
+         * 形状是**数组**而不是 `{"sms": true}` 这种 map：新增一项时，
+         * map 形状让旧客户端分不出「这是个新能力」还是「设备不支持」。
+         */
+        const val CAPABILITIES = "$BASE/capabilities"
+    }
+
     object Shell {
         const val BASE = "$API/shell"
 

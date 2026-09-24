@@ -1,7 +1,9 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.requireCapability
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
@@ -29,12 +31,15 @@ class SimRoutes(
     // ── 反向兼容 getter ──
     private val simClient get() = ctx.simClient
     private val cache get() = ctx.responseCache
+    private val dataHub get() = ctx.dataHub
 
     fun register(route: Route) {
         // 注意: SMS 路由(/api/sms/*)统一由 RootSmsRoutes 管理，此处仅注册 /sim 路由
         route.route("/sim") {
             // SIM 卡槽切换
             post("/switch") {
+                // 能力门禁（3.3）：缺 sim_slot_switch → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.SIM_SLOT_SWITCH)
                 val client = simClient
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,

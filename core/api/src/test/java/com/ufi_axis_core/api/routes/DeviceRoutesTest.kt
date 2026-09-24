@@ -40,7 +40,12 @@ import org.robolectric.annotation.Config
  *   2. 9.5 的三态写结果里 `Rejected` → 400 `OUT_OF_RANGE`（值域被拒，请求根本没发出去）。
  *
  * `RouteContext` 用 relaxed mock：上面两条分支都在触达其它依赖前返回，
- * 需要真值的只有 `settings`（读开关）与 `deviceClient`（造 Rejected）。
+ * 需要真值的只有 `settings`（读开关）、`deviceClient`（造 Rejected）与
+ * `dataHub.deviceCapabilities`（能力门禁，阶段 3 的 3.3）。
+ *
+ * ⚠ 能力集必须显式 stub：relaxed mock 的 `deviceCapabilities` 是**空集**，
+ * 那样 `/device/cell-lock` 会先被门禁拦成 501，本类下面两条用例根本走不到写路径。
+ * 门禁自身的行为与「每个 Capability 都被门禁引用」在 `CapabilityGateTest`。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -58,6 +63,11 @@ class DeviceRoutesTest {
         val ctx = mockk<RouteContext>(relaxed = true)
         every { ctx.settings } returns settings
         every { ctx.deviceClient } returns deviceClient
+        // 能力门禁：/device/cell-lock 需要 cell_lock，否则先被拦成 501（见类 KDoc）
+        val dataHub = mockk<com.ufi_axis_core.api.DataHub>(relaxed = true)
+        every { dataHub.deviceCapabilities } returns
+            com.ufi_axis_core.contract.Capability.entries.toSet()
+        every { ctx.dataHub } returns dataHub
         routes = DeviceRoutes(ctx)
     }
 

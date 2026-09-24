@@ -1,5 +1,6 @@
 package com.ufi_axis_core.devicespi
 
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldSpec
@@ -43,6 +44,15 @@ class DeviceRuntimeTest {
         private val deviceProfile: DeviceProfile,
     ) : DevicePlugin {
         override fun profile(): DeviceProfile = deviceProfile
+
+        /**
+         * 空能力集：本类只测**选型**，而选型规则一个字都不看能力集。
+         *
+         * 刻意不填几项进来 —— 填了就得解释「为什么这台假设备支持它们」，
+         * 而「声明了某项就必须真能做到」那条断言在 `PluginContractTest`（真插件那一侧）。
+         */
+        override val capabilities: Set<Capability> = emptySet()
+
 
         /** 本类永远不装配传输层：真造起来要 HTTP 客户端，而选型与传输无关。 */
         override fun createTransport(cfg: TransportConfig): DeviceTransport =

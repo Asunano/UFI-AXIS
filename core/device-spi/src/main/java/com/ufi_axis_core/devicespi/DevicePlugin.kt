@@ -1,31 +1,30 @@
 package com.ufi_axis_core.devicespi
 
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.deviceschema.DeviceProfile
 
 /**
  * 设备插件（聚合根）—— **适配一台新设备 = 新增一个本接口的实现**。
  *
  * 一个插件把「换设备时会一起换掉」的东西聚在一起：字段/命令映射（[profile]）、
- * 协议传输（[createTransport]）、实测调参（[tuning]），以及自我识别（[probe]）。
+ * 协议传输（[createTransport]）、实测调参（[tuning]）、能力集（[capabilities]），
+ * 以及自我识别（[probe]）。
  * 上层（route / collector / controller / scheduler）不认识任何具体插件，
- * 只经中间控制层拿到这四样东西。
+ * 只经中间控制层拿到这几样东西。
  *
- * ## 本批（阶段 2 批 A）刻意**没有**的两个成员
+ * ## 本接口目前**没有**的那个成员
  *
- * 计划书 §3.2 的骨架里还有 `capabilities` 与 `platform(ctx)`，这里**故意不带**，
- * 不是漏了：
+ * 计划书 §3.2 的骨架里还有 `platform(ctx)`，这里**故意不带**，不是漏了：
  *
- * 1. **`val capabilities: Set<Capability>`** —— `Capability` 要定在 `:core:contract`，
- *    而那是双端共享的**冻结区**（app / web 都照它写）。冻结区里的东西宁可晚定也不要
- *    定错再改，所以按计划书排到**阶段 3** 和能力门禁一起落。
- * 2. **`fun platform(ctx: Context): PlatformAdapter`** —— `PlatformAdapter` 的
- *    `atTransports()` 返回 `AtTransport`，而 `AtTransport` 现在在 `:core:collector`。
- *    让 `:core:device-spi` 依赖 collector 会直接成环
- *    （collector → goform → device-spi → collector）。所以它必须等 `AtTransport`
- *    先上移到本模块，两件事一起归**阶段 4**。
+ * - **`fun platform(ctx: Context): PlatformAdapter`** —— `PlatformAdapter` 的
+ *   `atTransports()` 返回 `AtTransport`，而 `AtTransport` 现在在 `:core:collector`。
+ *   让 `:core:device-spi` 依赖 collector 会直接成环
+ *   （collector → goform → device-spi → collector）。所以它必须等 `AtTransport`
+ *   先上移到本模块，两件事一起归**阶段 4**。
  *
- * 换句话说：这两条是**依赖方向**与**冻结区纪律**决定的排期，不是设计上不要。
- * 谁要补它们，先把上面那两个前置条件解决掉。
+ * 另一个曾经缺席的成员 [capabilities] 已于**阶段 3**（2026-09-24）落地：
+ * 当时推迟的理由是「`Capability` 要进 `:core:contract` 这个双端冻结区，宁可晚定也不要
+ * 定错再改」，现在那 10 个域已经按真机实测定稳，见 [Capability] 的文件头。
  */
 interface DevicePlugin {
 
@@ -34,6 +33,31 @@ interface DevicePlugin {
 
     /** 人类可读名称（如 `"ZTE F50"`），只用于日志与诊断展示。 */
     val displayName: String
+
+    /**
+     * 本设备支持的**功能域**（计划书 §7 / §11.4）。
+     *
+     * ## 怎么填
+     *
+     * **有实测依据、且 core 侧确实有对应写 route 的才填**。判据是「用户可见动作是否可达」，
+     * 不是「某个通道是否支持」（§11.6）—— 所以填之前要能回答：
+     * 「这台设备上点这个开关，命令真的下去了吗？」
+     *
+     * 与 `SettingKey` **不要求一一对应**：10 个域 vs 29 个 key，
+     * 没有 capability 的写操作照旧不拦（只有这里列出的域走 route 门禁）。
+     * 所以不要为了「凑齐」去声明一个没实测过的域 —— 声明了就等于告诉两端「这个开关能点」。
+     *
+     * ## 缺一项的后果
+     *
+     * 对应 route 回 **501 + `ErrorCode.NOT_SUPPORTED`**（由 route 层统一门禁产生），
+     * app / web 把开关灰掉并写明「当前设备不支持」。
+     * 所以少填一项 = 一个本来能用的功能被灰掉；多填一项 = 用户点了没反应。
+     *
+     * 返回值必须是**不可变**的（用 `setOf(...)`）：装配层会把它递给数据层与 route 层，
+     * 运行期不允许有人往里加一项 —— 换设备要重启后台服务（§11.10）。
+     */
+    val capabilities: Set<Capability>
+
 
     /** 本设备的字段/命令映射登记表。 */
     fun profile(): DeviceProfile

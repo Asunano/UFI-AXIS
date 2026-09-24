@@ -1,6 +1,8 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.requireCapability
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.controller.sms.SmsController
 import com.ufi_axis_core.controller.sms.SmsFilter
@@ -22,7 +24,18 @@ class RootSmsRoutes(
      * 挂在 `/api/sms` 下而不是新开一个 `/api/sms-filter`：规则和记录都是短信功能的一部分，
      * 而 `/api/sms` 的 owner 本来就是这个类 —— 拆出去只会让「短信相关端点在哪」这个问题多一个答案。
      */
-    private val ruleStore: SmsRuleStore? = null
+    private val ruleStore: SmsRuleStore? = null,
+    /**
+     * 选中插件声明的能力集（阶段 3 的 3.3）。只用于 `/sms/send` 的门禁。
+     *
+     * **刻意没有默认值**：给它一个 `emptySet()` 缺省，等于让「装配层忘了接线」表现成
+     * 「这台设备不支持发短信」—— 501 是不可恢复语义，前端会直接把发送按钮灰掉，
+     * 而真正的原因是接线漏了。所以宁可编译不过。
+     *
+     * 本类没有 `RouteContext`（它只要 SmsController + 规则库），所以直接持有这个 Set，
+     * 而不是为了一个门禁把整个 `DataHub` 递进来。
+     */
+    private val deviceCapabilities: Set<Capability>
 ) {
     fun register(route: Route) {
         route.route("/sms") {
@@ -84,6 +97,10 @@ class RootSmsRoutes(
             }
 
             post("/send") {
+                // 能力门禁（3.3）：缺 sms → 501 NOT_SUPPORTED。
+                // 判据是 profile.smsSpec()（短信不走 SettingKey，见计划书 §11.2）；
+                // 这是全仓唯一一条「往外发短信」的入口（信箱的读/删/标已读不在此域内）。
+                deviceCapabilities.requireCapability(Capability.SMS)
                 val body = call.receiveJsonObject()
                 val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""
                 val message = body["message"]?.jsonPrimitive?.contentOrNull ?: ""

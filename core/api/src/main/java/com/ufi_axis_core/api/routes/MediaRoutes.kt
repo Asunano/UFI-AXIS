@@ -81,7 +81,12 @@ class MediaRoutes(
      * 专辑 / 歌手 / 文件夹三个视图 —— 每次切换都重扫一遍是纯浪费。
      * 只有聚合类端点用它：`/list` 是分页查询，SQL 侧就把工作量限住了，不需要再叠一层内存缓存。
      */
-    private val cache: ResponseCache
+    private val cache: ResponseCache,
+    /**
+     * 「从音乐库移除」的排除名单。可空 + 默认 null：老的组装代码不传它也能编过，
+     * 传 null 就是"没有任何排除"（[listSelection] 里 `orEmpty()` 兜住）。
+     */
+    private val exclusions: com.ufi_axis_core.api.media.MediaExclusionStore? = null
 ) : com.ufi_axis_core.api.media.AudioItemLookup {
 
     companion object {
@@ -398,6 +403,27 @@ class MediaRoutes(
                     "${MediaStore.MediaColumns.DATA} NOT LIKE ?)"
                 args += "$dir/%"
                 args += "$dir/%/%"
+            }
+        }
+
+        /*
+         * 「从音乐库移除」的排除名单（2026-09-23）。
+         *
+         * 放在这个函数里是因为它的返回值**同时**喂给 total 统计与分页查询
+         *（见 get("/list")），在这里加一次就两处都覆盖；写在调用点就得记着两边都改。
+         *
+         * 只对音频生效：这个功能是音乐库的，视频/图片没有对应入口。
+         *
+         * ⚠ 每一条排除占一个 SQL 绑定变量，SQLite 上限 999，而上面的扫描目录 /
+         * 专辑 / 艺术家 / 目录过滤也在用。`MediaExclusionStore.MAX_EXCLUSIONS`（300）
+         * 就是为这条留的余量 —— 超了不是变慢，是直接抛异常。
+         */
+        if (kind == Kind.AUDIO) {
+            val excluded = exclusions?.excluded().orEmpty()
+            if (excluded.isNotEmpty()) {
+                clauses += "${MediaStore.MediaColumns.DATA} NOT IN (" +
+                    excluded.joinToString(",") { "?" } + ")"
+                args += excluded
             }
         }
 
@@ -1330,6 +1356,91 @@ class MediaRoutes(
 
     fun register(route: Route) {
         route.route("/media") {
+
+            // ── 「从音乐库移除」排除名单（2026-09-23）────────────────────────
+            //
+            // 语义边界：这组接口**只动名单，永远不动文件**。删文件是
+            // `POST /api/files/delete` 的事，两者刻意分开 —— 一个可撤销、一个不可逆，
+            // 混在一个接口里用参数区分，迟早有客户端传错那个参数。
+
+            /** 当前排除名单。客户端用它渲染「已从音乐库移除的歌曲」管理页。 */
+            get("/excluded") {
+                val store = exclusions
+                if (store == null) {
+                    call.respondFail(
+                        HttpStatusCode.ServiceUnavailable, ErrorCode.NOT_FOUND,
+                        "排除名单未启用"
+                    )
+                    return@get
+                }
+                val paths = store.excluded().toList()
+                call.respond(toJsonElement(mapOf(
+                    "paths" to paths,
+                    "total" to paths.size,
+                    // 名单有硬上限（SQL 绑定变量），客户端据此提前提示而不是让用户点了才发现没生效
+                    "max" to com.ufi_axis_core.api.media.MediaExclusionStore.MAX_EXCLUSIONS,
+                    "full" to store.isFull()
+                )))
+            }
+
+            /**
+             * 加入 / 移出排除名单。
+             *
+             * body: `{ "paths": [...], "action": "add" | "remove" | "clear" }`
+             * `action` 缺省为 `add`。
+             */
+            post("/exclude") {
+                val store = exclusions
+                if (store == null) {
+                    call.respondFail(
+                        HttpStatusCode.ServiceUnavailable, ErrorCode.NOT_FOUND,
+                        "排除名单未启用"
+                    )
+                    return@post
+                }
+                // receiveJsonObject 而不是 receive<JsonObject>()：后者在 Android 上
+                // 走反射会失败（全仓统一口径）
+                val body = call.receiveJsonObject()
+                val action = body["action"]?.jsonPrimitive?.contentOrNull ?: "add"
+                val paths = body["paths"]?.jsonArray
+                    ?.mapNotNull { it.jsonPrimitive.contentOrNull?.trim()?.takeIf(String::isNotEmpty) }
+                    .orEmpty()
+
+                if (action != "clear" && paths.isEmpty()) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BLANK_VALUE,
+                        "paths 不能为空"
+                    )
+                    return@post
+                }
+
+                val affected = when (action) {
+                    "add" -> store.add(paths)
+                    "remove" -> store.remove(paths)
+                    "clear" -> store.clear()
+                    else -> {
+                        call.respondFail(
+                            HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                            "action 必须是 add / remove / clear"
+                        )
+                        return@post
+                    }
+                }
+
+                // 名单变了，列表结果就变了。不失效缓存的话客户端刷出来还是旧的那一份，
+                // 用户会以为"移除没生效"（聚合类端点走 cache，见构造参数的说明）
+                cache.invalidate("media:*")
+
+                call.respond(toJsonElement(mapOf(
+                    "success" to true,
+                    "action" to action,
+                    "affected" to affected,
+                    // 请求了 N 条只生效了 M 条 = 撞上上限被截断，客户端据此提示
+                    "requested" to paths.size,
+                    "total" to store.excluded().size,
+                    "full" to store.isFull()
+                )))
+            }
 
             /**
              * 三类媒体各自的授权状态 + 当前扫描目录。

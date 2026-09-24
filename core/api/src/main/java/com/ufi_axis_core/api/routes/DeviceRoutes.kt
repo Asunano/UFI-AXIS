@@ -1,6 +1,8 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.api.requireCapability
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.contract.NetworkMode
@@ -250,6 +252,33 @@ class DeviceRoutes(
             }
 
             /**
+             * 设备能力集（计划书 §7 的 3.4，2026-09-24 新增）。
+             *
+             * 形状：`{ "plugin_id": "zte-f50", "capabilities": ["sms", "band_lock", …] }`
+             *
+             * ## 三个决定
+             *
+             * 1. **独立端点，不并入 `/api/diagnose`**：能力集是画开关时要读的业务数据，
+             *    不该让前端为了渲染一个开关去拉排障端点（那个端点还会跑 shell 探测）。
+             * 2. **数组而不是 `{"sms": true}` 的 map**：加一项新能力时，map 形状让旧客户端
+             *    分不出「这是个我不认识的新能力」还是「设备不支持」—— 两者的界面行为完全不同。
+             * 3. **带上 `plugin_id`**：与 `/api/diagnose` 的 `device_profile.plugin_id`
+             *    **同源同值**（都取 `DataHub.devicePluginId`），前端画设备卡片时只拉这一个端点就够。
+             *
+             * 顺序按 `Capability` 的声明序，不按 Set 的迭代序 —— 响应稳定才好做快照对比。
+             * 鉴权跟着 `/api` 块的 `AuthMiddleware` 走，**没有任何豁免**。
+             * 不发任何设备查询：取值在装配组件图时就定死了。
+             */
+            get("/capabilities") {
+                val caps = dataHub.deviceCapabilities
+                call.respond(toJsonElement(mapOf(
+                    "plugin_id" to dataHub.devicePluginId,
+                    "capabilities" to Capability.entries.filter { it in caps }.map { it.wire }
+                )))
+            }
+
+
+            /**
              * EPS 承载 QoS（`AT+CGEQOSRDP`，2026-09-22）。
              *
              * 返回默认承载（优先 cid=1）协商到的 QCI 与上下行 AMBR，供仪表盘设备信息卡显示。
@@ -325,6 +354,8 @@ class DeviceRoutes(
 
             // 调试模式 (ADB)
             post("/debug") {
+                // 能力门禁（3.3）：缺 usb_debug → 501 NOT_SUPPORTED（由 StatusPages 统一出口）
+                dataHub.deviceCapabilities.requireCapability(Capability.USB_DEBUG)
                 val params = call.receiveJsonObject()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val success = deviceClient.setDebugMode(enabled)
@@ -423,6 +454,8 @@ class DeviceRoutes(
             //   {"mode": "balanced"}    ↔ perfVal=0
             //   {"enabled": true}       ↔ perfVal=1
             post("/performance") {
+                // 能力门禁（3.3）：缺 performance_mode → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.PERFORMANCE_MODE)
                 val p = call.receiveJsonObject()
                 val perfVal = when {
                     p.containsKey("enabled") -> if (p["enabled"]?.jsonPrimitive?.booleanOrNull == true) 1 else 0
@@ -481,6 +514,9 @@ class DeviceRoutes(
             // 历史入参 `enabled` 是**反向**的（true = 禁用），保留一版兼容；
             // 设备侧的 UpgMode 编码在 profile 的 WriteSpec 里，这里只做旧字段翻转（计划书 2.7）。
             post("/fota") {
+                // 能力门禁（3.3）：缺 fota → 501 NOT_SUPPORTED。
+                // 指的是**设备固件**的自动升级开关，与 core 自己的 api/update 那组无关。
+                dataHub.deviceCapabilities.requireCapability(Capability.FOTA)
                 val p = call.receiveJsonObject()
                 val autoUpdate = p["auto_update"]?.jsonPrimitive?.booleanOrNull
                     ?: p["enabled"]?.jsonPrimitive?.booleanOrNull?.let { legacyDisable ->
@@ -509,6 +545,8 @@ class DeviceRoutes(
 
             // SAMBA 文件共享
             post("/samba") {
+                // 能力门禁（3.3）：缺 samba → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.SAMBA)
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val success = deviceClient.setSambaSetting(enabled)
@@ -524,6 +562,11 @@ class DeviceRoutes(
             // web 从邻区列表取 rat 且兜底 'LTE'（设备不认，锁定静默失败）。
             // 名字→数字码的映射现在在 profile 的 WriteSpec 里（计划书 2.6）。
             post("/cell-lock") {
+                // 能力门禁（3.3）：缺 cell_lock → 501 NOT_SUPPORTED。
+                //
+                // 本域的另一个写入口 /cell-unlock **同样要拦**：Capability 是功能域，
+                // 域内所有写入口都必须被同一个门禁覆盖，漏一个就等于留了一条绕过门禁的路。
+                dataHub.deviceCapabilities.requireCapability(Capability.CELL_LOCK)
                 val p = call.receiveJsonObject()
                 val pci = p["pci"]?.jsonPrimitive?.contentOrNull ?: ""
                 val earfcn = p["earfcn"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -550,6 +593,14 @@ class DeviceRoutes(
 
             // 解锁所有基站
             post("/cell-unlock") {
+                // 能力门禁（3.3）：缺 cell_lock → 501 NOT_SUPPORTED。
+                //
+                // 与 /cell-lock 各拦一次，**不是重复**：Capability 是**功能域**，
+                // 域内**所有写入口**都必须被同一个门禁覆盖。放行本入口，等于给前端留了一条
+                // 绕过门禁、把 goform 请求打到设备再失败的路 —— 那正是阶段 3 要消除的失败模式。
+                // 「解锁在不支持的设备上反正是空操作」不是理由：对外表现必须是明确的
+                // 501「不支持」，而不是一次打到设备的请求 + 一个含义不明的 success。
+                dataHub.deviceCapabilities.requireCapability(Capability.CELL_LOCK)
                 val success = deviceClient.unlockAllCell()
                 if (success) {
                     cache?.invalidate("network:cell-info")
@@ -607,6 +658,11 @@ class DeviceRoutes(
             // 其中一份（app NotificationCenter.parseLimitMb）解析不出复合格式，
             // 导致流量告警在 GB 档位下永不触发。
             post("/data-limit") {
+                // 能力门禁（3.3）：缺 traffic_limit → 501 NOT_SUPPORTED。
+                // 放在**读请求体之前**：这个端点顺带落盘 core 自制的「到阈值自动关网」开关，
+                // 设备侧限额写不下去时那个开关单独打开也没有意义（它的判据就是设备的限额与用量），
+                // 所以整个端点一起不可用，不做「只写 core 那半边」的半成功。
+                dataHub.deviceCapabilities.requireCapability(Capability.TRAFFIC_LIMIT)
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 var limitValue = p["limit_value"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()

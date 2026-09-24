@@ -1,5 +1,7 @@
 package com.ufi_axis_core.deviceplugins
 
+import com.ufi_axis_core.contract.Capability
+import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.devicespi.BuildInfo
 import com.ufi_axis_core.devicespi.DevicePlugin
 import com.ufi_axis_core.devicespi.ProbeEnv
@@ -11,22 +13,34 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 插件契约守门测试（计划书 §6 的 2.7）—— 对 [PluginRegistry.ALL] 里的**每一个**插件逐条查。
+ * 插件契约守门测试（计划书 §6 的 2.7 + §7 的 3.7）—— 对 [PluginRegistry.ALL] 里的**每一个**
+ * 插件逐条查。
  *
  * 守的是「加第二台设备时容易悄悄写错、而且写错了别的测试不会红」的那几条：
  * 注册表自洽（id 唯一、[PluginRegistry.DEFAULT] 真的在 [PluginRegistry.ALL] 里）、
- * `profile()` 不在每次调用时新建对象、`tuning()` 的阈值没填反、`probe()` 是纯函数。
+ * `profile()` 不在每次调用时新建对象、`tuning()` 的阈值没填反、`probe()` 是纯函数，
+ * 以及 `capabilities` **声明了就必须真能做到**。
  *
- * ## 本批刻意**不测**的两条，以及为什么
+ * ## 能力集这一段只做**单向**断言（2026-09-24 用户拍板）
  *
- * 1. **`capabilities`，以及「声明了某个 capability 就必须有对应 WriteSpec」** ——
- *    `Capability` 要定在 `:core:contract`（双端冻结区），按计划书归**阶段 3**，
- *    现在 `DevicePlugin` 上根本没有这个成员。没有类型可断言，写了也只是占位。
- * 2. **`createTransport()` 不在单测里调** —— 它会 `new GoformClient`，而那个构造一上来就起
- *    Ktor client、`AppLogger` 又依赖 `android.util.Log`（同一个坑记在
- *    `GoformBase64CharsetTest` 的文件头）。JVM 单测里调它只会拿到一条
- *    `RuntimeException: Stub!` —— 与「插件契约对不对」毫无关系的失败。
- *    这一条靠装配层的真机冒烟覆盖（`ComponentFactory.buildNetworkGraph` 造完就要连设备）。
+ * 断言方向是：**声明了某个 [Capability] → 必须能在该插件的 profile 里找到对应的写能力**
+ * （`WriteSpec` 或 `smsSpec()`）。防的是「定了不用 / 定了做不到」。
+ *
+ * **不加反向断言**（「有 `WriteSpec` 就必须有 capability」）：计划书 §6 的 2.7 原来那句
+ * 已经作废 —— Capability 是**功能域**（10 个），`SettingKey` 是**写入项**（29 个），
+ * 照反向断言写出来一上线必红，而且它逼着人给每个 key 编一个域，
+ * 那才是真正把能力集变成垃圾桶的做法。没有 capability 的写操作照旧不拦。
+ *
+ * ## 本批仍然刻意**不测**的一条
+ *
+ * **`createTransport()` 不在单测里调** —— 它会 `new GoformClient`，而那个构造一上来就起
+ * Ktor client、`AppLogger` 又依赖 `android.util.Log`（同一个坑记在
+ * `GoformBase64CharsetTest` 的文件头）。JVM 单测里调它只会拿到一条
+ * `RuntimeException: Stub!` —— 与「插件契约对不对」毫无关系的失败。
+ * 这一条靠装配层的真机冒烟覆盖（`ComponentFactory.buildNetworkGraph` 造完就要连设备）。
+ *
+ * 「每个 Capability 至少被一处 route 门禁引用」那一条在 `:core:api` 的
+ * `CapabilityGateTest`（route 源码在那个模块，这里看不见）。
  *
  * 旧注册表 `DeviceProfiles` 那一侧的同类断言在 `ProfileContractTest`
  * （`:core:device-schema`），它随 2.6 收尾一起删。
@@ -34,6 +48,28 @@ import org.junit.Test
 class PluginContractTest {
 
     private val plugins: List<DevicePlugin> = PluginRegistry.ALL
+
+    /**
+     * 「声明了这个域 → profile 里至少要有这里列的 `SettingKey` 之一」。
+     *
+     * 为什么是 `List`（任一成立即可）而不是单个 key：有的域天生对应多条设备命令
+     * （频段锁定分 LTE / NR，基站锁定分 lock / unlock），而「这台设备有没有 NR 频段」
+     * 不该由能力集回答。要求全部命中会把「只有 LTE 的设备」判成不支持频段锁定。
+     *
+     * [Capability.SMS] **不在这张表里**：短信不走 `SettingKey` + `WriteSpec`
+     * （计划书 §11.2），它的判据是 `profile.smsSpec() != null`，单独一条用例。
+     */
+    private val writeKeysOf: Map<Capability, List<SettingKey>> = mapOf(
+        Capability.SIM_SLOT_SWITCH to listOf(SettingKey.SIM_SLOT),
+        Capability.BAND_LOCK to listOf(SettingKey.BAND_LOCK_LTE, SettingKey.BAND_LOCK_NR),
+        Capability.CELL_LOCK to listOf(SettingKey.CELL_LOCK, SettingKey.CELL_UNLOCK),
+        Capability.NETWORK_MODE to listOf(SettingKey.NETWORK_MODE),
+        Capability.SAMBA to listOf(SettingKey.SAMBA),
+        Capability.USB_DEBUG to listOf(SettingKey.USB_PORT),
+        Capability.FOTA to listOf(SettingKey.FOTA_AUTO_UPDATE),
+        Capability.PERFORMANCE_MODE to listOf(SettingKey.PERFORMANCE_MODE),
+        Capability.TRAFFIC_LIMIT to listOf(SettingKey.TRAFFIC_LIMIT),
+    )
 
     /** 探测指纹的最小样例；单测只关心 `probe()` 读它的方式，字段取值本身不是契约。 */
     private fun probeEnv(
@@ -127,6 +163,69 @@ class PluginContractTest {
             // 许可数 <= 0 会让所有 root shell 直接排队到死
             assertTrue("${plugin.id}: rootShellPermits 必须为正", t.rootShellPermits > 0)
         }
+    }
+
+    // ───────────────────────── capabilities ─────────────────────────
+
+    @Test
+    fun `每个插件的 capabilities 非空且多次读返回同一个集合`() {
+        plugins.forEach { plugin ->
+            // 空能力集 = 这台设备上 10 个域全部回 501、两端全部灰掉。
+            // 真要有这种设备，那它就不该作为插件登记进来。
+            assertTrue(
+                "${plugin.id} 的 capabilities 不能为空（空 = 10 个功能域全部回 501）",
+                plugin.capabilities.isNotEmpty(),
+            )
+            // 与 profile() 那条同一个判据：别在 getter 里 new。
+            // 每次 new 一份的话，装配层递给 DataHub 的那份与后来读到的就不是同一个对象，
+            // 「运行期不变」这条约束会静默失效。
+            assertSame(
+                "${plugin.id}.capabilities 每次都必须返回同一个集合",
+                plugin.capabilities,
+                plugin.capabilities,
+            )
+        }
+    }
+
+    @Test
+    fun `声明了某个 capability 就必须能在 profile 里找到对应的写能力`() {
+        plugins.forEach { plugin ->
+            val profile = plugin.profile()
+            plugin.capabilities.forEach { cap ->
+                if (cap == Capability.SMS) {
+                    // 短信不走 SettingKey（§11.2），判据是 smsSpec()
+                    assertTrue(
+                        "${plugin.id} 声明了 ${cap.wire}，但 profile.smsSpec() 是 null —— " +
+                            "声明的能力必须真能做到，否则就是「开关能点、点了没反应」",
+                        profile.smsSpec() != null,
+                    )
+                    return@forEach
+                }
+                val keys = writeKeysOf[cap]
+                assertTrue(
+                    "对照表 writeKeysOf 缺少 ${cap.wire} —— 新增 Capability 时要把它的写侧判据补进来",
+                    keys != null,
+                )
+                assertTrue(
+                    "${plugin.id} 声明了 ${cap.wire}，但 profile(${profile.id}) 里 " +
+                        "${keys!!.joinToString { it.name }} 一条 WriteSpec 都没有登记",
+                    keys.any { profile.writeSpec(it) != null },
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `对照表覆盖 Capability 的全部取值`() {
+        // 这条是给「将来加第 11 个 Capability」的人准备的：
+        // 不补对照表，上面那条用例只会在**恰好有插件声明了新域**时才红 ——
+        // 也就是说漏补可能几个月都不暴露。这里让它立刻红。
+        val covered = writeKeysOf.keys + Capability.SMS
+        assertEquals(
+            "Capability 与对照表必须逐项对齐（缺：${(Capability.entries - covered).map { it.wire }}）",
+            Capability.entries.toSet(),
+            covered,
+        )
     }
 
     // ───────────────────────── probe ─────────────────────────

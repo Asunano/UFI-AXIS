@@ -1159,16 +1159,47 @@ contract  ←  device-schema  ←  device-spi  ←  device-plugins  ←  core（
 
 **这一阶段收益最直接**：现在设备不支持的功能要等请求打到设备才失败。
 
+### 开工前的三个裁决（2026-09-24，用户拍板）
+
+**① Capability 是「功能域」，与 `SettingKey` 不要求一一对应。**
+10 个 Capability vs 29 个 `SettingKey` —— **只对这 10 个域做门禁，其余写操作照旧**（没有 capability 就不拦）。
+所以 §6 的 2.7 原来那句「有 `WriteSpec` 但没声明 capability 也算失败」**作废**：
+照它写出来的双向断言一上线必红（29 个 key 不可能都归到 10 个域里）。
+守门测试改成**单向**：声明了某个 Capability，就必须能找到对应的 `WriteSpec` 或 route —— 防的是「定了不用」。
+
+**② 能力集走新端点 `GET /api/device/capabilities`**，不并入 `/api/diagnose`：
+能力集是 **UI 渲染开关时要读的业务数据**，不该让前端为了画一个开关去拉排障端点。
+
+**③ 本阶段只做 core 侧（3.1 / 3.2 / 3.3 / 3.4 / 3.7）。**
+3.5 / 3.6（app / web 置灰）与 3.8（两端镜像一致性）**等用户那批 UI 改动落地后单独一批** ——
+他正在并行改 `app/**` 与 `web/**`，现在动同一批文件必然撞车。
+3.9（3B）仍然等阶段 4。
+
 ### 任务
 
-- `[ ]` 3.1 `Capability` 定在 **`core/contract`**（冻结区，理由见 §11.4）
-- `[ ]` 3.2 `ZteF50Plugin.capabilities` 按真机实测填写（3A 部分）
-- `[ ]` 3.3 route 层统一门禁：`CapabilityMissing` → 501 / `ErrorCode.NOT_SUPPORTED`
-- `[ ]` 3.4 新端点 `GET /api/device/capabilities`（或并入 `/api/diagnose`，二选一后记在这里）
-- `[ ]` 3.5 app 侧消费：不支持的开关置灰 + 一句原因
-- `[ ]` 3.6 web 侧消费：同上（`web/src/api/contract.ts` 加镜像类型）
-- `[ ]` 3.7 守门测试：`Capability` 每一项都至少被一处 route 或一处 UI 消费（防止定了不用）
+
+- `[~]` 3.1 `Capability` 定在 **`core/contract`**（冻结区，理由见 §11.4）
+  → **2026-09-24 已落地**：`Capabilities.kt`，10 项 + `wire`（映射写在枚举上，不在下发处 `name.lowercase()`）
+  + `fromWire()`。同批给 `ErrorCode` 补了 **`NOT_SUPPORTED`** —— **实测它此前根本不存在**
+  （全仓只有两处注释提到「route 应回 NOT_SUPPORTED」），所以 501 这条出口是这次才真正建起来的
+- `[~]` 3.2 `ZteF50Plugin.capabilities` 按真机实测填写（3A 部分）
+  → `DevicePlugin` 加 `val capabilities: Set<Capability>`（批 A 刻意没加的两个成员之一，现在只剩 `platform()`），
+  `ZteF50Plugin` 填满 10 项 —— **每一项都有「WriteSpec（或 smsSpec）+ 写 route」双证据**，见 §9 批 29 的对照表
+- `[~]` 3.3 route 层统一门禁：`CapabilityMissing` → 501 / `ErrorCode.NOT_SUPPORTED`
+  → 落在 `HttpServer` 的 `StatusPages`（全站唯一异常出口），**没有在 handler 里撒 if**；
+  **12 处门禁 / 10 个域 / 4 个文件**。能力集经 `DataHub` 的一个只读 `Set<Capability>` 快照进 route，
+  口径同批 B2（**不把 `DeviceRuntime` / `DevicePlugin` 塞进 `DataHub` 或 `RouteContext`**）
+- `[~]` 3.4 新端点 `GET /api/device/capabilities`（**二选一已裁决：新端点，不并入 `/api/diagnose`**）
+  → 返回 `{"plugin_id": "...", "capabilities": ["sms", ...]}`。**数组而不是 map** ——
+  map 形态下旧客户端分不出「这是新增的能力」还是「不支持」。`plugin_id` 与 `/api/diagnose` 同源同值
+- `[ ]` 3.5 app 侧消费：不支持的开关置灰 + 一句原因 —— **等用户那批 UI 改动落地后单独一批**
+- `[ ]` 3.6 web 侧消费：同上（`web/src/api/contract.ts` 加镜像类型）—— 同上
+- `[~]` 3.7 守门测试：`Capability` 每一项都至少被一处 route 或一处 UI 消费（防止定了不用）
+  → 判据是「**每个 Capability 至少被一处 route 门禁引用**」+「引用总数 ≥ 项数 − 豁免数」，
+  **刻意不设上限**（域内可以有多个写入口，计数管不住语义、还会在加入口时逼人改测试）；
+  豁免表当前为空、且自带上限断言（防它变垃圾桶）。另有 `Capability.wire` 取值写死的断言
 - `[ ]` 3.8 两端镜像一致性测试：contract 的枚举 wire 名与 `contract.ts` 的字符串联合类型逐项对齐
+  —— **跟 3.5 / 3.6 同批**（要动 web）
 - `[ ]` 3.9 **3B**（阶段 4 之后）：`BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 由 `PlatformAdapter` 推导
 
 ### 怎么做
@@ -1633,6 +1664,37 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   - **新登记 P1-35**：`checkDeviceEvents` 的兜底 catch 仍把 `e.message` 拼进日志（基数无界、
     绕过 `repeatGate`），且会吞掉普通 `CancellationException`（与同文件其它多处的写法不一致）。见 §15。
   - 校验：`:core:common:test` **176/176**（171 + 5）、`:core:scheduler` 与 `:core` 编译通过。
+- 2026-09-24 **批 29：阶段 3 的 core 侧（3.1 / 3.2 / 3.3 / 3.4 / 3.7）**（子代理实现、我裁决与验收，未 push）：
+  - **三条开工裁决**见 §7 开头（Capability 是功能域不与 SettingKey 一一对应 / 新端点 / 本批只碰 core）。
+  - **10 个域的「双证据」对照表**（子代理逐项查的，没有一项需要豁免、没有硬造 route）：
+    `sms` ← `smsSpec`（不走 SettingKey）+ `POST /api/sms/send`；
+    `sim_slot_switch` ← `SIM_SLOT` + `/api/sim/switch`；
+    `band_lock` ← `BAND_LOCK_LTE`+`BAND_LOCK_NR` + `/api/network/band`；
+    `cell_lock` ← `CELL_LOCK`+`CELL_UNLOCK` + `/api/device/cell-lock` 与 `/cell-unlock`；
+    `network_mode` ← `NETWORK_MODE` + `/api/network/mode` 与 `/bearer`；
+    `samba` ← `SAMBA` + `/api/device/samba`；
+    `usb_debug` ← **`USB_PORT`**（该 key 的 KDoc 与 `GoformDeviceClient.setDebugMode` 两处一致证据，不是猜的）
+    + `/api/device/debug`；`fota` ← `FOTA_AUTO_UPDATE` + `/api/device/fota`；
+    `performance_mode` ← `PERFORMANCE_MODE` + `/api/device/performance`；
+    `traffic_limit` ← `TRAFFIC_LIMIT` + `/api/device/data-limit`。
+  - **两条实测事实值得记住**：① `ErrorCode.NOT_SUPPORTED` **此前根本不存在**，
+    全仓只有两处注释说「route 应回 NOT_SUPPORTED」—— 501 这条出口是这次才建起来的；
+    ② **`:core:network` 看不见 `:core:contract`**（`:core:api` 对 contract 是 `implementation`，不传递），
+    所以 `CapabilityMissing` 必须**自带** status / errorCode / 文案，
+    才能在 `HttpServer` 的 `StatusPages` 里被捕（第一次编译就是被这条打回来的）。
+    异常类因此定在 `:core:api`：它不是对外契约（跨 HTTP 的是 501 与 `NOT_SUPPORTED`，那两个已在冻结区）。
+  - **我的一处裁决：域内所有写入口都要拦**。子代理原本放行了 `/bearer` 与 `/cell-unlock`
+    （理由是「同一条设备命令只拦一次」）—— 那不成立：**拦的不是命令，是这台设备支不支持这个功能域**，
+    放行任一入口就等于给前端留了一条绕过门禁、把请求打到设备再失败的路。补完是 **12 处门禁 / 10 个域**，
+    守门测试的「恰好一处」同时改成「至少一处」+ 总数下限、**不设上限**
+    （计数管不住语义，还会在加写入口时逼人改测试）。
+  - 校验：`:core:contract:test` **11/11**、`:core:api:test` **235/235**（首次整模块跑，记为新基线）、
+    `:core:device-plugins:test` **11/11**、`:core:device-spi:test` 11/11、
+    `:core:goform:test --rerun-tasks` 103/103；六处编译通过。我复核了门禁调用点实测 12 处
+    （Sim 1 / RootSms 1 / Network 3 / Device 7）。`/api/diagnose` 的 `device_profile` 块一个字未改。
+  - **新登记 P1-36**：`TaskRoutes.kt:176` 是全仓唯一的旧 501，配的却是 `ErrorCode.UNAVAILABLE`
+    —— 正是 §11.6 说的「三种不可用混成一个码」。它与能力集无关（core 自己的组件没装配、可恢复），
+    本批没动。见 §15。
 
 
 ### 执行记录
@@ -3357,6 +3419,18 @@ P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍�
      起止判断错了会把正确的行也掰反，比现在更糟；
   ③ 删掉那段时间的小时行 —— 与「宁可少一段，不能凭空多一段」的既有取舍一致，最不容易做错。
 - 归属：**不属于阶段 0~5 的任何一步**，是一次性的数据处置。裁决前不要顺手写迁移脚本。
+
+**P1-36 `TaskRoutes` 的 501 配的是 `UNAVAILABLE` —— §11.6 点名的「三种不可用混成一个码」**
+
+- 事实（2026-09-24 批 29 调查时核出，**本批没动**）：`TaskRoutes.kt:176` 是全仓**唯一**的旧 501
+  出口（条件引擎未装配），配的错误码却是 `ErrorCode.UNAVAILABLE`。
+- 为什么不能照搬批 29 新建的 `NOT_SUPPORTED`：它的语义是「**core 自己的组件没装配**」，
+  **可恢复**（装上就好了），而 `NOT_SUPPORTED` 的约定是「设备不支持、不可恢复、前端别重试直接灰掉」。
+  两者混用会让前端把「core 少装了个组件」当成「这台设备没这功能」。
+- 待裁决：① 改成 503 + `UNAVAILABLE`（与「可重试」一致，但丢掉「这是未实现」这层信息）；
+  ② 新增一个 `NOT_IMPLEMENTED` 错误码（冻结区又多一项，要两端同步）；
+  ③ 维持现状并在 API 手册写明这一处的特殊口径。
+- 归属：与「三种不可用不许混码」一起单独一批，别混进设备插件化。
 
 **P1-35 `checkDeviceEvents()` 的兜底 catch 仍有两处隐患**
 

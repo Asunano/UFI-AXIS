@@ -1,5 +1,6 @@
 package com.ufi_axis_core.api
 
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.controller.goform.GoformWifiClient
@@ -76,6 +77,12 @@ import kotlinx.serialization.json.*
  *    去发请求」，而取数该走的是已注入的那几个客户端。
  *
  * 两个值在组件图构造时就定死、之后不会变（换设备要重启后台服务），所以传值不丢信息。
+ *
+ * ## [deviceCapabilities] 同一条口径（阶段 3 的 3.3）
+ *
+ * 能力集也是**只传一个不可变集合**，理由与上面两个 String 逐条相同（不让数据层认识
+ * `DevicePlugin`、不扩散选型对象的生命周期）。它同样不参与任何取数逻辑：
+ * 唯一的消费者是 route 层的门禁（`requireCapability`）与 `GET /api/device/capabilities`。
  */
 class DataHub(
     private val scheduler: DataScheduler,
@@ -84,7 +91,8 @@ class DataHub(
     private val responseCache: ResponseCache,
     /**
      * 选中插件的 id（如 `zte-f50`）。**恒非空**：认不出设备也会回落到默认插件。
-     * 只为 `/api/diagnose` 的 `device_profile.plugin_id` 存在，不参与任何取数逻辑。
+     * 只为 `/api/diagnose` 的 `device_profile.plugin_id` 与
+     * `/api/device/capabilities` 的 `plugin_id` 存在（**同源同值**），不参与任何取数逻辑。
      */
     val devicePluginId: String,
     /**
@@ -92,8 +100,19 @@ class DataHub(
      * （`configured` / `probed` / `default` / `fallback`）。
      * 只为 `/api/diagnose` 的 `device_profile.selection` 存在。
      */
-    val deviceSelection: String
+    val deviceSelection: String,
+    /**
+     * 选中插件声明的能力集（`DevicePlugin.capabilities`）。
+     *
+     * 只读快照：构造组件图时定一次，运行期不变（换设备要重启后台服务，见计划书 §11.10）。
+     * 下面用 `toSet()` 再拷一份，防的是调用方递进来一个 `MutableSet` 之后还留着引用 ——
+     * 能力集一旦能在运行期被改，门禁的行为就取决于「谁最后改了它」。
+     */
+    deviceCapabilities: Set<Capability>
 ) {
+    /** 见构造参数的 KDoc。route 层门禁与 `/api/device/capabilities` 从这里取。 */
+    val deviceCapabilities: Set<Capability> = deviceCapabilities.toSet()
+
     companion object {
         private const val TAG = "DataHub"
 

@@ -3,6 +3,7 @@
 package com.ufi_axis_core.api.components
 
 import android.content.Context
+import com.ufi_axis_core.api.update.MirrorResolver
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.BinaryComponentMeta
@@ -215,7 +216,7 @@ class ComponentManager(
         val extracted = store.tempFile("$id.bin")
         try {
             progress = Progress(id, State.DOWNLOADING, 0, "正在下载 $id v${m.version ?: "?"}...")
-            val actualSha = downloadTo(applyMirrorToUrl(url), download) { pct ->
+            val actualSha = downloadWithFallback(url, download) { pct ->
                 progress = progress.copy(state = State.DOWNLOADING, percent = pct)
             }
 
@@ -455,9 +456,7 @@ class ComponentManager(
     /** 同步拉取 `version.json` 的 components 段并写入缓存；失败只记 [manifestError]，不抛 */
     private fun fetchManifest() {
         try {
-            val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-            requireSecureUrl(manifestUrl, "更新源")
-            val text = fetchUrl(manifestUrl, 15_000) ?: throw Exception("更新源不可达: $manifestUrl")
+            val text = fetchManifestText()
             val root = json.parseToJsonElement(text).jsonObject
             val obj = root["components"]?.jsonObject
                 ?: throw Exception("更新源缺少 components 段（请更新 version.json）")
@@ -473,15 +472,55 @@ class ComponentManager(
 
     // ── 网络工具（与 backend UpdateManager / WebUpdateManager 保持同一套约定）──
 
-    /** GitHub 域名 URL 前拼接 [AppSettings.updateMirrorBase]；非 GitHub 原样返回；空串=直连 */
-    private fun applyMirrorToUrl(urlStr: String): String {
-        if (urlStr.isBlank()) return urlStr
-        val base = settings.updateMirrorBase.trim().trimEnd('/')
-        if (base.isEmpty()) return urlStr
-        val host = try { URL(urlStr).host?.lowercase() } catch (e: Exception) { return urlStr }
-        if (host.isNullOrBlank()) return urlStr
-        if (host in GITHUB_HOSTS || host.endsWith(".githubusercontent.com")) return "$base/$urlStr"
-        return urlStr
+    /**
+     * 逐候选拉取组件清单（2026-09-22：镜像决策统一到 [MirrorResolver]）。
+     *
+     * 这里**不调** `MirrorResolver.prepare`：组件下载不是更新主流程，没必要为它触发一次出网地区探测，
+     * 用当前已知地区即可（探测由 core 启动与更新流程负责刷新）。
+     */
+    private fun fetchManifestText(): String {
+        val candidates = MirrorResolver.candidates(settings, settings.updateUrl)
+        if (candidates.isEmpty()) throw Exception("更新源未配置（update_url 为空）")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "更新源")
+                val text = fetchUrl(url, 15_000)
+                if (text != null) {
+                    if (index > 0) AppLogger.i(TAG, "组件清单第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                    return text
+                }
+                "不可达"
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
+        }
+        throw Exception("更新源全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
+    }
+
+    /** 逐候选下载组件文件，返回 SHA-256。换候选前清掉半截临时文件。 */
+    private fun downloadWithFallback(
+        rawUrl: String,
+        target: File,
+        onProgress: (Int) -> Unit
+    ): String {
+        val candidates = MirrorResolver.candidates(settings, rawUrl)
+        if (candidates.isEmpty()) throw Exception("组件下载地址为空")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "组件下载地址")
+                val sha = downloadTo(url, target, onProgress)
+                if (index > 0) AppLogger.i(TAG, "组件下载第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                return sha
+            } catch (e: Exception) {
+                target.delete()
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
+        }
+        throw Exception("组件下载全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
     }
 
     private fun fetchUrl(urlStr: String, timeoutMs: Int): String? = try {

@@ -1,5 +1,6 @@
 package com.ufi_axis_core.deviceplugins.zte.f50
 
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.goform.GoformClient
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
@@ -17,6 +18,9 @@ import com.ufi_axis_core.devicespi.TransportConfig
  * - [createTransport] → `GoformClient`（`:core:goform`）；
  * - [tuning] → 四处实测常量的原值（来源逐条记在 [DeviceTuning] 的字段 KDoc 上）。
  *
+ * [capabilities] 同理：10 个域逐一对着「`ZteGoformProfile` 里有没有那条 `WriteSpec`」+
+ * 「core 侧有没有那个写 route」核过（2026-09-24 阶段 3.2），不是照 [Capability] 的清单抄一遍。
+ *
  * 是 `object` 而不是 class：插件本身**无状态**（有状态的是它造出来的传输层）。
  */
 object ZteF50Plugin : DevicePlugin {
@@ -24,6 +28,45 @@ object ZteF50Plugin : DevicePlugin {
     override val id = "zte-f50"
 
     override val displayName = "ZTE F50"
+
+    /**
+     * F50 支持 [Capability] 第一批的**全部 10 个域**。
+     *
+     * ## 判据（逐项都是「WriteSpec 在 + route 在」两条同时成立）
+     *
+     * | Capability | 设备侧依据（`ZteGoformProfile`） | 写 route |
+     * | --- | --- | --- |
+     * | [Capability.SMS] | `smsSpec() = ZteSmsSpec` | `POST /api/sms/send` |
+     * | [Capability.SIM_SLOT_SWITCH] | `SettingKey.SIM_SLOT` | `POST /api/sim/switch` |
+     * | [Capability.BAND_LOCK] | `BAND_LOCK_LTE` / `BAND_LOCK_NR` | `POST /api/network/band` |
+     * | [Capability.CELL_LOCK] | `CELL_LOCK` / `CELL_UNLOCK` | `POST /api/device/cell-lock` |
+     * | [Capability.NETWORK_MODE] | `NETWORK_MODE` | `POST /api/network/mode` |
+     * | [Capability.SAMBA] | `SAMBA` | `POST /api/device/samba` |
+     * | [Capability.USB_DEBUG] | `USB_PORT` | `POST /api/device/debug` |
+     * | [Capability.FOTA] | `FOTA_AUTO_UPDATE` | `POST /api/device/fota` |
+     * | [Capability.PERFORMANCE_MODE] | `PERFORMANCE_MODE` | `POST /api/device/performance` |
+     * | [Capability.TRAFFIC_LIMIT] | `TRAFFIC_LIMIT` | `POST /api/device/data-limit` |
+     *
+     * 「10 个全填」不是偷懒：第一批的 10 个域本来就是按「能在 F50 上明确验证、
+     * 且已有对应 route」挑出来的（计划书 §7）。真正需要挑的是**下一台设备** ——
+     * 那时这里的对照表就是「该怎么核」的样例。
+     *
+     * 排障时可以临时删掉一项验证门禁（如 [Capability.SAMBA] → `/api/device/samba` 回 501），
+     * **验完必须还原**（计划书 §7 的验收写明了这是排查性删除）。
+     */
+    override val capabilities: Set<Capability> = setOf(
+        Capability.SMS,
+        Capability.SIM_SLOT_SWITCH,
+        Capability.BAND_LOCK,
+        Capability.CELL_LOCK,
+        Capability.NETWORK_MODE,
+        Capability.SAMBA,
+        Capability.USB_DEBUG,
+        Capability.FOTA,
+        Capability.PERFORMANCE_MODE,
+        Capability.TRAFFIC_LIMIT,
+    )
+
 
     override fun profile(): DeviceProfile = ZteGoformProfile
 

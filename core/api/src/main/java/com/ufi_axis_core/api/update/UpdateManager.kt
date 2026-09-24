@@ -210,30 +210,66 @@ class UpdateManager(
     }
     private val BUSY_STATES = setOf(State.DOWNLOADING, State.VERIFYING, State.INSTALLING, State.UPLOADING)
 
-    /** GitHub 相关域名（命中即走镜像；gh-proxy 风格前缀拼接在完整 URL 前） */
-    private val GITHUB_HOSTS = listOf(
-        "github.com",
-        "raw.githubusercontent.com",
-        "objects.githubusercontent.com",
-        "codeload.github.com"
-    )
+    /**
+     * 逐候选拉取清单文本（2026-09-22：镜像决策下沉 [MirrorResolver]，并从「单地址」升级为「候选降级」）。
+     *
+     * 之前这里是 `applyMirrorToUrl(settings.updateUrl)` 单地址 —— 镜像挂了就整条更新链路挂掉，
+     * 而 app 侧早就有三级镜像 + 直连兜底，于是「app 能更新、core 更新不了」是可达状态。
+     *
+     * @param maxCandidates 候选上限。前端同步等待的只读查询（backend-info / frontend-info）
+     *        要压到 2，否则最坏要等 5 个候选逐个超时；后台安装流程可以用全部候选。
+     * @throws Exception 全部候选失败（消息里带每个候选的失败原因，便于定位是镜像挂了还是清单本身错了）
+     */
+    private fun fetchManifestWithFallback(
+        what: String = "更新源",
+        timeoutMs: Int = 15_000,
+        maxCandidates: Int = Int.MAX_VALUE
+    ): String {
+        val candidates = MirrorResolver.candidates(settings, settings.updateUrl).take(maxCandidates)
+        if (candidates.isEmpty()) throw Exception("$what 未配置（update_url 为空）")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, what)
+                val text = fetchUrl(url, timeoutMs)
+                if (text != null) {
+                    if (index > 0) {
+                        AppLogger.i(TAG, "$what 第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                    }
+                    return text
+                }
+                "不可达"
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
+        }
+        throw Exception("$what 全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
+    }
 
     /**
-     * 基础镜像支持：GitHub 域名的 URL 前拼接 [AppSettings.updateMirrorBase] 后返回；
-     * - 镜像前缀为空串（update_mirror_base=""）→ 直连，不拼接；
-     * - 非 GitHub 域名原样返回（自建 CDN / 本地地址不受影响）。
-     * 2026-08-12：镜像前缀由写死常量改为读 settings（前端「同步到设备」可下发）。
+     * 逐候选下载 APK，返回文件 SHA-256。
+     * 换候选前清掉半截 `.part`，避免上一个候选的残留字节混进下一次下载。
      */
-    private fun applyMirrorToUrl(urlStr: String): String {
-        if (urlStr.isBlank()) return urlStr
-        val base = settings.updateMirrorBase.trim().trimEnd('/')
-        if (base.isEmpty()) return urlStr   // 空串 = 直连
-        val host = try { URL(urlStr).host?.lowercase() } catch (e: Exception) { return urlStr }
-        if (host.isNullOrBlank()) return urlStr
-        if (host in GITHUB_HOSTS || host.endsWith(".githubusercontent.com")) {
-            return "$base/$urlStr"
+    private fun downloadApkWithFallback(rawUrl: String, target: File, timeoutMs: Int = 60_000): String {
+        val candidates = MirrorResolver.candidates(settings, rawUrl)
+        if (candidates.isEmpty()) throw Exception("APK 下载地址为空")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "APK 下载地址")
+                val hash = downloadApk(url, target, timeoutMs)
+                if (index > 0) {
+                    AppLogger.i(TAG, "APK 下载第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                }
+                return hash
+            } catch (e: Exception) {
+                target.delete()
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
         }
-        return urlStr
+        throw Exception("APK 下载全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
     }
 
     /** 触发检查 + 自动更新（异步；立即返回当前状态，进度经 [status] 轮询） */
@@ -250,11 +286,13 @@ class UpdateManager(
                 logUpdateFile("checkAndUpdate start (current=$current)")
 
                 // ① 拉取版本清单（update_url → version.json）；强制 HTTPS（本地调试 IP 例外）
-                // 2026-08-10：GitHub 域名自动拼镜像前缀（设备在国内访问 GitHub 被墙）
-                val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                requireSecureUrl(manifestUrl, "更新源")
-                val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                    ?: throw NeedPushException("更新源不可达: $manifestUrl")
+                // 2026-09-22：镜像决策交给 MirrorResolver，并逐候选降级（镜像挂了还能直连）
+                MirrorResolver.prepare(settings)
+                val manifestJson = try {
+                    fetchManifestWithFallback()
+                } catch (e: Exception) {
+                    throw NeedPushException(e.message ?: "更新源不可达")
+                }
                 val manifest = try {
                     // C5 双对象兼容：优先取 backend 对象；无 backend 字段回退整份（旧 flat 格式）
                     val root = json.parseToJsonElement(manifestJson).jsonObject
@@ -278,12 +316,11 @@ class UpdateManager(
                 status = UpdateStatus(State.DOWNLOADING, 0, "发现新版 v$latest，开始下载...", current, latest)
 
                 // ③ 下载 APK（.part 原子写 + 磁盘预检 + SHA-256 流式计算比对）
-                requireSecureUrl(apkUrl, "APK 下载地址")
                 val partFile = File(APK_PART_FILE)
                 partFile.delete()
                 val apkHash = try {
-                    // 2026-08-10：GitHub 域名 APK 下载同样走镜像（设备在国内拉 GitHub 被墙）
-                    downloadApk(applyMirrorToUrl(apkUrl), partFile)
+                    // 2026-09-22：候选逐个降级（镜像 1/2/3 → 直连兜底），HTTPS 校验在每个候选上做
+                    downloadApkWithFallback(apkUrl, partFile)
                 } catch (e: Exception) {
                     partFile.delete()
                     throw NeedPushException("APK 下载失败: ${e.message}")
@@ -773,11 +810,10 @@ class UpdateManager(
         // 外网阻塞 IO 切到 IO 线程池，避免占用 Ktor 事件循环线程
         return withContext(Dispatchers.IO) {
             try {
-                // 2026-08-10：GitHub 域名自动拼镜像前缀（设备在国内访问 GitHub 被墙）
-                val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                requireSecureUrl(manifestUrl, "更新源")
-                val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                    ?: throw Exception("更新源不可达: $manifestUrl")
+                // 2026-09-22：镜像决策交给 MirrorResolver。候选压到 2（首选 + 兜底）——
+                // 这是前端同步等待的只读查询，让它最坏等 5 个候选逐个超时是不可接受的。
+                MirrorResolver.prepare(settings)
+                val manifestJson = fetchManifestWithFallback(timeoutMs = 8_000, maxCandidates = 2)
                 val root = json.parseToJsonElement(manifestJson).jsonObject
                 val obj = root["frontend"]?.jsonObject ?: root
                 val info = json.decodeFromJsonElement(FrontendUpdateInfo.serializer(), obj)
@@ -794,6 +830,26 @@ class UpdateManager(
 
     /** 最近一次成功缓存的 frontend apk_url（frontend-apk 代理同源校验用） */
     fun cachedFrontendApkUrl(): String? = frontendInfoCache?.apk_url
+
+    /**
+     * 更新源决策快照（`GET /api/update/source`，2026-09-22）。
+     *
+     * 给 app 用：它的 APK 自更新刻意**不走 core 代理**（core 挂了也得能更新自己），
+     * 所以 core 只把决策给出去，由 app 自己拼 URL 下载。这里**不接受任何入参** ——
+     * 「给我一个 URL 我帮你改写」会凭空多出一个 SSRF 面，而 core 已经有一个带白名单的
+     * frontend-apk 代理了，不需要第二个。
+     *
+     * - `mode`：`auto` / `mirror` / `direct`
+     * - `country`：出网地区（空串 = 从未测出，**不等于海外**）
+     * - `use_mirror`：按当前 mode + 地区算出的结论，客户端直接用，不要自己再判一遍
+     * - `mirror_prefixes`：按优先级排列，客户端逐个降级，最后回落原地址
+     */
+    fun updateSourceSnapshot(): Map<String, Any?> = mapOf(
+        "mode" to settings.updateSourceMode,
+        "country" to settings.geoCountry,
+        "use_mirror" to MirrorResolver.useMirror(settings),
+        "mirror_prefixes" to MirrorResolver.mirrorPrefixes(settings)
+    )
 
     // ── 后端 core 更新信息（2026-09-06：只检查、不下载、不安装）──
     //
@@ -845,10 +901,9 @@ class UpdateManager(
             // 外网阻塞 IO 切到 IO 线程池，避免占用 Ktor 事件循环线程
             withContext(Dispatchers.IO) {
                 try {
-                    val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                    requireSecureUrl(manifestUrl, "更新源")
-                    val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                        ?: throw Exception("更新源不可达: $manifestUrl")
+                    // 2026-09-22：同 fetchFrontendUpdateInfo —— 前端同步等待，候选压到 2
+                    MirrorResolver.prepare(settings)
+                    val manifestJson = fetchManifestWithFallback(timeoutMs = 8_000, maxCandidates = 2)
                     val root = json.parseToJsonElement(manifestJson).jsonObject
                     val obj = root["backend"]?.jsonObject ?: root
                     val parsed = json.decodeFromJsonElement(BackendManifest.serializer(), obj)

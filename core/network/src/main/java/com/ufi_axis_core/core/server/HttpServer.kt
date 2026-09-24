@@ -1,5 +1,6 @@
 package com.ufi_axis_core.core.server
 
+import com.ufi_axis_core.api.CapabilityMissing
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.middleware.AuthMiddleware
 import com.ufi_axis_core.api.pairing.PairingManager
@@ -339,6 +340,25 @@ class HttpServer(
                 call.respond(
                     HttpStatusCode(413, "Request Entity Too Large"),
                     toJsonElement(mapOf("error" to cause.message))
+                )
+            }
+            // 当前设备不支持该功能（能力集门禁，计划书 §7 的 3.3）→ 501 + NOT_SUPPORTED。
+            //
+            // 这是**唯一**的出口：route 侧只写一行 `requireCapability(...)`，
+            // 状态码 / 错误码 / 文案三件事都由 CapabilityMissing 自己带过来
+            // （定义在 :core:api 的 CapabilityGate.kt，那里也写了为什么不放 :core:contract：
+            //  本模块看不见 Capability 这个类型，所以日志里用它给的 capabilityWire 字符串）。
+            // 必须在下面的 exception<Throwable> 之前成立 —— 否则「不支持」会被兜底成 500，
+            // 客户端只能显示「服务器内部错误」，而这恰恰是不可恢复、应该灰掉开关的那一种。
+            exception<CapabilityMissing> { call, cause ->
+                AppLogger.w(
+                    "StatusPages",
+                    "501 capability missing: ${cause.capabilityWire} " +
+                        "(${call.request.httpMethod.value} ${call.request.uri})"
+                )
+                call.respond(
+                    cause.status,
+                    com.ufi_axis_core.api.ResponseHelper.fail(cause.errorCode, cause.userMessage)
                 )
             }
             // 请求体非法（如 JSON 语法错误、不是 JSON 对象）→ 400 而不是落到下面的 500 兜底。

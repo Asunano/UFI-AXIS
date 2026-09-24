@@ -1,7 +1,9 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.requireCapability
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.contract.NetworkMode
@@ -132,6 +134,9 @@ class NetworkRoutes(
 
             // 锁定/解锁频段（goform 写入 + AT+SFUN 网络栈重启，无需设备重启）
             post("/band") {
+                // 能力门禁（3.3）：缺 band_lock → 501 NOT_SUPPORTED。
+                // lock 与 unlock 都在这一个端点上，所以这一处就覆盖了整个频段锁定域。
+                dataHub.deviceCapabilities.requireCapability(Capability.BAND_LOCK)
                 val params = call.receiveJsonObject()
                 val action = params["action"]?.jsonPrimitive?.contentOrNull ?: "lock"
 
@@ -182,9 +187,19 @@ class NetworkRoutes(
             // （会话失效）其实是"再点一次就好"，用户完全无从判断 —— 这就是"第一次必定 500"
             // 被当成 core 故障的由来。
             post("/mode") {
+                // 能力门禁（3.3）：缺 network_mode → 501 NOT_SUPPORTED。
+                //
+                // 本域的另一个写入口 /bearer **同样要拦**：Capability 是功能域，
+                // 域内所有写入口都必须被同一个门禁覆盖，漏一个就等于留了一条绕过门禁的路。
+                // 判据不是「这条设备命令拦过了没有」，而是「这台设备支不支持这个功能域」。
+                dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
                 val client = networkClient
                 if (client == null) {
-                    // goform 不可用时无法设置网络模式（AT+ZPREFMOD 在此设备不支持）
+                    // 通道不可用 → 503（可重试）。
+                    // 这里原先还有一行「AT+ZPREFMOD 在此设备不支持」的注释：那句话描述的是
+                    // 「这台设备只能走 goform 改制式」这个**设备事实**，现在由
+                    // Capability.NETWORK_MODE 表达（§11.6：能力按用户动作定，不按通道定），
+                    // 留着会让人以为 503 的判据是「某个 AT 命令不支持」—— 那是 501 的语义。
                     AppLogger.w("NetworkRoutes", "Goform client not available, cannot set network mode")
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "设备后台通道不可用，无法切换网络制式")
@@ -219,6 +234,15 @@ class NetworkRoutes(
             // 映射不出来就直接拒绝下发，不再把客户端猜的值原样丢给设备（计划书 2.6）。
             // 失败映射与 /mode 共用 respondWriteFailure，两个端点的错误码保持一致。
             post("/bearer") {
+                // 能力门禁（3.3）：缺 network_mode → 501 NOT_SUPPORTED。
+                //
+                // 与 /mode 各拦一次，**不是重复**：Capability 是**功能域**，
+                // 域内**所有写入口**都必须被同一个门禁覆盖。放行其中一个入口，
+                // 等于给前端留了一条绕过门禁、把请求打到设备再失败的路 ——
+                // 那正是阶段 3 要消除的失败模式。
+                // 「同一条设备命令只拦一次」在这里不成立：拦的不是命令（这两个端点确实共用
+                // SET_BEARER_PREFERENCE），而是**这台设备支不支持「切换网络制式」这个功能域**。
+                dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
                 val client = networkClient
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,

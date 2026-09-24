@@ -45,7 +45,17 @@ import com.ufi_axis_core.util.ArchiveExtractors
  * [registry] 提供存储提供者的解析与分发能力。路径以 `remote:` 开头时
  * 路由到对应的远程提供者；否则走本地逻辑（行为与引入 registry 之前完全一致）。
  */
-class FileRoutes(private val registry: FileProviderRegistry) {
+class FileRoutes(
+    private val registry: FileProviderRegistry,
+    /**
+     * 删除文件要用 `contentResolver`（走 MediaStore 才能连索引一起清，见
+     * `POST /delete` 的说明）。可空 + 默认 null：老的组装代码不传也能编过，
+     * 传 null 时 `/delete` 退回纯文件系统删除，并在响应里说明索引可能残留。
+     */
+    private val appContext: android.content.Context? = null,
+    /** 删除成功后要失效媒体列表缓存，否则客户端刷出来还是旧的那一条。 */
+    private val cache: com.ufi_axis_core.core.cache.ResponseCache? = null
+) {
 
     /**
      * 便捷访问本地提供者。所有原有的本地逻辑继续通过 FileRoutes 自身的私有方法执行，
@@ -501,6 +511,26 @@ class FileRoutes(private val registry: FileProviderRegistry) {
                 call.respond(toJsonElement(mapOf("success" to ok)))
             }
 
+            /**
+             * 删除文件或目录。**不可逆。**
+             *
+             * body: `{ "path": "…" }`；`remote:` 前缀交给对应存储源的 provider。
+             *
+             * ## 单个文件为什么先走 MediaStore
+             * `File.delete()` 只删磁盘上的字节，**MediaStore 的索引还在** —— 媒体库里会留下一条
+             * 指向不存在文件的僵尸记录：列表里看得见、点进去播放失败，重新扫描也不一定清得掉
+             *（扫描只补新增，不一定回收失效项）。`contentResolver.delete` 把文件与索引一起处理。
+             * 删到 0 行（文档、压缩包这类本来就不在 MediaStore 里的）才退回文件系统删除。
+             *
+             * 目录仍然只走 `deleteRecursively()`：逐个查 MediaStore 的代价随目录规模膨胀，
+             * 而目录删除本来就得靠一次重扫收尾。
+             *
+             * ## 权限
+             * 依赖 `MANAGE_EXTERNAL_STORAGE`（manifest 已申明）。没授权时 resolver 抛
+             * SecurityException —— 单独归类成 403 + `needsAllFilesAccess`，客户端据此引导去授权，
+             * 而不是让用户对着笼统的"删除失败"反复重试。可以先用 `GET /files/status` 的
+             * `isExternalStorageManager` 预判。
+             */
             post("/delete") {
                 val body = call.receiveJsonObject()
                 val filePath = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -524,16 +554,40 @@ class FileRoutes(private val registry: FileProviderRegistry) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.DANGEROUS_PATH, danger)
                     return@post
                 }
-                val ok = withContext(Dispatchers.IO) {
-                    val f = File(realPath)
-                    if (!f.exists()) {
-                        false
-                    } else {
-                        val deleted = f.deleteRecursively()
-                        deleted && !f.exists()
-                    }
+                // "denied" 单独一档：其余失败（不存在 / 删不动）都回 success=false，
+                // 与这个接口原本的语义保持一致，不改成 4xx/5xx（老客户端只看 success）
+                val outcome = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val f = File(realPath)
+                        when {
+                            !f.exists() -> "failed"
+                            f.isDirectory -> if (f.deleteRecursively() && !f.exists()) "ok" else "failed"
+                            else -> {
+                                val rows = appContext?.contentResolver?.delete(
+                                    android.provider.MediaStore.Files.getContentUri("external"),
+                                    "${android.provider.MediaStore.MediaColumns.DATA} = ?",
+                                    arrayOf(realPath)
+                                ) ?: 0
+                                if (rows > 0 || f.delete()) "ok" else "failed"
+                            }
+                        }
+                    }.getOrElse { e -> if (e is SecurityException) "denied" else "failed" }
                 }
-                call.respond(toJsonElement(mapOf("success" to ok, "deleted" to ok)))
+                when (outcome) {
+                    "ok" -> {
+                        // 媒体库列表里那一条得跟着消失，否则客户端刷出来还是旧的
+                        cache?.invalidate("media:*")
+                        call.respond(toJsonElement(mapOf(
+                            "success" to true, "deleted" to true, "path" to realPath
+                        )))
+                    }
+                    "denied" -> call.respondFail(
+                        HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
+                        "没有「所有文件访问权限」，无法删除",
+                        mapOf("needsAllFilesAccess" to true)
+                    )
+                    else -> call.respond(toJsonElement(mapOf("success" to false, "deleted" to false)))
+                }
             }
 
             post("/rename") {

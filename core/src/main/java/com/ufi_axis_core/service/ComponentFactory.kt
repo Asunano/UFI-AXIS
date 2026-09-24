@@ -413,15 +413,18 @@ object ComponentFactory {
 
 
         // ── 12.5 DataHub: 统一请求数据中心（集中管理所有 goform 查询缓存，消除路由间重复请求）──
-        // 后两个参数（2.8）只供 /api/diagnose 的 device_profile 块显示：传**值**不传 runtime，
+        // 后三个参数只供「显示与门禁」，不参与取数：传**值**不传 runtime，
         // 理由写在 DataHub 的类 KDoc（不让 :core:api 依赖 :core:device-spi、
         // 不把选型对象的生命周期扩散到数据层）。
         // selection 在这里就转成对外的小写 snake（Selection.wire），数据层与 route 层都不做映射 ——
         // 「枚举 → 线上取值」的唯一定义点在枚举自己身上。
+        // capabilities 是阶段 3 的 3.3 新增：插件声明的能力集原样递下去（Capability 在
+        // :core:contract，两边看到的是同一份冻结区类型，不需要在这里做任何翻译）。
         val dataHub = DataHub(
             scheduler, network.signalClient, network.wifiClient, responseCache,
             devicePluginId = runtime.plugin.id,
             deviceSelection = runtime.selection.wire,
+            deviceCapabilities = runtime.plugin.capabilities,
         )
         AppLogger.i(TAG, "[12.5] DataHub initialized")
 
@@ -600,7 +603,12 @@ object ComponentFactory {
         // 启动时的自动检测不在这里触发（build() 是阻塞的，出网最坏 24s 会顶到初始化看门狗），
         // 见 BackendService 里 HTTP 服务就绪之后那段。
         val geoRoutes = com.ufi_axis_core.api.routes.GeoRoutes(settings)
-        val rootSmsRoutes = RootSmsRoutes(smsController, scheduler, smsRuleStore)
+        // 短信路由：能力集只用于 /sms/send 的门禁（阶段 3 的 3.3）。
+        // 这个类没有 RouteContext，所以直接递不可变的 Set，不为一个门禁把 DataHub 递进去。
+        val rootSmsRoutes = RootSmsRoutes(
+            smsController, scheduler, smsRuleStore,
+            deviceCapabilities = runtime.plugin.capabilities,
+        )
         val smsForwardRoutes = SmsForwardRoutes(controller.smsForwardController, notifier)
         // Webhook 渠道（阶段 2）：配置 + 测试。gate 传的是同一个谓词（按 webhook 渠道绑好
         // respectDnd），只用于 /test 响应里的 auto_notify_enabled —— 不拦投递。
