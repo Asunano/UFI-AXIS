@@ -4,6 +4,7 @@ import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.WriteSpec
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.AppLogger
 
 

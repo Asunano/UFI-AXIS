@@ -9,7 +9,6 @@ import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.deviceschema.DeviceProfile
-import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import com.ufi_axis_core.core.database.AppDatabase
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -150,8 +149,12 @@ class DataScheduler(
      * **不接受 null**：`SignalCollector` 的第 1 层就是归一化，关掉等于信号数据全空，
      * 而 WS `signal` 频道与 REST 共用这份输出。所以字段归一化的回退开关不覆盖这里，
      * 只影响 goform 客户端层的透传查询。
+     *
+     * **无默认值**（2026-09-25 去掉了原来的 `= ZteGoformProfile`）：默认值等于
+     * 「漏传就按 ZTE F50 处理」，而本类驱动全部周期采集 —— 接第二台设备时漏传这一处，
+     * 得到的不是编译错误，而是整条采集链用别家设备的字段名解析本机响应。
      */
-    private val deviceProfile: DeviceProfile = ZteGoformProfile,
+    private val deviceProfile: DeviceProfile,
     /** 条件引擎（自动化规则）：在各采集点并联评估，零额外采集开销。 */
     private var conditionEngine: ConditionEngine? = null,
     /**

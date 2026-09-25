@@ -3,7 +3,7 @@ package com.ufi_axis_core.controller.goform
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.SettingKey
-import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -324,7 +324,11 @@ class GoformWifiClient(
         val obj = client.readOne("queryDeviceAccessControlList") as? JsonObject ?: return null
         fun str(key: String) = (obj[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
         return AclSnapshot(
-            mode = str("AclMode").ifEmpty { ZteGoformProfile.ACL_MODE_BLACKLIST },
+            // 设备没报 AclMode 时的兜底档位由 profile 提供（2026-09-25）。
+            // 此前这里直读 `ZteGoformProfile.ACL_MODE_BLACKLIST`，绕过了 commandProfile ——
+            // 换设备后仍拿 ZTE 的 "2" 兜底，而 "2" 在别家可能是白名单。
+            // profile 返回 null = 这台设备没有这个概念，空值原样往上传，不许自己编一个档位。
+            mode = str("AclMode").ifEmpty { commandProfile.aclDefaultMode().orEmpty() },
             black = zipAcl(str("BlackMacList"), str("BlackNameList")),
             white = zipAcl(str("WhiteMacList"), str("WhiteNameList")),
         )
@@ -343,7 +347,10 @@ class GoformWifiClient(
     ): WriteOutcome = writer.writeChecked(
         SettingKey.WIFI_ACL,
         mapOf(
-            "mode" to (mode?.takeIf { it.isNotBlank() } ?: ZteGoformProfile.ACL_MODE_BLACKLIST),
+            // 不在这里兜底档位（2026-09-25）：`SettingKey.WIFI_ACL` 的 encode 本来就做了
+            // 同一件事（缺 mode → profile 的默认档位）。两处都兜的后果是「改了 profile 却
+            // 被客户端这一层的硬编码盖住」—— 判据只该有一份，留在 profile 那边。
+            "mode" to mode?.takeIf { it.isNotBlank() },
             "black_macs" to black.map { it.mac },
             "black_names" to black.map { it.name },
             "white_macs" to white.map { it.mac },

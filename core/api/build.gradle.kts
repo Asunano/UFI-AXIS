@@ -40,6 +40,11 @@ dependencies {
     implementation(project(":core:contract"))
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
+    // 2026-09-25：`WriteOutcome` 从 :core:goform 搬到 :core:device-spi 之后显式声明。
+    // 它出现在本模块 `CallJsonExt` 的**公开扩展签名**上，属于直接依赖 ——
+    // 靠 goform 的 `api(":core:device-spi")` 传递可见的话，goform 哪天把它改成
+    // implementation，本模块就会莫名编译不过（口径同 :core:controller 的那段说明）。
+    implementation(project(":core:device-spi"))
     implementation(project(":core:collector"))
     implementation(project(":core:cache"))
     implementation(project(":core:controller"))

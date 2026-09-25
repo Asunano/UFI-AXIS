@@ -2,6 +2,7 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.SettingKey
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.AppLogger
 
 

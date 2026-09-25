@@ -162,6 +162,25 @@ interface DeviceProfile {
     fun nrAllBandsMask(): String? = null
 
     /**
+     * WiFi 接入控制（ACL）在设备**没有上报 mode 字段**时该按哪个档位理解。
+     *
+     * ## 语义：`null` ≠ 空串
+     *
+     * - 返回**非空串** = 这台设备的 ACL 有一个默认生效档位（ZTE F50 = `"2"`，黑名单）。
+     *   读侧拿不到 mode 时用它兜底，于是「设备省略了这个字段」不会被渲染成「没有模式」。
+     * - 返回 `null` = 这台设备没有这个概念，或者它的 mode 一定会上报。
+     *   调用方遇到 `null` **保持空值原样往上传**，不许自己编一个档位出来。
+     *
+     * ## 为什么这一条必须进 profile
+     *
+     * 2026-09-25 之前 `GoformWifiClient` 有两处直接写 `ZteGoformProfile.ACL_MODE_BLACKLIST`，
+     * **绕过了 commandProfile 这条唯一通道**。换设备之后它仍然拿 ZTE 的 `"2"` 兜底，
+     * 而 `"2"` 在别家设备上可能是白名单、也可能压根没有这个字段 ——
+     * 结果是界面显示「黑名单生效」而设备其实在放行所有人。这种错没有任何测试会变红。
+     */
+    fun aclDefaultMode(): String? = null
+
+    /**
      * 短信规则。不支持短信的设备返回 null（对应 `Capability.SMS` 缺失）。
      *
      * ## 为什么短信不走 [SettingKey] + [WriteSpec]（计划书 §11.2，已决）

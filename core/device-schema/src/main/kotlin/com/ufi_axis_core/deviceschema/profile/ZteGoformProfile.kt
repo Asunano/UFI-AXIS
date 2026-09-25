@@ -814,6 +814,17 @@ object ZteGoformProfile : DeviceProfile {
     override fun nrAllBandsMask(): String = "1,5,8,28,41,78"
 
     /**
+     * ACL 默认档位 = [ACL_MODE_BLACKLIST]（`"2"`，黑名单）。
+     *
+     * 判据来自抓包：F50 的「拉黑」与「取消拉黑」下发的都是 `AclMode=2`，区别只在名单内容；
+     * 读回时设备偶尔不带 `AclMode` 键，此时按 2 理解与设备的实际行为一致。
+     *
+     * 2026-09-25 搬家：此前 `GoformWifiClient` 两处直接读 `ZteGoformProfile.ACL_MODE_BLACKLIST`，
+     * 绕过了 commandProfile。现在改由本方法提供，换插件即换取值。
+     */
+    override fun aclDefaultMode(): String = ACL_MODE_BLACKLIST
+
+    /**
      * 短信规则在单独的 [ZteSmsSpec] 里（本文件已经 1300+ 行，而短信那套规则自成一体）。
      *
      * 为什么不进 [WRITE_SPECS]：`sms_time` 让 encode 不纯、下发后还要回读确认、

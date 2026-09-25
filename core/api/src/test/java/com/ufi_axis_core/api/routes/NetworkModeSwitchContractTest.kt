@@ -2,7 +2,7 @@ package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.contract.NetworkMode
-import com.ufi_axis_core.controller.goform.WriteOutcome
+import com.ufi_axis_core.devicespi.WriteOutcome
 import io.ktor.client.request.post
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode

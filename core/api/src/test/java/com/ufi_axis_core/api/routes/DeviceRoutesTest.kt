@@ -3,7 +3,7 @@ package com.ufi_axis_core.api.routes
 import androidx.test.core.app.ApplicationProvider
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.controller.goform.GoformDeviceClient
-import com.ufi_axis_core.controller.goform.WriteOutcome
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.AppSettings
 import io.ktor.client.request.get
 import io.ktor.client.request.post

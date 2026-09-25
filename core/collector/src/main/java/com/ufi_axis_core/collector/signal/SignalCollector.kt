@@ -8,7 +8,6 @@ import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldNormalizer
 import com.ufi_axis_core.deviceschema.ServingCell
-import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -41,7 +40,14 @@ import kotlinx.serialization.json.jsonPrimitive
 class SignalCollector(
     private val signalClient: GoformSignalClient?,
     private val telephonyCollector: TelephonyCollector,
-    private val profile: DeviceProfile = ZteGoformProfile
+    /**
+     * 字段映射表。**非空、无默认值** —— 2026-09-25 去掉了原来的 `= ZteGoformProfile`。
+     *
+     * 为什么不留默认值：那个默认值等于「漏传就按 ZTE F50 处理」。接第二台设备时漏传一处，
+     * 得到的不是编译错误而是**用别家设备的字段名去解析本机响应**，结果是整片读数静默为空。
+     * 选型的唯一出口是 `DeviceRuntime`，这里必须由装配层显式注入。
+     */
+    private val profile: DeviceProfile
 ) {
     private var lastTelephonyQueryAt = 0L
     private val telephonyCooldownMs = 15_000L // 2026-08-24: 限制 Telephony API 频率，防止系统 Cursor 泄漏

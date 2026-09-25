@@ -151,6 +151,10 @@ dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
+    // 2026-09-25：`WriteOutcome` 从 :core:goform 搬到 :core:device-spi 之后显式声明。
+    // 本模块的 `ActionExecutorImpl` 直接用它，装配层还直接用 DeviceRuntime / DevicePlugin /
+    // PlatformAdapter / DeviceTuning —— 全是直接依赖，不该靠 goform 的 api 传递。
+    implementation(project(":core:device-spi"))
     // 设备适配层：profile 选型在 ComponentFactory 里做（计划书 3.2）
     implementation(project(":core:device-schema"))
     // 设备插件注册表。**装配层是唯一知道「有哪些插件」的地方**（计划书 3.3）：

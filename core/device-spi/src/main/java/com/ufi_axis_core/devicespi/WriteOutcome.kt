@@ -1,4 +1,4 @@
-package com.ufi_axis_core.controller.goform
+package com.ufi_axis_core.devicespi
 
 /**
  * 写入结果三态（计划书 9.5）。
@@ -8,9 +8,11 @@ package com.ufi_axis_core.controller.goform
  * 只能靠翻 core 日志。这里把"被 [com.ufi_axis_core.deviceschema.WriteSpec.validate]
  * 拒绝"单独拆出来，route 才能回 400 + `OUT_OF_RANGE` + 具体原因。
  *
- * 为什么放在 `:core:goform`：它出现在本模块公开方法的返回类型上，而
- * `:core:api` / `:core:controller` / `:core` 只依赖 `:core:goform`（不依赖 device-schema，
- * 也拿不到它 `implementation` 进来的 contract），放别处调用方会看不见类型。
+ * 为什么搬到 `:core:device-spi`（2026-09-25 从 `:core:goform` 迁入）：设备适配接口
+ * （`DeviceAdapter` 及其六个域接口）定在本模块，**写侧方法的返回类型就是本类型** ——
+ * 而 `core/device-spi/build.gradle.kts` 的硬性约束写明本模块不得依赖 `:core:goform`
+ * （goform 反过来依赖本模块，加进来立刻成环）。类型留在 goform 的话，适配接口的签名
+ * 根本写不出来，所以它必须住在 device-spi。
  */
 sealed interface WriteOutcome {
 
@@ -33,11 +35,11 @@ sealed interface WriteOutcome {
     data object Failed : WriteOutcome
 
     /**
-     * 命令**没有被设备受理**：会话失效（core 已按 [GoformWritePolicy] 重登并重试过一次，
+     * 命令**没有被设备受理**：会话失效（core 已按 `GoformWritePolicy`（在 :core:goform）重登并重试过一次，
      * 仍然失效），或与设备的传输层就断了（连不上 / 超时）。
      *
      * 与 [Failed] 的分界是「固件有没有收下这条命令」，而不是「有没有报错」，
-     * 完整判据见 [GoformWriteResult]。这一态语义上**可重试** —— 用户稍后再操作一次是有
+     * 完整判据见 `GoformWriteResult`（在 :core:goform）。这一态语义上**可重试** —— 用户稍后再操作一次是有
      * 意义的 —— 所以 route 该回 503 `UNAVAILABLE`，不要回 500：500 在客户端只会显示成
      * 「服务器内部错误」，用户无从判断该不该再点一次，这正是网络制式"第一次必失败"
      * 被误报成服务端故障的原因。

@@ -4,6 +4,7 @@ import com.ufi_axis_core.deviceschema.RetryPolicy
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.WriteSpec
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
+import com.ufi_axis_core.devicespi.WriteOutcome
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

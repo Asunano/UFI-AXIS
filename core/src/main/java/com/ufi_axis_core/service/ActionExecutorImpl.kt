@@ -3,12 +3,12 @@ package com.ufi_axis_core.service
 import com.ufi_axis_core.controller.goform.GoformDeviceClient
 import com.ufi_axis_core.controller.goform.GoformNetworkClient
 import com.ufi_axis_core.controller.goform.GoformWifiClient
-import com.ufi_axis_core.controller.goform.WriteOutcome
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.contract.NetworkMode
 import com.ufi_axis_core.core.scheduler.ActionExecutor
 import com.ufi_axis_core.core.scheduler.ActionResult
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean

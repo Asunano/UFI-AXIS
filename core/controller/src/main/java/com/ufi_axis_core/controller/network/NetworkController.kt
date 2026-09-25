@@ -6,8 +6,8 @@ import android.net.NetworkCapabilities
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.controller.goform.GoformNetworkClient
 import com.ufi_axis_core.controller.goform.GoformWifiClient
-import com.ufi_axis_core.controller.goform.WriteOutcome
 import com.ufi_axis_core.devicespi.PlatformAdapter
+import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.coroutines.sync.withLock
