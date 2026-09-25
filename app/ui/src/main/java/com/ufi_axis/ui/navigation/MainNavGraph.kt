@@ -44,7 +44,6 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -65,13 +64,14 @@ import com.ufi_axis.ui.animation.page.LocalUfiBlurEnabled
 import com.ufi_axis.ui.animation.page.UfiPageTransitions
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.page.registerBuiltInTransitions
-import com.ufi_axis.ui.components.common.CAPSULE_BOTTOM_MARGIN
-import com.ufi_axis.ui.components.common.CAPSULE_SHADOW_ROOM
 import com.ufi_axis.ui.components.common.CapsuleBlurHost
 import com.ufi_axis.ui.components.common.CapsuleInsetHolder
 import com.ufi_axis.ui.components.common.CapsuleTabItem
 import com.ufi_axis.ui.components.common.CapsuleTouchGate
+import com.ufi_axis.ui.components.common.DOCK_CONTENT_MIN_HEIGHT
 import com.ufi_axis.ui.components.common.LocalCapsuleBottomInset
+import com.ufi_axis.ui.components.common.dockSurfaceColor
+import com.ufi_axis.ui.components.common.UfiBottomDock
 import com.ufi_axis.ui.components.common.UfiCapsuleTabBar
 import com.ufi_axis.ui.components.common.ufiCapsuleBottomInset
 import com.ufi_axis.ui.theme.Spacing
@@ -106,10 +106,15 @@ private val BOTTOM_TABS = listOf(
 
 private val TAB_ROUTES = BOTTOM_TABS.map { it.route }
 
-// 胶囊的两个几何常量（[CAPSULE_BOTTOM_MARGIN] 距导航栏顶边的视觉间距 / [CAPSULE_SHADOW_ROOM] 投影留白）
-// 现在的**单一真源**在 `UfiCapsuleBlurHost.kt`：窗口层（gravity + y 偏移 + 模糊区 inset）
-// 与内容层（本文件的 padding）必须用同一组数值，两处各写一份迟早漂移。
-// 这里只 import 使用，不再本地定义。
+// ★ 已删除（2026-09-24，贴底通栏低栏迁移阶段 2.2）：
+//   `import CAPSULE_BOTTOM_MARGIN`（胶囊距预留区顶边的 8dp 安全间距，历史别名）与
+//   `import CAPSULE_SHADOW_ROOM`（胶囊四周投影留白，恒 0.dp）。
+//
+// 这两个常量原本是「窗口层（gravity + y 偏移）与内容层（本文件的 padding）必须用同一组
+// 数值」的单一真源。通栏形态下窗口是 MATCH_PARENT 宽 + gravity=BOTTOM + y=0：
+// 没有抬升、没有四周投影、也没有「离热区多远」这个问题（热区那条带子就是栏自己的一部分），
+// 两个概念一起退休，源头的声明已在 `UfiCapsuleBlurHost.kt` 删除并留下完整说明。
+// 见 `docs/bottom-dock-migration-plan.md` §2.1 / §2.5。
 
 /**
  * 胶囊导航栏**收起**时长（毫秒）。★ 全库唯一一处刻意不在 [UfiMotion.Duration] 梯度上的时长。
@@ -127,33 +132,65 @@ private val TAB_ROUTES = BOTTOM_TABS.map { it.route }
 private const val CAPSULE_HIDE_MS = 360
 
 /**
+ * 底部栏形态开关：`true` = 贴底通栏低栏 [UfiBottomDock]，`false` = 悬浮胶囊 [UfiCapsuleTabBar]。
+ *
+ * ## 为什么要有这个开关
+ * 两种形态的几何假设是**互斥**的（见 `docs/bottom-dock-migration-plan.md`）：
+ * 胶囊是 wrap-content 窗口 + `LayoutParams.y` 抬起 + 四周一圈投影留白；
+ * 通栏是 MATCH_PARENT 宽 + `gravity=BOTTOM` + `y=0` + 安全区靠栏内 Spacer 让位。
+ * 原地改写就没有退路了；并存一段才能装包逐项对比、真机出问题时一行回退。
+ *
+ * ## ⚠ `false` 分支已不是回退位
+ * 窗口层（MATCH_PARENT / `gravity=BOTTOM` / `y=0`）、页面 inset（实测总高与「58 + 安全区」
+ * 取较大值）、进出场（纵向滑动）都已切到通栏口径。此时翻回 `false` 会得到
+ * **贴死屏幕底边、不再悬浮的胶囊**，且页面底部留白按通栏算 —— 是个错位的中间态。
+ * 真要回退请整批 revert 阶段 2，而不是只翻这个开关。
+ * 它留到阶段 3 只为「旧实现还在、可对照读代码」，届时连开关一起删。
+ */
+private const val USE_BOTTOM_DOCK = true
+
+/**
  * 底部导航栏。
  *
  * 方案 A′ 迁移后改为 **selectedIndex 驱动**：5 个 Tab 已收敛进 [Routes.MAIN] 单一目的地，
  * 不再能通过 `currentRoute` 区分选中项。
  *
- * 渲染委托给悬浮胶囊组件 [UfiCapsuleTabBar]：这里只负责水平居中，
- * 选中态动画 / 滑块指示器 / 名称延时收起等全部由该组件内部自洽处理。
+ * 两种形态二选一挂载，见 [USE_BOTTOM_DOCK]。选中态动画 / 滑块指示器 / 名称显隐等
+ * 全部由被挂载的那个组件内部自洽处理。
  *
- * 注意：**不再自带 `padding(bottom = …)`**。胶囊活在独立的 `Dialog` 窗口里，底部边距
- * （系统导航栏高度 + [CAPSULE_BOTTOM_MARGIN]）由窗口层的 `LayoutParams.y` 统一提供
- * （见 [CapsuleBlurHost]）；若两处都留白会造成双重偏移，胶囊被顶得过高。
+ * 注意：**不自带 `padding(bottom = …)`**。底栏活在独立的 `Dialog` 窗口里，与屏幕底边的
+ * 关系全部由窗口层负责（见 [CapsuleBlurHost]）：
+ * - 2026-09-24 之前（悬浮胶囊）：`LayoutParams.y` = 系统预留区 + 安全间距 8dp + 抬高 30dp；
+ * - 现在（贴底通栏）：`y = 0`，栏自己铺到屏幕真实底边，安全区由**栏内 Spacer** 让位。
+ * 两种形态下在这里再留一次白都会造成双重偏移。
  *
- * 另注意：这里**不再 `fillMaxWidth()`**。此 Composable 整体活在 Dialog 窗口里，且该窗口
- * 是 wrap-content（`usePlatformDefaultWidth = false` + `setLayout(WRAP_CONTENT, …)`），
- * 撑满宽度会让窗口横贯整屏 —— 既会拉出一条全宽的模糊带，也会把整条底部的触摸区域圈进
- * 窗口矩形内（`FLAG_NOT_TOUCH_MODAL` 只放行**窗口之外**的触摸），胶囊之外的点击就穿不下去了。
- *
- * 仅保留 [CAPSULE_SHADOW_ROOM] 一圈留白给投影：窗口紧贴内容，`shadow(10.dp)` 画到窗口外
- * 的部分会被裁掉。这圈留白在窗口层被 `InsetDrawable` 从模糊区里扣回去，所以模糊仍≈胶囊本体。
+ * 另注意：通栏形态下窗口已是 `MATCH_PARENT` 宽，所以本层**不再需要**「不许 fillMaxWidth」
+ * 那条旧约束（它当年的理由是：wrap-content 窗口一撑满宽度就会把整条底部触摸圈进窗口矩形，
+ * 而 `FLAG_NOT_TOUCH_MODAL` 只放行窗口**之外**的触摸）。通栏就是要占满那条带子；
+ * 二级页整块穿透改由 [CapsuleTouchGate] 的 `FLAG_NOT_TOUCHABLE` 保证（计划 §5.4）。
  */
 @Composable
 private fun AppBottomNavigation(
     selectedIndex: Int,
     onTabSelected: (Int) -> Unit
 ) {
+    val tabs = BOTTOM_TABS.map { CapsuleTabItem(it.route, it.label, it.icon) }
+
+    if (USE_BOTTOM_DOCK) {
+        UfiBottomDock(
+            tabs = tabs,
+            selectedIndex = selectedIndex,
+            onTabSelected = onTabSelected
+        )
+        return
+    }
+
+    // ★ 已删除（2026-09-24，迁移阶段 2.2）：这里原来套着 `Modifier.padding(CAPSULE_SHADOW_ROOM)`。
+    //   那圈留白是给胶囊 `shadow(10.dp)` 画到 wrap-content 窗口外留的余量（取值已长期为 0.dp，
+    //   只剩「与窗口层共用同一个数」这一个语义）。通栏形态没有四周投影
+    //   （只有顶边发丝线 + 上缘高光，都画在自己边界之内），而窗口也已是 MATCH_PARENT ——
+    //   留着它会在栏左右各留一道空隙，通栏就不通了。常量本体已在 `UfiCapsuleBlurHost` 删除。
     Box(
-        modifier = Modifier.padding(CAPSULE_SHADOW_ROOM),
         contentAlignment = Alignment.Center
     ) {
         // ★ 胶囊的淡色底 **归属 Compose 内容层**：它画在 UfiCapsuleTabBar 内部、
@@ -164,7 +201,7 @@ private fun AppBottomNavigation(
         //   一旦挂上 drawable 会复活「胶囊外圈 1px 细线」与「浮窗退回不透明黑底」两个真机 bug。
         //   回归护栏：CapsuleRegressionGuardTest.capsuleBackground_mustBeContentLayer。
         UfiCapsuleTabBar(
-            tabs = BOTTOM_TABS.map { CapsuleTabItem(it.route, it.label, it.icon) },
+            tabs = tabs,
             selectedIndex = selectedIndex,
             onTabSelected = onTabSelected
         )
@@ -187,6 +224,8 @@ private fun AppBottomNavigation(
  *
  * @param screens      路由 → 屏幕内容的映射表。
  * @param themeManager 提供 `pageTransition` 设置项（用户在设置页选择的切换动画 id）。
+ * @param suppressCapsule 强制隐藏底部胶囊（当前唯一用途：启动加载页期间）。
+ *   胶囊在独立 Dialog 窗口里，主窗口的全屏浮层盖不住它，只能从这里关。
  */
 @Composable
 // SharedTransitionLayout / SharedTransitionScope 仍是实验 API（androidx.compose.animation 1.10）。
@@ -197,7 +236,8 @@ fun MainNavGraph(
     themeManager: ThemeManager,
     navController: NavHostController,
     pendingSmsPhone: MutableState<String?> = mutableStateOf(null),
-    pendingAlertDeepLink: MutableState<String?> = mutableStateOf(null)
+    pendingAlertDeepLink: MutableState<String?> = mutableStateOf(null),
+    suppressCapsule: Boolean = false
 ) {
     // 装配 T03 六种内置策略。幂等且线程安全，重复调用无副作用。
     // 必须早于任何 UfiPageSwitcher 首次组合，否则 byId() 只能查到 T01 的安全 Fade 兜底，
@@ -266,7 +306,12 @@ fun MainNavGraph(
 
 
     // 只有停留在宿主目的地时才显示底部栏；detail 页仍然隐藏。
-    val showBottomBar = currentRoute == Routes.MAIN
+    //
+    // [suppressCapsule]：启动加载页期间也要藏。胶囊活在**独立的 Dialog 窗口**里
+    //（见下方 ~800 行的说明），窗口层级高于 Activity 主窗口，所以主窗口里那个
+    // 铺满屏幕的启动浮层**盖不住它** —— 不从这里关掉，加载页上会浮着一条胶囊。
+    val showBottomBar = currentRoute == Routes.MAIN && !suppressCapsule
+
 
     // ★ 2026-09-16（二级页底部控件点不动）：把「胶囊此刻该不该吃触摸」下发到窗口层。
     //
@@ -706,28 +751,42 @@ fun MainNavGraph(
 
 
 
-            // 悬浮胶囊 overlay 浮层（不再占 innerPadding，避免遮挡页面内容）
+            // 底栏 overlay 浮层（不占 innerPadding，避免遮挡页面内容）
             //
-            // 底部留白不再由这里换算：胶囊现在活在自己的 Dialog 窗口里，
-            // 距底偏移（导航栏高度 + CAPSULE_BOTTOM_MARGIN - CAPSULE_SHADOW_ROOM）
-            // 由 CapsuleBlurHost 直接写进 WindowManager.LayoutParams.y。
+            // 底部留白不由这里换算：底栏活在自己的 Dialog 窗口里，窗口几何全部由
+            // CapsuleBlurHost 写进 WindowManager.LayoutParams。
+            // 2026-09-24 起那份几何是「MATCH_PARENT 宽 + gravity=BOTTOM + y=0」；
+            // 在此之前是「wrap-content + y = 导航栏高度 + CAPSULE_BOTTOM_MARGIN − CAPSULE_SHADOW_ROOM」，
+            // 两个常量已随抬升语义一起删除（见文件顶部那段说明）。
             //
             // 注意：这里**不再**注入任何「胶囊模糊」开关。窗口级真模糊已被彻底移除
             // （连同其「每帧缩放窗口矩形」的配套方案 —— 那是动画卡顿与胶囊自激塌缩的根因），
             // 胶囊的玻璃观感改由 UfiCapsuleTabBar 的 frosted 渐变背景层恒定承担，
             // 因此驱动它的用户开关与 CompositionLocal 一并废弃，避免留下无效的死开关。
-            // 胶囊 hide/show 改为手动画（graphicsLayer + Animatable）：
-            // - show：p=0（scale 0 + alpha 0 + translationY=bottomEdgePx，缩在屏幕底部边缘）→ p=1（scale 1 + alpha 1 + translationY=0，
-            //   idle 0.86 经内部 graphicsLayer 复合 → idle 态无跳变），tween 420ms 慢-快-慢；
-            // - hide：反向向下方收缩（底边锚定 + translationY 补偿，p→0 时缩进屏幕底部边缘 + 渐隐），tween 360ms 慢-快-慢。
-            // 不用 AnimatedVisibility 的 scaleOut(0f)+slideOutVertically：那会在 Dialog 内视觉上"吸回中心"而非向下方。
+            // 底栏 hide/show 是手动画（graphicsLayer + Animatable）：
+            // - show：p=0（translationY = 栏总高，整条藏在屏幕底边之下）→ p=1（translationY=0），
+            //   tween Sweeping(320) 慢-快-慢；
+            // - hide：反向整条向下滑出，tween 360ms 慢-快-慢。
+            // 不用 AnimatedVisibility 的 slideOutVertically：那会在 Dialog 内按**窗口**尺寸算位移，
+            // 而我们要的是按栏自身总高算。
+            //
+            // ★ 2026-09-24（迁移阶段 2.2，计划 §5.5）：进出场由「从底部中心缩放」改成**纵向滑动**。
+            //   旧实现是 `scaleX/scaleY = p` + `transformOrigin = TransformOrigin(0.5f, 1f)`，
+            //   那是为**悬浮胶囊**设计的：一块四周都有空隙的浮块，缩放才读得出「浮出/收回」。
+            //   贴底通栏是一条横贯整屏、下边与屏幕底边重合的带子 —— 缩放会把它缩成屏幕正下方
+            //   一小块，两侧露出页面，观感完全不对。整条上下滑进滑出才是底栏的语言。
             val showCapsule = remember { mutableStateOf(showBottomBar) }
             val enterProgress = remember { Animatable(if (showBottomBar) 1f else 0f) }
-            // 屏幕底部边缘：底部系统 inset（导航栏/手势条）+ 悬浮抬高(lift≈30dp)+安全间距(gap≈8dp)。
-            // 缩放时以此补偿，使胶囊底边一路下移到屏幕底部边缘，而不是停在悬浮位。
+            // 滑动距离 = **栏总高** = 内容区 58dp + 底部安全区（§1 参数表）。
+            //
+            // ★ 2026-09-24：原式是 `safeDrawing.getBottom(density) + 38.dp`，那个 38
+            //   照抄的是胶囊的「抬高 30dp + 安全间距 8dp」—— 贴底之后这一项必须归 0，
+            //   否则栏会从屏幕外 38dp 处开始动（计划 §2.5 / §7-2.2）。
+            //   剩下的两项换成栏自己的总高：safeDrawing 的 bottom 就是安全区那一段，
+            //   再加内容区高度 [DOCK_CONTENT_MIN_HEIGHT]（**复用通栏组件的常量，不另写 58**）。
             val density = LocalDensity.current
-            val bottomEdgePx = WindowInsets.safeDrawing.getBottom(density) +
-                with(density) { 38.dp.toPx() }   // 38 ≈ 悬浮抬高 30dp + 安全间距 8dp
+            val dockTotalHeightPx = WindowInsets.safeDrawing.getBottom(density) +
+                with(density) { DOCK_CONTENT_MIN_HEIGHT.toPx() }
             LaunchedEffect(showBottomBar) {
                 // ★★ 2026-09-05（胶囊与实际页面错位）：**挂载不得延后** ★★
                 //
@@ -776,31 +835,44 @@ fun MainNavGraph(
                 // 胶囊活在独立 Dialog Window 里，转场中途 addView/removeView 一个窗口会带来
                 // 一帧与 Activity 窗口不同步的合成（窗口测量、背景、系统栏对比层都在那一帧生效）。
                 // 现在窗口从第一次进入 MAIN 起常驻，导航过程中不再有窗口增删：
-                // 隐藏只把 p 动到 0（scale/alpha 归零、不绘制像素），窗口留着。
-                // 代价：detail 页上多一个 wrap-content 的透明小窗 —— 它带
-                // FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCH_MODAL（CapsuleBlurHost 施加），不吃触摸。
+                // 隐藏只把 p 动到 0（整条滑出屏幕底边 + alpha 归零、不绘制像素），窗口留着。
+                // 代价：detail 页上多一个通栏宽的透明窗 —— 它带
+                // FLAG_NOT_FOCUSABLE|FLAG_NOT_TOUCH_MODAL，且隐藏期由 CapsuleTouchGate 补
+                // FLAG_NOT_TOUCHABLE（通栏后窗口更宽，这条 gate 比改造前更重要，计划 §5.4）。
             }
 
+            // ★ 2026-09-24：此处曾有一条「由主窗口补画手势区带子」的绘制，已删除。
+            //
+            // 当时的假设是「底栏那个 floating Dialog 窗口在 Android 15/16 上被 DecorView 吃掉
+            // 系统 inset、铺不到屏幕底边」，所以让主窗口补一条同色带子。诊断版（洋红/青色双色
+            // 标记）在真机上证伪了这个假设：**青色完全盖住洋红**，底栏窗口本来就铺到了底边。
+            // 真因是那个窗口缺 `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS`，导致透明 navigationBarColor
+            // 空转、系统补了一条不透明导航栏底色（见 `UfiCapsuleBlurHost.CAPSULE_WINDOW_FLAGS_ON`）。
+            // 补画那条带子与栏自己的安全区 Spacer 同色同高同位置，是纯重复绘制，故一并移除；
+            // 跨窗口传值用的 `CapsuleInsetHolder.bottomReservedDp` 也随之删除。
+
+
+
             if (showCapsule.value) {
-                // 用 Dialog（而非 Popup）承载胶囊：Dialog 才有 Window 对象，才能在窗口层
-                // 统一施加触摸穿透 flag、底部锚定与透明背景 —— 这是「常驻底部浮层 + 窗外
-                // 点击穿透」的实现基础。（整屏模糊的 FLAG_BLUR_BEHIND 对胶囊**永久禁用**；
+                // 用 Dialog（而非 Popup）承载底栏：Dialog 才有 Window 对象，才能在窗口层
+                // 统一施加触摸穿透 flag、底部锚定与透明背景 —— 这是「常驻底部浮层 + 栏以上
+                // 点击穿透」的实现基础。（整屏模糊的 FLAG_BLUR_BEHIND 对本窗口**永久禁用**；
                 // 窗口内背景模糊也已移除，见 CapsuleBlurHost。）
                 //
-                // usePlatformDefaultWidth = false ⇒ 解除平台默认宽度约束，窗口尺寸由内容
-                // 决定；胶囊是 wrap-content，于是拿到紧贴胶囊的小窗（窗外点击可穿透）。
-                // 写成 true 会被撑成平台默认全宽 —— 吞掉整条底部点击，正是要避免的事故。
+                // usePlatformDefaultWidth = false ⇒ 解除平台默认宽度约束，宽度由我们自己
+                // 在 LayoutParams 里说了算。2026-09-24 起那个值是 **MATCH_PARENT**（通栏）；
+                // 在此之前是 wrap-content（紧贴胶囊的小窗，让胶囊左右的点击能穿透）。
+                // 仍然不能写成 true —— 那会交回平台去决定宽度，我们就失去了对窗口矩形的控制。
                 //
                 // decorFitsSystemWindows = false ⇒ 窗口**不**被系统栏安全区约束。
                 // 写成 true 时窗口被夹在安全区内，系统会把手势小白条那条带子当成本窗口的
-                // 装饰区填成白色遮罩，同时把胶囊整体顶高 —— 真机现象就是「胶囊在屏幕下边框
-                // 被截断 + 底部一条白边」。改为 false 后，导航栏高度改由 CapsuleBlurHost
-                // 通过 WindowInsets.navigationBars 动态读取并写进 LayoutParams.y
-                // （配合 FLAG_LAYOUT_NO_LIMITS + 透明 navigationBarColor），偏移量精确可控。
+                // 装饰区填成白色遮罩，同时把栏整体顶高 —— 真机现象就是「底栏在屏幕下边框
+                // 被截断 + 底部一条白边」。改为 false 后（配合 FLAG_LAYOUT_NO_LIMITS +
+                // 透明 navigationBarColor），窗口能一路铺到屏幕真实底边，正是贴底通栏的前提。
                 //
-                // 触摸穿透红线（FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL）、窗口
-                // wrap-content、底部 gravity/偏移，全部由 CapsuleBlurHost 在窗口层统一施加。
-                // 胶囊常驻不可关闭，故两个 dismiss 开关都关掉。
+                // 触摸穿透红线（FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL）、窗口宽高、
+                // 底部 gravity 与 y=0，全部由 CapsuleBlurHost 在窗口层统一施加。
+                // 底栏常驻不可关闭，故两个 dismiss 开关都关掉。
                 Dialog(
                     onDismissRequest = { /* 常驻浮层，不可关闭 */ },
                     properties = DialogProperties(
@@ -815,8 +887,8 @@ fun MainNavGraph(
                     // 覆盖的全局缩放 density 冲掉 —— 现象就是"全局都缩了，只有胶囊没缩"。
                     // 自定义 local（LocalResolvedPalette / LocalUfiUiScale）不在平台那份重置列表里，
                     // 所以颜色能继承、density 不能，必须在这里显式补一次。
-                    // 必须包在 CapsuleBlurHost **外面**：它自己也读 LocalDensity 来算窗口 y 偏移
-                    // （抬高 / 导航栏 inset），一并跟随缩放才不会与胶囊本体错位。
+                    // 必须包在 CapsuleBlurHost **外面**：它自己也读 LocalDensity 做 dp↔px 换算
+                    // （安全区 reservedPx → dp、窗口圆角），一并跟随缩放才不会与栏本体错位。
                     UfiInheritUiScale {
                     CapsuleBlurHost {
                         // 2026-08-23 性能优化：以 lambda 形式下发进度。
@@ -833,18 +905,20 @@ fun MainNavGraph(
                                     // 是转场期掉帧/抖动的一个来源。graphicsLayer 的 block 在图层阶段执行，
                                     // 在这里读只订阅这一层，零重组。
                                     val p = enterProgress.value
-                                    scaleX = p
-                                    scaleY = p
-                                    // 渐入渐出：p=0 全透明 → p=1 不透明，叠加在缩放+位移上。
+                                    // 渐入渐出：叠在纵向位移上。留着它是**可见性保险** ——
+                                    // 只靠 translationY 时，隐藏态是否真的一个像素都不画取决于
+                                    // 窗口裁剪；alpha=0 让「二级页上完全不可见」成为无条件事实。
                                     alpha = p
-                                    transformOrigin = TransformOrigin(0.5f, 1f)
-                                    // 收缩/弹出都锚定「屏幕底部边缘」：胶囊底边到屏幕底的物理距离
-                                    // ≈ 底部 inset（导航栏/手势条）+ 悬浮抬高(lift≈30dp)+安全间距(gap≈8dp)。
-                                    // p→0 时胶囊整体下移 bottomEdgePx 同时缩到 0 → 视觉「缩进屏幕底部边缘」；
-                                    // p→1 时从屏幕底部边缘向上弹入（与收缩互为镜像）。
-                                    // ⚠ 只在 MainNavGraph 使用：护栏 collapseOrigin_mustNotBeBottom
-                                    // 只检查 UfiCapsuleTabBar.kt，本文件不受限。
-                                    translationY = (1f - p) * bottomEdgePx
+                                    // ★ 纵向滑动（§5.5）：p→0 时整条下移一个栏总高、滑到屏幕底边
+                                    //   之下；p→1 时从底边之下滑回原位。两者互为镜像。
+                                    // ★ 已删除：`scaleX/scaleY = p` 与
+                                    //   `transformOrigin = TransformOrigin(0.5f, 1f)`。
+                                    //   「从底部中心缩放」是悬浮胶囊的进出场语言，贴底通栏用它会
+                                    //   缩成屏幕正下方一小块、两侧漏出页面（理由见上方 val 处注释）。
+                                    //   顺带说明：护栏 collapseOrigin_mustNotBeBottom 只检查
+                                    //   UfiCapsuleTabBar.kt，本文件当年用 TransformOrigin(0.5f,1f)
+                                    //   并不违规；现在连用都不用了。
+                                    translationY = (1f - p) * dockTotalHeightPx
                                 }
                             ) {
                                 AppBottomNavigation(

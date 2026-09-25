@@ -39,6 +39,20 @@ package com.ufi_axis.viewmodel.module
 const val FOREGROUND_REFRESH_INTERVAL_MS: Long = 10_000L
 
 /**
+ * 网络页整套数据（信号 / 网络状态 / WiFi / 频段 / 基站 / LAN / 身份）的新鲜度窗口（ms）。
+ *
+ * 比 [FOREGROUND_REFRESH_INTERVAL_MS] 长得多，因为**这一页没有轮询**：它的数据不是"随时在变
+ * 的读数"，而是配置类字段（网络模式、频段锁定、LAN 段、本机号码）。取 30s 是对着 core 端
+ * 那几个响应缓存的 TTL 定的 —— `CELL_INFO` 20s 是里面最短的一档，再短就只是在打一个必定
+ * 命中 core 缓存的请求。
+ *
+ * 这个窗口就是"切到网络页要不要重新发那 6 个请求"的唯一判据（见 `NetworkModule.loadNetworkAll`）。
+ * 调小 = 切页更容易触发重拉，调大 = 切回去看到的数据可能更旧。
+ */
+const val NETWORK_ALL_FRESH_MS: Long = 30_000L
+
+
+/**
  * 前台化时「第一次请求还要等多久」（ms，纯函数，可单测）。
  *
  * `0` = 立刻请求（数据从未拉取过 / 已过期）；`> 0` = 数据仍新鲜，返回的是**剩余新鲜时长**，

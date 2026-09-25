@@ -120,12 +120,54 @@ object AudioQueueOwner {
 
     fun set(value: AudioQueueScope) {
         scope = value
+        // 重装队列 = 这一份是从作用域新鲜生成的，之前的自定义顺序已经不存在了
+        userEdited = false
     }
 
     /** 队列被清空/失效时调用（目前只有单曲兜底那条路径需要）。 */
     fun clear() {
         scope = null
+        userEdited = false
     }
+
+    // ── 「用户改过队列」标记（2026-09-23）─────────────────────────────────────
+    //
+    // ## 这是整个「虚拟播放列表」功能的生死线
+    // 播放页装队列时的判据本来是「作用域一致 **且** 队列内容与作用域推导出的列表逐项相等」。
+    // 用户一旦插一首（「下一首播放」）、移一首、或拖拽排过序，两边就不再相等 →
+    // 走 `setUfiAudioPlaylist` 全量重装 → **自定义顺序当场被抹掉**。
+    //
+    // 更要命的是「下一首播放」插进来的歌**很可能根本不在当前作用域里**
+    //（从专辑 A 插一首专辑 B 的歌），那样"逐项相等"永远不可能成立，
+    // 每次回到播放页都会重装一次。所以这个标记不是优化，是功能能不能存在的前提。
+    //
+    // ## 为什么它必须**跟队列一起持久化**
+    // 只持久化队列、不持久化这个标记，进程重启后标记回到 false，
+    // 下一次进播放页照样被作用域重装 —— 持久化白做。
+    // 写盘/读盘在 `UfiAudioQueueStore`，这里只是进程内的那一份。
+
+    @Volatile
+    private var userEdited = false
+
+    /** 队列是否被用户手工改过（插入 / 移除 / 重排）。 */
+    fun isUserEdited(): Boolean = userEdited
+
+    /** 队列操作后调用（见 `Player.ufiPlayNext` / `ufiRemoveFromQueue` / `ufiMoveInQueue`）。 */
+    fun markUserEdited() {
+        userEdited = true
+    }
+
+    /**
+     * 从持久化快照恢复时灌回来。
+     *
+     * 与 [set] 的区别：[set] 表示"刚按作用域重装过"，必然清掉 userEdited；
+     * 这里是"把上一次的状态原样接回来"，两个值都由调用方给。
+     */
+    fun restore(value: AudioQueueScope?, edited: Boolean) {
+        scope = value
+        userEdited = edited
+    }
+
 
     @Volatile
     private var shuffleRequested = false

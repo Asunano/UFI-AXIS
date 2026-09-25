@@ -246,10 +246,9 @@ class ToolsModule(
             while (isActive) {
                 doPollDeviceUpdateStatus()
                 val st = _updateDeviceState.value?.state
-                if (st == "done" || st == "failed") {
-                    updatePollJob = null
-                    break
-                }
+                // 终态只 break，**不回写 updatePollJob**：此前可能已经起了新一轮，
+                // 旧协程把字段置 null 会让 stopDeviceUpdatePolling 再也取消不了新 job。
+                if (st == "done" || st == "failed") break
                 delay(2000)
             }
         }
@@ -927,6 +926,9 @@ class ToolsModule(
                     if (!resp.isSuccessful) throw Exception("HTTP ${resp.code}")
                     resp.body?.string() ?: throw Exception("响应体为空")
                 }
+            } catch (e: CancellationException) {
+                // 取消不是"这个镜像不行"，不能吞掉继续试下一个
+                throw e
             } catch (e: Exception) {
                 failures += "${candidate.removePrefix("https://").take(28)}: ${e.message}"
             }
@@ -977,6 +979,10 @@ class ToolsModule(
                 if (targetFile.exists()) targetFile.delete()
                 if (!partFile.renameTo(targetFile)) throw Exception("文件提交失败")
                 return true
+            } catch (e: CancellationException) {
+                // 取消不是"这个镜像不行"：残留的 .part 要清，但不能继续试下一个
+                partFile.delete()
+                throw e
             } catch (e: Exception) {
                 partFile.delete()
                 // 继续尝试下一候选
@@ -2957,10 +2963,23 @@ class ToolsModule(
         }
     }
 
-    fun createTask(task: ScheduledTask) {
+    /**
+     * 新建任务。
+     *
+     * [onDone] 给"要等结果的调用方"用（编辑页要成功才 toast + 退页）：不给回调时行为不变，
+     * 失败只写 `errorMessage`。
+     */
+    fun createTask(task: ScheduledTask, onDone: ((Boolean, String) -> Unit)? = null) {
         scope.launch {
-            try { api.createTask(task); loadTaskList() }
-            catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "创建失败: ${e.message}") }
+            try {
+                api.createTask(task)
+                loadTaskList()
+                onDone?.invoke(true, "任务已创建")
+            } catch (e: Exception) {
+                val msg = "创建失败: ${e.message}"
+                _tasksState.value = _tasksState.value.copy(errorMessage = msg)
+                onDone?.invoke(false, msg)
+            }
         }
     }
 
@@ -2973,10 +2992,14 @@ class ToolsModule(
      *  - 加乐观更新：立刻把本地 `state.tasks` 里同 id 的 task 替换成新 task，UI 即时反馈；
      *    后端返回后再 `loadTaskList()` 校准；失败时再回拉一次（兜底）+ 错误信息。
      *  - id 为空直接 return（防御：上层传错也不发空请求）。
+     *
+     * [onDone] 同 [createTask]。
      */
-    fun updateTask(id: String, task: ScheduledTask) {
+    fun updateTask(id: String, task: ScheduledTask, onDone: ((Boolean, String) -> Unit)? = null) {
         if (id.isBlank()) {
-            _tasksState.value = _tasksState.value.copy(errorMessage = "更新失败: 任务 id 为空")
+            val msg = "更新失败: 任务 id 为空"
+            _tasksState.value = _tasksState.value.copy(errorMessage = msg)
+            onDone?.invoke(false, msg)
             return
         }
         // 乐观更新：立即替换本地状态，UI 立即反馈
@@ -2987,10 +3010,13 @@ class ToolsModule(
             try {
                 api.updateTask(id, task)
                 loadTaskList()
+                onDone?.invoke(true, "任务已保存")
             } catch (e: Exception) {
-                _tasksState.value = _tasksState.value.copy(errorMessage = "更新失败: ${e.message}")
+                val msg = "更新失败: ${e.message}"
+                _tasksState.value = _tasksState.value.copy(errorMessage = msg)
                 // 失败回拉一次以恢复正确状态
                 runCatching { loadTaskList() }
+                onDone?.invoke(false, msg)
             }
         }
     }
@@ -3062,20 +3088,32 @@ class ToolsModule(
         }
     }
 
-    fun createRule(rule: AutomationRule) {
+    /** 新建规则。[onDone] 同 [createTask]。 */
+    fun createRule(rule: AutomationRule, onDone: ((Boolean, String) -> Unit)? = null) {
         scope.launch {
-            try { api.createRule(rule); loadRuleList() }
-            catch (e: Exception) { _tasksState.value = _tasksState.value.copy(errorMessage = "创建规则失败: ${e.message}") }
+            try {
+                api.createRule(rule)
+                loadRuleList()
+                onDone?.invoke(true, "规则已创建")
+            } catch (e: Exception) {
+                val msg = "创建规则失败: ${e.message}"
+                _tasksState.value = _tasksState.value.copy(errorMessage = msg)
+                onDone?.invoke(false, msg)
+            }
         }
     }
 
     /**
      * 更新规则（含 Switch 开关、编辑对话框保存）。
      * 乐观更新 + 失败回拉，与 updateTask 同策略（AppJson.encodeDefaults=true 保证 body 完整，开关不回弹）。
+     *
+     * [onDone] 同 [createTask]。
      */
-    fun updateRule(id: String, rule: AutomationRule) {
+    fun updateRule(id: String, rule: AutomationRule, onDone: ((Boolean, String) -> Unit)? = null) {
         if (id.isBlank()) {
-            _tasksState.value = _tasksState.value.copy(errorMessage = "更新失败: 规则 id 为空")
+            val msg = "更新失败: 规则 id 为空"
+            _tasksState.value = _tasksState.value.copy(errorMessage = msg)
+            onDone?.invoke(false, msg)
             return
         }
         _tasksState.value = _tasksState.value.copy(
@@ -3085,9 +3123,12 @@ class ToolsModule(
             try {
                 api.updateRule(id, rule)
                 loadRuleList()
+                onDone?.invoke(true, "规则已保存")
             } catch (e: Exception) {
-                _tasksState.value = _tasksState.value.copy(errorMessage = "更新规则失败: ${e.message}")
+                val msg = "更新规则失败: ${e.message}"
+                _tasksState.value = _tasksState.value.copy(errorMessage = msg)
                 runCatching { loadRuleList() }
+                onDone?.invoke(false, msg)
             }
         }
     }
@@ -3384,8 +3425,13 @@ class ToolsModule(
      * **打开时连带打开「详细」（`debug_mode`）**：总闸只放开 WARN/ERROR，DEBUG/INFO 还要过
      * `DebugLog.verbose` / `AppLogger` 的详细闸门。一次正常会话里可能一条 WARN/ERROR 都不产生，
      * 于是用户「开了总开关，日志页还是空的」—— 表现和开关坏了一样。
-     * 打开即记全量，用户嫌吵可以再单独关掉「详细」。关闭总开关时不动 `debug_mode`，
-     * 免得下次打开把用户手动关掉的详细又翻回来。
+     * 打开即记全量，用户嫌吵可以再单独关掉「详细」。
+     *
+     * **关闭时也一并关掉 `debug_mode`**（2026-09-26 修）：原来关总闸刻意不动它，本意是
+     * "别把用户手动关掉的详细又翻回来"，实际造成一个关不掉的死循环 —— DebugLogScreen 在总闸
+     * 关闭时会隐藏「详细」chip，想关详细必须先开总闸，而一开总闸上面那条 `alsoVerbose`
+     * 又把详细自动置 true。口径改成「总闸关 = 详细一起关」：两者同生同灭，任何一条路径都能
+     * 把详细收回去，也不会再出现"总闸是关的、详细却留着 true"这种看不见的残留状态。
      */
     fun syncLogEnabled(enabled: Boolean) {
         val alsoVerbose = enabled && !_logSwitchState.value.debugMode
@@ -3393,21 +3439,30 @@ class ToolsModule(
             fields = buildMap {
                 put("log_enabled", enabled)
                 if (alsoVerbose) put("debug_mode", true)
+                if (!enabled) put("debug_mode", false)
             },
             // 连带打开了详细就要说出来，否则用户下次看到"详细"是开的会以为自己记错了
             successNotice = when {
-                !enabled -> "日志记录已关闭"
+                !enabled -> "日志记录已关闭（含详细级别）"
                 alsoVerbose -> "日志记录已开启（含详细级别）"
                 else -> "日志记录已开启"
             },
             applyLocal = { prefs ->
                 prefs.logEnabled = enabled
                 if (alsoVerbose) prefs.debugMode = true
+                if (!enabled) prefs.debugMode = false
                 // 关闸后清掉 app 侧内存缓冲：留着只会让日志页显示一批"已经不再更新"的旧行
                 if (!enabled) AppLogBuffer.clear()
             },
             mirror = { s ->
-                s.copy(logEnabled = enabled, debugMode = if (alsoVerbose) true else s.debugMode)
+                s.copy(
+                    logEnabled = enabled,
+                    debugMode = when {
+                        !enabled -> false
+                        alsoVerbose -> true
+                        else -> s.debugMode
+                    }
+                )
             }
         )
     }

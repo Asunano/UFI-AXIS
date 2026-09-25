@@ -6,6 +6,7 @@ import com.ufi_axis.ui.media.MediaAudioGroupScreen
 import com.ufi_axis.ui.media.MediaAudioPlayerScreen
 import com.ufi_axis.ui.media.MediaAudioScreen
 import com.ufi_axis.ui.media.MediaAudioSettingsScreen
+import com.ufi_axis.ui.media.MediaExcludedScreen
 import com.ufi_axis.ui.media.MediaImageScreen
 import com.ufi_axis.ui.media.MediaImageSettingsScreen
 import com.ufi_axis.ui.media.MediaImageViewerScreen
@@ -216,6 +217,10 @@ private fun rawAppScreens(
     },
     Routes.MEDIA_AUDIO_SETTINGS to { _, nc ->
         MediaAudioSettingsScreen(viewModel, nc)
+    },
+    // 已从音乐库移除的歌曲（排除名单）：有它「从音乐库移除」才是可撤销的
+    Routes.MEDIA_AUDIO_EXCLUDED to { _, nc ->
+        MediaExcludedScreen(viewModel, nc)
     },
     Routes.MEDIA_IMAGE_SETTINGS to { _, nc ->
         MediaImageSettingsScreen(viewModel, nc)

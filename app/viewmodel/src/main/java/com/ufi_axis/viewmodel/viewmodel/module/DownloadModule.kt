@@ -14,10 +14,39 @@ import com.ufi_axis.util.DebugLog
 
 class DownloadModule(
     private val appContext: Context,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    /**
+     * 跨模块 UI 事件出口（2026-09-22，阶段 3.1）。
+     *
+     * 本模块**没有**自己的 `_events`：Network / Tools 之所以要"本地 _events + init 里转发"，
+     * 是为了让 `MainViewModel.collectCrossModuleEvents` 不必访问它们从而不触发 by lazy
+     * （冷启动 eager 加载）。这里 sink 是构造参数，直接投就行，再加一层转发协程只是噪音。
+     */
+    private val crossModuleEventSink: MutableSharedFlow<UiEvent>
 ) {
     private val _state = MutableStateFlow(DownloadState())
     val state: StateFlow<DownloadState> = _state.asStateFlow()
+
+    /**
+     * 写成功提示。**只在设备确认收下之后**调用 —— 本模块此前的毛病正是相反的那一半：
+     * 四个下载设置子页在 `updateDownloadConfig` 刚被调用（请求还在飞）时就弹「已保存」，
+     * core 没起来也照样弹，失败反而只写进零消费的 `errorMessage`。
+     *
+     * 文案要说清是**哪一项**（「基础设置已保存」而不是「已保存」）：下载设置有 4 个子页
+     * 加一个 Tracker 列表，泛化文案让用户分不清落地的是哪一份。
+     */
+    private fun emitWriteNotice(message: String, subtitle: String? = null) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    }
+
+    /**
+     * 清错误：全局错误浮层收起时由 `MainViewModel.dismissGlobalError` 分派过来。
+     * 少了它，浮层收起后 `errorMessage` 还挂在 state 上，切回下载页会再弹一次陈旧错误。
+     */
+    fun clearError() {
+        _state.value = _state.value.copy(errorMessage = null)
+    }
+
 
     private fun api() = RetrofitClient.getApiService(AppPreferences(appContext))
 
@@ -354,49 +383,78 @@ class DownloadModule(
         }
     }
 
-    fun updateDownloadConfig(config: DownloadConfigItem) {
-        scope.launch {
+    /**
+     * 下发下载引擎配置。
+     *
+     * ## 2026-09-22：从"发了就算成功"改成"等结果"
+     * 原来这是 `fun`（fire-and-forget），4 个设置子页的 `onSave` 里紧跟一句
+     * `toast = ToastMessage("已保存")` —— core 没起来、路径非法、被 400 拒，界面照样显示
+     * 绿色「已保存」，真正的原因只写进当时没人读的 `errorMessage`。
+     *
+     * 现在：suspend + 返回布尔。成功由本模块发 [emitWriteNotice]（走全局 Toast 宿主），
+     * 失败写 `errorMessage`（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast）。
+     * 返回值给调用方**驱动按钮的 loading / 禁用**（防重复提交），不是让它自己再弹一次提示。
+     *
+     * @param itemLabel 出现在成功提示里的项目名（「基础设置」/「高级设置」…）。
+     *   说清是哪一项，见 §4.15。
+     */
+    suspend fun updateDownloadConfig(config: DownloadConfigItem, itemLabel: String): Boolean {
+        val body = mutableMapOf<String, Any>(
+            "max_concurrent" to config.maxConcurrent,
+            "max_connections_per_server" to config.maxConnectionsPerServer,
+            "global_speed_limit" to config.globalSpeedLimit,
+            "per_task_speed_limit" to config.perTaskSpeedLimit,
+            "save_dir" to config.saveDir,
+            "split_count" to config.splitCount,
+            "max_overall_upload_limit" to config.maxOverallUploadLimit,
+            "bt_seed_ratio" to config.btSeedRatio,
+            "bt_max_peers" to config.btMaxPeers,
+            "bt_enable_dht" to config.btEnableDht,
+            "bt_enable_lpd" to config.btEnableLpd,
+            "disable_ipv6" to config.disableIpv6,
+            "check_certificate" to config.checkCertificate,
+            "max_tries" to config.maxTries,
+            "retry_wait" to config.retryWait,
+            "bt_tracker_auto_update" to config.btTrackerAutoUpdate,
+            "bt_tracker_update_interval_hours" to config.btTrackerUpdateIntervalHours,
+            "bt_tracker_source_url" to config.btTrackerSourceUrl,
+            "bt_tracker_custom_list" to config.btTrackerCustomList,
+            "smart_throttle" to config.smartThrottle,
+            "throttle_temp_warn" to config.throttleTempWarn,
+            "throttle_temp_critical" to config.throttleTempCritical,
+            "throttle_cpu_warn" to config.throttleCpuWarn,
+            "throttle_cpu_critical" to config.throttleCpuCritical,
+            "throttle_battery_warn" to config.throttleBatteryWarn,
+            "throttle_battery_critical" to config.throttleBatteryCritical,
+            "throttle_memory_warn" to config.throttleMemoryWarn,
+            "throttle_memory_critical" to config.throttleMemoryCritical,
+            "only_download_when_charging" to config.onlyDownloadWhenCharging
+        )
+        // 整段跑在本模块的 scope 里（async + await）：调用方是设置子页，保存成功后用户
+        // 往往立刻返回上一页、它的 rememberCoroutineScope 随之取消。用 async 之后
+        // "取消等待"只停掉等待方，写入 / 回读 / 成功提示照样跑完（口径同 setWifiConfig）。
+        return scope.async {
             try {
-                val body = mutableMapOf<String, Any>(
-                    "max_concurrent" to config.maxConcurrent,
-                    "max_connections_per_server" to config.maxConnectionsPerServer,
-                    "global_speed_limit" to config.globalSpeedLimit,
-                    "per_task_speed_limit" to config.perTaskSpeedLimit,
-                    "save_dir" to config.saveDir,
-                    "split_count" to config.splitCount,
-                    "max_overall_upload_limit" to config.maxOverallUploadLimit,
-                    "bt_seed_ratio" to config.btSeedRatio,
-                    "bt_max_peers" to config.btMaxPeers,
-                    "bt_enable_dht" to config.btEnableDht,
-                    "bt_enable_lpd" to config.btEnableLpd,
-                    "disable_ipv6" to config.disableIpv6,
-                    "check_certificate" to config.checkCertificate,
-                    "max_tries" to config.maxTries,
-                    "retry_wait" to config.retryWait,
-                    "bt_tracker_auto_update" to config.btTrackerAutoUpdate,
-                    "bt_tracker_update_interval_hours" to config.btTrackerUpdateIntervalHours,
-                    "bt_tracker_source_url" to config.btTrackerSourceUrl,
-                    "bt_tracker_custom_list" to config.btTrackerCustomList,
-                    "smart_throttle" to config.smartThrottle,
-                    "throttle_temp_warn" to config.throttleTempWarn,
-                    "throttle_temp_critical" to config.throttleTempCritical,
-                    "throttle_cpu_warn" to config.throttleCpuWarn,
-                    "throttle_cpu_critical" to config.throttleCpuCritical,
-                    "throttle_battery_warn" to config.throttleBatteryWarn,
-                    "throttle_battery_critical" to config.throttleBatteryCritical,
-                    "throttle_memory_warn" to config.throttleMemoryWarn,
-                    "throttle_memory_critical" to config.throttleMemoryCritical,
-                    "only_download_when_charging" to config.onlyDownloadWhenCharging
-                )
                 val resp = withContext(Dispatchers.IO) { api().updateDownloadConfig(body) }
                 if (!resp.isSuccessful) {
-                    _state.value = _state.value.copy(errorMessage = "更新配置失败: HTTP ${resp.code()}")
-                    return@launch
+                    _state.value = _state.value.copy(
+                        errorMessage = "$itemLabel 保存失败：HTTP ${resp.code()}"
+                    )
+                    return@async false
                 }
                 // 写后回读：值刚被本 App 改过，必须绕过新鲜度闸门，否则回读到旧状态
                 loadDownloads(force = true)
-            } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "更新配置失败: ${e.message}") }
-        }
+                // 刻意不在 subtitle 里说"是否需要重启引擎"：那一位来自本次回读，而 loadDownloads
+                // 是异步的，此刻读到的还是写之前的值 —— 会说反。"有启动期改动没生效"由下载设置
+                // 首页那张常驻的 PendingRestartNotice 负责，它读的是回读后的 state。
+                emitWriteNotice("$itemLabel 已保存")
+                true
+            } catch (e: Exception) {
+                DebugLog.w("Download", "$itemLabel 保存失败: ${e.message}", e)
+                _state.value = _state.value.copy(errorMessage = "$itemLabel 保存失败：${e.message}")
+                false
+            }
+        }.await()
     }
 
     fun validatePath(path: String, onResult: (Map<String, Any?>) -> Unit) {
@@ -444,6 +502,13 @@ class DownloadModule(
         emptyList<String>() to null
     }
 
+    /**
+     * 立刻从远程源拉一遍 Tracker 列表。
+     *
+     * 2026-09-22：补成功提示。原来只有失败写 `errorMessage`（且当时没人读），成功后
+     * 唯一的变化是「Tracker 数量」那一行 —— 数字本来是几十条、刷完还是几十条，
+     * 用户看不出按钮到底起没起作用。
+     */
     fun refreshTrackers() {
         scope.launch {
             try {
@@ -455,6 +520,7 @@ class DownloadModule(
                 }
                 // 写后回读：值刚被本 App 改过，必须绕过新鲜度闸门，否则回读到旧状态
                 loadDownloads(force = true)
+                emitWriteNotice("Tracker 列表已从源刷新")
             } catch (e: Exception) { _state.value = _state.value.copy(trackerRefreshing = false, errorMessage = "Tracker 刷新失败: ${e.message}") }
         }
     }
@@ -475,17 +541,26 @@ class DownloadModule(
         }
     }
 
-    fun saveTrackerList(trackers: String) {
-        scope.launch {
-            try {
-                val resp = withContext(Dispatchers.IO) { api().saveTrackers(mapOf("trackers" to trackers)) }
-                if (!resp.isSuccessful) {
-                    _state.value = _state.value.copy(errorMessage = "保存 Tracker 列表失败: HTTP ${resp.code()}")
-                    return@launch
-                }
-                // 写后回读：值刚被本 App 改过，必须绕过新鲜度闸门，否则回读到旧状态
-                loadDownloads(force = true)
-            } catch (e: Exception) { _state.value = _state.value.copy(errorMessage = "保存 Tracker 列表失败: ${e.message}") }
+    /**
+     * 保存自定义 Tracker 列表。
+     *
+     * 2026-09-22：改为 suspend + 返回结果。原来页面在调用完就弹「Tracker 列表已保存」，
+     * 与 4 个设置子页同一个假成功。返回值用于页面按钮的 loading / 防重复提交。
+     */
+    suspend fun saveTrackerList(trackers: String): Boolean = scope.async {
+        try {
+            val resp = withContext(Dispatchers.IO) { api().saveTrackers(mapOf("trackers" to trackers)) }
+            if (!resp.isSuccessful) {
+                _state.value = _state.value.copy(errorMessage = "Tracker 列表保存失败：HTTP ${resp.code()}")
+                return@async false
+            }
+            // 写后回读：值刚被本 App 改过，必须绕过新鲜度闸门，否则回读到旧状态
+            loadDownloads(force = true)
+            emitWriteNotice("Tracker 列表已保存", subtitle = "已热加载到运行中的 aria2")
+            true
+        } catch (e: Exception) {
+            _state.value = _state.value.copy(errorMessage = "Tracker 列表保存失败：${e.message}")
+            false
         }
-    }
+    }.await()
 }

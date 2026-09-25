@@ -63,6 +63,8 @@ class HealthModule(
     @Volatile
     private var paused = false
 
+    /** 周期任务的起停锁：检查 + 赋值必须原子，否则多路调用会起两条 30s 循环。 */
+    private val periodicLock = Any()
     private var periodicJob: Job? = null
 
     /** 确证「掉线」用的连击：失败计数 + 首次失败时刻。 */
@@ -151,8 +153,10 @@ class HealthModule(
     /** 后台：停周期探活（Doze/冻结下的请求只会制造假 UNREACHABLE）。 */
     fun onAppBackgrounded() {
         paused = true
-        periodicJob?.cancel()
-        periodicJob = null
+        synchronized(periodicLock) {
+            periodicJob?.cancel()
+            periodicJob = null
+        }
         DebugLog.d("HealthModule", "periodic health check paused (app background)")
     }
 
@@ -173,12 +177,16 @@ class HealthModule(
 
     /** 周期健康检查：每 [intervalMs] 探活一次，直到暂停或 [scope] 取消。 */
     fun startPeriodicCheck(intervalMs: Long = DEFAULT_INTERVAL_MS) {
-        // 已有任务则不重复起（resume 与 init 可能叠）
-        if (periodicJob?.isActive == true) return
-        periodicJob = scope.launch {
-            while (isActive && !paused) {
-                checkHealthNow()
-                delay(intervalMs)
+        // 已有任务则不重复起（resume 与 init 可能叠）。
+        // 检查与赋值放进同一把锁：分开做时两路并发会各自起一条 30s 循环，
+        // 而字段只留得住后一条，前一条再也停不掉。
+        synchronized(periodicLock) {
+            if (periodicJob?.isActive == true) return
+            periodicJob = scope.launch {
+                while (isActive && !paused) {
+                    checkHealthNow()
+                    delay(intervalMs)
+                }
             }
         }
     }

@@ -351,7 +351,14 @@ private fun buildSliderMetrics(
     // 轨道仍按 trackRowHeight/2 垂直居中。缺省 0dp = 保持 UfiRangeSlider 原有尺寸不变。
     val trackRowHeight = maxOf(thumbSize * 1.5f, trackHeight + 16.dp, minTrackRowHeight)
     val tickRowHeight = if (ticks.values.isEmpty()) 0.dp else 10.dp
-    val labelRowHeight = if (ticks.labels == null) 0.dp else 16.dp
+    // 2026-09-22：判据从 `labels == null` 改成 `isNullOrEmpty()`。
+    // labels 只在 tickLabelFormatter 为 null 时才是 null；**传了 formatter 但没有刻度**
+    // （tickStep <= 0 时 computeTickValues 直接返回空列表，而 ThresholdEditDialog 的
+    // tickStep 默认值就是 0f）时它是**空列表** —— 于是这里照样预留 16dp，
+    // 而绘制那边是 `ticks.values.forEachIndexed`，一个字都画不出来。
+    // 结果是滑块底部凭空多 16dp 空白，且不受 labelAlpha 影响（调 alpha 也救不回来）。
+    // 上面 tickRowHeight 一直是判空的，这一行漏了，两者口径本该一致。
+    val labelRowHeight = if (ticks.labels.isNullOrEmpty()) 0.dp else 16.dp
     SliderMetrics(
         totalHeight = trackRowHeight + tickRowHeight + labelRowHeight,
         padPx = sidePadding.toPx(),
@@ -482,8 +489,19 @@ private fun animateThumbScale(dragging: Boolean) = animateFloatAsState(
 
 @Composable
 private fun animateTickLabelAlpha(dragging: Boolean) = animateFloatAsState(
-    // 标签只在拖动时出现：常驻一排小字会把轨道压得很脏
-    targetValue = if (dragging) 1f else 0f,
+    // 2026-09-22：静止时从 0（完全不画）改成 0.7（弱显示）。
+    //
+    // 原设计是"标签只在拖动时出现，常驻一排小字会把轨道压得很脏"，但 labelRowHeight 那 16dp
+    // 是**只要传了 tickLabelFormatter 就恒定预留**的（见 buildSliderMetrics）——
+    // 空间一直占着、内容只在拖动时出现，于是静止状态下滑块底部凭空多出 16dp 空白。
+    // 症状：告警设置里温度/电量/信号三个阈值弹窗，「滑块 → 底部按钮」的间隔看起来比
+    // 流量阈值弹窗（末元素是普通文字）宽出一截 —— 那不是弹窗间距错了，是这块空白。
+    //
+    // 两条路：把 16dp 省掉（= 放弃刻度标签，拖动时也看不到刻度值），或让它一直有内容。
+    // 选后者：刻度值本身是有用信息（告诉用户轨道上 40/60/80 在哪），而"不拖动就看不到刻度含义、
+    // 却一直为它留白"是两头不落好。0.7 而非 1.0：静止时可读但不抢视觉，拖动时升到 1.0 强调，
+    // 原来那个"拖动时强调"的意图保留。
+    targetValue = if (dragging) 1f else 0.7f,
     animationSpec = tween(durationMillis = UfiMotion.Duration.Quick),
     label = "tickLabelAlpha"
 )

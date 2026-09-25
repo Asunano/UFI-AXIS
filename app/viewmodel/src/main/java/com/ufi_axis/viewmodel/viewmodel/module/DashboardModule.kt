@@ -31,7 +31,21 @@ class DashboardModule(
     private val networkMonitor: NetworkMonitor,
     private val appContext: Context,
     private val scope: CoroutineScope,
-    private val alertPrefs: AlertPrefsRepository
+    private val alertPrefs: AlertPrefsRepository,
+    /**
+     * 跨模块 UI 事件出口（2026-09-22，阶段 3.3）。
+     *
+     * **刻意不把 [_events] 整条转发到这个 sink**（Network / Tools 是那么做的）：
+     * `_events` 现在只跑 `AlertDeleted`，由 `MonitorScreen` 直接收集 `dashboard.events` 处理；
+     * 整条转发会让 `AlertDeleted` 也流经 `MainViewModel.collectCrossModuleEvents`，
+     * 虽然那边现在是空分支、行为不变，但等于给一条已经工作的链路加了第二个订阅者。
+     * 写操作提示直投 sink，两条路各自独立 —— 改这一条不会碰到删除成功那一条。
+     *
+     * 给了默认值只为让**单元测试**能继续用原来的 6 参构造（它们测的是取数与并发，
+     * 不关心提示通道）。生产路径由 `MainViewModel` 显式传入真 sink。
+     */
+    private val crossModuleEventSink: MutableSharedFlow<UiEvent> =
+        MutableSharedFlow(extraBufferCapacity = 16)
 ) {
     // ── State ──
     private val _dashboardState = MutableStateFlow(DashboardState())
@@ -53,6 +67,17 @@ class DashboardModule(
     // 同构于 ToolsModule/NetworkModule 的 _events，但仅面向 UI（不转发跨模块 sink）。
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 16)
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
+
+    /**
+     * 写操作成功提示（2026-09-22）：直投 [crossModuleEventSink] → `MainViewModel.writeNotice`
+     * → Activity 级 Toast 宿主，与失败提示同一个出口。
+     *
+     * 文案要说清**是哪一项**生效了：监控设置四个二级页共用同一个 [setMonitorSettings]，
+     * 「保存成功」这种泛化文案让用户分不清落地的是采集间隔还是保留天数。
+     */
+    private fun emitWriteNotice(message: String, subtitle: String? = null) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    }
 
     private val _updateState = MutableStateFlow(UpdateState())
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
@@ -482,6 +507,37 @@ class DashboardModule(
     fun refreshDashboard(forceRefresh: Boolean = false) {
         refreshJob?.cancel()
         refreshJob = scope.launch { refreshDashboardInternal(forceRefresh) }
+    }
+
+    /**
+     * 预加载 / 前台化用的刷新入口。与 [refreshDashboard] 的**唯一**区别：
+     * 不取消在飞的刷新，数据够新时直接不发请求。
+     *
+     * 为什么需要单独一个入口：[refreshDashboard] 无条件 `refreshJob?.cancel()`，
+     * 那是"手动刷新"该有的语义（用户按了按钮，上一次的结果已经不重要了）。
+     * 但预加载与页面自身的首次加载几乎同时发生，两边都调 [refreshDashboard] 就是
+     * 后来的把前面的掐掉、来回浪费一次聚合请求。这里改成"已经有人在拉就让它拉完"。
+     *
+     * 新鲜度窗口用默认的 [FOREGROUND_REFRESH_INTERVAL_MS]（= 页面轮询周期），
+     * 语义与 `startAutoRefresh` 的首轮 hold-off 一致，不会出现"轮询刚刷过、
+     * 前台化又认为该拉"的自相矛盾。
+     */
+    fun refreshDashboardIfStale() {
+        if (refreshJob?.isActive == true) return
+        if (_dashboardState.value.deviceInfo != null &&
+            isForegroundDataFresh(dashboardSuccessElapsed, SystemClock.elapsedRealtime())
+        ) {
+            return
+        }
+        refreshJob = scope.launch { refreshDashboardInternal(false) }
+    }
+
+    /**
+     * 换设备 / 换地址后丢掉新鲜度基准。与 [clearDashboardCache] 同一批调用 ——
+     * 只清 Room 不清戳，新设备首屏会因为旧戳还在窗口内而跳过请求。
+     */
+    fun resetFreshness() {
+        dashboardSuccessElapsed = 0L
     }
 
     /**
@@ -1543,31 +1599,105 @@ class DashboardModule(
      *   任意无关设置（时长/间隔/指标开关…）都无条件重发本地默认值 `true`，会把用户在设置页
      *   或 web 端显式停掉的后台服务静默改回"已启动"。
      * - 个性化 7 项（T40-5）同理只在真正变化时 `PUT /api/monitor/preferences`，并以服务端回显覆盖本地。
-     * - 后端调用 fire-and-forget，失败静默不阻断 UI。
+     *
+     * ## 2026-09-22：从"fire-and-forget + 只打日志"改成有反馈（阶段 3.3）
+     * 原来两个请求都是发出去就不管了，失败只 `DebugLog.w` —— 而这里是**即改即存**的界面，
+     * 没有保存按钮可以停在"保存中"，用户唯一能观察到的就是"我改的设置过一会儿又变回去了"
+     *（下次进页面回读被服务端值覆盖）。原注释自己写下了这个症状。
+     *
+     * 现在：成功发 [emitWriteNotice]（说清是哪一项），失败写 `monitorState.errorMessage`
+     *（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast）并**回读服务端真值**，
+     * 让界面上那个已经被用户拨过去的开关/滑杆立刻弹回设备真值（§4.11），
+     * 而不是留一个"看着改了、其实没改"的假状态。
+     *
+     * 两个请求合并进**同一个协程**串行发（原来是两个 `scope.launch`）：一次保存最多只该
+     * 出现一条提示，拆成两个协程时"同时改了总开关和采集间隔"会弹两条、失败时还会写两次
+     * errorMessage 互相覆盖。
      */
     fun setMonitorSettings(settings: MonitorSettings) {
         val previous = _monitorState.value.settings
         monitorPreferences.save(settings)
         _monitorState.update { it.copy(settings = settings) }
-        if (settings.collectEnabled != previous.collectEnabled) {
-            scope.launch {
-                runCatching { api.setMonitorControl(mapOf("enabled" to settings.collectEnabled)) }
-            }
-        }
+
+        val collectChanged = settings.collectEnabled != previous.collectEnabled
         val payload = settings.toRemotePayload()
-        if (payload == previous.toRemotePayload()) return
+        val prefsChanged = payload != previous.toRemotePayload()
+        if (!collectChanged && !prefsChanged) return
+
+        // 文案在发请求之前算：算的是"用户这次改了什么"，与请求结果无关
+        val label = monitorSettingsChangeLabel(previous, settings)
+
         scope.launch {
-            val result = runCatching { api.updateMonitorPreferences(payload) }
-            val echoed = result.getOrNull()?.takeIf { it.success }?.preferences
-            if (echoed == null) {
-                // 不打扰用户，但必须留痕：写失败意味着本地缓存已经和 core 真源不一致，
-                // 下次进页面回读时会被服务端值覆盖（表现为"我改的设置又变回去了"）。
-                DebugLog.w("Monitor", "监控偏好下发失败，本地已改但 core 未更新: ${result.exceptionOrNull()?.message}")
-                return@launch
+            if (collectChanged) {
+                val ok = runCatching { api.setMonitorControl(mapOf("enabled" to settings.collectEnabled)) }
+                if (ok.isFailure) {
+                    monitorSettingsFailed("后台采集", ok.exceptionOrNull())
+                    return@launch
+                }
             }
-            // 以服务端回显为准：core 会做取值域校验，若本地传了越界值，服务端返回的才是真实生效值。
-            applyRemotePreferences(echoed)
+            if (prefsChanged) {
+                val result = runCatching { api.updateMonitorPreferences(payload) }
+                val echoed = result.getOrNull()?.takeIf { it.success }?.preferences
+                if (echoed == null) {
+                    monitorSettingsFailed(label, result.exceptionOrNull())
+                    return@launch
+                }
+                // 以服务端回显为准：core 会做取值域校验，若本地传了越界值，服务端返回的才是真实生效值。
+                applyRemotePreferences(echoed)
+            }
+            // 开关类说"已开启/已关闭"，数值类说"已保存"：对开关而言"已保存"没有告诉用户
+            // 现在是开还是关，而这恰恰是他刚做的那个决定。
+            emitWriteNotice(
+                if (collectChanged) {
+                    if (settings.collectEnabled) "后台采集已开启" else "后台采集已关闭"
+                } else {
+                    "$label 已保存"
+                }
+            )
         }
+    }
+
+    /**
+     * 监控设置下发失败的统一收尾。
+     *
+     * 回读放在写 errorMessage **之后**：`refreshMonitorSettingsFromBackend` 内部对
+     * "两个请求都失败"是直接 return（沿用本地缓存），不会把刚写的错误文案顶掉；
+     * 而它一旦成功，`settings` 变化会让界面上的控件自己回到设备真值。
+     */
+    private suspend fun monitorSettingsFailed(label: String, cause: Throwable?) {
+        val reason = cause?.message ?: "设备未接受这次修改"
+        DebugLog.w("Monitor", "监控设置下发失败（$label）: $reason", cause)
+        _monitorState.update { it.copy(errorMessage = "$label 保存失败：$reason") }
+        // 本地缓存已经被乐观地改过了，必须拉回 core 真值，否则界面停在一个没落地的值上
+        refreshMonitorSettingsFromBackend()
+    }
+
+    /**
+     * 这次改动最该被报出来的那一项（名词短语，调用方自己拼"已保存"之类的尾巴）。
+     *
+     * 为什么要挑一项而不是笼统说「监控设置」：四个二级页（采集 / 图表 / 调度 / 导出）共用
+     * 本方法，每页又有好几个滑杆，泛化文案等于没说（§4.15）。UI 一次交互只改一个字段，
+     * 所以"第一个不相等的字段"就是用户刚动的那个；真出现多字段同时变（指标开关弹窗的
+     * 批量勾选）时按声明顺序取第一个，仍然指向用户正在看的那一组。
+     */
+    private fun monitorSettingsChangeLabel(prev: MonitorSettings, next: MonitorSettings): String = when {
+        prev.collectEnabled != next.collectEnabled -> "后台采集"
+        prev.enabledTypes != next.enabledTypes -> "采集指标"
+        prev.defaultHours != next.defaultHours -> "默认时间范围"
+        prev.refreshIntervalSec != next.refreshIntervalSec -> "自动刷新间隔"
+        prev.fixedYAxis != next.fixedYAxis -> "Y 轴固定"
+        prev.fillAlpha != next.fillAlpha -> "图表填充透明度"
+        prev.exportZip != next.exportZip -> "导出方式"
+        prev.retentionDays != next.retentionDays -> "历史保留天数"
+        prev.flushIntervalSec != next.flushIntervalSec -> "采集刷写间隔"
+        prev.alertScanSec != next.alertScanSec -> "告警扫描间隔"
+        prev.idleIntervalSec != next.idleIntervalSec -> "空闲采集间隔"
+        prev.thermalWarnC != next.thermalWarnC -> "温控预警阈值"
+        prev.thermalCriticalC != next.thermalCriticalC -> "温控熔断阈值"
+        prev.thermalPauseSec != next.thermalPauseSec -> "熔断暂停时长"
+        prev.trafficLimitCheckSec != next.trafficLimitCheckSec -> "套餐限额检查间隔"
+        prev.deviceEventCheckSec != next.deviceEventCheckSec -> "设备接入检查间隔"
+        else -> "监控设置"
     }
 
     /**

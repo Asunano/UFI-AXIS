@@ -1,6 +1,7 @@
 package com.ufi_axis.viewmodel
 
 import android.content.Context
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -35,39 +36,65 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 /**
- * 全局错误的来源。决定重试动作与清除动作分派到哪个 module（见 [MainViewModel.retryGlobalError]）。
+ * 全局错误的来源。决定重试动作与清除动作分派到哪个 module（见 [MainViewModel.dismissGlobalError]）。
+ *
+ * 新增来源时**必须同步三处**：这个枚举、[MainViewModel.rawGlobalError] 的 combine、
+ * [MainViewModel.dismissGlobalError] 的分派。漏掉 dismiss 分派的后果很具体 ——
+ * 浮层收起后不清 state，切回页面又弹一次陈旧错误。
  */
-enum class GlobalErrorSource { DASHBOARD, NETWORK, MONITOR, TOOLS, SERVICE }
+enum class GlobalErrorSource { DASHBOARD, NETWORK, MONITOR, TOOLS, SERVICE, DEVICE_SETTINGS, DOWNLOAD }
 
 /** 后端健康检查周期（毫秒）：周期访问 /health 维护在线状态（仅前台）。 */
 private const val HEALTH_CHECK_INTERVAL_MS = 30_000L
 
 /**
- * 后端掉线提示去抖窗口（毫秒）。
- *
- * 2026-09：10s → 45s。切后台再回前台时网络栈可能短暂抖动，10s 去抖挡不住
- * 「回前台 → 业务失败 → 复查 /health」在 10s 内连着弹两次。
- */
-private const val BACKEND_DOWN_DEDUPE_MS = 45_000L
-
-/**
  * Core 更新期间豁免「后端掉线」弹窗的最长时间（毫秒）。
  *
  * 在线更新（`triggerDeviceUpdate`）与本地 APK 推送安装都会让 Core force-stop/重启，
- * 8088 断联约 1 分钟属预期。此窗口内业务失败 + /health 失败只当「更新中」，
+ * 8088 断联约 1 分钟属预期。此窗口内即使 /health 确证不可达也只当「更新中」，
  * 不弹掉线对话框（更新进度 UI 已有「设备重启中…」）。
  *
  * 超时后恢复弹窗：与 ToolsModule 更新轮询失联阈值（约 5 分钟）对齐，
  * 避免更新卡死时用户永远看不到「后端不可达」。
  */
 private const val CORE_UPDATE_EXEMPT_TIMEOUT_MS = 5 * 60_000L
+
+/**
+ * 豁免窗口的重算节拍（毫秒）。
+ *
+ * 必须有它：豁免到期是**时间**触发的，而判据的上游全是会去重相等值的 StateFlow ——
+ * 更新卡死时它们不再发值，没有节拍就永远走不到超时分支，启动页会一直停在 null 不报错。
+ * 取 30s：更新开始/结束本身由上游即时触发，节拍只负责 5 分钟窗口的到期判定，
+ * 与全站 /health 的 30s 周期同档。
+ */
+private const val CORE_UPDATE_EXEMPT_TICK_MS = 30_000L
+
+/**
+ * 启动页最长展示时间（ms）。
+ *
+ * 兜底用，不是常规路径 —— 预加载正常情况下 2 秒内跑完。它防的是"某一步挂住 120s
+ *（OkHttp readTimeout）导致启动页永远不消失"。宁可让用户进到一个数据还没齐的界面，
+ * 也不能把人锁在加载页上。
+ */
+private const val STARTUP_GATE_TIMEOUT_MS = 8_000L
+
+/**
+ * 启动页最短展示时间（ms）。
+ *
+ * 局域网上预加载可能几百毫秒就完事，不设下限时启动页会"闪一下" —— 比不显示更难看。
+ */
+private const val STARTUP_GATE_MIN_MS = 600L
 
 /**
  * 全局错误：一条待展示的错误文案 + 它来自哪里。
@@ -82,18 +109,17 @@ data class GlobalError(
 )
 
 /**
- * 后端掉线提示对话框状态。
+ * 写操作成功提示（2026-09-22）。与 [GlobalError] **对称**的成功通道。
  *
- * 由「数据加载出错 → 复查 /health 也失败」触发：此时基本可判定不是偶发网络抖动，而是后端
- * 服务挂了 / 地址不可达。UI 据此弹出一个带「重试 / 进入服务器设置」的对话框，比笼统的
- * 「加载失败」Toast 更有 actionable 的指引。
- *
- * @param errorMessage        最初触发此对话框的那条数据加载错误文案（主动探活路径为 null，无前置数据错误）
- * @param healthErrorMessage 复查 /health 失败的细节（null = 未取到）
+ * [seq] 是自增序号，唯一作用是**让同一条文案能连续触发两次**：
+ * 全局错误有 30s 同文案去重（防轮询刷屏），但成功提示不能去重 ——
+ * 用户连着保存两次就该看到两次确认。少了 seq，第二次的 `WriteNotice` 与第一次 equals 相等，
+ * 宿主的 `LaunchedEffect(notice)` 不会重新触发，表现就是"第二次点保存没反应"。
  */
-data class BackendDownDialogState(
-    val errorMessage: String?,
-    val healthErrorMessage: String?
+data class WriteNotice(
+    val message: String,
+    val subtitle: String? = null,
+    val seq: Long
 )
 
 /**
@@ -113,16 +139,16 @@ enum class ConnectivityStatus {
 }
 
 /**
- * @param title  一句话病因（横幅主文案）；[ConnectivityStatus.ONLINE]/[ConnectivityStatus.CHECKING] 时为 null
- * @param detail 下一步动作的指引（横幅副文案）
+ * @param title  一句话病因（弹窗标题）；[ConnectivityStatus.ONLINE]/[ConnectivityStatus.CHECKING] 时为 null
+ * @param detail 下一步动作的指引（弹窗正文）
  */
 data class ConnectivityUiState(
     val status: ConnectivityStatus,
     val title: String? = null,
     val detail: String? = null
 ) {
-    /** 是否应该显示离线横幅。CHECKING 不显示 —— 没结论就别吓用户。 */
-    val showBanner: Boolean
+    /** 是否处于「连不上」状态。CHECKING 不算 —— 没结论就别吓用户。 */
+    val hasProblem: Boolean
         get() = status != ConnectivityStatus.ONLINE && status != ConnectivityStatus.CHECKING
 
     /** 是否是「配都没配」——UI 可据此把按钮从「重试」换成「去配对」。 */
@@ -153,18 +179,25 @@ class MainViewModel(
     /** 只用来读「设备地址配过没有」（[connectivity] 的归因分支）。构造一次，别在 combine 里反复 new。 */
     private val appPrefs = AppPreferences(appContext)
 
-    val dashboard = DashboardModule(api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs)
+    // 跨模块 UI 事件汇聚点（eager 创建、开销极小）：各 module 构造时接收该 sink，
+    // 把自己的事件转发/直投到此。collectCrossModuleEvents 仅订阅本 sink，
+    // 不会在构造期触发 network / tools 的 by lazy 求值（修复冷启动 eager 加载，风险 #6）。
+    //
+    // 声明位置必须在 [dashboard] **之前**：Kotlin 按声明顺序初始化属性，
+    // 而 dashboard 是 eager 的，构造时就要拿到这个 sink；顺序反了传进去的是 null。
+    private val crossModuleEventSink = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
+
+    val dashboard = DashboardModule(
+        api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs,
+        // 2026-09-22：监控设置四个二级页的写结果要能到全局提示出口，所以 dashboard 也拿这个 sink。
+        crossModuleEventSink = crossModuleEventSink
+    )
 
     /**
      * 后端健康检查（周期探活 + 出错时即时复查）。[viewModelScope] 内常驻，供 UI 判断后端是否在线、
      * 以及数据加载失败时是否因后端挂了。见 [HealthModule]。
      */
     val health = HealthModule(api, viewModelScope)
-
-    // 跨模块错误事件汇聚点（eager 创建、开销极小）：NetworkModule / ToolsModule 构造时
-    // 接收该 sink，其 events 转发到此。collectCrossModuleEvents 仅订阅本 sink，
-    // 不会在构造期触发 network / tools 的 by lazy 求值（修复冷启动 eager 加载，风险 #6）。
-    private val crossModuleEventSink = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
 
     val network by lazy { NetworkModule(api, appContext, viewModelScope, crossModuleEventSink) }
     val tools by lazy { ToolsModule(api, appContext, viewModelScope, crossModuleEventSink, alertPrefs, coreUpdatePersistence) }
@@ -177,7 +210,7 @@ class MainViewModel(
     // 数据来自 core 的 /api/media（它查系统媒体库），播放仍走 /api/files/stream。
     val media by lazy { MediaModule(api, appContext, viewModelScope) }
     val apps by lazy { AppManagerModule(api, appContext, viewModelScope) }
-    val downloads by lazy { DownloadModule(appContext, viewModelScope) }
+    val downloads by lazy { DownloadModule(appContext, viewModelScope, crossModuleEventSink) }
     val tunnel by lazy { TunnelModule(appContext, viewModelScope) }
     val backup by lazy { BackupModule(api) }
 
@@ -186,14 +219,14 @@ class MainViewModel(
      *
      * by lazy：默认是关的，只有开了开关的用户才会有人访问它。
      */
-    val weather by lazy { WeatherModule(api, viewModelScope) }
+    val weather by lazy { WeatherModule(api, viewModelScope, crossModuleEventSink) }
 
     /**
      * 标题栏今日诗词（2026-09-18）：数据来自 core 的 `/api/poetry`（它代理 jinrishici v2）。
      *
      * by lazy 同上：默认关闭。挑诗的智能匹配在上游，本模块只负责取数与节流。
      */
-    val poetry by lazy { PoetryModule(api, viewModelScope) }
+    val poetry by lazy { PoetryModule(api, viewModelScope, crossModuleEventSink) }
 
     /**
      * 更新提示的唯一状态槽（2026-09-06）。
@@ -277,8 +310,14 @@ class MainViewModel(
         }
     }.stateIn(viewModelScope, SharingStarted.Eagerly, ConnectivityUiState(ConnectivityStatus.CHECKING))
 
-    /** 供 UI 的「重试」按钮调用：立刻探一次活。 */
+    /**
+     * 供掉线弹窗的「重试」按钮调用：清掉各模块的陈旧错误文案 + 立刻探一次活。
+     *
+     * 刻意**不**关弹窗：探活结果才是答案 —— 通了 [connectivity] 自己会翻 ONLINE、
+     * 弹窗随派生态消失；没通就该继续挂着。关掉再自己弹回来只会闪一下。
+     */
     fun retryConnectivity() {
+        clearError()
         viewModelScope.launch { runCatching { health.checkHealthNow() } }
     }
 
@@ -341,6 +380,14 @@ class MainViewModel(
         health.onAppForegrounded(HEALTH_CHECK_INTERVAL_MS)
     }
 
+    /**
+     * 启动页闸门协程（见 [startupGate]）。
+     *
+     * 必须**声明在 init 之前**：init 里就会调 [startupGate] 并给它赋值，
+     * 若声明在 init 之后，那句 `= null` 的初始化会把刚存的引用又抹掉。
+     */
+    private var startupGateJob: Job? = null
+
     // ── Init & Cleanup ──
     init {
         // Start modules
@@ -354,12 +401,12 @@ class MainViewModel(
         // Toast 出口那一侧另有静默，见 [globalError]。
         dashboard.pollGate = { tools.coreUpdating.value }
 
-        // 后端健康检查：周期探活（前台 30s）+ 数据出错时复查（见 collectBackendDownSignal）
+        // 后端健康检查：周期探活（前台 30s）+ 传输层失败时即时复查（见 HealthModule）。
+        // 它是全站唯一的可达性真源 —— connectivity 与掉线弹窗都从这里派生。
         health.startPeriodicCheck(HEALTH_CHECK_INTERVAL_MS)
-        collectBackendDownSignal()
-        // 周期探活**不再**因单次/未确证的 UNREACHABLE 直接弹窗（2026-09 误报治理）：
-        // 弹窗只挂在「业务请求失败 + 复查 /health 也失败」上（collectBackendDownSignal）。
-        // healthState 仍供 UI/调试展示。
+        collectConnectivityRecovery()
+        // 启动页闸门：与预加载同一条链路的收尾判据，见 startupGate 的说明
+        startupGate()
 
         // 收集跨模块事件，统一分发
         collectCrossModuleEvents()
@@ -396,6 +443,13 @@ class MainViewModel(
                     // 单条事件删除成功(AlertDeleted)由 MonitorScreen 直接收集 dashboard.events 处理，
                     // 不经过跨模块汇聚 sink，分发层忽略即可。
                     is UiEvent.AlertDeleted -> { }
+                    is UiEvent.ShowWriteNotice -> {
+                        _writeNotice.value = WriteNotice(
+                            message = event.message,
+                            subtitle = event.subtitle,
+                            seq = ++writeNoticeSeq
+                        )
+                    }
                 }
             }
         }
@@ -509,7 +563,18 @@ class MainViewModel(
             dashboard.stopAlertPolling()
             clearError()
             network.clearServiceError()
-            dismissBackendDownDialog()
+            skipConnectionNotice()
+            // 新鲜度戳必须跟着缓存一起清：只清 Room 不清戳，新设备的页面会因为
+            // 旧设备的戳还在窗口内而跳过请求，屏幕上留着上一台的信号与 WiFi 名。
+            dashboard.resetFreshness()
+            network.resetFreshness()
+            // 播放队列快照一起清：里面存的是**旧设备上的文件路径**，在新设备上基本不成立。
+            // 不清的话换设备后音乐全放不出来，队列面板还列着一堆上一台设备的歌。
+            AppPreferences(appContext).clearAudioQueue()
+            // 让下一次 ONLINE 为新设备重新跑一轮预加载，并重新挂起启动页
+            preload.reset()
+            _startupPhaseDone.value = false
+            startupGate()
         }
     }
 
@@ -523,6 +588,12 @@ class MainViewModel(
         if (hostChanged) {
             viewModelScope.launch { runCatching { dashboard.clearDashboardCache() } }
             clearError()
+            // 换的是另一台设备：同 prepareDeviceSwitch，戳与预加载一并复位
+            dashboard.resetFreshness()
+            network.resetFreshness()
+            // 队列快照里存的是旧设备的路径，换地址后必须清（见 prepareDeviceSwitch 的说明）
+            AppPreferences(appContext).clearAudioQueue()
+            preload.reset()
         }
         // 停掉旧地址上的告警轮询，避免下一轮仍打旧 baseUrl（refresh 会再启）
         dashboard.stopAlertPolling()
@@ -554,8 +625,14 @@ class MainViewModel(
     //
     // 为什么 [GlobalError] 里不放 retry lambda：那样每次 combine 都产生新实例、equals 恒为 false，
     // 宿主的 LaunchedEffect 会被每一轮轮询重启。改成只带 [GlobalErrorSource] 枚举，
-    // 重试动作由 [retryGlobalError] 按来源分派 —— 值语义干净，宿主可以安心用它当 key。
-    private val rawGlobalError: Flow<GlobalError?> = combine(
+    // 重试动作由来源分派 —— 值语义干净，宿主可以安心用它当 key。
+    //
+    // 2026-09-22：拆成两层 combine。`deviceSettingsState` 是第 6 个来源，而 Kotlin 的
+    // `combine` 具名重载只到 5 参，第 6 个起要走 vararg 版本（元素类型被擦成 Array<*>，
+    // 取值得强转，写错了编译器也不报）。内层先把原来的 5 个按严重度排成有序列表，
+    // 外层再把设备设置插到正确位置 —— 比 vararg + 下标可读得多，也不必为了凑 5 个
+    // 把某个来源塞进别人的 state。
+    private val baseGlobalErrors: Flow<List<GlobalError>> = combine(
         dashboard.dashboardState,
         network.networkState,
         dashboard.monitorState,
@@ -563,18 +640,56 @@ class MainViewModel(
         network.serviceState
     ) { dash, net, monitor, toolsState, service ->
         // 顺序 = 严重度：设备级操作失败 > 页面数据拉取失败。
-        val service0 = service.errorMessage
-        val dash0 = dash.errorMessage
-        val net0 = net.errorMessage
-        val monitor0 = monitor.errorMessage
-        val tools0 = toolsState.errorMessage
+        buildList {
+            service.errorMessage?.let { add(GlobalError(it, GlobalErrorSource.SERVICE)) }
+            dash.errorMessage?.let { add(GlobalError(it, GlobalErrorSource.DASHBOARD)) }
+            net.errorMessage?.let { add(GlobalError(it, GlobalErrorSource.NETWORK)) }
+            monitor.errorMessage?.let { add(GlobalError(it, GlobalErrorSource.MONITOR)) }
+            toolsState.errorMessage?.let { add(GlobalError(it, GlobalErrorSource.TOOLS)) }
+        }
+    }
+
+    /**
+     * 2026-09-22 新接入 `deviceSettingsState`：FOTA / 性能模式 / 指示灯 / 数据漫游 /
+     * WiFi 休眠 / Samba / 定时重启这 7 个写操作**一直在往它的 errorMessage 写、却零消费** ——
+     * 全仓没有一处读它，于是这 7 项失败时界面完全没反馈。这正是本段注释开头说的
+     * `ServiceControlState` 同一个坑，换了个 state 复发。
+     *
+     * 严重度插在 SERVICE 之后、DASHBOARD 之前：它们都是用户主动发起的设备级写操作，
+     * 比页面取数失败更需要被看到。
+     *
+     * 附带的行为变化：`deviceSettingsState` 的**加载**失败（loadDeviceSettings 的 catch）
+     * 原来也是静默的，现在会一起冒 Toast。这是刻意的一致化 —— 其他 4 个来源的加载失败
+     * 早就在弹了；Core 升级期间的噪音由 [globalError] 出口已有的静默闸门兜住。
+     *
+     * 2026-09-22 同轮接入 `downloads.state`：下载模块的 14 个写操作（创建/暂停/恢复/删除/
+     * 重试/重命名/清空/改配置/Tracker 刷新与保存…）**一直在写它的 errorMessage、同样零消费**
+     * —— 全仓没有一处读，于是「下载设置改一项」失败时界面只弹一句乐观的「已保存」。
+     * 这是 `deviceSettingsState` 那个坑的第三次复发，按 §4.8 一次接全（枚举 + combine +
+     * dismiss 分派三处同步）。
+     *
+     * 代价：本属性是 eager 初始化的，读 `downloads.state` 会把 `downloads` 的 by lazy 提前求值。
+     * 可接受 —— `DownloadModule` 的构造只是 new 一个 `MutableStateFlow(DownloadState())`，
+     * 不发请求、不注册监听；而 `network` / `tools` 早就因为同一个原因被这里提前求值了。
+     */
+    private val rawGlobalError: Flow<GlobalError?> = combine(
+        baseGlobalErrors,
+        network.deviceSettingsState,
+        downloads.state
+    ) { base, deviceSettings, download ->
+        val device = deviceSettings.errorMessage?.let {
+            GlobalError(it, GlobalErrorSource.DEVICE_SETTINGS)
+        }
+        val downloadErr = download.errorMessage?.let {
+            GlobalError(it, GlobalErrorSource.DOWNLOAD)
+        }
         when {
-            service0 != null -> GlobalError(service0, GlobalErrorSource.SERVICE)
-            dash0 != null -> GlobalError(dash0, GlobalErrorSource.DASHBOARD)
-            net0 != null -> GlobalError(net0, GlobalErrorSource.NETWORK)
-            monitor0 != null -> GlobalError(monitor0, GlobalErrorSource.MONITOR)
-            tools0 != null -> GlobalError(tools0, GlobalErrorSource.TOOLS)
-            else -> null
+            // SERVICE 最高（启停服务 / 关机 / 重启设备），永远优先
+            base.firstOrNull()?.source == GlobalErrorSource.SERVICE -> base.first()
+            device != null -> device
+            // 下载排在设备设置之后、页面取数之前：也是用户主动发起的写，但不改设备配置
+            downloadErr != null -> downloadErr
+            else -> base.firstOrNull()
         }
     }
 
@@ -597,22 +712,120 @@ class MainViewModel(
         if (updating) null else err
     }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    // ── 后端掉线提示（2026-09-12）──
+    // ── 写操作成功提示（2026-09-22）──────────────────────────────────────────
     //
-    // 触发链：任意数据加载出错（globalError 非空）→ 即时复查 /health。
-    // 若探活也失败，说明不是偶发抖动、而是后端服务挂了 / 地址不可达，弹出带
-    // 「重试 / 进入服务器设置」的对话框；否则只走常规错误 Toast（后端其实在线，错误另有原因）。
+    // 与 [globalError] 同构：一条流 + 一个 Activity 级宿主。理由也一样 —— 让每个页面
+    // 自己 `var toastMessage by remember` 就会抄 N 遍渲染代码，漏一个页面就变成静默成功。
     //
-    // 去抖：对话框已弹出时不再重复触发；同一句错误 10s 内不重复复查，避免轮询失败把
-    // /health 打成一波随抖动走的轮询。
-    private val _backendDownDialog = MutableStateFlow<BackendDownDialogState?>(null)
-    val backendDownDialogState: StateFlow<BackendDownDialogState?> = _backendDownDialog.asStateFlow()
+    // 这里刻意**不做**同文案去重（错误通道有 30s 去重是为了压住轮询刷屏）：
+    // 连续保存两次就该看到两次确认，去重会让第二次看起来"没反应"。由 [WriteNotice.seq] 保证。
+    private val _writeNotice = MutableStateFlow<WriteNotice?>(null)
+    val writeNotice: StateFlow<WriteNotice?> = _writeNotice.asStateFlow()
 
-    /** 后端掉线弹窗去抖时间戳：两条触发路径（数据错误 / 主动探活）共用，避免互相刷屏。 */
-    private var lastBackendDownAt = 0L
+    /** [WriteNotice.seq] 的自增源。只在主线程（事件收集协程）里递增，不需要原子类型。 */
+    private var writeNoticeSeq = 0L
 
-    /** 本轮「Core 更新中」豁免的起始时刻（0 = 当前未处于豁免）。超时后恢复掉线弹窗。 */
+    /** 宿主展示完毕后回调，清空以便下一条能进来。 */
+    fun dismissWriteNotice() {
+        _writeNotice.value = null
+    }
+
+    /**
+     * **纯本地**写操作的成功提示入口（2026-09-22）。
+     *
+     * 只给"没有任何 module 负责、也没有网络请求可以失败"的那类写用 —— 目前只有
+     * 「服务器配置 → 连接配置」的 Core IP / 端口（它写的是本机 `AppPreferences`）。
+     * 这类操作没有失败分支，所以不需要 module 层的成功/失败收尾，但成功提示仍然要走
+     * **同一个宿主**，否则又会在页面里长出一份私有 toast（见 [globalError] 那段注释里
+     * 反复出现的"抄 N 遍就会漏"）。
+     *
+     * 有网络请求的写操作**不要**用它：那些必须在 module 里等结果，成功才发 notice。
+     */
+    fun notifyLocalWriteSucceeded(message: String, subtitle: String? = null) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    }
+
+    // ── 「连不上设备」的唯一展示面：启动页（2026-09-22 二次收敛）────────────────
+    //
+    // 演进三步，后人别再倒退回前两步：
+    // 1. 断线时首页同时出现三处提示 —— 顶部全局横幅 + 卡内「服务状态条」+ 模态弹窗，
+    //    且横幅与弹窗来自两套判据不同的检测器。
+    // 2. 收敛成一处模态弹窗，全部派生自 [connectivity]（/health 连击确证，唯一权威可达性）。
+    // 3. **弹窗也撤掉**，改由[启动页]承担：加载中显示预加载进度，连不上就在同一个面上
+    //    显示病因 + 动作。理由是用户的原话「我更需要这个来显示」——
+    //    冷启动连不上时，一个铺满屏幕、写清病因和下一步的页面比一个盖在空界面上的弹窗清楚。
+    //
+    // 顺带修掉旧链的一个真实缺陷：它的 45s 去抖按**错误文本**分组
+    //（`err.message == lastHandledMessage`），而断线时各模块会依次抛出措辞不同的错误，
+    // 每换一条文本就绕过去抖 —— 用户点掉弹窗后马上会被另一条文本再弹一次。
+    // 派生态没有"触发"的概念，同一轮掉线只有一个状态，不存在重复弹。
+
+    /**
+     * 用户点了「先进入应用」：本轮掉线不再用启动页挡着。恢复 ONLINE 后复位，下次掉线重新挡。
+     *
+     * 必须留这个出口：三种病因里有两种不是在这个页面里能解决的 ——
+     * 「手机未连接网络」要去系统 WiFi 设置、「未配置设备地址」要走配对流程。
+     * 没有出口就等于把用户锁在一个按不动的页面上。让开之后仪表盘卡内状态条
+     * 仍然显示「后端服务未连接」，信息不会丢。
+     */
+    private val _connectionNoticeSkipped = MutableStateFlow(false)
+
+    /**
+     * 本轮「Core 更新中」豁免的起始时刻（0 = 当前未处于豁免）。
+     *
+     * 只在 [coreUpdateExempt] 那条流的收集协程里读写（单协程顺序执行），
+     * 不再在 [startupProblem] 的变换体里改实例字段。
+     */
     private var coreUpdateExemptSince = 0L
+
+    /**
+     * 「Core 更新中」豁免此刻是否仍然生效。
+     *
+     * 三条上游：`coreUpdating` / `updateDeviceState` 负责"更新开始/结束"的即时反应，
+     * 时间节拍负责"豁免到期"—— 更新卡死时前两条是去重的 StateFlow，不会再发值，
+     * 没有节拍就永远算不出超时（见 [CORE_UPDATE_EXEMPT_TICK_MS]）。
+     */
+    private val coreUpdateExempt: Flow<Boolean> = combine(
+        tools.coreUpdating,
+        tools.updateDeviceState,
+        flow<Long> {
+            while (true) {
+                emit(System.currentTimeMillis())
+                delay(CORE_UPDATE_EXEMPT_TICK_MS)
+            }
+        }
+    ) { _, _, nowMs ->
+        if (!isCoreUpdateInterruptingBackend()) {
+            coreUpdateExemptSince = 0L
+            false
+        } else {
+            if (coreUpdateExemptSince == 0L) coreUpdateExemptSince = nowMs
+            // 豁免超时（更新卡死）→ 不再豁免，照常报，否则用户永远看不到异常
+            nowMs - coreUpdateExemptSince < CORE_UPDATE_EXEMPT_TIMEOUT_MS
+        }
+    }.distinctUntilChanged()
+
+    /**
+     * 启动页当前要不要显示「连不上」那一态，以及显示什么。null = 正常（显示加载进度）。
+     *
+     * 两道闸：
+     * 1. [connectivity] 确证不可达（CHECKING 不算，冷启动首屏不吓人）；
+     * 2. 不在 Core 更新豁免窗内（见 [coreUpdateExempt]）——
+     *    升级 Core 时 8088 必然断联约 1 分钟，那是预期结果，不该拿一整页去报。
+     *
+     * 这里的变换是纯函数：豁免的判定与计时全在 [coreUpdateExempt] 里，
+     * 所以启动页不会因为"上游不再发值"而卡在某一态。
+     */
+    val startupProblem: StateFlow<ConnectivityUiState?> = combine(
+        connectivity,
+        coreUpdateExempt
+    ) { conn, exempt ->
+        when {
+            !conn.hasProblem -> null
+            exempt -> null
+            else -> conn
+        }
+    }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
     /**
      * Core 是否正在更新并导致后端必然不可达（在线自更新 / 本地 APK 推送安装皆算）。
@@ -620,7 +833,7 @@ class MainViewModel(
      * 判据两路 OR：
      * 1. 持久化标记 `core_update_in_progress`（触发更新或本地安装时写入，App 被杀仍在）；
      * 2. 内存态 [ToolsModule.updateDeviceState]：`uploading` / `installing` / `reconnecting`。
-     * 任一为真即豁免掉线弹窗；终态 done/failed 会清标记与状态（见 ToolsModule）。
+     * 任一为真即豁免；终态 done/failed 会清标记与状态（见 ToolsModule）。
      */
     private fun isCoreUpdateInterruptingBackend(): Boolean {
         if (coreUpdatePersistence.isCoreUpdating()) return true
@@ -628,100 +841,105 @@ class MainViewModel(
         return st?.state in setOf("uploading", "installing") || st?.reconnecting == true
     }
 
-    /** 关闭后端掉线提示（用户点了重试 / 服务器设置 / 返回键 / 点遮罩）。 */
-    fun dismissBackendDownDialog() {
-        _backendDownDialog.value = null
+    /** 「先进入应用」：让启动页让开，剩下的靠仪表盘卡内状态条继续显示。 */
+    fun skipConnectionNotice() {
+        _connectionNoticeSkipped.value = true
     }
 
     /**
-     * 「重试」：关闭对话框 + 清掉各模块的错误文案（下次轮询会重新拉取，若后端已恢复即正常），
-     * 并立刻复查一次健康状态——若仍不可达，下一次数据加载出错会再次弹窗；若已恢复则不再弹。
-     */
-    fun retryFromBackendDown() {
-        _backendDownDialog.value = null
-        clearError()
-        viewModelScope.launch { health.checkHealthNow() }
-    }
-
-    /**
-     * 订阅 globalError：出现新错误且对话框未弹出时，复查后端健康，失败则弹窗。
+     * 连接恢复时复位「先进入应用」：否则让开过一次之后，这台设备再也不会用启动页挡。
      *
-     * ⚠️ 健壮性（2026-09-12 修复）：收集协程必须「长生不老」。
-     * 旧实现用 try/catch 把异常（含 viewModelScope 取消竞态导致的 NPE）吞掉后协程直接结束——
-     * 一旦在运行期（约 19s 的取消竞态）崩一次，之后所有后端掉线都不再弹窗，只剩 Toast 照常，
-     * 表现为「Toast 提示无法连接后端、对话框却不出现」。
-     * 现改用 while(isActive) 包住 collect：单次 collect 抛异常仅记日志并 delay 后重新订阅 globalError，
-     * 探测器始终在线；仅 CancellationException 原样上抛以正常结束协程。
-     * 顺带兜住初始化顺序潜在问题：若首轮 globalError 尚未就绪导致 collect 抛 NPE，重试时它已初始化。
+     * 顺带承担首屏预加载的**启动闸门**：预加载必须等 `/health` 确证在线才能发，
+     * 否则十来个必定失败的请求会自己把 `HealthModule` 的"3 秒内 2 次失败"确证坐实，
+     * 变成开机就报连不上（见 [PreloadCoordinator] 的第 3 条约束）。
      */
-    private fun collectBackendDownSignal() {
+    private fun collectConnectivityRecovery() {
         viewModelScope.launch {
-            var lastHandledMessage: String? = null
-            while (isActive) {
-                try {
-                    globalError.collect { err ->
-                        if (err == null) {
-                            lastHandledMessage = null
-                            return@collect
-                        }
-                        if (_backendDownDialog.value != null) return@collect
-                        // WS 仍连着：后端进程活着，HTTP 单次失败更像瞬时抖动，不弹全屏「掉线」
-                        if (webSocketRepository.connectionState.value == ConnectionState.CONNECTED) {
-                            return@collect
-                        }
-                        // Core 更新/本地安装会让 8088 断联约 1 分钟：只当「更新中」，
-                        // 不弹后端掉线（更新进度 UI 已展示「设备重启中…」）。
-                        // 超过 CORE_UPDATE_EXEMPT_TIMEOUT_MS 仍未恢复 → 恢复掉线弹窗，
-                        // 避免更新卡死时用户永远看不到异常。
-                        if (isCoreUpdateInterruptingBackend()) {
-                            val nowMs = System.currentTimeMillis()
-                            if (coreUpdateExemptSince == 0L) coreUpdateExemptSince = nowMs
-                            if (nowMs - coreUpdateExemptSince < CORE_UPDATE_EXEMPT_TIMEOUT_MS) {
-                                return@collect
-                            }
-                            // 豁免超时：重置计时，走后面的 backend-down；更新若仍在进行，
-                            // 下一轮 collect 会重新起一轮豁免窗口（但此时已弹过掉线窗）。
-                            coreUpdateExemptSince = 0L
-                        } else {
-                            coreUpdateExemptSince = 0L
-                        }
-                        val now = System.currentTimeMillis()
-                        if (err.message == lastHandledMessage && now - lastBackendDownAt < BACKEND_DOWN_DEDUPE_MS) {
-                            return@collect
-                        }
-                        lastHandledMessage = err.message
-                        lastBackendDownAt = now
-                        val reachable = runCatching { health.checkHealthNow() }.getOrDefault(false)
-                        // 两个独立信号：业务请求已失败 + /health 也失败 → 可定性为后端不可达。
-                        // 周期探活单独失败**不**走这里（见 init 注释），所以不需要 HealthModule
-                        // 再叠一层「连击确证」——那会拖慢真正的掉线提示。
-                        if (!reachable) {
-                            _backendDownDialog.value = BackendDownDialogState(
-                                errorMessage = err.message,
-                                healthErrorMessage = health.healthState.value.errorMessage
-                            )
-                        }
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    DebugLog.w(
-                        "MainViewModel",
-                        "collectBackendDownSignal 收集异常（已忽略，1s 后重试）: ${e.message}"
-                    )
-                    delay(1000)
+            connectivity.collect { conn ->
+                if (conn.status == ConnectivityStatus.ONLINE) {
+                    _connectionNoticeSkipped.value = false
+                    preload.start()
                 }
             }
         }
     }
 
+    // ── 首屏预加载 + 启动页（2026-09-22）──────────────────────────────────────
+    private val preload by lazy {
+        PreloadCoordinator(viewModelScope, dashboard, network, tools)
+    }
+
+    /** 启动页那行小字与计数的数据源。 */
+    val preloadProgress: StateFlow<PreloadProgress> get() = preload.progress
+
+    /** 启动阶段（探活出结论 → 预加载发完 → 首份数据落地）是否已经走完。 */
+    private val _startupPhaseDone = MutableStateFlow(false)
+
     /**
-     * 2026-09 误报治理：删除「周期探活 → 直接弹窗」路径（原 collectHealthStatus）。
+     * 启动页是否还挡着。
      *
-     * 切后台再回前台时 /health 极易超时记成 UNREACHABLE，旧实现会立刻弹「后端掉线」。
-     * 现在弹窗**只**由 [collectBackendDownSignal] 触发：业务请求失败 + 复查 /health 失败。
-     * healthState 仍更新，供调试/设置展示，不再单独驱动全屏对话框。
+     * 两种挡的理由，合并成一个布尔：
+     * 1. **启动阶段没走完** —— 正常的"正在加载"。
+     * 2. **连不上设备** —— 这一条就是原来那个模态弹窗的职责。用户点「先进入应用」
+     *    可以让开（[skipConnectionNotice]），恢复 ONLINE 后自动复位。
+     *
+     * 存在 ViewModel 而不是 Activity 的 `remember`：VM 跨 Activity 重建存活，
+     * 所以旋转屏幕 / 从最近任务回来不会再看一遍启动页（参考实现那边用
+     * `hasCompletedFirstRefresh` 达到同样效果）。
      */
+    val startupOverlayVisible: StateFlow<Boolean> = combine(
+        _startupPhaseDone,
+        startupProblem,
+        _connectionNoticeSkipped
+    ) { done, problem, skipped ->
+        when {
+            !done -> true
+            problem != null && !skipped -> true
+            else -> false
+        }
+    }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, true)
+
+    /**
+     * 启动阶段的收尾条件。**注意它只负责「加载中」那一态的结束**，
+     * 连不上时页面继续挡着是 [startupOverlayVisible] 那边的事。
+     *
+     * ## 为什么不是"等预加载全部完成"
+     * [PreloadProgress.finished] 只代表所有步骤**已发起**（module 里那些 `loadXxx()` 是
+     * fire-and-forget），此刻回包可能还没落地，放行就会看到一屏骨架。所以再叠一个
+     * **数据就绪**判据：仪表盘拿到 `deviceInfo`（那是全站唯一的骨架屏判据）。
+     *
+     * ## 为什么每条路都必须有终局
+     * 参考实现（UFITOOLS-Widget）在 ViewModel 注释里记过这个坑：拦停既不算成功也不算失败，
+     * 若某条分支静默返回，调用方就无从得知本次刷新已结束，**加载动画会永远停在"请稍候"**。
+     * 这里的三条终局：
+     * 1. 预加载步骤发完 **且** `deviceInfo != null`；
+     * 2. `connectivity` 确证**不可达**（不启动预加载，直接结束"加载中"，
+     *    页面随即切到「连不上」那一态）；
+     * 3. [STARTUP_GATE_TIMEOUT_MS] 兜底 —— 上面两条都没成立也必须收尾。
+     *
+     * 另有 [STARTUP_GATE_MIN_MS] 最短展示：局域网上预加载可能几百毫秒就完事，
+     * 不设下限的话启动页会"闪一下"，比不显示更难看。
+     */
+    private fun startupGate() {
+        // 重进闸门（切设备）必须先取消上一条：旧协程可能还卡在 8s 超时或最短展示的 delay 上，
+        // 它醒来后那句 `_startupPhaseDone = true` 会把新设备的启动页提前放掉。
+        startupGateJob?.cancel()
+        startupGateJob = viewModelScope.launch {
+            val begunAt = SystemClock.elapsedRealtime()
+            withTimeoutOrNull(STARTUP_GATE_TIMEOUT_MS) {
+                // 先等探活出结论；CHECKING 阶段什么都不做（冷启动首屏本来就在这一档）
+                val settled = connectivity.first { it.status != ConnectivityStatus.CHECKING }
+                if (settled.status != ConnectivityStatus.ONLINE) return@withTimeoutOrNull
+                preload.start()
+                preload.progress.first { it.finished }
+                // 步骤发完 ≠ 数据到齐，再等骨架屏判据消失
+                dashboard.dashboardState.first { it.deviceInfo != null }
+            }
+            val elapsed = SystemClock.elapsedRealtime() - begunAt
+            if (elapsed < STARTUP_GATE_MIN_MS) delay(STARTUP_GATE_MIN_MS - elapsed)
+            _startupPhaseDone.value = true
+        }
+    }
 
     /** 展示完毕后清掉该来源的错误，避免陈旧错误在切页 / 重组时被当成新错误再弹一次。 */
     fun dismissGlobalError(source: GlobalErrorSource) {
@@ -731,6 +949,8 @@ class MainViewModel(
             GlobalErrorSource.MONITOR -> dashboard.clearMonitorMessage()
             GlobalErrorSource.TOOLS -> tools.clearError()
             GlobalErrorSource.SERVICE -> network.clearServiceError()
+            GlobalErrorSource.DEVICE_SETTINGS -> network.clearDeviceSettingsError()
+            GlobalErrorSource.DOWNLOAD -> downloads.clearError()
         }
     }
 

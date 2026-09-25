@@ -28,6 +28,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.draw.alpha
@@ -374,16 +375,30 @@ fun UfiDialogSectionTitle(title: String) {
 /**
  * 标准弹窗底部操作区：「取消(描边左) + 确认(实色主色右)」等宽双按钮。
  *
- * 放在 [UfiDialogBody] 之后（作为 content 的最后一个子元素），
- * 或配合 `UfiCustomDialog(showCloseButton=false)` 使用并**不传** confirmButton/dismissButton 槽位。
- *
- * 本组件自带底边距 22dp（对齐参考项目 UFITOOLS-Widget 的 paddingBottom）和顶部间距。
- *
  * 两种"危险操作"摆法，别混：
  * - [confirmDestructive]：**右侧确认键**本身就是危险动作（「确定删除？」这类二次确认弹窗）；
  * - [dismissDestructive]：**左侧槽位**是危险动作、右侧确认键只是关闭（如详情弹窗「删除 / 确认」）。
  *   2026-08-29 加入 —— 此前这种布局只能在调用处手搓 `Row { Danger 按钮; Primary 按钮 }`，
  *   间距和底边距全靠抄，容易和标准弹窗对不齐。
+ *
+ * ## 上间隔怎么来的（2026-09-22 整理，踩过三次的地方）
+ *
+ * 本组件**不自带**上间距，也不自带分隔线。它只是一行按钮，间隔由「它挂在谁下面」提供：
+ *
+ * - 放在 [UfiDialogBody] **里面**（最后一个子元素）→ body 的 `spacedBy(Spacing.Large)` 给 12dp，
+ *   [topSpacing] 保持默认 0。
+ * - 走 `UfiScrollableDialog(actions = { ... })` 槽位 → 壳子给「8dp + 分隔线 + 12dp」，同样传默认 0。
+ * - 放在 content 里、但在 [UfiDialogBody] **外面** → shell 的内容列**没有** spacedBy，
+ *   什么都没有，必须显式传 `topSpacing = Spacing.Large`。
+ *
+ * 最后那一档是实打实踩过的坑：2026-09-22 盘点时有 12 个调用点属于它且都没给间隔，
+ * 表现就是「连接配置 / Web 面板弹窗的按钮和上面的输入框粘在一起」。
+ *
+ * 反过来也别给多：2026-09-18 本组件里原有一个 18dp 的 Spacer，被删掉的原因正是它会与
+ * body 的 12dp 叠成 30dp（当时的症状是更新设置弹窗「内容→按钮」比「标题→内容」宽一倍半）。
+ * 所以间隔只能由**一侧**提供，不要两边都给。
+ *
+ * @param topSpacing 与上方内容的间隔，默认 0dp（由挂载位置提供）。仅「body 外的 content」这一档需要传。
  */
 @Composable
 fun UfiDialogActions(
@@ -394,7 +409,8 @@ fun UfiDialogActions(
     confirmDestructive: Boolean = false,
     enabled: Boolean = true,
     loading: Boolean = false,
-    dismissDestructive: Boolean = false
+    dismissDestructive: Boolean = false,
+    topSpacing: Dp = 0.dp
 ) {
     val palette = LocalResolvedPalette.current
     // 2026-09-18：两侧动作统一经 [LocalUfiDialogClose] 排时序 —— 弹窗离场的 backdrop
@@ -402,11 +418,13 @@ fun UfiDialogActions(
     // 若某个 onConfirm 其实不关闭弹窗（做了校验决定留下），shell 会把 backdrop 恢复回去。
     // 在 shell 之外使用本组件时该 local 是"直接执行"，行为不变。
     val close = LocalUfiDialogClose.current
-    // 2026-09-18：这里原来有一个 Spacer(DialogPaddingH = 18dp)。
+    // 2026-09-18：这里原来有一个**无条件**的 Spacer(DialogPaddingH = 18dp)。
     // 弹窗内容普遍改走 UfiDialogBody（spacedBy 12dp）之后，它会和 body 的间距叠成 30dp ——
     // 「内容 → 底部按钮」比「标题 → 内容」宽了一倍半，典型症状就是更新设置弹窗那一处。
-    // 现在"内容→按钮"这一段由 body 的 spacedBy 唯一提供，本组件不再自带上间距。
-    // 水平 padding 同理：唯一来源是 UfiDialogShell 的内容列（18dp）。
+    // 2026-09-22：改成由调用方按挂载位置显式声明（见 KDoc 的三档），默认仍是 0 ——
+    // 无条件给和无条件不给都错，只有「谁在上面谁给」才不会叠也不会漏。
+    if (topSpacing > 0.dp) Spacer(Modifier.height(topSpacing))
+    // 水平 padding 的唯一来源是 UfiDialogShell 的内容列（18dp），这里不要再加。
     Row(
         modifier = Modifier
             .fillMaxWidth(),

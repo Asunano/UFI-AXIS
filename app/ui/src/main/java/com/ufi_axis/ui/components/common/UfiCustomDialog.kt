@@ -317,10 +317,24 @@ fun UfiScrollableDialog(
         }
 
         // FIX-24：actions slot 渲染在 confirmButton/dismissButton 之后（互斥，建议 caller 二选一）。
-        // 同样加分隔线 + 上下 Spacing.Large padding，与 confirmButton 行视觉一致。
+        //
+        // 2026-09-22：补回「内容 → 按钮区」的间隔。上面这条注释一直声称"加分隔线 + 上下
+        // Spacing.Large padding"，但实现里**只有分隔线**：滚动内容紧贴分隔线、分隔线又紧贴按钮，
+        // 于是走 actions 槽位的那批弹窗（WiFi 热点 / DHCP / 设备后台 / 配对…）内容与按钮粘在一起。
+        //
+        // 节奏对齐上面 confirmButton 分支这条**唯一基准**：
+        //   内容 —8dp— 分隔线 —12dp— 按钮 —18dp— 下边框（最后一段由 shell 的 bottom padding 提供）
+        // 第一段刻意用 Medium(8dp) 而不是 DialogPaddingH(18dp)：18dp 会让按钮上方留白
+        // （18+1+12=31dp）远大于下方 18dp，观感是"按钮往下沉"。
+        //
+        // 为什么不把间隔加回 UfiDialogActions 自身：2026-09-18 刚因为"它会与 UfiDialogBody 的
+        // spacedBy(12dp) 叠成 30dp"而删掉（见该组件注释）。加回去会让**塞在 body 里**的调用点
+        // 重犯那个 bug —— 间隔只能由"按钮区在谁下面"这一侧提供，不能两边都给。
         if (actions != null) {
             val palette = LocalResolvedPalette.current
+            Spacer(Modifier.height(Spacing.Medium))
             HorizontalDivider(color = palette.divider.copy(alpha = 0.08f))
+            Spacer(Modifier.height(Spacing.Large))
             actions()
         }
     }

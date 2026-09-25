@@ -492,9 +492,12 @@ class MainActivity : ComponentActivity() {
                         // 探测器必须挂在这里（Activity 顶层）而不是控件内部：标题栏要先知道
                         // "有没有东西要显示"才能决定版式，写在控件里就成了「不渲染 ⇒ 探测不到」的死结。
                         UfiAudioNowPlayingProbe(viewModel)
-                        LaunchedEffect(navController) {
+                        // 槽位是**进程级**单例，lambda 捕获了 navController：
+                        // 离开时必须清掉，否则 Activity 销毁后槽里还攥着一个已死的 navController。
+                        DisposableEffect(navController) {
                             UfiNowPlayingSlot.content.value =
                                 { UfiAudioNowPlayingChip(navController) }
+                            onDispose { UfiNowPlayingSlot.content.value = null }
                         }
                         // 标题栏「标题下方小字」：天气 + 今日诗词（2026-09-18）。
                         // 天气原来在标题栏右侧、与正在播放抢位置，现在两者各有其位。

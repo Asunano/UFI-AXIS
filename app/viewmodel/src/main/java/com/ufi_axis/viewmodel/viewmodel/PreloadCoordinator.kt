@@ -13,6 +13,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -204,8 +205,10 @@ internal class PreloadCoordinator(
             // ★ 这一行是竞态里最要命的写入：`MainViewModel.startupGate` 等的就是
             //   `progress.first { it.finished }`。旧轮次写到这里必须被拦掉，
             //   否则新一轮才刚开始、启动门就被旧轮放行了。
-            if (gen != generation.get()) return@launch
-            _progress.value = _progress.value.copy(label = "准备就绪", finished = true)
+            //   校验与写入必须在**同一次原子更新**里：分成两步时 reset() 可能正好落在中间。
+            _progress.update { cur ->
+                if (gen != generation.get()) cur else cur.copy(label = "准备就绪", finished = true)
+            }
             DebugLog.d(TAG, "首屏预加载结束")
         }
     }

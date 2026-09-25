@@ -35,7 +35,9 @@ class UfiNotifyAccessibilityService : AccessibilityService() {
     }
 
     override fun onInterrupt() {
-        BackgroundActionHelper.unregisterAccessibilityContext()
+        // 空实现：onInterrupt 表示"反馈被中断"，服务本身仍存活。
+        // 在这里解绑会让特权 Context 永久失效（不会再有第二次 onServiceConnected），
+        // 解绑只留在 onDestroy。
     }
 
     override fun onDestroy() {

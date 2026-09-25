@@ -9,6 +9,7 @@ import com.ufi_axis.util.DebugLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -40,7 +41,14 @@ data class WeatherState(
 
 class WeatherModule(
     private val api: UfiAxisApi,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    /**
+     * 跨模块 UI 事件出口（2026-09-22，阶段 3.5）：写成功提示直投这里，由
+     * `MainViewModel.writeNotice` 落到 Activity 级 Toast 宿主。
+     *
+     * 本模块没有 `_events`，也不需要 —— sink 是构造参数，直接投比再加一层转发协程干净。
+     */
+    private val crossModuleEventSink: MutableSharedFlow<UiEvent>
 ) {
     private val _state = MutableStateFlow(WeatherState())
     val state: StateFlow<WeatherState> = _state.asStateFlow()
@@ -119,7 +127,11 @@ class WeatherModule(
     }
 
     /** 开关。关掉时不清城市 —— 再打开还是原来那个城市。 */
-    fun setEnabled(enabled: Boolean) = patch(WeatherConfigRequest(enabled = enabled), refreshAfter = enabled)
+    fun setEnabled(enabled: Boolean) = patch(
+        WeatherConfigRequest(enabled = enabled),
+        refreshAfter = enabled,
+        successNotice = if (enabled) "已开启标题栏天气" else "已关闭标题栏天气"
+    )
 
     /** 选定城市：名字与坐标一起写，不允许只改一半。 */
     fun setCity(city: WeatherCity) = patch(
@@ -128,16 +140,29 @@ class WeatherModule(
             latitude = city.latitude,
             longitude = city.longitude
         ),
-        refreshAfter = true
+        refreshAfter = true,
+        successNotice = "城市已设为「${displayName(city)}」"
     )
 
-    fun setUnit(unit: String) = patch(WeatherConfigRequest(unit = unit), refreshAfter = true)
+    fun setUnit(unit: String) = patch(
+        WeatherConfigRequest(unit = unit),
+        refreshAfter = true,
+        successNotice = if (unit == "fahrenheit") "温度单位已改为华氏度" else "温度单位已改为摄氏度"
+    )
 
-    private fun patch(body: WeatherConfigRequest, refreshAfter: Boolean) {
+    /**
+     * 2026-09-22（阶段 3.5）：补成功提示。
+     *
+     * 失败路径不动 —— 它写 `state.errorMessage`，设置页底部有一张红字卡在渲染它。
+     * 成功以前是静默的：真源在 core，本地 `config` 是用回包覆盖的，所以"开关拨过去了"
+     * 只代表界面动了，不代表 core 收下了（连不上时开关会自己弹回来，且没有任何解释）。
+     */
+    private fun patch(body: WeatherConfigRequest, refreshAfter: Boolean, successNotice: String) {
         scope.launch {
             try {
                 val resp = api.updateWeatherConfig(body)
                 _state.update { it.copy(config = resp.config, errorMessage = null) }
+                crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(successNotice))
                 if (refreshAfter) refresh(force = true)
             } catch (e: CancellationException) {
                 throw e

@@ -89,6 +89,12 @@ class FileManagerModule(
          * 再密的采样只是多打请求；再稀就会让"推送完成"的提示明显滞后于事实。
          */
         private const val PUSH_POLL_INTERVAL_MS = 1500L
+
+        /** 连续拉取失败时的退避上限：设备离线时不再按 1.5s 空转。 */
+        private const val PUSH_POLL_MAX_INTERVAL_MS = 30_000L
+
+        /** 连续拉取失败到这个次数就停止轮询并报"无法获取推送进度"。 */
+        private const val PUSH_POLL_MAX_FAILURES = 8
     }
 
     /** 判断路径是否指向远端存储源。 */
@@ -232,6 +238,9 @@ class FileManagerModule(
      * 也就是本进程真正的第一次；此后再进页面走的是 TTL 缓存那条早退分支。
      */
     fun loadFileList(path: String, force: Boolean = false) {
+        // 换目录必须丢掉旧选择集：否则多选态下切走，批量删除/复制作用的还是上一个目录的路径。
+        // 只在真的切路径时清（refreshFileList 走同一入口，同目录刷新不该把用户的勾选抹掉）。
+        val switching = path != _state.value.currentPath
         // Serve from TTL cache without hitting the API while the entry is still fresh.
         val cached = _state.value.cacheByPath[path]
         if (!force && cached != null) {
@@ -241,6 +250,7 @@ class FileManagerModule(
                     it.copy(
                         currentPath = path,
                         files = sortFiles(cached.files, _state.value.sortBy),
+                        selectedPaths = if (switching) emptySet() else it.selectedPaths,
                         isLoading = false,
                         errorMessage = null
                     )
@@ -256,6 +266,7 @@ class FileManagerModule(
                 _state.update { it.copy(
                     currentPath = resp.path,
                     files = sorted,
+                    selectedPaths = if (switching) emptySet() else it.selectedPaths,
                     isLoading = false,
                     // Backend error field is "error" (e.g. dir not found); "message" carries success info only
                     errorMessage = resp.error ?: resp.message
@@ -300,6 +311,7 @@ class FileManagerModule(
         _state.update { it.copy(
             currentPath = "",
             files = emptyList(),
+            selectedPaths = emptySet(),
             searchResults = null,
             isLoading = false,
             errorMessage = null
@@ -789,7 +801,11 @@ class FileManagerModule(
     }
 
     fun selectAllFiles() {
-        _state.update { it.copy(selectedPaths = _state.value.files.map { f -> f.path }.toSet()) }
+        // 按**可见集合**取：搜索态下 UI 渲染的是 searchResults，
+        // 若按 files 全选，用户勾的是看不见的当前目录条目（随后批量删除就删错东西）。
+        _state.update { s ->
+            s.copy(selectedPaths = (s.searchResults ?: s.files).map { f -> f.path }.toSet())
+        }
     }
 
     fun batchDeleteSelected() {
@@ -1207,7 +1223,8 @@ class FileManagerModule(
     //  而它发生在用户看到"已送达设备"之后。不观察就等于把失败藏起来。
     //
     //  轮询在**全部作业结束后自动停**（不是定时器常驻），与仓库里"事件驱动 + 按需"
-    //  的后台口径一致；app 切后台时随 scope 一起挂起，不需要额外的生命周期管理。
+    //  的后台口径一致；协程挂在 ViewModel 的 scope 上，app 切后台它仍在跑，所以
+    //  另一条收敛保障是连续拉取失败后退避并放弃（见 startRemotePushPolling）。
     // ═══════════════════════════════════════════════════════════════════════
     private var remotePushPollJob: Job? = null
 
@@ -1216,14 +1233,15 @@ class FileManagerModule(
         scope.launch { fetchRemotePushJobs() }
     }
 
-    private suspend fun fetchRemotePushJobs(): List<RemotePushJobInfo> = try {
+    /** 拉一次快照；**失败返回 null**，让轮询侧能区分"拉取失败"与"拿到快照"。 */
+    private suspend fun fetchRemotePushJobs(): List<RemotePushJobInfo>? = try {
         val resp = api.listRemotePushJobs()
         _state.update { it.copy(remotePushJobs = resp.jobs) }
         resp.jobs
     } catch (e: Exception) {
         // 拉不到不清空已有快照：网络抖一下就把整块任务面板清空比显示旧数据更糟
         DebugLog.w("FileManager", "拉取远端推送作业失败", e)
-        _state.value.remotePushJobs
+        null
     }
 
     /**
@@ -1237,9 +1255,26 @@ class FileManagerModule(
         if (remotePushPollJob?.isActive == true) return
         remotePushPollJob = scope.launch {
             var prev = _state.value.remotePushJobs.associate { it.id to it.state }
+            var failures = 0
+            var backoff = PUSH_POLL_INTERVAL_MS
             while (true) {
                 val jobs = fetchRemotePushJobs()
+                if (jobs == null) {
+                    // 拉不到就没有新状态可判：设备离线时旧快照永远满足"仍有在途"，
+                    // 只能靠失败计数退避收场，否则就是 1.5s 一次的无限空转。
+                    failures++
+                    if (failures >= PUSH_POLL_MAX_FAILURES) {
+                        _state.update { it.copy(errorMessage = "无法获取推送进度：设备连不上，请稍后在任务面板刷新") }
+                        break
+                    }
+                    delay(backoff)
+                    backoff = (backoff * 2).coerceAtMost(PUSH_POLL_MAX_INTERVAL_MS)
+                    continue
+                }
+                failures = 0
+                backoff = PUSH_POLL_INTERVAL_MS
                 // 首次见到就已经是 success 的也算"刚完成"（推得比一次轮询还快），
+
                 // 所以判据是"上一轮它不是 success"，null 也满足。
                 val justDone = jobs.filter { it.state == PUSH_STATE_SUCCESS && prev[it.id] != PUSH_STATE_SUCCESS }
                 val justFailed = jobs.filter { it.state == PUSH_STATE_FAILED && prev[it.id] != PUSH_STATE_FAILED }

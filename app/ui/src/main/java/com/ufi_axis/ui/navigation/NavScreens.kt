@@ -364,6 +364,15 @@ object Routes {
     const val MEDIA_AUDIO_SETTINGS = "media/library/audio/settings"
 
     /**
+     * 「已从音乐库移除的歌曲」管理页（音乐设置页进来）。
+     *
+     * 这一页是「从音乐库移除」那个动作能存在的前提：排除名单只在 core 侧，界面上看不见的话
+     * 误操作就等于永久丢歌。所以它不是可选的附属页。
+     */
+    const val MEDIA_AUDIO_EXCLUDED = "media/library/audio/excluded"
+
+
+    /**
      * 图片页的设置（扫描目录 / 重新扫描）。
      *
      * 与音乐页同一条理由：图片页顶部要放「时间轴 / 文件夹」两栏切换，工具条上那颗「目录」
@@ -557,6 +566,7 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.MEDIA_VIDEO_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_VIDEO_DOWNLOADS, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_AUDIO_SETTINGS, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_AUDIO_EXCLUDED, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_IMAGE_SETTINGS, TransitionType.DETAIL),
     // 分组详情：两个参数都给空缺省，缺参进来时至少能落到一个不崩的页面（列表为空 + 维度名当标题）
     AppRoute(

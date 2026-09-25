@@ -35,7 +35,8 @@ internal fun ServiceGate(
     if (stopped) {
         UfiServiceStoppedNotice(
             onEnable = { viewModel.network.setBackgroundService(true) },
-            onRefresh = { viewModel.network.loadServiceStatus() },
+            // 用户手按的「刷新状态」：必须绕过新鲜度闸门，否则按下去可能一个请求都不发。
+            onRefresh = { viewModel.network.loadServiceStatus(force = true) },
             busy = state.isBusy,
             errorMessage = state.errorMessage
         )

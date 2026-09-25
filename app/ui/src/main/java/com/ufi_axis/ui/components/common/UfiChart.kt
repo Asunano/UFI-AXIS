@@ -532,8 +532,8 @@ fun UfiMonitorChart(
                                 val singleDots = ArrayList<Pair<Offset, Color>>(1)                  // 点数极少 / 全是孤立段的 series
                                 val latestDots = ArrayList<Pair<Offset, Color>>(allSeries.size)     // 各 series 末点
 
-                                // ── 断档切分（2026-09-03 引入，2026-09-04 换判定基准）──
-                                // 判定规则与理由见 [chartGapLimit] / [chartSegments]（提到顶层是为了能被单测钉住，
+                                // ── 断档切分（2026-09-03 引入，2026-09-04 换判定基准，2026-09-26 换成局部判据）──
+                                // 判定规则与理由见 [chartGapLimitAt] / [chartSegments]（提到顶层是为了能被单测钉住，
                                 // 这条规则误判一次就是满屏「短点」，值得有回归护栏）。
                                 // 2026-09-03：原来分段结果由「min/max 区间带」和「填充 + 主线」两轮共用，
                                 // 区间带删除后只剩后者一个消费者，仍先整体算好而不是内联进循环 ——
@@ -862,7 +862,7 @@ fun UfiMonitorChart(
                 //   深色态它是**极低 alpha 的白色叠加**，浅色态叠在 cardBg 上呈浅灰发丝线，两边都"浅"。
                 // · divider 虽然也是浅色语义，但它是**每套配色各写一个具体色值**的存储字段，
                 //   深色预设里是 #333333 / #2A3A4E 这类深灰 —— 画在深色卡面上又是一道暗环，
-                //   等于把要修的问题换个地方重演。（cardBorder 同族但只有 6~8%，配 shadow 后几乎看不见边。）
+                //   等于把要修的问题换个地方重演。（cardBorder 同族但只有 5~6%，配 shadow 后几乎看不见边。）
                 // 宽度保持 1dp：alpha 已经很低，再压到 0.5dp 就只剩若有若无的一线，
                 // 气泡与卡面（两者都是 cardBg）会分不出边界。层次仍主要靠下面那层 shadow(6dp)。
                 // 未新增调色板字段，也未在调用点写死 Color.White / Color.Black。
@@ -1124,6 +1124,9 @@ private fun Path.cubicSmoothSegment(p0: Offset, p1: Offset, p2: Offset, p3: Offs
  * 序列本身就是误判来源，bucketMs 在这里只剩"下限参考"的角色。
  *
  * [bucketMs] <= 0（旧 core 不回该字段）时不断线，保持旧行为。
+ *
+ * 2026-09-26 起这个全局门槛不再直接参与分段判定，只作为「全局兜底 / 下限来源」保留：
+ * 真正判断某个间距断不断，走的是局部判据 [chartGapLimitAt]（原因见其下方的记录）。
  */
 internal fun chartGapLimit(points: List<UfiDownsampledPoint>, bucketMs: Long): Long {
     // 少于 3 个点时只有 0~1 个间距，无从谈"中位数"，也就无从判断哪个间距算异常
@@ -1134,14 +1137,94 @@ internal fun chartGapLimit(points: List<UfiDownsampledPoint>, bucketMs: Long): L
     return maxOf(bucketMs * 2L, medianDt * 3L)
 }
 
-/** 按 [chartGapLimit] 把序列切成若干连续段；每段内相邻点才连线/填充。 */
+// ── 2026-09-26：修「断档误判」第二轮，根因与上面那条「桶宽 × 2.5」是同一类 ──
+//
+// 上一轮把基准从「桶宽」换成「全序列间距中位数」，解决了"基准选错量纲"；这一轮的错是
+// **基准的作用范围选错了**：一个全局统计量被用来判断一件本质上是局部的事。
+//
+// 本 App 的采集节奏在同一个窗口内部就会跳变：DataScheduler.realtimeDelay 在「有前端连接」时
+// 约 3s、无连接时默认 60s，相差 20×，这是正常运行路径，不需要任何异常条件。于是同一条序列的
+// 间距是**双峰分布**：中位数必然落进样本更多的那一峰，另一峰的每一个间距都超过
+// `median * 3`，**整段稀疏区被逐个切开** —— 又是满屏碎段。
+//
+// 为什么换个分位数/系数救不了：真断档是「孤立的异常大间距」，节奏变化是「持续的较大间距」。
+// 两者在全局直方图上长得一样（离群占 25% 时该断，稀疏档占 23% 时不该断），任何全局分位数都
+// 分不开。区分点只存在于**时间上的邻接关系**里：断档周围是密的，节奏变化周围跟它一样疏。
+// 所以判据改成局部的 [chartGapLimitAt]：每个间距只跟自己邻域的节奏比。
+// [chartGapLimit] 保留不动，作为全局兜底与 `bucketMs * 2` 下限的来源。
+
+/**
+ * 「当前节奏」的采样窗口半径：以被判定的那个间距为中心，前后各取这么多个间距（窗口最大 5 个）。
+ *
+ * 取 2 有语义依据，不是调参调出来的：
+ * **一次真实断档在 dt 序列里只会产生 1 个大间距** —— 整段停采无论多长，都只是相邻两点之间的
+ * 一个 dt。要连续出现 3 个大间距，必须是「恢复采集 → 只记下 1 个点 → 又停」重复三次；
+ * 那种数据本身就该按"稀疏节奏"理解，而不是三次断档。所以判据可以直说：
+ * **连续 ≥3 个大间距 = 新节奏，不是断档**。半径 2（窗口 5 个间距）正好表达这句话：
+ * 稀疏段只要持续 3 个间距，就在窗口里占多数，局部中位数落到稀疏档 → 门槛跟着抬高 → 不断线。
+ *
+ * 双边约束（这个常量最容易被后人改坏，两边都写死）：
+ * - **下界 R >= 2**：R=1 时窗口只有 3 个，且序列末尾还会收缩。`dts = [60, 60, 60, 3600]` 的末尾
+ *   离群，其窗口收缩成 `[60, 3600]`，中位数取到 3600 → 门槛 10800s → 这个真空洞判不出来。
+ *   `UfiChartGapTest` 第 7 条「末段只剩一个点时仍作为独立段返回」就是这个下界的守门：
+ *   把 R 改小到 1，那条会立刻红。
+ * - **上界 R 不能大**：R 越大越接近全局统计量，本次要修的双峰误判就会回来 —— 窗口越宽，
+ *   一段稀疏节奏越难在窗口里占到多数，于是又被逐个切开。
+ * - **可容忍的最短节奏段 ~= R + 1 个间距**：R=2 → 3 个。要改这个数，实际是在改
+ *   "多长的稀疏节奏才被承认为节奏"：R=3 → 4 个，R=5 → 6 个。
+ *
+ * 实测矩阵（同一组用例，只改 R）：
+ * - R=1：`UfiChartGapTest` 第 7 条红（上面那个原因）；
+ * - R=2：`UfiChartGapTest` 7 条全绿，且「节奏来回切换」（稀疏段 3 个间距）修到 1 段；
+ * - R=5：7 条也全绿，但「节奏来回切换」残留 24 段（稀疏段 3 个间距占不到 11 元窗口的多数）。
+ */
+internal const val CHART_GAP_WINDOW_RADIUS = 2
+
+/**
+ * 局部断档门槛（毫秒）：`dts[index]` 这个间距要大到什么程度才算空洞，由它**邻域的节奏**决定。
+ *
+ * [dts] 是相邻点时间差数组（`dts[i] = points[i + 1].t - points[i].t`），[index] 是要判定的那个
+ * 间距的下标。取以 [index] 为中心、半径 [CHART_GAP_WINDOW_RADIUS] 的窗口（序列首尾处自动收缩），
+ * 窗口内间距的中位数 `localMedian` 就是"这一带的采样节奏"，门槛仍沿用全局版的两条：
+ * `localMedian * 3`（连漏两拍才算断）与 `bucketMs * 2`（绝对下限，防采样比桶还密时过敏）。
+ *
+ * 三类输入下的结果，也就是这个设计对的理由：
+ * - 混合节奏的稀疏区内部：邻域全是 300s → 门槛 900s → 300s 不断线；
+ * - 节奏切换处的那**一个**过渡间距：窗口里两档混合，R=2 时只要稀疏侧已占到 3 个就仍判不断
+ *   （实测 40×60s + 12×300s 与其反向都是整条 1 段）。即便某种混合比例下切换点断一次也是可接受的
+ *   —— 旧的全局门槛在同样数据上断 12 次；
+ * - 真长空洞：邻域是 60s → 门槛 180s → 7200s 断开。真断档在 dt 序列里只有 1 个大间距，
+ *   在 5 元窗口里永远是少数，抬不高中位数。
+ *
+ * 窗口取中位数而非均值：均值会被自己这个离群值拉高，导致"越是大空洞越判不出来"。
+ */
+internal fun chartGapLimitAt(dts: LongArray, index: Int, bucketMs: Long): Long {
+    if (dts.isEmpty()) return Long.MAX_VALUE
+    val center = index.coerceIn(0, dts.size - 1)
+    val from = (center - CHART_GAP_WINDOW_RADIUS).coerceAtLeast(0)
+    val to = (center + CHART_GAP_WINDOW_RADIUS).coerceAtMost(dts.size - 1)
+    val window = dts.copyOfRange(from, to + 1)
+    window.sort()
+    val localMedian = window[window.size / 2].coerceAtLeast(1L)
+    return maxOf(bucketMs * 2L, localMedian * 3L)
+}
+
+/**
+ * 按 [chartGapLimitAt] 把序列切成若干连续段；每段内相邻点才连线/填充。
+ *
+ * 逐个间距判：`dts[i - 1]` 对应 `points[i].t - points[i - 1].t`，门槛由该间距自己的邻域给出，
+ * 所以同一条序列里的密集区与稀疏区各按各的节奏被衡量。
+ * 早退条件与 [chartGapLimit] 一致（`bucketMs <= 0` 或点数 < 3 时不断线），行为不变。
+ */
 internal fun chartSegments(points: List<UfiDownsampledPoint>, bucketMs: Long): List<IntRange> {
     if (points.isEmpty()) return emptyList()
-    val gapLimit = chartGapLimit(points, bucketMs)
+    // 与 chartGapLimit 的早退语义对齐：桶宽未知、或点数少到算不出节奏时，宁可整条连起来
+    if (bucketMs <= 0L || points.size < 3) return listOf(0..(points.size - 1))
+    val dts = LongArray(points.size - 1) { i -> points[i + 1].t - points[i].t }
     val out = ArrayList<IntRange>(4)
     var segStart = 0
     for (i in 1 until points.size) {
-        if (points[i].t - points[i - 1].t > gapLimit) {
+        if (dts[i - 1] > chartGapLimitAt(dts, i - 1, bucketMs)) {
             out += segStart..(i - 1)
             segStart = i
         }

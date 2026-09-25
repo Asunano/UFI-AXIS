@@ -8,6 +8,7 @@ import com.ufi_axis.util.DebugLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -37,7 +38,9 @@ data class PoetryState(
 
 class PoetryModule(
     private val api: UfiAxisApi,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    /** 跨模块 UI 事件出口（2026-09-22，阶段 3.5）：同 [WeatherModule] 的那一份说明。 */
+    private val crossModuleEventSink: MutableSharedFlow<UiEvent>
 ) {
     private val _state = MutableStateFlow(PoetryState())
     val state: StateFlow<PoetryState> = _state.asStateFlow()
@@ -101,16 +104,29 @@ class PoetryModule(
     }
 
     fun setEnabled(enabled: Boolean) =
-        patch(PoetryConfigRequest(enabled = enabled), refreshAfter = enabled)
+        patch(
+            PoetryConfigRequest(enabled = enabled),
+            refreshAfter = enabled,
+            successNotice = if (enabled) "已开启今日诗词" else "已关闭今日诗词"
+        )
 
     fun setShowOrigin(show: Boolean) =
-        patch(PoetryConfigRequest(show_origin = show), refreshAfter = false)
+        patch(
+            PoetryConfigRequest(show_origin = show),
+            refreshAfter = false,
+            successNotice = if (show) "已显示出处" else "已隐藏出处"
+        )
 
-    private fun patch(body: PoetryConfigRequest, refreshAfter: Boolean) {
+    /**
+     * 2026-09-22（阶段 3.5）：补成功提示。失败路径不动 —— 它写 `state.errorMessage`，
+     * 设置页已经在渲染。成功以前是静默的，理由与 [WeatherModule.patch] 一模一样。
+     */
+    private fun patch(body: PoetryConfigRequest, refreshAfter: Boolean, successNotice: String) {
         scope.launch {
             try {
                 val resp = api.updatePoetryConfig(body)
                 _state.update { it.copy(config = resp.config, errorMessage = null) }
+                crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(successNotice))
                 if (refreshAfter) refresh(force = true)
             } catch (e: CancellationException) {
                 throw e

@@ -8,6 +8,7 @@ import com.ufi_axis.data.model.MEDIA_GROUP_FOLDER
 import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import com.ufi_axis.data.model.MediaDirsRequest
+import com.ufi_axis.data.model.MediaExcludeRequest
 import com.ufi_axis.data.model.MediaLibraryItem
 import com.ufi_axis.data.model.MediaSubtitleEntry
 import com.ufi_axis.data.model.MediaTagsResponse
@@ -24,12 +25,14 @@ import com.ufi_axis.viewmodel.state.MEDIA_KINDS
 import com.ufi_axis.viewmodel.state.MEDIA_ORDER_DESC
 import com.ufi_axis.viewmodel.state.MEDIA_SORT_DATE
 import com.ufi_axis.viewmodel.state.MediaBrowseState
+import com.ufi_axis.viewmodel.state.MediaExcludedState
 import com.ufi_axis.viewmodel.state.MediaGroupState
 import com.ufi_axis.viewmodel.state.MediaLibraryState
 import com.ufi_axis.viewmodel.state.MediaPlaylistDetailState
 import com.ufi_axis.viewmodel.state.MediaPlaylistState
 import com.ufi_axis.viewmodel.state.MediaTabState
 import com.ufi_axis.viewmodel.state.mediaGroupItemsKey
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -259,6 +262,9 @@ class MediaModule(
                     limit = PAGE_SIZE,
                     offset = offset
                 )
+            } catch (e: CancellationException) {
+                // 取消 ≠ 请求失败：吞掉会把残缺列表当成全集返回
+                throw e
             } catch (e: Exception) {
                 break
             }
@@ -312,6 +318,9 @@ class MediaModule(
                     artist = artist,
                     dir = dir
                 )
+            } catch (e: CancellationException) {
+                // 取消 ≠ 请求失败：吞掉会让队列只剩前几页的歌
+                throw e
             } catch (e: Exception) {
                 break
             }
@@ -742,6 +751,181 @@ class MediaModule(
     /** 页面显示过提示/错误之后调用，避免重组时反复弹同一条。 */
     fun clearPlaylistMessage() {
         updatePlaylists { it.copy(message = null, errorMessage = null) }
+    }
+
+    // ── 排除名单（「从音乐库移除」）与删除文件 ────────────────────────────────────
+    // 两件事刻意走两条链路：排除只改 core 的一份路径名单、**随时能撤销**；删除动的是文件本身、
+    // 不可逆。合成一个带 mode 参数的入口，会让"这一个能撤销、那一个不能"在调用点上看不出来。
+
+    private fun updateExcluded(transform: (MediaExcludedState) -> MediaExcludedState) {
+        _state.update { s -> s.copy(excluded = transform(s.excluded)) }
+    }
+
+    /**
+     * 拉排除名单。管理页进入时调；排除 / 恢复成功后由那两个方法自己 force 重拉。
+     *
+     * 三个列表页**不**调这个：core 已经在 `/api/media/list` 里把被排除的路径滤掉了，
+     * app 侧再拿一份名单做二次过滤只会多一处可能与 core 不一致的判定。
+     */
+    fun loadExcludedMedia(force: Boolean = false) {
+        val current = _state.value.excluded
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updateExcluded { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getExcludedMedia()
+                updateExcluded {
+                    it.copy(
+                        paths = resp.paths,
+                        total = resp.total,
+                        max = resp.max,
+                        full = resp.full,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateExcluded {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "排除名单加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 把曲目移出音乐库（加入排除名单）。**不动文件**，可在管理页撤销。
+     *
+     * @return null = 干净成功，什么都不用说；非 null = **必须告诉用户的话**
+     *   （失败原因，或"只生效了一部分"）。
+     *
+     * 为什么是 suspend 而不是 `scope.launch` 就返回：这条由长按菜单直接触发，用户点完就在等
+     * 结果。走 state 里的 message 字段也能显示，但那要求调用页自己接一套"显示过就清掉"的
+     * 逻辑（[clearPlaylistMessage] 那一套），而长按菜单的宿主是个临时组件，没有那个生命周期。
+     */
+    suspend fun excludeFromLibrary(paths: List<String>): String? {
+        val targets = paths.filter { it.isNotBlank() }.distinct()
+        if (targets.isEmpty()) return null
+        return try {
+            val resp = api.excludeMedia(MediaExcludeRequest(paths = targets, action = "add"))
+            dropAudioItems(targets.toSet())
+            loadExcludedMedia(force = true)
+            refreshAudioLists()
+            // affected < requested 只有一个原因：名单撞上了上限被截断。不说出来的话，
+            // 用户会以为都移除了，回头在列表里又看到那几首
+            if (resp.affected < resp.requested) {
+                "名单已满（上限 ${resp.total}），只移除了 ${resp.affected} / ${resp.requested} 首"
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            libraryErrorText("从音乐库移除", e)
+        }
+    }
+
+    /** 撤销排除（管理页的「恢复」）。恢复后那首歌会重新出现在列表里。 */
+    suspend fun restoreToLibrary(paths: List<String>): String? {
+        val targets = paths.filter { it.isNotBlank() }.distinct()
+        if (targets.isEmpty()) return null
+        return try {
+            api.excludeMedia(MediaExcludeRequest(paths = targets, action = "remove"))
+            loadExcludedMedia(force = true)
+            // 恢复只能靠重拉：本地没有那几首的 item，没法插回去
+            refreshAudioLists()
+            null
+        } catch (e: Exception) {
+            libraryErrorText("恢复到音乐库", e)
+        }
+    }
+
+    /**
+     * 删除文件本身。**不可逆** —— 调用方必须已经做过二次确认。
+     *
+     * core 走 MediaStore 删除，所以媒体索引会一起清掉；没有「所有文件访问权限」时回 403，
+     * 这里翻成"去授权"而不是笼统的"删除失败"（见 [libraryErrorText]）。
+     */
+    suspend fun deleteMediaFile(path: String): String? {
+        if (path.isBlank()) return "路径为空"
+        return try {
+            val resp = api.deleteFile(mapOf("path" to path))
+            if (!resp.success) return "删除失败：文件可能已被移动，或正被其他程序占用"
+            dropAudioItems(setOf(path))
+            // 歌单里那一条不会消失（歌单存的是路径），但会变成 missing —— 由 core 判定，
+            // 所以打开过的歌单要重拉，不在本地改标记
+            _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+            refreshAudioLists()
+            null
+        } catch (e: Exception) {
+            libraryErrorText("删除文件", e)
+        }
+    }
+
+    /** 管理页显示过提示/错误之后调用。 */
+    fun clearExcludedMessage() {
+        updateExcluded { it.copy(message = null, errorMessage = null) }
+    }
+
+    /**
+     * 把几个路径从**已加载的音频列表**里摘掉。
+     *
+     * 这是少数几个做本地乐观更新的地方，判据很硬：排除与删除都是"这个路径以后一定不在
+     * `/api/media/list` 的结果里"，不像加歌那样还有 core 才知道的去重与截断。不这么做的话，
+     * 重拉回来之前那一行还留在屏幕上，用户会以为没生效而再点一次。
+     *
+     * 只动音频：视频/图片页不提供这两个动作。
+     */
+    private fun dropAudioItems(paths: Set<String>) {
+        if (paths.isEmpty()) return
+        _state.update { s ->
+            s.copy(
+                tabs = s.tabs.mapValues { (type, tab) ->
+                    if (type != MEDIA_TYPE_AUDIO) tab else tab.withoutPaths(paths)
+                },
+                audioGroupItems = s.audioGroupItems.mapValues { (_, tab) -> tab.withoutPaths(paths) }
+            )
+        }
+    }
+
+    private fun MediaTabState.withoutPaths(paths: Set<String>): MediaTabState {
+        val kept = items.filterNot { it.path in paths }
+        if (kept.size == items.size) return this
+        // total 是"符合条件的总数"，不减的话 hasMore 会一直为真，列表底部挂着一个永远
+        // 加载不出东西的加载中
+        return copy(items = kept, total = (total - (items.size - kept.size)).coerceAtLeast(kept.size))
+    }
+
+    /**
+     * 重拉音频列表与已加载的分组维度。
+     *
+     * 分组计数（某个专辑还剩几首）只有 core 算得对，所以哪怕本地已经摘掉了那一行，
+     * 分组那一层还是要重拉。分组**详情**页不在这里重拉：它的 key 由 `by + key` 拼成，
+     * 从 map 的键反推回两个字段不可靠（key 本身可能含分隔符），而 [dropAudioItems] 已经
+     * 把那一行从详情列表里摘掉了。
+     */
+    private fun refreshAudioLists() {
+        loadFirstPage(MEDIA_TYPE_AUDIO, force = true)
+        _state.value.audioGroups.keys.forEach { loadGroups(it, force = true) }
+    }
+
+    /**
+     * 排除 / 删除的失败文案。
+     *
+     * 403 有明确的下一步（去授权），与"删不掉"必须分开说 —— 否则用户只会对着同一句
+     * "删除失败"反复重试。判据用 HTTP 状态码而不是 core 的 message（后者是给人看的，会改）。
+     */
+    private fun libraryErrorText(action: String, e: Exception): String {
+        val code = (e as? retrofit2.HttpException)?.code()
+        return when (code) {
+            403 -> "没有「所有文件访问权限」，无法$action。在设备设置里授权后再试"
+            404 -> "文件不存在（可能已在别处被删除）"
+            400 -> "$action 失败：core 拒绝了这个路径"
+            else -> "$action 失败: ${e.message}"
+        }
     }
 
     /**

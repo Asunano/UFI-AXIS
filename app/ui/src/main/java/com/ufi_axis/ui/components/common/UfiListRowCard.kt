@@ -22,6 +22,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiStandardCard
 
@@ -76,9 +77,22 @@ fun UfiListRowCard(
             .ufiStandardCard(elevation = 2.dp)
             .then(
                 if (selected) {
+                    /*
+                     * 2026-09-22 修「选中行的描边在四个角断开」。
+                     *
+                     * 原来这两句是 `.background(color)` + `.border(1.dp, color)`，**都没传 shape**，
+                     * 于是按默认的 `RectangleShape` 画。它们在修饰符链上位于 `ufiStandardCard()`
+                     * 的 `clip(shape)` 之后，所以会被圆角裁掉：
+                     * - 底色被裁成圆角，看起来没问题；
+                     * - **描边是沿矩形路径描的**，四个角那几段正好落在圆角之外被裁掉 ——
+                     *   于是选中态看起来是"四条断开的直线"而不是一圈完整的圆角描边。
+                     *
+                     * 传上与卡面同一个 shape 即可：描边自己就走圆角路径，不再依赖裁剪。
+                     * 这条对**所有**传 `selected = true` 的调用方都生效（媒体列表、文件行、队列弹窗）。
+                     */
                     Modifier
-                        .background(palette.accent.copy(alpha = 0.08f))
-                        .border(1.dp, palette.accent.copy(alpha = 0.5f))
+                        .background(palette.accent.copy(alpha = 0.08f), UfiCardDefaults.shape)
+                        .border(1.dp, palette.accent.copy(alpha = 0.5f), UfiCardDefaults.shape)
                 } else {
                     Modifier
                 }

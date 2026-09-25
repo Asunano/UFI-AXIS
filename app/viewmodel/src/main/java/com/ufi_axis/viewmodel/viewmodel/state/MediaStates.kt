@@ -147,6 +147,27 @@ data class MediaPlaylistDetailState(
 }
 
 /**
+ * 「已从音乐库移除的歌曲」名单（`GET /api/media/excluded` 的镜像）。
+ *
+ * 名单只存路径 —— core 把这些路径从 `/api/media/list` 的结果里排掉，所以被排除的歌**已经
+ * 查不到了**，没有 [MediaLibraryItem] 可用。管理页只能拿路径显示文件名，这不是偷工减料：
+ * 要显示标签就得为一批"不在库里"的文件再开一条读元数据的接口，而这一页的用途只是找回误删。
+ *
+ * @param max 名单硬上限（SQLite 绑定变量 999 逼出来的，不是产品取舍）。
+ * @param full 已满，由 core 算好。界面据此在"移除"之前就提示，而不是点完才说没生效。
+ */
+data class MediaExcludedState(
+    val paths: List<String> = emptyList(),
+    val total: Int = 0,
+    val max: Int = 0,
+    val full: Boolean = false,
+    val isLoading: Boolean = false,
+    val loadedOnce: Boolean = false,
+    val message: String? = null,
+    val errorMessage: String? = null
+)
+
+/**
  * 文件夹视图的状态（媒体库那一栏；`GET /api/media/browse` 的镜像）。
  * 与 [MediaTabState] **并存**而不是合并：平铺列表与文件夹视图是两份互不相同的数据
  * （一个分页、一个按层），合进去会出现"进文件夹之后平铺列表被冲掉、退出来又要重拉"。
@@ -212,6 +233,11 @@ data class MediaLibraryState(
      * 逛一圈下来全留在内存里没有意义。
      */
     val playlistItems: Map<String, MediaPlaylistDetailState> = emptyMap(),
+    /**
+     * 排除名单。只有管理页（设置 → 媒体）与"从音乐库移除"这个动作用得到，
+     * 所以不随三个列表页一起加载 —— 进管理页时才拉。
+     */
+    val excluded: MediaExcludedState = MediaExcludedState(),
     val allFilesAccess: Boolean = false,
     val statusLoaded: Boolean = false,
     val errorMessage: String? = null

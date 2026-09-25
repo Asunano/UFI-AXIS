@@ -74,6 +74,17 @@ class NavInsetHandoffGuardTest {
     private val capsuleHostPath =
         "src/main/java/com/ufi_axis/ui/components/common/UfiCapsuleBlurHost.kt"
 
+    /**
+     * 贴底通栏低栏本体（2026-09-24 起挂载的形态，见 `MainNavGraph.USE_BOTTOM_DOCK`）。
+     *
+     * 它是「测量完成前不发布」那道闸门的**供数方**：闸门的判据是
+     * `naturalSize.value.height > 0`，而这个值只能由**当前挂载的那个栏**回写。
+     * 见 [capsuleInset_measuredHeightMustBeSuppliedByMountedBar]。
+     */
+    private val bottomDockPath =
+        "src/main/java/com/ufi_axis/ui/components/common/UfiBottomDock.kt"
+
+
     private val themeManagerPath =
         "src/main/java/com/ufi_axis/ui/theme/ThemeManager.kt"
 
@@ -915,6 +926,11 @@ class NavInsetHandoffGuardTest {
      * 首帧 `naturalSize` 为 0，无条件写入会先发布一个矮 ~50dp 的假值，
      * 于是所有读 `LocalCapsuleBottomInset` 的长列表在返回动画途中要多重排一次，
      * 底部卡片上下跳 ⇒ 阴影再闪一次。
+     *
+     * ★ 2026-09-24（贴底通栏低栏迁移）：本条**语义不变**，继续守这道闸门。
+     *   计算式已从「胶囊高 + 8dp + 安全区」换成「58dp + 安全区」（不再依赖 naturalSize），
+     *   但闸门仍要留着 —— 它现在起的是「等栏真的立起来再让页面重排」的时序作用。
+     *   供数方见 [capsuleInset_measuredHeightMustBeSuppliedByMountedBar]。
      */
     @Test
     fun capsuleInset_mustNotPublishBeforeMeasured() {
@@ -923,6 +939,46 @@ class NavInsetHandoffGuardTest {
             "写 CapsuleInsetHolder.bottomInset 前必须判 `naturalSize.value.height > 0`：" +
                 "测量前发布的是矮 ~50dp 的假值，会让页面在转场途中多重排一次。",
             Regex("""naturalSize\.value\.height\s*>\s*0""").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 「测量完成前不发布」这道闸门必须有**供数方**：当前挂载的底栏要回写实测高度。
+     *
+     * ## 为什么单独一条（2026-09-24 通栏迁移的实测教训）
+     * 闸门判据是 `naturalSize.value.height > 0`，而 `LocalCapsuleNaturalSize` 原来
+     * **只有 `UfiCapsuleTabBar` 写**（在它自定义 `Layout` 的固有测量阶段）。
+     * 通栏迁移阶段 1 新建 `UfiBottomDock` 时漏了这一处：开关切到通栏后闸门**永不放行**，
+     * 所有读 `ufiCapsuleBottomInset` 的页面（监控 / 仪表盘的长列表）一直停在 88dp 兜底值
+     * —— 底部留白与真实栏高不符，且没有任何报错。
+     *
+     * 同一个值还钉着**窗口高度**（`applyCapsuleWindowParams` 用它代替 WRAP_CONTENT），
+     * 缺供数方时窗口会一直是 WRAP_CONTENT —— 靠内容撑开虽然也能对，但窗口矩形不再受控。
+     *
+     * 断言两件事：
+     * 1. 栏根节点挂了 `onSizeChanged` 并写 `LocalCapsuleNaturalSize`；
+     * 2. 写入前有相等性判断 —— `onSizeChanged` 回调里无条件写 `MutableState` 会
+     *    「写 → 重组 → 重新测量 → 再写」空转。
+     */
+    @Test
+    fun capsuleInset_measuredHeightMustBeSuppliedByMountedBar() {
+        val dock = executableCode(source(bottomDockPath))
+
+        assertTrue(
+            "UfiBottomDock 不再读 `LocalCapsuleNaturalSize` —— 「测量完成前不发布」那道闸门就没有" +
+                "供数方了：判据 `naturalSize.value.height > 0` 永不成立，所有页面的底部留白" +
+                "会一直停在 88dp 兜底值（且不报错）；窗口高度也会退回 WRAP_CONTENT。",
+            dock.contains("LocalCapsuleNaturalSize")
+        )
+        assertTrue(
+            "栏根节点没有挂 `onSizeChanged` 回写实测尺寸 —— 同上。" +
+                "必须是**实测值**而不是「58 + 安全区」常量：fontScale 1.5× 时栏会长高。",
+            Regex("""onSizeChanged\s*\{""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "回写 naturalSize 时缺少相等性判断（应为 `if (naturalSize.value != size) …`）—— " +
+                "onSizeChanged 里无条件写 MutableState 会「写 → 重组 → 重新测量 → 再写」空转。",
+            Regex("""if\s*\(\s*naturalSize\.value\s*!=\s*size\s*\)""").containsMatchIn(dock)
         )
     }
 
@@ -1019,6 +1075,58 @@ class NavInsetHandoffGuardTest {
                 "实例永不变 ⇒ static local 永不触发整树重组，快照读留给消费方的 layout 阶段。",
             Regex("""remember\s*\{\s*\{\s*CapsuleInsetHolder\.bottomInset\.value\s*\}\s*\}""")
                 .containsMatchIn(navGraph)
+        )
+    }
+
+    /**
+     * ★ 配对约定（2026-09-24，贴底通栏低栏 §5.21 / §7-2.9 ①）：
+     * 「页壳 padding navigationBars」与「inset 消费侧扣减 navigationBars」必须**同时在线**。
+     *
+     * `LocalCapsuleBottomInset` 发布的是底栏**自身总高**（内容 58dp + 安全区，**含**安全区），
+     * 而 `UfiScreenScaffold` 的内容 `Box` 已经 `windowInsetsPadding(WindowInsets.navigationBars)`
+     * —— 两者相加就是双算，6 个主 Tab 页各多留一个 navigationBars（手势≈24dp / 三键≈48dp）。
+     * 悬浮胶囊时代窗口 `y` 抬高 30dp 恰好抵掉了这一项，通栏形态抬升归 0 后双算立刻显形。
+     *
+     * 裁决是**不动页壳**（二级页确实需要那段 padding），改由消费侧显式减掉：
+     * `(底栏总高 − navigationBars.bottom).coerceAtLeast(0.dp) + extra`（见 `capsuleBottomClearance`）。
+     *
+     * 于是这条护栏盯两端：任何一端被单独改掉（消费侧不再减 ⇒ 双算回归；页壳那句被删 ⇒
+     * 反过来变成少留一个 navigationBars、内容压在手势条上）都会变红。
+     */
+    @Test
+    fun capsuleInset_mustDeductShellConsumedNavigationBars() {
+        val host = executableCode(source(capsuleHostPath))
+        assertTrue(
+            "扣减 navigationBars 的唯一落点 `Density.capsuleBottomClearance(` 不见了：" +
+                "它是底部留白与浮动控件抬升共用的那份算式，删掉任一端都会让两处各写一份数字。",
+            Regex("""fun\s+Density\.capsuleBottomClearance\(""").containsMatchIn(host)
+        )
+        val clearance = functionBody(host, "Density.capsuleBottomClearance")
+            .replace(Regex("""\s+"""), "")
+        assertTrue(
+            "capsuleBottomClearance 必须减掉页壳已消费的 `navigationBars.getBottom(this).toDp()`：" +
+                "少了这一步就是「底栏总高 + 页壳 padding」双算，每个主 Tab 页多留 24~48dp 白。",
+            clearance.contains("navigationBars.getBottom(this).toDp()")
+        )
+        assertTrue(
+            "扣减结果必须 `.coerceAtLeast(0.dp)`：栏比安全区还矮时（旧悬浮胶囊分支 / 未发布真值" +
+                "的兜底值）差值会变负，负高度会把呼吸间距一起吃掉。",
+            clearance.contains(".coerceAtLeast(0.dp)")
+        )
+        assertTrue(
+            "`Modifier.ufiCapsuleBottomInset` 必须走 capsuleBottomClearance —— 6 个主 Tab 页的" +
+                "底部留白都从这里出，自己再拼一遍 `insetOf() + extra` 就是双算回归。",
+            functionBody(host, "Modifier.ufiCapsuleBottomInset")
+                .contains("capsuleBottomClearance(")
+        )
+
+        // ── 配对的另一端：页壳那句必须还在 ──
+        // 消费侧减了、页壳却不再 padding，就从"多留"翻成"少留"（列表末行被手势条压住）。
+        val scaffoldBody = functionBody(executableCode(source(scaffoldPath)), "UfiScreenScaffold")
+        assertTrue(
+            "UfiScreenScaffold 的内容 Box 必须保留 `windowInsetsPadding(WindowInsets.navigationBars)`：" +
+                "`ufiCapsuleBottomInset` 是按「页壳已经消费过它」的前提在扣减的，两端必须成对存在。",
+            scaffoldBody.contains("windowInsetsPadding(WindowInsets.navigationBars)")
         )
     }
 }

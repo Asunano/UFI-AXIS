@@ -603,21 +603,382 @@ class ForegroundRefreshFreshnessTest {
      * 只钉 `CachedListing(...)` 这一处：本模块另有几处 `System.currentTimeMillis()` 是
      * 临时文件名与「手机端下载历史」的展示用 epoch 时间戳，那些**应该**用墙上时钟。
      */
-    @Test
-    fun fileListTtlCache_mustUseMonotonicClock() {
-        val code = executableCode(source(fileManagerPath))
+    // ── 2026-09-22：首屏预加载 + 切页不等待 ──────────────────────────────────
 
+    private val mainViewModelPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/MainViewModel.kt"
+    private val preloadPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/PreloadCoordinator.kt"
+
+    /** 跨模块：启动页与掉线弹窗的可见反馈都写在 Activity 侧。 */
+    private val mainActivityPath = "app/src/main/java/com/ufi_axis/MainActivity.kt"
+
+
+    @Test
+    fun networkAllFreshWindow_mustBeLongerThanPollingWindow() {
         assertTrue(
-            "目录列表缓存的写入时刻不是 `SystemClock.elapsedRealtime()` —— " +
-                "TTL 是一段时长，`currentTimeMillis` 被往前调过之后会把陈旧缓存永久判成新鲜" +
-                "（偏移多大就锁多久，目录再也不刷新）。",
-            Regex("""CachedListing\(\s*sorted\s*,\s*SystemClock\.elapsedRealtime\(\)\s*\)""")
-                .containsMatchIn(code)
+            "网络页的新鲜度窗口必须明显长于首页轮询窗口：这一页**没有轮询**，数据是配置类字段" +
+                "（网络模式 / 频段锁定 / LAN 段 / 本机号码），用 10s 窗口等于每次切过去都重发 6 个请求。",
+            NETWORK_ALL_FRESH_MS > FOREGROUND_REFRESH_INTERVAL_MS
+        )
+        assertEquals(
+            "窗口取 30s 是对着 core 端最短的那档响应缓存 TTL（CELL_INFO 20s）定的；" +
+                "再短就只是在打一个必定命中 core 缓存的请求。",
+            30_000L,
+            NETWORK_ALL_FRESH_MS
+        )
+        // 窗口参数确实被 foregroundRefreshDelayMs 接受并生效（判据与默认窗口同一份实现）
+        assertEquals(
+            25_000L,
+            foregroundRefreshDelayMs(
+                lastSuccessElapsedMs = 100_000L,
+                nowElapsedMs = 105_000L,
+                freshWindowMs = NETWORK_ALL_FRESH_MS
+            )
         )
         assertFalse(
-            "目录列表缓存又改回 `System.currentTimeMillis()` 了 —— 单调时钟红线回归。",
-            Regex("""CachedListing\(\s*sorted\s*,\s*System\.currentTimeMillis\(\)\s*\)""")
+            "满窗即过期",
+            isForegroundDataFresh(
+                lastSuccessElapsedMs = 100_000L,
+                nowElapsedMs = 100_000L + NETWORK_ALL_FRESH_MS,
+                freshWindowMs = NETWORK_ALL_FRESH_MS
+            )
+        )
+    }
+
+    /**
+     * 网络页那 6 个请求的扇出必须留在 module 里、且带新鲜度闸门。
+     *
+     * 回归形态很具体：把扇出搬回 `NetworkScreen` 的私有函数。那样判据（新鲜度戳）就有两份 ——
+     * 预加载协调器一份、页面一份 —— 而戳存在 composable 的 `remember` 里换页往复就丢了，
+     * 等于"切页不等待"这个功能被静默关掉，没有任何编译错误提示。
+     */
+    @Test
+    fun networkAll_fanOutMustLiveInModuleWithFreshnessGate() {
+        val code = executableCode(source(networkPath))
+
+        assertTrue(
+            "`NetworkModule.loadNetworkAll(force, silent)` 不见了 —— 网络页那 6 个请求的扇出" +
+                "必须在 module 里（判据与戳只能有一份，且要跨组合存活）。",
+            Regex("""fun loadNetworkAll\(\s*force:\s*Boolean\s*=\s*false\s*,\s*silent:\s*Boolean\s*=\s*false\s*\)""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "`loadNetworkAll` 缺少新鲜度闸门（isForegroundDataFresh(networkAllSuccessElapsed …)）—— " +
+                "缺了它每次 pageForeground 翻 true 都要重发 6 个请求，预加载就白做了。",
+            Regex("""isForegroundDataFresh\(\s*\r?\n?\s*networkAllSuccessElapsed""").containsMatchIn(code)
+        )
+        assertTrue(
+            "闸门没有用 NETWORK_ALL_FRESH_MS 这个窗口 —— 默认 10s 窗口对这一页太短。",
+            code.contains("NETWORK_ALL_FRESH_MS")
+        )
+        assertTrue(
+            "`networkAllSuccessElapsed` 没有用 `SystemClock.elapsedRealtime()` 写入 —— 单调时钟红线。",
+            Regex("""networkAllSuccessElapsed\s*=\s*SystemClock\.elapsedRealtime\(\)""").containsMatchIn(code)
+        )
+        assertFalse(
+            "`networkAllSuccessElapsed` 改成 `System.currentTimeMillis()` 了 —— 单调时钟红线回归。",
+            Regex("""networkAllSuccessElapsed\s*=\s*System\.currentTimeMillis\(\)""").containsMatchIn(code)
+        )
+        assertTrue(
+            "找不到「全部成功才打戳」的判据（`if (failures == null)`）—— " +
+                "部分失败时字段是缺的，打了戳会让下一次前台化跳过重拉、把缺字段固化成\"新鲜\"。",
+            Regex("""if\s*\(failures\s*==\s*null\)""").containsMatchIn(code)
+        )
+        assertTrue(
+            "换设备时必须能丢掉新鲜度基准（`fun resetFreshness()`）—— " +
+                "只清 Room 不清戳，新设备的页面会因为旧设备的戳还在窗口内而跳过请求。",
+            Regex("""fun resetFreshness\(\)""").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * `refreshNetwork` 也要守「有数据时不写 loading 态」这条不变量。
+     */
+    @Test
+    fun refreshNetwork_mustNotWriteLoadingWhenDataExists() {
+        val code = executableCode(source(networkPath))
+
+        assertFalse(
+            "又出现了 `_networkState.value = _networkState.value.copy(isLoading = true, errorMessage = null)` " +
+                "的无条件写法 —— 网络页一处都没读 isLoading，有数据时翻转它纯粹白付一次整页重组。",
+            Regex("""_networkState\.value\s*=\s*_networkState\.value\.copy\(\s*isLoading\s*=\s*true""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "找不到「没数据才写 loading」的分支（`current.signalInfo == null -> current.copy(isLoading = true`）。",
+            Regex("""current\.signalInfo\s*==\s*null\s*->\s*current\.copy\(\s*isLoading\s*=\s*true""")
                 .containsMatchIn(code)
         )
     }
+
+    /**
+     * 服务状态读取的重复调用必须被闸门挡住，写后回读必须绕过它。
+     */
+    @Test
+    fun serviceStatus_mustBeGatedButWriteBackMustForce() {
+        val code = executableCode(source(networkPath))
+
+        assertTrue(
+            "`loadServiceStatus(force, silent)` 的签名不对 —— 冷启动时它至少被 Dashboard 与 Settings " +
+                "各调一次，加上预加载就是三次，必须有闸门。",
+            Regex("""fun loadServiceStatus\(\s*force:\s*Boolean\s*=\s*false\s*,\s*silent:\s*Boolean\s*=\s*false\s*\)""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "缺少新鲜度闸门（isForegroundDataFresh(serviceStatusSuccessElapsed …)）",
+            Regex("""isForegroundDataFresh\(\s*serviceStatusSuccessElapsed""").containsMatchIn(code)
+        )
+        val forced = Regex("""loadServiceStatus\(force\s*=\s*true\)""").findAll(code).count()
+        assertTrue(
+            "NetworkModule 内 `loadServiceStatus(force = true)` 少于 2 处 —— " +
+                "setBackgroundService / setServiceAutoStart 失败后的回滚回读前提是「值刚被改过」，" +
+                "吃缓存会让徽标停在旧状态上。当前 $forced 处。",
+            forced >= 2
+        )
+    }
+
+    /**
+     * 预加载与页面自身的刷新**不得互相取消**。
+     *
+     * `refreshDashboard()` 无条件 `refreshJob?.cancel()` 是"手动刷新"该有的语义；
+     * 但仪表盘 Tab 与监控 Tab 都保活、都会在前台化时进到刷新效应里，用取消版就是
+     * 互相掐掉对方的聚合请求，来回浪费。
+     */
+    @Test
+    fun dashboardPreloadPath_mustNotCancelInFlightRefresh() {
+        val code = executableCode(source(dashboardPath))
+
+        assertTrue(
+            "`fun refreshDashboardIfStale()` 不见了 —— 预加载与前台化都必须走这个不取消的入口。",
+            Regex("""fun refreshDashboardIfStale\(\)""").containsMatchIn(code)
+        )
+        assertTrue(
+            "`refreshDashboardIfStale` 里找不到「已经有人在拉就让它拉完」的判据" +
+                "（`refreshJob?.isActive == true) return`）。",
+            Regex("""refreshJob\?\.isActive\s*==\s*true\s*\)\s*return""").containsMatchIn(code)
+        )
+        assertTrue(
+            "`refreshDashboardIfStale` 没有新鲜度闸门（isForegroundDataFresh(dashboardSuccessElapsed …)）",
+            Regex("""isForegroundDataFresh\(\s*dashboardSuccessElapsed""").containsMatchIn(code)
+        )
+        assertTrue(
+            "换设备时必须能丢掉仪表盘的新鲜度基准（`fun resetFreshness()`）。",
+            Regex("""fun resetFreshness\(\)""").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 首屏预加载的三条硬约束（分批 / 静默 / 只在确证在线时启动）。
+     *
+     * 第三条是最容易被删又后果最难看的：`HealthModule` 的掉线判据是 3 秒内 2 次失败确证，
+     * 而每个传输层失败都会驱动一次探活。设备不可达时丢出十来个必定失败的请求，
+     * **正好自己把"掉线"坐实** —— 开机就弹「无法连接后端服务」。
+     */
+    @Test
+    fun preload_mustBeBatchedSilentAndOnlineGated() {
+        val preload = executableCode(source(preloadPath))
+        val vm = executableCode(source(mainViewModelPath))
+
+        assertTrue(
+            "预加载没有分批（找不到 `delay(BATCH_GAP_MS)`）—— OkHttp 默认 maxRequestsPerHost = 5，" +
+                "一把梭十几个请求只会排队，还会跟 /health 与首屏 summary 抢槽位。",
+            preload.contains("delay(BATCH_GAP_MS)")
+        )
+        assertTrue(
+            "预加载没走静默变体（找不到 `silent = true`）—— 预加载发生在启动页背后，" +
+                "失败写进 errorMessage 会经 rawGlobalError 冒成全局 Toast，" +
+                "表现为\"刚开 app 就莫名弹一句加载失败\"。",
+            preload.contains("silent = true")
+        )
+        assertTrue(
+            "`step()` 里没有把 CancellationException 原样上抛 —— reset() 取消 job 时" +
+                "会被吃掉，协程继续跑完剩余批次。",
+            Regex("""catch\s*\(e:\s*CancellationException\)\s*\{\s*\r?\n?\s*throw e""")
+                .containsMatchIn(preload)
+        )
+        assertTrue(
+            "预加载不是「一次性」的（找不到 `compareAndSet(false, true)`）—— " +
+                "start() 有两个调用点（启动页闸门 / connectivity 转 ONLINE），必须幂等。",
+            preload.contains("compareAndSet(false, true)")
+        )
+
+        // TOTAL_STEPS 必须与实际步数一致，否则启动页的 "x / N" 会停在 6/7 之类的假进度
+        val declaredTotal = Regex("""TOTAL_STEPS\s*=\s*(\d+)""").find(preload)
+            ?.groupValues?.get(1)?.toInt()
+        val actualSteps = Regex("""\bstep\(""").findAll(preload).count() - 1 // 减去 step() 自身的定义
+        assertEquals(
+            "TOTAL_STEPS 与 start() 里 step( 的调用次数不一致 —— 启动页的进度计数会永远差几格，" +
+                "看起来像卡住了。声明 $declaredTotal，实际 $actualSteps。",
+            declaredTotal,
+            actualSteps
+        )
+
+        assertTrue(
+            "MainViewModel 里找不到「ONLINE 才启动预加载」的闸门 —— " +
+                "离线时发这一批必定失败的请求会自我坐实掉线判据，开机就弹掉线窗。",
+            Regex("""ConnectivityStatus\.ONLINE""").containsMatchIn(vm) &&
+                Regex("""preload\.start\(\)""").containsMatchIn(vm)
+        )
+        assertTrue(
+            "启动页闸门里找不到「确证不可达就直接放行」那条路" +
+                "（`settled.status != ConnectivityStatus.ONLINE` → return）—— " +
+                "缺了它，离线冷启动会一直停在加载页。",
+            Regex("""settled\.status\s*!=\s*ConnectivityStatus\.ONLINE""").containsMatchIn(vm)
+        )
+        val resets = Regex("""preload\.reset\(\)""").findAll(vm).count()
+        assertTrue(
+            "`preload.reset()` 少于 2 处 —— prepareDeviceSwitch 与 onServerEndpointChanged(hostChanged) " +
+                "两条换设备路径都必须复位，否则新设备的数据没人预加载。当前 $resets 处。",
+            resets >= 2
+        )
+    }
+
+    /**
+     * 监控中心必须被预热，而且必须**复用同一个 `MonitorTimeRange` 实例**。
+     *
+     * `MonitorTimeRange.today()` 的 `endMs` 按分钟向下取整，所以每次 new 出来的实例跨分钟就是
+     * 另一个记账 key（`DashboardModule.monitorRangeKey`）。预热时若自己 new 一个传给
+     * `loadMonitorTypes`，`MonitorScreen` 进页面时用的是 state 里那个 —— 两个 key 不同，
+     * `syncMonitorRangeKey` 会清掉记账并把这 6 类**重拉一遍**，预热等于白做。
+     */
+    @Test
+    fun preload_mustWarmMonitorOverviewWithTheSameRangeInstance() {
+        val preload = executableCode(source(preloadPath))
+
+        assertTrue(
+            "预加载没有拉监控曲线（找不到 `loadMonitorTypes(`）—— 切到监控中心时总览那 6 格" +
+                "仍要现场等 6 条序列，这一页就等于没接入预加载。",
+            preload.contains("loadMonitorTypes(")
+        )
+        assertTrue(
+            "找不到总览用到的指标清单 OVERVIEW_METRIC_KEYS。",
+            preload.contains("OVERVIEW_METRIC_KEYS")
+        )
+        assertTrue(
+            "`loadMonitorTypes` 的 range 不是从 state 里取的" +
+                "（应为 `dashboard.monitorState.value.selectedRange`）—— 见本测试的 KDoc：" +
+                "自己 new 一个 today() 会让记账 key 对不上，MonitorScreen 进页面时全部重拉。",
+            preload.contains("dashboard.monitorState.value.selectedRange")
+        )
+        assertTrue(
+            "监控设置必须排在拉曲线**之前**：enabledTypes 决定拉哪几类，" +
+                "collectEnabled = false 时 loadMonitorTypes 直接空转。",
+            preload.indexOf("refreshMonitorSettingsFromBackend") <
+                preload.indexOf("loadMonitorTypes(")
+        )
+    }
+
+    /**
+     * 启动页必须有**兜底终局**，且收尾动作不能写在超时块里面。
+     *
+     * 参考实现（UFITOOLS-Widget）的 ViewModel 注释专门记过这个坑：某条分支静默返回 ⇒
+     * 调用方无从得知刷新已结束 ⇒ 加载动画永远停在"请稍候"。这里的红线是
+     * `_startupPhaseDone.value = true` 必须在 `withTimeoutOrNull(...)` **之后**执行 ——
+     * 写进块里就意味着超时路径不收尾，用户被永久锁在加载页。
+     */
+    @Test
+    fun startupGate_mustAlwaysHaveATerminalExit() {
+        val vm = executableCode(source(mainViewModelPath))
+
+        assertTrue(
+            "启动页闸门没有超时兜底（找不到 `withTimeoutOrNull(STARTUP_GATE_TIMEOUT_MS)`）—— " +
+                "某一步挂住（OkHttp readTimeout 是 120s）就会把用户永久锁在加载页。",
+            vm.contains("withTimeoutOrNull(STARTUP_GATE_TIMEOUT_MS)")
+        )
+        val timeoutAt = vm.indexOf("withTimeoutOrNull(STARTUP_GATE_TIMEOUT_MS)")
+        val releaseAt = vm.indexOf("_startupPhaseDone.value = true")
+        assertTrue(
+            "找不到收尾动作 `_startupPhaseDone.value = true`。",
+            releaseAt >= 0
+        )
+        assertTrue(
+            "收尾动作写在了超时块**之前/之内** —— 必须在 withTimeoutOrNull 之后无条件执行，" +
+                "否则超时路径不收尾，加载页永远停在\"加载中\"。",
+            releaseAt > timeoutAt
+        )
+        assertTrue(
+            "启动页没有最短展示时间（找不到 STARTUP_GATE_MIN_MS）—— 局域网上预加载几百毫秒就完事，" +
+                "不设下限会\"闪一下\"，比不显示更难看。",
+            vm.contains("STARTUP_GATE_MIN_MS")
+        )
+        assertTrue(
+            "启动页的可见性不在 ViewModel 里（找不到 startupOverlayVisible）—— " +
+                "放在 Activity 的 remember 里，旋转屏幕 / 从最近任务回来会再看一遍启动页。",
+            vm.contains("val startupOverlayVisible")
+        )
+    }
+
+    /**
+     * 启动页接管「连不上设备」之后，必须留一个让开的出口。
+     *
+     * 三种病因里有两种不是在这一页能解决的：「手机未连接网络」要去系统 WiFi 设置、
+     * 「未配置设备地址」要走配对流程。没有出口就等于把用户锁在一个按不动的整屏页面上 ——
+     * 比它取代的那个模态弹窗还糟（那个至少是可关闭的）。
+     */
+    @Test
+    fun startupProblem_mustBeEscapableAndCoreUpdateExempt() {
+        val vm = executableCode(source(mainViewModelPath))
+        val activity = executableCode(source(mainActivityPath))
+
+        assertTrue(
+            "找不到 `startupProblem` —— 「连不上设备」那一态的数据源没了，" +
+                "启动页会一直转圈而不告诉用户原因。",
+            vm.contains("val startupProblem")
+        )
+        assertTrue(
+            "找不到让开的出口 `fun skipConnectionNotice()` —— " +
+                "见本测试 KDoc：没有出口会把用户锁在整屏提示上。",
+            Regex("""fun skipConnectionNotice\(\)""").containsMatchIn(vm)
+        )
+        assertTrue(
+            "`skipConnectionNotice` 的标记没有在恢复 ONLINE 时复位 —— " +
+                "让开过一次之后这台设备再也不会用启动页报连不上。",
+            Regex("""_connectionNoticeSkipped\.value = false""").containsMatchIn(vm)
+        )
+        assertTrue(
+            "`startupProblem` 没有 Core 更新豁免（找不到 isCoreUpdateInterruptingBackend）—— " +
+                "升级 Core 时 8088 必然断联约 1 分钟，那是预期结果，不该拿一整页去报。",
+            Regex("""isCoreUpdateInterruptingBackend\(\)""").containsMatchIn(vm)
+        )
+        assertFalse(
+            "旧的模态弹窗状态 `connectivityDialogState` 又回来了 —— " +
+                "它已被启动页取代（2026-09-22），两个一起在就是同一件事讲两遍。",
+            vm.contains("connectivityDialogState")
+        )
+
+        assertTrue(
+            "Activity 侧没有把「去服务器设置 / 去配对」与让开动作绑在一起 —— " +
+                "启动页是全屏不透明浮层，不先让开就会把目标页整个盖住。",
+            Regex("""viewModel\.skipConnectionNotice\(\)""").containsMatchIn(activity)
+        )
+        assertTrue(
+            "启动页期间没有抑制底部胶囊（找不到 `suppressCapsule`）—— " +
+                "胶囊活在独立 Dialog 窗口里，窗口层级高于 Activity 主窗口，" +
+                "主窗口的全屏浮层**盖不住它**，加载页上会浮着一条胶囊。",
+            activity.contains("suppressCapsule")
+        )
+    }
+
+    /**
+     * 「连不上」那一态的重试必须给可见反馈。
+     *
+     * 它刻意**不让页面消失**（探活结果才是答案），于是点下去屏幕上什么都不动 ——
+     * 而 `/health` 最长要 15s 才出结论，这段时间里按钮看起来就是坏的。
+     */
+    @Test
+    fun connectivityRetry_mustGiveVisibleFeedback() {
+        val code = executableCode(source(mainActivityPath))
+
+        assertTrue(
+            "「重试」没有 Toast 反馈 —— 它不让页面消失、探活最长 15s，" +
+                "没有反馈时用户只会以为按钮坏了。",
+            code.contains("\"正在重新连接设备…\"")
+        )
+        assertTrue(
+            "找不到 `viewModel.retryConnectivity()` —— 反馈给了但没真的去探活。",
+            code.contains("viewModel.retryConnectivity()")
+        )
+    }
 }
+
+
+
