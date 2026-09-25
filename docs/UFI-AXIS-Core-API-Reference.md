@@ -3233,6 +3233,50 @@ core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收�
 
 ---
 
+### GET /api/media/excluded
+
+「从音乐库移除」的那一份路径清单（排除名单）。**只对 `type=audio` 生效。**
+
+名单存在 core（`MediaExclusionStore`，SharedPreferences 单键 JSON），被列入的路径会从 `/api/media/list`
+的音频结果里**直接消失** —— 所以客户端拿不到它们的元数据，管理界面只能按路径显示文件名。
+
+**响应：**
+
+```json
+{ "paths": ["/storage/emulated/0/Music/x.mp3"], "total": 1, "max": 300, "full": false }
+```
+
+`max` **不是产品上的取舍**：名单会拼进 `/list` 查询的 `_data NOT IN (?,…)`，每条占一个 SQLite 绑定变量（硬上限 999）。
+`full` 等价于 `total >= max`，由 core 算好，客户端据此**提前**提示，别让用户点完才发现没生效。
+
+---
+
+### POST /api/media/exclude
+
+加入 / 移出排除名单。**只改名单，永远不动文件。**
+
+删文件是 `POST /api/files/delete`，两者刻意分成两条接口 —— 一个可撤销、一个不可逆。
+合成一条带 `mode` 的接口，"能撤销"这件事在调用点上就看不出来了。
+
+**请求体：**
+
+```json
+{ "paths": ["/storage/emulated/0/Music/x.mp3"], "action": "add" }
+```
+
+`action` ∈ `add` / `remove` / `clear`（`clear` 时 `paths` 可为空）。
+
+**响应：**
+
+```json
+{ "success": true, "action": "add", "affected": 1, "requested": 1, "total": 1, "full": false }
+```
+
+**`affected < requested` 是客户端唯一能发现"只生效了一部分"的途径**（撞上限被截断）。
+写成功后 core 失效 `media:*` 缓存并推 WS `media:playlists`（复用那个 topic，目前没有独立的）。
+
+---
+
 ## 音频歌单 /api/playlists
 
 用户自己整理的音乐清单，**存在 core**（`PlaylistStore`，SharedPreferences 单键 JSON），
@@ -4556,10 +4600,21 @@ WiFi 休眠定时器。
 { "path": "/storage/emulated/0/test.txt" }
 ```
 
-**响应：** `{ "success": true, "deleted": true }`
+**响应：** `{ "success": true, "deleted": true, "path": "/storage/emulated/0/test.txt" }`
 
 `deleted` 与 `success` **恒等**（同一个布尔），保留是为了兼容旧客户端。递归删除，目录也能删。  
 文件不存在时返回 `success:false`（200，不是 404）。命中危险路径黑名单 → `400 DANGEROUS_PATH`。
+
+**单个文件先走 MediaStore**（2026-09-23）：`contentResolver.delete` 把文件与媒体索引一起处理。
+只用 `File.delete()` 的话索引还在，媒体库里会留下一条指向不存在文件的僵尸记录 —— 列表里看得见、
+点进去播放失败，重新扫描也不一定清得掉。删到 0 行（文档、压缩包这类本来就不在 MediaStore 里的）
+才退回文件系统删除。**目录仍然只走 `deleteRecursively()`**：逐个查 MediaStore 的代价随目录规模膨胀，
+而目录删除本来就得靠一次重扫收尾。删除成功会失效 `media:*` 缓存。
+
+没有「所有文件访问权限」时 resolver 抛 SecurityException，单独归类成
+`403 FORBIDDEN` + `extra = { needsAllFilesAccess: true }` —— 客户端据此引导去授权，
+而不是让用户对着笼统的"删除失败"反复重试。可以先用 `GET /api/files/status` 的
+`isExternalStorageManager` 预判。
 
 #### `POST /api/files/rename`
 

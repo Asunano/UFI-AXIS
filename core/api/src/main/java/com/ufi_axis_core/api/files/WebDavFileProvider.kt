@@ -157,7 +157,8 @@ class WebDavFileProvider(private val config: StorageSourceConfig) : FileProvider
             val sslContext = SSLContext.getInstance("TLS")
             sslContext.init(null, arrayOf<TrustManager>(trustManager), SecureRandom())
             builder.sslSocketFactory(sslContext.socketFactory, trustManager)
-            builder.hostnameVerifier { _, _ -> true }
+            // 只跳过证书链校验，**保留 hostname 校验**：每个请求都带 Basic 认证头，
+            // 两道一起关等于任何中间人换个证书就能拿到远端账号密码。
         }
 
         builder.build()

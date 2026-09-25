@@ -88,6 +88,16 @@ class StorageSourceRoutes(private val manager: StorageSourceManager) {
                 if (manager.isPasswordMasked(config.password)) {
                     config = config.copy(password = existing.password)
                 }
+                // 与 POST 同一份校验：少了它，PUT 能把非法协议/缺必填的配置写进存档
+                val protocol = config.protocol
+                if (protocol != "ftp" && protocol != "webdav" && protocol != "smb" && protocol != "s3") {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Unsupported protocol: $protocol")
+                    return@put
+                }
+                validationError(config)?.let { (code, msg) ->
+                    call.respondFail(HttpStatusCode.BadRequest, code, msg)
+                    return@put
+                }
                 try {
                     withContext(Dispatchers.IO) { manager.update(id, config) }
                 } catch (e: IllegalArgumentException) {
@@ -255,7 +265,10 @@ class StorageSourceRoutes(private val manager: StorageSourceManager) {
             region = (body["region"] as? JsonPrimitive)?.contentOrNull ?: "us-east-1",
             endpoint = (body["endpoint"] as? JsonPrimitive)?.contentOrNull ?: "",
             pathStyle = (body["pathStyle"] as? JsonPrimitive)?.booleanOrNull ?: true,
-            timeoutSec = (body["timeoutSec"] as? JsonPrimitive)?.intOrNull ?: 15,
+            // 夹到有限区间：OkHttp / commons-net / smbj 都把 0 当"永不超时"，
+            // 显式传 0 会让不可达的源把 IO 线程永久挂住。
+            timeoutSec = (body["timeoutSec"] as? JsonPrimitive)?.intOrNull
+                ?.takeIf { it > 0 }?.coerceIn(3, 120) ?: 15,
             enabled = (body["enabled"] as? JsonPrimitive)?.booleanOrNull ?: true
         )
     }

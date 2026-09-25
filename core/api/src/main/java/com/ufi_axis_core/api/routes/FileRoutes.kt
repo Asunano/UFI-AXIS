@@ -872,7 +872,14 @@ class FileRoutes(
                     val mimeType = MimeTypes.fromFileName(name).ifBlank { "application/octet-stream" }
                     // 总大小：206 必须回 Content-Range，播放器靠它算总时长与可 seek 范围。
                     // 取不到（provider 不给 size / 一次网络失败）时退回 200 全量，功能降级但不报错。
-                    val total = try { provider.info(remotePath).size } catch (_: Exception) { -1L }
+                    val total = try {
+                        provider.info(remotePath).size
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        // 客户端断开时协程取消也会走 catch，吞掉会让取消信号失效
+                        throw e
+                    } catch (_: Exception) {
+                        -1L
+                    }
                     val start = parseRangeStart(call.request.header(HttpHeaders.Range))
                     call.response.header(HttpHeaders.AcceptRanges, "bytes")
                     call.response.header(HttpHeaders.ContentDisposition, contentDisposition("inline", name))
@@ -1345,17 +1352,21 @@ class FileRoutes(
                     )
                     return@post
                 }
-                val result = uploadSessions.complete(session.id, dest.absolutePath, actual)
 
                 // ── 第二阶段：远端目标的话，这里只是"到了 core"，还没到远端 ──
                 // 暂存目录自带 sourceId 与远端相对目录（编码进路径），所以不需要在会话里加字段。
                 val staging = remotePush.parseStagingDir(session.dir)
-                if (staging != null) {
-                    val (sourceId, relDir) = staging
+                val sourceId = staging?.first
+                val relDir = staging?.second
+                // 幂等记录必须登记 `remote:<id>/…` 形态：登记 core 内部暂存目录的绝对路径，
+                // 重传 complete 时的 staged 判据会恒为 false，把"还没推到远端"误报成上传成功。
+                val destClient = if (sourceId != null && relDir != null) {
+                    registry.toClientPath(sourceId, RemotePushManager.joinRemote(relDir, session.fileName))
+                } else null
+                val result = uploadSessions.complete(session.id, destClient ?: dest.absolutePath, actual)
+
+                if (sourceId != null && relDir != null && destClient != null) {
                     val label = registry.listSources().firstOrNull { it.id == sourceId }?.label ?: sourceId
-                    val destClient = registry.toClientPath(
-                        sourceId, RemotePushManager.joinRemote(relDir, session.fileName)
-                    )
                     val job = remotePush.enqueue(
                         sourceId = sourceId,
                         sourceLabel = label,

@@ -2,6 +2,9 @@ package com.ufi_axis_core.api.files
 
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.util.UUID
@@ -129,15 +132,18 @@ class StorageSourceManager(
 
     /**
      * 测试存储源连接。创建临时 provider，尝试 list("/")，测量延迟。
+     *
+     * 改成 suspend 并用 [withTimeout] 兜底（原来是 runBlocking 整段占着 Dispatchers.IO 线程）：
+     * 不可达的源配上宽松的 provider 超时，反复点"测试连接"能把 IO 线程池占满。
      */
-    fun testConnection(config: StorageSourceConfig): TestResult {
+    suspend fun testConnection(config: StorageSourceConfig): TestResult {
         val start = System.currentTimeMillis()
+        // 给 provider 自身的超时留 5s 余量，并压一个 30s 的硬上限
+        val budgetSec = (config.timeoutSec.takeIf { it > 0 } ?: 15).coerceIn(3, 30) + 5
         return try {
             val provider = createProvider(config)
             try {
-                // 使用 runBlocking 因为这个方法本身不是 suspend
-                // 调用方（路由层）已在 withContext(Dispatchers.IO) 中
-                kotlinx.coroutines.runBlocking {
+                withTimeout(budgetSec * 1000L) {
                     provider.list("/")
                 }
                 val latency = System.currentTimeMillis() - start
@@ -145,6 +151,12 @@ class StorageSourceManager(
             } finally {
                 closeProvider(provider)
             }
+        } catch (_: TimeoutCancellationException) {
+            val latency = System.currentTimeMillis() - start
+            TestResult(success = false, message = "Connection timed out after ${budgetSec}s", latencyMs = latency)
+        } catch (e: CancellationException) {
+            // 客户端断开导致的取消要原样抛出，否则会被报成一次"连接失败"
+            throw e
         } catch (e: FileProvider.ProviderAuthException) {
             val latency = System.currentTimeMillis() - start
             TestResult(success = false, message = "Authentication failed: ${e.message}", latencyMs = latency)

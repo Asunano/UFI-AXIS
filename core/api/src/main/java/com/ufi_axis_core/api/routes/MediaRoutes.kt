@@ -216,7 +216,13 @@ class MediaRoutes(
 
 
         /** 允许作为扫描目录的前缀：与 FileRoutes 的用户存储白名单同一口径。 */
-        private val ALLOWED_DIR_PREFIXES = listOf("/storage/", "/sdcard", "/mnt/media_rw/")
+        private val ALLOWED_DIR_PREFIXES = listOf("/storage", "/sdcard", "/mnt/media_rw")
+
+        /**
+         * 前缀判定必须分隔符敏感：裸 `startsWith("/sdcard")` 会放过 `/sdcardXYZ/…` 这类同前缀旁路目录。
+         */
+        private fun isAllowedDir(abs: String): Boolean =
+            ALLOWED_DIR_PREFIXES.any { abs == it || abs.startsWith("$it/") }
 
         // ─────────────────── 音频分组聚合（/groups，2026-09-20） ───────────────────
 
@@ -986,7 +992,7 @@ class MediaRoutes(
         val raw = path?.trim()?.takeIf { it.isNotBlank() } ?: return null
         val file = runCatching { File(raw).canonicalFile }.getOrNull() ?: return null
         val abs = file.absolutePath
-        if (!ALLOWED_DIR_PREFIXES.any { abs.startsWith(it) }) return null
+        if (!isAllowedDir(abs)) return null
         return file.takeIf { it.isFile }
     }
 
@@ -2342,8 +2348,9 @@ class MediaRoutes(
                     .filter { it.isNotBlank() }
                     .distinct()
                 val illegal = cleaned.filterNot { dir ->
-                    ALLOWED_DIR_PREFIXES.any { dir.startsWith(it) } &&
-                        !dir.contains("..")
+                    // 先 canonical 化再比前缀：符号链接指出白名单外时，原始字符串是看不出来的
+                    val abs = runCatching { File(dir).canonicalPath }.getOrNull()
+                    abs != null && isAllowedDir(abs) && !dir.contains("..")
                 }
                 if (illegal.isNotEmpty()) {
                     call.respondFail(
@@ -2413,7 +2420,11 @@ class MediaRoutes(
                 }
                 val dirs = candidates
                     .map { it.trimEnd('/') }
-                    .filter { dir -> ALLOWED_DIR_PREFIXES.any { dir.startsWith(it) } && !dir.contains("..") }
+                    .filter { dir ->
+                        // 与 /config 同一判据：canonical 化之后再比分隔符敏感的前缀
+                        val abs = runCatching { File(dir).canonicalPath }.getOrNull()
+                        abs != null && isAllowedDir(abs) && !dir.contains("..")
+                    }
                 if (dirs.isEmpty()) {
                     call.respondFail(
                         HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
