@@ -52,7 +52,7 @@ jobs:
       # 下中文注释全是乱码，还随时可能被 UTF-8 编辑器二次写坏。
       # 用**扩展名白名单**而不是黑名单：core/src/main/assets/shell/ 下的 ARM 可执行文件
       # 没有扩展名，黑名单会漏进来被误判成「非 UTF-8」。
-      # 刻意不列 *.bat：scripts/UFI-AXIS-Core-install 那个安装脚本第 3 行是 `chcp 936`，
+      # 刻意不列 *.bat：scripts/UFI-AXIS-Core-install-Windows-Linux 那个安装脚本第 3 行是 `chcp 936`，
       # GBK 编码与代码页匹配才是正确的，转成 UTF-8 反而会输出乱码。
       - name: Guard — tracked text files must be UTF-8
         run: |

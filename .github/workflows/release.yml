@@ -227,7 +227,7 @@ jobs:
           name: core-release
           path: ${{ steps.rename.outputs.core }}
 
-      # ── Core 一键安装器（scripts/UFI-AXIS-Core-install-Windows，含 Windows .bat 与 Linux/macOS .sh）──
+      # ── Core 一键安装器（scripts/UFI-AXIS-Core-install-Windows-Linux，含 Windows .bat 与 Linux/macOS .sh）──
       # 目录随仓库带着 adb.exe + 两个 DLL、Windows 的 .bat 与 Linux/macOS 的 .sh，
       # 唯一缺的就是 APK。安装脚本按 `core/*.apk` 通配来装，所以这里只需把本次签名+改名后的
       # core 包丢进 core/，不需要与某个固定文件名对齐。
@@ -235,7 +235,7 @@ jobs:
       - name: Package Core one-click installer ZIP
         id: installer_zip
         run: |
-          INSTALLER_DIR="scripts/UFI-AXIS-Core-install-Windows"
+          INSTALLER_DIR="scripts/UFI-AXIS-Core-install-Windows-Linux"
           # 缺 adb.exe 就直接失败：装不了的安装器发出去比不发更糟
           if [ ! -f "$INSTALLER_DIR/adb.exe" ]; then
             echo "::error::$INSTALLER_DIR/adb.exe 缺失，一键安装器无法工作（是否漏提交？）"
@@ -249,7 +249,7 @@ jobs:
           # 从 scripts/ 起打包，让 zip 内保留一层目录名 —— 用户解压即得完整安装器目录，
           # 而不是把 adb.exe 和 bat 散落到下载目录里
           cd scripts
-          zip -r "../$ZIP_NAME" UFI-AXIS-Core-install-Windows -x 'UFI-AXIS-Core-install-Windows/log/*'
+          zip -r "../$ZIP_NAME" UFI-AXIS-Core-install-Windows-Linux -x 'UFI-AXIS-Core-install-Windows-Linux/log/*'
           cd ..
           echo "file=$ZIP_NAME" >> "$GITHUB_OUTPUT"
           unzip -l "$ZIP_NAME"
