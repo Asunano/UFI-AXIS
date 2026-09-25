@@ -179,9 +179,27 @@ data class ResolvedPalette(
     val gradientMuted: Color,
     val isDark: Boolean
 ) {
-    /** Card border color: subtle alpha-based border */
+    /**
+     * 卡片描边：极轻的 alpha 描边（深色 **白 5%** / 浅色 黑 6%）。
+     *
+     * ## 2026-09-24：深色档从 8% 降到 5%（**只动深色，浅色 6% 保持不变**）
+     * 原值两态都是"8% / 6%"这一档很轻的描边，当年的目标只是"给卡片一个收边"。
+     * 但深色态的 8% 白在卡面上做出的 ΔL\* 是 **7.5~8.2**，而卡面与页面底的 ΔL\*
+     * 当时只有 **5.59（玫红）~9.16（翠绿）** —— 也就是说描边这条"极轻的线"在 6 套彩色皮肤里
+     * 有一半比卡片本身的层次还响。这与 [divider] 的 15%→6% 是同一个病灶
+     * （线比面重，卡片浮不起来），处置也必须一起做，否则把 divider 压下去之后
+     * 最响的那条线只是换成了 cardBorder。
+     * 5% 下深色态 ΔL\*(border, cardBg) 落到 **4.61~5.11**，全表低于各自的卡/页 ΔL\*（6.46~9.16），
+     * 且在 6 套彩色皮肤里仍略轻于同套的 divider（玫红 4.63 vs 5.30、宝蓝 5.11 vs 5.96）——
+     * 描边比分隔线更弱，这是原本的层级意图。
+     *
+     * ⚠ 浅色态的 6%（往**黑**混）刻意不动：浅色态是"白卡压在近白页面底上"，
+     * ΔL\*(cardBg, pageBg) 只有 2.42，卡片边界**只能**靠线表达，调弱会让卡片消失。
+     * 两态的描边在这里就该是两个独立的数，与 [DIVIDER_ALPHA_LIGHT] / [DIVIDER_ALPHA_DARK]
+     * 拆常量是同一个理由。
+     */
     val cardBorder: Color
-        get() = if (isDark) Color.White.copy(alpha = 0.08f) else Color.Black.copy(alpha = 0.06f)
+        get() = if (isDark) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.06f)
 
     /** Dialog border color: 更明显的描边（参考 UFITOOLS-Widget 的 2dp 强边框，浅色~18% / 深色~30%） */
     val dialogBorder: Color

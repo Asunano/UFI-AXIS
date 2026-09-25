@@ -38,9 +38,12 @@ import androidx.compose.ui.graphics.Color
  * 与设计稿**刻意不同**的两处（都是为了过对比度硬指标，不是手误）：
  *
  * 1. **深色态页面底色不用饱和的 `d`**，而是 `d` 往近黑 `#0B0B0C` 混合后的低饱和版
- *    （`pageBgDark` 混 82%、`cardBgDark` 混 58%）。直接用 `d` 铺满整个 App 会让长时间
- *    浏览很累，且卡片与页面同色系高饱和时层次会糊；现在两者 ΔL\* 在 5.6~9.2 之间
- *    （最紧的是玫红 5.59、最松的是翠绿 9.16），见 [surfacesAreDistinguishable]。
+ *    （`pageBgDark` 混 82%、`cardBgDark` 混 58%，**玫红 / 紫色两套 2026-09-24 起改为 50%**）。
+ *    直接用 `d` 铺满整个 App 会让长时间浏览很累，且卡片与页面同色系高饱和时层次会糊；
+ *    现在两者 ΔL\* 在 6.5~9.2 之间（最紧的是宝蓝 6.46、最松的是翠绿 9.16），
+ *    由 [MIN_SURFACE_DELTA_L_DARK]（深色态专用下限 6.0）逐套钉住。
+ *    ⚠ 2026-09-24 之前这个区间是 **5.6~9.2**（玫红 5.59 / 紫色 5.73 垫底），
+ *    那就是用户"玫红深色模式背景不美观"的病灶：卡片浮不起来。见 [surfacesAreDistinguishable]。
  * 2. **浅色态正文色不是 `d` 本身**。设计稿写 `text = d`、`text2 = d@60%`，但 `d@60%`
  *    压在白卡上只有 3.1~3.9:1，**过不了正文 4.5:1**。所以下移一档：
  *    `textPrimary` = `d` 往近黑混 45% 的同色相深墨，`textSecondary` = `d` 原色。
@@ -57,6 +60,33 @@ import androidx.compose.ui.graphics.Color
  * 与 [ufiShade]，四张 Hero 卡与判据共用同一份实现）而不是 accent 本身 —— 那才是白字最容易
  * 失守的位置。删掉橙 / 青后，**全表最紧的一项**
  * 就是玫红浅色态的 `onGradient` 对渐变最亮停止点：3.12:1（门槛 3.0，余量仅 4%）。
+ *
+ * 2026-09-24：**深色态也开始有这个问题了**。那天把四张 Hero 卡的深色渐变从"往黑混"
+ * 改成"往白提亮 16%"（见 [GRADIENT_TOP_LIGHTEN_DARK]），判据的深色分支同步跟上，
+ * 于是深色态最亮停止点 = `accent.ufiShade(0.16)`。白字三套里最紧的是玫红深色态 3.37:1
+ * （余量 12%）；金黄 / 柠绿 / 翠绿走深墨前景，底色变亮只会让它们更宽松。
+ *
+ * ## 2026-09-24 深色态观感批次（A / B / C，用户定稿）
+ * 起因是"玫红配色深色模式背景不美观"，用户以为要**提高**对比度；实测推翻了这个前提 ——
+ * 深色态 `textPrimary` 对 `pageBg` 当时是 17.61~18.79:1，而 WCAG AAA 门槛只要 7.0。
+ * 真正的病灶是**表面层次太弱、而线条过响**，于是本批只动三处，且**全部只动深色支**：
+ *
+ * - **A 线弱化**：`dividerDark` 从卡面混 15% 白降到 **6%**；`cardBorder` 深色档白 8% → **5%**
+ *   （见 [DIVIDER_ALPHA_DARK] 与 `ThemePalette.cardBorder`）。判据是
+ *   [MAX_LINE_TO_SURFACE_DELTA_RATIO]：`ΔL*(divider, cardBg)` 不得超过 `ΔL*(cardBg, pageBg)`。
+ *   改前 6 套彩色皮肤这个比值是 1.52~2.64，改后 0.60~0.92（默认皮肤一直是 0.54）。
+ * - **B 去眩光**：6 套彩色皮肤的 `textPrimaryDark` 纯白 `#FFFFFF` → **`#EEEEEE`**
+ *   （与默认皮肤对齐）。纯白压近黑是眩光 / 光晕的来源，不是清晰度。
+ * - **C 抬卡面**：玫红 / 紫色的 `cardBgDark` 统一系数 58% → **50%**（per-preset 定点补偿）。
+ *
+ * ⚠ 本批**刻意没动**的两处，留给后续批次：
+ * 1. `iconTintDark` 仍是纯白 `#FFFFFF`（6 套彩色皮肤）—— 它与 `textPrimaryDark` 原本同值，
+ *    现在分叉了。B 项用户只定了正文色；图标是实心图形、眩光观感与正文不同档，
+ *    要不要一起降到 `#EEEEEE` 是一个独立的设计决策（不影响任何对比度下限：白对卡面更宽松）。
+ * 2. **D 项：按 L\* 反解 `cardBgDark`**。C 项只是给两套皮肤单独换了个系数，
+ *    "统一混色系数在红-品红端产出明度偏低"这个根因仍在：宝蓝的 ΔL\* 6.46 就是它的残留
+ *    （全表最低，也是 A 项只能取 6% 而不是 7% 的原因）。根治做法是给定目标 ΔL\*
+ *    反解出 `cardBgDark` 的 L\*，再回到 sRGB —— 那时 6 套皮肤会重新共用一条推导式。
  *
  * ## 老用户迁移
  * prefs 里可能留着 `"aurora"` 等历史 id（出厂默认曾是 `"aurora"`）。
@@ -138,10 +168,23 @@ object ThemePresets {
     //   cardBgLight   = #FFFFFF                设计稿的浅色卡
     //   pageBgDark    = mix(d, #0B0B0C, 82%)   低饱和深色页面底（不用饱和 d，理由见类 KDoc）
     //   cardBgDark    = mix(d, #0B0B0C, 58%)   比 pageBgDark 亮一档、同色相
+    //                   ⚠ 2026-09-24 起玫红 / 紫色**不走这个系数**，改为 50%（per-preset 覆盖，
+    //                     见那两套的注释）：统一系数在 sRGB 上对所有色相一视同仁，而 Rec.709 里
+    //                     红-品红的亮度权重最低（R 0.2126），同一系数在这两个色相上产出的 L\* 最低。
     //   accentSec.L   = mix(p, d, 55%)         浅色态的次强调：`l` 压在白底上只有 1.9:1，不能用
     //
     //   textSecondaryDark = 白 60% composite 到 cardBgDark（设计稿的 alpha 值，压成实色）
-    //   divider*          = 15% composite 到对应卡面（同上，仓内字段是纯 Color，不接受 alpha）
+    //   dividerLight      = 黑 15% composite 到 cardBgLight（同上，仓内字段是纯 Color，不接受 alpha）
+    //   dividerDark       = 白 **6%** composite 到 cardBgDark
+    //                   ⚠ 2026-09-24 起深色档从 15% 降到 6%（浅色档 15% 未动）。原先两态共用
+    //                     一个 15%，深色态因此"线比面响"：玫红 ΔL\*(divider, cardBg) = 14.74,
+    //                     是卡/页 ΔL\*(5.59) 的 2.64 倍，而默认皮肤这个比值只有 0.54。
+    //                     完整推导与判据见 [DIVIDER_ALPHA_DARK] / [MAX_LINE_TO_SURFACE_DELTA_RATIO]。
+    //   textPrimaryDark   = #EEEEEE（2026-09-24 起；原为纯白 #FFFFFF）
+    //                   ⚠ 纯白压近黑的实测对比度是 17.61~18.79:1，而 WCAG AAA 只要 7.0 ——
+    //                     超标 2.4~2.7 倍不是"更清晰"而是眩光 / 光晕。改成与默认皮肤同值的
+    //                     #EEEEEE 后是 15.18~16.19:1，仍是 AAA 的 2 倍以上。
+    //                     ⚠ `iconTintDark` 本批**刻意未动**（仍是纯白），见类 KDoc 末尾。
     //
     // 为什么 composite 成实色而不是存 alpha：带 alpha 的色在不同底色上观感不一致，
     // 且 [contrastRatio] 不吃 alpha —— 存实色才能被对比度测试真正验到。
@@ -149,7 +192,15 @@ object ThemePresets {
     // 命名：id 用英文 snake_case（与 prefs 持久化值一致），name 用中文（直接进 UI）。
     // ══════════════════════════════════════════════════════════════════════════
 
-    /** 玫红 —— p `#ed335f` / d `#761137` / l `#f9858b`。accent 够深，实底走白字。 */
+    /**
+     * 玫红 —— p `#ed335f` / d `#761137` / l `#f9858b`。accent 够深，实底走白字。
+     *
+     * ⚠ 本套的 `cardBgDark` 是**唯一两处** per-preset 覆盖之一（另一处是 [Violet]）：
+     * 统一推导式 `mix(d, #0B0B0C, 58%)` 在这里产出 `#380E1E`，L\* 只有 10.91（全表最低），
+     * 对 `pageBgDark` 的 ΔL\* = **5.59**，也是全表最低 —— 就是用户 2026-09-24 反馈
+     * "玫红深色模式背景不美观"的直接原因。改用 **50%** 后是 `#410E21`，ΔL\* = **7.58**，
+     * 与金黄 7.17 / 默认 7.80 同一档。详见下方色值行上的注释与 [MIN_SURFACE_DELTA_L_DARK]。
+     */
     val Rose = ThemePalette(
         id = "rose",
         name = "玫红",
@@ -160,13 +211,28 @@ object ThemePresets {
         pageBgLight = Color(0xFFF6EBEF),
         pageBgDark = Color(0xFF1E0C14),
         cardBgLight = Color(0xFFFFFFFF),
-        cardBgDark = Color(0xFF380E1E),
+        // 2026-09-24 per-preset 覆盖：原 0xFF380E1E = mix(d, #0B0B0C, 58%)（统一系数），
+        // 现 0xFF410E21 = mix(d, #0B0B0C, **50%**)。
+        // 为什么当年是 58%：6 套彩色皮肤共用一条推导式，58% 是在 sRGB 上挑的"比 pageBgDark
+        // 亮一档"的数，对 6 个色相一视同仁。
+        // 为什么这里必须单独抬：Rec.709 里红-品红的亮度权重最低（R 系数 0.2126），
+        // 同一个系数在这个色相上产出的 L\* 最低 —— 玫红与金黄的 **HSL 明度完全相同（都 13.7%）**，
+        // 但 L\* 是 10.91 vs 14.27，差 31%。
+        // 判据数值：ΔL\*(cardBg, pageBg) 5.59 → **7.58**；
+        // 连带 textPrimary(#EEEEEE)/cardBg 13.82:1、textSecondary/cardBg 6.36:1（门槛 4.5）、
+        // accent/cardBg 4.19 → **4.00**（门槛 3.0，仍达标）、accentSecondary/cardBg 6.69:1。
+        // 这是**定点补偿**，不是根治：统一系数在红-品红端偏暗这件事没有被修掉，
+        // 根治方案是按目标 L\* 反解 cardBgDark（D 项，单独一批）。
+        cardBgDark = Color(0xFF410E21),
         textPrimaryLight = Color(0xFF460E24),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF761137),
         textSecondaryDark = Color(0xFFAF9FA5),
         dividerLight = Color(0xFFEADBE1),
-        dividerDark = Color(0xFF563240),
+        // 2026-09-24：原 0xFF563240 = cardBg 混 15% 白，现 0xFF4C1C2E = 新 cardBg 混 **6%** 白。
+        // 原值的 ΔL\*(divider, cardBg) = 14.74，是卡/页 ΔL\*(5.59) 的 **2.64 倍**（默认皮肤 0.54）
+        // —— 线比面响，卡片浮不起来。现在是 5.30 / 7.58 = **0.70**，见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF4C1C2E),
         iconTintLight = Color(0xFF460E24),
         iconTintDark = Color(0xFFFFFFFF)
     )
@@ -184,11 +250,13 @@ object ThemePresets {
         cardBgLight = Color(0xFFFFFFFF),
         cardBgDark = Color(0xFF391D0D),
         textPrimaryLight = Color(0xFF47220E),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF78350F),
         textSecondaryDark = Color(0xFFB0A59E),
         dividerLight = Color(0xFFEBE1DB),
-        dividerDark = Color(0xFF573F31),
+        // 2026-09-24：原 0xFF573F31 = cardBg 混 15% 白（ΔL\* 14.64 = 卡/页 7.17 的 2.04 倍），
+        // 现 0xFF452B1C = 混 **6%** 白（ΔL\* 6.07，比值 0.85）。见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF452B1C),
         iconTintLight = Color(0xFF47220E),
         iconTintDark = Color(0xFFFFFFFF),
         onAccentLight = Color(0xFF47220E),
@@ -212,11 +280,13 @@ object ThemePresets {
         cardBgLight = Color(0xFFFFFFFF),
         cardBgDark = Color(0xFF21300F),
         textPrimaryLight = Color(0xFF283B0F),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF3F6212),
         textSecondaryDark = Color(0xFFA6AC9F),
         dividerLight = Color(0xFFE2E7DB),
-        dividerDark = Color(0xFF424F33),
+        // 2026-09-24：原 0xFF424F33 = cardBg 混 15% 白（ΔL\* 13.99 = 卡/页 9.12 的 1.53 倍），
+        // 现 0xFF2E3C1D = 混 **6%** 白（ΔL\* 5.55，比值 0.61）。见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF2E3C1D),
         iconTintLight = Color(0xFF283B0F),
         iconTintDark = Color(0xFFFFFFFF),
         onAccentLight = Color(0xFF283B0F),
@@ -240,11 +310,13 @@ object ThemePresets {
         cardBgLight = Color(0xFFFFFFFF),
         cardBgDark = Color(0xFF10311D),
         textPrimaryLight = Color(0xFF113D22),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF166534),
         textSecondaryDark = Color(0xFF9FADA5),
         dividerLight = Color(0xFFDCE8E1),
-        dividerDark = Color(0xFF34503F),
+        // 2026-09-24：原 0xFF34503F = cardBg 混 15% 白（ΔL\* 13.97 = 卡/页 9.16 的 1.52 倍），
+        // 现 0xFF1E3D2B = 混 **6%** 白（ΔL\* 5.52，比值 0.60）。见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF1E3D2B),
         iconTintLight = Color(0xFF113D22),
         iconTintDark = Color(0xFFFFFFFF),
         onAccentLight = Color(0xFF113D22),
@@ -268,16 +340,26 @@ object ThemePresets {
         cardBgLight = Color(0xFFFFFFFF),
         cardBgDark = Color(0xFF131F41),
         textPrimaryLight = Color(0xFF152551),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF1E3A8A),
         textSecondaryDark = Color(0xFFA1A5B3),
         dividerLight = Color(0xFFDDE1ED),
-        dividerDark = Color(0xFF36415E),
+        // 2026-09-24：原 0xFF36415E = cardBg 混 15% 白（ΔL\* 15.16 = 卡/页 6.46 的 2.35 倍），
+        // 现 0xFF212C4C = 混 **6%** 白（ΔL\* 5.96，比值 **0.92**，全表最紧的一档）。
+        // 宝蓝的卡/页 ΔL\* 6.46 是修复后全表最低（本批没有抬它的卡面，见 [MIN_SURFACE_DELTA_L_DARK]），
+        // 所以它同时是"7% 白这一档过不了 1 倍判据"的那套 —— 详见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF212C4C),
         iconTintLight = Color(0xFF152551),
         iconTintDark = Color(0xFFFFFFFF)
     )
 
-    /** 紫色 —— p `#7c3aed` / d `#4c1d95` / l `#c4b5fd`。accent 够深，实底走白字（渐变最亮点 3.83:1）。 */
+    /**
+     * 紫色 —— p `#7c3aed` / d `#4c1d95` / l `#c4b5fd`。accent 够深，实底走白字（渐变最亮点 3.83:1）。
+     *
+     * ⚠ 本套的 `cardBgDark` 与 [Rose] 一样是 per-preset 覆盖（统一系数 58% → **50%**）：
+     * 原 `#261346` 的 ΔL\*(cardBg, pageBg) = 5.73，是全表倒数第二（仅高于玫红 5.59）。
+     * 品红-紫同样落在 Rec.709 亮度权重最低的那一段（R 0.2126 + B 0.0722）。
+     */
     val Violet = ThemePalette(
         id = "violet",
         name = "紫色",
@@ -288,13 +370,24 @@ object ThemePresets {
         pageBgLight = Color(0xFFF0ECF7),
         pageBgDark = Color(0xFF170E25),
         cardBgLight = Color(0xFFFFFFFF),
-        cardBgDark = Color(0xFF261346),
+        // 2026-09-24 per-preset 覆盖：原 0xFF261346 = mix(d, #0B0B0C, 58%)（统一系数），
+        // 现 0xFF2B1450 = mix(d, #0B0B0C, **50%**)，与 [Rose] 同一处置、同一档系数。
+        // 判据数值：ΔL\*(cardBg, pageBg) 5.73 → **7.50**；textPrimary(#EEEEEE)/cardBg 13.73:1、
+        // textSecondary/cardBg 6.39:1（门槛 4.5）、accentSecondary/cardBg 8.63:1。
+        // `accent/cardBg` 2.92 → **2.79**：本套深色态本来就在
+        // `ColorTest.ACCENT_FLOOR_EXEMPTIONS` 里（紫色 accent 是 6 套里色相最暗的一套，
+        // 卡面又是它自己的色相调出来的），抬亮卡面会让这一项更低 —— 例外清单不变，
+        // 可读兜底仍是 accentSecondary（8.63:1）。想真正修掉它要重标定 accentDark，是另一件事。
+        // 同为定点补偿，根治方案见 D 项（按目标 L\* 反解 cardBgDark）。
+        cardBgDark = Color(0xFF2B1450),
         textPrimaryLight = Color(0xFF2F1557),
-        textPrimaryDark = Color(0xFFFFFFFF),
+        textPrimaryDark = Color(0xFFEEEEEE), // 2026-09-24 消除纯白眩光，原 0xFFFFFFFF，见上方推导口径
         textSecondaryLight = Color(0xFF4C1D95),
         textSecondaryDark = Color(0xFFA8A1B5),
         dividerLight = Color(0xFFE4DDEF),
-        dividerDark = Color(0xFF473662),
+        // 2026-09-24：原 0xFF473662 = 旧 cardBg 混 15% 白（ΔL\* 14.92 = 卡/页 5.73 的 2.61 倍），
+        // 现 0xFF38225B = **新** cardBg 混 **6%** 白（ΔL\* 5.78，比值 0.77）。见 [DIVIDER_ALPHA_DARK]。
+        dividerDark = Color(0xFF38225B),
         iconTintLight = Color(0xFF2F1557),
         iconTintDark = Color(0xFFFFFFFF)
     )

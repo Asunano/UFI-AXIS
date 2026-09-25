@@ -3,6 +3,29 @@
 
     <style name="Theme.UFIAXIS" parent="android:Theme.Material.Light.NoActionBar">
         <!--
+            ★ 2026-09-24：系统栏底色 + 对比度增强层（**防御性**，不是当时那条白带的因）。
+
+            本主题继承 `android:Theme.Material.Light`，它的 `navigationBarColor` 是不透明浅色；
+            运行期 `MainActivity.enableEdgeToEdge(...)` 会覆盖成透明，但那发生在 `onCreate`
+            —— 窗口已经按主题创建过了，中间有一个窗口期。写在主题里就没有窗口期
+            （同一条结论的原文在下面 `UfiDialogWindowTheme` 里）。
+
+            ⚠ 复盘记录，免得后人误以为这几行修了什么：真机上那条「底部约导航栏高度的白带」
+              与本主题无关。真因是**底栏那个 Dialog 窗口**缺
+              `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS`（平台契约：不带这个 flag 时
+              `navigationBarColor` 是 no-op，系统改用自己的不透明底色），
+              见 `UfiCapsuleBlurHost.CAPSULE_WINDOW_FLAGS_ON`。
+              这几行保留是因为它们本身正确（窗口创建期就透明），但别指望它们能修那类问题。
+
+            ⚠ 这几项在 API 35+ 被系统忽略（强制 edge-to-edge，导航栏恒透明），
+              留着是为 Android 12~14 的真机 —— minSdk 是 31。
+        -->
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+
+        <!--
             把**所有** Compose Dialog 的窗口主题换成 UfiDialogWindowTheme。
 
             为什么必须在这里改（而不是在 Kotlin 侧调 API）：
