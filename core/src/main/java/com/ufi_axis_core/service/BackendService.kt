@@ -773,6 +773,10 @@ class BackendService : Service() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val settings = AppSettings.getInstance(this@BackendService)
+                    // 更新下载方式的一次性迁移（2026-09-22）：老设备没有 update_source_mode 这个键，
+                    // 统一置 auto 让 core 自己按地区决定。放在这里而不是 build()：它只写一次 prefs，
+                    // 但顺带要打一条说明日志，跟地区检测是同一件事的两半。
+                    settings.migrateUpdateSourceModeIfAbsent()
                     if (!com.ufi_axis_core.api.geo.GeoDetector.isStale(settings)) {
                         AppLogger.i(
                             tag,
@@ -1031,7 +1035,9 @@ class BackendService : Service() {
         if (smsForwardJob?.isActive == true) return
         smsForwardJob = smsPollScope.launch {
             val smsForwardCtl = g.controller.smsForwardController
-            val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.network.smsClient)
+            // 2026-09-25 批 C1：sms 域迁进 DeviceAdapter 之后取值从 deviceHub.sms 拿
+            // （NetworkGraph 不再有 smsClient 字段）。拿到的仍是同一个实例，行为不变。
+            val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.network.deviceHub.sms)
             val initCfg = smsForwardCtl.loadConfig()
             AppLogger.i(tag, "SMS forward init: enabled=${initCfg.enabled}, smtpHost=${initCfg.smtpHost.takeIf { it.isNotBlank() } ?: "(empty)"}")
 

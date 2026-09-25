@@ -1,5 +1,6 @@
 package com.ufi_axis_core.controller.notify
 
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.sms.MailDelivery
 import com.ufi_axis_core.core.database.MailSendRecord
 import com.ufi_axis_core.devicespi.adapter.SmsControl
@@ -89,6 +90,19 @@ class LocalSmsChannel(
      */
     private val smsClient: SmsControl,
     /**
+     * 这台设备声明的能力集（2026-09-25 P3-6）。
+     *
+     * 判据与 `RootSmsRoutes` 的 `/sms/send` 门禁**同一份**（装配层递的都是
+     * `network.deviceHub.capabilities`）：缺 [Capability.SMS] 的型号上本渠道
+     * 直接在 [isConfigured] 里报不可用，压根不进分发。
+     *
+     * 为什么拦在 [isConfigured] 而不是 [deliver]：
+     *   - 拦得更早 —— 不占配额、不写一条注定失败的投递记录、不打一条失败日志；
+     *   - 设置页读的就是这个位，可以据此把「本机短信」整块置灰，
+     *     而不是让用户配完号码、按下测试、再收到一句失败。
+     */
+    private val capabilities: Set<Capability>,
+    /**
      * 投递记录写入口（实现在 `SmsForwardController`，装配层接线）。
      *
      * null = 未接入 = 只是不留记录，投递照走 —— 口径同 [WebhookChannel.history]。
@@ -127,8 +141,15 @@ class LocalSmsChannel(
      */
     override val hasDeliveryConfirmation: Boolean = true
 
-    /** 判定在 [LocalSmsDelivery.isConfigured]（开关 + 号码合法）。空号码 = 没配完。 */
-    override fun isConfigured(): Boolean = LocalSmsDelivery.isConfigured(store.load())
+    /**
+     * 判定在 [LocalSmsDelivery.isConfigured]（开关 + 号码合法）。空号码 = 没配完。
+     *
+     * 2026-09-25 P3-6 起前置一道**能力判据**：缺 [Capability.SMS] 的型号上本渠道恒不可用 ——
+     * 配得再全也发不出去，让它「已配置」只会换来一条注定失败的投递和一条错误日志。
+     * 判据只有 [capabilities] 这一份，与 `RootSmsRoutes` 的 `/sms/send` 门禁同源。
+     */
+    override fun isConfigured(): Boolean =
+        Capability.SMS in capabilities && LocalSmsDelivery.isConfigured(store.load())
 
     /**
      * 级别门槛与每日配额的取值口（判定在分发器，见 [ChannelRules]）。

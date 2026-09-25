@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import com.ufi_axis_core.controller.notify.LocalSmsChannel
 import com.ufi_axis_core.controller.notify.LocalSmsConfig
 import com.ufi_axis_core.controller.notify.LocalSmsConfigStore
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.devicespi.adapter.SendOutcome
 import com.ufi_axis_core.devicespi.adapter.SendVerdict
 import com.ufi_axis_core.devicespi.adapter.SmsControl
@@ -60,7 +61,13 @@ class LocalSmsChannelContractTest {
         val context: Context = ApplicationProvider.getApplicationContext()
         store = LocalSmsConfigStore(context)
         smsClient = mockk()
-        channel = LocalSmsChannel(store = store, smsClient = smsClient)
+        // 默认按「设备支持发短信」造（P3-6 起渠道要问能力集）。
+        // 不支持那一侧单独造一个实例去验，见「设备不声明 sms 能力时渠道恒不可用」。
+        channel = LocalSmsChannel(
+            store = store,
+            smsClient = smsClient,
+            capabilities = setOf(Capability.SMS)
+        )
     }
 
     /** 一次性把配置写进真 prefs（`accepts` / `isConfigured` / 三道刹车都从那里读）。 */
@@ -149,6 +156,25 @@ class LocalSmsChannelContractTest {
     fun `启用且号码合法时渠道判定配置齐全`() {
         save(number = "138-0013-8000")
         assertTrue("带分隔符的写法也算合法", channel.isConfigured())
+    }
+
+    /**
+     * 阴性对照（P3-6）：**配置一模一样**，只把 `Capability.SMS` 从能力集里拿掉，
+     * `isConfigured()` 必须翻成 false。
+     *
+     * 上一条用例与本条的唯一差别就是那一项能力 —— 所以它钉住的是「能力判据真的接上了」，
+     * 而不是「配置校验恰好返回了 false」。
+     */
+    @Test
+    fun `设备不声明 sms 能力时渠道恒不可用`() {
+        save(number = "138-0013-8000")
+        val noSms = LocalSmsChannel(
+            store = store,
+            smsClient = smsClient,
+            capabilities = emptySet()
+        )
+        assertTrue("同一份配置在支持发短信的设备上是齐全的", channel.isConfigured())
+        assertFalse("设备不支持发短信时这条渠道整块不可用", noSms.isConfigured())
     }
 
     // ══════════════════ 场景勾选 ══════════════════

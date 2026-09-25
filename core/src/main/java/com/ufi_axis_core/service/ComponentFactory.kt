@@ -346,6 +346,9 @@ object ComponentFactory {
             networkController = network.networkController,
             wifiControl = network.deviceHub.wifi,
             networkControl = network.deviceHub.network,
+            // P3-5：定时任务的能力门禁判据。与 route 层门禁同一个来源
+            // （`DataHub.deviceCapabilities` 也是这份），不另存一份。
+            capabilities = network.deviceHub.capabilities,
             smsRuleStore = smsRuleStore,
             platform = platform,
             tuning = tuning
@@ -469,6 +472,8 @@ object ComponentFactory {
         val localSmsChannel = com.ufi_axis_core.controller.notify.LocalSmsChannel(
             store = localSmsStore,
             smsClient = network.deviceHub.sms,
+            // P3-6：渠道自己判「这台设备支不支持发短信」，判据与 RootSmsRoutes 的门禁同源。
+            capabilities = network.deviceHub.capabilities,
             history = com.ufi_axis_core.controller.notify.DeliveryHistoryRecorder {
                 channelId, scene, subject, target, outcome, detail ->
                 controller.smsForwardController.recordChannelHistory(
@@ -982,6 +987,11 @@ object ComponentFactory {
         networkController: NetworkController,
         wifiControl: WifiControl,
         networkControl: NetworkControl,
+        /**
+         * 设备声明的能力集，只递给 [ActionExecutorImpl]（P3-5 的定时任务门禁）。
+         * 递集合而不是递布尔，是因为门禁要按 actionType 查表，需要的是整份集合。
+         */
+        capabilities: Set<com.ufi_axis_core.contract.Capability>,
         /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
         smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore,
         platform: PlatformAdapter,
@@ -996,7 +1006,7 @@ object ComponentFactory {
 
         // ── 12. 扩展组件 ──
         val smsForwardController = com.ufi_axis_core.controller.sms.SmsForwardController(context, systemCollector)
-        val actionExecutor = ActionExecutorImpl(networkController, systemController, deviceControl, wifiControl, networkControl)
+        val actionExecutor = ActionExecutorImpl(networkController, systemController, deviceControl, wifiControl, networkControl, capabilities)
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
         val conditionEngine = com.ufi_axis_core.core.scheduler.ConditionEngine(context, actionExecutor)

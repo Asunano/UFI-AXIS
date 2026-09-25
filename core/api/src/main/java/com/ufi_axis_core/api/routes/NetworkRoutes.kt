@@ -124,7 +124,7 @@ class NetworkRoutes(
                 }
                 val result = cache!!.getOrPut("network:band-status", CacheTTL.BAND_STATUS) {
                     // getBandLockStatus() 已归一化（计划书 1.1），这里读的是 canonical key
-                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient?.getBandLockStatus())?.values ?: JsonObject(emptyMap())
+                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient.getBandLockStatus())?.values ?: JsonObject(emptyMap())
                     toJsonElement(mapOf(
                         DeviceFields.BandStatus.LTE_BAND_LOCK to
                             (data[DeviceFields.BandStatus.LTE_BAND_LOCK]?.jsonPrimitive?.contentOrNull ?: ""),
@@ -196,18 +196,12 @@ class NetworkRoutes(
                 // 域内所有写入口都必须被同一个门禁覆盖，漏一个就等于留了一条绕过门禁的路。
                 // 判据不是「这条设备命令拦过了没有」，而是「这台设备支不支持这个功能域」。
                 dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
-                val client = network
-                if (client == null) {
-                    // 通道不可用 → 503（可重试）。
-                    // 这里原先还有一行「AT+ZPREFMOD 在此设备不支持」的注释：那句话描述的是
-                    // 「这台设备只能走 goform 改制式」这个**设备事实**，现在由
-                    // Capability.NETWORK_MODE 表达（§11.6：能力按用户动作定，不按通道定），
-                    // 留着会让人以为 503 的判据是「某个 AT 命令不支持」—— 那是 501 的语义。
-                    AppLogger.w("NetworkRoutes", "Goform client not available, cannot set network mode")
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "设备后台通道不可用，无法切换网络制式")
-                    return@post
-                }
+                // 2026-09-25 P3-11：这里原来还有一段 `val client = network; if (client == null) 503`。
+                // `network` 是 `ctx.deviceHub.network`，类型 `NetworkControl` **非空** ——
+                // 那个分支永不成立，是一段死代码；而它回的那句 503 文案还把协议名
+                // （"Goform client not available"）吐给了客户端，对外不该出现（同批 SimRoutes 的
+                // KDoc 已记录这条理由）。通道级不可用现在由 `respondWriteFailure` 按
+                // WriteOutcome 映射（会话失效 → 503 可重试），不需要这一层前置判空。
                 val params = call.receiveJsonObject()
                 val mode = params["mode"]?.jsonPrimitive?.contentOrNull ?: NetworkMode.AUTO
                 // 别名 → BearerPreference 的映射唯一实现在 profile 的 WriteSpec 里（计划书 2.6），
@@ -220,7 +214,7 @@ class NetworkRoutes(
                     "bearer" to bearerValue,
                     "mode_label" to NetworkMode.label(mode)
                 )
-                val outcome = client.setBearerPreference(mode)
+                val outcome = network.setBearerPreference(mode)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次网络制式切换", echo)) return@post
                 invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
@@ -246,19 +240,14 @@ class NetworkRoutes(
                 // 「同一条设备命令只拦一次」在这里不成立：拦的不是命令（这两个端点确实共用
                 // SET_BEARER_PREFERENCE），而是**这台设备支不支持「切换网络制式」这个功能域**。
                 dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
-                val client = network
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "设备后台通道不可用，无法切换承载偏好")
-                    return@post
-                }
+                // P3-11：与 /mode 同一处死分支（`network` 非空），一起删掉，理由见那里。
                 val params = call.receiveJsonObject()
                 val preference = params["preference"]?.jsonPrimitive?.contentOrNull ?: NetworkMode.AUTO
                 val echo = mapOf<String, Any?>(
                     "preference" to preference,
                     "bearer" to NetworkMode.toBearer(preference)
                 )
-                val outcome = client.setBearerPreference(preference)
+                val outcome = network.setBearerPreference(preference)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次承载偏好设置", echo)) return@post
                 invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
@@ -269,14 +258,10 @@ class NetworkRoutes(
 
             // 连接网络 (拨号)
             post("/connect") {
-                val client = network
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
-                    return@post
-                }
-                val success = client.connectNetwork()
-                if (success) dataHub?.invalidateNetwork()
+                // P3-11：原来这里有一段 `if (network == null) 503 "Goform client not available"`。
+                // `network` 非空 → 分支永不成立，且那句文案把协议名吐给了客户端。
+                val success = network.connectNetwork()
+                if (success) dataHub.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -285,14 +270,9 @@ class NetworkRoutes(
 
             // 断开网络
             post("/disconnect") {
-                val client = network
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
-                    return@post
-                }
-                val success = client.disconnectNetwork()
-                if (success) dataHub?.invalidateNetwork()
+                // P3-11：同 /connect，死分支 + 泄漏协议名的文案一起删。
+                val success = network.disconnectNetwork()
+                if (success) dataHub.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -301,12 +281,7 @@ class NetworkRoutes(
 
             // 连接模式 (手动/自动)
             post("/connection-mode") {
-                val client = network
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
-                    return@post
-                }
+                // P3-11：同 /connect，死分支 + 泄漏协议名的文案一起删。
                 val params = call.receiveJsonObject()
                 val requested = params["mode"]?.jsonPrimitive?.contentOrNull
                 // 设备侧 ConnectionMode 只认 auto_dial / manual_dial。两端历史上各发一套
@@ -317,7 +292,7 @@ class NetworkRoutes(
                     "manual", "manual_dial", "hand", "1" -> "manual_dial"
                     else -> "auto_dial"
                 }
-                val success = client.setConnectionMode(deviceMode)
+                val success = network.setConnectionMode(deviceMode)
                 // connection_mode 就在 device:settings 里，写完必须清，否则客户端回读到的是
                 // 最长 5 分钟前的旧值（与制式切换同一个坑）。
                 if (success) cache?.invalidate("device:settings")
@@ -340,7 +315,7 @@ class NetworkRoutes(
                     return@get
                 }
                 val result = cache!!.getOrPut("network:cell-info", CacheTTL.CELL_INFO) {
-                    val cellInfo = (dh?.signalQuery { getCellInfo() } ?: signalClient?.getCellInfo())?.values
+                    val cellInfo = (dh?.signalQuery { getCellInfo() } ?: signalClient.getCellInfo())?.values
                     toJsonElement(cellInfo ?: emptyMap<String, Any>())
                 }
                 call.respond(result)
@@ -354,7 +329,7 @@ class NetworkRoutes(
                         "DataHub/Goform client not available")
                     return@get
                 }
-                val neighbors = dh?.signalQuery { getNeighborCellInfo() } ?: signalClient?.getNeighborCellInfo()
+                val neighbors = dh?.signalQuery { getNeighborCellInfo() } ?: signalClient.getNeighborCellInfo()
                 call.respond(toJsonElement(mapOf(
                     "neighbor_cell_info" to (neighbors ?: JsonArray(emptyList()))
                 )))

@@ -98,8 +98,15 @@ class RootSmsRoutes(
 
             post("/send") {
                 // 能力门禁（3.3）：缺 sms → 501 NOT_SUPPORTED。
-                // 判据是 profile.smsSpec()（短信不走 SettingKey，见计划书 §11.2）；
-                // 这是全仓唯一一条「往外发短信」的入口（信箱的读/删/标已读不在此域内）。
+                // 判据是 profile.smsSpec()（短信不走 SettingKey，见计划书 §11.2）。
+                //
+                // ⚠ 这是「用户主动发短信」的唯一入口，但**不是**全仓唯一一条往外发短信的出口
+                // （2026-09-25 P3-6 更正，原注释那句话是假的）。第二条出口是通知渠道
+                // `LocalSmsChannel`：告警 / 下载 / 隧道 / 流量自动关网的事件会让设备自己发一条短信，
+                // 它同样调 `SmsControl.sendSms`。那条出口自己在 `isConfigured()` 里判
+                // `Capability.SMS`，判据与本行同源（装配层递的都是 `deviceHub.capabilities`）——
+                // 加新的短信出口时这两处都要想到。
+                // 信箱的读 / 删 / 标已读不在此域内。
                 deviceCapabilities.requireCapability(Capability.SMS)
                 val body = call.receiveJsonObject()
                 val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""

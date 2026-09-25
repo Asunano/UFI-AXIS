@@ -3,10 +3,10 @@ package com.ufi_axis_core.deviceplugins.platform.sprd
 import com.ufi_axis_core.devicespi.AtTransport
 import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.util.ThermalZones
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
-import java.io.File
 
 /**
  * 展锐（Spreadtrum / UNISOC）平台适配层 —— 阶段 4 的 4.1。
@@ -81,71 +81,41 @@ class SprdPlatform : PlatformAdapter {
     override fun atTransports(): List<AtTransport> = listOf(ServiceCallAtExecutor())
 
     /**
-     * 热区读数，**摄氏度** —— 任务 4.3 的一半，从 `DownloadManager.readMaxTemp()`
-     * **逐字搬过来**（遍历 `/sys/class/thermal/thermal_zone*` 的 `temp`，取最大值）。
+     * 热区读数，**摄氏度** —— 2026-09-25 改为委托 [ThermalZones.readMax]（单一真源）。
      *
-     * 搬迁范围（路径集合、max 逻辑、异常处理一字未改）：
-     * - 先 `File("/sys/class/thermal").exists()` 再 `listFiles()`，按 `thermal_zone` 前缀过滤；
-     * - 每个热区**单独** `try` / `catch (_: Exception) {}` —— 一个热区读不动不影响其它热区；
-     * - 读之前查 `canRead()`；内容 `toLongOrNull() ?: 0L`，再 `/ 1000f` 换算成摄氏度；
-     * - `maxTemp` 从 `0f` 起，只在 `tempC > maxTemp` 时抬升 —— 所以**负数读数被地板夹成 0**
-     *   （某些内核在热区未就绪时会写 `-1` 之类的值）。这条是原实现的行为，跟着搬；
-     * - 整段外面再包一层 `try` / `catch`，异常一律当「读不到」。
+     * 原实现（2026-09-24 批 H/I）是在本方法里**自己遍历** `/sys/class/thermal/thermal_zone<N>/temp`
+     * 取最大值。这与 `SystemCollector.getCpuInfo()` 里那份只读 zone0 的实现并存 ——
+     * 同一台设备上「告警看到的温度」和「图表里的温度」是两个数（缺陷 C 的根因）。
      *
-     * ## `null` 与 `0f` 的边界（与原实现的唯一差别，且在调用点上等价）
+     * 收敛后：[ThermalZones]（`:core:common`）持有唯一的遍历逻辑，
+     * 本方法只做「毫度 Long → 摄氏度 Float」的单位换算。
      *
-     * 原实现返回 `Float`，「一个热区都读不到」与「读到了但都 ≤ 0」都返回 `0f`。
-     * 本方法按 [PlatformAdapter.readTemperature] 的第 1 条硬约束区分开：
-     * **一个 `temp` 都没读成功 → `null`**；读成功过至少一个 → 返回那个（地板夹到 0 的）最大值。
-     * 调用点 `DownloadManager` 写的是 `?: 0f`，所以两种情形合并回 `0f`，**运行时取值逐路一致**。
+     * ## 与原实现逐值等价（可比对的四条判据）
      *
-     * ## `DataScheduler.readMaxCpuTemp()` 批 I 起也走本方法（**行为变更，已裁决**）
+     * 1. **遍历范围**：仍是全部 `thermal_zone<N>`，按 `startsWith` 前缀过滤 —— 不变；
+     * 2. **负数地板夹 0**：`ThermalZones.readMax()` 的 `maxMilliC` 从 `0L` 起、只在更大时抬升
+     *    —— 等价于原来 `Float` 域的 `maxTemp = 0f` + `if (tempC > maxTemp)`；
+     * 3. **`null` vs `0f`**：原实现「一个热区都读不到」与「读到了但都 ≤ 0」都返回 `0f`。
+     *    `ThermalZones` 区分了（前者 `maxMilliC == null`，后者 `maxMilliC == 0L`），
+     *    本方法按 [PlatformAdapter.readTemperature] 第 1 条硬约束：`null` → `null`。
+     *    调用点 `DownloadManager` 写的 `?: 0f` 把两种合回 `0f` —— **运行时逐路一致**；
+     * 4. **每热区独立 try + canRead() 预检**：`ThermalZones` 照样逐条保留 —— 不变。
      *
-     * 那一处与本方法**不是同一个读法**（不是单位不同，是语义不同），所以批 H 没动它：
-     * 它读的是**毫摄氏度 `Int` 原值**（不做 `/1000`）、没有 `exists()` / `canRead()` 守卫、
-     * 只有一层外层 `try`（**任一热区抛异常 → 整轮读数退化成 0 并记一条 WARN**）、
-     * 且 `maxOrNull()` **不夹地板**（可以返回负数）。
+     * ⚠ 上面第 2、3 条已被 2026-09-25 的 P3-3 改掉（原文保留供对照）：
+     * `ThermalZones` 现在**只把「解析成功且 > 0」算作有效读数**，所以
+     * 「热区全部报 -1」「热区内容全不是数字」这两种情况下 `maxMilliC` 是 `null` 而不再是 `0L`，
+     * 本方法因此返回 `null` 而不是 `0f`。这是刻意的：原来那个 `0f` 会让 `DownloadManager`
+     * 的温控熔断把「读不到温度」当成「最凉」，越热越不熔断且没有任何告警
+     * —— 现在 `null` 会走到调用方的「温度不可用」分支。
+     * 第 3 条那句「运行时逐路一致」随之不再成立。
      *
-     * 批 I 接上时这四点全部随本方法变，用户已裁决接受；`DataScheduler` 侧
-     * `readMaxCpuTemp()` 的 KDoc 逐条记了每一点的实际影响。
-     *
-     * 取整那一条在批 I 有结论：**换算必须 `roundToInt()`，不许 `toInt()`**。
-     * 实测 20~100°C 的 80001 个毫度值做「毫度 → `Float` → 毫度」往返，
-     * `toInt()` 有 **555** 个少 1（最小的是 32002 → 32.002f → 32001.998f → 32001），
-     * `roundToInt()` **0** 个不匹配。换算函数落在 `core/common` 的 `celsiusToMilliC()`（有单测）。
 
-     *
-     * ## 调度器
-     *
-     * 内部 `withContext(Dispatchers.IO)`：本方法做阻塞 sysfs 读。
-     * 两个调用点（`DownloadManager.checkAndThrottle()` 与 `DataScheduler.readMaxCpuTemp()`）
-     * 本来就跑在 `Dispatchers.IO` 上，所以这层包裹不切线程、对现状零影响；
-     * 加它是为了让「谁来保证不在主线程读盘」这件事有唯一答案
-     * —— 批 I 起 `DataScheduler` 那一份自己的 `withContext(Dispatchers.IO)` 已经删掉了。
-     *
      * @return 摄氏度；一个热区都读不到时 `null`。
      */
     override suspend fun readTemperature(): Float? = withContext(Dispatchers.IO) {
-        try {
-            var maxTemp = 0f
-            var anyZoneRead = false
-            // 优先用 Java File I/O（无需 fork 进程，更快）
-            val thermalDir = File("/sys/class/thermal")
-            if (thermalDir.exists()) {
-                thermalDir.listFiles()?.filter { it.name.startsWith("thermal_zone") }?.forEach { zone ->
-                    try {
-                        val tempFile = File(zone, "temp")
-                        if (tempFile.canRead()) {
-                            val milli = tempFile.readText().trim().toLongOrNull() ?: 0L
-                            anyZoneRead = true
-                            val tempC = milli / 1000f
-                            if (tempC > maxTemp) maxTemp = tempC
-                        }
-                    } catch (_: Exception) {}
-                }
-            }
-            if (anyZoneRead) maxTemp else null
-        } catch (_: Exception) { null }
+        val reading = ThermalZones.readMax()
+        val milliC = reading.maxMilliC
+        if (milliC != null) milliC / 1000f else null
     }
 
     /**

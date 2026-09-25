@@ -1,7 +1,8 @@
 package com.ufi_axis_core.collector.system
 
 import org.junit.Test
-import org.junit.Assert.*
+import org.junit.Assert.assertEquals
+
 
 class SystemCollectorTest {
 
@@ -44,4 +45,20 @@ class SystemCollectorTest {
         assertEquals(32L * 1024 * 1024 * 1024, storageInfo.total)
         assertEquals(16L * 1024 * 1024 * 1024, storageInfo.available)
     }
+
+    // ── 缺陷 B：CPU 快照缓存的时钟回跳测试（2026-09-25 搬走）──
+    //
+    // 原来这里有四条 `isCpuSnapshotFresh 逻辑 - …` 用例，但它们把生产逻辑**抄一份**
+    // 到测试里再断言抄本（`val fresh = elapsed in 0 until 5_000L`），从未调用
+    // SystemCollector —— 于是把生产实现改回 `elapsed < 5_000L`（缺陷 B 的原始写法）
+    // 那四条仍然全绿，等于没有回归保护。
+    //
+    // 根因是模块边界：本文件在 `:core`，被测代码在 `:core:collector`，跨模块拿不到
+    // internal，所以当时留了一句「不值得为测试改生产签名」就抄了逻辑。
+    //
+    // 现在用例搬到了 `core/collector/src/test/.../SystemCollectorCpuSnapshotFreshnessTest.kt`
+    // （与被测代码同模块），`isCpuSnapshotFresh` 也从 private 实例方法提到
+    // internal companion object（纯函数、无行为变化），直接断言真实实现。
+    // 本文件只保留三个数据类的构造用例。
 }
+

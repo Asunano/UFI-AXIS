@@ -24,6 +24,10 @@ dependencies {
     // 但那是**别人的实现细节**：goform 哪天把那行改成 implementation，本模块就会莫名编译不过。
     // 直接依赖的模块要显式声明 —— 口径同 `:core:device-plugins` 里显式声明协程那一条。
     implementation(project(":core:device-spi"))
+    // 冻结区。2026-09-25 P3-6 起 `LocalSmsChannel` 的构造签名上出现 `Set<Capability>`
+    // （渠道自己判「这台设备支不支持发短信」）。它经 `:core:device-spi` 的
+    // `api(":core:contract")` 已在 classpath 上，但直接用的类型要显式声明 —— 口径同上面那条。
+    implementation(project(":core:contract"))
     implementation(libs.kotlinx.serialization.json)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.androidx.core.ktx)
