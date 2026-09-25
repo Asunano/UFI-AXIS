@@ -75,7 +75,9 @@ class WifiRoutes(
                 val maxStaNum = p["max_sta_num"]?.jsonPrimitive?.intOrNull
                 val broadcastDisabled = p["broadcast_disabled"]?.jsonPrimitive?.intOrNull
                 val chipIndex = p["chip_index"]?.jsonPrimitive?.contentOrNull
-                val outcome = wifi.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                val outcome = wifi.setWifiConfig(
+                    ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex
+                )
                 // 设备拒绝（密码位数 / 加密组合非法这类）回 400 + 原因，与 /sleep、/acl/* 同口径。
                 // 原来这里把三态压成 Boolean 再一律回 500，客户端只能显示一句 HTTP 500。
                 if (call.respondRejected(outcome)) return@post

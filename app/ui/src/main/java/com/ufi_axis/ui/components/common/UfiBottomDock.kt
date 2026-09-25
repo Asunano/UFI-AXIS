@@ -1,3 +1,4 @@
+// [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.components.common
 
 import androidx.compose.animation.core.Animatable
@@ -42,6 +43,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorProducer
+import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
@@ -145,8 +147,6 @@ fun UfiBottomDock(
     val bottomPadDp: Dp =
         (with(density) { systemBarPx.toDp() } + DOCK_ICON_LIFT).coerceAtMost(reservedDp)
     val topPadDp: Dp = reservedDp - bottomPadDp
-
-
 
     // 把「栏的实测总高」回写给窗口宿主。
     //
@@ -430,15 +430,12 @@ fun UfiBottomDock(
     // 去定手势小白条的明暗，见 UfiCapsuleBlurHost 的 `isAppearanceLightNavigationBars`）。
     val dockSurface: Color = dockSurfaceColor(palette)
 
-
     // 顶边发丝线：栏与「几乎同色的页面底色」之间唯一的分界（§5.17）。
     //
     // ★ 2026-09-24（用户定稿，第三轮）：上缘那条 6dp 高光带**已删除**。
     //   它先是白色渐变（浅色主题下白底加白，读不出来），改成主题色实色后又变成一条
     //   6dp 的彩色横条 —— 观感上像"底栏自己又长了个顶栏"。朴素形态只留 1 物理像素的发丝线。
     val topHairline: Color = palette.divider.copy(alpha = 0.62f)
-
-
 
     Column(
         modifier = modifier
@@ -538,7 +535,6 @@ fun UfiBottomDock(
                 }
             }
         }
-
 
         // 预留区的**下半段** = 系统栏本体（小白条 / 三键按键带）那一条。
         // 图标不压小白条靠的就是这一段，而不是把整条栏抬起来。
@@ -681,7 +677,7 @@ private fun DockTab(
  * @param visualPos 药丸位置（下标空间，已按 layoutDirection 取过反）。
  * @param tabCount  Tab 数，用来等分格宽。
  */
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawSelectionPill(
+private fun DrawScope.drawSelectionPill(
     visualPos: Float,
     tabCount: Int,
     accent: Color
@@ -704,7 +700,6 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawSelectionPill(
         cornerRadius = CornerRadius(PILL_CORNER.toPx())
     )
 }
-
 
 /**
  * 药丸**内部**图标与文字的颜色。
@@ -744,7 +739,6 @@ private fun dockPillContentColor(palette: ResolvedPalette): Color =
  * 滚动时底栏会呼吸，安全区那一段还会透出页面最底部内容，小白条的对比度也跟着不可控。
  */
 internal fun dockSurfaceColor(palette: ResolvedPalette): Color = palette.cardBg
-
 
 // ── 视觉常量（全部来自迁移计划 §1 的参数表）──────────────────────────────────
 
@@ -870,7 +864,6 @@ private val PILL_CORNER: Dp = 15.dp
 //   删除理由与各参数的推导见 `drawSelectionPill` 的 KDoc 与 git 历史。
 //   同批删除的还有栏顶那条 6dp 高光带的 DOCK_TOP_SHEEN_HEIGHT。
 
-
 /**
  * 「正在横滑」的判定带宽（下标空间）。
  *
@@ -963,4 +956,3 @@ private suspend fun awaitDockSettleAuthority(
 //   (`spring(0.8, 500)`)，KDoc 里注明「点击路径该用哪条曲线未拍板」。**通栏一律不用弹簧** ——
 //   本栏格宽等分且药丸只比格窄 16dp×2，弹簧的过冲会让药丸越过格边界、压到邻格图标上。
 //   两处 animateTo 都走同一条 tween，收尾干净。
-

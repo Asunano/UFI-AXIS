@@ -491,7 +491,8 @@ class DeviceRoutes(
             // 查询设备设置状态（通过 DataHub 获取）
             get("/settings") {
                 suspend fun f(): JsonElement {
-                    val data = (dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings())?.values
+                    val data = (dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings())
+                        ?.values
                     val map = (data ?: emptyMap()).toMutableMap()
                     // 制式中文名由 contract 统一给出（App/Web 不再各译一份）。
                     // 取 net_select（真机切换后变化的就是它），缺失才回落 BearerPreference；
@@ -644,7 +645,9 @@ class DeviceRoutes(
                 val dhcpStart = p["dhcp_start"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpEnd = p["dhcp_end"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpLease = p["dhcp_lease"]?.jsonPrimitive?.contentOrNull ?: "86400"
-                val outcome = deviceHub.device.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+                val outcome = deviceHub.device.setDhcpSetting(
+                    lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease
+                )
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:lan")

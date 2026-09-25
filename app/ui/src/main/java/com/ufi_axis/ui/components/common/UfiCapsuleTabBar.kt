@@ -705,7 +705,7 @@ fun UfiCapsuleTabBar(
     // 实时追踪进度：MainNavGraph 提供连续页位置 lambda；未提供时退化为按 selectedIndex。
     // 2026-08-23 优化：推迟到下层读取，本函数体实现零重组。
     val selectionProgressProvider = LocalUfiCapsuleSelectionProgress.current
-    
+
     // 实时追踪·滑动中展开：progress 偏离整数页即「滑动中」。
     //
     // 2026-09-05 第四版（「横滑落定还顿一下（变轻但没消失）」）：从
@@ -727,7 +727,7 @@ fun UfiCapsuleTabBar(
     // 一次性标记会被先跑到的那条消费掉，另一条读到 false ⇒ 两者错开 80ms（半修好状态）。
     var motionSettlePending by remember { mutableStateOf(false) }
     LaunchedEffect(Unit) {
-        snapshotFlow { 
+        snapshotFlow {
             val p = selectionProgressProvider()
             if (p.isNaN()) 0f else abs(p - p.roundToInt())
         }.collect { offset ->
@@ -1077,7 +1077,7 @@ fun UfiCapsuleTabBar(
     val sweepAlpha =
         if (isDarkPalette) CAPSULE_SWEEP_ALPHA_DARK else CAPSULE_SWEEP_ALPHA_LIGHT
     Box(
-    
+
             modifier = Modifier
                 .shadow(
                     elevation = 15.dp,

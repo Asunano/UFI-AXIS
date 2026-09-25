@@ -124,7 +124,8 @@ class NetworkRoutes(
                 }
                 val result = cache!!.getOrPut("network:band-status", CacheTTL.BAND_STATUS) {
                     // getBandLockStatus() 已归一化（计划书 1.1），这里读的是 canonical key
-                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient.getBandLockStatus())?.values ?: JsonObject(emptyMap())
+                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient.getBandLockStatus())
+                        ?.values ?: JsonObject(emptyMap())
                     toJsonElement(mapOf(
                         DeviceFields.BandStatus.LTE_BAND_LOCK to
                             (data[DeviceFields.BandStatus.LTE_BAND_LOCK]?.jsonPrimitive?.contentOrNull ?: ""),
