@@ -600,7 +600,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="8dp"
-                            tools:text="UFI-AXIS-Core_0.0.2.apk" />
+                            tools:text="UFI-AXIS-Core_0.0.3.apk" />
 
                         <View
                             android:layout_width="match_parent"
