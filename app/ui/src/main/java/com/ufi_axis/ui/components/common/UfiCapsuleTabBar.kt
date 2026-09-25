@@ -38,14 +38,20 @@ import com.ufi_axis.ui.theme.NeutralOutline
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.UfiTextStyles
 import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.draggable
-import androidx.compose.foundation.gestures.rememberDraggableState
+// ★ 已删除（2026-09-24，迁移阶段 2.4）：
+//   `androidx.compose.foundation.gestures.Orientation` / `.draggable` / `.rememberDraggableState`
+//   —— 横向拖拽切页整套已移除，理由见本文件下方 `settleIndex` 处的删除说明与
+//   `docs/bottom-dock-migration-plan.md` §5.2。
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.ImageShader
+import androidx.compose.ui.graphics.ShaderBrush
+import androidx.compose.ui.graphics.TileMode
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import kotlin.math.abs
@@ -142,6 +148,20 @@ private val EXPAND_SPRING: AnimationSpec<Float> =
     spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = UfiAnimSpecs.CapsuleExpandStiffness)
 
 /**
+ * **收回**进度弹簧（2026-09-23）。刚度比 [EXPAND_SPRING] 高一档，整段收回约 0.2s。
+ *
+ * 为什么收回要单独一条：收回时格宽跟的是 [labelReveal]（[LABEL_FADE_OUT_MS] = 220ms 走完），
+ * 而整体缩放跟的是 expandProgress（展开弹簧 ≈ 300ms）—— 于是宽度已经收到位、缩放还在跑那
+ * 最后 80ms，观感就是「收完之后又抖一下」。这正是「收回动画不好看」的来源。
+ *
+ * 1700f ≈ 0.2s，与标签淡出同量级，两条线同时到位。顺带也符合动效通则：**退出快于进入**
+ *（展开是用户在"打开"，值得从容；收回是收尾，拖着只会显得迟滞）。
+ * 仍用 `spring(` 而不是 tween：与展开同族，中途反向打断时不会有曲线突变。
+ */
+private val COLLAPSE_SPRING: AnimationSpec<Float> =
+    spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = 1700f)
+
+/**
  * 选中态「显示 / 消失」动画曲线。
  *
  * 2026-09-01 起胶囊不再有「扫荡」：点哪个就是哪个，被点的那个淡入、原来那个淡出，
@@ -196,19 +216,27 @@ private const val INDICATOR_FILL_TOP: Float = 1f
 /** 滑块底色下缘不透明度：比上缘略低一档，给药丸一点厚度，避免纯平涂。 */
 private const val INDICATOR_FILL_BOTTOM: Float = 0.90f
 
-/** 抓住滑块拖动时叠的一层白，给"抓住了"的确认感。 */
-private const val INDICATOR_DRAG_TINT: Float = 0.12f
+/*
+ * ★ 已删除（2026-09-24，迁移阶段 2.4）：`INDICATOR_DRAG_TINT = 0.12f` ★
+ * 抓住滑块拖动时叠在药丸上的一层白（"抓住了"的确认感）。唯一消费者是
+ * `CapsuleSelectionSlider` 的 dragBoost 分支，随横向拖拽整套一起退休，见计划 §5.2。
+ */
 
 /**
  * 滑块的滑动弹簧。用全站统一的「指示条滑动」档位 —— 与 UfiScrollableTabRow 的下划线同源。
  *
- * ## 使用范围（2026-09-05 收窄）
- * 只剩**一个**调用点：抓住滑块长按拖动、松手后「钉到目标格」那一下（C2 分支）。
- * 那是一次**手势释放**，弹簧的速度连续性正是它要的手感（把滑块当被甩出去的实体），
- * 而且此刻页面早已在拖动途中被逐格切走，没有一条"正在跑的页面动画"需要对齐。
+ * ## 使用范围
+ * 只剩**一个**调用点：`settleIndex != null` 时「钉到目标格」那一下（C2 分支）。
  *
- * ⚠ 常规归位（点击 / 横滑落定）**不再**用它，改用 [indicatorSettleSpec] ——
- * 那条路径必须与页面转场同一条时间轴，见该函数的 KDoc。
+ * 2026-09-24 前它的触发入口是**拖拽松手**——一次手势释放，弹簧的速度连续性正是它要的
+ * 手感（把滑块当被甩出去的实体）。横向拖拽删除后（§5.2），同一个分支改由**点击**进入
+ * （点击跨多页同样触发 pager 逐页扫场，见 `settleIndex` 的说明）。
+ *
+ * ⚠ 这意味着点击路径的滑块动画曲线从 [indicatorSettleSpec]（与页面转场同源的 tween）
+ *   变成了本弹簧 —— 计划 §7-2.4 只交代了「把赋值时机从松手改到点击」，没有交代这条曲线
+ *   该跟着换成哪一条。**未自行拍板**，留待 2.5/2.6 收尾时与真机观感一起决策。
+ *
+ * ⚠ 常规归位（横滑落定 / 无 settleIndex 的点击）仍**不**用它，用 [indicatorSettleSpec]。
  */
 private val INDICATOR_SPEC: AnimationSpec<Float> = UfiMotion.tabSlider()
 
@@ -239,16 +267,23 @@ internal fun indicatorSettleSpec(navTransitionMs: Int): AnimationSpec<Float> =
  * 页面拖动收尾时 `isScrolling` 会短暂抖成 false，若立刻归位就会与随后的连续进度打架
  * （表现为滑块抽搐）。等这么久仍然静止才归位；期间恢复滑动则归位自动取消。
  * 约 5 帧，肉眼察觉不到延迟。
+ *
+ * 2026-09-24（迁移阶段 2.7）：`private` → `internal`，**仅可见性**。
+ * `UfiBottomDock` 的归位也要付同一个确认窗，两处各写一个 80L 迟早漂移。
  */
-private const val IDLE_SETTLE_CONFIRM_MS = 80L
+internal const val IDLE_SETTLE_CONFIRM_MS = 80L
 
 /**
  * 归位时「已经到位」的判定阈值（下标空间）。
  *
  * 页面手势收尾时滑块往往已停在离整格不到 1% 的位置，此时再跑一次弹簧毫无意义，
  * 却会因为弹簧带初速而多晃一下。差距小于本值直接 snap。
+ *
+ * 2026-09-24（迁移阶段 2.7）：`private` → `internal`，**仅可见性**。[UfiBottomDock] 的
+ * 归位分支用同一道阈值 —— 它与 `isScrolling` 的 0.01f 判据是一对（本值必须更宽），
+ * 两处各写一份数字就会把这层关系拆散。
  */
-private const val SETTLE_SNAP_EPSILON: Float = 0.02f
+internal const val SETTLE_SNAP_EPSILON: Float = 0.02f
 
 /**
  * 「等权威追上」的最长等待时长（2026-09-05 第二版）。
@@ -266,8 +301,11 @@ private const val SETTLE_SNAP_EPSILON: Float = 0.02f
  * 就覆盖了「settle 跑满全程 + 回吐 + 重组」这条最慢的正常链路。超过它仍未一致，
  * 只可能是进度不可信，此时按唯一真相源（宿主下标）归位才是正确行为。
  * 不写裸字面量：值随全站转场时长梯度一起走，改了转场时长这里自动跟上。
+ *
+ * 2026-09-24（迁移阶段 2.7）：`private` → `internal`，**仅可见性**。
+ * [UfiBottomDock] 的 `awaitDockSettleAuthority` 用同一个上限（同一条兜底红线）。
  */
-private const val AUTHORITY_CATCHUP_TIMEOUT_MS: Long =
+internal const val AUTHORITY_CATCHUP_TIMEOUT_MS: Long =
     UfiMotion.Duration.Sweeping.toLong() + IDLE_SETTLE_CONFIRM_MS
 
 /**
@@ -348,7 +386,7 @@ internal fun settleNeedsConfirmWindow(
  * 两条归位驱动（滑块位置 / 图标着色）的一组判据快照（2026-09-05 第四版）。
  *
  * ## 存在的唯一理由：把这些输入的读取从**组合期**挪进协程
- * 它们原来直接当 `LaunchedEffect` 的 key（`safeIndex, isScrolling, isDragging, settleIndex`），
+ * 它们原来直接当 `LaunchedEffect` 的 key（`safeIndex, isScrolling, settleIndex`），
  * 也就是组合期读。横滑一次 `isScrolling` 必然翻转两下（起手 false→true、落定 true→false），
  * 每一下都让 [UfiCapsuleTabBar] **整体重组**；而这个 composable 活在独立 Dialog 窗口 +
  * 跨窗口渲染里，一次重组要重测量、重绘、再提交那个窗口。两下恰好落在 settle 前后 ——
@@ -360,16 +398,17 @@ internal fun settleNeedsConfirmWindow(
  * - `data class` 的 `equals` + `distinctUntilChanged()` ≡ 原来的「key 是否变化」；
  * - `collectLatest` 的「新值到达即取消上一次 body」≡ 原来的「key 变了就取消并重启 effect」。
  *
- * ⚠ **不要**把 `dragPos` / `selectionProgressProvider()` 加进来：它们每帧都变，
- * 会把本流变成每帧一次的发射源（原实现也没把它们当 key，只在分支体内用嵌套
- * `snapshotFlow` 现读）。
+ * ⚠ **不要**把 `selectionProgressProvider()` 加进来：它每帧都变，会把本流变成每帧一次的
+ * 发射源（原实现也没把它当 key，只在分支体内用嵌套 `snapshotFlow` 现读）。
+ *
+ * ★ 已删除字段（2026-09-24，迁移阶段 2.4）：`dragging`。它的唯一来源是横向拖拽的
+ *   `isDragging`，拖拽整套已移除（§5.2），于是这个判据恒为 false。
  *
  * @param index 权威下标（`latestIndex.value`，即 `mainTabIndex` 那一份唯一真相）。
  */
 private data class CapsuleSettleProbe(
     val index: Int,
     val scrolling: Boolean,
-    val dragging: Boolean,
     val settleIndex: Int?,
 )
 
@@ -378,12 +417,15 @@ private data class CapsuleSettleProbe(
  *
  * `resetToken` 只用于「重新计时」：它单调递增，两次自增被 `snapshotFlow` 的同帧合并成一次
  * 发射也不改变语义 —— `collectLatest` 收到任何新值都会重启 `delay(COLLAPSE_DELAY_MS)`。
+ *
+ * ★ 已删除字段（2026-09-24，迁移阶段 2.4）：`dragging`（原语义「手指正按着滑块拖动期间
+ *   不许自动收起」）。来源 `isDragging` 随横向拖拽一起移除，判据恒为 false。
+ *   收起/展开状态机本身属于阶段 3，本批不动。
  */
 private data class CapsuleCollapseProbe(
     val expanded: Boolean,
     val resetToken: Int,
     val scrolling: Boolean,
-    val dragging: Boolean,
 )
 
 /**
@@ -545,6 +587,101 @@ private fun capsuleSurfaceColor(): Color {
 }
 
 /**
+ * 底色竖向渐变里「顶部 alpha 相对底部」的比例（2026-09-23）。
+ *
+ * 玻璃有厚度：光从上方进来，上缘更透、下缘更实。0.70 是"看得出分层但不至于上缘露底"的值。
+ * 刻意做成**相对比例**而不是第二个绝对 alpha —— 通透度与配色仍由 [capsuleSurfaceColor]
+ * 一处掌管，这里只负责分层，调参不会变成两个数打架。
+ */
+private const val CAPSULE_SURFACE_ALPHA_TOP_RATIO: Float = 0.70f
+
+/** 上缘高光的收束位置：到 42% 高度就完全透明，下半截必须干净，否则整条会发白发灰。 */
+private const val CAPSULE_SHEEN_STOP: Float = 0.42f
+
+/** 噪点强度。0.05 已经够去塑料感；再高在纯色页面上会看出"脏"。 */
+private const val CAPSULE_NOISE_ALPHA: Float = 0.05f
+
+/**
+ * 跟随选中滑块的**局部高光**峰值 alpha（2026-09-23）。
+ *
+ * 静态的竖向高光看久了是一块死渐变。真玻璃的反光会随视角/物体移动而移动，所以让亮斑中心
+ * 跟着当前选中格走：切 tab 时高光会滑过去，与交互同源，不是为动而动的呼吸灯。
+ * 浅色 0.13 / 深色 0.07 —— 同样的白在深底上提亮幅度大得多。
+ */
+private const val CAPSULE_SHEEN_SPOT_ALPHA_LIGHT: Float = 0.13f
+private const val CAPSULE_SHEEN_SPOT_ALPHA_DARK: Float = 0.07f
+
+/** 局部亮斑的半径（相对胶囊宽度）。0.42 ≈ 一格半，够柔和不至于糊成整条。 */
+private const val CAPSULE_SHEEN_SPOT_RADIUS_RATIO: Float = 0.42f
+
+/**
+ * 展开瞬间的一次性**扫光**（2026-09-23）：一道亮带从左掠到右。
+ *
+ * 只在展开时跑一次，收回不跑 —— 收回本来就要"快、干脆"，再来一道光是画蛇添足。
+ * 420ms 略长于展开弹簧（≈300ms），所以光会在胶囊定型后才扫完，读起来是"玻璃被点亮"
+ * 而不是和形变混在一起。
+ */
+private const val CAPSULE_SWEEP_MS: Int = 420
+private const val CAPSULE_SWEEP_ALPHA_LIGHT: Float = 0.20f
+private const val CAPSULE_SWEEP_ALPHA_DARK: Float = 0.11f
+
+/** 扫光亮带的半宽（相对胶囊宽度）。 */
+private const val CAPSULE_SWEEP_HALF_WIDTH: Float = 0.16f
+
+/**
+ * 上缘高光色（2026-09-23）。
+ *
+ * 深色主题下要明显弱一些：同样的白在深底上提亮幅度大得多，0.26 会让胶囊上缘发灰发脏。
+ */
+@Composable
+private fun capsuleSheenColor(): Color {
+    val palette = LocalResolvedPalette.current
+    return if (palette.isDark) Color.White.copy(alpha = 0.14f) else Color.White.copy(alpha = 0.26f)
+}
+
+/**
+ * 胶囊描边（2026-09-23）：竖向渐变取代原来的均匀 `NeutralOutline@0.40`。
+ *
+ * 上缘亮（受光）→ 中段几乎消失 → 下缘回到中性描边色。均匀描边在浅色页面上像"贴纸边"，
+ * 这是本次要去掉的主要观感问题之一。
+ */
+@Composable
+private fun capsuleStrokeBrush(): Brush {
+    val palette = LocalResolvedPalette.current
+    val top = if (palette.isDark) Color.White.copy(alpha = 0.22f) else Color.White.copy(alpha = 0.58f)
+    return Brush.verticalGradient(
+        0f to top,
+        0.45f to Color.White.copy(alpha = 0.04f),
+        1f to NeutralOutline.copy(alpha = 0.32f)
+    )
+}
+
+/**
+ * 噪点画刷（2026-09-23）。进程内只生成一次，所有胶囊共享。
+ *
+ * 为什么运行时生成而不是放一张 PNG：省掉一个二进制资源和它的 dpi 变体，
+ * 也避免有人误改分辨率导致颗粒尺寸跟着屏幕密度变。48×48 足够，`TileMode.Repeated` 铺开后
+ * 看不出周期性。
+ *
+ * 噪声刻意围绕**中灰 128** 抖动而不是纯黑白：配 `BlendMode.Overlay` 时中灰是恒等值，
+ * 所以这一层只加颗粒、几乎不改底色亮度。固定随机种子是为了让同一版本的纹理稳定可复现
+ *（截图比对不会每次都差一点）。
+ */
+private val CAPSULE_NOISE_BRUSH: Brush by lazy {
+    val size = 48
+    val pixels = IntArray(size * size)
+    val random = java.util.Random(20260923L)
+    for (i in pixels.indices) {
+        val v = (128 + random.nextInt(65) - 32).coerceIn(0, 255)
+        pixels[i] = (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+    }
+    val bitmap = android.graphics.Bitmap.createBitmap(
+        pixels, size, size, android.graphics.Bitmap.Config.ARGB_8888
+    )
+    ShaderBrush(ImageShader(bitmap.asImageBitmap(), TileMode.Repeated, TileMode.Repeated))
+}
+
+/**
  * 悬浮胶囊底部导航栏。
  */
 @Composable
@@ -578,14 +715,14 @@ fun UfiCapsuleTabBar(
     // 就是 `UfiCapsuleTabBar` 在 settle 前后整体重组两次（跨窗口渲染，代价高且正好可见）。
     // 现在所有读取都推迟到协程内（`snapshotFlow { isScrollingState.value }`）。
     val isScrollingState: MutableState<Boolean> = remember { mutableStateOf(false) }
-    // ── 「本次归位是否紧跟一段滑动 / 拖拽」──────────────────────────────────────
+    // ── 「本次归位是否紧跟一段滑动」──────────────────────────────────────────────
     //
     // 只有这种归位需要付 [IDLE_SETTLE_CONFIRM_MS] 防抖窗（手势收尾时 isScrolling 会抖）；
     // 点击路径不存在中途态，必须零延迟，否则就是用户说的"不跟手 / 没有即点即达"。
-    // 写入点恰好三处，覆盖全部入口：
+    // 写入点恰好两处，覆盖全部入口：
     //   - 页面横滑（本 effect，进度离开整数带）→ true
-    //   - 抓住滑块拖动（onDragStarted）→ true
     //   - 点 Tab（CapsuleTab.onClick）→ false
+    // （2026-09-24 前还有第三处「抓住滑块拖动 onDragStarted → true」，随横向拖拽一起删除，§5.2。）
     // 刻意用快照状态而不是"可消费的一次性标记"：滑块位置与图标着色两条归位驱动都要读它，
     // 一次性标记会被先跑到的那条消费掉，另一条读到 false ⇒ 两者错开 80ms（半修好状态）。
     var motionSettlePending by remember { mutableStateOf(false) }
@@ -602,6 +739,8 @@ fun UfiCapsuleTabBar(
 
     val appContext = LocalContext.current.applicationContext
     val themeManager = remember { ThemeManager(appContext, observeExternal = true) }
+    // 反注册 prefs 监听：不解的话本栏销毁后监听仍挂在进程级 SharedPreferences 上。
+    DisposableEffect(themeManager) { onDispose { themeManager.dispose() } }
     val iconSizeDp by themeManager.capsuleIconSizeDp.collectAsState()
     val labelTextSp by themeManager.capsuleLabelTextSp.collectAsState()
     val cornerDp by themeManager.capsuleCornerDp.collectAsState()
@@ -632,16 +771,23 @@ fun UfiCapsuleTabBar(
 
     var expanded: Boolean by remember { mutableStateOf(false) }
     var resetToken: Int by remember { mutableIntStateOf(0) }
-    // 手指正按着滑块拖动：期间不许自动收起，滑块也不受"静止时弹簧回目标格"那条驱动管辖。
-    var isDragging: Boolean by remember { mutableStateOf(false) }
-    // 拖动位置（下标空间，可为小数）。手势只写这个**同步**状态，绝不自己去碰 Animatable ——
-    // 上一版在 onDelta 里 launch{snapTo}，队列滞后一帧以上，松手时 ① 读到的还是旧位置，
-    // round 出来等于当前页 → 界面不切；② 残留的 snapTo 又把归位动画掐掉 → 滑块停在两格中间。
-    var dragPos: Float by remember { mutableFloatStateOf(safeIndex.toFloat()) }
-    // 松手后的目标格。pager 收到跨多页的切换请求会「逐页扫场」，此期间 selectionProgress
-    // 是从**起点**一路扫过来的；滑块若去跟它，观感就是被拽回原处再追一遍。
-    // 2026-09-03：从仪表盘按住、1s 内快划到"我的"复现的就是这个。所以松手后先把滑块
-    // 钉在目标格，直到 pager 真的停在目标页，才把控制权交还给常规驱动。
+    // ★ 已删除（2026-09-24，迁移阶段 2.4，计划 §5.2）：`isDragging` 与 `dragPos` ★
+    //
+    // 它们是「抓住滑块横向拖拽切页」的两个状态：前者标记手指正按着（期间不许自动收起、
+    // 滑块不受"静止时弹回目标格"那条驱动管辖），后者是拖动位置（下标空间，可为小数；
+    // 手势只写这个**同步**状态，绝不自己碰 Animatable —— 上一版在 onDelta 里
+    // `launch{snapTo}`，队列滞后一帧以上，松手时既读到旧位置、又被残留 snapTo 掐掉归位动画）。
+    //
+    // 为什么删：贴底后栏占满屏幕最底部，左右边缘约 24dp 是系统返回手势热区，拖着切 tab
+    // 会被判成返回；传统底栏本来也不支持拖拽。少一套手势少一处冲突，也就不需要引入
+    // `setSystemGestureExclusionRects()`。2026-09-23 定稿，见迁移计划 §5.2。
+    //
+    // ⚠ 但 `settleIndex` **必须留下** —— 它防的不是拖拽，是 pager 的逐页扫场：
+    // pager 收到跨多页的切换请求会「逐页扫场」，此期间 selectionProgress 是从**起点**
+    // 一路扫过来的；滑块若去跟它，观感就是被拽回原处再追一遍。
+    // 2026-09-03 最容易复现的入口是「从仪表盘按住、1s 内快划到我的」，但**点击跨多页
+    // 同样会触发**（点第 1 格直接跳第 4 格）。所以拖拽删掉之后它只是换了赋值时机：
+    // 从「松手（onDragStopped）」改到「点击（CapsuleTab.onClick）」。
     var settleIndex: Int? by remember { mutableStateOf(null) }
     val expandProgress: Animatable<Float, AnimationVector1D> = remember { Animatable(0f) }
 
@@ -652,7 +798,26 @@ fun UfiCapsuleTabBar(
     }
 
     LaunchedEffect(expanded) {
-        expandProgress.animateTo(if (expanded) 1f else 0f, EXPAND_SPRING)
+        // 收回单独走 COLLAPSE_SPRING：与标签淡出（220ms）同量级，免得"宽度收完、缩放还在跑"
+        expandProgress.animateTo(
+            if (expanded) 1f else 0f,
+            if (expanded) EXPAND_SPRING else COLLAPSE_SPRING
+        )
+    }
+
+    // 展开瞬间的一次性扫光。刻意**只在展开时**跑：收回要的是快和干脆。
+    // snapTo(0) 而不是让它停在 1：下一次展开要从左边重新扫，否则第二次展开没有光。
+    val sheenSweep: Animatable<Float, AnimationVector1D> = remember { Animatable(0f) }
+    LaunchedEffect(expanded) {
+        if (expanded) {
+            sheenSweep.snapTo(0f)
+            sheenSweep.animateTo(
+                1f,
+                tween(durationMillis = CAPSULE_SWEEP_MS, easing = UfiMotion.Easing.Standard)
+            )
+        } else {
+            sheenSweep.snapTo(0f)
+        }
     }
 
     // 标签的淡入淡出**独立于**展开弹簧（2026-09-04 第二版）。
@@ -678,22 +843,22 @@ fun UfiCapsuleTabBar(
         }
     }
 
-    // 展开态自动收起：不滑、不拖、静置 COLLAPSE_DELAY_MS 后收起。
+    // 展开态自动收起：不滑、静置 COLLAPSE_DELAY_MS 后收起。
     // 2026-09-05 第四版：判据改走 [CapsuleCollapseProbe]（协程内读），
     // `isScrolling` 不再出现在 effect 的 key 里。语义等价：
     // distinctUntilChanged ≡「key 是否变化」，collectLatest ≡「key 变了就取消重启」。
+    // 2026-09-24：判据里的「不拖」一项随横向拖拽删除（§5.2），只剩「不滑」。
     LaunchedEffect(Unit) {
         snapshotFlow {
             CapsuleCollapseProbe(
                 expanded = expanded,
                 resetToken = resetToken,
                 scrolling = isScrollingState.value,
-                dragging = isDragging,
             )
         }
             .distinctUntilChanged()
             .collectLatest { probe ->
-                if (probe.expanded && !probe.scrolling && !probe.dragging) {
+                if (probe.expanded && !probe.scrolling) {
                     delay(COLLAPSE_DELAY_MS)
                     expanded = false
                 }
@@ -732,28 +897,22 @@ fun UfiCapsuleTabBar(
         List(tabs.size) { index -> Animatable(if (index == safeIndex) 1f else 0f) }
     }
     // 2026-09-05 第四版：四条分支的判据改走 [CapsuleSettleProbe]（协程内读），
-    // `safeIndex` / `isScrolling` / `isDragging` / `settleIndex` 全部离开 effect 的 key。
+    // `safeIndex` / `isScrolling` / `settleIndex` 全部离开 effect 的 key。
     // 分支选择顺序与优先级一字未动，仅数据来源从「组合期捕获的 key」换成「探针字段」。
+    // 2026-09-24（§5.2）：原来的第一条分支「拖动中 → 着色跟 dragPos 走」随横向拖拽删除，
+    // 现在只剩三条（归位中 / 滑动中 / 静止）。
     LaunchedEffect(selectionFactors) {
         snapshotFlow {
             CapsuleSettleProbe(
                 index = latestIndex.value,
                 scrolling = isScrollingState.value,
-                dragging = isDragging,
                 settleIndex = settleIndex,
             )
         }
             .distinctUntilChanged()
             .collectLatest { probe ->
                 val settling = probe.settleIndex
-                if (probe.dragging) {
-                    // 拖动中：着色跟 dragPos 走，和滑块同一个源，图标亮度与滑块位置永远对齐
-                    snapshotFlow { dragPos }.collect { p ->
-                        selectionFactors.forEachIndexed { index, factor ->
-                            factor.snapTo((1f - abs(p - index)).coerceIn(0f, 1f))
-                        }
-                    }
-                } else if (settling != null) {
+                if (settling != null) {
                     // 归位中：直接点亮目标格并保持，不跟 pager 的扫场进度（否则沿途图标被依次点亮）
                     coroutineScope {
                         selectionFactors.forEachIndexed { index, factor ->
@@ -815,23 +974,20 @@ fun UfiCapsuleTabBar(
     // 只能在测量里算：它取决于图标高与单元格高，而两者都由 ThemeManager 的可调项决定。
     var sliderCollapsedInsetPx: Float by remember { mutableFloatStateOf(0f) }
     // 2026-09-05 第四版：判据同样改走 [CapsuleSettleProbe]（协程内读），
-    // `safeIndex` / `isScrolling` / `isDragging` / `settleIndex` 全部离开 effect 的 key。
+    // `safeIndex` / `isScrolling` / `settleIndex` 全部离开 effect 的 key。
+    // 2026-09-24（§5.2）：原来的第一条分支「拖动中 → 滑块逐帧 snapTo(dragPos)」随横向拖拽删除。
     LaunchedEffect(indicatorPos) {
         snapshotFlow {
             CapsuleSettleProbe(
                 index = latestIndex.value,
                 scrolling = isScrollingState.value,
-                dragging = isDragging,
                 settleIndex = settleIndex,
             )
         }
             .distinctUntilChanged()
             .collectLatest { probe ->
                 val settling = probe.settleIndex
-                if (probe.dragging) {
-                    // 拖动中：滑块唯一的驱动源就是手指（逐帧 snapTo，跟手不能再套一层平滑）
-                    snapshotFlow { dragPos }.collect { indicatorPos.snapTo(it) }
-                } else if (settling != null) {
+                if (settling != null) {
                     // 归位中：钉在目标格，等 pager 真正停在目标页后才交还控制权。
                     // 2026-09-05 第四版：等待条件从「捕获的 safeIndex」换成 `latestIndex.value`
                     // 的**实时读**。旧写法靠 effect 重启来刷新那个捕获值（safeIndex 是 key），
@@ -895,25 +1051,33 @@ fun UfiCapsuleTabBar(
             }
     }
 
-    // ── 抓住滑块拖动 ──
+    // ★ 已删除（2026-09-24，迁移阶段 2.4，计划 §5.2）：「抓住滑块拖动」整套 ★
     //
-    // 手势只写 dragPos（同步状态），滑块与图标着色由上面两条驱动读它；
-    // 拖到哪一格页面就立刻切到哪一格 —— 不是松手才切，这样"滑块动、界面不动"不会再出现。
-    // 手势阈值交给 draggable 的 touch slop：没过阈值仍然是普通点击，不影响点按切页。
-    val dragBoost: Animatable<Float, AnimationVector1D> = remember { Animatable(0f) }
-    LaunchedEffect(isDragging) { dragBoost.animateTo(if (isDragging) 1f else 0f, SELECTION_SPEC) }
-    val dragState = rememberDraggableState { delta ->
-        if (tabStepPx <= 0) return@rememberDraggableState
-        val next = (dragPos + delta / tabStepPx).coerceIn(0f, tabs.lastIndex.toFloat())
-        dragPos = next
-        val nearest = next.roundToInt().coerceIn(0, tabs.lastIndex)
-        if (nearest != safeIndex) onTabSelected(nearest)
-    }
+    // 删掉的是：`rememberDraggableState { … }`（onDelta：按 `delta / tabStepPx` 累加 dragPos，
+    // 并在跨过整格时立刻 `onTabSelected(nearest)` —— 拖到哪一格页面就切到哪一格，
+    // 手势阈值交给 draggable 的 touch slop，没过阈值仍是普通点击）、
+    // 挂在 Layout 上的 `.draggable(state, Orientation.Horizontal, onDragStarted, onDragStopped)`、
+    // 以及「被抓住」的视觉反馈 `dragBoost`（Animatable，跟 isDragging 动到 1，在滑块上叠一层白）
+    // 与它用的 `INDICATOR_DRAG_TINT`。
+    //
+    // 为什么删：贴底通栏之后栏占满屏幕最底部，左右边缘约 24dp 是系统返回手势热区，
+    // 拖着切 tab 会被判成返回；而这套拖拽本来是为「可交互悬浮浮层」设计的，
+    // 传统底栏并不支持拖拽。少一套手势少一处冲突，也省掉引入
+    // `setSystemGestureExclusionRects()` 的必要（代码里至今没有这个 API）。
+    //
+    // `tabStepPx` **保留**：滑块的像素位移仍然是 `indicatorPos × tabStepPx`（见下方 Layout）。
 
-    // 底色在组合期取一次（drawBehind 里不能调 @Composable）
+    // 底色/高光/描边在组合期取一次（drawBehind 里不能调 @Composable）
     val capsuleSurface = capsuleSurfaceColor()
+    val capsuleSheen = capsuleSheenColor()
+    val capsuleStroke = capsuleStrokeBrush()
+    val isDarkPalette = LocalResolvedPalette.current.isDark
+    val sheenSpotAlpha =
+        if (isDarkPalette) CAPSULE_SHEEN_SPOT_ALPHA_DARK else CAPSULE_SHEEN_SPOT_ALPHA_LIGHT
+    val sweepAlpha =
+        if (isDarkPalette) CAPSULE_SWEEP_ALPHA_DARK else CAPSULE_SWEEP_ALPHA_LIGHT
     Box(
-
+    
             modifier = Modifier
                 .shadow(
                     elevation = 15.dp,
@@ -926,21 +1090,84 @@ fun UfiCapsuleTabBar(
                 // （收起更透、展开全实，见 CAPSULE_SURFACE_ALPHA_COLLAPSED）。
                 // 不能用整层 alpha —— 那会把图标、文字、滑块一起变透。
                 // 已经 clip 成胶囊形，所以这里直接铺满即可。
+                //
+                // 2026-09-23：单层实色 → 三层「渐变玻璃 + 噪点」。
+                // 原来一层平铺的 cardBg 没有厚度感，浅色页面上像贴纸、深色下偏灰。
+                // 现在是：底色竖向渐变（上更透、下更实，模拟玻璃厚度）
+                //       + 上缘高光（模拟光从上方打进来）
+                //       + 极淡噪点（Overlay 混合，去掉"塑料片"感）。
+                // 三层都乘同一个展开进度 factor，收起/展开的通透变化与改造前一致。
+                // 真模糊不在这里 —— 那条路要么依赖 OEM 的 surface_flinger 开关（不可靠），
+                // 要么得把胶囊搬回主窗口配 GraphicsLayer 采样，见 UfiCapsuleBlurHost 的复盘。
                 .drawBehind {
                     val base = capsuleSurface
                     val p = expandProgress.value.coerceIn(0f, 1f)
                     val factor = CAPSULE_SURFACE_ALPHA_COLLAPSED +
                         (1f - CAPSULE_SURFACE_ALPHA_COLLAPSED) * p
-                    drawRect(base.copy(alpha = base.alpha * factor))
+                    val bottomAlpha = base.alpha * factor
+                    // 顶部按比例更透：alpha 的绝对值仍由 capsuleSurfaceColor 统一掌管，
+                    // 这里只做相对分层，调通透度/换配色依旧只改那一个函数。
+                    val topAlpha = bottomAlpha * CAPSULE_SURFACE_ALPHA_TOP_RATIO
+                    drawRect(
+                        Brush.verticalGradient(
+                            colors = listOf(base.copy(alpha = topAlpha), base.copy(alpha = bottomAlpha))
+                        )
+                    )
+                    // 上缘高光：只覆盖上半部分，下半截必须干净，否则整条会发白发灰
+                    drawRect(
+                        Brush.verticalGradient(
+                            0f to capsuleSheen.copy(alpha = capsuleSheen.alpha * factor),
+                            CAPSULE_SHEEN_STOP to Color.Transparent,
+                            1f to Color.Transparent
+                        )
+                    )
+                    // 局部亮斑：中心跟着选中格走，切 tab 时高光滑过去（静态渐变看久了是块死光）。
+                    // 横向位置用「第几格 / 共几格」近似，不去精确还原 pad+gap —— 亮斑本身很柔，
+                    // 差几个 px 看不出来，却省掉把 Layout 的格宽回传到背景层这条耦合。
+                    val spotCenterX = size.width * ((indicatorPos.value + 0.5f) / tabs.size.coerceAtLeast(1))
+                    drawRect(
+                        Brush.radialGradient(
+                            colors = listOf(
+                                Color.White.copy(alpha = sheenSpotAlpha * factor),
+                                Color.Transparent
+                            ),
+                            center = Offset(spotCenterX, size.height * 0.15f),
+                            radius = size.width * CAPSULE_SHEEN_SPOT_RADIUS_RATIO
+                        )
+                    )
+                    // 展开时的一次性扫光：亮带从左掠到右，走完即停（sweep 回到 0 就不画）。
+                    val sweep = sheenSweep.value
+                    if (sweep > 0f && sweep < 1f) {
+                        // 中心从 -halfWidth 掠到 1+halfWidth，保证亮带完整进出画面两端
+                        val c = -CAPSULE_SWEEP_HALF_WIDTH +
+                            sweep * (1f + CAPSULE_SWEEP_HALF_WIDTH * 2f)
+                        // 两端淡出：刚出发和即将离场时压暗，否则会看到光"凭空出现/消失"
+                        val edgeFade = kotlin.math.sin(sweep * Math.PI).toFloat()
+                        drawRect(
+                            Brush.horizontalGradient(
+                                (c - CAPSULE_SWEEP_HALF_WIDTH).coerceIn(0f, 1f) to Color.Transparent,
+                                c.coerceIn(0f, 1f) to Color.White.copy(alpha = sweepAlpha * edgeFade),
+                                (c + CAPSULE_SWEEP_HALF_WIDTH).coerceIn(0f, 1f) to Color.Transparent
+                            )
+                        )
+                    }
+                    // 噪点：Overlay 混合 + 中灰噪声，所以它只加颗粒、几乎不改亮度
+                    // （SrcOver 那样直接盖会把底色整体往灰推）。
+                    drawRect(
+                        brush = CAPSULE_NOISE_BRUSH,
+                        alpha = CAPSULE_NOISE_ALPHA * factor,
+                        blendMode = BlendMode.Overlay
+                    )
                 }
-                .border(1.25.dp, NeutralOutline.copy(alpha = 0.40f), capsuleShape)
+                // 描边也改成竖向渐变：上缘亮（受光）、中段几乎消失、下缘回到中性描边色。
+                // 均匀描边在浅色页面上像"贴纸边"，这是这次要去掉的观感之一。
+                .border(1.25.dp, capsuleStroke, capsuleShape)
         ) {
             Layout(
                 content = {
                     // 第 0 个孩子固定是滑块，后面才是 tabs —— 测量块按这个约定拆分 measurables。
                     CapsuleSelectionSlider(
                         offsetX = { indicatorPos.value * tabStepPx },
-                        dragBoost = { dragBoost.value },
                         // 药丸的"张开/收拢"必须跟标签同一条进度：若跟展开弹簧（~0.15s），
                         // 收起时药丸已经缩回图标大小、文字还在淡出，字会掉到药丸外面。
                         revealProgress = { labelReveal.value },
@@ -958,7 +1185,13 @@ fun UfiCapsuleTabBar(
                             iconTextSpacing = iconTextSpacing,
                             labelReveal = { labelReveal.value },
                             onClick = {
-                                settleIndex = null
+                                // ★ 2026-09-24（迁移阶段 2.4，计划 §5.2）：这里原来是 `settleIndex = null`，
+                                //   「钉到目标格」只在拖拽松手（onDragStopped）时才设。拖拽删除后，
+                                //   赋值时机搬到**点击**：点第 1 格直接跳第 4 格时 pager 同样会逐页扫场，
+                                //   selectionProgress 从起点一路扫过来，滑块若跟着它就是「被拽回原处
+                                //   再追一遍」。钉住目标格直到 pager 真的停在目标页（见上面两条归位驱动的
+                                //   `settling != null` 分支），观感才是即点即达。
+                                settleIndex = index
                                 // 点击路径没有"滑动中途态"：显式清掉，让归位跳过防抖确认窗
                                 // （即点即达，见 settleNeedsConfirmWindow）。
                                 // 若此刻页面其实还在滑，上面那条 isScrolling 收集器会立刻把它重新置真，
@@ -971,32 +1204,14 @@ fun UfiCapsuleTabBar(
                         )
                     }
                 },
+                // ★ 已删除（2026-09-24）：这里原来链着 `.draggable(state = dragState,
+                //   orientation = Orientation.Horizontal, enabled = tabs.size > 1,
+                //   onDragStarted = { settleIndex = null; dragPos = indicatorPos.value;
+                //   isDragging = true; motionSettlePending = true; expanded = true; resetToken++ },
+                //   onDragStopped = { …吸附到最近整格、必要时 onTabSelected、settleIndex = target… })`。
+                //   理由见上方那段「抓住滑块拖动整套已删除」的说明与计划 §5.2。
                 modifier = Modifier
                     .zIndex(1f)
-                    .draggable(
-                        state = dragState,
-                        orientation = Orientation.Horizontal,
-                        enabled = tabs.size > 1,
-                        onDragStarted = {
-                            settleIndex = null
-                            dragPos = indicatorPos.value
-                            isDragging = true
-                            // 拖动是「中途态」：本轮归位必须付防抖确认窗（见 settleNeedsConfirmWindow）。
-                            motionSettlePending = true
-                            expanded = true
-                            resetToken++
-                        },
-                        onDragStopped = {
-                            // 归位：吸附到最近整格，并确保页面停在同一格
-                            val target = dragPos.roundToInt().coerceIn(0, tabs.lastIndex)
-                            dragPos = target.toFloat()
-                            if (target != safeIndex) onTabSelected(target)
-                            settleIndex = target
-                            expanded = true
-                            resetToken++
-                            isDragging = false
-                        }
-                    )
             ) { measurables, constraints ->
                 val padPx = PAD.roundToPx()
                 val gapPx = GAP.roundToPx()
@@ -1103,15 +1318,17 @@ fun UfiCapsuleTabBar(
  * —— 与图标的 `drawWithCache` 同一策略。尺寸与初始位置由父 `Layout` 给定。
  *
  * @param offsetX          相对第 0 格的横向位移（px），在 layer 阶段求值。
- * @param dragBoost        0..1 的"被抓住"程度，拖动时叠一层白做确认反馈，在 draw 阶段求值。
  * @param revealProgress   0..1 标签揭示进度，决定药丸是"包图标"（0）还是"占满整格"（1）。
  *                         刻意与标签同源而非跟展开弹簧，见调用点说明。
- * @param collapsedInsetY  收起态上下各内缩多少 px（由父 `Layout` 按图标高算出）。
+ * @param collapsedInsetY  收起态上下各内缩多少 px（由父 `Layout` 给出）。
+ *
+ * ★ 已删除形参（2026-09-24，迁移阶段 2.4）：`dragBoost: () -> Float`（0..1 的"被抓住"程度，
+ *   拖动时在药丸上叠一层白做确认反馈）。横向拖拽整套已移除（§5.2），它恒为 0，
+ *   连同所用的 `INDICATOR_DRAG_TINT` 一并退休。
  */
 @Composable
 private fun CapsuleSelectionSlider(
     offsetX: () -> Float,
-    dragBoost: () -> Float,
     revealProgress: () -> Float,
     collapsedInsetY: () -> Float
 ) {
@@ -1119,14 +1336,14 @@ private fun CapsuleSelectionSlider(
     val accent = palette.accent
     val fillTop = accent.copy(alpha = INDICATOR_FILL_TOP)
     val fillBottom = accent.copy(alpha = INDICATOR_FILL_BOTTOM)
-    // 2026-09-03（P1c）审过，**这两处白刻意不接 palette**：
-    // 它们不是"某个语义角色的颜色"，而是叠在 accent 实底上的**光照效果**——
-    // dragTint 是"被抓住"的提亮反馈，sheenTop 是上缘弧面镜面高光，模拟的是光源色而非主题色。
+    // 2026-09-03（P1c）审过，**这处白刻意不接 palette**：
+    // 它不是"某个语义角色的颜色"，而是叠在 accent 实底上的**光照效果**——
+    // sheenTop 是上缘弧面镜面高光，模拟的是光源色而非主题色。
     // 接成 onAccent 会出错：onAccent 是给这块底上的**文字/图标**用的，
     // 若某主题把它改成深色（浅 accent 场景），高光就变成一道黑影、按下去反而变暗，语义完全反了。
     // 两个 alpha（0.12 / 0.22，深/浅）也是按纯白校准的，换色源必须连带重调。
     // 换配色时的残影风险：无——白高光叠在会跟着变的 accent 上，观感随 accent 一起走。
-    val dragTint = Color.White.copy(alpha = INDICATOR_DRAG_TINT)
+    // （同类的 `dragTint`「被抓住」提亮反馈已于 2026-09-24 随横向拖拽一起删除。）
     // 上缘高光：让药丸有一点弧面感，而不是一块死平的色块。
     //
     // 2026-09-05：明暗**档位**的判据由 `isSystemInDarkTheme()` 改为 [ResolvedPalette.isDark]
@@ -1165,16 +1382,8 @@ private fun CapsuleSelectionSlider(
                     val radius = CornerRadius(h / 2f)
                     drawRoundRect(brush = fill, topLeft = topLeft, size = pillSize, cornerRadius = radius)
                     drawRoundRect(brush = sheen, topLeft = topLeft, size = pillSize, cornerRadius = radius)
-                    val boost = dragBoost().coerceIn(0f, 1f)
-                    if (boost > 0f) {
-                        drawRoundRect(
-                            color = dragTint,
-                            topLeft = topLeft,
-                            size = pillSize,
-                            cornerRadius = radius,
-                            alpha = boost
-                        )
-                    }
+                    // ★ 已删除（2026-09-24）：`if (boost > 0f) drawRoundRect(color = dragTint, …)`
+                    //   —— 「被抓住」时叠的那层白，随横向拖拽一起退休（§5.2）。
                 }
             }
     )

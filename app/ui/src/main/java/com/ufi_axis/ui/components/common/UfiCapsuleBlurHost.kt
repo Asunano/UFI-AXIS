@@ -13,6 +13,9 @@ import android.view.ViewGroup
 import android.view.ViewParent
 import android.view.Window
 import android.view.WindowManager
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.offset
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
@@ -28,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.MutableState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.platform.LocalContext
@@ -36,26 +40,40 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import kotlinx.coroutines.delay
 import java.util.function.Consumer
 
-/**
- * 胶囊四周预留给投影的空间（**单一真源**）。
+/*
+ * ★ 已删除（2026-09-24，贴底通栏低栏迁移阶段 2.1）：`CAPSULE_SHADOW_ROOM`（恒 0.dp）★
  *
- * 设为 **0.dp**：承载胶囊的 Dialog 窗口是 wrap-content，原本为让 `shadow(10.dp)` 投影完整
- * 落在窗口内而留的 10dp 留白现在直接去掉，窗口边界紧贴胶囊本体。这样模糊区就等于
- * 胶囊本体，不再有一圈「外圈空白」可供光晕溢出（见 [applyWindowBlur]）。
+ * ## 它原来是什么
+ * 「胶囊四周预留给投影的空间」的单一真源。悬浮形态下承载胶囊的 Dialog 窗口是
+ * wrap-content，`shadow(10.dp)` 画到窗口矩形之外的部分会被裁掉，所以窗口四周要留一圈
+ * 余量；后来投影收窄，它被压到 0.dp，只剩两个职责：
+ * - 当 `bottomOffsetPx` 表达式里一个恒 0 的减项，让护栏 `capsuleLift_mustBeWired`
+ *   能在源码文本里找到这个 token；
+ * - 给 `MainNavGraph` 的 `Modifier.padding(CAPSULE_SHADOW_ROOM)` 提供同一个数。
  *
- * 由 `MainNavGraph` 直接 import 引用，避免两处各写一份而漂移。
+ * ## 通栏形态下为什么不再需要
+ * 通栏低栏**没有四周投影**：窗口是 MATCH_PARENT 宽 + `gravity=BOTTOM` + `y=0`，
+ * 栏的视觉分界只由「顶边 1px 发丝线 + 上缘 6dp 高光」承担（都画在自己边界之内，
+ * 见 `UfiBottomDock`）。既没有溢出窗口的阴影要养，`bottomOffsetPx` 整条表达式也已退休，
+ * 两个消费者同时消失 —— 留着一个恒 0 的 Dp 常量只会误导后人以为「通栏还有投影余量」。
+ *
+ * 删除前已全仓 grep：消费者只有本文件的 `bottomOffsetPx` / `insetPx` 与
+ * `MainNavGraph` 的那一处 padding，两者在同一批改动里一并拆除。
+ *
+ * 详见 `docs/bottom-dock-migration-plan.md` §2.1（窗口层参数对照表）与 §2.5。
  */
-internal val CAPSULE_SHADOW_ROOM: Dp = 0.dp
 
 /**
  * 手势导航下**底部系统预留区**的保底高度（**单一真源**）。
@@ -76,73 +94,48 @@ internal val CAPSULE_SHADOW_ROOM: Dp = 0.dp
  */
 internal val GESTURE_BOTTOM_INSET_FLOOR: Dp = 24.dp
 
-/**
- * 底部系统预留区**顶边** → 胶囊**底边**的视觉呼吸间距（手势导航，**单一真源**）。
- *
- * ## 语义变更（底部截断 bug 修复 → 跨设备定位修复）
- * 最早的语义是「距**屏幕**底部的留白」，靠 `decorFitsSystemWindows = true` 让 Dialog
- * 窗口落在安全区内、由系统替我们避开导航栏 —— 代价是系统会在手势小白条位置填一层
- * **白色遮罩**，且胶囊被整体顶高、视觉上像被下边框截断。
- *
- * 现在窗口通过 `FLAG_LAYOUT_NO_LIMITS` 延伸到系统装饰区（见 [applyWindowBlur]），
- * 底部预留区高度由 [readBottomReservedPx] 动态读取后加进窗口 `y` 偏移
- * （见 [CapsuleBlurHost]），所以本常量只剩「别贴死手势条」这一个职责，取 8dp 即可。
- *
- * 参照物也随之精确化：不再是「系统导航栏顶边」，而是「系统栏 ∪ 手势热区」这块
- * **预留区**的顶边 —— 手势导航下两者并不相等（见 [readBottomReservedPx]）。
- *
- * 由 `MainNavGraph` 直接 import 引用，避免两处各写一份而漂移。
- */
-internal val CAPSULE_GAP_GESTURE: Dp = 8.dp
-
-/**
- * 底部系统预留区顶边 → 胶囊底边的视觉呼吸间距（**三键 / 二键导航**）。
- *
- * 当前刻意与 [CAPSULE_GAP_GESTURE] 取同一个值（8dp），视觉上两种导航模式一致。
- * 单独留一个常量、并用 [capsuleGapFor] 分发，是为了将来若要给按键导航加大间距，
- * **只改这一个数**即可，不必再动取值链路，也不会误伤手势导航。
- */
-internal val CAPSULE_GAP_BUTTON: Dp = 8.dp
-
 /*
- * ★ 设计说明（原 `private val CAPSULE_LIFT: Dp = 24.dp` 的文档，常量已移入函数内）★
+ * ★ 已删除（2026-09-24，贴底通栏低栏迁移阶段 2.1）★
+ * `CAPSULE_GAP_GESTURE` / `CAPSULE_GAP_BUTTON` / `capsuleGapFor()` / `CAPSULE_BOTTOM_MARGIN`
+ * （历史别名）/ 局部常量 `CAPSULE_LIFT`。
  *
- * 产品向的**视觉抬高量**：胶囊在「安全间距」之上再整体上浮的距离。
+ * ## 这一组原来回答两个正交的问题
+ * - **安全**（`CAPSULE_GAP_*`，8dp，经 `capsuleGapFor(isGestureNav)` 按导航模式分发）：
+ *   「胶囊**底边**至少要离系统预留区顶边多远，才不会被手势热区吃掉点击」。
+ *   悬浮胶囊是一块浮在页面之上、四边都有邻接内容的浮层，底边落进手势热区就会
+ *   「点不动 / 一点就回桌面」，8dp 是真机验证过的下限（旧注释称之为红线 R3）。
+ * - **审美**（`CAPSULE_LIFT`，由 `ThemeManager.capsuleLiftDp` 驱动，默认 30dp）：
+ *   「产品希望胶囊看起来离屏幕底边再远一点」。它是**追加项**而非替换项，
+ *   刻意与安全间距相加、而不是把 8dp 调大，好让那条已验证的不变量单独可回归。
  *
- * ## 本值已从「文件级常量」改为「用户可调设置项」（改动前必读）
- * 抬高量现由 `ThemeManager.capsuleLiftDp` 持久化（设置 → 外观 → 胶囊尺寸），
- * 默认值 [ThemeManager.DEFAULT_CAPSULE_LIFT_DP] = **30**（产品终稿值，原为 24）。
- * 未拖过滑块的用户读不到该键、回落到这个默认值。
+ * 三者（外加恒 0 的减项 `CAPSULE_SHADOW_ROOM`）合成窗口 `y` 偏移 `bottomOffsetPx`，
+ * 由 `applyCapsuleWindowParams` 写进 `LayoutParams.y`，把整块胶囊**抬离**屏幕底边。
  *
- * 实现形态：文件级常量被删除，改为 CapsuleBlurHost **函数内的局部 val**
- * `CAPSULE_LIFT`（由 `capsuleLiftDp.dp` 构造）。之所以刻意保留这个大写名字而不是
- * 直接内联 `capsuleLift.dp`，是为了让 `bottomOffsetPx` 的赋值表达式**一字不变** ——
- * 回归护栏 `capsuleLift_mustBeWired` 同时断言「`val CAPSULE_LIFT: Dp =` 声明存在」
- * 与「该表达式里出现 CAPSULE_LIFT」，两条都必须继续成立。
+ * ## 通栏形态下为什么整组都不再需要
+ * 贴底通栏低栏的窗口是 MATCH_PARENT 宽 + `gravity=BOTTOM` + **`y = 0`**：栏**主动铺满**
+ * 屏幕底部那条带子（含手势热区），底色一路画到屏幕真实底边，图标不压小白条靠的是
+ * **栏内部的一段 Spacer**（见 `UfiBottomDock` 与 [LocalCapsuleBottomReserved]）。
+ * 于是：
+ * - 「胶囊底边离热区多远」这个问题**本身消失**了 —— 栏不再有一条悬在热区上方的底边，
+ *   热区那一段是栏自己的一部分，里面刻意不放任何可点内容；
+ * - 「整体抬高」与贴底形态直接矛盾：只要 y ≠ 0，栏与屏幕底边之间就会露出一条页面内容，
+ *   通栏就不通了。
  *
- * ## 与 CAPSULE_GAP_GESTURE / CAPSULE_GAP_BUTTON 的语义正交（红线 R3）
- * 那两个常量回答的是**安全**问题 ——「胶囊底边至少要离系统预留区顶边多远，才不会被
- * 手势热区吃掉点击」，取值 8dp 是真机验证过的下限，属于**不变量**，不许动。
- * 本量回答的是**审美**问题 ——「产品希望胶囊看起来离屏幕底边再远一点」。
+ * ⚠ 安全区的**取值口径**一个字都没有变：仍是 [readBottomReservedPx]
+ * （`max(navigationBars, systemGestures)`、手势导航兜底 [GESTURE_BOTTOM_INSET_FLOOR]、
+ * 一律回读宿主 Activity 的全屏 `rootWindowInsets`）。变的只是**消费方**：
+ * 从「窗口 y 偏移」挪到「栏内 Spacer + 页面 inset」。
  *
- * 二者相加（见 [CapsuleWindowMetrics.bottomOffsetPx]）而不是把 8dp 直接调大，
- * 是为了让「安全间距」这条已验证的不变量在源码里保持**可识别、可单独回归**：
- * 用户拖动抬高滑块只改追加项，安全下限 8dp 原封不动，
- * 跨设备一致性（预留区由 [readBottomReservedPx] 动态读出）也完全不受影响。
+ * ⚠ `ThemeManager.capsuleLiftDp`（设置 → 外观 → 胶囊抬高）这个持久化设置项本身仍在，
+ *   通栏形态下已无几何消费者。它的清理属于阶段 3（旧实现下线）的范围，本批不动。
+ *
+ * 删除前已全仓 grep：`capsuleGapFor` 只在本文件的 `bottomOffsetPx` 里被调用；
+ * `CAPSULE_GAP_BUTTON` 另有一处消费者是 `capsuleBottomTotalDp`（页面 inset 的 8dp 间隙），
+ * 已在同一批的 2.3 里改写为「58dp + 安全区」；`CAPSULE_BOTTOM_MARGIN` 只剩
+ * `MainNavGraph` 的一行 import（无实际引用），已一并摘掉。
+ *
+ * 详见 `docs/bottom-dock-migration-plan.md` §2.1 / §3 / §7-2.1。
  */
-
-/**
- * 历史别名，**请勿在新代码中使用** —— 语义已由 [CAPSULE_GAP_GESTURE] 承接。
- *
- * 保留符号只是为了不打断既有 import（`MainNavGraph` 仍引用本名）。取值恒等于
- * [CAPSULE_GAP_GESTURE]，不会与之漂移。
- */
-@Deprecated(
-    message = "语义已拆分为 CAPSULE_GAP_GESTURE / CAPSULE_GAP_BUTTON，请改用 capsuleGapFor()；" +
-        "本别名仅为兼容既有 import 而保留。",
-    replaceWith = ReplaceWith("CAPSULE_GAP_GESTURE")
-)
-internal val CAPSULE_BOTTOM_MARGIN: Dp = CAPSULE_GAP_GESTURE
 
 /**
  * 窗口背景 drawable 的圆角半径。
@@ -195,7 +188,25 @@ private const val CAPSULE_WINDOW_TINT_ALPHA: Float = 0.12f
 private const val CAPSULE_WINDOW_FLAGS_ON: Int =
     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        // ★ 2026-09-24（ColorOS 16：小白条那条带子恒为白，且**只要本窗口存在就白**）
+        //
+        // `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS` 是 `Window.setNavigationBarColor` 生效的
+        // **前置条件**（平台契约：不带这个 flag 时 navigationBarColor 是个 no-op，
+        // 系统改用自己那套默认的不透明导航栏底色）。
+        //
+        // Activity 窗口有这个 flag（`Theme.Material` 的 `windowDrawsSystemBarBackgrounds=true`，
+        // 且 `enableEdgeToEdge()` 也会补），所以主窗口一直是沉浸的 —— 这正是
+        // 「启动检测页（底栏窗口还没创建）小白条正常」的原因。
+        // 而 **Dialog 主题没有这一项**（`Theme.Material.*.Dialog` 默认 false），
+        // 于是底栏窗口一旦挂载、盖住屏幕底部，系统就按「这个窗口不自己画系统栏背景」
+        // 补一条不透明底色 —— 我们在主题和 Kotlin 侧写的那两处 `navigationBarColor = TRANSPARENT`
+        // 全程是空转。这也解释了为什么二级页（底栏隐藏但**窗口仍挂载**）白带照旧。
+        //
+        // ⚠ 别把它挪去改全局 `android:dialogTheme`：那会一次性影响 App 里每一个 Compose 弹窗的
+        //   系统栏行为。这里只给底栏这一个窗口加，且走 [applyCapsuleWindowParams] 的
+        //   同一次 attributes 写入（带相等性守卫），不额外派发。
+        WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
 
 /**
  * 胶囊窗口**必须清除**的 flag（**单一真源**）。
@@ -204,7 +215,20 @@ private const val CAPSULE_WINDOW_FLAGS_ON: Int =
  * 与之配套的 `dimAmount` 也在 [applyCapsuleWindowParams] 的同一次写入里归零，
  * 不再单独调 `Window.setDimAmount`（那是又一次无条件 attributes 派发）。
  */
-private const val CAPSULE_WINDOW_FLAGS_OFF: Int = WindowManager.LayoutParams.FLAG_DIM_BEHIND
+// FLAG_TRANSLUCENT_* 在 API 30 起标记 deprecated，但**清除**它们仍然是让
+// navigationBarColor 生效的必要条件（Android 12~14 的真机上照旧），minSdk 是 31。
+@Suppress("DEPRECATION")
+private const val CAPSULE_WINDOW_FLAGS_OFF: Int = WindowManager.LayoutParams.FLAG_DIM_BEHIND or
+    // ★ 2026-09-24：与 `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS` 配套，必须**清掉**这两个。
+    //   平台契约：`FLAG_TRANSLUCENT_NAVIGATION` / `FLAG_TRANSLUCENT_STATUS` 一旦置位，
+    //   对应的 `navigationBarColor` / `statusBarColor` 直接被忽略、改由系统画半透明渐变底。
+    //   `UfiDialogWindowTheme` 的 `windowIsTranslucent = true` 会带上它们
+    //   （那一项是当年为窗口级真模糊留的硬性前提，模糊虽已移除但该项保留着防止换 parent 时被改掉），
+    //   所以这里必须显式清除，否则透明导航栏色仍然是空转。
+    //   ⚠ 清它们**不会**让窗口变回不透明：窗口透明由 `windowIsTranslucent` + `setFormat(TRANSLUCENT)`
+    //     决定，与这两个 flag 无关。
+    WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION or
+    WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS
 
 /**
  * 「窗口级真模糊此刻是否**真的**生效」。
@@ -288,6 +312,38 @@ val LocalCapsuleExpandProgress = compositionLocalOf { mutableFloatStateOf(1f) }
 val LocalCapsuleNaturalSize = compositionLocalOf { mutableStateOf(IntSize.Zero) }
 
 /**
+ * 底部系统预留区高度（px），由 [CapsuleBlurHost] 下发给栏内容消费。
+ *
+ * ## 为什么要有它（2026-09-24，贴底通栏低栏迁移阶段 1）
+ * 通栏形态把「安全区」从**窗口 y 偏移**挪进了**栏内部的一段 Spacer**
+ *（背景铺到屏幕真实底边、内容靠 Spacer 让位，见 `docs/bottom-dock-migration-plan.md` §3）。
+ * 消费方从此变成 Compose 内容层，但取值口径**一个字都不能变** ——
+ * [readBottomReservedPx] 是 `max(navigationBars, systemGestures)`、手势导航兜底
+ * [GESTURE_BOTTOM_INSET_FLOOR]、且一律回读**宿主 Activity** 的全屏 `rootWindowInsets`
+ *（读 Dialog 自己的会形成「窗口位置 → 自身 inset → 再改窗口位置」的自激振荡，已踩过）。
+ *
+ * 所以这里下发的是 [CapsuleBlurHost] 里**已经算好**的那份 `reservedPx`，
+ * 而不是让栏自己去读一遍 `WindowInsets`：真源只能有一个。
+ *
+ * 默认 0：未被 [CapsuleBlurHost] 包裹的场景（@Preview / 单测）没有真实屏幕底边可贴，
+ * 留 0 比留一个凭空的兜底值更容易看出「忘了套宿主」。
+ */
+val LocalCapsuleBottomReserved = compositionLocalOf { 0 }
+
+/**
+ * 底部**系统栏本体**高度（px，只有 `navigationBars`）—— [LocalCapsuleBottomReserved] 的搭档。
+ *
+ * 前者是「栏总共要为系统底部让出多高」（含手势热区），后者是「屏幕底部真正有系统像素
+ * （小白条 / 三键按键带）的那一段」。通栏形态下栏本来就横跨整条手势热区（热区只拦上滑手势，
+ * 不影响绘制），真正需要留空的只有系统栏本体 —— 两者的差值应该挪到**内容区上方**，
+ * 否则图标会被顶得离屏幕底边过远（2026-09-24 真机：ges=112px 而 nav=56px，差出 56px）。
+ *
+ * 由 [CapsuleBlurHost] 与 [LocalCapsuleBottomReserved] 在同一次 provide 里下发，
+ * 两个读数共用同一个 inset listener，天然同步。
+ */
+val LocalCapsuleBottomSystemBar = compositionLocalOf { 0 }
+
+/**
  * 胶囊悬浮栏底部遮挡预留高度的**读取器**（`() -> Dp`）。
  *
  * ## 为什么需要它（2026-08-08 19:47 新增，方案 A 修订版）
@@ -323,31 +379,117 @@ val LocalCapsuleNaturalSize = compositionLocalOf { mutableStateOf(IntSize.Zero) 
 val LocalCapsuleBottomInset = staticCompositionLocalOf<() -> Dp> { { DEFAULT_CAPSULE_BOTTOM_INSET } }
 
 /**
- * 把「胶囊底部遮挡预留」表达成一个**只在 layout 阶段读值**的高度占位。
+ * 「底栏遮挡预留」在**页壳内部**真正还需要补的那一段（Dp）。**扣减 navigationBars 的唯一落点。**
+ *
+ * ## 为什么要减（2026-09-24，贴底通栏低栏迁移 §5.21 / §7-2.9 ①）
+ * [LocalCapsuleBottomInset] 发布的是**底栏自身总高**（`DOCK_CONTENT_MIN_HEIGHT` + 安全区，
+ * 见 [CapsuleBlurHost] 里 `capsuleBottomTotalDp`），**含**安全区那条带子；
+ * 而 `UfiScreenScaffold` 的内容 `Box` 早就有 `windowInsetsPadding(WindowInsets.navigationBars)`
+ * （`UfiScaffold.kt:623`）—— 页面内容区的底边本来就已经在「屏幕底边 − navigationBars」处。
+ * 两个量直接相加就是**双算**：需要的留白是 `底栏总高 − navigationBars`，实际留白却是
+ * `底栏总高`，每个主 Tab 页各多留一个 navigationBars（手势导航≈24dp、三键≈48dp）。
+ *
+ * ## 旧数字当年为什么是对的
+ * 悬浮胶囊形态下这一项被**窗口 `y` 抬高 30dp**（`CAPSULE_LIFT`，已随 §2.1 退休）近似抵掉了：
+ * 胶囊本体悬在安全区**之上**，页面要避开的是「胶囊高 + 8dp 间隙 + 抬升 + 安全区」，
+ * 与页壳消费掉的那一段刚好各据一半，观感上看不出多留。通栏形态把安全区收进了栏自己
+ * （背景铺到屏幕真实底边 + 栏内 Spacer 让位，见 [LocalCapsuleBottomReserved]），
+ * 抬升归 0 ⇒ 抵消项消失，双算立刻显形。这是本次迁移**引入**的回归，不是历史遗留。
+ *
+ * ## 为什么读到的 navigationBars 就是页壳消费掉的那一段（已实查，2026-09-24）
+ * 从 Activity 根到 `UfiScaffold.kt:623` 那句之间**没有任何** `consumeWindowInsets`（全仓 grep 为 0）
+ * 也没有第二处消费 navigationBars 的 `windowInsetsPadding`：
+ * - `MainNavGraph` 的 `Scaffold` 是 `contentWindowInsets = WindowInsets(0, 0, 0, 0)`（`MainNavGraph.kt:373`），
+ *   四边恒 0、不消费；
+ * - 页壳根 `Column` 只有 `statusBarsPadding()`（`UfiScaffold.kt:577`），消费的是 statusBars（顶部），
+ *   与 navigationBars 是两路不同的 inset。
+ *
+ * 另外：`windowInsetsPadding` 的「消费」只在 modifier 链内经 ModifierLocal 传播，**不会**改变
+ * 组合期 `WindowInsets.navigationBars` 的读数 —— 所以这里读到的恒是完整值，与页壳收掉的那一段同量。
+ *
+ * ## 为什么只减 navigationBars、不减整条安全区
+ * [readBottomReservedPx] 的口径是 `max(navigationBars, systemGestures)` 且带手势兜底
+ * [GESTURE_BOTTOM_INSET_FLOOR]（24dp，应对把 navigationBars 报 0 的国产 ROM）。
+ * 页壳只 padding 了 navigationBars 这一路，所以只能减这一路：
+ * 兜底/手势那部分高出来的差额仍留在结果里，页面该避的照样避。
+ *
+ * @param total 底栏自身总高（[LocalCapsuleBottomInset] 的读数）。
+ * @param navigationBars 组合期取到的稳定 inset 对象，读数压在本函数（layout 阶段）里发生。
+ * @param extra 呼吸间距（调用点走 `Spacing` 令牌）。它**不参与**扣减：页壳消费的是安全区，
+ *              与「内容离栏多远」是两回事，减到 0 以下只会把呼吸吃掉。
+ */
+private fun Density.capsuleBottomClearance(total: Dp, navigationBars: WindowInsets, extra: Dp): Dp =
+    (total - navigationBars.getBottom(this).toDp()).coerceAtLeast(0.dp) + extra
+
+/**
+ * 把「底栏底部遮挡预留」表达成一个**只在 layout 阶段读值**的高度占位。
  *
  * 用法：作为滚动列表**最后一个 item** 的 `Spacer` 修饰符，语义等价于原来的
  * `LazyColumn(contentPadding = PaddingValues(bottom = inset + extra))` ——
  * 都是在内容末尾追加一段可滚动的空白，且不缩小视口（`Modifier.padding` 会缩小视口、
  * 让 item 在硬边界处被裁掉，不是同一个观感）。
  *
+ * ## ★★ 配对约定：本修饰符假定调用点在 `UfiScreenScaffold` 的内容区之内 ★★
+ * 那里已经 `windowInsetsPadding(WindowInsets.navigationBars)`（`UfiScaffold.kt:623`），
+ * 所以本修饰符**显式减掉**页壳已经消费的那一段（见 [capsuleBottomClearance]）：
+ * ```
+ * 最终高度 = (底栏总高 − navigationBars.bottom).coerceAtLeast(0.dp) + extra
+ * ```
+ * 在**页壳之外**使用（自持 `Scaffold`、或直接挂在满屏 Box 上的页面）会**少留**一个
+ * navigationBars 的白 —— 底部最后一行内容被栏压住。那种场景请自己补
+ * `navigationBarsPadding()`，或换用不减的口径。
+ *
+ * 配对关系由护栏 `capsuleInset_mustDeductShellConsumedNavigationBars` 钉住：
+ * 任何一端被单独改掉（这里不再减、或页壳那句被删）都会变红。
+ *
+ * 已实查（2026-09-24）：全部 6 个调用点都在页壳内容区之内 ——
+ * `DashboardScreen:229`（壳 166..233）/ `NetworkScreen:210`（壳 92..223）/
+ * `ToolsScreen:70`（壳 29..73）/ `SettingsScreen:276`（壳 45..279）/
+ * `MonitorScreen:549` 与 `:762`（两者在壳 229..265 内调用的两个 Tab 内容函数里）。
+ *
  * 关键点：[LocalCapsuleBottomInset] 的 `.current` 在组合期读到的只是那个**稳定的 lambda**
  * （provider 永不变 ⇒ 不触发重组），真正的快照读 `CapsuleInsetHolder.bottomInset.value`
  * 发生在 `Modifier.layout` 的 measure lambda 里 ⇒ **inset 变化只触发本节点重排，不触发重组**。
  * 这是 P1（pop 第 2~3 帧整树重组）修复的消费侧一半，另一半在 `MainNavGraph` 的 provider。
+ * `WindowInsets.navigationBars` 同理：组合期只取稳定对象，`getBottom()` 的读数压在 measure 里。
  *
- * @param extra 额外留白（如列表与胶囊之间的呼吸间距）。走 `ui.theme` 的 `Spacing` 令牌，
+ * @param extra 额外留白（如列表与底栏之间的呼吸间距）。走 `ui.theme` 的 `Spacing` 令牌，
  *              不要在调用点写裸数值。
  */
 @Composable
 fun Modifier.ufiCapsuleBottomInset(extra: Dp): Modifier {
     val insetOf: () -> Dp = LocalCapsuleBottomInset.current
+    val navigationBars = WindowInsets.navigationBars
     return this.layout { measurable, constraints ->
         // ★ 这一行是整个修复的落点：快照读在 measure 里，不在组合里。
-        val height = (insetOf() + extra).roundToPx().coerceAtLeast(0)
+        val height = capsuleBottomClearance(insetOf(), navigationBars, extra)
+            .roundToPx().coerceAtLeast(0)
         val placeable = measurable.measure(
             constraints.copy(minHeight = height, maxHeight = height)
         )
         layout(placeable.width, placeable.height) { placeable.place(0, 0) }
+    }
+}
+
+/**
+ * 把「底栏底部遮挡预留」表达成一个**向上的位移**，给贴底的**浮动**控件用。
+ *
+ * 与 [ufiCapsuleBottomInset] 同源（共用 [capsuleBottomClearance]，因此**没有第二个数字**），
+ * 区别只在表达方式：占位改不了「`align(Alignment.BottomCenter)` 贴在容器底边」的浮层，
+ * 那种控件要的是把自己抬离容器底边 `clearance` 那么多。
+ *
+ * 配对约定与 [ufiCapsuleBottomInset] 完全一致：调用点必须在 `UfiScreenScaffold` 内容区之内
+ * （容器底边 = 屏幕底边 − navigationBars），壳外使用会抬不够、被栏压住。
+ *
+ * 首个消费者：监控「总览」Tab 的浮动分页条（`MonitorScreen.kt`，原先写死 `offset(y = -40.dp)`）。
+ */
+@Composable
+fun Modifier.ufiCapsuleBottomLift(extra: Dp): Modifier {
+    val insetOf: () -> Dp = LocalCapsuleBottomInset.current
+    val navigationBars = WindowInsets.navigationBars
+    // offset 的 lambda 形态同样是 layout 阶段求值 —— 与上面一致，inset 变化只重排不重组。
+    return this.offset {
+        IntOffset(0, -capsuleBottomClearance(insetOf(), navigationBars, extra).roundToPx())
     }
 }
 
@@ -373,6 +515,17 @@ internal val DEFAULT_CAPSULE_BOTTOM_INSET: Dp = 88.dp
 object CapsuleInsetHolder {
     /** 当前胶囊底部遮挡总高（Dp）。默认 [DEFAULT_CAPSULE_BOTTOM_INSET]。 */
     val bottomInset: MutableState<Dp> = mutableStateOf(DEFAULT_CAPSULE_BOTTOM_INSET)
+
+    /*
+     * ★ 已删除（2026-09-24）：`bottomReservedDp` —— 把预留区高度跨窗口发给主窗口，
+     *   好让主窗口补画一条底栏窗口「够不到」的安全区带子。
+     *
+     *   当时的假设（floating Dialog 在 Android 15/16 被 DecorView 吃掉系统 inset）
+     *   被诊断版在真机上证伪：底栏窗口本来就铺到了屏幕底边。真因是那个窗口缺
+     *   `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS`，导致透明 navigationBarColor 空转、
+     *   系统补了一条不透明导航栏底色（见 [CAPSULE_WINDOW_FLAGS_ON]）。
+     *   补画那条带子因此是纯重复绘制，连同本字段一起移除。
+     */
 }
 
 /**
@@ -417,28 +570,45 @@ private fun queryCrossWindowBlurEnabled(context: Context): Boolean {
  * 反复调用），拿不到 `LocalDensity` / `LocalResolvedPalette`；因此把 dp→px 换算与取色
  * 全部前置到 [CapsuleBlurHost] 里做一次，用本值传进去。
  *
- * @property bottomOffsetPx    窗口相对**屏幕真实底边**的偏移（px）
- *                             = [bottomReservedPx] + (`capsuleGapFor(isGestureNav)` −
- *                             [CAPSULE_SHADOW_ROOM]) + [CAPSULE_LIFT]。
- *                             前两项是**安全**语义（保证胶囊底边不落进手势热区，已验证的
- *                             8dp 不变量），末项是**审美**语义（产品向的整体抬高），二者正交、
- *                             各自独立可调，见 [CAPSULE_LIFT]。
- *                             窗口已用 `FLAG_LAYOUT_NO_LIMITS` 延伸到系统装饰区，因此必须由
- *                             我们自己把预留区高度加回去，否则胶囊会压在手势小白条上被截断。
+ * ## ★ 已删除的两个字段（2026-09-24，贴底通栏低栏迁移阶段 2.1）
+ * - `bottomOffsetPx`：窗口相对屏幕真实底边的 `y` 偏移
+ *   （= `bottomReservedPx` + (`capsuleGapFor(isGestureNav)` − `CAPSULE_SHADOW_ROOM`) + `CAPSULE_LIFT`）。
+ *   悬浮形态靠它把胶囊**抬离**底边；通栏形态 `y` 恒 0（栏主动铺满底部那条带子），
+ *   整条表达式与它依赖的三个常量一起退休，见文件顶部的两段删除说明。
+ * - `insetPx`：窗口背景 drawable 四边内缩量。它恒等于 `CAPSULE_SHADOW_ROOM`（恒 0），
+ *   而窗口背景又必须恒为 `null`（红线 R1），所以本就是一个双重意义上的死值。
+ *
+ * ⚠ [bottomReservedPx] **保留**：安全区高度现在的消费方是「栏内 Spacer + 页面 inset」，
+ *   这一份仍是诊断与复用的出口，取值口径（[readBottomReservedPx]）一字未改。
+ *
  * @property cornerRadiusPx    窗口背景 drawable 的圆角半径（px）。
- * @property insetPx           窗口背景 drawable 四边内缩量（px），让模糊区 ≈ 胶囊本体。
  * @property tintArgb          窗口背景 drawable 的填充色（ARGB），低 alpha，只定形不抢色。
  * @property bottomReservedPx  屏幕底部**系统占用/预留区**高度（px）：系统导航栏与手势热区的
- *                             **并集**（见 [readBottomReservedPx]），已计入 [bottomOffsetPx]。
- *                             它比「导航栏高度」更宽 —— 手势导航下 `navigationBars` 可能远小于
- *                             真实手势热区。单独保留一份便于诊断与后续布局复用。
+ *                             **并集**（见 [readBottomReservedPx]）。它比「导航栏高度」更宽 ——
+ *                             手势导航下 `navigationBars` 可能远小于真实手势热区。
+ *                             通栏形态下由 [LocalCapsuleBottomReserved] 下发给栏内容消费。
  */
 private data class CapsuleWindowMetrics(
-    val bottomOffsetPx: Int,
     val cornerRadiusPx: Float,
-    val insetPx: Int,
     val tintArgb: Int,
-    val bottomReservedPx: Int
+    val bottomReservedPx: Int,
+    /**
+     * 栏底色是否**浅色** ⇒ 手势小白条必须画成**深色**才看得见。
+     *
+     * ## 这条不是可选的"打磨"（§5.3 的原假设是错的）
+     * 计划 §5.3 当时写「手势导航下平台做 dynamic color adaptation，小白条按背后内容自动反色，
+     * 不需要额外处理」。真机证伪：小白条的明暗只看**窗口的** `isAppearanceLightNavigationBars`，
+     * 平台不会去采样背后像素。
+     *
+     * 悬浮胶囊时代看不出来：胶囊被抬离底边，小白条压的是**页面**底色，而页面在 Activity 窗口里，
+     * 那个窗口的 appearance 由 `MainActivity.enableEdgeToEdge()` 按**系统**夜间模式定过一次。
+     * 贴底通栏之后小白条压的是**本 Dialog 窗口**里的栏底色，而这个窗口从来没设过 appearance
+     * ⇒ 取默认值「深背景」⇒ 小白条恒为白 ⇒ 压在白底栏上直接看不见。
+     *
+     * 判据取 [dockSurfaceColor] 的亮度（> 0.5 即浅色），与栏实际画的那块颜色同源；
+     * 顺带也覆盖了「应用内主题与系统夜间模式不一致」这种 `enableEdgeToEdge()` 管不到的组合。
+     */
+    val lightNavHandleSurface: Boolean
 )
 
 /**
@@ -485,24 +655,46 @@ private fun Context.findHostActivity(): Activity? {
  * ⚠ `format` 不在这里写：它必须走 `Window.setFormat`（那会同时置上平台内部的
  * `mHaveWindowFormat`，是"黑底回归修复"的命门），在 [applyWindowBlur] 里单独带守卫调用。
  *
- * @param naturalSize 胶囊根 Box 的固有尺寸；已测得则钉成固定宽高，未测得（首帧为 0）
- *                    退化 `WRAP_CONTENT` 由内容撑开。
+ * @param naturalSize 栏根 Box 的固有尺寸。**只用 height**：已测得则把窗口高度钉成它，
+ *                    未测得（首帧为 0）退化 `WRAP_CONTENT` 由内容撑开。
+ *                    width 分支已于 2026-09-24 退休 —— 通栏形态宽度恒 `MATCH_PARENT`
+ *                    （见函数体内说明与迁移计划 §5.7）。
  */
 private fun applyCapsuleWindowParams(
     window: Window,
-    metrics: CapsuleWindowMetrics,
     naturalSize: MutableState<IntSize>,
     interactive: Boolean
 ) {
-    val desiredWidth: Int = if (naturalSize.value.width > 0) naturalSize.value.width
-        else ViewGroup.LayoutParams.WRAP_CONTENT
+    // ★ 2026-09-24（贴底通栏低栏，迁移计划 §2.1 对照表）：width 恒 MATCH_PARENT。
+    //
+    // 原来是 `if (naturalSize.value.width > 0) it else WRAP_CONTENT` —— 悬浮胶囊必须让
+    // 窗口矩形**紧贴胶囊本体**：`FLAG_NOT_TOUCH_MODAL` 只放行窗口矩形**之外**的触摸，
+    // 窗口一撑满宽度就会把整条底部的点击圈进来，胶囊左右两侧的页面内容点不动。
+    // 通栏低栏的前提正好相反 —— 它**就是**要占满那条带子，而「栏以上区域仍需穿透」
+    // 依旧由 FLAG_NOT_TOUCH_MODAL 保证（栏本身是不透明可点的，这是预期）；
+    // 二级页整块不吃触摸另由 [CapsuleTouchGate] 的 FLAG_NOT_TOUCHABLE 负责，通栏后
+    // 窗口矩形更宽，那条 gate 比改造前更重要（§5.4）。
+    //
+    // ⚠ naturalSize 的 **height 分支保留**：栏总高仍由内容测量决定（fontScale 放大时
+    //   栏要能长高，见 §5.7 / §5.13），只有 width 分支退休。
+    val desiredWidth: Int = ViewGroup.LayoutParams.MATCH_PARENT
     val desiredHeight: Int = if (naturalSize.value.height > 0) naturalSize.value.height
         else ViewGroup.LayoutParams.WRAP_CONTENT
-    // 锚定底部居中；y = 系统底部预留区 + 安全间距 + 视觉抬高（见 CapsuleWindowMetrics）。
-    val desiredGravity: Int = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+    // ★ 2026-09-24：gravity 去掉 CENTER_HORIZONTAL —— 宽度已是 MATCH_PARENT，
+    //   水平居中无意义（留着只会让人以为窗口还有可居中的余量）。只保留 BOTTOM：
+    //   它配合 FLAG_LAYOUT_NO_LIMITS 把参考系钉在**屏幕真实底边**。
+    val desiredGravity: Int = Gravity.BOTTOM
     // 窗口已越过系统装饰边界，显式允许铺到刘海/挖孔区，避免横屏被平台二次内缩。
     val desiredCutoutMode: Int =
         WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+    // ★ 2026-09-24：y 恒 0（迁移计划 §2.1 对照表）。
+    //
+    // 原值是 `metrics.bottomOffsetPx` = 安全区 + 安全间距 8dp + 视觉抬高 30dp，
+    // 用来把悬浮胶囊整体**抬离**屏幕底边。通栏低栏贴底，任何 y > 0 都会在栏与屏幕底边
+    // 之间露出一条页面内容 —— 通栏就不通了。安全区不是被丢掉，而是换了消费方：
+    // 栏内部用一段只有底色的 Spacer 让位（[LocalCapsuleBottomReserved] → `UfiBottomDock`），
+    // 页面 inset 则由 [CapsuleInsetHolder] 发布「内容高 + 安全区」。见 §3。
+    val desiredY: Int = 0
 
     val params: WindowManager.LayoutParams = window.attributes
     // 隐藏期（二级页）补 FLAG_NOT_TOUCHABLE：窗口留着不闪帧，但整块不吃触摸 ——
@@ -524,7 +716,7 @@ private fun applyCapsuleWindowParams(
         params.width == desiredWidth &&
         params.height == desiredHeight &&
         params.gravity == desiredGravity &&
-        params.y == metrics.bottomOffsetPx &&
+        params.y == desiredY &&
         params.layoutInDisplayCutoutMode == desiredCutoutMode
     if (settled) return
 
@@ -534,7 +726,7 @@ private fun applyCapsuleWindowParams(
         width = desiredWidth
         height = desiredHeight
         gravity = desiredGravity
-        y = metrics.bottomOffsetPx
+        y = desiredY
         layoutInDisplayCutoutMode = desiredCutoutMode
     }
 }
@@ -558,9 +750,14 @@ private fun applyCapsuleWindowParams(
 private fun isGestureNavigationMode(view: View): Boolean {
     val decorView: View = view.context.findHostActivity()?.window?.decorView ?: return true
     val insets: WindowInsetsCompat = ViewCompat.getRootWindowInsets(decorView) ?: return true
-    val navBar = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
     val tappable = insets.getInsets(WindowInsetsCompat.Type.tappableElement()).bottom
-    return tappable == 0 && navBar > 0
+    // ★ 2026-09-24（ColorOS 16 手势区露黑）：判据去掉了原来的 `&& navBar > 0`。
+    //   原意是排除「全屏沉浸、底部什么都没有」的场景，但部分 ROM（实测 ColorOS 16）
+    //   在手势导航下把 `navigationBars().bottom` 也报成 0 —— 于是这里判成"不是手势导航"，
+    //   `readBottomReservedPx` 的 24dp 保底随之失效、预留区算成 0，通栏底栏就不再覆盖手势区。
+    //   现在只看 `tappable == 0`：真·全屏沉浸场景多留 24dp 无害（底栏本来就只在正常 UI 下显示），
+    //   而漏底是肉眼可见的缺陷 —— 两者的代价不对称。
+    return tappable == 0
 }
 
 /**
@@ -599,7 +796,11 @@ private fun readBottomReservedPx(view: View, density: Density): Int {
 
     val navBar = insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
     val gestures = insets.getInsets(WindowInsetsCompat.Type.systemGestures()).bottom
-    val raw = maxOf(navBar, gestures)
+    // ★ 2026-09-24：并集里加上 tappableElement。三键导航下它就是那条按键带的高度，
+    //   而个别 ROM 的 navigationBars 会比它小（甚至为 0）。取三者最大值，宁多不少 ——
+    //   通栏形态下这个值决定「栏有多高」，少算一点就是屏幕底部露出一条页面底色。
+    val tappable = insets.getInsets(WindowInsetsCompat.Type.tappableElement()).bottom
+    val raw = maxOf(navBar, gestures, tappable)
 
     // 手势导航才需要保底：三键导航的 navigationBars 是实打实的按键带高度，读数可信，
     // 强行抬到 24dp 反而会让胶囊无谓地飘起来。
@@ -610,13 +811,36 @@ private fun readBottomReservedPx(view: View, density: Density): Int {
 }
 
 /**
- * 按导航模式选择「预留区顶边 → 胶囊底边」的呼吸间距。
+ * 读取**系统栏本体**占用的底部高度（px）—— 只有 `navigationBars`，不含手势热区。
  *
- * 当前两个分支取值相同（都是 8dp），保留分发结构是为了将来只调
- * [CAPSULE_GAP_BUTTON] 一个数就能单独加大按键导航下的间距。
+ * ## 与 [readBottomReservedPx] 的分工（2026-09-24，通栏形态下才有意义）
+ * - [readBottomReservedPx] = `max(navigationBars, systemGestures, tappableElement)` + 手势保底
+ *   ⇒ 「栏总共要为系统底部让出多高」。悬浮胶囊时代它决定胶囊抬多高（绝不能落进手势热区）。
+ * - 本函数 = `navigationBars` ⇒ 「屏幕底部真正有系统像素（小白条 / 三键按键带）的那一段」。
+ *
+ * 通栏贴底之后两者的差值不再是"不能进入的区域"：栏本来就横跨整条手势热区（热区只拦上滑手势，
+ * 不影响绘制）。真正需要留空的只有系统栏本体那一段 —— 图标压在小白条上才是问题。
+ * 于是那个差值（手势导航下约 112−56 = 56px）应该挪到**内容区上方**，而不是堆在下方
+ * 把图标顶得离屏幕底边过远。见 [UfiBottomDock] 里 topPad / bottomPad 的拆分。
+ *
+ * 取值源与 [readBottomReservedPx] 完全一致（宿主 Activity 的全屏 rootWindowInsets），
+ * 读不到时回 0 —— 这里回 0 是安全的：它只决定「内容区下方留多少」，
+ * 少留会让图标更靠下、不会像预留区那样把整条栏算错高度。
  */
-private fun capsuleGapFor(isGestureNav: Boolean): Dp =
-    if (isGestureNav) CAPSULE_GAP_GESTURE else CAPSULE_GAP_BUTTON
+private fun readBottomSystemBarPx(view: View): Int {
+    val decorView: View = view.context.findHostActivity()?.window?.decorView ?: return 0
+    val insets: WindowInsetsCompat = ViewCompat.getRootWindowInsets(decorView) ?: return 0
+    return insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom
+}
+
+/*
+ * ★ 已删除（2026-09-24，贴底通栏低栏迁移阶段 2.1）：`capsuleGapFor(isGestureNav)` ★
+ *
+ * 它按导航模式分发「预留区顶边 → 胶囊底边」的呼吸间距（两个分支都是 8dp，分发结构只为
+ * 将来单独加大按键导航的间距）。唯一调用点是 `bottomOffsetPx` 的赋值表达式，
+ * 随该表达式一起退休 —— 通栏形态没有「悬在热区上方的底边」，这个间距概念本身不成立。
+ * 详见文件顶部那段常量删除说明与 `docs/bottom-dock-migration-plan.md` §2.1。
+ */
 
 /**
  * **响应式**读取底部系统预留区高度（px），跟随导航模式切换 / 旋转 / 系统栏显隐实时更新。
@@ -648,10 +872,17 @@ private fun capsuleGapFor(isGestureNav: Boolean): Dp =
  * - `onDispose` 里把 listener 与 attach 回调都摘掉，不留悬挂引用。
  */
 @Composable
-private fun rememberBottomReservedPx(view: View, density: Density): Int {
+private fun rememberBottomReservedPx(view: View, density: Density): BottomInsetReadings {
     // key 只有 view：不带任何 inset 读数，杜绝「读数一变就硬重置 state」。
     var reservedPx: Int by remember(view) {
         mutableIntStateOf(readBottomReservedPx(view, density))
+    }
+    // ★ 2026-09-24：第二个读数（系统栏本体高度），与 reservedPx **共用同一个 listener**。
+    //   绝不能为它再挂一个 `setOnApplyWindowInsetsListener(view.rootView, …)` ——
+    //   同一个 view 上的 listener 槽位只有一个，第二次注册会**顶掉**第一个，
+    //   预留区就此不再响应导航模式切换 / 旋转（静默失效，没有任何报错）。
+    var systemBarPx: Int by remember(view) {
+        mutableIntStateOf(readBottomSystemBarPx(view))
     }
 
     DisposableEffect(view, density) {
@@ -662,12 +893,16 @@ private fun rememberBottomReservedPx(view: View, density: Density): Int {
         // 重新派发 inset；这里无条件校准一次，避免保底值停在旧密度下的像素数。
         val recalibrated = readBottomReservedPx(view, density)
         if (recalibrated != reservedPx) reservedPx = recalibrated
+        val recalibratedBar = readBottomSystemBarPx(view)
+        if (recalibratedBar != systemBarPx) systemBarPx = recalibratedBar
 
         ViewCompat.setOnApplyWindowInsetsListener(signalTarget) { _, insets ->
             // ★ 取值一律回到宿主 Activity 的全屏 rootWindowInsets（红线 L1）。
             val next = readBottomReservedPx(view, density)
             // ★ 允许下降：只判「变了没有」，不做单调守卫（红线 L3）。
             if (next != reservedPx) reservedPx = next
+            val nextBar = readBottomSystemBarPx(view)
+            if (nextBar != systemBarPx) systemBarPx = nextBar
             // ★ 原样返回，绝不 CONSUMED（红线 L2）。
             insets
         }
@@ -678,6 +913,8 @@ private fun rememberBottomReservedPx(view: View, density: Density): Int {
             override fun onViewAttachedToWindow(v: View) {
                 val next = readBottomReservedPx(view, density)
                 if (next != reservedPx) reservedPx = next
+                val nextBar = readBottomSystemBarPx(view)
+                if (nextBar != systemBarPx) systemBarPx = nextBar
             }
 
             override fun onViewDetachedFromWindow(v: View) = Unit
@@ -693,8 +930,18 @@ private fun rememberBottomReservedPx(view: View, density: Density): Int {
         }
     }
 
-    return reservedPx
+    return BottomInsetReadings(reservedPx = reservedPx, systemBarPx = systemBarPx)
 }
+
+/**
+ * [rememberBottomReservedPx] 的两个读数。
+ *
+ * @property reservedPx 栏要为系统底部让出的总高（`max(navigationBars, systemGestures,
+ *   tappableElement)` + 手势保底）。决定**栏总高**与页面底部留白。
+ * @property systemBarPx 其中真正有系统像素的那一段（只有 `navigationBars`）。
+ *   决定**内容区下方**至少要留多少 —— 差值挪到内容区上方，见 [UfiBottomDock]。
+ */
+private data class BottomInsetReadings(val reservedPx: Int, val systemBarPx: Int)
 
 /**
  * 从子组合的 `LocalView` 出发解析出承载它的对话框 [Window]。
@@ -755,17 +1002,20 @@ private fun resolveDialogWindow(view: View): Window? {
  * - [GradientDrawable] 提供药丸圆角（[CapsuleWindowMetrics.cornerRadiusPx]）与一层
  *   极低 alpha 的底色（[CAPSULE_WINDOW_TINT_ALPHA]）——「定形」而不「抢色」，
  *   真正的玻璃质感仍由 Compose 侧 [UfiCapsuleTabBar] 绘制；
- * - 由于 [CAPSULE_SHADOW_ROOM] 已为 0.dp，[CapsuleWindowMetrics.insetPx] 恒为 0，
- *   不再需要 [InsetDrawable] 内缩包裹，drawable 直接以胶囊大小绘制，
- *   使**模糊区 = 胶囊本体**而非更大的矩形（见下方 `capsuleBackground`）。
+ * - 窗口背景 drawable 不再需要任何四边内缩：`CapsuleWindowMetrics.insetPx`（恒等于已删除的
+ *   `CAPSULE_SHADOW_ROOM`，恒 0）与 [InsetDrawable] 内缩包裹都已退休，drawable 直接以
+ *   窗口大小绘制（见下方 `capsuleBackground`）。
  *
  * ## 触摸穿透红线
  * `FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL` 必须打上：前者让窗口不抢焦点（不弹输入法、
- * 不吃返回键），后者让**窗口矩形之外**的触摸继续下发给下方页面。胶囊是常驻浮层，
+ * 不吃返回键），后者让**窗口矩形之外**的触摸继续下发给下方页面。底栏是常驻浮层，
  * 一旦漏掉这两个 flag 就会整块吞掉页面点击 —— 产品红线。
  *
- * 同时把窗口收成 wrap-content 并锚到 `BOTTOM|CENTER_HORIZONTAL`，
- * 使窗口矩形本身就只覆盖胶囊，把「窗外」区域压到最小。
+ * ★ 2026-09-24（贴底通栏低栏）：窗口已改成 `MATCH_PARENT` 宽 + `gravity=BOTTOM` + `y=0`，
+ * 「窗口矩形」从「紧贴胶囊的小窗」变成「屏幕底部整条带子」。`FLAG_NOT_TOUCH_MODAL` 的语义
+ * **一字未变**，只是它现在放行的是**栏以上**的整个页面区域（那才是需要穿透的地方）；
+ * 栏本身不透明可点，这是预期。二级页要让整条带子都穿透，靠的是 [CapsuleTouchGate]
+ * 给窗口补 `FLAG_NOT_TOUCHABLE` —— 窗口变宽之后这条 gate 比改造前更重要（§5.4）。
  *
  * ## ★ 窗口尺寸**固定**，不再跟随展开进度缩放（去模糊重构，改动前必读）
  * 历史上窗口必须跟着胶囊缩，唯一理由是「模糊区 = 窗口矩形」：窗口不缩就会在缩小的胶囊
@@ -795,9 +1045,11 @@ private fun resolveDialogWindow(view: View): Window? {
  *   + `isNavigationBarContrastEnforced = false` + `WindowCompat.setDecorFitsSystemWindows(false)`，
  *   让窗口能铺到屏幕真实底边且不再被平台补底色；
  * - 底部系统预留区高度改由 [CapsuleBlurHost] 经 [rememberBottomReservedPx] /
- *   [readBottomReservedPx]（宿主 Activity 的全屏 rootWindowInsets）读出来，
- *   加进 [CapsuleWindowMetrics.bottomOffsetPx]，把胶囊精确抬到手势热区上方
- *   [CAPSULE_GAP_GESTURE] 处。
+ *   [readBottomReservedPx]（宿主 Activity 的全屏 rootWindowInsets）读出来。
+ *   ★ 2026-09-24（贴底通栏低栏）：这份高度**不再加进窗口 y**（y 已恒 0），
+ *   而是经 [LocalCapsuleBottomReserved] 下发给栏内容，由栏内一段只有底色的 Spacer 让位；
+ *   背景则一路铺到屏幕真实底边（手势小白条浮在栏底色之上）。取值口径一字未改，
+ *   变的只是消费方，见 `docs/bottom-dock-migration-plan.md` §3。
  *
  * 资源侧还在 `UfiDialogWindowTheme` 里预置了同样的透明导航栏配置，
  * 避免 Dialog 每次重建时在本函数生效前闪一帧白边。
@@ -853,13 +1105,14 @@ private fun applyWindowBlur(
     if (dialogWindow != null) {
         // ═══ 红线 + 定位：LayoutParams 的**唯一整体写入点**，无条件先执行 ═══
         // 触摸穿透（FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL）、不变暗（清 FLAG_DIM_BEHIND
-        // + dimAmount 归零）、越界布局（FLAG_LAYOUT_NO_LIMITS）、底部锚定（gravity + y）、
-        // 窗口尺寸、刘海模式全部合并进 [applyCapsuleWindowParams] 的一次赋值，
-        // 且写前逐字段比对、相等即跳过 —— 重放不再制造 relayout（见该函数 KDoc）。
+        // + dimAmount 归零）、越界布局（FLAG_LAYOUT_NO_LIMITS）、底部锚定（gravity = BOTTOM
+        // + y = 0）、窗口尺寸（MATCH_PARENT 宽 / 内容高）、刘海模式全部合并进
+        // [applyCapsuleWindowParams] 的一次赋值，且写前逐字段比对、相等即跳过 ——
+        // 重放不再制造 relayout（见该函数 KDoc）。
         //
         // 它排在 runCatching **之外**：触摸穿透是产品红线，绝不依赖下方「尽力而为、
         // 个别 ROM 可能抛异常」的装饰配置；后者整段失败也不会退化成吞点击的模态窗。
-        applyCapsuleWindowParams(dialogWindow, metrics, naturalSize, interactive)
+        applyCapsuleWindowParams(dialogWindow, naturalSize, interactive)
 
         // ── 装饰（导航栏底色 / 背景 / 阴影）：尽力而为，异常则降级 ──
         return runCatching {
@@ -879,7 +1132,24 @@ private fun applyWindowBlur(
                 dialogWindow.isNavigationBarContrastEnforced = false
             }
 
-            // 窗口自己不吃 inset，底部偏移由 metrics.bottomOffsetPx 精确控制。
+            // 手势小白条的明暗。栏贴底之后小白条压在**本窗口**画的栏底色上，
+            // 而小白条不会自己按背后像素反色（§5.3 的原假设已被真机证伪，详见
+            // [CapsuleWindowMetrics.lightNavHandleSurface]）—— 必须显式告诉窗口
+            // 「我这块背景是浅的」，平台才会把小白条画成深色。
+            //
+            // 用 WindowInsetsControllerCompat 而不是直接改 decor 的 systemUiVisibility：
+            // 后者在 API 30+ 已废弃，且与 enableEdgeToEdge 用的那套 appearance 位不是同一条路径。
+            // 这里同样"值相等则跳过"：controller 的 setter 会走 InsetsController.setSystemBarsAppearance，
+            // 无条件写会在每次重放里多派发一次。
+            if (decor != null) {
+                val controller = WindowInsetsControllerCompat(dialogWindow, decor)
+                if (controller.isAppearanceLightNavigationBars != metrics.lightNavHandleSurface) {
+                    controller.isAppearanceLightNavigationBars = metrics.lightNavHandleSurface
+                }
+            }
+
+            // 窗口自己不吃 inset：栏要铺到屏幕真实底边，安全区由栏内 Spacer 让位
+            // （2026-09-24 前是「窗口 y 偏移精确控制」，见 applyCapsuleWindowParams 的 y 说明）。
             // ★ 平台没有对应 getter，而 Window.setDecorFitsSystemWindows 会走到
             //   ViewRootImpl.setOnContentApplyWindowInsetsListener → requestFitSystemWindows()，
             //   即**每次调用都强制一次 inset 重派发 + traversal**（还会顺带回调
@@ -1032,51 +1302,50 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // 本实例必须经 prefListener 收到变更，滑块才能实时联动。
     val appContext = LocalContext.current.applicationContext
     val themeManager = remember { ThemeManager(appContext, observeExternal = true) }
-    val capsuleLift by themeManager.capsuleLiftDp.collectAsState()
+    // 反注册 prefs 监听：Dialog 宿主会反复重建，不解就每重建一次多挂一个监听。
+    DisposableEffect(themeManager) { onDispose { themeManager.dispose() } }
+    // ★ 已删除（2026-09-24，迁移阶段 2.1）：`val capsuleLift by themeManager.capsuleLiftDp…`
+    //   与由它构造的局部常量 `CAPSULE_LIFT`（大写名字是为了让 `bottomOffsetPx` 的表达式
+    //   与护栏 `capsuleLift_mustBeWired` 对得上）。抬高量是**悬浮**形态的审美参数；
+    //   贴底通栏的 y 恒 0，抬高与「贴底」直接矛盾，整条链路退休。
+    //   `ThemeManager.capsuleLiftDp` 这个设置项本身仍在（清理属于阶段 3），只是不再有消费者。
     val capsuleCorner by themeManager.capsuleCornerDp.collectAsState()
 
-    // 底部系统预留区（系统栏 ∪ 手势热区）高度。窗口已用 FLAG_LAYOUT_NO_LIMITS 延伸到
-    // 系统装饰区，这段高度必须由我们自己加回窗口 y 偏移，否则胶囊压在手势条上被截断。
+    // 底部系统预留区（系统栏 ∪ 手势热区）高度。
     //
-    // 取值链路见 [rememberBottomReservedPx]：
+    // ★ 消费方已变（2026-09-24）：窗口 y 恒 0，这段高度不再加进窗口偏移，而是
+    //   ① 经 [LocalCapsuleBottomReserved] 下发给栏内容，由栏内一段只有底色的 Spacer 让位；
+    //   ② 计入 [CapsuleInsetHolder] 发布的页面底部 inset（见下方 capsuleBottomTotalDp）。
+    //
+    // ⚠ **取值链路一个字都不要动** —— 它是踩过「窗口位置 → 自身 inset → 再改窗口位置」
+    //   自激振荡的单一真源，见 [rememberBottomReservedPx]：
     // - 监听挂 Dialog 自己的 decorView，只当「inset 变了」的信号；
-    // - 取值一律走宿主 Activity 的全屏 rootWindowInsets（与胶囊窗口位置解耦，不自激振荡）；
+    // - 取值一律走宿主 Activity 的全屏 rootWindowInsets（与本窗口位置解耦，不自激振荡）；
     // - 允许下降（旋转 / 三键切手势时预留区变小也能跟上），读不到时回落保底值而非 0。
-    val reservedPx: Int = rememberBottomReservedPx(view, density)
+    val bottomInsets: BottomInsetReadings = rememberBottomReservedPx(view, density)
+    val reservedPx: Int = bottomInsets.reservedPx
 
     // dp→px 换算与取色只能在组合里做，提前算好交给非组合的 applyWindowBlur 复用。
-    //
-    // 导航模式在这里再判一次而不是塞进 state：预留区高度与导航模式同源同变
-    // （手势 ≈24dp / 三键 ≈48dp，切换必然带动 reservedPx 变化 → 本 remember 失效重算），
-    // 因此以 reservedPx 为 key 已足够跟随；且当前两套间距取值相同，不影响结果。
-    // ★ 局部 CAPSULE_LIFT：文件级 `private val CAPSULE_LIFT: Dp = 24.dp` 已删除，
-    //   抬高量改由用户设置驱动。刻意沿用大写常量名，使下方 `bottomOffsetPx` 的赋值
-    //   表达式**一字不改** —— 红线 R3 与护栏 `capsuleLift_mustBeWired` 双重要求。
-    @Suppress("LocalVariableName")
-    val CAPSULE_LIFT: Dp = capsuleLift.dp
 
     // 圆角：用户值优先，0（理论上不可达，MIN=10）时回退到文件级默认常量。
     val capsuleCornerRadius: Dp =
         if (capsuleCorner > 0) capsuleCorner.dp else CAPSULE_WINDOW_CORNER_RADIUS
 
-    // key 里追加 capsuleLift / capsuleCorner：两者任一变化都必须重算 metrics，
-    // 否则 metrics 引用不变，下游以它为 key 的 DisposableEffect / LaunchedEffect
-    // 不会重跑，窗口 y 偏移与圆角就不会下发（拖动滑块时胶囊纹丝不动）。
+    // key 里带 capsuleCorner：它一变就必须重算 metrics，否则 metrics 引用不变，
+    // 下游以它为 key 的 DisposableEffect / LaunchedEffect 不会重跑，圆角就不会下发。
+    // （原来还带 capsuleLift —— 那是窗口 y 偏移的驱动项，已随 CAPSULE_LIFT 一起退休。）
     val metrics: CapsuleWindowMetrics = remember(
-        density, palette, reservedPx, capsuleLift, capsuleCorner
+        density, palette, reservedPx, capsuleCorner
     ) {
-        val gestureNav = isGestureNavigationMode(view)
         with(density) {
             CapsuleWindowMetrics(
-                // 定位基线三项（reservedPx + 安全间距 − 投影留白）原样保留，
-                // 只在其上追加产品向的视觉抬高量 CAPSULE_LIFT —— 安全不变量不受影响。
-                bottomOffsetPx = reservedPx +
-                    (capsuleGapFor(gestureNav) - CAPSULE_SHADOW_ROOM).roundToPx() +
-                    CAPSULE_LIFT.roundToPx(),
                 cornerRadiusPx = capsuleCornerRadius.toPx(),
-                insetPx = CAPSULE_SHADOW_ROOM.roundToPx(),
                 tintArgb = palette.cardBg.copy(alpha = CAPSULE_WINDOW_TINT_ALPHA).toArgb(),
-                bottomReservedPx = reservedPx
+                bottomReservedPx = reservedPx,
+                // 判据必须来自**栏实际画的那块颜色**（[dockSurfaceColor]），不是 palette.isDark ——
+                // 两者在多套皮肤下不总是一致（有偏亮的深色皮肤、也有偏暗的浅色皮肤），
+                // 而小白条压的是前者。0.5 是亮度中线。
+                lightNavHandleSurface = dockSurfaceColor(palette).luminance() > 0.5f
             )
         }
     }
@@ -1118,16 +1387,35 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // 读成 State 才能在翻转时让下面两个效应重跑，把 FLAG_NOT_TOUCHABLE 下发到窗口。
     val capsuleInteractive: Boolean = CapsuleTouchGate.interactive.value
 
-    // ── 胶囊底部遮挡总高（跨窗口共享单例）──
+    // ── 底栏底部遮挡总高（跨窗口共享单例）──
     // 2026-08-08 19:47 新增（方案 A 修订版）：监控页底部内容被胶囊遮挡（88dp 硬编码不足）。
-    // 计算 = 未缩放固有高度（= 展开态 scale 1.0 最保守，天然覆盖收起 0.86 态；且不随动画
-    // 每帧变化，避免页面 padding 闪烁）+ 底部间隙(8dp) + 系统底部预留区(reservedPx，宿主已算)。
+    //
+    // ★ 2026-09-24（贴底通栏低栏，迁移计划 §2.3 / §7-2.3）：计算式改为「内容高 + 安全区」。
+    //
+    // 原式 = 未缩放固有高度 `naturalSize.height` + 底部间隙 8dp + 系统底部预留区 reservedPx。
+    // 三项都是**悬浮**形态的量：固有高度是胶囊本体（不含安全区，因为安全区在窗口 y 里）、
+    // 8dp 是「胶囊底边离手势热区」的安全间距、reservedPx 是被窗口 y 抬起来的那一段。
+    // 通栏形态下栏**自己**就覆盖了安全区那条带子（背景铺满 + 栏内 Spacer 让位），
+    // 页面要避开的正是「内容区高 + 安全区」这一整块，既没有 8dp 间隙也没有抬升。
+    //
+    // 高度常量复用 `UfiBottomDock` 的 [DOCK_CONTENT_MIN_HEIGHT]（58dp，§1 参数表的定稿值）
+    // —— **刻意不在这里另写一个 58**：两处各写一份数字迟早漂移（这正是 CAPSULE_SHADOW_ROOM
+    // 当年被收成「单一真源」的同一个理由）。
+    //
     // 经 [CapsuleInsetHolder] 写跨窗口单例，主窗口根读取后 CompositionLocal 下发 ——
     // ⚠ CompositionLocal 不跨 Window，绝不能在 Dialog 内直接 provide 给页面。
-    val capsuleBottomTotalDp: Dp = remember(naturalSize.value, reservedPx) {
-        with(density) { naturalSize.value.height.toDp() } +
-            CAPSULE_GAP_BUTTON +
-            with(density) { reservedPx.toDp() }
+    //
+    // ⚠ §5.13 与 §7-2.3 的口径冲突已裁决（2026-09-24）：**取两者的较大值**。
+    //   §7-2.3 写的是常量式「58 + 安全区」，§5.13 要求发布**实测总高**
+    //   （fontScale 1.5× 时 `heightIn(min=58)` 会让栏长高，常量式会比真实栏矮几 dp，
+    //   页面最后一行被压在栏下面）。两者并不真的矛盾：`UfiBottomDock` 的根 Column
+    //   就是「内容区 + 安全区 Spacer」，常规字号下实测值**恰好等于**常量式，
+    //   放大字号时实测值更大。取 max 同时满足两条，且天然兼容旧的悬浮胶囊分支
+    //   （胶囊实测高 ≈50dp < 58 + 安全区，常量式胜出 = 与迁移前的页面留白一致）。
+    val capsuleBottomTotalDp: Dp = remember(reservedPx, naturalSize.value.height) {
+        val byConstant = DOCK_CONTENT_MIN_HEIGHT + with(density) { reservedPx.toDp() }
+        val byMeasured = with(density) { naturalSize.value.height.toDp() }
+        maxOf(byConstant, byMeasured)
     }
     // 写入共享单例。
     //
@@ -1138,6 +1426,13 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     //   因此要**重新布局两次**：88dp 兜底 → 假值 → 真值。胶囊 Dialog 是在 pop 那一刻
     //   新挂的，这两次重排正好落在返回动画里，底部卡片跟着上下跳、阴影随之闪 ——
     //   跳过假值后只剩「兜底 88dp → 真值」一次。
+    //
+    // ★ 这道「测量完成前不发布」的闸门**保留**（护栏 `capsuleInset_mustNotPublishBeforeMeasured`
+    //   守的就是它，语义不变：栏还没测出来就别让页面按一个半成品值重排）。
+    //   注意计算式本身已不依赖 naturalSize，闸门现在只起「等栏真的立起来」的时序作用。
+    //   ★ 供数方已补齐（2026-09-24）：`UfiBottomDock` 的根 Column 挂了 `onSizeChanged`
+    //     回写 [LocalCapsuleNaturalSize]。此前只有 `UfiCapsuleTabBar` 写，开关切到通栏后
+    //     这道闸门会永不放行、所有页面停在 88dp 兜底值。
     LaunchedEffect(capsuleBottomTotalDp, naturalSize.value.height) {
         if (naturalSize.value.height > 0) {
             CapsuleInsetHolder.bottomInset.value = capsuleBottomTotalDp
@@ -1196,11 +1491,12 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // flags / gravity / 底边锚定 / 背景 drawable 的「初始 + 重放」，
     // 动画期间完全不触发 WindowManager relayout。
     //
-    // key 里显式带上 capsuleLift / capsuleCorner：metrics 已随二者重算（见其 remember key），
-    // 这里再列一次是为了让「用户拖动滑块 → 窗口属性重新下发」的因果关系在源码中显式可见，
+    // key 里显式带上 capsuleCorner：metrics 已随它重算（见其 remember key），这里再列一次
+    // 是为了让「用户拖动滑块 → 窗口属性重新下发」的因果关系在源码中显式可见，
     // 也防止将来有人重构 metrics 的 key 时静默切断实时联动。
+    // （原来还列了 capsuleLift —— 那是窗口 y 偏移的驱动项，2026-09-24 随 y→0 一并退休。）
     DisposableEffect(
-        view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner, capsuleInteractive
+        view, metrics, crossWindowBlurEnabled, capsuleCorner, capsuleInteractive
     ) {
         // 真模糊已移除，applyWindowBlur 恒返回 false；这里仍传 true，但 enabled=false 时
         // 窗口背景实际走 null 分支：胶囊纯透明、无定形 drawable、无系统 1px 描边，
@@ -1236,12 +1532,12 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
     // show()/attributes 重放覆盖，延迟一拍再写一次才留得住。
     // LaunchedEffect 在 dispose 时自动取消，不会有"清除后又被重新点亮"的竞态。
     // 同样不以展开进度为 key（理由见上方 DisposableEffect）。
-    // 同样带上 capsuleLift / capsuleCorner（理由见上方 DisposableEffect）。
+    // 同样带上 capsuleCorner（理由见上方 DisposableEffect）。
     //
     // ★ 这一拍恰好落在返回动画中段，是「阴影闪烁」最刺眼的一次。现在它只做校验：
     //   属性没被 DialogWrapper 改回去时全部命中相等性守卫，不写、不 relayout。
     LaunchedEffect(
-        view, metrics, crossWindowBlurEnabled, capsuleLift, capsuleCorner, capsuleInteractive
+        view, metrics, crossWindowBlurEnabled, capsuleCorner, capsuleInteractive
     ) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return@LaunchedEffect
         val wantBlur = false
@@ -1265,7 +1561,13 @@ fun CapsuleBlurHost(content: @Composable () -> Unit) {
         LocalUfiCapsuleBlurSubmitted provides blurSubmitted,
         LocalUfiCapsuleBlurCapability provides crossWindowBlurEnabled,
         LocalCapsuleExpandProgress provides expandProgress,
-        LocalCapsuleNaturalSize provides naturalSize
+        LocalCapsuleNaturalSize provides naturalSize,
+        // 下发**已经算好**的那份安全区高度，让通栏低栏自己不必再读一遍 WindowInsets。
+        // 用 compositionLocalOf（非 static）：它每次导航栏模式切换才变一次，
+        // 但变时只需要让真正读它的那一层（栏内容）重组，不该带走整棵子树。
+        LocalCapsuleBottomReserved provides reservedPx,
+        // 搭档读数：系统栏本体高度。两者共用同一个 inset listener，天然同步。
+        LocalCapsuleBottomSystemBar provides bottomInsets.systemBarPx
     ) {
         content()
     }
