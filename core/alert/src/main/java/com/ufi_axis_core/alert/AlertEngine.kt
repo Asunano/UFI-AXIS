@@ -41,7 +41,18 @@ import kotlinx.serialization.Serializable
 class AlertEngine(
     private val alertDao: AlertDao,
     private val webSocketManager: WebSocketManager,
-    private val appSettings: AppSettings
+    private val appSettings: AppSettings,
+    /**
+     * 温度告警的回差带宽，摄氏度。来自 `DeviceTuning.thermalJitterC`（设备插件的实测值）。
+     *
+     * **收一个 Double 而不是收整个 `DeviceTuning`**：`:core:alert` 不该认识插件层，
+     * 更重要的是 `DeviceTuning` 里还躺着 `downloadThrottleWarnC = 75f`，而本类的
+     * `AlertConfig.temperatureCritical` 默认也是 75.0 —— 两者数值相同、语义相反。
+     * 把整个 tuning 递进来，就给「看到两边都是 75 就接线」留了一个静默改坏告警的口子。
+     *
+     * 默认值 = [DEFAULT_TEMP_HYSTERESIS_C]，所以既有测试与任何不传的调用点行为不变。
+     */
+    private val temperatureHysteresisC: Double = DEFAULT_TEMP_HYSTERESIS_C
 ) {
     private val tag = "AlertEngine"
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -417,8 +428,14 @@ class AlertEngine(
 
         // ── 回差（hysteresis）带宽 ──
         // 见 leveledWithHysteresis 的注释：零回差 + 边沿触发 = 阈值附近微抖导致的告警风暴。
-        /** 温度：3°C。Unisoc 热区读数的正常抖动在 1~2°C。 */
-        private const val TEMP_HYSTERESIS_C = 3.0
+        /**
+         * 温度回差的**默认**带宽：3°C。Unisoc 热区读数的正常抖动在 1~2°C。
+         *
+         * 实际生效值由构造参数 [temperatureHysteresisC] 决定（装配层从
+         * `DeviceTuning.thermalJitterC` 取）。这里留一份默认值，是为了让不关心设备差异的
+         * 调用点（测试、独立工具）不必凑一个 tuning 出来。
+         */
+        const val DEFAULT_TEMP_HYSTERESIS_C = 3.0
         /** RSRP：3 dBm。固定位置设备常年在阈值附近 ±2 dBm 波动。 */
         private const val SIGNAL_HYSTERESIS_DBM = 3.0
         /** 电量：3%。充放电边界的读数抖动。 */
@@ -487,7 +504,7 @@ class AlertEngine(
         if (!typeEnabled(cfg, "temperature")) return
         val level = leveledWithHysteresis(
             temperature, cfg.temperatureWarning, cfg.temperatureCritical,
-            TEMP_HYSTERESIS_C, prevLevelOf("temperature")
+            temperatureHysteresisC, prevLevelOf("temperature")
         )
         evaluate("temperature", level, mapOf(
             "warning" to "设备温度偏高: ${temperature}°C",

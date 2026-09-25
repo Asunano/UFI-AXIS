@@ -243,6 +243,46 @@ class AlertEngineDedupTest {
         assertNotNull("恢复后原 critical 行应标记 resolvedAt", crit.resolvedAt)
     }
 
+    // 回差带宽来自构造参数，不是类内写死的常量（2026-09-25 / 计划书阶段 4 的 4.5）。
+    //
+    // 装配层从 `DeviceTuning.thermalJitterC` 取值递进来。**没有这条用例，接线被删掉也不会有
+    // 任何测试变红** —— F50 的 3f 与旧常量 3.0 相同，行为会悄悄退回写死值，而下一台设备
+    // 填的带宽从此被静默忽略。所以这里用「宽带宽 + 阴性对照」把读参数这件事钉住。
+    @Test
+    fun `温度回差带宽由构造参数决定`() = runTest {
+        val wideDao = FakeAlertDao()
+        val wide = AlertEngine(
+            wideDao, ws,
+            AppSettings(ApplicationProvider.getApplicationContext<Application>()),
+            temperatureHysteresisC = 20.0
+        )
+        wide.updateConfig(
+            wide.getConfig().copy(enabled = true, perType = ALERT_TYPES.associateWith { true })
+        )
+        val warning = wide.getConfig().temperatureWarning
+        // 先显式落到 normal：边沿状态会持久化到 SharedPreferences，不先压平就要依赖
+        // 「上一个用例留下了什么」，那是测试之间的隐式耦合。
+        wide.checkTemperature(warning - 30.0)
+        wide.checkTemperature(warning + 1.0)
+        assertEquals("warning", wideDao.rows.first { it.type == "temperature" }.level)
+        // 回落到 warning-5：带宽 20°C 时仍在回差区间内（要低于 warning-20 才算恢复）。
+        wide.checkTemperature(warning - 5.0)
+        assertNull(
+            "带宽 20°C 时 warning-5 仍在回差区间内，不该判成恢复",
+            wideDao.rows.first { it.type == "temperature" }.resolvedAt
+        )
+
+        // 阴性对照：同一串输入喂给默认带宽（3°C）的实例必须判成恢复。
+        // 两边都成立才说明读的是参数而不是常量 —— 只验一边的话，把参数忽略掉也能过。
+        engine.checkTemperature(warning - 30.0)
+        engine.checkTemperature(warning + 1.0)
+        engine.checkTemperature(warning - 5.0)
+        assertNotNull(
+            "默认带宽 3°C 时 warning-5 应判成恢复",
+            dao.rows.first { it.type == "temperature" }.resolvedAt
+        )
+    }
+
     @Test
     fun `ring buffer - trimTo keeps only most recent maxRows`() = runTest {
         // 预置行必须是**已确认**：triggerAlert 会先找同 (type,level) 的未确认行做聚合，

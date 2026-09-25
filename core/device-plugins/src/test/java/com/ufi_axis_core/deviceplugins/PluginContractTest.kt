@@ -27,9 +27,12 @@ import org.junit.Test
  * （`WriteSpec` 或 `smsSpec()`）。防的是「定了不用 / 定了做不到」。
  *
  * **不加反向断言**（「有 `WriteSpec` 就必须有 capability」）：计划书 §6 的 2.7 原来那句
- * 已经作废 —— Capability 是**功能域**（10 个），`SettingKey` 是**写入项**（29 个），
+ * 已经作废 —— Capability 是**功能域**（11 项），`SettingKey` 是**写入项**（29 个），
  * 照反向断言写出来一上线必红，而且它逼着人给每个 key 编一个域，
  * 那才是真正把能力集变成垃圾桶的做法。没有 capability 的写操作照旧不拦。
+ *
+ * 2026-09-24 批 L 起还有一类**纯读侧能力**（[Capability.BATTERY]）：它连写侧判据都没有，
+ * 走 [READ_ONLY_CAPABILITIES] 这张显式白名单，口径见 `Capability` 的文件头。
  *
  * ## 本批仍然刻意**不测**的一条
  *
@@ -58,6 +61,7 @@ class PluginContractTest {
      *
      * [Capability.SMS] **不在这张表里**：短信不走 `SettingKey` + `WriteSpec`
      * （计划书 §11.2），它的判据是 `profile.smsSpec() != null`，单独一条用例。
+     * [READ_ONLY_CAPABILITIES] 里的项也不在这张表里：它们压根没有写侧判据。
      */
     private val writeKeysOf: Map<Capability, List<SettingKey>> = mapOf(
         Capability.SIM_SLOT_SWITCH to listOf(SettingKey.SIM_SLOT),
@@ -70,6 +74,32 @@ class PluginContractTest {
         Capability.PERFORMANCE_MODE to listOf(SettingKey.PERFORMANCE_MODE),
         Capability.TRAFFIC_LIMIT to listOf(SettingKey.TRAFFIC_LIMIT),
     )
+
+    /**
+     * **纯读侧能力的显式白名单**（2026-09-24 批 L）。
+     *
+     * 这里列的项**没有写侧判据**，因此不进 [writeKeysOf]，也不参与
+     * `声明了某个 capability 就必须能在 profile 里找到对应的写能力` 那条断言。
+     * 口径的出处在 `Capability` 的文件头「纯读侧能力」一节。
+     *
+     * ## 为什么是白名单，而不是「找不到写能力就跳过」
+     *
+     * 那条全覆盖断言（`对照表覆盖 Capability 的全部取值`）存在的**唯一**意义是：
+     * 「新加了一个 Capability 却忘了登记它的 `SettingKey`」要立刻红。
+     * 改成「`writeKeysOf` 里找不到就当它是纯读侧、跳过」的话，这个意义会整条消失 ——
+     * 漏登记与纯读侧从此不可区分，那条断言会永远绿。
+     *
+     * 所以纯读侧项必须**在这里显式列名**：加一项纯读侧能力要改这个白名单，
+     * 忘了登记写侧 key 的照旧红。两种情况都需要人来做一次判断，这正是想要的。
+     *
+     * 逐项理由：
+     * - [Capability.BATTERY]：「这个型号有没有电池」是硬件事实，不存在写操作。
+     *   消费方在采集侧（`SystemCollector.getBatteryInfo()` 按它填 `supported` 字段 ——
+     *   2026-09-24 批 M：**读数照系统值下发、不抹成 -1**）、
+     *   调度侧（`DataScheduler` 按它跳过入库与电池告警）与两处读端点，
+     *   不在任何 route 门禁上（那边的登记在 `:core:api` 的 `CapabilityGateTest.exempt`）。
+     */
+    private val READ_ONLY_CAPABILITIES: Set<Capability> = setOf(Capability.BATTERY)
 
     /** 探测指纹的最小样例；单测只关心 `probe()` 读它的方式，字段取值本身不是契约。 */
     private fun probeEnv(
@@ -179,10 +209,10 @@ class PluginContractTest {
     @Test
     fun `每个插件的 capabilities 非空且多次读返回同一个集合`() {
         plugins.forEach { plugin ->
-            // 空能力集 = 这台设备上 10 个域全部回 501、两端全部灰掉。
+            // 空能力集 = 这台设备上所有做门禁的域全部回 501、两端全部灰掉。
             // 真要有这种设备，那它就不该作为插件登记进来。
             assertTrue(
-                "${plugin.id} 的 capabilities 不能为空（空 = 10 个功能域全部回 501）",
+                "${plugin.id} 的 capabilities 不能为空（空 = 所有被门禁的功能域全部回 501）",
                 plugin.capabilities.isNotEmpty(),
             )
             // 与 profile() 那条同一个判据：别在 getter 里 new。
@@ -201,6 +231,12 @@ class PluginContractTest {
         plugins.forEach { plugin ->
             val profile = plugin.profile()
             plugin.capabilities.forEach { cap ->
+                if (cap in READ_ONLY_CAPABILITIES) {
+                    // 纯读侧能力没有写侧判据可查（见 READ_ONLY_CAPABILITIES 的 KDoc）：
+                    // 它声明的是「某个读数有没有意义」，profile 里本来就不该有对应的 WriteSpec。
+                    // 这里放过的是**写侧**判据，不是放过登记 —— 漏登记由下面那条全覆盖用例拦。
+                    return@forEach
+                }
                 if (cap == Capability.SMS) {
                     // 短信不走 SettingKey（§11.2），判据是 smsSpec()
                     assertTrue(
@@ -226,14 +262,29 @@ class PluginContractTest {
 
     @Test
     fun `对照表覆盖 Capability 的全部取值`() {
-        // 这条是给「将来加第 11 个 Capability」的人准备的：
+        // 这条是给「将来加第 12 个 Capability」的人准备的：
         // 不补对照表，上面那条用例只会在**恰好有插件声明了新域**时才红 ——
         // 也就是说漏补可能几个月都不暴露。这里让它立刻红。
-        val covered = writeKeysOf.keys + Capability.SMS
+        //
+        // 覆盖面由三部分**显式**拼出，缺一项就红：
+        //   - writeKeysOf：有 SettingKey 写侧判据的域；
+        //   - Capability.SMS：写侧判据是 smsSpec()，不走 SettingKey（§11.2）；
+        //   - READ_ONLY_CAPABILITIES：纯读侧能力，本来就没有写侧判据（批 L）。
+        // ⚠ 三者都是白名单，**没有**「找不到就跳过」的兜底 —— 那会让本用例永远绿，
+        //   而它存在的唯一意义就是拦住「新加了 capability 却忘了登记写侧判据」。
+        val covered = writeKeysOf.keys + Capability.SMS + READ_ONLY_CAPABILITIES
         assertEquals(
-            "Capability 与对照表必须逐项对齐（缺：${(Capability.entries - covered).map { it.wire }}）",
+            "Capability 与对照表必须逐项对齐（缺：${(Capability.entries - covered).map { it.wire }}）—— " +
+                "有写动作的补进 writeKeysOf，纯读侧的补进 READ_ONLY_CAPABILITIES 并写明理由",
             Capability.entries.toSet(),
             covered,
+        )
+        // 一项不许同时出现在两张表里：那说明「它到底有没有写动作」这个问题没有唯一答案，
+        // 上面那条写侧断言会因为 READ_ONLY 分支先返回而静默失效。
+        val both = writeKeysOf.keys intersect READ_ONLY_CAPABILITIES
+        assertTrue(
+            "这些项同时在 writeKeysOf 与 READ_ONLY_CAPABILITIES 里：${both.map { it.wire }}",
+            both.isEmpty(),
         )
     }
 

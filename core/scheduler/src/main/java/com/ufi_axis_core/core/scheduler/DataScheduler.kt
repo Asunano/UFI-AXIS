@@ -109,6 +109,23 @@ class DataScheduler(
      * 不要在这里现场 `plugin.platform(ctx)` 再造一个 —— 理由见那行的注释。
      */
     private val platform: PlatformAdapter,
+    /**
+     * **这个型号声明了 `Capability.BATTERY` 吗**（2026-09-24 批 M / 方案 D）。
+     * 由装配层从 `runtime.plugin.capabilities` 算出来的**不可变布尔**，
+     * 与递给 `SystemCollector` 的是同一个值（在 `ComponentFactory` 里只算一次）。
+     *
+     * 只有两个用途，都在「写侧」：[collectBattery] 跳过入库与告警、[scanLocalAlerts] 跳过电量告警门。
+     *
+     * ⚠ **它不改变任何对外读数**。`SystemCollector.getBatteryInfo()` 照原样下发系统值
+     * （F50 上 percent 恒为 50，那是个假值但是系统就这么报的），
+     * `_latestBattery` 也照常赋值 —— 两个读端点靠它。
+     * 「读数可信吗」由 battery map 里的 `supported` 字段回答，不由这里回答。
+     *
+     * 为什么写侧仍要跳过：`percent` 恢复系统值只解决**显示**问题，
+     * 「数据库里存一条永远 50% 的假曲线」「电池告警引擎按假值判级别」这两件事还在。
+     * 跳过它们不改变任何一个下发字段，所以与「按系统值显示」的要求不冲突。
+     */
+    private val batteryDeclared: Boolean,
     private val signalClient: GoformSignalClient? = null,
     private val smsClient: GoformSmsClient? = null,
     private val alertEngine: com.ufi_axis_core.alert.AlertEngine? = null,
@@ -136,7 +153,18 @@ class DataScheduler(
      */
     private val deviceProfile: DeviceProfile = ZteGoformProfile,
     /** 条件引擎（自动化规则）：在各采集点并联评估，零额外采集开销。 */
-    private var conditionEngine: ConditionEngine? = null
+    private var conditionEngine: ConditionEngine? = null,
+    /**
+     * 开机预热期的**设备默认值**，毫秒。来自 `DeviceTuning.bootGraceMs`（插件的实测值）。
+     *
+     * 优先级：用户配置（`AppSettings.monitorBootGraceMs`）> 本参数 > [BOOT_GRACE_DEFAULT_MS]。
+     * 换一台启动更快/更慢的设备时，要改的是插件里那个值，不是这里的常量。
+     *
+     * **只收一个 Long 而不是整个 `DeviceTuning`**：那个类里还有三条**下载限速**的温度阈值，
+     * 与本文件里的采集降频阈值（`monitorThermal*` 70/80）是两套不同的东西。
+     * 把整个 tuning 递进来等于把三套同名不同义的阈值摆在同一个作用域里。
+     */
+    private val bootGraceDeviceDefaultMs: Long = BOOT_GRACE_DEFAULT_MS
 ) {
     private val tag = "DataScheduler"
     // 使用 Dispatchers.IO 而非 Default — DataScheduler 所有协程都在做 IO（shell/http/db），
@@ -446,9 +474,10 @@ class DataScheduler(
      * - **不触发告警**（温度 / 联网等边沿触发不会被开机瞬态误触）。
      *
      * 用 `SystemClock.elapsedRealtime()`（单调时钟，从开机起算），不受 NTP 校时影响。
-     * 值来自 `AppSettings.monitorBootGraceMs`；首次启动（旧版 core 无此配置）默认 90s。
+     * 取值优先级：用户配置 `AppSettings.monitorBootGraceMs` > 设备插件的
+     * [bootGraceDeviceDefaultMs]（`DeviceTuning.bootGraceMs`）> [BOOT_GRACE_DEFAULT_MS]。
      */
-    private val bootGraceMs: Long get() = settings?.monitorBootGraceMs ?: BOOT_GRACE_DEFAULT_MS
+    private val bootGraceMs: Long get() = settings?.monitorBootGraceMs ?: bootGraceDeviceDefaultMs
 
     /** grace period 是否已过。**每次采集都查**（elapsedRealtime 很便宜，纳秒级）。 */
     private fun isBootGracePassed(): Boolean =
@@ -615,14 +644,26 @@ class DataScheduler(
         }
 
         try {
-            val battery = systemCollector.getBatteryInfo()
-            val level = (battery["percent"] as? Int)
-                ?: (battery["level"] as? Number)?.toInt()
-            // level < 0 = 这台设备取不到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
-            // 少了这道判断会被当成「电量 -1%」，每 15s 触发一次 critical 低电量告警 ——
-            // collectBattery 早就挡了这个值（见那里的注释），这条路径 2026-09-21 才补上。
-            if (level != null && level >= 0) {
-                engine.checkBattery(level, battery["is_charging"] as? Boolean ?: false)
+            // 未声明 Capability.BATTERY = 这个型号没有电池（2026-09-24 批 M）。
+            // 与 collectBattery 同一个口径：读数照下发，但不拿假值去判告警 ——
+            // F50 恒报 50%，在这里会被当成一个真实电量喂给边沿状态机。
+            // 放在读取之前：连 getBatteryInfo() 都不必调，这条路径 15s 一轮。
+            //
+            // 文案固定、不拼任何变动内容（repeatGate 按 (级别, tag, 完整消息) 折叠，见 AppLogger）。
+            // ⚠ 与 collectBattery 那条**刻意不同文**：两处 tag 都是 DataScheduler，文案一样的话
+            // 折叠键就完全相同、两条会互相顶掉，从日志上看不出另一道门也在生效。
+            if (!batteryDeclared) {
+                AppLogger.w(tag, "scanLocalAlerts: 本机型未声明电池能力，跳过电量告警检查（电量只用于显示）")
+            } else {
+                val battery = systemCollector.getBatteryInfo()
+                val level = (battery["percent"] as? Int)
+                    ?: (battery["level"] as? Number)?.toInt()
+                // level < 0 = 这台设备取不到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
+                // 少了这道判断会被当成「电量 -1%」，每 15s 触发一次 critical 低电量告警 ——
+                // collectBattery 早就挡了这个值（见那里的注释），这条路径 2026-09-21 才补上。
+                if (level != null && level >= 0) {
+                    engine.checkBattery(level, battery["is_charging"] as? Boolean ?: false)
+                }
             }
         } catch (e: Exception) {
             AppLogger.w(tag, "scanLocalAlerts: 电池检查失败: ${e.message}")
@@ -1081,7 +1122,26 @@ class DataScheduler(
     private suspend fun collectBattery() {
         try {
             val batteryInfo = systemCollector.getBatteryInfo()
+            // ⚠ 顺序：**先赋值，再判断跳过**。两个读端点（/api/system/battery 与
+            // /api/dashboard 的 battery 段）优先读这份缓存，不赋值就等于无电池机型上两个端点
+            // 永远拿空 map —— 而批 M 的要求恰恰是「照系统值显示」。
+            // 下面跳过的只有「入库」与「告警」，一个下发字段都不动。
             _latestBattery.value = batteryInfo
+
+            // 未声明 Capability.BATTERY = 这个型号压根没有电池（2026-09-24 批 M）。
+            // 读数照上面下发（F50 上 percent 恒为 50），但那是**假值**：
+            // 存进 battery_history 就是一条永远 50% 的假曲线，喂给告警引擎就是按假值判级别。
+            // 两件事都与显示无关，所以跳过它们不违反「按系统值显示」。
+            //
+            // 为什么不能靠下面那条 level < 0：F50 的 sticky intent 带 level=50/scale=100，
+            // 负值分支一条都不进（这正是批 L 查出来的根因）。判据只能来自设备事实。
+            //
+            // 文案固定、不拼任何变动内容：AppLogger 的 repeatGate 按 (级别, tag, 完整消息) 折叠，
+            // 拼进 percent 之类会变的值就会让这条每次都是"新消息"，折叠失效、日志被刷爆。
+            if (!batteryDeclared) {
+                AppLogger.w(tag, "collectBattery: 本机型未声明电池能力，电量只用于显示，不入库、不告警")
+                return
+            }
 
             // percent < 0 = 这台设备这一轮压根没取到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
             // 既不能入库也不能拿去判告警：入库会在电量曲线上留一段 -1 的深坑，

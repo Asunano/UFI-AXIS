@@ -9,8 +9,9 @@ import org.junit.Test
  * [Capability] 的**对外 wire 契约**守门测试（计划书 §7 的 3.7）。
  *
  * 口径与 `DeviceRuntimeTest` 里 `Selection.wire` 那条完全一致：守的是**对外字符串**，
- * 不是内部枚举名。这 10 个取值会出现在 `GET /api/device/capabilities` 的 `capabilities`
- * 数组里，app 与 web 照它决定「开关能不能点」—— 枚举名怎么重构都无所谓，
+ * 不是内部枚举名。这 11 个取值**可能**出现在 `GET /api/device/capabilities` 的 `capabilities`
+ * 数组里（实际下发哪几个取决于当前插件声明了哪几项），app 与 web 照它决定「开关能不能点」——
+ * 枚举名怎么重构都无所谓，
  * 但这些字符串一动就是一次接口变更（且旧客户端只会静默把它当成不认识的能力忽略）。
  *
  * 期望值**逐个写死**，刻意不写 `name.lowercase()` —— 那样枚举改名时期望值会跟着一起变，
@@ -25,7 +26,7 @@ class CapabilityWireTest {
     private val why = "这是 /api/device/capabilities 的对外取值，改它等于改 API，app / web 都要同步"
 
     @Test
-    fun `十个 wire 取值写死不许动`() {
+    fun `十一个 wire 取值写死不许动`() {
         assertEquals(why, "sms", Capability.SMS.wire)
         assertEquals(why, "sim_slot_switch", Capability.SIM_SLOT_SWITCH.wire)
         assertEquals(why, "band_lock", Capability.BAND_LOCK.wire)
@@ -36,15 +37,23 @@ class CapabilityWireTest {
         assertEquals(why, "fota", Capability.FOTA.wire)
         assertEquals(why, "performance_mode", Capability.PERFORMANCE_MODE.wire)
         assertEquals(why, "traffic_limit", Capability.TRAFFIC_LIMIT.wire)
+        // 3B（批 L）新增的纯读侧项。它不进任何插件的默认声明（F50 无电池），
+        // 但 wire 名一旦下发过就同样是冻结区的一部分。
+        assertEquals(why, "battery", Capability.BATTERY.wire)
     }
 
     @Test
-    fun `第一批的值域大小固定为 10`() {
+    fun `值域大小固定为 11`() {
         // 值域大小本身也是契约：加一项请连 app / web 一起改（冻结区只增不改，见 §11.4）。
         // 这条红了不代表做错了 —— 它是提醒「你刚扩了一次对外值域」。
+        //
+        // 2026-09-24（批 L）10 → 11：加了 BATTERY。**这次是刻意改本断言** ——
+        // 它存在的全部意义就是「值域一变必须有人显式来改测试」，改它即是完成了那道确认。
+        // ⚠ 值域 11 项不等于 /api/device/capabilities 会下发 11 个：
+        //   那个数组只含当前插件**声明了**的项，F50 不声明 BATTERY，所以仍是 10 个。
         assertEquals(
             "$why（当前：${Capability.entries.map { it.wire }}）",
-            10,
+            11,
             Capability.entries.size,
         )
     }

@@ -24,6 +24,8 @@ import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -400,6 +402,21 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
     val lteColor = BandLte
     val nrColor = BandNr
 
+    // 设备能力集（批 O / 3.5）：core 在 `POST /api/network/band` 上有一处 route 门禁
+    // （`NetworkRoutes.kt:139`），lock 与 unlock 都走这一个端点，所以一处就覆盖了整个域。
+    // 于是这里只灰「锁定所选」「全部解锁」两个按钮。
+    //
+    // 状态卡与频段选择区**刻意不灰**：它们是读侧 + 纯本地选择，没有门禁 ——
+    // 「不支持锁频段」不等于「不能看当前锁了哪些」。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可点。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val bandLockSupported = capabilities.supports(Capability.BAND_LOCK)
+
+    // 本段被 BandLockDialog 复用，那条路径未必走过 loadNetworkAll，所以自己拉一次。
+    // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进来都发请求。
+    LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
+
     LaunchedEffect(state.bandStatus) {
         // 逗号串 → Set<Int> 的解析在 BandStatusResponse 里（"0"/"all" = 未锁定）
         selectedLte = state.bandStatus?.lteBands ?: emptySet()
@@ -409,6 +426,12 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
     val isFullyUnlocked = selectedLte.isEmpty() && selectedNr.isEmpty()
 
     Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
+        // 置灰原因（只在不支持时出现）。本段有 2 个写按钮，原因只说一次。
+        // 口径：只说「设备不支持」，不说"功能未开启"或"权限不足" —— 这台设备压根没有这个
+        // 能力，没地方可开，那两句会把用户引向一场白费的寻找。
+        if (!bandLockSupported) {
+            UfiNoticeCard(message = deviceUnsupportedNote("频段锁定"))
+        }
         // ── 状态卡 ──
         Box(
             Modifier
@@ -505,6 +528,7 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
                             if (selectedNr.isNotEmpty()) selectedNr.joinToString(",") else null
                         )
                     },
+                    enabled = bandLockSupported,
                     modifier = Modifier.weight(1f)
                 )
                 UfiButton(
@@ -514,6 +538,7 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
                         viewModel.network.lockBands(null, null)
                         selectedLte = emptySet(); selectedNr = emptySet()
                     },
+                    enabled = bandLockSupported,
                     modifier = Modifier.weight(1f)
                 )
             }

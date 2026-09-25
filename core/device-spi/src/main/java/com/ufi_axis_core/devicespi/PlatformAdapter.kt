@@ -13,7 +13,7 @@ package com.ufi_axis_core.devicespi
  *
  * ## 本接口刻意**没有**的两个成员
  *
- * 计划书 §3.2 的骨架里还有两个，2026-09-24 阶段 4 开工前的实测把它们否掉 / 推后了：
+ * 计划书 §3.2 的骨架里还有两个，2026-09-24 阶段 4 开工前的实测把它们**都否掉了**：
  *
  * - **`privilegeEscalation(): PrivilegeStrategy?` —— 不做（§8 裁决 ④）**。
  *   实测本仓的提权只有**一条**实际路径：ADB 自连 `localhost:5555`（uid 2000），
@@ -22,12 +22,27 @@ package com.ufi_axis_core.devicespi
  *   也就是说「`SambaPreexecStrategy` + `AdbOnlyStrategy` 二选一」是为一条不存在的路径造抽象 ——
  *   一个永远只有单一实现的策略接口，只会让读代码的人以为这里真有选择。
  *   等 Samba 那条路径真的被接上（登记在 §15 的 P1-38）再谈。
- * - **`readBattery(): BatteryReading?` —— 推后到 3B**。
- *   它存在的意义是驱动 `Capability.BATTERY`，而 `BATTERY` **不在阶段 3 已落地的 10 项里**
- *   （3A 只定了 SMS / SIM_SLOT_SWITCH / BAND_LOCK / CELL_LOCK / NETWORK_MODE /
- *   SAMBA / USB_DEBUG / FOTA / PERFORMANCE_MODE / TRAFFIC_LIMIT）。
- *   先加读法、能力集里却没有对应项，等于加一个没人消费的成员。
- *   `BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 三项由本接口推导是 **3.9（3B）**，届时一起加。
+ * - **`readBattery(): BatteryReading?` —— 不做（2026-09-24 批 L 裁决，替掉批 F 的「推后到 3B」）**。
+ *   3B 已经落地：`Capability.BATTERY` 加了，但**电量读法不进本接口**，理由两条：
+ *   1. **主路径不是平台知识**。电量的第一取值来源是 Android 自己的
+ *      `BatteryManager`（sticky `ACTION_BATTERY_CHANGED` 的 `EXTRA_LEVEL` / `EXTRA_SCALE`，
+ *      再兜 `BATTERY_PROPERTY_CAPACITY`），任何 Android 设备上都一样 ——
+ *      本接口管的是「绕过后台、跟**本机平台**打交道」那几件事，framework 通用 API 不属于这一类。
+ *      只有 `/sys/class/power_supply` 那一层兜底算平台细节，而现有实现已经**按 `type` 文件遍历**、
+ *      不硬编码节点名，本来就不需要按机型分支。
+ *   2. **会给实现引入第一个 `Context` 依赖**。`BatteryManager` 要 `Context`，
+ *      而今天 `SprdPlatform` 只需要 `ProcessBuilder` 与 `/sys` 文件读、构造是零参的
+ *      （`ZteF50Plugin.platform(ctx)` 拿到 `ctx` 却刻意没往下传）。
+ *      为一件不是平台知识的事把 `Context` 递进平台实现，是把依赖面白扩一圈。
+ *
+ *   `Capability.BATTERY` 的驱动方式因此换成了**采集侧按能力抹值**：
+ *   `SystemCollector` 收一个 `batterySupported: Boolean`，为 false 时把 `percent` / `level`
+ *   抹成 -1，让下游既有的负值分支自然生效。判据（有没有电池）是**插件声明的设备事实**，
+ *   不需要一次真实读取来产生 —— 这也正是 F50 那台机器的教训：
+ *   它**读得到**一个恒为 50 的假值，任何「读一次看能不能读到」的设计在它上面都会得出错误结论。
+ *
+ *   `ROOT_SHELL` / `AT_CHANNEL` 两项也**不由本接口推导**（那是运行时状态，不是设备事实），
+ *   经过记在 `Capability` 的文件头。
  */
 interface PlatformAdapter {
 

@@ -69,6 +69,8 @@ import com.ufi_axis.ui.theme.UfiWeight
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis.ui.navigation.LocalPendingSmsPhone
 import com.ufi_axis.ui.navigation.Routes
 import java.text.SimpleDateFormat
@@ -94,6 +96,20 @@ private const val CONTACTS_AUTO_REFRESH_MS = 10_000L
 fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val palette = LocalResolvedPalette.current
     val toolsState by viewModel.toolsState.collectAsState()
+
+    // 设备能力集（批 O / 3.5）：core 只在 `POST /api/sms/send` 上有门禁
+    // （`RootSmsRoutes.kt:103`，判据是 profile.smsSpec()，短信不走 SettingKey）。
+    // 那是全仓唯一一条「往外发短信」的入口，所以本页只灰**发信**入口：
+    // 新建短信 FAB + 对话里的输入栏 + 长按菜单的「重新发送」。
+    //
+    // 信箱的读 / 删 / 标已读 / 验证码 / 黑名单 / 转发规则**一律不灰** —— 它们不在这个域里，
+    // 也没有门禁。「这台设备不能发短信」不等于「不能看收到的短信」。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可发。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val smsSupported = capabilities.supports(Capability.SMS)
+    // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+    LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
 
     // ── lifecycle 门控（2026-09-21）──
     // 不轮询时在后台白打 HTTP；本页不是底部 Tab 页，不需要 pageForeground。
@@ -389,6 +405,16 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                             badges = listOf(null, toolsState.verificationCodesUnread)
                         )
 
+                        // 置灰原因（只在不支持时出现，且只在「消息」页签 —— 「通知」页签里
+                        // 全是本地解析出来的验证码，跟能不能发短信无关）。
+                        // 只说「设备不支持」：这台设备压根没有发信能力，没有任何地方可开。
+                        if (!smsSupported && toolsState.smsTab == 0) {
+                            UfiNoticeCard(
+                                message = deviceUnsupportedNote("发送短信"),
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                            )
+                        }
+
                         // 内容区。用 BoxWithConstraints 是为了让 FAB 的边距按**实际可用区域**
                         // 取百分比（见下方 fabEndPad / fabBottomPad），而不是写死 dp ——
                         // 写死值在小屏上顶边、在平板上又离内容太远。
@@ -498,6 +524,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     icon = Icons.Default.ChatBubbleOutline,
                                     onClick = { isComposing = true },
                                     contentDescription = "新建短信",
+                                    enabled = smsSupported,
                                     modifier = Modifier.align(Alignment.BottomEnd)
                                         .padding(end = fabEndPad, bottom = fabBottomPad)
                                 )
@@ -1295,6 +1322,9 @@ private fun SmsConversationView(
         ChatInputBar(
             value = messageText,
             onValueChange = { messageText = it },
+            // 发信能力（批 O / 3.5）。判据与 SmsScreen 那处同源，都读 network.capabilityState。
+            enabled = viewModel.network.capabilityState.collectAsState().value
+                .supports(Capability.SMS),
             onSend = {
                 if (messageText.isNotBlank()) {
                     viewModel.tools.sendSms(phone, messageText)
@@ -1563,6 +1593,10 @@ private fun ChatBubbleRow(
                     )
                 }
 
+                // 「重新发送」也走 POST /api/sms/send，所以同样受 Capability.SMS 门禁。
+                // 判据必须取在这里而不是下面的 buildList 里 —— 那个 lambda 不是 @Composable，
+                // collectAsState() 放进去编译不过。
+                val smsSupported by viewModel.network.capabilityState.collectAsState()
                 UfiPopupMenu(
                     visible = showActions,
                     onDismiss = { showActions = false },
@@ -1581,7 +1615,10 @@ private fun ChatBubbleRow(
                                 }
                             )
                         )
-                        if (!isReceived) {
+                        // 不支持发信时**整项不加**，而不是灰着显示：长按菜单不是设置面板，
+                        // 没有放原因文案的位置，灰掉一行却不说为什么只会让人反复戳。
+                        // 原因由对话输入栏的占位文字与消息列表页顶那张说明卡承担。
+                        if (!isReceived && smsSupported.supports(Capability.SMS)) {
                             add(
                                 UfiPopupOption(
                                     id = "resend",
@@ -1718,7 +1755,7 @@ private fun ChatInputBar(
                     Box {
                         if (value.isEmpty()) {
                             Text(
-                                text = "输入短信\u2026",
+                                text = if (enabled) "输入短信\u2026" else deviceUnsupportedNote("发送短信"),
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = palette.textSecondary
                             )

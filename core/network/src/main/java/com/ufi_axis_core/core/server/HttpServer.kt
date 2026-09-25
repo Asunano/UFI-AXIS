@@ -595,16 +595,19 @@ class HttpServer(
                     // - selection：这次选型是怎么定下来的，值域固定四个小写 snake：
                     //   configured（配置项命中）/ probed（probe 打分选出）/ default（没配，用注册表默认）/
                     //   fallback（配了但匹配不上，已回落）。
-                    //   probed 在当前版本**不会出现**（probe 选型是计划书阶段 5），但值域现在就定稳了 ——
-                    //   对外值域二次扩张要两端一起改，所以客户端请按四个值实现。
+                    //   probed 自 2026-09-24（probe 选型落地）起是**零配置部署的常态取值** ——
+                    //   没填 device_profile_id、后台可达、有插件认领时就是它；
+                    //   同样零配置但没人认领（比如后台探不通）时才回落 default。
+                    //   也就是说 selection 现在隐含了「探测通不通」这一层信息。
+                    //   ⚠ 早先这里写的是「probed 当前版本不会出现」，那是 probe 上线前的描述，已作废。
                     //
-                    // ⚠ 已知不一致（**本批刻意不修**）：selection 与 status 可以互相矛盾。
+                    // ⚠ 已知不一致（**刻意不修**）：selection 与 status 可以互相矛盾。
                     // 典型场景：device_profile_id 填的是 plugin id（zte-f50），选型命中 →
                     // selection=configured；但 active 走的是 profile id（zte-goform），于是
                     // configured != active，status 按上面那个 when 判成 fallback，看上去像「型号填错了」。
                     // status 的这套判据是既有行为，改它就是行为变更，所以这里只如实下发 selection。
-                    // 显示口径（status 与 selection 谁说了算、app/web 的诊断页怎么写）统一到阶段 3
-                    // 连 UI 一起改；在那之前**以 selection 为准**看选型结果。
+                    // 显示口径（status 与 selection 谁说了算、app/web 的诊断页怎么写）留给 UI 那一批；
+                    // 在那之前**以 selection 为准**看选型结果。
                     val configuredProfile = ctx.settings.deviceProfileId
                     val activeProfile = ctx.dataHub.deviceProfileId
                     diag["device_profile"] = mapOf(

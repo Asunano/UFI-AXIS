@@ -161,6 +161,20 @@ class NetworkModule(
     private val _pairingState = MutableStateFlow(PairingState())
     val pairingState: StateFlow<PairingState> = _pairingState.asStateFlow()
 
+    // ── 设备能力集（2026-09-25 批 O，计划书 §7 阶段 3 的 3.5）───────────────────
+    //
+    // 放在本 module 而不是 MainViewModel：10 个功能域里有 8 个的写操作就在这个文件里
+    // （FOTA / Samba / 性能模式 / 制式 / 承载偏好 / 锁频 / 锁站 / USB 调试），
+    // 门禁判据跟写操作放在一起才不会出现"能力集在 A 处、开关在 B 处"的两地维护。
+    //
+    // 初值是 UNKNOWN（= 全部支持），所以在拿到能力集之前 UI 与 3.5 之前一字不差。
+    private val _capabilityState = MutableStateFlow(DeviceCapabilityState.UNKNOWN)
+    val capabilityState: StateFlow<DeviceCapabilityState> = _capabilityState.asStateFlow()
+
+    // 能力集请求的在途协程。用来保证同一时刻只有一个请求 ——
+    // 拉失败后允许下一次调用重试，没有这个闸门的话四个页面同时进来就会打四发。
+    private var capabilityJob: Job? = null
+
     private var refreshJob: Job? = null
 
     /**
@@ -230,6 +244,10 @@ class NetworkModule(
      * 其余 5 项任一失败时字段保持 null，页面那条"出错 5s 后重试"的效应会补。
      */
     fun loadNetworkAll(force: Boolean = false, silent: Boolean = false) {
+        // 能力集借这一趟一起预热（它自带"本进程只成功拉一次"的闸门，所以摆在新鲜度门之前
+        // 也不会多发请求）。放在这里的好处是：用户真正走到设置页时能力集已经在手，
+        // 不会出现"页面先按全部支持画出来、半秒后某个开关忽然灰掉"的闪动。
+        loadDeviceCapabilities()
         if (!force &&
             _networkState.value.signalInfo != null &&
             isForegroundDataFresh(
@@ -258,7 +276,53 @@ class NetworkModule(
         networkAllSuccessElapsed = 0L
         wifiSuccessElapsed = 0L
         serviceStatusSuccessElapsed = 0L
+        // 能力集跟着一起丢：它是**上一台设备**的静态快照，换设备 / 换地址后必须重取。
+        //
+        // 复位成 UNKNOWN 而不是清成"空集合 + loaded=true"：后者会被判成「全部不支持」，
+        // 于是重连的那一瞬间整页控件全灰。降级方向只有一个 —— 不确定时按全部支持。
+        capabilityJob?.cancel()
+        _capabilityState.value = DeviceCapabilityState.UNKNOWN
     }
+
+    // 拉一次设备能力集（`GET /api/device/capabilities`）。
+    //
+    // ── 缓存策略：进程生命周期一次 ──
+    // core 侧这份取值是**装配组件图时算一次的静态快照**，同一个 core 进程里永不变化，
+    // 所以 app 侧只要成功拿到过（[DeviceCapabilityState.loaded]）就不再重复请求 ——
+    // 判据写在 state 自己身上，不额外维护第二个布尔量，免得两者漂移。
+    //
+    // ── 刷新时机 ──
+    // 挂在 [resetFreshness] 上，而不是某个页面的 onResume：`resetFreshness` 正是
+    // MainViewModel 在 `prepareDeviceSwitch()`（换设备）与
+    // `onServerEndpointChanged(hostChanged = true)`（换地址）里调的那一个，
+    // 语义恰好等于"现在对面可能是另一台设备了"。选它等于复用已有的唯一判据，
+    // 不必再造一条"什么算重连"的规则。
+    //
+    // ⚠ ── 拉取失败必须当成「全部支持」 ──
+    // catch 里**只记日志、不写任何错误 state**，`_capabilityState` 保持 UNKNOWN，
+    // 而 UNKNOWN 的判定结果是全部支持（见 DeviceCapabilityState）。
+    // 绝不许把失败当成「全部不支持」：那会让一次网络抖动把整个设置页灰掉，
+    // 并且把「通道不可用」（503，可重试）冒充成「设备不支持」（501，不可恢复）。
+    // 同理不冒全局错误横幅：这条请求是后台预热，用户没在等它的结果。
+    //
+    // @param force 无视已缓存结果重新拉。目前无调用方，留给将来"手动重新识别设备"用。
+    fun loadDeviceCapabilities(force: Boolean = false) {
+        if (!force && _capabilityState.value.loaded) return
+        if (capabilityJob?.isActive == true) return
+        capabilityJob = scope.launch {
+            try {
+                val resp = api.getDeviceCapabilities()
+                _capabilityState.value = DeviceCapabilityState.fromWires(resp.capabilities)
+                DebugLog.d(
+                    "Network",
+                    "设备能力集: plugin=${resp.plugin_id} 支持 ${resp.capabilities.size} 项"
+                )
+            } catch (e: Exception) {
+                DebugLog.w("Network", "设备能力集拉取失败，按「全部支持」处理: ${e.message}")
+            }
+        }
+    }
+
 
     fun refreshNetwork(silent: Boolean = false) {
         refreshJob?.cancel()

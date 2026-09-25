@@ -13,6 +13,7 @@ import com.ufi_axis_core.api.websocket.WebSocketPushService
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.goform.*
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
@@ -193,7 +194,29 @@ object ComponentFactory {
         // ── 2-3. 采集器子图（AT 通道 + system/telephony 采集器） ──
         // probeEnv 传的是上面那份**共享的**指纹：ATChannel 的平台判定（4.6）现在从它派生，
         // 不再自己读 /proc/cpuinfo。
-        val collector = buildCollectorGraph(context, platform.atTransports(), probeEnv)
+        //
+        // batteryDeclared（2026-09-24 批 M）：把「这个型号声明了 Capability.BATTERY 吗」这个
+        // **设备事实**在这里折成一个 Boolean 再往下递。装配层是唯一知道「当前是哪台设备」的地方，
+        // 下游只该拿到结论、不该拿到选型对象（口径同批 B2）。
+        //
+        // ⚠ 算**一次**、递给两个消费方（SystemCollector 与 DataScheduler），刻意不在两处各算一遍：
+        // 两处各算就有「口径漂移」的空间（谁哪天改成 `!= null` 或多判一项都不会有人发现），
+        // 而这两处必须永远是同一个答案 —— 一处填 `supported` 字段、另一处据它跳过入库与告警。
+        //
+        // ⚠ 它**不参与任何读数计算**。批 L 那个同源的 `batterySupported` 会把 percent 抹成 -1，
+        // 用户已推翻（改方案 D）：读数照系统值下发，可信度由 `supported` 字段单独表达。
+        val batteryDeclared = Capability.BATTERY in runtime.plugin.capabilities
+
+        // 设备调优值（阶段 4 的 4.5）。整图只取一份，口径同 `val platform`：
+        // `tuning()` 是插件上的函数，多调几次就多造几个对象，也就多了「两处拿到的不是同一份」
+        // 这种只在换插件时才暴露的错。三个消费方（下载限速 / 告警回差 / 预热期）都从这一份取。
+        val tuning = runtime.plugin.tuning()
+        val collector = buildCollectorGraph(
+            context,
+            platform.atTransports(),
+            probeEnv,
+            batteryDeclared = batteryDeclared
+        )
 
         // ── 4-5. 网络子图（Goform 客户端层 + 网络/ SIM 控制器） ──
         // deviceIp 由 [build] 算好传进来（`goformIp` 空则回落网关）：LD 探测与传输层必须是
@@ -234,7 +257,12 @@ object ComponentFactory {
         // ── 7. 告警引擎 ──
         // 告警系统通知统一由手机端 NotificationCenter 负责，device 端仅入库 + 广播（避免双进程重复弹通知）
         // 投递（推送 + 邮件）在下面统一 attachNotifier，引擎本身不再持有 pushService。
-        val alert = AlertEngine(database.alertDao(), wsManager, settings)
+        // 回差带宽（4.5）：从插件的 tuning 取，不再用 AlertEngine 自己的私有常量。
+        // F50 的 thermalJitterC = 3f 与原常量 3.0 相同，所以本次接线对现有行为零影响。
+        val alert = AlertEngine(
+            database.alertDao(), wsManager, settings,
+            temperatureHysteresisC = tuning.thermalJitterC.toDouble()
+        )
         AppLogger.i(TAG, "[7] Alert engine initialized")
 
         // ── 8. 共享组件 ──
@@ -269,6 +297,9 @@ object ComponentFactory {
             // 热区读数（4.3 / 批 I）：`readMaxCpuTemp()` 已改为调 platform.readTemperature()。
             // 传的是上面那份**共享实例**，不是现场新造的（见 `val platform` 那行的注释）。
             platform = platform,
+            // 电池能力（2026-09-24 批 M）：与上面递给 SystemCollector 的是**同一个** val，
+            // 不在这里重算。scheduler 只用它决定「要不要入库 / 要不要告警」，不影响任何下发读数。
+            batteryDeclared = batteryDeclared,
             signalClient = network.signalClient,
             smsClient = network.smsClient,
             alertEngine = alert,
@@ -281,7 +312,10 @@ object ComponentFactory {
             ruleStore = smsRuleStore,
             // SignalCollector 的字段映射表。它不吃"关归一化"那个开关（第 1 层就是归一化），
             // 所以关闭时也回落非空那份（命令表口径，来自选中的插件）。
-            deviceProfile = runtime.commandProfile
+            deviceProfile = runtime.commandProfile,
+            // 预热期的设备默认值（4.5）。用户在 AppSettings 里配过就以用户为准，这只是兜底口径。
+            // F50 的 bootGraceMs = 90_000L 与 DataScheduler 原常量相同，本次接线对现有行为零影响。
+            bootGraceDeviceDefaultMs = tuning.bootGraceMs
         )
         AppLogger.i(TAG, "[9] DataScheduler initialized")
 
@@ -305,7 +339,7 @@ object ComponentFactory {
             networkClient = network.networkClient,
             smsRuleStore = smsRuleStore,
             platform = platform,
-            tuning = runtime.plugin.tuning()
+            tuning = tuning
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
@@ -808,11 +842,17 @@ object ComponentFactory {
      * `ServiceCallAtExecutor` 现在住在 `:core:device-plugins` 的 `platform/sprd/`。
      *
      * [probeEnv] 同理（阶段 4 的 4.6）：`ATChannel` 不再自己读 `/proc/cpuinfo`，
-     * 平台判定从这份**组件图唯一的**指纹派生。 */
+     * 平台判定从这份**组件图唯一的**指纹派生。
+     *
+     * [batteryDeclared] 是 `Capability.BATTERY` 折出来的**一个不可变值**（2026-09-24 批 M）：
+     * 递 Boolean 而不是整个 capabilities 集合 —— 采集器不该认识能力集语义，
+     * 否则「往集合里加一项」就会变成「去采集器里加一个分支」。
+     * `SystemCollector` 只用它填 battery map 的 `supported` 字段，**不参与任何读数计算**。 */
     private suspend fun buildCollectorGraph(
         context: Context,
         atTransports: List<AtTransport>,
-        probeEnv: ProbeEnv
+        probeEnv: ProbeEnv,
+        batteryDeclared: Boolean
     ): CollectorGraph {
         val atChannel = ATChannel()
         val atConnected = try {
@@ -822,7 +862,7 @@ object ComponentFactory {
         }
         AppLogger.i(TAG, "[2] AT channel: ${if (atConnected) "connected" else "not available"}")
 
-        val systemCollector = SystemCollector(context)
+        val systemCollector = SystemCollector(context, batteryDeclared = batteryDeclared)
         val telephonyCollector = TelephonyCollector(context)
         AppLogger.i(TAG, "[3] Collectors initialized")
 

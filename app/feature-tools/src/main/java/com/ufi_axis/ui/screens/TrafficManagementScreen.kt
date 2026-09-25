@@ -25,11 +25,14 @@ import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.*
-// 本文件同时 star-import 了 ui.components.common 与 ui.theme，两边都有 `UfiMotion`
-// （前者是 P3a 留下的 @Deprecated 转发壳），星号导入同名会歧义。显式导入指向正本。
-import com.ufi_axis.ui.theme.UfiMotion
+// 2026-09-25：原先这里有一行 `import com.ufi_axis.ui.theme.UfiMotion`，用来消解
+// ui.components.common（P3a 留下的 @Deprecated 转发壳）与 ui.theme 两个星号导入的同名歧义。
+// UfiMotion 的唯一使用点（限额弹窗的两处 AnimatedVisibility）已搬去 UfiDataLimitDialog，
+// 本文件不再引用它，歧义也就不存在了 —— 显式导入随之删除。
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 import kotlin.math.roundToInt
 
 // 2026-09-05：私有 `Color.shade` 已删除 —— 与 HomeConnectionCard / NetworkScreen 是逐字节
@@ -45,7 +48,21 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
 
     LaunchedEffect(Unit) {
         viewModel.tools.loadTrafficLimit()
+        // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+        viewModel.network.loadDeviceCapabilities()
     }
+
+    // 设备能力集（批 O / 3.5）：core 在 `POST /api/device/data-limit` 上有一处门禁
+    // （`DeviceRoutes.kt:665`），那是限额域的唯一写入口，`saveDataLimit` 的三个调用点
+    // （本页的总开关、本页的限额弹窗、首页 hero 卡的同一个弹窗）最终都走它。
+    //
+    // 本页只灰**会调 saveDataLimit** 的入口。刻意不灰的：
+    // - 「流量校准」→ `POST /api/device/traffic-calibrate`，不在这个域里、没有门禁；
+    // - 「流量历史」与上面三张统计卡 → 纯读侧，「不支持设限额」不等于「不能看用了多少」。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可设。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val limitSupported = capabilities.supports(Capability.TRAFFIC_LIMIT)
 
     val cfg = state.limitConfig
 
@@ -265,7 +282,10 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 UfiSettingsGroup {
                     UfiSettingsToggle(
                         title = "启用流量限额",
-                        description = if (enabled) "超出限额将触发告警 · ${limitSize}${limitUnit} / 月" else "已关闭",
+                        // 置灰时保留原说明、原因另起一行追加。checked 仍是设备真值 ——
+                        // 「不支持」不等于「关着」，把它画成关就是假开关。
+                        description = (if (enabled) "超出限额将触发告警 · ${limitSize}${limitUnit} / 月" else "已关闭") +
+                            (if (limitSupported) "" else "\n" + deviceUnsupportedNote("流量限额")),
                         checked = enabled,
                         onCheckedChange = {
                             enabled = it
@@ -277,7 +297,8 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                                 autoClear = autoClear,
                                 clearDate = clearDate
                             )
-                        }
+                        },
+                        enabled = limitSupported
                     )
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
@@ -285,7 +306,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                     UfiSettingsValue(
                         title = "告警阈值",
                         value = "${alertPercent}%",
-                        onClick = if (enabled) { { showLimitDialog = true } } else null
+                        onClick = if (enabled && limitSupported) { { showLimitDialog = true } } else null
                     )
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
@@ -293,7 +314,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                     UfiSettingsValue(
                         title = "自动清零",
                         value = if (autoClear) "${clearDate}日" else "手动",
-                        onClick = if (enabled) { { showLimitDialog = true } } else null
+                        onClick = if (enabled && limitSupported) { { showLimitDialog = true } } else null
                     )
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
@@ -315,6 +336,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                             variant = UfiButtonVariant.Secondary,
                             text = "限额设置",
                             onClick = { showLimitDialog = true },
+                            enabled = limitSupported,
                             modifier = Modifier.weight(1f)
                         )
                         UfiButton(

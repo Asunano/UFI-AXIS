@@ -20,13 +20,21 @@ fun UfiFloatingActionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     contentDescription: String? = null,
-    containerColor: androidx.compose.ui.graphics.Color? = null
+    containerColor: androidx.compose.ui.graphics.Color? = null,
+    // 2026-09-25（批 O / 设备能力集 3.5）：`false` 时点击被吞掉、整钮按 DISABLED_ALPHA 淡化。
+    //
+    // ⚠ M3 的 `FloatingActionButton` **没有** `enabled` 参数（设计上 FAB 的主操作
+    // 理应始终可用），所以这里只能自己实现：onClick 换成空 lambda + 底色/图标降透明度。
+    // 之所以不改成「不显示」：FAB 消失会让用户以为功能被挪走了、去别处找；
+    // 淡化留在原位才表达得出"这台设备没有这个能力"。原因文案由调用页另行给出
+    // （本组件只有一个圆钮，没有放文字的位置）。
+    enabled: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
     val interactionSource = remember { MutableInteractionSource() }
 
     FloatingActionButton(
-        onClick = onClick,
+        onClick = { if (enabled) onClick() },
         // 2026-09-04（P2d）：0.92 → UfiMotion.PressScale.Fab（值不变）。FAB 是全站唯一的浮起
         // 圆钮、面积最小，按"面积越小缩得越多"的规则占最深那一档，配 controlPop 的回弹。
         //
@@ -42,8 +50,9 @@ fun UfiFloatingActionButton(
             spec = UfiMotion.controlPop()
         ),
         shape = UfiCardDefaults.largeSurfaceShape,
-        containerColor = containerColor ?: palette.accent,
-        contentColor = palette.onAccent,
+        containerColor = (containerColor ?: palette.accent)
+            .copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
+        contentColor = palette.onAccent.copy(alpha = if (enabled) 1f else DISABLED_ALPHA),
         interactionSource = interactionSource
     ) {
         Icon(
@@ -53,3 +62,9 @@ fun UfiFloatingActionButton(
         )
     }
 }
+
+/**
+ * FAB 禁用态的透明度。取 0.4f 与 `UfiButton` 的 `SUBTLE_DISABLED_CONTENT_ALPHA` 同值 ——
+ * 同一套界面里"不可用"的浓淡只该有一种，两处数值分叉的话用户会以为是两种不同的状态。
+ */
+private const val DISABLED_ALPHA = 0.4f

@@ -46,6 +46,8 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
 import androidx.navigation.NavHostController
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 
 /**
  * 设备控制页（v4 2026-08-23：开关型入口右侧 Switch，去弹窗）
@@ -67,6 +69,15 @@ fun DeviceControlScreen(
 ) {
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
 
+    // 设备能力集（批 O / 3.5）：本页 4 项里只有「性能模式」进了 Capability 枚举
+    // （core 的 `/api/device/performance` 有 route 门禁）。指示灯 / WiFi 休眠 / 定时重启
+    // 不在 10 个域里，按口径**照旧不拦**，这一批一个字都不改。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，全部可点。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val perfSupported = capabilities.supports(Capability.PERFORMANCE_MODE)
+
+
     // Device settings state
     var ledOn by remember { mutableStateOf(true) }
     var perfOn by remember { mutableStateOf(false) }
@@ -78,6 +89,8 @@ fun DeviceControlScreen(
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(300)
         viewModel.network.loadDeviceSettings()
+        // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+        viewModel.network.loadDeviceCapabilities()
     }
 
     LaunchedEffect(deviceSettingsState.settings) {
@@ -126,12 +139,20 @@ fun DeviceControlScreen(
                     UfiSettingsToggle(
                         icon = AppIconPerformance,
                         title = "性能模式",
-                        description = if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节",
+                        // 置灰时把原说明保留、原因另起一行追加。checked 仍是设备真值 ——
+                        // 「不支持」不等于「关着」，把它显示成关就是假开关。
+                        description = if (perfSupported) {
+                            if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节"
+                        } else {
+                            (if (perfOn) "高性能 · CPU 最大频率" else "均衡 · 自动调节") +
+                                "\n" + deviceUnsupportedNote("性能模式")
+                        },
                         checked = perfOn,
                         onCheckedChange = {
                             perfOn = it
                             viewModel.network.setPerformanceMode(if (it) "performance" else "balanced")
-                        }
+                        },
+                        enabled = perfSupported
                     )
                 }
 

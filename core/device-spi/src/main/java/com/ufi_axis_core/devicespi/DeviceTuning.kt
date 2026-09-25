@@ -107,7 +107,8 @@ data class DeviceTuning(
     /**
      * **用户告警**的温度回差（hysteresis）带宽，摄氏度。**F50 实测 3。**
      *
-     * 来源：`AlertEngine` 的 `TEMP_HYSTERESIS_C = 3.0`（`:core:alert`，那边是 `Double`）。
+     * 来源：`AlertEngine` 的 `DEFAULT_TEMP_HYSTERESIS_C = 3.0`（`:core:alert`，那边是 `Double`）。
+     * 消费点：`AlertEngine(temperatureHysteresisC = ...)`，由 `ComponentFactory` 接线。
      * 理由记在 `leveledWithHysteresis` 的注释里：**零回差 + 边沿触发 = 阈值附近微抖导致的告警风暴**；
      * Unisoc 热区读数的正常抖动就有 1~2°C，所以带宽取 3°C。
      *
@@ -131,6 +132,9 @@ data class DeviceTuning(
      * 同一数值也是 `AppSettings.monitorBootGraceMs` 的默认值）。
      * 那里的注释记着：Unisoc + Android 13 + 1.5GB RAM **实测 ~60s** 系统服务才基本稳定
      * （zygote / AMS / PMS / dex2oat 打满全部核心），**留 30s 余量**取 90s。
+     *
+     * 消费点：`DataScheduler(bootGraceDeviceDefaultMs = ...)`，由 `ComponentFactory` 接线。
+     * 用户在 `AppSettings.monitorBootGraceMs` 配过就以用户为准，本字段只是设备侧兜底。
      *
      * **它管什么**：预热期内**不入库、不判本地告警**，但 WS 实时推送照常。
      *

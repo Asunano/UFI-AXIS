@@ -13,6 +13,8 @@ import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -38,9 +40,22 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
     var message by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(true) }
 
+    // 设备能力集（批 O / 3.5）：core 对 `/api/device/cell-lock` 与 `/api/device/cell-unlock`
+    // 两个写入口都有 route 门禁（同属 CELL_LOCK 域），缺能力回 501 NOT_SUPPORTED。
+    // 本页有 3 个写控件（锁定当前基站 / 邻区逐条锁定 / 解锁全部），三个一起灰。
+    //
+    // 只灰**写**控件：「刷新」按钮走的是读侧 `/api/network/cell-info`，没有门禁，照旧可点 ——
+    // 不支持锁站不等于不能看基站信息。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可点。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val cellLockSupported = capabilities.supports(Capability.CELL_LOCK)
+
     LaunchedEffect(Unit) {
         isLoading = true
         viewModel.network.loadCellInfo()
+        // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+        viewModel.network.loadDeviceCapabilities()
     }
     LaunchedEffect(state) {
         if (state.cellInfo != null || state.errorMessage != null) isLoading = false
@@ -57,6 +72,13 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                 Spacer(Modifier.height(8.dp))
             // 错误提示
             state.errorMessage?.let { UfiErrorBanner(message = it) }
+            // 置灰原因（只在不支持时出现，批 O / 3.5）。本页有 3 个写控件，原因只说一次。
+            // 口径：只说「设备不支持」，不说"功能未开启"或"权限不足" —— 这台设备压根没有
+            // 这个能力，没地方可开，那两句会把用户引向一场白费的寻找。
+            if (!cellLockSupported) {
+                UfiNoticeCard(message = deviceUnsupportedNote("基站锁定"))
+                Spacer(Modifier.height(8.dp))
+            }
             message?.let {
                 Surface(
                     color = palette.accent.copy(alpha = 0.1f),
@@ -148,7 +170,8 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                             viewModel.network.cellLock(pci, fcn, if (is5G) "NR" else "LTE")
                             message = "已发送锁定当前基站命令 (PCI=$pci, FCN=$fcn)"
                             isLoading = true
-                        }
+                        },
+                        enabled = cellLockSupported
                     )
                 }
                 UfiDivider(Modifier.padding(vertical = 12.dp))
@@ -218,7 +241,8 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     viewModel.network.cellLock(cell.pci, cell.earfcn,
                                         if (inferIsNRDlg(cell.band, cell.earfcn, is5G)) "NR" else "LTE")
                                     message = "已锁定 PCI ${cell.pci}"
-                                }
+                                },
+                                enabled = cellLockSupported
                             )
                         }
                     }
@@ -261,6 +285,7 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                             variant = UfiButtonVariant.Danger,
                             text = "解锁全部",
                             onClick = { viewModel.network.unlockAllCell(); message = "已解锁全部"; isLoading = true },
+                            enabled = cellLockSupported,
                             modifier = Modifier.weight(1f)
                         )
                     }

@@ -18,6 +18,8 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.NetworkMode
 
 /**
@@ -46,10 +48,23 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
 
     var showSheet by remember { mutableStateOf(false) }
 
+    // 设备能力集（批 O / 3.5）：core 对 `/api/network/mode` 与 `/api/network/bearer` 两个
+    // 写入口都有 route 门禁（同属 NETWORK_MODE 域），缺能力回 501 NOT_SUPPORTED。
+    //
+    // 只灰「更改网络制式」这个入口，不动下面的「连接模式」—— 那条走
+    // `/api/network/connection-mode`，不在 10 个域里，按口径照旧不拦。
+    // 制式选择的磁贴网格在弹窗里，入口点不开 = 磁贴也点不到，不必再灰一层。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可点。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val modeSupported = capabilities.supports(Capability.NETWORK_MODE)
+
     // 进入即刷新设备设置，保证初值准确
     LaunchedEffect(Unit) {
         viewModel.network.refreshNetwork()
         viewModel.network.loadDeviceSettings()
+        // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+        viewModel.network.loadDeviceCapabilities()
     }
 
     UfiScreenScaffold(
@@ -132,9 +147,18 @@ fun NetworkModeScreen(viewModel: MainViewModel, navController: NavHostController
                             onClick = {
                                 showSheet = true
                             },
+                            enabled = modeSupported,
                             modifier = Modifier.fillMaxWidth()
                         )
                     }
+                }
+
+                // 置灰原因（只在不支持时出现）。走公共 UfiNoticeCard，与其它页面的内联说明同款。
+                // 口径：只说「设备不支持」，不说"功能未开启"或"权限不足" —— 那两句会把用户
+                // 引向"我去哪儿开一下"，而这台设备压根没有这个能力，没地方可开。
+                if (!modeSupported) {
+                    Spacer(Modifier.height(Spacing.Small))
+                    UfiNoticeCard(message = deviceUnsupportedNote("切换网络制式"))
                 }
 
                 Spacer(Modifier.height(Spacing.Medium))

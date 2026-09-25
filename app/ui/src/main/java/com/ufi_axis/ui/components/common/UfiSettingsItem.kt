@@ -107,6 +107,17 @@ fun UfiSettingsItem(
     }
 }
 
+// 带开关的设置行。
+//
+// @param enabled false 时整行置灰、点击被 [UfiSettingsItem] 吞掉，右侧 [UfiSwitch] 也不再可拨。
+//   2026-09-25 新增（批 O / 设备能力集 3.5）：`UfiSettingsItem` 与 `UfiSettingsValue` 早就有
+//   这个参数，只有本组件没有 —— 于是"这台设备不支持某个功能"时没法把开关灰掉，
+//   只能让用户点下去等 core 回 501。带默认值的新增参数，既有 24 个调用点全部不受影响
+//   （[F24] 向后兼容口径，同 `UfiSettingsValue.enabled` 当初的加法）。
+//
+//   ⚠ 置灰**不改 [checked]**：开关显示的仍然是设备的真实状态。
+//   本仓禁止假开关，而"因为不可用就顺手显示成关"就是假开关的一种 ——
+//   设备上明明开着 Samba，界面却画成关，用户会去别处找原因。
 @Composable
 fun UfiSettingsToggle(
     title: String,
@@ -114,12 +125,14 @@ fun UfiSettingsToggle(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
     icon: ImageVector? = null,
-    onClick: (() -> Unit)? = null
+    onClick: (() -> Unit)? = null,
+    enabled: Boolean = true
 ) {
     UfiSettingsItem(
         title = title,
         description = description,
         icon = icon,
+        enabled = enabled,
         // 默认整行点击 = 切换开关；传了 onClick 就走它（如「点行进设置页、点开关开热点」）
         onClick = onClick ?: { onCheckedChange(!checked) },
         trailing = {
@@ -129,7 +142,8 @@ fun UfiSettingsToggle(
             // Role.Switch 无障碍语义与 spring 动画。设置行的开关因此比原来略小。
             UfiSwitch(
                 checked = checked,
-                onCheckedChange = onCheckedChange
+                onCheckedChange = onCheckedChange,
+                enabled = enabled
             )
         }
     )

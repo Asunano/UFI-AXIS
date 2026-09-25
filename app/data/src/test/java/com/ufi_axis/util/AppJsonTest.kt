@@ -1,7 +1,9 @@
 package com.ufi_axis.util
 
+import com.ufi_axis.data.model.BatteryInfo
 import kotlinx.serialization.Serializable
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,6 +52,29 @@ class AppJsonTest {
         val sample = AppJson.decodeFromString(SignalSample.serializer(), json)
         assertEquals(23, sample.rsrp)
         assertEquals(3.5, sample.sinr, 0.0001)
+    }
+
+    /**
+     * 旧版 core 的 battery 响应里**没有** `supported` 键，必须默认解成 `true`。
+     *
+     * 钉的是 `BatteryInfo.supported` 那个默认值的**跨版本兼容判据**（core 批 M 起才下发它）：
+     * 默认值一旦被改成 `false` 或干脆去掉，所有还没升级 core 的部署都会在电池详情弹窗里
+     * 弹出「本机型可能没有电池」—— 而那些设备其实好着。
+     *
+     * 这是 app 侧唯一靠默认值维持的跨版本兼容点，所以值得单独一条断言。
+     * 反向也验一次：显式下发 `false` 时不能被默认值吃掉。
+     */
+    @Test
+    fun `battery supported defaults to true when core omits the field`() {
+        val legacy = """{"level":50,"scale":100,"percent":50,"temperature":0.0,""" +
+            """"voltage":0.0,"is_charging":false,"plugged":"None"}"""
+        val old = AppJson.decodeFromString(BatteryInfo.serializer(), legacy)
+        assertTrue("旧 core 没有 supported 键时必须默认 true", old.supported)
+
+        val declared = """{"level":50,"scale":100,"percent":50,"temperature":0.0,""" +
+            """"voltage":0.0,"is_charging":false,"plugged":"None","supported":false}"""
+        val current = AppJson.decodeFromString(BatteryInfo.serializer(), declared)
+        assertFalse("显式下发 false 时不能被默认值吃掉", current.supported)
     }
 
     @Test

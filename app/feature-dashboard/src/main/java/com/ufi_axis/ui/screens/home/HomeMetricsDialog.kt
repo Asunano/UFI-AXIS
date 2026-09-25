@@ -127,14 +127,36 @@ fun HomeMetricsDialog(
             ) {
                 UfiDialogBody {
                 state.batteryInfo?.let { b ->
+                    // core 批M 起：supported == false 表示设备没有声明电池能力（如 F50）。
+                    // 此时 percent / is_charging 仍是系统给的值（F50 恒报 50%、插电时可能报 true），
+                    // core 对这类设备既不入库也不做电池告警 —— 下面那行说明必须把这点讲出来，
+                    // 否则用户会奇怪电池历史图为什么是空的。
+                    val batteryUnsupported = !b.supported
+
                     UfiInfoRow("当前电量", "${b.percent}%")
-                    UfiInfoRow("状态", FormatUtils.getBatteryStatus(b.percent, b.is_charging))
+                    // 无电池能力时不复述系统的充电判断：getBatteryStatus 在 is_charging = true
+                    // 时会直接说「充电中」，那是一台没有电池的设备最不该出现的一句话。
+                    // 留着行、值给 null（UfiInfoRow 对 null 的既有渲染是长破折号），
+                    // 行数与行序和有电池的设备保持一致，不会因机型不同而跳变。
+                    UfiInfoRow(
+                        "状态",
+                        if (batteryUnsupported) null
+                        else FormatUtils.getBatteryStatus(b.percent, b.is_charging)
+                    )
 
                     // 所有信息行平铺
                     UfiInfoRow("温度", FormatUtils.formatTemperature(b.temperature))
                     UfiInfoRow("电压", FormatUtils.formatVoltage(b.voltage))
-                    UfiInfoRow("充电中", if (b.is_charging) "是" else "否")
+                    UfiInfoRow("充电中", if (batteryUnsupported) null else if (b.is_charging) "是" else "否")
                     UfiInfoRow("电量等级", "${b.level} / ${b.scale}")
+
+                    if (batteryUnsupported) {
+                        // 用中性说明（UfiDialogNote）而不是 UfiDialogWarning：这不是故障也不是风险，
+                        // 只是这台设备读不到真实电量。橙色警告块会把它说得像出了问题。
+                        UfiDialogNote(
+                            "本机型可能没有电池，或系统读不到真实电量 —— 上面的数值仅供参考，不做记录与告警。"
+                        )
+                    }
                 } ?: Text(text = "暂无电池数据", color = palette.textSecondary)
                 } // UfiDialogBody
             }

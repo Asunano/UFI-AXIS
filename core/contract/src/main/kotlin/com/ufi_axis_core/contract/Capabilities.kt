@@ -17,8 +17,9 @@ package com.ufi_axis_core.contract
  *
  * ## 语义：Capability 是「功能域」，不是 `SettingKey` 的一一映射（2026-09-24 用户拍板）
  *
- * 29 个 `SettingKey` 不可能都归到 10 个域里。口径是：
- * **只有这里列出的域做 route 门禁，其余写操作照旧不拦**。
+ * 29 个 `SettingKey` 不可能都归到 11 个域里。口径是：
+ * **只有这里列出的域做 route 门禁，其余写操作照旧不拦**
+ * （反过来也不是双射：**纯读侧项连门禁都没有**，见下面「纯读侧能力」那一节）。
  * 所以「有 `WriteSpec` 却没有对应 capability」**不是缺陷**，
  * 守门测试只做单向断言（声明了某项 → 必须能找到对应写能力与 route），防的是「定了不用」。
  *
@@ -44,11 +45,47 @@ package com.ufi_axis_core.contract
  * [ErrorCode.UNAVAILABLE]（503，设备离线/会话失效/提权失败，可重试）、
  * [ErrorCode.OUT_OF_RANGE]（400，值域非法）。
  *
- * ## 第一批只定 10 个
+ * ## 第一批 10 个（3A）+ 3B 补的 [BATTERY]
  *
- * 判据：**在 ZTE F50 上能明确验证，且 core 侧已经有对应的写 route**。
- * 其余（如 §11.5 想要的 `RAW_GOFORM`、阶段 4 才有取值的 `BATTERY` / `ROOT_SHELL` /
- * `AT_CHANNEL`）等有实测依据再进 —— 冻结区宁可晚定。
+ * 3A 的判据：**在 ZTE F50 上能明确验证，且 core 侧已经有对应的写 route** —— 按这条定了 10 项
+ * （[SMS] 到 [TRAFFIC_LIMIT]）。[BATTERY] 是 3B 补的第 11 项，它**不满足第二条**，
+ * 因为它本质上不该有写 route（见下面「纯读侧能力」）。
+ * §11.5 想要的 `RAW_GOFORM` 仍然等有实测依据再进 —— 冻结区宁可晚定。
+ *
+ * ## 为什么 3B 只落了 [BATTERY] 一项
+ *
+ * 计划书原本要在 3B 一次落 `BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 三项，
+ * 2026-09-24 砍到一项：**只有「这个型号有没有电池」是设备事实**。
+ * 一台机器出厂带不带电池，在组件图构造时就定死了，整个进程生命周期不会变。
+ *
+ * `ROOT_SHELL` 与 `AT_CHANNEL` 不是设备事实，是**运行时状态**：
+ * 提权走的 ADB 自连通道（`localhost:5555`）会断、会被设备端关掉；
+ * AT 通道有 20 次失败熔断，熔断之后在同一个进程里它就是不可用的。
+ * 把会变的东西塞进「组件图构造时算一次、之后永不更新」的静态 capabilities，
+ * 得到的就是又一个**假开关**：集合里写着能用、实际早就断了 ——
+ * 那正是这批能力集要消除的失败模式（开关能点、点了没反应）。
+ *
+ * 而且这两件事**已经各有对外表达**，不缺入口：AT 通道看 `/api/at/status` 的 `connected`，
+ * root shell 看 shell 那一侧的 root 上报。那两处是**实时查**的，语义本来就对。
+ *
+ * ## 「纯读侧能力」这一类（2026-09-24 用户裁决）
+ *
+ * 从 [BATTERY] 起，本枚举**不再假设每一项都有写 route**。
+ * 一项能力可以只影响**读侧**：它回答「这个字段有没有意义」，而不是「这个开关能不能点」。
+ *
+ * 纯读侧项的三条口径：
+ *
+ * 1. **没有 route 门禁**，因此必须进 `CapabilityGateTest` 的 `exempt` 豁免表；
+ * 2. 豁免理由**分两种**，登记时必须写明是哪一种 ——
+ *    **「core 侧还没有那个写 route」**（将来会补，属临时豁免，补上就要从表里删掉）
+ *    vs **「本质上不该有写 route」**（永久豁免；[BATTERY] 属于这一种：
+ *    电池是硬件事实，没有任何写操作可言）；
+ * 3. 也**不进** `PluginContractTest.writeKeysOf` 那张对照表，
+ *    改走那里的 `READ_ONLY_CAPABILITIES` **显式白名单** ——
+ *    不是「找不到写能力就跳过」。后者会把「新加了 capability 却忘了登记 `SettingKey`」
+ *    一起放过去，而那条全覆盖断言存在的全部意义就是拦住它。
+ *
+ * 纯读侧项的消费方不是 route 门禁，而是采集侧与下发的读数本身，逐项写在各自的枚举 KDoc 上。
  *
  * @property wire 对外 JSON 里的取值：小写 snake。
  *   **映射写在枚举上、不在下发处 `name.lowercase()`** —— 口径同
@@ -166,6 +203,45 @@ enum class Capability(val wire: String) {
      * 而「只写 core 那半边」会给用户一个开着却永远不触发的开关。
      */
     TRAFFIC_LIMIT("traffic_limit"),
+
+    /**
+     * **这个型号有没有电池** —— 本枚举的第一个**纯读侧能力**（口径见本文件「纯读侧能力」一节）。
+     *
+     * ## 判据是设备事实，不是「这一次有没有读到」
+     *
+     * 问的是**出厂带不带电池**，答案在组件图构造时就定死、整个进程生命周期不变。
+     * 不声明本项 = 这个型号压根没有电池，于是电量、电池温度、电压、充电状态**全部无意义**。
+     *
+     * ## 没有写 route，将来也不会有
+     *
+     * 电池是硬件，不存在任何「开关电池」的写操作 —— 所以它在 `CapabilityGateTest.exempt` 里
+     * 属于**「本质上不该有写 route」**那一类（永久豁免），不是「core 侧还没补 route」。
+     * 同理它不进 `PluginContractTest.writeKeysOf`，走那里的 `READ_ONLY_CAPABILITIES` 白名单。
+     *
+     * ## 消费方（都在读侧）
+     *
+     * ⚠ 2026-09-24 批 M 改了消费方式（用户推翻了批 L 的裁决 C，改成方案 D）。
+     * 现在的口径是 **「读数照发，可信度另说」**，而不是「抹成 -1」：
+     *
+     * - `SystemCollector.getBatteryInfo()`：**不因为未声明本项而改动任何读数**
+     *   （percent 就是系统报的值，F50 上是 50）。它只往返回的 map 里多填一个
+     *   `supported: Boolean` 字段，如实转述本项的声明结果。
+     *   为什么当初的「抹成 -1」被推翻：app 端会把 -1 渲染成红色的 `-1%`（低电量 critical 配色），
+     *   比那个假的 50% 更像故障。
+     * - `DataScheduler.collectBattery()` / `scanLocalAlerts()`：未声明本项时**跳过入库与告警**
+     *   （不写 `batteryBuffer`、不调 `checkBattery` / `evaluateBattery`）。
+     *   这两件事都与显示无关 —— 拦的是「数据库里存一条永远 50% 的假曲线」
+     *   和「告警引擎按假值判级别」。`_latestBattery` 照常赋值，读端点不受影响。
+     * - `GET /api/system/battery` 与 `GET /api/dashboard` 的 battery 段：下发系统读数 + `supported`。
+     * - 两端（app / web）的电量卡片：照系统值渲染；`supported=false` 时在电池详情里
+     *   提示「可能无电池或检测不到」（app 侧改动登记为下一批，本项的 core 侧已就位）。
+     *
+     * ⚠ **ZTE F50 不声明本项** —— 用户 2026-09-24 实测确认这台机器没有电池，
+     * 而系统的 sticky `ACTION_BATTERY_CHANGED` 在它上面恒报 `level=50, scale=100`：
+     * 那是个**假值**，不是「读不到」。正因为是假值，所有靠「读不到」判断的旧兜底全都失效，
+     * 必须由本项这样的**设备事实**来回答。
+     */
+    BATTERY("battery"),
     ;
 
     companion object {

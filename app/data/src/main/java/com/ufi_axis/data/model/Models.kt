@@ -81,7 +81,13 @@ data class BatteryInfo(
     val temperature: Double,
     val voltage: Double,
     val is_charging: Boolean,
-    val plugged: String
+    val plugged: String,
+    // 设备是否真的具备电池能力（core 批M 起下发）。false 时 percent / is_charging 仍是系统值
+    // （F50 无电池却恒报 level=50, scale=100），core 对这类设备不入库也不做电池告警。
+    //
+    // 默认 true 是**兼容性判据，不是产品取舍**：旧版 core 的响应里没有这个键，
+    // 默认 false 会让所有旧部署都被判成「可能无电池」并弹出提示。
+    val supported: Boolean = true
 )
 
 @Serializable
@@ -1442,6 +1448,22 @@ data class DeviceQosResponse(
     val hasData: Boolean get() = available && qci > 0
 }
 
+// 设备能力集（`GET /api/device/capabilities`，2026-09-25 批 O / 计划书 §7 阶段 3 的 3.5）。
+//
+// 形状：{ "plugin_id": "zte-f50", "capabilities": ["sms", "band_lock", …] }
+//
+// [capabilities] 是 wire 名数组，解析成枚举集合由
+// `com.ufi_axis.viewmodel.state.DeviceCapabilityState.fromWires` 负责 ——
+// 本层只管把 JSON 拿进来，认不认识哪个名字是上层的事。
+//
+// 默认值都给空：core 的取值在装配组件图时就定死了，但**拉取失败一律按"全部支持"降级**
+// （见 DeviceCapabilityState 的说明），所以这里不需要"失败时的假值"。
+@Serializable
+data class DeviceCapabilitiesResponse(
+    val plugin_id: String = "",
+    val capabilities: List<String> = emptyList()
+)
+
 // ========== Monitor ==========
 
 typealias DownsampledPoint = com.ufi_axis_core.util.DownsampledPoint
@@ -1892,6 +1914,44 @@ data class PlaylistCreateResponse(
 data class PlaylistPathsRequest(
     val paths: List<String>,
     val position: Int? = null
+)
+
+// ── 从音乐库移除 / 删除文件（2026-09-23）──────────────────────────────────────
+
+/**
+ * 排除名单（「从音乐库移除」的那一份路径清单）。
+ *
+ * @param max 名单硬上限。**这不是产品上的取舍**：名单会变成 SQL 的 `_data NOT IN (?,…)`，
+ *   每条占一个绑定变量，SQLite 上限 999。客户端据此提前提示，别让用户点了才发现没生效。
+ * @param full 已满。等价于 `total >= max`，由 core 算好，省得两端各算一遍。
+ */
+@Serializable
+data class MediaExcludedResponse(
+    val paths: List<String> = emptyList(),
+    val total: Int = 0,
+    val max: Int = 0,
+    val full: Boolean = false
+)
+
+/** @param action `add` / `remove` / `clear`（`clear` 时 [paths] 可为空）。 */
+@Serializable
+data class MediaExcludeRequest(
+    val paths: List<String> = emptyList(),
+    val action: String = "add"
+)
+
+/**
+ * @param affected 实际生效的条数。**小于 [requested] 就是撞上上限被截断了** ——
+ *   这是客户端唯一能发现"只加进去一部分"的途径。
+ */
+@Serializable
+data class MediaExcludeResponse(
+    val success: Boolean = false,
+    val action: String = "",
+    val affected: Int = 0,
+    val requested: Int = 0,
+    val total: Int = 0,
+    val full: Boolean = false
 )
 
 /**

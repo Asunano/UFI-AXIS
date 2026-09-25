@@ -15,7 +15,8 @@ import java.io.File
  *
  * 1. **[requireCapability] 的行为**：缺能力 → 抛 [CapabilityMissing]，且它带的是
  *    501 + [ErrorCode.NOT_SUPPORTED]（不是 503、不是 500）。
- * 2. **「定了不用」的防线**：[Capability] 的每一项都必须**至少被一处** route 门禁引用。
+ * 2. **「定了不用」的防线**：[Capability] 的每一项都必须**至少被一处** route 门禁引用
+ *    —— 除了 [exempt] 里逐条登记过豁免理由的（2026-09-24 批 L 起，纯读侧能力也走这张表）。
  *
  * ## 第 2 条为什么用「扫源码」实现
  *
@@ -32,22 +33,44 @@ import java.io.File
 class CapabilityGateTest {
 
     /**
-     * **豁免表：暂时没有写 route、因此不做门禁的 Capability。**
+     * **豁免表：没有写 route、因此不做门禁的 Capability。**
      *
-     * 现在是**空的** —— 第一批 10 个域逐项都核过「有 `WriteSpec`（或 `smsSpec`）+ 有写 route」
-     * 两条（对照表记在 `ZteF50Plugin.capabilities` 的 KDoc 上）。
+     * 现在有 **1 项**：[Capability.BATTERY]（2026-09-24 批 L 加）。
+     * 3A 的 10 个域逐项都核过「有 `WriteSpec`（或 `smsSpec`）+ 有写 route」两条
+     * （对照表记在 `ZteF50Plugin.capabilities` 的 KDoc 上），它们一个都不在这里。
+     *
+     * ## 豁免理由分两种，登记时必须写明是哪一种（2026-09-24 用户裁决）
+     *
+     * 1. **「core 侧还没有那个写 route」** —— 临时豁免。将来补上 route 就要从本表里删掉
+     *    （`豁免表本身受约束` 那条用例会在它已经有门禁时逼你删）。
+     * 2. **「本质上不该有写 route」** —— 永久豁免，也就是 `Capability` 文件头说的
+     *    **纯读侧能力**：这一项只回答「某个读数有没有意义」，不对应任何用户写动作。
+     *
+     * 逐项登记：
+     *
+     * - [Capability.BATTERY]：**第 2 种（本质上不该有写 route）**。
+     *   它回答的是「这个型号有没有电池」，是硬件事实 —— 没有任何「开关电池」的写操作可言，
+     *   所以不是「route 还没写」，而是永远不会有 route。
+     *   它的消费方全在读侧：`SystemCollector.getBatteryInfo()` 按它填 battery map 的
+     *   `supported` 字段（2026-09-24 批 M：**读数照系统值下发、不抹成 -1**），
+     *   `DataScheduler` 按它跳过入库与电池告警，`/api/system/battery` 与
+     *   `/api/dashboard` 的 battery 段照着下发。
      *
      * ## 往这里加项的规矩
      *
-     * 1. **只许因为「core 侧真的没有那个写 route」而豁免**，不许因为「加门禁麻烦 / 测试红了」而豁免；
-     * 2. 每加一项必须在这里写清**为什么没有 route**，以及补上 route 的条件；
+     * 1. **只许因为上面那两种理由之一而豁免**，不许因为「加门禁麻烦 / 测试红了」而豁免；
+     * 2. 每加一项必须在这里写清**是哪一种**：第 1 种要写补上 route 的条件，
+     *    第 2 种要写为什么这个域不可能有写动作；
      * 3. **有上限**（[MAX_EXEMPT]）：豁免表变成垃圾桶的第一步就是「反正能加」。
      *    超了就红 —— 那时该问的是「这批 Capability 是不是定早了」，而不是把上限调大。
+     *    ⚠ 上限对**两种**豁免一起算：纯读侧项也占额度。理由是本表的作用是
+     *    「拦住 Capability 无节制膨胀」，而不是「统计缺多少 route」——
+     *    如果纯读侧项不占额度，那把一项标成「纯读侧」就成了绕过上限的后门。
      *
      * **不许为了让测试绿而硬造 route**：一个只为通过断言而存在的端点，
      * 比一条豁免记录危险得多（它会被当成真能用的功能接进 UI）。
      */
-    private val exempt: Set<Capability> = emptySet()
+    private val exempt: Set<Capability> = setOf(Capability.BATTERY)
 
     /** `requireCapability(Capability.X)` 的调用点。KDoc 里的提及不算。 */
     private val gateCall = Regex("""requireCapability\(\s*Capability\.([A-Z_0-9]+)\s*\)""")
@@ -177,8 +200,13 @@ class CapabilityGateTest {
         /**
          * 豁免表上限。
          *
-         * 定 2 而不是 0：留一点余地给「第二台设备接进来时发现某个域在 core 侧确实还没有写
-         * route」这种真实情况；但 10 个域里超过 2 个没 route，就说明这批能力定得太早了。
+         * 定 2 而不是 0：留一点余地给两类真实情况 ——
+         * 「第二台设备接进来时发现某个域在 core 侧确实还没有写 route」，
+         * 以及「纯读侧能力」（本质上不该有写 route，2026-09-24 批 L）。
+         * 但 11 个域里超过 2 个不做门禁，就说明这批能力定得太早、或者「域」的粒度切错了。
+         *
+         * ⚠ 现已用掉 1 项（[Capability.BATTERY]）。再加纯读侧项时先想清楚是不是真的需要进
+         * `Capability` —— 只被采集器读一次的事实，未必值得进冻结区的对外值域。
          */
         const val MAX_EXEMPT = 2
     }

@@ -16,8 +16,28 @@ import java.io.File
  * Android API 采集器
  * 采集 CPU/内存/存储/温度/电池/流量等系统信息
  * 数据来源: /proc, /sys 文件系统 + Android API
+ *
+ * @param batteryDeclared **这个型号声明了 `Capability.BATTERY` 吗**（2026-09-24 批 M）。
+ *   由装配层从 `runtime.plugin.capabilities` 算出来传进来。
+ *
+ *   ⚠ **它不参与任何读数计算**。整个类里它只有一个用途：如实填进 [getBatteryInfo] 返回的
+ *   `supported` 字段，告诉客户端「这个型号声明了电池能力吗」。
+ *   `percent` / `level` / `temperature` / `voltage` / `is_charging` / `plugged` / `scale`
+ *   一律照三级取值跑出系统报的值，**不因为它是 false 而被抹掉**。
+ *
+ *   ⚠ 别把它当成批 L 那个 `batterySupported`：那个参数（裁决 C）会在 false 时整段短路、
+ *   把 `percent` / `level` 抹成 -1。用户 2026-09-24 推翻了那个裁决（改成方案 D）——
+ *   抹成 -1 之后 app 端会渲染出红色的 `-1%`，比假的 50% 更像故障。
+ *   现在的口径是：**读数照原样下发，可信度另开一个字段说**。
+ *
+ *   ⚠ 这里刻意收一个**不可变的 Boolean**，不收整个 capabilities 集合、更不收选型对象：
+ *   采集器需要的只是「这一个事实成不成立」，递进来一个集合等于让采集器自己去解释能力语义，
+ *   以后谁往集合里加项都可能顺手在采集器里加分支。口径同批 B2。
  */
-class SystemCollector(private val context: Context) {
+class SystemCollector(
+    private val context: Context,
+    private val batteryDeclared: Boolean,
+) {
 
     private val tag = "SystemCollector"
 
@@ -152,17 +172,54 @@ class SystemCollector(private val context: Context) {
     /**
      * 获取电池信息
      *
-     * 三级取值，任一级拿到就用（UFI 设备的 sticky ACTION_BATTERY_CHANGED 经常只带 status/plugged，
-     * 不带 EXTRA_LEVEL/EXTRA_SCALE —— 于是 percent 恒为 -1，就是"电量显示 -1"的直接原因）：
+     * ## 三级取值，任一级拿到就用
+     *
      *   1. sticky ACTION_BATTERY_CHANGED 的 EXTRA_LEVEL / EXTRA_SCALE
      *   2. BatteryManager.getIntProperty(BATTERY_PROPERTY_CAPACITY)（framework 自己去问 HAL）
      *   3. /sys/class/power_supply/<x>/capacity（节点名各家不同，遍历所有 type=Battery 的目录）
      *
      * 温度/电压同样做兜底，并且**取不到就返回 -1，而不是 -1/10.0 = -0.1** —— 原来那个
      * -0.1°C / -0.001V 比 -1 更难认出来是"没取到"。
+     *
+     * ## 无电池机型的两种表现，都记下来（2026-09-24 事实更正）
+     *
+     * 这段原来写的是「UFI 设备的 sticky intent 不带 EXTRA_LEVEL / EXTRA_SCALE，于是 percent 恒为 -1」。
+     * 那只描述了其中一种机型。实测确认**两种都存在**，而且第一种更难发现：
+     *
+     * 1. **sticky intent 带 level/scale，但值是假的** —— ZTE F50 就是这种：设备**没有电池**，
+     *    系统却恒报 `level=50, scale=100`。于是上面第 1 级的 `level >= 0 && scale > 0` 成立，
+     *    `percent` **恒为 50**，下面那条「读不到」的 WARN 压根不打。
+     *    也就是说这台机器上没有任何「读不到」的信号 —— 靠读数本身分辨不出真假。
+     * 2. **sticky intent 不带 level/scale** —— 另一种机型（本函数原注释描述的那种）：
+     *    第 1 级不成立，两级兜底也拿不到，`percent` **恒为 -1**。
+     *
+     * ⚠ 别把这两种混成一句话。看到「恒为 -1」就以为无电池设备一定报 -1，
+     * 会直接漏掉第 1 种（F50 那条永远 50% 的假曲线就是这么存进数据库的）。
+     *
+     * ## `supported` 字段：读数照发，可信度单独说（2026-09-24 批 M / 方案 D）
+     *
+     * 本函数**不因为 [batteryDeclared] 为 false 而改动任何读数** —— percent 就是系统报的值
+     * （F50 上是 50）。抹成 -1 的做法（批 L 裁决 C）已被用户推翻：app 端会渲染出红色的 `-1%`，
+     * 比假的 50% 更像故障。
+     *
+     * 取而代之，map 里多一个 `supported: Boolean`，如实转述装配层算出的
+     * 「这个型号声明了 `Capability.BATTERY` 吗」。客户端拿它去决定要不要在电池详情里
+     * 提示「可能无电池或检测不到」，**读数本身照原样渲染**。
+     *
+     * 为什么放在这张 map 里、而不是让客户端去读 `/api/device/capabilities`：
+     *   - 客户端渲染电量卡片时手里**已经有这张 map** 了，为一个布尔再发一次请求不划算；
+     *   - 「读数」与「读数可信吗」落在**同一个响应**里，不会出现两者不同步的窗口
+     *     （分两个请求就一定有那个窗口：capabilities 先到、battery 后到，中间那一帧
+     *     客户端只能拿旧的可信度去渲染新读数）。
+     *
+     * 新增键对旧客户端安全：app 侧走 `AppJson` 的 `ignoreUnknownKeys = true`，
+     * web 侧是逐字段挑（批 B2 已核实）。
      */
     fun getBatteryInfo(): Map<String, Any> {
         val result = mutableMapOf<String, Any>()
+        // supported 在 try 之外先填：它不依赖任何一次读取，而恰恰是「读数可信吗」这个答案 ——
+        // 下面任何一步抛异常（走到 catch、result 只剩半张表）时它都得在。
+        result["supported"] = batteryDeclared
         try {
             val intentFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
             val batteryStatus = context.registerReceiver(null, intentFilter)

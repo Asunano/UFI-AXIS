@@ -1,5 +1,17 @@
 # 设备插件化框架落地计划
 
+> **先说本文现在是什么：改造过程的「决策与执行记录」，不是照着做的手册。**
+> 阶段 1~5 的代码工作**已经全部落地并提交**（最后一批是 `ba08293`）。
+> 下面的任务清单、§9 的批次记录、§15 的待办池，记的是**当时为什么这么决定、哪些方案被推翻、
+> 每一批验到了第几层** —— 这是它剩下的唯一价值，所以决策痕迹一条不删。
+>
+> - **想知道「现在接一台新设备要改哪些地方」，去看 `docs/device-adaptation-guide.md`。**
+>   那份按代码现状写、只写现状，是照着做的文档；本文不再承担这个职责。
+> - **本文里的代码片段是当时的设计草案，与最终实现可能不同。** §3.2 的 SPI 骨架就有多处
+>   被后来的实测推翻（那一节上方有标废框），照它写会得到编译不过、或者行为不对的代码。
+> - 任何一处对不上，**以代码为准**：先按符号名在代码里确认真实形状，再回来改本文，
+>   **不要改代码去迁就本文**（§13 的偏差处理讲的就是这件事）。
+
 > 目标形态：**中间控制层 + 分层 SPI + 插件实现**。`ZteGoformProfile` 这类文件成为插件的一部分，
 > 上层（route / collector / controller / scheduler / app / web）不再持有任何设备知识。
 
@@ -273,7 +285,54 @@ SPI 层（分层接口）
 - `core/device-plugins`（**新增**，Android library）：**一个 module、每设备一个 package**。
   不做「一个设备一个 Gradle module」：构建图膨胀换不来任何隔离收益，隔离靠守门测试。
 
-### 3.2 SPI 骨架（阶段 2 落地时以此为准）
+### 3.2 SPI 骨架（~~阶段 2 落地时以此为准~~ → **设计草案，已作废，不要照抄**）
+
+> ⛔ **这一节整段是 2026-09-21 的设计草案，已作废。** 阶段 2~5 落地时它被实测推翻了多处，
+> 照这里写出来的代码要么**编译不过**（方法根本不存在），要么**签名不对**。
+> 草案**刻意保留不删** —— 删了就看不出原来打算怎么做、以及为什么没这么做。
+>
+> **真实签名只看代码**：`core/device-spi/src/main/java/com/ufi_axis_core/devicespi/` 下的
+> `DevicePlugin.kt` / `PlatformAdapter.kt` / `DeviceTuning.kt`（外加同目录的 `ProbeEnv.kt`）。
+> 那几个文件的 KDoc 逐成员写了「为什么是这个形状」「刻意没有什么」，比本节详细得多。
+> 要照着做请看 `docs/device-adaptation-guide.md`。
+>
+> **逐条差异（2026-09-25 打开上面四个文件逐成员核对）：**
+>
+> 1. **`PlatformAdapter.privilegeEscalation(): PrivilegeStrategy?` —— 最终不存在。**
+>    实测提权只有一条实际路径（ADB 自连 `localhost:5555`，`ShellExecutor.executeAsRoot()` 全走它），
+>    Samba `root preexec` 那条的执行入口是死代码。一个永远只有单一实现的策略接口，
+>    只会让读代码的人以为这里真有选择 —— 见 §8 裁决 ④ 与 `PlatformAdapter` 文件头。
+> 2. **`PlatformAdapter.readBattery(): BatteryReading?` —— 最终不存在。**
+>    电量的主取值来源是 Android 自己的 `BatteryManager`，那是 framework 通用 API、不是平台知识；
+>    而且会给平台实现引入第一个 `Context` 依赖（`SprdPlatform` 至今零参构造）。
+>    `Capability.BATTERY` 因此改成**采集侧按能力跳过入库与告警**（批 L / 批 M），
+>    不靠「读一次看能不能读到」—— F50 恰恰读得到一个恒为 50 的假值，那种设计在它上面会得出错误结论。
+> 3. **`restartNetworkStack()` 的签名多了一个执行器参数。** 实际是
+>    `suspend fun restartNetworkStack(at: suspend (String) -> String?): Boolean`。
+>    唯一的 AT 执行通道 `ATChannel` 住在 `:core:collector`，让平台实现反过来持有它会把策略层
+>    （全局互斥 / 500ms 最小间隔 / 指数退避 / 20 次熔断）塞进平台实现里、方向倒置，
+>    还要给 `:core:device-plugins` 加一条对 collector 的依赖。所以 adapter 只回答「发什么」，
+>    「怎么发」由调用方（`NetworkController`）注入 —— 附带收益是这个函数变得可单测（§8 裁决 ⑤，批 G）。
+> 4. **`DeviceTuning` 的字段名与成员集都变了。** 草案的 `thermalWarnC` / `thermalCriticalC`
+>    撞了三套完全不同的阈值（下载限速 75/85 `Float` / 采集降频 70/80 **`Int` 毫摄氏度** /
+>    用户告警 65/75 `Double` 带回差），所以改名成**只说自己管什么**的
+>    `downloadThrottleWarnC` / `downloadThrottleCriticalC`，并新增
+>    `downloadThrottleForcePauseOffsetC`（承载原本裸写在条件里的 `+10`，即 95°C 全部暂停）。
+>    `thermalJitterC` / `bootGraceMs` 名字未变。**`rootShellPermits` 被删掉** ——
+>    实测生效默认值是 3（`ShellQoS.DEFAULT_QOS_SHELL_MAX`），它是 QoS 配置默认值、不是设备事实
+>    （§8 裁决 ②③，批 F）。
+> 5. **`ProbeEnv` 的采集点不是 `DeviceRuntime`。** 草案注释写「由 `DeviceRuntime` 采一次」，
+>    实际由**装配层** `ComponentFactory.build()` 采好再递进来（采集要 `Context` / `AppSettings` / 网络，
+>    纯契约层拿不到这些）；采集器 `ProbeEnvCollector` 住在 `:core:device-plugins` 的 `probe/`。
+> 6. **`cpuInfoPlatform` 存的是 `/proc/cpuinfo` 全文**（trim + 小写），不是草案说的「平台串」——
+>    判据要与改造前 `ATChannel.detectPlatform()` 的「对全文 contains」逐位等价。
+>    marker 列表也不许自己写，统一在 `CpuInfoPlatform`（4.6 之前这里有两份不一致的列表）。
+>
+> `DevicePlugin` 的**成员集**反而与草案一致（`id` / `displayName` / `capabilities` / `profile()` /
+> `createTransport()` / `platform()` / `tuning()` / `probe()`）—— 只是 `capabilities` 与 `platform()`
+> 分别推到了阶段 3 与阶段 4 才补齐，不是一次落地的。
+
+
 
 ```kotlin
 // core/device-spi/.../DevicePlugin.kt
@@ -329,7 +388,54 @@ data class DeviceTuning(
 )
 ```
 
-### 3.3 中间控制层骨架
+### 3.3 中间控制层骨架（~~阶段 2 落地时以此为准~~ → **设计草案，已作废，不要照抄**）
+
+> ⛔ **同 §3.2：这一节是 2026-09-21 的草案，已作废。** 构造参数、成员、`resolve()` 签名、
+> 以及「全 0 时打 WARN」这条行为**全都与实现不同**。草案保留作决策痕迹。
+>
+> **真实形状只看代码**：`core/device-spi/src/main/java/com/ufi_axis_core/devicespi/DeviceRuntime.kt`
+> （2026-09-25 逐成员读过）。
+>
+> 逐条差异：
+>
+> 1. **构造参数只有三个**：`plugin: DevicePlugin` / `profile: DeviceProfile?` / `selection: Selection`。
+>    草案里的 `transport` / `platform` / `tuning` **都不在这个类上** ——
+>    它们由装配层 `ComponentFactory` 直接从 `plugin` 现造（`plugin.createTransport(cfg)` /
+>    `plugin.platform(ctx)` / `plugin.tuning()`）。把持有 HTTP 连接池、进程句柄的东西挂在选型对象上，
+>    会让它的生命周期与组件图纠缠。
+> 2. **多一个成员 `commandProfile: DeviceProfile`（非空）**，实现是 `profile ?: plugin.profile()`。
+>    这是草案没有的：字段归一化可以关、**命令表不能关**。兜底刻意用 `plugin.profile()`
+>    而不是 `default.profile()` —— 否则打开排障开关会顺带把命令表换成**另一台设备**的。
+> 3. **没有 `has()` / `require()`，`CapabilityMissing` 也不在这里。** 草案把能力门禁放在本类上，
+>    落地时门禁做在 route 层：能力集经 `DataHub` 的一个只读 `Set<Capability>` 快照进 route，
+>    `CapabilityMissing` 定在 `:core:api`、由 `HttpServer` 的 `StatusPages` 统一翻成
+>    501 / `NOT_SUPPORTED`（口径见 §7 的 3.3；`:core:network` 看不见 `:core:contract`，
+>    所以那个异常必须自带 status / errorCode / 文案）。
+> 4. **`resolve()` 的签名完全不同**，实测是：
+>    `suspend fun resolve(plugins: List<DevicePlugin>, default: DevicePlugin, configuredId: String,
+>    normalizationEnabled: Boolean, probeEnv: ProbeEnv, warn: (String) -> Unit = {},
+>    info: (String) -> Unit = {}): DeviceRuntime`。
+>    - **`suspend` 是真的**（5.2 起），因为 `DevicePlugin.probe()` 是 `suspend` 且选型真的会调它；
+>    - **没有 `AppSettings` / `Context`**：那会让纯契约层依赖 `:core:common` 与 Android，
+>      单测就得起 Android。配置取值由装配层取好**传值**进来；
+>    - **`probeEnv` 是入参、必填无默认值**：采集点在装配层（`ProbeEnvCollector`，见 5.1），
+>      不是草案说的「`resolve()` 里采一次」。一份对象贯穿全程，否则各插件打分没有可比性；
+>      给默认值就等于允许「忘了传 → 谁都探不到」静默发生；
+>    - **日志出口是两个回调 `warn` / `info`**（默认空实现只为单测）：契约层没有 `AppLogger`。
+> 5. **`Selection` 是四态枚举、每个值上挂显式 `wire`**（`configured` / `probed` / `default` /
+>    `fallback`），下发时用 `wire` 而不是 `name` —— 否则 Kotlin 标识符就成了对外契约。
+> 6. **草案下面那三条规则实际是五条互斥路径**，其中两处与草案不同：
+>    - 配置填了但两种 id 都匹配不上 → `FALLBACK` + WARN（草案只说「默认插件 + WARN」，
+>      没区分 `FALLBACK` 与 `DEFAULT`）；这条路径**刻意不发 probe** —— 填错了就该看见那条 WARN；
+>    - probe 全部 ≤ 0 → `DEFAULT` 且**刻意一行日志都不打**（草案写「默认插件 + WARN」）。
+>      三条判据写在 `resolve()` 的 KDoc 里，并有三条单测钉住「不打日志」。
+>    - 另外两条草案没写的细则：**并列同分取 `plugins` 声明顺序靠前者 + 一条 WARN**
+>      （并列意味着判据不足）、**某插件 `probe()` 抛异常按 0 分 + WARN 且整轮继续**
+>      （`CancellationException` 例外，原样抛出）。
+> 7. **`configuredId` 同时认两种 id**：先 plugin id（`zte-f50`）、再 profile id（`zte-goform`），
+>    命中后者打 **INFO 而不是 WARN**（用户填的值是对的）。草案只写了「按 id 取」。
+
+
 
 ```kotlin
 // core/device-spi/.../DeviceRuntime.kt
@@ -1041,9 +1147,22 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): GoformCli
   （多 7 个成员），且本文件不许写那个类型名。用 `as?` + `error()` 而不是硬 `as` ——
   失败的真实含义是「选中的插件不是 goform 系」，写成一句话比 ClassCastException 有用。
   **阶段 5/6 把 6 个客户端也收进插件后这次转型才能消掉。**
-- `[ ]` 2.6 `DeviceProfiles`（旧注册表）标为 `@Deprecated` 并让它委托给 `PluginRegistry`，
+- `[x]` 2.6 `DeviceProfiles`（旧注册表）标为 `@Deprecated` 并让它委托给 `PluginRegistry`，
   避免 `SignalCollector` 等直接 import `ZteGoformProfile` 的地方一次性全改
-- `[ ]` 2.7 守门测试 `PluginContractTest`
+  → **批 C 已落地**（`6e5e377`）：只标了 `@Deprecated(WARNING)`，**实现体一行未动** ——
+  「委托 `PluginRegistry`」在实测里是**反向依赖**（`DeviceProfiles` 在 device-schema，
+  `PluginRegistry` 在 device-plugins）、编译不过，理由与「什么时候才能真正删」写进了它的 KDoc。
+  ⚠ 顺带查清一件事：标废弃**并不能**提醒这条欠账的收尾 —— `SignalCollector` / `DataScheduler`
+  import 的是 `ZteGoformProfile` 而不是 `DeviceProfiles`，零 warning、没有任何编译期提醒盯着
+  （这两处现在登记在 `docs/device-adaptation-guide.md`「接第二台设备前必须先清」那一节）。
+- `[x]` 2.7 守门测试 `PluginContractTest`
+  → **批 C 已落地**（`6e5e377`）：`core/device-plugins/src/test/.../PluginContractTest.kt`，
+  落地时 8 条（id/displayName 唯一非空、`DEFAULT` 是 `ALL` 里那个对象、`byId` 往返、
+  `profile()` 多次调用同一对象、`tuning()` 值域自洽、`goformLdReachable=false` 必返 0、probe 纯函数）。
+  之后随阶段长过：阶段 3 补了 capability 侧断言，批 L 加了 `READ_ONLY_CAPABILITIES` 白名单
+  （`BATTERY` 是纯读侧能力）+「两表交集必须为空」。§7 裁决 ① 作废了原方案里那条**双向**断言
+  （29 个 key 不可能都归到 10 个域里），现在是单向 —— 防的是「定了不用」。
+
 - `[~]` 2.8 `/api/diagnose` 的 `device_profile` 块补 `plugin_id` 与 `selection`
   → **批 B2 已落地（只新增、不修正）**。`plugin_id` = 选中插件 id（**恒非空** —— 与 `active` 不同源：
   关掉归一化时 `active` 会空、`plugin_id` 照样有值）；`selection` 值域**一次定稳**四个：
@@ -1058,11 +1177,21 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): GoformCli
     （`selection=configured`），但 `active` 是 profile id、`configured != active` → `status` 仍判 `fallback`。
     两端 UI 现在都按 `status` 显示「型号填错」。**看选型结果以 `selection` 为准**；
     `status` 的显示口径连同 UI 一起归**阶段 3**
-- `[ ]` 2.9 **清 `NetworkController` 的设备知识 + 频段全集三份拷贝**（阶段 0 的 0.5 裁决推过来的，§15 的 **P0-1**）
+- `[x]` 2.9 **清 `NetworkController` 的设备知识 + 频段全集三份拷贝**（阶段 0 的 0.5 裁决推过来的，§15 的 **P0-1**）
   → `GoformNetworkClient.kt:29/31` 的 `LTE_ALL_BANDS` / `NR_ALL_BANDS`、
   `NetworkController.kt:122/127` 的跨模块直读、`core/contract/Enums.kt:145-146` 的第三份零引用拷贝。
   按 §3.4 判：若收进统一抽象仍要拉跨模块依赖，就允许各插件独立持有一份，**不为「统一」造新耦合**。
   ⚠ 「空串 = 不发限制」与「空串 = 下发全频段」是两种对外语义，换过来是**行为变更**，不是搬运
+  → **批 D1 已落地**（`d85096b`）：`DeviceProfile` 新增 `lteAllBandsMask()` / `nrAllBandsMask()`
+  （默认 `null`，两个方法而不是带 RAT 枚举的一个 —— 不为这件小事往冻结区加类型），
+  `ZteGoformProfile` 返回原常量的逐字取值；`GoformNetworkClient` 的两个 companion 常量删除、
+  改从非空 `commandProfile` 取，`lteAllBands()` / `nrAllBands()` 是**唯一**的 null 折叠 + WARN 归属地；
+  `NetworkController` 改调这两个方法（跨模块直读消失，只剩 `NetworkController.kt:132` 一行注释记着旧形态）；
+  `core/contract/Enums.kt` 那第三份零引用拷贝**直接删、不先标废弃**（没有消费者就没有迁移窗口要给）。
+  **对外语义一字未变**：`unlockAllBands()` 发的还是 `lte_band_lock=1,3,5,8,34,38,39,40,41` /
+  `nr_band_lock=1,5,8,28,41,78`，空串仍在调用方那侧表示「不发限制」。
+  ⚠ 验收的**真机那一半（频段锁回归 + 值域拒绝）仍未做**，见 §9 批 25 的第 3/4 层。
+
 - `[~]` 2.10 **二维码文件名模板进 profile 读侧 API 面**（0.5 未做的那一半，§15 的 **P1-5**）
   → **批 D2 已落地**：`DeviceProfile` 新增 `qrCodeFileNames(chip, ssidIndex): List<String> = emptyList()`，
   `ZteGoformProfile` 实现（两个候选：`{chip}_ssid{n}_qrcode_wifikey` 与兜底 `chip1_ssid1_qrcode_wifikey`，
@@ -1075,6 +1204,10 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): GoformCli
     device-schema 侧有一条 `distinct` 断言防这个
   - 空列表 = **该设备不支持从后台取二维码图**，行为与「所有候选都取不到」逐行相同
     （一条文件请求都不发、`lastQrCodeFailure` 为空串、原 WARN 照打、返回 null），**不抛异常**
+  - **代码已全部落地（第 1、2 层 ✓）**；仍标 `[~]` 而不是 `[x]` 的唯一原因是第 3/4 层未验 ——
+    解锁条件是下面「验收」里那条真机项：`GoformWifiClient` 里不再出现 `_qrcode_wifikey`（已成立），
+    **扫码直连在真机上仍能连上**（未验）。
+
 - `[~]` 2.11 **`checkDeviceEvents()` 容忍 `station_list` 的两种形态**（§15 的 **P1-29**，2026-09-23 裁决）
   → **2026-09-24 已落地**。容错解析放在 `core/common` 的 `StationListShape.kt`
   （`parseStationList()` + `Available` / `Missing` / `Malformed` 三态），`DataScheduler` 改用它。
@@ -1099,8 +1232,37 @@ private fun createTransport(settings: AppSettings, gatewayIp: String): GoformCli
     `current` 构造、首轮建基线、两个 for 的判定全部未改；字段缺失原来是 `?: return`（静默、保留基线），
     现在是 `Missing → return`（同）。**唯一变的是原本「抛异常 → catch → 清基线」那条失败路径。**
   - 校验：`:core:common:test` **176/176**（171 + 新增 5）、`:core:scheduler` 与 `:core` 编译通过。
+  - **代码已全部落地（第 1、2 层 ✓）**；仍标 `[~]` 的唯一原因是第 4 层未验 ——
+    解锁条件是下面「验收」里那条：关掉 `field_normalization_enabled` 后接入/断开一台 WiFi 设备
+    仍能产生事件、解不出来时日志里必须有 WARN（批 27 之后 WARN 才会落地，所以这条现在才验得了）。
+
 
 ### 怎么做
+
+> ⛔ **下面这段「2.1 Gradle」里「`device-spi` 依赖 `:core:collector`（要 `AtTransport`）」那句已作废，
+> 照它写会直接成环。** 原文保留（它是当时的判断，批 A 的决定 ② 正是从这里被推翻的），
+> 真实情况如下 —— 2026-09-25 读 `core/device-spi/build.gradle.kts` 与
+> `core/collector/build.gradle.kts` 核过：
+>
+> - **`AtTransport` 已在阶段 4 批 F 从 `:core:collector` 的 `at/` 包上移到 `:core:device-spi`。**
+>   所以不存在「device-spi 为了 `AtTransport` 去依赖 collector」这回事，方向恰好相反。
+> - **`device-spi` 不许依赖 `:core:goform` / `:core:collector` / `:core:controller`** ——
+>   这条已经写成 `build.gradle.kts` 的「硬性约束 1」：`goform` 反过来依赖 device-spi
+>   （`DeviceTransport` 在这里），`collector` 又依赖 `goform`，把它们加进来立刻成环。
+>   需要具体协议的东西一律放 `:core:device-plugins`。
+> - **`device-spi` 的实测依赖只有四条**：`api(project(":core:contract"))`、
+>   `api(project(":core:device-schema"))`、`api(libs.kotlinx.serialization.json)`、
+>   `implementation(libs.kotlinx.coroutines.android)`（另有两条 `testImplementation`：
+>   `junit` 与 `kotlinx.coroutines.android` —— 后者因为上面那条是 `implementation`、不传到测试 classpath，
+>   而 `resolve()` 自 5.2 起是 `suspend`，单测要 `runBlocking`）。
+>   **刻意不依赖 `libs.ktor.client.core`**：最终签名里没有任何 Ktor 类型。
+>   判据一句话：**只有公开签名里出现的类型才需要进依赖、才需要是 `api`**。
+> - **反过来是 `collector` 依赖 `device-spi`**：`core/collector/build.gradle.kts` 里有
+>   `implementation(project(":core:device-spi"))`，注释写明这一行**不加也能编**
+>   （`goform` 是用 `api` 声明 device-spi 的，传递过来就看得见 `AtTransport`），
+>   显式写是为了有约束力 —— 直接使用者不该把依赖寄生在「goform 恰好用了 api」这个事实上。
+> - 下面那张「模块依赖方向」图里的那条 `↑ collector` 现在要读成
+>   **collector → device-spi**（collector 是消费方），不是「collector 提供 `AtTransport`」。
 
 **2.1 Gradle**：`core/device-spi/build.gradle.kts` 依赖 `:core:contract` + `:core:device-schema` +
 `:core:collector`（要 `AtTransport`）。注意别让 `device-spi` 依赖 `:core:goform` ——
@@ -1130,6 +1292,12 @@ contract  ←  device-schema  ←  device-spi  ←  device-plugins  ←  core（
 - 每个 plugin 的 `id` 唯一且非空
 - 声明了 `Capability.X` → 必须能找到对应的 `WriteSpec`；反之，有 `WriteSpec` 但没声明 capability 也算失败
   （这条防的是「后端支持但前端永远灰着」）
+  ⚠ **后半句（「有 `WriteSpec` 但没声明 capability 也算失败」）已作废，见 §7 开头的裁决 ①**：
+  Capability 是**功能域**，与 `SettingKey` 不要求一一对应（实测 11 个域 vs 29 个 key），
+  照这条写出来的双向断言一上线必红。落地的 `PluginContractTest` 是**单向**的 ——
+  只断言「声明了就必须找得到写侧证据（`WriteSpec` 或 `smsSpec`）」，防的是「定了不用」；
+  纯读侧能力（`BATTERY`）走 `READ_ONLY_CAPABILITIES` 白名单显式豁免。
+  前半句仍然有效。
 - `probe()` 不做 I/O：用一个禁止文件访问的 `ProbeEnv` 假对象调用，并断言不抛
 - `capabilities` 里的每一项在 `Capability` 枚举里都有文档注释（否则前端不知道怎么翻译成文案）
 
@@ -1192,15 +1360,46 @@ contract  ←  device-schema  ←  device-spi  ←  device-plugins  ←  core（
 - `[~]` 3.4 新端点 `GET /api/device/capabilities`（**二选一已裁决：新端点，不并入 `/api/diagnose`**）
   → 返回 `{"plugin_id": "...", "capabilities": ["sms", ...]}`。**数组而不是 map** ——
   map 形态下旧客户端分不出「这是新增的能力」还是「不支持」。`plugin_id` 与 `/api/diagnose` 同源同值
-- `[ ]` 3.5 app 侧消费：不支持的开关置灰 + 一句原因 —— **等用户那批 UI 改动落地后单独一批**
+- `[~]` 3.5 app 侧消费：不支持的开关置灰 + 一句原因 —— **等用户那批 UI 改动落地后单独一批**
+  → **批 O（`ba08293`）落了机制与大部分入口，还没打完**：判定收在
+  `app/viewmodel/.../state/DeviceCapabilityState.kt` 的 `supports()`，
+  实现是 `!loaded || capability in supported` —— **`loaded=false` 时恒为 true**，
+  也就是拉不到能力集时**降级成「全部支持」**。方向只能是这一个：反过来做的话一次网络抖动
+  就能把整页灰掉，等于把「通道不可用」（503，可重试）冒充成「设备不支持」（501，不可恢复）。
+  拉取失败只记日志、不写错误 state；换设备 / 换地址时复位成 UNKNOWN 而不是空集合
+  （空集合会被判成「全部不支持」，重连那一瞬间整页全灰）。
+  置灰**不改 `checked`**（开关仍显示设备真实状态），文案只说「这台设备不支持 X」——
+  不写「未开启」「权限不足」，那两句会把用户引向一场没有出口的寻找。
+  已灰：`fota` / `samba`（网络功能页）、`performance_mode`（设备控制页）、`network_mode`（网络制式页）、
+  `cell_lock`（锁站页三个写按钮 + 页顶说明卡）= **4 个域 5 处控件**；「刷新」这类读侧入口不动。
+  **未完：`sms` / `traffic_limit` / `band_lock` 三个域**（commit 说明写的原因是与并行改动撞文件）——
+  所以这条是 `[~]` 不是 `[x]`。校验：`DeviceCapabilityStateTest` 7 条；
+  置灰分支在 F50 上**永远不会触发**（它声明全部 10 项），真机只能验「全部支持时 UI 与改动前一致」。
 - `[ ]` 3.6 web 侧消费：同上（`web/src/api/contract.ts` 加镜像类型）—— 同上
+  → 2026-09-25 实测**仍未做**：`web/**` 全仓搜不到 `/api/device/capabilities` 的任何消费
+  （`AboutPanel.vue` 只读 `device_profile` 块里的 `profile_id`）。
 - `[~]` 3.7 守门测试：`Capability` 每一项都至少被一处 route 或一处 UI 消费（防止定了不用）
   → 判据是「**每个 Capability 至少被一处 route 门禁引用**」+「引用总数 ≥ 项数 − 豁免数」，
   **刻意不设上限**（域内可以有多个写入口，计数管不住语义、还会在加入口时逼人改测试）；
   豁免表当前为空、且自带上限断言（防它变垃圾桶）。另有 `Capability.wire` 取值写死的断言
 - `[ ]` 3.8 两端镜像一致性测试：contract 的枚举 wire 名与 `contract.ts` 的字符串联合类型逐项对齐
   —— **跟 3.5 / 3.6 同批**（要动 web）
-- `[ ]` 3.9 **3B**（阶段 4 之后）：`BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 由 `PlatformAdapter` 推导
+  → 2026-09-25 实测**仍未做**。批 O 走的是另一条路：app 侧**直接复用 core 的 `Capability` 枚举**
+  （`app:data` 已 `api(:core:contract)`），不在 app 再抄一份 wire 名镜像 ——
+  所以「app 与 contract 对齐」这一半**结构上不可能错**，这条任务剩下的只有 web 那一半。
+- `[~]` 3.9 **3B**（阶段 4 之后）：`BATTERY` / `ROOT_SHELL` / `AT_CHANNEL` 由 `PlatformAdapter` 推导
+  → **三项的结论各不相同，整条按「一项落地、两项裁决不做」收尾**：
+  - `BATTERY` **已落地**（批 L 加枚举项 + 批 M 定最终形态），但**不由 `PlatformAdapter` 推导** ——
+    `readBattery()` 确定不进那个接口（理由见 §3.2 标废框第 2 条）。驱动方式是**插件静态声明**
+    （`ZteF50Plugin` 不声明 `BATTERY`）+ 装配层算一次布尔递给采集侧：`battery` map 多一个
+    `supported` 键、无电池机型跳过入库与本地告警。判据是「这台设备有没有电池」这条**设备事实**，
+    不是一次真实读取 —— F50 读得到恒为 50 的假值，任何「读一次看能不能读到」的设计在它上面都会判错。
+  - `ROOT_SHELL` / `AT_CHANNEL` **裁决不做**（批 L）：它们是**运行时状态**不是设备事实，
+    塞进静态能力集就是又一个假开关；现状已由 `/api/at/status` 的 `connected` 与 shell 的 root 上报
+    实时表达。经过记在 `Capability` 的文件头。
+  - 所以 `Capability` 实测是 **11 项**（10 个写侧域 + `BATTERY` 这个纯读侧域），
+    `/api/device/capabilities` 在 F50 上仍返回 10 项。
+
 
 ### 怎么做
 
@@ -1211,6 +1410,17 @@ contract  ←  device-schema  ←  device-spi  ←  device-plugins  ←  core（
 SMS, SIM_SLOT_SWITCH, BAND_LOCK, CELL_LOCK, NETWORK_MODE,
 SAMBA, USB_DEBUG, FOTA, PERFORMANCE_MODE, TRAFFIC_LIMIT
 ```
+
+> ⚠ **上面这 10 个是当时的草案清单；实际落地为 11 项。** 2026-09-25 数过
+> `core/contract/.../Capabilities.kt` 的枚举值 = **11**（`CapabilityWireTest` 有一条
+> 「值域大小固定为 11」把它写死）。第 11 项是 **`BATTERY("battery")`**，批 L 追加、批 M 定型：
+> 它是**纯读侧能力**，**不参与 route 门禁**（没有对应的写 route，`CapabilityGateTest` 把它列进
+> exempt、`PluginContractTest` 把它列进 `READ_ONLY_CAPABILITIES` 白名单），
+> 驱动的是「无电池机型跳过入库与本地告警 + `battery` map 下发 `supported`」。
+> ⚠ 另外**值域 11 项 ≠ 端点下发 11 个**：`/api/device/capabilities` 只含当前插件**声明了**的项，
+> F50 不声明 `BATTERY`，所以那个数组在 F50 上仍是 **10** 个。
+> 上面的清单不改（它是草案），要看当前值域请看代码。
+
 
 **3.3 落点**：在 route 的统一异常处理里捕 `CapabilityMissing`，不要在每个 handler 里写 if。
 `NetworkRoutes.kt:186` 那处注释同时删掉（它描述的事实由 capability 表达了）。
@@ -1304,25 +1514,136 @@ adapter 只提供「**这台设备怎么重启网络栈**」的知识（发哪�
 
 ### 阶段 4 — 平台适配层
 
-- `[ ]` 4.1 `PlatformAdapter` 实现 `SprdPlatform`：收 `ServiceCallAtExecutor` 的选型逻辑
-- `[ ]` 4.2 提权策略 `PrivilegeStrategy`：`SambaPreexecStrategy`（F50）+ `AdbOnlyStrategy`（兜底）
-- `[ ]` 4.3 传感器读法（温度 / 电池 / CPU）从 `SystemCollector` / `DownloadManager` 抽到 adapter
-- `[ ]` 4.4 `restartNetworkStack()` 收 `AT+SFUN=5/4`（`NetworkController.kt:183`）
-- `[ ]` 4.5 `DeviceTuning` 替换四处散落的实测常量
-- `[ ]` 4.6 `ATChannel.detectPlatform()` 的结果接到 `DevicePlugin.probe()` 上（它现在只用于上报）
+- `[x]` 4.1 `PlatformAdapter` 实现 `SprdPlatform`：收 `ServiceCallAtExecutor` 的选型逻辑
+  → **批 F（`1c04048`）已落地**：`AtTransport` 整文件上移到 `:core:device-spi`（零 import、零 Android
+  类型，不新增依赖也不成环），`SprdPlatform` + `ServiceCallAtExecutor` 落在
+  `core/device-plugins/.../platform/sprd/`（**不放 `zte/f50/`** —— 类里没有一个字节是 ZTE 知识，
+  别家 Unisoc 设备要原样复用）。`ATChannel` 留在 collector（策略层），`init()` 改成接收注入的
+  `List<AtTransport>`。`name = "SPREADTRUM"` 而不是 `"sprd"`：那个取值现在就在 `/api/at/platform`
+  下发，填小写等于一次静默的对外 JSON 变更。
+- `[-]` 4.2 提权策略 `PrivilegeStrategy`：`SambaPreexecStrategy`（F50）+ `AdbOnlyStrategy`（兜底）
+  → **放弃（§8 裁决 ④，降级为文档任务）**：实测提权只有一条实际路径 —— ADB 自连
+  `localhost:5555`（uid 2000），`ShellExecutor.executeAsRoot()` 全走它，回落是无特权的 `sh -c`，
+  `su -c` 已彻底移除；Samba `root preexec` 那条部署与保活都在跑但**执行入口没人调用，是死代码**。
+  为一条不存在的路径造策略接口，只会让人以为这里真有选择。`PlatformAdapter` 因此没有
+  `privilegeEscalation()`；Samba 那条登记为 §15 的 **P1-38**，真接上了再谈。
+- `[~]` 4.3 传感器读法（温度 / 电池 / CPU）从 `SystemCollector` / `DownloadManager` 抽到 adapter
+  → **三类读数的结论不同，只有温度真的进了 adapter**：
+  - **温度 ✓**：批 H（`6c22710`）把 `DownloadManager.readMaxTemp()` 的读法逐字搬进
+    `SprdPlatform.readTemperature()`（唯一差别是读不到返 `null` 而非 `0f`，契约要求）；
+    批 I（`0384f83`）`DataScheduler.readMaxCpuTemp()` 也改成调它 + `celsiusToMilliC` 换算。
+    **判据侧（下载限速 / 采集降频熔断 / 温度告警）统一到「全热区最大值」一个口径**；
+    **上报侧刻意不动**（`SystemCollector` 的 zone0 + 全热区列表、`QoSRoutes` 的 zone0）——
+    那是给人看的读数，语义不同（4.3 结论已写进 `PlatformAdapter.readTemperature` 的 KDoc）。
+    批 I 顺带修掉一个**既存缺陷**：原实现只有一层外层 try，任一热区 `readText` 抛异常就整轮退化成
+    0、误判「最凉」→ 高温时不降频、不清缓存、不告警；Unisoc 上确有 0400 root:root 的热区。
+  - **电池 ✗（裁决不做）**：不进 `PlatformAdapter`，改走能力声明 + 采集侧跳过，见 3.9 与 §3.2 标废框。
+  - **CPU ✗（未做，也没有裁决）**：2026-09-25 实测 `SystemCollector.readCpuUsage()` 与
+    `DownloadManager.readCpuUsage()` **仍各自读一份 `/proc/stat`**，`PlatformAdapter` 里没有任何
+    CPU 成员。要么补一批、要么照电池那样给它一个明确裁决 —— 现在是悬空状态，所以这条是 `[~]`。
+- `[x]` 4.4 `restartNetworkStack()` 收 `AT+SFUN=5/4`（`NetworkController.kt:183`）
+  → **批 G（`c637785`）已落地**：签名按 §8 的 ⑤ 收执行器
+  （`suspend fun restartNetworkStack(at: suspend (String) -> String?): Boolean`），
+  `SprdPlatform` 里那段**逐字搬迁**（命令、`delay(500)`、`delay(2000)`、`contains("OK")` 判据、
+  三条 INFO 与两条 WARN 文案全未改），`NetworkController` 退化成一行委派。
+  **两样刻意没搬**：互斥锁留在 `NetworkController`（`platform(ctx)` 每次调用新建实例，
+  锁放 adapter 等于没锁）、5000ms 超时留在调用方（超时属通道策略）。
+  单测 `SprdPlatformTest` 10 条用假执行器 + `runTest` 虚拟时钟把 500/2000 断到精确值。
+  真机判据（`POST /api/network/band` 锁频段后 `network_restarted` 那一位）**未验**。
+- `[x]` 4.5 `DeviceTuning` 替换四处散落的实测常量
+  → **五个字段全部有消费点了**（另两处按裁决 ② 不进 tuning）：
+  - **`DownloadManager` ✓**（批 H）：首次创建配置时两个阈值取自 tuning、`migrateConfig()` 的抬升
+    **目标值**改成 tuning 的值、第 4 档的 `+10` 换成 `downloadThrottleForcePauseOffsetC`；
+    **已有配置一个字节都不被 tuning 覆盖**。地板判据 70f/80f 仍是字面量（tuning 没有承载它，§15 的 **P1-40**）。
+    新增 `DownloadConfigTuningTest` 8 例，tuning 故意填 77/88/12 而不是 75/85/10 ——
+    否则「接线没接上」也能通过。
+  - **`AppSettings.monitorThermal*`（采集降频）与 `AlertEngine` 的阈值 65/75（用户告警）✗**：
+    按 §8 裁决 ② **不进** `DeviceTuning` —— 它们是**用户可配的策略**，不是设备事实。
+    `rootShellPermits` 也已按裁决 ③ 从 `DeviceTuning` 删除。
+    注意这条说的是**阈值**；下面那条回差带宽是另一回事。
+  - **`thermalJitterC` ✓**（2026-09-25 收尾轮）：`AlertEngine` 新增构造参数
+    `temperatureHysteresisC`（`Double`，默认 `DEFAULT_TEMP_HYSTERESIS_C = 3.0`），
+    `ComponentFactory` 从 `tuning.thermalJitterC.toDouble()` 递进去。
+    **刻意只递一个 Double 而不是整个 `DeviceTuning`**：`:core:alert` 不该认识插件层，
+    更要紧的是 tuning 里还躺着 `downloadThrottleWarnC = 75f` 而本类
+    `temperatureCritical` 默认也是 75.0 —— 把整包递进去就给「看到两边都是 75 就接线」留了口子。
+    验证：`AlertEngineDedupTest` 新增 1 例（宽带宽 20°C + 默认带宽 3°C 的阴性对照），
+    并做过**反向对照**：把接线改回读常量，这一例立刻红（8 tests / 1 failure）。
+  - **`bootGraceMs` ✓**（同轮）：`DataScheduler` 新增构造参数 `bootGraceDeviceDefaultMs`，
+    优先级变成「用户配置 > 插件实测值 > `BOOT_GRACE_DEFAULT_MS`」。
+    同样只递一个 `Long`（那个类里还有采集降频的 70/80，与 tuning 的 75/85 撞名）。
+    ⚠ **这一条没有单测**：`DataScheduler` 要真造得起来得凑齐十几个依赖 + `SystemClock`，
+    收益不抵成本。风险面是一行属性读取，但「没测」这件事要明写在这里。
+  - F50 的两个值（3f / 90_000L）与被替换的常量数值完全相同，**所以本次接线对现有行为零影响** ——
+    这既是安全性，也是隐患：不写上面那条阴性对照，接线被删掉也不会有任何测试变红。
+- `[x]` 4.6 `ATChannel.detectPlatform()` 的结果接到 `DevicePlugin.probe()` 上（它现在只用于上报）
+  → **批 J（`a3d3658`）已落地，但形状与原方案不同**：不是「把枚举接过去」，而是
+  **把读 `/proc/cpuinfo` 这一步上移**（改从注入的 `ProbeEnv.cpuInfoPlatform` 派生），
+  marker 判据合成一份放在 `:core:device-spi` 的 `CpuInfoPlatform`（纯常量 + 纯函数、零 I/O）——
+  **不放 `platform/sprd/`**：第二个消费者 `ATChannel`（`:core:collector`）看不见 device-plugins，
+  放那儿就只能继续留两份判据，而那正是 4.6 要消掉的。`Platform` 枚举三个取值与映射顺序一字未动
+  （**没有**改成直接取 `adapter.name` —— 那会让高通设备也被报成 SPREADTRUM）。
+  ⚠ **一处对外取值变化**：取并集后 marker 是 `[sprd, spreadtrum, unisoc]`，
+  所以 cpuinfo 里只有 `unisoc` 的机型上 `/api/at/platform` 从 `UNKNOWN` 变 `SPREADTRUM`
+  （在用的 F50 不受影响，已在 §16 基线加了比对提示）。
+
 
 注意：4.3 要保留 `SystemCollector.kt:232` 记录的结论（**不要硬编码**
 `/sys/class/power_supply/battery`，要遍历），同时修掉 `DownloadManager.kt:566` 违背该结论的那处硬编码。
 
-**验收**：温度 / 电池 / CPU 读数与改造前逐项一致（同一台机器对比 `/api/system/*` 的返回）；
-root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
+**验收**（2026-09-25 按批 H / 批 I / 批 L / 批 M 的实际结果改写 —— 原文写的是
+「温度 / 电池 / CPU 读数与改造前逐项一致（同一台机器对比 `/api/system/*` 的返回）」，
+**那三项里有两项已经不成立**）：
+
+- **温度**：判据侧（下载限速 / 采集降频熔断 / 温度告警）改成调 `PlatformAdapter.readTemperature()`，
+  口径统一为**全热区最大值**；上报侧（`SystemCollector` 的 zone0 + 全热区列表、`QoSRoutes` 的 zone0）
+  **未动**。所以「逐项一致」对上报侧成立；判据侧是**刻意的行为变更**（批 I 的四点语义差异 +
+  修掉一个既存的温控失效缺陷），比对时不要期望毫秒级逐位相同，要按批 I 记的四点逐条核。
+- **电池**：**对外 JSON 不再逐项一致** —— 批 M 给 `battery` map **新增了 `supported` 键**
+  （放在首位，F50 = false），`percent` 等读值本身回到了批 L 之前的系统值。
+  新增键对旧客户端安全（app 走 `ignoreUnknownKeys`），但「逐项一致」这个判据本身要改成
+  「**除新增 `supported` 外其余键逐项一致**」。另外无电池机型现在**跳过入库与本地告警**，
+  所以监控页的电池曲线会从某个时间点断掉 —— 那是预期，不是回归。
+- **CPU**：**压根没搬**。`SystemCollector.readCpuUsage()` 与 `DownloadManager.readCpuUsage()`
+  仍各自读一份 `/proc/stat`，`PlatformAdapter` 里没有任何 CPU 成员 —— 这一项没有 adapter 可验，
+  已登记为 §15 的 **P1-42**。
+- root shell 仍可用；`AT+SFUN` 重启网络栈仍生效（判据落在 `POST /api/network/band` 的
+  `network_restarted`，见 4.4 —— **仍未真机验**）。
 
 ### 阶段 5 — probe 选型上线
 
-- `[ ]` 5.1 `ProbeEnv` 采集实现（一次，缓存）
-- `[ ]` 5.2 各插件实现 `probe()`
-- `[ ]` 5.3 `deviceProfileId` 配置项从「决定性」降级为「覆盖」，设置页文案改为「自动识别（可手动指定）」
-- `[ ]` 5.4 `/api/diagnose` 的 `selection` 能区分 CONFIGURED / PROBED / DEFAULT / FALLBACK
+- `[x]` 5.1 `ProbeEnv` 采集实现（一次，缓存）
+  → **批 J（`a3d3658`）已落地**：`ProbeEnvCollector`（`core/device-plugins/.../probe/`）——
+  **不放 `:core:device-spi`**：那三件事全是 I/O（其中两件要 Android 与网络），而 device-spi 是纯契约层、
+  单测必须不起 Android 就能跑。采集点在**装配层** `ComponentFactory.build()`（选型之前采一次、
+  `ATChannel` 吃的是同一个对象），不是 §3.3 原写的 `DeviceRuntime`。
+  裸 HTTP 探 `cmd=LD` 照 `ensureLogin` 的实测形状发（不带 Cookie、不带密码 —— 此刻 transport 还没造，
+  这正是「鸡生蛋」）；1.5s 用在三处（connect / read / `withTimeoutOrNull`，因为 `HttpURLConnection`
+  的阻塞读不响应协程取消，最坏 3s）；超时 / 异常 / 非 200 一律 false，整个采集不抛异常，
+  只放 `CancellationException` 过去 —— **绝不影响组件图构造**。
+- `[x]` 5.2 各插件实现 `probe()`
+  → **批 J + 批 K 已落地**：`ZteF50Plugin.probe()` 的判据是
+  `goformLdReachable`（60 分，唯一准入条件，不可达直接返 0）+ 展锐平台（+20，只加分 ——
+  同平台别家设备也会命中），`Build.*` 特征匹配**刻意不写**（全仓没有 F50 的实测取值，
+  没依据编字符串只会得到死代码或误命中）。批 K 起 `resolve()` 真的调它打分。
+- `[x]` 5.3 `deviceProfileId` 配置项从「决定性」降级为「覆盖」，设置页文案改为「自动识别（可手动指定）」
+  → **core 侧已落地（批 K，`2ead061`）**：选型顺序是 排障 WARN 最前 → **配置命中 = CONFIGURED
+  （配置永远最高优先级，probe 压根不调）** → 配置认不出 = FALLBACK → **配置为空才 probe 打分**，
+  最高分 > 0 得 PROBED、全 ≤ 0 回落 default（是 DEFAULT 不是 FALLBACK —— 没人配错）。
+  并列同分取 `plugins` 声明顺序靠前那个 + 一条 WARN 说明「并列意味着判据不足」；
+  `probe` 抛异常按 0 分、其余插件照常参与；`CancellationException` 单独先 catch 原样抛出。
+  ⚠ **「设置页文案」那一半没有对象**：2026-09-25 全仓 grep，`app/**` 与 `web/**` 都**没有**
+  `device_profile_id` 的输入项（app 侧零命中，web 只在 `AboutPanel.vue` 读诊断块里的 `profile_id`），
+  这个配置只能改配置文件。所以这条剩下的就是 core 侧语义降级，已落地。
+- `[x]` 5.4 `/api/diagnose` 的 `selection` 能区分 CONFIGURED / PROBED / DEFAULT / FALLBACK
+  → **四态在批 B2 就一次定稳了值域**（`configured` / `probed` / `default` / `fallback`，
+  映射写在 `Selection.wire` 上、不在下发处 `name.lowercase()`），**批 K 起 `probed` 真的会出现** ——
+  现网零配置部署走 probe、真机上 LD 可达得 60 分，所以 `selection` 从 `default` 变成 `probed`，
+  选中的插件与改造前完全相同。反过来说：**`default` 现在意味着「没人认领、正在用兜底插件」**，
+  而 `probed` 隐含「探测通得过」（设备离线时 probe 返 0 → 仍是 `default`）。
+  ⚠ 顺带修的一处误导：`HttpServer` 里 `/api/diagnose` 旁边那条「probed 在当前版本不会出现」的注释
+  已在 `cd67804` 删掉 —— 它离 API 最近、最可能被抄进客户端实现。
+
 
 **验收**：清空 `deviceProfileId` 后仍然选中 `zte-f50`，日志写明 `selection=PROBED`；
 把 `ProbeEnv` 里的 `cpuInfoPlatform` 造成未知值时回落默认 + WARN，功能不中断。
@@ -1801,6 +2122,194 @@ root shell 仍可用；`AT+SFUN` 重启网络栈仍生效。
   - 校验：四处编译 + `:core:device-plugins:test` **21**（11 + 10）、device-spi 11、api 235、
     goform 103（`--rerun-tasks`）。第 3/4 层 ✗ —— **这一批改的是写路径**，
     真机判据是 `POST /api/network/band` 锁频段后 `network_restarted` 那一位。
+- 2026-09-24 **批 32（commit 里叫「阶段 4 的 4.3 一半 + 4.5 接线」，`SprdPlatform` KDoc 里叫批 H）**，
+  commit `6c22710`（子代理实现，我复核）。
+  **编号口径**：批 30 = 批 F、批 31 = 批 G，往后字母与序号一一对应（H=32、I=33、J=34、K=35、
+  L=36、M=37、N=38、O=39）；§15 的 P1-40 / P1-41 用的就是这套数字编号。
+  - **4.3 的 `DownloadManager` 那一半**：`SprdPlatform.readTemperature()` **逐字搬** `readMaxTemp`
+    的读法（遍历 `/sys/class/thermal` 全热区、每热区独立 try、`canRead` 守卫、负数夹地板），
+    **唯一不同是读不到返 `null` 而不是 `0f`**（契约要求）。`DownloadManager` 改调 adapter 并 `?: 0f`
+    —— 五种情形逐路对照过、分档结果与改造前完全一致，**没有**顺手改成「读不到按最高档保护」
+    （那是行为变更，不是搬运）。
+  - **4.5 接线**：`DownloadManager` 注入 `tuning`。首次创建配置时两个阈值取自 tuning；
+    **已有配置一个字节都不被 tuning 覆盖**；`migrateConfig` 的抬升**目标值**改成 tuning 的值，
+    而地板判据 `70f` / `80f` **保持字面量** —— 它与目标值不是同一个数，`DeviceTuning` 没有承载它
+    （登记为 §15 的 **P1-40**）。第 4 档的 `+10` 改成 `tuning.downloadThrottleForcePauseOffsetC`。
+  - **刻意没碰**：采集降频那套（`AppSettings.monitorThermal*` 70/80）与用户告警那套
+    （`AlertEngine` 65/75 + 3°C 回差）一个字未改，**也没有因为 `AlertEngine.temperatureCritical`
+    与 `downloadThrottleWarnC` 都是 75 就接线**（§8 裁决 ② 里那个坑）。
+  - 验证：四处编译 + `DownloadConfigTuningTest` 新增 8 例 —— **tuning 故意填 77/88/12 而不是
+    75/85/10**，否则「接线没接上」也能通过；覆盖首次取 tuning、已有配置不被覆盖（含走真实反序列化
+    入口）、迁移抬到 tuning 值、地板判据没被误接成 tuning、第 4 档用 tuning 偏移量。
+    controller / device-plugins / api 测试全绿。
+  - `DataScheduler` 那一侧子代理**按纪律停手未改**：它直读毫摄氏度原值，`Float?` 往返实测 80001 个值
+    里 555 个少 1；更硬的阻塞是两份实现有四点语义差（目录守卫 / 异常粒度 / 负数地板 /
+    不可解析内容）。用户裁决方案 B（接受四点变更、用 `roundToInt` 换算），单独一批做 → 批 33。
+- 2026-09-24 **批 33（「阶段 4 的 4.3 收尾」，即批 I）**，commit `0384f83`（子代理实现，我复核）。
+  - `DataScheduler` 注入**共享的** `PlatformAdapter`，`readMaxCpuTemp` 改成调
+    `platform.readTemperature()` + `celsiusToMilliC` 换算。换算抽成 `core/common` 的纯函数并补 4 条单测，
+    **其中一条故意断言 `toInt()` 算错**（32002 毫度 → `toInt` 得 32001、`roundToInt` 得 32002），
+    把「为什么必须 `roundToInt`」钉死在测试里，防将来被顺手简化成截断。
+    实测 20~100°C 区间 80001 个值：`toInt` 有 555 个少 1，`roundToInt` 零不匹配。
+  - **这一批是行为变更不是搬运**，四点语义差异逐条核过影响面：目录/文件守卫（取值不变，多一条 WARN）、
+    负数夹地板（下游三条降频档与熔断 `when` 对负数与 0 判定相同，真机不可观测）、
+    不可解析内容（max 从 0 起、0 不抬升结果，运行时等价）。
+  - **唯一会改变判定的是异常粒度，而那修掉了一个既存缺陷**：原实现只有一层外层 try，
+    任一热区 `readText` 抛异常就整轮退化成 0、误判「最凉」→ 高温时不降频、不清缓存、不告警。
+    Unisoc 上部分 `thermal_zone*/temp` 对非 root app 是 `0400 root:root` ——
+    **有这么一个热区，那类机型的温控一直是失效的**。改成每热区独立 try 后坏热区被跳过、其余照算。
+  - `null` 时的下游路径逐条保住：三条降频档落最凉、熔断 `when` 两个分支都不进、
+    `scanLocalAlerts` 的 `if (milli > 0)` 不成立所以 `AlertEngine` 的 65/75 回差状态机不被驱动
+    —— 与改造前逐位相同，**阈值一个字未碰**。
+  - WARN 文案去掉 `e.message` 插值（现在是编译期常量、能被 `repeatGate` 折叠成 1 条/分钟），
+    顺带修掉 **P1-35** 登记的那个坑。子代理还纠正了上一批报告里的一处事实错误：
+    `listFiles()` 对不存在的目录返回 `null`、`?:` 短路，所以「目录不存在」原本并不触发外层 catch 的 WARN。
+  - 验证：四处编译 + common **180**（176+4）+ controller 169 + device-plugins 21 + api 235 + goform 103。
+    新登记 **P1-41**（`DataScheduler` 行内注释写 85/75，实际阈值是 80/70 —— 那一批的硬约束是
+    「阈值一个字都不许碰」，所以刻意没动）。上报侧两处热区读法本批不碰。
+- 2026-09-24 **批 34（批 J）：4.6 + 5.1**，commit `a3d3658`（子代理实现，我复核）。
+  - **5.1**：新增 `ProbeEnvCollector`（`core/device-plugins` 的 `probe/` 包）。位置的四条排除理由都记下了：
+    不放 device-spi（纯契约层，单测不许起 Android）、不放 `core/common`（底座不该反向依赖设备 SPI）、
+    不放装配层（采集口径是会继续长的设备探测知识）。采 `cpuInfoPlatform`（`/proc/cpuinfo` 转小写原样给出）、
+    `androidBuild`、`goformLdReachable`；**整个采集不抛异常**，任何一项失败用 `null` / `false` 兜。
+    裸 HTTP 探测照 `ensureLogin` 的实测形状发 `cmd=LD`（不带 Cookie 不带密码 —— 此刻 transport 还没造，
+    这正是 `DeviceProfiles` 记的「鸡生蛋」）。1.5s 用在三处（connect / read / `withTimeoutOrNull`）：
+    `HttpURLConnection` 的阻塞读不响应协程取消，只靠 socket 超时最坏是 3s。
+    超时 / 异常 / 非 200 一律 `false`，只放 `CancellationException` 过去，**绝不影响组件图构造**。
+  - **4.6**：`ATChannel.detectPlatform` 删掉读文件那一步，改从注入的 `ProbeEnv.cpuInfoPlatform` 派生；
+    `Platform` 枚举三个取值与映射顺序一字未动，**没有**改成直接取 `adapter.name`
+    —— 那会让高通设备也被报成 `SPREADTRUM`、丢掉「这台其实不是展锐」的信息。
+    `ZteF50Plugin.probe` 不再自带 marker 列表。
+  - marker 合成一份放 `:core:device-spi` 的 `CpuInfoPlatform`（纯常量 + 纯函数，零 I/O 零 Android）。
+    这偏离了「平台知识放 `platform/sprd/`」的原指令，但理由成立：`:core:collector` 不许依赖
+    `:core:device-plugins`，放 `platform/sprd/` 的话 `ATChannel` 拿不到、只能继续留两份判据，
+    而那正是 4.6 要消掉的；另外 QUALCOMM 的两个 marker 在 `platform/` 下根本没有归属。
+  - ⚠ **一处对外取值变化**：并集后 marker 是 `[sprd, spreadtrum, unisoc]`（原 `ATChannel` 侧只有前两个），
+    所以 cpuinfo 里只有 `unisoc` 的机型上 `/api/at/platform` 等四处同源端点的 `platform`
+    从 `UNKNOWN` 变成 `SPREADTRUM`。在用的 F50 不受影响（cpuinfo 带 `Spreadtrum`）。
+    已在两处 KDoc 写明、一条单测钉住、§16 基线加了比对提示。
+  - `resolve()` **刻意不加 `probeEnv` 也不改 `suspend`**：本批范围是采集；加参数会把 `DeviceRuntime`
+    的 diff 从「只有 KDoc」变成「签名 + 11 条守选型规则的测试调用点」，而那 11 条正是本批唯一的回归防线。
+    验证：五处编译 + device-spi / device-plugins / api 测试全绿，新增 `CpuInfoPlatformTest` 9 条。
+- 2026-09-24 **批 35（批 K）：5.2 ~ 5.4 —— probe 真正参与选型**，commit `2ead061`（子代理实现，我复核）。
+  - `resolve()` 改 `suspend` 并收 `probeEnv`（批 34 已在它之前采好一份，`ATChannel` 吃的是同一个对象）。
+    选型顺序：排障 WARN 仍在最前 → 配置命中 `CONFIGURED`（**配置永远最高优先级，probe 压根不调**）→
+    配置认不出 `FALLBACK` → 配置为空才 probe 打分，最高分 > 0 则 `PROBED`、全部 ≤ 0 则回落 default
+    且是 `DEFAULT` 不是 `FALLBACK`（没人配错，走的是「认不出设备不能导致整个不工作」那条纪律）。
+  - 并列同分取 `plugins` 声明顺序靠前那个（`score > bestScore` 才换人）+ 一条 WARN 说明
+    「并列意味着判据不足」；probe 抛异常按 0 分处理、其余插件照常参与，
+    WARN 带插件 id 但**刻意不带异常 message**（`repeatGate` 按完整消息折叠，带 message 会让基数发散，
+    有测试硬钉这条）；`CancellationException` 单独先 catch 原样抛出 —— 调用方取消不是打分失败。
+  - **对现有部署零影响**：F50 的 `deviceProfileId` 是空 → 走 probe → 唯一插件在真机上 LD 可达得 60 分
+    → 选中的插件与改造前完全相同，只有 `/api/diagnose` 的 `selection` 从 `default` 变 `probed`
+    （`probed` 早在批 B2 一次定稳的值域里，**两端不用改**）。设备离线时 probe 返 0、`selection` 仍是
+    `default` —— 所以 `selection` 现在隐含了「探测通不通」，已写进 KDoc。
+  - 既有 11 条 `DeviceRuntimeTest` 断言**零改动**（`FakePlugin.probe` 原本就返 0，改成带默认值 0 的参数
+    + 调用计数）。新增 7 条：probe 命中 `PROBED`、多插件取最高分（两种声明顺序各跑一遍，证明是最高分
+    而不是第一个正分）、并列取靠前者（顺序倒过来再跑一遍，证明依据是列表顺序不是 id 字典序）、
+    抛异常者排最前也不中断后面的、全 0 回落 `DEFAULT` 且 `assertNotEquals FALLBACK`、
+    有配置时 `probeCalls == 0`、排障开关下 probe 照样参与且那条 WARN 仍在最前。
+  - 一处裁决：**probe 全 0 那条路径刻意不打日志**。我给的两条指令在这里硬冲突（要打日志 vs
+    既有断言不许改），选了不打，三条判据成立 —— 与改造前逐字一致、LD 探不通时采集器已经打过 WARN、
+    信息在 `/api/diagnose` 的 `selection` 里可见。三条断言「不打日志」的既有用例现在同时钉住了这个决定。
+    验证：三处编译 + device-spi **27**（20+7）+ api 235 + common 180 + goform 103。
+- 2026-09-24 **批 36（批 L）：无电池设备不再记录与告警假电量**，commit `4d9ea93`。
+  - 用户实测：**F50 没有电池、系统一直报 50%**。核过采集链后确认这不是「读不到」而是「读到假值」——
+    `level=50` / `scale=100` 满足 `SystemCollector` 第一级判据，于是 `percent=50`、那条「读不到」的 WARN
+    压根不打、`DataScheduler.collectBattery` 的 `level<0` 也不成立 → **数据库存着一条永远 50% 的假曲线、
+    告警引擎按假值在判**。`SystemCollector` 的 KDoc 原写「percent 恒为 -1」在这台机器上不成立
+    （那描述的是另一种机型），已修。
+  - 落地的裁决 C：`SystemCollector` 注入 `batterySupported`（装配层从 `runtime.plugin.capabilities`
+    算出的不可变布尔，**不递选型对象**），不支持时整段短路、`percent` / `level` 给 -1。
+    **键集 / 键序完全不变** —— 少一个键就是 JSON 形状变更。
+  - `Capability` 加 `BATTERY`（放末尾不影响已有声明序），但 `ZteF50Plugin` **不声明它**，
+    所以 `/api/device/capabilities` 的数组仍是 10 项。文件头补两段口径：为什么 3B 只落一项
+    （`ROOT_SHELL` / `AT_CHANNEL` 是运行时状态，塞进静态集合就是又一个假开关）、以及「纯读侧能力」这一类。
+    `readBattery()` 确定**不进** `PlatformAdapter`（主路径是 Android `BatteryManager`、不是平台知识，
+    还会给 `SprdPlatform` 加第一个 `Context` 依赖）。
+  - 三处测试口径同步：`CapabilityWireTest` 写死断言 10 → 11（值域一变必须有人显式改测试）、
+    `CapabilityGateTest` 的 exempt 空集 → `{BATTERY}` 并标明属「本质上不该有写 route」那类，
+    `PluginContractTest` 加 `READ_ONLY_CAPABILITIES` **显式白名单**而不是「找不到就跳过」，
+    并加一条「两表交集必须为空」——否则写侧判据会因例外分支先返回而静默失效。
+  - ⚠ 登记 **P0-4 发版阻塞**：core 侧改完后 app 三处会显示 `-1%` 且卡片被涂成 critical 红，
+    比原来的假 50% 更像故障。验证：五处编译 + contract 11 + device-plugins 21 + api 235 + device-spi 27。
+- 2026-09-24 **批 37（批 M）：电量回到系统值 + 新增 `supported` 字段，入库与告警按能力跳过**，
+  commit `9c0cbdd`。
+  - **用户推翻批 L 的裁决 C**（原话大意：F50 这种机型还是按系统值，别改成 -1，可以在电池详情弹窗提示）。
+    `getBatteryInfo` 的读值逻辑**整段回退到批 L 之前**（与 `4d9ea93^` 逐字节相同），F50 上 `percent` 仍是 50，
+    批 L 引入的 `-1` / `-1.0` / `false` / `None` 全部撤销。**P0-4 随之解除。**
+  - 新增 `battery` map 的 `supported` 字段（F50 = false），取值来自装配层**只算一次**的
+    `Capability.BATTERY in runtime.plugin.capabilities`，一路递到 `SystemCollector` 与 `DataScheduler`
+    —— 同一个 `val` 保证「填字段的口径」与「跳过入库的口径」**不可能漂移**。放在 map 首位是为了
+    异常路径（catch 后只剩半张表）也带着它。为什么不让客户端去读 `/api/device/capabilities`：
+    渲染电量卡片时手里已经有这张 map，为一个布尔再发一次请求不划算，
+    而且「读数」与「读数可信吗」在同一个响应里不会有不同步的窗口。
+  - 未声明电池能力时**跳过入库与本地告警**：`percent` 恢复系统值只解决显示问题，
+    「数据库存一条永远 50% 的假曲线」「告警引擎按假值判」还在。`collectBattery` 里
+    **先给 `_latestBattery` 赋值再判断跳过**（两个读端点靠它下发系统值，不赋值会让每次请求都在
+    Netty worker 上现场采集）；`scanLocalAlerts` 的门放在读取之前。
+    两条 WARN **刻意不同文** —— `repeatGate` 按「级别+tag+完整消息」折叠，同文案会互相顶掉，
+    就看不出另一道门也在生效。
+  - `SystemCollector` 的 KDoc 把**无电池机型的两种表现**都记下来了：F50 是 sticky intent 带
+    `level`/`scale` 但值是假的（恒 50，**没有任何「读不到」的信号**）；另一种是不带 `level`/`scale`（恒 -1）。
+    原注释只写了后者 —— 看到「恒为 -1」就以为无电池一定报 -1，会漏掉第一种，
+    那条 50% 假曲线就是这么进数据库的。
+  - 批 L 的其余部分全部保留（`Capability.BATTERY`、文件头两段口径、`ZteF50Plugin` 不声明、
+    `PlatformAdapter` 的 `readBattery` 不做、三处测试口径）；另有四处文件的 KDoc 跟着改了事实描述
+    （原文写「抹成 -1」，批 M 之后那是假话）。
+    验证：三处编译 + contract 11 + device-plugins 21 + api 235 + device-spi 27 + common 180。
+- 2026-09-25 **批 38（app 侧收尾，commit 标题未标批号，按字母序是批 N）：电池详情弹窗提示无电池机型**，
+
+
+  - commit `a249555`（app 三个文件 + 一条 `AppJsonTest` 用例）。
+
+  - `BatteryInfo` 加 `supported: Boolean = true`。**默认 true 是兼容性判据不是产品取舍** ——
+    旧版 core 的响应里没有这个键，默认 false 会让所有旧部署都被判成「可能无电池」并弹提示。
+  - `HomeMetricsDialog` 在 `supported=false` 时用 `UfiDialogNote`（中性说明档）加一行：
+    本机型可能没有电池、数值仅供参考、不做记录与告警。末尾那半句是解释「电池历史图为什么是空的」
+    的唯一线索（core 侧确实不入库不告警）。**没选 `UfiDialogWarning`**：那是橙底警告档，
+    它自己的 KDoc 就写着「别用它说普通的话」，而这不是故障。
+  - 充电状态弱化：`supported=false` 时「状态」与「充电中」两行的值给 `null`，`UfiInfoRow` 既有实现
+    渲染成长破折号。**零新增文案、零新增样式**；不隐藏行是为了不让弹窗行数随机型跳变；
+    破折号既不声称充电也不声称没充电，而「否」对一台没有电池的设备同样是假话。
+    `supported=true` 时两行渲染逐字节不变。
+  - 补的一条测试：`AppJsonTest` 加「core 省略该键时 `supported` 默认 true」——
+    用真实反序列化验旧 core 响应解出 true、显式 false 时不被默认值吃掉（核过 XML：5 条、`skipped=0`）。
+  - 首页卡片 `HomeMetricsCard` 按要求未动（它显示系统值，与 core 口径一致）。
+    登记未做：温度 / 电压在 F50 上大概率也是假值（本批只授权充电状态）；
+    `plugged` 字段全站无 UI 消费、是最适合表达「插着电但没电池」的死字段。
+- 2026-09-25 **文档轮（不标批号）：新增 `docs/device-adaptation-guide.md`**，commit `cd67804`。
+  - 分工从这一轮起固定：**计划书记「为什么这么设计、哪些方案被否掉」，适配指南记「照着做」。**
+    指南开头就写明能力边界（当前只支持 goform 系设备，非 goform 协议接不进来 ——
+    装配层那个 `as? GoformClient ?: error(...)` 就是哨兵），缺口清单单列一节。
+    内容按代码现状核对，不照抄计划书。
+  - 顺带修掉一条会误导客户端实现的注释：`HttpServer` 里 `/api/diagnose` 旁边写着
+    「`probed` 在当前版本不会出现（probe 选型是阶段 5）」—— **5.2 已落地，`probed` 现在是零配置部署的
+    常态取值**，而 `default` 反而意味着「没人认领、正在用兜底插件」。那条注释离 API 最近、
+    最可能被抄进文档，而 `DeviceRuntime` 的 KDoc 写的是对的，两处互相矛盾。
+  - 指南里诚实登记了**接第二台设备前必须先清的两处欠账**：`SignalCollector` 与 `DataScheduler` 的
+    `= ZteGoformProfile` 默认参数（新设备接上来后这两处仍会用 F50 的 profile）、
+    `GoformWifiClient` 两处直读 `ZteGoformProfile.ACL_MODE_BLACKLIST`（绕过 `commandProfile` 唯一通道）。
+    **后者此前任何清单都没登记。**
+- 2026-09-25 **批 39（批 O）：阶段 3 的 3.5 —— app 侧按能力集置灰**，commit `ba08293`。
+  - 此前 core 已按能力集回 501 / `NOT_SUPPORTED`，但 app 上的开关照样能点、点了才收到错误。
+    本批置灰 **4 个域 5 处控件**：`fota` / `samba`（网络功能页）、`performance_mode`（设备控制页）、
+    `network_mode`（网络制式页）、`cell_lock`（锁站页三个写按钮 + 页顶一张说明卡）。
+    **「刷新」这类读侧入口不动** —— 不支持锁站不等于不能看基站信息。
+  - 判定收在 `DeviceCapabilityState.supports()`：**`loaded=false` 时恒为 true**。拉取失败只记日志、
+    不写错误 state，于是降级方向只有一个 —— **不确定时按全部支持**。反过来做的话一次网络抖动就能把
+    整页灰掉，等于把「通道不可用」（503，可重试）冒充成「设备不支持」（501，不可恢复）。
+    换设备 / 换地址时跟 `resetFreshness` 一起复位成 UNKNOWN，**而不是清成空集合**
+    —— 后者会被判成「全部不支持」，重连那一瞬间整页全灰。
+  - **置灰不改 `checked`**（开关仍显示设备真实状态）；说明文案只说「这台设备不支持 X」，
+    不写「未开启」「权限不足」—— 那两句会把用户引向一场没有出口的寻找。
+  - 能力集**直接复用 core 的 `Capability` 枚举**（`app:data` 已 `api(:core:contract)`），
+    不在 app 侧再抄一份 wire 名镜像（所以 3.8 只剩 web 那一半）。
+    顺带给 `UfiSettingsToggle` 补 `enabled` 参数（同文件的 `UfiSettingsItem` / `UfiSettingsValue` 早就有）。
+  - 验证：`DeviceCapabilityStateTest` 7 条全绿。**置灰分支在 F50 上永远不会触发**（它声明全部 10 项），
+    所以只能靠单测验；真机能验的是「全部支持时 UI 与改动前一字不差」。
+  - **未完**：`sms` / `traffic_limit` / `band_lock` 三个域因与并行改动文件重叠未动 → 3.5 仍是 `[~]`。
+
 
 
 ### 执行记录
@@ -2427,6 +2936,16 @@ enum class Capability(val wire: String) {
 web 侧在 `contract.ts` 加同名字符串联合类型，并加一个守门测试断言两端逐项对齐（任务 3.8）。
 **第一批只定 10 个**（§7 的清单）：冻结区宁可晚定，也不要定一个将来要改名的。
 
+> ⚠ **上面那个代码块是当时的草案，现在实际是 11 项**（2026-09-25 数过
+> `core/contract/.../Capabilities.kt`，`CapabilityWireTest` 的「值域大小固定为 11」写死了它）。
+> 追加的是 **`BATTERY("battery")`**（批 L 加、批 M 定型），它是**纯读侧能力、不参与 route 门禁** ——
+> 声明序放在末尾，所以**没有动已有 10 项的顺序或 wire 名**，对旧客户端是一次安全的「只增」。
+> 代码块不改（它是草案），但读这一节时要知道：
+> 「第一批只定 10 个」这句话现在只描述**历史**，不描述当前值域。
+> 另外「值域 11 项」与「端点下发几项」是两件事：`/api/device/capabilities` 只含插件声明了的项，
+> F50 不声明 `BATTERY` → 数组仍是 10 个（这一点 `CapabilityWireTest` 的注释里也写着）。
+
+
 ### 11.5 两个裸命令端点是刻意的例外（已决）
 
 `POST /api/device/goform/query`（`DeviceRoutes.kt:129-156`）与
@@ -2865,6 +3384,25 @@ gradlew.bat :core:goform:test            # GoformSmsSendParamsTest 等
 ---
 
 ## 15. 阶段待办池（范围外问题登记处）
+
+**P0-4 ~~⚠ 发版阻塞：批 L 上线前必须先改 app 侧三处~~ → 2026-09-24 批 M 已解除**
+
+- **解除原因**：用户推翻裁决 C，改成方案 D（批 M）——`percent` **恢复系统值**（F50 上仍是 50），
+  不再抹成 -1，所以下面那三处 app 代码**不会**显示 `-1%`、也不会被涂成 critical 红。
+  原话：「还是按照系统值吧，别改成 -1 了，起码没那么膈应，
+  可以在电池详情弹窗中显示提示可能无电池或者检测不到之类的」。
+- **但 app 侧仍有一件要做的事**（不是阻塞，是新功能，归 3.5）：
+  battery map 现在多了一个 **`supported: Boolean`** 字段（F50 = false），
+  app 的电池详情弹窗要据此显示一句「本机型可能无电池 / 检测不到」之类的提示。
+- 下面这些定位结论保留，供 3.5 落地时参考（**它们现在不是 bug，是将来加提示的落点**）：
+  - `HomeMetricsCard.kt:104` `valueText = state.batteryInfo?.let { "${it.percent}%" } ?: "--"`
+  - `HomeMetricsCard.kt:107` 取色兜底 `val p = state.batteryInfo?.percent ?: 100`
+  - `HomeMetricsDialog.kt:130` `UfiInfoRow("当前电量", "${b.percent}%")` ← **提示加在这个弹窗里**
+- web 侧本来就安全（`percent >= 0` 才拼 `%`，`contract.ts:1349` 登记了 `batteryPercentUnknown: -1`），
+  但它也可以顺带读 `supported` 加同样的提示 —— 归 3.6。
+
+
+
 
 动手过程中发现但**刻意不在当前阶段修**的东西记在这里。格式：
 `P<级别>-<序号> 现象 / 事实 / 猜测 / 建议归属阶段`。
@@ -3545,6 +4083,32 @@ P1-19 是安装器那份，已按裁决结案为「刻意重复」；本条仍�
   会让本来就容易被误接的这组阈值更难读（见 P1-37）。
 - 待裁决：① 加两个字段（`downloadThrottleWarnFloorC` / `CriticalFloorC`）；
   ② 按「目标值 − 5」派生；③ 维持字面量并在 KDoc 写明它只对 F50 这一代配置有意义。
+
+#### 2026-09-25 文档回填轮新登记（P1-42）
+
+**P1-42 4.3 的「CPU 读法」从未落地，`/proc/stat` 仍有两份独立实现（阶段 4 的遗留缺口）**
+
+- 事实（2026-09-25 grep 核过）：`SystemCollector.readCpuUsage()`（`:core:collector`，`Double`，
+  两次 `/proc/stat` 差值）与 `DownloadManager.readCpuUsage()`（`:core:controller`，`Int`，同样两次差值）
+  **各读一份**；`PlatformAdapter` 里**没有任何 CPU 成员**（实测四个成员：`name` /
+  `atTransports()` / `readTemperature()` / `restartNetworkStack(at)`）。
+- 事实：任务 4.3 的原文是「传感器读法（温度 / **电池** / **CPU**）从 `SystemCollector` /
+  `DownloadManager` 抽到 adapter」。三项里**温度**在批 H / 批 I 落地，**电池**在批 L / 批 M
+  被明确裁决**不进** adapter（理由见 `PlatformAdapter` 文件头与 §3.2 标废框第 2 条），
+  **只有 CPU 既没做、也没有任何裁决** —— 它是三项里唯一的悬空项，所以 4.3 标 `[~]`。
+- 为什么它不像温度那样「顺手就能搬」：两份实现的**类型与口径不同**（`Double` 百分比 vs `Int` 百分比），
+  且消费侧的判据阈值也不同（`DataScheduler` 的 `> 80f` / `> 50f` 分档 vs `DownloadManager` 自己那套），
+  统一成一个 adapter 方法就必须先定「返回什么类型、谁负责取整」——
+  这与批 I 踩过的 `toInt()` / `roundToInt()` 是同一类坑（那次靠一条故意断言算错的单测钉住）。
+  所以这是一次**行为变更**，不是搬运，必须单独一批、单独验。
+- 另一个必须一起想清的事实：`/proc/cpuinfo` 的平台判据在 4.6 里被收进了 `:core:device-spi` 的
+  `CpuInfoPlatform`（纯常量 + 纯函数），而 CPU **使用率**是运行时读数、属于平台 I/O ——
+  两者别混成一件事：前者是「这台机器是什么平台」，后者是「它现在有多忙」。
+- 待裁决（三条，与电池那次同构）：① 给 `PlatformAdapter` 加 `suspend fun readCpuUsage(): Float?`
+  并统一两处调用点（读不到返 `null`，口径同 `readTemperature`）；
+  ② 判定它**不是平台知识**（`/proc/stat` 是 Linux 通用接口，不按机型分支）→ 照电池那样明确不做、
+  把 4.3 的措辞改窄；③ 只合并成 `core/common` 的一个纯函数（两处共用实现但不进 SPI）。
+  **裁决之前不要顺手改任何一处** —— 它们各自挂在采集循环与下载限速两条不同的判据链上。
 
 **P1-37 三套温度阈值撞名，其中一对「数值相同、语义相反」**
 

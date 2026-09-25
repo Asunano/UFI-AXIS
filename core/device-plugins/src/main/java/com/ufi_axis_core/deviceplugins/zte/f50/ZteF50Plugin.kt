@@ -23,8 +23,9 @@ import com.ufi_axis_core.devicespi.TransportConfig
  * - [platform] → [SprdPlatform]（同模块的 `platform/sprd/`，阶段 4 批 F）；
  * - [tuning] → 实测常量的原值（来源逐条记在 [DeviceTuning] 的字段 KDoc 上）。
  *
- * [capabilities] 同理：10 个域逐一对着「`ZteGoformProfile` 里有没有那条 `WriteSpec`」+
+ * [capabilities] 同理：3A 那 10 个域逐一对着「`ZteGoformProfile` 里有没有那条 `WriteSpec`」+
  * 「core 侧有没有那个写 route」核过（2026-09-24 阶段 3.2），不是照 [Capability] 的清单抄一遍。
+ * 3B 新增的 `Capability.BATTERY` **刻意没有声明**（F50 无电池，理由见 [capabilities] 的 KDoc）。
  *
  * 是 `object` 而不是 class：插件本身**无状态**（有状态的是它造出来的传输层）。
  */
@@ -35,7 +36,7 @@ object ZteF50Plugin : DevicePlugin {
     override val displayName = "ZTE F50"
 
     /**
-     * F50 支持 [Capability] 第一批的**全部 10 个域**。
+     * F50 支持 [Capability] 里**除 [Capability.BATTERY] 以外的 10 个域**（也就是 3A 那一批的全部）。
      *
      * ## 判据（逐项都是「WriteSpec 在 + route 在」两条同时成立）
      *
@@ -52,9 +53,23 @@ object ZteF50Plugin : DevicePlugin {
      * | [Capability.PERFORMANCE_MODE] | `PERFORMANCE_MODE` | `POST /api/device/performance` |
      * | [Capability.TRAFFIC_LIMIT] | `TRAFFIC_LIMIT` | `POST /api/device/data-limit` |
      *
-     * 「10 个全填」不是偷懒：第一批的 10 个域本来就是按「能在 F50 上明确验证、
+     * 「3A 那 10 个全填」不是偷懒：那一批本来就是按「能在 F50 上明确验证、
      * 且已有对应 route」挑出来的（计划书 §7）。真正需要挑的是**下一台设备** ——
      * 那时这里的对照表就是「该怎么核」的样例。
+     *
+     * ## 为什么**不**声明 [Capability.BATTERY]（2026-09-24 批 L，批 M 修正后果描述）
+     *
+     * **F50 没有电池**，用户实测确认。
+     *
+     * 这一项是纯读侧能力（不进上面那张表：它没有 `WriteSpec`、也没有写 route，
+     * 口径见 `Capability` 的文件头）。不声明它的直接后果（批 M / 方案 D 的口径）是：
+     * 电量**照系统值下发**（这台机器上恒为 50%），battery map 里多一个 `supported=false`
+     * 告诉客户端这个读数不可信；同时 `DataScheduler` 不把它入库、不拿它判电池告警。
+     * ⚠ 不是「抹成 -1」—— 批 L 那个做法已被用户推翻（app 端会渲染出红色的 `-1%`，更像故障）。
+     *
+     * ⚠ 特别注意**不要**因为「机器上能读到电量」就把它加回来：这台设备的
+     * sticky `ACTION_BATTERY_CHANGED` 恒报 `level=50, scale=100` —— 那是**假值**。
+     * 正是它让「读不到就兜底」的旧逻辑全部失效，50% 被当成真实读数存了很久。
      *
      * 排障时可以临时删掉一项验证门禁（如 [Capability.SAMBA] → `/api/device/samba` 回 501），
      * **验完必须还原**（计划书 §7 的验收写明了这是排查性删除）。
@@ -81,9 +96,12 @@ object ZteF50Plugin : DevicePlugin {
     /**
      * F50 跑在展锐（Unisoc）平台上 → [SprdPlatform]。
      *
-     * ⚠ [ctx] 目前**用不到**（[SprdPlatform] 只需要 `ProcessBuilder` 与 `/sys` 文件读，
-     * 两者都不要 `Context`），所以这里没往下传。签名保留它是因为 4.3 收电池读法时
-     * 大概会需要（`BatteryManager` 要 `Context`）—— 契约里留着比到时候改签名便宜。
+     * ⚠ [ctx] **用不到**（[SprdPlatform] 只需要 `ProcessBuilder` 与 `/sys` 文件读，
+     * 两者都不要 `Context`），所以这里没往下传。
+     * 2026-09-24 批 L 更新：原来这里写「4.3 收电池读法时大概会需要」——
+     * 那个假设已经作废，`readBattery()` 明确**不进** `PlatformAdapter`（理由在那个接口的文件头），
+     * 所以 `Context` 的唯一预期用途消失了。签名仍然保留它：`DevicePlugin.platform(ctx)` 是契约，
+     * 下一台设备的平台实现很可能真的需要 `Context`（例如读 framework 级别的系统属性）。
      * 每次调用新建一个：口径与 [createTransport] 一致，插件自己不缓存（见 [DevicePlugin.platform]）。
      */
     override fun platform(ctx: Context): PlatformAdapter = SprdPlatform()

@@ -1167,6 +1167,12 @@ interface UfiAxisApi {
     @POST("api/device/cell-unlock")
     suspend fun unlockAllCell(): SuccessResponse
 
+    // ========== Device Capabilities ==========
+    // 设备能力集（计划书 §7 阶段 3 的 3.5）。core 侧在装配组件图时算一次的**静态快照**，
+    // 不发任何设备查询，所以 app 侧缓存到进程生命周期就够（见 NetworkModule.loadDeviceCapabilities）。
+    @GET("api/device/capabilities")
+    suspend fun getDeviceCapabilities(): DeviceCapabilitiesResponse
+
     // ========== Shutdown ==========
     @POST("api/device/shutdown")
     suspend fun shutdownDevice(): DeviceControlResponse
