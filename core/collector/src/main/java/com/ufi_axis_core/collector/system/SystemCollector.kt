@@ -543,8 +543,11 @@ class SystemCollector(
      * 且 `temperature` 仍是「解析得到就原样 / 1000.0，解析不到写 0.0」——
      * 包含热区报 `-1` 时下发 `-0.001` 这个既有取值（那是 P3-3 在 [ThermalZones.readMax] 侧
      * 判无效的那种读数，但**本端点历来原样下发**，不跟着改）。
+     *
+     * 阻塞 sysfs 读整段切 IO：`readAll()` 加逐热区的 `type` 是十几次同步文件读，
+     * 而 `GET /api/device/thermal` 是在 Ktor 请求协程里直接调本方法的（口径同 [getCpuInfo]）。
      */
-    fun getThermalZones(): List<Map<String, Any>> {
+    suspend fun getThermalZones(): List<Map<String, Any>> = withContext(Dispatchers.IO) {
         val zones = mutableListOf<Map<String, Any>>()
         val scan = ThermalZones.readAll()
         scan.zones
@@ -557,7 +560,7 @@ class SystemCollector(
                 } catch (_: Exception) { zone.name }
                 zones.add(mapOf("name" to name, "temperature" to temp))
             }
-        return zones
+        zones
     }
 
     private fun formatUptime(seconds: Long): String {

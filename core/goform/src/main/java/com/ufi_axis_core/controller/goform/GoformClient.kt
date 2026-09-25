@@ -103,21 +103,14 @@ class GoformClient(
     @Volatile private var waVersion: String? = null
     @Volatile private var crVersion: String? = null
     @Volatile private var lastLoginAttempt = 0L
-    private val baseLoginCooldownMs = 1500L
-    // 2026-08-23: 退避上限从 60s 降到 10s —— 之前连续 session 失效会让退避叠到 60s，
-    // 前端轮询全被拦截，造成「长时间断连，必须手动重启核心服务」体感。10s 已足够
-    // 让设备 goform 释放被官方后台占用的 session，又不超出用户耐心。
-    private val maxLoginBackoffMs = 10_000L
-    // 2026-08-23: TTL 从 300s 缩到 90s —— ZTE 设备实际会话超时通常 1-3 分钟，
-    // 太长的 TTL 会让确保登录一直走缓存路径，等到下一次真断了才一起 invalidate 一波。
-    private val sessionCacheTtlMs = 90_000L
-    private val sessionValidationIntervalMs = 60_000L // 每 60s 验证一次
     @Volatile private var lastValidatedAt = 0L
-
-    
-    // 让位退避：检测到官方后台在线时主动避让 30s
     @Volatile private var lastGiveWayAt = 0L
-    private val giveWayDurationMs = 30_000L
+
+    // 2026-09-26：会话 TTL / 校验间隔 / 登录退避基数与上限 / 让位窗口这四组**数值与判定**
+    // 已搬到 [GoformSessionPolicy]（数值、注释、判定顺序逐字未变）。搬出去的唯一目的是让
+    // 「强制校验绕过 60s 间隔，但**不**绕过让位窗口与登录退避」这几条能在不起 HTTP 的前提下
+    // 被单测钉住。本类只留**状态**（上面那三个时间戳），判定一律问 policy。
+
 
     private val resolveMutex = Mutex()
     @Volatile private var baseUrlResolved = false
@@ -212,50 +205,107 @@ class GoformClient(
     override suspend fun ensureLogin(): Boolean = ensureSession() != null
 
     /**
+     * **强制校验**版的 [ensureLogin]：绕过 60s 校验间隔，下发前先确认会话真的还活着。
+     *
+     * ## 为什么需要它（2026-09-26，接「首次发短信必 500」那一批）
+     *
+     * `SEND_SMS` 已经走 [writeSessionSafe]，会话失效（登录页 / 非 200 / AD 算不出来）时会
+     * 重登重试一次。但真机上有一个**已知变体**：部分固件在会话陈旧时**不回登录页，而是回
+     * 200 + 业务失败体**（判据与踩坑记录见 [GoformWritePolicy.shouldRetryBusinessFailure]）。
+     * 那一档落 [GoformWriteResult.Accepted] ⇒ `isSuccess` 为假 ⇒ `SendVerdict` 判 `REJECTED`
+     * 且**不重发**（重复计费红线，不能破）⇒ 用户看到的还是"第一次发失败"。
+     *
+     * 所以真正的修法是把「会话陈旧」这个前提消掉：下发**之前**就校验一次。
+     *
+     * ## 语义边界（三条都不许放宽）
+     *
+     * 1. **只跳过校验间隔**（[GoformSessionPolicy.SESSION_VALIDATION_INTERVAL_MS]），
+     *    强制做一次 [validateSession]（一次轻量 `cmd=RD` GET）；
+     * 2. **校验失败才重登**，不是每次都强制重登 —— 重登要走 LD + LOGIN 两三个往返，
+     *    还会去撞 [consecutiveLoginFailures] 退避与官方后台让位窗口，反而制造新的首次失败；
+     * 3. **让位窗口与登录退避照旧生效**（见 [ensureSession] 里那两条短路上的注释）。
+     *    那两条是踩过坑的保护，"强制"指的是多校验一次，不是硬抢。
+     *
+     * ## 成本：每次调用多一次轻量 GET —— 所以只许用在用户发起的单次操作上
+     *
+     * 一次 `cmd=RD` 的往返在真机上是几十毫秒级，对**用户点了发送**这种单次操作完全可以接受
+     * （那条路后面还要回读信箱 3 次 × 1.2s）。
+     *
+     * **但不要把它接到自动 / 批量路径上** —— 例如 SMS 转发、日报、告警通知这些由调度器驱动、
+     * 一轮可能连发多条的地方。它们高频调用会给设备平白多出等量的 goform 请求，
+     * 把 [GoformQoS] 的许可占满，最后连读路径一起变慢（历史上「长时间断连」就是这么攒出来的）。
+     * 那些路径继续用 [ensureLogin]：它们本来就在重试圈里，慢一轮没有用户可感的代价。
+     *
+     * 目前唯一调用点：`GoformSmsClient.sendSms`。
+     */
+    override suspend fun ensureFreshLogin(): Boolean = ensureSession(forceValidate = true) != null
+
+    /**
      * 与 [ensureLogin] 同一套判定，但返回**当次判定所依据的会话快照**（null = 不可用）。
      *
      * 请求构建必须用这个返回值取 cookie，不要回头再读 [session]：判定与取 cookie 之间
      * 隔着一次 goform 往返，`invalidateSession()` 完全来得及把 cookie 置 null。
+     *
+     * @param forceValidate 见 [ensureFreshLogin]：只跳过校验间隔，不跳过让位窗口与登录退避。
      */
-    private suspend fun ensureSession(): SessionSnapshot? {
+    private suspend fun ensureSession(forceValidate: Boolean = false): SessionSnapshot? {
         ensureBaseUrlResolved()
         val now = System.currentTimeMillis()
         // ── 快速路径：缓存时间内且未到验证周期，直接返回 ──
+        // forceValidate 时 gate 不会给出 USE_CACHED，于是一定进锁走一次 validateSession。
         val fast = session.get()
-        if (fast.loggedIn && (now - lastValidatedAt) < sessionValidationIntervalMs) return fast
+        if (GoformSessionPolicy.gate(fast.loggedIn, now - lastValidatedAt, forceValidate)
+            == GoformSessionPolicy.SessionGate.USE_CACHED
+        ) return fast
 
         return loginMutex.withLock {
             val nowLocked = System.currentTimeMillis()
             val current = session.get()
-            // ── 二次检查 ──
-            if (current.loggedIn && (nowLocked - lastValidatedAt) < sessionValidationIntervalMs) return@withLock current
-
-            // ── 到达验证周期或已失效：执行 validate ──
-            if (current.loggedIn && (nowLocked - lastValidatedAt) < sessionCacheTtlMs) {
-                if (validateSession(current)) {
-                    lastValidatedAt = nowLocked
-                    return@withLock current
+            when (GoformSessionPolicy.gate(current.loggedIn, nowLocked - lastValidatedAt, forceValidate)) {
+                // ── 二次检查 ──
+                GoformSessionPolicy.SessionGate.USE_CACHED -> return@withLock current
+                // ── 到达验证周期（或调用方要求强制校验）：执行 validate ──
+                GoformSessionPolicy.SessionGate.VALIDATE -> {
+                    // forceValidate 这三条日志是真机上**唯一**能证明「下发前那次强制校验真的发生了」
+                    // 的痕迹：validateSession 成功时本身是静默的（只在网络错/失效时才打）。
+                    // 排障关键字：`[session] force validate`。
+                    if (forceValidate) {
+                        AppLogger.i(tag, "[session] force validate before dispatch " +
+                                "(sinceValidated=${nowLocked - lastValidatedAt}ms)")
+                    }
+                    if (validateSession(current)) {
+                        lastValidatedAt = nowLocked
+                        if (forceValidate) AppLogger.i(tag, "[session] force validate passed, reusing session")
+                        return@withLock current
+                    }
+                    // 校验没通过：validateSession 内部已经 invalidateSession() 了，往下走重登。
+                    // 这条是 WARN（release 包只保留 WARN 以上）：它正是「陈旧会话被拦在下发之前」
+                    // 这个修复真正起作用的那一刻，必须留证据。
+                    if (forceValidate) AppLogger.w(tag, "[session] force validate failed, re-login before dispatch")
                 }
+                // 没有登录态 / 连 TTL 都过了：直接重登，不浪费一次校验 GET。
+                GoformSessionPolicy.SessionGate.LOGIN -> Unit
             }
 
             val failCount = consecutiveLoginFailures.get()
-            
+
             // ── 检查让位状态 ──
-            val giveWayElapsed = nowLocked - lastGiveWayAt
-            if (lastGiveWayAt > 0 && giveWayElapsed < giveWayDurationMs) {
-                AppLogger.d(tag, "ensureLogin: Giving way to official UI (remains ${ (giveWayDurationMs - giveWayElapsed)/1000 }s)")
+            // ⚠ 这一条与下面的登录退避对 forceValidate **同样生效**：强制的只是「多校验一次」，
+            // 不是「硬抢登录」。为了"强制"把它们绕过去，就会去撞官方后台正在用的会话与
+            // 指数退避 —— 那只会制造新的首次失败，正是这两条保护当初要防的。
+            if (GoformSessionPolicy.shouldGiveWay(lastGiveWayAt, nowLocked)) {
+                val remainsSec = (GoformSessionPolicy.GIVE_WAY_DURATION_MS - (nowLocked - lastGiveWayAt)) / 1000
+                AppLogger.d(tag, "ensureLogin: Giving way to official UI (remains ${remainsSec}s)")
                 return@withLock null
             }
 
             // 2026-08-24: 不论 isLoggedIn 是否为 true，只要有失败记录就应用退避。
             // 否则在连续登录失败且 isLoggedIn=false 时会陷入无退避的死循环，压满 QoS。
-            if (failCount > 0) {
-                val backoffMs = (baseLoginCooldownMs * (1L shl failCount.coerceAtMost(6))).coerceAtMost(maxLoginBackoffMs)
-                if (nowLocked - lastLoginAttempt < backoffMs && lastLoginAttempt > 0L) {
-                    return@withLock null
-                }
+            if (GoformSessionPolicy.inLoginBackoff(failCount, lastLoginAttempt, nowLocked)) {
+                return@withLock null
             }
             markLoggedOut()
+
             AppLogger.i(tag, "Performing login to $deviceIp:$port... (failCount=$failCount)")
             try {
                 val base = baseUrl()
@@ -280,7 +330,7 @@ class GoformClient(
                     // 如果是 session 冲突，记录让位
                     if (loginBody.contains("\"result\":\"session\"", ignoreCase = true)) {
                         lastGiveWayAt = System.currentTimeMillis()
-                        AppLogger.w(tag, "Login rejected (session active), giving way for ${giveWayDurationMs/1000}s")
+                        AppLogger.w(tag, "Login rejected (session active), giving way for ${GoformSessionPolicy.GIVE_WAY_DURATION_MS / 1000}s")
                     }
                     AppLogger.w(tag, "LOGIN_MULTI_USER failed, trying LOGIN fallback...")
                     val fallbackResp = httpClient.post("$base/goform/goform_set_cmd_process") {
@@ -368,9 +418,9 @@ class GoformClient(
      * 2026-08-23 改造：仅标记「下次重登」，不再自增 [consecutiveLoginFailures]。
      *
      * 原因（旧版实现）：连续 invalidateSession 会把 failCount ++，而退避 backoff
-     * = 1500 * 2^failCount（封顶 maxLoginBackoffMs）。长会话运行 + 偶发心跳失败 +
-     * ZTE 官方后台在线顶「session active」，会让 failCount 几小时内叠到接近
-     * maxLoginBackoffMs。所有路径（前端 DataScheduler 轮询、信号采集、登出、
+     * = 1500 * 2^failCount（封顶 [GoformSessionPolicy.MAX_LOGIN_BACKOFF_MS]）。长会话运行 +
+     * 偶发心跳失败 + ZTE 官方后台在线顶「session active」，会让 failCount 几小时内叠到接近
+     * 那个上限。所有路径（前端 DataScheduler 轮询、信号采集、登出、
      * API 路由）都被 loginMutex 拒绝 → 「长时间断连，需要手动重启核心服务」。
      *
      * 真正**登录失败**（LD/AD 错误等）由 `ensureLogin()` 的 catch 自行递增，
@@ -469,42 +519,65 @@ class GoformClient(
     override suspend fun writeIdempotent(params: Map<String, String>): GoformWriteResult =
         postMeasured(params, retryOnSessionLost = true)
 
+    /**
+     * **非幂等但"没发出就该重发"**的写操作专用入口（`SEND_SMS` 的落点）。
+     *
+     * 三件必须一起记住的事：
+     *
+     * 1. **只对「确定没发出」重试。** 只有 [GoformWriteResult.SessionLost] 会触发重登重发 ——
+     *    那一态的语义是命令**根本没落到固件**（未登录 / AD 前置查询拿不到 wa·cr·RD /
+     *    设备回登录页 / HTTP 非 200，判据见 [GoformWriteResult]），所以重发**不会**产生
+     *    第二笔话费。
+     * 2. **业务失败绝不重试。** [GoformWriteResult.Accepted] 意味着设备已经收下并表过态，
+     *    即使 body 说失败，也**排除不了"其实已经进了发送队列"** —— 重发就是可能的第二条
+     *    真短信、第二笔钱。所以这里把 `retryOnBusinessFailure` 显式关掉，不能图省事改用
+     *    [writeIdempotent]（那条是开着的）。
+     * 3. **[GoformWriteResult.Unreachable] 也不重试**：拿不到设备表态，同样排除不了已发出。
+     *
+     * ## 三个写入口的分工（改动前先读完这张表）
+     *
+     * | 入口 | 会话失效 | 200 + 业务失败 | 谁在用 |
+     * |---|---|---|---|
+     * | [write] | 不重试 | 不重试 | `RetryPolicy.NEVER` 的命令（REBOOT / SHUTDOWN / FACTORY_RESET…）、删信箱 / 标已读 |
+     * | [writeIdempotent] | 重试一次 | 重试一次 | `SET_*` 这类**对同一取值幂等**的设置命令 |
+     * | [writeSessionSafe] | 重试一次 | **不重试** | `SEND_SMS`（非幂等，但"没发出"可以安全重发） |
+     *
+     * 为什么需要第三条路：`SEND_SMS` 原来走 [write]，整圈重试被 `retryOnSessionLost = false`
+     * 跳过，于是"冷启动 / 会话被官方后台顶掉后第一次发短信必 500、再点一次就好"在写路径上
+     * 是**必然**（第一次的失败路径顺带作废了会话，第二次因此走全新登录）。短信读路径 2026 年
+     * 改走 ContentResolver 之后没有任何东西在给 goform 会话续期，这条必然性只会更容易撞上。
+     */
+    override suspend fun writeSessionSafe(params: Map<String, String>): GoformWriteResult =
+        postMeasured(params, retryOnSessionLost = true, retryOnBusinessFailure = false)
+
+    /**
+     * 一次写操作的完整编排：重试圈 + 最终判据日志 + QoS 记账。
+     *
+     * @param retryOnSessionLost 会话失效（命令确定没落到固件）时重登重试一次。**同时是整圈
+     *   重试的总闸**：false ⇒ 一次都不重试（[write] 就是这条）。
+     * @param retryOnBusinessFailure 设备回 200 但 body 说失败时，也重登重试一次。
+     *   默认 **true**：这是 2026-09-15 修「冷启动后第一次切制式必失败」时定下的行为，
+     *   [write] / [writeIdempotent] 两个既有调用者都不传这个参数，因此行为逐位不变。
+     *   只有 [writeSessionSafe] 显式传 false（重发有重复计费风险，见那边的 KDoc）。
+     */
     private suspend fun postMeasured(
         params: Map<String, String>,
-        retryOnSessionLost: Boolean
+        retryOnSessionLost: Boolean,
+        retryOnBusinessFailure: Boolean = true
     ): GoformWriteResult = withContext(Dispatchers.IO) {
         val start = System.currentTimeMillis()
-        var attemptNo = 1
-        var result = goformPostOnce(params)
-        // 重试**必须**在 set 许可归还之后发起（goformPostOnce 内部的 withSetPermit 已退出），
-        // 理由与 queryInternal 那段注释一致：持一个许可再去申请第二个，在许可被自适应调节
-        // 压到 1 时就是永久挂死。上限由 GoformWritePolicy.MAX_ATTEMPTS 兜，不会无界重试。
-        //
-        // 两种可重试的失败（互斥，按顺序问一次）：
-        //  ① 会话失效：登录页 / 非 200 / AD 算不出来；
-        //  ② 设备回 200 但业务体说失败：固件在会话陈旧时也会走这一路，历史上被当成
-        //     「设备明确拒绝」直接 502，表现为「冷启动后第一次切制式必失败，再点一次就好」。
-        while (retryOnSessionLost && attemptNo < GoformWritePolicy.MAX_ATTEMPTS) {
-            val acceptedBody = (result as? GoformWriteResult.Accepted)?.body
-            if (GoformWritePolicy.shouldRetry(attemptNo, result)) {
-                attemptNo++
-                AppLogger.w(tag, "[goform_set] session lost, re-login and retry (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
-            } else if (GoformWritePolicy.shouldRetryBusinessFailure(
-                    attemptNo, result, acceptedBody?.let { isSuccess(it) } ?: true)
-            ) {
-                attemptNo++
-                // 这条是 WARN 而不是 DEBUG：release/benchmark 包只保留 WARN 以上，
-                // 而「第一次为什么被拒」只能靠设备回的这段 body 定性。
-                AppLogger.w(tag, "[goform_set] device returned business failure for " +
-                        "goformId=${params["goformId"]}, body=${acceptedBody?.take(200)}; " +
-                        "re-login and retry once (attempt=$attemptNo/${GoformWritePolicy.MAX_ATTEMPTS})")
-                // 陈旧会话是这一路最常见的成因，重发前先把会话作废，让 goformPostOnce 重登。
-                invalidateSession()
-            } else {
-                break
-            }
-            result = goformPostOnce(params)
-        }
+        // 循环体住在 GoformWritePolicy（2026-09-26 原样搬过去的，判定顺序与日志文案逐字未变），
+        // 为的是让「SessionLost 重试一次 / 业务失败绝不重发」两条能在不起 HTTP 的前提下被断言。
+        val attempted = GoformWritePolicy.runAttempts(
+            goformId = params["goformId"],
+            retryOnSessionLost = retryOnSessionLost,
+            retryOnBusinessFailure = retryOnBusinessFailure,
+            isSuccess = { isSuccess(it) },
+            invalidateSession = { invalidateSession() },
+            warn = { AppLogger.w(tag, it) },
+        ) { goformPostOnce(params) }
+        val result = attempted.result
+        val attemptNo = attempted.attempts
         // 重试后仍是业务失败 = 设备真的拒绝了这次取值，留一条 WARN 作为最终判据。
         (result as? GoformWriteResult.Accepted)?.body?.let { body ->
             if (!isSuccess(body)) {

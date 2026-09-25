@@ -140,6 +140,10 @@ object AppLogger {
     // 文件写入器缓存 (key = "prefix_date"，自动按天切换)
     private val writerCache = ConcurrentHashMap<String, BufferedWriter>()
 
+    // 落盘串行化：getOrPut、轮转（close/remove/重建）、write/flush 必须在同一临界区里，
+    // 否则多协程并发会写出交错行，或对轮转时已关闭的流写入（Stream closed）。
+    private val writerLock = Any()
+
     // 最近一次落盘所属日期，用于跨天触发 cleanOldLogs()（core 常驻不重启也能清理过期文件）
     @Volatile
     private var lastWriteDate: String? = null
@@ -594,42 +598,44 @@ object AppLogger {
             cleanOldLogs()
         }
 
-        try {
-            val dayDir = File(root, date)
-            if (!dayDir.exists() && !dayDir.mkdirs()) return
-            val currentFile = File(dayDir, "${type.prefix}.log")
-            val writer = writerCache.getOrPut(key) {
-                BufferedWriter(FileWriter(currentFile, true), 4096)
-            }
-            // 写入前检查：单文件超过 5MB 时 rotate 到 .log.1（覆盖最旧），新建当前文件继续。
-            // 2026-08-27：此前只有 error 类型有上限，app.log / at.log 可以无限长。
-            if (currentFile.exists() && currentFile.length() > MAX_LOG_FILE_BYTES) {
-                try {
-                    writer.flush()
-                    writer.close()
-                } catch (e: Exception) {
-                    Log.e("$TAG/Logger", "rotate close failed: ${e.message}")
+        synchronized(writerLock) {
+            try {
+                val dayDir = File(root, date)
+                if (!dayDir.exists() && !dayDir.mkdirs()) return
+                val currentFile = File(dayDir, "${type.prefix}.log")
+                val writer = writerCache.getOrPut(key) {
+                    BufferedWriter(FileWriter(currentFile, true), 4096)
                 }
+                // 写入前检查：单文件超过 5MB 时 rotate 到 .log.1（覆盖最旧），新建当前文件继续。
+                // 2026-08-27：此前只有 error 类型有上限，app.log / at.log 可以无限长。
+                if (currentFile.exists() && currentFile.length() > MAX_LOG_FILE_BYTES) {
+                    try {
+                        writer.flush()
+                        writer.close()
+                    } catch (e: Exception) {
+                        Log.e("$TAG/Logger", "rotate close failed: ${e.message}")
+                    }
+                    writerCache.remove(key)
+                    val rotated = File(dayDir, "${type.prefix}.log.1")
+                    if (rotated.exists()) rotated.delete()
+                    currentFile.renameTo(rotated)
+                    val fresh = BufferedWriter(FileWriter(currentFile, false), 4096)
+                    writerCache[key] = fresh
+                    fresh.write(entry)
+                    fresh.newLine()
+                    fresh.flush()
+                    // 轮转是目录变大的自然节点，顺手校一次总量预算
+                    enforceTotalBudget()
+                    return
+                }
+                writer.write(entry)
+                writer.newLine()
+                writer.flush()
+            } catch (e: Exception) {
+                // 写日志文件失败时移除缓存 writer，下次重新创建
                 writerCache.remove(key)
-                val rotated = File(dayDir, "${type.prefix}.log.1")
-                if (rotated.exists()) rotated.delete()
-                currentFile.renameTo(rotated)
-                val fresh = BufferedWriter(FileWriter(currentFile, false), 4096)
-                writerCache[key] = fresh
-                fresh.write(entry)
-                fresh.newLine()
-                fresh.flush()
-                // 轮转是目录变大的自然节点，顺手校一次总量预算
-                enforceTotalBudget()
-                return
+                Log.e("$TAG/Logger", "Failed to write log file: ${e.message}")
             }
-            writer.write(entry)
-            writer.newLine()
-            writer.flush()
-        } catch (e: Exception) {
-            // 写日志文件失败时移除缓存 writer，下次重新创建
-            writerCache.remove(key)
-            Log.e("$TAG/Logger", "Failed to write log file: ${e.message}")
         }
     }
 
@@ -638,14 +644,16 @@ object AppLogger {
      * 关闭所有文件写入器（进程退出前调用）
      */
     fun closeWriters() {
-        writerCache.values.forEach {
-            try {
-                it.close()
-            } catch (e: Exception) {
-                Log.e("$TAG/Logger", "close failed: ${e.message}")
+        synchronized(writerLock) {
+            writerCache.values.forEach {
+                try {
+                    it.close()
+                } catch (e: Exception) {
+                    Log.e("$TAG/Logger", "close failed: ${e.message}")
+                }
             }
+            writerCache.clear()
         }
-        writerCache.clear()
     }
 
     /**
@@ -687,15 +695,18 @@ object AppLogger {
         val files = allLogFiles().sortedBy { it.lastModified() }
         var total = files.sumOf { it.length() }
         if (total <= MAX_LOG_DIR_BYTES) return
-        for (f in files) {
-            if (total <= MAX_LOG_DIR_BYTES) break
-            val size = f.length()
-            // 正在写的 writer 必须先关掉，否则删除后 writer 仍指向已删除的 inode，日志静默丢失
-            val key = "${f.name.removeSuffix(".log.1").removeSuffix(".log")}_${f.parentFile?.name}"
-            writerCache.remove(key)?.let {
-                try { it.close() } catch (_: Exception) {}
+        // 关 writer + 删文件与落盘走同一把锁：否则可能在别的线程正写这个 writer 时把它关掉
+        synchronized(writerLock) {
+            for (f in files) {
+                if (total <= MAX_LOG_DIR_BYTES) break
+                val size = f.length()
+                // 正在写的 writer 必须先关掉，否则删除后 writer 仍指向已删除的 inode，日志静默丢失
+                val key = "${f.name.removeSuffix(".log.1").removeSuffix(".log")}_${f.parentFile?.name}"
+                writerCache.remove(key)?.let {
+                    try { it.close() } catch (_: Exception) {}
+                }
+                if (f.delete()) total -= size
             }
-            if (f.delete()) total -= size
         }
         Log.w("$TAG/Logger", "log dir over budget, trimmed to ${total / 1024}KB")
     }

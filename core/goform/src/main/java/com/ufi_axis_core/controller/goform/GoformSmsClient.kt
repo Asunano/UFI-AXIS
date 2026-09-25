@@ -8,6 +8,7 @@ import com.ufi_axis_core.devicespi.adapter.SmsMeta
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
 import java.util.TimeZone
 
@@ -100,6 +101,11 @@ class GoformSmsClient(
                 client.invalidateSession()
                 null
             }
+        } catch (e: CancellationException) {
+            // 本方法整段都是挂起调用（ensureLogin / httpGet / bodyAsText）。取消**不是**
+            // 「信箱读失败」：吞成 null 之后 sendSms 的 baselineId 会静默退成 -1、
+            // verifySend 会把一次取消当成「没看到最终状态」，上层看到的是假的业务结果。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "Goform getSmsList failed", e)
             null
@@ -120,8 +126,23 @@ class GoformSmsClient(
      * 收不到。ZTE 把最终状态写在信箱行的 `tag` 上（判据取自 [SmsSpec.sentTag] /
      * [SmsSpec.failedTag]），所以发完回读几次就能拿到真实结论，而不是让 UI 显示一个假的"发送成功"。
      *
-     * **失败分两档**（判据见 [SendVerdict]）：设备回了响应但结果是拒绝 → [SendVerdict.REJECTED]；
-     * 请求没走完 / 响应读不出来 → [SendVerdict.NO_RESPONSE]（不知道设备有没有已经发出去）。
+     * **失败分两档**（判据见 [SendVerdict]），分界线只有一条：**我们知不知道设备没收到**。
+     * 2026-09-26 起下发走 [GoformTransport.writeSessionSafe]，映射表也随之收紧：
+     *
+     * | 设备表态 | 结论 | 为什么 |
+     * |---|---|---|
+     * | [GoformWriteResult.SessionLost] | [SendVerdict.REJECTED] | 命令**确定没落到固件**（重登重试过一次仍失败）⇒ 未发出、可安全重发、不计配额 |
+     * | [GoformWriteResult.Unreachable] | [SendVerdict.NO_RESPONSE] | 传输层就断了，排除不了"其实已经发出去了" ⇒ 不许自动重发 |
+     * | [GoformWriteResult.Accepted] + body 说失败 | [SendVerdict.REJECTED] | 设备明确说了"没收下" |
+     * | [GoformWriteResult.Accepted] + body 说成功 | 回读信箱定结论 | `success` 只代表进了发送队列（见上） |
+     *
+     * ## 下发前先强制刷一次会话（2026-09-26）
+     *
+     * 上面那张表救不了一个真机变体：部分固件在会话陈旧时**不回登录页、而是回 200 + 业务失败体**，
+     * 于是落 [GoformWriteResult.Accepted] ⇒ 判 [SendVerdict.REJECTED] 且**不重发**
+     * （重复计费红线不能破）⇒ 第一次发还是失败。所以下面用
+     * [GoformTransport.ensureFreshLogin] 把「会话陈旧」这个前提在下发**之前**就消掉。
+     * 它的成本与「为什么只有短信这一条用它」写在那个方法的 KDoc 里。
      */
     suspend fun sendSms(phoneNumber: String, message: String): SendOutcome {
         val number = phoneNumber.trim()
@@ -139,7 +160,14 @@ class GoformSmsClient(
         // REJECTED（可重试）。不先判的话它会和真正的"请求半路断了"一起变成 goformPost
         // 返回 null，被迫按 NO_RESPONSE（不可重试）处理 —— 而 UFI 的会话被官方后台挤掉
         // 是常态，那样一次会话抖动就会让 CRITICAL 通知永久丢失。
-        if (!client.ensureLogin()) {
+        //
+        // ⚠ 这里**必须**是 ensureFreshLogin（强制校验）而不是 ensureLogin（2026-09-26）：
+        // writeSessionSafe 只能救「设备回登录页 / 非 200」那一档；部分固件在会话陈旧时
+        // 回的是 **200 + 业务失败体**，那一档落 Accepted ⇒ 判 REJECTED 且**不重发**
+        // （重复计费红线），于是第一次发还是失败。强制校验把「会话陈旧」这个前提直接消掉。
+        // 代价是多一次轻量 GET —— 用户手动发一条短信可以接受，
+        // **自动/批量路径（SMS 转发、日报）不许照抄**，理由见 GoformTransport.ensureFreshLogin。
+        if (!client.ensureFreshLogin()) {
             AppLogger.w(tag, "sendSms rejected: not logged in, SEND_SMS never dispatched")
             return SendOutcome(SendVerdict.REJECTED, "设备未登录，发送请求未发出（详见日志）")
         }
@@ -147,28 +175,56 @@ class GoformSmsClient(
         val params = spec.sendParams(number, message, System.currentTimeMillis(), TimeZone.getDefault())
         // 先记下发送前的最大信箱 id：回读时只认新出现的行，避免把历史同号短信当成本次结果
         val baselineId = maxSmsId()
-        val resp = client.write(params)
-        if (resp == null) {
-            // 拿不到设备的表态：会话中途失效 / AD 计算失败 / HTTP 非 200 / 网络异常。
-            // 请求**可能已经落到固件里**，所以这里绝不能报可重试 —— 重试就是可能的第二笔话费。
-            AppLogger.e(
-                tag,
-                "sendSms 无法确认结果: to=${maskNumber(number)} chars=${message.length} " +
-                    "sms_time=${params["sms_time"]} resp=null（看 NET/goform 与 GoformClient 日志）"
-            )
-            return SendOutcome(
-                SendVerdict.NO_RESPONSE,
-                "请求未走完 / 响应无法解析 / 超时，无法确认设备是否已发出"
-            )
-        }
-        if (!client.isSuccess(resp)) {
-            // 设备回了响应、结果是拒绝 —— 它明确说了"没收下"，所以重试不会重复发。
-            AppLogger.w(
-                tag,
-                "sendSms rejected by device: to=${maskNumber(number)} chars=${message.length} " +
-                    "sms_time=${params["sms_time"]} resp=${resp.take(160)}"
-            )
-            return SendOutcome(SendVerdict.REJECTED, "设备明确拒收（详见日志）")
+        // ⚠ 这里**必须**是 writeSessionSafe，不是 write，也不是 writeIdempotent：
+        //  - write：整圈重试被跳过 ⇒ 会话一旦陈旧，第一次发必失败（2026-09-26 修的就是这条）；
+        //  - writeIdempotent：它连「设备回 200 + 业务失败体」也重发，而那一档排除不了
+        //    「其实已经进了发送队列」⇒ 可能是第二条真短信、第二笔话费。
+        // 三者的分工表见 GoformClient.writeSessionSafe 的 KDoc。
+        val result = client.writeSessionSafe(params)
+        // 三态 → 两档失败判据（见 SendVerdict）。分界线只有一条：**我们知不知道设备没收到**。
+        when (result) {
+            is GoformWriteResult.SessionLost -> {
+                // 会话失效的语义是命令**一个字节都没落到固件**（未登录 / AD 前置查询拿不到
+                // wa·cr·RD / 设备回登录页 / HTTP 非 200，判据见 GoformWriteResult）。
+                // writeSessionSafe 已经重登重试过一次仍是这一态 ⇒ 确定没发出。
+                // 所以归 REJECTED（可重试、不计配额）而不是含糊的 NO_RESPONSE：
+                // 后者会让上层既不重发、又照扣配额，等于把一条 CRITICAL 通知白丢掉。
+                AppLogger.w(
+                    tag,
+                    "sendSms 未发出（会话失效，已重登重试仍失败）: to=${maskNumber(number)} " +
+                        "chars=${message.length} sms_time=${params["sms_time"]}"
+                )
+                return SendOutcome(
+                    SendVerdict.REJECTED,
+                    "设备会话失效，SEND_SMS 未发出；可安全重发，本次不计入发送配额（详见日志）"
+                )
+            }
+            is GoformWriteResult.Unreachable -> {
+                // 传输层就断了：请求**可能已经落到固件里**，所以绝不能报可重试 ——
+                // 重试就是可能的第二笔话费。这一档保持现状语义不变。
+                AppLogger.e(
+                    tag,
+                    "sendSms 无法确认结果: to=${maskNumber(number)} chars=${message.length} " +
+                        "sms_time=${params["sms_time"]} detail=${result.detail}（看 NET/goform 与 GoformClient 日志）"
+                )
+                return SendOutcome(
+                    SendVerdict.NO_RESPONSE,
+                    "请求未走完 / 响应无法解析 / 超时，无法确认设备是否已发出"
+                )
+            }
+            is GoformWriteResult.Accepted -> {
+                // 设备表过态了，接着按业务体判成功/拒收（口径与改造前逐字相同）
+                val resp = result.body
+                if (!client.isSuccess(resp)) {
+                    // 设备回了响应、结果是拒绝 —— 它明确说了"没收下"，所以重试不会重复发。
+                    AppLogger.w(
+                        tag,
+                        "sendSms rejected by device: to=${maskNumber(number)} chars=${message.length} " +
+                            "sms_time=${params["sms_time"]} resp=${resp.take(160)}"
+                    )
+                    return SendOutcome(SendVerdict.REJECTED, "设备明确拒收（详见日志）")
+                }
+            }
         }
         AppLogger.i(tag, "sendSms accepted by device: to=${maskNumber(number)} chars=${message.length}")
         val outcome = verifySend(spec, number, baselineId)
@@ -253,6 +309,10 @@ class GoformSmsClient(
                 client.invalidateSession()
                 null
             }
+        } catch (e: CancellationException) {
+            // 同 getSmsList：整段都是挂起调用，取消不是「计数读失败」。
+            // 吞成 null 会让上层（未读红点 / 日报）把一次停机当成「信箱是空的」。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "Goform getSmsMeta failed", e)
             null

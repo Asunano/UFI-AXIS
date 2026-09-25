@@ -39,4 +39,8 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+    // 2026-09-26 起本模块有单测：`CancellationOrderGuardTest` 守 DataScheduler 里
+    // 「TimeoutCancellationException 必须排在 CancellationException 之前」这条顺序纪律
+    // （顺序写反会把 withTimeout 的超时当成外部取消抛出去，打断整条调度循环）。
+    testImplementation(libs.junit)
 }

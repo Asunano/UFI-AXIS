@@ -47,16 +47,22 @@ class ATChannel {
      */
     enum class Platform { SPREADTRUM, QUALCOMM, UNKNOWN }
 
+    // init() 在装配线程写、采集/请求协程读，全部标 @Volatile 建立 happens-before
+    @Volatile
     private var platform: Platform = Platform.UNKNOWN
+    @Volatile
     private var connected: Boolean = false
     val isConnected: Boolean get() = connected
 
     /** 实际在用的通道；null = 未初始化或本机两套都不可用。 */
+    @Volatile
     private var transport: AtTransport? = null
 
     // ── 限流 & 退避 ──
     private val minCommandIntervalMs = 500L
     private var lastCommandTime: Long = 0L
+    // 退避在锁外读它（见 awaitBackoff），所以也要 @Volatile
+    @Volatile
     private var consecutiveFailures = 0
     private val maxConsecutiveFailures = 20
     @Volatile var isDisabled: Boolean = false
@@ -111,14 +117,34 @@ class ATChannel {
 
     /**
      * 发送 AT 指令并返回响应文本
+     *
+     * 退避**刻意放在 [withTimeoutOrNull] 之外**：它曾经在锁内，于是连续失败 6 次后
+     * 退避（32s → 现在封顶 30s）必然超过 [MUTEX_WAIT_TIMEOUT_MS]，每次调用都被超时取消 ——
+     * 失败计数不再自增、20 次熔断永不触发，还会误报一条 "timed out waiting for mutex"。
      */
-    suspend fun sendCommand(command: String, timeoutMs: Long = 3000): String? = withTimeoutOrNull(MUTEX_WAIT_TIMEOUT_MS) {
-        mutex.withLock {
-            sendCommandInternal(command, timeoutMs)
+    suspend fun sendCommand(command: String, timeoutMs: Long = 3000): String? {
+        awaitBackoff()
+        return withTimeoutOrNull(MUTEX_WAIT_TIMEOUT_MS) {
+            mutex.withLock {
+                sendCommandInternal(command, timeoutMs)
+            }
+        } ?: run {
+            AppLogger.w(tag, "sendCommand('$command') timed out waiting for mutex (${MUTEX_WAIT_TIMEOUT_MS}ms)")
+            null
         }
-    } ?: run {
-        AppLogger.w(tag, "sendCommand('$command') timed out waiting for mutex (${MUTEX_WAIT_TIMEOUT_MS}ms)")
-        null
+    }
+
+    /**
+     * 指数退避：500ms 起每次失败翻倍，上限 30s。
+     *
+     * 括号必须收在乘法**外面**：写成 `(1L shl n) * 500L.coerceAtMost(30_000L)` 时
+     * 上限作用在 500L 上（恒为 500），实际退避能到 (1 shl 6) * 500 = 32s，30s 上限形同虚设。
+     */
+    private suspend fun awaitBackoff() {
+        val failures = consecutiveFailures
+        if (failures <= 0) return
+        val backoff = ((1L shl (failures - 1).coerceAtMost(6)) * 500L).coerceAtMost(30_000L)
+        kotlinx.coroutines.delay(backoff)
     }
 
     /**
@@ -126,7 +152,7 @@ class ATChannel {
      *
      * 限流策略：
      * - 最小命令间隔 500ms，防止连续 AT 压垮 modem
-     * - 连续失败时指数退避
+     * - 连续失败时指数退避（在 [sendCommand] 里、拿锁之前做，见 [awaitBackoff]）
      * - 成功后重置退避计数
      */
     private suspend fun sendCommandInternal(command: String, timeoutMs: Long = 3000): String? {
@@ -146,13 +172,6 @@ class ATChannel {
         val elapsed = System.currentTimeMillis() - lastCommandTime
         if (elapsed < minCommandIntervalMs) {
             kotlinx.coroutines.delay(minCommandIntervalMs - elapsed)
-        }
-
-        // ── 退避 ──
-        if (consecutiveFailures > 0) {
-            val backoff = (1L shl (consecutiveFailures - 1).coerceAtMost(6)) * 500L
-                .coerceAtMost(30_000L)
-            kotlinx.coroutines.delay(backoff)
         }
 
         try {

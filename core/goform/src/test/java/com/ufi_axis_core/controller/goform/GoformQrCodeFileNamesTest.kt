@@ -87,6 +87,7 @@ class GoformQrCodeFileNamesTest {
         override fun parseJson(body: String): JsonObject? = nope()
         override fun isAuthFailure(body: String): Boolean = nope()
         override suspend fun writeIdempotent(params: Map<String, String>): GoformWriteResult = nope()
+        override suspend fun writeSessionSafe(params: Map<String, String>): GoformWriteResult = nope()
         override fun isSuccess(body: String?): Boolean = nope()
         override fun sha256Hex(input: String): String = nope()
     }

@@ -141,12 +141,11 @@ class SprdPlatform : PlatformAdapter {
      * 2. **AT 超时值 5000ms 留在调用方**。本方法的执行器签名里没有超时参数：
      *    超时是通道策略（`ATChannel.sendCommand(cmd, timeoutMs)`），由持有通道的一侧给。
      *
-     * ## 一处照搬的既有缺陷（本批刻意不修）
+     * ## 一处照搬的既有缺陷（已修）
      *
-     * `catch (e: Exception)` 会把 `CancellationException` 也吞掉 —— 调用方取消这次协程时，
-     * 本方法会返回 `false` 而不是把取消传播出去（同批的 [ServiceCallAtExecutor] 是先
-     * `catch CancellationException` 再 `throw` 的）。原实现就是这样，改它会改变取消语义，
-     * 不属于「等价搬迁」，登记在此。
+     * `catch (e: Exception)` 曾把 `CancellationException` 也吞掉 —— 调用方取消这次协程时
+     * 本方法返回 `false` 而不是把取消传播出去（`delay` 抛的就是它）。现在先
+     * `catch CancellationException` 再 `throw`，口径与同批的 [ServiceCallAtExecutor] 一致。
      *
      * @param at 由调用方注入的单条 AT 执行器，见 [PlatformAdapter.restartNetworkStack]。
      */
@@ -169,6 +168,8 @@ class SprdPlatform : PlatformAdapter {
             delay(2000)
             AppLogger.i(tag, "Network stack restart complete")
             return true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "Network stack restart exception: ${e.message}")
             return false

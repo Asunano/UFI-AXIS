@@ -8,7 +8,9 @@ import kotlinx.serialization.json.JsonObject
  * goform 协议传输层契约（**只许 `core/goform` module 内部使用**）。
  *
  * 它在 [DeviceTransport] 的 14 个公开方法之外，追加 6 个客户端与 [GoformSettingWriter]
- * 真正用到、但**跨模块没有任何调用方**的 7 个成员。
+ * 真正用到、但**跨模块没有任何调用方**的 9 个成员
+ * （2026-09-26 先新增 [writeSessionSafe]，同日再新增 [ensureFreshLogin]，原来是 7 个）。
+
  *
  * ## 为什么是 `public`，以及为什么它仍然「不对外」
  *
@@ -48,6 +50,32 @@ interface GoformTransport : DeviceTransport {
     /** 解析出真正可达的 base url（文件类端点不走 [ensureLogin]，但同样要先把 base url 定下来）。 */
     suspend fun ensureBaseUrlResolved()
 
+    /**
+     * **强制校验**版的 [ensureLogin]：绕过实现内部的会话校验间隔，下发前先确认会话还活着。
+     *
+     * 语义三条（判据与踩坑记录见 `GoformClient.ensureFreshLogin` 的 KDoc）：
+     *  1. 只跳过**校验间隔**，强制做一次轻量校验（goform 上是一次 `cmd=RD` GET）；
+     *  2. **校验失败才重登** —— 不是每次都强制重登；
+     *  3. 官方后台让位窗口与登录退避**照旧生效**。
+     *
+     * ## 成本与适用范围（⚠ 改调用点前必读）
+     *
+     * 每次调用多一次轻量 GET。这对**用户发起的单次操作**（手动发一条短信）可以接受，
+     * 但**不许**接到自动 / 批量路径上（SMS 转发、日报、告警通知这类调度器驱动的高频调用）——
+     * 那会给设备平白多出等量请求，占满 QoS 许可，把读路径一起拖慢。
+     * 那些路径继续用 [ensureLogin]。
+     *
+     * ## 为什么给默认实现
+     *
+     * 默认体就是 [ensureLogin]，也就是「不具备强制校验能力的实现 ⇒ 退回原语义」。
+     * 这样第二个协议实现（以及单测里的手写假传输层）不必为这个 goform 专属的优化被迫改签名，
+     * 而漏实现的后果最多是"没优化"，不会是"行为错"。
+     *
+     * 目前唯一调用点：`GoformSmsClient.sendSms`。
+     */
+    suspend fun ensureFreshLogin(): Boolean = ensureLogin()
+
+
     /** 直接 GET 一个设备侧 URL（文件类端点用：二维码图片、短信附件等），**必须带 session Cookie**。 */
     suspend fun httpGet(url: String): HttpResponse
 
@@ -59,6 +87,16 @@ interface GoformTransport : DeviceTransport {
 
     /** **幂等**写操作专用入口：会话失效时重登并只重试一次，三态结果见 [GoformWriteResult]。 */
     suspend fun writeIdempotent(params: Map<String, String>): GoformWriteResult
+
+    /**
+     * **非幂等但"没发出就该重发"**的写操作专用入口（`SEND_SMS`）。
+     *
+     * 只对 [GoformWriteResult.SessionLost]（命令确定没落到固件）重登重试一次；
+     * 设备回了 200 业务体但 body 说失败的那一路**绝不重发**（排除不了已进发送队列 ⇒
+     * 重复计费）。与 [write] / [writeIdempotent] 的分工表写在
+     * `GoformClient.writeSessionSafe` 的 KDoc 里，改动前先读那张表。
+     */
+    suspend fun writeSessionSafe(params: Map<String, String>): GoformWriteResult
 
     /** 设备业务响应是否表示成功。 */
     fun isSuccess(body: String?): Boolean

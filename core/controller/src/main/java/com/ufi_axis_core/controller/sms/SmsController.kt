@@ -319,13 +319,13 @@ class SmsController(
                     ids.forEach { id ->
                         try { vcDao?.deleteByMsgId(id) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
                     }
-                    AppLogger.i(tag, "deleteConversation($phone): deleted $rows via ContentResolver")
+                    AppLogger.i(tag, "deleteConversation(${phone.maskPhone()}): deleted $rows via ContentResolver")
                     return rows
                 }
             }
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) {
-            AppLogger.w(tag, "deleteConversation via ContentResolver failed for phone=$phone: ${e.javaClass.simpleName}: ${e.message}")
+            AppLogger.w(tag, "deleteConversation via ContentResolver failed for phone=${phone.maskPhone()}: ${e.javaClass.simpleName}: ${e.message}")
         }
 
         // ② goform 兜底：拉列表 → 按号码过滤 → 逐条删
@@ -343,15 +343,18 @@ class SmsController(
                 for (gfId in targetIds) {
                     if (gc.deleteSms(gfId.toString())) deleted++
                 }
-                AppLogger.i(tag, "deleteConversation($phone): deleted $deleted/${targetIds.size} via goform")
+                AppLogger.i(tag, "deleteConversation(${phone.maskPhone()}): deleted $deleted/${targetIds.size} via goform")
                 return deleted
             }
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) {
-            AppLogger.w(tag, "deleteConversation via goform failed for phone=$phone: ${e.javaClass.simpleName}: ${e.message}")
+            AppLogger.w(tag, "deleteConversation via goform failed for phone=${phone.maskPhone()}: ${e.javaClass.simpleName}: ${e.message}")
         }
         return -1
     }
+
+    /** 日志里的号码只留尾四位：诊断够用，完整手机号属于个人信息，不该落在日志里。 */
+    private fun String.maskPhone(): String = if (length <= 4) "***" else "***" + takeLast(4)
 
     /**
      * 批量删除多条短信（2026-09-21）。逐条调 [delete]。
@@ -532,6 +535,11 @@ class SmsController(
                 SendVerdict.REJECTED,
                 SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
             }
+        } catch (e: CancellationException) {
+            // 与本文件其它 suspend 方法同一条纪律：取消**不是**业务失败。
+            // 吞掉它会让「请求被客户端断开 / 上层 scope 取消」变成一条假的"发送失败"
+            // 提示给用户，而用户看到失败就会去手动重发 —— 那才是真花钱。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "send failed", e)
             SendResult(false, "发送失败（${e.javaClass.simpleName}: ${e.message ?: "-"}）")

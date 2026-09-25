@@ -1006,6 +1006,18 @@ class DataScheduler(
         } catch (e: TimeoutCancellationException) {
             AppLogger.w(tag, "checkDeviceEvents timed out (8s)")
             knownStations = null
+        } catch (e: CancellationException) {
+            // ⚠ 这一条**必须**排在 [TimeoutCancellationException] 之后 —— 后者是它的**子类**。
+            // 顺序写反的话 `withTimeout(8s)` 的超时会先落进这里被原样抛出去，而本函数是
+            // start() 里那条 60s 设备事件循环（`while (isActive) { checkDeviceEvents(); delay(…) }`）
+            // 直接调用的：抛出去就把整条循环打断了，设备接入/离开通知从此静默停摆 ——
+            // 而超时本该只是「本轮跳过、基线清空」（上面那条分支）。
+            //
+            // 排在后面之后，能到这里的只剩**外部取消**（stop() 的 cancelChildren()）。
+            // 它被下面的泛型 catch 吞掉时，本协程会继续跑完剩下的活，stop() 等的就是一个
+            // 不肯结束的子协程 —— 与本文件 collectTraffic() 里那条 CancellationException
+            // 分支同一口径：取消不是采集失败，原样抛回去。
+            throw e
         } catch (e: Exception) {
             AppLogger.w(tag, "checkDeviceEvents failed: ${e.message}")
             knownStations = null
@@ -1020,6 +1032,19 @@ class DataScheduler(
                 kotlinx.coroutines.withTimeout(5_000L) {
                     signalClient?.getSignalInfo()
                 }
+            } catch (_: TimeoutCancellationException) {
+                // 5s 拿不到 = 本轮没有 goform 数据，按 null 继续（下游 collect(null) 会退回
+                // 本机 telephony 采集）。⚠ 顺序与 checkDeviceEvents 同一条纪律：
+                // TimeoutCancellationException 是 CancellationException 的**子类**，
+                // 必须排在下面那条重抛**之前**，否则超时会被当成外部取消抛出去，
+                // 把整条秒级采集循环打断 —— 而超时本该只是「这一轮少一份数据」。
+                null
+            } catch (e: CancellationException) {
+                // 排在超时之后，能到这里的只剩**外部取消**（stop() 的 cancelChildren()）。
+                // 这里原来是 `catch (_: Exception) { null }`，把取消吞成「本轮没数据」，
+                // 于是停机瞬间本协程还会把剩下的 collect / 写 buffer / WebSocket 广播全跑完，
+                // stop() 等的就是一个不肯结束的子协程。取消不是采集失败，原样抛回去。
+                throw e
             } catch (_: Exception) {
                 null
             }

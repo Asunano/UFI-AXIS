@@ -145,14 +145,22 @@ class ServiceCallAtExecutor(
                 AppLogger.w(tag, "超时 ${timeoutMs}ms: ${argv.joinToString(" ")}")
                 return null
             }
-            process.inputStream.bufferedReader().readText()
+            process.inputStream.bufferedReader().use { it.readText() }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "执行失败: ${argv.firstOrNull()}", e)
             null
         } finally {
-            process?.destroyForcibly()
+            process?.let {
+                it.destroyForcibly()
+                // 强杀是异步的，短等一下让 fd 有确定的回收时机；等不到就放手，不拖住调用方
+                try {
+                    it.waitFor(KILL_WAIT_MS, TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
         }
     }
 
@@ -175,5 +183,8 @@ class ServiceCallAtExecutor(
 
         /** 探测只是问 servicemanager 要一次列表，1s 足够；卡住就当不可用。 */
         private const val PROBE_TIMEOUT_MS = 1_000L
+
+        /** destroyForcibly() 之后等子进程真正收尸的上限。 */
+        private const val KILL_WAIT_MS = 200L
     }
 }
