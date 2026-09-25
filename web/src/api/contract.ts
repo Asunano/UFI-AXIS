@@ -298,6 +298,26 @@ export const Endpoints = {
      * query：`path`（字幕真实路径）。后缀不认回 **415**，读取失败回 500。
      */
     subtitle: '/api/media/subtitle',
+    /**
+     * 排除名单：「从音乐库移除」的那一份路径清单（2026-09-23）。**只对 `type=audio` 生效。**
+     *
+     * `GET {excluded}` → `{ paths, total, max, full }`。`max` **不是产品上的取舍**：
+     * 名单会变成 `/list` 查询里的 `_data NOT IN (?,…)`，每条占一个 SQLite 绑定变量（上限 999）。
+     * `full` 是 core 算好的 `total >= max`，客户端据此**提前**提示，别让用户点完才发现没生效。
+     *
+     * `POST {exclude}` body `{ paths: string[], action: 'add' | 'remove' | 'clear' }`
+     * → `{ success, action, affected, requested, total, full }`。
+     * **`affected < requested` 是客户端唯一能发现"只生效了一部分"的途径**（撞上限被截断）。
+     *
+     * 与删文件刻意分成两条接口，不要合并成带 mode 的一条：这一条只改名单、**随时能撤销**；
+     * 删文件是 `POST /api/files/delete`，不可逆。合在一起，"能撤销"这件事在调用点上就消失了。
+     *
+     * 被排除的路径**从 `/list` 的结果里直接消失**，所以客户端拿不到它们的元数据 ——
+     * 管理界面只能按路径显示文件名。写操作成功后 core 失效 `media:*` 缓存并推
+     * `media:playlists`（复用那个 topic，目前没有独立的）。
+     */
+    excluded: '/api/media/excluded',
+    exclude: '/api/media/exclude',
   },
   /**
    * 音频歌单（core 侧 `PlaylistRoutes`，2026-09-21）。

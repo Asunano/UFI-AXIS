@@ -71,7 +71,8 @@
     </div>
     <div class="hint">
       组件从上游官方 release 直链下载，经 SHA-256 校验与 arm64 ELF 体检后安装到 filesDir/components/。
-      大陆网络可在「设置 → 更新」里配置镜像前缀加速。无外网时用「本地上传」手动提供裸二进制或官方 tar.gz。
+      大陆网络可在「设置 → 通用 → 更新配置」里把下载方式选成「镜像加速」。无外网时用「本地上传」手动提供裸二进制或官方
+      tar.gz。
     </div>
     <input ref="uploadInput" type="file" style="display: none" @change="onUploadPicked" />
     <template #footer>

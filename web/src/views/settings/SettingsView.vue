@@ -79,7 +79,7 @@ const CATEGORIES: Category[] = [
   },
   {
     key: 'uiExtras',
-    label: '界面小功能',
+    label: '小功能',
     desc: '顶栏天气与每日诗词。配置存在设备端，与手机端共用同一份',
     component: defineAsyncComponent(() => import('./panels/UiExtrasPanel.vue')),
   },

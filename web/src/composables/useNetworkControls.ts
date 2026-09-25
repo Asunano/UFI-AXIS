@@ -32,7 +32,7 @@
  *
  * 本文件不碰任何布局，也不 import 任何组件：调用方自己决定用什么控件、放在哪张卡。
  */
-import { ref, computed } from 'vue';
+import { ref, computed, onScopeDispose } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useCancellableApi } from '@/composables/useCancellableApi';
@@ -96,6 +96,22 @@ export function useNetworkControls() {
   const api = useCancellableApi();
   const dashboardStore = useDashboardStore();
 
+  /**
+   * 作用域已销毁（组件卸载 / 路由切走）。
+   *
+   * 卸载后 useCancellableApi 让每个请求都 resolve 成「无结果」，回读一律判成「没到达」——
+   * 轮询会一直跑到预算用尽，最后还在别的页面上弹一条误导的提示。所以带 await 的循环与
+   * 所有 toast 之前都要看这个标志。
+   */
+  let disposed = false;
+  /** detached 回读的 timer 句柄：卸载后这次回读没有意义，dispose 里统一清掉。 */
+  const detachedTimers = new Set<ReturnType<typeof setTimeout>>();
+  onScopeDispose(() => {
+    disposed = true;
+    for (const t of detachedTimers) clearTimeout(t);
+    detachedTimers.clear();
+  });
+
   /** 写操作统一外壳：toast、loading、信封失败判定、回读节奏都只在这里实现一次。 */
   async function runWrite<T>(opts: RunWriteOptions<T>): Promise<boolean> {
     const { setBusy, request, ok, fail = '操作失败', after, onOk, okWhen } = opts;
@@ -143,7 +159,12 @@ export function useNetworkControls() {
     if (after?.reload && (succeeded || after.always)) {
       const wait = after.delayMs ?? SETTLE_MS;
       if (after.detached) {
-        setTimeout(() => after.reload?.(), wait);
+        // 句柄登记进 detachedTimers：不登记的话卸载后这个 setTimeout 仍会醒来回读
+        const timer = setTimeout(() => {
+          detachedTimers.delete(timer);
+          after.reload?.();
+        }, wait);
+        detachedTimers.add(timer);
       } else {
         await new Promise((r) => setTimeout(r, wait));
         after.reload();
@@ -417,6 +438,8 @@ export function useNetworkControls() {
     let attempt = 0;
     let reached = false;
     for (;;) {
+      // 卸载后回读恒返回 null（= 判成没到达），再轮下去只是把预算跑满
+      if (disposed) return false;
       attempt += 1;
       reached = (await loadDeviceSettings()) === target;
       if (!shouldKeepProbingMode(attempt, reached)) break;
@@ -426,6 +449,8 @@ export function useNetworkControls() {
     modeSwitchTimedOut.value = !reached;
     // 闸门放开后补一次回读，让选中项与设备一致：成功时等于 target，超时时回到设备当前值
     await loadDeviceSettings();
+    // 组件已经不在了：这条 toast 会弹在用户当前所在的页面上，纯误导
+    if (disposed) return reached;
     if (reached) message.success('网络模式已切换');
     else message.warning('设备尚未完成切换，可稍后刷新查看');
     return reached;

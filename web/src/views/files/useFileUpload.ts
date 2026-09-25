@@ -54,6 +54,19 @@ const COMPLETE_URI = '/api/files/upload/complete';
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_MS = 1500;
 
+/**
+ * 单个请求的超时下限。
+ *
+ * 设备休眠或 WiFi 静默断开（对端不发 RST）时 TCP 连接会一直挂着，XHR 既不 load 也不 error，
+ * 于是 pump 的 await 永不返回、`running` 永久为 true，后续 enqueue 全被 `if (running) return`
+ * 挡在 pending 上且界面毫无提示 —— 只能刷新页面。所以每个请求都必须有超时。
+ */
+const REQUEST_TIMEOUT_MS = 60_000;
+/** 带 body 的请求按最低速率折算超时预算：大分片/大文件在弱网下本来就慢，不能按 60s 一刀切。 */
+const MIN_UPLOAD_BPS = 64 * 1024;
+/** 能力探测（`GET /api/files/status`）的超时：它只是一次小请求，卡住就该尽快降级。 */
+const CAPS_TIMEOUT_MS = 10_000;
+
 /** L2 续传线索的 localStorage 键。 */
 const RESUME_KEY = 'ufi.upload.resume';
 
@@ -143,6 +156,13 @@ interface XhrResult {
   status: number;
   error: string;
   body: any;
+  /** 这次是超时（没拿到任何响应）。超时值得重发，见 pump 里的 retriable 判定 */
+  timedOut?: boolean;
+}
+
+/** 带 body 的请求的超时预算：按最低 64KB/s 折算，不低于普通请求的 60s。 */
+function uploadTimeoutMs(bytes: number): number {
+  return Math.max(REQUEST_TIMEOUT_MS, Math.ceil(bytes / MIN_UPLOAD_BPS) * 1000);
 }
 
 export function useFileUpload(cb: UploadCallbacks) {
@@ -187,8 +207,18 @@ export function useFileUpload(cb: UploadCallbacks) {
         // 这里不复用 useApi 的实例：能力探测发生在任意调用栈上，
         // 而 useCancellableApi 绑定组件生命周期。直接用签名头发一次最简单。
         const headers = await authHeaders(u, 'GET');
-        const res = await fetch(`${appStore.baseUrl || ''}${u}`, { headers });
-        return { data: res.ok ? await res.json() : undefined };
+        // 必须带超时：这是 pump 的第一个 await，设备休眠时裸 fetch 会一直挂着，
+        // 整个队列连第一个文件都开不了。超时由 fetchUploadCaps 的 catch 收成回落能力位。
+        // 不用 AbortSignal.timeout：它在老一些的手机浏览器上没有，取不到会抛 TypeError
+        // 被同一个 catch 吞成"探测失败"，等于静默丢掉分片能力。
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), CAPS_TIMEOUT_MS);
+        try {
+          const res = await fetch(`${appStore.baseUrl || ''}${u}`, { headers, signal: controller.signal });
+          return { data: res.ok ? await res.json() : undefined };
+        } finally {
+          clearTimeout(timer);
+        }
       },
     });
     capsRef.value = caps;
@@ -251,7 +281,8 @@ export function useFileUpload(cb: UploadCallbacks) {
     uri: string,
     body: XMLHttpRequestBodyInit | null,
     taskId: number | null,
-    onUp?: (loaded: number) => void
+    onUp?: (loaded: number) => void,
+    timeoutMs: number = REQUEST_TIMEOUT_MS
   ): Promise<XhrResult> {
     return new Promise((resolve) => {
       // 签名摘要用的 URI 必须与实际请求路径逐字一致，query 也算在内
@@ -260,6 +291,8 @@ export function useFileUpload(cb: UploadCallbacks) {
           const xhr = new XMLHttpRequest();
           if (taskId !== null) inflight.value.set(taskId, xhr);
           xhr.open(method, `${appStore.baseUrl || ''}${uri}`, true);
+          // 必须在 open 之后设，否则 InvalidStateError
+          xhr.timeout = timeoutMs;
           for (const [k, v] of Object.entries(headers)) xhr.setRequestHeader(k, v);
           if (onUp) xhr.upload.onprogress = (e) => onUp(e.loaded);
           xhr.onload = () => {
@@ -281,6 +314,10 @@ export function useFileUpload(cb: UploadCallbacks) {
           xhr.onerror = () => {
             if (taskId !== null) inflight.value.delete(taskId);
             resolve({ ok: false, status: 0, error: '网络中断', body: null });
+          };
+          xhr.ontimeout = () => {
+            if (taskId !== null) inflight.value.delete(taskId);
+            resolve({ ok: false, status: 0, error: '请求超时', body: null, timedOut: true });
           };
           xhr.onabort = () => {
             if (taskId !== null) inflight.value.delete(taskId);
@@ -313,10 +350,18 @@ export function useFileUpload(cb: UploadCallbacks) {
     form.append('path', task.dir);
     form.append('file', file, task.name);
     // boundary 交给浏览器：手写 Content-Type 会漏掉 boundary，core 直接解析失败
-    return signedXhr('POST', UPLOAD_URI, form, task.id, (loaded) => {
-      task.loaded = loaded;
-      sampleSpeed(task, loaded);
-    });
+    return signedXhr(
+      'POST',
+      UPLOAD_URI,
+      form,
+      task.id,
+      (loaded) => {
+        task.loaded = loaded;
+        sampleSpeed(task, loaded);
+      },
+      // 整体上传是一次把整个文件推完，超时要按文件大小给
+      uploadTimeoutMs(task.size)
+    );
   }
 
   // ──────────────────────── 分片上传 ────────────────────────
@@ -367,10 +412,18 @@ export function useFileUpload(cb: UploadCallbacks) {
       }
       const base = received;
       const uri = `${CHUNK_URI}?session=${encodeURIComponent(sessionId)}&index=${index}`;
-      const res = await signedXhr('PUT', uri, blob, task.id, (loaded) => {
-        task.loaded = base + loaded;
-        sampleSpeed(task, task.loaded);
-      });
+      const res = await signedXhr(
+        'PUT',
+        uri,
+        blob,
+        task.id,
+        (loaded) => {
+          task.loaded = base + loaded;
+          sampleSpeed(task, task.loaded);
+        },
+        // 分片按本片字节数放宽：设备端分片可能有几十 MB，弱网下 60s 不够
+        uploadTimeoutMs(end - start)
+      );
 
       if (res.status === 409) {
         // 顺序不匹配：服务端在 extra 里回了它认的 next_index / received，据此纠正后重试
@@ -388,8 +441,10 @@ export function useFileUpload(cb: UploadCallbacks) {
         return { ok: false, status: 410, error: '上传会话已过期', body: null };
       }
       if (!res.ok) {
-        // 包含 507（空间不足，服务端刻意保留了进度）—— 记线索让用户清完空间能接着传
-        rememberResume(task);
+        // 包含 507（空间不足，服务端刻意保留了进度）—— 记线索让用户清完空间能接着传。
+        // 但取消不能记：cancel() 已经 DELETE 掉了会话（`.ufipart` 没了），
+        // 记下来只会让面板提示"可续传"，用户重选文件后却从 0 开始。
+        if (!isCanceled(task)) rememberResume(task);
         return res;
       }
       const next = Number(res.body?.received);
@@ -490,12 +545,15 @@ export function useFileUpload(cb: UploadCallbacks) {
           last = chunked ? await uploadChunked(task, file, c.chunkSize) : await uploadWhole(task, file);
           if (last.ok || isCanceled(task)) break;
           // 429 限流值得重试；分片路径下 410（会话过期）也值得 —— 重开会话会自动续传。
+          // 超时（设备休眠 / WiFi 静默断开）同样值得：连接是挂死的，重发才有机会拿到结果。
           // 其余 4xx 是请求本身不合法，重发同一份必然同样失败。
-          const retriable = last.status === 429 || (chunked && last.status === 410);
+          const retriable = last.status === 429 || last.timedOut === true || (chunked && last.status === 410);
           if (!retriable) break;
         }
         // 无论成功失败取消，这条的 File 都不再需要，及早释放引用
         pendingFiles.delete(task.id);
+        // 速率采样同理：不删的话 speedState 会随传过的文件数单调增长
+        speedState.delete(task.id);
         if (isCanceled(task)) continue;
         if (last.ok) {
           task.status = 'done';

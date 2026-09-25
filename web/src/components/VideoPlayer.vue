@@ -130,6 +130,15 @@ let assInstance: ASS | null = null;
  */
 let subtitleSeq = 0;
 /**
+ * 播放器创建的代数。与 [subtitleSeq] 同一套路。
+ *
+ * [createPlayer] 里 `art` 要等 `nextTick` 与 `import('artplayer')` 两次 await 之后才赋值，
+ * watch(url/name) 短时间触发两次时，后一次开头的 destroyPlayer 读到的 art 还是 null ——
+ * 先完成的那个实例被覆盖且永远不会 destroy，留下孤儿 video / 事件监听 / 解复用器
+ * （表现为两层画面或两路声音）。每个 await 之后与实例化后都校验代数，不是最新代就地收掉。
+ */
+let createSeq = 0;
+/**
  * 当前挂载的字幕走哪条渲染路径，空串 = 没挂。
  *
  * 用途只有一个：字幕外观设置只能作用于 ArtPlayer 内建字幕层（vtt/srt），
@@ -532,17 +541,20 @@ function buildSubtitleStyleSetting() {
 }
 
 async function createPlayer() {
+  const seq = ++createSeq;
   destroyPlayer();
   runtimeError.value = '';
   if (tier.value === 'unsupported' || !props.url) return;
   await nextTick();
+  if (seq !== createSeq) return;
   const host = hostEl.value;
   if (!host) return;
 
   const Artplayer = (await import('artplayer')).default;
+  if (seq !== createSeq) return;
   const type = artplayerTypeOf(props.name);
 
-  art = new Artplayer({
+  const instance = new Artplayer({
     container: host,
     url: props.url,
     // 显式给 type：url 没后缀，猜不出来（见文件头）
@@ -588,6 +600,17 @@ async function createPlayer() {
       mpd: (video: HTMLVideoElement, url: string) => attachDash(video, url),
     },
   });
+
+  if (seq !== createSeq) {
+    // 期间又触发了一次重建：这个实例已经没人认领，就地收掉（含 DOM）
+    try {
+      instance.destroy(true);
+    } catch {
+      /* 已经销毁过，忽略 */
+    }
+    return;
+  }
+  art = instance;
 
   // A 档的第二道兜底：容器对了不代表编码对了（HEVC / AC3 / ProRes 都在这里失败）
   art.on('video:error', () => {
