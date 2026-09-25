@@ -195,6 +195,7 @@ fun ServerConfigScreen(
         }
         UfiDialogActions(
             confirmText = "保存连接",
+            topSpacing = Spacing.Large,
             onConfirm = {
                 val p = connPort.toIntOrNull()
                 when {
@@ -210,6 +211,13 @@ fun ServerConfigScreen(
                         // （换机清缓存并重连，同机只轻刷新）。
                         onServerConfigChanged()
                         showConnectionDialog = false
+                        // 2026-09-22（阶段 3.5）：补成功提示。这一项**纯本地**（写
+                        // AppPreferences，没有请求可失败），所以走 notifyLocalWriteSucceeded
+                        // 而不是 module；提示仍落在全局宿主，不在本页另写一份。
+                        viewModel.notifyLocalWriteSucceeded(
+                            "Core 连接地址已保存",
+                            subtitle = "$connIp:$p"
+                        )
                     }
                 }
             },
@@ -224,6 +232,10 @@ fun ServerConfigScreen(
     var newPwd by remember { mutableStateOf("") }
     var confirmPwd by remember { mutableStateOf("") }
     var gwPwdError by remember { mutableStateOf<String?>(null) }
+    // 2026-09-22（阶段 3.2）：请求在飞期间的闸门。之前这里是"点保存 → 立刻关窗 + 弹绿色
+    // 「设备后台配置已保存」"，两个请求都还在飞 —— core 没起来、地址被拒、旧密码填错，
+    // 界面照样报成功。现在等结果，成功才关窗；失败留在弹窗里（原因由全局错误 Toast 给出）。
+    var gwSaving by remember { mutableStateOf(false) }
 
     UfiScrollableDialog(
         visible = showGatewayPwdDialog,
@@ -237,9 +249,12 @@ fun ServerConfigScreen(
         showCloseButton = false,
         actions = {
             UfiDialogActions(
-                confirmText = "保存",
+                confirmText = if (gwSaving) "保存中…" else "保存",
+                // loading 只是视觉，重复提交要靠 enabled 挡住（§4.3）
+                enabled = !gwSaving,
+                loading = gwSaving,
                 onConfirm = {
-                    // 1) 先校验并同步网关地址
+                    // 1) 前置校验（纯本地，不发请求）
                     when {
                         gwAddr.isBlank() -> { gwPwdError = "网关地址不能为空"; return@UfiDialogActions }
                         !gwAddr.contains(":") -> { gwPwdError = "需包含端口号（如 :8080）"; return@UfiDialogActions }
@@ -247,29 +262,40 @@ fun ServerConfigScreen(
                     val parts = gwAddr.split(":")
                     val gip = parts.getOrElse(0) { "192.168.0.1" }.ifBlank { "192.168.0.1" }
                     val gport = parts.getOrNull(1)?.toIntOrNull() ?: 8080
-                    prefs.gatewayIp = gip; prefs.goformPort = gport
-                    displayGwAddress = gwAddr
-                    // 不再回传本地密码副本：不传 goform_password 即「保持 core 现有密码不变」
-                    viewModel.tools.syncGatewayConfig(gip, gport)
-
-                    // 2) 再校验并提交密码修改（密码为空则只同步网关不报错）
-                    if (oldPwd.isNotEmpty() || newPwd.isNotEmpty() || confirmPwd.isNotEmpty()) {
+                    val wantPasswordChange =
+                        oldPwd.isNotEmpty() || newPwd.isNotEmpty() || confirmPwd.isNotEmpty()
+                    if (wantPasswordChange) {
                         when {
                             newPwd != confirmPwd -> { gwPwdError = "两次密码不一致"; return@UfiDialogActions }
                             oldPwd.isEmpty() || newPwd.isEmpty() -> { gwPwdError = "密码不能为空"; return@UfiDialogActions }
-                            else -> {
-                                viewModel.network.changePassword(oldPwd, newPwd)
-                                // core 端密码由 changePassword 落地；本地只记「已设置」
-                                prefs.goformPasswordSet = true
-                            }
                         }
                     }
 
-                    // 全部成功，关闭弹窗并通过页面级 Toast 提示
-                    showGatewayPwdDialog = false
-                    gwSelectedTab = 0
-                    oldPwd = ""; newPwd = ""; confirmPwd = ""; gwPwdError = null
-                    toastMessage = ToastMessage("设备后台配置已保存", ToastType.SUCCESS)
+                    gwPwdError = null
+                    gwSaving = true
+                    scope.launch {
+                        // 2) 两个写分属**不同 module**（地址在 tools / 密码在 network），
+                        //    各自等自己的结果、各自报自己的成功提示与失败原因。
+                        //    串行而不是并发：地址错了就没必要再拿错地址去改密码。
+                        val addrOk = viewModel.tools.syncGatewayConfig(gip, gport)
+                        val pwdOk = if (addrOk && wantPasswordChange) {
+                            viewModel.network.changePassword(oldPwd, newPwd)
+                        } else true
+
+                        gwSaving = false
+                        if (!addrOk || !pwdOk) return@launch
+
+                        // 3) 只有 core 真的收下之后才落本地缓存与界面摘要 ——
+                        //    先写会留下"本地显示新地址、core 还是旧的"这种更难查的分叉。
+                        prefs.gatewayIp = gip
+                        prefs.goformPort = gport
+                        displayGwAddress = gwAddr
+                        if (wantPasswordChange) prefs.goformPasswordSet = true
+
+                        showGatewayPwdDialog = false
+                        gwSelectedTab = 0
+                        oldPwd = ""; newPwd = ""; confirmPwd = ""
+                    }
                 },
                 onDismiss = {
                     showGatewayPwdDialog = false
@@ -432,7 +458,8 @@ fun ServerConfigScreen(
             onDismiss = { showWebPanelDialog = false },
             onConfirm = { showWebPanelDialog = false },
             confirmText = "完成",
-            dismissText = null
+            dismissText = null,
+            topSpacing = Spacing.Large
         )
     }
 

@@ -663,12 +663,32 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                 }
                             )
                         }
-                        add(
-                            UfiWizardStep(
-                                label = "确认",
-                                heading = if (needsGoformSetupNow) "核对一遍再配对" else "核对一遍再登录",
-                                description = "需要改动时点「上一步」，或直接点上方步骤条跳到任意一步。"
-                            ) {
+                        // ── 「确认」步只在**初次配对**出现（2026-09-25）──
+                        //
+                        // 判据复用上面那个 needsGoformSetupNow（= /pairing/info 的 has_default_password），
+                        // 不新造标记：这条流程的分支本来就全由后端那个字段派生（见 selectDevice 的说明）。
+                        //
+                        // 为什么登录路径不要确认页：那一步只有一个输入框（配对密码），
+                        // 确认页上能核对的就是「设备名 / 地址」两行只读信息 + 一句「密码已设置（N 位）」——
+                        // 用户刚刚亲手输的东西再看一遍，拦不住任何错误（密码对不对只有服务端知道），
+                        // 只是在「输密码 → 登录」之间插了一次多余的点击。
+                        //
+                        // 初次配对保留它是因为那条路径真的有东西要核对：新密码、GoForm 后台口令，
+                        // 而且这些是**一次性**设置，错了要退出重来。
+                        //
+                        // ⚠ 口径提醒：has_default_password 区分的是「**设备**从未被初始化」，
+                        // 不是「这台手机第一次配对」。所以「换台新手机首次连一台已配置的设备」
+                        // 也会走登录路径、没有确认页 —— 这与代码既有的划分一致（那条路径同样只输一个密码）。
+                        //
+                        // UfiWizard 支持单步：steps.size == 1 时 index == lastIndex，
+                        // 主按钮直接是 finishText（"登录"），步骤条不画连线（`i < labels.lastIndex` 为假）。
+                        if (needsGoformSetupNow) {
+                            add(
+                                UfiWizardStep(
+                                    label = "确认",
+                                    heading = "核对一遍再配对",
+                                    description = "需要改动时点「上一步」，或直接点上方步骤条跳到任意一步。"
+                                ) {
                                 Column(verticalArrangement = Arrangement.spacedBy(Spacing.Large)) {
                                     UfiWizardReviewCard(
                                         title = "设备",
@@ -707,10 +727,11 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                                 )
                                             )
                                         )
+                                        }
                                     }
                                 }
-                            }
-                        )
+                            )
+                        }
                     },
                     currentStep = confirmStep,
                     onStepChange = { confirmStep = it },

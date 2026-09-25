@@ -27,6 +27,7 @@ import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.state.DownloadConfigItem
 import com.ufi_axis.viewmodel.state.DownloadState
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -111,16 +112,26 @@ fun DownloadBasicSettingsScreen(
 ) {
     val state by viewModel.downloadState.collectAsState()
     var draft by remember(state.config) { mutableStateOf(state.config) }
+    // toast 只服务于下面那个「验证路径」按钮（读类动作，结果只对本页有意义）。
+    // 保存的成功/失败一律走全局宿主，见 SettingsSubScaffold 的说明。
     var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val palette = LocalResolvedPalette.current
 
     SettingsSubScaffold(
         title = "基础设置",
         navController = navController,
         dirty = draft != state.config,
+        saving = saving,
         onSave = {
-            viewModel.downloads.updateDownloadConfig(draft)
-            toast = ToastMessage("已保存", ToastType.SUCCESS)
+            scope.launch {
+                saving = true
+                // 成功提示与失败提示都由 DownloadModule 负责（等 core 回结果之后才发），
+                // 这里只关心"按钮该不该继续转圈"。
+                viewModel.downloads.updateDownloadConfig(draft, "基础设置")
+                saving = false
+            }
         },
         toast = toast,
         onToastDismiss = { toast = null }
@@ -238,18 +249,21 @@ fun DownloadThrottleSettingsScreen(
 ) {
     val state by viewModel.downloadState.collectAsState()
     var draft by remember(state.config) { mutableStateOf(state.config) }
-    var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     SettingsSubScaffold(
         title = "智能性能控制",
         navController = navController,
         dirty = draft != state.config,
+        saving = saving,
         onSave = {
-            viewModel.downloads.updateDownloadConfig(draft)
-            toast = ToastMessage("已保存", ToastType.SUCCESS)
-        },
-        toast = toast,
-        onToastDismiss = { toast = null }
+            scope.launch {
+                saving = true
+                viewModel.downloads.updateDownloadConfig(draft, "智能性能控制")
+                saving = false
+            }
+        }
     ) {
         SettingsCard(title = "开关") {
             SettingSwitchRow(
@@ -319,7 +333,11 @@ fun DownloadTrackerSettingsScreen(
 ) {
     val state by viewModel.downloadState.collectAsState()
     var draft by remember(state.config) { mutableStateOf(state.config) }
-    var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    // Tracker 列表与上面那组自动更新配置是**两个独立的写**（不同端点），所以各自一个在飞标志：
+    // 共用一个会让"保存列表"把上面那个保存按钮也一起置灰。
+    var savingTrackerList by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val palette = LocalResolvedPalette.current
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
 
@@ -333,12 +351,14 @@ fun DownloadTrackerSettingsScreen(
         title = "BT / Tracker",
         navController = navController,
         dirty = draft != state.config,
+        saving = saving,
         onSave = {
-            viewModel.downloads.updateDownloadConfig(draft)
-            toast = ToastMessage("已保存", ToastType.SUCCESS)
-        },
-        toast = toast,
-        onToastDismiss = { toast = null }
+            scope.launch {
+                saving = true
+                viewModel.downloads.updateDownloadConfig(draft, "BT / Tracker 设置")
+                saving = false
+            }
+        }
     ) {
         SettingsCard(title = "自动更新") {
             SettingSwitchRow(
@@ -421,12 +441,18 @@ fun DownloadTrackerSettingsScreen(
             Spacer(Modifier.height(8.dp))
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
-                text = "保存 Tracker 列表",
+                text = if (savingTrackerList) "保存中…" else "保存 Tracker 列表",
+                enabled = !savingTrackerList,
+                loading = savingTrackerList,
                 onClick = {
                     val commaSeparated = trackerText.split("\n")
                         .map { it.trim() }.filter { it.isNotBlank() }.joinToString(",")
-                    viewModel.downloads.saveTrackerList(commaSeparated)
-                    toast = ToastMessage("Tracker 列表已保存", ToastType.SUCCESS)
+                    scope.launch {
+                        savingTrackerList = true
+                        // 成功 / 失败提示都在 DownloadModule 里等结果之后才发
+                        viewModel.downloads.saveTrackerList(commaSeparated)
+                        savingTrackerList = false
+                    }
                 },
                 modifier = Modifier.fillMaxWidth()
             )
@@ -443,19 +469,22 @@ fun DownloadAdvancedSettingsScreen(
 ) {
     val state by viewModel.downloadState.collectAsState()
     var draft by remember(state.config) { mutableStateOf(state.config) }
-    var toast by remember { mutableStateOf<ToastMessage?>(null) }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     val palette = LocalResolvedPalette.current
 
     SettingsSubScaffold(
         title = "高级设置",
         navController = navController,
         dirty = draft != state.config,
+        saving = saving,
         onSave = {
-            viewModel.downloads.updateDownloadConfig(draft)
-            toast = ToastMessage("已保存", ToastType.SUCCESS)
-        },
-        toast = toast,
-        onToastDismiss = { toast = null }
+            scope.launch {
+                saving = true
+                viewModel.downloads.updateDownloadConfig(draft, "高级设置")
+                saving = false
+            }
+        }
     ) {
         SettingsCard(title = "分片与限速") {
             SettingSliderRow(label = "文件分片数", value = draft.splitCount, range = 1..16,
@@ -539,15 +568,23 @@ fun DownloadAdvancedSettingsScreen(
 
 // ==================== 页面骨架 / 公共行 ====================
 
-/** 子设置页统一骨架：滚动内容 + 底部保存按钮（无改动时按钮不出现）。 */
+/** 子设置页统一骨架：滚动内容 + 底部保存按钮（无改动时按钮不出现）。
+ *
+ * 2026-09-22：加 [saving]。保存改成"等 core 回结果"之后，请求在飞的这段时间必须既有
+ * 转圈也**禁用**按钮 —— 只给 loading 是视觉，连点仍会产出并发 PUT。
+ *
+ * [toast] 只留给**读类**反馈（基础设置页的「验证路径」按钮），保存成功/失败一律走
+ * 全局 Toast 宿主（`MainViewModel.writeNotice` / `globalError`），不在页面里再写一份。
+ */
 @Composable
 private fun SettingsSubScaffold(
     title: String,
     navController: NavHostController,
     dirty: Boolean,
+    saving: Boolean,
     onSave: () -> Unit,
-    toast: ToastMessage?,
-    onToastDismiss: () -> Unit,
+    toast: ToastMessage? = null,
+    onToastDismiss: () -> Unit = {},
     content: @Composable ColumnScope.() -> Unit
 ) {
     UfiScreenScaffold(
@@ -563,8 +600,10 @@ private fun SettingsSubScaffold(
                 content()
                 if (dirty) {
                     UfiButton(
-                        text = "保存",
+                        text = if (saving) "保存中…" else "保存",
                         onClick = onSave,
+                        enabled = !saving,
+                        loading = saving,
                         modifier = Modifier.fillMaxWidth()
                             .padding(horizontal = Spacing.CardHorizontalMargin)
                     )

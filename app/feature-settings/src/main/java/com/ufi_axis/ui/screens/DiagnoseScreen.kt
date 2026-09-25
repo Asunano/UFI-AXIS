@@ -399,7 +399,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             },
             confirmText = "失效",
-            dismissText = "取消"
+            dismissText = "取消",
+            topSpacing = Spacing.Large
         )
     }
 }

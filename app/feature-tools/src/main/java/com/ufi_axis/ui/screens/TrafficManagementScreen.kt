@@ -1,11 +1,8 @@
 package com.ufi_axis.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
+// 2026-09-25：animation 那 6 个 import（AnimatedVisibility / tween / expand·shrinkVertically /
+// fadeIn·fadeOut）随限额弹窗一起搬走了 —— 本文件已无使用点，见文件尾部
+// UfiDataLimitDialog 调用处的说明。
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
@@ -134,7 +131,9 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 val hours = monthlyTime / 3600
                 val mins = (monthlyTime % 3600) / 60
 
-                val limitBytes = if (enabled && limitSize.isNotBlank()) parseToBytes(limitSize, limitUnit) else 0L
+                // 限额字节数用 core 给的权威值 limit_bytes（Models.kt 明确要求客户端不做单位换算）；
+                // 本地 parseToBytes 只用于用户正在编辑的草稿提交值。
+                val limitBytes = if (enabled) cfg?.limit_bytes ?: 0L else 0L
                 val percent = if (limitBytes > 0) (monthTotal * 100f / limitBytes).coerceIn(0f, 100f) else 0f
                 val remainText = if (limitBytes > 0) {
                     val remain = (limitBytes - monthTotal).coerceAtLeast(0L)
@@ -142,8 +141,13 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 } else "—"
 
                 val heroShape = UfiCardDefaults.shape
+                // 深色档系数改自 GRADIENT_MID_LIGHTEN_DARK / GRADIENT_TOP_LIGHTEN_DARK 常量，理由见常量定义。
                 val gradColors = if (palette.isDark) {
-                    listOf(palette.accent.ufiShade(-0.14f), palette.accent.ufiShade(-0.04f), palette.accent)
+                    listOf(
+                        palette.accent,
+                        palette.accent.ufiShade(GRADIENT_MID_LIGHTEN_DARK),
+                        palette.accent.ufiShade(GRADIENT_TOP_LIGHTEN_DARK)
+                    )
                 } else {
                     listOf(palette.accent, palette.accent.ufiShade(0.12f), palette.accent.ufiShade(0.22f))
                 }
@@ -216,7 +220,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
                             Text(
-                                if (enabled && limitSize.isNotBlank()) "已用 %.0f%%".format(percent) else "未设限额",
+                                if (limitBytes > 0) "已用 %.0f%%".format(percent) else "未设限额",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = palette.gradientMuted.copy(alpha = 0.9f)  // 原 Color.White 90%：百分比脚注
                             )
@@ -360,189 +364,47 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
         onDismiss = { showTrafficHistory = false }
     )
 
-    if (showLimitDialog) {
-        // 暂存-确认：弹窗内改的是 draft，**不碰页面已生效值**，点「保存」才写回并发请求。
-        // 之前弹窗直接编辑页面级 state，于是点「取消」后改动其实已经留在页面上，
-        // 紧接着任何一次「启用流量限额」开关（它会立刻带着当前值调 saveDataLimit）
-        // 就把那些没确认的草稿一起发给了设备 —— 表现就是"取消了仍然生效"。
-        // draft 声明在 if 分支内：弹窗关闭时这段组合被销毁，下次打开自动按当前值重新初始化。
-        var draftSize by remember { mutableStateOf(limitSize) }
-        var draftUnit by remember { mutableStateOf(limitUnit) }
-        var draftAlert by remember { mutableStateOf(alertPercent) }
-        var draftAutoClear by remember { mutableStateOf(autoClear) }
-        var draftClearDate by remember { mutableStateOf(clearDate) }
+    // 限额设置弹窗。2026-09-25：那 180 行 UI + draft 暂存 + 输入校验已整体搬到公共层
+    // [UfiDataLimitDialog]（`app/ui`）—— 仪表盘 hero 卡「本月流量」要复用同一个弹窗，
+    // 而 :app:feature-dashboard 不依赖 :app:feature-tools，留在本文件就只能抄第二份。
+    //
+    // 留在页面侧的只有**映射**：`cfg`（TrafficLimitConfig，data 层类型）→ 纯值入参，
+    // 以及保存时把 `enabled`（本页的限额总开关，不属于弹窗）补进 saveDataLimit。
+    // 行为与搬之前逐项一致：
+    //  - 三个打开入口（「告警阈值」行 / 「自动清零」行 / 「限额设置」按钮）都只置 showLimitDialog；
+    //  - 「保存」仍是「写回页面 5 个 state → saveDataLimit(8 参) → 关闭」这同一条路径；
+    //  - 「取消」仍只关闭、不写回（暂存-确认，见 UfiDataLimitDialog 的 KDoc ①）。
+    UfiDataLimitDialog(
+        visible = showLimitDialog,
+        limitSize = limitSize,
+        limitUnit = limitUnit,
+        alertPercent = alertPercent,
+        autoClear = autoClear,
+        clearDate = clearDate,
         // 自动关网是 core 自制功能（不是设备字段），真源在 cfg.auto_off
-        var draftAutoOff by remember { mutableStateOf(cfg?.auto_off?.enabled ?: false) }
-        var draftAutoOffRestore by remember { mutableStateOf(cfg?.auto_off?.restore_on_reset ?: false) }
-
-        // ── 前置校验：值域与 core 侧 profile 的 validateTrafficLimit 逐条对齐 ──
-        // 越界时 core 回 400 OUT_OF_RANGE，app 只能显示一句没有原因的「保存失败」，
-        // 所以这里就把不合法的输入拦住：字段标红 + 保存按钮置灰，别让请求发出去。
-        // 限额数值原来是自由文本框（能输字母），非数字会被 core 的 toLongOrNull 判空 ——
-        // 那种情况更坑：接口回 success:true 但限额其实没写进设备。
-        val sizeNum = draftSize.trim().toLongOrNull()
-        val sizeValid = sizeNum != null && sizeNum > 0
-        val alertNum = draftAlert.trim().toIntOrNull()
-        val alertValid = alertNum != null && alertNum in 0..100
-        val dateNum = draftClearDate.trim().toIntOrNull()
-        // 自动清零关闭时清零日期不参与判定（它此时不会影响用量统计，但仍随请求下发）
-        val dateValid = !draftAutoClear || (dateNum != null && dateNum in 1..31)
-        val formValid = sizeValid && alertValid && dateValid
-
-        UfiScrollableDialog(
-            visible = true,
-            onDismiss = { showLimitDialog = false },
-            title = "限额设置",
-            icon = rememberVectorPainter(Icons.Filled.DataUsage),
-            showCloseButton = false,
-            actions = {
-                UfiDialogActions(
-                    onDismiss = { showLimitDialog = false },
-                    onConfirm = {
-                        limitSize = draftSize
-                        limitUnit = draftUnit
-                        alertPercent = draftAlert
-                        autoClear = draftAutoClear
-                        clearDate = draftClearDate
-                        viewModel.tools.saveDataLimit(
-                            enabled = enabled,
-                            limitValue = draftSize,
-                            limitUnit = draftUnit,
-                            alertPercent = draftAlert,
-                            autoClear = draftAutoClear,
-                            clearDate = draftClearDate,
-                            autoOffEnabled = draftAutoOff,
-                            autoOffRestore = draftAutoOffRestore
-                        )
-                        showLimitDialog = false
-                    },
-                    confirmText = "保存",
-                    dismissText = "取消",
-                    enabled = formValid
-                )
-            }
-        ) {
-            UfiDialogBody {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // 只收数字：原来是 UfiTextField，能输入字母/小数点，
-                    // 请求发出去后由 core 判非法（或静默丢弃），报错回来才知道。
-                    // maxLength=6 够到 999999 TB，够用且挡住误粘贴一长串。
-                    UfiDigitField(
-                        value = draftSize,
-                        onValueChange = { draftSize = it },
-                        label = "限额大小",
-                        modifier = Modifier.weight(1f),
-                        maxLength = 6,
-                        placeholder = "100",
-                        isError = !sizeValid,
-                        errorMessage = if (!sizeValid) "请输入大于 0 的整数" else null
-                    )
-                    Spacer(Modifier.width(Spacing.Medium))
-                    // 2026-09-04（P4e 下拉收敛）：UfiDropdown 已从 M3 ExposedDropdownMenuBox 换成
-                    // 主题化实现（44dp surfaceMuted 卡 + 主题化弹层），原先偏紫的 M3 弹层色随之消失。
-                    // 不再传 label："单位"作为浮动 label 已无对应槽位，本组件的 unitSuffix 是**值的后缀**
-                    // （"GB 单位"读不通）。左侧「限额大小」输入框的 label 已经交代了这一行在填什么。
-                    UfiDropdown(
-                        selectedValue = draftUnit,
-                        options = listOf("MB", "GB", "TB"),
-                        onValueSelected = { draftUnit = it },
-                        modifier = Modifier.width(110.dp)
-                    )
-                }
-
-                UfiDigitField(
-                    value = draftAlert,
-                    onValueChange = { draftAlert = it },
-                    label = "告警阈值 (%)",
-                    maxLength = 3,
-                    isError = !alertValid,
-                    errorMessage = if (!alertValid) "取值 0~100" else null
-                )
-                Text(
-                    "用量达到此百分比时触发告警",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textSecondary
-                )
-
-                // 2026-09-04：两处"开关控制的附属块"由裸 `if` 改为 AnimatedVisibility。
-                //
-                // ⚠ 两个必须注意的点：
-                // 1. **不能直接把 AnimatedVisibility 当 UfiDialogBody 的子项**：body 用
-                //    `Arrangement.spacedBy(Spacing.Large)`，收起态的 AnimatedVisibility 虽然测量为 0 高，
-                //    仍算一个子项 → 会凭空多出一道 12dp 间距（看起来就是"弹窗里莫名多一段空白"）。
-                //    所以把「开关 + 附属块」包成一个 Column 当单个子项，附属块的上间距由它自己的
-                //    padding 提供，收起时整块真正 0 高。
-                // 2. 时长取 Duration.Standard(220)。`DownloadDialogs.kt:86` 记录过 expand/shrink 会让
-                //    弹窗高度逐帧补间、输入框跟着抖，那里因此退回裸 if；这里能用是因为**附属块都在
-                //    输入区下方**（限额值/阈值/清零日期都在其上），展开不会推动正在编辑的字段，
-                //    且本弹窗是 UfiScrollableDialog（内容区带 verticalScroll），变高只滚动、不裁切。
-                Column {
-                    UfiSettingsToggle(
-                        title = "自动清零",
-                        description = if (draftAutoClear) "每月 $draftClearDate 日自动重置" else "手动管理",
-                        checked = draftAutoClear,
-                        onCheckedChange = { draftAutoClear = it }
-                    )
-                    AnimatedVisibility(
-                        visible = draftAutoClear,
-                        enter = fadeIn(tween(UfiMotion.Duration.Standard)) +
-                            expandVertically(tween(UfiMotion.Duration.Standard)),
-                        exit = fadeOut(tween(UfiMotion.Duration.Standard)) +
-                            shrinkVertically(tween(UfiMotion.Duration.Standard))
-                    ) {
-                        Column(modifier = Modifier.padding(top = Spacing.Large)) {
-                            UfiDigitField(
-                                value = draftClearDate,
-                                onValueChange = { draftClearDate = it },
-                                label = "清零日期 (1-31)",
-                                maxLength = 2,
-                                isError = !dateValid,
-                                errorMessage = if (!dateValid) "取值 1~31" else null
-                            )
-                        }
-                    }
-                }
-
-                Column {
-                    UfiSettingsToggle(
-                        title = "到达阈值关闭移动数据",
-                        description = "达到告警阈值后先发邮件通知，发送成功 1 分钟后关闭移动数据",
-                        checked = draftAutoOff,
-                        onCheckedChange = { draftAutoOff = it }
-                    )
-                    AnimatedVisibility(
-                        visible = draftAutoOff,
-                        enter = fadeIn(tween(UfiMotion.Duration.Standard)) +
-                            expandVertically(tween(UfiMotion.Duration.Standard)),
-                        exit = fadeOut(tween(UfiMotion.Duration.Standard)) +
-                            shrinkVertically(tween(UfiMotion.Duration.Standard))
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(top = Spacing.Large),
-                            verticalArrangement = Arrangement.spacedBy(Spacing.Large)
-                        ) {
-                            UfiSettingsToggle(
-                                title = "清零后自动重新打开",
-                                description = if (draftAutoOffRestore) "流量清零后自动恢复移动数据"
-                                else "只关一次，之后需手动打开",
-                                checked = draftAutoOffRestore,
-                                onCheckedChange = { draftAutoOffRestore = it }
-                            )
-                            Text(
-                                "邮件发送失败时不会关闭网络（避免你以为设备故障）。需要在邮件设置里勾选「流量预警」场景。" +
-                                    if (cfg?.auto_off?.triggered == true) "\n本计费周期已触发过，用量清零前不会再次关闭。" else "",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
-                            )
-                        }
-                    }
-                }
-            }
+        autoOffEnabled = cfg?.auto_off?.enabled ?: false,
+        autoOffRestore = cfg?.auto_off?.restore_on_reset ?: false,
+        autoOffTriggered = cfg?.auto_off?.triggered == true,
+        onDismiss = { showLimitDialog = false },
+        onConfirm = { size, unit, alert, clear, date, autoOff, autoOffRestore ->
+            limitSize = size
+            limitUnit = unit
+            alertPercent = alert
+            autoClear = clear
+            clearDate = date
+            viewModel.tools.saveDataLimit(
+                enabled = enabled,
+                limitValue = size,
+                limitUnit = unit,
+                alertPercent = alert,
+                autoClear = clear,
+                clearDate = date,
+                autoOffEnabled = autoOff,
+                autoOffRestore = autoOffRestore
+            )
+            showLimitDialog = false
         }
-    }
+    )
 
     if (showCalibrateDialog) {
         UfiCustomDialog(
@@ -652,14 +514,24 @@ private fun RowScope.TrafficSplitSegment(color: Color, share: Float, percentText
     }
 }
 
+/**
+ * 数值 + 单位 → 字节。**只用于用户正在编辑的草稿提交值**（限额弹窗、流量校准）；
+ * 展示侧的限额一律用 core 给的 `limit_bytes`，见 Models.kt 的 TrafficLimitConfig。
+ *
+ * 解析不出来回 0 让调用方按"未设限额"处理 —— 原来回 Long.MAX_VALUE，
+ * 而 "NaN" / "Infinity" 能过 toDoubleOrNull、BigDecimal 却会抛，于是限额被当成无上限、
+ * 校准会提交一个天文数字。
+ */
 private fun parseToBytes(value: String, unit: String): Long {
-    val num = value.toDoubleOrNull() ?: return 0
+    val num = value.toDoubleOrNull()?.takeIf { it.isFinite() } ?: return 0L
     val factor = when (unit.uppercase()) {
         "KB" -> java.math.BigDecimal(1024)
         "MB" -> java.math.BigDecimal(1048576)
         "GB" -> java.math.BigDecimal(1073741824)
         "TB" -> java.math.BigDecimal(1099511627776)
-        else -> return num.toLong()
+        // 未知单位按 GB 算：单位只可能来自本页的下拉（MB/GB/TB）或设备回的显示名，
+        // 按字节算会把 "100" 变成 100B，等于"几乎没有限额"——那是最危险的一种猜法。
+        else -> java.math.BigDecimal(1073741824)
     }
     return try {
         val bytes = java.math.BigDecimal(num.toString()).multiply(factor)
@@ -667,6 +539,6 @@ private fun parseToBytes(value: String, unit: String): Long {
         else bytes.coerceAtMost(java.math.BigDecimal(Long.MAX_VALUE))
             .setScale(0, java.math.RoundingMode.DOWN).longValueExact()
     } catch (_: Exception) {
-        Long.MAX_VALUE
+        0L
     }
 }

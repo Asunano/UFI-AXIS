@@ -570,7 +570,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     viewModel.tools.setSmsCodeEnabled(true)
                 },
                 confirmText = "开启",
-                dismissText = "取消"
+                dismissText = "取消",
+                topSpacing = Spacing.Large
             )
         }
     }
@@ -1717,10 +1718,16 @@ private fun SmsAvatarMini(identifier: String, modifier: Modifier = Modifier) {
 private fun ChatInputBar(
     value: String,
     onValueChange: (String) -> Unit,
-    onSend: () -> Unit
+    onSend: () -> Unit,
+    /**
+     * `false` = 这台设备不支持发短信（批 O / 3.5）。输入框不可编辑、发送键灰掉，
+     * 占位文字换成原因 —— 输入栏本身就是"在这里写字然后发出去"的承诺，
+     * 让人打完一段字才发现发不出去，比一开始就说清楚更糟。
+     */
+    enabled: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
-    val canSend = value.isNotBlank()
+    val canSend = value.isNotBlank() && enabled
     var isFocused by remember { mutableStateOf(false) }
 
     Column(
@@ -1747,6 +1754,7 @@ private fun ChatInputBar(
                     .padding(vertical = 8.dp)
                     .onFocusChanged { isFocused = it.isFocused },
                 maxLines = 5,
+                enabled = enabled,
                 cursorBrush = SolidColor(palette.accent),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = palette.textPrimary),
                 // 短信是多行正文，Enter 必须换行，所以这里不像控制台那样绑 ImeAction.Send

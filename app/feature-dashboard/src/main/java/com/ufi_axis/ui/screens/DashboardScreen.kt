@@ -13,17 +13,22 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavHostController
 import com.ufi_axis.ui.animation.page.isUfiPageForeground
 import com.ufi_axis.ui.components.common.*
+import com.ufi_axis.ui.screens.home.HomeBlockDeviceConfirmDialog
 import com.ufi_axis.ui.screens.home.HomeConnectionCard
 import com.ufi_axis.ui.screens.home.HomeDeviceInfoCard
 import com.ufi_axis.ui.screens.home.HomeMetricsCard
 import com.ufi_axis.ui.screens.home.HomeMetricsDialog
+import com.ufi_axis.ui.screens.home.HomeOnlineDevicesDialog
 import com.ufi_axis.ui.screens.home.MetricsSection
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.module.FOREGROUND_REFRESH_INTERVAL_MS
 import com.ufi_axis.viewmodel.state.DashboardState
+import com.ufi_axis.data.model.OnlineStation
+import com.ufi_axis.data.model.parseOnlineStations
 import com.ufi_axis.data.repository.ConnectionState
+import kotlinx.coroutines.delay
 import java.util.Calendar
 
 /**
@@ -150,6 +155,81 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // hero 卡「行2」双主角的两个点击联动（2026-09-25）
+    //
+    // 两个弹窗的状态**都持在本页这一层**（不是卡内）：HomeConnectionCard 是纯展示组件，
+    // 只出回调；而弹窗要 viewModel（保存限额 / 拉黑），那是 Screen 的职责。
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── 左列「本月流量」→ 限额设置弹窗 ──
+    var showLimitDialog by remember { mutableStateOf(false) }
+    val trafficCfg = trafficMgmt.limitConfig
+
+    // ⚠ 这段值域清洗与 TrafficManagementScreen 里的是**同一段**，必须留在页面侧：
+    // 它是 data 层语义（core 的 validateTrafficLimit 对 alert_percent 0~100 /
+    // clear_date 1~31 是硬校验），而 UfiDataLimitDialog 住在 app/ui、看不到 data 层。
+    // 设备在自动清零关闭时常给 traffic_clear_date=0，照原样发回去每次都是 400「保存失败」。
+    fun inRange(v: String?, range: IntRange): String? =
+        v?.takeIf { (it.trim().toIntOrNull() ?: Int.MIN_VALUE) in range }
+
+    // saveDataLimit 的成功/失败只写在 trafficManagementState 上，而那份 state **没有**接进
+    // Activity 级全局错误浮层 —— 不在本页消费的话，从首页保存限额是完全静默的
+    //（本仓有过「设置类操作无提示」的专项整治，不允许新增一处）。
+    //
+    // 闸门 trafficSavePending 的必要性：trafficManagementState 是共享状态，本页每次前台
+    // 都会 `loadTrafficLimit()`，它失败时也写 errorMessage，而那个字段**没有自动清除路径**
+    //（clearTrafficMessage 只由 successMessage 的 2s 定时器触发）。无条件渲染的话，
+    // 设备连不上时首页会常驻一张浮层错误卡，且与 hero 卡里那句「后端服务未连接」重复告知。
+    // 所以只报「本页发起的那次保存」的结果；banner 组件与 2s 清除写法与流量管理页一致。
+    var trafficSavePending by remember { mutableStateOf(false) }
+    // 再叠一层 pageForeground：UfiErrorBanner 是 Popup（浮在窗口顶部），本页的组合在切 Tab
+    // 后并不销毁（keepPagesAlive），不门控就会飘到网络/工具页上面去。
+    val trafficSaveSuccess = trafficMgmt.successMessage?.takeIf { trafficSavePending && pageForeground }
+    val trafficSaveError = trafficMgmt.errorMessage?.takeIf { trafficSavePending && pageForeground }
+    LaunchedEffect(trafficMgmt.successMessage, trafficMgmt.errorMessage, trafficSavePending) {
+        if (!trafficSavePending) return@LaunchedEffect
+        if (trafficMgmt.successMessage == null && trafficMgmt.errorMessage == null) return@LaunchedEffect
+        delay(2000)
+        trafficSavePending = false
+        viewModel.tools.clearTrafficMessage()
+    }
+
+    // ── 右列「已连接设备」→ 在线设备弹窗 ──
+    var showOnlineDevices by remember { mutableStateOf(false) }
+    // 拉黑的二次确认对象（非空即显示确认弹窗）
+    var confirmBlock by remember { mutableStateOf<OnlineStation?>(null) }
+
+    // 数据新鲜度：本页的前台 effect 已经覆盖 `wifiClients`（refreshWifi），但**没有**任何
+    // 地方拉过 `wifiAcl` —— 名单缺失会让"已拉黑的设备"照样出现在弹窗里、点拉黑再发一次写入。
+    // 所以打开弹窗时补一次 loadWifiAcl()；同时 refreshWifi(force = true) 绕过 10s 新鲜度闸门，
+    // 让"谁在线"是**点开那一刻**的快照而不是最多 10s 前的。
+    // 用现成的 NetworkModule 方法，不新写 API 调用；关闭弹窗时不做任何事（没有轮询要停）。
+    LaunchedEffect(showOnlineDevices) {
+        if (!showOnlineDevices) return@LaunchedEffect
+        viewModel.network.refreshWifi(force = true)
+        viewModel.network.loadWifiAcl()
+    }
+
+    // 解析走 :app:data 的唯一一份 parseOnlineStations（remember key 与在线设备页一致）
+    val onlineStations = remember(
+        networkState.wifiClients?.stations,
+        networkState.wifiClients?.lanStations
+    ) {
+        parseOnlineStations(
+            wifiList = networkState.wifiClients?.stations,
+            lanList = networkState.wifiClients?.lanStations
+        )
+    }
+    // 名单里的 MAC 一律按小写比对：设备回读是小写，客户端展示用大写。
+    val blockedMacs = remember(networkState.wifiAcl) {
+        networkState.wifiAcl?.blackList.orEmpty().map { it.mac.lowercase() }.toSet()
+    }
+    // 首页这个入口只回答"谁在用我的网"：已拉黑的不列（管理黑名单是网络页的事）。
+    val onlineVisibleStations = remember(onlineStations, blockedMacs) {
+        onlineStations.filter { it.mac.lowercase() !in blockedMacs }
+    }
+
     // 根据时间生成问候语
     val greeting = remember {
         val hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
@@ -181,6 +261,22 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                 // 错误提示也不在这里了：改由 Activity 级的全局错误浮层统一展示
                 //（MainActivity 读 viewModel.globalError），页面不再各写一遍。
 
+                // ── 限额保存的反馈（2026-09-25）──
+                // 组件与写法照抄流量管理页：错误用 UfiErrorBanner（它是 Popup，浮在窗口顶部、
+                // 不占布局），成功用 UfiSettingsGroup 里一行 accent 小字。2s 后由上面那个
+                // LaunchedEffect 清除。只在本页发起过保存时才有值（见 trafficSavePending 的说明）。
+                trafficSaveError?.let { err ->
+                    UfiErrorBanner(
+                        message = err,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                    )
+                }
+                trafficSaveSuccess?.let { msg ->
+                    UfiSettingsGroup {
+                        Text(msg, color = palette.accent, style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+
                 // 加载骨架屏
                 if (state.isLoading && state.deviceInfo == null) {
                     UfiShimmerLoading()
@@ -194,12 +290,15 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                     wifiSsid = wifiSsid,
                     wifiBand = wifiBand,
                     wifiClientCount = wifiClientCount,
-                    backendOffline = connectivity.showBanner,
+                    backendOffline = connectivity.hasProblem,
                     lastUpdatedText = state.lastUpdated?.let {
                         com.ufi_axis.util.FormatUtils.formatRelativeTime(it)
                     },
                     realtimeStatus = realtimeStatusMessage,
-                    modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                    modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin),
+                    // 行2 双主角的两个联动入口（弹窗本体挂在本 composable 末尾）
+                    onTrafficClick = { showLimitDialog = true },
+                    onClientsClick = { showOnlineDevices = true }
                 )
 
                 // ═══════════ ② 4-in-1 指标卡 ═══════════
@@ -230,4 +329,61 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
             }
         }
     }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  hero 卡行2 的两个弹窗（挂在 scaffold 之外，与流量管理页 / 在线设备页同一种摆法）
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ① 左列「本月流量」→ 限额设置。与「工具 → 流量管理」用的是**同一个**组件
+    //    [UfiDataLimitDialog]；这里只做 cfg → 纯值入参的映射（第二份映射，UI 不重复）。
+    UfiDataLimitDialog(
+        visible = showLimitDialog,
+        limitSize = inRange(trafficCfg?.limit_value, 1..999999) ?: "100",
+        limitUnit = trafficCfg?.limit_unit_display?.takeIf { it.isNotBlank() } ?: "GB",
+        alertPercent = inRange(trafficCfg?.alert_percent, 0..100) ?: "80",
+        autoClear = trafficCfg?.auto_clear ?: false,
+        clearDate = inRange(trafficCfg?.clear_date, 1..31) ?: "1",
+        autoOffEnabled = trafficCfg?.auto_off?.enabled ?: false,
+        autoOffRestore = trafficCfg?.auto_off?.restore_on_reset ?: false,
+        autoOffTriggered = trafficCfg?.auto_off?.triggered == true,
+        onDismiss = { showLimitDialog = false },
+        onConfirm = { size, unit, alert, clear, date, autoOff, autoOffRestore ->
+            // 首页没有「启用流量限额」那个总开关（它是流量管理页的一行），所以原样带回设备
+            // 当前值：从首页保存**不会**顺手把限额开关打开。要开关得去流量管理页 ——
+            // 悄悄替用户打开一个会触发「到达阈值关网」的功能，代价比多跳一层大得多。
+            trafficSavePending = true
+            viewModel.tools.saveDataLimit(
+                enabled = trafficCfg?.enabled ?: false,
+                limitValue = size,
+                limitUnit = unit,
+                alertPercent = alert,
+                autoClear = clear,
+                clearDate = date,
+                autoOffEnabled = autoOff,
+                autoOffRestore = autoOffRestore
+            )
+            showLimitDialog = false
+        }
+    )
+
+    // ② 右列「已连接设备」→ 在线设备列表（只列在线、不列已拉黑）
+    HomeOnlineDevicesDialog(
+        visible = showOnlineDevices,
+        stations = onlineVisibleStations,
+        isLoading = networkState.isLoading,
+        pendingMac = networkState.aclPendingMac,
+        onDismiss = { showOnlineDevices = false },
+        onBlock = { confirmBlock = it }
+    )
+
+    // ③ 拉黑二次确认（独立挂一个，文案与在线设备页同口径）。
+    //    拉黑的成功/失败反馈沿用网络模块既有路径：失败写 networkState.errorMessage，
+    //    那份 state **已经**接进 Activity 级全局错误浮层（MainActivity 读 viewModel.globalError），
+    //    所以这里不需要再写一套 banner；成功是静默的 —— 设备从列表上消失本身就是反馈
+    //    （blockDevice 非乐观更新：等回包整表覆盖 + 顺带刷在线列表）。
+    HomeBlockDeviceConfirmDialog(
+        station = confirmBlock,
+        onDismiss = { confirmBlock = null },
+        onConfirm = { viewModel.network.blockDevice(it.mac, it.hostname) }
+    )
 }

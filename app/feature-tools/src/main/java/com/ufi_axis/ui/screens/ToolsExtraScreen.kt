@@ -40,9 +40,19 @@ internal data class ToolEntry(
  */
 internal val TOOLS_PRIMARY = listOf(
     ToolEntry("文件管理", Icons.Default.FolderOpen, "浏览/复制/移动/上传", Routes.DETAIL_FILES),
-    ToolEntry("视频", Icons.Default.Videocam, "设备里的视频", Routes.MEDIA_LIBRARY_VIDEO),
-    ToolEntry("音乐", Icons.Default.MusicNote, "播放 · 系统媒体控制", Routes.MEDIA_LIBRARY_AUDIO),
-    ToolEntry("图片", Icons.Default.Image, "缩略图 · 缩放查看", Routes.MEDIA_LIBRARY_IMAGE),
+    // ★ 2026-09-24（用户定稿："音乐/视频/图片 的描述太普通，图片改成相册"）：
+    //   三条标题+副标题按各自页面**实际提供的能力**重写，而不是复述文件类型。
+    //   - 视频：`MediaVideoScreen` 是「首页 / 媒体库」两栏，首页是最近与继续观看 ⇒ 标题保留"视频"
+    //     （"影院"之类会暗示在线内容，此处只有设备本地文件），副标题点出两栏差异。
+    //   - 音乐：`MediaAudioScreen` 是「全部 / 歌手 / 专辑 / 文件夹 / 歌单」五栏 + 迷你播放条 +
+    //     系统媒体控制 ⇒ 副标题从"播放 · 系统媒体控制"改成点出歌单与后台播放这两个真差异点。
+    //   - 图片 → **相册**：`MediaImageScreen` 是「时间轴 / 文件夹」两栏、按天插段头、点开看原图，
+    //     这就是相册的形态；"图片"只是文件类型名。
+    //   ⚠ 副标题受 `UfiGridCard` 硬约束：`maxLines = 1` + `Ellipsis`，卡是半宽 + 18dp 内边距，
+    //     所以一律控制在 ~10 个汉字内（含分隔符），别写长。
+    ToolEntry("视频", Icons.Default.Videocam, "最近观看 · 媒体库", Routes.MEDIA_LIBRARY_VIDEO),
+    ToolEntry("音乐", Icons.Default.MusicNote, "歌单 · 后台播放", Routes.MEDIA_LIBRARY_AUDIO),
+    ToolEntry("相册", Icons.Default.Image, "时间轴 · 按文件夹浏览", Routes.MEDIA_LIBRARY_IMAGE),
     ToolEntry("下载管理", Icons.Default.CloudDownload, "远程下载/aria2", Routes.DETAIL_DOWNLOADS),
     ToolEntry("短信", Icons.Default.Sms, "收发短信", Routes.DETAIL_SMS),
     ToolEntry("流量管理", Icons.Default.DataUsage, "限额与统计", Routes.DETAIL_TRAFFIC_MGMT)

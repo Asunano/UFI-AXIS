@@ -105,6 +105,8 @@ import com.ufi_axis.ui.components.common.UfiPopupMenu
 import com.ufi_axis.ui.components.common.UfiRollingText
 
 import com.ufi_axis.ui.components.common.UfiScrollableTabRow
+import com.ufi_axis.ui.theme.GRADIENT_MID_LIGHTEN_DARK
+import com.ufi_axis.ui.theme.GRADIENT_TOP_LIGHTEN_DARK
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -292,10 +294,10 @@ fun EventSummaryCard(
     val heroQualifier =
         if (unread > 0 && worstPeakLevel != ThresholdLevel.NORMAL) "阈值告警" else null
 
-    // 2026-08-09 18:44 hero 取色对齐仪表盘 HomeConnectionCard（L91-95 gradColors 逻辑）：
+    // 2026-08-09 18:44 hero 取色对齐仪表盘 HomeConnectionCard（gradColors 逻辑）：
     // 之前用 palette.themeGradient（accent → lerp(accent, accentSecondary, 0.5f) → accentSecondary 双色渐变，
     // 会混入 accentSecondary 色相与仪表盘视觉不一致）。改为 accent 单色系渐变：
-    //   深色模式 = accentColor.ufiShade(-0.14/-0.04) → accentColor
+    //   深色模式 = accentColor → accentColor.ufiShade(+8%/+16%)
     //   浅色模式 = accentColor → accentColor.ufiShade(0.12/0.22)
     // v20h 拓展：base 色 = accentColor（unread=error / 阈值告警=warning / 正常=success），
     // 这样 hero 卡不再永远是绿底——CPU/MEM/TEMP 超阈值也会变橙底，与下方峰值卡状态圆点同语义。
@@ -305,20 +307,23 @@ fun EventSummaryCard(
     // 2026-09-04（P2-中）复核：这 4 个停止点**不接 onGradient**（它们算的是渐变**底色**，
     // 不是底色之上的前景），也**不收敛到 palette.accentStrong** —— 曾有判定说这是 accentStrong
     // 的第二个实现，实测不成立：
-    //   1) 方向相反：accentStrong 深色朝白、浅色朝黑；这里深色朝黑、浅色朝白（要的是"渐变阶梯"不是"按压加重"）；
-    //   2) 比例不同：accentStrong 只有单一 16%，这里是 14%/4% 与 12%/22% 四个停止点；
+    //   1) 方向不同：accentStrong 是"按压加重"（深色朝白、浅色朝黑的单一 16%），
+    //      这里要的是"渐变阶梯"（两态各三个停止点）；
+    //   2) 比例不同：accentStrong 只有单一 16%，这里是 0/8%/16% 与 0/12%/22% 两组停止点；
     //   3) 基色不同：accentStrong 恒取 palette.accent，这里取 accentColor（error/warning/accent/success 四态）。
     //
     // 2026-09-05（P1）：原先这里用 `androidx.compose.ui.graphics.lerp`（**Oklab 插值**）自己实现，
     // 是另三张 Hero 卡私有 `Color.shade`（sRGB 分量混合）的第四份实现。同一组比例在两个色彩空间下
     // 算出的像素并不相同 ⇒「四张 Hero 卡视觉统一」这个前提实际不成立。现统一改用主题层的
     // [com.ufi_axis.ui.theme.ufiShade]（sRGB），**本卡渐变像素会变**（这正是修复目的：四卡对齐）。
+    //
+    // 深色档系数改自 GRADIENT_MID_LIGHTEN_DARK / GRADIENT_TOP_LIGHTEN_DARK 常量，理由见常量定义。
     val gradient = remember(accentColor, palette.isDark) {
         val colors = if (palette.isDark) {
             listOf(
-                accentColor.ufiShade(-0.14f),
-                accentColor.ufiShade(-0.04f),
-                accentColor
+                accentColor,
+                accentColor.ufiShade(GRADIENT_MID_LIGHTEN_DARK),
+                accentColor.ufiShade(GRADIENT_TOP_LIGHTEN_DARK)
             )
         } else {
             listOf(

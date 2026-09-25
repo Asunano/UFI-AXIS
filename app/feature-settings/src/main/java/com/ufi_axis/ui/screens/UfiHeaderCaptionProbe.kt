@@ -13,15 +13,6 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AcUnit
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.Grain
-import androidx.compose.material.icons.filled.NightsStay
-import androidx.compose.material.icons.filled.Umbrella
-import androidx.compose.material.icons.filled.WbCloudy
-import androidx.compose.material.icons.filled.WbSunny
-import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -35,11 +26,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.TextStyle
@@ -436,14 +427,24 @@ private fun UfiHeaderWeather(now: WeatherNowResponse, onClick: () -> Unit) {
     val unit = if (now.unit == "fahrenheit") "℉" else "℃"
 
     /*
-     * 三行的内容先算出来：行数决定纵向排布方式（见下面 verticalArrangement）。
+     * 内容先算出来：末行在不在决定纵向排布方式（见下面 verticalArrangement）。
      * 算在 Column 外面是因为 Arrangement 是 Column 的入参，不能在它的 content 里再回头改。
      */
     val region = now.city.substringBefore(" · ").trim()
-    val detail = weatherDetail(now)
-    val lineCount = 1 + (if (region.isNotBlank()) 1 else 0) + (if (detail.isNotBlank()) 1 else 0)
+    val detail = weatherDetail(now, unit)
 
-    Row(
+    /*
+     * 2026-09-22 版式：**图形只跟前两行并排，末行独占整宽**。
+     *
+     * 上一版是「三行文字 | 图形」左右两栏，图形靠 fillMaxHeight 拉满三行的高度 ——
+     * 34dp 的图形被摊在 51dp 的高度里，周围一圈空，看着就是硬拉伸。
+     * 现在图形只跟"温度+天气 / 地区"这两行（约 37dp）并排、在它们中间居中，
+     * 尺寸和内容高度就对上了；"今日区间 · 湿度 · 体感"那行移到下面自成一行，
+     * 右对齐后它的右边缘与图形右边缘齐平。
+     *
+     * 外层由 Row 换成 Column，clip/clickable 也跟着挪上来（整块仍是一个点击区）。
+     */
+    Column(
         modifier = Modifier
             // 撑满页壳给右侧插槽的高度 —— 那个高度是左侧"标题 + 诗句"反推出来的
             // （页壳用 Row + height(IntrinsicSize.Min) 做的，见 UfiHeader 里那段说明）
@@ -458,104 +459,107 @@ private fun UfiHeaderWeather(now: WeatherNowResponse, onClick: () -> Unit) {
         //
         // 纵向那 2dp：它让挂件内容的上下沿各比左侧标题列内缩 2dp，"顶底对齐"就做不到。
         // 文字不会贴到标题栏边缘 —— 标题栏自己有 HEADER_PADDING_TOP/BOTTOM_NOW_PLAYING。
-        verticalAlignment = Alignment.Bottom,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
+        horizontalAlignment = Alignment.End,
+        /*
+         * 有末行时 **SpaceBetween**：上面那块贴顶、末行贴底，与左侧"标题顶沿 → 诗句底沿"
+         * 占据同一段垂直范围。
+         *
+         * 没有末行时退回 **Center**：只剩一块内容，用 SpaceBetween 等于贴顶、
+         * 用 Bottom 等于贴底，两者都会在另一侧留下一大片空白；居中最稳。
+         */
+        verticalArrangement = if (detail.isNotBlank()) {
+            Arrangement.SpaceBetween
+        } else {
+            Arrangement.Center
+        }
     ) {
-        Column(
-            // 撑满行高，SpaceBetween 才有余量可分
-            modifier = Modifier.fillMaxHeight(),
-            horizontalAlignment = Alignment.End,
-            /*
-             * 三行齐全时 **SpaceBetween**：首行贴顶、末行贴底，与左侧"标题顶沿 → 诗句底沿"
-             * 占据同一段垂直范围。
-             *
-             * 缺行时退回 **Bottom**：两行用 SpaceBetween 会被拉到一顶一底、中间空出一大块，
-             * 看着像漏了内容。贴底则保证末行底沿仍与诗句底沿齐，顶部留白是自然的。
-             */
-            verticalArrangement = if (lineCount >= 3) {
-                Arrangement.SpaceBetween
-            } else {
-                Arrangement.Bottom
-            }
+        // ── 上两行 + 图形 ──
+        Row(
+            // 图形与这两行**垂直居中**：34dp 对约 37dp 的两行块，本来就基本等高，
+            // 不需要（也不该）再拉伸
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            Column(horizontalAlignment = Alignment.End) {
+                AnimatedContent(
+                    targetState = "${now.temperature.toInt()}$unit ${now.description}".trim(),
+                    transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
+                    label = "header-weather-line1"
+                ) { text ->
+                    Text(
+                        text = text,
+                        // lineHeight 必须显式给：这些样式都是 Typography.bodyLarge.copy(fontSize = …)，
+                        // 而 bodyLarge 的 lineHeight 是**固定 24sp** —— 只改字号不改行高的话，
+                        // 12sp 的字也占 24dp 一行，三行加起来 72dp，比左侧标题列高出一大截
+                        // （2026-09-21 实测：右侧 76dp vs 左侧 51dp）。见 WEATHER_LINE*_HEIGHT。
+                        style = UfiTextStyles.bodyLead.copy(lineHeight = WEATHER_LINE1_HEIGHT),
+                        // 2026-09-21：由 alpha 0.75 改为**满色**。这一行是挂件的主信息
+                        // （现在几度、什么天），压到 75% 之后在浅色配色下发灰、读起来像次要说明。
+                        // 三行的层级改由下面两行退让来表达：满色 → 0.5 → 0.4。
+                        color = palette.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.End
+                    )
+                }
+                /*
+                 * 第二行：地区名。2026-09-21 从第三行（`weatherDetail` 的第一段）拆出来单独成行。
+                 *
+                 * 原来三类信息挤在一行：`北京 · 18°/28° · 62%`。地区名长一点（"乌鲁木齐市"）
+                 * 就会把温区与湿度挤成省略号，而那两项恰好是这个挂件最该显示的东西。
+                 * 拆开之后每行一种语义：现在几度什么天 / 在哪 / 今日区间与湿度体感。
+                 *
+                 * 地区名为空时整行不渲染（不留空白行）—— 定位失败、或后端没回 city 都属于这种。
+                 */
+                if (region.isNotBlank()) {
+                    AnimatedContent(
+                        targetState = region,
+                        transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
+                        label = "header-weather-region"
+                    ) { text ->
+                        Text(
+                            text = text,
+                            style = UfiTextStyles.headerSubtitle.copy(
+                                lineHeight = WEATHER_LINE2_HEIGHT
+                            ),
+                            color = palette.textPrimary.copy(alpha = 0.5f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.End
+                        )
+                    }
+                }
+            }
+            WeatherGlyph(
+                weatherCode = now.weather_code,
+                isDay = now.is_day,
+                size = WEATHER_GLYPH_SIZE
+            )
+        }
+
+        // ── 末行：今日区间 · 湿度 · 体感，独占整宽 ──
+        //
+        // 全都缺失时整行不渲染 —— 渲染一个空 Text 仍会占一行高度，挂件会莫名高出一行。
+        if (detail.isNotBlank()) {
             AnimatedContent(
-                targetState = "${now.temperature.toInt()}$unit ${now.description}".trim(),
+                targetState = detail,
                 transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
-                label = "header-weather-line1"
+                label = "header-weather-line3"
             ) { text ->
                 Text(
                     text = text,
-                    // lineHeight 必须显式给：这些样式都是 Typography.bodyLarge.copy(fontSize = …)，
-                    // 而 bodyLarge 的 lineHeight 是**固定 24sp** —— 只改字号不改行高的话，
-                    // 12sp 的字也占 24dp 一行，三行加起来 72dp，比左侧标题列高出一大截
-                    // （2026-09-21 实测：右侧 76dp vs 左侧 51dp）。见 WEATHER_LINE*_HEIGHT。
-                    style = UfiTextStyles.bodyLead.copy(lineHeight = WEATHER_LINE1_HEIGHT),
-                    // 2026-09-21：由 alpha 0.75 改为**满色**。这一行是挂件的主信息
-                    // （现在几度、什么天），压到 75% 之后在浅色配色下发灰、读起来像次要说明。
-                    // 三行的层级改由下面两行退让来表达：满色 → 0.5 → 0.4。
-                    color = palette.textPrimary,
+                    // 字号比上面低一档（12 → 11sp）：这一行是最次要的"顺带看一眼"。
+                    style = UfiTextStyles.headerCaption.copy(
+                        fontSize = 11.sp,
+                        lineHeight = WEATHER_LINE3_HEIGHT
+                    ),
+                    color = palette.textPrimary.copy(alpha = 0.4f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     textAlign = TextAlign.End
                 )
             }
-            /*
-             * 第二行：地区名。2026-09-21 从第三行（`weatherDetail` 的第一段）拆出来单独成行。
-             *
-             * 原来三类信息挤在一行：`北京 · 18°/28° · 62%`。地区名长一点（"乌鲁木齐市"）
-             * 就会把温区与湿度挤成省略号，而那两项恰好是这个挂件最该显示的东西。
-             * 拆开之后每行一种语义：现在几度什么天 / 在哪 / 今日区间与湿度。
-             *
-             * 地区名为空时整行不渲染（不留空白行）—— 定位失败、或后端没回 city 都属于这种。
-             */
-            if (region.isNotBlank()) {
-                AnimatedContent(
-                    targetState = region,
-                    transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
-                    label = "header-weather-region"
-                ) { text ->
-                    Text(
-                        text = text,
-                        style = UfiTextStyles.headerSubtitle.copy(
-                            lineHeight = WEATHER_LINE2_HEIGHT
-                        ),
-                        color = palette.textPrimary.copy(alpha = 0.5f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.End
-                    )
-                }
-            }
-            // 第三行：今日区间与湿度。全都缺失时整行不渲染 —— 渲染一个空 Text 仍会占一行高度，
-            // 挂件会比左侧标题列莫名高出一行。
-            if (detail.isNotBlank()) {
-                AnimatedContent(
-                    targetState = detail,
-                    transitionSpec = { fadeIn(tween(200)) togetherWith fadeOut(tween(200)) },
-                    label = "header-weather-line2"
-                ) { text ->
-                    Text(
-                        text = text,
-                        // 字号再降一档（12 → 11sp）：三行要压进左侧标题列的高度，
-                        // 而这一行是三行里最次要的（"顺带看一眼"的区间与湿度）。
-                        style = UfiTextStyles.headerCaption.copy(
-                            fontSize = 11.sp,
-                            lineHeight = WEATHER_LINE3_HEIGHT
-                        ),
-                        color = palette.textPrimary.copy(alpha = 0.4f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        textAlign = TextAlign.End
-                    )
-                }
-            }
         }
-        Icon(
-            imageVector = weatherIcon(now),
-            contentDescription = now.description,
-            tint = palette.accent,
-            modifier = Modifier.size(34.dp)
-        )
     }
 }
 
@@ -576,16 +580,25 @@ private val WEATHER_LINE3_HEIGHT = 14.sp
 
 
 /**
- * 第三行：`18°/28° · 62%`。缺的那段自动省略，不留孤零零的分隔点。
+ * 末行：`18°/28° · 62% · 体感 26°`。缺的那段自动省略，不留孤零零的分隔点。
  *
  * 2026-09-21 起**不含地区名** —— 它被提到第二行单独一行（见 [UfiHeaderWeather]）。
- * 全部缺失时回空串，那一行会渲染成一个零宽的 Text（不占额外高度，因为 Column 是贴底排的）。
+ *
+ * 2026-09-22 补上**体感温度**。它无条件显示，与天气详情弹窗、天气设置预览两处既有做法一致
+ * （那两处也是直接 `"%.0f".format(now.apparent_temperature)`）。
+ * 这里不能用"等于 0 就当缺失"来判有无 —— 0° 本身是合法气温，那样会在零度天把这一项藏掉。
+ *
+ * 全部缺失时回空串，调用方据此整行不渲染。
+ *
+ * @param unit 温度单位符号（`℃` / `℉`），由调用方按 `now.unit` 决定，这里不重复判一遍。
  */
-private fun weatherDetail(now: WeatherNowResponse): String = listOfNotNull(
+private fun weatherDetail(now: WeatherNowResponse, unit: String): String = listOfNotNull(
     if (now.temp_max != 0.0 || now.temp_min != 0.0) {
         "${now.temp_min.toInt()}°/${now.temp_max.toInt()}°"
     } else null,
-    now.humidity.takeIf { it > 0 }?.let { "$it%" }
+    now.humidity.takeIf { it > 0 }?.let { "$it%" },
+    // 只带度数符号、不重复单位字母：这一行已经很挤，而首行的 "23℃" 已经说明了单位体系
+    "体感 ${now.apparent_temperature.toInt()}°"
 ).joinToString(" · ")
 
 /**
@@ -654,16 +667,7 @@ internal fun clampPoem(content: String, budget: Int = POEM_BUDGET): String {
 /** 中文句读点：用来把整联切成可独立成立的短句。 */
 private val POEM_BREAKS = charArrayOf('，', '。', '；', '！', '？', '、', ',', '.', ';', '!', '?')
 
-/**
- * WMO 代码 → 图标。分档比 core 的文案粗（只有 6 类）：图标要一眼可辨，
- * 「小雨/中雨」用同一把伞更合适，具体强度看文字。
- */
-private fun weatherIcon(now: WeatherNowResponse): ImageVector = when (now.weather_code) {
-    0, 1 -> if (now.is_day) Icons.Default.WbSunny else Icons.Default.NightsStay
-    2 -> Icons.Default.WbCloudy
-    3, 45, 48 -> Icons.Default.Cloud
-    in 51..57, in 61..67, in 80..82 -> Icons.Default.Umbrella
-    in 71..77, 85, 86 -> Icons.Default.AcUnit
-    95, 96, 99 -> Icons.Default.Grain
-    else -> Icons.Default.Cloud
-}
+// 2026-09-22：`weatherIcon`（WMO code → Material ImageVector）与 `weatherIconTint`
+// （按天气分色的单一 tint）已删除，整体换成 Canvas 自绘的多色图形 —— 见 WeatherGlyph.kt。
+// 那两个函数只服务于挂件这一个调用点，换掉之后没有任何残留用途。
+

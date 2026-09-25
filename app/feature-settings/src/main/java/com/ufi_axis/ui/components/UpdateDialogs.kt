@@ -6,6 +6,7 @@
 package com.ufi_axis.ui.components
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
@@ -18,22 +19,29 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.filled.Update
 import com.ufi_axis.data.model.UpdateStatusResponse
+import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -42,6 +50,7 @@ import com.ufi_axis.util.UpdateSource
 import com.ufi_axis.viewmodel.state.FrontendUpdateState
 import com.ufi_axis.viewmodel.state.UpdatePromptState
 import com.ufi_axis.ui.theme.UfiMotion
+import kotlin.math.sqrt
 
 // 2026-09-06：原 UpdateCheckDialog（只讲 App 自更新的那个弹窗）已删除，由本文件末尾的
 // [UnifiedUpdateDialog] 取代 —— 它把 App 项与 Core 项放进同一个弹窗，只有一项有更新时
@@ -78,15 +87,25 @@ private fun UpdateProgressRing(
             // 出现两个圆形指示器（外面一圈空槽 + 里面一个小转圈），观感很杂。
             // 现在只有一个环在转：progress 固定 25%（一段弧），整体绕中心匀速旋转，
             // 中心留空（传空 lambda 覆盖组件默认的百分比数字——25% 是画弧用的，不是真实进度）。
-            val spin = rememberInfiniteTransition(label = "ringSpin")
-            val angle by spin.animateFloat(
-                initialValue = 0f,
-                targetValue = 360f,
-                animationSpec = infiniteRepeatable(
-                    animation = tween(UfiMotion.Duration.Languid, easing = LinearEasing)
-                ),
-                label = "ringSpinAngle"
-            )
+            //
+            // 2026-09-26：接上降低动效。无限旋转是典型的前庭刺激源，而且它会一直挂着一个
+            // 永不结束的动画帧回调；系统开了「移除动画」还在转等于没接这条通道。
+            // 为真时不起 rememberInfiniteTransition，静态画同一段 25% 弧（仍然看得出
+            // "这是个未完成的环"，只是不动），不要退化成空环——那会被当成卡死。
+            val reduceMotion = LocalUfiReduceMotion.current
+            val angle = if (reduceMotion) {
+                0f
+            } else {
+                val spin = rememberInfiniteTransition(label = "ringSpin")
+                spin.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(UfiMotion.Duration.Languid, easing = LinearEasing)
+                    ),
+                    label = "ringSpinAngle"
+                ).value
+            }
             UfiRingProgress(
                 progress = 0.25f,
                 modifier = Modifier.graphicsLayer { rotationZ = angle },
@@ -105,6 +124,157 @@ private fun UpdateProgressRing(
         }
         // 2026-09-04：环与下方文案的间距 Medium(8dp) → XLarge(16dp)。116dp 的大环视觉重量很沉，
         // 8dp 让文案像"贴"在环上；间距要跟元素体量走，不能沿用行间距那一档。
+        Spacer(Modifier.height(Spacing.XLarge))
+        Text(
+            text = caption,
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.textPrimary,
+            textAlign = TextAlign.Center
+        )
+        if (!subCaption.isNullOrBlank()) {
+            Spacer(Modifier.height(Spacing.Small))
+            Text(
+                text = subCaption,
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+/** 终态动画里「环收口」占整段进度的比例；剩下的 45% 留给中心符号的笔画描出。 */
+private const val RESULT_RING_CLOSE_FRACTION = 0.55f
+
+/**
+ * 更新流程的**终态**展示：环收口 + 中心自绘符号（成功打勾 / 失败画叉）+ 环下方文案。
+ *
+ * 2026-09-26：此前 done / failed 只有一行 Text。前面几十秒一直是个 116dp 的大环在动，
+ * 结束瞬间整块塌成一行小字 —— 用户反馈"不知道到底成没成"。这里让**同一个环**接着演下去：
+ * 先把它扫成一个完整的圆（"加载收口了"），再在圆心描出结论符号，视线不需要重新找落点。
+ *
+ * 为什么不复用 [UfiRingProgress]：它的签名被 `[F24] STABLE-UI-API` 冻结，而这里要的是
+ * "环的扫角 + 中心笔画"两段共用一条时间轴，塞进公共组件就得给它加终态参数。自绘一份更便宜。
+ *
+ * 为什么不用 Material 的 `Icons.Default.CheckCircle` / `Error`：实心圆底 + 白符号在弹窗里
+ * 看着像贴了个 emoji ✅/❌，与全站线性图标风格不一致（同一条决策见 [ApkPushDialog] 的成功态）。
+ *
+ * @param success true = 成功（打勾 / `palette.success`），false = 失败（打叉 / `palette.error`）。
+ * @param caption 环下方的结论文案（第一行，正文字号）。
+ * @param subCaption 可选的补充说明（第二行，小字次要色），如失败后的处置建议。
+ */
+@Composable
+private fun UpdateResultRing(
+    success: Boolean,
+    caption: String,
+    subCaption: String? = null
+) {
+    val palette = LocalResolvedPalette.current
+    // 主色跟语义走；轨道圈沿用 UfiRingProgress 的口径，终态与进度态叠在同一条基线上。
+    val mainColor = if (success) palette.success else palette.error
+    val trackColor = palette.divider.copy(alpha = 0.15f)
+
+    // 一条时间轴管两段（环收口 → 描符号）：两个独立动画对不齐相位，
+    // 会出现"符号已经画完、环还差一截"。
+    val reduceMotion = LocalUfiReduceMotion.current
+    val anim = remember(success) { Animatable(0f) }
+    LaunchedEffect(success, reduceMotion) {
+        // 降低动效：直接给终态。这一段是"从无到有描出来"的自绘动画，跳过即可，
+        // 不需要退化成别的过渡 —— 结论本身由符号与文案表达，不依赖运动。
+        if (reduceMotion) anim.snapTo(1f)
+        else anim.animateTo(
+            targetValue = 1f,
+            // Reveal(600ms) 就是"图表绘入"那一档，与本处的笔画描出同类
+            animationSpec = tween(UfiMotion.Duration.Reveal, easing = UfiMotion.Easing.Standard)
+        )
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Medium),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Canvas(
+            modifier = Modifier
+                .size(116.dp)
+                // 自绘图形对无障碍是透明的，必须显式给语义，否则读屏只能念到下面那行 caption
+                .semantics { contentDescription = if (success) "更新完成" else "更新失败" }
+        ) {
+            val t = anim.value
+            val strokePx = 8.dp.toPx()
+            val stroke = Stroke(width = strokePx, cap = StrokeCap.Round)
+            // 几何与 UpdateProgressRing 一致：直径内缩一个线宽，圆弧才不会被裁掉半条边
+            val diameter = size.minDimension - strokePx
+            val arcTopLeft = Offset(strokePx / 2, strokePx / 2)
+            val arcSize = Size(diameter, diameter)
+
+            drawArc(
+                color = trackColor,
+                startAngle = -90f,
+                sweepAngle = 360f,
+                useCenter = false,
+                topLeft = arcTopLeft,
+                size = arcSize,
+                style = stroke
+            )
+
+            // ── 阶段 A：环从 0 扫到整圈 ──
+            val ringSweep = 360f * (t / RESULT_RING_CLOSE_FRACTION).coerceIn(0f, 1f)
+            if (ringSweep > 0f) {
+                drawArc(
+                    color = mainColor,
+                    startAngle = -90f,
+                    sweepAngle = ringSweep,
+                    useCenter = false,
+                    topLeft = arcTopLeft,
+                    size = arcSize,
+                    style = stroke
+                )
+            }
+
+            // ── 阶段 B：在圆心区域按笔画顺序描符号 ──
+            val symbolT = ((t - RESULT_RING_CLOSE_FRACTION) / (1f - RESULT_RING_CLOSE_FRACTION))
+                .coerceIn(0f, 1f)
+            if (symbolT > 0f) {
+                // 单位坐标 × 边长：符号跟着环的尺寸缩放，改 116dp 不用重算一遍坐标
+                val side = size.minDimension
+                fun pt(x: Float, y: Float) = Offset(x * side, y * side)
+                fun lerp(a: Offset, b: Offset, f: Float) =
+                    Offset(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f)
+                fun len(a: Offset, b: Offset) =
+                    sqrt((b.x - a.x) * (b.x - a.x) + (b.y - a.y) * (b.y - a.y))
+                fun seg(a: Offset, b: Offset) =
+                    drawLine(color = mainColor, start = a, end = b, strokeWidth = strokePx, cap = StrokeCap.Round)
+
+                if (success) {
+                    // 对勾两段折线。进度按**实际长度比例**切分而不是各占一半 ——
+                    // 短的那一撇只有长撇的一半长，平分会让笔尖在拐角处明显减速。
+                    val p1 = pt(0.30f, 0.52f)
+                    val p2 = pt(0.44f, 0.67f)
+                    val p3 = pt(0.71f, 0.36f)
+                    val l1 = len(p1, p2)
+                    val split = l1 / (l1 + len(p2, p3))
+                    if (symbolT <= split) {
+                        seg(p1, lerp(p1, p2, symbolT / split))
+                    } else {
+                        seg(p1, p2)
+                        seg(p2, lerp(p2, p3, (symbolT - split) / (1f - split)))
+                    }
+                } else {
+                    // 叉两条对角线：等长，所以前后各半，不需要按长度切
+                    val a1 = pt(0.35f, 0.35f)
+                    val a2 = pt(0.65f, 0.65f)
+                    val b1 = pt(0.65f, 0.35f)
+                    val b2 = pt(0.35f, 0.65f)
+                    if (symbolT <= 0.5f) {
+                        seg(a1, lerp(a1, a2, symbolT / 0.5f))
+                    } else {
+                        seg(a1, a2)
+                        seg(b1, lerp(b1, b2, (symbolT - 0.5f) / 0.5f))
+                    }
+                }
+            }
+        }
+        // 环下文案排版与 UpdateProgressRing 同一份：终态与进度态切换时文案不跳位
         Spacer(Modifier.height(Spacing.XLarge))
         Text(
             text = caption,
@@ -282,7 +452,8 @@ fun ApkPushDialog(
     onDismiss: () -> Unit,
     onRetry: () -> Unit = {}
 ) {
-    val palette = LocalResolvedPalette.current
+    // 2026-09-26：本函数不再直接用调色板（done/failed 两态的取色已随 [UpdateResultRing] 内移），
+    // 故删掉原来的 `val palette = LocalResolvedPalette.current`。
     val s = state?.state ?: "uploading"
     val title = when (s) {
         "uploading" -> "正在上传 APK"
@@ -342,41 +513,27 @@ fun ApkPushDialog(
 
                 "done" -> {
                     // 2026-09-04：去掉前置的 Icons.Default.CheckCircle —— 实心圆底 + 白勾在弹窗里
-                    // 看着像贴了个 emoji ✅，与全站线性图标风格不一致；成功语义已由标题「安装成功」
-                    // 与右侧「完成」按钮表达，这里不需要再来一个图标。
-                    Text(
-                        text = state?.message?.takeIf { it.isNotBlank() }
-                            ?: "APK 已推送安装，设备将自动重启生效",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.textPrimary
+                    // 看着像贴了个 emoji ✅，与全站线性图标风格不一致。
+                    // 2026-09-26：改用 [UpdateResultRing] —— 上传态那个 116dp 的环收口成完整圆
+                    // 再描出勾，与前一帧的进度环是同一个元素，不再"整块塌成一行小字"。
+                    UpdateResultRing(
+                        success = true,
+                        caption = state?.message?.takeIf { it.isNotBlank() }
+                            ?: "APK 已推送安装，设备将自动重启生效"
                     )
                 }
 
                 "failed" -> {
                     // 错误分类：原因 + 建议（2026-08-10 增强错误反馈）
+                    // 2026-09-26：原来是「静态 Icons.Default.Error + 两行文案」的横排。
+                    // 静态实心图标同样违背上面那条线性风格决策，且失败与成功两个终态长得完全
+                    // 不像同一套 UI。现在两行落到环的 caption / subCaption，图标由环自绘的叉承担。
                     val (cause, hint) = classifyPushError(state?.message)
-                    Row(verticalAlignment = Alignment.Top) {
-                        Icon(
-                            Icons.Default.Error,
-                            null,
-                            tint = palette.error,
-                            modifier = Modifier.size(24.dp)
-                        )
-                        Spacer(Modifier.width(Spacing.Medium))
-                        Column {
-                            Text(
-                                text = "原因：$cause",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = palette.error
-                            )
-                            Spacer(Modifier.height(Spacing.Small))
-                            Text(
-                                text = "建议：$hint",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.textSecondary
-                            )
-                        }
-                    }
+                    UpdateResultRing(
+                        success = false,
+                        caption = "原因：$cause",
+                        subCaption = "建议：$hint"
+                    )
                 }
 
                 else -> {}
@@ -626,19 +783,13 @@ private fun AppUpdateAction(
             color = palette.textSecondary
         )
 
-        "error" -> Column(Modifier.fillMaxWidth()) {
-            Text(
-                text = state.errorMessage?.takeIf { it.isNotBlank() } ?: "App 更新失败",
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.error
-            )
-            Spacer(Modifier.height(Spacing.Small))
-            Text(
-                text = "建议在「更新设置」中切换镜像源后重试",
-                style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary
-            )
-        }
+        // 2026-09-26：终态从「双 Text 的 Column」换成 [UpdateResultRing] —— 下载态一直是个
+        // 116dp 的环，失败时塌成两行小红字，用户容易以为界面只是"没反应"。
+        "error" -> UpdateResultRing(
+            success = false,
+            caption = state.errorMessage?.takeIf { it.isNotBlank() } ?: "App 更新失败",
+            subCaption = "建议在「更新设置」中切换镜像源后重试"
+        )
 
         else -> {}
     }
@@ -666,7 +817,8 @@ private fun CoreUpdateAction(
     onCancelConfirm: () -> Unit,
     onConfirmed: () -> Unit
 ) {
-    val palette = LocalResolvedPalette.current
+    // 2026-09-26：本函数不再直接用调色板（done/failed 的取色已随 [UpdateResultRing] 内移），
+    // 故删掉原来的 `val palette = LocalResolvedPalette.current`。
     when {
         // ── 第三段：已触发，展示进度/结果 ──
         state.coreTriggered -> {
@@ -692,16 +844,17 @@ private fun CoreUpdateAction(
                     else message ?: "Core 正在安装并即将重启…"
                 )
 
-                "done" -> Text(
-                    text = message ?: "Core 已更新完成并重启",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.textPrimary
+                // 2026-09-26：两个终态从一行 Text 换成 [UpdateResultRing]。Core 更新要等十几秒
+                // 到一分钟（下载→安装→重启），全程都是这个环在动；结束只给一行字，用户分不清
+                // "已经结束了"还是"还在跑"。现在环收口 + 描出勾/叉，结论落在同一个视线落点上。
+                "done" -> UpdateResultRing(
+                    success = true,
+                    caption = message ?: "Core 已更新完成并重启"
                 )
 
-                "failed" -> Text(
-                    text = message ?: "Core 更新失败",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = palette.error
+                "failed" -> UpdateResultRing(
+                    success = false,
+                    caption = message ?: "Core 更新失败"
                 )
 
                 // null / idle：请求刚发出、core 还没写出状态。**明确说尚未完成**，

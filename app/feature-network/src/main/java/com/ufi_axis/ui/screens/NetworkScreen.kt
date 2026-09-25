@@ -50,10 +50,15 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
 
     // 首次加载：仅在页面处于前台时才拉，离屏预组合时一个请求都不发。
     // pageForeground 作为 key：用户首次切到本 Tab 时 LaunchedEffect 以新协程重启并自动补拉。
+    //
+    // 2026-09-22：扇出从本文件的私有 loadNetworkAll(viewModel) 搬到 NetworkModule.loadNetworkAll()，
+    // 那里带**新鲜度闸门**（NETWORK_ALL_FRESH_MS = 30s）。所以首屏预加载已经拉过的话，
+    // 这里切过来是零请求、直接渲染 —— 这就是"切页不等待"的实现点。
+    // delay(200) 保留：给横滑落定留出窗口，避免请求写状态落在胶囊归位的可见运动里。
     LaunchedEffect(pageForeground) {
         if (!pageForeground) return@LaunchedEffect
         kotlinx.coroutines.delay(200)
-        loadNetworkAll(viewModel)
+        viewModel.network.loadNetworkAll()
     }
     var retryCount by remember { mutableIntStateOf(0) }
 
@@ -67,7 +72,9 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
         if (state.errorMessage != null && pageForeground && retryCount < 3) {
             kotlinx.coroutines.delay(5_000)
             retryCount++
-            loadNetworkAll(viewModel)
+            // force：出错重试的前提就是"上一次没成功"，必须绕过新鲜度闸门。
+            // 部分失败时 refreshNetwork 不打戳，本来也不会被闸门挡住，但写明更稳。
+            viewModel.network.loadNetworkAll(force = true)
         }
     }
 
@@ -79,7 +86,8 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 直接捕获的是那一刻的 Boolean 快照（永远是首次值）；捕获 State 才能读到调用时的最新值。
     val foregroundForResume by rememberUpdatedState(pageForeground)
     rememberResumeRefresh {
-        if (foregroundForResume) loadNetworkAll(viewModel)
+        // 不 force：回前台时若数据还在 30s 新鲜窗口内就不必重取（息屏几秒解锁属常态）。
+        if (foregroundForResume) viewModel.network.loadNetworkAll()
     }
 
     // 顶栏不放手动刷新：本页有 ON_RESUME 自动重取，错误横幅自带「重试」，手动按钮属重复能力。
@@ -252,8 +260,13 @@ private fun CellularStatusCard(
     val bars = rsrpVal?.let { signalBars(it) } ?: 0
 
     // ── 渐变：与首页 Hero 一致的 accent 明暗衍生色（阶梯口径见 theme 层的 Color.ufiShade）──
+    // 深色档系数改自 GRADIENT_MID_LIGHTEN_DARK / GRADIENT_TOP_LIGHTEN_DARK 常量，理由见常量定义。
     val gradColors = if (palette.isDark) {
-        listOf(palette.accent.ufiShade(-0.14f), palette.accent.ufiShade(-0.04f), palette.accent)
+        listOf(
+            palette.accent,
+            palette.accent.ufiShade(GRADIENT_MID_LIGHTEN_DARK),
+            palette.accent.ufiShade(GRADIENT_TOP_LIGHTEN_DARK)
+        )
     } else {
         listOf(palette.accent, palette.accent.ufiShade(0.12f), palette.accent.ufiShade(0.22f))
     }
@@ -550,14 +563,9 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
 // 内部辅助函数
 // ═══════════════════════════════════════════════
 
-private fun loadNetworkAll(viewModel: MainViewModel) {
-    viewModel.network.refreshNetwork()
-    viewModel.network.loadBandStatus()
-    viewModel.network.loadCellInfo()
-    viewModel.network.loadDeviceSettings()
-    viewModel.network.loadLanSettings()
-    viewModel.network.loadDeviceIdentity()
-}
+// 2026-09-22：原来这里有个私有 `loadNetworkAll(viewModel)`，把 6 个请求扇出写在页面里。
+// 已搬到 `NetworkModule.loadNetworkAll(force, silent)` —— 首屏预加载协调器要发同一批，
+// 而"该不该发"的判据（新鲜度戳）必须只有一份、且存在 module 里才能跨组合存活。
 
 
 // ═══════════════════════════════════════════════

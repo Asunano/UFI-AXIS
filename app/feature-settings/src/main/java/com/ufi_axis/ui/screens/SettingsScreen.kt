@@ -184,7 +184,7 @@ fun SettingsScreen(
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.WbSunny,
-                        title = "界面小功能",
+                        title = "小功能",
                         description = "标题栏天气 · 今日诗词",
                         onClick = { navController?.navigate(Routes.DETAIL_UI_EXTRAS) },
                         trailing = { UfiSettingsChevron() }

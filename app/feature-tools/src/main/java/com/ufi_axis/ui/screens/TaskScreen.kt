@@ -410,7 +410,8 @@ private fun TaskLogDialog(task: ScheduledTask, logs: List<ExecutionLog>, onDismi
             onDismiss = onDismiss,
             onConfirm = onDismiss,
             confirmText = "关闭",
-            dismissText = null
+            dismissText = null,
+            topSpacing = Spacing.Large
         )
     }
 }
@@ -475,24 +476,38 @@ fun TaskEditScreen(
 ) {
     val state by viewModel.tasksState.collectAsState()
     val isNew = taskId.isBlank()
+    // 深链 / 进程重建时 state.tasks 可能是空的（列表页的 LaunchedEffect 没跑过），本页自己拉一次
+    LaunchedEffect(Unit) { viewModel.tools.loadTaskList() }
     val initial: ScheduledTask = remember(taskId, state.tasks) {
         if (isNew) ScheduledTask()
         else state.tasks.firstOrNull { it.id == taskId } ?: ScheduledTask(id = taskId)
     }
+    /*
+     * 编辑态且列表还没到：渲染加载态，不给保存按钮。
+     *
+     * 否则 initial 退化成空对象、表单一片空白，而保存会把这份空值覆盖到设备上的任务。
+     * 判据带 `!state.tasksLoaded` —— 列表已经成功读过但仍找不到这个 id（被别处删了），
+     * 就按原有兜底走（空表单 + 保留 id），不要在这里卡死。
+     */
+    val awaitingTask = !isNew && state.tasks.none { it.id == taskId } && !state.tasksLoaded
 
     var currentStep by remember { mutableStateOf(0) }
-    var name by remember { mutableStateOf(initial.name) }
-    var selectedCategory by remember { mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" }) }
-    var selectedActionType by remember { mutableStateOf(initial.actionType) }
-    var actionParams by remember { mutableStateOf(initial.params) }
-    var command by remember { mutableStateOf(initial.command) }
+    // 字段都跟着 initial 走：列表晚到时（深链）这些 remember 会重建并回填，
+    // 无 key 的 remember 会把空表单一直留在屏幕上（参考 StorageSourceEditScreen 的 remember(source)）
+    var name by remember(initial) { mutableStateOf(initial.name) }
+    var selectedCategory by remember(initial) { mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" }) }
+    var selectedActionType by remember(initial) { mutableStateOf(initial.actionType) }
+    var actionParams by remember(initial) { mutableStateOf(initial.params) }
+    var command by remember(initial) { mutableStateOf(initial.command) }
     // 执行周期（时间触发）：单一 ScheduleValue 承载 8 preset + 自定义 cron（v9 扩展）
-    var scheduleValue by remember {
+    var scheduleValue by remember(initial) {
         mutableStateOf(if (isNew) ScheduleValue.DEFAULT else initial.toScheduleValue())
     }
-    var enabled by remember { mutableStateOf(initial.enabled) }
+    var enabled by remember(initial) { mutableStateOf(initial.enabled) }
     var toast by remember { mutableStateOf<ToastMessage?>(null) }
     var saveDone by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
+
 
     // 这两个判据同时喂给 validate（决定能否往下走）与字段的 isError（行内标红），
     // 写成一处才不会出现"按钮灰了但没有哪个字段标红"的错位。
@@ -547,7 +562,31 @@ fun TaskEditScreen(
             scheduleParams = if (scheduleTypeOut == null) emptyMap() else scheduleParams,
             enabled = enabled
         )
-        if (isNew) viewModel.tools.createTask(task) else viewModel.tools.updateTask(task.id, task)
+        // 成功才 toast + 退页：createTask/updateTask 是 fire-and-forget，
+        // 原来提交完立刻报"已创建"并 pop，网络失败 / 400 时用户看到的是成功提示
+        submitting = true
+        val onDone: (Boolean, String) -> Unit = { ok, msg ->
+            submitting = false
+            toast = ToastMessage(msg, if (ok) ToastType.SUCCESS else ToastType.ERROR)
+            if (ok) saveDone = true
+        }
+        if (isNew) {
+            viewModel.tools.createTask(task, onDone)
+        } else {
+
+            viewModel.tools.updateTask(task.id, task, onDone)
+        }
+    }
+
+
+    // 列表还没到就只给加载态：表单与「保存」一起不出现，比灰着一个按钮更明确
+    if (awaitingTask) {
+        UfiScreenScaffold(title = "编辑任务", navController = navController, showBack = true) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                UfiLoadingIndicator()
+            }
+        }
+        return
     }
 
     UfiScreenScaffold(
@@ -556,6 +595,7 @@ fun TaskEditScreen(
         showBack = true
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+
             UfiWizard(
                 steps = listOf(
                     UfiWizardStep(
@@ -656,13 +696,11 @@ fun TaskEditScreen(
                 ),
                 currentStep = currentStep,
                 onStepChange = { currentStep = it },
-                onFinish = {
-                    submit()
-                    toast = ToastMessage(if (isNew) "任务已创建" else "任务已保存", ToastType.SUCCESS)
-                    saveDone = true
-                },
+                onFinish = { submit() },
                 finishText = if (isNew) "创建任务" else "保存修改",
+                finishLoading = submitting,
                 onStepBlocked = { toast = ToastMessage(it, ToastType.WARNING) }
+
             )
             UfiToastHost(toastMessage = toast, onDismiss = { toast = null })
         }
@@ -801,7 +839,13 @@ private fun RuleLogDialog(rule: AutomationRule, logs: List<ExecutionLog>, onDism
                 }
             }
         }
-        UfiDialogActions(onDismiss = onDismiss, onConfirm = onDismiss, confirmText = "关闭", dismissText = null)
+        UfiDialogActions(
+            onDismiss = onDismiss,
+            onConfirm = onDismiss,
+            confirmText = "关闭",
+            dismissText = null,
+            topSpacing = Spacing.Large
+        )
     }
 }
 
@@ -825,32 +869,38 @@ fun RuleEditScreen(
 ) {
     val state by viewModel.tasksState.collectAsState()
     val isNew = ruleId.isBlank()
+    // 深链 / 进程重建时 state.rules 可能是空的（列表页的 LaunchedEffect 没跑过），本页自己拉一次
+    LaunchedEffect(Unit) { viewModel.tools.loadRuleList() }
     // id 命中取已有规则；未命中或为空=新建。后端会自动给空 id 生成 8 字符 id（POST /rules）。
     val initial: AutomationRule = remember(ruleId, state.rules) {
         if (isNew) AutomationRule()
         else state.rules.firstOrNull { it.id == ruleId } ?: AutomationRule(id = ruleId)
     }
+    // 编辑态且列表还没到：见 [TaskEditScreen] 同名判据的说明
+    val awaitingRule = !isNew && state.rules.none { it.id == ruleId } && !state.rulesLoaded
 
-    // 表单 state —— 规则未变时跟随 initial 编辑态
+    // 表单 state —— 全部跟着 initial 走，列表晚到时会重建并回填
     var currentStep by remember { mutableStateOf(0) }
-    var name by remember { mutableStateOf(initial.name) }
-    var selectedTrigger by remember { mutableStateOf(initial.triggerType) }
-    var trafficGb by remember {
+    var name by remember(initial) { mutableStateOf(initial.name) }
+    var selectedTrigger by remember(initial) { mutableStateOf(initial.triggerType) }
+    var trafficGb by remember(initial) {
         mutableStateOf(initial.triggerParams["thresholdBytes"]?.content?.toLongOrNull()
             ?.let { it / (1024.0 * 1024 * 1024) }
             ?.let { String.format(Locale.US, "%.2f", it) } ?: "1.00")
     }
-    var rsrp by remember { mutableStateOf(initial.triggerParams["rsrp"]?.content ?: "-110") }
-    var batteryLevel by remember { mutableStateOf(initial.triggerParams["levelPercent"]?.content ?: "20") }
-    var targetType by remember { mutableStateOf(initial.triggerParams["targetType"]?.content ?: "4G") }
-    var selectedCategory by remember {
+    var rsrp by remember(initial) { mutableStateOf(initial.triggerParams["rsrp"]?.content ?: "-110") }
+    var batteryLevel by remember(initial) { mutableStateOf(initial.triggerParams["levelPercent"]?.content ?: "20") }
+    var targetType by remember(initial) { mutableStateOf(initial.triggerParams["targetType"]?.content ?: "4G") }
+    var selectedCategory by remember(initial) {
         mutableStateOf(initial.actionType.let { ActionRegistry.getByType(it)?.category ?: "network" })
     }
-    var selectedActionType by remember { mutableStateOf(initial.actionType) }
-    var actionParams by remember { mutableStateOf(initial.params) }
-    var enabled by remember { mutableStateOf(initial.enabled) }
+    var selectedActionType by remember(initial) { mutableStateOf(initial.actionType) }
+    var actionParams by remember(initial) { mutableStateOf(initial.params) }
+    var enabled by remember(initial) { mutableStateOf(initial.enabled) }
     var toast by remember { mutableStateOf<ToastMessage?>(null) }
     var saveDone by remember { mutableStateOf(false) }
+    var submitting by remember { mutableStateOf(false) }
+
 
     val triggerDef = RULE_TRIGGERS.firstOrNull { it.type == selectedTrigger }
 
@@ -900,12 +950,23 @@ fun RuleEditScreen(
         enabled = enabled
     )
 
+    // 列表还没到就只给加载态：见 [TaskEditScreen]
+    if (awaitingRule) {
+        UfiScreenScaffold(title = "编辑规则", navController = navController, showBack = true) { padding ->
+            Box(Modifier.fillMaxSize().padding(padding), contentAlignment = Alignment.Center) {
+                UfiLoadingIndicator()
+            }
+        }
+        return
+    }
+
     UfiScreenScaffold(
         title = if (isNew) "新建规则" else "编辑规则",
         navController = navController,
         showBack = true
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize().padding(padding)) {
+
             UfiWizard(
                 steps = listOf(
                     UfiWizardStep(
@@ -1075,12 +1136,23 @@ fun RuleEditScreen(
                 onStepChange = { currentStep = it },
                 onFinish = {
                     val rule = buildRule()
-                    if (isNew) viewModel.tools.createRule(rule) else viewModel.tools.updateRule(rule.id, rule)
-                    toast = ToastMessage(if (isNew) "规则已创建" else "规则已保存", ToastType.SUCCESS)
-                    saveDone = true
+                    // 成功才 toast + 退页（理由同 TaskEditScreen.submit）
+                    submitting = true
+                    val onDone: (Boolean, String) -> Unit = { ok, msg ->
+                        submitting = false
+                        toast = ToastMessage(msg, if (ok) ToastType.SUCCESS else ToastType.ERROR)
+                        if (ok) saveDone = true
+                    }
+                    if (isNew) {
+                        viewModel.tools.createRule(rule, onDone)
+                    } else {
+                        viewModel.tools.updateRule(rule.id, rule, onDone)
+                    }
                 },
                 finishText = if (isNew) "创建规则" else "保存修改",
+                finishLoading = submitting,
                 onStepBlocked = { toast = ToastMessage(it, ToastType.WARNING) }
+
             )
             UfiToastHost(toastMessage = toast, onDismiss = { toast = null })
         }

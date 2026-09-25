@@ -2,6 +2,7 @@ package com.ufi_axis.ui.screens.home
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDownward
@@ -12,6 +13,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -20,6 +24,8 @@ import com.ufi_axis.ui.components.common.UfiGradientSignalBar
 import com.ufi_axis.ui.components.common.UfiRollingMetric
 import com.ufi_axis.ui.components.common.UfiRollingText
 import com.ufi_axis.ui.components.common.signalBars
+import com.ufi_axis.ui.theme.GRADIENT_MID_LIGHTEN_DARK
+import com.ufi_axis.ui.theme.GRADIENT_TOP_LIGHTEN_DARK
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.StatusOnline
 import com.ufi_axis.ui.theme.UfiCardDefaults
@@ -65,7 +71,14 @@ fun HomeConnectionCard(
     // 只显示更严重的那条（后端未连接 > 实时通道），不再重复告知。
     backendOffline: Boolean = false,
     lastUpdatedText: String? = null,
-    realtimeStatus: String? = null
+    realtimeStatus: String? = null,
+    // ── 2026-09-25：行2 双主角各自整块可点（左流量 / 右已连接设备）──
+    //
+    // 本卡是纯展示组件（除 palette 外不读任何 Local、不持任何状态），所以两个动作都只出回调，
+    // 弹窗与它们的状态一律挂在 DashboardScreen 那一层。默认 null = 不可点（本卡在
+    // Gallery / Preview 里也能单独渲染，不会因为少传回调而变成点了没反应的假入口）。
+    onTrafficClick: (() -> Unit)? = null,
+    onClientsClick: (() -> Unit)? = null
 ) {
     val palette = LocalResolvedPalette.current
     val networkStatus = state.networkStatus
@@ -109,8 +122,13 @@ fun HomeConnectionCard(
     val bars = signalBars(rsrp)  // 0..5 格数
 
     // ── 渐变：不透明明暗衍生色（阶梯口径见 theme 层的 Color.ufiShade）──
+    // 深色档系数改自 GRADIENT_MID_LIGHTEN_DARK / GRADIENT_TOP_LIGHTEN_DARK 常量，理由见常量定义。
     val gradColors = if (palette.isDark) {
-        listOf(palette.accent.ufiShade(-0.14f), palette.accent.ufiShade(-0.04f), palette.accent)
+        listOf(
+            palette.accent,
+            palette.accent.ufiShade(GRADIENT_MID_LIGHTEN_DARK),
+            palette.accent.ufiShade(GRADIENT_TOP_LIGHTEN_DARK)
+        )
     } else {
         listOf(palette.accent, palette.accent.ufiShade(0.12f), palette.accent.ufiShade(0.22f))
     }
@@ -140,9 +158,16 @@ fun HomeConnectionCard(
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             // ═══ 行1：运营商 + 设备名 + 已连接 ═══
+            //
+            // ★ 2026-09-24（用户定稿："已连接和信号值图标往上移动一行"）：
+            //   `CenterVertically` → `Top`。左列是**两行**（运营商+制式胶囊 / 设备名），
+            //   右侧那组（连接圆点 + 文字 + 信号条）只有一行，居中时它落在左列两行的**中缝**上，
+            //   看着比运营商那行低半行。改成顶对齐后它与运营商行成对。
+            //   上方已经没有别的内容（行1 就是卡片内容区的第一个子项），所以"往上一行"
+            //   只能靠对齐实现，减 padding 是做不到的。
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     // ── 2026-09-04（P2-中）本卡内全部前景色收敛说明 ─────────────────────
@@ -190,6 +215,10 @@ fun HomeConnectionCard(
                 }
                 Spacer(Modifier.width(10.dp))
                 Row(
+                    // 顶对齐之后补 2dp：左列首行是 `metricValueCompact`（大字、行高高），
+                    // 右侧是 `labelSmall`。纯 Top 会让这组贴在运营商文字的**上沿**、
+                    // 看着略高；2dp 把它拉到与运营商文字的光学中线齐平。
+                    modifier = Modifier.padding(top = 2.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
@@ -266,17 +295,66 @@ fun HomeConnectionCard(
             Spacer(Modifier.height(10.dp))
 
             // ═══ 行2：双主角（左=流量 / 右=网络质量） ═══
+            //
+            // ★ 2026-09-24（用户定稿："右侧的已连接设备靠左对齐"）：间隙 12dp → 16dp。
+            //   右列内容本来就是 `Alignment.Start`（贴自己那一列的左边缘），"不对齐"的其实是
+            //   **两列离各自左边界的距离不等**：
+            //     左列文字离卡片内容左边缘 = 卡片水平内边距 16dp（见上方 `.padding(horizontal = 16.dp)`）
+            //     右列文字离分隔线       = 本 Row 的间隙 12dp
+            //   把间隙提到与卡片内边距同值，两列的"起跑线缩进"就一致了。
+            //   分隔线仍然居中 —— `spacedBy` 在它两侧给的是同一个值。
+            //   代价：两个间隙各多 4dp，可用宽度少 8dp（两列各 4dp）。
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(IntrinsicSize.Max),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                horizontalArrangement = Arrangement.spacedBy(16.dp)
             ) {
                 // —— 左：本月流量 ——
+                //
+                // ★ 2026-09-25（本轮）：整块可点 → 打开「流量限额设置」弹窗
+                //   （与工具-流量管理里的那一个是同一份组件，见 UfiDataLimitDialog）。
+                //   三件事必须这么做，别简化：
+                //   1. 点击区挂在**这一列**（标签 / 读数 / 限额行 + fillMaxHeight），不是挂在
+                //      数字那一个 Text 上 —— 用户心里"那一栏"是整块。
+                //   2. 竖分隔线是本 Row 的**另一个子项**、不在这个 Column 里，所以天然不会被
+                //      点击区吃掉。想给列加 padding 的话要先算过 weight，本轮不动行2 的几何。
+                //   3. `clip` 必须排在 `clickable` **之前**：本卡底是 accent 三段渐变，不裁形状
+                //      时默认 ripple 是直角矩形，压在圆角卡内侧像漏了一块。indication 保持默认
+                //      （不传 null）—— MonitorOverview 的 hero 入口胶囊也是渐变底 + 默认 ripple，
+                //      同一套观感。
+                val limitLine = if (hasLimitValid) "/ ${gb(limitBytes!!)} GB" else "/ 无限额"
                 Column(
                     modifier = Modifier
-                        .weight(1.1f)
-                        .fillMaxHeight(),
+                        // ★ 2026-09-24（用户定稿："中间的分割线改成居中"）：1.1f → 1f。
+                        //   分隔线是本 Row 的第二个子项，位置由两侧权重决定：1.1 : 1 时它落在
+                        //   约 52.4% 处，肉眼就是"往右偏"。两边等权后它正好在中线上
+                        //   （两个 12dp 间隙 + 1dp 线宽是对称扣除的，不影响居中）。
+                        //
+                        //   代价：左列比原来窄约 5%。左列读数是 28sp ExtraBold，
+                        //   `"1234.5 GB"` 这种四位整数 + 单位在窄屏上可能触到边界。
+                        //   真要出现（月流量过 1TB）再单独处理，别用回不等权 —— 那等于拿
+                        //   "线偏移"换"线不偏移"。
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .clip(UfiCardDefaults.subtleShape)
+                        .then(
+                            if (onTrafficClick != null) {
+                                Modifier
+                                    .clickable(
+                                        role = Role.Button,
+                                        onClickLabel = "设置流量限额",
+                                        onClick = onTrafficClick
+                                    )
+                                    // 语义挂在**整列**上（与 §5.20 无障碍同一口径）：三行文字各自
+                                    // 朗读会念成"本月流量 / 12.3 GB / 斜杠 100.0 GB"三段，
+                                    // 合并成一句才读得通，且动作提示由 onClickLabel 给。
+                                    .semantics(mergeDescendants = true) {
+                                        contentDescription =
+                                            "本月流量 ${gb(usedBytes)} GB $limitLine，点击设置限额"
+                                    }
+                            } else Modifier
+                        ),
                     verticalArrangement = Arrangement.Top
                 ) {
                     Text(
@@ -296,8 +374,14 @@ fun HomeConnectionCard(
                         unitSpacing = 5.dp
                     )
                     Spacer(Modifier.height(2.dp))
+                    // ★ 2026-09-24（用户定稿）：有限额分支末尾的「限额」二字删掉 ——
+                    //   `"/ 100.0 GB"` 已经能读懂，"限额"是冗余修饰。
+                    //   **无限额分支保持 `"/ 无限额"`**：那三个字是一体的，抽掉两个字会变成
+                    //   `"/ 无"`，读不成话。
+                    // 2026-09-25：文案提到上面的 `limitLine`，因为整列的无障碍描述也要用同一句 ——
+                    // 两处各写一遍就会出现"看到的和读到的不一样"。
                     Text(
-                        text = if (hasLimitValid) "/ ${gb(limitBytes!!)} GB 限额" else "/ 无限额",
+                        text = limitLine,
                         style = MaterialTheme.typography.labelMedium,
                         color = palette.gradientMuted.copy(alpha = 0.7f),  // 原 Color.White 70%：限额说明
                         maxLines = 1
@@ -313,10 +397,33 @@ fun HomeConnectionCard(
                 )
 
                 // —— 右：已连接设备总数 + WiFi 基本信息（与左列流量对称） ——
+                //
+                // ★ 2026-09-25（本轮）：整块可点 → 打开「在线设备」弹窗（数据与网络设置里的
+                //   在线设备页同源，见 HomeOnlineDevicesDialog）。几何与左列同一套理由，
+                //   clip / indication / 分隔线的说明见左列注释，不重复。
+                val clientsText = wifiClientCount?.toString() ?: "—"
                 Column(
                     modifier = Modifier
                         .weight(1f)
-                        .fillMaxHeight(),
+                        .fillMaxHeight()
+                        .clip(UfiCardDefaults.subtleShape)
+                        .then(
+                            if (onClientsClick != null) {
+                                Modifier
+                                    .clickable(
+                                        role = Role.Button,
+                                        onClickLabel = "查看在线设备",
+                                        onClick = onClientsClick
+                                    )
+                                    .semantics(mergeDescendants = true) {
+                                        contentDescription = if (wifiClientCount == null) {
+                                            "已连接设备数未知，点击查看在线设备"
+                                        } else {
+                                            "已连接设备 $wifiClientCount 台，点击查看在线设备"
+                                        }
+                                    }
+                            } else Modifier
+                        ),
                     horizontalAlignment = Alignment.Start,
                     verticalArrangement = Arrangement.Top
                 ) {
@@ -327,20 +434,24 @@ fun HomeConnectionCard(
                         maxLines = 1
                     )
                     Spacer(Modifier.height(2.dp))
-                    Row(verticalAlignment = Alignment.Bottom) {
-                        UfiRollingText(
-                            text = wifiClientCount?.toString() ?: "—",
-                            style = UfiTextStyles.metricValue,
-                            color = palette.onGradient  // 原 Color.White：设备数大数字
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            text = "台设备",
-                            style = UfiTextStyles.label,
-                            color = palette.gradientMuted.copy(alpha = 0.85f),  // 原 Color.White 85%：单位后缀
-                            maxLines = 1
-                        )
-                    }
+                    // ★ 2026-09-24（用户定稿）：「台设备」从**与数字同行**改成**单独一行**。
+                    //   左列「本月流量」是三行（标签 / 读数 / 限额行），右列原来只有两行，
+                    //   两列的基线与高度都对不齐。现在右列也是三行（标签 / 数字 / 台设备），
+                    //   第三行的样式与左列第三行完全一致（labelMedium + gradientMuted 70%），
+                    //   两列在视觉上成对。
+                    //   因此不再需要那个 `Row(verticalAlignment = Bottom)` 与 4dp 横向 Spacer。
+                    UfiRollingText(
+                        text = clientsText,
+                        style = UfiTextStyles.metricValue,
+                        color = palette.onGradient  // 原 Color.White：设备数大数字
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "台设备",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.gradientMuted.copy(alpha = 0.7f),  // 与左列第三行同值
+                        maxLines = 1
+                    )
                 }
             }
 

@@ -1003,7 +1003,8 @@ private fun StorageCleanDialog(
             confirmText = "清理",
             confirmDestructive = true,
             // 一个都不选时不让点：空集合发出去就是一个什么都不删的请求
-            enabled = scopes.isNotEmpty()
+            enabled = scopes.isNotEmpty(),
+            topSpacing = Spacing.Large
         )
     }
 }

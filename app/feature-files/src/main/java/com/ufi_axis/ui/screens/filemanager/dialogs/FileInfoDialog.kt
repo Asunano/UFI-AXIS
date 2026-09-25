@@ -14,6 +14,7 @@ import com.ufi_axis.ui.screens.filemanager.canExtract
 import com.ufi_axis.ui.screens.filemanager.fileKindOf
 import com.ufi_axis.ui.screens.filemanager.hasViewer
 import com.ufi_axis.ui.screens.filemanager.openActionLabel
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.util.FormatUtils
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -83,7 +84,8 @@ fun FileInfoDialog(
                     onAction(primary.action)
                 },
                 confirmText = primary.label,
-                dismissText = "关闭"
+                dismissText = "关闭",
+                topSpacing = Spacing.Large
             )
         } else {
             // 这个类型没有成立的主操作（不可解压的 rar/7z、pdf 等文档、未知扩展名）：
@@ -92,7 +94,8 @@ fun FileInfoDialog(
                 onDismiss = onDismiss,
                 onConfirm = onDismiss,
                 confirmText = "关闭",
-                dismissText = null
+                dismissText = null,
+                topSpacing = Spacing.Large
             )
         }
     }

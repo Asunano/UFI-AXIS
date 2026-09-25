@@ -92,24 +92,15 @@ fun AlertSettingsScreen(
     // 关着时 core 连 goform 都不查，引擎自然也无从判定。所以套餐限额与设备接入/离开
     // 这三类，只写 `perType` 是个假开关 —— 见下面 toggleTrafficLimitType / toggleDeviceEventType。
     // 本地 prefs 是这两个字段的镜像（`NotificationConfigSync.applyRemote` 回写）。
-    var traffic80Gate by remember { mutableStateOf(prefs.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)) }
-    var deviceEventsGate by remember {
-        mutableStateOf(prefs.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false))
-    }
+    //
+    // 2026-09-22：由 `remember { prefs.getBoolean(...) }` + ON_RESUME 重读换成跟着 prefs 走的
+    // [rememberPrefsBoolean]。动机是本轮给下发失败补了"回读 core 真值"这一步（见
+    // `ToolsModule.updateNotificationConfig`）—— 真值回灌只会改 prefs，一次性快照读不到，
+    // 开关会停在那个没落地的位置上，正是本仓明令禁止的假开关。监听器同时覆盖了原来
+    // ON_RESUME 那条路径（从「日常通知」页返回后要重读），所以那段一并去掉。
+    var traffic80Gate by rememberPrefsBoolean(prefs, NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)
+    var deviceEventsGate by rememberPrefsBoolean(prefs, NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false)
 
-    // 「日常通知」页写的是同两个字段，从那页返回后必须重读，否则本页显示的还是进页面那一刻的快照
-    // （与 NotificationsGuardScreen 的 ON_RESUME 重读同一个理由）。
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) {
-                traffic80Gate = prefs.getBoolean(NotificationCenter.KEY_TRAFFIC_80_NOTIF, false)
-                deviceEventsGate = prefs.getBoolean(NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, false)
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-    }
 
     // 拉取最新配置（连接即拉取镜像）。通知配置一起回读：上面两个闸门的真源在 core，
     // 回显由 NotificationConfigSync 写进 prefs，ON_RESUME 那一遍就能读到。
@@ -131,10 +122,20 @@ fun AlertSettingsScreen(
         pushConfig { copy(perType = next) }
     }
 
-    /** 写二级闸门：本地镜像先落地（UI 立刻响应），再把那一个字段下发 core（真源）。 */
-    fun pushGate(coreField: String, prefsKey: String, on: Boolean) {
+    /**
+     * 写二级闸门：本地镜像先落地（UI 立刻响应），再把那一个字段下发 core（真源）。
+     *
+     * 2026-09-22：传 [successNotice]。这一路原来是**完全静默**的（`updateNotificationConfig`
+     * 失败只打日志），而它管的是"core 到底要不要去查这项数据"——静默失败的表现就是
+     * "开关看着开了，却永远收不到这类告警"。失败提示由 `toolsState.errorMessage` 走全局通道，
+     * 并由 core 真值回灌把开关拉回去（见 ToolsModule 那边的说明）。
+     */
+    fun pushGate(coreField: String, prefsKey: String, on: Boolean, successNotice: String) {
         prefs.edit().putBoolean(prefsKey, on).apply()
-        viewModel.tools.updateNotificationConfig(mapOf(coreField to on))
+        viewModel.tools.updateNotificationConfig(
+            mapOf(coreField to on),
+            successNotice = successNotice
+        )
     }
 
     /** 套餐限额预警：`perType[traffic_limit]` 与取数闸门 `traffic_80_enabled` 同开同关。 */
@@ -142,7 +143,10 @@ fun AlertSettingsScreen(
         if (config == null) return
         togglePerType(Alerts.Type.TRAFFIC_LIMIT, on)
         traffic80Gate = on
-        pushGate("traffic_80_enabled", NotificationCenter.KEY_TRAFFIC_80_NOTIF, on)
+        pushGate(
+            "traffic_80_enabled", NotificationCenter.KEY_TRAFFIC_80_NOTIF, on,
+            successNotice = if (on) "套餐限额预警已开启" else "套餐限额预警已关闭"
+        )
     }
 
     /**
@@ -160,7 +164,11 @@ fun AlertSettingsScreen(
         val gate = on || (current.perType[siblingKey] ?: false)
         if (gate != deviceEventsGate) {
             deviceEventsGate = gate
-            pushGate("device_events_enabled", NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, gate)
+            pushGate(
+                "device_events_enabled", NotificationCenter.KEY_DEVICE_EVENTS_NOTIF, gate,
+                // 文案说"设备接入/离开监测"而不是具体哪一类：这道闸门是两类共用的
+                successNotice = if (gate) "设备接入/离开监测已开启" else "设备接入/离开监测已关闭"
+            )
         }
     }
 
@@ -633,7 +641,8 @@ private fun ThresholdEditDialog(
                 startThumbColor = leftColor,
                 endThumbColor = rightColor,
                 tickStep = tickStep,
-                // 标签只在拖动时淡入，所以这里可以放不带单位的裸数值（单位在上方双色标签里）
+                // 刻度标签常驻弱显、拖动时提亮（2026-09-22 改），所以这里放不带单位的裸数值就够——
+                // 带单位的当前值在上方那对双色 chip 里。
                 tickLabelFormatter = { formatValue(it) },
                 onValuesChange = { range ->
                     if (reverse) {

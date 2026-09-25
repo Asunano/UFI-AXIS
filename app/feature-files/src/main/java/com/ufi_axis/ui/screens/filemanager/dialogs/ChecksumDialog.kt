@@ -27,6 +27,7 @@ import com.ufi_axis.ui.components.common.UfiDialogActions
 import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiDialogInfoRow
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 
 /**
  * 文件校验和对话框（2026-09-12）。
@@ -63,7 +64,8 @@ fun ChecksumDialog(
             onDismiss = onDismiss,
             onConfirm = onDismiss,
             confirmText = "关闭",
-            dismissText = null
+            dismissText = null,
+            topSpacing = Spacing.Large
         )
     }
 }

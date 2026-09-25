@@ -612,8 +612,7 @@ private const val K_AUTO_REFRESH = "auto_refresh"
 private const val K_FILE_VIEW_MODE = "file_view_mode"
 private const val K_AUTO_CHECK_UPDATE = "auto_check_update"
 private const val K_UPDATE_SOURCE = "update_source_mode"
-private const val K_UPDATE_MIRROR_INDEX = "update_mirror_index"
-private const val K_UPDATE_MIRROR_CUSTOM = "update_mirror_custom"
+
 
 private fun collectAppSection(themeManager: ThemeManager, prefs: AppPreferences): JsonObject =
     buildJsonObject {
@@ -629,9 +628,8 @@ private fun collectAppSection(themeManager: ThemeManager, prefs: AppPreferences)
         put(K_FILE_VIEW_MODE, prefs.fileViewMode)
         put(K_AUTO_CHECK_UPDATE, prefs.autoCheckUpdate)
         put(K_UPDATE_SOURCE, prefs.updateSourceMode)
-        put(K_UPDATE_MIRROR_INDEX, prefs.updateMirrorIndex)
-        put(K_UPDATE_MIRROR_CUSTOM, prefs.updateMirrorCustom)
     }
+
 
 /**
  * 把 core 回传的手机端偏好段写回本机。
@@ -661,8 +659,7 @@ private fun applyAppSection(raw: String, themeManager: ThemeManager, prefs: AppP
     str(K_FILE_VIEW_MODE)?.takeIf { it.isNotBlank() }?.let { prefs.fileViewMode = it }
     bool(K_AUTO_CHECK_UPDATE)?.let { prefs.autoCheckUpdate = it }
     str(K_UPDATE_SOURCE)?.takeIf { it.isNotBlank() }?.let { prefs.updateSourceMode = it }
-    int(K_UPDATE_MIRROR_INDEX)?.let { prefs.updateMirrorIndex = it }
-    str(K_UPDATE_MIRROR_CUSTOM)?.let { prefs.updateMirrorCustom = it }
 }
+
 
 private val LENIENT = Json { ignoreUnknownKeys = true; isLenient = true }

@@ -244,9 +244,13 @@ internal val DAILY_NOTIFY_SCENES: List<Pair<String, Boolean>> = listOf(
  *
  * 监听器覆盖所有写入方（本页 UI、applyRemote、另一端改配置后的回灌），比在若干
  * 生命周期回调里各补一次重读更难漏。
+ *
+ * 2026-09-22 由 private 放宽到 internal：`AlertSettingsScreen` 的两个二级闸门镜像
+ * （`traffic_80_enabled` / `device_events_enabled`）需要同一个语义 —— 下发失败时
+ * `ToolsModule` 会回读 core 真值并重写 prefs，只有跟着 prefs 走的状态才会把开关拉回真值。
  */
 @Composable
-private fun rememberPrefsBoolean(
+internal fun rememberPrefsBoolean(
     prefs: SharedPreferences,
     key: String,
     default: Boolean

@@ -6,14 +6,18 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.ufi_axis.ui.components.common.UfiInfoCell
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -25,33 +29,31 @@ import com.ufi_axis.viewmodel.state.DashboardState
 /**
  * 设备信息卡（首页四环下方）。
  *
- * ## 2026-09-22 改版：从「图标 + 标签 + 值」单行左右分列改为 **2 列信息格**
+ * ## 2026-09-22 C1「纯层级」方案
  *
- * 旧版每行都是 `Icon | label | ………… value`，左右分列。问题不在于好不好看，而在于
- * **值那一侧只剩半屏宽**：固件版本、内核这种长值一进来就被挤成省略号。当时的应对是
- * 往值里塞一个 `\n` 把固件版本拆成两行 + `maxLines = 2`，结果第二段（`wa_inner_version`）
- * 照样被截断，还把那一行撑成别人的两倍高。
+ * 三段式，靠字号差（20sp / 13sp / 11sp）和一条分隔线分层，不使用渐变、色块或图标：
  *
- * 现在按公共件 [UfiInfoCell] 的既有分工来排（那份 KDoc 里写明了这条）：
- * - **短值**（型号 / 系统版本 / QoS 三项）→ 2~3 列并排，标签在上值在下，每格独占整格宽度；
- * - **长值**（固件版本 / 内核）→ **独占一整行**，拿到整卡宽度。
+ * ```
+ *  ZTE MU5001                    ← 20sp 标题级
+ *  Android 13 · SDK 33           ← 13sp 副信息
+ *  ─────────────────────────────
+ *  QCI        下行       上行     ← 三列等宽 UfiInfoCell
+ *  8          500 Mbps   100 Mbps
+ *  ─────────────────────────────
+ *  固件版本                       ← 长值独占整行
+ *  MU5001_V1.0.0B05
+ *  内核
+ *  5.4.147-perf-g9f2c1b8
+ * ```
  *
- * 顺带去掉了图标：8 个 accent 色图标竖着排下来比数据本身更抢眼，而"设备型号""内核"
- * 这些标签本身已经说清了是什么，图标没有增加信息。
+ * ## QoS 缺失时
+ * AT 通道不可用（非展锐平台 / HAL 被裁）时 QoS 区**整段不渲染**（含它上面那条分隔线），
+ * 卡片退化成"型号 + 副信息 + 分隔线 + 固件 + 内核"，不留空。
  *
- * ## 删掉了「运行时间」与「SIM 卡」两行（2026-09-22）
- * 按需求移除。数据源（`state.uptimeInfo` / `state.deviceInfo.sim`）仍在 summary 里，
- * 别处要用不受影响。
- *
- * ## 新增「承载 QoS」一组
- * QCI / 下行 / 上行 来自 `AT+CGEQOSRDP`（core 侧 `/api/device/qos` + `CgeqosrdpParser`）。
- * 单位换算与文案格式化都在 core 做，这里只渲染 —— 两端各写一份 kbps→Mbps 迟早对不上。
- * AT 通道不可用（非展锐平台等）时整组不渲染，而不是显示三个"—" —— 三个空格子只会让人
- * 以为是加载失败，而它其实是"这台设备没这个能力"。
- *
- * 容器样式沿用同包卡片的
- * `Box + ufiCardShadow(4.dp) + clip + background(cardBg) + border(1.dp, divider)`；
- * 内部是普通 [Column]（非滚动），符合 `UfiPageBackground` 不得再套滚动容器的约束。
+ * ## 5G 胶囊
+ * 预览里的 `5G` 描边胶囊**没有接入**：那个值来自信号那边的 `rat` 字段（`network:signal`），
+ * 不在这张卡现有的数据源（`/api/dashboard/summary` + `/api/device/version` + `/api/device/qos`）里。
+ * 接进来要改 `DashboardState` 的取数逻辑。留了 TODO 注释，你说要的时候我再接。
  */
 @Composable
 fun HomeDeviceInfoCard(
@@ -63,22 +65,23 @@ fun HomeDeviceInfoCard(
 
     val device = state.deviceInfo?.device
 
+    // ── 数据 ──
+
     val deviceModel = buildString {
         append(device?.brand ?: "")
         append(" ")
         append(device?.model ?: "")
     }.trim().ifEmpty { PLACEHOLDER }
 
-    // 2026-09-22：只留 cr_version。原来把 wa_inner_version 用 "\n" 接在后面，
-    // 而值那一侧当时只有半屏宽 + maxLines=2 —— 第二段必然被省略号截断，
-    // 等于用双倍行高换来一段读不全的文字。内部版本号对首页读者没有意义。
-    val firmware = state.deviceVersion?.cr_version?.trim().orEmpty().ifEmpty { PLACEHOLDER }
-
-    val systemVersion = device?.let { "Android ${it.android_version} (SDK ${it.sdk_version})" }
+    val systemVersion = device?.let { "Android ${it.android_version} · SDK ${it.sdk_version}" }
         ?: PLACEHOLDER
+
+    val firmware = state.deviceVersion?.cr_version?.trim().orEmpty().ifEmpty { PLACEHOLDER }
     val kernel = state.deviceInfo?.kernel?.trim().orEmpty().ifEmpty { PLACEHOLDER }
 
     val qos = state.deviceQos
+
+    // ── 卡片外壳 ──
 
     Box(
         modifier = modifier
@@ -91,53 +94,32 @@ fun HomeDeviceInfoCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = Spacing.Large, vertical = Spacing.Large),
-            verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                .padding(horizontal = 18.dp, vertical = 17.dp)
         ) {
-            // ── 设备信息 ──
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
-            ) {
-                UfiInfoCell(
-                    modifier = Modifier.weight(1f),
-                    label = "设备型号",
-                    value = deviceModel
-                )
-                UfiInfoCell(
-                    modifier = Modifier.weight(1f),
-                    label = "系统版本",
-                    value = systemVersion
-                )
-            }
-            // 长值独占整行：这两项在半屏宽下必然省略号（见本文件 KDoc）
-            UfiInfoCell(
-                modifier = Modifier.fillMaxWidth(),
-                label = "固件版本",
-                value = firmware
+            // ── 头部：型号 + 副信息 ──
+
+            // TODO：5G 胶囊（从信号的 rat 字段接入后，在标题右侧放一个 accent 描边的圆角标签）
+            Text(
+                text = deviceModel,
+                style = UfiTextStyles.bodyLeadStrong.copy(fontSize = TITLE_SIZE),
+                color = palette.textPrimary,
+                maxLines = 1
             )
-            UfiInfoCell(
-                modifier = Modifier.fillMaxWidth(),
-                label = "内核",
-                value = kernel
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = systemVersion,
+                style = UfiTextStyles.noteLead,
+                color = palette.textSecondary,
+                maxLines = 1
             )
 
-            // ── 承载 QoS（AT+CGEQOSRDP）──
-            //
-            // 查不到就整组不渲染：AT 通道在很多设备上根本不存在，那时显示三个"—"
-            // 会被当成加载失败，而它其实是"这台设备没这个能力"。
+            // ── QoS 区（有数据才渲染）──
+
             if (qos != null && qos.hasData) {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(1.dp)
-                        .background(palette.divider)
-                )
-                Text(
-                    text = "承载 QoS",
-                    style = UfiTextStyles.note,
-                    color = palette.textSecondary
-                )
+                Spacer(Modifier.height(SECTION_GAP))
+                Divider(palette.divider)
+                Spacer(Modifier.height(SECTION_GAP))
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
@@ -150,7 +132,6 @@ fun HomeDeviceInfoCard(
                     UfiInfoCell(
                         modifier = Modifier.weight(1f),
                         label = "下行",
-                        // 文案由 core 生成（"500 Mbps"）；0 / 未协商时 core 给空串
                         value = qos.downlink_display.ifEmpty { PLACEHOLDER }
                     )
                     UfiInfoCell(
@@ -160,9 +141,45 @@ fun HomeDeviceInfoCard(
                     )
                 }
             }
+
+            // ── 固件 + 内核 ──
+
+            Spacer(Modifier.height(SECTION_GAP))
+            Divider(palette.divider)
+            Spacer(Modifier.height(SECTION_GAP))
+
+            UfiInfoCell(
+                modifier = Modifier.fillMaxWidth(),
+                label = "固件版本",
+                value = firmware
+            )
+            Spacer(Modifier.height(ITEM_GAP))
+            UfiInfoCell(
+                modifier = Modifier.fillMaxWidth(),
+                label = "内核",
+                value = kernel
+            )
         }
     }
 }
 
-/** 取不到值时的占位。与仓库其它只读信息一致（`UfiInfoRow` 的 `sanitizeUnknown` 也用它）。 */
+/** 卡内分隔线。1dp 实线，不用 M3 的 `HorizontalDivider`（那个带 padding 约定，行为不受控）。 */
+@Composable
+private fun Divider(color: Color) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(color)
+    )
+}
+
+/** 标题字号。20sp 在标题层级里介于 headerTitle(26sp) 和 panelTitle(16sp) 之间。 */
+private val TITLE_SIZE = 20.sp
+/** 分隔线上下间距。 */
+private val SECTION_GAP = 14.dp
+
+/** 同一区内信息格之间的纵向间距。 */
+private val ITEM_GAP = 12.dp
+
 private const val PLACEHOLDER = "—"

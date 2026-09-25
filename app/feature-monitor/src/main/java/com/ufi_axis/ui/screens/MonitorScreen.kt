@@ -83,6 +83,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.state.MonitorState
 import com.ufi_axis.viewmodel.state.DashboardState
 import com.ufi_axis.viewmodel.module.UiEvent
+import com.ufi_axis_core.contract.Capability
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -141,13 +142,17 @@ fun MonitorScreen(
     //
     // 性能：这个复合请求会带来 2 次 dashboardState 发射，不能和首屏组合、页面转场动画抢同一帧。
     // 所以只有「确实没有数据」时才立刻拉，其它情况等首屏稳定后（1.5s）再补一次。
+    // 2026-09-22：改用 refreshDashboardIfStale() —— 本页与仪表盘 Tab 读同一份 dashboardState，
+    // 而 refreshDashboard() 会无条件 cancel 在飞的刷新。两个 Tab 都保活、都会在前台化时
+    // 进到这类效应里，用取消版就是互相掐掉对方的聚合请求。IfStale 版"有人在拉就让它拉完"，
+    // 且数据在新鲜窗口内时一个请求都不发。
     LaunchedEffect(pageForeground) {
         if (!pageForeground) return@LaunchedEffect
         if (dashboardState.trafficSummary == null) {
-            viewModel.dashboard.refreshDashboard()
+            viewModel.dashboard.refreshDashboardIfStale()
         } else {
             delay(1_500)
-            viewModel.dashboard.refreshDashboard()
+            viewModel.dashboard.refreshDashboardIfStale()
         }
     }
 
@@ -421,8 +426,12 @@ private fun MonitorOverviewTabContent(
 
             item(key = "hero") {
                 // 2026-09-08：首屏空数据时的 UfiLinearLoading（M3 indeterminate 横条，无限循环动画）
-                // 已删除，改成一行静态文案。横条本身没有进度信息，只是在动；数据到了卡片直接出现。
-                MonitorLoadingHint(visible = monitorState.isLoading && monitorState.alerts.isEmpty())
+                // 已删除，改成一行静态文案。
+                //
+                // 2026-09-22：那行静态文案（MonitorLoadingHint）也删了。总览页首屏在数据到达前
+                // 本来就会在**每张图表内部**各显示一次"数据加载中…"（FixedMonitorChart），
+                // 顶部再来一句笼统的"加载中…"是纯冗余，而且它只占一行高度、数据一到就消失，
+                // 反而制造一次整列表的位移。
                 EventSummaryCard(
                     alerts = todayAlerts,
                     range = todayRange,
@@ -564,7 +573,19 @@ private fun MonitorOverviewTabContent(
                 // 零观感变化）；离场那行早已走 Duration.Base，两边现在都在梯度上。
                 enter = slideInVertically(initialOffsetY = { it }) + fadeIn(animationSpec = tween(UfiMotion.Duration.Sweeping)),
                 exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(animationSpec = tween(UfiMotion.Duration.Base)),
-                modifier = Modifier.align(Alignment.BottomCenter).offset(y = (-40).dp)
+                // ★ 2026-09-24（贴底通栏低栏，§5.21 / §7-2.9 ②）：抬升量从写死的 `-40.dp`
+                //   改为读底栏 inset（`Modifier.ufiCapsuleBottomLift`）。
+                //
+                //   -40dp 当年是对的：悬浮胶囊的窗口被 `y` 抬高 30dp，胶囊自己只有约 50dp 高且
+                //   浮在页面之上，本 Box（= 页壳内容区，底边已在「屏幕底边 − navigationBars」处）
+                //   往上 40dp 正好落在胶囊左右两侧的空档里，分页条与胶囊不重叠。
+                //   通栏低栏没有抬升、也没有左右空档：栏顶边现在在「58dp 内容 + 安全区」≈ 82~106dp 处，
+                //   40dp 的浮层整段落在栏后面 —— 被压住。
+                //
+                //   抬升量不写新数字，与 6 个列表末尾的底部留白同源（同一个
+                //   `capsuleBottomClearance`：底栏总高 − 页壳已消费的 navigationBars + 呼吸），
+                //   栏高/字号/导航模式变化时两者一起走。
+                modifier = Modifier.align(Alignment.BottomCenter).ufiCapsuleBottomLift(Spacing.Medium)
             ) {
                 UfiPagination(
                     currentPage = currentPage,
@@ -607,6 +628,23 @@ private fun MonitorChartsTabContent(
     val palette = LocalResolvedPalette.current
     val settings = monitorState.settings
     val chartColors = ChartColors(palette.isDark)
+
+    // ── 电池图：「这台设备有没有电池」的判据（2026-09-26）──
+    //
+    // 取设备能力集（`Capability.BATTERY`），不取 `BatteryInfo.supported`。
+    // 两者是同一个事实的两份表达 —— core 侧都折自 `Capability.BATTERY in plugin.capabilities`
+    // （`supported` 只是电池读数上顺带捎回来的一份转述）。留两份判据迟早漂移，
+    // 而「有没有电池」本质就是能力集回答的问题，所以用能力集这一份。
+    //
+    // ⚠ 本处**刻意依赖** `DeviceCapabilityState.supports()` 在能力集没拉到时恒返回 true：
+    // 「还没拉到 / 拉失败」对电池必须按**有电池**处理 —— 照常画图，等能力集到手再说。
+    // 反过来（不确定就当没电池）会让一次网络抖动把一条正常的电量曲线判成假数据并灰掉。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val batterySupported = capabilities.supports(Capability.BATTERY)
+    // 补一发拉取：能力集自带「本进程只成功拉一次」的闸门，所以重复调用不会多发请求。
+    // 需要这一发是因为用户可能直接从底栏 / 深链进监控页，没走过网络页那条预热
+    // （`NetworkModule.loadNetworkAll` 顺带拉的那次）。
+    LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
 
     val range = monitorState.selectedRange
     val dateFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
@@ -684,9 +722,9 @@ private fun MonitorChartsTabContent(
             }
         }
 
-        item {
-            MonitorLoadingHint(visible = monitorState.isLoading && monitorState.cpuHistory.isEmpty())
-        }
+        // 2026-09-22：这里原来有一个只放 MonitorLoadingHint 的 LazyColumn item
+        // （"加载中…"，判据 isLoading && cpuHistory.isEmpty()）。删掉理由同 hero 那处：
+        // 下面每张图表自己就会显示"数据加载中…"，顶部这一句是冗余且会造成一次列表位移。
 
         // 2026-09-05：错误 item 已移除，见本文件上方同类注释（全局错误浮层）。
 
@@ -728,24 +766,40 @@ private fun MonitorChartsTabContent(
         MonitorMetricType.entries.forEach { metric ->
             if (!settings.enabledTypes.contains(metric.apiKey)) return@forEach
             item(key = metric.apiKey) {
-                MonitorChartSection(
-                    title = metric.label,
-                    monitorState = monitorState,
-                    types = listOf(metric),
-                    enabledTypes = settings.enabledTypes,
-                    chartColors = chartColors,
-                    timeRangeStr = timeRangeStr,
-                    range = monitorState.selectedRange,
-                    xDomainStartMs = sharedXDomain?.first,
-                    xDomainEndMs = sharedXDomain?.second,
-                    onNeedTypes = { needed ->
-                        viewModel.dashboard.loadMonitorTypes(needed, monitorState.selectedRange)
-                    },
-                    onVisibilityChanged = { types, visible ->
-                        if (visible) viewModel.dashboard.registerVisibleMonitorTypes(types)
-                        else viewModel.dashboard.unregisterVisibleMonitorTypes(types)
+                // 「本机型没有电池」时先摆一张说明卡，再摆图。
+                //
+                // 指标选择器里的电池项**不动**（仍可勾选）：用户可能就是来看旧数据的，
+                // 而且直接把这一项摘掉只会让「为什么没有电池图」更难问出口。
+                // 说明卡放在卡片外、图的正上方：`UfiNoticeCard` 自带
+                // `Spacing.CardHorizontalMargin` 横向外距，与下面 `MonitorSectionCard`
+                // 的外距同源，两块左右边缘对齐；塞进卡片里反而会多缩进一层。
+                Column {
+                    if (metric == MonitorMetricType.BATTERY && !batterySupported) {
+                        UfiNoticeCard(
+                            message = BATTERY_UNSUPPORTED_CHART_NOTE,
+                            modifier = Modifier.padding(bottom = Spacing.Small)
+                        )
                     }
-                )
+                    MonitorChartSection(
+                        title = metric.label,
+                        monitorState = monitorState,
+                        types = listOf(metric),
+                        enabledTypes = settings.enabledTypes,
+                        chartColors = chartColors,
+                        timeRangeStr = timeRangeStr,
+                        range = monitorState.selectedRange,
+                        xDomainStartMs = sharedXDomain?.first,
+                        xDomainEndMs = sharedXDomain?.second,
+                        batterySupported = batterySupported,
+                        onNeedTypes = { needed ->
+                            viewModel.dashboard.loadMonitorTypes(needed, monitorState.selectedRange)
+                        },
+                        onVisibilityChanged = { types, visible ->
+                            if (visible) viewModel.dashboard.registerVisibleMonitorTypes(types)
+                            else viewModel.dashboard.unregisterVisibleMonitorTypes(types)
+                        }
+                    )
+                }
             }
         }
 
@@ -773,7 +827,10 @@ private fun MonitorChartSection(
     // 2026-09-04：同屏各图共用的 X 轴时间域（由 MonitorChartsTabContent 统一算一次后下发，
     // null = 图表按自己的点集自适应 = 改动前的行为）。见调用点那段说明。
     xDomainStartMs: Long? = null,
-    xDomainEndMs: Long? = null
+    xDomainEndMs: Long? = null,
+    // 「这台设备有没有电池」（2026-09-26）。判据与文案都在调用点，这里只消费结论。
+    // 默认 true = 与改动前完全一致的画法；它只影响 [MonitorMetricType.BATTERY] 这一张图。
+    batterySupported: Boolean = true
 ) {
     val shownTypes = remember(types, enabledTypes) { types.filter { enabledTypes.contains(it.apiKey) } }
     if (shownTypes.isEmpty()) return
@@ -795,6 +852,21 @@ private fun MonitorChartSection(
     LaunchedEffect(range, apiKeys) { onNeedTypes(apiKeys) }
 
     val primary = shownTypes[0]
+
+    // ── 电池图在「本机型没有电池」时的画法（2026-09-26）──
+    //
+    // core 从 2026-09-24（批 L / M）起对未声明 `Capability.BATTERY` 的型号**不再写
+    // `battery_history`**，但之前写进去的那些行还在，而它们记的是系统的假值（F50 恒 50%）。
+    // 于是这张图变成「左半边一条 50% 的曲线、右半边空」，配上固定的 0~100 Y 轴，
+    // 看上去就是电量一路掉到 0 —— 图在说谎。
+    //
+    // 处理：曲线灰化 + 去掉填充。既不让这些点继续冒充"正在采集的实时曲线"
+    // （灰色 + 无填充在本页 8 张图里是唯一一份，与任何一条真曲线都不会混），
+    // 又把它们留着可查 —— 直接抹掉等于连"这里以前有过数据"都不告诉用户。
+    // 那些点到底是什么，由调用点那张说明卡讲清楚。
+    val palette = LocalResolvedPalette.current
+    val batteryStale = primary == MonitorMetricType.BATTERY && !batterySupported
+    val staleLineColor = palette.textSecondary.copy(alpha = 0.45f)
 
     // 2026-08-24（FIX-18）：按当前时间范围过滤数据——historyFor 返回的是完整历史序列，
     // 后端/mergePoints 可能保留窗口外（跨天）的点；图表层必须裁剪到 [queryStartMs, queryEndMs]，
@@ -822,7 +894,9 @@ private fun MonitorChartSection(
     // bucketMs 进 remember key：它一变（换区间 / 首次拿到服务端桶宽）裁剪边界就得跟着重算。
     // bucketMs <= 0（旧 core 不回 bucket_ms）时 halfBucketMs=0，退回原来的硬边界，行为不变。
     val bucketMs = monitorState.bucketMs
-    val chartData = remember(rawSeries, chartColors, range, bucketMs) {
+    // batteryStale / staleLineColor 进 key：它俩决定电池那条线的取色（见上面那段），
+    // 漏掉的话能力集拉回来之后曲线不会跟着变灰。
+    val chartData = remember(rawSeries, chartColors, range, bucketMs, batteryStale, staleLineColor) {
         val halfBucketMs = if (bucketMs > 0L) bucketMs / 2 else 0L
         val startMs = range.queryStartMs - halfBucketMs
         val endMs = range.queryEndMs + halfBucketMs
@@ -838,7 +912,8 @@ private fun MonitorChartSection(
                     MonitorMetricType.TRAFFIC_TX -> chartColors.trafficTx
                     MonitorMetricType.SIGNAL_RSRP -> chartColors.signalRsrp
                     MonitorMetricType.SIGNAL_SINR -> chartColors.signalSinr
-                    MonitorMetricType.BATTERY -> chartColors.battery
+                    MonitorMetricType.BATTERY ->
+                        if (batteryStale) staleLineColor else chartColors.battery
                     MonitorMetricType.TEMPERATURE -> chartColors.temperature
                 },
                 label = type.label,
@@ -880,7 +955,9 @@ private fun MonitorChartSection(
             // 「Y 轴固定」只对有公认定义域的指标生效（百分比 / 摄氏度）；
             // 流量与信号没有固定量程，硬给一个只会把曲线压成一条直线。
             fixedYRange = if (monitorState.settings.fixedYAxis) fixedYRangeFor(primary) else null,
-            fillAlpha = monitorState.settings.fillAlpha,
+            // 本机型没有电池时不画填充：填充是"这条曲线是本页主角"的视觉信号，
+            // 给一条旧版本留下的假曲线加这个信号只会让它更像真数据（见上面那段）。
+            fillAlpha = if (batteryStale) 0f else monitorState.settings.fillAlpha,
             // 桶宽来自服务端响应（state.bucketMs）：图表据此把真正的采集空洞断开，
             // 否则采集中断那几小时会被画成一条平直的假数据。
             // 注意这是**全区间一个值**，且它只是绘图分辨率（可见区间 / MAX_POINTS），不等于采集间隔；
@@ -1941,6 +2018,26 @@ private fun trafficYAxisLabel(v: Double): String {
         "%.1f%s".format(mantissa, suffix)
     }
 }
+
+// ── 「本机型没有电池」时电池图那张说明卡的文案（2026-09-26）──
+//
+// 第一句跟着批 N 在首页电池详情弹窗里那句走（原文：
+// 「本机型可能没有电池，或系统读不到真实电量 —— 上面的数值仅供参考，不做记录与告警。」），
+// 沿用「本机型…没有电池」「不做记录与告警」这两个说法，不另编一套。
+// 唯一的差别是去掉了「可能」和「或系统读不到真实电量」：那边的判据是电池读数上捎回来的
+// `supported` 字段（旧 core 不下发时默认 true，所以要留余地），这里的判据是设备能力集
+// 明确不含 `Capability.BATTERY` —— 那是插件声明的硬件事实，不是推测。
+//
+// 口径同批 O（见 `deviceUnsupportedNote`）：只说「这台设备没有」，
+// 不写「未开启」「权限不足」—— 这台机器压根没有电池，没有任何地方可开，
+// 那两句只会把用户引向一场白费的寻找。
+//
+// 第二句是给左半边那截旧曲线的：core 从 2026-09-24（批 L / M）起不再写 `battery_history`，
+// 而在那之前记下的是系统报的假值（F50 恒 50%）。不解释就会被读成「电量掉到 0 了」。
+// 「若…」是刻意的：全新部署根本没有旧行，那时图上只有"暂无数据"，这句话不该硬说有曲线。
+private const val BATTERY_UNSUPPORTED_CHART_NOTE =
+    "本机型没有电池，不采集电量，也不做记录与告警。" +
+        "若图中仍有灰色曲线，那是旧版本记录的假电量（恒 50%），不代表真实电量，也不会再增加。"
 
 /**
  * 「Y 轴固定」时该指标的固定量程；无公认定义域的指标返回 null（继续自适应）。

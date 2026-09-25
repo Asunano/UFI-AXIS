@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 
 /**
  * 双域存储权限引导对话框（ticket T12）。
@@ -88,7 +89,8 @@ fun StoragePermissionDialog(
             onDismiss = onDismiss,
             onConfirm = if (phoneMissing) onOpenPhoneSettings else onRetry,
             confirmText = if (phoneMissing) "前往手机设置" else "重试",
-            dismissText = "稍后"
+            dismissText = "稍后",
+            topSpacing = Spacing.Large
         )
     }
 }

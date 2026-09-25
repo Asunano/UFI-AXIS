@@ -41,7 +41,7 @@ fun UiExtrasSettingsScreen(viewModel: MainViewModel, navController: NavHostContr
     // 城市没设过（经纬度都是 0）时天气拿不到任何数据，开关也不能显示成开。
     val citySet = weather.config.latitude != 0.0 || weather.config.longitude != 0.0
 
-    UfiScreenScaffold(title = "界面小功能", navController = navController, showBack = true) { padding ->
+    UfiScreenScaffold(title = "小功能", navController = navController, showBack = true) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             // 注意：UfiPageBackground 内部已经是 Column + verticalScroll，这里**不能**再套一层
             // 滚动容器 —— 嵌套滚动会让内层收到 Infinity 高度约束，直接崩（2026-09-17 已踩）。

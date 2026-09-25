@@ -52,8 +52,8 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.UpdateSource
 import com.ufi_axis.viewmodel.MainViewModel
-import com.ufi_axis.viewmodel.module.ToolsModule
 import kotlinx.coroutines.Dispatchers
+
 import kotlinx.coroutines.withContext
 
 /**
@@ -78,6 +78,8 @@ import kotlinx.coroutines.withContext
  *
  * 2026-08-30：调试模式激活后额外显形「调试」卡片组（调试日志 / 运行诊断）。
  * 运行诊断（Routes.DETAIL_DIAGNOSE）只经这条隐藏入口进入，设置页不再放常规入口。
+ * 2026-09-26：该组首行补了「调试模式」开关 —— 解锁此前是**单向**的（只有 `= true`），
+ * 关不掉，用户只能清数据才能把调试入口收回去。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,10 +121,11 @@ fun AboutDeviceScreen(
     // 而弹窗的退场动画仍在渲染 content，于是关闭瞬间会闪一下加载动画。
     var donateQrRequested by remember { mutableStateOf(false) }
     var updateSourceMode by remember { mutableStateOf(prefs.updateSourceMode) }
-    // 打开「更新设置」那一刻的 mirrorBase 快照，用于关闭时判断是否真的改过。
+    // 打开「更新设置」那一刻的下载方式快照，用于关闭时判断是否真的改过。
     // 之前是无条件同步：每次点开再关就打一次设备写请求，还弹一次 toast；设备不在线时
     // 更是每次都弹「同步失败」，而用户其实什么都没改。
-    var mirrorBaseOnOpen by remember { mutableStateOf("") }
+    var modeOnOpen by remember { mutableStateOf("") }
+
     // 「当前国家/地区」只做展示：真源在 core（启动时自动检测一次并落盘，见 `/api/geo`）。
     // 初值取本地缓存，是为了 core 不可达时也有东西可显示。
     var lastCountry by remember { mutableStateOf(prefs.lastCountry) }
@@ -182,12 +185,8 @@ fun AboutDeviceScreen(
         viewModel.dashboard.checkForUpdate()
     }
 
-    /** 当前生效的镜像前缀（同步给设备的 `update_mirror_base`）；直连模式为空串。 */
-    fun currentMirrorBase(mode: String): String =
-        if (mode == UpdateSource.MODE_DIRECT) "" else (UpdateSource.selectedMirrorPrefix(prefs) ?: "")
-
-
     fun onVersionClick() {
+
         val now = System.currentTimeMillis()
         if (now - versionClickLastTime > 1500) versionClickCount = 0
         versionClickLastTime = now
@@ -332,10 +331,11 @@ fun AboutDeviceScreen(
                         )
                     },
                     modifier = Modifier.clickable {
-                        // 记下打开时的镜像前缀，关闭时据此判断是否需要下发（见 onDismiss）
-                        mirrorBaseOnOpen = currentMirrorBase(updateSourceMode)
+                        // 记下打开时的下载方式，关闭时据此判断是否需要下发（见 onDismiss）
+                        modeOnOpen = prefs.updateSourceMode
                         showUpdateSettingsDialog = true
                     }
+
                 )
                 Spacer(Modifier.height(Spacing.Medium))
                 // 「检查更新」放进卡片内部：原来它是卡片之间的一个独立按钮，
@@ -400,6 +400,34 @@ fun AboutDeviceScreen(
             if (debugActivated) {
                 UfiSettingsGroup {
                     UfiGroupHeader("调试")
+                    // 2026-09-26：补一个能**关**的开关。此前 `debugEntryUnlocked` 全仓只有
+                    // 连点解锁那一处 `= true`，没有任何 set false 路径 —— 一旦解锁，调试组就
+                    // 永久显形，用户只能清数据才收得回去。
+                    // 开关连同整组一起收起是预期的：这一组本来就是隐藏入口，藏起来之后靠
+                    // 连点版本号 5 次重新解锁，不需要再给它留一个常显容器。
+                    UfiSettingsItem(
+                        title = "调试模式",
+                        description = "关闭后收起本组调试入口；连点版本号 5 次可重新解锁",
+                        trailing = {
+                            UfiSwitch(
+                                checked = debugActivated,
+                                onCheckedChange = {
+                                    prefs.debugEntryUnlocked = it
+                                    debugActivated = it
+                                    if (!it) {
+                                        // 归零连点计数：关掉的这一下不该算进"再点 N 次解锁"里，
+                                        // 否则用户手上残留的计数会让下一次解锁提前触发
+                                        versionClickCount = 0
+                                        toastMessage = ToastMessage(
+                                            "已退出调试模式，连点版本号 5 次可重新解锁",
+                                            ToastType.INFO
+                                        )
+                                    }
+                                }
+                            )
+                        }
+                    )
+                    UfiDivider()
                     UfiSettingsItem(
                         title = "调试日志",
                         description = "抓包记录 · 日志开关",
@@ -555,26 +583,23 @@ fun AboutDeviceScreen(
                         showUpdateSettingsDialog = false
                         filePicker.launch(arrayOf("application/vnd.android.package-archive"))
                     },
-                    // 关闭时**仅在更新源确有变化**才下发（2026-09-05）。
+                    // 关闭时**仅在下载方式确有变化**才下发（2026-09-05）。
                     // 原来是无条件同步：点开看一眼再关也打一次设备写请求 + 弹一次 toast；
                     // 设备不在线时更是每次都弹「同步失败」，而用户其实什么都没改。
                     onDismiss = {
                         showUpdateSettingsDialog = false
-                        val mirrorBase = currentMirrorBase(updateSourceMode)
-                        if (mirrorBase != mirrorBaseOnOpen) {
-                            viewModel.tools.syncUpdateSourceToDevice(
-                                updateUrl = ToolsModule.RAW_VERSION_URL,
-                                mirrorBase = mirrorBase
-                            ) { ok ->
+                        if (updateSourceMode != modeOnOpen) {
+                            viewModel.tools.syncUpdateModeToDevice(updateSourceMode) { ok ->
                                 toastMessage = ToastMessage(
                                     if (ok) "已同步更新源设置到设备" else "设备未连接，同步失败",
                                     if (ok) ToastType.SUCCESS else ToastType.ERROR
                                 )
                                 // 同步失败时不要把快照推进到新值，否则下次关闭会被判成"没改过"而永远不再重试
-                                if (ok) mirrorBaseOnOpen = mirrorBase
+                                if (ok) modeOnOpen = updateSourceMode
                             }
                         }
                     }
+
                 )
             }
         }
