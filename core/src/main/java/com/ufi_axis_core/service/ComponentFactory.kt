@@ -1,5 +1,9 @@
-// 防腐层（F9）：本文件是**唯一**知道 GoformClient 具体类型的地方——它负责 new 出实现；
-// 组件图对外只暴露 DeviceTransport 接口（见 ComponentGraph.NetworkGraph.goformClient）。
+// 防腐层（F9）：本文件**不认识任何具体协议实现**。
+// 传输层与六个域的实现都由插件交付（`DevicePlugin.createTransport` / `createAdapter`），
+// 本文件只经 DeviceTransport / DeviceAdapter 两个契约类型接线。
+// 2026-09-25 批 A3 之前这里写的是「本文件是唯一知道 GoformClient 具体类型的地方 —— 它负责
+// new 出实现」：当时装配层要自己 new 六个协议客户端，为此把传输层向下转型成具体实现类。
+// 那句**已作废**，转型移进了 `ZteF50Plugin.createAdapter`（谁造的谁认识）。
 package com.ufi_axis_core.service
 
 import android.content.Context
@@ -14,7 +18,6 @@ import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.contract.Capability
-import com.ufi_axis_core.controller.goform.*
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 import com.ufi_axis_core.controller.system.SystemController
@@ -26,6 +29,10 @@ import com.ufi_axis_core.devicespi.DeviceRuntime
 import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.devicespi.ProbeEnv
 import com.ufi_axis_core.devicespi.TransportConfig
+import com.ufi_axis_core.devicespi.adapter.DeviceControl
+import com.ufi_axis_core.devicespi.adapter.DeviceHub
+import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.server.HttpServer
 import com.ufi_axis_core.util.AppLogger
@@ -285,7 +292,7 @@ object ComponentFactory {
             broadcaster = { type, data -> wsManager.broadcast(type, data) }
         )
         val smsController = com.ufi_axis_core.controller.sms.SmsController(
-            context, network.smsClient, database.smsReadStateDao(), database.smsVerificationCodeDao(), smsRuleStore
+            context, network.deviceHub.sms, database.smsReadStateDao(), database.smsVerificationCodeDao(), smsRuleStore
         )
 
         // ── 9. 数据采集调度器 ──
@@ -300,8 +307,10 @@ object ComponentFactory {
             // 电池能力（2026-09-24 批 M）：与上面递给 SystemCollector 的是**同一个** val，
             // 不在这里重算。scheduler 只用它决定「要不要入库 / 要不要告警」，不影响任何下发读数。
             batteryDeclared = batteryDeclared,
-            signalClient = network.signalClient,
-            smsClient = network.smsClient,
+            // 批 B2：signal 取数口是域接口 SignalSource，从 hub 上取（原来是 network.signalClient）。
+            signalClient = network.deviceHub.signal,
+            // 批 C1：短信取数口是域接口 SmsControl，从 hub 上取（原来是 network.smsClient）。
+            smsClient = network.deviceHub.sms,
             alertEngine = alert,
             dynamicThreadPool = dynamicThreadPool,
             wakeLockRenew = wakeLockRenew,
@@ -332,11 +341,11 @@ object ComponentFactory {
         // ── 11-12. 控制器子图（ADB / SMS 转发 / 任务 / 下载 / System 控制器） ──
         val controller = buildControllerGraph(
             context = context,
-            deviceClient = network.deviceClient,
+            deviceControl = network.deviceHub.device,
             systemCollector = collector.systemCollector,
             networkController = network.networkController,
-            wifiClient = network.wifiClient,
-            networkClient = network.networkClient,
+            wifiControl = network.deviceHub.wifi,
+            networkControl = network.deviceHub.network,
             smsRuleStore = smsRuleStore,
             platform = platform,
             tuning = tuning
@@ -455,11 +464,11 @@ object ComponentFactory {
         )
         notificationDispatcher.register(webhookChannel)
         // 本机短信（阶段 3）：唯一走**信令网**的渠道 —— 数据断了 / 套餐用尽 / 自动关网时，
-        // 邮件与 Webhook 恰恰都发不出去。发送出口复用 network.smsClient（全仓唯一那条
-        // goform SEND_SMS 通道），投递记录同样写进 mail_send_records 的 channel 列。
+        // 邮件与 Webhook 恰恰都发不出去。发送出口是 sms 域（批 C1 起从 deviceHub 上取，
+        // 全仓唯一那条发信通道），投递记录同样写进 mail_send_records 的 channel 列。
         val localSmsChannel = com.ufi_axis_core.controller.notify.LocalSmsChannel(
             store = localSmsStore,
-            smsClient = network.smsClient,
+            smsClient = network.deviceHub.sms,
             history = com.ufi_axis_core.controller.notify.DeliveryHistoryRecorder {
                 channelId, scene, subject, target, outcome, detail ->
                 controller.smsForwardController.recordChannelHistory(
@@ -498,7 +507,7 @@ object ComponentFactory {
         // capabilities 是阶段 3 的 3.3 新增：插件声明的能力集原样递下去（Capability 在
         // :core:contract，两边看到的是同一份冻结区类型，不需要在这里做任何翻译）。
         val dataHub = DataHub(
-            scheduler, network.signalClient, network.wifiClient, responseCache,
+            scheduler, network.deviceHub.signal, network.deviceHub.wifi, responseCache,
             devicePluginId = runtime.plugin.id,
             deviceSelection = runtime.selection.wire,
             deviceCapabilities = runtime.plugin.capabilities,
@@ -532,7 +541,7 @@ object ComponentFactory {
         scheduler.attachDeviceEventWatcher(
             provider = {
                 if (!NotificationRoutes.read(settings).device_events_enabled) null
-                else network.wifiClient.getConnectedClients()
+                else network.deviceHub.wifi.getConnectedClients()?.values
             },
             sink = { online, label, mac -> alert.recordDeviceEvent(online, label, mac) }
         )
@@ -548,11 +557,7 @@ object ComponentFactory {
             ),
             network = NetworkDeps(
                 goformClient = network.goformClient,
-                signalClient = network.signalClient,
-                networkClient = network.networkClient,
-                deviceClient = network.deviceClient,
-                wifiClient = network.wifiClient,
-                simClient = network.simClient,
+                deviceHub = network.deviceHub,
                 networkController = network.networkController
             ),
             storage = StorageDeps(
@@ -873,8 +878,8 @@ object ComponentFactory {
         )
     }
 
-    /** 网络子图：Goform 客户端层 + NetworkController（原步骤 4-5）。
-     * 注意：SystemController 依赖 deviceClient，归入 [buildControllerGraph]。
+    /** 网络子图：传输层 + 集中处理器（[DeviceHub]）+ NetworkController（原步骤 4-5）。
+     * 注意：SystemController 依赖 device 域（`deviceHub.device`），归入 [buildControllerGraph]。
      *
      * [runtime] 由 [build] 选好后注入（计划书 3.2 / 3.3）：本函数**不再自己读 settings 里的选型配置**，
      * 「当前是哪台设备」全仓只有一处答案。 */
@@ -892,16 +897,19 @@ object ComponentFactory {
         // 与 ProbeEnv 的 LD 探测共用同一份 —— 两处各算一遍就会有两个口径），
         // 端口与密码仍直取配置项（符号名中立、配置键仍叫 goform*，见 TransportConfig 的 KDoc）。
         //
-        // ⚠ 这里要**向下转型**到具体类 [GoformClient]：6 个客户端的构造参数是 `core/goform` 模块内部
-        // 那一层传输接口（比 `DeviceTransport` 多 7 个协议成员），用 `DeviceTransport` 接会编译不过；
-        // 而本文件**不许**直接写那个内部接口的类型名（`GoformTransportVisibilityGuardTest` 守着
-        // 「`core/goform` 之外零引用」）。所以沿用本文件既有的角色：**唯一知道具体实现类型的地方**
-        // （见文件头的 F9 注释）。真正消掉这次转型要等阶段 5/6 把 6 个客户端也收进插件，
-        // 那时装配层只认 `DeviceTransport`。
+        // 2026-09-25 批 A3：**这里原来有一句向下转型**（`transport as? GoformClient`）加一段注释，
+        // 说的是「6 个协议客户端的构造参数是 core/goform 模块内部那层传输接口，用 DeviceTransport
+        // 接不上，而本文件不许写那个内部接口的类型名，所以本文件是唯一知道具体实现类型的地方；
+        // 真正消掉它要等把 6 个客户端收进插件」。那段话**已作废** —— 客户端的 new 与那句转型
+        // 现在都在插件里（`ZteF50Plugin.createAdapter` → `ZteGoformAdapter` 的公开构造函数），
+        // 装配层只认 `DeviceTransport` 与 `DeviceAdapter` 两个契约类型。
+        // 当时停手的真实原因（WiFi 读侧与 sms 域还没有域接口，装配层必须把那两个具体客户端
+        // 交给 5 个上层消费点）由批 C1 / C2 解除。
         //
-        // 用 `as?` + `error()` 而不是硬 `as`：硬转型失败抛的是 ClassCastException，
-        // 在组件图构造这条启动路径上只会留下一行没有上下文的堆栈。这里失败的真实含义是
-        // 「选中的插件不是 goform 系」，把它写成一句话，下一个接非 goform 设备的人就不用猜。
+        // ⚠ transport **整图只造一份**：它持有会话（cookie、wa / cr 版本号）、登录退避与
+        // HTTP 连接池，造第二份等于两套会话互相顶下线。所以这一行仍然在装配层 ——
+        // 同一个实例既进 `NetworkGraph.goformClient`（`PairingRoutes` / `DeviceRoutes` 的
+        // updateGoformPassword 靠它），又递给 `createAdapter`。
         val transport = runtime.plugin.createTransport(
             TransportConfig(
                 deviceIp = deviceIp,
@@ -909,36 +917,25 @@ object ComponentFactory {
                 password = settings.goformPassword
             )
         )
-        val goform = transport as? GoformClient ?: error(
-            "插件 ${runtime.plugin.id} 造出的传输层不是 GoformClient —— " +
-                "6 个 goform 客户端要到阶段 5/6 才收进插件，在那之前装配层只支持 goform 系插件"
-        )
-        // profile 由调用方选好后注入（计划书 3.2）。
-        // 此前每个客户端的构造参数各带一个 `= ZteGoformProfile` 默认值 —— 等于选型逻辑
-        // 散在 6 个签名里，换设备要改 6 处且漏一处不会报错。
-        // 这两个客户端里的 GoformFieldMapper 是双 profile（阶段 0.4a）：
-        // **可空**的那一份（`runtime.profile`）管归一化 —— 排障开关关掉归一化时它就是 null，
-        // `enabled` / `profileId`（→ /api/diagnose 的 normalization_enabled）靠的就是这个 null；
-        // **非空**的那一份（`runtime.commandProfile`）管命令表。阶段 2 批 C（P1-30）之前，
-        // 命令表那一份是客户端内部 `?: DeviceProfiles.DEFAULT` 兜的 —— 兜的是**注册表默认插件**，
-        // 于是排障开关会顺带把命令表换成默认设备的（接第二台设备就是「向 B 发 A 的 cmd」）。
-        // 现在两份都由这里传，命令表那份是**选中插件**的 profile（理由见 DeviceRuntime.commandProfile）。
+        // 集中处理器（2026-09-25 批 A1 立，批 A2a 加 device 域，批 A3 起整条链由插件交付）：
+        // 上层（SimRoutes / DeviceRoutes / SystemController / ActionExecutorImpl）只认 DeviceHub
+        // 或它交付的域接口，具体协议客户端只有插件模块知道。
         //
-        // 阶段 2 批 D1（P1-31）起，**写**命令表也走同一条口径：`GoformSettingWriter` 内部
-        // 原来是 `?: ZteGoformProfile`，比读侧更危险（排障模式下会向 B 设备发 A 设备的写命令）。
-        // 于是 network / device / sim 三个**纯写**客户端改成只收非空 `commandProfile` ——
-        // 它们不持有 GoformFieldMapper，可空 profile 在那里无从生效，留一个死参数只会让人
-        // 误以为「字段归一化在这三个类里起作用」（见各自的类 KDoc）。
-        val signalClient = GoformSignalClient(goform, runtime.profile, runtime.commandProfile)
-        val wifiClient = GoformWifiClient(goform, runtime.profile, runtime.commandProfile)
-        val networkClient = GoformNetworkClient(goform, runtime.commandProfile)
-        val deviceClient = GoformDeviceClient(goform, runtime.commandProfile)
-        // 短信客户端要非空 profile：字段归一化可以关（排障开关 → profile = null），
-        // 但短信命令表不能关（没有参数表就发不出短信），口径同 GoformSettingWriter。
-        // `commandProfile` 就是这条口径的唯一出口 —— 它兜的是**选中插件**的 profile，
-        // 不是注册表默认值（理由见 DeviceRuntime.commandProfile 的 KDoc）。
-        val smsClient = GoformSmsClient(goform, runtime.commandProfile)
-        val simClient = GoformSimClient(goform, runtime.commandProfile)
+        // 两份 profile 的分工（原来写在这里那六行 new 上面，逐字未变，只是搬到了插件里）：
+        // **可空**的 `runtime.profile` 管归一化 —— 排障开关关掉归一化时它就是 null，
+        // `enabled` / `profileId`（→ /api/diagnose 的 normalization_enabled）靠的就是这个 null；
+        // **非空**的 `runtime.commandProfile` 管命令表，且兜的是**选中插件**的 profile、
+        // 不是注册表默认插件（否则排障开关会顺带把命令表换成默认设备的 —— 接第二台设备就是
+        // 「向 B 发 A 的 cmd」，见 DeviceRuntime.commandProfile 的 KDoc）。
+        // id / capabilities 也不在这里传了：插件自己交出 adapter，取的就是它自己的属性 ——
+        // 能力集是「设备支不支持某个动作」的唯一判据，不许有第二份。
+        val deviceHub = DeviceHub(
+            runtime.plugin.createAdapter(
+                transport = transport,
+                commandProfile = runtime.commandProfile,
+                normalizeProfile = runtime.profile,
+            )
+        )
         AppLogger.i(TAG, "[4] Goform clients initialized")
 
         // 平台适配层由装配层给（阶段 4 的 4.4）：`NetworkController.restartNetworkStack()`
@@ -949,18 +946,13 @@ object ComponentFactory {
         // `DevicePlugin.platform` 的纪律每次新建，适配层无跨调用状态（网络栈重启的互斥锁
         // 留在 NetworkController，理由见它的构造参数注释）。
         val networkController = NetworkController(
-            context, atChannel, networkClient, wifiClient, platform
+            context, atChannel, deviceHub.network, deviceHub.wifi, platform
         )
         AppLogger.i(TAG, "[5] Controllers initialized")
 
         return NetworkGraph(
-            goformClient = goform,
-            signalClient = signalClient,
-            wifiClient = wifiClient,
-            networkClient = networkClient,
-            deviceClient = deviceClient,
-            smsClient = smsClient,
-            simClient = simClient,
+            goformClient = transport,
+            deviceHub = deviceHub,
             networkController = networkController
         )
     }
@@ -985,18 +977,18 @@ object ComponentFactory {
      * 与迁移目标值收进了 `DeviceTuning`。[platform] 递的是 `build()` 里那**一份共享实例**。 */
     private fun buildControllerGraph(
         context: Context,
-        deviceClient: GoformDeviceClient,
+        deviceControl: DeviceControl,
         systemCollector: SystemCollector,
         networkController: NetworkController,
-        wifiClient: GoformWifiClient,
-        networkClient: GoformNetworkClient,
+        wifiControl: WifiControl,
+        networkControl: NetworkControl,
         /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
         smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore,
         platform: PlatformAdapter,
         tuning: com.ufi_axis_core.devicespi.DeviceTuning
     ): ControllerGraph {
-        // SystemController 依赖 deviceClient，与原步骤 5 同阶段构造
-        val systemController = SystemController(deviceClient)
+        // SystemController 依赖 device 域（DeviceControl），与原步骤 5 同阶段构造
+        val systemController = SystemController(deviceControl)
 
         // ── 11. ADB 控制器（2026-08-22：移除 Goform USB_PORT_SETTING 依赖，仅管理自连接） ──
         val adbController = com.ufi_axis_core.controller.adb.AdbController(context)
@@ -1004,7 +996,7 @@ object ComponentFactory {
 
         // ── 12. 扩展组件 ──
         val smsForwardController = com.ufi_axis_core.controller.sms.SmsForwardController(context, systemCollector)
-        val actionExecutor = ActionExecutorImpl(networkController, systemController, deviceClient, wifiClient, networkClient)
+        val actionExecutor = ActionExecutorImpl(networkController, systemController, deviceControl, wifiControl, networkControl)
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
         val conditionEngine = com.ufi_axis_core.core.scheduler.ConditionEngine(context, actionExecutor)

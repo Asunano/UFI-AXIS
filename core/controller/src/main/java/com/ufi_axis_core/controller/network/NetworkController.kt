@@ -4,10 +4,11 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import com.ufi_axis_core.collector.at.ATChannel
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.devicespi.adapter.BandSelection
+import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.coroutines.sync.withLock
@@ -15,12 +16,17 @@ import kotlinx.coroutines.sync.withLock
 /**
  * 网络控制器
  * 统一管理移动数据/WiFi/飞行模式/锁频/锁网
+ *
+ * @param network network 域的设备适配接口（2026-09-25 批 A2b 起）。
+ * @param wifi wifi 域的设备适配接口（同上）。收的是**这两个域**而不是整个 `DeviceHub`：
+ *   本类只用得到 network 的 3 个写方法（移动数据 + 两个频段锁定）与 wifi 的 2 个（SSID / 口令），
+ *   递整个 hub 等于让它看见所有域，权限比需要的大（口径同批 A2a 的 `ActionExecutorImpl`）。
  */
 class NetworkController(
     private val context: Context,
     private val atChannel: ATChannel,
-    private val networkClient: GoformNetworkClient,
-    private val wifiClient: GoformWifiClient,
+    private val network: NetworkControl,
+    private val wifi: WifiControl,
     /**
      * 平台适配层（阶段 4 的 4.4）：网络栈重启「发哪几条命令」这份**设备知识**住在它那里。
      *
@@ -44,7 +50,7 @@ class NetworkController(
     suspend fun setMobileData(enabled: Boolean): Boolean {
         AppLogger.i(tag, "Setting mobile data: $enabled")
         // 方式1: Goform API（与参考项目 KanoUtils.kt 一致）
-        if (networkClient.setMobileData(enabled)) {
+        if (network.setMobileData(enabled)) {
             AppLogger.i(tag, "Mobile data set via goform: $enabled")
             return true
         }
@@ -66,9 +72,9 @@ class NetworkController(
      */
     suspend fun setWifiSSID(ssid: String, password: String? = null): Boolean {
         AppLogger.i(tag, "Setting WiFi SSID: $ssid")
-        val ssidResult = wifiClient.setWifiSSID(ssid)
+        val ssidResult = wifi.setWifiSSID(ssid)
         if (ssidResult && password != null) {
-            return wifiClient.setWifiPassword(password)
+            return wifi.setWifiPassword(password)
         }
         return ssidResult
     }
@@ -78,7 +84,7 @@ class NetworkController(
      */
     suspend fun setWifiPassword(password: String): Boolean {
         AppLogger.i(tag, "Setting WiFi password")
-        return wifiClient.setWifiPassword(password)
+        return wifi.setWifiPassword(password)
     }
 
     /**
@@ -128,29 +134,29 @@ class NetworkController(
         unlockAll: Boolean = false
     ): BandLockResult {
         // unlockAll：同时发全频段 = 解除所有限制
-        // 全频段串从 networkClient 取（它再问自己的非空 commandProfile）—— 原来这里直读
-        // `GoformNetworkClient.LTE_ALL_BANDS` / `NR_ALL_BANDS` 两个 companion 常量，
-        // 那是 core/controller 对 core/goform 的跨模块直读，且全仓有三份同值拷贝
-        // （计划书 §15 的 P0-1 / 任务 2.9）。**取值逐字未变**：ZTE profile 返回的就是原来那两个串。
-        val lteValue = when {
-            unlockAll -> networkClient.lteAllBands()
-            lteBands != null -> lteBands
-            else -> ""   // 未选 LTE → 清空该 RAT 限制（参考项目：lte_bands.join(',') 空数组→空串）
-        }
-        val nrValue = when {
-            unlockAll -> networkClient.nrAllBands()
-            nrBands != null -> nrBands
-            else -> ""   // 未选 NR → 清空该 RAT 限制
-        }
+        //
+        // 2026-09-25 批 A2b：这里原来先问 `networkClient.lteAllBands()` / `nrAllBands()` 拿
+        // **goform 的频段全集掩码串**，再把它当普通频段列表发下去 —— 掩码串是协议细节，
+        // 出现在这一层等于规定「别人家的设备也得用掩码串表达全部频段」。现在本类只表达
+        // **意图**（[BandSelection.All]），掩码由 adapter 的 goform 实现去问那两个方法
+        // （连同 profile 没给掩码时的空串折叠 + WARN，仍在 `GoformNetworkClient` 里，
+        // 本批没有重新实现第二份）。**下发给设备的取值逐字未变**。
+        //
+        // 非 unlockAll 路径的取值仍是这两个串（空串 = 清除该 RAT 限制，
+        // 参考项目：lte_bands.join(',') 空数组→空串），下面的空串判断与 modeDesc 用的就是它们。
+        val lteValue = lteBands ?: ""
+        val nrValue = nrBands ?: ""
 
 
         if (!unlockAll && lteValue.isEmpty() && nrValue.isEmpty())
             return BandLockResult(false, "no_bands", false)
 
         // 始终发送两个 goform 请求（参考项目 Promise.all）
-        AppLogger.i(tag, "Band lock goform: LTE=\"$lteValue\" NR=\"$nrValue\"")
-        val lteOutcome = networkClient.lockLteBands(lteValue)
-        val nrOutcome = networkClient.lockNrBands(nrValue)
+        val lteSelection = if (unlockAll) BandSelection.All else BandSelection.Only(lteValue)
+        val nrSelection = if (unlockAll) BandSelection.All else BandSelection.Only(nrValue)
+        AppLogger.i(tag, "Band lock goform: LTE=${describe(lteSelection)} NR=${describe(nrSelection)}")
+        val lteOutcome = network.lockLteBands(lteSelection)
+        val nrOutcome = network.lockNrBands(nrSelection)
         val lteOk = lteOutcome.ok
         val nrOk = nrOutcome.ok
         AppLogger.i(tag, "Band lock result: LTE=$lteOk NR=$nrOk")
@@ -181,6 +187,19 @@ class NetworkController(
             return result.copy(stackRestarted = restarted)
         }
         return result
+    }
+
+    /**
+     * 频段选择在日志里的写法。
+     *
+     * [BandSelection.Only] 逐字保留改造前的 `"取值"` 形式；[BandSelection.All] 只能打**意图** ——
+     * 掩码串现在只在 adapter 实现里出现（批 A2b），本类拿不到它。这是本批唯一一处可观测差异：
+     * `unlockAll` 时这一行从掩码串变成 `<全部频段>`，**下发给设备的取值没变**。
+     * 掩码想核对的话看 adapter / profile（`lteAllBandsMask()`）。
+     */
+    private fun describe(selection: BandSelection): String = when (selection) {
+        BandSelection.All -> "<全部频段>"
+        is BandSelection.Only -> "\"${selection.bands}\""
     }
 
     /**

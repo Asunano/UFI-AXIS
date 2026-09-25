@@ -54,4 +54,8 @@ dependencies {
     // 刻意不用 coroutines-test：本模块的单测里没有任何需要虚拟时间的等待 ——
     // 假插件的 probe() 是纯函数，`runBlocking` 一跑就完。
     testImplementation(libs.kotlinx.coroutines.android)
+    // `DeviceHubTest` 的 signal 域假实现（批 B2）要 `JsonObject` / `JsonArray` / `JsonPrimitive`
+    // 造假响应。主源集那条是 `api`，本行只是把它显式摆到测试编译 classpath 上，
+    // 口径同上面那条协程依赖 —— 测试源集不吃「主源集恰好用了哪种声明」这个实现细节。
+    testImplementation(libs.kotlinx.serialization.json)
 }

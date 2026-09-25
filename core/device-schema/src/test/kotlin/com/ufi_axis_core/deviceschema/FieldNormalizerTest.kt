@@ -8,8 +8,10 @@ import kotlinx.serialization.json.buildJsonObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.lang.reflect.Modifier
 
 /**
  * [FieldNormalizer] 的语义基线。
@@ -353,4 +355,107 @@ class FieldNormalizerTest {
         val spec = fieldOf("out_m", FieldGroup.CONNECTION, "dev_m", decode = Decoders.mapValues(emptyMap()))
         assertEquals(JsonPrimitive("20"), FieldNormalizer.resolve(obj("dev_m" to "20"), spec)?.value)
     }
+
+    // ─────────── NormalizedFields（批 B1）：归一化是它唯一的来路 ───────────
+
+    /**
+     * **「绕不过归一化」这件事怎么保证的** —— 这条测试是那个保证的说明书，读它比读断言重要。
+     *
+     * 机制是三层，**没有一层靠纪律**：
+     *
+     * 1. [NormalizedFields] 的构造函数是 `private` —— 连同一个包里的 [FieldNormalizer]
+     *    都碰不到（Kotlin 的 `private` 不是 Java 的 package-private）。
+     * 2. 唯一的构造入口是它伴生对象里的 `internal fun of(...)`，而 `internal` 的作用域是
+     *    **`:core:device-schema` 这一个 Gradle 模块**。所有消费方（`:core:goform` /
+     *    `:core:api` / `:core:scheduler` / `:core`）都在模块外，**编译期**就被拒绝 ——
+     *    所以「在飞猫适配里 new 一个 NormalizedFields 交差」这条路根本走不通，
+     *    不是"能写但不该写"，是写了编译不过。
+     * 3. 模块内唯一的调用点是 [FieldNormalizer.normalizeToFields]，也就是归一化本身。
+     *
+     * **为什么这条测试只能断言第 1 层**：第 2 层是 Kotlin 编译器的可见性检查，一个「模块外
+     * 造不出来」的反例在本模块的 test 源集里**写不出来**（同模块，`internal` 可见），
+     * 硬写就成了自己给自己放行。跨模块的编译期失败要靠新建一个假模块才能测，代价远大于收益。
+     * 所以这里断言「JVM 层面没有能从 Kotlin 调到的构造函数」+ 上面这段说清机制，
+     * 第 2 层由 Kotlin 的语言规则兜着。
+     *
+     * ## 实测到的一处 JVM 细节（2026-09-25，第一版断言就是被它照出来的）
+     *
+     * `private constructor` + 伴生对象工厂，Kotlin 会为「伴生对象访问私有构造函数」多生成一个
+     * **合成桥构造函数**，字节码里它是 `public NormalizedFields(JsonObject, DefaultConstructorMarker)`。
+     * 所以「所有声明的构造函数都非 public」这条断言**会红**，但那不是后门：
+     * 末参 `kotlin.jvm.internal.DefaultConstructorMarker` 是 Kotlin 运行时的内部标记类型，
+     * Kotlin 侧看不到这个重载也调不了它（本仓全 Kotlin）。
+     * 因此这里改成钉住真正要防的形状：**不许存在 `NormalizedFields(JsonObject)` 这种
+     * 一参公开构造函数**，而任何 public 构造函数都必须是带 marker 的那个合成桥。
+     * 注意这条只挡 Kotlin —— 理论上 Java 侧硬传一个 `null` marker 能绕过去，
+     * 本仓没有 Java 生产代码，不为此再加一层。
+     *
+     * [NormalizedFields.EMPTY] 不破坏这个保证：它不吃任何入参，
+     * 因此没法用它把未归一化的数据偷带进来（空对象里没有字段名可言）。
+     */
+    @Test
+    fun `NormalizedFields 没有能从 Kotlin 调到的构造函数`() {
+        val ctors = NormalizedFields::class.java.declaredConstructors
+        assertTrue("构造函数一个都没有？那这个类型没法被归一化层产出", ctors.isNotEmpty())
+        for (c in ctors.filter { Modifier.isPublic(it.modifiers) }) {
+            assertTrue(
+                "public 构造函数 $c 不是「伴生对象访问私有构造函数」的合成桥 —— 后门开了",
+                c.parameterTypes.any { it.name == "kotlin.jvm.internal.DefaultConstructorMarker" },
+            )
+        }
+        assertNull(
+            "出现了 NormalizedFields(JsonObject) 这种公开构造函数 = 任何模块都能凭空造出「已归一化」的凭据",
+            ctors.firstOrNull {
+                Modifier.isPublic(it.modifiers) &&
+                    it.parameterTypes.size == 1 &&
+                    it.parameterTypes[0] == JsonObject::class.java
+            },
+        )
+    }
+
+
+    /** [FieldNormalizer.normalizeToFields] 解包后与 [FieldNormalizer.normalize] **逐字一致**（换类型不换内容）。 */
+    @Test
+    fun `normalizeToFields 解包后等于 normalize`() {
+        val raw = obj("dev_plain" to "v", "dev_flag" to "on", "brand_new_firmware_field" to "leak")
+        val expected = FieldNormalizer.normalize(
+            raw, FakeProfile, FieldGroup.DEVICE_SETTINGS, FieldNormalizer.LegacyAliases.DROP,
+        )
+        val actual = FieldNormalizer.normalizeToFields(
+            raw, FakeProfile, FieldGroup.DEVICE_SETTINGS, FieldNormalizer.LegacyAliases.DROP,
+        )
+        assertEquals(expected, actual?.values)
+        assertEquals("键序也要一致 —— 对外 JSON 的字节序列取决于它", expected.toString(), actual?.values.toString())
+        assertFalse("allowlist 照旧", actual!!.values.containsKey("brand_new_firmware_field"))
+    }
+
+    /**
+     * profile 为 `null`（排障开关关掉归一化）时**原样包住入参那个实例**。
+     *
+     * 这就是 [NormalizedFields] 的语义边界：它保证「过了归一化层」，**不保证**字段名是
+     * canonical —— 这条路上包着的就是设备原名。改成「复制一份」或「顺手过一遍 allowlist」
+     * 都会让这条红，而那两种都是行为变更（排障开关就是要看设备原名）。
+     */
+    @Test
+    fun `profile 为 null 时原样包住设备响应`() {
+        val raw = obj("dev_plain" to "v")
+        val out = FieldNormalizer.normalizeToFields(raw, null, FieldGroup.DEVICE_SETTINGS)
+        assertSame("透传分支不许拷贝也不许改写", raw, out?.values)
+        assertTrue("设备原名必须还在", out!!.values.containsKey("dev_plain"))
+        assertFalse("关掉归一化就不该冒出 canonical 键", out.values.containsKey("out_plain"))
+    }
+
+    /** `null` 进 `null` 出：上层用 null 区分「查询失败」与「查到了但为空」，两种 profile 状态下都一样。 */
+    @Test
+    fun `normalizeToFields 的 null 进 null 出`() {
+        assertNull(FieldNormalizer.normalizeToFields(null, FakeProfile, FieldGroup.DEVICE_SETTINGS))
+        assertNull(FieldNormalizer.normalizeToFields(null, null, FieldGroup.DEVICE_SETTINGS))
+    }
+
+    /** [NormalizedFields.EMPTY] 就是 `{}`（非空返回契约的那个位置用它，见 `GoformWifiClient.getWifiSettingsMerged`）。 */
+    @Test
+    fun `EMPTY 是空对象`() {
+        assertEquals(JsonObject(emptyMap()), NormalizedFields.EMPTY.values)
+    }
 }
+

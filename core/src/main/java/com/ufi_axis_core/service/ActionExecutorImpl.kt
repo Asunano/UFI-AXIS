@@ -1,14 +1,14 @@
 package com.ufi_axis_core.service
 
-import com.ufi_axis_core.controller.goform.GoformDeviceClient
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.contract.NetworkMode
 import com.ufi_axis_core.core.scheduler.ActionExecutor
 import com.ufi_axis_core.core.scheduler.ActionResult
 import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.devicespi.adapter.DeviceControl
+import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
@@ -19,13 +19,20 @@ import kotlinx.serialization.json.int
  *
  * 持有所有 Controller 引用，根据 actionType 分发到对应的 Controller 方法。
  * 保留 custom_shell 动作以支持向后兼容和高级用户自定义命令。
+ *
+ * @param device device 域的设备适配接口（2026-09-25 批 A2a 起）。收的是**这一个域**而不是整个
+ *   `DeviceHub`：本类只用 [DeviceControl.setIndicatorLight] / [DeviceControl.setPerformanceMode]
+ *   两个方法，递整个 hub 等于让它看见所有域，权限比需要的大。
+ * @param wifi wifi 域的设备适配接口（批 A2b 起）。同上口径：只用 [WifiControl.setWifiEnabled]。
+ * @param network network 域的设备适配接口（批 A2b 起）。只用 [NetworkControl.setRoaming] /
+ *   [NetworkControl.setBearerPreference]。
  */
 class ActionExecutorImpl(
     private val networkController: NetworkController,
     private val systemController: SystemController,
-    private val deviceClient: GoformDeviceClient,
-    private val wifiClient: GoformWifiClient,
-    private val networkClient: GoformNetworkClient
+    private val device: DeviceControl,
+    private val wifi: WifiControl,
+    private val network: NetworkControl
 ) : ActionExecutor {
 
     override suspend fun execute(actionType: String, params: Map<String, JsonPrimitive>): ActionResult {
@@ -37,7 +44,7 @@ class ActionExecutorImpl(
             }
             "wifi_toggle" -> {
                 val enabled = params["enabled"]?.boolean ?: true
-                wifiClient.setWifiEnabled(enabled)
+                wifi.setWifiEnabled(enabled)
                 ActionResult(true, if (enabled) "WiFi 热点已开启" else "WiFi 热点已关闭")
             }
             "airplane_toggle" -> {
@@ -55,17 +62,17 @@ class ActionExecutorImpl(
             }
             "led_toggle" -> {
                 val enabled = params["enabled"]?.boolean ?: true
-                deviceClient.setIndicatorLight(enabled)
+                device.setIndicatorLight(enabled)
                 ActionResult(true, if (enabled) "指示灯已开启" else "指示灯已关闭")
             }
             "performance_mode" -> {
                 val mode = params["mode"]?.int ?: 0
-                deviceClient.setPerformanceMode(mode)
+                device.setPerformanceMode(mode)
                 ActionResult(true, "性能模式已切换")
             }
             "roaming_toggle" -> {
                 val enabled = params["enabled"]?.boolean ?: true
-                networkClient.setRoaming(enabled)
+                network.setRoaming(enabled)
                 ActionResult(true, if (enabled) "数据漫游已开启" else "数据漫游已关闭")
             }
             "network_mode" -> {
@@ -75,7 +82,7 @@ class ActionExecutorImpl(
                 // T15：此前这里直接透传 UI 别名（`5G_ONLY`）且没有任何映射，goform 不认，
                 // 定时任务选「仅 5G」静默失败。
                 val bearer = NetworkMode.toBearer(mode)
-                val outcome = networkClient.setBearerPreference(mode)
+                val outcome = network.setBearerPreference(mode)
                 val ok = outcome.ok
                 // 值域校验失败时把原因带进任务结果，别让用户只看到"切换失败"
                 val rejected = (outcome as? WriteOutcome.Rejected)?.reason

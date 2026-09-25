@@ -2,11 +2,12 @@ package com.ufi_axis_core.controller.sms
 
 import android.content.Context
 import android.net.Uri
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.core.database.SmsReadState
 import com.ufi_axis_core.core.database.SmsReadStateDao
 import com.ufi_axis_core.core.database.SmsVerificationCode
 import com.ufi_axis_core.core.database.SmsVerificationCodeDao
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.util.AppLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
@@ -27,7 +28,7 @@ import kotlinx.serialization.json.*
  */
 class SmsController(
     private val context: Context? = null,
-    private val smsClient: GoformSmsClient? = null,
+    private val smsClient: SmsControl? = null,
     private val smsReadStateDao: SmsReadStateDao? = null,
     private val vcDao: SmsVerificationCodeDao? = null,
     /**
@@ -508,8 +509,8 @@ class SmsController(
 
 
     /**
-     * 发送短信。唯一通道是 goform `SEND_SMS`（见 `GoformSmsClient.sendSms`）——
-     * 读取走 ContentResolver、发送走 goform 是刻意的不对称，理由见类注释。
+     * 发送短信。唯一通道是 sms 域的 `SmsControl.sendSms`（goform 系的实现是 `GoformSmsClient`
+     * 的 `SEND_SMS`）—— 读取走 ContentResolver、发送走设备侧是刻意的不对称，理由见类注释。
      *
      * 结果直接采用客户端**回读设备信箱**后的结论：固件回 `success` 只表示进了发送队列，
      * 真发失败时信箱行 `tag=3`，那种情况必须报错，不能让 UI 显示假的"发送成功"。
@@ -522,14 +523,14 @@ class SmsController(
         return try {
             val outcome = gc.sendSms(phoneNumber, message)
             when (outcome.verdict) {
-                GoformSmsClient.SendVerdict.SENT -> SendResult(true, "已发送")
+                SendVerdict.SENT -> SendResult(true, "已发送")
                 // 未确认不等于失败（设备可能只是慢），按成功回但把状态说清楚
-                GoformSmsClient.SendVerdict.PENDING -> SendResult(true, "已提交设备：${outcome.detail}")
-                GoformSmsClient.SendVerdict.FAILED -> SendResult(false, outcome.detail)
+                SendVerdict.PENDING -> SendResult(true, "已提交设备：${outcome.detail}")
+                SendVerdict.FAILED -> SendResult(false, outcome.detail)
                 // 两档"没发成功"对手动发送是同一个结果（失败 + 说明），只是原因不同：
                 // REJECTED 是设备明确拒收、NO_RESPONSE 是拿不到设备表态（可能已发出，别盲目重发）。
-                GoformSmsClient.SendVerdict.REJECTED,
-                GoformSmsClient.SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
+                SendVerdict.REJECTED,
+                SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
             }
         } catch (e: Exception) {
             AppLogger.e(tag, "send failed", e)

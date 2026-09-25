@@ -23,13 +23,19 @@ import kotlinx.serialization.json.*
  * 结果，web 侧从未引用 —— 属于「core 存在但无真实消费者」的重复能力，按真源唯一原则删除，
  * 不留兼容壳。KDoc 里原先还写着 `POST /api/sim/ussd`，那个端点从来没被注册过，一并删掉。
  *
+ * 2026-09-25（批 A1）：切卡改走 [RouteContext.deviceHub]（`deviceHub.sim.switchSimSlot`），
+ * 不再直接拿 `GoformSimClient`。同时删掉了原先 `if (client == null)` 那个分支 ——
+ * `NetworkDeps` 里那个字段声明的是**非空**类型，那个分支永远不成立，
+ * 它回的 `"Goform client not available"` 也把协议名吐给了客户端。
+ * 行为没变（该分支从来没被执行过），响应形状一字未动。
+ *
  * 注意: SMS 路由(/api/sms/)统一由 RootSmsRoutes 管理
  */
 class SimRoutes(
     private val ctx: RouteContext
 ) {
     // ── 反向兼容 getter ──
-    private val simClient get() = ctx.simClient
+    private val deviceHub get() = ctx.deviceHub
     private val cache get() = ctx.responseCache
     private val dataHub get() = ctx.dataHub
 
@@ -40,12 +46,6 @@ class SimRoutes(
             post("/switch") {
                 // 能力门禁（3.3）：缺 sim_slot_switch → 501 NOT_SUPPORTED
                 dataHub.deviceCapabilities.requireCapability(Capability.SIM_SLOT_SWITCH)
-                val client = simClient
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
-                    return@post
-                }
                 val params = call.receiveJsonObject()
                 // 规范入参：slot = 1 起的卡槽序号，或 "external"（外置卡）。
                 // 序号 → 设备值的映射在 profile 的 WriteSpec 里（计划书 2.6）。
@@ -72,7 +72,7 @@ class SimRoutes(
                         "slot is required (1/2/3 or \"external\")")
                     return@post
                 }
-                val outcome = client.switchSimSlot(slot)
+                val outcome = deviceHub.sim.switchSimSlot(slot)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 // 换卡后失效的是 device:* 那几份缓存（device:info / device:identity / device:goform

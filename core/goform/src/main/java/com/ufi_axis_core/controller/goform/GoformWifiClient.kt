@@ -2,8 +2,11 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
+import com.ufi_axis_core.deviceschema.NormalizedFields
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.devicespi.adapter.AclEntry
+import com.ufi_axis_core.devicespi.adapter.AclSnapshot
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -43,6 +46,21 @@ import kotlinx.serialization.json.*
  * 所以命令表那一份由调用方（`ComponentFactory`，传 `runtime.commandProfile` =
  * **选中插件**的 profile）定下来，构造参数**不给默认值**：默认值等于把选型逻辑散进每个
  * 客户端的签名，换设备要改 N 处且漏一处不报错。口径与 [GoformSmsClient] 一致。
+ *
+ * ## 批 B1：读方法的归一化保证写在返回类型上
+ *
+ * 与 [GoformSignalClient] 同一条口径（判据与例外都在那边的类 KDoc 里）：
+ * 返回 [NormalizedFields] 的（[getWifiSettingsMerged] / [getConnectedClients]）= 过了归一化闸门，
+ * 那个类型在本模块造不出来；仍返回裸 `JsonObject?` 的（[getWifiModuleInfo] / [getWifiSettings]）
+ * = 原样透传，它们是前者的两个输入。消费点用 `.values` 解包，对外 JSON 一个字节没变。
+ *
+ * ## 批 C2：本类的全部 public 成员都在 `WifiControl` 上
+ *
+ * 读侧（含二维码与接入控制名单）与 `setAccessControlList` 本批也迁进了那个域接口，
+ * 上层（`core/api` / `core/src`）不再认识本类型。[AclEntry] / [AclSnapshot] 两个语义上
+ * 协议无关的类型随之搬到 `:core:device-spi`，本文件改成 import 它们（不留 typealias）。
+ * [getCurrentWifiConfig] 也因此从 `internal` 放开到 public —— 它是那个接口的成员之一，
+ * 而 adapter 在另一个模块里（`:core:device-plugins`）。
  */
 class GoformWifiClient(
     private val client: GoformTransport,
@@ -61,6 +79,14 @@ class GoformWifiClient(
 
     // ==================== WiFi 查询 ====================
 
+    /**
+     * WiFi 模块开关 + AP 列表（`ResponseList` 里是 AP 对象）。
+     *
+     * **原样透传，未归一化**（批 B1：返回裸 `JsonObject?`）—— 它是 [getWifiSettingsMerged]
+     * 的**两个输入之一**，归一化在那里对合并后的整体做一次（别名链要一次看到全部输入才能定优先级）。
+     * 这份原始形状同时也是诊断端点 `GET /api/wifi/module-info` 的出口
+     * （`DeviceFields.UNSTABLE_ENDPOINTS` 里登记过的例外）。
+     */
     suspend fun getWifiModuleInfo(): JsonObject? {
         // 刻意的**分批**查询，不走 profile 命令表：这 2 个容器命令 + [getWifiSettings] 的 12 个扁平 cmd
         // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**。
@@ -210,7 +236,7 @@ class GoformWifiClient(
      * 的 fallback 基本不会命中 —— 非法 base64 走的是「`config["Password"] = ""`」这条路。
      * **不要改它的行为**：`/api/wifi/settings` 的读路径依赖现有语义。
      */
-    internal suspend fun getCurrentWifiConfig(): Map<String, String> {
+    suspend fun getCurrentWifiConfig(): Map<String, String> {
         val info = getWifiModuleInfo()
         val config = mutableMapOf<String, String>()
         if (info != null) {
@@ -244,6 +270,12 @@ class GoformWifiClient(
         return config
     }
 
+    /**
+     * WiFi 的 12 个扁平字段查询。
+     *
+     * **原样透传，未归一化**（批 B1：返回裸 `JsonObject?`）—— 同 [getWifiModuleInfo]，
+     * 它是 [getWifiSettingsMerged] 的另一个输入，归一化在那里做。
+     */
     suspend fun getWifiSettings(): JsonObject? {
         // 刻意的**分批**查询，不走 profile 命令表：本方法的 12 项 + [getWifiModuleInfo] 的 2 个容器命令
         // **合起来**才等于 cmdsFor(WIFI_SETTINGS) 的 14 项，但线上是**两次独立请求**（见 getWifiModuleInfo）。
@@ -266,8 +298,11 @@ class GoformWifiClient(
      * 现在密码解码由 profile 的 `WIFI_PASSWORD_DECODER` 负责，上层不再碰设备字段。
      *
      * @return 只含 [DeviceFields.WifiSettings] 登记字段的对象；两个查询都失败时返回空对象。
+     *   返回 [NormalizedFields]（批 B1）：`.values` 解包出来的 `JsonObject` 与改造前逐字一致。
+     *   非空契约保持不变 —— 两个查询都失败时给 [NormalizedFields.EMPTY]（内容就是 `{}`，
+     *   与改造前那句 `?: JsonObject(emptyMap())` 等价）。
      */
-    suspend fun getWifiSettingsMerged(): JsonObject {
+    suspend fun getWifiSettingsMerged(): NormalizedFields {
         val settings = getWifiSettings()
         val moduleInfo = try {
             getWifiModuleInfo()
@@ -283,7 +318,7 @@ class GoformWifiClient(
             // 真正的优先级由 profile 里的别名链顺序表达（ZTE 原名在前）
             moduleInfo?.forEach { (k, v) -> put(k, v) }
         }
-        return fields.normalize(FieldGroup.WIFI_SETTINGS, raw) ?: JsonObject(emptyMap())
+        return fields.normalize(FieldGroup.WIFI_SETTINGS, raw) ?: NormalizedFields.EMPTY
     }
 
 
@@ -294,7 +329,7 @@ class GoformWifiClient(
      * 归一化后一律是 `{"station_list":[{...}]}` 的真数组，元素键统一成
      * `hostname`/`ip_addr`/`mac_addr`（见 `ZteGoformProfile.normalizeStationLists`）。
      */
-    suspend fun getConnectedClients(): JsonObject? {
+    suspend fun getConnectedClients(): NormalizedFields? {
         val raw = client.readOne("station_list")?.let {
             when (it) {
                 is JsonObject -> it
@@ -486,7 +521,7 @@ class GoformWifiClient(
      * 有兜底路径，让一次查询失败把「打开 WiFi」整个动作打断反而更糟。
      */
     private suspend fun readCurrentWifiChip(): String? = try {
-        (getWifiSettingsMerged()[WIFI_CHIP_FIELD] as? JsonPrimitive)
+        (getWifiSettingsMerged().values[WIFI_CHIP_FIELD] as? JsonPrimitive)
             ?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
     } catch (e: CancellationException) {
         throw e
@@ -691,20 +726,4 @@ class GoformWifiClient(
         }
     }
 }
-
-/** 接入控制名单里的一台设备。`name` 可能为空串（设备侧名单允许只有 MAC）。 */
-data class AclEntry(val mac: String, val name: String)
-
-/**
- * 一次 `queryDeviceAccessControlList` 的快照。
- *
- * [mode] 直接透传设备的 `AclMode`（`"2"` = 黑名单生效），本项目只用黑名单，
- * 白名单读出来只为「整表回写时不把它冲掉」。
- */
-data class AclSnapshot(
-    val mode: String,
-    val black: List<AclEntry>,
-    val white: List<AclEntry>,
-)
-
 

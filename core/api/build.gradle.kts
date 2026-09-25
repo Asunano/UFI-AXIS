@@ -41,10 +41,17 @@ dependencies {
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
     // 2026-09-25：`WriteOutcome` 从 :core:goform 搬到 :core:device-spi 之后显式声明。
-    // 它出现在本模块 `CallJsonExt` 的**公开扩展签名**上，属于直接依赖 ——
-    // 靠 goform 的 `api(":core:device-spi")` 传递可见的话，goform 哪天把它改成
-    // implementation，本模块就会莫名编译不过（口径同 :core:controller 的那段说明）。
-    implementation(project(":core:device-spi"))
+    // 用 `api` 而不是 `implementation`，判据就是本文件自己写的那条「公开签名里出现的类型
+    // 要让依赖方看得见」：`WriteOutcome` 在 `CallJsonExt` 的公开扩展签名上，
+    // 批 A1 之后 `DeviceHub` 又出现在 `NetworkDeps` / `RouteContext` 的公开签名上 ——
+    // 装配层 `:core` 要构造 `NetworkDeps`，拿不到这两个类型就编译不过。
+    // （现在 `:core` 自己也声明了 device-spi，但那是巧合，不该靠它。）
+    api(project(":core:device-spi"))
+    // 2026-09-25（批 B1）：`NormalizedFields` 出现在 `Goform*Client` 读方法的返回类型上，
+    // 本模块的 route / DataHub 要对它调 `.values` 解包 —— 直接依赖就显式声明，
+    // 不靠 `:core:device-spi` 的 `api(":core:device-schema")` 传递（口径同 `:core:scheduler`
+    // 里那条注释：直接依赖的模块要显式声明，别吃别人的实现细节）。
+    implementation(project(":core:device-schema"))
     implementation(project(":core:collector"))
     implementation(project(":core:cache"))
     implementation(project(":core:controller"))

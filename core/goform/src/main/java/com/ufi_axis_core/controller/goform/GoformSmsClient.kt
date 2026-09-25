@@ -2,6 +2,9 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.SmsSpec
+import com.ufi_axis_core.devicespi.adapter.SendOutcome
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
+import com.ufi_axis_core.devicespi.adapter.SmsMeta
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
@@ -72,47 +75,10 @@ class GoformSmsClient(
             "$smsQuery&_=${System.currentTimeMillis()}"
     }
 
-    /**
-     * 发送结论。设备回 `success` 只代表受理，最终状态要回读信箱 `tag` 才知道。
-     *
-     * ## 为什么 [REJECTED] 与 [NO_RESPONSE] 必须分成两档
-     *
-     * 上层（`LocalSmsDelivery.classify`）拿这个枚举决定**要不要重试**，而重试一条短信
-     * 等于可能再花一笔话费。判据只有一个：**我们知不知道设备没收到这条发送请求**。
-     * - 知道没收到（[REJECTED]）→ 重试安全，不会重复发；
-     * - 不知道（[NO_RESPONSE]）→ 请求可能已经落到固件里、短信可能已经发出去了，
-     *   重试就是第二条真短信、第二笔钱。
-     *
-     * 合成一档的代价是实测过的：`goformPost` 返回 null（请求没走完 / 响应读不出来）
-     * 与「设备明确回了一个失败结果」都落进 REJECTED，整档判可重试 → 后者安全、
-     * 前者会重复计费。所以分开的是"设备有没有表态"，不是"失败原因"。
-     */
-    enum class SendVerdict {
-        /** 信箱 tag=2：设备确认已发出 */
-        SENT,
-        /** 信箱 tag=3：设备侧发送失败 */
-        FAILED,
-        /** 设备已受理，但短时间内没给最终状态（不代表失败） */
-        PENDING,
-        /**
-         * **设备明确拒收**：请求到了设备、设备也回了响应，只是结果是"没受理"
-         * （参数不合法、固件忙、或 SEND_SMS 根本没被投出去——如未登录）。
-         *
-         * 设备说了"我没收下"，所以重试不会重复发 → 这是唯一**可重试**的一档，
-         * 也是唯一**不计配额**的一档（两件事必须同时成立，见 `LocalSmsDelivery`）。
-         */
-        REJECTED,
-        /**
-         * **拿不到设备的表态**：请求没走完 / 响应无法解析 / 超时（`goformPost` 返回 null）。
-         *
-         * 无法排除"设备其实已经收下并发出了"，所以**不可重试**（重试可能是第二笔话费），
-         * 而配额**要计**（宁可少发一条，也不要漏计导致真实发送超过用户设的上限）。
-         */
-        NO_RESPONSE,
-    }
-
-    data class SendOutcome(val verdict: SendVerdict, val detail: String)
-
+    // 发送结论的三个类型（SendVerdict / SendOutcome / SmsMeta）**不在本类里** ——
+    // 2026-09-25 批 C1 起它们住在 :core:device-spi 的 devicespi.adapter 包（见文件头 import），
+    // 因为它们出现在 SmsControl 的签名上，而语义（「设备对发信有没有表态」「信箱里有多少条」）
+    // 本来就与协议无关。枚举值名、字段名与 KDoc 逐字未变。
 
     suspend fun getSmsList(page: Int = 0, perPage: Int = 50): JsonObject? {
         val spec = specOrNull("getSmsList") ?: return null
@@ -268,9 +234,7 @@ class GoformSmsClient(
         return client.isSuccess(client.write(spec.markReadParams(listOf(msgId), read)))
     }
 
-    /** Goform 短信元数据（总数 / 未读），用于替代 ContentResolver 计数 */
-    data class SmsMeta(val total: Int, val unread: Int)
-
+    /** Goform 短信元数据（总数 / 未读），用于替代 ContentResolver 计数 —— 类型见 [SmsMeta]。 */
     suspend fun getSmsMeta(): SmsMeta? {
         val spec = specOrNull("getSmsMeta") ?: return null
         if (!client.ensureLogin()) return null

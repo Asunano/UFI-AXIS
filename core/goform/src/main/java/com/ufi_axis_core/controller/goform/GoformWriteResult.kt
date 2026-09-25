@@ -25,7 +25,8 @@ package com.ufi_axis_core.controller.goform
  *    直接把真因带给调用方。
  *
  * 非幂等命令（`SEND_SMS`）**不要**用这套三态去自动重试：见
- * [GoformSmsClient.SendVerdict.NO_RESPONSE] 的注释 —— 那里重试一次可能是第二笔话费。
+ * `SendVerdict.NO_RESPONSE` 的注释（批 C1 起那个枚举在 `:core:device-spi`）——
+ * 那里重试一次可能是第二笔话费。
  */
 sealed interface GoformWriteResult {
 

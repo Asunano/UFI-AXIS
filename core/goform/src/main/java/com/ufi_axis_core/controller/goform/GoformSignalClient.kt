@@ -2,6 +2,7 @@ package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
+import com.ufi_axis_core.deviceschema.NormalizedFields
 import kotlinx.serialization.json.*
 
 /**
@@ -25,6 +26,25 @@ import kotlinx.serialization.json.*
  *
  * [profile] 传 `null` 即整层短路成原样透传（一键回退）。
  * 尚未迁移的方法仍是透传。
+ *
+ * ## 批 B1：从签名就能看出哪个方法有归一化保证
+ *
+ * 「过了归一化层」这件事以前只由方法体里那句 `fields.normalize(GROUP, raw)` 保证，
+ * 返回类型一律是裸 `JsonObject?` —— 接第二台设备时漏调一次，编译照过、测试不红、
+ * route 拿到的字段名全错。现在按返回类型把两类方法分开：
+ *
+ * - 返回 [NormalizedFields]（`:core:device-schema`）= **过了归一化闸门**。
+ *   那个类型在本模块**造不出来**（构造入口是 `internal`，唯一途径是
+ *   [com.ufi_axis_core.deviceschema.FieldNormalizer.normalizeToFields]），
+ *   所以「返回了没归一化的数据」在类型上不可表达。消费点用 `.values` 解包成 `JsonObject`，
+ *   **内容与改造前逐字一致，对外 JSON 一个字节没变**。
+ * - 仍返回 `JsonObject?` / `JsonArray?` = **原样透传或形状不同**，每个都在自己的 KDoc 里
+ *   写清「未归一化 / 归一化在哪一步」。
+ *
+ * ⚠ [NormalizedFields] 的语义是「**过了归一化层**」，不是「字段名一定是 canonical」：
+ * 排障开关 `field_normalization_enabled=false` 时闸门原样透传（那正是它的用途），
+ * 此时那个类型包着的是设备原名。完整说明在 [NormalizedFields] 的 KDoc。
+
  *
  * ## 两份 profile 的分工
  *
@@ -83,6 +103,12 @@ class GoformSignalClient(
      *
      * 0.4b：原来这里是 16 个字面量，与 `cmdsFor(SIGNAL)` 逐字一致（含顺序）——
      * 核对通过后收进命令表，这里只留取值。
+     *
+     * **原样透传，未归一化**（批 B1：返回类型是裸 `JsonObject?` 而不是 [NormalizedFields]）。
+     * 本方法是 SIGNAL 组的**原始**取数口，归一化在两处下游各做一次，针对的分组不同：
+     * [getConnectionInfo]（CONNECTION 组）与 `SignalCollector.collectLayer1GoformFields`
+     * （SIGNAL 组，直接调 `FieldNormalizer.normalize`）。所以这里不能自己先归一化一次 ——
+     * 那两条下游要的是同一份**设备原始**输入（`GoformQoS` 的 2s 快照也存原始）。
      */
     suspend fun getSignalInfo(): JsonObject? {
         return client.read(fields.cmds(FieldGroup.SIGNAL))
@@ -99,7 +125,7 @@ class GoformSignalClient(
      *
      * 复用 [getSignalInfo] 的那一次查询（`GoformQoS` 的 2s 快照会命中，不会多打设备）。
      */
-    suspend fun getConnectionInfo(): JsonObject? {
+    suspend fun getConnectionInfo(): NormalizedFields? {
         val raw = getSignalInfo() ?: return null
         return fields.normalize(FieldGroup.CONNECTION, raw)
     }
@@ -108,6 +134,11 @@ class GoformSignalClient(
      * 单独获取 network_information（供需要仅获取 NR 信息时使用）
      * 返回字段：Nr_fcn, Nr_pci, Nr_bands, Nr_band_widths, Nr_cell_id,
      *           Nr_signal_strength, Nr_snr, nr_rsrp, nr_rsrq, nr_rssi, network_type
+     *
+     * **原样透传，未归一化**（批 B1：返回裸 `JsonObject?`）。NR 字段归 SIGNAL 组，
+     * 而这条查询只取 2 项 —— 归一化在下游按 SIGNAL 组做
+     * （`SignalCollector.collectLayer1GoformFields`，它还负责摊平 `network_information` 这个
+     * 嵌套容器；摊平规则在 profile 的结构解码器里）。
      */
     suspend fun getNetworkInformation(): JsonObject? {
         // 刻意的轻量查询，**不走 profile 命令表**：这 2 项没有对应的 FieldGroup（NR 字段归 SIGNAL，
@@ -118,6 +149,14 @@ class GoformSignalClient(
 
     // ==================== 设备信息 ====================
 
+    /**
+     * IMEI / IMSI / ICCID / LAN IP / MAC 的轻量查询。
+     *
+     * **原样透传，未归一化**（批 B1：返回裸 `JsonObject?`）。这 5 个字段属 IDENTITY 组，
+     * 归一化的那条路是 [getDeviceIdentity]（走 `cmdsFor(IDENTITY)` 的 20 项完整查询）。
+     * 本方法刻意保持透传 + 轻量，**没有任何 route 直接用它**（`signalQuery { getDeviceInfo() }`
+     * 在 `DataHub` 的 KDoc 里被列过，但全仓没有调用点），改动它请先确认消费方。
+     */
     suspend fun getDeviceInfo(): JsonObject? {
         // 刻意的轻量查询，**不走 profile 命令表**：IDENTITY 分组有 20 个 cmd，换过去会从 5 项变 20 项。
         // 字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
@@ -140,9 +179,9 @@ class GoformSignalClient(
      * 只有声明没有调用点，而 `web/src/api/contract.ts` 的 `identity.all` 本来就只列了这 7 个。
      * cmds 不动（少查一个字段并不省一次 HTTP，而改查询会改变设备侧请求形状）。
      */
-    suspend fun getDeviceIdentity(): JsonObject? {
+    suspend fun getDeviceIdentity(): NormalizedFields? {
         val data = client.read(fields.cmds(FieldGroup.IDENTITY)) ?: return null
-        return fields.normalize(FieldGroup.IDENTITY, data)?.ifEmpty { null }
+        return fields.normalize(FieldGroup.IDENTITY, data)?.takeUnless { it.values.isEmpty() }
     }
 
     /**
@@ -152,7 +191,7 @@ class GoformSignalClient(
      * `cr_version` / `wa_inner_version`（`DeviceRoutes` 用它们拼 camelCase 响应）。
      * 这里不用 `fields.cmds`：本方法只查 3 个字段，是刻意的轻量查询。
      */
-    suspend fun getDeviceVersion(): JsonObject? {
+    suspend fun getDeviceVersion(): NormalizedFields? {
         // 刻意的轻量查询，**不走 profile 命令表**（IDENTITY 是 20 项，这里只要 3 项；
         // 注意 `Language` 刻意只在这条查询里，不在 cmdsFor(IDENTITY) 里 —— 所以它在覆盖率报告里
         // 必然 missing，那是登记态不是缺陷）。字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
@@ -172,6 +211,15 @@ class GoformSignalClient(
      *
      * `realtime_time` / `realtime_*_thrpt` 没登记在该分组，归一化会丢掉，
      * 所以先铺原始响应再用归一化结果覆盖 —— 未登记字段原样保留，月累计取掰正后的值。
+     *
+     * ## 批 B1：为什么这个方法**不**返回 [NormalizedFields]
+     *
+     * 因为它的返回值**不是归一化层的产出**，而是「设备原始响应 + 归一化结果覆盖上去」的
+     * **混合体** —— 上一段那个 `merged` 就是为了留住 `realtime_*`（它们刻意没登记在
+     * TRAFFIC_LIMIT 里）。把混合体套上「过了归一化层」的类型是谎报：里面确实有一半
+     * 是设备原名。所以这里保持 `JsonObject?`，归一化只覆盖 TRAFFIC_LIMIT 登记的那些键。
+     *
+     * 需要**纯**归一化出口的是 [getDataUsage]（`GET /api/device/traffic-limit` 走它）。
      */
     suspend fun getTrafficStats(): JsonObject? {
         // 刻意的轻量查询，**不走 profile 命令表**：TRAFFIC_LIMIT 是 10 项且**不含** realtime_*，
@@ -184,7 +232,7 @@ class GoformSignalClient(
         )) ?: return null
         val normalized = fields.normalize(FieldGroup.TRAFFIC_LIMIT, raw) ?: return raw
         val merged = LinkedHashMap<String, JsonElement>(raw)
-        merged.putAll(normalized)
+        merged.putAll(normalized.values)
         return JsonObject(merged)
     }
 
@@ -202,6 +250,9 @@ class GoformSignalClient(
      * **为什么仍是三次请求**：批次边界是设备事实，一次发 96 项会被设备截断/返回空
      * （同类先例见 `station_list`）。所以这里逐批发，顺序即 profile 里的顺序 ——
      * 后一批的同名键覆盖前一批，与搬运前的 `putAll` 语义一致。
+     *
+     * **原样透传，未归一化**（批 B1：返回裸 `JsonObject?`）—— 不过 allowlist 正是这份 dump
+     * 的用途：看设备后台到底有哪些字段。它对外只经 [getFullStatusMasked] 出去（脱敏在那里）。
      */
     suspend fun getFullStatus(): JsonObject? {
         val merged = mutableMapOf<String, JsonElement>()
@@ -217,6 +268,9 @@ class GoformSignalClient(
      * 这份 dump 不过 allowlist（那正是它的用途：看设备后台到底有什么字段），所以
      * PII 与凭据必须在这里打掉：登记过的按 `Sensitivity`，没登记的按字段名兜底
      * （见 `FieldNormalizer.maskDump`）。想看真值请走对应的业务端点。
+     *
+     * **未归一化**（批 B1：返回裸 `JsonObject?`）。脱敏 ≠ 归一化：`maskDump` 只把敏感值换成
+     * `***`，**字段名一个都不动**（而且它连闸门都不走 —— profile 为 null 时原样返回）。
      */
     suspend fun getFullStatusMasked(): JsonObject? = fields.maskDump(getFullStatus())
 
@@ -226,6 +280,10 @@ class GoformSignalClient(
      *
      * **会逐分组向设备发查询**（最多 10 组，soloCmd 另发），因此只适合按需调用，
      * 不要放进任何轮询路径。输出只含字段名不含值。
+     *
+     * **返回的不是设备字段而是一份报告**（批 B1：所以是 `JsonObject`，不是 [NormalizedFields]）：
+     * 键是 `normalization_enabled` / `profile_id` / `groups` 这类诊断字段，它们由
+     * `GoformFieldMapper.coverageReport` 自己拼，根本不经过归一化闸门。
      */
     suspend fun diagnoseFieldCoverage(): JsonObject = fields.coverageReport { client.read(it) }
 
@@ -244,22 +302,27 @@ class GoformSignalClient(
      * 顶层只保留 `DeviceFields.CellInfo` 登记的字段 —— `network_information` 是查询用的容器命令，
      * 它自己不对外透出（NR 字段走 `signal` 频道与 `/api/network/signal`）。
      */
-    suspend fun getCellInfo(): JsonObject? {
+    suspend fun getCellInfo(): NormalizedFields? {
         val data = client.read(fields.cmds(FieldGroup.CELL_INFO)) ?: return null
-        return fields.normalize(FieldGroup.CELL_INFO, data)?.ifEmpty { null }
+        return fields.normalize(FieldGroup.CELL_INFO, data)?.takeUnless { it.values.isEmpty() }
     }
 
     /**
      * 仅查询邻区信息，用于快速刷新邻区列表。
      *
      * 归一化后 `neighbor_cell_info` 恒为真数组，所以这里不再需要"字符串 or 数组"两路解析。
+     *
+     * **归一化过，但返回类型仍是 `JsonArray?`**（批 B1）：它归一化的是 CELL_INFO 组，
+     * 然后**从结果里取出一个成员**再返回 —— 出去的是数组本身，不是字段集合，
+     * [NormalizedFields] 包的是「一份字段对象」，套在这里名不副实。
+     * 元素键（`pci` / `earfcn` / `rsrp` / …）的 canonical 保证来自上面那次归一化。
      */
     suspend fun getNeighborCellInfo(): JsonArray? {
         // 刻意的轻量查询，**不走 profile 命令表**：CELL_INFO 是 10 项，换过去会把「单字段快速刷新」
         // 变成 10 字段查询。字段名的核对依据是计划书 §16 的真机基线（2026-09-22）。
         val data = client.read(listOf("neighbor_cell_info")) ?: return null
         val normalized = fields.normalize(FieldGroup.CELL_INFO, data) ?: return null
-        return normalized["neighbor_cell_info"] as? JsonArray
+        return normalized.values["neighbor_cell_info"] as? JsonArray
     }
 
     // ==================== LAN/DHCP ====================
@@ -271,7 +334,7 @@ class GoformSignalClient(
      * / `DhcpStartIP` 等老名字）。`dhcpLease_hour` **不做单位换算** —— 两端客户端都已固化
      * "读到后自己 ×3600"，在这里换算会变成双重换算。
      */
-    suspend fun getLanSettings(): JsonObject? {
+    suspend fun getLanSettings(): NormalizedFields? {
         val cmds = fields.cmds(FieldGroup.LAN_SETTINGS)
         return fields.normalize(FieldGroup.LAN_SETTINGS, client.read(cmds))
     }
@@ -289,7 +352,7 @@ class GoformSignalClient(
      * `GET /api/network/band-status`（[getBandLockStatus]）提供，web 与 app 都只从那里读。
      * cmd 仍保留在查询里，避免改动设备侧的请求形状。
      */
-    suspend fun queryDeviceSettings(): Map<String, JsonElement>? {
+    suspend fun queryDeviceSettings(): NormalizedFields? {
         val cmds = fields.cmds(FieldGroup.DEVICE_SETTINGS)
         return fields.normalize(FieldGroup.DEVICE_SETTINGS, client.read(cmds))
     }
@@ -301,7 +364,7 @@ class GoformSignalClient(
      * 已归一化（计划书 1.1）：cmd 列表与字段名都来自 profile 的 `BAND_STATUS` 分组。
      * 值原样透出 —— `"0"` / `"all"` 表示未锁定，客户端的 `parseBands()` 已固化这个解析。
      */
-    suspend fun getBandLockStatus(): JsonObject? {
+    suspend fun getBandLockStatus(): NormalizedFields? {
         val cmds = fields.cmds(FieldGroup.BAND_STATUS)
         return fields.normalize(FieldGroup.BAND_STATUS, client.read(cmds))
     }
@@ -315,7 +378,7 @@ class GoformSignalClient(
      * profile 的结构解码器拆成 `limit_value` / `limit_unit_display` / `limit_bytes`，
      * 上层不再见到复合串，也不需要知道单位藏在乘数里。开关值统一成 `"1"`/`"0"`。
      */
-    suspend fun getDataUsage(): JsonObject? {
+    suspend fun getDataUsage(): NormalizedFields? {
         val cmds = fields.cmds(FieldGroup.TRAFFIC_LIMIT)
         return fields.normalize(FieldGroup.TRAFFIC_LIMIT, client.read(cmds))
     }

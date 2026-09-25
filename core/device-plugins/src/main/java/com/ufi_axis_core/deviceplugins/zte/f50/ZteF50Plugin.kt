@@ -4,6 +4,7 @@ import android.content.Context
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.goform.GoformClient
 import com.ufi_axis_core.deviceplugins.platform.sprd.SprdPlatform
+import com.ufi_axis_core.deviceplugins.zte.ZteGoformAdapter
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import com.ufi_axis_core.devicespi.CpuInfoPlatform
@@ -13,6 +14,7 @@ import com.ufi_axis_core.devicespi.DeviceTuning
 import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.devicespi.ProbeEnv
 import com.ufi_axis_core.devicespi.TransportConfig
+import com.ufi_axis_core.devicespi.adapter.DeviceAdapter
 
 /**
  * ZTE F50（Unisoc 平台随身 WiFi）插件 —— 本仓的首个 [DevicePlugin] 实现，也是默认插件。
@@ -22,6 +24,10 @@ import com.ufi_axis_core.devicespi.TransportConfig
  * - [createTransport] → `GoformClient`（`:core:goform`）；
  * - [platform] → [SprdPlatform]（同模块的 `platform/sprd/`，阶段 4 批 F）；
  * - [tuning] → 实测常量的原值（来源逐条记在 [DeviceTuning] 的字段 KDoc 上）。
+ *
+ * 2026-09-25 批 A3 加上第五样，同样没有新增设备知识：
+ * - [createAdapter] → [ZteGoformAdapter]（同模块的 `zte/`）。六个 `Goform*Client` 的
+ *   `new` 从装配层搬进了 adapter，`transport as? GoformClient` 那句转型搬进了本文件。
  *
  * [capabilities] 同理：3A 那 10 个域逐一对着「`ZteGoformProfile` 里有没有那条 `WriteSpec`」+
  * 「core 侧有没有那个写 route」核过（2026-09-24 阶段 3.2），不是照 [Capability] 的清单抄一遍。
@@ -92,6 +98,45 @@ object ZteF50Plugin : DevicePlugin {
 
     override fun createTransport(cfg: TransportConfig): DeviceTransport =
         GoformClient(deviceIp = cfg.deviceIp, port = cfg.port, password = cfg.password)
+
+    /**
+     * 六个域的实现 → [ZteGoformAdapter]（同模块的 `zte/`，2026-09-25 批 A3）。
+     *
+     * ## 这里那句向下转型是**合法**的
+     *
+     * [transport] 是装配层调本插件的 [createTransport] 造出来的，所以本插件知道它就是
+     * [GoformClient] —— 「谁造的谁认识」。批 A3 之前这一步写在
+     * `ComponentFactory.buildNetworkGraph` 里，那才是不该有的：装配层不生产具体实现，
+     * 却要为了六个客户端的构造参数去认识一个具体协议类。现在装配层只认 [DeviceTransport]。
+     *
+     * 用 `as?` + `error()` 而不是硬 `as`：硬转型抛的 ClassCastException 在组件图构造
+     * 这条启动路径上只会留下一行没有上下文的堆栈，而这里失败的真实含义是
+     * 「有人换掉了本插件的 transport 实现」—— 写成一句话，下一个人不用猜。
+     *
+     * ⚠ **不在这里再调一次 [createTransport]**：整图只许有一份传输层实例
+     * （会话 + 连接池，理由见 [DevicePlugin.createAdapter]），
+     * `ComponentGraph.NetworkGraph.goformClient` 与本 adapter 用的必须是同一个对象。
+     */
+    override fun createAdapter(
+        transport: DeviceTransport,
+        commandProfile: DeviceProfile,
+        normalizeProfile: DeviceProfile?,
+    ): DeviceAdapter {
+        val goform = transport as? GoformClient ?: error(
+            "插件 $id 收到的传输层不是 GoformClient（实际是 ${transport::class.java.name}）—— " +
+                "本插件的 createTransport() 造的就是 GoformClient，走到这里说明有人换掉了 " +
+                "transport 实现；六个 goform 客户端只能接 goform 传输层"
+        )
+        return ZteGoformAdapter(
+            // id / capabilities 取自本插件自己的属性：能力集是「设备支不支持某个动作」的
+            // 唯一判据，不许在装配层或 adapter 里另立一份。
+            id = id,
+            capabilities = capabilities,
+            transport = goform,
+            commandProfile = commandProfile,
+            normalizeProfile = normalizeProfile,
+        )
+    }
 
     /**
      * F50 跑在展锐（Unisoc）平台上 → [SprdPlatform]。

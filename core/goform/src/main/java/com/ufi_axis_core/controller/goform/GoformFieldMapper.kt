@@ -3,6 +3,7 @@ package com.ufi_axis_core.controller.goform
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldNormalizer
+import com.ufi_axis_core.deviceschema.NormalizedFields
 import com.ufi_axis_core.util.AppLogger
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -108,12 +109,23 @@ internal class GoformFieldMapper(
      * [normalizeProfile] 为 `null`（排障开关关掉归一化）时**原样透传** ——
      * 唯一例外是 [NORMALIZE_ALWAYS] 里的组，它们回落到非空的 [commandProfile] 继续归一化，
      * 见 [normalizeAlwaysProfile] / [NORMALIZE_ALWAYS]。
+     *
+     * ## 批 B1：返回 [NormalizedFields] 而不是裸 [JsonObject]
+     *
+     * 闸门的三条分支（归一化 / 豁免组归一化 / 原样透传）**一条都没改**，只是统一由
+
+     * [FieldNormalizer.normalizeToFields] 收口 —— 它是 [NormalizedFields] 的唯一构造途径，
+     * 于是「读侧返回了没过闸门的数据」在类型上不可表达。
+     *
+     * ⚠ 注意本类型的语义是「**过了归一化层**」，不是「字段名一定是 canonical」：
+     * 透传那条分支包着的就是设备原名（完整说明见 [NormalizedFields] 的 KDoc）。
+     * [normalizeAlwaysProfile] 仍然在 [raw] 判空**之前**调用，所以豁免 WARN 的时机一字未变。
      */
-    fun normalize(group: FieldGroup, raw: JsonObject?): JsonObject? {
-        val p = normalizeProfile ?: normalizeAlwaysProfile(group) ?: return raw
-        if (raw == null) return null
-        return FieldNormalizer.normalize(raw, p, group, legacy)
+    fun normalize(group: FieldGroup, raw: JsonObject?): NormalizedFields? {
+        val p = normalizeProfile ?: normalizeAlwaysProfile(group)
+        return FieldNormalizer.normalizeToFields(raw, p, group, legacy)
     }
+
 
     /**
      * 排障开关关掉归一化后，[group] 是否仍然要归一化；要的话返回用哪份 profile。

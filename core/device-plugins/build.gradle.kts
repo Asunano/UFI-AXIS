@@ -65,4 +65,13 @@ dependencies {
     // 主源集虽然经 device-spi / goform 拿到了协程，但那两处都是 implementation，
     // 不会传递到本模块的测试编译 classpath 上，所以这里显式声明一次。
     testImplementation(libs.kotlinx.coroutines.android)
+    // `ZteGoformAdapterBandSelectionTest` 要在**不触达传输层**的前提下断言
+    // 「BandSelection.All 最终传给 GoformNetworkClient 的取值就是 lteAllBands() / nrAllBands()」。
+    //
+    // ⚠ 刻意**不**自己写一个假 `GoformTransport`：那个符号有守门测试
+    // （`GoformTransportVisibilityGuardTest`）钉着「不许跨出 core/goform」，
+    // 连测试源码也算越界（它扫的是 core 目录下全部 .kt）。所以这里 mock 的是
+    // `GoformNetworkClient` 本身 —— 断言点正好就在 adapter 与客户端之间的那条边界上。
+    // mockk 已是本仓既有的测试依赖（`:core:api` 在用同一条）。
+    testImplementation(libs.mockk)
 }

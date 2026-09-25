@@ -3,8 +3,8 @@ package com.ufi_axis_core.api.routes
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.routes.RouteContext
 import com.ufi_axis_core.contract.ErrorCode
-import com.ufi_axis_core.controller.goform.AclEntry
-import com.ufi_axis_core.controller.goform.AclSnapshot
+import com.ufi_axis_core.devicespi.adapter.AclEntry
+import com.ufi_axis_core.devicespi.adapter.AclSnapshot
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
 import io.ktor.server.application.*
@@ -19,7 +19,11 @@ class WifiRoutes(
 ) {
     // ── 反向兼容 getter ──
     private val goformClient get() = ctx.goformClient
-    private val wifiClient get() = ctx.wifiClient
+    /**
+     * WiFi 域的设备适配接口 —— **读写都走这里**（写侧批 A2b 迁入，
+     * 读侧与 `setAccessControlList` 批 C2 迁入）。
+     */
+    private val wifi get() = ctx.deviceHub.wifi
     private val networkController get() = ctx.networkController
     private val dataHub get() = ctx.dataHub
 
@@ -29,7 +33,7 @@ class WifiRoutes(
             post("/enable") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = wifiClient.setWifiEnabled(enabled)
+                val success = wifi.setWifiEnabled(enabled)
                 if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "enabled" to enabled)))
@@ -71,7 +75,7 @@ class WifiRoutes(
                 val maxStaNum = p["max_sta_num"]?.jsonPrimitive?.intOrNull
                 val broadcastDisabled = p["broadcast_disabled"]?.jsonPrimitive?.intOrNull
                 val chipIndex = p["chip_index"]?.jsonPrimitive?.contentOrNull
-                val outcome = wifiClient.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
+                val outcome = wifi.setWifiConfig(ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex)
                 // 设备拒绝（密码位数 / 加密组合非法这类）回 400 + 原因，与 /sleep、/acl/* 同口径。
                 // 原来这里把三态压成 Boolean 再一律回 500，客户端只能显示一句 HTTP 500。
                 if (call.respondRejected(outcome)) return@post
@@ -89,7 +93,7 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "level must be 0-2")
                     return@post
                 }
-                val success = wifiClient.setWifiPower(level)
+                val success = wifi.setWifiPower(level)
                 if (success) dataHub?.invalidateWifi()
                 call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "level" to level)))
@@ -109,7 +113,7 @@ class WifiRoutes(
 
             // WiFi 模块详细信息（包含 AuthMode/EncrypType/Password 等，与参考项目一致）
             get("/module-info") {
-                val info = wifiClient.getWifiModuleInfo()
+                val info = wifi.getWifiModuleInfo()
                 call.respond(toJsonElement(info ?: emptyMap<String, Any>()))
             }
 
@@ -123,11 +127,11 @@ class WifiRoutes(
                         "chip must be chip1 or chip2")
                     return@get
                 }
-                val qr = wifiClient.getWifiQrCode(chip, ssidIndex)
+                val qr = wifi.getWifiQrCode(chip, ssidIndex)
                 if (qr == null) {
                     // 带上真因（HTTP 码 / 非图片 / 连接异常），否则前端只能看到一句无从下手的
                     // "无法从设备读取"，排查必须依赖 adb logcat。
-                    val reason = wifiClient.lastQrCodeFailure.takeIf { it.isNotBlank() }
+                    val reason = wifi.lastQrCodeFailure.takeIf { it.isNotBlank() }
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         if (reason != null) "无法从设备读取 WiFi 二维码：$reason" else "无法从设备读取 WiFi 二维码")
                     return@get
@@ -142,7 +146,7 @@ class WifiRoutes(
 
                 val p = call.receiveJsonObject()
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "0"
-                val outcome = wifiClient.setWifiSleep(time)
+                val outcome = wifi.setWifiSleep(time)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) dataHub?.invalidateWifi()
@@ -162,7 +166,7 @@ class WifiRoutes(
             post("/band") {
                 val p = call.receiveJsonObject()
                 val chip = p["chip"]?.jsonPrimitive?.contentOrNull ?: ""
-                val outcome = wifiClient.setWifiBand(chip)
+                val outcome = wifi.setWifiBand(chip)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) dataHub?.invalidateWifi()
@@ -177,7 +181,7 @@ class WifiRoutes(
                         "DataHub not available")
                     return@get
                 }
-                val clients = dh.wifiQuery { getConnectedClients() }
+                val clients = dh.wifiQuery { getConnectedClients() }?.values
                 call.respond(toJsonElement(clients ?: emptyMap<String, Any>()))
             }
 
@@ -186,7 +190,7 @@ class WifiRoutes(
             // 两端客户端只发单台设备的 mac/name，不需要自己拼完整名单（也就不会互相覆盖）。
             // 名单不缓存：条数极少、且拉黑后要立刻能看到结果。
             get("/acl") {
-                val acl = wifiClient.getAccessControlList()
+                val acl = wifi.getAccessControlList()
                 if (acl == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "无法从设备读取接入控制名单")
@@ -203,7 +207,7 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "mac is required")
                     return@post
                 }
-                val acl = wifiClient.getAccessControlList()
+                val acl = wifi.getAccessControlList()
                 if (acl == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "无法从设备读取接入控制名单")
@@ -215,7 +219,7 @@ class WifiRoutes(
                     return@post
                 }
                 val next = acl.black + AclEntry(mac = mac, name = name)
-                val outcome = wifiClient.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
+                val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
                 if (call.respondRejected(outcome)) return@post
                 call.respondAclResult(outcome.ok)
             }
@@ -227,7 +231,7 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "mac is required")
                     return@post
                 }
-                val acl = wifiClient.getAccessControlList()
+                val acl = wifi.getAccessControlList()
                 if (acl == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "无法从设备读取接入控制名单")
@@ -239,15 +243,15 @@ class WifiRoutes(
                     call.respond(toJsonElement(acl.toResponseMap() + mapOf("success" to true)))
                     return@post
                 }
-                val outcome = wifiClient.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
+                val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
                 if (call.respondRejected(outcome)) return@post
                 call.respondAclResult(outcome.ok)
             }
 
             post("/acl/clear") {
-                val acl = wifiClient.getAccessControlList()
+                val acl = wifi.getAccessControlList()
                 // 读不回来也照样清（清空是"发空名单"，不依赖当前内容）；白名单只在读到时才保留
-                val outcome = wifiClient.setAccessControlList(
+                val outcome = wifi.setAccessControlList(
                     black = emptyList(),
                     white = acl?.white ?: emptyList(),
                     mode = acl?.mode,
@@ -260,7 +264,7 @@ class WifiRoutes(
 
     /** 写完立刻回读，返回**设备的真实名单**而不是我们以为写进去的那份。 */
     private suspend fun ApplicationCall.respondAclResult(success: Boolean) {
-        val latest = if (success) wifiClient.getAccessControlList() else null
+        val latest = if (success) wifi.getAccessControlList() else null
         val body = (latest?.toResponseMap() ?: emptyMap()) + mapOf("success" to success)
         respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError, toJsonElement(body))
     }
@@ -269,7 +273,7 @@ class WifiRoutes(
      * 写完立刻回读，返回**设备的真实 WiFi 配置**而不是我们以为写进去的那份（同 [respondAclResult]）。
      *
      * 字段名与 `GET /api/wifi/settings` 是同一套（两边都是
-     * [com.ufi_axis_core.controller.goform.GoformWifiClient.getWifiSettingsMerged] 的归一化结果），
+     * [com.ufi_axis_core.devicespi.adapter.WifiControl.getWifiSettingsMerged] 的归一化结果），
      * 所以客户端可以直接拿这份响应刷新界面，少一个来回。
      *
      * 刻意**绕开 dataHub**：`dataHub.getWifiSettingsMerged()` 会把结果写进 30s 缓存，而此刻设备
@@ -282,7 +286,7 @@ class WifiRoutes(
     private suspend fun ApplicationCall.respondWifiConfigResult(success: Boolean) {
         val latest = if (success) {
             try {
-                wifiClient.getWifiSettingsMerged()
+                wifi.getWifiSettingsMerged().values
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

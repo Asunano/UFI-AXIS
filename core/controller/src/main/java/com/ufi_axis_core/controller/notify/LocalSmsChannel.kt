@@ -1,8 +1,8 @@
 package com.ufi_axis_core.controller.notify
 
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.controller.sms.MailDelivery
 import com.ufi_axis_core.core.database.MailSendRecord
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.notify.ChannelRules
 import com.ufi_axis_core.notify.DeliveryAttempt
 import com.ufi_axis_core.notify.DeliveryOutcome
@@ -87,7 +87,7 @@ class LocalSmsChannel(
      * 它会在 goform 受理之后**回读信箱 tag** 拿真实结论（2=已发送 / 3=失败），
      * 所以这条渠道有货真价实的送达确认（见 [hasDeliveryConfirmation]）。
      */
-    private val smsClient: GoformSmsClient,
+    private val smsClient: SmsControl,
     /**
      * 投递记录写入口（实现在 `SmsForwardController`，装配层接线）。
      *

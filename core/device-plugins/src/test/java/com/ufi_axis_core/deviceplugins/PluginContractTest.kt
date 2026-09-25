@@ -1,12 +1,16 @@
 package com.ufi_axis_core.deviceplugins
 
 import com.ufi_axis_core.contract.Capability
+import com.ufi_axis_core.controller.goform.GoformClient
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.devicespi.BuildInfo
 import com.ufi_axis_core.devicespi.DevicePlugin
+import com.ufi_axis_core.devicespi.DeviceTransport
 import com.ufi_axis_core.devicespi.ProbeEnv
+import io.mockk.mockk
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -319,6 +323,72 @@ class PluginContractTest {
                 firstNoPlatform,
                 plugin.probe(envNoPlatform),
             )
+        }
+    }
+
+    // ───────────────────────── createAdapter ─────────────────────────
+
+    /**
+     * 造一个**不发任何请求**的假传输层，给 [DevicePlugin.createAdapter] 用。
+     *
+     * 为什么不调 `plugin.createTransport()`：那会 `new GoformClient` —— 构造里起 Ktor client、
+     * `AppLogger` 又依赖 `android.util.Log`，JVM 单测里只会拿到 `RuntimeException: Stub!`
+     * （同一条判据见本类 KDoc「本批仍然刻意不测的一条」）。mockk **不走构造函数**，
+     * 所以这里既不起 HTTP、也不触达 Android。
+     *
+     * ⚠ mock 的类型是 `GoformClient`（具体协议实现）而**不是** `DeviceTransport`：
+     * `ZteF50Plugin.createAdapter` 会把 transport 向下转型回自己造的那个类型
+     * （理由见 `DevicePlugin.createAdapter` 的 KDoc）。今天 [PluginRegistry.ALL] 里只有
+     * goform 系插件，所以一份假传输层够用；**加一个非 goform 插件时这里要按插件给出
+     * 对应的假传输层**，否则会在那个插件的转型处失败。
+     */
+    private fun fakeTransport(): DeviceTransport = mockk<GoformClient>(relaxed = true)
+
+    @Test
+    fun `createAdapter 交出的 adapter 的 id 与 capabilities 与插件自身一致`() {
+        // 防「插件交出一个 id 不匹配的 adapter」或「能力集在 adapter 上另立一份」——
+        // 能力集是「设备支不支持某个动作」的唯一判据（见 DeviceAdapter 的类 KDoc），
+        // 两份早晚分叉，而分叉的现象是「开关能点、点了回 501」这种很难归因的事。
+        plugins.forEach { plugin ->
+            val profile = plugin.profile()
+            val adapter = plugin.createAdapter(
+                transport = fakeTransport(),
+                commandProfile = profile,
+                normalizeProfile = profile,
+            )
+            assertEquals(
+                "${plugin.id}: createAdapter 交出的 adapter.id 必须与 plugin.id 一致",
+                plugin.id,
+                adapter.id,
+            )
+            assertEquals(
+                "${plugin.id}: createAdapter 交出的 adapter.capabilities 必须与 plugin.capabilities 一致",
+                plugin.capabilities,
+                adapter.capabilities,
+            )
+        }
+    }
+
+    @Test
+    fun `createAdapter 交出的 adapter 六个域字段非空`() {
+        // 接口已保证非空（DeviceAdapter 上六个 val 都不是可空类型），这一条防的是实现里写
+        // `lateinit` / `Delegates.notNull()` 之类延迟初始化：那样编译能过，
+        // 但真正取域的时候才炸 —— 而取域的地方是线上请求路径。
+        //
+        // 归一化那一份传 null（排障开关关掉的形态）：六个协议客户端里有两个吃双 profile，
+        // 这里顺带钉住「归一化 profile 为 null 时 adapter 照样造得出来」。
+        plugins.forEach { plugin ->
+            val adapter = plugin.createAdapter(
+                transport = fakeTransport(),
+                commandProfile = plugin.profile(),
+                normalizeProfile = null,
+            )
+            assertNotNull("${plugin.id}: adapter.sim 不能为 null", adapter.sim)
+            assertNotNull("${plugin.id}: adapter.device 不能为 null", adapter.device)
+            assertNotNull("${plugin.id}: adapter.network 不能为 null", adapter.network)
+            assertNotNull("${plugin.id}: adapter.wifi 不能为 null", adapter.wifi)
+            assertNotNull("${plugin.id}: adapter.signal 不能为 null", adapter.signal)
+            assertNotNull("${plugin.id}: adapter.sms 不能为 null", adapter.sms)
         }
     }
 }

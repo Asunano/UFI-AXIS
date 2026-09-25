@@ -81,6 +81,36 @@ object FieldNormalizer {
     }
 
     /**
+     * [normalize] 的**类型化出口**（批 B1）：产出 [NormalizedFields] 而不是裸 [JsonObject]。
+     *
+     * 这是 [NormalizedFields] 的**唯一构造途径** —— 拿到那个类型就等于「真的跑过一次本方法」。
+     * 判据与动机见 [NormalizedFields] 的 KDoc；这里只说三条边界，它们逐条对齐
+     * `GoformFieldMapper.normalize()` 改造前的行为，**没有任何行为变化**：
+     *
+     * 1. **`null` 进 `null` 出**：上层用 `null` 区分「查询失败」与「查到了但字段为空」，
+     *    归一化不能把失败变成空对象。[raw] 为 `null` 时**不看 [profile]**，直接 `null`
+     *    （改造前那段 `?: return raw` / `if (raw == null) return null` 两条路都落在 `null` 上）。
+     * 2. **[profile] 为 `null` = 闸门关着（排障开关 `field_normalization_enabled=false`）**：
+     *    此时**不调用 [normalize]**，把 [raw] **原样**包起来返回（同一个实例，字段名还是设备原名）。
+     *    所以本方法的语义是「过了归一化层」，不是「字段名一定是 canonical」——
+     *    这条差别必须看 [NormalizedFields] 的 KDoc，别在调用点自己另立一套理解。
+     * 3. 其余情况就是 [normalize]，逐字同一份实现（不是复制一份判断）。
+     *
+     * @param profile `null` = 归一化已关（原样透传）。**不许**在这里给它补非空兜底：
+     *   那个排障开关的可观测性（`normalization_enabled`）是从「profile 是否为 null」推出来的。
+     */
+    fun normalizeToFields(
+        raw: JsonObject?,
+        profile: DeviceProfile?,
+        group: FieldGroup,
+        legacy: LegacyAliases = LegacyAliases.DROP,
+    ): NormalizedFields? {
+        if (raw == null) return null
+        if (profile == null) return NormalizedFields.of(raw)
+        return NormalizedFields.of(normalize(raw, profile, group, legacy))
+    }
+
+    /**
      * 跑结构解码器（若有）。解码器抛异常时退回原始对象 —— 固件返回意外结构不应让整个
      * 端点 500，退化成"该分组字段缺失"更符合"缺失 = 省略 key"的语义。
      */

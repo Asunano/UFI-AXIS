@@ -7,6 +7,7 @@ import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldSpec
 import com.ufi_axis_core.deviceschema.SettingKey
 import com.ufi_axis_core.deviceschema.WriteSpec
+import com.ufi_axis_core.devicespi.adapter.DeviceAdapter
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -84,6 +85,20 @@ class DeviceRuntimeTest {
         /** 本类永远不装配传输层：真造起来要 HTTP 客户端，而选型与传输无关。 */
         override fun createTransport(cfg: TransportConfig): DeviceTransport =
             throw UnsupportedOperationException("选型测试不构造传输层")
+
+        /**
+         * 同上：选型规则一个字都不看六个域的实现（2026-09-25 批 A3 新增的成员）。
+         *
+         * 真要在这里交出一个 [DeviceAdapter]，就得为六个域各写一份假实现 ——
+         * 而「adapter 是不是插件自己交的、id / capabilities 有没有对齐」那条断言
+         * 在 `PluginContractTest`（`:core:device-plugins`，真插件那一侧）。
+         */
+        override fun createAdapter(
+            transport: DeviceTransport,
+            commandProfile: DeviceProfile,
+            normalizeProfile: DeviceProfile?,
+        ): DeviceAdapter =
+            throw UnsupportedOperationException("选型测试不构造 DeviceAdapter")
 
         /**
          * 同上：选型规则一个字都不看平台适配层。

@@ -1,6 +1,6 @@
 package com.ufi_axis_core.controller.system
 
-import com.ufi_axis_core.controller.goform.GoformDeviceClient
+import com.ufi_axis_core.devicespi.adapter.DeviceControl
 import com.ufi_axis_core.util.AdbShellExecutor
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
@@ -8,9 +8,13 @@ import com.ufi_axis_core.util.ShellExecutor
 /**
  * 系统控制器
  * 设备重启、关机等系统级操作
+ *
+ * @param device device 域的设备适配接口（2026-09-25 批 A2a 起）。收的是**这一个域**而不是整个
+ *   `DeviceHub`：本类只用 [DeviceControl.rebootDevice] / [DeviceControl.shutdownDevice] 两个方法，
+ *   递整个 hub 等于让它看见所有域，权限比需要的大。
  */
 class SystemController(
-    private val deviceClient: GoformDeviceClient
+    private val device: DeviceControl
 ) {
     private val tag = "SystemController"
 
@@ -22,7 +26,7 @@ class SystemController(
         AppLogger.i(tag, "Rebooting device")
 
         // 方式1: Goform
-        if (deviceClient.rebootDevice()) {
+        if (device.rebootDevice()) {
             return true
         }
 
@@ -46,7 +50,7 @@ class SystemController(
         AppLogger.i(tag, "Shutting down device")
 
         // 方式1: Goform
-        if (deviceClient.shutdownDevice()) {
+        if (device.shutdownDevice()) {
             AppLogger.i(tag, "Shutdown issued via goform")
             return true
         }

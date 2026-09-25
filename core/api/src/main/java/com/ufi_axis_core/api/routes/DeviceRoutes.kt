@@ -58,9 +58,10 @@ class DeviceRoutes(
     private val telephonyCollector get() = ctx.telephonyCollector
     private val atChannel get() = ctx.atChannel
     private val goformClient get() = ctx.goformClient
-    private val signalClient get() = ctx.signalClient
-    private val networkClient get() = ctx.networkClient
-    private val deviceClient get() = ctx.deviceClient
+    // 批 B2 起走 signal 域的设备适配接口（原来是 ctx.signalClient = GoformSignalClient）。
+    // 名字刻意不改：路由体里的调用点一行没动，方法名与语义逐字相同。
+    private val signalClient get() = ctx.deviceHub.signal
+    private val deviceHub get() = ctx.deviceHub
     private val systemController get() = ctx.systemController
     private val cache get() = ctx.responseCache
     private val dataHub get() = ctx.dataHub
@@ -230,14 +231,14 @@ class DeviceRoutes(
             // 一次 goform 超时就让本机号码/IMEI/IMSI/ICCID 空掉半小时，刷新页面也无效。
             // 缓存只由 DataHub 负责（它存的已经是归一化后的 canonical 数据）。
             get("/identity") {
-                val data = dataHub?.getDeviceIdentity() ?: signalClient.getDeviceIdentity()
+                val data = dataHub?.getDeviceIdentity() ?: signalClient.getDeviceIdentity()?.values
                 call.respond(toJsonElement(data ?: emptyMap<String, Any>()))
             }
 
             // 设备固件版本（通过 DataHub 获取）
             get("/version") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { getDeviceVersion() } ?: signalClient.getDeviceVersion()
+                    val data = (dataHub?.signalQuery { getDeviceVersion() } ?: signalClient.getDeviceVersion())?.values
                     return toJsonElement(mapOf(
                         "language" to (data?.get("Language")?.jsonPrimitive?.contentOrNull ?: ""),
                         "cr_version" to (data?.get("cr_version")?.jsonPrimitive?.contentOrNull ?: ""),
@@ -345,7 +346,7 @@ class DeviceRoutes(
             // 恢复出厂设置
             post("/factory-reset") {
                 cache?.invalidate("*")
-                val success = deviceClient.factoryReset()
+                val success = deviceHub.device.factoryReset()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -358,7 +359,7 @@ class DeviceRoutes(
                 dataHub.deviceCapabilities.requireCapability(Capability.USB_DEBUG)
                 val params = call.receiveJsonObject()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = deviceClient.setDebugMode(enabled)
+                val success = deviceHub.device.setDebugMode(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
@@ -376,7 +377,7 @@ class DeviceRoutes(
                         "old_password and new_password are required")
                     return@post
                 }
-                val success = deviceClient.changePassword(oldPwd, newPwd)
+                val success = deviceHub.device.changePassword(oldPwd, newPwd)
                 if (success) {
                     // 同步更新后端本地存储的 goform 密码，使后续请求无需重启即可生效
                     settings?.goformPassword = newPwd
@@ -414,7 +415,7 @@ class DeviceRoutes(
 
             // 流量限额配置查询（通过 DataHub 从 goform 读取）
             get("/traffic-limit") {
-                val raw = dataHub?.signalQuery { getDataUsage() } ?: signalClient.getDataUsage()
+                val raw = (dataHub?.signalQuery { getDataUsage() } ?: signalClient.getDataUsage())?.values
                 if (raw == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "无法查询设备流量限额配置，请检查设备连接")
@@ -464,7 +465,7 @@ class DeviceRoutes(
                         if (mode == "performance") 1 else 0
                     }
                 }
-                val success = deviceClient.setPerformanceMode(perfVal)
+                val success = deviceHub.device.setPerformanceMode(perfVal)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "performance_mode" to perfVal)))
             }
@@ -473,7 +474,7 @@ class DeviceRoutes(
             post("/led") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                val success = deviceClient.setIndicatorLight(enabled)
+                val success = deviceHub.device.setIndicatorLight(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -482,7 +483,7 @@ class DeviceRoutes(
             post("/roaming") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = networkClient.setRoaming(enabled)
+                val success = deviceHub.network.setRoaming(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -490,7 +491,7 @@ class DeviceRoutes(
             // 查询设备设置状态（通过 DataHub 获取）
             get("/settings") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings()
+                    val data = (dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings())?.values
                     val map = (data ?: emptyMap()).toMutableMap()
                     // 制式中文名由 contract 统一给出（App/Web 不再各译一份）。
                     // 取 net_select（真机切换后变化的就是它），缺失才回落 BearerPreference；
@@ -525,7 +526,7 @@ class DeviceRoutes(
                         !legacyDisable
                     }
                     ?: true
-                val success = deviceClient.setFotaEnabled(autoUpdate)
+                val success = deviceHub.device.setFotaEnabled(autoUpdate)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf(
                     "success" to success,
@@ -549,7 +550,7 @@ class DeviceRoutes(
                 dataHub.deviceCapabilities.requireCapability(Capability.SAMBA)
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = deviceClient.setSambaSetting(enabled)
+                val success = deviceHub.device.setSambaSetting(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -581,7 +582,7 @@ class DeviceRoutes(
                         "pci, earfcn, network_type are required")
                     return@post
                 }
-                val outcome = deviceClient.cellLock(pci, earfcn, networkType)
+                val outcome = deviceHub.device.cellLock(pci, earfcn, networkType)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) {
@@ -601,7 +602,7 @@ class DeviceRoutes(
                 // 「解锁在不支持的设备上反正是空操作」不是理由：对外表现必须是明确的
                 // 501「不支持」，而不是一次打到设备的请求 + 一个含义不明的 success。
                 dataHub.deviceCapabilities.requireCapability(Capability.CELL_LOCK)
-                val success = deviceClient.unlockAllCell()
+                val success = deviceHub.device.unlockAllCell()
                 if (success) {
                     cache?.invalidate("network:cell-info")
                     cache?.invalidate("device:settings")
@@ -612,7 +613,7 @@ class DeviceRoutes(
             // 设备关机
             post("/shutdown") {
                 cache?.invalidate("*")
-                // 走 systemController 而不是直连 deviceClient：goform 失败时要有
+                // 走 systemController 而不是直连 deviceHub.device：goform 失败时要有
                 // `svc power shutdown` 兜底，与 /reboot 同口径
                 val success = systemController.shutdown()
                 call.respond(
@@ -626,7 +627,7 @@ class DeviceRoutes(
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "00:00"
-                val outcome = deviceClient.setRestartSchedule(enabled, time)
+                val outcome = deviceHub.device.setRestartSchedule(enabled, time)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:settings")
@@ -643,7 +644,7 @@ class DeviceRoutes(
                 val dhcpStart = p["dhcp_start"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpEnd = p["dhcp_end"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpLease = p["dhcp_lease"]?.jsonPrimitive?.contentOrNull ?: "86400"
-                val outcome = deviceClient.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+                val outcome = deviceHub.device.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:lan")
@@ -695,7 +696,7 @@ class DeviceRoutes(
                     )
                     if (next != cur) TrafficAutoOffGuard.writeConfig(s, next)
                 }
-                val outcome = networkClient.setDataLimit(
+                val outcome = deviceHub.network.setDataLimit(
                     enabled, limitValue, limitUnit, alertPercent, autoClear, clearDate)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
@@ -720,7 +721,7 @@ class DeviceRoutes(
                 val value = p["value"]?.jsonPrimitive?.contentOrNull
                     ?: (if (target == "time") p["time"] else p["data"])?.jsonPrimitive?.contentOrNull
                     ?: "0"
-                val outcome = networkClient.calibrateFlow(target, value)
+                val outcome = deviceHub.network.calibrateFlow(target, value)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:traffic-limit")
@@ -731,7 +732,7 @@ class DeviceRoutes(
 
             get("/lan-settings") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { getLanSettings() } ?: signalClient.getLanSettings()
+                    val data = (dataHub?.signalQuery { getLanSettings() } ?: signalClient.getLanSettings())?.values
                     return toJsonElement(data ?: emptyMap<String, Any>())
                 }
                 call.respond(if (cache != null) cache.getOrPut("device:lan", CacheTTL.LAN_SETTINGS) { f() } else f())

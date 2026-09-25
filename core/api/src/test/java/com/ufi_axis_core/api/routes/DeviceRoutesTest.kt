@@ -2,8 +2,10 @@ package com.ufi_axis_core.api.routes
 
 import androidx.test.core.app.ApplicationProvider
 import com.ufi_axis_core.contract.ErrorCode
-import com.ufi_axis_core.controller.goform.GoformDeviceClient
 import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.devicespi.adapter.DeviceAdapter
+import com.ufi_axis_core.devicespi.adapter.DeviceControl
+import com.ufi_axis_core.devicespi.adapter.DeviceHub
 import com.ufi_axis_core.util.AppSettings
 import io.ktor.client.request.get
 import io.ktor.client.request.post
@@ -40,8 +42,12 @@ import org.robolectric.annotation.Config
  *   2. 9.5 的三态写结果里 `Rejected` → 400 `OUT_OF_RANGE`（值域被拒，请求根本没发出去）。
  *
  * `RouteContext` 用 relaxed mock：上面两条分支都在触达其它依赖前返回，
- * 需要真值的只有 `settings`（读开关）、`deviceClient`（造 Rejected）与
+ * 需要真值的只有 `settings`（读开关）、`deviceHub.device`（造 Rejected）与
  * `dataHub.deviceCapabilities`（能力门禁，阶段 3 的 3.3）。
+ *
+ * 2026-09-25（批 A2a）：写操作的入口从 `ctx.deviceClient`（`GoformDeviceClient`）换成
+ * `ctx.deviceHub.device`（[DeviceControl]）。这里给的是真 [DeviceHub] 包一个 mock 的
+ * [DeviceAdapter] —— hub 本身只有转发，没必要 mock 掉它。
  *
  * ⚠ 能力集必须显式 stub：relaxed mock 的 `deviceCapabilities` 是**空集**，
  * 那样 `/device/cell-lock` 会先被门禁拦成 501，本类下面两条用例根本走不到写路径。
@@ -52,17 +58,19 @@ import org.robolectric.annotation.Config
 class DeviceRoutesTest {
 
     private lateinit var settings: AppSettings
-    private lateinit var deviceClient: GoformDeviceClient
+    private lateinit var device: DeviceControl
     private lateinit var routes: DeviceRoutes
 
     @Before
     fun setup() {
         settings = AppSettings(ApplicationProvider.getApplicationContext())
         settings.resetAll()
-        deviceClient = mockk(relaxed = true)
+        device = mockk(relaxed = true)
+        val adapter = mockk<DeviceAdapter>(relaxed = true)
+        every { adapter.device } returns device
         val ctx = mockk<RouteContext>(relaxed = true)
         every { ctx.settings } returns settings
-        every { ctx.deviceClient } returns deviceClient
+        every { ctx.deviceHub } returns DeviceHub(adapter)
         // 能力门禁：/device/cell-lock 需要 cell_lock，否则先被拦成 501（见类 KDoc）
         val dataHub = mockk<com.ufi_axis_core.api.DataHub>(relaxed = true)
         every { dataHub.deviceCapabilities } returns
@@ -99,7 +107,7 @@ class DeviceRoutesTest {
 
     @Test
     fun `值域被拒的写操作回 400 OUT_OF_RANGE 并带上原因`() = withRoutes { client ->
-        coEvery { deviceClient.cellLock(any(), any(), any()) } returns
+        coEvery { device.cellLock(any(), any(), any()) } returns
             WriteOutcome.Rejected("pci 必须是 0..1007 的整数")
 
         val res = client.post("/device/cell-lock") {
@@ -115,7 +123,7 @@ class DeviceRoutesTest {
 
     @Test
     fun `设备执行失败沿用 200 加 success false 而不是 400`() = withRoutes { client ->
-        coEvery { deviceClient.cellLock(any(), any(), any()) } returns WriteOutcome.Failed
+        coEvery { device.cellLock(any(), any(), any()) } returns WriteOutcome.Failed
 
         val res = client.post("/device/cell-lock") {
             contentType(ContentType.Application.Json)

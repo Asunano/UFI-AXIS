@@ -4,11 +4,6 @@ import com.ufi_axis_core.api.DataHub
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.GoformDeviceClient
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.goform.GoformSimClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.controller.network.NetworkController
 
 import com.ufi_axis_core.controller.system.SystemController
@@ -16,6 +11,7 @@ import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.devicespi.DeviceTransport
+import com.ufi_axis_core.devicespi.adapter.DeviceHub
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.DynamicThreadPool
 
@@ -46,11 +42,14 @@ data class RouteContext(
 
     // F9 防腐层：以 DeviceTransport 接口暴露（示范迁移，首个调用方）
     val goformClient: DeviceTransport get() = network.goformClient
-    val signalClient: GoformSignalClient get() = network.signalClient
-    val networkClient: GoformNetworkClient get() = network.networkClient
-    val deviceClient: GoformDeviceClient get() = network.deviceClient
-    val wifiClient: GoformWifiClient get() = network.wifiClient
-    val simClient: GoformSimClient get() = network.simClient
+    /**
+     * 集中处理器（2026-09-25 批 A1 立，批 A2a 起 device 域也走它，批 A2b 起 network / wifi 域也走它，
+     * 批 B2 起 signal 域也走它，批 C2 起 WiFi 读侧也走它）。
+     * 上层 route 只认它，不再直接拿 `Goform*Client`。现已迁入的域：
+     * `deviceHub.sim` / `deviceHub.device` / `deviceHub.network` / `deviceHub.wifi` / `deviceHub.signal`
+     * （wifi 域的**读写操作**都走 `deviceHub.wifi`），其余域后续一批一个地迁。
+     */
+    val deviceHub: DeviceHub get() = network.deviceHub
     val networkController: NetworkController get() = network.networkController
 
 
@@ -71,15 +70,31 @@ data class CollectorDeps(
     val atChannel: ATChannel
 )
 
-/** 网络依赖：全部 Goform 客户端 + 网络控制器。 */
+/** 网络依赖：传输层 + 集中处理器 + 网络控制器。 */
 data class NetworkDeps(
     // F9 防腐层：以 DeviceTransport 接口暴露
     val goformClient: DeviceTransport,
-    val signalClient: GoformSignalClient,
-    val networkClient: GoformNetworkClient,
-    val deviceClient: GoformDeviceClient,
-    val wifiClient: GoformWifiClient,
-    val simClient: GoformSimClient,
+    /**
+     * 集中处理器（2026-09-25 批 A1）。替掉了原来的 `simClient: GoformSimClient` ——
+     * 上层只依赖这一个类型，换设备时装配层改一处、route 零改动。
+     *
+     * 批 A2a 起 `deviceClient: GoformDeviceClient` 也被它替掉：device 域整体迁进
+     * `DeviceControl`，`GoformDeviceClient` 没有读方法，所以没有读侧残留要单独留字段。
+     *
+     * 批 A2b 起 `networkClient: GoformNetworkClient` 同理（纯写客户端）。
+     *
+     * 批 B2 起 `signalClient: GoformSignalClient` 也被它替掉：signal 域的 16 个查询方法
+     * 与 `profileId` 一个不剩地迁进了 `SignalSource`（走 `deviceHub.signal`），
+     * **没有读侧残留**。各 Routes 的 `signalClient` 私有 getter
+     * 改成从 `ctx.deviceHub.signal` 取，路由体一行没动。
+     *
+     * 批 C2 起 `wifiClient: GoformWifiClient` 也被它替掉：WiFi 的**读侧**（状态 / 已连客户端 /
+     * 二维码 / 接入控制名单）与 `setAccessControlList` 迁进了 `WifiControl`
+     * （`AclEntry` / `AclSnapshot` 随之落到契约层），所以这里不再留那个字段 ——
+     * 留一个 `deviceHub.wifi` 的等价物就是两份判据。`WifiRoutes` 改成从
+     * `ctx.deviceHub.wifi` 取，端点行为一字未变。
+     */
+    val deviceHub: DeviceHub,
     val networkController: NetworkController
 )
 

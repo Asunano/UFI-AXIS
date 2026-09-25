@@ -2,10 +2,12 @@ package com.ufi_axis_core.api.routes
 
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.controller.notify.LocalSmsChannel
 import com.ufi_axis_core.controller.notify.LocalSmsConfig
 import com.ufi_axis_core.controller.notify.LocalSmsConfigStore
+import com.ufi_axis_core.devicespi.adapter.SendOutcome
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.notify.ChannelRules
 import com.ufi_axis_core.notify.DeliveryAttempt
 import com.ufi_axis_core.notify.DeliveryOutcome
@@ -50,7 +52,7 @@ import org.robolectric.annotation.Config
 class LocalSmsChannelContractTest {
 
     private lateinit var store: LocalSmsConfigStore
-    private lateinit var smsClient: GoformSmsClient
+    private lateinit var smsClient: SmsControl
     private lateinit var channel: LocalSmsChannel
 
     @Before
@@ -85,9 +87,9 @@ class LocalSmsChannelContractTest {
         body = "套餐用量达到上限"
     )
 
-    private fun stubSend(verdict: GoformSmsClient.SendVerdict, detail: String = "d") {
+    private fun stubSend(verdict: SendVerdict, detail: String = "d") {
         coEvery { smsClient.sendSms(any(), any()) } returns
-            GoformSmsClient.SendOutcome(verdict, detail)
+            SendOutcome(verdict, detail)
     }
 
     // ══════════════════ 渠道级常量 ══════════════════
@@ -194,7 +196,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `级别达到门槛时正常投递`() = runBlocking {
         save(minLevel = NotifyLevel.WARNING)
-        stubSend(GoformSmsClient.SendVerdict.SENT)
+        stubSend(SendVerdict.SENT)
 
         assertEquals(DeliveryOutcome.Sent, channel.deliver(event(NotifyLevel.WARNING)).outcome)
 
@@ -207,7 +209,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `受理一条就计一条配额`() = runBlocking {
         save(dailyLimit = 3)
-        stubSend(GoformSmsClient.SendVerdict.SENT)
+        stubSend(SendVerdict.SENT)
 
         channel.deliver(event())
 
@@ -225,7 +227,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `配额耗尽后 hasQuota 报 false`() = runBlocking {
         save(dailyLimit = 2)
-        stubSend(GoformSmsClient.SendVerdict.SENT)
+        stubSend(SendVerdict.SENT)
 
         channel.deliver(event())
         assertTrue("发了 1/2，还有余量", channel.rules!!.hasQuota())
@@ -274,7 +276,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `设备未受理时不计配额且判为可重试`() = runBlocking {
         save()
-        stubSend(GoformSmsClient.SendVerdict.REJECTED, "设备明确拒收")
+        stubSend(SendVerdict.REJECTED, "设备明确拒收")
 
         val outcome = channel.deliver(event()).outcome
 
@@ -292,7 +294,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `拿不到设备表态时计配额且不重试`() = runBlocking {
         save()
-        stubSend(GoformSmsClient.SendVerdict.NO_RESPONSE, "resp=null")
+        stubSend(SendVerdict.NO_RESPONSE, "resp=null")
 
         val attempt = channel.deliver(event())
         val outcome = attempt.outcome
@@ -307,7 +309,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `设备侧发送失败计配额且不重试`() = runBlocking {
         save()
-        stubSend(GoformSmsClient.SendVerdict.FAILED, "信箱 tag=3")
+        stubSend(SendVerdict.FAILED, "信箱 tag=3")
 
         val outcome = channel.deliver(event()).outcome
 
@@ -329,7 +331,7 @@ class LocalSmsChannelContractTest {
     @Test
     fun `投递结果里带出本次的配额结算`() = runBlocking {
         save(dailyLimit = 5)
-        stubSend(GoformSmsClient.SendVerdict.SENT)
+        stubSend(SendVerdict.SENT)
 
         val attempt = channel.deliver(event())
         val diagnostics = attempt.diagnostics as LocalSmsChannel.Attempt

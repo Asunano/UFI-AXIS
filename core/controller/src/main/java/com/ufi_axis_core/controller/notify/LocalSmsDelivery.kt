@@ -1,6 +1,7 @@
 package com.ufi_axis_core.controller.notify
 
-import com.ufi_axis_core.controller.goform.GoformSmsClient
+import com.ufi_axis_core.devicespi.adapter.SendOutcome
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
 import com.ufi_axis_core.notify.DeliveryOutcome
 import com.ufi_axis_core.notify.NotifyLevel
 
@@ -120,7 +121,7 @@ internal object LocalSmsDelivery {
     // ══════════ 发送结论映射 ══════════
 
     /**
-     * `GoformSmsClient.SendOutcome` → [DeliveryOutcome]。**分发器唯一的重试判据来源。**
+     * [SendOutcome] → [DeliveryOutcome]。**分发器唯一的重试判据来源。**
      *
      * | 固件结论 | 结果 | 计配额 | 为什么 |
      * |---|---|---|---|
@@ -147,19 +148,19 @@ internal object LocalSmsDelivery {
      * `NO_RESPONSE` 刻意站在另一侧：不可重试（避免重复计费）**且**计配额 ——
      * 它可能真的发出去了，漏计会让实际发送条数超过用户设的每日上限，宁可少发一条。
      */
-    fun classify(outcome: GoformSmsClient.SendOutcome): DeliveryOutcome = when (outcome.verdict) {
-        GoformSmsClient.SendVerdict.SENT -> DeliveryOutcome.Sent
-        GoformSmsClient.SendVerdict.FAILED ->
+    fun classify(outcome: SendOutcome): DeliveryOutcome = when (outcome.verdict) {
+        SendVerdict.SENT -> DeliveryOutcome.Sent
+        SendVerdict.FAILED ->
             DeliveryOutcome.Failed("设备侧发送失败：${outcome.detail}", retryable = false)
-        GoformSmsClient.SendVerdict.PENDING -> DeliveryOutcome.Failed(
+        SendVerdict.PENDING -> DeliveryOutcome.Failed(
             "设备未回报最终状态，可能已发出，不会自动重发：${outcome.detail}",
             retryable = false
         )
-        GoformSmsClient.SendVerdict.NO_RESPONSE -> DeliveryOutcome.Failed(
+        SendVerdict.NO_RESPONSE -> DeliveryOutcome.Failed(
             "无法确认设备是否已发出，不会自动重发：${outcome.detail}",
             retryable = false
         )
-        GoformSmsClient.SendVerdict.REJECTED ->
+        SendVerdict.REJECTED ->
             DeliveryOutcome.Failed("设备明确拒收：${outcome.detail}", retryable = true)
     }
 
@@ -175,8 +176,8 @@ internal object LocalSmsDelivery {
      * 而 `REJECTED` 恰好是 [classify] 里唯一可重试的一档，于是**重试永远不会重复扣配额**。
      * 这条互斥关系是配额这道刹车的正确性前提，改任一侧都必须同时改另一侧。
      */
-    fun countsTowardQuota(outcome: GoformSmsClient.SendOutcome): Boolean =
-        outcome.verdict != GoformSmsClient.SendVerdict.REJECTED
+    fun countsTowardQuota(outcome: SendOutcome): Boolean =
+        outcome.verdict != SendVerdict.REJECTED
 
     /** 异常摊平成一行（含根因）。口径同 [WebhookDelivery.describeFailure]。 */
     fun describeFailure(e: Throwable): String {

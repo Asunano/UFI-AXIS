@@ -1,6 +1,7 @@
 package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.deviceschema.FieldGroup
+import com.ufi_axis_core.deviceschema.FieldNormalizer
 import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -97,9 +98,13 @@ class GoformNormalizeAlwaysTest {
     @Test
     fun `关掉归一化后 TRAFFIC_LIMIT 仍然输出 canonical 键`() {
         val warn = WarnSink()
+        // 批 B1：`normalize()` 现在返回 NormalizedFields（「过了归一化层」的类型化凭据），
+        // 这里 `.values` 解包成 JsonObject —— 下面每一条断言都**一字未改**，
+        // 那正是「只换中间传的类型、对外 JSON 一个字节不变」的可执行证据。
         val out = checkNotNull(
             mapperWithNormalizationOff(warn).normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)
-        )
+        ).values
+
 
         assertEquals("开关关掉也必须给 canonical 的 enabled", JsonPrimitive("1"), out["enabled"])
         assertEquals(JsonPrimitive("0"), out["auto_clear"])
@@ -139,8 +144,8 @@ class GoformNormalizeAlwaysTest {
     @Test
     fun `豁免路径的输出与开着归一化逐字一致`() {
         val warn = WarnSink()
-        val off = mapperWithNormalizationOff(warn).normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)
-        val on = mapperWithNormalizationOn().normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)
+        val off = mapperWithNormalizationOff(warn).normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)?.values
+        val on = mapperWithNormalizationOn().normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)?.values
         assertEquals("豁免引入了第二种行为 —— 排障模式与正常模式的流量出口必须逐字同形", on, off)
     }
 
@@ -168,7 +173,7 @@ class GoformNormalizeAlwaysTest {
             put("wifi_chip1_ssid1_ssid", "UFI-AXIS")
             put("wifi_chip1_ssid1_max_sta_num", "10")
         }
-        val wifiOut = mapper.normalize(FieldGroup.WIFI_SETTINGS, wifiRaw)
+        val wifiOut = mapper.normalize(FieldGroup.WIFI_SETTINGS, wifiRaw)?.values
         assertSame("WIFI_SETTINGS 必须原样透传（同一个对象）", wifiRaw, wifiOut)
         assertTrue("设备原名必须还在 —— 这就是排障开关的用途", wifiOut!!.containsKey("wifi_chip1_ssid1_ssid"))
         assertFalse("不该冒出 canonical 键", wifiOut.containsKey("ssid"))
@@ -177,7 +182,7 @@ class GoformNormalizeAlwaysTest {
             put("Lte_pci", "123")
             put("lte_rsrp", "-95")
         }
-        val cellOut = mapper.normalize(FieldGroup.CELL_INFO, cellRaw)
+        val cellOut = mapper.normalize(FieldGroup.CELL_INFO, cellRaw)?.values
         assertSame("CELL_INFO 必须原样透传（同一个对象）", cellRaw, cellOut)
 
         assertTrue("非豁免组不该打豁免 WARN：${warn.lines}", warn.lines.isEmpty())
@@ -199,7 +204,7 @@ class GoformNormalizeAlwaysTest {
             if (group == FieldGroup.TRAFFIC_LIMIT) continue
             assertSame(
                 "$group 跟着豁免了 —— 排障开关在这一组上失去了可观察效果",
-                probe, mapper.normalize(group, probe),
+                probe, mapper.normalize(group, probe)?.values,
             )
         }
         assertTrue("一组都没豁免时不该有任何 WARN，实际：${warn.lines}", warn.lines.isEmpty())
@@ -281,4 +286,52 @@ class GoformNormalizeAlwaysTest {
             dump, mapperWithNormalizationOff(warn).maskDump(dump),
         )
     }
+
+    // ─────────── 5. 批 B1：换类型没换内容 ───────────
+
+    /**
+     * 端到端：`normalize()` 的产出**解包后**与直接调 `FieldNormalizer.normalize()` **逐字节一致**。
+     *
+     * 这条是批 B1 的验收判据本体 —— 那一批只把「中间传的类型」从裸 `JsonObject?` 换成
+     * `NormalizedFields?`，最终序列化出去的内容必须一个字节都不变。
+     *
+     * 为什么连 `toString()` 都比一遍：`JsonObject` 是 `Map`，`equals` 只比内容**不比键序**，
+     * 而对外 JSON 的字节序列取决于插入顺序（`limit_value` 在 `limit_bytes` 前面还是后面，
+     * 前端不 care，但「一个字节都不能变」这句话 care）。两条一起断言才真的钉住"逐字节"。
+     */
+    @Test
+    fun `解包后的内容与直接调 FieldNormalizer 逐字节一致`() {
+        val expected = FieldNormalizer.normalize(
+            trafficRaw,
+            ZteGoformProfile,
+            FieldGroup.TRAFFIC_LIMIT,
+            FieldNormalizer.LegacyAliases.DROP,
+        )
+        val actual = checkNotNull(
+            mapperWithNormalizationOn().normalize(FieldGroup.TRAFFIC_LIMIT, trafficRaw)
+        ).values
+
+        assertEquals("解包后的字段集合变了 —— 对外 JSON 已经不是同一份", expected, actual)
+        assertEquals("键序变了 → 序列化出去的字节序列变了", expected.toString(), actual.toString())
+    }
+
+    /**
+     * 透传分支解包后是**同一个对象**（不是内容相等的拷贝）。
+     *
+     * 钉的是 `NormalizedFields` 的语义边界：它保证「过了归一化闸门」，**不保证**字段名是
+     * canonical —— 排障开关关掉时闸门原样透传，包在里面的就是设备那个实例。
+     * 哪天有人把透传分支改成「复制一份 / 顺手清理一下键」，这条会红，而那正是行为变更。
+     */
+    @Test
+    fun `透传分支包着的就是设备原始那个对象`() {
+        val warn = WarnSink()
+        val raw = buildJsonObject { put("Lte_pci", "123") }
+        val out = checkNotNull(mapperWithNormalizationOff(warn).normalize(FieldGroup.CELL_INFO, raw))
+        assertSame("透传分支必须原样包住入参实例 —— 类型只是凭据，不改数据", raw, out.values)
+        assertTrue(
+            "设备原名必须还在：NormalizedFields 的语义是「过了闸门」，不是「一定 canonical」",
+            out.values.containsKey("Lte_pci"),
+        )
+    }
 }
+

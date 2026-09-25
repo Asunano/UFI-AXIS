@@ -2,12 +2,12 @@ package com.ufi_axis_core.collector.signal
 
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.contract.DeviceFields
-import com.ufi_axis_core.controller.goform.GoformSignalClient
 import com.ufi_axis_core.core.database.SignalRecord
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
 import com.ufi_axis_core.deviceschema.FieldNormalizer
 import com.ufi_axis_core.deviceschema.ServingCell
+import com.ufi_axis_core.devicespi.adapter.SignalSource
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
@@ -36,9 +36,25 @@ import kotlinx.serialization.json.jsonPrimitive
  *
  * 输出的 key 一律是 `DeviceFields.Signal` 的 canonical 名（core 自有小写归一名，
  * **不是**设备原名），WS `signal` 频道与 REST 共用同一份，一个都不能改。
+ *
+ * ## 取数口是域接口，第 1 层映射仍在本类（批 B2）
+ *
+ * 构造参数收的是 [SignalSource]（`:core:device-spi`）而不是 `GoformSignalClient` ——
+ * 本类不再认识任何具体协议。但**第 1 层的字段映射没有跟着搬到实现侧**：它留在这里，
+ * 拿 [profile] 自己调 [FieldNormalizer]。这是与其它五个域相反的不对称，
+ * 三条理由记在 [SignalSource] 的类 KDoc 里（简言之：搬走会把三层编排拆开，
+ * 而 profile 本来就是按设备一份的，所以这个形状对第二台设备同样成立）。
  */
 class SignalCollector(
-    private val signalClient: GoformSignalClient?,
+    /**
+     * signal 域的设备适配接口（2026-09-25 批 B2 起是 [SignalSource]，原来是
+     * `GoformSignalClient` —— 那是 `:core:collector` 对 `:core:goform` 的最后一根类型绑带）。
+     *
+     * **仍然可空**：可空表达的是「装配层没给取数口」（本类的三层里 goform 那两层直接跳过、
+     * 走 Telephony 兜底），改成非空会让 `DataScheduler` 那条默认 null 的参数链一起变形 ——
+     * 那不是本批的事。
+     */
+    private val signalClient: SignalSource?,
     private val telephonyCollector: TelephonyCollector,
     /**
      * 字段映射表。**非空、无默认值** —— 2026-09-25 去掉了原来的 `= ZteGoformProfile`。

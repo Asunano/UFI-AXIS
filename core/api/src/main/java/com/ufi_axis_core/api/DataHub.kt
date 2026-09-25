@@ -2,11 +2,11 @@ package com.ufi_axis_core.api
 
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.DeviceFields
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
 import com.ufi_axis_core.core.cache.CacheTTL
 import com.ufi_axis_core.core.cache.ResponseCache
 import com.ufi_axis_core.core.scheduler.DataScheduler
+import com.ufi_axis_core.devicespi.adapter.SignalSource
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.util.AppLogger
 import kotlinx.serialization.json.*
 
@@ -33,7 +33,7 @@ import kotlinx.serialization.json.*
  * dataHub.getNetworkTypeInfo()    // 30s TTL，跨路由共享
  * dataHub.getWifiSettingsMerged() // ResponseCache，30s TTL
  *
- * // 无缓存透传 — signalQuery {} 直接代理到 GoformSignalClient
+ * // 无缓存透传 — signalQuery {} 直接代理到 SignalSource（批 B2 起是域接口，原来是 GoformSignalClient）
  * dataHub.signalQuery { getCellInfo() }
  * dataHub.signalQuery { getFullStatus() }
  *
@@ -53,6 +53,14 @@ import kotlinx.serialization.json.*
  *    canonical 取 `DeviceFields` 常量（没有就先加，新键用 `snake_case`）。
  * 2. **归一化在设备客户端层做**，不在 route 层：`GoformSignalClient` / `GoformWifiClient`
  *    对外返回的就是 canonical 数据。这样本类和 `ResponseCache` 缓存到的天然是 canonical。
+ *
+ *    ⚠ **这条纪律有一个已登记的例外：signal 域的第 1 层字段映射在消费方。**
+ *    `SignalCollector`（WS `signal` 频道与 `/api/network/signal` 的数据来源）拿
+ *    `DeviceProfile` 自己做设备原名 → canonical 的映射，而
+ *    [SignalSource.getSignalInfo] 出来的是**设备原始响应**。理由（三条）与它为什么不是
+ *    「纪律没落实」写在 [SignalSource] 的类 KDoc 里 —— 简言之：那一层与「PCI 匹配邻区」
+ *    「Telephony 兜底」两层是同一段编排，需要原始响应与归一化结果同时在场。
+ *    纪律本身不变：**除这一处以外**，读侧归一化仍然只许发生在设备客户端 / 适配实现侧。
  * 3. **需要缓存** → 在本类加专用方法，TTL 选 `CacheTTL` 常量；**跨路由共享** →
  *    `ResponseCache.getOrPut` / `getOrPutAny`。形状统一为
  *    `cache.getOrPut(key, ttl) { client.getXxx() }`（客户端已归一化，缓存不做转换）。
@@ -66,7 +74,8 @@ import kotlinx.serialization.json.*
  *
  * `/api/diagnose` 的 `device_profile` 块要的三样东西都从本类取：
  * [deviceProfileId]（生效中的可空 profile id）、[devicePluginId]、[deviceSelection]。
- * 前者是既有链路（来自 `GoformSignalClient.profileId`），后两个是阶段 2 的 2.8 新加的。
+ * 前者是既有链路（来自 [SignalSource.profileId]，goform 系那份最终读的是
+ * `GoformFieldMapper.profileId`），后两个是阶段 2 的 2.8 新加的。
  *
  * 后两个**刻意只传两个不可变的 String**，而不是把装配层的 `DeviceRuntime` 整个塞进来：
  *
@@ -86,8 +95,12 @@ import kotlinx.serialization.json.*
  */
 class DataHub(
     private val scheduler: DataScheduler,
-    private val signalClient: GoformSignalClient,
-    private val wifiClient: GoformWifiClient,
+    /**
+     * signal 域的设备适配接口（2026-09-25 批 B2 起是 [SignalSource]，原来是
+     * `GoformSignalClient`）。装配层传 `deviceHub.signal`，本类不再认识具体协议客户端。
+     */
+    private val signalClient: SignalSource,
+    private val wifiClient: WifiControl,
     private val responseCache: ResponseCache,
     /**
      * 选中插件的 id（如 `zte-f50`）。**恒非空**：认不出设备也会回落到默认插件。
@@ -157,7 +170,7 @@ class DataHub(
         return responseCache.getOrPutAny("hub:network-type-info", 30_000L) {
             val canon = try {
                 kotlinx.coroutines.withTimeout(5_000L) {
-                    signalClient.getConnectionInfo()
+                    signalClient.getConnectionInfo()?.values
                 }
             } catch (_: Exception) {
                 AppLogger.w("DataHub", "goform network-type-info query timeout")
@@ -185,7 +198,7 @@ class DataHub(
         // 命中负缓存（空对象）时直接返回 null，不重打设备
         if (cached is JsonObject) return cached.takeIf { it.isNotEmpty() }
 
-        val fresh = signalClient.getDeviceIdentity()?.takeIf { it.isNotEmpty() }
+        val fresh = signalClient.getDeviceIdentity()?.values?.takeIf { it.isNotEmpty() }
         if (fresh == null) {
             responseCache.put("device:identity", JsonObject(emptyMap()), IDENTITY_NEGATIVE_TTL_MS)
             return null
@@ -203,7 +216,7 @@ class DataHub(
      */
     suspend fun getTrafficLimit(): JsonObject? {
         val result = responseCache.getOrPut("hub:traffic-limit", 10_000L) {
-            signalClient.getDataUsage() ?: JsonObject(emptyMap())
+            signalClient.getDataUsage()?.values ?: JsonObject(emptyMap())
         }
         return result as? JsonObject
     }
@@ -211,14 +224,14 @@ class DataHub(
     /**
      * [ResponseCache 30s] WiFi 设置。
      *
-     * 合并 + 归一化都在 [GoformWifiClient.getWifiSettingsMerged] 里（设备客户端层），
+     * 合并 + 归一化都在 [WifiControl.getWifiSettingsMerged] 里（设备适配实现侧），
      * 这里只负责缓存 —— 所以缓存里存的已经是 canonical 数据。
      * 原先这里还有一份 `processModuleInfo` 把 ZTE 原生键改写成 goform 扁平键，
      * 那是第二份映射表，已迁进 `ZteGoformProfile.liftActiveAccessPoint`。
      */
     suspend fun getWifiSettingsMerged(): JsonObject {
         val result = responseCache.getOrPut("wifi:settings", CacheTTL.WIFI_SETTINGS) {
-            wifiClient.getWifiSettingsMerged()
+            wifiClient.getWifiSettingsMerged().values
         }
         return result as JsonObject
     }
@@ -228,7 +241,7 @@ class DataHub(
     // ═══════════════════════════════════════════════════════════
 
     /**
-     * 统一 goform 信号查询入口 — 直接代理到 [GoformSignalClient]。
+     * 统一信号查询入口 — 直接代理到 [SignalSource]。
      *
      * 用法：
      * ```kotlin
@@ -242,26 +255,38 @@ class DataHub(
      * getDeviceInfo, getDeviceVersion,
      * getCellInfo, getNeighborCellInfo, getDataUsage,
      * getBandLockStatus, queryDeviceSettings
+     *
+     * 批 B1：本方法是**泛型透传**，不需要改 —— 已归一化的那几个客户端方法现在返回
+     * `NormalizedFields`（`:core:device-schema`），[T] 原样把它带出来。调用点用 `.values`
+     * 解包成 `JsonObject` 再序列化，**解包后的内容与改造前逐字一致**。
+     * 哪些方法有这个保证、哪些仍是裸 `JsonObject?`（原样透传），看
+     * [SignalSource] 的类 KDoc 与各方法签名。
+     *
+     * 批 B2：receiver 从具体类 `GoformSignalClient` 换成域接口 [SignalSource] ——
+     * 这是接缝上最后一处「泛型透传却把具体类当 receiver」的硬绑带。方法名一个没改，
+     * 所以全部 16 处调用点零改动；换设备时这里也不用再动。
      */
 
-    suspend fun <T> signalQuery(block: suspend GoformSignalClient.() -> T): T = signalClient.block()
+    suspend fun <T> signalQuery(block: suspend SignalSource.() -> T): T = signalClient.block()
 
     /**
-     * 统一 WiFi 查询入口 — 直接代理到 [GoformWifiClient]。
+     * 统一 WiFi 查询入口 — 直接代理到 [WifiControl]。
      *
      * 用法：
      * ```kotlin
      * val clients = dataHub.wifiQuery { getConnectedClients() }
      * ```
      */
-    suspend fun <T> wifiQuery(block: suspend GoformWifiClient.() -> T): T = wifiClient.block()
+    suspend fun <T> wifiQuery(block: suspend WifiControl.() -> T): T = wifiClient.block()
 
     /**
      * 字段覆盖率诊断（计划书 10.1）。
      *
      * 之所以在 DataHub 上开这个方法而不是让上层直接调 `signalClient`：`:core:network`
-     * （`/api/diagnose` 的落地处）不依赖 `:core:goform`，`GoformSignalClient` 这个类型
-     * 在那边不可见。返回 `JsonObject` 就没有跨模块可见性问题。
+     * （`/api/diagnose` 的落地处）不依赖 `:core:goform`，批 B2 之前 `GoformSignalClient`
+     * 这个类型在那边不可见。返回 `JsonObject` 就没有跨模块可见性问题
+     * （批 B2 之后 receiver 已是协议无关的 [SignalSource]，但本方法的形状不动：
+     * 上层要的是一份报告，不是一个域接口）。
      *
      * **按需调用**：内部会逐分组向设备发查询。
      */

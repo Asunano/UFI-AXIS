@@ -6,9 +6,9 @@ import com.ufi_axis_core.collector.system.CpuInfoLite
 import com.ufi_axis_core.collector.system.MemoryInfo
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.deviceschema.DeviceProfile
+import com.ufi_axis_core.devicespi.adapter.SignalSource
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.core.database.AppDatabase
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -125,8 +125,8 @@ class DataScheduler(
      * 跳过它们不改变任何一个下发字段，所以与「按系统值显示」的要求不冲突。
      */
     private val batteryDeclared: Boolean,
-    private val signalClient: GoformSignalClient? = null,
-    private val smsClient: GoformSmsClient? = null,
+    private val signalClient: SignalSource? = null,
+    private val smsClient: SmsControl? = null,
     private val alertEngine: com.ufi_axis_core.alert.AlertEngine? = null,
     private val dynamicThreadPool: DynamicThreadPool = DynamicThreadPool(),
     private val wakeLockRenew: (() -> Unit)? = null,

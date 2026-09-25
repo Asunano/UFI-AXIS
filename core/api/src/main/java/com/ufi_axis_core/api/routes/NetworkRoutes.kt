@@ -29,8 +29,11 @@ class NetworkRoutes(
     private val networkController get() = ctx.networkController
     private val database get() = ctx.database
     private val goformClient get() = ctx.goformClient
-    private val signalClient get() = ctx.signalClient
-    private val networkClient get() = ctx.networkClient
+    // 批 B2 起走 signal 域的设备适配接口（原来是 ctx.signalClient = GoformSignalClient）。
+    // 名字刻意不改：路由体里的调用点一行没动，方法名与语义逐字相同。
+    private val signalClient get() = ctx.deviceHub.signal
+    // 批 A2b 起走 network 域的设备适配接口（原来是 ctx.networkClient = GoformNetworkClient）。
+    private val network get() = ctx.deviceHub.network
     private val dataScheduler get() = ctx.dataScheduler
     private val cache get() = ctx.responseCache
     private val dataHub get() = ctx.dataHub
@@ -121,7 +124,7 @@ class NetworkRoutes(
                 }
                 val result = cache!!.getOrPut("network:band-status", CacheTTL.BAND_STATUS) {
                     // getBandLockStatus() 已归一化（计划书 1.1），这里读的是 canonical key
-                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient?.getBandLockStatus()) ?: JsonObject(emptyMap())
+                    val data = (dh?.signalQuery { getBandLockStatus() } ?: signalClient?.getBandLockStatus())?.values ?: JsonObject(emptyMap())
                     toJsonElement(mapOf(
                         DeviceFields.BandStatus.LTE_BAND_LOCK to
                             (data[DeviceFields.BandStatus.LTE_BAND_LOCK]?.jsonPrimitive?.contentOrNull ?: ""),
@@ -193,7 +196,7 @@ class NetworkRoutes(
                 // 域内所有写入口都必须被同一个门禁覆盖，漏一个就等于留了一条绕过门禁的路。
                 // 判据不是「这条设备命令拦过了没有」，而是「这台设备支不支持这个功能域」。
                 dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
-                val client = networkClient
+                val client = network
                 if (client == null) {
                     // 通道不可用 → 503（可重试）。
                     // 这里原先还有一行「AT+ZPREFMOD 在此设备不支持」的注释：那句话描述的是
@@ -243,7 +246,7 @@ class NetworkRoutes(
                 // 「同一条设备命令只拦一次」在这里不成立：拦的不是命令（这两个端点确实共用
                 // SET_BEARER_PREFERENCE），而是**这台设备支不支持「切换网络制式」这个功能域**。
                 dataHub.deviceCapabilities.requireCapability(Capability.NETWORK_MODE)
-                val client = networkClient
+                val client = network
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "设备后台通道不可用，无法切换承载偏好")
@@ -266,7 +269,7 @@ class NetworkRoutes(
 
             // 连接网络 (拨号)
             post("/connect") {
-                val client = networkClient
+                val client = network
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "Goform client not available")
@@ -282,7 +285,7 @@ class NetworkRoutes(
 
             // 断开网络
             post("/disconnect") {
-                val client = networkClient
+                val client = network
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "Goform client not available")
@@ -298,7 +301,7 @@ class NetworkRoutes(
 
             // 连接模式 (手动/自动)
             post("/connection-mode") {
-                val client = networkClient
+                val client = network
                 if (client == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "Goform client not available")
@@ -337,7 +340,7 @@ class NetworkRoutes(
                     return@get
                 }
                 val result = cache!!.getOrPut("network:cell-info", CacheTTL.CELL_INFO) {
-                    val cellInfo = dh?.signalQuery { getCellInfo() } ?: signalClient?.getCellInfo()
+                    val cellInfo = (dh?.signalQuery { getCellInfo() } ?: signalClient?.getCellInfo())?.values
                     toJsonElement(cellInfo ?: emptyMap<String, Any>())
                 }
                 call.respond(result)
