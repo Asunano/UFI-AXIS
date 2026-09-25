@@ -9,7 +9,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import com.ufi_axis.ui.components.common.UfiSectionHeader
 import com.ufi_axis.ui.components.common.UfiSettingsItem
 import com.ufi_axis.ui.components.common.UfiSettingsRowCard
 import com.ufi_axis.ui.components.common.UfiSettingsValue
@@ -26,10 +25,15 @@ import com.ufi_axis.viewmodel.MainViewModel
  * 这正是本轮起因（视频设置页没跟上音乐页的形态调整）。图片页设置将来落地时直接用这个，
  * 所以 [type] 是参数而不是写死的两个分支。
  *
- * ## 为什么两行各占一张卡
+ * ## 为什么两行各占一张卡、且不带区块标题
  * 「扫描目录」是**配置**（点开选目录），「重新扫描」是**动作**（点一下就发请求给设备），
  * 两者只是同属一个话题，并不是一件事的两个面。全站标准设置页（外观 / 告警 / 后台守护 /
  * 监控）自 2026-09-08 起都是一项一卡，这里跟着走，页面的卡片节奏才和别处一致。
+ *
+ * 这一组原来在两张卡上方挂了一个 `UfiSectionHeader("扫描范围")`。2026-09-22 按用户要求撤掉：
+ * **卡外标题一律不要**。两张卡自己的标题（"扫描目录" / "重新扫描"）已经说清了是什么，
+ * 再压一行"扫描范围"只是把同一件事说两遍，还在卡片节奏上多插了 8dp 的断点。
+ * 不要改成 `UfiGroupHeader` 塞进卡里 —— 那会把两项并成一张卡，退回已被否掉的分区形态。
  *
  * @param type core 侧的媒体类型标识（`MEDIA_TYPE_AUDIO` / `_VIDEO` / `_IMAGE`）。
  *   扫描目录在 core 是**按类型各存一份**的，所以三页改的是三份互不影响的配置。
@@ -50,7 +54,6 @@ internal fun MediaScanScopeSection(
 
     var showDirPicker by remember { mutableStateOf(false) }
 
-    UfiSectionHeader(title = "扫描范围")
     UfiSettingsRowCard {
         UfiSettingsValue(
             title = "扫描目录",

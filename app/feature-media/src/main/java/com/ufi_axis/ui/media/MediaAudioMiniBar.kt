@@ -161,7 +161,11 @@ internal fun MediaAudioMiniBar(
                 positionMs = UfiNowPlayingState.positionMs.value,
                 onSeek = { controller.seekTo(it) },
                 compact = true,
-                sharedKey = UFI_SHARED_KEY_AUDIO_SEEK
+                sharedKey = UFI_SHARED_KEY_AUDIO_SEEK,
+                // 换歌时已播段平滑过去而不是瞬移。这条通栏轨道横跨整屏，
+                // 瞬间弹回 0 比播放页那根更显眼。用 mediaId（= 文件路径）当标识，
+                // 这里拿不到播放页那个 MediaLibraryItem.id。
+                trackKey = UfiNowPlayingState.mediaId.value
             )
 
 
@@ -297,7 +301,7 @@ internal fun MediaAudioMiniBar(
                  * 两者任一再缩都是在没有必要的地方降标准。
                  */
                 IconButton(
-                    onClick = { controller.seekToPreviousMediaItem() },
+                    onClick = { controller.ufiSkipToPrevious() },
                     enabled = hasPrev,
                     modifier = Modifier
                         .size(MINI_BAR_BUTTON_SIZE)
@@ -327,7 +331,7 @@ internal fun MediaAudioMiniBar(
                     )
                 }
                 IconButton(
-                    onClick = { controller.seekToNextMediaItem() },
+                    onClick = { controller.ufiSkipToNext() },
                     enabled = hasNext,
                     modifier = Modifier
                         .size(MINI_BAR_BUTTON_SIZE)

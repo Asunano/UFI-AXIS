@@ -334,6 +334,34 @@ interface UfiAxisApi {
         @Body body: PlaylistPathsRequest
     ): JsonElement
 
+    // ========== 从音乐库移除 / 删除文件（2026-09-23）==========
+    //
+    // 两件事刻意分成两个接口，**不要**合成一个带 mode 参数的：
+    // 一个可撤销（只改名单）、一个不可逆（删磁盘上的字节）。合在一起迟早有客户端传错那个参数。
+
+    /**
+     * 当前「从音乐库移除」的路径名单。
+     *
+     * 给管理页用 —— 没有这个页面就不该放开排除功能，误操作无法恢复。
+     * 响应里的 `max` / `full` 是硬上限（名单会变成 SQL 的 `NOT IN (?,…)`，绑定变量有限），
+     * 客户端据此提前提示，而不是让用户点了才发现没生效。
+     */
+    @GET("api/media/excluded")
+    suspend fun getExcludedMedia(): MediaExcludedResponse
+
+    /**
+     * 加入 / 移出排除名单。**只改名单，永远不动文件。**
+     *
+     * `action`：`add` / `remove` / `clear`（`clear` 时 `paths` 可为空）。
+     * 返回的 `affected` 小于 `requested` 说明撞上了上限被截断。
+     */
+    @POST("api/media/exclude")
+    suspend fun excludeMedia(@Body body: MediaExcludeRequest): MediaExcludeResponse
+
+    // 删除文件走的是既有的 `deleteFile(Map<String, String>)`（本文件下方文件管理那一段）——
+    // `POST /api/files/delete` 只有一条，不为音乐库再开一个同路径的重载：那样两处签名迟早分叉。
+    // 没有「所有文件访问权限」时 core 回 403 + `needsAllFilesAccess`，调用方按状态码引导授权。
+
     // ========== Weather（2026-09-17，core 代理 Open-Meteo）==========
 
     /**

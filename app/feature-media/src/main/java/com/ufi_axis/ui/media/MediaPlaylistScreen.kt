@@ -77,7 +77,10 @@ fun MediaPlaylistScreen(
         onDispose { media.clearPlaylistItems(id) }
     }
 
-    /** 长按选中、等待确认移出的那一首。null = 没有待确认的操作。 */
+    /** 长按选中、待弹动作表的那一首。null = 不显示（见 MediaTrackActionHost）。 */
+    var actionTarget by remember { mutableStateOf<MediaLibraryItem?>(null) }
+
+    /** 已从动作表选了「移出歌单」、等待确认的那一首。null = 没有待确认的操作。 */
     var pendingRemove by remember { mutableStateOf<MediaLibraryItem?>(null) }
 
     /*
@@ -200,7 +203,10 @@ fun MediaPlaylistScreen(
                                 )
                             )
                         },
-                        onLongClick = { pendingRemove = it }
+                        // 长按 = 动作表。2026-09-23 之前这里直接弹「移出歌单」确认框，
+                        // 现在「移出歌单」只是表里的一项（仍然带确认，见下方 pendingRemove）
+                        onLongClick = { actionTarget = it }
+
                     )
                 }
             }
@@ -218,7 +224,20 @@ fun MediaPlaylistScreen(
         }
     }
 
+    MediaTrackActionHost(
+        viewModel = viewModel,
+        target = actionTarget,
+        // 歌单内：多一项「移出歌单」
+        actionsOf = {
+            mediaTrackActionsFor(it, inPlaylist = true, canEditLibrary = true, canPlayNext = true)
+        },
+        onDone = { actionTarget = null },
+        // 仍然过一道确认：移出歌单是"改了用户自己编的东西"，误触的代价是要重新找回那首歌
+        onRemoveFromPlaylist = { pendingRemove = it }
+    )
+
     pendingRemove?.let { item ->
+
         UfiConfirmDialog(
             title = "移出歌单",
             text = "把「${audioDisplayTitle(item)}」从这个歌单里移出？文件本身不会被删除。",

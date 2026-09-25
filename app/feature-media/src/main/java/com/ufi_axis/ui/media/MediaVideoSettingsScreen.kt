@@ -31,7 +31,6 @@ import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiCompactProgressBar
 import com.ufi_axis.ui.components.common.UfiPageBackground
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
-import com.ufi_axis.ui.components.common.UfiSectionHeader
 import com.ufi_axis.ui.components.common.UfiSettingsChevron
 import com.ufi_axis.ui.components.common.UfiSettingsItem
 import com.ufi_axis.ui.components.common.UfiSettingsRowCard
@@ -59,6 +58,13 @@ import kotlinx.coroutines.launch
  *
  * 本页一处 `UfiSettingsGroup`（多项一卡）都不留：用户反馈明确说分区组件不美观，
  * 而"同一件事的两个面"这种理由在界面上看不出来，只体现在代码注释里。
+ *
+ * 同理，2026-09-22 起本页**卡外区块标题（`UfiSectionHeader`）一处不留**。原来有四个
+ * （视频封面 / 批量生成封面 / 下载到手机 / 其他），加上共用件带的"扫描范围"共五行；
+ * 它们只是把下面那张卡的 `title` 换个说法再说一遍，还各自在卡片节奏上插了 8dp 的断点。
+ * 撤掉之后信息没有丢：少数原本靠区块标题才说得清的行，标题自己补全了
+ * （"落点目录" → "下载落点目录"，"为缺封面的视频抽帧" → "…批量抽帧"）。
+ * 不要改用 `UfiGroupHeader` 挪进卡里 —— 那等于退回多项一卡的分区形态。
  *
  * ## 清单型内容一律另开页面
  * 下载队列与下载历史都搬去了 [MediaVideoDownloadHistoryScreen]。判据是**条数是否固定**：
@@ -121,7 +127,6 @@ fun MediaVideoSettingsScreen(
             )
 
             // ── 缩略图 ──
-            UfiSectionHeader(title = "视频封面")
             /*
              * 抽帧开关与封面缓存曾经合在一张卡里（理由是"同一件事的两个面"）。
              * 那个理由只在代码里成立：界面上它们一个是开关、一个带清空按钮，
@@ -201,10 +206,9 @@ fun MediaVideoSettingsScreen(
             )
 
             // ── 下载 ──
-            UfiSectionHeader(title = "下载到手机")
             UfiSettingsRowCard {
                 UfiSettingsItem(
-                    title = "落点目录",
+                    title = "下载落点目录",
                     description = "内部存储 / ${MediaDownloadQueue.RELATIVE_DIR}" +
                         "（源目录结构会原样带上，同名文件不会互相覆盖）",
                     icon = Icons.Default.Download
@@ -231,7 +235,6 @@ fun MediaVideoSettingsScreen(
             }
 
             // ── 最近播放 ──
-            UfiSectionHeader(title = "其他")
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     title = "最近播放",
@@ -257,11 +260,14 @@ fun MediaVideoSettingsScreen(
 }
 
 /**
- * 批量生成缩略图 —— 标准的「区块标题 + 一项一卡」结构。
+ * 批量生成缩略图 —— 一项一卡，和本页其余设置行同构。
  *
  * 2026-09-20 从手写的 `Text(cardTitle) + Spacer + Text(note) + Row{按钮}` 换成
- * [UfiSectionHeader] + [UfiSettingsItem]：原来那份自己搓标题字号与行距，和同一页上下的
- * 区块标题不是同一套字。状态说明进 `description`、按钮组进 `trailing`，语义各归其位。
+ * [UfiSettingsItem]：原来那份自己搓标题字号与行距，和同一页上下的文字不是同一套字。
+ * 状态说明进 `description`、按钮组进 `trailing`，语义各归其位。
+ *
+ * 2026-09-22 撤掉上方的 `UfiSectionHeader("批量生成封面")`：本页不再用卡外标题，
+ * 卡内 `title` 已经说清这张卡是干什么的。
  *
  * 按钮组随状态变（没跑 → 开始；在跑 → 暂停 + 取消；暂停中 → 继续 + 取消；跑完 → 再来一次），
  * 不摆按不动的按钮。已经有缓存的会被跳过，所以"再来一次"只处理剩下的那些。
@@ -277,10 +283,9 @@ private fun BatchThumbSection(
     onResume: () -> Unit,
     onCancel: () -> Unit
 ) {
-    UfiSectionHeader(title = "批量生成封面")
     UfiSettingsRowCard {
         UfiSettingsItem(
-            title = "为缺封面的视频抽帧",
+            title = "为缺封面的视频批量抽帧",
             description = when {
                 !enabled -> "本机抽帧已关闭，批量生成不可用"
                 progress == null -> "为还没有封面的视频逐个抽帧。可以随时暂停，退出这一页也会继续跑。"

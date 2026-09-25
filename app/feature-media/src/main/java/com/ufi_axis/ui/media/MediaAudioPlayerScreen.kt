@@ -1,28 +1,35 @@
 package com.ufi_axis.ui.media
 
 import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.StartOffset
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Shuffle
@@ -30,10 +37,13 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.BlurredEdgeTreatment
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
@@ -41,21 +51,31 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.util.lerp
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.navigation.NavHostController
+import coil3.SingletonImageLoader
 import coil3.compose.AsyncImage
+import coil3.compose.LocalPlatformContext
+import coil3.request.ImageRequest
+import coil3.request.crossfade
 import com.ufi_axis.data.api.RetrofitClient
 import com.ufi_axis.data.media.UfiAudioLyrics
 import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.data.model.MediaLibraryItem
 import com.ufi_axis.data.model.MediaTagsResponse
+import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
+import com.ufi_axis.ui.components.common.UfiButton
+import com.ufi_axis.ui.components.common.UfiButtonSize
+import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiListRowCard
 import com.ufi_axis.ui.components.common.UfiLoadingIndicator
@@ -208,6 +228,25 @@ fun MediaAudioPlayerScreen(
         }
     }
 
+    /**
+     * 单曲兜底队列项。
+     *
+     * 封面**能查到就给**：迷你条与标题栏挂件读的是队列项的 `artworkUri`（见
+     * `UfiAudioNowPlayingProbe`），给 null 的那一版会让那两处只剩一个占位音符 ——
+     * 而播放页自己是按 `MediaLibraryItem.id` 查封面的，所以这一屏看不出问题，
+     * bug 就是这么溜过去的（2026-09-23）。
+     *
+     * 查不到（这首歌不在当前范围里）才只能给 null：cover 接口只认 MediaStore 的 id，
+     * 光有路径拼不出 URL。
+     */
+    val fallbackTrack: (String) -> UfiAudioTrack = { p ->
+        UfiAudioTrack(
+            mediaId = p,
+            url = media.streamUrl(p),
+            artworkUrl = tracks.firstOrNull { it.path == p }?.let { media.coverUrl(it.id) }
+        )
+    }
+
     /*
      * 装队列。
      *
@@ -252,32 +291,42 @@ fun MediaAudioPlayerScreen(
                 } else if (loaded != listOf(filePath)) {
                     // 走到这里说明播放器里没有这首歌（进程重启后的深链接之类）。
                     // 只能装单曲 —— 没有任何范围信息可以据此重建队列。
-                    c.setUfiAudioPlaylist(
-                        listOf(
-                            UfiAudioTrack(
-                                mediaId = filePath,
-                                url = media.streamUrl(filePath),
-                                artworkUrl = null
-                            )
-                        ),
-                        0
-                    )
+                    c.setUfiAudioPlaylist(listOf(fallbackTrack(filePath)), 0)
                     c.playWhenReady = true
                     AudioQueueOwner.clear()
                 }
             }
 
+            /*
+             * 用户手工改过队列（插入 / 移除 / 重排）、还在同一个作用域、**而且路由那一首就在
+             * 这个队列里** → 只跳过去，绝不重装。
+             *
+             * 这一条是「虚拟播放列表」能不能存在的前提。下面 `loaded == paths` 那条判据
+             * 比的是"队列内容与作用域推导出的列表逐项相等"，而：
+             * · 拖拽排过序 → 顺序不同，不相等；
+             * · 「下一首播放」插进来的歌**很可能根本不在这个作用域里**（从专辑 A 插一首专辑 B 的）
+             *   → 永远不可能相等。
+             * 少了这条分支，每次回到播放页都会全量重装一次，用户排的顺序当场消失。
+             *
+             * ## `loaded.contains(filePath)` 这个条件是后补的（2026-09-23 修「播放队列完全错误」）
+             * 原来这里只判"同作用域 + 改过 + 队列非空"，队列里没有路由那一首时**什么都不做**，
+             * 理由写的是"保留用户排的队列更重要"。那个理由错了：
+             * 从列表点一首歌是**明确的指令**（"放这首"），而当时的表现是点下去毫无反应 ——
+             * 播放器还在放旧队列（重启后恢复的那份可能只剩几首），页面却显示着新点的歌，
+             * 「下一首」因为旧队列已到底而变灰，循环模式看起来也全乱。
+             * 现在这种情况直接落到下面的重装分支：用户既然点了整库/专辑里的一首，
+             * 那就按那个范围重建队列 —— 自定义顺序只在"点的是队列里的歌"时才需要保住。
+             */
+            sameScope && AudioQueueOwner.isUserEdited() && loaded.contains(filePath) -> {
+                val inQueue = loaded.indexOf(filePath)
+                if (c.currentMediaItemIndex != inQueue) {
+                    c.seekTo(inQueue, 0L)
+                    c.play()
+                }
+            }
+
             target < 0 -> if (loaded != listOf(filePath)) {
-                c.setUfiAudioPlaylist(
-                    listOf(
-                        UfiAudioTrack(
-                            mediaId = filePath,
-                            url = media.streamUrl(filePath),
-                            artworkUrl = null
-                        )
-                    ),
-                    0
-                )
+                c.setUfiAudioPlaylist(listOf(fallbackTrack(filePath)), 0)
                 c.playWhenReady = true
                 AudioQueueOwner.clear()
             }
@@ -300,7 +349,7 @@ fun MediaAudioPlayerScreen(
         if (AudioQueueOwner.consumeShuffleRequest()) c.shuffleModeEnabled = true
         handedOff = true
         currentIndex = c.currentMediaItemIndex
-        isPlaying = c.isPlaying
+        isPlaying = c.ufiPlayIntent()
         repeatMode = c.repeatMode
         shuffle = c.shuffleModeEnabled
         trackMeta = c.mediaMetadata
@@ -316,9 +365,30 @@ fun MediaAudioPlayerScreen(
                 currentIndex = c.currentMediaItemIndex
             }
 
+            /*
+             * 播放/暂停图标读的是**播放意图**（[Player.ufiPlayIntent]），不是 `isPlaying`。
+             *
+             * 2026-09-22 修「切歌时播放键抽搐」：`Player.isPlaying` 的定义是
+             * `playWhenReady && playbackState == READY && 没有被抑制`。切歌那一下
+             * playbackState 会掉进 **BUFFERING** 再回 READY，于是 isPlaying 短暂变 false ——
+             * 图标先翻成"播放"（= 显示为已暂停）再翻回来，而音频一秒都没停。
+             *
+             * 所以这里既订阅 onIsPlayingChanged（缓冲结束、焦点恢复这类真实变化），
+             * 也订阅 onPlayWhenReadyChanged（用户点了播放/暂停），两边都重算同一个意图值。
+             */
             override fun onIsPlayingChanged(playing: Boolean) {
-                isPlaying = playing
+                isPlaying = c.ufiPlayIntent()
             }
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                isPlaying = c.ufiPlayIntent()
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                // 队列播完（STATE_ENDED）时 playWhenReady 仍是 true，只有这里能把图标收回"暂停"
+                isPlaying = c.ufiPlayIntent()
+            }
+
 
             override fun onRepeatModeChanged(mode: Int) {
                 repeatMode = mode
@@ -360,6 +430,54 @@ fun MediaAudioPlayerScreen(
      */
     val resolvedIndex = if (currentIndex >= 0) currentIndex else paths.indexOf(filePath)
     val current = tracks.getOrNull(resolvedIndex)
+
+    /**
+     * 系统「降低动效」闸门。本页此前完全没读它 —— 切歌动画重做时一并接上：
+     * 开了就退化成极短的交叉淡入，缩放 / 模糊 / 文字递进全部不播。
+     */
+    val reduceMotion = LocalUfiReduceMotion.current
+
+    /**
+     * 换歌动画的触发键。用**曲目 id** 而不是整个 item：同一首歌的元信息刷新
+     *（封面地址签名换了、内嵌标签解析完成）不该触发一次切歌动画。
+     */
+    val trackAnimKey = current?.id ?: -1L
+
+    /**
+     * 封面预取（2026-09-22 修「播到没加载过的歌时先闪一下白底」）。
+     *
+     * ## 为什么是"前后各 [COVER_PREFETCH_RADIUS] 首"而不是整队列
+     * `/api/media/cover` 是**按需解析**的：core 每次要去读文件、把内嵌封面抽出来。
+     * 而 `MediaLibraryItem` 里**没有任何"这首有没有封面"的标志**（全仓只有 web 端两个
+     * 局部派生的 `hasCover`，不是接口字段）—— 也就是说预取整队列就是对每一首都发一次
+     * 解析请求，**没封面的那些也照样占一次往返**。队列可以是几百首，那会把 Coil 的请求
+     * 队列和 core 的文件 IO 一起灌满，反过来拖慢用户真正在看的这一张。
+     *
+     * 半径取 2 覆盖了"连点两三下下一首"这个最常见的路径。想改成整队列的前提是先让
+     * core 在列表接口里带上 hasCover，让我们能只对真有封面的那些发请求。
+     *
+     * 走 `enqueue` 而不是 `execute`：只要把图放进 Coil 的内存 / 磁盘缓存就行，
+     * 这里不关心结果，也不该阻塞当前组合的协程。
+     */
+    val coverContext = LocalPlatformContext.current
+    LaunchedEffect(trackAnimKey, tracks) {
+        if (resolvedIndex < 0) return@LaunchedEffect
+        val loader = SingletonImageLoader.get(coverContext)
+        (resolvedIndex - COVER_PREFETCH_RADIUS..resolvedIndex + COVER_PREFETCH_RADIUS)
+            .filter { it != resolvedIndex }
+            .mapNotNull { tracks.getOrNull(it) }
+            .forEach { neighbour ->
+                loader.enqueue(
+                    ImageRequest.Builder(coverContext)
+                        .data(media.coverUrl(neighbour.id))
+                        .build()
+                )
+            }
+    }
+
+
+
+
 
     /*
      * 音乐**不做播放进度记忆**（2026-09-19 去掉）。
@@ -568,7 +686,22 @@ fun MediaAudioPlayerScreen(
                         .fillMaxWidth()
                         .weight(1f),
                     pageSpacing = Spacing.Medium,
-                    verticalAlignment = Alignment.CenterVertically
+                    /*
+                     * 顶部对齐，**不要** CenterVertically（2026-09-22 修「切歌时封面上下抖动」）。
+                     *
+                     * 封面页是一个 wrap-content 的 Column，而它的高度是**跟着曲目变的**：
+                     * · 歌词预览在没歌词 / 没时间轴时整块不渲染（MediaLyrics.kt 里直接 return），
+                     *   有歌词时是 86dp —— 一来一回就是 86dp 的落差；
+                     * · 曲名 1 行还是 2 行差一个行高；
+                     * · 歌手为空时那一行连 Spacer 一起消失。
+                     *
+                     * 居中对齐会把这些落差**一半分给上方**，于是封面自己跟着上下跳。
+                     * 以前这事被"整块横滑"的切歌动画盖住了（位移期间看不出 13~51dp 的纵向偏移），
+                     * 封面改成原地对焦落位之后就直接暴露出来。
+                     *
+                     * 顶部对齐之后，下方内容再怎么变都只影响它自己下面的东西，封面纹丝不动。
+                     */
+                    verticalAlignment = Alignment.Top
                 ) { page ->
                     if (page == AUDIO_PAGE_LYRICS) {
                         MediaLyricsFullView(
@@ -587,28 +720,46 @@ fun MediaAudioPlayerScreen(
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
                             /*
-                             * 切歌过渡（2026-09-16）：封面 + 曲名/歌手整块做一次横向滑入。
+                             * 切歌过渡（2026-09-22 重做）：淡叠 + 超调落位 + 景深对焦。
                              *
                              * key 用当前曲目的 id：换歌才动，播放/暂停或进度变化不触发。
-                             * 方向按"下一首往左走"：新的一首从右侧进来，旧的往左出去 ——
-                             * 与列表/队列的顺序一致，用户能看出是往后翻了一首。
+                             *
+                             * **没有方向**。旧实现用 `targetState >= initialState` 比较 id 来决定
+                             * 往左还是往右，那在随机播放或乱序队列下是错的（id 大小与队列顺序无关）。
+                             * 现在进出都是同心缩放 + 淡入淡出，「下一首 / 上一首 / 点队列里某一首 /
+                             * 自动续播」全是同一个动作，不需要也不读方向。
+                             *
+                             * 位移与模糊的具体参数、以及为什么超调用 keyframes 而不是 spring，
+                             * 见文件末尾 AUDIO_SWITCH_* 那一组常量上方的说明。
                              */
-                            AnimatedContent(
-                                targetState = current?.id ?: -1L,
-                                transitionSpec = {
-                                    val forward = targetState >= initialState
-                                    val enter = slideInHorizontally(
-                                        animationSpec = tween(UfiMotion.Duration.Fluid)
-                                    ) { full -> if (forward) full / 3 else -full / 3 } +
-                                        fadeIn(tween(UfiMotion.Duration.Fluid))
-                                    val exit = slideOutHorizontally(
-                                        animationSpec = tween(UfiMotion.Duration.Fluid)
-                                    ) { full -> if (forward) -full / 3 else full / 3 } +
-                                        fadeOut(tween(UfiMotion.Duration.Fluid))
-                                    enter togetherWith exit
-                                },
-                                label = "audioTrackSwitch"
-                            ) { _ ->
+                            /*
+                             * 切歌过渡（2026-09-22 二次修正）：淡入 + 超调落位 + 景深对焦。
+                             *
+                             * ## 为什么封面**不再**放在 AnimatedContent 里
+                             * 第一版把封面留在 AnimatedContent 里，结果两个真实 bug：
+                             *
+                             * 1. **切歌闪烁**。AnimatedContent 在切换期间会同时保留旧内容与新内容，
+                             *    于是 `UFI_SHARED_KEY_AUDIO_COVER` 这个**常量** key 在同一帧出现两个节点
+                             *    —— 正是 UfiSharedTransition.kt 记过的「同帧重复 key」禁区，
+                             *    也正是曲名/歌手当初被移出 AnimatedContent 的原因。封面当时没被移出去，
+                             *    是因为横滑+淡入把闪烁盖住了；换成 blur 之后就藏不住了。
+                             * 2. **从迷你条点进来时封面闪一下模糊**。列表是异步拉的，`current` 从 null
+                             *    变成真正那一首时 `targetState` 就从 -1L 变成真实 id —— 时间点正好压在
+                             *    导航 RISE 转场中间，于是「进场模糊 + 超调」叠在共享元素的飞入上。
+                             *
+                             * ## 现在的做法
+                             * 封面是**单个节点**，缩放与模糊由一个 [rememberAudioSwitchProgress] 驱动
+                             *（与曲名/歌手同一套机制）。节点不复制 ⇒ 不可能出现重复 key；
+                             * 首次组合只 snap 到终态 ⇒ 进页不播效果。
+                             *
+                             * 代价：旧封面没有独立的离场动画（同一个节点，图片直接换）。
+                             * 这就是设计评审里 V2「只进不出」那一档 —— 同一时刻只有一个元素在做几何变化，
+                             * 本来就是四套方案里观感最干净的。
+                             *
+                             * **没有方向**。旧实现用 `targetState >= initialState` 比较 id 来定方向，
+                             * 那在随机播放或乱序队列下是错的（id 大小与队列顺序无关）。
+                             */
+                            run {
                                 Column(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalAlignment = Alignment.CenterHorizontally
@@ -618,10 +769,18 @@ fun MediaAudioPlayerScreen(
                                         animationSpec = UfiMotion.sliderTrack(),
                                         label = "audioCoverScale"
                                     )
+                                    // 0 = 刚换歌，1 = 已落位。缩放的超调与模糊都是它的纯函数，
+                                    // 所以两者的时间轴天然对齐，不需要各自起一个动画去对时。
+                                    val switchProgress = rememberAudioSwitchProgress(
+                                        trackKey = trackAnimKey,
+                                        reduceMotion = reduceMotion
+                                    )
+                                    val switchScale = audioSwitchScaleAt(switchProgress)
+                                    val switchBlur = AUDIO_SWITCH_BLUR_IN * (1f - switchProgress)
                                     /*
                                      * 封面刻意分成两层 Box（2026-09-20）：
                                      * - 外层只有固定尺寸 + 共享元素标记，几何稳定；
-                                     * - 内层才做播放/暂停的 0.96 缩放。
+                                     * - 内层才做播放/暂停的 0.96 缩放、以及切歌的缩放与模糊。
                                      *
                                      * 合成一层会打架：共享元素靠**测量出来的位置与尺寸**做补间，
                                      * 而 graphicsLayer 的 scale 是绘制期变换 —— 转场进行中
@@ -630,28 +789,38 @@ fun MediaAudioPlayerScreen(
                                      * 确定的框，scale 只在框内缩放内容。
                                      *
                                      * 共享元素的对端是迷你控制条那张 48dp 的封面
-                                     * （同一个 [UFI_SHARED_KEY_AUDIO_COVER]）。这里虽然套在
-                                     * AnimatedContent（切歌动画）里，但 ufiSharedElement 是从
-                                     * CompositionLocal 显式取**导航层**的 scope，不会被切歌那个
-                                     * AnimatedVisibilityScope 遮蔽。
+                                     * （同一个 [UFI_SHARED_KEY_AUDIO_COVER]）。
                                      */
                                     Box(
                                         modifier = Modifier
                                             .size(AUDIO_COVER_SIZE)
                                             .ufiSharedElement(UFI_SHARED_KEY_AUDIO_COVER)
                                     ) {
+
                                     Box(
                                         modifier = Modifier
                                             .size(AUDIO_COVER_SIZE)
                                             .graphicsLayer {
-                                                scaleX = coverScale
-                                                scaleY = coverScale
+                                                // 两个缩放相乘而不是各占一层：播放/暂停与切歌
+                                                // 可以同时发生，叠两层 graphicsLayer 只是白付一次离屏。
+                                                scaleX = coverScale * switchScale
+                                                scaleY = coverScale * switchScale
                                             }
                                             .shadow(18.dp, RoundedCornerShape(AUDIO_COVER_CORNER))
+                                            // blur 必须在 clip **之前**：糊出来的边由
+                                            // BlurredEdgeTreatment 按同一个圆角裁掉，否则会溢出圆角。
+                                            // API < 31 上这一句静默无效果 —— 见常量处说明的回落形态。
+                                            .blur(
+                                                switchBlur,
+                                                BlurredEdgeTreatment(
+                                                    RoundedCornerShape(AUDIO_COVER_CORNER)
+                                                )
+                                            )
                                             .clip(RoundedCornerShape(AUDIO_COVER_CORNER))
                                             .background(palette.surfaceMuted),
                                         contentAlignment = Alignment.Center
                                     ) {
+
                                         Icon(
                                             Icons.Default.MusicNote,
                                             contentDescription = null,
@@ -660,7 +829,13 @@ fun MediaAudioPlayerScreen(
                                         )
                                         current?.let { item ->
                                             AsyncImage(
-                                                model = media.coverUrl(item.id),
+                                                model = ImageRequest.Builder(coverContext)
+                                                    .data(media.coverUrl(item.id))
+                                                    // 淡入而不是硬切：封面是异步拉的，硬切时
+                                                    // 会看到底色（浅色主题下 surfaceMuted 近白）
+                                                    // 先闪一下再"啪"地换成图。
+                                                    .crossfade(UfiMotion.Duration.Gentle)
+                                                    .build(),
                                                 contentDescription = null,
                                                 contentScale = ContentScale.Crop,
                                                 // 失败仍是那个音符占位图标，但要留下原因：
@@ -691,15 +866,22 @@ fun MediaAudioPlayerScreen(
                              * 而这一页进来时几乎必然会切一次：列表是异步拉的，`current` 从 null
                              * 变成真正那一首时 `targetState` 就变了，时间点正好压在导航转场中间。
                              *
-                             * 代价是切歌时这两行不再跟着封面横向滑入，改为直接换字。可以接受：
-                             * 歌名/歌手本来就要等 core 的标签接口回来才定稿（中途会经过一次文件名
-                             * 兜底），那个"滑入"本身也盖不住这次文字变化。
+                             * 代价是切歌时这两行不能跟着封面一起被 AnimatedContent 搬运。
+                             * 2026-09-22 补上等价效果：改为对**同一个节点**做 alpha + 4dp 上浮
+                             *（[audioMetaEnterModifier]），节点不复制，所以常量 key 不会同帧出现两次。
+                             * 三行按 `STAGGER_DELAY_MS` 顺延，让信息有阅读顺序。
+                             * 修饰符接在 `ufiSharedBounds` **之后**：几何仍由共享元素接管，这里只动
+                             * alpha 与 translationY。
                              */
                             Spacer(Modifier.height(Spacing.Large))
                             Text(
                                 title,
                                 style = UfiTextStyles.sectionTitle,
                                 color = palette.textPrimary,
+                                // minLines = maxLines：曲名 1 行还是 2 行都占同样高度。
+                                // 否则下面的歌手与歌词会在换歌时上下跳一个行高 ——
+                                // 那是「切歌时封面上下抖动」同一个病的下半身。
+                                minLines = 2,
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
                                 textAlign = TextAlign.Center,
@@ -711,37 +893,63 @@ fun MediaAudioPlayerScreen(
                                         UFI_SHARED_KEY_AUDIO_TITLE,
                                         scaleContent = false
                                     )
-                            )
-                            if (artist.isNotBlank()) {
-                                Spacer(Modifier.height(Spacing.Small))
-                                Text(
-                                    artist,
-                                    style = UfiTextStyles.body,
-                                    color = palette.textSecondary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    textAlign = TextAlign.Center,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .ufiSharedBounds(
-                                            UFI_SHARED_KEY_AUDIO_ARTIST,
-                                            scaleContent = false
+                                    .then(
+                                        audioMetaEnterModifier(
+                                            trackKey = trackAnimKey,
+                                            delayMillis = UfiMotion.STAGGER_DELAY_MS.toInt(),
+                                            reduceMotion = reduceMotion
                                         )
-                                )
-                            }
+                                    )
+                            )
+                            // 歌手行**始终渲染**，空串也占一行高度。
+                            // 用 if 包起来的那一版里，从"有歌手"切到"没歌手"会连 Spacer
+                            // 一起消失，整栏高度跳一截 —— 同「封面上下抖动」一个病。
+                            Spacer(Modifier.height(Spacing.Small))
+                            Text(
+                                artist,
+                                style = UfiTextStyles.body,
+                                color = palette.textSecondary,
+                                minLines = 1,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .ufiSharedBounds(
+                                        UFI_SHARED_KEY_AUDIO_ARTIST,
+                                        scaleContent = false
+                                    )
+                                    .then(
+                                        audioMetaEnterModifier(
+                                            trackKey = trackAnimKey,
+                                            delayMillis =
+                                                (UfiMotion.STAGGER_DELAY_MS * 2).toInt(),
+                                            reduceMotion = reduceMotion
+                                        )
+                                    )
+                            )
 
                             Spacer(Modifier.height(Spacing.Large))
-                            MediaLyricsPreview(
-                                lines = lyrics,
-                                index = lyricIndex,
-                                // 点三行预览 = 翻到歌词页（与 Tab 同一个去处）
-                                onClick = {
-                                    pagerScope.launch {
-                                        pagerState.animateScrollToPage(AUDIO_PAGE_LYRICS)
+                            Box(
+                                modifier = audioMetaEnterModifier(
+                                    trackKey = trackAnimKey,
+                                    delayMillis = (UfiMotion.STAGGER_DELAY_MS * 3).toInt(),
+                                    reduceMotion = reduceMotion
+                                )
+                            ) {
+                                MediaLyricsPreview(
+                                    lines = lyrics,
+                                    index = lyricIndex,
+                                    // 点三行预览 = 翻到歌词页（与 Tab 同一个去处）
+                                    onClick = {
+                                        pagerScope.launch {
+                                            pagerState.animateScrollToPage(AUDIO_PAGE_LYRICS)
+                                        }
                                     }
-                                }
-                            )
+                                )
+                            }
                         }
+
 
                     }
                 }
@@ -760,7 +968,10 @@ fun MediaAudioPlayerScreen(
                         // 立刻写一份：轮询是 500ms 一次，不写的话歌词高亮会慢半拍
                         positionMs = target
                     },
-                    sharedKey = UFI_SHARED_KEY_AUDIO_SEEK
+                    sharedKey = UFI_SHARED_KEY_AUDIO_SEEK,
+                    // 换歌时已播段平滑过去，不瞬移 —— 封面那边已经是柔和落位，
+                    // 进度条再"啪"地弹回 0 就成了整屏最跳眼的东西。
+                    trackKey = trackAnimKey
                 )
                 Spacer(Modifier.height(Spacing.Small))
                 Row(modifier = Modifier.fillMaxWidth()) {
@@ -789,11 +1000,11 @@ fun MediaAudioPlayerScreen(
                         icon = Icons.Default.SkipPrevious,
                         label = "上一首",
                         iconSize = 34.dp,
-                        enabled = controller.hasPreviousMediaItem(),
+                        enabled = controller.ufiCanSkipToPrevious(),
                         // 2026-09-20：迷你条补上"上一首"之后这颗才有对端，于是也挂上 key。
                         // 三颗键同时参与转场，整组一起长大 / 缩回，不会只有中间两颗在动。
                         sharedKey = UFI_SHARED_KEY_AUDIO_PREV,
-                        onClick = { controller.seekToPreviousMediaItem() }
+                        onClick = { controller.ufiSkipToPrevious() }
                     )
                     Spacer(Modifier.width(Spacing.XLarge))
                     MediaControlAction(
@@ -809,9 +1020,9 @@ fun MediaAudioPlayerScreen(
                         icon = Icons.Default.SkipNext,
                         label = "下一首",
                         iconSize = 34.dp,
-                        enabled = controller.hasNextMediaItem(),
+                        enabled = controller.ufiCanSkipToNext(),
                         sharedKey = UFI_SHARED_KEY_AUDIO_NEXT,
-                        onClick = { controller.seekToNextMediaItem() }
+                        onClick = { controller.ufiSkipToNext() }
                     )
                 }
 
@@ -842,8 +1053,14 @@ fun MediaAudioPlayerScreen(
                             },
                             iconSize = 22.dp,
                             active = repeatMode != Player.REPEAT_MODE_OFF,
+                            // 下一档必须从 **controller 的现值** 推，不能从本地镜像 repeatMode 推。
+                            // 镜像只在两处更新：队列效应末尾的回读、以及本页的 Listener ——
+                            // 而 Listener 在本页离开组合时被移除（见下方 DisposableEffect），
+                            // 镜像随即冻结。这期间用户完全可以从标题栏挂件的迷你弹窗
+                            //（MediaNowPlayingChip，那边一直就是读现值）或通知栏改模式。
+                            // 用冻结值推下一档的表现是"点一下没反应"或"跳过一档"。
                             onClick = {
-                                controller.repeatMode = when (repeatMode) {
+                                controller.repeatMode = when (controller.repeatMode) {
                                     Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
                                     Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
                                     else -> Player.REPEAT_MODE_OFF
@@ -857,7 +1074,10 @@ fun MediaAudioPlayerScreen(
                             label = if (shuffle) "随机：开" else "随机：关",
                             iconSize = 22.dp,
                             active = shuffle,
-                            onClick = { controller.shuffleModeEnabled = !shuffle }
+                            // 同上：取反的基准用现值，不用可能已冻结的 shuffle 镜像。
+                            onClick = {
+                                controller.shuffleModeEnabled = !controller.shuffleModeEnabled
+                            }
                         )
                     }
                     Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.Center) {
@@ -878,13 +1098,48 @@ fun MediaAudioPlayerScreen(
 
             // ── 队列：公共弹窗（[UfiCustomDialog]，标题 + 右上角 ×）──
             if (showQueue) {
+                /*
+                 * 队列面板里的一行提示（目前只有"已关闭随机播放"那一条）。
+                 * 放在这一层而不是面板内部：它由面板的回调触发，但面板关掉再开时应该消失 ——
+                 * 状态跟着 showQueue 的生命周期走最省事。
+                 */
+                var queueHint by remember(showQueue) { mutableStateOf<String?>(null) }
+
                 NowPlayingQueueDialog(
                     queueRows = queueRows,
                     currentIndex = resolvedIndex,
+                    hintText = queueHint,
                     onSelect = { idx ->
                         controller.seekTo(idx, 0L)
                         controller.play()
                         showQueue = false
+                    },
+                    onRemove = { idx ->
+                        controller.ufiRemoveFromQueue(idx)
+                        // 回读：removeMediaItem 之后 timeline 变了，面板要按新队列重排。
+                        // media3 的 Listener 只在变化时回调，这里是本地发起的改动，
+                        // 顺手同步比等回调更可靠（也避免面板闪一帧旧数据）。
+                        queueIds = controller.ufiAudioQueueIds()
+                        currentIndex = controller.currentMediaItemIndex
+                        // 队列被清空 → 面板没有任何内容可显示，留着是个空壳
+                        if (queueIds.isEmpty()) showQueue = false
+                    },
+                    onMove = { from, to ->
+                        controller.ufiMoveInQueue(from, to)
+                        queueIds = controller.ufiAudioQueueIds()
+                        currentIndex = controller.currentMediaItemIndex
+                        /*
+                         * 排序时若随机播放开着，自动关掉它并告知（E13）。
+                         *
+                         * 否则用户排了半天顺序，实际播放仍按打乱的序走 —— 那是"功能看起来生效了
+                         * 其实没有"，比直接禁掉排序更糟。关掉随机是符合此刻意图的解释：
+                         * 他既然在手排顺序，就是想按这个顺序听。
+                         */
+                        if (controller.shuffleModeEnabled) {
+                            controller.shuffleModeEnabled = false
+                            shuffle = false
+                            queueHint = "已关闭随机播放，按你排的顺序播"
+                        }
                     },
                     onDismiss = { showQueue = false }
                 )
@@ -909,85 +1164,261 @@ fun MediaAudioPlayerScreen(
  * 这里只铺内容。之前是自己用 `Dialog` 画的一整页（自绘顶栏 + 返回箭头），
  * 与全 App 其他弹窗不是一套观感，而"队列"本来就是一层浮层、不是一个页面。
  *
- * 列表必须带 [AUDIO_QUEUE_LIST_MAX_HEIGHT] 上限：队列可能有上百首，
- * 不限高会把弹窗撑出屏幕。当前播放项保留 accent 竖条 + PlayArrow 标识。
+ * ## 2026-09-22 改版（"序号 + 律动条"）
+ *
+ * 四处改动，每一处都对应旧版一个具体问题：
+ *
+ * 1. **leading 由「透明竖条 + 图标」换成「序号槽」**。旧版在 leading 里塞了两个东西：
+ *    一条 accent 竖条和一个 PlayArrow/MusicNote 图标 —— 它们表达的是**同一件事**
+ *    （这是当前项）。更糟的是那条竖条在非当前项时是"透明但仍占宽度"，于是**每一行**的
+ *    文字都被无谓地往右推了 3dp + 间距。现在那个槽位放序号，非当前项显示 `1 2 3…`，
+ *    当前项换成 [QueuePlayingBars]。
+ * 2. **补上序号**。"这是第几首、还剩几首"是队列最有用的信息之一，旧版完全读不到。
+ * 3. **"共 N 首"从正文挪到标题栏右侧**，并改成 `3 / 24`。旧版它单独占一整行，
+ *    用一行高度换一条低信息量文字。
+ * 4. **打开时自动滚到当前项**。这是行为不是样式：队列可能上百首，旧版打开停在顶部，
+ *    正在播的那首可能在第 80 行 —— 高亮做得再好也看不见。
+ *
+ * 列表仍带 [AUDIO_QUEUE_LIST_MAX_HEIGHT] 上限：不限高会把弹窗撑出屏幕。
  */
 @Composable
 private fun NowPlayingQueueDialog(
     queueRows: List<AudioQueueRow>,
     currentIndex: Int,
+    hintText: String?,
     onSelect: (Int) -> Unit,
+    onRemove: (Int) -> Unit,
+    onMove: (Int, Int) -> Unit,
     onDismiss: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
+    val listState = rememberLazyListState()
+
+    /*
+     * 「编辑顺序」模式：开了之后每行右侧从「时长 + −」换成「↑ ↓ −」。
+     *
+     * ## 为什么是模式切换 + 按钮，不是长按拖拽
+     * 拖拽是更好的交互，但这里的行是 `UfiListRowCard`（冻结签名的公共件，内部自带
+     * `combinedClickable`）。要在它外面接 `detectDragGesturesAfterLongPress`，就得和它
+     * 内部的点击手势争仲裁 —— 谁先消费长按、拖拽中要不要屏蔽 onClick、跨行边界时
+     * LazyColumn 的自动滚边怎么接，每一条都只能在真机上试出来。
+     * 那是一轮独立的工作，不该夹在这次改动里半做。
+     *
+     * ↑↓ 按钮在功能上是完备的（任意顺序都排得出来），只是慢一点。
+     *
+     * ## 为什么要模式而不是常显 ↑↓
+     * 一行右侧本来已经有「时长 + −」，再塞两个图标要挤掉时长 —— 而时长是平时更常看的信息。
+     * 排序是低频操作，值得多点一下进模式。
+     */
+    var reorderMode by remember { mutableStateOf(false) }
+
+
+    /*
+     * 打开即滚到当前项。
+     *
+     * 往前多留 [AUDIO_QUEUE_SCROLL_LEAD] 行而不是把当前项顶到首行：当前项贴在列表最上沿时
+     * 看不出"它前面还有歌"，而队列的上下文（前一首是什么）本身是有用的信息。
+     *
+     * 用 `scrollToItem` 而不是 `animateScrollToItem`：弹窗刚出现就播一段长距离滚动动画，
+     * 观感是"列表自己在乱跑"。直接定位到位。
+     */
+    LaunchedEffect(currentIndex, queueRows.size) {
+        if (currentIndex in queueRows.indices) {
+            listState.scrollToItem((currentIndex - AUDIO_QUEUE_SCROLL_LEAD).coerceAtLeast(0))
+        }
+    }
+
     UfiCustomDialog(
         visible = true,
         onDismiss = onDismiss,
         title = "播放队列",
-        showCloseButton = true
-    ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            Text(
-                text = "共 ${queueRows.size} 首",
-                style = UfiTextStyles.caption,
-                color = palette.textSecondary
-            )
-            Spacer(Modifier.height(Spacing.Medium))
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = AUDIO_QUEUE_LIST_MAX_HEIGHT),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-            ) {
-                itemsIndexed(queueRows, key = { _, row -> row.key }) { index, row ->
-                    val active = index == currentIndex
-                    UfiListRowCard(
-                        title = row.title,
-                        subtitle = row.subtitle,
-                        selected = active,
-                        onClick = { onSelect(index) },
-                        leading = {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                // 当前播放项：accent 竖条
-                                Box(
-                                    modifier = Modifier
-                                        .width(AUDIO_QUEUE_ACTIVE_BAR_WIDTH)
-                                        .height(AUDIO_QUEUE_ACTIVE_BAR_HEIGHT)
-                                        .clip(
-                                            RoundedCornerShape(
-                                                AUDIO_QUEUE_ACTIVE_BAR_WIDTH
-                                            )
-                                        )
-                                        .background(
-                                            if (active) palette.accent else Color.Transparent
-                                        )
-                                )
-                                Spacer(Modifier.width(Spacing.Small))
-                                Icon(
-                                    if (active) {
-                                        Icons.Default.PlayArrow
-                                    } else {
-                                        Icons.Default.MusicNote
-                                    },
-                                    contentDescription = null,
-                                    tint = if (active) palette.accent else palette.textSecondary,
-                                    modifier = Modifier.size(AUDIO_QUEUE_ICON_SIZE)
-                                )
-                            }
-                        },
-                        trailing = {
-                            Text(
-                                row.duration,
-                                style = UfiTextStyles.monoCaption,
-                                color = palette.textSecondary
-                            )
-                        }
+        showCloseButton = true,
+        // 「第几首 / 共几首」放标题行右侧：它是这个弹窗的状态说明，不值得占正文一行
+        trailingContent = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = if (currentIndex in queueRows.indices) {
+                        "${currentIndex + 1} / ${queueRows.size}"
+                    } else {
+                        "${queueRows.size} 首"
+                    },
+                    style = UfiTextStyles.monoCaption,
+                    color = palette.textSecondary
+                )
+                // 队列少于两首时排序无意义，按钮也就不出现
+                if (queueRows.size > 1) {
+                    Spacer(Modifier.width(Spacing.Small))
+                    UfiButton(
+                        text = if (reorderMode) "完成" else "编辑顺序",
+                        variant = UfiButtonVariant.Subtle,
+                        size = UfiButtonSize.Small,
+                        onClick = { reorderMode = !reorderMode }
                     )
                 }
             }
         }
+
+    ) {
+        hintText?.let { hint ->
+            // 一行说明，跟着列表一起滚不合适（它是对刚发生的事的解释），所以钉在列表上方
+            Text(
+                text = hint,
+                style = UfiTextStyles.caption,
+                color = palette.accent,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = Spacing.Small)
+            )
+        }
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = AUDIO_QUEUE_LIST_MAX_HEIGHT),
+            // 上下各留一点：行卡自带阴影与描边，贴着裁剪边缘时第一/最后一行会被切掉一线
+            contentPadding = PaddingValues(vertical = 2.dp),
+            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+        ) {
+            itemsIndexed(queueRows, key = { _, row -> row.key }) { index, row ->
+                val active = index == currentIndex
+                UfiListRowCard(
+                    title = row.title,
+                    subtitle = row.subtitle,
+                    selected = active,
+                    onClick = { onSelect(index) },
+                    leading = {
+                        // 固定宽度的槽位：序号与律动条同宽，切换时右边的文字不会左右跳
+                        Box(
+                            modifier = Modifier.width(AUDIO_QUEUE_INDEX_SLOT),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (active) {
+                                QueuePlayingBars(color = palette.accent)
+                            } else {
+                                Text(
+                                    text = "${index + 1}",
+                                    style = UfiTextStyles.monoCaption,
+                                    color = palette.textSecondary
+                                )
+                            }
+                        }
+                    },
+                    trailing = {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (reorderMode) {
+                                // 首行没有「上移」、末行没有「下移」：摆一个点了没反应的箭头
+                                // 比少一个箭头更让人困惑
+                                if (index > 0) {
+                                    QueueRowIconButton(
+                                        icon = Icons.Default.KeyboardArrowUp,
+                                        description = "「${row.title}」上移",
+                                        tint = palette.textSecondary,
+                                        onClick = { onMove(index, index - 1) }
+                                    )
+                                }
+                                if (index < queueRows.lastIndex) {
+                                    QueueRowIconButton(
+                                        icon = Icons.Default.KeyboardArrowDown,
+                                        description = "「${row.title}」下移",
+                                        tint = palette.textSecondary,
+                                        onClick = { onMove(index, index + 1) }
+                                    )
+                                }
+                            } else {
+                                Text(
+                                    row.duration,
+                                    style = UfiTextStyles.monoCaption,
+                                    color = if (active) palette.accent else palette.textSecondary
+                                )
+                            }
+                            /*
+                             * 「移出队列」。**只动队列，不动文件。**
+                             *
+                             * 用 `−` 而不是垃圾桶：垃圾桶在这个 app 的其它地方都是"删文件"，
+                             * 在队列面板里摆一个会让人以为点了就把歌删了。
+                             *
+                             * 索引用 LazyColumn 的 index，它与 `ufiAudioQueueIds()` 的下标
+                             * 一一对应，也就是 media3 的**原始（未打乱）索引** ——
+                             * `removeMediaItem` / `moveMediaItem` 要的正是这个。
+                             * 随机播放开着时播放顺序与本表不同，所以本表一律按原始顺序渲染，
+                             * 否则点掉的会是另一首。
+                             */
+                            QueueRowIconButton(
+                                icon = Icons.Default.Remove,
+                                description = "从队列移出「${row.title}」",
+                                tint = palette.textSecondary,
+                                onClick = { onRemove(index) }
+                            )
+                        }
+                    }
+
+
+                )
+            }
+        }
     }
 }
+
+/**
+ * 队列面板里那几个小图标按钮（上移 / 下移 / 移出）。
+ *
+ * 尺寸比 Material 默认的 48dp 小一档：它们挤在一行卡片的右侧，48dp 会把整行撑高。
+ */
+@Composable
+private fun QueueRowIconButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    tint: androidx.compose.ui.graphics.Color,
+    onClick: () -> Unit
+) {
+    IconButton(onClick = onClick, modifier = Modifier.size(AUDIO_QUEUE_REMOVE_SIZE)) {
+        Icon(
+            imageVector = icon,
+            contentDescription = description,
+            tint = tint,
+            modifier = Modifier.size(18.dp)
+        )
+    }
+}
+
+/**
+ * 当前播放项的三根律动条。
+ *
+ * 只是"在播"的视觉暗示，**不是频谱** —— 它不读音频数据，就是三根按固定节奏反向来回的条。
+ * 真做频谱要接 `Visualizer`，那需要录音权限，为一个 20dp 的装饰不值得。
+ *
+ * 三根条的峰高与起跳延迟都写死（[EQ_BARS]）：错开才像在跳，同步就成了一个整体在缩放。
+ */
+@Composable
+private fun QueuePlayingBars(color: Color) {
+    val transition = rememberInfiniteTransition(label = "queue-eq")
+    Row(
+        modifier = Modifier.height(AUDIO_QUEUE_EQ_HEIGHT),
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        EQ_BARS.forEach { (peak, delayMs) ->
+            val scale by transition.animateFloat(
+                initialValue = 0.4f,
+                targetValue = 1f,
+                animationSpec = infiniteRepeatable(
+                    animation = tween(durationMillis = AUDIO_QUEUE_EQ_PERIOD_MS),
+                    repeatMode = RepeatMode.Reverse,
+                    initialStartOffset = StartOffset(delayMs)
+                ),
+                label = "queue-eq-bar"
+            )
+            Box(
+                modifier = Modifier
+                    .width(AUDIO_QUEUE_EQ_BAR_WIDTH)
+                    .height(peak * scale)
+                    .clip(RoundedCornerShape(AUDIO_QUEUE_EQ_BAR_WIDTH))
+                    .background(color)
+            )
+        }
+    }
+}
+
 
 // ───────────────────────── 版式常量 ─────────────────────────
 
@@ -1015,6 +1446,171 @@ private val AUDIO_COVER_CORNER = 20.dp
  * 而这个动作要表达的只是"停住了"这一点点状态差。
  */
 private const val AUDIO_COVER_PAUSED_SCALE = 0.96f
+
+// ── 切歌动画（2026-09-22 重做：淡叠 + 超调落位 + 景深对焦 + 时序递进）────────────
+//
+// ## 为什么整段推翻重写
+// 旧实现是「封面横滑屏宽 1/3 + 淡入」，只有封面参与，且方向由
+// `targetState >= initialState`（比较曲目 **id**）决定 —— 随机播放或乱序队列下方向是错的。
+// 新方案**不需要方向**：随机播放、点队列里任意一首、自动续播都是同一个动作。
+//
+// ## 动作构成
+// · 新封面：`1.05 → 0.996 → 1`（超调一下再落位）叠加 `blur 9dp → 0`（像镜头对焦）
+// · 旧封面：缩到 0.96 + 糊到 7dp 淡出
+// · 文字：4dp 上浮，曲名 / 歌手 / 歌词按 `UfiMotion.STAGGER_DELAY_MS` 顺延
+//
+// ## 三条约束（改之前先读）
+// 1. **blur 只能加在内层、且要在 clip 之前**。封面是两层 Box：外层挂 shared element
+//    且几何必须稳定，内层才做变换（见上方约 630 行的注释）。这里用
+//    `BlurredEdgeTreatment(圆角)` 把糊出来的边直接裁掉，否则会溢出圆角。
+//    `Modifier.blur` 在 **API < 31 上静默无效果**（不是崩）—— 那正是本方案的回落形态：
+//    低版本退化成「只有超调 + 递进」，观感仍然成立。
+// 2. **超调必须用 keyframes，不要用 spring**。这里是「1.05 → 0.996 → 1」三段定值，
+//    keyframes 可控可测；spring 的停顿点会随起始速度变，连点下一首时每次幅度都不一样。
+// 3. **文字不能进 AnimatedContent**（理由见约 700 行的注释），所以它的进场是对
+//    **同一个节点**做 alpha + translationY，节点不复制。
+
+/** 切歌动画基准时长。取现成档位而不是写裸数字（调参停在 290，最近的档位是 280）。 */
+private const val AUDIO_SWITCH_MS = UfiMotion.Duration.Gentle
+
+/**
+ * 封面时长：比基准长一档，给超调那一下留回弹余量。
+ * 280 × 1.15 ≈ 322，正好落在 [UfiMotion.Duration.Sweeping]（320）上。
+ */
+private const val AUDIO_SWITCH_COVER_MS = UfiMotion.Duration.Sweeping
+
+/** 新封面进场的起始缩放。 */
+private const val AUDIO_SWITCH_SCALE_FROM = 1.05f
+
+/** 超调谷值：越过 1 之后回弹到这里再停在 1。差值刻意很小 —— 要的是"落位有重量"而非"弹一下"。 */
+private const val AUDIO_SWITCH_SCALE_OVERSHOOT = 0.996f
+
+/** 超调谷值出现的时间点（占整段进度的比例）。 */
+private const val AUDIO_SWITCH_OVERSHOOT_AT = 0.62f
+
+/** 新封面进场的起始模糊半径（API < 31 无效果，见上方约束 1）。 */
+private val AUDIO_SWITCH_BLUR_IN = 9.dp
+
+/** 曲名 / 歌手 / 歌词进场时的上浮距离。 */
+private val AUDIO_SWITCH_META_RISE = 4.dp
+
+/**
+ * 队列面板里「移出队列」按钮的触控尺寸。比 Material 默认的 48dp 小一档：
+ * 它在一行卡片的右侧、紧挨时长文字，48dp 会把那一行撑高。
+ */
+private val AUDIO_QUEUE_REMOVE_SIZE = 34.dp
+
+/** 封面预取半径：当前这一首的前后各几首。
+ *
+ * 不做整队列的理由见调用点的说明（核心是列表接口没有 hasCover 标志，
+ * 整队列预取等于对每一首都发一次「读文件抽封面」的请求）。
+ */
+private const val COVER_PREFETCH_RADIUS = 2
+
+
+/**
+ * 把 0..1 的切歌进度映射成封面缩放，形状是「[AUDIO_SWITCH_SCALE_FROM] →
+ * [AUDIO_SWITCH_SCALE_OVERSHOOT] → 1」的两段折线。
+ *
+ * 用分段 lerp 而不是 `keyframes` spec：现在缩放与模糊共用**同一个**进度值
+ *（见 [rememberAudioSwitchProgress]），进度本身已经带了缓动，这里只负责形状。
+ * 好处是两者的时间轴不可能错位 —— 各起一个带独立 spec 的动画就得自己对时。
+ */
+private fun audioSwitchScaleAt(progress: Float): Float =
+    if (progress <= AUDIO_SWITCH_OVERSHOOT_AT) {
+        lerp(
+            AUDIO_SWITCH_SCALE_FROM,
+            AUDIO_SWITCH_SCALE_OVERSHOOT,
+            (progress / AUDIO_SWITCH_OVERSHOOT_AT).coerceIn(0f, 1f)
+        )
+    } else {
+        lerp(
+            AUDIO_SWITCH_SCALE_OVERSHOOT,
+            1f,
+            ((progress - AUDIO_SWITCH_OVERSHOOT_AT) / (1f - AUDIO_SWITCH_OVERSHOOT_AT))
+                .coerceIn(0f, 1f)
+        )
+    }
+
+/**
+ * 切歌进度：`0` = 刚换歌，`1` = 已落位。封面的缩放与模糊都由它派生。
+ *
+ * ## 为什么首次组合不播
+ * 列表是异步拉的，`current` 从 null 变成真正那一首时 [trackKey] 就会变一次 ——
+ * 时间点正好压在导航 RISE 转场中间。这时候播「模糊 → 对焦」，观感就是
+ * **从迷你条点进来时封面闪一下模糊**（用户实测报的第 2 个 bug）。
+ * 所以首次只 snap 到终态，只有**后续**的 [trackKey] 变化（= 真的换歌了）才播。
+ *
+ * ## 为什么 remember 不放在 reduceMotion 判断后面
+ * 条件式 `remember` 是 Compose 的硬错误：`reduceMotion` 在运行期可以被用户改，
+ * 一变就会让后面的 remember 槽位整体错位。所以无论如何都先 remember，
+ * 分支只写在 [LaunchedEffect] 里面。
+ */
+@Composable
+private fun rememberAudioSwitchProgress(trackKey: Long, reduceMotion: Boolean): Float {
+    val progress = remember { Animatable(1f) }
+    var firstPass by remember { mutableStateOf(true) }
+    LaunchedEffect(trackKey, reduceMotion) {
+        if (firstPass || reduceMotion) {
+            firstPass = false
+            progress.snapTo(1f)
+            return@LaunchedEffect
+        }
+        progress.snapTo(0f)
+        progress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(
+                durationMillis = AUDIO_SWITCH_COVER_MS,
+                easing = UfiMotion.Easing.EmphasizedIn
+            )
+        )
+    }
+    return progress.value
+}
+
+/**
+ * 换歌时给曲名 / 歌手 / 歌词用的进场修饰符：alpha + 上浮，按 [delayMillis] 顺延。
+ *
+ * ## 为什么返回 Modifier 而不是包一层 Composable
+ * 这三处都挂着常量 shared key 或参与页面转场，套一个 Box 会多一层布局节点、
+ * 影响 `ufiSharedBounds` 的测量。返回 Modifier 让调用点接在 sharedBounds **之后**：
+ * 几何仍由共享元素接管，这里只动 alpha 与 translationY。
+ *
+ * 首次组合不播、以及为什么 remember 不能写在 `reduceMotion` 判断后面，
+ * 理由与 [rememberAudioSwitchProgress] 完全相同。
+ */
+@Composable
+private fun audioMetaEnterModifier(
+    trackKey: Long,
+    delayMillis: Int,
+    reduceMotion: Boolean
+): Modifier {
+    val progress = remember { Animatable(1f) }
+    val riseTargetPx = with(LocalDensity.current) { AUDIO_SWITCH_META_RISE.toPx() }
+    var firstPass by remember { mutableStateOf(true) }
+    LaunchedEffect(trackKey, reduceMotion) {
+        if (firstPass || reduceMotion) {
+            firstPass = false
+            progress.snapTo(1f)
+            return@LaunchedEffect
+        }
+        progress.snapTo(0f)
+        progress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(
+                durationMillis = AUDIO_SWITCH_MS,
+                delayMillis = delayMillis,
+                easing = UfiMotion.Easing.EmphasizedIn
+            )
+        )
+    }
+    return Modifier.graphicsLayer {
+        alpha = progress.value
+        translationY = (1f - progress.value) * riseTargetPx
+    }
+}
+
+
 
 /** 顶部渐变里 accent 的浓度：再高就压过封面，再低就看不出来。 */
 private const val AUDIO_GRADIENT_ALPHA = 0.22f
@@ -1050,12 +1646,42 @@ private val AUDIO_CONTROLS_BOTTOM_LIFT = 40.dp
 /** 队列弹窗里列表的最大高度：弹窗不能被长队列撑出屏幕。 */
 private val AUDIO_QUEUE_LIST_MAX_HEIGHT = 420.dp
 
-/** 队列里当前播放项的 accent 竖条尺寸。 */
-private val AUDIO_QUEUE_ACTIVE_BAR_WIDTH = 3.dp
-private val AUDIO_QUEUE_ACTIVE_BAR_HEIGHT = 28.dp
+/**
+ * 队列行左侧那个槽位的宽度（序号 / 律动条共用）。
+ *
+ * 两者必须同宽，否则切歌时右边的歌名会左右跳一下。20dp 装得下三位数序号（"100"）
+ * 与三根 3dp 的条 + 两个 2dp 间隙（共 13dp）。
+ */
+private val AUDIO_QUEUE_INDEX_SLOT = 20.dp
 
-/** 队列行左侧那个状态图标（播放中 / 音符）的大小。 */
-private val AUDIO_QUEUE_ICON_SIZE = 18.dp
+/** 律动条整体高度（三根条里最高那根的峰值）。 */
+private val AUDIO_QUEUE_EQ_HEIGHT = 14.dp
+
+/** 单根律动条的宽度。也当作圆角半径用，于是两端是半圆。 */
+private val AUDIO_QUEUE_EQ_BAR_WIDTH = 3.dp
+
+/** 律动条单程时长。来回一轮 ≈ 1.1s，比心跳略慢，不会让人觉得界面在抖。 */
+private const val AUDIO_QUEUE_EQ_PERIOD_MS = 560
+
+/**
+ * 三根律动条的「峰高 → 起跳延迟」。
+ *
+ * 延迟错开是关键：三根同步起落就是一个整体在缩放，看不出"在跳"。
+ * 峰高也不一样 —— 等高三根条像信号格而不像律动。
+ */
+private val EQ_BARS = listOf(
+    7.dp to 0,
+    14.dp to 180,
+    10.dp to 360
+)
+
+/**
+ * 打开队列时，当前项上方多留几行。
+ *
+ * 不把当前项顶到首行：贴在最上沿时看不出"它前面还有歌"，而"前一首是什么"本身是有用的上下文。
+ */
+private const val AUDIO_QUEUE_SCROLL_LEAD = 2
+
 
 /**
  * 播控键的图标槽边长：取这一排里最大的那个图标（播放/暂停 52dp），**正方形**。

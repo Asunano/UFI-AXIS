@@ -209,20 +209,23 @@ internal object MediaThumbnailBuilder {
      *
      * 三种情况直接回 null 不干活：功能被关掉、这一项在失败冷却期内、换票或抽帧失败。
      * 一律不弹错误、不自动重试 —— 缩略图缺失不该打断浏览。
+     *
+     * **整体**跑在 IO 线程上：前三道闸门就已经在读文件元信息与 SharedPreferences，
+     * 而调用方是 Compose 的主线程作用域。
      */
     suspend fun build(
         context: Context,
         media: MediaModule,
         type: String,
         item: MediaLibraryItem
-    ): File? {
-        cached(context, type, item.id)?.let { return it }
-        if (!enabled(context)) return null
-        if (coolingDown(context, type, item.id)) return null
+    ): File? = withContext(Dispatchers.IO) {
+        cached(context, type, item.id)?.let { return@withContext it }
+        if (!enabled(context)) return@withContext null
+        if (coolingDown(context, type, item.id)) return@withContext null
         _everUsed.value = true
-        return GATE.withPermit {
+        GATE.withPermit {
             // 拿到许可后再查一次：等待期间可能已经被另一个请求抽好了
-            cached(context, type, item.id) ?: withContext(Dispatchers.IO) {
+            cached(context, type, item.id) ?: run {
                 _activeCount.update { it + 1 }
                 try {
                     buildLocked(context, media, type, item)
@@ -232,6 +235,7 @@ internal object MediaThumbnailBuilder {
             }
         }
     }
+
 
     private suspend fun buildLocked(
         context: Context,
@@ -284,18 +288,23 @@ internal object MediaThumbnailBuilder {
 
     // ── 缓存维护（设置页显示占用 / 清空）──
 
-    /** 缓存里的图片数与总字节数（`.fail` 标记不算，它们只有 0 字节）。 */
-    fun cacheStats(context: Context): Pair<Int, Long> {
+    /**
+     * 缓存里的图片数与总字节数（`.fail` 标记不算，它们只有 0 字节）。
+     *
+     * suspend + IO 线程：listFiles + 逐项 length 是真的磁盘活，调用方在 Compose 作用域里。
+     */
+    suspend fun cacheStats(context: Context): Pair<Int, Long> = withContext(Dispatchers.IO) {
         val files = runCatching { cacheDir(context).listFiles() }.getOrNull().orEmpty()
             .filter { it.isFile && it.name.endsWith(".jpg") }
-        return files.size to files.sumOf { it.length() }
+        files.size to files.sumOf { it.length() }
     }
 
     /** 清空缓存（连失败标记一起清：用户点"清空"也是在说"重新来一遍"）。 */
-    fun clearCache(context: Context) {
+    suspend fun clearCache(context: Context) = withContext(Dispatchers.IO) {
         runCatching { cacheDir(context).listFiles() }.getOrNull().orEmpty()
             .forEach { runCatching { it.delete() } }
     }
+
 
     /** 超出上限时按"最久没被写过"淘汰。不做 LRU：读的时候不碰 mtime，省一次写盘。 */
     private fun pruneCache(context: Context) {
@@ -317,18 +326,20 @@ internal object MediaThumbnailBuilder {
      *
      * [items] 由调用方给全（视频页会先把整库拉齐）—— 本对象不发列表请求，
      * 那是 `MediaModule` 的事，混进来就成了两个地方都能决定"要处理哪些文件"。
+     *
+     * suspend + IO 线程：起跑前要对整库逐项 stat（查缓存、清冷却标记），主线程做不起。
      */
-    fun startBatch(
+    suspend fun startBatch(
         context: Context,
         media: MediaModule,
         type: String,
         items: List<MediaLibraryItem>
-    ) {
-        if (batchJob?.isActive == true) return
+    ) = withContext(Dispatchers.IO) {
+        if (batchJob?.isActive == true) return@withContext
         val pending = items.filter { cached(context, type, it.id) == null }
         if (pending.isEmpty()) {
             _batch.value = BatchProgress(total = 0, done = 0, finished = true)
-            return
+            return@withContext
         }
         // 用户主动点"生成全部"= 明确要求重试，把冷却标记清掉
         pending.forEach { failFile(context, type, it.id).delete() }
@@ -349,6 +360,7 @@ internal object MediaThumbnailBuilder {
             _batch.update { it?.copy(finished = true, paused = false) }
         }
     }
+
 
     fun pauseBatch() {
         _batch.update { it?.copy(paused = true) }

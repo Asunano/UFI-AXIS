@@ -62,8 +62,8 @@ fun MediaAudioGroupScreen(
     val state by media.state.collectAsState()
     val items = state.groupItems(by, key)
 
-    /** 长按选中、待「加入歌单」的那一首。null = 面板不显示。 */
-    var addTarget by remember { mutableStateOf<MediaLibraryItem?>(null) }
+    /** 长按选中、待弹动作表的那一首。null = 不显示（见 MediaTrackActionHost）。 */
+    var actionTarget by remember { mutableStateOf<MediaLibraryItem?>(null) }
 
     LaunchedEffect(by, key) { media.loadGroupItems(by, key) }
     DisposableEffect(by, key) {
@@ -152,8 +152,9 @@ fun MediaAudioGroupScreen(
                                 mediaAudioRouteOf(it.path, scopeKind = by, scopeKey = key)
                             )
                         },
-                        // 长按 = 加入歌单，与"全部"那一页同一个入口
-                        onLongClick = { addTarget = it }
+                        // 长按 = 动作表，与"全部"那一页同一个入口
+                        onLongClick = { actionTarget = it }
+
                     )
                 }
             }
@@ -172,8 +173,16 @@ fun MediaAudioGroupScreen(
         }
     }
 
-    MediaAddToPlaylistHost(media = media, target = addTarget, onDone = { addTarget = null })
+    MediaTrackActionHost(
+        viewModel = viewModel,
+        target = actionTarget,
+        actionsOf = {
+            mediaTrackActionsFor(it, inPlaylist = false, canEditLibrary = true, canPlayNext = true)
+        },
+        onDone = { actionTarget = null }
+    )
 }
+
 
 /**
  * 页面标题。

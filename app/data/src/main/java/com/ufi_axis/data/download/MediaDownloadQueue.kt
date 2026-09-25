@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /**
  * 「把设备上的视频下载到手机」的任务队列与历史（2026-09-16）。
@@ -81,58 +82,85 @@ object MediaDownloadQueue {
     private var prefs: SharedPreferences? = null
 
     /**
+     * 队列/历史写入的唯一一把锁。
+     *
+     * 写方同时来自 Worker 的 IO 线程与 UI 主线程。`_queue.update {}` 只保证**单次**读改写原子，
+     * 而每个写入口都是"改内存 + 落盘"两步；不串行化就会出现「用户清空的条目被 Worker
+     * 的进度写回复活」这类丢更新。[ensureLoaded] 用的也是这把锁。
+     */
+    private val lock = Any()
+
+    /**
      * 首次使用时从磁盘装载。
      *
      * 幂等：多处入口（媒体库、设置页、Worker）都会调，只有第一次真读盘。
      */
-    @Synchronized
     fun ensureLoaded(context: Context) {
-        if (prefs != null) return
-        val p = context.applicationContext
-            .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        prefs = p
-        _queue.value = decodeTasks(p.getString(KEY_QUEUE, "").orEmpty())
-        _history.value = decodeHistory(p.getString(KEY_HISTORY, "").orEmpty())
+        synchronized(lock) {
+            if (prefs != null) return
+            val p = context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            prefs = p
+            _queue.value = decodeTasks(p.getString(KEY_QUEUE, "").orEmpty())
+            _history.value = decodeHistory(p.getString(KEY_HISTORY, "").orEmpty())
+        }
     }
 
     /** 入队（已存在的路径跳过），返回真正新增的条数。 */
     fun enqueue(context: Context, tasks: List<Task>): Int {
         ensureLoaded(context)
-        val existing = _queue.value.mapTo(HashSet()) { it.path }
-        val added = tasks.filter { it.path.isNotBlank() && it.path !in existing }
-        if (added.isEmpty()) return 0
-        _queue.value = (_queue.value + added).take(QUEUE_LIMIT)
-        persistQueue()
-        return added.size
+        var added = 0
+        synchronized(lock) {
+            _queue.update { current ->
+                val existing = current.mapTo(HashSet()) { it.path }
+                val fresh = tasks.filter { it.path.isNotBlank() && it.path !in existing }
+                added = fresh.size
+                if (fresh.isEmpty()) current else (current + fresh).take(QUEUE_LIMIT)
+            }
+            if (added > 0) persistQueue()
+        }
+        return added
     }
 
     /** 取下一个待处理任务（Worker 用；顺序即入队顺序）。 */
     fun nextPending(): Task? = _queue.value.firstOrNull { it.status != STATUS_ERROR }
 
     fun update(path: String, transform: (Task) -> Task) {
-        val current = _queue.value
-        val index = current.indexOfFirst { it.path == path }
-        if (index < 0) return
-        _queue.value = current.toMutableList().also { it[index] = transform(it[index]) }
-        persistQueue()
+        synchronized(lock) {
+            var hit = false
+            _queue.update { current ->
+                val index = current.indexOfFirst { it.path == path }
+                if (index < 0) {
+                    current
+                } else {
+                    hit = true
+                    current.toMutableList().also { it[index] = transform(it[index]) }
+                }
+            }
+            if (hit) persistQueue()
+        }
     }
 
     /** 完成（成功或失败）：从队列摘掉，写一条历史。失败的留在队列里等重试则传 keep=true。 */
     fun finish(context: Context, task: Task, ok: Boolean, message: String = "") {
         ensureLoaded(context)
-        _queue.value = _queue.value.filterNot { it.path == task.path }
-        _history.value = (listOf(
-            HistoryItem(
-                name = task.name,
-                path = task.path,
-                size = if (task.total > 0) task.total else task.size,
-                at = System.currentTimeMillis(),
-                ok = ok,
-                message = message
-            )
-        ) + _history.value).take(HISTORY_LIMIT)
-        persistQueue()
-        persistHistory()
+        synchronized(lock) {
+            _queue.update { current -> current.filterNot { it.path == task.path } }
+            _history.update { current ->
+                (listOf(
+                    HistoryItem(
+                        name = task.name,
+                        path = task.path,
+                        size = if (task.total > 0) task.total else task.size,
+                        at = System.currentTimeMillis(),
+                        ok = ok,
+                        message = message
+                    )
+                ) + current).take(HISTORY_LIMIT)
+            }
+            persistQueue()
+            persistHistory()
+        }
     }
 
     /** 把失败的那条标成 error 并留在队列里（用户可以手动重试或删除）。 */
@@ -145,18 +173,24 @@ object MediaDownloadQueue {
     }
 
     fun remove(path: String) {
-        _queue.value = _queue.value.filterNot { it.path == path }
-        persistQueue()
+        synchronized(lock) {
+            _queue.update { current -> current.filterNot { it.path == path } }
+            persistQueue()
+        }
     }
 
     fun clearQueue() {
-        _queue.value = emptyList()
-        persistQueue()
+        synchronized(lock) {
+            _queue.value = emptyList()
+            persistQueue()
+        }
     }
 
     fun clearHistory() {
-        _history.value = emptyList()
-        persistHistory()
+        synchronized(lock) {
+            _history.value = emptyList()
+            persistHistory()
+        }
     }
 
     // ── 序列化：制表符分隔的行，字段里出现制表符的概率远低于 `|` 和逗号 ──

@@ -12,6 +12,11 @@
 
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <!-- 播放器 setWakeMode(WAKE_MODE_NETWORK) 要持 PARTIAL_WAKE_LOCK + WifiLock：
+         缺权限时 acquire() 抛 SecurityException，息屏后缓冲断供。app 主清单虽已声明，
+         这里也留一条 —— 服务声明在本模块，模块搬走时权限不该落在别处。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
 
     <application>
         <service

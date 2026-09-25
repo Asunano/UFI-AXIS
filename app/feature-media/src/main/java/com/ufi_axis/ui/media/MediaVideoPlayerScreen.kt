@@ -87,7 +87,19 @@ fun MediaVideoPlayerScreen(
     var currentIndex by remember { mutableStateOf(0) }
     // 下半屏的两页：0 播放列表 / 1 视频详情（与 pager 双向同步）
     var bottomTab by remember { mutableStateOf(0) }
-    val player = rememberUfiExoPlayer(key = "media-video")
+    // 播放失败的提示（票据过期 / 404 / 解码失败）。不给就是静默黑屏。
+    var errorToast by remember { mutableStateOf<ToastMessage?>(null) }
+    val player = rememberUfiExoPlayer(
+        key = "media-video",
+        onError = { e ->
+            errorToast = ToastMessage(
+                text = "播放失败",
+                type = ToastType.ERROR,
+                subtitle = e.message ?: e.javaClass.simpleName
+            )
+        }
+    )
+
 
     // 播完停住（不自动下一个）
     LaunchedEffect(player) {
@@ -218,12 +230,57 @@ fun MediaVideoPlayerScreen(
         }
     }
 
-    // 切片 / 离开页面时补一次（DisposableEffect 的 key 带 currentPath，切片时就会先跑 onDispose）
-    DisposableEffect(currentPath, player) {
+    /*
+     * 切片：用 onPositionDiscontinuity 的 **oldPosition** 落盘"离开的那一项"。
+     *
+     * 不能靠 onDispose 现场读 player.currentPosition：手动切集时播放器已经跳到新片、
+     * 位置≈0，而 mediaSaveProgress 对 < MIN_RESUME_MS 一律写 0 —— 上一集的续播点被清零。
+     * 时长取媒体库里的 duration_ms 而不是 player.duration：回调这一刻 player 上的时长
+     * 已经是新片的（或还没就绪），拿它判"看完了没"会判错。
+     */
+    val videosForSave = rememberUpdatedState(videos)
+    DisposableEffect(player, prefs) {
+        val listener = object : Player.Listener {
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) {
+                // 只认"换项"这三种：REMOVE / INTERNAL 是装卸 playlist 带来的，旧位置不可信
+                if (reason != Player.DISCONTINUITY_REASON_SEEK &&
+                    reason != Player.DISCONTINUITY_REASON_AUTO_TRANSITION &&
+                    reason != Player.DISCONTINUITY_REASON_SKIP
+                ) {
+                    return
+                }
+                if (oldPosition.mediaItemIndex == newPosition.mediaItemIndex) return
+                val leaving = videosForSave.value.getOrNull(oldPosition.mediaItemIndex) ?: return
+                mediaSaveProgress(
+                    prefs,
+                    leaving.path,
+                    oldPosition.positionMs,
+                    leaving.duration_ms
+                )
+            }
+        }
+        player.addListener(listener)
+        onDispose { player.removeListener(listener) }
+    }
+
+    // 离开页面时补一次。key 里**不带** currentPath —— 带上的话切集也会跑 onDispose，
+    // 那一刻读到的是新片的位置，正是上面要修掉的那件事。
+    val currentPathForSave = rememberUpdatedState(currentPath)
+    DisposableEffect(player, prefs) {
         onDispose {
-            mediaSaveProgress(prefs, currentPath, player.currentPosition, player.duration)
+            mediaSaveProgress(
+                prefs,
+                currentPathForSave.value,
+                player.currentPosition,
+                player.duration
+            )
         }
     }
+
 
 
     // 退到后台暂停；回前台不自动续播（避免突然出声）
@@ -389,6 +446,10 @@ fun MediaVideoPlayerScreen(
 
     // 续播提示：只在真的 seek 过之后弹一次，让人知道"不是从头开始"不是 bug
     UfiToastHost(toastMessage = resumeToast, onDismiss = { resumeToast = null })
+
+    // 播放失败提示：与续播提示各占一个 state，互不顶掉
+    UfiToastHost(toastMessage = errorToast, onDismiss = { errorToast = null })
+
 
     // 手动选字幕：列同目录**全部**字幕（不只是同名匹配的）——
     // 压制组命名、单独下载的字幕包经常和视频名对不上，只给自动匹配等于没给。

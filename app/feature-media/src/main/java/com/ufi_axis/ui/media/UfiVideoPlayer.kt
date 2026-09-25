@@ -10,6 +10,7 @@ import android.widget.ImageButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.viewinterop.AndroidView
@@ -18,7 +19,10 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+
 import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -119,11 +123,23 @@ fun rememberUfiExoPlayer(
             )
             .build()
     }
+    // 用 rememberUpdatedState：监听器只在 player 换掉时重建，直接捕获 onError 会用到旧 lambda
+    val errorHandler = rememberUpdatedState(onError)
     DisposableEffect(player) {
-        onDispose { player.release() }
+        val listener = object : Player.Listener {
+            override fun onPlayerError(error: PlaybackException) {
+                errorHandler.value(error)
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
     return player
 }
+
 
 /**
  * 画面 + 控制条（media3 的 [PlayerView] + 项目自定义 controller 布局）。
@@ -334,9 +350,13 @@ suspend fun loadUfiSubtitleTracks(appContext: Context, videoPath: String): List<
                         java.net.URLEncoder.encode(path, "UTF-8")
                 }
             }
+    } catch (e: kotlinx.coroutines.CancellationException) {
+        // 取消不是"拉字幕失败"：吞掉会让调用方的协程继续往下跑
+        throw e
     } catch (e: Exception) {
         emptyList()
     }
+
 
 /**
  * 把一串「视频 + 外挂字幕」装进播放器。

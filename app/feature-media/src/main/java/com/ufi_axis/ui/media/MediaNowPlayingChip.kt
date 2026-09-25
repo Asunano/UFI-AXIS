@@ -166,14 +166,20 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
         fun sync() {
             mediaId = c.currentMediaItem?.mediaId.orEmpty()
             meta = c.mediaMetadata
-            UfiNowPlayingState.isPlaying.value = c.isPlaying
-            UfiNowPlayingState.hasNext.value = c.hasNextMediaItem()
-            UfiNowPlayingState.hasPrev.value = c.hasPreviousMediaItem()
+            // 播放/暂停图标读**播放意图**而不是 isPlaying：切歌那一下 playbackState 会掉进
+            // BUFFERING，isPlaying 随之短暂为 false，图标会抽一下（见 Player.ufiPlayIntent）。
+            UfiNowPlayingState.isPlaying.value = c.ufiPlayIntent()
+            // 两颗键的可用性与 ufiSkipToNext/Previous 用同一条判据：hasNextMediaItem() 在
+            // 单曲循环下恒为 true（"下一项"是自己），键亮着但按下去只会重播当前这首
+            UfiNowPlayingState.hasNext.value = c.ufiCanSkipToNext()
+            UfiNowPlayingState.hasPrev.value = c.ufiCanSkipToPrevious()
             UfiNowPlayingState.mediaId.value = mediaId
             UfiNowPlayingState.repeatMode.value = c.repeatMode
             UfiNowPlayingState.shuffleEnabled.value = c.shuffleModeEnabled
             // 队列空 = 这次进程里还没播过任何东西：标题栏不该为它改版式
             hasContent = c.mediaItemCount > 0 && mediaId.isNotBlank()
+            // 这一个刻意仍用 isPlaying：它决定标题栏挂件要不要让位，
+            // 那是"此刻真的在出声吗"的问题，不是"用户想不想播"。
             playing = c.isPlaying
             ended = c.playbackState == Player.STATE_ENDED
             queueExhausted = !c.hasNextMediaItem() && c.repeatMode == Player.REPEAT_MODE_OFF
@@ -181,6 +187,8 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
         sync()
         val listener = object : Player.Listener {
             override fun onIsPlayingChanged(playing: Boolean) = sync()
+
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) = sync()
             override fun onPlaybackStateChanged(state: Int) = sync()
             override fun onMediaItemTransition(item: MediaItem?, reason: Int) = sync()
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) = sync()
@@ -243,13 +251,25 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             ?: meta?.albumArtist?.toString()?.takeIf { it.isNotBlank() }
             ?: guessed.second
             ?: ""
-        UfiNowPlayingState.artworkUrl.value = meta?.artworkUri?.toString()
     }
 
     val media = viewModel.media
     val mediaState by media.state.collectAsState()
     val trackId = remember(mediaId, mediaState) {
         mediaState.tab(MEDIA_TYPE_AUDIO).items.firstOrNull { it.path == mediaId }?.id
+    }
+
+    /*
+     * 封面：队列项自带的 `artworkUri` 优先，拿不到才用媒体库那份记录的 id 现拼一个。
+     *
+     * 为什么要这个兜底（2026-09-23「迷你条/标题栏挂件不显示封面」）：这两处读的都是**队列项**的
+     * artworkUri，而队列不是只有播放页装的那一种 —— 进程重启后从快照恢复的、以及"这首歌不在
+     * 当前范围里"的单曲兜底队列，都可能没带封面 URL。播放页自己是按 `MediaLibraryItem.id`
+     * 查封面的，所以那一屏永远正常，这个 bug 就这么溜过去了。两条路都取不到才真的没有封面。
+     */
+    LaunchedEffect(meta, trackId) {
+        UfiNowPlayingState.artworkUrl.value = meta?.artworkUri?.toString()
+            ?: trackId?.let { media.coverUrl(it) }
     }
     var lyrics by remember { mutableStateOf<List<UfiAudioLyrics.Line>>(emptyList()) }
     LaunchedEffect(trackId, mediaId) {
@@ -451,9 +471,9 @@ fun UfiAudioNowPlayingChip(navController: NavHostController) {
             durationMs = UfiNowPlayingState.durationMs.value,
             repeatMode = UfiNowPlayingState.repeatMode.value,
             shuffleEnabled = UfiNowPlayingState.shuffleEnabled.value,
-            onPrev = { controller.seekToPreviousMediaItem() },
+            onPrev = { controller.ufiSkipToPrevious() },
             onToggle = { if (isPlaying) controller.pause() else controller.play() },
-            onNext = { controller.seekToNextMediaItem() },
+            onNext = { controller.ufiSkipToNext() },
             onSeek = { controller.seekTo(it) },
             // 三态循环：关 → 列表 → 单曲 → 关（与播放页同一套顺序）
             onCycleRepeat = {
@@ -607,30 +627,36 @@ private fun NowPlayingMiniDialog(
                             .fillMaxHeight(),
                         verticalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(
-                            text = title.ifBlank { "未知曲目" },
-                            style = UfiTextStyles.bodyEmphasis,
-                            color = palette.textPrimary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            // 只有歌名这一行要给右上角那颗图标让位；
-                            // 进度条不让，否则滑块右端会莫名短一截
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(end = DIALOG_TRAILING_RESERVE)
-                                .clickable(
-                                    indication = null,
-                                    interactionSource = remember { MutableInteractionSource() },
-                                    onClick = onGoToPlayer
-                                )
-                        )
-                        Text(
-                            text = artist.ifBlank { "未知歌手" },
-                            style = UfiTextStyles.caption,
-                            color = palette.textSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
+                        // 歌名 + 歌手打包成一组：让 SpaceBetween 只在「文字组 ↔ 进度行」之间分余量。
+                        // 原来三者平级，余量被平均成两个约 2dp 的缝，歌名一换大档余量就被吃掉、
+                        // 歌手会贴在歌名底下；组内间距显式给才稳。
+                        Column {
+                            Text(
+                                text = title.ifBlank { "未知曲目" },
+                                style = UfiTextStyles.panelTitle,
+                                color = palette.textPrimary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                // 只有歌名这一行要给右上角那颗图标让位；
+                                // 进度条不让，否则滑块右端会莫名短一截
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(end = DIALOG_TRAILING_RESERVE)
+                                    .clickable(
+                                        indication = null,
+                                        interactionSource = remember { MutableInteractionSource() },
+                                        onClick = onGoToPlayer
+                                    )
+                            )
+                            Spacer(Modifier.height(DIALOG_TITLE_ARTIST_GAP))
+                            Text(
+                                text = artist.ifBlank { "未知歌手" },
+                                style = UfiTextStyles.caption,
+                                color = palette.textSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                         // 进度：左已播 — 公共滑块 — 右总时长（时间贴在滑块两端，不另起一行）
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -881,13 +907,23 @@ private val CHIP_LYRIC_GAP = 3.dp
  */
 private val DIALOG_SECTION_GAP = 4.dp
 /**
+ * 歌名 → 歌手的间距（2026-09-23）。
+ *
+ * 原来三行平级靠 `SpaceBetween` 自动分余量，缝隙只有约 2dp；歌名换成 16sp 档之后余量更少，
+ * 歌手几乎贴在歌名底下。现在歌名+歌手打包成一组、组内间距写死，
+ * `SpaceBetween` 只负责「文字组 ↔ 进度行」那一段。
+ */
+private val DIALOG_TITLE_ARTIST_GAP = 3.dp
+/**
  * 封面边长，同时也是"歌名 + 歌手 + 进度"这一列的**高度上限**。
  *
- * 88dp 不是随手挑的：`UfiSlider` 的轨道行有 44dp 触摸下限，歌名 bodyEmphasis ≈ 20dp、
- * 歌手 caption ≈ 16dp，三行合计 ≈ 84dp。再小就装不下第三行，再大封面会开始抢版面
- * （上一版让封面跟着内容长到 110dp，弹窗宽度被吃掉一小半）。
+ * 92dp 的来历：`UfiSlider` 的轨道行有 44dp 触摸下限，歌名 `panelTitle`(16sp) ≈ 23dp、
+ * 组内间距 3dp、歌手 `caption` ≈ 16dp，三行合计 ≈ 86dp，留 6dp 给 SpaceBetween 分。
+ * 2026-09-23 从 88dp 提到 92dp：歌名由 14sp 换成 16sp 后 88dp 只剩 2dp 余量，
+ * 字体渲染差一点就会把进度行挤出封面下沿。
+ * 也别再往上加 —— 上一版让封面跟着内容长到 110dp，弹窗宽度被吃掉一小半。
  */
-private val DIALOG_COVER = 88.dp
+private val DIALOG_COVER = 92.dp
 private val DIALOG_COVER_CORNER = 14.dp
 private val DIALOG_COVER_PLACEHOLDER_ICON = 24.dp
 /** 右上角图标：触控区 44dp / 图标 22dp，与标准弹窗关闭按钮同一口径。 */

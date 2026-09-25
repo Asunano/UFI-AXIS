@@ -95,8 +95,9 @@ fun MediaAudioScreen(
 
     var pane by rememberSaveable { mutableIntStateOf(PANE_ALL) }
 
-    /** 长按一首歌之后待「加入歌单」的那一首。null = 面板不显示。 */
-    var addTarget by remember { mutableStateOf<MediaLibraryItem?>(null) }
+    /** 长按一首歌之后弹出的动作表的目标。null = 不显示（见 MediaTrackActionHost）。 */
+    var actionTarget by remember { mutableStateOf<MediaLibraryItem?>(null) }
+
 
     /** 「新建歌单」输入框（右上角那颗按钮的入口，与面板里的"新建并加入"是两条路）。 */
     var creatingPlaylist by remember { mutableStateOf(false) }
@@ -228,9 +229,11 @@ fun MediaAudioScreen(
                     )
                 },
                 listState = paneListStates[PANE_ALL],
-                // 长按 = 加入歌单。列表页只有这一个长按动作，所以直接开歌单选择面板，
-                // 不再套一层只有一项的操作菜单
-                onLongClick = { addTarget = it }
+                // 长按 = 打开动作表（加入歌单 / 歌曲信息 / 下载到手机）。
+                // 2026-09-23 之前这里直接弹歌单选择面板 —— 那时长按只有一个动作，
+                // 现在有多个，必须先经过菜单这一层
+                onLongClick = { actionTarget = it }
+
             )
 
             pane == PANE_PLAYLIST -> {
@@ -283,7 +286,16 @@ fun MediaAudioScreen(
 
     // ── 歌单相关的弹窗（都挂在页面这一层，与列表子树的存亡无关）──
 
-    MediaAddToPlaylistHost(media = media, target = addTarget, onDone = { addTarget = null })
+    MediaTrackActionHost(
+        viewModel = viewModel,
+        target = actionTarget,
+        // 整库列表：不在歌单里，所以没有「移出歌单」
+        actionsOf = {
+            mediaTrackActionsFor(it, inPlaylist = false, canEditLibrary = true, canPlayNext = true)
+        },
+        onDone = { actionTarget = null }
+    )
+
 
 
     if (creatingPlaylist) {

@@ -1,6 +1,9 @@
 package com.ufi_axis.ui.media
 
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -143,6 +146,8 @@ internal fun rememberMediaSeekState(): MediaSeekState {
  *                "同一个进度条"这件事不该因为它出现在哪一屏而变样。
  * @param sharedKey 跨页面共享元素的 key（见 [ufiSharedBounds]）；`null` = 不参与转场。
  *                  挂在**轨道**而不是触控区上，理由见下方实现里的注释。
+ * @param trackKey 当前曲目的标识。**换歌时**已播段会从旧位置平滑走到新位置，而不是瞬移。
+ *                 `null` = 不要这个平滑（永远瞬移）。为什么需要它见 [rememberSeekDisplayFraction]。
  */
 @Composable
 internal fun MediaSeekBar(
@@ -151,11 +156,17 @@ internal fun MediaSeekBar(
     positionMs: Long,
     onSeek: (Long) -> Unit,
     compact: Boolean = false,
-    sharedKey: String? = null
+    sharedKey: String? = null,
+    trackKey: Any? = null
 ) {
     val palette = LocalResolvedPalette.current
     val enabled = durationMs > 0
-    val fraction = state.fraction(durationMs, positionMs)
+    val fraction = rememberSeekDisplayFraction(
+        target = state.fraction(durationMs, positionMs),
+        trackKey = trackKey,
+        dragging = state.dragging
+    )
+
     val trackHeight by animateDpAsState(
         targetValue = if (state.dragging) SEEK_TRACK_ACTIVE else SEEK_TRACK_IDLE,
         animationSpec = UfiMotion.sliderTrack(),
@@ -185,24 +196,31 @@ internal fun MediaSeekBar(
                     state.onDragStart((down.position.x / width).coerceIn(0f, 1f))
                     down.consume()
                     var canceled = false
-                    while (true) {
-                        val event = awaitPointerEvent()
-                        val change = event.changes.firstOrNull { it.id == down.id }
-                        if (change == null) {
-                            canceled = true
-                            break
+                    // finally 不能省：pointerInput 的 key 含 durationMs，拖动中换歌会取消这条
+                    // 手势协程 —— 没有它 dragging 永久停在 true，播放页的进度与时间文字不再刷新
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id }
+                            if (change == null) {
+                                canceled = true
+                                break
+                            }
+                            state.onDrag((change.position.x / width).coerceIn(0f, 1f))
+                            change.consume()
+                            if (!change.pressed) break
                         }
-                        state.onDrag((change.position.x / width).coerceIn(0f, 1f))
-                        change.consume()
-                        if (!change.pressed) break
-                    }
-                    if (canceled) {
-                        state.onDragCancel()
-                    } else {
-                        state.onDragEnd(durationMs)?.let(onSeek)
+                        if (canceled) {
+                            state.onDragCancel()
+                        } else {
+                            state.onDragEnd(durationMs)?.let(onSeek)
+                        }
+                    } finally {
+                        if (state.dragging) state.onDragCancel()
                     }
                 }
             },
+
         // compact 形态把手势区的余量全部留给**下方**：这条轨道是迷你条的上边界，
         // 上方再留几 dp 底色就会读成"进度条上面还压着一条空条"（见 MediaAudioMiniBar 的说明）。
         contentAlignment = if (compact) Alignment.TopCenter else Alignment.Center
@@ -245,7 +263,58 @@ internal fun MediaSeekBar(
 }
 
 /**
+ * 已播段该画到哪（0..1）。平时就是 [target]，**只在换歌那一下**做平滑。
+ *
+ * ## 为什么需要它
+ * 换歌时 [target] 是瞬变的（上一首 69% → 新一首 0%），进度条会"啪"地弹回去。
+ * 封面那边已经改成柔和的对焦落位之后，这一下就成了整屏最跳眼的东西。
+ *
+ * ## 为什么不能简单地给它套一个 tween
+ * 播放位置是**轮询**回来的（播放页 500ms、迷你条 1s）。若常态带补间，每个周期都在
+ * 追一个已经往前跑了的目标，观感是进度条永远慢半拍、像根橡皮筋 ——
+ * 而进度条恰恰是这一页唯一要求"所见即实际位置"的控件。
+ *
+ * 所以平滑是**有时间窗的**：[trackKey] 一变就开窗 [SEEK_SWITCH_SMOOTH_MS]，窗内用 tween、
+ * 窗外用 `snap`。窗口长度取得比一个轮询周期短，保证窗关掉时最多只经过一次回读。
+ *
+ * ## 三种必须瞬移的情况
+ * 1. **手指正按着**（[dragging]）—— 显示必须跟手，慢一帧都算迟滞；
+ * 2. **首次组合** —— 进页时 fraction 从 0 变成真实值，平滑会让进度条"长出来"一下；
+ * 3. [trackKey] 为 null —— 调用方明确不要这个行为。
+ */
+@Composable
+private fun rememberSeekDisplayFraction(
+    target: Float,
+    trackKey: Any?,
+    dragging: Boolean
+): Float {
+    var smoothing by remember { mutableStateOf(false) }
+    var firstPass by remember { mutableStateOf(true) }
+    LaunchedEffect(trackKey) {
+        if (firstPass || trackKey == null) {
+            firstPass = false
+            return@LaunchedEffect
+        }
+        smoothing = true
+        delay(SEEK_SWITCH_SMOOTH_MS.toLong())
+        smoothing = false
+    }
+    val animated by animateFloatAsState(
+        targetValue = target,
+        // snap 而不是 tween(0)：前者根本不起动画，后者仍会走一帧调度
+        animationSpec = if (smoothing && !dragging) {
+            tween(SEEK_SWITCH_SMOOTH_MS, easing = UfiMotion.Easing.Standard)
+        } else {
+            snap()
+        },
+        label = "seekDisplayFraction"
+    )
+    return animated
+}
+
+/**
  * 轨道粗细：平时 / 按住时。
+
  *
  * 2026-09-16 加粗一轮（6/12dp，原 4/8dp）：4dp 在真机上又难看清又难对准，
  * 而这是播放页唯一需要"精确定位"的控件。迷你条也用同一组值 ——
@@ -275,3 +344,15 @@ private val SEEK_TOUCH_HEIGHT_COMPACT = 14.dp
  * "松手回弹一下再跳过去"。
  */
 private const val SEEK_PENDING_HOLD_MS = 1_500L
+
+/**
+ * 换歌时已播段平滑过去的时长，也是"允许平滑"那个时间窗的长度。
+ *
+ * 与封面的基准时长（`AUDIO_SWITCH_MS` = 280）对齐：这两件事是同一次切歌的两个面，
+ * 不该一个还在走、另一个已经停了。
+ *
+ * **上限受轮询周期约束**：必须短于最快那条位置轮询（播放页 500ms），否则窗内会经过
+ * 两次以上回读，补间被反复重定向，反而看出抖动。
+ */
+private const val SEEK_SWITCH_SMOOTH_MS = 280
+

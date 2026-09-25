@@ -182,9 +182,16 @@ class MediaDownloadWorker(
         }
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
             ?: throw IllegalStateException("无法在 $relativeDir 创建文件")
-        resolver.openOutputStream(uri)?.use { out ->
-            source.inputStream().use { it.copyTo(out) }
-        } ?: throw IllegalStateException("无法写入 $relativeDir/$fileName")
+        // 写失败必须把 IS_PENDING=1 的记录删掉：pending 记录对用户不可见，
+        // 留着就是一条谁都清理不掉的占位项（下次同名下载还会多一条）。
+        try {
+            resolver.openOutputStream(uri)?.use { out ->
+                source.inputStream().use { it.copyTo(out) }
+            } ?: throw IllegalStateException("无法写入 $relativeDir/$fileName")
+        } catch (e: Throwable) {
+            runCatching { resolver.delete(uri, null, null) }
+            throw e
+        }
         values.clear()
         values.put(MediaStore.Downloads.IS_PENDING, 0)
         resolver.update(uri, values, null, null)
