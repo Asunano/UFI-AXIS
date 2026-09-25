@@ -2,6 +2,8 @@ package com.ufi_axis.installer.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -54,15 +56,41 @@ class AddressParserTest {
     @Test
     fun `端口非法时回退到默认端口`() {
         assertEquals(5555, AddressParser.parse("192.168.0.1:abc").port)
-        // 注意：hostPort 会保留原始字符串，这是刻意为之，便于日志回显用户输入
-        assertEquals("192.168.0.1:abc", AddressParser.parse("192.168.0.1:abc").hostPort)
+        // hostPort 必须跟着回落后的端口重建，原始输入只放进 warning
+        assertEquals("192.168.0.1:5555", AddressParser.parse("192.168.0.1:abc").hostPort)
     }
 
     @Test
-    fun `IPv6 形式取最后一个冒号作为端口分隔`() {
-        val p = AddressParser.parse("fe80::1:5555")
-        assertEquals("fe80::1", p.host)
+    fun `容错处理必须带出原因而不是静默替换`() {
+        val badPort = AddressParser.parse("192.168.0.1:abc")
+        assertTrue("端口非法要说明已回退", badPort.warning?.contains("abc") == true)
+
+        val empty = AddressParser.parse("")
+        assertTrue("空输入要说明用了默认地址", empty.warning?.contains("默认") == true)
+
+        // 输入被原样采用时不应产生多余提示
+        assertNull(AddressParser.parse("10.0.0.7:6000").warning)
+    }
+
+    @Test
+    fun `裸 IPv6 判非法，方括号形式才被接受`() {
+        // 裸 IPv6 分不清哪个冒号是端口分隔符，只能判非法让用户重填
+        assertThrows(AddressParser.InvalidAddressException::class.java) {
+            AddressParser.parse("fe80::1:5555")
+        }
+        assertThrows(AddressParser.InvalidAddressException::class.java) {
+            AddressParser.parse("fe80::1")
+        }
+
+        val p = AddressParser.parse("[fe80::1]:5555")
+        assertEquals("[fe80::1]", p.host)
         assertEquals(5555, p.port)
+        assertEquals("[fe80::1]:5555", p.hostPort)
+        // healthUrl 必须带方括号，否则不是合法 URL
+        assertEquals("http://[fe80::1]:8088/health", p.healthUrl())
+
+        // 不带端口时补默认端口
+        assertEquals("[::1]:5555", AddressParser.parse("[::1]").hostPort)
     }
 
     @Test

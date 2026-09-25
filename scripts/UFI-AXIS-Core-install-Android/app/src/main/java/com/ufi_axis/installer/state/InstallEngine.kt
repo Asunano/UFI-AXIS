@@ -10,7 +10,6 @@ import com.ufi_axis.adbcore.AdbTlsRequiredException
 import com.ufi_axis.adbcore.AdbCrypto
 import com.ufi_axis.adbcore.PortProbe
 import com.ufi_axis.adbcore.AdbException
-import com.ufi_axis.adbcore.AdbStream
 import com.ufi_axis.adbcore.AdbTimeoutException
 import com.ufi_axis.installer.core.AddressParser
 import com.ufi_axis.installer.core.AppLauncher
@@ -29,10 +28,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import java.io.File
+import kotlinx.coroutines.isActive
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -69,7 +67,6 @@ object InstallEngine {
     // 内部运行时
     // ------------------------------------------------------------------
 
-    private var scope: CoroutineScope? = null
     private var job: Job? = null
 
     /** 应用 Context，由 [attach] 注入（前台服务 onCreate 时调用） */
@@ -78,17 +75,27 @@ object InstallEngine {
     /** 当前 ADB 客户端，一次安装流程内复用 */
     private var client: AdbClient? = null
 
-    /** 用户点击「重试」/「取消」的应答 */
-    private var confirmSignal: CompletableDeferred<Boolean>? = null
+    /** 用户点击「确认安装」/「取消」的应答。与其它 signal 一致用原子引用，跨线程可见 */
+    private val confirmSignal =
+        java.util.concurrent.atomic.AtomicReference<CompletableDeferred<Boolean>?>()
 
-    /** 用户选择的地址（确认弹窗里可能改过） */
-    private var resolvedAddress: AddressParser.Parsed? = null
+    /** 向导页已经点过「确认安装」：引擎直接跳过 CONFIRM 等待 */
+    private val preConfirmed = AtomicBoolean(false)
 
     /** 用户选定的 APK */
     private var selectedApk: AssetApkProvider.AssetApk? = null
 
     /** 正在运行中 */
     private val busy = AtomicBoolean(false)
+
+    /**
+     * 用户主动请求了取消。
+     *
+     * [cancel] 除了 cancel 协程还会直接关掉 ADB 连接来打断阻塞 I/O，
+     * 被打断的调用会抛出 `AdbConnectionClosedException` 而不是 `CancellationException`，
+     * 所以要靠这个标记把它归类成「已取消」而不是「连接断开」。
+     */
+    private val cancelRequested = AtomicBoolean(false)
 
     /** 连接阶段是否已经给过「请到设备上允许」的提示，避免刷屏 */
     private var authHintShown = false
@@ -122,70 +129,114 @@ object InstallEngine {
             InstallLogger.error("InstallEngine 尚未 attach(Context)")
             return
         }
-        this.scope = scope
+        if (!scope.isActive) {
+            // 服务正在销毁时收到 START：协程体不会执行，若不在这里复位 busy
+            // 就会永久卡在「已有安装任务在运行」，只能杀进程恢复
+            busy.set(false)
+            InstallLogger.error("安装服务已停止，无法启动安装，请重新打开应用再试")
+            return
+        }
 
-        InstallLogger.startSession(ctx)
+        cancelRequested.set(false)
         update { InstallState() }
 
         job = scope.launch {
             var success = false
             var failReason: String? = null
+            var cancelled = false
             try {
+                // 建目录 + 打开文件写入器是磁盘 I/O，必须离开主线程
+                withContext(Dispatchers.IO) { InstallLogger.startSession(ctx) }
                 runFlow(ctx, address)
                 success = true
             } catch (e: CancellationException) {
+                cancelled = true
                 failReason = "用户取消"
-                InstallLogger.warn("安装已被取消")
-                update { s ->
-                    s.copy(
-                        stage = InstallStage.FAILED,
-                        statusText = "已取消",
-                        errorMessage = "用户取消了安装",
-                        finished = true,
-                        success = false
-                    )
-                }
+                markCancelled()
+                throw e
             } catch (e: Throwable) {
-                failReason = humanize(e)
-                InstallLogger.error(failReason)
-                update { s ->
-                    s.copy(
-                        stage = InstallStage.FAILED,
-                        statusText = "安装失败",
-                        errorMessage = failReason!!,
-                        finished = true,
-                        success = false
-                    )
+                if (cancelRequested.get()) {
+                    // 取消时主动关闭了连接，被打断的阻塞 I/O 抛出的是连接异常，
+                    // 这里按「已取消」收敛，避免给用户报成莫名的连接错误
+                    cancelled = true
+                    failReason = "用户取消"
+                    markCancelled()
+                } else {
+                    failReason = humanize(e)
+                    InstallLogger.error(failReason)
+                    update { s ->
+                        s.copy(
+                            stage = InstallStage.FAILED,
+                            statusText = "安装失败",
+                            errorMessage = failReason!!,
+                            finished = true,
+                            success = false
+                        )
+                    }
                 }
             } finally {
-                cleanup()
+                cleanup(ctx)
                 busy.set(false)
                 InstallLogger.endSession(success, failReason)
-                finishNotification(ctx, success, failReason)
+                finishNotification(ctx, success, if (cancelled) "已取消" else failReason)
             }
+        }
+        // 兜底：协程因作用域取消而从未执行时，finally 不会跑，这里保证 busy 一定复位
+        job?.invokeOnCompletion { busy.set(false) }
+    }
+
+    private fun markCancelled() {
+        InstallLogger.warn("安装已被取消")
+        update { s ->
+            s.copy(
+                stage = InstallStage.FAILED,
+                statusText = "已取消",
+                errorMessage = "用户取消了安装",
+                finished = true,
+                success = false
+            )
         }
     }
 
-    /** 用户取消 */
+    /**
+     * 用户取消。
+     *
+     * 仅 `job.cancel()` 是不够的：推送 / shell / HTTP 都是不可中断的阻塞调用，
+     * 最坏要等到 `INSTALL_TIMEOUT_MS`（180s）才退出。这里同时关掉 ADB 连接，
+     * 让阻塞的 socket 立刻抛错，取消才是「立即生效」的。
+     */
     fun cancel() {
         if (!busy.get()) return
+        cancelRequested.set(true)
+        InstallLogger.warn("收到取消请求，正在中断与设备的连接…")
+        update { it.copy(statusText = "正在取消…") }
+        confirmSignal.get()?.complete(false)
         job?.cancel()
-        confirmSignal?.complete(false)
+        try {
+            client?.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    /** 向导页点了「确认安装」：引擎据此跳过 CONFIRM 等待，[cleanup] / [reset] 会复位 */
+    fun markPreConfirmed() {
+        preConfirmed.set(true)
     }
 
     /** 用户在确认弹窗点「确认安装」 */
     fun confirmInstall() {
-        confirmSignal?.complete(true)
+        confirmSignal.get()?.complete(true)
     }
 
     /** 用户在确认弹窗点「取消」 */
     fun rejectInstall() {
-        confirmSignal?.complete(false)
+        confirmSignal.get()?.complete(false)
     }
 
     /** 用户点「重新开始」：清理上一轮状态 */
     fun reset() {
         if (busy.get()) return
+        preConfirmed.set(false)
         update { InstallState(statusText = "准备就绪") }
     }
 
@@ -195,16 +246,21 @@ object InstallEngine {
         update { it.copy(address = address) }
     }
 
-    private fun cleanup() {
+    private fun cleanup(ctx: Context) {
         try {
             client?.close()
         } catch (_: Exception) {
         }
         client = null
-        confirmSignal = null
-        resolvedAddress = null
+        confirmSignal.set(null)
+        preConfirmed.set(false)
         selectedApk = null
         authHintShown = false
+        // 解出的 APK 有几十 MB，装完立刻删，不留到下一次安装才清
+        try {
+            AssetApkProvider.clearCache(ctx)
+        } catch (_: Exception) {
+        }
     }
 
     private fun finishNotification(ctx: Context, success: Boolean, reason: String?) {
@@ -212,7 +268,7 @@ object InstallEngine {
             NotificationHelper.finish(
                 ctx,
                 if (success) "UFI-AXIS 安装完成" else "UFI-AXIS 安装失败",
-                if (success) "核心服务已就绪" else (reason ?: "未知错误")
+                if (success) "核心服务已就绪" else brief(reason)
             )
         } catch (_: Exception) {
         }
@@ -246,9 +302,10 @@ object InstallEngine {
         // ---------- 步骤 2：解析地址 ----------
         setStage(InstallStage.PARSE_ADDR)
         val parsed = AddressParser.parse(addressInput)
-        resolvedAddress = parsed
         update { it.copy(address = parsed.hostPort, packageName = "") }
-        InstallLogger.info("设备地址：${parsed.hostPort}（健康检查 http://${parsed.host}:${AddressParser.DEFAULT_HEALTH_PORT}/health）")
+        // 端口非法等「已被容错处理」的输入必须说出来，不能静默替用户改掉
+        parsed.warning?.let { InstallLogger.warn("地址输入提示：$it") }
+        InstallLogger.info("设备地址：${parsed.hostPort}（健康检查 ${parsed.healthUrl()}）")
 
         // ---------- 步骤 2.5：连接前探测（端口可达性） ----------
         setStage(InstallStage.PREFLIGHT)
@@ -273,16 +330,8 @@ object InstallEngine {
         connectWithRetry(ctx, parsed)
 
         // ---------- 步骤 4：确认安装 ----------
-        setStage(InstallStage.CONFIRM, "等待确认安装", -1)
-        update {
-            it.copy(
-                pendingApkName = core.name,
-                pendingApkSize = core.sizeBytes
-            )
-        }
-        InstallLogger.info("等待用户确认安装 ${core.name}")
-
-        val approved = awaitConfirm()
+        // 注册与发布的先后顺序由 awaitConfirm 内部保证，这里不要再提前 setStage(CONFIRM)
+        val approved = awaitConfirm(core)
         if (!approved) {
             throw InstallException("用户取消了安装")
         }
@@ -310,34 +359,50 @@ object InstallEngine {
         InstallLogger.info("已解出 APK 到 ${localApk.absolutePath}（${formatSize(localApk.length())}）")
 
         val conn = client ?: throw InstallException("连接意外断开")
+
+        // 安装前先记下第三方包清单，装完做差集才能真正定位新包
+        val packagesBefore = try {
+            conn.listPackages(onlyThirdParty = true).toSet()
+        } catch (e: Exception) {
+            if (e is CancellationException) throw e
+            InstallLogger.warn("安装前列包失败，稍后将无法用差集识别包名：${humanize(e)}")
+            emptySet()
+        }
+
         var lastPercent = -1
         conn.installApk(
             apkFile = localApk,
             remoteName = core.name,
             onProgress = { sent, total ->
                 val pct = if (total > 0) ((sent * 100) / total).toInt() else -1
-                if (pct != lastPercent && pct % 5 == 0) {
+                // 按 5% 步长节流：不能写成 pct % 5 == 0，大文件下百分比会跳过 5 的倍数
+                if (pct >= 0 && (pct >= lastPercent + PROGRESS_STEP || pct == 100)) {
                     lastPercent = pct
                     update { it.copy(progress = pct, statusText = "正在推送 APK… $pct%") }
-                    // 推送很大，日志只记整十百分比，避免刷屏
                 }
-            }
+            },
+            onNotice = { InstallLogger.warn("安装回退：$it") }
         )
         InstallLogger.ok("APK 安装成功（pm install）")
         update { it.copy(progress = -1, statusText = "APK 安装完成") }
 
         // ---------- 步骤 6：识别包名 ----------
         setStage(InstallStage.RESOLVE_PKG)
-        val pkg = resolvePackageName(conn, core)
+        val pkg = resolvePackageName(conn, core, packagesBefore)
         update { it.copy(packageName = pkg) }
         InstallLogger.ok("包名：$pkg")
 
         // ---------- 步骤 7：授予权限 ----------
         setStage(InstallStage.GRANT, "正在授予权限…", 0)
         update { it.copy(totalPermissions = PermissionGranter.PERMISSIONS.size) }
-        val grantResults = PermissionGranter.grantAll(conn, pkg) { index, total, perm, ok ->
-            if (ok) InstallLogger.ok("[$index/$total] $perm")
-            else InstallLogger.warn("[$index/$total] $perm（失败，已跳过）")
+        val grantResults = PermissionGranter.grantAll(conn, pkg) { index, total, perm, outcome, detail ->
+            when (outcome) {
+                PermissionGranter.Outcome.GRANTED -> InstallLogger.ok("[$index/$total] $perm")
+                PermissionGranter.Outcome.NOT_APPLICABLE ->
+                    InstallLogger.info("[$index/$total] $perm（本机不适用，跳过${detail?.let { "：$it" } ?: ""}）")
+                PermissionGranter.Outcome.FAILED ->
+                    InstallLogger.warn("[$index/$total] $perm（失败，已跳过${detail?.let { "：$it" } ?: ""}）")
+            }
             update {
                 it.copy(
                     grantedCount = index,
@@ -346,8 +411,19 @@ object InstallEngine {
                 )
             }
         }
-        val grantedOk = grantResults.count { it.granted }
-        InstallLogger.info("权限授予完成：$grantedOk/${grantResults.size} 成功")
+        val grantedOk = grantResults.count { it.outcome == PermissionGranter.Outcome.GRANTED }
+        val skipped = grantResults.count { it.outcome == PermissionGranter.Outcome.NOT_APPLICABLE }
+        val failed = grantResults.count { it.outcome == PermissionGranter.Outcome.FAILED }
+        // 「不适用」和「失败」必须分开报，否则用户无法判断有没有真问题
+        InstallLogger.info(
+            "权限授予完成：成功 $grantedOk / 本机不适用 $skipped / 失败 $failed（共 ${grantResults.size}）"
+        )
+        if (failed > 0) {
+            InstallLogger.warn(
+                "失败项：${grantResults.filter { it.outcome == PermissionGranter.Outcome.FAILED }
+                    .joinToString { it.permission }}"
+            )
+        }
         update { it.copy(progress = -1) }
 
         // ---------- 步骤 8：启动应用 ----------
@@ -384,8 +460,11 @@ object InstallEngine {
             InstallLogger.info("连接设备 ${current.hostPort}…")
 
             try {
-                val c = AdbClient(AdbCrypto(ctx.filesDir))
+                // 先关掉上一次的连接再建新的，顺序不能反，否则 connect 抛错时
+                // client 字段还指向已经关闭的旧实例
                 client?.close()
+                client = null
+                val c = AdbClient(AdbCrypto(ctx.filesDir))
                 c.connect(
                     host = current.host,
                     port = current.port,
@@ -468,19 +547,20 @@ object InstallEngine {
         }
         throw InstallException(
             "健康检查失败：已重试 ${HealthChecker.MAX_ATTEMPTS} 次仍未就绪。\n" +
-                "请确认设备上 ${parsed.host} 的 8088 端口可访问，或查看日志排查。"
+                "请确认设备上 ${parsed.host} 的 ${AddressParser.DEFAULT_HEALTH_PORT} 端口可访问，或查看日志排查。"
         )
     }
 
     /**
      * 识别包名。优先级：
      * 1. 固定包名 `com.ufi_axis_core`（`pm path` 验证）
-     * 2. 安装前后包列表做差
+     * 2. 安装前后第三方包列表做差集（[packagesBefore] 是安装前的快照）
      * 3. 都失败则让用户手动输入
      */
     private suspend fun resolvePackageName(
         conn: AdbClient,
-        apk: AssetApkProvider.AssetApk
+        apk: AssetApkProvider.AssetApk,
+        packagesBefore: Set<String>
     ): String {
         // 1) 固定包名
         val fixed = AssetApkProvider.CORE_PACKAGE
@@ -495,15 +575,27 @@ object InstallEngine {
             InstallLogger.warn("验证固定包名失败：${humanize(e)}")
         }
 
-        // 2) 差集
+        // 2) 差集：安装后新增的第三方包
         try {
-            val candidates = conn.listPackages(onlyThirdParty = true)
-                .filter { it != fixed }
-            // 差集只能给出「可能的候选」，无法精确定位，这里取最近安装的一个
-            val newest = candidates.lastOrNull()
-            if (newest != null && looksLikeCore(newest)) {
-                InstallLogger.info("差集识别到候选包名：$newest")
-                return newest
+            val after = conn.listPackages(onlyThirdParty = true)
+            // 包名随后会被拼进设备侧 shell（pm grant / appops / am start），
+            // 这里就按白名单过滤，含空格或 `; $()` 的行一律不当候选
+            val added = after.filter { it !in packagesBefore && it != fixed && isValidPackageName(it) }
+            when {
+                added.size == 1 -> {
+                    InstallLogger.info("差集识别到新增包名：${added[0]}")
+                    return added[0]
+                }
+                added.isEmpty() ->
+                    InstallLogger.warn("差集为空（安装前后包列表无变化，可能是覆盖安装）")
+                else -> {
+                    val hit = added.firstOrNull { looksLikeCore(it) }
+                    if (hit != null) {
+                        InstallLogger.info("差集有多个新增包，按关键字选中：$hit（候选：${added.joinToString()}）")
+                        return hit
+                    }
+                    InstallLogger.warn("差集有多个新增包且无法区分：${added.joinToString()}")
+                }
             }
             InstallLogger.warn("差集未找到匹配 ${apk.name} 的包名")
         } catch (e: Exception) {
@@ -518,9 +610,17 @@ object InstallEngine {
         val manual = awaitManualPackage()
         update { it.copy(interaction = InstallInteraction.NONE) }
         if (manual.isBlank()) throw InstallException("未能确定包名")
+        // 双保险：submitManualPackage 已拦过一次，这里是「进设备 shell 前」的最后一道
+        if (!isValidPackageName(manual)) throw InstallException("包名「$manual」不是合法包名，已终止安装")
         InstallLogger.info("用户输入包名：$manual")
         return manual
     }
+
+    /**
+     * 包名白名单。包名会被裸拼进设备侧 shell（`pm grant` / `appops set` / `pm path` / `am start`），
+     * 含空格或 `; $()` 就会被设备 shell 当成额外命令执行，所以只放行合法包名字符。
+     */
+    private fun isValidPackageName(pkg: String): Boolean = PACKAGE_NAME_REGEX.matches(pkg)
 
     private fun looksLikeCore(pkg: String): Boolean {
         val lower = pkg.lowercase()
@@ -531,13 +631,35 @@ object InstallEngine {
     // 人工交互（挂起等待界面回应）
     // ------------------------------------------------------------------
 
-    private suspend fun awaitConfirm(): Boolean {
+    /**
+     * 等用户确认安装。
+     *
+     * 顺序是关键：**先注册 signal，再发布 CONFIRM 阶段**。反过来的话，界面在主线程
+     * 一收到 CONFIRM 就会立刻调 [confirmInstall]（向导页已确认时是自动放行），
+     * 那一刻 signal 还没赋值，complete 是空操作，这里的 await 就再也没人唤醒，
+     * 安装会永久停在「等待确认安装」。
+     *
+     * 两层兜底：① 向导页已经点过「确认安装」（[markPreConfirmed]）就不再等；
+     * ② 等待超时（界面已销毁、没人回应）按已确认继续——安装任务本来就只能由
+     * 向导页的「确认安装」按钮发起，不存在「用户没同意就装」的情况。
+     */
+    private suspend fun awaitConfirm(core: AssetApkProvider.AssetApk): Boolean {
+        update { it.copy(pendingApkName = core.name, pendingApkSize = core.sizeBytes) }
+        if (preConfirmed.get()) {
+            InstallLogger.info("向导页已确认安装 ${core.name}，跳过确认等待")
+            return true
+        }
         val signal = CompletableDeferred<Boolean>()
-        confirmSignal = signal
+        confirmSignal.set(signal)
+        setStage(InstallStage.CONFIRM, "等待确认安装", -1)
+        InstallLogger.info("等待用户确认安装 ${core.name}")
         return try {
-            signal.await()
+            withTimeoutOrNull(CONFIRM_TIMEOUT_MS) { signal.await() } ?: run {
+                InstallLogger.warn("等待确认安装超时（${CONFIRM_TIMEOUT_MS / 1000}s），按已确认继续")
+                true
+            }
         } finally {
-            confirmSignal = null
+            confirmSignal.set(null)
         }
     }
 
@@ -566,8 +688,8 @@ object InstallEngine {
             update { it.copy(interaction = InstallInteraction.NONE) }
         }
         val parsed = AddressParser.parse(input)
-        resolvedAddress = parsed
         update { it.copy(address = parsed.hostPort) }
+        parsed.warning?.let { InstallLogger.warn("地址输入提示：$it") }
         InstallLogger.info("地址已改为：${parsed.hostPort}")
         return parsed
     }
@@ -592,12 +714,16 @@ object InstallEngine {
         addressChangeSignal.get()?.complete(input)
     }
 
+    /** 界面提交手动输入的包名。非法包名直接拒收并要求重输，不往设备 shell 里送。 */
     fun submitManualPackage(pkg: String) {
-        manualPackageSignal.get()?.complete(pkg.trim())
+        val trimmed = pkg.trim()
+        if (!isValidPackageName(trimmed)) {
+            InstallLogger.error("包名「$trimmed」不合法（只允许字母、数字、下划线和点，且不能以点开头），请重新输入")
+            update { it.copy(statusText = "包名不合法，请重新输入") }
+            return
+        }
+        manualPackageSignal.get()?.complete(trimmed)
     }
-
-    /** 界面当前是否需要用户回应连接失败 */
-    fun needsConnectDecision(): Boolean = _state.value.stage == InstallStage.CONNECT && connectActionSignal.get() != null
 
     // ------------------------------------------------------------------
     // 错误翻译
@@ -605,6 +731,7 @@ object InstallEngine {
 
     private fun humanize(e: Throwable): String = when (e) {
         is InstallException -> e.message ?: "安装失败"
+        is AddressParser.InvalidAddressException -> "设备地址不合法：${e.message ?: "请检查输入"}"
         is AdbConnectException ->
             "无法连接到设备（${e.message ?: "网络不可达"}）。\n" +
                 "请检查：① 设备无线调试已开启 ② 手机与设备在同一局域网 ③ 设备已允许本机调试"
@@ -651,6 +778,12 @@ object InstallEngine {
     /** 启动后等待服务初始化的时间，对应 bat 的 `timeout /t 5` */
     const val LAUNCH_SETTLE_MS = 5_000L
 
-    @Suppress("unused")
-    private val KEEP_REFS: Any = AdbStream.INSTALL_TIMEOUT_MS to brief(null)
+    /** 推送进度上报的最小步长（百分比） */
+    private const val PROGRESS_STEP = 5
+
+    /** 等待「确认安装」的上限：超时按已确认继续，不让安装永久停在这一步 */
+    private const val CONFIRM_TIMEOUT_MS = 60_000L
+
+    /** 合法包名字符：首字符不能是点，其余只允许字母、数字、下划线和点 */
+    private val PACKAGE_NAME_REGEX = Regex("^[A-Za-z0-9_][A-Za-z0-9_.]*$")
 }

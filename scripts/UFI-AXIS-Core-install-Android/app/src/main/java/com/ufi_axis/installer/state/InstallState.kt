@@ -1,7 +1,5 @@
 package com.ufi_axis.installer.state
 
-import com.ufi_axis.adbcore.AdbClient
-
 /**
  * 安装引擎向界面暴露的唯一状态快照。
  *
@@ -64,9 +62,4 @@ data class InstallState(
 
     /** 是否已完成且正在等待用户查看结果（用于展示重试/分享按钮） */
     val showResultActions: Boolean get() = stage == InstallStage.DONE || stage == InstallStage.FAILED
-
-    companion object {
-        /** 把包名常量提上来，方便界面在没有 state 时显示默认值 */
-        val DEFAULT_PACKAGE: String = AdbClient.TARGET_PACKAGE
-    }
 }

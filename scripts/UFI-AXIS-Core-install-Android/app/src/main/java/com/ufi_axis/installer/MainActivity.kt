@@ -30,8 +30,10 @@ import com.ufi_axis.installer.state.InstallInteraction
 import com.ufi_axis.installer.state.InstallStage
 import com.ufi_axis.installer.state.InstallState
 import com.ufi_axis.installer.remoteadb.RemoteAdbActivity
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.util.Locale
 
 /**
@@ -76,7 +78,13 @@ class MainActivity : AppCompatActivity() {
 
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* 拒绝也不影响安装，只是没有前台通知 */ }
+    ) { granted ->
+        // 拒绝不影响安装，但通知栏不会有进度，必须明确告诉用户，别让它变成「静默失效」
+        if (!granted) {
+            InstallLogger.warn("通知权限被拒绝：安装进度只能在本界面查看")
+            Toast.makeText(this, R.string.toast_notification_denied, Toast.LENGTH_LONG).show()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -142,6 +150,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun onConfirm() {
         preConfirmed = true
+        // 同步告诉引擎：CONFIRM 阶段无需再等界面回应，避免等待与放行抢先后顺序
+        InstallEngine.markPreConfirmed()
         installStartTime = System.currentTimeMillis()
         val addr = pendingAddress.ifEmpty { binding.etAddress.text?.toString().orEmpty() }
         InstallerService.startInstall(this, addr)
@@ -162,42 +172,51 @@ class MainActivity : AppCompatActivity() {
     /**
      * 启动时检查内置 APK，并把信息带到「安装详情」页。
      * 缺 APK 时禁用「继续」，避免用户进了详情页才发现没法装。
+     *
+     * 枚举 assets 要读文件（未配置 noCompress 时还会整包流式统计大小），
+     * 必须放到 IO 线程，否则大 APK 会在 onCreate 里把主线程卡到 ANR。
      */
     private fun checkAssetApk() {
-        val apks = AssetApkProvider.listApks(this)
         apkReady = false
-        val permText = getString(R.string.detail_perm_count, PermissionGranter.PERMISSIONS.size)
-        binding.tvDetailPerm.text = permText
+        binding.btnContinue.isEnabled = false
+        binding.tvDetailPerm.text = getString(R.string.detail_perm_count, PermissionGranter.PERMISSIONS.size)
+        binding.tvApkInfo.text = getString(R.string.apk_scanning)
 
+        lifecycleScope.launch {
+            val apks = withContext(Dispatchers.IO) { AssetApkProvider.listApks(this@MainActivity) }
+            val core = withContext(Dispatchers.IO) { AssetApkProvider.pickCore(apks) }
+            renderAssetApk(apks, core)
+        }
+    }
+
+    private fun renderAssetApk(
+        apks: List<AssetApkProvider.AssetApk>,
+        core: AssetApkProvider.AssetApk?
+    ) {
         if (apks.isEmpty()) {
             InstallLogger.warn("assets/${AssetApkProvider.ASSET_DIR}/ 为空，未检测到内置 APK")
             binding.tvApkInfo.text = getString(R.string.apk_missing)
             binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.state_error))
-            binding.btnContinue.isEnabled = false
+            apkReady = false
+        } else if (core != null) {
+            apkName = core.name
+            apkSizeText = formatSize(core.sizeBytes)
+            binding.tvApkInfo.text = getString(R.string.apk_ready, apkName, apkSizeText)
+            binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
+            apkReady = true
+        } else {
+            binding.tvApkInfo.text = getString(R.string.apk_ambiguous, apks.joinToString { it.name })
+            binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.state_warning))
+            apkReady = false
+        }
+
+        if (!apkReady) {
             apkName = "?"
             apkSizeText = "?"
-            binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
-            binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
-        } else {
-            val core = AssetApkProvider.pickCore(apks)
-            apkReady = core != null
-            binding.btnContinue.isEnabled = apkReady
-            if (core != null) {
-                apkName = core.name
-                apkSizeText = formatSize(core.sizeBytes)
-                binding.tvApkInfo.text = getString(R.string.apk_ready, apkName, apkSizeText)
-                binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
-                binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
-                binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
-            } else {
-                binding.tvApkInfo.text = getString(R.string.apk_ambiguous, apks.joinToString { it.name })
-                binding.tvApkInfo.setTextColor(ContextCompat.getColor(this, R.color.state_warning))
-                apkName = "?"
-                apkSizeText = "?"
-                binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
-                binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
-            }
         }
+        binding.btnContinue.isEnabled = apkReady
+        binding.tvDetailName.text = getString(R.string.label_install_pkg, apkName)
+        binding.tvDetailSize.text = getString(R.string.label_install_size, apkSizeText)
     }
 
     private fun askNotificationPermission() {
@@ -258,6 +277,9 @@ class MainActivity : AppCompatActivity() {
         binding.tvStage.text = state.stage.title
         binding.tvStatus.text = state.statusText
 
+        // 安装期间禁止进入远程 ADB：两个引擎互不相让，远程 ADB 还可能重启设备
+        binding.btnRemoteAdb.isEnabled = !state.running
+
         // 横向步骤指示
         setStepIndicator(stageToStep(state.stage))
 
@@ -265,7 +287,7 @@ class MainActivity : AppCompatActivity() {
         when {
             state.stage == InstallStage.DONE -> {
                 binding.tvResultIcon.setBackgroundResource(R.drawable.bg_result_icon_success)
-                binding.tvResultIcon.text = "✓"
+                binding.tvResultIcon.text = getString(R.string.icon_success)
                 binding.tvResultTitle.text = getString(R.string.result_success_title)
                 binding.tvResultSubtitle.text = getString(R.string.result_success_subtitle)
                 binding.tvResultSubtitle.setTextColor(ContextCompat.getColor(this, R.color.text_secondary))
@@ -274,7 +296,7 @@ class MainActivity : AppCompatActivity() {
             }
             state.stage == InstallStage.FAILED -> {
                 binding.tvResultIcon.setBackgroundResource(R.drawable.bg_result_icon_error)
-                binding.tvResultIcon.text = "✕"
+                binding.tvResultIcon.text = getString(R.string.icon_error)
                 binding.tvResultTitle.text = getString(R.string.result_failed_title)
                 binding.tvResultSubtitle.text = state.errorMessage.ifEmpty { getString(R.string.result_failed_subtitle) }
                 binding.tvResultSubtitle.setTextColor(ContextCompat.getColor(this, R.color.state_error))
@@ -434,10 +456,21 @@ class MainActivity : AppCompatActivity() {
             .setView(input)
             .setCancelable(false)
             .setPositiveButton(R.string.action_confirm) { _, _ ->
+                // 包名非法时引擎会拒收并要求重输，先清掉去重标记，好让下一次 render 重新弹出
+                currentDialog = null
                 InstallEngine.submitManualPackage(input.text?.toString().orEmpty())
             }
             .setNegativeButton(R.string.action_cancel) { _, _ -> InstallEngine.cancel() }
             .show()
+    }
+
+    override fun onDestroy() {
+        // 这些对话框都是 setCancelable(false)：Activity 结束时不 dismiss 会 WindowLeaked
+        // 并把 Activity 引用漏在对话框上
+        dialog?.dismiss()
+        dialog = null
+        currentDialog = null
+        super.onDestroy()
     }
 
     // ------------------------------------------------------------------

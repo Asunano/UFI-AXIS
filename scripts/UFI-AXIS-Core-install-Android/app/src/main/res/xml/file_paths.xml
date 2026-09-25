@@ -8,8 +8,4 @@
     <files-path
         name="internal_logs"
         path="log/" />
-    <!-- 解出的 APK 缓存（当前不分享，保留以便排查） -->
-    <cache-path
-        name="apk_cache"
-        path="ufi-axis-core/" />
 </paths>

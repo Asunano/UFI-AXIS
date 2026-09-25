@@ -26,6 +26,14 @@ class AdbStream internal constructor(
     /** 本端是否已主动 close，避免重复发送 CLSE */
     private val localClosed = AtomicBoolean(false)
 
+    /**
+     * 流被关闭的真实原因（连接异常断开时由 reader 线程带入）。
+     * 没有它的话，所有等待者只会收到笼统的「流已关闭但数据不足」，
+     * 上层无法区分「设备主动关流」和「socket 断了/超时」。
+     */
+    @Volatile
+    private var closeCause: Throwable? = null
+
     val isClosed: Boolean get() = closed.get()
 
     val serviceName: String get() = service
@@ -38,8 +46,9 @@ class AdbStream internal constructor(
         }
     }
 
-    /** 由 reader 线程调用：对端关闭了流 */
-    internal fun onClose() {
+    /** 由 reader 线程调用：对端关闭了流。[cause] 为底层异常（正常关流时为 null）。 */
+    internal fun onClose(cause: Throwable? = null) {
+        if (cause != null && closeCause == null) closeCause = cause
         closed.set(true)
         synchronized(lock) {
             lock.notifyAll()
@@ -59,8 +68,10 @@ class AdbStream internal constructor(
         synchronized(lock) {
             while (buffer.size() < n) {
                 if (closed.get()) {
+                    val why = closeCause?.let { "：${it.message ?: it.javaClass.simpleName}" } ?: ""
                     throw AdbConnectionClosedException(
-                        "流已关闭但数据不足：需要 $n 字节，仅有 ${buffer.size()} 字节"
+                        "流已关闭但数据不足：需要 $n 字节，仅有 ${buffer.size()} 字节$why",
+                        closeCause
                     )
                 }
                 val remain = deadline - System.currentTimeMillis()

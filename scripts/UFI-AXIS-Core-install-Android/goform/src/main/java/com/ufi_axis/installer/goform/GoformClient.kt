@@ -106,16 +106,16 @@ class GoformClient(
         if (baseUrlResolved) return
         resolveMutex.withLock {
             if (baseUrlResolved) return
+            // 安装器跑在手机上、设备在局域网另一端，所以只能用用户给的地址。
+            // 不能像 core 那样把 127.0.0.1 / localhost 当候选：那会指向手机自己。
             val primary = if (port == 80) "http://$deviceIp" else "http://$deviceIp:$port"
-            val candidates = linkedSetOf(primary, "http://127.0.0.1:$port", "http://localhost:$port")
-            var chosen = primary
-            for (cand in candidates) {
-                if (isReachable(cand)) { chosen = cand; break }
-            }
-            effectiveBaseUrl = chosen
+            effectiveBaseUrl = primary
             baseUrlResolved = true
-            if (chosen != primary) GoformLog.w(tag, "Goform base url resolved to $chosen (primary $primary unreachable)")
-            else GoformLog.d(tag, "Goform base url=$chosen")
+            if (!isReachable(primary)) {
+                GoformLog.w(tag, "Goform base url $primary 当前不可达，仍按该地址请求")
+            } else {
+                GoformLog.d(tag, "Goform base url=$primary")
+            }
         }
     }
 
@@ -329,8 +329,12 @@ class GoformClient(
 
     // ============ POST ============
 
+    /**
+     * 通用 POST。**非幂等**语义：会话失效也不重发，避免 `REBOOT_DEVICE` 这类命令被执行两次
+     * （此前这里委派给 [goformPostIdempotent]，与 [GoformWritePolicy] 的约定正好相反）。
+     */
     override suspend fun goformPost(params: Map<String, String>): String? =
-        (goformPostIdempotent(params) as? GoformWriteResult.Accepted)?.body
+        (postMeasured(params, retryOnSessionLost = false) as? GoformWriteResult.Accepted)?.body
 
     /**
      * **幂等**写操作专用入口：会话失效时重登并只重试一次，返回 [GoformWriteResult]，
@@ -456,6 +460,18 @@ class GoformClient(
         val first = querySingleOnce(command, ensureSession() ?: return null)
         if (first != null) return first
         return querySingleOnce(command, ensureSession() ?: return null)
+    }
+
+    /**
+     * 诊断用：读回单个字段的**文本值**。
+     *
+     * 存在的理由是跨模块可见性：kotlinx-serialization 在本模块是 `implementation` 依赖，
+     * 上层（安装器 app）拿不到 [JsonElement] 类型，只能用字符串把值带出去。
+     * 读不到返回 null，调用方只应把它当日志，不要当判定依据。
+     */
+    suspend fun queryFieldText(command: String): String? {
+        val el = querySingle(command) ?: return null
+        return (el as? JsonPrimitive)?.contentOrNull ?: el.toString()
     }
 
     private suspend fun querySingleOnce(command: String, snapshot: SessionSnapshot): JsonElement? {

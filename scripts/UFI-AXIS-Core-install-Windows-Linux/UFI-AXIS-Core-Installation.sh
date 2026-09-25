@@ -23,9 +23,11 @@ DEF_PORT="5555"
 HEALTH_PORT="8088"
 KNOWN_PKG="com.ufi_axis_core"
 TMPBASE="${TMPDIR:-/tmp}"
-TMPOUT="$TMPBASE/ufiaxis_out.txt"
-TMPBEFORE="$TMPBASE/ufiaxis_pkgs_before.txt"
-TMPAFTER="$TMPBASE/ufiaxis_pkgs_after.txt"
+# 必须用 mktemp：/tmp 全局可写，固定文件名可被本地攻击者预先做成符号链接，
+# 既能借 >"$TMPOUT" 截断用户其它文件，也能投毒包名列表喂给 pm grant / am start
+TMPOUT="$(mktemp "$TMPBASE/ufiaxis.XXXXXX")" || { echo "[错误] 无法创建临时文件"; exit 1; }
+TMPBEFORE="$(mktemp "$TMPBASE/ufiaxis.XXXXXX")" || { echo "[错误] 无法创建临时文件"; exit 1; }
+TMPAFTER="$(mktemp "$TMPBASE/ufiaxis.XXXXXX")" || { echo "[错误] 无法创建临时文件"; exit 1; }
 ADB=""
 
 # adb 解析：脚本同目录优先，其次 PATH。找到返回 0，没找到返回 1。
@@ -57,6 +59,49 @@ dump() { [ -f "$1" ] || return 0; cat "$1"; cat "$1" >>"$LOGFILE"; }
 logonly() { [ -f "$1" ] || return 0; cat "$1" >>"$LOGFILE"; }
 
 cleanup() { rm -f "$TMPOUT" "$TMPBEFORE" "$TMPAFTER" >/dev/null 2>&1 || true; }
+
+# ======== 权限授予 ========
+# 判定一条设备侧命令是否成功。
+# 不能看退出码：`adb shell` 回的是 adb 客户端的退出码，设备侧 pm/appops 失败时它照样是 0。
+# pm grant / appops set 成功时没有任何输出，失败才打印异常文本，所以按输出判定。
+cmd_ok() {
+    printf '%s' "$1" | grep -qiE 'exception|error|failure|not allowed|unknown|denied' && return 1
+    return 0
+}
+
+# grant_one <权限名> <最低API> <最高API> <grant|appop> [appops操作名]
+#
+# - grant：先 `pm grant`，失败再回退 appops
+# - appop：只走 appops（MANAGE_EXTERNAL_STORAGE / REQUEST_INSTALL_PACKAGES /
+#   PACKAGE_USAGE_STATS / SCHEDULE_EXACT_ALARM 这类 appop 控制的权限，pm grant 必然失败）
+# - appops 操作名默认与权限名相同，但有例外：PACKAGE_USAGE_STATS 的 appop 叫 GET_USAGE_STATS
+# - 超出 API 适用范围的直接跳过：把「本机没有这个权限」报成失败会掩盖真问题
+grant_one() {
+    local p="$1" min="$2" max="$3" mode="$4" op="${5:-$1}" st="FAIL" out=""
+    if [ -n "$SDK" ]; then
+        if [ "$SDK" -lt "$min" ]; then
+            say "    [跳过] $p（设备 API $SDK < $min，本机无此权限）"
+            return 0
+        fi
+        if [ "$SDK" -gt "$max" ]; then
+            say "    [跳过] $p（设备 API $SDK > $max，该权限已被取代）"
+            return 0
+        fi
+    fi
+    if [ "$mode" = "grant" ]; then
+        out="$("$ADB" -s "$ADDR" shell pm grant "$NEWPKG" "android.permission.$p" 2>&1)"
+        cmd_ok "$out" && st="OK"
+    fi
+    if [ "$st" != "OK" ]; then
+        out="$("$ADB" -s "$ADDR" shell appops set "$NEWPKG" "$op" allow 2>&1)"
+        cmd_ok "$out" && st="OK"
+    fi
+    if [ "$st" = "OK" ]; then
+        say "    [OK] $p"
+    else
+        say "    [--] $p 未自动授权${out:+（${out%%$'\n'*}）}"
+    fi
+}
 
 # 对应 bat 的 pause
 pause() { printf '按回车键继续...'; read -r _ || true; }
@@ -290,30 +335,42 @@ say ""
 if [ -n "$NEWPKG" ]; then
     # 先授权再启动：首启缺权限时应用可能弹系统授权框，导致启动流程卡住
     say "[5/6] 正在授予权限 ..."
-    for p in \
-        READ_EXTERNAL_STORAGE \
-        WRITE_EXTERNAL_STORAGE \
-        MANAGE_EXTERNAL_STORAGE \
-        ACCESS_FINE_LOCATION \
-        ACCESS_COARSE_LOCATION \
-        READ_PHONE_STATE \
-        READ_SMS \
-        RECEIVE_SMS \
-        RECEIVE_MMS \
-        READ_CELL_BROADCASTS \
-        POST_NOTIFICATIONS \
-        REQUEST_INSTALL_PACKAGES
-    do
-        ST="FAIL"
-        if "$ADB" -s "$ADDR" shell pm grant "$NEWPKG" "android.permission.$p" >/dev/null 2>&1; then
-            ST="OK"
-        elif "$ADB" -s "$ADDR" shell appops set "$NEWPKG" "$p" allow >/dev/null 2>&1; then
-            ST="OK"
-        fi
-        if [ "$ST" = "OK" ]; then say "    [OK] $p"; else say "    [--] $p 未自动授权"; fi
-    done
+    # 读设备 API level，用于跳过本机不适用的权限；读不到就全部逐项尝试。
+    # exec-out 不分配 pty，输出不会被转成 CRLF，省去清洗 \r。
+    SDK="$("$ADB" -s "$ADDR" exec-out getprop ro.build.version.sdk 2>/dev/null | tr -d '\r\n')"
+    case "$SDK" in
+        ''|*[!0-9]*) SDK="" ;;
+    esac
+    if [ -n "$SDK" ]; then
+        say "       设备 API level: $SDK"
+    else
+        say "       [提示] 读取设备 API level 失败，将逐项尝试全部权限"
+    fi
+
+    # 清单与 core 的 AndroidManifest 对齐（core 加了新权限必须同步这里，
+    # 否则装完是「装上了但功能用不了」）。给 core 没声明的权限做 grant 是无效动作。
+    #          权限名                      minSdk maxSdk 方式   [appops 名]
+    grant_one READ_EXTERNAL_STORAGE        0   32  grant
+    grant_one WRITE_EXTERNAL_STORAGE       0   29  grant
+    grant_one MANAGE_EXTERNAL_STORAGE      30 999  appop
+    # 媒体库：core 2026-09-16 起的媒体中心需要，MANAGE_EXTERNAL_STORAGE 不等价
+    grant_one READ_MEDIA_IMAGES            33 999  grant
+    grant_one READ_MEDIA_VIDEO             33 999  grant
+    grant_one READ_MEDIA_AUDIO             33 999  grant
+    grant_one ACCESS_FINE_LOCATION         0  999  grant
+    grant_one ACCESS_COARSE_LOCATION       0  999  grant
+    grant_one READ_PHONE_STATE             0  999  grant
+    grant_one READ_PHONE_NUMBERS           0  999  grant
+    grant_one SEND_SMS                     0  999  grant
+    grant_one READ_SMS                     0  999  grant
+    grant_one POST_NOTIFICATIONS           33 999  grant
+    grant_one REQUEST_INSTALL_PACKAGES     0  999  appop
+    # 流量统计：权限名与 appop 名不同，必须显式给 GET_USAGE_STATS
+    grant_one PACKAGE_USAGE_STATS          0  999  appop  GET_USAGE_STATS
+    # 精确闹钟：core 的服务自恢复依赖它，拿不到会退化成 inexact
+    grant_one SCHEDULE_EXACT_ALARM         31 999  appop
     say "[完成] 权限授予完成。"
-    say "提示: 如系统设置中仍有权限显示未开启，可手动允许。"
+    say "提示: 标 [跳过] 的是本机 API 不适用（正常）；标 [--] 的才是没授上，可在系统设置里手动允许。"
     say ""
 
     say "正在启动应用 $NEWPKG ..."
@@ -348,7 +405,9 @@ while true; do
     while [ "$TRY" -lt 6 ]; do
         TRY=$((TRY + 1))
         say "正在请求 $HEALTH_URL ..."
-        rm -f "$TMPOUT" >/dev/null 2>&1 || true
+        # 原地清空而不是 rm：删掉 mktemp 建的文件后再由 curl 重建，会重新落进
+        # 「固定名字可被预先抢占」的老坑里
+        : >"$TMPOUT" 2>/dev/null || true
         curl -s --max-time 8 "$HEALTH_URL" >"$TMPOUT" 2>/dev/null || true
         # 与 bat 一致：响应体里同时含 status 与 ok 才算就绪
         if grep -qi "status" "$TMPOUT" 2>/dev/null && grep -qi "ok" "$TMPOUT" 2>/dev/null; then

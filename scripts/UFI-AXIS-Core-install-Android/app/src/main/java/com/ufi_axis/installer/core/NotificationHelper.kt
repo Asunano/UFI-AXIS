@@ -70,24 +70,29 @@ object NotificationHelper {
             .build()
     }
 
-    /** 就地更新通知内容 */
-    fun update(context: Context, title: String, text: String, ongoing: Boolean = true) {
-        val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        try {
+    /**
+     * 就地更新通知内容。
+     *
+     * Android 13+ 未授予 POST_NOTIFICATIONS 时 `notify` 是**静默丢弃**（不抛异常），
+     * 所以这里先判权限再走，避免白做一次构造，也让调用方知道通知不可用。
+     *
+     * @return 是否真的下发了通知
+     */
+    fun update(context: Context, title: String, text: String, ongoing: Boolean = true): Boolean {
+        if (!hasPermission(context)) return false
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        return try {
             manager.notify(NOTIFICATION_ID, build(context, title, text, ongoing))
+            true
         } catch (_: SecurityException) {
             // 通知权限被拒时不阻断流程
+            false
         }
     }
 
     /** 结束态通知：ongoing=false，可被划掉 */
     fun finish(context: Context, title: String, text: String) {
         update(context, title, text, ongoing = false)
-    }
-
-    fun cancel(context: Context) {
-        val manager = context.getSystemService(NotificationManager::class.java) ?: return
-        manager.cancel(NOTIFICATION_ID)
     }
 
     /** 判断通知权限是否已授予（Android 13+ 需要运行时权限） */

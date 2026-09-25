@@ -41,7 +41,6 @@
                 android:paddingTop="4dp"
                 android:paddingEnd="10dp"
                 android:paddingBottom="4dp"
-                android:text="@string/step_indicator"
                 tools:text="第 1 / 4 步" />
 
             <Button

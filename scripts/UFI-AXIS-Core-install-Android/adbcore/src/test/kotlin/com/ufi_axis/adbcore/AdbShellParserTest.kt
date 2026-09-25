@@ -2,6 +2,7 @@ package com.ufi_axis.adbcore
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -98,6 +99,21 @@ class AdbShellParserTest {
         )
         val r = AdbShell.parseV2Stream(stream)
         assertEquals(text, r.stdout)
+    }
+
+    @Test
+    fun `没有 EXIT 块时 exit code 不可信`() {
+        // 判据只能看文本的场景：调用方必须能区分「exit=0」和「不知道 exit」
+        val noExit = AdbShell.parseV2Stream(block(AdbShell.ID_STDOUT, "Success"))
+        assertFalse("缺少 EXIT 块时 exitCodeKnown 必须为 false", noExit.exitCodeKnown)
+
+        val withExit = AdbShell.parseV2Stream(
+            AdbProtocol.concat(
+                block(AdbShell.ID_STDOUT, "Success"),
+                block(AdbShell.ID_EXIT, byteArrayOf(0))
+            )
+        )
+        assertTrue(withExit.exitCodeKnown)
     }
 }
 

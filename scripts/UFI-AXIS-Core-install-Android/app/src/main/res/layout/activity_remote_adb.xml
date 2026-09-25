@@ -164,15 +164,20 @@
                 android:text="@string/remote_adb_cancel" />
         </LinearLayout>
 
-        <!-- 结果面板 -->
-        <LinearLayout
+        <!-- 结果面板：内容比输入页多，小屏必须能滚动，否则底部按钮会被裁掉 -->
+        <ScrollView
             android:id="@+id/panelResult"
             android:layout_width="match_parent"
             android:layout_height="0dp"
             android:layout_weight="1"
+            android:visibility="gone"
+            android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
             android:orientation="vertical"
             android:gravity="center_horizontal"
-            android:visibility="gone"
             android:paddingStart="16dp"
             android:paddingEnd="16dp"
             android:paddingTop="24dp"
@@ -268,5 +273,6 @@
                 android:layout_marginTop="10dp"
                 android:text="@string/remote_adb_retry" />
         </LinearLayout>
+        </ScrollView>
     </LinearLayout>
 </FrameLayout>
