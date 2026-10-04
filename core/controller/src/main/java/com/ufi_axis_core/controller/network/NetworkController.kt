@@ -68,21 +68,23 @@ class NetworkController(
     }
 
     /**
-     * 修改 WiFi 热点 SSID
+     * 修改 WiFi 热点 SSID（2026-10-05 R2-1 修复：三态透传）。
+     * 双写部分失败：SSID 成功但口令失败 → 返回口令阶段的结果（Rejected 带原因 / Failed），
+     * 客户端能知道卡在哪一步；不在此层做回滚（设备无事务语义，重发 SSID 反而是第三次写）。
      */
-    suspend fun setWifiSSID(ssid: String, password: String? = null): Boolean {
+    suspend fun setWifiSSID(ssid: String, password: String? = null): WriteOutcome {
         AppLogger.i(tag, "Setting WiFi SSID: $ssid")
         val ssidResult = wifi.setWifiSSID(ssid)
-        if (ssidResult && password != null) {
+        if (ssidResult is WriteOutcome.Ok && password != null) {
             return wifi.setWifiPassword(password)
         }
         return ssidResult
     }
 
     /**
-     * 修改 WiFi 密码
+     * 修改 WiFi 密码（2026-10-05 R2-1 修复：三态透传）。
      */
-    suspend fun setWifiPassword(password: String): Boolean {
+    suspend fun setWifiPassword(password: String): WriteOutcome {
         AppLogger.i(tag, "Setting WiFi password")
         return wifi.setWifiPassword(password)
     }

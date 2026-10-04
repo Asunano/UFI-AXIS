@@ -53,13 +53,27 @@ class TaskScheduler(
     private val actionExecutor: ActionExecutor
 ) {
     private val tag = "TaskScheduler"
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // CoroutineExceptionHandler（2026-10-05 R2-5② 修复）：SupervisorJob 只隔离子协程失败，
+    // 不吞异常——没有 handler 时调度协程抛未捕获异常会静默死亡（Default dispatcher 无默认处理器），
+    // 表现为"定时任务从此再也不触发"。记日志让死亡可观测。
+    private val exceptionHandler = CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "TaskScheduler coroutine crashed (uncaught)", e)
+    }
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
     private val tasks = ConcurrentHashMap<String, ScheduledTask>()
     private val triggeredToday = ConcurrentHashMap<String, String>() // taskId → dateStr
     private val prefs = context.getSharedPreferences("scheduled_tasks", Context.MODE_PRIVATE)
 
+    // reschedule 互斥锁（2026-10-05 R1-3 修复）：reschedule 被 add/remove/update/clear、
+    // 5 分钟轮询、触发后递归三条路径并发调用，原来"cancel 旧 Job → launch 新 Job"两步之间
+    // 有窗口：两次并发 reschedule 各自 cancel 再各自 launch → **双调度链**，同一时刻任务触发两次；
+    // 且 lastScheduleDate 的跨日检查也可能交错重复清 triggeredToday。整段收进锁。
+    private val rescheduleLock = Any()
     private var mainJob: Job? = null
     private var pollJob: Job? = null
+
+    /** 跨日校准指针。多条写路径经 [rescheduleLock] 互斥后已无撕裂；volatile 供将来无锁读。 */
+    @Volatile
     private var lastScheduleDate: String? = null
 
     /**
@@ -159,30 +173,35 @@ class TaskScheduler(
      * 只维护一个主 Job，取消旧 Job 后启动新 Job。
      */
     fun reschedule() {
-        mainJob?.cancel()
-        if (paused) return
+        // 整段互斥（2026-10-05 R1-3 修复）：cancel 与 launch 之间不再有窗口，
+        // 并发调用时后进者取消的必然是先进者刚创建的 Job，保证任一时刻只有一条调度链。
+        synchronized(rescheduleLock) {
+            mainJob?.cancel()
+            if (paused) return
 
-        // 检查是否跨日，如是则重置 hasTriggered
-        val todayStr = dateFormat.format(Date())
-        if (lastScheduleDate != todayStr) {
-            lastScheduleDate = todayStr
-            triggeredToday.clear()
-            AppLogger.d(tag, "New day ($todayStr), reset daily triggers")
-        }
+            // 检查是否跨日，如是则重置 hasTriggered
+            val todayStr = dateFormat.format(Date())
+            if (lastScheduleDate != todayStr) {
+                lastScheduleDate = todayStr
+                triggeredToday.clear()
+                AppLogger.d(tag, "New day ($todayStr), reset daily triggers")
+            }
 
-        val nextTriggerMs = getNextTriggerTimeMillis() ?: run {
-            AppLogger.d(tag, "No upcoming triggers, idle")
-            return
-        }
+            val nextTriggerMs = getNextTriggerTimeMillis() ?: run {
+                AppLogger.d(tag, "No upcoming triggers, idle")
+                mainJob = null
+                return
+            }
 
-        val delayMs = (nextTriggerMs - System.currentTimeMillis()).coerceAtLeast(0)
-        val triggerTimeStr = timeFormat.format(Date(nextTriggerMs))
-        AppLogger.i(tag, "Next trigger: $triggerTimeStr (delay=${delayMs / 1000}s)")
+            val delayMs = (nextTriggerMs - System.currentTimeMillis()).coerceAtLeast(0)
+            val triggerTimeStr = timeFormat.format(Date(nextTriggerMs))
+            AppLogger.i(tag, "Next trigger: $triggerTimeStr (delay=${delayMs / 1000}s)")
 
-        mainJob = scope.launch {
-            delay(delayMs)
-            triggerMatchedTasks()
-            reschedule() // 递归调度下一个
+            mainJob = scope.launch {
+                delay(delayMs)
+                triggerMatchedTasks()
+                reschedule() // 递归调度下一个
+            }
         }
     }
 

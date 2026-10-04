@@ -33,10 +33,12 @@ class WifiRoutes(
             post("/enable") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = wifi.setWifiEnabled(enabled)
-                if (success) dataHub?.invalidateWifi()
-                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "enabled" to enabled)))
+                // 三态透传（2026-10-05 R2-1 修复）：设备拒绝回 400+原因，失败回 500，成功 200。
+                // 原来把三态压成 Boolean 一律 500，客户端只能显示一句 HTTP 500。
+                val outcome = wifi.setWifiEnabled(enabled)
+                if (call.respondRejected(outcome)) return@post
+                if (outcome.ok) dataHub?.invalidateWifi()
+                call.respond(toJsonElement(mapOf("success" to outcome.ok, "enabled" to enabled)))
             }
             post("/ssid") {
                 val params = call.receiveJsonObject()
@@ -46,10 +48,17 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "ssid is required")
                     return@post
                 }
-                val success = networkController.setWifiSSID(ssid, password)
-                if (success) dataHub?.invalidateWifi()
-                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "ssid" to ssid)))
+                // 长度上限（2026-10-05 R4-2 修复）：IEEE 802.11 SSID 上限 32 字节（设备按 UTF-8 处理，
+                // 更长的值设备侧行为不可预期）；此前无任何长度校验，超长 SSID 会直达设备。
+                if (ssid.toByteArray(Charsets.UTF_8).size > 32) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "SSID 过长（UTF-8 上限 32 字节）")
+                    return@post
+                }
+                val outcome = networkController.setWifiSSID(ssid, password)
+                if (call.respondRejected(outcome)) return@post
+                if (outcome.ok) dataHub?.invalidateWifi()
+                call.respond(toJsonElement(mapOf("success" to outcome.ok, "ssid" to ssid)))
             }
 
             post("/password") {
@@ -59,10 +68,18 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "password is required")
                     return@post
                 }
-                val success = networkController.setWifiPassword(password)
-                if (success) dataHub?.invalidateWifi()
-                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success)))
+                // 长度上限（2026-10-05 R4-2 修复）：WPA2-PSK 口令上限 63 字符；此前无上限，
+                // 超长口令会被设备静默截断或拒绝，而客户端以为设置成功。
+                // 不设下限：设备允许开放网络（口令可为空串语义），下限校验属行为变更不在本项范围。
+                if (password.length > 63) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "WiFi 口令过长（上限 63 字符）")
+                    return@post
+                }
+                val outcome = networkController.setWifiPassword(password)
+                if (call.respondRejected(outcome)) return@post
+                if (outcome.ok) dataHub?.invalidateWifi()
+                call.respond(toJsonElement(mapOf("success" to outcome.ok)))
             }
 
             // WiFi 完整配置（SSID + 加密 + 密码 + 最大连接数 + 广播 + 芯片）
@@ -95,10 +112,11 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "level must be 0-2")
                     return@post
                 }
-                val success = wifi.setWifiPower(level)
-                if (success) dataHub?.invalidateWifi()
-                call.respond(if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
-                    toJsonElement(mapOf("success" to success, "level" to level)))
+                // 三态透传（2026-10-05 R2-1 修复）
+                val outcome = wifi.setWifiPower(level)
+                if (call.respondRejected(outcome)) return@post
+                if (outcome.ok) dataHub?.invalidateWifi()
+                call.respond(toJsonElement(mapOf("success" to outcome.ok, "level" to level)))
             }
 
             get("/settings") {
@@ -252,11 +270,19 @@ class WifiRoutes(
 
             post("/acl/clear") {
                 val acl = wifi.getAccessControlList()
-                // 读不回来也照样清（清空是"发空名单"，不依赖当前内容）；白名单只在读到时才保留
+                // 读失败必须拒绝而不是继续写（2026-10-05 R2-2 修复）：
+                // 清空的语义是"发空黑名单"，白名单本想"读到就保留、读不到当空"——
+                // 但读不到时把白名单当空下发，设备侧是整表替换，等于把用户白名单静默清空。
+                // 读失败时设备状态未知，此时任何写都可能造成数据丢失，直接 503 让客户端重试。
+                if (acl == null) {
+                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
+                        "无法从设备读取接入控制名单，已取消清空操作（避免误清白名单）")
+                    return@post
+                }
                 val outcome = wifi.setAccessControlList(
                     black = emptyList(),
-                    white = acl?.white ?: emptyList(),
-                    mode = acl?.mode,
+                    white = acl.white,
+                    mode = acl.mode,
                 )
                 if (call.respondRejected(outcome)) return@post
                 call.respondAclResult(outcome.ok)

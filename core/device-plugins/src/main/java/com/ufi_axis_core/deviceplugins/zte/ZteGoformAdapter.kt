@@ -262,16 +262,16 @@ class ZteGoformAdapter internal constructor(
                 ssid, authMode, encrypType, passphrase, maxStaNum, broadcastDisabled, chipIndex
             )
 
-        override suspend fun setWifiPower(level: Int): Boolean = client.setWifiPower(level)
+        override suspend fun setWifiPower(level: Int): WriteOutcome = client.setWifiPower(level)
 
-        override suspend fun setWifiSSID(ssid: String): Boolean = client.setWifiSSID(ssid)
+        override suspend fun setWifiSSID(ssid: String): WriteOutcome = client.setWifiSSID(ssid)
 
-        override suspend fun setWifiEnabled(enabled: Boolean): Boolean =
+        override suspend fun setWifiEnabled(enabled: Boolean): WriteOutcome =
             client.setWifiEnabled(enabled)
 
         override suspend fun setWifiBand(chip: String): WriteOutcome = client.setWifiBand(chip)
 
-        override suspend fun setWifiPassword(password: String): Boolean =
+        override suspend fun setWifiPassword(password: String): WriteOutcome =
             client.setWifiPassword(password)
 
         override suspend fun setWifiSleep(time: String): WriteOutcome = client.setWifiSleep(time)

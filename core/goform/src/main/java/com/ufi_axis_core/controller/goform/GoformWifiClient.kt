@@ -448,14 +448,16 @@ class GoformWifiClient(
     }
 
     /** @param level 发射功率档位（值域 0~2 的判据在 profile 的 validate 里，与 WifiRoutes 同一份事实）。 */
-    suspend fun setWifiPower(level: Int): Boolean = writer.write(SettingKey.WIFI_POWER, level)
+    suspend fun setWifiPower(level: Int): WriteOutcome = writer.writeChecked(SettingKey.WIFI_POWER, level)
 
     /**
      * 只改 SSID —— 其余 AP 配置必须从设备读回后原样带上（整表替换，见 [mergeApSsidParams]）。
+     * 三态返回（2026-10-05 R2-1 修复）：`Boolean` 会把「设备明确拒绝」压成 false，
+     * 路由只能一律回 500；改用 [WriteOutcome] 后客户端能看到设备给的具体原因。
      */
-    suspend fun setWifiSSID(ssid: String): Boolean {
+    suspend fun setWifiSSID(ssid: String): WriteOutcome {
         val current = getCurrentWifiConfig()
-        return writer.write(SettingKey.WIFI_AP_CONFIG, mergeApSsidParams(current, ssid))
+        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApSsidParams(current, ssid))
     }
 
     /**
@@ -482,7 +484,7 @@ class GoformWifiClient(
      *
      * 独立的频段切换入口是 [setWifiBand]。
      */
-    suspend fun setWifiEnabled(enabled: Boolean): Boolean = writer.write(
+    suspend fun setWifiEnabled(enabled: Boolean): WriteOutcome = writer.writeChecked(
         SettingKey.WIFI_ENABLED,
         wifiEnableParams(
             enabled = enabled,
@@ -533,9 +535,9 @@ class GoformWifiClient(
     /**
      * 只改口令 —— 其余 AP 配置从设备读回后原样带上（整表替换，见 [mergeApPasswordParams]）。
      */
-    suspend fun setWifiPassword(password: String): Boolean {
+    suspend fun setWifiPassword(password: String): WriteOutcome {
         val current = getCurrentWifiConfig()
-        return writer.write(SettingKey.WIFI_AP_CONFIG, mergeApPasswordParams(current, password))
+        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApPasswordParams(current, password))
     }
 
     suspend fun setWifiSleep(time: String): WriteOutcome =

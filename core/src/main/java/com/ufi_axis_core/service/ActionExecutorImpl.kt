@@ -70,7 +70,13 @@ class ActionExecutorImpl(
             }
             "wifi_toggle" -> {
                 val enabled = params["enabled"]?.boolean ?: true
-                val ok = wifi.setWifiEnabled(enabled)
+                // 2026-10-05 R2-1：setWifiEnabled 改三态返回，自动化动作取 ok 即可
+                // （Rejected 的具体原因在这里仍值得留日志，动作结果文案保持简单）。
+                val outcome = wifi.setWifiEnabled(enabled)
+                val ok = outcome.ok
+                if (!ok && outcome is com.ufi_axis_core.devicespi.WriteOutcome.Rejected) {
+                    android.util.Log.w("ActionExecutor", "wifi_toggle 被设备拒绝: ${outcome.reason}")
+                }
                 ActionResult(ok, when {
                     ok && enabled -> "WiFi 热点已开启"
                     ok -> "WiFi 热点已关闭"

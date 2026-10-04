@@ -219,25 +219,39 @@ class TunnelManager(private val appContext: android.content.Context) {
      * 所以用户在设置页开关一下即时生效，不需要重启服务。
      */
     fun startGuard() {
-        if (guardJob?.isActive == true) return
-        guardJob = guardScope.launch {
-            delay(FIRST_PASS_DELAY_MS)
-            while (isActive) {
-                try {
-                    guardPass()
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "Tunnel guard pass failed: ${e.message}")
+        // check-then-act 互斥（2026-10-05 R1-4 修复）：原来 `if (guardJob?.isActive == true) return`
+        // 后再 launch，两次并发调用可各自通过检查 → 双看护循环。双循环的恶果是每一轮
+        // guardPass 都跑两遍：失败计数翻倍增速、重复拉起隧道进程、日志混淆。
+        // synchronized 块内完成"检查+赋值"，cancel 掉任何残留旧 job 后再起新的。
+        synchronized(guardLock) {
+            if (guardJob?.isActive == true) return
+            guardJob = guardScope.launch {
+                delay(FIRST_PASS_DELAY_MS)
+                while (isActive) {
+                    try {
+                        guardPass()
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "Tunnel guard pass failed: ${e.message}")
+                    }
+                    delay(settings.tunnelReconnectIntervalSec * 1000L)
                 }
-                delay(settings.tunnelReconnectIntervalSec * 1000L)
             }
         }
         AppLogger.i(TAG, "Tunnel guard started")
     }
 
+    /** startGuard/stopGuard 的互斥锁（2026-10-05 R1-4 修复）。 */
+    private val guardLock = Any()
+
     /** 停止看护。**必须在 [shutdown] 停实例之前调用**，否则看护会跟停止流程抢着重启。 */
     fun stopGuard() {
-        guardJob?.cancel()
-        guardJob = null
+        // 同锁取消（2026-10-05 R1-4 修复）：防止与 startGuard 交错时 cancel 掉新启动的 job。
+        val job = synchronized(guardLock) {
+            val j = guardJob
+            guardJob = null
+            j
+        }
+        job?.cancel()
     }
 
     /** 一轮巡检：期望在跑但实际没在跑 → 拉起；配置已被删 → 移出期望集合 */

@@ -1499,10 +1499,24 @@ object ZteGoformProfile : DeviceProfile {
     }
 
 
+    /**
+     * 频段号列表校验。
+     *
+     * 值域 1..255：与 [GoformNetworkClient] 的 `lockLteBands`/`lockNrBands` 注释
+     * （「频段号值域由 profile 的 validate 兜（1..255 的纯数字列表）」）以及路由层
+     * `NetworkRoutes` 的注释承诺一致 —— 非法值必须在这里被拒（返回原因 → 路由回
+     * 400 OUT_OF_RANGE），不能只验「是不是数字」就放行到基带。
+     *
+     * 空串仍是「解锁」（与 [lteAllBandsMask] 的语义同侧，见 GoformAllBandsMaskTest）。
+     */
     private fun validateBandList(raw: String?): String? {
         val s = raw?.trim().orEmpty()
         if (s.isEmpty()) return null // 解锁
         if (!s.matches(Regex("^[0-9]+(,[0-9]+)*$"))) return "频段列表只能是逗号分隔的数字"
+        for (part in s.split(',')) {
+            val band = part.toIntOrNull() ?: return "频段号必须是数字：$part"
+            if (band !in 1..255) return "频段号超出范围（1..255）：$part"
+        }
         return null
     }
 

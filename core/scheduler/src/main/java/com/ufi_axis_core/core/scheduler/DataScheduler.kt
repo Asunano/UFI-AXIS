@@ -178,6 +178,13 @@ class DataScheduler(
     // isRunning / monitorEnabled 由 service 协程写、由 Netty worker 线程读（/api/service/status 回读），
     // 因此必须 @Volatile，否则回读到的可能是过期值。
     @Volatile private var isRunning = false
+
+    /**
+     * start/stop 互斥锁（2026-10-05 R1-1 修复）。
+     * `isRunning` 的 check-then-act 在并发 start/start 或 start/stop 交错时可双启动/状态撕裂；
+     * 置位动作统一收进这把锁。锁只护标志位读写，不覆盖采集循环体（避免长时间持锁）。
+     */
+    private val startStopLock = Any()
     /** 监控总开关（REST /monitor/control 设置）。仅控制冷采集循环是否运行，与前端连接无关。 */
     @Volatile private var monitorEnabled = true
     /**
@@ -487,8 +494,13 @@ class DataScheduler(
         android.os.SystemClock.elapsedRealtime() >= bootGraceMs
 
     fun start() {
-        if (isRunning) return
-        isRunning = true
+        // start/stop 并发互斥（2026-10-05 R1-1 修复）：原 `if (isRunning) return; isRunning = true`
+        // 是 check-then-act，两个线程同时通过检查会各启动一套采集循环（双份写库、双份推送）。
+        // stop() 在同一把锁上置位，保证互斥；锁外逻辑不变。
+        synchronized(startStopLock) {
+            if (isRunning) return
+            isRunning = true
+        }
         // 抢跑标记：让任何"正在等 flush 的 stop 收尾"放弃它的 cancelChildren（见 stopGeneration）
         stopGeneration++
         AppLogger.i(tag, "Starting data scheduler")
@@ -685,7 +697,8 @@ class DataScheduler(
     }
 
     fun stop() {
-        isRunning = false
+        // 与 start() 同锁置位（2026-10-05 R1-1 修复）：保证 start/stop 交错时状态一致。
+        synchronized(startStopLock) { isRunning = false }
         val token = ++stopGeneration
         AppLogger.i(tag, "Stopping data scheduler")
         

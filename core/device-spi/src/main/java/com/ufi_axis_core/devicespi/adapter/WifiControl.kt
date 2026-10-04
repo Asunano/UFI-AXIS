@@ -81,11 +81,14 @@ interface WifiControl {
         chipIndex: String? = null
     ): WriteOutcome
 
-    /** @param level 发射功率档位（值域 0~2 的判据在实现侧，与 route 的入参校验同一份事实）。 */
-    suspend fun setWifiPower(level: Int): Boolean
+    /**
+     * @param level 发射功率档位（值域 0~2 的判据在实现侧，与 route 的入参校验同一份事实）。
+     * 三态返回（2026-10-05 R2-1 修复）：设备明确拒绝时路由可回 400 + 原因，不再压成一律 500。
+     */
+    suspend fun setWifiPower(level: Int): WriteOutcome
 
-    /** 只改 SSID —— 其余热点配置由实现侧读回后原样带上（整表替换，见 [setWifiConfig]）。 */
-    suspend fun setWifiSSID(ssid: String): Boolean
+    /** 只改 SSID —— 其余热点配置由实现侧读回后原样带上（整表替换，见 [setWifiConfig]）。三态返回（R2-1）。 */
+    suspend fun setWifiSSID(ssid: String): WriteOutcome
 
     /**
      * WiFi 总开关。
@@ -93,8 +96,9 @@ interface WifiControl {
      * ⚠ 「开」在设备侧等于「在**某个频段**上启用 WiFi」，所以实现侧必须把设备**当前**频段
      * 一起发出去（不发会把在 5G 的用户静默切到 2.4G —— 实测过的 bug）。读当前频段、
      * 读失败时的退路与那条 WARN 都在实现侧，本接口不暴露频段参数：调用方点的是「开 / 关」。
+     * 三态返回（2026-10-05 R2-1 修复）。
      */
-    suspend fun setWifiEnabled(enabled: Boolean): Boolean
+    suspend fun setWifiEnabled(enabled: Boolean): WriteOutcome
 
     /**
      * 切换 WiFi 频段。
@@ -111,8 +115,8 @@ interface WifiControl {
      */
     suspend fun setWifiBand(chip: String): WriteOutcome
 
-    /** 只改口令 —— 其余热点配置由实现侧读回后原样带上（整表替换，见 [setWifiConfig]）。 */
-    suspend fun setWifiPassword(password: String): Boolean
+    /** 只改口令 —— 其余热点配置由实现侧读回后原样带上（整表替换，见 [setWifiConfig]）。三态返回（R2-1）。 */
+    suspend fun setWifiPassword(password: String): WriteOutcome
 
     /** @param time WiFi 空闲休眠时长（分钟，`"0"` = 不休眠）；值域校验在实现侧。 */
     suspend fun setWifiSleep(time: String): WriteOutcome

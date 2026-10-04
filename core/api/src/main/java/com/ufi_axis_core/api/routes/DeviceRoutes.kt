@@ -35,6 +35,47 @@ class DeviceRoutes(
 ) {
     private companion object {
         /**
+         * 危险 goformId 黑名单（2026-10-05 R4-5 修复）— 裸通道 /device/goform/set 的命令过滤。
+         *
+         * 这些命令与 ATRoutes.DANGEROUS_AT_PATTERNS / ShellRoutes 黑名单同口径：会触发整机
+         * 重启、关机、擦除用户数据。核心层走受控封装（GoformDeviceClient.rebootDevice 等，
+         * 有 UI 确认链路）；裸通道是调试入口，不应能直达这些动作。
+         * 命名字符串逐字取自 ZteGoformProfile 的 WriteSpec 表（:1090-1104）。
+         */
+        val DANGEROUS_GOFORM_IDS = listOf(
+            "REBOOT_DEVICE",      // 整机重启
+            "SHUTDOWN_DEVICE",    // 关机
+            "FACTORY_RESET"       // 恢复出厂（擦除全部配置）
+        )
+
+        /**
+         * DHCP 池跨字段语义校验（2026-10-05 R4-4 修复）。
+         * 返回 null = 通过；否则返回给客户端的错误文案。
+         *
+         * 三条判据（自锁防线）：
+         * 1. 起/止必须是合法 IPv4；
+         * 2. 起 ≤ 止（按无符号整数比较）；
+         * 3. 起/止必须落在 LAN 子网（lanIp AND mask）内 —— 否则设备会把池建在
+         *    管理面网段之外，客户端换到新网段后回不来。
+         */
+        fun validateDhcpRange(lanIp: String, lanNetmask: String, start: String, end: String): String? {
+            val ipToLong = { s: String ->
+                val parts = s.split(".")
+                if (parts.size != 4 || parts.any { it.isEmpty() || it.length > 3 || it.toIntOrNull() !in 0..255 }) null
+                else parts.fold(0L) { acc, p -> (acc shl 8) or (p.toLong() and 0xFF) }
+            }
+            val lan = ipToLong(lanIp) ?: return "LAN IP 非法: $lanIp"
+            val mask = ipToLong(lanNetmask) ?: return "子网掩码非法: $lanNetmask"
+            val s = ipToLong(start) ?: return "DHCP 起始 IP 非法: $start"
+            val e = ipToLong(end) ?: return "DHCP 结束 IP 非法: $end"
+            if (s > e) return "DHCP 起始 IP 不能大于结束 IP"
+            val network = lan and mask
+            if ((s and mask) != network || (e and mask) != network) {
+                return "DHCP 池必须与 LAN ($lanIp/$lanNetmask) 在同一子网内"
+            }
+            return null
+        }
+        /**
          * `/device/qos` 查不到时的响应骨架。
          *
          * 字段**一个不少**（只是空值），这样客户端不需要为"AT 不可用"写第二套解析分支。
@@ -194,6 +235,20 @@ class DeviceRoutes(
                 val extraParams = (body["params"] as? JsonObject)?.mapValues { (_, v) ->
                     (v as? JsonPrimitive)?.contentOrNull ?: v.toString()
                 } ?: emptyMap()
+
+                // 危险 goformId 黑名单（2026-10-05 R4-5 修复）：裸通道原本除了 rejectIfCommandDisabled
+                // 没有任何命令过滤 —— REBOOT_DEVICE / FACTORY_RESET / SET_DEVICE_MODE(重启类) /
+                // 静默 OTA 等可从 API 直达设备，与 ATRoutes/ShellRoutes 的黑名单口径不齐。
+                // 命中即 403，不记入 device:goform 缓存失效（命令未执行）。
+                // 注意大小写不敏感：goform 协议历史上两种风格都出现过。
+                val blocked = DANGEROUS_GOFORM_IDS.firstOrNull { it.equals(goformId, ignoreCase = true) }
+                if (blocked != null) {
+                    AppLogger.w("DeviceRoutes", "goform/set 危险命令已拦截: goformId=$goformId")
+                    call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
+                        "危险命令已被禁止通过裸通道执行: $goformId")
+                    return@post
+                }
+
                 // 只记键名：参数值可能是 WiFi 密码 / PIN / APN 凭据
                 AppLogger.w(
                     "DeviceRoutes",
@@ -645,6 +700,19 @@ class DeviceRoutes(
                 val dhcpStart = p["dhcp_start"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpEnd = p["dhcp_end"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpLease = p["dhcp_lease"]?.jsonPrimitive?.contentOrNull ?: "86400"
+
+                // 语义校验（2026-10-05 R4-4 修复）：此前只靠 profile 的语法校验（是否是 IP 字面量），
+                // 起 > 止、跨网段、甚至起止不在 LAN 子网内都能下发 —— DHCP 池错乱后客户端拿不到
+                // 正确的租约，管理面 IP 一旦漂出旧网段就自锁（只能恢复出厂）。
+                // 在 API 层拦下（profile 只管单字段语法，跨字段语义在这里）。
+                if (dhcpType == "SERVER") {
+                    val fail = validateDhcpRange(lanIp, lanNetmask, dhcpStart, dhcpEnd)
+                    if (fail != null) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, fail)
+                        return@post
+                    }
+                }
+
                 val outcome = deviceHub.device.setDhcpSetting(
                     lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease
                 )

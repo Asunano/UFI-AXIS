@@ -100,11 +100,11 @@ class DeviceHubTest {
             maxStaNum: Int?, broadcastDisabled: Int?, chipIndex: String?
         ): WriteOutcome = outcome
 
-        override suspend fun setWifiPower(level: Int): Boolean = true
-        override suspend fun setWifiSSID(ssid: String): Boolean = true
-        override suspend fun setWifiEnabled(enabled: Boolean): Boolean = true
+        override suspend fun setWifiPower(level: Int): WriteOutcome = WriteOutcome.Ok
+        override suspend fun setWifiSSID(ssid: String): WriteOutcome = WriteOutcome.Ok
+        override suspend fun setWifiEnabled(enabled: Boolean): WriteOutcome = WriteOutcome.Ok
         override suspend fun setWifiBand(chip: String): WriteOutcome = outcome
-        override suspend fun setWifiPassword(password: String): Boolean = true
+        override suspend fun setWifiPassword(password: String): WriteOutcome = WriteOutcome.Ok
         override suspend fun setWifiSleep(time: String): WriteOutcome = outcome
 
         override suspend fun setAccessControlList(

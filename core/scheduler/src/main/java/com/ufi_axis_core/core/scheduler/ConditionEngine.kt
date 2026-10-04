@@ -26,7 +26,12 @@ class ConditionEngine(
     private val actionExecutor: ActionExecutor
 ) {
     private val tag = "ConditionEngine"
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // CoroutineExceptionHandler（2026-10-05 R2-5③ 修复）：无 handler 时规则协程抛未捕获异常
+    // 会静默死亡，表现为"自动化规则从此不生效"。记日志让死亡可观测。
+    private val exceptionHandler = CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "ConditionEngine coroutine crashed (uncaught)", e)
+    }
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
     private val rules = ConcurrentHashMap<String, AutomationRule>()
     private val armed = ConcurrentHashMap<String, Boolean>()      // 电平类防刷武装位
     private val lastFiredAt = ConcurrentHashMap<String, Long>()   // 冷却时间戳

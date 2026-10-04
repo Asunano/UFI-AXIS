@@ -56,8 +56,15 @@ class BackendService : Service() {
     /**
      * SMS 轮询独立 scope：使用普通 IO（无 parallelism 限制），
      * 避免 while(isActive) 永久循环占用 limitedParallelism(8) 的稀缺线程。
+     *
+     * CoroutineExceptionHandler（2026-10-05 R2-5 修复）：此前缺 handler，轮询协程里
+     * 未捕获的异常会沿 SupervisorJob 静默终止协程本身——兜底轮询从此死亡且无任何
+     * 日志，"短信不进 Provider 时 5 分钟兜底"整条链路悄悄失效。与上方 serviceScope
+     * 同口径：记录 ERROR 后放行（SupervisorJob 已隔离，不影响兄弟协程）。
      */
-    private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "SmsPollScope coroutine exception (uncaught) — 兜底轮询协程已终止", e)
+    })
 
     companion object {
         const val CHANNEL_ID = "ufi_axis_core_service_v2"
