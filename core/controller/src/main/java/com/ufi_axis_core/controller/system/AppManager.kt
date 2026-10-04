@@ -327,10 +327,15 @@ class AppManager(
         // 现已拦掉引号/换行），再加协议白名单——避免 file:// 之类把本地文件当"下载"读出来。
         require(url.startsWith("http://") || url.startsWith("https://")) { "Invalid URL scheme: $url" }
         val tmpPath = "/data/local/tmp/install_${System.currentTimeMillis()}.apk"
+        // 2026-10-05 R3-3 修复：任何失败路径都必须清掉已下载的临时 APK（/data 分区空间敏感，
+        // 90MB 级 APK 反复失败会在 /data/local/tmp 堆积占满空间，后续下载全部 ENOSPC）。
         val download = ShellExecutor.executeAsRoot("curl -sL -o \"$tmpPath\" \"$url\" 2>/dev/null && echo OK || echo FAIL", 120_000L)
         if (!download.stdout.contains("OK")) {
             val wgetResult = ShellExecutor.executeAsRoot("wget -q -O \"$tmpPath\" \"$url\" 2>/dev/null && echo OK || echo FAIL", 120_000L)
-            if (!wgetResult.stdout.contains("OK")) return InstallResult(false, "下载失败: 不支持 curl/wget")
+            if (!wgetResult.stdout.contains("OK")) {
+                deleteTmpFile(tmpPath)
+                return InstallResult(false, "下载失败: 不支持 curl/wget")
+            }
         }
         // 确保 APK 对 adb client(uid=app)/adbd(uid 2000) 可读（adbd/shell 不可读 /data/local/tmp 下 root 写的文件时回退）
         ShellExecutor.executeAsRoot("chmod 644 \"$tmpPath\"", 5_000L)
@@ -627,9 +632,13 @@ class AppManager(
                     redirectErrorStream(true)
                 }.start()
 
-                val output = proc.inputStream.bufferedReader().readText()
+                // 2026-10-05 R3-2 修复：原来 readText() 在 waitFor 之前，adb 僵死不输出时
+                // readText 永远阻塞（流不 EOF），30s 超时形同虚设 → 请求协程永久挂起。
+                // 改为 waitFor 先行（bounded），再读已结束进程的输出。
                 val finished = proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
-                if (!finished) {
+                val output = if (finished) {
+                    proc.inputStream.bufferedReader().readText()
+                } else {
                     proc.destroyForcibly()
                     return@withContext false to "adb shell timeout (30s)"
                 }

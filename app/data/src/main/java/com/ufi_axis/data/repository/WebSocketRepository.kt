@@ -63,6 +63,14 @@ class WebSocketRepository(
     private var retryJob: Job? = null
     private var scope: CoroutineScope? = null
 
+    /**
+     * 用户主动断开标志（2026-10-05 R3-1 修复）。
+     * disconnect() 后 OkHttp 的 onClosed 回调仍会触发，原实现无条件 scheduleReconnect
+     * → 用户刚点了断开，WS 又自己连回去了。置位后回调直接放弃重连；connect() 时清零。
+     */
+    @Volatile
+    private var userDisconnected = false
+
     /** 当前订阅频道（重连后按此列表重新订阅）。 */
     private var subscribedTopics: List<String> = DEFAULT_TOPICS
 
@@ -85,6 +93,7 @@ class WebSocketRepository(
         this.scope = scope
         this.subscribedTopics = topics
         hasConnectedOnce = true
+        userDisconnected = false // 2026-10-05 R3-1：重新 connect 即恢复自动重连资格
         _connectionState.value = ConnectionState.CONNECTING
 
         // 握手鉴权全部走 query（token/ts/nonce/sig）：core 的 WebSocketManager 只读 query，
@@ -163,7 +172,8 @@ class WebSocketRepository(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 _connectionState.value = ConnectionState.DISCONNECTED
-                scheduleReconnect(scope)
+                // 2026-10-05 R3-1 修复：用户主动断开时不再自动重连
+                if (!userDisconnected) scheduleReconnect(scope)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -183,7 +193,8 @@ class WebSocketRepository(
                     exception = t,
                     requestLine = "WS $baseUrl/ws/realtime Authorization: Bearer ***"
                 )
-                scheduleReconnect(scope)
+                // 2026-10-05 R3-1 修复：用户主动断开后 close 引发的 onFailure 也不重连
+                if (!userDisconnected) scheduleReconnect(scope)
             }
         })
     }
@@ -233,6 +244,8 @@ class WebSocketRepository(
     }
 
     fun disconnect() {
+        // 2026-10-05 R3-1 修复：先置位再关闭，onClosed/onFailure 回调据此放弃重连
+        userDisconnected = true
         retryJob?.cancel()
         webSocket?.close(1000, "Client disconnect")
         _connectionState.value = ConnectionState.DISCONNECTED

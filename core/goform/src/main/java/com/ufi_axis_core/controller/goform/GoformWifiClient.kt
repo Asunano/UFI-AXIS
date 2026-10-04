@@ -11,6 +11,7 @@ import com.ufi_axis_core.util.AppLogger
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 
 /**
@@ -68,6 +69,11 @@ class GoformWifiClient(
     private val commandProfile: DeviceProfile,
 ) {
     private val tag = "GoformWifi"
+    // AP 整表写的读-改-写互斥（2026-10-05 R4-3 修复）：
+    // setWifiConfig / setWifiSSID / setWifiPassword 都是「读回当前表 → 合并 → 整表下发」，
+    // 两个客户端并发写时各自读到旧表再各自下发 → 后写覆盖前写（丢改动）。
+    // 临界区覆盖整段读改写，不只护写：否则锁毫无意义。
+    private val apConfigMutex = kotlinx.coroutines.sync.Mutex()
     // 双 profile：可空那份管归一化（排障开关关掉就是 null），非空那份管命令表。
     // 命令表**不在这里兜底** —— 兜底会让排障模式下的命令表悄悄换成默认设备的（见类 KDoc）。
     private val fields = GoformFieldMapper(profile, commandProfile)
@@ -427,7 +433,7 @@ class GoformWifiClient(
         maxStaNum: Int? = null,
         broadcastDisabled: Int? = null,
         chipIndex: String? = null
-    ): WriteOutcome {
+    ): WriteOutcome = apConfigMutex.withLock {
         val current = if (authMode == null || ssid == null) getCurrentWifiConfig() else emptyMap()
         val params = mergeApConfigParams(
             current = current,
@@ -444,7 +450,7 @@ class GoformWifiClient(
             tag,
             "setWifiConfig: SSID=${params["ssid"]} Auth=${params["auth_mode"]} Enc=${params["encrypt_type"]}"
         )
-        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, params)
+        writer.writeChecked(SettingKey.WIFI_AP_CONFIG, params)
     }
 
     /** @param level 发射功率档位（值域 0~2 的判据在 profile 的 validate 里，与 WifiRoutes 同一份事实）。 */
@@ -455,9 +461,9 @@ class GoformWifiClient(
      * 三态返回（2026-10-05 R2-1 修复）：`Boolean` 会把「设备明确拒绝」压成 false，
      * 路由只能一律回 500；改用 [WriteOutcome] 后客户端能看到设备给的具体原因。
      */
-    suspend fun setWifiSSID(ssid: String): WriteOutcome {
+    suspend fun setWifiSSID(ssid: String): WriteOutcome = apConfigMutex.withLock {
         val current = getCurrentWifiConfig()
-        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApSsidParams(current, ssid))
+        writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApSsidParams(current, ssid))
     }
 
     /**
@@ -535,9 +541,9 @@ class GoformWifiClient(
     /**
      * 只改口令 —— 其余 AP 配置从设备读回后原样带上（整表替换，见 [mergeApPasswordParams]）。
      */
-    suspend fun setWifiPassword(password: String): WriteOutcome {
+    suspend fun setWifiPassword(password: String): WriteOutcome = apConfigMutex.withLock {
         val current = getCurrentWifiConfig()
-        return writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApPasswordParams(current, password))
+        writer.writeChecked(SettingKey.WIFI_AP_CONFIG, mergeApPasswordParams(current, password))
     }
 
     suspend fun setWifiSleep(time: String): WriteOutcome =

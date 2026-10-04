@@ -113,6 +113,14 @@ class UpdateManager(
     /** P0-5 更新互斥：checkAndUpdate / installLocalApk 统一入口 CAS，防并发/重入/跨链路并发 install */
     private val updateMutex = AtomicBoolean(false)
 
+    /**
+     * 自更新安装线程已启动标志（2026-10-05 R3-4 修复）。
+     * checkAndUpdate 的 finally 据此决定是否放 updateMutex：安装是 fire-and-forget 裸线程，
+     * 锁必须移交给线程（失败/异常时放）而不是在安装仍在跑时被 finally 提前放掉。
+     * 仅在 checkAndUpdate 单次调用的协程内部读写，无需 volatile。
+     */
+    private var selfUpdateInstallLaunched = false
+
     /** P1 E25 上传互斥：upload 期间禁止 check/install，且 check/install 期间 upload 返回 409 */
     private val uploadMutex = AtomicBoolean(false)
 
@@ -355,7 +363,14 @@ class UpdateManager(
                 val pendingInstallFile = File("/data/local/tmp/ufi_pending_install.txt")
                 runCatching {
                     // MED1：第4行 mode 统一为 2（与实时启动脚本语义一致），BootReceiver 恢复时同走脚本接管安装
-                    pendingInstallFile.writeText("${apkFile.absolutePath}\n$latest\n$targetSha\n2")
+                    // 2026-10-05 R3-5 修复：原子写（tmp + rename）——BootReceiver 可能在写一半时读到此文件，
+                    // 半行内容会让恢复链路拿到错的 apk 路径/SHA。
+                    val tmp = File(pendingInstallFile.absolutePath + ".tmp")
+                    tmp.writeText("${apkFile.absolutePath}\n$latest\n$targetSha\n2")
+                    if (!tmp.renameTo(pendingInstallFile)) {
+                        tmp.delete()
+                        error("pending install rename failed")
+                    }
                 }
 
                 // 清除旧 RESULT 行（防止上次残留误判）
@@ -417,10 +432,17 @@ class UpdateManager(
                             // 仅当明确失败时才在此记录。
                             if (!success) {
                                 writeResultToLog("INSTALL_FAILED:$message")
+                                // 2026-10-05 R3-4 修复：自更新路径的互斥锁由外层 finally 释放的时代
+                                // 已经结束 —— 安装还在跑时 finally 就放锁，第二次 checkAndUpdate 立刻
+                                // 进来并发双装。现在：明确失败 = 安装已结束 → 在这里放锁；
+                                // 成功/超时 = 进程即将被杀（watchdog 接管）→ 锁随进程一起销毁，
+                                // 不会有人再拿到，也就不会有人并发进来。
                             }
                         } catch (e: Throwable) {
                             AppLogger.e(TAG, "checkAndUpdate installApk 异常", e)
                             writeResultToLog("INSTALL_FAILED:exception:${e.message}")
+                            // 异常路径安装线程已终止，放锁允许重试（2026-10-05 R3-4）
+                            releaseUpdate()
                         }
                     }
                 }.start()
@@ -428,6 +450,9 @@ class UpdateManager(
                 status = UpdateStatus(State.INSTALLING, 100, "更新执行中，设备将重启生效", current, latest, apkFile.absolutePath)
                 logUpdateFile("checkAndUpdate: 安装已后台启动 (target=$latest)")
                 broadcastUpdate()
+                // 2026-10-05 R3-4 修复：自更新路径到此返回时**不放锁** —— 锁的生命周期已移交
+                // 给安装线程（失败时它放，异常时它放）或随进程死亡。外层 finally 需要知道这一点。
+                selfUpdateInstallLaunched = true
             } catch (e: NeedPushException) {
                 // P1 A4：更新源不可用（不可达/非 JSON/下载失败）→ NEED_PUSH，引导前端走推送兜底
                 AppLogger.w(TAG, "checkAndUpdate 更新源不可用: ${e.message}")
@@ -441,7 +466,12 @@ class UpdateManager(
                 logUpdateFile("checkAndUpdate FAILED: ${e.message}")
                 broadcastUpdate()
             } finally {
-                releaseUpdate()
+                // 2026-10-05 R3-4 修复：自更新安装已启动时不释放锁（见上），否则安装期间
+                // 第二次触发可并发双装。标志位只在本次调用作用域内有意义，读完即清。
+                if (!selfUpdateInstallLaunched) {
+                    releaseUpdate()
+                }
+                selfUpdateInstallLaunched = false
             }
         }
     }
@@ -484,7 +514,13 @@ class UpdateManager(
             val pendingInstallFile = File("/data/local/tmp/ufi_pending_install.txt")
             runCatching {
                 // MED1：第4行 mode 统一为 2（与实时启动脚本语义一致），BootReceiver 恢复时同走脚本接管安装
-                pendingInstallFile.writeText("${f.absolutePath}\nlocal\n$apkSha\n2")
+                // 2026-10-05 R3-5 修复：原子写（tmp + rename），防 BootReceiver 读到半行内容。
+                val tmp = File(pendingInstallFile.absolutePath + ".tmp")
+                tmp.writeText("${f.absolutePath}\nlocal\n$apkSha\n2")
+                if (!tmp.renameTo(pendingInstallFile)) {
+                    tmp.delete()
+                    error("pending install rename failed")
+                }
             }
 
             // 清除旧 RESULT 行（防止上次残留误判）
