@@ -255,6 +255,28 @@ class ResponseCache(
      * - "device:info" 精确失效
      */
     suspend fun invalidate(pattern: String) {
+        val removed = invalidateCount(pattern)
+        // 通知 WebSocket 客户端数据已变更
+        if (removed > 0 && onInvalidate != null) {
+            try {
+                // 2026-09-21 修复：这里原来是 `pattern.substringBefore(":")`，
+                // 于是 `invalidate("device:traffic-limit")` 上线变成 `changed:"device"`。
+                // 两端的消费者都是按**完整** key 匹配的（app 侧 `MainViewModel` 要求
+                // `startsWith("device:")`、`ToolsModule.smartRefresh` 要求
+                // `== "device:traffic-limit"`），截断后的 `"device"` 两个条件都不满足
+                // —— 结果整条 data_changed 链路端到端是死的（流量上限、LAN 设置、
+                // 设备设置、小区信息的精准刷新从来没生效过）。现在原样透传 pattern，
+                // 通配形式（`wifi:*`）也能被 `startsWith("wifi:")` 命中。
+                onInvalidate.invoke(pattern)
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * P1（整合计划书 §3.2）：invalidate 的纯删除内核（返回删除条数，不广播）。
+     * 供 [invalidate]（单 pattern）与 [invalidateAll]（合并广播）共用同一套删除逻辑。
+     */
+    private fun invalidateCount(pattern: String): Int {
         val removed = synchronized(lock) {
             when (pattern) {
                 "*" -> {
@@ -288,19 +310,21 @@ class ResponseCache(
                 }
             }
         }
-        // 通知 WebSocket 客户端数据已变更
-        if (removed > 0 && onInvalidate != null) {
-            try {
-                // 2026-09-21 修复：这里原来是 `pattern.substringBefore(":")`，
-                // 于是 `invalidate("device:traffic-limit")` 上线变成 `changed:"device"`。
-                // 两端的消费者都是按**完整** key 匹配的（app 侧 `MainViewModel` 要求
-                // `startsWith("device:")`、`ToolsModule.smartRefresh` 要求
-                // `== "device:traffic-limit"`），截断后的 `"device"` 两个条件都不满足
-                // —— 结果整条 data_changed 链路端到端是死的（流量上限、LAN 设置、
-                // 设备设置、小区信息的精准刷新从来没生效过）。现在原样透传 pattern，
-                // 通配形式（`wifi:*`）也能被 `startsWith("wifi:")` 命中。
-                onInvalidate.invoke(pattern)
-            } catch (_: Exception) {}
+        return removed
+    }
+
+    /**
+     * P1（整合计划书 §3.2）：批量失效 + **单次广播**。
+     * 一次写操作常清多个 key（制式切换 3 个起）。逐个 invalidate 会广播 N 条 data_changed，
+     * 客户端每条各跑一轮 smartRefresh → 一次切换 N 轮请求扇出，恰好复现缓存防压要防的问题。
+     * 合并为一条 "k1,k2,k3" 事件，客户端（P5 配套）split 后一轮刷完。
+     * 删到任一条目即广播一次（部分删除场景多刷一个未变 key 可接受，见裁决 R3）。
+     */
+    suspend fun invalidateAll(vararg patterns: String) {
+        var removedAny = false
+        for (p in patterns) if (invalidateCount(p) > 0) removedAny = true
+        if (removedAny && onInvalidate != null) {
+            try { onInvalidate.invoke(patterns.joinToString(",")) } catch (_: Exception) {}
         }
     }
 
@@ -323,6 +347,10 @@ class ResponseCache(
                 "count" to cache.size,
                 "max_entries" to maxEntries,
                 "any_cache_count" to anyCache.size,
+                // P1（整合计划书 §3.4 / D-5）：过期但尚未被读触发的惰性删除所滞留的条目数。
+                // 健康态应远小于 count；长期逼近 count 说明存在大量"写入后无人再读"的 key
+                // ——那是 TTL 设置问题，不是需要清扫的信号。纯观测，不驱动任何自动行为。
+                "expired_count" to cache.values.count { isExpired(it) },
                 "total_bytes_estimate" to cache.entries.sumOf { it.value.sizeBytes },
                 "stale" to stale.get(),
                 "entries" to entries.take(50)
@@ -394,9 +422,17 @@ class ResponseCache(
     /**
      * 精确失效泛型缓存条目
      */
-    fun invalidateAny(key: String) {
-        synchronized(lock) {
-            anyCache.remove(key)
+    /**
+     * P1（整合计划书 §3.1，修 G2）：原来只删 anyCache、不走 onInvalidate —— 清了缓存
+     * 但客户端收不到 data_changed，`hub:network-type-info` 这类泛型 key 的变更端到端
+     * 是哑的（制式切换后 /api/network/status 无通知，即「网络界面不刷新」直接原因）。
+     * 改为与 [invalidate] 同一条通知链路；删到了才广播，与 invalidate 的 removed>0
+     * 语义一致。改 suspend 以复用挂起回调（调用方全在协程内，编译器强制检查调用链）。
+     */
+    suspend fun invalidateAny(key: String) {
+        val removed = synchronized(lock) { anyCache.remove(key) != null }
+        if (removed && onInvalidate != null) {
+            try { onInvalidate.invoke(key) } catch (_: Exception) {}
         }
     }
 
@@ -440,9 +476,16 @@ class ResponseCache(
     private val globRegexCache = ConcurrentHashMap<String, Regex>()
     
     private fun globToRegex(pattern: String): Regex {
-        return globRegexCache.getOrPut(pattern) {
-            Regex("^${Regex.escape(pattern).replace("\\*", ".*")}$")
+        // 2026-10-05 P1 修复：原实现 Regex.escape(pattern).replace("\\*", ".*") 是死代码——
+        // escape 产出 \Qwifi:*\E，引号段内不存在 "\*" 子串形态，replace 永不命中，
+        // 通配失效（invalidate("wifi:*") 等全仓 10 处生产调用）实际全为空操作。
+        // 逐字符转义：* → .*，其余字符字面匹配。
+        val body = buildString {
+            for (ch in pattern) {
+                if (ch == '*') append(".*") else append(Regex.escape(ch.toString()))
+            }
         }
+        return globRegexCache.getOrPut(pattern) { Regex("^$body$") }
     }
 
     /**

@@ -297,6 +297,14 @@ internal fun UfiDialogShell(
             if (!closing.value) {
                 closeAction.value = action
                 closing.value = true
+            } else {
+                // 2026-10-05 P0-2：离场 ramp 期间用户点的是"确认/取消"这类**动作**，
+                // 不是关闭请求。原来被静默丢弃——onConfirm 永不执行且无反馈，
+                // 用户以为按钮坏了。语义：closing 期间收到的新 action 仍然执行
+                //（动作照做），只是不再重复启动离场。
+                // 幂等性：onDismiss 多调一次 = 上层把 visible 再置 false 一次，无副作用。
+                Log.d("UfiDialogShell", "requestClose during ramp: executing late action")
+                action()
             }
         }
     }
@@ -510,6 +518,11 @@ internal fun UfiDialogShell(
         Box(
             modifier = Modifier
                 .fillMaxSize()
+                // 2026-10-05 P0-1：scrimAlpha 此前是死参数——声明了但没人用，弹窗与背景的
+                // 分离全靠 FLAG_BLUR_BEHIND，而模糊在 API<31 / 省电模式 / 关动画时静默失效，
+                // 低端机上弹窗"糊"进背景。补上真正的遮罩底色；模糊继续叠加，有则更好。
+                // pageBg 与页面底色同源，dark/light 主题自动正确（不用纯黑，light 下突兀）。
+                .background(palette.pageBg.copy(alpha = scrimAlpha))
                 .clickable(
                     enabled = dismissOnClickOutside,
                     indication = null,

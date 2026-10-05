@@ -169,7 +169,9 @@ class NetworkRoutes(
                 }
 
                 if (result.success) {
-                    cache?.invalidate("network:band-status")
+                    // 2026-10-05 P1（§3.3.2）：锁频不改 device:settings；goform/summary 的
+                    // 网络段随频段变化，合并一条事件。
+                    cache?.invalidateAll("network:band-status", "device:goform", "summary")
                 }
                 call.respond(
                     if (result.success) HttpStatusCode.OK else HttpStatusCode.BadRequest,
@@ -358,8 +360,17 @@ class NetworkRoutes(
      * 三个 key 一起清是硬要求：少清任何一个，对应那个端点就会继续回旧值。
      */
     private suspend fun invalidateAfterModeWrite() {
-        cache?.invalidate("device:settings")
-        cache?.invalidate("network:band-status")
-        cache?.invalidateAny("hub:network-type-info")
+        // 2026-10-05 P1（整合计划书 §3.3.1，修 G7/G8/G9）：原来 3 个 key 逐个清各自广播，
+        // 一次切换扇出 3 条 data_changed。改为一条合并事件，并补全 goform/qos/summary：
+        // device:goform 含 networkType 段（设备信息页，5min TTL，G8）；
+        // device:qos 随重驻网重新协商（G9）；summary 的 network_status 段一并失效（G7）。
+        cache?.invalidateAll(
+            "device:settings",
+            "network:band-status",
+            "hub:network-type-info",
+            "device:goform",
+            "device:qos",
+            "summary",
+        )
     }
 }

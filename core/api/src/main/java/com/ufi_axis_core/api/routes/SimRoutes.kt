@@ -91,7 +91,12 @@ class SimRoutes(
                 // 换卡后失效的是 device:* 那几份缓存（device:info / device:identity / device:goform
                 // 都带 imei/imsi/iccid）。原来写的是 `sim:*`，那是已删除的 /api/sim/info 的键，
                 // 现在没有任何缓存项匹配它，客户端也不会因此刷新真正展示 SIM 的那几个接口。
-                if (success) cache?.invalidate("device:*")
+                if (success) {
+                    cache?.invalidate("device:*")
+                    // 2026-10-05 P1（§3.3.3，修 G10）：换卡后运营商/制式随卡变，
+                    // 网络状态与制式文案一并失效，合并一条事件。
+                    cache?.invalidateAll("hub:network-type-info", "network:band-status", "summary")
+                }
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "slot" to slot))
