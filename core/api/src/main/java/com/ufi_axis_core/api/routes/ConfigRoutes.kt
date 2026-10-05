@@ -229,6 +229,11 @@ class ConfigRoutes(
                 }
                 boolField("sms_code_auto_copy") { settings.smsCodeAutoCopy = it }
 
+                // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）。每次循环迭代现读 prefs，
+                // PUT 完下一轮就生效，无需重启。
+                boolField("thumb_prewarm_enabled") { settings.thumbPrewarmEnabled = it }
+                boolField("thumb_prewarm_wifi_only") { settings.thumbPrewarmWifiOnly = it }
+
                 // SMS 拦截（黑名单 + 关键词）的两个开关。规则本身走 /api/sms/rules，不在这里。
                 boolField("sms_filter_exempt_verification_code") {
                     settings.smsFilterExemptVerificationCode = it

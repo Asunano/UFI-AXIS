@@ -380,6 +380,13 @@ object WsDataTopic {
     /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
     const val MEDIA_PLAYLISTS = "media:playlists"
 
+    /**
+     * 2026-10-05 G6（FFmpeg 接入计划书 §4.2）：封面预热进度变了
+     * （data: { done: Int, total: Int, failed: Int, running: Boolean }）。
+     * 设置页据此展示预热进度；媒体列表端收到后可做一次缩略图静默重拉。
+     */
+    const val MEDIA_THUMB_PREWARM = "media:thumb-progress"
+
     /** 前缀：按命名空间分流用。 */
     const val PREFIX_TASK = "task:"
     const val PREFIX_CONSOLE = "console:"

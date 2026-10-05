@@ -687,6 +687,26 @@ object ComponentFactory {
         val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(
             context, settings, responseCache, mediaExclusions
         )
+
+        // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）：把 ThumbPrewarmWorker
+        // 挂到 DataScheduler 的 idle 循环上。开关/闲时/写门判据全在 Worker 里（每轮现读），
+        // 这里只递「每张之间 delay(2s) 的节流」与「data_changed 进度广播」两个闭包。
+        scheduler.attachThumbPrewarmTask {
+            com.ufi_axis_core.media.ThumbPrewarmWorker.runOnce(
+                context,
+                throttledPerItem = { kotlinx.coroutines.delay(2_000L) },
+                broadcast = { done, total, failed, running ->
+                    wsManager.broadcast(
+                        "data_changed",
+                        mapOf(
+                            "changed" to com.ufi_axis_core.contract.WsDataTopic.MEDIA_THUMB_PREWARM,
+                            "done" to done, "total" to total,
+                            "failed" to failed, "running" to running
+                        )
+                    )
+                }
+            )
+        }
         // 音频歌单（2026-09-21）：歌单本身存 prefs（曲目只记路径），曲目回查复用 mediaRoutes
         // 的 MediaStore 查询（它实现了 AudioItemLookup）——「路径 → 曲目」只在 core 存在一份，
         // app 与 web 都不必自己拼。集合变更走 data_changed，否则一端加歌另一端要退页面才看得见。

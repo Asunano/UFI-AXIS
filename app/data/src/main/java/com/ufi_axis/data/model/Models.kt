@@ -1045,7 +1045,12 @@ data class AppConfig(
     val update_mirror_base: String = "",
     // 2026-09-22：下载方式（auto/mirror/direct）。**core 是这一项的真源**，app 只读回来显示，
     // 并在 core 不可达时作为选源兜底。空串 = 老 core 没这个字段，此时保持本地缓存不动。
-    val update_source_mode: String = ""
+    val update_source_mode: String = "",
+    // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+    // 真源在 core，**可空**：null = core 没返回这个键（老版本），UI 据此禁用开关，
+    // 不拿默认值冒充真值（口径同上面 sms_* / field_normalization_enabled 那批字段）。
+    val thumb_prewarm_enabled: Boolean? = null,
+    val thumb_prewarm_wifi_only: Boolean? = null
 )
 
 /**
@@ -1772,6 +1777,14 @@ data class MediaGroupsResponse(
 )
 
 /**
+ * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。 *
+ * [granted] 与 [scan_dirs] 的 key 都是 [MEDIA_TYPE_VIDEO] 等。某一类 granted 为 false 时
+ * 对应页面必须显示未授权引导 —— 显示空列表等于告诉用户"设备里没有视频"。
+ *
+ * [scan_dirs] 自 2026-09-16 起**按类型各一份**（媒体中心拆成三个独立页，每页管自己的范围）；
+ * 某一类为空数组 = 这一类不限目录。
+ */
+/**
  * 2026-10-05 G5：视频元信息（FFmpeg 接入计划书 §4.1）。
  * core 用 ffmpeg 探测真值（MediaStore 列在本机经常缺失），永久缓存。
  * [source]：cache（缓存命中）| ffmpeg（本次探测）。
@@ -1791,14 +1804,6 @@ data class VideoInfoResponse(
     val source: String = "",
 )
 
-/**
- * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。 *
- * [granted] 与 [scan_dirs] 的 key 都是 [MEDIA_TYPE_VIDEO] 等。某一类 granted 为 false 时
- * 对应页面必须显示未授权引导 —— 显示空列表等于告诉用户"设备里没有视频"。
- *
- * [scan_dirs] 自 2026-09-16 起**按类型各一份**（媒体中心拆成三个独立页，每页管自己的范围）；
- * 某一类为空数组 = 这一类不限目录。
- */
 @Serializable
 data class MediaStatusResponse(
     val all_files_access: Boolean = false,

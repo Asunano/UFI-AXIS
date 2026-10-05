@@ -290,6 +290,39 @@ class DataScheduler(
     }
 
     /**
+     * 注入媒体封面预热任务（2026-10-05 G6，FFmpeg 接入计划书 §4.2）。
+     *
+     * 与 [attachTrafficLimitProvider] 同一个解耦口径：预热的全部判据与执行
+     * （开关、闲时门、ffmpeg 抽帧、thumbCache 落盘）都在 `:core:api` 的
+     * `ThumbPrewarmWorker` 里，scheduler 层只负责「何时跑」——注册一个
+     * 低频 idle 循环，开关关闭时该回调内部第一行就返回，成本为零。
+     * 未 attach（测试/降级装配）时循环不启动。
+     */
+    fun attachThumbPrewarmTask(task: suspend () -> Unit) {
+        thumbPrewarmTask = task
+        if (isRunning) startThumbPrewarmLoop()
+        AppLogger.i(tag, "ThumbPrewarmTask attached")
+    }
+
+    @Volatile
+    private var thumbPrewarmTask: (suspend () -> Unit)? = null
+    private var thumbPrewarmJob: Job? = null
+
+    /**
+     * 预热 idle 循环：5 分钟一轮。判据全在被调方（开关 / 电量 / 写门），
+     * 这里只给节拍；对齐计划书 §4.2「预热永远让位给前台交互」。
+     */
+    private fun startThumbPrewarmLoop() {
+        thumbPrewarmJob?.cancel()
+        thumbPrewarmJob = launchLoop {
+            while (isActive) {
+                delay(5 * 60_000L)
+                thumbPrewarmTask?.invoke()
+            }
+        }
+    }
+
+    /**
      * 冷数据采集总开关（由 REST /monitor/control 设置）。
      * 仅控制「是否运行采集循环」，与前端是否连接无关——冷数据（月流量/电池/SMS/设备信息）
      * 是设备侧资产，必须无条件采集，否则前端断开后数据永久归零（见 2026-08-24 goform 掉线复盘）。
@@ -630,6 +663,9 @@ class DataScheduler(
                 cleanOldData()
             }
         }
+
+        // ── 【媒体封面预热】(2026-10-05 G6)：attach 过才启动；5 分钟一轮，判据在被调方 ──
+        if (thumbPrewarmTask != null) startThumbPrewarmLoop()
     }
 
     /**

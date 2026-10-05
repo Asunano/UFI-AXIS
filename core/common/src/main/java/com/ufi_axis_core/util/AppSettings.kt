@@ -57,6 +57,10 @@ class AppSettings(context: Context) {
         private const val KEY_GEO_COUNTRY = "geo_country"
         private const val KEY_GEO_DETECTED_AT = "geo_detected_at"
         private const val KEY_MEDIA_SCAN_DIRS = "media_scan_dirs"
+
+        // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+        private const val KEY_THUMB_PREWARM_ENABLED = "thumb_prewarm_enabled"
+        private const val KEY_THUMB_PREWARM_WIFI_ONLY = "thumb_prewarm_wifi_only"
         private const val KEY_ARIA2_RPC_SECRET = "aria2_rpc_secret"
 
         // ── 更新通道（2026-08-10：后端自拉取更新）──
@@ -200,6 +204,9 @@ class AppSettings(context: Context) {
             // 配对配额（不是凭据，是策略）
             BackupField(KEY_PAIRING_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_MAX_DEVICES, BackupValueType.INT, 0, 100),
+            // 媒体封面预热（G6）：用户偏好，换设备仍成立
+            BackupField(KEY_THUMB_PREWARM_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_THUMB_PREWARM_WIFI_ONLY, BackupValueType.BOOL),
             // 隧道
             BackupField(KEY_TUNNEL_AUTO_RECONNECT, BackupValueType.BOOL),
             BackupField(KEY_TUNNEL_RECONNECT_INTERVAL, BackupValueType.INT, 10, 120),
@@ -1257,6 +1264,24 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_TUNNEL_AUTO_RECONNECT, true)
         set(value) = prefs.edit().putBoolean(KEY_TUNNEL_AUTO_RECONNECT, value).apply()
 
+    // --- 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）---
+
+    /**
+     * 后台自动封面预热总开关。默认**关**（首次引入保守上线，见计划书 §8-1）：
+     * 开启后 DataScheduler 在闲时逐条给 MediaStore 视频补 ffmpeg 封面。
+     */
+    var thumbPrewarmEnabled: Boolean
+        get() = prefs.getBoolean(KEY_THUMB_PREWARM_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_THUMB_PREWARM_ENABLED, value).apply()
+
+    /**
+     * 预热仅限充电/电量充足时进行的开关（默认 true）。core 本身就是网关不存在"流量"
+     * 顾虑，保留该语义是给用户一个"闲时才干活"的一键开关。
+     */
+    var thumbPrewarmWifiOnly: Boolean
+        get() = prefs.getBoolean(KEY_THUMB_PREWARM_WIFI_ONLY, true)
+        set(value) = prefs.edit().putBoolean(KEY_THUMB_PREWARM_WIFI_ONLY, value).apply()
+
     /** 看护巡检间隔（秒），10..120；过小会把设备的 CPU 耗在无谓的 /proc 扫描上 */
     var tunnelReconnectIntervalSec: Int
         get() = prefs.getInt(KEY_TUNNEL_RECONNECT_INTERVAL, 30).coerceIn(10, 120)
@@ -1415,7 +1440,10 @@ class AppSettings(context: Context) {
         "update_url" to updateUrl,
         "update_mirror_base" to updateMirrorBase,
         // 下载方式（2026-09-22）：客户端靠 GET 回读当前值做基线，漏了它 web 的差量提交就永远发不出去
-        "update_source_mode" to updateSourceMode
+        "update_source_mode" to updateSourceMode,
+        // 媒体封面预热（2026-10-05 G6）：客户端靠 GET 回读做基线，漏登记 = 界面永远显示默认值
+        "thumb_prewarm_enabled" to thumbPrewarmEnabled,
+        "thumb_prewarm_wifi_only" to thumbPrewarmWifiOnly
     )
 
     // ────────────────────────────────────────────────────────────
