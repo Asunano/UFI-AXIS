@@ -178,7 +178,14 @@ class NetworkRoutes(
                         "action" to action,
                         "mode" to result.mode,
                         "needs_reboot" to false,
-                        "network_restarted" to result.stackRestarted
+                        "network_restarted" to result.stackRestarted,
+                        // 2026-10-05 R2-4 修复：半失败透传——一路成功一路失败时客户端能提示
+                        // 「部分频段未生效」，而不是显示完全成功。
+                        // 键名走 DeviceFields 镜像（R4-12 后校验器查 goform 字段名泄漏，
+                        // 路由源码不放 lte_/nr_ 字面量），TS 侧字段在 contract.ts 手抄镜像里。
+                        DeviceFields.BandLockApply.APPLIED_LTE to (result.lteOk ?: false),
+                        DeviceFields.BandLockApply.APPLIED_NR to (result.nrOk ?: false),
+                        DeviceFields.BandLockApply.PARTIAL to result.partial,
                     ))
                 )
             }

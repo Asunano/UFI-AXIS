@@ -175,6 +175,9 @@ class DataScheduler(
     private val schedulerScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         AppLogger.e(tag, "DataScheduler coroutine exception (uncaught)", e)
     })
+    // 2026-10-05 R1-2 修复：stop() 的收尾协程挂在独立 scope 上，
+    // 收尾里取消 schedulerScope 子协程时不会取消它自己。
+    private val stopScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // isRunning / monitorEnabled 由 service 协程写、由 Netty worker 线程读（/api/service/status 回读），
     // 因此必须 @Volatile，否则回读到的可能是过期值。
     @Volatile private var isRunning = false
@@ -706,11 +709,20 @@ class DataScheduler(
         performanceMonitorJob?.cancel()
         flushJob?.cancel()
         wakeLockRenewJob?.cancel()
+        // 2026-10-05 R1-2 修复：取消采集协程改在收尾协程**外部**做。原实现在收尾协程体内
+        // 调 schedulerScope.coroutineContext.cancelChildren()，而收尾协程本身是
+        // schedulerScope 的子协程——cancelChildren 会把它自己一并取消，
+        // 其后所有清理逻辑（含"Data scheduler stopped"日志）都成死代码。
+        // 现在：flush 等待结束后，由 cancelAllLoops() 精确取消采集相关 Job；
+        // 收尾协程挂在独立 stopScope 上，永不自伤。
+        if (token == stopGeneration && !isRunning) {
+            cancelAllLoops()
+        }
         
         // 异步刷写剩余缓冲数据后停止,避免阻塞主线程
         // 2026-08-23 修复:不在 NonCancellable 中调用 cancelChildren,
         // 避免正在进行的 goform 查询被强制中断导致协程卡死
-        schedulerScope.launch {
+        stopScope.launch {
             try {
                 // 等待当前采集周期完成(最多 5s)
                 withTimeout(5_000L) {
@@ -726,10 +738,31 @@ class DataScheduler(
                 AppLogger.w(tag, "Stop finalization skipped: scheduler was restarted during flush")
                 return@launch
             }
-            // 取消所有子协程(包括正在进行的 goform 查询)
-            schedulerScope.coroutineContext.cancelChildren()
+            // 取消所有采集协程（含正在进行的 goform 查询）——见上方 R1-2 说明
+            cancelAllLoops()
             AppLogger.i(tag, "Data scheduler stopped")
         }
+    }
+
+    /**
+     * 2026-10-05 R1-2 修复：集中取消所有采集相关协程。
+     * 不再用 schedulerScope.coroutineContext.cancelChildren()（会把调用者自己取消），
+     * 改为逐个取消已注册的 Job；start() 期间新起的循环也统一登记到 [loopJobs]。
+     */
+    private val loopJobs = java.util.concurrent.CopyOnWriteArrayList<Job>()
+
+    /** 采集循环统一从这里 launch，自动登记以便 stop() 精确取消。 */
+    private fun launchLoop(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit): Job =
+        schedulerScope.launch { block() }.also { loopJobs.add(it) }
+
+    private fun cancelAllLoops() {
+        loopJobs.forEach { it.cancel() }
+        loopJobs.clear()
+        // 兜底：仍可能有历史路径直接挂在 schedulerScope 上的零散协程；
+        // 收尾协程已在 stopScope 上，不会被误伤。
+        schedulerScope.coroutineContext[Job]?.children
+            ?.filter { it !in loopJobs }
+            ?.forEach { runCatching { it.cancel() } }
     }
 
     /**

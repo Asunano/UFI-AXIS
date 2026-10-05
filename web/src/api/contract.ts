@@ -1482,6 +1482,17 @@ export const DeviceFields = {
     all: ['lte_band_lock', 'nr_band_lock'],
   },
 
+  /**
+   * POST /api/network/band 响应的半失败透传字段（2026-10-05 R2-4）。
+   * LTE/NR 是两次独立 goform 写，一路成功一路失败时 success 仍为 true
+   * （网络栈已按「新值+旧值」混合状态重启），客户端凭 partial 提示部分未生效。
+   */
+  bandLockApply: {
+    lteApplied: 'lte_applied',
+    nrApplied: 'nr_applied',
+    partial: 'partial',
+  },
+
   /** GET /api/network/cell-info · /api/network/neighbor-cells */
   cellInfo: {
     neighborCellInfo: 'neighbor_cell_info',

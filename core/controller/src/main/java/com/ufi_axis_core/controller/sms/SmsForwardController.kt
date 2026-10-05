@@ -403,6 +403,24 @@ class SmsForwardController(
         get() = prefs.getLong(KEY_LAST_FORWARDED_SMS_ID, -1L)
         set(value) { prefs.edit().putLong(KEY_LAST_FORWARDED_SMS_ID, value).apply() }
 
+    /**
+     * 2026-10-05 R1-14 修复：水位推进的原子原语。
+     * [lastForwardedSmsId] 是跨协程共享的 check-then-act 状态（读水位→过滤→投递→写水位），
+     * prefs get/set 各自原子但序列不原子：两条转发路径并发时可能重发/漏发。
+     * [advanceWaterMarkIfBeyond] 把「比较 + 推进」收成 synchronized 单一原子操作，
+     * 单调只增语义；调用方投递循环内不再直接 set（走本方法推进）。
+     */
+    private val waterMarkLock = Any()
+
+    /** 仅当 [newId] 大于当前水位时推进，返回推进后的水位值。 */
+    fun advanceWaterMarkIfBeyond(newId: Long): Long = synchronized(waterMarkLock) {
+        val cur = prefs.getLong(KEY_LAST_FORWARDED_SMS_ID, -1L)
+        if (newId > cur) {
+            prefs.edit().putLong(KEY_LAST_FORWARDED_SMS_ID, newId).apply()
+            newId
+        } else cur
+    }
+
     fun loadStats(): MailStats = MailStats(
         success = prefs.getInt(KEY_STAT_SUCCESS, 0),
         failed = prefs.getInt(KEY_STAT_FAILED, 0),

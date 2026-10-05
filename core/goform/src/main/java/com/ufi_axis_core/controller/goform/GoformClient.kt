@@ -262,6 +262,16 @@ class GoformClient(
             == GoformSessionPolicy.SessionGate.USE_CACHED
         ) return fast
 
+        // 2026-10-05 R1-11 修复：锁外预检。原实现排队进锁之后才做退避/让位判定——
+        // 设备断连恢复窗口里，N 个调用者先排长队再逐个被拒，排队成本全白付。
+        // 预检只是快速路径优化：锁内二次检查保留（预检与进锁之间状态可能变化）。
+        val failCountPre = consecutiveLoginFailures.get()
+        if (GoformSessionPolicy.inLoginBackoff(failCountPre, lastLoginAttempt, now) ||
+            GoformSessionPolicy.shouldGiveWay(lastGiveWayAt, now)
+        ) {
+            return null
+        }
+
         return loginMutex.withLock {
             val nowLocked = System.currentTimeMillis()
             val current = session.get()

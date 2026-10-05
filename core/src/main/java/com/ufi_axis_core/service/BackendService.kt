@@ -429,7 +429,10 @@ class BackendService : Service() {
                 // 反过来（先投递成功再落 id）看着更"可靠"，但那意味着用户一打开总开关就会被
                 // 静默期里攒下的一堆邮件糊脸 —— 那些通知的时效早就过了。
                 // 这是明确的取舍，不是漏改：短信正文在 /api/sms 里一直查得到，补发的只是通知。
-                forwardCtl.lastForwardedSmsId = plan.highWaterMark
+                // 2026-10-05 R1-14 修复：写水位改走 synchronized 的 advanceWaterMarkIfBeyond，
+                // 与读侧（同一把锁的语义经由 plan 前的 lastId 读不变，但推进与并发路径互斥），
+                // 消除「A/B 双路径并发同水位时互相覆盖/重复投递」的竞态。
+                forwardCtl.advanceWaterMarkIfBeyond(plan.highWaterMark)
                 // **逐条串行**：forwardSms 内部持 WakeLock 走 SMTP，并发只会让几个握手互相抢锁。
                 for (msg in plan.toForward) {
                     AppLogger.i(tag, "New SMS #${msg.id} from ${msg.address} via $source: ${msg.body.take(50)}")

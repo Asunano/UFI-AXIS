@@ -224,6 +224,18 @@ object DeviceFields {
         val ALL = listOf(LTE_BAND_LOCK, NR_BAND_LOCK)
     }
 
+    /**
+     * 2026-10-05 R2-4 修复：POST /api/network/band 响应新增的半失败透传字段。
+     * 「LTE 成功、NR 失败」等部分失败时 success 仍为 true（栈已按混合状态重启），
+     * 客户端凭这两个布尔提示「部分频段未生效」。键名不带 goform 前缀，
+     * 但与 BandStatus 同域，TS 手抄镜像见 contract.ts `bandLockApply`。
+     */
+    object BandLockApply {
+        const val APPLIED_LTE = "lte_applied"
+        const val APPLIED_NR = "nr_applied"
+        const val PARTIAL = "partial"
+    }
+
     // ──────── GET /api/network/cell-info · /api/network/neighbor-cells ────────
 
     /**

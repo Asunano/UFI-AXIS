@@ -76,6 +76,10 @@ class WebSocketManager(
     private val connections = ConcurrentHashMap<WebSocketSession, MutableSet<String>>()
     private val maxConnections = com.ufi_axis_core.contract.WsChannel.MAX_CONNECTIONS  // 支持 App + Web 多客户端同时连接（契约常量，双端共用）
 
+    // 2026-10-05 R1-5 修复：连接准入信号量（与 maxConnections 同值）。
+    // finally 释放，与 tryAcquire 严格配对，见 handleConnection。
+    private val connectionSlots = java.util.concurrent.Semaphore(maxConnections)
+
     // 广播序列化缓存：同类型 + **同 payload** 在 500ms 内复用预序列化的 JSON 文本。
     // payload 必须参与命中判断 —— 见 [BroadcastCacheEntry]。
     private val broadcastCache = ConcurrentHashMap<String, BroadcastCacheEntry>()
@@ -135,15 +139,19 @@ class WebSocketManager(
         }
 
         val subscribedTypes = mutableSetOf<String>()
+        // 2026-10-05 R1-5 修复：准入裁决前置为原子 tryAcquire。
+        // 原实现「先注册再检查 size 再回滚」三步非原子：并发握手可同时越过上限检查，
+        // 且拒绝路径的 remove 与 finally 的 isEmpty 判定竞争，可把 stale 误置 true
+        // （前端显示「数据可能过期」）。信号量把裁决收成单一原子操作，注册路径必然在配额内。
+        if (!connectionSlots.tryAcquire()) {
+            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) exceeded")
+            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
+            return
+        }
         val existing = connections.putIfAbsent(session, subscribedTypes)
         if (existing != null) {
             AppLogger.w(tag, "WebSocket session already registered, skipping")
-            return
-        }
-        if (connections.size > maxConnections) {
-            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) exceeded")
-            connections.remove(session)
-            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
+            connectionSlots.release()
             return
         }
 
@@ -186,6 +194,8 @@ class WebSocketManager(
             AppLogger.e(tag, "WebSocket error", e)
         } finally {
             connections.remove(session)
+            // 2026-10-05 R1-5 修复：释放准入配额，与 tryAcquire 配对
+            connectionSlots.release()
             // 从订阅索引中移除该 session 的所有订阅
             subscriptions.values.forEach { it.remove(session) }
             // 全部客户端断开 → 手机端缓存视为可能过期（F27）

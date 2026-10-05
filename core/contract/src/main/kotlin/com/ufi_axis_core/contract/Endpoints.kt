@@ -329,4 +329,18 @@ object Endpoints {
 
     /** WebSocket 实时通道，订阅协议见 [WsChannel]。 */
     const val WS_REALTIME = "ws/realtime"
+
+    /**
+     * 配对 / 安全通道（`PairingRoutes`，2026-10-05 R4-12 入 contract）。
+     * web 首次连接走 challenge→confirm 换取会话令牌；change-password 修改配对口令。
+     */
+    object Pairing {
+        const val BASE = "pairing"
+        const val CHALLENGE = "$BASE/challenge"
+        const val CONFIRM = "$BASE/confirm"
+        const val CHANGE_PASSWORD = "$BASE/change-password"
+    }
+
+    /** 健康检查（core 进程存活探针，无鉴权）。 */
+    const val HEALTH = "health"
 }

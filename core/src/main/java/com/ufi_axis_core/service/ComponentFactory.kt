@@ -519,6 +519,11 @@ object ComponentFactory {
         )
         AppLogger.i(TAG, "[12.5] DataHub initialized")
 
+        // 2026-10-05 R2-3 修复：DataHub 建好后再挂 WiFi 缓存失效钩子（NetworkController 在
+        // buildNetworkGraph 内先于 DataHub 创建，故用延迟赋值）。setWifiSSID 部分失败
+        // （SSID 成功、口令失败）时也会失效缓存，保证下一位读方拿到新状态。
+        network.networkController.wifiCacheInvalidator = { dataHub.invalidateWifi() }
+
         // 流量套餐限额预警（2026-08-31 从 app 侧下沉）：判定在 AlertEngine，取数走 DataHub 的 10s 缓存。
         // 开关在 lambda 里查，关闭时连 goform 都不查（scheduler 引不到 NotificationConfig，见 attachTrafficLimitProvider）。
         //

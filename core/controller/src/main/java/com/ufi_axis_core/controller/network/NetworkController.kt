@@ -39,6 +39,14 @@ class NetworkController(
     private val platform: PlatformAdapter
 ) {
     private val tag = "NetworkController"
+
+    /**
+     * 2026-10-05 R2-3 修复：WiFi 缓存失效钩子。setWifiSSID「SSID 成功、口令失败」的部分失败
+     * 也必须让 /api/wifi 回读拿到设备实况（SSID 已变）。由装配层注入（dataHub.invalidateWifi），
+     * 控制器层不反向依赖 api/cache —— null 时静默跳过（等价旧行为）。
+     */
+    @Volatile var wifiCacheInvalidator: (suspend () -> Unit)? = null
+
     // 网络栈重启互斥锁 — 防止并发 AT+SFUN 调用
     private val stackRestartMutex = kotlinx.coroutines.sync.Mutex()
 
@@ -76,8 +84,17 @@ class NetworkController(
         AppLogger.i(tag, "Setting WiFi SSID: $ssid")
         val ssidResult = wifi.setWifiSSID(ssid)
         if (ssidResult is WriteOutcome.Ok && password != null) {
-            return wifi.setWifiPassword(password)
+            val pwdResult = wifi.setWifiPassword(password)
+            // 2026-10-05 R2-3 修复：SSID 写成功、密码写失败时，设备态已变（SSID=新值），
+            // 但按 WriteOutcome 只能回一个失败态 → 路由 500、客户端显示「修改失败」，
+            // 而此刻 /api/wifi 缓存若不失效，30s 内回读还是旧 SSID——三层状态互相矛盾。
+            // 最小改法：部分失败也强制失效缓存，让下一次回读拿到设备实况（SSID 已变）。
+            if (pwdResult !is WriteOutcome.Ok) {
+                wifiCacheInvalidator?.invoke()
+            }
+            return pwdResult
         }
+        // SSID 本身写失败：设备态未变（SSID 仍是旧值），无需失效
         return ssidResult
     }
 
@@ -127,7 +144,18 @@ class NetworkController(
          * **没有向设备发任何请求** —— route 应回 400 `OUT_OF_RANGE` 而不是 500（计划书 9.5）。
          */
         val rejectedReason: String? = null,
-    )
+        /**
+         * 2026-10-05 R2-4 修复：各路写结果明细。LTE 与 NR 是两次独立 goform 写，
+         * 可独立失败；`success`（任一路成功即重启栈）无法表达「半失败」。
+         * 客户端凭 [partial] 提示「部分频段未生效」，不再被整体 success 掩盖。
+         */
+        val lteOk: Boolean? = null,
+        val nrOk: Boolean? = null,
+    ) {
+        /** 至少一路成功、但另一路失败：栈已按「新值+旧值」混合状态重启，必须让客户端可见。 */
+        val partial: Boolean
+            get() = success && ((lteOk == false) || (nrOk == false))
+    }
 
 
     suspend fun lockBands(
@@ -180,7 +208,9 @@ class NetworkController(
         }
 
         val goformSuccess = lteOk || nrOk
-        val result = BandLockResult(success = goformSuccess, mode = modeDesc, stackRestarted = false)
+        // 2026-10-05 R2-4 修复：携带各路明细，partial 语义见 BandLockResult
+        val result = BandLockResult(success = goformSuccess, mode = modeDesc, stackRestarted = false,
+            lteOk = lteOk, nrOk = nrOk)
 
         // goform 写入成功后重启网络协议栈让频段立即生效
         if (result.success) {
