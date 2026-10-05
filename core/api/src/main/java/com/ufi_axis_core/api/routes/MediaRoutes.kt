@@ -1529,6 +1529,88 @@ class MediaRoutes(
              * 本端点不走 [ResponseCache]：它是分页查询，工作量已经被 SQL 的 LIMIT 限住了，
              * 叠内存缓存只会多出一份要失效的状态 —— 所以过滤参数也不存在"串缓存"的问题。
              */
+            /**
+             * 2026-10-05 G5（FFmpeg 接入计划书 §4.1）：视频元信息探测。
+             *
+             * ## 为什么需要它
+             * `/list` 的 duration/width/height 全来自 MediaStore 列，而本机 MediaProvider
+             * 同样依赖缺失的 codec 栈 —— 经常没扫描出来或为 0。ffmpeg 引入后 core 第一次
+             * 有了自主探测真值的能力。
+             *
+             * ## 缓存策略
+             * 媒体文件不可变：结果落 filesDir/video_info/ 永久缓存（单条 <1KB，无上限必要），
+             * 文件删除时随媒体库 rescan 清理。探测走 ffmpeg（fd 通道 + 20s 超时）。
+             *
+             * 404：无法解析（损坏/不支持容器/ffmpeg 不可用）——reason 随 404 带回。
+             */
+            get("/video-info") {
+                val id = call.request.queryParameters["id"]?.toLongOrNull() ?: run {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "缺少 id")
+                    return@get
+                }
+                val uri = ContentUris.withAppendedId(contentUriOf(Kind.VIDEO), id)
+                val cacheFile = File(File(appContext.filesDir, "video_info"), "$id.json")
+
+                var source = "cache"
+                val json = if (cacheFile.isFile) {
+                    withContext(Dispatchers.IO) { cacheFile.readBytes().decodeToString() }
+                } else {
+                    val probed = com.ufi_axis_core.media.FfmpegThumbnailService
+                        .probeVideoInfo(appContext, uri)
+                    if (probed == null) {
+                        call.respondFail(
+                            HttpStatusCode.NotFound, ErrorCode.BAD_REQUEST,
+                            "无法解析此视频（损坏/不支持容器/ffmpeg 不可用）"
+                        )
+                        return@get
+                    }
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            cacheFile.parentFile?.mkdirs()
+                            val tmp = File(cacheFile.parentFile, "${cacheFile.name}.tmp")
+                            tmp.writeBytes(probed.encodeToByteArray())
+                            tmp.renameTo(cacheFile)
+                        }
+                    }
+                    source = "ffmpeg"
+                    probed
+                }
+
+                // 解析 JNI JSON → 扁平响应（计划书 §4.1 口径：duration_ms/width/... + source）
+                val obj = runCatching {
+                    kotlinx.serialization.json.Json.parseToJsonElement(json)
+                        .let { it as kotlinx.serialization.json.JsonObject }
+                }.getOrNull()
+                if (obj == null) {
+                    call.respondFail(
+                        HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "元信息解析失败"
+                    )
+                    return@get
+                }
+                fun d(k: String): Double =
+                    (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0
+                fun l(k: String): Long =
+                    (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+                fun s(k: String): String =
+                    (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+                call.respond(
+                    toJsonElement(
+                        mapOf(
+                            "id" to id,
+                            "duration_ms" to (d("duration_s") * 1000).toLong(),
+                            "width" to l("width"),
+                            "height" to l("height"),
+                            "codec" to s("codec"),
+                            "pix_fmt" to s("pix_fmt"),
+                            "bit_rate" to l("bit_rate"),
+                            "fps_num" to l("fps_num"),
+                            "fps_den" to l("fps_den"),
+                            "source" to source,
+                        )
+                    )
+                )
+            }
+
             get("/list") {
                 val kind = Kind.of(call.request.queryParameters["type"]) ?: run {
                     call.respondFail(

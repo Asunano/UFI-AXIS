@@ -96,6 +96,23 @@ object FfmpegThumbnailService {
     }
 
     /**
+     * 2026-10-05 G5：探测视频元信息（JSON 文本），供 video-info 端点。
+     * fd 通道 + 串行 + 20s 超时，与抽帧共用 [decodeSlots]。失败返回 null。
+     */
+    suspend fun probeVideoInfo(context: Context, uri: Uri): String? = withContext(Dispatchers.IO) {
+        if (!FfmpegFrameExtractor.ensureLoaded()) return@withContext null
+        decodeSlots.withPermit {
+            withTimeoutOrNull(EXTRACT_TIMEOUT_MS) {
+                runCatching {
+                    context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        FfmpegFrameExtractor.probeVideoInfo("/proc/self/fd/${pfd.fd}")
+                    }
+                }.getOrNull()
+            }
+        }
+    }
+
+    /**
      * 探测视频信息（时长秒）。供 G5（video-info）与暗帧重试时判断可用位置。
      * <=0 = 未知（加载失败/解析失败）。
      */

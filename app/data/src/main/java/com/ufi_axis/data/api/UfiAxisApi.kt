@@ -108,6 +108,14 @@ interface UfiAxisApi {
     suspend fun getMediaStatus(): MediaStatusResponse
 
     /**
+     * 2026-10-05 G5：视频元信息（ffmpeg 探测，core 永久缓存）。
+     * MediaStore 列在本机经常缺 duration/width/height，此端点给真值。
+     * 404 = 无法解析（损坏/不支持容器）。
+     */
+    @GET("api/media/video-info")
+    suspend fun getVideoInfo(@Query("id") id: Long): VideoInfoResponse
+
+    /**
      * 列某一类媒体（分页）。
      *
      * @param type [MEDIA_TYPE_VIDEO] / [MEDIA_TYPE_AUDIO] / [MEDIA_TYPE_IMAGE]

@@ -51,4 +51,11 @@ object FfmpegFrameExtractor {
 
     /** 返回时长（秒）；<=0 表示未知。 */
     external fun probeDurationSeconds(srcPath: String): Double
+
+    /**
+     * 2026-10-05 G5：视频元信息探测（一次 open+find_stream_info 拿全部字段）。
+     * 返回 JSON 文本（duration_s/width/height/codec/pix_fmt/bit_rate/fps_num/fps_den）；
+     * 失败返回 null（原因见 [lastError]）。
+     */
+    external fun probeVideoInfo(srcPath: String): String?
 }

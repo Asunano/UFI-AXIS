@@ -270,6 +270,13 @@ export const Endpoints = {
   media: {
     status: '/api/media/status',
     list: '/api/media/list',
+    /**
+     * 2026-10-05 G5：视频元信息（ffmpeg 探测）。query: id。
+     * MediaStore 列在本机经常缺 duration/width/height（codec 栈缺失），
+     * core 用 ffmpeg 自主探测真值；结果永久缓存（媒体文件不可变）。
+     * 404 = 无法解析。source: cache|ffmpeg。
+     */
+    videoInfo: '/api/media/video-info',
     browse: '/api/media/browse',
     thumbnail: '/api/media/thumbnail',
     cover: '/api/media/cover',

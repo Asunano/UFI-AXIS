@@ -1772,6 +1772,26 @@ data class MediaGroupsResponse(
 )
 
 /**
+ * 2026-10-05 G5：视频元信息（FFmpeg 接入计划书 §4.1）。
+ * core 用 ffmpeg 探测真值（MediaStore 列在本机经常缺失），永久缓存。
+ * [source]：cache（缓存命中）| ffmpeg（本次探测）。
+ */
+@Serializable
+data class VideoInfoResponse(
+    val id: Long = 0,
+    /** 时长毫秒（core 侧由 duration_s 换算）。 */
+    @SerialName("duration_ms") val durationMs: Long = 0,
+    val width: Int = 0,
+    val height: Int = 0,
+    val codec: String = "",
+    val pix_fmt: String = "",
+    val bit_rate: Long = 0,
+    val fps_num: Int = 0,
+    val fps_den: Int = 1,
+    val source: String = "",
+)
+
+/**
  * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。 *
  * [granted] 与 [scan_dirs] 的 key 都是 [MEDIA_TYPE_VIDEO] 等。某一类 granted 为 false 时
  * 对应页面必须显示未授权引导 —— 显示空列表等于告诉用户"设备里没有视频"。
