@@ -180,6 +180,9 @@ data class CacheStatsResponse(
     val count: Int = 0,
     val max_entries: Int = 0,
     val any_cache_count: Int = 0,
+    // 2026-10-05 P1 收尾（复核偏差1）：core 已回传过期滞留计数（ResponseCache.getStats），
+    // app 消费端补字段，诊断页展示。0 值兜底兼容旧 core。
+    val expired_count: Int = 0,
     val total_bytes_estimate: Long = 0L,
     val stale: Boolean = false,
     val entries: List<CacheEntryStat> = emptyList()

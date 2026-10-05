@@ -319,6 +319,8 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                             // any_cache 是另一张表，不计入 count，也不含在体积估算里
                             UfiInfoRow("any 缓存", "${c.any_cache_count} 条（不计入上面）")
                             UfiInfoRow("体积估算", FormatUtils.formatBytes(c.total_bytes_estimate))
+                            // 2026-10-05 P1 收尾：过期滞留观测（expired_count），健康态应远小于 count
+                            UfiInfoRow("过期滞留", "${c.expired_count} / ${c.count}")
                             UfiInfoRow("是否可能过期", if (c.stale) "是 · WS 曾断开" else "否")
                             c.entries.firstOrNull()?.let {
                                 UfiInfoRow("最旧条目", "${it.key} · ${it.age_ms / 1000}s")
