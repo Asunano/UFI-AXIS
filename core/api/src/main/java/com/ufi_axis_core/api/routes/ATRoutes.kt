@@ -45,6 +45,8 @@ class ATRoutes(
         route.route("/at") {
             // 发送 AT 指令
             post("/command") {
+                // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：AT 写命令与更新互斥
+                if (call.rejectIfUpdating()) return@post
                 val params = call.receiveJsonObject()
                 val command = params["command"]?.jsonPrimitive?.contentOrNull ?: ""
                 // 发起端标识，仅用于历史列表展示；客户端自报，不参与任何判定。

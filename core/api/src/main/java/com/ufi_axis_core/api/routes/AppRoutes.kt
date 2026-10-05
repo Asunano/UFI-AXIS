@@ -36,6 +36,8 @@ class AppRoutes(
 
             // 安装 APK（从设备路径）
             post("/install") {
+                // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：安装与更新互斥
+                if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
                 val path = body["path"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (path.isBlank()) {
@@ -55,13 +57,22 @@ class AppRoutes(
 
             // 安装 APK（从 URL 下载）
             post("/install-url") {
+                // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：安装与更新互斥
+                if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
                 val url = body["url"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (url.isBlank()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "url is required")
                     return@post
                 }
-                val result = appManager.installApkFromUrl(url)
+                // P0-2：sha256 必填——没有内容校验的「下载并 root 安装」等于局域网明文投毒通道
+                val sha256 = body["sha256"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (sha256.isBlank()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "sha256 is required (64-hex of the APK to install)")
+                    return@post
+                }
+                val result = appManager.installApkFromUrl(url, sha256)
                 if (result.success) {
                     call.respond(
                         HttpStatusCode.OK,
@@ -74,6 +85,8 @@ class AppRoutes(
 
             // 卸载应用
             post("/uninstall") {
+                // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：卸载与更新互斥（被更新目标被卸会导致半装态）
+                if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
                 val pkg = body["packageName"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (pkg.isBlank()) {

@@ -341,6 +341,20 @@ object Endpoints {
         const val CHANGE_PASSWORD = "$BASE/change-password"
     }
 
+    /**
+     * 应用管理（`AppRoutes`，2026-10-05 P0-2 入 contract）。
+     *
+     * [Apps.INSTALL_URL] 的 `sha256` **必填**（64 hex）：core 下载后流式校验，
+     * 不匹配即删临时文件拒装 —— 此前任意 URL 下载后直接 root 静默安装，
+     * 是 P0-2 定级的局域网投毒通道。
+     */
+    object Apps {
+        const val BASE = "$API/apps"
+        const val INSTALL = "$BASE/install"
+        const val INSTALL_URL = "$BASE/install-url"
+        const val UNINSTALL = "$BASE/uninstall"
+    }
+
     /** 健康检查（core 进程存活探针，无鉴权）。 */
     const val HEALTH = "health"
 }

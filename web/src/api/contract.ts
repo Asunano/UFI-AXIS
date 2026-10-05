@@ -76,6 +76,17 @@ export const Endpoints = {
     rules: '/api/rules',
   },
   /**
+   * 应用管理（2026-10-05 P0-2 入 contract：install-url 的 sha256 现为必填，
+   * core 下载后流式校验，不匹配拒绝安装——防任意 URL 静默 root 安装）。
+   */
+  apps: {
+    root: '/api/apps',
+    install: '/api/apps/install',
+    /** POST { url, sha256 } —— sha256 必填（64 hex），http:// 仅内网调试地址豁免 */
+    installUrl: '/api/apps/install-url',
+    uninstall: '/api/apps/uninstall',
+  },
+  /**
    * 短信拦截：规则（号码黑名单 + 关键词）与拦截记录（2026-09-08）。
    *
    * 挂在既有的 sms 组下而不是新开一个 sms-filter 组，与 core 的 `RootSmsRoutes` 一致

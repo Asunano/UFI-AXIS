@@ -321,11 +321,30 @@ class AppManager(
         runCatching { ShellExecutor.executeAsRoot("rm -f \"$path\"", 5_000L) }
     }
 
-    suspend fun installApkFromUrl(url: String): InstallResult {
+    /**
+     * 从 URL 下载 APK 并静默安装。
+     *
+     * 2026-10-05 P0-2 修复（对齐 UpdateManager 的防护水准）：
+     * - `expectedSha256` **必填**：APK 内容哈希（小写 hex）。下载后流式计算比对，
+     *   不匹配即删临时文件拒绝安装——此前任意 URL 下载后直接 root 安装，等于局域网内
+     *   明文投毒通道（P0-1 的 body 签名缺口在修好前也压不住这条路径）。
+     * - URL 强制 HTTPS（同 UpdateManager.requireSecureUrl 的豁免口径：localhost/内网
+     *   调试地址允许 http——那是开发场景，生产-facing 的 URL 不豁免会被内网代理打穿）。
+     * - 域名白名单**不在此层做**：白名单挡内容投毒挡不住镜像缓存污染，而哈希校验
+     *   同时防两者且零维护成本；route 层与调用方（web UI）各自给出哈希来源即可。
+     */
+    suspend fun installApkFromUrl(url: String, expectedSha256: String): InstallResult {
         require(validateShellArg(url)) { "Invalid URL: $url" }
         // 2026-09-02：URL 会被插值进特权 curl/wget 命令。除了字符白名单（validateShellArg
         // 现已拦掉引号/换行），再加协议白名单——避免 file:// 之类把本地文件当"下载"读出来。
         require(url.startsWith("http://") || url.startsWith("https://")) { "Invalid URL scheme: $url" }
+        // P0-2：HTTPS 强制（localhost/内网调试地址豁免，口径对齐 UpdateManager.requireSecureUrl）
+        require(isSecureDownloadUrl(url)) { "URL 必须使用 HTTPS（内网调试地址除外）: $url" }
+        // P0-2：sha256 必填，格式校验（64 位 hex，大小写归一在比较时做）
+        val expectedSha = expectedSha256.trim().lowercase()
+        require(expectedSha.matches(Regex("^[0-9a-f]{64}$"))) {
+            "sha256 必填且为 64 位十六进制（防任意 APK 静默安装）"
+        }
         val tmpPath = "/data/local/tmp/install_${System.currentTimeMillis()}.apk"
         // 2026-10-05 R3-3 修复：任何失败路径都必须清掉已下载的临时 APK（/data 分区空间敏感，
         // 90MB 级 APK 反复失败会在 /data/local/tmp 堆积占满空间，后续下载全部 ENOSPC）。
@@ -336,6 +355,17 @@ class AppManager(
                 deleteTmpFile(tmpPath)
                 return InstallResult(false, "下载失败: 不支持 curl/wget")
             }
+        }
+        // P0-2：下载内容哈希比对——不匹配即拒绝（同时拦内容投毒与镜像缓存污染）
+        val actualSha = fileSha256Hex(tmpPath)
+        if (actualSha == null) {
+            deleteTmpFile(tmpPath)
+            return InstallResult(false, "SHA-256 计算失败：下载文件不可读")
+        }
+        if (!actualSha.equals(expectedSha, ignoreCase = true)) {
+            deleteTmpFile(tmpPath)
+            AppLogger.e(tag, "[P0-2] install-url 哈希不匹配，已拒绝安装: expected=$expectedSha actual=$actualSha url=$url")
+            return InstallResult(false, "SHA-256 不匹配（预期 $expectedSha，实际 $actualSha），已拒绝安装")
         }
         // 确保 APK 对 adb client(uid=app)/adbd(uid 2000) 可读（adbd/shell 不可读 /data/local/tmp 下 root 写的文件时回退）
         ShellExecutor.executeAsRoot("chmod 644 \"$tmpPath\"", 5_000L)
@@ -684,6 +714,54 @@ class AppManager(
      * 调用方普遍把参数包在单引号里（`'$arg'`），一个 `'` 就能闭合引号并追加任意命令；
      * 换行同样能在 `sh -c` 里起新语句。此处一并拦掉引号、换行、重定向与子 shell 括号。
      */
+    /**
+     * P0-2：下载 URL 安全协议检查。口径对齐 UpdateManager.requireSecureUrl（2026-10-05）：
+     * 强制 HTTPS；localhost/127.0.0.1/内网段/.local 视为本地调试地址允许 http。
+     * 这里不能用 java.net.URL 吗？可以，但签名保持 String 进 String 出更贴调用方——
+     * 内部仍用 URL 解析，解析失败按不安全处理（fail-secure）。
+     */
+    private fun isSecureDownloadUrl(urlStr: String): Boolean {
+        val u = try {
+            java.net.URL(urlStr)
+        } catch (e: Exception) {
+            return false
+        }
+        if (u.protocol.equals("https", ignoreCase = true)) return true
+        val host = u.host ?: return false
+        val isLocalDebug = host == "localhost" || host == "127.0.0.1" ||
+            host.startsWith("192.168.") || host.startsWith("10.") ||
+            host.startsWith("172.16.") || host.startsWith("172.17.") ||
+            host.startsWith("172.18.") || host.startsWith("172.19.") ||
+            host.startsWith("172.2") || host.startsWith("172.3") ||
+            host.endsWith(".local")
+        return isLocalDebug
+    }
+
+    /**
+     * P0-2：对下载落地的 APK 流式计算 SHA-256（90MB 级文件不能整读进内存）。
+     * 文件不可读/为空返回 null（调用方 fail-secure 拒装）。root 写的文件本进程（shell uid）
+     * 经 chmod 644 前可能读不了——所以先提权补一次 chmod 再算，失败仍返回 null。
+     */
+    private suspend fun fileSha256Hex(path: String): String? = try {
+        ShellExecutor.executeAsRoot("chmod 644 \"$path\"", 5_000L)
+        val f = java.io.File(path)
+        if (!f.exists() || f.length() == 0L) null else {
+            val md = java.security.MessageDigest.getInstance("SHA-256")
+            f.inputStream().use { input ->
+                val buf = ByteArray(64 * 1024)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n < 0) break
+                    md.update(buf, 0, n)
+                }
+                md.digest().joinToString("") { "%02x".format(it) }
+            }
+        }
+    } catch (e: Exception) {
+        AppLogger.e(tag, "fileSha256Hex failed: ${e.message}")
+        null
+    }
+
     private fun validateShellArg(arg: String): Boolean {
         if (arg.isBlank()) return false
         if (arg.any { it == '\n' || it == '\r' || it == '\u0000' }) return false
