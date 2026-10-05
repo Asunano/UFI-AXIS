@@ -387,6 +387,13 @@ object WsDataTopic {
     const val PREFIX_NETWORK = "network:"
     const val PREFIX_WIFI = "wifi:"
     const val PREFIX_MEDIA = "media:"
+
+    /**
+     * 2026-10-05 P5 端侧 WS 重连 sentinel（仅 app 内部语义，core 不发送，web 不需要）。
+     * 断线窗口的 data_changed 事件已丢（replay=0），重连成功后由 app 侧
+     * WebSocketRepository 补发本值，各 Module 按各自新鲜度策略做一次 silent 全量补拉。
+     */
+    const val RECONNECTED = "__reconnected__"
 }
 
 /**

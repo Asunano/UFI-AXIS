@@ -459,35 +459,97 @@ class MainViewModel(
     private fun collectDataChangedEvents() {
         viewModelScope.launch {
             webSocketRepository.dataChanged.collect { changedType ->
-                when {
-                    // Dashboard: 设备信息类变更
-                    changedType.startsWith(WsDataTopic.PREFIX_DEVICE) -> {
-                        dashboard.smartRefresh(changedType)
-                        network.smartRefresh(changedType)
-                        tools.smartRefresh(changedType)
-                    }
-                    // Network: WiFi / 网络类变更
-                    changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
-                    changedType.startsWith(WsDataTopic.PREFIX_NETWORK) -> {
-                        network.smartRefresh(changedType)
-                    }
-                    // Tools: 定时任务 / 自动化规则（core 侧增删改、以及任务自己触发后写日志）、
-                    // 控制台历史（另一端敲了命令）。
-                    // 2026-09-21：这两组分支原来**完全不存在** —— core 一直在推，app 这边
-                    // 分发层直接丢掉，`ToolsModule.smartRefresh` 的 console 分支从没被调用过。
-                    changedType.startsWith(WsDataTopic.PREFIX_TASK) ||
-                    changedType.startsWith(WsDataTopic.PREFIX_CONSOLE) -> {
-                        tools.smartRefresh(changedType)
-                    }
-                    // Media: 音频歌单（另一端 —— 通常是 web —— 建了 / 改了 / 删了歌单）。
-                    // 2026-09-21：与上面那两组一样，core 侧 PlaylistStore 一直在推
-                    // `media:playlists`，但这里原来没有分支 —— web 改完歌单，app 必须
-                    // 退出页面再进才看得见。
-                    changedType.startsWith(WsDataTopic.PREFIX_MEDIA) -> {
-                        media.smartRefresh(changedType)
-                    }
-                }
+                // 2026-10-05 P5：原 when 直发的四个前缀分支改为 dispatchChanged ——
+                // 按前缀分组 + 800ms 窗口尾沿统一分发，见 [dispatchChanged]。
+                dispatchChanged(changedType)
             }
+        }
+    }
+
+    // ── 2026-10-05 P5：data_changed 去抖合并（尾沿触发，防事件风暴）──────────────
+    // invalidateAll（P1）已把单次写操作压成 1 条事件；但通配失效（device:*）等仍可能多条
+    // 密集到达。按前缀分组、800ms 窗口尾沿统一分发：组内所有 key 一轮刷完，不丢 key。
+    // 两个 map 均只在主线程（viewModelScope 的 collect 协程）读写，无需并发容器。
+    private val pendingByGroup = mutableMapOf<String, MutableSet<String>>()
+    private val debounceJobs = mutableMapOf<String, Job>()
+
+    /** P5 去抖窗口（尾沿触发）。 */
+    private val DISPATCH_DEBOUNCE_MS = 800L
+
+    private fun groupOf(changed: String): String = when {
+        changed == WsDataTopic.RECONNECTED -> "reconnect"
+        changed.startsWith("device:") -> "device"
+        changed.startsWith("wifi:") -> "wifi"
+        changed.startsWith("network:") || changed.startsWith("hub:") -> "network"
+        changed.startsWith(WsDataTopic.PREFIX_TASK) || changed.startsWith(WsDataTopic.PREFIX_CONSOLE) -> "tools"
+        changed.startsWith("media:") -> "media"
+        changed == "summary" -> "network"
+        else -> "other"
+    }
+
+    private fun dispatchChanged(changedType: String) {
+        // P6 联动：网络相关前缀记外部变更信号（loadNetworkAll 闸门豁免的依据）
+        if (changedType == WsDataTopic.RECONNECTED ||
+            changedType.startsWith(WsDataTopic.PREFIX_DEVICE) || changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
+            changedType.startsWith(WsDataTopic.PREFIX_NETWORK) || changedType.startsWith("hub:") ||
+            changedType == "summary"
+        ) network.markExternalChange()
+
+        val group = groupOf(changedType)
+        pendingByGroup.getOrPut(group) { mutableSetOf() }.add(changedType)
+        if (debounceJobs[group]?.isActive == true) return
+        debounceJobs[group] = viewModelScope.launch {
+            delay(DISPATCH_DEBOUNCE_MS)
+            val keys = pendingByGroup.remove(group).orEmpty().toList()
+            if (keys.none()) return@launch
+            if (keys.contains(WsDataTopic.RECONNECTED)) {
+                // sentinel 优先：全量补拉路径，不逐 key
+                dashboard.smartRefresh(WsDataTopic.RECONNECTED)
+                network.smartRefresh(WsDataTopic.RECONNECTED)
+                tools.smartRefresh(WsDataTopic.RECONNECTED)
+                media.smartRefresh(WsDataTopic.RECONNECTED)
+                return@launch
+            }
+            keys.forEach { routeToModules(it) }
+        }
+    }
+
+    /** P5：原 collect 里的前缀路由（与原 when 逐条对应，另补 hub:/summary 两条）。 */
+    private fun routeToModules(changedType: String) {
+        when {
+            // Dashboard: 设备信息类变更
+            changedType.startsWith(WsDataTopic.PREFIX_DEVICE) -> {
+                dashboard.smartRefresh(changedType)
+                network.smartRefresh(changedType)
+                tools.smartRefresh(changedType)
+            }
+            // Network: WiFi / 网络类变更
+            changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
+            changedType.startsWith(WsDataTopic.PREFIX_NETWORK) -> {
+                network.smartRefresh(changedType)
+            }
+            // Tools: 定时任务 / 自动化规则（core 侧增删改、以及任务自己触发后写日志）、
+            // 控制台历史（另一端敲了命令）。
+            // 2026-09-21：这两组分支原来**完全不存在** —— core 一直在推，app 这边
+            // 分发层直接丢掉，`ToolsModule.smartRefresh` 的 console 分支从没被调用过。
+            changedType.startsWith(WsDataTopic.PREFIX_TASK) ||
+            changedType.startsWith(WsDataTopic.PREFIX_CONSOLE) -> {
+                tools.smartRefresh(changedType)
+            }
+            // Media: 音频歌单（另一端 —— 通常是 web —— 建了 / 改了 / 删了歌单）。
+            // 2026-09-21：与上面那两组一样，core 侧 PlaylistStore 一直在推
+            // `media:playlists`，但这里原来没有分支 —— web 改完歌单，app 必须
+            // 退出页面再进才看得见。
+            changedType.startsWith(WsDataTopic.PREFIX_MEDIA) -> {
+                media.smartRefresh(changedType)
+            }
+            // 2026-10-05 P5 新增：hub 泛型 key（G2 修复后 core 开始广播）→ network + dashboard
+            changedType.startsWith("hub:") -> {
+                network.smartRefresh(changedType)
+                dashboard.smartRefresh(changedType)
+            }
+            // 2026-10-05 P5 新增：summary 失效（G7）→ dashboard
+            changedType == "summary" -> dashboard.smartRefresh(changedType)
         }
     }
 

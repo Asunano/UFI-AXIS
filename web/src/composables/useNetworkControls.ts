@@ -46,12 +46,16 @@ import {
   shouldKeepProbingMode,
   wifiBandFromChipIndex,
 } from '@/api/contract';
+// 2026-10-05 P3 修复：A 级操作（WiFi 总开关 / 移动数据 / 飞行模式）接入确认器；
+// 制式切换只挂状态位换 UI 壳（保留原 runWrite+probe 逻辑与 toast）
+import { useApiOperation } from '@/composables/useApiOperation';
+import type { OperationDialogState } from '@/composables/useApiOperation';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
 
 /** 设备 goform 写入到查询接口可见的延迟补偿。见文件头约定 1。 */
 const SETTLE_MS = 600;
 /** ppp 相关状态（移动数据 / 飞行模式）落盘后要更久才反映出来。见约定 2。 */
-const PPP_SETTLE_MS = 2_000;
+// 2026-10-05 P3 修复：这两类操作改走确认器轮询回读，固定 2s 延迟补偿不再需要
 /** 拨号动作最慢，给 3s。 */
 const DIAL_SETTLE_MS = 3_000;
 
@@ -227,6 +231,11 @@ export function useNetworkControls() {
   const switchingMode = ref<string | null>(null);
   /** 上一次切换在 `NetworkModeSwitchProbe` 的预算内没等到设备报出目标档位。 */
   const modeSwitchTimedOut = ref(false);
+  /**
+   * 2026-10-05 P3 修复：制式切换的进度弹窗状态位。逻辑仍走 runWrite + probeNetworkMode，
+   * 只把 UI 壳从「弹窗内文案」换成统一进度弹窗（仅状态位，不接管 toast，E-8）。
+   */
+  const modeOpState = ref<OperationDialogState>({ kind: 'idle' });
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -344,20 +353,41 @@ export function useNetworkControls() {
   const roamingSaving = ref(false);
   const connModeSaving = ref(false);
 
+  // 2026-10-05 P3 修复：移动数据接成 A 级——verify 判 ppp 连接态与目标一致（E-13：关数据轮询全失败时 connected 判 false 即命中）
   const setMobileData = (enabled: boolean) =>
-    runWrite({
-      setBusy: (on) => (mobileDataSaving.value = on),
-      request: () => api.post('/api/network/data', { enabled }),
-      ok: enabled ? '移动数据已开启' : '移动数据已关闭',
-      after: { delayMs: PPP_SETTLE_MS, reload: refreshNetworkStatus, detached: true },
+    wifiOp.run({
+      title: '移动数据',
+      running: enabled ? '正在开启移动数据' : '正在关闭移动数据',
+      success: enabled ? '移动数据已开启' : '移动数据已关闭',
+      hint: '拨号状态更新需要几秒钟',
+      submit: () => api.post('/api/network/data', { enabled }),
+      verify: async () => {
+        // /api/network/status 的连接态真源是 ppp_status（非空且非 disconnected），
+        // 不是不存在的顶层 connected 字段——类型见 web/src/types 的 NetworkStatus
+        const { data } = await api.get('/api/network/status');
+        const ppp = String((data as any)?.ppp_status ?? '');
+        const connected = !!ppp && !/disconnect/i.test(ppp);
+        return connected === enabled;
+      },
+      onApplied: () => refreshNetworkStatus(),
     });
 
   /** core /api/network/airplane 只有写、没有读，所以调用方要用两个明确动作而不是一个开关 */
+  // 2026-10-05 P3 修复：飞行模式同构接成 A 级（开启=断网；关闭=等重新连上）
   const setAirplane = (enabled: boolean) =>
-    runWrite({
-      request: () => api.post('/api/network/airplane', { enabled }),
-      ok: enabled ? '飞行模式已开启' : '飞行模式已关闭',
-      after: { delayMs: PPP_SETTLE_MS, reload: refreshNetworkStatus, detached: true },
+    wifiOp.run({
+      title: '飞行模式',
+      running: enabled ? '正在开启飞行模式' : '正在关闭飞行模式',
+      success: enabled ? '飞行模式已开启' : '飞行模式已关闭',
+      hint: '拨号状态更新需要几秒钟',
+      submit: () => api.post('/api/network/airplane', { enabled }),
+      verify: async () => {
+        const { data } = await api.get('/api/network/status');
+        const ppp = String((data as any)?.ppp_status ?? '');
+        const connected = !!ppp && !/disconnect/i.test(ppp);
+        return connected === !enabled;
+      },
+      onApplied: () => refreshNetworkStatus(),
     });
 
   const setRoaming = (enabled: boolean) =>
@@ -423,6 +453,8 @@ export function useNetworkControls() {
       await loadDeviceSettings();
       return false;
     }
+    // 2026-10-05 P3 修复：换 UI 壳——下发受理后驱动统一进度弹窗（状态位保留，NetworkModeModal 仍在消费）
+    modeOpState.value = { kind: 'running' };
     return await probeNetworkMode(target);
   };
 
@@ -449,8 +481,19 @@ export function useNetworkControls() {
     modeSwitchTimedOut.value = !reached;
     // 闸门放开后补一次回读，让选中项与设备一致：成功时等于 target，超时时回到设备当前值
     await loadDeviceSettings();
+    // 2026-10-05 P3 修复：回读结束把进度弹窗状态位收敛（成功对勾停留 300ms 后自动关，超时进失败态）
+    if (reached) {
+      modeOpState.value = { kind: 'success' };
+      await sleep(300);
+      modeOpState.value = { kind: 'idle' };
+    } else {
+      modeOpState.value = { kind: 'failed' };
+    }
     // 组件已经不在了：这条 toast 会弹在用户当前所在的页面上，纯误导
-    if (disposed) return reached;
+    if (disposed) {
+      modeOpState.value = { kind: 'idle' };
+      return reached;
+    }
     if (reached) message.success('网络模式已切换');
     else message.warning('设备尚未完成切换，可稍后刷新查看');
     return reached;
@@ -503,13 +546,28 @@ export function useNetworkControls() {
     }
   }
 
+  // 2026-10-05 P3 修复：A 级操作共享确认器（WiFi 开关 / 移动数据 / 飞行模式）；
+  // 进度弹窗挂在本 composable 的两个消费方根组件（NetworkView / DashboardView）各一份
+  const wifiOp = useApiOperation();
+
+  // 2026-10-05 P3 修复：WiFi 总开关接成 A 级——模块重启级操作，回读命中前不给成功反馈
   const toggleWifiEnabled = (enabled: boolean) =>
-    runWrite({
-      request: () => api.post('/api/wifi/enable', { enabled }),
-      ok: enabled ? 'WiFi 已开启' : 'WiFi 已关闭',
-      onOk: () => (wifiEnabled.value = enabled),
-      // WiFi 模块开关在设备上要过一会儿才反映到查询接口，立刻回读会把开关刷回原样
-      after: { reload: loadWifiSettings, always: true },
+    wifiOp.run({
+      title: 'WiFi 开关',
+      running: '正在切换 WiFi',
+      success: enabled ? 'WiFi 已开启' : 'WiFi 已关闭',
+      hint: 'WiFi 模块重启期间已连接设备会短暂掉线',
+      submit: () => api.post('/api/wifi/enable', { enabled }),
+      verify: async () => {
+        // 复用 loadWifiSettings 的回读端点，但只关心 enabled 一位
+        const { data } = await api.get('/api/wifi/settings');
+        return normalizeWifiSettings(data).enabled === enabled;
+      },
+      onApplied: () => {
+        loadWifiSettings();
+        loadWifiClients();
+        wifiEnabled.value = enabled;
+      },
     });
 
   /**
@@ -641,6 +699,8 @@ export function useNetworkControls() {
     // 「切换中」中间态：调用方据此显示"正在切换 / 尚未完成"，不要自己去猜回读值
     switchingMode,
     modeSwitchTimedOut,
+    // 2026-10-05 P3 修复：制式切换进度弹窗状态位（消费方根组件挂 OperationProgressModal）
+    modeOpState,
 
     // 连接
     roamingEnabled,
@@ -662,6 +722,8 @@ export function useNetworkControls() {
     wifiLoading,
     wifiEnabled,
     toggleWifiEnabled,
+    // 2026-10-05 P3 修复：A 级操作确认器状态（消费方根组件据此挂 OperationProgressModal）
+    wifiOp,
     onWifiSaved,
     sleepTime,
     sleepLoading,

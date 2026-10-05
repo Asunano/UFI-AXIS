@@ -149,20 +149,22 @@ function onSave() {
     );
     return;
   }
+  // 2026-10-05 P3 修复：保存时弹窗保持打开（按钮 loading），关窗时机交给父组件经 notifySaved 通知
   saving.value = true;
-  try {
-    // 控件层的哨兵 0 在这里折成 null = 不下发 max_sta_num：`WifiSavePayload.maxStaNum`
-    // 是 `number | null`，父组件拿到的已经是报文取值，0 不会越过这个边界。
-    emit('save', {
-      ...wifiForm,
-      maxStaNum: wifiMaxStaNumForPayload(wifiForm.maxStaNum),
-      cur: props.wifiSettings,
-    });
-    emit('update:show', false);
-  } finally {
-    saving.value = false;
-  }
+  emit('save', {
+    ...wifiForm,
+    maxStaNum: wifiMaxStaNumForPayload(wifiForm.maxStaNum),
+    cur: props.wifiSettings,
+  });
 }
+
+/** 2026-10-05 P3 修复：父组件保存+回读完成后调用；ok=false 时弹窗保持打开让用户改了再存 */
+function notifySaved(ok: boolean, failText?: string) {
+  saving.value = false;
+  if (ok) emit('update:show', false);
+  else if (failText) message.error(failText);
+}
+defineExpose({ notifySaved });
 </script>
 
 <style scoped>

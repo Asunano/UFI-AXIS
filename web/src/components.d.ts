@@ -76,6 +76,7 @@ declare module 'vue' {
     NTag: typeof import('naive-ui')['NTag']
     NText: typeof import('naive-ui')['NText']
     NTooltip: typeof import('naive-ui')['NTooltip']
+    OperationProgressModal: typeof import('./components/common/OperationProgressModal.vue')['default']
     QrModal: typeof import('./components/modals/QrModal.vue')['default']
     RingGauge: typeof import('./components/RingGauge.vue')['default']
     RouterLink: typeof import('vue-router')['RouterLink']

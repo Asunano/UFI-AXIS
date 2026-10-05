@@ -3837,6 +3837,14 @@ class ToolsModule(
             // 这是「在任务页不动、也能看到变化」的唯一来源 —— 任务列表没有轮询。
             changedType == WsDataTopic.TASK_LIST -> loadTaskList()
             changedType == WsDataTopic.TASK_RULES -> loadRuleList()
+            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 工具域按既有入口补拉一轮
+            //（console 历史 + 任务/规则列表；其余各函数自带闸门/幂等，无风暴风险）
+            changedType == WsDataTopic.RECONNECTED -> {
+                refreshConsoleHistory(CONSOLE_CHANNEL_AT)
+                refreshConsoleHistory(CONSOLE_CHANNEL_SHELL)
+                loadTaskList()
+                loadRuleList()
+            }
         }
     }
 }

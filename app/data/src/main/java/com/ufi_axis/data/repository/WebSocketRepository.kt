@@ -3,6 +3,7 @@ package com.ufi_axis.data.repository
 import com.ufi_axis.data.model.SubscriptionRequest
 import com.ufi_axis.data.model.WebSocketMessage
 import com.ufi_axis_core.contract.WsChannel
+import com.ufi_axis_core.contract.WsDataTopic  // 2026-10-05 P5：RECONNECTED sentinel
 import com.ufi_axis.util.ApiErrorLogger
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.DebugLog
@@ -58,6 +59,8 @@ class WebSocketRepository(
     val dataChanged: SharedFlow<String> = _dataChanged
 
     private var retryCount = 0
+    // 2026-10-05 P5（修 G1）：首连/重连判据 —— 重连成功的 onOpen 才补发 RECONNECTED sentinel
+    private var everConnected = false
     private var retryJob: Job? = null
     private var scope: CoroutineScope? = null
 
@@ -125,6 +128,12 @@ class WebSocketRepository(
                 scope.launch {
                     _dataChanged.emit("console:at")
                     _dataChanged.emit("console:shell")
+                    // 2026-10-05 P5（修 G1）：断线窗口的 device/network/wifi/media 事件已丢
+                    //（replay=0，重连只补 console），重连补发 sentinel，各 Module 按各自
+                    // 新鲜度策略补拉。首连不发（页面 LaunchedEffect 与预加载协调器负责），
+                    // 只有重连才发。
+                    if (everConnected) _dataChanged.emit(WsDataTopic.RECONNECTED)
+                    everConnected = true
                 }
             }
 

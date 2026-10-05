@@ -36,6 +36,11 @@ dependencies {
     // 此处显式声明以保证 ScheduleSelector 等公共组件可直接引用 com.ufi_axis_core.util.*）
     implementation(project(":core:common"))
 
+    // 2026-10-05 P7：UfiOperationProgressDialog 消费 NetworkModule.opController 的
+    // ApiOperationController.UiState（viewmodel↔ui 边界：状态对象是纯数据）。
+    // 无循环依赖：app:viewmodel 不依赖 app:ui。
+    implementation(project(":app:viewmodel"))
+
     // ★ T15：ActionRegistry 的网络模式选项取自 contract（别名集与 core 映射同源）
     implementation(project(":core:contract"))
 

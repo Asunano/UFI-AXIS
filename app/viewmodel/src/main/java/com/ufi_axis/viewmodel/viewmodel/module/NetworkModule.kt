@@ -18,6 +18,8 @@ import com.ufi_axis.data.model.ModeRequest
 import com.ufi_axis.data.model.WifiAclResponse
 // 制式别名 ↔ 设备 BearerPreference 的换算与「切换中」回读预算都在 contract，两端同源
 import com.ufi_axis_core.contract.NetworkMode
+// 2026-10-05 P5：smartRefresh 消费 RECONNECTED sentinel（contract 唯一取值表）
+import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
@@ -218,6 +220,10 @@ class NetworkModule(
         _deviceSettingsState.value = _deviceSettingsState.value.copy(errorMessage = null)
     }
 
+    // ── 2026-10-05 P7：写操作确认器（「执行 → 等待结果 → 回读确认 → 更新」）──
+    // 状态机在 viewmodel 层（供各 Module 复用），UI 侧挂 UfiOperationProgressDialog 消费 state。
+    val opController = ApiOperationController(scope)
+
     // ── Network ──
 
     /**
@@ -225,6 +231,16 @@ class NetworkModule(
      * 判据窗口是 [NETWORK_ALL_FRESH_MS]。单调时钟的理由见 `DataFreshness.kt`。
      */
     @Volatile private var networkAllSuccessElapsed: Long = 0L
+
+    /**
+     * 2026-10-05 P6：最近一次外部变更信号的单调时刻（0 = 无）。
+     * 见 [loadNetworkAll] 闸门豁免；由 MainViewModel.dispatchChanged 对网络相关前缀调用 [markExternalChange]。
+     */
+    @Volatile var externalChangeElapsed: Long = 0L
+        private set
+
+    /** 2026-10-05 P6：收到外部变更信号时由 MainViewModel.dispatchChanged 调用。 */
+    fun markExternalChange() { externalChangeElapsed = SystemClock.elapsedRealtime() }
 
     /**
      * 网络页需要的那一整套数据（6 个请求）。
@@ -248,7 +264,11 @@ class NetworkModule(
         // 也不会多发请求）。放在这里的好处是：用户真正走到设置页时能力集已经在手，
         // 不会出现"页面先按全部支持画出来、半秒后某个开关忽然灰掉"的闪动。
         loadDeviceCapabilities()
-        if (!force &&
+        // 2026-10-05 P6：30s 闸门只防"无变化的重复拉取"；收到外部变更信号（web/另一端写操作）
+        // 后，陈旧风险大于重复拉取成本（6 请求/30s 上限 1 次）——放行。成功落地后清零，
+        // 不连续放行（见 refreshNetwork 的成功打戳处）。
+        val externallyStale = externalChangeElapsed > networkAllSuccessElapsed
+        if (!force && !externallyStale &&
             _networkState.value.signalInfo != null &&
             isForegroundDataFresh(
                 networkAllSuccessElapsed,
@@ -367,6 +387,8 @@ class NetworkModule(
                 if (failures == null) {
                     networkAllSuccessElapsed = SystemClock.elapsedRealtime()
                     wifiSuccessElapsed = SystemClock.elapsedRealtime()
+                    // 2026-10-05 P6：成功落地即清零外部变更戳，避免豁免被连续放行（不退化闸门）
+                    externalChangeElapsed = 0L
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) {
@@ -411,7 +433,8 @@ class NetworkModule(
                 _networkState.update {
                     it.copy(
                         mobileDataEnabled = previous, mobileDataPending = false,
-                        errorMessage = "操作失败: ${e.message}", isLoading = false
+                        // 2026-10-05 P7（§9.3）：超时静默——设备可能仍在后台完成，文案改中性提示
+                        errorMessage = "设备尚未完成，可稍后刷新查看", isLoading = false
                     )
                 }
             }
@@ -545,7 +568,10 @@ class NetworkModule(
                 if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "操作失败")
                 // 开飞行模式 = 等断开，关飞行模式 = 等连上（同 toggleMobileData 的坑②）
                 waitForNetworkReady(expectConnected = !enabled); refreshNetwork()
-            } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "操作失败: ${e.message}") }
+            } catch (e: Exception) {
+                // 2026-10-05 P7（§9.3）：超时静默——设备可能仍在后台完成，文案改中性提示
+                _networkState.value = _networkState.value.copy(errorMessage = "设备尚未完成，可稍后刷新查看")
+            }
         }
     }
 
@@ -663,27 +689,53 @@ class NetworkModule(
         return null
     }
 
-    /** 统一锁定 LTE+NR 频段（goform + AT+SFUN 网络栈重启，无需设备重启） */
-    fun lockBands(lteBands: String?, nrBands: String?) {
-        scope.launch {
-            try {
-                val resp = if (lteBands == null && nrBands == null) {
-                    api.setBandLock(buildMap { put("action", "unlock") })
-                } else {
-                    api.setBandLock(buildMap {
-                        if (!lteBands.isNullOrBlank()) put("lte_bands", lteBands)
-                        if (!nrBands.isNullOrBlank()) put("nr_bands", nrBands)
-                        if (lteBands.isNullOrBlank() && nrBands.isNullOrBlank()) put("action", "unlock")
-                    })
+    /**
+     * 统一锁定 LTE+NR 频段（goform + AT+SFUN 网络栈重启，无需设备重启）。
+     *
+     * 2026-10-05 P7：接入确认器（原【反馈】S5）。原来下发成功只 `waitForNetworkReady()` +
+     * `loadBandStatus()`（发射后不管），锁频实际要十几~二十几秒才生效，用户看不到中间态。
+     * 现在走 [opController]「执行→等待→回读确认→更新」：圆环弹窗 + 集合相等判定 + 超时明示。
+     *
+     * **签名变更点（P7 唯一一处）**：入参由 `String?` 改为 `Set<Int>?`，判定直接用
+     * [BandStatusResponse] 自带的集合解析（"0"/"all"=空集），不再在调用方拼字符串。
+     *
+     * @param lteBands / @param nrBands 均为 null = 全部解锁。
+     */
+    fun lockBands(lteBands: Set<Int>?, nrBands: Set<Int>?) {
+        val unlocking = lteBands == null && nrBands == null
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "频段锁定"
+            override val runningText = if (unlocking) "正在解锁全部频段" else "正在应用频段设置"
+            override val successText = if (unlocking) "频段已解锁" else "频段锁定已应用"
+            override val hint = "网络栈会重启，期间信号短暂中断，属正常现象"
+
+            override suspend fun submit(): String? {
+                val body = buildMap {
+                    if (unlocking) put("action", "unlock")
+                    else {
+                        lteBands?.takeIf { it.isNotEmpty() }?.let { put("lte_bands", it.joinToString(",")) }
+                        nrBands?.takeIf { it.isNotEmpty() }?.let { put("nr_bands", it.joinToString(",")) }
+                    }
                 }
-                if (!resp.success) {
-                    _networkState.value = _networkState.value.copy(errorMessage = "锁频失败")
-                } else {
-                    waitForNetworkReady()
-                    loadBandStatus()
-                }
-            } catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "锁频失败: ${e.message}") }
-        }
+                val resp = try { api.setBandLock(body) } catch (e: Exception) { return e.message ?: "锁频失败" }
+                return if (resp.success) null else "锁频失败"
+            }
+
+            override suspend fun verify(): Boolean {
+                val status = api.getBandStatus()
+                val targetLte = lteBands ?: emptySet()
+                val targetNr = nrBands ?: emptySet()
+                // BandStatusResponse 自带 Set<Int> 解析（"0"/"all"=空集），集合相等即命中；
+                // 顺带把回读值写入 _networkState.bandStatus，UI 立即对齐设备真值
+                _networkState.update { it.copy(bandStatus = status, loadVersion = System.currentTimeMillis()) }
+                return status.lteBands == targetLte && status.nrBands == targetNr
+            }
+
+            override fun onApplied() {
+                loadBandStatus()
+                emitWriteNotice(successText)      // 复用既有 toast 通道
+            }
+        })
     }
 
     /** @param silent 失败不写 `errorMessage`（预加载专用，见 [loadNetworkAll]）。 */
@@ -2033,19 +2085,31 @@ class NetworkModule(
      * 改成乐观回显 + [refreshWifi]（只拉 WiFi 设置与客户端列表，不做全量刷新）。
      */
     fun setWifiEnabled(enabled: Boolean) {
-        scope.launch {
-            val previous = _networkState.value.wifiEnabled
-            _networkState.update { it.copy(wifiEnabled = enabled) }
-            try {
-                api.setWifiEnabled(mapOf("enabled" to enabled))
-                // 写后回读：开关状态刚变，必须绕过新鲜度闸门
-                refreshWifi(force = true)
-            } catch (e: Exception) {
-                _networkState.update {
-                    it.copy(wifiEnabled = previous, errorMessage = "WiFi开关失败: ${e.message}")
-                }
+        // 2026-10-05 P7：接入确认器（原【反馈】S5）——WiFi 总开关生效需要模块重启，
+        // 原乐观回显在设备拒绝/超时时只能靠 catch 兜底，现在走「执行→等待→回读确认」。
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "WiFi 开关"
+            override val runningText = if (enabled) "正在开启 WiFi 热点" else "正在关闭 WiFi 热点"
+            override val successText = if (enabled) "WiFi 热点已开启" else "WiFi 热点已关闭"
+
+            override suspend fun submit(): String? {
+                val resp = try { api.setWifiEnabled(mapOf("enabled" to enabled)) }
+                    catch (e: Exception) { return e.message ?: "WiFi开关失败" }
+                return if (resp.success) null else "WiFi开关失败"
             }
-        }
+
+            override suspend fun verify(): Boolean {
+                // 回读判定：设备/已确认 enabled 与目标一致
+                val wifi = api.getWifiSettings()
+                _networkState.update { it.copy(wifiSettings = wifi, wifiEnabled = wifi.enabled) }
+                return wifi.enabled == enabled
+            }
+
+            override fun onApplied() {
+                // 写后回读：开关状态刚变，必须绕过新鲜度闸门（原路径行为保留）
+                refreshWifi(force = true)
+            }
+        })
     }
 
     // ── 设备设置类写操作的统一收尾（2026-09-22）────────────────────────────────
@@ -2197,11 +2261,31 @@ class NetworkModule(
 
     // ── Smart Refresh (data_changed 精准增量刷新) ──
     fun smartRefresh(changedType: String) {
+        // 2026-10-05 P5 配套：P1 的 invalidateAll 把单次写操作压成一条 "k1,k2,k3" 合并串，
+        // split(',') 对单元素恒等（旧广播兼容），此处递归拆开逐 key 分发。
+        if (changedType.contains(',')) {
+            changedType.split(',').forEach { smartRefresh(it.trim()) }
+            return
+        }
         when {
+            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 断线窗口变更不可知，
+            // 按各自新鲜度策略 silent 补拉一轮（断线短则被闸门挡住，长则等效全量）。
+            changedType == WsDataTopic.RECONNECTED -> {
+                refreshNetwork(silent = true)
+                loadBandStatus(silent = true)
+                loadDeviceSettings()
+                refreshWifi()
+            }
             changedType == "network:band-status" || changedType == "network:cell-info" -> refreshNetworkLight()
+            // 2026-10-05 P5 新增：hub:network-type-info（G2 修复后 core 开始广播此 key）
+            changedType == "hub:network-type-info" -> refreshNetworkLight()
             changedType.startsWith("wifi:") -> refreshWifiOnly()
             changedType == "device:lan" -> loadLanSettings()
             changedType == "device:settings" -> loadDeviceSettings()
+            // 2026-10-05 P5：device:goform / device:qos 只有设备信息页/高级页消费——
+            // 不在此主动拉（页面不在前台拉了白拉），靠 P6 的外部变更豁免在切页时放行重拉。
+            // summary 由 DashboardModule 消费，此处忽略。
+            else -> { /* 未知 key 静默忽略（与原 when 无匹配时一致） */ }
         }
     }
 

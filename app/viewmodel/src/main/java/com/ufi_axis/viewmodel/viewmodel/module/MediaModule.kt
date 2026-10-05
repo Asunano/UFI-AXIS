@@ -938,6 +938,14 @@ class MediaModule(
      * 认不出的 topic 直接忽略：媒体库本身（`/api/media/list`）不走 WS，core 也没在推。
      */
     fun smartRefresh(changedType: String) {
+        // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 断线窗口的歌单变更未知，补拉一轮。
+        // 与 MEDIA_PLAYLISTS 分支同语义（force=true）：重连补拉每轮连接至多一次，
+        // loadPlaylists 等请求幂等，风暴风险可忽略，保新鲜优先。
+        if (changedType == WsDataTopic.RECONNECTED) {
+            loadPlaylists(force = true)
+            _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+            return
+        }
         if (changedType != WsDataTopic.MEDIA_PLAYLISTS) return
         loadPlaylists(force = true)
         _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }

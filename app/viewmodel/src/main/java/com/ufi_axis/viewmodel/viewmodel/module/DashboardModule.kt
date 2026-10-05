@@ -13,6 +13,8 @@ import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.data.notification.NotifyPrefs
 import com.ufi_axis.util.*
+// 2026-10-05 P5：smartRefresh 消费 summary / RECONNECTED sentinel（contract 唯一取值表）
+import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis_core.util.UiFrameGate
 import com.ufi_axis.viewmodel.repository.AlertPrefsRepository
 import com.ufi_axis.viewmodel.state.*
@@ -1790,6 +1792,11 @@ class DashboardModule(
 
     fun smartRefresh(changedType: String) {
         when {
+            // 2026-10-05 P5：summary 失效事件（P1 invalidateAll 广播）复用既有 summary 拉取
+            changedType == "summary" -> refreshDashboard()
+            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 全量补拉一轮（非 force，
+            // 走既有新鲜度/轮询闸门，断线短时多数被挡住）
+            changedType == WsDataTopic.RECONNECTED -> refreshDashboard()
             changedType.startsWith("device:") -> refreshDashboard(forceRefresh = true)
         }
     }

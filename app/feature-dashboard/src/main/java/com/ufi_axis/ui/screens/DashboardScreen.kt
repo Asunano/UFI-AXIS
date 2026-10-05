@@ -55,6 +55,15 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
     val trafficMgmt by viewModel.trafficManagementState.collectAsState()
     val palette = LocalResolvedPalette.current
 
+    // 2026-10-05 P7：A 级操作进度弹窗（确认器状态机驱动；WiFi 开关等写操作的回读确认结果）
+    val opState by viewModel.network.opController.state.collectAsState()
+    UfiOperationProgressDialog(
+        state = opState,
+        onBackground = { viewModel.network.opController.toBackground() },
+        onDismiss = { viewModel.network.opController.dismiss() },
+        onRetry = { viewModel.network.opController.retry() },
+    )
+
     // ── WiFi 信息（hero 卡「已连接设备 / WiFi 信息」数据源） ──
     // 与「网络-无线设置」同源：NetworkModule.refreshWifi() 在页面前台轻量拉取
     // networkState.wifiSettings / wifiClients，这里仅读属性，不再重复请求。

@@ -33,6 +33,16 @@ import com.ufi_axis_core.contract.Capability
 fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
 
+    // 2026-10-05 P7：A 级操作进度弹窗（确认器状态机驱动；running=圆环 / success=对勾 / failed=叉）
+    val opState by viewModel.network.opController.state.collectAsState()
+    UfiOperationProgressDialog(
+        state = opState,
+        onBackground = { viewModel.network.opController.toBackground() },
+        onDismiss = { viewModel.network.opController.dismiss() },
+        // 2026-10-05 P7：failed 态提供「重试」（复跑最近一次规格）
+        onRetry = { viewModel.network.opController.retry() },
+    )
+
     // ── 无弹窗状态（全部已转为独立页面） ──
 
     // ── 页面前台判定（离屏 Tab 门控的总开关） ──
@@ -536,9 +546,11 @@ fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.stat
                 UfiButton(
                     text = "锁定所选",
                     onClick = {
+                        // 2026-10-05 P7：lockBands 签名由 String? 改为 Set<Int>?（P7 唯一签名变更点），
+                        // 集合相等判定不再依赖调用方拼字符串顺序
                         viewModel.network.lockBands(
-                            if (selectedLte.isNotEmpty()) selectedLte.joinToString(",") else null,
-                            if (selectedNr.isNotEmpty()) selectedNr.joinToString(",") else null
+                            if (selectedLte.isNotEmpty()) selectedLte else null,
+                            if (selectedNr.isNotEmpty()) selectedNr else null
                         )
                     },
                     enabled = bandLockSupported,

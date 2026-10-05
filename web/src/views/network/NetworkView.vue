@@ -130,6 +130,28 @@
 
     <component :is="moduleComponent" v-if="moduleComponent" :show="moduleShow" @update:show="moduleModal.setShow" />
     <component :is="cellComponent" v-if="cellComponent" :show="cellShow" @update:show="cellModal.setShow" />
+
+    <!-- 2026-10-05 P3 修复：A 级操作统一进度弹窗（与仪表盘各挂一份，本期妥协） -->
+    <OperationProgressModal
+      :state="wifiOp.state.value"
+      title="WiFi 开关"
+      running-text="正在切换 WiFi"
+      success-text="WiFi 设置已完成"
+      hint="WiFi 模块重启期间已连接设备会短暂掉线"
+      :fail-text="wifiOp.failReason.value"
+      :close="wifiOp.close"
+      :to-background="wifiOp.toBackground"
+    />
+    <OperationProgressModal
+      :state="modeOpState"
+      title="网络模式"
+      running-text="正在切换网络模式"
+      success-text="网络模式已切换"
+      hint="设备重新搜网需要一点时间"
+      fail-text="设备尚未完成切换，可稍后刷新查看"
+      :close="closeModeOp"
+      :to-background="noop"
+    />
   </div>
 </template>
 
@@ -138,10 +160,13 @@ import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useInterval } from '@/composables/useRealtime';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useWebSocketStore } from '@/stores/websocket';
+import { useServiceStore } from '@/stores/service';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useNetworkControls } from '@/composables/useNetworkControls';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { get } from '@/composables/utils';
+// 2026-10-05 P3 修复：A 级操作进度弹窗（WiFi 开关 / 移动数据 / 飞行模式 / 制式切换）
+import OperationProgressModal from '@/components/common/OperationProgressModal.vue';
 
 // 主卡（受控子组件：props 下行 + 事件上行）
 import NetworkInfoCard from './components/cards/NetworkInfoCard.vue';
@@ -163,6 +188,8 @@ import SleepModal from './components/modals/SleepModal.vue';
 
 const dashboardStore = useDashboardStore();
 const wsStore = useWebSocketStore();
+// 2026-10-05 P4 修复：data_changed 订阅需要判断服务是否已停止（core 重启期间不拉）
+const serviceStore = useServiceStore();
 const api = useCancellableApi();
 
 /**
@@ -203,6 +230,9 @@ const {
   wifiLoading,
   wifiEnabled,
   toggleWifiEnabled,
+  // 2026-10-05 P3 修复：A 级操作确认器状态与制式切换进度态
+  wifiOp,
+  modeOpState,
   onWifiSaved,
   sleepTime,
   sleepLoading,
@@ -243,6 +273,9 @@ const cellModal = useLazyModal(() => import('./components/modals/CellInfoModal.v
 const moduleModal = useLazyModal(() => import('./components/modals/ModuleInfoModal.vue'));
 const bandComponent = bandModal.component;
 const bandShow = bandModal.show;
+// 2026-10-05 P3 修复：制式切换进度弹窗的关闭/后台动作（状态位在 composable，这里只收敛）
+const closeModeOp = () => { modeOpState.value = { kind: 'idle' }; };
+const noop = () => {};
 const speedComponent = speedModal.component;
 const speedShow = speedModal.show;
 const cellComponent = cellModal.component;
@@ -312,6 +345,19 @@ onMounted(() => {
   refreshSignal();
 });
 
+// 2026-10-05 P4 修复：写操作缓存失效事件精准刷新（core invalidateAll 合并串按逗号拆）。
+// DefaultLayout 的监听只管仪表盘 summary；本页数据源不同必须自己订。
+// 保留 10s 轮询：兜底广播丢失与设备面板直改，不删。
+const unsubNet = wsStore.on('data_changed', (payload: any) => {
+  if (serviceStore.stopped) return;
+  const changed: string = payload?.changed ?? '';
+  for (const key of changed.split(',')) {
+    if (key.startsWith('wifi:')) { loadWifiSettings(); loadWifiClients(); }
+    else if (key === 'network:band-status' || key === 'hub:network-type-info') { refreshNetworkStatus(); refreshSignal(); }
+    else if (key === 'device:settings') { loadDeviceSettings(); }
+  }
+});
+
 // 之前本页只在挂载时取一次，进页面看到的可能是 DefaultLayout 那次 summary 的旧状态；
 // 与仪表盘保持一致的 10s 轮询
 useInterval(() => {
@@ -323,6 +369,8 @@ useInterval(() => {
 }, 10_000);
 
 onUnmounted(() => {
+  // 2026-10-05 P4 修复：注销 data_changed 订阅，避免切走页面后仍在刷新与弹 toast
+  unsubNet?.();
   // 组件销毁时弹窗的 @after-leave 不一定会触发（如整页路由切换），兜底 revoke 防止 blob 泄漏
   releaseQrUrl();
 });
