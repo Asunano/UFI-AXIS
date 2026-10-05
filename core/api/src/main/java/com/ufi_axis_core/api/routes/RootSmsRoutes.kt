@@ -109,10 +109,23 @@ class RootSmsRoutes(
                 // 信箱的读 / 删 / 标已读不在此域内。
                 deviceCapabilities.requireCapability(Capability.SMS)
                 val body = call.receiveJsonObject()
-                val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""
-                val message = body["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                // R4-11 修复：改用严格 strField，数字/布尔入参回 400 而非静默转字符串。
+                val phone = body.strField("phone") ?: ""
+                val message = body.strField("message") ?: ""
                 if (phone.isEmpty() || message.isEmpty()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "phone and message required")
+                    return@post
+                }
+                // 2026-10-05 R4-7 修复：号码格式与正文长度上限。此前 " "、"abc"、2KB 串都直接
+                // 下发 Number 字段；超长正文 UCS2 编码后可能超设备单命令缓冲（spec 只有单条路径）。
+                if (!Regex("^\\+?[0-9]{3,20}$").matches(phone.trim())) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "phone 必须是 3..20 位数字（可带 + 前缀）")
+                    return@post
+                }
+                if (message.length > 1000) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "message 过长（${message.length} 字符，上限 1000；长文请分段）")
                     return@post
                 }
                 val result = smsController.send(phone, message)

@@ -85,8 +85,19 @@ class AlertRoutes(
                     call.request.queryParameters["limit"]?.toIntOrNull()
                         ?: Alerts.ListQuery.LIMIT_DEFAULT
                 )
-                val level = call.request.queryParameters["level"]?.takeIf { it.isNotBlank() }
-                val type = call.request.queryParameters["type"]?.takeIf { it.isNotBlank() }
+                // 2026-10-05 R4-10 修复：level/type 白名单校验。此前拼错的取值静默返回空集，
+                // UI 渲染成「无告警」而非报错（contract 注释自认的欠账）。
+                // 兼容性备注：表外取值从「静默空集」变为 400，属期望的行为收紧。
+                val level = call.request.queryParameters["level"]?.takeIf { it.isNotBlank() }?.also {
+                    if (it !in Alerts.Level.PERSISTED)
+                        return@get call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                            "level 必须是 ${Alerts.Level.PERSISTED.joinToString("/")}")
+                }
+                val type = call.request.queryParameters["type"]?.takeIf { it.isNotBlank() }?.also {
+                    if (it !in Alerts.Type.ALL)
+                        return@get call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                            "type 必须是 ${Alerts.Type.ALL.joinToString("/")}")
+                }
                 val unreadOnly = call.request.queryParameters["unread"]?.toBooleanStrictOrNull() ?: false
                 val startTime = call.request.queryParameters["start_time"]?.toLongOrNull()
                 val endTime = call.request.queryParameters["end_time"]?.toLongOrNull()

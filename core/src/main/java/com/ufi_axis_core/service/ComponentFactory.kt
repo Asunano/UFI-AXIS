@@ -641,6 +641,16 @@ object ComponentFactory {
         } catch (e: Exception) {
             com.ufi_axis_core.util.AppLogger.w("ComponentFactory", "recoverFromPending 异常: ${e.message}")
         }
+        // 2026-10-05 R4-9 修复：把更新状态机的忙/闲接入全局写门（WriteGate），
+        // 重启 / 恢复出厂 / 切卡在更新进行中回 409，避免 OTA 半写状态。
+        com.ufi_axis_core.api.routes.WriteGate.updateBusy = {
+            updateManager.status.state in setOf(
+                com.ufi_axis_core.api.update.UpdateManager.State.DOWNLOADING,
+                com.ufi_axis_core.api.update.UpdateManager.State.VERIFYING,
+                com.ufi_axis_core.api.update.UpdateManager.State.INSTALLING,
+                com.ufi_axis_core.api.update.UpdateManager.State.UPLOADING
+            )
+        }
         val updateRoutes = com.ufi_axis_core.api.routes.UpdateRoutes(updateManager)
         val appRoutes = AppRoutes(appManager)
         val shellRoutes = ShellRoutes(consoleRecorder)

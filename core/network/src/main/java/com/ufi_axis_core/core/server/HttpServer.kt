@@ -242,6 +242,8 @@ class HttpServer(
             true
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to start HTTP server: ${e.javaClass.name}: ${e.message}", e)
+            // 2026-10-05 R3-10 修复：失败路径回收已创建的 Netty event loop，避免线程泄漏
+            runCatching { server?.stop(0, 500) }
             server = null
             false
         }

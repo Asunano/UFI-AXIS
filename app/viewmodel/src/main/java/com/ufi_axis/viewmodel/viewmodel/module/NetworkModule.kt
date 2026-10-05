@@ -1958,6 +1958,11 @@ class NetworkModule(
                 delay(500)
                 refreshWifi(force = true)
                 true
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                // 2026-10-05 R2-12 修复：scope 取消（退出页面/进程后台）不是「保存失败」，
+                // 原样抛回 —— 吞掉会让调用方拿到假的 false，还会让 emitWriteNotice 在取消后
+                // 弹「已保存」的假成功。与 core 侧「取消不是失败」纪律对齐。
+                throw e
             } catch (e: Exception) {
                 // 带上 core 回的原因（如 profile 校验的「密码长度…」），否则用户只看到 HTTP 400/500
                 val reason = coreRejectReason(e) ?: e.message ?: "未知错误"

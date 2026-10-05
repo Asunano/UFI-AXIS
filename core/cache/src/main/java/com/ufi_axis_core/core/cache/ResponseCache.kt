@@ -232,6 +232,23 @@ class ResponseCache(
     }
 
     /**
+     * 2026-10-05 R1-7 修复：公开 per-key 防击穿锁包装。
+     * 供 getOrPut 结构不适合的场景（如「成功长 TTL / 失败短负缓存」的二分写入）复用
+     * 同一套 acquireLock/releaseLock/cleanupLocks，避免调用方手搓 per-key 锁导致
+     * 锁条目回收竞态。调用方必须在 block 正常返回或抛异常时由 finally 语义完成注销。
+     */
+    suspend fun <T> withKeyLock(key: String, block: suspend () -> T): T {
+        val keyLock = acquireLock(key)
+        return try {
+            keyLock.mutex.withLock { block() }
+        } finally {
+            // 与 [getOrPut] 相同顺序：先注销等待者再清理。
+            releaseLock(keyLock)
+            cleanupLocks()
+        }
+    }
+
+    /**
      * 按模式失效缓存条目，并异步触发通知回调。
      * - "*" 清空全部（包括泛型缓存）
      * - "wifi:*" 失效所有 wifi: 开头的 key

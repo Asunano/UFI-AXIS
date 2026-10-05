@@ -278,8 +278,13 @@ class MainActivity : ComponentActivity() {
                 // 触发条件（444 / 连续次数 / 时间跨度 / 传输失败豁免）全在 RetrofitClient 的
                 // 鉴权策略里，这里只是装配；一次瞬时 401 不再把人踢下线（2026-09-08 事故）。
                 // F22：全局回调集中到 ConnectionBootstrap。
-                ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
-                    isSetupComplete = false
+                // 2026-10-05 R3-9 修复：注册移入 DisposableEffect，随组合销毁注销，
+                // 不再让 RetrofitClient 静态字段永久持有已销毁 Activity。
+                DisposableEffect(prefs) {
+                    ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
+                        isSetupComplete = false
+                    }
+                    onDispose { ConnectionBootstrap.unregisterUnauthorizedHandler() }
                 }
 
                 if (!isSetupComplete || forceSetup) {

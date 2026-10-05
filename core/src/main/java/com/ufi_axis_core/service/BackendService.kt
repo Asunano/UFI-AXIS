@@ -323,8 +323,9 @@ class BackendService : Service() {
     private fun launchMailEvent(source: String, block: suspend () -> Unit) {
         val ctl = graph?.controller?.smsForwardController ?: return
         if (!ctl.isSendable()) return
-        val lock = acquireMailWakeLock()
+        // 2026-10-05 R3-7 修复：acquire 移入协程内，消除「launch 未被调度则锁永不释放」的泄漏窗口
         serviceScope.launch {
+            val lock = acquireMailWakeLock()
             try {
                 block()
             } catch (e: Exception) {
@@ -756,6 +757,9 @@ class BackendService : Service() {
                 // 服务启动失败：不要静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
                 // 直接停止并记入失败计数，由 START_STICKY / 看门狗重新拉起，并在 logcat 暴露真实异常。
                 AppLogger.e(tag, "HTTP Server failed to start — stopping service to surface failure")
+                // 2026-10-05 R3-10 修复：start 失败后短延迟再 stopSelf，避开旧 Netty event loop
+                // 未退净导致的端口冲突窗口（同进程先 stop 后立刻 start 偶发 Address already in use）
+                delay(3000)
                 crashRetryCount.set(0)
                 isRunning = false
                 g.serverGraph.server.stop()

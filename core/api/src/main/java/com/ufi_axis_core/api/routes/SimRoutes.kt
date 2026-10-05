@@ -72,6 +72,19 @@ class SimRoutes(
                         "slot is required (1/2/3 or \"external\")")
                     return@post
                 }
+                // 更新互斥（2026-10-05 R4-9 修复）：更新进行中不接受切卡写命令。
+                if (call.rejectIfUpdating()) return@post
+                // 软检查（2026-10-05 R4-9 修复）：读 TelephonyManager 的 SIM 在位状态
+                // （本地调用，不打 goform），无卡 / PUK 时切卡只会得到设备侧模糊失败。
+                // 状态取不到时放行（不因采集缺失而阻塞合法操作）。
+                runCatching { ctx.telephonyCollector.getSimInfo()["sim_state"] }.getOrNull()
+                    ?.let { simState ->
+                        if (simState is String && !simState.equals("Ready", ignoreCase = true)) {
+                            call.respondFail(HttpStatusCode.Conflict, ErrorCode.CONFLICT,
+                                "SIM 未就绪（sim_state=$simState），切卡将被设备拒绝")
+                            return@post
+                        }
+                    }
                 val outcome = deviceHub.sim.switchSimSlot(slot)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok

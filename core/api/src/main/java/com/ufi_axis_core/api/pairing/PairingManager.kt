@@ -47,6 +47,32 @@ class PairingManager(
     /** 未消费的配对挑战：nonce → 下发时刻。一次性使用，过期自动清理。 */
     private val challenges = ConcurrentHashMap<String, Long>()
 
+    // 2026-10-05 R1-9 修复：两阶段消费——先 claim（原子 remove 出 challenges，防重放不变），
+    // 校验全部通过后再 commit 彻底烧毁；任一校验失败则 release 回灌（保留原 issuedAt，
+    // 总 TTL 不延长）。避免「输错一次密码/密码锁定就烧掉一次性挑战」导致配对反复失败。
+    private val pendingClaims = ConcurrentHashMap<String, Long>()
+
+    private fun claimChallenge(nonce: String): Boolean {
+        if (nonce.isBlank()) return false
+        val issuedAt = challenges.remove(nonce) ?: return false
+        val now = System.currentTimeMillis()
+        if (now - issuedAt > CHALLENGE_TTL_MS) return false
+        pendingClaims[nonce] = issuedAt
+        return true
+    }
+
+    private fun commitChallenge(nonce: String) {
+        pendingClaims.remove(nonce)
+    }
+
+    private fun releaseChallenge(nonce: String) {
+        val issuedAt = pendingClaims.remove(nonce) ?: return
+        // 未过 TTL 才回灌；issuedAt 用原值，不重置过期起点
+        if (System.currentTimeMillis() - issuedAt <= CHALLENGE_TTL_MS) {
+            challenges[nonce] = issuedAt
+        }
+    }
+
     /** 解析当前设备名（Settings.Global.DEVICE_NAME → deviceId 回退）。 */
     fun resolveDeviceName(): String = deviceNameProvider()
 
@@ -175,11 +201,43 @@ class PairingManager(
         //    顺序很重要：先算指纹（廉价）再消费挑战，避免公钥格式错误也白耗一个挑战。
         val fp = DeviceAuth.fingerprintOf(pubKeySpki.trim())
             ?: return PairingConfirmResult.InvalidDeviceKey
-        if (!consumeChallenge(challenge.trim())) {
+        // 2026-10-05 R1-9 修复：挑战改为两阶段消费——先 claim，全部校验通过才 commit；
+        // 失败路径 release 回灌（保留原 issuedAt），不再「一次失败烧掉一次性挑战」。
+        // claim 的 remove 仍保证同一挑战只能被一个并发请求占用（防重放语义不变）。
+        val trimmedChallenge = challenge.trim()
+        if (!claimChallenge(trimmedChallenge)) {
             return PairingConfirmResult.InvalidChallenge
         }
+        return try {
+            confirmClaimed(
+                trimmedCode, pubKeySpki, challenge, signature, password,
+                deviceName, ip, fp, trimmedChallenge,
+                goformIp, goformPort, goformPassword, hwId
+            )
+        } catch (t: Throwable) {
+            releaseChallenge(trimmedChallenge)
+            throw t
+        }
+    }
+
+    private fun confirmClaimed(
+        trimmedCode: String,
+        pubKeySpki: String,
+        challenge: String,
+        signature: String,
+        password: String?,
+        deviceName: String?,
+        ip: String,
+        fp: String,
+        trimmedChallenge: String,
+        goformIp: String?,
+        goformPort: Int?,
+        goformPassword: String?,
+        hwId: String?
+    ): PairingConfirmResult {
         if (!DeviceAuth.verifySignature(pubKeySpki.trim(), challenge.trim(), signature.trim())) {
             AppLogger.w(TAG, "配对验签失败 fp=$fp ip=$ip")
+            releaseChallenge(trimmedChallenge)
             return PairingConfirmResult.InvalidDeviceKey
         }
 
@@ -192,6 +250,7 @@ class PairingManager(
         val fpAlreadyPaired = fp in settings.pairedFingerprints
         val loginByPassword = settings.devicePasswordSet && !codeMatches && !fpAlreadyPaired
         if (!codeMatches && !fpAlreadyPaired && !loginByPassword) {
+            releaseChallenge(trimmedChallenge)
             return PairingConfirmResult.InvalidCode
         }
 
@@ -203,31 +262,39 @@ class PairingManager(
         if (settings.pairingEnabled && settings.pairingMaxDevices > 0 &&
             fps.size >= settings.pairingMaxDevices && fp !in fps
         ) {
+            releaseChallenge(trimmedChallenge)
             return PairingConfirmResult.AlreadyPaired
         }
 
         // 2.5 初次配对可同时写入 Goform 后台连接配置（IP/端口/密码）；校验前置，避免部分落库
         when (validateGoformSettings(goformIp, goformPort, goformPassword)) {
-            is GoformApplyResult.Failure -> return PairingConfirmResult.InvalidGoformConfig
+            is GoformApplyResult.Failure -> {
+                releaseChallenge(trimmedChallenge)
+                return PairingConfirmResult.InvalidGoformConfig
+            }
             is GoformApplyResult.Success -> {}
         }
 
         // 3. 密码校验
         if (passwordAttemptLimiter.isLocked(ip)) {
+            releaseChallenge(trimmedChallenge)
             return PairingConfirmResult.PasswordLocked
         }
         val pw = password
         if (pw.isNullOrEmpty()) {
+            releaseChallenge(trimmedChallenge)
             return PairingConfirmResult.PasswordRequired
         }
         if (!settings.devicePasswordSet) {
             // 首次配对：请求密码即新密码（“设置密码”语义）
             // 对齐 change-password 的长度校验（防绕过前端直接调 API 设置超长密码）
             if (pw.length < MIN_PASSWORD_LENGTH || pw.length > MAX_PASSWORD_LENGTH) {
+                releaseChallenge(trimmedChallenge)
                 return PairingConfirmResult.InvalidPassword
             }
             settings.setDevicePassword(pw)
         } else if (!settings.verifyDevicePassword(pw)) {
+            releaseChallenge(trimmedChallenge)
             return if (passwordAttemptLimiter.recordFailure(ip)) {
                 PairingConfirmResult.PasswordLocked
             } else {
@@ -250,6 +317,8 @@ class PairingManager(
         }
         return when (persistResult) {
             is AppSettings.PairingConfirmResult.Success -> {
+                // 2026-10-05 R1-9 修复：校验全部通过，commit 彻底烧毁挑战
+                commitChallenge(trimmedChallenge)
                 // 每台设备独占 token：明文只在本次响应里出现一次，落盘只有哈希。
                 // 重新配对（含同指纹刷新）会轮换该设备 token，旧 token 立即失效。
                 val token = newDeviceToken()
@@ -264,8 +333,14 @@ class PairingManager(
                 AppLogger.i(TAG, "配对成功 fp=$fp name=${deviceName.orEmpty()} 已配对=${settings.pairedFingerprints.size}")
                 PairingConfirmResult.Success(token = token, fingerprint = fp)
             }
-            is AppSettings.PairingConfirmResult.InvalidCode -> PairingConfirmResult.InvalidCode
-            is AppSettings.PairingConfirmResult.AlreadyPaired -> PairingConfirmResult.AlreadyPaired
+            is AppSettings.PairingConfirmResult.InvalidCode -> {
+                releaseChallenge(trimmedChallenge)
+                PairingConfirmResult.InvalidCode
+            }
+            is AppSettings.PairingConfirmResult.AlreadyPaired -> {
+                releaseChallenge(trimmedChallenge)
+                PairingConfirmResult.AlreadyPaired
+            }
         }
     }
 

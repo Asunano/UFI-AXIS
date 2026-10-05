@@ -46,14 +46,24 @@ object ConnectionBootstrap {
         prefs: AppPreferences,
         onUnauthorized: () -> Unit
     ) {
+        // 2026-10-05 R3-9 修复：弱引用持有回调 + 配对注销，避免静态字段滞留已销毁 Activity
+        onUnauthorizedRef = java.lang.ref.WeakReference(onUnauthorized)
         RetrofitClient.onUnauthorized = {
             val runnable = Runnable {
                 prefs.token = ""
                 prefs.isSetupComplete = false
-                onUnauthorized()
+                onUnauthorizedRef?.get()?.invoke()
             }
             if (context is ComponentActivity) context.runOnUiThread(runnable) else runnable.run()
         }
+    }
+
+    // 2026-10-05 R3-9 修复：注销回调，与 registerUnauthorizedHandler 生命周期配对
+    private var onUnauthorizedRef: java.lang.ref.WeakReference<(() -> Unit)?>? = null
+
+    fun unregisterUnauthorizedHandler() {
+        onUnauthorizedRef = null
+        RetrofitClient.onUnauthorized = null
     }
 
     /** 重建 Retrofit 实例（凭据 / 服务器配置变更后）。 */

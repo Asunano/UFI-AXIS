@@ -9,15 +9,36 @@ import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 
 /**
- * 请求体解析器：宽松模式，忽略未知字段。
+ * 请求体解析器：忽略未知字段。
+ * 2026-10-05 R4-11 修复：去掉 isLenient。宽松模式会把 `{"ssid": abc}`（未加引号）等
+ * 非标准 JSON 静默接受为字符串，本应 400 的请求被照单全收；标准 JSON 客户端不受影响。
  */
 private val RequestJson = Json {
-    isLenient = true
     ignoreUnknownKeys = true
+}
+
+/**
+ * 严格字符串取值（2026-10-05 R4-11 修复）。
+ *
+ * 与 `body[name]?.jsonPrimitive?.contentOrNull` 的区别：键存在但不是 JSON 字符串
+ * （数字 / 布尔 / 对象 / 数组）时抛 [BadRequestException]（400），而不是把 `12345`
+ * 静默接受为 "12345"。键不存在或值为 null 仍返回 null（可选字段语义不变）。
+ *
+ * 渐进迁移：新代码与改到的路由用本函数，存量 `contentOrNull` 消费点后续分批换。
+ */
+fun JsonObject.strField(name: String): String? {
+    val v = this[name] ?: return null
+    if (v is JsonNull) return null
+    if (v !is JsonPrimitive || !v.isString) {
+        throw BadRequestException("字段 $name 必须是字符串")
+    }
+    return v.content
 }
 
 /**

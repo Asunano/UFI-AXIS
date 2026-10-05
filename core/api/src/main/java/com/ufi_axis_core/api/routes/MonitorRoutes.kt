@@ -298,8 +298,18 @@ class MonitorRoutes(
                     Json.parseToJsonElement(call.receiveText()).jsonObject
                 }.getOrNull() ?: kotlinx.serialization.json.JsonObject(emptyMap())
 
+                // 2026-10-05 R4-6 修复：type 白名单 + days 区间校验。此前 days 为负/0 会把
+                // cutoff 推到未来 → deleteOlderThan 删光全部监控历史；巨值乘法溢出后删除窗口
+                // 不可预期；type 拼错则静默落在「不删任何表但仍 success」。
+                val knownTypes = setOf("all", "cpu_history", "memory_history", "traffic_records",
+                    "signal_history", "battery_history", "alert_records")
                 val type = body["type"]?.jsonPrimitive?.contentOrNull ?: "all"
-                val days = body["days"]?.jsonPrimitive?.intOrNull ?: 7
+                if (type !in knownTypes) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "type 必须是 ${knownTypes.joinToString("/")}")
+                    return@post
+                }
+                val days = (body["days"]?.jsonPrimitive?.intOrNull ?: 7).coerceIn(1, 3650)
                 val cutoff = System.currentTimeMillis() - days * 24L * 3600_000L
 
                 val deleted = withContext(Dispatchers.IO) {

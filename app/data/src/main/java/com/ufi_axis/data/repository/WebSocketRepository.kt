@@ -36,11 +36,9 @@ class WebSocketRepository(
     private var token: String
 ) {
     private var webSocket: WebSocket? = null
-    private val client = OkHttpClient.Builder()
-        // 应用层心跳：NAT/移动网络静默断链时 OkHttp 会在约 20s 内触发 onFailure → 走重连退避，
-        // 否则只能等下一次写失败才发现连接已死（后台进程可能几分钟都收不到推送）。
-        .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    // 2026-10-05 R3-12 修复：OkHttpClient 进程级单例，Activity 重建不再新建 client
+    // （连接池 / Dispatcher 线程池 / WS ping 调度器不随组合重建而泄漏堆积）
+    private val client = SHARED_CLIENT
 
     // 增加 buffer 容量 + DROP_OLDEST 策略，防止下游处理慢时 emit 挂起
     // extraBufferCapacity=64 可缓存约 64 条消息，DROP_OLDEST 丢弃最早消息避免 OOM
@@ -288,6 +286,14 @@ class WebSocketRepository(
     }
 
     companion object {
+        // 2026-10-05 R3-12 修复：OkHttpClient 进程级单例，Activity 重建不再新建 client
+        // （连接池 / Dispatcher 线程池 / WS ping 调度器不随组合重建而泄漏堆积）
+        val SHARED_CLIENT: OkHttpClient = OkHttpClient.Builder()
+            // 应用层心跳：NAT/移动网络静默断链时 OkHttp 会在约 20s 内触发 onFailure → 走重连退避，
+            // 否则只能等下一次写失败才发现连接已死（后台进程可能几分钟都收不到推送）。
+            .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
         /**
          * UI 进程默认订阅频道 = 契约的 [WsChannel.UI_TOPICS] **加上** `notification`。
          *

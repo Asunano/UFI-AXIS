@@ -1537,35 +1537,45 @@ class DataScheduler(
 
             val newMax = latest.maxOf { it.id }
             if (newMax <= lastPollMaxSmsId) return  // 无新消息，跳过后续的未读标记、聚合和广播
-            lastPollMaxSmsId = newMax
-
-            // ── SMS 已读状态：检测新消息并写入未读状态 ──
-            val highWaterMark = settings?.smsHighWaterMark ?: 0L
-            // ID 体系切换（goform id → 系统 _id，如后端升级后首次运行）：系统 _id 可能
-            // 小于历史 goform 水位线 → 新消息永远不触发未读标记；检测到回退时重置水位线
-            if (newMax < highWaterMark) {
-                settings?.smsHighWaterMark = newMax
-            }
-            for (m in latest) {
-                if (m.id > (settings?.smsHighWaterMark ?: 0L)) {
-                    // 只有接收的新消息才标记未读，发送的默认已读。
-                    //
-                    // 2026-09-08：被拦截的短信也直接标记已读 —— `getUnreadCount` 是纯 DB COUNT，
-                    // 而 DB 里**没有正文**，关键词规则在 DB 层无从判断。在唯一能看到正文的地方
-                    // （这里）把它写成已读，未读数就天然不含被拦短信，`getUnreadCount` 一行不用改，
-                    // 联系人列表的 unread 聚合也自动一致。
-                    //
-                    // **明确不做追溯**：先收到短信、后加规则的那些历史 `sms_read_state` 不回改。
-                    // 追溯要拿正文重跑全表判定，成本高，而且语义可疑 ——
-                    // 「我刚加了条规则，历史未读数突然变了」比未读数偏大更让人不安。
-                    val blocked = ruleStore?.isBlocked(m.address, m.body) == true
-                    smsReadStateDao?.insert(com.ufi_axis_core.core.database.SmsReadState(
-                        msg_id = m.id,
-                        read = (m.direction == "sent" || blocked),
-                        phone = m.address
-                    ))
+            // 2026-10-05 R2-6 修复：不再先推进内存水位。未读标记写失败（磁盘满/DB 锁超时）
+            // 时若已推进，下一轮 `newMax <= lastPollMaxSmsId` 直接 return，这条短信的未读
+            // 状态永久丢失。改为：先写 DAO（insert 用 msg_id 主键，重试天然幂等），成功后再推进。
+            var unreadMarked = true
+            try {
+                val highWaterMark = settings?.smsHighWaterMark ?: 0L
+                // ID 体系切换（goform id → 系统 _id，如后端升级后首次运行）：系统 _id 可能
+                // 小于历史 goform 水位线 → 新消息永远不触发未读标记；检测到回退时重置水位线
+                if (newMax < highWaterMark) {
+                    settings?.smsHighWaterMark = newMax
                 }
+                for (m in latest) {
+                    if (m.id > (settings?.smsHighWaterMark ?: 0L)) {
+                        // 只有接收的新消息才标记未读，发送的默认已读。
+                        //
+                        // 2026-09-08：被拦截的短信也直接标记已读 —— `getUnreadCount` 是纯 DB COUNT，
+                        // 而 DB 里**没有正文**，关键词规则在 DB 层无从判断。在唯一能看到正文的地方
+                        // （这里）把它写成已读，未读数就天然不含被拦短信，`getUnreadCount` 一行不用改，
+                        // 联系人列表的 unread 聚合也自动一致。
+                        //
+                        // **明确不做追溯**：先收到短信、后加规则的那些历史 `sms_read_state` 不回改。
+                        // 追溯要拿正文重跑全表判定，成本高，而且语义可疑 ——
+                        // 「我刚加了条规则，历史未读数突然变了」比未读数偏大更让人不安。
+                        val blocked = ruleStore?.isBlocked(m.address, m.body) == true
+                        smsReadStateDao?.insert(com.ufi_axis_core.core.database.SmsReadState(
+                            msg_id = m.id,
+                            read = (m.direction == "sent" || blocked),
+                            phone = m.address
+                        ))
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 2026-10-05 R2-6 修复：写入失败时水位暂不推进，下一轮重试同批消息（insert 幂等）。
+                unreadMarked = false
+                AppLogger.w(tag, "SMS 未读标记写入失败，下一轮重试（水位暂不推进）: ${e.message}")
             }
+            if (unreadMarked) lastPollMaxSmsId = newMax
             // 2026-09-04：本轮**真正新增**的接收消息，供下面推 WS 通知用。
             // 必须在推进水位之前算，且用的是与未读标记同一条判据 —— 水位是持久化的
             // （`lastPollMaxSmsId` 只在内存里，进程重启会归零，拿它做通知去重会重复轰炸）。
@@ -1847,20 +1857,13 @@ class DataScheduler(
         val signalBatch = mutableListOf<SignalRecord>()
         val batteryBatch = mutableListOf<BatteryHistoryRecord>()
         try {
-            while (true) { cpuBuffer.poll()?.let { cpuBatch.add(it) } ?: break }
-            cpuBufferSize.getAndSet(0)  // 原子重置：drain 期间新增的 item 也计入
-
-            while (true) { memoryBuffer.poll()?.let { memBatch.add(it) } ?: break }
-            memoryBufferSize.getAndSet(0)
-
-            while (true) { trafficBuffer.poll()?.let { trafficBatch.add(it) } ?: break }
-            trafficBufferSize.getAndSet(0)
-
-            while (true) { signalBuffer.poll()?.let { signalBatch.add(it) } ?: break }
-            signalBufferSize.getAndSet(0)
-
-            while (true) { batteryBuffer.poll()?.let { batteryBatch.add(it) } ?: break }
-            batteryBufferSize.getAndSet(0)
+            // 2026-10-05 R1-6 修复：drain 与计数走同一协议，消除「drain 后 getAndSet(0)」与生产者
+            // offerBounded 交错造成的 counter 与队列内容漂移（漂移后逐出判定失效 → 缓冲无界增长）。
+            cpuBuffer.drainBounded(cpuBufferSize, cpuBatch)
+            memoryBuffer.drainBounded(memoryBufferSize, memBatch)
+            trafficBuffer.drainBounded(trafficBufferSize, trafficBatch)
+            signalBuffer.drainBounded(signalBufferSize, signalBatch)
+            batteryBuffer.drainBounded(batteryBufferSize, batteryBatch)
 
             val totalFlushed = cpuBatch.size + memBatch.size + trafficBatch.size + signalBatch.size + batteryBatch.size
             if (totalFlushed > 0) {
@@ -1869,6 +1872,12 @@ class DataScheduler(
                 AppLogger.d(tag, "Flushed buffers: cpu=${cpuBatch.size}, mem=${memBatch.size}, traffic=${trafficBatch.size}, signal=${signalBatch.size}, battery=${batteryBatch.size}")
                 lastFlushError = null
             }
+        } catch (e: CancellationException) {
+            // 2026-10-05 R2-7 修复：stop() 的 cancelChildren 打在 flushAllBuffers 挂起点上时，
+            // 取消不是 flush 失败。批次重新入队也不会再有下一次 flush，原样抛回让协程正常退出，
+            // 不再在停机瞬间留下误导性的「Failed to flush buffers」ERROR。（停机丢最后一批
+            // buffer 是既有取舍，见 stop() 的 5s flush 预算。）
+            throw e
         } catch (e: Exception) {
             // 关键路径：刷新失败不要静默吞掉已 drain 的数据（会导致持久化状态错乱/丢点），
             // 重新入队以便下次重试，并置错误态供监控/诊断感知。
@@ -1952,12 +1961,34 @@ class DataScheduler(
      * 使用 AtomicInteger 计数器实现 O(1) 大小检查，
      * 替代 ConcurrentLinkedQueue.size() 的 O(n) 链表遍历。
      */
-    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) {
-        while (counter.get() >= MAX_BUFFER_SIZE) {
-            if (poll() != null) counter.decrementAndGet() else break
+    // 2026-10-05 R1-6 修复：drain 也走「计数占减 + 队列 poll」配对协议，drain 不再 getAndSet(0)，
+    // 消除与生产者 offerBounded 交错时的计数漂移。
+    private fun <T> ConcurrentLinkedQueue<T>.drainBounded(counter: AtomicInteger, into: MutableList<T>) {
+        while (true) {
+            val n = counter.updateAndGet { cur -> if (cur <= 0) cur else cur - 1 } // 先占减计数
+            if (n <= 0) { counter.set(0); break }
+            val e = poll()
+            if (e == null) { counter.incrementAndGet(); break } // 队列已空：回滚占减
+            into.add(e)
         }
-        offer(item)
-        counter.incrementAndGet()
+    }
+
+    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) {
+        // 2026-10-05 R1-6 修复：入队/逐出改为 CAS 配对协议（占计数即得名额，poll 与计数严格配对），
+        // 替代原「循环 poll + decrementAndGet」的 get-then-put 序列，避免并发下 counter 与队列内容漂移。
+        while (true) {
+            val cur = counter.get()
+            if (cur < MAX_BUFFER_SIZE) {
+                if (counter.compareAndSet(cur, cur + 1)) { offer(item); return }
+            } else {
+                // 已达上限：占减一个名额（丢最旧一条），再入队新记录
+                if (counter.compareAndSet(cur, cur - 1)) {
+                    poll()
+                    offer(item)
+                    return
+                }
+            }
+        }
     }
 
     /**

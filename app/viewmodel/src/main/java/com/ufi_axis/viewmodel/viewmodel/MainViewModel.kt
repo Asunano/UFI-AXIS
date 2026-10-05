@@ -790,7 +790,10 @@ class MainViewModel(
         tools.updateDeviceState,
         flow<Long> {
             while (true) {
-                emit(System.currentTimeMillis())
+                // 2026-10-05 R1-12 修复：计时口径从墙上时钟（System.currentTimeMillis）改为
+                // 单调时钟（SystemClock.elapsedRealtime）——NTP 校时跳变不再破坏 5 分钟豁免
+                // 窗口（回跳曾导致豁免无限延长）。与 startupGate 同一口径；差值同为毫秒。
+                emit(android.os.SystemClock.elapsedRealtime())
                 delay(CORE_UPDATE_EXEMPT_TICK_MS)
             }
         }

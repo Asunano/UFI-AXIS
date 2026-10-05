@@ -12,11 +12,16 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.*
 
 class WifiRoutes(
     private val ctx: RouteContext
 ) {
+    // 2026-10-05 R2-9 修复：ACL 是设备侧单份整表资源（只有整表替换语义），读-改-写必须
+    // 串行，否则并发 block/unblock 的整表写会互相覆盖（先写的条目静默消失）。Mutex 持有
+    // 期间没有再申请其他锁（goform loginMutex 独立、无反向嵌套），无死锁面。
+    private val aclMutex = kotlinx.coroutines.sync.Mutex()
     // ── 反向兼容 getter ──
     private val goformClient get() = ctx.goformClient
     /**
@@ -63,7 +68,8 @@ class WifiRoutes(
 
             post("/password") {
                 val params = call.receiveJsonObject()
-                val password = params["password"]?.jsonPrimitive?.contentOrNull ?: ""
+                // R4-11 修复：改用严格 strField，数字/布尔入参回 400 而非静默转字符串。
+                val password = params.strField("password") ?: ""
                 if (password.isEmpty()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "password is required")
                     return@post
@@ -142,6 +148,13 @@ class WifiRoutes(
             get("/qrcode") {
                 val chip = call.request.queryParameters["chip"] ?: "chip1"
                 val ssidIndex = call.request.queryParameters["ssid_index"]?.toIntOrNull() ?: 1
+                // 2026-10-05 R4-8 修复：ssid_index 值域校验。此前 -1/0/999999 直接拼进设备
+                // 文件名查询（qrCodeFileNames 按索引生成），属未定义行为。
+                if (ssidIndex !in 1..3) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "ssid_index must be 1..3")
+                    return@get
+                }
                 if (chip !in listOf("chip1", "chip2")) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
                         "chip must be chip1 or chip2")
@@ -227,21 +240,25 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "mac is required")
                     return@post
                 }
-                val acl = wifi.getAccessControlList()
-                if (acl == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "无法从设备读取接入控制名单")
-                    return@post
+                // 2026-10-05 R2-9 修复：读-改-写整体放进 aclMutex，串行化并发 block。
+                // 读失败/幂等分支的 early-return 在锁内直接 respond（respond 完才释放锁，无副作用）。
+                aclMutex.withLock {
+                    val acl = wifi.getAccessControlList()
+                    if (acl == null) {
+                        call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
+                            "无法从设备读取接入控制名单")
+                        return@post
+                    }
+                    // 已在名单里 → 幂等成功（不重复下发，也不把名字改掉）
+                    if (acl.black.any { it.mac.equalsIgnoreCase(mac) }) {
+                        call.respond(toJsonElement(acl.toResponseMap() + mapOf("success" to true)))
+                        return@post
+                    }
+                    val next = acl.black + AclEntry(mac = mac, name = name)
+                    val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
+                    if (call.respondRejected(outcome)) return@post
+                    call.respondAclResult(outcome.ok)
                 }
-                // 已在名单里 → 幂等成功（不重复下发，也不把名字改掉）
-                if (acl.black.any { it.mac.equalsIgnoreCase(mac) }) {
-                    call.respond(toJsonElement(acl.toResponseMap() + mapOf("success" to true)))
-                    return@post
-                }
-                val next = acl.black + AclEntry(mac = mac, name = name)
-                val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
-                if (call.respondRejected(outcome)) return@post
-                call.respondAclResult(outcome.ok)
             }
 
             post("/acl/unblock") {
@@ -251,21 +268,24 @@ class WifiRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "mac is required")
                     return@post
                 }
-                val acl = wifi.getAccessControlList()
-                if (acl == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "无法从设备读取接入控制名单")
-                    return@post
+                // 2026-10-05 R2-9 修复：读-改-写整体放进 aclMutex，串行化并发 unblock（理由同 block）。
+                aclMutex.withLock {
+                    val acl = wifi.getAccessControlList()
+                    if (acl == null) {
+                        call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
+                            "无法从设备读取接入控制名单")
+                        return@post
+                    }
+                    val next = acl.black.filterNot { it.mac.equalsIgnoreCase(mac) }
+                    if (next.size == acl.black.size) {
+                        // 本来就不在名单里 → 幂等成功
+                        call.respond(toJsonElement(acl.toResponseMap() + mapOf("success" to true)))
+                        return@post
+                    }
+                    val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
+                    if (call.respondRejected(outcome)) return@post
+                    call.respondAclResult(outcome.ok)
                 }
-                val next = acl.black.filterNot { it.mac.equalsIgnoreCase(mac) }
-                if (next.size == acl.black.size) {
-                    // 本来就不在名单里 → 幂等成功
-                    call.respond(toJsonElement(acl.toResponseMap() + mapOf("success" to true)))
-                    return@post
-                }
-                val outcome = wifi.setAccessControlList(black = next, white = acl.white, mode = acl.mode)
-                if (call.respondRejected(outcome)) return@post
-                call.respondAclResult(outcome.ok)
             }
 
             post("/acl/clear") {

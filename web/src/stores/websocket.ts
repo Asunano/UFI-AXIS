@@ -74,6 +74,9 @@ export const useWebSocketStore = defineStore('websocket', () => {
       ws!.send(JSON.stringify({ subscribe: WS_UI_TOPICS }));
     };
 
+    // 2026-10-05 R2-12 修复：解析错误不再零观测 —— 加客户端计数（与 core /health 的
+    // ws_parse_failures 成对），首次与每 50 次打一条 WARN，便于协议漂移/坏帧排障。
+    let wsParseFailures = 0;
     ws.onmessage = (event) => {
       lastMessage.value = Date.now();
       try {
@@ -86,8 +89,11 @@ export const useWebSocketStore = defineStore('websocket', () => {
         // 同时分发给通配符订阅
         const allHandlers = messageHandlers.get('*');
         if (allHandlers) allHandlers.forEach((h) => h(msg));
-      } catch {
-        // 忽略解析错误
+      } catch (e) {
+        wsParseFailures++;
+        if (wsParseFailures === 1 || wsParseFailures % 50 === 0) {
+          console.warn('[ws] parse failure #' + wsParseFailures, event.data?.slice?.(0, 120));
+        }
       }
     };
 

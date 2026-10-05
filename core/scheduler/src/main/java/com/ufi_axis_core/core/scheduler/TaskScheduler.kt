@@ -62,6 +62,9 @@ class TaskScheduler(
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
     private val tasks = ConcurrentHashMap<String, ScheduledTask>()
     private val triggeredToday = ConcurrentHashMap<String, String>() // taskId → dateStr
+    // 2026-10-05 R1-15 修复：cron 任务的分钟桶去重独立成表，不再覆盖 triggeredToday 的日界语义
+    // （原实现把桶键写进 taskId→dateStr 的值里，桶翻转后去重失效且污染旧路径判定）。
+    private val cronBuckets = ConcurrentHashMap<String, String>() // taskId → minuteBucket
     private val prefs = context.getSharedPreferences("scheduled_tasks", Context.MODE_PRIVATE)
 
     // reschedule 互斥锁（2026-10-05 R1-3 修复）：reschedule 被 add/remove/update/clear、
@@ -140,6 +143,7 @@ class TaskScheduler(
     fun remove(id: String): Boolean {
         tasks.remove(id) ?: return false
         triggeredToday.remove(id)
+        cronBuckets.remove(id) // 2026-10-05 R1-15 修复：随日界表同步清理
         saveTasks()
         reschedule()
         notifyTasksChanged()
@@ -151,6 +155,7 @@ class TaskScheduler(
         if (!tasks.containsKey(task.id)) return false
         tasks[task.id] = task
         triggeredToday.remove(task.id)
+        cronBuckets.remove(task.id) // 2026-10-05 R1-15 修复：任务更新时重置分钟桶去重
         saveTasks()
         reschedule()
         notifyTasksChanged()
@@ -160,6 +165,7 @@ class TaskScheduler(
     fun clear() {
         tasks.clear()
         triggeredToday.clear()
+        cronBuckets.clear() // 2026-10-05 R1-15 修复：随日界表同步清理
         saveTasks()
         reschedule()
         notifyTasksChanged()
@@ -184,6 +190,7 @@ class TaskScheduler(
             if (lastScheduleDate != todayStr) {
                 lastScheduleDate = todayStr
                 triggeredToday.clear()
+                cronBuckets.clear() // 2026-10-05 R1-15 修复：跨日同步清分钟桶表
                 AppLogger.d(tag, "New day ($todayStr), reset daily triggers")
             }
 
@@ -275,9 +282,10 @@ class TaskScheduler(
             // 防止重复触发
             if (task.cron != null) {
                 // cron 周期任务按「分钟桶」去重（同分钟只触发一次）
-                val bucketKey = "${task.id}@$minuteBucket"
-                if (triggeredToday[task.id] == bucketKey) continue
-                triggeredToday[task.id] = bucketKey
+                // 2026-10-05 R1-15 修复：桶键移入独立的 cronBuckets 表，不再写入
+                // triggeredToday（那里语义是 taskId → dateStr）
+                if (cronBuckets[task.id] == minuteBucket) continue
+                cronBuckets[task.id] = minuteBucket
             } else {
                 if (task.repeatDaily) {
                     if (triggeredToday[task.id] == todayStr) continue

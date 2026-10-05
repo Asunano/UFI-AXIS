@@ -194,17 +194,25 @@ class DataHub(
      * 成功才用长 TTL，失败只用 30s 负缓存（避免失败时每次仪表盘轮询都重打设备）。
      */
     suspend fun getDeviceIdentity(): JsonObject? {
+        // 命中正缓存（非空对象）直接返回
         val cached = responseCache.get("device:identity")
-        // 命中负缓存（空对象）时直接返回 null，不重打设备
-        if (cached is JsonObject) return cached.takeIf { it.isNotEmpty() }
+        if (cached is JsonObject && cached.isNotEmpty()) return cached
 
-        val fresh = signalClient.getDeviceIdentity()?.values?.takeIf { it.isNotEmpty() }
-        if (fresh == null) {
-            responseCache.put("device:identity", JsonObject(emptyMap()), IDENTITY_NEGATIVE_TTL_MS)
-            return null
+        // 2026-10-05 R1-7 修复：miss 走 ResponseCache 的 per-key 防击穿锁（复用 withKeyLock，
+        // 内部含双重检查），负缓存窗口内并发轮询不再全部击穿去打 goform。
+        return responseCache.withKeyLock("device:identity") {
+            val recheck = responseCache.get("device:identity")
+            if (recheck is JsonObject) return@withKeyLock recheck.takeIf { it.isNotEmpty() }
+
+            val fresh = signalClient.getDeviceIdentity()?.values?.takeIf { it.isNotEmpty() }
+            if (fresh == null) {
+                responseCache.put("device:identity", JsonObject(emptyMap()), IDENTITY_NEGATIVE_TTL_MS)
+                null
+            } else {
+                responseCache.put("device:identity", fresh, CacheTTL.DEVICE_IDENTITY)
+                fresh
+            }
         }
-        responseCache.put("device:identity", fresh, CacheTTL.DEVICE_IDENTITY)
-        return fresh
     }
 
 

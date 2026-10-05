@@ -231,18 +231,24 @@ class WebUpdateManager(
     }
 
     /** GET URL 返回文本（版本清单） */
-    private fun fetchUrl(urlStr: String, timeoutMs: Int): String? = try {
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            connectTimeout = timeoutMs
-            readTimeout = timeoutMs
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "UFI-AXIS-Core/1.0")
-            instanceFollowRedirects = true
+    // 2026-10-05 R3-6 修复：disconnect 移入 finally，异常路径不再泄漏 keep-alive 连接
+    private fun fetchUrl(urlStr: String, timeoutMs: Int): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "UFI-AXIS-Core/1.0")
+                instanceFollowRedirects = true
+            }
+            conn.inputStream.bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "fetchUrl 失败: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
         }
-        conn.inputStream.bufferedReader().use { it.readText() }.also { conn.disconnect() }
-    } catch (e: Exception) {
-        AppLogger.w(TAG, "fetchUrl 失败: ${e.message}")
-        null
     }
 
     /** 更新源/APK 地址强制 HTTPS（本地调试 IP 例外） */

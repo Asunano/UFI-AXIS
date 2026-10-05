@@ -390,6 +390,8 @@ class DeviceRoutes(
 
             // 重启设备
             post("/reboot") {
+                // 更新互斥（2026-10-05 R4-9 修复）：OTA 拷贝到一半重启可致半写状态。
+                if (call.rejectIfUpdating()) return@post
                 cache?.invalidate("device:*")
                 val success = systemController.reboot()
                 call.respond(
@@ -400,6 +402,8 @@ class DeviceRoutes(
 
             // 恢复出厂设置
             post("/factory-reset") {
+                // 更新互斥（2026-10-05 R4-9 修复）：同 /reboot。
+                if (call.rejectIfUpdating()) return@post
                 cache?.invalidate("*")
                 val success = deviceHub.device.factoryReset()
                 call.respond(

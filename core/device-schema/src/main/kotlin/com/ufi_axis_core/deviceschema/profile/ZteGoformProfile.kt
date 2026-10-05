@@ -1378,6 +1378,13 @@ object ZteGoformProfile : DeviceProfile {
                 return "最大接入设备数必须是 1~10 的整数（中兴 F50 最大支持 10 个）"
             }
         }
+        // 2026-10-05 R4-8 修复：chip_index 此前不经任何校验透传为 ChipIndex，"chip9"/空串等
+        // 非法值只会得到设备侧模糊失败。与 wifi_chip 写项同取值域（WIFI_CHIPS）。
+        p["chip_index"]?.let { raw ->
+            if (raw.toString().trim() !in WIFI_CHIPS) {
+                return "chip_index 只支持 chip1 / chip2"
+            }
+        }
         return null
     }
 

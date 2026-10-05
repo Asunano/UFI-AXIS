@@ -99,6 +99,9 @@ class WebSocketManager(
     // 按订阅类型分组的连接索引，避免广播时遍历所有连接检查订阅类型
     private val subscriptions = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
 
+    // 2026-10-05 R1-13 修复：订阅替换（摘除+重挂）与广播读侧快照的串行化锁
+    private val subscribeLock = Any()
+
     private companion object {
         private const val BROADCAST_CACHE_TTL_MS = 500L
         /** 单个客户端 send 的上限；超时只丢帧，不摘连接（见 [broadcast]）。 */
@@ -208,16 +211,20 @@ class WebSocketManager(
 
             // 处理订阅请求
             jsonObject["subscribe"]?.jsonArray?.let { types ->
-                // 从订阅索引中移除旧的订阅
-                subscribedTypes.forEach { subscriptions[it]?.remove(session) }
-                subscribedTypes.clear()
-                types.forEach {
-                    val type = it.jsonPrimitive.content
-                    subscribedTypes.add(type)
-                    // computeIfAbsent 而非 getOrPut：后者是 get-then-put 两步，不是原子操作。
-                    // 两个客户端并发订阅同一 type 时会各自建一个 Set，其中一个被覆盖，
-                    // 那个客户端从此静默收不到该 type 的任何广播。
-                    subscriptions.computeIfAbsent(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                // 2026-10-05 R1-13 修复：摘除+重挂与广播读侧快照共用 subscribeLock 串行化，
+                // 消除「已摘除、未重挂」窗口内广播漏帧（尤其 data_changed 失效通知）。
+                synchronized(subscribeLock) {
+                    // 从订阅索引中移除旧的订阅
+                    subscribedTypes.forEach { subscriptions[it]?.remove(session) }
+                    subscribedTypes.clear()
+                    types.forEach {
+                        val type = it.jsonPrimitive.content
+                        subscribedTypes.add(type)
+                        // computeIfAbsent 而非 getOrPut：后者是 get-then-put 两步，不是原子操作。
+                        // 两个客户端并发订阅同一 type 时会各自建一个 Set，其中一个被覆盖，
+                        // 那个客户端从此静默收不到该 type 的任何广播。
+                        subscriptions.computeIfAbsent(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                    }
                 }
                 AppLogger.i(tag, "Client subscribed to: $subscribedTypes")
             }
@@ -274,7 +281,9 @@ class WebSocketManager(
      */
     suspend fun broadcast(type: String, data: Map<String, Any?>) {
         // 死连接清理由 Ktor 协议层 ping/pong 统一处理，无需每次广播遍历检查
-        val subscribers = subscriptions[type] ?: return
+        // 2026-10-05 R1-13 修复：订阅者快照在 subscribeLock 内 copy 出来，锁外发送 ——
+        // 避免 re-subscribe 的「已摘除、未重挂」窗口漏帧；锁内只做 toList，无 IO。
+        val subscribers = synchronized(subscribeLock) { subscriptions[type]?.toList() } ?: return
         if (subscribers.isEmpty()) return
 
         val now = System.currentTimeMillis()

@@ -10,6 +10,7 @@ import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.sync.Mutex
@@ -105,6 +106,9 @@ class GoformClient(
     @Volatile private var lastLoginAttempt = 0L
     @Volatile private var lastValidatedAt = 0L
     @Volatile private var lastGiveWayAt = 0L
+    // 2026-10-05 R2-8 修复：最近一次 validateSession 是否因网络错而「通过」。
+    // 只在 loginMutex 内的 forceValidate 消费点读；null = 本次校验真实验证了会话。
+    @Volatile private var lastValidateNetworkDown: String? = null
 
     // 2026-09-26：会话 TTL / 校验间隔 / 登录退避基数与上限 / 让位窗口这四组**数值与判定**
     // 已搬到 [GoformSessionPolicy]（数值、注释、判定顺序逐字未变）。搬出去的唯一目的是让
@@ -273,9 +277,20 @@ class GoformClient(
                         AppLogger.i(tag, "[session] force validate before dispatch " +
                                 "(sinceValidated=${nowLocked - lastValidatedAt}ms)")
                     }
-                    if (validateSession(current)) {
+                    // 2026-10-05 R2-8 修复：forceValidate 时记录校验是否因网络错而「通过」。
+                    lastValidateNetworkDown = null
+                    if (validateSession(current) { lastValidateNetworkDown = it }) {
                         lastValidatedAt = nowLocked
                         if (forceValidate) AppLogger.i(tag, "[session] force validate passed, reusing session")
+                        // 2026-10-05 R2-8 修复：forceValidate 时若校验是因网络错而「通过」的，
+                        // 这次强制校验什么都没验证到（设备不可达/假死）。按未登录返回 null，
+                        // 让 sendSms 在下发前直接归 REJECTED，而不是等 POST 撞超时后 NO_RESPONSE。
+                        // 普通读路径不受影响（仍信任上次登录态）。
+                        if (forceValidate && lastValidateNetworkDown != null) {
+                            AppLogger.w(tag, "[session] force validate passed only via network error " +
+                                    "(device unreachable?), treating as unavailable: $lastValidateNetworkDown")
+                            return@withLock null
+                        }
                         return@withLock current
                     }
                     // 校验没通过：validateSession 内部已经 invalidateSession() 了，往下走重登。
@@ -392,7 +407,10 @@ class GoformClient(
         session.updateAndGet { SessionSnapshot(it.cookie, false) }
     }
 
-    private suspend fun validateSession(snapshot: SessionSnapshot): Boolean {
+    private suspend fun validateSession(
+        snapshot: SessionSnapshot,
+        networkDown: (String) -> Unit = {}
+    ): Boolean {
         return try {
             val base = baseUrl()
             val resp = httpClient.get("$base/goform/goform_get_cmd_process?cmd=RD&multi_data=1&isTest=false&_=${System.currentTimeMillis()}") {
@@ -410,6 +428,9 @@ class GoformClient(
             // —— 频繁网络抖动下原逻辑会把 failCount 推到退避上限 60s（虽然目前已降到 10s，
             // 但性质仍不对：网络错不会让 cookie 失效，下次请求正常就行）。
             AppLogger.w(tag, "validateSession network error (keeping login state): ${e.message}")
+            // 2026-10-05 R2-8 修复：把「网络错 ≠ 会话活着」暴露给调用方，forceValidate
+            // 路径据此提前定性（普通读路径不传回调，行为不变）。
+            networkDown(e.message ?: "network error")
             true
         }
     }
@@ -566,6 +587,12 @@ class GoformClient(
         retryOnBusinessFailure: Boolean = true
     ): GoformWriteResult = withContext(Dispatchers.IO) {
         val start = System.currentTimeMillis()
+        // 2026-10-05 R2-10 修复：写路径整体预算 20s（读路径早有 withTimeout 先例）。设备半死时
+        // 一次写 = 登录链 + AD 三次前置查询 + POST + 重试圈，单次传输层各 10s 超时但无整体
+        // 预算，最坏挂 ~40s（客户端早已超时，用户重试还可能与仍在进行的写并发落到设备）。
+        // 超时归 Unreachable：不能归 SessionLost（那会触发上层重发），也不能归 Accepted。
+        try {
+            withTimeout(20_000L) {
         // 循环体住在 GoformWritePolicy（2026-09-26 原样搬过去的，判定顺序与日志文案逐字未变），
         // 为的是让「SessionLost 重试一次 / 业务失败绝不重发」两条能在不起 HTTP 的前提下被断言。
         val attempted = GoformWritePolicy.runAttempts(
@@ -597,6 +624,13 @@ class GoformClient(
         )
         AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[QoS] goformPost cost=${cost}ms attempts=$attemptNo")
         result
+        }
+        } catch (e: TimeoutCancellationException) {
+            // 2026-10-05 R2-10 修复：整体预算超时。Unreachable 的语义排除不了「命令已落到设备」，
+            // 与超时同性质；NEVER 命令（如 REBOOT）不会因此被上层重发，红线保持。
+            AppLogger.w(tag, "[goform_set] overall budget (20s) exceeded, goformId=${params["goformId"]}")
+            GoformWriteResult.Unreachable("overall timeout 20s")
+        }
     }
 
 
@@ -737,7 +771,14 @@ class GoformClient(
 
         if (status != HttpStatusCode.OK || authFailure || isPartial) {
             if (isPartial) {
-                AppLogger.w(tag, "[goform_get] Partial response detected ($cmdParam, keys=${obj?.size ?: 0}), invalidating session")
+                // 2026-10-05 R2-11 修复：字段数少不一定是会话问题（固件对请求形状敏感是已知事实，
+                // station_list 合并查询被吞已有先例）。不再 invalidateSession + onAuthLost 重登重试 ——
+                // 对「合法少字段」的固件，那会把每次读都变成一次完整重登（登录风暴，撞退避、
+                // 占满 loginMutex 与 QoS 许可）。只按解析缺失处理：本轮 null、保留会话，由上层
+                // 按「数据缺失」展示。
+                AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
+                        " — session kept, treating as parse miss")
+                return null
             } else if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
                 lastGiveWayAt = System.currentTimeMillis()
                 AppLogger.w(tag, "[goform_get] session active on official UI, backing off")

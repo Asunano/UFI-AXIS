@@ -136,8 +136,29 @@ class ConfigRoutes(
                 intField("port", ConfigLimits.PORT) { settings.port = it }
                 intField("goform_port", ConfigLimits.GOFORM_PORT) { settings.goformPort = it }
 
-                textField("goform_ip") { settings.goformIp = it }
-                textField("update_url") { settings.updateUrl = it }
+                // 2026-10-05 R4-13 修复：goform_ip / update_url 格式校验。此前走宽松 textField
+                // 任意串落盘：非法 goform_ip 令 goform 全链路 503；update_url 是整个 FOTA/组件/Web
+                // 更新链的根 URL，无 scheme 白名单等于供应链面敞开。校验规则与 PairingManager
+                // 的 GOFORM_HOST_PATTERN（长度 ≤253）对齐，复用现成判据。
+                fun hostField(field: String, apply: (String) -> Unit) {
+                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
+                    val GOFORM_HOST_PATTERN = Regex("^[a-zA-Z0-9]([a-zA-Z0-9.\\-]*[a-zA-Z0-9])?$")
+                    when {
+                        v.isBlank() -> reject(field, ErrorCode.BLANK_VALUE)
+                        v.length > 253 || !GOFORM_HOST_PATTERN.matches(v) -> reject(field, ErrorCode.WRONG_TYPE)
+                        else -> { apply(v); updated.add(field) }
+                    }
+                }
+                fun urlField(field: String, apply: (String) -> Unit) {
+                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
+                    if (v.isBlank() || (!v.startsWith("http://") && !v.startsWith("https://"))) {
+                        reject(field, ErrorCode.WRONG_TYPE)
+                    } else {
+                        apply(v); updated.add(field)
+                    }
+                }
+                hostField("goform_ip") { settings.goformIp = it }
+                urlField("update_url") { settings.updateUrl = it }
 
                 boolField("auto_start_on_boot") { settings.autoStartOnBoot = it }
                 // 日志三层开关：总闸 → 两侧子开关 → 详细级别

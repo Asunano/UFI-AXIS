@@ -55,12 +55,18 @@ class AdaptiveSemaphore(
     val totalPermits: Int get() = _currentPermits.get()
     val target: Int get() = targetPermits
 
+    // 2026-10-05 R1-10 修复：adjustTo 与 release 共用一把小锁串行化，消除「release 读到
+    // 过期 target」导致的许可越出目标上限 / 真释放被连环吞掉的账实不符。
+    private val adjustLock = Any()
+
     fun adjustTo(newPermits: Int) {
         val clamped = newPermits.coerceIn(minPermits, maxPermits)
-        val old = targetPermits
-        if (old != clamped) {
-            targetPermits = clamped
-            AppLogger.d("AdaptiveSemaphore", "Target permits: $old -> $clamped (current total=${_currentPermits.get()}, available=${semaphore.availablePermits})")
+        synchronized(adjustLock) {
+            val old = targetPermits
+            if (old != clamped) {
+                targetPermits = clamped
+                AppLogger.d("AdaptiveSemaphore", "Target permits: $old -> $clamped (current total=${_currentPermits.get()}, available=${semaphore.availablePermits})")
+            }
         }
     }
 
@@ -72,7 +78,9 @@ class AdaptiveSemaphore(
         return semaphore.tryAcquire()
     }
 
-    fun release() {
+    fun release() = synchronized(adjustLock) {
+        // 2026-10-05 R1-10 修复：target 读取不再与 adjustTo 竞争；CAS 循环仍防与并发 release
+        // 交错时 _currentPermits 账本错乱。原 while-CAS 逻辑原样保留。
         while (true) {
             val current = _currentPermits.get()
             val target = targetPermits
