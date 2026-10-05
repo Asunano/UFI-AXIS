@@ -85,7 +85,15 @@ object ThumbPrewarmWorker {
             var failed = 0
             AppLogger.i(TAG, "预热开始：${ids.size} 个视频")
             broadcast(done, ids.size, failed, true)
+            var writeGateAborted = false
             for (id in ids) {
+                // ③ WriteGate 每条复查（审查修复）：大库一轮可达数十分钟，
+                // OTA 可能在循环中途开始——撞上即中止本轮，下轮闲时再续
+                if (com.ufi_axis_core.api.routes.WriteGate.updateBusy()) {
+                    writeGateAborted = true
+                    AppLogger.i(TAG, "预热中止：OTA 写操作开始（已处理 $done 条）")
+                    break
+                }
                 when {
                     hasCache(thumbDir, id) -> Unit                       // 已有图（回传/上轮成果）
                     isCoolingDown(thumbDir, id) -> Unit                  // 6h 内失败过
@@ -168,7 +176,12 @@ object ThumbPrewarmWorker {
             verdict !is FrameValidator.Verdict.TooDark
         ) {
             // Blank/TooSmall/Undecodable：写冷却标记，6h 内不再碰这条（PUT /thumbnail 拒收的是同一组判据）
-            failMark(thumbDir, id).writeText((System.currentTimeMillis() + FAIL_COOLDOWN_MS).toString())
+            // 原子写（审查修复）：半写的 .fail 会把时间戳写坏 → toLongOrNull()=0 → 冷却失效
+            val mark = failMark(thumbDir, id)
+            mark.parentFile?.mkdirs()
+            val tmpMark = File(mark.parentFile, mark.name + "." + java.util.UUID.randomUUID() + ".tmp")
+            tmpMark.writeText((System.currentTimeMillis() + FAIL_COOLDOWN_MS).toString())
+            if (!tmpMark.renameTo(mark)) tmpMark.delete()
             AppLogger.w(TAG, "预热失败($id): $verdict")
             return false
         }

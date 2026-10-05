@@ -287,6 +287,37 @@ class MediaRoutes(
         }
     }
 
+    /** G5：探测结果扁平化响应（审查修复时从主路径抽出复用）。 */
+    private suspend fun respondVideoInfo(
+        call: io.ktor.server.application.ApplicationCall,
+        id: Long,
+        obj: kotlinx.serialization.json.JsonObject,
+        source: String
+    ) {
+        fun d(k: String): Double =
+            (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toDoubleOrNull() ?: 0.0
+        fun l(k: String): Long =
+            (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: 0L
+        fun s(k: String): String =
+            (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+        call.respond(
+            toJsonElement(
+                mapOf(
+                    "id" to id,
+                    "duration_ms" to (d("duration_s") * 1000).toLong(),
+                    "width" to l("width"),
+                    "height" to l("height"),
+                    "codec" to s("codec"),
+                    "pix_fmt" to s("pix_fmt"),
+                    "bit_rate" to l("bit_rate"),
+                    "fps_num" to l("fps_num"),
+                    "fps_den" to l("fps_den"),
+                    "source" to source,
+                )
+            )
+        )
+    }
+
     private fun contentUriOf(kind: Kind): Uri = when (kind) {
         Kind.VIDEO -> MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         Kind.AUDIO -> MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
@@ -1538,10 +1569,14 @@ class MediaRoutes(
              * 有了自主探测真值的能力。
              *
              * ## 缓存策略
-             * 媒体文件不可变：结果落 filesDir/video_info/ 永久缓存（单条 <1KB，无上限必要），
-             * 文件删除时随媒体库 rescan 清理。探测走 ffmpeg（fd 通道 + 20s 超时）。
+             * 媒体文件不可变：结果落 filesDir/video_info/ 缓存（单条 <1KB）。探测走 ffmpeg
+             * （fd 通道 + 20s 超时）。注意：缓存目录不做 rescan 清理（2026-10-05 审查修正，
+             * 此前注释误称会清理）——MediaStore id 复用时旧结果会一直命中，量级可忽略
+             * （单文件 <1KB）；DELETE /thumbnail-cache 只清 thumbs/，需要时手动清 video_info/。
              *
-             * 404：无法解析（损坏/不支持容器/ffmpeg 不可用）——reason 随 404 带回。
+             * 404：无法解析（损坏/不支持容器/ffmpeg 不可用）——reason 随 404 带回；
+             * 同时写 .fail 冷却标记（6h，与缩略图预热同一口径），避免坏文件每次请求
+             * 都重新占用 20s 的 ffmpeg 探测槽位。
              */
             get("/video-info") {
                 val id = call.request.queryParameters["id"]?.toLongOrNull() ?: run {
@@ -1552,14 +1587,38 @@ class MediaRoutes(
                 val cacheFile = File(File(appContext.filesDir, "video_info"), "$id.json")
 
                 var source = "cache"
+                val failMark = File(cacheFile.parentFile, "${cacheFile.name}.fail")
                 val json = if (cacheFile.isFile) {
                     withContext(Dispatchers.IO) { cacheFile.readBytes().decodeToString() }
                 } else {
+                    // 404 冷却（审查修复）：冷却期内直接回 404，不再重探
+                    if (failMark.isFile) {
+                        val until = withContext(Dispatchers.IO) {
+                            runCatching { failMark.readText().trim().toLongOrNull() }.getOrNull()
+                        }
+                        if (until != null && until > System.currentTimeMillis()) {
+                            call.respondFail(
+                                HttpStatusCode.NotFound, ErrorCode.NOT_FOUND,
+                                "无法解析此视频（冷却中，稍后自动重试）"
+                            )
+                            return@get
+                        }
+                        withContext(Dispatchers.IO) { runCatching { failMark.delete() } }
+                    }
                     val probed = com.ufi_axis_core.media.FfmpegThumbnailService
                         .probeVideoInfo(appContext, uri)
                     if (probed == null) {
+                        // 2026-10-05 审查修复：404 也落冷却标记（6h），坏文件不再反复打满探测槽位
+                        withContext(Dispatchers.IO) {
+                            runCatching {
+                                failMark.parentFile?.mkdirs()
+                                failMark.writeText(
+                                    (System.currentTimeMillis() + 6L * 60 * 60 * 1000).toString()
+                                )
+                            }
+                        }
                         call.respondFail(
-                            HttpStatusCode.NotFound, ErrorCode.BAD_REQUEST,
+                            HttpStatusCode.NotFound, ErrorCode.NOT_FOUND,
                             "无法解析此视频（损坏/不支持容器/ffmpeg 不可用）"
                         )
                         return@get
@@ -1567,7 +1626,11 @@ class MediaRoutes(
                     withContext(Dispatchers.IO) {
                         runCatching {
                             cacheFile.parentFile?.mkdirs()
-                            val tmp = File(cacheFile.parentFile, "${cacheFile.name}.tmp")
+                            // 唯一临时名（审查修复）：并发 miss 不互踩同一 tmp
+                            val tmp = File(
+                                cacheFile.parentFile,
+                                cacheFile.name + "." + java.util.UUID.randomUUID() + ".tmp"
+                            )
                             tmp.writeBytes(probed.encodeToByteArray())
                             tmp.renameTo(cacheFile)
                         }
@@ -1582,9 +1645,38 @@ class MediaRoutes(
                         .let { it as kotlinx.serialization.json.JsonObject }
                 }.getOrNull()
                 if (obj == null) {
-                    call.respondFail(
-                        HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "元信息解析失败"
-                    )
+                    // 2026-10-05 审查修复：坏缓存自愈——删除后重新探测，不再永久 500
+                    withContext(Dispatchers.IO) { runCatching { cacheFile.delete() } }
+                    val probed = com.ufi_axis_core.media.FfmpegThumbnailService
+                        .probeVideoInfo(appContext, uri)
+                    if (probed == null) {
+                        call.respondFail(
+                            HttpStatusCode.NotFound, ErrorCode.NOT_FOUND, "元信息解析失败"
+                        )
+                        return@get
+                    }
+                    val retry = runCatching {
+                        kotlinx.serialization.json.Json.parseToJsonElement(probed)
+                            .let { it as kotlinx.serialization.json.JsonObject }
+                    }.getOrNull()
+                    if (retry == null) {
+                        call.respondFail(
+                            HttpStatusCode.InternalServerError, ErrorCode.INTERNAL_ERROR, "元信息解析失败"
+                        )
+                        return@get
+                    }
+                    withContext(Dispatchers.IO) {
+                        runCatching {
+                            cacheFile.parentFile?.mkdirs()
+                            val tmp = File(
+                                cacheFile.parentFile,
+                                cacheFile.name + "." + java.util.UUID.randomUUID() + ".tmp"
+                            )
+                            tmp.writeBytes(probed.encodeToByteArray())
+                            tmp.renameTo(cacheFile)
+                        }
+                    }
+                    respondVideoInfo(call, id, retry, "ffmpeg")
                     return@get
                 }
                 fun d(k: String): Double =
@@ -1593,22 +1685,7 @@ class MediaRoutes(
                     (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: 0L
                 fun s(k: String): String =
                     (obj[k] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
-                call.respond(
-                    toJsonElement(
-                        mapOf(
-                            "id" to id,
-                            "duration_ms" to (d("duration_s") * 1000).toLong(),
-                            "width" to l("width"),
-                            "height" to l("height"),
-                            "codec" to s("codec"),
-                            "pix_fmt" to s("pix_fmt"),
-                            "bit_rate" to l("bit_rate"),
-                            "fps_num" to l("fps_num"),
-                            "fps_den" to l("fps_den"),
-                            "source" to source,
-                        )
-                    )
-                )
+                respondVideoInfo(call, id, obj, source)
             }
 
             get("/list") {

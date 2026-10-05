@@ -385,6 +385,9 @@ object WsDataTopic {
      * （data: { done: Int, total: Int, failed: Int, running: Boolean }）。
      * 设置页据此展示预热进度；媒体列表端收到后可做一次缩略图静默重拉。
      */
+    /** 封面预热进度（G6）。payload: {done,total,failed,running}。
+     *  语义（2026-10-05 审查注明）：done 只累计本轮**新增**成功数，缓存命中不计入；
+     *  total 是全库视频数。消费端勿把它当"整体完成度"画进度条——稳定态下 done 恒为 0。 */
     const val MEDIA_THUMB_PREWARM = "media:thumb-progress"
 
     /** 前缀：按命名空间分流用。 */

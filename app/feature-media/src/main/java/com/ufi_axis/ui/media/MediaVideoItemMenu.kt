@@ -156,6 +156,10 @@ internal fun MediaVideoInfoDialog(
                 var probed by remember { mutableStateOf<VideoInfoResponse?>(null) }
                 var probeDone by remember { mutableStateOf(false) }
                 LaunchedEffect(item.id) {
+                    // 2026-10-05 审查修复：换 item 重开弹窗时先清旧探测值并复位 probeDone，
+                    // 否则在飞调用返回前会把上一条视频的编码/码率短暂渲染到新条目上（串台）
+                    probed = null
+                    probeDone = false
                     probed = videoInfo?.invoke(item.id)
                     probeDone = true
                 }

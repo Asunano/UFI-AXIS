@@ -1206,6 +1206,14 @@ class MediaModule(
      * 失败（损坏 / 不支持容器 / ffmpeg 不可用 → 404）回 null，由调用方展示
      * 「设备无法解析此文件」—— 比空白有信息量。
      */
+    suspend fun videoInfoOf(id: Long): VideoInfoResponse? = try {
+        api.getVideoInfo(id)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
     // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
     // 真源在 core（GET/PUT /api/config 的 thumb_prewarm_*）。null = core 未返回（老版本），
     // UI 据此禁用开关；改法与 ToolsModule 的字段归一化开关同一套"读真值 → PUT 单键 →
@@ -1258,14 +1266,6 @@ class MediaModule(
         } finally {
             thumbPrewarmSaving = false
         }
-    }
-
-    suspend fun videoInfoOf(id: Long): VideoInfoResponse? = try {
-        api.getVideoInfo(id)
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Exception) {
-        null
     }
 
     /**
