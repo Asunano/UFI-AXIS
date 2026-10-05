@@ -164,7 +164,7 @@ fun MediaVideoScreen(
             toast = ToastMessage(
                 text = "正在用本机生成视频缩略图",
                 type = ToastType.INFO,
-                subtitle = "设备端解不出画面，改由手机抽帧并回传"
+                subtitle = "设备端封面生成不可用，改由本机抽帧并回传兜底"
             )
         }
     }
@@ -383,9 +383,11 @@ fun MediaVideoScreen(
         )
     )
 
+    // 2026-10-05 G7（FFmpeg 接入计划书 §4.3）：详情弹窗接入 /video-info（ffmpeg 探测真值）
     MediaVideoInfoDialog(
         visible = infoTarget != null,
         item = infoTarget,
+        videoInfo = { id -> media.videoInfoOf(id) },
         onDismiss = { infoTarget = null }
     )
 
@@ -448,6 +450,10 @@ fun MediaVideoScreen(
  * 只在**真的**走过本机抽帧之后才出现（[MediaThumbnailBuilder.everUsed]）——
  * 对解码正常的设备提示这个纯属噪音。关掉之后不再出现（记在本地 prefs）；
  * 但每次开始抽帧仍会有 toast，那说的是"现在正在干活"，与"为什么这么干"是两件事。
+ *
+ * 2026-10-05 G7（FFmpeg 接入计划书 §4.2）文案校准：core 接入 ffmpeg 软解后，本机抽帧
+ * 的定位降为"ffmpeg 也不可用时的兜底"——弹窗/toast 文案同步改口径，不再宣称
+ * "设备端解不出画面"这个已不成立的前提。
  */
 @Composable
 private fun MediaLocalThumbNotice(onDismiss: () -> Unit) {
@@ -468,12 +474,12 @@ private fun MediaLocalThumbNotice(onDismiss: () -> Unit) {
         Spacer(Modifier.width(Spacing.Small))
         Column(modifier = Modifier.weight(1f)) {
             Text(
-                "设备端无法生成视频缩略图",
+                "设备端无法生成视频缩略图（含 ffmpeg 兜底）",
                 style = UfiTextStyles.bodyEmphasis,
                 color = palette.textPrimary
             )
             Text(
-                "已改为由本机抽帧并回传设备（走局域网，不消耗蜂窝流量）。每个视频只需抽一次，之后网页端也能看到。",
+                "设备端系统解码与本机 ffmpeg 软解都出不了画面，已改由本机抽帧并回传（走局域网，不消耗蜂窝流量）。每个视频只需抽一次，之后网页端也能看到。",
                 style = UfiTextStyles.note,
                 color = palette.textSecondary
             )

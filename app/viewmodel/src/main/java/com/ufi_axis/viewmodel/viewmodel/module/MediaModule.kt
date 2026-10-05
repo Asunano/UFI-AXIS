@@ -16,6 +16,7 @@ import com.ufi_axis.data.model.PlaylistAddResponse
 import com.ufi_axis.data.model.PlaylistNameRequest
 import com.ufi_axis.data.model.PlaylistPathsRequest
 import com.ufi_axis.data.model.StreamTicketRequest
+import com.ufi_axis.data.model.VideoInfoResponse
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.encodeUriComponent
 import com.ufi_axis_core.contract.WsDataTopic
@@ -1195,6 +1196,74 @@ class MediaModule(
      */
     suspend fun tagsOf(id: Long): MediaTagsResponse? = try {
         api.getMediaTags(id)
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * 2026-10-05 G7（FFmpeg 接入计划书 §4.3）：视频元信息（ffmpeg 探测，core 永久缓存）。
+     * 详情弹窗用：MediaStore 列在本机经常缺 duration/width/height，这里给真值。
+     * 失败（损坏 / 不支持容器 / ffmpeg 不可用 → 404）回 null，由调用方展示
+     * 「设备无法解析此文件」—— 比空白有信息量。
+     */
+    // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+    // 真源在 core（GET/PUT /api/config 的 thumb_prewarm_*）。null = core 未返回（老版本），
+    // UI 据此禁用开关；改法与 ToolsModule 的字段归一化开关同一套"读真值 → PUT 单键 →
+    // 校验 updated_fields → 成功才动镜像"三步，不引入"假开关"。
+
+    /** 预热开关当前镜像值（null = 未读到真值 / 老 core）。 */
+    private var thumbPrewarmValue: Boolean? = null
+
+    /** true = 有 PUT 在飞，回读要被丢弃。 */
+    @Volatile
+    private var thumbPrewarmSaving = false
+
+    /**
+     * 回读预热开关真值（进视频设置页时调用）。失败不动镜像、只置 read 标记。
+     */
+    suspend fun loadThumbPrewarm(): Boolean = try {
+        val cfg = api.getConfig()
+        if (!thumbPrewarmSaving) {
+            thumbPrewarmValue = cfg.thumb_prewarm_enabled
+        }
+        true
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        false
+    }
+
+    /** 当前镜像值（UI 进页面先调 [loadThumbPrewarm] 再读）。null = 未读到 / 老 core。 */
+    fun thumbPrewarmCurrent(): Boolean? = thumbPrewarmValue
+
+    /**
+     * 下发预热开关（`PUT /api/config` 单键）。
+     * @return null = 成功；非 null = 失败原因（UI 直接展示）。
+     */
+    suspend fun setThumbPrewarm(enabled: Boolean): String? {
+        if (thumbPrewarmSaving) return "上一个请求还在进行中"
+        thumbPrewarmSaving = true
+        try {
+            val resp = api.updateConfig(mapOf("thumb_prewarm_enabled" to enabled))
+            if ("thumb_prewarm_enabled" !in resp.updated_fields) {
+                val rejected = resp.rejected_fields.firstOrNull { it.field == "thumb_prewarm_enabled" }
+                return rejected?.describe() ?: "设备未接受该设置（thumb_prewarm_enabled）"
+            }
+            thumbPrewarmValue = enabled
+            return null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return "保存失败：${e.message}"
+        } finally {
+            thumbPrewarmSaving = false
+        }
+    }
+
+    suspend fun videoInfoOf(id: Long): VideoInfoResponse? = try {
+        api.getVideoInfo(id)
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) {
         null
     }

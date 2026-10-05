@@ -94,6 +94,15 @@ fun MediaVideoSettingsScreen(
         )
     }
 
+    // 2026-10-05 G6（FFmpeg 接入计划书 §4.2）：core 侧封面预热开关。
+    // 真源在 core；null = 老版本 core 没这个键，开关禁用（不拿默认值冒充真值）。
+    var prewarm by remember { mutableStateOf<Boolean?>(null) }
+    var prewarmSaving by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        media.loadThumbPrewarm()
+        prewarm = media.thumbPrewarmCurrent()
+    }
+
     // 缓存占用要"看得见变化"：清空之后立刻重算，而不是等下次进页面
     var cacheStats by remember { mutableStateOf(0 to 0L) }
     var statsVersion by remember { mutableStateOf(0) }
@@ -135,8 +144,9 @@ fun MediaVideoSettingsScreen(
             UfiSettingsRowCard {
                 UfiSettingsToggle(
                     title = "用本机抽帧生成封面",
-                    description = "设备端解不出画面时，由手机抽一帧并回传设备（局域网传输，" +
-                        "每个视频只需一次）。关掉后只显示设备能给出的封面。",
+                    // 2026-10-05 G7（FFmpeg 接入计划书 §4.2）：core 接入 ffmpeg 后本机抽帧降为兜底，文案同口径
+                    description = "设备端（含 ffmpeg 软解）出不了封面时，由手机抽一帧并回传设备" +
+                        "（局域网传输，每个视频只需一次）。关掉后只显示设备能给出的封面。",
                     checked = frameExtraction,
                     icon = Icons.Default.Videocam,
                     onCheckedChange = { checked ->
@@ -145,6 +155,34 @@ fun MediaVideoSettingsScreen(
                             AppPreferences(context).mediaPhoneFrameExtraction = checked
                         }
                         if (!checked) MediaThumbnailBuilder.cancelBatch()
+                    }
+                )
+            }
+            // 2026-10-05 G6：core 侧 ffmpeg 封面预热（闲时后台把整库封面铺满，列表秒出）
+            UfiSettingsRowCard {
+                UfiSettingsToggle(
+                    title = "设备后台预热封面（实验性）",
+                    description = if (prewarm == null) {
+                        "当前设备版本的 core 不支持此开关。"
+                    } else {
+                        "开启后设备在充电或电量充足（>30%）时用 ffmpeg 逐个补齐视频封面，" +
+                            "打开列表时全部秒出。软解较吃 CPU，低配设备建议保持关闭。"
+                    },
+                    checked = prewarm == true,
+                    icon = Icons.Default.History,
+                    enabled = prewarm != null && !prewarmSaving,
+                    onCheckedChange = { checked ->
+                        prewarmSaving = true
+                        scope.launch {
+                            val err = media.setThumbPrewarm(checked)
+                            prewarm = media.thumbPrewarmCurrent()
+                            prewarmSaving = false
+                            err?.let {
+                                android.widget.Toast.makeText(
+                                    context, it, android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
                     }
                 )
             }

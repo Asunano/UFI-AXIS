@@ -8,11 +8,17 @@ import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import com.ufi_axis.data.model.MediaLibraryItem
+import com.ufi_axis.data.model.VideoInfoResponse
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiDialogBody
 import com.ufi_axis.ui.components.common.UfiDialogInfoRow
@@ -120,14 +126,15 @@ internal fun mediaVideoItemMenuOptions(
  * 共用的是**弹窗零件**（[UfiDialogInfoRow]），不是弹窗本身 —— 视觉口径因此仍然只有一份。
  *
  * 拿不到的字段**整行不显示**，不写"未知 / 0×0"：那种占位看着像数据。
- * 这些值全部来自系统媒体库（core 的 `/api/media/list` 与 `/api/media/browse` 只是把
- * MediaStore 的列转发出来），
- * 所以"没有"的真实含义是"系统没记"，不是"文件没有"。
+ * 这些值来自两处：系统媒体库（core 的 `/api/media/list` 只是把 MediaStore 的列转发出来）
+ * 与 2026-10-05 G7 起追加的 `/api/media/video-info`（ffmpeg 探测，补编码 / 码率 / 帧率），
+ * 所以"没有"的真实含义是"两处都没记"，不是"文件没有"。
  */
 @Composable
 internal fun MediaVideoInfoDialog(
     visible: Boolean,
     item: MediaLibraryItem?,
+    videoInfo: (suspend (Long) -> VideoInfoResponse?)?,
     onDismiss: () -> Unit
 ) {
     UfiCustomDialog(
@@ -142,24 +149,59 @@ internal fun MediaVideoInfoDialog(
              * 代价是关闭那一刻 item 已经是 null，所以内容这里要能接受 null。
              */
             if (item != null) {
+                // 2026-10-05 G7（FFmpeg 接入计划书 §4.3）：打开弹窗时向 core 探一次视频
+                // 真值（ffmpeg 探测，core 侧永久缓存——第二次打开同一条就是瞬时返回）。
+                // 结果**追加**在 MediaStore 行下面：MediaStore 有值的字段优先（同源不冲突），
+                // ffmpeg 才有的字段（编码/位深/码率/帧率）补齐系统没记的那部分。
+                var probed by remember { mutableStateOf<VideoInfoResponse?>(null) }
+                var probeDone by remember { mutableStateOf(false) }
+                LaunchedEffect(item.id) {
+                    probed = videoInfo?.invoke(item.id)
+                    probeDone = true
+                }
                 UfiDialogInfoRow("名称", item.name, multiline = true)
                 if (item.size > 0) {
                     UfiDialogInfoRow("大小", FormatUtils.formatSize(item.size))
                 }
-                formatMediaDuration(item.duration_ms).takeIf { it.isNotBlank() }?.let {
-                    UfiDialogInfoRow("时长", it)
-                }
+                formatMediaDuration(item.duration_ms).takeIf { it.isNotBlank() }
+                    ?: formatMediaDuration(probed?.durationMs ?: 0L).takeIf { it.isNotBlank() }
+                    ?.let {
+                        UfiDialogInfoRow("时长", it)
+                    }
                 if (item.width > 0 && item.height > 0) {
                     UfiDialogInfoRow("分辨率", "${item.width} × ${item.height}")
+                } else if ((probed?.width ?: 0) > 0 && (probed?.height ?: 0) > 0) {
+                    UfiDialogInfoRow("分辨率", "${probed?.width} × ${probed?.height}")
                 }
                 if (item.mime.isNotBlank()) {
                     UfiDialogInfoRow("类型", item.mime)
+                }
+                probed?.takeIf { it.codec.isNotBlank() }?.let {
+                    UfiDialogInfoRow("编码", it.codec)
+                }
+                probed?.takeIf { it.pix_fmt.isNotBlank() }?.let {
+                    UfiDialogInfoRow("像素格式", it.pix_fmt)
+                }
+                probed?.takeIf { it.bit_rate > 0 }?.let {
+                    // bit_rate 是 bit/s，FormatUtils.formatSize 吃字节 —— 换算后自带 "bps" 语义
+                    UfiDialogInfoRow("码率", "${FormatUtils.formatSize(it.bit_rate / 8)}/s")
+                }
+                probed?.takeIf { it.fps_num > 0 && it.fps_den > 0 }?.let {
+                    UfiDialogInfoRow("帧率", "%.2f fps".format(it.fps_num.toDouble() / it.fps_den))
                 }
                 if (item.date_modified > 0) {
                     UfiDialogInfoRow("修改时间", FormatUtils.formatTimestamp(item.date_modified))
                 }
                 UfiDialogInfoRow("路径", item.path, multiline = true)
-                UfiDialogNote("以上信息来自设备的系统媒体库；文件刚改过名时可能还是旧记录。")
+                // probeDone 之前不落任何提示，避免"加载中"闪一下就变成"解析失败"
+                if (probeDone && probed == null) {
+                    UfiDialogNote("设备无法解析此文件的编码信息（损坏或容器不受支持）。")
+                } else {
+                    UfiDialogNote(
+                        "基础信息来自设备的系统媒体库；编码 / 码率 / 帧率由设备端 ffmpeg 探测，" +
+                            "文件刚改过名时可能还是旧记录。"
+                    )
+                }
             }
         }
     }
