@@ -96,6 +96,14 @@
           :disabled="probeSwitchDisabled('field_normalization_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('field_normalization_enabled', v)"
         />
+        <ToggleRow
+          label="设备后台预热封面（实验性，默认关，改动立即生效）"
+          :description="probeDescription('thumb_prewarm_enabled', PREWARM_DESC)"
+          :model-value="generalForm.thumbPrewarmEnabled"
+          :loading="probeSaving.thumb_prewarm_enabled"
+          :disabled="probeSwitchDisabled('thumb_prewarm_enabled')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('thumb_prewarm_enabled', v)"
+        />
       </div>
       <n-divider style="margin: 10px 0" />
       <div class="config-section">
@@ -227,6 +235,8 @@ const generalForm = reactive({
   // 默认值必须与 core 一致：这里写 false 会让「还没读到配置」时显示成关闭 —— 假状态。
   // 关掉它是排障后门（读侧原样透传设备字段），而且**改完要重启后台服务**才生效。
   fieldNormalizationEnabled: true,
+  // 设备后台封面预热（G6），core 侧默认 false —— 初值必须与 core 一致（见 fieldNormalizationEnabled 注释）
+  thumbPrewarmEnabled: false,
   smsCodeEnabled: false,
   smsCodeCleanupHours: 24,
   updateSourceMode: 'auto',
@@ -247,6 +257,7 @@ async function loadGeneralConfig() {
       goform_dump_enabled: 'goformDumpEnabled',
       goform_command_enabled: 'goformCommandEnabled',
       field_normalization_enabled: 'fieldNormalizationEnabled',
+      thumb_prewarm_enabled: 'thumbPrewarmEnabled',
       sms_code_enabled: 'smsCodeEnabled',
       sms_code_cleanup_hours: 'smsCodeCleanupHours',
       update_source_mode: 'updateSourceMode',
@@ -366,14 +377,15 @@ async function detectGeo(force: boolean): Promise<string> {
 
 // ── 三个排障开关：单键即时保存（生效时机各自不同，见 PROBE_NEEDS_RESTART）──
 
-type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled' | 'field_normalization_enabled';
+type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled' | 'field_normalization_enabled' | 'thumb_prewarm_enabled';
 
 /** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
-const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled' | 'fieldNormalizationEnabled'> =
+const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled' | 'fieldNormalizationEnabled' | 'thumbPrewarmEnabled'> =
   {
     goform_dump_enabled: 'goformDumpEnabled',
     goform_command_enabled: 'goformCommandEnabled',
     field_normalization_enabled: 'fieldNormalizationEnabled',
+    thumb_prewarm_enabled: 'thumbPrewarmEnabled',
   };
 
 /**
@@ -391,6 +403,7 @@ const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
   goform_dump_enabled: false,
   goform_command_enabled: false,
   field_normalization_enabled: true,
+  thumb_prewarm_enabled: false,
 };
 
 /** 各自独立的 loading：三个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
@@ -398,6 +411,7 @@ const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
   goform_dump_enabled: false,
   goform_command_enabled: false,
   field_normalization_enabled: false,
+  thumb_prewarm_enabled: false,
 });
 
 const PROBE_DUMP_DESC =
@@ -407,6 +421,10 @@ const PROBE_COMMAND_DESC =
   '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
   '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +
   '改动立即生效，不需要点下方「保存」；只在排障时临时打开，看完立刻关回去。';
+const PREWARM_DESC =
+  '开=设备闲时（充电或电量>30%、仅 Wi-Fi 场景）用 ffmpeg 批量为库内视频生成封面，' +
+  '列表打开更快；与前台抽帧共用解码通道，每张间隔 2 秒让路。OTA 更新期间自动暂停。' +
+  '改动立即生效，不需要点下方「保存」。';
 const PROBE_FIELD_NORMALIZATION_DESC =
   '开=按设备 profile 的登记表把设备字段归一化成统一字段名（默认，正常使用就该开着）；' +
   '关=读侧原样透传设备原始字段，仅排障用。已实测的副作用：流量限额整块会变成默认值' +

@@ -1572,7 +1572,7 @@ class MediaRoutes(
              * 媒体文件不可变：结果落 filesDir/video_info/ 缓存（单条 <1KB）。探测走 ffmpeg
              * （fd 通道 + 20s 超时）。注意：缓存目录不做 rescan 清理（2026-10-05 审查修正，
              * 此前注释误称会清理）——MediaStore id 复用时旧结果会一直命中，量级可忽略
-             * （单文件 <1KB）；DELETE /thumbnail-cache 只清 thumbs/，需要时手动清 video_info/。
+             * （单文件 <1KB）；DELETE /thumbnail-cache 在清视频/全量时连带清 video_info/。
              *
              * 404：无法解析（损坏/不支持容器/ffmpeg 不可用）——reason 随 404 带回；
              * 同时写 .fail 冷却标记（6h，与缩略图预热同一口径），避免坏文件每次请求
@@ -1650,6 +1650,15 @@ class MediaRoutes(
                     val probed = com.ufi_axis_core.media.FfmpegThumbnailService
                         .probeVideoInfo(appContext, uri)
                     if (probed == null) {
+                        // 与主失败路径同口径：自愈重探也失败就落冷却标记（测试锁定的行为）
+                        withContext(Dispatchers.IO) {
+                            runCatching {
+                                failMark.parentFile?.mkdirs()
+                                failMark.writeText(
+                                    (System.currentTimeMillis() + 6L * 60 * 60 * 1000).toString()
+                                )
+                            }
+                        }
                         call.respondFail(
                             HttpStatusCode.NotFound, ErrorCode.NOT_FOUND, "元信息解析失败"
                         )
@@ -2242,6 +2251,10 @@ class MediaRoutes(
                     )
                     return@delete
                 }
+                // video_info/ 一并清（2026-10-05 审查遗留补口）：探测缓存与 .fail 冷却标记
+                // 都随"换抽帧策略/排查黑图"的场景该重置；只在清视频（或不带 type）时清，
+                // 音频/图片场景与它无关。
+                val clearVideoInfo = kind == null || kind == Kind.VIDEO
                 val result = withContext(Dispatchers.IO) {
                     val prefix = kind?.let { "${it.key}_" }
                     var removed = 0
@@ -2255,11 +2268,20 @@ class MediaRoutes(
                             freed += len
                         }
                     }
-                    removed to freed
+                    var viRemoved = 0
+                    if (clearVideoInfo) {
+                        File(appContext.filesDir, "video_info").listFiles()?.forEach { f ->
+                            // <id>.json（探测缓存）与 <id>.json.fail（404 冷却）都归这里管
+                            if (f.isFile && (f.name.endsWith(".json") || f.name.endsWith(".fail"))) {
+                                if (f.delete()) viRemoved++
+                            }
+                        }
+                    }
+                    Triple(removed, freed, viRemoved)
                 }
                 AppLogger.i(
                     TAG,
-                    "已清空缩略图缓存(${kind?.key ?: "全部"}): ${result.first} 张, ${result.second / 1024} KB"
+                    "已清空缩略图缓存(${kind?.key ?: "全部"}): ${result.first} 张, ${result.second / 1024} KB, video_info ${result.third} 条"
                 )
                 call.respond(
                     toJsonElement(
@@ -2267,7 +2289,8 @@ class MediaRoutes(
                             "success" to true,
                             "type" to (kind?.key ?: ""),
                             "removed" to result.first,
-                            "freed_bytes" to result.second
+                            "freed_bytes" to result.second,
+                            "video_info_removed" to result.third
                         )
                     )
                 )
