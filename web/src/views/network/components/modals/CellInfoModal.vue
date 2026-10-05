@@ -17,12 +17,17 @@
           实时刷新
         </n-button>
       </div>
-      <div v-if="cellInfo?.neighbor_cells?.length">
+      <div v-if="cellInfo?.neighbor_cells?.length" class="neighbor-list">
         <div v-for="(nc, i) in cellInfo.neighbor_cells" :key="i" class="neighbor-item">
-          <span>PCI {{ nc.pci }}</span>
-          <span>EARFCN {{ nc.earfcn }}</span>
-          <span>RSRP {{ nc.rsrp }} dBm</span>
-          <n-button size="tiny" text @click="lockCell(nc)">锁定</n-button>
+          <div class="neighbor-id">
+            <span class="neighbor-pci">PCI {{ nc.pci }}</span>
+            <span class="neighbor-rat" :class="{ 'neighbor-rat--nr': isNRCell(nc) }">{{ isNRCell(nc) ? '5G' : '4G' }}</span>
+          </div>
+          <div class="neighbor-metrics">
+            <span>EARFCN {{ nc.earfcn }}</span>
+            <span :class="rsrpClass(nc.rsrp)">RSRP {{ nc.rsrp }} dBm</span>
+          </div>
+          <n-button size="tiny" type="primary" secondary class="neighbor-lock" @click="lockCell(nc)">锁定</n-button>
         </div>
       </div>
       <div v-else class="hint-text">未检测到邻区</div>
@@ -85,6 +90,26 @@ function toNetworkType(rat: unknown): 'LTE' | 'NR' {
     .trim()
     .toUpperCase();
   return v.startsWith('NR') || v.startsWith('5G') ? 'NR' : 'LTE';
+}
+
+/**
+ * 邻区制式判定（与 app 端 inferIsNRDlg 同判据）：NR 频点 > 100000、NR 频段号 > 255；
+ * 都判不出时回落服务小区制式。锁小区提交仍走 toNetworkType(rat)，这里只管展示。
+ */
+function isNRCell(nc: { earfcn: unknown; rat: unknown }): boolean {
+  const earfcn = Number(nc.earfcn);
+  if (Number.isFinite(earfcn) && earfcn > 100000) return true;
+  return toNetworkType(nc.rat) === 'NR';
+}
+
+/** RSRP 数值着色：>=-85 好（绿），-85~-95 中（amber），-95~-105 弱（橙），更低极弱（红） */
+function rsrpClass(rsrp: unknown): string {
+  const v = Number(rsrp);
+  if (!Number.isFinite(v)) return '';
+  if (v >= -85) return 'rsrp-good';
+  if (v >= -95) return 'rsrp-fair';
+  if (v >= -105) return 'rsrp-weak';
+  return 'rsrp-poor';
 }
 
 function mapNeighbors(raw: any[]) {
@@ -198,17 +223,58 @@ watch(show, (v) => {
   font-weight: 600;
   color: var(--text-secondary);
 }
-/* 4 段（PCI 52 + EARFCN 86 + RSRP 95 + 锁定钮 28）+ 3×12 间距 ≈ 297px，
-   而弹窗内可用 ~280px ⇒ 必溢出。允许换行，并把锁定钮推到行尾。 */
+/* 2026-10-05 布局重排：原来是 PCI/EARFCN/RSRP/按钮 挤一行靠 wrap 兜底，
+   窄屏换行后按钮位置漂移、数字不对齐。改为固定两行结构：
+   第一行 PCI + 制式徽标（右推锁定钮），第二行 EARFCN + RSRP（等宽数字对齐）。
+   行内剩余空间交给 margin-right:auto 吸收，任何宽度下不再溢出。 */
 .neighbor-item {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
   gap: 4px 12px;
   padding: 6px 0;
   border-bottom: 1px solid var(--border-subtle);
   font-size: 13px;
 }
+.neighbor-id {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.neighbor-pci {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.neighbor-rat {
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--text-muted) 14%, transparent);
+}
+.neighbor-rat--nr {
+  color: var(--accent, #2563eb);
+  background: color-mix(in srgb, var(--accent, #2563eb) 14%, transparent);
+  font-weight: 600;
+}
+.neighbor-metrics {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.neighbor-lock {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+.rsrp-good { color: #16a34a; font-weight: 600; }
+.rsrp-fair { color: #ca8a04; }
+.rsrp-weak { color: #ea580c; }
+.rsrp-poor { color: #dc2626; }
 .neighbor-item:last-child {
   border-bottom: none;
 }

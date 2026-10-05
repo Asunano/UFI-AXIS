@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
-import { WS_UI_TOPICS } from '../api/contract';
+import { WS_UI_TOPICS, WsChannel } from '../api/contract';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 
 export type WsStatus = 'disconnected' | 'connecting' | 'connected';
@@ -70,8 +70,13 @@ export const useWebSocketStore = defineStore('websocket', () => {
       status.value = 'connected';
       reconnectAttempts = 0;
       // 订阅频道走 core:contract 镜像（WS_UI_TOPICS = core 广播全集 - notification，
-      // 因为同一条告警 core 会 notification + alert 双发，UI 只认 alert）
-      ws!.send(JSON.stringify({ subscribe: WS_UI_TOPICS }));
+      // 因为同一条告警 core 会 notification + alert 双发，UI 只认 alert）。
+      //
+      // 唯独 `notification` 要补订：core 对验证码/短信推送**只发 notification、不镜像
+      // alert**（PushChannel.SINGLE_TOPIC_SCENES，镜像会让告警列表混进短信），不订就
+      // 永远收不到验证码帧。消费侧（VerificationToast）只认 type=verification/sms，
+      // 告警帧仍由 alert 频道那路 handler 消费，这里不会双份处理。
+      ws!.send(JSON.stringify({ subscribe: [...WS_UI_TOPICS, WsChannel.NOTIFICATION] }));
     };
 
     // 2026-10-05 R2-12 修复：解析错误不再零观测 —— 加客户端计数（与 core /health 的

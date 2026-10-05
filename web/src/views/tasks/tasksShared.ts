@@ -98,6 +98,57 @@ export const presets = [
 
 export type TaskPreset = (typeof presets)[number];
 
+/**
+ * 自动化规则模板（2026-10-05）。与 presets（定时任务预设）同思路：
+ * 点一下把触发+动作预填进表单，用户只需微调阈值。字段名与 core
+ * ConditionEngine 的 triggerType/triggerParams、ActionType 的 params 契约严格对应，
+ * 提交路径与手工创建完全一致（POST /api/rules），core 侧零改动。
+ */
+export interface RuleTemplate {
+  label: string;
+  /** 模板说明（chips 的 tooltip / aria） */
+  desc: string;
+  triggerType: string;
+  triggerParams: Record<string, any>;
+  actionType: string;
+  params: Record<string, any>;
+}
+
+export const ruleTemplates: RuleTemplate[] = [
+  {
+    label: '流量超限关数据',
+    desc: '当月累计流量达到 30GB 时自动关闭移动数据',
+    triggerType: 'traffic_total_reached',
+    triggerParams: { thresholdBytes: 30 * 1024 * 1024 * 1024 },
+    actionType: 'data_toggle',
+    params: { enabled: false },
+  },
+  {
+    label: '低电量省电',
+    desc: '电量低于 20%（未充电）时关数据、关指示灯',
+    triggerType: 'battery_below',
+    triggerParams: { levelPercent: 20 },
+    actionType: 'data_toggle',
+    params: { enabled: false },
+  },
+  {
+    label: '回落 4G 锁回 5G',
+    desc: '网络从 5G 跳变到 4G 时自动把网络模式切回 5G/4G',
+    triggerType: 'network_type_changed',
+    triggerParams: { targetType: '4G' },
+    actionType: 'network_mode',
+    params: { mode: 'LTE_AND_5G' },
+  },
+  {
+    label: '断网自动重启',
+    desc: '蜂窝网络断开并确认后自动重启设备（冷却 10 分钟）',
+    triggerType: 'disconnect',
+    triggerParams: {},
+    actionType: 'reboot',
+    params: {},
+  },
+];
+
 // ── 图标映射 ──
 const actionIconMap: Record<string, Component> = {
   data_toggle: PhonePortraitOutline,

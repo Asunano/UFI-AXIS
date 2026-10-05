@@ -46,6 +46,8 @@
             当满足网络/流量/电量等条件时自动执行动作（如锁回 5G、低电量关数据）。条件持续监测，触发后带冷却时间。
           </p>
 
+          <RuleTemplateChips @apply="applyRuleTemplate" />
+
           <n-spin :show="rulesLoading">
             <n-empty v-if="rules.length === 0 && !rulesLoading" description="暂无自动化规则" class="empty-state">
               <template #extra>
@@ -104,6 +106,7 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useWebSocketStore } from '@/stores/websocket';
 import GridCard from '@/components/GridCard.vue';
 import PresetChips from './components/PresetChips.vue';
+import RuleTemplateChips from './components/RuleTemplateChips.vue';
 import TaskCard from './components/TaskCard.vue';
 import RuleCard from './components/RuleCard.vue';
 import TaskFormModal from './components/TaskFormModal.vue';
@@ -117,6 +120,7 @@ import {
   triggerLabel,
   triggerOptions,
   type Rule,
+  type RuleTemplate,
   type Task,
   type TaskPreset,
 } from './tasksShared';
@@ -195,6 +199,13 @@ function applyPreset(preset: TaskPreset) {
   formKind.value = 'task';
   formEditing.value = null;
   formPreset.value = preset as any;
+  showFormModal.value = true;
+}
+
+function applyRuleTemplate(t: RuleTemplate) {
+  formKind.value = 'rule';
+  formEditing.value = null;
+  formPreset.value = t as any;
   showFormModal.value = true;
 }
 

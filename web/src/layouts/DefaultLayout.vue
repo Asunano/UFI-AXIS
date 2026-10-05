@@ -159,6 +159,9 @@
       </n-drawer-content>
     </n-drawer>
   </n-layout>
+
+  <!-- 验证码/新短信 实时卡片：全局浮动，数据来自 WS notification 频道（见组件头注释） -->
+  <VerificationToast />
 </template>
 
 <script setup lang="ts">
@@ -197,6 +200,7 @@ import { useIsMobile } from '@/composables/useIsMobile';
 import { useWsTopics } from '@/composables/useRealtime';
 import { getApiClient } from '@/composables/useApi';
 import DeviceTopBar from '@/components/DeviceTopBar.vue';
+import VerificationToast from '@/components/VerificationToast.vue';
 import HeaderWeather from '@/components/HeaderWeather.vue';
 import HeaderPoem from '@/components/HeaderPoem.vue';
 import ServiceStoppedNotice from '@/components/ServiceStoppedNotice.vue';

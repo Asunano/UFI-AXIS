@@ -730,6 +730,44 @@ private data class RuleTriggerDef(
     val hint: String
 )
 
+/**
+ * 自动化规则模板（2026-10-05，与 web tasksShared.ruleTemplates 同一套默认值）。
+ * 新建规则时第一步可一键套用，把触发+动作预填进向导各步，用户只需微调阈值。
+ * 提交路径与手工创建完全一致（POST /api/rules），core 侧零改动。
+ */
+private data class RuleTemplate(
+    val label: String,
+    val desc: String,
+    val triggerType: String,
+    val triggerParams: Map<String, String>,
+    val actionType: String,
+    val params: Map<String, String>,
+    val enabledParam: Boolean? = null
+)
+
+private val RULE_TEMPLATES = listOf(
+    RuleTemplate(
+        label = "流量超限关数据", desc = "当月累计流量达 30GB 时自动关闭移动数据",
+        triggerType = "traffic_total_reached", triggerParams = mapOf("thresholdBytes" to (30L * 1024 * 1024 * 1024).toString()),
+        actionType = "data_toggle", params = emptyMap(), enabledParam = false
+    ),
+    RuleTemplate(
+        label = "低电量省电", desc = "电量低于 20%（未充电）时关数据、关指示灯",
+        triggerType = "battery_below", triggerParams = mapOf("levelPercent" to "20"),
+        actionType = "data_toggle", params = emptyMap(), enabledParam = false
+    ),
+    RuleTemplate(
+        label = "回落 4G 锁回 5G", desc = "网络从 5G 跳变到 4G 时自动把网络模式切回 5G/4G",
+        triggerType = "network_type_changed", triggerParams = mapOf("targetType" to "4G"),
+        actionType = "network_mode", params = mapOf("mode" to "LTE_AND_5G")
+    ),
+    RuleTemplate(
+        label = "断网自动重启", desc = "蜂窝网络断开并确认后自动重启设备（冷却 10 分钟）",
+        triggerType = "disconnect", triggerParams = emptyMap(),
+        actionType = "reboot", params = emptyMap()
+    )
+)
+
 private val RULE_TRIGGERS = listOf(
     RuleTriggerDef("traffic_total_reached", "流量达标", Icons.Default.DataUsage, "当月累计流量达到阈值"),
     RuleTriggerDef("network_type_changed", "网络跳变", Icons.Default.SwapHoriz, "网络类型变为目标（如 5G→4G）"),
@@ -903,6 +941,7 @@ fun RuleEditScreen(
 
 
     val triggerDef = RULE_TRIGGERS.firstOrNull { it.type == selectedTrigger }
+    val palette = LocalResolvedPalette.current
 
     /** 当前触发条件的参数是否可用；同时喂给 validate 与对应输入框的 isError。 */
     fun triggerError(): String? = when (selectedTrigger) {
@@ -988,6 +1027,47 @@ fun RuleEditScreen(
                                 onValueChange = { name = it },
                                 placeholder = "如：流量超 1GB 关数据"
                             )
+                            if (isNew) {
+                                // ── 规则模板（2026-10-05）：一键预填触发+动作，后续步骤微调即可 ──
+                                Spacer(Modifier.height(4.dp))
+                                Text("从模板开始", style = MaterialTheme.typography.labelMedium,
+                                    color = palette.textSecondary)
+                                RULE_TEMPLATES.forEach { tpl ->
+                                    Surface(
+                                        onClick = {
+                                            name = tpl.label
+                                            selectedTrigger = tpl.triggerType
+                                            when (tpl.triggerType) {
+                                                "traffic_total_reached" ->
+                                                    trafficGb = tpl.triggerParams["thresholdBytes"]
+                                                        ?.toLongOrNull()
+                                                        ?.let { String.format(Locale.US, "%.2f", it / (1024.0 * 1024 * 1024)) }
+                                                        ?: trafficGb
+                                                "signal_below" -> rsrp = tpl.triggerParams["rsrp"] ?: rsrp
+                                                "battery_below" -> batteryLevel = tpl.triggerParams["levelPercent"] ?: batteryLevel
+                                                "network_type_changed" -> targetType = tpl.triggerParams["targetType"] ?: targetType
+                                            }
+                                            selectedActionType = tpl.actionType
+                                            selectedCategory = ActionRegistry.getByType(tpl.actionType)?.category ?: selectedCategory
+                                            actionParams = buildMap {
+                                                tpl.params.forEach { (k, v) -> put(k, JsonPrimitive(v)) }
+                                                if (tpl.enabledParam != null) put("enabled", JsonPrimitive(tpl.enabledParam))
+                                            }
+                                            toast = ToastMessage("已套用模板「" + tpl.label + "」，可在后续步骤微调")
+                                        },
+                                        color = palette.cardBg,
+                                        shape = UfiCardDefaults.microShape,
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Column(Modifier.padding(12.dp)) {
+                                            Text(tpl.label, style = UfiTextStyles.bodyEmphasis)
+                                            Spacer(Modifier.height(2.dp))
+                                            Text(tpl.desc, style = MaterialTheme.typography.bodySmall,
+                                                color = palette.textSecondary)
+                                        }
+                                    }
+                                }
+                            }
                         }
                     },
                     UfiWizardStep(
