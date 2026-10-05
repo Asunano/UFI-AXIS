@@ -433,6 +433,7 @@ interface UfiAxisApi {
         @Body body: okhttp3.RequestBody
     ): MediaThumbUploadResponse
 
+
     // ========== Network ==========
     @GET("api/network/signal")
     suspend fun getSignalInfo(): SignalInfo

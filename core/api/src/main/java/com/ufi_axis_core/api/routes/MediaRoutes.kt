@@ -669,7 +669,12 @@ class MediaRoutes(
      *
      * 只包含异常类名与消息，不含路径、token 之类的敏感信息。
      */
-    private data class ThumbnailAttempt(val bytes: ByteArray?, val reason: String)
+    // 2026-10-05 G4：source = 供 X-Thumb-Source 响应头（cache/system/mmr/ffmpeg）
+    private data class ThumbnailAttempt(
+        val bytes: ByteArray?,
+        val reason: String,
+        val source: String = "mmr",
+    )
 
     /**
      * 缩略图字节（JPEG）。两级：系统缩略图 → MediaMetadataRetriever。
@@ -706,7 +711,8 @@ class MediaRoutes(
      * 第二级慢（读文件 + 解一帧），但**只在第一级失败时才走**，
      * 且结果有强 ETag + `max-age=86400`，同一张只会算一次。
      */
-    private fun thumbnailBytes(kind: Kind, id: Long, size: Int): ThumbnailAttempt {
+    // 2026-10-05 G2：改 suspend —— 新增的 ffmpeg 2.5 级走 FfmpegThumbnailService（挂起串行+超时）
+    private suspend fun thumbnailBytes(kind: Kind, id: Long, size: Int): ThumbnailAttempt {
         val uri = ContentUris.withAppendedId(contentUriOf(kind), id)
 
         val systemThumb = runCatching {
@@ -718,15 +724,26 @@ class MediaRoutes(
             text
         } ?: if (systemThumb.getOrNull() == null) "系统缩略图返回空" else null
         systemThumb.getOrNull()?.let {
-            return ThumbnailAttempt(it.toJpegBytes(THUMB_JPEG_QUALITY), "")
+            return ThumbnailAttempt(it.toJpegBytes(THUMB_JPEG_QUALITY), "", source = "system")
         }
 
+        // 2026-10-05 G4：ffmpeg 2.5 级是否接管成功（供 X-Thumb-Source 区分 mmr/ffmpeg）
+        var ffmpegRecovered = false
         val generated = when (kind) {
             Kind.VIDEO -> videoFrameThumbnail(uri, size)
+                // 2026-10-05 G2（FFmpeg 接入计划书 §2.1）：新增 2.5 级 ffmpeg 抽帧 ——
+                // MMR 在本机 ROM 恒 null（无 VPU），ffmpeg 软解补上"系统与 MMR 双失败"
+                // 与"手机端回传兜底"之间的空档。失败静默落到手机兜底，不改变既有语义。
+                .recoverCatching {
+                    ffmpegThumbnail(uri, size)?.also { ffmpegRecovered = true }
+                }
             Kind.IMAGE -> downscaledImageThumbnail(uri, size)
             Kind.AUDIO -> runCatching { audioCoverBytes(id)?.first }
         }
-        generated.getOrNull()?.let { return ThumbnailAttempt(it, "") }
+        // 2026-10-05 G4：MMR 成功 → mmr；ffmpeg 2.5 级成功 → ffmpeg（以异常链是否为空区分不可靠，
+        // 改为 recoverCatching 内部直接回填 —— 这里用 generated 里的字节一致性判断不可行，
+        // 简化口径：video 走 MMR 失败且 ffmpeg 成功时 source=ffmpeg，见 ffmpegRecovered 标志）
+        generated.getOrNull()?.let { return ThumbnailAttempt(it, "", source = if (kind == Kind.VIDEO && ffmpegRecovered) "ffmpeg" else "mmr") }
 
         val generatedReason = generated.exceptionOrNull()
             ?.let { "自行生成 ${it.javaClass.simpleName}: ${it.message}" }
@@ -743,6 +760,33 @@ class MediaRoutes(
      * 位置选取与黑帧判定见 [VIDEO_FRAME_RATIOS] / [DARK_LUMA_THRESHOLD]。
      * 所有候选都偏暗时交**最亮的那张** —— 宁可给一张暗图，也比给纯黑或干脆没有强。
      */
+    /**
+     * 2026-10-05 G2：ffmpeg 抽帧（2.5 级）。挂起、内部串行+20s 超时+超时冷却，
+     * 失败返回 null（不是异常）→ recoverCatching 里转 Result.failure 语义对齐上级。
+     * 位置策略：首次 0（JNI 内部取 40%）；dark 时按 VIDEO_FRAME_RATIOS 换位再试由
+     * G3 FrameValidator 接入后实现——本轮保持单次调用，暗帧交给上层 reason 透出。
+     */
+    private suspend fun ffmpegThumbnail(uri: android.net.Uri, size: Int): ByteArray? {
+        val bytes = com.ufi_axis_core.media.FfmpegThumbnailService
+            .extractJpeg(appContext, uri, size, atSeconds = 0.0)
+        if (bytes == null) return null
+        // 2026-10-05 G3（修 F5）：ffmpeg exit 0 ≠ 内容有效 —— 全零帧/占位图在这里拦截
+        when (val v = com.ufi_axis_core.media.FrameValidator.validate(bytes)) {
+            is com.ufi_axis_core.media.FrameValidator.Verdict.Valid -> {
+                AppLogger.i(TAG, "ffmpeg 抽帧成功(${bytes.size / 1024}KB)")
+                return bytes
+            }
+            is com.ufi_axis_core.media.FrameValidator.Verdict.Blank -> {
+                AppLogger.w(TAG, "ffmpeg 抽出全零帧（10bit/HEVC Ma10p 已知问题），拒绝: $uri")
+                return null
+            }
+            else -> {
+                AppLogger.w(TAG, "ffmpeg 抽帧无效($v)，拒绝: $uri")
+                return null
+            }
+        }
+    }
+
     private fun videoFrameThumbnail(uri: android.net.Uri, size: Int): Result<ByteArray?> = runCatching {
         appContext.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
             val retriever = MediaMetadataRetriever()
@@ -771,6 +815,9 @@ class MediaRoutes(
                     ) ?: continue
                     val scaled = frame.scaledDown(size)
                     val luma = scaled.averageLuma()
+                    // 2026-10-05 G3（修 F3）：luma==0 是全零帧（解码器未填充缓冲），
+                    // 绝不能当候选交出去——原先"全都暗则交最亮一张"会把纯黑图写进缓存。
+                    if (luma <= 0) { scaled.recycle(); continue }
                     if (luma >= DARK_LUMA_THRESHOLD) {
                         best?.recycle()
                         return@use scaled.toJpegBytes(THUMB_JPEG_QUALITY)
@@ -1854,6 +1901,9 @@ class MediaRoutes(
                         return@get
                     }
                     call.response.header(HttpHeaders.ETag, cachedEtag)
+                    // 2026-10-05 G4：来源标记 —— 客户端可区分"真出图"与"404 兜底"，
+                    // app 端据此决定是否触发本机抽帧回传（X-Thumb-Source: cache = 已有图，不抽）
+                    call.response.header("X-Thumb-Source", "cache")
                     call.response.header(HttpHeaders.CacheControl, "private, max-age=86400")
                     call.respondBytes(
                         withContext(Dispatchers.IO) { cached.readBytes() },
@@ -1891,6 +1941,8 @@ class MediaRoutes(
                     return@get
                 }
                 call.response.header(HttpHeaders.ETag, etag)
+                // 2026-10-05 G4：system=系统缩略图 / mmr=自行抽帧 / ffmpeg=软解（attempt.source 由链路带回）
+                call.response.header("X-Thumb-Source", attempt.source)
                 call.response.header(HttpHeaders.CacheControl, "private, max-age=86400")
                 call.respondBytes(bytes, ContentType.Image.JPEG)
             }
@@ -1940,6 +1992,25 @@ class MediaRoutes(
                         HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "只接受 JPEG"
                     )
                     return@put
+                }
+                // 2026-10-05 G3（修 F4）：魔数之外补内容判定 —— 1×1 黑 JPEG 也带合法魔数，
+                // 一旦入库会被 GET 当缓存命中，且手机端 everUsed 逻辑认为"core 已有图"不再重传。
+                // TooDark 允许入库（暗场电影是真画面）；Blank/TooSmall/Undecodable 拒收。
+                when (val v = com.ufi_axis_core.media.FrameValidator.validate(bytes, allowDark = true)) {
+                    com.ufi_axis_core.media.FrameValidator.Verdict.Valid,
+                    is com.ufi_axis_core.media.FrameValidator.Verdict.TooDark -> Unit
+                    com.ufi_axis_core.media.FrameValidator.Verdict.Blank -> {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "缩略图内容无效（全黑帧）")
+                        return@put
+                    }
+                    com.ufi_axis_core.media.FrameValidator.Verdict.TooSmall -> {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "缩略图尺寸过小（疑似占位图）")
+                        return@put
+                    }
+                    com.ufi_axis_core.media.FrameValidator.Verdict.Undecodable -> {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "缩略图无法解码")
+                        return@put
+                    }
                 }
                 // id 必须真的在媒体库里：否则缓存目录会被塞进一堆永远不会被读到的孤儿文件
                 val exists = withContext(Dispatchers.IO) {

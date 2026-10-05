@@ -39,6 +39,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import com.ufi_axis.util.DebugLog
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
@@ -1227,8 +1228,15 @@ class MediaModule(
      */
     suspend fun uploadThumbnail(type: String, id: Long, jpeg: ByteArray): Boolean = try {
         val body = jpeg.toRequestBody("image/jpeg".toMediaType())
-        api.putMediaThumbnail(type, id, body).success
+        val ok = api.putMediaThumbnail(type, id, body).success
+        // 2026-10-05 G4（修 F2）：此前失败静默 false，core 缓存长期缺图而 app 本地正常
+        // ——两端状态漂移无人知。失败现在至少留痕。成功时不必再 GET 回读：
+        // core 侧 rename 成功才回 success=true（tmp→target 原子落盘），受理即确认；
+        // 额外回读会让批量任务多 N 次请求，得不偿失。
+        if (!ok) DebugLog.w("MediaModule", "缩略图回传未受理(core 未落盘): $type/$id")
+        ok
     } catch (e: Exception) {
+        DebugLog.w("MediaModule", "缩略图回传异常: $type/$id ${e.javaClass.simpleName}: ${e.message}")
         false
     }
 }
