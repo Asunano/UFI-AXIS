@@ -223,11 +223,25 @@ object DeviceAuth {
             return false
         }
 
+        /**
+         * 严格按时间淘汰过期 nonce。
+         *
+         * 2026-10-05 修复：此前超限时执行 `seen.clear()`，会把**尚未过期**的 nonce 一起抹掉 ——
+         * 攻击者只要把缓存灌满（2 万个 nonce），就能让任意已用过的 nonce 重新被接受，
+         * 防重放形同虚设。现在只按 ttl 淘汰；淘汰后仍超限说明 ttl 窗口内的真实请求量
+         * 超过了容量，此时**保留**旧条目（宁可多占内存也绝不放开重放窗口），只打一条 WARN。
+         *
+         * ttl 是窗口（[MAX_TIMESTAMP_DRIFT_MS]）的 2 倍且 `accept` 只拒绝重复项，
+         * 残留的过期条目不影响正确性（同样的 nonce 再来时依旧拒绝）。
+         */
         private fun evict(nowMs: Long) {
             seen.entries.removeAll { nowMs - it.value > ttlMs }
             if (seen.size > maxEntries) {
-                AppLogger.w(TAG, "nonce 缓存超限（${seen.size}），整体清空")
-                seen.clear()
+                AppLogger.w(
+                    TAG,
+                    "nonce 缓存超限（${seen.size} > $maxEntries）且过期项已清空 —— " +
+                        "保留全部条目不放行重放；若持续出现请提高 maxEntries"
+                )
             }
         }
 

@@ -218,6 +218,7 @@ import InfoRow from '@/components/InfoRow.vue';
 import StepWizard, { type WizardStep } from '@/components/StepWizard.vue';
 import { useAppStore } from '@/stores/app';
 import { getApiClient, resetApiClient } from '@/composables/useApi';
+import { calibrateClockOffset } from '@/composables/deviceIdentity';
 import { evaluatePasswordStrength } from '@/composables/utils';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 
@@ -518,8 +519,12 @@ async function handleLogin() {
     // 服务端算出的指纹：配对界面据此高亮"本浏览器"，不再由前端自行推导
     appStore.setDeviceFingerprint(confirmRes.data?.fingerprint ?? '');
 
-    // 3. 连通性 + 鉴权校验
-    await api.get('/health');
+    // 3. 连通性 + 鉴权校验。
+    // /health 免鉴权且带 core 服务器时间 → 先校准签名时钟，再打需要签名的 uptime，
+    // 否则本机时钟漂移 >5min 时这一步必然 STALE_TIMESTAMP（而配对端点不验时间戳，
+    // 于是表现成"能配对、一用就失败"）。
+    const healthRes = await api.get('/health');
+    calibrateClockOffset(healthRes.data?.timestamp);
     await api.get('/api/system/uptime');
 
     router.push('/dashboard');
@@ -563,7 +568,17 @@ function handleConfirmError(e: any) {
 
 function handleNetworkError(e: any) {
   if (e.response?.status === 401) {
-    error.value = '凭据已失效，请重新登录';
+    // 2026-10-05 修复：core 的 401 语义是「这次请求本身有问题（时间戳/签名），凭据仍有效」，
+    // 只有 444 才是吊销（AuthMiddleware 三档设计）。旧文案把时钟漂移说成"凭据已失效"，
+    // 用户反复重登毫无用处 —— 按响应体的 code 给出真正可执行的指引。
+    const code = e.response?.data?.code;
+    if (code === 'STALE_TIMESTAMP') {
+      error.value = '设备时间校验失败：请检查本机时间是否准确（设置→自动确定时间），并与设备时间保持一致';
+    } else if (code === 'INVALID_SIGNATURE' || code === 'INVALID_DEVICE_KEY') {
+      error.value = '请求签名校验失败，请刷新页面重试；若持续出现请在设备管理中删除本浏览器后重新配对';
+    } else {
+      error.value = '登录校验失败，请重试';
+    }
   } else if (e.code === 'ECONNABORTED') {
     error.value = '连接超时，请检查设备地址是否正确';
   } else if (e.code === 'ERR_NETWORK') {

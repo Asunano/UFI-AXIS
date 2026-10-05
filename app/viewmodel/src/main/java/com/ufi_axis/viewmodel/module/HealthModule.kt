@@ -1,5 +1,6 @@
 package com.ufi_axis.viewmodel.module
 
+import com.ufi_axis.data.api.RetrofitClient
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.util.NetworkErrorClassifier
@@ -87,7 +88,15 @@ class HealthModule(
      */
     suspend fun checkHealthNow(countTowardDownFlip: Boolean = true): Boolean {
         return try {
-            api.getHealth()
+            val health = api.getHealth()
+            // 2026-10-05 校时：/health 免鉴权且带 core 服务器时间戳，每次成功探活都
+            // 回写一次时钟偏差（RetrofitClient 签名时用「本机+偏差」生成 X-Timestamp）。
+            // 手机与随身WiFi设备时钟漂移 >5min 是「能配对但全量 401」的根因——
+            // 配对端点不验时间戳所以能配上，业务 /api 全部 STALE_TIMESTAMP。
+            // RTT 会污染观测值（偏差被低估 RTT/2），但漂移动辄分钟级，毫秒级 RTT 无关紧要。
+            health.timestamp.toLongOrNull()?.let { serverNow ->
+                RetrofitClient.updateClockOffset(serverNow)
+            }
             if (countTowardDownFlip) clearFailStreak()
             _healthState.value = HealthState(
                 status = HealthStatus.HEALTHY,

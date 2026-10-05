@@ -51,6 +51,32 @@ object RetrofitClient {
     var onUnauthorized: (() -> Unit)? = null
 
     /**
+     * 本机时钟相对 core 服务器时钟的偏差毫秒数（core 时间 − 本机时间）。
+     *
+     * 2026-10-05：签名的时间戳改为「本机 + 偏差」，根治手机/设备时钟漂移导致的
+     * STALE_TIMESTAMP 401（配对端点不验时间戳，所以"能配对不能用"就是它的症状形态）。
+     * 偏差由 [updateClockOffset] 回写， HealthModule 每次 /health 成功后调用；
+     * 单调性保护：观测到的偏差与上次相差 <2s 时不动（毫秒级抖动不值得追），
+     * 真实偏差只会被刷新为更新的观测值。默认 0 = 不补偿，行为与旧版一致。
+     */
+    @Volatile
+    private var clockOffsetObservedMs: Long = 0L
+
+    /** AtomicReference 语义的简化：只做原子读改写，Volatile + synchronized 足够（写入频率极低）。 */
+    private val clockOffsetMs = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** 由 HealthModule 在 /health 成功后调用：serverNowMs = 响应里的服务器时间戳。 */
+    fun updateClockOffset(serverNowMs: Long) {
+        val observed = serverNowMs - System.currentTimeMillis()
+        synchronized(this) {
+            // 抖动阈值：RTT/2 + 调度延迟通常 <2s；微小偏差追了也没意义，还可能来回震荡
+            if (Math.abs(observed - clockOffsetObservedMs) < 2_000L) return
+            clockOffsetObservedMs = observed
+            clockOffsetMs.set(observed)
+        }
+    }
+
+    /**
      * 「传输层打不通」回调（2026-09-21）。
      *
      * 任何业务 `/api/` 请求在 OkHttp 层抛 [IOException]（连接被拒 / 超时 / DNS / SSL）时触发一次。
@@ -190,8 +216,16 @@ object RetrofitClient {
     private fun signRequest(original: Request, prefs: AppPreferences): Request {
         val builder = original.newBuilder()
             .header("Authorization", "Bearer ${prefs.token}")
-        signHeaders(original.method, original.url.encodedPath, original.url.encodedQuery)
-            ?.forEach { (name, value) -> builder.header(name, value) }
+        // 2026-10-05 修复：签名失败不再静默裸发。裸发必然吃 401 MissingSignature，
+        // 而 RETRYABLE_AUTH_CODES 重试两次还是 null 照样失败 —— 三连 401 只会推高
+        // AuthRejectionPolicy 的计数器，日志里却没有"为什么签不出来"的痕迹。
+        //
+        // 抛 IOException 而不是 IllegalStateException：OkHttp 拦截器里 IOException 是
+        // 受检的常规失败路径，调用方（retryIO / 各 Module）本来就按"这次请求失败"处理；
+        // 非受检异常会直接穿透到业务协程把页面打崩。诊断信息在 message 里。
+        val signed = signHeaders(original.method, original.url.encodedPath, original.url.encodedQuery)
+            ?: throw java.io.IOException("设备签名失败：Keystore 不可用（详见 DeviceKeyStore 日志）")
+        signed.forEach { (name, value) -> builder.header(name, value) }
         if (original.body?.contentType() == null && original.header("Content-Type") == null) {
             builder.header("Content-Type", "application/json")
         }
@@ -217,7 +251,10 @@ object RetrofitClient {
      */
     private fun signHeaders(method: String, encodedPath: String, encodedQuery: String?): Map<String, String>? {
         val uri = if (encodedQuery.isNullOrEmpty()) encodedPath else "$encodedPath?$encodedQuery"
-        val timestamp = System.currentTimeMillis().toString()
+        // 2026-10-05 校时补偿：签名时间戳用「本机时钟 + 与 core 的观测偏差」，
+        // 手机与设备时钟漂移 >5min 时不再必然 STALE_TIMESTAMP（401）。
+        // 偏差由 HealthModule 每次成功的 /health 探活回写（health 响应带 core 服务器时间）。
+        val timestamp = (System.currentTimeMillis() + clockOffsetMs.get()).toString()
         val nonce = DeviceKeyStore.newNonce()
         val signature = DeviceKeyStore.sign(
             DeviceKeyStore.canonicalString(method, uri, timestamp, nonce)

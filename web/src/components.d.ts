@@ -86,6 +86,7 @@ declare module 'vue' {
     StepWizard: typeof import('./components/StepWizard.vue')['default']
     ToggleRow: typeof import('./components/ToggleRow.vue')['default']
     ValueBadge: typeof import('./components/ValueBadge.vue')['default']
+    VerificationToast: typeof import('./components/VerificationToast.vue')['default']
     VideoPlayer: typeof import('./components/VideoPlayer.vue')['default']
   }
 }
