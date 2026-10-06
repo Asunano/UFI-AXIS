@@ -243,7 +243,25 @@ class HttpServer(
                 configureRouting()
             }.start(wait = false)
 
-            AppLogger.i(tag, "HTTP server started on :$port")
+            // 监听自检（2026-10-07）：start(wait=false) 返回只代表 Ktor 发起了 bind，
+            // Netty 在 event loop 内部的异步 bind 失败不会走到上面的 catch ——
+            // 症状就是「日志显示 HTTP server started，外部全部 connection refused」。
+            // 这里用回环真实连一次，3 秒内连不上按启动失败处理（返回 false 触发
+            // BackendService 的失败路径：stopSelf + 看门狗重拉 + 真实异常暴露）。
+            val selfCheckOk = runCatching {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress("127.0.0.1", port), 3_000)
+                    true
+                }
+            }.getOrDefault(false)
+            if (!selfCheckOk) {
+                AppLogger.e(tag, "HTTP server self-check failed: port $port not accepting after start — treating as start failure")
+                runCatching { server?.stop(0, 500) }
+                server = null
+                return false
+            }
+
+            AppLogger.i(tag, "HTTP server started on :$port (self-check ok)")
             true
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to start HTTP server: ${e.javaClass.name}: ${e.message}", e)
