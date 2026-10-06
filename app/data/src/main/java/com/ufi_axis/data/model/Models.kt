@@ -328,6 +328,20 @@ data class SuccessResponse(
     val success: Boolean
 )
 
+/** 套餐档案（2026-10-07，GET /api/device/plan；core 语义层，goform 无套餐概念） */
+@Serializable
+data class PlanProfileResponse(
+    val mode: String = "monthly",
+    val start_date: String = "",
+    val duration_days: Int = 0,
+    val notify_days: Int = 3,
+    val expiry_at: Long = 0,
+    val days_left: Long = 0,
+    val fixed_usage_bytes: Long = 0,
+    val requires_auto_clear_off: Boolean = false,
+    val success: Boolean = true
+)
+
 @Serializable
 data class EnabledResponse(
     val success: Boolean,

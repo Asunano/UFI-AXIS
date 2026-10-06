@@ -270,6 +270,10 @@ async function saveWifiEdit(payload: WifiSavePayload) {
 // ── 流量限额保存 ──
 // goform 限额单位靠乘数表达：1=MB、1024=GB、1048576=TB
 interface TrafficSavePayload {
+  // 套餐模式（2026-10-07）：档案写入由 TrafficLimitModal 内直接 POST /api/device/plan，
+  // 父组件只负责设备侧 data-limit；planMode/plan 仅透传不使用
+  planMode?: 'monthly' | 'fixed';
+  plan?: { start_date: string; duration_days: number; notify_days: number } | null;
   enabled: boolean;
   limit_size: number;
   limit_unit: string;

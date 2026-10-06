@@ -470,6 +470,11 @@ export const Endpoints = {
     tcp: '/api/diagnostic/tcp',
     traceroute: '/api/diagnostic/traceroute',
   },
+  /** 套餐档案（2026-10-07 到量/到期融合）：core 侧语义层，goform 无套餐概念 */
+  plan: {
+    read: '/api/device/plan',
+    write: '/api/device/plan',
+  },
   diagnose: '/api/diagnose',
   wsRealtime: '/ws/realtime',
   /**
@@ -955,6 +960,7 @@ export const AlertType = [
   'signal',
   'connectivity',
   'traffic_limit',
+  'plan_expiry',
   'device_online',
   'device_offline',
 ] as const;

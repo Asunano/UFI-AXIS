@@ -217,6 +217,24 @@ class DataScheduler(
     /** 设备事件 per-MAC 同向冷却器（2026-10-07 审计修复）。 */
     private val deviceEventCooldown = DeviceEventCooldown()
 
+    // ── SmartLoop（2026-10-07 智能循环第一批迁移：月流量统计 + 电池温度）──
+    // 节拍 = base × 流量档 × 负载 × 前端在线。阈值可经 smart_loop_* 键调，smart_loop_enabled=false 一键回退固定值。
+    private fun makeSmartLoop(name: String, baseMs: Long) = com.ufi_axis_core.util.SmartLoop(
+        name = name,
+        baseMs = baseMs,
+        trafficSource = { _latestTraffic.value?.let { it.rxSpeed to it.txSpeed } },
+        loadSource = {
+            val goformLoad = 1.0 - (com.ufi_axis_core.util.GoformQoS.queryAvailablePermits.toDouble() /
+                com.ufi_axis_core.util.GoformQoS.queryTotalPermits.coerceAtLeast(1))
+            goformLoad.coerceIn(0.0, 0.5)
+        },
+        frontConnected = { webSocketManager.getConnectionCount() > 0 },
+        tuningProvider = { settings?.let { com.ufi_axis_core.util.SmartLoopTuning.read(it) }
+            ?: com.ufi_axis_core.util.SmartLoopTuning.defaults() },
+    )
+    private val goformTrafficLoop by lazy { makeSmartLoop("goform-traffic", 15_000L) }
+    private val batteryLoop by lazy { makeSmartLoop("battery", 30_000L) }
+
     /** 采集循环是否正在运行（供 `/api/service/status` 回读，此前外部无法得知）。 */
     val collecting: Boolean get() = isRunning
 
@@ -600,11 +618,12 @@ class DataScheduler(
             }
         }
 
-        // ── 【冷数据】月流量统计: 15s 固定间隔
+        // ── 【冷数据】月流量统计: SmartLoop（2026-10-07 迁移）——大流量时快于 15s 降图表
+        // 阶梯化，零流量时慢至 ~22.5s 省电；上限 90s 保底新鲜度。
         schedulerScope.launch {
             while (isActive) {
                 collectGoformTraffic()
-                delay(15_000L)
+                goformTrafficLoop.delaySuspend()
             }
         }
 
@@ -625,11 +644,12 @@ class DataScheduler(
             }
         }
 
-        // ── 【冷数据】电池/温度: 30s
+        // ── 【冷数据】电池/温度: SmartLoop（2026-10-07 迁移）——本地读不占 goform，
+        // 但没必要在深夜零流量时空转 30s；大流量时略提频让温度告警更跟手。
         schedulerScope.launch {
             while (isActive) {
                 collectBattery()
-                delay(30_000L)
+                batteryLoop.delaySuspend()
             }
         }
 
@@ -640,6 +660,23 @@ class DataScheduler(
             while (isActive) {
                 checkDeviceEvents()
                 delay(deviceEventCheckIntervalMs)
+            }
+        }
+
+        // ── 套餐到期检查（2026-10-07，fixed 模式专用）────────────────────────
+        // 日历事件，固定 1h 足够（去重由 PlanProfileManager.dueNotification 的
+        // 「每天一条 + 级别跃迁当天重发」语义兜住，AlertEngine 侧 plan_expiry
+        // 类型开关默认关，用户在通知设置里开启后才发）。monthly 模式下
+        // expiryState()=null，循环体直接空转，不产生任何请求。
+        schedulerScope.launch {
+            val sm = settings ?: return@launch
+            val planManager = com.ufi_axis_core.util.plan.PlanProfileManager(sm)
+            while (isActive) {
+                runCatching {
+                    val due = planManager.dueNotification()
+                    if (due != null) alertEngine?.checkPlanExpiry(due.first, due.second)
+                }.onFailure { AppLogger.w(tag, "plan expiry check failed: ${it.message}") }
+                delay(PLAN_EXPIRY_CHECK_INTERVAL_MS)
             }
         }
 
@@ -2159,6 +2196,9 @@ class DataScheduler(
         get() = (settings?.monitorTrafficLimitCheckSec ?: 300) * 1000L
     private val deviceEventCheckIntervalMs: Long
         get() = (settings?.monitorDeviceEventCheckSec ?: 60) * 1000L
+
+    /** 套餐到期检查间隔：1h（日历事件，分钟级精度无意义） */
+    private val PLAN_EXPIRY_CHECK_INTERVAL_MS: Long get() = 3_600_000L
 
     /**
      * 设备事件冷却器（键 = 方向+MAC）：断连风暴（AP 重启、省电抖动）下同向事件

@@ -325,6 +325,10 @@ const ALERT_TYPE_META: Record<AlertTypeKey, Omit<AlertTypeSwitch, 'type'>> = {
     hint: '按套餐用量百分比提醒（阈值取设备侧设置，默认 80%）；与按绝对 MB 的「流量告警」是两类',
     gate: 'traffic_80_enabled',
   },
+  plan_expiry: {
+    label: '套餐到期',
+    hint: '固定有效期套餐的到期提醒（在流量限额设置里配置）',
+  },
   device_online: {
     label: '设备接入提醒',
     hint: '有 WiFi 客户端接入时提醒（core 每 60 秒比对客户端列表）',

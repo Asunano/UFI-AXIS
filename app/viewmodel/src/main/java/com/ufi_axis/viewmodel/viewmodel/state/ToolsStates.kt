@@ -510,6 +510,8 @@ data class DiagnoseState(
 // ========== Traffic Management ==========
 data class TrafficManagementState(
     val limitConfig: TrafficLimitConfig? = null,
+    /** 套餐档案（2026-10-07，GET /api/device/plan）；null = 未拉取 */
+    val planProfile: com.ufi_axis.data.model.PlanProfileResponse? = null,
     val isLoading: Boolean = false,
     val isSaving: Boolean = false,
     val errorMessage: String? = null,

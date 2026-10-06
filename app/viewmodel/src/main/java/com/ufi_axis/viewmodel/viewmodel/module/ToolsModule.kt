@@ -3598,6 +3598,38 @@ class ToolsModule(
     }
 
     /**
+     * 保存套餐档案（2026-10-07，POST /api/device/plan）。
+     *
+     * monthly 模式：只切模式，fixed 专属键由 core 自清。
+     * fixed 模式：生效日（yyyy-MM-dd）+ 天数 + 到期提醒天数；保存后调用方应把设备侧
+     * auto_clear 关掉（core 返回的 requires_auto_clear_off 只是提示，真正写设备走 saveDataLimit）。
+     */
+    fun savePlanProfile(mode: String, startDate: String?, durationDays: Int?, notifyDays: Int?) {
+        scope.launch {
+            _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = true, errorMessage = null, successMessage = null)
+            try {
+                val body = mutableMapOf<String, Any>("mode" to mode)
+                startDate?.let { body["start_date"] = it }
+                durationDays?.let { body["duration_days"] = it }
+                notifyDays?.let { body["notify_days"] = it }
+                val resp = api.savePlanProfile(body)
+                _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = false,
+                    successMessage = if (resp.success) "套餐已保存" else null,
+                    errorMessage = if (!resp.success) "保存失败" else null)
+            } catch (e: Exception) { _trafficManagementState.value = _trafficManagementState.value.copy(isSaving = false, errorMessage = "保存失败: ${e.message}") }
+        }
+    }
+
+    /** 拉套餐档案（2026-10-07）：失败静默（monthly 是缺省语义，拉不到就当没配） */
+    fun loadPlanProfile() {
+        scope.launch {
+            runCatching { api.getPlanProfile() }.onSuccess { plan ->
+                _trafficManagementState.value = _trafficManagementState.value.copy(planProfile = plan)
+            }
+        }
+    }
+
+    /**
      * 流量校准。core 契约入参为 target（校准对象，如 "data"）+ value（校准值），
      * 旧入参 way/data/time core 仍兼容但已打 WARN，下一版会删。
      */

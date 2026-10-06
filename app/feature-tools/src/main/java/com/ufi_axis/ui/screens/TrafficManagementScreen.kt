@@ -83,9 +83,26 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
 
     // 弹窗控制
     var showLimitDialog by remember { mutableStateOf(false) }
+    // 套餐模式弹窗（2026-10-07 到量/到期融合）
+    var showPlanDialog by remember { mutableStateOf(false) }
+    var planMode by remember { mutableStateOf("monthly") }
+    var planStart by remember { mutableStateOf("") }
+    var planDays by remember { mutableStateOf("90") }
+    var planNotify by remember { mutableStateOf("3") }
     var showCalibrateDialog by remember { mutableStateOf(false) }
     /** 流量历史弹窗（2026-09-15 由独立页改成弹窗，入口是下面那行「流量历史」） */
     var showTrafficHistory by remember { mutableStateOf(false) }
+
+    // 首次进入拉套餐档案（一次性设置，回填模式/生效日/天数）
+    LaunchedEffect(state.planProfile) {
+        state.planProfile?.let { plan ->
+            planMode = if (plan.mode == "fixed") "fixed" else "monthly"
+            if (planStart.isBlank()) planStart = plan.start_date
+            planDays = plan.duration_days.takeIf { it > 0 }?.toString() ?: "90"
+            planNotify = plan.notify_days.toString()
+        }
+    }
+    LaunchedEffect(Unit) { viewModel.tools.loadPlanProfile() }
 
     LaunchedEffect(state.successMessage) {
         if (state.successMessage != null) {
@@ -323,6 +340,15 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
 
+                    // 套餐模式（2026-10-07）：monthly=循环月包；fixed=累计有效期包（到期提醒）
+                    UfiSettingsValue(
+                        title = "套餐模式",
+                        value = if (planMode == "fixed") "固定有效期" else "每月循环",
+                        onClick = { showPlanDialog = true }
+                    )
+
+                    UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
+
                     // 流量历史是**弹窗**而不是独立页（2026-09-15 改）：内容只有
                     // 「分段控件 + 一张图 + 一行合计」，撑不起一整页；弹窗看完直接回到限额设置。
                     UfiSettingsValue(
@@ -405,6 +431,82 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
             showLimitDialog = false
         }
     )
+
+    // ── 套餐模式弹窗（2026-10-07 到量/到期融合）────────────────────────
+    // monthly=现状（总量+清零日走设备）；fixed=累计有效期包（生效日+天数走 core，
+    // 保存时强制 autoClear=false 并立即 saveDataLimit 固化——固件月清会打断累计口径）。
+    if (showPlanDialog) {
+        UfiCustomDialog(
+            visible = true,
+            onDismiss = { showPlanDialog = false },
+            title = "套餐模式",
+            icon = rememberVectorPainter(Icons.Filled.Event),
+            showCloseButton = false,
+            confirmButton = {
+                val close = LocalUfiDialogClose.current
+                UfiButton(
+                    text = "保存",
+                    onClick = {
+                        close {
+                            val days = planDays.toIntOrNull() ?: 90
+                            val notify = planNotify.toIntOrNull() ?: 3
+                            viewModel.tools.savePlanProfile(
+                                mode = planMode,
+                                startDate = if (planMode == "fixed") planStart.trim().takeIf { it.isNotBlank() } else null,
+                                durationDays = if (planMode == "fixed") days else null,
+                                notifyDays = notify
+                            )
+                            if (planMode == "fixed" && autoClear) {
+                                // fixed 累计口径必须关固件月清
+                                autoClear = false
+                                viewModel.tools.saveDataLimit(
+                                    enabled = enabled, limitValue = limitSize, limitUnit = limitUnit,
+                                    alertPercent = alertPercent, autoClear = false, clearDate = clearDate
+                                )
+                            }
+                            showPlanDialog = false
+                        }
+                    }
+                )
+            },
+            dismissButton = {
+                val close = LocalUfiDialogClose.current
+                UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { showPlanDialog = false } })
+            }
+        ) {
+            UfiDialogBody {
+                Text("套餐类型", style = MaterialTheme.typography.labelSmall)
+                UfiSingleChipSelector(
+                    options = listOf("monthly" to "每月循环", "fixed" to "固定有效期"),
+                    selectedValue = planMode,
+                    onSelect = { planMode = it }
+                )
+                Spacer(Modifier.height(8.dp))
+                if (planMode == "fixed") {
+                    Text("生效日期（yyyy-MM-dd）", style = MaterialTheme.typography.labelSmall)
+                    UfiTextField(
+                        value = planStart, onValueChange = { planStart = it },
+                        label = "生效日期", placeholder = "2026-10-06"
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text("有效期（天）", style = MaterialTheme.typography.labelSmall)
+                    UfiSingleChipSelector(
+                        options = listOf("30" to "30 天", "90" to "90 天", "180" to "180 天", "365" to "365 天"),
+                        selectedValue = planDays,
+                        onSelect = { planDays = it }
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text("到期前提醒（天）", style = MaterialTheme.typography.labelSmall)
+                    UfiTextField(value = planNotify, onValueChange = { planNotify = it }, label = "到期前提醒")
+                    Text(
+                        "固定有效期套餐按生效日起累计用量，保存会自动关闭「每月自动清除」。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
 
     if (showCalibrateDialog) {
         UfiCustomDialog(

@@ -254,9 +254,12 @@ object Alerts {
         const val DEVICE_ONLINE = "device_online"
         const val DEVICE_OFFLINE = "device_offline"
 
+        /** 套餐到期（2026-10-07）：fixed 模式（累计有效期包）的日历到期提醒 */
+        const val PLAN_EXPIRY = "plan_expiry"
+
         val ALL: List<String> = listOf(
             TEMPERATURE, BATTERY, TRAFFIC, SIGNAL, CONNECTIVITY,
-            TRAFFIC_LIMIT, DEVICE_ONLINE, DEVICE_OFFLINE
+            TRAFFIC_LIMIT, DEVICE_ONLINE, DEVICE_OFFLINE, PLAN_EXPIRY
         )
     }
 

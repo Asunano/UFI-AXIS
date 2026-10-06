@@ -704,6 +704,13 @@ interface UfiAxisApi {
     @POST("api/device/data-limit")
     suspend fun setDataLimit(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
+    // 套餐档案（2026-10-07 到量/到期融合）：core 语义层，goform 无套餐概念
+    @GET("api/device/plan")
+    suspend fun getPlanProfile(): PlanProfileResponse
+
+    @POST("api/device/plan")
+    suspend fun savePlanProfile(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
+
     @POST("api/device/flow-calibration")
     suspend fun calibrateFlow(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 

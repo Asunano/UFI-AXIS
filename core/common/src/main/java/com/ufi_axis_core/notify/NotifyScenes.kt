@@ -93,11 +93,18 @@ object NotifyScenes {
      */
     const val TRAFFIC_REPORT = "trafficReport"
 
+    /**
+     * 套餐到期（2026-10-07）：fixed 模式（累计有效期包）到期前提醒 / 当天 / 过期。
+     * app 侧 NotifyScene 镜像需同步补 PLAN_EXPIRY（枚举值 planExpiry）。
+     */
+    const val PLAN_EXPIRY = "planExpiry"
+
     /** core 侧会产出的全部场景 id。新增常量必须同时登记到这里。 */
     val ALL: Set<String> = setOf(
         SMS, VERIFICATION, ALERT, CONNECTIVITY, TRAFFIC_80, DOWNLOAD, TUNNEL, EVENTS, BATTERY, TEST,
         SPEEDTEST_RESULT,
-        TRAFFIC_REPORT
+        TRAFFIC_REPORT,
+        PLAN_EXPIRY
     )
 }
 

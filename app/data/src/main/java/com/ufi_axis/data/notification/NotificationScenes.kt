@@ -133,6 +133,15 @@ enum class NotifyScene(
         rateLimitMinutes = 0
     ),
 
+    /** 套餐到期（fixed 模式有效期提醒，2026-10-07；依附事件 channel） */
+    PLAN_EXPIRY(
+        sceneId = "planExpiry",
+        channelId = NotificationCenter.CHANNEL_EVENTS,
+        defaultEnabled = false,
+        importance = NotificationManager.IMPORTANCE_DEFAULT,
+        rateLimitMinutes = 0
+    ),
+
     /** 设备事件（WiFi 客户端上下线，默认关闭） */
     DEVICE_EVENTS(
         sceneId = "events",

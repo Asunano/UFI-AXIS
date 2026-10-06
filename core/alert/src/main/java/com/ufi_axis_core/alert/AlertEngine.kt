@@ -247,6 +247,7 @@ class AlertEngine(
         // 套餐限额百分比预警自成一个场景（≠ 绝对 MB 阈值告警）
         "traffic_limit" -> NotifyScenes.TRAFFIC_80
         "device_online", "device_offline" -> NotifyScenes.EVENTS
+        "plan_expiry" -> NotifyScenes.PLAN_EXPIRY
         else -> NotifyScenes.ALERT
     }
 
@@ -580,6 +581,23 @@ class AlertEngine(
             "warning" to "流量已用 $shown%（$detail）",
             "critical" to "流量已达套餐限额（$detail）"
         ), "$shown%", "$warnPercent%")
+    }
+
+    /**
+     * 套餐到期检查（2026-10-07，fixed 模式专用；monthly 模式内部自动绝迹）。
+     *
+     * 与 checkTrafficLimit 不同：这是**日历事件**不是连续量，无回差概念；
+     * 「每天最多一条 + 级别跃迁当天重发」的去重已在 [PlanProfileManager.dueNotification]
+     * 内做掉（返回 null = 今天已发过/不在窗口），这里只转发。
+     *
+     * @param level  warning/critical/info（dueNotification 的第一返回值）
+     * @param body   人话正文（第二返回值）
+     */
+    suspend fun checkPlanExpiry(level: String, body: String) {
+        val cfg = _config.value
+        if (!typeEnabled(cfg, "plan_expiry")) return
+        // 第 4/5 参是 value/threshold 展示位：日历事件没有采集值，用剩余天数/提醒窗口
+        triggerAlert("plan_expiry", level, body, body, "")
     }
 
     /**

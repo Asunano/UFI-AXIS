@@ -36,6 +36,7 @@ const SCENE_LABELS: Record<string, string> = {
   speedtestResult: '测速结果',
   // 流量报告（2026-10-06）：日报/周报/月报，由 traffic_report 定时动作 emit。
   trafficReport: '流量报告',
+  planExpiry: '套餐到期',
   // 不在下面两个清单里：`test` 是「发送测试」那颗按钮用的场景，带 manual 跳过场景判定，
   // 勾不勾都发，所以没有对应的勾选框。但它会出现在投递记录里，缺了这一条就显示成裸的 `test`。
   test: '手动测试',
@@ -55,6 +56,7 @@ const MAIL_SCENE_IDS: readonly string[] = [
   'alert',
   'speedtestResult',
   'trafficReport',
+  'planExpiry',
   'connectivity',
   'verification',
   'traffic80',
@@ -71,6 +73,7 @@ const PUSH_CHANNEL_SCENE_IDS: readonly string[] = [
   'alert',
   'speedtestResult',
   'trafficReport',
+  'planExpiry',
   'connectivity',
   'traffic80',
   'download',
