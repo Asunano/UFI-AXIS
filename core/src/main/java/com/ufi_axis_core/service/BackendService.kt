@@ -924,7 +924,16 @@ class BackendService : Service() {
 
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to initialize components", e)
-            updateNotification("UFI-AXIS-Core 启动失败: ${e.message}")
+            // 2026-10-07：通知栏只带 e.message 时（如 ART 的 "Null reference used for
+            // synchronization"）信息量不足，用户又常拿不到日志。把最深的 3 个应用栈帧
+            // 拼进通知，无需日志也能定位到类。
+            val frames = e.stackTrace
+                .take(6)
+                .filter { it.className.startsWith("com.ufi_axis") }
+                .take(3)
+                .joinToString(" ← ") { "${it.className.substringAfterLast('.').substringBefore("Kt")}.${it.methodName}:${it.lineNumber}" }
+            val detail = if (frames.isNotBlank()) "${e.message} @ $frames" else e.message
+            updateNotification("UFI-AXIS-Core 启动失败: $detail")
 
             // 防止 START_STICKY 无限重启循环：连续失败 3 次后主动停止
             val retries = crashRetryCount.incrementAndGet()
