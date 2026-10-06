@@ -102,8 +102,19 @@ class TtydRoutes(
             get("/status") {
                 call.respond(toJsonElement(mapOf(
                     "enabled" to settings.ttydEnabled,
+                    // running=true = ttyd 正在设备后台常驻（退出页面不杀，直到 core 停止或手动停）
                     "running" to manager.isRunning,
                 )))
+            }
+
+            // 手动停掉后台常驻的 ttyd（开关保持开着，只是杀进程；下次连接会再 spawn）
+            post("/stop") {
+                if (!settings.ttydEnabled) {
+                    call.respond(HttpStatusCode.Forbidden, "真 PTY 未开启")
+                    return@post
+                }
+                manager.stop()
+                call.respond(toJsonElement(mapOf("stopped" to true)))
             }
         }
     }

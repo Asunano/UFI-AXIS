@@ -607,11 +607,12 @@ object ComponentFactory {
         )
         // 真 PTY 终端（ttyd 反代，2026-10-06）：开关默认关，关着时不会 spawn 任何进程。
         // 二进制路径用 AssetExtractor 的释放位（filesDir/shell/ttyd），与 aria2c/socat 同源。
+        val ttydManager = com.ufi_axis_core.api.terminal.TtydManager(
+            binaryPath = com.ufi_axis_core.util.AssetExtractor.getPath(context, "ttyd")
+        )
         val ttydRoutes = com.ufi_axis_core.api.routes.TtydRoutes(
             settings = settings,
-            manager = com.ufi_axis_core.api.terminal.TtydManager(
-                binaryPath = com.ufi_axis_core.util.AssetExtractor.getPath(context, "ttyd")
-            ),
+            manager = ttydManager,
             // 与 wsManager 同一鉴权源：/ws/terminal 反代握手必须过 query 验签
             wsAuthenticator = { token, ts, nonce, sig, path ->
                 val result = deviceVerifier.verify(
@@ -900,7 +901,8 @@ object ComponentFactory {
                 alertEngine = alert,
                 dataScheduler = scheduler,
                 dynamicThreadPool = dynamicThreadPool,
-                webResourceManager = webResourceManager
+                webResourceManager = webResourceManager,
+                ttydManager = ttydManager
             )
         )
     }
@@ -1163,7 +1165,8 @@ object ComponentFactory {
         alertEngine: AlertEngine,
         dataScheduler: DataScheduler,
         dynamicThreadPool: DynamicThreadPool,
-        webResourceManager: com.ufi_axis_core.util.WebResourceManager
+        webResourceManager: com.ufi_axis_core.util.WebResourceManager,
+        ttydManager: com.ufi_axis_core.api.terminal.TtydManager
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -1175,7 +1178,8 @@ object ComponentFactory {
             alertEngine = alertEngine,
             dataScheduler = dataScheduler,
             dynamicThreadPool = dynamicThreadPool,
-            webResourceManager = webResourceManager
+            webResourceManager = webResourceManager,
+            ttydManager = ttydManager
         )
     }
 }

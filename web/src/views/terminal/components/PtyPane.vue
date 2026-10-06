@@ -10,6 +10,11 @@
       <n-button size="small" @click="connect">重试</n-button>
     </div>
     <div v-show="connected" ref="termRef" class="pty-term"></div>
+    <div v-if="enabled" class="pty-status">
+      <span class="pty-status-dot" :class="{ on: running }" />
+      <span class="pty-status-text">{{ running ? 'ttyd 正在设备后台常驻（退出页面不会停止）' : 'ttyd 未在运行，连接时自动启动' }}</span>
+      <n-button v-if="running" size="tiny" quaternary type="warning" @click="stopDaemon">停止后台 ttyd</n-button>
+    </div>
   </div>
 </template>
 
@@ -41,6 +46,7 @@ const wrapRef = ref<HTMLDivElement>();
 const termRef = ref<HTMLDivElement>();
 const enabled = ref(false);
 const connected = ref(false);
+const running = ref(false);
 const errorText = ref('');
 
 let term: Terminal | null = null;
@@ -58,8 +64,18 @@ async function checkEnabled() {
   try {
     const { data } = await api.get('/api/terminal/status');
     enabled.value = Boolean(data?.enabled);
+    running.value = Boolean(data?.running);
   } catch {
     enabled.value = false;
+  }
+}
+
+/** 手动停掉设备后台常驻的 ttyd（开关不动，下次连接自动再起）。 */
+async function stopDaemon() {
+  try {
+    await api.post('/api/terminal/stop');
+  } finally {
+    running.value = false;
   }
 }
 
@@ -107,6 +123,7 @@ async function connect() {
   ws = new WebSocket(`${proto}://${location.host}${path}?${authQs}&ticket=${encodeURIComponent(ticket)}`);
   ws.onopen = () => {
     connected.value = true;
+    running.value = true; // WS 通了 = ttyd 已在设备后台常驻
     reauthOnce = false;
     // ttyd 握手：["0", {}] 请求初始输出（auth token 留空 —— 鉴权在反代层已完成）
     writeFrame(['0', '{}', '']);
@@ -238,5 +255,27 @@ watch(connected, (v) => {
 }
 .pty-tip-err {
   color: #e05555;
+}
+
+.pty-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  opacity: 0.75;
+}
+.pty-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cat-neutral-fg, #888);
+  flex: none;
+}
+.pty-status-dot.on {
+  background: #18a058;
+}
+.pty-status-text {
+  flex: 1;
 }
 </style>

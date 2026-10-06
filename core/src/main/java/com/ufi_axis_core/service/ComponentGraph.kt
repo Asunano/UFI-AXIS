@@ -132,5 +132,7 @@ data class ServerGraph(
     val alertEngine: AlertEngine,
     val dataScheduler: DataScheduler,
     val dynamicThreadPool: DynamicThreadPool,
-    val webResourceManager: WebResourceManager
+    val webResourceManager: WebResourceManager,
+    /** 真 PTY 的 ttyd 进程管理（2026-10-06）：停机必须显式杀，否则孤儿进程常驻。 */
+    val ttydManager: com.ufi_axis_core.api.terminal.TtydManager
 )
