@@ -1072,13 +1072,38 @@ class DataScheduler(
                 return
             }
             val alertPercent = (limit["alert_percent"]?.jsonPrimitive?.longOrNull ?: 80L).toInt()
-            engine?.checkTrafficLimit(usedBytes, limitBytes, alertPercent)
-            guard?.invoke(usedBytes, limitBytes, alertPercent)
+            // 套餐口径分流（2026-10-07 偏差1补齐）：fixed（累计有效期包）的用量不能拿固件
+            // 月计数器——固件按 clear_date 月清会打断「100G×3个月」的累计口径。改用
+            // traffic_hourly 在 [生效日, now) 的累加（与 GET /api/device/plan 的
+            // fixed_usage_bytes 同源）。monthly 模式仍走固件计数器（真源）。
+            val effectiveUsed = planUsageOverride() ?: usedBytes
+            if (effectiveUsed != usedBytes) {
+                AppLogger.i(tag, "traffic limit using fixed-plan accumulated usage ($effectiveUsed) instead of device monthly counter ($usedBytes)")
+            }
+            engine?.checkTrafficLimit(effectiveUsed, limitBytes, alertPercent)
+            guard?.invoke(effectiveUsed, limitBytes, alertPercent)
         } catch (e: TimeoutCancellationException) {
             AppLogger.w(tag, "checkTrafficLimit timed out (8s)")
         } catch (e: Exception) {
             AppLogger.w(tag, "checkTrafficLimit failed: ${e.message}")
         }
+    }
+
+    /**
+     * fixed（累计有效期包）模式的用量覆盖：返回 null = monthly/未配 → 用调用方原值。
+     * 累计 = traffic_hourly 在 [生效日 00:00, now) 的 rx+tx 求和，与 PlanRoutes 的
+     * fixed_usage_bytes 同口径（PlanProfileManager.fixedUsageWindow 单源日期运算）。
+     * 查询失败静默回退固件计数器（预警可用性优先于口径严格）。
+     */
+    private suspend fun planUsageOverride(): Long? {
+        val plan = com.ufi_axis_core.util.plan.PlanProfileManager(
+            { settings?.getRawString(it) }, { k, v -> settings?.setRawString(k, v) }
+        )
+        val window = plan.fixedUsageWindow() ?: return null
+        return runCatching {
+            database.trafficHourlyDao().listBetween(window.first, window.second)
+                .sumOf { it.rxBytes + it.txBytes }
+        }.getOrNull()
     }
 
     /**
