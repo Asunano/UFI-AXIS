@@ -22,6 +22,14 @@ export interface MonitorPrefs {
   fillAlpha: number;
   /** app 专有项：web 不展示，但要保留在本地副本里，避免字段级 PUT 之外的整体回传把它覆盖 */
   exportZip: boolean;
+  /**
+   * 告警扫描 / 套餐限额检查 / 设备事件比对间隔（2026-10-07 审计修复：core+app 早有，
+   * web 无 UI 属半成品缺口）。web 端只展示后两项（告警扫描偏专业，维持 app 专有展示）；
+   * 回传副本保留全部三项防字段级 PUT 之外的整体覆盖。
+   */
+  alertScanSec: number;
+  trafficLimitCheckSec: number;
+  deviceEventCheckSec: number;
 }
 
 /** GET /api/monitor/storage 的响应形状 */
@@ -51,6 +59,9 @@ export const DEFAULT_PREFS: MonitorPrefs = {
   fixedYAxis: false,
   fillAlpha: 1,
   exportZip: false,
+  alertScanSec: 15,
+  trafficLimitCheckSec: 300,
+  deviceEventCheckSec: 60,
 };
 
 export const TIME_RANGES = [

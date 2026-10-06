@@ -91,6 +91,42 @@
         </span>
       </div>
 
+      <!-- 告警/事件检查间隔（2026-10-07 审计修复：core+app 早有，web 补 UI 对齐双端口径） -->
+      <div class="settings-row">
+        <span class="settings-label">套餐限额检查</span>
+        <n-select
+          :value="prefs.trafficLimitCheckSec"
+          size="tiny"
+          style="width: 100px"
+          :options="[
+            { label: '1 分钟', value: 60 },
+            { label: '5 分钟', value: 300 },
+            { label: '15 分钟', value: 900 },
+            { label: '30 分钟', value: 1800 },
+            { label: '1 小时', value: 3600 },
+          ]"
+          @update:value="(v: number) => emit('save', { trafficLimitCheckSec: v })"
+        />
+        <span class="settings-hint">用量百分比预警的检查频率</span>
+      </div>
+      <div class="settings-row">
+        <span class="settings-label">设备事件检查</span>
+        <n-select
+          :value="prefs.deviceEventCheckSec"
+          size="tiny"
+          style="width: 100px"
+          :options="[
+            { label: '15 秒', value: 15 },
+            { label: '30 秒', value: 30 },
+            { label: '1 分钟', value: 60 },
+            { label: '5 分钟', value: 300 },
+            { label: '10 分钟', value: 600 },
+          ]"
+          @update:value="(v: number) => emit('save', { deviceEventCheckSec: v })"
+        />
+        <span class="settings-hint">接入/离开提醒的比对频率</span>
+      </div>
+
       <div class="settings-row">
         <span class="settings-label">Y 轴固定</span>
         <n-switch

@@ -214,6 +214,9 @@ class DataScheduler(
     /** 上一轮已连接客户端：mac -> 展示名。null = 还没有基线（首轮 / 上一轮查询失败）。 */
     @Volatile private var knownStations: Map<String, String>? = null
 
+    /** 设备事件 per-MAC 同向冷却器（2026-10-07 审计修复）。 */
+    private val deviceEventCooldown = DeviceEventCooldown()
+
     /** 采集循环是否正在运行（供 `/api/service/status` 回读，此前外部无法得知）。 */
     val collecting: Boolean get() = isRunning
 
@@ -1016,7 +1019,21 @@ class DataScheduler(
             val enabled = limit["enabled"]?.jsonPrimitive?.content?.let { it == "true" || it == "1" } ?: true
             if (!enabled) return
             val limitBytes = limit["limit_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
-            if (limitBytes <= 0L) return
+            if (limitBytes <= 0L) {
+                // 2026-10-07 审计修复：enabled=true 且设备确实报了总量值、但 core 解析出 0 字节
+                // ——这是「字段一个不缺、值全错」的排障盲区（归一化关掉 / 固件复合串缺乘数时
+                // 会走到这里）。此时预警静默失效，用户只会觉得「限额设了但不提醒」。
+                // 纯静默不变，但留一条带原始值的 WARN（只在真配了限额时才打，避免刷日志）。
+                val rawValue = limit["limit_value"]?.jsonPrimitive?.contentOrNull
+                if (rawValue != null && rawValue != "0") {
+                    AppLogger.w(
+                        tag,
+                        "traffic limit enabled but limit_bytes=0 (raw limit_value=$rawValue) " +
+                            "—— 预警与自动关网本轮跳过，请检查归一化开关/固件字段"
+                    )
+                }
+                return
+            }
             val alertPercent = (limit["alert_percent"]?.jsonPrimitive?.longOrNull ?: 80L).toInt()
             engine?.checkTrafficLimit(usedBytes, limitBytes, alertPercent)
             guard?.invoke(usedBytes, limitBytes, alertPercent)
@@ -1042,6 +1059,9 @@ class DataScheduler(
      *   于是「设备接入/离开」在整个排障期间**不报也不报错**。
      *   刻意**不**在这条路径上清基线：那种场景每轮都失败，清了就等于永久静默停摆；
      *   保留基线则解析一恢复就能和失败前的集合做差，把这段时间真实的上下线补报出来。
+     * - **同一 MAC 的同向事件有冷却窗**（2026-10-07 审计修复）：一台设备反复断连/重连时，
+     *   每 60s 一轮的差分会连环产出事件刷屏（WS/邮件首条跟着发）。同一 MAC 同方向
+     *   [DEVICE_EVENT_COOLDOWN_MS] 内只报第一次；反向事件不受限（断了立刻回连是值得报的）。
      */
     private suspend fun checkDeviceEvents() {
         val provider = stationListProvider ?: return
@@ -1083,8 +1103,13 @@ class DataScheduler(
                 AppLogger.i(tag, "Device event baseline established: ${current.size} clients")
                 return
             }
-            for ((mac, label) in current) if (!prev.containsKey(mac)) sink(true, label, mac)
-            for ((mac, label) in prev) if (!current.containsKey(mac)) sink(false, label, mac)
+            val nowEvt = System.currentTimeMillis()
+            for ((mac, label) in current) if (!prev.containsKey(mac)) {
+                if (deviceEventCooldown.allow(mac, true, nowEvt)) sink(true, label, mac)
+            }
+            for ((mac, label) in prev) if (!current.containsKey(mac)) {
+                if (deviceEventCooldown.allow(mac, false, nowEvt)) sink(false, label, mac)
+            }
         } catch (e: TimeoutCancellationException) {
             AppLogger.w(tag, "checkDeviceEvents timed out (8s)")
             knownStations = null
@@ -2135,7 +2160,25 @@ class DataScheduler(
     private val deviceEventCheckIntervalMs: Long
         get() = (settings?.monitorDeviceEventCheckSec ?: 60) * 1000L
 
+    /**
+     * 设备事件冷却器（键 = 方向+MAC）：断连风暴（AP 重启、省电抖动）下同向事件
+     * [DEVICE_EVENT_COOLDOWN_MS] 内只出一条；反向不受限。
+     */
+    private class DeviceEventCooldown {
+        private val last = HashMap<String, Long>()
+        fun allow(mac: String, online: Boolean, now: Long): Boolean {
+            val key = if (online) "on:$mac" else "off:$mac"
+            val prev = last[key]
+            if (prev != null && now - prev < DEVICE_EVENT_COOLDOWN_MS) return false
+            last[key] = now
+            if (last.size > 512) last.entries.removeIf { now - it.value > DEVICE_EVENT_COOLDOWN_MS }
+            return true
+        }
+    }
+
     private companion object {
+        /** 设备事件 per-MAC 同向冷却窗：采集节拍 60s，5 分钟内同一 MAC 同向只报一次。 */
+        const val DEVICE_EVENT_COOLDOWN_MS = 5 * 60_000L
         /** 默认 boot grace = 90 秒。Unisoc 实测 ~60s 稳定，留 30s 余量。 */
         const val BOOT_GRACE_DEFAULT_MS = 90_000L
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s

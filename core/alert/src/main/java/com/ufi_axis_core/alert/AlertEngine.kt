@@ -814,10 +814,16 @@ class AlertEngine(
     ) {
         val now = System.currentTimeMillis()
 
+        // 设备事件（device_online/device_offline，2026-10-07 审计修复）**不做聚合**：
+        // 聚合键是 (type,level)，而设备事件恒为 info——A 设备接入和 B 设备接入会并成一行
+        // count++，文案只剩最后一台，事件历史丢失。设备事件天然低频（上下线边沿），
+        // 逐条落行才是正确语义；value 里存着 MAC，排查也靠它。
+        val isDeviceEvent = type == "device_online" || type == "device_offline"
+
         // 1) 聚合：同 (type,level) 未确认行累加计数（返回受影响行数）
         // 2026-08-25：获取现有记录 ID 以便推送给前端做精确去重
-        val existing = alertDao.getUnacknowledged(type, level)
-        val bumped = alertDao.bumpExisting(type, level, now)
+        val existing = if (isDeviceEvent) null else alertDao.getUnacknowledged(type, level)
+        val bumped = if (isDeviceEvent) 0 else alertDao.bumpExisting(type, level, now)
         if (bumped > 0 && existing != null) {
             AppLogger.i(tag, "Alert aggregated: [$level] $message (count++)")
             // **只推送、不发邮件**：聚合意味着"同一件事又发生了一次"，前端要靠它把 badge 数字
