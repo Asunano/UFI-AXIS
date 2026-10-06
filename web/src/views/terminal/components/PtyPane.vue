@@ -81,7 +81,7 @@ async function stopDaemon() {
 
 async function enableTtyd() {
   try {
-    await api.post('/api/config', { ttyd_enabled: true });
+    await api.put('/api/config', { ttyd_enabled: true });  // 2026-10-07 修复：/api/config 只有 GET/PUT，POST 一律 405
     enabled.value = true;
     connect();
   } catch {
