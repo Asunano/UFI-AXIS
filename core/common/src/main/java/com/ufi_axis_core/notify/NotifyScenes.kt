@@ -85,10 +85,19 @@ object NotifyScenes {
      */
     const val SPEEDTEST_RESULT = "speedtestResult"
 
+    /**
+     * 流量报告（日报/周报/月报，2026-10-06）。
+     *
+     * 由 traffic_report 定时动作 emit（摘要含区间总量 + 日均 + 峰值日）。
+     * app 侧 NotifyScene 镜像需同步补 TRAFFIC_REPORT（枚举值 trafficReport）。
+     */
+    const val TRAFFIC_REPORT = "trafficReport"
+
     /** core 侧会产出的全部场景 id。新增常量必须同时登记到这里。 */
     val ALL: Set<String> = setOf(
         SMS, VERIFICATION, ALERT, CONNECTIVITY, TRAFFIC_80, DOWNLOAD, TUNNEL, EVENTS, BATTERY, TEST,
-        SPEEDTEST_RESULT
+        SPEEDTEST_RESULT,
+        TRAFFIC_REPORT
     )
 }
 

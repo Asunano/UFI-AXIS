@@ -43,7 +43,17 @@ class ActionExecutorImpl(
      * 定时测速（2026-10-06，可空兼容既有装配/测试）：执行一轮「跑+入库+推送」，
      * 返回结果摘要；null = 并发位被占 / 未装配。
      */
-    private val speedtestAction: (suspend () -> String?)? = null
+    private val speedtestAction: (suspend () -> String?)? = null,
+    /**
+     * 远端备份（2026-10-06，可空兼容既有装配/测试）：导出加密包推远端+滚动清理，
+     * 返回结果摘要；null = 未装配。
+     */
+    private val remoteBackupAction: (suspend () -> String)? = null,
+    /**
+     * 流量报告（2026-10-06）：入参 period(day|week|month)，返回摘要文案；
+     * null = 未装配。
+     */
+    private val trafficReportAction: (suspend (String) -> String?)? = null
 ) : ActionExecutor {
 
     override suspend fun execute(actionType: String, params: Map<String, JsonPrimitive>): ActionResult {
@@ -158,6 +168,26 @@ class ActionExecutorImpl(
                     if (summary == null) ActionResult(false, "已有测速在跑")
                     else ActionResult(true, summary)
                 }
+            }
+            "remote_backup" -> {
+                val action = remoteBackupAction
+                if (action == null) ActionResult(false, "远端备份未装配")
+                else runCatching { action() }.fold(
+                    onSuccess = { ActionResult(true, it) },
+                    onFailure = { ActionResult(false, "备份失败: ${it.message}") }
+                )
+            }
+            "traffic_report" -> {
+                val action = trafficReportAction
+                val period = params["period"]?.content ?: "week"
+                if (action == null) ActionResult(false, "流量报告未装配")
+                else runCatching { action(period) }.fold(
+                    onSuccess = { s ->
+                        if (s == null) ActionResult(false, "报告生成失败（流量数据可能还没落库）")
+                        else ActionResult(true, s)
+                    },
+                    onFailure = { ActionResult(false, "报告失败: ${it.message}") }
+                )
             }
             "custom_shell" -> {
                 val cmd = params["command"]?.content ?: ""

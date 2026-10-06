@@ -50,6 +50,7 @@
         @open-mode="showModeModal = true"
         @open-band="bandModal.open()"
         @open-speed="speedModal.open()"
+        @open-diag="diagModal.open()"
         @open-sleep="showSleepModal = true"
         @open-module="moduleModal.open()"
         @open-cell="cellModal.open()"
@@ -99,6 +100,7 @@
          这样进出场动画不会因为「首帧 show 就是 true」而丢掉 -->
     <component :is="bandComponent" v-if="bandComponent" :show="bandShow" @update:show="bandModal.setShow" />
     <component :is="speedComponent" v-if="speedComponent" :show="speedShow" @update:show="speedModal.setShow" />
+    <component :is="diagComponent" v-if="diagComponent" :show="diagShow" @update:show="diagModal.setShow" />
 
     <WifiEditModal v-model:show="showWifiEditModal" :wifi-settings="wifiSettings" @saved="handleWifiSaved" />
 
@@ -269,6 +271,8 @@ const showAclModal = ref(false);
  */
 const bandModal = useLazyModal(() => import('@/components/modals/BandLockModal.vue'));
 const speedModal = useLazyModal(() => import('./components/modals/SpeedTestModal.vue'));
+// 网络诊断工具集（2026-10-06 拍板第1项）：ping/DNS/TCP/traceroute
+const diagModal = useLazyModal(() => import('./components/modals/DiagnosticModal.vue'));
 const cellModal = useLazyModal(() => import('./components/modals/CellInfoModal.vue'));
 const moduleModal = useLazyModal(() => import('./components/modals/ModuleInfoModal.vue'));
 const bandComponent = bandModal.component;
@@ -277,6 +281,8 @@ const bandShow = bandModal.show;
 const closeModeOp = () => { modeOpState.value = { kind: 'idle' }; };
 const noop = () => {};
 const speedComponent = speedModal.component;
+const diagComponent = diagModal.component;
+const diagShow = diagModal.show;
 const speedShow = speedModal.show;
 const cellComponent = cellModal.component;
 const cellShow = cellModal.show;

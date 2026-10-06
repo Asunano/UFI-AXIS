@@ -470,6 +470,57 @@ fun SpeedTestScreen(viewModel: MainViewModel, navController: NavHostController) 
                 }
             }
 
+            // ═══════════ ⑥ 定时测速历史（2026-10-06 批C 对齐：core/web 已有，app 补消费） ═══════════
+            // 有记录才显示；测速完成时由 NetworkModule 在 DONE 分支刷新。
+            val history by viewModel.speedTestHistory.collectAsState()
+            LaunchedEffect(Unit) { viewModel.network.refreshSpeedTestHistory() }
+            LaunchedEffect(state.phase) {
+                if (state.phase == SpeedTestPhase.DONE) viewModel.network.refreshSpeedTestHistory()
+            }
+            if (history.isNotEmpty()) {
+                UfiSettingsGroup {
+                    Text(
+                        text = "定时测速历史",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.textSecondary,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
+                    )
+                    history.take(10).forEach { h ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.CHINA)
+                                        .format(java.util.Date(h.timestamp)),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.textSecondary
+                                )
+                                Text(
+                                    text = "↓ ${"%.1f".format(h.downloadMbps)} · ↑ ${"%.1f".format(h.uploadMbps)} Mbps · ${h.latencyMs} ms",
+                                    style = MaterialTheme.typography.bodySmall
+                                )
+                            }
+                            Text(
+                                text = if (h.trigger == "scheduled") "定时" else "手动",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = palette.textSecondary,
+                                modifier = Modifier
+                                    .background(
+                                        palette.divider.copy(alpha = 0.35f),
+                                        androidx.compose.foundation.shape.RoundedCornerShape(8.dp)
+                                    )
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(Spacing.Large))
         }
 

@@ -26,7 +26,16 @@ enum class ActionType(val wire: String) {
      * 定时测速（2026-10-06）：core 本地跑一轮测速并入库 + 推送。
      * 参数：notify（Boolean，默认 true —— 完成后走通知渠道）。
      */
-    SPEEDTEST("speedtest");
+    SPEEDTEST("speedtest"),
+    /**
+     * 配置自动备份到远端（2026-10-06）：加密备份包推送到已配置的远端存储源，
+     * 滚动保留 7 份。配置见 remote_backup_source_id / remote_backup_passphrase。
+     */
+    REMOTE_BACKUP("remote_backup"),
+    /**
+     * 流量报告（2026-10-06）：生成日/周/月报并推送。参数：period（day|week|month，默认 week）。
+     */
+    TRAFFIC_REPORT("traffic_report");
 
     companion object {
         val ALL: List<String> = entries.map { it.wire }

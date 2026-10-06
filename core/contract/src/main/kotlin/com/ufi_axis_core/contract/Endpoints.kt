@@ -175,6 +175,18 @@ object Endpoints {
     }
 
     /**
+     * 网络诊断工具集（2026-10-06 实用功能批·拍板第1项）。
+     * 全部无 root：ping/系统 resolver/TCP connect/TTL traceroute。
+     */
+    object Diagnostic {
+        const val BASE = "$API/diagnostic"
+        const val PING = "$BASE/ping"
+        const val DNS = "$BASE/dns"
+        const val TCP = "$BASE/tcp"
+        const val TRACEROUTE = "$BASE/traceroute"
+    }
+
+    /**
      * 短信。这里只登记 2026-09-08 拦截改造**新增**的端点 ——
      * 本文件的规则是「本次改到的端点必须走 contract」，不追求把 api/sms 下的端点一次性搬完，
      * 免得又造出一份看起来权威、实际半旧的清单。

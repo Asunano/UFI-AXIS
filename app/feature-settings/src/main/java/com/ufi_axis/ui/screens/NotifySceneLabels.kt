@@ -30,6 +30,7 @@ private val NOTIFY_SCENE_LABEL_BY_ID: Map<String, String> = mapOf(
     NotifyScene.DEVICE_EVENTS.sceneId to "设备事件",
     NOTIFY_SCENE_BATTERY to "电池状态",
     NOTIFY_SCENE_SPEEDTEST to "测速结果",
+    NOTIFY_SCENE_TRAFFIC_REPORT to "流量报告",
     NOTIFY_SCENE_TEST to "手动测试"
 )
 
@@ -51,7 +52,8 @@ private val NOTIFY_SCENE_CHIP_IDS: List<String> = listOf(
     NotifyScene.TUNNEL.sceneId,
     NotifyScene.DEVICE_EVENTS.sceneId,
     NOTIFY_SCENE_BATTERY,
-    NOTIFY_SCENE_SPEEDTEST
+    NOTIFY_SCENE_SPEEDTEST,
+    NOTIFY_SCENE_TRAFFIC_REPORT
 )
 
 /** 场景勾选 chip 的 `id to 标签`（三条渠道共用，顺序即展示顺序）。 */
@@ -83,6 +85,9 @@ internal const val NOTIFY_SCENE_BATTERY = "battery"
  * 这个 type，硬造枚举项才是假开关。进 [NOTIFY_SCENE_CHIP_IDS]（可勾选）。
  */
 internal const val NOTIFY_SCENE_SPEEDTEST = "speedtestResult"
+
+/** 流量报告场景 id（core `NotifyScenes.TRAFFIC_REPORT`，2026-10-06 日报/周报/月报）。 */
+internal const val NOTIFY_SCENE_TRAFFIC_REPORT = "trafficReport"
 
 /**
  * 手动测试信的场景 id（core `NotifyScenes.TEST`）。

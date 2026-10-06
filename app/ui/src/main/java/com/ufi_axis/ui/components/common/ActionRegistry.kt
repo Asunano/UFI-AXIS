@@ -71,7 +71,10 @@ object ActionRegistry {
 
         // 高级
         ActionDef("custom_shell", "advanced", "自定义命令", Icons.Default.Terminal,
-            listOf(ParamDef("command", "Shell 命令", ParamType.STRING, JsonPrimitive(""))))
+            listOf(ParamDef("command", "Shell 命令", ParamType.STRING, JsonPrimitive("")))),
+
+        // 工具类：定时测速（2026-10-06 批C；core ActionType.SPEEDTEST 与 web tasksShared.ts 已登记）
+        ActionDef("speedtest", "advanced", "定时测速", Icons.Default.NetworkCheck, emptyList())
     )
 
     val categories = listOf(

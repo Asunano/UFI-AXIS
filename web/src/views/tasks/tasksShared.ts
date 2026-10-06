@@ -70,6 +70,10 @@ export const actionOptions = [
   { label: '自定义命令', value: 'custom_shell' },
   // 定时测速（2026-10-06）：跑一轮测速并入库，结果走通知渠道（speedtestResult 场景）
   { label: '定时测速', value: 'speedtest' },
+  // 远端备份（2026-10-06）：加密配置包推送到远端存储源，滚动保留 7 份
+  { label: '远端备份', value: 'remote_backup' },
+  // 流量报告（2026-10-06）：生成日/周/月报并推送，参数 period
+  { label: '流量报告', value: 'traffic_report' },
 ];
 
 /** 这些动作的参数是一个开关（params.enabled），摘要文案要说「开启/关闭」 */

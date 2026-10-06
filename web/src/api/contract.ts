@@ -463,6 +463,13 @@ export const Endpoints = {
     /** GET ?limit=：定时测速历史（新的在前） */
     history: '/api/speedtest/history',
   },
+  /** 网络诊断工具集（2026-10-06）：ping/DNS/TCP/TTL traceroute，全部无 root */
+  diagnostic: {
+    ping: '/api/diagnostic/ping',
+    dns: '/api/diagnostic/dns',
+    tcp: '/api/diagnostic/tcp',
+    traceroute: '/api/diagnostic/traceroute',
+  },
   diagnose: '/api/diagnose',
   wsRealtime: '/ws/realtime',
   /**

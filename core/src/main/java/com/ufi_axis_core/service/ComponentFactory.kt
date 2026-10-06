@@ -67,6 +67,12 @@ object ComponentFactory {
     @Volatile
     private var notificationDispatcherRef: com.ufi_axis_core.notify.NotificationDispatcher? = null
 
+    /** 远端备份（2026-10-06）的延迟引用：构造晚于控制器子图，回调只在运行期触发。 */
+    @Volatile
+    private var backupAssemblerRef: com.ufi_axis_core.api.backup.BackupAssembler? = null
+    @Volatile
+    private var storageSourceManagerRef: com.ufi_axis_core.api.files.StorageSourceManager? = null
+
     private const val TAG = "ComponentFactory"
     private var built = false
 
@@ -360,7 +366,9 @@ object ComponentFactory {
             tuning = tuning,
             database = database,
             wsManager = wsManager,
-            notificationDispatcherProvider = { notificationDispatcherRef }
+            notificationDispatcherProvider = { notificationDispatcherRef },
+            backupAssemblerProvider = { backupAssemblerRef!! },
+            storageSourceManagerProvider = { storageSourceManagerRef!! }
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
@@ -623,9 +631,11 @@ object ComponentFactory {
             }
         )
         // 配置备份：Assembler 负责各段内容，Routes 负责 ZIP / manifest / 加密
+        val backupAssembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database)
+        backupAssemblerRef = backupAssembler
         val backupRoutes = com.ufi_axis_core.api.routes.BackupRoutes(
             settings = settings,
-            assembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database),
+            assembler = backupAssembler,
             tunnelActive = { controller.tunnelManager.anyRunning() }
         )
         val deviceRoutes = DeviceRoutes(routeCtx)
@@ -698,6 +708,7 @@ object ComponentFactory {
         val storageSourceManager = com.ufi_axis_core.api.files.StorageSourceManager(
             settings, fileProviderRegistry
         )
+        storageSourceManagerRef = storageSourceManager
         storageSourceManager.initializeProviders()
         val storageSourceRoutes = com.ufi_axis_core.api.routes.StorageSourceRoutes(storageSourceManager)
         // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
@@ -777,6 +788,7 @@ object ComponentFactory {
         val taskRoutes = TaskRoutes(controller.taskScheduler, controller.conditionEngine)
         val speedTestRoutes = SpeedTestRoutes(coordinator = controller.speedTestCoordinator)
         val debugLogRoutes = DebugLogRoutes()
+        val diagnosticRoutes = com.ufi_axis_core.api.routes.DiagnosticRoutes()
         val qosRoutes = QoSRoutes(routeCtx)
         val monitorRoutes = MonitorRoutes(database, scheduler, settings) { enabled ->
             BackendService.applyBackgroundServices(enabled)
@@ -862,6 +874,7 @@ object ComponentFactory {
             taskRoutes = taskRoutes,
             speedTestRoutes = speedTestRoutes,
             debugLogRoutes = debugLogRoutes,
+            diagnosticRoutes = diagnosticRoutes,
             qosRoutes = qosRoutes,
             monitorRoutes = monitorRoutes,
             notificationRoutes = notificationRoutes,
@@ -1068,7 +1081,10 @@ object ComponentFactory {
          * 通知分发器的**延迟引用**（2026-10-06）：NotificationDispatcher 在本函数之后才装配
          * （它依赖 pushService / 邮件渠道），而测速回调只在运行期触发，届时引用必已就绪。
          */
-        notificationDispatcherProvider: () -> com.ufi_axis_core.notify.NotificationDispatcher?
+        notificationDispatcherProvider: () -> com.ufi_axis_core.notify.NotificationDispatcher?,
+        /** 远端备份（2026-10-06）：ControllerGraph 构造早于 ServerGraph，由外层传引用 */
+        backupAssemblerProvider: () -> com.ufi_axis_core.api.backup.BackupAssembler,
+        storageSourceManagerProvider: () -> com.ufi_axis_core.api.files.StorageSourceManager
     ): ControllerGraph {
         // SystemController 依赖 device 域（DeviceControl），与原步骤 5 同阶段构造
         val systemController = SystemController(deviceControl)
@@ -1131,6 +1147,30 @@ object ComponentFactory {
                     if (r.uploadMbps >= 0) append(" / 上行 %.1f Mbps".format(r.uploadMbps))
                     if (r.latencyMs >= 0) append(" / 延迟 ${r.latencyMs} ms")
                 }
+            },
+            trafficReportAction = report@{ period ->
+                val generator = com.ufi_axis_core.api.traffic.TrafficReportGenerator(database.trafficHourlyDao())
+                val report = generator.generate(period)
+                val summary = generator.summarize(report)
+                val detailed = generator.summarizeDetailed(report)
+                notificationDispatcherRef?.emit(
+                    com.ufi_axis_core.notify.NotifyEvent(
+                        scene = com.ufi_axis_core.notify.NotifyScenes.TRAFFIC_REPORT,
+                        level = com.ufi_axis_core.notify.NotifyLevel.INFO,
+                        title = "流量报告",
+                        // 正文带每日明细（2026-10-06 用户要求「周报显示一周内每日使用情况」）
+                        body = detailed,
+                    )
+                )
+                summary
+            },
+            remoteBackupAction = {
+                val runner = com.ufi_axis_core.api.backup.RemoteBackupRunner(
+                    assembler = backupAssemblerProvider(),
+                    storageSourceManager = storageSourceManagerProvider(),
+                    settings = AppSettings.getInstance(context)
+                )
+                runner.runOnce()
             }
         )
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)

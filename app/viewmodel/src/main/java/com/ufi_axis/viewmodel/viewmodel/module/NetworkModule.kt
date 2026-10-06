@@ -160,6 +160,10 @@ class NetworkModule(
     private val _speedTestState = MutableStateFlow(SpeedTestState())
     val speedTestState: StateFlow<SpeedTestState> = _speedTestState.asStateFlow()
 
+    /** 定时测速历史（2026-10-06 批C 对齐：web 弹窗已有，app 补消费）。空列表 = 无记录或未拉取。 */
+    private val _speedTestHistory = MutableStateFlow<List<SpeedTestHistoryEntry>>(emptyList())
+    val speedTestHistory: StateFlow<List<SpeedTestHistoryEntry>> = _speedTestHistory.asStateFlow()
+
     private val _pairingState = MutableStateFlow(PairingState())
     val pairingState: StateFlow<PairingState> = _pairingState.asStateFlow()
 
@@ -874,6 +878,32 @@ class NetworkModule(
 
     /** 内网测速：从设备下载填充数据，时长由 [startSpeedTest] 自动决定 */
     fun runSpeedTest() = startSpeedTest("internal", null)
+
+    /**
+     * 拉定时测速历史（2026-10-06 批C 对齐）。失败静默：历史是增益信息，
+     * 拉不到不该把测速页拖进错误态。
+     */
+    fun refreshSpeedTestHistory() {
+        scope.launch {
+            try {
+                val resp = api.speedTestHistory(limit = 30)
+                val items = resp["items"]?.jsonArray?.mapNotNull { el ->
+                    val o = el as? JsonObject ?: return@mapNotNull null
+                    SpeedTestHistoryEntry(
+                        timestamp = o["timestamp"]?.jsonPrimitive?.content?.toLongOrNull() ?: return@mapNotNull null,
+                        downloadMbps = o["download_mbps"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        uploadMbps = o["upload_mbps"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        latencyMs = o["latency_ms"]?.jsonPrimitive?.content?.toIntOrNull() ?: -1,
+                        jitterMs = o["jitter_ms"]?.jsonPrimitive?.content?.toIntOrNull() ?: -1,
+                        trigger = o["trigger"]?.jsonPrimitive?.content ?: "manual",
+                    )
+                } ?: emptyList()
+                _speedTestHistory.value = items
+            } catch (e: Exception) {
+                DebugLog.w("Network", "speedtest history load failed: ${e.message}")
+            }
+        }
+    }
 
     /**
      * 外网测速：只接受节点 id，地址一律从 [SpeedTestState.EXTERNAL_NODES] 里取。

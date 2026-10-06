@@ -11,6 +11,7 @@ import com.ufi_axis.data.notification.NotificationConfigUpdateResponse
 import okhttp3.ResponseBody
 import retrofit2.Response
 import okhttp3.MultipartBody
+import kotlinx.serialization.json.JsonObject
 import retrofit2.http.*
 
 interface UfiAxisApi {
@@ -1241,6 +1242,14 @@ interface UfiAxisApi {
      */
     @POST("api/speedtest/upload")
     suspend fun speedTestUpload(@Body body: okhttp3.RequestBody): ResponseBody
+
+    /**
+     * 定时测速历史（2026-10-06 批C；core SpeedTestRoutes /history，新的在前）。
+     * 返回 `{ "items": [ { timestamp, download_mbps, upload_mbps, latency_ms, jitter_ms, trigger } ] }`，
+     * 数值是字符串化的（core 侧用 "%.2f".format 产出），消费端按 Double.parseDouble 解。
+     */
+    @GET("api/speedtest/history")
+    suspend fun speedTestHistory(@Query("limit") limit: Int = 30): JsonObject
 
     // ========== Debug Logs ==========
     @GET("api/debug-logs")

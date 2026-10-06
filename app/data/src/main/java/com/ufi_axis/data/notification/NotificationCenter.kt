@@ -1041,6 +1041,7 @@ class NotificationCenter(context: Context) {
         NotifyScene.DOWNLOAD -> KEY_DOWNLOAD_NOTIF
         NotifyScene.TRAFFIC_80 -> KEY_TRAFFIC_80_NOTIF
         NotifyScene.DEVICE_EVENTS -> KEY_DEVICE_EVENTS_NOTIF
+        NotifyScene.TRAFFIC_REPORT -> KEY_DEVICE_EVENTS_NOTIF // 流量报告依附事件通知开关（2026-10-06）
         NotifyScene.TUNNEL -> KEY_TUNNEL_NOTIF
     }
 

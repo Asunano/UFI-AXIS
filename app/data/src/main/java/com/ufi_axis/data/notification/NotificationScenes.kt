@@ -124,6 +124,15 @@ enum class NotifyScene(
         rateLimitMinutes = 0
     ),
 
+    /** 流量报告（日报/周报/月报，2026-10-06；依附事件 channel） */
+    TRAFFIC_REPORT(
+        sceneId = "trafficReport",
+        channelId = NotificationCenter.CHANNEL_EVENTS,
+        defaultEnabled = false,
+        importance = NotificationManager.IMPORTANCE_DEFAULT,
+        rateLimitMinutes = 0
+    ),
+
     /** 设备事件（WiFi 客户端上下线，默认关闭） */
     DEVICE_EVENTS(
         sceneId = "events",

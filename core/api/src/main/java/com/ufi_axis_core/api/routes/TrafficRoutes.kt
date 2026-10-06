@@ -17,6 +17,7 @@ import java.time.ZoneId
  * GET /api/traffic/history   - 流量历史
  * GET /api/traffic/summary   - 流量汇总（优先使用 Goform 月流量数据）
  * GET /api/traffic/usage     - 日/周/月/年用量分桶（数据源 traffic_hourly）
+ * GET /api/traffic/report    - 日/周/月报摘要 + 按日明细（2026-10-06；通知文案用，web 图表走 /usage）
  */
 class TrafficRoutes(
     private val ctx: RouteContext
@@ -27,6 +28,38 @@ class TrafficRoutes(
 
     fun register(route: Route) {
         route.route("/traffic") {
+            // 流量日报/周报/月报（2026-10-06 拍板第4项）：按自然日出桶，周报含一周每日明细
+            get("/report") {
+                val period = call.request.queryParameters["period"] ?: "week"
+                val generator = com.ufi_axis_core.api.traffic.TrafficReportGenerator(database.trafficHourlyDao())
+                val report = try {
+                    generator.generate(period)
+                } catch (e: IllegalArgumentException) {
+                    call.respondFail(io.ktor.http.HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "period must be day|week|month")
+                    return@get
+                }
+                val fmt = java.text.SimpleDateFormat("MM-dd", java.util.Locale.CHINA)
+                call.respond(mapOf(
+                    "ok" to true,
+                    "period" to report.period,
+                    "range_start" to report.rangeStart,
+                    "range_end" to report.rangeEnd,
+                    "rx_bytes" to report.rx,
+                    "tx_bytes" to report.tx,
+                    "total_bytes" to report.total,
+                    "summary" to generator.summarize(report),
+                    "days" to report.days.map { d ->
+                        mapOf(
+                            "day_start" to d.dayStart,
+                            "day_label" to fmt.format(java.util.Date(d.dayStart)),
+                            "rx_bytes" to d.rx,
+                            "tx_bytes" to d.tx,
+                            "total_bytes" to d.total
+                        )
+                    }
+                ))
+            }
+
             // 实时网速（从调度器缓存）
             get("/realtime") {
                 val latest = dataScheduler.latestTraffic.value

@@ -350,6 +350,9 @@ class MainViewModel(
     val deviceSettingsState: StateFlow<DeviceSettingsState> get() = network.deviceSettingsState
     val serviceState: StateFlow<ServiceControlState> get() = network.serviceState
     val speedTestState: StateFlow<SpeedTestState> get() = network.speedTestState
+
+    /** 定时测速历史（2026-10-06 批C 对齐；NetworkModule 拉取，Screen 消费）。 */
+    val speedTestHistory: StateFlow<List<SpeedTestHistoryEntry>> get() = network.speedTestHistory
     val fileManagerState: StateFlow<FileManagerState> get() = files.state
     /** 外部存储源配置页（文件管理器 → 更多 → 外部存储）的状态槽。 */
     val storageSourceState: StateFlow<StorageSourceState> get() = storageSources.state

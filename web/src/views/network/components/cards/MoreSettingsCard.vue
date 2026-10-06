@@ -19,6 +19,15 @@
           <span class="entry-desc">锁定 LTE / NR 频段</span>
         </span>
       </button>
+      <button class="entry-tile sub-panel" @click="emit('open-diag')">
+        <span class="entry-icon"
+          ><n-icon :size="18"><MedkitOutline /></n-icon
+        ></span>
+        <span class="entry-text">
+          <span class="entry-title">网络诊断</span>
+          <span class="entry-desc">Ping / DNS / 路由追踪</span>
+        </span>
+      </button>
       <button class="entry-tile sub-panel" @click="emit('open-speed')">
         <span class="entry-icon"
           ><n-icon :size="18"><SpeedometerOutline /></n-icon
@@ -63,6 +72,7 @@
 import {
   SwapHorizontalOutline,
   LockClosedOutline,
+  MedkitOutline,
   SpeedometerOutline,
   MoonOutline,
   HardwareChipOutline,
@@ -79,6 +89,7 @@ const emit = defineEmits<{
   'open-mode': [];
   'open-band': [];
   'open-speed': [];
+  'open-diag': [];
   'open-sleep': [];
   'open-module': [];
   'open-cell': [];
