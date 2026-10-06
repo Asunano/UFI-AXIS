@@ -1153,7 +1153,7 @@ class BackendService : Service() {
         try { g.controller.tunnelManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down tunnel manager", e) }
         // ttyd：父进程（core）退出不会带走子进程，必须显式杀，否则孤儿 shell 常驻耗电。
         // 注意顺序在 server.stop() 之后：先把 WS 反代收掉，再杀它背后的进程。
-        try { g.serverGraph.ttydManager.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }
+        try { g.serverGraph.ttydRoutes.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }
         // 关闭 ADB shell 持久会话
         try { com.ufi_axis_core.util.AdbShellExecutor.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down ADB shell", e) }
         // 配对存储：同步落一次盘并收掉 lastSeen 的异步 flush 线程。

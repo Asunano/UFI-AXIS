@@ -902,7 +902,8 @@ object ComponentFactory {
                 dataScheduler = scheduler,
                 dynamicThreadPool = dynamicThreadPool,
                 webResourceManager = webResourceManager,
-                ttydManager = ttydManager
+                // 停机钩子要能收 ttyd（杀进程 + 关反代 HttpClient；否则孤儿进程常驻，2026-10-06）
+                ttydRoutes = ttydRoutes
             )
         )
     }
@@ -1166,7 +1167,7 @@ object ComponentFactory {
         dataScheduler: DataScheduler,
         dynamicThreadPool: DynamicThreadPool,
         webResourceManager: com.ufi_axis_core.util.WebResourceManager,
-        ttydManager: com.ufi_axis_core.api.terminal.TtydManager
+        ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -1179,7 +1180,7 @@ object ComponentFactory {
             dataScheduler = dataScheduler,
             dynamicThreadPool = dynamicThreadPool,
             webResourceManager = webResourceManager,
-            ttydManager = ttydManager
+            ttydRoutes = ttydRoutes
         )
     }
 }

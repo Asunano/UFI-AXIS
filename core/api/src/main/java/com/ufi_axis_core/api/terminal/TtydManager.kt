@@ -38,6 +38,25 @@ class TtydManager(
 ) {
     private val processRef = AtomicReference<Process?>(null)
 
+    /**
+     * 抽干子进程输出的线程（2026-10-06 修）。
+     *
+     * **为什么必须有**：`redirectErrorStream(true)` 让 ttyd 的 stdout/stderr 并成一条管道，
+     * 而管道缓冲区只有 64KB。没人读的话，ttyd 写完缓冲就在 `write()` 上永久阻塞 ——
+     * 表现为长会话用一阵子后输出停摆（且 `isAlive` 仍为 true，`ensureStarted` 不会救），
+     * 页面重连也没用。这不是理论风险：ttyd 每帧都有 libwebsockets 日志。
+     *
+     * 线程是 daemon + 只读丢弃：不解析（会话内容由 WS 反代那条路走，与本管道无关），
+     * 抽到 EOF 自然结束，进程被杀时读立刻返回 -1。
+     */
+    private fun drainOutput(p: Process) {
+        val t = Thread({
+            runCatching { p.inputStream.use { it.copyTo(java.io.OutputStream.nullOutputStream()) } }
+        }, "ttyd-drain")
+        t.isDaemon = true
+        t.start()
+    }
+
     /** ttyd 是否在跑（进程活着即算）。 */
     val isRunning: Boolean
         get() = processRef.get()?.isAlive == true
@@ -76,6 +95,7 @@ class TtydManager(
         val lastError = runCatching {
             val p = processStarter(cmd)
             processRef.set(p)
+            drainOutput(p)
             waitForReady(p)
             port
         }.getOrElse { last ->

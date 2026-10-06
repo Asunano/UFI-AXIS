@@ -74,8 +74,11 @@ export function buildMonitorCsv(
 
   const esc = (v: string | number) => {
     const str = String(v);
-    // CSV 注入防护：以 =+-@ 开头的单元格前置单引号（Excel 公式注入）
-    return /^[=+\-@]/.test(str) ? `'${str}` : str;
+    // CSV 注入防护：以公式字符开头的单元格前置单引号（Excel 公式注入）。
+    // 注意**不含** '-'：RSRP/SINR 等指标恒为负（如 -105），数值先排除——
+    // 负数不是公式，前置引号会把整个数值列污染成文本，Excel/脚本没法直接用。
+    if (/^-?\d+(\.\d+)?$/.test(str)) return str;
+    return /^[=+@]/.test(str) ? `'${str}` : str;
   };
 
   const lines: string[] = [];

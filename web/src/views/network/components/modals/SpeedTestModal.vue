@@ -200,6 +200,8 @@
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useAppStore } from '@/stores/app';
+import { useWebSocketStore } from '@/stores/websocket';
+import { WsChannel } from '@/api/contract';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 import { useChartColors } from '@/composables/chartTheme';
 import ScrollingLineChart from '@/components/ScrollingLineChart.vue';
@@ -483,6 +485,19 @@ async function cancel() {
   if (j) await j.catch(() => undefined);
 }
 
+const wsStore = useWebSocketStore();
+function onSpeedtestBroadcast(data: any): void {
+  const item = data?.speedtest;
+  if (!item) return;
+  historyLoaded.value = true;
+  history.value = [
+    { ...item, time: new Date(Number(item.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) },
+    ...history.value,
+  ].slice(0, 30);
+}
+/** 组件常驻订阅（modal 常驻挂载，重复注册由 wsStore 的 Set 去重）；unmount 时摘除。 */
+const offSpeedtestBroadcast = wsStore.on(WsChannel.TRAFFIC, onSpeedtestBroadcast);
+
 watch(
   () => props.show,
   (v) => {
@@ -491,7 +506,10 @@ watch(
   }
 );
 
-onUnmounted(() => cancelAll());
+onUnmounted(() => {
+  cancelAll();
+  offSpeedtestBroadcast();
+});
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -1118,13 +1136,6 @@ async function runOnDevice(): Promise<void> {
   }
 }
 
-watch(
-  () => props.show,
-  (show) => {
-    if (show) void loadHistory();
-  },
-  { immediate: true },
-);
 </script>
 
 <style scoped>

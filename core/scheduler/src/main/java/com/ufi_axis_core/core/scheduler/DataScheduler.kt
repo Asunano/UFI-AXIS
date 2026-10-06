@@ -1992,6 +1992,8 @@ class DataScheduler(
                 { cutoff, limit -> database.batteryHistoryDao().deleteOlderThanBatched(cutoff, limit) },
                 monitorCutoff, tag = "battery_history"
             )
+            // 测速历史: 与监控历史同窗清理（2026-10-06 定时测速；一天至多几十条，无需分批）
+            val speedtestDeleted = database.speedTestDao().deleteOlderThan(monitorCutoff)
             // 告警记录: 保留 30 天（告警量少，无需分批）
             val alertDeleted = database.alertDao().deleteOlderThan(now - 30L * 24 * 60 * 60 * 1000L)
             // 短信记录: 永久保留，不自动清理
@@ -2002,7 +2004,7 @@ class DataScheduler(
                 vcDao?.deleteOlderThan(now - cleanupHours * 3600_000L) ?: 0
             } else 0
 
-            if (cpuDeleted + memoryDeleted + trafficDeleted + signalDeleted + batteryDeleted + alertDeleted + vcDeleted > 0) {
+            if (cpuDeleted + memoryDeleted + trafficDeleted + signalDeleted + batteryDeleted + speedtestDeleted + alertDeleted + vcDeleted > 0) {
                 AppLogger.i(tag, "Cleaned data: cpu=$cpuDeleted, memory=$memoryDeleted, traffic=$trafficDeleted, signal=$signalDeleted, battery=$batteryDeleted, alert=$alertDeleted, vc=$vcDeleted")
 
                 // WAL checkpoint(TRUNCATE)：合并 WAL 文件回主库，回收磁盘空间

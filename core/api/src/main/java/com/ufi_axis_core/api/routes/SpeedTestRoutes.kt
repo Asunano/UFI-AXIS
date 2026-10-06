@@ -87,7 +87,13 @@ class SpeedTestRoutes(
                     call.respond(HttpStatusCode.NotImplemented, "测速调度未装配")
                     return@post
                 }
-                val record = coord.runAndStore("manual")
+                // 节点不可达/无网在这里收口成 502 + 文案，不裸 500
+                val record = try {
+                    coord.runAndStore("manual")
+                } catch (e: IllegalStateException) {
+                    call.respond(HttpStatusCode.BadGateway, mapOf("code" to "SPEEDTEST_FAILED", "message" to (e.message ?: "测速失败")))
+                    return@post
+                }
                 if (record == null) {
                     call.respond(HttpStatusCode.Conflict, mapOf("code" to "BUSY", "message" to "已有测速在跑"))
                 } else {

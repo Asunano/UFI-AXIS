@@ -47,7 +47,9 @@ class SpeedTestRunner(
             return withContext(Dispatchers.IO) { execute() }
         } catch (e: Exception) {
             AppLogger.w(tag, "speedtest failed: ${e.message}")
-            throw e
+            // 包装成可读错误：DNS 失败/无网时的原始 IOException("Unable to resolve host…")
+            // 对用户毫无意义。上游（/run 端点、定时任务）把它当失败文案展示。
+            throw IllegalStateException("测速节点不可达（${e.message ?: "网络异常"}）", e)
         } finally {
             running.set(false)
         }
