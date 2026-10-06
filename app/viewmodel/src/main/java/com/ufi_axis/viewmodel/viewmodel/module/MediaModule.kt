@@ -1178,6 +1178,48 @@ class MediaModule(
     }
 
     /**
+     * 2026-10-07：手动重抽单条视频的封面准备 —— 清设备上那一条的封面缓存与
+     * video_info 探测缓存（含 .fail 冷却标记），下一次 GET /thumbnail 就会重新走
+     * 系统 → MMR → ffmpeg 三级。失败回 false（老 core 没有 id 参数会清掉整类，
+     * 那也可接受，只是范围大些）。
+     */
+    suspend fun resetThumbnail(type: String, id: Long): Boolean = try {
+        api.clearMediaThumbnailCache(type, id)
+        // 本机（Coil URL 磁盘缓存 / 本机抽帧成果）与来源记录的失效由 feature-media 层做：
+        // MediaThumbnailBuilder 是 feature-media 的 internal，本层摸不到。
+        com.ufi_axis.data.api.ThumbSourceRegistry.invalidate(thumbnailUrl(type, id))
+        true
+    } catch (e: Exception) {
+        DebugLog.w("MediaModule", "重置封面缓存失败: $type/$id ${e.javaClass.simpleName}")
+        false
+    }
+
+    /** 2026-10-07：读某条封面的最后来源（供详情弹窗显示）；没记录返回 null。 */
+    fun thumbSource(type: String, id: Long): String? =
+        com.ufi_axis.data.api.ThumbSourceRegistry.sourceOf(thumbnailUrl(type, id))
+
+    // ── 2026-10-07：封面预热进度（core 经 data_changed/media:thumb-progress 广播）──
+    // MainViewModel 的 WS 收集器解析后喂进 [onThumbPrewarmProgress]；设置页 collect 显示。
+    data class ThumbPrewarmProgress(val done: Int, val total: Int, val failed: Int, val running: Boolean)
+
+    private val _thumbPrewarmProgress = kotlinx.coroutines.flow.MutableStateFlow<ThumbPrewarmProgress?>(null)
+
+    /** 最近一次预热进度；null = 本次连接没收到过（未开启或 core 旧版本）。 */
+    val thumbPrewarmProgress: kotlinx.coroutines.flow.StateFlow<ThumbPrewarmProgress?> = _thumbPrewarmProgress
+
+    fun onThumbPrewarmProgress(done: Int, total: Int, failed: Int, running: Boolean) {
+        _thumbPrewarmProgress.value = ThumbPrewarmProgress(done, total, failed, running)
+    }
+
+    /**
+     * 2026-10-07：带 cache-bust 参数的封面 URL。手动重抽后用 `&v=<时间戳>`
+     * 绕开 Coil 按 URL 命中的磁盘/内存缓存（Coil3 没有"作废单条 URL"的公开 API）。
+     */
+    fun thumbnailUrlBusted(type: String = MEDIA_TYPE_VIDEO, id: Long, size: Int = THUMB_SIZE): String =
+        thumbnailUrl(type, id, size) + "&v=" + System.currentTimeMillis()
+
+
+    /**
      * 音频封面（原始内嵌图）。播放页用这个而不是 [thumbnailUrl]：
      * 260dp 的容器在 xxhdpi 上约 780 物理像素，喂 256px 的缩略图必然是糊的。
      */

@@ -194,6 +194,15 @@ internal object MediaThumbnailBuilder {
     fun enabled(context: Context): Boolean =
         runCatching { AppPreferences(context).mediaPhoneFrameExtraction }.getOrDefault(true)
 
+    /**
+     * 2026-10-07：手动重抽单条封面时删本机成果与失败冷却标记（远端缓存由
+     * [MediaModule.resetThumbnail] 清）。下次 [build] 会重新抽帧。
+     */
+    fun invalidate(context: Context, type: String, id: Long) {
+        cacheFile(context, type, id).delete()
+        failFile(context, type, id).delete()
+    }
+
     /** 这一项最近失败过、还在冷却期内吗。 */
     private fun coolingDown(context: Context, type: String, id: Long): Boolean {
         val marker = failFile(context, type, id)

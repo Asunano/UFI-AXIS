@@ -249,7 +249,9 @@ interface UfiAxisApi {
      */
     @DELETE("api/media/thumbnail-cache")
     suspend fun clearMediaThumbnailCache(
-        @Query("type") type: String? = null
+        @Query("type") type: String? = null,
+        // 2026-10-07：可选 id —— 传了只清那一条（「重新获取封面」菜单项用）
+        @Query("id") id: Long? = null
     ): JsonElement
 
     /**

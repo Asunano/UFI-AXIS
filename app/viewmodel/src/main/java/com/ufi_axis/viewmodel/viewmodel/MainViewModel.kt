@@ -21,6 +21,9 @@ import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.BackgroundManager
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.util.NetworkMonitor
 import com.ufi_axis.viewmodel.module.*
@@ -431,6 +434,7 @@ class MainViewModel(
 
         // update WS 推送（含订阅时服务端下发的快照）→ 设备更新状态（手动推送 APK 成功/失败）
         collectUpdateFromWs()
+        collectThumbPrewarmFromWs()
     }
 
     /** 收集跨模块 UiEvent，统一分发到目标 Module。
@@ -600,6 +604,26 @@ class MainViewModel(
      * 前端订阅 "update" 主题（见 WebSocketRepository）后，连接建立/恢复时即可收到快照，
      * 解决「手动推送 APK 后未收到更新成功推送」的问题。
      */
+    /**
+     * 2026-10-07：封面预热进度。core 的 ThumbPrewarmWorker 把进度挂在
+     * `data_changed` 消息里（changed = media:thumb-progress + done/total/failed/running），
+     * 设置页订阅 [MediaModule.thumbPrewarmProgress] 显示「预热中 12/85（失败 3）」。
+     */
+    private fun collectThumbPrewarmFromWs() {
+        viewModelScope.launch(Dispatchers.Default) {
+            webSocketRepository.messages.collect { message ->
+                if (message.type != "data_changed") return@collect
+                val obj = message.data as? kotlinx.serialization.json.JsonObject ?: return@collect
+                if (obj["changed"]?.jsonPrimitive?.content != "media:thumb-progress") return@collect
+                val done = obj["done"]?.jsonPrimitive?.intOrNull ?: return@collect
+                val total = obj["total"]?.jsonPrimitive?.intOrNull ?: 0
+                val failed = obj["failed"]?.jsonPrimitive?.intOrNull ?: 0
+                val running = obj["running"]?.jsonPrimitive?.booleanOrNull ?: false
+                media.onThumbPrewarmProgress(done, total, failed, running)
+            }
+        }
+    }
+
     private fun collectUpdateFromWs() {
         viewModelScope.launch(Dispatchers.Default) {
             webSocketRepository.messages.collect { message ->

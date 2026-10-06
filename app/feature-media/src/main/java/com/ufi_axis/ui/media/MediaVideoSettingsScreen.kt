@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.runtime.Composable
@@ -184,6 +185,23 @@ fun MediaVideoSettingsScreen(
                             }
                         }
                     }
+                )
+            }
+            // 2026-10-07：预热进度（core 经 WS data_changed/media:thumb-progress 推送）+ 日志指路
+            UfiSettingsRowCard {
+                val progress by media.thumbPrewarmProgress.collectAsState()
+                UfiSettingsItem(
+                    title = when {
+                        progress?.running == true ->
+                            "预热中 ${progress!!.done}/${progress!!.total}" +
+                                (progress!!.failed.takeIf { it > 0 }?.let { "（失败 $it）" } ?: "")
+                        progress != null ->
+                            "上次预热：新增 ${progress!!.done} / 失败 ${progress!!.failed} / 共 ${progress!!.total}"
+                        else -> "预热状态：暂无记录"
+                    },
+                    description = "开启后自动运行；详细日志在设备的 " +
+                        "/sdcard/Download/UFI-AXIS/log/core/ 当天目录（搜 ffmpeg 或 ThumbPrewarm）。",
+                    icon = Icons.Default.Info
                 )
             }
             UfiSettingsRowCard {

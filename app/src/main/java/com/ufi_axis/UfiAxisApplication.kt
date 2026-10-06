@@ -133,6 +133,33 @@ class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configur
         // 复用共享单例 OkHttpClient（保留长超时与 DEBUG 日志），叠加统一鉴权拦截器
         val okHttpClient = OkHttpClientProvider.shared.newBuilder()
             .addInterceptor(RetrofitClient.authInterceptor { AppPreferences(this@UfiAxisApplication) })
+            .addInterceptor { chain ->
+                val url = chain.request().url.toString()
+                val response = chain.proceed(chain.request())
+                if (url.contains("/api/media/thumbnail?")) {
+                    if (response.isSuccessful) {
+                        response.header("X-Thumb-Source")?.let {
+                            com.ufi_axis.data.api.ThumbSourceRegistry.record(url, it)
+                        }
+                    } else if (response.code == 404) {
+                        // 404 body 是 respondFail 的 JSON，取 message 字段作失败原因
+                        val body = response.peekBody(4096L).string()
+                        val msgKey = "message"
+                        val m = body.indexOf("message")
+                        val reason = if (m < 0) null else {
+                            val q = 34.toChar()
+                            val v0 = body.indexOf(q, m + 9)
+                            val v1 = body.indexOf(q, v0 + 1)
+
+                            if (v0 < 0 || v1 < 0) null else body.substring(v0 + 1, v1)
+                        }
+                        if (!reason.isNullOrEmpty()) {
+                            com.ufi_axis.data.api.ThumbSourceRegistry.recordFailure(url, reason)
+                        }
+                    }
+                }
+                response
+            }
             .build()
 
         return ImageLoader.Builder(context)

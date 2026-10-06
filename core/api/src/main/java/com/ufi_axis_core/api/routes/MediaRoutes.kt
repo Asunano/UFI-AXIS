@@ -2251,11 +2251,39 @@ class MediaRoutes(
                     )
                     return@delete
                 }
+                // 2026-10-07：可选 id —— 传了就只清那一条（手动"重新获取封面"用），
+                // 不带 id 保持整类/全部清空的旧语义，老客户端不受影响。
+                val singleId = call.request.queryParameters["id"]?.toLongOrNull()
                 // video_info/ 一并清（2026-10-05 审查遗留补口）：探测缓存与 .fail 冷却标记
                 // 都随"换抽帧策略/排查黑图"的场景该重置；只在清视频（或不带 type）时清，
                 // 音频/图片场景与它无关。
                 val clearVideoInfo = kind == null || kind == Kind.VIDEO
-                val result = withContext(Dispatchers.IO) {
+                val result = if (singleId != null) {
+                    // 2026-10-07：单条路径 —— 封面缓存 + video_info（探测缓存/冷却标记）各删一份，
+                    // 汇总口径与整类清除一致（removed=0 时不报错，调用方按语义当"本来就没有"）。
+                    withContext(Dispatchers.IO) {
+                        val cache = thumbCacheDir()
+                        var removed = 0
+                        var freed = 0L
+                        val prefix = (kind ?: Kind.VIDEO).key + "_"
+                        cache.listFiles()?.forEach { f ->
+                            if (f.isFile && f.name == "$prefix$singleId.jpg") {
+                                freed = f.length()
+                                if (f.delete()) removed++
+                            }
+                        }
+                        var viRemoved = 0
+                        if (clearVideoInfo) {
+                            val vi = File(appContext.filesDir, "video_info")
+                            listOf("$singleId.json", "$singleId.json.fail").forEach { name ->
+                                val f = File(vi, name)
+                                if (f.isFile && f.delete()) viRemoved++
+                            }
+                        }
+                        Triple(removed, freed, viRemoved)
+                    }
+                } else {
+                withContext(Dispatchers.IO) {
                     val prefix = kind?.let { "${it.key}_" }
                     var removed = 0
                     var freed = 0L
@@ -2278,6 +2306,7 @@ class MediaRoutes(
                         }
                     }
                     Triple(removed, freed, viRemoved)
+                }
                 }
                 AppLogger.i(
                     TAG,

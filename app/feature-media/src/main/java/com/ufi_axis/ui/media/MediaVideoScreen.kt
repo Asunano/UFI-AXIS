@@ -354,6 +354,31 @@ fun MediaVideoScreen(
      * 不用 `menuTarget?.let { 菜单 }` 包起来：那会在关闭时把菜单直接卸载、退场淡出播不出来。
      * 选项的 onClick 在组件内部先于 dismiss() 执行，所以回调里读 `menuTarget` 仍是被长按那一项。
      */
+    // 2026-10-07：单条重抽封面（菜单回调 → 清缓存 + cache-bust 重拉）
+    fun refetchThumbFor(target: com.ufi_axis.data.model.MediaLibraryItem) {
+        scope.launch {
+            // 1) 清设备缓存 + video_info（远端）与本机抽帧成果（feature-media internal 可及）
+            MediaThumbnailBuilder.invalidate(context, "video", target.id)
+            val ok = media.resetThumbnail("video", target.id)
+            if (!ok) {
+                toast = ToastMessage("重置封面缓存失败", ToastType.ERROR)
+            } else {
+                // 2) 立刻重新拉一次：cache-bust URL 绕开 Coil 缓存；404 的 reason
+                //    由 Coil 拦截器记进 ThumbSourceRegistry，详情弹窗能看到
+                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    runCatching {
+                        java.net.URL(media.thumbnailUrlBusted("video", target.id)).openStream()
+                            .use { it.readBytes() }
+                    }
+                }
+                toast = ToastMessage(
+                    "已重新获取封面", ToastType.SUCCESS,
+                    subtitle = "详情弹窗可查看封面来源或失败原因"
+                )
+            }
+        }
+    }
+
     val menuAnchor = menuTarget
     UfiPopupMenu(
         visible = menuAnchor != null,
@@ -379,6 +404,10 @@ fun MediaVideoScreen(
                 }
             },
             onInfo = { infoTarget = menuTarget?.item },
+            onRefetchThumb = {
+                val item = menuTarget?.item
+                if (item != null) refetchThumbFor(item)
+            },
             onDelete = { deleteTarget = menuTarget?.item }
         )
     )
@@ -388,6 +417,7 @@ fun MediaVideoScreen(
         visible = infoTarget != null,
         item = infoTarget,
         videoInfo = { id -> media.videoInfoOf(id) },
+        thumbSource = { type, id -> media.thumbSource(type, id) },
         onDismiss = { infoTarget = null }
     )
 

@@ -7,6 +7,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -96,27 +97,29 @@ internal fun mediaVideoItemMenuOptions(
     onRename: () -> Unit,
     onCopyPath: () -> Unit,
     onInfo: () -> Unit,
+    onRefetchThumb: (() -> Unit)? = null,
     onDelete: () -> Unit
-): List<UfiPopupOption> = listOf(
-    UfiPopupOption("play", "播放", icon = Icons.Default.PlayArrow, onClick = onPlay),
-    UfiPopupOption("download", "下载到手机", icon = Icons.Default.Download, onClick = onDownload),
-    UfiPopupOption(
-        "rename",
-        "重命名",
-        icon = Icons.Default.DriveFileRenameOutline,
-        onClick = onRename
-    ),
-    UfiPopupOption("copy-path", "复制路径", icon = Icons.Default.ContentCopy, onClick = onCopyPath),
-    UfiPopupOption("info", "文件信息", icon = Icons.Default.Info, onClick = onInfo),
-    UfiPopupOption.divider(),
-    UfiPopupOption(
-        "delete",
-        "删除",
-        icon = Icons.Default.Delete,
-        isDestructive = true,
-        onClick = onDelete
+): List<UfiPopupOption> = buildList<UfiPopupOption> {
+    add(UfiPopupOption("play", "播放", icon = Icons.Default.PlayArrow, onClick = onPlay))
+    add(UfiPopupOption("download", "下载到手机", icon = Icons.Default.Download, onClick = onDownload))
+    add(UfiPopupOption("rename", "重命名", icon = Icons.Default.DriveFileRenameOutline, onClick = onRename))
+    add(UfiPopupOption("copy-path", "复制路径", icon = Icons.Default.ContentCopy, onClick = onCopyPath))
+    add(UfiPopupOption("info", "文件信息", icon = Icons.Default.Info, onClick = onInfo))
+    // 2026-10-07：手动重抽封面（清设备缓存后重新走 系统→MMR→ffmpeg 三级）
+    if (onRefetchThumb != null) {
+        add(UfiPopupOption("refetch-thumb", "重新获取封面", icon = Icons.Default.Refresh, onClick = onRefetchThumb))
+    }
+    add(UfiPopupOption.divider())
+    add(
+        UfiPopupOption(
+            "delete",
+            "删除",
+            icon = Icons.Default.Delete,
+            isDestructive = true,
+            onClick = onDelete
+        )
     )
-)
+}
 
 /**
  * 文件信息弹窗。
@@ -135,6 +138,7 @@ internal fun MediaVideoInfoDialog(
     visible: Boolean,
     item: MediaLibraryItem?,
     videoInfo: (suspend (Long) -> VideoInfoResponse?)?,
+    thumbSource: (String, Long) -> String? = { _, _ -> null },
     onDismiss: () -> Unit
 ) {
     UfiCustomDialog(
@@ -197,6 +201,19 @@ internal fun MediaVideoInfoDialog(
                     UfiDialogInfoRow("修改时间", FormatUtils.formatTimestamp(item.date_modified))
                 }
                 UfiDialogInfoRow("路径", item.path, multiline = true)
+                // 2026-10-07：封面来源（core 的 X-Thumb-Source 头，Coil 拦截器记录）。
+                // 没记录（条目没在屏上渲染过封面）整行不显示 —— 与本弹窗"拿不到就不显示"口径一致。
+                thumbSource("video", item.id)?.let { src ->
+                    val label = when {
+                        src.startsWith("fail:") -> "获取失败：${src.removePrefix("fail:")}"
+                        src == "cache" -> "缓存"
+                        src == "system" -> "系统生成"
+                        src == "mmr" -> "本机解码（MMR）"
+                        src == "ffmpeg" -> "ffmpeg 软解"
+                        else -> src
+                    }
+                    UfiDialogInfoRow("封面来源", label)
+                }
                 // probeDone 之前不落任何提示，避免"加载中"闪一下就变成"解析失败"
                 if (probeDone && probed == null) {
                     UfiDialogNote("设备无法解析此文件的编码信息（损坏或容器不受支持）。")
