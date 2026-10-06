@@ -13,6 +13,9 @@
       </div>
       <div class="head-actions">
         <n-input v-model:value="query" size="small" placeholder="搜索文件名" clearable class="head-search" />
+        <span v-if="prewarm" class="prewarm-badge">
+          {{ prewarm.running ? `预热中 ${prewarm.done}/${prewarm.total}` + (prewarm.failed ? `（失败 ${prewarm.failed}）` : '') : `预热完成：新增 ${prewarm.done} / 失败 ${prewarm.failed}` }}
+        </span>
         <n-button size="small" quaternary :loading="loading" @click="reload">刷新</n-button>
       </div>
     </div>
@@ -56,12 +59,23 @@
         @download="downloadPlaying"
       />
       <div v-else class="player-loading"><n-spin size="small" /></div>
+      <div class="refetch-bar">
+        <n-button
+          size="small"
+          quaternary
+          :loading="refetchingId !== null"
+          @click="onRefetchThumb"
+        >
+          重新获取封面
+        </n-button>
+      </div>
     </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { useWebSocketStore } from '@/stores/websocket';
 import { useMessage } from 'naive-ui';
 import { VideocamOutline } from '@vicons/ionicons5';
 import { fetchStreamUrl, formatDuration, formatMediaSize, type MediaItem } from './mediaShared';
@@ -70,8 +84,39 @@ import MediaEmptyState from './components/MediaEmptyState.vue';
 import VideoPlayer from '@/components/VideoPlayer.vue';
 
 const message = useMessage();
-const { api, items, total, loading, loadingMore, permissionDenied, failed, thumbs, hasMore, reload, loadMore } =
+const { api, items, total, loading, loadingMore, permissionDenied, failed, thumbs, hasMore, reload, loadMore, refetchThumb } =
   useMediaLibrary('video');
+
+// 2026-10-07：单条重抽封面 + 预热进度
+const refetchingId = ref<number | null>(null);
+async function onRefetchThumb() {
+  const item = playingItem.value;
+  if (!item || refetchingId.value !== null) return;
+  refetchingId.value = item.id;
+  try {
+    await refetchThumb(item.id);
+    message.success('已重新获取封面');
+  } catch (e: any) {
+    message.error(e?.message || '封面获取失败');
+  } finally {
+    refetchingId.value = null;
+  }
+}
+
+// 预热进度（core 经 data_changed/media:thumb-progress 广播；仅页面开着时订阅）
+const wsStore = useWebSocketStore();
+const prewarm = ref<{ done: number; total: number; failed: number; running: boolean } | null>(null);
+const unsubPrewarm = wsStore.on('data_changed', (payload: any) => {
+  if (payload?.changed === 'media:thumb-progress') {
+    prewarm.value = {
+      done: Number(payload.done) || 0,
+      total: Number(payload.total) || 0,
+      failed: Number(payload.failed) || 0,
+      running: !!payload.running,
+    };
+  }
+});
+onUnmounted(unsubPrewarm);
 
 const query = ref('');
 const playingItem = ref<MediaItem | null>(null);
@@ -128,6 +173,16 @@ onMounted(reload);
 </script>
 
 <style scoped>
+.prewarm-badge {
+  font-size: 12px;
+  color: var(--n-text-color-disabled, #999);
+  white-space: nowrap;
+}
+.refetch-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding: 8px 4px 0;
+}
 /* 页头 / 网格 / 加载更多 / 详情表这几块与图片页同构，但两页各自 scoped：
    共用一份要么抽成组件（两页的网格比例不同，抽了还要加参数），
    要么提到全局（会污染其它页的 .poster-* 命名）。当前规模下各留一份更清楚。 */

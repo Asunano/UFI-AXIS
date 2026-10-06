@@ -279,6 +279,8 @@ export const Endpoints = {
     videoInfo: '/api/media/video-info',
     browse: '/api/media/browse',
     thumbnail: '/api/media/thumbnail',
+    // 2026-10-07：单条重抽封面用（type+id 查询参数）；不带 id 仍是整类/全部清除
+    thumbnailCache: '/api/media/thumbnail-cache',
     cover: '/api/media/cover',
     lyrics: '/api/media/lyrics',
     tags: '/api/media/tags',

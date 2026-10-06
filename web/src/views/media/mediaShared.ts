@@ -95,10 +95,11 @@ export async function fetchMediaPage(
  * 缩略图不可用是**常态**而不是异常：设备 ROM 解不出视频帧、图片格式浏览器不认、
  * core 还没生成缓存都会落到这里。所以失败一律静默，由调用方渲染占位图标。
  */
-export async function fetchThumbUrl(api: MediaApiClient, kind: MediaKind, id: number): Promise<string> {
+export async function fetchThumbUrl(api: MediaApiClient, kind: MediaKind, id: number, bust?: number): Promise<string> {
   try {
     const { data } = await api.get(Endpoints.media.thumbnail, {
-      params: { type: kind, id, size: MEDIA_THUMB_SIZE },
+      // bust：手动重抽时传时间戳绕开浏览器 HTTP 缓存（/thumbnail 带 max-age=86400）
+      params: { type: kind, id, size: MEDIA_THUMB_SIZE, ...(bust ? { v: bust } : {}) },
       responseType: 'blob',
     });
     if (data instanceof Blob && data.size > 0) return URL.createObjectURL(data);

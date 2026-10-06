@@ -302,6 +302,9 @@ async function loadGeneralConfig() {
       goform_command_enabled: 'goformCommandEnabled',
       field_normalization_enabled: 'fieldNormalizationEnabled',
       thumb_prewarm_enabled: 'thumbPrewarmEnabled',
+      // 2026-10-07 修复：ttyd_enabled 此前漏在这张基线表外，generalOriginal 里没有它的键，
+      // probeDescription 一律判成「当前 core 版本不支持此项」并禁用——core 其实支持。
+      ttyd_enabled: 'ttydEnabled',
       sms_code_enabled: 'smsCodeEnabled',
       sms_code_cleanup_hours: 'smsCodeCleanupHours',
       update_source_mode: 'updateSourceMode',

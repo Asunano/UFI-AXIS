@@ -11,11 +11,13 @@
  */
 import { onUnmounted, ref } from 'vue';
 import { useCancellableApi } from '@/composables/useCancellableApi';
+import { Endpoints } from '@/api/contract';
 import {
   createBlobUrlPool,
   fetchMediaPage,
   fetchThumbUrl,
   MEDIA_PAGE_SIZE,
+  MEDIA_THUMB_SIZE,
   type MediaItem,
   type MediaKind,
 } from './mediaShared';
@@ -103,6 +105,26 @@ export function useMediaLibrary(kind: MediaKind) {
     load(items.value.length);
   }
 
+  /**
+   * 2026-10-07：手动重抽单条封面。清设备缓存（含 video_info 探测缓存与 404 冷却标记）
+   * 后用带 `v=` 时间戳的 URL 绕开浏览器/blob 池缓存重拉一次；失败把 core 404 带回的
+   * reason 抛给调用方展示（损坏 / 不支持容器 / ffmpeg 不可用，一眼可判）。
+   */
+  async function refetchThumb(id: number): Promise<void> {
+    await api.delete(`${Endpoints.media.thumbnailCache}?type=${kind}&id=${id}`);
+    const url = await fetchThumbUrl(api, kind, id, Date.now());
+    if (url) thumbs.value[id] = pool.keep(url);
+    else {
+      // fetchThumbUrl 静默吞错，这里要拿到 reason 就得显式再请求一次 404 响应体
+      try {
+        await api.get(Endpoints.media.thumbnail, { params: { type: kind, id, size: MEDIA_THUMB_SIZE } });
+      } catch (e: any) {
+        const reason = e?.response?.data?.reason || e?.response?.data?.error || '';
+        throw new Error(reason ? `封面获取失败：${reason}` : '封面获取失败');
+      }
+    }
+  }
+
   onUnmounted(() => pool.releaseAll());
 
   // loadThumbs 一并暴露：歌单曲目不是这个 composable 拉的（走 /api/playlists/:id/items），
@@ -122,5 +144,6 @@ export function useMediaLibrary(kind: MediaKind) {
     reload,
     loadMore,
     loadThumbs,
+    refetchThumb,
   };
 }
