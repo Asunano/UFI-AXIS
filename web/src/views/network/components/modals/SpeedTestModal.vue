@@ -168,6 +168,21 @@
               <div v-else key="empty" class="st-right-empty" />
             </Transition>
           </div>
+
+          <!-- 定时测速历史（core 侧跑的轮次：定时任务 / 手动触发，2026-10-06） -->
+          <div v-if="history.length || historyLoaded" class="st-history">
+            <div class="st-history-head">
+              <span class="st-history-title">定时测速历史</span>
+              <n-button size="tiny" quaternary :disabled="isRunning" @click="runOnDevice">在设备上测一次</n-button>
+            </div>
+            <div v-for="r in history" :key="r.timestamp" class="st-history-row">
+              <span class="st-h-time">{{ r.time }}</span>
+              <span class="st-h-dl">↓ {{ r.download_mbps }} Mbps</span>
+              <span class="st-h-up">↑ {{ r.upload_mbps }} Mbps</span>
+              <span class="st-h-lat">{{ r.latency_ms }} ms</span>
+              <span class="st-h-trig" :class="r.trigger">{{ r.trigger === 'scheduled' ? '定时' : '手动' }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -471,7 +486,8 @@ async function cancel() {
 watch(
   () => props.show,
   (v) => {
-    if (!v) cancel();
+    if (v) void loadHistory();
+    else cancel();
   }
 );
 
@@ -1054,6 +1070,61 @@ async function start() {
 onUnmounted(() => {
   cancelAll();
 });
+
+// ── 定时测速（core 侧执行，2026-10-06）─────────────────────────
+interface SpeedHistoryItem {
+  timestamp: string;
+  download_mbps: string;
+  upload_mbps: string;
+  latency_ms: string;
+  jitter_ms?: string;
+  trigger: string;
+}
+const history = ref<(SpeedHistoryItem & { time: string })[]>([]);
+const historyLoaded = ref(false);
+
+async function loadHistory(): Promise<void> {
+  try {
+    const uri = '/api/speedtest/history?limit=30';
+    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { headers: await speedHeaders('GET', uri) });
+    if (!res.ok) return;
+    historyLoaded.value = true;
+    const data = (await res.json()) as { items?: SpeedHistoryItem[] };
+    history.value = (data.items ?? []).map((r) => ({
+      ...r,
+      time: new Date(Number(r.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+    }));
+  } catch {
+    // 历史加载失败不打扰：列表区域直接隐藏
+  }
+}
+
+async function runOnDevice(): Promise<void> {
+  try {
+    const uri = '/api/speedtest/run';
+    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { method: 'POST', headers: await speedHeaders('POST', uri) });
+    if (res.status === 409) {
+      message.warning('已有测速在跑');
+      return;
+    }
+    if (!res.ok) {
+      message.error(`设备测速失败（HTTP ${res.status}）`);
+      return;
+    }
+    message.success('设备测速完成，已记入历史');
+    await loadHistory();
+  } catch (e: any) {
+    message.error(`设备测速失败: ${e?.message || '未知错误'}`);
+  }
+}
+
+watch(
+  () => props.show,
+  (show) => {
+    if (show) void loadHistory();
+  },
+  { immediate: true },
+);
 </script>
 
 <style scoped>
@@ -1484,5 +1555,55 @@ onUnmounted(() => {
 .st-target.active .st-t-dot {
   border-color: var(--accent-color);
   background: var(--accent-color);
+}
+
+.st-history {
+  margin-top: 12px;
+  border-top: 1px dashed var(--divider-color, rgba(128, 128, 128, 0.25));
+  padding-top: 8px;
+}
+.st-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.st-history-title {
+  font-size: 12px;
+  opacity: 0.65;
+}
+.st-history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 3px 0;
+  font-variant-numeric: tabular-nums;
+}
+.st-h-time {
+  opacity: 0.6;
+  min-width: 78px;
+}
+.st-h-dl {
+  color: var(--cat-cyan-fg, #00838f);
+  min-width: 104px;
+}
+.st-h-up {
+  min-width: 96px;
+  opacity: 0.8;
+}
+.st-h-lat {
+  opacity: 0.7;
+  min-width: 64px;
+}
+.st-h-trig {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--cat-neutral-bg, rgba(128, 128, 128, 0.15));
+}
+.st-h-trig.scheduled {
+  background: var(--cat-cyan-bg, #e0f2f1);
+  color: var(--cat-cyan-fg, #00838f);
 }
 </style>

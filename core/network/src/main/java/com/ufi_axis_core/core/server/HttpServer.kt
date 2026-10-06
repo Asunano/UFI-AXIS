@@ -31,6 +31,8 @@ import io.netty.buffer.PooledByteBufAllocator
 import io.netty.channel.ChannelOption
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.close
 import kotlinx.serialization.json.*
 import java.time.Duration
 
@@ -75,6 +77,7 @@ class HttpServer(
     private val componentRoutes: com.ufi_axis_core.api.routes.ComponentRoutes? = null,
     /** 终端命令历史（AT / Shell 两端共享），可空只为兼容尚未装配它的调用方。 */
     private val consoleRoutes: com.ufi_axis_core.api.routes.ConsoleRoutes? = null,
+    private val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes? = null,
     /** 配置备份导出 / 恢复，可空同上。 */
     private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null,
     /**
@@ -654,6 +657,7 @@ class HttpServer(
                 appRoutes.register(this)
                 shellRoutes.register(this)
                 consoleRoutes?.register(this)
+                ttydRoutes?.register(this)
                 backupRoutes?.register(this)
                 fileRoutes.register(this)
                 storageSourceRoutes?.register(this)
@@ -682,6 +686,18 @@ class HttpServer(
 
             webSocket("/ws/realtime") {
                 webSocketManager.handleConnection(this)
+            }
+
+            // 真 PTY 终端反代（2026-10-06）：浏览器 WebSocket 发不了自定义头，与 /ws/realtime
+            // 同理挂 /api 之外、凭 PTY 票据鉴权（票据由 POST /api/terminal/pty-ticket 签发，
+            // 签发本身走完整头部鉴权 + ttyd_enabled 开关）。ttyd 只绑 127.0.0.1，这是唯一外部入口。
+            webSocket("/ws/terminal") {
+                val routes = ttydRoutes
+                if (routes == null) {
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal routes not wired"))
+                } else {
+                    routes.proxy(this)
+                }
             }
 
             // 凭票流式播放（2026-09-14）：刻意挂在 `/api` **之外**。

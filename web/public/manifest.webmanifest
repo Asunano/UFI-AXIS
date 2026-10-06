@@ -1,0 +1,19 @@
+{
+  "name": "UFI-AXIS 管理后台",
+  "short_name": "UFI-AXIS",
+  "description": "UFI-AXIS 随身 WiFi 设备管理后台",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#101014",
+  "theme_color": "#101014",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

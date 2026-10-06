@@ -60,6 +60,12 @@ import kotlinx.coroutines.*
  * 各 [1]..[14] 步骤日志完整保留。
  */
 object ComponentFactory {
+    /**
+     * NotificationDispatcher 的延迟引用（2026-10-06）：它构造晚于控制器子图，而测速回调
+     * 只在运行期触发。volatile：build() 在服务协程，回调在测速协程。
+     */
+    @Volatile
+    private var notificationDispatcherRef: com.ufi_axis_core.notify.NotificationDispatcher? = null
 
     private const val TAG = "ComponentFactory"
     private var built = false
@@ -351,7 +357,10 @@ object ComponentFactory {
             capabilities = network.deviceHub.capabilities,
             smsRuleStore = smsRuleStore,
             platform = platform,
-            tuning = tuning
+            tuning = tuning,
+            database = database,
+            wsManager = wsManager,
+            notificationDispatcherProvider = { notificationDispatcherRef }
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
@@ -447,6 +456,7 @@ object ComponentFactory {
             gate = notifyGate,
             criticalOverride = { NotificationRoutes.read(settings).critical_override_enabled }
         )
+        notificationDispatcherRef = notificationDispatcher
         // 注册顺序 = 投递顺序（分发器串行投递）。push 放前面：它是内存操作、几乎立即返回，
         // 而邮件那条要持 WakeLock 做 SMTP 握手，最坏几十秒。先把实时的那条发出去。
         notificationDispatcher.register(com.ufi_axis_core.notify.PushChannel(pushService))
@@ -594,6 +604,22 @@ object ComponentFactory {
         val consoleRoutes = com.ufi_axis_core.api.routes.ConsoleRoutes(
             dao = database.consoleHistoryDao(),
             recorder = consoleRecorder
+        )
+        // 真 PTY 终端（ttyd 反代，2026-10-06）：开关默认关，关着时不会 spawn 任何进程。
+        // 二进制路径用 AssetExtractor 的释放位（filesDir/shell/ttyd），与 aria2c/socat 同源。
+        val ttydRoutes = com.ufi_axis_core.api.routes.TtydRoutes(
+            settings = settings,
+            manager = com.ufi_axis_core.api.terminal.TtydManager(
+                binaryPath = com.ufi_axis_core.util.AssetExtractor.getPath(context, "ttyd")
+            ),
+            // 与 wsManager 同一鉴权源：/ws/terminal 反代握手必须过 query 验签
+            wsAuthenticator = { token, ts, nonce, sig, path ->
+                val result = deviceVerifier.verify(
+                    token = token, timestamp = ts, nonce = nonce, signature = sig,
+                    method = "GET", uri = path
+                )
+                (result as? com.ufi_axis_core.util.DeviceRequestVerifier.Result.Ok)?.device?.fingerprint
+            }
         )
         // 配置备份：Assembler 负责各段内容，Routes 负责 ZIP / manifest / 加密
         val backupRoutes = com.ufi_axis_core.api.routes.BackupRoutes(
@@ -748,7 +774,7 @@ object ComponentFactory {
             gate = { notifyGateOpen(com.ufi_axis_core.controller.notify.LocalSmsChannel.ID) }
         )
         val taskRoutes = TaskRoutes(controller.taskScheduler, controller.conditionEngine)
-        val speedTestRoutes = SpeedTestRoutes()
+        val speedTestRoutes = SpeedTestRoutes(coordinator = controller.speedTestCoordinator)
         val debugLogRoutes = DebugLogRoutes()
         val qosRoutes = QoSRoutes(routeCtx)
         val monitorRoutes = MonitorRoutes(database, scheduler, settings) { enabled ->
@@ -849,6 +875,7 @@ object ComponentFactory {
             tunnelRoutes = tunnelRoutes,
             componentRoutes = componentRoutes,
             consoleRoutes = consoleRoutes,
+            ttydRoutes = ttydRoutes,
             backupRoutes = backupRoutes
         )
         AppLogger.i(TAG, "[14] HTTP server ready (with API cache)")
@@ -1030,7 +1057,15 @@ object ComponentFactory {
         /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
         smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore,
         platform: PlatformAdapter,
-        tuning: com.ufi_axis_core.devicespi.DeviceTuning
+        tuning: com.ufi_axis_core.devicespi.DeviceTuning,
+        /** 定时测速（2026-10-06）：入库 + WS 广播 + 通知都依赖外层已装配好的这三个组件。 */
+        database: com.ufi_axis_core.core.database.AppDatabase,
+        wsManager: WebSocketManager,
+        /**
+         * 通知分发器的**延迟引用**（2026-10-06）：NotificationDispatcher 在本函数之后才装配
+         * （它依赖 pushService / 邮件渠道），而测速回调只在运行期触发，届时引用必已就绪。
+         */
+        notificationDispatcherProvider: () -> com.ufi_axis_core.notify.NotificationDispatcher?
     ): ControllerGraph {
         // SystemController 依赖 device 域（DeviceControl），与原步骤 5 同阶段构造
         val systemController = SystemController(deviceControl)
@@ -1041,8 +1076,59 @@ object ComponentFactory {
 
         // ── 12. 扩展组件 ──
         val smsForwardController = com.ufi_axis_core.controller.sms.SmsForwardController(context, systemCollector)
+        // 测速调度中心（2026-10-06）：跑一轮 → 入库 → WS 广播 + 通知（场景 speedtestResult，
+        // 渠道与是否发送由用户的通知设置决定）。ActionExecutorImpl 的 speedtest 动作与
+        // POST /api/speedtest/run 共用这一个实例。
+        val speedTestCoordinator = com.ufi_axis_core.api.speedtest.SpeedTestCoordinator(
+            runner = com.ufi_axis_core.api.speedtest.SpeedTestRunner(),
+            dao = database.speedTestDao(),
+            onResult = { result, record ->
+                // WS 实时广播：web/app 监听 data_changed/traffic 后刷新测速历史
+                wsManager.broadcast(
+                    com.ufi_axis_core.contract.WsChannel.TRAFFIC,
+                    mapOf(
+                        "speedtest" to mapOf(
+                            "timestamp" to record.timestamp.toString(),
+                            "download_mbps" to "%.2f".format(result.downloadMbps),
+                            "upload_mbps" to "%.2f".format(result.uploadMbps),
+                            "latency_ms" to result.latencyMs.toString(),
+                            "jitter_ms" to result.jitterMs.toString(),
+                            "trigger" to record.trigger,
+                        )
+                    )
+                )
+                // 通知（PushChannel + Mail + Webhook 按用户场景勾选与级别门槛决定）
+                notificationDispatcherProvider()?.emit(
+                    com.ufi_axis_core.notify.NotifyEvent(
+                        scene = com.ufi_axis_core.notify.NotifyScenes.SPEEDTEST_RESULT,
+                        level = com.ufi_axis_core.notify.NotifyLevel.INFO,
+                        title = "测速完成：下行 %.1f Mbps".format(result.downloadMbps),
+                        body = buildString {
+                            append("下行 ").append("%.1f".format(result.downloadMbps)).append(" Mbps")
+                            if (result.uploadMbps >= 0) append("，上行 ").append("%.1f".format(result.uploadMbps)).append(" Mbps")
+                            if (result.latencyMs >= 0) append("，延迟 ").append(result.latencyMs).append(" ms")
+                            if (result.jitterMs >= 0) append("（抖动 ").append(result.jitterMs).append(" ms）")
+                        },
+                        extra = mapOf(
+                            "download_mbps" to "%.2f".format(result.downloadMbps),
+                            "upload_mbps" to "%.2f".format(result.uploadMbps),
+                            "latency_ms" to result.latencyMs.toString(),
+                            "trigger" to record.trigger,
+                        ),
+                    )
+                )
+            }
+        )
         val actionExecutor = ActionExecutorImpl(
-            networkController, systemController, deviceControl, wifiControl, networkControl, capabilities
+            networkController, systemController, deviceControl, wifiControl, networkControl, capabilities,
+            speedtestAction = action@{
+                val r = speedTestCoordinator.runAndStore("scheduled") ?: return@action null
+                buildString {
+                    append("下行 %.1f Mbps".format(r.downloadMbps))
+                    if (r.uploadMbps >= 0) append(" / 上行 %.1f Mbps".format(r.uploadMbps))
+                    if (r.latencyMs >= 0) append(" / 延迟 ${r.latencyMs} ms")
+                }
+            }
         )
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
@@ -1054,6 +1140,7 @@ object ComponentFactory {
         AppLogger.i(TAG, "[12] Extended components initialized")
 
         return ControllerGraph(
+            speedTestCoordinator = speedTestCoordinator,
             systemController = systemController,
             adbController = adbController,
             smsForwardController = smsForwardController,

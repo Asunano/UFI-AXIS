@@ -41,7 +41,9 @@ internal object MailTemplate {
         // 电池：绿色。2026-09-08 电池事件从"伪装成 SYSTEM 短信"改走自己的场景。
         NotifyScenes.BATTERY to "#16a34a",
         // 测试信：灰绿。刻意与所有真实场景都不同色 —— 收件箱里一眼能看出"这封是我自己点出来的"。
-        NotifyScenes.TEST to "#0f766e"
+        NotifyScenes.TEST to "#0f766e",
+        // 测速结果：青色。2026-10-06 定时测速新场景。
+        NotifyScenes.SPEEDTEST_RESULT to "#0891b2"
     )
 
     private val SCENE_LABELS = mapOf(
@@ -54,7 +56,8 @@ internal object MailTemplate {
         NotifyScenes.TUNNEL to "隧道异常",
         NotifyScenes.EVENTS to "设备事件",
         NotifyScenes.BATTERY to "电池状态",
-        NotifyScenes.TEST to "连通性测试"
+        NotifyScenes.TEST to "连通性测试",
+        NotifyScenes.SPEEDTEST_RESULT to "测速结果"
     )
 
     /** 已登记场景色的场景 id。只给 `MailTemplateSceneCoverageTest` 核对登记完整性用。 */

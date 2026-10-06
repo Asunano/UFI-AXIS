@@ -183,6 +183,9 @@ class ConfigRoutes(
                 // 裸 goform 命令通道开关（默认关；关闭时 /api/device/goform/query|set 回 403）
                 // set 会绕过 profile 的 WriteSpec 值域校验，返回值也不脱敏，只在排障时临时打开
                 boolField("goform_command_enabled") { settings.goformCommandEnabled = it }
+                // 真 PTY 终端开关（ttyd 反代，默认关；关闭时 /api/terminal/pty-ticket 403）。
+                // 与 goform_command_enabled 同档位：打开等于把设备 shell 交给持 token 的客户端。
+                boolField("ttyd_enabled") { settings.ttydEnabled = it }
                 // 字段归一化总开关（决策 D7 的排障回退开关，默认开）。2026-09-22 补上写入口：
                 // 之前只有 KEY + 属性 + BACKUP_FIELDS，PUT 没登记、toMap() 也没登记，
                 // 结果只有「导入备份」改得动 —— web/app 做不出真开关。

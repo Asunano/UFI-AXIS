@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { WS_UI_TOPICS, WsChannel } from '../api/contract';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
+import { notifySystem } from '@/composables/browserNotify';
 
 export type WsStatus = 'disconnected' | 'connecting' | 'connected';
 
@@ -91,6 +92,18 @@ export const useWebSocketStore = defineStore('websocket', () => {
         // 分发给注册的 handler
         const handlers = messageHandlers.get(type);
         if (handlers) handlers.forEach((h) => h(data));
+        // 2026-10-06：浏览器系统通知转发 —— 页面不在前台时把验证码/告警送到系统层，
+        // 让用户切到别的标签页也能收到。开关与授权在 browserNotify.ts（默认关、静默降级）。
+        if (type === WsChannel.NOTIFICATION && (data?.type === 'verification' || data?.type === 'sms')) {
+          const extra = data.extra ?? {};
+          notifySystem(
+            extra.code ? `验证码 ${extra.code}` : String(data.title ?? '新短信'),
+            [extra.sender, extra.snippet ?? data.message].filter(Boolean).join(' · '),
+            `code:${extra.code ?? data.timestamp}`,
+          );
+        } else if (type === WsChannel.ALERT && data?.title) {
+          notifySystem(String(data.title), String(data.message ?? ''), `alert:${data.id ?? data.timestamp}`);
+        }
         // 同时分发给通配符订阅
         const allHandlers = messageHandlers.get('*');
         if (allHandlers) allHandlers.forEach((h) => h(msg));

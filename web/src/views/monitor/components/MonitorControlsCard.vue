@@ -140,12 +140,15 @@ const props = defineProps<{
   hours: number;
   /** 任一图表在取数中 —— 只用于刷新按钮的 loading */
   loading: boolean;
+  /** CSV 导出进行中 —— 导出按钮的 loading */
+  exporting?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: 'update:hours', hours: number): void;
   (e: 'refresh'): void;
   (e: 'save', patch: Partial<MonitorPrefs>): void;
+  (e: 'export'): void;
 }>();
 
 const message = useMessage();

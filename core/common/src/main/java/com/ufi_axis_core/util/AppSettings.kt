@@ -30,6 +30,7 @@ class AppSettings(context: Context) {
         private const val KEY_FIELD_NORMALIZATION = "field_normalization_enabled"
         private const val KEY_GOFORM_DUMP_ENABLED = "goform_dump_enabled"
         private const val KEY_GOFORM_COMMAND_ENABLED = "goform_command_enabled"
+        private const val KEY_TTYD_ENABLED = "ttyd_enabled"
         private const val KEY_DEBUG_MODE = "debug_mode"
         private const val KEY_LOG_ENABLED = "log_enabled"
         private const val KEY_CORE_LOG_ENABLED = "core_log_enabled"
@@ -164,6 +165,8 @@ class AppSettings(context: Context) {
             BackupField(KEY_FIELD_NORMALIZATION, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_DUMP_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_COMMAND_ENABLED, BackupValueType.BOOL),
+            // 真 PTY 终端（2026-10-06）：开关进备份，恢复后语义与原机一致
+            BackupField(KEY_TTYD_ENABLED, BackupValueType.BOOL),
             // 日志
             BackupField(KEY_DEBUG_MODE, BackupValueType.BOOL),
             BackupField(KEY_LOG_ENABLED, BackupValueType.BOOL),
@@ -746,6 +749,20 @@ class AppSettings(context: Context) {
     var goformCommandEnabled: Boolean
         get() = prefs.getBoolean(KEY_GOFORM_COMMAND_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_GOFORM_COMMAND_ENABLED, value).apply()
+
+    /**
+     * 真 PTY 终端开关（ttyd 反代，2026-10-06）：**默认关**。
+     *
+     * 与 goform_dump_enabled / goform_command_enabled 同一防御模型：开关本身就是安全边界。
+     * 打开后 core 会按需 spawn assets/shell/ttyd（只绑 127.0.0.1），浏览器凭 PTY 票据经
+     * core 的 WS 反代获得一个**可交互**的设备 shell —— 等于把整台设备的命令行交给
+     * 持 token 的客户端，所以必须由用户显式打开（设置里手动拨开关），且随手可关。
+     * 关闭时：pty-ticket 端点 403、已有 WS 反代连接被拒，但**不主动 kill** 已在跑的
+     * ttyd 进程（惰性退出：core 重启后自然消失；需要立即回收用 /api/service/restart）。
+     */
+    var ttydEnabled: Boolean
+        get() = prefs.getBoolean(KEY_TTYD_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_TTYD_ENABLED, value).apply()
 
     // --- Debug ---
 
@@ -1417,6 +1434,9 @@ class AppSettings(context: Context) {
         "app_log_enabled" to appLogEnabled,
         "goform_dump_enabled" to goformDumpEnabled,
         "goform_command_enabled" to goformCommandEnabled,
+        // 2026-10-06：真 PTY 终端开关。BACKUP_FIELDS / toMap / ConfigRoutes 三处必须同步
+        // 登记 —— 漏一处就是「开关永远显示默认值」那个老 bug 的复刻（见 field_normalization_enabled 的事故注释）。
+        "ttyd_enabled" to ttydEnabled,
         // 2026-09-22：本键就是下面那段「漏一个键 = 开关永远显示默认值」的实例 —— KEY 常量、
         // 读写属性、BACKUP_FIELDS 都齐了，只漏了这一行，于是只有「导入备份」改得动它，
         // web/app 侧永远读回默认 true。补登记。

@@ -4,9 +4,11 @@
       :prefs="prefs"
       :hours="hours"
       :loading="anyLoading"
+      :exporting="exporting"
       @update:hours="hours = $event"
       @refresh="loadAll"
       @save="savePrefs"
+      @export="exportCsv"
     />
 
     <div class="chart-grid">
@@ -78,6 +80,7 @@
  * 偏好与图表数据都留在这里：它们被多张卡同时消费，下沉到任何一张卡都会分叉。
  */
 import { ref, computed, watch, onMounted } from 'vue';
+import { buildMonitorCsv, downloadCsv, type MetricSeries } from '@/composables/monitorCsv';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
@@ -260,6 +263,39 @@ async function loadStorage() {
     /* 静默 */
   } finally {
     loading.value.storage = false;
+  }
+}
+
+/**
+ * 2026-10-06 新增：监控数据 CSV 导出。
+ * 导出的就是当前页面已加载（勾选显示 + 当前时间范围）的序列 ——「所见即所得」，
+ * 与 app 端 exportZip 的全量口径不同（web 不拉未展示的指标，避免额外取数）。
+ */
+const exporting = ref(false);
+async function exportCsv() {
+  if (exporting.value) return;
+  exporting.value = true;
+  try {
+    const series: MetricSeries[] = [];
+    if (metricEnabled('cpu')) series.push({ key: 'cpu', label: 'CPU使用率(%)', points: cpuData.value });
+    if (metricEnabled('memory')) series.push({ key: 'memory', label: '内存使用率(%)', points: memData.value });
+    if (metricEnabled('temperature')) series.push({ key: 'temperature', label: '温度(°C)', points: tempData.value });
+    if (metricEnabled('battery')) series.push({ key: 'battery', label: '电池(%)', points: batData.value });
+    if (metricEnabled('traffic_rx') && rxDatas.value.length)
+      series.push({ key: 'traffic_rx', label: '下行(B/s)', points: rxDatas.value });
+    if (metricEnabled('traffic_tx') && txDatas.value.length)
+      series.push({ key: 'traffic_tx', label: '上行(B/s)', points: txDatas.value });
+    if (metricEnabled('signal_rsrp') && rsrpDatas.value.length)
+      series.push({ key: 'signal_rsrp', label: 'RSRP(dBm)', points: rsrpDatas.value });
+    if (metricEnabled('signal_sinr') && sinrDatas.value.length)
+      series.push({ key: 'signal_sinr', label: 'SINR(dB)', points: sinrDatas.value });
+    if (!series.length) {
+      message.warning('没有可导出的指标：请先在监控设置中勾选要显示的指标');
+      return;
+    }
+    downloadCsv(`ufi-monitor-${new Date().toISOString().slice(0, 10)}.csv`, buildMonitorCsv(series, hours.value));
+  } finally {
+    exporting.value = false;
   }
 }
 

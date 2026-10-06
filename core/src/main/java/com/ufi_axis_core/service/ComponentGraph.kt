@@ -107,7 +107,9 @@ data class ControllerGraph(
     val downloadManager: DownloadManager,
     val taskScheduler: TaskScheduler,
     val conditionEngine: ConditionEngine,
-    val tunnelManager: TunnelManager
+    val tunnelManager: TunnelManager,
+    /** 定时测速调度中心（2026-10-06）：SpeedTestRoutes 的 /run、/history 共用。 */
+    val speedTestCoordinator: com.ufi_axis_core.api.speedtest.SpeedTestCoordinator
 )
 
 /** 服务端相关：HTTP Server + 推送 / 鉴权 / 告警 / 调度 / 线程池。 */

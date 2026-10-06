@@ -458,6 +458,10 @@ export const Endpoints = {
     root: '/api/speedtest',
     upload: '/api/speedtest/upload',
     relay: '/api/speedtest/relay',
+    /** POST：手动触发一轮定时测速（跑+入库+WS 广播+通知，2026-10-06） */
+    run: '/api/speedtest/run',
+    /** GET ?limit=：定时测速历史（新的在前） */
+    history: '/api/speedtest/history',
   },
   diagnose: '/api/diagnose',
   wsRealtime: '/ws/realtime',

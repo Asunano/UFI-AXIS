@@ -23,7 +23,10 @@ import java.net.URL
  * - `GET|POST /api/speedtest/relay?url=` — **仅 Web**：把外网自建节点请求经 core 转发。
  *   浏览器无法直连无 CORS 的测速站；App 仍直连节点，不走本端点。url 必须在白名单内。
  */
-class SpeedTestRoutes {
+class SpeedTestRoutes(
+    /** 可空：定时测速调度中心（2026-10-06）。null 时 /run 与 /history 回 501。 */
+    private val coordinator: com.ufi_axis_core.api.speedtest.SpeedTestCoordinator? = null,
+) {
     private val tag = "SpeedTest"
     private val limiter = Semaphore(MAX_CONCURRENT)
     private val buffer = ByteArray(Units.SPEEDTEST_CHUNK_BYTES) { 0x66.toByte() }
@@ -77,6 +80,41 @@ class SpeedTestRoutes {
             }
 
             // ── 上行：读完即丢，只回报字节数 ──
+            // ── 定时测速：手动触发一轮「跑+入库+WS广播+通知」──────
+            post("/run") {
+                val coord = coordinator
+                if (coord == null) {
+                    call.respond(HttpStatusCode.NotImplemented, "测速调度未装配")
+                    return@post
+                }
+                val record = coord.runAndStore("manual")
+                if (record == null) {
+                    call.respond(HttpStatusCode.Conflict, mapOf("code" to "BUSY", "message" to "已有测速在跑"))
+                } else {
+                    call.respond(
+                        mapOf(
+                            "timestamp" to record.timestamp.toString(),
+                            "download_mbps" to "%.2f".format(record.downloadMbps),
+                            "upload_mbps" to "%.2f".format(record.uploadMbps),
+                            "latency_ms" to record.latencyMs.toString(),
+                            "jitter_ms" to record.jitterMs.toString(),
+                            "trigger" to record.trigger,
+                        )
+                    )
+                }
+            }
+
+            // ── 定时测速历史：limit 上限 500 ──────
+            get("/history") {
+                val coord = coordinator
+                if (coord == null) {
+                    call.respond(HttpStatusCode.NotImplemented, "测速调度未装配")
+                    return@get
+                }
+                val limit = (call.request.queryParameters["limit"]?.toIntOrNull() ?: 100).coerceIn(1, 500)
+                call.respond(mapOf("items" to coord.history(limit)))
+            }
+
             post("/upload") {
                 if (!limiter.tryAcquire()) {
                     call.respond(HttpStatusCode.TooManyRequests, "请求频率过多")

@@ -36,6 +36,7 @@ dependencies {
     //   - :core:collector  → 部分 Route 直接调用采集器
     //   - :core:cache      → ResponseCache 直连
     //   - :core:database   → AppDatabase 直连
+    implementation(project(":core:websocket"))
     implementation(project(":core:common"))
     implementation(project(":core:contract"))
     implementation(project(":core:database"))
@@ -63,6 +64,10 @@ dependencies {
     // Ktor Server (for routing DSL)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.websockets)
+    // 2026-10-06：ttyd WS 反代需要 client 侧 websocket（core → 127.0.0.1:ttyd）
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.websockets)
     implementation(libs.ktor.server.status.pages)
     implementation(libs.ktor.serialization.kotlinx.json)
     // Room Database (for AppDatabase subclasses)

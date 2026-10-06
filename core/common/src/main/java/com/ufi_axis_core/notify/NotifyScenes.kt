@@ -75,10 +75,20 @@ object NotifyScenes {
      */
     const val TEST = "test"
 
+    /**
+     * 测速结果（定时测速，2026-10-06）。
+     *
+     * 由 SpeedTestCoordinator 在每轮测速完成后 emit；走通知渠道由用户在通知设置里
+     * 按场景勾选（不勾 = 只入库 + WS 广播，不打扰）。**不进** SINGLE_TOPIC_SCENES：
+     * 测速结果允许双发（notification + alert），它天然是「值得在告警流里看到的一条」。
+     * app 侧 NotifyScene 镜像需同步补 SPEEDTEST_RESULT（枚举值 speedtestResult）。
+     */
+    const val SPEEDTEST_RESULT = "speedtestResult"
 
     /** core 侧会产出的全部场景 id。新增常量必须同时登记到这里。 */
     val ALL: Set<String> = setOf(
-        SMS, VERIFICATION, ALERT, CONNECTIVITY, TRAFFIC_80, DOWNLOAD, TUNNEL, EVENTS, BATTERY, TEST
+        SMS, VERIFICATION, ALERT, CONNECTIVITY, TRAFFIC_80, DOWNLOAD, TUNNEL, EVENTS, BATTERY, TEST,
+        SPEEDTEST_RESULT
     )
 }
 

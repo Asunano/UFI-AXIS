@@ -43,9 +43,10 @@ import java.io.File
         MemoryHistoryRecord::class,
         BatteryHistoryRecord::class,
         MailSendRecord::class,
-        ConsoleHistoryRecord::class
+        ConsoleHistoryRecord::class,
+        SpeedTestRecord::class
     ],
-    version = 14,
+    version = 15,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -64,6 +65,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun batteryHistoryDao(): BatteryHistoryDao
     abstract fun mailSendRecordDao(): MailSendRecordDao
     abstract fun consoleHistoryDao(): ConsoleHistoryDao
+    abstract fun speedTestDao(): SpeedTestDao
 
     /**
      * 将 5 个 buffer 的写入合并为 1 个事务，减少事务竞争。
@@ -429,6 +431,31 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * v14→v15：新增 `speedtest_history`（定时测速的数据源，2026-10-06）。
+         *
+         * 纯建表，既有数据不受影响。主键 timestamp 即 rowid 别名（同 MIGRATION_13_14
+         * 的论证），不额外建索引。清理走 DataScheduler.cleanOldData 的 retentionDays。
+         */
+        @VisibleForTesting
+        internal val MIGRATION_14_15 = object : Migration(14, 15) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `speedtest_history` (
+                        `timestamp` INTEGER PRIMARY KEY NOT NULL,
+                        `trigger` TEXT NOT NULL,
+                        `latencyMs` INTEGER NOT NULL,
+                        `jitterMs` INTEGER NOT NULL,
+                        `downloadMbps` REAL NOT NULL,
+                        `uploadMbps` REAL NOT NULL,
+                        `bytesUsed` INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+        }
+
+        /**
          * 全部迁移，按版本递增排列。**新增迁移只追加到这个数组末尾。**
          *
          * 2026-09-08：生产装配与两个 androidTest 此前各手抄一份迁移列表。DB 从 8 一路涨到 10
@@ -458,7 +485,7 @@ abstract class AppDatabase : RoomDatabase() {
         internal val ALL_MIGRATIONS: Array<Migration> = arrayOf(
             MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7,
             MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11,
-            MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14
+            MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15
         )
 
         /**

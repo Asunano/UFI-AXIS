@@ -12,10 +12,11 @@
       :value="activeTab"
       display-directive="if"
       class="console-tabbar"
-      @update:value="(v: string) => (activeTab = v as 'at' | 'shell')"
+      @update:value="(v: string) => (activeTab = v as 'at' | 'shell' | 'pty')"
     >
       <n-tab-pane name="at" tab="AT 命令" />
       <n-tab-pane name="shell" tab="Shell" />
+      <n-tab-pane name="pty" tab="真 PTY" />
     </n-tabs>
 
     <!--
@@ -65,10 +66,12 @@
       </div>
 
       <!-- ── 消息列表：flex:1 内部滚动 ── -->
-      <ConsoleMessageList :messages="activeMessages" :loading="activeSending" class="pane-list" />
+       <!-- 真 PTY：独立 xterm 面板，替代对话流（PTY 是流式全屏，没有"消息列表"概念） -->
+      <PtyPane v-if="activeTab === 'pty'" class="pane-list pty-host" />
+      <ConsoleMessageList v-else :messages="activeMessages" :loading="activeSending" class="pane-list" />
 
       <!-- ── 快捷命令 ── -->
-      <div class="quick-cmds">
+      <div v-if="activeTab !== 'pty'" class="quick-cmds">
         <n-tag v-for="q in activeQuick" :key="q.key" size="small" class="quick-tag" @click="runQuick(q.cmd)">
           {{ q.label }}
         </n-tag>
@@ -82,6 +85,7 @@
 
       <!-- ── 吸底输入栏（AT/Shell 共用，按 activeTab 绑数据）── -->
       <ConsoleInputBar
+        v-if="activeTab !== 'pty'"
         v-model="activeCommand"
         :loading="activeSending"
         :placeholder="
@@ -101,6 +105,7 @@ import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useWebSocketStore } from '@/stores/websocket';
 import ConsoleMessageList from './components/ConsoleMessageList.vue';
+import PtyPane from './components/PtyPane.vue';
 import ConsoleInputBar from './components/ConsoleInputBar.vue';
 import { nextId, ensureSeqAbove, type ConsoleMessage } from './components/types';
 
@@ -109,7 +114,7 @@ const message = useMessage();
 const wsStore = useWebSocketStore();
 
 // ── 当前 Tab（单布局：状态条/列表/输入栏都按它切数据）──
-const activeTab = ref<'at' | 'shell'>('at');
+const activeTab = ref<'at' | 'shell' | 'pty'>('at');
 
 // ── 快捷命令 ──
 const quickAtCmds = [

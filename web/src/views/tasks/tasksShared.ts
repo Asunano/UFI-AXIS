@@ -68,6 +68,8 @@ export const actionOptions = [
   { label: '漫游', value: 'roaming_toggle' },
   { label: '网络模式', value: 'network_mode' },
   { label: '自定义命令', value: 'custom_shell' },
+  // 定时测速（2026-10-06）：跑一轮测速并入库，结果走通知渠道（speedtestResult 场景）
+  { label: '定时测速', value: 'speedtest' },
 ];
 
 /** 这些动作的参数是一个开关（params.enabled），摘要文案要说「开启/关闭」 */
@@ -161,6 +163,7 @@ const actionIconMap: Record<string, Component> = {
   roaming_toggle: GlobeOutline,
   network_mode: CellularOutline,
   custom_shell: TerminalOutline,
+  speedtest: SpeedometerOutline,
 };
 
 const triggerIconMap: Record<string, Component> = {

@@ -29,6 +29,7 @@ private val NOTIFY_SCENE_LABEL_BY_ID: Map<String, String> = mapOf(
     NotifyScene.TUNNEL.sceneId to "隧道异常",
     NotifyScene.DEVICE_EVENTS.sceneId to "设备事件",
     NOTIFY_SCENE_BATTERY to "电池状态",
+    NOTIFY_SCENE_SPEEDTEST to "测速结果",
     NOTIFY_SCENE_TEST to "手动测试"
 )
 
@@ -49,7 +50,8 @@ private val NOTIFY_SCENE_CHIP_IDS: List<String> = listOf(
     NotifyScene.DOWNLOAD.sceneId,
     NotifyScene.TUNNEL.sceneId,
     NotifyScene.DEVICE_EVENTS.sceneId,
-    NOTIFY_SCENE_BATTERY
+    NOTIFY_SCENE_BATTERY,
+    NOTIFY_SCENE_SPEEDTEST
 )
 
 /** 场景勾选 chip 的 `id to 标签`（三条渠道共用，顺序即展示顺序）。 */
@@ -73,6 +75,14 @@ internal fun sceneLabel(sceneId: String): String = NOTIFY_SCENE_LABEL_BY_ID[scen
  * 硬给它造一个通知场景枚举项才是假开关。
  */
 internal const val NOTIFY_SCENE_BATTERY = "battery"
+
+/**
+ * 测速结果的场景 id（core `NotifyScenes.SPEEDTEST_RESULT`，2026-10-06 定时测速）。
+ *
+ * 与 [NOTIFY_SCENE_BATTERY] 同理没有对应的 [NotifyScene]：app 侧推送分流认不出
+ * 这个 type，硬造枚举项才是假开关。进 [NOTIFY_SCENE_CHIP_IDS]（可勾选）。
+ */
+internal const val NOTIFY_SCENE_SPEEDTEST = "speedtestResult"
 
 /**
  * 手动测试信的场景 id（core `NotifyScenes.TEST`）。

@@ -168,6 +168,10 @@ object Endpoints {
         const val UPLOAD = "$BASE/upload"
         /** GET/POST：`url` 必须是白名单外网节点地址；转发 Range / 流式 body */
         const val RELAY = "$BASE/relay"
+        /** POST：手动触发一轮定时测速（跑+入库+广播+通知，2026-10-06） */
+        const val RUN = "$BASE/run"
+        /** GET ?limit=：测速历史（新的在前） */
+        const val HISTORY = "$BASE/history"
     }
 
     /**

@@ -62,6 +62,20 @@
             <span class="config-label">手机端日志</span>
             <n-switch v-model:value="generalForm.appLogEnabled" :disabled="!generalLoaded || !generalForm.logEnabled" />
           </div>
+      </div>
+      <div class="config-section">
+        <div class="section-subtitle">本浏览器</div>
+        <!-- 2026-10-06：浏览器系统通知 —— web 本地偏好（localStorage），不写设备配置 -->
+        <div class="config-item switch-item">
+          <span class="config-label">系统通知（验证码/告警，页面在后台时提醒）</span>
+          <n-switch
+            :value="browserNotifyOn"
+            @update:value="(v: boolean) => toggleBrowserNotify(v)"
+          />
+        </div>
+        <div v-if="browserNotifyHint" class="section-subtitle" style="color: var(--n-warning-color, #f0a050)">
+          {{ browserNotifyHint }}
+        </div>
           <div class="config-item switch-item">
             <span class="config-label">详细日志（Debug）</span>
             <n-switch v-model:value="generalForm.debugMode" :disabled="!generalLoaded || !generalForm.logEnabled" />
@@ -87,6 +101,14 @@
           :loading="probeSaving.goform_command_enabled"
           :disabled="probeSwitchDisabled('goform_command_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('goform_command_enabled', v)"
+        />
+        <ToggleRow
+          label="真 PTY 终端（ttyd，默认关，改动立即生效）"
+          :description="probeDescription('ttyd_enabled', PROBE_TTYD_DESC)"
+          :model-value="generalForm.ttydEnabled"
+          :loading="probeSaving.ttyd_enabled"
+          :disabled="probeSwitchDisabled('ttyd_enabled')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('ttyd_enabled', v)"
         />
         <ToggleRow
           label="字段归一化（默认开，改完需重启后台服务）"
@@ -200,6 +222,11 @@ import GridCard from '@/components/GridCard.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
 import { ConfigLimits, Endpoints, describeConfigReject, type ConfigRejectedField } from '@/api/contract';
 import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
+import {
+  isBrowserNotifyEnabled,
+  enableBrowserNotify,
+  disableBrowserNotify,
+} from '@/composables/browserNotify';
 
 const message = useMessage();
 const api = getApiClient();
@@ -210,6 +237,22 @@ const savingGeneral = ref(false);
 /** 是否已经从 core 读到过配置。false 时表单值只是硬编码初值，禁止编辑与保存。 */
 const generalLoaded = ref(false);
 const generalOriginal = reactive<Record<string, any>>({});
+// ── 浏览器系统通知（本地偏好，非设备配置）──────────────────────────────
+const browserNotifyOn = ref(isBrowserNotifyEnabled());
+const browserNotifyHint = ref('');
+async function toggleBrowserNotify(v: boolean) {
+  if (v) {
+    // 必须在用户手势的同步调用栈里发 requestPermission，所以整个 toggle 由 switch 点击触发
+    const result = await enableBrowserNotify();
+    browserNotifyOn.value = result === '已开启';
+    browserNotifyHint.value = result === '已开启' ? '' : result;
+  } else {
+    disableBrowserNotify();
+    browserNotifyOn.value = false;
+    browserNotifyHint.value = '';
+  }
+}
+
 const generalForm = reactive({
   goformIp: '',
   goformPort: 8080,
@@ -225,6 +268,7 @@ const generalForm = reactive({
   debugMode: false,
   // GET /api/device/goform（设备原始 dump）的开关，core 侧默认关，关着时该端点回 403
   goformDumpEnabled: false,
+  ttydEnabled: false,
   // 裸 goform 命令通道开关，管 POST /api/device/goform/query 与 POST /api/device/goform/set
   // （core 侧 rejectIfCommandDisabled，关着时两个端点都回 403）。
   // 默认 false 与 core 一致，而且必须是 false：set 绕过 profile 的 WriteSpec 值域校验、
@@ -377,13 +421,22 @@ async function detectGeo(force: boolean): Promise<string> {
 
 // ── 三个排障开关：单键即时保存（生效时机各自不同，见 PROBE_NEEDS_RESTART）──
 
-type ProbeApiKey = 'goform_dump_enabled' | 'goform_command_enabled' | 'field_normalization_enabled' | 'thumb_prewarm_enabled';
+type ProbeApiKey =
+  | 'goform_dump_enabled'
+  | 'goform_command_enabled'
+  | 'ttyd_enabled'
+  | 'field_normalization_enabled'
+  | 'thumb_prewarm_enabled';
 
 /** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
-const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEnabled' | 'fieldNormalizationEnabled' | 'thumbPrewarmEnabled'> =
+const PROBE_FORM_KEY: Record<
+  ProbeApiKey,
+  'goformDumpEnabled' | 'goformCommandEnabled' | 'ttydEnabled' | 'fieldNormalizationEnabled' | 'thumbPrewarmEnabled'
+> =
   {
     goform_dump_enabled: 'goformDumpEnabled',
     goform_command_enabled: 'goformCommandEnabled',
+    ttyd_enabled: 'ttydEnabled',
     field_normalization_enabled: 'fieldNormalizationEnabled',
     thumb_prewarm_enabled: 'thumbPrewarmEnabled',
   };
@@ -402,6 +455,7 @@ const PROBE_FORM_KEY: Record<ProbeApiKey, 'goformDumpEnabled' | 'goformCommandEn
 const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
   goform_dump_enabled: false,
   goform_command_enabled: false,
+  ttyd_enabled: false,
   field_normalization_enabled: true,
   thumb_prewarm_enabled: false,
 };
@@ -410,6 +464,7 @@ const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
 const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
   goform_dump_enabled: false,
   goform_command_enabled: false,
+  ttyd_enabled: false,
   field_normalization_enabled: false,
   thumb_prewarm_enabled: false,
 });
@@ -417,6 +472,10 @@ const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
 const PROBE_DUMP_DESC =
   '控制 GET /api/device/goform（设备原始字段 dump，不走 profile 归一化也不脱敏），关着时该端点回 403。' +
   '改动立即生效，不需要点下方「保存」。';
+const PROBE_TTYD_DESC =
+  '打开后终端页出现「真 PTY」标签页：由设备上的 ttyd 提供 root 环境真实 shell（会话 30 分钟滑动过期）。' +
+  '默认关闭：该功能授予浏览器侧完整的 shell 执行能力，仅在排障时开启。';
+
 const PROBE_COMMAND_DESC =
   '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
   '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +

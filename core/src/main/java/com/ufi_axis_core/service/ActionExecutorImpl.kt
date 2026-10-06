@@ -38,7 +38,12 @@ class ActionExecutorImpl(
     private val device: DeviceControl,
     private val wifi: WifiControl,
     private val network: NetworkControl,
-    private val capabilities: Set<Capability>
+    private val capabilities: Set<Capability>,
+    /**
+     * 定时测速（2026-10-06，可空兼容既有装配/测试）：执行一轮「跑+入库+推送」，
+     * 返回结果摘要；null = 并发位被占 / 未装配。
+     */
+    private val speedtestAction: (suspend () -> String?)? = null
 ) : ActionExecutor {
 
     override suspend fun execute(actionType: String, params: Map<String, JsonPrimitive>): ActionResult {
@@ -143,6 +148,16 @@ class ActionExecutorImpl(
                     rejected != null -> "网络模式参数被拒绝：$rejected"
                     else -> "网络模式切换失败（${NetworkMode.label(mode)} → $bearer）"
                 })
+            }
+            "speedtest" -> {
+                val action = speedtestAction
+                if (action == null) {
+                    ActionResult(false, "测速执行器未装配")
+                } else {
+                    val summary = action()
+                    if (summary == null) ActionResult(false, "已有测速在跑")
+                    else ActionResult(true, summary)
+                }
             }
             "custom_shell" -> {
                 val cmd = params["command"]?.content ?: ""

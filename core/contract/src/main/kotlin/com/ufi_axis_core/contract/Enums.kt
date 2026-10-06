@@ -21,7 +21,12 @@ enum class ActionType(val wire: String) {
     PERFORMANCE_MODE("performance_mode"),
     ROAMING_TOGGLE("roaming_toggle"),
     NETWORK_MODE("network_mode"),
-    CUSTOM_SHELL("custom_shell");
+    CUSTOM_SHELL("custom_shell"),
+    /**
+     * 定时测速（2026-10-06）：core 本地跑一轮测速并入库 + 推送。
+     * 参数：notify（Boolean，默认 true —— 完成后走通知渠道）。
+     */
+    SPEEDTEST("speedtest");
 
     companion object {
         val ALL: List<String> = entries.map { it.wire }
