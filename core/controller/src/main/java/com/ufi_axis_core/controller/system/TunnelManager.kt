@@ -48,6 +48,16 @@ class TunnelManager(private val appContext: android.content.Context) {
 
     private val guardScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * startGuard/stopGuard 的互斥锁（2026-10-05 R1-4 修复）。
+     *
+     * **必须声明在 init{} 之前**：init 块会调 startGuard() → synchronized(guardLock)。
+     * 曾因声明在 startGuard 函数之后（Kotlin 按声明序初始化属性）导致 init 先跑、
+     * 锁还是 null → ART "Null reference used for synchronization (monitor-enter)"，
+     * core 起不来（2026-10-07 真机 R8 包复现，retrace 定位到本行）。
+     */
+    private val guardLock = Any()
+
     @Volatile private var guardJob: Job? = null
 
     /** name → 连续重连失败次数；用户手动启动会清零 */
@@ -239,9 +249,6 @@ class TunnelManager(private val appContext: android.content.Context) {
         }
         AppLogger.i(TAG, "Tunnel guard started")
     }
-
-    /** startGuard/stopGuard 的互斥锁（2026-10-05 R1-4 修复）。 */
-    private val guardLock = Any()
 
     /** 停止看护。**必须在 [shutdown] 停实例之前调用**，否则看护会跟停止流程抢着重启。 */
     fun stopGuard() {
