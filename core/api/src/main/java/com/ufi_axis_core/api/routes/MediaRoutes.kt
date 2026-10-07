@@ -771,12 +771,20 @@ class MediaRoutes(
                 // MMR 解不出画面时返回 success(null)——recoverCatching 只对 failure 生效，
                 // 于是 2.5 级 ffmpeg 兜底从未被执行（日志零 ffmpeg 记录即旁证）。
                 // 改为显式判空：MMR 无果（null 或异常）都进 ffmpeg。
-                val mmr = videoFrameThumbnail(uri, size)
-                if (mmr.getOrNull() != null) mmr
-                else mmr.recoverCatching {
-                    // 2026-10-05 G2（FFmpeg 接入计划书 §2.1）：MMR 在本机 ROM 恒 null（无 VPU），
-                    // ffmpeg 软解补上"系统与 MMR 双失败"与"手机端回传兜底"之间的空档。
-                    ffmpegThumbnail(uri, size)?.also { ffmpegRecovered = true }
+                //
+                // 2026-10-07 二次修复（r14 安装即崩根因）：上版 `mmr.recoverCatching{}` 的
+                // 编译产物经 R8 full mode 处理后，dex string 表出现连续重复的
+                // 'ScheduledExecutorService' 条目（dex 规范要求 string_ids 严格递增），
+                // ART 安装期校验直接拒绝 → 打不开。弃用 Result 组合子链，改普通 try/catch，
+                // 语义不变（MMR 无果/异常都进 ffmpeg 兜底）。
+                val mmr = runCatching { videoFrameThumbnail(uri, size) }.getOrElse { Result.failure(it) }
+                if (mmr.getOrNull() != null) {
+                    mmr
+                } else {
+                    val ffmpeg = runCatching {
+                        ffmpegThumbnail(uri, size)?.also { ffmpegRecovered = true }
+                    }
+                    if (ffmpeg.getOrNull() != null) ffmpeg else mmr
                 }
             }
             Kind.IMAGE -> downscaledImageThumbnail(uri, size)
