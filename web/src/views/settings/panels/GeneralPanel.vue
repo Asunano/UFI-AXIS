@@ -488,10 +488,6 @@ const PROBE_COMMAND_DESC =
   '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
   '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +
   '改动立即生效，不需要点下方「保存」；只在排障时临时打开，看完立刻关回去。';
-const PREWARM_DESC =
-  '开=设备闲时（充电或电量>30%、仅 Wi-Fi 场景）用 ffmpeg 批量为库内视频生成封面，' +
-  '列表打开更快；与前台抽帧共用解码通道，每张间隔 2 秒让路。OTA 更新期间自动暂停。' +
-  '改动立即生效，不需要点下方「保存」。';
 const PROBE_FIELD_NORMALIZATION_DESC =
   '开=按设备 profile 的登记表把设备字段归一化成统一字段名（默认，正常使用就该开着）；' +
   '关=读侧原样透传设备原始字段，仅排障用。已实测的副作用：流量限额整块会变成默认值' +
