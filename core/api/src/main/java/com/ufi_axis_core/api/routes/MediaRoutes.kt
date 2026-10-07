@@ -793,7 +793,21 @@ class MediaRoutes(
         // 2026-10-05 G4：MMR 成功 → mmr；ffmpeg 2.5 级成功 → ffmpeg（以异常链是否为空区分不可靠，
         // 改为 recoverCatching 内部直接回填 —— 这里用 generated 里的字节一致性判断不可行，
         // 简化口径：video 走 MMR 失败且 ffmpeg 成功时 source=ffmpeg，见 ffmpegRecovered 标志）
-        generated.getOrNull()?.let { return ThumbnailAttempt(it, "", source = if (kind == Kind.VIDEO && ffmpegRecovered) "ffmpeg" else "mmr") }
+        generated.getOrNull()?.let { bytes ->
+            // 2026-10-07（真机定罪：缩略图请求 90s 超时、列表永远空白）：此前成功生成后
+            // 直接返回、**从不落盘**，写盘只存在于手机回传 PUT 与预热 Worker 两条路径。
+            // 本机 ROM 走 MMR/ffmpeg 每次要 60~90s，客户端图片请求早超时放弃 → 列表永远
+            // 空白且每次刷新都重算。这里补落盘（与 PUT 路径同一套 tmp+rename 原子写法）：
+            // 首刷慢是一次性的，之后全部秒回 ①缓存命中。失败不影响本次响应。
+            runCatching {
+                val target = thumbCacheFile(kind, id)
+                val tmp = File(target.parentFile, "${target.name}.tmp")
+                tmp.writeBytes(bytes)
+                if (target.exists()) target.delete()
+                if (!tmp.renameTo(target)) tmp.delete()
+            }
+            return ThumbnailAttempt(bytes, "", source = if (kind == Kind.VIDEO && ffmpegRecovered) "ffmpeg" else "mmr")
+        }
 
         val generatedReason = generated.exceptionOrNull()
             ?.let { "自行生成 ${it.javaClass.simpleName}: ${it.message}" }
