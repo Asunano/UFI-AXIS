@@ -17,6 +17,27 @@
           {{ prewarm.running ? `预热中 ${prewarm.done}/${prewarm.total}` + (prewarm.failed ? `（失败 ${prewarm.failed}）` : '') : `预热完成：新增 ${prewarm.done} / 失败 ${prewarm.failed}` }}
         </span>
         <n-button size="small" quaternary :loading="loading" @click="reload">刷新</n-button>
+        <!-- 2026-10-07：封面设置从 GeneralPanel 迁来 —— 视频域的开关放视频页，设置页只留全局项 -->
+        <n-popover trigger="click" placement="bottom-end" :width="300">
+          <template #trigger>
+            <n-button size="small" quaternary :loading="thumbCfgLoading">
+              <template #icon><n-icon><SettingsOutline /></n-icon></template>
+              封面设置
+            </n-button>
+          </template>
+          <div class="thumb-cfg">
+            <n-switch v-model:value="thumbCfg.prewarmEnabled" size="small" @update:value="savePrewarmEnabled" />
+            <span class="thumb-cfg-label">后台预热封面（闲时自动补齐，开=立即生效）</span>
+            <n-switch v-model:value="thumbCfg.wifiOnly" size="small" @update:value="saveWifiOnly" />
+            <span class="thumb-cfg-label">仅充电或电量充足（>30%）时预热</span>
+            <n-button size="tiny" :disabled="!thumbCfg.prewarmEnabled" :loading="prewarmNowRunning" @click="prewarmNow" style="grid-column: 2">
+              立即预热一轮
+            </n-button>
+            <span class="thumb-cfg-note" style="grid-column: 1 / -1">
+              进度见上方徽标；详细日志在设备 /sdcard/Download/UFI-AXIS/log/core/ 当天目录。
+            </span>
+          </div>
+        </n-popover>
       </div>
     </div>
 
@@ -74,14 +95,55 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
 import { useWebSocketStore } from '@/stores/websocket';
 import { useMessage } from 'naive-ui';
-import { VideocamOutline } from '@vicons/ionicons5';
+import { VideocamOutline, SettingsOutline } from '@vicons/ionicons5';
 import { fetchStreamUrl, formatDuration, formatMediaSize, type MediaItem } from './mediaShared';
 import { useMediaLibrary } from './useMediaLibrary';
 import MediaEmptyState from './components/MediaEmptyState.vue';
 import VideoPlayer from '@/components/VideoPlayer.vue';
+
+// 2026-10-07：封面预热设置（自 GeneralPanel 迁入——视频域开关放视频页）。
+// 读：GET /api/config；写：PUT /api/config（与 GeneralPanel 的 saveProbeSwitch 同一端点）。
+const thumbCfg = reactive({ prewarmEnabled: false, wifiOnly: false });
+const thumbCfgLoading = ref(false);
+async function loadThumbCfg() {
+  thumbCfgLoading.value = true;
+  try {
+    const { data } = await api.get('/api/config');
+    thumbCfg.prewarmEnabled = !!data?.thumb_prewarm_enabled;
+    thumbCfg.wifiOnly = !!data?.thumb_prewarm_wifi_only;
+  } catch { /* 读失败保持默认；开关是低危项，不打断列表 */ }
+  finally { thumbCfgLoading.value = false; }
+}
+async function saveThumbKey(key: 'thumb_prewarm_enabled' | 'thumb_prewarm_wifi_only', value: boolean) {
+  try {
+    const { data } = await api.put('/api/config', { [key]: value });
+    const ok = (data?.updated_fields || []).includes(key);
+    if (ok) message.success('已保存，立即生效');
+    else message.error('设备未接受此项改动，已回滚');
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '保存失败');
+  }
+}
+function savePrewarmEnabled(v: boolean) { saveThumbKey('thumb_prewarm_enabled', v); }
+function saveWifiOnly(v: boolean) { saveThumbKey('thumb_prewarm_wifi_only', v); }
+
+const prewarmNowRunning = ref(false);
+async function prewarmNow() {
+  if (prewarmNowRunning.value) return;
+  prewarmNowRunning.value = true;
+  try {
+    await api.post('/api/media/thumbnail-prewarm');
+    message.success('已触发预热，进度见上方徽标');
+  } catch (e: any) {
+    const detail = e?.response?.data?.message || e?.response?.data?.error;
+    message.error(detail || '触发失败（需先打开预热开关）');
+  } finally {
+    setTimeout(() => { prewarmNowRunning.value = false; }, 2000);
+  }
+}
 
 const message = useMessage();
 const { api, items, total, loading, loadingMore, permissionDenied, failed, thumbs, hasMore, reload, loadMore, refetchThumb } =
@@ -169,7 +231,7 @@ function downloadPlaying() {
   a.click();
 }
 
-onMounted(reload);
+onMounted(() => { reload(); loadThumbCfg(); });
 </script>
 
 <style scoped>
@@ -375,5 +437,21 @@ onMounted(reload);
   .detail-value {
     text-align: left;
   }
+}
+/* 2026-10-07：封面设置 popover（自 GeneralPanel 迁入） */
+.thumb-cfg {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px 8px;
+  align-items: center;
+}
+.thumb-cfg-label {
+  font-size: 12px;
+  line-height: 1.4;
+}
+.thumb-cfg-note {
+  font-size: 11px;
+  color: var(--text-muted, #999);
+  line-height: 1.5;
 }
 </style>
