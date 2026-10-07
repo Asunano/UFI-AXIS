@@ -766,13 +766,19 @@ class MediaRoutes(
         // 2026-10-05 G4：ffmpeg 2.5 级是否接管成功（供 X-Thumb-Source 区分 mmr/ffmpeg）
         var ffmpegRecovered = false
         val generated = when (kind) {
-            Kind.VIDEO -> videoFrameThumbnail(uri, size)
-                // 2026-10-05 G2（FFmpeg 接入计划书 §2.1）：新增 2.5 级 ffmpeg 抽帧 ——
-                // MMR 在本机 ROM 恒 null（无 VPU），ffmpeg 软解补上"系统与 MMR 双失败"
-                // 与"手机端回传兜底"之间的空档。失败静默落到手机兜底，不改变既有语义。
-                .recoverCatching {
+            Kind.VIDEO -> {
+                // 2026-10-07（真机日志定罪）：videoFrameThumbnail 是 Result<ByteArray?>，
+                // MMR 解不出画面时返回 success(null)——recoverCatching 只对 failure 生效，
+                // 于是 2.5 级 ffmpeg 兜底从未被执行（日志零 ffmpeg 记录即旁证）。
+                // 改为显式判空：MMR 无果（null 或异常）都进 ffmpeg。
+                val mmr = videoFrameThumbnail(uri, size)
+                if (mmr.getOrNull() != null) mmr
+                else mmr.recoverCatching {
+                    // 2026-10-05 G2（FFmpeg 接入计划书 §2.1）：MMR 在本机 ROM 恒 null（无 VPU），
+                    // ffmpeg 软解补上"系统与 MMR 双失败"与"手机端回传兜底"之间的空档。
                     ffmpegThumbnail(uri, size)?.also { ffmpegRecovered = true }
                 }
+            }
             Kind.IMAGE -> downscaledImageThumbnail(uri, size)
             Kind.AUDIO -> runCatching { audioCoverBytes(id)?.first }
         }
