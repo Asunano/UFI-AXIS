@@ -74,16 +74,24 @@ internal object UfiDialogAnim {
     const val DimWithBlur = 0.10f
 
     /**
-     * 变暗峰值 —— **拿不到跨窗口模糊时**（2026-09-18）。
-     *
-     * 省电模式、开发者选项里关掉动画、以及低端机
-     * （`ro.surface_flinger.supports_background_blur=false`）都会让 `FLAG_BLUR_BEHIND`
-     * 静默失效。此前只判了 SDK 版本，于是在这些机器/状态上"背景什么都不会发生"——
-     * 模糊没有、dim 又只有 0.10，弹窗后面完全没有层次，看着像界面错位。
-     *
-     * 0.30 仍比平台默认（0.6）浅不少：这套弹窗的设计取向是轻压暗。
-     */
-    const val DimFallback = 0.30f
+     * 变暗峰值 —— **拿不到跨窗口模糊时**（2026-09-18 引入；2026-10-08 弃用）。
+      *
+      * 省电模式、关动画、低端机会让 `FLAG_BLUR_BEHIND` 静默失效，此时仍需要一层变暗兜底。
+      * 但 P0-1 之后兜底遮罩已改由 Compose scrim 承担（`scrimAlpha`，随 backdrop ramp
+      * 同步渐变），窗口 dim 与 Compose scrim 二选一（见 UfiDialogShell 内 2026-10-08 注释），
+      * 本常量不再被引用 —— 保留条目只为说明这段历史，防止后来者把两套变暗再叠回去。
+      */
+     @Deprecated("变暗兜底已由 Compose scrim 接管，勿再引入窗口 dim 叠加")
+     const val DimFallback = 0.30f
+
+     /**
+      * 跨窗口模糊**可用**时 Compose 层遮罩的透明度（2026-10-08 新增）。
+      *
+      * 这层不承担"变暗"职责（那是窗口 dim 的事），只负责把弹窗卡片从模糊过的背景里
+      * 托出来一点点（纸色底 12%）。它随 backdrop ramp 同步渐变 —— 数值小，渐变本身
+      * 几乎不可见，但能保证进出场的首尾帧与窗口 dim 端点完全对齐。
+      */
+     const val ScrimWithBlur = 0.12f
 
     /**
      * backdrop 渐变的**量化步数**（0..[BackdropSteps]）。
@@ -211,7 +219,8 @@ private fun applyDialogBackdrop(
  * 上都会是 false。此前漏了这一条，那些情况下 `blurBehindRadius` 写了也不生效，
  * 而 dim 又按"有模糊"的 0.10 给 —— 结果是弹窗背后毫无变化。
  *
- * false 时调用方必须把 dim 提到 [UfiDialogAnim.DimFallback]。
+ * false 时调用方改用 Compose scrim 兜底（`scrimAlpha`），窗口 dim 置 0
+ *（避免两层半透明叠加出现分层，见 UfiDialogShell 内 2026-10-08 注释）。
  */
 private fun Window.canBlurBehind(): Boolean {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
@@ -373,7 +382,18 @@ internal fun UfiDialogShell(
          * 去注册 `addCrossWindowBlurEnabledListener`（还得记得注销）。
          */
         val blurCapable = remember(window) { window?.canBlurBehind() == true }
-        val maxDim = if (blurCapable) UfiDialogAnim.DimWithBlur else UfiDialogAnim.DimFallback
+        // 2026-10-08：变暗来源二选一（修"白色遮罩盖住系统模糊"+"分层"观感）。
+        // 10-05 P0-1 把 scrim 无条件接到了 scrimAlpha(0.5)，浅色主题下弹窗背后永远罩一层
+        // 50% 近白纱，把 FLAG_BLUR_BEHIND 的模糊质感整个冲掉 —— 用户看到的就是"自写白色
+        // 遮罩、系统模糊没了"。且窗口 dim(0.10) 与 Compose scrim 同时生效，两层不同源的
+        // 半透明叠加在不同 GPU 路径上呈现不同色阶，弹窗边缘出现"分层/色带"。
+        // 现在：
+        //   - blurCapable：变暗只走窗口 dim（随 ramp 渐变，DimWithBlur=0.10），Compose 层
+        //     只留一层极淡的底色（ScrimWithBlur=0.12，同样随 ramp）负责把弹窗从背景里"托"出来；
+        //   - !blurCapable：窗口 dim 关掉，变暗全走 Compose scrim（scrimAlpha 兜底，随
+        //     backdrop ramp 同步渐变，见下方 collect）——单一来源，天然无分层。
+        val composeScrimAlpha = if (blurCapable) UfiDialogAnim.ScrimWithBlur else scrimAlpha
+        val maxDim = if (blurCapable) UfiDialogAnim.DimWithBlur else 0f
 
         // [Debug-only] Diagnostic log: confirms whether the dialog Window was
         // resolved, the view/context class names, and the runtime SDK level.
@@ -431,7 +451,7 @@ internal fun UfiDialogShell(
                     val fraction = step / UfiDialogAnim.BackdropSteps.toFloat()
                     applyDialogBackdrop(
                         window = window,
-                        // 拿不到模糊时半径写 0（flag 也不会挂），层次全靠 DimFallback
+                        // 拿不到模糊时半径写 0（flag 也不会挂），层次全靠 Compose scrim（scrimAlpha）
                         blurRadius = if (blurCapable) (UfiDialogAnim.BlurRadius * fraction).toInt() else 0,
                         dim = maxDim * fraction,
                         blurCapable = blurCapable
@@ -518,11 +538,10 @@ internal fun UfiDialogShell(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                // 2026-10-05 P0-1：scrimAlpha 此前是死参数——声明了但没人用，弹窗与背景的
-                // 分离全靠 FLAG_BLUR_BEHIND，而模糊在 API<31 / 省电模式 / 关动画时静默失效，
-                // 低端机上弹窗"糊"进背景。补上真正的遮罩底色；模糊继续叠加，有则更好。
-                // pageBg 与页面底色同源，dark/light 主题自动正确（不用纯黑，light 下突兀）。
-                .background(palette.pageBg.copy(alpha = scrimAlpha))
+                // 2026-10-08：遮罩条件化。blurCapable 时只留一层 12% 底色（ScrimWithBlur），
+                // 模糊质感不被冲掉；!blurCapable 时才用 scrimAlpha 兜底且随 backdrop ramp
+                // 同步渐变（与模糊失效时的 dim 行为一致）。分层修法见 blurCapable 处注释。
+                .background(palette.pageBg.copy(alpha = composeScrimAlpha * backdrop.value.coerceIn(0f, 1f)))
                 .clickable(
                     enabled = dismissOnClickOutside,
                     indication = null,
