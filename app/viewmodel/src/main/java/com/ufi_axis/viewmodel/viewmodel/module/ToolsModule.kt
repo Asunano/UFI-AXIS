@@ -185,6 +185,12 @@ class ToolsModule(
      */
     private var updatePollJob: Job? = null
 
+    /**
+     * core 更新占线状态（与 core 侧 `UpdateManager.BUSY_STATES` + `statusToMap` 的小写口径一致）。
+     * 见 [onUpdateWsEvent]：收到这些态即视为"更新正在进行"，app 需要进入豁免与轮询。
+     */
+    private val UPDATE_BUSY_STATES = setOf("downloading", "verifying", "installing", "uploading")
+
     /** 单次轮询设备更新状态（suspend，供轮询循环复用）。 */
     private suspend fun doPollDeviceUpdateStatus() {
         runCatching { api.getDeviceUpdateStatus() }
@@ -273,6 +279,14 @@ class ToolsModule(
             if (resp.state == "done" || resp.state == "failed") {
                 stopDeviceUpdatePolling()
                 markCoreUpdating(false)
+            } else if (resp.state in UPDATE_BUSY_STATES) {
+                // 2026-10-07 修复：**别人**（web 端 / core 自更新）发起的更新，app 以前完全
+                // 不知情——markCoreUpdating(true) 只在 app 自己触发的两条路径里调。
+                // 结果下载/安装导致 core 断联时，健康检查照常弹全屏「无法连接到设备」，
+                // 而且"更新状态"从头到尾没有数据（没人轮询）。
+                // 现在收到任一占线态就置「更新中」标记并起轮询，与 app 自行触发同一套待遇。
+                markCoreUpdating(true)
+                startDeviceUpdatePolling()
             }
         }
     }

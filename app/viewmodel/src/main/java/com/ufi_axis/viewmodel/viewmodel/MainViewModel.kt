@@ -74,6 +74,9 @@ private const val HEALTH_CHECK_INTERVAL_MS = 30_000L
  */
 private const val CORE_UPDATE_EXEMPT_TIMEOUT_MS = 5 * 60_000L
 
+/** core 更新占线状态（与 core 侧 UpdateManager.BUSY_STATES 对齐，小写）。 */
+private val CORE_UPDATE_BUSY_STATES = setOf("downloading", "verifying", "installing", "uploading")
+
 /**
  * 豁免窗口的重算节拍（毫秒）。
  *
@@ -933,7 +936,10 @@ class MainViewModel(
     private fun isCoreUpdateInterruptingBackend(): Boolean {
         if (coreUpdatePersistence.isCoreUpdating()) return true
         val st = tools.updateDeviceState.value
-        return st?.state in setOf("uploading", "installing") || st?.reconnecting == true
+        // 2026-10-07 修复：补齐 downloading/verifying —— 之前只认 uploading/installing，
+        // 而下载阶段（几十 MB，最久的就是它）app 会照常弹「无法连接到设备」。
+        // 与 core 侧 UpdateManager.BUSY_STATES（DOWNLOADING/VERIFYING/INSTALLING/UPLOADING）对齐。
+        return st?.state in CORE_UPDATE_BUSY_STATES || st?.reconnecting == true
     }
 
     /** 「先进入应用」：让启动页让开，剩下的靠仪表盘卡内状态条继续显示。 */

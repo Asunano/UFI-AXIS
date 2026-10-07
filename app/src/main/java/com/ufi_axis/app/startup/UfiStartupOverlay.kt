@@ -7,6 +7,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,7 +27,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.UfiButton
-import com.ufi_axis.ui.components.common.UfiButtonSize
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiLoadingIndicator
 import com.ufi_axis.ui.theme.LocalResolvedPalette
@@ -163,6 +163,15 @@ private fun LoadingContent(progress: PreloadProgress) {
  * 该把他送进配对流程；已经配过的用户则是「重试」优先、改地址次之。
  * 底下那行「先进入应用」两套都有：不给出口就等于把用户锁在这一页上
  * （手机没联网 / 要去改 WiFi，都不是在这一页能解决的）。
+ *
+ * ## 2026-10-07 布局重排
+ * 原布局的问题：主操作列（fillMaxWidth 的实底/描边按钮）下面孤零零挂一个小号
+ * `Subtle` 自适应宽度的「先进入应用」，三个按钮三种宽度两种视觉重量，Subtle
+ * 那条又细又方（8dp 圆角），夹在圆角大按钮下面显得像残次品；且点击热区只有
+ * 文字那么宽，单手很难按准。现在：
+ *  - 「重试」「服务器设置」并排一行等重（UfiButtonRow 的标准用法），都走 Standard 高度；
+ *  - 「先进入应用」改为铺满的 Secondary，与上面拉开间距（XLarge），视觉上明确
+ *    "这是出口不是另一个失败原因"，热区也够大。
  */
 @Composable
 private fun ProblemContent(
@@ -215,22 +224,31 @@ private fun ProblemContent(
     if (problem.needsSetup) {
         UfiButton(text = "去配对", onClick = onSetup, modifier = Modifier.fillMaxWidth())
     } else {
-        UfiButton(text = "重试", onClick = onRetry, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(Spacing.Medium))
-        UfiButton(
-            text = "服务器设置",
-            variant = UfiButtonVariant.Secondary,
-            onClick = onOpenServerConfig,
-            modifier = Modifier.fillMaxWidth()
-        )
+        // 主操作并排一行：探活重试（Primary）与改地址（Secondary）等宽等高
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+            UfiButton(
+                text = "重试",
+                onClick = onRetry,
+                modifier = Modifier.weight(1f),
+                fillWidth = false
+            )
+            UfiButton(
+                text = "服务器设置",
+                variant = UfiButtonVariant.Secondary,
+                onClick = onOpenServerConfig,
+                modifier = Modifier.weight(1f),
+                fillWidth = false
+            )
+        }
     }
 
-    Spacer(Modifier.height(Spacing.Medium))
+    Spacer(Modifier.height(Spacing.XLarge))
 
+    // 出口按钮：铺满 + Secondary，视觉明确是"跳过"而不是又一个失败原因
     UfiButton(
         text = "先进入应用",
-        variant = UfiButtonVariant.Subtle,
-        size = UfiButtonSize.Small,
-        onClick = onSkip
+        variant = UfiButtonVariant.Secondary,
+        onClick = onSkip,
+        modifier = Modifier.fillMaxWidth()
     )
 }
