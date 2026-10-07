@@ -363,18 +363,21 @@ fun MediaVideoScreen(
             if (!ok) {
                 toast = ToastMessage("重置封面缓存失败", ToastType.ERROR)
             } else {
-                // 2) 立刻重新拉一次：cache-bust URL 绕开 Coil 缓存；404 的 reason
-                //    由 Coil 拦截器记进 ThumbSourceRegistry，详情弹窗能看到
-                kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    runCatching {
-                        java.net.URL(media.thumbnailUrlBusted("video", target.id)).openStream()
-                            .use { it.readBytes() }
-                    }
+                // 2) 带鉴权重拉一次并直接记录来源（2026-10-07 修复：原来用裸 java.net.URL
+                //    既没有鉴权头（必然 401）也不经过 Coil 拦截器，所以"点了没反应"）。
+                val (ok, detail) = media.refetchThumbnailWithSource("video", target.id)
+                val label = when {
+                    detail == "cache" -> "缓存"
+                    detail == "system" -> "系统生成"
+                    detail == "mmr" -> "本机解码（MMR）"
+                    detail == "ffmpeg" -> "ffmpeg 软解"
+                    else -> detail
                 }
-                toast = ToastMessage(
-                    "已重新获取封面", ToastType.SUCCESS,
-                    subtitle = "详情弹窗可查看封面来源或失败原因"
-                )
+                toast = if (ok) {
+                    ToastMessage("已重新获取封面", ToastType.SUCCESS, subtitle = "来源：$label")
+                } else {
+                    ToastMessage("封面获取失败", ToastType.ERROR, subtitle = detail)
+                }
             }
         }
     }

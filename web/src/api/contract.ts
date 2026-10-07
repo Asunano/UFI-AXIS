@@ -281,6 +281,8 @@ export const Endpoints = {
     thumbnail: '/api/media/thumbnail',
     // 2026-10-07：单条重抽封面用（type+id 查询参数）；不带 id 仍是整类/全部清除
     thumbnailCache: '/api/media/thumbnail-cache',
+    // 2026-10-07：手动触发一轮封面预热（POST；开关未开时 core 回 409）
+    thumbnailPrewarm: '/api/media/thumbnail-prewarm',
     cover: '/api/media/cover',
     lyrics: '/api/media/lyrics',
     tags: '/api/media/tags',

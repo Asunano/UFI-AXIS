@@ -93,12 +93,22 @@ private fun EditableContent(
                     val y = result.getLineTop(visualLine)
                     if (y + LINE_PROBE_SLACK < top) continue
                     if (y - LINE_PROBE_SLACK > bottom) break
-                    drawText(
-                        textMeasurer = measurer,
+                    // 2026-10-07 修复：DrawScope.drawText 重载内部用画布尺寸（= BasicTextField
+                    // 整篇高度）建 Constraints，长文本高度超 Compose 上限（262143px）直接
+                    // IllegalArgumentException 崩溃（r12 真机崩溃：height 372885）。
+                    // 改为 measure(显式小 constraints) + drawText(result)，每行只占一个行高的约束。
+                    val measured = measurer.measure(
                         text = (index + 1).toString(),
-                        topLeft = Offset(0f, y),
-                        style = numberStyle
+                        style = numberStyle,
+                        maxLines = 1,
+                        constraints = androidx.compose.ui.unit.Constraints(
+                            minWidth = 0,
+                            maxWidth = size.width.toInt().coerceAtLeast(0),
+                            minHeight = 0,
+                            maxHeight = 400
+                        )
                     )
+                    drawText(measured, topLeft = Offset(0f, y))
                 }
             }
             .padding(start = gutterWidth)

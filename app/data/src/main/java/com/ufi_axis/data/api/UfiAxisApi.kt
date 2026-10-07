@@ -247,6 +247,29 @@ interface UfiAxisApi {
      *
      * [type] 省略清全部；给了只清那一类（换抽帧策略时通常只需重算 video）。
      */
+    /**
+     * 2026-10-07：手动重抽封面用 —— 拿 Response 以便读取 X-Thumb-Source 头与 404 reason
+     * （普通 ResponseBody 变体拿不到这两样）。
+     */
+    @GET("api/media/thumbnail")
+    suspend fun fetchThumbnailMeta(
+        @Query("type") type: String,
+        @Query("id") id: Long,
+        @Query("size") size: Int = 256
+    ): Response<okhttp3.ResponseBody>
+
+    /** 2026-10-07：手动跑一轮封面预热（需先开 thumb_prewarm_enabled；进度走 WS 广播）。 */
+    @POST("api/media/thumbnail-prewarm")
+    suspend fun runThumbnailPrewarm(): JsonElement
+
+    /** 2026-10-07：真 PTY 终端状态（enabled=开关、running=ttyd 进程）。 */
+    @GET("api/terminal/status")
+    suspend fun ttydStatus(): JsonElement
+
+    /** 2026-10-07：停掉设备后台常驻的 ttyd 进程（开关保持）。 */
+    @POST("api/terminal/stop")
+    suspend fun ttydStop(): JsonElement
+
     @DELETE("api/media/thumbnail-cache")
     suspend fun clearMediaThumbnailCache(
         @Query("type") type: String? = null,

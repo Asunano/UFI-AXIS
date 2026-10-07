@@ -722,8 +722,29 @@ object ComponentFactory {
         mediaExclusions.attachChangeBroadcaster {
             wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
         }
+        // 预热进度广播闭包（2026-10-07：抽出来给调度侧与手动触发共用一份口径）
+        val thumbPrewarmBroadcast: suspend (Int, Int, Int, Boolean) -> Unit = { done, total, failed, running ->
+            wsManager.broadcast(
+                "data_changed",
+                mapOf(
+                    "changed" to com.ufi_axis_core.contract.WsDataTopic.MEDIA_THUMB_PREWARM,
+                    "done" to done, "total" to total,
+                    "failed" to failed, "running" to running
+                )
+            )
+        }
         val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(
-            context, settings, responseCache, mediaExclusions
+            context, settings, responseCache, mediaExclusions,
+            // 2026-10-07：手动预热（POST /api/media/thumbnail-prewarm）与调度侧同一条执行路径，
+            // forceIdle=true 表示用户点按钮时忽略闲时门。
+            manualPrewarm = {
+                com.ufi_axis_core.media.ThumbPrewarmWorker.runOnce(
+                    context = context,
+                    throttledPerItem = { kotlinx.coroutines.delay(2_000L) },
+                    broadcast = thumbPrewarmBroadcast,
+                    forceIdle = true
+                )
+            }
         )
 
         // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）：把 ThumbPrewarmWorker
@@ -733,16 +754,7 @@ object ComponentFactory {
             com.ufi_axis_core.media.ThumbPrewarmWorker.runOnce(
                 context,
                 throttledPerItem = { kotlinx.coroutines.delay(2_000L) },
-                broadcast = { done, total, failed, running ->
-                    wsManager.broadcast(
-                        "data_changed",
-                        mapOf(
-                            "changed" to com.ufi_axis_core.contract.WsDataTopic.MEDIA_THUMB_PREWARM,
-                            "done" to done, "total" to total,
-                            "failed" to failed, "running" to running
-                        )
-                    )
-                }
+                broadcast = thumbPrewarmBroadcast
             )
         }
         // 音频歌单（2026-09-21）：歌单本身存 prefs（曲目只记路径），曲目回查复用 mediaRoutes

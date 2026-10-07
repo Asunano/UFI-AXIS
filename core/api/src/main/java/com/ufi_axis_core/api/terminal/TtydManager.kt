@@ -89,7 +89,9 @@ class TtydManager(
             "-p", port.toString(),      // 监听端口
             "-i", "127.0.0.1",          // 只绑回环：外部流量必须走 core 反代
             "--max-clients", "4",
-            "-b", "/",                  // base path（ttyd 的 URL 前缀）
+            // 2026-10-07 修复：**不要**加 `-b "/"`。ttyd 的 WS 路径 = base_path + "ws"，
+            // 传 "/" 会变成 "//ws"，反代连 /ws 反而对不上（r12 真机 1006 的另一半原因）。
+            // 默认 base path（空）时端点就是 /ws，与本端 TtydRoutes 的反代 URL 一致。
             "/system/bin/sh", "-l",     // 登录 shell；设备上 mksh 是常态
         )
         val lastError = runCatching {

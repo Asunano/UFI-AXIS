@@ -86,7 +86,12 @@ class MediaRoutes(
      * 「从音乐库移除」的排除名单。可空 + 默认 null：老的组装代码不传它也能编过，
      * 传 null 就是"没有任何排除"（[listSelection] 里 `orEmpty()` 兜住）。
      */
-    private val exclusions: com.ufi_axis_core.api.media.MediaExclusionStore? = null
+    private val exclusions: com.ufi_axis_core.api.media.MediaExclusionStore? = null,
+    /**
+     * 2026-10-07：手动预热钩子（ComponentFactory 注入 `ThumbPrewarmWorker.runOnce(forceIdle=true)`，
+     * 广播闭包与调度侧同一份）。null = 老装配（无此能力）时端点回 501。
+     */
+    private val manualPrewarm: (suspend () -> Unit)? = null
 ) : com.ufi_axis_core.api.media.AudioItemLookup {
 
     companion object {
@@ -2323,6 +2328,32 @@ class MediaRoutes(
                         )
                     )
                 )
+            }
+
+            /**
+             * 2026-10-07：手动跑一轮封面预热（app 设置页「立即预热」按钮）。
+             * 忽略闲时门（手动=现在就要跑），总开关仍需开启；重复点击被 Worker 的
+             * start/stop 互斥挡住（返回 busy）。
+             */
+            post("/thumbnail-prewarm") {
+                if (!settings.thumbPrewarmEnabled) {
+                    call.respondFail(
+                        HttpStatusCode.Conflict, ErrorCode.BAD_REQUEST,
+                        "预热开关未开启（先在设置中打开）"
+                    )
+                    return@post
+                }
+                val hook = manualPrewarm
+                if (hook == null) {
+                    call.respondFail(HttpStatusCode.NotImplemented, ErrorCode.INTERNAL_ERROR, "当前装配不支持手动预热")
+                    return@post
+                }
+                call.respond(toJsonElement(mapOf("started" to true)))
+                // 响应先回，预热在后台跑（进度走 WS 广播）
+                // respond 已把响应刷给客户端；预热在同一协程里继续跑（进度走 WS 广播）。
+                // 不用 launch：本文件的协程作用域不持有 Job，且请求协程本就挂在 core 的
+                // application 作用域上，生命周期与后台服务一致。
+                runCatching { hook() }
             }
 
             /**

@@ -25,6 +25,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis_core.contract.ErrorCode
@@ -3878,6 +3879,31 @@ class ToolsModule(
                 loadRuleList()
             }
         }
+    }
+
+    // ── 真 PTY 终端（ttyd，2026-10-07）──
+
+    /**
+     * ttyd 配置三元组：(enabled 开关, running 设备上进程是否在跑, expired 会话是否已过期)。
+     * 读失败返回 null（调用方显示「未知」而不是假值）。
+     */
+    suspend fun ttydStatus(): Triple<Boolean, Boolean, Boolean>? = runCatching {
+        val o = api.ttydStatus().jsonObject
+        Triple(
+            o["enabled"]?.jsonPrimitive?.booleanOrNull ?: false,
+            o["running"]?.jsonPrimitive?.booleanOrNull ?: false,
+            o["expired"]?.jsonPrimitive?.booleanOrNull ?: false
+        )
+    }.getOrNull()
+
+    /** 打开/关闭 ttyd 开关（立即生效：开=拉起进程，关=停进程）。失败抛原异常由调用方 toast。 */
+    suspend fun setTtydEnabled(enabled: Boolean) {
+        api.updateConfig(mapOf("ttyd_enabled" to enabled))
+    }
+
+    /** 手动停掉设备后台 ttyd 进程（开关保持）。 */
+    suspend fun ttydStop() {
+        api.ttydStop()
     }
 }
 

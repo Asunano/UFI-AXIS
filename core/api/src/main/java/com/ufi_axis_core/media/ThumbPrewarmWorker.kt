@@ -59,7 +59,9 @@ object ThumbPrewarmWorker {
     suspend fun runOnce(
         context: Context,
         throttledPerItem: suspend () -> Unit,
-        broadcast: suspend (done: Int, total: Int, failed: Int, running: Boolean) -> Unit
+        broadcast: suspend (done: Int, total: Int, failed: Int, running: Boolean) -> Unit,
+        /** 2026-10-07：手动触发（POST /media/thumbnail-prewarm）时忽略闲时门 —— 用户点按钮就是要现在跑。 */
+        forceIdle: Boolean = false
     ) {
         // start/stop 互斥：调度循环的周期比一轮可能跑的时间短，重入会双份抽帧
         if (!running.compareAndSet(false, true)) return
@@ -68,8 +70,8 @@ object ThumbPrewarmWorker {
             // ① 总开关：每轮现读 prefs，PUT 完下一轮生效（与 goform_dump_enabled 同口径）
             if (!settings.thumbPrewarmEnabled) return
 
-            // ② 闲时门：充电 或 电量 > 30%（开关关掉时无条件放行）
-            if (settings.thumbPrewarmWifiOnly && !isIdleEnough(context)) {
+            // ② 闲时门：充电 或 电量 > 30%（手动触发 forceIdle 时跳过；总开关仍生效）
+            if (!forceIdle && settings.thumbPrewarmWifiOnly && !isIdleEnough(context)) {
                 AppLogger.d(TAG, "预热跳过：非闲时（未充电且电量<=${PREWARM_MIN_BATTERY_PERCENT}%）")
                 return
             }

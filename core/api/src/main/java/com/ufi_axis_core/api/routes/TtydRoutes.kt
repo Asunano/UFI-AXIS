@@ -154,7 +154,10 @@ class TtydRoutes(
         }
 
         val ttyd = try {
-            http.webSocketSession("ws://127.0.0.1:$port/")
+            // 2026-10-07 修复（r12 真机 1006）：ttyd 的 WS 端点是 **/ws**（二进制里
+            // "refuse to serve WS client for illegal ws path" 即此），连根路径会被它直接拒掉，
+            // 浏览器侧表现为「连接已断开（code 1006）」。之前没真机验证过这一路径。
+            http.webSocketSession("ws://127.0.0.1:$port/ws")
         } catch (e: Exception) {
             clientSession.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "ttyd connect failed: ${e.message}"))
             return

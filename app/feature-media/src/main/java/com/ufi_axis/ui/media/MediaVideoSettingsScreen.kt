@@ -188,8 +188,10 @@ fun MediaVideoSettingsScreen(
                 )
             }
             // 2026-10-07：预热进度（core 经 WS data_changed/media:thumb-progress 推送）+ 日志指路
+            //  + 手动触发按钮（POST /thumbnail-prewarm，core 忽略闲时门立即跑一轮）
             UfiSettingsRowCard {
                 val progress by media.thumbPrewarmProgress.collectAsState()
+                var prewarmRunning by remember { mutableStateOf(false) }
                 UfiSettingsItem(
                     title = when {
                         progress?.running == true ->
@@ -199,9 +201,31 @@ fun MediaVideoSettingsScreen(
                             "上次预热：新增 ${progress!!.done} / 失败 ${progress!!.failed} / 共 ${progress!!.total}"
                         else -> "预热状态：暂无记录"
                     },
-                    description = "开启后自动运行；详细日志在设备的 " +
+                    description = "详细日志在设备的 " +
                         "/sdcard/Download/UFI-AXIS/log/core/ 当天目录（搜 ffmpeg 或 ThumbPrewarm）。",
-                    icon = Icons.Default.Info
+                    icon = Icons.Default.Info,
+                    trailing = {
+                        UfiButton(
+                            text = if (prewarmRunning) "已触发" else "立即预热",
+                            onClick = {
+                                if (!prewarmRunning) {
+                                    prewarmRunning = true
+                                    scope.launch {
+                                        val (ok, msg) = media.runPrewarmNow()
+                                        if (!ok) {
+                                            android.widget.Toast.makeText(
+                                                context, msg, android.widget.Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                        kotlinx.coroutines.delay(2000)
+                                        prewarmRunning = false
+                                    }
+                                }
+                            },
+                            variant = UfiButtonVariant.Subtle,
+                            size = UfiButtonSize.Small
+                        )
+                    }
                 )
             }
             UfiSettingsRowCard {

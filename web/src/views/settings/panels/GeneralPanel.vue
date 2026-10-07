@@ -126,6 +126,20 @@
           :disabled="probeSwitchDisabled('thumb_prewarm_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('thumb_prewarm_enabled', v)"
         />
+        <ToggleRow
+          label="预热仅在 WiFi 环境运行"
+          :description="probeDescription('thumb_prewarm_wifi_only', '开启后只有设备经 WiFi 上网时才执行封面预热；流量/热点环境跳过，省流量。改动立即生效。')"
+          :model-value="generalForm.thumbPrewarmWifiOnly"
+          :loading="probeSaving.thumb_prewarm_wifi_only"
+          :disabled="probeSwitchDisabled('thumb_prewarm_wifi_only')"
+          @update:model-value="(v: boolean) => saveProbeSwitch('thumb_prewarm_wifi_only', v)"
+        />
+        <div class="config-item switch-item" style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <span class="config-label">手动立即预热一轮</span>
+          <n-button size="small" :loading="prewarmManualRunning" :disabled="!generalForm.thumbPrewarmEnabled" @click="runPrewarmNow">
+            立即预热
+          </n-button>
+        </div>
       </div>
       <n-divider style="margin: 10px 0" />
       <div class="config-section">
@@ -281,6 +295,8 @@ const generalForm = reactive({
   fieldNormalizationEnabled: true,
   // 设备后台封面预热（G6），core 侧默认 false —— 初值必须与 core 一致（见 fieldNormalizationEnabled 注释）
   thumbPrewarmEnabled: false,
+  // 仅 WiFi 下预热（thumb_prewarm_wifi_only），core 侧默认值待回读覆盖；与 enabled 同批即时保存
+  thumbPrewarmWifiOnly: false,
   smsCodeEnabled: false,
   smsCodeCleanupHours: 24,
   updateSourceMode: 'auto',
@@ -302,6 +318,7 @@ async function loadGeneralConfig() {
       goform_command_enabled: 'goformCommandEnabled',
       field_normalization_enabled: 'fieldNormalizationEnabled',
       thumb_prewarm_enabled: 'thumbPrewarmEnabled',
+      thumb_prewarm_wifi_only: 'thumbPrewarmWifiOnly',
       // 2026-10-07 修复：ttyd_enabled 此前漏在这张基线表外，generalOriginal 里没有它的键，
       // probeDescription 一律判成「当前 core 版本不支持此项」并禁用——core 其实支持。
       ttyd_enabled: 'ttydEnabled',
@@ -429,12 +446,18 @@ type ProbeApiKey =
   | 'goform_command_enabled'
   | 'ttyd_enabled'
   | 'field_normalization_enabled'
-  | 'thumb_prewarm_enabled';
+  | 'thumb_prewarm_enabled'
+  | 'thumb_prewarm_wifi_only';
 
 /** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
 const PROBE_FORM_KEY: Record<
   ProbeApiKey,
-  'goformDumpEnabled' | 'goformCommandEnabled' | 'ttydEnabled' | 'fieldNormalizationEnabled' | 'thumbPrewarmEnabled'
+  | 'goformDumpEnabled'
+  | 'goformCommandEnabled'
+  | 'ttydEnabled'
+  | 'fieldNormalizationEnabled'
+  | 'thumbPrewarmEnabled'
+  | 'thumbPrewarmWifiOnly'
 > =
   {
     goform_dump_enabled: 'goformDumpEnabled',
@@ -442,6 +465,7 @@ const PROBE_FORM_KEY: Record<
     ttyd_enabled: 'ttydEnabled',
     field_normalization_enabled: 'fieldNormalizationEnabled',
     thumb_prewarm_enabled: 'thumbPrewarmEnabled',
+    thumb_prewarm_wifi_only: 'thumbPrewarmWifiOnly',
   };
 
 /**
@@ -461,6 +485,7 @@ const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
   ttyd_enabled: false,
   field_normalization_enabled: true,
   thumb_prewarm_enabled: false,
+  thumb_prewarm_wifi_only: false,
 };
 
 /** 各自独立的 loading：三个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
@@ -470,6 +495,7 @@ const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
   ttyd_enabled: false,
   field_normalization_enabled: false,
   thumb_prewarm_enabled: false,
+  thumb_prewarm_wifi_only: false,
 });
 
 const PROBE_DUMP_DESC =
@@ -527,6 +553,22 @@ function probeDescription(apiKey: ProbeApiKey, base: string): string {
  * 与 postToggle 的区别是这里不整卡回读 —— loadGeneralConfig 会把用户正在编辑的
  * IP / 端口 / 密码一起冲掉，所以只同步这一个键的 form 与 original。
  */
+/** 2026-10-07：手动触发一轮封面预热（POST /api/media/thumbnail-prewarm，core 忽略闲时门）。 */
+const prewarmManualRunning = ref(false);
+async function runPrewarmNow() {
+  if (prewarmManualRunning.value) return;
+  prewarmManualRunning.value = true;
+  try {
+    await api.post(Endpoints.media.thumbnailPrewarm);
+    message.success('已触发预热，进度见媒体页徽标 / 设备日志');
+  } catch (e: any) {
+    const detail = e?.response?.data?.message || e?.response?.data?.error;
+    message.error(detail || '触发失败');
+  } finally {
+    setTimeout(() => { prewarmManualRunning.value = false; }, 2000);
+  }
+}
+
 async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
   if (probeSaving[apiKey]) return;
   const formKey = PROBE_FORM_KEY[apiKey];

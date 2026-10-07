@@ -1194,6 +1194,46 @@ class MediaModule(
         false
     }
 
+    /**
+     * 2026-10-07：手动重抽封面 —— 带鉴权拉一次并**直接记录来源**（X-Thumb-Source / 404 reason）。
+     *
+     * 为什么不用 Coil：列表里该条没渲染时不会发请求，Coil 拦截器就永远没有记录，
+     * 详情弹窗的「封面来源」行什么都不显示（用户报的"点了没效果"）。
+     * 返回 (成功?, 来源标签或失败原因)。
+     */
+    suspend fun refetchThumbnailWithSource(type: String, id: Long): Pair<Boolean, String> = try {
+        val resp = api.fetchThumbnailMeta(type, id)
+        if (resp.isSuccessful) {
+            val src = resp.headers()["X-Thumb-Source"] ?: "unknown"
+            com.ufi_axis.data.api.ThumbSourceRegistry.record(thumbnailUrl(type, id), src)
+            true to src
+        } else {
+            val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
+            val reason = Regex("\"message\"\\s*:\\s*\"([^\"]*)\"").find(body)?.groupValues?.getOrNull(1)
+                ?: "HTTP ${resp.code()}"
+            com.ufi_axis.data.api.ThumbSourceRegistry.recordFailure(thumbnailUrl(type, id), reason)
+            false to reason
+        }
+    } catch (e: Exception) {
+        DebugLog.w("MediaModule", "重取封面失败: $type/$id ${e.javaClass.simpleName}")
+        false to (e.message ?: "网络错误")
+    }
+
+    /**
+     * 2026-10-07：手动跑一轮设备端封面预热（忽略闲时门；需预热总开关已开）。
+     * 返回 (是否受理, 错误文案)；进度经 WS media:thumb-progress 广播回来。
+     */
+    suspend fun runPrewarmNow(): Pair<Boolean, String> = try {
+        api.runThumbnailPrewarm()
+        true to ""
+    } catch (e: Exception) {
+        val msg = when {
+            e.message?.contains("409") == true -> "预热开关未开启，请先打开上方开关"
+            else -> e.message ?: "请求失败"
+        }
+        false to msg
+    }
+
     /** 2026-10-07：读某条封面的最后来源（供详情弹窗显示）；没记录返回 null。 */
     fun thumbSource(type: String, id: Long): String? =
         com.ufi_axis.data.api.ThumbSourceRegistry.sourceOf(thumbnailUrl(type, id))

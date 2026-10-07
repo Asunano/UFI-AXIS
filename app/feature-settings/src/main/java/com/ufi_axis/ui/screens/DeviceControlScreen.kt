@@ -14,9 +14,11 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import kotlinx.coroutines.launch
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -85,6 +87,20 @@ fun DeviceControlScreen(
     var wifiSleepTime by remember { mutableStateOf("0") }
     var restartScheduleOn by remember { mutableStateOf(false) }
     var restartTime by remember { mutableStateOf("00:00") }
+
+    // 真 PTY 终端（ttyd，2026-10-07）：enabled 本地镜像；busy 防重复点击；note 写最近一次操作结果。
+    // status 拉不到（core 暂时不可达）时开关维持本地值但描述行提示「状态未知」。
+    var ttydEnabled by remember { mutableStateOf(false) }
+    var ttydRunning by remember { mutableStateOf(false) }
+    var ttydBusy by remember { mutableStateOf(false) }
+    var ttydNote by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        viewModel.tools.ttydStatus()?.let { (en, run) ->
+            ttydEnabled = en
+            ttydRunning = run
+        } ?: run { ttydNote = "状态未知（core 未连接）" }
+    }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(300)
@@ -156,7 +172,46 @@ fun DeviceControlScreen(
                     )
                 }
 
-                // ═══ 入口 3：WiFi 休眠（保留 chevron + Dialog：7 个时间选项）═══
+                // ═══ 入口 3：真 PTY 终端（ttyd，2026-10-07）═══
+                // 开=立即拉起设备后台 ttyd（root shell，30 分钟滑动过期）；关=停进程。
+                // 完整交互终端（xterm）在 web 端终端页；app 端提供开关与状态，排障用。
+                UfiSettingsRowCard {
+                    UfiSettingsToggle(
+                        icon = AppIconPerformance,
+                        title = "真 PTY 终端（ttyd）",
+                        description = buildString {
+                            append(if (ttydEnabled) "已开启" else "已关闭")
+                            if (ttydEnabled) append(if (ttydRunning) " · 进程运行中" else " · 进程未运行")
+                            ttydNote?.let { append("\n$it") }
+                        },
+                        checked = ttydEnabled,
+                        onCheckedChange = { target ->
+                            if (!ttydBusy) {
+                                ttydBusy = true
+                                ttydEnabled = target
+                                scope.launch {
+                                    runCatching { viewModel.tools.setTtydEnabled(target) }
+                                        .onSuccess {
+                                            ttydNote = if (target) "已开启，进程正在启动" else "已关闭"
+                                            if (target) {
+                                                kotlinx.coroutines.delay(1500)
+                                                viewModel.tools.ttydStatus()?.let { (en, run) ->
+                                                    ttydEnabled = en; ttydRunning = run
+                                                }
+                                            }
+                                        }
+                                        .onFailure { e ->
+                                            ttydEnabled = !target
+                                            ttydNote = "操作失败：${e.message ?: "未知错误"}"
+                                        }
+                                    ttydBusy = false
+                                }
+                            }
+                        }
+                    )
+                }
+
+                // ═══ 入口 4：WiFi 休眠（保留 chevron + Dialog：7 个时间选项）═══
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = AppIconWifiSleep,
