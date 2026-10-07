@@ -3,11 +3,10 @@ package com.ufi_axis_core.media
 /**
  * FFmpeg 抽帧 JNI 入口（FFmpeg 接入计划书 G1）。
  *
- * 类名/方法签名必须与 libufi_ffmpeg.so 的导出符号严格一致：
- *   Java_com_ufi_axis_core_media_FfmpegFrameExtractor_extractFrame
- *   Java_com_ufi_axis_core_media_FfmpegFrameExtractor_probeDurationSeconds
- *   Java_com_ufi_axis_core_media_FfmpegFrameExtractor_lastError
- * （改包名/类名 = UnresolvedSymbol native crash，别动。）
+ * so 来源：Asunano/FFmpeg-Android-4KB 仓库（通用桥，RegisterNatives 动态注册）。
+ * 构建该 so 时 BRIDGE_CLASS 必须是 com/ufi_axis_core/media/FfmpegFrameExtractor
+ * （与 loadLibrary 的库名 libffmpeg_bridge 一同构成加载契约）。
+ * 方法签名与桥内 JNINativeMethod 表严格一致（改签名 = UnsatisfiedLinkError）。
  *
  * 加载策略（E2）：ensureLoaded() 失败（.so 缺失 / ABI 不符 / RELRO 残留）→
  * 返回 false，调用方**永久跳过** ffmpeg 2.5 级（进程内标记，不反复尝试重载），
@@ -35,7 +34,7 @@ object FfmpegFrameExtractor {
         loadState?.let { return it }
         synchronized(this) {
             loadState?.let { return it }
-            val ok = runCatching { System.loadLibrary("ufi_ffmpeg") }.isSuccess
+            val ok = runCatching { System.loadLibrary("ffmpeg_bridge") }.isSuccess
             loadState = ok
             return ok
         }
