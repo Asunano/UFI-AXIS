@@ -216,6 +216,8 @@ fun MediaAudioPlayerScreen(
 
 
     val paths = remember(tracks) { tracks.map { it.path } }
+    /** 路径 → 列表项。`current`（按 timeline 的 mediaId 查）与封面预取都用它。 */
+    val trackByPath = remember(tracks) { tracks.associateBy { it.path } }
 
     /** 列表项 → 队列项。三处装队列（首装 / 追加 / 重装）共用，构造口径不能各写一份。 */
     val toTrack: (MediaLibraryItem) -> UfiAudioTrack = remember(media) {
@@ -429,7 +431,22 @@ fun MediaAudioPlayerScreen(
      * 下游的 `current?.path ?: filePath` 会正确降级到路由那一首。
      */
     val resolvedIndex = if (currentIndex >= 0) currentIndex else paths.indexOf(filePath)
-    val current = tracks.getOrNull(resolvedIndex)
+    /*
+     * 2026-10-07 修「排序后播放与显示彻底错乱」：
+     *
+     * 原来这里直接 `tracks.getOrNull(resolvedIndex)` —— 把**播放器 timeline 的下标**当
+     * **浏览列表的下标**用。两者只有在"队列刚按作用域原样装入"时才恰好相等；用户在队列
+     * 面板 ↑↓ 排序之后（或「下一首播放」插过歌），timeline 的顺序就与 `tracks` 分道扬镳，
+     * 而 `currentIndex` 仍随播放推进在 timeline 里走 —— 于是 `current` 取出来是另一首歌：
+     * 曲名、封面、歌词、标签全都显示成错的，看起来就是"播放的歌曲与显示的不一致"、
+     * "点列表的歌播了别的歌"（点歌本身播对了，是这页顶部显示错了）。
+     *
+     * 现在以 **timeline 为权威**：当前项 = `queueIds[currentIndex]`（mediaId = 路径），
+     * 元信息去 `trackByPath` 按路径查。顺序怎么排都错不了；查不到（单曲兜底那首不在
+     * 浏览范围内）降级到路由那一首，行为与旧版的"查不到显示文件名"一致。
+     */
+    val playingPath = queueIds.getOrNull(currentIndex) ?: filePath
+    val current = trackByPath[playingPath]
 
     /**
      * 系统「降低动效」闸门。本页此前完全没读它 —— 切歌动画重做时一并接上：
@@ -460,12 +477,15 @@ fun MediaAudioPlayerScreen(
      * 这里不关心结果，也不该阻塞当前组合的协程。
      */
     val coverContext = LocalPlatformContext.current
-    LaunchedEffect(trackAnimKey, tracks) {
-        if (resolvedIndex < 0) return@LaunchedEffect
+    LaunchedEffect(playingPath, tracks) {
+        // 2026-10-07：预取邻居改为**按 timeline 顺序**找（与 current 的修法同一口径）。
+        // 原来按 tracks 下标取邻居，排序后取到的是"显示顺序的邻居"而不是"接下来要播的"。
         val loader = SingletonImageLoader.get(coverContext)
-        (resolvedIndex - COVER_PREFETCH_RADIUS..resolvedIndex + COVER_PREFETCH_RADIUS)
-            .filter { it != resolvedIndex }
-            .mapNotNull { tracks.getOrNull(it) }
+        val pos = queueIds.indexOf(playingPath)
+        if (pos < 0) return@LaunchedEffect
+        (pos - COVER_PREFETCH_RADIUS..pos + COVER_PREFETCH_RADIUS)
+            .filter { it != pos }
+            .mapNotNull { trackByPath[queueIds.getOrNull(it)] }
             .forEach { neighbour ->
                 loader.enqueue(
                     ImageRequest.Builder(coverContext)
@@ -566,14 +586,19 @@ fun MediaAudioPlayerScreen(
      * 元信息去 `tracks` 里按 path 查；查不到（单曲兜底那首不在范围内）就用当前曲目的
      * 标题/歌手兜底，至少不会出现"面板空白但音乐在放"。
      */
-    val trackByPath = remember(tracks) { tracks.associateBy { it.path } }
     val queueRows = remember(queueIds, trackByPath, filePath, title, artist, durationMs) {
         val ids = queueIds.ifEmpty { listOf(filePath) }
+        // key 必须唯一：LazyColumn 的 itemsIndexed 用它做移动动画与复用。
+        // 「下一首播放」允许把同一首歌插多次（没有去重），裸用路径做 key 会撞
+        // "Key was already used" 直接崩；给重复项追加出现序号。
+        val seen = HashMap<String, Int>()
         ids.map { id ->
+            val n = seen.merge(id, 1, Int::plus) ?: 1
+            val rowKey = if (n == 1) id else "$id#$n"
             val item = trackByPath[id]
             if (item != null) {
                 AudioQueueRow(
-                    key = id,
+                    key = rowKey,
                     title = audioDisplayTitle(item),
                     subtitle = listOf(
                         audioDisplayArtist(item),
@@ -583,7 +608,7 @@ fun MediaAudioPlayerScreen(
                 )
             } else {
                 AudioQueueRow(
-                    key = id,
+                    key = rowKey,
                     title = title,
                     subtitle = artist,
                     duration = formatMediaDuration(durationMs)
