@@ -2385,6 +2385,36 @@ class MediaRoutes(
             }
 
             /**
+             * 2026-10-07：封面预热状态查询（GET /thumbnail-prewarm）。
+             *
+             * 解决"点击立即预热后退出页面、重进看不到任何状态"——之前进度只活在
+             * WS 广播里，页面不在就丢了。现在 Worker 每处理一条都落盘快照，
+             * 这里读回快照 + 内存实时值：`snapshot=false` 表示 core 重启后还没跑过任何一轮。
+             */
+            get("/thumbnail-prewarm") {
+                val p = com.ufi_axis_core.media.ThumbPrewarmWorker.readPersisted(appContext)
+                if (p == null) {
+                    call.respond(toJsonElement(mapOf("snapshot" to false)))
+                    return@get
+                }
+                call.respond(
+                    toJsonElement(
+                        mapOf(
+                            "snapshot" to mapOf(
+                                "done" to p.done,
+                                "total" to p.total,
+                                "failed" to p.failed,
+                                "running" to p.running,
+                                "current_name" to p.currentName,
+                                "started_at" to p.startedAt,
+                                "updated_at" to p.updatedAt
+                            )
+                        )
+                    )
+                )
+            }
+
+            /**
              * 音频封面（原始内嵌图，取不到时回退到大尺寸缩略图）。
              *
              * 与 `/thumbnail` 分开的理由：列表要的是"小而快"（256px、可缓存、能糊），

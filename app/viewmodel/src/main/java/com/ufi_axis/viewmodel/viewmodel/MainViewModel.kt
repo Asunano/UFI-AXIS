@@ -23,6 +23,7 @@ import com.ufi_axis.util.BackgroundManager
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.util.NetworkMonitor
@@ -619,7 +620,9 @@ class MainViewModel(
                 val total = obj["total"]?.jsonPrimitive?.intOrNull ?: 0
                 val failed = obj["failed"]?.jsonPrimitive?.intOrNull ?: 0
                 val running = obj["running"]?.jsonPrimitive?.booleanOrNull ?: false
-                media.onThumbPrewarmProgress(done, total, failed, running)
+                // 2026-10-07：带上当前条目名，设置页显示"正在处理 xxx.mkv"
+                val current = obj["current_name"]?.jsonPrimitive?.contentOrNull ?: ""
+                media.onThumbPrewarmProgress(done, total, failed, running, current)
             }
         }
     }

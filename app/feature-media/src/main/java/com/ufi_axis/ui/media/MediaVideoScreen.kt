@@ -136,38 +136,9 @@ fun MediaVideoScreen(
     val libraryListState = rememberLazyListState()
 
 
-    /*
-     * core 拿不到缩略图时（随身 WiFi 的定制 ROM 解不出视频画面）由**手机自己抽一帧**，
-     * 抽完顺手回传 core，这样 Web 端与第二台手机也能命中同一张图。
-     * 只在远端 404 之后触发，不主动预抽 —— 每张要拉几 MB 视频头部。
-     */
-    val buildThumb: suspend (MediaLibraryItem) -> File? = { item ->
-        MediaThumbnailBuilder.build(context, media, MEDIA_TYPE_VIDEO, item)
-    }
-
-    // 抽帧是"看不见的活"：不说一声，用户只会觉得列表卡了几秒又莫名多出几张图。
-    //
-    // 刻意**不用** `isLoading = true` 的 toast：那种是"持久型"，UfiToastOverlay 对它不注册
-    // 自动移除（见其 show() 末尾），而抽帧是一批零散短任务、activeCount 反复 0↔n，
-    // 很容易留下一条永不消失的转圈提示。这里只需要"说一声"，走普通定时 toast。
-    val everUsed by MediaThumbnailBuilder.everUsed.collectAsState()
-    val activeCount by MediaThumbnailBuilder.activeCount.collectAsState()
-    var noticeDismissed by remember {
-        mutableStateOf(
-            runCatching { AppPreferences(context).mediaLocalThumbNoticeDismissed }
-                .getOrDefault(false)
-        )
-    }
+    // 2026-10-07：本机抽帧兜底已整体删除（core 侧 ffmpeg 2.5 级稳定，不再需要手机代劳）。
+    // 封面全部由设备端产出（系统缩略图 → MMR → ffmpeg），拿不到就显示占位图标。
     var toast by remember { mutableStateOf<ToastMessage?>(null) }
-    LaunchedEffect(activeCount > 0) {
-        if (activeCount > 0) {
-            toast = ToastMessage(
-                text = "正在用本机生成视频缩略图",
-                type = ToastType.INFO,
-                subtitle = "设备端封面生成不可用，改由本机抽帧并回传兜底"
-            )
-        }
-    }
 
     val onOpen: (MediaLibraryItem) -> Unit = { item ->
         runCatching {
@@ -266,20 +237,6 @@ fun MediaVideoScreen(
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            if (everUsed && !noticeDismissed) {
-                Box(modifier = Modifier.padding(horizontal = Spacing.Medium)) {
-                    MediaLocalThumbNotice(
-                        onDismiss = {
-                            runCatching {
-                                AppPreferences(context).mediaLocalThumbNoticeDismissed = true
-                            }
-                            noticeDismissed = true
-                        }
-                    )
-                }
-                Spacer(Modifier.height(Spacing.Small))
-            }
-
             /*
              * 两栏切换：内容区**上方**（2026-09-20 从底部搬上来，理由见本文件 KDoc）。
              *
@@ -323,7 +280,6 @@ fun MediaVideoScreen(
                         thumbUrl = { media.thumbnailUrl(MEDIA_TYPE_VIDEO, it.id) },
                         onNearEnd = { media.loadMore(MEDIA_TYPE_VIDEO) },
                         onOpen = onOpen,
-                        onThumbMissing = buildThumb,
                         onOpenRecent = { path, name, id ->
                             onOpen(MediaLibraryItem(id = id, name = name, path = path))
                         },
@@ -335,7 +291,6 @@ fun MediaVideoScreen(
                         viewModel = viewModel,
                         onOpen = onOpen,
                         onDownload = onDownload,
-                        onThumbMissing = buildThumb,
                         listState = libraryListState,
                         onLongPress = { menuTarget = it }
                     )
@@ -357,8 +312,7 @@ fun MediaVideoScreen(
     // 2026-10-07：单条重抽封面（菜单回调 → 清缓存 + cache-bust 重拉）
     fun refetchThumbFor(target: com.ufi_axis.data.model.MediaLibraryItem) {
         scope.launch {
-            // 1) 清设备缓存 + video_info（远端）与本机抽帧成果（feature-media internal 可及）
-            MediaThumbnailBuilder.invalidate(context, "video", target.id)
+            // 1) 清设备缓存 + video_info（远端）——本机抽帧已删，只剩设备侧
             val ok = media.resetThumbnail("video", target.id)
             if (!ok) {
                 toast = ToastMessage("重置封面缓存失败", ToastType.ERROR)
@@ -475,58 +429,6 @@ fun MediaVideoScreen(
     )
 
     UfiToastHost(toastMessage = toast, onDismiss = { toast = null })
-}
-
-/**
- * 一次性说明：为什么缩略图是"慢慢长出来"的。
- *
- * 只在**真的**走过本机抽帧之后才出现（[MediaThumbnailBuilder.everUsed]）——
- * 对解码正常的设备提示这个纯属噪音。关掉之后不再出现（记在本地 prefs）；
- * 但每次开始抽帧仍会有 toast，那说的是"现在正在干活"，与"为什么这么干"是两件事。
- *
- * 2026-10-05 G7（FFmpeg 接入计划书 §4.2）文案校准：core 接入 ffmpeg 软解后，本机抽帧
- * 的定位降为"ffmpeg 也不可用时的兜底"——弹窗/toast 文案同步改口径，不再宣称
- * "设备端解不出画面"这个已不成立的前提。
- */
-@Composable
-private fun MediaLocalThumbNotice(onDismiss: () -> Unit) {
-    val palette = LocalResolvedPalette.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .ufiStandardCard(elevation = 2.dp)
-            .padding(horizontal = Spacing.Medium, vertical = Spacing.Small),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            Icons.Default.Info,
-            contentDescription = null,
-            tint = palette.accent,
-            modifier = Modifier.size(18.dp)
-        )
-        Spacer(Modifier.width(Spacing.Small))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                "设备端无法生成视频缩略图（含 ffmpeg 兜底）",
-                style = UfiTextStyles.bodyEmphasis,
-                color = palette.textPrimary
-            )
-            Text(
-                "设备端系统解码与本机 ffmpeg 软解都出不了画面，已改由本机抽帧并回传（走局域网，不消耗蜂窝流量）。每个视频只需抽一次，之后网页端也能看到。",
-                style = UfiTextStyles.note,
-                color = palette.textSecondary
-            )
-        }
-        Spacer(Modifier.width(Spacing.Small))
-        IconButton(onClick = onDismiss) {
-            Icon(
-                Icons.Default.Close,
-                contentDescription = "不再提示",
-                tint = palette.textSecondary,
-                modifier = Modifier.size(16.dp)
-            )
-        }
-    }
 }
 
 /** 媒体库那一栏行内的缩略图尺寸（16:9）。骨架与真实行共用这两个常量，不各写一份字面量。 */

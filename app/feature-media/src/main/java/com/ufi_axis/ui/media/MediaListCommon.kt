@@ -23,7 +23,6 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,8 +41,6 @@ import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.viewmodel.state.MEDIA_KINDS
-import kotlinx.coroutines.launch
-import java.io.File
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -70,12 +67,9 @@ import java.time.ZoneId
  * · [aspectRatio]：宽度撑满、**高度按比例算**（海报墙用 16:9 —— 卡片宽度随列数与间距变，
  *   写死高度会在不同屏宽上出现黑边或裁切）。给了它就不看 width/height。
  *
- * ## 远端拿不到时的兜底（2026-09-16）
- * 传了 [onRemoteMissing] 就意味着"远端 404 之后可以由本机自己生成一张"：加载失败会调它一次
- * （**只一次**，避免失败重试打成循环），拿到本地文件后换成本地文件重新加载。
- * 这条路是为随身 WiFi 这类**解不出视频画面**的设备准备的，实现见 [MediaThumbnailBuilder]。
- *
- * 失败仍然只写 DebugLog，不弹错误、不画破图：缩略图缺失不该打断浏览。
+ * ## 远端拿不到时（2026-10-07 简化）
+ * 本机抽帧兜底已删除——core 侧 ffmpeg 2.5 级稳定后不再需要。远端 404 就显示占位图标，
+ * 加载失败只写 DebugLog，不弹错误、不画破图：缩略图缺失不该打断浏览。
  */
 @Composable
 internal fun MediaThumb(
@@ -84,14 +78,9 @@ internal fun MediaThumb(
     width: Dp = 0.dp,
     height: Dp = 0.dp,
     fillWidth: Boolean = false,
-    aspectRatio: Float? = null,
-    onRemoteMissing: (suspend () -> File?)? = null
+    aspectRatio: Float? = null
 ) {
     val palette = LocalResolvedPalette.current
-    val scope = rememberCoroutineScope()
-    // key 用 url：换了一项（id 变了）就重新开始判定，不要继承上一项的"已尝试过"
-    var localFile by remember(url) { mutableStateOf<File?>(null) }
-    var triedLocal by remember(url) { mutableStateOf(false) }
 
     val sizing = when {
         aspectRatio != null -> Modifier.fillMaxWidth().aspectRatio(aspectRatio)
@@ -112,20 +101,15 @@ internal fun MediaThumb(
             modifier = Modifier.size(20.dp)
         )
         AsyncImage(
-            model = localFile ?: url,
+            model = url,
             contentDescription = null,
             contentScale = ContentScale.Crop,
             onError = { state ->
-                if (onRemoteMissing != null && !triedLocal && localFile == null) {
-                    triedLocal = true
-                    scope.launch { localFile = onRemoteMissing() }
-                } else {
-                    DebugLog.w(
-                        "MediaThumb",
-                        "缩略图加载失败: ${localFile?.name ?: url}",
-                        state.result.throwable
-                    )
-                }
+                DebugLog.w(
+                    "MediaThumb",
+                    "缩略图加载失败: $url",
+                    state.result.throwable
+                )
             },
             modifier = Modifier.fillMaxSize()
         )

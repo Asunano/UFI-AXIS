@@ -48,7 +48,7 @@ import kotlinx.coroutines.launch
  *
  * 收进这一页的都是"配一次就不动"的东西 —— 摆在浏览界面上只会挤掉内容：
  *  · **扫描目录**：设备侧配置，写 core（按类型各一份），UI 走共用件 [MediaScanScopeSection]；
- *  · **本机抽帧**开关、封面缓存、批量生成：缩略图这一件事的三个面；
+ *  · **封面**：设备端预热开关/状态（ffmpeg 抽帧）；本机抽帧已于 2026-10-07 删除；
  *  · **下载**：落点目录（只读说明）+ 通往 [MediaVideoDownloadHistoryScreen] 的入口。
  *
  * ## 页壳与卡形态（2026-09-20 对齐全站标准设置页）
@@ -64,7 +64,7 @@ import kotlinx.coroutines.launch
  * （视频封面 / 批量生成封面 / 下载到手机 / 其他），加上共用件带的"扫描范围"共五行；
  * 它们只是把下面那张卡的 `title` 换个说法再说一遍，还各自在卡片节奏上插了 8dp 的断点。
  * 撤掉之后信息没有丢：少数原本靠区块标题才说得清的行，标题自己补全了
- * （"落点目录" → "下载落点目录"，"为缺封面的视频抽帧" → "…批量抽帧"）。
+ * （"落点目录" → "下载落点目录"）。
  * 不要改用 `UfiGroupHeader` 挪进卡里 —— 那等于退回多项一卡的分区形态。
  *
  * ## 清单型内容一律另开页面
@@ -72,10 +72,6 @@ import kotlinx.coroutines.launch
  * 设置项的条数由代码决定（看一屏就知道全貌），而队列/历史的条数由使用量决定、还会一直长 ——
  * 留在这里就会把真正的设置项推到屏幕外。
  *
- * ## 为什么开关是"真开关"
- * [AppPreferences.mediaPhoneFrameExtraction] 关掉之后：列表不再触发抽帧
- * （[MediaThumbnailBuilder.build] 第一件事就是查它），批量入口一并禁用。
- * 不存在"关了还在偷偷抽"或"关了但按钮还能点"的情况。
  */
 @Composable
 fun MediaVideoSettingsScreen(
@@ -89,11 +85,6 @@ fun MediaVideoSettingsScreen(
     LaunchedEffect(Unit) { media.loadStatus() }
     LaunchedEffect(Unit) { MediaDownloadQueue.ensureLoaded(context) }
 
-    var frameExtraction by remember {
-        mutableStateOf(
-            runCatching { AppPreferences(context).mediaPhoneFrameExtraction }.getOrDefault(true)
-        )
-    }
 
     // 2026-10-05 G6（FFmpeg 接入计划书 §4.2）：core 侧封面预热开关。
     // 真源在 core；null = 老版本 core 没这个键，开关禁用（不拿默认值冒充真值）。
@@ -105,15 +96,9 @@ fun MediaVideoSettingsScreen(
     }
 
     // 缓存占用要"看得见变化"：清空之后立刻重算，而不是等下次进页面
-    var cacheStats by remember { mutableStateOf(0 to 0L) }
-    var statsVersion by remember { mutableStateOf(0) }
+    // 2026-10-07：本机抽帧已删，封面缓存只剩设备侧一份（清空动作直接打 core 端点）。
     /** 清缓存要打一次网络（设备侧那层），按钮得有在忙的状态，否则会被连点。 */
     var clearingCache by remember { mutableStateOf(false) }
-    LaunchedEffect(statsVersion) {
-        cacheStats = runCatching { MediaThumbnailBuilder.cacheStats(context) }.getOrDefault(0 to 0L)
-    }
-
-    val batch by MediaThumbnailBuilder.batch.collectAsState()
     val queue by MediaDownloadQueue.queue.collectAsState()
     val history by MediaDownloadQueue.history.collectAsState()
 
@@ -142,23 +127,6 @@ fun MediaVideoSettingsScreen(
              * 那个理由只在代码里成立：界面上它们一个是开关、一个带清空按钮，
              * 合卡之后与本页其余一项一卡的节奏对不上。现在各自一卡。
              */
-            UfiSettingsRowCard {
-                UfiSettingsToggle(
-                    title = "用本机抽帧生成封面",
-                    // 2026-10-05 G7（FFmpeg 接入计划书 §4.2）：core 接入 ffmpeg 后本机抽帧降为兜底，文案同口径
-                    description = "设备端（含 ffmpeg 软解）出不了封面时，由手机抽一帧并回传设备" +
-                        "（局域网传输，每个视频只需一次）。关掉后只显示设备能给出的封面。",
-                    checked = frameExtraction,
-                    icon = Icons.Default.Videocam,
-                    onCheckedChange = { checked ->
-                        frameExtraction = checked
-                        runCatching {
-                            AppPreferences(context).mediaPhoneFrameExtraction = checked
-                        }
-                        if (!checked) MediaThumbnailBuilder.cancelBatch()
-                    }
-                )
-            }
             // 2026-10-05 G6：core 侧 ffmpeg 封面预热（闲时后台把整库封面铺满，列表秒出）
             UfiSettingsRowCard {
                 UfiSettingsToggle(
@@ -187,11 +155,24 @@ fun MediaVideoSettingsScreen(
                     }
                 )
             }
-            // 2026-10-07：预热进度（core 经 WS data_changed/media:thumb-progress 推送）+ 日志指路
-            //  + 手动触发按钮（POST /thumbnail-prewarm，core 忽略闲时门立即跑一轮）
+            /*
+             * 2026-10-07 重做：之前这里只有一行字，点完「立即预热」退出页面再进来就什么都没了。
+             * 现在三件事都补上：
+             *  ① 进页面先 GET 一次快照（core 落盘的进度），所以退出重进仍能看到上一轮结果；
+             *  ② 进度条 + 「正在处理 xxx.mkv」，running 时才画；
+             *  ③ 轮询兜底：running 时每 3s 拉一次快照，不依赖 WS 是否连着。
+             */
             UfiSettingsRowCard {
                 val progress by media.thumbPrewarmProgress.collectAsState()
                 var prewarmRunning by remember { mutableStateOf(false) }
+                // 页面存活期间每 3s 拉一次快照：running → 看进度；非 running → 一次即止
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        media.refreshPrewarmState()
+                        if (media.thumbPrewarmProgress.value?.running != true) break
+                        kotlinx.coroutines.delay(3_000)
+                    }
+                }
                 UfiSettingsItem(
                     title = when {
                         progress?.running == true ->
@@ -201,8 +182,14 @@ fun MediaVideoSettingsScreen(
                             "上次预热：新增 ${progress!!.done} / 失败 ${progress!!.failed} / 共 ${progress!!.total}"
                         else -> "预热状态：暂无记录"
                     },
-                    description = "详细日志在设备的 " +
-                        "/sdcard/Download/UFI-AXIS/log/core/ 当天目录（搜 ffmpeg 或 ThumbPrewarm）。",
+                    description = when {
+                        progress?.running == true && progress!!.currentName.isNotBlank() ->
+                            "正在处理：${progress!!.currentName}"
+                        progress?.running == true -> "正在处理…"
+                        progress != null ->
+                            "详细日志在设备的 /sdcard/Download/UFI-AXIS/log/core/ 当天目录（搜 ffmpeg 或 ThumbPrewarm）。"
+                        else -> "还没有跑过预热。点右侧按钮立即跑一轮。"
+                    },
                     icon = Icons.Default.Info,
                     trailing = {
                         UfiButton(
@@ -216,6 +203,9 @@ fun MediaVideoSettingsScreen(
                                             android.widget.Toast.makeText(
                                                 context, msg, android.widget.Toast.LENGTH_SHORT
                                             ).show()
+                                        } else {
+                                            // 受理后立刻拉一次快照，让 UI 马上切到「预热中」
+                                            media.refreshPrewarmState()
                                         }
                                         kotlinx.coroutines.delay(2000)
                                         prewarmRunning = false
@@ -223,17 +213,23 @@ fun MediaVideoSettingsScreen(
                                 }
                             },
                             variant = UfiButtonVariant.Subtle,
-                            size = UfiButtonSize.Small
+                            size = UfiButtonSize.Small,
+                            enabled = prewarm == true
                         )
                     }
                 )
+                val p = media.thumbPrewarmProgress.collectAsState().value
+                if (p != null && p.total > 0) {
+                    UfiCompactProgressBar(
+                        progress = (p.done + p.failed).toFloat() / p.total,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     title = "封面缓存",
-                    description = "本机已缓存 ${cacheStats.first} 张 · " +
-                        FormatUtils.formatSize(cacheStats.second) +
-                        "（清空会一并丢掉设备上那份与图片加载缓存，下次浏览重新抽帧）",
+                    description = "清空设备上的封面缓存与图片加载缓存，下次浏览重新抽帧",
                     icon = Icons.Default.Image,
                     trailing = {
                         UfiButton(
@@ -243,20 +239,17 @@ fun MediaVideoSettingsScreen(
                                 clearingCache = true
                                 scope.launch {
                                     /*
-                                     * 三层都得清，少一层就等于没清 —— 这是"改了抽帧策略却看不到变化"的根因：
+                                     * 两层都得清（本机抽帧目录已随该功能删除）：
                                      *  1. 图片加载库：按 URL 命中，而缩略图 URL 只含 (type,id)、
                                      *     core 又给 max-age=86400 → 一天内根本不重新发请求；
-                                     *  2. 本机抽帧成果：MediaThumbnailBuilder 的目录；
-                                     *  3. 设备上客户端回传的成果：core 的 /thumbnail 命中即原样返回，
+                                     *  2. 设备侧缓存：core 的 /thumbnail 命中即原样返回，
                                      *     覆盖安装 core 也不会清掉它。
                                      */
-                                    MediaThumbnailBuilder.clearCache(context)
                                     media.clearRemoteThumbnails(MEDIA_TYPE_VIDEO)
                                     SingletonImageLoader.get(context).let { loader ->
                                         loader.memoryCache?.clear()
                                         loader.diskCache?.clear()
                                     }
-                                    statsVersion++
                                     clearingCache = false
                                 }
                             },
@@ -266,24 +259,6 @@ fun MediaVideoSettingsScreen(
                     }
                 )
             }
-
-            // 批量生成：可暂停 / 继续 / 取消，退出这一页仍在跑
-            BatchThumbSection(
-                enabled = frameExtraction,
-                progress = batch,
-                onStart = {
-                    scope.launch {
-                        val all = media.allItems(MEDIA_TYPE_VIDEO)
-                        MediaThumbnailBuilder.startBatch(context, media, MEDIA_TYPE_VIDEO, all)
-                    }
-                },
-                onPause = { MediaThumbnailBuilder.pauseBatch() },
-                onResume = { MediaThumbnailBuilder.resumeBatch() },
-                onCancel = {
-                    MediaThumbnailBuilder.cancelBatch()
-                    statsVersion++
-                }
-            )
 
             // ── 下载 ──
             UfiSettingsRowCard {
@@ -335,95 +310,6 @@ fun MediaVideoSettingsScreen(
             }
 
             Spacer(Modifier.height(Spacing.Large))
-        }
-    }
-}
-
-/**
- * 批量生成缩略图 —— 一项一卡，和本页其余设置行同构。
- *
- * 2026-09-20 从手写的 `Text(cardTitle) + Spacer + Text(note) + Row{按钮}` 换成
- * [UfiSettingsItem]：原来那份自己搓标题字号与行距，和同一页上下的文字不是同一套字。
- * 状态说明进 `description`、按钮组进 `trailing`，语义各归其位。
- *
- * 2026-09-22 撤掉上方的 `UfiSectionHeader("批量生成封面")`：本页不再用卡外标题，
- * 卡内 `title` 已经说清这张卡是干什么的。
- *
- * 按钮组随状态变（没跑 → 开始；在跑 → 暂停 + 取消；暂停中 → 继续 + 取消；跑完 → 再来一次），
- * 不摆按不动的按钮。已经有缓存的会被跳过，所以"再来一次"只处理剩下的那些。
- *
- * 进度条排在设置行**下方**、同一张卡内：它是通栏的，塞进 `trailing` 会与按钮抢那一小块宽度。
- */
-@Composable
-private fun BatchThumbSection(
-    enabled: Boolean,
-    progress: MediaThumbnailBuilder.BatchProgress?,
-    onStart: () -> Unit,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    onCancel: () -> Unit
-) {
-    UfiSettingsRowCard {
-        UfiSettingsItem(
-            title = "为缺封面的视频批量抽帧",
-            description = when {
-                !enabled -> "本机抽帧已关闭，批量生成不可用"
-                progress == null -> "为还没有封面的视频逐个抽帧。可以随时暂停，退出这一页也会继续跑。"
-                progress.finished -> "已完成 ${progress.done}/${progress.total}" +
-                    if (progress.failed > 0) "，其中 ${progress.failed} 个失败" else ""
-                progress.paused -> "已暂停：${progress.done}/${progress.total}"
-                else -> "正在生成：${progress.done}/${progress.total}" +
-                    if (progress.failed > 0) "（失败 ${progress.failed}）" else ""
-            },
-            trailing = {
-                Row(horizontalArrangement = Arrangement.spacedBy(Spacing.Small)) {
-                    when {
-                        progress == null || progress.finished -> UfiButton(
-                            text = if (progress?.finished == true) "再来一次" else "开始",
-                            onClick = onStart,
-                            variant = UfiButtonVariant.Subtle,
-                            size = UfiButtonSize.Small,
-                            enabled = enabled
-                        )
-
-                        progress.paused -> {
-                            UfiButton(
-                                text = "继续",
-                                onClick = onResume,
-                                variant = UfiButtonVariant.Subtle,
-                                size = UfiButtonSize.Small
-                            )
-                            UfiButton(
-                                text = "取消",
-                                onClick = onCancel,
-                                variant = UfiButtonVariant.Subtle,
-                                size = UfiButtonSize.Small
-                            )
-                        }
-
-                        else -> {
-                            UfiButton(
-                                text = "暂停",
-                                onClick = onPause,
-                                variant = UfiButtonVariant.Subtle,
-                                size = UfiButtonSize.Small
-                            )
-                            UfiButton(
-                                text = "取消",
-                                onClick = onCancel,
-                                variant = UfiButtonVariant.Subtle,
-                                size = UfiButtonSize.Small
-                            )
-                        }
-                    }
-                }
-            }
-        )
-        if (progress != null && progress.total > 0) {
-            UfiCompactProgressBar(
-                progress = progress.done.toFloat() / progress.total,
-                modifier = Modifier.fillMaxWidth()
-            )
         }
     }
 }

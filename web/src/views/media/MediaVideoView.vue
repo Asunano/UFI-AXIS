@@ -13,8 +13,13 @@
       </div>
       <div class="head-actions">
         <n-input v-model:value="query" size="small" placeholder="搜索文件名" clearable class="head-search" />
-        <span v-if="prewarm" class="prewarm-badge">
-          {{ prewarm.running ? `预热中 ${prewarm.done}/${prewarm.total}` + (prewarm.failed ? `（失败 ${prewarm.failed}）` : '') : `预热完成：新增 ${prewarm.done} / 失败 ${prewarm.failed}` }}
+        <span v-if="prewarm" class="prewarm-badge" :class="{ running: prewarm.running }">
+          <template v-if="prewarm.running">
+            预热中 {{ prewarm.done }}/{{ prewarm.total }}<template v-if="prewarm.failed">（失败 {{ prewarm.failed }}）</template>
+            <template v-if="prewarm.current_name">· {{ prewarm.current_name }}</template>
+            <span class="prewarm-bar"><span class="prewarm-bar-fill" :style="{ width: prewarm.total ? ((prewarm.done + prewarm.failed) / prewarm.total * 100) + '%' : '0%' }" /></span>
+          </template>
+          <template v-else>预热完成：新增 {{ prewarm.done }} / 失败 {{ prewarm.failed }}</template>
         </span>
         <n-button size="small" quaternary :loading="loading" @click="reload">刷新</n-button>
         <!-- 2026-10-07：封面设置从 GeneralPanel 迁来 —— 视频域的开关放视频页，设置页只留全局项 -->
@@ -95,7 +100,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from 'vue';
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
 import { useWebSocketStore } from '@/stores/websocket';
 import { useMessage } from 'naive-ui';
 import { VideocamOutline, SettingsOutline } from '@vicons/ionicons5';
@@ -136,7 +141,8 @@ async function prewarmNow() {
   prewarmNowRunning.value = true;
   try {
     await api.post('/api/media/thumbnail-prewarm');
-    message.success('已触发预热，进度见上方徽标');
+    message.success('已触发预热');
+    loadPrewarmSnapshot();
   } catch (e: any) {
     const detail = e?.response?.data?.message || e?.response?.data?.error;
     message.error(detail || '触发失败（需先打开预热开关）');
@@ -165,9 +171,29 @@ async function onRefetchThumb() {
   }
 }
 
-// 预热进度（core 经 data_changed/media:thumb-progress 广播；仅页面开着时订阅）
+// 预热进度：① 进页面先 GET 一次落盘快照（解决"退出重进看不到状态"）；
+// ② WS data_changed/media:thumb-progress 实时推送；③ running 时每 3s 轮询兜底（WS 断了也能看到进度）。
 const wsStore = useWebSocketStore();
-const prewarm = ref<{ done: number; total: number; failed: number; running: boolean } | null>(null);
+const prewarm = ref<{
+  done: number; total: number; failed: number; running: boolean; current_name?: string;
+} | null>(null);
+async function loadPrewarmSnapshot() {
+  try {
+    const { data } = await api.get('/api/media/thumbnail-prewarm');
+    if (data?.snapshot) {
+      prewarm.value = {
+        done: Number(data.snapshot.done) || 0,
+        total: Number(data.snapshot.total) || 0,
+        failed: Number(data.snapshot.failed) || 0,
+        running: !!data.snapshot.running,
+        current_name: String(data.snapshot.current_name || ''),
+      };
+    } else {
+      prewarm.value = null;
+    }
+  } catch { /* 旧 core 无此端点，保持静默 */ }
+}
+onMounted(loadPrewarmSnapshot);
 const unsubPrewarm = wsStore.on('data_changed', (payload: any) => {
   if (payload?.changed === 'media:thumb-progress') {
     prewarm.value = {
@@ -175,10 +201,23 @@ const unsubPrewarm = wsStore.on('data_changed', (payload: any) => {
       total: Number(payload.total) || 0,
       failed: Number(payload.failed) || 0,
       running: !!payload.running,
+      current_name: String(payload.current_name || ''),
     };
   }
 });
 onUnmounted(unsubPrewarm);
+let pollTimer: number | null = null;
+function syncPolling() {
+  const should = prewarm.value?.running === true;
+  if (should && pollTimer === null) {
+    pollTimer = window.setInterval(loadPrewarmSnapshot, 3000);
+  } else if (!should && pollTimer !== null) {
+    window.clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+watch(prewarm, syncPolling, { deep: true });
+onUnmounted(() => { if (pollTimer !== null) window.clearInterval(pollTimer); });
 
 const query = ref('');
 const playingItem = ref<MediaItem | null>(null);
@@ -239,6 +278,27 @@ onMounted(() => { reload(); loadThumbCfg(); });
   font-size: 12px;
   color: var(--n-text-color-disabled, #999);
   white-space: nowrap;
+}
+.prewarm-badge.running {
+  /* 预热进行中：主题色描边提示还有动态 */
+  border-color: rgba(99, 102, 241, 0.55);
+}
+.prewarm-bar {
+  display: inline-block;
+  width: 64px;
+  height: 4px;
+  margin-left: 8px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+  vertical-align: middle;
+}
+.prewarm-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: #6366f1;
+  transition: width 0.4s ease;
 }
 .refetch-bar {
   display: flex;

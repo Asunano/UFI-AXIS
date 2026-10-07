@@ -15,7 +15,6 @@ import com.ufi_axis.data.model.MediaTagsResponse
 import com.ufi_axis.data.model.PlaylistAddResponse
 import com.ufi_axis.data.model.PlaylistNameRequest
 import com.ufi_axis.data.model.PlaylistPathsRequest
-import com.ufi_axis.data.model.StreamTicketRequest
 import com.ufi_axis.data.model.VideoInfoResponse
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.encodeUriComponent
@@ -40,9 +39,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.boolean
 import com.ufi_axis.util.DebugLog
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URLEncoder
 
 /**
@@ -72,7 +75,7 @@ class MediaModule(
         /** 缩略图默认边长（core 侧夹在 96..1024）。 */
         const val THUMB_SIZE = 256
 
-        /** [allItems] 的枚举上限：批量抽帧一次处理上万项本身就不合理。 */
+        /** [allItems] 的枚举上限：一次枚举上万项本身就不合理。 */
         const val ALL_ITEMS_LIMIT = 2000
 
         /**
@@ -245,11 +248,11 @@ class MediaModule(
     }
 
     /**
-     * 把某一类**整库**拉齐（分页循环），给"批量生成缩略图"这种要先知道全集的操作用。
+     * 把某一类**整库**拉齐（分页循环），给需要全集的操作用。
      *
      * 不进 [state]：这是一次性的枚举结果，塞进列表状态会和分页浏览打架
      * （用户明明只滚到第 2 页，列表却突然有了 800 项）。
-     * 上限 [ALL_ITEMS_LIMIT] 是防呆：真有上万个视频时，批量抽帧本身就不该一次做完。
+     * 上限 [ALL_ITEMS_LIMIT] 是防呆：真有上万个视频时，整库枚举不该一次做完。
      */
     suspend fun allItems(type: String): List<MediaLibraryItem> {
         val tab = _state.value.tab(type)
@@ -1161,7 +1164,6 @@ class MediaModule(
      * ## 为什么需要这个
      * 缩略图有三层缓存，只清一层等于没清：
      *  1. 图片加载库（按 URL 命中的磁盘 + 内存缓存）；
-     *  2. 本机抽帧的成果（`MediaThumbnailBuilder` 的目录）；
      *  3. **设备上客户端回传的成果** ← 本方法清的是这层。
      *
      * `/thumbnail` 的 URL 只含 (type, id)、不含内容指纹，命中即原样返回。
@@ -1185,8 +1187,7 @@ class MediaModule(
      */
     suspend fun resetThumbnail(type: String, id: Long): Boolean = try {
         api.clearMediaThumbnailCache(type, id)
-        // 本机（Coil URL 磁盘缓存 / 本机抽帧成果）与来源记录的失效由 feature-media 层做：
-        // MediaThumbnailBuilder 是 feature-media 的 internal，本层摸不到。
+        // 2026-10-07：本机抽帧已删除，这里只失效 Coil 侧由 URL 命中的来源记录。
         com.ufi_axis.data.api.ThumbSourceRegistry.invalidate(thumbnailUrl(type, id))
         true
     } catch (e: Exception) {
@@ -1240,15 +1241,32 @@ class MediaModule(
 
     // ── 2026-10-07：封面预热进度（core 经 data_changed/media:thumb-progress 广播）──
     // MainViewModel 的 WS 收集器解析后喂进 [onThumbPrewarmProgress]；设置页 collect 显示。
-    data class ThumbPrewarmProgress(val done: Int, val total: Int, val failed: Int, val running: Boolean)
+    data class ThumbPrewarmProgress(
+        val done: Int,
+        val total: Int,
+        val failed: Int,
+        val running: Boolean,
+        val currentName: String = "",
+        val startedAt: String = "",
+        val updatedAt: String = ""
+    )
 
     private val _thumbPrewarmProgress = kotlinx.coroutines.flow.MutableStateFlow<ThumbPrewarmProgress?>(null)
 
     /** 最近一次预热进度；null = 本次连接没收到过（未开启或 core 旧版本）。 */
     val thumbPrewarmProgress: kotlinx.coroutines.flow.StateFlow<ThumbPrewarmProgress?> = _thumbPrewarmProgress
 
-    fun onThumbPrewarmProgress(done: Int, total: Int, failed: Int, running: Boolean) {
-        _thumbPrewarmProgress.value = ThumbPrewarmProgress(done, total, failed, running)
+    fun onThumbPrewarmProgress(
+        done: Int, total: Int, failed: Int, running: Boolean, currentName: String = ""
+    ) {
+        // 只覆盖进度字段：WS 不带 started_at/updated_at，别把 GET 快照里读到的清掉
+        val prev = _thumbPrewarmProgress.value
+        _thumbPrewarmProgress.value = ThumbPrewarmProgress(
+            done = done, total = total, failed = failed, running = running,
+            currentName = currentName,
+            startedAt = prev?.startedAt.orEmpty(),
+            updatedAt = prev?.updatedAt.orEmpty()
+        )
     }
 
     /**
@@ -1351,43 +1369,36 @@ class MediaModule(
     }
 
     /**
-     * 换一张**免鉴权**播放地址（`/media/stream?ticket=…` 的完整 URL）。
-     *
-     * 只给 [MediaMetadataRetriever][android.media.MediaMetadataRetriever] 这类"自己发 HTTP、
-     * 加不了请求头"的调用方用：`/api/files/stream` 要设备签名，而签名里的 nonce 是一次性的，
-     * 抽帧过程中的多个 Range 请求必然从第二个起被拒。播放器（ExoPlayer）不需要它 ——
-     * 那条链路走 OkHttp，能逐请求重签。
+     * 2026-10-07：拉一次预热状态快照（GET /api/media/thumbnail-prewarm）。
+     * 进设置页时先调一次 → 退出重进也能看到上一轮的进度/结果；预热中轮询也走它。
+     * @return null = core 从未跑过（或旧 core 无此端点）。
      */
-    suspend fun ticketStreamUrl(path: String): String? = try {
-        val resp = api.createStreamTicket(StreamTicketRequest(path))
-        resp.url.takeIf { it.isNotBlank() }?.let { rel ->
-            val prefs = AppPreferences(appContext)
-            "http://${prefs.effectiveHost}:${prefs.serverPort}$rel"
+    suspend fun refreshPrewarmState(): ThumbPrewarmProgress? {
+        return try {
+            val o = api.getThumbnailPrewarmState().jsonObject
+            val snap = o["snapshot"]?.jsonObject
+            if (snap == null) {
+                _thumbPrewarmProgress.value = null
+                null
+            } else {
+                fun k(name: String) = snap[name]?.jsonPrimitive
+                val p = ThumbPrewarmProgress(
+                    running = k("running")?.boolean ?: false,
+                    done = k("done")?.int ?: 0,
+                    failed = k("failed")?.int ?: 0,
+                    total = k("total")?.int ?: 0,
+                    currentName = k("current_name")?.content ?: "",
+                    startedAt = k("started_at")?.content ?: "",
+                    updatedAt = k("updated_at")?.content ?: ""
+                )
+                _thumbPrewarmProgress.value = p
+                p
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
         }
-    } catch (e: Exception) {
-        null
     }
 
-    /**
-     * 把手机抽好的缩略图交给 core 缓存。
-     *
-     * 为什么要回传而不是只存本地：core 的 `/media/thumbnail` 第一级就是这份缓存，交上去之后
-     * **Web 端、第二台手机**都能直接看到同一张图；只存本地的话每个客户端都要自己重抽一遍。
-     *
-     * 失败只回 false 不抛：这是"顺手把成果共享出去"，失败了本地缓存仍然有效，
-     * 不该因为它让缩略图显示不出来。
-     */
-    suspend fun uploadThumbnail(type: String, id: Long, jpeg: ByteArray): Boolean = try {
-        val body = jpeg.toRequestBody("image/jpeg".toMediaType())
-        val ok = api.putMediaThumbnail(type, id, body).success
-        // 2026-10-05 G4（修 F2）：此前失败静默 false，core 缓存长期缺图而 app 本地正常
-        // ——两端状态漂移无人知。失败现在至少留痕。成功时不必再 GET 回读：
-        // core 侧 rename 成功才回 success=true（tmp→target 原子落盘），受理即确认；
-        // 额外回读会让批量任务多 N 次请求，得不偿失。
-        if (!ok) DebugLog.w("MediaModule", "缩略图回传未受理(core 未落盘): $type/$id")
-        ok
-    } catch (e: Exception) {
-        DebugLog.w("MediaModule", "缩略图回传异常: $type/$id ${e.javaClass.simpleName}: ${e.message}")
-        false
-    }
 }

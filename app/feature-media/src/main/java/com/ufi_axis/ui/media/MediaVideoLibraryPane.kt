@@ -47,7 +47,6 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
-import java.io.File
 
 /**
  * 视频页 · 媒体库（文件夹视图）。
@@ -77,7 +76,6 @@ internal fun MediaVideoLibraryPane(
     viewModel: MainViewModel,
     onOpen: (MediaLibraryItem) -> Unit,
     onDownload: (MediaLibraryItem, String) -> Unit,
-    onThumbMissing: (suspend (MediaLibraryItem) -> File?)? = null,
     listState: LazyListState,
     onLongPress: (MediaVideoMenuTarget) -> Unit
 ) {
@@ -236,7 +234,6 @@ internal fun MediaVideoLibraryPane(
                                     fallback = Icons.Default.Videocam,
                                     width = MEDIA_VIDEO_THUMB_WIDTH,
                                     height = MEDIA_VIDEO_THUMB_HEIGHT,
-                                    onRemoteMissing = onThumbMissing?.let { build -> { build(item) } }
                                 )
                             },
                             trailing = {

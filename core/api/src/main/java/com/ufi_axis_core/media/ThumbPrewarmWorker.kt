@@ -48,6 +48,72 @@ object ThumbPrewarmWorker {
 
     private val running = AtomicBoolean(false)
 
+    // ── 2026-10-07：进度持久化 ──
+    // 之前进度只活在 WS 广播里，客户端退出页面再进来就"失忆"（无从得知上一轮跑没跑、
+    // 跑到哪）。现在每处理一条都把快照落盘，任何客户端随时 GET 都能拿到真实状态。
+    // 快照很小（一行 JSON），每条一次写盘可接受（预热本来就是秒级间隔的任务）。
+
+    /** 持久化进度快照。 */
+    data class Progress(
+        val done: Int,
+        val total: Int,
+        val failed: Int,
+        val running: Boolean,
+        /** 当前正在抽帧的那条的文件名（running=false 时为上一轮最后一条）。 */
+        val currentName: String = "",
+        /** 本轮开始时刻（epoch ms）；0 = 未知（旧快照）。 */
+        val startedAt: Long = 0,
+        /** 快照写入时刻（epoch ms）——客户端据此区分"刚跑完"与"很久前的一轮"。 */
+        val updatedAt: Long = 0
+    ) {
+        fun toJson(): String = """{"done":$done,"total":$total,"failed":$failed,""" +
+            """"running":$running,"current_name":"${currentName.replace("\\", "\\\\").replace("\"", "\\\"")}",""" +
+            """"started_at":$startedAt,"updated_at":$updatedAt}"""
+
+        companion object {
+            fun fromJson(text: String): Progress? = runCatching {
+                // 手写极简解析：字段固定、无嵌套，避免为一个快照引入 JSON 依赖
+                fun str(key: String): String =
+                    text.substringAfter("\"$key\":\"", "").substringBefore('"')
+                fun num(key: String): Long =
+                    text.substringAfter("\"$key\":", "").substringBefore(',').trim().toLongOrNull() ?: 0L
+                Progress(
+                    done = num("done").toInt(),
+                    total = num("total").toInt(),
+                    failed = num("failed").toInt(),
+                    running = text.contains("\"running\":true"),
+                    currentName = str("current_name"),
+                    startedAt = num("started_at"),
+                    updatedAt = num("updated_at")
+                )
+            }.getOrNull()
+        }
+    }
+
+    /** 最新进度快照（内存镜像；进程被杀后由 [readPersisted] 恢复）。 */
+    @Volatile
+    var lastProgress: Progress? = null
+        private set
+
+    private fun snapshotFile(context: Context): File = File(context.filesDir, "thumbs/prewarm_progress.json")
+
+    /** 读持久化快照（进程重启后恢复用）。文件不存在/损坏 = null。 */
+    fun readPersisted(context: Context): Progress? =
+        lastProgress ?: runCatching {
+            snapshotFile(context).takeIf { it.isFile }?.readText()?.let { Progress.fromJson(it) }
+        }.getOrNull().also { lastProgress = it }
+
+    private fun persist(context: Context, p: Progress) {
+        lastProgress = p
+        runCatching {
+            val f = snapshotFile(context)
+            f.parentFile?.mkdirs()
+            val tmp = File(f.parentFile, f.name + ".tmp")
+            tmp.writeText(p.toJson())
+            if (!tmp.renameTo(f)) tmp.delete()
+        }
+    }
+
     /**
      * 跑一轮预热。由 DataScheduler 的 idle 循环周期性调用（其 scope 取消时协程随之取消）。
      *
@@ -59,7 +125,7 @@ object ThumbPrewarmWorker {
     suspend fun runOnce(
         context: Context,
         throttledPerItem: suspend () -> Unit,
-        broadcast: suspend (done: Int, total: Int, failed: Int, running: Boolean) -> Unit,
+        broadcast: suspend (done: Int, total: Int, failed: Int, running: Boolean, currentName: String) -> Unit,
         /** 2026-10-07：手动触发（POST /media/thumbnail-prewarm）时忽略闲时门 —— 用户点按钮就是要现在跑。 */
         forceIdle: Boolean = false
     ) {
@@ -82,11 +148,14 @@ object ThumbPrewarmWorker {
             val thumbDir = File(context.filesDir, "thumbs").apply { if (!isDirectory) mkdirs() }
             val ids = listVideoIds(context)
             if (ids.isEmpty()) return
+            val names = idToName(context)
 
             var done = 0
             var failed = 0
+            val startedAt = System.currentTimeMillis()
             AppLogger.i(TAG, "预热开始：${ids.size} 个视频")
-            broadcast(done, ids.size, failed, true)
+            persist(context, Progress(0, ids.size, 0, true, startedAt = startedAt, updatedAt = startedAt))
+            broadcast(done, ids.size, failed, true, "")
             var writeGateAborted = false
             for (id in ids) {
                 // ③ WriteGate 每条复查（审查修复）：大库一轮可达数十分钟，
@@ -100,24 +169,58 @@ object ThumbPrewarmWorker {
                     hasCache(thumbDir, id) -> Unit                       // 已有图（回传/上轮成果）
                     isCoolingDown(thumbDir, id) -> Unit                  // 6h 内失败过
                     else -> {
+                        // 进度快照带上当前条目名，客户端能看到"正在处理 xxx.mkv"
+                        persist(context, Progress(done, ids.size, failed, true,
+                            currentName = names[id] ?: "", startedAt = startedAt,
+                            updatedAt = System.currentTimeMillis()))
                         val ok = prewarmOne(context, thumbDir, id)
                         if (ok) done++ else failed++
-                        broadcast(done, ids.size, failed, true)
+                        persist(context, Progress(done, ids.size, failed, true,
+                            currentName = names[id] ?: "", startedAt = startedAt,
+                            updatedAt = System.currentTimeMillis()))
+                        broadcast(done, ids.size, failed, true, names[id] ?: "")
                         throttledPerItem()                               // 节流：让位前台
                     }
                 }
             }
-            AppLogger.i(TAG, "预热结束：新增 $done / 失败 $failed / 共 ${ids.size}")
-            broadcast(done, ids.size, failed, false)
+            val finishedAt = System.currentTimeMillis()
+            AppLogger.i(TAG, "预热结束：新增 $done / 失败 $failed / 共 ${ids.size}" +
+                (if (writeGateAborted) "（OTA 中止）" else ""))
+            persist(context, Progress(done, ids.size, failed, false,
+                startedAt = startedAt, updatedAt = finishedAt))
+            broadcast(done, ids.size, failed, false, "")
         } catch (e: kotlinx.coroutines.CancellationException) {
+            // 被取消（调度 scope 关闭/服务停止）：快照标成非 running，别让客户端永远等"预热中"
+            runCatching {
+                persist(context, (lastProgress ?: Progress(0, 0, 0, false)).copy(running = false))
+            }
             throw e
         } catch (e: Exception) {
             // 预热是纯锦上添花，任何一轮的异常都不该冒泡打断调度循环
             AppLogger.w(TAG, "预热轮异常: ${e.javaClass.simpleName}: ${e.message}")
+            runCatching {
+                persist(context, (lastProgress ?: Progress(0, 0, 0, false)).copy(running = false))
+            }
         } finally {
             running.set(false)
         }
     }
+
+    /** id → 文件名映射（一次查询，进度快照显示"正在处理谁"用）。失败返回空表（快照无名可显）。 */
+    private fun idToName(context: Context): Map<Long, String> = runCatching {
+        val out = mutableMapOf<Long, String>()
+        context.contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DISPLAY_NAME),
+            null, null,
+            "${MediaStore.MediaColumns._ID} ASC"
+        )?.use { c ->
+            val idCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+            val nameCol = c.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+            while (c.moveToNext()) out[c.getLong(idCol)] = c.getString(nameCol) ?: ""
+        }
+        out
+    }.getOrDefault(emptyMap())
 
     /** 闲时判据：充电中（含 FULL）或电量 > [PREWARM_MIN_BATTERY_PERCENT]。 */
     private fun isIdleEnough(context: Context): Boolean {

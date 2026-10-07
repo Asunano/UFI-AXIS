@@ -262,6 +262,14 @@ interface UfiAxisApi {
     @POST("api/media/thumbnail-prewarm")
     suspend fun runThumbnailPrewarm(): JsonElement
 
+    /**
+     * 2026-10-07：封面预热状态快照（core 落盘，随时可查——解决"退出页面重进看不到状态"）。
+     * snapshot=false = core 从未跑过预热；其余字段 done/total/failed/running/current_name/
+     * started_at/updated_at。
+     */
+    @GET("api/media/thumbnail-prewarm")
+    suspend fun getThumbnailPrewarmState(): JsonElement
+
     /** 2026-10-07：真 PTY 终端状态（enabled=开关、running=ttyd 进程）。 */
     @GET("api/terminal/status")
     suspend fun ttydStatus(): JsonElement
@@ -286,15 +294,6 @@ interface UfiAxisApi {
      */
     @GET("api/media/tags")
     suspend fun getMediaTags(@Query("id") id: Long): MediaTagsResponse
-
-    /**
-     * 换一张免鉴权播放票据（`/media/stream?ticket=…`）。
-     *
-     * 手机端给「设备解不出画面」的视频抽缩略图时要用：`MediaMetadataRetriever` 自己发 HTTP
-     * 请求、加不了签名头，而签名的 nonce 是一次性的，多个 Range 请求必然从第二个起被拒。
-     */
-    @POST("api/files/stream-ticket")
-    suspend fun createStreamTicket(@Body body: StreamTicketRequest): StreamTicketResponse
 
     // ========== 音频歌单（2026-09-21）==========
     //
@@ -453,20 +452,6 @@ interface UfiAxisApi {
      */
     @GET("api/geo")
     suspend fun getGeo(): GeoResponse
-
-    /**
-     * 把手机端抽好的缩略图交给 core 缓存（raw JPEG 字节）。
-     *
-     * core 侧 `/api/media/thumbnail` 的第一级就是这份缓存，所以传一次之后
-     * **Web 端和其它客户端也能看到**这张缩略图 —— 这正是"抽完要回传"而不是只存本地的理由。
-     */
-    @PUT("api/media/thumbnail")
-    suspend fun putMediaThumbnail(
-        @Query("type") type: String,
-        @Query("id") id: Long,
-        @Body body: okhttp3.RequestBody
-    ): MediaThumbUploadResponse
-
 
     // ========== Network ==========
     @GET("api/network/signal")

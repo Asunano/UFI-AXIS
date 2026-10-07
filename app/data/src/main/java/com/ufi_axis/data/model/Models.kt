@@ -2015,36 +2015,6 @@ data class PlaylistRemoveResponse(
     val removed: Int = 0
 )
 
-/** `POST /api/files/stream-ticket` 的请求体。 */
-@Serializable
-data class StreamTicketRequest(val path: String)
-/**
- * `POST /api/files/stream-ticket`：换一张**免鉴权**的播放票据。
- *
- * 用途（2026-09-16）：手机端给设备解不出画面的视频抽缩略图时，要把地址交给
- * `MediaMetadataRetriever`，而它自己发 HTTP 请求、**加不了签名头**；签名里的 nonce 又是
- * 一次性的，多个 Range 请求必然从第二个开始被拒。票据正是为这种客户端准备的：
- * 可重复使用、滑动过期、只授权这一个文件。
- *
- * [url] 是 core 给出的相对路径（`/media/stream?ticket=…`），客户端拼上 host:port 即可。
- */
-@Serializable
-data class StreamTicketResponse(
-    val ticket: String = "",
-    val url: String = "",
-    val expires_in: Long = 0,
-    val size: Long = 0,
-    val mime: String = ""
-)
-
-/** `PUT /api/media/thumbnail`：客户端把抽好的缩略图交给 core 缓存。 */
-@Serializable
-data class MediaThumbUploadResponse(
-    val success: Boolean = false,
-    val type: String = MEDIA_TYPE_VIDEO,
-    val id: Long = 0,
-    val size: Int = 0
-)
 
 // ══════════════════════════ 天气（2026-09-17）══════════════════════════
 //

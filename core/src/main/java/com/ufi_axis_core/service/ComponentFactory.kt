@@ -723,13 +723,13 @@ object ComponentFactory {
             wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
         }
         // 预热进度广播闭包（2026-10-07：抽出来给调度侧与手动触发共用一份口径）
-        val thumbPrewarmBroadcast: suspend (Int, Int, Int, Boolean) -> Unit = { done, total, failed, running ->
+        val thumbPrewarmBroadcast: suspend (Int, Int, Int, Boolean, String) -> Unit = { done, total, failed, running, currentName ->
             wsManager.broadcast(
                 "data_changed",
                 mapOf(
                     "changed" to com.ufi_axis_core.contract.WsDataTopic.MEDIA_THUMB_PREWARM,
                     "done" to done, "total" to total,
-                    "failed" to failed, "running" to running
+                    "failed" to failed, "running" to running, "current_name" to currentName
                 )
             )
         }

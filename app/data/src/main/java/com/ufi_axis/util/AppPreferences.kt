@@ -333,18 +333,8 @@ class AppPreferences(private val context: Context) {
         get() = prefs.getBoolean(KEY_AUDIO_SHUFFLE, false)
         set(value) = prefs.edit().putBoolean(KEY_AUDIO_SHUFFLE, value).apply()
 
-    // ── 媒体：本机抽帧提示 & 播放进度（2026-09-16）──
+    // ── 媒体：播放进度（2026-09-16）──
 
-
-    /**
-     * 「设备端出不了缩略图、改由本机抽帧」这条说明是否已被用户关掉。
-     *
-     * 一次性说明：关掉之后不再出现（抽帧本身仍会用 toast 提示，那是"正在做什么"，
-     * 与这条"为什么这么做"是两件事）。
-     */
-    var mediaLocalThumbNoticeDismissed: Boolean
-        get() = prefs.getBoolean(KEY_MEDIA_THUMB_NOTICE, false)
-        set(value) = prefs.edit().putBoolean(KEY_MEDIA_THUMB_NOTICE, value).apply()
 
     /**
      * 上次播放到哪（毫秒）。0 = 没有记录 / 已看完。
@@ -404,17 +394,6 @@ class AppPreferences(private val context: Context) {
     }
 
     // ── 媒体：抽帧开关 & 最近播放（2026-09-16 第三轮）──
-
-    /**
-     * 是否允许**本机抽帧**生成视频缩略图（默认开）。
-     *
-     * 关掉之后只显示 core 给得出的缩略图 —— 在解码器残缺的设备上那等于没有缩略图。
-     * 之所以给开关：抽帧要拉几 MB 视频头部并占用手机 CPU，用户有权拒绝这笔开销。
-     * 这是**真开关**：关掉后列表不再触发抽帧，批量任务入口也随之停用。
-     */
-    var mediaPhoneFrameExtraction: Boolean
-        get() = prefs.getBoolean(KEY_MEDIA_PHONE_FRAME, true)
-        set(value) = prefs.edit().putBoolean(KEY_MEDIA_PHONE_FRAME, value).apply()
 
     /**
      * 最近播放（首页横向列表）。存 `path|name|id` 三段，最新的在前，最多 [MEDIA_RECENT_LIMIT] 条。
@@ -647,8 +626,6 @@ class AppPreferences(private val context: Context) {
         private const val KEY_GOFORM_PORT = "goform_port"
         private const val KEY_FILE_VIEW_MODE = "file_view_mode"
 
-        /** 「设备端出不了缩略图、改由本机抽帧」这条一次性说明是否已关闭。 */
-        private const val KEY_MEDIA_THUMB_NOTICE = "media_local_thumb_notice_dismissed"
 
         /** 音乐循环模式（media3 `Player.REPEAT_MODE_*` 原值）。 */
         private const val KEY_AUDIO_REPEAT_MODE = "audio_repeat_mode"
@@ -666,8 +643,6 @@ class AppPreferences(private val context: Context) {
         /** 最多记住多少个文件的播放进度。200 条够覆盖"最近在看的"，再多是负担不是功能。 */
         private const val MEDIA_POSITION_LIMIT = 200
 
-        /** 本机抽帧开关（默认开）。 */
-        private const val KEY_MEDIA_PHONE_FRAME = "media_phone_frame_extraction"
 
         /** 最近播放（换行分隔的 `path|name|id`）。 */
         private const val KEY_MEDIA_RECENT = "media_recent_plays"

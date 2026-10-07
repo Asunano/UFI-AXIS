@@ -46,7 +46,6 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.state.MediaTabState
-import java.io.File
 
 /**
  * 视频页 · 首页（海报墙）。
@@ -76,7 +75,6 @@ internal fun MediaVideoHome(
     thumbUrl: (MediaLibraryItem) -> String,
     onNearEnd: () -> Unit,
     onOpen: (MediaLibraryItem) -> Unit,
-    onThumbMissing: (suspend (MediaLibraryItem) -> File?)? = null,
     onOpenRecent: (path: String, name: String, id: Long) -> Unit,
     gridState: LazyGridState,
     onLongPress: (MediaVideoMenuTarget) -> Unit
@@ -160,7 +158,6 @@ internal fun MediaVideoHome(
                 item = item,
                 thumbUrl = thumbUrl(item),
                 onClick = { onOpen(item) },
-                onThumbMissing = onThumbMissing?.let { build -> { build(item) } },
                 // 首页没有"当前目录"，下载的镜像子目录只能是空串（理由见 MediaVideoMenuTarget）
                 onLongPress = { bounds, point ->
                     onLongPress(MediaVideoMenuTarget(item, bounds, point, downloadSubDir = ""))
@@ -188,7 +185,6 @@ private fun PosterCell(
     item: MediaLibraryItem,
     thumbUrl: String,
     onClick: () -> Unit,
-    onThumbMissing: (suspend () -> File?)? = null,
     onLongPress: (IntRect, IntOffset) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -206,7 +202,6 @@ private fun PosterCell(
             url = thumbUrl,
             fallback = Icons.Default.Videocam,
             aspectRatio = POSTER_ASPECT,
-            onRemoteMissing = onThumbMissing
         )
         Spacer(Modifier.height(Spacing.Small))
         Text(
