@@ -64,6 +64,22 @@ fun HomeMetricsDialog(
                     cpu.cores.forEach { core ->
                         UfiInfoRow("核心 ${core.core}", core.freq_display)
                     }
+
+                    // 2026-10-08 只读监控档：关键热区温度。全量 20+ 区太吵，按前缀筛
+                    // SoC/大核簇/Modem/PA 这几类真正反映负载与射频发热的，其余折叠进「其他（最高）」。
+                    val keyZones = state.thermalZones.filter { z ->
+                        listOf("soc", "big7", "apcpu", "pa-", "nr", "lte", "mid").any { z.name.startsWith(it) }
+                    }
+                    if (keyZones.isNotEmpty()) {
+                        UfiSectionHeader("关键温度")
+                        keyZones.forEach { z ->
+                            UfiInfoRow(z.name.removeSuffix("-thmzone"), FormatUtils.formatTemperature(z.temperature))
+                        }
+                        val others = state.thermalZones.filter { it !in keyZones && it.temperature > 0 }
+                        others.maxOfOrNull { it.temperature }?.let {
+                            UfiInfoRow("其他（最高）", FormatUtils.formatTemperature(it))
+                        }
+                    }
                 } ?: Box(
                     modifier = Modifier.fillMaxWidth(),
                     contentAlignment = Alignment.Center

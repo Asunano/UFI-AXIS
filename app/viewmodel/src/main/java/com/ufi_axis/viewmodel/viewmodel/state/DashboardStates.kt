@@ -15,6 +15,8 @@ import androidx.compose.runtime.Immutable
 data class DashboardState(
     val deviceInfo: DeviceInfoResponse? = null,
     val cpuInfo: CpuInfo? = null,
+    /** 全量热区温度（只读监控档，2026-10-08）：CPU 弹窗筛关键热区展示。 */
+    val thermalZones: List<ThermalZoneItem> = emptyList(),
     val memoryInfo: MemoryInfo? = null,
     val batteryInfo: BatteryInfo? = null,
     val storageInfo: StorageInfo? = null,

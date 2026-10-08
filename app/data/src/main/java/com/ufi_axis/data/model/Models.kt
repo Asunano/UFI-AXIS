@@ -62,6 +62,19 @@ data class CpuCore(
     val freq_display: String = ""
 )
 
+/** 全量热区（GET api/device/thermal，2026-10-08 只读监控档：关键温度进 CPU 弹窗）。 */
+@Serializable
+data class ThermalZoneItem(
+    val name: String,
+    val temperature: Double
+)
+
+@Serializable
+data class ThermalZonesResponse(
+    val zones: List<ThermalZoneItem> = emptyList(),
+    val count: Int = 0
+)
+
 @Serializable
 data class MemoryInfo(
     val total: Long,

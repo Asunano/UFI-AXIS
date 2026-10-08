@@ -835,6 +835,19 @@ class DashboardModule(
         }
     }
 
+    // 2026-10-08 只读监控档：热区温度拉取（CPU 弹窗展示关键热区）。失败静默——热区读不到
+    // 弹窗就不显示该区，不影响仪表盘其它数据。
+    private suspend fun loadThermalZonesSilently() {
+        try {
+            val resp = AppJson.decodeFromJsonElement<ThermalZonesResponse>(api.getThermalZones())
+            if (resp.zones.isNotEmpty()) {
+                _dashboardState.update { it.copy(thermalZones = resp.zones) }
+            }
+        } catch (_: Exception) {
+            // 静默：热区在部分固件上读不到，非致命
+        }
+    }
+
     /**
      * 加载后端 Core 进程首次启动时间（UTC epoch ms）。用于监控页"自定义时间范围"对话框 minDateMs 下限。
      * 2026-08-08 12:09 新增：app 启动时调用一次即可（startupTime 是常量），不需刷新。
