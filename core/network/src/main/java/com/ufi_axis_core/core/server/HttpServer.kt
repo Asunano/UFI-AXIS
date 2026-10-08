@@ -69,6 +69,7 @@ class HttpServer(
     private val speedTestRoutes: SpeedTestRoutes? = null,
     private val debugLogRoutes: DebugLogRoutes? = null,
     private val diagnosticRoutes: com.ufi_axis_core.api.routes.DiagnosticRoutes? = null,
+    private val cpuProbeRoutes: com.ufi_axis_core.api.routes.CpuProbeRoutes? = null,
     private val planRoutes: com.ufi_axis_core.api.routes.PlanRoutes? = null,
     private val qosRoutes: QoSRoutes? = null,
     private val monitorRoutes: MonitorRoutes? = null,
@@ -692,6 +693,7 @@ class HttpServer(
                 speedTestRoutes?.register(this)
                 debugLogRoutes?.register(this)
                 diagnosticRoutes?.register(this)
+                cpuProbeRoutes?.register(this)
                 planRoutes?.register(this)
                 qosRoutes?.register(this)
                 monitorRoutes?.register(this)

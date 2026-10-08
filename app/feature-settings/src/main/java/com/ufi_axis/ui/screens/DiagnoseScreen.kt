@@ -282,6 +282,52 @@ fun DiagnoseScreen(viewModel: MainViewModel, navController: NavHostController) {
                         }
                     }
 
+                    // ═════ CPU 控制能力探测（2026-10-08）═════
+                    // 为「处理器管理 / 智能调度」做的真机前置勘察：一次探测回报
+                    // cpufreq policy 矩阵（每组核的当前/最小/最大频率、governor 及其可选值、
+                    // 频率表）、per-cpu online 节点的存在性与可写性、thermal zone 快照。
+                    // 探测会发 20+ 条 shell（5~15s），所以独立按钮独立 loading，不跟页面刷新走。
+                    DiagnoseCard(title = "CPU 控制能力") {
+                        val probe = state.cpuProbe
+                        Text(
+                            "探测会检查每核 cpufreq 节点的读写权限与 online 开关（全部只读或写回原值，" +
+                                "不会改动设备状态），约 5~15 秒。用于确认处理器管理功能在这台设备上能开放到什么程度。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary
+                        )
+                        if (probe != null) CpuProbeDetail(probe)
+                        UfiButton(
+                            variant = UfiButtonVariant.Secondary,
+                            text = if (probe == null) "开始探测" else "重新探测",
+                            onClick = { viewModel.tools.runCpuProbe() },
+                            enabled = !state.cpuProbing,
+                            loading = state.cpuProbing,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        if (probe != null) {
+                            UfiButton(
+                                variant = UfiButtonVariant.Subtle,
+                                text = "复制原始 JSON",
+                                onClick = {
+                                    runCatching {
+                                        val cm = context
+                                            .getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(
+                                            ClipData.newPlainText(
+                                                "cpu_probe",
+                                                prettyJson.encodeToString(JsonElement.serializer(), probe)
+                                            )
+                                        )
+                                        toastMessage = ToastMessage("已复制 cpu_probe", ToastType.SUCCESS)
+                                    }.onFailure {
+                                        toastMessage = ToastMessage("复制失败", ToastType.ERROR)
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                    }
+
                     // ═════ QoS / 线程池 ═════
                     state.qos?.let { q ->
                         DiagnoseCard(title = "QoS 与线程池") {
@@ -541,3 +587,131 @@ private fun JsonObject.coverageString(key: String): String? =
 /** 只认数字型的键：缺键 / 类型不对时回 null，由调用点决定显示成什么，不静默当 0。 */
 private fun JsonObject.coverageInt(key: String): Int? = (this[key] as? JsonPrimitive)?.intOrNull
 
+
+
+/**
+ * CPU 探测结果卡的内容（2026-10-08）。
+ *
+ * 与 [FieldCoverageDetail] 同一设计取向：结果形状随内核/机型漂移，只认认得出的键，
+ * 认不出的（或退化形态）走「复制原始 JSON」对账，不在这里吞掉。
+ *
+ * 渲染重点按后续「处理器管理」功能的需求排序：
+ * 1. 每个 policy 一块：核组、当前/最小/最大频率（kHz→MHz）、governor 及可选值、可写性；
+ * 2. per-cpu online：节点存在 + 可写 = 「开关核心」功能可行；
+ * 3. 结论行：freq_writable / gov_writable / online_writable 三项汇总——三项全绿
+ *    代表频率限制、governor 切换、核开关全部可编程；全红则只能靠现有只读监控。
+ */
+@Composable
+private fun CpuProbeDetail(probe: JsonElement) {
+    val palette = LocalResolvedPalette.current
+    val obj = probe as? JsonObject
+    if (obj == null) {
+        Text(probe.toString(), style = UfiTextStyles.monoNote, color = palette.textSecondary)
+        return
+    }
+    if ((obj["ok"] as? JsonPrimitive)?.booleanOrNull == false) {
+        Text(
+            "探测失败：" + ((obj["error"] as? JsonPrimitive)?.contentOrNull ?: "未知原因"),
+            style = UfiTextStyles.note,
+            color = palette.error
+        )
+        return
+    }
+
+    UfiInfoRow("内核", obj.str("kernel").ifBlank { "未知" })
+    obj.str("board").takeIf { it.isNotBlank() }?.let { UfiInfoRow("平台", it) }
+    UfiInfoRow("核心数", obj.str("cores_declared").ifBlank { "未知" })
+
+    val policies = obj["policies"] as? JsonArray
+    if (!policies.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text("调频域（policy）", style = MaterialTheme.typography.titleSmall, color = palette.textPrimary)
+        for ((i, raw) in policies.withIndex()) {
+            val p = raw as? JsonObject ?: continue
+            val cpus = (p["cpus"] as? JsonArray)
+                ?.mapNotNull { (it as? JsonPrimitive)?.intOrNull }?.joinToString(",")
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Small)) {
+                UfiInfoRow("CPU 组 ${i + 1}", "cpu$cpus")
+                UfiInfoRow("当前频率", p.freqMHz("cur_freq"))
+                UfiInfoRow("范围", "${p.freqMHz("min_freq")} ~ ${p.freqMHz("max_freq")}")
+                UfiInfoRow("调频策略", p.str("governor").ifBlank { "未知" })
+                val govs = p.strList("available_governors")
+                if (govs.isNotEmpty()) UfiInfoRow("可选策略", govs.joinToString("、"))
+                UfiInfoRow(
+                    "频率上限可写",
+                    if ((p["freq_writable"] as? JsonPrimitive)?.booleanOrNull == true) "✓ 可写" else "✗ 不可写",
+                )
+                UfiInfoRow(
+                    "策略可切换",
+                    if ((p["gov_writable"] as? JsonPrimitive)?.booleanOrNull == true) "✓ 可写" else "✗ 不可写",
+                )
+            }
+        }
+    }
+
+    val online = obj["online_nodes"] as? JsonArray
+    if (!online.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text("核心开关（online 节点）", style = MaterialTheme.typography.titleSmall, color = palette.textPrimary)
+        val writable = online.mapNotNull { it as? JsonObject }
+            .count { (it["writable"] as? JsonPrimitive)?.booleanOrNull == true }
+        val withNode = online.mapNotNull { it as? JsonObject }
+            .count { (it["node_exists"] as? JsonPrimitive)?.booleanOrNull == true }
+        UfiInfoRow("节点存在", "$withNode / ${online.size}")
+        UfiInfoRow("可写（可开/关核）", "$writable / ${online.size}")
+        if (writable > 0) {
+            val list = online.mapNotNull { it as? JsonObject }
+                .filter { (it["writable"] as? JsonPrimitive)?.booleanOrNull == true }
+                .mapNotNull { (it["cpu"] as? JsonPrimitive)?.intOrNull }
+                .joinToString(",")
+            Text(
+                "可编程核心：cpu$list",
+                style = UfiTextStyles.monoNote,
+                color = palette.textSecondary
+            )
+        }
+    }
+
+    val zones = obj["thermal_zones"] as? JsonArray
+    if (!zones.isNullOrEmpty()) {
+        Spacer(Modifier.height(Spacing.Small))
+        Text(
+            "温度区：${zones.size} 个（原始 JSON 含当前温度）",
+            style = MaterialTheme.typography.bodySmall,
+            color = palette.textSecondary
+        )
+    }
+
+    // 结论行：三项能力汇总，一眼看出这台设备能开放到哪一档
+    Spacer(Modifier.height(Spacing.Small))
+    val anyFreq = (policies ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("freq_writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val anyGov = (policies ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("gov_writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val anyOnline = (online ?: JsonArray(emptyList())).any { (it as? JsonObject)?.get("writable")?.let { e -> (e as? JsonPrimitive)?.booleanOrNull } == true }
+    val conclusion = when {
+        anyOnline -> "✓ 全能档：频率限制 + 策略切换 + 核心开关均可编程，智能调度可完整实现"
+        anyFreq && anyGov -> "△ 频率档：可限频/切策略，但核心开关不可编程（用最低频率替代关核）"
+        anyFreq -> "△ 仅限频：governor 与核心开关不可编程"
+        else -> "✗ 只读：cpufreq 不可写，处理器管理只能做监控展示"
+    }
+    Text(
+        conclusion,
+        style = MaterialTheme.typography.bodySmall,
+        color = when {
+            anyOnline -> palette.success
+            anyFreq -> palette.warning
+            else -> palette.error
+        }
+    )
+}
+
+private fun JsonObject.str(key: String): String = (this[key] as? JsonPrimitive)?.contentOrNull.orEmpty()
+
+private fun JsonObject.strList(key: String): List<String> =
+    (this[key] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }.orEmpty()
+
+/** kHz 原始值转 MHz 展示；空值/非数字原样回 "?"。 */
+private fun JsonObject.freqMHz(key: String): String {
+    val raw = str(key)
+    val khz = raw.toLongOrNull() ?: return if (raw.isBlank()) "?" else raw
+    return if (khz >= 1_000_000) "%.2f GHz".format(khz / 1_000_000.0) else "${khz / 1000} MHz"
+}

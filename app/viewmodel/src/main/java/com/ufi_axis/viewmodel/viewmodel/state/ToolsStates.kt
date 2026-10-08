@@ -504,6 +504,13 @@ data class DiagnoseState(
     val fieldNormalizationSaving: Boolean = false,
     /** 归一化开关回读/下发失败的原因，由 UI 弹一次 toast 后清掉；与下面的 [errorMessage] 分开。 */
     val fieldNormalizationError: String? = null,
+    /**
+     * CPU 控制能力探测结果（GET /api/cpu-probe）。null = 还没探测过。
+     * JsonElement 承接（形状随内核漂移，同 field_coverage 的理由）。
+     */
+    val cpuProbe: kotlinx.serialization.json.JsonElement? = null,
+    /** 探测进行中：core 侧要发 20+ 条 shell（5~15s），期间按钮转圈防连点。 */
+    val cpuProbing: Boolean = false,
     val errorMessage: String? = null
 )
 

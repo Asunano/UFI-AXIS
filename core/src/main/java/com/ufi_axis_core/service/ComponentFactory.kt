@@ -801,6 +801,7 @@ object ComponentFactory {
         val speedTestRoutes = SpeedTestRoutes(coordinator = controller.speedTestCoordinator)
         val debugLogRoutes = DebugLogRoutes()
         val diagnosticRoutes = com.ufi_axis_core.api.routes.DiagnosticRoutes()
+        val cpuProbeRoutes = com.ufi_axis_core.api.routes.CpuProbeRoutes()
         val planRoutes = com.ufi_axis_core.api.routes.PlanRoutes(routeCtx)
         val qosRoutes = QoSRoutes(routeCtx)
         val monitorRoutes = MonitorRoutes(database, scheduler, settings) { enabled ->
@@ -888,6 +889,7 @@ object ComponentFactory {
             speedTestRoutes = speedTestRoutes,
             debugLogRoutes = debugLogRoutes,
             diagnosticRoutes = diagnosticRoutes,
+            cpuProbeRoutes = cpuProbeRoutes,
             planRoutes = planRoutes,
             qosRoutes = qosRoutes,
             monitorRoutes = monitorRoutes,

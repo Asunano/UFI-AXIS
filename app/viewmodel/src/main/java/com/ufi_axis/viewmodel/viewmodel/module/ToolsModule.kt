@@ -745,6 +745,31 @@ class ToolsModule(
         }
     }
 
+    /**
+     * CPU 控制能力探测（2026-10-08）。
+     *
+     * core 侧要发 20+ 条 shell（ADB 优先、普通 shell 兜底），实测 5~15s —— 所以独立按钮 +
+     * 独立 loading（[ToolsStates.DiagnoseState.cpuProbing]），不挂进 [loadDiagnostics] 的并行组：
+     * 页面刷新频率高，把 15s 的探测混进去会让刷新按钮看起来卡死。
+     *
+     * 结果是 JsonElement：形状随内核漂移（policy 数、键集合），强类型解析遇新键整块空白，
+     * 诊断场景要"能认的都显示"，与 field_coverage 同一处理方式。
+     */
+    fun runCpuProbe() {
+        scope.launch {
+            _diagnoseState.value = _diagnoseState.value.copy(cpuProbing = true, errorMessage = null)
+            try {
+                val result = api.getCpuProbe()
+                _diagnoseState.value = _diagnoseState.value.copy(cpuProbe = result, cpuProbing = false)
+            } catch (e: Exception) {
+                DebugLog.w("Tools", "CPU 能力探测失败", e)
+                _diagnoseState.value = _diagnoseState.value.copy(
+                    cpuProbing = false,
+                    errorMessage = "CPU 探测失败：${e.message ?: "unknown"}")
+            }
+        }
+    }
+
     /** 只重读缓存统计（清缓存后对账用，不必把五个端点全拉一遍）。 */
     fun loadCacheStats() {
         scope.launch {

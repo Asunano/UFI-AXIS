@@ -1666,6 +1666,16 @@ interface UfiAxisApi {
     @POST("api/components/{id}/uninstall")
     suspend fun uninstallComponent(@Path("id") id: String): JsonElement
 
+    /**
+     * CPU 控制能力探测（2026-10-08，GET /api/cpu-probe）。
+     * core 会发 20+ 条只读/写回原值的 shell 命令（5~15s），返回 cpufreq policy 矩阵、
+     * per-cpu online 节点可写性、governor 可选值与 thermal zone 快照。
+     * 用 [JsonElement] 承接：结果形状按内核漂移（policy 数、键集合），强类型解析遇新键就空白，
+     * 诊断场景要求"能认的都显示出来"，与 field_coverage 同一处理方式。
+     */
+    @GET("api/cpu-probe")
+    suspend fun getCpuProbe(): JsonElement
+
     // ========== 诊断 / 运维（2026-08-30：喂给「运行诊断」页） ==========
     // 这一组读的都是 **core 自己的状态**，不打设备，所以可以随页面刷新自由调用。
     // 唯一例外是 [getDiagnose] 带 fields=1 的那条路径 —— 见它的 KDoc。
