@@ -143,6 +143,7 @@ private fun rawAppScreens(
     Routes.DETAIL_APPEARANCE to { _, nc -> AppearanceSettingsScreen(viewModel, nc) },
     // 界面小功能（2026-09-17）：2026-09-18 起只是入口页，天气与诗词各自一页
     Routes.DETAIL_UI_EXTRAS to { _, nc -> UiExtrasSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_DLNA to { _, nc -> DlnaSettingsScreen(viewModel, nc) },
     Routes.DETAIL_WEATHER to { _, nc -> WeatherSettingsScreen(viewModel, nc) },
     Routes.DETAIL_POETRY to { _, nc -> PoetrySettingsScreen(viewModel, nc) },
     // 组件画廊：纯 UI 预览，不需要 viewModel（组件本身在 :app:ui，画廊也放在那）

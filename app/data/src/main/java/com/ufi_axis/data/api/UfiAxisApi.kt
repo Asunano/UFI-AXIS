@@ -193,6 +193,14 @@ interface UfiAxisApi {
         @Body body: MediaDirsRequest
     ): MediaConfigResponse
 
+    // ── DLNA MediaServer（/api/dlna，2026-10-09） ──
+
+    @GET("api/dlna/status")
+    suspend fun getDlnaStatus(): DlnaStatusResponse
+
+    @PUT("api/dlna/config")
+    suspend fun putDlnaConfig(@Body body: DlnaConfigRequest): DlnaStatusResponse
+
     /**
      * 请系统重新收录某一类的目录（`dirs` 为空时用该类型已配置的目录）。
      * 只提交该类型的文件；收录是异步的：成功返回不代表 [getMediaList] 立刻能查到新文件。

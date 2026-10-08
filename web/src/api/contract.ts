@@ -46,6 +46,16 @@ export const Endpoints = {
     restart: '/api/service/restart',
     autostart: '/api/service/autostart',
   },
+  /**
+   * DLNA MediaServer（2026-10-09）。
+   *
+   * 开关门控在 core：目录未配置（status.ready=false）时 enabled=true 会被 400 拒掉，
+   * 前端据此把开关置灰而不是等报错。
+   */
+  dlna: {
+    status: '/api/dlna/status',
+    config: '/api/dlna/config',
+  },
   network: {
     status: '/api/network/status',
     /** 入参走 NetworkMode 的别名集，core 会映射成 BearerPreference 再下发 */

@@ -7,6 +7,8 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- DLNA/UPnP（2026-10-09）：SSDP 走 UDP 1900 多播，Android 上必须持 MulticastLock 才能收发 -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- 电话/网络信息 -->
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />

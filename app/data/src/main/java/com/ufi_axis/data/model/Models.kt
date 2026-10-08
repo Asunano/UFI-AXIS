@@ -1853,6 +1853,24 @@ data class MediaDirsRequest(
     val dirs: List<String> = emptyList()
 )
 
+// ── DLNA MediaServer（/api/dlna，2026-10-09） ──────────────────────────
+
+/** `GET /api/dlna/status`：开关态 + 运行态 + 就绪态（目录未配置时 ready=false，开关置灰依据）。 */
+@Serializable
+data class DlnaStatusResponse(
+    val enabled: Boolean = false,
+    val running: Boolean = false,
+    val ready: Boolean = false,
+    val dirs: List<String> = emptyList()
+)
+
+/** `PUT /api/dlna/config` 请求/响应体：两项都可空 = 只改其中之一。 */
+@Serializable
+data class DlnaConfigRequest(
+    val enabled: Boolean? = null,
+    val dirs: List<String>? = null
+)
+
 /**
  * `POST /api/media/rescan`：请系统重新收录这些目录。
  *

@@ -235,6 +235,9 @@ class MainViewModel(
      */
     val poetry by lazy { PoetryModule(api, viewModelScope, crossModuleEventSink) }
 
+    /** DLNA MediaServer（2026-10-09）：设置 → DLNA 投屏。默认关。 */
+    val dlna by lazy { DlnaModule(api, viewModelScope, crossModuleEventSink) }
+
     /**
      * 更新提示的唯一状态槽（2026-09-06）。
      *

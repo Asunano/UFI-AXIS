@@ -170,6 +170,17 @@ dependencies {
     implementation(project(":core:controller"))
     implementation(project(":core:api"))
     implementation(project(":core:network"))
+
+    // ── DLNA MediaServer（2026-10-09）：jUPnP 纯 Java UPnP 栈 + Android 网络层 + slf4j 桥 ──
+    implementation(libs.jupnp.core)
+    implementation(libs.jupnp.android)
+    implementation(libs.jupnp.support)
+    implementation(libs.slf4j.android)
+    // jUPnP POM 把 Jetty 标 provided 不传递（POM 里根本没有），运行期 JettyServletContainer
+    // 初始化 NoClassDefFoundError —— 必须显式带上（版本=jUPnP 3.0.5 父 POM 的 jetty.version）。
+    implementation(libs.jetty.server)
+    implementation(libs.jetty.servlet)
+    implementation(libs.jetty.client)
 }
 
 // ── Web 产物与 assets 合并之间的显式依赖（2026-09-06，缺陷 4）──

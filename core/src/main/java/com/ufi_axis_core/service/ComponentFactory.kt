@@ -855,6 +855,36 @@ object ComponentFactory {
         val webUpdateRoutes = com.ufi_axis_core.api.routes.WebUpdateRoutes(webResourceManager, webUpdateManager)
         AppLogger.i(TAG, "[13.6] Web resource manager initialized")
 
+        // ── 13.7 DLNA MediaServer（2026-10-09）──
+        // 依赖 fileRoutes 的票据签发（同一份 MediaTicketStore）与 core 的 HTTP 端口。
+        // 启动与否由持久化的 enabled 决定；目录未配置时不启动（DlnaService 内二次校验）。
+        val dlnaService = DlnaService(
+            androidContext = context.applicationContext,
+            settings = settings,
+            corePort = settings.port,
+            issueTicket = { f -> fileRoutes.issueStreamTicketFor(f.absolutePath) ?: "" },
+        )
+        // 启动必须在 build() 阻塞路径之外：startup() → router.enable() 同步绑 Jetty +
+        // 多播/DatagramIO，而 build() 被 15s 初始化看门狗盯着，超时杀进程 —— r25 前的
+        // 「一直初始化组件」卡死即此。DLNA 晚几秒起没有功能影响，故丢到后台线程。
+        if (dlnaService.isEnabled() && dlnaService.readyToEnable()) {
+            Thread({ dlnaService.start() }, "dlna-start").apply { isDaemon = true }.start()
+        }
+        val dlnaRoutes = com.ufi_axis_core.api.routes.DlnaRoutes(
+            status = {
+                com.ufi_axis_core.api.routes.DlnaRoutes.DlnaStatus(
+                    enabled = dlnaService.isEnabled(),
+                    running = dlnaService.isRunning,
+                    ready = dlnaService.readyToEnable(),
+                    dirs = dlnaService.dirs(),
+                )
+            },
+            applyConfig = { cfg ->
+                cfg.dirs?.let { dlnaService.setDirs(it) }
+                cfg.enabled?.let { dlnaService.setEnabled(it) }
+            }
+        )
+
         // ── 14. HTTP Server ──
         val server = HttpServer(
             port = settings.port,
@@ -906,7 +936,8 @@ object ComponentFactory {
             componentRoutes = componentRoutes,
             consoleRoutes = consoleRoutes,
             ttydRoutes = ttydRoutes,
-            backupRoutes = backupRoutes
+            backupRoutes = backupRoutes,
+            dlnaRoutes = dlnaRoutes
         )
         AppLogger.i(TAG, "[14] HTTP server ready (with API cache)")
 

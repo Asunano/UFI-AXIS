@@ -83,6 +83,8 @@ class HttpServer(
     private val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes? = null,
     /** 配置备份导出 / 恢复，可空同上。 */
     private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null,
+    /** DLNA MediaServer 配置（2026-10-09），可空同上。 */
+    private val dlnaRoutes: com.ufi_axis_core.api.routes.DlnaRoutes? = null,
     /**
      * 媒体中心（`/api/media` 下的一组端点，2026-09-16）：查系统媒体库 + 缩略图 + 扫描目录配置。
      * 可空只为兼容尚未装配它的调用方；播放字节流仍由 [fileRoutes] 的 `/api/files/stream` 提供。
@@ -228,6 +230,10 @@ class HttpServer(
                 connectionGroupSize = 1
                 workerGroupSize = 1
                 callGroupSize = 1
+                // Ktor Netty 默认 responseWriteTimeoutSeconds=15：写出停滞 15s 即 WriteTimeoutException
+                // 掐断连接。DLNA 播放器（WiFi 边下边播、暂停缓冲）经常触发 —— 实机表现为拖进度条
+                // 断流回 0。流式大文件本来就可能长时间慢写，放宽到 120s（仍能兜住真死连接）。
+                responseWriteTimeoutSeconds = 120
                 configureBootstrap = {
                     option(ChannelOption.SO_BACKLOG, 128)
                     option(ChannelOption.SO_REUSEADDR, true)
@@ -683,6 +689,7 @@ class HttpServer(
                 fileRoutes.register(this)
                 storageSourceRoutes?.register(this)
                 mediaRoutes?.register(this)
+                dlnaRoutes?.register(this)
                 playlistRoutes?.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)

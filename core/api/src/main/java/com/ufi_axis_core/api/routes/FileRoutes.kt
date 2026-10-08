@@ -11,6 +11,7 @@ import com.ufi_axis_core.api.files.RemotePushManager
 import com.ufi_axis_core.api.files.UploadSessionStore
 import com.ufi_axis_core.api.media.MediaTicketStore
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.MimeTypes
 
 import io.ktor.http.*
@@ -231,6 +232,20 @@ class FileRoutes(
      * 放 companion 会让"多实例时票据串台"变成一个只在测试里才暴露的隐患。
      */
     private val mediaTicketStore = MediaTicketStore()
+
+    /**
+     * 为 DLNA 内容目录签发流媒体票据（2026-10-09）。
+     *
+     * DlnaService browse 时为每个媒体文件现场换票 —— 与 web 端 `/stream-ticket` 走的是
+     * 同一份票据表与同一条 `/media/stream` 校验路径，但 DLNA 播放器不能调 HTTP 换票
+     * （没有鉴权头），只能由 core 在枚举时代劳。路径校验复用 [safeResolveForRead]，
+     * 不在用户存储范围内的路径返回 null（调用方跳过该条目）。
+     */
+    fun issueStreamTicketFor(path: String): String? {
+        val real = safeResolveForRead(path) ?: return null
+        val f = File(real)
+        return if (f.isFile) mediaTicketStore.issue(real) else null
+    }
 
     /**
      * 分片上传的会话表。与 [mediaTicketStore] 同样是**实例字段而不是 companion**：
@@ -1895,18 +1910,50 @@ class FileRoutes(
                 disks.add(diskMap("内部存储", INTERNAL_STORAGE, total, used, avail))
             }
         }
-        // SD 卡：枚举 /storage/ 下非 emulated/self 的挂载点
-        val storageRoot = File("/storage")
-        storageRoot.listFiles().orEmpty().forEach { d ->
-            if (!d.isDirectory) return@forEach
-            val name = d.name
-            if (name == "emulated" || name == "self") return@forEach
-            runCatching {
-                val sf = StatFs(d.absolutePath)
-                val total = sf.totalBytes
-                if (total > 0) {
-                    val avail = sf.availableBytes
-                    disks.add(diskMap("SD卡", d.absolutePath, total, total - avail, avail))
+        // SD 卡：优先走系统 StorageManager（framework 的卷表，不依赖列 /storage 目录；
+        // targetSdk 30+ 上 File("/storage").listFiles() 可能因挂载视图受限返回空/残缺，
+        // 卷就"凭空消失"且 runCatching 吞了错误 —— 2026-10-09 实机 SD 卡不识别即此）。
+        var sawSdCard = false
+        runCatching {
+            val sm = appContext?.getSystemService(android.content.Context.STORAGE_SERVICE)
+                as? android.os.storage.StorageManager ?: return@runCatching
+            sm.storageVolumes.forEach { v ->
+                val dir = runCatching { v.directory }.getOrNull() ?: return@forEach
+                if (!dir.isDirectory) return@forEach
+                val abs = dir.absolutePath.trimEnd('/')
+                // 内部存储已在上面登记；emulated/0 与 INTERNAL_STORAGE 同卷跳过
+                if (abs == INTERNAL_STORAGE || abs == "/storage/emulated" || abs == "/storage/self") return@forEach
+                runCatching {
+                    val sf = StatFs(abs)
+                    val total = sf.totalBytes
+                    if (total > 0) {
+                        sawSdCard = true
+                        val avail = sf.availableBytes
+                        disks.add(diskMap(v.getDescription(appContext) ?: "SD卡", abs, total, total - avail, avail))
+                    }
+                }.onFailure {
+                    AppLogger.w("FileRoutes", "StatFs failed for volume $abs: ${it.message}")
+                }
+            }
+        }.onFailure {
+            AppLogger.w("FileRoutes", "StorageManager volume enumeration failed: ${it.message}")
+        }
+        // 兜底：StorageManager 拿不到（context 为 null / ROM 裁剪）再退回列 /storage 目录
+        if (!sawSdCard) {
+            val storageRoot = File("/storage")
+            storageRoot.listFiles().orEmpty().forEach { d ->
+                if (!d.isDirectory) return@forEach
+                val name = d.name
+                if (name == "emulated" || name == "self") return@forEach
+                runCatching {
+                    val sf = StatFs(d.absolutePath)
+                    val total = sf.totalBytes
+                    if (total > 0) {
+                        val avail = sf.availableBytes
+                        disks.add(diskMap("SD卡", d.absolutePath, total, total - avail, avail))
+                    }
+                }.onFailure {
+                    AppLogger.w("FileRoutes", "StatFs failed for ${d.absolutePath}: ${it.message}")
                 }
             }
         }

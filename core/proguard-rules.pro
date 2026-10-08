@@ -112,6 +112,19 @@
 # 混淆掉方法名就收不到事件；整包保留（库本身很小）。
 -keep class net.engio.mbassy.** { *; }
 -dontwarn net.engio.mbassy.**
+
+# jUPnP（DLNA MediaServer，2026-10-09）
+# AnnotationLocalServiceBinder 反射读 @UpnpService/@UpnpAction/@UpnpStateVariable，
+# 类/方法/字段名与注解必须原样；jUPnP android jar 自带的 META-INF/proguard 规则只 keep
+# 注解没 keep Signature，且 jar 形式的规则 AGP 不自动消费 —— 必须在这里补。
+# 关键：support 包的 AbstractContentDirectoryService 有 CSV<String> 状态变量，
+# CSV 无参构造走 Reflections.getTypeArguments() 沿 getGenericSuperclass() 读泛型签名，
+# Signature 被 R8 剥离后返回裸 Class → "(ParameterizedType) type" ClassCastException
+# （真机实锤：DLNA start failed）。所以 -keepattributes Signature 必须配合类名 keep。
+-keepattributes Signature
+-keep class org.jupnp.** { *; }
+-keepnames @org.jupnp.binding.annotations.UpnpService class *
+-dontwarn org.jupnp.**
 # mbassador 的 EL 过滤器引用 javax.el（Java EE 可选依赖，Android 上不存在）。
 # 我们不用表达式过滤，dontwarn 即可 —— 不加这条 R8 直接以 Missing class 失败。
 -dontwarn javax.el.**

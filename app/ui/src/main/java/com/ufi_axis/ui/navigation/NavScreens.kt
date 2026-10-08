@@ -217,6 +217,8 @@ object Routes {
     const val DETAIL_DIAGNOSE = "detail/diagnose"
     const val DETAIL_MONITOR = "detail/monitor"
     const val DETAIL_MONITOR_SETTINGS = "detail/monitor-settings"
+    /** DLNA 投屏（2026-10-09）：MediaServer 开关 + 共享目录。入口在设置页。 */
+    const val DETAIL_DLNA = "detail/dlna"
     // 监控设置的分组：2026-09-03 从"同一页内的局部状态"改成独立页面，
     // 与「设置 → 服务器 → 服务器配置」同构（每一级都是路由，转场/返回/系统返回键全部由导航接管）
     // 2026-09-08 删掉两条：metrics（8 个指标开关并入 collection 的弹窗）、
@@ -612,6 +614,7 @@ val appRoutes: List<AppRoute> = listOf(
         )
     ),
     AppRoute(Routes.DETAIL_MONITOR_SETTINGS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_DLNA, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_COLLECTION, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_CHART, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_MONITOR_SCHEDULER, TransitionType.DETAIL),

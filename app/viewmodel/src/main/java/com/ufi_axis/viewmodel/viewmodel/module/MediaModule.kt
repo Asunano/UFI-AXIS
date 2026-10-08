@@ -1087,7 +1087,14 @@ class MediaModule(
      */
     suspend fun browseDirs(path: String): Pair<List<String>, String?> = try {
         val resp = api.listFiles(path)
-        resp.files.filter { it.isDirectory }.map { it.path }.sorted() to resp.parent
+        val dirs = resp.files.filter { it.isDirectory }.map { it.path }.toMutableSet()
+        // 列 /storage 时并上 disk-usage 的真实卷（走 core StorageManager，准）：
+        // Android 11+ 上 File("/storage").listFiles() 可能只见 emulated/self 或为空，
+        // 外接 SD 卡（/storage/XXXX-XXXX）会"消失" —— 2026-10-10 实机反馈选择器失效即此。
+        if (path.trimEnd('/') == "/storage") {
+            runCatching { api.getDiskUsage() }.getOrNull()?.disks?.forEach { dirs += it.mount }
+        }
+        dirs.sorted() to resp.parent
     } catch (e: Exception) {
         emptyList<String>() to null
     }

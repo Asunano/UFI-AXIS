@@ -203,6 +203,16 @@ fun SettingsScreen(
                         trailing = { UfiSettingsChevron() }
                     )
                 }
+                // DLNA 投屏（2026-10-09）：MediaServer 开关 + 共享目录
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.Cast,
+                        title = "DLNA 投屏",
+                        description = "局域网媒体共享 · 电视直接播放",
+                        onClick = { navController?.navigate(Routes.DETAIL_DLNA) },
+                        trailing = { UfiSettingsChevron() }
+                    )
+                }
                 // 服务器（合并：服务器配置 / 设备控制 / 配对管理）
                 UfiSettingsRowCard {
                     UfiSettingsItem(
