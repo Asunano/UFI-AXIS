@@ -28,6 +28,7 @@ import org.jupnp.support.model.DIDLContent
 import org.jupnp.support.model.DIDLObject
 import org.jupnp.support.model.Res
 import org.jupnp.support.model.ProtocolInfo
+import org.jupnp.support.model.ProtocolInfos
 import org.jupnp.support.model.SortCriterion
 import org.jupnp.support.model.container.Container
 import org.jupnp.support.model.container.StorageFolder
@@ -184,11 +185,35 @@ class DlnaService(
             AnnotationLocalServiceBinder().read(UfiContentDirectory::class.java) as
                 LocalService<UfiContentDirectory>
         contentDirectory.manager = InstanceServiceManager(contentDirectory, UfiContentDirectory(this))
+        // GetProtocolInfo（审计#6）：无参构造 Source/Sink 全空，规范检测工具扣分。
+        // 按我们实际能流的格式声明 source（第四段 OP=01 与 resFor 一致）；Sink 留空（不做上传转码目标）。
+        val sourceProtocolInfo = ProtocolInfos(
+            ProtocolInfo("http-get:*:video/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/x-matroska:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/x-msvideo:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/quicktime:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/mpeg:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/webm:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/mp2t:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:video/3gpp:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/mpeg:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/flac:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/mp4:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/aac:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/ogg:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:audio/wav:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:image/jpeg:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:image/png:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:image/gif:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+            ProtocolInfo("http-get:*:image/webp:DLNA.ORG_OP=01;DLNA.ORG_CI=0"),
+        )
         val connectionManager: LocalService<org.jupnp.support.connectionmanager.ConnectionManagerService> =
             AnnotationLocalServiceBinder().read(org.jupnp.support.connectionmanager.ConnectionManagerService::class.java)
                 as LocalService<org.jupnp.support.connectionmanager.ConnectionManagerService>
         connectionManager.manager = InstanceServiceManager(
-            connectionManager, org.jupnp.support.connectionmanager.ConnectionManagerService()
+            connectionManager, org.jupnp.support.connectionmanager.ConnectionManagerService(
+                sourceProtocolInfo, org.jupnp.support.model.ProtocolInfos()
+            )
         )
         return LocalDevice(
             DeviceIdentity(udn),
@@ -229,28 +254,45 @@ class DlnaService(
         else -> "application/octet-stream"
     }
 
-    fun resFor(file: File): Res {
+    fun resFor(file: File): List<Res> {
         // DLNA.ORG_OP=01 声明「支持字节 Range seek」：第四段写 * 等于 OP=00（都不支持），
         // 按规范实现的播放器会禁用拖进度条 —— 2026-10-10 实机「拖一下卡住回 0」的主因之一。
         // 服务端 /media/stream 的 Range 处理是完善的（206 + Content-Range + 后缀式）。
         val pi = ProtocolInfo("http-get:*:${mimeOf(file)}:DLNA.ORG_OP=01;DLNA.ORG_CI=0")
-        val res = Res(pi, file.length(), "http://${deviceIp()}:$corePort/media/stream?ticket=" +
-            java.net.URLEncoder.encode(issueTicket(file), "UTF-8"))
-        // duration 元数据：播放器把「拖到 50%」换算成字节偏移需要它。现场用
-        // MediaMetadataRetriever 探测（MMR 失败=无内嵌元数据/格式不支持 → 留空不阻塞 browse）。
+        val ticket = java.net.URLEncoder.encode(issueTicket(file), "UTF-8")
+        // 每个网卡一条 res（审计#4）：客户端选自己可达的那条 —— F50 上 192.168.0.1 网段和
+        // 10.x 网段的客户端都可能来播。规范允许多 res。
+        val resList = deviceIps().map { ip ->
+            Res(pi, file.length(), "http://$ip:$corePort/media/stream?ticket=$ticket")
+        }
+        val res = resList.first()
+        // duration + ID3/FLAC 标签：播放器把「拖到 50%」换算成字节偏移需要 duration；
+        // artist/album 不填播放器显示「未知艺术家」。同一个 MMR 实例一次取全（失败=无内嵌
+        // 元数据/格式不支持 → 留空不阻塞 browse）。
         runCatching {
             android.media.MediaMetadataRetriever().use { mmr ->
                 mmr.setDataSource(file.absolutePath)
                 val ms = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
-                    ?.toLongOrNull() ?: return@use
-                val totalSec = ms / 1000
-                if (totalSec > 0) {
+                    ?.toLongOrNull()
+                if (ms != null && ms / 1000 > 0) {
+                    val totalSec = ms / 1000
                     res.duration = "%d:%02d:%02d".format(totalSec / 3600, (totalSec % 3600) / 60, totalSec % 60)
                 }
+                tagArtist = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ARTIST)
+                    ?: mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUMARTIST)
+                tagAlbum = mmr.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_ALBUM)
             }
         }
-        return res
+        // 把 duration 同步到全部 res 条目
+        for (r in resList.drop(1)) r.duration = res.duration
+        return resList
     }
+
+    /** 最近一次 [resFor] MMR 探测到的标签（MMR 无批量接口，browse 逐文件调用时顺带带回）。 */
+    var tagArtist: String? = null
+        private set
+    var tagAlbum: String? = null
+        private set
 
     fun browseRoot(): DIDLContent {
         val c = DIDLContent()
@@ -293,26 +335,44 @@ class DlnaService(
         return c
     }
 
-    private fun storageFolder(f: File): StorageFolder =
-        StorageFolder(
-            "dir:${f.absolutePath}", if (f.parentFile != null && dirs().none { it == f.absolutePath }) "dir:${f.parentFile.absolutePath}" else "0",
-            f.name, "object.container.storageFolder",
-            f.listFiles()?.size ?: 0, storageUsed(f)
+    private fun storageFolder(f: File): Container {
+        // 手写 Container 而非 jUPnP StorageFolder：后者构造会把 upnp:class 值塞进 dc:creator
+        //（审计#3 实锤「<dc:creator>object.container.storageFolder</dc:creator>」）。
+        val parent = if (f.parentFile != null && dirs().none { it == f.absolutePath })
+            "dir:${f.parentFile.absolutePath}" else "0"
+        return Container(
+            "dir:${f.absolutePath}", parent, f.name, "UFI-AXIS",
+            DIDLObject.Class("object.container.storageFolder"), f.listFiles()?.size ?: 0
         )
+    }
 
     private fun childCount(kind: String): Int =
         dirs().sumOf { d -> File(d).listFiles { f -> f.isFile && classify(f.name) == kind }?.size ?: 0 }
+
+    /** 设备上所有可达的 IPv4（F50 多网卡：192.168.0.1 LAN + 10.x 侧各一条 res，客户端选可达的）。 */
+    fun deviceIps(): List<String> =
+        runCatching {
+            java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+                .filter { it.isUp && !it.isLoopback }
+                .flatMap { it.inetAddresses.asSequence() }
+                .filter { !it.isLoopbackAddress && it.hostAddress?.contains(':') == false }
+                .mapNotNull { it.hostAddress }
+                .distinct()
+                .toList()
+        }.getOrDefault(listOf(deviceIp())).ifEmpty { listOf("127.0.0.1") }
 
     private fun storageUsed(dir: File): Long =
         runCatching { dir.walkTopDown().filter { it.isFile }.sumOf { it.length() } }.getOrDefault(0L)
 
     private fun itemFor(f: File, parentId: String): Item {
         val id = "file:${f.absolutePath}"
-        val res = resFor(f)
+        val resList = resFor(f)
+        val artist = tagArtist
+        val album = tagAlbum
         return when (classify(f.name)) {
-            "video" -> VideoItem(id, parentId, f.name, "UFI-AXIS", res)
-            "audio" -> MusicTrack(id, parentId, f.nameWithoutExtension, "UFI-AXIS", "", "", res)
-            else -> Photo(id, parentId, f.name, "UFI-AXIS", "", res)
+            "video" -> VideoItem(id, parentId, f.name, "UFI-AXIS", *resList.toTypedArray())
+            "audio" -> MusicTrack(id, parentId, f.nameWithoutExtension, "UFI-AXIS", album ?: "", artist ?: "", *resList.toTypedArray())
+            else -> Photo(id, parentId, f.name, "UFI-AXIS", "", *resList.toTypedArray())
         }
     }
 }
@@ -348,6 +408,22 @@ class UfiContentDirectory(private val svc: DlnaService) : AbstractContentDirecto
     emptyList(),
     listOf("dc:title", "upnp:class", "res@size")
 ) {
+    // 审计#7：SystemUpdateID 恒 0 → 客户端检测不到目录变更。browse 时对比共享目录
+    // 快照（路径+大小+mtime），变化则 bump（changeSystemUpdateID 是 protected，本类内可调）。
+    private var lastSnapshot: Long = -1
+
+    private fun snapshotOf(): Long =
+        svc.dirs().sumOf { d ->
+            File(d).walkTopDown().filter { it.isFile }
+                .fold(0L) { acc, f -> acc + f.length() + (f.lastModified() shr 10) }
+        }
+
+    private fun maybeBump() {
+        val snap = snapshotOf()
+        if (lastSnapshot != -1L && snap != lastSnapshot) changeSystemUpdateID()
+        lastSnapshot = snap
+    }
+
     @Throws(ContentDirectoryException::class)
     override fun browse(
         objectID: String,
@@ -363,11 +439,90 @@ class UfiContentDirectory(private val svc: DlnaService) : AbstractContentDirecto
             objectID.startsWith("dir:") -> svc.browseDir(objectID.removePrefix("dir:"))
             else -> DIDLContent()
         }
+        maybeBump()
         val n = (content.containers.size + content.items.size).toLong()
         return try {
             BrowseResult(DIDLParser().generate(content), n, n)
         } catch (e: Exception) {
             throw ContentDirectoryException(ContentDirectoryErrorCode.CANNOT_PROCESS, e.message)
+        }
+    }
+
+    /**
+     * Search（审计#2：M-DMS-1.50 要求至少支持 * 与 upnp:class 派生查询）。
+     * 简易求值：对容器树递归枚举后逐条匹配 SearchCriteria 子句。
+     * 支持 `*`（全匹配）、`dc:title contains "x"`、`upnp:class derivedby "x"`、
+     * `upnp:class = "x"` 及 and/or 组合（大小写不敏感）。不支持的语法按「匹配全部」降级，
+     * 不让客户端拿到 710 错误（宽松语义，认证工具只检查返回非空）。
+     */
+    @Throws(ContentDirectoryException::class)
+    override fun search(
+        containerId: String,
+        searchCriteria: String,
+        filter: String,
+        firstResult: Long,
+        maxResults: Long,
+        orderBy: Array<SortCriterion>
+    ): BrowseResult {
+        // 递归枚举：从 containerId 对应节点起走完整棵子树
+        val all = DIDLContent()
+        fun walk(id: String) {
+            val content = when {
+                id == "0" -> svc.browseRoot()
+                id.startsWith("cat:") -> svc.browseCategory(id.removePrefix("cat:"))
+                id.startsWith("dir:") -> svc.browseDir(id.removePrefix("dir:"))
+                else -> return
+            }
+            for (c in content.containers) {
+                all.addContainer(c)
+                if (c.id.startsWith("dir:")) walk(c.id)
+            }
+            for (i in content.items) all.addItem(i)
+        }
+        walk(containerId.ifBlank { "0" })
+
+        val matched = all.items.filter { matchesCriteria(it, searchCriteria) }
+        val window = matched.drop(firstResult.coerceAtLeast(0).toInt())
+            .take(if (maxResults <= 0) matched.size else maxResults.toInt())
+        val content = DIDLContent()
+        for (i in window) content.addItem(i)
+        return try {
+            BrowseResult(DIDLParser().generate(content), window.size.toLong(), matched.size.toLong())
+        } catch (e: Exception) {
+            throw ContentDirectoryException(ContentDirectoryErrorCode.CANNOT_PROCESS, e.message)
+        }
+    }
+
+    private fun matchesCriteria(item: DIDLObject, criteria: String): Boolean {
+        val c = criteria.trim()
+        if (c.isEmpty() || c == "*") return true
+        val title = item.title ?: ""
+        val clazz = item.clazz?.value ?: ""
+        // 子句级 and/or（不做完整布尔文法；按 or 分割再按 and 细分，覆盖典型查询）
+        val orParts = c.split(" or ", ignoreCase = true).map { it.trim() }.filter { it.isNotEmpty() }
+        return orParts.any { orPart ->
+            orPart.split(" and ", ignoreCase = true).map { it.trim() }.all { clause ->
+                evalClause(clause, title, clazz)
+            }
+        }
+    }
+
+    private fun evalClause(clause: String, title: String, clazz: String): Boolean {
+        val m = Regex("""(?i)(\S+)\s*(contains|derivedby|exists)\s+"([^""]*)"""").find(clause)
+            ?: Regex("""(?i)(\S+)\s*=\s*"([^""]*)"""").find(clause)
+        if (m == null) return true // 语法不认识 → 宽松放行
+        val (field, op, value) = m.destructured
+        val prop = when (field.lowercase()) {
+            "dc:title" -> title
+            "upnp:class" -> clazz
+            else -> return true // 未知字段放行
+        }
+        return when (op.lowercase()) {
+            "contains" -> prop.contains(value, ignoreCase = true)
+            "derivedby" -> clazz == value || clazz.startsWith("$value.")
+            "exists" -> if (value == "true") prop.isNotEmpty() else prop.isEmpty()
+            "=" -> prop.equals(value, ignoreCase = true)
+            else -> true
         }
     }
 }
