@@ -200,6 +200,9 @@ class DataScheduler(
     @Volatile private var stopGeneration = 0    /** 实时推送开关（方案 A·2026-08-24）：仅当存在前端 WebSocket 连接时为 true。 */
     @Volatile private var realtimePushEnabled = false
 
+    /** 温度告警日志的状态沿记录（2026-10-08）：最近一次记日志时的整数 °C；null = 当前不在告警态。 */
+    @Volatile private var lastThermalWarnLoggedC: Int? = null
+
     /** 套餐限额供给器（见 [attachTrafficLimitProvider]）。 */
     @Volatile private var trafficLimitProvider: (suspend () -> JsonObject?)? = null
     /** 上次检查套餐限额的时间戳；限额是月度量，15s 的流量循环里按 [trafficLimitCheckIntervalMs] 节流。 */
@@ -926,7 +929,20 @@ class DataScheduler(
                         }
                         maxTemp > thermalWarnMilliC -> {
                             // 75°C: 警告（频率降低已由 getAdaptiveDelay 处理）
-                            AppLogger.w(tag, "Thermal warning: ${maxTemp / 1000}°C > ${thermalWarnMilliC / 1000}°C")
+                            // 2026-10-08：按"状态沿"打日志——进入告警态记 1 条，温度每升 1°C
+                            // 记 1 条，回落到阈值下再记 1 条恢复。此前每轮检查（约 3s~5s）都打，
+                            // 72~73°C 平台期每 1~2 分钟刷一条，把 debug 日志窗口刷满没有信息量。
+                            val tempC = maxTemp / 1000
+                            if (lastThermalWarnLoggedC == null || tempC > lastThermalWarnLoggedC!!) {
+                                AppLogger.w(tag, "Thermal warning: ${tempC}°C > ${thermalWarnMilliC / 1000}°C")
+                                lastThermalWarnLoggedC = tempC
+                            }
+                        }
+                        else -> {
+                            if (lastThermalWarnLoggedC != null) {
+                                AppLogger.i(tag, "Thermal recovered: ${maxTemp / 1000}°C ≤ ${thermalWarnMilliC / 1000}°C")
+                                lastThermalWarnLoggedC = null
+                            }
                         }
                     }
                 } catch (e: Exception) {

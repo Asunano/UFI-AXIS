@@ -206,7 +206,15 @@ class TrackerManager(
      */
     private fun saveMeta() {
         try {
-            metaFile.writeText(json.encodeToString(meta))
+            // 2026-10-08：写临时文件再原子改名。此前直写目标文件，掉电/被杀会留下全 \0
+            // 或半截 JSON（真机 tracker-meta.json 实测 34KB 全 \0），下次 loadMeta 解析失败。
+            val tmp = File(metaFile.parentFile, metaFile.name + ".tmp")
+            tmp.writeText(json.encodeToString(meta))
+            if (!tmp.renameTo(metaFile)) {
+                // rename 失败（跨设备/目标被占）退回覆盖写
+                metaFile.writeText(json.encodeToString(meta))
+                tmp.delete()
+            }
         } catch (e: Exception) {
             AppLogger.w(TAG, "saveMeta failed, meta not persisted: ${metaFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
         }
@@ -221,7 +229,10 @@ class TrackerManager(
                 }
             }
         } catch (e: Exception) {
-            AppLogger.w(TAG, "loadMeta failed, falling back to defaults: ${metaFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+            // 2026-10-08：坏文件自愈——解析失败即删除损坏文件（真机见过全 \0 截断），
+            // 让下次 saveMeta 从干净状态重建，isStale() 也不会因 meta 回退默认值而误判。
+            AppLogger.w(TAG, "loadMeta failed, resetting corrupt meta: ${metaFile.absolutePath}: ${e.javaClass.simpleName}: ${e.message}")
+            runCatching { metaFile.delete() }
         }
     }
 }

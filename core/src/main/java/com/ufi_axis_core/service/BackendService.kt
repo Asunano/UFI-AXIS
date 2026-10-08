@@ -1017,15 +1017,30 @@ class BackendService : Service() {
         sambaKeepAliveJob = serviceScope.launch(Dispatchers.IO) {
             var consecutiveFailures = 0
             while (isActive) {
-                val baseDelay = if (consecutiveFailures >= 3) 300_000L else 60_000L
+                // 2026-10-08：连续失败 ≥10 次后进入「挂起」档（30min）：设备 SMB 未启用/密码不对时，
+                // 每 5 分钟 6 条连接失败 + 1 条汇总（真机 2026-10-08 日志实测）纯属刷屏——socket
+                // 不可能自己好起来。30min 仍会再试（不是放弃），部署成功或 socket 恢复即复位。
+                val baseDelay = when {
+                    consecutiveFailures >= 10 -> 1_800_000L
+                    consecutiveFailures >= 3 -> 300_000L
+                    else -> 60_000L
+                }
                 delay(baseDelay)
                 try {
                     if (!com.ufi_axis_core.util.SambaRootShell.isSocketAvailable()) {
-                        AppLogger.d(tag, "Samba socket not available, triggering connection... (failCount=$consecutiveFailures)")
-                        com.ufi_axis_core.util.SambaRootShell.triggerSambaConnection()
+                        if (consecutiveFailures >= 10 && consecutiveFailures % 6 == 0) {
+                            // 挂起档下每 ~3 小时才提醒一次（30min × 6），其余轮次静默
+                            AppLogger.d(tag, "Samba socket still unavailable (failCount=$consecutiveFailures), skipping trigger this round")
+                        } else {
+                            AppLogger.d(tag, "Samba socket not available, triggering connection... (failCount=$consecutiveFailures)")
+                            com.ufi_axis_core.util.SambaRootShell.triggerSambaConnection()
+                        }
                         // triggerSambaConnection 内部没有返回值，我们通过下一次循环 checkSocket 判定
                         consecutiveFailures++
                     } else {
+                        if (consecutiveFailures >= 10) {
+                            AppLogger.i(tag, "Samba socket recovered after $consecutiveFailures failures")
+                        }
                         consecutiveFailures = 0
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {

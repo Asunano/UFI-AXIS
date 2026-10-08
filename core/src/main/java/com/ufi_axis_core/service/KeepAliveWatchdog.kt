@@ -108,18 +108,54 @@ object KeepAliveWatchdog {
         }
     }
 
-    /** 把 assets 里的脚本覆盖写到 [SCRIPT_PATH] 并放开 world r/x。 */
-    private fun writeScript(template: String): Boolean = try {
-        val scriptFile = File(SCRIPT_PATH)
-        scriptFile.writeText(template)
-        // 必须 world-readable + executable：执行方是 adb shell（uid 2000），
-        // 只给执行位不给读位会 Permission denied（sh 需要 open 文件）。
-        scriptFile.setReadable(true, false)
-        scriptFile.setExecutable(true, false)
-        true
-    } catch (e: Exception) {
-        AppLogger.e(TAG, "keepalive script write failed: ${e.message}")
-        false
+    /**
+     * 把 assets 里的脚本覆盖写到 [SCRIPT_PATH] 并放开 world r/x。
+     *
+     * 2026-10-08：真机（无 root、ADB 通道未就绪的窗口）上 app 进程直接 `File.writeText`
+     * `/data/local/tmp` 会 EACCES（uid 不匹配，SELinux 拒绝）—— 此前每 5 分钟自愈都会
+     * 报一次错、看门狗永远装不上。现在两级落盘：
+     *   1. 直接写（历史上 ADB shell 特权下可行，uid 2000 同组写）；
+     *   2. 失败则走 [ShellExecutor.executeAsRoot]（ADB 优先，普通 shell 兜底）用
+     *      `base64 -d` 写入——模板经 base64 编码传输，规避引号/换行/EOF 标记注入问题。
+     * 写完统一 chmod 644。两级都失败才返回 false（此时看门狗确实装不上，保留错误日志）。
+     */
+    private suspend fun writeScript(template: String): Boolean {
+        // ── 一级：直接写 ──
+        val direct = try {
+            val scriptFile = File(SCRIPT_PATH)
+            scriptFile.writeText(template)
+            // 必须 world-readable + executable：执行方是 adb shell（uid 2000），
+            // 只给执行位不给读位会 Permission denied（sh 需要 open 文件）。
+            scriptFile.setReadable(true, false)
+            scriptFile.setExecutable(true, false)
+            true
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "keepalive direct write failed (will try shell): ${e.message}")
+            false
+        }
+        if (direct) return true
+
+        // ── 二级：shell base64 写入（含 chmod，保证执行方读得到）──
+        return try {
+            val b64 = android.util.Base64.encodeToString(
+                template.toByteArray(Charsets.UTF_8), android.util.Base64.NO_WRAP
+            )
+            // 一行 b64 可能有几千字符：adb shell 参数长度上限（Linux MAX_ARG_STRLEN 128KB）内，
+            // 3~4KB 的脚本模板远够。分块反而会引入跨块状态，不做。
+            val result = ShellExecutor.executeAsRoot(
+                "echo '$b64' | base64 -d > $SCRIPT_PATH && chmod 755 $SCRIPT_PATH", 10_000L
+            )
+            if (result.isSuccess) {
+                AppLogger.i(TAG, "keepalive script written via shell fallback")
+                true
+            } else {
+                AppLogger.e(TAG, "keepalive shell write failed: rc=${result.exitCode} ${result.stderr.take(120)}")
+                false
+            }
+        } catch (e: Exception) {
+            AppLogger.e(TAG, "keepalive shell write exception: ${e.message}")
+            false
+        }
     }
 
     /**
