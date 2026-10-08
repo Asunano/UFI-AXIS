@@ -106,6 +106,14 @@ class GoformClient(
     @Volatile private var lastLoginAttempt = 0L
     @Volatile private var lastValidatedAt = 0L
     @Volatile private var lastGiveWayAt = 0L
+    // 2026-10-08：partial 响应的「升级重登」节流戳。F50 固件过载/会话半死时会对多 key
+    // 查询持续回 200+空体（R2-11 之后我们不再自动重登，数据就一直缺失，表现为
+    // /api/device/traffic-limit 503、信号/WiFi/邻区全空）。真机验证：设备重启即恢复，
+    // 说明重登可救。这里每 60s 只允许一次 partial→重登升级，兼顾自愈与防登录风暴。
+    private val lastPartialRecoveryAt = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /** partial→重登升级的最小间隔（防登录风暴，见 queryOnce 内 2026-10-08 注释）。 */
+    private val PARTIAL_RECOVERY_INTERVAL_MS = 60_000L
     // 2026-10-05 R2-8 修复：最近一次 validateSession 是否因网络错而「通过」。
     // 只在 loginMutex 内的 forceValidate 消费点读；null = 本次校验真实验证了会话。
     @Volatile private var lastValidateNetworkDown: String? = null
@@ -781,13 +789,25 @@ class GoformClient(
 
         if (status != HttpStatusCode.OK || authFailure || isPartial) {
             if (isPartial) {
-                // 2026-10-05 R2-11 修复：字段数少不一定是会话问题（固件对请求形状敏感是已知事实，
-                // station_list 合并查询被吞已有先例）。不再 invalidateSession + onAuthLost 重登重试 ——
-                // 对「合法少字段」的固件，那会把每次读都变成一次完整重登（登录风暴，撞退避、
-                // 占满 loginMutex 与 QoS 许可）。只按解析缺失处理：本轮 null、保留会话，由上层
-                // 按「数据缺失」展示。
-                AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
-                        " — session kept, treating as parse miss")
+                // 2026-10-08：R2-11 的修正版——partial 保留「不每次都重登」的原则，但补回自愈路径。
+                // 真机结论（2026-10-08，F50）：固件对多 key 查询会持续回 200+空体（会话半死态），
+                // 设备重启即恢复 → 说明重登可救；而 R2-11 的「永远只本轮 null」让这种病一旦发作
+                // 就再也不自愈（/api/device/traffic-limit 503、信号/WiFi/邻区全空）。
+                // 折衷：60s 内只允许一次 partial→失效会话→重登升级（CAS 认领，并发读不会重复升级），
+                // 窗口内其余 partial 仍按 R2-11 处理（本轮 null、会话保留）。onAuthLost 交由
+                // queryInternal 走既有的「许可外重登+重试」路径。
+                val now = System.currentTimeMillis()
+                val last = lastPartialRecoveryAt.get()
+                if (now - last >= PARTIAL_RECOVERY_INTERVAL_MS &&
+                    lastPartialRecoveryAt.compareAndSet(last, now)) {
+                    AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
+                            " — upgrading to session invalidate + relogin (throttled 60s)")
+                    invalidateSession()
+                    onAuthLost()
+                } else {
+                    AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
+                            " — session kept (recovery throttle window)")
+                }
                 return null
             } else if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
                 lastGiveWayAt = System.currentTimeMillis()
