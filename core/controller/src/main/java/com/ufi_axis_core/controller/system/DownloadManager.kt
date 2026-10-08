@@ -359,8 +359,9 @@ class DownloadManager(
         if (aria2.isRunning()) {
             aria2.changeGlobalSetting(
                 maxConcurrentDownloads = config.maxConcurrent,
-                maxOverallDownloadLimit = if (config.globalSpeedLimit > 0) config.globalSpeedLimit else null,
-                maxOverallUploadLimit = if (config.maxOverallUploadLimit > 0) config.maxOverallUploadLimit else null,
+                // 同 restoreOriginalSettings：解除限速要显式 0，null = 不改 = 旧限速残留
+                maxOverallDownloadLimit = if (config.globalSpeedLimit > 0) config.globalSpeedLimit else 0L,
+                maxOverallUploadLimit = if (config.maxOverallUploadLimit > 0) config.maxOverallUploadLimit else 0L,
                 btMaxPeers = config.btMaxPeers
             )
             // 启动期选项改了：引擎空闲就直接重启让它生效（之前这些项写完 config.json 就没人管，
@@ -400,14 +401,16 @@ class DownloadManager(
 
     /** 保存用户手动编辑的 Tracker 列表 */
     fun saveTrackerList(trackers: String) {
-        val trackerFile = File(appContext.filesDir, "aria2/bt-trackers.txt")
-        trackerFile.parentFile?.mkdirs()
-        trackerFile.writeText(trackers.trim())
+        val cleaned = trackers.trim()
+        // 2026-10-08：手动列表持久化进 meta + 写缓存（原子写）。此前直写缓存文件，
+        // 下次自动/手动刷新 refreshNow 用 fetched+customList 覆盖 —— 用户手编内容静默丢失。
+        // 现在 refreshNow 检测到 manualTrackers 非空就以手动列表为准（保存空 = 恢复自动模式）。
+        trackerManager.setManualList(cleaned)
         // 热加载到运行中的 aria2
-        if (aria2.isRunning() && trackers.isNotBlank()) {
-            aria2.changeBtTracker(trackers.trim())
+        if (aria2.isRunning() && cleaned.isNotBlank()) {
+            aria2.changeBtTracker(cleaned)
         }
-        AppLogger.i(TAG, "Tracker list saved (${trackers.split(",").count { it.trim().isNotBlank() }} entries)")
+        AppLogger.i(TAG, "Tracker list saved (${cleaned.split(",").count { it.trim().isNotBlank() }} entries)")
     }
 
     /** 获取当前缓存的 Tracker 列表 */
@@ -598,7 +601,9 @@ class DownloadManager(
     private fun restoreOriginalSettings() {
         aria2.changeGlobalSetting(
             maxConcurrentDownloads = config.maxConcurrent,
-            maxOverallDownloadLimit = if (config.globalSpeedLimit > 0) config.globalSpeedLimit else null
+            // 2026-10-08：无限制必须显式传 0（引擎层把 <=0 映射成 "0"）。原来传 null 会让
+            // changeGlobalSetting 跳过该选项 —— 节流档设置的 1MB/s 限速永久残留。
+            maxOverallDownloadLimit = if (config.globalSpeedLimit > 0) config.globalSpeedLimit else 0L
         )
     }
 

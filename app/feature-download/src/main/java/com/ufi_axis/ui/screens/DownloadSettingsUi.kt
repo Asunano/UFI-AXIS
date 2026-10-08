@@ -343,8 +343,15 @@ fun DownloadTrackerSettingsScreen(
 
     // 列表编辑从弹窗搬进本页，进页面就把缓存列表拉下来
     LaunchedEffect(Unit) { viewModel.downloads.loadTrackers() }
-    var trackerText by remember(state.cachedTrackerList) {
-        mutableStateOf(state.cachedTrackerList.replace(",", "\n").trim())
+    // 2026-10-08：原来 `remember(state.cachedTrackerList)` 把 key 挂在加载结果上 ——
+    // 用户开始编辑后异步加载完成，整个输入框被远端内容强制重置（编辑丢失，观感像卡死）。
+    // 现在只在「用户还没动过」时跟随加载结果回填；一旦编辑（userEdited=true）就不再回填。
+    var userEdited by remember { mutableStateOf(false) }
+    var trackerText by remember { mutableStateOf("") }
+    LaunchedEffect(state.cachedTrackerList) {
+        if (!userEdited) {
+            trackerText = state.cachedTrackerList.replace(",", "\n").trim()
+        }
     }
 
     SettingsSubScaffold(
@@ -425,7 +432,10 @@ fun DownloadTrackerSettingsScreen(
             }
             UfiTextField(
                 value = trackerText,
-                onValueChange = { trackerText = it },
+                onValueChange = {
+                    userEdited = true
+                    trackerText = it
+                },
                 label = "",
                 modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 360.dp),
                 placeholder = "udp://tracker.example.com:80/announce\n" +

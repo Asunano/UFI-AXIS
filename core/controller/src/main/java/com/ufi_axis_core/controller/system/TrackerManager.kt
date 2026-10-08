@@ -42,7 +42,11 @@ class TrackerManager(
         val lastUpdated: Long = 0L,
         val sourceUrl: String = "",
         val trackerCount: Int = 0,
-        val status: String = "idle"  // idle / updating / ok / error: ...
+        val status: String = "idle",  // idle / updating / ok / error: ...
+        // 2026-10-08：用户在 UI 手动保存的列表（逗号分隔）。此前手动保存直写缓存文件，
+        // 下一次自动刷新会用 fetched+customList 整个覆盖 —— 用户编辑静默丢失。
+        // 独立持久化后，每次刷新都把 manual 合并回去（distinct 去重）。
+        val manualTrackers: String = ""
     )
 
     private val trackerDir = File(appContext.filesDir, "aria2").also { it.mkdirs() }
@@ -118,31 +122,53 @@ class TrackerManager(
         return try {
             val fetched = fetchTrackers(sourceUrl)
             if (fetched != null) {
-                // 合并自定义 Tracker
-                val combined = if (customList.isNotBlank()) {
-                    // 去重合并
+                // 自动池 = 远程列表 + 配置里的自定义附加项
+                val autoList = if (customList.isNotBlank()) {
                     val existing = fetched.split(",").map { it.trim() }.filter { it.isNotBlank() }
                     val custom = customList.split(",").map { it.trim() }.filter { it.isNotBlank() }
                     (existing + custom).distinct().joinToString(",")
                 } else fetched
 
-                trackerCacheFile.writeText(combined)
+                // 2026-10-08：用户手动保存过就以手动列表为准。此前刷新无条件用 fetched 覆盖
+                // 缓存文件 —— 用户在 UI 里删掉的条目下次刷新又回来，表现为「编辑不生效」。
+                // 语义：手动列表 = 权威（查看/编辑即所见即生效）；保存空列表即恢复自动模式。
+                val manual = meta.manualTrackers.trim()
+                val manualActive = manual.isNotBlank()
+                val combined = if (manualActive) manual else autoList
+                writeCache(combined)
                 val count = combined.split(",").count { it.trim().isNotBlank() }
                 meta = meta.copy(
                     lastUpdated = System.currentTimeMillis(),
                     sourceUrl = sourceUrl,
                     trackerCount = count,
-                    status = "ok"
+                    status = if (manualActive) "ok (manual list active)" else "ok"
                 )
                 saveMeta()
-                AppLogger.i(TAG, "Updated $count trackers from $sourceUrl")
+                AppLogger.i(TAG, "Updated $count trackers from $sourceUrl (manual=$manualActive)")
                 try { onTrackersUpdated?.invoke(combined) } catch (e: Exception) {
                     AppLogger.w(TAG, "tracker hot-reload hook failed: ${e.message}")
                 }
                 true
             } else {
-                meta = meta.copy(status = "error: fetch returned empty")
-                saveMeta()
+                // 2026-10-08：拉取失败时的兜底修正。此前缓存文件保持缺失，/trackers 返回空，
+                // 而 aria2.conf 里实际生效的是 BUILTIN_TRACKERS —— UI 显示与引擎不一致，
+                // 用户看到「0 条」却磁链能连 tracker，无法查看「实际内容」。
+                // 现在把实际生效的那份写进缓存，UI 与 aria2 看到同一份数据。
+                if (getCachedTrackers() == null) {
+                    val seed = meta.manualTrackers.trim().ifBlank { BUILTIN_TRACKERS }
+                    writeCache(seed)
+                    meta = meta.copy(
+                        sourceUrl = sourceUrl,
+                        trackerCount = seed.split(",").count { it.trim().isNotBlank() },
+                        status = "ok (builtin fallback)"
+                    )
+                    saveMeta()
+                    AppLogger.w(TAG, "Tracker fetch failed; seeded cache with fallback (${meta.trackerCount} entries)")
+                    try { onTrackersUpdated?.invoke(seed) } catch (e: Exception) { /* 热加载失败不影响流程 */ }
+                } else {
+                    meta = meta.copy(status = "error: fetch returned empty (kept cached list)")
+                    saveMeta()
+                }
                 AppLogger.w(TAG, "Tracker fetch returned empty/null from $sourceUrl")
                 false
             }
@@ -155,6 +181,35 @@ class TrackerManager(
     }
 
     // ─── 内部方法 ──────────────────────────────────────────
+
+    /** 缓存写入统一走原子写（同 saveMeta 教训：直写掉电会留全 \0 文件） */
+    private fun writeCache(content: String) {
+        val tmp = File(trackerDir, trackerCacheFile.name + ".tmp")
+        tmp.writeText(content)
+        if (!tmp.renameTo(trackerCacheFile)) {
+            trackerCacheFile.writeText(content)
+            tmp.delete()
+        }
+    }
+
+    /** 把用户手动保存的 tracker 合并进给定列表（distinct 去重）；手动保存流程现走 saveTrackerList，保留给未来聚合用 */
+    private fun mergeManual(base: String): String {
+        val manual = meta.manualTrackers.split(",").map { it.trim() }.filter { it.isNotBlank() }
+        if (manual.isEmpty()) return base
+        val existing = base.split(",").map { it.trim() }.filter { it.isNotBlank() }
+        return (existing + manual).distinct().joinToString(",")
+    }
+
+    /**
+     * 2026-10-08：用户在 UI 手动保存列表（DownloadManager.saveTrackerList 调用）。
+     * 手动列表持久化进 meta，并直接写入缓存文件 —— 用户保存的就是缓存/引擎生效的内容。
+     * 语义：保存非空 = 手动模式（刷新时以此为准，不再被远程列表覆盖）；保存空 = 回到自动模式。
+     */
+    fun setManualList(trackers: String) {
+        meta = meta.copy(manualTrackers = trackers.trim())
+        saveMeta()
+        writeCache(meta.manualTrackers)
+    }
 
     private fun fetchTrackers(url: String): String? {
         // disconnect 必须放在 finally：早期实现只在成功分支和非 200 分支调用它，
