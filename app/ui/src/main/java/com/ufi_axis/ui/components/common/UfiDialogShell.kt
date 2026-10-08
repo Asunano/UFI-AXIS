@@ -85,15 +85,6 @@ internal object UfiDialogAnim {
      const val DimFallback = 0.30f
 
      /**
-      * 跨窗口模糊**可用**时 Compose 层遮罩的透明度（2026-10-08 新增）。
-      *
-      * 这层不承担"变暗"职责（那是窗口 dim 的事），只负责把弹窗卡片从模糊过的背景里
-      * 托出来一点点（纸色底 12%）。它随 backdrop ramp 同步渐变 —— 数值小，渐变本身
-      * 几乎不可见，但能保证进出场的首尾帧与窗口 dim 端点完全对齐。
-      */
-     const val ScrimWithBlur = 0.12f
-
-    /**
      * backdrop 渐变的**量化步数**（0..[BackdropSteps]）。
      *
      * 为什么要量化：每一步都会走 `Window.attributes =` → `WindowManager.updateViewLayout`
@@ -388,11 +379,13 @@ internal fun UfiDialogShell(
         // 遮罩、系统模糊没了"。且窗口 dim(0.10) 与 Compose scrim 同时生效，两层不同源的
         // 半透明叠加在不同 GPU 路径上呈现不同色阶，弹窗边缘出现"分层/色带"。
         // 现在：
-        //   - blurCapable：变暗只走窗口 dim（随 ramp 渐变，DimWithBlur=0.10），Compose 层
-        //     只留一层极淡的底色（ScrimWithBlur=0.12，同样随 ramp）负责把弹窗从背景里"托"出来；
+        //   - blurCapable：变暗只走窗口 dim（随 ramp 渐变，DimWithBlur=0.10）。Compose 层
+        //     **不再铺任何底色**——10-08 第一版曾留 ScrimWithBlur(0.12) 的 pageBg 底色"托"
+        //     弹窗，但浅色主题 pageBg 近白，12% 铺满全屏又成了一层可见白纱盖在模糊上
+        //     （用户实测：模糊+白纱同时出现）。dim 单独已足够把弹窗从背景里分离出来；
         //   - !blurCapable：窗口 dim 关掉，变暗全走 Compose scrim（scrimAlpha 兜底，随
         //     backdrop ramp 同步渐变，见下方 collect）——单一来源，天然无分层。
-        val composeScrimAlpha = if (blurCapable) UfiDialogAnim.ScrimWithBlur else scrimAlpha
+        val composeScrimAlpha = if (blurCapable) 0f else scrimAlpha
         val maxDim = if (blurCapable) UfiDialogAnim.DimWithBlur else 0f
 
         // [Debug-only] Diagnostic log: confirms whether the dialog Window was
@@ -538,9 +531,9 @@ internal fun UfiDialogShell(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                // 2026-10-08：遮罩条件化。blurCapable 时只留一层 12% 底色（ScrimWithBlur），
-                // 模糊质感不被冲掉；!blurCapable 时才用 scrimAlpha 兜底且随 backdrop ramp
-                // 同步渐变（与模糊失效时的 dim 行为一致）。分层修法见 blurCapable 处注释。
+                // 2026-10-08（二修）：blurCapable 时 Compose 层零底色（白纱实测仍会盖模糊），
+                // 变暗只走窗口 dim；!blurCapable 时才用 scrimAlpha 兜底且随 backdrop ramp
+                // 同步渐变。见 blurCapable 处注释。
                 .background(palette.pageBg.copy(alpha = composeScrimAlpha * backdrop.value.coerceIn(0f, 1f)))
                 .clickable(
                     enabled = dismissOnClickOutside,
