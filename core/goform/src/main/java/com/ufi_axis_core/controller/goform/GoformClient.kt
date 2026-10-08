@@ -112,8 +112,28 @@ class GoformClient(
     // 说明重登可救。这里每 60s 只允许一次 partial→重登升级，兼顾自愈与防登录风暴。
     private val lastPartialRecoveryAt = java.util.concurrent.atomic.AtomicLong(0L)
 
-    /** partial→重登升级的最小间隔（防登录风暴，见 queryOnce 内 2026-10-08 注释）。 */
-    private val PARTIAL_RECOVERY_INTERVAL_MS = 60_000L
+    /**
+     * partial 自愈的**连续失败次数**（2026-10-08 主动自愈版）。
+     *
+     * 语义：每次「升级重登后仍然 partial」就 +1，下一次升级的等待时间指数拉长
+     * （60s → 120s → 240s → … 封顶 10min）；任何一次**完整**响应（非 partial 成功）
+     * 都把计数清零、退避复位 —— 设备恢复正常后立刻回到 60s 的灵敏档。
+     *
+     * 这样固件半死态的恢复节奏是「主动、持续、越救越慢但永不放弃」：
+     * 最坏情况（病一直不好）每 10min 也一定会再试一次，而不是 9541125 初版的
+     * 固定 60s（病不好时每分钟白登一次，纯耗 QoS 配额与登录风险）。
+     */
+    private val partialRecoveryFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** 首次升级等待（60s）；之后按 2^n 指数拉长。 */
+    private val PARTIAL_RECOVERY_BASE_MS = 60_000L
+
+    /** 升级等待上限（10min）：病再顽固也保持这个节奏持续尝试。 */
+    private val PARTIAL_RECOVERY_MAX_MS = 600_000L
+
+    /** 第 [failures] 次连续失败后的升级等待：BASE × 2^n，封顶 MAX。 */
+    private fun partialRecoveryWaitMs(failures: Int): Long =
+        (PARTIAL_RECOVERY_BASE_MS shl failures.coerceIn(0, 16)).coerceAtMost(PARTIAL_RECOVERY_MAX_MS)
     // 2026-10-05 R2-8 修复：最近一次 validateSession 是否因网络错而「通过」。
     // 只在 loginMutex 内的 forceValidate 消费点读；null = 本次校验真实验证了会话。
     @Volatile private var lastValidateNetworkDown: String? = null
@@ -798,15 +818,20 @@ class GoformClient(
                 // queryInternal 走既有的「许可外重登+重试」路径。
                 val now = System.currentTimeMillis()
                 val last = lastPartialRecoveryAt.get()
-                if (now - last >= PARTIAL_RECOVERY_INTERVAL_MS &&
-                    lastPartialRecoveryAt.compareAndSet(last, now)) {
+                val failures = partialRecoveryFailures.get()
+                val waitMs = partialRecoveryWaitMs(failures)
+                if (now - last >= waitMs && lastPartialRecoveryAt.compareAndSet(last, now)) {
+                    // last != 0 表示上一次升级重登之后**又**看到 partial ⇒ 上次没救回来，计数 +1，
+                    // 下一次等待按指数拉长（60s→120s→240s…封顶 10min）。首次（last==0）不计失败。
+                    if (last != 0L) partialRecoveryFailures.incrementAndGet()
                     AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
-                            " — upgrading to session invalidate + relogin (throttled 60s)")
+                            " — self-heal: invalidate session + relogin (attempt=${failures + 1}," +
+                            " next wait=${partialRecoveryWaitMs(failures + 1)}ms)")
                     invalidateSession()
                     onAuthLost()
                 } else {
                     AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
-                            " — session kept (recovery throttle window)")
+                            " — session kept (self-heal backoff ${waitMs}ms, ${now - last}ms elapsed)")
                 }
                 return null
             } else if (rawBody.contains("\"result\":\"session\"", ignoreCase = true)) {
@@ -822,6 +847,13 @@ class GoformClient(
         if (obj == null) {
             AppLogger.w(tag, "[goform_get] parse failed: ${rawBody.take(200)}")
             return null
+        }
+        // 主动自愈（2026-10-08）：完整响应 = 设备已恢复。清零失败计数、退避复位到 60s 档，
+        // 下次再发作时立刻以最灵敏的节奏去救。
+        if (partialRecoveryFailures.get() != 0 || lastPartialRecoveryAt.get() != 0L) {
+            partialRecoveryFailures.set(0)
+            lastPartialRecoveryAt.set(0L)
+            AppLogger.i(tag, "[goform_get] full response restored — partial self-heal state reset")
         }
         GoformQoS.cacheQuery(key, obj)
         return obj
