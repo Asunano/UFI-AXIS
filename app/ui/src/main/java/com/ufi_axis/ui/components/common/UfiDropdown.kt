@@ -5,6 +5,7 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -88,8 +89,12 @@ import kotlinx.coroutines.launch
  * 按 D8「只有减少入口数量的签名改动值得解冻」，本次 3 → 1 属可解冻情形。
  */
 
-/** 触发器高度。 */
-private val UfiDropdownTriggerHeight = 44.dp
+/** 触发器高度。2026-10-10：44dp（比 16sp 文字高出一倍多，观感臃肿）→ 32dp 扁平长方形，
+ *  文字行高约 20dp 上下各留 6dp，与文字体量相当。 */
+private val UfiDropdownTriggerHeight = 32.dp
+
+/** 触发器圆角：扁平长方形（Spacing.CornerBase 12dp 接近半高、显胶囊感 → 6dp）。 */
+private val UfiDropdownTriggerShape = RoundedCornerShape(6.dp)
 
 /**
  * 弹层单项的**最小**高度（实际高度由文字 + 垂直内距自适应，长文案换行时会自然变高）。
@@ -174,9 +179,11 @@ fun <T> UfiDropdown(
 
         Surface(
             onClick = { expanded = !expanded },
-            shape = shape,
+            // 扁平长方形触发器（2026-10-10 用户裁决）：6dp 小圆角、无边框无阴影 ——
+            // 原 12dp 圆角 + 1dp 边框在 32dp 高度上显「大块卡片」感，与「标签: 控件」
+            // 同行布局的轻量观感不配。surfaceMuted 底色已足够区分可点击区域。
+            shape = UfiDropdownTriggerShape,
             color = palette.surfaceMuted,
-            border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.6f)),
             modifier = Modifier
                 .fillMaxWidth()
                 .height(UfiDropdownTriggerHeight)
@@ -249,9 +256,11 @@ fun <T> UfiDropdown(
                 }
 
                 Surface(
-                    shape = shape,
+                    // 弹层与触发器同款扁平化：6dp 圆角、无边框无阴影（原 12dp 圆角 + 1dp 边框
+                    // + Level2 柔阴影在 7 项限高的浮层上显得笨重）。cardBg 底 + 触发器同宽
+                    // 已足够让浮层从背景里分离出来。
+                    shape = UfiDropdownTriggerShape,
                     color = palette.cardBg,
-                    border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.5f)),
                     modifier = Modifier
                         .width(triggerWidth)
                         .heightIn(max = popupMaxHeight)
@@ -261,15 +270,6 @@ fun <T> UfiDropdown(
                             scaleY = enterScale.value
                             transformOrigin = TransformOrigin(0f, if (openUpward) 1f else 0f)
                         }
-                        // 2026-09-04：原为 M3 Surface 的 `shadowElevation = 12.dp` + `tonalElevation = 2.dp`。
-                        // 那套阴影边缘硬、又重，贴屏幕边时观感像弹层"超出"了页面边距；tonalElevation 还会
-                        // 往 cardBg 上叠一层 M3 的色调，与全站卡片不是同一种底。现在改用项目自己的柔阴影
-                        // [ufiCardShadow] + Level 2（重要卡片档，6dp），与全站卡片同一套阴影观感。
-                        // 位置在 graphicsLayer **之后**（= 更内层），阴影才会跟着进场动画一起缩放淡入。
-                        .ufiCardShadow(
-                            elevation = UfiCardDefaults.elevationLevel2Dp,
-                            shape = shape
-                        )
                 ) {
                     Column(
                         modifier = Modifier
