@@ -92,14 +92,22 @@ fun UfiDialogBody(content: @Composable ColumnScope.() -> Unit) {
 @Composable
 fun UfiDialogField(label: String, content: @Composable () -> Unit) {
     val palette = LocalResolvedPalette.current
-    Column(Modifier.fillMaxWidth()) {
+    // 「标签: 控件」同行布局（2026-10-10 用户裁决）：原为 Column 上标题下内容 ——
+    // labelSmall 小字吊在左上角、控件独占一行又大又空，观感差。改为 Row：
+    // label 用 bodyMedium 正常字号垂直居中在左，内容 weight(1f) 吃剩余宽度。
+    // 长标签 weight(0.35f) 限宽防挤压控件（如「可用占位符（点一下插到光标处）」）。
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+    ) {
         Text(
             text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = palette.textSecondary
+            style = MaterialTheme.typography.bodyMedium,
+            color = palette.textSecondary,
+            modifier = Modifier.weight(0.35f, fill = false)
         )
-        Spacer(Modifier.height(Spacing.Small))
-        content()
+        Box(Modifier.weight(1f)) { content() }
     }
 }
 
