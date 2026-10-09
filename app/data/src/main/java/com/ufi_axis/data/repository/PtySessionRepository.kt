@@ -28,12 +28,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  * （页面级开关）、错误语义（1008=重签、1013=可重试）都不同。塞进去会变成两头都难维护的
  * 巨类，这正是 2026-10-10 用户裁决「别堆屎山」要避免的。
  *
- * ## 协议（ttyd 1.7 协议，JSON 数组指令流）
- * - 上行握手：`["0", "{}", ""]` → 请求初始输出（auth token 留空，鉴权在 core 反代层已完成）
- * - 上行输入：`["2", "<按键数据>"]`
- * - 下行输出：`["1", "<文本>"]`
- * - 下行其它指令（4/5/6 等扩展）不消费，丢弃。
- * 与 web 端 `PtyPane.vue` 完全同源（同一份协议，不是另发明一套）。
+ * ## 协议（ttyd 1.7.x，权威定义见 ttyd 源码 `src/server.h`）
+ * 帧是「1 个 ASCII 命令码 + 载荷」的**二进制**帧，不是 JSON：
+ * - client → ttyd：`'{'` JSON_DATA 握手（`{"AuthToken":"","columns":N,"rows":N}`）
+ *   → `'0'` INPUT（原始按键字节）→ `'1'` RESIZE_TERMINAL（`{"columns":N,"rows":N}`）
+ * - ttyd → client：`'0'` OUTPUT（终端输出字节）→ `'1'` SET_WINDOW_TITLE → `'2'` SET_PREFERENCES
+ *
+ * ⚠️ 2026-10-10 修正：此前本类按 `["1", data]` / `["2", data]` 的 **JSON 数组**帧实现 ——
+ * 那是 ttyd **1.6 及更早**的老协议。本机 ttyd 是 **1.7.7**，数组帧被它当垃圾丢弃，
+ * 表现是连接建立但终端全空白、完全无法输入（r32 真机实锤）。
+ * 尺寸字段名是 `columns`（不是老代码里的 `cols`）。与 web 端 `PtyPane.vue` 同源。
  *
  * ## 鉴权
  * `/ws/` 前缀在 core 的 AuthMiddleware 里整体豁免，路由自己做验签：
@@ -101,8 +105,10 @@ class PtySessionRepository(
             override fun onOpen(ws: WebSocket, response: Response) {
                 _connected.value = true
                 _error.value = null
-                // 握手指令：请求初始输出。auth token 传空串 —— 鉴权已在反代层完成。
-                sendFrame("""["0","{}",""]""")
+                // 握手帧：'{' + {"AuthToken":"","columns":..,"rows":..}。ttyd 收到它才 fork pty。
+                // 尺寸必须给 —— 缺了 shell 会按 0×0 起（提示符错位 / 无回显）。
+                // AuthToken 留空：鉴权已在 core 反代层完成，ttyd 只绑 127.0.0.1。
+                sendFrame("""{"AuthToken":"","columns":80,"rows":24}""")
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
@@ -144,31 +150,14 @@ class PtySessionRepository(
     }
 
     /**
-     * 构造并发送一条 ttyd 输入指令 `["2", data]`。
-     * 手工拼串而非 kotlinx JsonArray：协议形态固定两个元素，手拼可读性更好，
-     * 只需对 data 做 JSON 字符串转义（控制字符按 \u00XX 输出）。
+     * 发送一条 INPUT 帧：`'0'` 命令码 + 原始按键字节。
+     *
+     * ttyd 1.7.x 的 client INPUT 就是 `'0'` + **原始字节**，不做任何 JSON 包装
+     * （老协议 `["2", data]` 的数组包装是 1.6 的做法，在 1.7.7 上是无效帧）。
+     * 所以这里**不要**转义引号/反斜杠——回车、Ctrl-C(0x03)、Tab(0x09) 都是裸字节。
      */
     private fun sendInput(data: String) {
-        sendFrame("""["2",${jsonString(data)}]""")
-    }
-
-    /** JSON 字符串字面量转义（引号/反斜杠/控制字符/换行回车）。 */
-    private fun jsonString(s: String): String {
-        val sb = StringBuilder(s.length + 8)
-        sb.append('"')
-        for (ch in s) {
-            when {
-                ch == '"' -> sb.append("\\\"")
-                ch == '\\' -> sb.append("\\\\")
-                ch == '\r' -> sb.append("\\r")
-                ch == '\n' -> sb.append("\\n")
-                ch == '\t' -> sb.append("\\t")
-                ch < ' ' -> sb.append("\\u%04x".format(ch.code))
-                else -> sb.append(ch)
-            }
-        }
-        sb.append('"')
-        return sb.toString()
+        sendFrame(TTYD_INPUT + data)
     }
 
     /** 清屏（本地清缓冲，不动设备侧）。 */
@@ -193,17 +182,22 @@ class PtySessionRepository(
     }
 
     /**
-     * 解析下行帧，取出 `["1", data]` 里的 data。
-     * 非 JSON / 非输出帧（4/5/6 等扩展指令）返回 null 丢弃 —— 与 web 端同一处理策略。
+     * 解析下行帧，返回 OUTPUT 的载荷（首字符是命令码，载荷从第 2 字符起）。
+     *
+     * ttyd 1.7.x 下行帧：`'0'` OUTPUT（终端输出字节，要写进终端）
+     * / `'1'` SET_WINDOW_TITLE / `'2'` SET_PREFERENCES（后两者不消费，丢弃）。
+     *
+     * ⚠️ 老实现按 `["1", data]` JSON 数组解析 —— 那是 ttyd 1.6 的协议，本机 1.7.7
+     * 根本不发这种帧，导致终端永远空白（2026-10-10 r32 真机实锤）。
      */
-    private fun parseOutputFrame(text: String): String? = runCatching {
-        val arr = kotlinx.serialization.json.Json.parseToJsonElement(text) as? kotlinx.serialization.json.JsonArray
-            ?: return null
-        if (arr.size < 2) return null
-        val cmd = (arr[0] as? kotlinx.serialization.json.JsonPrimitive)?.content
-        if (cmd != "1") return null
-        (arr[1] as? kotlinx.serialization.json.JsonPrimitive)?.content
-    }.getOrNull()
+    private fun parseOutputFrame(text: String): String? {
+        if (text.isEmpty()) return null
+        return when (text[0]) {
+            '0' -> text.substring(1) // OUTPUT
+            '1', '2' -> null // SET_WINDOW_TITLE / SET_PREFERENCES：不消费
+            else -> null // 未知命令码：丢弃，不让一条脏帧炸掉整个会话
+        }
+    }
 
     /**
      * 累积输出：ttyd 送的是**字节流片段**，一次 `["1", data]` 可能只有半个行、
@@ -265,5 +259,13 @@ class PtySessionRepository(
     companion object {
         private const val MAX_LINES = 500
         private const val NORMAL_CLOSURE = 1000
+
+        /**
+         * ttyd 1.7.x client→server 命令码（权威定义见 ttyd `src/server.h`）：
+         * `'0'` INPUT / `'1'` RESIZE_TERMINAL / `'2'` PAUSE / `'3'` RESUME / `'{'` JSON_DATA。
+         * server→client 是另一套同数字的码（`'0'` OUTPUT / `'1'` SET_WINDOW_TITLE /
+         * `'2'` SET_PREFERENCES）——**两边数字撞车但含义不同**，别混用。
+         */
+        private const val TTYD_INPUT = '0'
     }
 }

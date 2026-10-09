@@ -89,8 +89,35 @@ async function enableTtyd() {
   }
 }
 
-function writeFrame(arr: (string | number)[]) {
-  ws?.send(JSON.stringify(arr));
+/**
+ * ttyd 1.7.x 帧构造（权威定义见 ttyd `src/server.h`）。
+ *
+ * ⚠️ 2026-10-10 修正：此前用的是 `["0", ...] / ["1", data] / ["2", data]` 这种
+ * **JSON 数组**帧 —— 那是 ttyd 1.6 及更早的老协议。本机 ttyd 是 **1.7.7**，它的
+ * 帧是「1 个 ASCII 命令码 + 载荷」的**二进制**帧，JSON 数组会被 ttyd 当垃圾丢弃：
+ * 表现就是连接建立、但终端一片空白且完全无法输入（2026-10-10 r32 真机）。
+ *
+ * client → server（`server.h` 的 client message）：
+ *   '0' INPUT            载荷 = 原始按键字节
+ *   '1' RESIZE_TERMINAL  载荷 = {"columns":N,"rows":N}（注意是 columns，不是 cols）
+ *   '2' PAUSE / '3' RESUME
+ *   '{' JSON_DATA        载荷 = {"AuthToken":"","columns":..,"rows":..}，握手用
+ * server → client：'0' OUTPUT / '1' SET_WINDOW_TITLE / '2' SET_PREFERENCES
+ *
+ * 鉴权：AuthToken 留空 —— 鉴权已在 core 反代层完成，ttyd 只绑 127.0.0.1。
+ */
+const TTYD_INPUT = '0'; // client → ttyd：按键输入
+const TTYD_RESIZE = '1'; // client → ttyd：尺寸同步
+const TTYD_JSON_DATA = '{'; // client → ttyd：握手（首帧）
+
+/** 发一帧：命令码 + 载荷，二进制 WS 帧（ttyd 用 LWS_WRITE_BINARY 收）。 */
+function writeFrame(cmd: string, payload: string) {
+  ws?.send(cmd + payload);
+}
+
+/** 握手帧：请求初始输出 + 告知终端尺寸。ttyd 收到它才真正 fork pty。 */
+function writeInit(cols: number, rows: number) {
+  writeFrame(TTYD_JSON_DATA, JSON.stringify({ AuthToken: '', columns: cols, rows: rows }));
 }
 
 async function connect() {
@@ -125,20 +152,24 @@ async function connect() {
     connected.value = true;
     running.value = true; // WS 通了 = ttyd 已在设备后台常驻
     reauthOnce = false;
-    // ttyd 握手：["0", {}] 请求初始输出（auth token 留空 —— 鉴权在反代层已完成）
-    writeFrame(['0', '{}', '']);
+    // 握手帧：'{' + {"AuthToken":"","columns":..,"rows":..}。ttyd 收到这一帧才 fork pty，
+    // 尺寸必须带上 —— 缺了它 shell 会按 0×0 起（表现为提示符错位 / 无回显）。
+    writeInit(term?.cols ?? 80, term?.rows ?? 24);
     term?.focus();
     scheduleFit();
   };
   ws.onmessage = (ev) => {
-    try {
-      const arr = JSON.parse(ev.data as string);
-      // ["1", output] 输出帧；其余指令（4/5/6 等 ttyd 扩展）xterm 不消费
-      if (Array.isArray(arr) && arr[0] === '1' && typeof arr[1] === 'string') {
-        term?.write(arr[1]);
-      }
-    } catch {
-      /* 非 JSON 帧丢弃（对端抽风时不让它炸掉整条消息处理） */
+    // ttyd 1.7.x 下行帧：第 1 个字符是命令码，其余是载荷。
+    //  '0' OUTPUT           → 终端输出字节，写进 xterm
+    //  '1' SET_WINDOW_TITLE → 标题（设置标签页标题用，这里不处理）
+    //  '2' SET_PREFERENCES  → 偏好 JSON（同上，忽略）
+    //  注：老协议的 ["1", data] JSON 数组格式**不再存在**，别再加回来。
+    const data = typeof ev.data === 'string' ? ev.data : '';
+    if (!data.length) return;
+    const cmd = data.charCodeAt(0);
+    const payload = data.slice(1);
+    if (cmd === 0x30 /* '0' OUTPUT */) {
+      term?.write(payload);
     }
   };
   ws.onclose = (ev) => {
@@ -172,13 +203,14 @@ function createTerm() {
   term.loadAddon(fit);
   term.onData((data) => {
     // 键盘输入 → ttyd 输入指令 ["2", input]
-    if (ws && ws.readyState === WebSocket.OPEN) writeFrame(['2', data]);
+    // ttyd 1.7.x：按键输入是 '0' + 原始字节（不是老协议的 ["2", data]）
+    if (ws && ws.readyState === WebSocket.OPEN) writeFrame(TTYD_INPUT, data);
   });
   term.onResize(({ cols, rows }) => {
-    // 尺寸同步：ttyd 用 ["1", {...{"cols":..,"rows":..}}] 之外的独立 resize 指令 ["1", {...}]
-    // 不同版本行为有差；保守做法是发 JSON 负载（ttyd html 客户端同款）。
+    // 尺寸同步：ttyd 1.7.x 是 '1' + {"columns":..,"rows":..}（字段名是 columns，不是 cols）。
+    // 老版本（1.6）用的是 ["1", {...}] 数组格式 —— 那套在 1.7.7 上是无效帧。
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify([{ cols, rows }, '']));
+      writeFrame(TTYD_RESIZE, JSON.stringify({ columns: cols, rows: rows }));
     }
   });
   if (termRef.value) term.open(termRef.value);
