@@ -39,19 +39,40 @@ class TtydManager(
     private val processRef = AtomicReference<Process?>(null)
 
     /**
-     * 抽干子进程输出的线程（2026-10-06 修）。
+     * 抽干子进程输出的线程，并把**内容记进 core 日志**（2026-10-10 修：原来纯丢弃）。
      *
-     * **为什么必须有**：`redirectErrorStream(true)` 让 ttyd 的 stdout/stderr 并成一条管道，
+     * **为什么必须有这条线程**：`redirectErrorStream(true)` 让 ttyd 的 stdout/stderr 并成一条管道，
      * 而管道缓冲区只有 64KB。没人读的话，ttyd 写完缓冲就在 `write()` 上永久阻塞 ——
      * 表现为长会话用一阵子后输出停摆（且 `isAlive` 仍为 true，`ensureStarted` 不会救），
      * 页面重连也没用。这不是理论风险：ttyd 每帧都有 libwebsockets 日志。
      *
-     * 线程是 daemon + 只读丢弃：不解析（会话内容由 WS 反代那条路走，与本管道无关），
-     * 抽到 EOF 自然结束，进程被杀时读立刻返回 -1。
+     * **为什么还要记内容**：ttyd 是 C 程序，它唯一的排障信息（bind 失败、非法 WS 路径被拒、
+     * libwebsockets 握手错误）**只出现在这条管道里**。原来 `copyTo(nullOutputStream())`
+     * 把它们全扔了，于是「core 日志里什么都抓不到」，无法定位任何 ttyd 侧问题。
+     *
+     * 限流：libwebsockets 每帧一行日志，全量记会瞬间刷爆日志文件（5MB 单文件上限轮转），
+     * 把有用的记录冲掉。这里只记**前若干行**（首次启动的握手/绑定信息最有价值），
+     * 之后静默丢弃但继续抽干（抽干本身不可省）。
+     *
+     * 线程是 daemon + 到 EOF 自然结束；进程被杀时读立刻返回 -1。
      */
     private fun drainOutput(p: Process) {
         val t = Thread({
-            runCatching { p.inputStream.use { it.copyTo(java.io.OutputStream.nullOutputStream()) } }
+            runCatching {
+                p.inputStream.use { stream ->
+                    val reader = stream.bufferedReader()
+                    var lineNo = 0
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        lineNo++
+                        if (lineNo <= MAX_LOGGED_LINES) {
+                            AppLogger.i(TAG, "ttyd> $line")
+                        } else if (lineNo == MAX_LOGGED_LINES + 1) {
+                            AppLogger.i(TAG, "ttyd> …（后续日志已静默丢弃，仅抽干）")
+                        }
+                    }
+                }
+            }
         }, "ttyd-drain")
         t.isDaemon = true
         t.start()
@@ -135,6 +156,9 @@ class TtydManager(
 
     companion object {
         private const val TAG = "TtydManager"
+
+        /** ttyd 输出最多记多少行进 core 日志（之后静默丢弃但继续抽干）。 */
+        private const val MAX_LOGGED_LINES = 200
 
         /** 本地端口。选 7682（ttyd 官方默认）+ 偏移，避开 goform 80/8080/8088 等常见占用。 */
         const val DEFAULT_PORT = 17682

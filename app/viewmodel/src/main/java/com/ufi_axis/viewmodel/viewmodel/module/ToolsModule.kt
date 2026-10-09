@@ -3944,6 +3944,29 @@ class ToolsModule(
     suspend fun ttydStop() {
         api.ttydStop()
     }
+
+    /**
+     * 签发真 PTY 票据并交给 [connect] 建立 WS 会话（app 端原生终端入口，2026-10-10）。
+     *
+     * 票据端点走标准头部鉴权（Bearer + 设备签名），成功即证明调用方过了完整鉴权；
+     * 403 = `ttyd_enabled` 开关未开（core 侧的安全边界），这里把原因写进 UI 可见的
+     * 状态而不是静默失败 —— 「403 但页面只显示连接失败」会让人以为是 bug。
+     *
+     * @return true=票据已拿到并已发起连接；false=失败（原因见调用方的 error 状态）
+     */
+    suspend fun openPtySession(connect: (String) -> Unit): Boolean = runCatching {
+        val o = api.ptyTicket().jsonObject
+        val ticket = o["ticket"]?.jsonPrimitive?.content
+        if (ticket.isNullOrBlank()) {
+            DebugLog.w("PTY", "pty-ticket returned no ticket: $o")
+            return false
+        }
+        connect(ticket)
+        true
+    }.getOrElse { e ->
+        DebugLog.w("PTY", "pty-ticket failed: ${e.javaClass.simpleName}: ${e.message}")
+        false
+    }
 }
 
 @Serializable

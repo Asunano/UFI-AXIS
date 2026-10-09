@@ -98,6 +98,14 @@ object Routes {
 
     const val DETAIL_SERVER_CONFIG = "detail/server-config"
     const val DETAIL_TOOLS_ADVANCED = "detail/tools-advanced"
+
+    /**
+     * 真 PTY 终端（app 端原生，2026-10-10）。
+     *
+     * 与 `DETAIL_TOOLS_ADVANCED`（高级控制台 = 逐条命令 exec）是两种东西：那条路没有
+     * 交互式 shell，本页走 ttyd 真 PTY 会话。
+     */
+    const val DETAIL_PTY_TERMINAL = "detail/pty-terminal"
     /**
      * 进阶工具页（2026-09-20）。
      *
@@ -448,6 +456,7 @@ val appRoutes: List<AppRoute> = listOf(
 
     AppRoute(Routes.DETAIL_SERVER_CONFIG, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TOOLS_ADVANCED, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_PTY_TERMINAL, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TOOLS_EXTRA, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_SPEED_TEST, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TRAFFIC_MGMT, TransitionType.DETAIL),

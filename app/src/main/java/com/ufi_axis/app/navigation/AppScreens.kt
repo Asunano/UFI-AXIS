@@ -71,6 +71,8 @@ private fun rawAppScreens(
 
     Routes.DETAIL_SERVER_CONFIG to { _, nc -> ServerConfigScreen(viewModel, onServerConfigChanged, nc) },
     Routes.DETAIL_TOOLS_ADVANCED to { _, nc -> AdvancedConsoleScreen(viewModel, nc) },
+    // 真 PTY 终端（app 端原生，2026-10-10）：ttyd 真 PTY 会话，与上面的逐条 exec 不同。
+    Routes.DETAIL_PTY_TERMINAL to { _, nc -> PtyTerminalScreen(viewModel, nc) },
     // 进阶工具页只是一页入口网格，不碰 viewModel
     Routes.DETAIL_TOOLS_EXTRA to { _, nc -> ToolsExtraScreen(nc) },
     Routes.DETAIL_SPEED_TEST to { _, nc -> SpeedTestScreen(viewModel, nc) },

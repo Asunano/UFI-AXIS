@@ -286,6 +286,14 @@ interface UfiAxisApi {
     @POST("api/terminal/stop")
     suspend fun ttydStop(): JsonElement
 
+    /**
+     * 2026-10-10：签发真 PTY 票据（app 端原生终端用）。
+     * 返回 `{"ticket": "...", "session_id": "...", "port": 17682}`。
+     * 403 = `ttyd_enabled` 开关未开（与 core 侧同一防御模型）。
+     */
+    @POST("api/terminal/pty-ticket")
+    suspend fun ptyTicket(): JsonElement
+
     @DELETE("api/media/thumbnail-cache")
     suspend fun clearMediaThumbnailCache(
         @Query("type") type: String? = null,

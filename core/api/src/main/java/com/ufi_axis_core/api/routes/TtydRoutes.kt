@@ -4,6 +4,7 @@ import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.terminal.TtydManager
 import com.ufi_axis_core.api.terminal.TtydTicketStore
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO
@@ -121,75 +122,101 @@ class TtydRoutes(
 
     /** WS 反代主循环（HttpServer 的 `webSocket("/ws/terminal")` 调进来）。 */
     suspend fun proxy(clientSession: DefaultWebSocketServerSession) {
-        // ── 第一道闸：WS 握手 query 验签（与 /ws/realtime 完全同参同名，web 端零新增）──
-        if (wsAuthenticator != null) {
-            val q = clientSession.call.request.queryParameters
-            val fp = wsAuthenticator.authenticate(
-                token = q["token"],
-                timestamp = q["ts"],
-                nonce = q["nonce"],
-                signature = q["sig"],
-                path = clientSession.call.request.path(),
-            )
-            if (fp == null) {
-                clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Authentication failed"))
+            // ── 第一道闸：WS 握手 query 验签（与 /ws/realtime 完全同参同名，web 端零新增）──
+            if (wsAuthenticator != null) {
+                val q = clientSession.call.request.queryParameters
+                val fp = wsAuthenticator.authenticate(
+                    token = q["token"],
+                    timestamp = q["ts"],
+                    nonce = q["nonce"],
+                    signature = q["sig"],
+                    path = clientSession.call.request.path(),
+                )
+                if (fp == null) {
+                    AppLogger.w(TAG, "WS terminal: 握手验签失败, close=1008")
+                    clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "Authentication failed"))
+                    return
+                }
+            }
+            // ── 第二道闸：PTY 票据（票据签发端点本身已过完整头部鉴权 + 开关）──
+            val sessionId = ticketStore.resolve(clientSession.call.request.queryParameters["ticket"])
+            if (sessionId == null) {
+                AppLogger.w(TAG, "WS terminal: 票据无效/过期, close=1008")
+                clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal ticket invalid or expired"))
                 return
             }
-        }
-        // ── 第二道闸：PTY 票据（票据签发端点本身已过完整头部鉴权 + 开关）──
-        val sessionId = ticketStore.resolve(clientSession.call.request.queryParameters["ticket"])
-        if (sessionId == null) {
-            clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal ticket invalid or expired"))
-            return
-        }
-        if (!settings.ttydEnabled) {
-            clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal disabled"))
-            return
-        }
-        val port = try {
-            manager.ensureStarted()
-        } catch (e: TtydManager.TtydStartException) {
-            clientSession.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, e.message ?: "ttyd unavailable"))
-            return
-        }
-
-        val ttyd = try {
-            // 2026-10-07 修复（r12 真机 1006）：ttyd 的 WS 端点是 **/ws**（二进制里
-            // "refuse to serve WS client for illegal ws path" 即此），连根路径会被它直接拒掉，
-            // 浏览器侧表现为「连接已断开（code 1006）」。之前没真机验证过这一路径。
-            http.webSocketSession("ws://127.0.0.1:$port/ws")
-        } catch (e: Exception) {
-            clientSession.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "ttyd connect failed: ${e.message}"))
-            return
-        }
-
-        try {
-            coroutineScope {
-                // ttyd → client（终端输出）
-                launch {
-                    try {
-                        for (frame in ttyd.incoming) {
-                            if (frame is Frame.Close) break
-                            clientSession.send(frame)
-                        }
-                    } catch (_: Exception) { /* 对端已关：走 finally 清理 */ }
-                    runCatching { clientSession.close() }
-                }
-                // client → ttyd（键盘输入）
-                launch {
-                    try {
-                        for (frame in clientSession.incoming) {
-                            if (frame is Frame.Close) break
-                            ttyd.send(frame)
-                        }
-                    } catch (_: Exception) { /* 对端已关 */ }
-                    runCatching { ttyd.close() }
-                }
+            if (!settings.ttydEnabled) {
+                AppLogger.w(TAG, "WS terminal: 开关关闭, close=1008")
+                clientSession.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal disabled"))
+                return
             }
-        } finally {
-            runCatching { ttyd.close() }
-            runCatching { clientSession.close() }
+            val port = try {
+                manager.ensureStarted()
+            } catch (e: TtydManager.TtydStartException) {
+                AppLogger.w(TAG, "WS terminal: ttyd 启动失败: ${e.message}, close=1013")
+                clientSession.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, e.message ?: "ttyd unavailable"))
+                return
+            }
+
+            val ttyd = try {
+                // 2026-10-07 修复（r12 真机 1006）：ttyd 的 WS 端点是 **/ws**（二进制里
+                // "refuse to serve WS client for illegal ws path" 即此），连根路径会被它直接拒掉，
+                // 浏览器侧表现为「连接已断开（code 1006）」。之前没真机验证过这一路径。
+                http.webSocketSession("ws://127.0.0.1:$port/ws")
+            } catch (e: Exception) {
+                AppLogger.w(TAG, "WS terminal: 连 ttyd ws://127.0.0.1:$port/ws 失败: ${e.javaClass.simpleName}: ${e.message}, close=1013")
+                clientSession.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "ttyd connect failed: ${e.message}"))
+                return
+            }
+            AppLogger.i(TAG, "WS terminal: 已连 ttyd session=$sessionId port=$port")
+
+            var outFrames = 0L
+            var inFrames = 0L
+            try {
+                coroutineScope {
+                    // ttyd → client（终端输出）
+                    launch {
+                        try {
+                            for (frame in ttyd.incoming) {
+                                if (frame is Frame.Close) {
+                                    AppLogger.i(TAG, "WS terminal: 收到 ttyd Close 帧 (out=$outFrames in=$inFrames)")
+                                    break
+                                }
+                                outFrames++
+                                clientSession.send(frame)
+                            }
+                        } catch (e: Exception) {
+                            // 原为静默 catch：连「为什么断」都看不到。现在至少记类型+消息。
+                            AppLogger.w(TAG, "WS terminal: ttyd→client 泵异常: ${e.javaClass.simpleName}: ${e.message} (out=$outFrames in=$inFrames)")
+                        }
+                        runCatching { clientSession.close() }
+                    }
+                    // client → ttyd（键盘输入）
+                    launch {
+                        try {
+                            for (frame in clientSession.incoming) {
+                                if (frame is Frame.Close) {
+                                    AppLogger.i(TAG, "WS terminal: 收到 client Close 帧 (out=$outFrames in=$inFrames)")
+                                    break
+                                }
+                                inFrames++
+                                ttyd.send(frame)
+                            }
+                        } catch (e: Exception) {
+                            AppLogger.w(TAG, "WS terminal: client→ttyd 泵异常: ${e.javaClass.simpleName}: ${e.message} (out=$outFrames in=$inFrames)")
+                        }
+                        runCatching { ttyd.close() }
+                    }
+                }
+            } finally {
+                AppLogger.i(TAG, "WS terminal: 会话结束 session=$sessionId (out=$outFrames in=$inFrames)")
+                runCatching { ttyd.close() }
+                runCatching { clientSession.close() }
+            }
         }
+
+    companion object {
+        private const val TAG = "TtydRoutes"
     }
 
     /** 服务停止钩子（ComponentFactory.stop 时调）。 */

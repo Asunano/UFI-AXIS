@@ -213,6 +213,25 @@ class MainViewModel(
     // 源里的列目录与读写仍由 files 走 remote: 前缀路径完成（core 侧派发）。
     // by lazy：绝大多数用户一个源都不配，不该在 ViewModel 构造时就占一份 state。
     val storageSources by lazy { StorageSourceModule(api, viewModelScope) }
+
+    /**
+     * 真 PTY 终端会话（app 端原生，2026-10-10）。
+     *
+     * 独立 repository 而非塞进 `WebSocketRepository`：那是 /ws/realtime 推送通道，
+     * 带订阅主题/重连退避/data_changed 扇出，与终端的帧协议和生命周期都不同（详见
+     * `PtySessionRepository` 类文档）。`by lazy` — 绝大多数用户不进终端页，
+     * 不该在 ViewModel 构造时就建 OkHttpClient。
+     *
+     * 设备地址/token 每次现取 [AppPreferences]：设备重新配对后 baseUrl/token 会变，
+     * 长驻实例拿着旧值会连不上（与 RetrofitClient.recreate 同一理由）。
+     */
+    fun ptySession(): com.ufi_axis.data.repository.PtySessionRepository =
+        ptySessionRef ?: com.ufi_axis.data.repository.PtySessionRepository(
+            AppPreferences(appContext).baseUrl,
+            AppPreferences(appContext).token,
+        ).also { ptySessionRef = it }
+
+    private var ptySessionRef: com.ufi_axis.data.repository.PtySessionRepository? = null
     // 媒体中心（工具 → 媒体中心，2026-09-16）：列设备端的视频 / 音乐 / 图片。
     // 数据来自 core 的 /api/media（它查系统媒体库），播放仍走 /api/files/stream。
     val media by lazy { MediaModule(api, appContext, viewModelScope) }
