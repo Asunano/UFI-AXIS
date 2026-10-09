@@ -66,7 +66,21 @@ class TtydRoutes(
     private val wsAuthenticator: com.ufi_axis_core.api.websocket.WsAuthenticator? = null,
 ) {
     private val http = HttpClient(CIO) {
-        // ttyd 在本机回环，超时给小 —— 挂了就快速失败，别让页面转圈
+        // 2026-10-10 修（r31 实机日志实锤）：**必须**装 WebSockets 插件。
+        // 下面 proxy() 用 `http.webSocketSession(...)` 连本机 ttyd，而 client 侧的该扩展函数
+        // 是 `io.ktor.client.plugins.websocket.WebSockets` 插件提供的 —— 没装时它在**运行期**
+        // 抛 `IllegalStateException: Plugin ... WebSockets$Plugin is not installed`，
+        // 表现是每次连接都 close=1013、Web 端永远握手失败。
+        //
+        // 为什么之前一直没暴露：客户端这一行写在 core 里、服务端 WebSocket 插件装在
+        // HttpServer 的**服务端**配置里，两者是不同插件实例；此前从未有一条代码路径
+        // 真正执行到 `webSocketSession()`（r30 之前 WS 路由被 catch-all 吃掉，
+        // r31 才第一次走到这里），于是这个漏装一直没机会抛。
+        // **教训**：客户端/服务端同名插件不是同一个东西，装一边不代表另一边有。
+        install(io.ktor.client.plugins.websocket.WebSockets)
+        // ttyd 在本机回环，超时给小 —— 挂了就快速失败，别让页面转圈。
+        // 注意 requestTimeout 只管握手前的 HTTP 阶段；WS 建连后是长连接，不受它约束
+        // （长连接由下面的 pingInterval / session 生命周期管）。
         engine { requestTimeout = 5_000 }
     }
 
