@@ -469,6 +469,36 @@ class HttpServer(
                 pairingRoutes.register(this)
             }
 
+            // ══ 【注册顺序不变量】WebSocket 路由必须在下面那个 catch-all 静态资源路由之前 ══
+            //
+            // 2026-10-10 实机根因（r30，web 终端页「Invalid frame header」）：本块原本注册在
+            // `get("/{path...}")` **之后**。Ktor 的路由匹配按注册顺序取第一个能处理请求的路由，
+            // catch-all `/{path...}` 会把 `GET /ws/terminal` 当成一个前端路径吃掉，返回
+            // **200 + index.html**；浏览器要的却是 `101 Switching Protocols`，
+            // 于是抛「Invalid frame header」并不断重连（重连再打同一个坑，故日志刷屏）。
+            //
+            // 为什么 /ws/realtime 没暴露这个问题：它同样注册在 catch-all 之后，但 Ktor 对
+            // `GET` + `Upgrade: websocket` 有内建分流，在 pipeline 层先于 route 匹配生效 ——
+            // **但那只在 WS 路由确实是 GET 可达时**；/ws/terminal 的请求带着 Upgrade 头却被
+            // catch-all 以普通 GET 处理，于是返回 HTML。结论：WS 路由的位置不是风格问题，
+            // 是能否握上手的决定因素，别把它移到 catch-all 后面。
+            webSocket("/ws/realtime") {
+                webSocketManager.handleConnection(this)
+            }
+
+            // 真 PTY 终端反代（2026-10-07 票据鉴权，2026-10-10 移位 + 日志可见化）：
+            // 浏览器 WebSocket 发不了自定义头，与 /ws/realtime 同理挂 /api 之外、凭 PTY
+            // 票据鉴权（票据由 POST /api/terminal/pty-ticket 签发，签发走完整头部鉴权 +
+            // ttyd_enabled 开关）。ttyd 只绑 127.0.0.1，这是唯一外部入口。
+            webSocket("/ws/terminal") {
+                val routes = ttydRoutes
+                if (routes == null) {
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal routes not wired"))
+                } else {
+                    routes.proxy(this)
+                }
+            }
+
             // ── Web 前端静态资源 + SPA fallback（通过 WebResourceManager 实现 override + assets 回退）──
             // index.html / version.json 一律 no-store：它们的 URL 不带 hash，浏览器的启发式缓存
             // 会让「换了 core 包但页面还是旧的」变成常态（旧 index 引用旧 assets，而旧 assets 因为
@@ -713,22 +743,6 @@ class HttpServer(
                 poetryRoutes?.register(this)
                 geoRoutes?.register(this)
                 webUpdateRoutes.register(this)
-            }
-
-            webSocket("/ws/realtime") {
-                webSocketManager.handleConnection(this)
-            }
-
-            // 真 PTY 终端反代（2026-10-06）：浏览器 WebSocket 发不了自定义头，与 /ws/realtime
-            // 同理挂 /api 之外、凭 PTY 票据鉴权（票据由 POST /api/terminal/pty-ticket 签发，
-            // 签发本身走完整头部鉴权 + ttyd_enabled 开关）。ttyd 只绑 127.0.0.1，这是唯一外部入口。
-            webSocket("/ws/terminal") {
-                val routes = ttydRoutes
-                if (routes == null) {
-                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal routes not wired"))
-                } else {
-                    routes.proxy(this)
-                }
             }
 
             // 凭票流式播放（2026-09-14）：刻意挂在 `/api` **之外**。
