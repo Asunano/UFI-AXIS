@@ -5,7 +5,6 @@ import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -17,6 +16,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -37,6 +38,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -89,12 +91,9 @@ import kotlinx.coroutines.launch
  * 按 D8「只有减少入口数量的签名改动值得解冻」，本次 3 → 1 属可解冻情形。
  */
 
-/** 触发器高度。2026-10-10：44dp（比 16sp 文字高出一倍多，观感臃肿）→ 32dp 扁平长方形，
- *  文字行高约 20dp 上下各留 6dp，与文字体量相当。 */
+/** 触发器高度。2026-10-10：44dp → 32dp（**尺寸**扁平化：16sp 文字行高约 20dp，
+ *  上下各留 6dp，原高度比文字体量高一倍多）。外观（圆角/边框/阴影）保持不变。 */
 private val UfiDropdownTriggerHeight = 32.dp
-
-/** 触发器圆角：扁平长方形（Spacing.CornerBase 12dp 接近半高、显胶囊感 → 6dp）。 */
-private val UfiDropdownTriggerShape = RoundedCornerShape(6.dp)
 
 /**
  * 弹层单项的**最小**高度（实际高度由文字 + 垂直内距自适应，长文案换行时会自然变高）。
@@ -107,6 +106,9 @@ private val UfiDropdownOptionMinHeight = 36.dp
 
 /** 触发器/弹层项的横向内距。2026-09-04：14dp → Spacing.Large（12dp），给窄触发器（年/月/日）多留 4dp 给文字。 */
 private val UfiDropdownPaddingH = Spacing.Large
+
+/** 触发器最小宽度（内容宽度更小时的下限）—— 保证「2」「chip1」这类短值也点得准、放得下箭头。 */
+private val UfiDropdownTriggerMinWidth = 88.dp
 
 /** 弹层默认最大可见项数，超出滚动。 */
 private const val UfiDropdownMaxVisibleItems = 7
@@ -179,31 +181,38 @@ fun <T> UfiDropdown(
 
         Surface(
             onClick = { expanded = !expanded },
-            // 扁平长方形触发器（2026-10-10 用户裁决）：6dp 小圆角、无边框无阴影 ——
-            // 原 12dp 圆角 + 1dp 边框在 32dp 高度上显「大块卡片」感，与「标签: 控件」
-            // 同行布局的轻量观感不配。surfaceMuted 底色已足够区分可点击区域。
-            shape = UfiDropdownTriggerShape,
+            shape = shape,
             color = palette.surfaceMuted,
+            border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.6f)),
+            // 2026-10-10：**宽度**也扁平化 —— 原 fillMaxWidth() 触发器撑满整行，在「标签: 控件」
+            // 同行布局下控件宽度与左侧标签相加远超一行，视觉上仍是「一个大盒子」。改为按内容宽度
+            // 撑开（wrapContentWidth），并用 [UfiDropdownTriggerMinWidth] 保底：太窄的触发器
+            // （「2」/「chip1」）点起来费劲，也容不下下箭头。宽度由「文字 + 单位 + 箭头 + 内距」
+            // 自然决定，长选项（密码档位长文案）也据此展开，不再固定成整行宽。
             modifier = Modifier
-                .fillMaxWidth()
+                .wrapContentWidth()
+                .widthIn(min = UfiDropdownTriggerMinWidth)
                 .height(UfiDropdownTriggerHeight)
                 .onSizeChanged { triggerWidthPx = it.width }
         ) {
             Row(
                 modifier = Modifier
-                    .fillMaxWidth()
+                    .wrapContentWidth()
+                    .widthIn(min = UfiDropdownTriggerMinWidth)
                     .padding(horizontal = UfiDropdownPaddingH),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // weight(1f) + textAlign=Center：值在「后缀/箭头之外的剩余空间」内居中。
-                // 不用 fillMaxWidth()——它会吞掉整行宽度把同级后缀与箭头挤成 0dp。
+                // 原 weight(1f)+textAlign=Center 是为 fillMaxWidth 的宽触发器（日期弹窗年/月/日各占
+                // 一份）设计的：值在「后缀/箭头之外的剩余空间」内居中。触发器改按内容宽度后不再有
+                // 「剩余空间」需要分配，这里改成 wrapContentWidth + 文字左对齐，箭头紧随文字 ——
+                // 这才是「和文字差不多宽」的扁平长方形。
                 Text(
                     text = optionLabel(selectedValue),
                     style = UfiTextStyles.bodyLead.copy(fontWeight = UfiWeight.Emphasis),
                     color = palette.textPrimary,
-                    textAlign = TextAlign.Center,
                     maxLines = 1,
-                    modifier = Modifier.weight(1f)
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis
                 )
                 if (unitSuffix.isNotEmpty()) {
                     Text(
@@ -256,11 +265,9 @@ fun <T> UfiDropdown(
                 }
 
                 Surface(
-                    // 弹层与触发器同款扁平化：6dp 圆角、无边框无阴影（原 12dp 圆角 + 1dp 边框
-                    // + Level2 柔阴影在 7 项限高的浮层上显得笨重）。cardBg 底 + 触发器同宽
-                    // 已足够让浮层从背景里分离出来。
-                    shape = UfiDropdownTriggerShape,
+                    shape = shape,
                     color = palette.cardBg,
+                    border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.5f)),
                     modifier = Modifier
                         .width(triggerWidth)
                         .heightIn(max = popupMaxHeight)
@@ -270,6 +277,15 @@ fun <T> UfiDropdown(
                             scaleY = enterScale.value
                             transformOrigin = TransformOrigin(0f, if (openUpward) 1f else 0f)
                         }
+                        // 2026-09-04：原为 M3 Surface 的 `shadowElevation = 12.dp` + `tonalElevation = 2.dp`。
+                        // 那套阴影边缘硬、又重，贴屏幕边时观感像弹层"超出"了页面边距；tonalElevation 还会
+                        // 往 cardBg 上叠一层 M3 的色调，与全站卡片不是同一种底。现在改用项目自己的柔阴影
+                        // [ufiCardShadow] + Level 2（重要卡片档, 6dp），与全站卡片同一套阴影观感。
+                        // 位置在 graphicsLayer **之后**（= 更内层），阴影才会跟着进场动画一起缩放淡入。
+                        .ufiCardShadow(
+                            elevation = UfiCardDefaults.elevationLevel2Dp,
+                            shape = shape
+                        )
                 ) {
                     Column(
                         modifier = Modifier
