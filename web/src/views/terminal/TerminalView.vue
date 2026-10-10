@@ -16,7 +16,13 @@
     >
       <n-tab-pane name="at" tab="AT 命令" />
       <n-tab-pane name="shell" tab="Shell" />
-      <n-tab-pane name="pty" tab="真 PTY" />
+      <!--
+        2026-10-10 暂时隐藏「真 PTY」tab：ttyd 帧协议已按 1.7.7 修正、但整套功能尚未完工
+        （终端渲染 / app 端入口待重做），先撤下避免用户进到半成品。
+        同页的 AT 命令 / Shell 两个 tab 与 ttyd 无关，**不受影响**。
+        恢复只需把下面这行恢复为 <n-tab-pane name="pty" tab="真 PTY" />。
+      -->
+      <!-- <n-tab-pane name="pty" tab="真 PTY" /> -->
     </n-tabs>
 
     <!--
@@ -66,9 +72,14 @@
       </div>
 
       <!-- ── 消息列表：flex:1 内部滚动 ── -->
-       <!-- 真 PTY：独立 xterm 面板，替代对话流（PTY 是流式全屏，没有"消息列表"概念） -->
-      <PtyPane v-if="activeTab === 'pty'" class="pane-list pty-host" />
-      <ConsoleMessageList v-else :messages="activeMessages" :loading="activeSending" class="pane-list" />
+      <!--
+        真 PTY 面板（PTY 是流式全屏，没有"消息列表"概念，所以替代而非并列）。
+        2026-10-10 随上面那个 tab 一并隐藏：tab 撤了、activeTab 默认也是 'at'，
+        这行运行上已经不可达，但留着会让"藏干净了"这件事说不清 —— 一起注释掉，
+        恢复时和 tab 一起放开。
+      -->
+      <!-- <PtyPane v-if="activeTab === 'pty'" class="pane-list pty-host" /> -->
+      <ConsoleMessageList v-if="activeTab !== 'pty'" :messages="activeMessages" :loading="activeSending" class="pane-list" />
 
       <!-- ── 快捷命令 ── -->
       <div v-if="activeTab !== 'pty'" class="quick-cmds">
@@ -105,7 +116,11 @@ import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useWebSocketStore } from '@/stores/websocket';
 import ConsoleMessageList from './components/ConsoleMessageList.vue';
+// 2026-10-10 随「真 PTY」tab 一并隐藏（整套功能未完工，2026-10 再做）。
+// 用 `void` 占位而不是删掉 import：TS 严格模式会报 TS6133 未使用，但保留这一行
+// 能让"恢复只需删掉 void、启用 tab 与面板"成为一处改动，组件文件也不会被顺手删掉。
 import PtyPane from './components/PtyPane.vue';
+void PtyPane;
 import ConsoleInputBar from './components/ConsoleInputBar.vue';
 import { nextId, ensureSeqAbove, type ConsoleMessage } from './components/types';
 

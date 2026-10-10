@@ -71,10 +71,15 @@ internal val TOOLS_EXTRA = listOf(
     ToolEntry("内网穿透", Icons.Default.VpnLock, "FRP · CF Tunnel", Routes.DETAIL_TUNNEL),
     ToolEntry("定时任务", Icons.Default.Schedule, "脚本调度", Routes.DETAIL_TASKS),
     ToolEntry("应用管理", Icons.Default.Apps, "安装/卸载", Routes.DETAIL_APPS),
-    ToolEntry("高级控制台", Icons.Default.Terminal, "AT 指令 · Shell", Routes.DETAIL_TOOLS_ADVANCED),
+    ToolEntry("高级控制台", Icons.Default.Terminal, "AT 指令 · Shell", Routes.DETAIL_TOOLS_ADVANCED)
     // 真 PTY 终端（2026-10-10）：与上面「高级控制台」是两种东西 —— 那条是逐条命令 exec，
     // 这条是 ttyd 真 PTY 交互式 shell。app 此前完全没有这个入口（仅 web 端有）。
-    ToolEntry("真 PTY 终端", Icons.Default.Terminal, "交互式 shell", Routes.DETAIL_PTY_TERMINAL)
+    //
+    // 2026-10-10 暂时隐藏：整套真 PTY 功能尚未完工（app 端渲染方式待重做），
+    // 入口先撤下。注意上面「高级控制台」是**列表最后一项**，去掉这一项后它的行尾
+    // 逗号已一并去掉（Kotlin 尾随逗号虽合法，但这里保持列表末项无逗号的原风格）。
+    // 恢复只需把下面两行解除注释。
+    // ToolEntry("真 PTY 终端", Icons.Default.Terminal, "交互式 shell", Routes.DETAIL_PTY_TERMINAL),
 )
 
 /**

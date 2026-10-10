@@ -102,14 +102,19 @@
           :disabled="probeSwitchDisabled('goform_command_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('goform_command_enabled', v)"
         />
-        <ToggleRow
+        <!--
+          2026-10-10 暂时隐藏 ttyd 开关：整套真 PTY 功能尚未完工，先从设置里撤下。
+          **只藏 UI，配置 key `ttyd_enabled` 与 core 侧读写逻辑全部保留** ——
+          这样恢复时只需放开这一个 ToggleRow，不用重新对齐 core 的字段名。
+        -->
+        <!-- <ToggleRow
           label="真 PTY 终端（ttyd，默认关，改动立即生效）"
           :description="probeDescription('ttyd_enabled', PROBE_TTYD_DESC)"
           :model-value="generalForm.ttydEnabled"
           :loading="probeSaving.ttyd_enabled"
           :disabled="probeSwitchDisabled('ttyd_enabled')"
           @update:model-value="(v: boolean) => saveProbeSwitch('ttyd_enabled', v)"
-        />
+        /> -->
         <ToggleRow
           label="字段归一化（默认开，改完需重启后台服务）"
           :description="probeDescription('field_normalization_enabled', PROBE_FIELD_NORMALIZATION_DESC)"
@@ -480,9 +485,13 @@ const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
 const PROBE_DUMP_DESC =
   '控制 GET /api/device/goform（设备原始字段 dump，不走 profile 归一化也不脱敏），关着时该端点回 403。' +
   '改动立即生效，不需要点下方「保存」。';
+// 2026-10-10 随上面的 ttyd 开关 ToggleRow 一并隐藏（整套功能未完工，2026-10 再做）。
+// 同样用 `void` 占位而非删除：TS 严格模式报 TS6133，且保留它能让"恢复 = 放开 ToggleRow
+// 并删掉 void"成为一处改动，描述文案不必重新誊写（改文案的历史很容易丢）。
 const PROBE_TTYD_DESC =
   '打开后终端页出现「真 PTY」标签页：由设备上的 ttyd 提供 root 环境真实 shell（会话 30 分钟滑动过期）。' +
   '默认关闭：该功能授予浏览器侧完整的 shell 执行能力，仅在排障时开启。';
+void PROBE_TTYD_DESC;
 
 const PROBE_COMMAND_DESC =
   '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +

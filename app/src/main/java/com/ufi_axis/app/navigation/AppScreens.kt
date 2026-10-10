@@ -71,8 +71,11 @@ private fun rawAppScreens(
 
     Routes.DETAIL_SERVER_CONFIG to { _, nc -> ServerConfigScreen(viewModel, onServerConfigChanged, nc) },
     Routes.DETAIL_TOOLS_ADVANCED to { _, nc -> AdvancedConsoleScreen(viewModel, nc) },
+    // 2026-10-10 暂时隐藏：真 PTY 终端的路由注册也一并撤下。
+    // 只藏 UI 入口不够 —— 路由表留着的话，任何能触发导航的地方（深链、外部 Intent、
+    // 后续误加的入口）仍能直接把这页打开。恢复时解除下面一行注释即可。
     // 真 PTY 终端（app 端原生，2026-10-10）：ttyd 真 PTY 会话，与上面的逐条 exec 不同。
-    Routes.DETAIL_PTY_TERMINAL to { _, nc -> PtyTerminalScreen(viewModel, nc) },
+    // Routes.DETAIL_PTY_TERMINAL to { _, nc -> PtyTerminalScreen(viewModel, nc) },
     // 进阶工具页只是一页入口网格，不碰 viewModel
     Routes.DETAIL_TOOLS_EXTRA to { _, nc -> ToolsExtraScreen(nc) },
     Routes.DETAIL_SPEED_TEST to { _, nc -> SpeedTestScreen(viewModel, nc) },
