@@ -77,16 +77,12 @@
     <template #footer>
       <!-- GridCard.footer 默认 flex-end；这里包一个 wrapper 让左 select / 右 按钮空间分布 -->
       <div class="footer-row">
-        <div class="footer-conn">
-          <n-select
-            :value="connectionMode"
-            :options="connModeOptions"
-            size="small"
-            :loading="connModeSaving"
-            class="footer-mode-select"
-            @update:value="emit('update:connection-mode', $event)"
-          />
-        </div>
+        <!--
+          2026-10-10 用户裁决：删掉页脚那个连接模式下拉（自动拨号 / 手动拨号）。
+          **只删 UI**：props（connectionMode / connModeOptions / connModeSaving）与
+          `update:connection-mode` 事件、以及 composable 里的下发逻辑全部保留
+          —— 设备侧 `dial_mode` 配置不动（用户裁决 A）。
+        -->
         <div class="footer-actions">
           <n-popconfirm @positive-click="emit('airplane-on')">
             <template #trigger><n-button size="small">开启飞行模式</n-button></template>

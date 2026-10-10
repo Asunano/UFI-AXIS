@@ -246,7 +246,6 @@ object Routes {
     const val DETAIL_DOWNLOAD_ADVANCED = "detail/download-settings/advanced"
     const val DETAIL_DATA_MANAGEMENT = "detail/data-management"
     const val DETAIL_CELL_LOCK = "detail/cell-lock"
-    const val DETAIL_NETWORK_MODE = "detail/network-mode"
     const val DETAIL_BAND_LOCK = "detail/band-lock"
     const val DETAIL_CELLULAR_ADVANCED = "detail/cellular-advanced"
     const val DETAIL_NETWORK_FEATURES = "detail/network-features"
@@ -510,7 +509,6 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_DOWNLOAD_ADVANCED, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DATA_MANAGEMENT, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_CELL_LOCK, TransitionType.DETAIL),
-    AppRoute(Routes.DETAIL_NETWORK_MODE, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_BAND_LOCK, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_CELLULAR_ADVANCED, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_NETWORK_FEATURES, TransitionType.DETAIL),

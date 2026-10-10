@@ -24,7 +24,17 @@ import com.ufi_axis_core.contract.NetworkMode
  */
 internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
 
-/** 连接模式 & 网络制式设置弹窗 */
+/**
+ * 网络制式设置弹窗。
+ *
+ * 2026-10-10 用户裁决：① 由独立页面 `detail/network-mode` 收进蜂窝高级设置页，
+ * ② 删掉「连接模式 / 自动拨号·手动拨号」这一块 UI（**设备侧 `dial_mode` 配置不动**，
+ * 设备侧 `dial_mode` 配置与 core 字段映射一律不动，见文件末尾说明），③ 制式选择改用公共下拉 `UfiDropdown`。
+ *
+ * 为什么是下拉而不是原来那一列 Surface 卡片：那一列是 5 个整行选项卡片，
+ * 在弹窗里显得冗长；取值域就 5 项，下拉是这类「单选一组固定档位」的标准形态，
+ * 且全站只有 `UfiDropdown` 一种实现（见 WifiSettingsDialog 的同款用法）。
+ */
 @Composable
 fun NetworkModeDialog(
     viewModel: MainViewModel,
@@ -35,7 +45,6 @@ fun NetworkModeDialog(
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
     val palette = LocalResolvedPalette.current
 
-    val connModeJson = connModeOf(deviceSettingsState.settings)
     val netModeJson = netModeOf(deviceSettingsState.settings)
 
     // T15：档位键统一为 contract 别名（下发时由 core 的 NetworkMode.toBearer 换算成设备取值）。
@@ -48,141 +57,63 @@ fun NetworkModeDialog(
     val displayMode = pendingMode ?: currentMode
     val switching = pendingMode != null
 
-
     UfiCustomDialog(
         visible = visible,
         onDismiss = onDismiss,
-        title = "连接与网络模式",
+        title = "网络制式",
         icon = rememberVectorPainter(Icons.Filled.SignalCellularAlt),
         showCloseButton = false
     ) {
         UfiDialogBody {
-            // ── 当前状态概览 ──
-            Row(Modifier.fillMaxWidth()) {
-                UfiStatItem(
-                    value = if (connModeJson == "auto") "自动拨号" else "手动拨号",
-                    label = "连接模式",
-                    modifier = Modifier.weight(1f)
-                )
-                UfiStatItem(
-                    value = deviceSettingsState.settings?.networkModeLabel
-                        ?: NetworkMode.label(displayMode),
-                    label = if (switching) "网络制式（切换中）" else "网络制式",
-                    modifier = Modifier.weight(1f),
-                    valueColor = when (displayMode) {
-                        NetworkMode.ONLY_WCDMA, NetworkMode.ONLY_LTE -> palette.error
-                        NetworkMode.LTE_AND_5G -> palette.accentSecondary
-                        NetworkMode.ONLY_5G -> palette.accent
-                        else -> Color.Unspecified
-                    }
-                )
-            }
-
-            // ── 连接模式 ──
-            UfiDialogField("连接模式") {
-                // 2026-08-31：两个手绘 FilterChip → 公共 UfiOptionGrid（双栏，leading 槽位保留勾选图标）
-                val isAuto = connModeJson == "auto"
-                UfiOptionGrid(
-                    options = listOf(
-                        UfiOptionItem(
-                            value = "auto",
-                            label = "自动拨号",
-                            leading = {
-                                Icon(
-                                    if (isAuto) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp)
-                                )
-                            }
-                        ),
-                        UfiOptionItem(
-                            value = "manual",
-                            label = "手动拨号",
-                            leading = {
-                                Icon(
-                                    if (!isAuto) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp)
-                                )
-                            }
-                        )
-                    ),
-                    selectedValue = if (isAuto) "auto" else "manual",
-                    onSelect = { viewModel.network.setConnectionMode(it) },
-                    columns = 2
-                )
-            }
-
-            // ── 网络制式 ──
-            UfiDialogField("网络制式") {
-                Text(
-                    when {
-                        // 切换中：说清"设备在搜网"，让用户知道要等
-                        switching -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间"
-                        // 回读预算用尽仍未报出目标档位：明说，不静默停在旧值上
-                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看"
-                        else -> "切换后设备将重新搜网"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.modeSwitchTimedOut && !switching) palette.error else palette.textSecondary
-                )
-                Spacer(Modifier.height(8.dp))
-                Column(Modifier.fillMaxWidth()) {
-                    NetworkMode.UI_OPTIONS.forEach { key ->
-                        val label = NetworkMode.label(key)
-                        val isSelected = key == displayMode
-                        val chipColor = when {
-                            isSelected -> palette.accent
-                            key == NetworkMode.ONLY_WCDMA || key == NetworkMode.ONLY_LTE -> palette.error.copy(alpha = 0.7f)
-                            key == NetworkMode.ONLY_5G -> palette.accent.copy(alpha = 0.7f)
-                            else -> palette.textSecondary
-                        }
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 2.dp),
-                            shape = UfiCardDefaults.inputShape,
-                            color = if (isSelected) palette.accent.copy(alpha = 0.08f) else palette.cardBg,
-                            onClick = { viewModel.network.setNetworkMode(key) }
-                        ) {
-                            Row(
-                                Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp), tint = chipColor
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Text(
-                                    label,
-                                    style = UfiTextStyles.body.copy(
-                                        fontWeight = if (isSelected) UfiWeight.Strong else UfiWeight.Regular
-                                    ),
-                                    color = palette.textPrimary
-                                )
-                                Spacer(Modifier.weight(1f))
-                                if (isSelected) {
-                                    Surface(
-                                        color = palette.accent.copy(alpha = 0.15f),
-                                        shape = UfiCardDefaults.trackShape
-                                    ) {
-                                        Text(
-                                            if (switching) "切换中" else "当前",
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-                                            style = MaterialTheme.typography.labelSmall, color = palette.accent
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
+            // ── 当前制式（概览）：切换中/超时两种异常态都要讲清，别静默停在旧值上 ──
+            UfiStatItem(
+                value = deviceSettingsState.settings?.networkModeLabel
+                    ?: NetworkMode.label(displayMode),
+                label = when {
+                    switching -> "网络制式（切换中）"
+                    state.modeSwitchTimedOut -> "网络制式（尚未完成切换）"
+                    else -> "当前网络制式"
+                },
+                valueColor = when (displayMode) {
+                    NetworkMode.ONLY_WCDMA, NetworkMode.ONLY_LTE -> palette.error
+                    NetworkMode.LTE_AND_5G -> palette.accentSecondary
+                    NetworkMode.ONLY_5G -> palette.accent
+                    else -> Color.Unspecified
                 }
+            )
+
+            // ── 制式选择：公共下拉 ──
+            UfiDialogField("网络制式") {
+                UfiDropdown(
+                    selectedValue = displayMode,
+                    options = NetworkMode.UI_OPTIONS,
+                    onValueSelected = { key ->
+                        // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
+                        if (key != displayMode) viewModel.network.setNetworkMode(key)
+                    },
+                    optionLabel = { NetworkMode.label(it) }
+                )
             }
+
+            // 切换后设备要重新搜网，这句提示把「为什么没有立刻生效」讲在前面。
+            Text(
+                when {
+                    switching -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间"
+                    state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看"
+                    else -> "切换后设备将重新搜网"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = if (state.modeSwitchTimedOut && !switching) palette.error else palette.textSecondary
+            )
         }
     }
 }
 
-internal fun connModeOf(settings: DeviceSettingsResponse?): String =
-    if (settings?.manualConnection == true) "manual" else "auto"
+// 2026-10-10：原 `connModeOf`（读 manualConnection → auto/manual）随「连接模式」UI
+// 一起删除 —— 删掉最后一个调用者（NetworkModeScreen）后它成了死代码。
+// **设备侧拨号配置本身没动**：`DeviceSettingsResponse.manualConnection` 字段、
+// `NetworkModule.setConnectionMode()`、`POST /api/network/connection-mode` 与
+// DeviceResponsesTest 里的相关单测全部保留，恢复 UI 时把本函数按原样加回即可。
 
 /**
  * 读取设备当前档位。

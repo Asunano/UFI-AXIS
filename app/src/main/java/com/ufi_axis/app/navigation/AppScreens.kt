@@ -139,7 +139,6 @@ private fun rawAppScreens(
     Routes.DETAIL_DOWNLOAD_ADVANCED to { _, nc -> DownloadAdvancedSettingsScreen(viewModel, nc) },
     Routes.DETAIL_DATA_MANAGEMENT to { _, nc -> DataManagementScreen(viewModel, nc) },
     Routes.DETAIL_CELL_LOCK to { _, nc -> CellLockScreen(viewModel, nc) },
-    Routes.DETAIL_NETWORK_MODE to { _, nc -> NetworkModeScreen(viewModel, nc) },
     Routes.DETAIL_BAND_LOCK to { _, nc -> BandLockScreen(viewModel, nc) },
     Routes.DETAIL_CELLULAR_ADVANCED to { _, nc -> CellularAdvancedScreen(viewModel, nc) },
     Routes.DETAIL_NETWORK_FEATURES to { _, nc -> NetworkFeaturesScreen(viewModel, nc) },
