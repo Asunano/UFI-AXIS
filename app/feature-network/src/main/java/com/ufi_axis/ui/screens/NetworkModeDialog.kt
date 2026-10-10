@@ -81,84 +81,94 @@ fun NetworkModeDialog(
     val modeLabel = deviceSettingsState.settings?.networkModeLabel
         ?: NetworkMode.label(displayMode)
 
-    // ── 顶部左右布局：左「网络信息」四行，右「制式名 + 信号强度」──
-    Row(
-        Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+    UfiCustomDialog(
+        visible = visible,
+        onDismiss = onDismiss,
+        title = "网络制式",
+        icon = rememberVectorPainter(Icons.Filled.SignalCellularAlt),
+        showCloseButton = false
     ) {
-        // 左：PCI / 频点 / SINR / RSRQ
-        Column(
-            Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-        ) {
-            UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--")
-            UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--")
-            UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--")
-            UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--")
-        }
-        // 右：制式名（大字）+ 紧邻其下的信号强度评级
-        Column(
-            Modifier.weight(1f),
-            horizontalAlignment = Alignment.End,
-            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-        ) {
-            Text(
-                modeLabel,
-                style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
-                color = palette.textPrimary
-            )
-            // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
-            // 5G SA 下常为 null，所以**不用它判等级**，只当左侧那行读数展示 ——
-            // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是 --"的错配感。
-            val rsrp = state.signalInfo?.rsrp
-            Text(
-                text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = signalColor(rsrp)
-            )
-            if (switching || state.modeSwitchTimedOut) {
-                UfiBadge(
-                    text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
-                    type = UfiBadgeType.WARNING
+        UfiDialogBody {
+            // ── 顶部左右布局：左「网络信息」四行，右「制式名 + 信号强度」──
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+            ) {
+                // 左：PCI / 频点 / SINR / RSRQ
+                Column(
+                    Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                ) {
+                    UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--")
+                    UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--")
+                    UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--")
+                    UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--")
+                }
+                // 右：制式名（大字）+ 紧邻其下的信号强度评级
+                Column(
+                    Modifier.weight(1f),
+                    horizontalAlignment = Alignment.End,
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                ) {
+                    Text(
+                        modeLabel,
+                        style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
+                        color = palette.textPrimary
+                    )
+                    // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
+                    // 5G SA 下常为 null，所以**不用它判等级**，只当左侧那行读数展示 ——
+                    // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
+                    val rsrp = state.signalInfo?.rsrp
+                    Text(
+                        text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = signalColor(rsrp)
+                    )
+                    if (switching || state.modeSwitchTimedOut) {
+                        UfiBadge(
+                            text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
+                            type = UfiBadgeType.WARNING
+                        )
+                    }
+                }
+            }
+
+            // ── 切换制式：整行可点的选择器，不用「一行文字 + 一个按钮」──
+            //
+            // 初版是 `UfiDialogField("切换制式") { UfiDropdown(...) }`，那个组件是**同行**布局
+            //（`Row`：左 label 右控件），视觉上退化成"左边一个文字标签、右边一个控件"的
+            // 表单行，用户反馈「太丑」。改成**上下两块**：标题独立一行，下拉独占整行宽度 ——
+            // 控件有足够宽度显示完整制式名，也不再和标签挤在同一行。
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    "切换制式",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = palette.textSecondary
+                )
+                Spacer(Modifier.height(Spacing.Small))
+                UfiDropdown(
+                    selectedValue = displayMode,
+                    options = NetworkMode.UI_OPTIONS,
+                    onValueSelected = { key ->
+                        // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
+                        if (key != displayMode) viewModel.network.setNetworkMode(key)
+                    },
+                    optionLabel = { NetworkMode.label(it) }
                 )
             }
-        }
-    }
 
-    // ── 切换制式：整行可点的选择器，不用「一行文字 + 一个按钮」──
-    //
-    // 初版是 `UfiDialogField("切换制式") { UfiDropdown(...) }`，视觉上退化成"左边一个
-    // 文字标签、右边一个控件"的表单行，用户反馈「太丑」。改成**上下两行**：
-    // 标题独立一行，下面下拉独占整行宽度 —— 控件有足够宽度显示完整制式名，
-    // 也不再和标签挤在同一行。
-    Column(Modifier.fillMaxWidth()) {
-        Text(
-            "切换制式",
-            style = MaterialTheme.typography.labelLarge,
-            color = palette.textSecondary
-        )
-        Spacer(Modifier.height(Spacing.Small))
-        UfiDropdown(
-            selectedValue = displayMode,
-            options = NetworkMode.UI_OPTIONS,
-            onValueSelected = { key ->
-                // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
-                if (key != displayMode) viewModel.network.setNetworkMode(key)
-            },
-            optionLabel = { NetworkMode.label(it) }
-        )
-    }
-
-    // 异常态走 warning 语义（底色块），正常态走 note（弱化）。
-    if (switching || state.modeSwitchTimedOut) {
-        UfiDialogWarning(
-            when {
-                state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
-                else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
+            // 异常态走 warning 语义（底色块），正常态走 note（弱化）。
+            if (switching || state.modeSwitchTimedOut) {
+                UfiDialogWarning(
+                    when {
+                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
+                        else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
+                    }
+                )
+            } else {
+                UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
             }
-        )
-    } else {
-        UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
+        }
     }
 }
 
