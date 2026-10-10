@@ -27,23 +27,27 @@ internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
 /**
  * 网络制式设置弹窗。
  *
- * 2026-10-10 用户裁决：① 由独立页面 `detail/network-mode` 收进蜂窝高级设置页，
+ * 2026-10-10 用户裁决（三轮迭代）：
+ * ① 由独立页面 `detail/network-mode` 收进蜂窝高级设置页；
  * ② 删掉「连接模式 / 自动拨号·手动拨号」这一块 UI（**设备侧 `dial_mode` 配置不动**，
- * 见文件末尾说明），③ 制式选择改用公共下拉 `UfiDropdown`。
+ * 见文件末尾说明）；
+ * ③ 制式选择改用公共下拉 `UfiDropdown`；
+ * ④ 顶部**不要**浅色着色块：改成左「网络信息」右「制式名 + 信号强度」的左右布局。
  *
- * ## 布局为什么是三段式（2026-10-10 重做）
- * 初版把 `UfiStatItem`（当前制式）和 `UfiDropdown`（选择）上下直排，两个控件都是
- * 灰底小字，视觉权重一样、label 还都叫「网络制式」——用户既看不出"哪个是现在的状态、
- * 哪个是要改的操作"，也被两坨同色块挤在一起（真机反馈：太普通、都挤在一起）。
+ * ## 数据来源（④ 新增）
+ * PCI / 频点 / SINR / RSRQ 全部读 [NetworkState.signalInfo]（`GET /api/device/signal` 的
+ * `SignalInfo`），与基站信息页 / CellLockDialog 同一个数据源、同一批字段 ——
+ * core 已按「NR 优先、LTE 兜底」合并过（band_label / pci / arfcn / signal_strength），
+ * 所以**客户端不要按制式 if**，直接读统一字段。
  *
- * 改成三段，各有职责、彼此拉开：
- * 1. **英雄区**（Surface 卡片）：制式名用 `dialogTitle` 大字居中，下面挂状态徽章
- *    （5G / 5G·4G / 仅 4G 色相不同，异常态另有说法）。"现在是什么"一眼可见。
- * 2. **分区标题** `UfiDialogSectionTitle("切换制式")`：把操作区和状态区明确分开，
- *    顺带消除上面 label 的重复感。
- * 3. **下拉** `UfiDropdown`：唯一需要动手的地方，紧跟标题。
- * 异常态（切换中 / 尚未完成切换）走 `UfiDialogWarning`，颜色统一到 warning 语义，
- * 不再用 bodySmall 灰字 —— 那种灰字和下拉的灰底混在一起，正是"挤在一起"的另一半。
+ * 信号强度文案与颜色复用 `signalLevelText` / `signalColor`（`UfiSignalBars.kt`），
+ * 不在本页自建第二套分档 —— 那些函数注释里明确写了「与外部调用点同源，别分叉」。
+ *
+ * ## 刷新时机（用户裁决：开时拉一次，不轮询）
+ * `LaunchedEffect(visible)`：弹窗打开才`refreshNetwork(silent = true)`，关闭不轮询 ——
+ * 弹窗是短时查看场景，常驻轮询只会白耗电。
+ * 切换制式后**不需要**本弹窗再拉：`NetworkModule.awaitNetworkModeApplied` 尾部已经调了
+ * `refreshNetwork()`（全量，含 signalInfo），重新搜网后的信号值会自动跟上。
  */
 @Composable
 fun NetworkModeDialog(
@@ -54,6 +58,13 @@ fun NetworkModeDialog(
     val state by viewModel.networkState.collectAsState()
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
     val palette = LocalResolvedPalette.current
+
+    // 开弹窗拉一次信号数据；关闭时不轮询（见 KDoc「刷新时机」）。
+    // 用 refreshSignalOnly 而不是 refreshNetwork —— 后者会连带拉 WiFi 设置与客户端列表，
+    // 为看 4 个信号读数付 4 个请求不划算。
+    LaunchedEffect(visible) {
+        if (visible) viewModel.network.refreshSignalOnly()
+    }
 
     val netModeJson = netModeOf(deviceSettingsState.settings)
 
@@ -69,92 +80,85 @@ fun NetworkModeDialog(
 
     val modeLabel = deviceSettingsState.settings?.networkModeLabel
         ?: NetworkMode.label(displayMode)
-    // 制式色相：5G 全开=主色、混合=次色、锁 4G/WCDMA=警示色（与旧页面同一口径）。
-    val modeColor = when (displayMode) {
-        NetworkMode.ONLY_WCDMA, NetworkMode.ONLY_LTE -> palette.error
-        NetworkMode.LTE_AND_5G -> palette.accentSecondary
-        NetworkMode.ONLY_5G -> palette.accent
-        else -> palette.textPrimary
-    }
 
-    UfiCustomDialog(
-        visible = visible,
-        onDismiss = onDismiss,
-        title = "网络制式",
-        icon = rememberVectorPainter(Icons.Filled.SignalCellularAlt),
-        showCloseButton = false
+    // ── 顶部左右布局：左「网络信息」四行，右「制式名 + 信号强度」──
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
     ) {
-        UfiDialogBody {
-            // ── 1. 英雄区：当前制式（大字）+ 状态徽章 ──
-            Surface(
-                modifier = Modifier.fillMaxWidth(),
-                shape = UfiCardDefaults.largeShape,
-                color = modeColor.copy(alpha = 0.08f)
-            ) {
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 18.dp, horizontal = 16.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text(
-                        modeLabel,
-                        style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
-                        color = modeColor
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    UfiBadge(
-                        text = when {
-                            switching -> "切换中"
-                            state.modeSwitchTimedOut -> "尚未完成切换"
-                            else -> "当前生效"
-                        },
-                        type = when {
-                            switching -> UfiBadgeType.WARNING
-                            state.modeSwitchTimedOut -> UfiBadgeType.WARNING
-                            else -> UfiBadgeType.SUCCESS
-                        }
-                    )
-                }
-            }
-
-            // ── 2+3. 操作区：标题与下拉绑成一个组 ──
-            //
-            // 不用 UfiDialogSectionTitle：它自带 4dp 内距 + 一条分隔线，而 UfiDialogBody 的
-            // 块间距是 12dp —— 标题会离下拉 16dp、离英雄卡 12dp，两侧不等；而且一道横线
-            // 把已经是两段式（浅色块 + 控件）的界面再切一刀，显得更碎而不是更清楚。
-            // 这里自己排：标题紧贴下拉（4dp），与英雄卡之间仍是 Body 的 12dp。
-            Column {
-                Text(
-                    "切换制式",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Small))
-                UfiDropdown(
-                    selectedValue = displayMode,
-                    options = NetworkMode.UI_OPTIONS,
-                    onValueSelected = { key ->
-                        // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
-                        if (key != displayMode) viewModel.network.setNetworkMode(key)
-                    },
-                    optionLabel = { NetworkMode.label(it) }
-                )
-            }
-
-            // 异常态走 warning 语义（底色块），正常态的提示走 note（弱化）——
-            // 二者不再都是灰字，避免和下拉的灰底糊在一起。
+        // 左：PCI / 频点 / SINR / RSRQ
+        Column(
+            Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+        ) {
+            UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--")
+            UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--")
+            UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--")
+            UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--")
+        }
+        // 右：制式名（大字）+ 紧邻其下的信号强度评级
+        Column(
+            Modifier.weight(1f),
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+        ) {
+            Text(
+                modeLabel,
+                style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
+                color = palette.textPrimary
+            )
+            // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
+            // 5G SA 下常为 null，所以**不用它判等级**，只当左侧那行读数展示 ——
+            // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是 --"的错配感。
+            val rsrp = state.signalInfo?.rsrp
+            Text(
+                text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = signalColor(rsrp)
+            )
             if (switching || state.modeSwitchTimedOut) {
-                UfiDialogWarning(
-                    when {
-                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
-                        else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
-                    }
+                UfiBadge(
+                    text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
+                    type = UfiBadgeType.WARNING
                 )
-            } else {
-                UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
             }
         }
+    }
+
+    // ── 切换制式：整行可点的选择器，不用「一行文字 + 一个按钮」──
+    //
+    // 初版是 `UfiDialogField("切换制式") { UfiDropdown(...) }`，视觉上退化成"左边一个
+    // 文字标签、右边一个控件"的表单行，用户反馈「太丑」。改成**上下两行**：
+    // 标题独立一行，下面下拉独占整行宽度 —— 控件有足够宽度显示完整制式名，
+    // 也不再和标签挤在同一行。
+    Column(Modifier.fillMaxWidth()) {
+        Text(
+            "切换制式",
+            style = MaterialTheme.typography.labelLarge,
+            color = palette.textSecondary
+        )
+        Spacer(Modifier.height(Spacing.Small))
+        UfiDropdown(
+            selectedValue = displayMode,
+            options = NetworkMode.UI_OPTIONS,
+            onValueSelected = { key ->
+                // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
+                if (key != displayMode) viewModel.network.setNetworkMode(key)
+            },
+            optionLabel = { NetworkMode.label(it) }
+        )
+    }
+
+    // 异常态走 warning 语义（底色块），正常态走 note（弱化）。
+    if (switching || state.modeSwitchTimedOut) {
+        UfiDialogWarning(
+            when {
+                state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
+                else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
+            }
+        )
+    } else {
+        UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
     }
 }
 

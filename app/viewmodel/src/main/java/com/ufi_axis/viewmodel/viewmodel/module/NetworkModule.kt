@@ -2319,6 +2319,23 @@ class NetworkModule(
         }
     }
 
+    /**
+     * 只拉信号（`GET /api/device/signal`）并写入 [NetworkState.signalInfo]。
+     *
+     * 2026-10-10 为网络制式弹窗新增：弹窗顶部要显示 PCI / 频点 / SINR / RSRQ，
+     * 打开时拉一次即可。用 [refreshNetwork] 会连带请求 WiFi 设置与客户端列表 ——
+     * 为看 4 个信号读数付 4 个请求不划算，且这四项与 WiFi 无关。
+     *
+     * 失败**不写** [NetworkState.errorMessage]：信号读不到时弹窗显示 `--` 即可，
+     * 不该为一个辅助读数把整页的错误条点亮（真正的失败仍由 refreshNetwork 报）。
+     */
+    fun refreshSignalOnly() {
+        scope.launch {
+            runCatching { api.getSignalInfo() }
+                .onSuccess { sig -> _networkState.update { it.copy(signalInfo = sig) } }
+        }
+    }
+
     /** 轻量刷新：仅信号+网络状态+频段状态（网络模式/频段锁定变更时触发） */
     private fun refreshNetworkLight() {
         scope.launch {
