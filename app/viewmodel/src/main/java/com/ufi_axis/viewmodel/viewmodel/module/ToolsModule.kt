@@ -158,21 +158,44 @@ class ToolsModule(
     /**
      * 触发后端检查更新（后端自动拉取+安装；状态经 [pollDeviceUpdateStatus] 轮询）。
      *
-     * 后置持久化标记：后端更新**脱离前端独立执行**（core 进程内 `scope.launch`），
-     * 置 `coreUpdateInProgress=true` 让前端冷启动能接管进度显示（见 [CoreUpdatePersistence]）。
-     * 触发失败（连不上 / 后端没起来）说明后端根本没开始，清回 false，避免冷启动误以为在更。
+     * 后端更新**脱离前端独立执行**（core 进程内 `scope.launch`），所以
+     * `coreUpdateInProgress=true` 这个持久标记是前端冷启动接管进度、以及健康检查
+     * 在「core 断联」期间**豁免弹「无法连接到设备」**的唯一依据（见
+     * [MainViewModel.isCoreUpdateInterruptingBackend]）。
+     *
+     * ⚠️ 2026-10-10 修复（真机实锤：更新中弹全屏「无法连接到设备」+ 更新状态全程无数据）：
+     * 标记必须**先于**请求写，且**失败时不能清**。
+     *
+     * 1. 顺序：`POST /api/update/check` 的语义是「让 core 立刻开始下载+安装+重启」，
+     *    应答返回时 core 已经在下载了。旧实现把 `markCoreUpdating(true)` 放在 `onSuccess`
+     *    分支里 —— 一旦这次请求因 core 正在重启而失败（这是更新的**必然结果**，不是意外），
+     *    runCatching 走 onFailure，标记就永远没落地：core 确实在更（所以断联），
+     *    app 却不知道 → 健康检查照常弹全屏提示，且更新状态从头到尾没有数据。
+     * 2. 失败不清标记：「请求失败」≠「core 没开始」——core 完全可能已经拉起来了
+     *    （正是上面那种情况）。改成起轮询去读**真实**状态：读到 done/failed 会自己清；
+     *    真失败则走 [deviceUpdatePollFailures] 的 5 分钟失联阈值自己清。
+     *    早于请求先清过一次（旧行为）会让这个 bug 稳定复现。
+     *
+     * 对照：`pushApkAndInstall`（本地 APK 推送）那条路径本来就是「先写标记再上传」，
+     * 顺序正确 —— 这也是为什么只有 core 自更新这条路径出问题，正好佐证了上面的根因。
      */
     fun triggerDeviceUpdate() {
+        markCoreUpdating(true)
         scope.launch {
             runCatching { api.triggerDeviceUpdate() }
                 .onSuccess {
-                    markCoreUpdating(true)
                     _updateDeviceState.value = it
                     startDeviceUpdatePolling()
                 }
                 .onFailure { e ->
-                    markCoreUpdating(false)
-                    _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = "触发更新失败: ${e.message}")
+                    // 不清标记、不报终态失败：见 KDoc 第 2 条。先显示「已触发」过渡态，
+                    // 让 UI 不要停在旧状态，然后由轮询去读 core 的真实进度。
+                    _updateDeviceState.value = UpdateStatusResponse(
+                        state = "installing",
+                        message = "已触发更新，等待设备响应…"
+                    )
+                    startDeviceUpdatePolling()
+                    DebugLog.d("Update", "triggerDeviceUpdate request failed: ${e.message}")
                 }
         }
     }
