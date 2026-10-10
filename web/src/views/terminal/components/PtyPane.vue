@@ -120,6 +120,27 @@ function writeInit(cols: number, rows: number) {
   writeFrame(TTYD_JSON_DATA, JSON.stringify({ AuthToken: '', columns: cols, rows: rows }));
 }
 
+/**
+ * 把一条下行帧的载荷（OUTPUT 文本）写进终端。非 OUTPUT 命令码直接丢弃。
+ * 纯函数、不碰 ws —— ArrayBuffer 和 Blob 两条路径共用它。
+ */
+function decodeTtydFrame(data: string) {
+  if (!data.length) return;
+  const cmd = data.charCodeAt(0);
+  if (cmd !== 0x30 /* '0' OUTPUT */) return; // '1' TITLE / '2' PREFS：不消费
+  term?.write(data.slice(1));
+}
+
+/** 跨浏览器/跨帧类型的下行帧入口：string / ArrayBuffer / Blob 三种都要收。 */
+async function decodeFrame(raw: unknown) {
+  let data: string;
+  if (typeof raw === 'string') data = raw;
+  else if (raw instanceof ArrayBuffer) data = new TextDecoder('utf-8').decode(raw);
+  else if (typeof Blob !== 'undefined' && raw instanceof Blob) data = new TextDecoder('utf-8').decode(await raw.arrayBuffer());
+  else return; // 未知帧类型：丢弃，不让一条脏帧炸掉会话
+  decodeTtydFrame(data);
+}
+
 async function connect() {
   errorText.value = '';
   disconnect();
@@ -161,16 +182,15 @@ async function connect() {
   ws.onmessage = (ev) => {
     // ttyd 1.7.x 下行帧：第 1 个字符是命令码，其余是载荷。
     //  '0' OUTPUT           → 终端输出字节，写进 xterm
-    //  '1' SET_WINDOW_TITLE → 标题（设置标签页标题用，这里不处理）
-    //  '2' SET_PREFERENCES  → 偏好 JSON（同上，忽略）
+    //  '1' SET_WINDOW_TITLE → 标题（这里不处理）
+    //  '2' SET_PREFERENCES  → 偏好 JSON（忽略）
     //  注：老协议的 ["1", data] JSON 数组格式**不再存在**，别再加回来。
-    const data = typeof ev.data === 'string' ? ev.data : '';
-    if (!data.length) return;
-    const cmd = data.charCodeAt(0);
-    const payload = data.slice(1);
-    if (cmd === 0x30 /* '0' OUTPUT */) {
-      term?.write(payload);
-    }
+    //
+    // ⚠️ 2026-10-10 修（r33 真机实锤：WS 已连接、状态显示「已连接设备 shell」，
+    // 但终端零输出、按键无反应）：ttyd 用 `LWS_WRITE_BINARY` 发帧 —— 浏览器的
+    // ev.data 是 ArrayBuffer/Blob，**不是 string**。之前只认 string 分支，
+    // binary 帧被 `if (!data.length) return` 全部丢弃：连上了，却一个字都没有。
+    void decodeFrame(ev.data);
   };
   ws.onclose = (ev) => {
     connected.value = false;

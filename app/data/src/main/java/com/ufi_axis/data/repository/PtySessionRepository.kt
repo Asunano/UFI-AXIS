@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import okio.ByteString
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -109,6 +110,24 @@ class PtySessionRepository(
                 // 尺寸必须给 —— 缺了 shell 会按 0×0 起（提示符错位 / 无回显）。
                 // AuthToken 留空：鉴权已在 core 反代层完成，ttyd 只绑 127.0.0.1。
                 sendFrame("""{"AuthToken":"","columns":80,"rows":24}""")
+            }
+
+            /**
+             * ttyd 下行帧回调。
+             *
+             * ⚠️ 2026-10-10 修（r33 真机实锤：连接成功但终端全空白、零输出）：
+             * ttyd 用 `LWS_WRITE_BINARY` 发帧 —— OkHttp 走的是 **ByteString 重载**，
+             * 不会触发 `onMessage(ws, text: String)`。我们之前只实现了 String 版，
+             * 于是所有 OUTPUT 帧被 OkHttp 静默丢弃：状态显示「已连接」，但一个字都没有。
+             *
+             * 两个重载都实现：binary 走实际路径，text 版留作兼容（万一将来有代理把帧转成文本）。
+             * 字节要按 UTF-8 解码 —— ttyd 直接吐 pty 的原始字节，非法 UTF-8 序列用替换符兜底
+             * （不能抛异常，否则一条坏字节就中断整个会话）。
+             */
+            override fun onMessage(ws: WebSocket, bytes: ByteString) {
+                val output = parseOutputFrame(bytes.toByteArray().toString(Charsets.UTF_8)) ?: return
+                if (output.isEmpty()) return
+                appendOutput(output)
             }
 
             override fun onMessage(ws: WebSocket, text: String) {
