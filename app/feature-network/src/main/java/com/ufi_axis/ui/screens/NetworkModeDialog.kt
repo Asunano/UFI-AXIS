@@ -10,6 +10,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
@@ -32,8 +33,11 @@ internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
  * ① 由独立页面 `detail/network-mode` 收进蜂窝高级设置页；
  * ② 删掉「连接模式 / 自动拨号·手动拨号」这一块 UI（**设备侧 `dial_mode` 配置不动**，
  * 见文件末尾说明）；
- * ③ 制式选择改用公共下拉 `UfiDropdown`；
- * ④ 顶部**不要**浅色着色块：改成左「网络信息」右「制式名 + 信号强度」的左右布局。
+ * ③ 制式选择改用公共 chip（⑤ 之后见下）；
+ * ④ 顶部**不要**浅色着色块：改成左「制式名 + 信号强度」右「网络信息 2×2」的左右布局；
+ * ⑤ 左右互换 + 读数改 2×2 + 制式名放大 + 下拉改 chip + 加确认/取消（2026-10-10）；
+ * ⑥ chip 换成真正的 [CategoryChip]、制式名锁单行（2026-10-11，修「界面错乱、
+ *    没有固定布局、chip 调用错误」）。
  *
  * ## 数据来源（④ 新增）
  * PCI / 频点 / SINR / RSRQ 全部读 [NetworkState.signalInfo]（`GET /api/device/signal` 的
@@ -141,15 +145,22 @@ fun NetworkModeDialog(
                     Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(Spacing.Small)
                 ) {
-                    // 用 displaySmall 而不是 dialogTitle：制式名是这个弹窗的主角，
-                    // 而 dialogTitle(headlineSmall) 与右侧读数字号同档、撑不起"主角"的观感。
-                    // fillMaxWidth + 居中让长文案（如「5G/4G/3G」）也能占满左半并视觉居中，
-                    // 与右边 2×2 的上下宽度对齐。
+                    // 制式名是这个弹窗的主角，用 displaySmall（比 dialogTitle 大两档）。
+                    //
+                    // 2026-10-11「界面错乱、没有固定布局」的另一半根因：原来 maxLines = 2 让
+                    // 「5G/4G/3G」这类长文案折成两行 → 左栏高度随文案长度跳变，
+                    // 与右边**恒为两行**的 2×2 网格对不齐，两栏看起来一高一低。
+                    // 左边是一个"值"、右边是一个固定形状的网格，两者高度必须恒定才对得起来。
+                    //
+                    // 所以 maxLines = 1：代价是极端长文案会被 ellipsis 截断，
+                    // 换来的是**布局恒定** —— 对「当前状态展示区」而言恒定布局优先于完整文案。
+                    // 制式名本身很短（最长「5G/4G/3G」），实际极少触发截断。
                     Text(
-                        modeLabel,
+                        text = modeLabel,
                         style = MaterialTheme.typography.displaySmall.copy(fontWeight = UfiWeight.Strong),
                         color = palette.textPrimary,
-                        maxLines = 2,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.fillMaxWidth(),
                         textAlign = TextAlign.Center
                     )
@@ -188,28 +199,28 @@ fun NetworkModeDialog(
             // ── 切换制式：chip 单选 + 确认/取消 ──
             //
             // 2026-10-10 用户裁决：下拉改 chip 选择器，并加确认/取消按钮。
-            // 两处一起改是有因果的：下拉是"点开浮层选中即刻生效"，没有反悔余地；
-            // 而制式切换会让设备重新搜网、断流数秒。改成 chip 后 6 个档位平铺可见、
-            // 先选后确认，「取消」能真正丢弃选择。
+            // 两处一起改有因果：下拉是"点开浮层选中即刻生效"，没有反悔余地；
+            // 而制式切换会让设备重新搜网、断流数秒。改成先选、再按「确定」才下发，
+            // 「取消」能真正丢弃选择。
             //
-            // 用 [UfiSingleChipSelector]（chip 本体）而不是 [UfiDialogChipSelector]：
-            // 后者自带 `UfiDialogField` 的同行标签布局，而这里标签要独占一行。
-            Column(Modifier.fillMaxWidth()) {
-                Text(
-                    "切换制式",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(Spacing.Small))
-                UfiSingleChipSelector(
-                    options = NetworkMode.UI_OPTIONS.map { it to NetworkMode.label(it) },
-                    selectedValue = pendingSelection,
-                    onSelect = { pendingSelection = it },
-                    // 6 项超过一行：靠 wrap 折行，而不是让 chip 横向挤成一排看不清的字。
-                    wrap = true
-                )
+            // 2026-10-11 用 [CategoryChip] 而**不是** [UfiSingleChipSelector]：
+            // 后者名字里有 "Chip"，实际是**分段控件**——轨道底色 + [UfiSegment] + 滑块动画，
+            // 滑块位置/宽度由 `onSizeChanged` 量出的段宽算出（见 UfiChipSelector.kt:135-147）。
+            // 6 段在 FlowRow 里各自宽度不同 → 几何失效，滑块飞掉、整体看起来就是"错乱"。
+            // [CategoryChip] 是项目里真正的 chip（描边 + 淡底 + 选中态填色），不依赖几何。
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(Spacing.Small),
+                verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+            ) {
+                NetworkMode.UI_OPTIONS.forEach { mode ->
+                    CategoryChip(
+                        label = NetworkMode.label(mode),
+                        selected = mode == pendingSelection,
+                        onClick = { pendingSelection = mode }
+                    )
+                }
             }
-
             // 异常态走 warning 语义（底色块），正常态走 note（弱化）。
             if (switching || state.modeSwitchTimedOut) {
                 UfiDialogWarning(

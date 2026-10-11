@@ -1,5 +1,6 @@
 package com.ufi_axis.viewmodel.module
 
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -98,6 +99,45 @@ class DialogShellGuardTest {
         throw AssertionError(
             "定位不到源文件 '$relative'（起点：${File(".").absolutePath}）。" +
                 "若模块路径发生变化，请同步更新本测试中的相对路径。"
+        )
+    }
+
+    /**
+     * 2026-10-11：`NetworkModeDialog` 不得用 [UfiSingleChipSelector]。
+     *
+     * 它的名字里有 "Chip"，实际是**分段控件**：轨道底色 + `UfiSegment` + 滑块动画，
+     * 滑块几何由 `onSizeChanged` 量出的段宽算出（UfiChipSelector.kt:135-147）。
+     * 6 个制式档位在 FlowRow 里宽度各异 → 几何失效、滑块飞掉，表现就是「界面错乱」。
+     * 真正的 chip 是 `CategoryChip`（描边 + 淡底 + 选中填色），不依赖几何计算。
+     */
+    @Test
+    fun networkModeDialog_mustNotUseSegmentedControlAsChip() {
+        val code = executableCode(source("feature-network/src/main/java/com/ufi_axis/ui/screens/NetworkModeDialog.kt"))
+        assertFalse(
+            "网络制式档位必须用 CategoryChip 平铺，不能用分段控件 UfiSingleChipSelector",
+            code.contains("UfiSingleChipSelector")
+        )
+        assertTrue(
+            "应改用真正的 chip 组件 CategoryChip",
+            code.contains("CategoryChip(")
+        )
+    }
+
+    /**
+     * 2026-10-11：制式名必须 `maxLines = 1`，否则长文案折行会让左栏高度跳变，
+     * 与右边恒为两行的 2×2 网格对不齐 —— 用户报的「没有固定布局」。
+     */
+    @Test
+    fun networkModeDialog_modeLabel_mustStaySingleLine() {
+        val code = executableCode(source("feature-network/src/main/java/com/ufi_axis/ui/screens/NetworkModeDialog.kt"))
+        val modeText = code.substringAfter("text = modeLabel").take(400)
+        assertTrue(
+            "制式名必须锁单行（maxLines = 1），否则布局高度随文案长度跳变",
+            modeText.contains("maxLines = 1")
+        )
+        assertFalse(
+            "制式名不能允许折行（maxLines = 2）",
+            modeText.contains("maxLines = 2")
         )
     }
 
