@@ -141,7 +141,6 @@ private fun rawAppScreens(
     Routes.DETAIL_CELL_LOCK to { _, nc -> CellLockScreen(viewModel, nc) },
     Routes.DETAIL_BAND_LOCK to { _, nc -> BandLockScreen(viewModel, nc) },
     Routes.DETAIL_CELLULAR_ADVANCED to { _, nc -> CellularAdvancedScreen(viewModel, nc) },
-    Routes.DETAIL_NETWORK_FEATURES to { _, nc -> NetworkFeaturesScreen(viewModel, nc) },
     Routes.DETAIL_ONLINE_DEVICES to { _, nc -> OnlineDevicesScreen(viewModel, nc) },
     Routes.DETAIL_PAIRING to { _, nc -> PairingConfigScreen(viewModel, nc) },
     Routes.DETAIL_APPEARANCE to { _, nc -> AppearanceSettingsScreen(viewModel, nc) },

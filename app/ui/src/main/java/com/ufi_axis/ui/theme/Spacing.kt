@@ -147,7 +147,11 @@ object Spacing {
      * ⚠ 与 [SwitchTrackHeight] 无关，**不要互相借用**（本文件的「一个 token 只服务
      * 一个语义」原则：改开关轨道高度不该连带改分段控件）。
      */
-    val SegmentHeight = 32.dp
+    val SegmentHeight = 36.dp
+    // 2026-10-11：32 → 36dp（用户裁决「略微调大，不要过度」）。
+    // 改动理由与影响面：该 token 只服务分段/芯片选择器，全站 26 个调用点、15 个页面
+    // （监控、下载、流量、调试日志、外观设置…）。所以这是**全站可见**的一处改动，
+    // 不是只影响网络制式弹窗 —— 后续若某页觉得偏大，优先在调用处覆盖，别再回头动这个 token。
 
     // Navigation bar metrics (no longer used for bottom nav, kept for compatibility)
     val NavBarCornerRadius = 0.dp

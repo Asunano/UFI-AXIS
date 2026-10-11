@@ -37,7 +37,10 @@ internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
  * ④ 顶部**不要**浅色着色块：改成左「制式名 + 信号强度」右「网络信息 2×2」的左右布局；
  * ⑤ 左右互换 + 读数改 2×2 + 制式名放大 + 下拉改 chip + 加确认/取消（2026-10-10）；
  * ⑥ chip 换成真正的 [CategoryChip]、制式名锁单行（2026-10-11，修「界面错乱、
- *    没有固定布局、chip 调用错误」）。
+ *    没有固定布局、chip 调用错误」）；
+ * ⑦ 制式名放大到 displayMedium、信号评级改 [UfiBadge] 居中、2×2 改 [UfiInfoCell]
+ *    上下排（修「频点换行、没有间隔」）；
+ * ⑧ 整体间距加宽（用户「太挤了」）。
  *
  * ## 数据来源（④ 新增）
  * PCI / 频点 / SINR / RSRQ 全部读 [NetworkState.signalInfo]（`GET /api/device/signal` 的
@@ -129,6 +132,13 @@ fun NetworkModeDialog(
         }
     ) {
         UfiDialogBody {
+            // 2026-10-11 用户「间隔加宽、当前太挤」。
+            //
+            // [UfiDialogBody] 的块间距是全站统一的 Spacing.Large(12dp)，而它的 KDoc
+            // 明确写了「块与块之间一律 12dp，上下边距由 shell 负责」——那是公共节奏，
+            // 不该在单页私自改。所以这里在 Body 内**自己套一层 Column** 控制块间距，
+            // 而不是去改公共组件或给 Body 传参（Body 也没有间距参数）。
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.XLarge)) {
             // ── 顶部：左「制式名 + 信号强度」，右「网络信息 2×2」──
             //
             // 2026-10-10 用户裁决：左右互换（制式在左），四行读数改 2×2 网格，
@@ -145,7 +155,8 @@ fun NetworkModeDialog(
                     Modifier.weight(1f),
                     // 居中：制式名 / 信号徽章 / 状态徽章成一列，同一条中轴线。
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                    // 2026-10-11 用户「间隔加宽、当前太挤」：块内间距 Small(4) → Large(12)。
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Large)
                 ) {
                     // 制式名是这个弹窗的主角，用 displaySmall（比 dialogTitle 大两档）。
                     //
@@ -210,7 +221,8 @@ fun NetworkModeDialog(
                 // 换句话说：这不是新需求，是公共组件早就为这种网格准备好的形态。
                 Column(
                     Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                    // 行间 Medium(8) → Large(12)（同上，用户反馈太挤）
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Large)
                 ) {
                     // 行内横向留 Spacing.Medium：两格都是 weight(1f)，不给间距时
                     // 「频点」的长值会紧贴右边那格的标签（用户报的"没有间隔"）。
@@ -245,8 +257,9 @@ fun NetworkModeDialog(
             // [CategoryChip] 是项目里真正的 chip（描边 + 淡底 + 选中态填色），不依赖几何。
             FlowRow(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(Spacing.Small),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                // chip 之间 Small(4) → Medium(8)：6 个 chip 挤在一起分不清边界
+                horizontalArrangement = Arrangement.spacedBy(Spacing.Medium),
+                verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
             ) {
                 NetworkMode.UI_OPTIONS.forEach { mode ->
                     CategoryChip(
@@ -270,7 +283,7 @@ fun NetworkModeDialog(
             } else {
                 UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
             }
-
+            }
         }
     }
 }

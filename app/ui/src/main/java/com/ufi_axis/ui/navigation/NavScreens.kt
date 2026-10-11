@@ -248,7 +248,6 @@ object Routes {
     const val DETAIL_CELL_LOCK = "detail/cell-lock"
     const val DETAIL_BAND_LOCK = "detail/band-lock"
     const val DETAIL_CELLULAR_ADVANCED = "detail/cellular-advanced"
-    const val DETAIL_NETWORK_FEATURES = "detail/network-features"
     /** 在线设备列表（2026-08-30 从网络页尾的卡片拆出，避免长列表被底部胶囊导航栏遮挡）。 */
     const val DETAIL_ONLINE_DEVICES = "detail/online-devices"
     const val DETAIL_PAIRING = "detail/pairing"
@@ -511,7 +510,6 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_CELL_LOCK, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_BAND_LOCK, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_CELLULAR_ADVANCED, TransitionType.DETAIL),
-    AppRoute(Routes.DETAIL_NETWORK_FEATURES, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_ONLINE_DEVICES, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_PAIRING, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_APPEARANCE, TransitionType.DETAIL),

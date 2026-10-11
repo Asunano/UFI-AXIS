@@ -46,6 +46,20 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
     val capabilities by viewModel.network.capabilityState.collectAsState()
     val modeSupported = capabilities.supports(Capability.NETWORK_MODE)
 
+    // 2026-10-11：「网络功能」入口删除，FOTA / 文件共享(SAMBA) 两个开关并入本页
+    // （原 NetworkFeaturesScreen 只有这两个开关，为两个开关单开一个二级页不值当）。
+    // 能力门禁口径与原页一致：core 对 /api/device/fota 与 /api/device/samba 各有 route 门禁，
+    // 缺能力回 501，这里前置到 UI，开关在点之前就灰掉。
+    val fotaSupported = capabilities.supports(Capability.FOTA)
+    val sambaSupported = capabilities.supports(Capability.SAMBA)
+    // fotaAutoUpdateOn 为 null = 设备没报这个字段，此时按「未禁用」显示。
+    val fotaOff = deviceSettingsState.settings?.fotaAutoUpdateOn?.let { !it } ?: false
+    var sambaOn by remember { mutableStateOf(false) }
+    // SAMBA 的真值从 settings 回显；fotaOff 上面已从同一处算出。
+    LaunchedEffect(deviceSettingsState.settings) {
+        deviceSettingsState.settings?.let { sambaOn = it.sambaOn }
+    }
+
     // 进入时加载 deviceSettings（漫游开关 + 网络模式当前制式都依赖此数据）
     LaunchedEffect(Unit) { viewModel.network.loadDeviceSettings() }
 
@@ -106,60 +120,89 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
                     // 独立页原本只有两块内容（英雄卡 + 连接模式磁贴）却占掉整屏，浪费；
                     // 而「变更网络制式」本来就是弹窗交互，跳页只是多一次无意义的层级跳转。
                     // 下拉用公共 [UfiDropdown]（全站唯一实现，见 WifiSettingsDialog 的同款用法）。
-                    NavRowItem(
+                    UfiSettingsItem(
                         icon = Icons.Default.SettingsInputAntenna,
                         title = "网络模式",
                         enabled = modeSupported,
-                        subtitle = "当前 ${networkModeCurrentLabel}",
-                        onClick = { showNetworkModeDialog = true },
-                        palette = palette
+                        description = "当前 ${networkModeCurrentLabel}",
+                        onClick = { showNetworkModeDialog = true }
                     )
 
                     HorizontalDivider(color = palette.divider.copy(alpha = 0.3f))
 
                     // 频段锁定
-                    NavRowItem(
+                    UfiSettingsItem(
                         icon = Icons.Default.Tune,
                         title = "频段锁定",
-                        subtitle = "锁定指定 LTE / NR 频段",
-                        onClick = { navController.navigate("detail/band-lock") },
-                        palette = palette
+                        description = "锁定指定 LTE / NR 频段",
+                        onClick = { navController.navigate("detail/band-lock") }
                     )
 
                     HorizontalDivider(color = palette.divider.copy(alpha = 0.3f))
 
                     // 基站信息
-                    NavRowItem(
+                    UfiSettingsItem(
                         icon = Icons.Default.GpsFixed,
                         title = "基站信息",
-                        subtitle = "查看/锁定邻区基站",
-                        onClick = { navController.navigate("detail/cell-lock") },
-                        palette = palette
+                        description = "查看/锁定邻区基站",
+                        onClick = { navController.navigate("detail/cell-lock") }
                     )
                 }
             }
 
-            // ═══ DHCP 设置 / 网络功能（合一卡片） ═══
-            Box(Modifier.ufiStandardCard().padding(16.dp)) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    NavRowItem(
-                        icon = Icons.Default.Link,
-                        title = "DHCP 设置",
-                        subtitle = "局域网地址分配与租约配置",
-                        onClick = { showDhcpDialog = true },
-                        palette = palette
-                    )
+            // ═══ DHCP 设置 ═══
+            //
+            // 2026-10-11：改用公共 [UfiSettingsRowCard] + [UfiSettingsItem]。
+            // 原先这里是 `Box(ufiStandardCard().padding(16.dp))` 手搓卡壳 + 私有
+            // `NavRowItem` 手搓行，两者都是绕过公共组件的私有实现：
+            //   - NavRowItem 的 padding(vertical = 8.dp) / width(12.dp) / size(24.dp)
+            //     全是硬编码 dp，绕开了主题 token，全站其他设置行都不是这个内边距；
+            //   - UfiSettingsRowCard 的 KDoc 明确写了「别再各自手搓
+            //     Box(ufiStandardCard(...).clip(...).background(...))」。
+            // [UfiSettingsItem] 已覆盖 icon/title/description/onClick/trailing/enabled，
+            // 且它 2026-09-08 就修过「enabled=false 时必须吞掉点击」的假开关问题。
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    icon = Icons.Default.Link,
+                    title = "DHCP 设置",
+                    description = "局域网地址分配与租约配置",
+                    onClick = { showDhcpDialog = true }
+                )
+            }
 
-                    HorizontalDivider(color = palette.divider.copy(alpha = 0.3f))
-
-                    NavRowItem(
-                        icon = Icons.Default.Extension,
-                        title = "网络功能",
-                        subtitle = "FOTA · USB 共享 · SAMBA",
-                        onClick = { navController.navigate("detail/network-features") },
-                        palette = palette
-                    )
-                }
+            // ═══ FOTA / 文件共享（原「网络功能」二级页的两个开关，并入本页） ═══
+            //
+            // 2026-10-11：删除「网络功能」入口与 detail/network-features 路由。
+            // 原 NetworkFeaturesScreen 只有这两个开关，为两个开关单开一个二级页不值当；
+            // 能力门禁与回显口径完全沿用原页（见文件头部状态声明处的说明）。
+            UfiSettingsRowCard {
+                // FOTA：置灰时保留原说明、原因另起一行 —— 开关的 checked 仍是设备真值
+                // （不支持 ≠ 关着，本仓禁止假开关）。
+                UfiSettingsToggle(
+                    icon = Icons.Default.SystemUpdate,
+                    title = "禁用 FOTA",
+                    description = if (fotaSupported) {
+                        "阻止运营商推送更新"
+                    } else {
+                        "阻止运营商推送更新\n" + deviceUnsupportedNote("运营商自动升级（FOTA）")
+                    },
+                    checked = fotaOff,
+                    onCheckedChange = { viewModel.network.setFotaDisabled(it) },
+                    enabled = fotaSupported
+                )
+                UfiDivider()
+                UfiSettingsToggle(
+                    icon = Icons.Default.FolderShared,
+                    title = "文件共享 (SAMBA)",
+                    description = if (sambaSupported) {
+                        "SMB 局域网文件共享"
+                    } else {
+                        "SMB 局域网文件共享\n" + deviceUnsupportedNote("文件共享（SAMBA）")
+                    },
+                    checked = sambaOn,
+                    onCheckedChange = { sambaOn = it; viewModel.network.setSambaSetting(it) },
+                    enabled = sambaSupported
+                )
             }
 
             Spacer(Modifier.height(32.dp))
@@ -176,42 +219,6 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
             viewModel = viewModel,
             visible = showNetworkModeDialog,
             onDismiss = { showNetworkModeDialog = false }
-        )
-    }
-}
-
-/** 导航行项（图标 + 标题 + 副标题 + 箭头）— 蜂窝高级设置内复用 */
-@Composable
-private fun NavRowItem(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    title: String,
-    subtitle: String,
-    onClick: () -> Unit,
-    palette: com.ufi_axis.ui.theme.ResolvedPalette,
-    // 2026-10-10：网络模式行需要能力门禁（设备不支持 NETWORK_MODE 时点不开），
-    // 其余调用点都是纯导航、不需要 —— 默认 true 让它们一行不改。
-    enabled: Boolean = true,
-) {
-    val contentColor = if (enabled) palette.textPrimary else palette.textSecondary
-    Row(
-        Modifier
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            icon, null, Modifier.size(24.dp),
-            tint = if (enabled) palette.accent else palette.textSecondary
-        )
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(title, style = MaterialTheme.typography.bodyLarge, color = contentColor)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall,
-                color = palette.textSecondary.copy(alpha = if (enabled) 0.7f else 0.4f))
-        }
-        Icon(
-            Icons.AutoMirrored.Filled.KeyboardArrowRight, null,
-            tint = if (enabled) palette.textSecondary else palette.textSecondary.copy(alpha = 0.4f)
         )
     }
 }
