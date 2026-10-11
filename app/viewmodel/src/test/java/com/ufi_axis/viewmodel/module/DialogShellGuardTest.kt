@@ -1,5 +1,6 @@
 package com.ufi_axis.viewmodel.module
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -186,17 +187,36 @@ class DialogShellGuardTest {
     }
 
     /**
-     * 2026-10-11：四个二级入口必须用 [UfiEntryCard]，且各自独立成卡（不共用一张卡壳）。
+     * 2026-10-11：四个二级入口必须与**网络设置页**同形态：各自独立一张
+     * [UfiSettingsRowCard] + [UfiSettingsItem] + [UfiSettingsChevron]，不共用一张卡壳。
      *
-     * `UfiEntryCard` 是**导航入口**（自带右箭头 + Surface 卡壳），
-     * `UfiSettingsItem` 是**设置行**（无右箭头、可带开关）。语义不同、卡片形态也应不同。
+     * 曾一度误改成 `UfiEntryCard` —— 它是**列表入口卡**（Surface 卡壳 + 自带右箭头 +
+     * 徽标，隧道/通道列表用），而全站设置类页面的入口行口径是 UfiSettingsItem +
+     * UfiSettingsChevron（见 NetworkScreen）。同一类东西必须同一个组件。
      */
     @Test
     fun cellularAdvancedScreen_entries_mustUseEntryCard() {
         val code = executableCode(
             source("feature-network/src/main/java/com/ufi_axis/ui/screens/CellularAdvancedScreen.kt")
         )
-        assertTrue("二级入口应用 UfiEntryCard", code.contains("UfiEntryCard("))
+        // 2026-10-11 修正：入口行的正确形态是 UfiSettingsRowCard + UfiSettingsItem +
+        // UfiSettingsChevron，与 NetworkScreen 的「蜂窝网络高级设置 / 网速测试 / 在线设备」
+        // 三行完全一致。上一轮我断言 UfiEntryCard 是错的 —— 那套是隧道/通道列表用的
+        // Surface 卡壳 + 自带箭头，和全站设置类页面的入口行不是同一个东西。
+        assertFalse(
+            "入口行不该用 UfiEntryCard（那是隧道/通道列表的 Surface 卡壳）；" +
+                "应与 NetworkScreen 一致：UfiSettingsItem + UfiSettingsChevron",
+            code.contains("UfiEntryCard(")
+        )
+        // 必须**四个入口都**带 Chevron：上一轮只断言 contains()，结果注入删掉一行的
+        // 场景仍然通过（还剩三行），护栏等于没生效。这里改成数量断言。
+        val chevrons = Regex("UfiSettingsChevron\\(\\)").findAll(code).count()
+        assertEquals(
+            "四个二级入口都应带 UfiSettingsChevron（实际 $chevrons 处）",
+            4, chevrons
+        )
+        val entryRows = Regex("UfiSettingsItem\\(").findAll(code).count()
+        assertTrue("应至少 4 个 UfiSettingsItem 入口行（实际 $entryRows）", entryRows >= 4)
         // 手搓卡壳（曾用于把四个入口挤在一张卡里）不应再出现
         assertFalse(
             "四个入口已各自独立成卡，不该再手搓合一卡壳 Box(ufiStandardCard()...)",

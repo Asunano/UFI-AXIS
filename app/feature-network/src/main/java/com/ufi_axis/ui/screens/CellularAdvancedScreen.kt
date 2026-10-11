@@ -102,6 +102,7 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
             Modifier
                 .padding(padding)
                 .fillMaxWidth(),
+            // 卡间距与网络设置页一致（10dp / Spacing.SettingsCardGap）
             verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
         ) {
             Spacer(Modifier.height(8.dp))
@@ -129,48 +130,59 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
                 UfiNoticeCard(message = deviceUnsupportedNote("切换网络制式"))
             }
 
-            // ═══ 四个二级入口：各自独立一张 [UfiEntryCard]（2026-10-11） ═══
+            // ═══ 四个二级入口：各自独立一张卡（2026-10-11） ═══
             //
-            // 用户裁决：改成 UfiEntryCard，且**不要分组**（原来四行挤在一张
-            // `Box(ufiStandardCard().padding(16.dp))` 里，用 HorizontalDivider 分隔）。
-            // 独立成卡后与「数据漫游 / FOTA / SAMBA」这些开关卡形态统一 ——
-            // 开关是"改一个值"、入口是"进下一层"，两种语义本就该有两种卡片形态。
+            // 形态与**网络设置页完全一致**（用户裁决「参考网络设置界面」）：
+            // `UfiSettingsRowCard` + `UfiSettingsItem` + `trailing = { UfiSettingsChevron() }`，
+            // 卡间距 10dp。
             //
-            // 为什么是 [UfiEntryCard] 而不是 [UfiSettingsItem]：
-            // 后者是**设置行**（可带开关、无右箭头），本组件是**导航入口**
-            // （自带右箭头 + 状态徽标 + Surface 卡壳）。本组件 KDoc 写明用途就是
-            // 「点进去还有下一层」的列表项。
+            // 2026-10-11 修正：上一轮我改成了 [UfiEntryCard]，方向错了。
+            // [UfiEntryCard] 是 Surface 卡壳 + 自带右箭头 + 徽标那套（隧道/通道列表用），
+            // 而全站设置类页面的入口行口径是 [UfiSettingsItem] + [UfiSettingsChevron] ——
+            // 见 NetworkScreen 的「蜂窝网络高级设置」「网速测试」「在线设备」三行。
+            // 同一类东西在 App 里必须是同一个组件，否则用户一眼就看出"这张不对"。
+            // 入口行仍各自独立成卡、不分组（上一轮的这条裁决保留）。
             //
-            // 能力门禁：`UfiEntryCard` **没有 enabled 参数**（签名已 F24 冻结），
-            // 所以设备不支持 NETWORK_MODE 时不能靠它置灰 —— 改为不渲染那一行，
-            // 由下面的 [UfiNoticeCard] 说明原因。避免"看起来能点、点了没反应"，
-            // 也避免为绕开冻结签名去改公共组件。
-            if (modeSupported) {
-                UfiEntryCard(
+            // 能力门禁：`UfiSettingsItem` **有 enabled 参数**（且 2026-09-08 修过
+            // 「enabled=false 必须吞掉点击」的假开关问题），所以设备不支持 NETWORK_MODE 时
+            // 照旧置灰那一行 + 上面 [UfiNoticeCard] 说明原因，不必再"整行不渲染"。
+            UfiSettingsRowCard {
+                UfiSettingsItem(
                     icon = Icons.Default.SettingsInputAntenna,
                     title = "网络模式",
-                    subtitle = "当前 ${networkModeCurrentLabel}",
-                    onClick = { showNetworkModeDialog = true }
+                    description = "当前 ${networkModeCurrentLabel}",
+                    onClick = { showNetworkModeDialog = true },
+                    enabled = modeSupported,
+                    trailing = { UfiSettingsChevron() }
                 )
             }
-            UfiEntryCard(
-                icon = Icons.Default.Tune,
-                title = "频段锁定",
-                subtitle = "锁定指定 LTE / NR 频段",
-                onClick = { navController.navigate("detail/band-lock") }
-            )
-            UfiEntryCard(
-                icon = Icons.Default.GpsFixed,
-                title = "基站信息",
-                subtitle = "查看/锁定邻区基站",
-                onClick = { navController.navigate("detail/cell-lock") }
-            )
-            UfiEntryCard(
-                icon = Icons.Default.Link,
-                title = "DHCP 设置",
-                subtitle = "局域网地址分配与租约配置",
-                onClick = { showDhcpDialog = true }
-            )
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    icon = Icons.Default.Tune,
+                    title = "频段锁定",
+                    description = "锁定指定 LTE / NR 频段",
+                    onClick = { navController.navigate("detail/band-lock") },
+                    trailing = { UfiSettingsChevron() }
+                )
+            }
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    icon = Icons.Default.GpsFixed,
+                    title = "基站信息",
+                    description = "查看/锁定邻区基站",
+                    onClick = { navController.navigate("detail/cell-lock") },
+                    trailing = { UfiSettingsChevron() }
+                )
+            }
+            UfiSettingsRowCard {
+                UfiSettingsItem(
+                    icon = Icons.Default.Link,
+                    title = "DHCP 设置",
+                    description = "局域网地址分配与租约配置",
+                    onClick = { showDhcpDialog = true },
+                    trailing = { UfiSettingsChevron() }
+                )
+            }
 
             // ═══ FOTA / 文件共享（原「网络功能」二级页的两个开关，并入本页） ═══
             //

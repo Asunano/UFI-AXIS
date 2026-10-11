@@ -123,16 +123,16 @@ object FormatUtils {
         return String.format("%.2f V", v)
     }
 
-    fun getSignalLevel(rsrp: Int?): String {
-        if (rsrp == null) return "未知"
-        return when {
-            rsrp >= -80 -> "极好"
-            rsrp >= -90 -> "好"
-            rsrp >= -100 -> "一般"
-            rsrp >= -115 -> "差"
-            else -> "极差"
-        }
-    }
+    // 2026-10-11 删除 `getSignalLevel(rsrp)`。
+    //
+    // 它与 app/ui 的 `signalLevelText(rsrp)` 是**同一套 5 档分档的两份实现**，
+    // 而且文案不一致（本函数"极好/好/一般/差/极差" vs signalLevelText 同档同义）。
+    // 查全仓调用点：本函数**零调用** —— 属于死代码。
+    //
+    // 留着比删掉更危险：谁哪天看到 FormatUtils 里有"信号等级"就会直接用，
+    // 于是同一个 RSRP 在不同页面显示不同措辞，而且分档阈值将来只改一处就悄悄分叉。
+    // 信号分档的唯一真源是 app/ui/UfiSignalBars.kt 的 signalLevelText / signalBars /
+    // signalColor（三者同源，改动请一并改）。
 
     fun getSignalBars(rsrp: Int?): Int {
         if (rsrp == null) return 0

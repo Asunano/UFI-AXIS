@@ -32,12 +32,20 @@ fun signalBars(rsrp: Int?): Int = when {
     else -> 1
 }
 
+// 2026-10-11 用户裁决：措辞改正式（"极好/好/一般/差/极差" → "优秀/良好/一般/较差/极差"）。
+//
+// 为什么改：原措辞是口语化的主观评价，而同组的 signalColor 用的是
+// Excellent / Good / Fair / Poor / Dead 这套**英文域名**——中文档位与英文域名对不上
+// （"极好" 对 Excellent、"好" 对 Good，但 "一般" 对 Fair、"差" 对 Poor）。
+// 改后与英文域名一一对应，同一套数据在中英文语境下读起来是同一件事。
+//
+// 唯一外部调用点：网络制式弹窗的信号徽章（NetworkModeDialog.kt）。
 fun signalLevelText(rsrp: Int?): String = when {
     rsrp == null -> "未知"
-    rsrp >= -80 -> "极好"
-    rsrp >= -90 -> "好"
+    rsrp >= -80 -> "优秀"
+    rsrp >= -90 -> "良好"
     rsrp >= -100 -> "一般"
-    rsrp >= -115 -> "差"
+    rsrp >= -115 -> "较差"
     else -> "极差"
 }
 
