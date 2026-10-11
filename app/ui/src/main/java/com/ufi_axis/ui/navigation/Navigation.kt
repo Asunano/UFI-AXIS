@@ -138,10 +138,41 @@ fun ufiSharedAxisDurationMs(durationMillis: Int): Int =
 private fun <T> sharedAxisSpec(durationMillis: Int) =
     tween<T>(ufiSharedAxisDurationMs(durationMillis), easing = UfiMotion.Easing.Standard)
 
+/**
+ * 位移起点的**下限保护**。
+ *
+ * ## 现象（用户实测，2026-10-11）
+ * 概率性出现「二级页从右下角长出来」，后续再进就正常。复现路径：进应用管理页、
+ * **骨架屏还在加载时**退出并立刻进别的二级页。
+ *
+ * ## 判断
+ * `slideInHorizontally` 的起点由 `{ it }` 给出，`it` 是**目标页在那一帧被测量的宽度**。
+ * 正常路径下这一帧测量已完成，`it` = 屏宽，整页自右缘滑入。而"转场中途打断"时
+ * navigation-compose 要在同一帧内处理「当前页退出 + 上一页进入」，新目标页的测量与
+ * 转场起点同时发生；当那一帧测量尚未落定（`it` 极小或0），位移起点就从"右缘一个点"
+ * 变成近零 —— 观感正是**从右下角长出来**。
+ *
+ * 这与本文件 546/637 行记的病史同源：**slide 起点依赖当帧测量**。那次是从
+ * `graphicsLayer{RoundedCornerShape}` 那侧绕过去的，这次是测量竞态那侧。
+ *
+ * ## 为什么加下限而不是改成固定屏宽
+ * `{ it }` 的语义是"按自身宽度位移"，全站二级页一致，**正常帧它是对的**。
+ * 直接换成屏宽会失去自适应（若将来有宽度不同的目的地就会错位）。
+ * 所以只在**明显异常**（宽度不足全屏一半）时兜底，正常路径一个字节都不变。
+ *
+ * ⚠ 本修正**未经真机验证**（用户反馈 logcat 不便，改到下一批次加日志实测）。
+ * 判定依据是上述测量竞态推断。留此注记，便于后续拿到实测数据后回来核对：
+ * 若实测发现正常帧的 `it` 本就小于阈值，说明该推断有误，应撤掉本保护。
+ */
+private fun slideStartOffsetGuarded(width: Int, fallbackWidth: Int): Int =
+    if (width <= 0 || width * 2 < fallbackWidth) fallbackWidth else width
+
 /** 前进：新页从右缘整屏滑入。上层，不做 scale。 */
-fun detailSharedAxisEnter(durationMillis: Int): EnterTransition {
+fun detailSharedAxisEnter(durationMillis: Int, fallbackWidth: Int): EnterTransition {
     if (durationMillis <= 0) return EnterTransition.None
-    return slideInHorizontally(animationSpec = sharedAxisSpec(durationMillis)) { it }
+    return slideInHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
+        slideStartOffsetGuarded(it, fallbackWidth)
+    }
 }
 
 /**
@@ -152,6 +183,7 @@ fun detailSharedAxisEnter(durationMillis: Int): EnterTransition {
 fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detailSharedAxisExit(
     durationMillis: Int,
     role: UfiNavRecedeRole,
+    fallbackWidth: Int,
 ): ExitTransition {
     role.recedingEntryId = initialState.id
     // 普通二级页当下层：只压暗，不模糊。这一行是**复位**而不是冗余 —— 角色对象跨转场复用，
@@ -159,7 +191,7 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detail
     role.recedingBlur = false
     if (durationMillis <= 0) return ExitTransition.None
     return slideOutHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
-        -it / SHARED_AXIS_X_PARALLAX
+        -slideStartOffsetGuarded(it, fallbackWidth) / SHARED_AXIS_X_PARALLAX
     }
 }
 
@@ -171,20 +203,23 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detail
 fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detailSharedAxisPopEnter(
     durationMillis: Int,
     role: UfiNavRecedeRole,
+    fallbackWidth: Int,
 ): EnterTransition {
     role.recedingEntryId = targetState.id
     // 与 [detailSharedAxisExit] 同理：普通二级页的下层不模糊，且必须显式复位。
     role.recedingBlur = false
     if (durationMillis <= 0) return EnterTransition.None
     return slideInHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
-        -it / SHARED_AXIS_X_PARALLAX
+        -slideStartOffsetGuarded(it, fallbackWidth) / SHARED_AXIS_X_PARALLAX
     }
 }
 
 /** 返回：上层 detail 整屏右滑退出。不做 scale、不压暗。 */
-fun detailSharedAxisPopExit(durationMillis: Int): ExitTransition {
+fun detailSharedAxisPopExit(durationMillis: Int, fallbackWidth: Int): ExitTransition {
     if (durationMillis <= 0) return ExitTransition.None
-    return slideOutHorizontally(animationSpec = sharedAxisSpec(durationMillis)) { it }
+    return slideOutHorizontally(animationSpec = sharedAxisSpec(durationMillis)) {
+        slideStartOffsetGuarded(it, fallbackWidth)
+    }
 }
 
 

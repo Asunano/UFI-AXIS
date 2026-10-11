@@ -47,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -56,6 +57,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.NavHostController
+import kotlin.math.roundToInt
 import com.ufi_axis.ui.animation.blurEntrance
 import com.ufi_axis.ui.animation.page.UfiPage
 import com.ufi_axis.ui.animation.page.UfiPageSwitcher
@@ -274,6 +276,19 @@ fun MainNavGraph(
     val systemReduceMotion = LocalUfiReduceMotion.current
     val navTransitionMs = ufiNavTransitionDurationMs(transitionDurationMs, systemReduceMotion)
 
+    // 转场位移起点的兜底宽度（px）。
+    //
+    // 2026-10-11：二级页「从右下角长出来」的概率性缺陷兜底 ——
+    // `slideInHorizontally { it }` 的 `it` 是目标页在**那一帧**测量的宽度，
+    // 转场被中途打断（新目标页测量与转场起点同帧发生）时它可能尚未落定，
+    // 起点就退化成"右缘一个点"。详见 [slideStartOffsetGuarded] 的 KDoc。
+    //
+    // 用 LocalConfiguration 而不是 LocalDensity：这里要的是**整屏宽度**，
+    // 不是某个 dp 值换算出来的像素。旋转屏幕时该值会变，故用 remember 之外直接读。
+    val fallbackSlideWidthPx = with(LocalDensity.current) {
+        LocalConfiguration.current.screenWidthDp.dp.toPx()
+    }.roundToInt()
+
     // Shared Axis 深度图层的「谁是下层」角色持有者。push/pop 在 exit / popEnter
     // 里登记 entry id；图层侧用 `() -> Boolean` 比对，零重组。详见 UfiNavRecedeRole。
     val recedeRole = remember { UfiNavRecedeRole() }
@@ -436,19 +451,19 @@ fun MainNavGraph(
             NavHost(
                 navController = navController,
                 startDestination = Routes.MAIN,
-                enterTransition = { detailSharedAxisEnter(navTransitionMs) },
-                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
-                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
-                popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
+                enterTransition = { detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx) },
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
             ) {
             // ── Tab 宿主目的地：5 个 Tab 作为 UfiPageSwitcher 的 5 页
             composable(
                 route = Routes.MAIN,
                 // 宿主与二级页同一套 Shared Axis，进/回二级页时两侧同步。
-                enterTransition = { detailSharedAxisEnter(navTransitionMs) },
-                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole) },
-                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole) },
-                popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
+                enterTransition = { detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx) },
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
             ) { entry ->
                 // 先把导航层的 AnimatedVisibilityScope 抓在手里：下面要在几层 lambda 内部
                 // provide 它，而那些 lambda 里的 `this` 已经是别的 receiver 了。
@@ -590,14 +605,14 @@ fun MainNavGraph(
                 composable(
                     route = appRoute.route,
                     arguments = appRoute.arguments,
-                    enterTransition = { detailSharedAxisEnter(navTransitionMs) },
+                    enterTransition = { detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx) },
                     exitTransition = {
                         if (isUfiMiniBarHostRoute(appRoute.route) &&
                             isUfiRiseRoute(targetState.destination.route)
                         ) {
                             riseUnderlayExit(navTransitionMs, recedeRole)
                         } else {
-                            detailSharedAxisExit(navTransitionMs, recedeRole)
+                            detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx)
                         }
                     },
                     popEnterTransition = {
@@ -606,10 +621,10 @@ fun MainNavGraph(
                         ) {
                             riseUnderlayPopEnter(recedeRole)
                         } else {
-                            detailSharedAxisPopEnter(navTransitionMs, recedeRole)
+                            detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx)
                         }
                     },
-                    popExitTransition = { detailSharedAxisPopExit(navTransitionMs) }
+                    popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
                 ) { entry ->
                 // 深度层：进二级页时上层圆角描边（满屏不缩放）；返回时 detail 是上层纯平移。
                 //
@@ -685,7 +700,7 @@ fun MainNavGraph(
                         if (fromMiniBarHost) {
                             risePanelEnter(navTransitionMs)
                         } else {
-                            detailSharedAxisEnter(navTransitionMs)
+                            detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx)
                         }
                     },
                     exitTransition = { risePanelExit(navTransitionMs, recedeRole) },
@@ -698,7 +713,7 @@ fun MainNavGraph(
                         if (toMiniBarHost) {
                             risePanelPopExit(navTransitionMs)
                         } else {
-                            detailSharedAxisPopExit(navTransitionMs)
+                            detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx)
                         }
                     }
                 ) { entry ->

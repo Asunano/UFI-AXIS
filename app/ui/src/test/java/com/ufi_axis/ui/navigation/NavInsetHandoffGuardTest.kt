@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.navigation
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -132,6 +133,51 @@ class NavInsetHandoffGuardTest {
      * `contentWindowInsets` / `beyondViewportPageCount` 都在注释里出现多次），
      * 直接全文搜索必然误报，必须先去注释再断言。
      */
+    /**
+     * 2026-10-11：二级页转场的位移起点必须走 [slideStartOffsetGuarded] 下限保护。
+     *
+     * 用户实测症状：概率性「二级页从右下角长出来」，复现路径是"进应用管理页、
+     * 骨架屏还在加载时退出并立刻进别的二级页"。判断为 `slideInHorizontally { it }`
+     * 的 `it`（目标页**那一帧**测量的宽度）在转场被中途打断时尚未落定，起点退化成近零。
+     *
+     * ⚠ 本修正**未经真机验证**（用户反馈 logcat 不便，加日志实测改到下一批次）。
+     * 判定依据是测量竞态推断。若后续实测发现正常帧的 `it` 本就偏小，应重新评估本保护。
+     *
+     * 守护点：四处 detail 位移（enter / exit / popEnter / popExit）都必须过保护，
+     * 且 rise 系列（垂直）**不得**被牵连改签名。
+     */
+    @Test
+    fun detailSlideStart_mustUseGuardedFallback() {
+        val code = executableCode(source(navigationPath))
+        assertTrue(
+            "必须保留 slideStartOffsetGuarded 下限保护（转场中途打断时 it 未落定 → 从右下角长出来）",
+            code.contains("slideStartOffsetGuarded")
+        )
+        // 四处 detail 位移全部走保护
+        val guarded = Regex("slideStartOffsetGuarded\\(it, fallbackWidth\\)").findAll(code).count()
+        assertEquals("四处 detail 位移（enter/exit/popEnter/popExit）都应走保护，实际 $guarded 处", 4, guarded)
+        // rise 系列保持原签名，不接受 fallbackWidth
+        assertFalse(
+            "rise 系列（垂直位移）不应被牵连加 fallbackWidth 参数",
+            Regex("fun AnimatedContentTransitionScope<androidx\\.navigation\\.NavBackStackEntry>\\.rise\\w+\\([^)]*fallbackWidth").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 2026-10-11：`fallbackWidth` 必须来自 `LocalConfiguration.screenWidthDp` 换算的**整屏宽度**。
+     *
+     * 用 `LocalDensity` 是为了 dp→px 的换算（`toPx()` 需要 Density scope），
+     * 但宽度本身只能来自 Configuration —— 不能用某个 dp 常量乘 density 猜。
+     */
+    @Test
+    fun fallbackSlideWidth_mustComeFromScreenConfiguration() {
+        val code = executableCode(source(navGraphPath))
+        assertTrue(
+            "兜底宽度应取 LocalConfiguration.screenWidthDp 换算的整屏宽度",
+            code.contains("screenWidthDp")
+        )
+    }
+
     private fun executableCode(text: String): String =
         text.replace(Regex("""/\*[\s\S]*?\*/"""), "")
             .lines()
