@@ -47,6 +47,9 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     var grantAllRunning by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
+    // 进页面：force = false —— 30s 新鲜窗口（APP_LIST_FRESH_MS）内复用内存里那份列表，一个请求都不发。
+    // 首次进入 / 超出窗口时照旧真打一次，而 core 侧自己有 5 分钟进程内缓存
+    // （AppManager.listApps），所以那次"真打"在 core 上也是毫秒级而不是 4 条特权 shell。
     LaunchedEffect(state.filter) { viewModel.apps.loadAppList(state.filter) }
     LaunchedEffect(state.selectedApp) { if (state.selectedApp != null) cachedDetail = state.selectedApp }
 
@@ -58,7 +61,10 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     UfiScreenScaffold(title = "应用管理", navController = navController, showBack = true,
         actions = {
             if (state.hasRoot) Icon(Icons.Default.VerifiedUser, null, Modifier.padding(end = 8.dp), tint = LocalResolvedPalette.current.accent)
-            IconButton(onClick = { viewModel.apps.loadAppList(state.filter) }) { Icon(Icons.Default.Refresh, null) }
+            // force = true：刷新按钮是用户显式动作，必须绕过新鲜窗口真打一次。
+            // 注意它绕过的是**客户端**闸门；core 侧那条 5 分钟缓存同样会被写操作/TTL 处理，
+            // 但手动刷新在"装完应用马上想看到"这个最常见的诉求下拿到的是最新数据。
+            IconButton(onClick = { viewModel.apps.loadAppList(state.filter, force = true) }) { Icon(Icons.Default.Refresh, null) }
             IconButton(onClick = { showInstallDialog = true }) { Icon(Icons.Default.Add, null) }
         }
     ) { padding ->
@@ -66,7 +72,9 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
         Column(Modifier.fillMaxSize()) {
             UfiScrollableTabRow(
                 selectedTabIndex = filterIndex,
-                onTabSelected = { viewModel.apps.loadAppList(filterValues[it]) },
+                // 页签切换必须真拉（force = true）：内存里那份是**另一个 filter** 的，
+                // 闸门在 AppManagerModule 里已按 loadedFilter 放行，这里 force 只是把语义写在调用点。
+                onTabSelected = { viewModel.apps.loadAppList(filterValues[it], force = true) },
                 tabs = filterTabs,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
             )

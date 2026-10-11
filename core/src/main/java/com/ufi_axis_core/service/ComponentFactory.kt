@@ -963,7 +963,9 @@ object ComponentFactory {
                 dynamicThreadPool = dynamicThreadPool,
                 webResourceManager = webResourceManager,
                 // 停机钩子要能收 ttyd（杀进程 + 关反代 HttpClient；否则孤儿进程常驻，2026-10-06）
-                ttydRoutes = ttydRoutes
+                ttydRoutes = ttydRoutes,
+                // 应用列表定时刷新的起停钩子（见 ServerGraph.appManager 的说明）
+                appManager = appManager
             )
         )
     }
@@ -1254,7 +1256,8 @@ object ComponentFactory {
         dataScheduler: DataScheduler,
         dynamicThreadPool: DynamicThreadPool,
         webResourceManager: com.ufi_axis_core.util.WebResourceManager,
-        ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes
+        ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
+        appManager: com.ufi_axis_core.controller.system.AppManager
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -1267,7 +1270,8 @@ object ComponentFactory {
             dataScheduler = dataScheduler,
             dynamicThreadPool = dynamicThreadPool,
             webResourceManager = webResourceManager,
-            ttydRoutes = ttydRoutes
+            ttydRoutes = ttydRoutes,
+            appManager = appManager
         )
     }
 }

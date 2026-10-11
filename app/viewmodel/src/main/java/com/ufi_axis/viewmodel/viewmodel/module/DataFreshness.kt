@@ -51,6 +51,24 @@ const val FOREGROUND_REFRESH_INTERVAL_MS: Long = 10_000L
  */
 const val NETWORK_ALL_FRESH_MS: Long = 30_000L
 
+/**
+ * 应用列表（`GET /api/apps`）的新鲜度窗口（ms）。
+ *
+ * 取 30s，对齐 [NETWORK_ALL_FRESH_MS] 而不是更长的 core 侧缓存 TTL：
+ * - 30s 内**重进页面**（或者用户自己来回切页签）直接复用列表，一个请求都不发。
+ *   这一页的服务端成本天然很高 —— core 侧一次 `listApps` 要串 4 条特权 shell
+ *   （`pm list packages -f` / `-d` / `--suspended` + `dumpsys package packages | grep`），
+ *   设备上是秒级；2026-10-12 起 core 自己加了 5 分钟 TTL 的进程内缓存把它压到毫秒级，
+ *   但客户端仍不该在几秒内重复问同一件事。
+ * - 窗口不能盖住 core 的 5 分钟 TTL：窗口与 TTL 同长的话，"刚装的应用迟迟不出现"
+ *   会被放大到 5 分钟，且这一页**没有** WS 推送，用户只能手动刷新来打破。
+ *   30s 是"复用与新鲜"之间对本页最划算的一档。
+ *
+ * 超窗之后不是"卡住不动"：调用方照旧发请求，而 core 那次请求命中的是它自己的缓存，
+ * 仍是毫秒级 —— 详见 `AppManagerModule.loadAppList` 里 `silent` 那一支。
+ */
+const val APP_LIST_FRESH_MS: Long = 30_000L
+
 
 /**
  * 前台化时「第一次请求还要等多久」（ms，纯函数，可单测）。

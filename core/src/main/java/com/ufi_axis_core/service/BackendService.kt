@@ -755,6 +755,19 @@ class BackendService : Service() {
                 pauseComponentBackground(g)
             }
 
+            // ── 应用列表定时主动刷新（2026-10-12 应用列表缓存批次）──
+            // 为什么挂在这里（HTTP 就绪之后、而不是 ComponentFactory.build() 里）：
+            // build() 是阻塞调用且被 15s 初始化看门狗盯着，而首轮刷新要串 4 条特权 shell
+            // （pm list ×3 + dumpsys），设备上秒级 —— 放进 build 等于用一次慢 shell 去换
+            // 「通知栏卡在正在初始化 → 进程被判超时重启」。与本文件里 geo 检测同一条理由。
+            //
+            // 为什么不在 AppManager 构造里起：它还有一个只做自更新安装的短命实例
+            // （BootReceiver 开机恢复），构造即起协程会给那种一次性实例也挂一条永不结束的循环。
+            //
+            // 作用域用 serviceScope：onDestroy 里它会被 cancel，即便下方显式 stop 漏了也死得掉。
+            // 停机路径另有一刀见 stopAllComponents。
+            g.serverGraph.appManager.startPeriodicRefresh(serviceScope)
+
             val serverOk = g.serverGraph.server.start()
             if (!serverOk) {
                 // 服务启动失败：不要静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
@@ -994,6 +1007,8 @@ class BackendService : Service() {
         try { g.controller.taskScheduler.pause() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.pause failed: ${e.message}") }
         try { g.controller.tunnelManager.stopGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.stopGuard failed: ${e.message}") }
         try { g.controller.downloadManager.pauseBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.pauseBackground failed: ${e.message}") }
+        // 应用列表定时刷新同属「自主活动」：用户点「停止服务」后不该还每 2 分钟打 4 条特权 shell。
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     private fun resumeComponentBackground(g: ComponentGraph) {
@@ -1001,6 +1016,7 @@ class BackendService : Service() {
         try { g.controller.taskScheduler.resume() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.resume failed: ${e.message}") }
         try { g.controller.tunnelManager.startGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.startGuard failed: ${e.message}") }
         try { g.controller.downloadManager.resumeBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.resumeBackground failed: ${e.message}") }
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     /**
@@ -1175,6 +1191,10 @@ class BackendService : Service() {
         try { g.controller.adbController.destroy() } catch (e: Exception) { AppLogger.e(tag, "Error stopping adb", e) }
         try { g.controller.downloadManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down download manager", e) }
         try { g.controller.tunnelManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down tunnel manager", e) }
+        // 应用列表定时刷新：持有自己的 CoroutineScope，不显式收的话服务停掉后仍每 2 分钟
+        // 打 4 条特权 shell（serviceScope 虽会在 onDestroy 被 cancel，但 stopAllComponents 也走
+        // 「停止服务」而不销毁 Service 的路径 —— 那条路上 serviceScope 还活着）。
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.e(tag, "Error stopping app list refresh", e) }
         // ttyd：父进程（core）退出不会带走子进程，必须显式杀，否则孤儿 shell 常驻耗电。
         // 注意顺序在 server.stop() 之后：先把 WS 反代收掉，再杀它背后的进程。
         try { g.serverGraph.ttydRoutes.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }

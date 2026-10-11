@@ -129,6 +129,12 @@ class ForegroundRefreshFreshnessTest {
     private val freshnessPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/DataFreshness.kt"
     private val downloadPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/DownloadModule.kt"
     private val appManagerPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/AppManagerModule.kt"
+
+    /**
+     * 同样跨模块：刷新按钮 / 页签切换这两个 `loadAppList` 调用点的 `force` 分工写在**界面侧**，
+     * 判错的后果（刷新按钮被闸门吃掉 → 连点十次无反应）比模块内部写法回归更直观。
+     */
+    private val appScreenPath = "app/feature-apps/src/main/java/com/ufi_axis/ui/screens/AppScreen.kt"
     private val tunnelPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/TunnelModule.kt"
     private val fileManagerPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/FileManagerModule.kt"
 
@@ -450,6 +456,111 @@ class ForegroundRefreshFreshnessTest {
         )
     }
 
+
+/**
+     * 2026-10-12 应用列表缓存批次：客户端侧新鲜度闸门 + 调用点的 `force` 分工。
+     *
+     * ## 为什么这一批要加护栏
+     * core 侧加了 5 分钟进程内缓存（`AppManager.listApps`）之后，客户端还**每个 30 秒**
+     * 重问一次，收益就少了一半；反过来若闸门放得太宽（或者刷新按钮忘了 force），
+     * 表现是"我刚禁用了它，页面还显示启用"且没有任何自愈路径 —— 这一页没有 WS 推送。
+     *
+     * ## 三条不变量
+     * 1. `loadAppList` 必须有 `force` 形参 + `isForegroundDataFresh(…, APP_LIST_FRESH_MS)` 闸门；
+     * 2. **刷新按钮 / 页签切换 / 写后回读必须 `force = true`**（界面 2 处 + 模块内 3 处）；
+     * 3. 成功时刻必须用单调时钟 `SystemClock.elapsedRealtime()`，且**只在成功后**打戳
+     *    （失败也打戳 ⇒ 一次网络抖动会让 30s 内后续所有进入都被闸门挡掉，页面停在空态）。
+     *
+     * 判错任何一个的后果都是"静默的功能失效"，没有编译错误 —— 正合源码级断言的形态。
+     */
+    @Test
+    fun appList_freshnessGateAndForceSplit() {
+        val code = executableCode(source(appManagerPath))
+
+        assertTrue(
+            "`loadAppList` 必须收 force 形参（顶栏刷新 / 页签切换 / 写后回读靠它绕过闸门）。",
+            Regex("""fun loadAppList\(\s*filter:\s*String\s*=\s*"user"\s*,\s*force:\s*Boolean\s*=\s*false\s*\)""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "`loadAppList` 里找不到新鲜度闸门（isForegroundDataFresh(listSuccessElapsedMs …)）—— " +
+                "缺了它每次进页面都重发一次，而 core 侧那次请求本来可以只花一次 4 条特权 shell。",
+            Regex("""isForegroundDataFresh\(\s*listSuccessElapsedMs""").containsMatchIn(code)
+        )
+        assertTrue(
+            "闸门必须用本页专用的窗口 APP_LIST_FRESH_MS —— 默认 10s 对这一页太短（" +
+                "core 端那次请求的缓存 TTL 是 5 分钟量级，10s 窗口只是在白发必然命中缓存的请求）。",
+            code.contains("APP_LIST_FRESH_MS")
+        )
+        assertTrue(
+            "找不到「切页签必须真拉」的例外（filterChanged）：内存里那份是**另一个 filter** 的，" +
+                "闸门会把它判成新鲜直接返回，页面就永远停在旧页签的数据上。",
+            code.contains("filterChanged")
+        )
+        assertTrue(
+            "`listSuccessElapsedMs` 没有用 `SystemClock.elapsedRealtime()` 写入 —— 单调时钟红线。",
+            Regex("""listSuccessElapsedMs\s*=\s*SystemClock\.elapsedRealtime\(\)""").containsMatchIn(code)
+        )
+        assertFalse(
+            "`listSuccessElapsedMs` 改成 `System.currentTimeMillis()` 了 —— 单调时钟红线回归。",
+            Regex("""listSuccessElapsedMs\s*=\s*System\.currentTimeMillis\(\)""").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 界面侧两个调用点的 `force` 分工（跨模块断言）。
+     *
+     * 刷新按钮漏 force 的后果最直观：用户连点十次刷新，每次都被 30s 闸门吃掉，一个请求都不发，
+     * 而页面上什么也没变 —— 用户只会得出"这 app 坏了"。
+     * 反过来给进页面那处加了 force，本批次客户端侧的一半收益直接归零。
+     */
+    @Test
+    fun appListRefreshButtonAndTabSwitch_mustForce() {
+        val code = executableCode(source(appScreenPath))
+
+        assertTrue(
+            "找不到顶栏刷新按钮的调用点 —— 若它没带 force，闸门会把用户显式动作吃掉。",
+            Regex("""Icons\.Default\.Refresh""").containsMatchIn(code)
+        )
+        assertEquals(
+            "刷新按钮 + 页签切换两处都必须显式 `force = true`（进页面那处刻意不带）。",
+            2L,
+            Regex("""loadAppList\([^)]*force\s*=\s*true""").findAll(code).count().toLong()
+        )
+        assertTrue(
+            "进页面的 `LaunchedEffect(state.filter)` 不得带 force —— 那正是要被闸门挡掉的那一次" +
+                "（用户 30s 内反复进出页面不该每次都重发）。",
+            Regex("""LaunchedEffect\(state\.filter\)\s*\{\s*viewModel\.apps\.loadAppList\(state\.filter\)\s*\}""")
+                .containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 窗口取值断言：30s，且必须**明显长于**首页轮询窗口。
+     *
+     * 另一头（必须短于 core 侧 5 分钟缓存 TTL）无法在本模块断言 —— 那是 core 的常量，
+     * 跨模块读源码加断言的收益不抵它的脆弱。理由写在 `APP_LIST_FRESH_MS` 的 KDoc 里。
+     */
+    @Test
+    fun appListFreshWindow_takeMiddleGround() {
+        assertEquals(
+            "应用列表窗口取 30s，对齐网络页（那一页同样没有轮询、服务端同样有响应缓存）。",
+            30_000L,
+            APP_LIST_FRESH_MS
+        )
+        assertTrue(
+            "窗口必须长于首页轮询周期，否则重进应用页比首页还勤。",
+            APP_LIST_FRESH_MS > FOREGROUND_REFRESH_INTERVAL_MS
+        )
+        assertTrue(
+            "窗口判据本身必须复用本仓那份（isForegroundDataFresh），不得各写一份比较式。",
+            isForegroundDataFresh(
+                lastSuccessElapsedMs = 100_000L,
+                nowElapsedMs = 110_000L,
+                freshWindowMs = APP_LIST_FRESH_MS
+            )
+        )
+    }
 
     /**
      * 空态 item 必须**恒定挂载**，不得再被任何加载态摘掉。

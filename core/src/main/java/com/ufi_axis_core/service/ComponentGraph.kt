@@ -134,5 +134,18 @@ data class ServerGraph(
     val dynamicThreadPool: DynamicThreadPool,
     val webResourceManager: WebResourceManager,
     /** 真 PTY（2026-10-06）：停机必须显式收（杀 ttyd 进程 + 关反代 HttpClient），否则孤儿进程常驻。 */
-    val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes
+    val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
+    /**
+     * 应用列表管理器（2026-10-12 应用列表缓存批次）。
+     *
+     * 暴露它**只**为了让 [com.ufi_axis_core.service.BackendService] 按服务生命周期起停它的
+     * 定时刷新协程 —— 理由与本子图里的 pushService / notificationDispatcher / webhookChannel
+     * 完全同源：组件自己持有 CoroutineScope，不在停机流程里显式收，它会在服务停掉之后继续跑
+     * （这里的表现是每 2 分钟继续打 4 条特权 shell）。
+     *
+     * 放 ServerGraph 而不是 ControllerGraph：它构造在 build() 主流程里（供 UpdateManager /
+     * AppRoutes 共用同一个实例），**晚于** buildControllerGraph 调用点，放后者就得把构造
+     * 顺序整条倒过来（牵动一大片），不值得 —— 语义归置优先于就近。
+     */
+    val appManager: com.ufi_axis_core.controller.system.AppManager
 )

@@ -9,8 +9,14 @@ import android.graphics.drawable.Drawable
 import android.util.Base64
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -50,8 +56,216 @@ class AppManager(
 
     suspend fun hasRoot(): Boolean = ShellExecutor.hasRootAccess()
 
+    /**
+     * 应用列表入口：**先命中缓存再打 shell**（2026-10-12 应用列表缓存批次）。
+     *
+     * 慢的根因就在下面 [loadAllAppsUncached]：一次要串 4 条特权 shell
+     * （`pm list packages -f` / `pm list packages -d` / `pm list packages --suspended` /
+     * `dumpsys package packages | grep`），设备上是**秒级**开销。而「已安装哪些应用」是
+     * 变化极慢的数据（人手动装/卸一次），于是改成：全量列表只拉一次并带时间戳缓存住，
+     * `type` 过滤在内存里做（三个页签共用同一份全量，不必各拉一次）。
+     *
+     * 语义要点：
+     * - **首次仍是同步拉取**：用户第一次进页面时该等的还是要等（没有旧值可给），
+     *   但并发到达的多个请求由 [appListMutex] 合并，**只跑一次 shell**（不形成击穿风暴）。
+     * - **空结果不入缓存**：`pm` 失败时本方法返回空列表（保持原行为），若把空列表也缓存住，
+     *   一次瞬时失败会让页面在 TTL 内一直空着。设备上"一个包都没有"不可能发生
+     *   （系统至少有几十个包），所以这个判据不会误伤真实的空设备。
+     * - **写操作一律失效**：见 [invalidateAppListCache] 的调用点清单。
+     */
     suspend fun listApps(type: String = "all"): List<Map<String, Any>> {
+        freshAppListCache()?.let { return it.filterByType(type) }
+        // 未命中（或已过期）→ 进互斥区二次检查 + 真实拉取。
+        // 二次检查必须放在锁内：并发的第二个请求可能在第一个已经把值放进缓存**之前**
+        // 读到 null，只靠锁外那一次检查会让两个请求各跑一遍 4 条 shell。
+        return appListMutex.withLock {
+            freshAppListCache()?.let { return@withLock it.filterByType(type) }
+            val all = listLoader()
+            // 拉取路径也走**同一份**过滤逻辑：先把结果装进一个临时条目再过滤，
+            // 而不是直接 `all.filter {…}`。两处各写一遍的话，缓存命中路径与首次拉取路径
+            // 迟早会给出不一致的列表（而且这个不一致不会被任何编译错误发现）。
+            if (all.isEmpty()) return@withLock all
+            val entry = AppListCacheEntry(all, System.currentTimeMillis())
+            appListCache = entry
+            entry.filterByType(type)
+        }
+    }
+
+    /**
+     * 取**未过期**的缓存条目（过期视为未命中，交给调用方去拉）。
+     *
+     * TTL 在这里判、而不是靠"定时刷新把 TTL 顶住"：后者只在定时协程活着时成立，
+     * 而它会被「停止服务」暂停 —— 一旦被暂停又恢复，缓存可能是几小时前的，
+     * 那时若无条件命中，用户会看到一份过期的应用列表（且没有任何提示能刷新它）。
+     * 定时刷新的作用是"让绝大多数请求不必走这条路"，TTL 是这条路的安全网。
+     */
+    private fun freshAppListCache(): AppListCacheEntry? =
+        appListCache?.takeIf { !it.isExpired(System.currentTimeMillis(), APP_LIST_CACHE_TTL_MS) }
+
+    /**
+     * 全量拉取入口的**可替换缝**（测试用）。
+     *
+     * 默认指向 [loadAllAppsUncached]（真的 4 条特权 shell）。单测把它换成计数器 + 假数据，
+     * 于是"第二次调用到底跑没跑 shell"可以被**数出来**，而不是靠 mock ShellExecutor
+     * （那是 object + 静态方法，mock 起来比重写实现还脆）。
+     *
+     * 用 `var` 而不是构造参数：它是**测试缝**，不是依赖 —— 生产路径永远是默认值，
+     * 不该让每个构造点都多传一个参数（`BootReceiver` 也 new 了一个只用来 installApk 的实例）。
+     */
+    @Volatile
+    internal var listLoader: suspend () -> List<Map<String, Any>> = { loadAllAppsUncached() }
+
+    /** 应用列表缓存条目：全量（**未**按 filter 过滤）+ 写入时刻（epoch 毫秒）。 */
+    private data class AppListCacheEntry(
+        val all: List<Map<String, Any>>,
+        val timestampMs: Long
+    ) {
+        /**
+         * 内存二次过滤：`system` / `user` / 其它（= 全量）。
+         *
+         * 判据与 [loadAllAppsUncached] 里原来那段 `when` 完全一致（先标 isSystem 再过滤），
+         * 抽成函数是为了让"缓存命中路径"和"拉取路径"走**同一份**过滤逻辑 ——
+         * 两处各写一遍的话，缓存命中的结果迟早会和首次拉取不一致。
+         */
+        fun filterByType(type: String): List<Map<String, Any>> = when (type) {
+            "system" -> all.filter { it["isSystem"] == true }
+            "user" -> all.filter { it["isSystem"] == false }
+            else -> all
+        }
+
+        /** 距上次刷新是否已超过 TTL（按**写入时刻**算，不用 lastAccess）。 */
+        fun isExpired(nowMs: Long, ttlMs: Long): Boolean = nowMs - timestampMs >= ttlMs
+    }
+
+    /** 缓存本体。`@Volatile` + 整体替换：读侧无锁，失效只需置 null，不需要加锁改内容。 */
+    @Volatile
+    private var appListCache: AppListCacheEntry? = null
+
+    /**
+     * 应用列表刷新的互斥锁 —— **刷新与请求共用同一把**。
+     *
+     * 场景：定时刷新正在跑（持锁、4 条 shell 飞着），此时用户进页面来读。
+     * 共用一把锁意味着用户要等这一次跑完（几秒）而不是又并发开一轮 —— 后者会让设备
+     * 同时跑 8 条 `pm`/`dumpsys`，在随身 WiFi 这种小内存设备上明显更慢甚至互相拖死。
+     * 「后台刷新」的价值在于把用户这次等待**前置**到定时轮次里，而不是让它变快。
+     */
+    private val appListMutex = Mutex()
+
+    /** 定时刷新协程句柄（见 [startPeriodicRefresh]）。`null` = 未启动或已停。 */
+    @Volatile
+    private var appListRefreshJob: Job? = null
+
+    /** [startPeriodicRefresh] 记下的作用域，`setPeriodicRefreshEnabled(true)` 要靠它重新拉起。 */
+    @Volatile
+    private var appListRefreshScope: CoroutineScope? = null
+
+    /**
+     * 应用列表缓存 TTL（5 分钟）与定时刷新周期（2 分钟）。
+     *
+     * 为什么不用 `ResponseCache.CacheTTL`：那个常量住在 `:core:cache`，而 `AppManager`
+     * 在 `:core:controller` —— `:core:controller` 现在**没有**对 `:core:cache` 的依赖
+     * （缓存是 API 响应层的 JsonElement 缓存，语义也不同：它按 key 存 JSON，
+     * 这里存的是已解析好的 `List<Map<String,Any>>`）。为复用一个数字引入模块依赖不划算，
+     * 故就地定义并写清取值理由。
+     *
+     * - **TTL 5 分钟**：应用集合是人手动的变化（装/卸/冻结），系统自身不会自己增删包。
+     *   5 分钟内最多让用户看到一次"刚装的应用没出现"，而页面上的刷新按钮、以及任何写操作
+     *   都会立刻失效缓存，所以可感知窗口很短。
+     * - **刷新周期 2 分钟 < TTL**：定时刷新每 2 分钟把 TTL 顶回去，于是进页面时**几乎总是命中**
+     *   （最坏情况数据年龄 = TTL - 周期 = 3 分钟）。若周期 >= TTL，就会出现"进页面恰好
+     *   卡在过期点"而现场跑 4 条 shell —— 那正是这次要消掉的体感。
+     */
+    /**
+     * 让缓存失效 —— **所有会改变应用列表的写操作后都必须调用**。
+     *
+     * 取舍（保守失效）：`forceStop` / `clearAppData` / `grantPermission` /
+     * `revokePermission` / `grantAllPermissionsViaAdb` 其实**不改变列表内容**
+     * （列表字段只有 packageName/appName/apkPath/isSystem/versionName/enabled/isFrozen/icon），
+     * 理论上可以不失效。但一律失效的代价只是"下一次进页面重新拉一次（core 侧还有 iconCache 兜底）"，
+     * 而漏失效的代价是用户看到"我明明禁用了它，列表还显示启用"且**没有任何自愈路径**
+     * （没有事件、没有推送）。省下的那点开销不值这个风险，故保守。
+     *
+     * 注意这里**不**顺带触发立即刷新：写操作刚跑完多条 shell，紧接着再串 4 条
+     * 只会让写请求自己变慢（客户端正在等这个写的结果）。写后回读由客户端显式重发列表请求完成。
+     */
+    private fun invalidateAppListCache() {
+        appListCache = null
+    }
+
+    /**
+     * 启动定时主动刷新（用户要的"core 主动获取缓存并定时更新"）。
+     *
+     * **刻意不在构造里起**：`AppManager` 还有一个只用来做自更新安装的短命实例
+     * （`BootReceiver` 的开机恢复），构造即起协程等于给那种一次性实例也挂一条永不结束的循环。
+     * 真正的持有者是 `ComponentFactory.build()` 里那个实例，它随 `ComponentGraph` 生灭，
+     * 所以由 `BackendService` 在拿到图之后显式启动、`onDestroy` 路径显式停止。
+     *
+     * @param scope 必须来自 `BackendService.serviceScope`（它在 `onDestroy` 里被 cancel），
+     *   这样即便漏掉显式 stop，协程也会随服务一起死 —— 双保险。
+     */
+    fun startPeriodicRefresh(scope: CoroutineScope) {
+        if (appListRefreshJob?.isActive == true) return
+        appListRefreshScope = scope
+        appListRefreshJob = scope.launch(Dispatchers.IO) {
+            // 启动后先等一个周期再刷：core 刚起来时设备上 pm/dumpsys 可能还在被别的初始化
+            // 抢（AT 通道初始化、updateManager 恢复…），立刻刷只是给启动期添乱。
+            while (isActive) {
+                delay(APP_LIST_REFRESH_INTERVAL_MS)
+                refreshAppListInBackground()
+            }
+        }
+        AppLogger.i(tag, "App list periodic refresh started (interval=${APP_LIST_REFRESH_INTERVAL_MS}ms)")
+    }
+
+    /**
+     * 后台刷新一轮（定时器与「启动/恢复后台」两个入口共用）。
+     *
+     * 失败/空结果一律**不写缓存**：保留上一份好数据比写空强（失败写空 = 让页面在 TTL 内全空）。
+     * 只在"跑完真的变了"时不需要通知客户端 —— 本仓没有应用列表的 WS 推送，
+     * 客户端进页面拿到的就是它，不需要额外广播（别为此新增频道）。
+     */
+    private suspend fun refreshAppListInBackground() {
+        try {
+            appListMutex.withLock {
+                val all = listLoader()
+                if (all.isEmpty()) {
+                    AppLogger.w(tag, "后台刷新应用列表返回空，保留旧缓存")
+                    return@withLock
+                }
+                appListCache = AppListCacheEntry(all, System.currentTimeMillis())
+                AppLogger.i(tag, "后台刷新应用列表完成，共 ${all.size} 个包")
+            }
+        } catch (e: Exception) {
+            // 定时循环里绝不能把异常放出去（SupervisorJob 下会静默终止这条循环且无日志）
+            AppLogger.w(tag, "后台刷新应用列表失败: ${e.message}")
+        }
+    }
+
+    /**
+     * 暂停/恢复定时刷新 —— 对齐 [com.ufi_axis_core.service.BackendService] 的
+     * 「停止服务 = 除 HTTP 外全停」语义（`pauseComponentBackground` / `resumeComponentBackground`）。
+     *
+     * 不接这一层的话，用户点「停止服务」之后后台仍在每 2 分钟跑 4 条特权 shell，
+     * 与该开关的既有语义（read-through 闸门 / 任务调度 / 隧道看护 / 下载轮询都停）自相矛盾。
+     *
+     * 暂停 = 取消协程（而不是置一个 flag 让循环空转）：设备上少 4 条 shell 比多一次唤醒便宜。
+     */
+    fun setPeriodicRefreshEnabled(enabled: Boolean) {
+        val scope = appListRefreshScope
+        if (!enabled) {
+            appListRefreshJob?.cancel()
+            appListRefreshJob = null
+            AppLogger.i(tag, "App list periodic refresh paused")
+            return
+        }
+        // 恢复需要当初那个 scope；没有（从没启动过）就保持不启动 —— 宁可不刷，也别自己造一个
+        // 与服务生命周期脱钩的 scope（那就是本批次要消灭的泄漏形态）。
+        if (scope != null) startPeriodicRefresh(scope)
+    }
+
+    private suspend fun loadAllAppsUncached(): List<Map<String, Any>> {
         // 统一拉取全部包：不再依赖 pm 的 -s/-3 标记（root 模拟器/部分 ROM 上不可靠，会导致分类错乱）。
+
         val result = ShellExecutor.executeAsRoot("pm list packages -f 2>/dev/null")
         if (!result.isSuccess || result.stdout.isBlank()) return emptyList()
 
@@ -104,12 +318,9 @@ class AppManager(
                 null
             }
         }
-        // 内存里按 type 二次过滤（先标 isSystem 再过滤），彻底摆脱 pm 标记不可靠问题。
-        return when (type) {
-            "system" -> all.filter { it["isSystem"] == true }
-            "user" -> all.filter { it["isSystem"] == false }
-            else -> all
-        }
+        // 返回**全量**（不按 type 过滤）：过滤已上移到 [AppListCacheEntry.filterByType]，
+        // 这样缓存只存一份全量、三个页签共用（原来每次调用都各自重拉一遍全量再过滤）。
+        return all
     }
 
     private fun String.toIfNotEmpty(): String? = if (isNotBlank()) this else null
@@ -291,6 +502,10 @@ class AppManager(
         // 主通道 adb install -r 是覆盖安装，运行时权限本身会被系统继承，这一步是多余的；
         // 需要手动授权仍可走 POST /api/apps/grant-all-permissions（web 应用页的按钮）。
         deleteTmpFile(tmpApk)
+        // 失效点⑩：安装成功会在包里多一个/多一个版本，列表（版本名/isSystem/图标）都要变。
+        // 失败也失效：adb 主通道失败后 PackageInstaller 仍可能已经装上（结果判据不唯一），
+        // 宁可多失效一次，也不能让用户看着"装成功了但列表里没有"。
+        invalidateAppListCache()
         return result
     }
 
@@ -375,6 +590,8 @@ class AppManager(
         }
         // 2026-08-28：同 installApk，删除安装后自动授权（adb install -r 覆盖安装本就继承权限）
         deleteTmpFile(tmpPath)
+        // 失效点⑪：同 [installApk]
+        invalidateAppListCache()
         return result
     }
 
@@ -584,34 +801,51 @@ class AppManager(
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         // 2026-08-23 修复：移除 -k 标志以进行干净卸载，并显式指定 --user 0
         val result = ShellExecutor.executeAsRoot("pm uninstall --user 0 \"$packageName\" 2>/dev/null", 30_000L)
+        // 失效点①：卸载直接改变包集合（且最容易被用户当场验证 —— 卸完刷新应当看不到它）
+        invalidateAppListCache()
         // pm uninstall 成功时输出通常包含 "Success"
         return parseInstallResult(result)
     }
 
     suspend fun disableApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("pm disable \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm disable \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点②：enabled 字段直接由 `pm list packages -d` 决定
+        invalidateAppListCache()
+        return ok
     }
 
     suspend fun enableApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点③：同 disable，enabled 字段会变
+        invalidateAppListCache()
+        return ok
     }
 
     suspend fun clearAppData(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("pm clear \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm clear \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点④（保守）：清数据不改列表内容，见 [invalidateAppListCache] 的取舍说明
+        invalidateAppListCache()
+        return ok
     }
 
     suspend fun forceStop(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("am force-stop \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("am force-stop \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点⑤（保守）：强停不动列表字段，但统一失效免得为它单开一条例外分支
+        invalidateAppListCache()
+        return ok
     }
 
     suspend fun grantPermission(pkg: String, perm: String): Boolean {
         require(validatePackageName(pkg)) { "Invalid package name: $pkg" }
         require(validateShellArg(perm)) { "Invalid permission name: $perm" }
-        return ShellExecutor.executeAsRoot("pm grant \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm grant \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
+        // 失效点⑥（保守）：权限不进列表字段，见 [invalidateAppListCache] 的取舍说明
+        invalidateAppListCache()
+        return ok
     }
 
     /**
@@ -679,25 +913,39 @@ class AppManager(
                 AppLogger.e(tag, "grantAllPermissionsViaAdb exception: ${e.message}")
                 false to "exception: ${e.message}"
             }
+        }.also {
+            // 失效点⑫（保守）：它会顺带改 appops（影响可见性行为），且权限不进列表字段；
+            // 与 [grantPermission] 同口径统一失效。放在 `also` 上是为了覆盖内部所有返回分支
+            // （正常 / context 为空 / adb 找不到 / 超时），漏一条分支就等于漏一次失效。
+            invalidateAppListCache()
         }
     }
 
     suspend fun revokePermission(pkg: String, perm: String): Boolean {
         require(validatePackageName(pkg)) { "Invalid package name: $pkg" }
         require(validateShellArg(perm)) { "Invalid permission name: $perm" }
-        return ShellExecutor.executeAsRoot("pm revoke \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm revoke \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
+        // 失效点⑦（保守）：同 [grantPermission]
+        invalidateAppListCache()
+        return ok
     }
 
     /** 冻结应用 (pm disable-user) */
     suspend fun freezeApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("pm disable-user --user 0 \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm disable-user --user 0 \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点⑧：冻结走 disable-user，同时改变 enabled 与 isFrozen 两个字段
+        invalidateAppListCache()
+        return ok
     }
 
     /** 解冻应用 (pm enable) */
     suspend fun unfreezeApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        return ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
+        val ok = ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
+        // 失效点⑨：解冻改变 enabled 与 isFrozen
+        invalidateAppListCache()
+        return ok
     }
 
     /**
@@ -786,4 +1034,28 @@ class AppManager(
     }
 
     data class InstallResult(val success: Boolean, val message: String)
+
+    companion object {
+        /**
+         * 应用列表缓存 TTL（5 分钟）与定时刷新周期（2 分钟）。
+         *
+         * 为什么不用 `ResponseCache.CacheTTL`：那个常量住在 `:core:cache`，而 `AppManager`
+         * 在 `:core:controller` —— `:core:controller` 现在**没有**对 `:core:cache` 的依赖
+         * （那里缓存的是 API 响应的 JsonElement，语义也不同：按 key 存 JSON，
+         * 而这里存的是已解析好的 `List<Map<String,Any>>`）。为复用一个数字引入模块依赖不划算，
+         * 故就地定义并写清取值理由。
+         *
+         * - **TTL 5 分钟**：应用集合是人手动的变化（装/卸/冻结），系统自身不会自己增删包。
+         *   5 分钟内最多让用户看到一次"刚装的应用没出现"，而页面上的刷新按钮、以及任何写操作
+         *   都会立刻失效缓存，所以可感知窗口很短。
+         * - **刷新周期 2 分钟 < TTL**：定时刷新每 2 分钟把 TTL 顶回去，于是进页面时**几乎总是命中**
+         *   （最坏情况数据年龄 = TTL − 周期 = 3 分钟）。若周期 >= TTL，就会出现"进页面恰好
+         *   卡在过期点"而现场跑 4 条 shell —— 那正是这次要消掉的体感。
+         *
+         * 放 companion 而非类体：`const val` 在 Kotlin 里只允许出现在顶层 / 具名 object /
+         * companion object 中（编译报 `Const 'val' is only allowed on top level...`）。
+         */
+        private const val APP_LIST_CACHE_TTL_MS = 5 * 60 * 1000L
+        private const val APP_LIST_REFRESH_INTERVAL_MS = 2 * 60 * 1000L
+    }
 }
