@@ -164,6 +164,46 @@ class DialogShellGuardTest {
         )
     }
 
+    /**
+     * 2026-10-11：`CellularAdvancedScreen` 的根 Column **不得**再加
+     * `padding(horizontal = CardHorizontalMargin)`。
+     *
+     * [UfiSettingsRowCard] 内部**自带**同样的外边距（`UfiSettingsGroup.kt:64`），
+     * 两者叠加成 32dp —— 表现就是「DHCP / 禁用 FOTA / 文件共享 左右间隔过大」。
+     * 而 [UfiEntryCard] 走的是**内**边距（`padding(Spacing.InnerPadding)`）、不带外边距，
+     * 所以根 Column 加外边距会让两种卡左右边界天然不对齐。
+     * 边距只能由各卡片组件自己负责，根 Column 只管纵向节奏。
+     */
+    @Test
+    fun cellularAdvancedScreen_rootColumn_mustNotDoublePadHorizontally() {
+        val code = executableCode(
+            source("feature-network/src/main/java/com/ufi_axis/ui/screens/CellularAdvancedScreen.kt")
+        )
+        assertFalse(
+            "根 Column 不得横向加 CardHorizontalMargin——UfiSettingsRowCard 自带，会叠成 32dp",
+            Regex("padding\\(horizontal = Spacing\\.CardHorizontalMargin\\)").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 2026-10-11：四个二级入口必须用 [UfiEntryCard]，且各自独立成卡（不共用一张卡壳）。
+     *
+     * `UfiEntryCard` 是**导航入口**（自带右箭头 + Surface 卡壳），
+     * `UfiSettingsItem` 是**设置行**（无右箭头、可带开关）。语义不同、卡片形态也应不同。
+     */
+    @Test
+    fun cellularAdvancedScreen_entries_mustUseEntryCard() {
+        val code = executableCode(
+            source("feature-network/src/main/java/com/ufi_axis/ui/screens/CellularAdvancedScreen.kt")
+        )
+        assertTrue("二级入口应用 UfiEntryCard", code.contains("UfiEntryCard("))
+        // 手搓卡壳（曾用于把四个入口挤在一张卡里）不应再出现
+        assertFalse(
+            "四个入口已各自独立成卡，不该再手搓合一卡壳 Box(ufiStandardCard()...)",
+            code.contains("ufiStandardCard()")
+        )
+    }
+
     /** 剥掉注释，只留可执行代码（KDoc 里反复出现 `UfiCustomDialog` 这些名字）。 */
     private fun executableCode(text: String): String =
         text.replace(Regex("""/\*[\s\S]*?\*/"""), "")

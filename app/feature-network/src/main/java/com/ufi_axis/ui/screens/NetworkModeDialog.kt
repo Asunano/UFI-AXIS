@@ -148,7 +148,10 @@ fun NetworkModeDialog(
             // 而右边 2×2 每格label+值也要够宽 —— 任一边固定宽度都会让另一边挤。
             Row(
                 Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                // 2026-10-11 用户「制式和 2×2 信息中间间隔增大一点」：
+                // Medium(8) → **XLarge(16dp)**。这一行是弹窗内唯一的横向分隔，
+                // 8dp 在 displayMedium 大字旁边显得太紧，两栏内容糊成一片。
+                horizontalArrangement = Arrangement.spacedBy(Spacing.XLarge)
             ) {
                 // 左：制式名（大字）+ 紧邻其下的信号强度评级
                 Column(
