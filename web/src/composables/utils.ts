@@ -183,10 +183,16 @@ export function networkTypeLabel(type: string): string {
  * （core 用小写 `n`）；② NSA 双连接时 `network_type` 是 `"NSA"`，`networkTypeLabel` 不认，
  * 于是走进 LTE 分支贴上 4G 频段，而 core 的 `ServingCell.derive` 明确按字段存在性取 NR。
  * `band_label` 缺失（两侧都没值）就只显示制式，不编造。
+ *
+ * 2026-10-11 用户裁决：显示层把频段转**大写** —— `n78` → `N78`（3GPP 官方写法）。
+ * 只改显示、不改 core 派生的 `band_label` 原值：那把值已被
+ * `SignalInfo.isNr`（startsWith("n") 判 5G）与 core 的 `ServingCell.derive`
+ * 及多个测试当**判据**用，改它会连带波及这些判据与断言。
+ * 与 app 侧 `SignalInfo.bandLabelDisplay` 是同一套处理。
  */
 export function networkTypeWithBand(type: string, signal?: Record<string, any> | null): string {
   const label = networkTypeLabel(type);
-  const band = signal?.band_label ? String(signal.band_label) : '';
+  const band = signal?.band_label ? String(signal.band_label).trim().toUpperCase() : '';
   return band ? `${label} ${band}` : label;
 }
 

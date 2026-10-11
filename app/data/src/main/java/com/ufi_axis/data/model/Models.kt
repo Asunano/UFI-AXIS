@@ -304,6 +304,24 @@ data class SignalInfo(
 ) {
     /** 当前是否驻留 5G：**看服务小区频段标签**（core 派生，NR 优先），不解析 [rat] 文案。 */
     val isNr: Boolean get() = band_label?.startsWith("n", ignoreCase = true) == true
+
+    /**
+     * 频段的**显示**文案：把 core 的小写 `n` 前缀转成大写 —— `n78` → `N78`。
+     *
+     * 2026-10-11 用户裁决（显示层转大写，不改 core 的值）：
+     * 3GPP 的频段号官方写法就是大写 `N78` / `B3`，core 拼的是 `n78`（小写 n）。
+     *
+     * 为什么不在 core 侧改成大写（那才是"更靠源头"的做法）：
+     * `band_label` 的小写 `n` 已经被两处逻辑当成**判据**在用 ——
+     * [isNr] 用 `startsWith("n")` 判 5G，core 自己的 `ServingCell.derive` 与
+     * 三个测试（SignalCollectorTest / ZteGoformProfileTest）也按 `n78` 断言。
+     * 改 core 会连带改这些判据与断言，风险远大于收益。
+     * 所以：**值保持 core 的原样，只在显示时转大写**，判据一侧完全不受影响。
+     *
+     * 空/空白原样返回 null，让调用方沿用各自的"无数据"处理（多数是省略显示）。
+     */
+    val bandLabelDisplay: String?
+        get() = band_label?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()
 }
 
 @Serializable

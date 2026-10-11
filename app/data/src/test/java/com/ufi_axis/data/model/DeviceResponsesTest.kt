@@ -232,4 +232,30 @@ class DeviceResponsesTest {
         // 带宽固件普遍不填 → 省略 key → null（不能是 0，0 会被当成「带宽 0」显示）
         assertNull(nr.band_width)
     }
+
+    /**
+     * 2026-10-11：`bandLabelDisplay` 只在**显示层**转大写，`band_label` 原值不动。
+     *
+     * 这条区分很要紧：`band_label` 的小写 `n` 被当作**判据**使用 ——
+     * [SignalInfo.isNr] 用 `startsWith("n")` 判 5G，core 的 `ServingCell.derive`
+     * 与 SignalCollectorTest / ZteGoformProfileTest 也按 `n78` 断言。
+     * 所以正确做法是"值不变、显示转大写"，而不是去改 core 拼出来的字符串。
+     */
+    @Test
+    fun `频段显示转大写 但 band_label 原值与 isNr 判定不受影响`() {
+        val nr = AppJson.decodeFromString<SignalInfo>("""{"band_label":"n78","rsrp":-85}""")
+        assertEquals("N78", nr.bandLabelDisplay)
+        // 值保持 core 的原样 —— isNr 仍靠小写 n 判 5G
+        assertEquals("n78", nr.band_label)
+        assertTrue(nr.isNr)
+
+        // LTE 本来就是大写 B，转大写后不变，且不误判成 5G
+        val lte = AppJson.decodeFromString<SignalInfo>("""{"band_label":"B3"}""")
+        assertEquals("B3", lte.bandLabelDisplay)
+        assertFalse(lte.isNr)
+
+        // 空白 / 缺字段 → null，让调用方走各自的「无数据」处理，不显示成空字符串
+        assertNull(AppJson.decodeFromString<SignalInfo>("""{"band_label":"  "}""").bandLabelDisplay)
+        assertNull(AppJson.decodeFromString<SignalInfo>("""{}""").bandLabelDisplay)
+    }
 }

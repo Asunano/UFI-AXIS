@@ -122,7 +122,9 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                     ?: cellInfo?.ltePci?.takeIf { it.isNotBlank() } ?: ""
                 val fcn = sig?.arfcn?.takeIf { it >= 0 }?.toString()
                     ?: cellInfo?.lteEarfcn?.takeIf { it.isNotBlank() } ?: ""
-                val bandLabel = sig?.band_label?.takeIf { it.isNotBlank() }
+                // 2026-10-11：显示层转大写（n78 → N78）。
+                // LTE 兜底那支这里直接拼 "B$it"（大写），无需再转。
+                val bandLabel = sig?.bandLabelDisplay
                     ?: cellInfo?.lteBands?.takeIf { it.isNotBlank() }?.let { "B$it" }
 
                 val rsrp = sig?.rsrp ?: cellInfo?.lteRsrp?.toIntOrNull()

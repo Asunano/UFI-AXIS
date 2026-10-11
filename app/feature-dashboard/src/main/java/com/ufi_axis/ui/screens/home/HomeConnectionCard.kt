@@ -96,6 +96,12 @@ fun HomeConnectionCard(
         else -> "—"
     }
 
+    // 2026-10-11 用户裁决：制式后面加上频段（如 `5G N78`）。
+    // 频段读 core 派生的服务小区统一字段 band_label（NR 优先），显示层转大写
+    // （n78 → N78，见 SignalInfo.bandLabelDisplay）。缺失就只显示制式、不编造。
+    val bandDisplay = state.signalInfo?.bandLabelDisplay.orEmpty()
+    val ratWithBand = if (bandDisplay.isNotBlank()) "$ratDisplay $bandDisplay" else ratDisplay
+
     // ── 设备名 ──
     val deviceName = state.deviceInfo?.device?.model
         ?: state.deviceInfo?.identity?.get("product_name")
@@ -196,7 +202,7 @@ fun HomeConnectionCard(
                                 shape = UfiCardDefaults.tagShape
                             ) {
                                 Text(
-                                    text = ratDisplay,
+                                    text = ratWithBand,
                                     modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.5.dp),
                                     style = UfiTextStyles.label.copy(fontWeight = UfiWeight.Emphasis),
                                     color = palette.onGradient,  // 原 Color.White：胶囊内制式文字

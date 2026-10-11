@@ -123,7 +123,8 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                 // 频段标签由 core 拼好（服务小区统一字段 band_label，NR 优先），客户端不按制式分支
                 CellularStatusCard(
                     state = state,
-                    currentBand = state.signalInfo?.band_label
+                    // 2026-10-11：显示层转大写（n78 → N78），不改 core 的 band_label 值
+                    currentBand = state.signalInfo?.bandLabelDisplay
                 )
 
                 Spacer(Modifier.height(10.dp))
