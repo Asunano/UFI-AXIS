@@ -196,7 +196,7 @@ class SignalCollectorTest {
         // NCI 值域超 Int，必须保持字符串（这是 SignalCollector 按 isString 分流的理由）
         assertEquals("1234567890123", out[DeviceFields.Signal.CELL_ID])
         // 频段前缀由 core 拼，前端直接显示
-        assertEquals("n78", out[DeviceFields.Signal.BAND_LABEL])
+        assertEquals("N78", out[DeviceFields.Signal.BAND_LABEL])
         assertEquals(301, out[DeviceFields.Signal.PCI])
         assertEquals(true, out[DeviceFields.Signal.NETWORK_REGISTERED])
     }

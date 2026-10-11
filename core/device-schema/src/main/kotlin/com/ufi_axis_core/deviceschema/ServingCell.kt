@@ -51,7 +51,16 @@ object ServingCell {
             if (!num.isNullOrEmpty()) {
                 // 前缀由 core 拼：前端此前一边拼 N/B（formatBand）、一边又反向剥前缀
                 // （parseBands），两套规则漂移过。
-                out[DeviceFields.Signal.BAND_LABEL] = JsonPrimitive(if (isNr) "n$num" else "B$num")
+                //
+                // 2026-10-11 用户裁决：`n` → **`N`**（3GPP 官方写法就是大写）。
+                // 在**源头**改，而不是让 app / web 各自在显示层 toUpperCase ——
+                // 后者要两端各改一处、出两版包，而这里改一次两端自动都对。
+                //
+                // 安全性：客户端唯一的判据是 app `SignalInfo.isNr`，它用
+                // `startsWith("n", ignoreCase = true)` —— **大小写不敏感**，N78 仍判为 5G。
+                // web 端没有拿 band_label 当判据的地方（parseBands 处理的是
+                // lte_band_lock 那类纯数字逗号串，与本字段无关）。
+                out[DeviceFields.Signal.BAND_LABEL] = JsonPrimitive(if (isNr) "N$num" else "B$num")
             }
         }
         pick(DeviceFields.Signal.NR_ARFCN, DeviceFields.Signal.LTE_ARFCN)

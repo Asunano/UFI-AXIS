@@ -219,9 +219,9 @@ class DeviceResponsesTest {
     @Test
     fun `信号响应带服务小区统一字段 制式由 band_label 判定`() {
         val nr = AppJson.decodeFromString<SignalInfo>(
-            """{"rsrp":-85,"band":"78","band_label":"n78","arfcn":633984,"pci":301,"signal_strength":-60}"""
+            """{"rsrp":-85,"band":"78","band_label":"N78","arfcn":633984,"pci":301,"signal_strength":-60}"""
         )
-        assertEquals("n78", nr.band_label)
+        assertEquals("N78", nr.band_label)
         assertEquals(633984L, nr.arfcn)
         assertEquals(301, nr.pci)
         assertTrue(nr.isNr)
@@ -242,12 +242,15 @@ class DeviceResponsesTest {
      * 所以正确做法是"值不变、显示转大写"，而不是去改 core 拼出来的字符串。
      */
     @Test
-    fun `频段显示转大写 但 band_label 原值与 isNr 判定不受影响`() {
-        val nr = AppJson.decodeFromString<SignalInfo>("""{"band_label":"n78","rsrp":-85}""")
+    fun `频段由 core 拼大写 isNr 判定大小写不敏感`() {
+        val nr = AppJson.decodeFromString<SignalInfo>("""{"band_label":"N78","rsrp":-85}""")
         assertEquals("N78", nr.bandLabelDisplay)
-        // 值保持 core 的原样 —— isNr 仍靠小写 n 判 5G
-        assertEquals("n78", nr.band_label)
+        // core 源头已拼大写（ServingCell.derive 用 "N$num"），客户端不再转大小写
+        assertEquals("N78", nr.band_label)
+        // 判据不挑大小写 —— 这是"在源头改大小写"能成立的前提，必须钉住
         assertTrue(nr.isNr)
+        // 即便设备/旧 core 送来小写 n78，判定仍是 5G（向后兼容）
+        assertTrue(AppJson.decodeFromString<SignalInfo>("""{"band_label":"n78"}""").isNr)
 
         // LTE 本来就是大写 B，转大写后不变，且不误判成 5G
         val lte = AppJson.decodeFromString<SignalInfo>("""{"band_label":"B3"}""")

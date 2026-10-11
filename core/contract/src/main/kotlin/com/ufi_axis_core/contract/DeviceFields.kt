@@ -363,7 +363,7 @@ object DeviceFields {
         /** 服务小区频段号，纯数字（`"78"` / `"3"`）。 */
         const val BAND = "band"
 
-        /** 频段显示名，由 core 拼好（`"n78"` / `"B3"`）。前端直接显示，不要自己拼前缀。 */
+        /** 频段显示名，由 core 拼好（`"N78"` / `"B3"`，前缀大写）。前端直接显示，不要自己拼前缀。 */
         const val BAND_LABEL = "band_label"
 
         /** 服务小区频点（NR-ARFCN 或 EARFCN）。 */

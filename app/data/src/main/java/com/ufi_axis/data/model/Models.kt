@@ -291,7 +291,7 @@ data class SignalInfo(
     val network_registered: Boolean? = null,
     /** 服务小区频段号，纯数字（`"78"` / `"3"`）。 */
     val band: String? = null,
-    /** 频段显示名，core 拼好（`"n78"` / `"B3"`）。 */
+    /** 频段显示名，core 拼好（`"N78"` / `"B3"`，前缀大写）。 */
     val band_label: String? = null,
     /** 服务小区频点（NR-ARFCN 或 EARFCN）。 */
     val arfcn: Long? = null,
@@ -306,22 +306,17 @@ data class SignalInfo(
     val isNr: Boolean get() = band_label?.startsWith("n", ignoreCase = true) == true
 
     /**
-     * 频段的**显示**文案：把 core 的小写 `n` 前缀转成大写 —— `n78` → `N78`。
+     * 频段的**显示**文案：`band_label` 去掉首尾空白后的值，空值返回 null。
      *
-     * 2026-10-11 用户裁决（显示层转大写，不改 core 的值）：
-     * 3GPP 的频段号官方写法就是大写 `N78` / `B3`，core 拼的是 `n78`（小写 n）。
+     * 2026-10-11：原先这里做 `.uppercase()`（core 当时拼的是小写 `n78`），
+     * 现已改为**在 core 源头拼大写**（`ServingCell.derive` 拼 `"N$num"`）——
+     * 源头改一次、app 与 web 两端自动都对，不必各改一处、各出一个包。
+     * 所以本属性现在只做 trim 与空值归一，不再转大小写。
      *
-     * 为什么不在 core 侧改成大写（那才是"更靠源头"的做法）：
-     * `band_label` 的小写 `n` 已经被两处逻辑当成**判据**在用 ——
-     * [isNr] 用 `startsWith("n")` 判 5G，core 自己的 `ServingCell.derive` 与
-     * 三个测试（SignalCollectorTest / ZteGoformProfileTest）也按 `n78` 断言。
-     * 改 core 会连带改这些判据与断言，风险远大于收益。
-     * 所以：**值保持 core 的原样，只在显示时转大写**，判据一侧完全不受影响。
-     *
-     * 空/空白原样返回 null，让调用方沿用各自的"无数据"处理（多数是省略显示）。
+     * 判据一侧不受影响：[isNr] 用 `startsWith("n", ignoreCase = true)`，大小写不敏感。
      */
     val bandLabelDisplay: String?
-        get() = band_label?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()
+        get() = band_label?.trim()?.takeIf { it.isNotEmpty() }
 }
 
 @Serializable

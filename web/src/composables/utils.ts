@@ -176,7 +176,7 @@ export function networkTypeLabel(type: string): string {
  * 网络类型 + 当前注册频段，如 `5G n78` / `4G B3`。
  *
  * 频段直接读 `/api/network/signal`（及同源 WS signal 推送）的 **`band_label`** ——
- * 它是 core 派生的服务小区统一字段，前缀已经拼好（`"n78"` / `"B3"`）。
+ * 它是 core 派生的服务小区统一字段，前缀已经拼好（`"N78"` / `"B3"`，大写）。
  *
  * 2026-08-29 修：原来自己按 `networkTypeLabel(type)` 分制式，5G 取 `nr_band` 拼 `N`、
  * 否则取 `lte_band` 拼 `B`。两个问题：① 拼前缀的规则在 core 与 web 各有一份，会漂移
@@ -184,15 +184,14 @@ export function networkTypeLabel(type: string): string {
  * 于是走进 LTE 分支贴上 4G 频段，而 core 的 `ServingCell.derive` 明确按字段存在性取 NR。
  * `band_label` 缺失（两侧都没值）就只显示制式，不编造。
  *
- * 2026-10-11 用户裁决：显示层把频段转**大写** —— `n78` → `N78`（3GPP 官方写法）。
- * 只改显示、不改 core 派生的 `band_label` 原值：那把值已被
- * `SignalInfo.isNr`（startsWith("n") 判 5G）与 core 的 `ServingCell.derive`
- * 及多个测试当**判据**用，改它会连带波及这些判据与断言。
- * 与 app 侧 `SignalInfo.bandLabelDisplay` 是同一套处理。
+ * 2026-10-11 用户裁决：频段前缀在 **core 源头**就拼成大写（`N78` / `B3`），
+ * 所以这里**不需要**再 toUpperCase —— 源头改一次、app 与 web 两端自动都对，
+ * 不必各改一处、各出一个包。判据一侧不受影响：app `SignalInfo.isNr` 用
+ * `startsWith("n", ignoreCase = true)`，大小写不敏感。
  */
 export function networkTypeWithBand(type: string, signal?: Record<string, any> | null): string {
   const label = networkTypeLabel(type);
-  const band = signal?.band_label ? String(signal.band_label).trim().toUpperCase() : '';
+  const band = signal?.band_label ? String(signal.band_label).trim() : '';
   return band ? `${label} ${band}` : label;
 }
 

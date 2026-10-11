@@ -1001,7 +1001,7 @@ class ZteGoformProfileTest {
         )
         val cell = ServingCell.derive(canon)
         assertEquals(JsonPrimitive("78"), cell[DeviceFields.Signal.BAND])
-        assertEquals(JsonPrimitive("n78"), cell[DeviceFields.Signal.BAND_LABEL])
+        assertEquals(JsonPrimitive("N78"), cell[DeviceFields.Signal.BAND_LABEL])
         assertEquals(JsonPrimitive(633984L), cell[DeviceFields.Signal.ARFCN])
         assertEquals(JsonPrimitive(301L), cell[DeviceFields.Signal.PCI])
         assertEquals(JsonPrimitive(-60L), cell[DeviceFields.Signal.SIGNAL_STRENGTH])
@@ -1042,7 +1042,7 @@ class ZteGoformProfileTest {
                 "network_type" to "NSA", "Nr_bands" to "78", "Lte_bands" to "3",
             ),
         )
-        assertEquals(JsonPrimitive("n78"), cell[DeviceFields.Signal.BAND_LABEL])
+        assertEquals(JsonPrimitive("N78"), cell[DeviceFields.Signal.BAND_LABEL])
     }
 
     @Test
@@ -1083,7 +1083,7 @@ class ZteGoformProfileTest {
 
         val nr = ZteGoformProfile.writeSpec(SettingKey.BAND_LOCK_NR)!!
         assertEquals("NR_BAND_LOCK", nr.command)
-        assertNotNull(nr.validate(mapOf("value" to "n78")))
+        assertNotNull(nr.validate(mapOf("value" to "N78")))
     }
 
     /**
