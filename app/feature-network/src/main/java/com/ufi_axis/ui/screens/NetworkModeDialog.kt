@@ -143,6 +143,8 @@ fun NetworkModeDialog(
                 // 左：制式名（大字）+ 紧邻其下的信号强度评级
                 Column(
                     Modifier.weight(1f),
+                    // 居中：制式名 / 信号徽章 / 状态徽章成一列，同一条中轴线。
+                    horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(Spacing.Small)
                 ) {
                     // 制式名是这个弹窗的主角，用 displaySmall（比 dialogTitle 大两档）。
@@ -155,9 +157,13 @@ fun NetworkModeDialog(
                     // 所以 maxLines = 1：代价是极端长文案会被 ellipsis 截断，
                     // 换来的是**布局恒定** —— 对「当前状态展示区」而言恒定布局优先于完整文案。
                     // 制式名本身很短（最长「5G/4G/3G」），实际极少触发截断。
+                    // 制式名是这个弹窗的主角。2026-10-11 用户要求"再大一点"：
+                    // displaySmall → **displayMedium**（再上一档）。
+                    // maxLines = 1 + Ellipsis：左边是一个"值"、右边是恒为两行的 2×2 网格，
+                    // 高度必须恒定才对得起来（见本文件 KDoc ⑥）。
                     Text(
                         text = modeLabel,
-                        style = MaterialTheme.typography.displaySmall.copy(fontWeight = UfiWeight.Strong),
+                        style = MaterialTheme.typography.displayMedium.copy(fontWeight = UfiWeight.Strong),
                         color = palette.textPrimary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -167,31 +173,60 @@ fun NetworkModeDialog(
                     // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
                     // 5G SA 下常为 null，所以**不用它判等级**，只当右侧那格读数展示 ——
                     // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
+                    //
+                    // 2026-10-11：文字 → 公共 [UfiBadge]，与制式名同列居中。
+                    // 之前是 bodySmall 裸文字，和右边读数同一档、看不出是"状态"；
+                    // badge 有底色和描边，一眼就能和静态读数区分开。
                     val rsrp = state.signalInfo?.rsrp
-                    Text(
+                    UfiBadge(
                         text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = signalColor(rsrp)
+                        // 徽章色走 [signalBars] 的等级（1..5），**不自己判 dBm 阈值**。
+                        // signalLevelText / signalBars 是唯一分档真源（UfiSignalBars.kt:20-42），
+                        // 那里的 KDoc 明确写了「与外部调用点同源，别分叉」——
+                        // 本轮之前我就在这里手写过一套 -90/-105 的阈值，把「差」错标成 INFO。
+                        type = when (rsrp?.let { signalBars(it) }) {
+                            4, 5 -> UfiBadgeType.SUCCESS
+                            3 -> UfiBadgeType.INFO
+                            else -> UfiBadgeType.WARNING
+                        },
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
                     )
                     if (switching || state.modeSwitchTimedOut) {
                         UfiBadge(
                             text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
-                            type = UfiBadgeType.WARNING
+                            type = UfiBadgeType.WARNING,
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
                         )
                     }
                 }
                 // 右：PCI / 频点 / SINR / RSRQ —— 2×2 网格
+                //
+                // 2026-10-11 用 [UfiInfoCell] 而不是 [UfiDialogInfoRow]：
+                // 后者是**左右**分列（Row: 左 label 右 value），格子只有半屏宽时长值
+                // 会被挤进省略号或直接换行（用户报的"频点出现换行"）。而 [UfiInfoCell] 是
+                // **上下**排 —— 标签一行、值一行，值固定 maxLines=1 + Ellipsis。
+                // 它的 KDoc 早就写明了这条取舍：「格子宽度只有半屏时，左右分列会让长值
+                // 立刻被挤进省略号，所以网格里必须上下排」「值换行会把同排另一格顶歪」。
+                // 换句话说：这不是新需求，是公共组件早就为这种网格准备好的形态。
                 Column(
                     Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
                 ) {
-                    Row(Modifier.fillMaxWidth()) {
-                        UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--", modifier = Modifier.weight(1f))
-                        UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--", modifier = Modifier.weight(1f))
+                    // 行内横向留 Spacing.Medium：两格都是 weight(1f)，不给间距时
+                    // 「频点」的长值会紧贴右边那格的标签（用户报的"没有间隔"）。
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                    ) {
+                        UfiInfoCell("PCI", state.signalInfo?.pci?.toString() ?: "--", Modifier.weight(1f))
+                        UfiInfoCell("频点", state.signalInfo?.arfcn?.toString() ?: "--", Modifier.weight(1f))
                     }
-                    Row(Modifier.fillMaxWidth()) {
-                        UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", modifier = Modifier.weight(1f))
-                        UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", modifier = Modifier.weight(1f))
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                    ) {
+                        UfiInfoCell("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", Modifier.weight(1f))
+                        UfiInfoCell("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", Modifier.weight(1f))
                     }
                 }
             }

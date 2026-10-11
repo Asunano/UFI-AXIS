@@ -141,6 +141,29 @@ class DialogShellGuardTest {
         )
     }
 
+    /**
+     * 2026-10-11：信号等级**不得**在本文件里手写 dBm 阈值。
+     *
+     * `signalLevelText` / `signalBars` 是唯一分档真源（`UfiSignalBars.kt:20-42`，
+     * 5 档：-80/-90/-100/-115），其 KDoc 明确写「与外部调用点同源，别分叉」。
+     * 本轮曾手写一套 `-90/-105`，结果把「差」错标成 INFO —— 与真源分档不一致，
+     * 同一个 RSRP 在别处显示「差」而这里显示「一般」。
+     */
+    @Test
+    fun networkModeDialog_mustNotForkSignalThresholds() {
+        val code = executableCode(
+            source("feature-network/src/main/java/com/ufi_axis/ui/screens/NetworkModeDialog.kt")
+        )
+        assertFalse(
+            "信号等级必须走 signalLevelText / signalBars，不得手写 dBm 阈值",
+            Regex("rsrp\\s*>=\\s*-\\d+").containsMatchIn(code)
+        )
+        assertTrue(
+            "应复用公共分档函数 signalLevelText",
+            code.contains("signalLevelText(")
+        )
+    }
+
     /** 剥掉注释，只留可执行代码（KDoc 里反复出现 `UfiCustomDialog` 这些名字）。 */
     private fun executableCode(text: String): String =
         text.replace(Regex("""/\*[\s\S]*?\*/"""), "")
