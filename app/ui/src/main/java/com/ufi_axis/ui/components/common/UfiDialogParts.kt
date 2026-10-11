@@ -290,10 +290,17 @@ fun UfiDialogSwitchField(
  * 用于不需要编辑的字段展示（如设备型号、IP 地址等）。
  */
 @Composable
-fun UfiDialogInfoRow(label: String, value: String, multiline: Boolean = false) {
+fun UfiDialogInfoRow(
+    label: String,
+    value: String,
+    multiline: Boolean = false,
+    // 2026-10-10 为网络制式弹窗的 2×2 读数网格新增：默认值 Modifier 保持既有调用点
+    // 行为逐字节不变（F24 冻结口径下的向后兼容新增），需要并排分栏时传 weight(1f)。
+    modifier: Modifier = Modifier
+) {
     val palette = LocalResolvedPalette.current
     Row(
-        Modifier.fillMaxWidth(),
+        modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = if (multiline) Alignment.Top else Alignment.CenterVertically
     ) {

@@ -9,6 +9,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
@@ -81,42 +82,79 @@ fun NetworkModeDialog(
     val modeLabel = deviceSettingsState.settings?.networkModeLabel
         ?: NetworkMode.label(displayMode)
 
+    // 2026-10-10：下拉改成 [UfiSingleChipSelector] + 确认/取消按钮后，选择不再即时下发 ——
+    // 弹窗内先选、再按「确定」才下发，「取消」直接丢弃。
+    // 与旧下拉的关键差别：下拉是"点开→选中即刻生效"，而制式切换会让设备重新搜网、断流数秒，
+    // 让用户在浮层里一按就触发副作用、又没有反悔余地。
+    // 每次打开弹窗重置为设备当前档位（见下面的 LaunchedEffect(visible)）。
+    var pendingSelection by remember(visible) { mutableStateOf(displayMode) }
+    val selectionChanged = pendingSelection != displayMode
+
     UfiCustomDialog(
         visible = visible,
         onDismiss = onDismiss,
         title = "网络制式",
         icon = rememberVectorPainter(Icons.Filled.SignalCellularAlt),
-        showCloseButton = false
+        showCloseButton = false,
+        // 按钮走壳子自带的 confirmButton / dismissButton 槽位，**不塞进 content**。
+        // 两个坑（都写在 UfiCustomDialog 的 KDoc 里）：
+        // 1. 塞进 content 的话按钮不会吸底，弹窗内容一多就跟着滚走；
+        // 2. 壳子已在 weight(1f) Box 内包裹两键（2026-08-11 修的「Standard 档UfiButton
+        //    默认 fillWidth=true 会占满整行、把确认键挤出屏幕，只剩取消」）。
+        // 所以这里只给按钮本体，weight / 分隔线 / 间距都由壳子负责。
+        confirmButton = {
+            UfiButton(
+                text = "确定",
+                enabled = selectionChanged && !switching && !state.modeSwitchTimedOut,
+                // 无改动时置灰：没有要下发的东西，别让用户以为已经生效。
+                onClick = {
+                    // 只在真有改动时下发，避免"按确定"却跑一趟无意义的重新搜网。
+                    if (selectionChanged) viewModel.network.setNetworkMode(pendingSelection)
+                    onDismiss()
+                }
+            )
+        },
+        dismissButton = {
+            UfiButton(
+                text = "取消",
+                variant = UfiButtonVariant.Secondary,
+                // 取消**不跟随**确认键的 enabled：enabled 表达的是"确认动作当前能否执行"，
+                // 而"放弃并关闭"在任何状态下都应点得动（见 UfiDialogActions 的同名注释）。
+                onClick = onDismiss
+            )
+        }
     ) {
         UfiDialogBody {
-            // ── 顶部左右布局：左「网络信息」四行，右「制式名 + 信号强度」──
+            // ── 顶部：左「制式名 + 信号强度」，右「网络信息 2×2」──
+            //
+            // 2026-10-10 用户裁决：左右互换（制式在左），四行读数改 2×2 网格，
+            // 制式名字号放大到与 2×2 那一块的上下宽度对齐。
+            //
+            // 为什么左右两边都 weight(1f)：制式名「5G/4G/3G」这类最长文案要能撑住左半，
+            // 而右边 2×2 每格label+值也要够宽 —— 任一边固定宽度都会让另一边挤。
             Row(
                 Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
             ) {
-                // 左：PCI / 频点 / SINR / RSRQ
+                // 左：制式名（大字）+ 紧邻其下的信号强度评级
                 Column(
                     Modifier.weight(1f),
                     verticalArrangement = Arrangement.spacedBy(Spacing.Small)
                 ) {
-                    UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--")
-                    UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--")
-                    UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--")
-                    UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--")
-                }
-                // 右：制式名（大字）+ 紧邻其下的信号强度评级
-                Column(
-                    Modifier.weight(1f),
-                    horizontalAlignment = Alignment.End,
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-                ) {
+                    // 用 displaySmall 而不是 dialogTitle：制式名是这个弹窗的主角，
+                    // 而 dialogTitle(headlineSmall) 与右侧读数字号同档、撑不起"主角"的观感。
+                    // fillMaxWidth + 居中让长文案（如「5G/4G/3G」）也能占满左半并视觉居中，
+                    // 与右边 2×2 的上下宽度对齐。
                     Text(
                         modeLabel,
-                        style = UfiTextStyles.dialogTitle.copy(fontWeight = UfiWeight.Strong),
-                        color = palette.textPrimary
+                        style = MaterialTheme.typography.displaySmall.copy(fontWeight = UfiWeight.Strong),
+                        color = palette.textPrimary,
+                        maxLines = 2,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center
                     )
                     // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
-                    // 5G SA 下常为 null，所以**不用它判等级**，只当左侧那行读数展示 ——
+                    // 5G SA 下常为 null，所以**不用它判等级**，只当右侧那格读数展示 ——
                     // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
                     val rsrp = state.signalInfo?.rsrp
                     Text(
@@ -131,14 +169,31 @@ fun NetworkModeDialog(
                         )
                     }
                 }
+                // 右：PCI / 频点 / SINR / RSRQ —— 2×2 网格
+                Column(
+                    Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                ) {
+                    Row(Modifier.fillMaxWidth()) {
+                        UfiDialogInfoRow("PCI", state.signalInfo?.pci?.toString() ?: "--", modifier = Modifier.weight(1f))
+                        UfiDialogInfoRow("频点", state.signalInfo?.arfcn?.toString() ?: "--", modifier = Modifier.weight(1f))
+                    }
+                    Row(Modifier.fillMaxWidth()) {
+                        UfiDialogInfoRow("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", modifier = Modifier.weight(1f))
+                        UfiDialogInfoRow("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", modifier = Modifier.weight(1f))
+                    }
+                }
             }
 
-            // ── 切换制式：整行可点的选择器，不用「一行文字 + 一个按钮」──
+            // ── 切换制式：chip 单选 + 确认/取消 ──
             //
-            // 初版是 `UfiDialogField("切换制式") { UfiDropdown(...) }`，那个组件是**同行**布局
-            //（`Row`：左 label 右控件），视觉上退化成"左边一个文字标签、右边一个控件"的
-            // 表单行，用户反馈「太丑」。改成**上下两块**：标题独立一行，下拉独占整行宽度 ——
-            // 控件有足够宽度显示完整制式名，也不再和标签挤在同一行。
+            // 2026-10-10 用户裁决：下拉改 chip 选择器，并加确认/取消按钮。
+            // 两处一起改是有因果的：下拉是"点开浮层选中即刻生效"，没有反悔余地；
+            // 而制式切换会让设备重新搜网、断流数秒。改成 chip 后 6 个档位平铺可见、
+            // 先选后确认，「取消」能真正丢弃选择。
+            //
+            // 用 [UfiSingleChipSelector]（chip 本体）而不是 [UfiDialogChipSelector]：
+            // 后者自带 `UfiDialogField` 的同行标签布局，而这里标签要独占一行。
             Column(Modifier.fillMaxWidth()) {
                 Text(
                     "切换制式",
@@ -146,14 +201,12 @@ fun NetworkModeDialog(
                     color = palette.textSecondary
                 )
                 Spacer(Modifier.height(Spacing.Small))
-                UfiDropdown(
-                    selectedValue = displayMode,
-                    options = NetworkMode.UI_OPTIONS,
-                    onValueSelected = { key ->
-                        // 选中当前档位不下发：设备会重新搜网，白跑一趟还让界面停在"切换中"。
-                        if (key != displayMode) viewModel.network.setNetworkMode(key)
-                    },
-                    optionLabel = { NetworkMode.label(it) }
+                UfiSingleChipSelector(
+                    options = NetworkMode.UI_OPTIONS.map { it to NetworkMode.label(it) },
+                    selectedValue = pendingSelection,
+                    onSelect = { pendingSelection = it },
+                    // 6 项超过一行：靠 wrap 折行，而不是让 chip 横向挤成一排看不清的字。
+                    wrap = true
                 )
             }
 
@@ -165,9 +218,13 @@ fun NetworkModeDialog(
                         else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
                     }
                 )
+            } else if (selectionChanged) {
+                // 选了新档位但还没确认：把"将要发生什么"讲在确认键之前。
+                UfiDialogNote("确定后将切换到「${NetworkMode.label(pendingSelection)}」，设备会重新搜网并短暂断流。")
             } else {
                 UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
             }
+
         }
     }
 }
