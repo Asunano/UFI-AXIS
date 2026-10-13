@@ -1206,7 +1206,25 @@ internal fun chartGapLimitAt(dts: LongArray, index: Int, bucketMs: Long): Long {
     val window = dts.copyOfRange(from, to + 1)
     window.sort()
     val localMedian = window[window.size / 2].coerceAtLeast(1L)
-    return maxOf(bucketMs * 2L, localMedian * 3L)
+    // 2026-10-12：去掉 `bucketMs * 2` 这个下限，门槛只由邻域节奏决定。
+    //
+    // 为什么它必须去掉 —— bucketMs 是**绘图分辨率**（可见区间 / MAX_POINTS），不是采集节奏。
+    // 实测日志里两种错法都出现在它身上：
+    //   · 长区间：bucketMs=2520000（42 分钟）而真实采样间距 360000（6 分钟），桶粗 7 倍。
+    //     `bucketMs*2` 门槛高达 84 分钟，于是「漏 1 拍」（12 分钟）这种正常抖动也被连成直线
+    //     —— 该断的不断，图在说谎。
+    //   · 短区间：bucketMs=21000 而真实间距 63000，桶细 1/3。门槛被压到 42 秒，正常间隔
+    //     反而显得"异常" —— 不该断的断了。
+    // 也就是说这一个下限在两个方向上都能出错，根源是它量纲错了：它把"绘制粒度"当成了
+    // "采集节奏"，而后者才是判据。邻域中位数已经是可靠的节奏估计（抗离群、跟随局部节奏变化），
+    // 再叠一个外来量纲只会引入偏差。
+    //
+    // 全局版 [chartGapLimit] 保留 `bucketMs * 2` 不动：它服务的是"采样比桶密（服务端原样返回
+    // 原始行）"这一种边界情形，由 `采样比桶密时桶宽下限生效` 一条测试钉住。分段判定只用局部版。
+    //
+    // bucketMs 形参保留：调用点 [chartSegments] 仍用它做 `bucketMs <= 0` 的早退判断
+    // （旧 core 不回该字段时完全不断线，保持既有行为）。
+    return localMedian * 3L
 }
 
 /**
@@ -1216,20 +1234,58 @@ internal fun chartGapLimitAt(dts: LongArray, index: Int, bucketMs: Long): Long {
  * 所以同一条序列里的密集区与稀疏区各按各的节奏被衡量。
  * 早退条件与 [chartGapLimit] 一致（`bucketMs <= 0` 或点数 < 3 时不断线），行为不变。
  */
+/**
+ * 图表诊断日志出口（2026-10-12，临时）。
+ *
+ * 为什么在这里开一个 sink 而不是直接写 android.util.Log：用户要看的是**App 内调试日志页**
+ * （AppFileLogger），而 [DebugLog] 在 `:app:data`，`:app:ui` 不依赖它（也不能为此加一条
+ * 模块依赖）。所以由 `:app:feature-monitor` 在组合时把 [DebugLog.i] 注册进来，
+ * 图表层只管调[log]，两边解耦。
+ *
+ * 没注册时（单测、其他调用方）静默丢弃——诊断日志不能影响主流程。
+ */
+object UfiChartDiagnostics {
+    @Volatile
+    var sink: ((String) -> Unit)? = null
+
+    fun log(msg: String) {
+        sink?.invoke(msg)
+    }
+}
+
 internal fun chartSegments(points: List<UfiDownsampledPoint>, bucketMs: Long): List<IntRange> {
     if (points.isEmpty()) return emptyList()
     // 与 chartGapLimit 的早退语义对齐：桶宽未知、或点数少到算不出节奏时，宁可整条连起来
-    if (bucketMs <= 0L || points.size < 3) return listOf(0..(points.size - 1))
+    if (bucketMs <= 0L || points.size < 3) {
+        // 早退也是诊断信息：bucketMs=0（旧 core 不回该字段）会让**所有**图表都走"完全不断线"，
+        // 与"判定过严导致满屏碎段"是完全相反的症状，两者必须能区分。
+        UfiChartDiagnostics.log(
+            "segments bypass: n=${points.size} bucketMs=$bucketMs " +
+                "pts=[${points.first().t},${points.last().t}]"
+        )
+        return listOf(0..(points.size - 1))
+    }
     val dts = LongArray(points.size - 1) { i -> points[i + 1].t - points[i].t }
     val out = ArrayList<IntRange>(4)
     var segStart = 0
+    val cuts = ArrayList<String>(4)   // 诊断：记录每个被切断的间距
     for (i in 1 until points.size) {
-        if (dts[i - 1] > chartGapLimitAt(dts, i - 1, bucketMs)) {
+        val limit = chartGapLimitAt(dts, i - 1, bucketMs)
+        if (dts[i - 1] > limit) {
+            cuts += "i=$i dt=${dts[i - 1]}ms limit=${limit}ms"
             out += segStart..(i - 1)
             segStart = i
         }
     }
     out += segStart..(points.size - 1)
+    // 诊断（2026-10-12，临时）：切段结果 + 每个切口的实际间距与门槛。
+    // 满屏碎段 vs 正常稀疏，两者在这行里一眼可辨：碎段是 cuts 很多且 limit 普遍偏小，
+    // 正常是 cuts 很少或没有。间距分布也一并打出来，用来核对"双峰节奏"假设是否成立。
+    UfiChartDiagnostics.log(
+        "segments n=${points.size} segs=${out.size} bucketMs=$bucketMs " +
+            "dt[min=${dts.minOrNull()}med=${dts.sorted()[dts.size / 2]}max=${dts.maxOrNull()}] " +
+            "cuts(${cuts.size})=${cuts.take(6).joinToString(" | ")}"
+    )
     return out
 }
 

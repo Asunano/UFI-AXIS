@@ -589,8 +589,6 @@ private fun classifyPushError(message: String?): Pair<String, String> {
 // [UpdateProgressRing]、错误分类 [classifyPushError] 都在本文件里。
 // 原 app/src/.../UpdateDialog.kt（只会「前往下载」跳浏览器的那个）已随本次改动删除。
 
-/** 更新日志折叠时显示的行数。超过就给一个「展开」，不做限高嵌套滚动（外层弹窗本身就能滚）。 */
-private const val CHANGELOG_COLLAPSED_LINES = 5
 
 /**
  * 统一更新提示弹窗：**同一时刻只有这一个更新弹窗**。
@@ -638,13 +636,35 @@ fun UnifiedUpdateDialog(
         // 要离开只能按「稍后」（它同时是取消入口）。返回键仍然放行 —— 那是 Android 的
         // 系统级退出手势，屏蔽它会让人以为界面卡死。
         dismissOnClickOutside = false,
+        // 2026-10-12（用户要求）：主更新动作（更新 / 下载 / 安装）从内容区移到**底部按钮行**，
+        // 与「稍后」并排成「左取消 / 右更新」—— 原来更新按钮在弹窗正中间悬着，
+        // 下面还有一行按钮，视觉上像两个不相干的操作区。
+        //
+        // 一次只对一个目标给主按钮：core 段优先（先升 core 才能连上），否则 app。
+        // 二次确认态只显示「确认更新 Core」，因为那时用户已经按过一次更新，
+        // 再放别的按钮会让"下一步是什么"变得不确定。
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            when {
+                coreConfirming -> UfiButton(
+                    text = "确认更新 Core",
+                    onClick = {
+                        coreConfirming = false
+                        onCoreUpdateConfirmed()
+                    }
+                )
+                state.showCoreSection -> CoreUpdateFooterButton(state = state, onRequestConfirm = { coreConfirming = true })
+                state.showAppSection -> AppUpdateFooterButton(state = state.app, onDownload = onDownloadApp, onInstall = onInstallApp)
+                else -> Unit
+            }
+        },
         dismissButton = {
-            // 关闭动作交给 shell 排时序（见 LocalUfiDialogClose）。内容里的
-            // 「下载 / 安装 / 更新 Core / 确认更新 Core」都在弹窗内继续展示进度，所以都不包。
+            // 关闭动作交给 shell 排时序（见 LocalUfiDialogClose）。内容里不再有任何可点按钮，
+            // 所以这里不需要额外注释包close。
             val close = LocalUfiDialogClose.current
             UfiButton(
                 variant = UfiButtonVariant.Secondary,
-                text = "稍后",
+                text = if (state.hasAnyUpdate) "稍后" else "关闭",
                 onClick = { close(onDismiss) }
             )
         }
@@ -665,11 +685,7 @@ fun UnifiedUpdateDialog(
                     latestVersion = state.app.latestVersion,
                     changelog = state.app.changelog
                 ) {
-                    AppUpdateAction(
-                        state = state.app,
-                        onDownload = onDownloadApp,
-                        onInstall = onInstallApp
-                    )
+                    AppUpdateProgressOnly(state = state.app)
                 }
             }
 
@@ -680,16 +696,7 @@ fun UnifiedUpdateDialog(
                     latestVersion = state.coreLatestVersion,
                     changelog = state.coreChangelog
                 ) {
-                    CoreUpdateAction(
-                        state = state,
-                        confirming = coreConfirming,
-                        onRequestConfirm = { coreConfirming = true },
-                        onCancelConfirm = { coreConfirming = false },
-                        onConfirmed = {
-                            coreConfirming = false
-                            onCoreUpdateConfirmed()
-                        }
-                    )
+                    CoreUpdateProgressOnly(state = state)
                 }
             }
         }
@@ -706,7 +713,7 @@ private fun UpdateTargetBlock(
     currentVersion: String,
     latestVersion: String,
     changelog: String,
-    action: @Composable () -> Unit
+    content: @Composable () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
     Column(Modifier.fillMaxWidth()) {
@@ -719,28 +726,19 @@ private fun UpdateTargetBlock(
             style = UfiTextStyles.bodyEmphasis,
             color = palette.textPrimary
         )
+        // 2026-10-12（用户要求）：删除「展开更新日志」。原来折叠到3 行 + 一个展开按钮，
+        // 而外层是 [UfiScrollableDialog]—— 弹窗本身就滚，长日志天然可以滚着看，
+        // 再套一层折叠/展开按钮只是多一次点击，还让用户以为下面被截断了什么。
         if (changelog.isNotBlank()) {
             Spacer(Modifier.height(Spacing.Small))
-            var expanded by remember { mutableStateOf(false) }
-            val lines = remember(changelog) { changelog.trim().lines() }
             Text(
-                text = if (expanded) lines.joinToString("\n")
-                else lines.take(CHANGELOG_COLLAPSED_LINES).joinToString("\n"),
+                text = changelog.trim(),
                 style = MaterialTheme.typography.bodySmall,
                 color = palette.textSecondary
             )
-            if (lines.size > CHANGELOG_COLLAPSED_LINES) {
-                Spacer(Modifier.height(Spacing.Small))
-                UfiButton(
-                    variant = UfiButtonVariant.Subtle,
-                    size = UfiButtonSize.Small,
-                    text = if (expanded) "收起更新日志" else "展开更新日志",
-                    onClick = { expanded = !expanded }
-                )
-            }
         }
         Spacer(Modifier.height(Spacing.Medium))
-        action()
+        content()
     }
 }
 
@@ -751,30 +749,25 @@ private fun UpdateTargetBlock(
  * 下载进度用公共 [UpdateProgressRing]（116dp 圆环 + 中心百分比），与本地推送
  * [ApkPushDialog]、Core 项统一同一套视觉。顺序弹窗下同时只渲染一块，无两环溢出风险。
  */
+/**
+ * App 项的**进度/结果展示**（2026-10-12：从 [AppUpdateAction] 拆分）。
+ *
+ * 原来这个组件同时管展示和按钮，按钮因此落在弹窗内容区正中间，而「稍后」在底部按钮行 ——
+ * 两个操作区上下分离。拆分后：内容区只管"现在到哪一步了"，按钮统一交给弹窗底部行。
+ * 「下载 / 安装」两个按钮的文案与状态映射见 [AppUpdateFooterButton]。
+ */
 @Composable
-private fun AppUpdateAction(
-    state: FrontendUpdateState,
-    onDownload: () -> Unit,
-    onInstall: () -> Unit
-) {
+private fun AppUpdateProgressOnly(state: FrontendUpdateState) {
     val palette = LocalResolvedPalette.current
     when (state.state) {
-        "available" -> UfiButton(
-            size = UfiButtonSize.Small,
-            text = "下载",
-            onClick = onDownload
-        )
+        // 待下载 / 已下载完成这两态内容区不再显示任何东西 —— 下一步是什么由底部按钮讲，
+        // 内容区再放一遍"下载"按钮只会让用户以为有两个不同的下载入口。
+        "available", "downloaded" -> {}
 
         "downloading" -> UpdateProgressRing(
             progress = state.downloadProgress.coerceIn(0, 100) / 100f,
             caption = "正在下载安装包",
             subCaption = "请保持网络连接"
-        )
-
-        "downloaded" -> UfiButton(
-            size = UfiButtonSize.Small,
-            text = "安装",
-            onClick = onInstall
         )
 
         "installing" -> Text(
@@ -794,33 +787,40 @@ private fun AppUpdateAction(
         else -> {}
     }
 }
+
 /**
- * Core 项的操作区，三段式：**待确认 → 二次确认 → 更新中/结果**。
+ * App 项的**底部主按钮**（2026-10-12 新增，配合「左取消 / 右更新」的按钮行）。
  *
- * 触发走的是 `ToolsModule.triggerDeviceUpdate()`（`POST /api/update/check`）——
- * 这个方法一直存在但在本次改动前**全仓没有任何调用方**，App 端更新 core 只剩"手动选 APK 推送"。
+ * 返回 null 表示当前态不提供主按钮（下载中 / 安装中 / 失败）——那时用户唯一该做的是等，
+ * 给一个点不动的按钮反而像卡住了。
+ */
+@Composable
+private fun AppUpdateFooterButton(
+    state: FrontendUpdateState,
+    onDownload: () -> Unit,
+    onInstall: () -> Unit
+) {
+    when (state.state) {
+        "available" -> UfiButton(text = "下载更新", onClick = onDownload)
+        "downloaded" -> UfiButton(text = "安装更新", onClick = onInstall)
+        else -> Unit
+    }
+}
+
+/**
+ * Core 项的**进度/结果展示**（2026-10-12：从 [CoreUpdateAction] 拆分，与 App 侧同构）。
  *
- * 必须二次确认：这条接口不是"检查"，是 core 自己下载 + 校验 + 安装 + **重启服务**一条龙，
- * 期间 8088 不可达十几秒。所以点一下不能直接发，先把后果讲清楚。
+ * 触发走 `ToolsModule.triggerDeviceUpdate()`（`POST /api/update/check`）：core 自己下载 +
+ * 校验 + 安装 + 重启服务一条龙，期间 8088 不可达十几秒。
  *
- * 触发后展示真实进度而不是直接"完成"：`triggerDeviceUpdate()` 内部会
- * `startDeviceUpdatePolling()`（每 2s 打 `GET /api/update/status`），进度经
- * `updateDeviceState` 回到 [UpdatePromptState.coreStatus]。重启窗口里轮询会失败，
- * ToolsModule 已把连续失败翻译成 `reconnecting=true` 的过渡态，这里照它渲染，
+ * 触发后展示真实进度而不是直接"完成"：内部每 2s 打 `GET /api/update/status`，重启窗口里
+ * 轮询会失败，ToolsModule 已把连续失败翻译成 `reconnecting=true` 的过渡态，这里照它渲染，
  * 不把"暂时连不上"显示成失败。
  */
 @Composable
-private fun CoreUpdateAction(
-    state: UpdatePromptState,
-    confirming: Boolean,
-    onRequestConfirm: () -> Unit,
-    onCancelConfirm: () -> Unit,
-    onConfirmed: () -> Unit
-) {
-    // 2026-09-26：本函数不再直接用调色板（done/failed 的取色已随 [UpdateResultRing] 内移），
-    // 故删掉原来的 `val palette = LocalResolvedPalette.current`。
+private fun CoreUpdateProgressOnly(state: UpdatePromptState) {
     when {
-        // ── 第三段：已触发，展示进度/结果 ──
+        // ── 已触发：展示进度/结果 ──
         state.coreTriggered -> {
             // 全部经局部变量取值：coreStatus 可空（请求刚发出、core 还没写状态），
             // 在 when 分支里直接点 status.xxx 拿不到智能转换。
@@ -866,33 +866,29 @@ private fun CoreUpdateAction(
             }
         }
 
-        // ── 第二段：二次确认（就地切换，不再开一个独立弹窗）──
-        confirming -> Column(Modifier.fillMaxWidth()) {
-            UfiDialogWarning(
-                "Core 会自行下载安装并重启后端服务，期间接口会中断十几秒（App 会短暂显示离线）。" +
-                    "请保持设备供电与网络，不要在此期间断电。"
-            )
-            Spacer(Modifier.height(Spacing.Medium))
-            Row(horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
-                UfiButton(
-                    variant = UfiButtonVariant.Subtle,
-                    size = UfiButtonSize.Small,
-                    text = "取消",
-                    onClick = onCancelConfirm
-                )
-                UfiButton(
-                    size = UfiButtonSize.Small,
-                    text = "确认更新 Core",
-                    onClick = onConfirmed
-                )
-            }
-        }
-
-        // ── 第一段：待确认 ──
-        else -> UfiButton(
-            size = UfiButtonSize.Small,
-            text = "更新 Core",
-            onClick = onRequestConfirm
+        // ── 二次确认：只留预警文案，取消/确认都交给底部按钮行 ──
+        // 原来这里内嵌一整行「取消 / 确认更新 Core」，而弹窗底部又有「稍后」——
+        // 同一屏出现两组按钮且各说各的。现在取消 = 底部「稍后」，确认 = 底部主按钮。
+        else -> UfiDialogWarning(
+            "Core 会自行下载安装并重启后端服务，期间接口会中断十几秒（App 会短暂显示离线）。" +
+                "请保持设备供电与网络，不要在此期间断电。"
         )
+    }
+}
+
+/**
+ * Core 项的**底部主按钮**（2026-10-12 新增）。
+ *
+ * 三态对应内容区的三段：待触发 → 「更新 Core」；二次确认中 → 「确认更新 Core」；
+ * 已触发（下载/安装/终态）→ null（用户此刻只能等）。
+ */
+@Composable
+private fun CoreUpdateFooterButton(
+    state: UpdatePromptState,
+    onRequestConfirm: () -> Unit
+) {
+    // 已触发（下载/安装/终态）→ 不给主按钮：用户此刻只能等，给一个点不动的按钮像卡住了。
+    if (!state.coreTriggered) {
+        UfiButton(text = "更新 Core", onClick = onRequestConfirm)
     }
 }

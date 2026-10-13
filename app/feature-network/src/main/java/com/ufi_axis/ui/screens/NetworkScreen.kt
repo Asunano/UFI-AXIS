@@ -127,8 +127,6 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                     currentBand = state.signalInfo?.bandLabelDisplay
                 )
 
-                Spacer(Modifier.height(10.dp))
-
                 // ═══════════ 2. 网络设置列表（一行一张卡 + 10dp 间距） ═══════════
                 // 2026-08-30：原来是「移动数据走 UfiSettingsGroup + UfiSettingsToggle，其余 4 行
                 // 各自手搓 Box(rowModifier) + Row/Icon/Column/Text」。两套容器的阴影(4dp vs 2dp)、
@@ -183,8 +181,11 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                         UfiSettingsToggle(
                             icon = Icons.Default.Wifi,
                             title = "WiFi 热点",
+                            // 2026-10-12（用户要求）：去掉「N 台设备」。原来那一项在这行里
+                            // 只会挤窄 SSID（长名字会被截断得看不出全貌），而在线台数在 WiFi
+                            // 设置弹窗里有独立列表和更完整的信息，这里重复一遍没有价值。
                             description = if (state.wifiEnabled) {
-                                "${wifi?.ssid?.ifBlank { "未命名" } ?: "未命名"} · ${allStations.size} 台设备 · " +
+                                "${wifi?.ssid?.ifBlank { "未命名" } ?: "未命名"} · " +
                                     if (wifi?.activeChip == "chip2") "5GHz" else "2.4GHz"
                             } else "已关闭",
                             checked = state.wifiEnabled,
@@ -301,13 +302,17 @@ private fun CellularStatusCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 16.dp)
+                // 2026-10-12（用户要求）：纵向内边距 16dp → 12dp，与首页 Hero 卡
+                // （HomeConnectionCard，`horizontal = 16.dp, vertical = 12.dp`）对齐。
+                // 原来顶部多出 4dp，运营商那行离卡片上边缘明显比其他 Hero 远一截，
+                // 两个界面并排看时能直接看出错位。横向保持 16dp 不动。
+                .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             // ═══ 行1：图标 + 标题(运营商) + 胶囊(制式频段) + 副标题(IP) / 信号条右上 ═══
-            // heroIconSize：左侧图标圆底的直径，同时作为右侧信号条的对齐轴高度
-            // （信号条在这段高度内垂直居中 ⇒ 与运营商标题那一行同处一条水平带）。
+            // heroIconSize：左侧图标圆底的直径。
+            // 2026-10-12：外层对齐由 Alignment.Top 改为 CenterVertically（见下方长注释）。
             val heroIconSize = 36.dp
-            Row(verticalAlignment = Alignment.Top) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Surface(
                     shape = CircleShape,
                     color = palette.gradientMuted.copy(alpha = 0.18f),  // 原 Color.White 18%：图标圆底
@@ -327,7 +332,12 @@ private fun CellularStatusCard(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             text = operator,
-                            style = UfiTextStyles.screenTitle,
+                            // 2026-10-12：screenTitle(22sp) → metricValueCompact(19sp)，与首页
+                            // HomeConnectionCard 的运营商字号**逐值对齐**（用户反馈两页字号不一致）。
+                            // 为什么不用改 screenTitle token：那个 token 有 9 个文件在用（各页大标题），
+                            // 改 token 会波及所有页面标题；只有这一处是"渐变卡内的运营商名"，
+                            // 与首页那处是同一语义，理应同 token。
+                            style = UfiTextStyles.metricValueCompact,
                             color = palette.onGradient,  // 原 Color.White：运营商主标题
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -340,9 +350,11 @@ private fun CellularStatusCard(
                             ) {
                                 Text(
                                     text = " $it ",
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                    // 2026-10-12：tag(13sp/横10纵4) → label(12sp/横7纵1.5)，
+                                    // 与首页 HomeConnectionCard 制式胶囊**逐值对齐**（含内边距）。
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.5.dp),
                                     color = palette.onGradient,  // 原 Color.White：胶囊内文字
-                                    style = UfiTextStyles.tag.copy(fontWeight = UfiWeight.Max)
+                                    style = UfiTextStyles.label.copy(fontWeight = UfiWeight.Emphasis)
                                 )
                             }
                         }
@@ -350,13 +362,13 @@ private fun CellularStatusCard(
                 }
                 Spacer(Modifier.width(10.dp))
                 // 右上角信号条（不显示 dBm 文字，dBm 数值在下方三张 HeroMetric）
-                // 2026-09-05：原为 40dp 高 / 64dp 宽（barWidth = null 各段平分 64dp 容器），
-                // 约为首页 HomeConnectionCard 同款信号条的 9 倍面积。现改回组件默认尺寸
-                // （12dp 高 × 23dp 宽，固定 3dp 段宽），两处视觉逐位一致；
-                // 外层容器由「固定 64dp 宽 + BottomEnd」改为「与图标圆底等高 + 居中」。
-                Box(Modifier.height(heroIconSize), contentAlignment = Alignment.Center) {
-                    UfiGradientSignalBar(bars = bars)
-                }
+                //
+                // 2026-10-12：原来套一层 `Box(Modifier.height(heroIconSize), Center)`，把 14dp 的
+                // 信号条**居中放进 36dp 空容器**，于是它顶边在 11dp、底边在 25dp；左边图标圆底
+                // 占 0~36dp、运营商文字占 0~26dp —— 三个底边各在一处，视觉上"一上一下"
+                //（用户反馈）。这层空容器没有任何语义，纯粹是上一轮"用图标高度当对齐轴"
+                // 的遗留，而外层 Row 已经是 CenterVertically，**删掉它信号条自然与文字行同中心**。
+                UfiGradientSignalBar(bars = bars)
             }
 
             Spacer(Modifier.height(10.dp))

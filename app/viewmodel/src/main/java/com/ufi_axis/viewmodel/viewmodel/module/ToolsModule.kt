@@ -2394,6 +2394,14 @@ class ToolsModule(
                 return@launch
             }
             com.ufi_axis.data.notification.NotificationConfigSync.applyRemote(appContext, remote, guard)
+            // 2026-10-12（跨设备一致性）：applyRemote 把 core 真值写回 prefs，但**没有通知 UI**。
+            // 「通知与守护」那一页的开关全是 remember { prefs.getBoolean(...) } 初始化的，
+            // 进页面后不再读 prefs —— 于是 B 设备（没在本机开过总闸）进页面永远停在 false，
+            // 入口全部置灰，尽管 core 上的配置是好的。
+            //
+            // 这里 emit 一次 toolsState 当"配置已落地"的信号；页面订阅它并重读 prefs。
+            // 用 update{} 而不是整体赋值：这里没有任何字段要改，只是让引用变一次。
+            _toolsState.update { it }
         }
     }
 

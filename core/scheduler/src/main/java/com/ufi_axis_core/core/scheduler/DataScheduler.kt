@@ -550,6 +550,9 @@ class DataScheduler(
     private val bootGraceMs: Long get() = settings?.monitorBootGraceMs ?: bootGraceDeviceDefaultMs
 
     /** grace period 是否已过。**每次采集都查**（elapsedRealtime 很便宜，纳秒级）。 */
+    // 诊断用（2026-10-12，临时）：上一次成功写库的时刻，用于检测写库间隔异常。
+    private var lastCpuFlushAtMs: Long = 0L
+
     private fun isBootGracePassed(): Boolean =
         android.os.SystemClock.elapsedRealtime() >= bootGraceMs
 
@@ -1310,7 +1313,16 @@ class DataScheduler(
 
             // Boot grace period 内不写 DB、不触发告警 —— 开机初始化阶段 CPU 100% / 高温
             // 是系统行为而非用户负载，写入会污染历史图表，告警会误报。
-            if (!isBootGracePassed()) return
+            if (!isBootGracePassed()) {
+                // 诊断（2026-10-12，临时）：开机宽限期内不写库是**既有正确行为**，
+                // 但它与「采集异常被吞」在图表上长得一样（都表现为数据少一段），
+                // 所以必须能从日志上区分：这里打 i 级并带 elapsedRealtime。
+                AppLogger.i(
+                    tag,
+                    "Diag: boot grace 未过，CPU 不写库 elapsed=${android.os.SystemClock.elapsedRealtime()}ms grace=${bootGraceMs}ms"
+                )
+                return
+            }
 
             val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
             val cpuRecord = CpuHistoryRecord(
@@ -1329,6 +1341,13 @@ class DataScheduler(
             throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect CPU", e)
+            // 诊断（2026-10-12，临时）：单次采集失败在图表上就少一个点，
+            // 但连续失败会连成一段（用户看到的"断层"）。记下时刻便于和图表断层对齐。
+            AppLogger.i(
+                tag,
+                "Diag: CPU 采集失败 elapsed=${android.os.SystemClock.elapsedRealtime()}ms " +
+                    "err=${e.javaClass.simpleName}:${e.message}"
+            )
         }
     }
 
@@ -2043,6 +2062,20 @@ class DataScheduler(
                 database.flushAllBuffers(cpuBatch, memBatch, trafficBatch, signalBatch, batteryBatch)
                 AppLogger.d(tag, "Flushed buffers: cpu=${cpuBatch.size}, mem=${memBatch.size}, traffic=${trafficBatch.size}, signal=${signalBatch.size}, battery=${batteryBatch.size}")
                 lastFlushError = null
+                // 诊断日志（2026-10-12，临时；定位「采集间断导致图表断层」用，定位完删）。
+                // 打的是**写进去的最后一个时间点**与本轮间隔：断层如果出现在库里的相邻点之间，
+                // 这里能直接看出是「采集中断」还是「写入失败重入队」。
+                // 用 AppLogger.i 而不是 d：d 级默认不进文件，间断问题恰恰要事后翻文件才看得见。
+                val nowMs = System.currentTimeMillis()
+                val cpuGap = nowMs - lastCpuFlushAtMs
+                if (lastCpuFlushAtMs > 0L && cpuGap > FLUSH_GAP_WARN_MS) {
+                    AppLogger.i(
+                        tag,
+                        "Diag: 写库间隔异常 prev=${lastCpuFlushAtMs} now=$nowMs gap=${cpuGap}ms " +
+                            "batch=cpu:${cpuBatch.size},mem:${memBatch.size},traffic:${trafficBatch.size},signal:${signalBatch.size}"
+                    )
+                }
+                lastCpuFlushAtMs = nowMs
             }
         } catch (e: CancellationException) {
             // 2026-10-05 R2-7 修复：stop() 的 cancelChildren 打在 flushAllBuffers 挂起点上时，
@@ -2055,6 +2088,11 @@ class DataScheduler(
             // 重新入队以便下次重试，并置错误态供监控/诊断感知。
             AppLogger.e(tag, "Failed to flush buffers, re-enqueuing for retry", e)
             lastFlushError = e.message ?: e.javaClass.simpleName
+            AppLogger.i(
+                tag,
+                "Diag: flush 失败，批次重新入队 batch=cpu:${cpuBatch.size},mem:${memBatch.size}," +
+                    "traffic:${trafficBatch.size},signal:${signalBatch.size} err=${e.javaClass.simpleName}:${e.message}"
+            )
             cpuBatch.forEach { cpuBuffer.offerBounded(it, cpuBufferSize) }
             memBatch.forEach { memoryBuffer.offerBounded(it, memoryBufferSize) }
             trafficBatch.forEach { trafficBuffer.offerBounded(it, trafficBufferSize) }
@@ -2260,6 +2298,11 @@ class DataScheduler(
     private companion object {
         /** 设备事件 per-MAC 同向冷却窗：采集节拍 60s，5 分钟内同一 MAC 同向只报一次。 */
         const val DEVICE_EVENT_COOLDOWN_MS = 5 * 60_000L
+        /**
+         * 写库间隔超过这个值就打诊断日志（2026-10-12，临时，定位图表断层用）。
+         * 正常 flushIntervalMs = 10s，留足余量取 5 分钟。
+         */
+        const val FLUSH_GAP_WARN_MS = 5 * 60_000L
         /** 默认 boot grace = 90 秒。Unisoc 实测 ~60s 稳定，留 30s 余量。 */
         const val BOOT_GRACE_DEFAULT_MS = 90_000L
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s

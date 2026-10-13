@@ -343,7 +343,37 @@ private fun MonitorOverviewTabContent(
     // hero 卡的 range 必须是稳定实例：MonitorTimeRange.today() 每次都是新的 Custom（含 currentTimeMillis），
     // 直接传就等于让这张卡每次重组都无法被跳过。
     val todayRange = remember(hourBucket) { MonitorTimeRange.today() }
-    val (worstPeak, worstPeakCount) = remember(monitorState, hourBucket) { worstPeakSummary(monitorState) }
+    // ═══ hero 阈值状态加迟滞（2026-10-12，用户报「抖一下就警告」）═══
+    //
+    // 现象：hero 卡在阈值附近反复变色 —— 一轮轮询里峰值越过阈值 → 橙，下一轮掉回来 → 绿，
+    // 用户看到的就是"闪一下"。
+    // 根因：remember 的 key 是 monitorState，而它**每轮轮询都换新实例** ⇒ 这个 remember
+    // 从来不生效，每轮都重算一遍。峰值恰好落在阈值附近时，相邻两轮的判定就会翻转。
+    //
+    // 迟滞口径（不对称是刻意的：误报比漏报更打扰人）：
+    //   · 进警告/严重：需要**连续 2 轮**都超阈值（快速确认真有问题）
+    //   · 退回正常：需要**连续 3 轮**都不超（给指标回落留余量，别一回落就变绿）
+    // ALERT 与 WARN 之间同样按这个规则走，状态只允许逐级变化，不会因为一次抖动跳级。
+    val rawPeak = remember(monitorState, hourBucket) { worstPeakSummary(monitorState) }
+    var peakStreak by remember { mutableIntStateOf(0) }   // 连续超阈值的轮数
+    var normalStreak by remember { mutableIntStateOf(0) } // 连续正常的轮数
+    var latchedPeak by remember { mutableStateOf(ThresholdLevel.NORMAL) } // 迟滞后的对外状态
+    val enterStreak = 2
+    val exitStreak = 3
+    if (rawPeak.first != ThresholdLevel.NORMAL) {
+        peakStreak++
+        normalStreak = 0
+        if (peakStreak >= enterStreak) latchedPeak = rawPeak.first
+    } else {
+        normalStreak++
+        peakStreak = 0
+        // 只在「已经处于某种告警态」时才需要数退出；本来就是正常的不用等。
+        if (normalStreak >= exitStreak && latchedPeak != ThresholdLevel.NORMAL) {
+            latchedPeak = ThresholdLevel.NORMAL
+        }
+    }
+    val worstPeak = latchedPeak
+    val worstPeakCount = if (latchedPeak == rawPeak.first) rawPeak.second else 0
     val palette = LocalResolvedPalette.current
 
     // ★ 2026-09-02 懒加载：告警只在「总览 Tab 真被打开」时拉 —— 本函数只在该 Tab 下组合，
@@ -811,6 +841,29 @@ private fun MonitorChartsTabContent(
 }
 
 
+/**
+ * 图表空态的**三种**成因（2026-10-12）。
+ *
+ * 起因：原来只有"有数据 / 没数据"两分，判据是 `points.isEmpty()`。但切区间时会出现
+ * 「手里握着旧区间的点、它们全落在新窗口之外」这种中间态 —— 日志实测
+ * `raw=12 clipped=0 isLoading=true`，UI 却显示"暂无数据"。
+ * 用户看到的是"我明明有历史数据，怎么忽然空了"，而后台正在拉新区间，几秒后就恢复。
+ * 三种成因在UI 上必须给出不同文案，否则其中两种必然被误报。
+ */
+private enum class ChartEmptyReason {
+    /** 正在取数：用"加载中"而不是"暂无数据"，后者是在撒谎。 */
+    LOADING,
+
+    /**
+     * 手里有数据但都不在当前窗口 —— 切区间/切指标的过渡态，不是空。
+     * 判据 [rawCount][MonitorChartSection] > 0 且裁剪后为 0。
+     */
+    SWITCHING,
+
+    /** 真的没有数据（服务端返回 0 行，或指标未开启）。 */
+    NO_DATA,
+}
+
 @Composable
 private fun MonitorChartSection(
     title: String,
@@ -925,6 +978,26 @@ private fun MonitorChartSection(
     val primaryPoints = chartData.first
     val allSeries = chartData.second
 
+    // ═══ 诊断日志（2026-10-12，临时；定位「图表暂无数据」与断档问题用，定位完删除）═══
+    // 打的是**事实**：每类指标原始点数、裁剪后点数、桶宽、以及 loadedMonitorTypes 视角的
+    // 记账状态。目的是区分三种"空"，它们在UI 上长得一模一样但根因完全不同：
+    //   ① 服务端根本没返回行（rawSeries 就空）→ 采集/接口/区间问题
+    //   ② 服务端返回了但被裁剪窗口滤光（rawSeries 非空、primaryPoints 空）→ 裁剪边界算错
+    //   ③ 桶宽未知（bucketMs <= 0）导致 X 轴域为 null，各图自适应 → 视觉对不齐
+    // ═══ 空态三态判定（2026-10-12）═══
+    //
+    // 原来只看 points.isEmpty()，把「手里有旧区间的点但全落在新窗口外」也报成"暂无数据"。
+    // 日志实测过这个中间态：raw=12 clipped=0 isLoading=true —— 用户明明有历史数据却看到
+    // "暂无数据"，而后台正在拉新区间，几秒后就恢复（切区间时的正常过渡，不是缺陷）。
+    // 现在区分三种：正在取数 / 区间切换中 / 真的没数据。
+    val rawCount = rawSeries.firstOrNull()?.size ?: 0
+    val emptyReason = when {
+        primaryPoints.isNotEmpty() -> ChartEmptyReason.NO_DATA  // 非空时不显示，占位
+        monitorState.isLoading -> ChartEmptyReason.LOADING
+        rawCount > 0 -> ChartEmptyReason.SWITCHING
+        else -> ChartEmptyReason.NO_DATA
+    }
+
     // 2026-08-24（FIX-18）：所有走 valueFormatter 的图表其 formatter 已含单位（如 pctAxisLabel→"51%"、
     // formatBytes→"389.0 KB/s"、信号→"dBm"），UfiMonitorChart 的 formatWithUnit 会再拼 unit——
     // 故这里 unit 一律传空，避免 "51%%" / "389.0 KB/sB/s" 这类双重单位。
@@ -946,6 +1019,7 @@ private fun MonitorChartSection(
             unit = effectiveUnit,
             lineColor = allSeries[0].lineColor,
             isLoading = monitorState.isLoading,
+            emptyReason = emptyReason,
             valueFormatter = yFormatterFor(primary),
             yAxisLabelFormatter = yAxisLabelFormatter ?: yAxisFormatterFor(primary),
             showLegend = false,
@@ -1805,6 +1879,7 @@ private fun FixedMonitorChart(
     unit: String,
     lineColor: Color,
     isLoading: Boolean,
+    emptyReason: ChartEmptyReason = ChartEmptyReason.NO_DATA,
     valueFormatter: ((Double) -> String)? = null,
     onClick: (() -> Unit)? = null,
     extraSeries: List<MonitorSeries> = emptyList(),
@@ -1868,7 +1943,11 @@ private fun FixedMonitorChart(
                 // 它挂在 monitorState.isLoading 上，每轮轮询都会转一遍 —— 那就是用户看到的"刷新动画"。
                 // 只留静态文案：图表是否有数据一眼可见，转圈提供不了额外信息。
                 Text(
-                    if (isLoading) "数据加载中…" else "暂无数据",
+                    when (emptyReason) {
+                        ChartEmptyReason.LOADING -> "数据加载中…"
+                        ChartEmptyReason.SWITCHING -> "切换中…"
+                        ChartEmptyReason.NO_DATA -> "暂无数据"
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = LocalResolvedPalette.current.textSecondary
                 )

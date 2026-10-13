@@ -484,6 +484,17 @@ internal fun UfiDialogShell(
                 } else {
                     backdrop.animateTo(1f, UfiMotion.dialogBackdropIn())
                 }
+                // 2026-10-12 曾在此补一次 applyDialogBackdrop(BlurRadius, maxDim)：
+                // 用户实测**无任何效果，且引入了闪烁抽搐**（r53）。已撤回。
+                // 撤回理由（记在这里防止再犯一次）：
+                // ① 闪烁是实打实的回归——离场 ramp 正在 animateTo(1f) 途中补写满值，
+                //    窗口 blur 与动画进度脱钩，肉眼就是"抽搐一下"。
+                // ② 无效说明真正的写入者另有其人（或根本没写），不是"这里漏了一次"。
+                //    用户观察"弹出预警框时 WiFi 弹窗仍然模糊"排除了窗口被抢；
+                //    "关掉预警框后弹窗还在、只是模糊没了"排除了宿主被误关闭。
+                // 剩余未排除的方向：LocalUfiDialogClose 的覆盖链路
+                //    （UfiDialogShell:544 下发 requestClose，UfiDialogParts:435 的 close(onDismiss)）。
+                // 走那条路之前先确证，不要再凭推断补写。
             }
         }
 

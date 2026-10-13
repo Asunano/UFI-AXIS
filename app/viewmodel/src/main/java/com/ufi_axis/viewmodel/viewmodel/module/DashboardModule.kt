@@ -1409,6 +1409,14 @@ class DashboardModule(
                 val pending: List<String> = types.filter { type ->
                     type in settings.enabledTypes && (force || type !in loadedMonitorTypes)
                 }
+                // 诊断日志（2026-10-12，临时；定位「图表暂无数据」用，定位完删）：
+                // pending 为空但界面没数据 =记账说"拉过了"而实际没数据，是记账与取数脱节；
+                // 这两种情况在UI 上都是"暂无数据"，必须靠这行日志区分。
+                DebugLog.i("ChartDbg") {
+                    "loadMonitorTypes req=${types.joinToString(",")} pending=${pending.joinToString(",")} " +
+                        "loaded=${loadedMonitorTypes.joinToString(",")} force=$force " +
+                        "collectEnabled=${settings.collectEnabled} rangeKey=$loadedMonitorRangeKey"
+                }
                 if (pending.isEmpty()) return@launch
                 // 先记账再发请求：两个区块共享同一类指标（例如都要 traffic）时不会各拉一遍。
                 loadedMonitorTypes.addAll(pending)
@@ -1443,7 +1451,12 @@ class DashboardModule(
                         if (silent) next else next.copy(isLoading = false)
                     }
                     // 失败的类型撤销记账：下次露面或下一轮轮询还能重试，否则会永久空着。
-                    loaded.forEach { (type, resp) -> if (resp == null) loadedMonitorTypes.remove(type) }
+                    loaded.forEach { (type, resp) ->
+                        if (resp == null) loadedMonitorTypes.remove(type)
+                        DebugLog.i("ChartDbg") {
+                            "fetch $type ok=${resp != null} points=${resp?.points?.size ?: -1} bucketMs=${resp?.bucket_ms ?: -1} bucketSec=${resp?.bucket_seconds ?: -1} count=${resp?.count ?: -1} raw=${resp?.raw_count ?: -1}"
+                        }
+                    }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     loadedMonitorTypes.removeAll(pending.toSet())

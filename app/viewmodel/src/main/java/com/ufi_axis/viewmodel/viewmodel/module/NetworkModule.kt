@@ -215,6 +215,24 @@ class NetworkModule(
      * 文案要说清**是哪一项**生效了：一个界面上往往有多个写操作，「保存成功」这种泛化文案
      * 让用户分不清生效的是哪个。
      */
+    /**
+     * 这次异常是不是「连不上」——即设备正在重启热点/WiFi 模块，请求等不到响应。
+     *
+     * 判据只看连接层（[java.net.ConnectException] / `SocketTimeout` / `UnknownHost` 等），
+     * 不看 HTTP 状态码：4xx/5xx 是 core 或设备明确回了原因，那是真的失败，必须报出来。
+     * 2026-10-12：设备重启热点实测要 15~20 秒，这期间任何「等确认再定成败」的窗口都会
+     * 撞在重启期里，所以这类断连一律按「已提交」处理，不当成失败。
+     */
+    private fun isConnectivityFailure(e: Exception): Boolean {
+        val chain = generateSequence<Throwable>(e) { it.cause }.take(6).toList()
+        return chain.any { c ->
+            c is java.net.ConnectException ||
+                c is java.net.SocketTimeoutException ||
+                c is java.net.UnknownHostException ||
+                c is java.net.NoRouteToHostException
+        } || chain.any { it.message?.contains("Failed to connect", ignoreCase = true) == true }
+    }
+
     private fun emitWriteNotice(message: String, subtitle: String? = null) {
         _events.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
     }
@@ -2025,9 +2043,7 @@ class NetworkModule(
                 // 但「200 + success:false」在契约上随时可能出现，不检查就是一个等着被踩的
                 // 假成功（口径同 setDhcpSetting）。
                 if (!resp.success) {
-                    _networkState.update {
-                        it.copy(errorMessage = "WiFi 热点保存失败：设备未接受这份配置")
-                    }
+                    _networkState.update { it.copy(errorMessage = "WiFi 热点保存失败：设备未接受这份配置") }
                     return@async false
                 }
                 emitWriteNotice(
@@ -2036,7 +2052,12 @@ class NetworkModule(
                 )
                 // 主动回读，不等 WS 推送：推送有三个会丢的缺口（core 缓存里没有 wifi:* 条目时
                 // 不发、WS 掉线期间丢且重连只补 console:*、降级轮询还有 30s 新鲜度闸门）。
-                // 500ms 是留给设备应用新配置的时间，0ms 大概率读回旧值，而这一轮之后不会有第二次。
+                //
+                // 2026-10-12：这里**不再等回读结果**。实测设备重启热点要 15~20 秒
+                // （连接 34.7s 断 → 51.3s 通），任何"等回读确认再定成败"的窗口都会撞在
+                // 重启期里、必然读不到新值，于是把已经生效的配置误判成失败。
+                // 既然失败后没有自愈路径，正确做法是：请求返回就报成功，界面立刻收工；
+                // 真正的生效状态交给这次回读去刷新（成不成功它都会去跑）。
                 delay(500)
                 refreshWifi(force = true)
                 true
@@ -2046,12 +2067,34 @@ class NetworkModule(
                 // 弹「已保存」的假成功。与 core 侧「取消不是失败」纪律对齐。
                 throw e
             } catch (e: Exception) {
-                // 带上 core 回的原因（如 profile 校验的「密码长度…」），否则用户只看到 HTTP 400/500
+                // 2026-10-12（用户裁决）：**只在这一步就失败时**才提示，而且走 toast，
+                // 不再挂 errorMessage 让弹窗留在屏幕上。
+                //
+                // 改 WiFi 配置会让设备重启热点，请求大概率等不到响应 —— 那种"失败"其实是
+                // 成功。此时任何"保存失败"的提示都是错的，而且把弹窗按在屏幕上让用户以为没生效
+                // （用户实测「设备已生效、app 报失败、弹窗又弹出来」）。
+                // core 明确拒绝的情况（4xx，如密码长度非法）原因在这一层就有，照原样透出。
+                // 分两种失败，走两条通道 —— 用户实测「设备已生效，app 却弹绿色 ✓「保存失败」」：
+                // emitWriteNotice 只有 message/subtitle，没有成败标志，UI 图标写死成功，
+                // 所以拿它报失败就会得到「绿色对勾 + 失败文案」这种自相矛盾的东西。
+                //
+                // ① 连不上 = 设备正在重启热点，请求等不到响应。**这不是失败**：用户实测过设备
+                //    重启要 15~20 秒，期间设备侧照样应用了配置。这里不能报错，也不该报错。
+                // ② core 明确拒绝（4xx，如密码长度非法）= 真失败，走 errorMessage，让全局
+                //    错误浮层接手（它有自己的失败样式）。
                 val reason = coreRejectReason(e) ?: e.message ?: "未知错误"
+                if (isConnectivityFailure(e)) {
+                    // 断连不是失败：设备已生效（或即将生效），等它重启完 WS 会重连并推送新状态。
+                    DebugLog.i("Network") { "setWifiConfig: 连接中断（设备重启热点），按已提交处理" }
+                    emitWriteNotice("WiFi 热点已保存", subtitle = WIFI_RESTART_DISCONNECT_HINT)
+                    refreshWifi(force = true)
+                    return@async true
+                }
                 _networkState.update { it.copy(errorMessage = "WiFi 热点保存失败：$reason") }
                 false
             }
         }.await()
+
 
     /**
      * 切换 WiFi 频段（`POST /api/wifi/band`，`chip1` = 2.4G / `chip2` = 5G）。
@@ -2078,9 +2121,7 @@ class NetworkModule(
                 // 独立检查 success：口径同 setWifiConfig，「200 + success:false」在契约上
                 // 随时可能出现，不检查就是一个等着被踩的假成功。
                 if (!resp.success) {
-                    _networkState.update {
-                        it.copy(errorMessage = "WiFi 频段切换失败：设备未接受这个频段")
-                    }
+                    _networkState.update { it.copy(errorMessage = "WiFi 频段切换失败：设备未接受这个频段") }
                     return@async false
                 }
                 emitWriteNotice("WiFi 频段已切换", subtitle = WIFI_BAND_SWITCH_DISCONNECT_HINT)
@@ -2091,9 +2132,22 @@ class NetworkModule(
                 refreshWifi(force = true)
                 true
             } catch (e: Exception) {
-                // 带上 core 回的原因（取值域非法时 profile 的 validate 会回 400 + 原因），
+                // 2026-10-12：换频段会重启 WiFi 模块，连接必然中断 —— 那一发等不到响应就
+                // ConnectException，但设备侧可能已经切过去了。口径同 setWifiConfig：
+                // 先回读核实生效频段，再决定成败，否则用户看到的是「设备已切换、app 却报失败」。
+                // 2026-10-12（用户裁决）：口径同 setWifiConfig —— 换频段同样会重启 WiFi 模块，
+                // 请求等不到响应不代表没生效，所以只在**这一步就失败**时提示，且走 toast 通道
+                // （[emitWriteNotice]）而不是把弹窗按在屏幕上。
+                // 带出 core 回的原因（取值域非法时 profile 的 validate 会回 400 + 原因），
                 // 否则用户只看到一句 HTTP 400
                 val reason = coreRejectReason(e) ?: e.message ?: "未知错误"
+                if (isConnectivityFailure(e)) {
+                    // 同 setWifiConfig：重启 WiFi 模块期间的断连不是失败，设备侧照样生效。
+                    DebugLog.i("Network") { "setWifiBand: 连接中断（设备重启 WiFi 模块），按已提交处理" }
+                    emitWriteNotice("WiFi 频段已切换", subtitle = WIFI_BAND_SWITCH_DISCONNECT_HINT)
+                    refreshWifi(force = true)
+                    return@async true
+                }
                 _networkState.update { it.copy(errorMessage = "WiFi 频段切换失败：$reason") }
                 false
             }

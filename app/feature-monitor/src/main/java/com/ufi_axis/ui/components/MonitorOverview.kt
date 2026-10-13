@@ -1154,7 +1154,14 @@ fun alertTypeLabel(type: String): String = when (type) {
 }
 
 // ========== 总览「今日峰值」区块（2026-08-15 新增） ==========
-// 6 张峰值卡（CPU / 内存 / 流量 / 信号 / 温度 / 今日流量），2×3 压扁网格。
+// 3 张峰值卡（CPU / 内存 / 温度），单行平铺。
+//
+// 2026-10-12（用户要求）：从 6 张删到 3 张 —— 去掉「信号最差」「流量峰值」「今日流量」。
+// 留下的三张口径一致（都是区间内的峰值），而删掉的三张各有各的问题：
+//   · 信号最差 = RSRP 历史最差，与当前信号对不上，用户会以为设备坏了；
+//   · 今日流量 = 累计量，不是峰值，混在峰值卡里口径不同类（且网络 Hero 已有一份）；
+//   · 流量峰值 = RX+TX 合计，需要按桶时间戳对齐求和才不出错，口径最绕，
+//     而同屏的 charts 页曲线已经能看清流量走势。
 // 数据窗口：今天 00:00 至今（与总览「今天」语义一致）。
 // 单格：指标名 + 状态点 + 峰值大数字 + 单位（2026-08-26 起去掉迷你 sparkline，只留峰值数字）。
 // 阈值方向按 MonitorMetricType.lowerIsWorse；优先 state.thresholds，未配置回退默认阈值。
@@ -1267,56 +1274,9 @@ private fun computePeakMetrics(
         items += PeakMetricItem("内存峰值", fmt(memV), "%", levelFor("memory", memV, false), emptyHint = hint)
     }
 
-    // 3. 流量峰值（RX+TX 合计，后端给的是 B/s，按 1024 自适应到 B/s / KB/s / MB/s，
-    //    unit=null 让 valueText 自带"X B/s"等，与 charts 页 valueFormatter=::formatBytes 同口径；
-    //    与"今日流量"卡的 "0 B" 视觉一致。启用条件：rx/tx 任一开启即展示，两者共用一份阈值）
-    if (!enabled("traffic_rx") && !enabled("traffic_tx")) {
-        items += PeakMetricItem("流量峰值", "—", null, ThresholdLevel.NORMAL, enabled = false, emptyHint = "未开启")
-    } else {
-        val rxHist = state.trafficRxHistory
-        val txHist = state.trafficTxHistory
-        val rxV = peakSince(rxHist, start, false)
-        val txV = peakSince(txHist, start, false)
-        val hasRx = hasPointsSince(rxHist, start)
-        val hasTx = hasPointsSince(txHist, start)
-        // 合计峰值必须按「同一时刻」相加后再取最大：直接 max(rx)+max(tx) 会把凌晨的下行峰值和
-        // 傍晚的上行峰值拼成一个从未真实出现过的数字。按桶时间戳对齐求和，缺失的一侧记 0
-        // （该桶确实没有采样），再取最大值。
-        val trafficPeak = if (!hasRx && !hasTx) Double.NaN else {
-            val txByT = HashMap<Long, Double>(txHist.size.coerceAtLeast(1))
-            txHist.forEach { if (it.t >= start) txByT[it.t] = it.max }
-            var best = Double.NaN
-            rxHist.forEach { p ->
-                if (p.t < start) return@forEach
-                val r = if (p.max.isNaN()) 0.0 else p.max.coerceAtLeast(0.0)
-                val x = txByT.remove(p.t)?.let { if (it.isNaN()) 0.0 else it.coerceAtLeast(0.0) } ?: 0.0
-                val sum = r + x
-                if (best.isNaN() || sum > best) best = sum
-            }
-            // 只有 TX 有采样的桶（remove 后剩下的）
-            txByT.values.forEach { v ->
-                val sum = if (v.isNaN()) 0.0 else v.coerceAtLeast(0.0)
-                if (best.isNaN() || sum > best) best = sum
-            }
-            best
-        }
-        val hint = if (hasRx || hasTx) null else "暂无数据"
-        // 阈值按各自的 key 判定后取最差：把"RX+TX 合计"拿去查 traffic_rx 的阈值属于口径错位
-        // （阈值是给单方向速率配的），合计值只用于显示。
-        val rxLevel = levelFor("traffic_rx", rxV, false)
-        val txLevel = levelFor("traffic_tx", txV, false)
-        val trafficLevel = if (txLevel.ordinal > rxLevel.ordinal) txLevel else rxLevel
-        items += PeakMetricItem("流量峰值", FormatUtils.formatRate(trafficPeak), null, trafficLevel, emptyHint = hint)
-    }
-
-    // 4. 信号最差（RSRP，dBm，越小越差）
-    if (!enabled("signal_rsrp")) {
-        items += PeakMetricItem("信号最差", "—", "dBm", ThresholdLevel.NORMAL, enabled = false, emptyHint = "未开启")
-    } else {
-        val sigV = peakSince(state.signalRsrpHistory, start, true)
-        val hint = if (hasPointsSince(state.signalRsrpHistory, start)) null else "暂无数据"
-        items += PeakMetricItem("信号最差", fmt(sigV), "dBm", levelFor("signal_rsrp", sigV, true), emptyHint = hint)
-    }
+    // 2026-10-12（用户要求）：「信号最差」已删除。理由：它是 RSRP 的**历史最差值**，
+    // 与同一屏的当前信号（首页/网络页 Hero）没有直接对应，用户看到「峰值 -120dBm」
+    // 却发现现在信号正常，会怀疑设备出故障；而它想表达的趋势在 charts 页的曲线里更清楚。
 
     // 5. 温度峰值（°C）：全 0 视为「无数据」而不是设备真的 0°C
     if (!enabled("temperature")) {
@@ -1328,15 +1288,9 @@ private fun computePeakMetrics(
         items += PeakMetricItem("温度峰值", fmt(tempV), "°C", levelFor("temperature", tempV, false), emptyHint = hint)
     }
 
-    // 6. 今日流量（累计：core 给的 today_total_display = 上行+下行合计，无阈值色）
-    // 仪表盘还没拉到数据时必须显式置灰 + 给原因，否则一张"正常卡"里写着"—"，
-    // 看起来像设备今天真的零流量。
-    val todayDisp = trafficSummary?.today_total_display?.takeIf { it.isNotBlank() }
-    items += if (todayDisp == null) {
-        PeakMetricItem("今日流量", "—", null, ThresholdLevel.NORMAL, emptyHint = "暂无数据")
-    } else {
-        PeakMetricItem("今日流量", todayDisp, null, ThresholdLevel.NORMAL)
-    }
+    // 2026-10-12（用户要求）：「今日流量」已删除。理由：它是**累计量**不是峰值，
+    // 与同屏其余「XX 峰值」的口径完全不同，放在一起会让人误以为它也是峰值类指标；
+    // 而累计值在仪表盘的网络 Hero 里已经有一份，放这里是重复。
 
     return items
 }
@@ -1361,16 +1315,15 @@ fun worstPeakSummary(state: MonitorState): Pair<ThresholdLevel, Int> {
 }
 
 /**
- * v20h：仅用于 [worstPeakSummary] 的轻量派生 —— 取今日窗口内 5 个有阈值指标的峰值 + 等级，
+ * v20h：仅用于 [worstPeakSummary] 的轻量派生 —— 取今日窗口内**3 个**有阈值指标的峰值 + 等级
+ * （CPU / 内存 / 温度，2026-10-12 从 5 个减到 3 个，与 [computePeakMetrics] 的网格同源），
  * 不构造 PeakMetricItem（无需 label/icon/unit），减少浪费。
- * 复用 computePeakMetrics 里的 peakOf/levelFor 闭包，但拆出来避免对 dashboardsState 依赖。
  */
 private fun computePeakMetricsForLevel(state: MonitorState): List<Triple<String, Double, ThresholdLevel>> {
     val start = todayStartMillis()
     fun levelFor(apiKey: String, value: Double, lowerIsWorse: Boolean): ThresholdLevel =
         thresholdLevelOf(state.thresholds, apiKey, value, lowerIsWorse)
-    val out = ArrayList<Triple<String, Double, ThresholdLevel>>(5)
-    // 5 个有阈值指标（跳过 today_traffic，无阈值）
+    val out = ArrayList<Triple<String, Double, ThresholdLevel>>(3)
     if (state.settings.enabledTypes.contains("cpu")) {
         val v = peakSince(state.cpuHistory, start, false)
         out += Triple("cpu", v, levelFor("cpu", v, false))
@@ -1379,25 +1332,10 @@ private fun computePeakMetricsForLevel(state: MonitorState): List<Triple<String,
         val v = peakSince(state.memoryHistory, start, false)
         out += Triple("memory", v, levelFor("memory", v, false))
     }
-    if (state.settings.enabledTypes.contains("signal_rsrp")) {
-        val v = peakSince(state.signalRsrpHistory, start, true)
-        out += Triple("signal_rsrp", v, levelFor("signal_rsrp", v, true))
-    }
-    // 流量口径必须与网格里的「流量峰值」完全一致（rx/tx 任一开启即计入、各自按自己的阈值键判定后取最差），
-    // 否则 hero 说"运行正常"而下面那格是橙的，两处自相矛盾。
-    if (state.settings.enabledTypes.contains("traffic_rx") ||
-        state.settings.enabledTypes.contains("traffic_tx")
-    ) {
-        val rxV = peakSince(state.trafficRxHistory, start, false)
-        val txV = peakSince(state.trafficTxHistory, start, false)
-        val rxLevel = levelFor("traffic_rx", rxV, false)
-        val txLevel = levelFor("traffic_tx", txV, false)
-        if (txLevel.ordinal > rxLevel.ordinal) {
-            out += Triple("traffic_tx", txV, txLevel)
-        } else {
-            out += Triple("traffic_rx", rxV, rxLevel)
-        }
-    }
+    // 2026-10-12（用户要求）：信号最差（signal_rsrp）与流量峰值（traffic_rx/tx）已从总览删除，
+    // 这里同步移除 —— 否则 hero 的取色/文案仍会被这两项驱动：用户看到"3 项严重阈值"或橙色 hero，
+    // 往下翻却找不到对应的那几格卡，等于给了一个无法下钻的结论。
+    // 现在 hero 只看 CPU / 内存 / 温度，与下方网格的三格严格同源。
     if (state.settings.enabledTypes.contains("temperature")) {
         val real = if (hasRealTempSince(state.temperatureHistory, start)) {
             peakSince(state.temperatureHistory, start, false)
@@ -1435,7 +1373,10 @@ fun PeakMetricsGrid(state: MonitorState, trafficSummary: TrafficSummary?, modifi
         Column(Modifier.fillMaxWidth()) {
             // computePeakMetrics 恒返回 6 项（6 个区块每支都恰好 += 1），所以这里恒为 2×3；
             // 不写补位分支（那是永不可达的死代码），改动 computePeakMetrics 时靠这条断言兜住。
-            require(items.size == 6) { "峰值网格需要恰好 6 项，实际 ${items.size}" }
+            // 2026-10-12：6 → 3（用户要求删掉信号最差 / 流量峰值 / 今日流量）。
+            // 保留这个 require：它是「派生函数与网格布局同宽」的护栏 —— 派生多给一项或少给一项
+            // 都会在这里直接炸，而不是静默画出一个错位的网格（chunked(3) 对 4/5 项会画出残行）。
+            require(items.size == 3) { "峰值网格需要恰好 3 项，实际 ${items.size}" }
             items.chunked(3).forEachIndexed { rowIdx, rowItems ->
                 // 行之间加一条横向发丝线（放在行前，行数变化也不会漏画/多画）
                 if (rowIdx > 0) {

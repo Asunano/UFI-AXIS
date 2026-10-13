@@ -200,6 +200,13 @@ class MediaRoutes(
 
         /** `/rescan` 单次提交给系统扫描器的文件数与递归深度上限。 */
         private const val MAX_RESCAN_FILES = 5000
+        /**
+         * 单次 `MediaScannerConnection.scanFile` 的路径数上限（2026-10-12）。
+         *
+         * 5000 个绝对路径一次性跨进程传递会把系统媒体进程顶到 500MB —— 接收端要把整批
+         * 读进内存做归类与聚合。200 个约 12KB，Binder 侧安全，接收端峰值内存也可控。
+         */
+        private const val RESCAN_CHUNK_SIZE = 200
         private const val MAX_RESCAN_DEPTH = 12
 
         /**
@@ -2827,8 +2834,27 @@ class MediaRoutes(
                 }
 
                 if (paths.isNotEmpty()) {
-                    // 异步提交：扫描器自己排队收录，这里不等它完成（可能几十秒）
-                    MediaScannerConnection.scanFile(appContext, paths.toTypedArray(), null, null)
+                    // ═══ 分批提交扫描（2026-10-12，修 android.process.media 内存暴涨）═══
+                    //
+                    // 现象：点一次「重新扫描」，系统媒体进程 `android.process.media` 内存涨到
+                    // 500MB，要重启 core 才释放。
+                    //
+                    // 根因：[MediaScannerConnection.scanFile] 的路径数组是**一次性跨进程传递**的
+                    // —— 整个 String[] 序列化进 Binder 事务；5000 个平均 60 字符的绝对路径
+                    // 就是 300KB+ 的单个 String[]，加上 Binder 1MB 上限被撑到极限，
+                    // 而接收端 `MediaProvider.scanFile` 还要把全部路径**读进内存**做扩展名归类、
+                    // 建 pending 队列、按目录聚合。两端同时持有 → 内存暴涨。
+                    //
+                    // 为什么分批有效：接收端每次只处理一小批，pending 队列与路径集合的峰值内存
+                    // 被压到单批的量级；而且 MediaProvider 内部本身就是**按批串行 drain** 的，
+                    // 分批提交与它的消费模型一致，不会丢项。
+                    //
+                    // 批大小取 200：一次 200 个路径约 12KB，远在 Binder 安全范围内；
+                    // 又不会太碎（批数 = 5000/200 = 25 次，串行提交耗时可忽略）。
+                    paths.chunked(RESCAN_CHUNK_SIZE).forEach { chunk ->
+                        // 异步提交：扫描器自己排队收录，这里不等它完成（可能几十秒）
+                        MediaScannerConnection.scanFile(appContext, chunk.toTypedArray(), null, null)
+                    }
                 }
                 AppLogger.i(
                     TAG,

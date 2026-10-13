@@ -173,6 +173,38 @@ fun NotificationsGuardScreen(
         ALERT_TYPE_KEYS.count { perType[it] == true && alertTypeGateEnabled(prefs, it) }
     }
 
+    // ═══ core 回读落地后重读 prefs（2026-10-12，跨设备一致性）═══
+    //
+    // 现象：手机上开好总闸 → 换另一台手机/平板进这一页，邮件/Webhook 等入口**全是灰的**，
+    // 明明 core 上配置是好的。
+    //
+    // 机制（不是 bug 在门禁，在**读的不是真源**）：
+    //   · `masterOn` / `categoriesOn` / `dndOn` 全都用 `remember { prefs.getBoolean(...) }` 初始化，
+    //     之后**再也不读 prefs** —— 只在这一页里被用户自己改。
+    //   · 而 core 回读走 [NotificationConfigSync.applyRemote]，它**会**把 core 的真值写回 prefs。
+    //     但那是异步的（页面进来时 LaunchedEffect 才发请求），回来时 `remember` 早就初始化完了。
+    //   · 于是这一页永远停在"进页面那一刻的本地快照"上。B 设备刚装、清过数据、
+    //     或只是没在这个页面上开过总闸，它就一直是 false。
+    //
+    // 修法：订阅一个**每次 core 配置落地都会变**的信号，在它变化时重读 prefs。
+    // `toolsState` 每次 applyRemote / updateNotificationConfig 都会 emit，用它的引用变化即可，
+    // 不必给 ToolsState 加专门的字段（那是给跨模块共享的 DTO 用的，不该为单页刷新加状态）。
+    val toolsState by viewModel.tools.toolsState.collectAsState()
+    LaunchedEffect(toolsState) {
+        val next = prefs.getBoolean(NotificationCenter.KEY_NOTIFY_MASTER, false)
+        if (next != masterOn) {
+            masterOn = next
+            categoriesOn = NotificationCenter.CATEGORY_KEYS.count { prefs.getBoolean(it, false) }
+            dndOn = prefs.getBoolean(NotificationCenter.KEY_DND_ENABLED, false)
+            dndStart = prefs.getInt(
+                NotificationCenter.KEY_DND_START_HOUR,
+                NotificationCenter.DEFAULT_DND_START_HOUR
+            )
+            dndEnd = prefs.getInt(NotificationCenter.KEY_DND_END_HOUR, NotificationCenter.DEFAULT_DND_END_HOUR)
+            alertGateStamp++
+        }
+    }
+
     // 从系统设置或二级页返回后必须重检：否则开关与摘要停在进页面那一刻的快照上。
     rememberResumeRefresh {
         notifAllowed = readNotifAllowed()
@@ -197,7 +229,21 @@ fun NotificationsGuardScreen(
      *
      * Hero 的开关显示态、下面两个入口的可用性都用它 —— 一份判据，界面不会自相矛盾。
      */
-    val gateOn = masterOn && notifAllowed
+    // 2026-10-12（用户报告的缺陷：重装/清数据后邮件、Webhook 等入口全被置灰）：
+    //
+    // 原来这里写的是 `masterOn && notifAllowed`，而 notifAllowed 是**系统通知权限**
+    // （Android 13+ 的 POST_NOTIFICATIONS）。但这一页除状态栏通知外的三条渠道 ——
+    // 邮件、Webhook、本机短信、实时推送 —— 都**不经过 Android 通知系统**，
+    // 它们的投递判定第一条都是 core 侧的 `master_enabled`（见下面「推送渠道」那条注释）。
+    //
+    // 于是清数据/重装后权限回到"未授予"，`notifAllowed=false` → 整页所有入口一起变灰，
+    // 用户明明在另一台设备/网页端配好了邮件和 Webhook，在这台手机上却进不去设置 ——
+    // 表现就是"通知渠道莫名其妙全被禁用了"。
+    //
+    // 现在：**渠道与后台相关的门禁只看 masterOn**（投递总闸，这是渠道真正的上游）；
+    // 系统通知权限只影响 Hero 卡自己的显示态与状态栏那一路（[NotificationsHeroCard] 内部
+    // 仍用 masterOn && notifAllowed，那一处是对的 —— 它管的就是状态栏通知）。
+    val gateOn = masterOn
 
     /** 打开系统「应用通知」设置页 —— 权限被二次拒绝后，这是唯一的修复入口。 */
     val openSystemNotifSettings = {

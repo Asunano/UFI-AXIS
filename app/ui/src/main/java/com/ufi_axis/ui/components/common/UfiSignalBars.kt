@@ -95,6 +95,15 @@ fun UfiSignalBars(
  * - [barWidth] 传 null = 各段 `weight(1f)` 平分容器宽度（NetworkScreen Hero 的用法）；
  *   传具体值 = 固定宽度（首页连接卡的用法）。
  * - [barHeight] 最高那一段的高度，其余按比例缩放。
+ * - 2026-10-12：`barHeight` 12dp → 14dp、`barWidth` 3dp → 3.5dp（`barSpacing` 2dp 不变）。
+ *   **为什么放大**：两处调用点（首页 HomeConnectionCard / 网络设置 NetworkScreen Hero）
+ *   都在渐变卡上，12dp 配 Hero 卡里的 36dp 圆底图标只有 1/3 高，底部差 12dp，
+ *   看着像"图标底下的小附件"而不是与运营商标题并排的一行（用户反馈"偏低、太平"）。
+ *   14dp 是"两处都略微放大"的最保守档：网络设置那处的 36dp 容器内底部差降到 7dp，
+ *   首页那处配 labelSmall 文字也不再显得比文字矮一截。
+ *   **刻意不动调用点而是改默认值**：两个调用点要的效果完全一致（用户要求两页视觉统一），
+ *   在调用点各自覆盖参数只会让下一处新调用点再犯一遍同样的错。
+ *   只有这两处调用该组件，改默认值影响面就等于这两处。
  *
  * 与 [UfiSignalBars] 的区别：这里是「渐变卡前景色（palette.onGradient / gradientMuted，默认白）
  * + 已算好的激活根数」，用于渐变 Hero 卡；后者是「按 rsrp 自动着色（绿/黄/红）」，用于普通浅色卡片。
@@ -104,8 +113,8 @@ fun UfiGradientSignalBar(
     bars: Int,
     modifier: Modifier = Modifier,
     segmentCount: Int = 5,
-    barHeight: Dp = 12.dp,
-    barWidth: Dp? = 3.dp,
+    barHeight: Dp = 14.dp,
+    barWidth: Dp? = 3.5.dp,
     barSpacing: Dp = 2.dp,
     cornerRadius: Dp = 1.5.dp
 ) {
