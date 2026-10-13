@@ -154,6 +154,16 @@ class MediaRoutes(
         /** 缓存总量上限，超了按修改时间从旧到新删（不是 LRU：读命中不 touch，否则 ETag 会跟着变）。 */
         private const val THUMB_CACHE_LIMIT_BYTES = 64L * 1024 * 1024
 
+        /**
+         * 对系统 MediaProvider 的调用闸门（2026-10-12）。
+         *
+         * 只保护 `loadThumbnail`：它是唯一会驱动 MediaProvider **解码**的调用，
+         * 并发上去会让它的解码缓存同时压几十份、涨到几百 MB 且不回落。
+         * 换成 1 是刻意的——列表按可见项加载本来就慢一点无感，
+         * 而 MediaStore 的普通查询（/list）不涉及解码，不该被这条闸门拖慢。
+         */
+        private val thumbSystemSemaphore = kotlinx.coroutines.sync.Mutex()
+
         /** `/lyrics` 读取的歌词旁挂文件后缀与大小上限（歌词就是几 KB，超过就不是歌词了）。 */
         private val LYRICS_EXTENSIONS = listOf("lrc", "txt")
         private const val MAX_LYRICS_BYTES = 256 * 1024
@@ -758,8 +768,30 @@ class MediaRoutes(
     private suspend fun thumbnailBytes(kind: Kind, id: Long, size: Int): ThumbnailAttempt {
         val uri = ContentUris.withAppendedId(contentUriOf(kind), id)
 
-        val systemThumb = runCatching {
-            appContext.contentResolver.loadThumbnail(uri, Size(size, size), null)
+        // ═══ 缩略图并发闸门（2026-10-12，修 android.process.media 涨到 471MB）═══
+        //
+        // 现象：媒体页滑动一段后，系统媒体进程内存涨到 471MB 且不回落，重启 core 才释放。
+        // 真机确认**设备无 root**（所以与 root shell 无关），且 `/rescan` 已改分批仍然复现。
+        //
+        // 根因是这一行`contentResolver.loadThumbnail()`：它在**系统没有该文件的缩略图缓存**时
+        // 会让 MediaProvider 同步打开文件、软解一帧（视频还要 demux），然后把解码产物
+        // 留在自己进程的缓存里。core 这边的行为是「列表滚动 → 连续几十个不同视频要缩略图」，
+        // 每一张都在驱动 MediaProvider 解码；它的解码缓存按**文件**留、不按访问淘汰，
+        // 于是几十个视频的解码缓冲叠起来就是几百 MB，而且**不会自己回落**。
+        //
+        // 原来的 `/rescan` 分批只治了「一次性提交 5000 路径」那条路，与本条无关 ——
+        // 所以分批上线后 471MB 照旧，这条才是真凶。
+        //
+        // 修法：把对 MediaProvider 的调用**串行化**（信号量 1）。滑动列表时请求照样一个个
+        // 排队，UI 侧本来也是按可见项加载、慢一点不影响；换来的是同一时刻只有一次解码在飞，
+        // 它的中间产物能被复用/释放，而不是几十份同时压在MediaProvider 里。
+        val systemThumb: Result<android.graphics.Bitmap?> = runCatching {
+            thumbSystemSemaphore.lock()
+            try {
+                appContext.contentResolver.loadThumbnail(uri, Size(size, size), null)
+            } finally {
+                thumbSystemSemaphore.unlock()
+            }
         }
         val systemReason = systemThumb.exceptionOrNull()?.let { e ->
             val text = "系统缩略图 ${e.javaClass.simpleName}: ${e.message}"
@@ -1268,8 +1300,45 @@ class MediaRoutes(
         val title = sanitizeTag(rawTitle)
         if (title.isEmpty()) return ""
         val base = displayName.substringBeforeLast('.', missingDelimiterValue = displayName).trim()
-        return if (title.equals(base, ignoreCase = true)) "" else title
+        if (title.equals(base, ignoreCase = true)) return ""
+        // 2026-10-13：MediaStore 里的陈旧标题（用户真机报"歌名后面跟一串英文乱码"）。
+        //
+        // 真实样本：
+        //   磁盘上真正的文件名：  阳光下的星星-金海心.flac
+        //   MediaStore 里的 TITLE：阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2
+        //
+        // 那个 `29894902` 是下载分片的字节数、`_CEujVT6XmHgTkI2` 是网易云音乐的临时文件标记 ——
+        // 所以这**不是编码乱码**（不是 GBK/UTF-8 嗅探错），而是：文件下载时以临时名被扫进
+        // MediaStore，之后被改名成正常名字，但 MediaStore 没有重新扫，那条 TITLE 就烂在库里了。
+        //
+        // 老逻辑只挡"TITLE == 文件名基名"，这条烂标题与基名不一致（多了 `.flac.29894902._CE…`），
+        // 于是被当成真曲名原样透出去，显示成"阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2"。
+        //
+        // 这里按"陈旧扫描"特征识别并丢弃，回空串让客户端走文件名兜底
+        // （`splitFileNameTitleArtist` 能正确拆出 `阳光下的星星` + `金海心`）。
+        //
+        // 判据只有一条：**归一化后以基名开头、且比基名更长** —— 多出来的那截正是下载残留
+        //（`.flac.29894902._CEujVT6XmHgTkI2`）。归一化是必需的：样本里基名是
+        // `阳光下的星星-金海心` 而 TITLE 是 `阳光下的星星 -金海心…`，**多了一个空格**。
+        //
+        // 刻意**没有**采用"点数 ≥ 2 就当陈旧"这种更宽的规则：它会把
+        // `Dr. A. Livingstone` 这类真实存在的曲名判掉。宁可漏判（多显示几秒残缺名，
+        // 下次重扫 MediaStore 就好了）也不能误伤真曲名。
+        val t = title.normalizedTitleKey()
+        val b = base.normalizedTitleKey()
+        val looksStale = b.isNotEmpty() && t.length > b.length && t.startsWith(b)
+        return if (looksStale) "" else title
     }
+
+    /**
+     * 曲名比较用的归一化：去空白 + 转小写 + 全角转半角。
+     *
+     * 样本里基名是 `阳光下的星星-金海心` 而TITLE 是 `阳光下的星星 -金海心.flac.29894902._CE…`
+     * ——**多了一个空格**。MediaStore 与磁盘名不一致的空格/全角在中文歌名上很常见，
+     * 不归一化就永远判不出"它是同一个名字的旧版本"。
+     */
+    private fun String.normalizedTitleKey(): String =
+        trim().lowercase().replace('\u3000', ' ').replace(Regex("\\s+"), "")
 
 
     /**

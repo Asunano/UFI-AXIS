@@ -51,11 +51,25 @@ import java.util.concurrent.ConcurrentLinkedQueue
 object AppLogger {
 
     private const val TAG = "UFI-AXIS-Core"
-    private const val MAX_LOG_FILES = 7  // 保留最近 7 天
+    // ═══ 2026-10-13：用户要求取消日志保留上限 ═══
+    //
+    // 背景：core 日志是定位图表断层唯一的证据来源。原来的三级上限（7 天 / 单文件 5MB / 目录 40MB）
+    // 在长时间抓日志时会把关键记录直接轮转掉 —— 用户导出时发现日志内容缺失，于是要求取消。
+    //
+    // 为什么这里不设「更大一点」的上限而是直接取消：
+    // · 5MB/文件 → 轮转覆盖 .log.1，同一分钟内的高频日志只留最新一段，开头直接消失；
+    // · 40MB 目录 → enforceTotalBudget() 按修改时间删最旧，同样会吃掉当天的证据。
+    //
+    // 风险与代价（明说，不回避）：日志目录现在只受设备存储容量约束，不设内部上限，
+    // 长期开日志的设备上它会持续增长。这是用户显式要求的行为；
+    // 若以后要收敛，应该改成「按天保留 + 用户可见的占用提示」，而不是偷偷截断。
+    private const val MAX_LOG_FILES = 3650  // 约 10 年；实质等于不删，只避免清理时误删今天之前很久的目录
     private const val MAX_BUFFER_SIZE = 500  // 内存缓冲区最大条目数
     private const val ERROR_DEDUP_WINDOW_MS = 5 * 60 * 1000L  // 错误去重窗口：5 分钟
-    private const val MAX_LOG_FILE_BYTES = 5L * 1024 * 1024  // 单个日志文件上限 5MB（所有类型）
-    private const val MAX_LOG_DIR_BYTES = 40L * 1024 * 1024  // 整个 logs 目录总量上限 40MB
+    // 2026-10-13：按用户要求取消单文件 5MB 轮转（见 MAX_LOG_FILES 上方说明）
+    private const val MAX_LOG_FILE_BYTES = Long.MAX_VALUE
+    // 2026-10-13：按用户要求取消目录 40MB 总预算（同上）
+    private const val MAX_LOG_DIR_BYTES = Long.MAX_VALUE
 
     /**
      * 详细日志关闭时，内存缓冲仍然收录的最低级别。
@@ -537,9 +551,23 @@ object AppLogger {
 
 
         // 文件持久化（复用 BufferedWriter）。
-        // DEBUG/INFO 只在 debug_mode 开启时落盘 —— 否则每个 HTTP 请求一行 DEBUG 访问日志
-        // 会让 app_*.log 的增长与请求量成正比（这是 core 日志目录变大的主因）。
-        if (level >= LogLevel.WARN || verboseEnabled) {
+        //
+        // 2026-10-12（用户报告"开了 core 日志开关但诊断日志一条都没落盘"）：
+        // INFO 落盘原本只认 [verboseEnabled]（= debug_mode），而 debug_mode 与
+        // `core_log_enabled` 是**两个独立开关**、默认都false。用户去设置里打开
+        // 「core 日志」，verboseEnabled 仍是 false —— 于是本该落盘的 INFO 一条没进文件，
+        // 而界面上没有任何提示说"你还需要开另一个开关"，表现就是诊断日志凭空消失。
+        //
+        // 现在 INFO 的落盘闸门是 `verboseEnabled || coreLogEnabled`：
+        // 「core 日志」这个开关的语义本来就是"我要 core 的运行日志"，INFO 属于运行日志，
+        // 不该再被一个藏在别处的 debug_mode 把住。DEBUG 仍然只认 debug_mode
+        // —— 每个 HTTP 请求一行 DEBUG，放开它才是日志目录变大的主因。
+        //
+        // [shouldEmit] 已经先判过 coreLogEnabled，所以这里不必再判 coreLogEnabled 为 false 的情况。
+        val persist = level >= LogLevel.WARN ||
+            (level == LogLevel.INFO && (verboseEnabled || coreLogEnabled)) ||
+            (level == LogLevel.DEBUG && verboseEnabled)
+        if (persist) {
             writeToFile(type, entry)
         }
 

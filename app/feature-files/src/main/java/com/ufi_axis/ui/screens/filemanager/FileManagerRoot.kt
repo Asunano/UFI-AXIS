@@ -384,6 +384,22 @@ fun FileManagerRoot(
     val pushJobs = state.remotePushJobs
     val pushCurrent = pushJobs.firstOrNull { it.state == FileManagerModule.PUSH_STATE_PUSHING }
         ?: pushJobs.firstOrNull { it.state == FileManagerModule.PUSH_STATE_QUEUED }
+
+    // 2026-10-13：这批上传的**目标是不是远端存储源**。
+    //
+    // 背景：core 的 RemotePushManager 里 jobs 是**常驻内存表**（ConcurrentHashMap，无落盘），
+    // 推过的作业一直留在里面直到被清理。于是「传到内部存储 / SD 卡」的本地上传，
+    // 只要之前推送过任何远端作业，`pushCurrent` 就非空 ——
+    // 弹窗的可见条件 `isUploading || pushCurrent != null` 会在本地上传结束后继续成立，
+    // 于是第一段刚结束就被判成 `UploadPhase.PUSHING`，弹出"第 2 步：设备推送到 外部存储"。
+    //
+    // 这正是用户报的"上传到内部储存或 SD 卡也要显示中转弹窗"：那条推送根本不是这一批的，
+    // 是上一次远端上传残留的作业，而 core 早已把文件送到了。
+    //
+    // 判据必须取**发起这一批上传时的目标路径**，不能读现在的 currentPath
+    // （选择器在后台开着，用户中途翻目录的情况会让它对不上），
+    // 所以在菜单点击那一刻就存下来。
+    var uploadTargetIsRemote by remember { mutableStateOf(false) }
     val pushActiveCount = pushJobs.count {
         it.state == FileManagerModule.PUSH_STATE_PUSHING || it.state == FileManagerModule.PUSH_STATE_QUEUED
     }
@@ -674,7 +690,13 @@ fun FileManagerRoot(
                                 // 再由设备推送），事先说清比事后解释为什么还没出现在远端要好。
                                 if (isRemoteHere) "上传（经设备中转）" else "上传",
                                 icon = Icons.Filled.FileUpload,
-                                onClick = { uploadLauncher.launch("*/*") }
+                                onClick = {
+                                    // 在点开选择器这一刻记下目标是本地还是远端：
+                                    // core 的推送作业表是常驻内存的，本批目标为本地时
+                                    // 不能被历史远端作业带出"第 2 步 推送"阶段（见 uploadTargetIsRemote）。
+                                    uploadTargetIsRemote = isRemoteHere
+                                    uploadLauncher.launch("*/*")
+                                }
                             ))
                         }
                         add(UfiPopupOption("refresh", "刷新", icon = Icons.Default.Refresh, onClick = { viewModel.refreshFileList() }))
@@ -1253,7 +1275,12 @@ fun FileManagerRoot(
             // "上传完成"的时刻，而实际上文件才刚到设备。
             val uploadPhase = if (state.isUploading) UploadPhase.UPLOADING else UploadPhase.PUSHING
             UploadProgressDialog(
-                visible = uploadDialogVisible && (state.isUploading || pushCurrent != null),
+                // 2026-10-13：第二阶段（推送）只在**本批目标真的是远端**时才可能出现。
+                // 原来是无条件 `|| pushCurrent != null`，而 core 的推送作业表是常驻内存的 ——
+                // 之前任何一次远端上传的残留作业都会让本地上传结束后弹出"第 2 步：设备推送到…"，
+                // 这就是用户报的"上传到内部储存或 SD 卡也要显示中转弹窗"。
+                visible = uploadDialogVisible &&
+                    (state.isUploading || (uploadTargetIsRemote && pushCurrent != null)),
                 phase = uploadPhase,
                 fileName = if (state.isUploading) state.uploadFileName else pushCurrent?.file_name.orEmpty(),
                 progress = if (state.isUploading) state.uploadProgress else (pushCurrent?.progress ?: -1f),

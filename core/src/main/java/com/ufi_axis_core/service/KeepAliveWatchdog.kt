@@ -149,7 +149,17 @@ object KeepAliveWatchdog {
                 AppLogger.i(TAG, "keepalive script written via shell fallback")
                 true
             } else {
-                AppLogger.e(TAG, "keepalive shell write failed: rc=${result.exitCode} ${result.stderr.take(120)}")
+                // 2026-10-12：无 root 设备上这是**预期结果**，不是故障。
+                // `executeAsRoot` 拿不到 root 时 rc!=0，每 5 分钟一次、自愈循环每次都试 ——
+                // 打成 [ERROR] 就是每5 分钟往 error.log 塞一条噪音，把真正的错误挤出去
+                // （实测一台无 root 设备上连续刷了几十条）。
+                // 降级到 [WARN]：仍能在日志里看见「这台设备没有 root，保活脚本没落地」，
+                // 但不占 ERROR 位，也不掩盖别的问题。
+                AppLogger.w(
+                    TAG,
+                    "keepalive shell write failed（设备可能无 root，属预期降级）: " +
+                        "rc=${result.exitCode} ${result.stderr.take(120)}"
+                )
                 false
             }
         } catch (e: Exception) {
