@@ -32,10 +32,10 @@
   "components": {
     "frpc": {
       "upstream": "fatedier/frp",
-      "version": "0.71.0",
-      "url": "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_linux_arm64.tar.gz",
-      "sha256": "f33c293c275d8fc68c654b6fba8f10b2551d6463d09a9fc9cffb7227eae82266",
-      "size": 12375716,
+      "version": "0.71.1",
+      "url": "https://github.com/fatedier/frp/releases/download/v0.71.1/frp_0.71.1_linux_arm64.tar.gz",
+      "sha256": "8edf590b0c396fa42f9c147121a76af83cfc2002b08f5aef0ea1008c43482019",
+      "size": 12539075,
       "archive": "tar.gz",
       "entry": "frpc"
     },
