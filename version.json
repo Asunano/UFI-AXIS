@@ -41,10 +41,10 @@
     },
     "cloudflared": {
       "upstream": "cloudflare/cloudflared",
-      "version": "2026.10.1",
-      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.1/cloudflared-linux-arm64",
-      "sha256": "2c65dfabf616c40efc7545d107d7a57ad5e21377e2964b7e88af19a238074a46",
-      "size": 37651992,
+      "version": "2026.10.2",
+      "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.2/cloudflared-linux-arm64",
+      "sha256": "b7e55b4d9702c2ab5f8348f780bb1db044527fc555367714c78e0595750a4665",
+      "size": 37652905,
       "archive": "raw",
       "entry": ""
     }
