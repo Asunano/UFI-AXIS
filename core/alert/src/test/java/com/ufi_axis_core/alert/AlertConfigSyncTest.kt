@@ -3,6 +3,7 @@ package com.ufi_axis_core.alert
 import android.app.Application
 import androidx.test.core.app.ApplicationProvider
 import com.ufi_axis_core.api.websocket.WebSocketManager
+import com.ufi_axis_core.core.database.AlertDailyCount
 import com.ufi_axis_core.core.database.AlertDao
 import com.ufi_axis_core.core.database.AlertRecord
 import com.ufi_axis_core.core.database.TypeCount
@@ -50,6 +51,8 @@ class AlertConfigSyncTest {
         override suspend fun getRecentAlerts(limit: Int): List<AlertRecord> = rows.sortedByDescending { it.timestamp }.take(limit)
         override suspend fun getCount(): Int = rows.size
         override suspend fun getAlertsBetween(startTime: Long, endTime: Long): List<AlertRecord> = rows.filter { it.timestamp in startTime..endTime }.sortedByDescending { it.timestamp }
+        // 0.1 新增的告警日统计：本用例不涉及，返回空即可（签名由 AlertDao 约束）
+        override suspend fun getDailyCounts(start: Long, end: Long): List<AlertDailyCount> = emptyList()
         override suspend fun getUnacknowledgedAlerts(): List<AlertRecord> = rows.filter { !it.acknowledged }
         override suspend fun getLatestByType(type: String): AlertRecord? = rows.filter { it.type == type }.maxByOrNull { it.timestamp }
         override suspend fun deleteOlderThan(cutoff: Long): Int { val b = rows.size; rows.removeIf { it.timestamp < cutoff }; return b - rows.size }

@@ -280,7 +280,12 @@ class ToastDialogTeardownGuardTest {
      */
     @Test
     fun dialogShellDispose_mustNotMutateDyingWindow() {
-        val body = bodyOf(executableCode(source(dialogShellPath)), "onDispose {")
+        // 0.1 起 UfiDialogShell 里不止一个 onDispose（弹窗在场计数 / toast 宿主各一个）。
+        // 这里只看**紧跟 pushDialogHost 的那个宿主收尾块**，否则会挑到前面
+        // UfiDialogVisibility 的 onDispose，误报「丢了 popDialogHost」。
+        val code = executableCode(source(dialogShellPath))
+        val hostTeardown = code.substringAfter("UfiToastOverlay.pushDialogHost(it)")
+        val body = bodyOf(hostTeardown, "onDispose {")
 
         assertTrue(
             "UfiDialogShell 的 onDispose 丢了 popDialogHost —— toast 宿主栈会残留已死窗口。",
