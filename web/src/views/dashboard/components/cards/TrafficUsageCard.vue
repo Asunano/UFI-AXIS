@@ -1,5 +1,5 @@
 <template>
-  <GridCard class="panel-card" title="流量使用情况">
+  <GridCard class="panel-card" title="流量使用情况" :loading="initialLoading">
     <template #extra>
       <n-tag size="small" :type="usageStatusType" :bordered="false" round>{{ usageStatusText }}</n-tag>
       <!-- 「历史」与「设限额」并列：一个看过去、一个改规则，都是这张卡的下钻动作 -->
@@ -31,9 +31,9 @@
             <span>提醒线 {{ alertPercent }}%</span>
           </div>
         </template>
-        <div v-else class="usage-bar-meta usage-bar-meta-only">
-          {{ trafficLimitEnabled ? '已启用限额，但设备未设置额度' : '未启用流量限额' }}
-        </div>
+        <!-- 没有有效额度时这里不再补一句「未启用限额 / 已启用但未设置额度」：
+             卡头那颗 tag（usageStatusText，五档状态）已经把这件事说得更全，
+             同一句话在一张卡上说两遍是最容易出现「两处不一致」的地方。 -->
       </div>
 
       <!-- 右：本月总流量。已用值独占一行当主角，额度与说明各自换行退到次要位置 -->
@@ -82,6 +82,12 @@ const showHistory = ref(false);
 
 const trafficSummary = computed(() => get(dashboardStore.summary, 'traffic_summary', null));
 const trafficLimit = computed(() => get(dashboardStore.summary, 'traffic_limit', null));
+
+/**
+ * 只在「整份 summary 还没到手」时给骨架：loadSummary 每 10s 都会把 store 的 loading 置位，
+ * 拿它直接喂 GridCard 会让这张卡每 10 秒闪一次占位块。
+ */
+const initialLoading = computed(() => dashboardStore.loading && !dashboardStore.summary);
 
 // 流量使用情况数据源说明（对齐 core）：
 // - traffic_limit.used_bytes / limit_bytes 由 core 算好（与 /api/device/traffic-limit 同一契约），
@@ -182,7 +188,7 @@ const usageStatusText = computed(() => {
 .usage-wide {
   display: flex;
   align-items: center;
-  gap: 24px;
+  gap: var(--space-6);
   flex-wrap: wrap;
 }
 .usage-bar-col {
@@ -197,11 +203,11 @@ const usageStatusText = computed(() => {
   margin-bottom: 6px;
 }
 .usage-bar-label {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
 }
 .usage-bar-value {
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 600;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
@@ -212,12 +218,8 @@ const usageStatusText = computed(() => {
   justify-content: space-between;
   gap: 10px;
   margin-top: 6px;
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
-}
-/* 没有有效额度时只有一行说明文字，不需要两端对齐 */
-.usage-bar-meta-only {
-  justify-content: flex-start;
 }
 
 .usage-hero {
@@ -228,20 +230,20 @@ const usageStatusText = computed(() => {
   gap: 2px;
 }
 .usage-hero-label {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
 }
 /* 已用值 / 额度 / 说明各占一行（.usage-hero 是竖排 flex），
    已用值靠字号与字重独占视觉重心，额度退成一行小字参照 */
 .usage-hero-value {
-  font-size: 26px;
+  font-size: var(--font-2xl);
   font-weight: 700;
   line-height: 1.15;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
 .usage-hero-total {
-  font-size: 13px;
+  font-size: var(--font-base);
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
 }

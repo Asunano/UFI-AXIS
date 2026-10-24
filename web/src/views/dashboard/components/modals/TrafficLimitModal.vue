@@ -3,7 +3,8 @@
     :show="show"
     preset="card"
     title="流量限额设置"
-    style="width: 440px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 460px; --modal-h: 720px"
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <div class="modal-form-col">
@@ -47,10 +48,13 @@
         </div>
       </template>
 
-      <div class="form-item">
-        <n-switch v-model:value="trafficForm.enabled" />
-        <span class="form-inline-label">启用流量限额</span>
-      </div>
+      <!-- 整行带说明的开关走 ToggleRow（§3 家规「开关三版式各归其位」） -->
+      <ToggleRow
+        label="启用流量限额"
+        description="启用后按下方的额度与提醒百分比生效；关闭时这些值只是草稿"
+        :model-value="trafficForm.enabled"
+        @update:model-value="(v: boolean) => (trafficForm.enabled = v)"
+      />
       <div class="form-item">
         <label>限额大小</label>
         <n-input-number v-model:value="trafficForm.limit_size" :min="1" size="small" style="width: 100%" />
@@ -78,10 +82,12 @@
         />
       </div>
       <template v-if="planMode === 'monthly'">
-        <div class="form-item">
-          <n-switch v-model:value="trafficForm.auto_clear" />
-          <span class="form-inline-label">每月自动清除</span>
-        </div>
+        <ToggleRow
+          label="每月自动清除"
+          description="到「清除日期」把当月用量计数清零；固定有效期套餐保存时会强制关闭这一项"
+          :model-value="trafficForm.auto_clear"
+          @update:model-value="(v: boolean) => (trafficForm.auto_clear = v)"
+        />
         <div class="form-item">
           <label>清除日期</label>
           <n-input-number v-model:value="trafficForm.clear_date" :min="1" :max="31" size="small" style="width: 100%" />
@@ -101,6 +107,7 @@
 import { ref, reactive, watch } from 'vue';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { Endpoints } from '@/api/contract';
+import ToggleRow from '@/components/ToggleRow.vue';
 
 const api = useCancellableApi();
 
@@ -165,8 +172,7 @@ watch(
       planForm.duration_days = Number(plan.duration_days) || 90;
       planForm.notify_days = Number(plan.notify_days) || 3;
       if (plan.mode === 'fixed' && plan.days_left !== undefined) {
-        planExpiryText.value =
-          plan.days_left >= 0 ? `剩余 ${plan.days_left} 天` : `已过期 ${-plan.days_left} 天`;
+        planExpiryText.value = plan.days_left >= 0 ? `剩余 ${plan.days_left} 天` : `已过期 ${-plan.days_left} 天`;
       } else {
         planExpiryText.value = '';
       }
@@ -216,26 +222,22 @@ async function onSave() {
 .modal-form-col {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 4px 0;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
 }
 .form-item {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
 }
 .form-item label {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-secondary);
   font-weight: 500;
 }
-.form-inline-label {
-  font-size: 13px;
-  color: var(--text-primary);
-  margin-left: 8px;
-}
+/* 原 .form-inline-label（裸开关右侧的说明文字）随两个开关改 ToggleRow 一并退役 */
 .plan-hint {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-secondary);
   line-height: 1.5;
 }

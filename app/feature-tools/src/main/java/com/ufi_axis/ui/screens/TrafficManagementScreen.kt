@@ -119,7 +119,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             // ── 提示区域 ──
             state.errorMessage?.let { err ->
-                UfiErrorBanner(message = err, modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin))
+                UfiErrorBanner(message = err)
             }
             state.successMessage?.let { msg ->
                 UfiSettingsGroup {
@@ -127,13 +127,11 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 }
             }
 
-            if (state.isLoading && cfg == null) {
-                UfiSettingsGroup {
-                    Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
-                        UfiLoadingIndicator()
-                    }
-                }
-            }
+            // 2026-10-15（用户："在 Hero 卡上方有加载布局，删除这个加载布局，有圆环转圈那里"）：
+            // 这里原来是一个 UfiSettingsGroup 包着 UfiLoadingIndicator 的转圈块，**已整块删除**。
+            // 它压在 Hero 卡上方，加载那一下把整页内容顶下去、转完再弹回来 —— 观感就是"界面异常"。
+            // 数据没回来时下面各卡本来就走"占位/默认值"分支（cfg == null 时显示默认额度），
+            // 不需要再额外插一块转圈。
 
             // ── 内容主体：监控与设置（统一使用 12dp 间距） ──
             Column(
@@ -357,6 +355,20 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                         value = "查看",
                         icon = Icons.Default.BarChart,
                         onClick = { showTrafficHistory = true }
+                    )
+
+                    UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
+
+                    // 流量报表（2026-10-15 用户要求：从监控中心总览搬到本页）。
+                    // 与上面「流量历史」同族 —— 都是只读的"看数"入口，只是时间尺度不同：
+                    // 历史看"按日/周/月/年"的曲线，报表看"日报/周报/月报"的区间合计与逐日明细。
+                    // 放在这张卡里而不是新开一张：它和限额、历史读的是同一份流量数据。
+                    UfiSettingsValue(
+                        title = "流量报表",
+                        description = "日报 / 周报 / 月报：区间合计与逐日用量",
+                        value = "查看",
+                        icon = Icons.Default.CalendarMonth,
+                        onClick = { navController.navigate(Routes.DETAIL_TRAFFIC_REPORT) }
                     )
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))

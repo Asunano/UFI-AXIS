@@ -1,5 +1,5 @@
 <template>
-  <div class="traffic-chart">
+  <div class="traffic-chart" :style="horizontal ? { height: `${chartHeight}px` } : undefined">
     <v-chart :option="option" autoresize />
   </div>
 </template>
@@ -22,14 +22,20 @@ import { BarChart } from 'echarts/charts';
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components';
 import { useChartColors } from '@/composables/chartTheme';
 import type { TrafficUsageResponse } from '@/api/traffic';
-import { trafficHistoryBarOption } from '../trafficHistoryCharts';
+import { trafficHistoryBarOption, trafficHistoryHorizontalBarOption } from '../trafficHistoryCharts';
 
 use([CanvasRenderer, BarChart, GridComponent, TooltipComponent, LegendComponent]);
 
-const props = defineProps<{ data: TrafficUsageResponse | null }>();
+const props = defineProps<{ data: TrafficUsageResponse | null; horizontal?: boolean }>();
 
 const colors = useChartColors();
-const option = computed(() => trafficHistoryBarOption(props.data, colors.value));
+const option = computed(() =>
+  props.horizontal
+    ? trafficHistoryHorizontalBarOption(props.data, colors.value)
+    : trafficHistoryBarOption(props.data, colors.value)
+);
+/** 横向图每个桶占一行，高度随桶数增长；默认纵向图仍用 CSS 的 300/240px */
+const chartHeight = computed(() => Math.max(240, (props.data?.buckets.length ?? 0) * 20 + 52));
 </script>
 
 <style scoped>

@@ -129,3 +129,84 @@ export function trafficHistoryBarOption(data: TrafficUsageResponse | null, color
     ],
   };
 }
+
+/**
+ * 同一份分桶数据的**横向**堆叠柱状图。
+ *
+ * 监控页的「流量报表」要替代逐日明细表：日期在左、柱条向右延伸，读法更接近表格。
+ * 数据、配色、tooltip 的文案口径与上面的纵向图完全一致，只是交换了 x/y 轴。
+ */
+export function trafficHistoryHorizontalBarOption(data: TrafficUsageResponse | null, colors: ChartColors): Option {
+  const buckets: TrafficUsageBucket[] = data?.buckets ?? [];
+  return {
+    color: [colors.info, colors.success],
+    legend: {
+      data: [SERIES_RX, SERIES_TX],
+      textStyle: { color: colors.textSecondary, fontSize: 11 },
+      top: 0,
+      right: 0,
+    },
+    grid: { top: 30, right: 18, bottom: 22, left: 50 },
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      backgroundColor: colors.popoverBg,
+      borderColor: colors.border,
+      textStyle: { color: colors.textPrimary, fontSize: 12 },
+      formatter: (params: any) => {
+        const list = Array.isArray(params) ? params : [params];
+        const bucket = buckets[Number(list[0]?.dataIndex ?? -1)];
+        if (!bucket) {
+          return '';
+        }
+        const rxMarker = String(list.find((p: any) => p.seriesName === SERIES_RX)?.marker ?? '');
+        const txMarker = String(list.find((p: any) => p.seriesName === SERIES_TX)?.marker ?? '');
+        return (
+          '<div style="max-width:240px">' +
+          `<div style="font-weight:600;margin-bottom:4px">${bucket.title}</div>` +
+          tooltipRow(rxMarker, SERIES_RX, bucket.rx_bytes) +
+          tooltipRow(txMarker, SERIES_TX, bucket.tx_bytes) +
+          tooltipRow('', '合计', bucket.total_bytes) +
+          '</div>'
+        );
+      },
+    },
+    xAxis: {
+      type: 'value',
+      min: 0,
+      max: trafficAxisPeakBytes(data?.peak_bytes ?? 0),
+      splitNumber: 3,
+      axisLabel: {
+        color: colors.textMuted,
+        fontSize: 11,
+        hideOverlap: true,
+        formatter: (v: number) => formatBytes(v),
+      },
+      splitLine: { lineStyle: { color: colors.border, type: 'dashed' } },
+    },
+    yAxis: {
+      type: 'category',
+      inverse: true,
+      data: buckets.map((b) => b.label),
+      axisTick: { show: true, alignWithLabel: true, interval: 0, lineStyle: { color: colors.border } },
+      axisLine: { lineStyle: { color: colors.border } },
+      axisLabel: { color: colors.textMuted, fontSize: 11, interval: 0 },
+    },
+    series: [
+      {
+        name: SERIES_RX,
+        type: 'bar',
+        stack: 'traffic',
+        barMaxWidth: 14,
+        data: buckets.map((b) => b.rx_bytes),
+      },
+      {
+        name: SERIES_TX,
+        type: 'bar',
+        stack: 'traffic',
+        barMaxWidth: 14,
+        data: buckets.map((b) => b.tx_bytes),
+      },
+    ],
+  };
+}

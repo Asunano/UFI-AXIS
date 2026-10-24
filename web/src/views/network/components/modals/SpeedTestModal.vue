@@ -3,8 +3,8 @@
     :show="show"
     preset="card"
     title="网速测试"
-    style="width: min(720px, calc(100vw - 24px))"
-    :content-style="{ maxHeight: '88vh', overflow: 'auto' }"
+    class="modal-fit"
+    style="--modal-w: 720px; --modal-h: 720px"
     @update:show="emit('update:show', $event)"
   >
     <div class="st">
@@ -161,7 +161,7 @@
                     <span>已传</span><b>{{ formatBytes(state.totalBytes) }}</b>
                   </div>
                   <div class="st-stat">
-                    <span>并发</span><b>{{ state.streams || '—' }}</b>
+                    <span>并发</span><b>{{ state.streams || '--' }}</b>
                   </div>
                 </div>
               </div>
@@ -170,16 +170,21 @@
           </div>
 
           <!-- 定时测速历史（core 侧跑的轮次：定时任务 / 手动触发，2026-10-06） -->
-          <div v-if="history.length || historyLoaded" class="st-history">
+          <div v-if="history.length || historyLoaded || historyFailed" class="st-history">
             <div class="st-history-head">
               <span class="st-history-title">定时测速历史</span>
               <n-button size="tiny" quaternary :disabled="isRunning" @click="runOnDevice">在设备上测一次</n-button>
             </div>
+            <!-- 读取失败不能与「还没有历史」混成同一个空区（家规第 6 条） -->
+            <div v-if="historyFailed && !history.length" class="st-history-error">
+              历史读取失败，
+              <n-button size="tiny" text type="primary" @click="loadHistory">重试</n-button>
+            </div>
             <div v-for="r in history" :key="r.timestamp" class="st-history-row">
               <span class="st-h-time">{{ r.time }}</span>
-              <span class="st-h-dl">↓ {{ r.download_mbps }} Mbps</span>
-              <span class="st-h-up">↑ {{ r.upload_mbps }} Mbps</span>
-              <span class="st-h-lat">{{ r.latency_ms }} ms</span>
+              <span class="st-h-dl">↓ {{ fmtHistory(r.download_mbps) }} Mbps</span>
+              <span class="st-h-up">↑ {{ fmtHistory(r.upload_mbps) }} Mbps</span>
+              <span class="st-h-lat">{{ fmtHistory(r.latency_ms) }} ms</span>
               <span class="st-h-trig" :class="r.trigger">{{ r.trigger === 'scheduled' ? '定时' : '手动' }}</span>
             </div>
           </div>
@@ -373,16 +378,31 @@ function formatMs(ms: number | null): string {
 }
 
 function fmtMbps(v: number): string {
-  if (!Number.isFinite(v) || v <= 0) return '—';
+  if (!Number.isFinite(v) || v <= 0) return '--';
   return v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2);
 }
 
 function formatBytes(n: number): string {
-  if (n <= 0) return '—';
+  if (n <= 0) return '--';
   const mb = n / (1024 * 1024);
   if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
   if (mb >= 1) return `${mb.toFixed(1)} MB`;
   return `${(n / 1024).toFixed(0)} KB`;
+}
+
+/**
+ * 「定时测速历史」行的数值格式化。
+ *
+ * 接口把这些字段按字符串给（`download_mbps: "23.40"`），直接上屏会出现空串或
+ * `23.400000000000002` 这类长尾；统一保留 1~2 位小数，缺值显示 `--`（家规第 5 条）。
+ */
+function fmtHistory(v: string | number | null | undefined): string {
+  if (v == null || String(v).trim() === '') return '--';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return '--';
+  if (n >= 100) return n.toFixed(0);
+  if (n >= 10) return n.toFixed(1);
+  return n.toFixed(2);
 }
 
 function formatMbpsAxis(v: number): string {
@@ -491,7 +511,15 @@ function onSpeedtestBroadcast(data: any): void {
   if (!item) return;
   historyLoaded.value = true;
   history.value = [
-    { ...item, time: new Date(Number(item.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) },
+    {
+      ...item,
+      time: new Date(Number(item.timestamp)).toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+    },
     ...history.value,
   ].slice(0, 30);
 }
@@ -804,9 +832,7 @@ async function probeUpload(url: string): Promise<boolean> {
  * 上行：时间预算内循环 POST 固定 512KB 块。
  * 浏览器没有 OkHttp 那种「单请求边写边计」的 body，短块 + 连发才能按秒收尾，
  * 也避开平台请求体上限。失败只记日志，不打断整体测速。
- */
-/**
- * 上行：时间预算内循环 POST 固定 512KB 块。
+ *
  * @param downloadBase 下行已传字节——上传过程中「已传输」= 下行 + 上行，避免停在下行数字上。
  *
  * 字节计数：
@@ -1085,9 +1111,7 @@ async function start() {
   })();
 }
 
-onUnmounted(() => {
-  cancelAll();
-});
+// 卸载清理统一在上文那一处 onUnmounted（cancelAll + 摘掉 WS 订阅），这里不再重复注册。
 
 // ── 定时测速（core 侧执行，2026-10-06）─────────────────────────
 interface SpeedHistoryItem {
@@ -1100,27 +1124,42 @@ interface SpeedHistoryItem {
 }
 const history = ref<(SpeedHistoryItem & { time: string })[]>([]);
 const historyLoaded = ref(false);
+/** 历史读取失败：原来 catch 后直接隐藏列表，等于把失败伪装成「没有历史」 */
+const historyFailed = ref(false);
 
 async function loadHistory(): Promise<void> {
+  historyFailed.value = false;
   try {
     const uri = '/api/speedtest/history?limit=30';
     const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { headers: await speedHeaders('GET', uri) });
-    if (!res.ok) return;
+    if (!res.ok) {
+      historyFailed.value = true;
+      return;
+    }
     historyLoaded.value = true;
     const data = (await res.json()) as { items?: SpeedHistoryItem[] };
     history.value = (data.items ?? []).map((r) => ({
       ...r,
-      time: new Date(Number(r.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+      time: new Date(Number(r.timestamp)).toLocaleString('zh-CN', {
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
     }));
   } catch {
-    // 历史加载失败不打扰：列表区域直接隐藏
+    // 失败态由模板显示「历史读取失败 + 重试」，不再静默隐藏
+    historyFailed.value = true;
   }
 }
 
 async function runOnDevice(): Promise<void> {
   try {
     const uri = '/api/speedtest/run';
-    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { method: 'POST', headers: await speedHeaders('POST', uri) });
+    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, {
+      method: 'POST',
+      headers: await speedHeaders('POST', uri),
+    });
     if (res.status === 409) {
       message.warning('已有测速在跑');
       return;
@@ -1135,7 +1174,6 @@ async function runOnDevice(): Promise<void> {
     message.error(`设备测速失败: ${e?.message || '未知错误'}`);
   }
 }
-
 </script>
 
 <style scoped>
@@ -1241,7 +1279,7 @@ async function runOnDevice(): Promise<void> {
 .st-dial-slot {
   transition: opacity 0.25s ease;
 }
-@media (max-width: 680px) {
+@media (max-width: 768px) {
   .st-layout {
     grid-template-columns: 1fr;
   }
@@ -1454,21 +1492,9 @@ async function runOnDevice(): Promise<void> {
   padding: 10px 6px;
 }
 
-.st-data {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.st-chart-wrap {
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  padding: 8px;
-}
-.st-chart {
-  width: 100%;
-  height: 72px;
-  display: block;
-}
+/* 2026-10-21 删除 `.st-data` / `.st-chart-wrap` / 第二份 `.st-chart`：
+   它们对应早期「小折线 72px + 外框」的结构，模板早已改用 ScrollingLineChart
+   （`.st-chart` 直接带描边与 200px 下限），留着只会误导改样式的人。 */
 .st-stats {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -1502,9 +1528,8 @@ async function runOnDevice(): Promise<void> {
   color: var(--error);
   text-align: center;
 }
-.st-actions:empty {
-  display: none;
-}
+/* `.st-actions:empty` 已删（2026-10-21）：规则只在「两个按钮都没渲染」时生效，
+   .st-left 的 gap 本来就不靠它兜，属于对不上需求的无用规则。 */
 .st-targets {
   display: flex;
   flex-direction: column;
@@ -1570,7 +1595,7 @@ async function runOnDevice(): Promise<void> {
 
 .st-history {
   margin-top: 12px;
-  border-top: 1px dashed var(--divider-color, rgba(128, 128, 128, 0.25));
+  border-top: 1px dashed var(--border-subtle);
   padding-top: 8px;
 }
 .st-history-head {
@@ -1582,6 +1607,13 @@ async function runOnDevice(): Promise<void> {
 .st-history-title {
   font-size: 12px;
   opacity: 0.65;
+}
+.st-history-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--font-sm);
+  color: var(--text-muted);
 }
 .st-history-row {
   display: flex;

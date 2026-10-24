@@ -39,7 +39,7 @@ class TrafficRoutes(
                     return@get
                 }
                 val fmt = java.text.SimpleDateFormat("MM-dd", java.util.Locale.CHINA)
-                call.respond(mapOf(
+                call.respond(toJsonElement(mapOf(
                     "ok" to true,
                     "period" to report.period,
                     "range_start" to report.rangeStart,
@@ -57,7 +57,7 @@ class TrafficRoutes(
                             "total_bytes" to d.total
                         )
                     }
-                ))
+                )))
             }
 
             // 实时网速（从调度器缓存）
