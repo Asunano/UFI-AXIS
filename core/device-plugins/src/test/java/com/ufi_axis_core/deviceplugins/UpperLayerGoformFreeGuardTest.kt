@@ -161,7 +161,15 @@ class UpperLayerGoformFreeGuardTest {
                 "etGoformPassword",
                 "btnToggleGoformPwd",
                 "InvalidGoformConfig",
+                // 0.1：设置页新增的「测试 goform 连通性」按钮与结果文本，纯控件命名（R.id 在布局里）
+                "btnTestGoform",
+                "tvGoformTest",
+                "testGoformConnectivity",
             ),
+        // 0.1：goform 熔断健康闸门的装配。`GoformGuard` 在 :core:common、`setGoformUnhealthy`
+        // 在 ResponseCache，装配层只把两者接成一条回调；不涉及具体协议类型，也不向上层暴露。
+        "core/src/main/java/com/ufi_axis_core/service/ComponentFactory.kt" to
+            setOf("GoformGuard", "setGoformUnhealthy"),
         "core/src/main/java/com/ufi_axis_core/service/BackendService.kt" to
             setOf("GoformQoS", "GoformSessionLog"),
         "core/api/src/main/java/com/ufi_axis_core/api/DataHub.kt" to

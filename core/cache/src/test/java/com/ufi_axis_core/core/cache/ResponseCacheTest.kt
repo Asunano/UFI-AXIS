@@ -167,9 +167,12 @@ class ResponseCacheTest {
         val cache = ResponseCache()
         var calls = 0
 
-        // ttl=0 → 下一次读必然"过期"
+        // ttl=0 → 跨过 1ms 后必然"过期"
         val first = cache.getOrPut("device:identity", 0L) { calls++; JsonPrimitive("v1") }
         assertEquals("v1", first.jsonPrimitive.content)
+        // `isExpired` 是 `elapsed > ttl`，同毫秒内 ttl=0 还不算过期；
+        // 显式跨过 1ms，避免恢复后的读取因时钟粒度直接命中旧值（CI 上偶发）。
+        kotlinx.coroutines.delay(5)
 
         cache.setGoformUnhealthy(true)
         val stale = cache.getOrPut("device:identity", 0L) { calls++; JsonPrimitive("v2") }
