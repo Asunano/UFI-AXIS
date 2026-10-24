@@ -3,11 +3,15 @@ package com.ufi_axis_core.api.routes
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
 import com.ufi_axis_core.api.backup.BackupAssembler
+import com.ufi_axis_core.api.backup.RemoteBackupRunner
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.database.SmsRuleDao
 import com.ufi_axis_core.util.AppSettings
+import com.ufi_axis_core.util.BackupCrypto
+import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.post
+import io.ktor.client.request.put
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsText
@@ -412,6 +416,46 @@ class BackupRoutesTest {
                 else """{"encrypted":false,"acknowledge_plaintext":true}"""
             )
         }.readBytes()
+
+    // ── 远端自动备份配置（2026-10-24） ──
+
+    @Test
+    fun `remote config endpoint stores source and passphrase without echoing it`() = testApplication {
+        application { mount() }
+        val pass = "r".repeat(BackupCrypto.MIN_PASSPHRASE_LENGTH)
+
+        val put = client.put("/backup/remote-config") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"source_id":"src-1","passphrase":"$pass"}""")
+        }
+        assertEquals(HttpStatusCode.OK, put.status)
+        assertFalse("口令绝不能出现在响应里", put.bodyAsText().contains(pass))
+        assertEquals("src-1", settings.getRawString(RemoteBackupRunner.KEY_BACKUP_SOURCE_ID))
+        assertEquals(pass, settings.getRawString(RemoteBackupRunner.KEY_BACKUP_PASSPHRASE))
+
+        val get = client.get("/backup/remote-config")
+        assertEquals(HttpStatusCode.OK, get.status)
+        assertFalse("GET 也不能回显口令", get.bodyAsText().contains(pass))
+        val body = get.json()
+        assertEquals("src-1", body["source_id"]?.jsonPrimitive?.content)
+        assertEquals(true, body["passphrase_set"]?.jsonPrimitive?.booleanOrNull)
+    }
+
+    @Test
+    fun `remote config endpoint rejects source without passphrase`() = testApplication {
+        application { mount() }
+
+        val resp = client.put("/backup/remote-config") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"source_id":"src-1"}""")
+        }
+
+        assertEquals("有源没口令的任务必然失败，端点必须先拒", HttpStatusCode.BadRequest, resp.status)
+        assertTrue(
+            "拒绝时不能落半套 source",
+            settings.getRawString(RemoteBackupRunner.KEY_BACKUP_SOURCE_ID).isNullOrEmpty()
+        )
+    }
 
     private suspend fun io.ktor.server.testing.ApplicationTestBuilder.exportPackage(
         encrypted: Boolean

@@ -1,8 +1,10 @@
 <template>
   <div class="settings-panel">
     <!-- 明文链路提示：只在「隧道来源 + http」这一种组合下出现。
-         局域网 http 与隧道 https 都不打扰用户。 -->
-    <n-alert v-if="insecureRemote" type="warning" :bordered="false" style="grid-column: 1 / -1">
+         局域网 http 与隧道 https 都不打扰用户。
+         `.full-width` 是 main.css 里 `.settings-panel > .full-width` 的通栏钩子（原先写的是内联
+         style="grid-column: 1 / -1"，计划 B8-3 收到类里）。 -->
+    <n-alert v-if="insecureRemote" class="full-width" type="warning" :bordered="false">
       当前是通过内网穿透以 HTTP 访问的。备份内容与口令在链路上是明文的，建议改用 HTTPS 或在设备所在的局域网内操作。
     </n-alert>
 
@@ -11,7 +13,7 @@
          「是否已选文件 / 是否已预览 / 段数 / 是否替换模式 / 是否有失败明细」变化，
          幅度可达数倍。按栅格铁律「高度随运行时状态变化的卡不参与等高配对」，
          强行两列会在宽屏上留下整块空洞。 -->
-    <n-card class="full-width" title="导出备份" size="small">
+    <GridCard class="full-width" title="导出备份">
       <n-space vertical :size="14">
         <n-alert type="default" :bordered="false">
           备份包含服务与设备后台配置、告警与监控设置、通知渠道、定时任务与自动化规则、
@@ -35,22 +37,59 @@
             :placeholder="`设置口令（至少 ${minPassphrase} 个字符）`"
           />
           <n-input v-model:value="exportPassphrase2" type="password" show-password-on="click" placeholder="确认口令" />
-          <n-text depth="3" style="font-size: 12px">
-            口令不会被保存在设备或备份文件中，遗忘后无法恢复备份内容。
-          </n-text>
+          <n-text class="field-hint"> 口令不会被保存在设备或备份文件中，遗忘后无法恢复备份内容。 </n-text>
         </template>
 
         <n-space justify="end">
           <n-button type="primary" size="small" :loading="exporting" @click="doExport"> 导出并下载 </n-button>
         </n-space>
       </n-space>
-    </n-card>
+    </GridCard>
 
-    <n-card class="full-width" title="从备份恢复" size="small">
+    <GridCard class="full-width" title="远端自动备份">
+      <n-space vertical :size="14">
+        <n-alert type="default" :bordered="false">
+          定时任务选择「远端备份」后，会把加密备份包推送到下面选中的存储源，并在
+          <code>ufi-axis-backup/</code> 下滚动保留 7 份。口令只保存在设备本地，接口不会回显。
+        </n-alert>
+
+        <n-select
+          v-model:value="remoteSourceId"
+          :options="remoteSourceOptions"
+          placeholder="选择远端存储源（留空 = 关闭远端备份）"
+          clearable
+        />
+        <n-text v-if="remoteSources.length === 0" class="field-hint">
+          还没有远端存储源。请先在「文件管理 → 存储源」里添加 FTP / WebDAV / SMB / S3 之一。
+        </n-text>
+
+        <n-input
+          v-model:value="remotePassphrase"
+          type="password"
+          show-password-on="click"
+          :placeholder="
+            remotePassphraseSet
+              ? `已设置口令（至少 ${minPassphrase} 位），留空保持不变`
+              : `设置备份口令（至少 ${minPassphrase} 位）`
+          "
+        />
+        <n-checkbox v-if="remotePassphraseSet" v-model:checked="remoteClearPassphrase">
+          清除已保存的备份口令（需先把存储源留空保存）
+        </n-checkbox>
+
+        <n-space justify="end">
+          <n-button size="small" type="primary" :loading="remoteSaving" @click="saveRemoteConfig">
+            保存远端备份设置
+          </n-button>
+        </n-space>
+      </n-space>
+    </GridCard>
+
+    <GridCard class="full-width" title="从备份恢复">
       <n-space vertical :size="14">
         <n-space align="center" :size="10">
           <n-button size="small" :disabled="importing" @click="pickFile">选择备份文件</n-button>
-          <n-text v-if="fileName" depth="2" style="font-size: 13px">{{ fileName }}</n-text>
+          <n-text v-if="fileName" class="file-name">{{ fileName }}</n-text>
         </n-space>
         <input ref="fileInputRef" type="file" accept=".ufibak,.zip" style="display: none" @change="onFileSelected" />
 
@@ -67,23 +106,29 @@
             <n-descriptions-item label="包含段数">{{ preview.sections?.length ?? 0 }}</n-descriptions-item>
           </n-descriptions>
 
-          <n-table :single-line="false" size="small">
-            <thead>
-              <tr>
-                <th>内容</th>
-                <th style="width: 96px">条目</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="s in preview.sections" :key="s.path">
-                <td>
-                  {{ s.label }}
-                  <n-tag v-if="s.sensitive_items > 0" size="tiny" type="warning" :bordered="false"> 含敏感信息 </n-tag>
-                </td>
-                <td>{{ s.items }}</td>
-              </tr>
-            </tbody>
-          </n-table>
+          <!-- 两张 n-table 都套一层横向滚动容器：360px 下卡内只有 ~298px，
+               「未成功的项 / 原因」两列与长路径会把表格顶出卡片右边界。 -->
+          <div class="table-scroll">
+            <n-table :single-line="false" size="small">
+              <thead>
+                <tr>
+                  <th>内容</th>
+                  <th class="col-count">条目</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="s in preview.sections" :key="s.path">
+                  <td>
+                    {{ s.label }}
+                    <n-tag v-if="s.sensitive_items > 0" size="tiny" type="warning" :bordered="false">
+                      含敏感信息
+                    </n-tag>
+                  </td>
+                  <td>{{ s.items }}</td>
+                </tr>
+              </tbody>
+            </n-table>
+          </div>
 
           <n-radio-group v-model:value="importMode" size="small">
             <n-space vertical :size="6">
@@ -115,23 +160,25 @@
               <br /><strong>端口或设备档位有变化，需要重启核心服务才会生效。</strong>
             </template>
           </n-alert>
-          <n-table v-if="result.failed.length" :single-line="false" size="small" class="fail-table">
-            <thead>
-              <tr>
-                <th>未成功的项</th>
-                <th>原因</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="f in result.failed" :key="f.path">
-                <td>{{ f.path }}</td>
-                <td>{{ f.reason }}</td>
-              </tr>
-            </tbody>
-          </n-table>
+          <div v-if="result.failed.length" class="table-scroll">
+            <n-table :single-line="false" size="small" class="fail-table">
+              <thead>
+                <tr>
+                  <th>未成功的项</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="f in result.failed" :key="f.path">
+                  <td>{{ f.path }}</td>
+                  <td>{{ f.reason }}</td>
+                </tr>
+              </tbody>
+            </n-table>
+          </div>
         </template>
       </n-space>
-    </n-card>
+    </GridCard>
   </div>
 </template>
 
@@ -154,6 +201,7 @@ import { getApiClient } from '@/composables/useApi';
 import { useAppStore } from '@/stores/app';
 import { useIsMobile } from '@/composables/useIsMobile';
 import { readByteLimit, uploadSizeError } from '@/composables/uploadLimit';
+import GridCard from '@/components/GridCard.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
 
 /**
@@ -194,6 +242,29 @@ const minPassphrase = ref(12);
  * 不预检的话用户选一个 100MB 的文件会先吃 100MB 内存、再被服务端 413 拒掉。
  */
 const maxUploadBytes = ref(0);
+/**
+ * 远端自动备份（2026-10-24）：定时任务动作 `remote_backup` 的配置入口。
+ *
+ * 以前只有动作、没有入口，任务必然报"未配置远端存储源"。这里只读写
+ * `/api/backup/remote-config`，口令永不回显（接口只回 `passphrase_set`）。
+ */
+interface RemoteStorageSource {
+  id: string;
+  label: string;
+  enabled?: boolean;
+}
+const remoteSources = ref<RemoteStorageSource[]>([]);
+const remoteSourceId = ref('');
+const remotePassphrase = ref('');
+const remotePassphraseSet = ref(false);
+const remoteClearPassphrase = ref(false);
+const remoteSaving = ref(false);
+const remoteSourceOptions = computed(() =>
+  remoteSources.value.map((s) => ({
+    label: s.enabled === false ? `${s.label}（已停用）` : s.label,
+    value: s.id,
+  }))
+);
 const origin = ref<'lan' | 'tunnel'>('lan');
 /** 隧道来源且当前是 http：内容与口令在链路上是明文的 */
 const insecureRemote = computed(() => origin.value === 'tunnel' && window.location.protocol === 'http:');
@@ -228,7 +299,53 @@ onMounted(async () => {
   } catch {
     /* 拿不到就按默认提示，不阻塞面板 */
   }
+  void loadRemoteConfig();
 });
+
+async function loadRemoteConfig() {
+  try {
+    const { data } = await api.get('/api/backup/remote-config');
+    remoteSourceId.value = data?.source_id ?? '';
+    remotePassphraseSet.value = data?.passphrase_set === true;
+  } catch {
+    /* 旧 core 没有这个端点：保持空态；保存时会明确失败，不假装成功 */
+  }
+  try {
+    const { data } = await api.get('/api/storage/sources');
+    remoteSources.value = Array.isArray(data?.sources) ? data.sources : [];
+  } catch {
+    /* 存储源列表拿不到时仍可保存已有 id；只是下拉为空 */
+  }
+}
+
+async function saveRemoteConfig() {
+  if (remotePassphrase.value && remotePassphrase.value.length < minPassphrase.value) {
+    message.warning(`备份口令至少需要 ${minPassphrase.value} 个字符`);
+    return;
+  }
+  if (remoteSourceId.value && !remotePassphraseSet.value && !remotePassphrase.value) {
+    message.warning('配置远端存储源前请先设置备份口令');
+    return;
+  }
+  remoteSaving.value = true;
+  try {
+    const body: Record<string, unknown> = { source_id: remoteSourceId.value || '' };
+    if (remoteClearPassphrase.value) {
+      body.clear_passphrase = true;
+    } else if (remotePassphrase.value) {
+      body.passphrase = remotePassphrase.value;
+    }
+    const { data } = await api.put('/api/backup/remote-config', body);
+    remotePassphraseSet.value = data?.passphrase_set === true;
+    remotePassphrase.value = '';
+    remoteClearPassphrase.value = false;
+    message.success(remoteSourceId.value ? '远端备份设置已保存' : '已关闭远端备份');
+  } catch (e: any) {
+    message.error(e?.response?.data?.error || '保存远端备份设置失败');
+  } finally {
+    remoteSaving.value = false;
+  }
+}
 
 function formatTime(ms: number): string {
   if (!ms) return '未知';
@@ -441,6 +558,33 @@ function applyWebSection(raw: unknown) {
 </script>
 
 <style scoped>
+/* .settings-panel / .full-width 栅格与断点、.sub-panel 描边内距均已统一到 src/styles/main.css */
+
+/* 口令说明（原为 n-text depth="3" style="font-size:12px"）：次要色 + 字号令牌 */
+.field-hint {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+/* 已选文件名（原为 n-text depth="2" style="font-size:13px"）：长文件名要能折行，
+   否则 360px 下会把「选择备份文件」按钮顶出卡片 */
+.file-name {
+  font-size: var(--font-base);
+  color: var(--text-secondary);
+  min-width: 0;
+  word-break: break-all;
+}
+/* 「条目」列（原为内联 style="width:96px"）：6 档间距令牌里没有 96，
+   用 --space-6(24px) × 4 表达同一个宽度，改阶梯时跟着走 */
+.col-count {
+  width: calc(var(--space-6) * 4);
+}
+/* 表格横向滚动容器：窄屏让表格在卡片内自己滚，而不是把卡片顶出视口 */
+.table-scroll {
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+
 /* 失败明细表的「未成功的项」是 `notify/webhook/config` 这类不可断的拉丁路径，
    n-table 按内容撑宽 ⇒ 300px 的卡内产生横向溢出。强制断词。 */
 .fail-table :deep(td) {

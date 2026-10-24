@@ -107,15 +107,26 @@ class BackupAssembler(
      * 把一组段写回系统。
      *
      * @param replace true = 每一段先回到"空/默认"再写入；false = 只覆盖包里出现的内容
+     * @param dryRun 2026-10-19：只算报告、**不写任何东西**（给"导入前预览"用）。
+     *   注意：预览里 `applied` 的语义是"将会被应用"，不是"已经应用"。
      */
-    suspend fun apply(entries: Map<String, ByteArray>, replace: Boolean): ApplyReport {
+    suspend fun apply(
+        entries: Map<String, ByteArray>,
+        replace: Boolean,
+        dryRun: Boolean = false
+    ): ApplyReport {
         val applied = mutableListOf<String>()
         val failed = LinkedHashMap<String, String>()
         var needsRestart = false
 
         entries[PATH_SETTINGS]?.let { bytes ->
             runCatching {
-                val report = settings.importBackupFields(decodeTypedMap(bytes), replace)
+                val values = decodeTypedMap(bytes)
+                val report = if (dryRun) {
+                    settings.previewBackupFields(values, replace)
+                } else {
+                    settings.importBackupFields(values, replace)
+                }
                 needsRestart = needsRestart || report.needsRestart
                 applied += "$PATH_SETTINGS(${report.applied.size} 项)"
                 report.rejected.forEach { (k, why) -> failed["$PATH_SETTINGS:$k"] = why }
@@ -127,17 +138,19 @@ class BackupAssembler(
             val bytes = entries[path] ?: return@forEach
             runCatching {
                 val values = decodeTypedMap(bytes)
-                val prefs = context.getSharedPreferences(spec.name, Context.MODE_PRIVATE)
-                val editor = prefs.edit()
-                if (replace) {
-                    // 只清"非排除项"：配额与统计属于运行态，既不进包也不该被清零，
-                    // 否则恢复一次备份就等于把今天的短信配额重置了。
-                    prefs.all.keys
-                        .filter { key -> spec.excludedKeys.none { it == key } }
-                        .forEach { editor.remove(it) }
+                if (!dryRun) {
+                    val prefs = context.getSharedPreferences(spec.name, Context.MODE_PRIVATE)
+                    val editor = prefs.edit()
+                    if (replace) {
+                        // 只清"非排除项"：配额与统计属于运行态，既不进包也不该被清零，
+                        // 否则恢复一次备份就等于把今天的短信配额重置了。
+                        prefs.all.keys
+                            .filter { key -> spec.excludedKeys.none { it == key } }
+                            .forEach { editor.remove(it) }
+                    }
+                    values.forEach { (key, value) -> putTyped(editor, key, value) }
+                    editor.apply()
                 }
-                values.forEach { (key, value) -> putTyped(editor, key, value) }
-                editor.apply()
                 applied += "$path(${values.size} 项)"
             }.onFailure { failed[path] = it.message ?: "解析失败" }
         }
@@ -145,21 +158,25 @@ class BackupAssembler(
         entries[PATH_SMS_RULES]?.let { bytes ->
             runCatching {
                 val rules = decodeRules(bytes)
-                val dao = database.smsRuleDao()
-                if (replace) dao.deleteAll()
-                rules.forEach { dao.insert(it) }
+                if (!dryRun) {
+                    val dao = database.smsRuleDao()
+                    if (replace) dao.deleteAll()
+                    rules.forEach { dao.insert(it) }
+                }
                 applied += "$PATH_SMS_RULES(${rules.size} 条)"
             }.onFailure { failed[PATH_SMS_RULES] = it.message ?: "解析失败" }
         }
 
-        applyTunnelFiles(entries, applied, failed)
+        // 隧道文件预览时不落盘：`applied` 里只报"将写入的路径"
+        applyTunnelFiles(entries, applied, failed, dryRun)
         return ApplyReport(applied, failed, needsRestart)
     }
 
     private fun applyTunnelFiles(
         entries: Map<String, ByteArray>,
         applied: MutableList<String>,
-        failed: MutableMap<String, String>
+        failed: MutableMap<String, String>,
+        dryRun: Boolean = false
     ) {
         entries.keys.filter { it.startsWith(TUNNEL_DIR) }.forEach { path ->
             val name = path.substringAfterLast('/')
@@ -178,8 +195,10 @@ class BackupAssembler(
                 return@forEach
             }
             runCatching {
-                dir.mkdirs()
-                File(dir, name).writeBytes(entries.getValue(path))
+                if (!dryRun) {
+                    dir.mkdirs()
+                    File(dir, name).writeBytes(entries.getValue(path))
+                }
                 applied += path
             }.onFailure { failed[path] = it.message ?: "写入失败" }
         }
@@ -370,7 +389,16 @@ class BackupAssembler(
             PrefsSpec(
                 "notify_local_sms", "本机短信通知渠道",
                 excludedKeys = listOf("quota_day", "quota_count")
-            )
+            ),
+            // ── 2026-10-15 补漏：三个"新 store 忘了进备份"的典型 ──
+            //
+            // 这三份数据都是**用户配置**（歌单、媒体库移除名单、配对黑名单），
+            // 换设备后应当跟过去。之前它们各自新建了 prefs 文件却没登记到这里 ——
+            // 表现是"换设备后歌单/移除名单/拉黑关系全没了"，而且不会报任何错。
+            // 现在由 `BackupPrefsCoverageTest` 守着：新增 prefs 文件必须显式表态。
+            PrefsSpec("audio_playlists", "音乐歌单"),
+            PrefsSpec("media_exclusions", "媒体库移除名单"),
+            PrefsSpec("paired_blacklist", "配对设备黑名单")
         )
     }
 }
