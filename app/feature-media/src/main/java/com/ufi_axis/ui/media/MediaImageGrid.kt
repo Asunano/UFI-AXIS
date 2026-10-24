@@ -1,6 +1,8 @@
 package com.ufi_axis.ui.media
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,8 +15,14 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.MediaLibraryItem
 import com.ufi_axis.ui.components.common.UfiListLoadedCounter
@@ -50,7 +58,11 @@ internal fun MediaImageGrid(
     onNearEnd: () -> Unit,
     onClick: (MediaLibraryItem) -> Unit,
     gridState: LazyGridState,
-    groupByDate: Boolean = false
+    groupByDate: Boolean = false,
+    /** 列数（2..5）。默认取三列常量；图片设置页里可调（见 `AppPreferences.mediaImageColumns`）。 */
+    columns: Int = MEDIA_IMAGE_GRID_COLUMNS,
+    /** 长按一格（2026-10-21）：上报"哪一张 + 它所在的格子矩形 + 落点"，菜单与编辑器由页壳托管。 */
+    onLongPress: ((MediaLibraryItem, IntRect, IntOffset) -> Unit)? = null
 ) {
     MediaNearEndEffect(gridState, items.size, onNearEnd)
 
@@ -62,7 +74,7 @@ internal fun MediaImageGrid(
 
     LazyVerticalGrid(
         state = gridState,
-        columns = GridCells.Fixed(MEDIA_IMAGE_GRID_COLUMNS),
+        columns = GridCells.Fixed(columns),
         modifier = Modifier.fillMaxSize(),
         horizontalArrangement = Arrangement.spacedBy(Spacing.Small),
         verticalArrangement = Arrangement.spacedBy(Spacing.Small),
@@ -70,7 +82,13 @@ internal fun MediaImageGrid(
     ) {
         if (sections.isEmpty()) {
             items(items, key = { it.id }) { item ->
-                ImageCell(thumbUrl = thumbUrl(item), onClick = { onClick(item) })
+                ImageCell(
+                    thumbUrl = thumbUrl(item),
+                    onClick = { onClick(item) },
+                    onLongPress = onLongPress?.let { report ->
+                        { bounds, point -> report(item, bounds, point) }
+                    }
+                )
             }
         } else {
             sections.forEach { section ->
@@ -82,23 +100,54 @@ internal fun MediaImageGrid(
                     MediaDateSectionHeader(section.label)
                 }
                 items(section.items, key = { it.id }) { item ->
-                    ImageCell(thumbUrl = thumbUrl(item), onClick = { onClick(item) })
+                    ImageCell(
+                        thumbUrl = thumbUrl(item),
+                        onClick = { onClick(item) },
+                        onLongPress = onLongPress?.let { report ->
+                            { bounds, point -> report(item, bounds, point) }
+                        }
+                    )
                 }
             }
         }
 
         if (items.size < total) {
-            item(span = { GridItemSpan(MEDIA_IMAGE_GRID_COLUMNS) }) {
+            item(span = { GridItemSpan(columns) }) {
                 UfiListLoadedCounter(loaded = items.size, total = total)
             }
         }
     }
 }
 
-/** 一格：只有缩略图（文件名在查看器里才有意义，网格里挤不下也没人读）。 */
+/**
+ * 一格：只有缩略图（文件名在查看器里才有意义，网格里挤不下也没人读）。
+ *
+ * 长按上报的是**这一格的窗口矩形 + 几何中心**：`combinedClickable` 不暴露长按落点，
+ * 用格子中心顶替 —— 与视频海报墙、文件管理器行卡是同一个妥协（见 `MediaVideoMenuTarget`）。
+ */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ImageCell(thumbUrl: String, onClick: () -> Unit) {
-    Box(modifier = Modifier.clickable(onClick = onClick)) {
+private fun ImageCell(
+    thumbUrl: String,
+    onClick: () -> Unit,
+    onLongPress: ((IntRect, IntOffset) -> Unit)?
+) {
+    // 只有需要长按时才采集窗口矩形：每格都挂 onGloballyPositioned 会在滚动时白付布局回调
+    var bounds by remember { mutableStateOf(IntRect.Zero) }
+    val base = if (onLongPress != null) {
+        Modifier.onGloballyPositioned { bounds = mediaVideoAnchorRect(it) }
+    } else {
+        Modifier
+    }
+    val input = if (onLongPress != null) {
+        Modifier.combinedClickable(
+            onClick = onClick,
+            onLongClick = { onLongPress(bounds, mediaVideoAnchorCenter(bounds)) }
+        )
+    } else {
+        Modifier.clickable(onClick = onClick)
+    }
+    Box(modifier = base.then(input)) {
         MediaThumb(
             url = thumbUrl,
             fallback = Icons.Default.Image,

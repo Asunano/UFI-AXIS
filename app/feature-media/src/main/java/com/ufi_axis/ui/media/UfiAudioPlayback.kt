@@ -27,6 +27,11 @@ import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.MediaController
+import androidx.media3.session.MediaNotification
+import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.CommandButton
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
 import androidx.media3.session.MediaSession
 import androidx.media3.session.MediaSessionService
 import androidx.media3.session.SessionToken
@@ -146,7 +151,11 @@ class UfiAudioPlaybackService : MediaSessionService() {
         })
 
         session = MediaSession.Builder(this, player)
-
+            /*
+             * 外接设备（蓝牙耳机 / 音响 / 车机 / 手表 / 线控耳机）的播放控制、
+             * 以及"进程被杀后按耳机键起播"，都由这个 callback 收口 —— 见下面那个内部类。
+             */
+            .setCallback(UfiAudioSessionCallback())
             .setBitmapLoader(
                 CacheBitmapLoader(
                     DataSourceBitmapLoader(
@@ -156,6 +165,16 @@ class UfiAudioPlaybackService : MediaSessionService() {
                 )
             )
             .build()
+
+        /*
+         * 通知第二行显示"当前这一句歌词"（2026-10-21）。
+         *
+         * 包一层 media3 的默认通知实现：只有 `createNotification` 里能拿到"已经建好的那条通知"，
+         * 在它上面补 contentText / subText 是唯一不重造通知、也不影响 media3 内部状态的做法。
+         */
+        setMediaNotificationProvider(
+            LyricNotificationProvider(DefaultMediaNotificationProvider.Builder(this).build())
+        )
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
@@ -171,6 +190,102 @@ class UfiAudioPlaybackService : MediaSessionService() {
         if (player == null || !player.playWhenReady || player.mediaItemCount == 0) {
             stopSelf()
         }
+    }
+
+    /**
+     * 会话回调：**媒体键开关** + **冷启动恢复**。
+     *
+     * ## onMediaButtonEvent
+     * 蓝牙 AVRCP、线控耳机、锁屏、手表、车机都走这一条通道，所以"允许外接设备控制播放"的开关
+     * 只需要在这儿判一次：关掉时 `return true`（事件已被消费、播放器不动）。
+     * 刻意**不停用 session** —— 停用会把通知栏与锁屏控制也一起弄没，那不是用户要的。
+     *
+     * ## onPlaybackResumption
+     * 进程被杀之后用户按耳机上的播放键：系统会拉起服务并问"上次在听什么"。
+     * 这一步以前没有，所以按下没反应（服务起来了但队列是空的）。
+     * 恢复后**显式起播**：这条路径只会由"用户按了播放"触发，与冷启动自动播放是两件事
+     * （后者在 [UfiAudioQueueStore.restoreInto] 里刻意 `playWhenReady = false`，那条不变）。
+     */
+    private inner class UfiAudioSessionCallback : MediaSession.Callback {
+
+        override fun onMediaButtonEvent(
+            session: MediaSession,
+            controllerInfo: MediaSession.ControllerInfo,
+            intent: Intent
+        ): Boolean {
+            if (!AppPreferences(applicationContext).audioExternalControl) {
+                // true = 已处理。事件被吃掉，既不会播放也不会穿透到别的应用
+                return true
+            }
+            return super.onMediaButtonEvent(session, controllerInfo, intent)
+        }
+
+        override fun onPlaybackResumption(
+            mediaSession: MediaSession,
+            controllerInfo: MediaSession.ControllerInfo
+        ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> {
+            val player = mediaSession.player
+            if (player.mediaItemCount == 0) {
+                UfiAudioQueueStore.restoreInto(applicationContext, player)
+            }
+            val items = (0 until player.mediaItemCount).map { player.getMediaItemAt(it) }
+            if (items.isEmpty()) {
+                return Futures.immediateFuture(
+                    MediaSession.MediaItemsWithStartPosition(emptyList(), 0, 0L)
+                )
+            }
+            player.playWhenReady = true
+            return Futures.immediateFuture(
+                MediaSession.MediaItemsWithStartPosition(
+                    items,
+                    player.currentMediaItemIndex.coerceAtLeast(0),
+                    player.currentPosition.coerceAtLeast(0L)
+                )
+            )
+        }
+    }
+
+    /**
+     * 通知装饰：把 [UfiAudioLyricBadge] 记住的那条通知登记下来，并在开关打开时补上当前歌词。
+     *
+     * 除 `createNotification` 之外全部原样转交给 media3 的默认实现 —— 通知渠道、按钮、
+     * 大图与媒体样式都保持原样，我们只改两行文字。
+     */
+    @OptIn(UnstableApi::class)
+    private inner class LyricNotificationProvider(
+        private val delegate: MediaNotification.Provider
+    ) : MediaNotification.Provider {
+
+        override fun createNotification(
+            mediaSession: MediaSession,
+            mediaButtonPreferences: com.google.common.collect.ImmutableList<CommandButton>,
+            actionFactory: MediaNotification.ActionFactory,
+            onNotificationChangedCallback: MediaNotification.Provider.Callback
+        ): MediaNotification {
+            val result = delegate.createNotification(
+                mediaSession, mediaButtonPreferences, actionFactory, onNotificationChangedCallback
+            )
+            // 登记：后续歌词换句时就地改写这一条（见 UfiAudioLyricBadge.push）
+            UfiAudioLyricBadge.rememberNotification(result.notificationId, result.notification)
+            val prefs = AppPreferences(applicationContext)
+            if (!prefs.audioBtLyrics) return result
+            val showLyric = UfiNowPlayingState.subtitleIsLyric.value
+            val line = UfiNowPlayingState.subtitle.value
+            return UfiAudioLyricBadge.decorate(
+                applicationContext,
+                result,
+                line.takeIf { showLyric }
+            ) ?: result
+        }
+
+        override fun handleCustomCommand(
+            mediaSession: MediaSession,
+            customCommand: String,
+            args: android.os.Bundle
+        ): Boolean = delegate.handleCustomCommand(mediaSession, customCommand, args)
+
+        override fun getNotificationChannelInfo(): MediaNotification.Provider.NotificationChannelInfo =
+            requireNotNull(delegate.notificationChannelInfo)
     }
 
     override fun onDestroy() {
@@ -321,6 +436,44 @@ fun Player.ufiSkipToPrevious() {
 }
 
 /**
+ * 「下一首」的**循环版**（2026-10-14）：列表到头就绕回第一首，**不看当前的循环模式**。
+ *
+ * ## 为什么单开一条而不是改 [ufiSkipToNext]
+ * 播放页那两颗键的语义是"在队列里挪一格"：不循环模式下到头就该按不动
+ *（`ufiCanSkipToNext` 与它配对）。而音乐页迷你条上的**左右滑动**是另一回事 ——
+ * 用户要的是"一直有下一首"，列表放完再滑就绕回开头，明确说过不要被播放页的模式限制。
+ *
+ * ## 随机播放怎么办
+ * 仍然交给时间线：`getNextWindowIndex(…, REPEAT_MODE_ALL, shuffle = true)` 走的是打乱后的
+ * 顺序，绕回也在那个顺序里 —— 不自己算下标（自己算会在随机模式下跳到另一首）。
+ * 随机的语义本身用户说"另外讨论"，这里只保证"一定有下一首"。
+ */
+fun Player.ufiSkipToNextLooped() {
+    // 2026-10-20（用户反馈"随机播放开了还是按列表播"）：随机模式必须交给 media3 算下一项，
+    // 自己算 index+1 等于把 shuffle 架空。repeatMode = ALL 时 seekToNext 会自动绕回开头。
+    if (shuffleModeEnabled) {
+        seekToNextMediaItem()
+        play()
+        return
+    }
+    val target = ufiAdjacentIndex(next = true, forceLoop = true)
+    if (target == null) seekToNextMediaItem() else seekTo(target, 0L)
+    play()
+}
+
+/** 见 [ufiSkipToNextLooped]。 */
+fun Player.ufiSkipToPreviousLooped() {
+    if (shuffleModeEnabled) {
+        seekToPreviousMediaItem()
+        play()
+        return
+    }
+    val target = ufiAdjacentIndex(next = false, forceLoop = true)
+    if (target == null) seekToPreviousMediaItem() else seekTo(target, 0L)
+    play()
+}
+
+/**
  * 「上一首 / 下一首」该跳到哪一项。时间线为空或算不出来时回 null。
  *
  * ## 为什么不直接用 `seekToNextMediaItem()`（2026-09-23 修「下一首与循环模式互相冲突」）
@@ -333,10 +486,15 @@ fun Player.ufiSkipToPrevious() {
  *
  * 随机播放仍然交给时间线：打乱顺序由 media3 维护，自己算会跳到另一首。
  */
-private fun Player.ufiAdjacentIndex(next: Boolean): Int? {
+private fun Player.ufiAdjacentIndex(next: Boolean, forceLoop: Boolean = false): Int? {
     val timeline = currentTimeline
     if (timeline.isEmpty || mediaItemCount == 0) return null
-    val repeat = if (repeatMode == Player.REPEAT_MODE_ONE) Player.REPEAT_MODE_ALL else repeatMode
+    val repeat = when {
+        // 跟手滑动那条路：永远按"列表循环"算，到头绕回第一首（见 ufiSkipToNextLooped）
+        forceLoop -> Player.REPEAT_MODE_ALL
+        repeatMode == Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_ALL
+        else -> repeatMode
+    }
     val index = if (next) {
         timeline.getNextWindowIndex(currentMediaItemIndex, repeat, shuffleModeEnabled)
     } else {

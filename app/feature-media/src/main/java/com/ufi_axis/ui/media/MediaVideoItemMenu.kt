@@ -105,7 +105,8 @@ internal fun mediaVideoItemMenuOptions(
     add(UfiPopupOption("rename", "重命名", icon = Icons.Default.DriveFileRenameOutline, onClick = onRename))
     add(UfiPopupOption("copy-path", "复制路径", icon = Icons.Default.ContentCopy, onClick = onCopyPath))
     add(UfiPopupOption("info", "文件信息", icon = Icons.Default.Info, onClick = onInfo))
-    // 2026-10-07：手动重抽封面（清设备缓存后重新走 系统→MMR→ffmpeg 三级）
+    // 2026-10-07：手动重抽封面（清设备缓存后让 core 重新出图）
+    // 2026-10-13：core 侧只剩 ffmpeg 一条来源（系统缩略图 / MMR 抽帧已退役）
     if (onRefetchThumb != null) {
         add(UfiPopupOption("refetch-thumb", "重新获取封面", icon = Icons.Default.Refresh, onClick = onRefetchThumb))
     }
@@ -204,15 +205,9 @@ internal fun MediaVideoInfoDialog(
                 // 2026-10-07：封面来源（core 的 X-Thumb-Source 头，Coil 拦截器记录）。
                 // 没记录（条目没在屏上渲染过封面）整行不显示 —— 与本弹窗"拿不到就不显示"口径一致。
                 thumbSource("video", item.id)?.let { src ->
-                    val label = when {
-                        src.startsWith("fail:") -> "获取失败：${src.removePrefix("fail:")}"
-                        src == "cache" -> "缓存"
-                        src == "system" -> "系统生成"
-                        src == "mmr" -> "本机解码（MMR）"
-                        src == "ffmpeg" -> "ffmpeg 软解"
-                        else -> src
-                    }
-                    UfiDialogInfoRow("封面来源", label)
+                    // 标签映射抽到 MediaListCommon.thumbSourceLabel —— 原来这里与
+                    // MediaVideoScreen 的 toast 各写了一份，改 core 的取值集合时必然漏一处
+                    UfiDialogInfoRow("封面来源", thumbSourceLabel(src))
                 }
                 // probeDone 之前不落任何提示，避免"加载中"闪一下就变成"解析失败"
                 if (probeDone && probed == null) {

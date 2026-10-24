@@ -9,10 +9,14 @@ import androidx.compose.material3.IconButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavHostController
+import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.data.model.MEDIA_TYPE_IMAGE
 import com.ufi_axis.ui.components.common.UfiScrollableTabRow
 import com.ufi_axis.ui.navigation.Routes
@@ -57,9 +61,28 @@ fun MediaImageScreen(
     navController: NavHostController
 ) {
     val palette = LocalResolvedPalette.current
+    val context = LocalContext.current
     val media = viewModel.media
 
     var pane by rememberSaveable { mutableIntStateOf(PANE_TIMELINE) }
+
+    /*
+     * 时间轴的两项显示偏好（2026-10-21，图片设置页里可调）。
+     *
+     * 直接读 prefs 而不是 remember 起来：从设置页返回时这一页会重组一次，读到新值即可；
+     * SharedPreferences 本来就有内存缓存，读一次的代价可以忽略。
+     */
+    val appPrefs = remember { AppPreferences(context) }
+    val imageColumns = appPrefs.mediaImageColumns()
+
+    /*
+     * 长按菜单 / 编辑器的触发目标（2026-10-21）。
+     *
+     * 状态建在页壳这一层：格子会随滚动回收，状态建在格子里会在菜单还开着时被销毁 ——
+     * 视频页那一轮踩过同一个坑。菜单、重命名、删除确认与编辑器全部由
+     * [MediaImageActionHost] 一处实现，两栏只负责上报"哪一张被长按了"。
+     */
+    var menuTarget by remember { mutableStateOf<MediaImageMenuTarget?>(null) }
 
     // 两栏各一份滚动位置：都是网格，但内容与层级不同，共用一份会让"在时间轴滚到一半再切
     // 文件夹"时文件夹停在同一个偏移上
@@ -111,17 +134,33 @@ fun MediaImageScreen(
                 onNearEnd = { media.loadMore(MEDIA_TYPE_IMAGE) },
                 onClick = { onOpen(it.path) },
                 gridState = timelineGridState,
-                // 只有按时间排序时段头才有意义（理由见本文件 KDoc）
-                groupByDate = tab.sort == MEDIA_SORT_DATE
+                // 只有按时间排序时段头才有意义（理由见本文件 KDoc）：分段是这套排序的固有行为，
+                // 不做成开关 —— 按名称/大小排序时相邻两项日期是乱的，插段头只会长出一堆单一项的段
+                groupByDate = tab.sort == MEDIA_SORT_DATE,
+                columns = imageColumns,
+                onLongPress = { item, bounds, point ->
+                    menuTarget = MediaImageMenuTarget(item, bounds, point)
+                }
             )
         } else {
             MediaImageFolderPane(
                 viewModel = viewModel,
                 onOpen = { onOpen(it.path) },
-                gridState = folderGridState
+                gridState = folderGridState,
+                onLongPress = { item, bounds, point ->
+                    menuTarget = MediaImageMenuTarget(item, bounds, point)
+                }
             )
         }
     }
+
+    // 菜单 / 重命名 / 删除 / 编辑器：一套实现（见 MediaImageItemMenu.kt）
+    MediaImageActionHost(
+        viewModel = viewModel,
+        target = menuTarget,
+        onTargetChange = { menuTarget = it },
+        onOpen = { onOpen(it.path) }
+    )
 }
 
 /** "时间轴"那一栏的下标；另一栏是文件夹。 */

@@ -136,7 +136,9 @@ fun MediaPlaylistScreen(
                     Icon(Icons.Default.Shuffle, contentDescription = "随机播放")
                 }
             }
-        }
+        },
+        // 上滑跟手升起的播放面板（见 MediaAudioRisePanel.kt）：挂在页壳的整屏浮层槽上
+        overlay = { MediaAudioRisePanel(viewModel, navController) }
     ) { padding ->
         Column(
             modifier = Modifier

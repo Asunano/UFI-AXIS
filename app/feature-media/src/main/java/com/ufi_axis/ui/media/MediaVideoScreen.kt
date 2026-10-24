@@ -136,13 +136,14 @@ fun MediaVideoScreen(
     val libraryListState = rememberLazyListState()
 
 
-    // 2026-10-07：本机抽帧兜底已整体删除（core 侧 ffmpeg 2.5 级稳定，不再需要手机代劳）。
-    // 封面全部由设备端产出（系统缩略图 → MMR → ffmpeg），拿不到就显示占位图标。
+    // 2026-10-07：本机抽帧兜底已整体删除（core 侧 ffmpeg 稳定，不再需要手机代劳）。
+    // 2026-10-13：core 侧的系统解码两级（系统缩略图 / MMR 抽帧）也已退役，封面全部由
+    // 设备端自有解码产出（视频 ffmpeg / 图片降采样 / 音频内嵌封面），拿不到就显示占位图标。
     var toast by remember { mutableStateOf<ToastMessage?>(null) }
 
     val onOpen: (MediaLibraryItem) -> Unit = { item ->
         runCatching {
-            AppPreferences(context).addMediaRecentPlay(item.path, item.name, item.id)
+            AppPreferences(context).addMediaRecentPlay(MEDIA_TYPE_VIDEO, item.path, item.name, item.id)
         }
         navController.navigate(mediaRouteOf("media/video", item.path))
     }
@@ -320,13 +321,8 @@ fun MediaVideoScreen(
                 // 2) 带鉴权重拉一次并直接记录来源（2026-10-07 修复：原来用裸 java.net.URL
                 //    既没有鉴权头（必然 401）也不经过 Coil 拦截器，所以"点了没反应"）。
                 val (ok, detail) = media.refetchThumbnailWithSource("video", target.id)
-                val label = when {
-                    detail == "cache" -> "缓存"
-                    detail == "system" -> "系统生成"
-                    detail == "mmr" -> "本机解码（MMR）"
-                    detail == "ffmpeg" -> "ffmpeg 软解"
-                    else -> detail
-                }
+                // 与详情弹窗共用同一份映射（MediaListCommon.thumbSourceLabel）
+                val label = thumbSourceLabel(detail)
                 toast = if (ok) {
                     ToastMessage("已重新获取封面", ToastType.SUCCESS, subtitle = "来源：$label")
                 } else {

@@ -163,9 +163,32 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             UfiNowPlayingSlot.active.value = false
             return@DisposableEffect onDispose { }
         }
+        // 音乐「最近播放」的落点：只认**换歌**，sync 会被播放/暂停/缓冲反复触发
+        var lastRecentPath = ""
+
         fun sync() {
             mediaId = c.currentMediaItem?.mediaId.orEmpty()
             meta = c.mediaMetadata
+            /*
+             * 记一条「最近播放」（2026-10-21）。
+             *
+             * 为什么记在探针里而不是某个页面：播放入口有四五条（列表点歌、迷你条、通知栏、
+             * 面板里切下一首），页面各自记必然漏。探针常驻 Activity 顶层、且订阅了
+             * `onMediaItemTransition`，是**唯一**能覆盖全部入口的位置。
+             *
+             * 标题优先用播放器解出来的标签（`meta.title`），没有就退回文件名 —— 此时元数据
+             * 可能还没解析完，退回文件名的结果比空标题好，下一首记的时候自然会补上。
+             */
+            if (mediaId.isNotBlank() && mediaId != lastRecentPath) {
+                lastRecentPath = mediaId
+                prefs.addMediaRecentPlay(
+                    type = MEDIA_TYPE_AUDIO,
+                    path = mediaId,
+                    name = c.mediaMetadata?.title?.toString()?.takeIf { it.isNotBlank() }
+                        ?: audioFileBase(mediaId.substringAfterLast('/')),
+                    id = 0L
+                )
+            }
             // 播放/暂停图标读**播放意图**而不是 isPlaying：切歌那一下 playbackState 会掉进
             // BUFFERING，isPlaying 随之短暂为 false，图标会抽一下（见 Player.ufiPlayIntent）。
             UfiNowPlayingState.isPlaying.value = c.ufiPlayIntent()
@@ -183,6 +206,8 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             playing = c.isPlaying
             ended = c.playbackState == Player.STATE_ENDED
             queueExhausted = !c.hasNextMediaItem() && c.repeatMode == Player.REPEAT_MODE_OFF
+            // 定时关闭那条"放完当前这首再停"：靠这里的换歌/播完回调收口（见 UfiSleepTimer）
+            UfiSleepTimer.onPlayerSynced(c)
         }
         sync()
         val listener = object : Player.Listener {
@@ -242,6 +267,14 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
         }
     }
 
+    /*
+     * 定时关闭的倒计时（2026-10-14）。
+     *
+     * 挂在**这一层**而不是播放页：用户完全可能"设 30 分钟然后退出播放页"，定时器不能跟着
+     * 页面一起消失。这一层在 App 壳里（`MainActivity` 直接调本探针），一直在组合中。
+     */
+    UfiSleepTimerEffect()
+
     // 曲名 / 歌手：播放器解出的标签优先，没有才从文件名猜（与播放页同一套口径）
     LaunchedEffect(meta, mediaId) {
         val guessed = splitFileNameTitleArtist(audioFileBase(mediaId.substringAfterLast('/')))
@@ -293,6 +326,13 @@ fun UfiAudioNowPlayingProbe(viewModel: MainViewModel) {
             ?.takeIf { it.isNotBlank() }
         UfiNowPlayingState.subtitle.value = line.orEmpty()
         UfiNowPlayingState.subtitleIsLyric.value = line != null
+        /*
+         * 蓝牙歌词（2026-10-21）：把这一句推到媒体通知的第二行。
+         *
+         * 为什么放在这里：这一处**已经算出了"当前唱到哪一句"**（每秒一次），再算一遍纯属浪费；
+         * 开关关闭 / 这一句为空时 `push` 内部直接返回，所以不打开这个开关时零开销。
+         */
+        UfiAudioLyricBadge.push(context = context, line = line, enabled = prefs.audioBtLyrics)
         /*
          * 这一句还会停留多久 = 下一句的时间戳 − 当前播放位置。
          * 最后一句没有"下一句"，退回整首的剩余时长。

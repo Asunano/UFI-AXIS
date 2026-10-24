@@ -81,12 +81,17 @@ internal fun MediaVideoHome(
 ) {
     val palette = LocalResolvedPalette.current
     val context = LocalContext.current
+    /*
+     * 海报墙列数（2026-10-21 可调，见「视频设置 → 显示与字幕」）：默认仍是 2 列。
+     * 直接读偏好而不是 remember：从设置页返回时这一栏会重组一次，读到的就是新值。
+     */
+    val posterColumns = AppPreferences(context).videoPosterColumns
     MediaNearEndEffect(gridState, tab.items.size, onNearEnd)
 
     // 最近播放：每次进这一栏读一次（它由播放页写入，不走 ViewModel 状态）
     var recent by remember { mutableStateOf(emptyList<Triple<String, String, Long>>()) }
     LaunchedEffect(Unit) {
-        recent = runCatching { AppPreferences(context).mediaRecentPlays() }.getOrDefault(emptyList())
+        recent = runCatching { AppPreferences(context).mediaRecentPlays(MEDIA_TYPE_VIDEO) }.getOrDefault(emptyList())
     }
 
     /*
@@ -97,7 +102,7 @@ internal fun MediaVideoHome(
     if (tab.isEmpty) {
         if (!tab.loadedOnce) {
             UfiGridLoadingState(
-                columns = POSTER_COLUMNS,
+                columns = posterColumns,
                 cellHeight = POSTER_SKELETON_CELL_HEIGHT
             )
         } else {
@@ -111,7 +116,7 @@ internal fun MediaVideoHome(
 
 
     LazyVerticalGrid(
-        columns = GridCells.Fixed(POSTER_COLUMNS),
+        columns = GridCells.Fixed(posterColumns),
         state = gridState,
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(

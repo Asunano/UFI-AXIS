@@ -113,6 +113,12 @@ internal fun MediaLibraryPage(
     actions: @Composable RowScope.() -> Unit = {},
     topContent: @Composable () -> Unit = {},
     bottomBar: @Composable () -> Unit = {},
+    /**
+     * 页面级浮层（2026-10-14）。音乐页用它挂「上滑跟手升起的播放面板」
+     *（见 MediaAudioRisePanel.kt）—— 面板要盖住整页（含标题栏），只能挂在页壳这一层。
+     * 默认 null：图片 / 视频那两页不传，行为与从前一致。
+     */
+    overlay: (@Composable () -> Unit)? = null,
     content: @Composable (MediaTabState) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -131,7 +137,8 @@ internal fun MediaLibraryPage(
         title = title,
         navController = navController,
         showBack = true,
-        actions = actions
+        actions = actions,
+        overlay = overlay
     ) { padding ->
         Column(
             modifier = Modifier

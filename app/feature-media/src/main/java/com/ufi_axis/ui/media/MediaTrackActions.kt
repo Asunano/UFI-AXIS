@@ -289,7 +289,7 @@ internal fun MediaTrackActionHost(
                     if (viewModel.files.state.value.isDownloading) {
                         blockedMessage = "已有下载任务在进行中，完成后再试"
                     } else {
-                        viewModel.files.downloadFileToPhone(item.path, item.name)
+                        viewModel.files.downloadFileToPhone(item.path, item.name, source = "audio")
                     }
                 }
 

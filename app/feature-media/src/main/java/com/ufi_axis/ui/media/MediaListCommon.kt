@@ -375,5 +375,38 @@ internal fun MediaDateSectionHeader(label: String) {
     )
 }
 
+/**
+ * `X-Thumb-Source` 的取值 → 给用户看的中文标签（2026-10-13）。
+ *
+ * ## 为什么抽成公共函数
+ * 这段映射原本在 `MediaVideoItemMenu`（详情弹窗）与 `MediaVideoScreen`（手动重抽的 toast）
+ * 里**各写了一遍**。core 侧 2026-10-13 把取值集合从 `cache/system/mmr/ffmpeg` 收敛成
+ * `cache/ffmpeg/image/tag/extractor`（系统解码整体退役），两份拷贝就必须同时改 ——
+ * 漏一处就会出现"同一个来源在两处显示成不同东西"，而且不会有任何编译错误。
+ *
+ * ## 取值含义（与 core 的 `MediaRoutes.ThumbnailAttempt` 一一对应）
+ *  · `cache`     —— 命中 core 的落盘缓存，没跑任何解码器
+ *  · `ffmpeg`    —— 视频：ffmpeg 软解抽帧
+ *  · `image`     —— 图片：core 按 `inSampleSize` 降采样解码
+ *  · `tag`       —— 音频：解析容器头部的内嵌封面字节（ID3 APIC / FLAC PICTURE）
+ *  · `extractor` —— 音频：系统提取器读封面原子（M4A 的 `covr`）
+ *  · `fail:原因` —— 上一次请求失败，冒号后面是 core 回的 reason
+ *
+ * 认不出的取值**原样透出**而不是显示"未知"：将来 core 新增来源时，
+ * 用户看到的至少是个可检索的字符串，而不是一句没有信息量的占位文案。
+ */
+internal fun thumbSourceLabel(src: String): String = when {
+    src.startsWith("fail:") -> "获取失败：${src.removePrefix("fail:")}"
+    src == "cache" -> "缓存"
+    src == "ffmpeg" -> "ffmpeg 软解"
+    src == "image" -> "设备端降采样"
+    src == "tag" -> "内嵌封面"
+    src == "extractor" -> "系统提取器"
+    // 2026-10-13 之前的旧取值：设备上跑着老 core 时仍会回这两个，保留映射免得显示成生字符串
+    src == "system" -> "系统生成（旧版）"
+    src == "mmr" -> "本机解码（旧版）"
+    else -> src
+}
+
 
 

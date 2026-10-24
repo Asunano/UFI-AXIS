@@ -191,23 +191,14 @@ internal fun MediaVideoLibraryPane(
                             subtitle = "${folder.count} 个视频",
                             onClick = { media.browse(MEDIA_TYPE_VIDEO, folder.path, force = true) },
                             leading = {
-                                // 文件夹封面就用子树里最新那一个视频的缩略图，没有就画文件夹图标
-                                val coverId = folder.cover_id
-                                if (coverId != null && coverId > 0) {
-                                    MediaThumb(
-                                        url = media.thumbnailUrl(MEDIA_TYPE_VIDEO, coverId),
-                                        fallback = Icons.Default.Folder,
-                                        width = MEDIA_VIDEO_THUMB_WIDTH,
-                                        height = MEDIA_VIDEO_THUMB_HEIGHT
-                                    )
-                                } else {
-                                    Icon(
-                                        Icons.Default.Folder,
-                                        contentDescription = null,
-                                        tint = palette.accent,
-                                        modifier = Modifier.size(24.dp)
-                                    )
-                                }
+                                // 2026-10-19：文件夹一律画文件夹图标（对齐文件管理器），
+                                // 不再拿子树里某个视频的封面当缩略图 —— 用户反馈"文件夹长得像视频"。
+                                Icon(
+                                    Icons.Default.Folder,
+                                    contentDescription = null,
+                                    tint = palette.accent,
+                                    modifier = Modifier.size(24.dp)
+                                )
                             }
                         )
                     }
