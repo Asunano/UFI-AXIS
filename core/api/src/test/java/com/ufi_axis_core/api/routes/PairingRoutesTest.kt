@@ -158,6 +158,9 @@ class PairingRoutesTest {
             assertFalse("info 绝不返回 secret", "secret" in obj)
             assertTrue("info 应含 device_id", "device_id" in obj)
             assertTrue("info 应含 pairing_code", "pairing_code" in obj)
+            // 2026-10-22：App 的「清除旧配对」自救入口按条数显示，info 必须回 paired_count。
+            assertTrue("info 应含 paired_count", "paired_count" in obj)
+            assertEquals("paired_count 初始应为 0", "0", obj["paired_count"]?.jsonPrimitive?.content)
         }
     }
 

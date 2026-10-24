@@ -13,6 +13,7 @@ import com.ufi_axis_core.api.pairing.PairingManager.ChangePwdResult
 import com.ufi_axis_core.api.pairing.PairingManager.PairingConfirmResult
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.util.DeviceAuth
 import com.ufi_axis_core.util.ShellExecutor
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
@@ -124,6 +125,14 @@ class PairingRoutes(
         isTunnelOrigin(call.request.local.localAddress, tunnelActive())
     },
     /**
+     * 被拉黑设备尝试配对 / 登录时的回调（2026-10-15），参数是 `(指纹, 来源 IP)`。
+     *
+     * 用**回调**而不是直接依赖 `AlertEngine`：本类在 `core:api`、告警引擎在 `core:alert`，
+     * 由装配层注入比让路由反向依赖引擎清楚（`tunnelActive` / `rootChecker` 都是同款 seam）。
+     * 传 null 时只记日志 —— 测试与未装配场景不受影响。
+     */
+    private val onBlockedDevice: (suspend (String, String) -> Unit)? = null,
+    /**
      * 可测试性 seam：解析设备名（Settings.Global.DEVICE_NAME → deviceId 回退）。
      * 默认委托 [PairingManager.resolveDeviceName]（读 Settings.Global）；测试注入固定值。
      */
@@ -195,7 +204,19 @@ class PairingRoutes(
          * **仅**用于合并「同一台设备换了密钥后」产生的重复记录，防止设备列表无限增长，
          * 不参与任何安全判定（它是可伪造的明文）。
          */
-        val device_hwid: String? = null
+        val device_hwid: String? = null,
+        /**
+         * 批准流程的会话随机数（2026-10-15，Web 端生成）。
+         *
+         * 只用于把这次 confirm 与一次待批准请求对上；**不是凭据** —— 它由请求方自己生成，
+         * 服务端不采信它的"身份"含义，只用来查"这个对话被批准了吗"。
+         */
+        val sid: String? = null,
+        /**
+         * 机主从外部通知里读到的 6 位配对码（2026-10-15）。
+         * 回传正确即视为"机主看到了这次请求"，等价于在 App 上点了允许。
+         */
+        val approval_code: String? = null
     )
 
     @Serializable
@@ -343,6 +364,11 @@ class PairingRoutes(
             return
         }
         throttlePassword()
+        // 双键退避（2026-10-15）：指纹 / hwId 各自计数、取最严。与上面按 IP 的密码节流**并存** ——
+        // 那条的前提是"换源地址有成本"，而局域网内换 IP / 走隧道成本极低；这两条键跟着设备走，
+        // 换 IP 甩不掉。正常用户在这里恒为 0（没有任何失败记录）。
+        val attemptDelay = pairingManager.attemptDelayMsFor(body?.device_pubkey, body?.device_hwid)
+        if (attemptDelay > 0) delay(attemptDelay)
         val result = pairingManager.confirm(
             code = code,
             pubKeySpki = pubKey,
@@ -354,7 +380,9 @@ class PairingRoutes(
             goformIp = body?.goform_ip,
             goformPort = body?.goform_port,
             goformPassword = body?.goform_password,
-            hwId = body?.device_hwid
+            hwId = body?.device_hwid,
+            sid = body?.sid,
+            approvalCode = body?.approval_code
         )
         when (result) {
             is PairingConfirmResult.Success -> {
@@ -402,6 +430,52 @@ class PairingRoutes(
                     "挑战不存在或已过期，请重新获取"
                 )
             }
+            is PairingConfirmResult.Blocked -> {
+                // 2026-10-15：被拉黑设备的配对/登录尝试。
+                // 403 而不是 401（理由见 ErrorCode.DEVICE_BLOCKED 的注释）。
+                // 指纹在路由层再算一次（一次 SHA-256，只发生在被拦路径上）：服务端的权威指纹
+                // 仍在 PairingManager 内部算，这里只是为了把"哪台设备在试"写进日志与事件中心。
+                val blockedFp = DeviceAuth.fingerprintOf(body?.device_pubkey.orEmpty().trim()).orEmpty()
+                AppLogger.w(TAG, "Blocked device attempted pairing/login ip=$ip fp=${blockedFp.take(8)}")
+                // 留痕：写进事件中心（默认**不发**系统通知/邮件 —— 命中是被拉黑者可控的，
+                // 每试一次就弹通知等于给对方一个远程刷屏机主的手段，见 AlertEngine 的说明）。
+                onBlockedDevice?.invoke(blockedFp, ip)
+                call.respondFail(
+                    HttpStatusCode.Forbidden,
+                    ErrorCode.DEVICE_BLOCKED,
+                    "本设备已被拉黑，无法配对或登录",
+                    // 2026-10-21（决策 D4）：告诉客户端"还要等多久"。
+                    // 解除拉黑**不清冷却**（首次 10 分钟、连击升到 1 小时），
+                    // 之前两端只能写"最长 1 小时"，用户不知道自己该等 5 分钟还是一小时，
+                    // 于是反复重试 —— 而每次重试都在刷新冷却计数。
+                    mapOf("retry_after_seconds" to result.retryAfterSeconds)
+                )
+            }
+            is PairingConfirmResult.ApprovalRequired -> {
+                // 2026-10-15：新设备需要机主批准。
+                // 403 而不是 401：401 会被客户端当成"密码错，重试"，而这里重试一万次也没用 ——
+                // 得去已配对设备上点允许，或者输入外部通知里的配对码。
+                AppLogger.w(TAG, "Pairing requires owner approval (sid=${body?.sid?.take(8)}) ip=$ip")
+                call.respondFail(
+                    HttpStatusCode.Forbidden,
+                    ErrorCode.APPROVAL_REQUIRED,
+                    "新设备需要机主批准：请在已配对设备上点「允许」，或输入通知里的配对码"
+                )
+            }
+        }
+
+        // 2026-10-15：**任何失败都尝试轮换配对码**（成功时由 confirmPairing 消耗掉，无需轮换）。
+        //
+        // 放在 when 之后而不是逐个分支里：分支有九个，一个个加必然漏一个 —— 而漏掉的那条
+        // 就是留给爆破的口子。轮换后旧码立即失效，攻击者每次失败都面对一个新靶子；
+        // 合法用户只是重新看一眼设备上显示的码。
+        //
+        // 2026-10-21 澄清（审计 §C2）：这里对**已初始化设备是空操作** ——
+        // `rotatePairingCode()` 只在 `devicePasswordSet=false`（首次配对，靠码登录）时换码，
+        // 已初始化设备的码本来是空串、也永远不参与登录（那条路必须给密码），
+        // 凭空生成一个新码没有人会读到。注释别再说成"任何设备都换码"。
+        if (result !is PairingConfirmResult.Success) {
+            ctx.settings.rotatePairingCode()
         }
     }
 
