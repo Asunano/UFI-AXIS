@@ -296,6 +296,12 @@ data class RotateTransition(
  * - [clipToBounds] 必须为 `false` —— 否则旋转出界的棱边会被裁掉；
  * - `alpha` 恒为 `1f` —— 立方体是不透明实体，任何淡化都会露馅。
  *
+ * ## 本策略**刻意不做**过渡模糊（2026-10-14 明确）
+ * [requiresPairedRendering] 为 `true` 时宿主会直接跳过 `applyTransitionBlur`：配对渲染本身
+ * 已经是两张全屏离屏图层，再叠一层 `RenderEffect` 会触发**第二遍离屏渲染**、GPU 开销翻倍
+ * （见 `UfiPageSwitcherHost` 调用点的说明）。所以「立方体3D 没有模糊」是**设计**，不是缺陷
+ * —— 它和 Flip3D 的情况不同（Flip3D 不是配对渲染，详见 [Flip3DTransition.blurIntensity]）。
+ *
  * 映射：
  * - `rotationY       = -p * 90`（负号使旋转方向与位移方向视觉一致）
  * - `translationX    = p * 容器宽度(px)`
@@ -367,6 +373,27 @@ object Flip3DTransition : UfiPageTransition {
     override val displayName: String = "翻转3D"
 
     override val clipToBounds: Boolean = false
+
+    /**
+     * 2026-10-14：**显式关闭过渡模糊**（`blurIntensity = 0f` → 宿主算出的半径恒为 0 →
+     * `renderEffect = null`，见宿主 `applyTransitionBlur` 的 `MIN_EFFECTIVE_BLUR_PX` 判据）。
+     *
+     * 为什么关掉一个"本来就没看见"的模糊：
+     * 1. **它确实下发了**。Flip3D 的 [requiresPairedRendering] 是 `false`（它不需要出入页同框），
+     *    所以宿主那条「配对渲染跳过模糊」的闸门拦不住它，会走全局三角脉冲 [defaultBlurProfile]。
+     * 2. **但它永远看不见**。该脉冲的峰值恰好在 `|p| = 0.5`，而此刻 `rotationY = 90°` ——
+     *    页面侧面朝观察者、投影宽度 ≈ 0；`|p| > 0.5` 之后 `alpha` 又被背面剔除归零，
+     *    宿主 F1 可见性短路直接跳过。可见区间 `|p| ∈ (0, 0.5)` 里系数最多约 0.19（≈2.3dp），
+     *    肉眼无感。
+     * 3. **代价却是实打实的**：整页已经是 3D 旋转的离屏图层，再挂 `RenderEffect` 会在过渡起点
+     *    多分配一张全屏 FBO、每帧多跑一遍全屏模糊 —— 这正是宿主 KDoc 里记的
+     *    「某一帧卡一下」尖峰，也是 3D 切换卡顿的来源之一。
+     *
+     * 即：**付出全屏 GPU 模糊的钱，买一个投影宽度为零的时刻的模糊**。关掉它观感零变化、
+     * 卡顿减少。若将来确实想让 Flip3D 有可见的模糊，正确做法是给它一条**自定义
+     * `blurProfile`**（峰值挪到页面还看得见的 `|p| ≈ 0.25`），而不是复用这条峰值错位的默认曲线。
+     */
+    override val blurIntensity: Float = 0f
 
     override fun writeLayer(
         target: UfiPageLayer,

@@ -72,7 +72,20 @@ private val ENTER_SPEC: AnimationSpec<Float> = tween(
  *
  * @param message 错误文案。
  * @param onRetry 非 null 时右侧显示「重试」按钮（Subtle/Small 档，与全站按钮同源）。
- * @param modifier 施加在**悬浮卡本体**上（旧调用点传的横向 padding 仍然安全，只是不再影响布局）。
+ * @param modifier 施加在**悬浮卡本体**上。**不要再传横向 padding** —— 见下方说明。
+ *
+ * ## 为什么调用点不该传 padding（2026-10-13 更正）
+ * 本组件是 [Popup]：横向位置与宽度由 [UfiBannerDefaults.sideMargin] 与
+ * [PopupPositionProvider] **独立算出**（`x = (屏宽 − 内容宽)/2` 再 `coerceAtLeast(sideMargin)`），
+ * 与调用点所在页面的 `contentHPadding` 毫无关系。所以传横向 padding：
+ *  · **短文案**下是个 no-op（居中仍然成立），这也是旧 KDoc 说它"安全"的原因；
+ *  · **长文案**下（内容被 `maxCardWidth = 屏宽 − sideMargin*2` 夹住时）会让
+ *    Popup 总宽 = 屏宽 + 32dp，`x` 被 `coerceAtLeast` 顶到 sideMargin，
+ *    结果卡片**左 32dp、右贴屏**，左右不对称。
+ * 纵向 padding 同理：它只是把卡在 popup 窗口里下移，而纵向位置本应由 `topMargin` 决定。
+ *
+ * 因此本组件的 9 个调用点已在 2026-10-13 全部去掉 padding。旧 KDoc 写的
+ * 「旧调用点传的横向 padding 仍然安全，只是不再影响布局」**对长文案不准确**，已删除。
  */
 @Composable
 fun UfiErrorBanner(

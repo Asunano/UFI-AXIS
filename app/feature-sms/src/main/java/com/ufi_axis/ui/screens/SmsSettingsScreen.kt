@@ -216,9 +216,10 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
             // 两个二级页做成同款入口卡（而不是一个「值 + 箭头」行、一个入口卡）：
             // 它们是平级的两件事 —— 规则是"设什么"、已拦截是"拦到了什么"。
             //
-            // 外面这层 horizontal padding 是必须的：UfiEntryCard 自身 fillMaxWidth、
-            // 不带卡片外边距（它原本长在已有横向内距的列表里），直接放进
-            // UfiPageBackground 会贴到屏幕两侧、和上面几张单行卡对不齐。
+            // 2026-10-13：原先这里各补了一层 `padding(horizontal = CardHorizontalMargin)`，
+            // 因为当时 UfiEntryCard 自身不带卡片外边距。现在它已内建同一个值
+            //（与 UfiSettingsRowCard / UfiSettingsGroup 对齐），补偿必须删掉，
+            // 否则叠成 32dp 的双重内距、比上面几张单行卡凸出去 16dp。
             UfiEntryCard(
                 title = "拦截规则",
                 subtitle = "号码黑名单与关键词",
@@ -227,8 +228,7 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                 // 0 条时不亮角标（`takeIf`），空规则表本身由规则页的空态解释。
                 badgeText = toolsState.smsRules.size.takeIf { it > 0 }?.let { "$it 条" },
                 badgeType = UfiBadgeType.INFO,
-                onClick = { navController.navigate(Routes.DETAIL_SMS_FILTER_RULES) },
-                modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                onClick = { navController.navigate(Routes.DETAIL_SMS_FILTER_RULES) }
             )
 
             // 拦截是「静默丢消息」的功能，用户能不能发现"我是不是漏了什么"全靠这个入口。
@@ -240,8 +240,7 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                 icon = Icons.Default.Block,
                 badgeText = toolsState.smsBlockedUnviewed.takeIf { it > 0 }?.toString(),
                 badgeType = UfiBadgeType.WARNING,
-                onClick = { navController.navigate(Routes.DETAIL_SMS_BLOCKED) },
-                modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                onClick = { navController.navigate(Routes.DETAIL_SMS_BLOCKED) }
             )
 
             // 2026-09-08：原来这里还有一个「其它」分组（设备短信条数只读行 + 全部标为已读）。

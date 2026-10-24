@@ -52,6 +52,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.theme.DonatePink
 import com.ufi_axis.ui.theme.LocalResolvedPalette
@@ -103,6 +104,10 @@ enum class UfiButtonVariant {
 enum class UfiButtonSize {
     /** 高 [Spacing.ButtonHeight]（48dp，Android 触摸目标下限），M3 默认内距，加粗正文。默认铺满宽度。 */
     Standard,
+    /**
+     * 大号（64dp）：引导 / 登录首屏专用。2026-10-22 与 onboardingTitle/onboardingNote 配套引入。
+     */
+    Large,
 
     /** 高 [Spacing.SmallButtonHeight]（36dp），内距 h16/v0，`tagStrong` 小字。默认自适应宽度。 */
     Small,
@@ -134,7 +139,7 @@ fun UfiButton(
     size: UfiButtonSize = UfiButtonSize.Standard,
     enabled: Boolean = true,
     loading: Boolean = false,
-    fillWidth: Boolean = size == UfiButtonSize.Standard,
+    fillWidth: Boolean = size != UfiButtonSize.Small,
     icon: ImageVector? = null,
 ) {
     val palette = LocalResolvedPalette.current
@@ -146,6 +151,7 @@ fun UfiButton(
         .height(
             when (size) {
                 UfiButtonSize.Standard -> Spacing.ButtonHeight
+                UfiButtonSize.Large -> Spacing.ButtonHeightLarge
                 UfiButtonSize.Small -> Spacing.SmallButtonHeight
             }
         )
@@ -169,6 +175,7 @@ fun UfiButton(
     val contentPadding = when (size) {
         // Standard 沿用 M3 默认（h24/v8）—— 合并前 Primary/Secondary/Danger 都没显式传，吃的就是这个。
         UfiButtonSize.Standard -> ButtonDefaults.ContentPadding
+        UfiButtonSize.Large -> PaddingValues(horizontal = 28.dp, vertical = 14.dp)
         UfiButtonSize.Small -> PaddingValues(
             horizontal = Spacing.SmallButtonPaddingH,
             vertical = Spacing.SmallButtonPaddingV
@@ -198,6 +205,11 @@ fun UfiButton(
             Spacer(Modifier.width(Spacing.Small))
         }
         when {
+            size == UfiButtonSize.Large -> Text(
+                text, style = UfiTextStyles.bodyLeadStrong,
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+
             size == UfiButtonSize.Small -> Text(text, style = UfiTextStyles.tagStrong)
 
             // 2026-09-03：Standard 档按钮文案强制单行。按钮多为等宽 weight(1f) 布局，稍长的中文标签

@@ -54,7 +54,17 @@ data class PhoneDownloadHistoryItem(
     val fileSize: Long,
     val sourcePath: String,
     val downloadedAt: Long,
-    val status: String  // "completed", "cancelled", "error"
+    val status: String,  // "completed", "cancelled", "error"
+    /**
+     * 这条下载**从哪个入口发起**（2026-10-21）。
+     *
+     * 取值：`"audio"`（音乐列表长按）、`"image"`（图片菜单/编辑器）、`"file"`（文件管理器、文本编辑器）；
+     * 空串 = 这一版之前的旧记录（那时没有这个字段，只能靠扩展名猜）。
+     *
+     * 为什么不能只按扩展名分类：一份 mp3 可能是从文件管理器下的、也可能从音乐列表下的，
+     * 两者在"音乐 → 下载记录"里应该分开放 —— 否则文件管理器的下载会混进音乐设置里。
+     */
+    val source: String = ""
 )
 
 // ========== Clipboard Entry ==========
@@ -124,6 +134,15 @@ data class TextFileContent(
 
 data class FileManagerState(
     val currentPath: String = "",
+    /**
+     * 最近一次**加载失败**的目标路径（2026-10-21）。
+     *
+     * 为什么需要它：`currentPath` 只在成功时才更新，所以"点进远端源但连不上"这种情况下
+     * `currentPath` 还停在上一层（常常是虚拟根 `""`）。此时错误页上的「重试」如果按
+     * `currentPath` 去重试，重试的其实是**上一层**，而那条失败的请求再也不会被重发 ——
+     * 用户读到的就是"点了重试没反应"。
+     */
+    val lastFailedPath: String? = null,
     val files: List<FileItem> = emptyList(),
     val isLoading: Boolean = false,
     val isUploading: Boolean = false,

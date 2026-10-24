@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.StrictMode
 import android.util.Log
 import androidx.work.Configuration
+import com.ufi_axis.data.media.UfiAudioLyrics
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.disk.DiskCache
@@ -44,6 +45,13 @@ class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configur
         DebugLog.masterEnabled = prefs.logEnabled
         DebugLog.appEnabled = prefs.appLogEnabled
         DebugLog.enabled = prefs.debugMode
+
+        /*
+         * 歌词磁盘缓存安装（2026-10-21）：`UfiAudioLyrics` 是单例但没有 Context，
+         * 这里把 `cacheDir/lyrics` 交给它一次。装了之后歌词跨进程可用 —— 冷启动、
+         * 切回之前的歌都不必再问 core / 扫内嵌标签。
+         */
+        UfiAudioLyrics.install(this)
 
         // 初始化通信报错日志落盘（Download/UFI-AXIS/log），用于诊断「服务无法链接」
         ApiErrorLogger.init(this)
@@ -174,7 +182,8 @@ class UfiAxisApplication : Application(), SingletonImageLoader.Factory, Configur
              *
              * Coil3 **不显式配置就没有磁盘缓存**，于是每次冷启动、每次退出再进媒体库，
              * 缩略图都要重新走一遍网络 —— 而这些图来自随身 WiFi 上的 core，那台设备
-             * 生成一张缩略图的代价远高于一次普通请求（解码器残缺时还要靠手机抽帧回传）。
+             * 生成一张缩略图的代价远高于一次普通请求（视频要 ffmpeg 软解一帧，是秒级开销；
+             * 图片与音频封面虽然便宜，但也没必要为了省本地磁盘反复往返）。
              * 128MB 是"上千张 256~512px JPEG"的量级；目录放 cacheDir 下，系统缺存储时可回收。
              */
             .diskCache {

@@ -5,6 +5,10 @@ import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.res.painterResource
+import com.ufi_axis.R
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
@@ -99,7 +103,14 @@ fun UfiStartupOverlay(
             contentAlignment = Alignment.Center
         ) {
             Column(
-                modifier = Modifier.padding(horizontal = 32.dp),
+                modifier = Modifier
+                    .padding(horizontal = 32.dp)
+                    // 整体放大 10%（2026-10-21 用户要求）：只放大绘制、不改布局，
+                    // 所以居中对齐与换行宽度都保持原样，不会因为字号放大而重新折行。
+                    .graphicsLayer {
+                        scaleX = STARTUP_CONTENT_SCALE
+                        scaleY = STARTUP_CONTENT_SCALE
+                    },
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.Center
             ) {
@@ -123,6 +134,24 @@ fun UfiStartupOverlay(
 @Composable
 private fun LoadingContent(progress: PreloadProgress) {
     val palette = LocalResolvedPalette.current
+    /*
+     * 标题上方的应用图标（2026-10-21）：直接用自适应图标的前景层
+     * （`ic_launcher_foreground`，背景透明），所以和桌面图标是同一个图形，
+     * 不需要另做一张启动图。自适应的前景画布四周有留白，120dp 显示出来约等于 72dp 的可见图形。
+     *
+     * ⚠ 2026-10-22 闪退修复：**绝不能**写 `painterResource(R.mipmap.ic_launcher)`。
+     * 本工程的 `mipmap-anydpi/ic_launcher.xml` 是 `<adaptive-icon>`（没有位图 mipmap），
+     * Compose 的 `painterResource` 只认 VectorDrawable 与 PNG/JPG/WEBP，遇到自适应图标 XML
+     * 会抛 `IllegalArgumentException: Only VectorDrawables and rasterized asset types are supported`
+     * —— 而且它发生在**首帧组合**里，属于必崩（Android 16 / API 36 实测）。
+     * 这里要的是前景层，直接引用它自己的矢量资源即可。
+     */
+    Image(
+        painter = painterResource(R.drawable.ic_launcher_foreground),
+        contentDescription = null,
+        modifier = Modifier.size(120.dp)
+    )
+    Spacer(Modifier.height(Spacing.Large))
     Text(
         text = "UFI-AXIS",
         style = UfiTextStyles.headerTitle,
@@ -252,3 +281,10 @@ private fun ProblemContent(
         modifier = Modifier.fillMaxWidth()
     )
 }
+/**
+ * 启动页整体缩放（2026-10-21 用户要求 +10%）。
+ *
+ * 用 `graphicsLayer` 而不是把每个字号/间距都乘一遍：只放大绘制、不改布局，
+ * 文字不会因为变宽而重新折行，居中关系也原样保留。
+ */
+private const val STARTUP_CONTENT_SCALE = 1.1f

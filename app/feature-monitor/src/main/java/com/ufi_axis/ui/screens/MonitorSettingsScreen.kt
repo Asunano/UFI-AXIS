@@ -39,7 +39,7 @@ import kotlin.math.roundToInt
  * - 存储管理（P7b）：进入存储管理二级页经 `LaunchedEffect(Unit)` 首载一次存储统计
  *   （主页已删该卡 → 此处是 loadMonitorStorage 唯一入口）。
  * - 布局：UfiScreenScaffold + UfiPageBackground（自带 verticalScroll）+
- *   UfiSettingsGroup 分组卡片；chip 行采用全宽布局（详见 [MonitorSettingsChipRow]）。
+ *   UfiSettingsGroup 分组卡片；带固定档位的项走 [UfiSettingsItem] 的 trailing 下拉框。
  *
  * @param viewModel 全局 ViewModel（[MainViewModel.dashboard] 承载监控设置读写）。
  * @param navController 导航控制器（供返回）。
@@ -56,7 +56,7 @@ enum class MonitorSettingsGroup(
     DATA_COLLECTION(
         "数据采集",
         Icons.Default.Tune,
-        "总开关 · 采集指标 · 默认时间范围 · 自动刷新",
+        "总开关 · 采集指标 · 刷新间隔 · 智能节拍",
         Routes.DETAIL_MONITOR_COLLECTION
     ),
     // 「告警设置」已于 2026-09-10 迁回「设置 → 通知与守护」，本页不再提供入口。
@@ -125,7 +125,14 @@ fun MonitorCollectionSettingsScreen(viewModel: MainViewModel, navController: Nav
                 onChange = { v -> viewModel.dashboard.setMonitorSettings(settings.copy(collectEnabled = v)) },
                 onDefaultHours = { v -> viewModel.dashboard.setMonitorSettings(settings.copy(defaultHours = v.toInt())) },
                 onRefreshInterval = { v -> viewModel.dashboard.setMonitorSettings(settings.copy(refreshIntervalSec = v.toInt())) },
-                onEnabledTypes = { next -> viewModel.dashboard.setMonitorSettings(settings.copy(enabledTypes = next)) }
+                onEnabledTypes = { next -> viewModel.dashboard.setMonitorSettings(settings.copy(enabledTypes = next)) },
+                onSmartLoopEnabled = { v ->
+                    viewModel.dashboard.setMonitorSettings(settings.copy(smartLoopEnabled = v))
+                },
+                // 三个阈值改一项就是一次提交：走既有的整表 PUT（setMonitorSettings 内部发
+                // toRemotePayload 全量），不新增按字段的请求 —— 本仓的写路径约定见
+                // MediaScanDirsSettings 的文件头。
+                onSmartLoopThreshold = { next -> viewModel.dashboard.setMonitorSettings(next) }
             )
             Spacer(Modifier.height(Spacing.Large))
         }
@@ -311,14 +318,44 @@ private fun MonitorSettingsEntryCard(
 
 // ==================== 二级设置页 ====================
 
-/** ① 数据采集：总开关 + 采集指标 + 默认时间范围 + 自动刷新间隔 */
+/**
+ * 「默认时间范围」的档位：值（小时）→ 文案。
+ *
+ * 取值必须与 core 的 `MonitorRoutes.ALLOWED_HOURS`（1/6/24/168）逐字一致 ——
+ * 那是服务端的硬校验，多一档就会被 400 拒掉。
+ */
+private val DEFAULT_HOURS_OPTIONS = listOf(
+    "1" to "1 小时",
+    "6" to "6 小时",
+    "24" to "24 小时",
+    "168" to "7 天"
+)
+
+/** 「自动刷新间隔」的档位：值（秒）→ 文案。 */
+private val REFRESH_INTERVAL_OPTIONS = listOf(
+    "10" to "10 秒",
+    "30" to "30 秒",
+    "60" to "1 分",
+    "300" to "5 分"
+)
+
+/**
+ * ① 数据采集：总开关 + 采集指标 + 默认时间范围 + 自动刷新间隔 + 智能采集节拍。
+ *
+ * 智能节拍（2026-10-14 接线）独立成第二张卡而不是塞进上面那张：它调的是**采集循环自己的节拍**
+ *（core 的 `SmartLoop`），而上面那张回答的是"采什么、界面多久刷一次"；混在一张卡里时
+ * "关掉智能节拍"看起来像是关掉了刷新。仍在同一页 —— 用户眼里这两件事是同一个问题
+ *（"它多久采一次"），分到「采集调度」只会让人以为要多调一处。
+ */
 @Composable
 private fun DataCollectionSettingsGroup(
     settings: MonitorSettings,
     onChange: (Boolean) -> Unit,
     onDefaultHours: (String) -> Unit,
     onRefreshInterval: (String) -> Unit,
-    onEnabledTypes: (Set<String>) -> Unit
+    onEnabledTypes: (Set<String>) -> Unit,
+    onSmartLoopEnabled: (Boolean) -> Unit,
+    onSmartLoopThreshold: (MonitorSettings) -> Unit
 ) {
     var metricsDialogOpen by remember { mutableStateOf(false) }
 
@@ -345,21 +382,76 @@ private fun DataCollectionSettingsGroup(
             onClick = { metricsDialogOpen = true }
         )
 
-        MonitorSettingsChipRow(
+        // 2026-10-15（用户要求）：这两个从 chip 行改成**下拉框** —— 都是四个固定档位，
+        // 下拉一次点准，也不再各占一整行（两行 chip 把这一页撑得很长）。
+        UfiSettingsItem(
             title = "默认时间范围",
-            subtitle = "进入监控页默认显示",
-            options = listOf("1" to "1小时", "6" to "6小时", "24" to "24小时", "168" to "7天"),
-            selectedValue = settings.defaultHours.toString(),
-            onSelect = onDefaultHours
+            description = "进入监控页默认显示",
+            trailing = {
+                UfiDropdown(
+                    selectedValue = settings.defaultHours.toString(),
+                    options = DEFAULT_HOURS_OPTIONS.map { it.first },
+                    onValueSelected = onDefaultHours,
+                    modifier = Modifier.width(120.dp),
+                    optionLabel = { value ->
+                        DEFAULT_HOURS_OPTIONS.firstOrNull { it.first == value }?.second ?: value
+                    }
+                )
+            }
         )
 
-        MonitorSettingsChipRow(
+        UfiSettingsItem(
             title = "自动刷新间隔",
-            subtitle = null,
-            options = listOf("10" to "10秒", "30" to "30秒", "60" to "1分", "300" to "5分"),
-            selectedValue = settings.refreshIntervalSec.toString(),
-            onSelect = onRefreshInterval
+            description = "前台轮询间隔，越短越及时也越耗电",
+            trailing = {
+                UfiDropdown(
+                    selectedValue = settings.refreshIntervalSec.toString(),
+                    options = REFRESH_INTERVAL_OPTIONS.map { it.first },
+                    onValueSelected = onRefreshInterval,
+                    modifier = Modifier.width(120.dp),
+                    optionLabel = { value ->
+                        REFRESH_INTERVAL_OPTIONS.firstOrNull { it.first == value }?.second ?: value
+                    }
+                )
+            }
         )
+    }
+
+    // ── 智能采集节拍（2026-10-14 接线；core 侧真源是 `smart_loop_*` 原始键）──
+    UfiSettingsGroup {
+        UfiGroupHeader("智能采集节拍")
+
+        // 第一位就是回退开关，不是三个阈值之后的第四项：它是"采集行为出问题时一键退回
+        // 固定间隔"的出口，排在阈值后面会被当成又一个阈值，真出事时找不到。
+        UfiSettingsItem(
+            title = "智能节拍",
+            description = "按流量自动加快/放慢采集。关闭后所有采集循环退回固定间隔（更费电但更保守）" +
+                "——出问题时的一键回退开关。",
+            trailing = {
+                UfiSwitch(checked = settings.smartLoopEnabled, onCheckedChange = onSmartLoopEnabled)
+            }
+        )
+
+        SmartLoopThreshold.entries.forEach { threshold ->
+            UfiDivider()
+            UfiSettingsItem(
+                title = threshold.title,
+                description = threshold.summary,
+                trailing = {
+                    UfiDropdown(
+                        selectedValue = threshold.read(settings),
+                        options = smartLoopChoices(threshold, settings),
+                        onValueSelected = { v -> onSmartLoopThreshold(threshold.write(settings, v)) },
+                        modifier = Modifier.width(140.dp),
+                        optionLabel = { formatBps(it) },
+                        // 总开关关着时这三个值不起作用（所有循环退回固定间隔），
+                        // 界面就不能让它们看起来还能改 —— 与 UfiDropdown 的 `enabled`
+                        // 参数当初为「巡检间隔」加进来的理由同一条。
+                        enabled = settings.smartLoopEnabled
+                    )
+                }
+            )
+        }
     }
 
     if (metricsDialogOpen) {
@@ -372,6 +464,96 @@ private fun DataCollectionSettingsGroup(
             }
         )
     }
+}
+
+/**
+ * 智能节拍（core `SmartLoop`）的三个吞吐量阈值，单位统一 **bytes/s**。
+ *
+ * 把「文案 + 档位 + 读写位置」放在一处，与 [SchedulerField] 同一手法：拆成三段重复代码时，
+ * 说明和档位很容易只改一头。
+ *
+ * ## 档位为什么按量级分带
+ * idle 全部 < 1MB ≤ active 全部 < 20MB ≤ heavy 全部。core 的 PUT 对序关系是硬校验
+ *（`idle < active < heavy`，反序直接 400），若三份档位表取同一批值，用户随时能选出一个
+ * 必然被拒的组合；分带之后**随手选都是合法的**。这三组值必须与 web 的
+ * `SMART_LOOP_*_CHOICES`（`monitorShared.ts`）逐字一致 —— 同一项在两端给出不同档位，
+ * 用户换一端就会看到"值自己变了"。
+ *
+ * ## 为什么没有弹窗
+ * 其余调度项（[SchedulerField]）用"行 + 弹窗滑块"是因为值域是连续区间；这三个阈值的
+ * 可用范围由档位表决定，四个固定档位直接下拉一次点准，不需要再套一层弹窗。
+ *
+ * @param title 行标题
+ * @param summary 行副标：只说这一项管什么（取舍说明没有地方放 —— 本页即改即存、无弹窗）
+ * @param choices 本档位的可选值（bytes/s），实际可用列表还要经 [smartLoopChoices] 过滤
+ */
+private enum class SmartLoopThreshold(
+    val title: String,
+    val summary: String,
+    val choices: List<Long>
+) {
+    IDLE(
+        title = "零流量阈值",
+        summary = "低于它按零流量放慢（省电）",
+        choices = listOf(4_096L, 16_384L, 65_536L, 262_144L)
+    ),
+    ACTIVE(
+        title = "中流量阈值",
+        summary = "超过它按基准节拍采集",
+        choices = listOf(1_048_576L, 4_194_304L, 10_485_760L)
+    ),
+    HEAVY(
+        title = "大流量阈值",
+        summary = "超过它进最快档，降低数据延迟",
+        choices = listOf(20_971_520L, 52_428_800L, 104_857_600L)
+    );
+
+    /** 从设置里读当前值。 */
+    fun read(settings: MonitorSettings): Long = when (this) {
+        IDLE -> settings.smartLoopIdleBps
+        ACTIVE -> settings.smartLoopActiveBps
+        HEAVY -> settings.smartLoopHeavyBps
+    }
+
+    /** 写回设置。序关系由 [smartLoopChoices] 在选项层面保证，这里不做纠正。 */
+    fun write(settings: MonitorSettings, value: Long): MonitorSettings = when (this) {
+        IDLE -> settings.copy(smartLoopIdleBps = value)
+        ACTIVE -> settings.copy(smartLoopActiveBps = value)
+        HEAVY -> settings.copy(smartLoopHeavyBps = value)
+    }
+}
+
+/**
+ * 某个阈值当前可选的档位：本带档位里再滤掉会破坏 idle < active < heavy 的那些。
+ *
+ * core 的 PUT 对序关系是硬校验，"选了却报错、值又弹回去"正是本仓明令避免的假设置交互
+ *（理由同 [withThermalOrder]：用户只会看到设置自己变回来了），所以直接在**选项层面**堵掉，
+ * 而不是等用户选完再纠正他。一次只改一个键，因此只需拿另外两个**现值**做过滤。
+ *
+ * 当前值永远保留在列表里：它可能是设备上已有的非档位值（web 端或旧版本留下的），
+ * 剔掉的话下拉框就显示不出这个值了。
+ */
+private fun smartLoopChoices(threshold: SmartLoopThreshold, settings: MonitorSettings): List<Long> {
+    val allowed = threshold.choices.filter { v ->
+        when (threshold) {
+            SmartLoopThreshold.IDLE -> v < settings.smartLoopActiveBps
+            SmartLoopThreshold.ACTIVE ->
+                v > settings.smartLoopIdleBps && v < settings.smartLoopHeavyBps
+            SmartLoopThreshold.HEAVY -> v > settings.smartLoopActiveBps
+        }
+    }
+    val current = threshold.read(settings)
+    return (if (current in allowed) allowed else allowed + current).sorted()
+}
+
+/**
+ * bytes/s → 人话（KB/s / MB/s）。**逐字对齐** web 的 `formatSpeedValue`（`monitorShared.ts`）：
+ * 同一个阈值在两端显示成不同的数字（"16 KB/s" vs "16.0 KB/s"）会被当成两回事。
+ */
+private fun formatBps(v: Long): String = when {
+    v >= 1024L * 1024 -> "%.2f MB/s".format(v / 1024.0 / 1024.0)
+    v >= 1024L -> "%.1f KB/s".format(v / 1024.0)
+    else -> "$v B/s"
 }
 
 /**
@@ -1009,51 +1191,6 @@ private fun StorageCleanDialog(
     }
 }
 
-/**
- * 设置分组内的「标题 + 说明 + 全宽 chip 选择器」行。
- *
- * 不用 [UfiSettingsItem] 的 trailing 槽放 [UfiSingleChipSelector]：
- * chip 内部 Row 带 fillMaxWidth 且每个 chip 是 weight(1f)，放进 trailing 的
- * 非权重 Box 会占满整行，标题列被挤成 0 宽；改为全宽堆叠（与 AppearanceSettingsScreen
- * 的 chip 用法一致），标题/说明样式与 [UfiSettingsItem] 完全对齐。
- */
-@Composable
-private fun MonitorSettingsChipRow(
-    title: String,
-    subtitle: String?,
-    options: List<Pair<String, String>>,
-    selectedValue: String,
-    onSelect: (String) -> Unit
-) {
-    val palette = LocalResolvedPalette.current
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 10.dp)
-    ) {
-        Text(
-            text = title,
-            style = UfiTextStyles.listItemTitle,
-            color = palette.textPrimary,
-            maxLines = 2
-        )
-        if (subtitle != null) {
-            Text(
-                text = subtitle,
-                style = UfiTextStyles.note,
-                color = palette.textSecondary,
-                maxLines = 2,
-                modifier = Modifier.padding(top = 2.dp)
-            )
-        }
-        Spacer(Modifier.height(Spacing.Medium))
-        UfiSingleChipSelector(
-            options = options,
-            selectedValue = selectedValue,
-            onSelect = onSelect
-        )
-    }
-}
 
 // ==================== 存储管理私有辅助（P7b，自主页 P5e 迁入；两文件各自实现，避免跨文件共享私有） ====================
 

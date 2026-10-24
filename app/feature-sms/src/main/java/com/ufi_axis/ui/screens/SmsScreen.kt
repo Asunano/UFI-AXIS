@@ -73,6 +73,10 @@ import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis.ui.navigation.LocalPendingSmsPhone
 import com.ufi_axis.ui.navigation.Routes
+// 2026-10-14：页内「列表 ⇄ 对话」转场改为与导航层二级界面同源，直接复用这两个来源
+// （时长换算与视差分母）—— 避免同一个 app 里两种"二级界面"各有一套数。
+import com.ufi_axis.ui.navigation.SHARED_AXIS_X_PARALLAX
+import com.ufi_axis.ui.navigation.ufiSharedAxisDurationMs
 import java.text.SimpleDateFormat
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -279,6 +283,11 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         title = "短信",
         navController = navController,
         showBack = true,
+        // 2026-10-14：底部输入法 inset 交给外壳统一处理（navigationBars ∪ ime）。
+        // 对话页的输入栏贴在底部，键盘弹出时整块面板要上移；原先在 SmsConversationView 的根
+        // Column 上挂 `imePadding()`，而外壳的内容 Box 已经应用过 navigationBars，两者相加 →
+        // 输入栏悬在键盘上方约一个导航栏的高度（与控制台同一个 bug）。
+        imeAwareBottomInset = true,
         navigationIcon = {
             // 上下文感知返回按钮：对话打开时关闭对话，否则退出短信页面
             val hasConversation = toolsState.conversationPhone.isNotEmpty()
@@ -314,20 +323,9 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             }
         },
         actions = {
-            // 手动刷新：下拉手势删掉后的唯一主动刷新入口。
-            // 只在列表层出现 —— 对话层自己有分页加载，顶栏再给一个"刷新"会让人以为是刷对话。
-            // 按当前页签分派，不是无脑全刷：两个页签的数据源不同（联系人聚合 / 验证码缓存），
-            // 全刷会白发一个请求。
-            if (toolsState.conversationPhone.isEmpty()) {
-                IconButton(
-                    onClick = {
-                        if (toolsState.smsTab == 0) viewModel.tools.loadSmsContacts()
-                        else viewModel.tools.loadVerificationCodes()
-                    }
-                ) {
-                    Icon(Icons.Default.Refresh, "刷新", tint = palette.textSecondary)
-                }
-            }
+            // 2026-10-21：顶栏「刷新」按钮删除（用户要求）。
+            // 会话列表与验证码列表都各有 10s 静默轮询 + 重进页面刷新（rememberResumeRefresh），
+            // 手动再刷一遍是多余的；对话层本来就只有分页加载，顶栏刷新更容易让人以为是刷对话。
             // 齿轮 → 独立的「短信设置」页面。
             // 2026-09-08：这里原来是 `showSettingsDialog = true` 弹一个 UfiCustomDialog，
             // 那个弹窗已连同它的状态一起删除 —— 拦截规则与拦截记录是两个各自带列表的二级页，
@@ -344,28 +342,34 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             // 跳一下。现在两层都是铺满整屏的兄弟节点，列表层（含 Tab 栏）作为一个整体平移出去，
             // 转场期间没有任何节点增删、没有高度变化，所以不会抽。
             // sizeTransform = null 同理：不让 AnimatedContent 去补间容器尺寸。
-            val emphasizedDecelerate = UfiMotion.Easing.EmphasizedIn
-            val emphasizedAccelerate = UfiMotion.Easing.EmphasizedOut
+            // 2026-10-14：转场口径改为与**导航层二级界面**（TransitionType.DETAIL 的共享轴）完全同源。
+            //
+            // 改动前这里是自己一套：进/出用**两条不同的曲线**（EmphasizedIn / EmphasizedOut）、
+            // 视差 1/4、并且叠了 fadeIn/fadeOut。三处都偏离了共享轴的既定口径：
+            //   1. 共享轴两页是**同时**平移的，曲线必须同一条 —— 一边加速一边减速会让上下层的
+            //      视差关系在中途走歪，观感是两层"错位 / 拉扯"。`Navigation.kt` 的
+            //      `sharedAxisSpec` 注释里明确记过这条，并记录过换 emphasized 曲线后回退；
+            //   2. 视差 1/4 比导航层的 1/6 深 ⇒ 同一个 app 里两种"二级界面"的层次不一致；
+            //   3. 共享轴**不引入 alpha 淡入淡出**（见 Navigation.kt 顶部的口径）。
+            //      整屏平移上再叠淡入，新页会显得"发虚"，而不是实心压上来。
+            // 现在时长与视差都直接取导航层的来源，曲线取同一条 `Easing.Standard`。
+            val smsAxisSpec = tween<IntOffset>(
+                ufiSharedAxisDurationMs(UfiMotion.Duration.Sweeping),
+                easing = UfiMotion.Easing.Standard
+            )
             AnimatedContent(
                 targetState = toolsState.conversationPhone.ifEmpty { null },
                 modifier = Modifier.fillMaxSize(),
                 transitionSpec = {
                     val enteringConversation = targetState != null
-                    // 2026-09-04（P2b）：下面两处 `fadeOut(tween(240))` → Duration.Fluid（250，+10ms，
-                    // 在吸附容差内）。240 与梯度上的 250 是同一种「离场比进场快半拍」的手感，
-                    // 全库不该保留两个数；顺带与弹窗离场（UfiMotion.Duration.Fluid）走了同一档。
                     val transform = if (enteringConversation) {
-                        // push：新页整幅宽度滑入压在上面，旧页只走 1/4 宽做视差（M3 的做法，
-                        // 两页等速对滑会像"翻牌"，视差才有层级）
-                        (slideInHorizontally(tween(UfiMotion.Duration.Deliberate, easing = emphasizedDecelerate)) { it } +
-                            fadeIn(tween(UfiMotion.Duration.Quick))) togetherWith
-                            (slideOutHorizontally(tween(UfiMotion.Duration.Deliberate, easing = emphasizedAccelerate)) { -it / 4 } +
-                                fadeOut(tween(UfiMotion.Duration.Fluid)))
+                        // push：新页整幅宽度滑入压在上面，旧页走 1/6 屏做视差（与二级页一致）
+                        slideInHorizontally(smsAxisSpec) { it } togetherWith
+                            slideOutHorizontally(smsAxisSpec) { -it / SHARED_AXIS_X_PARALLAX }
                     } else {
-                        (slideInHorizontally(tween(UfiMotion.Duration.Deliberate, easing = emphasizedDecelerate)) { -it / 4 } +
-                            fadeIn(tween(UfiMotion.Duration.Quick))) togetherWith
-                            (slideOutHorizontally(tween(UfiMotion.Duration.Deliberate, easing = emphasizedAccelerate)) { it } +
-                                fadeOut(tween(UfiMotion.Duration.Fluid)))
+                        // pop：下层（列表）自左侧视差滑回，上层（对话）整幅右滑退出
+                        slideInHorizontally(smsAxisSpec) { -it / SHARED_AXIS_X_PARALLAX } togetherWith
+                            slideOutHorizontally(smsAxisSpec) { it }
                     }
                     // 进入对话时新页在上（zIndex 1），返回时旧页在上盖住新页 —— 这才是 push/pop
                     // 该有的遮挡关系；不设的话两页同层，看着就是个交叉淡入淡出
@@ -423,7 +427,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                 // 2026-09-04 去掉下拉刷新：原来这里是 `PullToRefreshBox(indicator = {})`，
                                 // 即「保留手势、不画指示器」的折中版。现在连手势一起删掉 ——
                                 // 一个既不给任何视觉反馈、又会和列表滚动抢通道的手势，用户只会误触，
-                                // 触发了也不知道发生了什么。主动刷新改走顶栏刷新按钮（见 actions）。
+                                // 触发了也不知道发生了什么。顶栏那个刷新按钮同样在 2026-10-21 删除，
+                                // 数据保鲜改由 10s 静默轮询 + 重进页面负责。
                                 Box(Modifier.fillMaxSize()) {
                                     when {
                                         toolsState.smsContacts.isNotEmpty() -> {
@@ -495,7 +500,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     }
                                 }
                             } else {
-                                // 通知 Tab：验证码面板（下拉手势同样删除，刷新走顶栏按钮）
+                                // 通知 Tab：验证码面板（下拉手势同样删除；顶栏刷新按钮 2026-10-21 也删了，
+                                // 靠下方 10s 静默轮询保鲜）
                                 Box(Modifier.fillMaxSize()) {
                                     VerificationCodePanel(
                                         codes = toolsState.verificationCodes,
@@ -825,6 +831,11 @@ private fun SmsConversationList(
         if (deviceSmsTotal != null) {
             item(key = "device-sms-info") {
                 UfiStatusCard(
+                    // 2026-10-13：本 LazyColumn 已用 contentPadding 给了 16dp 横向内距
+                    //（与下面 SmsConversationRow 共用同一条基线），而 UfiStatusCard 现在自带
+                    // 同一个 CardHorizontalMargin —— 两边都留就是 32dp 的双重内距，卡片会比
+                    // 会话行窄一圈。所以这里显式关掉组件自带的那一层。
+                    horizontalMargin = 0.dp,
                     title = "设备短信",
                     statusText = "$deviceSmsTotal 条",
                     // 有未读才用 WARNING 让徽标亮起来；全读完是常态，常态不该是彩色。
@@ -1219,15 +1230,16 @@ private fun SmsConversationView(
         headers
     }
 
-    // imePadding()：键盘弹出时整个对话面板上移，输入栏浮在输入法之上。
-    // 这是「控制台同款」里最关键、上一版漏掉的一项 —— 控制台在 AdvancedConsoleScreen.kt:117
-    // 就是 `Column(Modifier.fillMaxSize().imePadding())`。缺了它输入栏会被输入法直接盖住。
-    // 放在根 Column 而不是只给输入栏：消息列表用 weight(1f)，父级让出高度后列表自动压缩，
-    // 于是"最后一条消息 + 输入栏"始终同时可见；只给输入栏加会把它顶到列表上方遮住内容。
+    // 2026-10-14 修正：这里**刻意不再有 `imePadding()`**。
+    //
+    // 原写法是「外壳已应用 navigationBars」+「本页再 imePadding()」，而 Android 的 IME inset
+    // 本身就覆盖导航栏那一段 ⇒ 底部被算两次，输入栏会"悬浮"在键盘上方约一个导航栏的高度。
+    // 现在底部 inset 由 `UfiScreenScaffold(imeAwareBottomInset = true)` 在外壳层一次性应用
+    // （`navigationBars ∪ ime`，取较大值而非相加），本页只负责让消息列表用 weight(1f) 让出高度
+    // —— 父级让出空间后列表自动压缩，"最后一条消息 + 输入栏"始终同时可见。
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .imePadding()
             .background(palette.pageBg)
     ) {
         // 顶栏直接坐在 pageBg 上：不再包 `Surface(cardBg, tonalElevation=2, ufiCardShadow)`。
@@ -1242,14 +1254,17 @@ private fun SmsConversationView(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // 进入对话的首屏骨架（本页唯一的加载动画，且只在"进入"时出现）。
-            // 条件 = 一条消息都还没有 + 正在拉第一页；openConversation 每次都是先清空再拉，
-            // 所以这个条件天然只在"进入/重新进入某个对话"时成立，翻页与轮询都不会命中。
-            // 放在 LazyColumn **里面**而不是替换整棵子树：容器恒定挂载，数据到位时只是这个 item
-            // 消失、消息 item 插入，没有"两棵子树互换"那一下闪。
-            if (messages.isEmpty() && isLoading) {
-                item(key = "entry-skeleton") { ConversationEntrySkeleton() }
-            }
+            // 2026-10-14（用户要求）：**删掉进入对话的首屏骨架**，只保留懒加载。
+            //
+            // 原来这里在「一条消息都没有 + 正在拉第一页」时插一个 `ConversationEntrySkeleton()`
+            // （6 行交替气泡占位 + shimmer）。用户反馈两件事，都成立：
+            //   ① 那是本页唯一的加载动画，而进入对话只需要"懒加载"—— 数据到位直接出现即可；
+            //   ② 它会**闪**：骨架是固定 44dp 高的灰块，与真实气泡高度并不相等，
+            //      数据一到整块被真实气泡顶掉，形态与高度同时变（原注释说"只是灰块变成文字"
+            //      并不成立），于是进入对话时有一次可见跳动。
+            // 现在什么都不画：数据到达前列表为空，到位后一次性铺出来。
+            //
+            // 「查看更早的消息」按钮不受影响（它要求 messages 非空），翻页期间的视觉行为不变。
             // 「查看更早的消息」：只要还有更早的就常驻，**不会因为 isLoading 换成转圈**。
             // 2026-09-04 删掉了这里的 `if (isLoading) 圆圈 item else if (hasMore) 按钮`：
             // 两者互斥意味着点一下按钮就被圆圈顶掉、加载完又换回来 —— 每次翻页闪一次版式，
@@ -1259,8 +1274,10 @@ private fun SmsConversationView(
                 item(key = "load_more") {
                     TextButton(
                         onClick = {
+                            // 锚点 = 当前第一个可见的**消息**项（跳过本按钮自己）。
+                            // 「entry-skeleton」已在 2026-10-14 随骨架屏一起删除，不再需要排除它。
                             listState.layoutInfo.visibleItemsInfo
-                                .firstOrNull { (it.key as? String)?.let { k -> k != "load_more" && k != "entry-skeleton" } == true }
+                                .firstOrNull { (it.key as? String)?.let { k -> k != "load_more" } == true }
                                 ?.key?.let { pendingAnchorKey = it as? String }
                             onLoadMore()
                         },
@@ -1343,41 +1360,10 @@ private fun SmsConversationView(
     // 发完短信重拉对话也会再盖一次。首屏改由列表内的骨架 item 表达，遮罩没有存在意义。
 }
 
-/**
- * 进入对话时的首屏骨架：交替左右的气泡占位块。
- *
- * 为什么不用公共的 [UfiSkeletonList]：那支是"左圆图标 + 两行文字"的**列表行**版式，
- * 对话页真实内容是左右交替的气泡，形状差太多，数据到位时会有一次明显的形态跳变。
- * 这里用同一支公共构件 [UfiSkeletonBlock]（共用 shimmer）拼出气泡轮廓，
- * 高度/圆角贴近真实气泡，落位时只是"灰块变成文字"。
- *
- * 宽度刻意不等：真实对话就是长短交错，等宽会像一堵灰墙而不是一段聊天。
- */
-@Composable
-private fun ConversationEntrySkeleton() {
-    Column(
-        modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        CONVERSATION_SKELETON_WIDTHS.forEachIndexed { index, fraction ->
-            // 偶数行当作"收到"（左），奇数行当作"发出"（右）
-            val received = index % 2 == 0
-            Box(
-                modifier = Modifier.fillMaxWidth(),
-                contentAlignment = if (received) Alignment.CenterStart else Alignment.CenterEnd
-            ) {
-                UfiSkeletonBlock(
-                    modifier = Modifier.fillMaxWidth(fraction),
-                    height = 44.dp,
-                    cornerRadius = 18.dp
-                )
-            }
-        }
-    }
-}
-
-/** 对话骨架的 6 行气泡宽度占比（长短交错，见 [ConversationEntrySkeleton]）。 */
-private val CONVERSATION_SKELETON_WIDTHS = listOf(0.62f, 0.45f, 0.70f, 0.50f, 0.58f, 0.40f)
+// 2026-10-14（用户要求）：`ConversationEntrySkeleton()` 与它的 `CONVERSATION_SKELETON_WIDTHS`
+// 已**整体删除**。它是"6 行交替气泡占位 + shimmer"的进入动画，而用户明确不要加载动画：
+// 进入对话只需要懒加载 —— 数据到位直接铺出来即可。删除理由与副作用见对话页 LazyColumn 里
+// 那处调用的注释（骨架的固定 44dp 高度与真实气泡高度并不相等，数据到达那一下是可见的跳动）。
 
 /**
  * 「首屏是否还没出过结果」闩锁：返回 true = 该画骨架；false = 已经落地过一次，永久不再画。

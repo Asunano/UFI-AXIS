@@ -23,6 +23,10 @@ import com.ufi_axis.ui.theme.UfiTextStyles
  *
  * 用于编辑 TOML / YAML / 脚本等纯文本配置，取色与圆角统一走 [LocalResolvedPalette] +
  * [UfiCardDefaults]，业务页不要再自绘 Card + OutlinedTextField 组合。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 [UfiSettingsRowCard] /
+ * [UfiSettingsGroup] 对齐；**调用方不要再补水平 padding**，那会叠成 32dp 的双重内距。
+ * 卡内 `footer` 槽里的内容（如 [UfiButtonRow]）由卡自己的内距负责，不要在那里再补。
  */
 @Composable
 fun UfiCodeEditorCard(
@@ -40,7 +44,7 @@ fun UfiCodeEditorCard(
 ) {
     val palette = LocalResolvedPalette.current
     Surface(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().padding(horizontal = Spacing.CardHorizontalMargin),
         shape = UfiCardDefaults.shape,
         color = palette.cardBg,
         border = BorderStroke(1.dp, palette.cardBorder)

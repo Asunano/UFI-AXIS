@@ -278,9 +278,34 @@ fun UfiPopupMenu(
     // 仅当完全不可见（visible 与退出动画期间的 internalVisible 均为假）才卸载 Popup
     if (!visible && !internalVisible) return
 
+    /*
+     * 淡出期间**冻结锚点**（2026-10-21）。
+     *
+     * 调用方普遍写成 `visible = target != null`：点空白处关闭时，`target = null` 与
+     * `visible = false` 发生在同一次重组里，于是 `anchorBounds` 变成 `IntRect.Zero`、
+     * `anchorPoint` 变成 null —— [UfiMenuPositionProvider] 被重建，淡出的那 90ms 里
+     * 菜单改用「父节点 bounds」重新定位，实际观感就是「菜单往上闪一下就消失」
+     * （用户报的视频长按菜单抖动）。
+     *
+     * 这里记住最后一次 `visible` 时的锚点，淡出期间继续用它。打开的第一帧 alpha 还是 0，
+     * 所以即使这一帧用的是上一轮记下的锚点也看不出来。
+     */
+    var frozenAnchorBounds by remember { mutableStateOf(anchorBounds) }
+    var frozenAnchorPoint by remember { mutableStateOf(anchorPoint) }
+    LaunchedEffect(visible, anchorBounds, anchorPoint) {
+        if (visible) {
+            frozenAnchorBounds = anchorBounds
+            frozenAnchorPoint = anchorPoint
+        }
+    }
+
+    // 打开中一律用**当下**的锚点（改锚点要立刻生效），只有淡出那一段才回落到冻结值。
+    val shownAnchorBounds = if (visible) anchorBounds else frozenAnchorBounds
+    val shownAnchorPoint = if (visible) anchorPoint else frozenAnchorPoint
+
     val screenMarginPx = with(density) { 8.dp.roundToPx() }
-    val positionProvider = remember(anchorBounds, anchorPoint, screenMarginPx) {
-        UfiMenuPositionProvider(anchorBounds, anchorPoint, screenMarginPx)
+    val positionProvider = remember(shownAnchorBounds, shownAnchorPoint, screenMarginPx) {
+        UfiMenuPositionProvider(shownAnchorBounds, shownAnchorPoint, screenMarginPx)
     }
 
     Popup(

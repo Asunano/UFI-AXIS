@@ -1,5 +1,10 @@
 package com.ufi_axis.ui.screens.filemanager
 
+import com.ufi_axis.ui.components.common.UfiButton
+import com.ufi_axis.ui.components.common.UfiButtonSize
+import com.ufi_axis.ui.components.common.UfiButtonVariant
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -79,7 +84,6 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Archive
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.InstallMobile
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.automirrored.filled.Launch
 import androidx.navigation.NavHostController
@@ -290,7 +294,7 @@ fun FileManagerRoot(
         when (action) {
             "open" -> resolveOpenRoute(f)
             "edit" -> navController.navigate("file/editor?path=" + URLEncoder.encode(f.path, "UTF-8"))
-            "download" -> viewModel.downloadFileToPhone(f.path, f.name)
+            "download" -> viewModel.downloadFileToPhone(f.path, f.name, source = "file")
             "info" -> { infoTarget = f; showInfo = true }
             "copy" -> { viewModel.copyToClipboard(f.path, isCut = false) }
             "cut" -> { viewModel.copyToClipboard(f.path, isCut = true) }
@@ -699,8 +703,19 @@ fun FileManagerRoot(
                                 }
                             ))
                         }
-                        add(UfiPopupOption("refresh", "刷新", icon = Icons.Default.Refresh, onClick = { viewModel.refreshFileList() }))
-                        add(UfiPopupOption("storage", "存储权限", icon = Icons.Filled.Storage, onClick = { viewModel.checkStorageAccess() }))
+                        /*
+                         * 「刷新」也删掉了（2026-10-21 用户要求）：这一层本来就没有"手动刷新"的语义 ——
+                         * 进目录、返回上一级、上传/删除后都会自己重载；而它之前还因为没传 force
+                         * 命中 TTL 缓存，点了等于没点。真正的"重新拉一次"留给错误横幅上的「重试」，
+                         * 那里语义明确（失败了才需要重来）。
+                         */
+                        /*
+                         * 「存储权限」这一项已删除（2026-10-21 用户要求）：
+                         * 它只是个"再查一次"的入口，查到没有权限时弹出的引导框本来就由
+                         * `checkStorageAccess()` 自动挂载（进页/回到前台各一次）；
+                         * 放在「更多」里既不常用，又把三个高频动作挤在一列。
+                         * 权限的**状态展示**留给设置页（待建），那里才是"看状态/去授权"的地方。
+                         */
                     }
                 )
                 }
@@ -772,12 +787,38 @@ fun FileManagerRoot(
                     state.isLoading && state.files.isEmpty() && state.searchResults == null -> {
                         FileLoadingState(modifier = Modifier.weight(1f))
                     }
-                    errorMessage != null -> {
-                        FileErrorState(
-                            message = errorMessage,
-                            onRetry = { viewModel.loadFileList(state.currentPath) },
-                            modifier = Modifier.weight(1f)
-                        )
+                    /*
+                     * 错误页**不能吃掉「选存储」那一层**（2026-10-21 修复"进不去也退不出"）。
+                     *
+                     * 点一个连不上的远端源时，`currentPath` **不会变**（它只在成功时更新），
+                     * 所以 `isVirtualRoot` 仍是 true；而错误分支原来排在虚拟根分支之前，
+                     * 会把整张源列表换成错误页 —— 那一层又恰好不渲染工具栏、也不拦截返回键
+                     * （`canBack` 要求 currentPath 非空），于是用户既看不到源列表、也没有返回，
+                     * 只能退出整个文件管理器。现在多了 `&& !isVirtualRoot`：那一层照常列源，
+                     * 错误以顶部一条提示呈现（见下面 LazyColumn 的 landing-error item）。
+                     */
+                    errorMessage != null && !isVirtualRoot -> {
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            FileErrorState(
+                                message = errorMessage,
+                                onRetry = { viewModel.refreshFileList() },
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (hasVirtualRoot) {
+                                // 连不上某个源之后，"回到存储列表"永远得有个出口
+                                UfiButton(
+                                    text = "返回存储列表",
+                                    onClick = { viewModel.navigateToRoot() },
+                                    variant = UfiButtonVariant.Secondary,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(
+                                            horizontal = Spacing.CardHorizontalMargin,
+                                            vertical = 8.dp
+                                        )
+                                )
+                            }
+                        }
                     }
                     else -> {
                         // 虚拟根（多卷 landing）：展示存储卷列表。
@@ -873,6 +914,35 @@ fun FileManagerRoot(
                                 ),
                                 verticalArrangement = Arrangement.spacedBy(Spacing.CardBottomMargin)
                             ) {
+                                /*
+                                 * 顶部错误条（2026-10-21）：刚刚点过的源连不上时，列表照常在下面，
+                                 * 这里只说清"哪个请求失败了"并给一个重试。重试走 `refreshFileList()`，
+                                 * 它会优先重试 `lastFailedPath`（就是这次失败的那条），而不是当前目录。
+                                 */
+                                if (errorMessage != null) {
+                                    item(key = "landing-error") {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .ufiStandardCard()
+                                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                                        ) {
+                                            Text(
+                                                text = errorMessage,
+                                                style = UfiTextStyles.note,
+                                                color = palette.error
+                                            )
+                                            Spacer(Modifier.height(8.dp))
+                                            UfiButton(
+                                                text = "重试",
+                                                onClick = { viewModel.refreshFileList() },
+                                                variant = UfiButtonVariant.Subtle,
+                                                size = UfiButtonSize.Small
+                                            )
+                                        }
+                                    }
+                                }
+
                                 items(state.storageVolumes, key = { it.mountPath }) { vol ->
                                     StorageRow(
                                         // SD 卡与内部存储给不同图标：同一个盘符图标重复三次

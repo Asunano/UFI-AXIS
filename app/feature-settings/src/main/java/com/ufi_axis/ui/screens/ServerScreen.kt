@@ -29,7 +29,7 @@ import com.ufi_axis.viewmodel.MainViewModel
  *
  * 2026-09 增加「切换设备 / 退出」：
  * - token 与本机 Keystore 绑定，换另一台 Core **不能**只改 IP，必须清凭据重新配对；
- * - 本入口显式调用 [onRepairRequested]（MainActivity：清 token + reset 密钥 + 回 SetupScreen）。
+ * - 本入口显式调用 [onRepairRequested]，由 MainActivity 弹**一个**两步确认弹窗（警告 → 密码），\n *   避免"这一页一个确认 + 那边又一个密码弹窗"两个窗口叠在一起（2026-10-22）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -42,7 +42,7 @@ fun ServerScreen(
     val context = LocalContext.current
     val prefs = remember { AppPreferences(context) }
     val palette = LocalResolvedPalette.current
-    var showSwitchConfirm by remember { mutableStateOf(false) }
+
     var displayEndpoint by remember { mutableStateOf("${prefs.serverIp}:${prefs.serverPort}") }
 
     UfiScreenScaffold(title = "服务器", navController = navController, showBack = true) { padding ->
@@ -51,12 +51,13 @@ fun ServerScreen(
                 Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                // 入口 1：服务器配置（连接地址 / 设备后台 / Web 面板）
+                // 入口 1：服务器配置（连接地址 / 设备后台 / 配对密码）
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Router,
                         title = "服务器配置",
-                        description = "连接地址 · 设备后台 · Web 面板",
+                        // 2026-10-24：Web 面板已迁到资源中心，入口描述里不再列它。
+                        description = "连接地址 · 设备后台",
                         onClick = { navController.navigate(Routes.DETAIL_SERVER_CONFIG) },
                         trailing = { UfiSettingsChevron() }
                     )
@@ -73,12 +74,19 @@ fun ServerScreen(
                     )
                 }
 
-                // 入口 3：配对与访问
+                // 入口 3：安全中心（2026-10-15 由「配对与访问」升级而来）
+                //
+                // 为什么改名而不是新开一页：这一页本来就已经装着准入相关的东西
+                //（配对信息 / 已配对设备 / 数量限制 / 解除全部配对），
+                // 这一轮又加了黑名单、批准策略与它的通知渠道 —— 内容早就不止"配对与访问"。
+                // 再开一页只会把同一件事拆到两处，用户得猜哪个在哪。
+                // 2026-10-24：配对密码的修改入口已移到「服务器配置 → 连接配置」，
+                // 描述里不再列它；本页只剩配对密码作为破坏性操作的门禁。
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Smartphone,
-                        title = "配对与访问",
-                        description = "已配对设备 · 配对密码 · 数量限制",
+                        title = "安全中心",
+                        description = "配对设备 · 黑名单 · 批准",
                         onClick = { navController.navigate(Routes.DETAIL_PAIRING) },
                         trailing = { UfiSettingsChevron() }
                     )
@@ -90,8 +98,8 @@ fun ServerScreen(
                         icon = Icons.Default.Logout,
                         iconTint = palette.error,
                         title = "切换设备 / 退出",
-                        description = "当前 $displayEndpoint · 清除本机凭据后重新配对",
-                        onClick = { showSwitchConfirm = true },
+                        description = "当前 $displayEndpoint · 只解除本机配对，不影响其他设备",
+                        onClick = { onRepairRequested() },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -100,24 +108,5 @@ fun ServerScreen(
             }
         }
 
-        if (showSwitchConfirm) {
-            UfiConfirmDialog(
-                visible = true,
-                title = "切换设备 / 退出",
-                text = "将清除本机保存的连接凭据与设备身份密钥，并回到配对引导页。\n\n" +
-                    "· 换到另一台 Core：需重新输入配对密码\n" +
-                    "· 仍连当前设备：重新配对即可，服务端配对记录不会自动删除\n" +
-                    "· 本机缓存的仪表盘数据会一并清空",
-                confirmText = "退出并重新配对",
-                dismissText = "取消",
-                destructive = true,
-                onDismiss = { showSwitchConfirm = false },
-                onConfirm = {
-                    showSwitchConfirm = false
-                    displayEndpoint = ""
-                    onRepairRequested()
-                }
-            )
-        }
     }
 }

@@ -10,6 +10,7 @@ import androidx.compose.material3.*
 import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableFloatStateOf
@@ -24,6 +25,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntRect
@@ -38,6 +40,7 @@ import androidx.compose.runtime.setValue
 import kotlinx.coroutines.delay
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.theme.UfiTextStyles
 
 // ══════════════════════════════════════════════════════════════
 // 弹窗内容统一外壳
@@ -82,32 +85,73 @@ fun UfiDialogBody(content: @Composable ColumnScope.() -> Unit) {
 // ══════════════════════════════════════════════════════════════
 
 /**
- * 统一的「标签 + 控件」纵向块。
+ * 字段标签的样式（两个排布共用，用户 2026-10-15："标题字体放大一点""要全局生效，不能单改一处"）。
  *
- * 标签使用 `labelSmall` + `textSecondary`（低调、非粗体非 accent）；
- * 标签与控件间距 4dp（`Spacing.Small`）。
+ * `bodyMedium`（14sp）：比原来的 `labelSmall`（11sp）/ `labelMedium`（12sp）大一档，
+ * 但不追平设置页入口行标题（`listItemTitle` = bodyLarge 16sp）—— 用户看过 16sp 之后定稿 14sp。
+ * 两种排布共用这一个来源，不会一处大一处小。
+ */
+private val UfiDialogFieldLabelStyle: TextStyle
+    @Composable get() = MaterialTheme.typography.bodyMedium
+
+/** 同行排布里标签最多占这一行的比例（2026-10-14）。见 [UfiDialogField] 的说明。 */
+private const val UfiDialogLabelMaxFraction = 0.45f
+
+/**
+ * 统一的「标签 + 控件」字段块。两种排布由 [inline] 选，**判据是控件形态，不是风格偏好**：
  *
- * 当内置快捷组件（如 UfiDialogTextField）不够用时，用此原语包裹任意控件。
+ * - `inline = false`（默认）：**标签独占一行、控件下一行占满整行** —— 给"宽控件"。
+ *   文本输入框挤在标签右边只剩半行宽（2026-10-14 试过），打字时连 SSID 都看不全。
+ * - `inline = true`：**标签在左、控件在右（贴右边缘）** —— 给"紧凑控件"。
+ *   下拉框只有 100dp 上下、开关只有 42dp，跟标签同行才不会白占一整行。
+ *
+ * 用户 2026-10-15 的定稿就是这两条并存：输入框走纵向、下拉框走同行。
+ * 两种排布都在**本组件**里，调用点只传 [inline] —— 这样全局一致，不会某个弹窗自己写一套。
+ *
+ * ⚠ 与 [UfiDialogSwitchField] 的关系：开关行仍是"标签左、开关右"（等价于本组件的 inline 排布），
+ * 只是它自带 [UfiSwitch]，调用点不用自己拼。
  */
 @Composable
-fun UfiDialogField(label: String, content: @Composable () -> Unit) {
+fun UfiDialogField(
+    label: String,
+    inline: Boolean = false,
+    content: @Composable () -> Unit
+) {
     val palette = LocalResolvedPalette.current
-    // 「标签: 控件」同行布局（2026-10-10 用户裁决）：原为 Column 上标题下内容 ——
-    // labelSmall 小字吊在左上角、控件独占一行又大又空，观感差。改为 Row：
-    // label 用 bodyMedium 正常字号垂直居中在左，内容 weight(1f) 吃剩余宽度。
-    // 长标签 weight(0.35f) 限宽防挤压控件（如「可用占位符（点一下插到光标处）」）。
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textSecondary,
-            modifier = Modifier.weight(0.35f, fill = false)
-        )
-        Box(Modifier.weight(1f)) { content() }
+    if (inline) {
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            val labelMax = maxWidth * UfiDialogLabelMaxFraction
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+            ) {
+                Text(
+                    text = label,
+                    style = UfiDialogFieldLabelStyle,
+                    color = palette.textSecondary,
+                    modifier = Modifier.widthIn(max = labelMax)
+                )
+                // 控件**贴右**：同行排布的全部意义就是"左边标题、右边控件"。
+                // 标签按内容宽度占（不是 weight），所以控件这一格拿到的是真正的剩余宽度，
+                // 它的右边缘永远落在行的右边缘 —— 2026-10-14 用 weight 分宽度时控件停在行中间。
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) {
+                // 2026-10-24：告诉下拉"你在 inline 槽里"，由它自己按内容宽并封顶，
+                // 调用点不必再手写 widthIn。
+                CompositionLocalProvider(LocalUfiDropdownInline provides true) { content() }
+            }
+            }
+        }
+    } else {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Text(
+                text = label,
+                style = UfiDialogFieldLabelStyle,
+                color = palette.textSecondary
+            )
+            Spacer(Modifier.height(Spacing.Small))
+            content()
+        }
     }
 }
 

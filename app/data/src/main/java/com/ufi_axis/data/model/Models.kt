@@ -224,6 +224,66 @@ data class TrafficUsageBucket(
 )
 
 /**
+ * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`，2026-10-06 拍板第4项）。
+ *
+ * ## 与 [TrafficUsageResponse] 的边界（两者都在 `/api/traffic` 下，不要混用）
+ * - [TrafficUsageResponse] 是**给图表用的分桶序列**：桶粒度随 `range` 变（日=小时、年=月），
+ *   由 core 的 `resolveTrafficUsageWindow` 定窗口，带 `prev_anchor` / `next_anchor` 供左右翻页；
+ * - 本端点是**给"报表"用的按自然日聚合**：永远是日桶（日报 1 行、周报 7 行、月报 28~31 行），
+ *   外加一句 core 生成的人话摘要，没有翻页锚点。
+ *
+ * 数据源同为 `traffic_hourly`，但出桶口径、行数与消费场景都不同，所以 core 侧是两个端点，
+ * app 侧也就保持两个 DTO —— 合并成一个只会让两边各长一半用不上的字段。
+ *
+ * ## 单位与形状（2026-10-14 读 core 源码确认，勿猜）
+ * - [range_start] / [range_end] / [TrafficReportDay.day_start] 都是 **epoch 毫秒**：
+ *   `TrafficReportGenerator.dayStartOf/weekStartOf/monthStartOf` 全部用 `Calendar.timeInMillis`
+ *   产出，`TrafficRoutes` 的 `get("/report")` 把这些 Long 原样放进 JSON。
+ * - [range_end] 是**排他**的（= 下一段的起点：日报 = 明天 0 点，周报 = 下周一 0 点，
+ *   月报 = 下月 1 日 0 点），所以"今天 / 本周 / 本月"天然都是**尚未走完的一段**。
+ * - [summary] 是 **String 而不是对象**：core 的 `TrafficReportGenerator.summarize()` 返回
+ *   `summarizeLine()` 拼好的整句（例："本周流量 12.3 GB（↓11.0 GB ↑1.3 GB），日均 1.8 GB，最高周六 4.1 GB"）。
+ *   app **原样显示**，不拆字段、不重算日均 —— 两端各拼一份必然分叉，而它正是用户看到的那句话。
+ * - [TrafficReportDay.day_label] 是 core 用 `SimpleDateFormat("MM-dd", Locale.CHINA)` 格式化好的
+ *   （见 `TrafficRoutes` 的 `fmt`），**直接显示**；不要自己格式化 `day_start` ——
+ *   时区口径统一在 core（`TimeZone.getDefault()`，与 web 流量页同一份）。
+ *
+ * 字段名与 JSON 逐字对应（snake_case），不做 `@SerialName` 重命名；全部带默认值，
+ * 老 core 少回一个键不该让整页解析失败（`AppJson` 是 lenient + ignoreUnknownKeys，
+ * 但缺字段在无默认值时仍会抛 `MissingFieldException`）。
+ */
+@Serializable
+data class TrafficReportResponse(
+    /** core 的固定成功位（本端点失败时走统一失败信封，不是靠它判断）。 */
+    val ok: Boolean = true,
+    /** 回显的统计周期：`day` / `week` / `month`。 */
+    val period: String = "week",
+    /** 区间起点（epoch ms，设备本地时区当日 0 点）。 */
+    val range_start: Long = 0,
+    /** 区间终点（epoch ms，**排他**：下一段的起点）。 */
+    val range_end: Long = 0,
+    val rx_bytes: Long = 0,
+    val tx_bytes: Long = 0,
+    val total_bytes: Long = 0,
+    /** core 生成的一句话摘要，直接显示。 */
+    val summary: String = "",
+    /** 逐日明细：**完整覆盖区间每一天**（没有记录的那天是三个 0，不是缺行）。 */
+    val days: List<TrafficReportDay> = emptyList()
+)
+
+/** [TrafficReportResponse] 的单日桶（core `TrafficReportGenerator.DayBucket`）。 */
+@Serializable
+data class TrafficReportDay(
+    /** 该自然日 0 点（epoch ms，设备本地时区）。 */
+    val day_start: Long = 0,
+    /** core 格式化好的 `MM-dd` 标签，直接显示。 */
+    val day_label: String = "",
+    val rx_bytes: Long = 0,
+    val tx_bytes: Long = 0,
+    val total_bytes: Long = 0
+)
+
+/**
  * 流量限额配置（`GET /api/device/traffic-limit`）。
  *
  * core 已经把设备侧的复合串（`"470_1024"` = 470 GB）拆成 [limit_value] +
@@ -738,6 +798,26 @@ data class ShellExecResponse(
     val success: Boolean
 )
 
+/**
+ * 单个系统属性（`GET /api/shell/prop/{key}`，2026-10-14 接入）。
+ *
+ * ## 为什么单独一条端点，而不是 `POST /api/shell/exec` 拼 `getprop <key>`
+ * 1. **校验责任在 core**：本端点的 key 由 core 用 `PROP_KEY_PATTERN`（只许 `[a-zA-Z0-9._]`）
+ *    白名单校验，非法直接回 400（见 `ShellRoutes` 的 `get("/prop/{key}")`）。走 exec 是把
+ *    一整条命令交给 shell，转义/注入由**调用方**负责 —— 每个调用点都得自己保证拼对了。
+ * 2. **不污染终端历史**：exec 每次执行都会由 `ConsoleHistoryRecorder` 在设备端落一行记录
+ *    （那是给用户查"我发过什么命令"用的）。读几个只读属性不该在用户的历史里留痕。
+ *
+ * ## 形状
+ * [value] 是 `getprop <key>` 的**原始 stdout**，**含结尾换行** —— 展示前必须 `trim()`。
+ * 属性不存在时是空串（core 不回 404）；只有 key 非法才回 400。
+ */
+@Serializable
+data class ShellPropResponse(
+    val key: String = "",
+    val value: String = ""
+)
+
 // ========== 终端命令历史（core 存，app / web 共享同一份） ==========
 
 /**
@@ -961,6 +1041,10 @@ data class ServiceStatusResponse(
  *
  * `timestamp` 是去重键：app 把它与 `AppPreferences.coreCrashShownAt` 比对，不同才弹窗。
  * 老 core 没有这个端点（404）→ 调用方按"没崩溃"处理即可。
+ *
+ * 2026-10-23：新增 [ageMs] / [recent]。`crashed` 只说明"历史上崩过"，三个月前的记录
+ * 也会一直是 true；真正的"值不值得在启动时提示"由 core 用**同一时钟**算出的 [recent]
+ * 决定（窗口见 `ServiceRoutes.CRASH_NOTICE_WINDOW_MS`），判定收敛在 `CoreCrashPolicy`。
  */
 @Serializable
 data class CoreCrashResponse(
@@ -970,7 +1054,21 @@ data class CoreCrashResponse(
     val summary: String = "",
     /** 崩溃详情文件在设备上的绝对路径（提示用户去哪找，app 不直接读）。 */
     val file: String = "",
-    @SerialName("uptime_ms") val uptimeMs: Long = 0L
+    @SerialName("uptime_ms") val uptimeMs: Long = 0L,
+    /**
+     * 崩溃年龄（毫秒，core 用自己这台设备的时钟计算）。
+     *
+     * `-1` = 从未崩溃 / 老 core 未提供。**不要**在客户端用 `now - timestamp` 代替：
+     * 手机与设备时钟漂移 >5min 在本仓是真实发生过的，会把"刚崩"误判成"很久以前"。
+     */
+    @SerialName("age_ms") val ageMs: Long = -1L,
+    /**
+     * core 判定这次崩溃是否还在启动提示窗口内（7 天）。
+     *
+     * 默认 **true** 是为了向后兼容：老 core 不带这个字段，升级 App 后行为保持不变
+     * （否则所有崩溃提示会被静默吞掉）。新 core 一定显式下发。
+     */
+    val recent: Boolean = true
 )
 
 /** `POST /api/service/restart` 的返回体（服务会在约 10 秒后自动恢复）。 */
@@ -1024,6 +1122,16 @@ data class SimSwitchResponse(
 data class AppConfig(
     val port: Int,
     val auto_start_on_boot: Boolean,
+    /**
+     * 跨设备的已读水位（2026-10-19）。
+     *
+     * 验证码「通知」页签与「已拦截」角标原来只在 App 本地记水位，换设备后归零 ⇒
+     * 把所有历史记录都算未读（角标显示成总数）。现在真源在 core：
+     * 客户端标记已读时 `PUT /api/config` 写回，另一台设备 `GET /api/config` 读取。
+     * null = 老 core 没给这个字段，别动本地镜像。
+     */
+    val sms_code_seen_msg_id: Long? = null,
+    val sms_blocked_seen_msg_id: Long? = null,
     val goform_ip: String = "192.168.0.1",
     val goform_port: Int = 8080,
     val goform_password: String = "admin",

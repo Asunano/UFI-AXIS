@@ -43,4 +43,17 @@ class DispatchDebounceTest {
     fun `未知 key 落 other 组不被丢弃`() {
         assertEquals("other", groupOf("unknown:key"))
     }
+
+    /**
+     * 2026-10-21：`pairing:approvals` **不该**归进任何分组。
+     *
+     * 实现里它在 [MainViewModel.dispatchChanged] 的分组**之前**就短路了（直接
+     * `loadApprovalsFromPush()`），所以它根本走不到 `groupOf`。这条断言的意义是把这件事写死：
+     * 一旦有人给它加了分组、"顺手"让它走 800ms 尾沿去抖，弹窗就白等 800ms，
+     * 而 core 一轮补发的 4 帧会被合并成 1 次 —— 功能看起来还在，只是又变慢了。
+     */
+    @Test
+    fun `配对待批准不参与去抖分组（实现里已短路）`() {
+        assertEquals("other", groupOf("pairing:approvals"))
+    }
 }

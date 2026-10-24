@@ -93,5 +93,23 @@ internal val SERVICE_INDEPENDENT_ROUTES: Set<String> = setOf(
     Routes.DETAIL_DOWNLOAD_THROTTLE,
     Routes.DETAIL_DOWNLOAD_TRACKER,
     Routes.DETAIL_DOWNLOAD_ADVANCED,
-    Routes.DETAIL_TUNNEL_SETTINGS
+    Routes.DETAIL_TUNNEL_SETTINGS,
+    // 2026-10-14：通用设置拆出的三个子页（组件管理 / 连接与重连 / 日志与路径）。
+    // 漏了它们，停服时这三页会被换成「服务已停止」占位页 —— 而"看护与重连""日志与路径"
+    // 恰恰是 core 没起来时用户要去改 / 去看的地方，且改的是 core 的持久化设置，与后台采集无关。
+    Routes.DETAIL_TUNNEL_SETTINGS_COMPONENTS,
+    Routes.DETAIL_TUNNEL_SETTINGS_RECONNECT,
+    Routes.DETAIL_TUNNEL_SETTINGS_LOG,
+    // 资源中心（2026-10-14）：Web 前端 ZIP / frpc / cloudflared 的收拢页。
+    //
+    // 它取代了上面那条 DETAIL_TUNNEL_SETTINGS_COMPONENTS（组件管理）与服务器配置页里的
+    // 「Web 面板」弹窗，那两处原本就在本名单里/本就在白名单页面上 —— 资源中心**必须**跟着进来，
+    // 否则会开一个很荒唐的口子：用户上传了坏的 Web 产物 → 面板白屏 → 停掉服务想换回来 →
+    // 资源中心被换成「服务已停止」占位页，唯一的恢复通道没了。
+    // 另外组件（frpc / cloudflared）的下载安装走的是 core 的 HTTP 服务，用户"停止服务"后
+    // HTTP 仍在跑，所以停服状态下这一页的取数与安装依然是有意义的。
+    Routes.DETAIL_RESOURCES
 )
+// 注（2026-10-14）：DETAIL_SPONSORS **故意不在**上面这份名单里 ——
+// 它们是赞赏性质的内容页，既不是设置入口也不是排障工具（与 NavScreens 里那条路由自己的
+// 注释同一口径）；停服时被换成占位页不影响任何恢复路径，所以别为了"顺手补齐"把它们加进来。

@@ -104,13 +104,18 @@ fun FrpChannelScreen(viewModel: MainViewModel, navController: NavHostController,
         navController = navController,
         showBack = true
     ) { padding ->
-        UfiPageBackground(
-            modifier = Modifier.padding(padding),
-            contentHPadding = Spacing.PagePadding
-        ) {
+        // 2026-10-13：本页**不再**给 `contentHPadding`（原为 PagePadding = 12dp）。横向留白改由
+        // 组件自带：UfiStatusCard / UfiCodeEditorCard / UfiLogPanel 都已内建
+        // CardHorizontalMargin（16dp）；不在族里的 UfiButtonRow / 裸 UfiButton
+        // 由调用点补同一个值（与 CfTunnelScreen 同做法）。
+        // UfiErrorBanner 例外：它是 Popup，横向位置由 sideMargin 独立算出，**不要**传 padding。
+        // 为什么必须整页一起换：两种口径混排会左右差 4dp（16 vs 12），肉眼可见。
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
+            // 平级卡/面板（状态卡 · 配置编辑器 · 日志面板 · 操作按钮行）之间的间距统一走
+            // Spacing.SettingsCardGap，与设置类页面同档；原来是 Spacing.Large（12dp）。
             Column(
                 modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Large),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
             ) {
                 state.errorMessage?.let { msg -> UfiErrorBanner(message = msg) }
 
@@ -180,7 +185,7 @@ fun FrpChannelScreen(viewModel: MainViewModel, navController: NavHostController,
                     emptyHint = "（暂无日志，启动后将显示 frpc 输出）"
                 )
 
-                UfiButtonRow {
+                UfiButtonRow(modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)) {
                     UfiButton(
                         text = "启动",
                         onClick = {
@@ -204,7 +209,12 @@ fun FrpChannelScreen(viewModel: MainViewModel, navController: NavHostController,
                     )
                 }
 
-                UfiButton(variant = UfiButtonVariant.Danger, text = "删除该隧道", onClick = { showDeleteConfirm = true })
+                UfiButton(
+                    variant = UfiButtonVariant.Danger,
+                    text = "删除该隧道",
+                    onClick = { showDeleteConfirm = true },
+                    modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                )
 
                 Spacer(Modifier.height(Spacing.Medium))
             }

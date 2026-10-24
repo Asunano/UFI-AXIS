@@ -121,6 +121,8 @@ fun SmsBlockedScreen(viewModel: MainViewModel, navController: NavHostController)
 
     var pendingDeleteLog by remember { mutableStateOf<SmsBlockedLog?>(null) }
     var pendingDisableLog by remember { mutableStateOf<SmsBlockedLog?>(null) }
+    // 2026-10-19：点击整行 → 详情弹窗（此前行内只有两个图标按钮，看不到正文与命中规则全貌）。
+    var detailLog by remember { mutableStateOf<SmsBlockedLog?>(null) }
     var showClearConfirm by remember { mutableStateOf(false) }
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
 
@@ -194,6 +196,8 @@ fun SmsBlockedScreen(viewModel: MainViewModel, navController: NavHostController)
                                 title = log.sender.ifBlank { "未知号码" },
                                 description = blockedDescription(log, ruleAlive),
                                 icon = Icons.Default.Block,
+                                // 2026-10-19：整行可点 → 打开详情弹窗（正文、命中规则、拦截路径全貌）。
+                                onClick = { detailLog = log },
                                 // 说明是三行（时间/路径、正文预览、命中规则），显式给上限：
                                 // 默认不限行数，遇到长 snippet 会把一行卡片撑成半屏。
                                 descriptionMaxLines = BLOCKED_DESCRIPTION_MAX_LINES,
@@ -253,6 +257,38 @@ fun SmsBlockedScreen(viewModel: MainViewModel, navController: NavHostController)
                     hint = "规则命中后这里会记下发件人与正文预览"
                 )
             }
+        }
+
+        // ── 详情（2026-10-19）──
+        detailLog?.let { log ->
+            UfiAlertDialog(
+                visible = true,
+                title = log.sender.ifBlank { "未知号码" },
+                text = buildString {
+                    append("时间：")
+                    append(FormatUtils.formatRelativeTime(log.blockedAt))
+                    append('\n')
+                    append("命中规则：")
+                    append(log.rulePattern.ifBlank { "—" })
+                    append('\n')
+                    append("范围 · 匹配：")
+                    append(scopeLabel(log.ruleScope))
+                    append(" · ")
+                    append(matchLabel(log.ruleMatch))
+                    append('\n')
+                    append("拦截路径：")
+                    append(blockedPathLabel(log.blockedPath))
+                    append('\n')
+                    append("正文：")
+                    append(
+                        log.body.ifBlank { log.snippet }
+                            .ifBlank { "（未保存正文；可在短信设置里打开「保存拦截全文」）" }
+                    )
+                },
+                confirmText = "关闭",
+                onConfirm = { detailLog = null },
+                onDismiss = { detailLog = null }
+            )
         }
 
         // ── 「不再按此规则拦截」= 把命中的那条规则 enabled 置 false ──

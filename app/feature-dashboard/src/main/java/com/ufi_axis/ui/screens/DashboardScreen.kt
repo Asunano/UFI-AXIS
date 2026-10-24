@@ -173,6 +173,8 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
 
     // ── 左列「本月流量」→ 限额设置弹窗 ──
     var showLimitDialog by remember { mutableStateOf(false) }
+    // 2026-10-24：hero 卡「本月流量」改为打开「流量历史」弹窗（与工具-流量管理同一组件）。
+    var showTrafficHistory by remember { mutableStateOf(false) }
     val trafficCfg = trafficMgmt.limitConfig
 
     // ⚠ 这段值域清洗与 TrafficManagementScreen 里的是**同一段**，必须留在页面侧：
@@ -274,12 +276,7 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                 // 组件与写法照抄流量管理页：错误用 UfiErrorBanner（它是 Popup，浮在窗口顶部、
                 // 不占布局），成功用 UfiSettingsGroup 里一行 accent 小字。2s 后由上面那个
                 // LaunchedEffect 清除。只在本页发起过保存时才有值（见 trafficSavePending 的说明）。
-                trafficSaveError?.let { err ->
-                    UfiErrorBanner(
-                        message = err,
-                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
-                    )
-                }
+                trafficSaveError?.let { err -> UfiErrorBanner(message = err) }
                 trafficSaveSuccess?.let { msg ->
                     UfiSettingsGroup {
                         Text(msg, color = palette.accent, style = MaterialTheme.typography.bodyMedium)
@@ -306,7 +303,7 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
                     realtimeStatus = realtimeStatusMessage,
                     modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin),
                     // 行2 双主角的两个联动入口（弹窗本体挂在本 composable 末尾）
-                    onTrafficClick = { showLimitDialog = true },
+                    onTrafficClick = { showTrafficHistory = true },
                     onClientsClick = { showOnlineDevices = true }
                 )
 
@@ -345,6 +342,12 @@ fun DashboardScreen(viewModel: MainViewModel, navController: NavHostController) 
 
     // ① 左列「本月流量」→ 限额设置。与「工具 → 流量管理」用的是**同一个**组件
     //    [UfiDataLimitDialog]；这里只做 cfg → 纯值入参的映射（第二份映射，UI 不重复）。
+    TrafficHistoryDialog(
+        visible = showTrafficHistory,
+        viewModel = viewModel,
+        onDismiss = { showTrafficHistory = false }
+    )
+
     UfiDataLimitDialog(
         visible = showLimitDialog,
         limitSize = inRange(trafficCfg?.limit_value, 1..999999) ?: "100",

@@ -400,8 +400,16 @@ fun UfiGalleryScreen(navController: NavHostController) {
                     }
                 }
 
-                GallerySection("卡片 · 5 个入口") {
-                    Text("UfiEntryCard（横向入口）", style = UfiTextStyles.note, color = palette.textSecondary)
+                // 2026-10-13：本节里的 UfiEntryCard / UfiGridCard / UfiStatusCard 现在都自带
+                // CardHorizontalMargin，所以本节不再补 contentInset（否则 16+16=32dp）；
+                // 三行说明文字是裸 Text，没有自带外边距，由本文件自己补同一个值保持对齐。
+                GallerySection("卡片 · 5 个入口", contentInset = false) {
+                    Text(
+                        "UfiEntryCard（横向入口）",
+                        style = UfiTextStyles.note,
+                        color = palette.textSecondary,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                    )
                     UfiEntryCard(
                         title = "入口卡片",
                         subtitle = "带副标题、徽标与右箭头",
@@ -419,7 +427,12 @@ fun UfiGalleryScreen(navController: NavHostController) {
                     )
 
                     Spacer(Modifier.height(Spacing.Large))
-                    Text("UfiGridCard（网格入口，图标居中）", style = UfiTextStyles.note, color = palette.textSecondary)
+                    Text(
+                        "UfiGridCard（网格入口，图标居中）",
+                        style = UfiTextStyles.note,
+                        color = palette.textSecondary,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
                         UfiGridCard(
                             modifier = Modifier.weight(1f),
@@ -438,7 +451,12 @@ fun UfiGalleryScreen(navController: NavHostController) {
                     }
 
                     Spacer(Modifier.height(Spacing.Large))
-                    Text("UfiStatusCard（一行式状态）", style = UfiTextStyles.note, color = palette.textSecondary)
+                    Text(
+                        "UfiStatusCard（一行式状态）",
+                        style = UfiTextStyles.note,
+                        color = palette.textSecondary,
+                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)
+                    )
                     UfiStatusCard(title = "服务状态", statusText = "运行中", statusType = UfiBadgeType.SUCCESS)
                     Spacer(Modifier.height(Spacing.Small))
                     UfiStatusCard(
@@ -720,12 +738,16 @@ private fun GalleryPreviewTheme(
 /**
  * 画廊分区：标题 + 内容块，统一间距。
  *
- * 关于横向内距（2026-09-03 修）：全站约定是**页面容器横向内距 0**，由组件自己决定缩进
- * （见 `UfiBackground.kt` 的说明）。实测只有 [UfiSettingsGroup] / [UfiSettingsRowCard] 自带
- * `Spacing.CardHorizontalMargin`；[UfiEntryCard] / [UfiGridCard] / [UfiStatusCard] 与所有裸组件
- * 都不带，需要调用方补。所以：
- * - [contentInset] = true（默认）：给内容补 `CardHorizontalMargin`，与自带内距的卡片视觉对齐；
- * - [contentInset] = false：内容里放的是 Group / RowCard，它们自己已经缩进过，不能再补，否则双重内距。
+ * 关于横向内距（2026-09-03 建、2026-10-13 补完）：全站约定是**页面容器横向内距 0**，由组件
+ * 自己决定缩进（见 `UfiBackground.kt` 的说明）。2026-10-13 之前只有 [UfiSettingsGroup] /
+ * [UfiSettingsRowCard] 自带 `Spacing.CardHorizontalMargin`，[UfiEntryCard] / [UfiGridCard] /
+ * [UfiStatusCard] 与所有裸组件都不带、需要调用方补；现在**所有卡片组件都自带**（另有
+ * [UfiNoticeCard] / [UfiLogPanel] / [UfiCodeEditorCard] 等同一批收敛），所以：
+ * - [contentInset] = true（默认）：内容里是**裸组件**（[androidx.compose.material3.Text] /
+ *   `UfiTextField` / `UfiBadge` 这类没有自带外边距的），由本节补 `CardHorizontalMargin`
+ *   让它们和卡片对齐；
+ * - [contentInset] = false：内容里全是自带外边距的卡片（Group / RowCard / EntryCard /
+ *   GridCard / StatusCard …），不能再补，否则双重内距。
  *
  * 之前本页在最外层滚动容器上加了 `PagePadding`，于是卡片类缩进 12+16=28dp、裸组件只有 12dp，
  * 一眼就能看出左右边距对不齐 —— 这正是画廊该暴露的问题，只不过这次暴露的是画廊自己。

@@ -434,6 +434,12 @@ object UfiToastOverlay {
             topMargin = dp(TOP_MARGIN_DP)
         }
         decorView.addView(toastView, lp)
+        // 读屏用户：Toast 是挂在 decorView 上的独立浮层，不会自动获得焦点，
+        // 不显式播报的话「密码错误 / 配对失败」对 TalkBack 完全静默。
+        @Suppress("DEPRECATION")
+        toastView.announceForAccessibility(
+            if (subtitle.isNullOrBlank()) title else "$title，$subtitle"
+        )
 
         activeToast = toastView
         // ★ 与容器同源记下宿主窗口：popDialogHost 只靠这个引用判断"是不是挂在将死的窗口上"，

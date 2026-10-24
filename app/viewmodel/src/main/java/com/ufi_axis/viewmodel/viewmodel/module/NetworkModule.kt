@@ -5,6 +5,7 @@ import android.content.Context
 import android.os.SystemClock
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
@@ -14,7 +15,9 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.booleanOrNull
 import com.ufi_axis.data.api.RetrofitClient
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.CellInfoResponse
 import com.ufi_axis.data.model.ModeRequest
+import com.ufi_axis.data.model.SignalInfo
 import com.ufi_axis.data.model.WifiAclResponse
 // 制式别名 ↔ 设备 BearerPreference 的换算与「切换中」回读预算都在 contract，两端同源
 import com.ufi_axis_core.contract.NetworkMode
@@ -244,7 +247,20 @@ class NetworkModule(
 
     // ── 2026-10-05 P7：写操作确认器（「执行 → 等待结果 → 回读确认 → 更新」）──
     // 状态机在 viewmodel 层（供各 Module 复用），UI 侧挂 UfiOperationProgressDialog 消费 state。
-    val opController = ApiOperationController(scope)
+    //
+    // 2026-10-14（修 G8）：把失败文案接到既有 toast 通道上。用户点「后台进行」之后弹窗就没了，
+    // 超时那一刻**不能**把弹窗弹回来（那与"别挡着我"正好相反），但也不能静默 ——
+    // 唯一的出口就是这里：ShowWriteNotice 与其它写操作成功提示同一个出口（Activity 级 Toast）。
+    //
+    // **为什么不用 `errorMessage` 那条（全局错误）通道**：① 它带 30s 同文案去重
+    // （`MainActivity.kt:80,573`），而"超时不能再静默"要的正是**每次都说得出来**；
+    // ② 它是 state 上的一个字段，写进去之后会被紧随其后的 refreshNetwork() 用 null 覆盖
+    // （失败回读里就有一发 refreshNetwork），两个写入挤在一帧里会被 StateFlow 合并掉，
+    // 变成"偶尔不弹"。ShowWriteNotice 是一次性事件流（带自增 seq），不存在这两个问题。
+    // 已知代价：宿主把它渲染成 SUCCESS 样式的 Toast（`MainActivity.kt:595` 写死 ToastType.SUCCESS），
+    // 而 web 同一句用的是 warning。**文案本身已经说清"未完成"**，改样式需要动 `app/src/**`
+    //（本轮写权限之外），故只在此登记，不改。
+    val opController = ApiOperationController(scope) { reason -> emitWriteNotice(reason) }
 
     // ── Network ──
 
@@ -439,28 +455,74 @@ class NetworkModule(
      * ③ **不动全页 isLoading**：原来置 true 会让整页进 loading 态；改用 [NetworkState.mobileDataPending]
      *    只影响这一行。
      * 失败时把乐观值回滚，避免 UI 停在没生效的状态上。
+     * （2026-10-14：回滚不再靠 catch 里的 `previous`，而是靠 onSettled(false) 的 refreshNetwork() ——
+     * 设备真值比"我们记着的上一个值"更可靠，详见下面 onSettled 的注释。）
+     *
+     * ── 2026-10-14（修 G4）─────────────────────────────────────────────────────
+     * **原来是什么样**：`api.setMobileData(...)` 之后 `waitForNetworkReady(expectConnected = enabled)`
+     * —— 5 秒预算、每 500ms 一次 `GET /api/network/status`（最多 11 次），到点**直接 return，
+     * 一个字段都不写**（`waitForNetworkReady` 无返回值）。设备弱信号下重新拨号动辄十几秒，
+     * 于是最常见的结果是"设备其实成功了、app 什么都没说"。
+     * **为什么不对**：① 超时静默 —— 用户唯一的判断依据是那一行开关有没有自己变回去；
+     * ② 节奏与另一端不同源 —— 同一件事 web 端有 13 次 / 30.6s 的回读与明示
+     * （`web/src/composables/useNetworkControls.ts:378-394`），同一台设备在两个客户端上
+     * "多久算超时"不一样。
+     * **现在怎么改**：接 [opController]（与同一屏的 WiFi 开关 [setWifiEnabled]、频段锁定
+     * [lockBands] 同构，也与 web 同构）：预算由 contract 的 [NetworkMode.SwitchProbe] 给出
+     * （首延 600ms + 快档 1.5s×4 + 慢档 3s×8 = 13 次 / 30.6s），超时文案取确认器那一句
+     * "未在预期时间内完成，设备可能仍在后台继续"，并自带「后台进行」出口。
+     *
+     * **代价（产品取舍，明写在这里）**：确认器带来的是**阻塞式进度弹窗**，与原来"乐观回显 +
+     * 只转一行"的轻交互不同。选它、而不是"保留轻交互只把预算提到 30.6s"，理由三条：
+     * ① 同一张网络页上紧邻的「WiFi 热点」开关早就走确认器，两个相邻开关一个弹窗一个不弹，
+     *    本身就是不一致；
+     * ② 轻交互那条路**没有**"设备可能仍在后台继续"这句话的落点 —— 那句话的唯一出处是确认器
+     *    （也是 web 的同一句），要么再抄一份文案、要么继续静默；
+     * ③ 30.6s 的等待必须给用户出口，否则就是"卡住半分钟不能动"；「后台进行」只存在于确认器里。
+     * 轻交互的部分**没有丢**：乐观回显与行内 [NetworkState.mobileDataPending]（"切换中…"）
+     * 都保留 —— 点了「后台进行」之后那一行仍显示"切换中…"，直到 onSettled 收尾。
      */
     fun toggleMobileData(enabled: Boolean) {
-        scope.launch {
-            val previous = _networkState.value.mobileDataEnabled
-            _networkState.update {
-                it.copy(mobileDataEnabled = enabled, mobileDataPending = true, errorMessage = null)
-            }
-            try {
-                api.setMobileData(mapOf("enabled" to enabled))
-                waitForNetworkReady(expectConnected = enabled)
-                refreshNetwork()
-                _networkState.update { it.copy(mobileDataPending = false) }
-            } catch (e: Exception) {
-                _networkState.update {
-                    it.copy(
-                        mobileDataEnabled = previous, mobileDataPending = false,
-                        // 2026-10-05 P7（§9.3）：超时静默——设备可能仍在后台完成，文案改中性提示
-                        errorMessage = "设备尚未完成，可稍后刷新查看", isLoading = false
-                    )
-                }
-            }
+        // 乐观回显（坑①）保留：先就地置成目标值，避免"点了没反应"
+        _networkState.update {
+            it.copy(mobileDataEnabled = enabled, mobileDataPending = true, errorMessage = null)
         }
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "移动数据"
+            override val runningText = if (enabled) "正在开启移动数据" else "正在关闭移动数据"
+            override val successText = if (enabled) "移动数据已开启" else "移动数据已关闭"
+            override val hint = "拨号状态更新需要几秒钟"
+
+            override suspend fun submit(): String? {
+                val resp = try { api.setMobileData(mapOf("enabled" to enabled)) }
+                    catch (e: Exception) { return e.message ?: "移动数据开关失败" }
+                // 「200 + success:false」在契约上随时可能出现，不检查就是一个等着被踩的假成功
+                return if (resp.success) null else "移动数据开关失败"
+            }
+
+            override suspend fun verify(): Boolean {
+                // 判据：蜂窝连接态 == 目标（关数据时等断开，见上面坑②）。与 web 同源 ——
+                // 真源都是 ppp_status（[NetworkStatusResponse.isCellularConnected]），不是顶层 connected。
+                val status = api.getNetworkStatus()
+                _networkState.update {
+                    it.copy(networkStatus = status, mobileDataEnabled = status.mobile_data)
+                }
+                return status.isCellularConnected == enabled
+            }
+
+            override fun onApplied() {
+                // 写后回读：拨号状态变了，信号/WiFi/客户端都可能跟着变，保留原路径的全量刷新
+                refreshNetwork()
+            }
+
+            override fun onSettled(applied: Boolean) {
+                _networkState.update { it.copy(mobileDataPending = false) }
+                // 超时也要回读一次：乐观值是我们自己写上去的，只有设备真值能纠正它。
+                // 口径同原实现 —— 原来无论等没等到都会 refreshNetwork()，这里不变。
+                // **不回滚**乐观值：设备可能仍在后台继续，回滚等于断言"没生效"，那是我们并不知道的事。
+                if (!applied) refreshNetwork()
+            }
+        })
     }
 
 
@@ -584,17 +646,53 @@ class NetworkModule(
         }
     }
 
-    fun toggleAirplaneMode(enabled: Boolean) {        scope.launch {
-            try {
-                val resp = api.setAirplaneMode(mapOf("enabled" to enabled))
-                if (!resp.success) _networkState.value = _networkState.value.copy(errorMessage = "操作失败")
-                // 开飞行模式 = 等断开，关飞行模式 = 等连上（同 toggleMobileData 的坑②）
-                waitForNetworkReady(expectConnected = !enabled); refreshNetwork()
-            } catch (e: Exception) {
-                // 2026-10-05 P7（§9.3）：超时静默——设备可能仍在后台完成，文案改中性提示
-                _networkState.value = _networkState.value.copy(errorMessage = "设备尚未完成，可稍后刷新查看")
+    /**
+     * 开 / 关飞行模式（`POST /api/network/airplane`）。
+     *
+     * ── 2026-10-14（修 G4）─────────────────────────────────────────────────────
+     * **原来是什么样**：下发成功后 `waitForNetworkReady(expectConnected = !enabled)` + `refreshNetwork()`
+     * —— 与 [toggleMobileData] 一模一样的 5 秒静默预算，到点直接 return、不写任何字段；
+     * 失败分支还写着"设备尚未完成，可稍后刷新查看"，而**真正会发生的超时那条路根本不经过它**
+     * （`waitForNetworkReady` 不抛异常，catch 只兜得住下发失败）。
+     * **为什么不对**：同上 —— 静默超时 + 节奏与 web 不同源
+     * （`web/src/composables/useNetworkControls.ts:398-411`，13 次 / 30.6s）。
+     * **现在怎么改**：与 [toggleMobileData] 同构接 [opController]。取舍理由见那边的长注释；
+     * 本条多一层：飞行模式会**断开蜂窝**，30.6s 里用户很可能想先去干别的 —— 「后台进行」在这里
+     * 比移动数据更必要，而不是更不必要。
+     *
+     * 契约补充：core 的 `/api/network/airplane` 只有写、没有读（web 侧同注释），
+     * 所以回读判据只能借 `GET /api/network/status` 的蜂窝连接态。
+     */
+    fun toggleAirplaneMode(enabled: Boolean) {
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "飞行模式"
+            override val runningText = if (enabled) "正在开启飞行模式" else "正在关闭飞行模式"
+            override val successText = if (enabled) "飞行模式已开启" else "飞行模式已关闭"
+            override val hint = "拨号状态更新需要几秒钟"
+
+            override suspend fun submit(): String? {
+                val resp = try { api.setAirplaneMode(mapOf("enabled" to enabled)) }
+                    catch (e: Exception) { return e.message ?: "飞行模式切换失败" }
+                return if (resp.success) null else "飞行模式切换失败"
             }
-        }
+
+            override suspend fun verify(): Boolean {
+                val status = api.getNetworkStatus()
+                // 飞行模式会连带关掉移动数据，所以两个字段一起对齐设备真值
+                _networkState.update {
+                    it.copy(networkStatus = status, mobileDataEnabled = status.mobile_data)
+                }
+                // 开飞行模式 = 等断开，关飞行模式 = 等连上（同 toggleMobileData 的坑②）
+                return status.isCellularConnected == !enabled
+            }
+
+            override fun onApplied() { refreshNetwork() }
+
+            override fun onSettled(applied: Boolean) {
+                // 没有行内 pending 位要清（飞行模式开关不在本页），只做超时后的真值回读。
+                if (!applied) refreshNetwork()
+            }
+        })
     }
 
     /**
@@ -1605,19 +1703,133 @@ class NetworkModule(
     /**
      * 锁基站。networkType 只接受 core 契约值域 "LTE" / "NR"（core 会自行映射成设备侧 12/16），
      * 不要再传设备数字码或旧入参名 rat（core 仍兼容但已打 WARN，下一版会删）。
+     *
+     * ── 2026-10-14（修 G3）─────────────────────────────────────────────────────
+     * **原来是什么样**：`api.cellLock(...)` 成功后 `delay(500); loadCellInfo()` —— 一次回读、
+     * **无判据**，读到什么就渲染什么。
+     * **为什么不对**：锁定是异步生效的（设备要重新选小区、重新驻网），500ms 后那次回读几乎必然
+     * 还是旧小区，于是"点了锁定、界面显示的还是原来那个基站"，用户无从判断锁上没有；
+     * 而且只有一次机会、没有预算 —— 把"命令已下发"当成了"已经锁上"。
+     * **现在怎么改**：接 [opController]，判据 = **服务小区就是目标小区**（pci + earfcn 都对上），
+     * 回读节奏与预算取 contract 的 [NetworkMode.SwitchProbe]（13 次 / 30.6s）。
+     *
+     * **契约（core 侧，字段名不猜）**：
+     * - 写：`POST /api/device/cell-lock`，入参 `pci` / `earfcn` / `network_type`，
+     *   回 `{"success": bool}` —— `core/api/src/main/java/com/ufi_axis_core/api/routes/DeviceRoutes.kt:625-653`。
+     *   成功后 core 会清 `network:cell-info` 缓存（同文件 `:649`），所以下面的回读拿到的是**写后**
+     *   快照，而不是那 20s TTL（`core/cache/.../ResponseCache.kt:590`）的旧值。
+     * - 读服务小区：`GET /api/network/signal` 的统一字段 `pci` / `arfcn`
+     *   （`app/data/src/main/java/com/ufi_axis/data/model/Models.kt:344-364`，core 已做 NR 优先合并）。
+     * - 读 LTE 侧：`GET /api/network/cell-info` 的 `Lte_pci` / `Lte_fcn`
+     *   （`DeviceFields.CellInfo`，`app/data/.../model/DeviceResponses.kt:241-253`）。
      */
     fun cellLock(pci: String, earfcn: String, networkType: String) {
-        scope.launch {
-            try { api.cellLock(mapOf("pci" to pci, "earfcn" to earfcn, "network_type" to networkType)); delay(500); loadCellInfo() }
-            catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "锁基站失败: ${e.message}") }
-        }
+        val targetPci = pci.trim()
+        val targetEarfcn = earfcn.trim()
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "基站锁定"
+            override val runningText = "正在锁定基站 PCI $targetPci"
+            override val successText = "已锁定基站 PCI $targetPci"
+            override val hint = "设备需要重新驻网，期间信号会短暂中断"
+
+            override suspend fun submit(): String? {
+                val resp = try {
+                    api.cellLock(mapOf(
+                        "pci" to targetPci, "earfcn" to targetEarfcn, "network_type" to networkType
+                    ))
+                } catch (e: Exception) { return e.message ?: "锁基站失败" }
+                return if (resp.success) null else "锁基站失败"
+            }
+
+            override suspend fun verify(): Boolean {
+                // 两个来源都读：/signal 是 NR 优先的合并值，/cell-info 只有 LTE 字段，
+                // 锁 LTE 小区而设备仍驻留 NR 时只有后者能确认（见 servingCellMatches）。
+                val sig = runCatching { api.getSignalInfo() }.getOrNull()
+                val cell = runCatching { api.getCellInfo() }.getOrNull()
+                _networkState.update {
+                    it.copy(signalInfo = sig ?: it.signalInfo, cellInfo = cell ?: it.cellInfo)
+                }
+                return servingCellMatches(sig, cell, targetPci, targetEarfcn)
+            }
+
+            override fun onApplied() {
+                // 写后回读：基站页的"已锁定基站"列表与邻区都可能变了
+                loadCellInfo()
+                emitWriteNotice(successText)
+            }
+        })
     }
 
+    /**
+     * 解锁全部基站（`POST /api/device/cell-unlock`，回 `{"success": bool}`）。
+     *
+     * 2026-10-14（修 G3，同 [cellLock]）：原来同样是 `delay(500); loadCellInfo()` 的单次无判据回读。
+     * 现在判据 = **已锁定列表为空**（`locked_cell_info`，core 已归一成真数组，见 [lockedCellCount]）。
+     * 解锁同样是异步生效的，所以走同一套 13 次 / 30.6s 预算。
+     */
     fun unlockAllCell() {
-        scope.launch {
-            try { api.unlockAllCell(); delay(500); loadCellInfo() }
-            catch (e: Exception) { _networkState.value = _networkState.value.copy(errorMessage = "解锁基站失败: ${e.message}") }
-        }
+        opController.run(object : ApiOperationController.Spec {
+            override val title = "基站解锁"
+            override val runningText = "正在解锁全部基站"
+            override val successText = "已解锁全部基站"
+            override val hint = "设备需要重新驻网，期间信号会短暂中断"
+
+            override suspend fun submit(): String? {
+                val resp = try { api.unlockAllCell() }
+                    catch (e: Exception) { return e.message ?: "解锁基站失败" }
+                return if (resp.success) null else "解锁基站失败"
+            }
+
+            override suspend fun verify(): Boolean {
+                val cell = runCatching { api.getCellInfo() }.getOrNull()
+                if (cell != null) _networkState.update { it.copy(cellInfo = cell) }
+                // lockedCellCount 返回 null = 这次没读到列表 → 按未命中继续等，不当成"已解锁"
+                return lockedCellCount(cell) == 0
+            }
+
+            override fun onApplied() {
+                loadCellInfo()
+                emitWriteNotice(successText)
+            }
+        })
+    }
+
+    /**
+     * 服务小区是否就是目标小区 —— [cellLock] 的 verify 判据。
+     *
+     * **为什么两个来源都要看**：`/api/network/signal` 的服务小区字段是 core 按"NR 优先、LTE 兜底"
+     * 合并过的，而 `/api/network/cell-info` **只有 LTE 侧字段**。锁 LTE 小区时设备可能仍驻留在 NR
+     * （NSA 双连接），这时只有 cell-info 那份能确认；锁 NR 小区时只有 signal 那份能确认。
+     * 任一命中即算生效：两个来源的 (pci, 频点) 组合不会互相冒充 —— NR-ARFCN 与 LTE EARFCN
+     * 的取值区间不重叠（NR 高频段 ARFCN 远大于 EARFCN 上限）。
+     */
+    private fun servingCellMatches(
+        signal: SignalInfo?, cell: CellInfoResponse?, pci: String, earfcn: String
+    ): Boolean {
+        // pci / arfcn 是非负量，-1 是 core 的"无数据"哨兵（见 contract 的 Units），先滤掉
+        val signalPci = signal?.pci?.takeIf { it >= 0 }?.toString()
+        val signalFcn = signal?.arfcn?.takeIf { it >= 0 }?.toString()
+        val ltePci = cell?.ltePci?.trim()?.takeIf { it.isNotEmpty() }
+        val lteFcn = cell?.lteEarfcn?.trim()?.takeIf { it.isNotEmpty() }
+        return (signalPci == pci && signalFcn == earfcn) || (ltePci == pci && lteFcn == earfcn)
+    }
+
+    /**
+     * 已锁定基站条数 —— [unlockAllCell] 的 verify 判据。
+     *
+     * 容器缺失 / 空串按 **0 条**处理：与基站页 `parseLockedCellsDlg` 的显示口径一致
+     * （那边 null 也画"暂无已锁定基站"）。不这么归一的话，一次**正常**的解锁会因为设备回了
+     * `locked_cell_info: ""` 而被判成"从未生效"，白等满 30.6s 再报超时。
+     *
+     * @return null = 这次回读没拿到 / 解不出列表 —— 调用方按未命中继续等，**不要**当成"已解锁"。
+     */
+    private fun lockedCellCount(cell: CellInfoResponse?): Int? {
+        if (cell == null) return null
+        cell.lockedCells?.let { return it.size }
+        val raw = cell.lockedCellInfo
+        if (raw == null || raw is JsonNull) return 0
+        val text = (raw as? JsonPrimitive)?.content
+        return if (text.isNullOrBlank()) 0 else null
     }
 
     // ── LAN ──
@@ -2359,6 +2571,9 @@ class NetworkModule(
                 loadBandStatus(silent = true)
                 loadDeviceSettings()
                 refreshWifi()
+                // 2026-10-21：断线窗口里的 `pairing:approvals` 推送已经丢了（replay=0），
+                // 重连必须补拉一次 —— 否则「WS 刚断过」这个场景又要退回到 30s 轮询。
+                loadApprovals()
             }
             changedType == "network:band-status" || changedType == "network:cell-info" -> refreshNetworkLight()
             // 2026-10-05 P5 新增：hub:network-type-info（G2 修复后 core 开始广播此 key）
@@ -2366,6 +2581,11 @@ class NetworkModule(
             changedType.startsWith("wifi:") -> refreshWifiOnly()
             changedType == "device:lan" -> loadLanSettings()
             changedType == "device:settings" -> loadDeviceSettings()
+            // 2026-10-21：core 的批准推送（`ApprovalPushNudger`）→ 立刻拉一次待批准列表。
+            // 正常情况下这条 key 在 MainViewModel.dispatchChanged 里已经短路（不吃 800ms 去抖），
+            // 走到这里说明有人改过那条短路 —— 兜底成"最多慢 800ms"，别静默丢掉。
+            changedType == WsDataTopic.PAIRING_APPROVALS ||
+                changedType.startsWith(WsDataTopic.PREFIX_PAIRING) -> loadApprovalsFromPush()
             // 2026-10-05 P5：device:goform / device:qos 只有设备信息页/高级页消费——
             // 不在此主动拉（页面不在前台拉了白拉），靠 P6 的外部变更豁免在切页时放行重拉。
             // summary 由 DashboardModule 消费，此处忽略。
@@ -2462,6 +2682,16 @@ class NetworkModule(
                     pairingCode = json["pairing_code"]?.jsonPrimitive?.content ?: "",
                     pairingEnabled = json["pairing_enabled"]?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: false,
                     pairingMaxDevices = json["pairing_max_devices"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
+                    // 2026-10-15（安全中心）：批准策略 + 外部通知渠道。旧 core 不返回这些字段 →
+                    // 一律回落 false（= 批准不生效、不通知），与"旧 core 没有这些能力"一致。
+                    approvalRequired = json["pairing_approval_required"]?.jsonPrimitive?.content
+                        ?.toBooleanStrictOrNull() ?: false,
+                    notifySystem = json["pairing_notify_system"]?.jsonPrimitive?.content
+                        ?.toBooleanStrictOrNull() ?: false,
+                    notifyEmail = json["pairing_notify_email"]?.jsonPrimitive?.content
+                        ?.toBooleanStrictOrNull() ?: false,
+                    notifyWebhook = json["pairing_notify_webhook"]?.jsonPrimitive?.content
+                        ?.toBooleanStrictOrNull() ?: false,
                     devices = parsePairedDevices(json["devices"]),
                     isLoading = false
                 )
@@ -2476,14 +2706,37 @@ class NetworkModule(
     // 失败路径不动 —— 它们写 `pairingState.errorMessage`，`PairingConfigScreen` 已经在渲染
     // （UfiErrorBanner），不是"写了没人读"那一类，不需要改道全局通道。
 
-    fun updatePairingConfig(enabled: Boolean, maxDevices: Int) {
+    /**
+     * 保存配对策略（`PUT /api/pairing/config`）。
+     *
+     * 2026-10-15 扩展：多出批准策略与三个外部通知开关（安全中心）。
+     * 四个新参数都带默认值 → 既有调用点（只传 enabled/maxDevices）行为不变；
+     * 传 null 表示"这次不动这一项"，避免把没在编辑的开关一并覆盖掉。
+     */
+    fun updatePairingConfig(
+        enabled: Boolean,
+        maxDevices: Int,
+        approvalRequired: Boolean? = null,
+        notifySystem: Boolean? = null,
+        notifyEmail: Boolean? = null,
+        notifyWebhook: Boolean? = null
+    ) {
         scope.launch {
             try {
-                api.updatePairingConfig(mapOf(
+                val body = mutableMapOf<String, Any>(
                     "pairing_enabled" to enabled,
                     "pairing_max_devices" to maxDevices
-                ))
+                )
+                approvalRequired?.let { body["pairing_approval_required"] = it }
+                notifySystem?.let { body["pairing_notify_system"] = it }
+                notifyEmail?.let { body["pairing_notify_email"] = it }
+                notifyWebhook?.let { body["pairing_notify_webhook"] = it }
+                api.updatePairingConfig(body)
                 loadPairingStatus()
+                // 2026-10-24：关闭批准策略时 core 会清空待批准请求并广播 pairing:approvals；
+                // 这里再主动拉一次，覆盖"WS 断线/推送丢失"的情况 —— 否则根部的批准弹窗
+                // 会一直挂着一条已经被取消的请求。
+                loadApprovals()
                 emitWriteNotice(
                     if (enabled) "已允许新设备配对" else "已停止接受新设备配对",
                     subtitle = if (enabled) "上限 $maxDevices 台" else null
@@ -2495,29 +2748,54 @@ class NetworkModule(
         }
     }
 
-    fun unpairAll() {
+    /**
+     * 解除全部设备的配对（POST api/pairing/unpair）。
+     *
+     * 2026-10-21（审计 §B1）：**必须带配对密码**。之前这条免密码、而"移除单台"要密码，
+     * 于是破坏性最强的操作反而是门槛最低的一条；core 已同步收紧，这里跟上传参。
+     * 成功后自己的 token 也一起失效 —— 立刻回配对引导，别等下一次请求撞 444。
+     */
+    fun unpairAll(password: String, onResult: (String?) -> Unit = {}) {
         scope.launch {
             try {
-                api.unpairAll()
-                loadPairingStatus()
+                api.unpairAll(mapOf("password" to password))
                 emitWriteNotice("已解除全部设备的配对", subtitle = "所有客户端需要重新配对")
+                loadPairingStatus()
+                onResult(null)
             } catch (e: Exception) {
                 DebugLog.e("Network", "unpairAll failed", e)
-                _pairingState.value = _pairingState.value.copy(errorMessage = "解除配对失败: ${e.message}")
+                val msg = unpairErrorMessage(e, "解除配对失败")
+                _pairingState.value = _pairingState.value.copy(errorMessage = msg)
+                onResult(msg)
             }
         }
     }
 
-    fun unpairFingerprint(fingerprint: String) {
+    fun unpairFingerprint(fingerprint: String, password: String, onResult: (String?) -> Unit = {}) {
         scope.launch {
             try {
-                api.unpairFingerprint(fingerprint)
+                api.unpairFingerprint(fingerprint, mapOf("password" to password))
                 loadPairingStatus()
                 emitWriteNotice("已解除该设备的配对")
+                onResult(null)
             } catch (e: Exception) {
                 DebugLog.e("Network", "unpairFingerprint failed", e)
-                _pairingState.value = _pairingState.value.copy(errorMessage = "移除设备失败: ${e.message}")
+                val msg = unpairErrorMessage(e, "移除设备失败")
+                _pairingState.value = _pairingState.value.copy(errorMessage = msg)
+                onResult(msg)
             }
+        }
+    }
+
+    /** 解除配对类接口的错误文案（core 回 `{error, code}`，按 code 给可执行的话）。 */
+    private fun unpairErrorMessage(e: Exception, fallback: String): String {
+        val code = (e as? retrofit2.HttpException)
+            ?.let { runCatching { org.json.JSONObject(it.response()?.errorBody()?.string().orEmpty()).optString("code") }.getOrNull() }
+        return when (code) {
+            "MISSING_PASSWORD" -> "请输入配对密码"
+            "INVALID_PASSWORD" -> "配对密码错误"
+            "PASSWORD_LOCKED" -> "密码错误次数过多，请 15 分钟后再试"
+            else -> "$fallback: ${e.message}"
         }
     }
 
@@ -2575,6 +2853,218 @@ class NetworkModule(
         }
     }
 
+    // ── 配对设备黑名单（2026-10-15） ──
+    //
+    // 读侧拦截不在这里：被拉黑设备的配对/密码登录由 core 的 PairingManager.confirm 直接拦
+    // （403 DEVICE_BLOCKED），已鉴权请求由 444 拦。这里只是管理面（增删查）。
+
+    /**
+     * 加载黑名单（GET /api/pairing/blacklist）。
+     *
+     * 旧版 core 没有这个端点 → 404。**这不是错误**：把 [PairingState.blacklistAvailable]
+     * 置 false 让 UI 隐藏入口即可 —— "新 App + 旧 core"是必须支持的组合，
+     * 不能因为设备端版本旧就弹一个用户看不懂的报错。
+     */
+    fun loadBlacklist() {
+        scope.launch {
+            try {
+                val json = api.getPairingBlacklist().jsonObject
+                _pairingState.update {
+                    it.copy(
+                        blockedDevices = parseBlockedDevices(json["devices"]),
+                        blacklistAvailable = json["available"]?.jsonPrimitive?.booleanOrNull ?: true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                if (e.isEndpointMissing()) {
+                    DebugLog.w("Network", "pairing blacklist not supported by this core (404) → 隐藏入口")
+                    _pairingState.update { it.copy(blacklistAvailable = false, blockedDevices = emptyList()) }
+                } else {
+                    DebugLog.e("Network", "loadBlacklist failed", e)
+                    _pairingState.update { it.copy(errorMessage = "加载黑名单失败: ${e.message}") }
+                }
+            }
+        }
+    }
+
+    /**
+     * 拉黑一台设备（POST /api/pairing/blacklist，需配对密码）。
+     *
+     * @param hwId 已配对记录里的硬件标识（辅助键，可空）。一起记下来才能挡住
+     *   "清 App 数据换密钥后重新配对"这条路 —— 那是纯指纹拦截唯一的绕过口。
+     */
+    fun blockDevice(
+        fingerprint: String,
+        name: String,
+        hwId: String = "",
+        password: String,
+        reason: String = ""
+    ) {
+        scope.launch {
+            try {
+                val body = mutableMapOf<String, Any>(
+                    "fingerprint" to fingerprint,
+                    "name" to name,
+                    "reason" to reason,
+                    "password" to password
+                )
+                if (hwId.isNotBlank()) body["hw_id"] = hwId
+                api.blockPairedDevice(body)
+                loadBlacklist()
+                emitWriteNotice("已拉黑「${name.ifBlank { fingerprint.take(8) }}」")
+            } catch (e: Exception) {
+                DebugLog.e("Network", "blockDevice failed", e)
+                _pairingState.update { it.copy(errorMessage = "拉黑失败: ${e.message}") }
+            }
+        }
+    }
+
+    /** 解除拉黑（DELETE /api/pairing/blacklist/{fp}，需配对密码）。 */
+    fun unblockDevice(fingerprint: String, password: String) {
+        scope.launch {
+            try {
+                api.unblockPairedDevice(fingerprint, mapOf("password" to password))
+                loadBlacklist()
+                emitWriteNotice("已解除拉黑")
+            } catch (e: Exception) {
+                DebugLog.e("Network", "unblockDevice failed", e)
+                _pairingState.update { it.copy(errorMessage = "解除拉黑失败: ${e.message}") }
+            }
+        }
+    }
+
+    /** 全部解除（POST /api/pairing/blacklist/clear，需配对密码）。 */
+    fun clearBlacklist(password: String) {
+        scope.launch {
+            try {
+                api.clearPairingBlacklist(mapOf("password" to password))
+                loadBlacklist()
+                emitWriteNotice("已全部解除拉黑")
+            } catch (e: Exception) {
+                DebugLog.e("Network", "clearBlacklist failed", e)
+                _pairingState.update { it.copy(errorMessage = "全部解除失败: ${e.message}") }
+            }
+        }
+    }
+
+    // ── 新设备批准（2026-10-15） ──
+
+    /**
+     * 待批准列表的「在途 / 最近一次」标记（2026-10-21）。
+     *
+     * core 的 `ApprovalPushNudger` 一轮会**快速补发 4 帧**唤醒帧；App 若每帧都发一个 GET，
+     * 就是自己在打自己。这里只做「在途合并 + 1 秒内不重复」这一层 —— 窗口再放大，
+     * 弹窗就又要多等，那就把提速的意义吃掉了。
+     *
+     * 只有**推送触发**的拉取走这两道闸（[loadApprovalsFromPush]）；页面进入 / 机主点允许后的
+     * 主动刷新走 [loadApprovals]，不受限制（否则「点允许后立刻刷新」会被自己刚刚那一次挡住）。
+     */
+    @Volatile private var approvalsInFlight = false
+    @Volatile private var lastApprovalsAt = 0L
+
+    /**
+     * 加载待批准列表（GET /api/pairing/approvals）。
+     *
+     * 与黑名单同款降级：旧 core 没有这个端点 → 404 → 标记不可用、隐藏入口（不弹错误）。
+     */
+    fun loadApprovals() {
+        scope.launch {
+            approvalsInFlight = true
+            try {
+                val json = api.getPairingApprovals().jsonObject
+                _pairingState.update {
+                    it.copy(
+                        pendingApprovals = parsePendingApprovals(json["approvals"]),
+                        approvalAvailable = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                if (e.isEndpointMissing()) {
+                    DebugLog.w("Network", "pairing approvals not supported by this core (404) → 隐藏入口")
+                    _pairingState.update { it.copy(approvalAvailable = false, pendingApprovals = emptyList()) }
+                } else {
+                    DebugLog.e("Network", "loadApprovals failed", e)
+                }
+            } finally {
+                approvalsInFlight = false
+            }
+        }
+    }
+
+    /**
+     * 推送触发的拉取（2026-10-21）：在途合并 + 1 秒内不重复。
+     *
+     * 与 [loadApprovals] 分开而不是在它里面加闸的理由见 [approvalsInFlight] 的注释 ——
+     * 「机主点允许后立刻刷新」必须无条件生效。
+     */
+    fun loadApprovalsFromPush() {
+        if (approvalsInFlight) return
+        val now = System.currentTimeMillis()
+        if (now - lastApprovalsAt < 1_000L) return
+        lastApprovalsAt = now
+        loadApprovals()
+    }
+
+    /**
+     * 机主点「允许」。
+     *
+     * 批准只对**这一条请求**生效；请求方随后带着同一个 `sid` 重试 confirm 才会通过。
+     *
+     * 2026-10-21（审计 §B2）：带结果回调。之前失败只写 `pairingState.errorMessage`，
+     * 而那份状态**只有「设置 → 安全中心」页在渲染**；根部的批准弹窗点完就消失，
+     * 机主以为批了、其实 404（请求已过期）或网络失败 —— 必须把结果交回调用方去提示。
+     *
+     * @param onResult 参数为错误文案；成功传 null。
+     */
+    fun approveDevice(sid: String, onResult: (String?) -> Unit = {}) {
+        scope.launch {
+            try {
+                api.approvePairingRequest(sid)
+                loadApprovals()
+                emitWriteNotice("已允许该设备配对")
+                onResult(null)
+            } catch (e: Exception) {
+                DebugLog.e("Network", "approveDevice failed", e)
+                val msg = approvalErrorMessage(e, "批准失败")
+                _pairingState.update { it.copy(errorMessage = msg) }
+                onResult(msg)
+            }
+        }
+    }
+
+    /**
+     * 机主点「拒绝」。拒绝后该 sid 不能再被批准（服务端把 rejected 视为终态）。
+     *
+     * @param onResult 参数为错误文案；成功传 null（见 [approveDevice] 的说明）。
+     */
+    fun rejectDevice(sid: String, onResult: (String?) -> Unit = {}) {
+        scope.launch {
+            try {
+                api.rejectPairingRequest(sid)
+                loadApprovals()
+                emitWriteNotice("已拒绝该设备")
+                onResult(null)
+            } catch (e: Exception) {
+                DebugLog.e("Network", "rejectDevice failed", e)
+                val msg = approvalErrorMessage(e, "拒绝失败")
+                _pairingState.update { it.copy(errorMessage = msg) }
+                onResult(msg)
+            }
+        }
+    }
+
+    /** 批准/拒绝类接口的错误文案：404 表示这条请求已经不用处理了（过期/已被处理）。 */
+    private fun approvalErrorMessage(e: Exception, fallback: String): String {
+        val code = (e as? retrofit2.HttpException)?.code()
+        return when (code) {
+            404 -> "$fallback：这条请求已过期或已被处理"
+            444 -> "$fallback：本机凭据已失效，请重新配对"
+            else -> "$fallback: ${e.message}"
+        }
+    }
+
     /** 修改配对密码（POST pairing/change-password，root 路径；旧密码即门禁）。 */
     fun changeDevicePassword(oldPw: String, newPw: String) {
         scope.launch {
@@ -2610,10 +3100,68 @@ fun parsePairedDevices(el: JsonElement?): List<PairedDeviceItem> {
             fingerprint = obj.safeGetString("fingerprint") ?: "",
             deviceName = obj.safeGetString("device_name") ?: "",
             lastSeen = obj.safeGetString("last_seen")?.toLongOrNull() ?: 0L,
-            createdAt = obj.safeGetString("created_at")?.toLongOrNull() ?: 0L
+            createdAt = obj.safeGetString("created_at")?.toLongOrNull() ?: 0L,
+            // 2026-10-15 新增：拉黑时一并带上（辅助键）。旧 core 不返回该字段 → 空串，
+            // 那时只按指纹拦（弱一档，但功能仍成立）。
+            hwId = obj.safeGetString("hw_id").orEmpty()
         )
     }
 }
+
+/**
+ * 解析配对黑名单 JSON（`GET /api/pairing/blacklist` 的 `devices`）。
+ *
+ * 字段与 core 的 `BlockedDevice` 对齐：fingerprint / hw_id / name / reason / blocked_at / blocked_by。
+ * 没有 fingerprint 的条目直接丢弃（它是主键，空值的条目无法展示也无法解除）。
+ */
+fun parseBlockedDevices(el: JsonElement?): List<BlockedDeviceItem> {
+    if (el !is JsonArray) return emptyList()
+    return el.mapNotNull { item ->
+        val obj = item as? JsonObject ?: return@mapNotNull null
+        val fp = obj.safeGetString("fingerprint")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        BlockedDeviceItem(
+            fingerprint = fp,
+            hwId = obj.safeGetString("hw_id").orEmpty(),
+            name = obj.safeGetString("name").orEmpty(),
+            reason = obj.safeGetString("reason").orEmpty(),
+            blockedAt = obj.safeGetString("blocked_at")?.toLongOrNull() ?: 0L,
+            blockedBy = obj.safeGetString("blocked_by").orEmpty()
+        )
+    }
+}
+
+/**
+ * 解析待批准列表（`GET /api/pairing/approvals` 的 `approvals`，2026-10-15）。
+ *
+ * `code` 是弹窗要大字显示的 6 位配对码 —— 它只在这个**已鉴权**的接口里出现，
+ * 请求方自己的 `request-approval` 响应里永远没有它。
+ *
+ * 2026-10-17：**已批准/已拒绝的条目直接丢掉**。服务端已经过滤过一次，这里再滤一遍是防御性的 ——
+ * 之前弹窗"点了允许关不掉、反复弹"就是因为已批准的条目还留在列表里。
+ */
+fun parsePendingApprovals(el: JsonElement?): List<PendingApprovalItem> {
+    if (el !is JsonArray) return emptyList()
+    return el.mapNotNull { item ->
+        val obj = item as? JsonObject ?: return@mapNotNull null
+        val sid = obj.safeGetString("sid")?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        // 已处理过的不再算"待批准"
+        val approved = obj.safeGetString("approved")?.toBooleanStrictOrNull() ?: false
+        val rejected = obj.safeGetString("rejected")?.toBooleanStrictOrNull() ?: false
+        if (approved || rejected) return@mapNotNull null
+        PendingApprovalItem(
+            sid = sid,
+            code = obj.safeGetString("code").orEmpty(),
+            deviceName = obj.safeGetString("device_name").orEmpty(),
+            source = obj.safeGetString("source").orEmpty(),
+            requestedAt = obj.safeGetString("requested_at")?.toLongOrNull() ?: 0L,
+            expiresAt = obj.safeGetString("expires_at")?.toLongOrNull() ?: 0L
+        )
+    }
+}
+
+/** 404 = 设备端没有这个端点（旧版 core）—— 属于"功能不可用"，不是用户做错了什么。 */
+private fun Exception.isEndpointMissing(): Boolean =
+    this is retrofit2.HttpException && code() == 404
 
 // ── 重启后端服务的恢复探测参数（2026-09-14，见 NetworkModule.restartBackendService）──
 //

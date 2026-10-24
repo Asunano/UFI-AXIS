@@ -131,8 +131,9 @@ class ForegroundRefreshFreshnessTest {
     private val appManagerPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/AppManagerModule.kt"
 
     /**
-     * 同样跨模块：刷新按钮 / 页签切换这两个 `loadAppList` 调用点的 `force` 分工写在**界面侧**，
-     * 判错的后果（刷新按钮被闸门吃掉 → 连点十次无反应）比模块内部写法回归更直观。
+     * 同样跨模块：`loadAppList` 的两个调用点（进页面 / 切页签）的 `force` 分工写在**界面侧**，
+     * 判错的后果（页签切换被 30s 闸门吃掉 → 停在旧页签数据上）比模块内部写法回归更直观。
+     * 2026-10-21 起顶栏「刷新」按钮已按用户要求删除，界面侧不再是它。
      */
     private val appScreenPath = "app/feature-apps/src/main/java/com/ufi_axis/ui/screens/AppScreen.kt"
     private val tunnelPath = "src/main/java/com/ufi_axis/viewmodel/viewmodel/module/TunnelModule.kt"
@@ -467,7 +468,8 @@ class ForegroundRefreshFreshnessTest {
      *
      * ## 三条不变量
      * 1. `loadAppList` 必须有 `force` 形参 + `isForegroundDataFresh(…, APP_LIST_FRESH_MS)` 闸门；
-     * 2. **刷新按钮 / 页签切换 / 写后回读必须 `force = true`**（界面 2 处 + 模块内 3 处）；
+     * 2. **页签切换 / 写后回读必须 `force = true`**（界面 1 处 + 模块内 3 处；
+ *    顶栏「刷新」按钮那 1 处已于 2026-10-21 按用户要求删除）；
      * 3. 成功时刻必须用单调时钟 `SystemClock.elapsedRealtime()`，且**只在成功后**打戳
      *    （失败也打戳 ⇒ 一次网络抖动会让 30s 内后续所有进入都被闸门挡掉，页面停在空态）。
      *
@@ -508,23 +510,36 @@ class ForegroundRefreshFreshnessTest {
     }
 
     /**
-     * 界面侧两个调用点的 `force` 分工（跨模块断言）。
+     * 界面侧的 `force` 分工（跨模块断言）。
      *
-     * 刷新按钮漏 force 的后果最直观：用户连点十次刷新，每次都被 30s 闸门吃掉，一个请求都不发，
-     * 而页面上什么也没变 —— 用户只会得出"这 app 坏了"。
+     * 2026-10-21：用户要求删掉顶栏「刷新」按钮，于是本页的**用户显式动作**只剩「切页签」一处 ——
+     * 它仍必须 `force = true`，否则 30s 闸门会把它当成"数据还新鲜"直接返回，
+     * 页面就永远停在旧页签的数据上（没有编译错误，也没有任何提示）。
+     * 同一天补上的**静默轮询**是反面：自动路径必须走非 force，靠闸门省掉重复请求。
      * 反过来给进页面那处加了 force，本批次客户端侧的一半收益直接归零。
      */
     @Test
-    fun appListRefreshButtonAndTabSwitch_mustForce() {
+    fun appListTabSwitch_mustForce_andNoTopBarRefresh() {
         val code = executableCode(source(appScreenPath))
 
-        assertTrue(
-            "找不到顶栏刷新按钮的调用点 —— 若它没带 force，闸门会把用户显式动作吃掉。",
+        assertFalse(
+            "顶栏「刷新」按钮又回来了 —— 用户 2026-10-21 明确删除。若要恢复，" +
+                "必须同时给它 `force = true`，并把本断言连同下面的计数一起改回来。",
             Regex("""Icons\.Default\.Refresh""").containsMatchIn(code)
         )
+        // 2026-10-21 补：删掉刷新按钮后，本页唯一的自动刷新出口是静默轮询。
+        // 它必须走**非 force** 路径 —— force 会绕过 30s 新鲜窗口，每轮白付一次 core 的
+        // `listApps`（4 条特权 shell）。断言刻意只认「delay(APP_LIST_POLL_MS) 之后那次
+        // loadAppList(state.filter)」，不锁死循环写法；但只要这里出现 force = true 就算回归。
+        assertTrue(
+            "找不到静默轮询调用点（delay(APP_LIST_POLL_MS) → loadAppList(state.filter)）—— " +
+                "顶栏刷新按钮删除后，这一页就没有任何自动刷新出口了。",
+            Regex("""delay\(APP_LIST_POLL_MS\)[\s\S]{0,200}loadAppList\(state\.filter\)""").containsMatchIn(code)
+        )
         assertEquals(
-            "刷新按钮 + 页签切换两处都必须显式 `force = true`（进页面那处刻意不带）。",
-            2L,
+            "界面侧 `loadAppList(… force = true)` 应只剩「切页签」这一处（进页面那处刻意不带 force）；" +
+                "多出来的那处就是刷新按钮被悄悄加回来了。",
+            1L,
             Regex("""loadAppList\([^)]*force\s*=\s*true""").findAll(code).count().toLong()
         )
         assertTrue(

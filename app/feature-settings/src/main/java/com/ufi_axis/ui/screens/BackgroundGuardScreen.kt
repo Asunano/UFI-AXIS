@@ -167,18 +167,16 @@ fun BackgroundGuardScreen(
                     },
                     enabled = guardState.enabled,
                     trailing = {
-                        // 2026-08-31：3 个手绘 FilterChip → 公共 UfiSingleChipSelector
-                        //（新增的 enabled 参数负责整组置灰；chip 间距 6dp → Spacing.Small 4dp）
-                        UfiSingleChipSelector(
-                            options = listOf("15" to "15", "30" to "30", "60" to "60"),
-                            selectedValue = guardState.intervalMinutes.toString(),
-                            onSelect = { value ->
-                                val minutes = value.toInt()
+                        // 2026-10-24：三档 chip → 公共下拉（用户要求；选项少但和其它设置项一致）
+                        UfiDropdown(
+                            selectedValue = guardState.intervalMinutes,
+                            options = listOf(15, 30, 60),
+                            optionLabel = { "$it 分钟" },
+                            onValueSelected = { minutes ->
                                 viewModel.backgroundGuard.setInterval(minutes)
                                 configClient.setGuardIntervalMinutes(minutes)
                                 syncNotifyField("guard_interval_minutes", minutes)
                             },
-                            wrapContent = true,
                             enabled = guardState.enabled
                         )
                     }

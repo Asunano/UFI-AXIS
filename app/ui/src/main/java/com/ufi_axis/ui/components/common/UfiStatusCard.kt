@@ -9,6 +9,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
@@ -20,6 +21,11 @@ import com.ufi_axis.ui.theme.UfiTextStyles
  *
  * 用于"某个服务/隧道现在是什么状态"这类一行式展示，取色与圆角统一走
  * [LocalResolvedPalette] + [UfiCardDefaults]，不要在业务页里自绘 Surface + pill。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 [UfiSettingsRowCard] /
+ * [UfiSettingsGroup] 对齐；**调用方不要再补水平 padding**，那会叠成 32dp 的双重内距。
+ * [horizontalMargin] 只服务于"已经身处有横向内距的容器里"的调用点（例如短信页那个
+ * `contentPadding = 16dp` 的 LazyColumn），那里显式传 `0.dp`。
  */
 @Composable
 fun UfiStatusCard(
@@ -28,11 +34,12 @@ fun UfiStatusCard(
     modifier: Modifier = Modifier,
     statusType: UfiBadgeType = UfiBadgeType.DEFAULT,
     subtitle: String? = null,
-    trailing: @Composable (() -> Unit)? = null
+    trailing: @Composable (() -> Unit)? = null,
+    horizontalMargin: Dp = Spacing.CardHorizontalMargin
 ) {
     val palette = LocalResolvedPalette.current
     Surface(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().padding(horizontal = horizontalMargin),
         shape = UfiCardDefaults.shape,
         color = palette.cardBg,
         border = BorderStroke(1.dp, palette.cardBorder)
@@ -43,7 +50,7 @@ fun UfiStatusCard(
         ) {
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+                verticalArrangement = Arrangement.spacedBy(Spacing.TextStackGap)
             ) {
                 Text(
                     text = title,

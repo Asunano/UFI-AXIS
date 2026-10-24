@@ -33,7 +33,15 @@ data class MonitorSettings(
     val thermalPauseSec: Int = 20,                         // ⑫ 熔断后暂停采集时长秒（5..300）
     // ── 2026-09-08 补齐：上一次漏掉的两个 DataScheduler 常量 ──
     val trafficLimitCheckSec: Int = 300,                   // ⑬ 套餐限额检查间隔秒（60..3600）
-    val deviceEventCheckSec: Int = 60                      // ⑭ 设备接入/离开比对间隔秒（15..600）
+    val deviceEventCheckSec: Int = 60,                     // ⑭ 设备接入/离开比对间隔秒（15..600）
+    // ── 智能采集节拍（2026-10-14 接线；core 侧真源是 `smart_loop_*` 原始键）──
+    // 与上面几项同一类：DataScheduler 的 SmartLoop 每轮现读，改完下一轮生效。
+    // 默认值必须与 core 的 `SmartLoopTuning.defaults()` 逐字一致（= SmartLoop 伴生对象的
+    // IDLE/ACTIVE/HEAVY 常量 + enabled=true），抄错一个数就等于"升级后设备行为变了"。
+    val smartLoopEnabled: Boolean = true,                  // ⑮ false = 所有采集循环退回固定间隔（故障回退开关）
+    val smartLoopIdleBps: Long = 16 * 1024,                // ⑯ 零流量判定阈值 bytes/s（< 中流量阈值）
+    val smartLoopActiveBps: Long = 1 * 1024 * 1024,        // ⑰ 中流量阈值 bytes/s（idle 与 heavy 之间）
+    val smartLoopHeavyBps: Long = 20 * 1024 * 1024         // ⑱ 大流量阈值 bytes/s（> 中流量阈值）
 )
 
 /**
@@ -103,7 +111,12 @@ data class MonitorPrefsPayload(
     val thermalCriticalC: Int = 80,
     val thermalPauseSec: Int = 20,
     val trafficLimitCheckSec: Int = 300,
-    val deviceEventCheckSec: Int = 60
+    val deviceEventCheckSec: Int = 60,
+    // 2026-10-14 智能采集节拍：同样带默认值，旧版 core（不返回这四项）也能反序列化成功
+    val smartLoopEnabled: Boolean = true,
+    val smartLoopIdleBps: Long = 16 * 1024,
+    val smartLoopActiveBps: Long = 1 * 1024 * 1024,
+    val smartLoopHeavyBps: Long = 20 * 1024 * 1024
 )
 
 /** 把 core 回读到的偏好覆盖到本地设置上，保留本地 `collectEnabled`。 */
@@ -122,7 +135,11 @@ fun MonitorSettings.applyRemote(remote: MonitorPrefsPayload): MonitorSettings = 
     thermalCriticalC = remote.thermalCriticalC,
     thermalPauseSec = remote.thermalPauseSec,
     trafficLimitCheckSec = remote.trafficLimitCheckSec,
-    deviceEventCheckSec = remote.deviceEventCheckSec
+    deviceEventCheckSec = remote.deviceEventCheckSec,
+    smartLoopEnabled = remote.smartLoopEnabled,
+    smartLoopIdleBps = remote.smartLoopIdleBps,
+    smartLoopActiveBps = remote.smartLoopActiveBps,
+    smartLoopHeavyBps = remote.smartLoopHeavyBps
 )
 
 /** 抽出要上行到 core 的偏好项。 */
@@ -141,7 +158,11 @@ fun MonitorSettings.toRemotePayload(): MonitorPrefsPayload = MonitorPrefsPayload
     thermalCriticalC = thermalCriticalC,
     thermalPauseSec = thermalPauseSec,
     trafficLimitCheckSec = trafficLimitCheckSec,
-    deviceEventCheckSec = deviceEventCheckSec
+    deviceEventCheckSec = deviceEventCheckSec,
+    smartLoopEnabled = smartLoopEnabled,
+    smartLoopIdleBps = smartLoopIdleBps,
+    smartLoopActiveBps = smartLoopActiveBps,
+    smartLoopHeavyBps = smartLoopHeavyBps
 )
 
 /** `PUT /api/monitor/preferences` 的响应：回显服务端合并+校验后的最终值。 */

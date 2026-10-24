@@ -16,6 +16,7 @@ android {
 }
 
 dependencies {
+    implementation(project(":app:feature-tools"))
     implementation(project(":app:viewmodel"))
     implementation(project(":app:data"))
     implementation(project(":app:ui"))

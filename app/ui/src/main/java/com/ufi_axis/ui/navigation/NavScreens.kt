@@ -223,9 +223,25 @@ object Routes {
 
     const val DETAIL_DEBUG_LOG = "detail/debug-log"
     const val DETAIL_DIAGNOSE = "detail/diagnose"
+    /** 诊断中心分组子页（2026-10-20）：{group} = env / network / service / advanced。 */
+    const val DETAIL_DIAGNOSE_GROUP = "detail/diagnose/{group}"
+    fun diagnoseGroupRoute(group: String) = "detail/diagnose/$group"
     const val DETAIL_MONITOR = "detail/monitor"
     const val DETAIL_MONITOR_SETTINGS = "detail/monitor-settings"
-    /** DLNA 投屏（2026-10-09）：MediaServer 开关 + 共享目录。入口在设置页。 */
+
+    /**
+     * 流量报表（日报 / 周报 / 月报，2026-10-14 接入 core 的 `GET /api/traffic/report`）。
+     *
+     * 入口在**监控中心总览**（`MonitorScreen` 里 hero 卡下面那一行）。选那里的理由：报表是
+     * "看数"的产物，与总览的今日流量是同一件事的不同时间尺度；设置页收的是"改配置"，
+     * 把只读报表挂过去会让人以为它是个开关。
+     *
+     * **不进** `ServiceGate.SERVICE_INDEPENDENT_ROUTES`：数据全在 core 侧（`traffic_hourly`），
+     * 停服时这一页没有任何东西可显示。监控设置那几条在名单里，是因为它们改的是 core 的
+     * 持久化配置、停服时正需要能改回来 —— 两者性质不同。
+     */
+    const val DETAIL_TRAFFIC_REPORT = "detail/traffic-report"
+    /** DLNA 服务（2026-10-09；2026-10-15 由「DLNA 投屏」更名）：MediaServer 开关 + 共享目录。入口在设置页。 */
     const val DETAIL_DLNA = "detail/dlna"
     // 监控设置的分组：2026-09-03 从"同一页内的局部状态"改成独立页面，
     // 与「设置 → 服务器 → 服务器配置」同构（每一级都是路由，转场/返回/系统返回键全部由导航接管）
@@ -276,6 +292,36 @@ object Routes {
     const val DETAIL_BACKGROUND_GUARD = "detail/background-guard"
     /** 配置备份与恢复（2026-09-11）：core + 本机偏好合体的 `.ufibak` 包导出 / 导入。 */
     const val DETAIL_BACKUP_RESTORE = "detail/backup-restore"
+
+    // 2026-10-14：`DETAIL_DONATE = "detail/donate"` 已**删除**，不是改名、也没有保留兼容壳。
+    //
+    // 它对应的 `DonateScreen`（"赞赏码独立整页"那一版）随用户要求一起撤掉了 ——
+    // 原话是「赞赏按钮打开闪退，app 端恢复之前的赞赏按钮修改，**不需要额外的赞赏入口，
+    // 只需要按钮即可**」。于是关于页那颗 `UfiButtonVariant.Donate` 按钮改回**打开赞赏弹窗**，
+    // 这条路由就没有任何入口了。
+    //
+    // 为什么连路由一起删、而不是留一条"以后可能有用"的死路由：
+    //  · 没有入口的 DETAIL 路由只会让 `RouteBindingGuardTest` 与后来读代码的人多问一句；
+    //  · 更要紧的是它会成为同一批 1260px 赞赏码位图的**第二个解码 / 渲染点** ——
+    //    那正是"打开赞赏就崩"会复发的形态（三层设防只能有一个落点）。
+    // 所以 文件 / 本常量 / `appRoutes` 条目 / `AppScreens` 登记 **四处一并删除**。
+    //
+    // ⚠ 赞赏码本身没有消失：它只渲染在 `AboutDeviceScreen` 的赞赏弹窗里。
+    // ⚠ `ServiceGate.SERVICE_INDEPENDENT_ROUTES` 本来就没有这条路由（那是对的），无需再动。
+
+    /**
+     * **赞助与感谢**（2026-10-14）：只有赞助名单（构建期打进 assets 的保底数据，
+     * 再由 `GET /api/sponsors` 覆盖）。屏幕实现在 `feature-settings` 的 `SponsorsScreen`。
+     *
+     * 本页**一张位图都不渲染**：赞赏码只在关于页那个赞赏弹窗里（见上面那段关于
+     * `DETAIL_DONATE` 被删除的说明）。名单页**保留** —— 用户要撤的是"额外的赞赏**入口**"，
+     * 不是这份名单，两者本来就不是一回事。
+     *
+     * 入口在关于页（一颗「赞助与感谢」行卡）。
+     * **不进** `ServiceGate.SERVICE_INDEPENDENT_ROUTES`：它既不是设置入口也不是排障工具，
+     * 停服时被换成「服务已停止」占位页不影响任何恢复路径（名单本来就有一份内置保底）。
+     */
+    const val DETAIL_SPONSORS = "detail/sponsors"
     const val DETAIL_TUNNEL = "detail/tunnel"
     // FIX-9（2026-08-23）：内网穿透拆 3 屏：主页（入口列表）+ FRP 详情 + CF Tunnel 详情 + 通用设置
     const val DETAIL_TUNNEL_FRP = "detail/tunnel/frp"
@@ -294,6 +340,38 @@ object Routes {
     // 2026-08-26：CF 也拆为「隧道列表」+「单隧道管理」
     const val DETAIL_TUNNEL_CF_TUNNEL = "detail/tunnel/cf/tunnel?name={name}"
     const val DETAIL_TUNNEL_SETTINGS = "detail/tunnel/settings"
+    /**
+     * 内网穿透通用设置的三个子页（2026-10-14）。
+     *
+     * 拆页判据是**一件事一页**：[DETAIL_TUNNEL_SETTINGS] 此前同时装了三件刷新节奏完全不同的事
+     * （组件清单要 1.5s 懒加载 + 安装任务 1s 轮询；看护设置只需一次带闸门的读取；日志与路径
+     * 什么都不用拉），只想改"断开自动重连"的人要先滚过整张组件清单。原路由保留为**入口列表页**
+     * （一行一个子页入口），所以 `TunnelScreen` 顶栏齿轮的调用点不用改。
+     *
+     * ⚠ 三条子路由必须同时在 `ServiceGate.SERVICE_INDEPENDENT_ROUTES` 白名单里：
+     * 停服时这些页面被换成占位页的话，用户就没有地方把配置改回来（原 [DETAIL_TUNNEL_SETTINGS]
+     * 就在那份名单里）。
+     */
+    const val DETAIL_TUNNEL_SETTINGS_COMPONENTS = "detail/tunnel/settings/components"
+    const val DETAIL_TUNNEL_SETTINGS_RECONNECT = "detail/tunnel/settings/reconnect"
+    const val DETAIL_TUNNEL_SETTINGS_LOG = "detail/tunnel/settings/log"
+
+    /**
+     * **资源中心**（2026-10-14）：把散落的可下载资源收拢到一处。
+     *
+     * 本批三类：Web 前端 ZIP、frpc、cloudflared。屏幕实现是
+     * `com.ufi_axis.ui.resources.ResourcesScreen`（模块 `:app:feature-resources`），
+     * 但路由常量按本仓惯例仍定义在 `:app:ui` —— 三个 feature 模块（tools / settings / resources）
+     * 因此都只依赖一个字符串常量，彼此之间**零新增依赖**。
+     *
+     * 它取代了两个旧入口（两处都只留一颗"前往资源中心"的行卡）：
+     *  · `feature-tools` 的「组件管理」整页（原 `DETAIL_TUNNEL_SETTINGS_COMPONENTS`，保留但不再挂载）；
+     *  · `feature-settings` 的服务器配置页里「Web 面板」那颗行卡 + 它的管理弹窗。
+     *
+     * **必须同时在 `ServiceGate.SERVICE_INDEPENDENT_ROUTES` 白名单里**：上传坏 Web 产物之后
+     * 面板自己打不开，而"把服务开回来 / 把面板换回来"正是停服状态下最需要能做的事。
+     */
+    const val DETAIL_RESOURCES = "detail/resources"
 
     /**
      * 构造 FRP 单隧道配置页路由（隧道名可能含中文/空格）。
@@ -353,6 +431,26 @@ object Routes {
     const val MEDIA_VIDEO_SETTINGS = "media/library/video/settings"
 
     /**
+     * 视频设置的三个子页（2026-10-14）。
+     *
+     * [MEDIA_VIDEO_SETTINGS] 此前把四件刷新节奏完全不同的事装在一屏（扫描范围是 core 侧配置、
+     * 预热要每 3s 拉快照、封面缓存是动作、下载是落点说明 + 队列入口），只想清一次封面缓存的人
+     * 也要先滚过预热进度条。原路由保留为**入口列表页**（一行一个子页入口），所以视频页工具条
+     * 那颗齿轮的调用点不用改。
+     */
+    const val MEDIA_VIDEO_SETTINGS_SCAN = "media/library/video/settings/scan"
+    const val MEDIA_VIDEO_SETTINGS_PLAYBACK = "media/library/video/settings/playback"
+    const val MEDIA_VIDEO_SETTINGS_COVERS = "media/library/video/settings/covers"
+
+    /**
+     * 视频设置补的两页（2026-10-21）：
+     * · **显示与字幕**：海报墙列数 + 字幕三项（自动显示 / 字号 / 半透明底）；
+     * · **最近播放**：可以逐条查看与续播（原来只能清空，看不到列表）。
+     */
+    const val MEDIA_VIDEO_SETTINGS_DISPLAY = "media/library/video/settings/display"
+    const val MEDIA_VIDEO_RECENT = "media/library/video/recent"
+
+    /**
      * 视频下载任务：队列 + 历史（2026-09-20 从 [MEDIA_VIDEO_SETTINGS] 拆出）。
      *
      * 拆页判据是**条数是否固定**：设置项的条数写死在代码里，而队列与历史的条数由使用量决定、
@@ -378,6 +476,15 @@ object Routes {
      * 误操作就等于永久丢歌。所以它不是可选的附属页。
      */
     const val MEDIA_AUDIO_EXCLUDED = "media/library/audio/excluded"
+
+    /**
+     * 音乐的「最近播放」与「下载记录」（2026-10-21）。
+     *
+     * 两件事此前都**没有入口**：播放记录只存在于本机偏好里、下载记录写进去了却没有任何页面读。
+     * 它们各自一页，而不是塞进设置页 —— 都是可以逐条查看/操作的列表，不是"配一次就不动"的开关。
+     */
+    const val MEDIA_AUDIO_RECENT = "media/library/audio/recent"
+    const val MEDIA_AUDIO_DOWNLOADS = "media/library/audio/downloads"
 
 
     /**
@@ -454,7 +561,11 @@ val appRoutes: List<AppRoute> = listOf(
 
     AppRoute(Routes.DETAIL_SERVER_CONFIG, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TOOLS_ADVANCED, TransitionType.DETAIL),
-    AppRoute(Routes.DETAIL_PTY_TERMINAL, TransitionType.DETAIL),
+    // 2026-10-24：PTY 页面绑定仍是注释（见 AppScreens.rawAppScreens），路由不能再留着。
+    // 只藏绑定不撤路由，深链/外部 Intent 仍能导航到这个地址，而
+    // `screens[appRoute.route]?.invoke(...)` 拿到 null → 白屏。
+    // 恢复时解除下面一行，并同时恢复 AppScreens 的页面绑定。
+    // AppRoute(Routes.DETAIL_PTY_TERMINAL, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TOOLS_EXTRA, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_SPEED_TEST, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TRAFFIC_MGMT, TransitionType.DETAIL),
@@ -499,7 +610,16 @@ val appRoutes: List<AppRoute> = listOf(
     ),
     AppRoute(Routes.DETAIL_DEBUG_LOG, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DIAGNOSE, TransitionType.DETAIL),
+    AppRoute(
+        route = Routes.DETAIL_DIAGNOSE_GROUP,
+        transition = TransitionType.DETAIL,
+        arguments = listOf(
+            navArgument("group") { type = NavType.StringType; defaultValue = "env" }
+        )
+    ),
     AppRoute(Routes.DETAIL_MONITOR, TransitionType.DETAIL),
+    // 流量报表（2026-10-14）：日报/周报/月报，入口在监控中心总览。
+    AppRoute(Routes.DETAIL_TRAFFIC_REPORT, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DOWNLOADS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DOWNLOAD_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_DOWNLOAD_BASIC, TransitionType.DETAIL),
@@ -522,6 +642,10 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_ALERT_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_BACKGROUND_GUARD, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_BACKUP_RESTORE, TransitionType.DETAIL),
+    // 赞赏（2026-10-14）：`DETAIL_DONATE` 那条整页路由已删除（理由见 Routes 里的说明）。
+    // 赞赏码现在只渲染在关于页的赞赏弹窗里，不再是一条导航目的地。
+    // 赞助与感谢（2026-10-14）：只有赞助名单。入口在关于页。
+    AppRoute(Routes.DETAIL_SPONSORS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TUNNEL, TransitionType.DETAIL),
     // FIX-9：内网穿透三拆路由
     AppRoute(Routes.DETAIL_TUNNEL_FRP, TransitionType.DETAIL),
@@ -542,6 +666,13 @@ val appRoutes: List<AppRoute> = listOf(
         )
     ),
     AppRoute(Routes.DETAIL_TUNNEL_SETTINGS, TransitionType.DETAIL),
+    // 2026-10-14：通用设置拆出的三个子页（入口列表页仍是上面那条 DETAIL_TUNNEL_SETTINGS）
+    AppRoute(Routes.DETAIL_TUNNEL_SETTINGS_COMPONENTS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_TUNNEL_SETTINGS_RECONNECT, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_TUNNEL_SETTINGS_LOG, TransitionType.DETAIL),
+    // 资源中心（2026-10-14）：Web 前端 ZIP / frpc / cloudflared 的注册表驱动收拢页。
+    // 入口来自隧道设置的「组件管理」行与服务器配置的「Web 面板」行。
+    AppRoute(Routes.DETAIL_RESOURCES, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_SERVER, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_NOTIFICATIONS_GUARD, TransitionType.DETAIL),
 
@@ -571,9 +702,17 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.MEDIA_LIBRARY_AUDIO, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_LIBRARY_IMAGE, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_VIDEO_SETTINGS, TransitionType.DETAIL),
+    // 2026-10-14：视频设置拆出的三个子页（入口列表页仍是上面那条 MEDIA_VIDEO_SETTINGS）
+    AppRoute(Routes.MEDIA_VIDEO_SETTINGS_SCAN, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_VIDEO_SETTINGS_PLAYBACK, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_VIDEO_SETTINGS_COVERS, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_VIDEO_SETTINGS_DISPLAY, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_VIDEO_RECENT, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_VIDEO_DOWNLOADS, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_AUDIO_SETTINGS, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_AUDIO_EXCLUDED, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_AUDIO_RECENT, TransitionType.DETAIL),
+    AppRoute(Routes.MEDIA_AUDIO_DOWNLOADS, TransitionType.DETAIL),
     AppRoute(Routes.MEDIA_IMAGE_SETTINGS, TransitionType.DETAIL),
     // 分组详情：两个参数都给空缺省，缺参进来时至少能落到一个不崩的页面（列表为空 + 维度名当标题）
     AppRoute(

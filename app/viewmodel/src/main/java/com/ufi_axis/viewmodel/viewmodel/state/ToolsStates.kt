@@ -453,6 +453,9 @@ data class LogSwitchState(
  *
  * core 崩溃后由 keepalive 脚本 / START_STICKY 自动拉起，HTTP 很快恢复，用户只看到数据断了一下；
  * 这里把它显式提示出来。[timestamp] 同时是去重键（写回 `AppPreferences.coreCrashShownAt`）。
+ *
+ * 2026-10-23：只有 core 判定 `recent`（7 天内）的崩溃才会走到这里；记账在发出提示前完成，
+ * 见 `ToolsModule.loadCoreCrashNotice` 与 `com.ufi_axis.util.CoreCrashPolicy`。
  */
 data class CoreCrashNotice(
     val timestamp: Long,

@@ -54,7 +54,8 @@ fun DownloadSettingsScreen(
         showBack = true
     ) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            // 平级单行卡之间的间距统一走 Spacing.SettingsCardGap（10dp），与网络设置页同构。
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)) {
                 if (state.pendingEngineRestart) {
                     PendingRestartNotice()
                 }
@@ -136,25 +137,34 @@ fun DownloadBasicSettingsScreen(
         toast = toast,
         onToastDismiss = { toast = null }
     ) {
-        SettingsCard(title = "并发与限速") {
-            SettingSliderRow(
+        // 一项一张 UfiSettingsRowCard，与网络设置页同构：原来这里是
+        // `SettingsCard("并发与限速")` = UfiSettingsGroup + UfiGroupHeader 的多项一卡，
+        // 组标题的语义由各行自己的 title 表达，条目之间的 UfiDivider 一并删掉。
+        //
+        // 2026-10-14：这两个值**从滑块改成下拉框**。它们是"从 1 数到 10 / 16"的离散小整数，
+        // 滑块的毛病是：档位挤在几十 dp 里，想精确落到 7 要试两次；而量程两端还要单独占一行
+        // 刻度文字。下拉框一次点准，且值本身就在触发器上（见 SettingDropdownRow）。
+        UfiSettingsRowCard {
+            SettingDropdownRow(
                 label = "最大并发下载数",
                 value = draft.maxConcurrent,
-                range = 1..10,
+                options = (1..10).toList(),
                 unit = "个",
                 description = "同时下载的任务数量，超出的排队等待",
                 onValueChange = { draft = draft.copy(maxConcurrent = it) }
             )
-            UfiDivider()
-            SettingSliderRow(
+        }
+        UfiSettingsRowCard {
+            SettingDropdownRow(
                 label = "每服务器最大连接数",
                 value = draft.maxConnectionsPerServer,
-                range = 1..16,
+                options = (1..16).toList(),
                 unit = "连接",
                 description = "对同一服务器并行建立的连接数，太高可能被服务端拒绝",
                 onValueChange = { draft = draft.copy(maxConnectionsPerServer = it) }
             )
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SpeedLimitRow(
                 label = "全局速度限制",
                 valueBytes = draft.globalSpeedLimit,
@@ -163,7 +173,14 @@ fun DownloadBasicSettingsScreen(
             )
         }
 
-        SettingsCard(title = "保存路径") {
+        // 保存路径：输入框 + 快捷路径下拉 + 路径校验是**同一个设置项**的三段（见规则 4），
+        // 所以留在同一张行卡里不拆开。卡内的 8dp 是**表单字段之间**的间距，保持原样
+        //（只有平级卡片之间才用 Spacing.SettingsCardGap）。组标题「保存路径」由输入框自己的
+        // label（默认保存路径）表达，不再单列一行标题。
+        UfiSettingsRowCard(contentPadding = PaddingValues(Spacing.XLarge)) {
+            // 2026-10-15（用户："恢复之前的输入框上下宽度"）：回到标准形态的输入框
+            //（M3 56dp + 浮动 label + 左侧文件夹图标）—— 上一版压成 32dp 的紧凑形态在纵向
+            // 布局里显得单薄。紧凑形态留给"与单位下拉框并排"那一处（见 SpeedLimitRow）。
             UfiTextField(
                 value = draft.saveDir,
                 onValueChange = { draft = draft.copy(saveDir = it) },
@@ -180,25 +197,47 @@ fun DownloadBasicSettingsScreen(
                 leadingIcon = { Icon(Icons.Default.Folder, contentDescription = null) }
             )
             Spacer(Modifier.height(8.dp))
-            Text(
-                "快捷路径",
-                style = UfiTextStyles.caption,
-                color = palette.textSecondary,
-                modifier = Modifier.padding(bottom = 4.dp)
-            )
             val presets = listOf(
                 "/storage/emulated/0/Download/UFI-AXIS/Download" to "UFI-AXIS（默认）",
                 "/storage/emulated/0/Download" to "系统下载",
                 "/storage/emulated/0/Movies" to "视频",
                 "/storage/emulated/0/Documents" to "文档"
             )
-            UfiSingleChipSelector(
-                options = presets,
-                selectedValue = draft.saveDir,
-                onSelect = { path -> draft = draft.copy(saveDir = path) },
-                wrapContent = true,
-                wrap = true
-            )
+            /*
+             * 快捷路径：2026-10-14 从 chip 组改成下拉框。
+             *
+             * chip 组在这里的毛病是**长度不可控**：四个候选的显示名长短差得多
+             *（"UFI-AXIS（默认）" 与 "视频"），`wrap = true` 之后占两三行，把下面的校验行
+             * 推得远远的；而它表达的本就是"从四个预设里挑一个"—— 正是下拉框的形状。
+             *
+             * `selectedValue` 传 **null = 自定义**：路径是自由文本，用户手打的任何路径都不在预设里，
+             * 这时下拉框显示"自定义"，而不是假装选中了某一个预设（那会让人以为路径被改过）。
+             */
+            val presetPaths = presets.map { it.first }
+            val selectedPreset = presetPaths.firstOrNull { it == draft.saveDir }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "快捷路径",
+                    style = UfiTextStyles.caption,
+                    color = palette.textSecondary,
+                    modifier = Modifier.weight(1f)
+                )
+                UfiDropdown(
+                    selectedValue = selectedPreset,
+                    options = presetPaths + listOf(null),
+                    onValueSelected = { path ->
+                        // 选"自定义"什么都不做：输入框里那一份就是自定义值，别把它清掉
+                        if (path != null) draft = draft.copy(saveDir = path)
+                    },
+                    modifier = Modifier.width(180.dp),
+                    optionLabel = { path ->
+                        presets.firstOrNull { it.first == path }?.second ?: "自定义"
+                    }
+                )
+            }
             Spacer(Modifier.height(6.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -265,14 +304,19 @@ fun DownloadThrottleSettingsScreen(
             }
         }
     ) {
-        SettingsCard(title = "开关") {
+        // 一项一张 UfiSettingsRowCard（与网络设置页同构）：原来这里是 5 个
+        // `SettingsCard(...)` = UfiSettingsGroup + UfiGroupHeader 的多项一卡，
+        // 组标题（开关 / 温度阈值 / CPU 阈值 / 电量阈值 / 内存阈值）的语义都由各行自己的
+        // title 表达（"警告温度""CPU 警告""内存临界"…），条目之间的 UfiDivider 一并删掉。
+        UfiSettingsRowCard {
             SettingSwitchRow(
                 label = "启用智能限速",
                 description = "根据温度、CPU、电量和内存动态调整下载性能",
                 checked = draft.smartThrottle,
                 onCheckedChange = { draft = draft.copy(smartThrottle = it) }
             )
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SettingSwitchRow(
                 label = "仅充电时下载",
                 description = "设备未充电时自动暂停，充电后自动恢复",
@@ -281,43 +325,59 @@ fun DownloadThrottleSettingsScreen(
             )
         }
 
+        /*
+         * 文案修（2026-10-13）：这一组原来 8 条描述里有 5 条只写「降到 50% / 降到 20%」，
+         * **缺主语**。「内存占用超过此值降到 50%」字面上读起来像"内存占用会掉到 50%"，
+         * 而实际语义是「**下载速度**降到 50%」。同组的「警告温度」那条恰好写了主语
+         *（"超过后下载速度降到 50%"），所以这不是风格差异，是漏字 —— 属"明显有歧义"一类。
+         * 现在 6 条降速描述统一补主语并用逗号断句，口径一致。
+         * （另外 2 条本来就清楚：「电量临界」写的是暂停下载、「电量警告」带充电条件说明。）
+         */
         if (draft.smartThrottle) {
-            SettingsCard(title = "温度阈值") {
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "警告温度", value = draft.throttleTempWarn.toInt(), range = 40..80,
-                    unit = "°C", description = "超过后下载速度降到 50%",
+                    unit = "°C", description = "超过后，下载速度降到 50%",
                     onValueChange = { draft = draft.copy(throttleTempWarn = it.toFloat()) })
-                UfiDivider()
+            }
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "临界温度", value = draft.throttleTempCritical.toInt(), range = 50..90,
-                    unit = "°C", description = "超过后降到 20%，持续过热则暂停任务",
+                    unit = "°C", description = "超过后，下载速度降到 20%；持续过热则暂停任务",
                     onValueChange = { draft = draft.copy(throttleTempCritical = it.toFloat()) })
             }
-            SettingsCard(title = "CPU 阈值") {
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "CPU 警告", value = draft.throttleCpuWarn, range = 30..95,
-                    unit = "%", description = "CPU 占用超过此值降到 50%",
+                    unit = "%", description = "CPU 占用超过此值，下载速度降到 50%",
                     onValueChange = { draft = draft.copy(throttleCpuWarn = it) })
-                UfiDivider()
+            }
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "CPU 临界", value = draft.throttleCpuCritical, range = 40..100,
-                    unit = "%", description = "CPU 占用超过此值降到 20%",
+                    unit = "%", description = "CPU 占用超过此值，下载速度降到 20%",
                     onValueChange = { draft = draft.copy(throttleCpuCritical = it) })
             }
-            SettingsCard(title = "电量阈值（充电时不触发）") {
+            // 「电量阈值（充电时不触发）」这个组标题里的「充电时不触发」是行内没有的信息，
+            // 按拆分规则并进这一行的 description（文案其余部分一字未动）。
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "电量警告", value = draft.throttleBatteryWarn, range = 10..50,
-                    unit = "%", description = "电量低于此值降到 50%",
+                    unit = "%", description = "电量低于此值，下载速度降到 50%（充电时不触发）",
                     onValueChange = { draft = draft.copy(throttleBatteryWarn = it) })
-                UfiDivider()
+            }
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "电量临界", value = draft.throttleBatteryCritical, range = 5..30,
                     unit = "%", description = "电量低于此值暂停下载，充电或回升后自动恢复",
                     onValueChange = { draft = draft.copy(throttleBatteryCritical = it) })
             }
-            SettingsCard(title = "内存阈值") {
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "内存警告", value = draft.throttleMemoryWarn, range = 50..95,
-                    unit = "%", description = "内存占用超过此值降到 50%",
+                    unit = "%", description = "内存占用超过此值，下载速度降到 50%",
                     onValueChange = { draft = draft.copy(throttleMemoryWarn = it) })
-                UfiDivider()
+            }
+            UfiSettingsRowCard {
                 SettingSliderRow(label = "内存临界", value = draft.throttleMemoryCritical, range = 60..98,
-                    unit = "%", description = "内存占用超过此值降到 20%",
+                    unit = "%", description = "内存占用超过此值，下载速度降到 20%",
                     onValueChange = { draft = draft.copy(throttleMemoryCritical = it) })
             }
+            // 当前状态是一块只读读数面板（多指标网格 + 随状态变色的底），不是平级设置行，
+            // 保持原样：它本来就只有一层 Surface，没有套 UfiSettingsGroup / UfiGroupHeader。
             ThrottleStatusCard(state = state, draft = draft)
         }
     }
@@ -337,6 +397,8 @@ fun DownloadTrackerSettingsScreen(
     // Tracker 列表与上面那组自动更新配置是**两个独立的写**（不同端点），所以各自一个在飞标志：
     // 共用一个会让"保存列表"把上面那个保存按钮也一起置灰。
     var savingTrackerList by remember { mutableStateOf(false) }
+    // 2026-10-20（用户要求）：Tracker 列表编辑器从页内搬进**弹窗**，页面上只留一个入口行。
+    var showTrackerEditor by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val palette = LocalResolvedPalette.current
     val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()) }
@@ -367,21 +429,30 @@ fun DownloadTrackerSettingsScreen(
             }
         }
     ) {
-        SettingsCard(title = "自动更新") {
+        // 一项一张 UfiSettingsRowCard（与网络设置页同构）：原「自动更新」组拆成 4 张行卡
+        //（开关 / 更新间隔 chip / 源地址输入框 / 立即刷新动作行），组标题「自动更新」的语义
+        // 由第一行自己的 title（自动更新 Tracker）表达，条目之间的 UfiDivider 一并删掉。
+        UfiSettingsRowCard {
             SettingSwitchRow(
                 label = "自动更新 Tracker",
                 description = "定期从远程源拉取最新 Tracker 列表，拉到后热加载进运行中的 aria2",
                 checked = draft.btTrackerAutoUpdate,
                 onCheckedChange = { draft = draft.copy(btTrackerAutoUpdate = it) }
             )
-            UfiDivider()
-            ChipSelectorRow(
+        }
+        UfiSettingsRowCard {
+            // 2026-10-20：更新间隔从 chip 选择器改成下拉框（用户要求）。
+            SettingDropdownRow(
                 label = "更新间隔",
-                options = listOf("12" to "12 小时", "24" to "24 小时", "48" to "48 小时"),
-                selectedValue = draft.btTrackerUpdateIntervalHours.toString(),
-                onSelect = { draft = draft.copy(btTrackerUpdateIntervalHours = it.toInt()) }
+                value = draft.btTrackerUpdateIntervalHours,
+                options = listOf(12, 24, 48),
+                unit = "小时",
+                description = "多久从上面的源地址拉一次最新列表",
+                onValueChange = { draft = draft.copy(btTrackerUpdateIntervalHours = it) }
             )
-            UfiDivider()
+        }
+        // 单个输入框（表单字段）自成一张卡，卡内留白按公共约定用 16dp。
+        UfiSettingsRowCard(contentPadding = PaddingValues(Spacing.XLarge)) {
             UfiTextField(
                 value = draft.btTrackerSourceUrl,
                 onValueChange = { draft = draft.copy(btTrackerSourceUrl = it) },
@@ -395,63 +466,109 @@ fun DownloadTrackerSettingsScreen(
                     )
                 }
             )
-            Spacer(Modifier.height(8.dp))
-            UfiButton(
-                variant = UfiButtonVariant.Secondary,
-                text = if (state.trackerRefreshing) "刷新中…" else "立即刷新",
-                onClick = { viewModel.downloads.refreshTrackers() },
-                modifier = Modifier.fillMaxWidth()
+        }
+        // 组级动作独立成卡：原来它是「自动更新」卡底部的一颗通栏按钮，通栏会把这一组的
+        // 次要操作做成视觉上的主操作（见 UfiGroupHeader KDoc）。现在按钮进 UfiSettingsItem
+        // 的 trailing 槽，与 MediaVideoSettingsScreen 的「清空」「立即预热」两行同款；
+        // 行标题用的就是原按钮文案「立即刷新」，点击回调原样搬过来。
+        UfiSettingsRowCard {
+            UfiSettingsItem(
+                icon = Icons.Default.Refresh,
+                title = "立即刷新",
+                description = "从上面的源地址立刻拉一次最新列表，拉到后热加载进运行中的 aria2",
+                trailing = {
+                    UfiButton(
+                        text = if (state.trackerRefreshing) "刷新中…" else "刷新",
+                        onClick = { viewModel.downloads.refreshTrackers() },
+                        variant = UfiButtonVariant.Subtle,
+                        size = UfiButtonSize.Small
+                    )
+                }
             )
         }
 
-        SettingsCard(title = "当前状态") {
-            UfiInfoRow(label = "Tracker 数量", value = "${state.trackerCount} 条")
-            if (state.trackerLastUpdated > 0L) {
+        // 只读读数：每个 UfiInfoRow 各成一张行卡（与页面其余卡片同构）。
+        // 组标题「当前状态」不再单列 —— 三行各自的 label 就是它们各自的状态项，行文案一字未动。
+        UfiSettingsRowCard { UfiInfoRow(label = "Tracker 数量", value = "${state.trackerCount} 条") }
+        if (state.trackerLastUpdated > 0L) {
+            UfiSettingsRowCard {
                 UfiInfoRow(label = "上次更新", value = dateFormat.format(Date(state.trackerLastUpdated)))
             }
-            UfiInfoRow(label = "状态", value = state.trackerStatus)
+        }
+        UfiSettingsRowCard { UfiInfoRow(label = "状态", value = state.trackerStatus) }
+        // 这段说明原来贴在「当前状态」卡底；它不是设置行，按本仓约定（PoetrySettingsScreen /
+        // WeatherSettingsScreen 的说明卡同款）给纯文字一张 16dp 内距的行卡，不留卡外裸段落。
+        UfiSettingsRowCard(contentPadding = PaddingValues(Spacing.XLarge)) {
             Text(
                 "拉不到列表时后端会退回内置 Tracker，磁链不会因为列表为空而卡在获取种子信息。",
                 style = UfiTextStyles.note,
-                color = palette.textSecondary,
-                modifier = Modifier.padding(top = 4.dp)
+                color = palette.textSecondary
             )
         }
 
-        SettingsCard(title = "Tracker 列表（每行一个）") {
-            if (state.trackerListLoading) {
-                // 2026-09-04：原为不确定态 `LinearProgressIndicator`（无限左右扫动的 2dp 细条）。
-                // 下载模块本轮统一删掉所有动效，这里换成一行静态文案：
-                // 既没有动画，也仍然告诉用户"列表还在拉，现在框里是空的不代表没配置"。
-                Text(
-                    "正在载入 Tracker 列表…",
-                    style = UfiTextStyles.note,
-                    color = palette.textSecondary
-                )
-                Spacer(Modifier.height(6.dp))
-            }
-            UfiTextField(
-                value = trackerText,
-                onValueChange = {
-                    userEdited = true
-                    trackerText = it
-                },
-                label = "",
-                modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 360.dp),
-                placeholder = "udp://tracker.example.com:80/announce\n" +
-                    "http://tracker2.example.com/announce",
-                maxLines = 20
+        // Tracker 列表编辑：2026-10-20 改成**入口行 + 弹窗**（用户要求）。
+        // 原来页内直接摆一个多行输入框，且该框漏了 `singleLine = false` ——
+        // UfiTextField 默认 singleLine = true，maxLines 被忽略，于是"几十条 Tracker 只显示一条"。
+        UfiSettingsRowCard {
+            UfiSettingsItem(
+                icon = Icons.Default.List,
+                title = "Tracker 列表",
+                description = "当前 ${state.trackerCount} 条 · 每行一个地址，保存后热加载到运行中的 aria2",
+                onClick = { showTrackerEditor = true },
+                trailing = { UfiSettingsChevron() }
             )
-            Spacer(Modifier.height(6.dp))
+        }
+    }
+
+    // ── Tracker 列表编辑弹窗 ──
+    UfiCustomDialog(
+        visible = showTrackerEditor,
+        onDismiss = { showTrackerEditor = false },
+        title = "编辑 Tracker 列表",
+        showCloseButton = true
+    ) {
+        if (state.trackerListLoading) {
             Text(
-                "当前 ${trackerText.split("\n").count { it.trim().isNotBlank() }} 条，保存后热加载到运行中的 aria2",
+                "正在载入 Tracker 列表…",
                 style = UfiTextStyles.note,
                 color = palette.textSecondary
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(6.dp))
+        }
+        UfiTextField(
+            value = trackerText,
+            onValueChange = {
+                userEdited = true
+                trackerText = it
+            },
+            label = "",
+            modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp, max = 360.dp),
+            placeholder = "udp://tracker.example.com:80/announce\n" +
+                "http://tracker2.example.com/announce",
+            // ★ 关键：多行必须显式关掉 singleLine，否则 maxLines 无效（只能看到一条）。
+            singleLine = false,
+            maxLines = 40
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "当前 ${trackerText.split("\n").count { it.trim().isNotBlank() }} 条，保存后热加载到运行中的 aria2",
+            style = UfiTextStyles.note,
+            color = palette.textSecondary
+        )
+        Spacer(Modifier.height(Spacing.Large))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+        ) {
             UfiButton(
-                variant = UfiButtonVariant.Secondary,
-                text = if (savingTrackerList) "保存中…" else "保存 Tracker 列表",
+                text = "取消",
+                onClick = { showTrackerEditor = false },
+                variant = UfiButtonVariant.Subtle,
+                size = UfiButtonSize.Standard,
+                modifier = Modifier.weight(1f)
+            )
+            UfiButton(
+                text = if (savingTrackerList) "保存中…" else "保存",
                 enabled = !savingTrackerList,
                 loading = savingTrackerList,
                 onClick = {
@@ -462,9 +579,12 @@ fun DownloadTrackerSettingsScreen(
                         // 成功 / 失败提示都在 DownloadModule 里等结果之后才发
                         viewModel.downloads.saveTrackerList(commaSeparated)
                         savingTrackerList = false
+                        showTrackerEditor = false
                     }
                 },
-                modifier = Modifier.fillMaxWidth()
+                variant = UfiButtonVariant.Primary,
+                size = UfiButtonSize.Standard,
+                modifier = Modifier.weight(1f)
             )
         }
     }
@@ -496,31 +616,42 @@ fun DownloadAdvancedSettingsScreen(
             }
         }
     ) {
-        SettingsCard(title = "分片与限速") {
-            SettingSliderRow(label = "文件分片数", value = draft.splitCount, range = 1..16,
+        // 一项一张 UfiSettingsRowCard（与网络设置页同构）：原来 4 个 `SettingsCard(...)`
+        // = UfiSettingsGroup + UfiGroupHeader 的多项一卡。组标题的语义由各行自己的 title
+        // 表达（"文件分片数""BT 最大节点数""禁用 IPv6"…），条目之间的 UfiDivider 一并删掉。
+        UfiSettingsRowCard {
+            SettingDropdownRow(label = "文件分片数", value = draft.splitCount,
+                options = (1..16).toList(),
                 unit = "片", description = "单个文件切成几段并行下载",
                 onValueChange = { draft = draft.copy(splitCount = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SpeedLimitRow(label = "单任务速度限制", valueBytes = draft.perTaskSpeedLimit,
                 description = "单个任务的下载上限，留空或填 0 表示不限速",
                 onValueChange = { draft = draft.copy(perTaskSpeedLimit = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SpeedLimitRow(label = "全局上传限制", valueBytes = draft.maxOverallUploadLimit,
                 description = "BT 做种的上传上限，留空或填 0 表示不限速",
                 onValueChange = { draft = draft.copy(maxOverallUploadLimit = it) })
         }
 
-        SettingsCard(title = "BT") {
+        UfiSettingsRowCard {
             SettingSliderRow(label = "BT 最大节点数", value = draft.btMaxPeers, range = 10..200,
                 unit = "个", description = "单个 BT 任务同时连接的节点上限",
                 onValueChange = { draft = draft.copy(btMaxPeers = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SettingSwitchRow(label = "启用 DHT", description = "分布式哈希表，用于 BT 节点发现（磁链没有 tracker 时靠它）",
                 checked = draft.btEnableDht, onCheckedChange = { draft = draft.copy(btEnableDht = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SettingSwitchRow(label = "启用 LPD", description = "局域网内 BT 节点发现",
                 checked = draft.btEnableLpd, onCheckedChange = { draft = draft.copy(btEnableLpd = it) })
-            UfiDivider()
+        }
+        // 做种分享比率是手搓的「标题 + 说明 + 输入框」复合行：天然属于同一个设置项（规则 4），
+        // 整行进一张卡，行内结构、留白与文案都不动。
+        UfiSettingsRowCard {
             Row(Modifier.fillMaxWidth().padding(vertical = Spacing.Small), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("做种分享比率", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
@@ -547,30 +678,36 @@ fun DownloadAdvancedSettingsScreen(
             }
         }
 
-        SettingsCard(title = "网络与重试") {
+        UfiSettingsRowCard {
             SettingSwitchRow(label = "禁用 IPv6", description = "仅使用 IPv4 连接",
                 checked = draft.disableIpv6, onCheckedChange = { draft = draft.copy(disableIpv6 = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SettingSwitchRow(label = "校验证书", description = "HTTPS 连接时验证服务器证书",
                 checked = draft.checkCertificate, onCheckedChange = { draft = draft.copy(checkCertificate = it) })
-            UfiDivider()
-            SettingSliderRow(label = "最大重试次数", value = draft.maxTries, range = 1..20,
+        }
+        UfiSettingsRowCard {
+            SettingDropdownRow(label = "最大重试次数", value = draft.maxTries,
+                options = (1..20).toList(),
                 unit = "次", description = "单个连接失败后重试的上限",
                 onValueChange = { draft = draft.copy(maxTries = it) })
-            UfiDivider()
+        }
+        UfiSettingsRowCard {
             SettingSliderRow(label = "重试等待", value = draft.retryWait, range = 0..60,
                 unit = "秒", description = "两次重试之间的间隔",
                 onValueChange = { draft = draft.copy(retryWait = it) })
         }
 
-        SettingsCard(title = "生效方式") {
-            Text(
-                "并发数、全局上传/下载限速、BT 最大节点数会立刻热更新到运行中的 aria2。" +
+        // 「生效方式」整段是一句说明，不是平级设置行：原组标题并进行 title（规则 2 的合并写法），
+        // 段落原文一字未动地进 description（UfiSettingsItem 的说明样式本来就是 note，与原 Text 同款）。
+        UfiSettingsRowCard {
+            UfiSettingsItem(
+                icon = Icons.Default.Info,
+                title = "生效方式",
+                description = "并发数、全局上传/下载限速、BT 最大节点数会立刻热更新到运行中的 aria2。" +
                     "分片数、每服务器连接数、DHT / LPD、做种率、IPv6、证书校验、重试参数和保存路径" +
                     "属于启动期选项：保存时若没有任务在跑，后端会自动重启引擎让它们生效；" +
-                    "有任务在跑则等下次引擎启动。",
-                style = UfiTextStyles.note,
-                color = palette.textSecondary
+                    "有任务在跑则等下次引擎启动。"
             )
         }
     }
@@ -605,7 +742,9 @@ private fun SettingsSubScaffold(
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             Column(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
+                // 平级单行卡之间的间距统一走 Spacing.SettingsCardGap（10dp），
+                // 与网络设置页 / 设置页一致；页面里不再有手写卡片容器。
+                verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
             ) {
                 content()
                 if (dirty) {
@@ -625,14 +764,14 @@ private fun SettingsSubScaffold(
     }
 }
 
-/** 分组卡片：统一走公共的 [UfiSettingsGroup] + [UfiGroupHeader]，与告警/软件设置页同款。 */
-@Composable
-private fun SettingsCard(title: String, content: @Composable ColumnScope.() -> Unit) {
-    UfiSettingsGroup {
-        UfiGroupHeader(title)
-        content()
-    }
-}
+/*
+ * 本文件原先的 `SettingsCard(title) { ... }`（= 公共的 UfiSettingsGroup + UfiGroupHeader，
+ * 多项一卡）已整体拆除：现在**一项一张 UfiSettingsRowCard，与网络设置页同构** ——
+ * 分组标题的语义由每张卡自己的 title 表达，条目之间不再有 UfiDivider，平级行靠
+ * Spacing.SettingsCardGap 的间距分隔，页面里不再有手写卡片容器，也不再有分组标题。
+ * 卡里放的不是设置行（表单 / chip 区 / 纯说明段）时，用
+ * `contentPadding = PaddingValues(Spacing.XLarge)` 覆盖成 16dp。
+ */
 
 /** 待重启提示：启动期配置改过，但当时有任务在跑没法重启引擎。 */
 @Composable
@@ -731,6 +870,43 @@ private fun ThrottleStatusCard(state: DownloadState, draft: DownloadConfigItem) 
 // ==================== Setting Helpers ====================
 
 /**
+ * 下拉选择行（2026-10-14）：用下拉框代替滑块。
+ *
+ * ## 什么样的设置该用它，而不是滑块
+ * 判据是**档数**：滑块把整个量程压进几十 dp 的轨道里，档位一多，落点就只能"拖 + 猜"，
+ * 而且量程两端还得单独占一行刻度文字；档数少（十几个以内）时，下拉框一次点准，
+ * "当前值 + 单位"直接写在触发器上，也不用再画刻度行。
+ *
+ * 反过来，量程宽、档位密的（温度 40~80、占用率 30~95）仍该用滑块 ——
+ * 下拉框列出六十项没人愿意翻。
+ *
+ * 与 [UfiSettingsItem] 的 trailing 槽配合：标题与说明在左、选择器在右，与开关行同构。
+ */
+@Composable
+private fun SettingDropdownRow(
+    label: String,
+    value: Int,
+    options: List<Int>,
+    unit: String = "",
+    description: String? = null,
+    onValueChange: (Int) -> Unit
+) {
+    UfiSettingsItem(
+        title = label,
+        description = description,
+        trailing = {
+            UfiDropdown(
+                selectedValue = value,
+                options = options,
+                onValueSelected = onValueChange,
+                modifier = Modifier.width(110.dp),
+                unitSuffix = unit
+            )
+        }
+    )
+}
+
+/**
  * 滑杆行。相比旧版补了三件用户看得见的信息：
  * ① 当前值带单位；② 滑杆下方标出量程两端（原来只有一根光秃秃的轨道）；③ 可选的一行说明。
  * 单位不要再塞进 label（"警告温度 (°C)" 这种写法），传 [unit]。
@@ -792,7 +968,16 @@ private enum class SpeedUnit(val label: String, val factor: Long) {
 /**
  * 限速行。旧版只有一个裸输入框：单位只在值 > 0 时才出现在框内，
  * "0 = 不限速" 这条规则完全没写出来，而且只能按 MB 输入 —— 想限到 512 KB/s 做不到。
- * 现在是「数值 + 单位选择 + 当前生效值说明 + 一键不限速」。
+ *
+ * ## 2026-10-14：单位从 chip 组挪到输入框**同一行的下拉框**
+ * 上一版是「输入框（框内一个只读单位文字）+ 下一行的 KB/s | MB/s chip 组」——
+ * 同一个信息（当前单位）在一行里出现两次，而两个控件还分居两行、互相看不出关系；
+ * chip 组那一行右边还挂着一颗"不限速"按钮，三种东西挤在一行里（用户："样式更加冲突"）。
+ *
+ * 现在只有**一个输入框 + 一个单位下拉框**，同处一行：
+ * · 单位只出现一次，且就是它自己的选择器（不再有只读的单位文字）；
+ * · "不限速"那颗按钮删掉 —— 输入框留空或填 0 本来就是不限速（下面那行说明一直这么写），
+ *   为了它多一颗按钮是把一条规则变成两个入口。
  */
 @Composable
 private fun SpeedLimitRow(
@@ -811,7 +996,7 @@ private fun SpeedLimitRow(
     var text by remember(unit) {
         mutableStateOf(if (valueBytes > 0) (valueBytes / unit.factor).toString() else "")
     }
-    // 外部值变化（配置刚从设备拉到 / 点了"不限速"）时同步回输入框，
+    // 外部值变化（配置刚从设备拉到）时同步回输入框，
     // 但只在两者真的不等时才覆盖，避免边打字边被重置。
     LaunchedEffect(valueBytes, unit) {
         val parsed = (text.toLongOrNull() ?: 0L) * unit.factor
@@ -835,54 +1020,29 @@ private fun SpeedLimitRow(
                     color = if (valueBytes <= 0) palette.textSecondary else palette.accent
                 )
             }
-            UfiDigitField(
+            UfiCompactDigitField(
                 value = text,
                 onValueChange = { newText ->
                     text = newText
                     commit(newText, unit)
                 },
-                label = "",
-                modifier = Modifier.width(96.dp),
-                fillMaxWidth = false,
-                placeholder = "0",
-                trailingIcon = {
-                    Text(
-                        unit.label,
-                        style = UfiTextStyles.caption,
-                        color = palette.textSecondary,
-                        modifier = Modifier.padding(end = 8.dp)
-                    )
-                }
+                modifier = Modifier.width(88.dp),
+                placeholder = "0"
             )
-        }
-        Spacer(Modifier.height(6.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            UfiSingleChipSelector(
-                options = SpeedUnit.values().map { it.name to it.label },
-                selectedValue = unit.name,
-                onSelect = { picked ->
-                    val next = SpeedUnit.valueOf(picked)
+            Spacer(Modifier.width(Spacing.Small))
+            UfiDropdown(
+                selectedValue = unit,
+                options = SpeedUnit.values().toList(),
+                onValueSelected = { next ->
                     if (next != unit) {
                         // 换单位保持"实际速度"不变，只改显示刻度
                         unit = next
                         text = if (valueBytes > 0) (valueBytes / next.factor).toString() else ""
                     }
                 },
-                wrapContent = true
+                modifier = Modifier.width(104.dp),
+                optionLabel = { it.label }
             )
-            Spacer(Modifier.weight(1f))
-            if (valueBytes > 0) {
-                TextButton(
-                    onClick = { text = ""; onValueChange(0L) },
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    modifier = Modifier.height(24.dp)
-                ) {
-                    Text("不限速", style = UfiTextStyles.caption)
-                }
-            }
         }
         Text(
             description ?: "留空或填 0 表示不限速",

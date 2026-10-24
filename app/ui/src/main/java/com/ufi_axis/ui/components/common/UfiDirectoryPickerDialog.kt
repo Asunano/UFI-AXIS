@@ -94,6 +94,9 @@ fun UfiDirectoryPickerDialog(
     var parent by remember { mutableStateOf<String?>(null) }
     var children by remember { mutableStateOf<List<String>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    // 2026-10-20（用户要求）：**两屏切换** —— 第一屏只显示已选目录/文件，无则空态并提示去添加；
+    // 点底部按钮进入第二屏的目录浏览器，浏览完再切回来看已选。
+    var browsing by remember { mutableStateOf(false) }
 
     LaunchedEffect(path) {
         loading = true
@@ -124,138 +127,152 @@ fun UfiDirectoryPickerDialog(
         }
     ) {
         // 块间距统一由 UfiDialogBody 给（12dp），这里不再自己加 Spacer。
+        // 块间距统一由 UfiDialogBody 给（12dp），这里不再自己加 Spacer。
         UfiDialogBody {
-            Text(
-                when {
-                    selection.isEmpty() -> emptySelectionHint
-                    multiSelect -> "已选 ${selection.size} 个目录"
-                    else -> "已选目录"
-                },
-                style = UfiTextStyles.note,
-                color = palette.textSecondary
-            )
-
-            selection.forEach { dir ->
-                // 多选下点已选项 = 取消勾选（比逼人逐条找地方删更顺手）；
-                // 单选下确认键已经要求必选，"点一下把唯一选择去掉"只会把自己点进置灰状态。
-                val onSelectedClick: (() -> Unit)? =
-                    if (multiSelect) ({ selection = selection - dir }) else null
-                UfiListRowCard(
-                    title = dir.substringAfterLast('/').ifBlank { dir },
-                    subtitle = dir,
-                    selected = true,
-                    onClick = onSelectedClick,
-                    leading = {
-                        Icon(
-                            Icons.Default.Check,
-                            contentDescription = null,
-                            tint = palette.accent,
-                            modifier = Modifier.size(DIRECTORY_ROW_ICON_SIZE)
-                        )
-                    }
-                )
-            }
-
-            if (extraAction != null && extraAction.visible(selection)) {
-                UfiButton(
-                    text = extraAction.text,
-                    onClick = { extraAction.onClick { next -> selection = next } },
-                    variant = UfiButtonVariant.Subtle,
-                    size = UfiButtonSize.Small
-                )
-            }
-
-            UfiDivider()
-
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(
-                    onClick = { parent?.let { path = it } },
-                    enabled = parent != null
-                ) {
-                    Icon(
-                        Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "上一级",
-                        tint = if (parent != null) palette.accent else palette.textSecondary,
-                        modifier = Modifier.size(DIRECTORY_ROW_ICON_SIZE)
-                    )
-                }
+            if (!browsing) {
+                // ── 第一屏：已选目录 / 文件（无则空态 + 提示去添加）──
                 Text(
-                    path,
-                    style = UfiTextStyles.note,
-                    color = palette.textSecondary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                // 目标目录常常就是"我现在正站着的这个"（它不会出现在自己的子目录列表里），
-                // 所以必须有一颗"选当前路径"的键，否则用户只能选到叶子目录的上一层。
-                UfiButton(
-                    text = if (multiSelect) "加入此目录" else "选择此目录",
-                    onClick = {
-                        selection = if (multiSelect) {
-                            if (path in selection) selection else selection + path
-                        } else {
-                            listOf(path)
-                        }
+                    when {
+                        selection.isEmpty() -> emptySelectionHint
+                        multiSelect -> "已选 ${selection.size} 个目录"
+                        else -> "已选目录"
                     },
-                    variant = UfiButtonVariant.Subtle,
-                    size = UfiButtonSize.Small,
-                    icon = if (multiSelect) Icons.Default.Add else Icons.Default.Check
+                    style = UfiTextStyles.note,
+                    color = palette.textSecondary
                 )
-            }
 
-            when {
-                // 换目录就是换一份列表，用骨架而不是转圈：转圈只说"在忙"，骨架还说明
-                // "马上会出现一份列表"（见 UfiListStates 的口径）。
-                loading -> UfiListLoadingState(rows = DIRECTORY_SKELETON_ROWS)
-
-                // "读不到"与"真的没有子目录"在这里合并成一句话：对用户而言下一步动作相同
-                // （往上退或选当前目录），分两种文案只会让人去猜是不是坏了。
-                children.isEmpty() -> Box(
-                    modifier = Modifier.fillMaxWidth().height(DIRECTORY_STATE_HEIGHT)
-                ) {
-                    UfiListEmptyState(text = "这个目录下没有子目录")
-                }
-
-                else -> LazyColumn(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        // 必须钉上限：目录数量由设备决定（几百个子目录很常见），
-                        // 不限高时弹窗会被内容撑出屏幕，底部确认键直接点不到。
-                        .heightIn(max = DIRECTORY_LIST_MAX_HEIGHT),
-                    contentPadding = PaddingValues(vertical = Spacing.Small),
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-                ) {
-                    items(children, key = { it }) { dir ->
+                if (selection.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxWidth().height(DIRECTORY_STATE_HEIGHT)) {
+                        UfiListEmptyState(text = "还没有添加目录，点下面的「浏览目录」去添加")
+                    }
+                } else {
+                    selection.forEach { dir ->
+                        // 多选下点已选项 = 取消勾选；单选下点已选无动作（确认键已要求必选）。
+                        val onSelectedClick: (() -> Unit)? =
+                            if (multiSelect) ({ selection = selection - dir }) else null
                         UfiListRowCard(
                             title = dir.substringAfterLast('/').ifBlank { dir },
-                            selected = dir in selection,
-                            // 点行 = 进下一层，勾选走右侧按钮：两个动作都很常用，
-                            // 挤到同一个手势上必然误触（想进去结果选中了）。
-                            onClick = { path = dir },
+                            subtitle = dir,
+                            selected = true,
+                            onClick = onSelectedClick,
                             leading = {
                                 Icon(
-                                    Icons.Default.Folder,
+                                    Icons.Default.Check,
                                     contentDescription = null,
-                                    tint = palette.textSecondary,
+                                    tint = palette.accent,
                                     modifier = Modifier.size(DIRECTORY_ROW_ICON_SIZE)
-                                )
-                            },
-                            trailing = {
-                                UfiButton(
-                                    text = if (dir in selection) "已选" else "选择",
-                                    onClick = {
-                                        selection = when {
-                                            !multiSelect -> listOf(dir)
-                                            dir in selection -> selection - dir
-                                            else -> selection + dir
-                                        }
-                                    },
-                                    variant = UfiButtonVariant.Subtle,
-                                    size = UfiButtonSize.Small
                                 )
                             }
                         )
+                    }
+                }
+
+                if (extraAction != null && extraAction.visible(selection)) {
+                    UfiButton(
+                        text = extraAction.text,
+                        onClick = { extraAction.onClick { next -> selection = next } },
+                        variant = UfiButtonVariant.Subtle,
+                        size = UfiButtonSize.Small
+                    )
+                }
+
+                UfiDivider()
+
+                UfiButton(
+                    text = "浏览目录",
+                    onClick = { browsing = true },
+                    variant = UfiButtonVariant.Primary,
+                    size = UfiButtonSize.Standard,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            } else {
+                // ── 第二屏：目录浏览器 ──
+                UfiButton(
+                    text = if (multiSelect) "返回已选（${selection.size}）" else "返回已选",
+                    onClick = { browsing = false },
+                    variant = UfiButtonVariant.Subtle,
+                    size = UfiButtonSize.Small,
+                    icon = Icons.AutoMirrored.Filled.ArrowBack
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = { parent?.let { path = it } }, enabled = parent != null) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "上一级",
+                            tint = if (parent != null) palette.accent else palette.textSecondary,
+                            modifier = Modifier.size(DIRECTORY_ROW_ICON_SIZE)
+                        )
+                    }
+                    Text(
+                        path,
+                        style = UfiTextStyles.note,
+                        color = palette.textSecondary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    // 目标目录常常就是"我现在正站着的这个"，所以必须有"选当前路径"的键。
+                    UfiButton(
+                        text = if (multiSelect) "加入此目录" else "选择此目录",
+                        onClick = {
+                            selection = if (multiSelect) {
+                                if (path in selection) selection else selection + path
+                            } else {
+                                listOf(path)
+                            }
+                        },
+                        variant = UfiButtonVariant.Subtle,
+                        size = UfiButtonSize.Small,
+                        icon = if (multiSelect) Icons.Default.Add else Icons.Default.Check
+                    )
+                }
+
+                when {
+                    loading -> UfiListLoadingState(rows = DIRECTORY_SKELETON_ROWS)
+
+                    children.isEmpty() -> Box(
+                        modifier = Modifier.fillMaxWidth().height(DIRECTORY_STATE_HEIGHT)
+                    ) {
+                        UfiListEmptyState(text = "这个目录下没有子目录")
+                    }
+
+                    else -> LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = DIRECTORY_LIST_MAX_HEIGHT),
+                        contentPadding = PaddingValues(vertical = Spacing.Small),
+                        verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                    ) {
+                        items(children, key = { it }) { dir ->
+                            UfiListRowCard(
+                                title = dir.substringAfterLast('/').ifBlank { dir },
+                                selected = dir in selection,
+                                onClick = { path = dir },
+                                leading = {
+                                    Icon(
+                                        Icons.Default.Folder,
+                                        contentDescription = null,
+                                        tint = palette.textSecondary,
+                                        modifier = Modifier.size(DIRECTORY_ROW_ICON_SIZE)
+                                    )
+                                },
+                                trailing = {
+                                    UfiButton(
+                                        text = if (dir in selection) "已选" else "选择",
+                                        onClick = {
+                                            selection = when {
+                                                !multiSelect -> listOf(dir)
+                                                dir in selection -> selection - dir
+                                                else -> selection + dir
+                                            }
+                                        },
+                                        variant = UfiButtonVariant.Subtle,
+                                        size = UfiButtonSize.Small
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }

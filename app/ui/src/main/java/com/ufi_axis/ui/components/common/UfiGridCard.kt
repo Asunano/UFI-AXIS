@@ -12,8 +12,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
@@ -25,6 +27,13 @@ import com.ufi_axis.ui.theme.ufiCardShadow
  *
  * 视觉统一为全局标准卡片样式（与 [com.ufi_axis.ui.theme.ufiStandardCard] 一致）：
  * Box + ufiCardShadow + clip + background + border 四件套，替代 M3 原生 Card。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 [UfiSettingsRowCard] /
+ * [UfiSettingsGroup] 对齐；**调用方不要再补水平 padding**，那会叠成 32dp 的双重内距。
+ * 卡内那个裸 `padding(18.dp)` 是**卡内距**，与本次的外边距无关，保持不动。
+ * [horizontalMargin] 服务于"网格容器已经统一给过横向内距"的调用点（例如工具页那个
+ * `FlowRow(...).padding(horizontal = …)` 两列网格 —— 逐卡再加外边距会同时撑开列间距与外边距），
+ * 那里显式传 `0.dp`。
  */
 @Composable
 fun UfiGridCard(
@@ -33,6 +42,7 @@ fun UfiGridCard(
     icon: ImageVector,
     description: String,
     onClick: () -> Unit,
+    horizontalMargin: Dp = Spacing.CardHorizontalMargin
 ) {
     val palette = LocalResolvedPalette.current
     val cardShape = UfiCardDefaults.shape
@@ -40,6 +50,7 @@ fun UfiGridCard(
     Box(
         modifier = modifier
             .fillMaxWidth()
+            .padding(horizontal = horizontalMargin)
             .ufiCardShadow(elevation = 4.dp, shape = cardShape)
             .clip(cardShape)
             .background(palette.cardBg, cardShape)

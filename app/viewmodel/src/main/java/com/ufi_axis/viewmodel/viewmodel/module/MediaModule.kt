@@ -1188,9 +1188,9 @@ class MediaModule(
 
     /**
      * 2026-10-07：手动重抽单条视频的封面准备 —— 清设备上那一条的封面缓存与
-     * video_info 探测缓存（含 .fail 冷却标记），下一次 GET /thumbnail 就会重新走
-     * 系统 → MMR → ffmpeg 三级。失败回 false（老 core 没有 id 参数会清掉整类，
-     * 那也可接受，只是范围大些）。
+     * video_info 探测缓存（含 .fail 冷却标记），下一次 GET /thumbnail 就会让 core 重新出图。
+     * 2026-10-13 起 core 侧只剩 ffmpeg 一条来源（系统缩略图 / MMR 抽帧已退役）。
+     * 失败回 false（老 core 没有 id 参数会清掉整类，那也可接受，只是范围大些）。
      */
     suspend fun resetThumbnail(type: String, id: Long): Boolean = try {
         api.clearMediaThumbnailCache(type, id)

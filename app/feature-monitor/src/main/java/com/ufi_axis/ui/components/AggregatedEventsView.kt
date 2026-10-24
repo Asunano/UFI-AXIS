@@ -72,6 +72,11 @@ const val IN_DIALOG_PAGE_SIZE_DEFAULT = 20
 /**
  * 聚合行渲染：与现有 MonitorEventCard 同视觉权重（图标色块 + 信息列 + 时间），但**只展示类型 + 次数**，
  * 不显示 detail message（避免主列表信息堆叠冗余）。点击触发 [onClick]。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 `UfiSettingsRowCard` /
+ * `UfiSettingsGroup` 对齐；**调用方不要再补水平 padding**（原先 MonitorScreen 两处逐行补了同一个
+ * 16dp，两边都留就会叠成 32dp）。本组件没有"已在有内距容器里"的调用点，因此不开
+ * `horizontalMargin` 例外参数。
  */
 @Composable
 fun AggregatedAlertRowView(
@@ -87,7 +92,7 @@ fun AggregatedAlertRowView(
     val hasUnread = row.unread > 0
 
     Surface(
-        modifier = modifier.fillMaxWidth().clickable(onClick = onClick),
+        modifier = modifier.fillMaxWidth().padding(horizontal = Spacing.CardHorizontalMargin).clickable(onClick = onClick),
         shape = UfiCardDefaults.shape,
         color = palette.cardBg,
         border = BorderStroke(1.dp, palette.cardBorder)
@@ -283,7 +288,12 @@ fun AlertTypeDetailDialog(
                         MonitorEventCard(
                             alert = record,
                             onAckOne = onAckOne,
-                            onDelete = onDeleteOne
+                            onDelete = onDeleteOne,
+                            // 2026-10-13：弹窗内容已经由 UfiDialogShell 的内容列统一给了横向内距
+                            //（DialogPaddingH = 18dp，见 UfiDialogBody 的 KDoc：横向内距唯一来源是
+                            // 弹窗壳）。卡片再自带 16dp 就会比弹窗标题/分页条窄一圈，所以这里显式
+                            // 关掉 —— 这是 horizontalMargin 例外参数存在的唯一理由。
+                            horizontalMargin = 0.dp
                         )
                     }
                 }

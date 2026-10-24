@@ -28,7 +28,7 @@ import java.io.File
  * - app `AppScreens`：路由注册（防深链绕过）
  * - app `DeviceControlScreen`：设置开关卡片 + 四个状态变量 + 首帧 status 拉取
  * - web `TerminalView`：「真 PTY」tab + `<PtyPane>` 面板
- * - web `GeneralPanel`：设置开关 ToggleRow
+ * - web `GeneralPanel`：设置开关 ToggleRow（2026-10-14 已随日志开关搬到 `LogsPanel`）
  */
 class PtyEntryHiddenGuardTest {
 
@@ -59,6 +59,26 @@ class PtyEntryHiddenGuardTest {
         assertTrue(
             "路由注册那行连注释都没了，DeepLink 兜底也一并去掉才对（恢复点）",
             source(AppScreensPath).contains("// Routes.DETAIL_PTY_TERMINAL to")
+        )
+    }
+
+    /**
+     * 2026-10-24：`AppScreens` 的页面绑定注释掉还不够，`NavScreens.appRoutes` 也必须撤掉。
+     *
+     * 路由还在、绑定不在时，`screens[appRoute.route]?.invoke(...)` 拿到 null —— 深链/
+     * 外部 Intent 导航到 `detail/pty-terminal` 就是白屏。上一版只改了 AppScreens，
+     * 而 `RouteBindingGuardTest` 又被注释行骗过，两边都没拦住。
+     */
+    @Test
+    fun appRoutes_ptyRouteMustStayHidden() {
+        val full = source(NavScreensPath)
+        assertTrue(
+            "NavScreens.appRoutes 里仍注册着 DETAIL_PTY_TERMINAL —— 没有页面绑定，进去就是白屏",
+            !executableCode(full).contains("AppRoute(Routes.DETAIL_PTY_TERMINAL")
+        )
+        assertTrue(
+            "appRoutes 的恢复点丢了：应保留注释掉的 AppRoute 行",
+            full.contains("// AppRoute(Routes.DETAIL_PTY_TERMINAL")
         )
     }
 
@@ -117,8 +137,8 @@ class PtyEntryHiddenGuardTest {
     }
 
     @Test
-    fun webGeneralPanel_switchMustStayHidden() {
-        val full = source(WebGeneralPanelPath)
+    fun webLogsPanel_switchMustStayHidden() {
+        val full = source(WebLogsPanelPath)
         val code = executableCode(full)
 
         assertTrue(
@@ -126,7 +146,7 @@ class PtyEntryHiddenGuardTest {
             !code.contains("""label="真 PTY 终端（ttyd，默认关，改动立即生效）"""")
         )
         assertTrue(
-            "恢复点丢了：找不到注释掉的 ToggleRow",
+            "恢复点丢了：LogsPanel 里找不到注释掉的 ToggleRow",
             full.contains("<!-- <ToggleRow")
         )
     }
@@ -138,10 +158,12 @@ class PtyEntryHiddenGuardTest {
             "app/feature-tools/src/main/java/com/ufi_axis/ui/screens/ToolsExtraScreen.kt"
         const val AppScreensPath =
             "app/src/main/java/com/ufi_axis/app/navigation/AppScreens.kt"
+        const val NavScreensPath =
+            "app/ui/src/main/java/com/ufi_axis/ui/navigation/NavScreens.kt"
         const val DeviceControlPath =
             "app/feature-settings/src/main/java/com/ufi_axis/ui/screens/DeviceControlScreen.kt"
         const val WebTerminalViewPath = "web/src/views/terminal/TerminalView.vue"
-        const val WebGeneralPanelPath = "web/src/views/settings/panels/GeneralPanel.vue"
+        const val WebLogsPanelPath = "web/src/views/settings/panels/LogsPanel.vue"
     }
 
     private fun source(relative: String): String {

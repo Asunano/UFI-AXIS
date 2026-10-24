@@ -1,5 +1,6 @@
 package com.ufi_axis.app.navigation
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -39,6 +40,21 @@ class RouteBindingGuardTest {
     }
 
     /**
+     * 剥掉 Kotlin 注释，只留可执行代码。
+     *
+     * 2026-10-24：`boundRouteNames()` 原来直接扫整份源文件，**注释掉的绑定也会被算进去**。
+     * PTY 下线时把 `AppScreens` 的绑定注释了，这条护栏于是认为它仍然有页面 —— 而
+     * `NavScreens.appRoutes` 里的路由还在，实际导航过去就是白屏。护栏必须只信可执行代码。
+     */
+    private fun executableCode(text: String): String =
+        text.replace(Regex("""/\*[\s\S]*?\*/"""), "")
+            .lines()
+            .joinToString("\n") { line ->
+                val t = line.trimStart()
+                if (t.startsWith("//")) "" else line
+            }
+
+    /**
      * `appRoutes` 里所有**页面级**路由（DETAIL 与 RISE）的常量名。
      *
      * 两种书写形态都要认：单行 `AppRoute(Routes.X, TransitionType.DETAIL)`，
@@ -49,7 +65,7 @@ class RouteBindingGuardTest {
      * 只写 DETAIL 的话，把一条路由改成 RISE 就等于把它从这道护栏里摘出去了。
      */
     private fun detailRouteNames(): Set<String> {
-        val code = source(navScreensPath)
+        val code = executableCode(source(navScreensPath))
         val block = code.substringAfter("val appRoutes")
         val names = mutableSetOf<String>()
         Regex("""AppRoute\(\s*Routes\.(\w+)\s*,\s*TransitionType\.(?:DETAIL|RISE)""")
@@ -61,13 +77,28 @@ class RouteBindingGuardTest {
         return names
     }
 
-    /** `rawAppScreens` 里登记了页面的路由常量名。 */
-    private fun boundRouteNames(): Set<String> {
-        val code = source(appScreensPath)
-        return Regex("""Routes\.(\w+)\s+to\s*\{""")
+    /** 从一段 Kotlin 源码里解析已绑定的路由常量名（注释已剥）。 */
+    private fun parseBoundRouteNames(code: String): Set<String> =
+        Regex("""Routes\.(\w+)\s+to\s*\{""")
             .findAll(code)
             .map { it.groupValues[1] }
             .toSet()
+
+    /** `rawAppScreens` 里登记了页面的路由常量名。 */
+    private fun boundRouteNames(): Set<String> =
+        parseBoundRouteNames(executableCode(source(appScreensPath)))
+
+    @Test
+    fun `注释掉的绑定不能算已绑定`() {
+        val sample = """
+            // Routes.DETAIL_PTY_TERMINAL to { _, _ -> }
+            Routes.DETAIL_ABOUT to { _, _ -> }
+        """.trimIndent()
+        assertEquals(
+            "注释行被当成已绑定，正是 PTY 白屏漏网的原因",
+            setOf("DETAIL_ABOUT"),
+            parseBoundRouteNames(executableCode(sample))
+        )
     }
 
     @Test
