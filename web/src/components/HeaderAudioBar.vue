@@ -378,7 +378,7 @@ onBeforeUnmount(() => {
   border: 0;
   border-radius: 10px;
   background: var(--card-bg);
-  box-shadow: 0 3px 12px -9px rgba(15, 30, 22, 0.35);
+  box-shadow: 0 3px 12px -9px var(--shadow-color-strong);
   overflow: hidden;
   transition: background 0.16s ease;
 }
@@ -412,7 +412,7 @@ onBeforeUnmount(() => {
   border-radius: 7px;
   color: var(--accent-color);
   background: var(--surface-hover);
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+  box-shadow: inset 0 0 0 1px var(--neutral-light-bg);
 }
 .ha-cover img {
   width: 100%;
@@ -585,7 +585,7 @@ onBeforeUnmount(() => {
   border: 1px solid var(--border-subtle);
   border-radius: 16px;
   background: var(--card-bg);
-  box-shadow: 0 22px 56px -26px rgba(15, 30, 22, 0.35);
+  box-shadow: 0 22px 56px -26px var(--shadow-color-strong);
   overflow: hidden;
   color: var(--text-primary);
 }

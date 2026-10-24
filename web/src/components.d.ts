@@ -96,7 +96,6 @@ declare module 'vue' {
     ServiceStoppedNotice: typeof import('./components/ServiceStoppedNotice.vue')['default']
     StepWizard: typeof import('./components/StepWizard.vue')['default']
     ToggleRow: typeof import('./components/ToggleRow.vue')['default']
-    TrafficLimitModal: typeof import('./components/modals/TrafficLimitModal.vue')['default']
     ValueBadge: typeof import('./components/ValueBadge.vue')['default']
     VerificationToast: typeof import('./components/VerificationToast.vue')['default']
     VideoPlayer: typeof import('./components/VideoPlayer.vue')['default']
