@@ -1,0 +1,10 @@
+{
+  "_note": "赞助感谢名单（唯一源文件）。三端在构建时各自取用同一份作为『保底数据』：web 进 bundle、app 与 core 进 assets；core 另有一条 12 小时的后台刷新从本仓库 main 分支拉取更新（走 MirrorResolver，与 version.json 同一条路），拉到的合规数据覆盖保底那份。字段规则见 version；`at` 必填（YYYY-MM 或 YYYY-MM-DD），只用于排序、**不在界面上显示**；`anonymous: true` 与 `name` 互斥，匿名条目只用于计数，渲染成名单尾部的一行『另有 N 位匿名赞助者』。名单按 `at` 倒序（新赞助在前），同级按 `name` 升序以保证远端顺序变化时名单不跳。",
+  "version": 1,
+  "updatedAt": "2026-10",
+  "sponsors": [
+    { "name": "云季清", "at": "2026-10" },
+    { "name": "阿维和阿虹", "at": "2026-09" },
+    { "name": "高*.", "at": "2026-07" }
+  ]
+}

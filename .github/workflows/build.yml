@@ -104,6 +104,27 @@ jobs:
       - name: Install web dependencies
         run: cd web && npm ci
 
+      # ── Web UI 基线门禁（2026-10-14 补）──
+      # 这个脚本自 2026-09-19 写下基线以来**从来没有在 CI 里跑过** —— 它挂在
+      # `npm run lint` 的最后一段，而所有 workflow 只跑 `npm ci` + `npm run build`。
+      # 后果：基线写的是 13/41，实测已经漂到 26/49，全程无人发现（每次 UI 提交都只是
+      # 在记账，账从来没被核对过）。这里把它单独提出来跑，不跑整条 `npm run lint`：
+      # 那条链上的 `eslint .`（public/sw.js 的存量报错）与
+      # `prettier --check .`（21 个文件的存量未格式化）都还没清完，混在一起会让这条
+      # 门禁一上来就是红的，等于没加。两者各自清完后应改为直接跑 `npm run lint`。
+      - name: Check web UI baseline
+        run: cd web && npm run check:ui
+
+      # ── 诊断项跨端归属门禁（2026-10-14 补）──
+      # 诊断中心两端各有一份注册表：查 core/设备状态的项（scope=core）**必须两端都有**，
+      # 而"本端专有"的项（浏览器通知授权 / Android 通知授权 / 本页 WebSocket）只该在那一端。
+      # 这件事此前只存在于人脑里 —— 加一项时没有任何东西会提醒你"这是 core 类的，另一端也要加"，
+      # 于是 app 曾长期比 web 少 4 项 core 类检查而无人发现。
+      # 脚本用自身路径定位仓库根，**任何 cwd 都能跑**，所以刻意不挂在 web/package.json 下
+      # （挂在那边会在只检出 web 的场景里假失败，位置本身也在误导"这是 web 的检查"）。
+      - name: Check diagnostics scope (web ↔ app)
+        run: node scripts/check-diagnostics-scope.mjs
+
       # ── 单一版本源校验：version.json 双对象与 gradle 默认一致 ──
       # 发版流程：先改根目录 version.json → CI 校验通过 → 打 v<backend.version> tag → release.yml 发布
       # 前端 App = version.json.frontend ↔ ufiFrontendVersionName/Code

@@ -350,7 +350,37 @@ jobs:
           CORE_NAME="$(basename "$CORE_APK")"
           CORE_SHA="$(sha256sum "$CORE_APK" | awk '{print $1}')"
           CORE_SIZE="$(stat -c %s "$CORE_APK")"
+          # ── Web 更新包（2026-10-14 补）──
+          # 此前这里只回写 frontend / backend，**web 对象的 apkUrl 从来没被写过**，
+          # 而 WebUpdateManager 读到 apk_url 为空会直接抛 NeedPushException("web 对象缺少 apk_url 字段")
+          # ⇒ 那条「不重装 APK 单独更新 web 前端」的通道事实上从未被触发过。
+          # ZIP 由上面的 `Package web update ZIP` 步产出（仓根 web-update-<ver>.zip）。
+          WEB_ZIP="${{ steps.web_zip.outputs.file }}"
+          WEB_NAME="$(basename "$WEB_ZIP")"
+          WEB_SHA="$(sha256sum "$WEB_ZIP" | awk '{print $1}')"
+          WEB_SIZE="$(stat -c %s "$WEB_ZIP")"
           PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # ── Web 回写守卫（2026-10-14）：只在本次 web 包**严格高于**已发布基线时才写 web.* ──
+          # 为什么需要：`v*` 触发的 core 发布是从**标签所指的提交**构建的，而下面回写时会 rebase 到
+          # main —— main 上可能已经有一次 web-only 发布（web-release.yml）把 web.version 抬到了更高
+          # （如 0.0.4）。此时这次 core release 带着旧的 web 包（0.0.3）无条件覆盖，就会把清单里那条
+          # 更新的 web 记录**打回旧版**：设备端虽然会安全跳过（WebUpdateManager 禁止降级），
+          # 但「最新 web」从此不再被告知，新设备也永远拿不到它。
+          # 基线取两处的较大者：本次 checkout 的清单 + main 上的清单（rebase 后 main 才是最终落点）。
+          WEB_VERSION="$(jq -r .version web/dist/version.json)"
+          CUR_WEB="$(jq -r '.web.version // "0.0.0"' version.json)"
+          git fetch origin main --depth=1 2>/dev/null || true
+          MAIN_WEB="$(git show origin/main:version.json 2>/dev/null | jq -r '.web.version // "0.0.0"')"
+          BASE_WEB="$(printf '%s\n%s\n' "$CUR_WEB" "$MAIN_WEB" | sort -V | tail -n1)"
+          HIGHEST_WEB="$(printf '%s\n%s\n' "$WEB_VERSION" "$BASE_WEB" | sort -V | tail -n1)"
+          FILTER='.frontend.apkUrl = $fapk | .frontend.apkSize = $fsize | .frontend.apkSha256 = $fsha | .frontend.publishedAt = $fpub | .frontend.tagName = $ftag | .backend.apkUrl = $bapk | .backend.apkSize = $bsize | .backend.apkSha256 = $bsha | .backend.publishedAt = $bpub | .backend.tagName = $btag'
+          if [ "$HIGHEST_WEB" = "$WEB_VERSION" ] && [ "$WEB_VERSION" != "$BASE_WEB" ]; then
+            FILTER="$FILTER | .web.apkUrl = \$wapk | .web.apkSize = \$wsize | .web.apkSha256 = \$wsha | .web.publishedAt = \$wpub | .web.tagName = \$wtag"
+            echo "web.* 回写：本次 $WEB_VERSION > 基线 $BASE_WEB（main=$MAIN_WEB / 清单=$CUR_WEB）"
+          else
+            echo "::notice::跳过 web.* 回写：本次 web 包版本 $WEB_VERSION 不高于已发布基线 $BASE_WEB（main=$MAIN_WEB / 清单=$CUR_WEB）。保留清单里那条更新的 web 记录。"
+          fi
           jq \
             --arg fapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$APP_NAME" \
             --argjson fsize "$APP_SIZE" \
@@ -362,7 +392,12 @@ jobs:
             --arg bsha "$CORE_SHA" \
             --arg bpub "$PUBLISHED_AT" \
             --arg btag "${{ github.ref_name }}" \
-            '.frontend.apkUrl = $fapk | .frontend.apkSize = $fsize | .frontend.apkSha256 = $fsha | .frontend.publishedAt = $fpub | .frontend.tagName = $ftag | .backend.apkUrl = $bapk | .backend.apkSize = $bsize | .backend.apkSha256 = $bsha | .backend.publishedAt = $bpub | .backend.tagName = $btag' \
+            --arg wapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$WEB_NAME" \
+            --argjson wsize "$WEB_SIZE" \
+            --arg wsha "$WEB_SHA" \
+            --arg wpub "$PUBLISHED_AT" \
+            --arg wtag "${{ github.ref_name }}" \
+            "$FILTER" \
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "version.json 回写后："
           cat version.json

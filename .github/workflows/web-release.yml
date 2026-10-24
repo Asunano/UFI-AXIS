@@ -1,0 +1,190 @@
+# =============================================================================
+# UFI-AXIS Web 前端独立更新工作流（2026-10-14 新建）
+# =============================================================================
+# 用途：**只改 web 前端、不需要动 core** 的更新。
+#
+# 为什么可以只发 web：设备侧那条通道早就存在且完整 ——
+#   · WebResourceManager：覆盖目录 filesDir/web，readAsset() 先查覆盖目录、miss 才回退 APK 的 assets/web；
+#   · WebUpdateManager：拉清单 → 取 `web` 对象 → 比版本 → 下载 ZIP → SHA-256 校验 → installFromZip 原子替换；
+#   · WebUpdateRoutes：手动通道（上传 ZIP / rollback / clear override）。
+#   也就是说：**只要清单里 web.apkUrl 有效，设备自己就会覆盖，完全不用重装 core。**
+#
+# 在此之前这条通道事实上从未被触发过，原因是 release.yml 回写 version.json 时只写了
+# frontend / backend，web 对象的 apkUrl 一直是空串 ⇒ WebUpdateManager 抛
+# NeedPushException("web 对象缺少 apk_url 字段")。本次一并补上（release.yml 的回写段已加 web 分支）。
+#
+# ── 触发与版本号（2026-10-14 与用户确认）──────────────────────────────────────
+#   · 触发：打 `web-v<version>` 标签。**刻意不加 workflow_dispatch** —— 手动在 main 上跑时
+#     github.ref_name 是 "main"，回写出的 apkUrl 会变成 .../releases/download/main/... 这种死链
+#     （release.yml 历史上踩过这个坑，见它的 tag 守卫注释）。tag 触发天然带版本语义。
+#   · 版本号：`web.version` **独立递增**，与 backend.version 解耦。
+#     发版流程 = 先改根 version.json 的 web.version → 提交 → 打 `web-v<同值>` 标签。
+#     下面「Verify tag matches built web version」会强制两者一致。
+#     注意 WebUpdateManager **禁止降级**（compareVersions(latest, current) <= 0 直接跳过），
+#     所以版本号只能往上加。
+#   · `web-v*` 不会误触发 release.yml（它的过滤是 `tags: ['v*']`，要求以 v 开头）。
+#
+# ── 更新源（第 3 点：与 core 自身更新一致，自动选直连/镜像）────────────────────
+#   设备读的是 AppSettings.updateUrl（默认 raw.githubusercontent.com/Asunano/UFI-AXIS/main/version.json），
+#   直连还是镜像由 MirrorResolver 按「地区 + 用户模式」在设备侧自动降级（core 的 UpdateManager 与
+#   web 的 WebUpdateManager 共用同一套 resolver + 同一个 URL）。
+#   ⇒ **本工作流不需要为镜像做任何事**，只要把 web 对象回写到 main 的 version.json 即可。
+# =============================================================================
+
+name: Release Web (standalone update)
+
+on:
+  push:
+    tags:
+      - 'web-v*'
+
+permissions:
+  contents: write
+
+# ⚠ 必须与 release.yml / component-versions.yml 共用同一个组：三者都会 commit 根目录 version.json，
+#   并发跑会撞 non-fast-forward。发版频率低，串行排队的代价可以忽略。
+concurrency:
+  group: version-json
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build & Publish Web Update
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # ── 编码守卫：跟踪的文本文件必须是 UTF-8 ──
+      # 与 build.yml / release.yml 同一条门禁。web 侧的 .vue/.ts/.json/.css/.html/.svg/.mjs/.js
+      # 全在白名单里；这些文件一旦以 GBK 入库，构建不报错但 IDE / GitHub / grep 下中文注释全是乱码。
+      - name: Guard — tracked text files must be UTF-8
+        run: |
+          bad=$(git ls-files '*.kt' '*.kts' '*.java' '*.aidl' '*.pro' '*.keep' \
+                  '*.ts' '*.vue' '*.mjs' '*.js' '*.json' '*.css' '*.html' '*.svg' \
+                  '*.xml' '*.md' '*.yml' '*.yaml' '*.toml' '*.properties' '*.py' '*.sh' \
+                | while read -r f; do
+                    iconv -f UTF-8 -t UTF-8 "$f" >/dev/null 2>&1 || echo "$f"
+                  done)
+          if [ -n "$bad" ]; then
+            echo "::error::以下跟踪文件不是 UTF-8，请转码后再提交（iconv -f GBK -t UTF-8 <文件>）："
+            echo "$bad"
+            exit 1
+          fi
+          echo "OK: 跟踪的文本文件均为 UTF-8"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: cd web && npm ci
+
+      # ── Web UI 基线门禁（2026-10-14 补，与 build.yml 同一条）──
+      # 发布路径上再卡一次：只改 web 的更新包走的是本工作流，不经过 build.yml，
+      # 少了这一步就等于"发版可以绕过 UI 基线"。
+      - name: Check web UI baseline
+        run: cd web && npm run check:ui
+
+      # ── 构建（vue-tsc -b && vite build）──
+      # vite.config.ts 的 webVersionPlugin 会读**根目录 version.json 的 web.version** 生成
+      # web/dist/version.json —— 所以 ZIP 里的 version.json 天然带上正确版本，
+      # installFromZip / getVersionInfo 读的就是它。
+      - name: Build web frontend
+        run: cd web && npm run build
+
+      # ── 版本一致性门禁（与 release.yml 的 "Verify tag matches version.json" 同构）──
+      # 强制「先改 version.json 的 web.version、再打同值标签」。这条同时是防降级的第一道闸：
+      # 忘了改版本号就会在这里失败，而不是发一个设备端会被 compareVersions 静默跳过的包。
+      - name: Verify tag matches built web version
+        id: web_ver
+        run: |
+          WEB_VERSION=$(jq -r .version web/dist/version.json)
+          TAG_VERSION="${GITHUB_REF_NAME#web-v}"
+          echo "tag=$GITHUB_REF_NAME  标签版本=$TAG_VERSION  dist 版本=$WEB_VERSION"
+          if [ -z "$WEB_VERSION" ] || [ "$WEB_VERSION" = "null" ]; then
+            echo "::error::读不到 web/dist/version.json 的 version 字段"
+            exit 1
+          fi
+          if [ "$WEB_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::标签 $GITHUB_REF_NAME 与构建出的 web 版本 $WEB_VERSION 不一致。"
+            echo "::error::请先把根目录 version.json 的 web.version 改成目标版本并提交，再打 web-v<版本> 标签。"
+            exit 1
+          fi
+          echo "version=$WEB_VERSION" >> $GITHUB_OUTPUT
+
+      # ── 打包 ──
+      # 从 web/dist **内部** zip，让 ZIP 根目录直接是 index.html / version.json / assets/
+      # —— installFromZip 校验的就是「根目录必须有 index.html 与 version.json」。
+      - name: Package web update ZIP
+        id: web_zip
+        run: |
+          WEB_VERSION="${{ steps.web_ver.outputs.version }}"
+          ZIP="web-${WEB_VERSION}.zip"
+          rm -f "$ZIP"
+          (cd web/dist && zip -r "../../$ZIP" . -x "*.DS_Store")
+          # 体积闸门：WebUpdateManager 的 MAX_WEB_ZIP_BYTES = 50MB，超了设备端会拒绝下载。
+          SIZE=$(stat -c %s "$ZIP")
+          MAX=$((50 * 1024 * 1024))
+          echo "ZIP=$ZIP  size=$SIZE  sha256=$(sha256sum "$ZIP" | awk '{print $1}')"
+          if [ "$SIZE" -ge "$MAX" ]; then
+            echo "::error::web 更新包 $SIZE 字节，超过设备端上限 ${MAX}（WebUpdateManager.MAX_WEB_ZIP_BYTES）"
+            exit 1
+          fi
+          echo "file=$ZIP" >> $GITHUB_OUTPUT
+
+      # ── 建 Release 并附上 ZIP（必须先于回写：回写里的 apkUrl 指向这个附件）──
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Web ${{ steps.web_ver.outputs.version }}
+          body: |
+            ## Web 前端独立更新 ${{ steps.web_ver.outputs.version }}
+
+            本包只更新设备上的 Web 控制面板（覆盖到 `filesDir/web`），**不涉及 core APK**。
+            设备侧由 `WebUpdateManager` 拉取本仓库 `main` 分支的 `version.json` 自动更新。
+
+            ${{ github.event.head_commit.message }}
+          files: ${{ steps.web_zip.outputs.file }}
+
+      # ── 回写 version.json 的 web 对象 ──
+      # 只动 web.*，**不碰** frontend/backend —— 那两个由 release.yml 管，混在一起会互相覆盖。
+      # 设备读的就是这份（main 分支的 raw version.json），所以必须落回 main。
+      - name: Write back version.json (web only)
+        run: |
+          ZIP="${{ steps.web_zip.outputs.file }}"
+          WEB_SHA="$(sha256sum "$ZIP" | awk '{print $1}')"
+          WEB_SIZE="$(stat -c %s "$ZIP")"
+          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq \
+            --arg wapk "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/$ZIP" \
+            --argjson wsize "$WEB_SIZE" \
+            --arg wsha "$WEB_SHA" \
+            --arg wpub "$PUBLISHED_AT" \
+            --arg wtag "${{ github.ref_name }}" \
+            '.web.apkUrl = $wapk | .web.apkSize = $wsize | .web.apkSha256 = $wsha | .web.publishedAt = $wpub | .web.tagName = $wtag' \
+            version.json > version.json.tmp && mv version.json.tmp version.json
+          echo "version.json 的 web 段回写后："
+          jq .web version.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "ci: 回写 web release ${{ github.ref_name }} 的 apkUrl/apkSize/apkSha256/publishedAt/tagName" \
+            || echo "version.json 无变更，跳过 commit"
+          # 与 release.yml 同一套防 non-fast-forward 手法（顺序不能反：index 里有暂存改动时
+          # git rebase 会直接拒绝执行，之前 add → rebase → commit 的写法是空转）。
+          git fetch origin main || true
+          git rebase origin/main || git rebase --abort || true
+          git push origin HEAD:main || echo "::warning::version.json 回写 push 失败（不阻断 release）"
+
+      # ── 标签前移到回写提交 ──
+      # 与 release.yml 同理：让标签快照里的 version.json 也带着 apkUrl。
+      # 设备默认读 main，这条是为「直接读标签快照的通道 / 回写落地前的竞态窗口」兜底。
+      - name: Move tag to write-back commit
+        run: |
+          git tag -f "${{ github.ref_name }}" HEAD
+          git push origin "refs/tags/${{ github.ref_name }}" --force

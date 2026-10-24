@@ -64,3 +64,9 @@ include(":app:feature-download")   // 下载管理（Download）
 include(":app:feature-sms")        // 短信（Sms/SmsForward）
 include(":app:feature-apps")       // 应用管理（App/Adb）
 include(":app:feature-monitor")    // 监控中心（Monitor）
+// 资源中心（2026-10-14）：把散落的可下载资源（Web 前端 ZIP / frpc / cloudflared）收拢到一处。
+// **注册表驱动** —— 后续加新资源只写一条 ResourceDescriptor，不写新屏幕、不写新分支。
+// 单独成模块而不是塞进 feature-settings：两个来源页（feature-tools 的隧道设置、
+// feature-settings 的服务器配置）都要跳过来，放进任何一边都会让三个 feature 模块之间
+// 长出一条横向依赖；独立模块则两侧都只经 :app:ui 的 Routes 常量跳转，零新增依赖。
+include(":app:feature-resources")  // 资源中心（Web ZIP / frpc / cloudflared）

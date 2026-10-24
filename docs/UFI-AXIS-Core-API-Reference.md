@@ -2750,7 +2750,16 @@ AT 通道状态。
 
 数据源是**系统媒体库（MediaStore）**，core 不自建索引：系统已经把整卡的媒体索引好了（时长、分辨率、专辑、艺术家，还有缓存好的缩略图），
 再写一套扫描器 + 索引表等于把增量与失效逻辑重做一遍，而且会与系统媒体库长期两份数据打架。
-core 只做三件事：查 MediaStore、按该类型配置的扫描目录过滤、把缩略图转成 JPEG 发出去。
+
+**2026-10-13 起加了一层内存索引缓存**（`MediaIndexStore`）：后台每 5 分钟把整库元数据查一次存进内存，
+用户读 `/list`、`/groups`、`/browse` 时**只读内存快照**，过滤 / 排序 / 分页都在内存里做。
+改造前这三个端点每次请求都要现场查 MediaStore（`/browse` 最坏是 1 + 200 次跨进程查询）。
+快照存的是**未过滤的整库**，扫描目录与「从音乐库移除」名单在读时才套 —— 这样改设置立刻生效，
+且歌单回查（刻意不受扫描目录约束）不会把库外的歌判成已失效。
+`/rescan` 提交扫描后会按 +3s/+15s/+45s 追赶重建（`MediaScannerConnection` 是异步的，立刻重建只会拿到旧库）。
+
+缩略图与封面由 core 自己解码（2026-10-13 起**不再调用系统解码**）：视频 ffmpeg、图片降采样、
+音频读容器头部的内嵌封面字节。理由与取舍见下面的 `GET /api/media/thumbnail`。
 
 **不复用 `/api/files/list` 与 `/api/files/search`**：前者只能单层列目录，后者按**文件名**子串递归找且有 50 条硬顶、深度 ≤ 8、10s 墙钟。
 拿它们凑「这台设备上所有视频 / 音乐 / 图片」要么漏要么慢到不可用。
@@ -2990,12 +2999,24 @@ MediaStore 查询失败时不报错，而是回空 `groups` + `total: 0` 并在 
 
 ### GET /api/media/thumbnail
 
-缩略图（JPEG）。**三级回退：客户端回传的缓存 → 系统缩略图（`loadThumbnail`）→ core 自行生成**（视频抽第 1 秒关键帧、图片降采样解码、音频取内嵌封面）。
+缩略图（JPEG）。**两级：落盘缓存 → core 自行解码**。
 
-缓存排第一是因为 core 跑的随身 WiFi 用的是精简 ROM，**可能根本解不出视频画面**：`MediaProvider` 与 `MediaMetadataRetriever` 走同一套 codec，实测双双失败。
-这种设备上唯一能出图的办法是让有解码能力的客户端抽好帧回传（`PUT /api/media/thumbnail`），core 只管存与发。
+2026-10-13 起**不再调用系统解码**。此前的一级是系统缩略图（`MediaProvider.loadThumbnail`）、
+二级是 `MediaMetadataRetriever` 抽帧，两者走同一套系统 codec 栈，而 core 跑的随身 WiFi 用的是精简 ROM
+（桥接不到硬件 VPU），实测 `getFrameAtTime` 恒返回 null、`loadThumbnail` 报 `Failed to create thumbnail`。
+也就是说这两级在这类设备上**必然失败**，唯一的"收益"是让 `android.process.media` 白解一次 ——
+那正是它内存涨到 471MB 且**不回落**的原因。ffmpeg 接入并稳定后，两级整体退役。
 
-视频不取第 0 帧：很多视频首帧是黑场或渐入，抽出来是一张纯黑图，那和没有缩略图没区别。
+现在按类型走各自的自有解码路径：
+
+| type | 来源 | 并发闸门 |
+| --- | --- | --- |
+| `video` | ffmpeg 软解抽帧（`libffmpeg_bridge.so`） | 全局串行（许可 1） |
+| `image` | `BitmapFactory` 按 `inSampleSize` 降采样 | 许可 2 |
+| `audio` | 内嵌封面字节（ID3 `APIC` / FLAC `PICTURE`）→ 系统提取器兜底 | 许可 2 |
+
+视频**不取第 0 帧**：很多视频首帧是黑场或渐入，抽出来是一张纯黑图，那和没有缩略图没区别；
+ffmpeg 的输出仍要过 `FrameValidator` 的四判据（字节数 / 尺寸 / 全零帧 / 亮度）。
 
 **查询参数：**
 
@@ -3003,14 +3024,16 @@ MediaStore 查询失败时不报错，而是回空 `groups` + `total: 0` 并在 
 | --- | --- | --- |
 | type | 是 | `video` / `audio` / `image` |
 | id | 是 | MediaStore 行 id |
-| size | 否 | 最长边像素，默认 256，夹取到 96..1024；命中回传缓存时该参数被忽略 |
+| size | 否 | 最长边像素，默认 256，夹取到 96..1024；命中落盘缓存时该参数被忽略 |
 
 `size` 上限 2026-09-16 由 512 提到 1024：音乐播放页的封面容器是 260dp，在 xxhdpi 上约 780 物理像素，请求 512 会被放大 1.5 倍 —— 这就是「封面很模糊」的原因。
 
-**响应：** `200` + `image/jpeg` 字节流，带强 ETag（`"media-<type>-<id>-<size>"`，命中回传缓存时是 `"media-<type>-<id>-c<mtime>"`）与 `Cache-Control: private, max-age=86400`。
+**响应：** `200` + `image/jpeg` 字节流，带强 ETag（`"media-<type>-<id>-<size>"`，命中落盘缓存时是 `"media-<type>-<id>-c<mtime>"`）与 `Cache-Control: private, max-age=86400`。
 带 `If-None-Match` 且一致时回 `304`。
 
-回传缓存的文件名只按 `(type, id)` 编、**不含 size**：客户端交上来的是一张够大的图，列表要 256、网格要 108 都能用它缩；按 size 分开存会让同一个视频存出好几份，把 64MB 的缓存上限很快撑满。
+`X-Thumb-Source` 响应头标明来源，取值：`cache`（落盘命中）/ `ffmpeg` / `image` / `tag`（容器内嵌封面）/ `extractor`（系统提取器读封面原子）。
+
+缓存文件名只按 `(type, id)` 编、**不含 size**：同一张图列表要 256、网格要 108 都能用它缩；按 size 分开存会让同一个视频存出好几份，把 64MB 的缓存上限很快撑满。
 缓存超限时按修改时间从旧到新删，**不做 LRU**（读命中不 touch 文件：一 touch，基于 `lastModified` 的 ETag 就跟着变，客户端缓存全部作废）。
 
 **错误：**
@@ -3019,52 +3042,36 @@ MediaStore 查询失败时不报错，而是回空 `groups` + `total: 0` 并在 
 | --- | --- |
 | 400 | `type` 不合法，或缺少 `id` |
 | 403 | 该类型媒体权限未授权 |
-| 404 | 三级都拿不到图，`message` 与 `reason` 里带**两级各自的失败原因**（异常类名 + 消息） |
+| 404 | 拿不到图，`message` 与 `reason` 里带**失败原因**（异常类名 + 消息） |
 
 404 带原因是 2026-09-16 补的可观测性：设备端日志要连 ADB 才看得到，而客户端原来只拿到一句「缩略图不可用」——
 权限被拒、解码栈缺失、文件损坏在两侧长得完全一样。原因里不含路径与凭据。
 **绝不回一张破图或空 200**：客户端据 404 画占位图标。
 
-### PUT /api/media/thumbnail
-
-接收客户端抽好的缩略图（请求体是 **raw JPEG 字节**，不是 JSON、不是 multipart）。
-
-存在的理由就是上一条里那台解不出画面的设备：手机端的解码栈是完整的，「谁有解码能力谁干活」。
-回传一次之后 `GET /api/media/thumbnail` 的第一级直接命中，**Web 端与第二台手机也就一并有了缩略图** —— 这是选它而不是「只在 app 本地缓存」的唯一理由。
-同一个 id 再传一次会覆盖（客户端可能抽到更好的一帧）。
-
-**查询参数：** `type`（必填）、`id`（必填）
-
-**请求体：** JPEG 字节流，`Content-Type: image/jpeg`
-
-**响应：**
-
-```json
-{ "success": true, "type": "video", "id": 20501, "size": 48213 }
-```
-
-**错误：**
-
-| 状态码 | 场景 |
-| --- | --- |
-| 400 | `type` 不合法 / 缺少 `id` / 请求体不是 JPEG（魔数不是 `FF D8 FF`） |
-| 404 | 媒体库里没有这一项（`type`/`id` 对不上任何行） |
-| 413 | 超过单张上限 512KB |
-| 500 | 写入缓存目录失败 |
-
-这不是「允许客户端随便塞图」：四条校验（type/id 合法、id 真实存在、≤512KB、必须是 JPEG）加上 `/api` 本身的设备签名鉴权，
-攻击面就是「已配对设备可以给自己库里的某个媒体塞一张 ≤512KB 的 JPEG」，与它本来就能改文件的权限相比没有放大。
-写入用「先写 `.tmp` 再 rename」：中途断开不会留下半张图被当成缓存命中。
+> **已删除（2026-10-13）：`PUT /api/media/thumbnail`。**
+> 它原本用于「谁有解码能力谁干活」—— 让手机抽好帧回传给 core。ffmpeg 接入后这个理由消失，
+> 而 app 与 web **都已不再调用它**（app 侧注释写明「本机抽帧兜底已整体删除」），
+> 于是只剩成本：一个接收任意 ≤512KB JPEG 的写入口与孤儿文件风险。
+> 需要重抽时用 `DELETE /api/media/thumbnail-cache?type=&id=` 清掉缓存再拉。
 
 ### GET /api/media/cover
 
-音频封面。先取**内嵌封面原图字节**（ID3 APIC / FLAC PICTURE，**不重新编码** → 能拿到的最高画质），取不到再退回 `loadThumbnail(1024)`。
+音频封面。取**内嵌封面原图字节**（ID3 APIC / FLAC PICTURE，**不重新编码** → 能拿到的最高画质）。
+
+2026-10-13 起不再有 `size` 参数、也不再退回 `loadThumbnail`：内嵌封面本身就是原图字节，
+要「小图」是客户端缩放的事，core 侧缩放只会白丢画质还多一次编码。
+
+三级回退：**落盘缓存** → `AudioTagReader` 解容器头部字节（ID3 `APIC` / FLAC `PICTURE`，不依赖任何 codec）
+→ `MediaMetadataRetriever.embeddedPicture` 兜底（它是**提取器**不是解码器，只读封面原子；
+M4A 的 `covr` 走的就是这条）。
+
+取不到会写 6h 冷却标记，避免无封面的歌每次列表刷新都重跑一遍解析。
 
 与 `/thumbnail` 分开的理由：列表要的是「小而快」（256px、可缓存、能糊），播放页要的是「尽量清楚」。
 
 **查询参数：** `id`（必填，音频的 MediaStore id）
 
-**响应：** `200` + `image/jpeg` 或 `image/png` 字节流（内嵌封面按魔数判类型，不一律声明成 JPEG），带 ETag `"media-cover-<id>"` 与 `Cache-Control: private, max-age=86400`；`If-None-Match` 命中回 `304`。
+**响应：** `200` + `image/jpeg` 或 `image/png` 字节流（按魔数判类型，不一律声明成 JPEG），带 ETag `"media-cover-<id>"` 与 `Cache-Control: private, max-age=86400`；`If-None-Match` 命中回 `304`。
 
 **错误：**
 

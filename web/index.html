@@ -35,7 +35,9 @@
             refreshing = true;
             location.reload();
           });
-          navigator.serviceWorker.register('/sw.js').catch(function () { /* 静默：PWA 是增强项 */ });
+          navigator.serviceWorker.register('/sw.js').catch(function () {
+            /* 静默：PWA 是增强项 */
+          });
         });
       }
     </script>
