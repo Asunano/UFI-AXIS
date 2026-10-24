@@ -4,6 +4,7 @@ import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DeviceRequestVerifier
+import com.ufi_axis_core.util.PairedDeviceRecord
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.application.call
@@ -32,7 +33,15 @@ import io.ktor.util.AttributeKey
  * 鉴权通过后把设备指纹写入 [DEVICE_FINGERPRINT_KEY]，供访问日志与业务侧归因。
  */
 class AuthMiddleware(
-    private val verifier: DeviceRequestVerifier
+    private val verifier: DeviceRequestVerifier,
+    /**
+     * 被拉黑设备的**已鉴权请求**被拒时的回调（2026-10-15），参数是被拒的设备记录。
+     *
+     * 用回调而不是直接依赖 `AlertEngine`：本类在 `core:api`、告警引擎在 `core:alert`，
+     * 由装配层注入比让中间件反向依赖引擎清楚（与 `PairingRoutes.onBlockedDevice` 同款）。
+     * 这里是 suspend 上下文（`route.intercept`），所以回调可以是 suspend 的。
+     */
+    private val onBlockedDevice: (suspend (PairedDeviceRecord) -> Unit)? = null
 ) {
     private val tag = "AuthMiddleware"
 
@@ -104,6 +113,19 @@ class AuthMiddleware(
                 DeviceRequestVerifier.Result.Replayed -> {
                     call.logReject("nonce replayed")
                     call.rejectRetryable("Nonce replayed", ErrorCode.INVALID_SIGNATURE)
+                    finish()
+                }
+                is DeviceRequestVerifier.Result.Blocked -> {
+                    // 2026-10-15：设备被机主拉黑。走 rejectRevoked（444）而不是 401 ——
+                    // 444 是既有的"凭据确证作废"语义：客户端清 token 回配对引导。
+                    // 这正是"拉黑即刻掉线"的实现（HTTP 与 WebSocket 共用同一个 verifier 实例，
+                    // 所以两者会一起断）。代价：解除拉黑后该设备需要重新配对一次。
+                    call.logReject("device blocked by owner")
+                    // 事件留痕（L2）。注意：这条路**每次请求**都会命中（客户端在轮询），
+                    // 所以节流交给回调实现方（见 ComponentFactory 里的 recordHitThrottled）。
+                    runCatching { onBlockedDevice?.invoke(result.device) }
+                        .onFailure { AppLogger.w(tag, "onBlockedDevice callback failed: ${it.message}") }
+                    call.rejectRevoked("Device blocked", ErrorCode.DEVICE_BLOCKED)
                     finish()
                 }
             }

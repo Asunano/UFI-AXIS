@@ -62,6 +62,81 @@ private suspend fun deleteBatched(
 }
 
 /**
+ * 有界队列的「计数 ↔ 容器」配对协议 —— [DataScheduler] 那 5 个历史 buffer 共用的**唯一**实现。
+ *
+ * ## 为什么抽成顶层 internal
+ * 这套协议里藏过一个**让图表整段没有数据**的 off-by-one（见 [drainCounterBounded] 的注释），
+ * 而它只在「产出速率 ≈ 1 条/刷写周期」时才显形 —— 也就是**没有前端连接**的常态。
+ * 藏在 `DataScheduler` 的私有成员里就没法直接单测（构造一个 DataScheduler 要十几个依赖）。
+ * 现在逻辑落在顶层，测试可以直接喂一个 `ConcurrentLinkedQueue` + `AtomicInteger` 进去。
+ */
+internal fun <T> ConcurrentLinkedQueue<T>.offerCounterBounded(
+    item: T,
+    counter: AtomicInteger,
+    maxSize: Int,
+) {
+    // 2026-10-05 R1-6：入队/逐出改为 CAS 配对协议（占计数即得名额，poll 与计数严格配对），
+    // 替代原「循环 poll + decrementAndGet」的 get-then-put 序列，避免并发下 counter 与队列内容漂移。
+    while (true) {
+        val cur = counter.get()
+        if (cur < maxSize) {
+            if (counter.compareAndSet(cur, cur + 1)) { offer(item); return }
+        } else {
+            // 已达上限：丢最旧一条，再入队新记录。
+            //
+            // ★★ 2026-10-14：这一支**不能动计数** ★★
+            // `poll()` 一条 + `offer(item)` 一条是**净零**，队列长度不变 ⇒ 计数也必须不变。
+            // 旧实现在这里做了 `counter - 1`，于是**每发生一次逐出，计数就比队列实际长度少 1**：
+            //   · 上界失效 —— 计数顶在 maxSize 不动，队列却每 2 次 offer 稳定涨 1 条（无界增长）；
+            //   · 而 drain 只按计数取，于是积压永远清不干净，写进库的还是**很旧的时间戳**
+            //     （图表时间轴错位）。
+            // 与 drain 的并发也安全：drain 若同时取走一条，计数与队列各减 1，本支的 poll+offer
+            // 让两者都保持不变，不变量 `计数 == 队列长度` 继续成立。
+            poll()
+            offer(item)
+            return
+        }
+    }
+}
+
+/**
+ * 把队列里**计数所声明的全部元素**取走。
+ *
+ * ## ★★ 2026-10-14：这里曾有一个让图表整段无数据的 off-by-one ★★
+ *
+ * 旧实现是：
+ * ```
+ * val n = counter.updateAndGet { cur -> if (cur <= 0) cur else cur - 1 }  // 返回**减过之后**的新值
+ * if (n <= 0) { counter.set(0); break }                                   // 计数为 1 → n == 0 → 不 poll 就退出
+ * ```
+ * `updateAndGet` 给的是**新值**，于是**计数为 1 时直接 break，那一条根本不会被 poll**。
+ * 净效果：**每次 drain 只能取走「计数 − 1」条**。
+ *
+ * 后果不是"少一条"这么轻：无前端连接时 `realtimeDelay` 走 `idleDelayMs`（默认 60s），
+ * 每个指标每 30s 只产出 **1 条**，计数恰好是 1 → drain **恒返回空** → `totalFlushed == 0`
+ * → 既不写库、也不打 "Flushed buffers"（那行只在 `totalFlushed > 0` 时打），图表整段空白。
+ * 而前端一连上，产出变成 8~9 条/30s，drain 立刻正常 —— 真机表现就是
+ * 「断开就没数据、连上就恢复、重启后要等 App 连上才有数据」。
+ * 实测：09:26→11:48 共 142 分钟零产出，11:48:05 WS 一连上、11:48:16 立刻恢复。
+ *
+ * 现在改成「先 CAS 占到名额（拿旧值）再去 poll」，计数 1 也能取走那一条。
+ * 队列空而计数不为 0（并发漂移）时回滚占减。
+ */
+internal fun <T> ConcurrentLinkedQueue<T>.drainCounterBounded(
+    counter: AtomicInteger,
+    into: MutableList<T>,
+) {
+    while (true) {
+        val cur = counter.get()
+        if (cur <= 0) break
+        if (!counter.compareAndSet(cur, cur - 1)) continue // 占减失败（有并发）→ 重读重试
+        val e = poll()
+        if (e == null) { counter.incrementAndGet(); break } // 队列已空：回滚占减
+        into.add(e)
+    }
+}
+
+/**
  * 多频率采集调度器
  *
  * ════════════════════════════════════════
@@ -401,17 +476,58 @@ class DataScheduler(
     /**
      * 实时采集循环的间隔等待：有前端连接时按自适应间隔硬等；无连接时按 idleDelayMs 等待，
      * 但可被 [applyRealtimePushState] 的唤醒信号提前打断，使前端连上后立刻采一轮并广播。
+     *
+     * @param sampleWhenIdle 2026-10-20：无前端连接时也按"**至少每半个 flush 周期**"采一次。
+     *   原来无连接一律等满 idleDelayMs（默认 60s），而 flush 周期是 30s ⇒ 每个指标每两个
+     *   flush 才有一条记录，flush 队列一半是空的 —— 日志里那条
+     *   「采集间歇缺失 cpu：最近 10 轮里有 5 轮无数据」就是它，图表因此断断续续。
+     *   CPU/内存是纯本地读取（/proc），成本可忽略，不该跟着"有没有人订阅"降频。
      */
-    private suspend fun realtimeDelay(priority: DataPriority, wake: Channel<Unit>) {
+    private suspend fun realtimeDelay(
+        priority: DataPriority,
+        wake: Channel<Unit>,
+        sampleWhenIdle: Boolean = false
+    ) {
         if (webSocketManager.getConnectionCount() > 0) {
             delay(getAdaptiveDelay(priority))
         } else {
-            withTimeoutOrNull(idleDelayMs) { wake.receive() }
+            val waitMs = if (sampleWhenIdle) minOf(idleDelayMs, flushIntervalMs / 2) else idleDelayMs
+            withTimeoutOrNull(waitMs) { wake.receive() }
         }
     }
 
     /** 最近一次缓冲区刷写失败的错误信息（置错误态，供监控/诊断感知；成功刷写后清空）。 */
     @Volatile private var lastFlushError: String? = null
+
+    /**
+     * 最近一次**尝试**刷写的时刻（不论这一轮有没有数据）。
+     *
+     * 与 [lastCpuFlushAtMs] 的区别是后者只在 `totalFlushed > 0` 时更新 —— 于是「采集本身停摆、
+     * buffer 一直是空的」这种情况在旧诊断里完全不可见（没有 flush、没有 gap 日志，图表却是一段空白）。
+     * 这里无条件记录，供 [flushWatchdog] 判断 flush 协程是否还活着。
+     */
+    @Volatile private var lastFlushAttemptAtMs = 0L
+
+    /** 上次由看护循环重启 flush 的时刻，用于防抖（见 [FLUSH_WATCHDOG_MIN_RESTART_GAP_MS]）。 */
+    @Volatile private var lastFlushWatchdogRestartAtMs = 0L
+
+    /**
+     * 每个指标「连续多少轮 flush 为空」，顺序与 [FLUSH_METRIC_NAMES] 对齐（cpu/memory/traffic/signal/battery）。
+     *
+     * 2026-10-14：用户报「有些指标有数据、有些没有、断断续续」，而旧诊断只能发现
+     * 「成功写库之间的间隔」，抓不到「某个指标一直没产出」。连续为空达到
+     * [EMPTY_STREAK_WARN] 轮就 WARN 一次（WARN 级不受 debug_mode 影响，必定落盘），
+     * 恢复时再 INFO 一条，这样断层能被直接归因到具体指标。
+     */
+    private val emptyFlushStreak = IntArray(5)
+
+    /** 滚动窗口内每个指标的「总轮数 / 空轮数」，用于抓间歇性缺失（见 [EMPTY_RATIO_WINDOW]）。 */
+    private val flushRounds = IntArray(5)
+    private val emptyRounds = IntArray(5)
+
+    /** 信号全 0 被跳过（不入库）的连续轮数 —— signal 曲线断层的直接原因。 */
+    private var signalZeroStreak = 0
+
     private var performanceMonitorJob: Job? = null
     private var flushJob: Job? = null
     private var wakeLockRenewJob: Job? = null
@@ -581,11 +697,31 @@ class DataScheduler(
         // 设备性能监控: 每30秒检查一次，动态调整线程池
         startPerformanceMonitor()
 
-        // 批量刷写: 每 10 秒将缓冲区数据批量写入数据库，减少 I/O 次数
-        flushJob = schedulerScope.launch {
+        // 批量刷写: 每 flushIntervalMs 将缓冲区数据批量写入数据库，减少 I/O 次数
+        startFlushLoop()
+
+        // ── 【自愈】flush 看护（2026-10-14）──
+        // flush 循环若停摆（异常退出，或卡死在 DB 写入里），采集照跑、buffer 只进不出，
+        // 图表整段空白而日志里可能什么都没有（旧实现正是如此，只能靠人发现）。
+        // 这里独立看守：静默超过 3 个刷写周期就重启它。重启本身也会打 WARN，
+        // 所以「反复重启」这件事在日志上是可见的，而不是悄悄兜住。
+        schedulerScope.launch {
             while (isActive) {
-                delay(flushIntervalMs)
-                flushBuffers()
+                delay(FLUSH_WATCHDOG_INTERVAL_MS)
+                val last = lastFlushAttemptAtMs
+                if (last == 0L) continue
+                val silentMs = System.currentTimeMillis() - last
+                if (silentMs <= flushIntervalMs * 3) continue
+                // 防抖：至少间隔 FLUSH_WATCHDOG_MIN_RESTART_GAP_MS 才重启一次，
+                // 避免 DB 真的坏掉时每 60s 反复 cancel/relaunch。
+                val nowMs = System.currentTimeMillis()
+                if (nowMs - lastFlushWatchdogRestartAtMs < FLUSH_WATCHDOG_MIN_RESTART_GAP_MS) continue
+                lastFlushWatchdogRestartAtMs = nowMs
+                AppLogger.w(
+                    tag,
+                    "Diag: flush 停摆 ${silentMs}ms（> 3×${flushIntervalMs}ms，协程存活=${flushJob?.isActive == true}），正在重启 flush 循环"
+                )
+                startFlushLoop(runImmediately = true)
             }
         }
 
@@ -610,7 +746,9 @@ class DataScheduler(
             while (isActive) {
                 collectCpu()
                 collectMemory()
-                realtimeDelay(DataPriority.HIGH, cpuMemoryWake)
+                // sampleWhenIdle = true：无前端连接时也保证每 ≤flush/2 采一次，
+                // 否则 flush 会有一半是空轮（图表断层，见 realtimeDelay 的说明）。
+                realtimeDelay(DataPriority.HIGH, cpuMemoryWake, sampleWhenIdle = true)
             }
         }
 
@@ -712,6 +850,54 @@ class DataScheduler(
 
         // ── 【媒体封面预热】(2026-10-05 G6)：attach 过才启动；5 分钟一轮，判据在被调方 ──
         if (thumbPrewarmTask != null) startThumbPrewarmLoop()
+    }
+
+    /**
+     * 启动（或重启）批量刷写循环。抽成函数是为了让 [start] 里的看护循环能在它停摆后重启它。
+     *
+     * @param runImmediately 重启场景传 true：立刻先刷一轮，让看护循环马上看到「有活动」，
+     *   而不是等一个完整 [flushIntervalMs]。
+     */
+    private fun startFlushLoop(runImmediately: Boolean = false) {
+        flushJob?.cancel()
+        flushJob = schedulerScope.launch {
+            if (runImmediately) flushOnce()
+            while (isActive) {
+                delay(flushIntervalMs)
+                flushOnce()
+            }
+        }
+    }
+
+    /**
+     * 单轮刷写，**把任何异常都挡在循环体里**。
+     *
+     * 2026-10-14 修一个会让图表「长时间无数据」的真缺陷：旧循环体直接调 `flushBuffers()`，
+     * 而 `flushBuffers()` 对 `CancellationException` 是 `throw e`。Kotlin 把
+     * `CancellationException` 当作**正常取消**处理 —— 既不触发 `CoroutineExceptionHandler`、
+     * 也不打任何日志，于是整个 flush 循环**静默死亡**：buffer 只进不出（超过 50 条就丢最旧的），
+     * 图表再无新数据，而其它采集循环（battery / 告警 / 性能监控 / goform）照常运行，
+     * 从日志上完全看不出问题。真机实测两段空白：12:44→13:57（72 分钟）、15:34→20:57（5.4 小时），
+     * 且都只有 App 重启才恢复。
+     *
+     * 现在的判据：**协程仍 active ⇒ 这个 CancellationException 不是外部取消**，
+     * 属于 DB/事务层抛出的取消类异常，记一条 WARN 后继续循环；只有真的被取消（isActive=false）
+     * 才让它传播出去。
+     */
+    private suspend fun flushOnce() {
+        try {
+            flushBuffers()
+        } catch (e: CancellationException) {
+            if (!currentCoroutineContext().isActive) throw e
+            AppLogger.w(
+                tag,
+                "Diag: flush 抛出取消类异常但协程未取消（按可恢复处理，循环继续）: " +
+                    "${e.javaClass.simpleName}: ${e.message}"
+            )
+        } catch (e: Exception) {
+            // flushBuffers 内部已自行重入队；这里兜底，保证循环不会因任何异常退出。
+            AppLogger.w(tag, "Diag: flush 轮次异常（已忽略，循环继续）: ${e.javaClass.simpleName}: ${e.message}")
+        }
     }
 
     /**
@@ -1251,9 +1437,25 @@ class DataScheduler(
 
             // ── 以下保持与原有逻辑一致 ──
             if (record.rsrp != 0 || record.sinr != 0 || record.rssi != 0) {
+                if (signalZeroStreak >= SIGNAL_ZERO_WARN_STREAK) {
+                    AppLogger.i(tag, "Diag: 信号恢复入库（此前连续 $signalZeroStreak 轮全 0 未入库）")
+                }
+                signalZeroStreak = 0
                 signalBuffer.offerBounded(record, signalBufferSize)
             } else {
-                AppLogger.d(tag, "Signal record skipped: all metrics are 0 (rsrp=${record.rsrp}, sinr=${record.sinr}, rssi=${record.rssi})")
+                // 2026-10-14：全 0 的记录**不入库**（0 是「无信号」哨兵，DAO 查询也按 !=0 过滤），
+                // 所以 signal 曲线的断层就是这里造成的。原来这条只用 AppLogger.d 记 —— 而 d 级
+                // 默认不落盘，等于断层原因完全不可见。改成「连续 N 轮就 WARN 一次」，
+                // 让用户看到的「signal 断断续续」能直接对上「goform 超时/未注册」这个原因。
+                signalZeroStreak++
+                if (signalZeroStreak == SIGNAL_ZERO_WARN_STREAK) {
+                    AppLogger.w(
+                        tag,
+                        "Diag: 信号全 0 连续 ${SIGNAL_ZERO_WARN_STREAK} 轮未入库" +
+                            "（rsrp=${record.rsrp}, sinr=${record.sinr}, rssi=${record.rssi}）" +
+                            "→ signal 曲线会出现断层；通常是 goform 5s 超时或 modem 未注册"
+                    )
+                }
             }
             _latestSignal.value = record
             // 完整输出与记录必须同步写，否则 getSignalInfo() 缓存命中时会退回六列版本
@@ -2057,6 +2259,51 @@ class DataScheduler(
             batteryBuffer.drainBounded(batteryBufferSize, batteryBatch)
 
             val totalFlushed = cpuBatch.size + memBatch.size + trafficBatch.size + signalBatch.size + batteryBatch.size
+
+            // 每轮都记「尝试过」，供 flush 看护判断协程是否还活着（见 start() 里的看护循环）。
+            lastFlushAttemptAtMs = System.currentTimeMillis()
+
+            // ── 按指标的采集停摆诊断（2026-10-14）──
+            // 旧诊断只在 totalFlushed > 0 时判间隔，于是「某个指标一直没产出、buffer 恒空」这种
+            // 断层完全不可见。这里逐个指标记「连续空轮数」：达到阈值 WARN 一次（WARN 不受
+            // debug_mode 影响，必定落盘），恢复时 INFO 一条 —— 断层可直接归因到具体指标。
+            val batchSizes = intArrayOf(cpuBatch.size, memBatch.size, trafficBatch.size, signalBatch.size, batteryBatch.size)
+            for (i in batchSizes.indices) {
+                val name = FLUSH_METRIC_NAMES[i]
+                if (batchSizes[i] > 0) {
+                    if (emptyFlushStreak[i] >= EMPTY_STREAK_WARN) {
+                        AppLogger.i(tag, "Diag: 采集恢复 $name（此前连续 ${emptyFlushStreak[i]} 轮无数据）")
+                    }
+                    emptyFlushStreak[i] = 0
+                } else {
+                    emptyFlushStreak[i]++
+                    emptyRounds[i]++
+                    // battery 在「未声明电池能力」的机型上恒为空，是预期行为，不报
+                    if (name != "battery" && emptyFlushStreak[i] == EMPTY_STREAK_WARN) {
+                        AppLogger.w(
+                            tag,
+                            "Diag: 采集停摆 $name 连续 ${EMPTY_STREAK_WARN} 轮无数据" +
+                                "（约 ${EMPTY_STREAK_WARN * flushIntervalMs / 1000}s，buffer 一直为空）"
+                        )
+                    }
+                }
+
+                // 滚动窗口的空轮占比：抓「断断续续」——连续空轮判定抓不到它
+                //（每隔一轮有数据就永远达不到 EMPTY_STREAK_WARN），但用户看到的正是这种锯齿状断层。
+                flushRounds[i]++
+                if (flushRounds[i] >= EMPTY_RATIO_WINDOW) {
+                    if (name != "battery" && emptyRounds[i] * 2 >= flushRounds[i]) {
+                        AppLogger.w(
+                            tag,
+                            "Diag: 采集间歇缺失 $name：最近 ${flushRounds[i]} 轮里有 ${emptyRounds[i]} 轮无数据" +
+                                "（约 ${flushRounds[i] * flushIntervalMs / 1000}s 窗口）→ 该指标曲线会断断续续"
+                        )
+                    }
+                    flushRounds[i] = 0
+                    emptyRounds[i] = 0
+                }
+            }
+
             if (totalFlushed > 0) {
                 // 5 个 buffer 合并为 1 个事务，减少 WAL 模式下的事务竞争
                 database.flushAllBuffers(cpuBatch, memBatch, trafficBatch, signalBatch, batteryBatch)
@@ -2069,7 +2316,10 @@ class DataScheduler(
                 val nowMs = System.currentTimeMillis()
                 val cpuGap = nowMs - lastCpuFlushAtMs
                 if (lastCpuFlushAtMs > 0L && cpuGap > FLUSH_GAP_WARN_MS) {
-                    AppLogger.i(
+                    // 用 W 而不是 I（2026-10-14）：INFO 只在 debug_mode / core 日志开关打开时落盘，
+                    // 而「图表断层」恰恰是用户关掉详细日志之后才来报的问题 —— 用 INFO 等于诊断在最
+                    // 需要它的时候静默。WARN 无条件落盘。
+                    AppLogger.w(
                         tag,
                         "Diag: 写库间隔异常 prev=${lastCpuFlushAtMs} now=$nowMs gap=${cpuGap}ms " +
                             "batch=cpu:${cpuBatch.size},mem:${memBatch.size},traffic:${trafficBatch.size},signal:${signalBatch.size}"
@@ -2078,27 +2328,50 @@ class DataScheduler(
                 lastCpuFlushAtMs = nowMs
             }
         } catch (e: CancellationException) {
-            // 2026-10-05 R2-7 修复：stop() 的 cancelChildren 打在 flushAllBuffers 挂起点上时，
-            // 取消不是 flush 失败。批次重新入队也不会再有下一次 flush，原样抛回让协程正常退出，
-            // 不再在停机瞬间留下误导性的「Failed to flush buffers」ERROR。（停机丢最后一批
-            // buffer 是既有取舍，见 stop() 的 5s flush 预算。）
-            throw e
+            // 2026-10-05 R2-7：stop() 的 cancelChildren 打在 flushAllBuffers 挂起点上时，
+            // 取消不是 flush 失败，原样抛回让协程正常退出（停机丢最后一批是既有取舍，
+            // 见 stop() 的 5s 预算）。
+            //
+            // 2026-10-14 补充关键判据：**只有协程真的被取消才算停机**。若协程仍 active，
+            // 这个 CancellationException 来自 DB/事务层 —— 按停机处理会同时造成两个后果：
+            //   ① 本批已 drain 的数据永久丢失（重入队被跳过）；
+            //   ② flush 循环静默死亡（CancellationException 不触发异常处理器、不打日志），
+            //      真机实测导致 12:44→13:57、15:34→20:57 两段图表空白。
+            if (!currentCoroutineContext().isActive) throw e
+            reEnqueueFlushBatches(cpuBatch, memBatch, trafficBatch, signalBatch, batteryBatch)
+            lastFlushError = "cancellation-like: ${e.message}"
+            AppLogger.w(
+                tag,
+                "Diag: flush 抛出取消类异常但协程未取消，批次重新入队 batch=cpu:${cpuBatch.size}," +
+                    "mem:${memBatch.size},traffic:${trafficBatch.size},signal:${signalBatch.size}"
+            )
         } catch (e: Exception) {
             // 关键路径：刷新失败不要静默吞掉已 drain 的数据（会导致持久化状态错乱/丢点），
             // 重新入队以便下次重试，并置错误态供监控/诊断感知。
             AppLogger.e(tag, "Failed to flush buffers, re-enqueuing for retry", e)
             lastFlushError = e.message ?: e.javaClass.simpleName
-            AppLogger.i(
+            AppLogger.w(
                 tag,
                 "Diag: flush 失败，批次重新入队 batch=cpu:${cpuBatch.size},mem:${memBatch.size}," +
                     "traffic:${trafficBatch.size},signal:${signalBatch.size} err=${e.javaClass.simpleName}:${e.message}"
             )
-            cpuBatch.forEach { cpuBuffer.offerBounded(it, cpuBufferSize) }
-            memBatch.forEach { memoryBuffer.offerBounded(it, memoryBufferSize) }
-            trafficBatch.forEach { trafficBuffer.offerBounded(it, trafficBufferSize) }
-            signalBatch.forEach { signalBuffer.offerBounded(it, signalBufferSize) }
-            batteryBatch.forEach { batteryBuffer.offerBounded(it, batteryBufferSize) }
+            reEnqueueFlushBatches(cpuBatch, memBatch, trafficBatch, signalBatch, batteryBatch)
         }
+    }
+
+    /** 把一轮 flush 的批次重新入队（失败/可恢复异常路径，见 [flushBuffers]）。 */
+    private fun reEnqueueFlushBatches(
+        cpu: List<CpuHistoryRecord>,
+        mem: List<MemoryHistoryRecord>,
+        traffic: List<TrafficRecord>,
+        signal: List<SignalRecord>,
+        battery: List<BatteryHistoryRecord>
+    ) {
+        cpu.forEach { cpuBuffer.offerBounded(it, cpuBufferSize) }
+        mem.forEach { memoryBuffer.offerBounded(it, memoryBufferSize) }
+        traffic.forEach { trafficBuffer.offerBounded(it, trafficBufferSize) }
+        signal.forEach { signalBuffer.offerBounded(it, signalBufferSize) }
+        battery.forEach { batteryBuffer.offerBounded(it, batteryBufferSize) }
     }
 
     /**
@@ -2169,39 +2442,18 @@ class DataScheduler(
     }
 
     /**
-     * 有界入队：超过 MAX_BUFFER_SIZE 时丢弃最旧记录。
-     * 使用 AtomicInteger 计数器实现 O(1) 大小检查，
-     * 替代 ConcurrentLinkedQueue.size() 的 O(n) 链表遍历。
+     * 有界入队 / 有界取走：超过 [MAX_BUFFER_SIZE] 时丢最旧一条；取走时按计数取满。
+     *
+     * 逻辑在顶层的 [offerCounterBounded] / [drainCounterBounded] —— 抽出去是为了能**直接单测**：
+     * 那里藏过一个让图表整段无数据的 off-by-one，而它只在「产出速率 ≈ 1 条/刷写周期」
+     * （即**没有前端连接**的常态）时才显形。完整复盘见 `drainCounterBounded` 的 KDoc。
+     * 这里只做参数适配（`MAX_BUFFER_SIZE` 是本类私有常量）。
      */
-    // 2026-10-05 R1-6 修复：drain 也走「计数占减 + 队列 poll」配对协议，drain 不再 getAndSet(0)，
-    // 消除与生产者 offerBounded 交错时的计数漂移。
-    private fun <T> ConcurrentLinkedQueue<T>.drainBounded(counter: AtomicInteger, into: MutableList<T>) {
-        while (true) {
-            val n = counter.updateAndGet { cur -> if (cur <= 0) cur else cur - 1 } // 先占减计数
-            if (n <= 0) { counter.set(0); break }
-            val e = poll()
-            if (e == null) { counter.incrementAndGet(); break } // 队列已空：回滚占减
-            into.add(e)
-        }
-    }
+    private fun <T> ConcurrentLinkedQueue<T>.drainBounded(counter: AtomicInteger, into: MutableList<T>) =
+        drainCounterBounded(counter, into)
 
-    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) {
-        // 2026-10-05 R1-6 修复：入队/逐出改为 CAS 配对协议（占计数即得名额，poll 与计数严格配对），
-        // 替代原「循环 poll + decrementAndGet」的 get-then-put 序列，避免并发下 counter 与队列内容漂移。
-        while (true) {
-            val cur = counter.get()
-            if (cur < MAX_BUFFER_SIZE) {
-                if (counter.compareAndSet(cur, cur + 1)) { offer(item); return }
-            } else {
-                // 已达上限：占减一个名额（丢最旧一条），再入队新记录
-                if (counter.compareAndSet(cur, cur - 1)) {
-                    poll()
-                    offer(item)
-                    return
-                }
-            }
-        }
-    }
+    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) =
+        offerCounterBounded(item, counter, MAX_BUFFER_SIZE)
 
     /**
      * 读取 CPU 最高温度（**毫摄氏度**）—— 阶段 4 的 4.3（批 I）起改由
@@ -2303,6 +2555,38 @@ class DataScheduler(
          * 正常 flushIntervalMs = 10s，留足余量取 5 分钟。
          */
         const val FLUSH_GAP_WARN_MS = 5 * 60_000L
+
+        /**
+         * 缓冲区顺序 ↔ 指标名（与 [flushBuffers] 里 batchSizes 的顺序严格一致）。
+         * 用于把「连续空轮」的诊断归因到具体指标（2026-10-14）。
+         */
+        val FLUSH_METRIC_NAMES = arrayOf("cpu", "memory", "traffic", "signal", "battery")
+
+        /**
+         * 某指标连续多少轮 flush 为空就 WARN 一次（2026-10-14）。
+         * 取 3：flush 默认 30s，约 90s 没有任何数据已远超正常抖动；且 WARN 级不受
+         * debug_mode 影响，必定落盘 —— 这正是旧诊断（只在成功写库时判定）缺的那一半。
+         */
+        const val EMPTY_STREAK_WARN = 3
+
+        /**
+         * 间歇缺失的滚动窗口轮数（2026-10-14）。每满这么多轮 flush 就统计一次各指标的空轮占比，
+         * ≥50% 就 WARN。flush 默认 30s，10 轮 ≈ 5 分钟窗口 —— 足以刻画"断断续续"这种锯齿，
+         * 又不至于把日志刷满（每个指标最多 5 分钟一条）。
+         */
+        const val EMPTY_RATIO_WINDOW = 10
+
+        /**
+         * 信号读数连续多少轮全 0（因此不入库）就 WARN 一次（2026-10-14）。
+         * 信号采集最密 3s 一轮，取 10 轮 ≈ 30s，足以越过一次 goform 抖动。
+         */
+        const val SIGNAL_ZERO_WARN_STREAK = 10
+
+        /** flush 看护循环的检查间隔（2026-10-14）。 */
+        const val FLUSH_WATCHDOG_INTERVAL_MS = 60_000L
+
+        /** flush 看护两次重启之间的最小间隔（防抖，2026-10-14）。 */
+        const val FLUSH_WATCHDOG_MIN_RESTART_GAP_MS = 5 * 60_000L
         /** 默认 boot grace = 90 秒。Unisoc 实测 ~60s 稳定，留 30s 余量。 */
         const val BOOT_GRACE_DEFAULT_MS = 90_000L
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s

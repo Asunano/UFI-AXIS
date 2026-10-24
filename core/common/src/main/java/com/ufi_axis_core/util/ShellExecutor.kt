@@ -111,7 +111,15 @@ object ShellExecutor {
         withTimeout(timeoutMs) {
             // 优先: ADB shell
             if (AdbShellExecutor.isAvailable) {
-                val result = AdbShellExecutor.execute(command, timeoutMs)
+                // 预算切分（2026-10-14 修正）：
+                // 原来这里传的是与外层 withTimeout **完全相同**的 timeoutMs —— ADB 一挂死就吃满
+                // 整个预算，外层超时把协程取消，下面的「普通 shell 兜底」永远跑不到（fallback 形同虚设）。
+                // 第一版改成给 ADB 一半，但对 5s 级调用方只剩 2.5s，而 `adb shell` 冷启动本身就要
+                // 数秒（真机实测 `ADB shell timed out after 2500ms`）—— 等于把 ADB 通道废掉。
+                // 现在改成**固定给兜底留 [FALLBACK_RESERVE_MS]**：长超时调用方仍拿到绝大部分预算，
+                // 兜底也一定有 2s 可用（它是本地 ProcessBuilder，通常 <1s 就返回）。
+                val adbBudget = (timeoutMs - FALLBACK_RESERVE_MS).coerceAtLeast(2_000L)
+                val result = AdbShellExecutor.execute(command, adbBudget)
                 // ADB shell 返回了有效结果（非连接级错误）
                 if (result.exitCode != -1 || result.stdout.isNotBlank()) {
                     return@withTimeout result
@@ -123,6 +131,9 @@ object ShellExecutor {
             execute(command, timeoutMs)
         }
     }
+
+    /** 留给普通 shell 兜底的固定预算（见 [executeAsRoot] 的预算切分说明）。 */
+    private const val FALLBACK_RESERVE_MS = 2_000L
 
     /**
      * 限制读取进程输出大小，防止 OOM。

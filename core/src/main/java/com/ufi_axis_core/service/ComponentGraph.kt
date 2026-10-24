@@ -147,5 +147,18 @@ data class ServerGraph(
      * AppRoutes 共用同一个实例），**晚于** buildControllerGraph 调用点，放后者就得把构造
      * 顺序整条倒过来（牵动一大片），不值得 —— 语义归置优先于就近。
      */
-    val appManager: com.ufi_axis_core.controller.system.AppManager
+    val appManager: com.ufi_axis_core.controller.system.AppManager,
+
+    /**
+     * 媒体索引缓存（2026-10-13）。
+     *
+     * 暴露它的理由与 [appManager] 完全同源：它自己持有一个后台定时刷新协程，
+     * 不在停机流程里显式收，服务停掉之后还会每 5 分钟扫一遍整库。
+     *
+     * 与 [appManager] 的差异：`AppManager` 的定时刷新挂在外部传进来的
+     * `BackendService.serviceScope` 上，而媒体索引**另外**自持一个作用域承载
+     * 「重新扫描」的追赶刷新（它必须活过那次 HTTP 请求，见 `MediaIndexStore` 的类 KDoc）。
+     * 那个自持作用域只能靠显式 `stop()` 收，所以停机路径必须调到它。
+     */
+    val mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore
 )

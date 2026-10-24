@@ -66,6 +66,26 @@ object ErrorCode {
     const val INVALID_DEVICE_NAME = "INVALID_DEVICE_NAME"
     const val DEVICE_NOT_FOUND = "DEVICE_NOT_FOUND"
     const val INVALID_GOFORM_CONFIG = "INVALID_GOFORM_CONFIG"
+    /**
+     * 本设备已被机主拉黑（2026-10-15）。
+     *
+     * 两个落点，语义都是"这个身份被明确拒绝了"：
+     * - 配对 / 密码登录：**HTTP 403**（放 403 而不是 401 —— 401 会被客户端"密码错→重试"
+     *   的逻辑吃掉，用户只会看到没头没尾的失败；403 + 本码才能弹出"本设备已被拉黑"）；
+     * - 已鉴权请求（含 WebSocket 握手）：**HTTP 444**，与既有的"凭据确证作废 → 客户端清
+     *   token 回配对引导"同一语义（见 `RetrofitClient` 的 444 处理）。
+     */
+    const val DEVICE_BLOCKED = "DEVICE_BLOCKED"
+    /** 黑名单已满（HTTP 409）：先解除几条再拉黑，而不是静默丢弃。 */
+    const val BLACKLIST_FULL = "BLACKLIST_FULL"
+    /**
+     * 新设备需要机主批准（2026-10-15，HTTP 403）。
+     *
+     * 只在 `pairing_approval_required` 打开、且**已有**已配对设备时出现
+     *（一台已配对设备都没有时不做批准 —— 否则机主删光设备后就再也进不去，见方案 §5.1）。
+     * 请求方应提示"请在已配对设备上批准，或输入外部通知里的配对码"。
+     */
+    const val APPROVAL_REQUIRED = "APPROVAL_REQUIRED"
 
     // ── 严格设备独立性（2026-08-28：设备身份=不可导出密钥对）──
     /** `device_pubkey` 无法解析为 EC 公钥，或用它验签挑战/请求失败（HTTP 401）。 */

@@ -248,6 +248,9 @@ class AlertEngine(
         "traffic_limit" -> NotifyScenes.TRAFFIC_80
         "device_online", "device_offline" -> NotifyScenes.EVENTS
         "plan_expiry" -> NotifyScenes.PLAN_EXPIRY
+        // 安全事件（2026-10-15：配对黑名单命中 / 冷却）归"事件"场景，与设备上下线同族 ——
+        // 它们都是"发生了一件事"，不是"某个指标超阈值"。
+        "pairing_blocked_hit", "pairing_block_cooldown" -> NotifyScenes.EVENTS
         else -> NotifyScenes.ALERT
     }
 
@@ -828,20 +831,23 @@ class AlertEngine(
         level: String,
         message: String,
         value: String,
-        threshold: String
+        threshold: String,
+        /** 新行投递的渠道；null = 全部已注册渠道（推送 + 邮件）。安全事件传"只推送"。 */
+        channels: Set<String>? = null
     ) {
         val now = System.currentTimeMillis()
 
-        // 设备事件（device_online/device_offline，2026-10-07 审计修复）**不做聚合**：
-        // 聚合键是 (type,level)，而设备事件恒为 info——A 设备接入和 B 设备接入会并成一行
-        // count++，文案只剩最后一台，事件历史丢失。设备事件天然低频（上下线边沿），
-        // 逐条落行才是正确语义；value 里存着 MAC，排查也靠它。
-        val isDeviceEvent = type == "device_online" || type == "device_offline"
+        // 不做聚合的类型：设备事件 + 安全事件（2026-10-15 扩充）。
+        // 聚合键是 (type,level)，而这两族恒为同一 level —— A 设备接入和 B 设备接入会并成一行
+        // count++，文案只剩最后一台；安全事件更糟：把"三台不同设备在试探"并成一行，
+        // 机主就看不到攻击面了。它们天然低频（边沿触发 / 真的有人在尝试），逐条落行才对。
+        val noAggregate = type == "device_online" || type == "device_offline" ||
+            type == "pairing_blocked_hit" || type == "pairing_block_cooldown"
 
         // 1) 聚合：同 (type,level) 未确认行累加计数（返回受影响行数）
         // 2026-08-25：获取现有记录 ID 以便推送给前端做精确去重
-        val existing = if (isDeviceEvent) null else alertDao.getUnacknowledged(type, level)
-        val bumped = if (isDeviceEvent) 0 else alertDao.bumpExisting(type, level, now)
+        val existing = if (noAggregate) null else alertDao.getUnacknowledged(type, level)
+        val bumped = if (noAggregate) 0 else alertDao.bumpExisting(type, level, now)
         if (bumped > 0 && existing != null) {
             AppLogger.i(tag, "Alert aggregated: [$level] $message (count++)")
             // **只推送、不发邮件**：聚合意味着"同一件事又发生了一次"，前端要靠它把 badge 数字
@@ -876,12 +882,48 @@ class AlertEngine(
 
         AppLogger.i(tag, "Alert triggered & stored: [$level] $message (id=$newId)")
 
-        // 新告警：投给**所有**已注册渠道（推送 + 邮件）。core 自己发，不依赖 app 是否在线。
+        // 新告警：投给指定渠道；null = **所有**已注册渠道（推送 + 邮件）。
+        // core 自己发，不依赖 app 是否在线。
         emitAlert(
             type = type, level = level, message = message,
             value = value, threshold = threshold,
             alertId = newId, aggregated = false,
-            channels = null
+            channels = channels
+        )
+    }
+
+    /**
+     * 记录一次**安全事件**（2026-10-15：配对设备黑名单命中 / 冷却）。
+     *
+     * ## 为什么不受 perType 分类开关约束，只看总开关
+     * `typeEnabled` 的口径是"分类开关**缺省视为关闭**"（2026-09-07 的既定决策）。
+     * 新增的安全类型在用户存量配置里必然缺省 → 会被静默丢掉，机主永远看不到
+     * "有人在反复尝试连接"。所以这里只尊重**总开关** `cfg.enabled`：
+     * 总开关的语义是"我不看告警"（那就不记），分类开关的语义是"这一类指标我不关心"，
+     * 而安全事件不属于任何一类指标。
+     *
+     * ## 为什么只走实时渠道，不发邮件 / 不弹系统通知
+     * 命中是**被拉黑者可控**的：对方每试一次就发一封邮件或弹一次通知，
+     * 等于给攻击者一个"远程刷屏机主"的能力。所以这里只落库 + WS 推送（事件中心可见、
+     * badge 会涨）；要升级成系统通知，由调用方按连击次数显式决定（见方案 §6.3）。
+     *
+     * @param type `pairing_blocked_hit`（被拉黑设备尝试连接）/ `pairing_block_cooldown`（进入冷却）
+     * @param value 落库到 value 列，放指纹前缀 / 设备名，便于事件中心展示与排查
+     */
+    suspend fun recordSecurityEvent(
+        type: String,
+        level: String,
+        message: String,
+        value: String = ""
+    ) {
+        if (!_config.value.enabled) return
+        triggerAlert(
+            type = type,
+            level = level,
+            message = message,
+            value = value,
+            threshold = "",
+            channels = setOf(PushChannel.ID)
         )
     }
 
@@ -944,6 +986,10 @@ class AlertEngine(
     /**
      * 聚合计数（事件中心分类胶囊 + hero 统计）。
      */
+    /** 按天计数（月历热力，2026-10-23）：返回本地日期 `yyyy-MM-dd` → 条数。 */
+    suspend fun getDailyCounts(start: Long, end: Long): Map<String, Int> =
+        alertDao.getDailyCounts(start, end).associate { it.day to it.count }
+
     suspend fun getCounts(
         level: String? = null,
         type: String? = null,

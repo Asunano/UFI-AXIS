@@ -342,4 +342,65 @@ class AlertEngineDedupTest {
         assertEquals(2, dao.rows.first().count)
         assertEquals("true", push.pushed.single().extra["aggregated"])
     }
+
+    // ══════════════════ 安全事件（2026-10-15：配对黑名单命中 / 冷却） ══════════════════
+
+    /**
+     * **本组最重要的一条**：安全事件不受 perType 分类开关约束。
+     *
+     * `typeEnabled` 的口径是"分类开关缺省视为关闭"，而新加的安全类型在用户存量配置里
+     * 必然缺省 —— 如果沿用那条口径，被拉黑设备的尝试会被**静默丢掉**，
+     * 机主永远看不到"有人在反复尝试连接"。所以它只看总开关。
+     */
+    @Test
+    fun `security event is recorded even when its perType key is absent`() = runTest {
+        // setUp 里 perType 只打开了 ALERT_TYPES（不含 pairing_*），这里刻意不动它
+        assertFalse(
+            "前置：pairing_blocked_hit 不应在 perType 里",
+            engine.getConfig().perType.containsKey("pairing_blocked_hit")
+        )
+        engine.recordSecurityEvent(
+            type = "pairing_blocked_hit",
+            level = "warning",
+            message = "被拉黑的设备尝试连接",
+            value = "ab12"
+        )
+        assertEquals("分类开关缺省也必须入库", 1, dao.rows.size)
+        assertEquals("pairing_blocked_hit", dao.rows.first().type)
+        assertEquals("ab12", dao.rows.first().value)
+    }
+
+    /**
+     * 逐条落行、不聚合：三台不同设备的尝试必须是三行。
+     *
+     * 聚合键是 (type,level)，而安全事件恒为同一 level —— 一聚合就变成
+     * "一行 count=3、文案只剩最后一台"，机主看不到攻击面（几台设备、分别是谁）。
+     */
+    @Test
+    fun `security events do not aggregate - three devices produce three rows`() = runTest {
+        repeat(3) { i ->
+            engine.recordSecurityEvent(
+                type = "pairing_blocked_hit",
+                level = "warning",
+                message = "被拉黑的设备尝试连接 #$i",
+                value = "fp$i"
+            )
+        }
+        assertEquals("三次尝试应落三行", 3, dao.rows.size)
+        assertEquals("每行 count 都是 1", listOf(1, 1, 1), dao.rows.map { it.count })
+        assertEquals("三台设备都要留痕", setOf("fp0", "fp1", "fp2"), dao.rows.map { it.value }.toSet())
+    }
+
+    /** 总开关关闭时安全事件也不入库（总开关的语义是"我不看告警"，那就不记）。 */
+    @Test
+    fun `security event respects the master switch`() = runTest {
+        engine.updateConfig(engine.getConfig().copy(enabled = false))
+        engine.recordSecurityEvent(
+            type = "pairing_blocked_hit",
+            level = "warning",
+            message = "被拉黑的设备尝试连接",
+            value = "ab12"
+        )
+        assertEquals("总开关关闭时不应入库", 0, dao.rows.size)
+    }
 }

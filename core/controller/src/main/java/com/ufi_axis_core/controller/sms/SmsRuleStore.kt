@@ -307,6 +307,12 @@ class SmsRuleStore(
     ) {
         val dao = logDao ?: return
         val now = System.currentTimeMillis()
+        // 2026-10-19：**只有真正新增一条拦截记录时才计一次命中**。
+        // 原实现在去重分支（existing != null，即同一条短信的第二、三条路径）之后**无条件**
+        // 调 bumpHit —— 一条短信走「邮件 + 推送 + 验证码」三条路径就被记 3 次；若某条路径
+        // 在轮询里反复命中同一条短信（msgId 拿不到时尤其容易），命中数会持续膨胀
+        // （用户看到过 11521 次）。去重与计数必须同一口径：一条短信 = 一次命中。
+        var inserted = false
         try {
             recordLock.withLock {
                 val existing = if (msgId != 0L) {
@@ -320,6 +326,7 @@ class SmsRuleStore(
                         dao.update(existing.copy(blocked_path = merged))
                     }
                 } else {
+                    inserted = true
                     dao.insert(
                         SmsBlockedLog(
                             msg_id = msgId,
@@ -339,7 +346,8 @@ class SmsRuleStore(
                     dao.trimTo(MAX_BLOCKED_ROWS)
                 }
             }
-            bumpHit(block.ruleId, now)
+            // 只有新增记录才计数（见上面的 inserted 说明）。
+            if (inserted) bumpHit(block.ruleId, now)
             // 正文只打 50 字，沿用 forwardLatestSmsIfNew 的既有做法。
             AppLogger.i(
                 tag,

@@ -95,6 +95,12 @@ object KeepAliveWatchdog {
         // ── 纵深防御：exec 前复核落盘内容 ──
         if (!ensureDigestMatches(expectedDigest, template)) return false
 
+        // 注意：这里**不要**预清残留锁。脚本自己（以 uid 2000 运行）的 acquire_lock 会用
+        // 「先删内部 pid、再 rmdir 目录名」两步 unlink 接管任意属主/权限的残留锁 —— 它比
+        // app 进程更有权限（app 读不到别的 uid 的 /proc/<pid>/cmdline，isRunning() 可能误判
+        // 为「没在跑」）。若在 app 侧抢先删锁，反而会把「脚本原子锁」这道真正的防重入闸门
+        // 拆掉，可能同时跑起两只看门狗。
+
         return try {
             // setsid + nohup：与调用方进程脱钩，Core 被整体回收时它还在
             val result = ShellExecutor.executeAsRoot(
@@ -120,14 +126,28 @@ object KeepAliveWatchdog {
      * 写完统一 chmod 644。两级都失败才返回 false（此时看门狗确实装不上，保留错误日志）。
      */
     private suspend fun writeScript(template: String): Boolean {
-        // ── 一级：直接写 ──
+        // ── 一级：直接写（原子：写临时文件 → rename 覆盖）──
         val direct = try {
-            val scriptFile = File(SCRIPT_PATH)
-            scriptFile.writeText(template)
+            // 2026-10-13：必须原子落盘。原来直接 `File.writeText(SCRIPT_PATH)` 是**原地截断重写**，
+            // 而看门狗是一个正在增量读取该文件的 mksh 进程 —— 自愈（每 5 分钟）恰好落在它解析
+            // 主循环的那一刻时，mksh 会读到「截断到一半」的内容并以
+            // `syntax error: unmatched '('` 崩掉，看门狗就此死掉（真机实测复现）。
+            // 先写同目录临时文件、设好权限，再 rename：同一文件系统内的 rename 是原子替换，
+            // 读者要么看到旧内容、要么看到新内容，永远看不到半截。
+            val tmp = File("$SCRIPT_PATH.tmp")
+            tmp.writeText(template)
             // 必须 world-readable + executable：执行方是 adb shell（uid 2000），
             // 只给执行位不给读位会 Permission denied（sh 需要 open 文件）。
-            scriptFile.setReadable(true, false)
-            scriptFile.setExecutable(true, false)
+            tmp.setReadable(true, false)
+            tmp.setExecutable(true, false)
+            if (!tmp.renameTo(File(SCRIPT_PATH))) {
+                // rename 失败（跨挂载点等罕见情况）：退化为原地覆盖，保证脚本仍能落地
+                AppLogger.w(TAG, "keepalive atomic rename failed, falling back to in-place write")
+                val scriptFile = File(SCRIPT_PATH)
+                scriptFile.writeText(template)
+                scriptFile.setReadable(true, false)
+                scriptFile.setExecutable(true, false)
+            }
             true
         } catch (e: Exception) {
             AppLogger.w(TAG, "keepalive direct write failed (will try shell): ${e.message}")
@@ -142,8 +162,11 @@ object KeepAliveWatchdog {
             )
             // 一行 b64 可能有几千字符：adb shell 参数长度上限（Linux MAX_ARG_STRLEN 128KB）内，
             // 3~4KB 的脚本模板远够。分块反而会引入跨块状态，不做。
+            // 同样走「临时文件 + mv」原子替换（同目录 mv 即 rename），避免打断运行中的看门狗。
             val result = ShellExecutor.executeAsRoot(
-                "echo '$b64' | base64 -d > $SCRIPT_PATH && chmod 755 $SCRIPT_PATH", 10_000L
+                "echo '$b64' | base64 -d > $SCRIPT_PATH.tmp && chmod 755 $SCRIPT_PATH.tmp " +
+                    "&& mv -f $SCRIPT_PATH.tmp $SCRIPT_PATH",
+                10_000L
             )
             if (result.isSuccess) {
                 AppLogger.i(TAG, "keepalive script written via shell fallback")

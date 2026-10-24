@@ -119,9 +119,17 @@ class ServiceRoutes(
              *
              * 为什么没有 ack 接口：app 与 web 是两个独立展示端，谁先 ack 另一端就再也看不到。
              * 去重放各自本地（app: `AppPreferences.coreCrashShownAt`，web: localStorage）。
+             *
+             * 2026-10-23：新增 `age_ms` / `recent`。此前 `crashed` = `last_crash_at > 0`，
+             * 三个月前的一次崩溃也会让两端在**每次启动时**弹窗（本地标记一丢就重弹）。
+             * 现在「是否值得在启动时提示」由 core 用**自己这台设备的时钟**算年龄后给出，
+             * 窗口外的崩溃仍可通过本接口回读（诊断页要看历史），但两端不再弹窗。
+             * 年龄必须由 core 算：手机与设备时钟漂移时，客户端拿本机 `now - timestamp`
+             * 会把「刚崩」误判成「很久以前」（本仓已有 >5min 漂移的真实案例）。
              */
             get("/crash") {
                 val at = settings.lastCrashAt
+                val ageMs = crashAgeMs(at, System.currentTimeMillis())
                 call.respond(
                     toJsonElement(
                         mapOf(
@@ -129,6 +137,9 @@ class ServiceRoutes(
                             "ok" to true,
                             "crashed" to (at > 0L),
                             "timestamp" to at,
+                            // -1 = 从未崩溃；0..窗口 = 值得提示；> 窗口 = 只留给诊断页
+                            "age_ms" to ageMs,
+                            "recent" to isRecentCrash(ageMs),
                             "summary" to settings.lastCrashSummary,
                             "file" to settings.lastCrashFile,
                             // 拿来算"崩溃发生在本次启动之前多久"，也能让前端判断服务是否刚起来
@@ -182,5 +193,28 @@ class ServiceRoutes(
     companion object {
         /** 与 `BackendService.RESTART_DELAY_MS` 对齐，仅作为客户端提示。 */
         private const val RESTART_DOWNTIME_HINT_MS = 10_000L
+
+        /**
+         * 崩溃提示的新鲜度窗口（2026-10-23）：超过 7 天的崩溃只在诊断页 / 日志里可见，
+         * 不再在 App / Web 启动时弹窗。
+         *
+         * 语义依据：这条提醒想说明的是「刚才数据断了一下，是 core 崩过又自动拉起了」。
+         * 三个月前的记录不是这件事，每次启动都为它弹窗只会变成噪音。
+         */
+        const val CRASH_NOTICE_WINDOW_MS = 7L * 24 * 60 * 60 * 1000
+
+        /**
+         * 崩溃年龄（毫秒）。**必须传入同一个时钟的 now**（core 本机），
+         * 否则手机与设备的时钟漂移会直接把年龄算错。
+         *
+         * @return -1 = 从未崩溃（与「刚崩」的 0 区分开）；时钟回拨导致负年龄时夹到 0
+         *         （保守按「刚崩」处理，宁可多提示一次也不要因为一次 NTP 回跳把崩溃吞掉）。
+         */
+        fun crashAgeMs(lastCrashAt: Long, nowMs: Long): Long =
+            if (lastCrashAt <= 0L) -1L else (nowMs - lastCrashAt).coerceAtLeast(0L)
+
+        /** 是否还在启动提示窗口内（`age_ms` 口径）。 */
+        fun isRecentCrash(ageMs: Long): Boolean =
+            ageMs in 0..CRASH_NOTICE_WINDOW_MS
     }
 }

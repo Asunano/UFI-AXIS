@@ -94,6 +94,19 @@ class ConfigRoutes(
                     }
                 }
 
+                /** 长整型字段（2026-10-19：已读水位用 Long，id 来自 Room 自增，超过 Int 也不会在可预见范围内，但类型要对齐）。 */
+                fun longField(field: String, apply: (Long) -> Unit) {
+                    val raw = body[field] ?: return
+                    if (raw is JsonNull) return
+                    val v = (raw as? JsonPrimitive)?.longOrNull
+                    if (v == null) {
+                        reject(field, ErrorCode.WRONG_TYPE)
+                        return
+                    }
+                    apply(v)
+                    updated.add(field)
+                }
+
                 /** 密钥类字符串：空串与脱敏值都拒绝（脱敏回写会覆盖真实密钥）。 */
                 fun secretField(field: String, apply: (String) -> Unit) {
                     val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
@@ -135,6 +148,15 @@ class ConfigRoutes(
 
                 intField("port", ConfigLimits.PORT) { settings.port = it }
                 intField("goform_port", ConfigLimits.GOFORM_PORT) { settings.goformPort = it }
+
+                // 2026-10-19：跨设备的已读水位（验证码通知 / 已拦截角标）。
+                // 只前推不回退：客户端并发的旧快照不该把水位拨回去，否则已读的内容会重新点亮角标。
+                longField("sms_code_seen_msg_id") {
+                    settings.smsCodeSeenMsgId = maxOf(settings.smsCodeSeenMsgId, it)
+                }
+                longField("sms_blocked_seen_msg_id") {
+                    settings.smsBlockedSeenMsgId = maxOf(settings.smsBlockedSeenMsgId, it)
+                }
 
                 // 2026-10-05 R4-13 修复：goform_ip / update_url 格式校验。此前走宽松 textField
                 // 任意串落盘：非法 goform_ip 令 goform 全链路 503；update_url 是整个 FOTA/组件/Web

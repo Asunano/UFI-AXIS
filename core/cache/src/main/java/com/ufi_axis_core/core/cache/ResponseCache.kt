@@ -146,6 +146,29 @@ class ResponseCache(
         AppLogger.i("ResponseCache", "read-through ${if (paused) "PAUSED (serving stale)" else "resumed"}")
     }
 
+    /**
+     * goform 不健康（熔断打开）期间置位（2026-10-17）。
+     *
+     * 与 [readThroughPaused] **语义相同、触发源不同**：那个是"用户停止服务"，这个是
+     * "设备后台已经坏了"。必须分开存 —— 否则一方恢复时会把另一方的闸门一起放行
+     *（例如熔断恢复时把"用户已停止服务"的闸门打开，又开始打 goform）。
+     *
+     * 效果：设备后台坏掉期间，前端拿到的是**上一次成功值**（旧数据），而不是空白或 500。
+     * 缓存里连旧值都没有时仍会 fetch 一次（否则面板整页报错）—— 这次 fetch 由
+     * `GoformGuard` 的 5s 预算兜住，不会把请求拖几十秒。
+     */
+    @Volatile
+    private var goformUnhealthy: Boolean = false
+
+    fun setGoformUnhealthy(unhealthy: Boolean) {
+        if (goformUnhealthy == unhealthy) return
+        goformUnhealthy = unhealthy
+        AppLogger.i("ResponseCache", "goform health gate ${if (unhealthy) "CLOSED (serving stale)" else "OPEN"}")
+    }
+
+    /** 是否只服务旧值（任一闸门关闭）。 */
+    private fun servingStaleOnly(): Boolean = readThroughPaused || goformUnhealthy
+
     /** 忽略 TTL 取值（只在 [readThroughPaused] 生效期间使用）。 */
     private fun getIgnoringTtl(key: String): JsonElement? = synchronized(lock) { cache[key]?.data }
 
@@ -198,19 +221,23 @@ class ResponseCache(
      * @param fetcher 数据获取函数（仅 miss 时调用一次）
      */
     suspend fun getOrPut(key: String, ttlMs: Long, fetcher: suspend () -> JsonElement): JsonElement {
+        // 只服务旧值（用户停止服务 / goform 熔断）：**先**看旧值。
+        //
+        // 顺序很关键：`get()` 会把过期条目**删掉**，所以"先 get 再取旧值"永远取不到 ——
+        // 表现就是"回旧值"静默退化成"照常去调 fetcher（打 goform）"。
+        // 2026-10-17 由 `goform 不健康时只回旧值且不调 fetcher` 这条测试发现。
+        if (servingStaleOnly()) getIgnoringTtl(key)?.let { return it }
+
         // 快速路径：缓存命中直接返回
         get(key)?.let { return it }
-
-        // 服务已停：有旧值就给旧值，绝不为"过期"去打 goform
-        if (readThroughPaused) getIgnoringTtl(key)?.let { return it }
 
         // 慢路径：按 key 加锁，防止同 key 并发穿透
         val keyLock = acquireLock(key)
         return try {
             keyLock.mutex.withLock {
-                // 双重检查
+                // 双重检查（同样先旧值、后命中）
+                if (servingStaleOnly()) getIgnoringTtl(key)?.let { return it }
                 get(key)?.let { return it }
-                if (readThroughPaused) getIgnoringTtl(key)?.let { return it }
 
 
                 val data = fetcher()
@@ -394,7 +421,7 @@ class ResponseCache(
         synchronized(lock) {
             @Suppress("UNCHECKED_CAST")
             val entry = anyCache[key] as? AnyCacheEntry<T>
-            if (entry != null && (!entry.isExpired() || readThroughPaused)) return entry.data
+            if (entry != null && (!entry.isExpired() || servingStaleOnly())) return entry.data
         }
 
 
@@ -405,7 +432,7 @@ class ResponseCache(
                 synchronized(lock) {
                     @Suppress("UNCHECKED_CAST")
                     val recheck = anyCache[key] as? AnyCacheEntry<T>
-                    if (recheck != null && (!recheck.isExpired() || readThroughPaused)) return recheck.data
+                    if (recheck != null && (!recheck.isExpired() || servingStaleOnly())) return recheck.data
                 }
                 val data = fetcher()
                 synchronized(lock) {

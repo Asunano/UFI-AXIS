@@ -229,9 +229,16 @@ class WebResourceManager(private val context: Context) {
             return null
         }
 
+        val overrideVersion = readOverrideVersionJson()?.get("version")?.let { (it as? JsonPrimitive)?.content }
         when {
+            // 版本能对上才保留；对不上（含 lastSeen 尚未记录）一律清掉。
+            // 否则出现"内置已经换了一版 UI，设备还在跑旧 override，且永远不清"的死角。
+            hasOverride() && (overrideVersion == null || overrideVersion != bundledVersion) -> {
+                AppLogger.i(TAG, "override 版本 $overrideVersion 无法对应内置 $bundledVersion，清除旧 override")
+                clearOverride()
+            }
             lastSeenVersion == null ->
-                AppLogger.d(TAG, "首次记录内置 web version=$bundledVersion，不清除 override")
+                AppLogger.d(TAG, "首次记录内置 web version=$bundledVersion，保留同版本 override")
             lastSeenVersion != bundledVersion -> {
                 if (hasOverride()) {
                     AppLogger.i(TAG, "内置 web 版本已变化 ($lastSeenVersion → $bundledVersion)，清除旧 override")

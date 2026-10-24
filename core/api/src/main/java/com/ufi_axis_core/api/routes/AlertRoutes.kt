@@ -117,6 +117,26 @@ class AlertRoutes(
                 )))
             }
 
+            // 按天计数（2026-10-23）：月历热力。查询参数 start / end 为毫秒时间戳。
+            get("/daily_counts") {
+                val range = parseDailyCountsRange(
+                    call.request.queryParameters["start"],
+                    call.request.queryParameters["end"]
+                )
+                if (range == null) {
+                    return@get call.respondFail(
+                        HttpStatusCode.BadRequest,
+                        ErrorCode.BAD_REQUEST,
+                        "start/end 必须是毫秒时间戳，且 end > start"
+                    )
+                }
+                val days = alertEngine.getDailyCounts(range.first, range.second)
+                call.respond(toJsonElement(mapOf(
+                    "days" to days,
+                    "total" to days.values.sum()
+                )))
+            }
+
             // 确认告警
             post("/ack") {
                 val params = call.receiveJsonObject()

@@ -41,6 +41,17 @@ class MainActivity : Activity() {
         private const val REQUEST_CODE_CORE_PERMISSIONS = 1002
 
         /**
+         * adb 直达设置页（2026-10-19）。
+         *
+         * 设备没有屏幕，排障时通常靠 adb + 投屏：投屏后还要手动点一下「设置」很别扭。
+         * 用法：`adb shell am start -n com.ufi_axis_core/.MainActivity --ez open_settings true`
+         *
+         * 为什么不把 `SettingsActivity` 改成 exported：那会让任意本机应用拉起设置页，
+         * 多一个攻击面；这里只加一个 extra，入口仍是 exported 的 MainActivity。
+         */
+        const val EXTRA_OPEN_SETTINGS = "open_settings"
+
+        /**
          * 后端运行所需的全部运行时权限。
          *
          * 2026-09-16 补 `READ_MEDIA_VIDEO/AUDIO/IMAGES`：manifest 里早就声明了，但从没在运行时
@@ -123,6 +134,12 @@ class MainActivity : Activity() {
         val btnSettings = findViewById<Button>(R.id.btnSettings)
 
         updateUI()
+
+        // 2026-10-19：adb 直达设置页（见 EXTRA_OPEN_SETTINGS）。
+        if (intent?.getBooleanExtra(EXTRA_OPEN_SETTINGS, false) == true) {
+            intent.removeExtra(EXTRA_OPEN_SETTINGS)
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
 
         // 存储权限检查 (Android 11+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

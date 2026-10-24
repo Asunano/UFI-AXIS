@@ -57,7 +57,11 @@ class TestDeviceIdentity(val deviceName: String = "test-device") {
         manager: PairingManager,
         settings: AppSettings,
         password: String,
-        hwId: String? = null
+        hwId: String? = null,
+        /** 批准流程的会话随机数（2026-10-15）：走批准路径的用例必须带上。 */
+        sid: String? = null,
+        /** 机主从外部通知里读到的配对码。 */
+        approvalCode: String? = null
     ): PairingManager.PairingConfirmResult {
         settings.enterPairingMode()
         val challenge = manager.issueChallenge()
@@ -69,7 +73,9 @@ class TestDeviceIdentity(val deviceName: String = "test-device") {
             password = password,
             deviceName = deviceName,
             ip = "127.0.0.1",
-            hwId = hwId
+            hwId = hwId,
+            sid = sid,
+            approvalCode = approvalCode
         )
         if (result is PairingManager.PairingConfirmResult.Success) {
             token = result.token

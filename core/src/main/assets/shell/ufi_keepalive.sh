@@ -108,22 +108,63 @@ is_updating() {
 # 现在锁里记 pid，接管前先看那个 pid 还活着不活着（且 cmdline 确实是本脚本）。
 acquire_lock() {
   if mkdir "$LOCK" 2>/dev/null; then
+    # 放开目录/pidfile 权限：任何 uid（含未来重装后的新 uid 或 adb shell）都能通过
+    # 「可写父目录两步 unlink」清掉它，避免再次形成 0700 跨 uid 残留锁。
+    chmod 777 "$LOCK" 2>/dev/null
     echo $$ > "$PIDFILE" 2>/dev/null
+    chmod 666 "$PIDFILE" 2>/dev/null
     return 0
   fi
+  # 锁目录已存在。判定是否为「自己人还活着」：pidfile 可读 + pid 存活 + cmdline 确为本脚本
+  # ⇒ 视为已运行，退出。其余所有情况（pidfile 为空 / 不可读 / pid 死了 / 非本脚本）一律当
+  # 陈旧锁接管。
+  #
+  # 2026-10-13 修一个会让看门狗**永久失效**的死角：当锁目录属于一个已经不存在的旧 app uid
+  # （例如 Core 重装后 uid 从 u0_a101 变成 u0_a110，或 SIGKILL 后残留的 0700 锁目录），
+  # 当前 uid（含 adb shell uid 2000）没有权限读它的 pidfile → `cat` 直接 Permission denied，
+  # 旧逻辑既进不了「已运行」分支也进不了「陈旧接管」分支，于是 mkdir 永远失败、看门狗再也
+  # 起不来。下面只要 pidfile 不可读 / pid 死了 / 非本脚本，一律当陈旧锁接管（见下方强清逻辑）。
   _old=$(cat "$PIDFILE" 2>/dev/null)
   if [ -n "$_old" ] && [ -d "/proc/$_old" ] &&
      tr '\0' ' ' < "/proc/$_old/cmdline" 2>/dev/null | grep -q ufi_keepalive; then
     return 1
   fi
-  echo "$(date) stale lock (pid=${_old:-none}), taking over" >> "$LOG" 2>/dev/null
-  rm -rf "$LOCK" 2>/dev/null
+  # 走到这里只有两种可能：① pidfile 为空或不可读（含 lock 不在自己 uid 下）；② pid 死了/非本脚本。
+  # 两者都是陈旧锁，先试着强清。
+  #
+  # 2026-10-13 关键修正：不能用 `rm -rf "$LOCK"`。当锁目录属于另一个（已不存在的）app uid
+  # 时，`rm -rf` 在递归下降前会先对目录做 chmod，而 chmod 别人的目录会 EPERM，于是整个
+  # `rm -rf` 中断、锁永远删不掉、mkdir 永远失败、看门狗永久失效。
+  # 内核规则：只要父目录 `/data/local/tmp`（0777 sticky）可写，删除其下的目录项**只看父目录
+  # 权限，不看子目录属主/权限**。所以改用「先删内部文件、再 rmdir 目录名」两步 unlink，
+  # 通过可写父目录直接摘掉名字，规避 chmod 这一关 —— 对任意属主/权限的残留锁都能清掉。
+  echo "$(date) stale lock (pid=${_old:-?unreadable}, owner=$(ls -ld "$LOCK" 2>/dev/null | awk '{print $3}')), taking over" >> "$LOG" 2>/dev/null
+  rm -f "$LOCK/pid" 2>/dev/null
+  rmdir "$LOCK" 2>/dev/null
   if mkdir "$LOCK" 2>/dev/null; then
+    chmod 777 "$LOCK" 2>/dev/null
     echo $$ > "$PIDFILE" 2>/dev/null
+    chmod 666 "$PIDFILE" 2>/dev/null
     return 0
   fi
   return 1
 }
+
+# ── 运行身份校验（必须在拿锁之前）──
+#
+# 2026-10-13：看门狗只有以 adb shell（uid 2000）或 root（uid 0）运行才**真的**能拉起 Core。
+# 以 app uid 运行时，它是 app 的**后台**进程，受 Android 12+ 前台服务后台启动限制，
+# `am start-foreground-service` 会被 AMS 静默拒绝（实测返回空、服务不起）——看门狗等于白跑。
+# 更糟的是它会占住锁，让随后以 shell 身份启动的「真」看门狗因「已在运行」而退出，
+# 于是保活彻底失效。因此非 shell/root 直接退出，把位置让给真正的看门狗。
+_CUR_UID=$(id -u 2>/dev/null)
+case "$_CUR_UID" in
+  0|2000) : ;;
+  *)
+    log "refuse to run as uid=${_CUR_UID:-?} (need 2000/shell or 0/root): cannot start services, exit"
+    exit 0
+    ;;
+esac
 
 if ! acquire_lock; then
   echo "$(date) keepalive already running, exit" >> "$LOG" 2>/dev/null

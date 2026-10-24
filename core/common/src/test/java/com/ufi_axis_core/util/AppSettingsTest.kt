@@ -139,4 +139,154 @@ class AppSettingsTest {
         val s2 = AppSettings(context)
         assertEquals("跨实例应持久化一致", id1, s2.deviceId)
     }
+
+    // ══════════════ 配对码失败即轮换（2026-10-15） ══════════════
+
+    /**
+     * 轮换后**旧码立即失效、新码可用** —— 这是"暴力猜码彻底失效"的依据：
+     * 攻击者每失败一次，靶子就被换掉，它手上的旧码再也对不上。
+     */
+    @Test
+    fun `rotatePairingCode invalidates the old code and the new one works`() {
+        val s = freshPairingSettings()
+        s.enterPairingMode()
+        val oldCode = s.pairingCode
+        assertTrue("前置：应有配对码", oldCode.isNotBlank())
+
+        val newCode = s.rotatePairingCode()
+        assertTrue("应返回非空新码", newCode.isNotBlank())
+        assertNotEquals("新码必须与旧码不同", oldCode, newCode)
+        assertEquals("pairingCode 应已换成新码", newCode, s.pairingCode)
+        assertTrue(
+            "旧码必须立即失效",
+            s.confirmPairing(oldCode, "fp-attacker") is AppSettings.PairingConfirmResult.InvalidCode
+        )
+        assertTrue(
+            "新码应可用",
+            s.confirmPairing(newCode, "fp-owner") is AppSettings.PairingConfirmResult.Success
+        )
+    }
+
+    /**
+     * 设备已初始化（设过密码）后没有配对码可轮换：返回空串且不写 prefs。
+     *
+     * 这条守的是"别凭空造一个永远不会被读到的码" —— 已初始化设备的 `infoPayload`
+     * 根本不下发 pairing_code。
+     */
+    @Test
+    fun `rotatePairingCode is a no-op once the device is initialized`() {
+        val s = freshPairingSettings()
+        s.setDevicePassword("secret123")
+        val before = s.pairingCode
+        val rotated = s.rotatePairingCode()
+        assertEquals("已初始化时应返回空串（没有码可轮换）", "", rotated)
+        assertEquals("不应改动 pairingCode", before, s.pairingCode)
+    }
+
+    // ══════════════ 恢复默认 vs 恢复出厂（2026-10-19） ══════════════
+
+    /**
+     * 两条"重置"路径的语义必须**互不越界**：
+     * - [AppSettings.resetAll] 只恢复配置、**保留**身份与凭据（远程 `/api/config/reset` 用它，
+     *   否则一次远程重置就把设备变成"谁都能重新初始化"）；
+     * - [AppSettings.factoryReset] 是**仅本机设置页**才能触发的"放弃所有权"，必须连密码一起清。
+     *
+     * 守的是"别把两者合并"：合并任意方向都会造成安全事故（远程能清所有权）
+     * 或留下残渣（本地恢复出厂后密码还在、别人仍能登录）。
+     */
+    @Test
+    fun `resetAll keeps credentials but factoryReset clears them`() {
+        val s = freshPairingSettings()
+        s.setDevicePassword("secret123")
+        val idBefore = s.deviceId
+        assertTrue("前置：已设置密码", s.devicePasswordSet)
+
+        s.resetAll()
+        assertTrue("resetAll 必须保留密码（远程重置不等于放弃所有权）", s.verifyDevicePassword("secret123"))
+        assertEquals("resetAll 必须保留 device_id", idBefore, s.deviceId)
+
+        s.factoryReset()
+        assertFalse("factoryReset 必须清掉密码", s.verifyDevicePassword("secret123"))
+        assertFalse("factoryReset 必须清掉『已设置』标记", s.devicePasswordSet)
+        assertNotEquals("factoryReset 必须换掉 device_id", idBefore, s.deviceId)
+    }
+
+    // ══════════════ 启动失败计数 / 安全模式（2026-10-19） ══════════════
+
+    /**
+     * 这两个键是**运行态**（不是用户配置）：默认必须是"没有失败、没进安全模式"，
+     * 且 `resetAll()` 必须清掉 —— 否则用户"恢复默认"之后设备还停在安全模式里（强制默认端口、关后台），
+     * 表现就是"恢复了默认但功能不全"。
+     */
+    @Test
+    fun `startup counters default to clean state and resetAll clears them`() {
+        val s = freshPairingSettings()
+        assertEquals("默认失败计数应为 0", 0, s.startupFailureCount)
+        assertFalse("默认不应处于安全模式", s.safeModeActive)
+
+        s.startupFailureCount = 5
+        s.safeModeActive = true
+        assertEquals(5, s.startupFailureCount)
+        assertTrue(s.safeModeActive)
+
+        s.resetAll()
+        assertEquals("恢复默认必须清掉失败计数", 0, s.startupFailureCount)
+        assertFalse("恢复默认必须清掉安全模式", s.safeModeActive)
+    }
+
+    // ══════════════ 备份导入的字符串格式校验（2026-10-19） ══════════════
+
+    /**
+     * 备份包可以被手工编辑，而 STRING 之前**只校验类型**：写入一个非法 `goform_ip`
+     * 会让 core 永远连不上设备后台（只能靠本地页改回），非法 `update_url` 会让更新链路失效。
+     * 这条测试钉住两个"改错就失联"的键，同时确认正常的键不受影响。
+     */
+    @Test
+    fun `导入备份时非法 goform_ip 与 update_url 会被拒`() {
+        val s = freshPairingSettings()
+        val report = s.importBackupFields(
+            mapOf(
+                "goform_ip" to "http://evil/../x",
+                "update_url" to "ftp://nope",
+                "server_port" to 8081
+            ),
+            replace = false
+        )
+
+        assertTrue("非法 goform_ip 应被拒", "goform_ip" in report.rejected)
+        assertTrue("非法 update_url 应被拒", "update_url" in report.rejected)
+        assertTrue("合法项应被接受", "server_port" in report.applied)
+        assertEquals("合法项要真的落库", 8081, s.port)
+        assertNotEquals("非法值不能落库", "http://evil/../x", s.goformIp)
+
+        // 空串是"清空/回默认"的合法语义，不应被格式校验拦住
+        val cleared = s.importBackupFields(mapOf("goform_ip" to ""), replace = false)
+        assertTrue("空串应放行", "goform_ip" in cleared.applied)
+    }
+
+    /**
+     * 预览导入（dry-run，2026-10-19）：只算报告，**不写任何东西**。
+     *
+     * 备份导入是 60+ 键的批量写入口，客户端必须先预览再确认；如果预览偷偷写盘，
+     * "先看一眼"就变成了"直接恢复"，等于没有确认步骤。
+     */
+    @Test
+    fun `预览导入只出报告不落盘`() {
+        val s = freshPairingSettings()
+        val portBefore = s.port
+
+        val report = s.previewBackupFields(
+            mapOf("server_port" to 9099, "goform_ip" to "bad host!"),
+            replace = false
+        )
+
+        assertTrue("应报告 server_port 会被应用", "server_port" in report.applied)
+        assertTrue("应报告 goform_ip 会被拒绝", "goform_ip" in report.rejected)
+        assertEquals("预览绝不能改配置", portBefore, s.port)
+
+        // 真导入才会落盘
+        val real = s.importBackupFields(mapOf("server_port" to 9099), replace = false)
+        assertTrue("server_port" in real.applied)
+        assertEquals("真导入应落盘", 9099, s.port)
+    }
 }

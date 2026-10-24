@@ -410,6 +410,20 @@ interface AlertDao {
         level: String?, type: String?, unreadOnly: Int, start: Long?, end: Long?
     ): Int
 
+    /**
+     * 按天聚合的事件计数（2026-10-23）：月历热力用。
+     *
+     * 用 `localtime` 分组 —— 用户看到的"某一天"是本地时区的自然日，与 `localDayKey` 一致。
+     * 返回值是 `(yyyy-MM-dd, count)`，空的天不返回（调用方按 0 处理）。
+     */
+    @Query("""
+        SELECT date(timestamp / 1000, 'unixepoch', 'localtime') AS day, COUNT(*) AS count
+        FROM alert_records
+        WHERE timestamp >= :start AND timestamp < :end
+        GROUP BY day ORDER BY day ASC
+    """)
+    suspend fun getDailyCounts(start: Long, end: Long): List<AlertDailyCount>
+
     /** 全表总数。存储统计（`GET /api/monitor/storage`）用它 ——
      *  2026-09-08 之前那里取的是 `getRecentAlerts(1).size`，于是"告警记录条数"最大只会是 1。 */
     @Query("SELECT COUNT(*) FROM alert_records")
@@ -987,3 +1001,8 @@ interface ConsoleHistoryDao {
     """)
     suspend fun trimChannelTo(channel: String, maxRows: Int)
 }
+/** 单日事件计数（月历热力用）。day 为本地日期 `yyyy-MM-dd`。 */
+data class AlertDailyCount(
+    val day: String,
+    val count: Int
+)

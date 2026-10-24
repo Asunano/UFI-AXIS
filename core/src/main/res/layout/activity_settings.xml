@@ -28,6 +28,33 @@
             android:singleLine="true"
             android:inputType="number" />
 
+        <!-- 2026-10-19：端口被占用时服务起不来、且没有任何自动回退 —— 这里给一个一键回退。
+             端口冲突的典型来源：8080 是设备自身 goform 管理面、5555 是 adbd、7682 是 ttyd。 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="改端口后：FRP / Cloudflare 隧道里配置的本地端口也要同步改，否则远程入口会失效。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnPortFallback"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="端口被占用？回退默认 8088" />
+
+        <TextView
+            android:id="@+id/tvPortHint"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary"
+            android:visibility="gone" />
+
         <CheckBox
             android:id="@+id/cbAutoStart"
             android:layout_width="wrap_content"
@@ -88,7 +115,7 @@
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
                 android:layout_weight="1"
-                android:hint="设备后台密码"
+                android:hint="设备后台密码（core 登录后台用）"
                 android:singleLine="true"
                 android:inputType="textPassword" />
 
@@ -98,6 +125,34 @@
                 android:layout_height="wrap_content"
                 android:text="显示" />
         </LinearLayout>
+
+        <!-- 2026-10-19：澄清"两把钥匙"。本地页只能改 core 保存的 goform 口令，
+             不能改设备固件里的 admin 密码 —— 后者只有 App/Web 的 /api/device/password 能做。 -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="这里只改 core 保存的登录口令，不改设备固件的 admin 密码；要改固件密码请用 App / Web。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <!-- 2026-10-19：连通性测试。设备后台填错（IP/端口/口令）时，
+             这里能立刻分清是"地址不通"还是"口令不对"，不用等业务接口 503。 -->
+        <Button
+            android:id="@+id/btnTestGoform"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="测试设备后台连通性" />
+
+        <TextView
+            android:id="@+id/tvGoformTest"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary"
+            android:visibility="gone" />
 
         <View
             android:layout_width="match_parent"
@@ -171,6 +226,15 @@
             android:layout_marginTop="8dp"
             android:text="修改密码" />
 
+        <!-- 2026-10-19：默认改密**不会**踢掉已配对设备（很多人以为是掉线的）。
+             需要"改密即失效"时勾这里。 -->
+        <CheckBox
+            android:id="@+id/cbRevokeOnPwdChange"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="改密后同时踢出所有已配对设备" />
+
         <TextView
             android:id="@+id/tvCorePwdStatus"
             android:layout_width="match_parent"
@@ -241,6 +305,128 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
+            android:text=""
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:layout_marginTop="16dp"
+            android:background="?android:attr/dividerVertical" />
+
+        <!-- ────────── 安全与恢复（2026-10-19）──────────
+             这些是"远程改坏之后的最后保险"：全部只在设备本机（物理在场 / adb 投屏）可用，
+             远程没有任何对应接口 —— 因为每一条都能绕过密码或放弃所有权。 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="16dp"
+            android:text="安全与恢复"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:textColor="?android:attr/textColorPrimary" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="2dp"
+            android:text="仅本机可用。用于远程把设备改到连不上时自救，操作会写入事件中心。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <CheckBox
+            android:id="@+id/cbApprovalRequired"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="新设备需在 App 上批准" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="关掉后：新设备凭配对密码即可配对；已配对设备不受影响。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnResetPassword"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="重置配对密码（无需旧密码）" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="忘记密码时用。已配对设备不会被踢下线（需要踢出请用「解除全部配对」）。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnUnpairAll"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="解除全部配对" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="所有 App / Web 需要重新配对；不会清空黑名单，也不会改密码。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnClearBlacklist"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="清空配对黑名单" />
+
+        <TextView
+            android:id="@+id/tvBlacklistCount"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="当前黑名单：0 条"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnRollbackWeb"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="回滚 Web 前端到内置版本" />
+
+        <TextView
+            android:id="@+id/tvWebOverrideState"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Web 前端：未覆盖（使用内置版本）"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <Button
+            android:id="@+id/btnFactoryReset"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:text="恢复出厂（放弃所有权）"
+            android:textColor="#C62828" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="清除：配对密码、全部配对设备、配对黑名单、设备身份与所有配置。不可恢复。"
+            android:textSize="12sp"
+            android:textColor="?android:attr/textColorTertiary" />
+
+        <TextView
+            android:id="@+id/tvDiagnostics"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:text=""
             android:textSize="12sp"
             android:textColor="?android:attr/textColorTertiary" />

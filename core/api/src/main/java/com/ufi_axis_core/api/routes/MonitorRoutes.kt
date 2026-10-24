@@ -5,6 +5,8 @@ import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.core.database.AppDatabase
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.util.DownsampledPoint
+import com.ufi_axis_core.util.SmartLoop
+import com.ufi_axis_core.util.SmartLoopTuning
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.call
 import io.ktor.server.request.receiveText
@@ -72,7 +74,26 @@ data class MonitorPreferences(
     /** 套餐限额百分比检查间隔（秒）60..3600。下限 60 是为了不跟设备 Web UI 抢 goform 会话 */
     val trafficLimitCheckSec: Int = 300,
     /** WiFi 客户端接入/离开的比对间隔（秒）15..600。接入与离开共用同一次 station_list 查询 */
-    val deviceEventCheckSec: Int = 60
+    val deviceEventCheckSec: Int = 60,
+
+    // ── 智能采集节拍（2026-10-14 接线；真源是 AppSettings 的 `smart_loop_*` 原始键）──
+    // 【为什么在这里】这四个键在 SmartLoop.kt 里早就定义好了（含默认值与读写函数），
+    // 但 `SmartLoopTuning.write` **零调用方**、键也不在任何设置模型里 —— 结果是
+    // DataScheduler 的两条 SmartLoop（goform-traffic / battery）只能永远跑默认档位，
+    // 其中 `smartLoopEnabled=false` 这个"出问题不拆代码就能回退固定间隔"的开关现场按不到。
+    // 接进本模型后走既有的「PUT /preferences → applySchedulerFields → AppSettings」那条路，
+    // DataScheduler 每轮现读，所以改完下一轮生效、不需要重启采集。
+    //
+    // 【默认值逐字等于 SmartLoopTuning.defaults()】这里直接引用 SmartLoop 的常量而不是
+    // 抄字面量：一升级就改变设备行为是这类"补设置项"最容易犯的错，引用常量让两边不可能漂。
+    /** 智能节拍总开关。false = 所有 SmartLoop 退回固定 baseMs（故障回退开关，不是调优项） */
+    val smartLoopEnabled: Boolean = true,
+    /** 零流量判定阈值（bytes/s）。低于它进 1.5 慢档省电；须 < smartLoopActiveBps */
+    val smartLoopIdleBps: Long = SmartLoop.IDLE_BYTES_PER_SEC,
+    /** 中流量阈值（bytes/s）。超过它进 1.0 基准节拍；须在 idle 与 heavy 之间 */
+    val smartLoopActiveBps: Long = SmartLoop.ACTIVE_BYTES_PER_SEC,
+    /** 大流量阈值（bytes/s）。超过它进 0.5 快档（大文件下载/测速中）；须 > smartLoopActiveBps */
+    val smartLoopHeavyBps: Long = SmartLoop.HEAVY_BYTES_PER_SEC
 )
 
 
@@ -163,6 +184,20 @@ class MonitorRoutes(
                 "套餐限额检查间隔（trafficLimitCheckSec）必须在 60..3600 秒之间，收到 ${p.trafficLimitCheckSec}"
             p.deviceEventCheckSec !in 15..600 ->
                 "设备事件检查间隔（deviceEventCheckSec）必须在 15..600 秒之间，收到 ${p.deviceEventCheckSec}"
+            // ── 智能采集节拍（2026-10-14）──
+            // 边界取自 SmartLoopTuning（组件自己声明合法区间），这里只负责"越界就拒"。
+            // 与上面几项同口径：不静默夹住 —— 夹住会让两端 UI 显示的值与设备真值不一致，
+            // 正是本仓反复修的那类"设置自己变回来"。
+            p.smartLoopIdleBps !in SmartLoopTuning.MIN_THRESHOLD_BPS..SmartLoopTuning.MAX_THRESHOLD_BPS ->
+                "智能节拍零流量阈值（smartLoopIdleBps）必须在 ${SmartLoopTuning.MIN_THRESHOLD_BPS}..${SmartLoopTuning.MAX_THRESHOLD_BPS} bytes/s 之间，收到 ${p.smartLoopIdleBps}"
+            p.smartLoopActiveBps !in SmartLoopTuning.MIN_THRESHOLD_BPS..SmartLoopTuning.MAX_THRESHOLD_BPS ->
+                "智能节拍中流量阈值（smartLoopActiveBps）必须在 ${SmartLoopTuning.MIN_THRESHOLD_BPS}..${SmartLoopTuning.MAX_THRESHOLD_BPS} bytes/s 之间，收到 ${p.smartLoopActiveBps}"
+            p.smartLoopHeavyBps !in SmartLoopTuning.MIN_THRESHOLD_BPS..SmartLoopTuning.MAX_THRESHOLD_BPS ->
+                "智能节拍大流量阈值（smartLoopHeavyBps）必须在 ${SmartLoopTuning.MIN_THRESHOLD_BPS}..${SmartLoopTuning.MAX_THRESHOLD_BPS} bytes/s 之间，收到 ${p.smartLoopHeavyBps}"
+            // 序关系：三个区间重叠时 SmartLoop.nextDelayMs 的 when 会有永远落不到的分支
+            //（档位从三档塌成一档），而且塌陷是静默的 —— 所以必须在写入前就拒掉。
+            p.smartLoopIdleBps >= p.smartLoopActiveBps || p.smartLoopActiveBps >= p.smartLoopHeavyBps ->
+                "智能节拍三个阈值必须严格递增（零流量 < 中流量 < 大流量），收到 ${p.smartLoopIdleBps} / ${p.smartLoopActiveBps} / ${p.smartLoopHeavyBps} bytes/s"
             else -> (p.enabledTypes - METRIC_KEYS).takeIf { it.isNotEmpty() }?.let {
                 "监控指标开关（enabledTypes）含未知指标：${it.sorted().joinToString(",")}"
             }
@@ -398,7 +433,8 @@ class MonitorRoutes(
                 }
                 settings.monitorPreferencesJson =
                     PrefsJson.encodeToString(MonitorPreferences.serializer(), merged)
-                // 采集调度 7 项另存为强类型字段，DataScheduler 在循环内读它 → 改完立即生效
+                // 采集调度 9 项 + 智能节拍 4 项另存到 AppSettings（强类型字段 / smart_loop_* 原始键），
+                // DataScheduler 在循环内读它 → 改完立即生效
                 applySchedulerFields(merged)
                 call.respond(toJsonElement(mapOf("success" to true, "preferences" to merged)))
             }
@@ -484,20 +520,29 @@ class MonitorRoutes(
     }
 
     /**
-     * 采集调度那 9 项的真源是 AppSettings 的强类型字段（DataScheduler 直接读它，不解析 JSON），
-     * 所以回读时统一用 settings 覆盖 blob 里的副本，避免两处不一致。
+     * 采集调度那 9 项 + 智能节拍 4 项的真源是 AppSettings（DataScheduler 直接读它，
+     * 不解析 JSON），所以回读时统一用 settings 覆盖 blob 里的副本，避免两处不一致。
      */
-    private fun withSchedulerFields(p: MonitorPreferences): MonitorPreferences = p.copy(
-        retentionDays = settings.monitorRetentionDays,
-        flushIntervalSec = settings.monitorFlushIntervalSec,
-        alertScanSec = settings.monitorAlertScanSec,
-        idleIntervalSec = settings.monitorIdleIntervalSec,
-        thermalWarnC = settings.monitorThermalWarnC,
-        thermalCriticalC = settings.monitorThermalCriticalC,
-        thermalPauseSec = settings.monitorThermalPauseSec,
-        trafficLimitCheckSec = settings.monitorTrafficLimitCheckSec,
-        deviceEventCheckSec = settings.monitorDeviceEventCheckSec
-    )
+    private fun withSchedulerFields(p: MonitorPreferences): MonitorPreferences {
+        // 智能节拍的四个键在 AppSettings 里是 `smart_loop_*` 原始键（不是强类型字段），
+        // 读取入口只有 SmartLoopTuning.read —— 与写入入口 write 成对，中间不留第二份副本。
+        val smart = SmartLoopTuning.read(settings)
+        return p.copy(
+            retentionDays = settings.monitorRetentionDays,
+            flushIntervalSec = settings.monitorFlushIntervalSec,
+            alertScanSec = settings.monitorAlertScanSec,
+            idleIntervalSec = settings.monitorIdleIntervalSec,
+            thermalWarnC = settings.monitorThermalWarnC,
+            thermalCriticalC = settings.monitorThermalCriticalC,
+            thermalPauseSec = settings.monitorThermalPauseSec,
+            trafficLimitCheckSec = settings.monitorTrafficLimitCheckSec,
+            deviceEventCheckSec = settings.monitorDeviceEventCheckSec,
+            smartLoopEnabled = smart.enabled,
+            smartLoopIdleBps = smart.idleBytesPerSec,
+            smartLoopActiveBps = smart.activeBytesPerSec,
+            smartLoopHeavyBps = smart.heavyBytesPerSec
+        )
+    }
 
     /** 把采集调度字段落到 AppSettings（PUT 时调用） */
     private fun applySchedulerFields(p: MonitorPreferences) {
@@ -510,6 +555,18 @@ class MonitorRoutes(
         settings.monitorThermalPauseSec = p.thermalPauseSec
         settings.monitorTrafficLimitCheckSec = p.trafficLimitCheckSec
         settings.monitorDeviceEventCheckSec = p.deviceEventCheckSec
+        // 智能采集节拍（2026-10-14）：四个键一起写（理由见 SmartLoopTuning.write 的 KDoc）。
+        // 这是 SmartLoopTuning.write 的唯一调用方 —— 在此之前它零调用方，
+        // 于是 smart_loop_enabled=false 这个故障回退开关现场根本按不到。
+        SmartLoopTuning.write(
+            settings,
+            SmartLoopTuning.Tuning(
+                idleBytesPerSec = p.smartLoopIdleBps,
+                activeBytesPerSec = p.smartLoopActiveBps,
+                heavyBytesPerSec = p.smartLoopHeavyBps,
+                enabled = p.smartLoopEnabled
+            )
+        )
     }
 
     private fun tableInfo(name: String, count: Int, bytesPerRow: Int): Map<String, Any> {

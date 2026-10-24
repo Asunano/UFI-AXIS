@@ -1,6 +1,9 @@
 package com.ufi_axis_core.controller.system
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -193,6 +196,49 @@ class AppManager(
     }
 
     /**
+     * 包变化（安装 / 卸载 / 更新 / 启用停用）→ **立即失效缓存并后台重拉**（2026-10-19）。
+     *
+     * 用户反馈：在应用管理里卸载/安装后，列表要等 5 分钟 TTL 或手动刷新才变。
+     * 根因是缓存只在 core 自己的写操作里失效；**通过其它途径**（系统设置、第三方商店、
+     * `pm uninstall`）改包时，core 完全不知道。因此在定时刷新启动时顺带注册包变化广播。
+     */
+    fun onPackagesChanged() {
+        invalidateAppListCache()
+        val scope = appListRefreshScope ?: return
+        scope.launch(Dispatchers.IO) { refreshAppListInBackground() }
+    }
+
+    /** 包变化广播接收器（随定时刷新一起注册/注销）。 */
+    private var packageReceiver: BroadcastReceiver? = null
+
+    private fun registerPackageReceiver() {
+        val ctx = context ?: return
+        if (packageReceiver != null) return
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_PACKAGE_ADDED)
+            addAction(Intent.ACTION_PACKAGE_REMOVED)
+            addAction(Intent.ACTION_PACKAGE_REPLACED)
+            addAction(Intent.ACTION_PACKAGE_CHANGED)
+            addDataScheme("package")
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(c: Context?, intent: Intent?) {
+                AppLogger.i(tag, "包变化（${intent?.action}）→ 立即失效应用列表缓存并重拉")
+                onPackagesChanged()
+            }
+        }
+        runCatching { ctx.registerReceiver(receiver, filter) }
+            .onSuccess { packageReceiver = receiver }
+            .onFailure { AppLogger.w(tag, "注册包变化监听失败: ${it.message}") }
+    }
+
+    private fun unregisterPackageReceiver() {
+        val ctx = context ?: return
+        packageReceiver?.let { runCatching { ctx.unregisterReceiver(it) } }
+        packageReceiver = null
+    }
+
+    /**
      * 启动定时主动刷新（用户要的"core 主动获取缓存并定时更新"）。
      *
      * **刻意不在构造里起**：`AppManager` 还有一个只用来做自更新安装的短命实例
@@ -215,6 +261,8 @@ class AppManager(
             }
         }
         AppLogger.i(tag, "App list periodic refresh started (interval=${APP_LIST_REFRESH_INTERVAL_MS}ms)")
+        // 顺带监听包变化：外部安装/卸载时立刻失效缓存，不用等 TTL。
+        registerPackageReceiver()
     }
 
     /**
@@ -255,6 +303,7 @@ class AppManager(
         if (!enabled) {
             appListRefreshJob?.cancel()
             appListRefreshJob = null
+            unregisterPackageReceiver()
             AppLogger.i(tag, "App list periodic refresh paused")
             return
         }
