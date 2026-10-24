@@ -17,7 +17,7 @@
     - last_error 原先是一行裸红字，同样会 break-all 撑高。现在是一条 error-light 提示带，
       最多两行并自带「查看日志」出口。
   -->
-  <GridCard>
+  <GridCard :loading="initialLoading && !group.items.length && !error">
     <template #title>
       <n-button-group size="small">
         <n-button :type="isFrp ? 'primary' : 'default'" size="small" @click="emit('update:kind', 'frp')">
@@ -39,28 +39,45 @@
     </template>
 
     <!-- 组件没装时先横一条提醒：配置照常可看可改，但启动一定失败，
-         所以是横幅而不是把列表整个替换掉 -->
+         所以是横幅而不是把列表整个替换掉。
+         2026-10-14：出口从「就地弹窗安装」改成「去资源中心」。原来这颗按钮 emit('open-components')
+         打开本页的 ComponentsModal，于是"装 frpc"这件事在隧道页、设置页各有一份入口；
+         现在可下载资源统一收进资源中心，本页只保留提醒 + 指路。 -->
     <div v-if="!installed" class="warn-bar">
       <i class="dot dot-warn"></i>
       <span>{{ binary }} 未安装，{{ isFrp ? '通道' : '隧道' }}无法启动。配置可以照常新建与修改。</span>
-      <n-button size="tiny" type="primary" @click="emit('open-components')">去安装</n-button>
+      <n-button size="tiny" type="primary" @click="emit('open-resources')">前往资源中心</n-button>
     </div>
 
-    <div v-if="!group.items.length" class="empty">
+    <!-- 读取失败：与「暂无配置」分开。有旧列表时保留旧列表（可能过期），
+         但先横一条可重试的失败提示；没列表时只显示提示，不显示空态。 -->
+    <div v-if="error" class="load-err" role="alert">
+      <n-icon :size="14"><AlertCircleOutline /></n-icon>
+      <span class="load-err-text">{{ error }}</span>
+      <n-button size="tiny" :loading="retrying" @click="emit('retry')">重试</n-button>
+    </div>
+
+    <div v-else-if="!group.items.length" class="empty">
       <n-empty :description="isFrp ? '暂无 FRP 通道配置' : '暂无 Cloudflare 隧道'">
         <template v-if="!installed" #extra>
-          <n-button size="small" type="primary" @click="emit('open-components')">先安装 {{ binary }}</n-button>
+          <!-- 空列表这一颗比上面横幅那颗更具体：这里只有一句「暂无配置」，
+               不带上二进制名，用户看不出缺的到底是哪个资源。 -->
+          <n-button size="small" type="primary" @click="emit('open-resources')">
+            前往资源中心安装 {{ binary }}
+          </n-button>
         </template>
       </n-empty>
     </div>
-    <div v-else class="rows">
+    <div v-if="group.items.length" class="rows">
       <div v-for="it in group.items" :key="it.name" class="row" :class="{ 'row-active': group.active === it.name }">
         <div class="row-name">
           <i class="dot" :class="dotClass(it)"></i>
           <b :title="it.name">{{ it.name }}</b>
           <span v-if="group.active === it.name" class="tag tag-accent">选中</span>
           <!-- 运行/停止已由状态点表达，tag 只留异常这一种需要文字的情况 -->
-          <span v-if="it.status === 'Error'" class="tag tag-err">{{ statusLabel(it.status) }}</span>
+          <span v-if="isErrorStatus(it.status)" class="tag tag-err" :title="`原始状态：${it.status}`">{{
+            statusLabel(it.status)
+          }}</span>
           <span v-if="!isFrp && !it.token_set" class="tag tag-warn">未设置 token</span>
         </div>
 
@@ -113,7 +130,7 @@ import { computed } from 'vue';
 import type { DropdownOption } from 'naive-ui';
 import { AlertCircleOutline, EllipsisHorizontalOutline } from '@vicons/ionicons5';
 import GridCard from '@/components/GridCard.vue';
-import { statusLabel, type Instance } from '@/views/tunnel/tunnelShared';
+import { isErrorStatus, statusLabel, type Instance } from '@/views/tunnel/tunnelShared';
 
 /** 一类隧道的「在跑 / 总数」。两类都要，因为计数挂在两颗切换按钮上。 */
 interface KindCount {
@@ -132,12 +149,21 @@ const props = defineProps<{
   binary: string;
   /** 形如 `frp-start-<name>` 的忙碌键，父组件那一份，用于给对应按钮上 loading */
   busy: string | null;
+  /** 这一类的读取失败原因（空串 = 最近一次读成功）。与「列表为空」是两件事 */
+  error: string;
+  /** 首屏（还没有任何数据）时的占位；后续动作/轮询不再把整卡闪成骨架 */
+  initialLoading: boolean;
+  /** 页面正在重拉（失败横幅上的重试按钮转圈用） */
+  retrying: boolean;
 }>();
 
 const emit = defineEmits<{
   'update:kind': ['frp' | 'cf'];
   'stop-all-kind': [];
-  'open-components': [];
+  /** 2026-10-14：原名 `open-components`（就地弹安装弹窗），组件安装已收进资源中心，改为跳转 */
+  'open-resources': [];
+  /** 读取失败横幅上的重试（由页面重新拉这一类） */
+  retry: [];
   start: [string];
   stop: [string];
   /** 空串 = 新建 */
@@ -152,14 +178,20 @@ const isFrp = computed(() => props.kind === 'frp');
 /** 状态点：在跑（绿，带呼吸）/ 异常（红）/ 已停止（灰） */
 function dotClass(it: Instance): string {
   if (it.running) return 'dot-live';
-  return it.status === 'Error' ? 'dot-err' : '';
+  return isErrorStatus(it.status) ? 'dot-err' : '';
 }
 
-/** 行中间那一列。FRP 报 serverAddr 与 proxy 数，CF 只有 token 状态可报。 */
+/**
+ * 行中间那一列。FRP 报 serverAddr 与 proxy 数，CF 只有 token 状态可报。
+ *
+ * `proxy_count` 为 null/undefined 表示「core 没给这个字段」（未配置 / 老版本），
+ * 与「配了 0 个 proxy」不是一回事 —— 旧写法 `?? 0` 会把两者都显示成「0 个 proxy」。
+ */
 function metaText(it: Instance): string {
   if (!isFrp.value) return it.token_set ? 'token 已配置' : 'token 未配置，无法连接';
   const addr = it.server_addr ? `${it.server_addr}${it.server_port ? `:${it.server_port}` : ''}` : '未配置 serverAddr';
-  return `${addr} · ${it.proxy_count ?? 0} 个 proxy`;
+  const proxies = it.proxy_count == null ? 'proxy 未配置' : `${it.proxy_count} 个 proxy`;
+  return `${addr} · ${proxies}`;
 }
 
 /**
@@ -229,6 +261,24 @@ function onRowAction(key: string, name: string) {
 }
 .empty {
   padding: var(--space-6) 0;
+}
+/* 读取失败横幅：与 warn-bar 同一形状，但语义是「没读到」而不是「缺组件」 */
+.load-err {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--error);
+  border-radius: var(--radius-sm);
+  background: var(--error-light);
+  color: var(--error);
+  font-size: var(--font-sm);
+}
+.load-err-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
 }
 
 /* ── 行 ──

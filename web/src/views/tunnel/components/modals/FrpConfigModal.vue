@@ -1,9 +1,10 @@
 <template>
   <n-modal
     :show="show"
+    class="modal-fit"
     preset="card"
     :title="isNew ? '新建 FRP 通道' : `编辑 ${nameInput}`"
-    style="width: 720px; max-width: calc(100vw - 32px)"
+    style="--modal-w: 720px; --modal-h: 720px"
     @update:show="emit('update:show', $event)"
   >
     <n-space vertical :size="10">
@@ -50,16 +51,21 @@ const toml = ref('');
 const saving = ref(false);
 const isNew = computed(() => !props.name);
 
+// 2026-10-22：watch 依赖从只看 show 改为 [show, name]（与 CfTokenModal 同一处理）。
+// 只看 show 时，快速「关 A → 开 B」会落在 useLazyModal 的 350ms 保活窗口里 ——
+// A 的迟到 GET 会把 A 的 TOML 填进标题写着 B 的编辑框，一按保存就把 A 的配置写给了 B。
 watch(
-  () => props.show,
-  async (v) => {
+  () => [props.show, props.name] as const,
+  async ([v, name]) => {
     if (!v) return;
-    nameInput.value = props.name;
+    nameInput.value = name;
     toml.value = '';
     saving.value = false;
-    if (!props.name) return;
+    if (!name) return;
     try {
-      const { data } = await api.get(`/api/tunnel/frp/config/${encodeURIComponent(props.name)}`);
+      const { data } = await api.get(`/api/tunnel/frp/config/${encodeURIComponent(name)}`);
+      // 名字变了 → 这次 GET 的结果已过期（show 从没变过 false）
+      if (nameInput.value !== name) return;
       toml.value = data?.toml || '';
     } catch (e: any) {
       message.error(errText(e, '读取配置失败'));

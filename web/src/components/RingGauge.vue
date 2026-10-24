@@ -29,7 +29,7 @@
     <div class="ring-center">
       <div class="ring-value-row">
         <span class="ring-value" :style="{ color: resolvedColor }">{{ displayValue }}</span>
-        <span v-if="unit" class="ring-unit">{{ unit }}</span>
+        <span v-if="unit && hasValue" class="ring-unit">{{ unit }}</span>
       </div>
       <div v-if="label" class="ring-label-below">{{ label }}</div>
     </div>
@@ -63,11 +63,20 @@ const props = withDefaults(
   }
 );
 
-const ratio = computed(() => Math.min(1, Math.max(0, props.value / props.max)));
+/**
+ * `value` 声明上是必填 number，但调用方在「还没取到数」时可能传进来 undefined / NaN。
+ * 原先直接 `toFixed()`，环里就会印出一个 `NaN` —— 那既不是 0% 也不是「没取到」。
+ */
+const hasValue = computed(() => Number.isFinite(props.value));
+/** `max` 为 0 或非数时按 100 处理：除 0 会得到 Infinity，被 clamp 成满环，等于伪造 100% */
+const safeMax = computed(() => (Number.isFinite(props.max) && props.max > 0 ? props.max : 100));
+
+const ratio = computed(() => (hasValue.value ? Math.min(1, Math.max(0, props.value / safeMax.value)) : 0));
 const radius = computed(() => props.size / 2 - props.strokeWidth / 2 - 4);
 const circumference = computed(() => 2 * Math.PI * radius.value);
 
 const displayValue = computed(() => {
+  if (!hasValue.value) return '--';
   if (props.value >= 1000) return props.value.toFixed(0);
   return props.value.toFixed(props.value % 1 === 0 ? 0 : 2);
 });
@@ -133,16 +142,16 @@ const progressStyle = computed(() => ({
   white-space: nowrap;
 }
 .ring-value {
-  font-size: 20px;
+  font-size: var(--font-xl);
   font-weight: 700;
   line-height: 1;
 }
 .ring-unit {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
 }
 .ring-label-below {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-secondary);
   margin-top: 4px;
 }

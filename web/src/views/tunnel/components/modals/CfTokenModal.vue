@@ -1,9 +1,10 @@
 <template>
   <n-modal
     :show="show"
+    class="modal-fit"
     preset="card"
     :title="isNew ? '新建 Cloudflare 隧道' : `编辑 ${nameInput}`"
-    style="width: 560px; max-width: calc(100vw - 32px)"
+    style="--modal-w: 560px"
     @update:show="emit('update:show', $event)"
   >
     <n-space vertical :size="10">

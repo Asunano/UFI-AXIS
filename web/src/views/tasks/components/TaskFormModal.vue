@@ -1,11 +1,12 @@
 <template>
   <n-modal
     :show="show"
+    class="modal-fit"
     preset="dialog"
     :title="formTitle"
     :positive-text="editingId ? '保存' : '创建'"
     negative-text="取消"
-    style="width: 520px"
+    style="--modal-w: 520px; --modal-h: 720px"
     @update:show="(v: boolean) => emit('update:show', v)"
     @positive-click="onPositiveClick"
   >
@@ -20,6 +21,7 @@
       </n-form-item>
       <n-form-item v-if="isToggleAction" label="目标状态">
         <div class="toggle-param">
+          <!-- ui-baseline-allow: 弹窗表单行内开关，右侧紧跟「启用/禁用」文案，不属于整行设置项 -->
           <n-switch v-model:value="form.enabled" />
           <span class="toggle-label">{{ form.enabled ? '启用' : '禁用' }}</span>
         </div>
@@ -363,10 +365,22 @@ function buildCron(): string | null {
   }
 }
 const schedulePreview = computed(() => {
-  const hm = `${String(form.hour ?? 0).padStart(2, '0')}:${String(form.minute ?? 0).padStart(2, '0')}`;
+  const h = Number(form.hour) || 0;
+  const m = Number(form.minute) || 0;
+  const hm = `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
   switch (form.scheduleType) {
-    case 'once':
-      return `${hm}（仅一次）`;
+    case 'once': {
+      /**
+       * 「仅一次」下发的 cron 是 null（`5 * * * *` 那类重复语义一概没有），core 走的是
+       * 旧路径：按 hour:minute 取**最近的一次** —— 今天还没到就是今天，否则明天
+       * （TaskScheduler.getNextTriggerTimeMillis）。原来这里只显示时分，用户无从判断是哪天，
+       * 于是「下次执行」看起来像每天。这里把「今天/明天」算出来显示，**下发字段一个没动**。
+       */
+      const now = new Date();
+      const minutesNow = now.getHours() * 60 + now.getMinutes();
+      const due = h * 60 + m > minutesNow;
+      return `${due ? '今天' : '明天'} ${hm}（仅一次，触发后自动禁用）`;
+    }
     case 'daily':
       return `每天 ${hm}`;
     case 'weekly': {
@@ -486,7 +500,7 @@ function prefillFromRule(r: Record<string, any>) {
   form.targetType = tp.targetType || '5G';
   form.rsrp = Number(tp.rsrp ?? -110);
   form.levelPercent = Number(tp.levelPercent ?? 20);
-  form.cooldownSec = Math.max(0, Math.round((r.cooldownMs || 60000) / 1000));
+  form.cooldownSec = Math.max(0, Math.round((r.cooldownMs ?? 60000) / 1000));
 }
 function prefillFromPreset(p: Record<string, any>) {
   editingId.value = null;

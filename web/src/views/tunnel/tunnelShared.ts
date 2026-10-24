@@ -35,8 +35,26 @@ export function errText(e: any, fallback: string): string {
 /**
  * 状态文案。只有异常态需要它 —— 运行/停止由列表行左侧的状态点表达
  * （2026-09-21 行版式重排后，原先那个 `statusTagType()` 已无消费方，一并删除）。
+ *
+ * 2026-10-22：比较一律走 `statusKey()` 归一化。core 侧写的是 `Running/Stopped/Error`，
+ * 但旧代码在 3 处用 `it.status === 'Error'` 直接比较，一旦哪天大小写变了（或来自
+ * 不同引擎的 `error`），异常点与异常标签会**同时静默消失** —— 那是把故障显示成健康。
+ * 认不出的键显示「未知」，原始值由调用方放进 title。
  */
+const STATUS_LABELS: Record<string, string> = { running: '运行中', stopped: '已停止', error: '异常' };
+
+/** 归一化后的状态键（小写、去空白）。空值返回空串 */
+export function statusKey(s: unknown): string {
+  return String(s ?? '')
+    .trim()
+    .toLowerCase();
+}
+
+/** 是否异常态（归一化比较，不再依赖调用方记得大小写） */
+export function isErrorStatus(s: unknown): boolean {
+  return statusKey(s) === 'error';
+}
+
 export function statusLabel(s: string): string {
-  const map: Record<string, string> = { Running: '运行中', Stopped: '已停止', Error: '异常' };
-  return map[s] || s;
+  return STATUS_LABELS[statusKey(s)] ?? '未知';
 }

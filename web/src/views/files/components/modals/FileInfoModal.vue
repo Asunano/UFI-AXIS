@@ -1,5 +1,13 @@
 <template>
-  <n-modal :show="show" preset="card" title="文件信息" style="width: 400px" @update:show="emit('update:show', $event)">
+  <!-- 宽高交给全局 `.modal-fit`（360px 视口下不再出屏，且矮屏头尾始终可见） -->
+  <n-modal
+    :show="show"
+    preset="card"
+    title="文件信息"
+    class="modal-fit"
+    style="--modal-w: 400px"
+    @update:show="emit('update:show', $event)"
+  >
     <div v-if="info" class="info-grid">
       <InfoRow label="名称" :value="info.name" />
       <InfoRow label="路径" :value="info.path" />

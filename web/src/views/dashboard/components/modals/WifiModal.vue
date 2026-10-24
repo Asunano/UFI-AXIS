@@ -3,14 +3,19 @@
     :show="show"
     preset="card"
     title="WiFi 设置"
-    style="width: 460px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 460px"
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <div class="modal-form-col">
-      <div class="form-item">
-        <n-switch v-model:value="wifiForm.enabled" />
-        <span class="form-inline-label">启用 WiFi</span>
-      </div>
+      <!-- 整行带说明的开关走 ToggleRow（§3 家规「开关三版式各归其位」）：
+           这两项都是「一行一句话」的语义，不是两列栅格里的紧凑格 -->
+      <ToggleRow
+        label="启用 WiFi"
+        description="保存后下发；切换这个开关会重启 WiFi 模块，已连接设备会短暂掉线"
+        :model-value="wifiForm.enabled"
+        @update:model-value="(v: boolean) => (wifiForm.enabled = v)"
+      />
       <div class="form-item">
         <label>SSID</label>
         <n-input v-model:value="wifiForm.ssid" placeholder="网络名称" size="small" />
@@ -45,11 +50,13 @@
              本弹窗**没有频段控件**（频段是独立动作，走网络页的 WifiEditModal），不要在这里加。 -->
         <n-select v-model:value="wifiForm.maxStaNum" :options="maxStaNumOptions" size="small" />
       </div>
-      <div class="form-item">
-        <!-- 开=隐藏（broadcast_disabled=1），关=广播。别按"广播开关"理解，值是反的 -->
-        <n-switch v-model:value="wifiForm.broadcastHidden" />
-        <span class="form-inline-label">隐藏 SSID（不广播）</span>
-      </div>
+      <!-- 开=隐藏（broadcast_disabled=1），关=广播。别按"广播开关"理解，值是反的 -->
+      <ToggleRow
+        label="隐藏 SSID（不广播）"
+        description="开启后该网络不出现在扫描列表里，需要手动输入 SSID 才能连接"
+        :model-value="wifiForm.broadcastHidden"
+        @update:model-value="(v: boolean) => (wifiForm.broadcastHidden = v)"
+      />
     </div>
     <template #footer>
       <n-space justify="end">
@@ -63,6 +70,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch } from 'vue';
 import { useMessage } from 'naive-ui';
+import ToggleRow from '@/components/ToggleRow.vue';
 import {
   WIFI_AUTH_MODE_DEFAULT,
   WIFI_MAX_STA_NUM_KEEP_LABEL,
@@ -171,22 +179,18 @@ defineExpose({ notifySaved });
 .modal-form-col {
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 4px 0;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
 }
 .form-item {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
 }
 .form-item label {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-secondary);
   font-weight: 500;
 }
-.form-inline-label {
-  font-size: 13px;
-  color: var(--text-primary);
-  margin-left: 8px;
-}
+/* 原 .form-inline-label（裸开关右侧的说明文字）随两个开关改 ToggleRow 一并退役 */
 </style>

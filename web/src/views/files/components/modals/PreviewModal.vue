@@ -3,9 +3,8 @@
     :show="show"
     preset="card"
     :title="file?.name || '预览'"
-    class="preview-modal"
-    style="width: min(960px, 94vw)"
-    :content-style="{ maxHeight: '86vh', display: 'flex', flexDirection: 'column' }"
+    class="modal-fit preview-modal"
+    style="--modal-w: 960px; --modal-h: 860px"
     @update:show="emit('update:show', $event)"
   >
     <n-spin :show="loading" class="preview-spin">
@@ -140,7 +139,6 @@
                     <path v-if="volume <= 0" fill="currentColor" :d="VOL_ICON_MUTE" />
                     <path v-else-if="volume < 0.5" fill="currentColor" :d="VOL_ICON_LOW" />
                     <path v-else fill="currentColor" :d="VOL_ICON_HIGH" />
-                    />
                   </svg>
                 </button>
                 <div class="volume-slot">
@@ -225,9 +223,10 @@
 /**
  * 媒体预览。
  *
- * 视频：只用原生 <video controls>（自带播放/进度/音量/全屏），底部不再叠重复按钮。
+ * 视频：统一走 `VideoPlayer`（格式分档 / customType / 字幕 / 错误兜底都在它里面），
+ *       这里不再自绘 `<video>`，也不再另起一层文件名。
  * 音频：Apple Music 式版式 —— 左列大封面 + 标题层次 + 细轨进度 + 大播放键，右列歌词。
- *       进度/音量坚持用原生 <input type="range">（填充色靠 accent-color），不引第三方 slider。
+ *       进度/音量坚持用原生 `<input type="range">`（填充色靠自绘渐变），不引第三方 slider。
  * 图片：缩放/平移在手势期间直接改 img.style.transform（不走 Vue 响应式重渲染），避免卡顿。
  * 图标一律用 inline SVG，全站禁止 emoji。
  */
@@ -268,7 +267,6 @@ const url = ref('');
 const kind = ref<PreviewKind>('');
 const loading = ref(false);
 
-const videoEl = ref<HTMLVideoElement | null>(null);
 const audioEl = ref<HTMLAudioElement | null>(null);
 const playing = ref(false);
 const currentTime = ref(0);
@@ -487,7 +485,6 @@ function releaseMedia() {
   duration.value = 0;
   scrubbing.value = false;
   scrubPos.value = 0;
-  videoEl.value?.pause();
   audioEl.value?.pause();
 }
 
@@ -861,22 +858,6 @@ onUnmounted(() => {
   transform: translate3d(0, 0, 0) scale(1);
   will-change: transform;
   backface-visibility: hidden;
-}
-
-/* 视频：只有原生控件 */
-.preview-video {
-  width: 100%;
-  max-height: min(58vh, 640px);
-  border-radius: 8px;
-  background: #000;
-  display: block;
-}
-.video-meta {
-  font-size: 12px;
-  color: var(--text-muted);
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
 }
 
 /* ── 音频：Apple Music 式版式 ──
@@ -1368,10 +1349,13 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
-/* 矮屏（视口高不足约 560px）：把左列那些"固定高度"的块整体压小一档。
-   封面能自己收缩，但如果标题/控制/音量维持原尺寸，收缩额度会全被它们吃掉、
-   封面直接掉到 72px 下限还是紧绷 —— 所以这里主动降一档，给封面留出比例。 */
-@media (max-height: 560px) {
+/* 矮屏：把左列那些"固定高度"的块整体压小一档。封面能自己收缩，但如果标题/控制/音量
+   维持原尺寸，收缩额度会全被它们吃掉、封面直接掉到 72px 下限还是紧绷 ——
+   所以这里主动降一档，给封面留出比例。
+   2026-10-21：断点由 `max-height: 560px` 并入全站唯一的 720 高度档（计划 §3.2 只允许
+   768 / 1024 / 720高 三档）。这些声明在 720 块里没有等价项，所以不能删 ——
+   直接抬到 720：560–720 之间只是播放器小一档，不会溢出（左列 overflow:hidden 兜底）。 */
+@media (max-height: 720px) {
   .audio-body {
     gap: var(--space-3);
   }
@@ -1429,10 +1413,10 @@ onUnmounted(() => {
   }
 }
 
-/* 窄屏：单列。歌词行用 minmax(0,1fr) 而不是给最小高度 ——
+/* 窄屏（断点 2026-10-21 由 720 并回 768）：单列。歌词行用 minmax(0,1fr) 而不是给最小高度 ——
    容器高度是确定的，行高之和只要可能超过它就会溢出，让歌词吃"剩下的"最稳；
    面板自己能滚，所以行数再多也不会把播放器顶出去。 */
-@media (max-width: 720px) {
+@media (max-width: 768px) {
   .audio-body {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);

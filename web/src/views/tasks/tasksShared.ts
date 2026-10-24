@@ -118,6 +118,8 @@ export interface RuleTemplate {
   triggerParams: Record<string, any>;
   actionType: string;
   params: Record<string, any>;
+  /** 模板自带的冷却（毫秒→秒前的秒数），不填就落表单默认 60s */
+  cooldownSec?: number;
 }
 
 export const ruleTemplates: RuleTemplate[] = [
@@ -152,6 +154,9 @@ export const ruleTemplates: RuleTemplate[] = [
     triggerParams: {},
     actionType: 'reboot',
     params: {},
+    // 之前只有 desc 写着「冷却 10 分钟」，模板里却没带这个字段 —— 建出来的规则实际是 60s，
+    // 与用户看到的说明不符。这里补上，prefillFromRuleTemplate 早就在读它了。
+    cooldownSec: 600,
   },
 ];
 
@@ -187,12 +192,24 @@ export function getTriggerIconComp(triggerType: string): Component {
 }
 
 // ── 文案辅助 ──
+/** 认得出这个动作类型吗（认不出时页面显示「未知动作」并把原始键放进 title） */
+export function isKnownAction(actionType: string): boolean {
+  return actionOptions.some((o) => o.value === actionType);
+}
+
+/** 认得出这个触发条件吗（同上） */
+export function isKnownTrigger(triggerType: string): boolean {
+  return triggerOptions.some((o) => o.value === triggerType);
+}
+
+// 兜底文案不再直出英文键：core 新增枚举时 web 会先落后一步，`signal_below` 这样的
+// 裸键上屏用户看不懂，也没法据此判断是"新功能"还是"数据坏了"。
 export function actionLabel(actionType: string): string {
-  return actionOptions.find((o) => o.value === actionType)?.label || actionType;
+  return actionOptions.find((o) => o.value === actionType)?.label ?? '未知动作';
 }
 
 export function triggerLabel(triggerType: string): string {
-  return triggerOptions.find((o) => o.value === triggerType)?.label || triggerType;
+  return triggerOptions.find((o) => o.value === triggerType)?.label ?? '未知条件';
 }
 
 export function bearerLabel(mode: string): string {
@@ -276,15 +293,16 @@ export function triggerSummary(rule: Rule): string {
     case 'traffic_total_reached':
       return `月流量 ≥ ${formatThresholdBytes(Number(tp.thresholdBytes) || 0)}`;
     case 'network_type_changed':
-      return `网络变为 ${tp.targetType || '?'}`;
+      return `网络变为 ${tp.targetType || '--'}`;
     case 'signal_below':
-      return `信号 ≤ ${tp.rsrp ?? '?'} dBm`;
+      return `信号 ≤ ${tp.rsrp ?? '--'} dBm`;
     case 'battery_below':
-      return `电量 ≤ ${tp.levelPercent ?? '?'}%`;
+      return `电量 ≤ ${tp.levelPercent ?? '--'}%`;
     case 'disconnect':
       return '蜂窝网络断开';
     default:
-      return rule.triggerType;
+      // 认不出的 triggerType 显示「未知条件」，原始键由 RuleCard 放进 title
+      return '未知条件';
   }
 }
 
@@ -301,6 +319,15 @@ export function actionSummary(rule: Rule): string {
     return cmd ? `执行命令 ${cmd.slice(0, 30)}${cmd.length > 30 ? '...' : ''}` : '执行自定义命令';
   }
   return base;
+}
+
+/**
+ * 请求失败时的人话（tasks 域与 tunnelShared.errText 同形的三行实现）。
+ * 放在这里的理由与那边一样：TasksView 与 TaskLogModal 都要用，各抄一份迟早漂。
+ */
+export function errText(e: any, fallback: string): string {
+  const d = e?.response?.data;
+  return d?.message || d?.error || fallback;
 }
 
 /** 列表里用的时间戳格式化（与 TaskLogModal 内那份同源，保持显示一致） */

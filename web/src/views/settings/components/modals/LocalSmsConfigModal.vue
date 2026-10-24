@@ -14,11 +14,14 @@
   这条渠道**不允许「不限」**（`daily_limit_min = 1`），差异由那个组件按取值域说清楚。
 -->
 <template>
+  <!-- 尺寸走 main.css 的 `.modal-fit`（2026-10-14）：内容（号码 / 规则 / 场景 / 测试结果）
+       在手机上比一屏高，改前只有宽度约束 ⇒ 卡片整块超出屏幕。现在高度封顶、内容区自滚。 -->
   <n-modal
     :show="show"
     preset="card"
     title="本机短信通知"
-    style="width: 560px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 560px"
     @update:show="emit('update:show', $event)"
   >
     <n-spin :show="loading">
@@ -171,6 +174,11 @@ const dailyLimitMax = computed(() => config.value?.daily_limit_max ?? FALLBACK_L
  *
  * 「未回报最终状态」与「无法确认」两档必须带上「可能已发出」：它们记在投递记录里是失败，
  * 但短信很可能真的发出去了。只显示一个「失败」会让用户再点一次 —— 那才是真花钱。
+ *
+ * ⚠ 已知风险（计划 §6.9 B8-7，本轮**保留不改**）：这张表是 web 手抄的设备端 verdict→中文映射，
+ * 与「web 侧不维护第二张映射表」的口径冲突 —— core 以后加一档 verdict，这里就会退化成
+ * 兜底的「未发出」，而设备其实受理了。正确解是 core 直接下发中文文案（协议层，见计划 §12 待决项 2）。
+ * 在 core 改动之前，`VERDICT_TEXT` 与 core 的 verdict 枚举**必须同批修改**。
  */
 const VERDICT_TEXT: Record<string, string> = {
   SENT: '设备已发出',
@@ -332,21 +340,8 @@ watch(
 </script>
 
 <style scoped>
-.row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 0;
-}
-.field-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+/* `.field` / `.field-label` / `.row-hint` / `.footer-bar` 已上收到 src/styles/main.css
+   （计划 §8.2 C2）：本文件原来那四份副本与全局取值逐字相同，故整体删除。 */
 .test-result {
   display: flex;
   flex-direction: column;
@@ -358,13 +353,5 @@ watch(
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
-}
-.footer-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  width: 100%;
 }
 </style>

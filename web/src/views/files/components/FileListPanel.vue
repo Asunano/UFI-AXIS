@@ -17,16 +17,18 @@
 
         <FileKindIcon :file="f" />
         <div class="file-info">
-          <span class="file-name">{{ f.name }}</span>
+          <span class="file-name" :title="f.name">{{ f.name }}</span>
           <span class="file-meta">{{ fileMeta(f) }}</span>
         </div>
 
         <!-- 多选态隐藏行内操作：批量动作已上提到顶栏的选择工具条 -->
         <div v-if="!selMode" class="file-actions" @click.stop>
-          <n-button v-if="canPreview(f)" size="tiny" text @click="emit('preview', f)">预览</n-button>
-          <n-button v-if="!f.isDirectory" size="tiny" text @click="emit('download', f)">下载</n-button>
+          <!-- 窄屏（≤768）只留「更多」：预览/下载在 ⋮ 菜单里都有，
+               把 156px 的文件名区让回来，行内也不会挤成三颗小按钮 -->
+          <n-button v-if="canPreview(f)" class="quick" size="tiny" text @click="emit('preview', f)">预览</n-button>
+          <n-button v-if="!f.isDirectory" class="quick" size="tiny" text @click="emit('download', f)">下载</n-button>
           <n-dropdown :options="fileActions(f)" trigger="click" @select="(k: string) => emit('action', k, f)">
-            <n-button size="tiny" text>
+            <n-button size="tiny" text title="更多操作">
               <template #icon
                 ><n-icon><EllipsisHorizontalOutline /></n-icon
               ></template>
@@ -34,7 +36,13 @@
           </n-dropdown>
         </div>
       </div>
-      <div v-if="!files.length && !loading" class="empty-state">空目录</div>
+      <div v-if="!files.length && !loading" class="empty-state" :class="{ 'is-failed': failed }">
+        <template v-if="failed">
+          <span>读取失败，没拿到这一层的文件列表。</span>
+          <n-button size="tiny" text type="primary" @click="emit('retry')">重试</n-button>
+        </template>
+        <template v-else>空目录</template>
+      </div>
     </div>
   </n-spin>
 </template>
@@ -49,6 +57,9 @@
  *  · `selMode + selectedPaths` —— **多选**模式下的勾选集合（批量复制/移动/删除的输入）。
  * 多选态下单选高亮不再参与渲染，否则同一行会出现两种高亮叠加。
  *
+ * 空态与失败态**必须分开**：只说「空目录」会把「没读到」误导成「没有文件」，
+ * 用户会以为文件被删了。失败态给一个重试入口（`retry` 由页面接回 loadFiles）。
+ *
  * 搜索结果不再走本组件：`/search` 的结果必须显示「在哪一层目录」，
  * 而列表行只有文件名 + 元信息（`/search` 连 size 都不返回），同名文件无法区分。
  * 现在统一在 SearchModal 里呈现。
@@ -61,13 +72,15 @@ const props = withDefaults(
   defineProps<{
     files: FileEntry[];
     loading: boolean;
+    /** 上一次加载失败（与「空目录」区分，见文件头） */
+    failed?: boolean;
     selectedPath: string;
     /** 多选模式：整行点击 = 切换勾选，行内操作隐藏 */
     selMode?: boolean;
     /** 多选模式下已勾选的路径集合 */
     selectedPaths?: string[];
   }>(),
-  { selMode: false, selectedPaths: () => [] }
+  { failed: false, selMode: false, selectedPaths: () => [] }
 );
 
 const emit = defineEmits<{
@@ -77,6 +90,7 @@ const emit = defineEmits<{
   (e: 'preview', f: FileEntry): void;
   (e: 'download', f: FileEntry): void;
   (e: 'action', key: string, f: FileEntry): void;
+  (e: 'retry'): void;
 }>();
 
 function isSelected(f: FileEntry): boolean {
@@ -198,6 +212,9 @@ function fileActions(f: FileEntry) {
   font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
+  /* 元信息是「大小 · 时间」这类短文本，但窄屏列宽可能只有 150px：
+     允许在任意字符处断行，宁可两行也不横向撑破行 */
+  overflow-wrap: anywhere;
 }
 .file-actions {
   display: flex;
@@ -217,10 +234,36 @@ function fileActions(f: FileEntry) {
     opacity: 1;
   }
 }
+
+/**
+ * 窄屏的退化策略（2026-10-14）：
+ *   · 行内「预览 / 下载」隐藏 —— 它们在 ⋮ 菜单里是同一套动作（见 fileActions），
+ *     不是丢功能，只是把位置让给文件名；
+ *   · 行距收紧一档，让一屏多显示一行；
+ *   · 文件名仍用 ellipsis（长名不换行撑高行），悬停/长按有 title 看全名。
+ *
+ * 断点 2026-10-21 由 480 并回 768（全站只留 768/1024 两档）。
+ */
+@media (max-width: 768px) {
+  .file-actions .quick {
+    display: none;
+  }
+  .file-item {
+    padding: var(--space-2);
+  }
+}
 .empty-state {
   padding: 48px 16px;
   text-align: center;
   color: var(--text-muted);
   font-size: var(--font-md);
+}
+/* 失败态：一句话 + 一个重试入口，竖排居中 */
+.empty-state.is-failed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
 }
 </style>

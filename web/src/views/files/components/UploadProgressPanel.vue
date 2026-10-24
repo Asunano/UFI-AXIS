@@ -27,7 +27,9 @@
       <div v-for="t in tasks" :key="t.id" class="up-row">
         <div class="up-row-top">
           <span class="up-name" :title="t.name">{{ t.name }}</span>
-          <span class="up-state" :class="stateClass(t)">{{ stateText(t) }}</span>
+          <span class="up-state" :class="progressStateClass(t.status)">{{
+            progressStateText(t.status, percentOf(t))
+          }}</span>
           <n-button
             v-if="t.status === 'pending' || t.status === 'uploading'"
             size="tiny"
@@ -35,6 +37,11 @@
             @click="emit('cancel', t.id)"
           >
             取消
+          </n-button>
+          <!-- 失败项的「重试」与批量面板的 retry-item 对齐：单项重传，不必重新选一遍文件。
+               超限被拦下的那些没有 File 引用（从来没过入队），所以只看 retryable。 -->
+          <n-button v-else-if="t.status === 'error' && t.retryable" size="tiny" quaternary @click="emit('retry', t.id)">
+            重试
           </n-button>
         </div>
         <n-progress
@@ -55,11 +62,14 @@
  * 上传进度面板。
  *
  * 纯展示 + 意图上抛：队列、XHR、重试全在 `useFileUpload` 里，这里只读 tasks。
+ * 状态文案与状态类走 `filesShared` 的那一份（与 `BatchProgressPanel` 共用）：
+ * 两处原先各写一套 switch，文案已经漂成「排队中 / 待处理」「完成 / 成功」。
  * 之所以做成常驻浮层而不是 `message.loading` 转圈：一次可以选多个文件，
  * 而 message 只能显示一行、也说不清"哪一个失败了"。
  */
 import { computed } from 'vue';
 import { formatBytes } from '@/composables/utils';
+import { progressStateClass, progressStateText } from '../filesShared';
 import type { UploadTask } from '../useFileUpload';
 
 const props = defineProps<{
@@ -77,6 +87,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'cancel', id: number): void;
   (e: 'cancel-all'): void;
+  (e: 'retry', id: number): void;
   (e: 'clear'): void;
   (e: 'close'): void;
 }>();
@@ -87,28 +98,6 @@ const headText = computed(() => {
   if (props.failedCount) return `上传结束：成功 ${props.doneCount}，失败 ${props.failedCount}`;
   return `上传完成 ${props.doneCount} / ${total}`;
 });
-
-function stateText(t: UploadTask): string {
-  switch (t.status) {
-    case 'pending':
-      return '排队中';
-    case 'uploading':
-      return `${props.percentOf(t)}%`;
-    case 'done':
-      return '完成';
-    case 'canceled':
-      return '已取消';
-    default:
-      return '失败';
-  }
-}
-
-function stateClass(t: UploadTask): string {
-  if (t.status === 'error') return 'is-error';
-  if (t.status === 'done') return 'is-done';
-  if (t.status === 'canceled') return 'is-muted';
-  return '';
-}
 
 /** 副行：传输量 + 速率；失败时换成原因（用户此刻要的是原因，不是又传了多少） */
 function subText(t: UploadTask): string {
@@ -159,7 +148,7 @@ function subText(t: UploadTask): string {
 /* 上限说明：贴在头部下方，与列表之间不另加分隔线（头部那条已经断开了） */
 .up-limit {
   padding: 6px 12px 0;
-  font-size: var(--font-xs, 11px);
+  font-size: var(--font-xs);
   color: var(--text-muted);
 }
 

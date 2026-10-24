@@ -1,5 +1,5 @@
 <template>
-  <n-modal v-model:show="show" preset="card" title="WiFi 休眠定时" style="width: 420px; max-width: calc(100vw - 32px)">
+  <n-modal v-model:show="show" preset="card" title="WiFi 休眠定时" class="modal-fit" style="--modal-w: 420px">
     <n-spin :show="sleepLoading">
       <div class="sleep-body">
         <div class="hint-text">空闲超过设定时长后关闭 WiFi；填 0 表示永不休眠。单位是分钟。</div>
@@ -55,11 +55,7 @@ const sleepTime = computed({
 </script>
 
 <style scoped>
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
+/* `.modal-footer` 已上收到 src/styles/main.css（计划 §8.2 C2），本文件副本与全局逐字相同 */
 .sleep-body {
   display: flex;
   flex-direction: column;

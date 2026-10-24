@@ -32,7 +32,11 @@
       </div>
 
       <!-- 上行/下行的名称与实时值已在卡头的 tag 里，legend 关掉免得说两遍 -->
+      <div class="chart-unit-hint">纵轴：KB/s（下行 · 上行）</div>
+      <!-- 0 点时画布是空的，与「读取失败」长得一样：给一句「等待采样…」把两者分开 -->
+      <div v-if="!chartHasPoints" class="chart-empty">等待采样…</div>
       <ScrollingLineChart
+        v-else
         class="chart-container"
         :series="trafficSeries"
         :window-ms="TRAFFIC_WINDOW_MS"
@@ -53,7 +57,10 @@
       </div>
 
       <!-- 四条线必须有颜色索引，legend 打开 -->
+      <div class="chart-unit-hint">纵轴：左轴 dBm（RSRP / RSSI）· 右轴 dB（RSRQ / SINR）</div>
+      <div v-if="!chartHasPoints" class="chart-empty">等待采样…</div>
       <ScrollingLineChart
+        v-else
         class="chart-container"
         :series="signalSeries"
         :window-ms="SIGNAL_WINDOW_MS"
@@ -187,6 +194,15 @@ function pushSignalPoint(data: Record<string, any> | null) {
 }
 
 // ── 轴范围与系列 ──
+/**
+ * 当前 Tab 是否已经有采样点（0 点时画布空白，与「读取失败」长得一样，需要一句占位）。
+ * 只区分「完全没有」与「有数据」：信号图是 3min 窗口、10s 一帧，刚进页面一两分钟里
+ * 本就只有一两个点，有 1 个点就应当正常出图。
+ */
+const chartHasPoints = computed(() =>
+  netDetailTab.value === 'traffic' ? trafficHistory.value.length > 0 : signalHistory.value.length > 0
+);
+
 const trafficRange = computed<[number, number]>(() => {
   const speeds = trafficHistory.value.flatMap((p) => [p.rx, p.tx]);
   return [0, niceCeil(Math.max(TRAFFIC_FLOOR_KBPS, ...speeds) * 1.25)];
@@ -313,7 +329,29 @@ useWsTopics({
   flex-wrap: wrap;
   justify-content: center;
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: var(--space-3);
+}
+
+/* 量纲说明：刻度本身是紧凑写法（`512K` / `48`），单位放在这里说一次，
+   免得每条刻度都带单位把轴标签槽撑宽（手机竖屏那槽已经吃掉三分之一画幅）。 */
+.chart-unit-hint {
+  margin-bottom: var(--space-2);
+  font-size: var(--font-xs);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+/* 0 点占位：与图表区同尺寸的虚线块，明确说「还没采到样」而不是失败 */
+.chart-empty {
+  flex: 1;
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-base);
+  color: var(--text-muted);
+  border: 1px dashed var(--border-subtle);
+  border-radius: var(--radius-sm);
 }
 
 /* 高度不再写死：宽屏下吃掉卡片剩余空间，min-height 兜住极矮窗口 */

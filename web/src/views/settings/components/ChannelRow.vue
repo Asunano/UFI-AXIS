@@ -10,7 +10,8 @@
         <div v-if="lines.length" class="channel-row-facts">
           <span v-for="l in lines" :key="l.label" class="channel-fact">
             <span class="row-hint">{{ l.label }}</span>
-            <span class="channel-fact-value">{{ l.value }}</span>
+            <!-- title 是截断的兜底：340px 上限会把长地址/号码切掉，悬停能看全文（2026-10-21） -->
+            <span class="channel-fact-value" :title="l.value">{{ l.value }}</span>
           </span>
         </div>
         <span v-if="note" class="row-hint">{{ note }}</span>
@@ -74,6 +75,9 @@ withDefaults(
 </script>
 
 <style scoped>
+/* 模板里的 `.row-hint`（meta / 摘要标签 / note / 最近测试）走 main.css 的全局类。
+   2026-10-21 之前本文件没有定义它，而 scoped 样式不会跨组件生效 —— 那几处当时是**无样式**的，
+   看起来与正文同色同字号。上收（计划 §8.2 C2）之后才真正拿到 12px 次要色，这是修正而非改版。 */
 .channel-row {
   padding: 14px 0;
   border-top: 1px solid var(--border-subtle);
@@ -124,7 +128,9 @@ withDefaults(
   gap: 6px;
   min-width: 0;
 }
-/* 地址与号码可能很长：单行截断，完整值在配置弹窗里可见可改 */
+/* 地址与号码可能很长：单行截断，完整值在配置弹窗里可见可改；
+   再加上模板里的 `title`，不必打开弹窗也能悬停读到全文（2026-10-21）。
+   340px 是**桌面端**上限，窄屏那条在下面的 768px 档里放宽到 100%。 */
 .channel-fact-value {
   font-size: 13px;
   color: var(--text-primary);

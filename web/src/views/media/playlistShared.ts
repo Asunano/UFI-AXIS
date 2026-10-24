@@ -61,10 +61,7 @@ export async function fetchPlaylists(api: PlaylistApiClient): Promise<PlaylistEn
   return data?.playlists ?? [];
 }
 
-export async function fetchPlaylistItems(
-  api: PlaylistApiClient,
-  id: string
-): Promise<PlaylistItemsResponse | null> {
+export async function fetchPlaylistItems(api: PlaylistApiClient, id: string): Promise<PlaylistItemsResponse | null> {
   const { data } = await api.get<PlaylistItemsResponse>(Endpoints.playlists.items(id));
   return data ?? null;
 }
@@ -83,11 +80,7 @@ export async function deletePlaylist(api: PlaylistApiClient, id: string): Promis
   await api.delete(Endpoints.playlists.one(id));
 }
 
-export async function addPlaylistItems(
-  api: PlaylistApiClient,
-  id: string,
-  paths: string[]
-): Promise<AddResult> {
+export async function addPlaylistItems(api: PlaylistApiClient, id: string, paths: string[]): Promise<AddResult> {
   const { data } = await api.post<AddResult>(Endpoints.playlists.items(id), { paths });
   return { added: data?.added ?? 0, skipped: data?.skipped ?? 0, truncated: data?.truncated ?? false };
 }
@@ -98,11 +91,7 @@ export async function addPlaylistItems(
  * body 走 axios 的 `data` 选项 —— DELETE 的请求体只能这么带。core 同时也接受
  * `?path=` 重复参数（app 端用那种），两边不必一致。
  */
-export async function removePlaylistItems(
-  api: PlaylistApiClient,
-  id: string,
-  paths: string[]
-): Promise<number> {
+export async function removePlaylistItems(api: PlaylistApiClient, id: string, paths: string[]): Promise<number> {
   const { data } = await api.delete<{ removed?: number }>(Endpoints.playlists.items(id), {
     data: { paths },
   });

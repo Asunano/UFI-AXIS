@@ -3,8 +3,8 @@
     :show="show"
     preset="card"
     :title="title"
-    class="text-editor-modal"
-    style="width: min(920px, 94vw)"
+    class="modal-fit text-editor-modal"
+    style="--modal-w: 920px; --modal-h: 720px"
     :content-style="contentStyle"
     @update:show="emit('update:show', $event)"
   >

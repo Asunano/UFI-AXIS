@@ -29,6 +29,15 @@ export const PRIMARY_STORAGE = '/storage/emulated/0';
 /** `/sdcard` 是 primary 的别名，展示与导航统一映射到 [PRIMARY_STORAGE] */
 export const SDCARD_ALIAS = '/sdcard';
 
+/**
+ * 远端存储源的路径前缀（2026-10-14 补）。
+ *
+ * 与 core 的 `FileProviderRegistry.REMOTE_PREFIX` **同值**，客户端路径形态是
+ * `remote:<sourceId>/<相对路径>`（`toClientPath` 拼出来的就是它）。
+ * 改这里必须同步改 core —— 两边漂了的表现是"远端源点进去报路径非法"。
+ */
+export const REMOTE_PREFIX = 'remote:';
+
 /** 把 `/sdcard` 别名归一到 `/storage/emulated/0`，避免同目录双路径。 */
 export function normalizePath(p: string): string {
   if (!p) return PRIMARY_STORAGE;
@@ -52,6 +61,11 @@ export function isPrimaryStoragePath(p: string): boolean {
  */
 export function isAllowedRoot(p: string): boolean {
   const n = normalizePath(p);
+  // 远端存储源（2026-10-14 补）：`remote:<sourceId>[/相对路径]`，与 core 的
+  // FileProviderRegistry.REMOTE_PREFIX 同值。文件 API 全线接受这种路径
+  // （list / upload / download / rename / delete / mkdir / search 都走 registry.resolve），
+  // 所以远端源与本地卷共用同一套浏览逻辑 —— 少了这一条，点远端源会报"不在可访问范围内"。
+  if (n.startsWith(REMOTE_PREFIX)) return n.length > REMOTE_PREFIX.length;
   if (isPrimaryStoragePath(n)) return true;
   // 其它卷：/storage/XXXX-XXXX（SD 卡）及其子目录
   if (n === '/storage') return false;
@@ -74,6 +88,23 @@ export interface Crumb {
  */
 export function breadcrumbSegments(path: string): Crumb[] {
   const n = normalizePath(path);
+  // 远端存储源（2026-10-14 补）：`remote:<id>[/相对路径]`。
+  // 第一段必须保留 `remote:<id>` **整体** —— 按 '/' 拆会拼出 `/remote:abc` 这种非法路径，
+  // 点面包屑直接报"路径非法"。
+  if (n.startsWith(REMOTE_PREFIX)) {
+    const rest = n.slice(REMOTE_PREFIX.length);
+    const slash = rest.indexOf('/');
+    const id = slash < 0 ? rest : rest.slice(0, slash);
+    const crumbs: Crumb[] = [{ label: `远端：${id}`, path: `${REMOTE_PREFIX}${id}/` }];
+    if (slash >= 0) {
+      let acc = `${REMOTE_PREFIX}${id}`;
+      for (const part of rest.slice(slash).split('/').filter(Boolean)) {
+        acc += `/${part}`;
+        crumbs.push({ label: part, path: acc });
+      }
+    }
+    return crumbs;
+  }
   if (isPrimaryStoragePath(n)) {
     const crumbs: Crumb[] = [{ label: '内部存储', path: PRIMARY_STORAGE }];
     const rest = n.slice(PRIMARY_STORAGE.length);
@@ -186,7 +217,18 @@ export function relativeDirLabel(dir: string, currentPath: string): string {
 
 export function formatDate(ts: number): string {
   if (!ts) return '--';
-  return new Date(ts).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const d = new Date(ts);
+  /**
+   * 同年只给「月-日 时:分」（列表元信息要短），**跨年补年份**：
+   * 原先三种字段里没有年，于是去年 3 月与今年 3 月改过的文件在列表与详情里完全同形。
+   */
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleString(
+    'zh-CN',
+    sameYear
+      ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+      : { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+  );
 }
 
 /** core diskMap 返回的全是字符串（size/used/available 已格式化，usePercent 形如 "57%"） */
@@ -535,4 +577,81 @@ export async function authHeaders(uri: string, method = 'GET'): Promise<Record<s
   const appStore = useAppStore();
   const signed = await (await loadDeviceIdentity()).signRequest(method, uri);
   return appStore.token ? { Authorization: `Bearer ${appStore.token}`, ...signed } : { ...signed };
+}
+
+// ── 成败判定（2026-10-21 统一到一份）──
+/**
+ * core 的写操作普遍是 **HTTP 200 + `{ success: false, error }`**，只看 HTTP 状态码会把
+ * 「目标已存在」「路径非法」这类失败当成成功。
+ *
+ * 本函数是文件域唯一的判据。它取代了原先同一个页面里并存的三套口径：
+ *   · `data?.success === false`（对，但只在一处）
+ *   · `data?.success !== false`（对，但把 `error` 原文丢了，逐项面板只能显示「操作失败」）
+ *   · `!data?.success`（错：响应缺字段时**把成功判成失败**）
+ *
+ * @param fallback 响应里没有可读原因时的兜底文案
+ * @param onError  提示出口（页面注入 `message.error`）。不传则只返回 false，
+ *                 由调用方自己决定怎么提示 / 怎么把原因带进队列。
+ * @returns true = 成功
+ */
+export function assertOk(data: any, fallback: string, onError?: (msg: string) => void): boolean {
+  if (data?.success === false) {
+    onError?.(errorOf(data, fallback));
+    return false;
+  }
+  return true;
+}
+
+/** core 失败信封里的可读原因：`error` 优先，其次 `message`，都没有才用兜底文案。 */
+export function errorOf(data: any, fallback: string): string {
+  const msg = data?.error || data?.message;
+  return typeof msg === 'string' && msg.trim() ? msg : fallback;
+}
+
+// ── 存储源能力列表文案 ──
+/**
+ * `capabilities` 的展示文本。
+ *
+ * core 正常回数组；老固件可能缺字段，也可能回**字符串**。两处消费方原先各写一份，
+ * 其中一份没判字符串型（对字符串调 `.join` 会抛 TypeError，整块列表渲染崩掉）。
+ */
+export function capsTextOf(source: any): string {
+  const caps = source?.capabilities;
+  if (Array.isArray(caps)) {
+    return caps.filter((c: unknown) => typeof c === 'string' && c).join(' · ');
+  }
+  if (typeof caps === 'string') return caps;
+  return '';
+}
+
+// ── 进度行文案（上传面板与批量面板共用）──
+/**
+ * 两条队列的状态集合不同（上传多一个 `uploading`、批量多一个 `running`），但**渲染口径必须一致**：
+ * 两处原先各写一份 `stateText` / `stateClass`，文案已经漂成「排队中 / 待处理」「完成 / 成功」。
+ * 这里合成一份。`percent` 只对「进行中」有意义（上传有字节进度，批量没有）。
+ */
+export type ProgressState = 'pending' | 'running' | 'uploading' | 'done' | 'error' | 'canceled';
+
+export function progressStateText(status: ProgressState, percent?: number): string {
+  switch (status) {
+    case 'pending':
+      return '等待中';
+    case 'running':
+    case 'uploading':
+      return percent == null ? '进行中' : `${percent}%`;
+    case 'done':
+      return '完成';
+    case 'canceled':
+      return '已取消';
+    default:
+      return '失败';
+  }
+}
+
+/** 进度行状态样式（对应 `.up-state` / `.bp-state` 的 is-* 三档，两文件同名同值）。 */
+export function progressStateClass(status: ProgressState): string {
+  if (status === 'error') return 'is-error';
+  if (status === 'done') return 'is-done';
+  if (status === 'canceled') return 'is-muted';
+  return '';
 }

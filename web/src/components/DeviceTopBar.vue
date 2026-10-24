@@ -1,11 +1,9 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
-import { useRouter } from 'vue-router';
 import { useDashboardStore } from '@/stores/dashboard';
 import { getApiClient } from '@/composables/useApi';
 import { formatUptime, networkTypeWithBand, signalColor, get } from '@/composables/utils';
 
-const router = useRouter();
 const dashboardStore = useDashboardStore();
 
 // ── 设备概览（型号 + 悬浮详情，复用 summary.device_info）──
@@ -45,21 +43,58 @@ const imeiText = computed(() => {
   return '--';
 });
 
-async function loadDeviceExtra(): Promise<boolean> {
-  let ok = true;
+/**
+ * 四个 `/api/device/*` 接口（version / magisk / selinux / identity）的失败标记。
+ *
+ * 之前 catch 里什么都不做，于是「请求失败」和「设备没有这个字段」在面板上是同一个样子（都是 `--`），
+ * 用户分不出该刷新还是该接受。现在按字段记下来，缺值时显示「未取到」。
+ */
+const versionFailed = ref(false);
+const magiskFailed = ref(false);
+const selinuxFailed = ref(false);
+const imeiFailed = ref(false);
+
+/** 单个请求的结果。失败只影响自己那几行，不连带把并发里另外两个的已取到的值丢掉。 */
+async function settle<T>(p: Promise<T>): Promise<{ ok: boolean; data: any }> {
   try {
-    const api = getApiClient();
-    const [{ data: ver }, { data: mag }, { data: sel }] = await Promise.all([
-      api.get('/api/device/version'),
-      api.get('/api/device/magisk'),
-      api.get('/api/device/selinux'),
-    ]);
-    const parts = [ver.language, ver.cr_version, ver.wa_inner_version].filter(Boolean);
-    firmwareVersion.value = parts.join(' / ') || '--';
-    magiskStatus.value = mag.hasRoot ? `已 Root (${mag.magiskVersion || '未知版本'})` : '未 Root';
-    selinuxStatus.value = sel.selinux || '--';
+    const res = (await p) as { data?: any };
+    return { ok: true, data: res?.data };
   } catch {
-    ok = false; /* 静默，交给调用方决定是否下次重试 */
+    return { ok: false, data: null };
+  }
+}
+
+async function loadDeviceExtra(): Promise<boolean> {
+  const api = getApiClient();
+  versionFailed.value = false;
+  magiskFailed.value = false;
+  selinuxFailed.value = false;
+  // 三个请求仍然并发（与改前的 Promise.all 同一时刻发出），只是各自结算
+  const [ver, mag, sel] = await Promise.all([
+    settle(api.get('/api/device/version')),
+    settle(api.get('/api/device/magisk')),
+    settle(api.get('/api/device/selinux')),
+  ]);
+
+  if (ver.ok) {
+    const v = ver.data ?? {};
+    const parts = [v.language, v.cr_version, v.wa_inner_version].filter(Boolean);
+    firmwareVersion.value = parts.join(' / ') || '--';
+  } else {
+    versionFailed.value = true;
+  }
+
+  if (mag.ok) {
+    const m = mag.data ?? {};
+    magiskStatus.value = m.hasRoot ? `已 Root (${m.magiskVersion || '未知版本'})` : '未 Root';
+  } else {
+    magiskFailed.value = true;
+  }
+
+  if (sel.ok) {
+    selinuxStatus.value = sel.data?.selinux || '--';
+  } else {
+    selinuxFailed.value = true;
   }
 
   // 如果 version 接口没拿到固件版本，尝试从 device_info.versions 取
@@ -70,7 +105,7 @@ async function loadDeviceExtra(): Promise<boolean> {
       firmwareVersion.value = parts.join(' / ') || '--';
     }
   }
-  return ok;
+  return ver.ok && mag.ok && sel.ok;
 }
 
 async function loadDeviceIdentity(): Promise<boolean> {
@@ -78,8 +113,10 @@ async function loadDeviceIdentity(): Promise<boolean> {
     const api = getApiClient();
     const { data } = await api.get('/api/device/identity');
     imeiFromIdentity.value = data?.imei || null;
+    imeiFailed.value = false;
     return true;
   } catch {
+    imeiFailed.value = true;
     return false;
   }
 }
@@ -106,10 +143,32 @@ async function ensureDeviceDetail() {
   }
 }
 
-/** 值缺失且正在拉取时给个占位，避免面板一打开满屏 `--` */
-function orPending(v: string): string {
-  return v === '--' && detailPending.value ? '加载中…' : v;
+/** 一项详情值的显示态：真实值 / 加载中 / 未取到 / 设备无此字段（`--`）。 */
+interface FieldState {
+  /** 要显示的文字 */
+  display: string;
+  /** true = 不是真实值（要压暗，且不能套状态徽标） */
+  placeholder: boolean;
 }
+
+/**
+ * 让「没取到」与「设备没有这个字段」在界面上分开。
+ *
+ * 判据顺序不能换：`--` 且正在拉 → 加载中…；`--` 且这次请求失败 → 未取到；
+ * 其余（含设备确实没给该字段）→ `--`。已知字段有值时一律显示真实值，
+ * 哪怕同时有别的接口失败（部分失败不该把已拿到的值也抹成占位）。
+ */
+function fieldStateOf(text: string, failed: boolean): FieldState {
+  if (text !== '--') return { display: text, placeholder: false };
+  if (detailPending.value) return { display: '加载中…', placeholder: true };
+  if (failed) return { display: '未取到', placeholder: true };
+  return { display: '--', placeholder: true };
+}
+
+const firmwareState = computed(() => fieldStateOf(firmwareText.value, versionFailed.value));
+const selinuxState = computed(() => fieldStateOf(selinuxText.value, selinuxFailed.value));
+const magiskState = computed(() => fieldStateOf(magiskText.value, magiskFailed.value));
+const imeiState = computed(() => fieldStateOf(imeiText.value, imeiFailed.value));
 
 // ── 顶栏实时芯片 ──
 const signalInfo = computed(() => dashboardStore.realtimeSignal || null);
@@ -122,6 +181,16 @@ const signalText = computed(() => {
 const signalTint = computed(() => {
   const r = signalInfo.value?.rsrp;
   return r != null ? signalColor(Number(r)) : 'var(--text-secondary)';
+});
+/** 4 格信号：沿用 RSRP 的常用阈值，只用于顶栏小条，不参与任何业务判断。 */
+const signalLevel = computed(() => {
+  const r = Number(signalInfo.value?.rsrp);
+  if (!Number.isFinite(r)) return 0;
+  if (r >= -85) return 4;
+  if (r >= -95) return 3;
+  if (r >= -105) return 2;
+  if (r >= -115) return 1;
+  return 0;
 });
 
 const networkStatus = computed(() => get(dashboardStore.summary, 'network_status', null));
@@ -155,10 +224,6 @@ const online = computed(() => {
   // 所以这条 fallback 一直是死代码，恒为 false
   return !!get(networkStatus.value, 'network.is_connected', false);
 });
-
-function goDetail() {
-  router.push({ name: 'dashboard' });
-}
 </script>
 
 <template>
@@ -179,46 +244,40 @@ function goDetail() {
     >
       <template #trigger>
         <!--
-          2026-09-05 重排：原来是「大圆角胶囊里再套两个小圆角胶囊」，
-          三层边框 + 三层背景叠在一起，顶栏本来就窄，看着很碎。
-          现在只保留最外层一个容器，内部改成用 1px 竖分隔线切段、没有任何内层底色，
-          颜色只留给状态点和信号值（都带语义）。
+          2026-10-24：从「分段胶囊」改成无底色内联状态。
+          设备图标、型号、在线点、制式、信号和展开箭头排成一行；
+          不再给整条加底色，也不再给图标套绿色方块。
         -->
-        <div class="dtb-bar">
-          <!-- 设备主体 + 在线状态点 -->
-          <div class="dtb-seg dtb-seg-device">
-            <span class="dtb-ico" aria-hidden="true">
-              <svg
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              >
-                <rect x="6" y="2" width="12" height="20" rx="2.5" />
-                <line x1="11" y1="18" x2="13" y2="18" />
-              </svg>
+        <button type="button" class="dtb-inline" aria-label="设备状态与详情">
+          <span class="dtb-ico" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="6.5" y="2" width="11" height="20" rx="2.2" />
+              <path d="M10.5 18.5h3" />
+            </svg>
+          </span>
+          <span class="dtb-name">{{ deviceModelText }}</span>
+          <span class="dtb-dot" :class="online ? 'is-online' : 'is-offline'" :title="online ? '在线' : '离线'"></span>
+          <span class="dtb-divider" aria-hidden="true"></span>
+          <span v-if="netTypeText || signalText !== '--'" class="dtb-net">
+            <span class="dtb-signal-bars" :style="{ color: signalTint }" aria-hidden="true">
+              <i v-for="level in 4" :key="level" :class="{ on: level <= signalLevel }"></i>
             </span>
-            <span class="dtb-name">{{ deviceModelText }}</span>
-            <span class="dtb-dot" :class="online ? 'is-online' : 'is-offline'" :title="online ? '在线' : '离线'"></span>
-          </div>
-
-          <!-- 网络制式：拿不到时整段不占位，而不是显示一个空标签 -->
-          <span v-if="netTypeText" class="dtb-seg dtb-seg-net">{{ netTypeText }}</span>
-
-          <!-- 信号：值本身按强弱染色，不再套底色块 -->
-          <span class="dtb-seg">
-            <span class="dtb-val" :style="{ color: signalTint }">{{ signalText }}</span>
+            <span v-if="netTypeText" class="dtb-net-type">{{ netTypeText }}</span>
+            <span v-if="signalText !== '--'" class="dtb-signal-text">{{ signalText }}</span>
           </span>
-
-          <!-- 运行时间：移动端第一个被隐藏的段（信息价值最低） -->
-          <span class="dtb-seg dtb-seg-uptime">
-            <span class="dtb-val">{{ uptimeText }}</span>
+          <span class="dtb-chev" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+              <path d="m6 9 6 6 6-6" />
+            </svg>
           </span>
-
-          <n-button text size="tiny" type="primary" class="dtb-more" @click.stop="goDetail">详情 ›</n-button>
-        </div>
+        </button>
       </template>
       <!--
         简略设备详情。定位就是「顶栏塞不下、但值得一眼看到」的几项，不再是完整设备信息的入口：
@@ -261,36 +320,38 @@ function goDetail() {
             </div>
             <div class="dev-cell dev-cell-wide">
               <span class="dev-label">固件版本</span>
-              <span class="dev-val" :class="{ 'dev-val-pending': detailPending }">{{ orPending(firmwareText) }}</span>
+              <span class="dev-val" :class="{ 'dev-val-pending': firmwareState.placeholder }">{{
+                firmwareState.display
+              }}</span>
             </div>
             <div class="dev-cell">
               <span class="dev-label">SELinux</span>
               <span class="dev-val">
-                <span v-if="detailPending && selinuxText === '--'" class="dev-val-pending">加载中…</span>
+                <span v-if="selinuxState.placeholder" class="dev-val-pending">{{ selinuxState.display }}</span>
                 <span
                   v-else
                   class="dev-badge"
                   :class="'dev-badge-' + (selinuxStatus === 'Enforcing' ? 'warn' : 'ok')"
-                  >{{ selinuxText }}</span
+                  >{{ selinuxState.display }}</span
                 >
               </span>
             </div>
             <div class="dev-cell">
               <span class="dev-label">Magisk</span>
               <span class="dev-val">
-                <span v-if="detailPending && magiskText === '--'" class="dev-val-pending">加载中…</span>
+                <span v-if="magiskState.placeholder" class="dev-val-pending">{{ magiskState.display }}</span>
                 <span
                   v-else
                   class="dev-badge"
                   :class="'dev-badge-' + (magiskStatus.includes('已 Root') ? 'root' : 'info')"
-                  >{{ magiskText }}</span
+                  >{{ magiskState.display }}</span
                 >
               </span>
             </div>
             <div class="dev-cell dev-cell-wide">
               <span class="dev-label">IMEI</span>
-              <span class="dev-val" :class="detailPending && imeiText === '--' ? 'dev-val-pending' : 'dev-val-mono'">{{
-                orPending(imeiText)
+              <span class="dev-val" :class="imeiState.placeholder ? 'dev-val-pending' : 'dev-val-mono'">{{
+                imeiState.display
               }}</span>
             </div>
           </div>
@@ -306,130 +367,156 @@ function goDetail() {
 .device-top-bar {
   display: inline-flex;
 }
-.dtb-bar {
-  display: inline-flex;
-  align-items: stretch;
-  /* 段与段之间不留 gap：间距由每段自己的 padding + 竖分隔线负责，
-     这样分隔线能贴满整条的高度、不出现断头 */
-  gap: 0;
-  padding: 0 6px 0 0;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  cursor: default;
-  font-size: 13px;
-  line-height: 1;
-  transition:
-    background 0.2s ease,
-    border-color 0.2s ease;
-}
-.dtb-bar:hover {
-  background: var(--surface-hover);
-  border-color: var(--border-subtle);
-}
-
-/* 一段信息。除第一段外都带左侧发丝线 —— 这是唯一的分隔手段，不再靠内层胶囊 */
-.dtb-seg {
+.dtb-inline {
+  height: 40px;
+  max-width: 260px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 7px 10px;
-  white-space: nowrap;
-}
-.dtb-seg + .dtb-seg {
-  border-left: 1px solid var(--border-subtle);
-}
-.dtb-seg-device {
   gap: 7px;
-  padding-left: 11px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+  min-width: 0;
+  text-align: left;
+  transition: background 0.16s ease;
 }
-
+.dtb-inline:hover {
+  background: var(--surface-hover);
+}
 .dtb-ico {
+  width: 16px;
+  height: 16px;
+  flex: none;
   display: inline-flex;
-  color: var(--accent-color);
+  color: var(--text-secondary);
 }
 .dtb-ico svg {
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
 }
 .dtb-name {
-  color: var(--text-primary);
-  font-weight: 600;
-  max-width: 180px;
+  max-width: 120px;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-/* 制式：小一号、字距略开，读起来像标签但没有底色 */
-.dtb-seg-net {
-  color: var(--text-secondary);
-  font-size: 12px;
-  letter-spacing: 0.02em;
-}
-.dtb-val {
-  color: var(--text-secondary);
+  white-space: nowrap;
+  font-size: 12.5px;
   font-weight: 600;
-  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
-
-/* 在线状态点：唯一带光环的元素，离线时只压暗不发光 */
 .dtb-dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: var(--radius-pill);
   flex-shrink: 0;
 }
 .dtb-dot.is-online {
   background: var(--success);
-  box-shadow: 0 0 0 3px var(--accent-ring);
+  box-shadow: 0 0 0 2px var(--accent-ring);
 }
 .dtb-dot.is-offline {
   background: var(--text-muted);
   opacity: 0.45;
 }
-
-.dtb-more {
-  align-self: center;
-  margin-left: 6px;
-  font-size: 12px;
+.dtb-divider {
+  width: 1px;
+  height: 14px;
+  background: var(--border-subtle);
+  flex: none;
 }
-
-/*
-  移动端：**不再把信号与运行时间整块 display:none**（那是之前「有的信息看不到」的一半原因）。
-  只藏掉运行时间这一段 —— 它是四项里最不需要在顶栏盯着的，
-  型号 / 在线点 / 制式 / 信号都保留。
-
-  2026-09-19 补：这一段在 ≤768px 下**曾经是死代码** —— DefaultLayout 用
-  `v-if="!isMobile"`（isMobile = innerWidth < 768）把整个组件卸掉了，手机上
-  型号/制式/信号一个都看不到，与上面这段注释的意图正好相反。现在 DefaultLayout
-  改为在移动端把本组件移入抽屉顶部（不再卸载），所以这一段终于生效了。
-*/
-@media (max-width: 768px) {
-  .dtb-seg {
-    padding: 6px 8px;
-  }
-  .dtb-seg-device {
-    padding-left: 9px;
-  }
-  .dtb-seg-uptime {
+.dtb-net {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 10.5px;
+  line-height: 1;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.dtb-signal-bars {
+  height: 10px;
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  flex: none;
+}
+.dtb-signal-bars i {
+  width: 2px;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.22;
+}
+.dtb-signal-bars i.on {
+  opacity: 1;
+}
+.dtb-signal-bars i:nth-child(1) {
+  height: 3px;
+}
+.dtb-signal-bars i:nth-child(2) {
+  height: 5px;
+}
+.dtb-signal-bars i:nth-child(3) {
+  height: 7px;
+}
+.dtb-signal-bars i:nth-child(4) {
+  height: 9px;
+}
+.dtb-net-type {
+  max-width: 86px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dtb-signal-text {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.dtb-chev {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  color: var(--text-muted);
+  flex: none;
+}
+.dtb-chev svg {
+  width: 12px;
+  height: 12px;
+}
+@media (max-width: 1180px) {
+  .dtb-net,
+  .dtb-divider {
     display: none;
   }
   .dtb-name {
     max-width: 96px;
   }
-  .dtb-more {
-    margin-left: 2px;
+}
+@media (max-width: 900px) {
+  .dtb-inline {
+    gap: 5px;
+    padding: 0 5px;
   }
-  /* 抽屉里横向空间充裕（240px 宽），但仍可能放不下 4 段 —— 允许换行 */
-  .dtb-bar {
-    flex-wrap: wrap;
+  .dtb-name {
+    max-width: 78px;
   }
 }
-
+@media (max-width: 720px) {
+  .dtb-chev {
+    display: none;
+  }
+  .dtb-name {
+    max-width: 68px;
+  }
+}
 /* ── 设备详情面板（Popover 内）── */
 /* 阴影颜色走令牌（--shadow-color-* 自带暗色档），所以下面不再需要
    `.dark .dev-panel` 那条只为了加深阴影而存在的覆盖 */
 .dev-panel {
-  width: 320px;
+  /* 固定 320px 是桌面端的阅读宽度，但视口只有 300 多时它会顶出屏幕
+     （popover 的定位容器不会替它收窄），所以给一个随视口收缩的上限 */
+  width: min(320px, calc(100vw - 24px));
   background: var(--card-bg);
   border-radius: var(--radius-md);
   box-shadow:

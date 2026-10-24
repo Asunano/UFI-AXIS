@@ -1,46 +1,65 @@
 <template>
-  <n-modal v-model:show="show" preset="card" title="基站信息" style="width: 520px; max-width: calc(100vw - 32px)">
-    <div v-if="cellInfo?.serving_cell" class="kv-grid">
-      <InfoRow label="PCI" :value="String(cellInfo.serving_cell.pci ?? '--')" />
-      <InfoRow
-        label="EARFCN"
-        :value="String(cellInfo.serving_cell.earfcn ?? cellInfo.serving_cell.fc_number ?? '--')"
-      />
-      <InfoRow label="频段" :value="String(cellInfo.serving_cell.band ?? '--')" />
-      <InfoRow label="RSRP" :value="cellInfo.serving_cell.rsrp != null ? `${cellInfo.serving_cell.rsrp} dBm` : '--'" />
-      <InfoRow label="SINR" :value="cellInfo.serving_cell.sinr != null ? `${cellInfo.serving_cell.sinr} dB` : '--'" />
-    </div>
-    <div style="margin-top: 16px">
-      <div class="neighbor-head">
-        <span class="section-title">邻区列表 ({{ cellInfo?.neighbor_cells?.length || 0 }})</span>
-        <n-button size="tiny" text type="primary" :loading="neighborRefreshing" @click="refreshNeighborCells">
-          实时刷新
-        </n-button>
+  <n-modal v-model:show="show" preset="card" title="基站信息" class="modal-fit" style="--modal-w: 520px">
+    <n-spin :show="loading">
+      <div v-if="cellInfo?.serving_cell" class="kv-grid">
+        <InfoRow label="PCI" :value="dash(cellInfo.serving_cell.pci)" />
+        <InfoRow label="EARFCN" :value="dash(cellInfo.serving_cell.earfcn ?? cellInfo.serving_cell.fc_number)" />
+        <InfoRow label="频段" :value="dash(cellInfo.serving_cell.band)" />
+        <InfoRow
+          label="RSRP"
+          :value="cellInfo.serving_cell.rsrp != null ? `${cellInfo.serving_cell.rsrp} dBm` : '--'"
+        />
+        <InfoRow label="SINR" :value="cellInfo.serving_cell.sinr != null ? `${cellInfo.serving_cell.sinr} dB` : '--'" />
       </div>
-      <div v-if="cellInfo?.neighbor_cells?.length" class="neighbor-list">
-        <div v-for="(nc, i) in cellInfo.neighbor_cells" :key="i" class="neighbor-item">
-          <div class="neighbor-id">
-            <span class="neighbor-pci">PCI {{ nc.pci }}</span>
-            <span class="neighbor-rat" :class="{ 'neighbor-rat--nr': isNRCell(nc) }">{{ isNRCell(nc) ? '5G' : '4G' }}</span>
-          </div>
-          <div class="neighbor-metrics">
-            <span>EARFCN {{ nc.earfcn }}</span>
-            <span :class="rsrpClass(nc.rsrp)">RSRP {{ nc.rsrp }} dBm</span>
-          </div>
-          <n-button size="tiny" type="primary" secondary class="neighbor-lock" @click="lockCell(nc)">锁定</n-button>
+      <div style="margin-top: 16px">
+        <div class="neighbor-head">
+          <span class="section-title">邻区列表 ({{ cellInfo?.neighbor_cells?.length || 0 }})</span>
+          <n-button size="tiny" text type="primary" :loading="neighborRefreshing" @click="refreshNeighborCells">
+            实时刷新
+          </n-button>
         </div>
+        <!-- 三态（加载中 / 空 / 失败可重试）：读取失败时不能显示「未检测到邻区」，
+             那是把「没读到」伪装成「没有」—— 家规第 6 条。 -->
+        <div v-if="loadFailed" class="hint-text">
+          邻区读取失败，
+          <n-button size="tiny" text type="primary" @click="loadCellInfo">重试</n-button>
+        </div>
+        <div v-else-if="cellInfo?.neighbor_cells?.length" class="neighbor-list">
+          <div v-for="(nc, i) in cellInfo.neighbor_cells" :key="i" class="neighbor-item">
+            <div class="neighbor-id">
+              <span class="neighbor-pci">PCI {{ dash(nc.pci) }}</span>
+              <span class="neighbor-rat" :class="{ 'neighbor-rat--nr': isNRCell(nc) }">{{
+                isNRCell(nc) ? '5G' : '4G'
+              }}</span>
+            </div>
+            <div class="neighbor-metrics">
+              <span>EARFCN {{ dash(nc.earfcn) }}</span>
+              <span :class="rsrpClass(nc.rsrp)">RSRP {{ rsrpText(nc.rsrp) }}</span>
+            </div>
+            <n-button
+              size="tiny"
+              type="primary"
+              secondary
+              class="neighbor-lock"
+              :loading="lockingIndex === i"
+              :disabled="lockingIndex !== null && lockingIndex !== i"
+              @click="lockSelectedCell(nc, i)"
+              >锁定</n-button
+            >
+          </div>
+        </div>
+        <div v-else-if="!loading" class="hint-text">未检测到邻区</div>
       </div>
-      <div v-else class="hint-text">未检测到邻区</div>
-    </div>
 
-    <div v-if="cellInfo?.locked_cells?.length" style="margin-top: 16px">
-      <div class="section-title" style="margin-bottom: 8px">已锁定基站</div>
-      <div v-for="(lc, i) in cellInfo.locked_cells" :key="i" class="neighbor-item">
-        <span>PCI {{ lc.pci }}</span>
-        <span>EARFCN {{ lc.earfcn }}</span>
+      <div v-if="cellInfo?.locked_cells?.length" style="margin-top: 16px">
+        <div class="section-title" style="margin-bottom: 8px">已锁定基站</div>
+        <div v-for="(lc, i) in cellInfo.locked_cells" :key="i" class="neighbor-item">
+          <span>PCI {{ dash(lc.pci) }}</span>
+          <span>EARFCN {{ dash(lc.earfcn) }}</span>
+        </div>
+        <n-button size="small" type="warning" style="margin-top: 8px" @click="unlockAllCells">全部解锁</n-button>
       </div>
-      <n-button size="small" type="warning" style="margin-top: 8px" @click="unlockCells">全部解锁</n-button>
-    </div>
+    </n-spin>
   </n-modal>
 </template>
 
@@ -48,10 +67,26 @@
 import { ref, computed, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
+import { parseCellList } from '@/api/contract';
 import InfoRow from '@/components/InfoRow.vue';
 import type { CellInfo } from '@/types';
 
-const props = defineProps<{ show: boolean }>();
+const props = defineProps<{
+  show: boolean;
+  /**
+   * 锁定一个邻区 / 全部解锁（2026-10-14 新增）。
+   *
+   * 这两个动作都是 **A 级操作**（下发 + 按 contract 的 `NetworkModeSwitchProbe` 预算轮询回读确认），
+   * 执行体在 `useNetworkControls`：本组件不自己发 POST —— 那个 composable 每次调用都会新建一套
+   * 页面级 ref（见其文件头），弹窗里再调一次就会多出一份状态与一次 `finishedSeq` 订阅，
+   * 所以由 NetworkView 以函数形式传进来（与卡片收 props 的约定一致）。
+   *
+   * 返回值 = 设备是否在预算内被确认生效（超时返回 false，但这次操作本身已经结束）。
+   */
+  lockCell: (cell: { pci: string; earfcn: string; networkType: 'LTE' | 'NR' }) => Promise<boolean>;
+  unlockCells: () => Promise<boolean>;
+}>();
+
 const emit = defineEmits<{ 'update:show': [boolean] }>();
 
 const show = computed({
@@ -61,24 +96,18 @@ const show = computed({
 
 const message = useMessage();
 const api = getApiClient();
-const settleDelay = () => new Promise((resolve) => setTimeout(resolve, 600));
 
 const cellInfo = ref<CellInfo | null>(null);
 const neighborRefreshing = ref(false);
+/** 首次读取 / 重试的整块加载态（配合 n-spin + 邻区三态，见模板）。 */
+const loading = ref(false);
+/** 读取失败标记：不能把失败渲染成「未检测到邻区」（家规第 6 条）。 */
+const loadFailed = ref(false);
+/** 正在锁定的邻区下标：同卡其它按钮有 pending，这里补齐，避免连点重复下发。 */
+const lockingIndex = ref<number | null>(null);
 
-// goform 的邻区字段可能是 JSON 字符串也可能已是数组
-function parseCellArray(v: any): any[] {
-  if (!v) return [];
-  if (Array.isArray(v)) return v;
-  if (typeof v === 'string') {
-    try {
-      return JSON.parse(v);
-    } catch {
-      return [];
-    }
-  }
-  return [];
-}
+// 数组字段的两形态解析（真数组 / 数组的 JSON 字符串）统一在 contract.parseCellList ——
+// 展示与锁定的回读确认读的是同一份规则，不再各写一份
 
 /**
  * 设备侧 rat 字符串 → `POST /api/device/cell-lock` 的 `network_type` 值域（`LTE` | `NR`）。
@@ -93,13 +122,25 @@ function toNetworkType(rat: unknown): 'LTE' | 'NR' {
 }
 
 /**
- * 邻区制式判定（与 app 端 inferIsNRDlg 同判据）：NR 频点 > 100000、NR 频段号 > 255；
- * 都判不出时回落服务小区制式。锁小区提交仍走 toNetworkType(rat)，这里只管展示。
+ * 邻区制式判定（与 app 端 inferIsNRDlg 同判据）：NR 频点 > 100000，或 rat 以 NR / 5G 开头。
+ * 邻区数据里**没有**频段号（band）字段，所以这里不做「频段号 > 255」那一判
+ * （2026-10-21 修正了原注释：它写的那条判据从未实现过，留矛盾注释比不写更误导）。
+ * 都判不出时按 LTE 处理 —— 锁小区提交走的也是同一个 toNetworkType()。
  */
 function isNRCell(nc: { earfcn: unknown; rat: unknown }): boolean {
   const earfcn = Number(nc.earfcn);
   if (Number.isFinite(earfcn) && earfcn > 100000) return true;
   return toNetworkType(nc.rat) === 'NR';
+}
+
+/** 空值统一显示 `--`（家规第 5 条）：PCI / EARFCN 这类标识字段缺值时不再留一段空白。 */
+function dash(v: unknown): string {
+  return v == null || v === '' ? '--' : String(v);
+}
+
+/** 邻区 RSRP 文案：缺值统一 `--`，不要把 `null dBm` / `-- dBm` 印到界面上（家规第 5 条）。 */
+function rsrpText(rsrp: unknown): string {
+  return rsrp == null || rsrp === '--' || rsrp === '' ? '--' : `${rsrp} dBm`;
 }
 
 /** RSRP 数值着色：>=-85 好（绿），-85~-95 中（amber），-95~-105 弱（橙），更低极弱（红） */
@@ -126,13 +167,15 @@ function mapNeighbors(raw: any[]) {
 }
 
 async function loadCellInfo() {
+  loading.value = true;
+  loadFailed.value = false;
   try {
     const { data } = await api.get('/api/network/cell-info');
     // core 回的是 cell-info 分组的契约字段（Lte_pci / Lte_fcn / Lte_bands 这些名字是
     // 冻结下来的设备原名，见 contract.ts 的 DeviceFields.cellInfo），这里拍平成前端结构
     const raw: any = data || {};
-    const neighborRaw = parseCellArray(raw.neighbor_cell_info);
-    const lockedRaw = parseCellArray(raw.locked_cell_info);
+    const neighborRaw = parseCellList(raw.neighbor_cell_info);
+    const lockedRaw = parseCellList(raw.locked_cell_info);
     const parsed: any = {
       serving_cell: {
         pci: raw.Lte_pci ?? raw.pci ?? '',
@@ -151,7 +194,11 @@ async function loadCellInfo() {
     };
     cellInfo.value = parsed as CellInfo;
   } catch {
+    // 失败标记交给模板显示「读取失败 + 重试」；toast 只做补充说明
+    loadFailed.value = true;
     message.error('获取基站信息失败');
+  } finally {
+    loading.value = false;
   }
 }
 
@@ -161,7 +208,7 @@ async function refreshNeighborCells() {
   neighborRefreshing.value = true;
   try {
     const { data } = await api.get('/api/network/neighbor-cells');
-    const list = mapNeighbors(parseCellArray((data as any)?.neighbor_cell_info));
+    const list = mapNeighbors(parseCellList((data as any)?.neighbor_cell_info));
     if (cellInfo.value) cellInfo.value.neighbor_cells = list as any;
     message.success(`邻区已刷新（${list.length}）`);
   } catch {
@@ -171,34 +218,41 @@ async function refreshNeighborCells() {
   }
 }
 
-async function lockCell(nc: { pci: number; earfcn: number; rat: string }) {
+/**
+ * 锁定一个邻区（2026-10-14 改：接 A 级确认器）。
+ *
+ * 改前：本组件 `api.post('/api/device/cell-lock')` → `message.success('基站已锁定')` →
+ * `settleDelay()`（600ms）→ **单次** `loadCellInfo()`，**没有任何判据**。
+ * 设备侧锁定后要重新驻留小区，600ms 时服务小区还是原来那个 —— 界面显示的锁定结果与设备真值
+ * 不一致，且"成功"是下发被受理就直接报的（受理 ≠ 生效）。
+ *
+ * 现在：`props.lockCell` 内部按 contract 的预算轮询回读，判据是服务小区的 pci/earfcn
+ * 已等于目标（NR 目标见 composable 里的说明）。本组件**不再自己报成功/失败** ——
+ * 终态 toast 与失败原因由确认器统一给（它有 hidden 后台进行、重试这些收敛手段）。
+ * 这里只在操作结束后回读一次，把界面拉到设备真值：超时那一支更需要它（设备可能稍后才生效）。
+ */
+async function lockSelectedCell(nc: { pci: number; earfcn: number; rat: string }, index: number) {
+  // 同一时刻只允许一个锁定动作在飞（按钮 pending + 互斥禁用，见模板）
+  if (lockingIndex.value !== null) return;
+  lockingIndex.value = index;
   try {
-    // 入参是 network_type（LTE|NR），不是设备侧的 rat 字符串。
-    // core 会校验取值域，非 LTE/NR 直接回 400 OUT_OF_RANGE 且不下发；
-    // 旧字段名 rat 仍被兼容但会打 warn，这里不再用它。
-    await api.post('/api/device/cell-lock', {
+    // 入参是 network_type（LTE|NR），不是设备侧的 rat 字符串；收敛只有 toNetworkType 一处。
+    // core 会校验取值域，非 LTE/NR 直接回 400 OUT_OF_RANGE 且不下发（DeviceRoutes.kt:640-644）。
+    await props.lockCell({
       pci: String(nc.pci),
       earfcn: String(nc.earfcn),
-      network_type: toNetworkType(nc.rat),
+      networkType: toNetworkType(nc.rat),
     });
-    message.success('基站已锁定');
-  } catch {
-    message.error('锁定失败');
+    await loadCellInfo();
+  } finally {
+    lockingIndex.value = null;
   }
-  // 锁定生效后驻留信息才会变，立刻回读拿到的还是旧小区
-  await settleDelay();
-  loadCellInfo();
 }
 
-async function unlockCells() {
-  try {
-    await api.post('/api/device/cell-unlock');
-    message.success('基站已全部解锁');
-  } catch {
-    message.error('解锁失败');
-  }
-  await settleDelay();
-  loadCellInfo();
+/** 全部解锁。同 [lockSelectedCell]：A 级确认器（判据 = 锁定名单清空）+ 收敛后回读一次。 */
+async function unlockAllCells() {
+  await props.unlockCells();
+  await loadCellInfo();
 }
 
 watch(show, (v) => {
@@ -254,8 +308,8 @@ watch(show, (v) => {
   background: color-mix(in srgb, var(--text-muted) 14%, transparent);
 }
 .neighbor-rat--nr {
-  color: var(--accent, #2563eb);
-  background: color-mix(in srgb, var(--accent, #2563eb) 14%, transparent);
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
   font-weight: 600;
 }
 .neighbor-metrics {
@@ -271,10 +325,22 @@ watch(show, (v) => {
   flex-shrink: 0;
   margin-left: auto;
 }
-.rsrp-good { color: #16a34a; font-weight: 600; }
-.rsrp-fair { color: #ca8a04; }
-.rsrp-weak { color: #ea580c; }
-.rsrp-poor { color: #dc2626; }
+/* RSRP 四档语义色走 A1 同波次新增的 --signal-*（取值见计划 §6.1）。
+   不用 --success/--warning/--error：那三档会把 fair 与 weak 压成同一个色，
+   四档信息就丢了。 */
+.rsrp-good {
+  color: var(--signal-good);
+  font-weight: 600;
+}
+.rsrp-fair {
+  color: var(--signal-fair);
+}
+.rsrp-weak {
+  color: var(--signal-weak);
+}
+.rsrp-poor {
+  color: var(--signal-poor);
+}
 .neighbor-item:last-child {
   border-bottom: none;
 }

@@ -1,37 +1,37 @@
 <template>
-  <n-modal v-model:show="show" preset="card" title="频段锁定" style="width: 480px; max-width: calc(100vw - 32px)">
-      <div class="band-section">
-        <div class="band-group">
-          <span class="band-group-label">LTE</span>
-          <n-flex wrap>
-            <n-tag
-              v-for="b in lteBandList"
-              :key="b"
-              :checked="selectedLteBands.has(b)"
-              checkable
-              size="small"
-              :bordered="false"
-              @update:checked="toggleLteBand(b)"
-              >B{{ b }}</n-tag
-            >
-          </n-flex>
-        </div>
-        <div class="band-group">
-          <span class="band-group-label">NR</span>
-          <n-flex wrap>
-            <n-tag
-              v-for="b in nrBandList"
-              :key="b"
-              :checked="selectedNrBands.has(b)"
-              checkable
-              size="small"
-              :bordered="false"
-              @update:checked="toggleNrBand(b)"
-              >N{{ b }}</n-tag
-            >
-          </n-flex>
-        </div>
+  <n-modal v-model:show="show" preset="card" title="频段锁定" class="modal-fit" style="--modal-w: 480px">
+    <div class="band-section">
+      <div class="band-group">
+        <span class="band-group-label">LTE</span>
+        <n-flex wrap>
+          <n-tag
+            v-for="b in lteBandList"
+            :key="b"
+            :checked="selectedLteBands.has(b)"
+            checkable
+            size="small"
+            :bordered="false"
+            @update:checked="toggleLteBand(b)"
+            >B{{ b }}</n-tag
+          >
+        </n-flex>
       </div>
+      <div class="band-group">
+        <span class="band-group-label">NR</span>
+        <n-flex wrap>
+          <n-tag
+            v-for="b in nrBandList"
+            :key="b"
+            :checked="selectedNrBands.has(b)"
+            checkable
+            size="small"
+            :bordered="false"
+            @update:checked="toggleNrBand(b)"
+            >N{{ b }}</n-tag
+          >
+        </n-flex>
+      </div>
+    </div>
     <template #footer>
       <div class="modal-footer">
         <n-button size="small" @click="show = false">关闭</n-button>
@@ -150,17 +150,22 @@ async function applyBandLock() {
     running: '正在应用频段设置',
     success: lte.length || nr.length ? '频段锁定已应用' : '频段已解锁',
     hint: '网络栈会重启，期间信号短暂中断，属正常现象',
-    submit: () => api.post('/api/network/band', {
-      action: 'lock',
-      lte_bands: lte.join(',') || undefined,
-      nr_bands: nr.join(',') || undefined,
-    }),
+    submit: () =>
+      api.post('/api/network/band', {
+        action: 'lock',
+        lte_bands: lte.join(',') || undefined,
+        nr_bands: nr.join(',') || undefined,
+      }),
     verify: async () => {
       const { data } = await api.get('/api/network/band-status');
-      return bandsMatch(data.lte_band_lock, selectedLteBands.value)
-          && bandsMatch(data.nr_band_lock, selectedNrBands.value);
+      return (
+        bandsMatch(data.lte_band_lock, selectedLteBands.value) && bandsMatch(data.nr_band_lock, selectedNrBands.value)
+      );
     },
-    onApplied: () => { loadBandStatus(); emit('update:show', true); },  // 回到选择弹窗展示真实状态
+    onApplied: () => {
+      loadBandStatus();
+      emit('update:show', true);
+    }, // 回到选择弹窗展示真实状态
     retry: () => opRetry.value(),
   });
 }
@@ -175,10 +180,12 @@ async function unlockBands() {
     submit: () => api.post('/api/network/band', { action: 'unlock' }),
     verify: async () => {
       const { data } = await api.get('/api/network/band-status');
-      return parseBands(data.lte_band_lock || '').size === 0
-          && parseBands(data.nr_band_lock || '').size === 0;
+      return parseBands(data.lte_band_lock || '').size === 0 && parseBands(data.nr_band_lock || '').size === 0;
     },
-    onApplied: () => { loadBandStatus(); emit('update:show', true); },
+    onApplied: () => {
+      loadBandStatus();
+      emit('update:show', true);
+    },
     retry: () => opRetry.value(),
   });
 }

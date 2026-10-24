@@ -1,153 +1,39 @@
 <template>
   <GridCard title="系统监控">
     <div class="controls-bar">
-      <n-button-group>
-        <n-button
-          v-for="r in TIME_RANGES"
-          :key="r.hours"
-          :type="hours === r.hours ? 'primary' : 'default'"
-          size="small"
-          @click="emit('update:hours', r.hours)"
-          >{{ r.label }}</n-button
-        >
-      </n-button-group>
-      <n-button size="small" :loading="loading" @click="emit('refresh')">刷新</n-button>
-      <n-button size="small" quaternary @click="showSettings = !showSettings">
-        {{ showSettings ? '收起设置' : '监控设置' }}
-      </n-button>
-    </div>
-
-    <!--
-      监控个性化设置：真源在 core（GET/PUT /api/monitor/preferences），与 app 共享同一份。
-      即改即存；未在此展示的 exportZip 是 app 专有项，
-      web 只做字段级 PUT，不会把它们覆盖掉。
-    -->
-    <div v-if="showSettings" class="monitor-prefs">
-      <div class="settings-row">
-        <span class="settings-label">默认时间范围</span>
+      <div class="controls-group">
         <n-button-group>
           <n-button
             v-for="r in TIME_RANGES"
-            :key="`def-${r.hours}`"
-            :type="prefs.defaultHours === r.hours ? 'primary' : 'default'"
-            size="tiny"
-            @click="emit('save', { defaultHours: r.hours })"
+            :key="r.hours"
+            :type="hours === r.hours ? 'primary' : 'default'"
+            size="small"
+            @click="emit('update:hours', r.hours)"
             >{{ r.label }}</n-button
           >
         </n-button-group>
-      </div>
-
-      <div class="settings-row">
-        <span class="settings-label">自动刷新间隔</span>
-        <n-button-group>
-          <n-button
-            v-for="s in REFRESH_CHOICES"
-            :key="`ri-${s}`"
-            :type="prefs.refreshIntervalSec === s ? 'primary' : 'default'"
-            size="tiny"
-            @click="emit('save', { refreshIntervalSec: s })"
-            >{{ s }}s</n-button
-          >
-        </n-button-group>
-      </div>
-
-      <div class="settings-row">
-        <span class="settings-label">显示指标</span>
-        <div class="settings-chips">
-          <n-button
-            v-for="m in METRIC_CHOICES"
-            :key="m.key"
-            :type="prefs.enabledTypes.includes(m.key) ? 'primary' : 'default'"
-            size="tiny"
-            @click="toggleMetric(m.key)"
-            >{{ m.label }}</n-button
-          >
-        </div>
+        <n-button size="small" :loading="loading" @click="emit('refresh')">刷新</n-button>
       </div>
 
       <!--
-        采集总开关（POST /api/monitor/control）。
-        core 侧真源是 AppSettings.backgroundServiceEnabled，与 POST /api/service/start|stop
-        是同一个开关的两个入口；GET /api/monitor/preferences 的响应里**没有**任何能表达
-        采集状态的字段（core MonitorRoutes 注释明确「采集总开关 collectEnabled 不在本模型内」），
-        所以无状态可回读 —— 不凭空假设默认值，改用两个明确动作，同 NetworkView 飞行模式的惯例。
+        页面级动作插槽：本卡只放「与监控设置/取数相关」的控件。
+        流量报表这类独立功能由 MonitorView 传入触发按钮（弹窗也归它管），
+        免得这张卡去持有自己用不上的弹窗状态。
       -->
-      <div class="settings-row">
-        <span class="settings-label">数据采集</span>
-        <n-popconfirm @positive-click="setCollect(true)">
-          <template #trigger>
-            <n-button size="tiny" type="primary" :loading="collectSaving">开启采集</n-button>
-          </template>
-          开启后 core 恢复写入监控历史，图表继续增长。确认继续？
-        </n-popconfirm>
-        <n-popconfirm @positive-click="setCollect(false)">
-          <template #trigger>
-            <n-button size="tiny" :loading="collectSaving">停止采集</n-button>
-          </template>
-          关闭后 core 停止写入监控历史（已有数据不删除，图表将不再增长）。确认继续？
-        </n-popconfirm>
-        <span class="settings-hint">
-          关闭后 core 停止写入监控历史：已有数据不会删除，图表将不再增长； core 未提供状态读取接口，此处不展示当前状态。
-        </span>
+      <div v-if="$slots.actions" class="controls-group">
+        <slot name="actions" />
       </div>
 
-      <!-- 告警/事件检查间隔（2026-10-07 审计修复：core+app 早有，web 补 UI 对齐双端口径） -->
-      <div class="settings-row">
-        <span class="settings-label">套餐限额检查</span>
-        <n-select
-          :value="prefs.trafficLimitCheckSec"
-          size="tiny"
-          style="width: 100px"
-          :options="[
-            { label: '1 分钟', value: 60 },
-            { label: '5 分钟', value: 300 },
-            { label: '15 分钟', value: 900 },
-            { label: '30 分钟', value: 1800 },
-            { label: '1 小时', value: 3600 },
-          ]"
-          @update:value="(v: number) => emit('save', { trafficLimitCheckSec: v })"
-        />
-        <span class="settings-hint">用量百分比预警的检查频率</span>
-      </div>
-      <div class="settings-row">
-        <span class="settings-label">设备事件检查</span>
-        <n-select
-          :value="prefs.deviceEventCheckSec"
-          size="tiny"
-          style="width: 100px"
-          :options="[
-            { label: '15 秒', value: 15 },
-            { label: '30 秒', value: 30 },
-            { label: '1 分钟', value: 60 },
-            { label: '5 分钟', value: 300 },
-            { label: '10 分钟', value: 600 },
-          ]"
-          @update:value="(v: number) => emit('save', { deviceEventCheckSec: v })"
-        />
-        <span class="settings-hint">接入/离开提醒的比对频率</span>
-      </div>
-
-      <div class="settings-row">
-        <span class="settings-label">Y 轴固定</span>
-        <n-switch
-          :value="prefs.fixedYAxis"
-          size="small"
-          @update:value="(v: boolean) => emit('save', { fixedYAxis: v })"
-        />
-        <span class="settings-hint">关闭 = 按数据自适应缩放</span>
-      </div>
-
-      <div class="settings-row">
-        <span class="settings-label">填充透明度</span>
-        <n-slider
-          :value="prefs.fillAlpha"
-          :min="0"
-          :max="1"
-          :step="0.05"
-          style="max-width: 220px"
-          @update:value="(v: number) => emit('save', { fillAlpha: Number(v.toFixed(2)) })"
-        />
-        <span class="settings-hint">{{ prefs.fillAlpha.toFixed(2) }}</span>
+      <!--
+        存储管理 / 监控设置：2026-10-22 从「底部常驻卡 + 控件条内嵌展开区」改成两个弹窗入口。
+        两者都是「点开看一眼或调一次就关」的动作，常驻会把首屏图表挤下去。
+        单独成一组：窄屏（≤768px）每个组独占一行，这两个入口不会和刷新/告警挤成一条。
+      -->
+      <div class="controls-group">
+        <n-button size="small" @click="emit('open-storage')">存储管理</n-button>
+        <!-- 与存储管理同一档按钮样式：quaternary 会在浅色底上退化成纯文字，
+             看起来不像可点击入口。 -->
+        <n-button size="small" @click="emit('open-settings')">监控设置</n-button>
       </div>
     </div>
   </GridCard>
@@ -155,125 +41,78 @@
 
 <script setup lang="ts">
 /**
- * 时间范围 + 监控偏好设置卡片。
+ * 时间范围 + 页面入口的控件条。
  *
- * 偏好不自持：prefs 由父组件回读并下发，改动一律 emit('save', patch) 交给父组件做字段级 PUT
- * —— 图表的 fillAlpha / fixedYAxis / enabledTypes 用的是同一份 prefs，
- * 拆成两份状态必然出现「设置里改了、图没跟着变」。
+ * 这里只留「取数口径」与「打开哪个弹窗」两类控件：监控偏好（prefs）由 MonitorView
+ * 持有并下发到弹窗，本卡不再渲染任何设置项 —— 设置项都在 MonitorSettingsModal 里，
+ * 这样才能保证图表的 fillAlpha / fixedYAxis / enabledTypes 与设置用的是同一份状态。
  *
- * 采集总开关是例外，留在本组件：它没有可回读的状态，只是两个一次性动作，
- * 与父组件的任何状态都不耦合。
+ * `exporting` / `export` 是历史遗留的 CSV 导出接线（模板里已无对应按钮），
+ * 本批次不动它，避免牵连 MonitorView 的导出逻辑。
  */
-import { ref } from 'vue';
-import { useMessage } from 'naive-ui';
-import { useCancellableApi } from '@/composables/useCancellableApi';
-import { Endpoints } from '@/api/contract';
 import GridCard from '@/components/GridCard.vue';
-import { METRIC_CHOICES, METRIC_KEYS, REFRESH_CHOICES, TIME_RANGES, type MonitorPrefs } from '../monitorShared';
+import { TIME_RANGES } from '../monitorShared';
 
-const props = defineProps<{
-  prefs: MonitorPrefs;
+defineProps<{
   hours: number;
   /** 任一图表在取数中 —— 只用于刷新按钮的 loading */
   loading: boolean;
-  /** CSV 导出进行中 —— 导出按钮的 loading */
+  /** CSV 导出进行中（遗留接线，见文件头） */
   exporting?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: 'update:hours', hours: number): void;
   (e: 'refresh'): void;
-  (e: 'save', patch: Partial<MonitorPrefs>): void;
   (e: 'export'): void;
+  (e: 'open-storage'): void;
+  (e: 'open-settings'): void;
 }>();
 
-const message = useMessage();
-const api = useCancellableApi();
-
-const showSettings = ref(false);
-
-function toggleMetric(key: string) {
-  const cur = props.prefs.enabledTypes;
-  const next = cur.includes(key) ? cur.filter((k) => k !== key) : [...cur, key];
-  // enabledTypes 是完整集合语义：改单个指标也要传整份集合，且按 METRIC_KEYS 的顺序
-  emit('save', { enabledTypes: METRIC_KEYS.filter((k) => next.includes(k)) });
-}
-
-const collectSaving = ref(false);
-
-async function setCollect(enabled: boolean) {
-  collectSaving.value = true;
-  try {
-    // enabled 必须是严格的 JSON boolean：core 用 jsonPrimitive.booleanOrNull 取值，
-    // 字符串 "true" 会被当成缺参直接 400（error: enabled (boolean) required）。
-    const { data } = await api.post(Endpoints.monitor.control, { enabled });
-    // 成功信封是 { ok: true, enabled } —— 注意是 ok 不是 success（PUT /preferences 才是 success）
-    if (data?.ok === false) {
-      message.error(data?.message || data?.error || '操作失败');
-      return;
-    }
-    const eff = typeof data?.enabled === 'boolean' ? data.enabled : enabled;
-    message.success(eff ? '已开启数据采集' : '已停止数据采集');
-  } catch (e: any) {
-    const d = e?.response?.data;
-    message.error(d?.message || d?.error || '操作失败');
-  } finally {
-    collectSaving.value = false;
-  }
-}
+/** #actions：页面级动作按钮（当前是 MonitorView 的「流量报表」「告警」入口） */
+defineSlots<{ actions?(): any }>();
 </script>
 
 <style scoped>
-/* 4 档区间按钮组（152px）+ 刷新（48px）+ 监控设置（76px）+ 24px 间距 ≈ 300px，
-   正好顶到 298px 卡内宽的上限：文案换成「收起设置」就多一个字宽，320px 设备更是必溢出。
-   允许换行。 */
 .controls-bar {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px 12px;
+  gap: var(--space-2) var(--space-3);
 }
 
-/* 原名 .settings-panel —— 与 settings/panels 的同名栅格类语义完全不同（那边是 auto-fit 卡片栅格，
-   这里只是折叠出来的偏好设置竖列）。该类已提升为 main.css 的全局类，故此处改名避免撞车。 */
-.monitor-prefs {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border-subtle);
-}
-
-.settings-row {
+.controls-group {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
-.settings-label {
-  min-width: 96px;
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-
-.settings-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.settings-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
+/* 桌面端一行放得下（4 档区间 + 刷新 + 报表/告警 + 两个弹窗入口 ≈ 520px）。
+   手机端不再让每个 group 独占整行（会把所有按钮挤在左侧、右侧留一大片空白），
+   改成 4 列网格：时间档 + 刷新占第一行，报表/告警/存储/监控设置各占一格第二行。 */
 @media (max-width: 768px) {
-  /* 96px 的标签下限在 298px 内会把「开启采集/停止采集 + 长提示」压到 204px，
-     提示折成 5 行。窄屏改成标签独占一行。 */
-  .settings-label {
-    min-width: 100%;
+  .controls-bar {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .controls-group {
+    display: contents;
+  }
+  .controls-bar > .controls-group > :deep(.n-button) {
+    width: 100%;
+    min-width: 0;
+  }
+  .controls-bar > .controls-group:first-child :deep(.n-button-group) {
+    grid-column: span 3;
+    display: flex;
+    width: 100%;
+    min-width: 0;
+  }
+  .controls-bar > .controls-group:first-child :deep(.n-button-group .n-button) {
+    flex: 1 1 0;
+    min-width: 0;
   }
 }
 </style>

@@ -2,7 +2,9 @@
   <!-- 横向铺开时用「标签在上、值在下」的格子，比左右对齐的行更好读 -->
   <GridCard class="panel-card" title="网络信息">
     <template #extra>
-      <n-tag :type="netStatus?.network?.is_connected ? 'success' : 'error'" size="small" :bordered="false">
+      <!-- 「未连接」是状态不是故障：用中性灰（default）而不是 error 红。
+           红色留给「操作失败 / 读取失败」，否则日常没插卡时整张卡像报错。 -->
+      <n-tag :type="netStatus?.network?.is_connected ? 'success' : 'default'" size="small" :bordered="false">
         {{ netStatus?.network?.is_connected ? '已连接' : '未连接' }}
       </n-tag>
       <n-button size="small" quaternary type="primary" @click="emit('open-mode')">网络模式</n-button>
@@ -34,8 +36,10 @@
       </div>
       <!--
         2026-10-10 用户裁决：删掉「连接模式」这一格（自动拨号 / 手动拨号）。
-        **只删显示**：`connectionMode` prop 与 `update:connection-mode` 事件、以及
-        composable 里的下发逻辑全部保留 —— 设备侧 `dial_mode` 配置不动（用户裁决 A）。
+        2026-10-21：连 `connectionMode` prop 一起删掉了 —— 这一格删掉之后，
+        本卡再没有任何地方渲染它（模板、计算属性、CSS 里都没有第二处消费），
+        留着就是一个「传了也永远不显示」的死 prop。设备侧 `dial_mode` 配置与
+        composable 里的下发逻辑不受影响（用户裁决 A）。
       -->
     </div>
   </GridCard>
@@ -46,7 +50,7 @@
  * 网络信息卡。
  *
  * 网络状态与信号读 dashboardStore（单例，与父组件同一份）；
- * 漫游 / 拨号模式 / 移动数据的 loading 只能走 props ——
+ * 漫游状态 / 移动数据的 loading 只能走 props ——
  * 它们的真源是 `useNetworkControls()`，而那个 composable **每次调用都新建一套 ref**
  * （不是模块级单例）。在本组件里再调一次会拿到互不相干的第二份状态：
  * 父组件轮询刷新的是它自己那份，这里永远显示初始值。
@@ -60,7 +64,6 @@ import GridCard from '@/components/GridCard.vue';
 
 defineProps<{
   roamingEnabled: boolean;
-  connectionMode: string;
   mobileDataSaving: boolean;
 }>();
 

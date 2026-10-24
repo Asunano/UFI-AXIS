@@ -19,7 +19,7 @@
   并给设备当前那一项额外标一个「当前」徽标。
 -->
 <template>
-  <n-modal v-model:show="show" preset="card" title="网络模式" style="width: 460px; max-width: calc(100vw - 32px)">
+  <n-modal v-model:show="show" preset="card" title="网络模式" class="modal-fit" style="--modal-w: 460px">
     <!-- 设备当前档位。与下面的"待应用选项"是两件事，必须分开说 -->
     <div class="current-row">
       <span class="current-label">设备当前</span>

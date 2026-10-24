@@ -91,6 +91,12 @@ export interface UploadTask {
   finalName?: string;
   /** 这一条是续传上来的（面板上标一下，让「进度不从 0 开始」看起来是对的） */
   resumed?: boolean;
+  /**
+   * 失败后能否「重试」。
+   * 只有真正入过队（File 引用还在）的能重试；超限被拦下的那些一个字节都没发过，
+   * 也没有 File 引用 —— 面板上不该出现一颗点了只会报错的按钮。
+   */
+  retryable?: boolean;
 }
 
 /** L2 续传线索。只是"告诉用户有东西可以续"，续传本身不依赖它。 */
@@ -497,6 +503,7 @@ export function useFileUpload(cb: UploadCallbacks) {
         // 理论上不该发生；真发生了就把它标失败而不是让队列卡在这一条上
         task.status = 'error';
         task.error = '文件引用已丢失，请重新选择';
+        task.retryable = false;
         continue;
       }
       return { task, file };
@@ -550,9 +557,10 @@ export function useFileUpload(cb: UploadCallbacks) {
           const retriable = last.status === 429 || last.timedOut === true || (chunked && last.status === 410);
           if (!retriable) break;
         }
-        // 无论成功失败取消，这条的 File 都不再需要，及早释放引用
-        pendingFiles.delete(task.id);
-        // 速率采样同理：不删的话 speedState 会随传过的文件数单调增长
+        // File 引用：成功 / 取消后立刻释放；**失败要留着** —— 面板上的「重试」靠它原样重发
+        // （分片路径下服务端按 name+size 匹配到已有的 `.ufipart`，天然续传）。
+        if (last.ok || isCanceled(task)) pendingFiles.delete(task.id);
+        // 速率采样一律释放：不删的话 speedState 会随传过的文件数单调增长
         speedState.delete(task.id);
         if (isCanceled(task)) continue;
         if (last.ok) {
@@ -607,9 +615,12 @@ export function useFileUpload(cb: UploadCallbacks) {
         task.status = 'error';
         // 把实际大小一起报出来：只说"超限"用户还得自己去查文件多大
         task.error = `${formatBytes(file.size)}，超过单文件上限 ${limitLabel}`;
+        // 没入队（一个字节都没发）、也没有 File 引用 ⇒ 不能重试
+        task.retryable = false;
         rejected.push(task);
       } else {
         pendingFiles.set(task.id, file);
+        task.retryable = true;
         accepted.push(task);
       }
     }
@@ -648,6 +659,35 @@ export function useFileUpload(cb: UploadCallbacks) {
     for (const t of tasks.value) {
       if (t.status === 'pending' || t.status === 'uploading') cancel(t.id);
     }
+  }
+
+  /**
+   * 重试一条失败的上传。
+   *
+   * 与批量队列的 `retryItem` 同一条口径：只认 `error`，把状态打回 `pending` 再让 `pump` 接上，
+   * **不重开整个批次**（重新选一遍文件等于把已经传完的那些也丢了）。
+   *
+   * 前提是 File 引用还在 —— `pump` 刻意只在成功/取消时释放（见那里的注释）。
+   * 分片路径下服务端按 name+size 匹配到已有的 `.ufipart` 并回 `received`，所以重试天然续传；
+   * 整体上传则从头重发，进度条同步归零，免得看着像往回跳。
+   */
+  function retry(id: number): void {
+    const t = tasks.value.find((x) => x.id === id);
+    if (!t || t.status !== 'error') return;
+    if (!pendingFiles.has(t.id)) {
+      t.error = '文件引用已丢失，请重新选择该文件';
+      t.retryable = false;
+      return;
+    }
+    t.status = 'pending';
+    t.error = '';
+    t.loaded = 0;
+    t.speed = 0;
+    t.resumed = false;
+    t.finalName = undefined;
+    panelOpen.value = true;
+    // 队列已在跑时直接返回，这条会被当前循环接上（见 pump 的注释）
+    void pump();
   }
 
   /** 清掉已结束的行；正在传的保留。全清空时顺手收起面板。 */
@@ -701,6 +741,7 @@ export function useFileUpload(cb: UploadCallbacks) {
     enqueue,
     cancel,
     cancelAll,
+    retry,
     clearFinished,
     closePanel,
     ensureCaps,

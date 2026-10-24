@@ -15,7 +15,10 @@
     />
     <!-- 中心文字 -->
     <text :x="size / 2" :y="size / 2 - 4" text-anchor="middle" class="gauge-value">{{ computedDisplay }}</text>
-    <text v-if="unit" :x="size / 2" :y="size / 2 + 12" text-anchor="middle" class="gauge-unit">{{ unit }}</text>
+    <!-- 非百分比档（max ≠ 100）时数值本身已经带上 unit（见 computedDisplay），这里不再重复一行 -->
+    <text v-if="unit && !unitInlined" :x="size / 2" :y="size / 2 + 12" text-anchor="middle" class="gauge-unit">
+      {{ unit }}
+    </text>
     <text v-if="label" :x="size / 2" :y="size / 2 + 28" text-anchor="middle" class="gauge-label">{{ label }}</text>
   </svg>
 </template>
@@ -45,11 +48,29 @@ const props = withDefaults(
   }
 );
 
-const ratio = computed(() => Math.min(1, Math.max(0, props.value / props.max)));
+/**
+ * `value` 声明为必填 number，但调用方在「还没取到数」时可能传 undefined / NaN ——
+ * 原先 `Math.round(NaN)` 会直接在表盘中央印一个 `NaN`。现在统一走 `--`。
+ */
+const hasValue = computed(() => Number.isFinite(props.value));
+/** `max` 为 0 / 非数时按 100 处理：除 0 得 Infinity，clamp 后等于伪造满档 */
+const safeMax = computed(() => (Number.isFinite(props.max) && props.max > 0 ? props.max : 100));
+
+const ratio = computed(() => (hasValue.value ? Math.min(1, Math.max(0, props.value / safeMax.value)) : 0));
+
+/**
+ * 数值文本里已经并进去的单位。
+ *
+ * `max = 100` 是百分比语义，数字自带 `%`（与 unit 无关，保持各调用点现有观感）；
+ * 其余档位是绝对量，若只印一个裸数字（如「45」）读者无从判断量纲，
+ * 所以把 `unit` 拼进数值文本 —— 此时下面那行小字 unit 不再重复渲染。
+ */
+const unitInlined = computed(() => safeMax.value !== 100 && !!props.unit);
 const computedDisplay = computed(() => {
   if (props.displayValue) return props.displayValue;
-  if (props.max === 100) return `${Math.round(props.value)}%`;
-  return `${Math.round(props.value)}`;
+  if (!hasValue.value) return '--';
+  if (safeMax.value === 100) return `${Math.round(props.value)}%`;
+  return props.unit ? `${Math.round(props.value)} ${props.unit}` : `${Math.round(props.value)}`;
 });
 
 // 半圆弧参数
@@ -94,11 +115,11 @@ const resolvedColor = computed(() => {
   fill: var(--text-primary);
 }
 .gauge-unit {
-  font-size: 12px;
+  font-size: var(--font-sm);
   fill: var(--text-muted);
 }
 .gauge-label {
-  font-size: 12px;
+  font-size: var(--font-sm);
   fill: var(--text-secondary);
 }
 </style>

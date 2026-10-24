@@ -1,6 +1,8 @@
 <template>
-  <n-modal v-model:show="show" preset="dialog" title="WiFi 设置" style="width: 440px; max-width: calc(100vw - 32px)">
-    <n-form label-placement="left" label-width="90">
+  <n-modal v-model:show="show" preset="dialog" title="WiFi 设置" class="modal-fit" style="--modal-w: 440px">
+    <!-- 窄屏（≤768px）标签改顶置：left + label-width 90 在 360px 视口下给输入框只剩
+         ~200px（弹窗 440 → 实际 336，扣掉 90 标签与内距），SSID/密码看得见一半。 -->
+    <n-form :label-placement="isMobile ? 'top' : 'left'" label-width="90">
       <n-form-item label="SSID">
         <n-input v-model:value="wifiForm.ssid" />
       </n-form-item>
@@ -47,6 +49,7 @@
 import { reactive, ref, computed, watch } from 'vue';
 import { useDialog, useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
+import { useIsMobile } from '@/composables/useIsMobile';
 import {
   WIFI_AUTH_MODE_DEFAULT,
   WIFI_MAX_STA_NUM_KEEP_LABEL,
@@ -65,7 +68,17 @@ import type { WifiBand } from '@/api/contract';
 import type { WifiSettings } from '@/types';
 
 const props = defineProps<{ show: boolean; wifiSettings: WifiSettings | null }>();
-const emit = defineEmits<{ 'update:show': [boolean]; saved: [] }>();
+const emit = defineEmits<{
+  'update:show': [boolean];
+  saved: [];
+  /**
+   * 2026-10-14：换频段是一次 A 级操作（下发 + 13 次回读确认），执行体在
+   * `useNetworkControls.switchWifiBand`，本组件只把目标频段交上去（理由见 submit 里的注释）。
+   * 只传频段、不传 SSID：判据只认生效频段（设备每个 chip 的 AP 各有一份配置，切过去之后
+   * 回读到的 SSID 是目标 chip 那个 AP 自己的，拿它比对必然对不上 —— 见 composable 里的说明）。
+   */
+  'switch-band': [chip: WifiBand];
+}>();
 
 const show = computed({
   get: () => props.show,
@@ -75,6 +88,8 @@ const show = computed({
 const message = useMessage();
 const dialog = useDialog();
 const api = getApiClient();
+/** 与 CSS 的 768 档同一判据（见模板里 label-placement 的说明） */
+const isMobile = useIsMobile();
 
 const wifiForm = reactive({
   ssid: '',
@@ -165,6 +180,10 @@ async function saveWifi() {
 /**
  * 真正下发。顺序是先 `/api/wifi/config` 再 `/api/wifi/band`：
  * 换频段会重启 WiFi 模块并顶掉连接，把它放最后，SSID/密码这些才有机会先落到设备上。
+ *
+ * 2026-10-14：`/api/wifi/band` 不再由本组件直发 —— 它改走父组件的 A 级确认器
+ * （`useNetworkControls.switchWifiBand`），所以这里只负责"发配置 + 把频段切换交给父组件"。
+ * 原因见下面那段注释与 [emit('switch-band')]。
  */
 async function submit(switchBand: boolean) {
   wifiSaving.value = true;
@@ -184,22 +203,43 @@ async function submit(switchBand: boolean) {
         fallbackEncrypType: props.wifiSettings?.encryp_type,
       })
     );
-    if (switchBand) {
-      // 取值域非法时 core 回 400 + 原因，直接把原因显示出来，别压成一句「保存失败」
-      await api.post('/api/wifi/band', { chip: wifiForm.band });
-      message.success('WiFi 设置已保存，正在切换频段（WiFi 会重启）');
-    } else {
-      message.success('WiFi 设置已保存');
-    }
-    show.value = false;
-    // 设备写入到查询接口可见有延迟，二维码按当前 SSID/密码实时生成，配置一改旧图就是错的：
-    // 由父组件在 saved 事件里统一回读设置（新频段、以及「WiFi 被打开」这个副作用都靠这次回读
-    // 反映到界面）+ 丢弃旧二维码缓存并视情况重拉
-    emit('saved');
   } catch (e: any) {
+    // 取值域非法时 core 回 400 + 原因，直接把原因显示出来，别压成一句「保存失败」
     message.error(e?.response?.data?.error || '保存失败');
+    return;
   } finally {
     wifiSaving.value = false;
   }
+
+  if (!switchBand) {
+    message.success('WiFi 设置已保存');
+    show.value = false;
+    // 设备写入到查询接口可见有延迟，二维码按当前 SSID/密码实时生成，配置一改旧图就是错的：
+    // 由父组件在 saved 事件里统一回读设置 + 丢弃旧二维码缓存并视情况重拉。
+    // 这一支**不需要** A 级：`/api/wifi/config` 是 AP 配置表的普通写入，不重启模块
+    // （会重启模块的是 `/api/wifi/band`，见下）。
+    emit('saved');
+    return;
+  }
+
+  /*
+   * 2026-10-14 修（审计 G2：切频段没有确认器）。
+   *
+   * 改前：这里 `await api.post('/api/wifi/band')` 成功后 `emit('saved')` →
+   * `NetworkView.handleWifiSaved` → `onWifiSaved`，那边等 600ms **单读一次**。
+   * core 写成功确实清了读缓存（`WifiRoutes.kt:199-208` 的 `invalidateWifi()`，所以回读真的打设备），
+   * 但设备侧这条命令会**重启 WiFi 模块**（`GoformWifiClient.kt:490-521`，语义是"在该频段上启用 WiFi"），
+   * 600ms 时模块还没起来 —— 回读到的还是旧频段/旧 SSID，界面要等下一轮 10s 轮询才自己变对。
+   *
+   * 现在：把这次切换交给父组件，由 A 级入口 `useNetworkControls.switchWifiBand` 下发并
+   * 按 contract 的 `NetworkModeSwitchProbe` 预算轮询回读生效频段（判据与理由见那个入口的注释：
+   * 只认归一后的频段，不含 SSID —— 设备每个 chip 的 AP 各有一份配置）。
+   * 本组件**先关窗再上交**（同制式切换的 applyModeAndClose）：A 级回读最长 30.6s，
+   * 不该让配置弹窗空转，进度与结论由全局进度弹窗呈现。
+   * 组件自己不持有那个 A 级入口：`useNetworkControls()` 每次调用都会新建一套页面级 ref，
+   * 弹窗里再调一次就会多一份订阅（见 useNetworkControls 文件头），所以动作一律从父组件来。
+   */
+  show.value = false;
+  emit('switch-band', wifiForm.band);
 }
 </script>

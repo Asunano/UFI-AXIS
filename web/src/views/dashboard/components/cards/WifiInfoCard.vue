@@ -1,6 +1,6 @@
 <template>
   <!-- WiFi 与局域网设置都走弹窗，不在概览里铺开 -->
-  <GridCard class="panel-card" title="WiFi 信息">
+  <GridCard class="panel-card" title="WiFi 信息" :loading="showSkeleton">
     <template #extra>
       <!-- 开关即状态：不再另放一个「已开启/已关闭」的 tag，避免两处说同一件事却可能不一致 -->
       <n-switch :value="wifiEnabled" size="small" @update:value="(v: boolean) => emit('toggle-enabled', v)" />
@@ -26,7 +26,7 @@
           </div>
           <div class="stat-cell">
             <span class="stat-label">频段</span>
-            <span class="stat-value">{{ wifiSettings.chip_index === '2' ? '5 GHz' : '2.4 GHz' }}</span>
+            <span class="stat-value">{{ wifiBandText }}</span>
           </div>
           <div class="stat-cell">
             <span class="stat-label">SSID 广播</span>
@@ -34,10 +34,18 @@
           </div>
           <div class="stat-cell">
             <span class="stat-label">最大接入数</span>
-            <span class="stat-value">{{ wifiSettings.max_sta_num || '--' }}</span>
+            <span class="stat-value">{{ maxStaNumText }}</span>
           </div>
         </div>
-        <div v-else class="client-empty">WiFi 信息读取失败</div>
+        <!--
+          「加载中」由 GridCard 的 :loading（骨架）承担，所以走到这里只剩「没读到」这一种：
+          原来这里是 `v-else` 直接把「还没加载」和「读取失败」一起渲染成「读取失败」，
+          而且没有重试入口。现在给文案 + 重试（读取失败不会自动恢复，只能等下一轮 10s 轮询）。
+        -->
+        <div v-else class="client-empty wifi-fail">
+          <span>WiFi 信息读取失败</span>
+          <n-button size="tiny" quaternary type="primary" @click="emit('retry')">重试</n-button>
+        </div>
       </div>
 
       <div class="wifi-qr">
@@ -61,11 +69,14 @@
  */
 import { computed } from 'vue';
 import GridCard from '@/components/GridCard.vue';
+import { WifiBandOptions, findWifiSecurityPreset, wifiBandFromChipIndex } from '@/api/contract';
 import type { WifiSettings } from '@/types';
 
 const props = defineProps<{
   wifiSettings: WifiSettings | null;
   wifiEnabled: boolean;
+  /** 首次取数是否仍在途（父组件给的 `wifiLoading || !首次尝试完成`） */
+  wifiLoading: boolean;
   qrUrl: string;
   qrLoading: boolean;
   qrError: string;
@@ -74,16 +85,49 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'toggle-enabled', enabled: boolean): void;
   (e: 'open-settings'): void;
+  (e: 'retry'): void;
 }>();
 
-/** goform 的 auth_mode / encryp_type 原样拼接；两者都为空或 NONE 视为开放网络 */
+/**
+ * 只在「还没有任何数据」时才让卡壳显示骨架：有数据之后的 10s 轮询不该把整张卡闪成占位块。
+ */
+const showSkeleton = computed(() => props.wifiLoading && !props.wifiSettings);
+
+/**
+ * 加密方式：不直出 goform 的 `auth_mode / encryp_type`（那种 `WPA2PSK / CCMP` 用户读不懂），
+ * label 唯一来源是 contract 的档位表（与两个 WiFi 表单下拉同一个来源）。
+ * 表外写法（老固件 / 别的型号）原样带出 `auth_mode（encryp_type）`，不假装认识它。
+ */
 const wifiAuthText = computed(() => {
   const s = props.wifiSettings;
   if (!s) return '--';
-  const parts = [s.auth_mode, s.encryp_type]
-    .map((v) => String(v ?? '').trim())
-    .filter((v) => v && v.toUpperCase() !== 'NONE');
-  return parts.length ? parts.join(' / ') : '开放';
+  const auth = String(s.auth_mode ?? '').trim();
+  if (!auth) return '--';
+  const preset = findWifiSecurityPreset(auth);
+  if (preset) return preset.label;
+  const encryp = String(s.encryp_type ?? '').trim();
+  return !encryp || encryp.toUpperCase() === 'NONE' ? auth : `${auth}（${encryp}）`;
+});
+
+/**
+ * 频段：`chip_index` 是**读侧展示编码**（`'1'` / `'2'`），与写侧取值域（`chip1` / `chip2`）不同。
+ * 翻译只走 contract 的 `wifiBandFromChipIndex`（composable 的频段确认也用它），
+ * 文案取 `WifiBandOptions`，不在这里另写一份 `'2' ? '5 GHz' : '2.4 GHz'`。
+ */
+const wifiBandText = computed(() => {
+  const s = props.wifiSettings;
+  if (!s) return '--';
+  const band = wifiBandFromChipIndex(s.chip_index);
+  return WifiBandOptions.find((o) => o.value === band)?.label ?? '--';
+});
+
+/**
+ * 最大接入数：`normalizeWifiSettings` 把读不到的字段折成 0，所以 0 在这里是「没读到」而不是
+ * 一个合法的接入数上限（合法值域是 1..10，见 contract.WifiMaxStaNumRange）。
+ */
+const maxStaNumText = computed(() => {
+  const n = Number(props.wifiSettings?.max_sta_num);
+  return Number.isFinite(n) && n > 0 ? String(n) : '--';
 });
 </script>
 
@@ -92,7 +136,7 @@ const wifiAuthText = computed(() => {
 .wifi-layout {
   display: flex;
   align-items: flex-start;
-  gap: 20px;
+  gap: var(--space-5);
 }
 .wifi-info {
   /* min-width:0 是必须的：里面是 grid，不给它就会被最长的 SSID 撑出卡片 */
@@ -104,6 +148,13 @@ const wifiAuthText = computed(() => {
    scoped 选择器 (0,2,0) 压过 main.css 里的 .stat-grid (0,1,0)，与源码顺序无关。 */
 .wifi-stat-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+/* 失败态：文案 + 重试按钮竖排居中（.client-empty 已给居中与内距） */
+.wifi-fail {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
 }
 
 /* ── WiFi 二维码（卡内右侧固定列，不走弹窗）── */
@@ -121,11 +172,12 @@ const wifiAuthText = computed(() => {
   display: block;
   border-radius: var(--radius-sm);
   /* 与 components/modals/QrModal.vue 同一条豁免：二维码底色必须是纯白，
-     接 --card-bg 会让暗色下扫不出来。 */
+     接 --card-bg 会让暗色下扫不出来。
+     ui-baseline-allow: 二维码底色必须纯白，与 QrModal 同一口径 */
   background: #fff;
 }
 .wifi-qr-hint {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   text-align: center;
 }
@@ -135,11 +187,11 @@ const wifiAuthText = computed(() => {
      二维码这时可以放大一点 —— 它是整张卡里最有用的东西 */
   .wifi-layout {
     flex-direction: column;
-    gap: 12px;
+    gap: var(--space-3);
   }
   .wifi-qr {
     align-self: center;
-    padding-top: 12px;
+    padding-top: var(--space-3);
     border-top: 1px solid var(--border-subtle);
     width: 100%;
   }

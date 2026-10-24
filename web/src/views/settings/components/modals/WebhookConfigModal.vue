@@ -39,14 +39,30 @@
     **留在收起区外面** —— 它可能是短信验证码原文，藏进折叠区等于没说。
 -->
 <template>
+  <!-- 尺寸走 main.css 的 `.modal-fit`（2026-10-14）：这张表单是全仓最长的设置弹窗之一
+       （预设 / 密钥 / 请求体模板 / 高级设置 / 占位符），改前只给了宽度 ⇒ 卡片高度随内容长，
+       整块滚出屏幕、标题与「保存」都不在视野里。现在卡片高度封顶、只有内容区滚。 -->
   <n-modal
     :show="show"
     preset="card"
     title="Webhook 通知"
-    style="width: 640px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 640px; --modal-h: 720px"
     @update:show="emit('update:show', $event)"
   >
     <n-spin :show="loading">
+      <!--
+        读取失败的失败态（计划 §6.9 B8-7）：原先只在 catch 里 toast 一句，弹窗依旧渲染那套
+        硬编码初值 —— 观感与「配置为空」完全一样，用户很可能照着默认值点一次保存把设备的
+        真实配置覆盖掉。现在顶部挂一条失败提示条并给重试；失败期间保存按钮一并禁用。
+      -->
+      <n-alert v-if="loadFailed" class="load-failed" type="error" :bordered="false">
+        <span class="load-failed-text"
+          >配置读取失败，下面的值是前端默认值，不是设备上的真实配置。请重试，或关闭后重新打开。</span
+        >
+        <n-button size="tiny" quaternary :loading="loading" @click="loadConfig">重试</n-button>
+      </n-alert>
+
       <ToggleRow
         v-model="form.enabled"
         label="启用 Webhook 通知"
@@ -170,7 +186,7 @@
               :min="TIMEOUT_MIN_SEC"
               :max="TIMEOUT_MAX_SEC"
               size="small"
-              style="width: 150px"
+              class="num-compact"
             >
               <template #suffix>秒</template>
             </n-input-number>
@@ -282,7 +298,7 @@
           通知总开关当前关闭，自动通知不会发送；手动测试不受它约束。
         </div>
         <span class="field-label">响应内容</span>
-        <n-scrollbar style="max-height: 120px">
+        <n-scrollbar class="resp-scroll">
           <pre class="resp-body">{{ testResult.response_body || '（无响应内容）' }}</pre>
         </n-scrollbar>
       </div>
@@ -294,7 +310,9 @@
         <n-space :size="8">
           <n-button size="small" @click="emit('update:show', false)">关闭</n-button>
           <n-button size="small" :loading="testing" :disabled="saving" @click="runTest">发送测试</n-button>
-          <n-button size="small" type="primary" :loading="saving" :disabled="testing" @click="save">保存配置</n-button>
+          <n-button size="small" type="primary" :loading="saving" :disabled="testing || loadFailed" @click="save"
+            >保存配置</n-button
+          >
         </n-space>
       </div>
     </template>
@@ -453,6 +471,11 @@ const HIGHLIGHT_RISK_NOTE =
   '{{highlight}} 可能是短信验证码原文。插入模板后，验证码会随通知一起发送给第三方服务；只在你信任该服务时使用。';
 
 const loading = ref(false);
+/**
+ * 读取失败标记（计划 §6.9 B8-7）。true 时弹窗里那份表单只是硬编码初值，
+ * 必须挂提示条并挡住保存 —— 否则「读失败」与「配置为空」在界面上长得一模一样。
+ */
+const loadFailed = ref(false);
 const saving = ref(false);
 const testing = ref(false);
 const headersEditing = ref(false);
@@ -726,7 +749,11 @@ async function loadConfig() {
   try {
     const { data } = await api.get(Endpoints.notify.webhookConfig);
     applyConfig(data);
+    loadFailed.value = false;
   } catch (e: any) {
+    // 原来的 catch 只弹一条 toast，弹窗继续渲染空表单（观感等同「配置为空」）——
+    // 现在同时置失败标记，由模板里的提示条与禁用的保存按钮接管（计划 §6.9 B8-7）
+    loadFailed.value = true;
     message.error(e?.response?.data?.error || '加载 Webhook 配置失败');
   } finally {
     loading.value = false;
@@ -790,6 +817,11 @@ function validate(): string | null {
 }
 
 async function save() {
+  // 与 GeneralPanel 的 generalLoaded 同一纪律：没读到设备真值就禁止写回（按钮已禁用，这里再挡一次）
+  if (loadFailed.value) {
+    message.warning('配置尚未从设备读取，保存已阻止');
+    return;
+  }
   const invalid = validate();
   if (invalid) {
     message.error(invalid);
@@ -857,10 +889,26 @@ watch(
   所以时长与缓动写成两个局部自定义属性（见 .field-swap-*），供那组过渡共用 ——
   直接把 160ms 抄进每条规则的话，以后统一节奏就得逐条改。颜色一律用既有令牌。
 */
-.row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
+/* ── 字段类 ──
+   `.field` / `.field-label` / `.row-hint` / `.footer-bar` 已上收到 main.css（计划 §8.2 C2）。
+   `.test-result / .test-head` 仍留在本地：它们只有本文件与 LocalSmsConfigModal 两份副本，
+   不在 §8.2 的收敛名单里。 */
+/* 读取失败的提示条（计划 §6.9 B8-7）：说明 + 重试按钮同一行，窄屏自动折行 */
+.load-failed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.load-failed-text {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+/* 超时输入框（原为内联 style="width:150px"）：只占一格，不铺满整宽 */
+.num-compact {
+  width: 150px;
 }
 /* 风险提示只此一处用告警色：它讲的是「验证码会被发给第三方」这类后果，与普通说明不同权重 */
 .risk-hint {
@@ -906,16 +954,7 @@ watch(
   opacity: 0;
   transform: translateY(-4px);
 }
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 0;
-}
-.field-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+/* `.field` / `.field-label` 已上收到 main.css（计划 §8.2 C2），本文件不再保留副本 */
 .field-head {
   display: flex;
   align-items: center;
@@ -971,13 +1010,11 @@ watch(
   white-space: pre-wrap;
   word-break: break-all;
 }
-.footer-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  width: 100%;
+/* 响应体的滚动区高度（原为内联 style="max-height:120px"）：
+   它只是弹窗内容区里的一小块，不由 .modal-fit 的 --modal-h 管 —— 那管的是整张卡片。
+   120px 定值刻意保留：响应体可能是几十行 JSON，给一个固定的矮窗比按比例更好用。 */
+.resp-scroll {
+  max-height: 120px;
 }
 
 @media (max-width: 768px) {

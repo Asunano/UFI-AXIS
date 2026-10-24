@@ -36,9 +36,36 @@
   同时新增「严重事件兜底」开关（`NotificationConfig.critical_override_enabled`，**默认开启**）。
   它是**跨渠道**的一条规则，所以摆在清单上方而不是塞进某一条渠道 —— 塞进去就得写三份开关，
   而三份改的是同一个字段。
+  2026-10-14：「本浏览器系统通知」自「设置 → 通用」迁入，单独一张卡摆在渠道清单上方。
+  它**不是第四条渠道**：下面三条渠道的每一项都对应 core 里的一份配置（改了就写设备），
+  而这一条只是本浏览器的本地偏好（localStorage + Web Notification 权限）—— 换浏览器、
+  换电脑都要各开一次，关掉它也拦不住设备端继续投递。混进渠道清单会让人以为关掉它就能
+  停掉设备端推送，所以宁可多一张卡，也不与那三条并列。
 -->
 <template>
   <div class="settings-panel">
+    <!--
+      本浏览器系统通知：本地偏好，不写设备配置。
+      单独一张卡而不是塞进下面「通知渠道」那张卡，理由见文件头 2026-10-14 那条。
+    -->
+    <GridCard class="full-width" title="本浏览器系统通知">
+      <ToggleRow
+        :model-value="browserNotifyOn"
+        :disabled="notifyBlocked"
+        :label="BROWSER_NOTIFY_LABEL"
+        :description="BROWSER_NOTIFY_DESC"
+        @update:model-value="toggleBrowserNotify"
+      />
+      <!--
+        提示用 n-alert 而不是一行灰字：它说的是「权限被拒 / 浏览器不支持」这类只能由用户
+        去浏览器站点设置里改的事 —— 灰字会被当成普通说明略过，而这两种情况下开关是灰的，
+        没有这条提示用户只会以为界面坏了。
+      -->
+      <n-alert v-if="notifyHintText" type="warning" :bordered="false" class="notify-alert">
+        {{ notifyHintText }}
+      </n-alert>
+    </GridCard>
+
     <GridCard class="full-width" title="通知渠道">
       <template #extra>
         <n-button size="small" quaternary :loading="anyLoading" @click="reloadAll">刷新</n-button>
@@ -89,7 +116,9 @@
             />
 
             <template v-if="form.enabled">
-              <div class="grid">
+              <!-- 两列字段栅格走全局 `.config-grid`（2026-10-21：原来是本地 .grid，
+                   与全局那份逐字相同的列定义 + 同一档 768px 折单列）。 -->
+              <div class="config-grid">
                 <div class="field">
                   <span class="field-label">SMTP 服务器</span>
                   <n-input v-model:value="form.smtp_host" size="small" placeholder="smtp.example.com" />
@@ -178,7 +207,7 @@
               <n-button size="tiny" quaternary :loading="diagLoading" @click="loadDiagnose">重新检查</n-button>
             </div>
             <div v-if="!diagnose" class="row-hint">尚未取到体检结果。</div>
-            <div v-else class="diag-grid">
+            <div v-else class="config-grid">
               <div v-for="item in diagRows" :key="item.label" class="diag-item">
                 <span class="row-hint">{{ item.label }}</span>
                 <n-tag :type="item.ok ? 'success' : 'warning'" size="tiny" :bordered="false">{{ item.text }}</n-tag>
@@ -242,10 +271,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted } from 'vue';
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
 import { useDialog, useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useLazyModal } from '@/composables/useLazyModal';
+import { disableBrowserNotify, enableBrowserNotify, isBrowserNotifyEnabled } from '@/composables/browserNotify';
 import {
   CRITICAL_OVERRIDE_DEFAULT,
   DAILY_LIMIT_UNLIMITED,
@@ -272,6 +302,79 @@ import {
 const message = useMessage();
 const dialog = useDialog();
 const api = getApiClient();
+
+// ══════════════════════════════════════════════════════════════
+// 本浏览器系统通知（web 本地偏好，2026-10-14 自 GeneralPanel 迁入）
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * 这一块与下面三条渠道的**根本差别**：它不写设备配置。
+ * 开关落的是本浏览器的 localStorage，并在用户点击时向浏览器申请通知权限
+ * （见 `@/composables/browserNotify`）；设备端该发什么照旧发，只是本浏览器要不要弹系统通知。
+ */
+const BROWSER_NOTIFY_LABEL = '浏览器系统通知';
+
+/**
+ * 说明位要一次说清三件事，少一件都会让人误判这一块的作用域：
+ * ① 只对本浏览器生效（换浏览器/换电脑各开一次）；② 不写设备配置；③ 只有页面在后台时才提醒
+ * —— 页面在前台时页内已有 toast/卡片，再叠一份系统通知是重复打扰（composable 里就是这么判的）。
+ */
+const BROWSER_NOTIFY_DESC =
+  '开启后，页面切到后台（标签页不在前台）时验证码与告警会弹出系统通知；只对本浏览器生效，不写设备配置，设备端的推送照旧。';
+
+const browserNotifyOn = ref(isBrowserNotifyEnabled());
+const browserNotifyHint = ref('');
+
+/**
+ * 浏览器能力与授权状态。**不支持 / 已被拒绝时开关必须禁用**：
+ * 这两种情况下 `enableBrowserNotify()` 只会原样返回一句说明，开关点了不会有任何反应，
+ * 看起来就像坏了。禁用 + 下面那条 alert 才是诚实的表达。
+ */
+const notifyUnsupported = ref(typeof Notification === 'undefined');
+// 类型由 Notification.permission 推出来，不手写 NotificationPermission：
+// 那个 DOM 类型名在 .vue 里会被 eslint 的 no-undef 当成未定义全局（TS 类型它认不出）
+const notifyPermission = ref(notifyUnsupported.value ? 'denied' : Notification.permission);
+const notifyBlocked = computed(() => notifyUnsupported.value || notifyPermission.value === 'denied');
+
+/** 环境本身导致的禁用原因（与「用户点了一次开关之后拿到的那句话」分开，两者都要能显示）。 */
+const notifyBlockedReason = computed(() => {
+  if (notifyUnsupported.value) return '当前浏览器不支持系统通知，无法在后台提醒。';
+  if (notifyPermission.value === 'denied') {
+    // 措辞与开关当前显示的开/关无关：被拒之后无论存的是哪个值都不会弹出系统通知
+    return '通知权限已被拒绝，系统通知不会弹出：请在本浏览器的站点设置里允许「通知」，再回到本页。';
+  }
+  return '';
+});
+
+/** alert 的内容：环境原因优先（它解释了开关为什么是灰的），否则显示上一次点击的结果。 */
+const notifyHintText = computed(() => notifyBlockedReason.value || browserNotifyHint.value);
+
+/**
+ * 重读浏览器授权状态。
+ *
+ * 用户被拒之后要去的是**浏览器的站点设置**（另一个标签页/另一个窗口），改完回到本页时
+ * 只在 setup 里读一次的权限值还是「拒绝」，开关会永远停在灰的 —— 而他明明已经改好了。
+ * 所以窗口重新获得焦点时重读一次。
+ */
+function refreshNotifyPermission() {
+  notifyUnsupported.value = typeof Notification === 'undefined';
+  notifyPermission.value = notifyUnsupported.value ? 'denied' : Notification.permission;
+}
+
+async function toggleBrowserNotify(v: boolean) {
+  if (v) {
+    // 必须在用户手势的同步调用栈里发 requestPermission，所以整个 toggle 由开关点击触发
+    const result = await enableBrowserNotify();
+    browserNotifyOn.value = result === '已开启';
+    browserNotifyHint.value = result === '已开启' ? '' : result;
+    // 授权结果可能改变权限状态（如用户在弹出的授权框里选了「拒绝」），重新读一次
+    refreshNotifyPermission();
+  } else {
+    disableBrowserNotify();
+    browserNotifyOn.value = false;
+    browserNotifyHint.value = '';
+  }
+}
 
 /**
  * GET /api/sms-forward/config 的响应形状（凭据字段只回 `*_set` 屏蔽位，不回明文）。
@@ -581,7 +684,13 @@ function reloadAll() {
   loadCriticalOverride();
 }
 
-onMounted(reloadAll);
+onMounted(() => {
+  reloadAll();
+  // 授权可能在别处被改（见 refreshNotifyPermission），窗口重新获得焦点时重读一次
+  window.addEventListener('focus', refreshNotifyPermission);
+});
+
+onUnmounted(() => window.removeEventListener('focus', refreshNotifyPermission));
 
 // ══════════════════════════════════════════════════════════════
 // Webhook 渠道（摘要卡；详细配置在 WebhookConfigModal 里）
@@ -881,36 +990,29 @@ function openHistory(channel: string) {
 
 <style scoped>
 /* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
-/* .row-hint 仍在用：字段说明、体检项标签都靠它，不随 ToggleRow 一起退役 */
+/* `.field` / `.field-label` / `.row-hint` 已上收到 src/styles/main.css（计划 §8.2 C2）。
+   这里**只留一条差异覆盖**：本文件的 `.row-hint` 原先没有 `line-height`（另外五份副本都是
+   1.5），为了不改变现有行距，用 `inherit` 还原原来的继承值。
+   scoped 选择器是 (0,2,0)，天然压过全局的 (0,1,0)。 */
 .row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
+  line-height: inherit;
 }
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 0;
-}
-.field-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
-.grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0 14px;
-}
-.diag-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px 14px;
-}
+/* 两列字段栅格（原 .grid / .diag-grid）已改用全局 .config-grid：
+   列数与 768px 折单列都在 main.css 里，这里不再各留一份。 */
 .diag-item {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  /* 360px 下标签 + 徽标会挤在一行里互相压字：允许换行（标签一行、徽标下一行） */
+  flex-wrap: wrap;
+}
+
+/* ── 本浏览器系统通知（不写设备配置，单独一张卡）──
+   说明位由 ToggleRow 提供；这条 alert 说的是「权限被拒 / 浏览器不支持」，
+   与开关之间留一点间距，免得看起来像是开关说明的一部分。 */
+.notify-alert {
+  margin-top: 10px;
 }
 
 /* ── 严重事件兜底（渠道清单上方的跨渠道规则，.sub-panel 是全局类）── */
@@ -930,10 +1032,6 @@ function openHistory(channel: string) {
   margin-bottom: 8px;
 }
 
-@media (max-width: 768px) {
-  .grid,
-  .diag-grid {
-    grid-template-columns: 1fr;
-  }
-}
+/* 窄屏折单列由全局 `.config-grid` 的 768px 档负责（本文件原先那条只服务于已删掉的
+   .grid / .diag-grid，随之删除，避免留下第四个断点数值）。 */
 </style>

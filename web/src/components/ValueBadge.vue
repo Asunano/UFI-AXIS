@@ -1,5 +1,9 @@
 <template>
-  <span class="value-badge" :class="[`badge-${size}`, `badge-${variant}`]" :style="badgeStyle">
+  <span
+    class="value-badge"
+    :class="[`badge-${size}`, `badge-${variant}`, { 'badge-tint-self': selfTinted }]"
+    :style="badgeStyle"
+  >
     <span v-if="label" class="badge-label">{{ label }}</span>
     <span class="badge-value">{{ value }}{{ unit || '' }}</span>
   </span>
@@ -33,23 +37,25 @@ const badgeStyle = computed(() => {
     // 中性底交给 CSS 类，这里只负责「有 color 就染数值」——没给 color 时用正文色
     return { color: props.color || 'var(--text-primary)' };
   }
-  return { background: tintedBg.value, color: props.color || 'var(--accent-color)' };
+  // tinted 且传了 color：底色由 `.badge-tint-self` 用 currentColor 叠出来（理由见 style 里的注释），
+  // 这里不给 background，否则会盖掉那层叠色。
+  return {
+    background: props.color ? undefined : 'var(--accent-color-light)',
+    color: props.color || 'var(--accent-color)',
+  };
 });
 
-const tintedBg = computed(() => {
-  const c = props.color;
-  // 不传 color 时数值取 var(--accent-color)，底色也必须走同一个令牌 ——
-  // 原来这里兜底写死 #2080f0（蓝），主色改绿后就成了「绿字蓝底」
-  if (!c) return 'var(--accent-color-light)';
-  // 将 hex 转为淡色背景
-  if (c.startsWith('#')) {
-    const r = parseInt(c.slice(1, 3), 16);
-    const g = parseInt(c.slice(3, 5), 16);
-    const b = parseInt(c.slice(5, 7), 16);
-    return `rgba(${r}, ${g}, ${b}, 0.1)`;
-  }
-  return 'var(--accent-color-light)';
-});
+/**
+ * 需要「底色跟着文字色走」的场景：tinted + 传了 color。
+ *
+ * 2026-10-21 修：原来的 `tintedBg` 只会把 **hex** 换算成 `rgba(r,g,b,0.1)`，
+ * 其余一律退回 `--accent-color-light`。而调用方传的可能是 CSS 变量
+ * （`var(--warning)`，以及 A1 把 `signalColor()` 改成返回 `var(--signal-*)` 之后
+ * 的监控页信号徽标）—— 那些分支就落成「橙字绿底」，且换肤后底色永远不跟。
+ * 变量值要到运行时才由浏览器解析，JS 里算不出来，所以改由 CSS 的 `currentColor`
+ * 低透明度叠层实现（见 `.badge-tint-self`），hex 与 `var()` 因此走同一条路径。
+ */
+const selfTinted = computed(() => props.variant === 'tinted' && !!props.color);
 </script>
 
 <style scoped>
@@ -87,6 +93,28 @@ const tintedBg = computed(() => {
 .badge-outline {
   background: var(--surface-elevated);
   border: 1px solid var(--border-subtle);
+}
+/* ── 自染色底（tinted 且传了 color）──
+   底色 = 「文字色 × 10%」。用 currentColor 叠层而不是在 JS 里算 rgba：
+   `color` 可能是 hex，也可能是 `var(--warning)` / `var(--signal-weak)` 这类 CSS 变量 ——
+   后者的具体值只有浏览器到运行时才知道，JS 里只能猜（原来就猜成了 `--accent-color-light`，
+   于是橙字配绿底，且换肤后底色永远不跟）。这里让底色直接继承文字色，两种形态一条路径。
+
+   · `isolation: isolate` 给本元素建独立层叠上下文，`z-index: -1` 的伪元素才会退到
+     **本元素的文字之下**、而不是整页背景之下（否则底色会被卡片背景遮住）；
+   · `border-radius: inherit` 跟着胶囊令牌（--radius-pill）走，不另写一份圆角。 */
+.value-badge.badge-tint-self {
+  position: relative;
+  isolation: isolate;
+}
+.value-badge.badge-tint-self::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: currentColor;
+  opacity: 0.1;
 }
 .badge-outline .badge-label {
   color: var(--text-muted);

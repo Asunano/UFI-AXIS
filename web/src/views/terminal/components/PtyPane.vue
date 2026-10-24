@@ -12,7 +12,9 @@
     <div v-show="connected" ref="termRef" class="pty-term"></div>
     <div v-if="enabled" class="pty-status">
       <span class="pty-status-dot" :class="{ on: running }" />
-      <span class="pty-status-text">{{ running ? 'ttyd 正在设备后台常驻（退出页面不会停止）' : 'ttyd 未在运行，连接时自动启动' }}</span>
+      <span class="pty-status-text">{{
+        running ? 'ttyd 正在设备后台常驻（退出页面不会停止）' : 'ttyd 未在运行，连接时自动启动'
+      }}</span>
       <n-button v-if="running" size="tiny" quaternary type="warning" @click="stopDaemon">停止后台 ttyd</n-button>
     </div>
   </div>
@@ -81,7 +83,7 @@ async function stopDaemon() {
 
 async function enableTtyd() {
   try {
-    await api.put('/api/config', { ttyd_enabled: true });  // 2026-10-07 修复：/api/config 只有 GET/PUT，POST 一律 405
+    await api.put('/api/config', { ttyd_enabled: true }); // 2026-10-07 修复：/api/config 只有 GET/PUT，POST 一律 405
     enabled.value = true;
     connect();
   } catch {
@@ -136,7 +138,8 @@ async function decodeFrame(raw: unknown) {
   let data: string;
   if (typeof raw === 'string') data = raw;
   else if (raw instanceof ArrayBuffer) data = new TextDecoder('utf-8').decode(raw);
-  else if (typeof Blob !== 'undefined' && raw instanceof Blob) data = new TextDecoder('utf-8').decode(await raw.arrayBuffer());
+  else if (typeof Blob !== 'undefined' && raw instanceof Blob)
+    data = new TextDecoder('utf-8').decode(await raw.arrayBuffer());
   else return; // 未知帧类型：丢弃，不让一条脏帧炸掉会话
   decodeTtydFrame(data);
 }
@@ -285,6 +288,9 @@ watch(connected, (v) => {
   display: flex;
   flex-direction: column;
 }
+/* 终端画布。与 ConsoleBubble / ConsoleTypingIndicator 同一条口径：
+   这一块整体是「一个终端」，底色与终端里的语义色属于那套配色，不跟本站的明暗模式与换肤走。
+   ui-baseline-allow: 终端画布底色，与 ConsoleBubble 同一口径，属于终端配色而非本站语义色 */
 .pty-term {
   flex: 1;
   min-height: 0;
@@ -306,6 +312,8 @@ watch(connected, (v) => {
   opacity: 0.75;
 }
 .pty-tip-err {
+  /* 终端面板自己的错误红（比 --error 亮一档，压在 #101014 上才够对比）。
+     ui-baseline-allow: 终端配色里的错误红，压在终端黑底上，与本站 --error 不是同一个色 */
   color: #e05555;
 }
 
@@ -325,7 +333,9 @@ watch(connected, (v) => {
   flex: none;
 }
 .pty-status-dot.on {
-  background: #18a058;
+  /* 2026-10-14 基线清理：原来写死 #18a058，而 --success 在明暗两态都是同一个值，
+     换过来零视觉变化。这是那批写死值里唯一"有等价令牌且值完全相同"的一处。 */
+  background: var(--success);
 }
 .pty-status-text {
   flex: 1;

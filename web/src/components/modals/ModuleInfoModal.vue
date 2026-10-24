@@ -1,5 +1,11 @@
 <template>
-  <n-modal v-model:show="show" preset="card" title="WiFi 模块信息" style="width: 520px; max-width: calc(100vw - 32px)">
+  <n-modal
+    v-model:show="show"
+    preset="card"
+    title="WiFi 模块信息"
+    class="modal-fit"
+    style="--modal-w: 520px; --modal-h: 640px"
+  >
     <n-spin :show="moduleInfoLoading">
       <div class="module-body">
         <div v-if="moduleInfoRows.length" class="kv-table">
@@ -85,9 +91,10 @@ watch(
   justify-content: flex-end;
   gap: 8px;
 }
+/* 高度交给 `.modal-fit`（--modal-h）管：内容区自己滚、头尾固定。
+   原先这里写的是 `max-height: min(420px, calc(100vh - 240px))` —— 240 是按桌面端卡片头尾
+   估的魔法数，手机上 `100vh` 还是地址栏收起时的高度，于是又套出一层内滚动（双层滚动条）。 */
 .module-body {
-  max-height: min(420px, calc(100vh - 240px));
-  overflow-y: auto;
   padding-right: 4px;
 }
 .kv-table {
@@ -122,7 +129,7 @@ watch(
   word-break: break-all;
   margin: 0;
   color: var(--text-primary);
-  max-height: 260px;
+  /* 内层 max-height 去掉（同上：滚动统一交给 `.modal-fit` 的内容区） */
   overflow-y: auto;
 }
 .hint-text {

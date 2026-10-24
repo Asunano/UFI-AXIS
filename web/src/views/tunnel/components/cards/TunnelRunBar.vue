@@ -14,30 +14,47 @@
       两个破坏性的在菜单里单独分组并标红；原先它们与「刷新」同尺寸并排，没有优先级之分；
     - 原来常驻在卡底的「全部停止会清空看护期望列表…」删掉 —— 那是确认弹窗该说的话
       （见 TunnelView.confirmStopAll 的 content），不该长期占版面。
+
+    2026-10-14：组件安装不再「就地弹窗」。原来读数行的「去安装」与 ⋯ 菜单的「组件管理」
+    都是 `emit('open-components')` → 打开本页的 ComponentsModal；现在 frpc/cloudflared
+    这类可下载资源统一收进「资源中心」页，本组件只负责把用户送过去（`open-resources`）。
+    取舍见下面模板与 moreOptions 上的注释。
   -->
   <section class="runbar">
     <div v-for="c in components" :key="c.key" class="rb-item" :class="{ 'rb-warn': !c.installed }">
       <div class="rb-head"><i class="dot" :class="dotClass(c)"></i>{{ c.name }}</div>
       <div class="rb-val">
-        <template v-if="c.installed">
+        <!-- 还没读到过 / 读失败：显示 `--`，不要用 reactive 的初值冒充读数。
+             旧实现在这两种情况下都会渲染「版本未知 · 未运行」，而"未运行"是结论，
+             不是占位 —— 隧道明明在跑的时候说它没跑，比什么都不说更糟。 -->
+        <template v-if="!loaded">
+          --
+          <em>{{ error ? '状态读取失败' : '读取中…' }}</em>
+        </template>
+        <template v-else-if="c.installed">
           {{ c.version || '版本未知' }}
           <em>{{ c.running ? `· ${c.running} 条在跑` : '· 未运行' }}</em>
         </template>
         <template v-else>
           未安装
-          <!-- 这里只给一颗 tiny：它是嵌在读数行里的次要动作，
+          <!-- 2026-10-14：原来这颗按钮是 `emit('open-components')` → 就地弹 ComponentsModal 安装。
+               组件安装整体收进「资源中心」后，本页不再复制一份安装 UI，只把人送过去
+               —— 这正是"当前分得太散了"要收掉的东西。
+               仍然只给一颗 tiny：它是嵌在读数行里的次要动作，
                和列表里的「启动」同尺寸会让人以为它才是本屏主按钮。 -->
-          <n-button size="tiny" @click="emit('open-components')">去安装</n-button>
+          <n-button size="tiny" @click="emit('open-resources')">前往资源中心</n-button>
         </template>
       </div>
     </div>
 
     <div class="rb-item" title="隧道回源指向这个端口">
       <div class="rb-head"><i class="dot"></i>回源端口</div>
-      <div class="rb-val">{{ localPort || '--' }}</div>
+      <div class="rb-val">{{ loaded ? localPort || '--' : '--' }}</div>
     </div>
 
     <div class="rb-act">
+      <!-- 刷新同时是「读取失败」的重试入口；失败原因放 title，不占版面 -->
+      <span v-if="error" class="rb-err" :title="error">状态读取失败</span>
       <n-button quaternary size="small" :loading="loading" title="刷新" aria-label="刷新" @click="emit('refresh')">
         <template #icon>
           <n-icon><RefreshOutline /></n-icon>
@@ -73,11 +90,17 @@ defineProps<{
   components: OverviewComponent[];
   localPort: number;
   loading: boolean;
+  /** 是否已经成功读到过 `/api/tunnel/status`（否则读数一律 `--`，见模板注释） */
+  loaded: boolean;
+  /** 最近一次读取失败的原因（空串 = 成功）。有旧读数时保留旧读数并挂一个提示 */
+  error: string;
 }>();
 
 const emit = defineEmits<{
   refresh: [];
-  'open-components': [];
+  /** 2026-10-14：原名 `open-components`（就地弹安装弹窗）。组件安装收进资源中心后改名 ——
+      事件名要说出它真正干的事，留着一个叫 components 却跳去 resources 的事件迟早会误导人。 */
+  'open-resources': [];
   'open-guard': [];
   'clear-logs': [];
   'stop-all': [];
@@ -91,7 +114,10 @@ function dotClass(c: OverviewComponent): string {
 
 /** 破坏性两项走 props.style 上色（本项目既有写法，见 FilesToolbar 的 sortOptions）。 */
 const moreOptions: DropdownOption[] = [
-  { label: '组件管理', key: 'components' },
+  // 2026-10-14：原「组件管理」开的是就地弹窗 ComponentsModal（挂载已随资源中心收口断开）。
+  // 这一格**保留**、只换去向：「装/卸组件」是低频但真实存在的诉求，删掉它就只剩读数行里
+  // 那颗只在"未安装"时出现的 tiny 按钮 —— 组件装好之后反而再也找不到管理入口了。
+  { label: '资源中心', key: 'resources' },
   { label: '看护设置', key: 'guard' },
   { type: 'divider', key: 'd1' },
   { label: '清空全部日志', key: 'clear-logs', props: { style: 'color: var(--error)' } },
@@ -99,7 +125,7 @@ const moreOptions: DropdownOption[] = [
 ];
 
 function onMore(key: string) {
-  if (key === 'components') emit('open-components');
+  if (key === 'resources') emit('open-resources');
   else if (key === 'guard') emit('open-guard');
   else if (key === 'clear-logs') emit('clear-logs');
   else if (key === 'stop-all') emit('stop-all');
@@ -160,6 +186,12 @@ function onMore(key: string) {
   align-items: center;
   gap: var(--space-1);
   padding-left: var(--space-2);
+}
+/* 读取失败的角标：放在动作区，紧挨着重试用的刷新按钮。完整原因在 title 里 */
+.rb-err {
+  font-size: var(--font-xs);
+  color: var(--error);
+  white-space: nowrap;
 }
 
 /* ── 状态点与呼吸光环 ──

@@ -61,6 +61,20 @@
             {{ h }}
           </span>
         </div>
+        <div class="token-row">
+          <span class="token-name">信号四档</span>
+          <span v-for="s in signalTokens" :key="s" class="signal-item">
+            <span class="swatch-chip" :style="{ background: `var(--signal-${s})` }" :title="`--signal-${s}`"></span>
+            <code>{{ s }}</code>
+          </span>
+          <code class="token-note">--signal-good / fair / weak / poor（RSRP 四档，三档语义色装不下）</code>
+        </div>
+        <div class="token-row">
+          <span class="token-name">中性浅档</span>
+          <span class="neutral-chip" title="--neutral-light / --neutral-light-bg">debug</span>
+          <span class="swatch-chip" :style="{ background: 'var(--neutral-light)' }" title="--neutral-light"></span>
+          <code class="token-note">--neutral-light（字）/ --neutral-light-bg（底）—— 日志 debug 徽标</code>
+        </div>
       </div>
     </GridCard>
 
@@ -199,12 +213,59 @@
     <!-- ── 8. 弹窗壳 ── -->
     <GridCard title="8. 弹窗壳（n-modal preset=card，与 GridCard 是两套外观）">
       <n-button size="small" @click="modalVisible = true">打开弹窗比对边框/圆角</n-button>
-      <n-modal v-model:show="modalVisible" preset="card" title="弹窗壳" style="width: 420px">
+      <n-modal v-model:show="modalVisible" class="modal-fit" preset="card" title="弹窗壳" style="--modal-w: 420px">
         <ToggleRow v-model="demoToggleA" label="弹窗里的设置行" description="与页面里应当完全一致" />
         <div class="sub-panel gallery-gap">弹窗里的 .sub-panel</div>
         <template #footer>
           <div class="card-actions">
             <n-button size="small" @click="modalVisible = false">关闭</n-button>
+          </div>
+        </template>
+      </n-modal>
+    </GridCard>
+
+    <!-- ── 8·1. 弹窗 .modal-fit 验收（两档）── -->
+    <GridCard title="8·1 弹窗 .modal-fit 两档验收（宽 / 宽 + 限高）">
+      <p class="gallery-desc">
+        验收的是「矮屏弹窗」这一类毛病（计划 §6.1 A1-6）。每档都塞了 60 行，请在
+        <b>360×640</b> 与 <b>1366×680</b> 两个视口下点开： ① 卡片左右各留安全边距，不应出现一条贴边的整屏白块； ②
+        长内容由<b>内容区自己滚</b> —— 标题与底部按钮始终留在视野里， 滚动条出现在卡片内部，而不是整张卡片滚出屏幕。
+      </p>
+      <div class="btn-row">
+        <n-button size="small" @click="fitModalNarrow = true">520px 宽（未传 --modal-h）</n-button>
+        <n-button size="small" type="primary" @click="fitModalWide = true">960px 宽 + --modal-h: 480px</n-button>
+      </div>
+
+      <n-modal
+        v-model:show="fitModalNarrow"
+        class="modal-fit"
+        preset="card"
+        title="520px 宽 · 未传 --modal-h"
+        style="--modal-w: 520px"
+      >
+        <ol class="long-lines">
+          <li v-for="n in 60" :key="n">第 {{ n }} 行：内容区应当自己滚，标题与底部按钮不动。</li>
+        </ol>
+        <template #footer>
+          <div class="card-actions">
+            <n-button size="small" @click="fitModalNarrow = false">关闭</n-button>
+          </div>
+        </template>
+      </n-modal>
+
+      <n-modal
+        v-model:show="fitModalWide"
+        class="modal-fit"
+        preset="card"
+        title="960px 宽 · --modal-h: 480px"
+        style="--modal-w: 960px; --modal-h: 480px"
+      >
+        <ol class="long-lines">
+          <li v-for="n in 60" :key="n">第 {{ n }} 行：限高 480px 后，卡片的头尾必须固定、只有这里滚。</li>
+        </ol>
+        <template #footer>
+          <div class="card-actions">
+            <n-button size="small" @click="fitModalWide = false">关闭</n-button>
           </div>
         </template>
       </n-modal>
@@ -280,6 +341,8 @@ const spaceTokens = ['--space-1', '--space-2', '--space-3', '--space-4', '--spac
 const fontTokens = ['--font-xs', '--font-sm', '--font-base', '--font-md', '--font-lg', '--font-xl', '--font-2xl'];
 /** 分类色十档。切到暗色时这一排应当变成「深底亮字」而不是浅底深字 —— 这是 W4 的验收位置 */
 const catHues = ['green', 'blue', 'red', 'orange', 'brown', 'yellow', 'purple', 'teal', 'indigo', 'neutral'];
+/** 信号四档：质量降序。切暗色后是「同色系提亮」，不是换一批色相 */
+const signalTokens = ['good', 'fair', 'weak', 'poor'];
 
 const demoToggleA = ref(true);
 const demoToggleB = ref(false);
@@ -289,6 +352,9 @@ const demoNumber = ref(30);
 const demoText = ref('');
 const gaugeValue = ref(42);
 const modalVisible = ref(false);
+// 8·1 的两档弹窗：短内容只验宽度，长内容验「内容区自己滚、头尾固定」
+const fitModalNarrow = ref(false);
+const fitModalWide = ref(false);
 
 // 分步向导的演示态。第 2 步刻意设成必填，用来验收"拦下时必须写出理由"。
 const wizardStep = ref(0);
@@ -389,6 +455,31 @@ const wizardSteps = computed<WizardStep[]>(() => [
   border-radius: var(--radius-pill);
   font-size: var(--font-xs);
   font-weight: 500;
+}
+/* 信号四档：色块 + 名称并排（不把文字压在色块上）。
+   四档里 yellow / orange 在暗色档是亮色，白字压上去对比度不够；
+   名称留在正文色里，明暗两态都能读，色卡本身只负责显示色值。 */
+.signal-item {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-xs);
+}
+/* 中性浅档：一对令牌「字色 + 淡底」，模拟日志 debug 徽标的用法 */
+.neutral-chip {
+  padding: 3px 12px;
+  border-radius: var(--radius-pill);
+  font-size: var(--font-xs);
+  font-weight: 500;
+  color: var(--neutral-light);
+  background: var(--neutral-light-bg);
+}
+/* 8·1 的 60 行长内容：只是为了撑出滚动，不承担版式示范 */
+.long-lines {
+  padding-left: var(--space-5);
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+  line-height: 1.8;
 }
 
 /* 卡片段 */

@@ -1,9 +1,17 @@
 <template>
-  <n-modal :show="show" preset="dialog" :title="title" style="width: 360px" @update:show="emit('update:show', $event)">
-    <n-input v-model:value="value" :placeholder="placeholder" @keyup.enter="emit('confirm', value)" />
+  <!-- 宽高交给全局 `.modal-fit`（360px 视口下不再出屏） -->
+  <n-modal
+    :show="show"
+    preset="dialog"
+    :title="title"
+    class="modal-fit"
+    style="--modal-w: 360px"
+    @update:show="emit('update:show', $event)"
+  >
+    <n-input v-model:value="value" :placeholder="placeholder" @keyup.enter="submit" />
     <template #action>
       <n-button @click="emit('update:show', false)">取消</n-button>
-      <n-button type="primary" :loading="loading" @click="emit('confirm', value)">{{ confirmText }}</n-button>
+      <n-button type="primary" :loading="loading" @click="submit">{{ confirmText }}</n-button>
     </template>
   </n-modal>
 </template>
@@ -45,6 +53,17 @@ const emit = defineEmits<{
 }>();
 
 const value = ref(props.initialValue);
+
+/**
+ * 提交的唯一出口（回车与按钮共用）。
+ *
+ * 必须判 `loading`：回车不受按钮禁用态约束，原来回车可以连按 ——
+ * 每按一次就 emit 一次 confirm，页面那边会并发发两个 mkdir/rename 请求。
+ */
+function submit() {
+  if (props.loading) return;
+  emit('confirm', value.value);
+}
 
 watch(
   () => props.show,

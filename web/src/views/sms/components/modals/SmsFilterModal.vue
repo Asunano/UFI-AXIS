@@ -7,9 +7,18 @@
 
   硬边界：**web 不做任何拦截判定**。命中与否全在 core（命中就不推、不发、不返回），
   这里只做规则的增删改查与两个开关的读写。
+
+  宽高由 `.modal-fit` 收口（`--modal-w` / `--modal-h`）：规则可能很多，需要
+  「内容区自己滚、标题与底栏常驻」，不能让整张卡片滚出矮屏（见 main.css 里那段说明）。
 -->
 <template>
-  <n-modal v-model:show="show" preset="card" title="短信拦截规则" style="width: 560px; max-width: calc(100vw - 32px)">
+  <n-modal
+    v-model:show="show"
+    preset="card"
+    title="短信拦截规则"
+    class="modal-fit"
+    style="--modal-w: 560px; --modal-h: 640px"
+  >
     <n-spin :show="loading">
       <!--
         豁免开关：默认值与 core 的 `smsFilterExemptVerificationCode` 一致（true），
@@ -75,6 +84,7 @@
           </div>
           <div class="rule-actions">
             <n-button size="tiny" quaternary @click="openForm(r)">编辑</n-button>
+            <!-- ui-baseline-allow: 规则行里的紧凑启停开关；这一行已被「编辑 / 删除」占满，套 ToggleRow 会把单行撑成两行 -->
             <n-switch
               size="small"
               :value="r.enabled"
@@ -301,18 +311,17 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.modal-footer {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-}
+/* `.modal-footer` / `.field-label` 已上收到 src/styles/main.css（计划 §8.2 C2）。
+   两处差异**保留本地覆盖**（scoped 选择器是 (0,2,0)，压过全局的 (0,1,0)）：
+     · `.field` 的上下内距是 6px（全局 10px）—— 这里是一屏七八个筛选项的密集表单；
+     · `.field-label` 用 `--font-sm`（12px），与同弹窗的 `.hint-text` 同档（全局 13px）。 */
 .hint-text {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   line-height: 1.5;
 }
 .empty-hint {
-  padding: 12px 0;
+  padding: var(--space-3) 0;
 }
 .rules-toolbar {
   display: flex;
@@ -321,7 +330,7 @@ onMounted(() => {
   margin: 14px 0 8px;
 }
 .section-title {
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -334,15 +343,12 @@ onMounted(() => {
   grid-template-columns: 1fr 1fr;
   gap: 0 12px;
 }
+/* 与全局 .field 的差异只有上下内距（见文件头注释） */
 .field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
   padding: 6px 0;
 }
 .field-label {
-  font-size: 12px;
-  color: var(--text-secondary);
+  font-size: var(--font-sm);
 }
 .form-actions {
   display: flex;
@@ -372,14 +378,14 @@ onMounted(() => {
   min-width: 0;
 }
 .rule-pattern {
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 500;
   color: var(--text-primary);
   word-break: break-all;
 }
 .rule-meta {
   margin-top: 2px;
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
 }
 .rule-actions {

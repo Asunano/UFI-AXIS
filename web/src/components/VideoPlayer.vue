@@ -21,6 +21,14 @@
      而我们的 url 每次都带一张**新票据** —— 不给 `id` 的话每次都是新 key，记忆永远不生效。
      这里用设备上的文件路径作为 `id`。
 
+  ## 起播失败（2026-10-22 补）
+  C 档由 `canPlayType` 判定；A/B 档靠 `video:error` 兜底。但 Chromium 对某些 MKV
+  **根本不发 error**，只发一个 `stalled`，然后 `readyState` 永远是 0 —— 用户看到的是
+  无限转圈，和"网速慢"完全同形。所以对 **native 档**额外监听 `video:stalled` 并给
+  15 秒宽限（见 [STALL_GRACE_MS]）：期间没有任何可播数据就按"加载超时"处理（**不**断言容器不支持），
+  给出明确文案与下载入口。`error.code === 3/4` 的文案也会说到容器这一层
+  （见 [runtimeErrorText]）。
+
   ## 外挂字幕
   三段都走"**先用 axios 把文本取下来**"，因为 `/api/media/subtitle` 要验签，
   而播放器内部的 fetch 带不上签名头（详见 [fetchSubtitleText]）：
@@ -57,6 +65,7 @@ import {
   artplayerTypeOf,
   mediaErrorTextOf,
   unsupportedReasonOf,
+  videoExtOf,
   videoTierOf,
   type VideoTier,
 } from '@/composables/videoFormat';
@@ -156,7 +165,79 @@ const runtimeError = ref('');
 const subtitleBlobUrls: string[] = [];
 
 const tier = computed<VideoTier>(() => videoTierOf(props.name));
-const unsupportedReason = computed(() => unsupportedReasonOf(props.name));
+/**
+ * 已知容器名的中文说法。只用于把失败原因**说到容器这一层**：
+ * `canPlayType` 判死、`error.code === 4`、起播一直 stalled，这三种情况用户需要看到
+ * "浏览器不支持 MKV 容器"，而不是笼统的"不支持该视频" —— 前者能直接告诉他
+ * "换容器/换浏览器/下载"，后者只能让他怀疑文件坏了。
+ */
+const CONTAINER_LABELS: Record<string, string> = {
+  mkv: 'MKV',
+  avi: 'AVI',
+  wmv: 'WMV',
+  asf: 'ASF',
+  rm: 'RM',
+  rmvb: 'RMVB',
+  vob: 'VOB',
+  mpg: 'MPEG',
+  mpeg: 'MPEG',
+  divx: 'DivX',
+  mov: 'MOV',
+};
+
+/** 容器层面的劝退文案；文件名不在表里时返回空串（调用方退回通用文案）。 */
+function containerUnsupportedText(name: string): string {
+  const label = CONTAINER_LABELS[videoExtOf(name)];
+  if (!label) return '';
+  return `浏览器不支持 ${label} 容器，请下载后用本地播放器播放。`;
+}
+
+/**
+ * C 档的文案。优先说容器（「浏览器不支持 MKV 容器…」），
+ * 表里没有的扩展名才退回 `videoFormat` 里的通用说法。
+ */
+const unsupportedReason = computed(() => containerUnsupportedText(props.name) || unsupportedReasonOf(props.name));
+
+/**
+ * `error.code` 的文案。`mediaErrorTextOf` 负责把码值翻成人话，这里在它前面补一层
+ * 容器/编码的判据：
+ *  · code 4（SRC_NOT_SUPPORTED）：与 `canPlayType` 判死是同一类失败 —— 直接说容器；
+ *  · code 3（DECODE）：容器进去了、内部编码解不了 —— 把容器名和常见编码带上，
+ *    用户才知道"不是文件坏了，是浏览器不收这个编码"。
+ */
+function runtimeErrorText(err: MediaError | null | undefined): string {
+  const ext = videoExtOf(props.name).toUpperCase();
+  if (err?.code === 4) {
+    const label = CONTAINER_LABELS[videoExtOf(props.name)];
+    // 票据过期时 core 也会回 4xx，浏览器同样报 code 4 —— 所以不把"不支持容器"
+    // 说成唯一原因（卡片上有「重试」按钮，会换一张新票据）
+    if (label) {
+      return `浏览器无法播放该 ${label} 文件（容器或内部编码不受支持，也可能是播放票据已过期）。可先点「重试」换一张票据；仍不行就下载后用本地播放器播放。`;
+    }
+    return mediaErrorTextOf(err, props.name);
+  }
+  if (err?.code === 3) {
+    return `${ext ? `${ext} 容器能识别，但` : ''}视频内部的编码（如 H.265 / ProRes）或音轨（AC3 / DTS）可能不被当前浏览器支持，请下载后用本地播放器播放。`;
+  }
+  return mediaErrorTextOf(err, props.name);
+}
+
+/**
+ * stalled 的宽限期（毫秒）。
+ *
+ * 播放地址是局域网直连：正常文件 1–3 秒内就该 `loadedmetadata`。而容器/编码不被接受时，
+ * Chromium 往往不发 error，只发 `stalled` 且 `readyState` 停在 0 —— 无限转圈与"网速慢"
+ * 长得一模一样。8 秒是保守值：真慢的网络里 `readyState` 会推进（于是计时被清掉），
+ * 到了这个时间仍然一个字节都没解出来，更可能是格式问题。
+ */
+const STALL_GRACE_MS = 15000;
+let stallTimer: number | null = null;
+function clearStallTimer() {
+  if (stallTimer !== null) {
+    window.clearTimeout(stallTimer);
+    stallTimer = null;
+  }
+}
 
 /**
  * 收掉 assjs 实例。
@@ -176,6 +257,9 @@ function destroyAss() {
 }
 
 function destroyPlayer() {
+  // 起播宽限计时必须在收播放器之前停掉：否则换片/关页之后它仍会醒来，
+  // 对着一条已经不存在的流报"不支持"（art 为 null 时有守卫，但没必要留一颗定时炸弹）
+  clearStallTimer();
   // 先收解复用器再销毁播放器：反过来的话 art already destroyed 时 demuxer 还挂在
   // 一个已解绑的 video 上，某些版本会抛
   if (demuxer) {
@@ -614,7 +698,7 @@ async function createPlayer() {
 
   // A 档的第二道兜底：容器对了不代表编码对了（HEVC / AC3 / ProRes 都在这里失败）
   art.on('video:error', () => {
-    const msg = mediaErrorTextOf(art?.video?.error, props.name);
+    const msg = runtimeErrorText(art?.video?.error);
     runtimeError.value = msg;
     emit('error', msg);
     // 报错后把播放器收掉：留着它只会显示一个黑框盖住上面的提示
@@ -627,6 +711,45 @@ async function createPlayer() {
     emit('error', msg);
     destroyPlayer();
   });
+
+  /**
+   * 起播阶段的 stalled：`error` 不一定来（见文件头「起播失败」）。
+   *
+   * 只在"还没有任何可播数据"时计时：`readyState > 0` 或已经开始播的都不算
+   * （播放中途网络抖动是另一回事，交给控制条自己的缓冲提示）。
+   */
+  art.on('video:stalled', () => {
+    if (!art) return;
+    // 只对 native 档做这件事：B 档（flv / hls / ts）的启动本来就交给解复用器，
+    // MSE 首帧慢是常态，拿时间判"不支持"会误伤；它们的失败走 `art.on('error')`。
+    if (tier.value !== 'native') return;
+    const v = art.video as HTMLVideoElement;
+    if (v.readyState > 0 || v.currentTime > 0) return;
+    // 已经在计时就不再续期：stalled 可能每隔几秒反复发一次，
+    // 每发一次都重置计时的话这个宽限期永远不会到点。
+    if (stallTimer !== null) return;
+    stallTimer = window.setTimeout(() => {
+      stallTimer = null;
+      if (!art) return;
+      const video = art.video as HTMLVideoElement;
+      // 宽限期内只要解出过一帧/拿到元数据，就说明容器是对的，不当格式问题处理
+      if (video.readyState > 0 || video.currentTime > 0) return;
+      // 注意：这里**不能**再说"浏览器不支持 MKV 容器"。
+      // 容器能不能放已经由 `videoTierOf` + `canPlayType` 判过（能走到 native 档就说明
+      // 容器是认的）；15 秒没数据更可能是设备读取慢 / 网络卡住 / 内部编码解不出。
+      // 之前直接把 `containerUnsupportedText()` 放在这里，导致"网速慢的 MKV"被误报成
+      // "浏览器不支持 MKV"，用户按提示去下载也能播 —— 那是错的诊断。
+      const msg =
+        '视频在 15 秒内没有开始播放。可能是设备读取或网络较慢，也可能是文件内部编码（如 H.265 / AC3）不被当前浏览器支持。可点「重试」再试一次，或下载后用本地播放器播放。';
+      runtimeError.value = msg;
+      emit('error', msg);
+      destroyPlayer();
+    }, STALL_GRACE_MS);
+  });
+  // 任何"开始有数据"的信号都取消宽限计时
+  art.on('video:loadedmetadata', clearStallTimer);
+  art.on('video:canplay', clearStallTimer);
+  art.on('video:playing', clearStallTimer);
 
   // 字幕：播放器建好之后再拉。放在 ready 之后是因为 `art.setting.add` 与
   // `art.subtitle.switch` 都要求播放器已初始化完成。
@@ -667,12 +790,21 @@ onBeforeUnmount(destroyPlayer);
 </script>
 
 <style scoped>
+/* 视频画布。信箱边（letterbox）必须是纯黑，与影片本身同色，
+   接 --card-bg 会在暗色下与卡片糊成一片、在浅色下把画面框成一个白边方块。
+   ui-baseline-allow: 视频画布底色，两种主题下都必须是纯黑 */
 .vp-host {
   width: 100%;
   aspect-ratio: 16 / 9;
-  max-height: 68vh;
   border-radius: var(--radius-md);
   overflow: hidden;
+  background: #000;
+}
+/* ArtPlayer 默认给 video 宽高 100% 且不设 object-fit，4:3/竖屏源会被硬拉成
+   16:9。这里必须 contain：窗口固定 16:9，非 16:9 的画面留黑边，不拉伸。 */
+.vp-host :deep(video.art-video) {
+  object-fit: contain;
+  /* ui-baseline-allow: 视频信箱边必须是纯黑，不能跟随主题 */
   background: #000;
 }
 
@@ -716,9 +848,6 @@ onBeforeUnmount(destroyPlayer);
 }
 
 @media (max-width: 768px) {
-  .vp-host {
-    max-height: 42vh;
-  }
   .vp-unsupported {
     min-height: 180px;
     padding: 16px;

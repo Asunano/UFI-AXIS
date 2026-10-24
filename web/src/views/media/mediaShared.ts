@@ -44,6 +44,14 @@ export interface MediaItem {
   album?: string;
   artist?: string;
   title?: string;
+  /**
+   * 旁挂字幕条数（2026-10-14 补）。
+   *
+   * core 的 `/list` 一直在算这个字段（`MediaRoutes` 里按同名规则匹配 `.srt`/`.ass`…），
+   * app 的列表也一直在用它显示「字幕 3」；web 的 `MediaItem` 此前**没有这个字段**，
+   * 所以数据到了前端也用不上。**声明类型不等于有数据** —— 它只在视频条目上出现。
+   */
+  subtitle_count?: number;
 }
 
 /** `GET /api/media/list` 的响应。 */
@@ -69,23 +77,108 @@ export const MEDIA_THUMB_SIZE = 256;
 export type MediaApiClient = Pick<AxiosInstance, 'get' | 'post'>;
 
 /**
+ * `/list` 的服务端筛选参数（2026-10-14 加，给音乐页的分组浏览回查用）。
+ *
+ * 三个字段与 core 的 query 参数**同名同义**，其中 `dir` 刻意不叫 `folder`：
+ * `folder` 是分组的**维度**名（`/groups?by=folder`），而回查 `/list` 时那个参数叫 `dir`。
+ * 名字不一致是 core 侧的既有事实（见 `MediaRoutes` 的 `queryParameters["dir"]`），
+ * 这里照抄而不是"统一"——统一就得在两端各加一层翻译，只会多一个出错的地方。
+ */
+export interface MediaFilter {
+  album?: string;
+  artist?: string;
+  dir?: string;
+}
+
+/**
+ * 排序维度。取值与 core 的 `listComparator` **逐字一致**（`name` / `size` / 其余一律按 `date`）。
+ * 写错不会报错 —— core 的 `when` 走 `else` 分支静默按日期排，用户会以为"排序没生效"。
+ */
+export type MediaSortKey = 'date' | 'name' | 'size';
+
+/** 排序方向。core 侧 `order != "asc"` 即降序，所以只认 `asc` 与 `desc` 两个值。 */
+export type MediaSortOrder = 'asc' | 'desc';
+
+export interface MediaSort {
+  key: MediaSortKey;
+  order: MediaSortOrder;
+}
+
+/**
+ * 默认排序：修改时间倒序。
+ *
+ * 与 core 的兜底分支一致（不传 `sort` 就是按 `date_modified`），也是三页拆分之前
+ * 硬编码的那个口径 —— 拆出来只是让它可改，默认行为一点没变。
+ */
+export const DEFAULT_MEDIA_SORT: MediaSort = { key: 'date', order: 'desc' };
+
+/**
+ * 六档排序，与 app 的 `MediaLibraryPage` 的 `UfiSortAction` 一一对应
+ * （时间↑↓ / 名称↑↓ / 大小↑↓）。**做成"六个平铺选项"而不是"三个维度 + 一个方向开关"**：
+ * 后者要点两次才能表达"名称升序"，而且两个控件之间的联动（换维度时方向要不要重置）
+ * 是额外的状态，六档一次点清更省事。
+ */
+export const MEDIA_SORT_OPTIONS: ReadonlyArray<{ label: string; value: string } & MediaSort> = [
+  { label: '最近修改', value: 'date-desc', key: 'date', order: 'desc' },
+  { label: '最早修改', value: 'date-asc', key: 'date', order: 'asc' },
+  { label: '名称 A→Z', value: 'name-asc', key: 'name', order: 'asc' },
+  { label: '名称 Z→A', value: 'name-desc', key: 'name', order: 'desc' },
+  { label: '从大到小', value: 'size-desc', key: 'size', order: 'desc' },
+  { label: '从小到大', value: 'size-asc', key: 'size', order: 'asc' },
+];
+
+/** `MediaSort` → 上面那个下拉的 value（用于 `n-select` 的 `v-model`）。 */
+export function mediaSortValue(s: MediaSort): string {
+  return `${s.key}-${s.order}`;
+}
+
+/** 下拉的 value → `MediaSort`。认不出回默认，不要抛。 */
+export function mediaSortOf(value: string): MediaSort {
+  return MEDIA_SORT_OPTIONS.find((o) => o.value === value) ?? DEFAULT_MEDIA_SORT;
+}
+
+/**
  * 拉一页列表。
  *
- * 排序固定「按修改时间倒序」：媒体库里"最近加进来的"几乎总是用户要找的，
- * 而 app 端首页也是这个口径。需要别的排序时再把参数提上来。
+ * 排序**默认**「按修改时间倒序」：媒体库里"最近加进来的"几乎总是用户要找的，
+ * 而 app 端首页也是这个口径。2026-10-14 起排序可以由用户改（见 [MediaSortKey]）——
+ * 此前三页都硬编码 `sort:'date', order:'desc'`，而 app 侧 `MediaLibraryPage` 有六档排序，
+ * web 一个入口都没有。
  *
  * 权限不足时 core 回 **HTTP 403**（`code` 仍是 `BAD_REQUEST`，没有专用错误码），
  * axios 会抛出 —— 调用方据 `status === 403` 显示"未授权"，不要把它当普通网络错误。
+ *
+ * ──── 为什么筛选参数放在这里，而不是在客户端过滤 ────
+ * core 侧是"先按标签筛完、再排序分页"（等价于原来的 SQL `WHERE album = ?`）。
+ * 客户端自己筛的话，得先把整库几千首翻页拉完才可能筛对 —— 而分组浏览明明已经从
+ * `/groups` 知道"这一组共 N 首"，却还要拉全库才能凑出这 N 首，纯属把服务端已经做完的事
+ * 在浏览器里重做一遍。所以筛选必须跟着 `offset` / `limit` 一起下推到 core。
+ *
+ * `filter` 里为空串的字段**不并进 params**：core 的 `filterParam` 把空串当"没传"，
+ * 传一个 `album=` 会静默退回整库（而不是"筛选出空集"），结果比不筛更错。
+ *
+ * **排序同理必须下推**：客户端排序只能排"已经翻出来的那 60 条"，
+ * 用户按名称排序时看到的会是"每页内部有序、页与页之间乱序"——比没有排序更误导。
  */
 export async function fetchMediaPage(
   api: MediaApiClient,
   kind: MediaKind,
   offset = 0,
-  limit = MEDIA_PAGE_SIZE
+  limit = MEDIA_PAGE_SIZE,
+  filter?: MediaFilter,
+  sort?: MediaSort
 ): Promise<MediaListResponse | null> {
-  const { data } = await api.get<MediaListResponse>(Endpoints.media.list, {
-    params: { type: kind, limit, offset, sort: 'date', order: 'desc' },
-  });
+  const params: Record<string, string | number> = {
+    type: kind,
+    limit,
+    offset,
+    sort: sort?.key ?? DEFAULT_MEDIA_SORT.key,
+    order: sort?.order ?? DEFAULT_MEDIA_SORT.order,
+  };
+  if (filter?.album) params.album = filter.album;
+  if (filter?.artist) params.artist = filter.artist;
+  if (filter?.dir) params.dir = filter.dir;
+  const { data } = await api.get<MediaListResponse>(Endpoints.media.list, { params });
   return data ?? null;
 }
 
@@ -229,9 +322,14 @@ export function createBlobUrlPool() {
  *
  * 与播放进度条共用同一个函数：进度条的"已播/总长"和列表里的时长必须是同一种写法，
  * 各写一份必然分叉成 `3:07` 与 `03:07` 两种。
+ *
+ * **缺值显示 `--`，不显示 `0:00`**（2026-10-21）。`duration_ms` 为 0 / 缺字段是**常态**：
+ * 本机 MediaStore 对不少视频与无损音频给不出时长，core 的 `/list` 就原样回 0。
+ * 界面上把这种条目写成「0:00」是在说"这是一个零秒的文件"，与「还没读到时长」是两件事；
+ * 口径与 `formatMediaDate` 一致（那里缺值也是 `--`）。
  */
 export function formatDuration(ms: number | undefined): string {
-  if (!ms || ms < 0) return '0:00';
+  if (ms == null || !Number.isFinite(ms) || ms <= 0) return '--';
   const total = Math.floor(ms / 1000);
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
@@ -286,7 +384,11 @@ const DEFAULT_AUDIO_VOLUME = 0.85;
 
 export function readAudioVolume(): number {
   try {
-    const v = Number(localStorage.getItem(LS_AUDIO_VOLUME));
+    const raw = localStorage.getItem(LS_AUDIO_VOLUME);
+    // 没有存过 → 用默认音量。不能直接 Number(null)：它是 0，
+    // 会让第一次打开音乐页的用户以为"播放器没声音"（2026-10-23 修）。
+    if (raw === null) return DEFAULT_AUDIO_VOLUME;
+    const v = Number(raw);
     return Number.isFinite(v) && v >= 0 && v <= 1 ? v : DEFAULT_AUDIO_VOLUME;
   } catch {
     return DEFAULT_AUDIO_VOLUME;

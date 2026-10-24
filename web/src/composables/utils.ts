@@ -142,17 +142,40 @@ export function signalLevel(rsrp: number): 'excellent' | 'good' | 'fair' | 'poor
   return 'poor';
 }
 
-/** 信号强度颜色 */
+/**
+ * 信号强度颜色。
+ *
+ * 返回**令牌引用**而不是色值，按 `signalLevel()` 的四档**依次**对应
+ * （等级名次 → 令牌，第四档 `poor` 同名）：
+ *
+ * | signalLevel | 返回 |
+ * | --- | --- |
+ * | excellent | `var(--signal-good)` |
+ * | good | `var(--signal-fair)` |
+ * | fair | `var(--signal-weak)` |
+ * | poor | `var(--signal-poor)` |
+ *
+ * 2026-10-21 改（计划 §6.1 A1-2）：原来这里返回写死的 hex
+ * （`#18a058` / `#2080f0` / `#f0a020` / `#d03050`）。两个毛病：
+ * ① 既不跟暗色模式走、也不跟换肤走 —— 暗色下这四色压在深色卡片上全靠运气；
+ * ② 第二档是**蓝**，信号色阶里夹一个蓝不表达任何语义（用户读不出「比绿差、比黄好」）。
+ * 现在四档统一由 `styles/main.css` 的 `--signal-*` 提供，明暗两态各一套取值。
+ *
+ * 注意返回值是 **CSS 变量字符串**，只能用在 CSS 上下文（`:style` / `:color` / class 绑定）。
+ * **不要**把结果交给 ECharts 的 option —— canvas 不解析 `var()`，赋值会被静默忽略
+ * （画出来是上一次的 fillStyle 或黑色）；画布需要具体色值时走 `useChartColors()`
+ * （内部用 getComputedStyle 解析成字面量）。
+ */
 export function signalColor(rsrp: number): string {
   switch (signalLevel(rsrp)) {
     case 'excellent':
-      return '#18a058';
+      return 'var(--signal-good)';
     case 'good':
-      return '#2080f0';
+      return 'var(--signal-fair)';
     case 'fair':
-      return '#f0a020';
+      return 'var(--signal-weak)';
     case 'poor':
-      return '#d03050';
+      return 'var(--signal-poor)';
   }
 }
 

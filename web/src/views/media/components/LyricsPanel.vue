@@ -46,6 +46,8 @@ const props = defineProps<{
   currentSec: number;
   /** 沉浸视图里字号升一档 */
   large?: boolean;
+  /** 面板当前是否可见；隐藏时不测量/不滚，避免 display:none 下 clientHeight=0 把滚动算坏 */
+  active?: boolean;
 }>();
 
 const emit = defineEmits<{ seek: [seconds: number] }>();
@@ -107,12 +109,13 @@ function animateScrollTo(panel: HTMLElement, to: number, duration = 420) {
 function center(i: number) {
   const panel = panelEl.value;
   const line = lineEls.get(i);
-  if (!panel || !line) return;
+  // 隐藏（display:none）时不测量：clientHeight 为 0 会把 scrollTop 算到 0
+  if (!panel || !line || !panel.clientHeight) return;
   animateScrollTo(panel, line.offsetTop - panel.clientHeight / 2 + line.offsetHeight / 2);
 }
 
 watch(currentIndex, (i) => {
-  if (i >= 0) center(i);
+  if (i >= 0 && props.active !== false) center(i);
 });
 
 // 换歌 / 歌词首次到达后也居中。同时清行元素表：切歌时 Vue 会复用 DOM，
@@ -123,7 +126,7 @@ watch(
     lineEls.clear();
     if (!props.lyricLines.length) return;
     await nextTick();
-    if (currentIndex.value >= 0) center(currentIndex.value);
+    if (props.active !== false && currentIndex.value >= 0) center(currentIndex.value);
   }
 );
 
@@ -131,6 +134,20 @@ watch(
 watch(
   () => props.large,
   async () => {
+    await nextTick();
+    if (props.active !== false && currentIndex.value >= 0) center(currentIndex.value);
+  }
+);
+
+// 预挂载时面板在 display:none 下；真正显示后再滚动到当前行
+watch(
+  () => props.active,
+  async (on) => {
+    if (!on) {
+      if (raf) cancelAnimationFrame(raf);
+      raf = 0;
+      return;
+    }
     await nextTick();
     if (currentIndex.value >= 0) center(currentIndex.value);
   }
@@ -155,7 +172,8 @@ onBeforeUnmount(() => {
   padding: 0 6px;
   /* 滚到底不该把外层页面接着往下带 */
   overscroll-behavior: contain;
-  /* 上下渐隐让"当前行在中间"看起来是自然的；滚动时改成不遮，减少每帧重绘 */
+  /* 上下渐隐让"当前行在中间"看起来是自然的；滚动时改成不遮，减少每帧重绘。
+     ui-baseline-allow: 遮罩只取 alpha 通道，色值写 #000 还是 #fff 渲染完全一样，接主题令牌没有意义 */
   mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   scrollbar-width: none;
@@ -259,7 +277,7 @@ onBeforeUnmount(() => {
   font-size: 26px;
 }
 
-@media (max-width: 720px) {
+@media (max-width: 768px) {
   .lyrics-line {
     font-size: var(--font-md);
     padding: 6px 10px;

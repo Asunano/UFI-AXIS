@@ -56,6 +56,51 @@ export const Endpoints = {
     status: '/api/dlna/status',
     config: '/api/dlna/config',
   },
+  /**
+   * 设备能力与设备侧只读信息（2026-10-14 新增这三条）。
+   *
+   * ## 为什么这里单开一组，而其它 `/api/device/*` 是裸字面量
+   * 历史原因：`/api/device/led`、`/api/device/samba`、`/api/device/thermal` 这些
+   * 散在各视图里直接写字符串（`DeviceView.vue`、`ThermalModal.vue`…），契约里从来没有
+   * 一组 `device`。那是不一致，但**本批不顺手改它们** —— 一次提交里同时"加功能"和
+   * "把十几处裸字面量搬进契约"会让 review 分不清哪行是行为变更。
+   * 新加的这三条**至少要有单一出处**：`capabilities` 尤其要在能力门禁的基座里被引用，
+   * 散成四个字面量迟早写岔一个。
+   */
+  device: {
+    /**
+     * 设备能力集。`{ plugin_id, capabilities: string[] }`。
+     *
+     * ★ **数组而不是 `{sms:true}` 的 map**（core 侧刻意如此）：map 形状让旧客户端分不出
+     * 「这是个我不认识的新能力」还是「设备不支持」——两者的界面行为完全相反。
+     * 所以判断一律走 `capabilities.includes(wire)`，**不要**写 `caps.sms === false`。
+     *
+     * 取值是 `Capability` 的 wire 名，见本文件下方的 `Capability` 常量（两端镜像，
+     * 守门测试在 `core/contract/.../CapabilityWireTest.kt`）。
+     */
+    capabilities: '/api/device/capabilities',
+    /**
+     * EPS 承载 QoS：`{ available, cid, qci, downlink_kbps, uplink_kbps, downlink_display, uplink_display }`。
+     *
+     * 两个必须照做的点：
+     * ① **失败也回 HTTP 200**，只是 `available: false` + 空字段（AT 通道在很多机型上
+     *    根本不可用，那是预期状态不是错误）⇒ 客户端据 `available` 显示「—」，不要按网络错误处理；
+     * ② `*_display` 是 core 已经换算好的文案（如 `500 Mbps`），**直接用**，
+     *    两端各写一份换算逻辑迟早对不上（一个显示 500 Mbps、一个显示 500.0 Mbps）。
+     * core 侧 5 分钟缓存（`CacheTTL.DEVICE_QOS`），前端不必自己节流。
+     */
+    qos: '/api/device/qos',
+    /**
+     * 流量校准：body `{ target: 'data' | 'time', value: string }` → `{ success }`。
+     *
+     * `target=data` 校准已用流量、`target=time` 校准已用时长；`value` 是**字符串**
+     * （设备侧按文本收，传数字会在 profile 的 WriteSpec 里对不上）。
+     * 设备拒绝（值非法/越界）回 **400**，成功时 core 失效 `device:traffic-limit` 缓存。
+     *
+     * 旧字段 `way` + `data`/`time` 三件套仍兼容但会打 WARN，新代码一律用 `target` + `value`。
+     */
+    flowCalibration: '/api/device/flow-calibration',
+  },
   network: {
     status: '/api/network/status',
     /** 入参走 NetworkMode 的别名集，core 会映射成 BearerPreference 再下发 */
@@ -69,6 +114,17 @@ export const Endpoints = {
     root: '/api/shell/root',
     /** 执行一条 shell 命令；与 at 通道共用终端页历史（服务端在写侧记账） */
     exec: '/api/shell/exec',
+    /**
+     * 读一条系统属性（2026-10-14 web 接入）：`{ key, value }`。
+     *
+     * **优先用它而不是 `shell.exec('getprop …')`**：core 侧这条会做 key 白名单校验
+     * （只许 `[a-zA-Z0-9._]`，防命令注入），而走 `exec` 是把拼好的命令交给 shell，
+     * 校验责任落在调用方；而且 `exec` 会在终端历史里记一笔，读几个只读属性不该污染历史。
+     *
+     * key 非法回 **400**（不是 500）。`value` 是 `getprop` 的原始 stdout（含结尾换行），
+     * 客户端要自己 `trim()`。
+     */
+    prop: (key: string) => `/api/shell/prop/${encodeURIComponent(key)}`,
   },
   /**
    * AT 命令通道（2026-09-12 入 contract）。
@@ -118,6 +174,18 @@ export const Endpoints = {
     rule: (id: number) => `/api/sms/rules/${id}`,
     blocked: '/api/sms/blocked',
     blockedRecord: (id: number) => `/api/sms/blocked/${id}`,
+    /**
+     * 批量删除多条短信（2026-09-21 core 侧，2026-10-14 web 接入）。
+     * body `{ ids: number[] }` → `{ success, deleted, requested }`；`ids` 为空回 **400**。
+     *
+     * 与 `/api/sms/delete`（单条）和 `/api/sms/delete-conversation`（按号码整段）刻意分成三条：
+     * 三者的"删多少"语义不同，合成一条带 mode 的接口后，调用点就再也说不清自己删了什么。
+     *
+     * ⚠ `deleted` 可能**小于** `requested`（其中几条已经不在了），而 `success` 判据是
+     * `deleted > 0` —— 所以"一条都没删掉"会回 `success: false`。文案要按 `deleted` 说，
+     * 不要把 `success: false` 直接报成"删除失败"。
+     */
+    deleteBatch: '/api/sms/delete-batch',
   },
   /**
    * 邮件通知（2026-08-27 web 接入；2026-08-29 由「短信转发」改名，只剩 SMTP 一种通道）。
@@ -213,6 +281,18 @@ export const Endpoints = {
     history: '/api/traffic/history',
     summary: '/api/traffic/summary',
     usage: '/api/traffic/usage',
+    /**
+     * 流量日/周/月报（2026-10-06 core 侧，2026-10-14 web 接入）。
+     * query `period` ∈ `day|week|month`（**默认 week**，其它值回 400）。
+     *
+     * 回 `{ ok, period, range_start, range_end, rx_bytes, tx_bytes, total_bytes, summary, days[] }`，
+     * `days[]` 每项是 `{ day_start, day_label, rx_bytes, tx_bytes, total_bytes }` ——
+     * `day_label` 是 core 用 `MM-dd` 格式化好的，客户端**不要再自己格式化**
+     * （时区/补零两边写法不一致就会出现 10-4 与 10-04 并存）。
+     *
+     * 按**自然日**出桶（不是滑动 24h），所以"今天"是残缺的一天，看趋势要用 week/month。
+     */
+    report: '/api/traffic/report',
   },
   /**
    * 天气（2026-09-19 web 接入；core 侧 `WeatherRoutes`，上游 Open-Meteo，**无需 API key**）。
@@ -280,6 +360,31 @@ export const Endpoints = {
   media: {
     status: '/api/media/status',
     list: '/api/media/list',
+    /**
+     * 音频分组聚合（专辑 / 歌手 / 文件夹），2026-10-14 web 侧接入
+     * （界面在 `views/media/components/GroupBrowserPanel.vue`，取数在 `views/media/mediaGroups.ts`）。
+     *
+     * query：`type` 必须是 `audio`（其它值回 400 —— `album` / `artist` 是 MediaStore.Audio
+     * 独有的维度，视频与图片没有等价物，它们的"文件夹视图"走 [Endpoints.media.browse]）；
+     * `by` ∈ `album` / `artist` / `folder`，其它值也回 400。未授权回 **403 但 code 仍是
+     * `BAD_REQUEST`**，与 [Endpoints.media.list] 同一约定。
+     *
+     * 回 `{ type, by, groups: [{ key, title, subtitle, count, cover_id }], total }`。
+     * `total` 是**分组总数**，不是曲目总数（曲目数在每组的 `count` 里）。
+     *
+     * 三处必须照做，否则会静默给出错的结果：
+     * ① 排序由 core 做（`count` 降序 → `title` 升序），客户端**不要再排一次**；
+     * ② 组内曲目要拿 `key` 回查 [Endpoints.media.list]：`by=album` → `?album=<key>`、
+     *    `by=artist` → `?artist=<key>`、`by=folder` → `?dir=<key>`
+     *    （**是 `dir` 不是 `folder`**，见 `mediaShared.MediaFilter`）。
+     *    `album` / `artist` 里没有标签的曲目会聚成一个 `key` 为空串的分组
+     *    （`title` 是「未知专辑」/「未知歌手」）——空 `key` 送回 `/list` 会被当成"没传"
+     *    而返回整库，所以这一组只能当展示用，不能当作筛选条件；
+     * ③ 封面走 `GET [Endpoints.media.thumbnail]?type=audio&id=<cover_id>`；`cover_id <= 0`
+     *    表示组内没有可用条目（`_ID` 从 1 开始，所以 0 天然表示"没有"），此时
+     *    **不要发缩略图请求** —— 与 [Endpoints.playlists] 的 `cover_id` 同一约定。
+     */
+    groups: '/api/media/groups',
     /**
      * 2026-10-05 G5：视频元信息（ffmpeg 探测）。query: id。
      * MediaStore 列在本机经常缺 duration/width/height（codec 栈缺失），
@@ -429,6 +534,36 @@ export const Endpoints = {
     clear: '/api/web/clear',
   },
   /**
+   * 可选二进制组件（frpc / cloudflared）。2026-10-14 借「资源中心」接入时补登记。
+   *
+   * ## 为什么现在才补
+   * 这一组自 2026-09-01 就在用，但调用点（`composables/useComponentInstaller.ts`）写的是
+   * 裸字面量 —— 既有漂移。资源中心是**第二个**消费者，两个调用点各写一遍字面量迟早写岔
+   * （尤其 `/{id}/install` 这种带参路径），所以借这次收进契约。那个 composable 本次**不改**
+   * （它在别的一次改造的范围内），漂移由本组兜住。
+   *
+   * ## 三条必须照做的约定
+   * ① 进度是**真百分比**：`GET /api/components/status` 的 `percent` 是 0-100 的实数；
+   *    而且 `ComponentManager.State` 比 `WebUpdateManager.State` **多一档 `EXTRACTING`**
+   *    （裸 tar.gz 要先解包），前端词表见 `updateShared.ts` 的 `COMPONENT_STATE_META`。
+   * ② 上传走 **raw body**（`application/octet-stream`），不是 multipart —— cloudflared
+   *    裸二进制约 36MB，multipart 那套要先在内存里攒一份，低端设备会 OOM。
+   * ③ 上传上限在**列表端点**的 `max_upload_bytes`（core 侧 96MB），**不在** status 端点里；
+   *    前端据此在选文件时就挡掉超限的包（413 要等 body 全推完才读得到，几十 MB 上行白烧）。
+   */
+  components: {
+    /** `{ components: [...], max_upload_bytes, id, state, percent, message, manifest_error, ... }` */
+    list: '/api/components',
+    /** 只要进度那几档（`{ id, state, percent, message, ... }`），比列表端点轻 */
+    status: '/api/components/status',
+    /** POST，异步受理：200 = 已开始下载，400 = 拒绝（未知组件 / 已有任务在跑） */
+    install: (id: string) => `/api/components/${encodeURIComponent(id)}/install`,
+    /** POST，同步：409 = 还有实例在跑 */
+    uninstall: (id: string) => `/api/components/${encodeURIComponent(id)}/uninstall`,
+    /** POST，raw body 同步安装，200 回 `{ success, version }` */
+    upload: (id: string) => `/api/components/${encodeURIComponent(id)}/upload`,
+  },
+  /**
    * 配置备份与恢复（2026-09-12 web 接入；Kotlin 侧见同名 Endpoints.Backup）。
    *
    * 四个端点都在鉴权块内。三个坑：
@@ -483,6 +618,184 @@ export const Endpoints = {
     dns: '/api/diagnostic/dns',
     tcp: '/api/diagnostic/tcp',
     traceroute: '/api/diagnostic/traceroute',
+  },
+  /**
+   * 诊断中心（`/diagnostics`，2026-10-14）用的**只读探针**端点。
+   *
+   * ## 为什么不并进上面的 [diagnostic] 组
+   * 那一组是「网络诊断工具集」：四条 POST、必须吃 host 入参、跑的是 ping 与 Java socket，
+   * 语义是"对某个**外部目标**做一次主动探测"。本组是"把**设备自己**的状态读出来"：
+   * 全是 GET、无入参、与目标地址无关。两者的入参形状、失败模式、调用方都不同，
+   * 合成一组会让"这一条要不要 host"变成必须翻实现才知道的隐式问题。
+   *
+   * ## 为什么这里只有七条
+   * `monitor/storage`、`media/status`、`service/status`、`diagnose` 早就在各自的组里，
+   * 诊断中心**直接引用那些既有条目**，不在这里重复登记 —— 同一路径有两处出处必然漂移。
+   * 本组只收本轮**新登记**的：此前 web 侧要么没用过、要么写的是裸字面量
+   * （裸字面量在 `views/network/components/modals/DiagnosticModal.vue` 那批里已经有先例，
+   * 那种写法在契约校验器眼里与没登记等价）。
+   */
+  diagnostics: {
+    /**
+     * CPU 控制能力探测（core `CpuProbeRoutes`）：一条 GET 跑 20+ 条 shell，5~15s。
+     * 回 `{ ok, ts, kernel, board, cores_declared, shell_uid, policies[], online_nodes[], thermal_zones[] }`。
+     *
+     * 两条必须知道的：
+     * ① 全部命令**只读或写回原值**（试写 scaling_max_freq 用当前值写回，online 节点只写 1）
+     *    —— 它不会改设备状态，可以放心在诊断页里点；
+     * ② 失败**也是 HTTP 200**，形状变成 `{ ok: false, error }`，所以不能按 HTTP 码判成败。
+     */
+    cpuProbe: '/api/cpu-probe',
+    /**
+     * 特权通道探测：`{ hasRoot }`。
+     *
+     * 判据是 `ShellExecutor.hasRootAccess()`，即「ADB 特权通道是否可用」——
+     * 底层 ADB shell 是 **uid 2000，不是 uid=0**。它与 `shell/root` 的 `uid` 输出、
+     * 与 `diagnose` 的 `root`（`executeAsRoot("id")` 里含 uid=0）**是三个不同的探针**，
+     * 实测会出现「通道可用但 shell 不是 root」，界面上必须分开说。
+     */
+    rootCheck: '/api/system/root-check',
+    /**
+     * SELinux 状态：`{ selinux }`，值是 `getenforce` 原文（Enforcing / Permissive / Unknown）。
+     *
+     * ⚠ 与 `service/status` 的 `native_exec.selinux` **不是同一个探针**：那个说的是
+     * "打包的原生二进制能不能 exec"（enforcing 设备上恒为 false），这个说的是系统策略模式。
+     */
+    selinux: '/api/device/selinux',
+    /**
+     * 名字叫 magisk，**实现已经不是 Magisk 检测**：core 的 `SystemController.getMagiskStatus()`
+     * 现在只是 `getPrivilegedShellStatus()` 的兼容别名，回 `{ adb_shell, method, uid }`。
+     * 路径保留是因为 app 与 API 手册都按它引用，改名只会破坏跨端契约。
+     */
+    magisk: '/api/device/magisk',
+    /**
+     * 上一次 core 崩溃：`{ success, ok, crashed, timestamp, summary, file, age_ms, recent, uptime_ms }`。
+     *
+     * `crashed` 是 `timestamp > 0` 的派生值，**没有 ack 接口**（app 与 web 是两个独立展示端，
+     * 谁先 ack 另一端就再也看不到）—— 去重放各自的本地存储。
+     *
+     * 2026-10-23 新增 `age_ms` / `recent`：`recent` 是 core 用**自己这台设备的时钟**算出的
+     * 7 天新鲜度窗口（`age_ms` 是原始年龄，-1 = 从未崩溃）。`crashed` 对三个月前的记录也恒为
+     * true，两端只在 `recent` 为真时弹窗；旧 core 不带这两个字段，按"新鲜"处理以保持兼容。
+     */
+    serviceCrash: '/api/service/crash',
+    /**
+     * QoS 诊断快照：`{ enabled, shell_qos, goform_qos, cpu_temp, dynamic_pool }`。
+     *
+     * ⚠ `cpu_temp` 是**毫摄氏度原始整数**，读不到时是 `0`（不是 null）——
+     * 直接当摄氏度显示会得到「0°C」这种假读数，要先判 `<= 0`。
+     */
+    qosStatus: '/api/qos/status',
+    /**
+     * 落盘的日志**文件清单**：`{ files: [{ name, size, modified }], total, total_bytes, dir }`，
+     * `name` 是相对路径（`2026-08-28/app.log`，日志按日期分目录）。
+     *
+     * ⚠ 与下面的 [debugLogs] 那个**内存缓冲**是两回事：那个回 `{ logs, total }` 且带
+     * `limit`/`level`。本页只要文件名与大小（"日志有没有在落盘"），读内容属于设置页的日志面板。
+     */
+    debugLogFiles: '/api/debug-logs/files',
+    /**
+     * 内存里的调试日志缓冲：`{ logs: string[], total }`，`logs` 是**字符串数组**
+     * （格式 `HH:mm:ss.SSS [LEVEL] [TAG] message`，不是对象数组），支持 `limit` / `level`。
+     *
+     * 登记进来的原因：诊断包（导出 `.txt`）要附最近一段日志，而它是本页第二个消费者。
+     * 设置页 `LogsPanel` 仍在用裸字面量读同一个端点 —— 那是**既有漂移，本批不改那个文件**，
+     * 由本组兜住（同 [components] 组当初的处境）。
+     */
+    debugLogs: '/api/debug-logs',
+    /**
+     * 设备数据分区占用（`StatFs("/data")`）：`{ total, available, used, usage_percent }`，
+     * `usage_percent` 是 0-100 的浮点数；**读取抛异常时回空对象 `{}`**（不是 null、不是错误码）。
+     *
+     * 登记进来的原因与 [debugLogFiles] 同一条：此前 web 侧只有「关于」面板的
+     * `SYSTEM_ENDPOINTS.storage` 一个裸字面量在用（那个本地映射的注释写着"contract.ts 目前没有
+     * system 分组"），而诊断中心是本端点的第二个消费者。**同一路径两处出处必然漂移**，
+     * 所以收进这里；「关于」面板那处属既有漂移，本批不改那个文件。
+     *
+     * ★ 与 [monitor.storage]（监控数据库各表占用）**不是一回事**：那个答"我们自己的数据占了多少"，
+     * 这个答"设备还有没有地方写"。
+     */
+    diskUsage: '/api/system/storage',
+    /**
+     * 服务端响应缓存统计：`{ count, max_entries, any_cache_count, total_bytes_estimate, stale, entries[] }`。
+     *
+     * 登记进来的原因同 [diskUsage]：设置页 `PerformancePanel`（真源，含清空 / 按模式失效两个
+     * **写入**动作）一直用裸字面量读它，诊断中心现在要读同一份做**只读**健康摘要。
+     *
+     * ⚠ 两个字段值得单独说，它们只在诊断页被展示（core 侧确实会回，见 `ResponseCache.getStats`）：
+     *  · `stale` —— 缓存被标记为"可能过期"（WS 客户端全部断开、内部刷新失败）；
+     *  · `expired_count` —— 已过期但**惰性删除还没触发**的条目数，健康态应远小于 `count`。
+     *    它不在 core 手册的响应示例里，但 `ResponseCache.kt` 会回这个键 —— 别按手册的字段表写死。
+     */
+    cacheStats: '/api/cache/stats',
+    /**
+     * Core **自身**的权限自检（core `PermissionRoutes`，2026-10-14）。
+     *
+     * ## 为什么需要它（旧 core 没有这一条）
+     * 「core 需要哪些权限」的真源是 core 自己的 AndroidManifest，而真正执行授予的只有
+     * 安装脚本（`scripts/UFI-AXIS-Core-install-*`）与 Android 安装器 —— **升级 core 时都不会重跑**。
+     * 于是新版本新增的权限没人补：界面在、点了没用、日志里也没有一句"权限不足"。
+     * 客户端自己算不出来（看不见 manifest，也读不到 appop 模式），所以判据必须由 core 现场查：
+     * `requestedPermissions`（要哪些）+ `checkPermission`（runtime 授没授）+
+     * `AppOpsManager`（appop 放没放行）。**不是**"能不能用"的间接猜测。
+     *
+     * ## 响应
+     * `{ package, sdk_int, uid, shell_method, shell_privileged, requested_count, granted_count,
+     *    missing_count, missing[], blocked[], not_applicable[], granted[], checked_at }`。
+     *
+     * 三条必读：
+     * ① `missing[]` 与 `blocked[]` **不是一回事**：`missing` 是"缺、且 shell 能补"（每条带
+     *    `fixable: true` 与原文 `fix_command`），`blocked` 是"缺、但 shell 补不了"（签名级权限，
+     *    只有以系统应用方式安装才拿得到）—— 界面上必须分开说，否则用户会去点一个必然失败的按钮；
+     * ② `not_applicable[]` 是**本机不需要**的那一类（`kind` 为 `superseded` / `unknown`）：
+     *    典型是 `WRITE_EXTERNAL_STORAGE`（Android 11 起对 targetSdk≥30 不再授予）与
+     *    `READ_EXTERNAL_STORAGE`（Android 13 起被 `READ_MEDIA_*` 取代）。**既不算缺失也不算
+     *    补不了** —— 把它们报成缺失会让用户去补一个补了也没用的权限（core 侧按
+     *    `SUPERSEDED_MAX_SDK` 排除，与安装脚本的 maxSdk 同口径）；
+     * ③ `shell_privileged` 是"能不能补"的前提：`pm grant` 要求 uid 0/2000（core 走内置 adb 自连接），
+     *    通道不可用时本端点会**逐条失败**而不是假装成功。为 false 时界面应当给"先去修 ADB 通道"，
+     *    而不是给补全按钮。
+     *
+     * ⚠ 旧 core 上这条是 **404**（不是 500）。客户端要把 404 说成"这台 core 还没有自检端点"，
+     * 并给出可手工执行的兜底命令（见 `diagnosticRegistry.ts` 的 `core-permission`）。
+     */
+    corePermissions: '/api/system/permissions',
+    /**
+     * 补全 core 缺失的权限（**写动作**，2026-10-14）。
+     *
+     * body 可空；`{ permissions: ['READ_MEDIA_AUDIO', …] }` 只补指定几条（短名/全名都认），
+     * 不传则补全部"缺且可补"的。回 `{ success, attempted, granted, failed, results[],
+     * auto_revoke, permissions }` —— `permissions` 是**补完之后重新探测**的完整快照
+     * （结论是"现在实际是什么"，不是"我们发过命令了"）。
+     *
+     * ## 这是写动作，调用方必须二次确认
+     * 它会改设备状态（`pm grant` / `appops set … allow`），并且**不可由本端点撤销**
+     * （没有 revoke 端点 —— 撤销 core 自己的权限只会让功能坏掉）。想回退只能用原文命令：
+     * runtime 走 `pm revoke <pkg> <perm>`、appop 走 `appops set <pkg> <OP> default`。
+     *
+     * 顺带把 `AUTO_REVOKE_PERMISSIONS_IF_UNUSED` 设为 `ignore`（防"补完过一阵又被系统收走"），
+     * 结果在 `auto_revoke` 里回；这一步失败**不算整体失败**。
+     */
+    corePermissionsGrant: '/api/system/permissions/grant',
+  },
+  /**
+   * 赞助感谢名单（`/sponsors`，2026-10-14）。
+   *
+   * 回 `{ source: 'bundled' | 'remote', updatedAt, sponsors: [...] }`。
+   * **消费方必须假定这份数据可能是坏的**：core 侧那份来自 12 小时一次的后台刷新
+   * （从仓库 main 分支拉 sponsors.json），拉到的内容不经过编译期校验，
+   * 所以 web 与 core 都要按 `sponsors.json` 的字段规则逐条校验，
+   * **不合规整份丢弃**（保留上一层：远端坏了就退内置那份，内置坏了就整块不渲染）。
+   *
+   * 字段规则（与仓库根 sponsors.json 的 `_note` 同源）：
+   * 每条**恰好**有 `name`（非空、trim 后 ≤32）或 `anonymous: true` 之一；
+   * `at` 必填且形如 `YYYY-MM` 或 `YYYY-MM-DD`；`version` 必须等于支持值。
+   *
+   * 这份数据是**保底 + 更新**两层：页面先用构建期打进 bundle 的那份渲染（0 延迟、不白屏），
+   * 拿到本端点且校验通过才替换。core 不可达就停在保底那份 —— 这正是"保底"的意义。
+   */
+  sponsors: {
+    root: '/api/sponsors',
   },
   /** 套餐档案（2026-10-07 到量/到期融合）：core 侧语义层，goform 无套餐概念 */
   plan: {
@@ -565,7 +878,46 @@ export const WsDataTopic = {
   DEVICE_TRAFFIC_LIMIT: 'device:traffic-limit',
   /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
   MEDIA_PLAYLISTS: 'media:playlists',
+  /**
+   * 2026-10-21：新设备批准请求有变化（core 在登记成功后主动推送，App 收到即拉
+   * `/api/pairing/approvals` 弹窗）。载荷里**没有配对码**，只是一次唤醒。
+   *
+   * Web 端目前**不消费**这个键（它正是发出请求的一方）；这里登记它只为与 Kotlin
+   * `WsDataTopic` 保持一致，避免下次有人对表时以为漏了一个取值。
+   */
+  PAIRING_APPROVALS: 'pairing:approvals',
 } as const;
+
+/**
+ * 设备能力（`GET /api/device/capabilities` 的 `capabilities` 数组取值）。
+ *
+ * ## 这是 Kotlin `Capability.wire` 的**手抄镜像**
+ * 单一出处是 `core/contract/src/main/kotlin/com/ufi_axis_core/contract/Capabilities.kt`，
+ * 守门测试 `CapabilityWireTest.kt` 把那 11 个字符串逐个写死了。两端镜像的一致性测试
+ * **core 侧明确写了"本批不做"**（见那个测试的类注释），所以这里没有编译期约束 ——
+ * 改任何一个字符串都要**同时**改 Kotlin 侧，否则 web 会把"设备不支持"看成
+ * "我不认识这个能力"（反之亦然），而两者的界面行为正好相反。
+ *
+ * ## 为什么是字符串常量而不是收窄的联合类型用在运行时判断上
+ * 与服务端保持同一形状：服务端就是 `string[]`。`CapabilityWire` 联合类型只用来标注
+ * **我们主动查询的那几个**；服务端多下发的未知 wire 必须能被安静忽略
+ * （旧客户端遇到新能力的正确行为是"当它不存在"，不是崩在类型断言上）。
+ */
+export const Capability = {
+  SMS: 'sms',
+  SIM_SLOT_SWITCH: 'sim_slot_switch',
+  BAND_LOCK: 'band_lock',
+  CELL_LOCK: 'cell_lock',
+  NETWORK_MODE: 'network_mode',
+  SAMBA: 'samba',
+  USB_DEBUG: 'usb_debug',
+  FOTA: 'fota',
+  PERFORMANCE_MODE: 'performance_mode',
+  TRAFFIC_LIMIT: 'traffic_limit',
+  BATTERY: 'battery',
+} as const;
+
+export type CapabilityWire = (typeof Capability)[keyof typeof Capability];
 
 /**
  * 网络模式（T15）：与 Kotlin `NetworkMode` 对齐。
@@ -667,7 +1019,13 @@ export function modeProbeIntervalMs(attemptNo: number): number {
     : NetworkModeSwitchProbe.slowIntervalMs;
 }
 
-/** 总时长上限，给文案用。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。 */
+/**
+ * 总时长上限，给**超时文案**用。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。
+ *
+ * 2026-10-14：确认器超时那句提示（`useApiOperation.ts` 的
+ * `${title}未在预期时间内完成（已等待约 N 秒）…`）就取这个常量算 N —— 文案里的秒数
+ * 必须跟着预算走，不要再写死一个数字（改前它是个没人引用的死常量，用户看不到要等多久）。
+ */
 export const NetworkModeSwitchBudgetMs = (() => {
   let total = NetworkModeSwitchProbe.firstDelayMs;
   for (let i = 1; i < NetworkModeSwitchProbe.maxAttempts; i += 1) total += modeProbeIntervalMs(i);
@@ -1687,6 +2045,68 @@ export const DeviceFields = {
    */
   unstableEndpoints: ['api/device/goform', 'api/device/goform/query', 'api/device/goform/set', 'api/wifi/module-info'],
 } as const;
+
+// ────────────────────────────────────────────────────────────
+// 基站信息（GET /api/network/cell-info）—— 展示与回读确认共用的解析
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 小区信息里的「数组字段」取值：真数组，或**数组的 JSON 字符串**（双重编码，固件而定）。
+ *
+ * 这段逻辑原来只活在 `CellInfoModal.vue` 的 `parseCellArray()` 里（展示用）。2026-10-14 起
+ * 锁小区要走 A 级回读确认，判据同样要解这两个形态 —— 抄第二份迟早与展示那份分叉，
+ * 所以收敛到这里（core 侧 `ZteGoformProfile.normalizeCellLists` 也在做同一件事，
+ * 但客户端不能假设所有固件都被 core 归一过，见 `DeviceFields.CellInfo` 的 KDoc）。
+ */
+export function parseCellList(v: unknown): any[] {
+  if (!v) return [];
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string') {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+/**
+ * 小区标识字段的可比对形式。
+ *
+ * 设备把 PCI / 频点写成数字或字符串两种（`Lte_pci: 301` / `"301"`），直接 `===` 比会把
+ * 「已经驻留到目标小区」判成没到。数字归一成十进制字符串（`301` 与 `"301"` 相等），
+ * 读不到（null / undefined / 空串）一律返回 `''` = **没读到**，调用方不得当成相等。
+ */
+export function cellFieldKey(v: unknown): string {
+  if (v === null || v === undefined) return '';
+  return String(v).trim();
+}
+
+/**
+ * 服务小区（PCI / EARFCN），字段名取 [DeviceFields.cellInfo]。
+ *
+ * ⚠ 服务小区只有 **LTE** 那一组字段（`Lte_pci` / `Lte_fcn`）：NR 的 `Nr_pci` / `Nr_fcn`
+ * 归 SIGNAL 分组（core `DeviceFields.Signal`），cell-info 端点里根本没有。
+ * 所以「NR 目标小区」不能靠服务小区比对确认 —— 调用方要自己处理这一支。
+ */
+export function cellInfoServingCell(raw: unknown): { pci: string; earfcn: string } {
+  const src: any = raw ?? {};
+  return {
+    pci: cellFieldKey(src[DeviceFields.cellInfo.ltePci] ?? src[DeviceFields.cellInfo.itemPci]),
+    earfcn: cellFieldKey(src[DeviceFields.cellInfo.lteEarfcn] ?? src[DeviceFields.cellInfo.itemEarfcn]),
+  };
+}
+
+/** 已锁定小区列表（只取 pci / earfcn 两个判据字段；`rat` 与信号量不参与判定）。 */
+export function cellInfoLockedCells(raw: unknown): Array<{ pci: string; earfcn: string }> {
+  const src: any = raw ?? {};
+  return parseCellList(src[DeviceFields.cellInfo.lockedCellInfo]).map((c: any) => ({
+    pci: cellFieldKey(c?.[DeviceFields.cellInfo.itemPci]),
+    earfcn: cellFieldKey(c?.[DeviceFields.cellInfo.itemEarfcn]),
+  }));
+}
 
 /** `GET /api/weather/config` 配置。`0, 0` 是"未设城市"的哨兵，不是几内亚湾。 */
 export const WeatherUnit = { CELSIUS: 'celsius', FAHRENHEIT: 'fahrenheit' } as const;

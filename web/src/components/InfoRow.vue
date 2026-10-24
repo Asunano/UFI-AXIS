@@ -1,17 +1,33 @@
 <template>
   <div class="info-row">
     <span class="info-label">{{ label }}</span>
-    <span class="info-value">
+    <span class="info-value" :title="valueTitle">
       <slot>{{ value }}</slot>
     </span>
   </div>
 </template>
 
 <script setup lang="ts">
-defineProps<{
+import { computed, useSlots } from 'vue';
+
+const props = defineProps<{
   label: string;
   value?: string | number;
 }>();
+
+const slots = useSlots();
+
+/**
+ * 值被省略号截断（见 `.info-value` 的 `max-width: 65%` + ellipsis）之后就看不全了，
+ * 把同一份文本挂到 `title` 上，鼠标悬停能读全文。长值场景（SSID / ICCID / IMEI /
+ * MAC / 长域名）都是靠这一条兜住可读性，卡片本身不用再改成 `word-break` 换行。
+ *
+ * 两种情况**不设** title：
+ *  · `#default` 插槽有内容 —— 里面可能是徽标、按钮组、多个 span，无法文本化，
+ *    硬拼一个 title 只会显示半句话或 `[object Object]`；
+ *  · 值不是字符串 —— 数字（及缺省的 `undefined`）不会被截断，且 title 只接受字符串。
+ */
+const valueTitle = computed(() => (slots.default || typeof props.value !== 'string' ? undefined : props.value));
 </script>
 
 <style scoped>

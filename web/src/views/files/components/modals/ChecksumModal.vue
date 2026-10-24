@@ -1,9 +1,11 @@
 <template>
+  <!-- 宽高交给全局 `.modal-fit`（360px 视口下不再出屏） -->
   <n-modal
     :show="show"
     preset="card"
     title="文件校验和"
-    style="width: 460px"
+    class="modal-fit"
+    style="--modal-w: 460px"
     @update:show="emit('update:show', $event)"
   >
     <div v-if="result" class="cs-grid">

@@ -1,7 +1,8 @@
 <template>
   <GridCard title="网络信息">
-    <!-- 上排：gauge(左,96px) + 标题/运营商/3 项开关(右)。
-         拨号模式 n-select 移到 footer 与飞行/连接按钮同行，避免 4 列等分把 select 挤窄。 -->
+    <!-- 上排：gauge(左,96px) + 标题/运营商/2 项开关(右)。
+         拨号模式下拉已按用户裁决删除（2026-10-10）。
+         WiFi 热点开关已移到下方「WiFi 热点」卡的状态行，避免同一状态出现两次。 -->
     <div class="conn-horizontal">
       <div class="conn-gauge">
         <GaugeChart
@@ -24,10 +25,10 @@
         </div>
         <div class="conn-operator">{{ operator }}</div>
 
-        <!-- 3 项一行：移动数据 / WiFi 热点 / 数据漫游（拨号模式已移走） -->
+        <!-- 2 项一行：移动数据 / 数据漫游。WiFi 热点开关归下方 WiFi 卡。 -->
         <div class="ctrl-bar">
-          <div class="ctrl-item">
-            <span class="ctrl-label">移动数据</span>
+          <div class="config-item switch-item">
+            <span class="config-label">移动数据</span>
             <n-switch
               :value="!!mobileData"
               size="small"
@@ -36,17 +37,8 @@
               @update:value="emit('update:mobile-data', $event)"
             />
           </div>
-          <div class="ctrl-item">
-            <span class="ctrl-label">WiFi 热点</span>
-            <n-switch
-              :value="wifiEnabled"
-              size="small"
-              :rubber-band="false"
-              @update:value="emit('toggle-wifi', $event)"
-            />
-          </div>
-          <div class="ctrl-item">
-            <span class="ctrl-label">数据漫游</span>
+          <div class="config-item switch-item">
+            <span class="config-label">数据漫游</span>
             <n-switch
               :value="roamingEnabled"
               size="small"
@@ -59,43 +51,36 @@
       </div>
     </div>
 
-    <!-- 中段：3 个信号 metric 一行横排（margin-top 收敛 16→10，与上方紧凑） -->
+    <!-- 中段：3 个信号指标一行横排；只保留一个中文标签，英文键放在 title 里 -->
     <div class="metric-strip">
-      <div v-for="m in signalMetrics" :key="m.key" class="metric-cell sub-panel">
-        <div class="metric-head">
-          <span class="metric-dot" :style="{ background: m.color || 'var(--text-muted)' }"></span>
-          <span class="metric-key">{{ m.key }}</span>
-        </div>
+      <div v-for="m in signalMetrics" :key="m.key" class="metric-cell" :title="`${m.key} · ${m.label}`">
+        <div class="metric-label">{{ m.label }}</div>
         <div class="metric-value-row">
           <span class="metric-value">{{ m.display }}</span>
           <span class="metric-unit">{{ m.unit }}</span>
         </div>
-        <div class="metric-label">{{ m.label }}</div>
       </div>
     </div>
 
     <template #footer>
-      <!-- GridCard.footer 默认 flex-end；这里包一个 wrapper 让左 select / 右 按钮空间分布 -->
-      <div class="footer-row">
-        <!--
-          2026-10-10 用户裁决：删掉页脚那个连接模式下拉（自动拨号 / 手动拨号）。
-          **只删 UI**：props（connectionMode / connModeOptions / connModeSaving）与
-          `update:connection-mode` 事件、以及 composable 里的下发逻辑全部保留
-          —— 设备侧 `dial_mode` 配置不动（用户裁决 A）。
-        -->
-        <div class="footer-actions">
-          <n-popconfirm @positive-click="emit('airplane-on')">
-            <template #trigger><n-button size="small">开启飞行模式</n-button></template>
-            开启飞行模式会切断蜂窝网络与当前拨号连接，确认继续？
-          </n-popconfirm>
-          <n-button size="small" @click="emit('airplane-off')">关闭飞行模式</n-button>
-          <n-button v-if="!isConnected" size="small" type="primary" @click="emit('ppp-connect')">拨号连接</n-button>
-          <n-popconfirm v-else @positive-click="emit('ppp-disconnect')">
-            <template #trigger><n-button size="small">断开连接</n-button></template>
-            断开后设备将失去蜂窝上网，确认继续？
-          </n-popconfirm>
-        </div>
-      </div>
+      <!--
+        2026-10-10 用户裁决：删掉页脚那个连接模式下拉（自动拨号 / 手动拨号）。
+        **只删 UI**：`/api/device/settings` 里的 `dial_mode` 与 composable 的下发逻辑都保留
+        （用户裁决 A）。2026-10-21 补齐：已无 UI 的三个 props 与 `update:connection-mode`
+        事件也一并从本组件删除，父组件不再透传。
+        footer 现在只剩这一组按钮，GridCard 的 footer 自带 flex-end + wrap，
+        原先那层 `.footer-row`(space-between) 会把它推到左边，已去掉。
+      -->
+      <n-popconfirm @positive-click="emit('airplane-on')">
+        <template #trigger><n-button size="small">开启飞行模式</n-button></template>
+        开启飞行模式会切断蜂窝网络与当前拨号连接，确认继续？
+      </n-popconfirm>
+      <n-button size="small" @click="emit('airplane-off')">关闭飞行模式</n-button>
+      <n-button v-if="!isConnected" size="small" type="primary" @click="emit('ppp-connect')">拨号连接</n-button>
+      <n-popconfirm v-else @positive-click="emit('ppp-disconnect')">
+        <template #trigger><n-button size="small">断开连接</n-button></template>
+        断开后设备将失去蜂窝上网，确认继续？
+      </n-popconfirm>
     </template>
   </GridCard>
 </template>
@@ -109,20 +94,14 @@ import { networkTypeWithBand, signalColor } from '@/composables/utils';
 const props = defineProps<{
   netStatus: any;
   signal: any;
-  wifiEnabled: boolean;
   mobileDataSaving: boolean;
   roamingEnabled: boolean;
   roamingSaving: boolean;
-  connectionMode: string;
-  connModeOptions: { label: string; value: string }[];
-  connModeSaving: boolean;
 }>();
 
 const emit = defineEmits<{
   'update:mobile-data': [boolean];
-  'toggle-wifi': [boolean];
   'update:roaming': [boolean];
-  'update:connection-mode': [string];
   'airplane-on': [];
   'airplane-off': [];
   'ppp-connect': [];
@@ -135,28 +114,23 @@ const connType = computed(() => networkTypeWithBand(props.netStatus?.network_typ
 const connState = computed(() => (isConnected.value ? '已连接' : '未连接'));
 const operator = computed(() => props.netStatus?.operator || '--');
 
-// RSRP 仪表盘：归一化 -140~-44 dBm 到 0-100
+// RSRP 仪表盘：归一化 -140~-44 dBm 到 0-100。
+// 判空一律 `!= null`：0 是合法数值（家规第 5 条），不能当"没有值"。
 const rsrpGaugeValue = computed(() => {
   const r = props.signal?.rsrp;
-  if (r == null || r === 0) return 0;
+  if (r == null) return 0;
   return Math.max(0, Math.min(100, ((r + 140) / 96) * 100));
 });
-const rsrpDisplay = computed(() => (props.signal?.rsrp ? `${props.signal.rsrp}` : '--'));
-const rsrpColor = computed(() => (props.signal?.rsrp ? signalColor(props.signal.rsrp) : undefined));
+const rsrpDisplay = computed(() => (props.signal?.rsrp != null ? `${props.signal.rsrp}` : '--'));
+const rsrpColor = computed(() => (props.signal?.rsrp != null ? signalColor(props.signal.rsrp) : undefined));
 
-// 状态点只对 dBm 量纲着色；SINR/RSRQ 无既有阈值，留中性色只呈现数值。
+// 指标只保留中文标签；英文键（SINR/RSRQ/RSSI）放 title，避免同一行出现两次说明。
 const signalMetrics = computed(() => {
   const s = props.signal;
   return [
-    { key: 'SINR', label: '信噪比', unit: 'dB', display: s?.sinr != null ? String(s.sinr) : '--', color: '' },
-    { key: 'RSRQ', label: '参考信号接收质量', unit: 'dB', display: s?.rsrq != null ? String(s.rsrq) : '--', color: '' },
-    {
-      key: 'RSSI',
-      label: '接收信号强度',
-      unit: 'dBm',
-      display: s?.rssi ? String(s.rssi) : '--',
-      color: s?.rssi ? signalColor(s.rssi) : '',
-    },
+    { key: 'SINR', label: '信噪比', unit: 'dB', display: s?.sinr != null ? String(s.sinr) : '--' },
+    { key: 'RSRQ', label: '接收质量', unit: 'dB', display: s?.rsrq != null ? String(s.rsrq) : '--' },
+    { key: 'RSSI', label: '信号强度', unit: 'dBm', display: s?.rssi != null ? String(s.rssi) : '--' },
   ];
 });
 </script>
@@ -203,64 +177,61 @@ const signalMetrics = computed(() => {
   color: var(--text-primary);
 }
 .conn-state {
-  font-size: 12px;
-  color: var(--text-secondary);
+  font-size: 10.5px;
+  color: var(--accent-color);
+  background: var(--accent-color-light);
+  border-radius: 999px;
+  padding: 2px 7px;
+  line-height: 1.4;
 }
 .conn-operator {
-  font-size: 13px;
+  font-size: 12.5px;
   color: var(--text-secondary);
 }
 
-/* ── 控件条：3 项一行（拨号模式已移走） ── */
+/* ── 控件条：2 项一行（WiFi 热点开关已移到下方 WiFi 卡）──
+   单元格版式（标签左 / 控件右、对齐与间距）来自全局 `.config-item.switch-item`，
+   这里只补背景/边框，让它看起来是紧凑的快捷开关，不再是一片裸文字。 */
 .ctrl-bar {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px 16px;
-  margin-top: 2px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-2);
+  margin-top: 3px;
 }
-.ctrl-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  min-height: 28px;
-  min-width: 0;
+.ctrl-bar .config-item {
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  background: var(--surface-elevated);
 }
-.ctrl-label {
-  font-size: 13px;
-  color: var(--text-secondary);
+.ctrl-bar .config-label {
   white-space: nowrap;
 }
 
-/* ── 中段：3 个 metric 一行横排 ── */
+/* ── 中段：3 个指标一行；用分隔线代替三个小盒子 ── */
 .metric-strip {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 10px;
+  gap: 0;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
 }
-/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
 .metric-cell {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  min-width: 0;
+  padding: 0 12px;
+  border-left: 1px solid var(--border-subtle);
 }
-.metric-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.metric-cell:first-child {
+  border-left: 0;
+  padding-left: 0;
 }
-.metric-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
-.metric-key {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  letter-spacing: 0.04em;
+.metric-cell:last-child {
+  padding-right: 0;
 }
 .metric-value-row {
   display: flex;
@@ -268,74 +239,45 @@ const signalMetrics = computed(() => {
   gap: 4px;
 }
 .metric-value {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 700;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .metric-unit {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--text-secondary);
 }
 .metric-label {
   font-size: 11px;
   color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* ── footer 改造：拨号模式 select 在左、3 按钮在右 ── */
-.footer-row {
-  display: flex;
-  width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-.footer-conn {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-}
-.footer-mode-select {
-  /* select 宽度自适应,但不窄于 140px / 不宽于 200px,
-     保留视觉舒适区,与右侧 3 按钮平衡 */
-  min-width: 140px;
-  max-width: 200px;
-}
-.footer-actions {
-  display: flex;
-  gap: 8px;
-  flex-shrink: 0;
+/* ── 768–1024 中间档：指标字号降一档，开关仍两列 ── */
+@media (max-width: 1024px) {
+  .metric-value {
+    font-size: var(--font-lg);
+  }
+  .metric-cell {
+    padding: 0 8px;
+  }
 }
 
-/* ── 窄屏回退 ── */
+/* ── 窄屏：保持仪表 + 两开关横向，指标仍是一条三列，避免卡片被拉得过高 ── */
 @media (max-width: 768px) {
   .conn-horizontal {
-    grid-template-columns: 1fr;
-    /* justify-items:center 会让 ctrl-bar / conn-facts 不铺满 → 删掉 */
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 12px;
   }
-  .ctrl-bar {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .metric-value {
+    font-size: var(--font-lg);
   }
-  .metric-strip {
-    grid-template-columns: 1fr;
-  }
-  .footer-conn {
-    width: 100%;
-  }
-  .footer-mode-select {
-    width: 100%;
-    max-width: 100%;
-  }
-  /* footer 竖排：select 占一行，3 按钮占一行并可换行 */
-  .footer-row {
-    flex-wrap: wrap;
-  }
-  .footer-actions {
-    flex-shrink: 1;
-    flex-wrap: wrap;
-    width: 100%;
-    justify-content: flex-end;
+  .metric-cell {
+    padding: 0 7px;
   }
 }
 </style>

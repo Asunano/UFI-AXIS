@@ -7,7 +7,6 @@
       <TrafficUsageCard @open-limit="showTrafficModal = true" />
       <NetworkInfoCard
         :roaming-enabled="roamingEnabled"
-        :connection-mode="connectionMode"
         :mobile-data-saving="mobileDataSaving"
         @set-mobile-data="setMobileData"
         @open-mode="showModeModal = true"
@@ -28,14 +27,17 @@
         <WifiInfoCard
           :wifi-settings="wifiSettings"
           :wifi-enabled="wifiEnabled"
+          :wifi-loading="wifiPending"
           :qr-url="qrUrl"
           :qr-loading="qrLoading"
           :qr-error="qrError"
           @toggle-enabled="toggleWifiEnabled"
           @open-settings="showWifiModal = true"
+          @retry="refreshWifiSettings"
         />
         <ClientsCard
           :clients="wifiClients"
+          :loading="clientsLoading"
           :blocked-list="blockedList"
           :blocked-macs="blockedMacs"
           :acl-pending="aclPending"
@@ -76,27 +78,12 @@
       @clear="clearBlockedDevices"
     />
 
-    <!-- 2026-10-05 P3 修复：A 级操作统一进度弹窗（本页是可写操作消费方之一，与网络页各挂一份） -->
-    <OperationProgressModal
-      :state="wifiOp.state.value"
-      title="WiFi 开关"
-      running-text="正在切换 WiFi"
-      success-text="WiFi 设置已完成"
-      hint="WiFi 模块重启期间已连接设备会短暂掉线"
-      :fail-text="wifiOp.failReason.value"
-      :close="wifiOp.close"
-      :to-background="wifiOp.toBackground"
-    />
-    <OperationProgressModal
-      :state="modeOpState"
-      title="网络模式"
-      running-text="正在切换网络模式"
-      success-text="网络模式已切换"
-      hint="设备重新搜网需要一点时间"
-      fail-text="设备尚未完成切换，可稍后刷新查看"
-      :close="closeModeOp"
-      :to-background="noop"
-    />
+    <!--
+      2026-10-14：这里原来挂着两份 OperationProgressModal（WiFi 开关一份、制式切换一份），
+      而进度状态是各页自己的 composable 实例 —— "在仪表盘点 WiFi 开关、切到网络页"进度就没了
+      （反过来一样）。现在**全仓只有 DefaultLayout 挂一份**，状态在 stores/networkOps：
+      从哪一页发起、切到哪一页，看到的都是同一份进度与结论。
+    -->
   </div>
 </template>
 
@@ -105,7 +92,9 @@
  * 仪表盘：只负责取数编排、设备写操作与弹窗，卡片全部拆到 components/cards/。
  *
  * 为什么设备状态不下沉到卡里：`useNetworkControls()` **每次调用都新建一套 ref**
- * （见该文件，里面没有模块级单例）。卡片自己调一次就会拿到第二份互不相干的状态 ——
+ * （见该文件，里面没有模块级单例）—— 唯一的例外是 A 级操作的进度状态：2026-10-14 起
+ * 它住在 `stores/networkOps`（那批操作比页面活得久，弹窗也只在 DefaultLayout 挂一份）。
+ * 卡片自己调一次 composable 就会拿到第二份互不相干的状态 ——
  * 这里轮询刷新的是自己那份，卡片永远显示初始值；拉黑写完覆盖的名单也和弹窗看到的不是同一份。
  * 所以 composable 只在本文件调用一次，卡片收 props、把动作 emit 回来。
  *
@@ -132,8 +121,8 @@ import TrafficLimitModal from './components/modals/TrafficLimitModal.vue';
 // 与网络页共用的弹窗（已从 views/network 提到 src/components/modals）
 import NetworkModeModal from '@/components/modals/NetworkModeModal.vue';
 import AclModal from '@/components/modals/AclModal.vue';
-// 2026-10-05 P3 修复：A 级操作（WiFi 开关 / 移动数据 / 飞行模式 / 制式切换）进度弹窗
-import OperationProgressModal from '@/components/common/OperationProgressModal.vue';
+// 2026-10-14：A 级操作的进度弹窗已统一挂到 DefaultLayout（状态在 stores/networkOps），
+// 本页不再 import OperationProgressModal —— 见模板末尾的说明。
 // 频段锁定较重，按需加载；组件本体与显隐时序由 useLazyModal 管（见 bandModal）
 import type { WifiSettings } from '@/types';
 
@@ -170,16 +159,17 @@ const {
   switchingMode,
   modeSwitchTimedOut,
   roamingEnabled,
-  connectionMode,
   mobileDataSaving,
   setMobileData,
   wifiSettings,
   wifiClients,
   wifiEnabled,
+  // `wifiLoading` 只用来给 WiFi 信息卡区分「还在读」与「读取失败」；
+  // 连不上时 wifiSettings 恒为 null（loadWifiSettings 的 catch 不回写），所以 null 就是失败态
+  wifiLoading,
   toggleWifiEnabled,
-  // 2026-10-05 P3 修复：A 级操作确认器状态（WiFi 开关 / 移动数据 / 飞行模式）与制式切换进度态
-  wifiOp,
-  modeOpState,
+  // 2026-10-14：A 级操作的状态与进度弹窗统一在 stores/networkOps + DefaultLayout，
+  // 本页不再持有 wifiOp / modeOpState（见 useNetworkControls 的导出说明）
   qrUrl,
   qrLoading,
   qrError,
@@ -193,6 +183,34 @@ const {
   clearBlockedDevices,
 } = useNetworkControls();
 
+// ── 卡片三态的加载位 ──
+/*
+ * WiFi 信息卡：`loadWifiSettings` 失败时只吞掉错误、不回写 `wifiSettings`（首次失败就是 null），
+ * 所以「null = 没读到」成立，用它当失败态。但首帧（setup 到 onMounted 之间）也是 null 且不在加载中，
+ * 只按这两个信号判会闪一下「读取失败」—— 因此额外记一个「是否已经尝试过」。
+ */
+const wifiAttempted = ref(false);
+const wifiPending = computed(() => wifiLoading.value || !wifiAttempted.value);
+
+function refreshWifiSettings() {
+  return loadWifiSettings().finally(() => {
+    wifiAttempted.value = true;
+  });
+}
+
+/*
+ * 连接设备卡：composable 的 `loadWifiClients` 把失败吞成空数组（catch 里 `= []`），
+ * 空列表与读取失败在 web 侧无法区分 —— 这里只能维护「首次取数是否结束」，
+ * 至少让加载期不再显示「暂无设备连接」。彻底区分需要改 composable（报告里已列出）。
+ */
+const clientsLoading = ref(true);
+
+function refreshWifiClients() {
+  return loadWifiClients().finally(() => {
+    clientsLoading.value = false;
+  });
+}
+
 // ── 弹窗显隐（打开由卡片按钮置位，表单回填由子组件在 watch(show) 内完成）──
 const showWifiModal = ref(false);
 const showTrafficModal = ref(false);
@@ -204,15 +222,22 @@ const bandModal = useLazyModal(() => import('@/components/modals/BandLockModal.v
 const bandComponent = bandModal.component;
 const bandShow = bandModal.show;
 
-// 2026-10-05 P3 修复：制式切换进度弹窗的关闭/后台动作（状态位在 composable，这里只收敛）
-const closeModeOp = () => { modeOpState.value = { kind: 'idle' }; };
-const noop = () => {};
+// 2026-10-14：原来这里还有 closeModeOp 与一个 `const noop = () => {}` —— 前者收敛各页自己那份
+// 进度状态位，后者只用来喂制式切换弹窗的 `:to-background`（一颗点了没反应的假按钮）。
+// 进度状态与弹窗都统一到 stores/networkOps + DefaultLayout 之后，两者都没有存在意义了。
 const wifiModalRef = ref<InstanceType<typeof WifiModal> | null>(null);
 
 function applyModeAndClose() {
-  applyNetworkMode().finally(() => {
-    showModeModal.value = false;
-  });
+  /*
+   * 2026-10-14：改成与网络页同构 —— **先关配置弹窗，再下发**。
+   *
+   * 改前是 `applyNetworkMode().finally(() => (showModeModal = false))`：制式切换的回读确认
+   * 最长十几秒，于是仪表盘上这张配置弹窗会一直开着，同时全局进度弹窗也在跑 —— 两个模态叠在一起，
+   * 后挂载的那个还压在进度上面（用户看不到真正的进度）。网络页一直是"先关再下发"，
+   * 现在两页一致：进度由全局进度弹窗呈现，配置弹窗立即退场。
+   */
+  showModeModal.value = false;
+  applyNetworkMode();
 }
 
 // ── WiFi 设置保存（报文统一由 contract.buildWifiConfigPayload 拼，规则见那里）──
@@ -227,10 +252,12 @@ interface WifiSavePayload {
 }
 async function saveWifiEdit(payload: WifiSavePayload) {
   // 2026-10-05 P3 修复：保存结果回传 WifiModal（notifySaved）——ok 才关窗，失败显示 core 具体原因
+  const cur = payload.cur;
+  // 开关是独立接口，只有真的变了才下发，避免每次保存都重启一遍 WiFi 模块
+  const switchChanged = !!cur && payload.enabled !== cur.enabled;
   let ok = false;
   let failText: string | undefined;
   try {
-    const cur = payload.cur;
     // 报文里 passphrase 的 OPEN 特例、encryp_type 的配对/透传、broadcast_disabled 的方向
     // 都在 buildWifiConfigPayload 里（与网络页的 WifiEditModal 共用同一份规则）。
     // 频段不在这个表单里（本弹窗没有频段控件），换频段是 POST /api/wifi/band 的独立动作
@@ -245,23 +272,52 @@ async function saveWifiEdit(payload: WifiSavePayload) {
         fallbackEncrypType: cur?.encryp_type,
       })
     );
-    // 开关是独立接口，只有真的变了才下发，避免每次保存都重启一遍 WiFi 模块
-    if (cur && payload.enabled !== cur.enabled) {
-      await api.post('/api/wifi/enable', { enabled: payload.enabled });
-    }
     ok = true;
     message.success('WiFi 设置已保存');
   } catch (e: any) {
     // 具体原因替代笼统文案：能拿到 core 的 error 就透出
     failText = e?.response?.data?.error || e?.message || '保存失败';
   }
-  // 设备写入到查询接口可见有延迟，立刻回读会拿回改动前的 SSID / 加密方式
+
+  /*
+   * 2026-10-14 修（审计 G1：这个弹窗的 WiFi 开关绕过了 A 级入口）。
+   *
+   * 改前：这里直发 `POST /api/wifi/enable`，然后 `settleDelay()`（600ms）+ **单次**
+   * `loadWifiSettings()`。而设备侧的「开/关 WiFi」是 `switchWiFiChip` / `switchWiFiModule`，
+   * 会重启 WiFi 模块（`GoformWifiClient.kt:469-489`）——600ms 时模块还没起来，这次回读拿到的
+   * 仍是旧状态，界面停在改动前直到下一轮 10s 轮询。同一个开关在网络页卡片上走的是
+   * `useNetworkControls.toggleWifiEnabled`（下发 + 13 次回读确认，见 contract 的
+   * `NetworkModeSwitchProbe`）：**一个开关两条写路径、两套节奏**，两边表现还不一样。
+   *
+   * 现在：本文件**不再自己发 `/api/wifi/enable`**，开关唯一写路径 = `toggleWifiEnabled`（A 级）。
+   * 先关窗再下发（与 applyModeAndClose 同构）：A 级回读最长 30.6s，不该让配置弹窗空转，
+   * 进度与结论交给全局进度弹窗（DefaultLayout 挂的唯一一份）。
+   *
+   * 已知取舍：A 级有全站并发闸门，若此刻已有别的 A 级操作在跑，这次开关会被拒
+   * （弹「已有操作正在进行」）——配置已经保存成功，开关需要用户稍后再点一次。
+   * 这与网络页卡片上点开关的行为完全一致，不再出现"两个入口两套结果"。
+   */
+  if (ok && switchChanged) {
+    // 旧二维码立刻作废：SSID/密码这次一起改了，按旧配置生成的图已经是错的
+    releaseQrUrl();
+    wifiModalRef.value?.notifySaved(true);
+    await toggleWifiEnabled(payload.enabled);
+    // 开关收敛后 wifiSettings / wifiClients 由 useNetworkControls 的 finishedSeq 统一回读刷新
+    // （见那里的说明），这里只补二维码 —— 它不在那次统一回读里
+    loadQrCode();
+    return;
+  }
+
+  // 设备写入到查询接口可见有延迟，立刻回读会拿回改动前的 SSID / 加密方式。
+  // 这一支**不需要** A 级：`/api/wifi/config` 是 AP 配置表的普通写入，不重启模块
+  // （会重启模块的是 `/api/wifi/enable` 与 `/api/wifi/band`，那两条已各自走 A 级），
+  // 与其它 B 级写操作同属"一次写 + 600ms 后一次回读"这一档。
   await settleDelay();
-  loadWifiSettings().then(() => {
+  refreshWifiSettings().then(() => {
     // 回读落地后再通知弹窗关/留，避免窗口已关还显示 loading
     wifiModalRef.value?.notifySaved(ok, failText);
   });
-  loadWifiClients();
+  refreshWifiClients();
   // WiFi 配置一改，按旧 SSID/密码生成的二维码就是错的：丢掉旧 blob 重新取一张
   releaseQrUrl();
   loadQrCode();
@@ -298,8 +354,10 @@ async function saveTrafficLimit(payload: TrafficSavePayload) {
     // 设备写入到查询接口可见有延迟，立刻回读会拿到旧值
     await settleDelay();
     loadSummary();
-  } catch {
-    message.error('保存失败');
+  } catch (e: any) {
+    // 与上面 saveWifiEdit 同一口径：能拿到 core 的 error 就透出它，
+    // 笼统的「保存失败」让用户不知道是数值越界还是设备拒绝
+    message.error(e?.response?.data?.error || e?.message || '保存失败');
     await settleDelay();
     loadSummary();
   }
@@ -314,10 +372,10 @@ onMounted(() => {
   loadDeviceInfo();
   refreshNetworkStatus();
   loadDeviceSettings();
-  loadWifiClients();
+  refreshWifiClients();
   loadWifiAcl();
   // 二维码要按当前频段（chip1/chip2）取，所以等 WiFi 设置到手再拉
-  loadWifiSettings().then(() => loadQrCode());
+  refreshWifiSettings().then(() => loadQrCode());
 });
 
 useInterval(() => {
@@ -331,8 +389,8 @@ useInterval(() => {
 }, 10_000);
 useInterval(() => {
   // 二维码不跟着轮询重取：它是 blob，只在挂载与改完 WiFi 配置后取
-  loadWifiSettings();
-  loadWifiClients();
+  refreshWifiSettings();
+  refreshWifiClients();
 }, 10_000);
 
 onUnmounted(() => {
@@ -409,18 +467,24 @@ async function loadDeviceInfo() {
 .dashboard {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
   /* 宽屏下整页刚好铺满内容区、自身不滚动：高度交给内部按 flex 分配，
-     多出来的空间给折线图卡吃掉（见 .chart-card）。窄屏恢复自然高度并允许滚动。 */
-  height: 100%;
-  min-height: 0;
+     多出来的空间给折线图卡吃掉（见 .chart-card）。窄屏恢复自然高度并允许滚动。
+
+     2026-10-21：原来是 `height: 100%` —— 内容（两栏各自最小高度之和）装不下时，盒子仍是
+     一屏高，卡片被压进 GridCard 的 overflow:hidden 里静默裁掉，而页面又不滚（721–900px 高度档
+     就是这样，720 以下才有媒体查询兜底）。改成 `min-height: 100%`：装得下时行为与 height:100%
+     完全一致（flex 子项仍按剩余空间分配），装不下时盒子跟着长高、交给内容区滚动。
+     这样 721–900 档不必新增第四档断点（§3.2 只允许 768 / 1024 / max-height:720）。 */
+  min-height: 100%;
+  height: auto;
 }
 
 /* 顶栏：流量 + 网络，两张卡等宽等高并排（窄屏折成单列，见下方媒体查询） */
 .dashboard-top {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
+  gap: var(--space-4);
   /* stretch 而不是 start：两张卡内容行数不同，必须拉到同高，否则一高一矮 */
   align-items: stretch;
 }
@@ -433,7 +497,7 @@ async function loadDeviceInfo() {
   /* 右栏宽度跟着窗口走（原来写死 360px：窗口一变只压缩左栏，右栏几张卡完全不自适应）。
      clamp 兜住上下限，免得超宽屏时右栏拉得比左栏还宽、窄屏时挤成一条。 */
   grid-template-columns: minmax(0, 1fr) clamp(280px, 26%, 420px);
-  gap: 16px;
+  gap: var(--space-4);
   align-items: stretch;
   flex: 1;
   min-height: 0;
@@ -443,7 +507,7 @@ async function loadDeviceInfo() {
 .dashboard-right {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
   min-height: 0;
 }
 /* flex 项默认 flex-shrink:1 —— 空间不够时会把卡片本身压扁（内容溢出到卡片外，
@@ -479,11 +543,9 @@ async function loadDeviceInfo() {
 
 /* 视口太矮时"刚好铺满"会把折线图压到不可读：回退成整页滚动，
    两栏的伸缩卡也解锁成自然高度（设备列表直接列全，不再内部滚）。
-   阈值与 DefaultLayout 的矮屏压缩共用 720px（原先这里写 760，是第四套断点）。 */
+   阈值与 DefaultLayout 的矮屏压缩共用 720px（原先这里写 760，是第四套断点）。
+   页面高度那一层不必再写：.dashboard 已经是 min-height:100% + 自然高度。 */
 @media (max-height: 720px) {
-  .dashboard {
-    height: auto;
-  }
   .dashboard-grid {
     flex: none;
   }
@@ -496,10 +558,7 @@ async function loadDeviceInfo() {
 }
 
 @media (max-width: 1024px) {
-  /* 单列排布时内容必然高于视口，恢复自然高度、交回给内容区滚动 */
-  .dashboard {
-    height: auto;
-  }
+  /* 单列排布时内容必然高于视口，解锁伸缩（页面高度由 .dashboard 的 min-height 兜住） */
   .dashboard-top {
     grid-template-columns: 1fr;
   }

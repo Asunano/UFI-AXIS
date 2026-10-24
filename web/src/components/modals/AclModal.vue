@@ -1,5 +1,11 @@
 <template>
-  <n-modal v-model:show="show" preset="card" title="已拉黑设备" style="width: 460px; max-width: calc(100vw - 32px)">
+  <n-modal
+    v-model:show="show"
+    preset="card"
+    title="已拉黑设备"
+    class="modal-fit"
+    style="--modal-w: 460px; --modal-h: 640px"
+  >
     <div v-if="blockedList.length" class="lan-list">
       <div v-for="e in blockedList" :key="e.mac" class="lan-row acl-row">
         <span class="lan-name">{{ e.name || '未知设备' }}</span>

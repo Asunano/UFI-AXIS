@@ -149,7 +149,10 @@ async function loadOrCreateKeyPair(): Promise<StoredKeyPair> {
       cachedPair = existing;
       return existing;
     }
-    // extractable=false：私钥字节永远无法导出，身份不可被复制到其它浏览器
+    // extractable=false：**仅在这条路径上**（https / localhost，即有 crypto.subtle）
+    // 私钥字节永远无法导出，身份不可被复制到其它浏览器。
+    // 明文 http 走的是下面的 [loadOrCreateRawKey] 回退：那份私钥是 IndexedDB 里的裸字节，
+    // 任意同源脚本都能读走 —— 两句话不能混为一谈（2026-10-21 审计 §B11）。
     const generated = await crypto.subtle.generateKey(KEY_ALGORITHM, false, ['sign', 'verify']);
     const pair: StoredKeyPair = {
       privateKey: generated.privateKey,
@@ -292,8 +295,25 @@ function randomNonce(): string {
  * STALE_TIMESTAMP 401。偏差来源：/health 响应自带服务器时间（免费鉴权），登录第 3 步
  * 与各视图的探活都能顺带校准（见 calibrateClockOffset）。
  * 默认 0 = 不补偿；观测到微小偏差（<2s）不采纳，避免 RTT 抖动造成来回震荡。
+ *
+ * ## 2026-10-17：必须**持久化**
+ * 原来这个值只在内存里。而 core 跑在没有电池的 F50 上 —— **重启后设备时钟会回到出厂值**，
+ * 于是「浏览器时钟对、服务器时钟错」；只要页面刷新一次，内存里的偏差就归零，
+ * 之后**每一个**签名请求都 STALE_TIMESTAMP → 401（控制台整片 401 的现场）。
+ * 现在写进 localStorage，并在 401 时由 useApi 的响应拦截器用 /health 重新校准后重试。
  */
-let clockOffsetMs = 0;
+const CLOCK_OFFSET_KEY = 'ufi-axis-clock-offset-ms';
+
+let clockOffsetMs: number = (() => {
+  try {
+    const raw = localStorage.getItem(CLOCK_OFFSET_KEY);
+    const v = raw ? Number(raw) : 0;
+    return Number.isFinite(v) ? v : 0;
+  } catch {
+    // 隐私模式 / 禁用 storage：退化为"本次会话内有效"，401 时仍会被重新校准
+    return 0;
+  }
+})();
 
 /** 用服务器当前时间校准签名时钟；serverNowMs 为 /health 响应的 timestamp（毫秒数字符串或数字）。 */
 export function calibrateClockOffset(serverNowMs: number | string): void {
@@ -302,6 +322,16 @@ export function calibrateClockOffset(serverNowMs: number | string): void {
   const observed = server - Date.now();
   if (Math.abs(observed - clockOffsetMs) < 2_000) return;
   clockOffsetMs = observed;
+  try {
+    localStorage.setItem(CLOCK_OFFSET_KEY, String(observed));
+  } catch {
+    // 存不下就算了：本次会话仍用内存里的值
+  }
+}
+
+/** 当前偏差（诊断/测试用）。 */
+export function getClockOffsetMs(): number {
+  return clockOffsetMs;
 }
 
 export async function signRequest(method: string, uri: string): Promise<SignedHeaders> {

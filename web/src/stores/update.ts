@@ -2,6 +2,12 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import { getApiClient } from '@/composables/useApi';
 import { Endpoints } from '@/api/contract';
+import {
+  UPDATE_RESULT_KEYS,
+  readLastResult,
+  saveLastResult,
+  type UpdateLastResult,
+} from '@/views/settings/components/updateResult';
 
 /**
  * 后端 core 自更新的全局状态（2026-09-06）。
@@ -64,7 +70,16 @@ export interface BackendUpdateInfo {
   sha256: string;
 }
 
-/** 一次性提示：store 里产生，由面板消费后调 `clearNotice()`（避免重挂载重复弹）。 */
+/**
+ * 一次性提示：store 里产生，由面板消费后调 `clearNotice()`（避免重挂载重复弹）。
+ *
+ * 2026-10-14 **降级**：它只承载"这一刻弹一下"的即时反馈（用户在页面上时的 toast），
+ * **不再是结论的载体** —— 结论在 [UpdateLastResult]，由卡片上那一行常驻渲染。
+ * 分工的理由：notice 是易失的（面板一卸载就没人消费、`clearNotice()` 之后即消失、
+ * 刷新整页更是随 store 一起归零），而"这次更新到底成没成"必须活过弹窗开合与整页刷新。
+ * 所以每个终态**两处都写**：结论进 `lastResult`，即时反馈走 notice。
+ * 谁都不许只写一处，更不许拿 notice 反推结论。
+ */
 export interface UpdateNotice {
   id: number;
   type: 'success' | 'error' | 'warning' | 'info';
@@ -128,6 +143,22 @@ export const useUpdateStore = defineStore('update', () => {
   const installedVersion = ref('');
   const notice = ref<UpdateNotice | null>(null);
   /**
+   * 「上次更新结果」—— 结论的**唯一**落点（2026-10-14 修"关掉设置弹窗 / 刷新整页就再也
+   * 看不到更新结论"）。成功 / 失败 / 超时三个终态都写，并且落 sessionStorage 扛刷新。
+   *
+   * 为什么不能只靠 notice：设置页是**弹窗**（`SettingsView.vue` 的 `n-modal`，默认
+   * `display-directive="if"`），关掉即卸载面板 —— 那一刻更新完成就没人消费 notice 了；
+   * 刷新整页则连 store 都重建。详见 `views/settings/components/updateResult.ts` 的文件头。
+   *
+   * 初值从 sessionStorage 恢复：刷新后重进设置页，卡片上那一行直接就有内容。
+   *
+   * **已知缺口（刻意不补）**：`resume()` 刻意不复核 core 的历史 `done`（每次打开都去复核
+   * 只会重复弹"更新完成"），所以"刷新页面那一刻 core 恰好已经装完"这种情况本页并没有见证过
+   * 终态、也就没有结论可写。此时卡片上的「状态」行仍如实显示 core 的 `done`；要复核就点
+   * 「重新检查状态」（它走 /health + 版本比对，成功了会写进这里）。
+   */
+  const lastResult = ref<UpdateLastResult | null>(readLastResult(UPDATE_RESULT_KEYS.backend));
+  /**
    * 最近一次探测失败原因。安装/重启期间连不上是**预期**的（core 在自杀重启），
    * 所以不当错误终止，但必须记下来 —— 超时时要把它一起报出去，而不是像原来那样 `catch {}` 全吞。
    */
@@ -167,6 +198,20 @@ export const useUpdateStore = defineStore('update', () => {
 
   function clearNotice() {
     notice.value = null;
+  }
+
+  /**
+   * 记一条结论：进响应式字段（卡片那一行立刻跟着变）+ 落 sessionStorage（扛刷新）。
+   *
+   * 版本号在 `saveLastResult` 里统一剥 `v` 前缀：清单给的是 `v0.0.5`、BuildConfig 给的是
+   * `0.0.5`，而卡片文案会自己补 `v` —— 不剥就会出现 `vv0.0.5`。
+   *
+   * 对外暴露是为了 `localUpdatePush.ts`：上传/开装那两条链路的失败终态**不经过**本 store
+   * 的状态机（那是"core 在装"那一段的机器），不主动补记的话，卡片会停在上一次的成功上，
+   * 那比不显示更误导。
+   */
+  function recordResult(ok: boolean, version: string, message: string) {
+    lastResult.value = saveLastResult(UPDATE_RESULT_KEYS.backend, ok, version, message);
   }
 
   /**
@@ -375,10 +420,10 @@ export const useUpdateStore = defineStore('update', () => {
     installedVersion.value = actualVersion || targetVersion.value;
     probeFailures.value = 0;
     lastProbeError.value = '';
-    pushNotice(
-      'success',
-      installedVersion.value ? `更新完成，已更新到 v${installedVersion.value}` : '更新完成，core 已重启就绪'
-    );
+    const text = installedVersion.value ? `更新完成，已更新到 v${installedVersion.value}` : '更新完成，core 已重启就绪';
+    // 同一句话写两处：结论进 lastResult（常驻 + 扛刷新），即时反馈走 notice（toast）
+    recordResult(true, installedVersion.value, text);
+    pushNotice('success', text);
   }
 
   /** core 脱离忙态但不是 done：failed / need_push / idle（idle = 清单里没有更新） */
@@ -386,9 +431,21 @@ export const useUpdateStore = defineStore('update', () => {
     stopTimer();
     phase.value = 'idle';
     deadlineAt.value = 0;
-    if (state === 'failed') pushNotice('error', status.value.message || '后端更新失败');
-    else if (state === 'need_push') pushNotice('warning', status.value.message || '更新源不可达，请手动上传 APK');
-    else pushNotice('info', status.value.message || '后端已是最新版本');
+    if (state === 'failed') {
+      const text = status.value.message || '后端更新失败';
+      recordResult(false, '', text);
+      pushNotice('error', text);
+    } else if (state === 'need_push') {
+      // need_push 也算"没成"：更新源不可达，这次更新根本没发生（要用户手动传 APK）。
+      // 记成 ok:false 而不是丢弃 —— 否则用户在弹窗关着时错过了 toast，卡片上什么也看不到。
+      const text = status.value.message || '更新源不可达，请手动上传 APK';
+      recordResult(false, '', text);
+      pushNotice('warning', text);
+    } else {
+      // idle = core 比完版本认为无事可做（清单里没有更新）：**这不是一次更新结果**，
+      // 不写 lastResult —— 写了会让卡片显示"上次更新结果：成功"，而其实什么都没装。
+      pushNotice('info', status.value.message || '后端已是最新版本');
+    }
   }
 
   /** 超时：停止轮询，把最后一次探测失败原因一起报出（不做无限静默重试） */
@@ -397,7 +454,9 @@ export const useUpdateStore = defineStore('update', () => {
     phase.value = 'timeout';
     deadlineAt.value = 0;
     const detail = lastProbeError.value ? `，最后一次探测：${lastProbeError.value}` : '';
-    pushNotice('error', `${reason}${detail}。已停止轮询，可点「重新检查状态」再确认一次。`);
+    const text = `${reason}${detail}。已停止轮询，可点「重新检查状态」再确认一次。`;
+    recordResult(false, '', text);
+    pushNotice('error', text);
   }
 
   // ── 对外动作 ──
@@ -419,8 +478,27 @@ export const useUpdateStore = defineStore('update', () => {
 
   /** 安装已上传的本地 APK（兜底通道）。返回 false = core 没能启动安装。 */
   async function installLocal(apkPath: string): Promise<boolean> {
-    const { data } = await getApiClient().post(Endpoints.update.installLocal, { apk_path: apkPath });
-    const body = (data ?? {}) as Record<string, unknown>;
+    let body: Record<string, unknown>;
+    try {
+      const { data } = await getApiClient().post(Endpoints.update.installLocal, { apk_path: apkPath });
+      body = (data ?? {}) as Record<string, unknown>;
+    } catch (e: any) {
+      // 有响应 = core 明确拒绝了（apk_path 不存在 / 正在更新中…），那是真失败。
+      if (e?.response) return false;
+      /*
+       * 无响应（连接被重置 / 超时）：**安装很可能已经开始**。
+       *
+       * core 装 APK 会重启自身，浏览器这条 HTTP 连接正好断在重启那一刻 —— 这不是失败。
+       * 2026-10-14 修：原来这里直接抛出，于是下面的 `beginInstallWatch()` 永不执行，
+       * 进度环就永远冻在"正在安装"（此前是组件侧用「5×2s 静默 resume + recheck」绕过的，
+       * 现在收进 store —— 轮询是 store 的职责，不该由调用方补）。
+       * 版本号未知（本地包不走清单），完成判定退化为「/health 就绪即完成」，与正常路径一致。
+       */
+      targetVersion.value = '';
+      installedVersion.value = '';
+      beginInstallWatch();
+      return true;
+    }
     applyStatus(body.status);
     if (body.ok === false) return false;
     // 本地包的版本号未知（清单没参与），完成判定退化为「/health 就绪即完成」
@@ -446,6 +524,8 @@ export const useUpdateStore = defineStore('update', () => {
     }
     // state=done 时**不**自动进入重启复核：那是历史遗留终态（上次更新的结论），
     // 页面每次打开都去复核一遍只会重复弹"更新完成"。需要复核请点「重新检查状态」。
+    // 注意这与"结论落在哪"是两件事：结论落在 `lastResult`（初值从 sessionStorage 恢复），
+    // 所以这里省掉的只是"重新问一遍"，不是"让用户看不到结果"。
   }
 
   /** 「重新检查状态」入口：超时或失败后手动再确认一次，忙态则重新续上轮询。 */
@@ -457,6 +537,8 @@ export const useUpdateStore = defineStore('update', () => {
     probeFailures.value = 0;
     const s = await refreshStatus();
     if (!s) {
+      // 只弹即时提示，**不**写 lastResult：这是"这一次没问到"，不是一次更新的结论 ——
+      // 写进去会让卡片显示"上次更新结果：失败"，而设备侧可能什么事都没有。
       pushNotice('error', lastProbeError.value || '状态查询失败，core 可能仍在重启');
       return;
     }
@@ -472,7 +554,13 @@ export const useUpdateStore = defineStore('update', () => {
     pushNotice('info', s.message || `当前状态：${s.state}`);
   }
 
-  /** 重置 core 侧状态（"忘掉这次更新"），同时清掉本地阶段与 apkPath。 */
+  /**
+   * 重置 core 侧状态（"忘掉这次更新"），同时清掉本地阶段与 apkPath。
+   *
+   * **不动 `lastResult`**：它记的是"发生过什么"（历史结论），而 reset 清的是"core 现在
+   * 处在什么状态"（状态机）。抹掉它会让用户刚看清失败原因、顺手点一下重置就再也看不到 ——
+   * 而那正是本次要修的"结论看不到"。下一次终态自然会覆盖它。
+   */
   async function reset(): Promise<void> {
     stopTimer();
     const { data } = await getApiClient().post(Endpoints.update.reset);
@@ -497,6 +585,7 @@ export const useUpdateStore = defineStore('update', () => {
     targetVersion,
     installedVersion,
     notice,
+    lastResult,
     lastProbeError,
     probeFailures,
     deadlineAt,
@@ -515,5 +604,6 @@ export const useUpdateStore = defineStore('update', () => {
     setApkPath,
     stopWatch,
     clearNotice,
+    recordResult,
   };
 });
