@@ -74,6 +74,16 @@ object ComponentFactory {
     private var storageSourceManagerRef: com.ufi_axis_core.api.files.StorageSourceManager? = null
 
     private const val TAG = "ComponentFactory"
+
+    /**
+     * L2（已鉴权请求）命中黑名单时，事件中心最多每 5 分钟记一条。
+     *
+     * 为什么必须节流：L2 是**每次请求**都命中 —— 被拉黑设备的客户端还在轮询，
+     * 不节流的话事件中心会被它一个人刷满（环形上限会裁，但那几百行足以把
+     * 真正有用的告警挤走）。冷却本身不受这个窗口影响，仍然每次命中都续期。
+     */
+    private const val L2_BLOCKED_EVENT_MIN_INTERVAL_MS = 5 * 60 * 1000L
+
     private var built = false
 
     /**
@@ -253,7 +263,31 @@ object ComponentFactory {
         // 会拿旧快照全量覆盖，把新实例刚写的配对记录抹掉。
         val pairedDeviceStore = PairedDeviceStore.getInstance(context.applicationContext, settings)
 
-        val deviceVerifier = com.ufi_axis_core.util.DeviceRequestVerifier(pairedDeviceStore)
+        // 配对设备黑名单（2026-10-15）：与 pairedDeviceStore 同批创建 —— 两者在配对/鉴权
+        // 两条热路径上成对使用：一个回答"谁被允许进来"，一个回答"谁被明确拒绝"。
+        // 与 PairedDeviceStore 不同，它没有跨进程需求（守护进程不做配对判定），
+        // 所以直接 new 一个即可；但它**必须**被注入 PairingManager，否则功能静默失效。
+        val pairedBlacklistStore =
+            com.ufi_axis_core.api.pairing.PairedDeviceBlacklistStore(context.applicationContext)
+
+        // 新设备待批准请求（2026-10-15）：短命状态（15 分钟 TTL），内存态即可 ——
+        // 进程重启后请求方重新发起一次就行（它本来就在轮询）。批准**结果**不在这里，
+        // 它体现在"该指纹已配对"这件事上。
+        val pairedApprovalStore = com.ufi_axis_core.api.pairing.PairedDeviceApprovalStore()
+
+        // 黑名单命中冷却（2026-10-15）：两处共用同一实例 ——
+        // ① L1（配对/登录）命中时进入/续期冷却；② L2（已鉴权请求）的**事件节流**也复用它，
+        //    因为键完全一样（指纹 + hwId），而 L2 是每次请求都命中、必须节流。
+        val pairedBlockCooldown = com.ufi_axis_core.api.pairing.PairingBlockCooldown()
+
+        val deviceVerifier = com.ufi_axis_core.util.DeviceRequestVerifier(
+            pairedDeviceStore,
+            // 黑名单查询（2026-10-15，L2）：被拉黑设备的**已鉴权请求**直接判 444，
+            // 做到"拉黑即刻掉线"；HTTP 与 WebSocket 共用本实例，所以两者会一起断。
+            // 传 lambda 而不是 store 本身：verifier 在 core:common、store 在 core:api，
+            // 反向依赖会成环（见 BlockedDeviceLookup 的说明）。
+            blockedDevices = { fp, hw -> pairedBlacklistStore.isBlocked(fp, hw) }
+        )
         AppLogger.i(TAG, "[5.5] Paired device store & request verifier initialized")
 
         // ── 6. WebSocket 管理器与推送服务 ──
@@ -290,6 +324,15 @@ object ComponentFactory {
         val responseCache = com.ufi_axis_core.core.cache.ResponseCache(
             onInvalidate = { type -> wsManager.broadcastDataChanged(type) }
         )
+        // 2026-10-17：goform 熔断打开时，把缓存切到"只服务旧值"。
+        //
+        // 这是"goform 坏了别把整个功能拖死"的最后一环：熔断让请求快速失败（不再等满超时），
+        // 而这个闸门让前端拿到**上一次成功值**而不是空白 —— 设备后台坏掉时页面仍然可看。
+        // 回调由 GoformGuard 在熔断打开/恢复的那一跳触发，不是每次失败都触发。
+        com.ufi_axis_core.util.GoformGuard.onHealthChanged = { healthy ->
+            runCatching { responseCache.setGoformUnhealthy(!healthy) }
+                .onFailure { AppLogger.w(TAG, "goform health gate wiring failed: ${it.message}") }
+        }
         AppLogger.i(TAG, "[8] Shared components initialized (cache + ws notification enabled)")
 
         // ── 8.5 SMS 控制器（提前创建，供 DataScheduler VC 扫描使用）──
@@ -347,7 +390,29 @@ object ComponentFactory {
         wsManager.onConnectionRestored = { responseCache.clearStale(); scheduler.applyRealtimePushState() }
 
         // ── 10. 认证中间件 ──
-        val authMiddleware = AuthMiddleware(deviceVerifier)
+        val authMiddleware = AuthMiddleware(
+            deviceVerifier,
+            // L2 事件留痕（2026-10-15）：被拉黑设备的**每一次已鉴权请求**都会走到这里，
+            // 而客户端还在轮询 —— 不节流会把事件中心刷爆（环形上限虽会裁，但那几百行
+            // 足以把真正有用的事件挤走）。节流状态复用冷却实例（同一套键）。
+            onBlockedDevice = { device ->
+                val worthReporting = pairedBlockCooldown.recordHitThrottled(
+                    fingerprint = device.fingerprint,
+                    hwId = device.hwId,
+                    minIntervalMs = L2_BLOCKED_EVENT_MIN_INTERVAL_MS
+                )
+                if (worthReporting) {
+                    alert.recordSecurityEvent(
+                        type = "pairing_blocked_hit",
+                        level = "warning",
+                        message = "被拉黑的设备「" +
+                            device.deviceName.ifBlank { device.fingerprint.take(8) } +
+                            "」的请求被拒",
+                        value = device.fingerprint.take(8)
+                    )
+                }
+            }
+        )
         AppLogger.i(TAG, "[10] Auth middleware initialized")
 
         // ── 11-12. 控制器子图（ADB / SMS 转发 / 任务 / 下载 / System 控制器） ──
@@ -697,11 +762,26 @@ object ComponentFactory {
         val appRoutes = AppRoutes(appManager)
         val shellRoutes = ShellRoutes(consoleRecorder)
         val fileProviderRegistry = com.ufi_axis_core.api.files.FileProviderRegistry()
+        // 媒体索引缓存（2026-10-13）：后台取一次 MediaStore 元数据 → 存内存 → 用户读内存。
+        //
+        // 建在这里（早于 fileRoutes 与 mediaRoutes）的理由有两个：
+        //  1. FileRoutes 删除媒体文件后要失效它，所以必须先有实例；
+        //  2. MediaRoutes 要用同一个实例注册 loader（只有它知道 Kind / projection /
+        //     游标怎么解析），而"同一个"很关键 —— 两个实例就是两份缓存，定时刷新只会刷到一份。
+        //
+        // 本类不参与它的取数逻辑，只负责建出来、注入下去、挂进 ServerGraph
+        //（好让 BackendService 按服务生命周期起停它的定时刷新）。
+        val mediaIndexStore = com.ufi_axis_core.api.media.MediaIndexStore()
         fileProviderRegistry.register(com.ufi_axis_core.api.files.LocalFileProvider())
         // context / responseCache 是给 POST /api/files/delete 用的：走 MediaStore 删除才能
         // 把媒体索引一起清掉（File.delete 会留下指向不存在文件的僵尸条目），
-        // 删完再失效 media:* 缓存，客户端刷出来才是新的
-        val fileRoutes = FileRoutes(fileProviderRegistry, context, responseCache)
+        // 删完再失效 media:* 缓存，客户端刷出来才是新的。
+        // onMediaMutated 是 2026-10-13 加的：媒体库内容被删掉之后索引快照也必须失效，
+        // 否则客户端还会在列表里看到那个已经不存在的文件。
+        val fileRoutes = FileRoutes(
+            fileProviderRegistry, context, responseCache,
+            onMediaMutated = { mediaIndexStore.invalidate() }
+        )
         // 远程存储源（阶段 2-4）：FTP / WebDAV 配置存在 settings 的 storage_sources 键上，
         // 启动时把已启用的源注册进 registry —— FileRoutes 的 `remote:<id>/...` 路径解析靠它。
         // 建连失败不阻塞启动：initializeProviders 内部按源吞异常并记 WARN。
@@ -713,11 +793,10 @@ object ComponentFactory {
         val storageSourceRoutes = com.ufi_axis_core.api.routes.StorageSourceRoutes(storageSourceManager)
         // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
         // 播放仍走 fileRoutes 的 /api/files/stream，这里不碰字节流。
-        // responseCache 只给 /media/groups 用（整表聚合，客户端会来回切三个分组视图）。
         // 「从音乐库移除」的排除名单（2026-09-23）：单文件级，扫描目录管不了单首。
-        // 它被 MediaRoutes.listSelection 用来在 SQL 里排掉那些路径 ——
-        // 所以必须先建它再建 mediaRoutes。名单变更走 data_changed，
-        // 否则在一端移除、另一端要退页面才看得见。
+        // 2026-10-13 起它不再拼 SQL（`listSelection` 已随索引缓存删除），改为在读快照时
+        // 于内存里过滤（`MediaRoutes.filterListItems`）—— 所以它只需早于 mediaRoutes 建好。
+        // 名单变更走 data_changed，否则在一端移除、另一端要退页面才看得见。
         val mediaExclusions = com.ufi_axis_core.api.media.MediaExclusionStore(context)
         mediaExclusions.attachChangeBroadcaster {
             wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
@@ -744,7 +823,10 @@ object ComponentFactory {
                     broadcast = thumbPrewarmBroadcast,
                     forceIdle = true
                 )
-            }
+            },
+            // 2026-10-13：媒体索引缓存。传**同一个**实例给 FileRoutes（删除后失效）与
+            // ServerGraph（生命周期起停），两个实例就是两份缓存。
+            indexStore = mediaIndexStore
         )
 
         // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）：把 ThumbPrewarmWorker
@@ -838,14 +920,107 @@ object ComponentFactory {
 
         // ── 13.5 配对模式路由（免鉴权；发现改为网关探测 + 手动输入，不再注册 mDNS）──
         // pairedDeviceStore 已在 [5.5] 创建（WS 握手鉴权需要它）
-        val pairingManager = PairingManager(settings, pairedDeviceStore)
+        // blacklist 见 [5.5]：L1 拦截（配对与密码登录同一条链路）就靠它。
+        val pairingManager = PairingManager(
+            settings,
+            pairedDeviceStore,
+            blacklist = pairedBlacklistStore,
+            // 双键退避（2026-10-15）：指纹 + hwId 各自计数，与按 IP 的密码节流并存取最严。
+            // 内存态、进程重启清零（理由见 PairingAttemptLimiter 的类注释：攻击者无法触发 core 重启）。
+            attemptLimiter = com.ufi_axis_core.api.pairing.PairingAttemptLimiter(),
+            // 黑名单命中后的冷却（2026-10-15）：解除拉黑不解除冷却，堵住"解除即被重新爆破"。
+            // 内存态、进程重启清零，理由同 PairingAttemptLimiter。
+            blockCooldown = pairedBlockCooldown,
+            // 新设备批准（2026-10-15）：默认关（pairing_approval_required=false）→ 整体跳过。
+            approvalStore = pairedApprovalStore
+        )
         val pairingRoutes = PairingRoutes(
             routeCtx,
             pairingManager,
             // 隧道来源判据的第 1 条：没有隧道在跑时，回环接收地址只能是本机直连
-            tunnelActive = { controller.tunnelManager.anyRunning() }
+            tunnelActive = { controller.tunnelManager.anyRunning() },
+            // 被拉黑设备尝试配对/登录 → 事件中心留痕（2026-10-15）。
+            // 只落库 + WS 推送，**不发**邮件/系统通知：命中是被拉黑者可控的，
+            // 每试一次就通知一次等于给对方一个远程刷屏机主的手段（见 AlertEngine 的说明）。
+            onBlockedDevice = { fp, ip ->
+                alert.recordSecurityEvent(
+                    type = "pairing_blocked_hit",
+                    level = "warning",
+                    message = "被拉黑的设备尝试连接（${fp.take(8)}…，来自 $ip）",
+                    value = fp.take(8)
+                )
+            }
         )
         val pairedDevicesRoutes = PairedDevicesRoutes(pairingManager)
+        // 黑名单管理端点（2026-10-15）：与配对设备管理并列，走同一套双因素（Bearer + 配对密码）。
+        // 读侧拦截不经过路由（在 PairingManager.confirm 里），所以这里漏传只影响"增删条目"。
+        val pairedBlacklistRoutes =
+            com.ufi_axis_core.api.routes.PairedDeviceBlacklistRoutes(pairingManager)
+        // 新设备批准端点（2026-10-15）：公开部分（request-approval / approval-status）
+        // 挂 root，管理部分（列表 / 允许 / 拒绝）挂 /api。
+        //
+        // 主动推送（2026-10-21）：新请求登记后立刻经 WS 广播 `pairing:approvals`，并快速补发几帧，
+        // 让 App 在 1 秒内弹窗 —— 在此之前 App 只能靠 30s 轮询，机主感觉就是"弹窗特别慢"。
+        // 三个依赖全部是 lambda：本类（core:api）不必知道 WebSocketManager 的存在，
+        // 与 `PairingRoutes.onBlockedDevice` / `UpdateManager.broadcaster` 同款。
+        val approvalPushNudger = com.ufi_axis_core.api.pairing.ApprovalPushNudger(
+            push = {
+                wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.PAIRING_APPROVALS)
+            },
+            isStillPending = { sid ->
+                pairingManager.approvalStatus(sid) ==
+                    com.ufi_axis_core.api.pairing.PairedDeviceApprovalStore.STATUS_PENDING
+            },
+            // 只用来省掉明显无效的一帧（连 web 都算"有客户端"）：无订阅时 broadcast 本来也会
+            // 静默返回，多发一条没人消费的帧无害，换不到"区分是 App 还是浏览器"的复杂度。
+            hasLiveClient = { wsManager.getConnectionCount() > 0 }
+        )
+        val pairedApprovalRoutes =
+            com.ufi_axis_core.api.routes.PairedDeviceApprovalRoutes(
+                pairingManager,
+                onApprovalRequested = { pending ->
+                    // 外部通知（2026-10-15）：渠道按用户的三个开关算，**默认全关**。
+                    // 全关时不发任何通知 —— App 弹窗照旧（它走 WS/轮询，不依赖这里）。
+                    // 这三个开关是**额外闸门**：最终还要过通知总开关 / 免打扰 / 场景开关，
+                    // 与其它通知链路完全一致（不是假开关，是叠加的过滤）。
+                    val channels = buildSet {
+                        if (settings.pairingNotifySystem) add(com.ufi_axis_core.notify.PushChannel.ID)
+                        if (settings.pairingNotifyEmail) add(com.ufi_axis_core.controller.sms.MailChannel.ID)
+                        if (settings.pairingNotifyWebhook) {
+                            add(com.ufi_axis_core.controller.notify.WebhookChannel.ID)
+                        }
+                    }
+                    if (channels.isNotEmpty()) {
+                        val mask = com.ufi_axis_core.api.pairing.PairingNotificationMask
+                        notifier(
+                            com.ufi_axis_core.notify.NotifyEvent(
+                                scene = com.ufi_axis_core.notify.NotifyScenes.EVENTS,
+                                type = "pairing_approval",
+                                level = com.ufi_axis_core.notify.NotifyLevel.WARNING,
+                                title = "网页端请求配对",
+                                // 只放配对码 + 掩码后的基本信息（设备名留前 2 字、来源只留前两段）
+                                body = "配对码 ${pending.code}（15 分钟内有效）\n" +
+                                    "设备：${mask.deviceName(pending.deviceName)} · 来源：${pending.source}",
+                                // highlight 是"需要高亮的短值（验证码）"，邮件会渲染成大号块
+                                highlight = pending.code,
+                                channels = channels,
+                                extra = mapOf(
+                                    "code" to pending.code,
+                                    "source" to pending.source,
+                                    "fingerprint_prefix" to mask.fingerprintPrefix(pending.fingerprint)
+                                )
+                            )
+                        )
+                    }
+                },
+                // App 内弹窗通道（2026-10-21）：与上面的外部通知**分开判**。
+                // 混在一起的后果很具体：外部通知被 allowApprovalNotification() 限速时，
+                // App 弹窗会跟着一起不推。
+                onApprovalPending = { pending ->
+                    AppLogger.i(TAG, "[13.5] approval push sid=${pending.sid.take(8)}")
+                    approvalPushNudger.onNewApproval(pending.sid)
+                }
+            )
         AppLogger.i(TAG, "[13.5] Pairing components initialized")
 
         // ── 13.6 Web 前端资源管理（独立更新机制）──
@@ -930,6 +1105,8 @@ object ComponentFactory {
             pairingRoutes = pairingRoutes,
             pairingManager = pairingManager,
             pairedDevicesRoutes = pairedDevicesRoutes,
+            pairedBlacklistRoutes = pairedBlacklistRoutes,
+            pairedApprovalRoutes = pairedApprovalRoutes,
             webResourceManager = webResourceManager,
             webUpdateRoutes = webUpdateRoutes,
             tunnelRoutes = tunnelRoutes,
@@ -965,7 +1142,9 @@ object ComponentFactory {
                 // 停机钩子要能收 ttyd（杀进程 + 关反代 HttpClient；否则孤儿进程常驻，2026-10-06）
                 ttydRoutes = ttydRoutes,
                 // 应用列表定时刷新的起停钩子（见 ServerGraph.appManager 的说明）
-                appManager = appManager
+                appManager = appManager,
+                // 媒体索引定时刷新的起停钩子（2026-10-13，理由同上）
+                mediaIndexStore = mediaIndexStore
             )
         )
     }
@@ -1257,7 +1436,8 @@ object ComponentFactory {
         dynamicThreadPool: DynamicThreadPool,
         webResourceManager: com.ufi_axis_core.util.WebResourceManager,
         ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
-        appManager: com.ufi_axis_core.controller.system.AppManager
+        appManager: com.ufi_axis_core.controller.system.AppManager,
+        mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -1271,7 +1451,8 @@ object ComponentFactory {
             dynamicThreadPool = dynamicThreadPool,
             webResourceManager = webResourceManager,
             ttydRoutes = ttydRoutes,
-            appManager = appManager
+            appManager = appManager,
+            mediaIndexStore = mediaIndexStore
         )
     }
 }

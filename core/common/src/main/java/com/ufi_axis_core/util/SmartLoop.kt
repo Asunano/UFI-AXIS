@@ -34,7 +34,11 @@ package com.ufi_axis_core.util
  * ## 可调参数
  *
  * 默认档位见 [SmartLoopTuning]，经 `AppSettings.getRawString` 读写（`smart_loop_*` 键组），
- * 后续做设置 UI 时直接改值即可，组件无感（每次计算都重新读 provider）。
+ * 组件无感（每次计算都重新读 provider）。
+ *
+ * 2026-10-14：这四个键已接进 `MonitorPreferences`（`GET/PUT /api/monitor/preferences`），
+ * app 与 web 的「监控设置」都能调 —— 在此之前 `SmartLoopTuning.write` 零调用方，
+ * 其中 `smart_loop_enabled=false` 这个"出问题不拆代码就能回退"的开关现场根本按不到。
  *
  * 放 core/common：依赖 GoformQoS/ShellQoS 与 TrafficRecord；scheduler 依赖 common，
  * 不产生循环依赖。
@@ -117,6 +121,26 @@ object SmartLoopTuning {
     private const val KEY_HEAVY = "smart_loop_heavy_bps"
     private const val KEY_ENABLED = "smart_loop_enabled"
 
+    /**
+     * 三个阈值（bytes/s）的合法区间 —— 2026-10-14 随设置 UI 一起补上。
+     *
+     * 此前这四个键只有默认值、没有任何写入口，所以不需要边界；接进
+     * `MonitorPreferences` 之后必须有一条硬边界，否则一个手滑的 0 会让
+     * [SmartLoop.nextDelayMs] 的 `totalSpeed >= 0` 恒真 —— 三档塌成一档，
+     * 而且"零流量省电"这条设计目标会被静默取消。
+     *
+     * - 下限 1 KB/s：连 [SmartLoop.IDLE_BYTES_PER_SEC]（16 KB/s）都在这个量级，
+     *   再低的话"零流量"判定连一次心跳都盖不住。
+     * - 上限 1 GB/s：消费级模组的实际吞吐差着两个数量级，再高等于快档永远选不中。
+     *
+     * 三个键之间还要求**严格递增**（idle < active < heavy）：区间重叠时
+     * [SmartLoop.nextDelayMs] 的 `when` 会有永远落不到的分支，档位就不是三档了。
+     * 边界与序关系都由设置端点 `MonitorRoutes.validatePreferences` 兜底校验
+     *（两端 UI 只提供合法档位，越界值不该走到那里）。
+     */
+    const val MIN_THRESHOLD_BPS = 1024L
+    const val MAX_THRESHOLD_BPS = 1024L * 1024 * 1024
+
     data class Tuning(
         val idleBytesPerSec: Long,
         val activeBytesPerSec: Long,
@@ -134,6 +158,15 @@ object SmartLoopTuning {
         )
     }
 
+    /**
+     * 唯一的写入口（2026-10-14 起由 `MonitorRoutes.applySchedulerFields` 调用）。
+     *
+     * 四个键必须**一起**写：分开写会在两次 set 之间留下一份自相矛盾的档位
+     *（例如 idle 已经抬到 active 之上），而 [SmartLoop.nextDelayMs] 每次计算都现读。
+     * `enabled` 刻意存成 `"true"`/`"false"` 字面量、[read] 也只把字面量 `"false"`
+     * 当关闭（其余脏值一律按开启），这样"回退开关"在解析失败时倒向安全的一侧 ——
+     * 开着的智能节拍只是费点电，关掉却会让大流量下的数据延迟变差。
+     */
     fun write(settings: com.ufi_axis_core.util.AppSettings, t: Tuning) {
         settings.setRawString(KEY_IDLE, t.idleBytesPerSec.toString())
         settings.setRawString(KEY_ACTIVE, t.activeBytesPerSec.toString())

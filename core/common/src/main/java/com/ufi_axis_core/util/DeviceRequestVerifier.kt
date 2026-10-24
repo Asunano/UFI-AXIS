@@ -1,6 +1,23 @@
 package com.ufi_axis_core.util
 
 /**
+ * 黑名单查询的最小接口（2026-10-15）。
+ *
+ * ## 为什么是接口而不是直接吃 `PairedDeviceBlacklistStore`
+ * 那个类在 `core:api`，而本类在 `core:common` —— 依赖方向是 api → common，
+ * 反向引用会成环。鉴权层只需要"问一句这台设备是否被拉黑"，一个函数接口正好够。
+ *
+ * 生产装配传的是 `{ fp, hw -> pairedBlacklistStore.isBlocked(fp, hw) }`（见 `ComponentFactory`）。
+ */
+fun interface BlockedDeviceLookup {
+    /**
+     * @param hwId 客户端自报的硬件标识，可为空。实现方自行决定是否采信 ——
+     *   它是**可伪造的明文**，只用于提高绕过门槛（挡住"清 App 数据换密钥"），不作为授权依据。
+     */
+    fun isBlocked(fingerprint: String?, hwId: String?): Boolean
+}
+
+/**
  * 设备请求验证的**唯一实现**：token → 设备记录 → 时间戳 → 验签 → nonce 去重。
  *
  * 为什么要单独抽一层：HTTP（`AuthMiddleware`）和 WebSocket 握手
@@ -16,10 +33,13 @@ package com.ufi_axis_core.util
  *
  * @param nonceCache HTTP 与 WS 必须共享同一个实例，否则"HTTP 用过的 nonce 拿去开 WS"
  *   这类跨通道重放就拦不住。
+ * @param blockedDevices 黑名单查询（2026-10-15）。可空是为了不破坏既有构造点；
+ *   生产装配必须传（由装配守卫测试守着），漏传等于"拉黑不会让在线设备掉线"。
  */
 class DeviceRequestVerifier(
     private val store: PairedDeviceStore,
-    private val nonceCache: DeviceAuth.NonceCache = DeviceAuth.NonceCache()
+    private val nonceCache: DeviceAuth.NonceCache = DeviceAuth.NonceCache(),
+    private val blockedDevices: BlockedDeviceLookup? = null
 ) {
 
     sealed class Result {
@@ -47,6 +67,18 @@ class DeviceRequestVerifier(
         object StaleTimestamp : Result()
         object BadSignature : Result()
         object Replayed : Result()
+
+        /**
+         * 设备已被机主拉黑（2026-10-15）。
+         *
+         * 调用方（`AuthMiddleware` 与 WS 握手）映射为 **444** —— 与既有的"凭据确证作废"
+         * 同一语义：客户端应清 token 回配对引导。这就是"拉黑即刻掉线"的实现方式，
+         * 且 HTTP 与 WebSocket 会**一起**断（两者共用本类的同一个实例）。
+         *
+         * 带 [device] 载荷是为了让上层能把"哪台设备在撞"写进事件中心 —— 单靠一个 object
+         * 上层只知道"有人被拒"，写不出可读的事件。
+         */
+        data class Blocked(val device: PairedDeviceRecord) : Result()
     }
 
     fun verify(
@@ -79,6 +111,13 @@ class DeviceRequestVerifier(
         )
         if (!DeviceAuth.verifySignature(device.pubKey, canonical, signature)) return Result.BadSignature
         if (!nonceCache.accept(nonce)) return Result.Replayed
+        // 黑名单（2026-10-15）：放在**验签之后**，而不是"一拿到 device 就判"。
+        // 理由：后者会让"这个 token 属于一台被拉黑的设备"成为一个**不需要私钥就能读到**的信息
+        //（一个 oracle：拿着偷来的 token 随便发一个请求就能试探出自己是否被拉黑）。
+        // 代价是被拉黑设备要多做一次验签 —— 它本来就持有私钥，这个代价换判定的可信度是划算的。
+        if (blockedDevices?.isBlocked(device.fingerprint, device.hwId) == true) {
+            return Result.Blocked(device)
+        }
         store.touch(device.fingerprint)
         return Result.Ok(device)
     }

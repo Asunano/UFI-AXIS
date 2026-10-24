@@ -19,7 +19,7 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * - app.log   应用日志
  * - at.log    AT 指令日志
  * - error.log 错误日志
- * （单文件超 5MB 轮转为 `*.log.1`；外部存储不可用时回退到私有目录 `<dataDir>/logs`）
+ * （2026-10-13 起**不再轮转、不再有总量上限**：见 [MAX_LOG_FILE_BYTES] 的说明；外部存储不可用时回退到私有目录 `<dataDir>/logs`）
  *
  * 性能优化：文件写入复用 BufferedWriter，避免每行日志都 new FileWriter/PrintWriter
  *
@@ -266,13 +266,17 @@ object AppLogger {
      * ## 放行的是**全部三条路**，不是只放行 logcat
      *
      * 这台设备没有 root，用户拿不到 logcat；只放行 logcat 等于「排障线索仍然取不回来」，
-     * 验收判据（默认部署下排障 WARN 落地）不成立。文件那条路的体积已经被三层既有闸门兜住：
+     * 验收判据（默认部署下排障 WARN 落地）不成立。文件那条路**约束的是频率，不是总量**：
      * - [repeatGate]：同一 (级别, tag, 完整消息) 每 [REPEAT_WINDOW_MS] 只放行 1 条
      *   —— 周期任务里逐 tick 重复的 WARN（离线时的 `checkTrafficLimit failed` 一类）
      *   最坏也就 1 条/分钟/文本；
      * - [e] 的错误去重：相同 (message + 堆栈指纹) 每 [ERROR_DEDUP_WINDOW_MS]（5 分钟）1 条；
-     * - [MAX_LOG_FILE_BYTES]（单文件 5MB 轮转）+ [MAX_LOG_DIR_BYTES]（目录总量 40MB）
-     *   + [MAX_LOG_FILES]（7 天）—— 无论频率多高，占用都有硬上限。
+     * - ⚠️ **"第三条硬上限"已经没有了**（2026-10-13 用户要求取消日志上限）：原来这里写的是
+     *   `MAX_LOG_FILE_BYTES`（单文件 5MB 轮转）+ `MAX_LOG_DIR_BYTES`（目录总量 40MB）+
+     *   `MAX_LOG_FILES`（7 天）。三个常量现在全部等于无限，那条断言**已不成立**
+     *   （见 [MAX_LOG_FILE_BYTES] 上方的说明）。上面两条约束的是**频率**、不是**总量** ——
+     *   日志占用只受设备存储容量约束。不要再从这条注释推断"日志体积有硬上限"，
+     *   那正是上一版注释留下的坑。
      *
      * ## [coreLogEnabled] 不在放行范围内
      *
@@ -634,8 +638,10 @@ object AppLogger {
                 val writer = writerCache.getOrPut(key) {
                     BufferedWriter(FileWriter(currentFile, true), 4096)
                 }
-                // 写入前检查：单文件超过 5MB 时 rotate 到 .log.1（覆盖最旧），新建当前文件继续。
-                // 2026-08-27：此前只有 error 类型有上限，app.log / at.log 可以无限长。
+                // ⚠️ 这个 rotate 分支自 2026-10-13 起**永远不会执行**：MAX_LOG_FILE_BYTES 已是
+                // Long.MAX_VALUE，`length() > Long.MAX_VALUE` 恒为 false，所以 .log.1 不会再产生。
+                // 代码保留是为了"以后要恢复上限时只改常量"；不要据此以为单文件仍有 5MB 上限。
+                // 2026-08-27 加它时的背景：此前只有 error 类型有上限，app.log / at.log 可以无限长。
                 if (currentFile.exists() && currentFile.length() > MAX_LOG_FILE_BYTES) {
                     try {
                         writer.flush()
@@ -690,6 +696,14 @@ object AppLogger {
      *
      * 2026-08-28 加总量上限的原因：只有"每天一个文件 + 单文件 5MB 轮转"的话，
      * 3 种类型 × 7 天 × (当前 + .1) 理论上仍能堆到 200MB+。对一个随身 UFI 来说这不可接受。
+     *
+     * ⚠️ **2026-10-13 用户要求取消日志上限后，上面这两条都不再生效**：
+     * [MAX_LOG_FILES] 变成 3650 天（≈10 年，等于不删），[MAX_LOG_DIR_BYTES] 变成无限
+     * （[enforceTotalBudget] 会在第一个 `if` 直接返回，它的删除循环是死代码）。
+     * 所以本函数现在**实际上什么都不做**，只保留结构以便将来恢复策略。
+     * 另外注意它的作用范围：只清理 `log/core/` 下**名字能解析成日期**的目录，
+     * 因此 `crash/` `update/` `launcher/` `goform/` 以及 `log/install|watchdog|keepalive/`
+     * **从来不归它管**（那些有自己的上限，或者没有）。
      */
     private fun cleanOldLogs() {
         val root = logDir ?: return

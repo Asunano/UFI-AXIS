@@ -1,6 +1,7 @@
 package com.ufi_axis_core.controller.goform
 
 import com.ufi_axis_core.util.AppLogger
+import com.ufi_axis_core.util.GoformGuard
 import com.ufi_axis_core.util.GoformQoS
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
@@ -13,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
@@ -175,8 +177,11 @@ class GoformClient(
         }
     }
 
-    private suspend fun isReachable(cand: String): Boolean {
-        return try {
+    private suspend fun isReachable(cand: String): Boolean = withContext(Dispatchers.IO) {
+        // 2026-10-17：这里用的是**阻塞** HttpURLConnection。以前它直接在调用方线程上跑，
+        // 而 HTTP 服务器的 callGroupSize=1 —— 一旦首次解析 base url 时它卡住，
+        // **整个后端的请求都会停**。切到 IO 线程后，最坏也只是这次解析慢。
+        try {
             val url = URL(cand)
             withTimeout(1000) {
                 val conn = url.openConnection() as java.net.HttpURLConnection
@@ -623,7 +628,9 @@ class GoformClient(
         params: Map<String, String>,
         retryOnSessionLost: Boolean,
         retryOnBusinessFailure: Boolean = true
-    ): GoformWriteResult = withContext(Dispatchers.IO) {
+    ): GoformWriteResult = withContext(GoformGuard.dispatcher) {
+        // 2026-10-17：写路径也走 goform 专用调度器（原来是通用 Dispatchers.IO）——
+        // 写操作要等登录 + 前置查询 + POST，占线程时间长，和文件/数据库抢同一个池没有好处。
         val start = System.currentTimeMillis()
         // 2026-10-05 R2-10 修复：写路径整体预算 20s（读路径早有 withTimeout 先例）。设备半死时
         // 一次写 = 登录链 + AD 三次前置查询 + POST + 重试圈，单次传输层各 10s 超时但无整体
@@ -754,6 +761,44 @@ class GoformClient(
      * 并发重试即挂死，整条 goform 读路径再也不恢复（表现为「长时间断连，必须重启核心服务」）。
      */
     private suspend fun queryInternal(commands: List<String>, retry: Boolean): JsonObject? {
+        // 2026-10-17（goform 隔离改造）：熔断 → 整体预算 → 独立调度器，三者缺一不可。
+        // 没有熔断，设备坏的时候每个请求都要重新等满超时；没有预算，读路径最坏能串到 ~50s；
+        // 没有独立调度器，goform 会和文件操作抢同一个 IO 池（无卡启动时"文件管理也打不开"就是这么来的）。
+        if (GoformGuard.isOpen()) {
+            GoformGuard.recordFastFail()
+            return null
+        }
+        val startedAt = System.currentTimeMillis()
+        val result = try {
+            withContext(GoformGuard.dispatcher) {
+                withTimeoutOrNull(GoformGuard.READ_BUDGET_MS) {
+                    queryInternalLocked(commands, retry)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // 读路径以前会把传输异常直接抛给路由层 → 500。现在统一收成 null（与"读失败返回 null"
+            // 同一契约），路由层走它既有的 503/空值分支，不会因为设备后台抽风而变成未处理异常。
+            AppLogger.w(tag, "[goform_get] transport error: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+        if (result == null) {
+            if (System.currentTimeMillis() - startedAt >= GoformGuard.READ_BUDGET_MS) {
+                GoformGuard.recordTimeout()
+            }
+            if (GoformGuard.recordFailure() >= GoformGuard.FAILURE_THRESHOLD) {
+                // 连续失败到阈值：连地址也可能变了（换网 / DHCP），让下次重新解析 base url。
+                baseUrlResolved = false
+            }
+        } else {
+            GoformGuard.recordSuccess()
+        }
+        return result
+    }
+
+    /** [queryInternal] 的实际逻辑；熔断、整体预算、独立调度器都在外层。 */
+    private suspend fun queryInternalLocked(commands: List<String>, retry: Boolean): JsonObject? {
         val snapshot = ensureSession() ?: return null
         var authLost = false
         val first = GoformQoS.withQueryPermit { queryOnce(commands, snapshot) { authLost = true } }
@@ -867,6 +912,32 @@ class GoformClient(
 
     /** 重试在许可之外发起，理由同 [queryInternal]。 */
     private suspend fun querySingleInternal(command: String, retry: Boolean): JsonElement? {
+        // 2026-10-17：与 queryInternal 同一套隔离（熔断 / 预算 / 独立调度器）。
+        if (GoformGuard.isOpen()) {
+            GoformGuard.recordFastFail()
+            return null
+        }
+        val result = try {
+            withContext(GoformGuard.dispatcher) {
+                withTimeoutOrNull(GoformGuard.READ_BUDGET_MS) {
+                    querySingleInternalLocked(command, retry)
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w(tag, "[goform_get_single] transport error: ${e.javaClass.simpleName}: ${e.message}")
+            null
+        }
+        if (result == null) {
+            GoformGuard.recordFailure()
+        } else {
+            GoformGuard.recordSuccess()
+        }
+        return result
+    }
+
+    private suspend fun querySingleInternalLocked(command: String, retry: Boolean): JsonElement? {
         val snapshot = ensureSession() ?: return null
         var authLost = false
         val first = GoformQoS.withQueryPermit { querySingleOnce(command, snapshot) { authLost = true } }

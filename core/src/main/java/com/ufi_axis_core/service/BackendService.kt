@@ -681,10 +681,78 @@ class BackendService : Service() {
         }
     }
 
+    /**
+     * 端口预检与自动回退（2026-10-19）。
+     *
+     * 端口被占时 core 会陷入"启动失败 → stopSelf → 看门狗拉起 → 再失败"的无限循环，
+     * 客户端完全连不上，而远程没有任何入口能改端口（HTTP 都不在）。所以必须在 build 之前
+     * （HttpServer 的端口是构造参数）先探一次，必要时回退默认端口。
+     *
+     * 判两轮是为了避开"自己的旧 server 还没退净"：`stopSelf` 后重启时端口可能被上一轮
+     * 短暂占着，直接判"被占"会白白把用户配置的端口改掉。
+     */
+    private suspend fun ensurePortUsable() {
+        val settings = AppSettings.getInstance(this)
+
+        // 2026-10-19：安全模式。连续启动失败达到阈值后，下一次启动用**最小配置**拉起：
+        // 强制默认端口 + 关闭后台采集 —— 目标是"先让设备能被连上、能进设置页改回来"，
+        // 而不是继续按原配置无限重启。成功启动后由调用方清除（一次性）。
+        if (settings.safeModeActive) {
+            AppLogger.w(tag, "SAFE MODE active — starting with minimal config (default port, background off)")
+            if (settings.port != AppSettings.DEFAULT_PORT) {
+                AppLogger.w(tag, "safe mode: port ${settings.port} -> ${AppSettings.DEFAULT_PORT}")
+                settings.port = AppSettings.DEFAULT_PORT
+            }
+            settings.backgroundServiceEnabled = false
+        }
+
+        val configured = settings.port
+        if (isPortBindable(configured)) return
+
+        delay(2_000)
+        if (isPortBindable(configured)) return
+
+        if (configured == AppSettings.DEFAULT_PORT) {
+            AppLogger.e(
+                tag,
+                "Port $configured is occupied and it is already the default — cannot fall back; " +
+                    "service will fail to start (use local Settings page to change port)"
+            )
+            return
+        }
+        if (!isPortBindable(AppSettings.DEFAULT_PORT)) {
+            AppLogger.e(
+                tag,
+                "Port $configured occupied and default ${AppSettings.DEFAULT_PORT} also occupied — cannot fall back"
+            )
+            return
+        }
+        settings.port = AppSettings.DEFAULT_PORT
+        AppLogger.w(
+            tag,
+            "Port $configured occupied — fell back to default ${AppSettings.DEFAULT_PORT} " +
+                "(可以恢复：本机设置页改回端口，或 App/Web 的 PUT /api/config)"
+        )
+    }
+
+    /** 能否在本机绑定该端口（true = 端口空闲）。 */
+    private fun isPortBindable(port: Int): Boolean = runCatching {
+        java.net.ServerSocket(port).use { true }
+    }.getOrDefault(false)
+
     private suspend fun initializeComponents() {
         try {
             AppLogger.i(tag, "Initializing components...")
             updateNotification("正在初始化组件...")
+
+            // 2026-10-19：端口占用预检 + 自动回退。
+            //
+            // 为什么必须在 build() 之前：HttpServer 的端口是**构造参数**，build 之后无法改；
+            // 而端口被占时 HttpServer 只会自检失败 → stopSelf → 看门狗再拉 → 再失败，
+            // 形成无限重启（且 BackendService 在失败分支把 crashRetryCount 清零，
+            // "连续 3 次就停"的保护对这条路径不生效）。
+            // 设备上最常见的冲突：8080（厂商 goform 管理面）、5555（adbd）、7682（ttyd）。
+            ensurePortUsable()
 
             // 初始化看门狗：build() 全程是阻塞调用（解压资产、shell 探测网关、二进制 --version、
             // 特权 shell 迁移），任何一处卡住此前都没人发现 —— 通知栏永远停在"正在初始化组件..."，
@@ -768,11 +836,41 @@ class BackendService : Service() {
             // 停机路径另有一刀见 stopAllComponents。
             g.serverGraph.appManager.startPeriodicRefresh(serviceScope)
 
+            // ── 媒体索引缓存（2026-10-13）──
+            // 与 appManager 同一套挂法：定时刷新用 serviceScope（onDestroy 会 cancel，
+            // 停机路径另有一刀见 stopAllComponents / pauseComponentBackground）。
+            g.serverGraph.mediaIndexStore.startPeriodicRefresh(serviceScope)
+            // 启动预热一轮：定时循环的第一轮要等满 5 分钟，不预热的话用户第一次进媒体页
+            // 会撞上"冷启动同步拉取"（那时快照还不存在，只能现场查一次）。
+            // 延迟 8s 避开启动高峰（AT 通道 / goform 登录 / update 恢复都在头几秒），
+            // 而它是纯 MediaStore 元数据查询（不像 appManager 那样串 4 条特权 shell），
+            // 所以不必像它那样等到 HTTP 就绪之后很久。
+            serviceScope.launch {
+                delay(8_000L)
+                runCatching { g.serverGraph.mediaIndexStore.refresh(force = true) }
+                    .onFailure { AppLogger.w(tag, "媒体索引启动预热失败: ${it.message}") }
+            }
+
             val serverOk = g.serverGraph.server.start()
             if (!serverOk) {
                 // 服务启动失败：不要静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
                 // 直接停止并记入失败计数，由 START_STICKY / 看门狗重新拉起，并在 logcat 暴露真实异常。
                 AppLogger.e(tag, "HTTP Server failed to start — stopping service to surface failure")
+                // 2026-10-19：累计"连续启动失败"次数；达到阈值就武装安全模式，
+                // 下一次启动用默认端口 + 关后台采集，避免无限重启循环里谁也改不回来。
+                runCatching {
+                    val s = AppSettings.getInstance(this@BackendService)
+                    val failures = s.startupFailureCount + 1
+                    s.startupFailureCount = failures
+                    if (failures >= AppSettings.SAFE_MODE_THRESHOLD) {
+                        s.safeModeActive = true
+                        AppLogger.e(
+                            tag,
+                            "startup failed $failures times — SAFE MODE armed for next start " +
+                                "(default port ${AppSettings.DEFAULT_PORT}, background off)"
+                        )
+                    }
+                }.onFailure { AppLogger.w(tag, "failed to record startup failure: ${it.message}") }
                 // 2026-10-05 R3-10 修复：start 失败后短延迟再 stopSelf，避开旧 Netty event loop
                 // 未退净导致的端口冲突窗口（同进程先 stop 后立刻 start 偶发 Address already in use）
                 delay(3000)
@@ -781,6 +879,15 @@ class BackendService : Service() {
                 g.serverGraph.server.stop()
                 stopSelf()
                 return
+            }
+            // 2026-10-19：启动成功 → 清失败计数、退出安全模式（安全模式是一次性的）。
+            runCatching {
+                val s = AppSettings.getInstance(this@BackendService)
+                if (s.startupFailureCount != 0) s.startupFailureCount = 0
+                if (s.safeModeActive) {
+                    s.safeModeActive = false
+                    AppLogger.i(tag, "SAFE MODE cleared — normal startup succeeded")
+                }
             }
             AppLogger.i(tag, "[14] HTTP server ready")
 
@@ -821,8 +928,10 @@ class BackendService : Service() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     // ADB 特权通道（系统关键，无条件启动）
-                    // AdbController.start() 先通过 Goform USB_PORT_SETTING 启用 adbd，
-                    // 再初始化 AdbShellExecutor（所有 executeAsRoot 依赖的系统级特权执行通道）。
+                    // 2026-10-19 更正：`AdbController.start()` **不会**再去打开 USB_PORT ——
+                    // 那条自动切换逻辑已于 2026-08-22 移除（见 AdbController 头注释）。
+                    // 它只负责初始化 AdbShellExecutor（所有 executeAsRoot 依赖的 uid 2000 通道）；
+                    // adbd 是否监听由设备侧决定，core 不再替用户打开。
                     try {
                         val adbOk = g.controller.adbController.start()
                         AppLogger.i(tag, "ADB privileged channel started: $adbOk")
@@ -1009,6 +1118,8 @@ class BackendService : Service() {
         try { g.controller.downloadManager.pauseBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.pauseBackground failed: ${e.message}") }
         // 应用列表定时刷新同属「自主活动」：用户点「停止服务」后不该还每 2 分钟打 4 条特权 shell。
         try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
+        // 媒体索引定时刷新同理：停了之后不该还每 5 分钟扫一遍整库（2026-10-13）。
+        try { g.serverGraph.mediaIndexStore.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "mediaIndexStore.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     private fun resumeComponentBackground(g: ComponentGraph) {
@@ -1017,6 +1128,8 @@ class BackendService : Service() {
         try { g.controller.tunnelManager.startGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.startGuard failed: ${e.message}") }
         try { g.controller.downloadManager.resumeBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.resumeBackground failed: ${e.message}") }
         try { g.serverGraph.appManager.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
+        // 媒体索引定时刷新同属「自主活动」（2026-10-13）
+        try { g.serverGraph.mediaIndexStore.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "mediaIndexStore.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     /**
@@ -1195,6 +1308,10 @@ class BackendService : Service() {
         // 打 4 条特权 shell（serviceScope 虽会在 onDestroy 被 cancel，但 stopAllComponents 也走
         // 「停止服务」而不销毁 Service 的路径 —— 那条路上 serviceScope 还活着）。
         try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.e(tag, "Error stopping app list refresh", e) }
+        // 媒体索引：除了定时刷新，它还自持一个作用域跑「重新扫描」的追赶刷新
+        //（那组协程要活过一次 HTTP 请求，不能挂 serviceScope），只能靠 stop() 显式收。
+        // 不调它的话，停止服务后最多还会多跑三次整库扫描（+3s/+15s/+45s）。
+        try { g.serverGraph.mediaIndexStore.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping media index", e) }
         // ttyd：父进程（core）退出不会带走子进程，必须显式杀，否则孤儿 shell 常驻耗电。
         // 注意顺序在 server.stop() 之后：先把 WS 反代收掉，再杀它背后的进程。
         try { g.serverGraph.ttydRoutes.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }

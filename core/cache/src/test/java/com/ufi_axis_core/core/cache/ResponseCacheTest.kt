@@ -7,6 +7,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -153,6 +154,48 @@ class ResponseCacheTest {
         repeat(400) { i -> cache.getOrPut("cold:$i", 60_000L) { JsonPrimitive(i) } }
         val size = cache.lockEntries().size
         assertTrue("locks 不应随 key 数无限增长，实际=$size", size <= 210)
+    }
+
+    /**
+     * goform 熔断期间：只回旧值，不再调 fetcher（2026-10-17）。
+     *
+     * 这是"设备后台坏了，页面仍显示上次数据"的实现。它与 `setReadThroughPaused`
+     * （用户停止服务）是两个独立闸门，这里单独验证第二个。
+     */
+    @Test
+    fun `goform 不健康时只回旧值且不调 fetcher`() = runBlocking {
+        val cache = ResponseCache()
+        var calls = 0
+
+        // ttl=0 → 下一次读必然"过期"
+        val first = cache.getOrPut("device:identity", 0L) { calls++; JsonPrimitive("v1") }
+        assertEquals("v1", first.jsonPrimitive.content)
+
+        cache.setGoformUnhealthy(true)
+        val stale = cache.getOrPut("device:identity", 0L) { calls++; JsonPrimitive("v2") }
+        assertEquals("熔断期间必须回旧值", "v1", stale.jsonPrimitive.content)
+        assertEquals("熔断期间绝不能再调 fetcher（那就是又去打 goform）", 1, calls)
+
+        cache.setGoformUnhealthy(false)
+        val fresh = cache.getOrPut("device:identity", 0L) { calls++; JsonPrimitive("v3") }
+        assertEquals("恢复后应重新取新值", "v3", fresh.jsonPrimitive.content)
+        assertEquals(2, calls)
+    }
+
+    /** 两个闸门互相独立：goform 恢复不能把"用户停止服务"的闸门一起打开。 */
+    @Test
+    fun `两个闸门互不覆盖`() = runBlocking {
+        val cache = ResponseCache()
+        var calls = 0
+        cache.getOrPut("k", 0L) { calls++; JsonPrimitive("v1") }
+
+        cache.setReadThroughPaused(true)   // 用户停止服务
+        cache.setGoformUnhealthy(true)     // 设备后台坏了
+        cache.setGoformUnhealthy(false)    // goform 恢复
+        // 但服务仍处于"停止"状态 → 仍应回旧值
+        val v = cache.getOrPut("k", 0L) { calls++; JsonPrimitive("v2") }
+        assertEquals("v1", v.jsonPrimitive.content)
+        assertEquals("用户停止服务期间不该调 fetcher", 1, calls)
     }
 
     private companion object {

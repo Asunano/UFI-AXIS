@@ -7,6 +7,8 @@ import com.ufi_axis_core.api.pairing.PairingManager
 import com.ufi_axis_core.api.routes.*
 import com.ufi_axis_core.api.routes.PairingRoutes
 import com.ufi_axis_core.api.websocket.WebSocketManager
+import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 import io.ktor.http.*
@@ -60,6 +62,17 @@ class HttpServer(
     private val pairingRoutes: PairingRoutes,
     private val pairingManager: PairingManager,
     private val pairedDevicesRoutes: PairedDevicesRoutes,
+    /**
+     * 配对设备黑名单端点（2026-10-15）。可空 + 默认 null 是为了不破坏既有构造点；
+     * 生产装配（`ComponentFactory`）必须传入 —— 漏传等于黑名单的管理入口静默消失
+     *（读侧拦截仍在，只是没法增删条目），由装配守卫测试守着。
+     */
+    private val pairedBlacklistRoutes: com.ufi_axis_core.api.routes.PairedDeviceBlacklistRoutes? = null,
+    /**
+     * 新设备批准端点（2026-10-15）。公开部分挂 root（请求方此时还没有凭据），
+     * 管理部分挂 `/api`。可空 + 默认 null 不破坏既有构造点，生产装配必须传。
+     */
+    private val pairedApprovalRoutes: com.ufi_axis_core.api.routes.PairedDeviceApprovalRoutes? = null,
     private val webResourceManager: com.ufi_axis_core.util.WebResourceManager,
     private val webUpdateRoutes: com.ufi_axis_core.api.routes.WebUpdateRoutes,
     private val smsForwardRoutes: SmsForwardRoutes? = null,
@@ -110,6 +123,15 @@ class HttpServer(
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB（普通路由：防滥用 + 内存安全）
+
+        /**
+         * `pairing_max_devices` 的合法上限（2026-10-21，审计 §C1）。
+         *
+         * 这个值只用于「启用配对数量限制」时的下限约束，不是业务承诺；给 64 是因为
+         * 待批准表上限是 32、设备记录再涨也不会有人真的配几十台。超出的值直接钳到上限，
+         * 免得界面出现"已用 3 / -5"这种把人搞懵的状态。
+         */
+        private const val MAX_PAIRING_DEVICES = 64
 
         /**
          * 文件管理器上传上限。**引用 [com.ufi_axis_core.api.routes.FileRoutes.UPLOAD_BODY_LIMIT]，
@@ -446,6 +468,38 @@ class HttpServer(
         }
     }
 
+    /**
+     * 「解除配对」两条旧端点的统一响应（2026-10-21，审计 §B1）。
+     *
+     * 密码校验成功后顺手清掉该 IP 的配对限速记录 —— 让主人能立刻重新配对，
+     * 与 root 端点 `POST /pairing/unpair` 的行为保持一致。
+     */
+    private suspend fun respondUnpair(
+        call: ApplicationCall,
+        result: PairingManager.UnpairResult
+    ) {
+        when (result) {
+            is PairingManager.UnpairResult.Success -> {
+                pairingRoutes.clearRateLimits(call.request.local.remoteAddress)
+                call.respond(
+                    toJsonElement(
+                        mapOf("success" to true, "message" to "Devices unpaired, re-entered pairing mode")
+                    )
+                )
+            }
+            is PairingManager.UnpairResult.MissingPassword ->
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "请输入配对密码")
+            is PairingManager.UnpairResult.InvalidPassword ->
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
+            is PairingManager.UnpairResult.PasswordLocked ->
+                call.respondFail(
+                    HttpStatusCode.TooManyRequests,
+                    ErrorCode.PASSWORD_LOCKED,
+                    "Too many failed password attempts, retry later"
+                )
+        }
+    }
+
     private fun Application.configureRouting() {
         routing {
             get("/health") {
@@ -467,6 +521,9 @@ class HttpServer(
             // 2026-08-25：`QoSMiddleware`（对客户端请求数限流并回 429）已整体删除，见下面 /api 块的说明。
             route("/pairing") {
                 pairingRoutes.register(this)
+                // 批准流程的公开端点（root）：请求方此刻还没有任何凭据。
+                // 它们**永不返回配对码** —— 码只发给已配对设备与外部通知。
+                pairedApprovalRoutes?.registerPublic(this)
             }
 
             // ══ 【注册顺序不变量】WebSocket 路由必须在下面那个 catch-all 静态资源路由之前 ══
@@ -573,27 +630,88 @@ class HttpServer(
                     get("/status") {
                         call.respond(toJsonElement(pairingManager.statusPayload()))
                     }
+                    // 2026-10-21（审计 §B1）：这两条旧端点**必须带配对密码**。
+                    //
+                    // 之前它们只校验 Bearer+签名，而「移除单台设备」
+                    // （DELETE /api/pairing/devices/{fp}）与 root 的「解除全部」（POST /pairing/unpair）
+                    // 都要密码 —— 于是"踢掉所有人"反而是门槛最低的破坏性操作，双因素形同虚设。
+                    // 现在三条路一个口径：任何"让设备掉出配对"的写操作都要密码。
+                    //
+                    // 不破坏兼容的方式：缺密码回 401 MISSING_PASSWORD（不是 404/500），
+                    // 客户端据此弹密码框即可（App 的 NetworkModule.unpairAll / Web 的 PairingPanel 已跟上）。
                     post("/unpair") {
-                        pairingManager.unpairAll()
-                        pairingRoutes.clearRateLimits(call.request.local.remoteAddress)
-                        call.respond(toJsonElement(mapOf("success" to true, "message" to "All devices unpaired, re-entered pairing mode")))
+                        val password = runCatching {
+                            call.receiveJsonObject()["password"]?.jsonPrimitive?.contentOrNull
+                        }.getOrNull()
+                        respondUnpair(
+                            call,
+                            pairingManager.unpairAllWithPassword(password, call.request.local.remoteAddress)
+                        )
                     }
                     post("/unpair/{fingerprint}") {
                         val fp = call.parameters.getAll("fingerprint")?.joinToString("/") ?: ""
-                        pairingManager.unpairFingerprint(fp)
-                        pairingRoutes.clearRateLimits(call.request.local.remoteAddress)
-                        call.respond(toJsonElement(mapOf("success" to true, "message" to "Device unpaired")))
+                        if (fp.isBlank()) {
+                            call.respondFail(
+                                HttpStatusCode.BadRequest,
+                                ErrorCode.BAD_REQUEST,
+                                "fingerprint required"
+                            )
+                            return@post
+                        }
+                        val password = runCatching {
+                            call.receiveJsonObject()["password"]?.jsonPrimitive?.contentOrNull
+                        }.getOrNull()
+                        respondUnpair(
+                            call,
+                            pairingManager.unpairFingerprintWithPassword(
+                                fp, password, call.request.local.remoteAddress
+                            )
+                        )
                     }
                     put("/config") {
                         val body = call.receiveJsonObject()
                         val enabled = body["pairing_enabled"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
-                        val maxDevices = body["pairing_max_devices"]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                        // 2026-10-21（审计 §C1）：范围校验。之前任意整数都直接落库，
+                        // 负数会被 `maxDevices > 0` 判成"不限"，但界面仍显示"已用 3 / -5"。
+                        val maxDevices = body["pairing_max_devices"]?.jsonPrimitive?.contentOrNull
+                            ?.toIntOrNull()?.coerceIn(0, MAX_PAIRING_DEVICES)
                         if (enabled != null) ctx.settings.pairingEnabled = enabled
                         if (maxDevices != null) ctx.settings.pairingMaxDevices = maxDevices
+                        // 2026-10-15（安全中心）：批准策略 + 它的外部通知渠道。
+                        // 通知三个开关**默认关**，而且是"额外闸门" —— 最终还要过通知总开关 /
+                        // 免打扰 / 场景开关，与其它通知链路一致（所以别在 UI 上承诺"打开就一定收到"）。
+                        body["pairing_approval_required"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingApprovalRequired = it }
+                        body["pairing_notify_system"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingNotifySystem = it }
+                        body["pairing_notify_email"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingNotifyEmail = it }
+                        body["pairing_notify_webhook"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingNotifyWebhook = it }
+
+                        // 2026-10-24：批准策略关闭后，旧 pending 请求必须当场作废。
+                        // 之前这里只改设置，`PairedDeviceApprovalStore` 里的条目继续存在，
+                        // `GET /api/pairing/approvals` 仍会把它返回给 App —— 现象就是
+                        // "开关已关、重启 App 后申请还在"。
+                        // enforceApprovalPolicy() 只在关闭时清 pending（approved/rejected 保留），
+                        // 有实际清理才广播一帧 `pairing:approvals`，让在线的已配对 App 立刻重拉列表。
+                        val cancelledApprovals = pairingManager.enforceApprovalPolicy()
+                        if (cancelledApprovals > 0) {
+                            AppLogger.i(
+                                "HttpServer",
+                                "pairing config: cleared $cancelledApprovals pending approvals " +
+                                    "(approvalRequired=${ctx.settings.pairingApprovalRequired})"
+                            )
+                            webSocketManager.broadcastDataChanged(WsDataTopic.PAIRING_APPROVALS)
+                        }
                         call.respond(toJsonElement(mapOf(
                             "success" to true,
                             "pairing_enabled" to ctx.settings.pairingEnabled,
-                            "pairing_max_devices" to ctx.settings.pairingMaxDevices
+                            "pairing_max_devices" to ctx.settings.pairingMaxDevices,
+                            "pairing_approval_required" to ctx.settings.pairingApprovalRequired,
+                            "pairing_notify_system" to ctx.settings.pairingNotifySystem,
+                            "pairing_notify_email" to ctx.settings.pairingNotifyEmail,
+                            "pairing_notify_webhook" to ctx.settings.pairingNotifyWebhook
                         )))
                     }
                 }
@@ -723,6 +841,9 @@ class HttpServer(
                 playlistRoutes?.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)
+                pairedBlacklistRoutes?.register(this)
+                // 批准流程的管理端点（/api 内）：待批准列表（含码）+ 允许/拒绝
+                pairedApprovalRoutes?.registerAuthed(this)
                 smsForwardRoutes?.register(this)
                 webhookRoutes?.register(this)
                 localSmsRoutes?.register(this)
@@ -742,6 +863,13 @@ class HttpServer(
                 weatherRoutes?.register(this)
                 poetryRoutes?.register(this)
                 geoRoutes?.register(this)
+                // 赞助名单（/api/sponsors，2026-10-14）：只依赖 settings + androidContext，
+                // 且构造即启动 12 小时后台刷新协程，故就地构造（理由见 SponsorRoutes 类注释）。
+                SponsorRoutes(ctx.settings, androidContext).register(this)
+                // Core 自身权限自检 / 补全（/api/system/permissions，2026-10-14）：
+                // 只依赖 androidContext + ShellExecutor（都是现成的），故与 SponsorRoutes 同样就地构造，
+                // 不给 HttpServer 再加一个构造参数（少一个"装配层漏传 ⇒ 端点静默消失"的机会）。
+                PermissionRoutes(androidContext).register(this)
                 webUpdateRoutes.register(this)
             }
 

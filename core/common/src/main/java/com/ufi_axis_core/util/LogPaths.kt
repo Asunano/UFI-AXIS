@@ -16,7 +16,7 @@ package com.ufi_axis_core.util
  * <base>/Download/UFI-AXIS/                      ← [appRoot]，应用根目录（update/ 放安装包，不属日志）
  * └── log/                                       ← [logRoot]，所有日志的根
  *     ├── core/                                  ← [Component.CORE]
- *     │   ├── <yyyy-MM-dd>/                       AppLogger 运行时日志（按天分目录，5MB 轮转）
+ *     │   ├── <yyyy-MM-dd>/                       AppLogger 运行时日志（按天分目录；2026-10-13 起不再轮转/不再有总量上限）
  *     │   │   ├── app.log(.1)                     应用日志
  *     │   │   ├── at.log(.1)                      AT 指令日志
  *     │   │   └── error.log(.1)                   错误日志

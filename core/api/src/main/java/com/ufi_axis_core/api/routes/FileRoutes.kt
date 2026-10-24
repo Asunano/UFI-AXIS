@@ -55,7 +55,17 @@ class FileRoutes(
      */
     private val appContext: android.content.Context? = null,
     /** 删除成功后要失效媒体列表缓存，否则客户端刷出来还是旧的那一条。 */
-    private val cache: com.ufi_axis_core.core.cache.ResponseCache? = null
+    private val cache: com.ufi_axis_core.core.cache.ResponseCache? = null,
+    /**
+     * 媒体库内容被改动后的回调（2026-10-13）。
+     *
+     * 加它是因为媒体列表/分组的数据源换成了 `MediaIndexStore` 的**内存快照**：
+     * 光失效 `ResponseCache` 已经不够了，快照里还留着那条已经不存在的记录，
+     * 客户端会在列表里看到一个点不开的文件。装配层把它接到 `MediaIndexStore.invalidate()`。
+     *
+     * 可空 + 默认 null：与 [cache] 同一口径，老的组装代码不传也能编过。
+     */
+    private val onMediaMutated: (() -> Unit)? = null
 ) {
 
     /**
@@ -592,6 +602,9 @@ class FileRoutes(
                     "ok" -> {
                         // 媒体库列表里那一条得跟着消失，否则客户端刷出来还是旧的
                         cache?.invalidate("media:*")
+                        // 2026-10-13：列表/分组现在读 MediaIndexStore 的内存快照，
+                        // 光清 ResponseCache 不够 —— 快照里那条记录还在。
+                        onMediaMutated?.invoke()
                         call.respond(toJsonElement(mapOf(
                             "success" to true, "deleted" to true, "path" to realPath
                         )))

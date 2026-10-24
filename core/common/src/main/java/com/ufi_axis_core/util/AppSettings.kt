@@ -23,6 +23,12 @@ class AppSettings(context: Context) {
         private const val KEY_PORT = "server_port"
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_BG_SERVICE_ENABLED = "background_service_enabled"
+        // 2026-10-19：启动失败计数 + 安全模式（跨重启生效，见 startupFailureCount / safeModeActive）
+        private const val KEY_STARTUP_FAILURES = "startup_failure_count"
+        private const val KEY_SAFE_MODE = "safe_mode_active"
+        // 2026-10-19：验证码通知 / 拦截记录的**已读水位**（跨设备同步用，运行态、不进备份）。
+        private const val KEY_SMS_CODE_SEEN_MSG_ID = "sms_code_seen_msg_id"
+        private const val KEY_SMS_BLOCKED_SEEN_MSG_ID = "sms_blocked_seen_msg_id"
         private const val KEY_GOFORM_IP = "goform_ip"
         private const val KEY_GOFORM_PORT = "goform_port"
         private const val KEY_GOFORM_PASSWORD = "goform_password"
@@ -102,6 +108,18 @@ class AppSettings(context: Context) {
         private const val KEY_PAIRED_AT = "paired_at"
         private const val KEY_PAIRING_ENABLED = "pairing_enabled"
         private const val KEY_PAIRING_MAX_DEVICES = "pairing_max_devices"
+
+        // ── 新设备需批准（2026-10-15）──
+        /** 新设备配对是否需要机主在已配对设备上批准。**默认关**（用户 2026-10-15 决定）。 */
+        private const val KEY_PAIRING_APPROVAL_REQUIRED = "pairing_approval_required"
+
+        /**
+         * 配对申请的外部通知渠道（2026-10-15）。**三个都默认关**（用户明确要求）：
+         * 配对码会经这些渠道明文外发（已做掩码），必须由机主自己打开并确认风险。
+         */
+        private const val KEY_PAIRING_NOTIFY_SYSTEM = "pairing_notify_system"
+        private const val KEY_PAIRING_NOTIFY_EMAIL = "pairing_notify_email"
+        private const val KEY_PAIRING_NOTIFY_WEBHOOK = "pairing_notify_webhook"
 
         // ── 配对密码（配对认证，2026-08-11）──
         // 字段名与 key 沿用 `device_password*` / `KEY_DEVICE_PASSWORD_*`：它们是持久化 key 的一部分，
@@ -207,6 +225,28 @@ class AppSettings(context: Context) {
             // 配对配额（不是凭据，是策略）
             BackupField(KEY_PAIRING_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_MAX_DEVICES, BackupValueType.INT, 0, 100),
+            // 2026-10-15：批准策略与它的通知渠道。都是"用户设定的配置、换设备仍成立"，
+            // 所以进备份（与配对配额同一判据）。**不进备份的是黑名单条目本身之外的东西** ——
+            // 那些是运行态（冷却、退避计数），见各自类的注释。
+            BackupField(KEY_PAIRING_APPROVAL_REQUIRED, BackupValueType.BOOL),
+            BackupField(KEY_PAIRING_NOTIFY_SYSTEM, BackupValueType.BOOL),
+            BackupField(KEY_PAIRING_NOTIFY_EMAIL, BackupValueType.BOOL),
+            BackupField(KEY_PAIRING_NOTIFY_WEBHOOK, BackupValueType.BOOL),
+            // ── 2026-10-15 补漏（换设备后应该跟过去的配置，之前漏登记了）──
+            //
+            // DLNA：开关与共享目录。类型都是 **STRING** 而不是 BOOL —— `DlnaService` 用的是
+            // `getRawString` / `setRawString`（存的是 "true"/"false" 文本），备份的 typed 编码
+            // 按**实际存储类型**走，写 BOOL 会在恢复时把 String 当 Boolean 读。
+            //
+            // ⚠ 键名是字面量：`DlnaService` 在 `:core`，而本文件在 `:core:common` ——
+            //   依赖方向不允许反过来引用它的常量。两边一致由 `DlnaBackupKeyGuardTest` 守着。
+            BackupField("dlna_enabled", BackupValueType.STRING),
+            BackupField("dlna_dirs_json", BackupValueType.STRING),
+            // 媒体库扫描范围（video/audio/image 三类各一份 JSON）。
+            // 与"天气城市"同一判据：它描述"这台设备的媒体库范围"，换设备通常仍成立。
+            BackupField("${KEY_MEDIA_SCAN_DIRS}_video", BackupValueType.STRING),
+            BackupField("${KEY_MEDIA_SCAN_DIRS}_audio", BackupValueType.STRING),
+            BackupField("${KEY_MEDIA_SCAN_DIRS}_image", BackupValueType.STRING),
             // 媒体封面预热（G6）：用户偏好，换设备仍成立
             BackupField(KEY_THUMB_PREWARM_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_THUMB_PREWARM_WIFI_ONLY, BackupValueType.BOOL),
@@ -237,6 +277,12 @@ class AppSettings(context: Context) {
 
         private val BACKUP_FIELDS_BY_KEY: Map<String, BackupField> =
             BACKUP_FIELDS.associateBy { it.key }
+
+        /** 备份导入时对 goform_ip 的形状校验（与 `ConfigRoutes` 的 PUT 校验同一条规则）。 */
+        private val BACKUP_HOST_PATTERN = Regex("^[A-Za-z0-9]([A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$")
+
+        /** 备份导入时对 update_url / update_mirror_base 的协议校验。 */
+        private val BACKUP_URL_PATTERN = Regex("^https?://[^\\s]{1,2048}$")
 
         /** 备份包里出现的敏感键，供 UI 提示"这个包含密码与令牌"。 */
         val SENSITIVE_BACKUP_KEYS: Set<String> =
@@ -292,6 +338,15 @@ class AppSettings(context: Context) {
         // 设备配对默认密码（仅用于 hasDefaultPassword 判定与旧版 App 兼容兜底；绝不回显/落明文）
         private const val DEFAULT_DEVICE_PASSWORD = "admin"
         const val DEFAULT_DEBUG_MODE = false
+
+        /**
+         * 连续启动失败多少次后进入安全模式（2026-10-19）。
+         *
+         * 取 2：一次失败可能是瞬时（端口刚开始释放/系统抖动），两次连续失败基本可以确定
+         * "再按原配置启动也会失败"。安全模式本身是**一次性**的：用最小配置启动成功即清除，
+         * 用户若没改配置、下次又失败，计数会重新累积 —— 不会把设备永久钉在安全模式里。
+         */
+        const val SAFE_MODE_THRESHOLD = 2
 
         /**
          * 日志总开关默认 **false**（2026-09-04 由 true 改）。
@@ -411,6 +466,32 @@ class AppSettings(context: Context) {
     var pairingEnabled: Boolean
         get() = prefs.getBoolean(KEY_PAIRING_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_PAIRING_ENABLED, value).apply()
+
+    /**
+     * 新设备配对是否需要机主在**已配对设备**上批准（2026-10-15）。
+     *
+     * **默认关**：打开之后，任何未配对的指纹都要先经过一次批准（App 点允许，或在网页上
+     * 回传从外部通知里读到的配对码）。默认关是为了"升级零感知" —— 存量用户不点这个开关，
+     * 配对流程与今天逐字一致。
+     */
+    var pairingApprovalRequired: Boolean
+        get() = prefs.getBoolean(KEY_PAIRING_APPROVAL_REQUIRED, false)
+        set(value) = prefs.edit().putBoolean(KEY_PAIRING_APPROVAL_REQUIRED, value).apply()
+
+    /** 配对申请是否发本机系统通知（默认关；见 KEY_PAIRING_NOTIFY_* 的说明）。 */
+    var pairingNotifySystem: Boolean
+        get() = prefs.getBoolean(KEY_PAIRING_NOTIFY_SYSTEM, false)
+        set(value) = prefs.edit().putBoolean(KEY_PAIRING_NOTIFY_SYSTEM, value).apply()
+
+    /** 配对申请是否发邮件（默认关）。 */
+    var pairingNotifyEmail: Boolean
+        get() = prefs.getBoolean(KEY_PAIRING_NOTIFY_EMAIL, false)
+        set(value) = prefs.edit().putBoolean(KEY_PAIRING_NOTIFY_EMAIL, value).apply()
+
+    /** 配对申请是否发 Webhook（默认关）。 */
+    var pairingNotifyWebhook: Boolean
+        get() = prefs.getBoolean(KEY_PAIRING_NOTIFY_WEBHOOK, false)
+        set(value) = prefs.edit().putBoolean(KEY_PAIRING_NOTIFY_WEBHOOK, value).apply()
 
     /** 最大配对设备数，0 表示无限制。仅在 pairingEnabled=true 时生效。 */
     var pairingMaxDevices: Int
@@ -533,6 +614,31 @@ class AppSettings(context: Context) {
                 apply()
             }
             AppLogger.i("AppSettings", "配对模式就绪，当前已配对 ${pairedFingerprints.size} 台设备")
+        }
+    }
+
+    /**
+     * 立刻轮换配对码（2026-10-15）。
+     *
+     * ## 为什么需要它
+     * 配对码是 6 位、一次性，但它原来**失败不换** —— 攻击者可以对着同一个码无限次尝试，
+     * 配合 confirm 的按 IP 限速仍是一条可爆破的路。改成"每次 confirm 失败即轮换"之后，
+     * 暴力猜码彻底失效：每失败一次靶子就被换掉。合法用户的代价只是重新看一眼设备上显示的码
+     *（本来就得读它才能配对）。
+     *
+     * ## 为什么只在"设备尚未初始化"时轮换
+     * 已初始化设备的配对码本来就是空串（`infoPayload` 不下发），这时凭空生成一个新码
+     * 没有任何用处，只会让 prefs 里多一个永远不会被读到的值。
+     *
+     * @return 轮换后的新码；设备已初始化时返回空串（表示"没有码可轮换"）
+     */
+    fun rotatePairingCode(): String {
+        synchronized(this) {
+            if (devicePasswordSet) return ""
+            val code = generatePairingCode()
+            prefs.edit().putString(KEY_PAIRING_CODE, code).apply()
+            AppLogger.i("AppSettings", "配对码已轮换（上一次 confirm 失败）")
+            return code
         }
     }
 
@@ -665,6 +771,47 @@ class AppSettings(context: Context) {
     var autoStartOnBoot: Boolean
         get() = prefs.getBoolean(KEY_AUTO_START, DEFAULT_AUTO_START)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_START, value).apply()
+
+    /**
+     * 连续启动失败次数（2026-10-19）。
+     *
+     * 由 `BackendService` 在"HTTP 服务启动失败"或"进程初始化失败"时自增、启动成功时清零。
+     * 达到 [SAFE_MODE_THRESHOLD] 后置位 [safeModeActive]，下一次启动以最小配置启动。
+     *
+     * 为什么不放内存：这条计数要跨进程重启才有意义（重启后才知道"上次也失败了"）。
+     */
+    var startupFailureCount: Int
+        get() = prefs.getInt(KEY_STARTUP_FAILURES, 0).coerceIn(0, 100)
+        set(value) = prefs.edit().putInt(KEY_STARTUP_FAILURES, value.coerceIn(0, 100)).apply()
+
+    /**
+     * 安全模式标记（2026-10-19）：下一次启动强制用**默认端口**、并关闭后台采集，
+     * 让设备先回到"能被连上"的最小状态；启动成功后自动清除（一次性）。
+     *
+     * 只在连续启动失败到阈值时置位，用于把"某个配置把 core 弄挂 / 端口被占"从
+     * "无限重启循环"拉回到"至少能进设置页改回来"。
+     */
+    var safeModeActive: Boolean
+        get() = prefs.getBoolean(KEY_SAFE_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_SAFE_MODE, value).apply()
+
+    /**
+     * 「通知」页签的已读水位（2026-10-19，跨设备同步）。
+     *
+     * 背景：这个水位原来只存在 App 本地（`AppPreferences.smsCodeSeenMsgId`），换一台设备配对后
+     * 水位为 0 ⇒ 把所有历史验证码都算未读，角标显示成"总数"。现在真源放在 core：
+     * 客户端标记已读时写回这里，另一台设备加载时先从这里取。
+     *
+     * 语义与客户端一致：`msgId > 水位` 视为未读；只前推不回退。
+     */
+    var smsCodeSeenMsgId: Long
+        get() = prefs.getLong(KEY_SMS_CODE_SEEN_MSG_ID, 0L)
+        set(value) = prefs.edit().putLong(KEY_SMS_CODE_SEEN_MSG_ID, value.coerceAtLeast(0L)).apply()
+
+    /** 「已拦截」角标的已读水位（2026-10-19，跨设备同步；语义同 [smsCodeSeenMsgId]）。 */
+    var smsBlockedSeenMsgId: Long
+        get() = prefs.getLong(KEY_SMS_BLOCKED_SEEN_MSG_ID, 0L)
+        set(value) = prefs.edit().putLong(KEY_SMS_BLOCKED_SEEN_MSG_ID, value.coerceAtLeast(0L)).apply()
 
     /**
      * 后台采集服务开关（`/api/service/start|stop` 的真源，默认开）。
@@ -1426,6 +1573,9 @@ class AppSettings(context: Context) {
     fun toMap(): Map<String, Any> = mapOf(
         "port" to port,
         "auto_start_on_boot" to autoStartOnBoot,
+        // 2026-10-19：跨设备的已读水位（客户端 GET /api/config 时读取）。
+        "sms_code_seen_msg_id" to smsCodeSeenMsgId,
+        "sms_blocked_seen_msg_id" to smsBlockedSeenMsgId,
         "goform_ip" to goformIp,
         "goform_port" to goformPort,
         "debug_mode" to debugMode,
@@ -1501,7 +1651,24 @@ class AppSettings(context: Context) {
      * 部分键只在 setter 里夹取（例如 `server_port`），绕过 setter 写入一个越界值会让服务
      * 下次启动就崩在端口绑定上，而备份文件是可以被手工编辑的。
      */
-    fun importBackupFields(values: Map<String, Any?>, replace: Boolean): BackupImportReport {
+    fun importBackupFields(values: Map<String, Any?>, replace: Boolean): BackupImportReport =
+        applyBackupFields(values, replace, dryRun = false)
+
+    /**
+     * 预览导入：只算"会应用哪些键、会拒哪些键"，**不写任何东西**（2026-10-19）。
+     *
+     * 为什么需要：备份导入是一次性写 60+ 个键（含端口、goform、配对策略）的批量操作，
+     * 用户点"恢复"之前应该先看到将发生什么。与 [importBackupFields] 共用同一套校验，
+     * 所以"预览通过 = 真导入也会通过"（除了 IO 失败这类运行时差异）。
+     */
+    fun previewBackupFields(values: Map<String, Any?>, replace: Boolean): BackupImportReport =
+        applyBackupFields(values, replace, dryRun = true)
+
+    private fun applyBackupFields(
+        values: Map<String, Any?>,
+        replace: Boolean,
+        dryRun: Boolean
+    ): BackupImportReport {
         val applied = mutableListOf<String>()
         val rejected = LinkedHashMap<String, String>()
         val editor = prefs.edit()
@@ -1546,12 +1713,26 @@ class AppSettings(context: Context) {
                 }
                 BackupValueType.STRING -> {
                     val v = raw as? String
-                    if (v == null) rejected[key] = "需要字符串" else editor.putString(key, v)
+                    when {
+                        v == null -> rejected[key] = "需要字符串"
+                        // 2026-10-19：两个"改错就失联"的字符串键做格式校验。
+                        // 备份包可以被手工编辑，之前 STRING 只校验类型 —— 写入一个非法 goform_ip
+                        // 会让 core 永远连不上设备后台，非法 update_url 会让更新链路失效。
+                        // 空串放行：它是"清空/回默认"的合法语义。
+                        key == KEY_GOFORM_IP && v.isNotBlank() &&
+                            !BACKUP_HOST_PATTERN.matches(v.trim()) ->
+                            rejected[key] = "IP / 主机名格式不合法"
+                        (key == KEY_UPDATE_URL || key == KEY_UPDATE_MIRROR_BASE) && v.isNotBlank() &&
+                            !BACKUP_URL_PATTERN.matches(v.trim()) ->
+                            rejected[key] = "必须是 http(s) 地址"
+                        else -> editor.putString(key, v)
+                    }
                 }
             }
             if (!rejected.containsKey(key)) applied += key
         }
-        editor.apply()
+        // dryRun 时不落盘：editor 上的 remove/put 只在 apply() 时生效，跳过即完全无副作用。
+        if (!dryRun) editor.apply()
 
         return BackupImportReport(
             applied = applied,
@@ -1588,6 +1769,23 @@ class AppSettings(context: Context) {
         val editor = prefs.edit()
         prefs.all.keys.filterNot { it in PRESERVED_ON_RESET }.forEach { editor.remove(it) }
         editor.apply()
+    }
+
+    /**
+     * 彻底恢复出厂（2026-10-19）：连身份与凭据一起清，等价于"放弃设备所有权"。
+     *
+     * ## 为什么必须和 [resetAll] 分开
+     * [resetAll] 刻意保留 `PRESERVED_ON_RESET`（密码哈希、配对指纹、device_id、aria2 secret）——
+     * 因为**远程**重置不该把设备变成"任何人都能重新初始化"的状态（`/api/config/reset`
+     * 只要求已配对身份，成本很低）。而本方法只在**本机设置页**（物理在场 / adb 投屏）触发，
+     * 语义是"我把这台设备交出去了"，清干净才是正确的。
+     *
+     * ⚠ 只清本 prefs 文件。配对记录（`filesDir/paired_devices.json`）与配对黑名单
+     * （`paired_blacklist` 独立 prefs）是另外两处存储，调用方必须同时清 —— 见
+     * `SettingsActivity.factoryReset()` 的三连清。
+     */
+    fun factoryReset() {
+        prefs.edit().clear().apply()
     }
 }
 

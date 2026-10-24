@@ -407,6 +407,19 @@ object WsDataTopic {
      *  total 是全库视频数。消费端勿把它当"整体完成度"画进度条——稳定态下 done 恒为 0。 */
     const val MEDIA_THUMB_PREWARM = "media:thumb-progress"
 
+    /**
+     * 2026-10-21：**新设备批准请求有变化**，core 在登记成功后主动推送。
+     *
+     * 载荷只有 `{changed: "pairing:approvals"}`，**没有配对码**（码只出现在已鉴权的
+     * `GET /api/pairing/approvals` 与机主配置的外部通知里）。本帧的语义是「去拉一次列表」，
+     * App 收到即 `loadApprovals()` 弹窗 —— 不带载荷是刻意的，见 `ApprovalPushNudger` 的类注释。
+     *
+     * 为什么复用 `data_changed` 而不是新开频道：两端都已订阅该频道，加频道要动
+     * `WsChannel.ALL / UI_TOPICS` 与 `scripts/verify-api-contract.mjs` 的频道差集校验，
+     * 收益为零。
+     */
+    const val PAIRING_APPROVALS = "pairing:approvals"
+
     /** 前缀：按命名空间分流用。 */
     const val PREFIX_TASK = "task:"
     const val PREFIX_CONSOLE = "console:"
@@ -414,6 +427,9 @@ object WsDataTopic {
     const val PREFIX_NETWORK = "network:"
     const val PREFIX_WIFI = "wifi:"
     const val PREFIX_MEDIA = "media:"
+
+    /** 配对相关（2026-10-21）：目前只有 [PAIRING_APPROVALS]。 */
+    const val PREFIX_PAIRING = "pairing:"
 
     /**
      * 2026-10-05 P5 端侧 WS 重连 sentinel（仅 app 内部语义，core 不发送，web 不需要）。
