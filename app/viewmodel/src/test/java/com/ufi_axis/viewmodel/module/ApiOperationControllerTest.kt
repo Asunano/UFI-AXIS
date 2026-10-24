@@ -68,14 +68,16 @@ class ApiOperationControllerTest {
     }
 
     @Test
-    fun `toBackground 后命中不再进 SUCCESS 停留`() = runTest {
+    fun `toBackground 后命中不再进 SUCCESS 停留，收敛回 IDLE`() = runTest {
         val c = ApiOperationController(this)
         c.run(FakeSpec(verifyResults = listOf(true)))
         // RUNNING → toBackground → HIDDEN
         advanceTimeBy(1)
         c.toBackground()
         advanceUntilIdle()
-        assertEquals(ApiOperationController.Kind.HIDDEN, c.state.value.kind)
+        // 2026-10-14 口径：HIDDEN 只对 RUNNING 生效；操作结束后收敛回 IDLE（与 web 一致），
+        // 关键是不能弹 SUCCESS 停留。
+        assertEquals(ApiOperationController.Kind.IDLE, c.state.value.kind)
     }
 
     @Test
