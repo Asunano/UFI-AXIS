@@ -39,11 +39,7 @@ export function setExportMinMax(v: boolean): void {
 }
 
 /** 行时间戳对齐：以全部序列时间戳的并集为准，缺的点留空单元格。 */
-export function buildMonitorCsv(
-  series: MetricSeries[],
-  hours: number,
-  includeMinMax = getExportMinMax(),
-): string {
+export function buildMonitorCsv(series: MetricSeries[], hours: number, includeMinMax = getExportMinMax()): string {
   const headers: string[] = ['时间'];
   for (const s of series) {
     headers.push(s.label);

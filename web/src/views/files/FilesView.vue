@@ -7,6 +7,7 @@
         v-model:sort-by="sortBy"
         :current-path="currentPath"
         :disks="disks"
+        :push-active="pushSummary?.active ?? 0"
         :is-mobile="isMobile"
         :can-back="canBack"
         :can-forward="canForward"
@@ -21,6 +22,7 @@
         @create="onCreate"
         @tool="onTool"
         @upload="onPickUpload"
+        @open-storage-devices="showStorageDevicesModal = true"
       />
     </div>
 
@@ -43,6 +45,19 @@
       <!-- 提示层：pointer-events:none，不能挡住 drop 事件本身 -->
       <div v-if="dropActive" class="drop-hint">松开即上传到当前目录</div>
 
+      <!-- 批量复制/移动/删除的常驻进度条（2026-10-14）：队列与重试在 useBatchOperation 里，
+           状态是模块级的 —— 关弹窗、换目录、切页面再回来都还在（刷新页面才会丢） -->
+      <BatchProgressPanel
+        :jobs="batchJobs"
+        :collapsed="batchCollapsed"
+        @cancel-all="batch.cancelAll"
+        @cancel-item="batch.cancelItem"
+        @retry-item="batch.retryItem"
+        @retry-failed="batch.retryFailed"
+        @clear="batch.clearFinished"
+        @toggle="batch.toggleCollapsed"
+      />
+
       <n-alert v-if="storageDenied" type="warning" :show-icon="false" class="perm-alert">
         Core 未获得「所有文件访问权限」，文件列表可能为空或操作失败。请在设备端 UFI-AXIS 应用中授予该权限后点刷新。
       </n-alert>
@@ -57,9 +72,15 @@
         <n-button size="tiny" @click="clearClipboard">取消</n-button>
       </div>
 
+      <!-- 远端推送摘要（2026-10-14）：上传到远端是两段式，第二段（core → 远端）原来只在
+           作业弹窗打开时可见 —— 关掉弹窗就没进度、也没失败重试入口。这里常驻一条，
+           并给一个直接打开作业面板的入口（失败项的「重试」在里面）。 -->
+      <RemotePushBanner :summary="pushSummary" @open="showRemotePushModal = true" />
+
       <FileListPanel
         :files="visibleFiles"
         :loading="loading"
+        :failed="loadFailed"
         :selected-path="selectedPath"
         :sel-mode="selMode"
         :selected-paths="selectedPaths"
@@ -69,6 +90,7 @@
         @preview="openPreview"
         @download="downloadFile"
         @action="handleAction"
+        @retry="loadFiles"
       />
     </div>
 
@@ -105,11 +127,35 @@
 
     <ChecksumModal v-model:show="showChecksumModal" :result="checksumResult" />
 
+    <!-- 存储与外接设备（2026-10-14）：入口是工具栏的存储读数与「更多 → 存储」。
+         原来这里是一个 popover，内容长度不可预知时会被顶出视口；现在改成弹窗，
+         数据仍由本页持有（打开时刷新一次），弹窗本身不发请求。 -->
+    <StorageDevicesModal
+      v-model:show="showStorageDevicesModal"
+      :disks="disks"
+      :loading="diskLoading"
+      :storage-sources="storageSources"
+      :current-path="currentPath"
+      :push-active="pushSummary?.active ?? 0"
+      @navigate-to-volume="onNavigateToVolume"
+      @navigate-to-remote="onNavigateToRemote"
+      @manage-sources="onManageSourcesFromDevices"
+      @open-push="onOpenPushFromDevices"
+    />
+
+    <!-- 远端存储源管理（2026-10-14）：入口在「存储」弹窗底部。
+         关掉后重拉一次列表 —— 刚新增/停用的源要立刻反映到弹窗里的可浏览入口。 -->
+    <StorageSourcesModal v-model:show="showStorageSourcesModal" @update:show="onStorageSourcesClosed" />
+
+    <!-- 远端推送作业面板（2026-10-14）：入口在「存储」弹层里。
+         它自己管轮询（只在打开期间，2s），关掉即停 —— 关掉后的可见性由上面的
+         RemotePushBanner（15s 摘要轮询，见 useRemotePush.ts）接管，所以不打开它也看得见在跑什么。 -->
+    <RemotePushModal v-model:show="showRemotePushModal" />
+
     <SearchModal
       v-model:show="showSearchModal"
       :current-path="currentPath"
       :initial-query="searchQuery"
-      :is-mobile="isMobile"
       @pick="onSearchPick"
     />
 
@@ -145,6 +191,7 @@
       :limit-label="uploadLimitText"
       @cancel="upload.cancel"
       @cancel-all="upload.cancelAll"
+      @retry="upload.retry"
       @clear="upload.clearFinished"
       @close="upload.closePanel"
     />
@@ -161,15 +208,18 @@
  *
  * ── 关于「批量」必须知道的前提 ──
  * core 的 `/api/files/{copy,move,delete}` **只收单个 source**，没有批量端点，
- * 所以多选后的复制/移动/删除都是**前端串行循环**（见 `runBatch` / `pasteHere`）。
+ * 所以多选后的复制/移动/删除都是**前端串行循环**（见 `pasteHere` / `confirmDeleteSelected`，
+ * 队列本体在 `useBatchOperation.ts`，面板在 `BatchProgressPanel.vue`）。
  * 唯一的例外是 `/compress`，它收 `paths: []`，多选压缩是**一次请求**。
+ * 2026-10-14：串行循环的进度原来只活在一条 `message.loading` 里（关掉即失忆、不能取消、
+ * 失败只能整批重来），现在改成常驻的逐项面板 + 单项重试，判据写在下面「批量操作」那一节。
  *
  * ── 关于「覆盖」必须知道的前提 ──
  * `/copy` 内部用 `REPLACE_EXISTING`（同名直接覆盖），`/move` 遇到目标已存在直接失败。
  * 两者都不做改名，所以**冲突规避必须在客户端完成**（见 `uniqueChildName`）——
  * 否则粘贴到已有同名文件的目录就是「要么丢数据、要么报错」。
  */
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useMessage, useDialog } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import { useAppStore } from '@/stores/app';
@@ -179,15 +229,29 @@ import { useIsMobile } from '@/composables/useIsMobile';
 import FilesToolbar from './components/FilesToolbar.vue';
 import FileListPanel from './components/FileListPanel.vue';
 import UploadProgressPanel from './components/UploadProgressPanel.vue';
+// 2026-10-14：批量操作的常驻进度条（队列在 useBatchOperation 里）
+import BatchProgressPanel from './components/BatchProgressPanel.vue';
+// 2026-10-14：远端推送摘要条（第二段进度的常驻可见性）
+import RemotePushBanner from './components/RemotePushBanner.vue';
 import SearchModal from './components/modals/SearchModal.vue';
 import NameInputModal from './components/modals/NameInputModal.vue';
 import FileInfoModal from './components/modals/FileInfoModal.vue';
 import ChecksumModal from './components/modals/ChecksumModal.vue';
+// 2026-10-14：存储与外接设备（原来的工具栏 popover，改成自适应弹窗）
+import StorageDevicesModal from './components/modals/StorageDevicesModal.vue';
+// 2026-10-14：远端存储源管理（web 侧此前完全没有这块支持）
+import StorageSourcesModal from './components/modals/StorageSourcesModal.vue';
+// 2026-10-14：远端推送作业面板（上传到远端的第二段，此前完全不可见）
+import RemotePushModal from './components/modals/RemotePushModal.vue';
 import { useFileUpload } from './useFileUpload';
+import { useBatchOperation } from './useBatchOperation';
+import { useRemotePushSummary } from './useRemotePush';
 import {
   PREVIEW_MAX_BYTES,
+  assertOk as assertOkShared,
   authHeaders,
   effectiveUploadLimit,
+  errorOf,
   uploadLimitLabel,
   breadcrumbSegments,
   canPreview,
@@ -199,6 +263,7 @@ import {
   PRIMARY_STORAGE,
   previewKindOf,
   primaryFileActionOf,
+  REMOTE_PREFIX,
   uniqueChildName,
   type FileEntry,
 } from './filesShared';
@@ -212,10 +277,19 @@ const appStore = useAppStore();
 const currentPath = ref(PRIMARY_STORAGE);
 const files = ref<FileEntry[]>([]);
 const loading = ref(false);
+/** 列表**读取失败**（与「空目录」是两件事，见 loadFiles 的注释） */
+const loadFailed = ref(false);
+/** 本机卷读数是否在读取中：存储弹窗用它区分「还没读到」与「真的没有卷」 */
+const diskLoading = ref(false);
 const selectedPath = ref('');
 const searchQuery = ref('');
 const sortBy = ref('name');
 const disks = ref<any[]>([]);
+/** 远端存储源（GET /api/storage/sources）。文件 API 全线接受 `remote:<id>/…`，所以它们与本地卷共用同一套浏览 UI。 */
+const storageSources = ref<any[]>([]);
+const showStorageSourcesModal = ref(false);
+/** 存储与外接设备弹窗（2026-10-14：原工具栏 popover 的明细搬到这里） */
+const showStorageDevicesModal = ref(false);
 const actionLoading = ref(false);
 const fileInfo = ref<FileEntry | null>(null);
 const showChecksumModal = ref(false);
@@ -224,7 +298,8 @@ const storageDenied = ref(false);
 const showSearchModal = ref(false);
 /** 视口判据统一走 composable（matchMedia，阈值与全站 768px 一致） */
 const isMobile = useIsMobile();
-const pasting = ref(false);
+// 2026-10-14：原来的 `pasting` 是个组件局部 ref（粘贴的 loading 状态）。
+// 现在它是从模块级批量队列派生出来的 computed —— 切页回来仍然是对的（见批量操作那一节）。
 
 /** 隐藏文件开关。core `/list` 不过滤隐藏项，过滤只能做在客户端 */
 const showHidden = ref(false);
@@ -294,17 +369,16 @@ const visibleFiles = computed(() => {
 const selectedItems = computed(() => visibleFiles.value.filter((f) => selectedPaths.value.includes(f.path)));
 
 // ── 文件加载 ──
-// core 的多数写操作返回 HTTP 200 + { success: false, error: "..." }，必须显式判断
+// core 的多数写操作返回 HTTP 200 + { success: false, error: "..." }，必须显式判断。
+// 判定实现只有一份（`filesShared.assertOk`），这里只注入提示出口 ——
+// composable 不直接依赖 naive-ui 的 message 实例。
 function assertOk(data: any, fallback: string): boolean {
-  if (data?.success === false) {
-    message.error(data.error || fallback);
-    return false;
-  }
-  return true;
+  return assertOkShared(data, fallback, (msg) => message.error(msg));
 }
 
 async function loadFiles() {
   loading.value = true;
+  loadFailed.value = false;
   try {
     const { data } = await api.get('/api/files/list', { params: { path: currentPath.value } });
     files.value = data.files || [];
@@ -315,8 +389,12 @@ async function loadFiles() {
       pendingSelectPath.value = '';
       if (files.value.some((f) => f.path === target)) selectedPath.value = target;
     }
-  } catch {
-    message.error('加载文件列表失败');
+  } catch (e: any) {
+    // 失败必须与「空目录」区分开：原来只弹一条 toast，列表区照样渲染「空目录」，
+    // 用户看到的是「这个目录没有文件」——比起报错，这是更糟的误导。
+    files.value = [];
+    loadFailed.value = true;
+    message.error(e?.response?.data?.error || '加载文件列表失败');
   } finally {
     loading.value = false;
   }
@@ -332,13 +410,107 @@ async function loadStorageStatus() {
 }
 
 async function loadDiskUsage() {
+  diskLoading.value = true;
   try {
     const { data } = await api.get('/api/files/disk-usage');
     disks.value = data.disks || [];
   } catch {
-    /* 静默 */
+    /* 静默：读数拿不到时存储弹窗显示「还没有读到」，不弹错 */
+  } finally {
+    diskLoading.value = false;
   }
 }
+
+/**
+ * 远端存储源列表（2026-10-14 补）。
+ *
+ * 只在「存储」弹层里用来给可浏览入口 + 试连/管理，**不影响本地卷那条链路**；
+ * 拿不到就当作"没配远端源"（老固件没有 /api/storage/*，静默即可，不要弹错）。
+ */
+async function loadStorageSources() {
+  try {
+    const { data } = await api.get('/api/storage/sources');
+    storageSources.value = data?.sources || [];
+  } catch {
+    /* 静默 */
+  } finally {
+    // 2026-10-14：推送摘要的启用判据是"有没有启用中的远端源"，而 onMounted 里
+    // loadStorageSources() 没有 await，紧跟其后问一次的话看到的是**空列表**
+    // （原来那个角标就是这么在前 15s 恒为 0 的）。改成源拉完再问一次。
+    void push.refresh();
+  }
+}
+
+/** 点远端源入口：拼成 core 的客户端路径形态 `remote:<id>/`，再走统一导航（白名单已放行 remote:）。 */
+function onNavigateToRemote(id: string) {
+  enterPath(`${REMOTE_PREFIX}${id}/`);
+}
+
+/**
+ * 切到另一块本机卷（SD 卡 / U 盘）。
+ *
+ * 弹窗那边已经先 emit 再关窗；这里只负责走统一白名单与历史栈 ——
+ * `enterPath` 会校验 `isAllowedRoot`，并清掉跨目录没有意义的选中态。
+ */
+function onNavigateToVolume(mount: string) {
+  enterPath(mount);
+}
+
+/** 弹窗里的「管理远端存储源…」：先关本弹窗再开配置弹窗，避免两层 mask 叠着。 */
+function onManageSourcesFromDevices() {
+  showStorageDevicesModal.value = false;
+  showStorageSourcesModal.value = true;
+}
+
+/** 弹窗里的「远端推送作业…」：同上，作业面板自己管 2s 轮询。 */
+function onOpenPushFromDevices() {
+  showStorageDevicesModal.value = false;
+  showRemotePushModal.value = true;
+}
+
+/**
+ * 打开存储弹窗时刷新一次读数与远端源列表。
+ *
+ * 磁盘读数只在上传/删除后被动刷新，用户隔一阵点开看到的可能是旧数字；
+ * 远端源列表也可能刚在设备端改过。两个请求都**不 await**：弹窗先用现有数据渲染，
+ * 回来再就地更新 —— 不会出现"打开弹窗先空一下"。
+ */
+watch(showStorageDevicesModal, (v) => {
+  if (!v) return;
+  loadDiskUsage();
+  loadStorageSources();
+});
+
+/** 存储源弹窗关闭后重拉列表：刚新增 / 停用 / 删除的源要立刻反映到「存储」弹层里的可浏览入口。 */
+function onStorageSourcesClosed(v: boolean) {
+  if (!v) {
+    loadStorageSources();
+  }
+}
+
+/**
+ * 远端推送作业摘要（2026-10-14 升级）。
+ *
+ * 2026-10-14：这里原来只有一个 `pushActive`（数字），用途仅仅是给「存储」弹层里的
+ * 「远端推送作业…」入口挂个角标 —— 于是用户传完文件只看到"上传成功"、远端其实还没有文件，
+ * 而**关掉作业弹窗后既没有进度、也没有失败重试入口**（`RemotePushModal` 的轮询是
+ * `watch(() => props.show)` 起停的）。现在同一份数据升级成摘要，由列表上方的常驻横幅
+ * （`RemotePushBanner`）呈现，并直接给一个打开作业面板的入口。
+ *
+ * **轮询没有新增第二条**：仍是原来那一条 15s / 同一个端点，只是搬进 `useRemotePushSummary`
+ * （它同时保留了"没有启用中的远端源就不打端点"的判断）。
+ */
+const push = useRemotePushSummary(() => storageSources.value.some((s) => s.enabled !== false));
+const pushSummary = push.summary;
+const showRemotePushModal = ref(false);
+
+/**
+ * 作业面板关掉时立刻问一次摘要：用户在面板里点了「清理已结束」/「重试」之后，
+ * 横幅不该等到下一轮 15s 轮询才跟着变。
+ */
+watch(showRemotePushModal, (v) => {
+  if (!v) void push.refresh();
+});
 
 // ── 导航 ──
 /** 换目录：清掉单选与多选（跨目录的选中集合没有意义），再拉列表 */
@@ -519,46 +691,60 @@ function onSearchPick(f: FileEntry) {
 }
 
 // ── 批量操作 ──
-function reportBatch(verb: string, ok: number, failed: string[]) {
-  if (!failed.length) {
-    message.success(`${verb}完成（${ok} 项）`);
-    return;
-  }
-  const head = failed.slice(0, 3).join('、') + (failed.length > 3 ? ' 等' : '');
-  if (ok === 0) message.error(`${verb}失败：${head}`);
-  else message.warning(`${verb}完成 ${ok} 项，失败 ${failed.length} 项：${head}`);
+/**
+ * 批量复制 / 移动 / 删除统一走 `useBatchOperation`：逐项状态、取消剩余、失败项单独重试，
+ * 面板常驻在列表上方（`BatchProgressPanel`）。
+ *
+ * 2026-10-14：原来是 `runBatch` + `pasteHere` 各自 `message.loading` 转圈，`ok`/`failed` 是
+ * 函数内的局部变量 —— 关掉那条 toast 就再也查不到失败的是哪几项，想中止只能刷新页面
+ * （连已经完成的进度一起丢），失败后也只能整批重来。详见 useBatchOperation.ts 的文件头。
+ *
+ * **这次把 6 处 `message.loading` 逐个过了一遍，判据如下**：
+ *   进面板 = 具备「多项 + 逐项成败 + 取消剩余 + 单项重试」四件事的操作，也就是**前端串行循环**
+ *     （core 的 `/copy` `/move` `/delete` 都只收单个 source，没有批量端点）。
+ *   留 toast = **单请求**操作：core 的 `/compress` 一次收 `paths[]`，`/extract` 与两个安装
+ *     都只有一个请求，没有"项"这一维度 —— 中途取消 HTTP 停不下 core 已经开始的压缩/解压/安装，
+ *     重试也无法只重试其中一项，硬塞进面板只会做出一个永远只有一行、按钮全都不适用的假面板。
+ *
+ * 队列为什么串行而不是 `Promise.all`：core 是跑在随身 WiFi 这类弱设备上的单进程，
+ * 同时打 N 个文件操作只会让 IO 队列互相拖慢，且并发下的失败原因更难归因。
+ */
+const batch = useBatchOperation({
+  notify: notifyBatch,
+  onBatchSettled: (job) => {
+    // 整批结束才刷列表：`FileListPanel` 的 loading 是整块遮罩（`n-spin :show`），
+    // 逐项刷新会让整批期间遮罩反复闪；逐项进度由常驻面板负责，这里只交代最终结果。
+    loadFiles();
+    loadDiskUsage();
+    exitSelectMode();
+    // 粘贴：只有全部成功才清空剪贴板。部分失败时保留 —— 现在面板里每个失败项都有「重试」，
+    // 不必再自己回列表里翻出是哪几个失败了（这是 2026-10-14 这次改动的直接动机之一）。
+    if ((job.verb === '复制' || job.verb === '移动') && !job.items.some((i) => i.status === 'error')) {
+      clearClipboard();
+    }
+  },
+});
+const batchJobs = batch.jobs;
+const batchCollapsed = batch.collapsed;
+
+/** 队列的提示出口：composable 不直接依赖 naive-ui 的 message 实例（它要能在组件之外继续跑） */
+function notifyBatch(kind: 'info' | 'success' | 'warning' | 'error', text: string) {
+  if (kind === 'success') message.success(text);
+  else if (kind === 'warning') message.warning(text);
+  else if (kind === 'error') message.error(text);
+  else message.info(text);
 }
+
+/** 粘贴按钮的转圈：状态从模块级队列派生，切页回来仍然是对的（原来是个组件局部 ref） */
+const pasting = computed(() => batch.activeVerb.value === '复制' || batch.activeVerb.value === '移动');
 
 /**
- * 串行执行批量动作。
+ * 多选压缩：core `/compress` 收 `paths: []`，**一次请求**，不必循环。
  *
- * 为什么串行而不是 `Promise.all`：core 是跑在随身 WiFi 这类弱设备上的单进程，
- * 同时打 N 个文件操作只会让 IO 队列互相拖慢，且并发下的失败原因更难归因。
- * 串行 + 进度提示慢一点，但每一步的成败都能如实汇报。
+ * 2026-10-14：保留 `message.loading`，不进批量面板 —— 判据见上面那一段（单请求 = 没有"项"）。
+ * 已知遗留（不在本次改动范围内）：它走全局 axios 的 15s 超时（`composables/useApi.ts`），
+ * 压缩大目录可能"客户端报失败、设备端其实成功"。
  */
-async function runBatch(targets: FileEntry[], verb: string, one: (f: FileEntry) => Promise<boolean>) {
-  if (!targets.length) return;
-  const m = message.loading(`${verb}中… 0/${targets.length}`, { duration: 0 });
-  let ok = 0;
-  const failed: string[] = [];
-  for (let i = 0; i < targets.length; i++) {
-    const f = targets[i]!;
-    m.content = `${verb}中… ${i + 1}/${targets.length}`;
-    try {
-      if (await one(f)) ok += 1;
-      else failed.push(f.name);
-    } catch {
-      failed.push(f.name);
-    }
-  }
-  m.destroy();
-  reportBatch(verb, ok, failed);
-  exitSelectMode();
-  await loadFiles();
-  loadDiskUsage();
-}
-
-/** 多选压缩：core `/compress` 收 `paths: []`，**一次请求**，不必循环 */
 async function compressSelected() {
   const items = selectedItems.value;
   if (!items.length) return;
@@ -566,10 +752,8 @@ async function compressSelected() {
   try {
     const { data } = await api.post('/api/files/compress', { paths: items.map((i) => i.path) });
     m.destroy();
-    if (!assertOk(data, '压缩失败')) {
-      message.error(data?.error || '压缩失败（目标同名 zip 可能已存在）');
-      return;
-    }
+    // 只提示一次：原来 assertOk 已经弹过一条，这里又补一条 data?.error，同一件事说两遍
+    if (!assertOk(data, '压缩失败（目标同名 zip 可能已存在）')) return;
     message.success(`已生成 ${data.path}`);
     exitSelectMode();
     await loadFiles();
@@ -590,10 +774,21 @@ function confirmDeleteSelected() {
     positiveText: '删除',
     negativeText: '取消',
     onPositiveClick: () =>
-      runBatch(items, '删除', async (f) => {
-        const { data } = await api.post('/api/files/delete', { path: f.path });
-        return data?.success !== false;
-      }),
+      batch.start(
+        '删除',
+        currentPath.value,
+        items.map((f) => ({
+          path: f.path,
+          name: f.name,
+          run: async () => {
+            const { data } = await api.post('/api/files/delete', { path: f.path });
+            // 判定统一走 filesShared.assertOk；失败原因抛给队列，逐项面板上显示 core 原文，
+            // 而不是所有失败都压成同一句「操作失败」
+            if (!assertOkShared(data, '删除失败')) throw new Error(errorOf(data, '删除失败'));
+            return true;
+          },
+        }))
+      ),
   });
 }
 
@@ -674,6 +869,16 @@ function downloadFile(f: FileEntry) {
     .catch((e) => message.error(e?.message ? `下载失败: ${e.message}` : '下载失败'));
 }
 
+/**
+ * 安装 APK（文件行内 / 详情弹窗里的入口）。
+ *
+ * 2026-10-14：保留 `message.loading`，不进批量面板 —— 判据同上面批量那一节：这是**单请求**操作，
+ * 没有"项"可分（取消 HTTP 停不下 core 的安装，重试也没法只重试其中一项）。
+ * 但也正因为它是单请求，这条 toast 只能代表「core 收下了请求」：core 内部还要等
+ * `adb install -r` / PackageInstaller 回调（见 core `AppManager.installApk`）。
+ * 所以文案改成如实说"已提交"并指向能看结果的地方；**回读 `/api/apps` 确认真的装上了**
+ * 放在应用页（那边有版本号可比），不在这里再复制一套轮询。
+ */
 function installApk(f: FileEntry) {
   dialog.info({
     title: '确认安装',
@@ -684,13 +889,12 @@ function installApk(f: FileEntry) {
       const m = message.loading('正在发起安装...', { duration: 0 });
       try {
         const { data } = await api.post('/api/apps/install', { path: f.path });
-        if (data.success) {
-          message.success('已提交安装请求');
-        } else {
-          message.error(`安装失败: ${data.message}`);
-        }
+        if (!assertOk(data, '安装失败')) return;
+        message.success('已提交安装请求，可在「应用」页查看安装结果');
       } catch (e: any) {
-        message.error(`安装出错: ${e.response?.data?.message || e.message}`);
+        // core 的失败原因在 `error` 信封里；原先只读 `.message`，于是恒显示 axios 的
+        // `Request failed with status code 500`，把 core 说的话丢了
+        message.error(`安装出错: ${e.response?.data?.error || e.response?.data?.message || e.message}`);
       } finally {
         m.destroy();
       }
@@ -849,8 +1053,13 @@ function setClipboard(mode: 'copy' | 'move', items: FileEntry[]) {
  * 目标名一律走 `uniqueChildName` 做冲突规避 —— core 的 `/copy` 是 REPLACE_EXISTING
  * （同名会被静默覆盖），`/move` 遇到同名直接失败。两者都不改名，所以这里必须改名：
  * `a.txt` → `a (2).txt`。同一个粘贴批次里新占用的名字也要并进集合，否则多项重名会撞在一起。
+ *
+ * 2026-10-14：整批交给 `useBatchOperation`（原来是本函数自己循环 + `message.loading`，
+ * `ok`/`failed` 都是局部变量，关掉 toast 就查不到失败的是哪几项）。
+ * 剪贴板口径不变：只有全部成功才清空；部分失败时保留 —— 但**现在面板里每个失败项都有
+ * 「重试」**，不必再自己回列表里翻出是哪几个失败了。
  */
-async function pasteHere() {
+function pasteHere() {
   const total = clipboard.paths.length;
   if (!total) return;
   const mode = clipboard.mode;
@@ -858,42 +1067,30 @@ async function pasteHere() {
     message.warning('源与目标相同，未执行');
     return;
   }
+  const dir = currentPath.value;
+  const uri = mode === 'copy' ? '/api/files/copy' : '/api/files/move';
+  const failText = mode === 'copy' ? '复制失败' : '移动失败';
   const taken = new Set(files.value.map((f) => f.name));
-  const jobs = clipboard.paths.map((src, i) => {
-    const destName = uniqueChildName(taken, clipboard.names[i]!);
+  // 目标名在**入队时**算好并快照进 run：重试必须打到同一个目标名，
+  // 否则"重试"会再算一次 uniqueChildName（这次 `a (2).txt` 已存在）而变成又复制一份 `a (3).txt`
+  const targets = clipboard.paths.map((src, i) => {
+    const name = clipboard.names[i]!;
+    const destName = uniqueChildName(taken, name);
     taken.add(destName);
-    return { src, name: clipboard.names[i]!, dest: `${currentPath.value}/${destName}` };
+    const dest = `${dir}/${destName}`;
+    return {
+      path: src,
+      name,
+      run: async () => {
+        const { data } = await api.post(uri, { source: src, destination: dest });
+        // 同 confirmDeleteSelected：判定一份、原因带进队列
+        if (!assertOkShared(data, failText)) throw new Error(errorOf(data, failText));
+        return true;
+      },
+    };
   });
 
-  const verb = mode === 'copy' ? '复制' : '移动';
-  pasting.value = true;
-  const m = message.loading(`${verb}中… 0/${total}`, { duration: 0 });
-  let ok = 0;
-  const failed: string[] = [];
-  try {
-    for (let i = 0; i < jobs.length; i++) {
-      const j = jobs[i]!;
-      m.content = `${verb}中… ${i + 1}/${total}`;
-      try {
-        const { data } = await api.post(mode === 'copy' ? '/api/files/copy' : '/api/files/move', {
-          source: j.src,
-          destination: j.dest,
-        });
-        if (data?.success === false) failed.push(j.name);
-        else ok += 1;
-      } catch {
-        failed.push(j.name);
-      }
-    }
-  } finally {
-    m.destroy();
-    pasting.value = false;
-  }
-  reportBatch(verb, ok, failed);
-  // 只有全部成功才清空剪贴板：部分失败时保留，用户可重试
-  if (!failed.length) clearClipboard();
-  await loadFiles();
-  loadDiskUsage();
+  batch.start(mode === 'copy' ? '复制' : '移动', dir, targets);
 }
 
 function clearClipboard() {
@@ -1059,15 +1256,19 @@ async function saveTextFile() {
 }
 
 // ── 归档操作：解压 / 压缩 / 校验和 / 复制路径 ──
+/**
+ * 2026-10-14：解压保留 `message.loading`，不进批量面板 —— 判据同批量那一节：
+ * `/extract` 是**单请求**（core 内部解完才回），没有"项"可分，取消 HTTP 也停不下它。
+ * 单个文件的解压确实常常一两秒就结束，为它撑一个只有一行、按钮全不适用的面板不划算。
+ * 已知遗留（不在本次改动范围内）：它走全局 axios 的 15s 超时（`composables/useApi.ts`），
+ * 解压大压缩包可能"客户端报失败、设备端其实成功"。
+ */
 function extractArchive(f: FileEntry) {
   const m = message.loading('正在解压...', { duration: 0 });
   api
     .post('/api/files/extract', { path: f.path })
     .then(({ data }: any) => {
-      if (!data?.success) {
-        message.error('解压失败');
-        return;
-      }
+      if (!assertOk(data, '解压失败')) return;
       message.success(`已解压到 ${data.destination}`);
       loadFiles();
       loadDiskUsage();
@@ -1076,15 +1277,13 @@ function extractArchive(f: FileEntry) {
     .finally(() => m.destroy());
 }
 
+/** 2026-10-14：同 `extractArchive` —— 单请求、无"项"可分，保留 toast（判据见上） */
 function compressItem(f: FileEntry) {
   const m = message.loading('正在压缩...', { duration: 0 });
   api
     .post('/api/files/compress', { paths: [f.path] })
     .then(({ data }: any) => {
-      if (!data?.success) {
-        message.error('压缩失败');
-        return;
-      }
+      if (!assertOk(data, '压缩失败')) return;
       message.success(`已生成 ${data.path}`);
       loadFiles();
       loadDiskUsage();
@@ -1107,10 +1306,7 @@ function copyPath(f: FileEntry) {
 async function openChecksum(f: FileEntry) {
   try {
     const { data } = await api.post('/api/files/checksum', { path: f.path });
-    if (!data?.success) {
-      message.error('校验和计算失败');
-      return;
-    }
+    if (!assertOk(data, '校验和计算失败')) return;
     checksumResult.value = { path: data.path, algorithms: data.algorithms };
     showChecksumModal.value = true;
   } catch (e: any) {
@@ -1131,6 +1327,10 @@ onMounted(() => {
   // 能力探测 + 加载 L2 续传线索
   upload.ensureCaps().then((c) => upload.loadResumeHints(c.sessionTtlSeconds));
   loadStorageStatus();
+  // 2026-10-14：推送摘要的首次拉取放在 loadStorageSources() 的 finally 里（它的启用判据
+  // 依赖那份列表，而这里没有 await —— 原来就是这么让角标在前 15s 恒为 0 的）。
+  // 那一条 15s 轮询现在由 useRemotePushSummary 自己起停，随组件作用域一起销毁。
+  loadStorageSources();
   loadFiles();
   loadDiskUsage();
 });
@@ -1138,10 +1338,6 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown);
   removeUnloadGuard?.();
-});
-
-onUnmounted(() => {
-  window.removeEventListener('keydown', onKeydown);
 });
 </script>
 
@@ -1156,7 +1352,7 @@ onUnmounted(() => {
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  gap: 10px;
+  gap: var(--space-2);
 }
 .files-header {
   flex: 0 0 auto;
@@ -1164,8 +1360,8 @@ onUnmounted(() => {
   border: 1px solid var(--border-subtle);
   /* 圆角卡片而不是「只有底边线的平条」：平条会让整块顶栏失去与列表的层次区分 */
   border-radius: var(--radius-md);
-  /* --bg-color 从未定义过（兜底一路吃到纯白），所以暗色下这条顶栏其实是靠
-     --surface-elevated 生效的 —— 直接接它，去掉那层假变量 */
+  /* 底色接 --surface-elevated。历史上的 `--bg-color` 从未定义过（兜底一路吃到纯白），
+     暗色下这条顶栏其实一直是靠 --surface-elevated 生效的 —— 现在直接接它。 */
   background: var(--surface-elevated);
   box-shadow: 0 1px 2px var(--shadow-color-soft);
 }
@@ -1176,8 +1372,8 @@ onUnmounted(() => {
   overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding-bottom: 4px;
+  gap: var(--space-2);
+  padding-bottom: var(--space-1);
   /* 拖拽投放区的定位基准（提示层是 absolute） */
   position: relative;
 }
@@ -1195,7 +1391,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   z-index: 10;
-  font-size: 14px;
+  font-size: var(--font-md);
   font-weight: 600;
   color: var(--accent-color);
   /* 关键：不能吃掉 drop 事件，否则松手时事件落在提示层上、而它没有 drop 处理 */

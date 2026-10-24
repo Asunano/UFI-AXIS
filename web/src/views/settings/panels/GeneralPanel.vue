@@ -1,7 +1,22 @@
+<!--
+  连接与端口（原「通用设置」）：**这一栏只放 core 自身的连接参数** ——
+  设备后台 IP / 端口 / 密码、服务监听端口，外加一个「恢复默认配置」入口。
+  一句话定位：这里回答的是「web 怎么连上 core 与设备后台」。
+
+  2026-10-14 搬迁：日志与排障开关已移到「日志」面板（LogsPanel.vue），
+  卡片里那段占位注释写清了搬走了什么、为什么。本栏此后不再是「什么设置都往里塞」的筐。
+
+  2026-10-14 收口：原先保留的另外三块（本浏览器系统通知 / 短信验证码 / 更新配置）
+  也已各自回到功能分栏 —— NotifyPanel.vue / 短信页的「验证码设置」弹窗 /
+  UpdatePanel.vue 的「更新源」卡。那三块当时没动是因为目标分栏还在别人手里改，
+  留着说明比删出空档稳；现在它们都落地了，所以在这里一次性删掉字段、读映射与差量键。
+  **本栏现在只持有 goform_ip / goform_port / goform_password / port 四个键**，
+  不再持有任何别的域的键 —— 否则差量保存会把另一栏刚写的值用旧快照覆盖回去。
+-->
 <template>
   <div class="settings-panel">
-    <!-- Card 2: 通用设置 -->
-    <GridCard title="通用设置">
+    <!-- Card: 连接与端口 -->
+    <GridCard title="连接与端口">
       <template #extra>
         <n-button size="tiny" type="error" quaternary @click="resetConfig">恢复默认</n-button>
       </template>
@@ -42,150 +57,53 @@
           </div>
         </div>
       </div>
-      <div class="config-section">
-        <div v-if="!generalLoaded" class="section-subtitle">配置未从设备读取，开关已禁用（避免把默认值写回设备）</div>
-        <div class="config-grid">
-          <!-- 开机自启已移到「服务控制」卡片（立即生效 + 有状态回读）。
-               此处原来有第二个开关写同一个后端字段 auto_start_on_boot，两者互不刷新。 -->
-          <div class="config-item switch-item">
-            <span class="config-label">日志总开关</span>
-            <n-switch v-model:value="generalForm.logEnabled" :disabled="!generalLoaded" />
-          </div>
-          <div class="config-item switch-item">
-            <span class="config-label">后端日志</span>
-            <n-switch
-              v-model:value="generalForm.coreLogEnabled"
-              :disabled="!generalLoaded || !generalForm.logEnabled"
-            />
-          </div>
-          <div class="config-item switch-item">
-            <span class="config-label">手机端日志</span>
-            <n-switch v-model:value="generalForm.appLogEnabled" :disabled="!generalLoaded || !generalForm.logEnabled" />
-          </div>
-      </div>
-      <div class="config-section">
-        <div class="section-subtitle">本浏览器</div>
-        <!-- 2026-10-06：浏览器系统通知 —— web 本地偏好（localStorage），不写设备配置 -->
-        <div class="config-item switch-item">
-          <span class="config-label">系统通知（验证码/告警，页面在后台时提醒）</span>
-          <n-switch
-            :value="browserNotifyOn"
-            @update:value="(v: boolean) => toggleBrowserNotify(v)"
-          />
-        </div>
-        <div v-if="browserNotifyHint" class="section-subtitle" style="color: var(--n-warning-color, #f0a050)">
-          {{ browserNotifyHint }}
-        </div>
-          <div class="config-item switch-item">
-            <span class="config-label">详细日志（Debug）</span>
-            <n-switch v-model:value="generalForm.debugMode" :disabled="!generalLoaded || !generalForm.logEnabled" />
-          </div>
-        </div>
-        <!-- 三个排障开关都走 ToggleRow + 即时保存（见 saveProbeSwitch）：
-             它们需要说明位（端点名 + 危险警示 + 生效时机），而上面两列栅格里的
-             .switch-item 那一种没有说明位，硬塞会把警示挤成第二个标签。
-             注意第三个「字段归一化」与前两个的生效时机不同：它要重启后台服务，
-             见 PROBE_NEEDS_RESTART。 -->
-        <ToggleRow
-          label="设备原始字段 dump（排障用，默认关，改动立即生效）"
-          :description="probeDescription('goform_dump_enabled', PROBE_DUMP_DESC)"
-          :model-value="generalForm.goformDumpEnabled"
-          :loading="probeSaving.goform_dump_enabled"
-          :disabled="probeSwitchDisabled('goform_dump_enabled')"
-          @update:model-value="(v: boolean) => saveProbeSwitch('goform_dump_enabled', v)"
-        />
-        <ToggleRow
-          label="裸 goform 命令通道（排障用，默认关，改动立即生效）"
-          :description="probeDescription('goform_command_enabled', PROBE_COMMAND_DESC)"
-          :model-value="generalForm.goformCommandEnabled"
-          :loading="probeSaving.goform_command_enabled"
-          :disabled="probeSwitchDisabled('goform_command_enabled')"
-          @update:model-value="(v: boolean) => saveProbeSwitch('goform_command_enabled', v)"
-        />
-        <!--
-          2026-10-10 暂时隐藏 ttyd 开关：整套真 PTY 功能尚未完工，先从设置里撤下。
-          **只藏 UI，配置 key `ttyd_enabled` 与 core 侧读写逻辑全部保留** ——
-          这样恢复时只需放开这一个 ToggleRow，不用重新对齐 core 的字段名。
-        -->
-        <!-- <ToggleRow
-          label="真 PTY 终端（ttyd，默认关，改动立即生效）"
-          :description="probeDescription('ttyd_enabled', PROBE_TTYD_DESC)"
-          :model-value="generalForm.ttydEnabled"
-          :loading="probeSaving.ttyd_enabled"
-          :disabled="probeSwitchDisabled('ttyd_enabled')"
-          @update:model-value="(v: boolean) => saveProbeSwitch('ttyd_enabled', v)"
-        /> -->
-        <ToggleRow
-          label="字段归一化（默认开，改完需重启后台服务）"
-          :description="probeDescription('field_normalization_enabled', PROBE_FIELD_NORMALIZATION_DESC)"
-          :model-value="generalForm.fieldNormalizationEnabled"
-          :loading="probeSaving.field_normalization_enabled"
-          :disabled="probeSwitchDisabled('field_normalization_enabled')"
-          @update:model-value="(v: boolean) => saveProbeSwitch('field_normalization_enabled', v)"
-        />
-        <!-- 2026-10-07：预热开关与手动预热已迁至视频页「封面设置」（视频域开关放视频页） -->
-      </div>
-      <n-divider style="margin: 10px 0" />
-      <div class="config-section">
-        <div class="section-subtitle">短信验证码</div>
-        <div class="config-grid">
-          <div class="config-item switch-item">
-            <span class="config-label">启用验证码提取</span>
-            <n-switch v-model:value="generalForm.smsCodeEnabled" />
-          </div>
-          <div class="config-item">
-            <span class="config-label">清理周期 (小时)</span>
-            <n-input-number
-              v-model:value="generalForm.smsCodeCleanupHours"
-              :min="ConfigLimits.smsCodeCleanupHours[0]"
-              :max="ConfigLimits.smsCodeCleanupHours[1]"
-              size="small"
-            />
-          </div>
-        </div>
-      </div>
-      <n-divider style="margin: 10px 0" />
-      <div class="config-section">
-        <div class="section-subtitle">更新配置</div>
-        <div class="config-grid">
-          <div class="config-item">
-            <span class="config-label">下载方式</span>
-            <n-select
-              :value="updateMode"
-              :options="UPDATE_MODE_OPTIONS"
-              :loading="detectingGeo"
-              size="small"
-              :disabled="!generalLoaded"
-              @update:value="onUpdateModeChange"
-            />
-          </div>
-          <div class="config-item">
-            <span class="config-label">设备出口地区</span>
-            <div style="display: flex; align-items: center; gap: 8px; min-height: 28px">
-              <span style="font-size: 13px">{{ geoText }}</span>
-              <n-button size="tiny" :loading="detectingGeo" :disabled="!generalLoaded" @click="detectGeo(true)">
-                重新检测
-              </n-button>
-            </div>
-          </div>
-        </div>
-        <span class="row-hint" style="display: block; margin-top: 4px">
-          「自动」由设备按出口 IP 所在地区决定：中国大陆走镜像加速，其他地区（含未测出）直连。
-          镜像节点与失败换源都由设备侧处理，这里只需要选一个方式，改完点下方「保存」。
-        </span>
-      </div>
+      <!--
+        2026-10-14 搬迁：日志与排障开关已移到「日志」面板（LogsPanel.vue）——
+        log_enabled / core_log_enabled / app_log_enabled / debug_mode 四个日志开关，
+        goform_dump_enabled / goform_command_enabled / field_normalization_enabled 三个排障开关
+        （外加那个暂时隐藏的 ttyd 开关，它与排障开关共用同一套即时保存机制）。
+        理由：它们本来就是日志域的东西，此前被拆在「通用」与「日志」两栏（要开详细日志得先想到
+        来「通用」找），而四个日志开关互相有依赖、需要一个「改完一起提交」的时机 ——
+        跟「日志」栏的查看/清空放在一起才是一件事。**要找它们去 LogsPanel.vue，别在这里加回来。**
+
+        这一段里原先还夹着两条别的域的记录，一并留在原处免得后来的人找不到：
+        · 「开机自启已移到『服务控制』卡片（立即生效 + 有状态回读）。此处原来有第二个开关
+          写同一个后端字段 auto_start_on_boot，两者互不刷新。」
+        · 「2026-10-07：预热开关与手动预热已迁至视频页『封面设置』（视频域开关放视频页）。」
+      -->
+      <!--
+        2026-10-14 搬迁：本栏原有三块属于别的域的内容，已各自回到它们的功能分栏。
+        **要找它们去下面这些地方，别在这里加回来：**
+        · 「本浏览器系统通知」→ NotifyPanel.vue（通知面板顶部独立一张卡）。
+          它是**浏览器本地偏好**（localStorage + Notification 权限），不写设备配置，
+          放在"通知渠道"那一栏才对得上；
+        · 「短信验证码」（启用提取 / 清理周期）→ 短信页 `#/sms` 的「验证码设置」弹窗
+          （`views/sms/components/modals/SmsCodeSettingsModal.vue`）。它只影响短信页的
+          验证码提取，住在"通用"里没有任何人找得到；
+        · 「更新配置」（下载方式 / 设备出口地区）→ UpdatePanel.vue 顶部的「更新源」卡。
+          它决定"包从哪来"，与"怎么更新"必须在一起。
+
+        删掉它们之后本栏才真的只剩「连接 + 恢复默认」—— 卡片标题是「连接与端口」，
+        内容与标题对得上。（此前 W1 搬迁时保留了这三块并留了说明，因为那时 notify / sms /
+        update 三个目标分栏还在别的 agent 手里改；现在它们都落地了，所以在这里收口。）
+      -->
+      <!-- 未读到配置时的告警：本栏的四个连接输入与「保存」按钮都受 generalLoaded 控制 -->
+      <div v-if="!generalLoaded" class="section-subtitle">配置未从设备读取，本栏开关已禁用（避免把默认值写回设备）</div>
       <div class="card-actions">
         <n-button type="primary" size="small" :loading="savingGeneral" :disabled="!generalLoaded" @click="saveGeneral"
           >保存</n-button
         >
       </div>
     </GridCard>
-    <!-- 恢复默认配置：需配对密码，core 侧 /api/config/reset 会校验 -->
+    <!-- 恢复默认配置：需配对密码，core 侧 /api/config/reset 会校验。
+         尺寸走 main.css 的 `.modal-fit`（2026-10-14）：只传设计宽，视口约束与内容滚动由那个类统一管，
+         不再各写一份 `width + max-width` —— 抄漏一处就会在窄屏贴死屏幕。 -->
     <n-modal
       v-model:show="resetModalOpen"
       preset="card"
       title="恢复默认配置"
-      style="width: 460px; max-width: calc(100vw - 32px)"
+      class="modal-fit"
+      style="--modal-w: 460px"
       :mask-closable="!resetting"
     >
       <n-space vertical :size="12">
@@ -213,43 +131,22 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, onMounted, onUnmounted } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
-import ToggleRow from '@/components/ToggleRow.vue';
-import { ConfigLimits, Endpoints, describeConfigReject, type ConfigRejectedField } from '@/api/contract';
+import { ConfigLimits } from '@/api/contract';
 import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
-import {
-  isBrowserNotifyEnabled,
-  enableBrowserNotify,
-  disableBrowserNotify,
-} from '@/composables/browserNotify';
 
 const message = useMessage();
 const api = getApiClient();
 
-// ── 通用设置 ──
+// ── 连接与端口 ──
 
 const savingGeneral = ref(false);
 /** 是否已经从 core 读到过配置。false 时表单值只是硬编码初值，禁止编辑与保存。 */
 const generalLoaded = ref(false);
 const generalOriginal = reactive<Record<string, any>>({});
-// ── 浏览器系统通知（本地偏好，非设备配置）──────────────────────────────
-const browserNotifyOn = ref(isBrowserNotifyEnabled());
-const browserNotifyHint = ref('');
-async function toggleBrowserNotify(v: boolean) {
-  if (v) {
-    // 必须在用户手势的同步调用栈里发 requestPermission，所以整个 toggle 由 switch 点击触发
-    const result = await enableBrowserNotify();
-    browserNotifyOn.value = result === '已开启';
-    browserNotifyHint.value = result === '已开启' ? '' : result;
-  } else {
-    disableBrowserNotify();
-    browserNotifyOn.value = false;
-    browserNotifyHint.value = '';
-  }
-}
 
 const generalForm = reactive({
   goformIp: '',
@@ -258,32 +155,22 @@ const generalForm = reactive({
   port: 8080,
   // autoStart 已移除：开机自启由「服务控制」卡片经 /api/service/autostart 单独管理，
   // 留在这里会形成第二份写同一后端字段的表单值。
-  // 这些初值只在「还没读到设备配置」时短暂出现，且此时开关与保存都是禁用的
-  // （见 generalLoaded）。日志总闸与 core 的 DEFAULT_LOG_ENABLED 一致：默认关。
-  logEnabled: false,
-  coreLogEnabled: true,
-  appLogEnabled: true,
-  debugMode: false,
-  // GET /api/device/goform（设备原始 dump）的开关，core 侧默认关，关着时该端点回 403
-  goformDumpEnabled: false,
-  ttydEnabled: false,
-  // 裸 goform 命令通道开关，管 POST /api/device/goform/query 与 POST /api/device/goform/set
-  // （core 侧 rejectIfCommandDisabled，关着时两个端点都回 403）。
-  // 默认 false 与 core 一致，而且必须是 false：set 绕过 profile 的 WriteSpec 值域校验、
-  // 返回值也不脱敏，默认打开等于把「无校验写设备 + 明文回读」长期挂在网上。
-  goformCommandEnabled: false,
-  // 字段归一化总开关，core 侧默认 **true**
-  // （AppSettings.fieldNormalizationEnabled 的 getter：prefs.getBoolean(KEY, true)）。
-  // 默认值必须与 core 一致：这里写 false 会让「还没读到配置」时显示成关闭 —— 假状态。
-  // 关掉它是排障后门（读侧原样透传设备字段），而且**改完要重启后台服务**才生效。
-  fieldNormalizationEnabled: true,
-  // 设备后台封面预热（G6），core 侧默认 false —— 初值必须与 core 一致（见 fieldNormalizationEnabled 注释）
-  thumbPrewarmEnabled: false,
-  // 仅 WiFi 下预热（thumb_prewarm_wifi_only），core 侧默认值待回读覆盖；与 enabled 同批即时保存
-  thumbPrewarmWifiOnly: false,
-  smsCodeEnabled: false,
-  smsCodeCleanupHours: 24,
-  updateSourceMode: 'auto',
+  // 这些初值只在「还没读到设备配置」时短暂出现，且此时保存是禁用的（见 generalLoaded）。
+  //
+  // 2026-10-14：日志四开关（logEnabled / coreLogEnabled / appLogEnabled / debugMode）与排障三开关
+  // （goformDumpEnabled / ttydEnabled / goformCommandEnabled / fieldNormalizationEnabled）
+  // 连同它们的即时保存机制一起移到了 LogsPanel.vue —— 那些键现在由「日志」面板读写，这里不再持有。
+  //
+  // 2026-10-14：封面预热（thumbPrewarmEnabled / thumbPrewarmWifiOnly）的字段与读映射一并删除。
+  // 它们的开关 2026-10-07 就迁到了视频页「封面设置」，视频页自己读写这两个键
+  // （MediaVideoView.saveThumbKey），留在这里的两个表单字段与读映射早已没有消费者，
+  // 而它们引用的 fieldNormalizationEnabled 初值注释这次也搬走了 —— 再留着就是指向空气的注释。
+  //
+  // 2026-10-14 收口：短信验证码（smsCodeEnabled / smsCodeCleanupHours）与更新源
+  // （updateSourceMode）也删了 —— 它们分别搬进短信页的「验证码设置」弹窗与
+  // UpdatePanel 的「更新源」卡。**本栏不再持有任何别的域的键**，
+  // 这正是「同一件事不能有两个入口」那条纪律的落地：留着字段与读映射，
+  // 差量保存就会把另一栏刚写的值用旧快照覆盖回去。
 });
 
 async function loadGeneralConfig() {
@@ -294,21 +181,11 @@ async function loadGeneralConfig() {
       goform_port: 'goformPort',
       goform_password: 'goformPassword',
       port: 'port',
-      log_enabled: 'logEnabled',
-      core_log_enabled: 'coreLogEnabled',
-      app_log_enabled: 'appLogEnabled',
-      debug_mode: 'debugMode',
-      goform_dump_enabled: 'goformDumpEnabled',
-      goform_command_enabled: 'goformCommandEnabled',
-      field_normalization_enabled: 'fieldNormalizationEnabled',
-      thumb_prewarm_enabled: 'thumbPrewarmEnabled',
-      thumb_prewarm_wifi_only: 'thumbPrewarmWifiOnly',
-      // 2026-10-07 修复：ttyd_enabled 此前漏在这张基线表外，generalOriginal 里没有它的键，
-      // probeDescription 一律判成「当前 core 版本不支持此项」并禁用——core 其实支持。
-      ttyd_enabled: 'ttydEnabled',
-      sms_code_enabled: 'smsCodeEnabled',
-      sms_code_cleanup_hours: 'smsCodeCleanupHours',
-      update_source_mode: 'updateSourceMode',
+      // 2026-10-14 搬迁：日志 / 排障 / ttyd / 封面预热的键不在这里读了 —— 前三个（组）
+      // 由 LogsPanel.vue 自己读（开关要显示设备真实状态，就得由持有开关的面板持有基线），
+      // 封面预热由视频页读（见 generalForm 里的说明）。
+      // 2026-10-14 收口：短信验证码与更新源的键同样不在这里读了，各自由
+      // SmsCodeSettingsModal.vue 与 UpdatePanel.vue 持有基线。
     };
     for (const [apiKey, formKey] of Object.entries(mapping)) {
       if (data[apiKey] !== undefined) {
@@ -322,11 +199,12 @@ async function loadGeneralConfig() {
     generalOriginal['goform_password'] = '';
     generalLoaded.value = true;
   } catch {
-    // 2026-09-04：这里原来是 silent catch，表单于是停在硬编码初值上（日志开关全 true）
-    // 却看起来像设备的真实状态 —— 用户在手机端刚关掉的开关，在 web 上显示为开启，
-    // 一点保存就把它又打开了。现在明确标记「未加载」：开关与保存按钮全部禁用。
+    // 2026-09-04：这里原来是 silent catch，表单于是停在硬编码初值上（当时这一栏还带着日志开关，
+    // 它们的初值全是 true）却看起来像设备的真实状态 —— 用户在手机端刚关掉的开关，在 web 上
+    // 显示为开启，一点保存就把它又打开了。现在明确标记「未加载」：开关与保存按钮全部禁用。
+    // （日志开关本身已于 2026-10-14 移到「日志」面板，同一条纪律在 LogsPanel.vue 里继续生效。）
     generalLoaded.value = false;
-    message.warning('设备配置读取失败，通用设置暂不可编辑');
+    message.warning('设备配置读取失败，本栏配置暂不可编辑');
   }
 }
 
@@ -334,259 +212,36 @@ async function loadGeneralConfig() {
  * 表单字段 ↔ core 配置键。提到函数外是因为「有没有未保存改动」的判断也要用它
  * （见 [hasUnsavedChanges]），放在 saveGeneral 里就得抄第二份。
  *
- * **三个排障开关刻意不在这里**（goform_dump_enabled / goform_command_enabled /
- * field_normalization_enabled）：
- * 它们改走即时保存（见 saveProbeSwitch）。留在这张表里会被差量提交再处理一遍 ——
- * 即时保存已经把 generalOriginal 同步成新值，差量比较虽然不会重复 PUT，
- * 但一旦只同步了 form 没同步 original（或反过来）就会双写；而且 hasUnsavedChanges
- * 会把「刚刚已经生效的开关」算成未保存改动，让 onVisible 的回读被永久跳过。
- * 它们的读映射仍保留在 loadGeneralConfig 里：开关必须显示设备真实状态，
- * 且 probeSwitchDisabled 依赖 `apiKey in generalOriginal` 判断基线在不在。
+ * 2026-10-14：四个日志开关与三个排障开关的键随开关一起搬到了 LogsPanel.vue，
+ * 这张表里不再有它们。那边同样把排障三键排除在差量表外 —— 理由（避免与即时保存双写、
+ * 避免 hasUnsavedChanges 把刚生效的开关算成未保存改动）写在 LogsPanel 的同名常量上。
  */
 const GENERAL_FORM_KEYS: Record<string, string> = {
   goformIp: 'goform_ip',
   goformPort: 'goform_port',
   goformPassword: 'goform_password',
   port: 'port',
-  logEnabled: 'log_enabled',
-  coreLogEnabled: 'core_log_enabled',
-  appLogEnabled: 'app_log_enabled',
-  debugMode: 'debug_mode',
-  smsCodeEnabled: 'sms_code_enabled',
-  smsCodeCleanupHours: 'sms_code_cleanup_hours',
-  // 下载方式是 web 唯一会写的更新相关字段。
-  // update_url / update_mirror_base 刻意不在这里：2026-09-22 起它们是 core 的实现细节
-  // （清单地址 + 自定义前缀覆盖），web 只读不写，写了就等于又多出一个决策方。
-  updateSourceMode: 'update_source_mode',
 };
 
 function hasUnsavedChanges(): boolean {
   return Object.keys(buildChangedPayload(GENERAL_FORM_KEYS, generalForm, generalOriginal)).length > 0;
 }
 
-// ── 更新配置：只给下载方式三档，不暴露地址 ──
+// ── 2026-10-14 搬迁：更新源（下载方式 + 设备出口地区）整体移到了「更新」面板 ──
 //
-// 2026-09-22 决策下沉 core（docs/update-source-core-plan.md）：唯一真源是 core 的
-// `update_source_mode`，web 只读写它。`update_url` / `update_mirror_base` 都是实现细节，
-// 做成输入框只会让人填错，而填错要等到去「更新」页点检查更新时才以 502 的形式暴露。
-// 「用不用镜像」「用哪个镜像」「失败怎么降级」全部由 core 的 MirrorResolver 决定。
+// 这里原来放着 UPDATE_MODE_OPTIONS / updateMode / onUpdateModeChange / geoCountry /
+// detectingGeo / geoText / detectGeo（含 2026-09-22 那条「唯一真源是 core 的
+// update_source_mode，web 只读写它，update_url / update_mirror_base 是实现细节」的决策记录）。
+// 搬迁理由：它决定"包从哪来"，与"怎么更新"必须在一起 —— 此前「通用」里有下载方式、
+// 「服务更新」里有 Web 前端与后端 core，同一个域被拆成两处。
+// **要改更新源去 UpdatePanel.vue 的「更新源」卡，别在这里加回来。**
 
-type UpdateMode = 'auto' | 'mirror' | 'direct';
-
-const UPDATE_MODE_OPTIONS = [
-  { label: '自动（按设备出口地区）', value: 'auto' },
-  { label: '镜像加速（中国大陆推荐）', value: 'mirror' },
-  { label: '直连 GitHub', value: 'direct' },
-];
-
-/** 下拉当前值。`auto` 现在是 core 的持久模式，可以正常显示，不再是「瞬时动作」。 */
-const updateMode = computed<UpdateMode>(() => generalForm.updateSourceMode as UpdateMode);
-
-function onUpdateModeChange(mode: UpdateMode) {
-  generalForm.updateSourceMode = mode;
-  // 选了自动但还没测过地区：顺手测一次，让用户立刻看到判定依据。
-  // 测不出来也不改模式 —— core 侧「地区未知」按直连走，且会在检查更新时自己重试。
-  if (mode === 'auto' && !geoCountry.value) detectGeo(true);
-}
-
-// ── 设备出口地区：core 的 GeoDetector 探出网 IP 归属，core 的 auto 判定用的就是它 ──
-
-const geoCountry = ref('');
-const detectingGeo = ref(false);
-
-const geoText = computed(() => {
-  if (!geoCountry.value) return '未检测';
-  return geoCountry.value === 'CN' ? '中国大陆（CN）' : geoCountry.value;
-});
-
-/**
- * 读取/重测出口地区。
- * @param force true = 强制重测（POST detect，三源全挂回 502）；false = 只读 core 的缓存快照
- * @returns 国家码；空串 = 没测出来（**不等于海外**）
- */
-async function detectGeo(force: boolean): Promise<string> {
-  detectingGeo.value = true;
-  try {
-    const { data } = force ? await api.post(Endpoints.geo.detect) : await api.get(Endpoints.geo.root);
-    // country 为空串 = 从未探测成功，此时 source 恒为 unknown
-    geoCountry.value = String(data?.country || '').trim();
-    if (force) {
-      if (geoCountry.value) message.success(`已检测到出口地区：${geoText.value}`);
-      else message.warning('三个地理源都不可达，未能测出地区');
-    }
-    return geoCountry.value;
-  } catch {
-    if (force) message.error('地区检测失败，设备可能不可达');
-    return '';
-  } finally {
-    detectingGeo.value = false;
-  }
-}
-
-// ── 三个排障开关：单键即时保存（生效时机各自不同，见 PROBE_NEEDS_RESTART）──
-
-type ProbeApiKey =
-  | 'goform_dump_enabled'
-  | 'goform_command_enabled'
-  | 'ttyd_enabled'
-  | 'field_normalization_enabled'
-  | 'thumb_prewarm_enabled'
-  | 'thumb_prewarm_wifi_only';
-
-/** 排障开关的 api 键 → 表单字段。回滚与置位都要按键找回表单字段。 */
-const PROBE_FORM_KEY: Record<
-  ProbeApiKey,
-  | 'goformDumpEnabled'
-  | 'goformCommandEnabled'
-  | 'ttydEnabled'
-  | 'fieldNormalizationEnabled'
-  | 'thumbPrewarmEnabled'
-  | 'thumbPrewarmWifiOnly'
-> =
-  {
-    goform_dump_enabled: 'goformDumpEnabled',
-    goform_command_enabled: 'goformCommandEnabled',
-    ttyd_enabled: 'ttydEnabled',
-    field_normalization_enabled: 'fieldNormalizationEnabled',
-    thumb_prewarm_enabled: 'thumbPrewarmEnabled',
-    thumb_prewarm_wifi_only: 'thumbPrewarmWifiOnly',
-  };
-
-/**
- * 改完要不要重启后台服务。
- *
- * 为什么写死在前端：`PUT /api/config` 的 `needs_restart` 只覆盖
- * port / goform_ip / goform_port / goform_password（ConfigRoutes.kt:264），
- * `field_normalization_enabled` **不在**那张清单里，所以靠响应判断不出来。
- *
- * 为什么它确实需要重启：core 只在构造组件图时读一次这个开关
- * （ComponentFactory.resolveDeviceProfile()），之后 profile 被固化进各设备客户端；
- * 前两个键是每次请求现读 prefs，所以是即时的。别把三个键当同一种生效语义。
- */
-const PROBE_NEEDS_RESTART: Record<ProbeApiKey, boolean> = {
-  goform_dump_enabled: false,
-  goform_command_enabled: false,
-  ttyd_enabled: false,
-  field_normalization_enabled: true,
-  thumb_prewarm_enabled: false,
-  thumb_prewarm_wifi_only: false,
-};
-
-/** 各自独立的 loading：三个开关互不相干，共用一个会让点 A 时 B 也转圈且被禁用。 */
-const probeSaving = reactive<Record<ProbeApiKey, boolean>>({
-  goform_dump_enabled: false,
-  goform_command_enabled: false,
-  ttyd_enabled: false,
-  field_normalization_enabled: false,
-  thumb_prewarm_enabled: false,
-  thumb_prewarm_wifi_only: false,
-});
-
-const PROBE_DUMP_DESC =
-  '控制 GET /api/device/goform（设备原始字段 dump，不走 profile 归一化也不脱敏），关着时该端点回 403。' +
-  '改动立即生效，不需要点下方「保存」。';
-// 2026-10-10 随上面的 ttyd 开关 ToggleRow 一并隐藏（整套功能未完工，2026-10 再做）。
-// 同样用 `void` 占位而非删除：TS 严格模式报 TS6133，且保留它能让"恢复 = 放开 ToggleRow
-// 并删掉 void"成为一处改动，描述文案不必重新誊写（改文案的历史很容易丢）。
-const PROBE_TTYD_DESC =
-  '打开后终端页出现「真 PTY」标签页：由设备上的 ttyd 提供 root 环境真实 shell（会话 30 分钟滑动过期）。' +
-  '默认关闭：该功能授予浏览器侧完整的 shell 执行能力，仅在排障时开启。';
-void PROBE_TTYD_DESC;
-
-const PROBE_COMMAND_DESC =
-  '控制 POST /api/device/goform/query 与 POST /api/device/goform/set，关着时两个端点都回 403。' +
-  '危险：set 会绕过 profile 的所有值域校验直接写设备，两个端点的返回值也都不脱敏（真密码、真 IMEI）。' +
-  '改动立即生效，不需要点下方「保存」；只在排障时临时打开，看完立刻关回去。';
-const PROBE_FIELD_NORMALIZATION_DESC =
-  '开=按设备 profile 的登记表把设备字段归一化成统一字段名（默认，正常使用就该开着）；' +
-  '关=读侧原样透传设备原始字段，仅排障用。已实测的副作用：流量限额整块会变成默认值' +
-  '（显示未开启限额、限额为 0），因为限额里有三个字段是 core 从复合串拆出来的派生键，' +
-  '设备上本来不存在；字段覆盖率页也没有登记表可比对。仪表盘 / 网络 / WiFi 与信号数据不受影响。' +
-  '改完需重启后台服务才生效：配置值立刻就能读回来，但 core 只在构造组件图时读一次这个开关，' +
-  '不重启的话归一化行为不会变。';
-
-/**
- * 禁用时把**原因**说出来，而不是只灰着。
- *
- * 为什么必须说：这三个键比其它字段新，最常见的情形就是「设备上的 core 比 web 旧、
- * GET /api/config 里没有这个键」。只灰掉的话用户只会以为界面坏了或权限不够，
- * 于是去翻别的开关；写明「当前 core 版本不支持」他才知道该去升 core。
- * 这也顺带补上了移出 GENERAL_FORM_KEYS 后 findUnbaselinedKeys 不再覆盖这三键的告知职责。
- */
-function probeDescription(apiKey: ProbeApiKey, base: string): string {
-  if (!generalLoaded.value) return `${base}（配置尚未从设备读取，暂不可修改）`;
-  if (!(apiKey in generalOriginal)) return `${base}（当前 core 版本不支持此项，已禁用）`;
-  return base;
-}
-
-/**
- * 三个排障开关走「即时保存」而不是表单式差量提交。
- *
- * 为什么与本卡其它字段不一样：① 全仓页面里的 ToggleRow 都是即时语义
- *    （ControlTab 的 LED/Samba、AlertConfigPanel 全部…），表单式只用在弹窗表单里；
- *    放一个表单式开关在这里，用户拖完不点保存就走 = 假开关（刷新回默认、全程零反馈）。
- * ② 它们是**排障动作**不是配置项：打开的动机就是「现在就要看 dump / 现在就要发裸命令 /
- *    现在就要看设备原始字段名」，用完立刻关回去，不该跟 IP/端口/密码一起攒着提交。
- *
- * 注意「即时保存」≠「即时生效」：`field_normalization_enabled` 的写入是即时的
- * （回读立刻能拿到新值），但归一化行为要重启后台服务才变 —— 成功提示按
- * PROBE_NEEDS_RESTART 分两种文案，不能一律说「立即生效」。
- *
- * 写法照 ControlTab.postToggle：只在**确认生效后**才置位（ToggleRow 是完全受控组件，
- * 父组件不回写它就不动，所以失败路径写回原值即回滚），期间 :loading 挡住重复点。
- * 与 postToggle 的区别是这里不整卡回读 —— loadGeneralConfig 会把用户正在编辑的
- * IP / 端口 / 密码一起冲掉，所以只同步这一个键的 form 与 original。
- */
-async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
-  if (probeSaving[apiKey]) return;
-  const formKey = PROBE_FORM_KEY[apiKey];
-  const previous = generalForm[formKey];
-  probeSaving[apiKey] = true;
-  try {
-    const { data } = await api.put('/api/config', { [apiKey]: value });
-    const updated: string[] = data?.updated_fields || [];
-    if (!updated.includes(apiKey)) {
-      // 没进 updated_fields 就是没生效（老 core 没有 rejected_fields，只能这样推断），
-      // 此时 UI 必须回到原值，否则开关显示的是一个设备并不认的状态。
-      generalForm[formKey] = previous;
-      const rejected: ConfigRejectedField[] = data?.rejected_fields || [];
-      const detail = rejected.find((r) => r.field === apiKey);
-      message.error(detail ? `未生效 —— ${describeConfigReject(detail)}` : `${apiKey} 未生效，设备未接受此项改动`);
-      return;
-    }
-    // form 与 original 两处都要更新：original 不更新的话 hasUnsavedChanges 会一直是 true，
-    // onVisible 的回读被永久跳过（手机端改了也看不到）。
-    generalForm[formKey] = value;
-    generalOriginal[apiKey] = value;
-    const verb = value ? '已开启' : '已关闭';
-    // 需重启的那一项用 warning 而不是 success：说「保存成功」会让用户以为行为已经变了。
-    if (PROBE_NEEDS_RESTART[apiKey]) message.warning(`${verb}，需重启后台服务才会生效`);
-    else message.success(`${verb}，立即生效`);
-  } catch (e: any) {
-    generalForm[formKey] = previous;
-    message.error(e?.response?.data?.error || '保存失败，开关已回滚');
-  } finally {
-    probeSaving[apiKey] = false;
-  }
-}
-
-/**
- * 三个排障开关（`goform_dump_enabled` / `goform_command_enabled` /
- * `field_normalization_enabled`）的禁用判定。
- *
- * 为什么只有它们要多一层判断：它们是最近才加进 core 的键，最容易撞上「设备上的 core 比
- * web 旧、GET /api/config 里根本没这个键」。此时 generalOriginal 缺基线 —— 开关拖得动、
- * PUT 上去也不会进 updated_fields，即典型的假开关。而这几个偏偏是排障入口，
- * 用户正指望靠它们看设备真实状态，显示成可用最误导人，所以直接禁用，
- * 并由 probeDescription 说明禁用原因。
- *
- * 这条判定**不能为了「看起来可用」而放宽**：旧 core 上禁用是正确行为，不是 bug。
- *
- * 其余字段不做这个处理：它们都是老键，且保存时的 findUnbaselinedKeys 提示已经够用。
- */
-function probeSwitchDisabled(apiKey: ProbeApiKey): boolean {
-  return !generalLoaded.value || !(apiKey in generalOriginal);
-}
+// ── 2026-10-14 搬迁：排障开关的即时保存机制整体移到了「日志」面板 ──
+//
+// 这里原来放着 saveProbeSwitch / probeDescription / probeSwitchDisabled / PROBE_FORM_KEY /
+// PROBE_NEEDS_RESTART / probeSaving 与四条说明文案（dump / 裸命令 / 字段归一化 / 隐藏的 ttyd）。
+// 三个排障开关本身搬去了 LogsPanel.vue，机制跟着开关走 —— 留一份在这里就等于有了两个
+// 「谁在写同一个 /api/config 键」的实现，那正是本次搬迁要消除的东西。要改排障开关去 LogsPanel.vue。
 
 async function saveGeneral() {
   if (!generalLoaded.value) {
@@ -607,7 +262,7 @@ async function saveGeneral() {
   savingGeneral.value = true;
   try {
     const { data } = await api.put('/api/config', payload);
-    commitConfigSave(payload, data, generalOriginal, '通用设置', message, loadGeneralConfig);
+    commitConfigSave(payload, data, generalOriginal, '连接与端口', message, loadGeneralConfig);
   } catch (e: any) {
     message.error(e?.response?.data?.error || '保存失败');
   } finally {
@@ -655,9 +310,11 @@ async function submitReset() {
 /**
  * 页面重新可见时重新拉一次配置。
  *
- * 为什么需要：这些开关的唯一真源在 core，而**手机端 App 随时可以改它们**。
- * 原来本面板只在 onMounted 拉一次，于是「用户在手机上关掉日志 → 切回 web 这个标签页」
- * 看到的仍是几十分钟前的快照，表现为「手机端已关闭，web 端却显示开启」。
+ * 为什么需要：这些字段的唯一真源在 core，而**手机端 App 随时可以改它们**。
+ * 原来本面板只在 onMounted 拉一次，于是「用户在手机上改了配置 → 切回 web 这个标签页」
+ * 看到的仍是几十分钟前的快照，表现为「手机端已改、web 端还显示旧值」。
+ * （日志开关 2026-10-14 搬去「日志」面板时把同一段逻辑带了过去，见 LogsPanel.onVisible ——
+ * 那边不能没有它，否则同一个毛病会以「日志面板显示旧快照」的形式复发。）
  *
  * 有未保存改动时跳过：否则用户填了一半的表单会被后台状态冲掉。
  */
@@ -669,8 +326,6 @@ function onVisible() {
 
 onMounted(() => {
   loadGeneralConfig();
-  // 只读缓存快照，不强制出网重测：进设置页不该为了显示一行地区去打三个地理源
-  detectGeo(false);
   document.addEventListener('visibilitychange', onVisible);
 });
 

@@ -88,7 +88,7 @@
         <n-button :disabled="!canGoLeft || finishLoading" @click="onLeft">{{ leftText }}</n-button>
         <n-button
           type="primary"
-          style="flex: 1"
+          class="wiz-next"
           :disabled="blockReason !== null"
           :loading="isLast && finishLoading"
           @click="onRight"
@@ -410,15 +410,25 @@ function onStepClick(target: number) {
   display: flex;
   gap: var(--space-2);
 }
+/* 主按钮吃掉剩余宽度（原来是行内 `style="flex: 1"`） */
+.wiz-next {
+  flex: 1;
+}
 
-/* 窄屏：步骤条标签在 360px 下 5 列会挤成一两个字，允许它降到极小字号再省略。
-   不改圆点尺寸 —— 那是点击目标，缩了更难点。 */
+/* 窄屏：步骤条标签在 360px 下 5 列会挤成一两个字。
+   原先这里把字号压到 10px（比 --font-xs 还小、且不属于字号阶梯），结果仍然只剩 1~2 字 ——
+   字号再小只会更难读。改成**允许折行**：每个标签占两行、每行两个字，信息不丢，
+   也不用隐藏非当前步（藏掉会让用户以为向导只有一步）。
+   圆点尺寸不动 —— 那是点击目标，缩了更难点。 */
 @media (max-width: 768px) {
   .wiz-steps {
     gap: 0;
   }
   .wiz-label {
-    font-size: 10px;
+    font-size: var(--font-xs);
+    white-space: normal;
+    line-height: 1.25;
+    word-break: break-all;
   }
 }
 </style>

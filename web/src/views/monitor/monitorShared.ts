@@ -30,6 +30,18 @@ export interface MonitorPrefs {
   alertScanSec: number;
   trafficLimitCheckSec: number;
   deviceEventCheckSec: number;
+  /**
+   * 智能采集节拍（SmartLoop，2026-10-14 接线）。
+   *
+   * core 侧真源是 AppSettings 的 `smart_loop_*` 原始键（`SmartLoopTuning`），
+   * DataScheduler 的 goform-traffic / battery 两条循环每轮现读 —— 改完下一轮生效。
+   * 三个阈值单位都是 **bytes/s**（不是 bit/s、也不是 KB/s），与 core 的常量同口径。
+   * `smartLoopEnabled` 是故障回退开关而不是调优项，所以它在 UI 上排在这一组第一位。
+   */
+  smartLoopEnabled: boolean;
+  smartLoopIdleBps: number;
+  smartLoopActiveBps: number;
+  smartLoopHeavyBps: number;
 }
 
 /** GET /api/monitor/storage 的响应形状 */
@@ -62,6 +74,13 @@ export const DEFAULT_PREFS: MonitorPrefs = {
   alertScanSec: 15,
   trafficLimitCheckSec: 300,
   deviceEventCheckSec: 60,
+  // 智能节拍：与 core `SmartLoopTuning.defaults()` 逐字一致
+  //（= SmartLoop 伴生对象的 IDLE/ACTIVE/HEAVY 三个常量 + enabled=true）。
+  // 抄错一个数就意味着"升级后设备行为变了"，所以这里刻意写成常量表达式而不是字面量。
+  smartLoopEnabled: true,
+  smartLoopIdleBps: 16 * 1024,
+  smartLoopActiveBps: 1 * 1024 * 1024,
+  smartLoopHeavyBps: 20 * 1024 * 1024,
 };
 
 export const TIME_RANGES = [
@@ -72,6 +91,51 @@ export const TIME_RANGES = [
 ];
 
 export const REFRESH_CHOICES = [10, 30, 60, 300];
+
+/**
+ * 智能节拍三个阈值的可选档位（bytes/s），按量级**分带**：
+ * idle 全部 < 1MB ≤ active 全部 < 20MB ≤ heavy 全部。
+ *
+ * 分带而不是三份相同的档位表，是为了让"随手点一个"都不会违反 idle < active < heavy ——
+ * core 的 PUT 对序关系是硬校验（反序直接 400），可选值本身反序时用户根本没有合法组合可点。
+ */
+export const SMART_LOOP_IDLE_CHOICES = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
+export const SMART_LOOP_ACTIVE_CHOICES = [1 * 1024 * 1024, 4 * 1024 * 1024, 10 * 1024 * 1024];
+export const SMART_LOOP_HEAVY_CHOICES = [20 * 1024 * 1024, 50 * 1024 * 1024, 100 * 1024 * 1024];
+
+/** 智能节拍的三个阈值键（与 core `MonitorPreferences` 同名字段一一对应） */
+export type SmartLoopThresholdKey = 'smartLoopIdleBps' | 'smartLoopActiveBps' | 'smartLoopHeavyBps';
+
+/**
+ * 某个阈值当前可选的档位：本带档位里再滤掉会破坏 idle < active < heavy 的那些。
+ *
+ * core 的 PUT 对序关系是硬校验，"点了却报错、值又弹回去"正是本仓明令避免的假设置交互
+ *（app 侧 `withThermalOrder` 的 KDoc 写了同一个坑），所以直接在**选项层面**堵掉，
+ * 而不是等用户点完再纠正他。一次只改一个键，因此只需拿另外两个**现值**做过滤。
+ *
+ * 当前值永远保留在列表里：它可能是设备上已有的非档位值（直接 PUT 或旧版本留下的），
+ * 剔掉的话下拉框就显示不出这个值了。
+ */
+export function smartLoopThresholdOptions(
+  key: SmartLoopThresholdKey,
+  prefs: MonitorPrefs
+): { label: string; value: number }[] {
+  const band =
+    key === 'smartLoopIdleBps'
+      ? SMART_LOOP_IDLE_CHOICES
+      : key === 'smartLoopActiveBps'
+        ? SMART_LOOP_ACTIVE_CHOICES
+        : SMART_LOOP_HEAVY_CHOICES;
+  const allowed = band.filter((v) => {
+    if (key === 'smartLoopIdleBps') return v < prefs.smartLoopActiveBps;
+    if (key === 'smartLoopActiveBps') return v > prefs.smartLoopIdleBps && v < prefs.smartLoopHeavyBps;
+    return v > prefs.smartLoopActiveBps;
+  });
+  const current = prefs[key];
+  if (!allowed.includes(current)) allowed.push(current);
+  // 档位表本身是升序的，只有"补进来的当前值"可能乱序，所以统一排一次
+  return allowed.sort((a, b) => a - b).map((v) => ({ label: formatSpeedValue(v), value: v }));
+}
 
 export const METRIC_CHOICES = [
   { key: 'cpu', label: 'CPU' },

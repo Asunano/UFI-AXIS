@@ -301,21 +301,13 @@ onMounted(async () => {
 
 <style scoped>
 /* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，各面板共用一份） */
-.row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 0;
-}
-.field-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-}
+
+/* ── 字段类 ──
+   `.row-hint` / `.field` / `.field-label` 已上收到 src/styles/main.css（计划 §8.2 C2）：
+   本文件原来那三份副本与全局取值逐字相同（含 .field 的 `padding: 10px 0`），故整体删除。
+   要改字段间距请改 main.css 那一份，别在这里单独调。
+   另外 `renderCityLabel` 的 inline 样式**刻意保留**：下拉面板被 naive teleport 到 body，
+   本组件的 scoped 选择器到不了那棵子树（详见脚本里那段注释）。 */
 .preview-line {
   margin: 2px 0;
   font-size: 13px;

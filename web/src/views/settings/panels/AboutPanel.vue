@@ -8,6 +8,11 @@
       当前配对（DOM 顺序即栅格顺序，行优先）：
         行 1 = 版本与来源(5 行) ｜ 运行与存储(4 行 + 进度条)
         行 2 = 电池(5 行)        ｜ 诊断信息(5 行)
+        行 3 = 诊断中心入口      ｜ 赞赏入口
+        行 4 = 赞助与感谢入口    ｜ （空）
+      （这三颗是 2026-10-14 的单行入口卡：min-height 相同 ⇒ 天然等高，
+        不违反下面这条约束。**加一颗就要补一颗**，理由见那几颗卡片上方的注释；
+        2026-10-14 晚些时候「赞赏码」从赞助页里拆了出来，所以这里由两颗变三颗。）
       增删行之前先按这个约束重算，不要让单张卡独自变长。
     -->
     <!-- Card 1: 版本与来源 —— 原「版本信息」+「开源信息」合并。
@@ -118,18 +123,55 @@
       <InfoRow label="网关" :value="diag.gateway || '--'" />
     </GridCard>
 
+    <!--
+      入口行（2026-10-14 新增）：诊断中心 ｜ 赞赏 ｜ 赞助与感谢。
+      三颗都是**直接跳页**（各自是完整页面：诊断有出网工具、原始输出与文件导出；赞赏页是两张
+      能扫的码；赞助页是会长的名单），不是弹窗 —— 行为相同才放同一行，与设置页「更多功能」
+      那三颗瓦片同一条规矩。
+
+      ★ 为什么「赞赏」与「赞助与感谢」是两颗而不是一颗：2026-10-14 把这两个主题拆成了两个页面
+      （`/donate` 与 `/sponsors`）。码要够大才扫得出来（并排两张各需 200px 以上），
+      名单的条数由赞助人数决定、会一直长 —— 挤在同一张卡里窄屏只能二选一，
+      用户的原话就是「防止内容挤压」。
+
+      ★ 排版（改这一页前先读文件头那条约束）：`.settings-panel` 是固定 2 列栅格、
+      同一行等高（main.css 的 align-items:start），所以**同一行两张卡的高度差必须 ≤ 1 行**。
+      这三颗都是"单行入口"（min-height 72px），天然等高；DOM 顺序是行优先，于是
+      行 3 = 诊断中心 ｜ 赞赏、行 4 = 赞助与感谢 ｜ 空。**不要只加一颗**：那样它会与第 2 行的
+      「电池」配对，两张卡的高度差会在下方拉出一道整块页面底色 —— 本文件头记的那个 263px
+      空洞就是这么来的。（落单的那颗自己占一格，不会拉出空洞。）
+
+      为什么不塞进上面「诊断信息」那张卡：那张卡是 5 行的只读信息卡，加一颗入口会把它顶高
+      一整行（按钮行 ≈45px > 1 行 38px），同样破坏等高约束；而且"看四个字段"与"去另一个页面"
+      本来就是两件事。
+
+      为什么诊断中心是独立路由而不是这里的一个弹窗：本面板本身已经是设置页里的弹窗
+      （`SettingsView` 的 `n-modal`），再嵌一层会让内容区没有可用高度，而诊断要展示
+      几十行的原始输出、还要能导出文件。
+    -->
+    <EntryTile
+      :icon="MedkitOutline"
+      title="诊断中心"
+      desc="设备环境、服务快照与 ping / DNS / TCP / traceroute，可导出诊断包"
+      @click="router.push({ name: 'diagnostics' })"
+    />
+    <EntryTile
+      :icon="QrCodeOutline"
+      title="赞赏"
+      desc="支付宝 / 微信赞赏码，可使用对应应用扫码"
+      @click="router.push({ name: 'donate' })"
+    />
+    <EntryTile :icon="HeartOutline" title="赞助与感谢" desc="赞助者名单" @click="router.push({ name: 'sponsors' })" />
+
     <!-- 字段覆盖率（GET /api/diagnose?fields=1）——「设备适配改造」的验收工具，计划书 §14.3。
          改造前后各抓一份逐字比对，是「行为没变」的直接证据。以前 web 上没有入口，
          抓基线得手调 API —— 麻烦到这一步就会被跳过，所以这里补一个按钮。
          分组视图与原始 JSON 两份都给：视图用来当场看 missing，
          「复制 JSON」给的是 core 原文，只有原文能贴进文档逐字 diff（渲染后的文字 diff 不出东西）。
-         n-modal 会传送到 body，不参与本页 2 列栅格，所以不影响上面那条等高约束。 -->
-    <n-modal
-      v-model:show="coverageOpen"
-      preset="card"
-      title="字段覆盖率"
-      style="width: 720px; max-width: calc(100vw - 32px)"
-    >
+         n-modal 会传送到 body，不参与本页 2 列栅格，所以不影响上面那条等高约束。
+         尺寸走 `.modal-fit`（2026-10-14）：这个弹窗里有一个 10 行高的只读 JSON 框 + 逐分组清单，
+         改前只给了宽度，卡片高度随内容长，在手机上会整块滚出屏幕（标题与「复制 JSON」被顶走）。 -->
+    <n-modal v-model:show="coverageOpen" preset="card" title="字段覆盖率" class="modal-fit" style="--modal-w: 720px">
       <!-- 这个 ref 不是为了取值，是给 copyToClipboard 当挂载容器用：
            n-modal 默认 trap-focus，插在 document.body 上的临时 textarea 会被焦点陷阱判为「外面」
            并被立刻夺走焦点，execCommand('copy') 于是抄到空（详见 utils.copyToClipboard 的注释）。
@@ -141,7 +183,7 @@
         <n-button size="small" :disabled="!coverageJson" @click="copyCoverageJson">复制 JSON</n-button>
         <!-- 这句不是客套话：core 会逐个 FieldGroup 向设备发一次查询（最多 10 组），
              设备只有 256MB 内存，这个按钮不能当刷新用。 -->
-        <span class="cov-bar-note">会真向设备发查询（逐分组，最多 10 组），只在需要抓基线时点。</span>
+        <span class="cov-bar-note">将向设备发起查询（逐分组，最多 10 组），仅在需要采集基线数据时使用。</span>
       </div>
 
       <!-- 加载态用文字而不是 n-spin 遮罩：首次抓取时下面还没有内容可覆盖，遮罩会塌成一条线 -->
@@ -209,15 +251,24 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue';
 import { useMessage } from 'naive-ui';
+import { useRouter } from 'vue-router';
+import { HeartOutline, MedkitOutline, QrCodeOutline } from '@vicons/ionicons5';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
+import EntryTile from '@/components/EntryTile.vue';
 import { copyToClipboard, formatBytes } from '@/composables/utils';
 import { formatUptime } from '@/views/settings/settingsShared';
 import { Endpoints } from '@/api/contract';
 
 const api = getApiClient();
 const message = useMessage();
+/**
+ * 三颗入口行卡（诊断中心 / 赞赏 / 赞助与感谢）用 `router.push` 跳页，而不是把页面塞进弹窗。
+ * 理由见模板里那两段注释；这里只记一句：本面板自己就在一个 `n-modal` 里，
+ * 再嵌一层会让"会出网、有原始输出、能导出文件"的界面没有可用高度。
+ */
+const router = useRouter();
 
 // ── 开源信息（单一真源在仓库里，这里只做跳转）──
 const REPO_URL = 'https://github.com/Asunano/UFI-AXIS';
@@ -552,6 +603,14 @@ onMounted(() => {
 
 <style scoped>
 /* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
+
+/* ── 入口行卡（诊断中心 / 赞赏 / 赞助与感谢）──
+   瓦片本体（`.entry-tile` / `.entry-icon` / `.entry-text` / `.entry-title` / `.entry-desc`）
+   已收敛到 `src/components/EntryTile.vue`（计划 §8.1，2026-10-21）。原先这五条在
+   `SettingsView` / `network/{NetworkSettingsCard,MoreSettingsCard}` /
+   `settings/panels/{Device,About}Panel` 里各有一份（scoped 样式不外泄，只能照抄），
+   现在本文件不再写瓦片样式：三颗入口就是三个 `EntryTile`，
+   描边/内距/圆角/底色仍走 main.css 的全局 `.sub-panel`（由组件内部套用）。 */
 
 /* ── 更新地址行 ──
    InfoRow 默认给值限了 65% 宽并省略号（InfoRow.vue 的 .info-value），对短值是对的，

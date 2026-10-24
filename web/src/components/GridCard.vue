@@ -147,7 +147,14 @@ defineSlots<{
 }
 
 /* ── 主体：density 控制内边距 ──
-   compact: 8/12/12 ; default: 12/16/16 ; spacious: 16/20/20 */
+   compact: 8/12/12 ; default: 12/16/16 ; spacious: 16/20/20
+   三档就是 main.css 间距阶梯（--space-1..6 = 4/8/12/16/20/24px）上的读数，
+   逐一对应「上 / 右 / 下」：
+     compact  → --space-2 / --space-3 / --space-3
+     default  → --space-3 / --space-4 / --space-4
+     spacious → --space-4 / --space-5 / --space-5
+   保留字面量而不写成 var(--space-*)：density 是**表格化的三档**，读代码时要能一眼比出
+   「这三档差在哪」；换成变量名反而看不出档位关系，也不新增档位。 */
 .grid-card-body {
   padding: 12px 16px 16px;
 }

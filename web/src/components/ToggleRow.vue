@@ -46,6 +46,13 @@ defineSlots<{ control?(): any }>();
 .toggle-row:first-child {
   padding-top: 0;
 }
+/* ↑ 上面两条「首行去上内距 / 末行去底边框」只在**一列堆叠**的整行设置项里成立。
+   两列栅格里它们会错位（例如设备页 `.ctl-grid`）：第 1 行右格多出 12px 上内距，
+   最后一格丢了底边框而邻居还留着。那种版式请由栅格容器自己控制边框与间距 ——
+   父组件的 scoped 选择器作用不到子组件内部，但**子组件根元素会带上父组件的 scope 标记**，
+   所以父组件写 `.ctl-grid :deep(.toggle-row)` 能命中；它和上面两条同为 (0,3,0)，
+   胜负有赖样式顺序，稳妥写法是把类名叠一次提高特异性：
+     .ctl-grid :deep(.toggle-row.toggle-row) { padding: 0; border-bottom: none; } */
 .toggle-info {
   display: flex;
   flex-direction: column;

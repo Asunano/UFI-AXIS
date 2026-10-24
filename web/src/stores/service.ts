@@ -70,6 +70,8 @@ export const useServiceStore = defineStore('service', () => {
     try {
       await getApiClient().post(Endpoints.service.autostart, { enabled: value });
       autoStartOnBoot.value = value;
+      // 成功后必须清掉上一次操作的错误：聚合页的"常用开关"直接读这个字段决定要不要弹错误。
+      errorMessage.value = '';
     } catch (e) {
       errorMessage.value = toApiErrorMessage(e, '设置失败');
       await refresh();

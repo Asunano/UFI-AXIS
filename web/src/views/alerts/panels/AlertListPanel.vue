@@ -8,20 +8,24 @@
         </n-tag>
       </template>
 
-      <div class="summary-row">
-        <div class="stat-tile sub-panel stat-critical">
+      <!--
+        概览四格：容器用全局 `.stat-grid`（标签在上/值在下的信息格），
+        这里只覆盖列数为固定 4 列；768 档全局那套 auto-fit 会折成 3+1，所以保留本地折 2×2。
+      -->
+      <div class="summary-row stat-grid">
+        <div class="stat-cell sub-panel stat-critical">
           <span class="stat-num">{{ levelCounts.critical }}</span>
           <span class="stat-label">严重</span>
         </div>
-        <div class="stat-tile sub-panel stat-warning">
+        <div class="stat-cell sub-panel stat-warning">
           <span class="stat-num">{{ levelCounts.warning }}</span>
           <span class="stat-label">警告</span>
         </div>
-        <div class="stat-tile sub-panel stat-info">
+        <div class="stat-cell sub-panel stat-info">
           <span class="stat-num">{{ levelCounts.info }}</span>
           <span class="stat-label">提示</span>
         </div>
-        <div class="stat-tile sub-panel stat-unread">
+        <div class="stat-cell sub-panel stat-unread">
           <span class="stat-num">{{ unreadTotal }}</span>
           <span class="stat-label">未确认</span>
         </div>
@@ -42,13 +46,7 @@
         </n-space>
         <n-space size="small">
           <n-button size="tiny" quaternary :loading="alertsLoading" @click="loadAlerts()"> 刷新 </n-button>
-          <n-button
-            size="tiny"
-            type="warning"
-            :disabled="unreadTotal === 0 && unacknowledgedCount === 0"
-            :loading="ackAllLoading"
-            @click="ackAll"
-          >
+          <n-button size="tiny" type="warning" :disabled="unreadTotal === 0" :loading="ackAllLoading" @click="ackAll">
             全部确认
           </n-button>
           <!--
@@ -79,7 +77,12 @@
 
       <n-spin :show="alertsLoading && alerts.length === 0">
         <div v-if="filteredAlerts.length === 0" class="empty-state">
-          <n-empty description="暂无告警" />
+          <!-- 读取失败不能显示成「暂无告警」：那会让用户以为设备一切正常 -->
+          <n-empty :description="alertsFailed ? '告警列表读取失败' : '暂无告警'">
+            <template #extra>
+              <n-button v-if="alertsFailed" size="small" @click="loadAlerts()">重试</n-button>
+            </template>
+          </n-empty>
         </div>
         <div v-else class="alert-list">
           <div v-for="alert in filteredAlerts" :key="alert.id" class="alert-item">
@@ -99,9 +102,9 @@
                 <n-tag v-if="alert.resolvedAt" type="success" size="tiny" :bordered="false"> 已恢复 </n-tag>
                 <span class="alert-time">{{ relativeTime(alert.timestamp) }}</span>
               </div>
-              <div class="alert-message">{{ alert.message }}</div>
+              <div class="alert-message">{{ plainMessage(alert.message) }}</div>
               <div v-if="hasDetail(alert)" class="alert-detail">
-                当前: {{ alert.value || '--' }} / 阈值: {{ alert.threshold || '--' }}
+                当前: {{ detailText(alert.value) }} / 阈值: {{ detailText(alert.threshold) }}
               </div>
               <div v-if="(alert.count ?? 1) > 1 && alert.firstSeenAt" class="alert-detail">
                 首次出现: {{ relativeTime(alert.firstSeenAt) }}
@@ -163,6 +166,8 @@ const api = useCancellableApi();
 // ── 告警列表 ──
 const alerts = ref<any[]>([]);
 const alertsLoading = ref(false);
+/** 列表读取失败：空态文案要区分「没有告警」与「没读到」（计划 §3 家规 6） */
+const alertsFailed = ref(false);
 const filterTab = ref<'all' | 'unacknowledged'>('all');
 const ackLoadingId = ref<number | null>(null);
 const ackAllLoading = ref(false);
@@ -186,8 +191,10 @@ const loadingMore = ref(false);
 const paginated = ref(false);
 
 // ── 计算属性 ──
-const unacknowledgedCount = computed(() => alerts.value.filter((a) => !a.acknowledged).length);
-
+// 2026-10-21（计划 §6.10 B9-5）：原先「未读」有两套口径并存 ——
+// `unreadTotal`（core 的 counts.unread，全库真值）与 `unacknowledgedCount`
+// （只数当前这一页已加载的 ≤50 条）。同一屏上两个数字必然对不上。
+// 统一到 unreadTotal：标题标签、概览未确认格、批量确认按钮的 disabled 都用它。
 const filteredAlerts = computed(() => {
   if (filterTab.value === 'unacknowledged') {
     return alerts.value.filter((a) => !a.acknowledged);
@@ -243,6 +250,28 @@ function hasDetail(alert: any): boolean {
   return !!String(alert?.value ?? '').trim() || !!String(alert?.threshold ?? '').trim();
 }
 
+/**
+ * 明细值的统一口径：`0` / `false` 是合法读数（`|| '--'` 会把 0 当空），
+ * 只有 null / undefined / 空白串才显示 `--`。
+ */
+function detailText(v: unknown): string {
+  if (v == null) return '--';
+  const s = String(v).trim();
+  return s === '' ? '--' : s;
+}
+
+/**
+ * core 的 `AlertRecord.message` 可能带 Markdown 强调标记（`**温度过高**`），
+ * 模板里是纯文本插值，星号会原样上屏。这里只剥强调与行内代码标记，
+ * 不引入 Markdown 渲染（告警文案由 core 生成，前端不做二次排版）。
+ */
+function plainMessage(msg: unknown): string {
+  return String(msg ?? '')
+    .replace(/\*\*/g, '')
+    .replace(/[*`]/g, '')
+    .trim();
+}
+
 // ── 数据加载 ──
 async function loadAlerts(more = false) {
   if (more) {
@@ -258,11 +287,16 @@ async function loadAlerts(more = false) {
     const list: any[] = data.alerts || [];
     alerts.value = more ? [...alerts.value, ...list] : list;
     totalCount.value = data.total ?? alerts.value.length;
-    unreadTotal.value = data.counts?.unread ?? unacknowledgedCount.value;
+    // core 没回 counts 时退回「当前已加载列表里未确认的条数」，但仍写进同一个 unreadTotal，
+    // 不在组件里保留第二套计数口径
+    unreadTotal.value = data.counts?.unread ?? alerts.value.filter((a) => !a.acknowledged).length;
     nextCursor.value = data.nextCursor ?? null;
     hasMore.value = !!data.hasMore && !!data.nextCursor;
     paginated.value = more;
+    alertsFailed.value = false;
   } catch {
+    // 「加载更多」失败不动已有列表，只提示；首屏失败则把空态换成失败态
+    if (!more) alertsFailed.value = true;
     if (!more) message.error('加载告警列表失败');
     else message.error('加载更多失败');
   } finally {
@@ -370,29 +404,21 @@ onUnmounted(() => unsubAlert());
   gap: 16px;
 }
 
-/* 概览条：4 个统计块，按级别着色，给一眼可见的态势 */
+/* 概览条：4 个统计块，按级别着色，给一眼可见的态势。
+   容器用的是全局 `.stat-grid`（信息格：标签在上、值在下），这里只把列数钉成 4 列 ——
+   全局那份是 auto-fit minmax(120px, 1fr)，宽卡上会摊成 5 列以上。 */
 .summary-row {
-  display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
-/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel */
-.stat-tile {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 2px;
-}
+/* 描边/内距/圆角/底色走 main.css 的全局 .sub-panel；
+   标签用全局 .stat-label（12px + --text-muted），本地同名副本已删（计划 §6.10 B9-5）。 */
 .stat-num {
   font-size: 22px;
   font-weight: 700;
   line-height: 1.1;
   font-variant-numeric: tabular-nums;
-}
-.stat-label {
-  font-size: 12px;
-  color: var(--text-muted);
 }
 .stat-critical .stat-num {
   color: var(--error);

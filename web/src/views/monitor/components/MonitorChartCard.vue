@@ -4,6 +4,14 @@
       <ValueBadge v-if="badge != null" :value="badge" :unit="unit" :color="color" size="sm" />
     </template>
     <n-spin :show="loading">
+      <!--
+        失败条：历史接口失败时不能只留一张空图 —— 那与「这段时间没有数据」长得一样。
+        曲线保留上一次的结果（父组件不清空），这里明说「可能不是最新的」并给重试。
+      -->
+      <div v-if="failed" class="chart-failed">
+        <span class="chart-failed-text">数据读取失败，曲线可能不是最新的</span>
+        <n-button size="tiny" quaternary type="primary" @click="emit('retry')">重试</n-button>
+      </div>
       <div class="chart-container">
         <v-chart :option="option" autoresize />
       </div>
@@ -37,14 +45,35 @@ defineProps<{
   title: string;
   option: Record<string, any>;
   loading: boolean;
+  /** 本指标的历史取数失败（与「没有数据」区分，见计划 §6.10 B9-1） */
+  failed?: boolean;
   /** 已格式化好的当前值；null / undefined = 无数据，不显示徽标 */
   badge?: string | null;
   unit?: string;
   color?: string;
 }>();
+
+const emit = defineEmits<{ (e: 'retry'): void }>();
 </script>
 
 <style scoped>
+.chart-failed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--error-light);
+}
+
+.chart-failed-text {
+  font-size: var(--font-sm);
+  color: var(--error);
+}
+
 .chart-container {
   height: 280px;
   width: 100%;

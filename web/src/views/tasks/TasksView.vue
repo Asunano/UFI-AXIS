@@ -20,13 +20,24 @@
           <PresetChips @apply="applyPreset" />
 
           <n-spin :show="loading">
-            <n-empty v-if="tasks.length === 0 && !loading" description="暂无定时任务" class="empty-state">
+            <!-- 失败不再静默成「暂无定时任务」：那是「没有任务」，与「没读到」是两件事。
+                 有旧数据时保留旧列表（可能过期），但在列表上方横一条可重试的失败提示。 -->
+            <div v-if="tasksError" class="load-error" role="alert">
+              <span class="load-error-text">{{ tasksError }}</span>
+              <n-button size="tiny" :loading="loading" @click="loadTasks">重试</n-button>
+            </div>
+
+            <n-empty
+              v-if="tasks.length === 0 && !loading && !tasksError"
+              description="暂无定时任务"
+              class="empty-state"
+            >
               <template #extra>
                 <n-button size="small" type="primary" @click="openCreate">创建第一个任务</n-button>
               </template>
             </n-empty>
 
-            <div v-else class="task-list">
+            <div v-if="tasks.length" class="task-list">
               <TaskCard
                 v-for="task in tasks"
                 :key="task.id"
@@ -49,13 +60,22 @@
           <RuleTemplateChips @apply="applyRuleTemplate" />
 
           <n-spin :show="rulesLoading">
-            <n-empty v-if="rules.length === 0 && !rulesLoading" description="暂无自动化规则" class="empty-state">
+            <div v-if="rulesError" class="load-error" role="alert">
+              <span class="load-error-text">{{ rulesError }}</span>
+              <n-button size="tiny" :loading="rulesLoading" @click="loadRules">重试</n-button>
+            </div>
+
+            <n-empty
+              v-if="rules.length === 0 && !rulesLoading && !rulesError"
+              description="暂无自动化规则"
+              class="empty-state"
+            >
               <template #extra>
                 <n-button size="small" type="primary" @click="openCreate">创建第一条规则</n-button>
               </template>
             </n-empty>
 
-            <div v-else class="task-list">
+            <div v-if="rules.length" class="task-list">
               <RuleCard
                 v-for="rule in rules"
                 :key="rule.id"
@@ -115,6 +135,7 @@ import {
   actionLabel,
   actionOptions,
   bearerOptions,
+  errText,
   normalizeRule,
   normalizeTask,
   triggerLabel,
@@ -135,8 +156,11 @@ const wsStore = useWebSocketStore();
 const activeTab = ref<'scheduled' | 'rules'>('scheduled');
 const loading = ref(false);
 const tasks = ref<Task[]>([]);
+/** 读取失败的原因（空串 = 这一次读成功）。与「列表为空」是两件事，见模板里的三态 */
+const tasksError = ref('');
 const rulesLoading = ref(false);
 const rules = ref<Rule[]>([]);
+const rulesError = ref('');
 const showFormModal = ref(false);
 const showLogModal = ref(false);
 const currentList = computed(() => (activeTab.value === 'scheduled' ? tasks.value : rules.value));
@@ -152,13 +176,16 @@ const logId = ref('');
 const logTitle = ref('');
 
 // ── 数据加载 ──
+// 失败必须留痕：旧实现两处 catch 都是「静默」，于是接口挂了页面显示「暂无定时任务」——
+// 用户会去新建一条本来已经存在的任务。这里记下来在列表上方给「重试」。
 async function loadTasks() {
   loading.value = true;
   try {
     const { data } = await api.get('/api/tasks');
     tasks.value = (data.tasks || []).map(normalizeTask);
-  } catch {
-    /* 静默 */
+    tasksError.value = '';
+  } catch (e: any) {
+    tasksError.value = errText(e, '定时任务读取失败');
   } finally {
     loading.value = false;
   }
@@ -169,8 +196,9 @@ async function loadRules() {
   try {
     const { data } = await api.get('/api/rules');
     rules.value = (data.rules || []).map(normalizeRule);
-  } catch {
-    /* 静默 */
+    rulesError.value = '';
+  } catch (e: any) {
+    rulesError.value = errText(e, '自动化规则读取失败');
   } finally {
     rulesLoading.value = false;
   }
@@ -365,6 +393,23 @@ onUnmounted(() => unsubTasks());
 }
 .empty-state {
   padding: 32px 0;
+}
+/* 读取失败条：与列表同宽横一条，列表本身保留（旧数据可能是过期的，但比"空"诚实） */
+.load-error {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--error-light);
+  color: var(--error);
+  font-size: var(--font-sm);
+}
+.load-error-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
 }
 .task-list {
   display: flex;

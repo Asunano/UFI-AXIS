@@ -6,6 +6,12 @@
         <div class="hero-text">
           <div class="hero-title">告警监控</div>
           <div class="hero-desc">监控设备温度、电量、信号与流量，异常时按下方渠道通知你</div>
+          <!--
+            保存时机必须写在页面上（计划 §6.10 B9-6）：总闸与阈值改的是本地副本，
+            要点「保存配置」才下发；而「告警分类」「通知渠道」的开关是即时 PUT 的。
+            两套时机并存不加说明，用户会以为总闸也是即时生效的（或反之）。
+          -->
+          <div class="hero-hint">总闸与阈值需点「保存配置」生效；分类与通知渠道的开关切换即保存</div>
         </div>
         <div class="hero-switch">
           <n-switch v-model:value="config.enabled" size="large" :rubber-band="false" />
@@ -113,6 +119,16 @@
 
     <!-- 通知设置分组（core: /api/notifications/config，与 app 共享同一份真源） -->
     <GridCard title="通知渠道" :loading="notifyLoading">
+      <!--
+        回读失败时不能静默用本地默认值顶上去：那会让这一屏的开关与设备真值相反（假开关，
+        计划 §6.10 B9-6）。失败时明示 + 禁用所有开关，把「保存」这个动作也一起挡住。
+      -->
+      <n-alert v-if="notifyFailed" type="error" :bordered="false" class="notify-alert">
+        <div class="notify-alert-row">
+          <span>通知设置读取失败，当前显示的是本地默认值，暂不能在此修改。</span>
+          <n-button size="tiny" type="primary" @click="loadNotifyConfig()">重试</n-button>
+        </div>
+      </n-alert>
       <section class="cfg-section">
         <header class="cfg-section-head">
           <span class="cfg-section-title">全局与渠道</span>
@@ -125,6 +141,7 @@
             :label="item.label"
             :description="item.hint"
             :model-value="notifyConfig[item.field] as boolean"
+            :disabled="notifyFailed"
             @update:model-value="(v: boolean) => saveNotify({ [item.field]: v })"
           />
         </div>
@@ -141,6 +158,7 @@
             :label="item.label"
             :description="item.hint"
             :model-value="notifyConfig[item.field] as boolean"
+            :disabled="notifyFailed"
             @update:model-value="(v: boolean) => saveNotify({ [item.field]: v })"
           />
         </div>
@@ -158,6 +176,7 @@
             :label="item.label"
             :description="item.hint"
             :model-value="notifyConfig[item.field] as boolean"
+            :disabled="notifyFailed"
             @update:model-value="(v: boolean) => saveNotify({ [item.field]: v })"
           />
         </div>
@@ -174,6 +193,7 @@
             :label="item.label"
             :description="item.hint"
             :model-value="notifyConfig[item.field] as boolean"
+            :disabled="notifyFailed"
             @update:model-value="(v: boolean) => saveNotify({ [item.field]: v })"
           />
           <ToggleRow
@@ -187,6 +207,7 @@
                   :min="0"
                   :max="23"
                   size="small"
+                  :disabled="notifyFailed"
                   style="width: 84px"
                   @update:value="(v: number | null) => v !== null && saveNotify({ dnd_start_hour: v })"
                 />
@@ -195,6 +216,7 @@
                   :min="0"
                   :max="23"
                   size="small"
+                  :disabled="notifyFailed"
                   style="width: 84px"
                   @update:value="(v: number | null) => v !== null && saveNotify({ dnd_end_hour: v })"
                 />
@@ -209,6 +231,7 @@
                 :max="60"
                 :step="5"
                 size="small"
+                :disabled="notifyFailed"
                 style="width: 110px"
                 @update:value="(v: number | null) => v && saveNotify({ guard_interval_minutes: v })"
               />
@@ -222,6 +245,7 @@
                 :max="5000"
                 :step="100"
                 size="small"
+                :disabled="notifyFailed"
                 style="width: 110px"
                 @update:value="(v: number | null) => v && saveNotify({ history_max_rows: v })"
               />
@@ -234,6 +258,7 @@
                 :min="0"
                 :max="365"
                 size="small"
+                :disabled="notifyFailed"
                 style="width: 110px"
                 @update:value="(v: number | null) => v !== null && saveNotify({ history_max_age_days: v })"
               />
@@ -481,15 +506,22 @@ const notifyConfig = reactive<NotifyConfig>({
   critical_override_enabled: CRITICAL_OVERRIDE_DEFAULT,
 });
 const notifyLoading = ref(false);
+/**
+ * 通知配置回读失败标记（计划 §6.10 B9-6）。
+ * 失败时 notifyConfig 仍是本文件里那份「与 core 默认值逐字一致」的初值 —— 它只在
+ * 巧合下等于设备真值，直接当读数展示就是假开关；所以失败要明示并禁用这一屏的修改。
+ */
+const notifyFailed = ref(false);
 
-// 回读失败静默沿用本地默认值：core 是唯一真源，但不因一次网络抖动在 UI 上报错
 async function loadNotifyConfig() {
   notifyLoading.value = true;
   try {
     const { data } = await api.get(Endpoints.notifications.config);
     Object.assign(notifyConfig, data || {});
+    notifyFailed.value = false;
   } catch {
-    /* 静默 */
+    // 不静默：置失败态，由模板里的 n-alert 说明「显示的是默认值」并提供重试
+    notifyFailed.value = true;
   } finally {
     notifyLoading.value = false;
   }
@@ -696,6 +728,12 @@ onMounted(() => {
   color: var(--text-muted);
   line-height: 1.5;
 }
+/* 保存时机的说明（总闸/阈值需保存、其余即时）：与 hero-desc 同色但更小，避免抢主文案 */
+.hero-hint {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
 .hero-switch {
   display: flex;
   align-items: center;
@@ -770,6 +808,17 @@ onMounted(() => {
 .notify-grid {
   display: flex;
   flex-direction: column;
+}
+/* 通知配置读取失败条（见 loadNotifyConfig）：标题行 + 重试按钮同一行，窄屏换行 */
+.notify-alert {
+  margin-bottom: var(--space-3);
+}
+.notify-alert-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 /* 免打扰起止两个小时输入框：ToggleRow 的 #control 只有一个插槽位，
    两个输入框需要自己的容器来定间距（原先是靠 .notify-row 的 space-between 撑开） */

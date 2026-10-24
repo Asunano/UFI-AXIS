@@ -1,15 +1,20 @@
 <template>
   <n-modal
     :show="show"
-    preset="card"
-    title="局域网 (LAN) 设置"
-    style="width: 460px; max-width: calc(100vw - 32px)"
+    preset="dialog"
+    title="编辑 LAN / DHCP 设置"
+    positive-text="保存"
+    negative-text="取消"
+    class="modal-fit"
+    style="--modal-w: 446px; --modal-h: 560px"
     @update:show="(v: boolean) => emit('update:show', v)"
+    @positive-click="onSave"
   >
-    <div class="modal-form-col">
+    <div class="modal-form">
       <div class="form-item">
+        <label>DHCP 服务</label>
+        <!-- ui-baseline-allow: 弹窗行内表单的一个字段，和同排的输入框等宽对齐；ToggleRow 是整行设置项的版式 -->
         <n-switch v-model:value="lanForm.dhcp_enabled" />
-        <span class="form-inline-label">启用 DHCP 服务器</span>
       </div>
       <div class="form-item">
         <label>LAN IP</label>
@@ -29,28 +34,17 @@
       </div>
       <div class="form-item">
         <label>租约时间 (小时)</label>
-        <n-input-number v-model:value="lanForm.dhcp_lease_hour" :min="1" size="small" style="width: 100%" />
+        <n-input-number v-model:value="lanForm.dhcp_lease_hour" :min="1" size="small" />
       </div>
-      <!-- MTU 只读：core 侧没有对应写入接口，放这里是为了不用再单独开一处 LAN 信息 -->
-      <InfoRow label="MTU" :value="lanSettings.mtu ?? '--'" />
     </div>
-    <template #footer>
-      <n-space justify="end">
-        <n-button size="small" @click="emit('update:show', false)">取消</n-button>
-        <n-button size="small" type="primary" :loading="saving" @click="onSave">保存</n-button>
-      </n-space>
-    </template>
   </n-modal>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, watch } from 'vue';
-import InfoRow from '@/components/InfoRow.vue';
+import { reactive, watch } from 'vue';
 
 const props = defineProps<{ show: boolean; lanSettings: Record<string, any> }>();
-const emit = defineEmits<{ 'update:show': [boolean]; save: [form: LanForm] }>();
-
-const saving = ref(false);
+const emit = defineEmits<{ 'update:show': [boolean]; save: [form: Record<string, any>] }>();
 
 const lanForm = reactive({
   lan_ip: '',
@@ -60,15 +54,6 @@ const lanForm = reactive({
   dhcp_end: '',
   dhcp_lease_hour: 24,
 });
-
-interface LanForm {
-  lan_ip: string;
-  lan_netmask: string;
-  dhcp_enabled: boolean;
-  dhcp_start: string;
-  dhcp_end: string;
-  dhcp_lease_hour: number;
-}
 
 // 打开时把当前只读数据填入表单（父组件持续轮询刷新 lanSettings，所以这里拿到的是最新值）
 watch(
@@ -86,23 +71,21 @@ watch(
   { immediate: true }
 );
 
-async function onSave() {
-  saving.value = true;
-  try {
-    emit('save', { ...lanForm });
-    emit('update:show', false);
-  } finally {
-    saving.value = false;
-  }
+function onSave() {
+  // 2026-10-14：删掉原来那个 `saving` 标志 —— 它 `true` 之后紧接着在 `finally` 里 `false`
+  // （整段同步执行，从来没有可观察到的 true），而且模板里根本没读它，是纯死代码。
+  // 真正的写入是异步的、留在父组件（NetworkTab.saveLanSettings），弹窗这里同步关闭即可。
+  emit('save', { ...lanForm });
+  emit('update:show', false);
 }
 </script>
 
 <style scoped>
-.modal-form-col {
-  display: flex;
-  flex-direction: column;
+.modal-form {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
   gap: 12px;
-  padding: 4px 0;
+  padding: 8px 0;
 }
 .form-item {
   display: flex;
@@ -114,11 +97,9 @@ async function onSave() {
   color: var(--text-secondary);
   font-weight: 500;
 }
-.form-inline-label {
-  font-size: 13px;
-  color: var(--text-primary);
-  margin-left: 8px;
+@media (max-width: 768px) {
+  .modal-form {
+    grid-template-columns: 1fr;
+  }
 }
-/* 原来这里自己定义了一份 .info-row/.info-label/.info-value，与公共 InfoRow.vue 的类名
-   逐字撞车、样式又略有出入；已改用公共组件。 */
 </style>

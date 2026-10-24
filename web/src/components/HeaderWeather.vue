@@ -91,14 +91,40 @@ function hhmm(iso: string | undefined): string {
   return at >= 0 ? iso.slice(at + 1, at + 6) : iso;
 }
 
+/**
+ * 时间戳归一成毫秒。
+ *
+ * core 的 `updated_at` 可能是秒级 Unix 时间戳、毫秒级，或 ISO 串（不同上游/版本混着来）。
+ * 直接把秒级数字丢给 `new Date()` 会被当成毫秒 → 显示成 1970 年，用户只会以为天气卡坏了。
+ *
+ * 判据用**量级**而不是位数：1e12 毫秒 ≈ 公元 33658 年，任何真实时间戳都到不了；
+ * 反过来，秒级时间戳要到 1e12 秒才是公元 33658 年，所以「< 1e12 就是秒」这条不会误判。
+ */
+function toMillis(ts: unknown): number | null {
+  if (typeof ts === 'number') {
+    if (!Number.isFinite(ts) || ts <= 0) return null;
+    return ts < 1e12 ? ts * 1000 : ts;
+  }
+  if (typeof ts === 'string') {
+    const s = ts.trim();
+    if (!s) return null;
+    // 纯数字串按数字处理（"1758..." 这类），否则交给 Date.parse
+    if (/^\d+(\.\d+)?$/.test(s)) return toMillis(Number(s));
+    const parsed = Date.parse(s);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
 const updatedText = computed(() => {
-  const ts = w.value?.updated_at;
-  return ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '';
+  const ms = toMillis(w.value?.updated_at);
+  return ms == null ? '' : new Date(ms).toLocaleString('zh-CN', { hour12: false });
 });
 </script>
 
 <style scoped>
 .weather-chip {
+  position: relative;
   display: inline-flex;
   align-items: baseline;
   gap: 6px;
@@ -113,8 +139,23 @@ const updatedText = computed(() => {
   flex-shrink: 0;
   max-width: 180px;
 }
-.weather-chip:hover {
+/* hover 不再换到另一个令牌族。
+   原先写的是 `background: var(--surface-hover)` —— 那是「透明底 + 3% 黑」，
+   而静止态是 `--cat-neutral-bg` 的实色中性底，两态观感像是换了块东西（暗色下尤其明显：
+   0.08 白 → 0.04 白，胶囊一下子变透明）。改成在**原底色上叠一层**同样的中性 hover 色，
+   两态同族、只差一档明度，且与全站其它 hover 用的是同一个令牌。 */
+.weather-chip::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
   background: var(--surface-hover);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  pointer-events: none;
+}
+.weather-chip:hover::after {
+  opacity: 1;
 }
 .weather-temp {
   font-weight: 600;
@@ -195,6 +236,11 @@ const updatedText = computed(() => {
   }
   .weather-chip {
     padding: 6px 8px;
+  }
+}
+@media (max-width: 1180px) {
+  .weather-chip {
+    display: none;
   }
 }
 </style>

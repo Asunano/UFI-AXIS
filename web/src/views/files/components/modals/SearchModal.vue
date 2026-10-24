@@ -2,8 +2,8 @@
   <n-modal
     :show="show"
     preset="card"
-    class="search-modal"
-    :style="{ width: isMobile ? '94vw' : 'min(600px, 92vw)' }"
+    class="modal-fit search-modal"
+    style="--modal-w: 600px; --modal-h: 720px"
     :mask-closable="true"
     :bordered="false"
     @update:show="(v: boolean) => emit('update:show', v)"
@@ -41,6 +41,12 @@
       <!-- 结果 -->
       <div class="sm-results">
         <div v-if="loading" class="sm-hint">正在搜索…（单次最多 10 秒）</div>
+        <!-- 失败必须与「没找到」分开：原来 catch 里把状态置成「已搜索 + 空结果」，
+             于是请求失败与真的零命中显示同一句「未找到匹配项」 -->
+        <div v-else-if="failed" class="sm-hint is-failed">
+          <span>搜索失败，没拿到结果（可能是设备端超时或连接中断）。</span>
+          <n-button size="tiny" text type="primary" @click="runSearch">重试</n-button>
+        </div>
         <div v-else-if="!searched" class="sm-hint">输入关键词后回车开始搜索</div>
         <div v-else-if="!results.length" class="sm-hint">
           未找到匹配项（{{ SEARCH_SCOPES.find((s) => s.key === scope)?.label }}）
@@ -103,9 +109,8 @@ const props = withDefaults(
     show: boolean;
     currentPath: string;
     initialQuery?: string;
-    isMobile?: boolean;
   }>(),
-  { initialQuery: '', isMobile: false }
+  { initialQuery: '' }
 );
 
 const emit = defineEmits<{
@@ -122,6 +127,8 @@ const results = ref<FileEntry[]>([]);
 const loading = ref(false);
 const searched = ref(false);
 const timedOut = ref(false);
+/** 请求失败（与「已搜索、零命中」互斥，见模板注释） */
+const failed = ref(false);
 
 const rootPath = computed(() => searchRootFor(scope.value, props.currentPath));
 
@@ -156,6 +163,7 @@ async function runSearch() {
   if (!q) return;
   const spec = SEARCH_SCOPES.find((s) => s.key === scope.value);
   loading.value = true;
+  failed.value = false;
   try {
     const { data } = await api.get('/api/files/search', {
       params: { path: rootPath.value, query: q, depth: spec?.depth ?? 3 },
@@ -167,6 +175,8 @@ async function runSearch() {
     results.value = [];
     timedOut.value = false;
     searched.value = true;
+    // 只留在结果区（带重试）：再弹一条 toast 是对同一件事说两遍
+    failed.value = true;
   } finally {
     loading.value = false;
   }
@@ -186,6 +196,7 @@ watch(
     results.value = [];
     searched.value = false;
     timedOut.value = false;
+    failed.value = false;
     nextTick(() => inputRef.value?.focus());
     if (query.value.trim()) runSearch();
   },
@@ -197,6 +208,7 @@ watch(scope, () => {
   results.value = [];
   searched.value = false;
   timedOut.value = false;
+  failed.value = false;
 });
 </script>
 
@@ -220,6 +232,13 @@ watch(scope, () => {
   gap: var(--space-3);
   flex-wrap: wrap;
 }
+/* 四档范围在 360px 下本来就排不进一行（每档 4~5 个汉字 + 内距），而 naive 的
+   `.n-radio-group` 是 inline-flex + nowrap —— 溢出的那两档会被卡片裁掉。这里允许换行。 */
+.sm-scope :deep(.n-radio-group) {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
 .sm-root {
   font-size: var(--font-xs);
   color: var(--text-muted);
@@ -229,9 +248,10 @@ watch(scope, () => {
   min-width: 0;
   flex: 1 1 auto;
 }
+/* 结果区不再自设高度与滚动：`max-height: 52vh + overflow-y: auto` 会在
+   `.modal-fit` 的内容区（`.n-card-content`，本身已 overflow:auto）里再套一层，
+   矮屏下用户要先滚外层再滚内层才看得到下面的结果。滚动统一交给内容区。 */
 .sm-results {
-  max-height: 52vh;
-  overflow-y: auto;
   overscroll-behavior: contain;
   border-top: 1px solid var(--border-subtle);
   padding-top: var(--space-2);
@@ -241,6 +261,15 @@ watch(scope, () => {
   text-align: center;
   color: var(--text-muted);
   font-size: var(--font-base);
+}
+/* 失败态：一句话 + 重试入口，竖排居中 */
+.sm-hint.is-failed {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  line-height: 1.6;
 }
 .sm-warn {
   padding: var(--space-2) var(--space-3);

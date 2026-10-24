@@ -36,6 +36,27 @@ export const useAppStore = defineStore('app', () => {
 
   const isAuthenticated = computed(() => !!token.value);
 
+  /**
+   * 掉线原因（2026-10-21，审计 §B8）。
+   *
+   * 444 有两种成因：凭据被吊销（设备没了/被移除）与**设备被机主拉黑**。
+   * 之前两者都被处理成"静默跳登录页"，用户完全不知道为什么。
+   * 这里存一句话，登录页挂载时读一次并清空 —— 不放进路由 query，
+   * 免得刷新页面后同一条提示反复出现。
+   */
+  const authFailureReason = ref('');
+
+  function setAuthFailureReason(reason: string) {
+    authFailureReason.value = reason;
+  }
+
+  /** 读一次就清空（登录页专用）。 */
+  function consumeAuthFailureReason(): string {
+    const reason = authFailureReason.value;
+    authFailureReason.value = '';
+    return reason;
+  }
+
   function setAuth(serverUrl: string, authToken: string) {
     baseUrl.value = serverUrl.replace(/\/$/, '');
     token.value = authToken;
@@ -62,11 +83,20 @@ export const useAppStore = defineStore('app', () => {
     else localStorage.removeItem(LS_DEVICE_FP);
   }
 
-  function clearAuth() {
+  /**
+   * 清空登录态。
+   *
+   * @param options.keepBaseUrl 保留设备地址。**444 掉线时必须保留**（2026-10-21，审计 §B8）：
+   *   掉线是"这台设备不认我了"，不是"我不知道设备在哪"。之前一并清掉，
+   *   用户回到登录页还得重新填地址 —— 在跨域/非默认端口场景下等于把人卡死。
+   */
+  function clearAuth(options: { keepBaseUrl?: boolean } = {}) {
     token.value = '';
-    baseUrl.value = '';
     localStorage.removeItem(LS_TOKEN);
-    localStorage.removeItem(LS_BASE_URL);
+    if (!options.keepBaseUrl) {
+      baseUrl.value = '';
+      localStorage.removeItem(LS_BASE_URL);
+    }
     // 退出/掉线是一次会话结束，HTTP 明文提示的"一天内不再提示"随之失效
     resetInsecureNoticeMute();
   }
@@ -97,10 +127,13 @@ export const useAppStore = defineStore('app', () => {
     themeId,
     deviceFingerprint,
     isAuthenticated,
+    authFailureReason,
     setAuth,
     setBaseUrl,
     setToken,
     setDeviceFingerprint,
+    setAuthFailureReason,
+    consumeAuthFailureReason,
     clearAuth,
     toggleDarkMode,
     setThemeId,

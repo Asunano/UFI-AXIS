@@ -19,12 +19,7 @@
     <n-spin :show="loading && playlists.length === 0" class="pl-spin">
       <n-scrollbar class="pl-scroll">
         <!-- 「全部音乐」是一个固定项而不是歌单：它代表"不筛歌单"，所以没有重命名/删除 -->
-        <button
-          type="button"
-          class="pl-item"
-          :class="{ 'is-active': activeId === null }"
-          @click="emit('select', null)"
-        >
+        <button type="button" class="pl-item" :class="{ 'is-active': activeId === null }" @click="emit('select', null)">
           <span class="pl-item-name">全部音乐</span>
         </button>
 
@@ -33,18 +28,12 @@
             <span class="pl-item-name" :title="p.name">{{ p.name }}</span>
             <span class="pl-item-count">{{ p.count }}</span>
           </button>
-          <n-dropdown
-            trigger="click"
-            :options="rowOptions"
-            @select="(k: string) => onRowAction(k, p)"
-          >
+          <n-dropdown trigger="click" :options="rowOptions" @select="(k: string) => onRowAction(k, p)">
             <n-button size="tiny" quaternary class="pl-more" aria-label="更多操作">⋯</n-button>
           </n-dropdown>
         </div>
 
-        <div v-if="!loading && playlists.length === 0" class="pl-empty">
-          还没有歌单，点右上角「新建」
-        </div>
+        <div v-if="!loading && playlists.length === 0" class="pl-empty">还没有歌单，点右上角「新建」</div>
       </n-scrollbar>
     </n-spin>
   </section>
@@ -84,6 +73,10 @@ function onRowAction(key: string, entry: PlaylistEntry) {
 .pl-panel {
   display: flex;
   flex-direction: column;
+  /* 抽屉是绝对定位、高度确定的容器；面板必须自己吃满这个高度，
+     `.pl-spin` 的 `flex: 1` 才有确定高度可分配。缺了它，n-spin 会按内容长到
+     1500px+，抽屉 `overflow: hidden` 把第 21 项以后全部裁掉（2026-10-23 实测）。 */
+  height: 100%;
   min-width: 0;
   min-height: 0;
 }

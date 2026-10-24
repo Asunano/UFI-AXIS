@@ -1,15 +1,32 @@
 <template>
   <div class="monitor-view">
     <MonitorControlsCard
-      :prefs="prefs"
       :hours="hours"
       :loading="anyLoading"
       :exporting="exporting"
       @update:hours="hours = $event"
       @refresh="loadAll"
-      @save="savePrefs"
       @export="exportCsv"
-    />
+      @open-storage="storageModal.open()"
+      @open-settings="settingsModal.open()"
+    >
+      <!--
+        流量报表入口（日 / 周 / 月报，`GET /api/traffic/report`）。
+        放进页头控件条而不是单开一张卡：它是一次性下钻动作，常驻卡片会白占一屏
+        （与仪表盘「流量使用情况 → 历史」同一个取舍）。
+      -->
+      <template #actions>
+        <n-button size="small" @click="reportModal.open()">流量报表</n-button>
+        <!--
+          告警入口（2026-10-14 从设置页「更多功能」迁来）。
+          原先放设置页是临时决定，理由写在那边：「原计划并进监控页，但监控页没有现成的
+          入口位置」。上一轮控件条加了 `#actions` 插槽，那个理由不成立了。
+          告警与监控是同一件事的两面（一个看趋势、一个看发生了什么），放在同一页才顺。
+          路由不变（`/alerts` 照旧可直接打开），这里只是换了个入口位置。
+        -->
+        <n-button size="small" @click="router.push({ name: 'alerts' })">告警</n-button>
+      </template>
+    </MonitorControlsCard>
 
     <div class="chart-grid">
       <MonitorChartCard
@@ -17,57 +34,104 @@
         title="CPU 使用率"
         :option="cpuOption"
         :loading="loading.cpu"
+        :failed="failed.cpu"
         :badge="cpuCurrent != null ? cpuCurrent.toFixed(1) : null"
         unit="%"
         :color="cpuBadgeColor"
+        @retry="loadAll"
       />
       <MonitorChartCard
         v-if="metricEnabled('memory')"
         title="内存使用率"
         :option="memoryOption"
         :loading="loading.memory"
+        :failed="failed.memory"
         :badge="memCurrent != null ? memCurrent.toFixed(1) : null"
         unit="%"
-        color="#2080f0"
+        color="var(--info)"
+        @retry="loadAll"
       />
       <MonitorChartCard
         v-if="trafficEnabled"
         title="网络流量"
         :option="trafficOption"
         :loading="loading.traffic"
+        :failed="failed.traffic"
         :badge="rxCurrent != null ? formatSpeedValue(rxCurrent) : null"
-        color="#2080f0"
+        color="var(--info)"
+        @retry="loadAll"
       />
       <MonitorChartCard
         v-if="signalEnabled"
         title="信号强度"
         :option="signalOption"
         :loading="loading.signal"
+        :failed="failed.signal"
         :badge="rsrpCurrent != null ? rsrpCurrent.toFixed(0) : null"
         unit="dBm"
         :color="rsrpCurrent != null ? signalColor(rsrpCurrent) : undefined"
+        @retry="loadAll"
       />
       <MonitorChartCard
         v-if="metricEnabled('battery')"
         title="电池"
         :option="batteryOption"
         :loading="loading.battery"
+        :failed="failed.battery"
         :badge="batCurrent != null ? batCurrent.toFixed(1) : null"
         unit="%"
-        color="#f0a050"
+        color="var(--warning)"
+        @retry="loadAll"
       />
       <MonitorChartCard
         v-if="metricEnabled('temperature')"
         title="温度"
         :option="tempOption"
         :loading="loading.temperature"
+        :failed="failed.temperature"
         :badge="tempCurrent != null ? tempCurrent.toFixed(1) : null"
         unit="°C"
-        color="#d03050"
+        color="var(--error)"
+        @retry="loadAll"
       />
     </div>
 
-    <StorageCard :data="storageData" :loading="loading.storage" @cleaned="loadAll" />
+    <!--
+      存储管理 / 监控设置：都是控件条上按钮打开的弹窗（2026-10-22 由底部常驻卡与
+      控件条内嵌展开区改来）。懒挂载、关闭即卸载，首屏只剩图表。
+      数据与保存逻辑仍留在本页：两个弹窗只收 props、回 emit，不各持一份状态。
+    -->
+    <component
+      :is="storageModalComponent"
+      v-if="storageModalComponent"
+      :show="storageModalShow"
+      :data="storageData"
+      :loading="loading.storage"
+      :failed="failed.storage"
+      @update:show="storageModal.setShow"
+      @retry="loadAll"
+      @cleaned="loadAll"
+    />
+
+    <component
+      :is="settingsModalComponent"
+      v-if="settingsModalComponent"
+      :show="settingsModalShow"
+      :prefs="prefs"
+      :prefs-failed="prefsFailed"
+      @update:show="settingsModal.setShow"
+      @save="savePrefs"
+      @reload-prefs="reloadPrefs"
+    />
+
+    <component
+      :is="reportModalComponent"
+      v-if="reportModalComponent"
+      :show="reportModalShow"
+      title="流量报表"
+      horizontal
+      @update:show="reportModal.setShow"
+    />
   </div>
 </template>
 
@@ -75,24 +139,26 @@
 /**
  * 监控页：只负责状态与取数编排。
  *
- * 渲染拆到 components/ 下（设置卡 / 图表卡 / 存储卡 + 清理弹窗），
+ * 渲染拆到 components/ 下（控件条 / 图表卡 + 设置弹窗 / 存储弹窗 / 清理弹窗），
  * option 构造在 monitorCharts.ts，类型与格式化在 monitorShared.ts。
  * 偏好与图表数据都留在这里：它们被多张卡同时消费，下沉到任何一张卡都会分叉。
  */
 import { ref, computed, watch, onMounted } from 'vue';
+import { useRouter } from 'vue-router';
 import { buildMonitorCsv, downloadCsv, type MetricSeries } from '@/composables/monitorCsv';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
+import { useLazyModal } from '@/composables/useLazyModal';
 import { signalColor } from '@/composables/utils';
 import { useChartColors } from '@/composables/chartTheme';
 import MonitorControlsCard from './components/MonitorControlsCard.vue';
 import MonitorChartCard from './components/MonitorChartCard.vue';
-import StorageCard from './components/StorageCard.vue';
 import { bandChartOption, signalChartOption, trafficChartOption, type ChartCtx } from './monitorCharts';
 import { DEFAULT_PREFS, formatSpeedValue, type MonitorPrefs, type Pt, type StorageData } from './monitorShared';
 
 const message = useMessage();
+const router = useRouter();
 const api = useCancellableApi();
 
 // ── 颜色（深浅自适应）──
@@ -106,8 +172,10 @@ const hours = ref(24);
 
 // ── 监控个性化偏好（T40-5）──
 // core 是唯一真源：`GET/PUT /api/monitor/preferences`。web 不做本地持久化，
-// 每次进页面回读；回读失败静默沿用内置默认值（core_truth_silent 策略）。
+// 每次进页面回读；回读失败不再静默当作真值（那会把本地默认值当成设备配置显示，
+// 见计划 §6.10 B9-1），而是置 prefsFailed 让控件条挂一条「读取失败 + 重试」。
 const prefs = ref<MonitorPrefs>({ ...DEFAULT_PREFS, enabledTypes: [...DEFAULT_PREFS.enabledTypes] });
+const prefsFailed = ref(false);
 
 function metricEnabled(key: string): boolean {
   return prefs.value.enabledTypes.includes(key);
@@ -117,14 +185,34 @@ function metricEnabled(key: string): boolean {
 const trafficEnabled = computed(() => metricEnabled('traffic_rx') || metricEnabled('traffic_tx'));
 const signalEnabled = computed(() => metricEnabled('signal_rsrp') || metricEnabled('signal_sinr'));
 
+/**
+ * 回读偏好时会把 hours 改成 core 里的 defaultHours，这会触发下面的 `watch(hours)`
+ * 再拉一遍历史 —— 与 onMounted 里紧跟的那次 `loadAll()` 重复（首屏两倍的
+ * `/api/monitor/history`）。用一次性标记吞掉这次由回读引起的触发：
+ * 标记只在取值**真的变了**时置位，否则 watcher 不触发、标记会残留下来吞掉下一次
+ * 用户的真实切换。
+ */
+let skipHoursReload = false;
+
 async function loadPrefs() {
+  const prevHours = hours.value;
   try {
     const { data } = await api.get('/api/monitor/preferences');
     prefs.value = { ...prefs.value, ...data };
-    hours.value = prefs.value.defaultHours;
+    prefsFailed.value = false;
+    if (prefs.value.defaultHours !== prevHours) {
+      skipHoursReload = true;
+      hours.value = prefs.value.defaultHours;
+    }
   } catch {
-    /* 静默：沿用默认值，不在 UI 上提示 */
+    prefsFailed.value = true;
   }
+}
+
+/** 偏好读取失败后的重试：先拿回偏好（hours 可能随之变化），再按新口径取数 */
+async function reloadPrefs() {
+  await loadPrefs();
+  await loadAll();
 }
 
 /**
@@ -169,7 +257,23 @@ const loading = ref({
   storage: false,
 });
 
-const storageData = ref<StorageData>({ tables: [], total_kb: 0, total_display: '0 KB' });
+/**
+ * 取数失败标记（键与 loading 一一对应）。
+ * 与「这段时间没有数据」是两件事：失败时保留上一次的曲线、由卡片显示
+ * 「读取失败 + 重试」，否则空图会把失败伪装成「暂无数据」（计划 §6.10 B9-1）。
+ */
+const failed = ref({
+  cpu: false,
+  memory: false,
+  traffic: false,
+  signal: false,
+  battery: false,
+  temperature: false,
+  storage: false,
+});
+
+// total_display 的初值是 `--` 而不是 `0 KB`：首帧还没取到数据，写 0 KB 是假读数
+const storageData = ref<StorageData>({ tables: [], total_kb: 0, total_display: '--' });
 
 // ── 当前值 (用于 ValueBadge) ──
 const cpuCurrent = computed(() => cpuData.value.at(-1)?.avg ?? null);
@@ -181,12 +285,14 @@ const rsrpCurrent = computed(() => rsrpDatas.value.at(-1)?.avg ?? null);
 
 const anyLoading = computed(() => Object.values(loading.value).some(Boolean));
 
+// 徽标是 CSS 上下文（ValueBadge 的 :style），所以这里用令牌引用而不是 useChartColors()
+// 的字面量 —— 换肤/暗色下会自动跟。图表本身走 colors（canvas 不认 var()）。
 const cpuBadgeColor = computed(() => {
   const v = cpuCurrent.value;
   if (v == null) return undefined;
-  if (v >= 80) return '#d03050';
-  if (v >= 60) return '#f0a050';
-  return '#18a058';
+  if (v >= 80) return 'var(--error)';
+  if (v >= 60) return 'var(--warning)';
+  return 'var(--success)';
 });
 
 // ── 图表 Options ──
@@ -208,21 +314,25 @@ const trafficOption = computed(() => trafficChartOption(rxDatas.value, txDatas.v
 const signalOption = computed(() => signalChartOption(rsrpDatas.value, sinrDatas.value, chartCtx.value));
 
 // ── 数据加载 ──
-async function fetchHistory(type: string): Promise<Pt[]> {
+/** 失败返回 null（而不是空数组）：调用方据此区分「读失败」与「这段时间没有数据」 */
+async function fetchHistory(type: string): Promise<Pt[] | null> {
   try {
     const { data } = await api.get('/api/monitor/history', {
       params: { type, hours: hours.value, points: 360 },
     });
     return data.points || [];
   } catch {
-    return [];
+    return null;
   }
 }
 
 async function loadSingle(type: string, target: { value: Pt[] }, key: keyof typeof loading.value) {
   loading.value[key] = true;
   try {
-    target.value = await fetchHistory(type);
+    const pts = await fetchHistory(type);
+    failed.value[key] = pts === null;
+    // 失败时保留上一次的曲线：清空只会让图变成「暂无数据」，那是另一种假状态
+    if (pts) target.value = pts;
   } finally {
     loading.value[key] = false;
   }
@@ -232,8 +342,9 @@ async function loadTraffic() {
   loading.value.traffic = true;
   try {
     const [rx, tx] = await Promise.all([fetchHistory('traffic_rx'), fetchHistory('traffic_tx')]);
-    rxDatas.value = rx;
-    txDatas.value = tx;
+    failed.value.traffic = rx === null || tx === null;
+    if (rx) rxDatas.value = rx;
+    if (tx) txDatas.value = tx;
   } finally {
     loading.value.traffic = false;
   }
@@ -243,8 +354,9 @@ async function loadSignal() {
   loading.value.signal = true;
   try {
     const [rsrp, sinr] = await Promise.all([fetchHistory('signal_rsrp'), fetchHistory('signal_sinr')]);
-    rsrpDatas.value = rsrp;
-    sinrDatas.value = sinr;
+    failed.value.signal = rsrp === null || sinr === null;
+    if (rsrp) rsrpDatas.value = rsrp;
+    if (sinr) sinrDatas.value = sinr;
   } finally {
     loading.value.signal = false;
   }
@@ -256,11 +368,14 @@ async function loadStorage() {
     const { data } = await api.get('/api/monitor/storage');
     storageData.value = {
       tables: data.tables || [],
-      total_kb: data.total_kb || 0,
-      total_display: data.total_display || '0 KB',
+      total_kb: data.total_kb ?? 0,
+      // 缺值一律 `--`，不拿 0 KB 冒充「已取到」
+      total_display: data.total_display || '--',
     };
+    failed.value.storage = false;
   } catch {
-    /* 静默 */
+    // 失败不清空旧表：由存储弹窗显示「读取失败 + 重试」，总占用显示 `--`
+    failed.value.storage = true;
   } finally {
     loading.value.storage = false;
   }
@@ -299,6 +414,33 @@ async function exportCsv() {
   }
 }
 
+/**
+ * 流量报表弹窗（2026-10-24）：直接复用仪表盘的「流量历史」弹窗。
+ *
+ * 监控页原来的 /report 逐日表格与主界面的 /usage 分桶图数据口径太接近，
+ * 维护两套 UI 没有收益；这里只换标题，区间切换、翻页、柱形图、合计都复用同一组件。
+ * 仍然是 useLazyModal：一次性下钻，没必要在监控页常驻。
+ */
+const reportModal = useLazyModal(() => import('@/views/traffic/TrafficHistoryModal.vue'));
+const reportModalComponent = reportModal.component;
+const reportModalShow = reportModal.show;
+
+/**
+ * 存储管理 / 监控设置弹窗（2026-10-22）。
+ *
+ * 两个入口都在控件条上，弹窗本身同样走 useLazyModal 懒挂载、关闭即卸载：
+ * 首屏不该为「可能不点开」的存储表格与十来行设置付出渲染成本。
+ * 存储取数仍留在 loadAll（自动刷新同一个口径），所以弹窗一打开就是当前值；
+ * 设置的状态在父组件，弹窗关闭不会丢未保存内容（设置是即改即存，本来也没有未保存态）。
+ */
+const storageModal = useLazyModal(() => import('./components/StorageCard.vue'));
+const storageModalComponent = storageModal.component;
+const storageModalShow = storageModal.show;
+
+const settingsModal = useLazyModal(() => import('./components/modals/MonitorSettingsModal.vue'));
+const settingsModalComponent = settingsModal.component;
+const settingsModalShow = settingsModal.show;
+
 async function loadAll() {
   // 关掉的指标不取数（与 app 的 enabledMonitorTypes 过滤同口径），避免为不显示的图白跑请求
   await Promise.all([
@@ -313,7 +455,12 @@ async function loadAll() {
 }
 
 // ── 监听时间范围变化 ──
+// 回读偏好导致的那一次 hours 变化已经由 onMounted 后面的 loadAll 覆盖，跳过它以免首屏重复取数
 watch(hours, () => {
+  if (skipHoursReload) {
+    skipHoursReload = false;
+    return;
+  }
   loadAll();
 });
 

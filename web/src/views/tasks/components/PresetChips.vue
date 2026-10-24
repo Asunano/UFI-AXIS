@@ -26,40 +26,4 @@ import { formatHM, presets, type TaskPreset } from '../tasksShared';
 const emit = defineEmits<{ (e: 'apply', preset: TaskPreset): void }>();
 </script>
 
-<style scoped>
-.preset-section {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  margin-bottom: 14px;
-}
-.preset-label {
-  font-size: 13px;
-  color: var(--text-secondary);
-  flex-shrink: 0;
-}
-.preset-chips {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.preset-chip {
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.preset-time {
-  font-size: 11px;
-  opacity: 0.7;
-  margin-left: 2px;
-}
-
-@media (max-width: 768px) {
-  .preset-section {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-}
-</style>
+<style scoped src="./chipStrip.css"></style>

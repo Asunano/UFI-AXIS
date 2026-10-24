@@ -11,7 +11,15 @@
 <template>
   <n-popover v-if="visible" trigger="click" placement="bottom" :width="320">
     <template #trigger>
-      <span class="poem-line" :title="p?.content">{{ p?.content }}</span>
+      <span class="poem-trigger" :title="p?.content">
+        <span class="poem-line">{{ p?.content }}</span>
+        <!--
+          手机（≤768px）上整条收成这一个「诗」字，而不是把挂件 display:none 掉。
+          原先直接隐藏，结果是挂了件却在手机上**静默消失** —— 用户以为功能坏了
+          （设备条、天气挂件在窄屏都是「收敛」而不是「消失」，这里对齐同一条口径）。
+        -->
+        <span class="poem-mini" title="每日诗词">诗</span>
+      </span>
     </template>
 
     <div class="poem-detail">
@@ -68,20 +76,28 @@ const authorLine = computed(() => {
 </script>
 
 <style scoped>
-.poem-line {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.2;
+.poem-trigger {
+  display: inline-flex;
+  align-items: center;
   cursor: pointer;
   user-select: none;
+}
+.poem-line {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.2;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   /* 顶栏里它和设备条抢宽度，给一个上限而不是任其撑开 */
-  max-width: 220px;
+  max-width: 190px;
 }
-.poem-line:hover {
+.poem-trigger:hover .poem-line {
   color: var(--text-secondary);
+}
+/* 手机上不再用单个「诗」字替换原句：一句诗本身就是挂件的意义。 */
+.poem-mini {
+  display: none;
 }
 
 /* ── 详情浮层 ── */
@@ -152,10 +168,31 @@ const authorLine = computed(() => {
   color: var(--text-muted);
 }
 
-/* 手机上顶栏放不下这一句 —— 设备条也是同样的处理 */
-@media (max-width: 768px) {
+/* 窄屏仍然显示原句，只收窄上限；不再整块消失。 */
+@media (max-width: 1180px) {
   .poem-line {
-    display: none;
+    max-width: 150px;
+  }
+}
+@media (max-width: 1024px) {
+  .poem-line {
+    max-width: 130px;
+  }
+}
+@media (max-width: 900px) {
+  .poem-line {
+    max-width: 110px;
+  }
+}
+@media (max-width: 720px) {
+  .poem-line {
+    max-width: 110px;
+    font-size: 10.5px;
+  }
+}
+@media (max-width: 480px) {
+  .poem-line {
+    max-width: 100px;
   }
 }
 </style>

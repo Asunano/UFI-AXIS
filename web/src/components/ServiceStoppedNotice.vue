@@ -60,13 +60,15 @@ function goSettings() {
   text-align: center;
   font-size: 13px;
   line-height: 1.7;
-  opacity: 0.85;
+  /* 原先用 opacity 压暗正文（.85 / .7）：透明度是"把已有颜色乘一下"，
+     它跟明暗模式与换肤都不联动，暗色下正文会糊成一片。改用语义文字色。 */
+  color: var(--text-secondary);
 }
 
 .desc .hint {
   margin-top: 8px;
   font-size: 12px;
-  opacity: 0.7;
+  color: var(--text-muted);
 }
 
 .desc .err {

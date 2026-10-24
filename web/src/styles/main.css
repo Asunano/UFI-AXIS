@@ -36,6 +36,25 @@
   --warning-light: rgba(240, 160, 32, 0.1);
   --error-light: rgba(208, 48, 80, 0.08);
 
+  /* ── 信号四档（RSRP 分档）──
+     `--success` / `--warning` / `--error` 只有三档，硬套会丢掉 fair 与 weak 的区别：
+     「弱但还能用」和「快断了」画成同一个色，用户就分不出该不该换个位置。
+     四档按质量降序排列（good > fair > weak > poor），
+     CellInfoModal 的阈值 -85 / -95 / -105 dBm 依次落到这四档。
+     消费方：CellInfoModal 的 RSRP 标签、`composables/utils.ts` 的 signalColor()。
+     暗色档按同色系提亮（深底上 #16a34a 这类深绿对比不足）。 */
+  --signal-good: #16a34a;
+  --signal-fair: #ca8a04;
+  --signal-weak: #ea580c;
+  --signal-poor: #dc2626;
+
+  /* ── 中性灰的浅档（LogsPanel 的 debug 级别徽标）──
+     现有中性选项都替代不了：`--cat-neutral-*` 是不透明色块（当字色用会跟正文抢亮度），
+     `--surface-hover` 又太淡（0.03 / 0.04，当字色等于没有）。
+     所以单开一对「字色 + 淡底」，取值沿用 LogsPanel 原先写死的那两个。 */
+  --neutral-light: #606060;
+  --neutral-light-bg: rgba(96, 96, 96, 0.1);
+
   /* 表面色 */
   --surface-hover: rgba(0, 0, 0, 0.03);
   --surface-elevated: #fafafa;
@@ -49,6 +68,18 @@
      之前各处写 `color: #fff`，语义丢失：读代码的人分不清"这里必须白"
      还是"这里恰好白"。 */
   --on-accent: #ffffff;
+
+  /* ── 登录页品牌区（2026-10-22）──
+     语义是"这是产品封面"，不是页面语义色：它不跟换肤走，也不跟明暗反转；
+     暗色下只压暗一档（见 .dark 里的覆盖）。放在这里而不是写在组件的 scoped 样式里，
+     是因为它是**跨端一致的品牌取值**，而 scoped 里的写死色还会撞 UI 基线门禁。 */
+  --brand-panel-1: #08251b;
+  --brand-panel-2: #0f4a33;
+  --brand-glow: rgba(24, 160, 88, 0.55);
+  --brand-glow-soft: rgba(255, 255, 255, 0.16);
+  --brand-ink: #eafff5;
+  /* 品牌图标底板：必须与 :app 启动图标一致（白底），两种主题下都不变 */
+  --brand-logo-bg: #ffffff;
 
   /* 主色光晕 / 聚焦环。都是"主色 + 低透明度"，但两个用途的强度差一档，
      合成一个会两边都不对：
@@ -150,8 +181,22 @@
   --success-light: rgba(24, 160, 88, 0.14);
   --warning-light: rgba(240, 160, 32, 0.14);
   --error-light: rgba(208, 48, 80, 0.12);
+
+  /* 信号四档 / 中性浅档的暗色档：同色系提亮，深底上才分得清 */
+  --signal-good: #4ade80;
+  --signal-fair: #facc15;
+  --signal-weak: #fb923c;
+  --signal-poor: #f87171;
+  --neutral-light: #b0b0b0;
+  --neutral-light-bg: rgba(176, 176, 176, 0.12);
+
   --surface-hover: rgba(255, 255, 255, 0.04);
   --surface-elevated: #222228;
+
+  /* 登录页品牌区：深色下压暗一档，否则同一条绿在暗背景旁会发亮 */
+  --brand-panel-1: #061a13;
+  --brand-panel-2: #0b3527;
+  --brand-glow: rgba(24, 160, 88, 0.45);
 
   /* 光晕/阴影暗色档：深底吃光，浅色档的 alpha 在这里等于看不见 */
   --accent-glow: rgba(24, 160, 88, 0.45);
@@ -477,9 +522,82 @@ body,
    这条规则给所有 n-modal 一个下限保护。注意它**盖不过内联 max-width**
    （行内样式优先级最高），所以写了 `style="max-width: 900px"` 的那几个弹窗
    仍需在各自文件里显式补上 `max-width: calc(100vw - 32px)`。
-   新写弹窗时只给 `width`，剩下的交给这条。 */
+   2026-10-14 起新写弹窗请直接用下面的 `.modal-fit`（宽度与高度都管）；
+   这条只作为**没接类的存量弹窗**的兜底。 */
 .n-modal {
   max-width: calc(100vw - 32px);
+}
+
+/* ── 弹窗自适应：一个类管宽高（2026-10-14）──
+   用户原话：「设置界面的弹窗都没有自适应，会出现窗口异常同时超出屏幕」。
+
+   改前的三处具体写法与各自的毛病：
+     ① 每个弹窗各写一份 `style="width: 640px; max-width: calc(100vw - 32px)"`
+        —— **只有宽度、没有高度**。naive 的 `preset="card"` 样式里没有任何 max-height，
+        卡片高度 = 内容高度。Webhook 配置 / 投递记录 / 字段覆盖率这些长内容一撑，
+        卡片就比视口高；而 naive 的 `.n-modal-body-wrapper` 是 fixed 满屏 + **隐藏滚动条**的
+        滚动容器，于是整张卡片在里面整体滚动：标题、右上角 ×、底部「保存 / 关闭」全被推出屏幕，
+        用户看到的是一块没有头尾的浮层 —— 这就是"窗口异常"。
+     ② `max-width: calc(100vw - 32px)` 靠每个文件手抄。抄漏一个就出事：
+        `ServicePanel` 的「选择 DLNA 共享目录」只写了 `style="max-width: 520px"`
+        （行内样式优先级高于下面那条全局兜底），且没有 width ⇒ `.n-card{width:100%}`
+        让它直接铺满整屏、左右零间距。
+     ③ 高度靠魔法数：`SettingsView` 的 `.panel-body { max-height: calc(100vh - 220px) }`。
+        220px 是按桌面端卡片头 / 内距估的，没算二级弹窗自己的头尾；手机上 `100vh` 还是
+        "地址栏收起时"的高度，比可见区域高一截，卡片照样探出屏幕。
+
+   统一做法：**一个类 `.modal-fit`，设计尺寸用 CSS 变量传**：
+       <n-modal class="modal-fit" style="--modal-w: 640px; --modal-h: 720px">
+   宽度 = min(设计宽, 视口宽 − 安全边距)，高度 = min(设计高, 视口高 − 安全边距)，
+   内容区自己滚、头尾固定。
+
+   为什么用变量而不是让每个弹窗继续写 width/max-width：行内 `width` 优先级最高，
+   会把这里的 `min()` 整个盖掉；变量只携带"设计值"，约束只有这一处，改口径只改这里。
+   为什么不用 JS 监听 resize：只有"手机 / 非手机"两档，CSS 媒体查询足够，也没有首帧跳动。
+
+   `100dvh` 那一行兜住手机地址栏收放（`100vh` 是地址栏收起时的高度，拿它当上限会让卡片
+   比可见区域高一截）；不支持 dvh 的浏览器退回上一行的 100vh，不会更糟。 */
+.n-modal.modal-fit {
+  width: min(var(--modal-w, 560px), calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+  max-height: min(var(--modal-h, 720px), calc(100vh - 48px));
+  max-height: min(var(--modal-h, 720px), calc(100dvh - 48px));
+  display: flex;
+  flex-direction: column;
+}
+/* 头 / 尾不参与压缩：否则长内容会把标题行和底部按钮一起挤扁（它们必须始终可点）。
+   注意 naive 的三个类名各不相同：头 `.n-card-header`（单连字符）、内容 `.n-card-content`
+   （单连字符）、尾 `.n-card__footer`（双下划线）。照 BEM 直觉写会静默失效。 */
+.n-modal.modal-fit > .n-card-header,
+.n-modal.modal-fit > .n-card__footer,
+.n-modal.modal-fit > .n-dialog__title,
+.n-modal.modal-fit > .n-dialog__action {
+  flex: 0 0 auto;
+}
+/* 内容区才是滚动容器（注意 naive 的类名是 `.n-card-content`，单连字符 ——
+   与 `.n-card__footer` / `.n-dialog__content` 的 BEM 双下划线不一致，写错就完全不生效）：
+   · `min-height: 0` 是 flex 子项能滚起来的前提 —— 默认 `min-height: auto` 会顶住内容高度，
+     加多少 max-height 都没用（这是"设了 max-height 却还是溢出"的常见根因）；
+   · `overflow: auto` 同时兜住横向：长串 / 宽表格在卡片内滚，而不是把卡片顶出视口；
+   · `overscroll-behavior: contain` 防止滚到底后把背后的设置页一起带着滚。 */
+.n-modal.modal-fit > .n-card-content,
+.n-modal.modal-fit > .n-dialog__content {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+/* 窄屏（360–414px 这一档）：左右各留 12px。刻意**不**贴边 ——
+   贴边会看不出这是一层浮层，也容易误触遮罩直接关掉；高度扣 24px 把地址栏 / 手势条让出来。
+   2026-10-21：这一档原先写的是 `max-width: 720px`，属于本仓早已退役的「第四档」
+   （见上面「断点约定」）—— 720 与 768 之间那 48px 宽既拿不到兜底、也不算窄屏。已并回 768，
+   与全站同一个移动阈值；放宽 8px 只会让 720–768 之间的窗口多拿一点边距，不会更糟。 */
+@media (max-width: 768px) {
+  .n-modal.modal-fit {
+    width: min(var(--modal-w, 560px), calc(100vw - 24px));
+    max-width: calc(100vw - 24px);
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+  }
 }
 
 /* ── 分段标签（n-tabs type="segment"）的窄屏形态 ──
@@ -535,4 +653,72 @@ body,
   .stat-grid {
     gap: 10px 14px;
   }
+}
+
+/* ── 字段行的公共版式（2026-10-21，计划 §8.2 C2）──
+   下面五个类原先在设置域（NotifyPanel / UiExtrasPanel / ChannelRulesFields /
+   WebhookConfigModal / LocalSmsConfigModal / DeliveryHistoryModal）与
+   sms、files、network 三个目录的弹窗里各有一份 scoped 副本，多数逐字相同：
+
+     .field         一个字段行（列方向：标签 + 控件 + 说明）
+     .field-label   字段名，压在控件上方，次要色
+     .row-hint      控件下方的补充说明 / 统计口径提示
+     .footer-bar    弹窗或面板底部「左边说明、右边按钮」的两栏动作条
+     .modal-footer  弹窗底部的纯按钮行（右对齐）—— 与 .card-actions 的区别：
+                    后者是**卡内**动作区，带 `margin-top`；弹窗底部由 `.n-card__footer` 自带内距
+
+   与既有的两个栅格类怎么选：
+     · `.field`      竖排、独占一行（弹窗里的表单字段）
+     · `.config-item` 两列栅格里的单元格（设置面板里成对出现的短字段）
+   两者不是同一个东西，不要互相替代：`.field` 自带上下留白，`.config-item` 靠栅格 gap。
+
+   **取值不同的两处刻意不走全局**，由各自 scoped 规则覆盖（scoped 选择器是 (0,2,0)，
+   天然压过这里的 (0,1,0)，注释里写了差异原因）：
+     · 短信两个弹窗的 `.field-label` 用 `--font-sm`（12px），与同弹窗的 `.hint-text` 同档；
+     · `SmsFilterModal` 的 `.field` 上下内距更紧（6px）—— 那里是一屏七八个筛选项的密集表单。
+   改这里的取值会同时动到上述副本以外的所有消费方，改之前先 `grep "class=\"field"`。 */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  /* ui-baseline-allow: 上下留白沿用各副本原值 10px；间距阶梯里没有 10px 档，改 12px 会改变现有观感 */
+  padding: 10px 0;
+}
+
+.field-label {
+  font-size: var(--font-base);
+  color: var(--text-secondary);
+}
+
+/* 注意与 `.config-label` 的区别：那个是控件**上方**的字段名（13px 次要色），
+   `.row-hint` 是控件**下方**的解释（12px 更淡，行高 1.5 让多行说明读起来不挤）。 */
+.row-hint {
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.footer-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  width: 100%;
+}
+
+/* 窄屏折行交给各弹窗自己的 768 档（页脚项目数不同，折法也不同），这里不给 flex-wrap */
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+/* 沉浸播放打开时锁住壳层滚动。
+   音乐页的沉浸层是 fixed 的，本身不会跟着滚；但背景仍可能被滚轮/触摸带着走，
+   而“歌词界面能上下滑离开”正是这类背景滚动的表象。类挂在 <html> 上，
+   MediaAudioView 打开/关闭 stageOpen 时同步增删，卸载时兜底移除。 */
+html.stage-locked .main-content > .n-layout-scroll-container {
+  overflow: hidden;
+  overscroll-behavior: contain;
 }

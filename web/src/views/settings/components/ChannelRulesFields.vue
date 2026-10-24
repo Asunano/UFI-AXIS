@@ -43,7 +43,7 @@
           :min="dailyLimitMin"
           :max="dailyLimitMax"
           size="small"
-          style="width: 150px"
+          class="limit-input"
           @update:value="(v: number | null) => emit('update:dailyLimit', v)"
         >
           <template #suffix>条</template>
@@ -140,20 +140,12 @@ const usageText = computed(() =>
 </script>
 
 <style scoped>
-.row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
-}
-.field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 10px 0;
-}
-.field-label {
-  font-size: 13px;
-  color: var(--text-secondary);
+/* `.field` / `.field-label` / `.row-hint` 已上收到 src/styles/main.css（计划 §8.2 C2），
+   本文件原来的三份副本与全局取值逐字相同，故整体删除。 */
+/* 「每日上限」输入框固定宽度：窄输入框比整列宽的输入框更容易看出"这是个数字"，
+   也给下面的说明文字留出对齐边（原来写在模板里的 `style="width: 150px"`，已收进类）。 */
+.limit-input {
+  width: 150px;
 }
 /* 两个旋钮并排：它们是一组（"什么级别、每天几条"），拆成上下两行会读成两件事 */
 .rules-grid {

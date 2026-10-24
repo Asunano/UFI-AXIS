@@ -9,16 +9,17 @@
     </div>
     <div class="rule-body">
       <div class="task-card-top">
-        <span class="task-name">{{ rule.name || triggerLabel(rule.triggerType) }}</span>
+        <span class="task-name" :title="nameTitle">{{ rule.name || triggerLabel(rule.triggerType) }}</span>
         <n-tag type="warning" size="tiny" round :bordered="false">条件触发</n-tag>
       </div>
       <div class="rule-meta">
-        <span class="rule-cond"><b>当</b> {{ triggerSummary(rule) }}</span>
-        <span class="rule-do"><b>执行</b> {{ actionSummary(rule) }}</span>
-        <span class="rule-cooldown">冷却 {{ (rule.cooldownMs || 60000) / 1000 }}s</span>
+        <span class="rule-cond" :title="triggerTitle"><b>当</b> {{ triggerSummary(rule) }}</span>
+        <span class="rule-do" :title="actionTitle"><b>执行</b> {{ actionSummary(rule) }}</span>
+        <span class="rule-cooldown">{{ cooldownText }}</span>
       </div>
     </div>
     <div class="rule-actions">
+      <!-- ui-baseline-allow: 卡片行内的启停开关（无标签、无说明），套 ToggleRow 会把一条规则撑成三行 -->
       <n-switch :value="rule.enabled" size="medium" @update:value="(v: boolean) => emit('toggle', v)" />
       <n-button size="tiny" quaternary @click="emit('edit')"
         ><n-icon :size="15"><CreateOutline /></n-icon
@@ -38,11 +39,43 @@
  * 一条自动化规则。左侧是「触发 → 动作」的可视化：触发节点自己一套橙色，
  * 动作节点复用 ActionIconBadge（与定时任务卡同一份配色，见该组件的文件头）。
  */
-import ActionIconBadge from './ActionIconBadge.vue';
-import { actionSummary, getTriggerIconComp, triggerLabel, triggerSummary, type Rule } from '../tasksShared';
+import { computed } from 'vue';
 import { ArrowForwardOutline, CreateOutline, ListOutline, TrashOutline } from '@vicons/ionicons5';
+import ActionIconBadge from './ActionIconBadge.vue';
+import {
+  actionSummary,
+  getTriggerIconComp,
+  isKnownAction,
+  isKnownTrigger,
+  triggerLabel,
+  triggerSummary,
+  type Rule,
+} from '../tasksShared';
 
-defineProps<{ rule: Rule }>();
+const props = defineProps<{ rule: Rule }>();
+
+const nameTitle = computed(() => {
+  const known = !!props.rule.name || isKnownTrigger(props.rule.triggerType);
+  return known ? undefined : `未知触发条件：${props.rule.triggerType}`;
+});
+/** 认不出的条件 / 动作：正文显示中文兜底，原始键放 title（不直出英文枚举） */
+const triggerTitle = computed(() =>
+  isKnownTrigger(props.rule.triggerType) ? undefined : `未知触发条件：${props.rule.triggerType}`
+);
+const actionTitle = computed(() =>
+  isKnownAction(props.rule.actionType) ? undefined : `未知动作：${props.rule.actionType}`
+);
+
+/**
+ * 冷却文案。`cooldownMs` 为 0 是**合法值**（不冷却），旧写法 `(x || 60000)` 会把它顶成 60s。
+ * `null/undefined` 才表示"老数据没这个字段"，此时按后端默认 60s 显示。
+ */
+const cooldownText = computed(() => {
+  const ms = props.rule.cooldownMs;
+  if (ms == null) return '冷却 60s';
+  if (ms <= 0) return '不冷却';
+  return `冷却 ${Math.round(ms / 1000)}s`;
+});
 
 const emit = defineEmits<{
   (e: 'toggle', enabled: boolean): void;

@@ -3,17 +3,21 @@
     <!-- 顶部状态栏 -->
     <GridCard title="下载管理">
       <div class="top-bar">
+        <!--
+          「aria2 未启动」在读取失败时是假的：aria2Running 初值就是 false，请求失败也不会变。
+          所以先看 tasksLoaded —— 一次都没读到时只说「状态未知」，活跃数/Tracker 数一律 `--`。
+        -->
         <div class="status-info">
-          <span class="status-dot" :class="{ active: aria2Running }"></span>
-          <span class="status-text">{{ aria2Running ? 'aria2 运行中' : 'aria2 未启动' }}</span>
+          <span class="status-dot" :class="{ active: aria2Running && tasksLoaded }"></span>
+          <span class="status-text">{{ aria2StateText }}</span>
           <span v-if="aria2Version" class="status-version">v{{ aria2Version }}</span>
           <span class="status-sep">|</span>
-          <span>活跃 {{ activeCount }}</span>
+          <span>活跃 {{ tasksLoaded ? activeCount : '--' }}</span>
           <span class="status-sep">|</span>
-          <span>Tracker {{ trackerCount }}</span>
-          <span v-if="throttleState !== 'normal'" class="throttle-warn">
+          <span>Tracker {{ tasksLoaded ? trackerCount : '--' }}</span>
+          <span v-if="tasksLoaded && throttleState !== 'normal'" class="throttle-warn">
             <span class="status-sep">|</span>
-            <span>节流: {{ throttleState }}{{ throttleDetail }}</span>
+            <span>节流: {{ throttleLabel(throttleState) }}{{ throttleDetail }}</span>
           </span>
         </div>
         <div class="top-actions">
@@ -25,90 +29,99 @@
     </GridCard>
 
     <!-- 任务列表 -->
-    <GridCard title="下载任务">
+    <GridCard title="下载任务" :loading="loading">
       <template #extra>
         <n-button size="tiny" quaternary :disabled="completedCount === 0" @click="clearCompleted">
           清除已完成 ({{ completedCount }})
         </n-button>
+        <!-- 已经读到过数据、但这一轮刷新失败：保留旧列表，同时明说它可能不是最新的 -->
+        <n-button v-if="tasksError" size="tiny" quaternary type="warning" @click="loadTasks">刷新失败，重试</n-button>
       </template>
-      <n-spin :show="loading">
-        <div v-if="tasks.length === 0" class="empty-state">暂无下载任务</div>
-        <div v-else class="task-list">
-          <div v-for="task in tasks" :key="task.id" class="task-item">
-            <div class="task-header">
-              <div class="task-name" :title="task.file_name || task.url">
-                {{ task.file_name || task.url }}
-              </div>
-              <div class="task-actions">
-                <n-button
-                  v-if="task.status === 'downloading' || task.status === 'meta' || task.status === 'verifying'"
-                  size="tiny"
-                  quaternary
-                  @click="pauseTask(task.id)"
-                  >暂停</n-button
-                >
-                <n-button
-                  v-else-if="task.status === 'paused'"
-                  size="tiny"
-                  quaternary
-                  type="primary"
-                  @click="resumeTask(task.id)"
-                  >继续</n-button
-                >
-                <n-button
-                  v-else-if="task.status === 'error'"
-                  size="tiny"
-                  quaternary
-                  type="warning"
-                  @click="retryTask(task.id)"
-                  >重试</n-button
-                >
-                <n-button size="tiny" quaternary @click="openRename(task)">重命名</n-button>
-                <n-button size="tiny" quaternary type="error" @click="deleteTask(task)">删除</n-button>
-              </div>
+      <!-- 「读不到」与「确实没有」必须分开：前者给重试入口，后者才是空态 -->
+      <div v-if="tasksError && tasks.length === 0" class="client-empty">
+        <n-button size="small" quaternary type="primary" @click="loadTasks">下载任务读取失败，点击重试</n-button>
+      </div>
+      <div v-else-if="tasks.length === 0" class="client-empty">暂无下载任务</div>
+      <div v-else class="task-list">
+        <div v-for="task in tasks" :key="task.id" class="task-item">
+          <div class="task-header">
+            <div class="task-name" :title="task.file_name || task.url">
+              {{ task.file_name || task.url }}
             </div>
-            <div class="task-meta">
-              <span class="task-status" :class="'status-' + task.status">{{ statusLabel(task.status) }}</span>
-              <span v-if="task.total_size > 0" class="task-size">
-                {{ formatBytes(task.downloaded_bytes) }} / {{ formatBytes(task.total_size) }}
-              </span>
-              <span v-if="task.speed > 0" class="task-speed">{{ formatSpeed(task.speed) }}/s</span>
-              <span v-if="task.connections" class="task-conn">{{ task.connections }} 连接</span>
-              <span v-if="task.seeders > 0" class="task-seeders">{{ task.seeders }} 做种</span>
-              <span class="task-protocol">{{ task.protocol }}</span>
+            <div class="task-actions">
+              <n-button
+                v-if="task.status === 'downloading' || task.status === 'meta' || task.status === 'verifying'"
+                size="tiny"
+                quaternary
+                @click="pauseTask(task.id)"
+                >暂停</n-button
+              >
+              <n-button
+                v-else-if="task.status === 'paused'"
+                size="tiny"
+                quaternary
+                type="primary"
+                @click="resumeTask(task.id)"
+                >继续</n-button
+              >
+              <n-button
+                v-else-if="task.status === 'error'"
+                size="tiny"
+                quaternary
+                type="warning"
+                @click="retryTask(task.id)"
+                >重试</n-button
+              >
+              <n-button size="tiny" quaternary @click="openRename(task)">重命名</n-button>
+              <n-button size="tiny" quaternary type="error" @click="deleteTask(task)">删除</n-button>
             </div>
-            <div
-              v-if="
-                task.status === 'downloading' ||
-                task.status === 'meta' ||
-                task.status === 'verifying' ||
-                task.status === 'paused'
-              "
-              class="task-progress"
-            >
-              <n-progress
-                v-if="task.progress >= 0"
-                :percentage="progressPercent(task)"
-                :show-indicator="true"
-                :height="6"
-              />
-              <span v-else class="progress-unknown">进度未知（正在获取元数据）</span>
-            </div>
-            <div v-if="task.error" class="task-error">{{ task.error }}</div>
           </div>
+          <div class="task-meta">
+            <span class="task-status" :class="'status-' + task.status">{{ statusLabel(task.status) }}</span>
+            <span v-if="task.total_size > 0" class="task-size">
+              {{ formatBytes(task.downloaded_bytes ?? 0) }} / {{ formatBytes(task.total_size) }}
+            </span>
+            <!-- `!= null` 而不是 `> 0`：0 速度 / 0 连接 / 0 做种都是真实读数，不能被当成「没这个字段」 -->
+            <span v-if="task.speed != null" class="task-speed">{{ formatSpeed(task.speed) }}</span>
+            <span v-if="task.connections != null" class="task-conn">{{ task.connections }} 连接</span>
+            <!-- 做种只有 BT 才有意义：core 对 HTTP 任务同样回 seeders=0，直出会变成「0 做种」 -->
+            <span v-if="task.seeders != null && isBtProtocol(task.protocol)" class="task-seeders">
+              {{ task.seeders }} 做种
+            </span>
+            <span class="task-protocol" :title="task.protocol">{{ protocolLabel(task.protocol) }}</span>
+          </div>
+          <div
+            v-if="
+              task.status === 'downloading' ||
+              task.status === 'meta' ||
+              task.status === 'verifying' ||
+              task.status === 'paused'
+            "
+            class="task-progress"
+          >
+            <n-progress
+              v-if="task.progress >= 0"
+              :percentage="progressPercent(task)"
+              :show-indicator="true"
+              :height="6"
+            />
+            <span v-else class="progress-unknown">进度未知（正在获取元数据）</span>
+          </div>
+          <div v-if="task.error" class="task-error">{{ task.error }}</div>
         </div>
-      </n-spin>
+      </div>
     </GridCard>
 
     <!-- 新建下载弹窗 -->
     <n-modal
       v-model:show="showNewTask"
+      class="modal-fit"
       preset="dialog"
       title="新建下载"
       positive-text="开始下载"
       negative-text="取消"
       :positive-button-props="{ disabled: pathInvalid }"
-      style="width: 480px"
+      style="--modal-w: 480px"
       @positive-click="createTask"
     >
       <n-form label-placement="left" label-width="80">
@@ -152,13 +165,23 @@
     <!-- 配置弹窗 -->
     <n-modal
       v-model:show="showConfig"
+      class="modal-fit"
       preset="dialog"
       title="下载配置"
       positive-text="保存"
       negative-text="取消"
-      style="width: 520px"
+      :positive-button-props="{ disabled: configError }"
+      style="--modal-w: 520px; --modal-h: 720px"
       @positive-click="saveConfig"
     >
+      <!--
+        读不到配置时表单里是本文件的默认值（max_concurrent=3 之类），看上去和真实配置一样。
+        失败态要说清这一点，并禁掉「保存」—— 否则一次误点就把设备配置写成默认值。
+      -->
+      <div v-if="configError" class="client-empty">
+        <span>下载配置读取失败，当前显示的是页面默认值</span>
+        <n-button size="tiny" quaternary type="primary" @click="loadConfig">重试</n-button>
+      </div>
       <n-tabs type="segment" animated>
         <n-tab-pane name="basic" tab="基础">
           <div class="config-grid">
@@ -198,11 +221,11 @@
               <span class="config-label">最大 Peer</span>
               <n-input-number v-model:value="config.bt_max_peers" :min="1" :max="500" size="small" />
             </div>
-            <div class="config-item">
+            <div class="config-item switch-item">
               <span class="config-label">DHT</span>
               <n-switch v-model:value="config.bt_enable_dht" />
             </div>
-            <div class="config-item">
+            <div class="config-item switch-item">
               <span class="config-label">LPD</span>
               <n-switch v-model:value="config.bt_enable_lpd" />
             </div>
@@ -210,11 +233,11 @@
         </n-tab-pane>
         <n-tab-pane name="network" tab="网络">
           <div class="config-grid">
-            <div class="config-item">
+            <div class="config-item switch-item">
               <span class="config-label">禁用 IPv6</span>
               <n-switch v-model:value="config.disable_ipv6" />
             </div>
-            <div class="config-item">
+            <div class="config-item switch-item">
               <span class="config-label">校验证书</span>
               <n-switch v-model:value="config.check_certificate" />
             </div>
@@ -270,49 +293,62 @@
     <!-- Tracker 弹窗 -->
     <n-modal
       v-model:show="showTracker"
+      class="modal-fit"
       preset="dialog"
       title="BT Tracker"
       positive-text="保存"
       negative-text="取消"
-      style="width: 520px"
+      :positive-button-props="{ disabled: trackersError }"
+      style="--modal-w: 520px; --modal-h: 640px"
       @positive-click="saveTrackers"
     >
-      <div class="tracker-info">
-        <span>Tracker 数量: {{ trackerCount }}</span>
-        <span v-if="trackerLastUpdated">上次更新: {{ formatTime(trackerLastUpdated) }}</span>
-        <span>状态: {{ trackerStatus }}</span>
+      <!--
+        读不到 Tracker 时 textarea 是空串 —— 既看着像「一条都没有」，点保存还会用空列表覆盖设备端配置。
+        所以失败时换成重试入口，并把「保存」禁掉。
+      -->
+      <div v-if="trackersError" class="client-empty">
+        <span>Tracker 列表读取失败</span>
+        <n-button size="tiny" quaternary type="primary" @click="loadTrackers">重试</n-button>
       </div>
-      <div class="tracker-actions">
-        <n-button size="small" :loading="trackerRefreshing" @click="refreshTrackers">刷新 Tracker 列表</n-button>
-        <n-checkbox v-model:checked="trackerAutoUpdate">自动更新</n-checkbox>
-        <n-input-number
-          v-if="trackerAutoUpdate"
-          v-model:value="trackerIntervalHours"
-          :min="1"
-          :max="720"
-          size="small"
-          style="width: 110px"
+      <template v-else>
+        <div class="tracker-info">
+          <span>Tracker 数量: {{ trackerCount }}</span>
+          <span v-if="trackerLastUpdated">上次更新: {{ formatTime(trackerLastUpdated) }}</span>
+          <span :title="trackerStatus">状态: {{ trackerStatusLabel(trackerStatus) }}</span>
+        </div>
+        <div class="tracker-actions">
+          <n-button size="small" :loading="trackerRefreshing" @click="refreshTrackers">刷新 Tracker 列表</n-button>
+          <n-checkbox v-model:checked="trackerAutoUpdate">自动更新</n-checkbox>
+          <n-input-number
+            v-if="trackerAutoUpdate"
+            v-model:value="trackerIntervalHours"
+            :min="1"
+            :max="720"
+            size="small"
+            style="width: 110px"
+          />
+          <span v-if="trackerAutoUpdate" class="form-hint">小时</span>
+        </div>
+        <n-input
+          v-model:value="trackerText"
+          type="textarea"
+          :rows="10"
+          placeholder="每行一个 tracker URL"
+          style="margin-top: 12px"
         />
-        <span v-if="trackerAutoUpdate" class="form-hint">小时</span>
-      </div>
-      <n-input
-        v-model:value="trackerText"
-        type="textarea"
-        :rows="10"
-        placeholder="每行一个 tracker URL"
-        style="margin-top: 12px"
-      />
-      <div class="form-hint" style="margin-top: 6px">后端以逗号分隔存储，这里按行编辑，保存时自动转换。</div>
+        <div class="form-hint" style="margin-top: 6px">后端以逗号分隔存储，这里按行编辑，保存时自动转换。</div>
+      </template>
     </n-modal>
 
     <!-- 重命名弹窗 -->
     <n-modal
       v-model:show="showRename"
+      class="modal-fit"
       preset="dialog"
       title="重命名任务"
       positive-text="确定"
       negative-text="取消"
-      style="width: 420px"
+      style="--modal-w: 420px"
       @positive-click="submitRename"
     >
       <n-input v-model:value="renameName" placeholder="新的文件名" @keydown.enter="submitRename" />
@@ -336,6 +372,10 @@ const api = useCancellableApi();
 // ── 状态 ──
 const loading = ref(false);
 const tasks = ref<any[]>([]);
+/** 这一轮列表没读到（tasks 保留上一次的读数，不静默清空） */
+const tasksError = ref(false);
+/** 至少成功读到过一次列表 —— 状态栏据此区分「aria2 没启动」与「根本没读到」 */
+const tasksLoaded = ref(false);
 const aria2Running = ref(false);
 const aria2Version = ref<string | null>(null);
 const activeCount = ref(0);
@@ -375,7 +415,8 @@ const pathHint = computed<{ level: 'ok' | 'warn' | 'bad'; text: string } | null>
   const r = pathResult.value;
   if (!r || !newTask.save_path.trim()) return null;
   if (r.valid) {
-    return { level: 'ok', text: `可写，剩余 ${formatBytes(r.free_space >= 0 ? r.free_space : 0)}` };
+    // core 用 -1 表示「目录存在但读不到剩余空间」（validate-path），0 是合法的「写满了」
+    return { level: 'ok', text: `可写，剩余 ${r.free_space >= 0 ? formatBytes(r.free_space) : '--'}` };
   }
   if (!r.exists) return { level: 'warn', text: '目录不存在，下载时会尝试创建' };
   if (r.is_directory === false) return { level: 'bad', text: '该路径是文件，不是目录' };
@@ -438,6 +479,8 @@ const renameTarget = ref<any | null>(null);
 
 // ── 配置 ──
 const showConfig = ref(false);
+/** 配置没读到：弹窗里显示的是本地默认值，不能当成设备真实配置 */
+const configError = ref(false);
 const config = reactive({
   max_concurrent: 3,
   max_connections_per_server: 16,
@@ -466,6 +509,8 @@ const config = reactive({
 // ── Tracker ──
 const showTracker = ref(false);
 const trackerText = ref('');
+/** Tracker 列表没读到：空 textarea 既像「一条都没有」，保存还会覆盖设备端配置 */
+const trackersError = ref(false);
 const trackerLastUpdated = ref(0);
 const trackerStatus = ref('unknown');
 const trackerRefreshing = ref(false);
@@ -475,6 +520,16 @@ const deleteWithFile = ref(false);
 
 // ── 计算属性 ──
 const completedCount = computed(() => tasks.value.filter((t) => t.status === 'completed').length);
+
+/**
+ * 状态栏第一句。
+ * 之前直接写 `aria2Running ? '运行中' : '未启动'`，而 `aria2Running` 初值就是 false ——
+ * 于是「请求失败」和「aria2 真的没起来」在界面上是同一句话，用户会去重启 aria2 白折腾。
+ */
+const aria2StateText = computed(() => {
+  if (!tasksLoaded.value) return tasksError.value ? 'aria2 状态未知（读取失败）' : '正在读取状态…';
+  return aria2Running.value ? 'aria2 运行中' : 'aria2 未启动';
+});
 
 const throttleDetail = computed(() => {
   const parts: string[] = [];
@@ -509,8 +564,11 @@ async function loadTasks() {
     if (data.config) {
       defaultSavePath.value = data.config.save_dir || '';
     }
+    tasksError.value = false;
+    tasksLoaded.value = true;
   } catch {
-    /* 静默 */
+    // 读不到 ≠ 没有任务：置错误态让列表区分「空」与「失败」，下一轮轮询成功会自己清掉
+    tasksError.value = true;
   }
 }
 
@@ -541,8 +599,9 @@ async function loadConfig() {
       throttle_battery_critical: data.throttle_battery_critical ?? 10,
       only_download_when_charging: data.only_download_when_charging ?? false,
     });
+    configError.value = false;
   } catch {
-    /* 静默 */
+    configError.value = true;
   }
 }
 
@@ -560,8 +619,9 @@ async function loadTrackers() {
     trackerStatus.value = data.status || 'unknown';
     trackerAutoUpdate.value = data.auto_update ?? false;
     trackerIntervalHours.value = data.interval_hours ?? 24;
+    trackersError.value = false;
   } catch {
-    /* 静默 */
+    trackersError.value = true;
   }
 }
 
@@ -866,6 +926,68 @@ function statusLabel(status: string): string {
   return map[status] || status;
 }
 
+/**
+ * core `DownloadManager.throttleState` 的取值：normal / disabled / stopped / warning / critical
+ * （见 `DownloadManager.kt` 的 `startSmartThrottle()` 与 `checkAndThrottle()`）。
+ */
+function throttleLabel(state: string): string {
+  const map: Record<string, string> = {
+    normal: '正常',
+    disabled: '未启用（智能节流关闭）',
+    stopped: '已暂停（触发节流）',
+    warning: '轻度限速',
+    critical: '严重限速',
+  };
+  return map[state] || `未知（${state}）`;
+}
+
+/** core `TrackerMeta.status` 里 error 后面的自由文本，只有已知这一句有中文，其余原样透出 */
+const TRACKER_ERROR_TEXT: Record<string, string> = {
+  'fetch returned empty (kept cached list)': '抓取结果为空，已保留原列表',
+};
+
+/**
+ * core `TrackerMeta.status` 的取值：idle / updating / ok / ok (manual list active) /
+ * ok (builtin fallback) / error: <msg>（见 `TrackerManager.kt`）。
+ */
+function trackerStatusLabel(status: string): string {
+  if (!status || status === 'unknown') return '--';
+  if (status === 'idle') return '尚未刷新';
+  if (status === 'updating') return '更新中';
+  if (status.startsWith('error')) {
+    const detail = status.slice(status.indexOf(':') + 1).trim();
+    return detail ? `刷新失败（${TRACKER_ERROR_TEXT[detail] || detail}）` : '刷新失败';
+  }
+  if (status.includes('manual')) return '正常（使用手动列表）';
+  if (status.includes('builtin')) return '正常（内置列表兜底）';
+  if (status.startsWith('ok')) return '正常';
+  return `未知（${status}）`;
+}
+
+/**
+ * `task.protocol` 是 core `detectProtocol()` 的结果：http / https / ftp / sftp /
+ * magnet / torrent / metalink。BT 那两项必须中文，其余是通用写法、保留大写。
+ */
+function protocolLabel(protocol: string | null | undefined): string {
+  if (!protocol) return '--';
+  const map: Record<string, string> = {
+    http: 'HTTP',
+    https: 'HTTPS',
+    ftp: 'FTP',
+    sftp: 'SFTP',
+    magnet: '磁力链接',
+    torrent: 'BT 种子',
+    metalink: 'Metalink',
+  };
+  return map[protocol.toLowerCase()] || `未知（${protocol}）`;
+}
+
+/** 「做种」只有 BT 协议才有：core 对 HTTP 任务也返回 `seeders=0`，不能当 0 个做种显示 */
+function isBtProtocol(protocol: string | null | undefined): boolean {
+  const p = (protocol || '').toLowerCase();
+  return p === 'magnet' || p === 'torrent';
+}
+
 function formatTime(ts: number): string {
   if (!ts) return '--';
   // core TrackerMeta.lastUpdated 是 System.currentTimeMillis()（毫秒）
@@ -940,12 +1062,7 @@ onUnmounted(() => {
   display: flex;
   gap: 8px;
 }
-.empty-state {
-  text-align: center;
-  padding: 40px 0;
-  color: var(--text-muted);
-  font-size: 14px;
-}
+/* 空态/失败态统一走全局 .client-empty（main.css），本文件不再自绘 .empty-state */
 .task-list {
   display: flex;
   flex-direction: column;

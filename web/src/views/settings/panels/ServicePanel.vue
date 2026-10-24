@@ -25,15 +25,29 @@
       </div>
       <InfoRow label="采集循环" :value="service.loaded ? (service.collecting ? '运行中' : '已停止') : '--'" />
       <InfoRow label="运行时长" :value="serviceUptimeText" />
-      <div class="text-muted" style="margin-top: 8px; font-size: 12px">
+      <div class="text-muted config-hint">
         停止后台服务会停掉设备侧全部自主活动：数据采集、告警检测、定时任务、短信转发、下载与内网穿透看护。HTTP
-        接口保持可用（否则就没法再开回来），其它页面会显示"服务已停止"，重新开启后自动恢复；「重启服务」是后端进程级完全重启，接口会中断约
-        10 秒。
+        接口保持可用（否则就没法再开回来），其它页面会显示"服务已停止"，重新开启后自动恢复；「重启服务」会销毁并重新拉起后端服务组件（进程通常不退出，别按"进程级重启"理解，core
+        侧 `BackendService.kt:145-146` 有口径澄清），接口会中断约 10 秒，重启完成后本面板会自动等到就绪。
       </div>
+      <!-- 重启看护的实时状态（2026-10-14）：原来只有一个写死的 13s 定时器，超时后停在"未知"且不会自恢复；
+           现在由 useServiceRestart 轮询 /health 直到就绪，这里显示"已等 Ns"或失败原因。
+           颜色走 n-text 的语义色，不写死色值（check-ui-baseline 会卡）。 -->
+      <n-text v-if="serviceRestartText" :type="serviceRestartType" class="restart-status">
+        {{ serviceRestartText }}
+      </n-text>
       <div class="card-actions">
-        <n-button type="warning" size="small" :loading="serviceRestarting" @click="restartBackendService"
+        <n-button
+          type="warning"
+          size="small"
+          :loading="serviceRestarting"
+          :disabled="serviceRestarting"
+          @click="restartBackendService"
           >重启服务</n-button
         >
+        <!-- 重试：服务端拒绝过 → 重新发一次请求；只是等超时 → 只重新看护，不再打一次重启
+             （理由见 useServiceRestart.retry 的注释：超时多半是设备慢，服务其实已经在起来了）。 -->
+        <n-button v-if="serviceRestartFailed" size="small" quaternary @click="retryServiceRestart">重试</n-button>
       </div>
     </GridCard>
 
@@ -56,15 +70,25 @@
         </div>
       </div>
       <InfoRow label="共享目录" :value="dlnaDirsText" />
-      <div v-if="dlna.loaded && !dlna.ready" class="text-muted" style="margin-top: 8px; font-size: 12px">
+      <div v-if="dlna.loaded && !dlna.ready" class="text-muted config-hint">
         请先添加至少一个共享目录，否则开关不可用。
       </div>
       <div class="card-actions">
         <n-button size="small" @click="openDlnaDirs">选择共享目录</n-button>
       </div>
-      <n-modal v-model:show="dlnaDirsModal" preset="card" title="选择 DLNA 共享目录" style="max-width: 520px">
-        <div style="margin-bottom: 8px; font-size: 12px; opacity: 0.7">当前：{{ dlnaBrowsePath }}</div>
-        <n-breadcrumb style="margin-bottom: 8px">
+      <!-- 尺寸走 `.modal-fit`（2026-10-14）。改前这里只写了 `style="max-width: 520px"`：
+           行内 max-width 压过了 main.css 里 `.n-modal` 的全局兜底，而 card preset 又没有默认宽度
+           （`.n-card{width:100%}`），于是这个弹窗在手机上直接铺满整屏、左右零间距；
+           目录一多还会比屏幕高。现在宽高都由那个类收口。 -->
+      <n-modal
+        v-model:show="dlnaDirsModal"
+        preset="card"
+        title="选择 DLNA 共享目录"
+        class="modal-fit"
+        style="--modal-w: 520px"
+      >
+        <div class="dlna-current">当前：{{ dlnaBrowsePath }}</div>
+        <n-breadcrumb class="dlna-crumbs">
           <n-breadcrumb-item v-for="c in dlnaCrumbs" :key="c.path" @click="browseDlna(c.path)">
             {{ c.name }}
           </n-breadcrumb-item>
@@ -72,8 +96,10 @@
         <n-spin :show="dlnaBrowsing">
           <n-list v-if="dlnaChildren.length" hoverable clickable size="small">
             <n-list-item v-for="d in dlnaChildren" :key="d.path" @click="browseDlna(d.path)">
-              <div style="display: flex; justify-content: space-between; align-items: center">
-                <span>{{ d.name }}</span>
+              <div class="dlna-row">
+                <!-- 目录名可能很长（/storage/emulated/0/Android/data/…）：必须 min-width:0 + 省略号，
+                     否则它会把右侧的「选择」按钮整颗挤出 360px 的弹窗。完整路径放 title。 -->
+                <span class="dlna-row-name" :title="d.path">{{ d.name }}</span>
                 <n-button
                   size="tiny"
                   :type="dlnaPicked.includes(d.path) ? 'primary' : 'default'"
@@ -83,11 +109,11 @@
               </div>
             </n-list-item>
           </n-list>
-          <div v-else style="padding: 16px; text-align: center; opacity: 0.6">无子目录</div>
+          <div v-else class="client-empty">无子目录</div>
         </n-spin>
         <template #footer>
-          <div style="display: flex; justify-content: space-between; align-items: center">
-            <span style="font-size: 12px; opacity: 0.7">已选 {{ dlnaPicked.length }} 个目录</span>
+          <div class="dlna-footer">
+            <span class="dlna-footer-count">已选 {{ dlnaPicked.length }} 个目录</span>
             <n-space>
               <n-button size="small" @click="dlnaDirsModal = false">取消</n-button>
               <n-button size="small" type="primary" :loading="dlnaBusy" @click="saveDlnaDirs">保存</n-button>
@@ -97,27 +123,18 @@
       </n-modal>
     </GridCard>
 
-    <!-- Card 5: 缓存管理 -->
-    <GridCard title="缓存管理">
-      <InfoRow label="条目数" :value="cacheStats.entries" />
-      <InfoRow label="缓存大小" :value="cacheStats.size" />
-      <div class="card-actions">
-        <n-button type="warning" size="small" :loading="cacheLoading" @click="clearCache">清空缓存</n-button>
-      </div>
-      <n-divider style="margin: 10px 0" />
-      <div class="section-subtitle">按模式清除</div>
-      <div class="inline-group">
-        <n-input v-model:value="cachePattern" placeholder="输入匹配模式" size="small" style="flex: 1" />
-        <n-button size="small" :disabled="!cachePattern" :loading="cacheLoading" @click="invalidateCache"
-          >清除</n-button
-        >
-      </div>
-    </GridCard>
+    <!-- Card 5「缓存管理」已移到「性能」面板（PerformancePanel，2026-10-14「各回各家」搬迁）。
+         理由：本面板管的是**采集服务的起停**（start/stop/restart/autostart），而「清缓存」是
+         缓存话题 —— 它和性能面板里的「缓存 TTL」是一件事的两半（一个定缓存活多久、一个立刻
+         清掉），拆在两个面板里讲不通。搬走后本面板只剩服务控制 + DLNA 投屏，域是干净的。
+         原先那块的 import / ref / 函数（cacheStats / cachePattern / cacheLoading /
+         loadCacheStats / clearCache / invalidateCache / formatCacheSize）已随块一并删除，
+         避免 noUnusedLocals 报错与死代码 —— 已确认它们没有被 DLNA 那块复用。 -->
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue';
+import { ref, reactive, computed, onMounted } from 'vue';
 import { useMessage, useDialog } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
@@ -125,6 +142,7 @@ import InfoRow from '@/components/InfoRow.vue';
 import { Endpoints } from '@/api/contract';
 import { formatUptime } from '@/views/settings/settingsShared';
 import { useServiceStore } from '@/stores/service';
+import { useServiceRestart } from '@/composables/useServiceRestart';
 
 const message = useMessage();
 const dialog = useDialog();
@@ -145,11 +163,39 @@ const service = reactive({
   autoStartOnBoot: false,
 });
 const serviceBusy = ref(false);
-const serviceRestarting = ref(false);
-let serviceRestartTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ── 服务重启看护（2026-10-14 重写）──
+// 2026-10-14 之前：`serviceRestarting` + 一个写死的 13s `setTimeout` 回读（原 `:139-140` / `:224-229`），
+// 状态还是组件实例级的、`onUnmounted` 顺手清掉定时器（原 `:365-367`）。两个毛病：
+// ① 13s 是**猜的**，设备慢一点就回读到"未知"且**再也不会自己恢复**；
+// ② 切走再回来只剩 `service.loaded = false` 的"未知"，没有任何"上次重启到底成没成"的记录。
+// 现在换成 useServiceRestart（轮询 /health + 明确超时上限 + 复核服务运行时长），状态放模块作用域。
+const {
+  restarting: serviceRestarting,
+  failed: serviceRestartFailed,
+  statusText: serviceRestartText,
+  request: requestServiceRestart,
+  retry: retryServiceRestart,
+} = useServiceRestart({
+  onRequested: () => {
+    message.warning('已请求重启，正在等待服务就绪…');
+  },
+  onReady: () => {
+    // 确认就绪 → 立刻回读真实状态，并同步全局 store（否则布局层要等 30s 巡检才反应过来）
+    void loadServiceStatus();
+    void serviceStore.refresh();
+    message.success('后端服务已重启就绪');
+  },
+  onFailed: (reason) => {
+    message.error(reason);
+    // 失败也回读一次：接口可能已经能答了（那就显示真实状态），也可能仍不可达
+    void loadServiceStatus();
+  },
+});
 
 const serviceTagType = computed<'default' | 'success' | 'warning' | 'error'>(() => {
-  // 重启中优先：重启时会把 loaded 置 false，若先判 loaded 会显示成"未知"
+  // 重启中/未确认优先：重启时会把 loaded 置 false，若先判 loaded 会显示成"未知"
+  if (serviceRestartFailed.value) return 'error';
   if (serviceRestarting.value) return 'warning';
   if (!service.loaded) return 'default';
   if (!service.enabled) return 'error';
@@ -157,32 +203,28 @@ const serviceTagType = computed<'default' | 'success' | 'warning' | 'error'>(() 
 });
 const serviceTagLabel = computed(() => {
   if (serviceRestarting.value) return '重启中';
+  if (serviceRestartFailed.value) return '重启未确认';
   if (!service.loaded) return '未知';
   if (!service.enabled) return '已停止';
   // 开关为开但采集循环没跑 = 异常，显式暴露而不是报"运行中"
   return service.collecting ? '运行中' : '未采集';
 });
+/** 重启状态行的语义色（用 n-text 的 type，不写死色值） */
+const serviceRestartType = computed<'warning' | 'success' | 'error'>(() => {
+  if (serviceRestartFailed.value) return 'error';
+  if (serviceRestarting.value) return 'warning';
+  return 'success';
+});
 // 共享版 settingsShared.formatUptime 与拆分前的实现一致，收的是**毫秒**（内部自己 /1000），
 // 所以这里直接传 uptime_ms，不要再换算。
 const serviceUptimeText = computed(() => (service.loaded ? formatUptime(service.uptimeMs) : '--'));
 
-// ── 缓存 ──
-const cacheStats = reactive({ entries: 0, size: '0 B' });
-const cachePattern = ref('');
-const cacheLoading = ref(false);
-
-// ── ADB / Cache ──
-async function loadCacheStats() {
-  try {
-    const { data } = await api.get('/api/cache/stats');
-    // core ResponseCache.getStats(): { count, max_entries, any_cache_count, total_bytes_estimate, stale, entries[] }
-    // 旧代码读 data.entries（其实是数组）与 data.size/bytes（不存在），导致条目数错乱、大小恒 0
-    cacheStats.entries = Number(data.count ?? 0) + Number(data.any_cache_count ?? 0);
-    cacheStats.size = formatCacheSize(Number(data.total_bytes_estimate ?? 0));
-  } catch {
-    /* silent */
-  }
-}
+// ── 缓存管理 ──
+// 2026-10-14 整体移到 PerformancePanel：cacheStats / cachePattern / cacheLoading / loadCacheStats /
+// clearCache / invalidateCache / formatCacheSize 与「按模式清除」那段 UI 全部搬走，不留死代码
+// （已逐个确认没有被 DLNA 那块复用）。理由见模板里那条注释：它和性能面板的「缓存 TTL」是一件事的两半。
+// 顺带记一笔：本面板的 `api` 仍是 getApiClient()（服务控制与 DLNA 沿用旧写法，不在本次搬迁范围内），
+// 性能面板那边新写的取数走 useCancellableApi()。
 
 // ── 服务控制 ──
 // 路径统一走 contract 常量（Endpoints.service.*），改错会有类型错误，不再靠手抄字符串。
@@ -225,86 +267,32 @@ async function toggleAutoStart(value: boolean) {
   }
 }
 
+// ── 重启服务（2026-10-14 重写，理由见上方 useServiceRestart 那段注释）──
+// 2026-10-14 之前是：`serviceRestarting = true` → POST → `message.warning('约 10 秒后自动恢复')`
+// → `service.loaded = false` → `setTimeout(回读, 13000)`。13s 是**猜的**，猜错就永远停在"未知"。
+// 现在 POST 与等待都交给 useServiceRestart.request()：读基线 → POST → 轮询 /health 直到就绪（上限 90s）。
 function restartBackendService() {
+  if (serviceRestarting.value) return;
   dialog.warning({
     title: '重启服务',
     content: '将重启后端服务，所有接口（含本页面）会中断约 10 秒，期间正在进行的下载/上传任务会被中断。确定继续？',
     positiveText: '重启',
     negativeText: '取消',
-    onPositiveClick: async () => {
-      serviceRestarting.value = true;
-      try {
-        await api.post(Endpoints.service.restart);
-      } catch {
-        // 服务被停掉时连接会断开，请求失败属于预期，不当作错误
-      }
-      message.warning('已请求重启，约 10 秒后自动恢复');
+    onPositiveClick: () => {
+      // 回读会失败到服务回来为止：先按"读不到"处理，别把重启前的旧值当现状展示
       service.loaded = false;
-      // 给 AlarmManager 的 10s 重启延迟留出余量后回读（句柄存下来，卸载时清理）
-      if (serviceRestartTimer) clearTimeout(serviceRestartTimer);
-      serviceRestartTimer = setTimeout(async () => {
-        serviceRestartTimer = null;
-        await loadServiceStatus();
-        serviceRestarting.value = false;
-      }, 13000);
+      // **不要 await**：看护最长 90 秒，await 会让弹窗一直转圈。状态由面板那行"重启中…"承接。
+      // "已请求重启"的提示由 onRequested 在 POST 被受理后发出（被拒时只弹错误，不弹这句）。
+      void requestServiceRestart();
     },
   });
-}
-
-// ── Cache ──
-async function clearCache() {
-  dialog.warning({
-    title: '清空缓存',
-    content: '确定清空所有缓存数据？',
-    positiveText: '清空',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      cacheLoading.value = true;
-      try {
-        await api.post('/api/cache/clear');
-        message.success('缓存已清空');
-        loadCacheStats();
-      } catch {
-        message.error('清空失败');
-      } finally {
-        cacheLoading.value = false;
-      }
-    },
-  });
-}
-
-async function invalidateCache() {
-  if (!cachePattern.value) return;
-  cacheLoading.value = true;
-  try {
-    await api.post('/api/cache/invalidate', { pattern: cachePattern.value });
-    message.success('缓存已按模式清除');
-    loadCacheStats();
-  } catch {
-    message.error('清除失败');
-  } finally {
-    cacheLoading.value = false;
-  }
-}
-
-// ══════════════════════════════════════════════
-//  Helpers
-// ══════════════════════════════════════════════
-
-function formatCacheSize(bytes: number): string {
-  if (!bytes || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-  return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
 }
 
 // ── DLNA MediaServer（2026-10-09）──
 // ready=false（未配目录）时开关置灰：core 也会拒（400），这里提前拦住体验更好。
 const dlna = reactive({ loaded: false, enabled: false, running: false, ready: false, dirs: [] as string[] });
 const dlnaBusy = ref(false);
-const dlnaDirsText = computed(() =>
-  dlna.dirs.length ? dlna.dirs.join('、') : '未配置（至少需要一个目录）'
-);
+const dlnaDirsText = computed(() => (dlna.dirs.length ? dlna.dirs.join('、') : '未配置（至少需要一个目录）'));
 
 async function loadDlnaStatus() {
   try {
@@ -379,7 +367,9 @@ async function browseDlna(path: string) {
             children.push({ path: d.mount, name: d.label || d.mount });
           }
         }
-      } catch { /* disk-usage 失败不阻塞浏览 */ }
+      } catch {
+        /* disk-usage 失败不阻塞浏览 */
+      }
     }
     dlnaChildren.value = children;
   } catch {
@@ -425,36 +415,85 @@ async function saveDlnaDirs() {
 
 onMounted(() => {
   loadServiceStatus();
-  loadCacheStats();
+  // loadCacheStats() 已随「缓存管理」卡移到 PerformancePanel（2026-10-14）
   loadDlnaStatus();
 });
 
-onUnmounted(() => {
-  if (serviceRestartTimer) clearTimeout(serviceRestartTimer);
-});
+// 2026-10-14：原来这里清的是「重启回读」的 setTimeout 句柄。现在定时器在看护内部
+// （模块作用域的 useServiceRestart），且**必须**活得比本组件久——否则切页回来就看不到结果了，
+// 所以卸载时不再清任何东西：回调解绑由 useServiceRestart 的 onScopeDispose 负责。
 </script>
 
 <style scoped>
 /* .settings-panel 栅格与断点、.config-grid/.config-item/.config-label/.switch-item 版式、
    .section-subtitle、.card-actions 均已统一到 src/styles/main.css（全局各一份） */
 
-/* 只在本面板使用：「日志保留天数」输入框与单位文字并排 */
-.inline-group {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
+/* .inline-group（模式输入框 + 按钮并排）已随「缓存管理」卡移到 PerformancePanel（2026-10-14）——
+   它在搬走前就只被那一块用，留着是死代码。 */
 
-/* ── 与「调试日志」卡共用的头部操作区（LogsPanel 里各留一份）── */
+/* ── 与「调试日志」卡共用的头部操作区（LogsPanel 里各留一份）──
+   ⚠ 本轮**保留这份本地副本**：`.log-header-actions` 在 LogsPanel 里还有一份，
+   与 `.text-muted` 同属「设置域字段类/排版类上收」的范畴。收公共件由 C2 负责
+   （docs-dev/web-ui-remediation-plan.md §8.2），本轮不抽 —— 抽了会同时改到 B8 的文件。 */
 .log-header-actions {
   display: flex;
   gap: 6px;
   align-items: center;
 }
 
-/* ── Text helpers ── */
+/* ── 重启看护的状态行（2026-10-14）：只管版式，颜色走 n-text 的 type，不写死色值 ── */
+.restart-status {
+  display: block;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+/* ── DLNA 共享目录弹窗（2026-10-21：原来这里全是行内样式）──
+   尺寸仍由 `.modal-fit` 收口（`--modal-w: 520px`），下面只放版式。 */
+.dlna-current {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.dlna-crumbs {
+  margin-bottom: 8px;
+}
+.dlna-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+/* 目录名过长时省略而不是把「选择」按钮挤出弹窗；完整名字走 title 悬停 */
+.dlna-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dlna-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.dlna-footer-count {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* ── Text helpers ──
+   ⚠ `.text-muted` 在多个设置面板与弹窗里各有一份，`.config-hint`（说明句的小字号 +
+   上外边距）同理。本轮只把**行内样式**收进类，不收公共件 —— 上收由 C2 负责
+   （docs-dev/web-ui-remediation-plan.md §8.2）。 */
 .text-muted {
   color: var(--text-muted);
   font-size: 13px;
+}
+.config-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>

@@ -1,9 +1,10 @@
 <template>
   <n-modal
     :show="show"
+    class="modal-fit"
     preset="dialog"
     :show-icon="false"
-    style="width: 600px"
+    style="--modal-w: 600px; --modal-h: 720px"
     @update:show="(v: boolean) => emit('update:show', v)"
   >
     <template #header>
@@ -14,7 +15,12 @@
     </template>
 
     <n-spin :show="logsLoading">
-      <div v-if="taskLogs.length === 0 && !logsLoading" class="log-empty">
+      <!-- 读取失败不再落成「暂无执行记录」（那是「没有日志」而不是「没读到」） -->
+      <div v-if="loadError" class="log-empty log-failed" role="alert">
+        <span class="log-failed-text">{{ loadError }}</span>
+        <n-button size="tiny" :loading="logsLoading" @click="loadLogs">重试</n-button>
+      </div>
+      <div v-else-if="taskLogs.length === 0 && !logsLoading" class="log-empty">
         <n-empty description="暂无执行记录" />
       </div>
       <div v-else class="log-list">
@@ -43,14 +49,13 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue';
-import { useMessage } from 'naive-ui';
 import { CheckmarkCircle, CloseCircle } from '@vicons/ionicons5';
 import { getApiClient } from '@/composables/useApi';
+import { errText } from '../tasksShared';
 
 const props = defineProps<{ show: boolean; title: string; kind: 'task' | 'rule'; id: string }>();
 const emit = defineEmits<{ 'update:show': [boolean] }>();
 
-const message = useMessage();
 const api = getApiClient();
 
 interface TaskLog {
@@ -61,6 +66,12 @@ interface TaskLog {
 
 const taskLogs = ref<TaskLog[]>([]);
 const logsLoading = ref(false);
+/** 读取失败的原因（空串 = 读成功）。失败与「没有日志」要分开显示 */
+const loadError = ref('');
+
+/** 请求序号：只有最后发出的那一次请求才有资格写 logs / 复位 loading
+ *  （见 loadLogs；与 DeliveryHistoryModal 同一套机制） */
+let logsSeq = 0;
 
 function formatTimestamp(ts: string | number): string {
   if (!ts) return '--';
@@ -76,27 +87,51 @@ function formatTimestamp(ts: string | number): string {
   });
 }
 
-// 打开时拉取日志：core 按追加顺序返回（最旧在前），倒序展示让最新记录在最上
-watch(
-  () => props.show,
-  async (v) => {
-    if (!v) return;
-    taskLogs.value = [];
-    logsLoading.value = true;
-    try {
-      const { data } = await api.get(`/api/${props.kind === 'task' ? 'tasks' : 'rules'}/${props.id}/logs`);
-      taskLogs.value = (data.logs || [])
-        .map((l: any) => ({
-          timestamp: l.timestamp || l.time || '',
-          success: l.success ?? l.ok ?? false,
-          output: l.output || l.message || '',
-        }))
-        .reverse();
-    } catch {
-      message.error('加载日志失败');
-    } finally {
+async function loadLogs() {
+  // 记下这次请求的目标：回来时目标变了就丢弃结果（useLazyModal 的 350ms 保活窗口里
+  // 「关 A → 开 B」时，A 的迟到响应会把 A 的日志填进标题写着 B 的弹窗）
+  const id = props.id;
+  const kind = props.kind;
+  // 序号比 id/kind 更强：id 没变但用户又点了一次重试时，前一次请求的迟到响应
+  // 同样不该覆盖新结果（也不能在 finally 里把新请求的 loading 提前复位）
+  const seq = ++logsSeq;
+  taskLogs.value = [];
+  loadError.value = '';
+  logsLoading.value = true;
+  try {
+    const { data } = await api.get(`/api/${kind === 'task' ? 'tasks' : 'rules'}/${id}/logs`);
+    if (seq !== logsSeq || id !== props.id || kind !== props.kind) {
+      return;
+    }
+    // core 按追加顺序返回（最旧在前），倒序展示让最新记录在最上
+    taskLogs.value = (data.logs || [])
+      .map((l: any) => ({
+        timestamp: l.timestamp || l.time || '',
+        success: l.success ?? l.ok ?? false,
+        output: l.output || l.message || '',
+      }))
+      .reverse();
+  } catch (e: any) {
+    if (seq !== logsSeq || id !== props.id || kind !== props.kind) {
+      return;
+    }
+    loadError.value = errText(e, '加载日志失败');
+  } finally {
+    // 过期请求不碰 loading：新请求的骨架屏会被这一下提前关掉、闪一下再回来
+    if (seq === logsSeq) {
       logsLoading.value = false;
     }
+  }
+}
+
+// 打开时拉取日志：watch 依赖从只看 show 改为 [show, id, kind]（与 CfTokenModal 同一处理）
+watch(
+  () => [props.show, props.id, props.kind] as const,
+  ([v]) => {
+    if (!v) {
+      return;
+    }
+    void loadLogs();
   },
   { immediate: true }
 );
@@ -114,11 +149,26 @@ watch(
   font-weight: 400;
 }
 .log-empty {
-  padding: 24px 0;
+  padding: var(--space-6) 0;
 }
+/* 失败态：一行原因 + 重试（与「暂无执行记录」区分开） */
+.log-failed {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) 0;
+  color: var(--error);
+  font-size: var(--font-sm);
+}
+.log-failed-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+/* 列表不再自设 max-height：滚动交给 .modal-fit 的内容区（否则会出现里外两条滚动条，
+   矮屏下用户要先滚外层再滚内层才发现底下还有记录） */
 .log-list {
-  max-height: min(400px, 56vh);
-  overflow-y: auto;
+  min-height: 0;
 }
 .log-item {
   padding: 8px 10px;

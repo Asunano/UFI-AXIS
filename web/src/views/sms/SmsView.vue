@@ -2,20 +2,82 @@
   <div class="sms-view">
     <GridCard title="短信管理">
       <template #extra>
-        <n-space :size="8" align="center">
+        <!--
+          `wrap`：360–414px 下这块要放「共 N 条 / N 条未读 + 刷新 / 全部已读 / 多选 / 新建短信
+          + 拦截规则」7 个元素，不换行就只能互相挤压（文案糊成一团、按钮缩到不可点）。
+          换行是低风险方案：高度多一两行，但每个动作都保持原尺寸与可读性。
+        -->
+        <n-space :size="8" align="center" wrap>
           <template v-if="activeTab === 'messages'">
-            <n-tag v-if="totalCount > 0" :bordered="false" size="small"> 共 {{ totalCount }} 条 </n-tag>
-            <n-tag v-if="unreadCount > 0" type="info" :bordered="false" size="small"> {{ unreadCount }} 条未读 </n-tag>
-            <n-button size="small" :loading="contactsLoading" @click="refreshAll"> 刷新 </n-button>
-            <n-button v-if="unreadCount > 0" size="small" @click="markAllRead"> 全部已读 </n-button>
-            <n-button size="small" type="primary" @click="showNewSms = true"> 新建短信 </n-button>
+            <!--
+              多选动作条（2026-10-14）。进入多选后它**替换**整块页面级动作，
+              而不是并列追加：多选期间「刷新 / 全部已读 / 新建短信」都跟"我正要删的这几条"
+              不是一回事，留着它们只会让用户在最需要确认自己选了什么的时候，
+              眼前多出四个语义无关的按钮（也与「删除」争同一片注意力）。
+            -->
+            <template v-if="selectMode">
+              <ValueBadge label="已选" :value="selectedIds.size" unit=" 项" size="sm" />
+              <n-button size="small" :disabled="selectableIds.length === 0 || allSelected" @click="selectAllMessages">
+                全选
+              </n-button>
+              <n-button size="small" @click="exitSelectMode">取消</n-button>
+              <n-button
+                size="small"
+                type="error"
+                :disabled="selectedIds.size === 0"
+                :loading="deleting"
+                @click="confirmDeleteSelected"
+              >
+                删除
+              </n-button>
+            </template>
+            <template v-else>
+              <ValueBadge v-if="totalCount > 0" label="共" :value="totalCount" unit=" 条" size="sm" />
+              <ValueBadge v-if="unreadCount > 0" :value="unreadCount" unit=" 条未读" size="sm" color="var(--info)" />
+              <!-- 计数读失败不能说成「没有」：两个胶囊都带 v-if，失败时会一起消失，
+                   看上去与「共 0 条」完全一样，所以这里单独给一个可重试的出口 -->
+              <n-button v-if="countsError" size="small" quaternary type="error" @click="loadCounts">
+                统计读取失败，重试
+              </n-button>
+              <n-button size="small" :loading="contactsLoading" @click="refreshAll"> 刷新 </n-button>
+              <n-button v-if="unreadCount > 0" size="small" @click="markAllRead"> 全部已读 </n-button>
+              <n-button v-if="canEnterSelectMode" size="small" @click="enterSelectMode"> 多选 </n-button>
+              <!--
+                发短信入口的能力门禁（Capability.SMS）。禁用判据一律用 `caps.unsupported()`，
+               绝不用 `!caps.supports()`：后者在"能力集还没拉到 / 拉取失败"时也成立，
+                会把整个入口锁死（见 stores/capabilities.ts 文件头）。
+                外层 span 是为了让 tooltip 能被 hover 到 —— 浏览器不对 disabled 表单控件
+                派发鼠标事件，`.gated-btn:disabled` 上的 pointer-events:none 把悬停让给外层。
+              -->
+              <n-tooltip :disabled="!smsUnsupported" :title="smsHint">
+                <template #trigger>
+                  <span class="gated-wrap">
+                    <n-button
+                      size="small"
+                      type="primary"
+                      class="gated-btn"
+                      :disabled="smsUnsupported"
+                      @click="showNewSms = true"
+                    >
+                      新建短信
+                    </n-button>
+                  </span>
+                </template>
+              </n-tooltip>
+            </template>
           </template>
           <template v-else-if="activeTab === 'codes'">
-            <n-tag v-if="codes.length > 0" :bordered="false" size="small"> 共 {{ codes.length }} 条 </n-tag>
+            <ValueBadge v-if="codes.length > 0" label="共" :value="codes.length" unit=" 条" size="sm" />
             <n-button size="small" :loading="codesLoading" @click="loadVerificationCodes"> 刷新 </n-button>
+            <!--
+              2026-10-14：「验证码设置」（启用提取 / 清理周期）自「设置 → 通用」迁来。
+              与下面的「拦截规则」同一形态 —— 设置不进 tab 清单，点开一个弹窗；
+              入口放在「验证码」这个 tab 的动作区，因为它只影响这个 tab 的内容。
+            -->
+            <n-button size="small" quaternary @click="codeSettingsModal.open()">验证码设置</n-button>
           </template>
           <template v-else>
-            <n-tag v-if="blockedTotal > 0" :bordered="false" size="small"> 共 {{ blockedTotal }} 条 </n-tag>
+            <ValueBadge v-if="blockedTotal > 0" label="共" :value="blockedTotal" unit=" 条" size="sm" />
             <n-button size="small" :loading="blockedLoading" @click="loadBlocked()"> 刷新 </n-button>
             <n-button v-if="blockedRecords.length > 0" size="small" type="error" @click="confirmClearBlocked">
               清空
@@ -42,7 +104,11 @@
               </div>
               <n-spin :show="contactsLoading && contacts.length === 0">
                 <n-scrollbar class="contacts-scroll">
-                  <div v-if="filteredContacts.length === 0 && !contactsLoading" class="panel-empty">
+                  <!-- 「读不到」与「确实没有」必须分开：前者给重试，后者才是空态 -->
+                  <div v-if="contactsError && contacts.length === 0" class="client-empty">
+                    <n-button size="small" quaternary @click="loadContacts">读取失败，点击重试</n-button>
+                  </div>
+                  <div v-else-if="filteredContacts.length === 0 && !contactsLoading" class="client-empty">
                     <n-empty :description="contactFilter === 'unread' ? '没有未读短信' : '暂无短信'" size="small" />
                   </div>
                   <div
@@ -89,18 +155,23 @@
               <template v-if="selectedPhone">
                 <!-- Conversation header -->
                 <div class="conv-header">
-                  <n-button v-if="isMobile" size="tiny" quaternary class="back-btn" @click="selectedPhone = ''">
+                  <n-button v-if="isMobile" size="tiny" quaternary class="back-btn" @click="closeConversation">
                     &larr;
                   </n-button>
                   <span class="conv-phone">{{ selectedPhone }}</span>
-                  <n-tag size="tiny" :bordered="false"> {{ conversationCount }} 条消息 </n-tag>
+                  <ValueBadge :value="conversationCount" unit=" 条消息" size="sm" variant="outline" />
                 </div>
 
                 <!-- Messages -->
                 <n-spin :show="messagesLoading && messages.length === 0">
                   <n-scrollbar ref="scrollbarRef" class="messages-scroll">
                     <div class="messages-list">
-                      <div v-if="displayMessages.length === 0 && !messagesLoading" class="panel-empty">
+                      <div v-if="messagesError && displayMessages.length === 0" class="client-empty">
+                        <n-button size="small" quaternary @click="loadConversation(selectedPhone)">
+                          读取失败，点击重试
+                        </n-button>
+                      </div>
+                      <div v-else-if="displayMessages.length === 0 && !messagesLoading" class="client-empty">
                         <n-empty description="暂无消息记录" size="small" />
                       </div>
                       <div v-if="canLoadMore" class="load-more-row">
@@ -111,7 +182,29 @@
                       <div v-else-if="hitPageCap" class="load-more-row load-more-hint">
                         已加载最近 {{ MAX_PAGE }} 条（后端单次上限），更早消息请在设备端查看
                       </div>
-                      <div v-for="msg in displayMessages" :key="msg.id" class="msg-row" :class="msg.direction">
+                      <div
+                        v-for="msg in displayMessages"
+                        :key="msg.id"
+                        class="msg-row"
+                        :class="[msg.direction, { selectable: selectMode, selected: isSelected(msg) }]"
+                        @click="onMsgRowClick(msg)"
+                      >
+                        <!--
+                          复选框只在多选模式出现。乐观气泡（`opt-<ts>`，已发未确认）的复选框
+                          禁用：它没有后端 id，混进 `ids` 会让 core 整批 400。
+                        -->
+                        <span
+                          v-if="selectMode"
+                          class="msg-check"
+                          :title="isSelectable(msg) ? undefined : '这条短信还没写入设备，暂时不能批量删除'"
+                          @click.stop
+                        >
+                          <n-checkbox
+                            :checked="isSelected(msg)"
+                            :disabled="!isSelectable(msg)"
+                            @update:checked="toggleMessageSelection(msg)"
+                          />
+                        </span>
                         <div class="msg-bubble" @contextmenu.prevent="openMsgMenu($event, msg)">
                           <div class="msg-content">{{ msg.content }}</div>
                           <div class="msg-time">
@@ -138,27 +231,39 @@
 
                 <!-- Message input -->
                 <div class="msg-input-bar">
+                  <!--
+                    不支持短信能力时输入框也一并禁用：留一个能打字但发不出去的框，
+                    用户会先写完整条短信才在点「发送」时撞墙。提示直接写进 placeholder，
+                    因为 tooltip 在 disabled 的输入框上同样出不来。
+                  -->
                   <n-input
                     v-model:value="newMessage"
-                    placeholder="输入短信内容..."
+                    :placeholder="smsUnsupported ? smsHint : '输入短信内容...'"
+                    :disabled="smsUnsupported"
                     type="textarea"
                     :autosize="{ minRows: 1, maxRows: 4 }"
                     @keydown.enter.exact.prevent="sendMessage"
                   />
-                  <n-button
-                    type="primary"
-                    :loading="sending"
-                    :disabled="!newMessage.trim()"
-                    class="send-btn"
-                    @click="sendMessage"
-                  >
-                    发送
-                  </n-button>
+                  <n-tooltip :disabled="!smsUnsupported" :title="smsHint">
+                    <template #trigger>
+                      <span class="gated-wrap">
+                        <n-button
+                          type="primary"
+                          :loading="sending"
+                          :disabled="smsUnsupported || !newMessage.trim()"
+                          class="send-btn gated-btn"
+                          @click="sendMessage"
+                        >
+                          发送
+                        </n-button>
+                      </span>
+                    </template>
+                  </n-tooltip>
                 </div>
               </template>
 
               <template v-else>
-                <div class="panel-empty conv-placeholder">
+                <div class="client-empty conv-placeholder">
                   <n-empty description="选择一个联系人查看短信" size="large" />
                 </div>
               </template>
@@ -170,7 +275,11 @@
           <div class="codes-body">
             <n-spin :show="codesLoading && codes.length === 0">
               <n-scrollbar class="codes-scroll">
-                <div v-if="codes.length === 0 && !codesLoading" class="panel-empty">
+                <!-- 同联系人列表：「读不到」单独给重试，「确实没有」才是空态 -->
+                <div v-if="codesError && codes.length === 0" class="client-empty">
+                  <n-button size="small" quaternary @click="loadVerificationCodes">读取失败，点击重试</n-button>
+                </div>
+                <div v-else-if="codes.length === 0 && !codesLoading && !codesError" class="client-empty">
                   <n-empty description="暂无验证码" size="small" />
                 </div>
                 <div v-else class="codes-list">
@@ -205,7 +314,10 @@
           <div class="blocked-body">
             <n-spin :show="blockedLoading && blockedRecords.length === 0">
               <n-scrollbar class="blocked-scroll">
-                <div v-if="blockedRecords.length === 0 && !blockedLoading" class="panel-empty">
+                <div v-if="blockedError && blockedRecords.length === 0" class="client-empty">
+                  <n-button size="small" quaternary @click="loadBlocked()">读取失败，点击重试</n-button>
+                </div>
+                <div v-else-if="blockedRecords.length === 0 && !blockedLoading && !blockedError" class="client-empty">
                   <n-empty description="暂无被拦截的短信" size="small" />
                 </div>
                 <div v-else class="blocked-list">
@@ -244,14 +356,15 @@
       </n-tabs>
     </GridCard>
 
-    <!-- New SMS modal -->
+    <!-- New SMS modal（宽高由 .modal-fit 收口，不再写行内 width） -->
     <n-modal
       v-model:show="showNewSms"
       preset="dialog"
       title="新建短信"
       positive-text="发送"
       negative-text="取消"
-      style="width: 440px"
+      class="modal-fit"
+      style="--modal-w: 440px"
       @positive-click="sendNewSms"
     >
       <div class="new-sms-form">
@@ -266,9 +379,14 @@
       </div>
     </n-modal>
 
-    <!-- 验证码原文弹窗 -->
-
-    <n-modal v-model:show="showRawSms" preset="card" title="短信原文" style="width: 440px">
+    <!-- 验证码原文弹窗：正文可能很长，--modal-h 让内容区自己滚、标题常驻 -->
+    <n-modal
+      v-model:show="showRawSms"
+      preset="card"
+      title="短信原文"
+      class="modal-fit"
+      style="--modal-w: 440px; --modal-h: 600px"
+    >
       <n-spin :show="rawLoading">
         <div v-if="rawSms" class="raw-sms">
           <InfoRow label="手机号" :value="rawSms.phoneNumber || '未知'" />
@@ -276,7 +394,7 @@
           <InfoRow label="时间" :value="formatFullTime(rawSms.timestamp)" />
           <div class="raw-content">{{ rawSms.content }}</div>
         </div>
-        <div v-else-if="!rawLoading" class="panel-empty">
+        <div v-else-if="!rawLoading" class="client-empty">
           <n-empty description="无法获取短信原文" size="small" />
         </div>
       </n-spin>
@@ -290,6 +408,14 @@
       @update:show="filterModal.setShow"
       @changed="onRulesChanged"
     />
+
+    <!-- 验证码设置弹窗：懒加载，与拦截规则同一套「挂载与显隐分两拍」 -->
+    <component
+      :is="codeSettingsComponent"
+      v-if="codeSettingsComponent"
+      :show="codeSettingsShow"
+      @update:show="codeSettingsModal.setShow"
+    />
   </div>
 </template>
 
@@ -300,8 +426,10 @@ import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { useIsMobile } from '@/composables/useIsMobile';
+import { useCapabilitiesStore } from '@/stores/capabilities';
 import { copyToClipboard } from '@/composables/utils';
 import {
+  Capability,
   Endpoints,
   SmsRuleScopeLabels,
   SmsRuleMatchLabels,
@@ -312,6 +440,7 @@ import {
 
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
+import ValueBadge from '@/components/ValueBadge.vue';
 import type { VerificationCode } from '@/types';
 
 interface Contact {
@@ -335,12 +464,44 @@ const message = useMessage();
 const dialog = useDialog();
 const api = useCancellableApi();
 
+/**
+ * 短信能力门禁（`Capability.SMS`）。
+ *
+ * ## 语义边界（照 core 侧定的，不是猜的）
+ * `Capability.SMS` 覆盖的**只有"发送"这一个写动作**：`contract/Capabilities.kt` 的枚举 KDoc
+ * 写的是「覆盖的写动作：`POST /api/sms/send`」，门禁落点也只有 `RootSmsRoutes` 的 `/sms/send`；
+ * 那个 route 自己的注释还补了一句「信箱的读 / 删 / 标已读**不在此域内**」。
+ * 而 `DeviceAdapter.sms`（信箱查询 / 发送 / 删除 / 已读标记 / 条数统计）对每台设备都是**非空**的 ——
+ * 即"没有短信能力"指的是**发不出去**，不是"没有信箱"。
+ *
+ * 所以这里只门禁两个**发短信入口**（页面上的「新建短信」与会话里的「发送」/输入框）；
+ * 浏览列表、验证码、已拦截、单条/整段/批量删除、标记已读/未读**一律照常可用**。
+ * 若拿 `Capability.SMS` 去禁用删除，用户会在一个"短信列表就在眼前"的页面上看到一个删不掉的列表。
+ *
+ * ## 判据
+ * 一律用 `unsupported()`（只有"明确不支持"才 true），**不用** `!supports()`：
+ * 后者在能力集还没拉到 / 拉取失败时也成立，会把入口锁死（见 stores/capabilities.ts 文件头）。
+ */
+const caps = useCapabilitiesStore();
+const smsUnsupported = computed(() => caps.unsupported(Capability.SMS));
+const smsHint = computed(() => caps.hintOf(Capability.SMS));
+
 // ── State ──
 const contacts = ref<Contact[]>([]);
 const messages = ref<SmsMessage[]>([]);
 const selectedPhone = ref('');
 const contactsLoading = ref(false);
 const messagesLoading = ref(false);
+/**
+ * 三个「静默失败」的出口（原先是 `catch {}`）。
+ *
+ * 为什么必须留状态：联系人 / 计数 / 会话三个接口失败时，界面会退化成
+ * 「暂无短信」「共 0 条」—— 那与「设备里确实没有短信」在屏幕上完全一样，
+ * 用户会以为短信丢了（或以为被拦截规则吃掉了）。失败要能说出来，并且给重试。
+ */
+const contactsError = ref(false);
+const messagesError = ref(false);
+const countsError = ref(false);
 const sending = ref(false);
 const newMessage = ref('');
 const contactFilter = ref<'all' | 'unread'>('all');
@@ -356,11 +517,36 @@ const scrollbarRef = ref<any>(null);
 // 已发送但后端尚未确认的乐观消息（发送后即时显示，避免界面不刷新）
 const optimisticMessages = ref<SmsMessage[]>([]);
 
+// ── 批量删除（2026-10-14）──
+//
+// 三条删除接口语义不同，**不合并调用**（契约里刻意分成三条的理由见 `Endpoints.sms.deleteBatch`）：
+//   · `POST /api/sms/delete`             单条（气泡右键菜单，已有）
+//   · `POST /api/sms/delete-conversation` 按号码整段（会话行右键菜单，已有）
+//   · `POST /api/sms/delete-batch`        一批短信 id（本次新增）
+//
+// ## 多选为什么挂在**消息列表**上、而不是会话列表上
+// deleteBatch 收的是短信 id；会话行只有号码，没有 id —— 想删一整段得走 delete-conversation，
+// 那是另一条语义（"这段会话全删" ≠ "我勾的这几条"）。把多选画在会话行上，
+// 用户勾了三段会话之后按「删除」，代码只能猜他要哪一条接口，猜错就是把整段会话删了。
+//
+// ## 入口为什么是按钮而不是长按
+// 本仓 web 侧的既有习惯是**右键菜单**（消息气泡与会话行都是 `@contextmenu`），
+// 长按在这个界面里没有任何先例；而且长按在桌面浏览器上会被文本选择/拖拽吃掉，
+// 在移动端浏览器里还会触发系统的"长按选中/放大镜"，和 app（Compose `combinedClickable`）不同 ——
+// app 的长按是自己实现的、不会被系统抢走。显式按钮可发现、可键盘触达，
+// 代价只是多一个按钮，所以选它。
+const selectMode = ref(false);
+/** 勾选的短信 id。**只装后端 id（number）**：乐观气泡的 `opt-<ts>` 是字符串，进去就是整批 400。 */
+const selectedIds = ref<Set<number>>(new Set());
+const deleting = ref(false);
+
 // ── 验证码 / 短信原文 ──
 // 验证码与短信同为页面主体，用页内 tab 切换
 const activeTab = ref<'messages' | 'codes' | 'blocked'>('messages');
 const codesLoading = ref(false);
 const codes = ref<VerificationCode[]>([]);
+/** 同 contacts/messages：请求失败不能落成「暂无验证码」，要留可重试的出口。 */
+const codesError = ref(false);
 const codesLoaded = ref(false);
 const showRawSms = ref(false);
 
@@ -375,6 +561,8 @@ const LS_BLOCKED_SEEN_ID = 'ufi_axis_sms_blocked_seen_id';
 const blockedRecords = ref<SmsBlockedRecord[]>([]);
 const blockedLoading = ref(false);
 const blockedLoadingMore = ref(false);
+/** 同 codesError：加载失败且手上没有数据时，列表区要给「读取失败，点击重试」。 */
+const blockedError = ref(false);
 const blockedLoaded = ref(false);
 const blockedTotal = ref(0);
 const blockedCursorTs = ref<number | null>(null);
@@ -390,6 +578,11 @@ const rules = ref<SmsRuleItem[]>([]);
 const filterModal = useLazyModal(() => import('./components/modals/SmsFilterModal.vue'));
 const filterComponent = filterModal.component;
 const filterShow = filterModal.show;
+
+// 验证码设置弹窗（懒加载，2026-10-14 自设置页「通用」迁来：这两项只影响本页的验证码 tab）
+const codeSettingsModal = useLazyModal(() => import('./components/modals/SmsCodeSettingsModal.vue'));
+const codeSettingsComponent = codeSettingsModal.component;
+const codeSettingsShow = codeSettingsModal.show;
 
 // ── Dropdown state ──
 const msgMenuTarget = ref<SmsMessage | null>(null);
@@ -419,6 +612,36 @@ const displayMessages = computed(() => [
   ...optimisticMessages.value.filter((o) => o.phoneNumber === selectedPhone.value),
 ]);
 
+// ── 多选（批量删除）──
+
+/** 后端 id（正整数）。乐观气泡的 `opt-<ts>` 是字符串，塞进 `ids` 会让 core 以 400 拒掉整批。 */
+function numericId(msg: SmsMessage): number | null {
+  return typeof msg.id === 'number' && Number.isInteger(msg.id) && msg.id > 0 ? msg.id : null;
+}
+
+function isSelectable(msg: SmsMessage): boolean {
+  return numericId(msg) !== null;
+}
+
+function isSelected(msg: SmsMessage): boolean {
+  const id = numericId(msg);
+  return id !== null && selectedIds.value.has(id);
+}
+
+/**
+ * 「全选」的范围 = **当前会话里已加载的这批**（受 core 单次 200 条上限约束），不是整段会话。
+ * 刻意不把未加载的历史消息也算进来：那得先把整段会话分页拉完，而拉完之后用户眼前仍然只有
+ * 屏幕上这几十条 —— 界面与"全选"的语义对不上时，用户会以为自己也就能删掉看得见的这些，
+ * 结果一次点击删掉几百条历史短信。
+ */
+const selectableIds = computed(() => messages.value.map(numericId).filter((id): id is number => id !== null));
+
+const allSelected = computed(
+  () => selectableIds.value.length > 0 && selectableIds.value.every((id) => selectedIds.value.has(id))
+);
+
+const canEnterSelectMode = computed(() => messages.value.length > 0);
+
 const canLoadMore = computed(
   () => messages.value.length > 0 && messages.value.length < conversationCount.value && pageLimit.value < MAX_PAGE
 );
@@ -435,7 +658,9 @@ const msgMenuOptions = computed(() => {
   options.push({
     key: 'delete',
     label: '删除',
-    render: (option: any) => h('span', { style: { color: '#d03050' } }, option.label),
+    // 令牌而不是 hex：基线扫描器只看 <style>，JS 里的写死色它扫不到，
+    // 但暗色/换肤下同样不跟（与 .msg-bubble 里用 token 的其它地方保持同一来源）。
+    render: (option: any) => h('span', { style: { color: 'var(--error)' } }, option.label),
   });
   return options;
 });
@@ -465,8 +690,10 @@ async function loadContacts() {
       lastTime: c.latestTimestamp ?? c.lastTime ?? c.last_time ?? 0,
       unread: c.unread ?? 0,
     }));
+    contactsError.value = false;
   } catch {
-    /* silent */
+    // 不把失败写成空列表：列表区据此显示「读取失败，点击重试」
+    contactsError.value = true;
   } finally {
     contactsLoading.value = false;
   }
@@ -477,13 +704,15 @@ async function loadCounts() {
     const { data } = await api.get('/api/sms/count');
     totalCount.value = data.total ?? 0;
     unreadCount.value = data.unread ?? 0;
+    countsError.value = false;
   } catch {
-    /* silent */
+    countsError.value = true;
   }
 }
 
 async function loadConversation(phone: string, scroll = true) {
   messagesLoading.value = true;
+  messagesError.value = false;
   try {
     const { data } = await api.get('/api/sms/list', {
       params: { phone, limit: pageLimit.value, offset: 0 },
@@ -519,7 +748,8 @@ async function loadConversation(phone: string, scroll = true) {
 
     if (scroll) scrollToBottom();
   } catch {
-    /* silent */
+    // 同 loadContacts：失败不能渲染成「暂无消息记录」，要让用户看见并能重试
+    messagesError.value = true;
   } finally {
     messagesLoading.value = false;
   }
@@ -531,13 +761,117 @@ function selectContact(phone: string) {
   messages.value = [];
   optimisticMessages.value = [];
   pageLimit.value = 50;
+  // 换会话就退出多选：勾选的是"上一个会话里的那几条"，留着模式会让新会话
+  // 一进来就满屏复选框，而用户并没有在这个会话里点过「多选」。
+  exitSelectMode();
   loadConversation(phone);
+}
+
+/** 关闭当前会话（移动端返回）。多选模式跟着会话一起退，否则会留下一个看不见的选中集。 */
+function closeConversation() {
+  selectedPhone.value = '';
+  messages.value = [];
+  optimisticMessages.value = [];
+  exitSelectMode();
 }
 
 async function loadMore() {
   if (!selectedPhone.value || messagesLoading.value) return;
   pageLimit.value = Math.min(MAX_PAGE, pageLimit.value + 50);
   await loadConversation(selectedPhone.value, false);
+}
+
+// ── 多选 / 批量删除 ──
+
+function enterSelectMode() {
+  selectMode.value = true;
+  selectedIds.value = new Set();
+}
+
+/** 退出多选并清空勾选。取消 / 删完 / 换会话 / 关会话 / 切 tab 都走它。 */
+function exitSelectMode() {
+  selectMode.value = false;
+  selectedIds.value = new Set();
+}
+
+function onMsgRowClick(msg: SmsMessage) {
+  if (!selectMode.value) return;
+  toggleMessageSelection(msg);
+}
+
+function toggleMessageSelection(msg: SmsMessage) {
+  const id = numericId(msg);
+  if (id === null) return;
+  // 换一个新 Set 而不是就地 add/delete：就地改也能触发（Vue 的集合是响应式的），
+  // 但整值替换让"选中集变了"这件事在代码里看得见，不必依赖对响应式集合的隐式依赖。
+  const next = new Set(selectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  selectedIds.value = next;
+}
+
+function selectAllMessages() {
+  selectedIds.value = new Set(selectableIds.value);
+}
+
+function confirmDeleteSelected() {
+  const ids = [...selectedIds.value];
+  if (ids.length === 0) return;
+  dialog.warning({
+    title: '删除短信',
+    // 说清删几条 + 不可撤销。这条路径**没有**回收站，也不像「标记已读」那样可以反着点回去。
+    content: `将删除 ${ids.length} 条短信，此操作不可撤销。`,
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: () => deleteSelected(ids),
+  });
+}
+
+/**
+ * `POST Endpoints.sms.deleteBatch`，body `{ ids }` → `{ success, deleted, requested }`。
+ *
+ * 文案按 **`deleted`** 说，不按 `success`：core 的判据是 `deleted > 0`，所以
+ * "一条都没删掉"回的是 `success: false` —— 那不是操作失败，是这些短信本来就不在了
+ * （多半在别处已经删过）。把它报成「删除失败」会让用户以为自己操作错了，然后反复重试。
+ */
+async function deleteSelected(ids: number[]) {
+  deleting.value = true;
+  try {
+    const { data } = await api.post(Endpoints.sms.deleteBatch, { ids });
+    // 组件卸载时请求被取消，data 为 undefined（见 useCancellableApi）
+    if (!data) return;
+    const deleted = Number(data.deleted ?? 0);
+    const requested = Number(data.requested ?? ids.length);
+    const missing = Math.max(0, requested - deleted);
+    if (deleted <= 0) {
+      message.warning(`所选 ${requested} 条短信均已不存在`);
+    } else if (missing > 0) {
+      message.success(`已删除 ${deleted} 条（${missing} 条已不存在）`);
+    } else {
+      message.success(`已删除 ${deleted} 条短信`);
+    }
+    exitSelectMode();
+    // 刷新列表：勾选期间 10s 轮询可能已经换过这批数据，本地过滤不如重新拉一遍准
+    loadContacts();
+    loadCounts();
+    if (selectedPhone.value) await loadConversation(selectedPhone.value, false);
+  } catch (e: any) {
+    // 三种失败分开说，判据一律是 HTTP 状态码，**不用** core 回的中文 `message`
+    // （那是给日志看的，措辞随时会变，拿它当判据等于把文案变成契约）：
+    //   · 400        —— 请求本身被拒（一个有效的 id 都没有），服务端一条都没删 ⇒ 重选；
+    //   · 其它状态码 —— 服务端收到了但没做成（5xx），删没删不确定 ⇒ 稍后重试；
+    //   · 没有状态码 —— 请求根本没到服务端（断网 / 超时）⇒ 先查网络。
+    const status = e?.response?.status;
+    if (status === 400) {
+      message.error('删除失败：没有有效的短信 ID，请刷新后重试');
+    } else if (status) {
+      message.error('删除失败：服务端出错，请稍后重试');
+    } else {
+      message.error('删除失败，请检查网络后重试');
+    }
+  } finally {
+    deleting.value = false;
+  }
 }
 
 async function markAllRead() {
@@ -662,6 +996,9 @@ function confirmDeleteMessage(msg: SmsMessage) {
 }
 
 function openMsgMenu(e: MouseEvent, msg: SmsMessage) {
+  // 多选期间不开右键菜单：这时候点一条消息的意图是"选中/取消它"，
+  // 再弹一个「删除 / 标记为未读」的单条菜单，等于在同一块区域里给两套互相矛盾的语义。
+  if (selectMode.value) return;
   msgDropdownX.value = e.clientX;
   msgDropdownY.value = e.clientY;
   msgMenuTarget.value = msg;
@@ -704,8 +1041,11 @@ async function loadVerificationCodes() {
   try {
     const { data } = await api.get('/api/sms/verification-codes');
     codes.value = (data.codes || []) as VerificationCode[];
+    codesError.value = false;
     codesLoaded.value = true;
   } catch {
+    // 保留上次成功的列表，只把失败标出来（空态分支据此让位给重试）
+    codesError.value = true;
     message.error('获取验证码失败');
   } finally {
     codesLoading.value = false;
@@ -714,6 +1054,9 @@ async function loadVerificationCodes() {
 
 // 切到验证码 tab 时首次加载；之后由 10s 轮询接管
 watch(activeTab, (tab) => {
+  // 离开「短信」tab 就退出多选：动作条只在那个 tab 的动作区里，
+  // 留着模式会让用户切回来时发现复选框还在，而中间他并没有再点过「多选」。
+  if (tab !== 'messages') exitSelectMode();
   if (tab === 'codes' && !codesLoaded.value) loadVerificationCodes();
   if (tab === 'blocked') {
     // 规则集合只在这个 tab 用得上（判断命中规则是否还在），进来再拉
@@ -809,9 +1152,12 @@ async function loadBlocked(more = false) {
     blockedCursorId.value = data.next_cursor_id ?? null;
     blockedHasMore.value = !!data.has_more && data.next_cursor_ts != null && data.next_cursor_id != null;
     blockedPaginated.value = more;
+    blockedError.value = false;
     blockedLoaded.value = true;
     if (activeTab.value === 'blocked') markBlockedSeen();
   } catch {
+    // 「加载更多」失败时列表里仍有数据，不该抢走展示；只有首屏失败才落到重试态
+    if (!more) blockedError.value = true;
     message.error(more ? '加载更多失败' : '加载拦截记录失败');
   } finally {
     blockedLoading.value = false;
@@ -903,6 +1249,8 @@ function confirmClearBlocked() {
         blockedCursorId.value = null;
         blockedHasMore.value = false;
         blockedPaginated.value = false;
+        // 清空成功即「确定没有」，不能让更早一次读失败留下的重试态盖在此刻的空列表上
+        blockedError.value = false;
         message.success('已清空');
       } catch {
         message.error('清空失败');
@@ -941,12 +1289,8 @@ function handleContactAction(key: string) {
           await api.post('/api/sms/delete-conversation', { phone: contact.phone });
           message.success('已删除');
           loadContacts();
-          // 如果当前正在看这段会话，关闭它
-          if (selectedPhone.value === contact.phone) {
-            selectedPhone.value = '';
-            messages.value = [];
-            optimisticMessages.value = [];
-          }
+          // 如果当前正在看这段会话，关闭它（连同多选模式）
+          if (selectedPhone.value === contact.phone) closeConversation();
         } catch {
           message.error('删除失败');
         }
@@ -972,10 +1316,8 @@ function handleContactAction(key: string) {
           match_type: 'equals',
         });
         message.success('已加入黑名单');
-        if (selectedPhone.value === contact.phone) {
-          selectedPhone.value = '';
-          messages.value = [];
-        }
+        // 该号码的短信从此不出现在列表里，正看着的这段会话必须关掉（连同多选模式）
+        if (selectedPhone.value === contact.phone) closeConversation();
         loadContacts();
         loadCounts();
         onRulesChanged();
@@ -1044,14 +1386,21 @@ function scrollToBottom() {
   });
 }
 
-function checkMobile() {
-  // isMobile 已改由 useIsMobile() composable 驱动，不再需要手动同步
+/**
+ * Esc 退出多选。与文件页（`FilesView.onKeydown`）同一条约定：
+ * 多选是个「临时状态」，必须有不用鼠标也能退出的出口 —— 否则用户只能去点「取消」，
+ * 而勾选了一屏之后他更想先"退出去看看"，不是先做决定。
+ * 弹窗打开时不抢 Esc：那个键归 naive-ui 的弹窗自己（关弹窗），一次按键只该做一件事。
+ */
+function onKeydown(e: KeyboardEvent) {
+  if (e.key !== 'Escape') return;
+  if (showNewSms.value || showRawSms.value) return;
+  if (selectMode.value) exitSelectMode();
 }
 
 // ── Lifecycle ──
 onMounted(() => {
-  checkMobile();
-  window.addEventListener('resize', checkMobile);
+  window.addEventListener('keydown', onKeydown);
   loadContacts();
   loadCounts();
   // 首页拦截记录挂载即拉一次：角标要在用户还没点进「已拦截」时就能看到
@@ -1077,32 +1426,66 @@ useInterval(() => {
 }, 30_000);
 
 onUnmounted(() => {
-  window.removeEventListener('resize', checkMobile);
+  window.removeEventListener('keydown', onKeydown);
 });
 </script>
 
 <style scoped>
+/* 高度链路（2026-10-21）：页面不再用 `calc(100dvh - 250px)` 把「顶栏 + 卡头 + tab 头 +
+   布局内距」估成一个固定数字。估错一档就整页多/少一截：多了出滚动条，少了把列表压扁。
+   现在改成从内容区（.main-content 的滚动容器是 height:100%）一路 flex 传下来。 */
 .sms-view {
   display: flex;
   flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+/* 卡壳是 GridCard（不归本批次），它自带 `overflow: hidden` —— 链路里任何一层没接上，
+   多出来的高度会被**静默裁掉**而不是出现滚动条。所以三层各自声明 min-height: 0。 */
+.sms-view :deep(.grid-card) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.sms-view :deep(.grid-card-body) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .sms-tabs {
-  margin-top: 4px;
+  margin-top: var(--space-1);
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
-/* tab 头 + pane 内边距约占 50px，主体高度相应下调，避免整页出现滚动条。
-   dvh 跟随移动端浏览器地址栏伸缩（Safari/Chrome 的 100vh 解析为大视口，
-   内容会比可视区高出地址栏那一截）。vh 是不支持 dvh 的旧浏览器回落。 */
+/* n-tabs 自己已经是 flex 列，但 nav / pane-wrapper / pane 默认是普通块，
+   高度传到 pane 就断了 —— 这三处补齐（inactive pane 靠 naive 的行内 display:none 隐藏，
+   与这里的 display:flex 不冲突）。 */
+.sms-tabs :deep(.n-tabs-nav) {
+  flex: 0 0 auto;
+}
+
+.sms-tabs :deep(.n-tabs-pane-wrapper),
+.sms-tabs :deep(.n-tab-pane) {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .sms-body,
 .codes-body,
 .blocked-body {
   display: flex;
-  height: calc(100vh - 250px);
-  height: calc(100dvh - 250px);
-  min-height: 360px;
+  flex: 1 1 auto;
+  min-height: 0;
   border: 1px solid var(--border-subtle);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
@@ -1123,7 +1506,7 @@ onUnmounted(() => {
 .tab-label {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 /* n-spin 包裹滚动区时默认不约束高度，导致内部滚动区高度坍塌无法滚动；
@@ -1163,7 +1546,7 @@ onUnmounted(() => {
   flex: 1;
   text-align: center;
   padding: 10px 0;
-  font-size: 13px;
+  font-size: var(--font-base);
   cursor: pointer;
   color: var(--text-secondary);
   transition:
@@ -1192,7 +1575,7 @@ onUnmounted(() => {
 .contact-item {
   display: flex;
   align-items: center;
-  padding: 12px 14px;
+  padding: var(--space-3);
   cursor: pointer;
   border-bottom: 1px solid var(--border-subtle);
   transition: background 0.15s;
@@ -1213,14 +1596,14 @@ onUnmounted(() => {
 }
 
 .contact-phone {
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 500;
   color: var(--text-primary);
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 
 .contact-preview {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -1237,7 +1620,7 @@ onUnmounted(() => {
 }
 
 .contact-time {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
   white-space: nowrap;
 }
@@ -1255,20 +1638,20 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 16px;
+  padding: 10px var(--space-4);
   border-bottom: 1px solid var(--border-subtle);
   background: var(--card-bg);
   flex-shrink: 0;
 }
 
 .conv-phone {
-  font-size: 14px;
+  font-size: var(--font-md);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .back-btn {
-  font-size: 16px;
+  font-size: var(--font-lg);
   padding: 0 6px;
 }
 
@@ -1284,10 +1667,10 @@ onUnmounted(() => {
 }
 
 .messages-list {
-  padding: 16px;
+  padding: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 /* ── Load more ── */
@@ -1298,7 +1681,7 @@ onUnmounted(() => {
 }
 
 .load-more-hint {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
   text-align: center;
 }
@@ -1316,11 +1699,49 @@ onUnmounted(() => {
   justify-content: flex-end;
 }
 
+/* ── 多选模式 ── */
+.msg-row.selectable {
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+/* 复选框贴着气泡：incoming 在左、outgoing 靠右整组右对齐，
+   所以它总在气泡的内侧，不会把已发气泡推离右边缘。 */
+.msg-check {
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.msg-row.selectable .msg-bubble {
+  cursor: pointer;
+}
+
+/* 选中态画在**整行**上而不是给气泡描边：已发气泡的底色就是 `--accent-color`，
+   拿 accent 去描它的边在两种主题下都看不出来。整行底色与气泡自身颜色无关。 */
+.msg-row.selected {
+  background: var(--accent-color-light);
+  border-radius: var(--radius-sm);
+}
+
+/* 禁用按钮上的 tooltip 需要外层接住指针事件：
+   浏览器不对 disabled 表单控件派发鼠标事件，把 pointer-events 让给外层 span
+   （否则「新建短信 / 发送」被禁用时，说明为什么不支持的提示永远弹不出来）。
+   `flex-shrink: 0` 是替原来的按钮接住发送栏里的约束 —— 现在 span 才是那个 flex 子项。 */
+.gated-wrap {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.gated-btn:disabled {
+  pointer-events: none;
+}
+
 .msg-bubble {
   max-width: 70%;
-  padding: 10px 14px;
-  border-radius: 12px;
-  font-size: 13px;
+  padding: 10px var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--font-base);
   line-height: 1.5;
   position: relative;
   word-break: break-word;
@@ -1348,14 +1769,14 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-top: 4px;
-  font-size: 11px;
+  margin-top: var(--space-1);
+  font-size: var(--font-xs);
   opacity: 0.6;
   justify-content: flex-end;
 }
 
 .msg-dir-tag {
-  font-size: 10px;
+  font-size: var(--font-xs);
   opacity: 0.8;
 }
 
@@ -1363,8 +1784,8 @@ onUnmounted(() => {
 .msg-input-bar {
   display: flex;
   align-items: flex-end;
-  gap: 8px;
-  padding: 12px 16px;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
   border-top: 1px solid var(--border-subtle);
   background: var(--card-bg);
   flex-shrink: 0;
@@ -1378,24 +1799,24 @@ onUnmounted(() => {
   height: 34px;
 }
 
-/* ── Empty / placeholder ── */
-.panel-empty {
+/* ── 空态 ──
+   空态统一走全局 `.client-empty`（main.css）。原先这里还有一份 `.panel-empty`
+   （flex 居中 + 40px 内距），与全局那份做同一件事，只差内距，故删掉。
+   `.conv-placeholder` 是唯一保留的本地修饰：它要占满整个会话区，
+   否则「选择一个联系人」会贴着顶部而不是居中。 */
+.conv-placeholder {
+  flex: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 40px 16px;
-  color: var(--text-muted);
-}
-
-.conv-placeholder {
-  flex: 1;
+  padding: var(--space-4) 0;
 }
 
 /* ── New SMS form ── */
 .new-sms-form {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: var(--space-3);
 }
 
 .form-row {
@@ -1405,7 +1826,7 @@ onUnmounted(() => {
 }
 
 .form-label {
-  font-size: 13px;
+  font-size: var(--font-base);
   color: var(--text-secondary);
   font-weight: 500;
 }
@@ -1415,18 +1836,18 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
   gap: 10px;
-  padding: 12px;
+  padding: var(--space-3);
 }
 
 .code-item {
-  padding: 12px 14px;
+  padding: var(--space-3);
   border: 1px solid var(--border-subtle);
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--card-bg);
 }
 
 .code-value {
-  font-size: 22px;
+  font-size: var(--font-xl);
   font-weight: 600;
   letter-spacing: 2px;
   color: var(--text-primary);
@@ -1438,8 +1859,8 @@ onUnmounted(() => {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  margin-top: 4px;
-  font-size: 12px;
+  margin-top: var(--space-1);
+  font-size: var(--font-sm);
   color: var(--text-secondary);
 }
 
@@ -1453,7 +1874,7 @@ onUnmounted(() => {
 
 .code-snippet {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
   line-height: 1.5;
   word-break: break-word;
@@ -1461,7 +1882,7 @@ onUnmounted(() => {
 
 .code-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   margin-top: 10px;
 }
 
@@ -1470,11 +1891,11 @@ onUnmounted(() => {
   flex-direction: column;
 }
 .raw-content {
-  margin-top: 12px;
-  padding: 12px;
-  border-radius: 8px;
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
   background: var(--page-bg);
-  font-size: 13px;
+  font-size: var(--font-base);
   line-height: 1.6;
   color: var(--text-primary);
   white-space: pre-wrap;
@@ -1485,11 +1906,11 @@ onUnmounted(() => {
 .blocked-list {
   display: flex;
   flex-direction: column;
-  padding: 4px 12px;
+  padding: var(--space-1) var(--space-3);
 }
 
 .blocked-item {
-  padding: 12px 0;
+  padding: var(--space-3) 0;
   border-bottom: 1px solid var(--border-subtle);
 }
 
@@ -1505,21 +1926,21 @@ onUnmounted(() => {
 }
 
 .blocked-sender {
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 500;
   color: var(--text-primary);
   word-break: break-all;
 }
 
 .blocked-time {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
   white-space: nowrap;
 }
 
 .blocked-snippet {
-  margin-top: 4px;
-  font-size: 12px;
+  margin-top: var(--space-1);
+  font-size: var(--font-sm);
   line-height: 1.5;
   color: var(--text-secondary);
   word-break: break-word;
@@ -1529,9 +1950,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
   margin-top: 6px;
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
 }
 
@@ -1539,25 +1960,30 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
 }
 
 .blocked-hint {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
+}
+
+/* ── 中间档（768–1024）──
+   侧栏在这一档已自动收起（DefaultLayout 的 NARROW_BREAKPOINT=1024），内容区反而比
+   1025–1200px 窄。联系人栏的 `30% + min-width: 260px` 会把会话区压到 400px 出头，
+   气泡一行只剩十几个字 —— 这一段把联系人栏的下限让出一档。
+   必须写在 768px 的那段**之前**：同特异性下后者胜出，手机形态才不会被这里盖掉。 */
+@media (max-width: 1024px) {
+  .contacts-panel {
+    width: 30%;
+    min-width: 200px;
+    max-width: 300px;
+  }
 }
 
 /* ── Mobile responsive ── */
 @media (max-width: 768px) {
-  .sms-body,
-  .codes-body,
-  .blocked-body {
-    height: calc(100vh - 230px);
-    height: calc(100dvh - 230px);
-    min-height: 300px;
-  }
-
   .codes-list {
     grid-template-columns: 1fr;
   }

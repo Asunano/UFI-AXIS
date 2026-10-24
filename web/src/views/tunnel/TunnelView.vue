@@ -11,13 +11,23 @@
 
       2026-09-21：概览卡换成 TunnelRunBar（一条 ~70px 的运行态条，不再是卡），
       理由与取舍写在那个组件的文件头。
+
+      ★ 2026-10-14：**组件安装整体搬去「资源中心」页**（用户原话："当前分得太散了"）。
+      原来本页有一整套就地安装：ComponentsModal 弹窗 + useComponentInstaller 的 1s 进度轮询
+      + 四张卡的安装/卸载/上传动作。它和设置页的「更新」面板各摆一份"下载并安装"的入口，
+      而两者装的东西（frpc/cloudflared vs 前端包/core APK）在用户眼里是同一类事。
+      现在：本页只留「未安装」的**提示 + 指路**（三处按钮都跳 `resources`），
+      ComponentsModal 的挂载已断开，本页也不再持有 useComponentInstaller。
+      注意本页**仍然**要读 `/api/tunnel/status` 的 `installed` 字段：提示本身依赖它。
     -->
     <TunnelRunBar
       :components="overviewComponents"
       :local-port="status.localPort"
       :loading="loading"
+      :loaded="statusLoaded"
+      :error="loadErrors.status"
       @refresh="loadAll"
-      @open-components="componentsModal.open()"
+      @open-resources="goResources"
       @open-guard="guardModal.open()"
       @clear-logs="confirmClearAllLogs"
       @stop-all="confirmStopAll"
@@ -30,9 +40,13 @@
       :installed="activeInstalled"
       :binary="activeBinary"
       :busy="busy"
+      :error="activeError"
+      :initial-loading="loading && !loadedOnce"
+      :retrying="loading"
       @update:kind="tunnelKind = $event"
       @stop-all-kind="stopAllOfKind"
-      @open-components="componentsModal.open()"
+      @open-resources="goResources"
+      @retry="loadAll"
       @start="startItem"
       @stop="stopItem"
       @edit="editItem"
@@ -41,21 +55,19 @@
       @delete="deleteItem"
     />
 
-    <!-- 五个弹窗全部按需加载：都是「点开才看」的东西，常驻挂载既占首包又让
+    <!-- 四个弹窗全部按需加载：都是「点开才看」的东西，常驻挂载既占首包又让
          自包含弹窗内部的 watch 一直在。挂载/显隐时序由 useLazyModal 管
          （所以是 :show + @update:show，不是 v-model:show），写法与网络页一致。 -->
-    <component
-      :is="componentsComponent"
-      v-if="componentsComponent"
-      :show="componentsShow"
-      :comp="comp"
-      :progress-active="progressActive"
-      @update:show="componentsModal.setShow"
-      @install="installComponent"
-      @uninstall="confirmUninstall"
-      @upload="uploadComponent"
-      @refresh="loadComponents(true)"
-    />
+    <!-- 2026-10-14：这里原来挂第五个弹窗 `ComponentsModal`（frpc/cloudflared 的下载安装列表）。
+         已移到资源中心，本页**不要再恢复这个挂载**。
+         关于那个组件文件本身：全仓 grep 后确认它已**没有任何消费者**，本该一并删除；
+         但删之前发现它的工作区版本里有 60 余行**尚未提交**的改动（2026-10-14 的「本地上传进度
+         接到 UI 上」那一版，git HEAD 里只有旧版），删掉就等于把那批改动弄丢。
+         所以本次**只断开挂载、保留文件**，把"删不删"留给资源中心那一侧决定
+         （要么复用它的列表 UI，要么确认无用后连同下面的 composable 一起删）。
+         它原来的取数层 `useComponentInstaller.ts` 同样**已无消费者**：本页不再调用它，
+         唯一的引用方就是上面那个已断开挂载的 ComponentsModal.vue（而且只 import 了一个类型）。
+         那个文件不在本次改造的写权限内，留给它的 owner 处理（要删就与 ComponentsModal 一起删）。 -->
 
     <component :is="guardComponent" v-if="guardComponent" :show="guardShow" @update:show="guardModal.setShow" />
 
@@ -89,22 +101,48 @@
 
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted } from 'vue';
+import { useRouter } from 'vue-router';
 import { useInterval } from '@/composables/useRealtime';
 import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
-import { useComponentInstaller } from '@/composables/useComponentInstaller';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { errText, type Instance } from './tunnelShared';
 import TunnelRunBar from './components/cards/TunnelRunBar.vue';
 import TunnelListCard from './components/cards/TunnelListCard.vue';
-// 五个弹窗都是按需加载，组件本体与显隐时序由 useLazyModal 管（见下方 componentsModal 等）。
+// 四个弹窗都是按需加载，组件本体与显隐时序由 useLazyModal 管（见下方 guardModal 等）。
+// 2026-10-14：组件安装弹窗 ComponentsModal 已移到资源中心，这里不再有它。
 
 const message = useMessage();
 const dialog = useDialog();
 const api = useCancellableApi();
+const router = useRouter();
+
+/**
+ * 三处「未安装」入口（运行态条读数行、列表上方横幅、空列表）统一走这里。
+ *
+ * 为什么由页面转发而不是让卡片自己 `router.push`：卡片在本项目里一律只 emit
+ * （见 TunnelListCard 的六个动作），跳转是页面级的编排；集中一处也方便以后要带
+ * query（例如高亮某个组件）时只改一行。**不带 query**：资源中心是别人在新建的页，
+ * 路由契约只冻结了 `name: 'resources'`，凭空塞参数等于单方面加接口。
+ */
+function goResources() {
+  router.push({ name: 'resources' });
+}
 
 const loading = ref(false);
 const busy = ref<string | null>(null);
+
+/**
+ * 三个取数端点各自的失败原因（空串 = 最近一次读成功）。
+ *
+ * 旧实现三处 catch 全是「静默」，于是读失败会显示成「暂无 FRP 通道配置」/「未运行」——
+ * 用户会去重配一条已经存在的隧道，或者以为进程挂了。失败必须能被看见、能被重试。
+ */
+const loadErrors = reactive({ status: '', frp: '', cf: '' });
+/** `/api/tunnel/status` 是否成功读到过：没读到过时运行态条的读数一律显示 `--` */
+const statusLoaded = ref(false);
+/** 首屏是否已经拉过一轮：卡片骨架只用于首屏，避免每次动作后整卡闪一下 */
+const loadedOnce = ref(false);
 
 const status = reactive({
   frpVersion: '',
@@ -136,6 +174,8 @@ const stopAllOfKind = () => (isFrp.value ? stopAllFrp() : stopAllCf());
 /** 当前这类隧道依赖的二进制装了没 —— 没装时列表上方横一条提醒并给安装入口 */
 const activeInstalled = computed(() => (isFrp.value ? status.frpInstalled : status.cfInstalled));
 const activeBinary = computed(() => (isFrp.value ? 'frpc' : 'cloudflared'));
+/** 当前这类隧道列表的读取失败原因（两类各自记账，切过去才不会串） */
+const activeError = computed(() => (isFrp.value ? loadErrors.frp : loadErrors.cf));
 
 /** 两类各自的「在跑 / 总数」，挂在列表卡那两颗切换按钮上：
     不切过去也知道另一边有几条在跑。running 是名字数组，长度即条数。 */
@@ -162,18 +202,17 @@ const overviewComponents = computed(() => [
   },
 ]);
 
-// 组件管理与看护设置从常驻卡片改成弹窗，入口在运行态条的 ⋯ 菜单
-const componentsModal = useLazyModal(() => import('./components/modals/ComponentsModal.vue'));
+// 看护设置从常驻卡片改成弹窗，入口在运行态条的 ⋯ 菜单。
+// 2026-10-14：原来是"组件管理与看护设置"两个弹窗，组件管理那个已随资源中心收口删除。
 const guardModal = useLazyModal(() => import('./components/modals/GuardSettingsModal.vue'));
-const componentsComponent = componentsModal.component;
-const componentsShow = componentsModal.show;
 const guardComponent = guardModal.component;
 const guardShow = guardModal.show;
 
-// 组件安装的状态与 1s 进度轮询挂在页面上（弹窗关了也要继续），只把展示交给 ComponentsModal。
-// onChanged：组件装好/卸掉后 installed 与版本号变了，隧道侧的 status 得重拉。
-const { comp, progressActive, loadComponents, installComponent, confirmUninstall, uploadComponent } =
-  useComponentInstaller({ onChanged: () => loadStatus() });
+// 2026-10-14：这里原来还有 useComponentInstaller({ onChanged: () => loadStatus() })，
+// 为 ComponentsModal 提供 comp / progressActive 与安装/卸载/上传动作。整体搬到资源中心后
+// 本页不再需要它 —— 安装进度也不再由本页的 1s 轮询承担（那个 composable 现在无消费者）。
+// 本页仍然依赖 /api/tunnel/status 的 installed 字段（下面 activeInstalled / overviewComponents），
+// 所以 loadStatus 里那段读法一个字都没动。
 
 // ── 编辑与日志弹窗的目标 ──
 // 两个编辑器共用一个 editorName：同一时刻只可能开一个（由 tunnelKind 决定开哪个）。
@@ -214,8 +253,10 @@ async function loadStatus() {
     status.cfRunning = data?.cf_tunnel?.running_count ?? 0;
     status.cfInstalled = data?.cf_tunnel?.installed !== false;
     status.localPort = data?.local_port ?? 0;
-  } catch {
-    /* 静默 */
+    loadErrors.status = '';
+    statusLoaded.value = true;
+  } catch (e: any) {
+    loadErrors.status = errText(e, '读取隧道运行状态失败');
   }
 }
 
@@ -225,8 +266,9 @@ async function loadFrp() {
     frp.active = data?.active || '';
     frp.running = data?.running || [];
     frp.items = data?.items || [];
-  } catch {
-    /* 静默 */
+    loadErrors.frp = '';
+  } catch (e: any) {
+    loadErrors.frp = errText(e, '读取 FRP 通道失败');
   }
 }
 
@@ -236,8 +278,9 @@ async function loadCf() {
     cf.active = data?.active || '';
     cf.running = data?.running || [];
     cf.items = data?.items || [];
-  } catch {
-    /* 静默 */
+    loadErrors.cf = '';
+  } catch (e: any) {
+    loadErrors.cf = errText(e, '读取 Cloudflare 隧道失败');
   }
 }
 
@@ -245,9 +288,11 @@ async function loadCf() {
 async function loadAll() {
   loading.value = true;
   try {
-    await Promise.all([loadStatus(), loadFrp(), loadCf(), loadComponents()]);
+    // 2026-10-14：原来还有 loadComponents()（组件清单，给 ComponentsModal 用）。已随安装 UI 搬走。
+    await Promise.all([loadStatus(), loadFrp(), loadCf()]);
   } finally {
     loading.value = false;
+    loadedOnce.value = true;
   }
 }
 

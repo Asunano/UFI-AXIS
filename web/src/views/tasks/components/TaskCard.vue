@@ -3,7 +3,7 @@
     <ActionIconBadge :action-type="task.actionType" :size="40" />
     <div class="task-card-body">
       <div class="task-card-top">
-        <span class="task-name">{{ task.name || actionLabel(task.actionType) }}</span>
+        <span class="task-name" :title="nameTitle">{{ task.name || actionLabel(task.actionType) }}</span>
         <n-tag
           :type="task.scheduleType && task.scheduleType !== 'once' ? 'info' : 'default'"
           size="tiny"
@@ -26,6 +26,7 @@
       </div>
     </div>
     <div class="task-card-actions">
+      <!-- ui-baseline-allow: 卡片行内的启停开关（无标签、无说明），套 ToggleRow 会把一条任务撑成三行 -->
       <n-switch :value="task.enabled" size="medium" @update:value="(v: boolean) => emit('toggle', v)" />
       <n-button size="tiny" quaternary @click="emit('edit')"
         ><n-icon :size="15"><CreateOutline /></n-icon
@@ -45,18 +46,29 @@
  * 一条定时任务。纯展示 + 意图上报：开关的乐观更新与接口写入都在页面里
  * （开关成功后页面直接改 task.enabled，失败不改 —— 那份时序不该拆两处）。
  */
+import { computed } from 'vue';
+import { TimeOutline, CreateOutline, ListOutline, TrashOutline } from '@vicons/ionicons5';
 import ActionIconBadge from './ActionIconBadge.vue';
 import {
   actionLabel,
   formatTimestampLocal,
+  isKnownAction,
   isSpentOnce,
   scheduleLabel,
   scheduleSummaryText,
   type Task,
 } from '../tasksShared';
-import { TimeOutline, CreateOutline, ListOutline, TrashOutline } from '@vicons/ionicons5';
 
-defineProps<{ task: Task }>();
+const props = defineProps<{ task: Task }>();
+
+/**
+ * 标题兜底：没有名称时显示动作类型的中文 label；动作类型也认不出时显示「未知动作」，
+ * 并把原始键放进 title —— 直接把 `data_toggle` 这样的键当标题上屏，用户既读不懂也查不到。
+ */
+const nameTitle = computed(() => {
+  const known = !!props.task.name || isKnownAction(props.task.actionType);
+  return known ? undefined : `未知动作：${props.task.actionType}`;
+});
 
 const emit = defineEmits<{
   (e: 'toggle', enabled: boolean): void;

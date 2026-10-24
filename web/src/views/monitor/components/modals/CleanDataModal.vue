@@ -2,10 +2,11 @@
   <n-modal
     :show="show"
     preset="dialog"
+    class="modal-fit"
     title="清理监控数据"
     positive-text="确认清理"
     negative-text="取消"
-    style="width: 400px"
+    style="--modal-w: 400px"
     @update:show="emit('update:show', $event)"
     @positive-click="doClean"
   >
@@ -13,7 +14,7 @@
       <p>清理指定天数之前的历史数据：</p>
       <div class="clean-input-row">
         <span>保留最近</span>
-        <n-input-number v-model:value="cleanDays" :min="1" :max="365" size="small" style="width: 120px" />
+        <n-input-number v-model:value="cleanDays" :min="1" :max="365" size="small" class="clean-days" />
         <span>天的数据</span>
       </div>
       <p class="clean-hint">
@@ -33,6 +34,9 @@
  *
  * 清理成功后 emit('cleaned') 而不是自己重新取数：被删的历史同时影响 6 张图和存储表，
  * 统一交给页面级的 loadAll。
+ *
+ * 宽高走 `.modal-fit`（计划 §6.10 B9-3）：原来写死 `style="width: 400px"`，
+ * 行内宽度会盖掉全局的 `max-width: calc(100vw - 32px)`，360px 视口下弹窗贴死屏幕两边。
  */
 import { ref } from 'vue';
 import { useMessage } from 'naive-ui';
@@ -81,6 +85,10 @@ async function doClean(): Promise<boolean> {
   gap: 8px;
   font-size: 14px;
   color: var(--text-secondary);
+}
+
+.clean-days {
+  width: 120px;
 }
 
 .clean-hint {

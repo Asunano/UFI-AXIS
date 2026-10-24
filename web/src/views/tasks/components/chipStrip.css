@@ -1,0 +1,50 @@
+/*
+ * 「快捷创建 / 规则模板」两个 chip 条共用的样式（2026-10-22，计划 §6.11 B10-8）。
+ *
+ * 背景：`PresetChips.vue` 与 `RuleTemplateChips.vue` 原先各带一份**逐字相同**的
+ * `.preset-*` 规则（含同一份 768px 折单列的 media query），改一处忘一处是迟早的事。
+ * scoped 样式无法在 SFC 之间 import，所以两个组件用 `<style scoped src="./chipStrip.css">`
+ * 指向这一份：源码只有一处，scoped 仍按各自组件生成 data-v 属性，互不污染。
+ *
+ * 顺带修正结构差异：`RuleTemplateChips` 原先没有 `.preset-chips` 容器（那条规则是死规则），
+ * 现在两个组件都是「label + chips 容器」，规则与结构一一对应。
+ *
+ * 取值说明：8 / 4px 走间距令牌；`margin-bottom: 14px` 与 `margin-left: 2px` 不在间距阶梯上
+ * （--space-3 是 12px、--space-4 是 16px），换成令牌会改变两个 chip 条的行距节奏，
+ * 属视觉改版、不在本轮范围，故原值保留。
+ */
+.preset-section {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.preset-label {
+  font-size: var(--font-base);
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+.preset-chips {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.preset-chip {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+.preset-time {
+  font-size: var(--font-xs);
+  opacity: 0.7;
+  margin-left: 2px;
+}
+
+@media (max-width: 768px) {
+  .preset-section {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}

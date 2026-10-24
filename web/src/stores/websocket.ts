@@ -99,7 +99,7 @@ export const useWebSocketStore = defineStore('websocket', () => {
           notifySystem(
             extra.code ? `验证码 ${extra.code}` : String(data.title ?? '新短信'),
             [extra.sender, extra.snippet ?? data.message].filter(Boolean).join(' · '),
-            `code:${extra.code ?? data.timestamp}`,
+            `code:${extra.code ?? data.timestamp}`
           );
         } else if (type === WsChannel.ALERT && data?.title) {
           notifySystem(String(data.title), String(data.message ?? ''), `alert:${data.id ?? data.timestamp}`);

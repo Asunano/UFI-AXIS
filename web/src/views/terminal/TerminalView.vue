@@ -1,29 +1,25 @@
 <template>
   <div class="terminal-view">
     <!--
-      Tab 切换条（纯选择器）：
-      对齐 Android AdvancedConsoleScreen 的 UfiScrollableTabRow —— 切换条与对话内容区
-      是「上下兄弟」而非 n-tabs 把内容塞进 pane，从根本上避免 Naive tab-pane-wrapper
-      高度链不收敛导致输入框无法吸底。pane 用空内容 + display-directive="if"（非激活不渲染、
-      激活也是 0 高度），真正的布局放在下方 .console-body。
+      顶部通道切换：完整复用短信页的样式与交互 —— Naive `n-tabs type="segment" animated`。
+      2026-10-24：原来只有 tab 条，没有短信页那层白色卡片，segment 的浅灰轨道和页面底色
+      几乎一样，激活胶囊滑动时看不出动画；现在用同样的白色卡面承载 tab 条。
+      内容仍在下面的 .console-body（输入栏要吸底，不能塞进 pane），由 .pane-list
+      自己做与短信 pane 相同的淡入/横向位移。
     -->
-    <n-tabs
-      type="segment"
-      :value="activeTab"
-      display-directive="if"
-      class="console-tabbar"
-      @update:value="(v: string) => (activeTab = v as 'at' | 'shell' | 'pty')"
-    >
-      <n-tab-pane name="at" tab="AT 命令" />
-      <n-tab-pane name="shell" tab="Shell" />
-      <!--
-        2026-10-10 暂时隐藏「真 PTY」tab：ttyd 帧协议已按 1.7.7 修正、但整套功能尚未完工
-        （终端渲染 / app 端入口待重做），先撤下避免用户进到半成品。
-        同页的 AT 命令 / Shell 两个 tab 与 ttyd 无关，**不受影响**。
-        恢复只需把下面这行恢复为 <n-tab-pane name="pty" tab="真 PTY" />。
-      -->
-      <!-- <n-tab-pane name="pty" tab="真 PTY" /> -->
-    </n-tabs>
+    <div class="console-tabs-card">
+      <n-tabs v-model:value="activeTab" type="segment" animated class="console-tabs">
+        <n-tab-pane name="at" tab="AT 命令" display-directive="if">
+          <span class="pane-placeholder" aria-hidden="true"></span>
+        </n-tab-pane>
+        <n-tab-pane name="shell" tab="Shell" display-directive="if">
+          <span class="pane-placeholder" aria-hidden="true"></span>
+        </n-tab-pane>
+        <!-- <n-tab-pane name="pty" tab="真 PTY" display-directive="if">
+          <PtyPane v-if="activeTab === 'pty'" class="pane-list pty-host" />
+        </n-tab-pane> （2026-10-10 暂时隐藏：整套 PTY 功能未完工） -->
+      </n-tabs>
+    </div>
 
     <!--
       对话主区：状态条(flex:0 0 auto) + 消息列表(flex:1 内部滚动) + 快捷命令(flex:0 0 auto)
@@ -79,7 +75,47 @@
         恢复时和 tab 一起放开。
       -->
       <!-- <PtyPane v-if="activeTab === 'pty'" class="pane-list pty-host" /> -->
-      <ConsoleMessageList v-if="activeTab !== 'pty'" :messages="activeMessages" :loading="activeSending" class="pane-list" />
+      <!--
+        每个 channel 一份独立的消息列表，首次访问才挂载；两份列表叠在同一个
+        `.pane-stack` 里，只切透明度和横向位移，不切 display。
+
+        2026-10-24：先前一个 ConsoleMessageList 在切 Tab 时换 messages，400 个气泡
+        全部重建。拆成两份后仍用 display 切换，实测 800 个气泡的容器重新布局会有
+        200–300ms 的长帧。改成绝对定位叠放 + 透明度/位移后，隐藏列表保持已有布局，
+        切 Tab 不再触发整棵消息树重新布局；`visible` 仍负责切过去时滚到底。
+        位移方向与短信页 n-tabs pane 一致：AT 从左侧进出，Shell 从右侧进出。
+      -->
+      <div class="pane-stack">
+        <div
+          class="pane-list"
+          data-tab="at"
+          :class="{ 'is-hidden': activeTab !== 'at' }"
+          :aria-hidden="activeTab !== 'at'"
+        >
+          <ConsoleMessageList
+            :visible="activeTab === 'at'"
+            :messages="renderedAtMessages"
+            :earlier-count="atEarlierCount"
+            :loading="atSending"
+            @load-earlier="loadEarlierAt"
+          />
+        </div>
+        <div
+          v-if="shellMounted"
+          class="pane-list"
+          data-tab="shell"
+          :class="{ 'is-hidden': activeTab !== 'shell' }"
+          :aria-hidden="activeTab !== 'shell'"
+        >
+          <ConsoleMessageList
+            :visible="activeTab === 'shell'"
+            :messages="renderedShellMessages"
+            :earlier-count="shellEarlierCount"
+            :loading="shellSending"
+            @load-earlier="loadEarlierShell"
+          />
+        </div>
+      </div>
 
       <!-- ── 快捷命令 ── -->
       <div v-if="activeTab !== 'pty'" class="quick-cmds">
@@ -88,9 +124,16 @@
         </n-tag>
         <template v-if="activeTab === 'shell'">
           <span class="quick-sep">getprop:</span>
-          <n-tag v-for="k in quickProps" :key="k" size="small" class="quick-tag" @click="runQuick('getprop ' + k)">
-            {{ k }}
+          <!--
+            只读属性面板（2026-10-14 改）：值走 `GET /api/shell/prop/{key}` 并发取，
+            不再把 `getprop xxx` 拼成命令送进 /api/shell/exec —— 那会在终端历史里
+            记下一笔「用户从没敲过的命令」。整块只读，点标签不再执行任何东西。
+          -->
+          <n-tag v-for="k in quickProps" :key="k" size="small" class="prop-tag" :title="k">
+            <span class="prop-key">{{ k }}</span>
+            <span class="prop-value">{{ propValue(k) }}</span>
           </n-tag>
+          <n-button size="tiny" quaternary :loading="quickPropsLoading" @click="loadQuickProps()"> 刷新属性 </n-button>
         </template>
       </div>
 
@@ -114,6 +157,8 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
+import { useCancellableApi } from '@/composables/useCancellableApi';
+import { Endpoints } from '@/api/contract';
 import { useWebSocketStore } from '@/stores/websocket';
 import ConsoleMessageList from './components/ConsoleMessageList.vue';
 // 2026-10-10 随「真 PTY」tab 一并隐藏（整套功能未完工，2026-10 再做）。
@@ -125,11 +170,32 @@ import ConsoleInputBar from './components/ConsoleInputBar.vue';
 import { nextId, ensureSeqAbove, type ConsoleMessage } from './components/types';
 
 const api = getApiClient();
+/**
+ * 只读探测（getprop）单独用一个可取消客户端。
+ *
+ * 不能把它和上面那个 `api` 合成一个：`useCancellableApi` 会用作用域里的 signal
+ * **覆盖**调用方传入的 signal，而 exec / at 那条链路靠自己的 AbortController 管取消
+ * （见下方 activeControllers），两者混用会让「发送中取消」失效。
+ * 分开之后，本页卸载时在途的属性请求会自动 abort，不需要手工登记。
+ */
+const readApi = useCancellableApi();
 const message = useMessage();
 const wsStore = useWebSocketStore();
 
 // ── 当前 Tab（单布局：状态条/列表/输入栏都按它切数据）──
 const activeTab = ref<'at' | 'shell' | 'pty'>('at');
+/**
+ * Shell 列表是否已挂载。首次切到 Shell 才挂载第二份 ConsoleMessageList；
+ * 之后只切 v-show，不再销毁/重建气泡（见模板里那段注释）。
+ */
+const shellMounted = ref(false);
+watch(
+  activeTab,
+  (v) => {
+    if (v === 'shell') shellMounted.value = true;
+  },
+  { immediate: true }
+);
 
 // ── 快捷命令 ──
 const quickAtCmds = [
@@ -154,19 +220,86 @@ const quickShellCmds = [
   { key: 'uptime', cmd: 'uptime', label: 'uptime' },
   { key: 'dmesg | tail -20', cmd: 'dmesg | tail -20', label: 'dmesg' },
 ];
-// getprop 在 app 无对应 Tab，降级为 Shell 快捷命令，点击即作为普通命令送入同一消息流
+// ── 系统属性（只读探测）──
+/**
+ * getprop 快捷项：原来是「点一下就把 `getprop <key>` 送进 exec」，现在改成
+ * **只读展示 + 并发读取**（2026-10-14）。两处取舍：
+ *
+ * ① 走 `GET /api/shell/prop/{key}` 而不是 `POST /api/shell/exec`：
+ *    core 这条路由对 key 做白名单校验（只许 `[a-zA-Z0-9._]`，防命令注入），
+ *    而 exec 是把拼好的字符串交给 shell、校验责任全在调用方；更要紧的是 exec
+ *    会在终端历史里记一笔 —— 读几个只读属性不该把用户真正的操作淹掉。
+ * ② 并发（Promise.allSettled）而不是逐个 await：5 个属性各走一轮 shell，
+ *    串行会比并发明显慢一个数量级。
+ *
+ * 失败不弹 toast：设备离线 / 属性不存在都是常态，单条失败只影响它自己那格，
+ * 显示 `—` 即可（整块失败也一样，不打断用户）。
+ */
 const quickProps = ['ro.product.model', 'ro.build.version.release', 'ro.serialno', 'init.svc.adbd', 'gsm.network.type'];
+const propValues = ref<Record<string, string>>({});
+const quickPropsLoading = ref(false);
+
+/** 空值 / 读取失败统一显示 `—`：留白会让人分不清「没这个属性」和「没取到」 */
+function propValue(key: string): string {
+  return propValues.value[key] || '—';
+}
+
+async function loadQuickProps() {
+  quickPropsLoading.value = true;
+  try {
+    const results = await Promise.allSettled(quickProps.map((key) => readApi.get(Endpoints.shell.prop(key))));
+    const next: Record<string, string> = {};
+    results.forEach((r, i) => {
+      const key = quickProps[i];
+      if (key === undefined) {
+        return;
+      }
+      // value 是 getprop 的原始 stdout（含结尾换行），必须自己 trim
+      next[key] = r.status === 'fulfilled' ? String(r.value.data?.value ?? '').trim() : '';
+    });
+    propValues.value = next;
+  } finally {
+    quickPropsLoading.value = false;
+  }
+}
 
 const activeQuick = computed(() => (activeTab.value === 'at' ? quickAtCmds : quickShellCmds));
 
 // ── 消息流（对话化）──
 const atMessages = ref<ConsoleMessage[]>([]);
 const shellMessages = ref<ConsoleMessage[]>([]);
-const activeMessages = computed<ConsoleMessage[]>(() =>
-  activeTab.value === 'at' ? atMessages.value : shellMessages.value
-);
+
+/**
+ * 首屏只渲染最近 80 条消息（约 40 条命令）。core 历史一次最多 200 条记录，
+ * 全量铺成 DOM 会让 AT/Shell 各背几百个气泡，切 Tab 时重新布局必然卡。
+ * 更早的部分保留在内存里，按「加载更早」逐段追加。
+ */
+const RENDER_MESSAGES = 80;
+const atRenderLimit = ref(RENDER_MESSAGES);
+const shellRenderLimit = ref(RENDER_MESSAGES);
+const renderedAtMessages = computed(() => atMessages.value.slice(-atRenderLimit.value));
+const renderedShellMessages = computed(() => shellMessages.value.slice(-shellRenderLimit.value));
+const atEarlierCount = computed(() => Math.max(0, atMessages.value.length - renderedAtMessages.value.length));
+const shellEarlierCount = computed(() => Math.max(0, shellMessages.value.length - renderedShellMessages.value.length));
+function loadEarlierAt() {
+  atRenderLimit.value = Math.min(atMessages.value.length, atRenderLimit.value + RENDER_MESSAGES);
+}
+function loadEarlierShell() {
+  shellRenderLimit.value = Math.min(shellMessages.value.length, shellRenderLimit.value + RENDER_MESSAGES);
+}
 
 // ── AT 状态 ──
+/**
+ * AT 通道状态。**一份**，不再拆成两个同构对象：
+ * 原来 `atStatus` 与 `atPlatform` 各存一份 `{connected, platform, method}`，而模板只用到了
+ * `atStatus.connected` + `atPlatform.platform/method` —— `atStatus.platform/method` 从来没上过屏，
+ * 两份状态各自维护的结果是同一个「通道在不在」有两个可能互相矛盾的副本。
+ *
+ * 两个端点的口径本来也不同，合并后按字段各取其源（见 `loadAtStatus`）：
+ *   · `GET /api/at/status`  → `{ connected, platform: { platform, method } }`（嵌套）
+ *   · `GET /api/at/platform`→ `{ connected, platform, method }`（扁平，显式带 connected）
+ * `connected` 一律以 status 为准（它才是「通道在不在」）；平台/方式优先取 platform 端点。
+ */
 const atStatus = reactive({ connected: false, platform: '', method: '' });
 const atStatusLoading = ref(false);
 const atCommand = ref('');
@@ -190,19 +323,18 @@ const activeCommand = computed<string>({
 });
 const activeSending = computed(() => (activeTab.value === 'at' ? atSending.value : shellSending.value));
 
-// ── AT 平台探测（GET /api/at/platform）──
-const atPlatform = reactive({ connected: false, platform: '', method: '' });
+// ── AT 平台探测（GET /api/at/platform，结果并入上面的 atStatus）──
 const PLATFORM_LABELS: Record<string, string> = {
   SPREADTRUM: '展讯',
   QUALCOMM: '高通',
   UNKNOWN: '未知',
 };
 const atPlatformText = computed(() => {
-  if (!atPlatform.connected || !atPlatform.platform) return '--';
-  const key = atPlatform.platform.toUpperCase();
+  if (!atStatus.platform) return '--';
+  const key = atStatus.platform.toUpperCase();
   return PLATFORM_LABELS[key] ? `${PLATFORM_LABELS[key]}（${key}）` : key;
 });
-const atMethodText = computed(() => (atPlatform.connected && atPlatform.method ? atPlatform.method : '--'));
+const atMethodText = computed(() => atStatus.method || '--');
 
 // ── 历史（core 存，app / web 共享同一份）──
 // 旧版把历史存在 localStorage：换个浏览器、清一次缓存就没了，手机 app 更是完全看不见。
@@ -318,23 +450,19 @@ function appendShell(m: ConsoleMessage) {
 }
 
 // ── AT 接口 ──
-function applyAtPlatform(data: any) {
-  const connected = data?.connected === true;
-  atPlatform.connected = connected;
-  atPlatform.platform = connected ? String(data?.platform ?? '') : '';
-  atPlatform.method = connected ? String(data?.method ?? '') : '';
-}
 async function loadAtStatus() {
   atStatusLoading.value = true;
   try {
     const [statusRes, platformRes] = await Promise.allSettled([api.get('/api/at/status'), api.get('/api/at/platform')]);
-    if (platformRes.status === 'fulfilled') applyAtPlatform(platformRes.value.data);
-    else applyAtPlatform(null);
     if (statusRes.status === 'rejected') throw statusRes.reason;
     const data = statusRes.value.data;
     atStatus.connected = data.connected ?? false;
-    atStatus.platform = data.platform?.platform ?? '';
-    atStatus.method = data.platform?.method ?? '';
+    // 平台/方式：platform 端点成功时以它为准（它显式带 connected，未连接就是空值，
+    // 不会把上一次的结果当成这一次的）；它整个请求失败时才退回 status 的嵌套字段。
+    const p = platformRes.status === 'fulfilled' ? platformRes.value.data : null;
+    const platform = p ? (p.connected === true ? p : null) : (data?.platform ?? null);
+    atStatus.platform = String(platform?.platform ?? '');
+    atStatus.method = String(platform?.method ?? '');
   } catch (e: any) {
     atStatus.connected = false;
     atStatus.platform = '';
@@ -456,6 +584,10 @@ onMounted(async () => {
   loadHistory('shell');
   loadAtStatus();
   loadShellRoot();
+  // 只读属性与 shell 状态同批探测：并发 5 个小请求，换来切到 Shell tab 时面板已是热的
+  loadQuickProps();
+  // 直接挂载隐藏的 Shell 列表；只渲染最近 80 条，切 Tab 时不再创建几百个气泡
+  shellMounted.value = true;
 });
 // 另一端（或本端）执行命令后 core 会推 data_changed:console:<channel>，拉一次对齐
 const unsubConsole = wsStore.on('data_changed', (payload: any) => {
@@ -489,8 +621,24 @@ onUnmounted(() => {
   gap: 12px;
   /* 不要给 min-height：矮视口下会被撑高、被 .main-content(overflow:hidden) 裁掉底部输入栏 */
 }
-.console-tabbar {
+.console-tabs-card {
   flex: 0 0 auto;
+  padding: 10px 16px;
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.console-tabs {
+  width: 100%;
+  flex: none;
+}
+/* 终端内容在 n-tabs 外部；pane 里只放一个不可见占位，满足 Naive 的 tab 标签渲染路径。
+   pane wrapper 也隐藏，避免空 pane 的 12px 顶部内距在 tab 条和状态条之间多出一段空白。 */
+.pane-placeholder {
+  display: none;
+}
+.console-tabs :deep(.n-tabs-pane-wrapper) {
+  display: none;
 }
 /* ── 单布局：状态条 + 列表(滚) + 快捷 + 吸底输入栏 ── */
 .console-body {
@@ -536,14 +684,57 @@ onUnmounted(() => {
   font-size: 13px;
   color: var(--text-secondary);
 }
-/* 列表容器：flex:1 + min-height:0 ⇒ 占满剩余空间、内部滚动，输入栏自然钉在下方。
-   本身再变成 flex 列，让内部的 n-scrollbar 用 flex:1/min-height:0 拿到确定的可用高度，
-   避免「height:100% 百分比高度在 flex 链里循环依赖」导致列表随消息撑高、把输入栏顶出屏幕。 */
-.pane-list {
+/* 列表叠放容器：flex:1 + min-height:0 ⇒ 占满剩余空间、内部滚动，输入栏自然钉在下方。
+   AT / Shell 两份列表都绝对定位到同一块区域，只切透明度和横向位移；隐藏那一份保持布局，
+   切 Tab 不会让几百个气泡重新走一遍 layout。 */
+.pane-stack {
   flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  /* 切 Tab 时两个列表做横向位移，超出部分在栈内裁掉 */
+  overflow: hidden;
+}
+.pane-list {
+  position: absolute;
+  inset: 0;
   min-height: 0;
   display: flex;
   flex-direction: column;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease,
+    visibility 0s linear 0.18s;
+}
+/* 与短信 n-tabs pane 同方向：旧页向左/右退出，新页从另一侧进入 */
+.pane-list[data-tab='at'] {
+  transform: translateX(-32px);
+}
+.pane-list[data-tab='shell'] {
+  transform: translateX(32px);
+}
+.pane-list:not(.is-hidden) {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateX(0);
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-list,
+  .pane-list:not(.is-hidden) {
+    transition: none;
+  }
+}
+@media (max-width: 768px) {
+  /* 与短信卡片在移动端的左右内距对齐，tab 轨道宽度保持一致 */
+  .console-tabs-card {
+    padding: 8px 12px;
+  }
 }
 
 /* ── 快捷命令 ── */
@@ -557,6 +748,20 @@ onUnmounted(() => {
 .quick-tag {
   cursor: pointer;
 }
+/* 属性标签是只读展示（没有 cursor: pointer，点了不执行任何东西）。
+   n-tag 的内容被包在 .n-tag__content 里，key / value 的间距只能从那里给。 */
+.prop-tag :deep(.n-tag__content) {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.prop-key {
+  color: var(--text-muted);
+}
+.prop-value {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .quick-sep {
   font-size: 12px;
   color: var(--text-muted);
@@ -565,8 +770,17 @@ onUnmounted(() => {
 
 /* ── 响应式 ── */
 @media (max-width: 768px) {
+  .pane-status {
+    gap: 8px;
+  }
   .status-info {
     gap: 6px;
+  }
+  /* 768 档状态条要同时装下「连接态 + 清空 + 刷新状态」：平台名与提权方式是只读的
+     次要属性（点一次「刷新状态」仍在，只是不常驻），先收起来 —— 不收的话
+     `flex-wrap` 会把右侧两颗按钮挤到第二行，白吃掉一截本就不多的列表高度。 */
+  .status-platform {
+    display: none;
   }
 }
 </style>

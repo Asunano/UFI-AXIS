@@ -27,18 +27,23 @@
     :show="show"
     preset="card"
     :title="title"
-    style="width: 720px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 720px; --modal-h: 640px"
     @update:show="emit('update:show', $event)"
   >
     <!--
       三个计数分开显示：失败与跳过**不能相加**（跳过是闸门按用户自己的配置拦下的，
       并进失败数会让人去排一个不存在的故障）。两者都是该渠道的全表计数，不随筛选变化。
+
+      2026-10-21（计划 §6.9 B8-7）：自绘的 `.summary / .summary-item / .summary-value`
+      换成全局 `.stat-grid / .stat-cell / .stat-label / .stat-value`（main.css 各一份），
+      窄屏的两列改排也由那个全局类自己的 768 档接管。
     -->
-    <div class="summary">
-      <span v-for="s in summaryItems" :key="s.label" class="summary-item">
-        <span class="row-hint">{{ s.label }}</span>
-        <span class="summary-value" :class="s.tone">{{ s.value }}</span>
-      </span>
+    <div class="stat-grid">
+      <div v-for="s in summaryItems" :key="s.label" class="stat-cell">
+        <span class="stat-label">{{ s.label }}</span>
+        <span class="stat-value" :class="s.tone">{{ s.value }}</span>
+      </div>
     </div>
     <span class="row-hint">失败与跳过是两组独立计数，不相加；两者统计该渠道的全部记录，不随下面的筛选变化。</span>
     <!-- 最后一条记录的时间。只有 stats 端点回得出，老固件上这一行不出现 -->
@@ -64,38 +69,40 @@
           </template>
         </n-empty>
       </div>
-      <n-scrollbar v-else style="max-height: min(420px, 56vh)">
-        <div class="history-list">
-          <div v-for="r in records" :key="r.id" class="history-item">
-            <div class="history-head">
-              <span class="history-title">{{ r.subject || sceneLabel(r.scene) }}</span>
-              <n-tag size="tiny" :bordered="false" :type="statusOf(r).tag">{{ statusOf(r).text }}</n-tag>
-              <span class="history-time">{{ formatNotifyTime(r.sent_at) }}</span>
-              <!--
-                删单条。没有二次确认：删掉的是一条诊断记录（不含正文），
-                代价远小于为每一行弹一次对话框的打扰；清空整份才需要确认。
-              -->
-              <n-button
-                size="tiny"
-                quaternary
-                :loading="deletingId === r.id"
-                :disabled="deletingId !== null"
-                @click="deleteOne(r)"
-                >删除</n-button
-              >
-            </div>
-            <div class="history-meta">
-              <span>{{ sceneLabel(r.scene) }}</span>
-              <span v-if="r.recipient">发往 {{ r.recipient }}</span>
-            </div>
-            <!-- failed 的异常链与 skipped 的中文原因都取 core 的 `error` 原文，两者只在配色上区分 -->
-            <div v-if="detailOf(r)" class="history-detail" :class="statusOf(r).tone">{{ detailOf(r) }}</div>
+      <!-- 列表不再自带 max-height：高度由 `.modal-fit` 的 `--modal-h` 统一封顶，
+           内容区自己滚 —— 原先这里一层 `min(420px,56vh)` + 弹窗一层，是双层滚动。 -->
+      <div v-else class="history-list">
+        <div v-for="r in records" :key="r.id" class="history-item">
+          <div class="history-head">
+            <span class="history-title">{{ r.subject || sceneLabel(r.scene) }}</span>
+            <n-tag size="tiny" :bordered="false" :type="statusOf(r).tag">{{ statusOf(r).text }}</n-tag>
+            <span class="history-time">{{ formatNotifyTime(r.sent_at) }}</span>
+            <!--
+              删单条。没有二次确认：删掉的是一条诊断记录（不含正文），
+              代价远小于为每一行弹一次对话框的打扰；清空整份才需要确认。
+            -->
+            <n-button
+              size="tiny"
+              quaternary
+              :loading="deletingId === r.id"
+              :disabled="deletingId !== null"
+              @click="deleteOne(r)"
+              >删除</n-button
+            >
           </div>
+          <!-- 场景名只在标题用的是 subject 时才显示：否则标题本身就是场景名，
+               同一句话上下重复一遍（计划 §6.9 B8-7「标题与场景名重复显示 → 去一处」） -->
+          <div v-if="r.subject || r.recipient" class="history-meta">
+            <span v-if="r.subject">{{ sceneLabel(r.scene) }}</span>
+            <span v-if="r.recipient">发往 {{ r.recipient }}</span>
+          </div>
+          <!-- failed 的异常链与 skipped 的中文原因都取 core 的 `error` 原文，两者只在配色上区分 -->
+          <div v-if="detailOf(r)" class="history-detail" :class="statusOf(r).tone">{{ detailOf(r) }}</div>
         </div>
         <div v-if="hasMore" class="load-more-row">
           <n-button size="tiny" quaternary :loading="loadingMore" @click="load(true)">加载更多</n-button>
         </div>
-      </n-scrollbar>
+      </div>
     </n-spin>
 
     <template #footer>
@@ -370,29 +377,12 @@ watch(
 </script>
 
 <style scoped>
-.row-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.5;
-}
+/* `.row-hint` / `.footer-bar` 已上收到 src/styles/main.css（计划 §8.2 C2），
+   本文件原来的两份副本与全局取值逐字相同，故整体删除。 */
 
-/* ── 计数摘要 ── */
-.summary {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px 24px;
-  padding: 4px 0 6px;
-}
-.summary-item {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-.summary-value {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
+/* ── 计数摘要 ──
+   版式走全局 `.stat-grid / .stat-cell / .stat-label / .stat-value`（main.css），
+   本文件原先那三条自绘规则已删除（计划 §6.9 B8-7）。这里只保留两个色调类。 */
 
 .filter-row {
   display: flex;
@@ -475,23 +465,7 @@ watch(
   padding: 10px 0;
 }
 
-.footer-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  width: 100%;
-}
-
 @media (max-width: 768px) {
-  /* 四个计数在 360px 上一行放不下（24px 列距 × 3 + 四组数字）。
-     两列栅格比 flex-wrap 稳：wrap 会排成 3+1，最后一个孤零零掉到第二行。 */
-  .summary {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px 12px;
-  }
   /* 标题 + 状态标签 + 时间 + 删除四样挤一行必然折行，且 `margin-left:auto` 会把
      时间甩到折行后的最右侧、与删除按钮分家。改成：标题独占一行，其余一行靠左排。 */
   .history-title {

@@ -3,7 +3,8 @@
     v-model:show="show"
     preset="card"
     title="WiFi 二维码"
-    style="width: 340px; max-width: calc(100vw - 32px)"
+    class="modal-fit"
+    style="--modal-w: 340px"
     @after-leave="emit('released')"
   >
     <div class="qr-body">
@@ -69,7 +70,8 @@ const show = computed({
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   /* 刻意写死纯白，**不要**接 --card-bg：二维码识别依赖码块与底色的高对比，
-     暗色模式下若跟着卡片变成 #1a1a20，摄像头基本扫不出来。 */
+     暗色模式下若跟着卡片变成 #1a1a20，摄像头基本扫不出来。
+     ui-baseline-allow: 二维码底色必须纯白，接令牌在暗色下扫不出来 */
   background: #ffffff;
   overflow: hidden;
 }
