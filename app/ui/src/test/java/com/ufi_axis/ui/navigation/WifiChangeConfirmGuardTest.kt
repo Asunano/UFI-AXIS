@@ -68,28 +68,27 @@ class WifiChangeConfirmGuardTest {
     @Test
     fun programmaticSuspendMustNotCloseWholeDialog() {
         val src = wifiSource()
+        // 2026-10-22：二次确认改走公共设施 UfiDialogSuspendState + UfiConfirmHost，
+        // 不再在本文件手写 suspendedForConfirm / closeRequested 两个 flag。
+        // 不变量不变：程序性收起不能被当成「用户关闭设置」。
         assertTrue(
             "UfiScrollableDialog 的 onDismiss 必须区分「程序性收起」与「真实关闭」",
-            src.contains("suspendedForConfirm && !closeRequested")
-        )
-        // 提交成功必须走「真实关闭」路径并显式置位 —— 少了 closeRequested 就会出现
-        // 用户实测的「点确认修改配置后 WiFi 设置弹窗又弹出来」。
-        assertTrue(
-            "提交成功必须置 closeRequested 后再调 onDismiss，否则弹窗会被守卫挡回",
-            src.contains("closeRequested = true") &&
-                Regex("""closeRequested\s*=\s*true[\s\S]{0,120}?onDismiss\(\)""").containsMatchIn(src)
-        )
-        // 2026-10-12（用户裁决）：提交后**无论成败都关窗**，所以 suspendedForConfirm /
-        // closeRequested 必须无条件复位 —— 不能挂在 `if (ok)` 之类成败分支上。
-        // （旧断言盯的是「失败时复位」，那次行为已经改成「都关窗」，故同步更新。）
-        assertTrue(
-            "提交后必须复位 suspendedForConfirm 且不挂在成败分支上",
-            src.contains("suspendedForConfirm = false") &&
-                !Regex("""if\s*\(!?ok\)\s*suspendedForConfirm""").containsMatchIn(src)
+            src.contains("confirmSuspend.consumeProgrammaticDismiss()") &&
+                Regex("""consumeProgrammaticDismiss\(\)\)\s*return@UfiScrollableDialog""")
+                    .containsMatchIn(src)
         )
         assertTrue(
-            "提交后必须置 closeRequested（onDismiss 守卫靠它区分程序性收起与真实关闭）",
-            src.contains("closeRequested = true")
+            "确认框上场前必须先收起本弹窗（confirmSuspend.suspend()）",
+            src.contains("confirmSuspend.suspend()")
+        )
+        assertTrue(
+            "点「暂不执行」必须恢复本弹窗（confirmSuspend.resume()），否则设置页再也打不开",
+            src.contains("confirmSuspend.resume()")
+        )
+        assertTrue(
+            "程序性收起之后仍要调用 onDismiss（真实关闭路径）",
+            Regex("""consumeProgrammaticDismiss\(\)\)\s*return@UfiScrollableDialog[\s\S]{0,120}?onDismiss\(\)""")
+                .containsMatchIn(src)
         )
     }
 
@@ -133,12 +132,12 @@ class WifiChangeConfirmGuardTest {
             "确认按钮的危险色判据应直接用 hasAnyChange，不另写一套",
             src.contains("confirmDestructive = hasAnyChange")
         )
-        // 只断言「hasAnyChange 后面跟着 bandConfirmVisible = true」，
-        // 不写死整行 —— 2026-10-12 曾因为保存分支改成多行（插入 suspendedForConfirm）
-        // 而误报一次。判据名与赋值目标才是契约，格式不是。
+        // 只断言「hasAnyChange 后面跟着确认框上场（confirmSuspend.suspend()）」，
+        // 不写死整行 —— 2026-10-22 改走 UfiConfirmHost 后旧判据名 bandConfirmVisible
+        // 已不存在，契约是「判据名 + 确认动作」同源，格式不是。
         assertTrue(
-            "保存时必须先过 hasAnyChange 拦截（hasAnyChange 与 bandConfirmVisible = true 必须同现）",
-            Regex("""hasAnyChange[\s\S]{0,200}?bandConfirmVisible\s*=\s*true""").containsMatchIn(src)
+            "保存时必须先过 hasAnyChange 拦截（hasAnyChange 与 confirmSuspend.suspend() 必须同现）",
+            Regex("""hasAnyChange[\s\S]{0,200}?confirmSuspend\.suspend\(\)""").containsMatchIn(src)
         )
     }
 
