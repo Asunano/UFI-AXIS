@@ -2,6 +2,7 @@ package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.backup.BackupAssembler
+import com.ufi_axis_core.api.backup.RemoteBackupConfig
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
@@ -93,6 +94,50 @@ class BackupRoutes(
                 )))
             }
 
+            /*
+             * 远端自动备份配置（2026-10-24）。
+             *
+             * 定时任务动作 `remote_backup` 一直可用，但此前没有任何 UI/端点能写
+             * `remote_backup_source_id` / `remote_backup_passphrase` —— 任务必然失败。
+             * 这里补上读写：GET 只回 `passphrase_set`，**绝不回显口令**；PUT 的校验与
+             * 半套状态防护见 [RemoteBackupConfig]。
+             */
+            get("/remote-config") {
+                val state = RemoteBackupConfig.read(settings)
+                call.respond(toJsonElement(mapOf(
+                    "source_id" to state.sourceId,
+                    "passphrase_set" to state.passphraseSet
+                )))
+            }
+
+            put("/remote-config") {
+                val body = runCatching { call.receiveJsonObject() }.getOrNull() ?: JsonObject(emptyMap())
+                val sourceId = if (body.containsKey("source_id")) {
+                    (body["source_id"] as? JsonPrimitive)?.contentOrNull.orEmpty()
+                } else {
+                    null // 本次不改目标源
+                }
+                val passphrase = (body["passphrase"] as? JsonPrimitive)?.contentOrNull
+                val clearPassphrase = body["clear_passphrase"]?.jsonPrimitive?.booleanOrNull == true
+
+                val error = RemoteBackupConfig.update(
+                    settings = settings,
+                    sourceId = sourceId,
+                    passphrase = passphrase,
+                    clearPassphrase = clearPassphrase,
+                )
+                if (error != null) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, error)
+                    return@put
+                }
+                val state = RemoteBackupConfig.read(settings)
+                call.respond(toJsonElement(mapOf(
+                    "success" to true,
+                    "source_id" to state.sourceId,
+                    "passphrase_set" to state.passphraseSet
+                )))
+            }
+
             post("/export") {
                 val body = runCatching { call.receiveJsonObject() }.getOrNull() ?: JsonObject(emptyMap())
                 val encrypted = body["encrypted"]?.jsonPrimitive?.booleanOrNull ?: true
@@ -163,19 +208,29 @@ class BackupRoutes(
 
             post("/import") {
                 val replace = call.request.queryParameters["mode"] == MODE_REPLACE
+                // 2026-10-19：dry_run=1 = 只预览"会改什么"，不写任何东西。
+                // 备份导入是 60+ 键的批量写入口（含端口/goform/配对策略），
+                // 客户端应先预览再确认，避免"恢复一份别人的包"直接把设备改到连不上。
+                val dryRun = call.request.queryParameters["dry_run"] == "1"
                 val pack = readPackage(call) ?: return@post
                 val entries = withContext(Dispatchers.IO) {
                     openPayload(call, pack) ?: return@withContext null
                 } ?: return@post
 
-                val report = withContext(Dispatchers.IO) { assembler.apply(entries, replace) }
-                AppLogger.w(
-                    TAG,
-                    "备份恢复完成 mode=${if (replace) MODE_REPLACE else MODE_MERGE} " +
-                        "applied=${report.applied.size} failed=${report.failed.size}"
-                )
+                val report = withContext(Dispatchers.IO) { assembler.apply(entries, replace, dryRun) }
+                if (dryRun) {
+                    AppLogger.i(TAG, "备份预览 mode=${if (replace) MODE_REPLACE else MODE_MERGE} " +
+                        "会应用=${report.applied.size} 会拒绝=${report.failed.size}")
+                } else {
+                    AppLogger.w(
+                        TAG,
+                        "备份恢复完成 mode=${if (replace) MODE_REPLACE else MODE_MERGE} " +
+                            "applied=${report.applied.size} failed=${report.failed.size}"
+                    )
+                }
                 call.respond(toJsonElement(mapOf(
                     "success" to true,
+                    "dry_run" to dryRun,
                     "mode" to if (replace) MODE_REPLACE else MODE_MERGE,
                     "applied" to report.applied,
                     "failed" to report.failed,

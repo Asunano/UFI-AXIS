@@ -50,7 +50,11 @@ class RemoteBackupRunner(
         if (provider.readonly) throw IllegalStateException("存储源只读: ${config.label}")
 
         val passphrase = settings.getRawString(KEY_BACKUP_PASSPHRASE).orEmpty()
-        if (passphrase.length < 8) throw IllegalStateException("未配置备份口令或口令过短（remote_backup_passphrase）")
+        if (passphrase.length < BackupCrypto.MIN_PASSPHRASE_LENGTH) {
+            throw IllegalStateException(
+                "未配置备份口令或口令过短（remote_backup_passphrase，至少 ${BackupCrypto.MIN_PASSPHRASE_LENGTH} 位）"
+            )
+        }
 
         // 打包（与 BackupRoutes.export 完全同一套加密/格式）
         val sections = assembler.collect(emptyMap())
@@ -61,7 +65,7 @@ class RemoteBackupRunner(
         val name = "$PREFIX${System.currentTimeMillis()}.ufibak"
         val remotePath = "$REMOTE_DIR/$name"
         try {
-            provider.mkdir(REMOTE_DIR)
+            ensureRemoteDir(provider, REMOTE_DIR)
             // write() 只写文本；备份是二进制 → 用 upload（base64 走 write 会膨胀 4/3 且编码歧义）
             // FileProvider 没有二进制 write，各 provider 的 upload 接收原始字节流 —— 这里用
             // write + base64 是不对的；改为要求 Capability.UPLOAD。实际写法见下方 uploadBytes。
@@ -136,6 +140,26 @@ class RemoteBackupRunner(
             }
         }
         return out.toByteArray()
+    }
+
+    /**
+     * 确保远端目录存在，**把"已存在"当成功**（2026-10-24）。
+     *
+     * 之前无条件 `provider.mkdir(REMOTE_DIR)`：WebDAV 对已存在目录回 405、FTP 的
+     * `makeDirectory` 返回 false 后 provider 会抛异常 —— 第一次备份建好目录，第二次
+     * 就永远失败。这里先试列目录；列得通说明已存在，直接返回。列不通才 mkdir；
+     * mkdir 抛错时再列一次，仍列不通才把原异常抛出去（区分"已存在"与真失败）。
+     */
+    private suspend fun ensureRemoteDir(
+        provider: com.ufi_axis_core.api.files.FileProvider,
+        dir: String,
+    ) {
+        if (runCatching { provider.list(dir) }.isSuccess) return
+        try {
+            provider.mkdir(dir)
+        } catch (e: Exception) {
+            if (runCatching { provider.list(dir) }.isFailure) throw e
+        }
     }
 
     /** 二进制上传：优先 Capability.UPLOAD（Stream/字节流），provider 不支持时回退 base64 write。 */
