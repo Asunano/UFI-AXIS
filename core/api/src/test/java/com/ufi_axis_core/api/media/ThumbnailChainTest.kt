@@ -27,14 +27,14 @@ import java.io.File
  * G8（FFmpeg 接入计划书 §6.1）：`GET /api/media/thumbnail` 的**缓存命中层 + 来源标记**测试。
  *
  * ## 为什么不测全链路（§6.1 的 ThumbnailChainTest 意图）
- * `thumbnailBytes` 的三级来源（MMR → ffmpeg → 404）每一级都压在 `MediaMetadataRetriever` /
- * native `.so` 上，Robolectric 下要么返回不可控的 shadow 值、要么根本加载不了 ——
- * 纯 JVM mock 需要把三个来源抽成接口，那是重构不是测试。三级来源的**短路顺序**由代码
- * 结构保证（early return / `recoverCatching`），真机行为由计划书 §6.3 端到端清单验收。
- * 这里锁定的是不依赖解码器的**外层契约**：缓存命中、来源头、ETag/304。
+ * 2026-10-13 起视频只剩 ffmpeg 一条来源（系统缩略图 / MMR 抽帧两级已整体退役），
+ * 而它压在 native `.so` 上 —— Robolectric 下加载不了。纯 JVM mock 需要把来源抽成接口，
+ * 那是重构不是测试。来源的**短路顺序**由代码结构保证，真机行为由计划书 §6.3 端到端清单验收。
+ * 这里锁定的是不依赖解码器的**外层契约**：缓存命中、来源头、ETag/304、失败 reason。
  *
- * G4 的 `X-Thumb-Source` 是 app 端"要不要本机抽帧回传"的决策依据，标错会导致
- * app 无限重抽 —— 所以它是必须被测试锁住的契约，不是实现细节。
+ * `X-Thumb-Source` 是 app 端详情弹窗显示「封面来源」的依据，标错会让用户看到假信息 ——
+ * 所以它是必须被测试锁住的契约，不是实现细节。取值集合见
+ * `MediaRoutes.ThumbnailAttempt`（2026-10-13 收敛为 cache/ffmpeg/image/tag/extractor）。
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [33])
@@ -102,13 +102,28 @@ class ThumbnailChainTest {
 
     @Test
     fun `无缓存且ffmpeg不可用时回404带reason`() = withApp {
-        // Robolectric 空库：MMR/系统缩略图都失败，ffmpeg .so 加载失败 → 全链路无来源
+        // Robolectric 空库 + ffmpeg .so 加载失败 → 视频没有可用来源。
+        // 2026-10-13 起系统解码两级（系统缩略图 / MMR 抽帧）已整体退役，所以这里只剩 ffmpeg 一条路。
         val resp = client.get("/api/media/thumbnail?type=video&id=99")
         assertEquals(HttpStatusCode.NotFound, resp.status)
         val body = Json.parseToJsonElement(resp.bodyAsText()).jsonObject
         // reason 要能独立看懂（修 F1 的语义：客户端把它显示给用户）
         val reason = body["reason"]!!.jsonPrimitive.content
-        assertTrue("实际 reason=$reason", reason.contains("系统缩略图") || reason.contains("自行生成"))
+        assertTrue(
+            "reason 必须指明是哪一类、为什么没出图（实际 reason=$reason）",
+            reason.contains("video") && reason.contains("生成")
+        )
+        /*
+         * 关键契约（2026-10-13 补）：视频失败时必须**区分**"ffmpeg 不可用"与"这帧解不出来"。
+         * 前者是整类失败（要重新打包 / 换 ABI / 查 RELRO），后者只影响这一条；
+         * 混成一句"缩略图不可用"会让用户与排查者都只能靠猜。
+         * 本环境（Robolectric/JVM）加载不了 arm64 的 .so，所以这里必然走"不可用"那条。
+         */
+        assertTrue(
+            "视频失败原因里必须带 ffmpeg 不可用的具体原因（实际 reason=$reason）——" +
+                "否则 .so 加载失败时整条链路零信息，只能靠猜",
+            reason.contains("ffmpeg 不可用")
+        )
         // 失败响应不带 X-Thumb-Source（没有"来源"可言）
         assertEquals(null, resp.headers["X-Thumb-Source"])
     }

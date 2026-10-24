@@ -19,20 +19,23 @@ import org.json.JSONArray
  * 这在语义上也说得过去（"你换了个位置放它"），而且管理页里能看到失效项并清理。
  *
  * ## 为什么读是同步的
- * 唯一的消费者是 `MediaRoutes.listSelection`，那是个非 suspend 的私有函数，
- * 跑在 `Dispatchers.IO` 的查询里。为它把整条查询链改成 suspend 不值得，
+ * 消费者是 `MediaRoutes.filterListItems`，那是个非 suspend 的私有函数，跑在
+ * `Dispatchers.IO` 里对内存快照做过滤。为它把整条读链改成 suspend 不值得，
  * 所以这里维护一份内存快照：写入时更新，读取直接拿。
  *
  * ## 为什么有上限
- * 排除名单会变成 SQL 的 `_data NOT IN (?,?,…)`，每一条占一个绑定变量。
- * SQLite 的上限是 999，而 `listSelection` 里还有扫描目录、专辑、艺术家、目录过滤在用。
- * 取 [MAX_EXCLUSIONS] = 300 留足余量 —— 这条限制不是性能考虑，是**超了会直接抛异常**
- *（同 `MediaRoutes.PATH_LOOKUP_CHUNK` 那条教训）。
+ * **历史原因**：排除名单原来会变成 SQL 的 `_data NOT IN (?,?,…)`，每一条占一个绑定变量，
+ * 而 SQLite 的上限是 999（`MediaRoutes.listSelection` 里还有扫描目录 / 专辑 / 艺术家 /
+ * 目录过滤在共用它）。2026-10-13 过滤改到内存里做之后，这条**技术约束已经不存在**了。
+ *
+ * 上限本身仍然保留（[MAX_EXCLUSIONS] = 300）：它现在是一条**产品约束** ——
+ * 管理页不该无限膨胀、用户也不该把整个库一首首"移除"掉（那是扫描目录该干的事）。
+ * 换句话说，别再拿"SQLite 会抛异常"去解释这个数字，那条理由已经过期了。
  */
 class MediaExclusionStore(context: Context) {
 
     companion object {
-        /** 名单上限。见类注释：这是 SQLite 绑定变量上限逼出来的硬约束，不是拍脑袋的数。 */
+        /** 名单上限。见类注释：技术约束已随内存过滤消失，这里保留的是产品约束。 */
         const val MAX_EXCLUSIONS = 300
 
         private const val PREFS_NAME = "media_exclusions"
@@ -53,7 +56,7 @@ class MediaExclusionStore(context: Context) {
 
     private var onChanged: (suspend () -> Unit)? = null
 
-    /** 当前排除的路径集合。给 `listSelection` 同步调用。 */
+    /** 当前排除的路径集合。给 `MediaRoutes.filterListItems` 同步调用。 */
     fun excluded(): Set<String> = cache
 
     /** 名单是否已满。UI 据此提示用户，而不是让他点了之后发现没生效。 */

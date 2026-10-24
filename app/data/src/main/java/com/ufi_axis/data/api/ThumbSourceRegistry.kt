@@ -3,9 +3,19 @@ package com.ufi_axis.data.api
 /**
  * 缩略图来源记录（2026-10-07）。
  *
- * core 的 `GET /api/media/thumbnail` 响应带 `X-Thumb-Source` 头（cache/system/mmr/ffmpeg），
- * 404 时 body 里带 `reason`。app 的封面走 Coil 直连 URL，响应头只能在拦截器层拿到 ——
+ * core 的 `GET /api/media/thumbnail` 响应带 `X-Thumb-Source` 头，404 时 body 里带 `reason`。
+ * app 的封面走 Coil 直连 URL，响应头只能在拦截器层拿到 ——
  * 这里用一个按 (type,id) 记录最后来源的小表，详情弹窗读它显示「封面来源」。
+ *
+ * ## 取值集合（2026-10-13 收敛）
+ * 系统解码整体退役后，core 只会回这几个值：
+ *  · `cache`     —— 命中 core 的落盘缓存
+ *  · `ffmpeg`    —— 视频：ffmpeg 软解抽帧
+ *  · `image`     —— 图片：core 降采样解码
+ *  · `tag`       —— 音频：解析容器头部的内嵌封面字节
+ *  · `extractor` —— 音频：系统提取器读封面原子（M4A 的 `covr`）
+ * 旧的 `system` / `mmr` 已不再产生，但 [ThumbSourceRegistry] 不认识具体取值 ——
+ * 到中文标签的映射在 `MediaListCommon.thumbSourceLabel`（那里保留了对旧值的兼容）。
  *
  * 只记最近一页条目（LinkedHashMap LRU，访问序），封面是滚动态的，全量记录没有意义。
  */
@@ -38,7 +48,7 @@ object ThumbSourceRegistry {
         synchronized(map) { map[key] = "fail:$reason" }
     }
 
-    /** 返回来源（"cache"/"system"/"mmr"/"ffmpeg"），失败返回 "fail:原因"，没记录返回 null。 */
+    /** 返回来源（cache/ffmpeg/image/tag/extractor），失败返回 "fail:原因"，没记录返回 null。 */
     fun sourceOf(url: String): String? {
         val key = keyOf(url) ?: return null
         synchronized(map) { return map[key] }
