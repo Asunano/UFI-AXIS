@@ -7,10 +7,14 @@ import android.graphics.BitmapFactory
  * 帧有效性统一判定（FFmpeg 接入计划书 G3 / §3.1）。
  *
  * ## 为什么需要它（修 F3/F4/F5）
- * 接入 ffmpeg 后 core 有三级帧来源（MMR / ffmpeg / 手机回传），历史上各自为政：
+ * 历史上 core 有过三级帧来源（MMR 抽帧 / ffmpeg / 手机回传），各自为政：
  * - MMR 级只查亮度阈值，**没有全零帧防护**（F3：10bit/HEVC Ma10p 实测会产出全零 JPEG）；
  * - PUT 回传只验 3 字节魔数，**1×1 黑 JPEG 也合法入库**（F4）；
  * - ffmpeg exit 0 只保证"解出了一帧"，不保证"帧有意义"（F5）。
+ *
+ * 2026-10-13 起前两级与 PUT 回传都已退役（系统解码整体删除，见 `MediaRoutes.thumbnailBytes`），
+ * **现在唯一的调用方是 ffmpeg 抽帧**。本类保留原样，因为它是"这一帧有没有意义"的
+ * 唯一判据，与"谁来解"无关 —— 将来换解码器也应该继续过它。
  *
  * 四判据（合并 app 端 MediaThumbnailBuilder 的实测经验，core 侧补齐）：
  * 1. 字节数 > [MIN_BYTES]——1.6KB 是全零帧 JPEG 的实测大小（app 侧 :134 记录）；
@@ -28,7 +32,7 @@ object FrameValidator {
     /** 1×1 占位图防线。 */
     const val MIN_DIM = 16
 
-    /** 与 MediaRoutes.DARK_LUMA_THRESHOLD / app BLANK_LUMA 同一口径。 */
+    /** 与 app 端 `BLANK_LUMA` / 亮度阈值同一口径（18），三端口径一致。 */
     const val DARK_THRESHOLD = 18
 
     /** 判定结果。调用方按分支决定"拒绝入库 / 降级为最亮候选 / 直接用"。 */
@@ -69,7 +73,7 @@ object FrameValidator {
         }
     }
 
-    /** 网格采样感知亮度——口径与 MediaRoutes.averageLuma 一致（2R+5G+B)/8，16² 采样。 */
+    /** 网格采样感知亮度——口径与 app 端 `MediaThumbnailBuilder` 一致（2R+5G+B)/8，16² 采样。 */
     private fun Bitmap.averageLuma(): Int {
         val grid = 16
         val stepX = (width / grid).coerceAtLeast(1)
