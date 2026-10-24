@@ -8,6 +8,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.FormatSize
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.Wallpaper
@@ -85,8 +86,14 @@ fun AppearanceSettingsScreen(
     val themeMode by themeManager.themeMode.collectAsState()
     val transitionDurationMs by themeManager.transitionDurationMs.collectAsState()
     val blurEnabled by themeManager.blurEnabled.collectAsState()
+    // 2026-10-14：二级页转场的压暗 / 圆角（与「过渡模糊」同一个弹窗里的三项）。
+    val navScrimEnabled by themeManager.navScrimEnabled.collectAsState()
+    val navCornersEnabled by themeManager.navCornersEnabled.collectAsState()
+    val navPredictiveBack by themeManager.navPredictiveBack.collectAsState()
     val pageTransitionId by themeManager.pageTransition.collectAsState()
     val uiScalePercent by themeManager.uiScalePercent.collectAsState()
+    // 2026-10-20：底部栏抬高（用户可调，默认 12dp）。
+    val dockLiftDp by themeManager.dockLiftDp.collectAsState()
     val selectedThemeId by themeManager.selectedThemeId.collectAsState()
     val dynamicEnabled by themeManager.dynamicEnabled.collectAsState()
     // 「自定义」皮肤的种子色（ARGB Int；[ThemeManager.CUSTOM_SEED_UNSET] = 从未选过）。
@@ -206,17 +213,47 @@ fun AppearanceSettingsScreen(
                 }
 
                 // ═══ 入口 5：界面缩放 ═══
+                // 2026-10-15（用户："删除弹窗，直接在右侧加一个下拉框即可"）：不再进弹窗选，
+                // 下拉框就在行右侧，选完立即生效（`setUiScalePercent` 自己会持久化）。
+                //
+                // 为什么能省掉"草稿 - 确认"那一层：它当初是为**滑块**加的 —— 缩放一旦生效是整树
+                // 重排，弹窗自己会跟着缩、滑块在手指底下漂移；下拉框选一次就结束，没有这个问题。
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.FormatSize,
                         title = "界面缩放",
-                        description = buildString {
-                            append(uiScalePercent)
-                            append("%")
-                            if (uiScalePercent == ThemeManager.DEFAULT_UI_SCALE_PERCENT) append(" · 默认")
-                        },
-                        onClick = { openDialog = AppearanceDialog.UI_SCALE },
-                        trailing = { UfiSettingsChevron() }
+                        description = "整体缩放界面尺寸，文字与间距一起等比变化",
+                        trailing = {
+                            UfiDropdown(
+                                selectedValue = uiScalePercent,
+                                // 90/95/…/120，共 7 档（区间来自 ThemeManager，不在调用点写死）
+                                options = (ThemeManager.UI_SCALE_PERCENT_MIN..
+                                    ThemeManager.UI_SCALE_PERCENT_MAX step 5).toList(),
+                                onValueSelected = { themeManager.setUiScalePercent(it) },
+                                modifier = Modifier.width(110.dp),
+                                unitSuffix = "%"
+                            )
+                        }
+                    )
+                }
+
+                // 底部栏抬高（2026-10-20）：小屏设备上低栏太靠下，默认 +4dp（8 → 12），
+                // 这里开放给用户自行微调（0~32dp，步长 4）。
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.ArrowUpward,
+                        title = "底部栏抬高",
+                        description = "把底部低栏内容整体上移，小屏设备可调大一些",
+                        trailing = {
+                            UfiDropdown(
+                                selectedValue = dockLiftDp,
+                                options = (ThemeManager.DOCK_LIFT_MIN_DP..
+                                    ThemeManager.DOCK_LIFT_MAX_DP step 4).toList(),
+                                onValueSelected = { themeManager.setDockLiftDp(it) },
+                                modifier = Modifier.width(96.dp),
+                                unitSuffix = "dp"
+                            )
+                        }
                     )
                 }
 
@@ -504,6 +541,12 @@ fun AppearanceSettingsScreen(
                 )
             }
             var draftBlur by remember { mutableStateOf(blurEnabled) }
+            // 2026-10-14：二级页转场另外两项的草稿值（确认时才落盘，与其他 draft 一致）。
+            var draftScrim by remember { mutableStateOf(navScrimEnabled) }
+            var draftCorners by remember { mutableStateOf(navCornersEnabled) }
+            // 2026-10-19：可预测性返回（跟手预览）**没有草稿** —— 见下方开关处的注释：
+            // 这一项改完即落盘，否则「拨完开关直接退出/返回」时选择只活在这个草稿里，
+            // 冷启动读不到键就回落到默认 true，表现正是「关了重进又自动开启」。
 
 
             UfiCustomDialog(
@@ -557,28 +600,34 @@ fun AppearanceSettingsScreen(
                             )
                         }
                         if (!draftTransitionOff) {
-                            // 「动画时长」标签 + 滑块是同一个控件组（标签就是这条滑块的名字），
-                            // 整组作为 body 的单个子级：与上下两个开关行之间 12dp、组内 4dp。
-                            Column(
+                            /*
+                             * 「动画时长」2026-10-14：滑块 → 下拉框。
+                             *
+                             * 它本来就是 150,200,…,600 共 **9 个离散档位**（下面的区间推导一字未改），
+                             * 滑块只是把这 9 个点摊在一根轨道上：想落到 300 要试着拖，而且看不出
+                             * 还有哪几档。下拉框把 9 档一次列全，当前值直接显示在触发器上。
+                             */
+                            Row(
                                 modifier = Modifier.fillMaxWidth(),
-                                verticalArrangement = Arrangement.spacedBy(Spacing.Small)
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
                                 Text(
                                     "动画时长",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = palette.textSecondary
+                                    // 2026-10-19 修复：原来用 labelMedium（12sp），与同弹窗里
+                                    // 「关闭转场动画 / 过渡模糊 / 压暗 / 圆角」的 listItemTitle（16sp）
+                                    // 不一致 —— 用户看到的就是"有的大有的小"。统一走列表项标题样式。
+                                    style = UfiTextStyles.listItemTitle,
+                                    color = palette.textPrimary
                                 )
-                                UfiSlider(
-                                    value = draftDuration.toFloat(),
-                                    onValueChange = { draftDuration = it.roundToInt() },
-                                    // 区间与档数由 ThemeManager 的 MIN/MAX 推导，不再写死 150f..600f：
-                                    // 150,200,…,600 共 9 档（steps = 档数 - 1 = 8）。
-                                    valueRange = ThemeManager.TRANSITION_DURATION_MIN_MS.toFloat()..
-                                        ThemeManager.TRANSITION_DURATION_MAX_MS.toFloat(),
-                                    steps = (ThemeManager.TRANSITION_DURATION_MAX_MS -
-                                        ThemeManager.TRANSITION_DURATION_MIN_MS) / 50 - 1,
-                                    label = "",
-                                    valueLabel = "${draftDuration}ms",
+                                UfiDropdown(
+                                    selectedValue = draftDuration,
+                                    // 区间与档距由 ThemeManager 的 MIN/MAX 推导，不写死 150..600
+                                    options = (ThemeManager.TRANSITION_DURATION_MIN_MS..
+                                        ThemeManager.TRANSITION_DURATION_MAX_MS step 50).toList(),
+                                    onValueSelected = { draftDuration = it },
+                                    modifier = Modifier.width(120.dp),
+                                    unitSuffix = "ms"
                                 )
                             }
                         }
@@ -597,6 +646,73 @@ fun AppearanceSettingsScreen(
                                 onCheckedChange = { draftBlur = it }
                             )
                         }
+                        // 2026-10-14：二级页转场的另外两项效果（用户要求：一个入口 + 一个弹窗就够，
+                        // 不再为它们单开二级页）。两项默认都开，与改动前的写死行为一致。
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "压暗",
+                                style = UfiTextStyles.listItemTitle,
+                                color = palette.textPrimary
+                            )
+                            UfiSwitch(
+                                checked = draftScrim,
+                                onCheckedChange = { draftScrim = it }
+                            )
+                        }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "圆角",
+                                style = UfiTextStyles.listItemTitle,
+                                color = palette.textPrimary
+                            )
+                            UfiSwitch(
+                                checked = draftCorners,
+                                onCheckedChange = { draftCorners = it }
+                            )
+                        }
+                        // 2026-10-19：可预测性返回开关。关掉后返回一律按设定时长播放，
+                        // 不再被"快滑"缩短；开着重启跟手预览。
+                        //
+                        // 2026-10-21（用户："关闭可预测性返回…退出重进又自动开启"）：本项
+                        // **刻意不走同弹窗的"草稿 - 确认"**，改成一拨就落盘（与「动态取色」行同口径）。
+                        // 根因：原先它只写本地草稿 `draftPredictiveBack`，唯一落盘点是弹窗底部那颗
+                        // 「确认」；而弹窗的另外三个关闭入口（系统返回键 / 点空白处 / 直接离开本页）
+                        // 走的都是 `onDismiss`（取消），草稿被整组丢弃 ⇒ `ufi_nav_predictive_back`
+                        // 一次都没写过 ⇒ 冷启动 `ThemeManager` 的播种读不到键、回落到默认 `true`，
+                        // 用户看到的就是"关了、重进又开着"。
+                        // 为什么这一项可以脱离草稿：它是纯两态、没有"预览"语义（不像皮肤 / 时长
+                        // 那样确认前需要看效果），即时生效不会产生"确认了还没变"的中间态。
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                "可预测性返回",
+                                style = UfiTextStyles.listItemTitle,
+                                color = palette.textPrimary
+                            )
+                            UfiSwitch(
+                                // 直接读共享 flow 的持久化值：开关显示态与实际生效值同一个来源
+                                //（MainNavGraph 也 collect 这条 flow），不存在"界面开了、实际没开"。
+                                checked = navPredictiveBack,
+                                onCheckedChange = { themeManager.setNavPredictiveBack(it) }
+                            )
+                        }
+                        Text(
+                            "提示：某些设置在一些系统上可能不生效（例如部分系统改写了模糊与图层合成）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.textSecondary,
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
                     }
                     DialogButtonRow(
                         confirmText = "确认",
@@ -610,6 +726,11 @@ fun AppearanceSettingsScreen(
                                 themeManager.setTransitionDurationMs(targetDuration)
                             }
                             if (draftBlur != blurEnabled) themeManager.setBlurEnabled(draftBlur)
+                            // 2026-10-14：同样只在真的变了才落盘。
+                            if (draftScrim != navScrimEnabled) themeManager.setNavScrimEnabled(draftScrim)
+                            if (draftCorners != navCornersEnabled) themeManager.setNavCornersEnabled(draftCorners)
+                            // 可预测性返回不在这里落盘：它在开关本身上即时写入（见那一段的长注释），
+                            // 确认/取消都不该再改它一次 —— 否则"取消"会把用户刚拨的开关又盖回去。
                             openDialog = null
                         },
                         dismissText = "取消",
@@ -619,70 +740,12 @@ fun AppearanceSettingsScreen(
             }
         }
 
-        AppearanceDialog.UI_SCALE -> {
-            // 草稿 - 确认模式：拖动过程中不落盘。缩放一旦生效是整树重排，若做实时预览，
-            // 弹窗自己也会跟着缩、滑块位置在手指下漂移，几乎没法拖准。
-            var draftScale by remember { mutableStateOf(uiScalePercent) }
-            UfiCustomDialog(
-                visible = true,
-                onDismiss = { openDialog = null },
-                title = "界面缩放",
-                icon = rememberVectorPainter(Icons.Default.FormatSize),
-                confirmButton = null,
-                dismissButton = null,
-                showCloseButton = false
-            ) {
-                UfiDialogBody {
-                    Text(
-                        "整体缩放界面尺寸，文字与间距一起等比变化。系统的字体大小设置仍按比例生效。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = palette.textSecondary
-                    )
-                    // 缩放滑块 + 它下面那句解释是同一个控件组（说明文字随滑块值变），
-                    // 整组作为 body 的单个子级：与上面的说明段、下面的按钮行之间 12dp、组内 4dp。
-                    Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalArrangement = Arrangement.spacedBy(Spacing.Small)
-                    ) {
-                        UfiSlider(
-                            value = draftScale.toFloat(),
-                            onValueChange = { draftScale = it.roundToInt() },
-                            // 区间与 steps 由 ThemeManager 的 MIN/MAX 推导：90~120 每 5 一档共 7 档
-                            valueRange = ThemeManager.UI_SCALE_PERCENT_MIN.toFloat()..ThemeManager.UI_SCALE_PERCENT_MAX.toFloat(),
-                            steps = (ThemeManager.UI_SCALE_PERCENT_MAX - ThemeManager.UI_SCALE_PERCENT_MIN) / 5 - 1,
-                            label = "",
-                            valueLabel = "${draftScale}%"
-                        )
-                        Text(
-                            when {
-                                draftScale < ThemeManager.DEFAULT_UI_SCALE_PERCENT ->
-                                    "偏小：按钮与图标会小于系统建议的触摸尺寸"
-                                draftScale == ThemeManager.DEFAULT_UI_SCALE_PERCENT -> "默认 100%"
-                                else -> "偏大：部分页面的长文案可能折行增多"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = palette.textSecondary.copy(alpha = 0.7f)
-                        )
-                    }
-                }
-                DialogButtonRow(
-                    confirmText = "确认",
-                    onConfirm = {
-                        if (draftScale != uiScalePercent) themeManager.setUiScalePercent(draftScale)
-                        openDialog = null
-                    },
-                    dismissText = "取消",
-                    onDismiss = { openDialog = null }
-                )
-            }
-        }
-
         null -> {}
     }
 }
 
-/** 外观页弹窗类型 */
-private enum class AppearanceDialog { THEME_MODE, THEME_SKIN, PAGE_TRANSITION, UI_SCALE, CUSTOM_COLOR }
+/** 外观页弹窗类型（2026-10-15：`UI_SCALE` 已删 —— 界面缩放改成行内下拉框，不再进弹窗） */
+private enum class AppearanceDialog { THEME_MODE, THEME_SKIN, PAGE_TRANSITION, CUSTOM_COLOR }
 
 /** 色相滑块的上界（度）。放在这里而不是内联 360f，是为了让三个滑块的区间口径都有名字。 */
 private const val HUE_MAX: Float = 360f

@@ -13,9 +13,6 @@ import com.ufi_axis.data.upload.ChunkedFileUploader
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.DebugLog
 import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis.util.AppHttpClient
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.state.*
@@ -252,7 +249,9 @@ class FileManagerModule(
                         files = sortFiles(cached.files, _state.value.sortBy),
                         selectedPaths = if (switching) emptySet() else it.selectedPaths,
                         isLoading = false,
-                        errorMessage = null
+                        errorMessage = null,
+                        // 命中缓存也是一次"成功的加载"：把上一条失败标记清掉，否则错误条会一直挂着
+                        lastFailedPath = null
                     )
                 }
                 return
@@ -269,7 +268,9 @@ class FileManagerModule(
                     selectedPaths = if (switching) emptySet() else it.selectedPaths,
                     isLoading = false,
                     // Backend error field is "error" (e.g. dir not found); "message" carries success info only
-                    errorMessage = resp.error ?: resp.message
+                    errorMessage = resp.error ?: resp.message,
+                    // 成功（或 core 明确回错）都算"这一次请求有结果"，失败路径标记清掉
+                    lastFailedPath = null
                 ) }
                 // Cache only on a successful (non-error) listing.
                 if (resp.error == null) {
@@ -281,7 +282,15 @@ class FileManagerModule(
                     }
                 }
             } catch (e: Exception) {
-                _state.update { it.copy(isLoading = false, errorMessage = "加载失败: ${e.message}") }
+                // 记下"这次要进的是哪个路径"：`currentPath` 没动（只在成功时更新），
+                // 不记的话错误页的重试会去重试上一层（见 [FileManagerState.lastFailedPath]）。
+                _state.update {
+                    it.copy(
+                        isLoading = false,
+                        errorMessage = "加载失败: ${e.message}",
+                        lastFailedPath = path
+                    )
+                }
             }
         }
     }
@@ -374,7 +383,19 @@ class FileManagerModule(
         }
     }
 
-    fun refreshFileList() { loadFileList(_state.value.currentPath) }
+    /**
+     * 手动刷新当前目录（工具栏「更多 → 刷新」）。
+     *
+     * ★ 必须 `force = true`：`loadFileList` 命中 TTL 缓存时会**直接返回缓存、不发请求**
+     *   （见那一处 `cached.fetchedAt + cacheTtlMs > now` 的早退）。原来这里传的是默认
+     *   `force = false`，于是"点刷新"在缓存有效期内是一个**完全的空操作** ——
+     *   用户看到的就是"刷新按钮不生效"。
+     */
+    fun refreshFileList() {
+        // 有未消化的失败就先重试**那一条**（例如刚点过的远端源），否则才是"重载当前目录"。
+        val target = _state.value.lastFailedPath ?: _state.value.currentPath
+        loadFileList(target, force = true)
+    }
 
     // ── File Info / Content ──
     fun getFileInfo(path: String) {
@@ -845,21 +866,30 @@ class FileManagerModule(
 
     // ── Phone Download History ──
     fun loadPhoneDownloadHistory() {
-            val jsonStr = _phoneHistoryPrefs.getString("history", null) ?: return
-        try {
-            val arr = AppJson.parseToJsonElement(jsonStr).jsonArray
-            val items = arr.map { elem ->
-                val obj = elem.jsonObject
-                PhoneDownloadHistoryItem(
-                    fileName = obj["fileName"]?.jsonPrimitive?.content ?: "",
-                    fileSize = obj["fileSize"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
-                    sourcePath = obj["sourcePath"]?.jsonPrimitive?.content ?: "",
-                    downloadedAt = obj["downloadedAt"]?.jsonPrimitive?.content?.toLongOrNull() ?: 0L,
-                    status = obj["status"]?.jsonPrimitive?.content ?: "completed"
-                )
-            }
-            _state.update { it.copy(phoneDownloadHistory = items) }
-        } catch (e: Exception) { DebugLog.w("FileManager", "loadPhoneDownloadHistory: failed to parse", e) }
+        val jsonStr = _phoneHistoryPrefs.getString("history", null) ?: return
+        // 2026-10-24：反序列化抽到 [decodePhoneDownloadHistory]，并**补上 source 字段**。
+        // 原实现漏读 source（构造后恒为空串），随后下面的 `filter { it.source == audio }`
+        // 会把所有记录都丢掉，再回写空数组 —— 表现就是"重启后下载历史被清空"。
+        val items = try {
+            decodePhoneDownloadHistory(jsonStr)
+        } catch (e: Exception) {
+            DebugLog.w("FileManager", "loadPhoneDownloadHistory: failed to parse", e)
+            return
+        }
+        /*
+         * 只保留 music 来源（2026-10-21）。
+         *
+         * 这一版之前的记录没有 `source` 字段（空串），分不清是从哪下的；用户要求
+         * "彻底独立、防止混淆"，所以这些老记录与 file/image 记录一并丢弃并回写一次。
+         * 下载历史本身只是"最近下了什么"，重来一次的成本远低于长期混着看。
+         */
+        val kept = items.filter { it.source == DOWNLOAD_SOURCE_AUDIO }
+        _state.update { it.copy(phoneDownloadHistory = kept) }
+        if (kept.size != items.size) {
+            _phoneHistoryPrefs.edit()
+                .putString("history", AppJson.encodeToString<List<PhoneDownloadHistoryItem>>(kept))
+                .apply()
+        }
     }
 
     private fun savePhoneDownloadHistory(item: PhoneDownloadHistoryItem) {
@@ -877,8 +907,60 @@ class FileManagerModule(
         _phoneHistoryPrefs.edit().remove("history").apply()
     }
 
+    /**
+     * **按条件**清下载记录（2026-10-21）。
+     *
+     * 这份历史是文件链共用的（文件 / 音乐 / 图片的「下载到手机」都往这里写一条），
+     * 而设置页各自只想清自己那一类 —— 例：音乐设置页的「下载记录」清空时不该把图片那几条也抹掉。
+     *
+     * 不新增"类型"字段：老记录里没有它，加字段就得迁移，而"按扩展名分类"对历史记录完全够用
+     * （记录只用于展示与清理，不参与任何业务判断）。
+     *
+     * @param predicate 返回 true 的条目会被删掉；其余原样保留并回写。
+     * @return 真正删除的条数。
+     */
+    fun clearPhoneDownloadHistory(predicate: (PhoneDownloadHistoryItem) -> Boolean): Int {
+        val current = _state.value.phoneDownloadHistory
+        val kept = current.filterNot(predicate)
+        val removed = current.size - kept.size
+        if (removed <= 0) return 0
+        _state.update { it.copy(phoneDownloadHistory = kept) }
+        if (kept.isEmpty()) {
+            _phoneHistoryPrefs.edit().remove("history").apply()
+        } else {
+            try {
+                _phoneHistoryPrefs.edit()
+                    .putString("history", AppJson.encodeToString<List<PhoneDownloadHistoryItem>>(kept))
+                    .apply()
+            } catch (e: Exception) {
+                DebugLog.w("FileManager", "clearPhoneDownloadHistory(filtered): failed", e)
+            }
+        }
+        return removed
+    }
+
     // ── Download to Phone ──
-    fun downloadFileToPhone(path: String, fileName: String) {
+    /**
+     * 下载一个文件到手机的公共下载目录。
+     *
+     * @param source 发起入口（`"audio"` / `"image"` / `"file"`），只用于给下载记录分类 ——
+     *   同一份 mp3 从音乐列表下和从文件管理器下，在各自的记录里应该分得开（见
+     *   [PhoneDownloadHistoryItem.source]）。
+     */
+    /** 当前这次下载的发起入口（落进记录用，见 [downloadFileToPhone]）。 */
+    private var currentDownloadSource: String = ""
+
+    /**
+     * 唯一需要下载历史的来源（2026-10-21）。
+     *
+     * 「下载记录」是**音乐设置**里的功能页；文件管理器与图片的下载不需要历史，
+     * 所以判据落在**写入点**（[downloadFileToPhone]）与**加载点**（[loadPhoneDownloadHistory]），
+     * 从源头就不产生其它来源的记录，读取方也就不必各自过滤。
+     */
+    private val DOWNLOAD_SOURCE_AUDIO = "audio"
+
+    fun downloadFileToPhone(path: String, fileName: String, source: String = "") {
+        currentDownloadSource = source
         if (_state.value.isDownloading) return
         downloadJob?.cancel()
         downloadJob = scope.launch {
@@ -965,7 +1047,24 @@ class FileManagerModule(
                     // 用户看到文件名却不知道去哪找是最常见的一句追问
                     _state.update { it.copy(isDownloading = false, downloadStatus = "completed", operationMessage = "下载完成: Download/$DOWNLOAD_SUBDIR/$fileName") }
 
-                    savePhoneDownloadHistory(PhoneDownloadHistoryItem(fileName = fileName, fileSize = _state.value.downloadTotalBytes, sourcePath = path, downloadedAt = System.currentTimeMillis(), status = "completed"))
+                    /*
+                     * 只有**从音乐里发起**的下载才留历史（2026-10-21 用户要求）：
+                     * 「下载记录」是音乐设置里的一个功能页；文件管理器与图片的下载
+                     * 不需要历史，写进去只会造成两边混淆。所以判据放在写入点，
+                     * 而不是让每个读取方各自过滤 —— 从源头就不产生脏数据。
+                     */
+                    if (currentDownloadSource == DOWNLOAD_SOURCE_AUDIO) {
+                        savePhoneDownloadHistory(
+                            PhoneDownloadHistoryItem(
+                                fileName = fileName,
+                                fileSize = _state.value.downloadTotalBytes,
+                                sourcePath = path,
+                                downloadedAt = System.currentTimeMillis(),
+                                status = "completed",
+                                source = currentDownloadSource
+                            )
+                        )
+                    }
                 }
                 result == "cancelled" -> _state.update { it.copy(isDownloading = false, downloadStatus = "paused") }
                 else -> _state.update { it.copy(isDownloading = false, downloadStatus = "error", errorMessage = "下载失败: ${result.substringAfter("error:")}") }
@@ -980,7 +1079,9 @@ class FileManagerModule(
     }
 
     fun resumeDownload(path: String, fileName: String) {
-        if (_downloadPartialFile?.exists() == true) downloadFileToPhone(path, fileName)
+        if (_downloadPartialFile?.exists() == true) {
+            downloadFileToPhone(path, fileName, currentDownloadSource)
+        }
     }
 
     /**

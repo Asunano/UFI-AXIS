@@ -65,6 +65,24 @@ class DashboardModule(
     private val _monitorState = MutableStateFlow(MonitorState())
     val monitorState: StateFlow<MonitorState> = _monitorState.asStateFlow()
 
+    /** 按天事件计数（月历热力，2026-10-23）：`yyyy-MM-dd` → 条数。 */
+    private val _alertDailyCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val alertDailyCounts: StateFlow<Map<String, Int>> = _alertDailyCounts.asStateFlow()
+
+    /** 拉取某个月（或任意区间）的每日事件计数。失败时保留上一次结果。 */
+    fun loadAlertDailyCounts(start: Long, end: Long) {
+        scope.launch {
+            runCatching { api.getAlertDailyCounts(start, end) }
+                .onSuccess { element ->
+                    val days = element.jsonObject["days"]?.jsonObject ?: return@onSuccess
+                    _alertDailyCounts.value = days.mapValues { (_, v) ->
+                        runCatching { v.jsonPrimitive.int }.getOrDefault(0)
+                    }
+                }
+                .onFailure { DebugLog.e("Dashboard", "loadAlertDailyCounts failed", it) }
+        }
+    }
+
     // ── UI 事件出口（ViewModel → Compose；如删除成功 Toast 信号）──
     // 同构于 ToolsModule/NetworkModule 的 _events，但仅面向 UI（不转发跨模块 sink）。
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 16)

@@ -1,31 +1,15 @@
 package com.ufi_axis.ui.screens
 
-import android.graphics.BitmapFactory
-import androidx.compose.foundation.Image
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.Modifier
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
-import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.module.WIFI_BAND_SWITCH_DISCONNECT_HINT
 import com.ufi_axis.viewmodel.module.WIFI_RESTART_DISCONNECT_HINT
@@ -131,17 +115,18 @@ private fun wifiChangeConfirmText(items: List<WifiChangeItem>): String {
  * 只认这两个。**不要**拿 `"0"` / `"1"`（读侧 `chip_index` 的展示编码）或界面文案
  * `"2.4 GHz"` / `"5 GHz"` 去下发，那些会被 core 直接 400。
  *
- * 收成一份表是因为这两个字符串要出现在三处：下拉文案、确认弹窗正文、二维码区说明。
+ * 收成一份表是因为这两个字符串要出现在三处：下拉文案、确认弹窗正文、二维码弹窗的说明。
  * 各写一遍迟早漂成"下拉说 5 GHz、确认弹窗说 2.4 GHz"。列表顺序 = 下拉选项顺序。
  */
 private val WIFI_BAND_OPTIONS = listOf("chip1" to "2.4 GHz", "chip2" to "5 GHz")
 
 /** 频段传输值 → 界面文案。读到表外的值时按 2.4G 兜底（与 `WifiSettingsResponse.activeChip` 同口径）。 */
-private fun wifiBandLabel(chip: String): String =
+internal fun wifiBandLabel(chip: String): String =
     WIFI_BAND_OPTIONS.firstOrNull { it.first == chip }?.second ?: WIFI_BAND_OPTIONS.first().second
 
 /**
- * WiFi 热点设置弹窗 — 网络名称 / 加密方式 / 连接密码 / 最大连接数 / 隐藏 SSID / 频段 + 连接二维码。
+ * WiFi 热点设置弹窗 — 网络名称 / 加密方式 / 连接密码 / 最大连接数 / 隐藏 SSID / 频段。
+ *（连接二维码 2026-10-14 从这里拆出去，成了网络页上「WiFi 热点」下面一个独立入口。）
  *
  * 全部使用 [UfiDialogParts] 中的统一快捷组件，零重复样式代码。
  *
@@ -269,7 +254,10 @@ fun WifiSettingsDialog(
      * 以 [visible] 为 key：本弹窗关掉时 WifiSettingsDialog 并没有离开组合（只是 visible=false），
      * 不重置的话上一次没点完的确认会在下次打开时直接冒出来。
      */
-    var bandConfirmVisible by remember(visible) { mutableStateOf(false) }
+    // 2026-10-22：二次确认改走公共设施（UfiDialogSuspendState + UfiConfirmHost），
+    // 不再在本文件里手写 suspendedForConfirm / closeRequested 两个 flag。
+    val confirmSuspend = rememberUfiDialogSuspendState()
+    var confirmRequest by remember(visible) { mutableStateOf<UfiConfirmRequest?>(null) }
 
     // 2026-10-12：二次确认期间**先收起热点设置弹窗**，确认框独立在场。
     //
@@ -285,15 +273,12 @@ fun WifiSettingsDialog(
     // 用户裁决：先解决闪烁与模糊，草稿保不住可以接受。
     // 若日后要保住草稿，得把编辑状态提到 ViewModel 或调用方的 remember 里 ——
     // 那时本方案的"收起再重开"才真正无损。
-    var suspendedForConfirm by remember { mutableStateOf(false) }
-    // 真正决定"这一次有没有窗口在场"的是两者都可见。
-    val onScreen = visible && !suspendedForConfirm
 
-    // 2026-10-12：区分「收起去弹确认框」与「真的要关闭」。
-    // 程序性收起（保存时先收起本弹窗、让确认框独立上场）不该触发外层 onDismiss，
-    // 但提交成功后**就是要关闭** —— 两者在 suspendedForConfirm 上都是 true，
-    // 只能靠这个独立的关闭意图来区分。
-    var closeRequested by remember { mutableStateOf(false) }
+    // 真正决定"这一次有没有窗口在场"的是两者都可见。
+    val onScreen = confirmSuspend.onScreen(visible)
+
+    // 「程序性收起」与「真的要关闭」的区分已收进 UfiDialogSuspendState
+    // （confirmSuspend.consumeProgrammaticDismiss()）。
 
 
     /**
@@ -350,17 +335,17 @@ fun WifiSettingsDialog(
             //
             // 先记下「真的要关」再调 onDismiss：此刻 suspendedForConfirm 仍为 true
             // （弹窗处于收起状态），onDismiss 的守卫要靠这个标志才肯透传。
-            suspendedForConfirm = false
-            closeRequested = true
+            confirmSuspend.resume()
             onDismiss()
         }
     }
 
     // 用 UfiScrollableDialog 而不是 UfiCustomDialog（2026-08-30）：
-    // UfiCustomDialog 的 content 不滚动也不设高度上限，二维码展开后这一列高度直接超过弹窗，
-    // Column 只能把各子项按比例压缩 —— 表现就是"弹窗被挤变形、底部按钮变扁"。
+    // UfiCustomDialog 的 content 不滚动也不设高度上限，这一列（六个字段 + 两条说明）
+    // 高度直接超过弹窗，Column 只能把各子项按比例压缩 —— 表现就是"弹窗被挤变形、底部按钮变扁"。
     // UfiScrollableDialog 会给内容区 clamp 出 maxScrollH 并让它滚动，
     // 同时把 actions 放到滚动区**之外**的固定位置（footer 预算 120dp）。
+    // （2026-10-14 二维码搬走之后这一条**依然成立**：字段与说明本身已经够高。）
     UfiScrollableDialog(
         visible = onScreen,
         // 程序性收起（suspendedForConfirm=true 去弹确认框）也会让 shell 走一遍离场并
@@ -374,10 +359,7 @@ fun WifiSettingsDialog(
             //  · suspendedForConfirm=true 但确实是关闭（如提交成功）—— 那是**要关**的，
             //    复位后照常透传。不能一律 return：否则提交成功后弹窗会重新弹回来
             //    （用户实测「点确认修改配置后 WiFi 设置弹窗又弹出来」）。
-            val programmatic = suspendedForConfirm && !closeRequested
-            suspendedForConfirm = false
-            closeRequested = false
-            if (programmatic) return@UfiScrollableDialog
+            if (confirmSuspend.consumeProgrammaticDismiss()) return@UfiScrollableDialog
             onDismiss()
         },
         title = "WiFi 热点设置",
@@ -393,8 +375,22 @@ fun WifiSettingsDialog(
                     // 没改任何东西 → 直接保存配置，一个字段都不发。
                     if (hasAnyChange) {
                         // 先收起本弹窗（草稿保留），再让确认框独立上场。
-                        suspendedForConfirm = true
-                        bandConfirmVisible = true
+                        confirmSuspend.suspend()
+                        confirmRequest = UfiConfirmRequest(
+                            title = changedItems.firstOrNull()?.let { "确认${it.label}" } ?: "确认 WiFi 设置变更",
+                            text = wifiChangeConfirmText(changedItems),
+                            confirmText = "确认并保存",
+                            dismissText = "暂不执行",
+                            destructive = true,
+                            onConfirm = {
+                                confirmRequest = null
+                                submit(switchBand = changedItems.contains(WifiChangeItem.BAND))
+                            },
+                            onDismiss = {
+                                confirmRequest = null
+                                confirmSuspend.resume()
+                            }
+                        )
                     } else submit(switchBand = false)
                 },
                 confirmText = "保存配置",
@@ -414,6 +410,9 @@ fun WifiSettingsDialog(
         }
     ) {
         UfiDialogBody {
+            // 2026-10-15（用户："改成左侧标题+输入框内容，比如连接密码在左上角，换一行是输入框，
+            // 输入框占一整行，恢复之前的输入框上下宽度"）：回到「标签独占一行、控件下一行占满整行」，
+            // 输入框也用回标准形态（M3 56dp）—— 上一版压成 32dp 的紧凑形态在纵向布局里显得单薄。
             UfiDialogTextField(
                 label = "网络名称 (SSID)",
                 value = ssid,
@@ -425,9 +424,10 @@ fun WifiSettingsDialog(
             //（四档、含追加档时五档，靠 `wrap = true` 折行放下）。
             // 取值域仍是 [authPresets] 的 authMode（含「保持不变」档与透传档），显示文案由
             // optionLabel 从**同一份** authPresets 取：值与文案没有第二个来源。
-            // modifier 不给 —— UfiDropdown 内部触发器已 fillMaxWidth，横向内距的唯一来源是弹窗壳
-            //（UfiDateRangePickerDialog.kt:630 记过"自带一层 padding 导致左右缩进比别的字段多 18dp"）。
-            UfiDialogField(label = "加密方式") {
+            // 2026-10-15：下拉框回到**同行**排布（左边标题、右边下拉框，不占满整行）——
+            // 下拉只有 100dp 上下，占一整行是白占。输入框仍走纵向（标签一行、输入框一整行）。
+            // 两种排布都由 UfiDialogField 提供，不是这里自己拼的。
+            UfiDialogField(label = "加密方式", inline = true) {
                 UfiDropdown(
                     selectedValue = selectedAuth,
                     options = authPresets.map { it.authMode },
@@ -456,7 +456,7 @@ fun WifiSettingsDialog(
             // 「保持不变」= 列表首项（null），选它就等于旧实现里的"留空"：提交时不带 max_sta_num。
             // 11 项超过 UfiDropdown 的默认 7 项可见高度，由它自己限高滚动并在打开时滚到选中项 ——
             // 不显式传 maxVisibleItems：让弹层长到 11 项高会在小屏上顶满内容区。
-            UfiDialogField(label = "最大连接数") {
+            UfiDialogField(label = "最大连接数", inline = true) {
                 UfiDropdown(
                     selectedValue = maxStaValue,
                     options = maxStaOptions,
@@ -489,7 +489,7 @@ fun WifiSettingsDialog(
             //
             // 文案与传输取值仍然**只**来自 [WIFI_BAND_OPTIONS]：options 取 `chip1`/`chip2`
             //（= 真正发出去的值），显示文案由 wifiBandLabel 从同一张表取，界面文案永远不当传输值。
-            UfiDialogField(label = "WiFi 频段") {
+            UfiDialogField(label = "WiFi 频段", inline = true) {
                 UfiDropdown(
                     selectedValue = selectedChip,
                     options = WIFI_BAND_OPTIONS.map { it.first },
@@ -503,7 +503,10 @@ fun WifiSettingsDialog(
             if (bandChanged) {
                 UfiDialogNote("频段会在配置保存后单独切换，点「保存配置」时会先请你确认。")
             }
-            WifiQrCodeSection(viewModel = viewModel, chip = wifi?.activeChip ?: "chip1")
+            // 2026-10-14：二维码区从这里**移出去了**（用户："显示二维码功能单独放出来，
+            // 入口放在 WiFi 设置弹窗的下面"）。本弹窗里全是"改完要保存"的草稿字段，
+            // 二维码是只读的一件事，混在一起会让人以为它也要点保存才更新 ——
+            // 现在它是网络页「WiFi 热点」下面一个独立入口，见 [WifiQrCodeDialog]。
             // 断连警告必须在**点击之前**给：用户很可能正通过这个热点连着设备，保存后热点重启，
             // 失败/成功提示物理上都送不到他眼前 —— 那时才提示等于没提示。
             // 放在内容最后（紧贴底部按钮）而不是顶部：本弹窗内容是可滚动的，
@@ -515,115 +518,7 @@ fun WifiSettingsDialog(
     }
 
     // ── WiFi 设置的二次确认（本仓硬约定：破坏性动作必须用户点头且写清后果）──
-    // 用公共 UfiConfirmDialog(destructive = true)，与重启设备 / 恢复出厂那几处同一套观感，
-    // 不另造布局。渲染在 UfiScrollableDialog **之外**：它是独立的一层弹窗，
-    // 叠在热点设置弹窗上面（同 MediaVideoDownloadHistoryScreen 的 `if (flag) { … }` 写法）。
-    //
-    // 2026-10-12：由「仅确认换频段」扩到「确认任一变更项」，标题与正文都由实际变更列表生成。
-    if (bandConfirmVisible) {
-        UfiConfirmDialog(
-            // 标题跟着实际内容走：只有频段变时仍是「切换 WiFi 频段」，
-            // 只改密码时是「修改 WiFi 密码」，多项同时变时取第一项（正文会列全）。
-            title = changedItems.firstOrNull()?.let { "确认${it.label}" } ?: "确认 WiFi 设置变更",
-            text = wifiChangeConfirmText(changedItems),
-            confirmText = "确认并保存",
-            // 「暂不执行」而不是「取消」：这里要留的是"我不做这个动作"的出口，
-            // 而不是"关掉整个设置"—— 点它只收起本确认框，热点设置弹窗还在，草稿都留着。
-            dismissText = "暂不执行",
-            destructive = true,
-            onConfirm = {
-                bandConfirmVisible = false
-                // switchBand 只在**频段真的变了**时才为 true：submit 里它决定要不要额外
-                // 打 POST /api/wifi/band。带 true 去而频段没变，等于给设备发一条重启 WiFi
-                // 模块的命令 —— 正是这个确认框要防的后果。
-                submit(switchBand = changedItems.contains(WifiChangeItem.BAND))
-            },
-            // 「暂不执行」= **一个字段都不发**（连 /config 都不发）。
-            // 半套下发（存了 SSID 却没换频段）会让弹窗上的频段显示成设备并不在用的值 ——
-            // 那就是假开关。要只存配置，用户可以把频段下拉选回原频段再点保存。
-            // 「暂不执行」= 一个字段都不发，并把热点设置弹窗带回来（草稿全在）。
-            onDismiss = {
-                bandConfirmVisible = false
-                suspendedForConfirm = false
-            }
-        )
-    }
-}
-
-
-/**
- * 连接二维码区（`GET /api/wifi/qrcode`）。
- *
- * 按需加载：默认只显示一个按钮，点开才发请求 —— 二维码是设备现生成的图片，
- * 每次打开 WiFi 设置都预拉会让弹窗多等一个来回。
- *
- * [chip] 用的是**设备当前生效频段**（`wifi.activeChip`）而不是弹窗里的草稿选择：
- * 二维码由设备按已生效的配置生成，草稿还没保存时拿它去请求只会得到旧频段的图，反而误导。
- * 同理，改完配置保存后需要重新打开本区才会拿到新图。
- */
-@Composable
-private fun WifiQrCodeSection(viewModel: MainViewModel, chip: String) {
-    val palette = LocalResolvedPalette.current
-    var expanded by remember { mutableStateOf(false) }
-    var bytes by remember(chip) { mutableStateOf<ByteArray?>(null) }
-    var loading by remember { mutableStateOf(false) }
-    var failed by remember { mutableStateOf(false) }
-
-    LaunchedEffect(expanded, chip) {
-        if (!expanded || bytes != null) return@LaunchedEffect
-        loading = true
-        failed = false
-        val result = viewModel.network.fetchWifiQrCode(chip)
-        bytes = result
-        failed = result == null
-        loading = false
-    }
-
-    UfiDialogField(label = "连接二维码") {
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            if (!expanded) {
-                UfiButton(variant = UfiButtonVariant.Secondary, text = "显示二维码", onClick = { expanded = true })
-            } else {
-                // 二维码永远画在白底上：设备生成的是黑白 PNG，深色主题下直接贴会糊成一片。
-                val bitmap = remember(bytes) {
-                    bytes?.let { runCatching { BitmapFactory.decodeByteArray(it, 0, it.size) }.getOrNull() }
-                }
-                when {
-                    bitmap != null -> Box(
-                        modifier = Modifier
-                            // 168dp 而非 196dp：弹窗内容区高度有限，二维码不该独占大半屏；
-                            // 168dp 在手机上扫码距离仍然充裕。
-                            .size(168.dp)
-                            .clip(UfiCardDefaults.shape)
-                            .background(Color.White)
-                            .padding(8.dp)
-                    ) {
-                        Image(
-                            bitmap = bitmap.asImageBitmap(),
-                            contentDescription = "WiFi 连接二维码",
-                            // fillMaxSize + Fit：设备返回的图不保证是正方形，
-                            // 原来只给 fillMaxWidth 会让高度按原始比例撑出白底方框。
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Fit
-                        )
-                    }
-                    loading -> UfiLoadingBox(isLoading = true) {}
-                    failed -> Text(
-                        text = "设备未提供二维码",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = palette.textSecondary
-                    )
-                }
-                Text(
-                    text = "扫码即可连接 ${wifiBandLabel(chip)} 热点",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = palette.textSecondary
-                )
-            }
-        }
-    }
+    // 2026-10-22：改走公共 UfiConfirmHost；父弹窗的收起/恢复由 confirmSuspend 负责，
+    // 两个窗口永远不会同时在场（这正是之前 backdrop 丢模糊 / 闪烁的根因）。
+    UfiConfirmHost(confirmRequest)
 }

@@ -201,9 +201,16 @@ data class ResolvedPalette(
     val cardBorder: Color
         get() = if (isDark) Color.White.copy(alpha = 0.05f) else Color.Black.copy(alpha = 0.06f)
 
-    /** Dialog border color: 更明显的描边（参考 UFITOOLS-Widget 的 2dp 强边框，浅色~18% / 深色~30%） */
+    /**
+     * Dialog border color：弹窗卡片的描边（`UfiDialogShell` 用 2dp 强边框）。
+     *
+     * 2026-10-15（用户："更改公共弹窗组件的边框细线，当前是灰色，加深一点颜色但不是深黑"）：
+     * 浅色 18% → **26%**、深色 30% → **38%**。原来的 18% 在近白卡面上只差一档灰，
+     * 弹窗边界基本靠阴影撑；加深到 26% 后线条立得住，又远没到"黑框"（仍是黑/白加透明度，
+     * 不是不透明色）。两态各自独立取值，理由与 [cardBorder] 那段相同。
+     */
     val dialogBorder: Color
-        get() = if (isDark) Color.White.copy(alpha = 0.30f) else Color.Black.copy(alpha = 0.18f)
+        get() = if (isDark) Color.White.copy(alpha = 0.38f) else Color.Black.copy(alpha = 0.26f)
 
     /** Toast border color */
     val toastBorder: Color

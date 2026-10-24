@@ -122,7 +122,7 @@ fun UfiListRowCard(
             }
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+                verticalArrangement = Arrangement.spacedBy(Spacing.TextStackGap)
             ) {
                 Text(
                     text = title,

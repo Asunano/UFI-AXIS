@@ -74,6 +74,8 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
 
     // WiFi 热点设置弹窗开关
     var showWifiSettingsDialog by remember { mutableStateOf(false) }
+    // 连接二维码弹窗开关（2026-10-14：从 WiFi 设置弹窗里拆出来的独立入口）
+    var showWifiQrDialog by remember { mutableStateOf(false) }
 
     // 出错 5s 后自动重试，最多 3 次（网络界面无轮询，不重试会导致出错后永久卡住）。
     // 同样只在页面前台时重试：后台 Tab 出错先躺着，等用户切回来（pageForeground 变 true
@@ -194,6 +196,23 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                         )
                     }
 
+                    // 连接二维码（2026-10-14 用户要求）：从 WiFi 设置弹窗里拆出来，单独一个入口，
+                    // 就放在「WiFi 热点」下面。二维码是**只读**的一件事，而设置弹窗里全是
+                    // "改完要保存"的草稿字段 —— 混在一起会让人以为二维码也要点保存才更新。
+                    UfiSettingsRowCard {
+                        UfiSettingsItem(
+                            icon = Icons.Default.QrCode,
+                            title = "连接二维码",
+                            description = if (state.wifiEnabled) {
+                                "扫码连接 ${wifi?.ssid?.ifBlank { "未命名" } ?: "未命名"} 热点"
+                            } else {
+                                "热点已关闭，开启后可用"
+                            },
+                            onClick = { showWifiQrDialog = true },
+                            trailing = { UfiSettingsChevron() }
+                        )
+                    }
+
                     UfiSettingsRowCard {
                         UfiSettingsItem(
                             icon = Icons.Default.Speed,
@@ -230,6 +249,18 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                     viewModel = viewModel,
                     visible = true,
                     onDismiss = { showWifiSettingsDialog = false }
+                )
+            }
+
+            // 连接二维码弹窗（2026-10-14：从 WiFi 设置弹窗里拆出来的独立入口）。
+            // chip 用**设备当前生效频段**：二维码由设备按已生效的配置生成，
+            // 草稿里的选择还没保存时拿它去请求只会得到旧频段的图。
+            if (showWifiQrDialog) {
+                WifiQrCodeDialog(
+                    viewModel = viewModel,
+                    // 直接用 state 里的值：上面那个 `wifi` 局部 val 声明在内容列内部，这里已经出作用域
+                    chip = state.wifiSettings?.activeChip ?: "chip1",
+                    onDismiss = { showWifiQrDialog = false }
                 )
             }
         }
@@ -625,11 +656,19 @@ private fun HeroMetric(value: String, label: String, modifier: Modifier = Modifi
                 .padding(vertical = 10.dp, horizontal = 6.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(
-                value,
+            // 2026-10-14（用户要求）：RSRP / SNR / RSRQ 数值接入滚轮动画，与仪表盘的实时读数同款。
+            //
+            // 这里用 UfiRollingText 而**不是** UfiRollingMetric：本卡的**单位在下方 label 里**
+            // （"RSRP dBm" / "SNR dB"），数值串是纯整数（空值哨兵是 "—"），不存在自适应单位换档
+            // —— 而「998 KB/s → 1.0 MB/s」那种换档正是 UfiRollingMetric 存在的唯一理由
+            // （见 HomeConnectionCard 实时速率那处的注释）。
+            //
+            // 注意 UfiRollingText 没有 `maxLines`：它按定义就是单行（宽度 = 字形实测和），
+            // 原来的 `maxLines = 1` 是多余的。居中由外层 Column 的 CenterHorizontally 负责。
+            UfiRollingText(
+                text = value,
                 style = UfiTextStyles.panelTitleStrong,
-                color = palette.onGradient,  // 原 Color.White：RSRP/SNR/RSRQ 数值
-                maxLines = 1
+                color = palette.onGradient  // 原 Color.White：RSRP/SNR/RSRQ 数值
             )
             Spacer(Modifier.height(2.dp))
             Text(

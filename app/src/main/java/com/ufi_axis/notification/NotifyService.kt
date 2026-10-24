@@ -190,6 +190,13 @@ class NotifyService : Service() {
     }
 
     private fun initWebSocket(baseUrl: String, token: String) {
+        // 2026-10-21（审计 §B12）：token 为空说明本进程拿到的还是"未配对"的参数
+        // （主进程刚清凭据 / 还没推送新 token）。此时建连必然被 core 拒（444/1008），
+        // 之后就是无限重连空转、还占着 core 的 MAX_CONNECTIONS 名额。
+        if (token.isBlank()) {
+            DebugLog.w(TAG, "token 为空，跳过 WS 连接（等待主进程推送新凭据）")
+            return
+        }
         val wsUrl = ConnectionBootstrap.rewriteWsUrl(baseUrl)
         val wsRepo = WebSocketRepository(wsUrl, token)
         webSocketRepository = wsRepo

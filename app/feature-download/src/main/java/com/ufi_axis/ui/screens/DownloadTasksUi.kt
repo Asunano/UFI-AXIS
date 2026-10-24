@@ -121,7 +121,8 @@ internal fun DownloadTasksTab(
                 top = 4.dp,
                 bottom = 88.dp
             ),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            // 任务卡之间的间距与设置页的平级行卡对齐（Spacing.SettingsCardGap = 10dp）。
+            verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
         ) {
             // key = task.id（稳定业务 id，非下标）：轮询回来后同一任务仍映射到同一个 item 节点，
             // Compose 只更新它内部变化的字段（进度/速度/徽标），不重建整列。
@@ -388,7 +389,7 @@ private fun DownloadTaskCard(
 
                 Spacer(Modifier.height(6.dp))
                 // 副标题：大小 / 路径，分两行展示
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(Spacing.TextStackGap)) {
                     Text(
                         text = buildString {
                             append(FormatUtils.formatBytes(task.downloadedBytes))

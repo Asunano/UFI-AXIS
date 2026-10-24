@@ -10,13 +10,14 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.requiredWidthIn
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -26,6 +27,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -33,6 +36,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.onSizeChanged
@@ -91,8 +95,13 @@ import kotlinx.coroutines.launch
  * 按 D8「只有减少入口数量的签名改动值得解冻」，本次 3 → 1 属可解冻情形。
  */
 
-/** 触发器高度。2026-10-10：44dp → 32dp（**尺寸**扁平化：16sp 文字行高约 20dp，
- *  上下各留 6dp，原高度比文字体量高一倍多）。外观（圆角/边框/阴影）保持不变。 */
+/**
+ * 触发器的**最小**高度。2026-10-10：44dp → 32dp（**尺寸**扁平化：16sp 文字行高约 20dp，
+ * 上下各留 6dp，原高度比文字体量高一倍多）。外观（圆角/边框/阴影）保持不变。
+ *
+ * 2026-10-14：从 `height(...)` 改成 `heightIn(min = ...)` —— 用户把全局字号调大之后，
+ * 固定 32dp 会把文字裁掉。现在它随字体长高，与 [UfiCompactTextField] 一起长。
+ */
 private val UfiDropdownTriggerHeight = 32.dp
 
 /**
@@ -111,7 +120,16 @@ private val UfiDropdownPaddingH = Spacing.Large
 private val UfiDropdownTriggerMinWidth = 88.dp
 
 /** 弹层默认最大可见项数，超出滚动。 */
-private const val UfiDropdownMaxVisibleItems = 7
+private const val UfiDropdownMaxVisibleItems = 5
+
+/**
+ * 不可用时的整体透明度（2026-10-14）。
+ *
+ * 与 [UfiSwitch] 的不可用态同值：本仓"不可用"的统一表达就是压到 0.4 ——
+ * 触发器里的文字/箭头颜色是显式指定的，只靠 `Surface(enabled = false)` 不会变淡，
+ * 必须自己压 alpha，否则禁用看起来和可用一模一样（那就成了假控件）。
+ */
+private const val UfiDropdownDisabledAlpha = 0.4f
 
 /**
  * 下拉单选字段 —— 全站唯一实现。
@@ -131,6 +149,15 @@ private const val UfiDropdownMaxVisibleItems = 7
  * @param maxVisibleItems 弹层最大可见项数，超出滚动。
  * @param optionLabel 值 → 显示文案。时分用 `{ "%02d".format(it) }` 补零，其余默认 `toString()`。
  */
+/**
+ * 当前下拉是否处在 [UfiDialogField] 的 `inline = true` 槽里（2026-10-24）。
+ *
+ * inline 槽给的是"标签右侧的剩余整行宽"，而 `UfiDropdown` 的触发器按内容宽撑开；
+ * 在固定约束的槽里会被拉成一条长条。这里用 CompositionLocal 让下拉自己知道场景并封顶，
+ * 不必每个调用点手写 `widthIn(max = …)`。
+ */
+val LocalUfiDropdownInline = staticCompositionLocalOf { false }
+
 @Composable
 fun <T> UfiDropdown(
     selectedValue: T,
@@ -139,11 +166,33 @@ fun <T> UfiDropdown(
     modifier: Modifier = Modifier,
     unitSuffix: String = "",
     maxVisibleItems: Int = UfiDropdownMaxVisibleItems,
-    optionLabel: (T) -> String = { it.toString() }
+    optionLabel: (T) -> String = { it.toString() },
+    /**
+     * 是否可用（2026-10-14 新增，带默认值 ⇒ 既有调用点不受影响）。
+     *
+     * 上一轮收敛时删掉过 `enabled`（当时零调用点）；现在"巡检间隔"这类**跟着另一个开关走**
+     * 的字段需要它 —— 开关关着时那个值不起作用，界面就不能让它看起来能改。
+     * 不可用时：触发器压到 [UfiDropdownDisabledAlpha]、不响应点击、已展开的弹层立即收起。
+     */
+    enabled: Boolean = true,
+    /**
+     * 触发器是否占满父容器的整行宽（2026-10-15 新增，默认 false = 按内容宽度撑开）。
+     *
+     * 两种形态各有各的场合，不是新旧关系：
+     * · **按内容宽度**（默认）：设置行"标签在左、控件在右"，与开关同宽同列（[UfiSettingsItem] 的 trailing 槽）；
+     * · **占满整行**：弹窗字段"标签在上一行、控件独占下一行"（[UfiDialogField]），
+     *   这时不占满就只占左边一小块，与旁边的输入框对不齐。
+     * 占满时值的文字靠左、箭头贴右边缘（`Spacer(weight(1f))` 把箭头推过去），像一个字段。
+     */
+    fillWidth: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
     val shape = UfiCardDefaults.shape
     var expanded by remember { mutableStateOf(false) }
+    // 展开状态下被置为不可用（上层开关被关掉）时立即收起，避免留下一个点不动的浮层
+    LaunchedEffect(enabled) {
+        if (!enabled) expanded = false
+    }
     // ⚠ 这个局部变量**不能叫 maxHeight**：BoxWithConstraints 的 receiver 有同名成员，
     // 在它的 lambda 里同名成员优先，外层局部会被静默遮蔽 —— 收敛前的 TimeField 就踩了这个坑，
     // `heightIn(max = maxHeight)` 实际拿到的是**约束上限（常是整屏高）**而不是七项高度，
@@ -161,7 +210,11 @@ fun <T> UfiDropdown(
     // 触发器自身在 wrap-content / widthIn 等情形下可能比它窄，弹层就会比按钮宽出一截。
     var triggerWidthPx by remember { mutableStateOf(0) }
 
-    BoxWithConstraints(modifier = modifier) {
+    BoxWithConstraints(
+        modifier = modifier.then(
+            if (LocalUfiDropdownInline.current) Modifier.requiredWidthIn(max = 200.dp) else Modifier
+        )
+    ) {
         val triggerWidth = if (triggerWidthPx > 0) with(density) { triggerWidthPx.toDp() } else maxWidth
         val gapPx = with(density) { Spacing.Small.roundToPx() }
         val edgeMarginPx = with(density) { Spacing.Large.roundToPx() }
@@ -181,6 +234,7 @@ fun <T> UfiDropdown(
 
         Surface(
             onClick = { expanded = !expanded },
+            enabled = enabled,
             shape = shape,
             color = palette.surfaceMuted,
             border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.6f)),
@@ -190,14 +244,17 @@ fun <T> UfiDropdown(
             // （「2」/「chip1」）点起来费劲，也容不下下箭头。宽度由「文字 + 单位 + 箭头 + 内距」
             // 自然决定，长选项（密码档位长文案）也据此展开，不再固定成整行宽。
             modifier = Modifier
-                .wrapContentWidth()
+                .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
                 .widthIn(min = UfiDropdownTriggerMinWidth)
-                .height(UfiDropdownTriggerHeight)
+                // 最小高度而不是固定高度：字号调大时触发器跟着长（见常量说明）
+                .heightIn(min = UfiDropdownTriggerHeight)
+                // 不可用时压暗（理由见 [UfiDropdownDisabledAlpha]）
+                .alpha(if (enabled) 1f else UfiDropdownDisabledAlpha)
                 .onSizeChanged { triggerWidthPx = it.width }
         ) {
             Row(
                 modifier = Modifier
-                    .wrapContentWidth()
+                    .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth())
                     .widthIn(min = UfiDropdownTriggerMinWidth)
                     .padding(horizontal = UfiDropdownPaddingH),
                 verticalAlignment = Alignment.CenterVertically
@@ -222,7 +279,14 @@ fun <T> UfiDropdown(
                         modifier = Modifier.padding(start = Spacing.Medium)
                     )
                 }
-                Icon(
+                // 2026-10-19：**无条件**把箭头推到右边缘。
+                // 原来只在 fillWidth 时加 weight：固定宽度用法（如「界面缩放」的 110dp 触发器）
+                // 内容比盒子窄，箭头紧跟文字 → 右侧空出一截，看起来"没靠右"。
+                // 在 wrapContentWidth 下 weight 拿不到剩余空间，等于无操作，不影响既有布局。
+                // 2026-10-24：只在 fillWidth 时推箭头 —— wrapContentWidth 下 weight 会把 Row 撑到约束上限，
+                // 触发器就会被拉成一条长条（WiFi 弹窗三个下拉的"异常长"正是这个）。
+                if (fillWidth) Spacer(Modifier.weight(1f))
+            Icon(
                     Icons.Filled.KeyboardArrowDown,
                     contentDescription = null,
                     tint = palette.textSecondary,

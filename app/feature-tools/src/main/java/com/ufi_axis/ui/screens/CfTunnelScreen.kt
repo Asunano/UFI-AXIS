@@ -1,10 +1,8 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.screens
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.*
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.lifecycle.Lifecycle
@@ -18,7 +16,6 @@ import androidx.navigation.NavHostController
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
-import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
@@ -112,13 +109,32 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
         navController = navController,
         showBack = true
     ) { padding ->
-        UfiPageBackground(
-            modifier = Modifier.padding(padding),
-            contentHPadding = Spacing.PagePadding
-        ) {
+        /*
+         * 横向留白口径（2026-10-13 统一）：本页**不再**用 `contentHPadding = PagePadding`（12dp），
+         * 改为「谁自带外边距谁给」——
+         *  · 自带：`UfiSettingsRowCard` / `UfiStatusCard` / `UfiLogPanel` 内建
+         *    `CardHorizontalMargin`（16dp），调用点**不得**再补；
+         *  · 不自带：`UfiButtonRow` / 裸 `UfiButton` 由调用点补同一个 Modifier ——
+         *    与 `TunnelSettingsScreen` / `TrafficManagementScreen` 同做法。
+         *  · **`UfiErrorBanner` 谁都不补**：它是 Popup，横向位置由 `UfiBannerDefaults.sideMargin`
+         *    独立算出、与页面的 `contentHPadding` 无关；传 padding 反而会让长文案左右不对称
+         *    （详见该组件 KDoc 的 2026-10-13 更正）。全库 9 个调用点已统一去掉。
+         *
+         * 为什么必须整页一起换：两种口径混排会左右差 4dp（16 vs 12），肉眼可见。
+         * token 卡原先手搓 `Surface`（只有 1dp 描边、**无阴影**、内距 12dp），
+         * 换成 `UfiSettingsRowCard` 后才与设置页的卡同族；而它自带 16dp 外边距，
+         * 所以同页其余组件必须一起对齐到 16dp，否则新卡会比邻居凸出来。
+         *
+         * 2026-10-13 补完：`UfiStatusCard` / `UfiLogPanel` 现已自带同一个外边距（全站卡片组件
+         * 一起收敛），本页给它们补的那两层 Modifier 已删除 —— 否则就是 16+16=32dp 的双重内距。
+         */
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
+            // 平级卡/面板（状态卡 · token 卡 · 日志面板 · 操作按钮行）之间的间距统一走
+            // Spacing.SettingsCardGap，与设置类页面同档；原来是 Spacing.Large（12dp）。
+            // token 卡**内部**的 spacedBy(Spacing.Medium) 是表单字段堆叠，保持不动。
             Column(
                 modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Large),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
             ) {
                 state.errorMessage?.let { msg -> UfiErrorBanner(message = msg) }
 
@@ -147,16 +163,14 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
                 )
 
                 // ── token ──
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = UfiCardDefaults.shape,
-                    color = palette.cardBg,
-                    border = BorderStroke(1.dp, palette.cardBorder)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(Spacing.InnerPadding),
-                        verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
-                    ) {
+                // 2026-10-13：由手搓 `Surface`（1dp 描边 + cardBg + InnerPadding，**无阴影**）
+                // 换成公共的 `UfiSettingsRowCard`。理由：它是本页唯一一张"设置项形态"的卡
+                //（标题 + 表单字段 + 提交按钮），而手搓版与设置页的卡不同族 —— 邻居有 2dp 阴影、
+                // 它只有描边，同屏看就是"这张卡陷进去了"。
+                // 内距用 `XLarge`(16dp)：卡里放的是表单而非单行设置项，按 `UfiSettingsRowCard`
+                // 的 KDoc 指引覆盖（同 `DownloadSettingsUi` 的「保存路径」卡）。
+                UfiSettingsRowCard(contentPadding = PaddingValues(Spacing.XLarge)) {
+                    Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
                         Text(
                             "Tunnel token",
                             style = UfiTextStyles.sectionTitle,
@@ -198,7 +212,7 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
                     emptyHint = "（暂无日志，启动后将显示 cloudflared 输出）"
                 )
 
-                UfiButtonRow {
+                UfiButtonRow(modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin)) {
                     UfiButton(
                         text = "启动",
                         modifier = Modifier.weight(1f),
@@ -222,7 +236,12 @@ fun CfTunnelScreen(viewModel: MainViewModel, navController: NavHostController, t
                     )
                 }
 
-                UfiButton(variant = UfiButtonVariant.Danger, text = "删除该隧道", onClick = { showDeleteConfirm = true })
+                UfiButton(
+                    variant = UfiButtonVariant.Danger,
+                    text = "删除该隧道",
+                    modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin),
+                    onClick = { showDeleteConfirm = true }
+                )
 
                 Spacer(Modifier.height(Spacing.Medium))
             }

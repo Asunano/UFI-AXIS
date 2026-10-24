@@ -15,7 +15,10 @@ import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.viewmodel.MainViewModel
 
 /**
- * DLNA 投屏（设置 → DLNA 投屏，2026-10-09）。
+ * DLNA 服务（设置 → DLNA 服务，2026-10-09）。
+ *
+ * 2026-10-15（用户）：标题由「DLNA 投屏」改成「DLNA 服务」—— 本页做的是把设备上的媒体
+ * **共享出去**（MediaServer），不是把画面投到大屏；"投屏"是反方向的那件事。
  *
  * 开关门控（用户明确要求）：**共享目录未配置时开关置灰**，描述行提示先选目录。
  * 开关与目录都在本页完成 —— 开关打开的前提就是目录已配置，不做成两步导航。
@@ -33,7 +36,7 @@ fun DlnaSettingsScreen(viewModel: MainViewModel, navController: NavHostControlle
 
     LaunchedEffect(Unit) { viewModel.dlna.load() }
 
-    UfiScreenScaffold(title = "DLNA 投屏", navController = navController, showBack = true) { padding ->
+    UfiScreenScaffold(title = "DLNA 服务", navController = navController, showBack = true) { padding ->
         UfiPageBackground(modifier = Modifier.padding(padding)) {
             Column(
                 Modifier.fillMaxWidth(),
@@ -92,8 +95,9 @@ fun DlnaSettingsScreen(viewModel: MainViewModel, navController: NavHostControlle
                     }
                 }
 
-                Spacer(Modifier.height(8.dp))
-
+                // 2026-10-19：间距统一交给外层 `Arrangement.spacedBy(10.dp)`。
+                // 原来这里（以及下面说明卡前后）还各插了一个 8dp Spacer，于是那几处是 18dp、
+                // 其余是 10dp —— 用户看到的"间隔不一致 + 有错误卡时界面抖一下"就是这个。
                 UfiSettingsRowCard {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
                         Text(
@@ -103,8 +107,6 @@ fun DlnaSettingsScreen(viewModel: MainViewModel, navController: NavHostControlle
                         )
                     }
                 }
-
-                Spacer(Modifier.height(8.dp))
             }
         }
     }

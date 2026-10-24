@@ -169,6 +169,18 @@ fun SettingsScreen(
                     }
                 }
 
+                // 2026-10-14：这里曾经有一颗紧挨 Hero 卡（「设备与服务」状态卡）的「诊断中心」浅入口，
+                // 同日**已删除**。用户的原话是「诊断中心入口放在关于界面，**不要在设置界面
+                // （Hero 卡正下方）出现**」—— 诊断中心在本 App 里只保留**关于页**那一颗常显行卡
+                // （`AboutDeviceScreen` 的「诊断中心」，同一页还有调试组里的「运行诊断」）。
+                //
+                // 删掉时顺手作废了上一轮为它写的那套理由（"异常显示在 Hero 卡上，所以入口要贴在
+                // 它下面"）。那套理由本身不假，但入口的**位置**由用户定，不由理由定；同一条路由
+                // 也不需要两个常显入口 —— 本仓反复出问题的正是"同一件事多个入口"。
+                //
+                // ⚠ 不要再往这里加回来：诊断中心不进 `ServiceGate.SERVICE_INDEPENDENT_ROUTES`
+                // 也没关系（它本来就不在那份白名单里），这条路径的通断不构成加回它的理由。
+
                 // 外观
                 UfiSettingsRowCard {
                     UfiSettingsItem(
@@ -203,16 +215,8 @@ fun SettingsScreen(
                         trailing = { UfiSettingsChevron() }
                     )
                 }
-                // DLNA 投屏（2026-10-09）：MediaServer 开关 + 共享目录
-                UfiSettingsRowCard {
-                    UfiSettingsItem(
-                        icon = Icons.Default.Cast,
-                        title = "DLNA 投屏",
-                        description = "局域网媒体共享 · 电视直接播放",
-                        onClick = { navController?.navigate(Routes.DETAIL_DLNA) },
-                        trailing = { UfiSettingsChevron() }
-                    )
-                }
+                // DLNA 服务入口已于 2026-10-20 移到「小功能」页（ToolsExtraScreen 的 TOOLS_EXTRA）。
+                // 它是设备侧的一项能力（媒体共享），与文件/媒体/下载同类，不属于服务器/网络设置。
                 // 服务器（合并：服务器配置 / 设备控制 / 配对管理）
                 UfiSettingsRowCard {
                     UfiSettingsItem(

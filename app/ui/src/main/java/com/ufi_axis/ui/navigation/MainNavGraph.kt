@@ -1,5 +1,7 @@
 package com.ufi_axis.ui.navigation
 
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
@@ -32,6 +34,7 @@ import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.collectAsState
@@ -46,6 +49,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -305,6 +310,12 @@ fun MainNavGraph(
     //    （UfiPageSwitcherDefaults.isBlurSupported），不另立一套"什么叫低端机"的标准。
     //    结果在进程内恒定，按 context 记一次。
     val blurEnabled by themeManager.blurEnabled.collectAsState()
+    // 2026-10-14：二级页转场的另外两项效果开关（外观 → 切换动画 弹窗里，与「过渡模糊」同一处）。
+    // 2026-10-19：压暗与过渡模糊**默认关闭**（部分系统上渐变效果会频闪，改由用户显式开启）。
+    val navScrimEnabled by themeManager.navScrimEnabled.collectAsState()
+    val navCornersEnabled by themeManager.navCornersEnabled.collectAsState()
+    // 2026-10-19：可预测性返回（跟手预览）开关。关闭时在下方的 DisposableEffect 里接管返回。
+    val navPredictiveBack by themeManager.navPredictiveBack.collectAsState()
     val context = LocalContext.current
     val blurSupported = remember(context) { UfiPageSwitcherDefaults.isBlurSupported(context) }
     val underlayBlurAllowed = blurEnabled && blurSupported
@@ -448,12 +459,43 @@ fun MainNavGraph(
             CompositionLocalProvider(LocalUfiSharedTransitionScope provides this) {
             // 二级页：Material Shared Axis X（纯水平，无交叉淡入淡出）。
             // Tab 之间仍由宿主内 UfiPageSwitcher 负责。
+            // 2026-10-19：可预测性返回开关的**运行时**实现。
+            //
+            // manifest 的 `enableOnBackInvokedCallback` 是编译期开关、无法运行时切；所以"关闭"
+            // 用一个**非预测性**返回回调接管：系统不再驱动跟手进度，`popBackStack()` 触发我们的
+            // popExitTransition，按「动画时长」完整播放（快滑不会再把它缩短）。
+            //
+            // ⚠ 2026-10-24（用户复报：开关显示关闭、重启后仍跟手预览）：
+            // 根因不是 ThemeManager 的持久化，而是 **navigation-compose 2.8.0 的 `NavHost`
+            // 自己注册了一条 `PredictiveBackHandler`**（见其 NavHost.kt:514）。它与
+            // `navController.enableOnBackPressed(false)` **无关** —— 后者只关掉 NavController
+            // 自己那条 `OnBackPressedCallback`，预测性手势仍由 NavHost 那条回调消费。
+            //
+            // 而且 `OnBackPressedDispatcher` 按**反注册顺序**派发（activity 1.8.2
+            // OnBackPressedDispatcher.kt:233/271：`lastOrNull { it.isEnabled }`）。本 effect
+            // 原先写在 `NavHost` **之前**，回调先注册、NavHost 的预测性回调后注册 ⇒ 我们永远
+            // 抢不到返回，"关闭"在运行时实际是死代码。
+            //
+            // 修法：把本 effect 放到 `NavHost` **之后**（见下方调用点），让它是最后注册的那条
+            // 回调。PredictiveBackHandler 的注册只在 lifecycleOwner / backDispatcher 变化时
+            // 重做，返回栈变化只改 `isEnabled`，不会重新插到我们后面；Activity 重建时两边按同一
+            // 源码顺序重注册，仍是我们在最后。诊断日志里的 `effective` 因此才与实际生效值一致。
+
             NavHost(
                 navController = navController,
                 startDestination = Routes.MAIN,
                 enterTransition = { detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx) },
-                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
-                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                // 与下面每一条登记**逐项对齐**（见 MAIN 那一条上的说明）：
+                // 这几条只是兜底，但"钉住默认值"的意义就在于别让兜底与显式登记长得不一样。
+                //
+                // 2026-10-14（DETAIL 转场卡顿）：这里与 MAIN / DETAIL 三条登记一起**撤掉了下层
+                // 模糊**（原为 `blur = underlayBlurAllowed`）。逐帧账写在下面 DETAIL 循环开头，
+                // 一句话：下层的模糊是「每帧重录整棵下层子树 + 每帧全屏 110px RenderEffect」，
+                // 而它同时还在平移。压暗与圆角两项不受影响。
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true) },
+                popEnterTransition = {
+                    detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true)
+                },
                 popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
             ) {
             // ── Tab 宿主目的地：5 个 Tab 作为 UfiPageSwitcher 的 5 页
@@ -461,8 +503,28 @@ fun MainNavGraph(
                 route = Routes.MAIN,
                 // 宿主与二级页同一套 Shared Axis，进/回二级页时两侧同步。
                 enterTransition = { detailSharedAxisEnter(navTransitionMs, fallbackSlideWidthPx) },
-                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
-                popEnterTransition = { detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx) },
+                /*
+                 * ★ 2026-10-14（修「从 Tab 进二级页」与「从二级页进二级页」动画不一致）：
+                 *
+                 * 这两条登记此前只传了前三个参数，`blur` 走默认值 false；而下面二级页那两条
+                 * 传了 `blur = underlayBlurAllowed`。于是**同样一件事**（进一个二级页）在两种
+                 * 来路上是两套观感：
+                 * · 工具页（Tab 宿主）→ 音乐：背后那张 Tab 页**不模糊**，用户关掉「压暗 / 圆角」
+                 *   也照样生效（那两项同样只在二级页那侧传了）；
+                 * · 音乐 → 音乐设置：背后那张音乐页会模糊，三项开关都听用户的。
+                 *
+                 * 差异不是设计，是 2026-10-14 给二级页补「过渡模糊 + 压暗/圆角开关」时**漏了宿主
+                 * 这一条**（当时只改了 DETAIL 循环）。
+                 *
+                 * ★ 2026-10-14 二次修订：`blur` 这一项**两侧一起撤掉**（仍然"逐项对齐"，只是对齐到
+                 *   "下层不模糊"）。当天加上"下层过渡模糊"之后真机反馈二级页转场卡顿，逐帧账算下来
+                 *   根因就是它 —— 完整论证写在下面 DETAIL 循环开头那段。**压暗 / 圆角两项保留**，
+                 *   仍然听用户开关。
+                 */
+                exitTransition = { detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true) },
+                popEnterTransition = {
+                    detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true)
+                },
                 popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
             ) { entry ->
                 // 先把导航层的 AnimatedVisibilityScope 抓在手里：下面要在几层 lambda 内部
@@ -473,9 +535,22 @@ fun MainNavGraph(
                 // 不共享，既不报错也没动画，排查成本远高于现在多写一行。
                 val navAnimatedScope: AnimatedVisibilityScope = this
                 // 深度层：去二级页时宿主是下层（压暗+后退）；回宿主时宿主仍是下层。
+                //
+                // 效果参数与二级页那一条**逐项相同**（理由见上面 exitTransition 的说明）：
+                // 转场长什么样只取决于"谁在上面"。
+                //
+                // `blurUnderlay` 保持恒 true 是**允许**而不是执行：宿主这条登记现在不会把
+                // recedingBlur 置 true，绘制期因此永远走"只压暗"那一支，那张离屏图层不会被录制
+                // （空 GraphicsLayer 只是一只未录制的 RenderNode，不占缓冲）。2026-10-14 撤掉下层
+                // 模糊的逐帧账见 DETAIL 循环开头。
                 val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
                     durationMillis = navTransitionMs,
+                    blurUnderlay = underlayBlurAllowed,
+                    underlayBlurActive = underlayBlurActive,
+                    clipCorners = { navCornersEnabled },
+                    // 2026-10-19：压暗与过渡模糊**默认关闭**（外观 → 切换动画里可开）。
+                    scrimEnabled = navScrimEnabled,
                 )
 
                 // 缓存页列表，避免每次重组都重建 5 个 UfiPage 与其 content lambda。
@@ -528,8 +603,9 @@ fun MainNavGraph(
                             //   axisLayer 负责转场期圆角/scrim（进场新页圆角 20dp→0）。
                             modifier = Modifier
                                 .fillMaxSize()
-                                .background(palette.pageBg)
-                                .then(axisLayer),
+                                // ⚠ 顺序同 DETAIL：axisLayer（圆角 clip）在外，底色在内。
+                                .then(axisLayer)
+                                .background(palette.pageBg),
 
                             transition = UfiPageTransitions.byId(pageTransitionId),
                             swipeEnabled = true,
@@ -601,6 +677,37 @@ fun MainNavGraph(
             //   目前 DETAIL 循环里能跳到播放页的只有音乐列表页与分组页（两者都挂迷你条），
             //   所以这一条现在不改变任何实际表现；它是为"日后又有 DETAIL 页能进播放页"准备的 ——
             //   那一页若没有迷你条，会自动跟着上层一起退回普通横向转场。
+            //
+            // ★★ 2026-10-14（DETAIL 转场卡顿）：下层**不做真实模糊**，只保留压暗 ★★
+            //
+            // 症状：进/出二级页时整段动画掉帧（低端机尤甚），与"进的是哪一个二级页"无关。
+            //
+            // 逐帧账（真机卡顿的账，不是猜测）。`ufiSharedAxisLayer` 的下层分支在
+            // `underlayBlurActive()` 为真时，每一帧都要做两件事：
+            //   ① `blurLayer.record { drawContent() }` —— 把**整棵下层子树**的绘制指令重录一遍。
+            //      从 Tab 页进二级页时，这棵子树是 UfiPageSwitcher 里 3 个已组合的页
+            //      （beyondViewportPageCount = 1，当前页 ± 相邻页），是全局最重的一棵
+            //      （胶囊不在这里 —— 它在独立 Dialog 窗口）；
+            //   ② 给这张全屏图层挂半径最大 110px 的 `RenderEffect` 再合成 —— 半径取自弹窗的
+            //      `UfiDialogAnim.BlurRadius`，而它原本服务的是"静止背景 + 只糊一次峰值"。
+            // 而二级页的下层**全程还在做 1/6 屏的视差平移**，所以 ①+② 是每帧实打实地付，
+            // 付满整段转场（默认 380×1.2 ≈ 456ms ≈ 28 帧）。最不划算的是收益：下层此刻被上层
+            // 盖住，真正露出来的只有左侧一条窄边 —— 全屏模糊的钱，一条边的画面。
+            //
+            // 为什么不是"把半径调小"：Tab 切页那条链路当年正是为此把峰值从 18dp 降到 12dp
+            // （见 `UfiPageSwitcherHost.TRANSITION_BLUR_MAX_RADIUS_DP`），降完仍只在 2D 策略上
+            // 保留。转场模糊这条路上，**"下层在动"本身就是不该做实时模糊的判据** —— 平台自己也
+            // 只在静止 backdrop 上做（弹窗 FLAG_BLUR_BEHIND / M3 modal scrim）。所以这里不调参，
+            // 而是把这一种处境整段摘掉。
+            //
+            // 代价（视觉差异，接受才继续）：二级页转场时背后那页不再"糊掉"，层次改由
+            // **压暗（scrim 峰值 0.5）+ 1/6 屏视差 + 上层圆角**表达。RISE 面板那条路径
+            // （下层**静止**、被面板整块盖住）**仍然照旧模糊**，一行没动 —— 那才是"背景像弹窗
+            // 背景那样糊掉"的原始诉求。外观里的「过渡模糊」开关依旧有效（Tab 切页 + RISE 面板）。
+            //
+            // 要恢复：把 `blur = underlayBlurAllowed` 加回下面两条登记即可，但请先读
+            // `Navigation.kt` 里 `detailSharedAxisExit` 的 `blur` 形参说明 —— 那里已经把
+            // "只允许静止下层"写成了契约，以及为什么恢复它等于把卡顿一起恢复。
             appRoutes.filter { it.transition == TransitionType.DETAIL }.forEach { appRoute ->
                 composable(
                     route = appRoute.route,
@@ -610,9 +717,13 @@ fun MainNavGraph(
                         if (isUfiMiniBarHostRoute(appRoute.route) &&
                             isUfiRiseRoute(targetState.destination.route)
                         ) {
+                            // 下层**静止**（面板竖着盖上来），模糊留给它 —— 与上面那段不冲突。
                             riseUnderlayExit(navTransitionMs, recedeRole)
                         } else {
-                            detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx)
+                            // 2026-10-14：不传 `blur`（= false）⇒ 下层的 recedingBlur 为 false
+                            // ⇒ 绘制期 `underlayBlurActive()` 返回 false ⇒ 不录制、不挂
+                            // RenderEffect，只剩一次 scrim 的 drawRect。理由见本循环开头。
+                            detailSharedAxisExit(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true)
                         }
                     },
                     popEnterTransition = {
@@ -621,7 +732,8 @@ fun MainNavGraph(
                         ) {
                             riseUnderlayPopEnter(recedeRole)
                         } else {
-                            detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx)
+                            // 同 exitTransition：pop 回来时下层同样只压暗、不模糊。
+                            detailSharedAxisPopEnter(navTransitionMs, recedeRole, fallbackSlideWidthPx, blur = true)
                         }
                     },
                     popExitTransition = { detailSharedAxisPopExit(navTransitionMs, fallbackSlideWidthPx) }
@@ -631,21 +743,38 @@ fun MainNavGraph(
                 // blurUnderlay：本页作为下层时**允许**背景模糊，但只在"对端是升起面板"那种
                 // 处境才真的模糊 —— 那条判定由 underlayBlurActive 在绘制期问 recedeRole，
                 // 与上面 exitTransition / popEnterTransition 里的 isUfiRiseRoute 分支同源
-                // （那两条分支就是写入方）。普通详情页当垫底时一如既往只压暗。
+                // （那两条分支就是写入方）。普通详情页当垫底时只压暗（2026-10-14 起，见本循环开头）。
+                // 这里保持 true 而不是写死 false：这一页**既可能**给升起面板垫底（要模糊）、
+                // **也可能**给普通详情页垫底（不要），两者共用同一份图层。
                 val axisLayer = ufiSharedAxisLayer(
                     isReceding = { recedeRole.recedingEntryId == entry.id },
                     durationMillis = navTransitionMs,
                     blurUnderlay = underlayBlurAllowed,
                     underlayBlurActive = underlayBlurActive,
+                    // 2026-10-14：压暗 / 圆角改为用户可关（外观 → 切换动画）。默认 true = 原行为。
+                    clipCorners = { navCornersEnabled },
+                    // 2026-10-19：压暗与过渡模糊**默认关闭**（外观 → 切换动画里可开）。
+                    scrimEnabled = navScrimEnabled,
                 )
 
-                // ★ 每个 detail 目的地**自己画不透明底色**（`.background(palette.pageBg)`，
-                //   且必须放在 axisLayer **之前**，否则圆角 clip 裁不到底色、圆角消失），
+                // ★ 每个 detail 目的地**自己画不透明底色**（`.background(palette.pageBg)`），
                 //   不能只靠外层 Scaffold 的 containerColor。根因（2026-08-30 修）：targetSdk 36
                 //   上系统「可预测性手势返回」默认开启，navigation-compose 在手势进行中会同时
                 //   组合「即将退出的 detail 页」和「下面那一层」，并把 detail 页整体丢进
                 //   graphicsLayer 做位移/圆角/scrim。该图层只包含本页**自己绘制的像素** ——
                 //   页面没有底色时，卡片与图标之间全是透明区，手势中就直接看到下层内容。
+                //
+                // ★★ 2026-10-14 修正底色与 axisLayer 的**顺序**（原注释把因果写反了）★★
+                // 原注释写的是"必须放在 axisLayer **之前**，否则圆角 clip 裁不到底色"—— 事实恰好相反。
+                // Compose 的 modifier 链**靠前的先绘制（在外层）**，而 `ufiSharedAxisLayer` 是
+                // `drawWithContent`：它的 `clipPath` 只作用于自己的 `drawContent()`，即**链上更内层**
+                // 的绘制与页面内容。于是写成
+                //     `.background(pageBg).then(axisLayer)`
+                // 时，那块**不裁切的整屏方形底色**先画完，圆角外的四块正好被它填满 ⇒
+                // **圆角裁切一直在跑却完全看不见**（用户报的"有圆角裁切但被遮挡"）。
+                // 调换成 `.then(axisLayer).background(pageBg)` 后底色进入 clip 内部：圆角外露出的
+                // 是下层页面（它正带着 scrim 与反向视差在动），圆角因此可见；而底色本身仍在，
+                // 可预测性手势返回要的"本页不透明像素"一个字都没少。
                 // ★ UfiNavFrameGate：转场/手势期间压住 WS 整屏重组（性能用，不是动画）。
                 // ★ LocalUfiNavAnimatedScope：把**导航层**的 AnimatedVisibilityScope 下发给页面。
                 //   必须包住 `screens[...].invoke`，共享元素（Modifier.ufiSharedElement）才找得到
@@ -656,8 +785,10 @@ fun MainNavGraph(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(palette.pageBg)
+                        // ⚠ 顺序：axisLayer（含圆角 clip）在外，底色在**内** —— 见上方 2026-10-14 的说明。
+                        // 反过来写会让不裁切的方形底色把圆角外的四块填满，圆角完全看不见。
                         .then(axisLayer)
+                        .background(palette.pageBg)
                 ) {
                     screens[appRoute.route]?.invoke(entry, navController)
                 }
@@ -736,11 +867,18 @@ fun MainNavGraph(
                     // blurUnderlay 保持恒 true（只受用户开关与机型闸门约束）：它是**组合期**
                     // 常量、决定要不要给这个目的地备那张离屏图层，而"这一次该不该真模糊"
                     // 由绘制期的 underlayBlurActive 回答。两者的时序差正是这样拆开的。
-                    // 至于"从 Tab 页横着进来那次下层不该模糊"—— 那条已经天然成立：
-                    // 下层是 MAIN 宿主，它登记的 detailSharedAxisExit 会把 recedingBlur 复位成
-                    // false，于是 underlayBlurActive 在那一次返回 false。这里不需要额外做什么。
+                    //
+                    // ★ 2026-10-14 二次修订：这里原来还写着一句"从 Tab 页横着进来那次下层
+                    //   不该模糊，那条已经天然成立，不需要额外做什么"—— 现在**仍然成立**，但理由
+                    //   变了：当天一度把 MAIN 那条登记也接上 `blur = underlayBlurAllowed`，随后
+                    //   因二级页转场卡顿整体撤掉（见 DETAIL 循环开头）。所以从 Tab 页横着进播放页
+                    //   时下层（Tab 宿主）不模糊，与"从二级页进播放页"一致 —— 两条路径都由各自
+                    //   的登记决定，这里依旧**不需要**补任何分支。
                     blurUnderlay = underlayBlurAllowed,
                     underlayBlurActive = underlayBlurActive,
+                    // 与 DETAIL / MAIN 两条登记对齐：用户关掉「压暗」时面板当垫底也不该压暗
+                    // 2026-10-19：压暗与过渡模糊**默认关闭**（外观 → 切换动画里可开）。
+                    scrimEnabled = navScrimEnabled,
                 )
 
                 CompositionLocalProvider(LocalUfiNavAnimatedScope provides this) {
@@ -748,8 +886,10 @@ fun MainNavGraph(
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(palette.pageBg)
+                        // ⚠ 顺序：axisLayer（含圆角 clip）在外，底色在**内** —— 见上方 2026-10-14 的说明。
+                        // 反过来写会让不裁切的方形底色把圆角外的四块填满，圆角完全看不见。
                         .then(axisLayer)
+                        .background(palette.pageBg)
                 ) {
                     screens[appRoute.route]?.invoke(entry, navController)
                 }
@@ -761,6 +901,55 @@ fun MainNavGraph(
             }
             } // LocalUfiSharedTransitionScope
             } // SharedTransitionLayout
+
+            /*
+             * 可预测性返回开关的运行时接管（2026-10-19；2026-10-24 修正注册时机）。
+             *
+             * 必须放在 NavHost **之后**：NavHost（navigation-compose 2.8.0）自己会通过
+             * PredictiveBackHandler 往同一个 OnBackPressedDispatcher 注册一条回调；该 dispatcher
+             * 按「后注册者优先」派发（`lastOrNull { isEnabled }`）。放在 NavHost 之前注册的回调
+             * 永远抢不到返回 —— 这正是"开关显示关闭、实际仍跟手"的根因。
+             *
+             * 关闭时：先关掉 NavController 自己那条回调，再注册本回调（最后一条 ⇒ 由它接管），
+             * 系统不再驱动预测性进度，`popBackStack()` 走完整的 popExitTransition。
+             * 打开时：移除本回调并恢复 NavController 的返回处理，预测性手势交还给 NavHost。
+             */
+            DisposableEffect(navPredictiveBack, context) {
+                val activity = context.findComponentActivity()
+                // 诊断：外观页开关、MainNavGraph 实际读值与最终生效分支必须能对照。
+                com.ufi_axis_core.util.UiLogBridge.w(
+                    "MainNavGraph",
+                    "effective navPredictiveBack=$navPredictiveBack activity=${activity != null}"
+                )
+                if (navPredictiveBack || activity == null) {
+                    navController.enableOnBackPressed(true)
+                    onDispose { }
+                } else {
+                    navController.enableOnBackPressed(false)
+                    val callback = object : OnBackPressedCallback(true) {
+                        override fun handleOnBackPressed() {
+                            if (!navController.popBackStack()) activity.finish()
+                        }
+                    }
+                    // 注册在 NavHost 的 PredictiveBackHandler 之后 ⇒ 位于 dispatcher 末尾；
+                    // started / progressed / pressed 都会先落到这条非预测性回调上。
+                    //
+                    // ⚠ 2026-10-24 二次修正（用户：回桌面再回来又失效）：
+                    // 必须**带 lifecycleOwner** 注册。NavHost 的 PredictiveBackHandler 用的是
+                    // `addCallback(lifecycleOwner, cb)`：ON_STOP 会把那条回调移出队列，ON_START
+                    // 再追加回来。若我们这里用无 lifecycle 的 `addCallback(cb)`，回桌面时我们的
+                    // 回调留在队列里、预测回调被移除，回前台后预测回调追加到队尾 ⇒ 又变成
+                    // "后注册者优先"的那一条，跟手预览复活。
+                    // 两边都挂同一个 lifecycle 后，ON_START 按 observer 注册顺序重放：预测回调
+                    // 先入队、我们的后入队，顺序才稳定为"我们在最后"。
+                    // （lifecycleOwner 直接传 activity：ComponentActivity 即 LifecycleOwner。）
+                    activity.onBackPressedDispatcher.addCallback(activity, callback)
+                    onDispose {
+                        callback.remove()
+                        navController.enableOnBackPressed(true)
+                    }
+                }
+            }
 
 
 
@@ -950,3 +1139,19 @@ fun MainNavGraph(
         } // CompositionLocalProvider
     } // Scaffold innerPadding
 } // MainNavGraph
+
+/**
+ * 沿 ContextWrapper 链找宿主 Activity。
+ *
+ * `LocalContext.current` 在主题包装 / Compose 的某些子组合里可能是 `ContextThemeWrapper`，
+ * 直接 `as? ComponentActivity` 会得到 null —— 那会让"关闭可预测性返回"静默退化成不可用
+ * （旧实现就是直接强转）。这里与 `UfiToastOverlay.findActivity` 同一种链式查找。
+ */
+private fun Context.findComponentActivity(): ComponentActivity? {
+    var current: Context? = this
+    while (current is ContextWrapper) {
+        if (current is ComponentActivity) return current
+        current = current.baseContext
+    }
+    return null
+}

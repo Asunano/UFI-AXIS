@@ -112,7 +112,11 @@ fun NetworkModeDialog(
         confirmButton = {
             UfiButton(
                 text = "确定",
-                enabled = selectionChanged && !switching && !state.modeSwitchTimedOut,
+                // 2026-10-24：`modeSwitchTimedOut` **不能**参与禁用判据。
+                // 超时只说明"这次回读预算内没看到目标档位"，设备可能稍后自己切过去；
+                // 但唯一能把该标志复位的地方就是 `setNetworkMode()`，而它的唯一调用点
+                // 正是这颗按钮 —— 置灰后用户再也触发不了重试，只能重启 App。
+                enabled = selectionChanged && !switching,
                 // 无改动时置灰：没有要下发的东西，别让用户以为已经生效。
                 onClick = {
                     // 只在真有改动时下发，避免"按确定"却跑一趟无意义的重新搜网。
@@ -276,7 +280,7 @@ fun NetworkModeDialog(
             if (switching || state.modeSwitchTimedOut) {
                 UfiDialogWarning(
                     when {
-                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
+                        state.modeSwitchTimedOut -> "设备尚未完成切换，可再次点「确定」重试。"
                         else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
                     }
                 )

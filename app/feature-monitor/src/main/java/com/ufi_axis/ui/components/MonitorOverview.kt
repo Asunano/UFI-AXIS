@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.foundation.layout.wrapContentWidth
@@ -70,7 +69,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextMeasurer
@@ -83,11 +81,6 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 
 import com.ufi_axis.data.model.AlertRecord
-import com.ufi_axis.data.model.DownsampledPoint
-import com.ufi_axis.data.model.TrafficSummary
-import com.ufi_axis.data.monitor.MonitorMetricType
-import com.ufi_axis.data.monitor.MetricThreshold
-import com.ufi_axis.data.monitor.ThresholdLevel
 import com.ufi_axis.data.monitor.MonitorTimeRange
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.state.MonitorState
@@ -120,8 +113,6 @@ import com.ufi_axis.ui.theme.ufiShade
 
 import java.text.SimpleDateFormat
 import java.util.Date
-import java.util.Calendar
-import java.util.Locale
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -155,6 +146,49 @@ fun MonitorTopTab(
         tabs = entries.map { it.label },
         modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 8.dp)
     )
+}
+
+/**
+ * 「事件中心 ›」入口（2026-10-14 用户要求：挂在总览「按类型聚合 / 全部明细」那一行 chip 的右侧）。
+ *
+ * ## 它挪过两次，理由是同一条
+ * hero 卡右上角 → 分类 Tab 行右边（hero 卡删除后临时安置）→ 现在这一行 chip 的右侧。
+ * 后一次的依据：它和 chip 组回答的是同一个问题（"这一屏看什么"），与 Tab 行那种页面级
+ * 导航不是一类东西；而且挂在 Tab 行右边时，它把那条 16dp 呼吸位一并吃掉了。
+ * 调用点在 `MonitorScreen.MonitorOverviewTabContent` 的 `overviewFilterChips` item，
+ * 那里负责"窄屏下不被 chip 顶走"的宽度分配（chip 组让出 `weight(1f)`）。
+ *
+ * ## 与 hero 卡里那颗 [HeroEventsEntry] 的区别只有配色
+ * 那颗坐在 accent 渐变卡上，用的是 `gradientMuted` / `onGradient`（白字）；
+ * 这一颗坐在**页面底色**上，必须用页面色板 —— 照搬白字会在浅色页面上什么都看不见。
+ * 样式取"surfaceMuted 胶囊底 + accent 文字"，与同一行 chip 的选中色同系。
+ */
+@Composable
+fun MonitorEventsEntry(onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val palette = LocalResolvedPalette.current
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .background(palette.surfaceMuted)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = "事件",
+            style = UfiTextStyles.caption.copy(fontWeight = UfiWeight.Medium),
+            color = palette.accent,
+            maxLines = 1,
+            softWrap = false
+        )
+        Icon(
+            imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
+            contentDescription = "进入事件中心",
+            tint = palette.accent,
+            modifier = Modifier.size(Spacing.IconSizeSmall)
+        )
+    }
 }
 
 /**
@@ -254,13 +288,6 @@ private fun countAlerts(alerts: List<AlertRecord>): AlertCounts {
 fun EventSummaryCard(
     alerts: List<AlertRecord>,
     range: MonitorTimeRange,
-    // v20h：阈值级 hero 状态——把今日 6 张 peak 卡里"最差的阈值等级"传上来，让 hero 在「无未读告警」
-    // 但「有指标超阈值」（典型：CPU 90% WARN、内存峰值 ALERT）的常见场景下也给出视觉提示。
-    // NORMAL=没有指标超阈值
-    worstPeakLevel: ThresholdLevel,
-    // 处于 [worstPeakLevel] 这一等级的指标条数（0=无）。副文案要说"N 项"，
-    // 之前写死"1 项"，CPU 与温度同时超标也只说 1 项。
-    worstPeakCount: Int,
     // v26（2026-08-20）：hero 卡右上角「事件中心 ›」入口按钮（方案 A：事件中心迁为独立全屏页）。
     onEventsClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -270,13 +297,18 @@ fun EventSummaryCard(
     // 是 5 次独立 `alerts.count{}`，写在 composable 函数体里，每次重组都要把列表走 5 遍。
     val counts = remember(alerts) { countAlerts(alerts) }
     val unread = counts.unread
-    val peakAlert = worstPeakLevel == ThresholdLevel.ALERT
-    val peakWarn = worstPeakLevel == ThresholdLevel.WARN && !peakAlert
-    // 状态色 = 最差信号驱动：严重（阈值 ALERT / critical 未读）> 警告（阈值 WARN / warning 未读）
-    // > 有未读但都是提示级 > 正常。
+    // 2026-10-14（用户要求）：hero 状态改为**完全由事件列表驱动**，不再掺入「今日阈值/峰值」。
+    //
+    // 为什么去掉阈值源：它和事件列表是两个口径的东西混在同一个状态里 ——
+    //   · 用户看到橙底分不清是"有告警"还是"指标偏高"；
+    //   · 会出现「hero 说严重阈值、事件列表一条没有」这种无法下钻的结论
+    //     （总览的峰值网格已删，没有对应的卡片可看）。
+    // 现在 hero 只回答一件事：事件列表里有多少未读、最严重到哪一级。
+    //
+    // 状态色 = 最差未读级别：严重 > 警告 > 提示级未读 > 正常。
     val accentColor = when {
-        peakAlert || counts.unreadCritical > 0 -> palette.error
-        peakWarn || counts.unreadWarning > 0 -> palette.warning
+        counts.unreadCritical > 0 -> palette.error
+        counts.unreadWarning > 0 -> palette.warning
         unread > 0 -> palette.accent
         else -> palette.success
     }
@@ -284,23 +316,23 @@ fun EventSummaryCard(
     // 为什么拆：主句里带着结论性的数字（"N 项未读告警"），限定语只是补充定语。
     // 宽度真的不够时，排版要能把限定语降级成第二行小字（见 [HeroStatusHeader] 的"拆句档"）——
     // 拼成一整句就只剩"整体缩到很小"或"截断"两条路，而截断会把结论吃掉。
-    // 语义与拆分前完全一致：unread>0 且有指标超阈值 = 主句 + "阈值告警" 限定语。
-    val heroMain = when {
-        unread > 0 -> "$unread 项未读告警"
-        peakAlert -> "严重阈值告警"
-        peakWarn -> "存在阈值告警"
-        else -> "运行正常"
+    val heroMain = if (unread > 0) "$unread 项未读告警" else "运行正常"
+    // 限定语 = 未读里最严重的那一级；没有未读时为 null（主句已自洽）。
+    val heroQualifier = when {
+        unread > 0 && counts.unreadCritical > 0 -> "含严重告警"
+        unread > 0 && counts.unreadWarning > 0 -> "含警告"
+        else -> null
     }
-    val heroQualifier =
-        if (unread > 0 && worstPeakLevel != ThresholdLevel.NORMAL) "阈值告警" else null
 
     // 2026-08-09 18:44 hero 取色对齐仪表盘 HomeConnectionCard（gradColors 逻辑）：
     // 之前用 palette.themeGradient（accent → lerp(accent, accentSecondary, 0.5f) → accentSecondary 双色渐变，
     // 会混入 accentSecondary 色相与仪表盘视觉不一致）。改为 accent 单色系渐变：
     //   深色模式 = accentColor → accentColor.ufiShade(+8%/+16%)
     //   浅色模式 = accentColor → accentColor.ufiShade(0.12/0.22)
-    // v20h 拓展：base 色 = accentColor（unread=error / 阈值告警=warning / 正常=success），
-    // 这样 hero 卡不再永远是绿底——CPU/MEM/TEMP 超阈值也会变橙底，与下方峰值卡状态圆点同语义。
+    // v20h 拓展：base 色 = accentColor（未读严重=error / 未读警告=warning / 仅有提示级未读=accent
+    // / 无未读=success），所以 hero 卡不再永远是绿底。
+    // 2026-10-14：accentColor 的取值来源已收窄为**事件列表的未读级别**（原先还掺入指标阈值），
+    // 见上方 accentColor 的注释。
     // 只依赖 accentColor + 主题明暗，remember 住：否则每次重组都要做 2 次混色并新建一个 Brush。
 
     //
@@ -367,16 +399,12 @@ fun EventSummaryCard(
             val count = counts.total
             val criticalCount = counts.critical
             val warningCount = counts.warning
-            val peakSuffix = when {
-                peakAlert -> if (worstPeakCount > 0) " · $worstPeakCount 项严重阈值" else " · 指标超严重阈值"
-                peakWarn -> if (worstPeakCount > 0) " · $worstPeakCount 项警告阈值" else " · 指标进入警告阈值"
-                else -> ""
-            }
-            val subText = when {
-                count > 0 -> "$rangeLabel $count 条告警 · 严重 $criticalCount · 警告 $warningCount$peakSuffix"
-                peakAlert -> "$rangeLabel 无告警，但指标已超严重阈值，请关注下方峰值卡"
-                peakWarn -> "$rangeLabel 无告警，但有指标进入警告阈值，请关注下方峰值卡"
-                else -> "$rangeLabel 无异常，设备持续稳定运行"
+            // 2026-10-14：hero 状态完全由事件列表驱动，副文案也只剩事件口径
+            //（原 peakSuffix 与两条"无告警但指标超阈值"分支随阈值源一起去掉）。
+            val subText = if (count > 0) {
+                "$rangeLabel $count 条告警 · 严重 $criticalCount · 警告 $warningCount"
+            } else {
+                "$rangeLabel 无异常，设备持续稳定运行"
             }
             Text(
                 text = subText,
@@ -1153,328 +1181,19 @@ fun alertTypeLabel(type: String): String = when (type) {
     else -> "设备通知"
 }
 
-// ========== 总览「今日峰值」区块（2026-08-15 新增） ==========
-// 3 张峰值卡（CPU / 内存 / 温度），单行平铺。
+// ========== 今日阈值派生：2026-10-14 已整段删除 ==========
 //
-// 2026-10-12（用户要求）：从 6 张删到 3 张 —— 去掉「信号最差」「流量峰值」「今日流量」。
-// 留下的三张口径一致（都是区间内的峰值），而删掉的三张各有各的问题：
-//   · 信号最差 = RSRP 历史最差，与当前信号对不上，用户会以为设备坏了；
-//   · 今日流量 = 累计量，不是峰值，混在峰值卡里口径不同类（且网络 Hero 已有一份）；
-//   · 流量峰值 = RX+TX 合计，需要按桶时间戳对齐求和才不出错，口径最绕，
-//     而同屏的 charts 页曲线已经能看清流量走势。
-// 数据窗口：今天 00:00 至今（与总览「今天」语义一致）。
-// 单格：指标名 + 状态点 + 峰值大数字 + 单位（2026-08-26 起去掉迷你 sparkline，只留峰值数字）。
-// 阈值方向按 MonitorMetricType.lowerIsWorse；优先 state.thresholds，未配置回退默认阈值。
-// 不可点击下钻（纯展示）。空数据数值显示「—」并给出原因文案。
-
-/** 单格数据（已计算好展示所需的一切，组件只负责渲染） */
-private data class PeakMetricItem(
-    val label: String,
-    val valueText: String,            // 主数字（已格式化；未开启/无数据时为 "—"）
-    val unit: String?,                // 单位（valueText 已含单位如 "1.2 GB" 时为 null）
-    val level: ThresholdLevel,        // 阈值等级（决定大数字/状态点颜色）
-    val enabled: Boolean = true,        // 该指标是否在设置中开启
-    val emptyHint: String? = null     // 未开启/空数据时的辅助文案（null=正常）
-)
-
-/** 计算今日 00:00 的 epoch ms（本地时区） */
-private fun todayStartMillis(): Long {
-    val cal = Calendar.getInstance()
-    cal.set(Calendar.HOUR_OF_DAY, 0)
-    cal.set(Calendar.MINUTE, 0)
-    cal.set(Calendar.SECOND, 0)
-    cal.set(Calendar.MILLISECOND, 0)
-    return cal.timeInMillis
-}
-
-/**
- * 以下三个 helper 都是「零分配」的窗口扫描：直接跳过 `t < since` 的点，
- * 不再先 `filter{}` 出「今天」的子列表。原写法每次派生都要为 8 条 720 点序列各拷一份新 list
- * （约 5760 个元素），而这个派生会随 MonitorState 的每次发射重跑 —— 是切进监控页掉帧的一部分。
- */
-private fun hasPointsSince(points: List<DownsampledPoint>, since: Long): Boolean {
-    points.forEach { if (it.t >= since) return true }
-    return false
-}
-
-/** [since] 之后的峰值：lowerIsWorse=true 取 min 最小（最差），否则取 max 最大；无有效点 → NaN */
-private fun peakSince(points: List<DownsampledPoint>, since: Long, lowerIsWorse: Boolean): Double {
-    var bv = if (lowerIsWorse) Double.POSITIVE_INFINITY else Double.NEGATIVE_INFINITY
-    points.forEach { p ->
-        if (p.t < since) return@forEach
-        val v = if (lowerIsWorse) p.min else p.max
-        if (if (lowerIsWorse) v < bv else v > bv) bv = v
-    }
-    // 全 NaN 序列的比较全为 false，bv 会留在 ±Infinity 被原样打印成 "-Infinity"，统一收敛成 NaN
-    return if (bv.isFinite()) bv else Double.NaN
-}
-
-/** [since] 之后是否有 avg≠0 的温度读数（传感器未就绪时后端常返回全 0，应视为「无数据」） */
-private fun hasRealTempSince(points: List<DownsampledPoint>, since: Long): Boolean {
-    points.forEach { if (it.t >= since && it.avg != 0.0) return true }
-    return false
-}
-
-/**
- * 阈值等级：有配置就用配置，没配过才回落到 MonitorMetricType 的内置默认阈值。
- * 注意 `enabled = false` 表示"用户明确关掉了这条阈值"，必须直接判 NORMAL —— 旧写法
- * （cfg != null && cfg.enabled 才用 cfg，否则回落默认）会把"关掉"当成"没配过"，等于关不掉。
- * 现状补充：state.thresholds 目前还没有任何写入点，所以实际用的一直是内置默认阈值。
- * 方向按 lowerIsWorse：false=越大越糟（value>=阈值），true=越小越糟（value<=阈值）。
- */
-private fun thresholdLevelOf(
-    thresholds: Map<String, MetricThreshold>,
-    apiKey: String,
-    value: Double,
-    lowerIsWorse: Boolean
-): ThresholdLevel {
-    if (value.isNaN()) return ThresholdLevel.NORMAL
-    val mt = MonitorMetricType.fromApiKey(apiKey) ?: return ThresholdLevel.NORMAL
-    val thr = thresholds[apiKey] ?: MetricThreshold(mt.defaultWarn, mt.defaultAlert, enabled = true)
-    if (!thr.enabled) return ThresholdLevel.NORMAL
-    thr.alertValue?.let { if (if (lowerIsWorse) value <= it else value >= it) return ThresholdLevel.ALERT }
-    thr.warnValue?.let { if (if (lowerIsWorse) value <= it else value >= it) return ThresholdLevel.WARN }
-    return ThresholdLevel.NORMAL
-}
-
-/** 从 monitorState 计算 6 张峰值卡；空/未开启指标用辅助文案说明原因。 */
-private fun computePeakMetrics(
-    state: MonitorState,
-    trafficSummary: TrafficSummary?
-): List<PeakMetricItem> {
-    val start = todayStartMillis()
-    val enabled = { key: String -> state.settings.enabledTypes.contains(key) }
-    fun levelFor(apiKey: String, value: Double, lowerIsWorse: Boolean): ThresholdLevel =
-        thresholdLevelOf(state.thresholds, apiKey, value, lowerIsWorse)
-
-    // Locale.ROOT：默认 Locale 在阿拉伯语等语系下会输出非 ASCII 数字，和等宽大数字排版冲突
-    fun fmt(v: Double): String = if (v.isNaN()) "—" else String.format(Locale.ROOT, "%.0f", v)
-
-    // 2026-08-31：局部 formatTrafficRate 已删除 —— 收敛到
-    // [FormatUtils.formatRate]（口径不变，额外获得 GB/s 档）。
-
-
-    val items = ArrayList<PeakMetricItem>(6)
-
-    // 1. CPU 峰值（%）
-    if (!enabled("cpu")) {
-        items += PeakMetricItem("CPU 峰值", "—", "%", ThresholdLevel.NORMAL, enabled = false, emptyHint = "未开启")
-    } else {
-        val cpuV = peakSince(state.cpuHistory, start, false)
-        val hint = if (hasPointsSince(state.cpuHistory, start)) null else "暂无数据"
-        items += PeakMetricItem("CPU 峰值", fmt(cpuV), "%", levelFor("cpu", cpuV, false), emptyHint = hint)
-    }
-
-    // 2. 内存峰值（%：后端 memory_history 存的是 usagePercent，不是 MB）
-    if (!enabled("memory")) {
-        items += PeakMetricItem("内存峰值", "—", "%", ThresholdLevel.NORMAL, enabled = false, emptyHint = "未开启")
-    } else {
-        val memV = peakSince(state.memoryHistory, start, false)
-        val hint = if (hasPointsSince(state.memoryHistory, start)) null else "暂无数据"
-        items += PeakMetricItem("内存峰值", fmt(memV), "%", levelFor("memory", memV, false), emptyHint = hint)
-    }
-
-    // 2026-10-12（用户要求）：「信号最差」已删除。理由：它是 RSRP 的**历史最差值**，
-    // 与同一屏的当前信号（首页/网络页 Hero）没有直接对应，用户看到「峰值 -120dBm」
-    // 却发现现在信号正常，会怀疑设备出故障；而它想表达的趋势在 charts 页的曲线里更清楚。
-
-    // 5. 温度峰值（°C）：全 0 视为「无数据」而不是设备真的 0°C
-    if (!enabled("temperature")) {
-        items += PeakMetricItem("温度峰值", "—", "°C", ThresholdLevel.NORMAL, enabled = false, emptyHint = "未开启")
-    } else {
-        val hasReal = hasRealTempSince(state.temperatureHistory, start)
-        val tempV = if (hasReal) peakSince(state.temperatureHistory, start, false) else Double.NaN
-        val hint = if (hasReal) null else "暂无数据"
-        items += PeakMetricItem("温度峰值", fmt(tempV), "°C", levelFor("temperature", tempV, false), emptyHint = hint)
-    }
-
-    // 2026-10-12（用户要求）：「今日流量」已删除。理由：它是**累计量**不是峰值，
-    // 与同屏其余「XX 峰值」的口径完全不同，放在一起会让人误以为它也是峰值类指标；
-    // 而累计值在仪表盘的网络 Hero 里已经有一份，放这里是重复。
-
-    return items
-}
-
-/**
- * v20h：从 6 格今日峰值里挑出「最差的阈值等级」+ 处于该等级的指标条数 ——
- * 让 EventSummaryCard 在「无未读告警但指标超阈值」的场景下（典型：CPU 90% WARN）
- * 也能给出对应 hero 视觉与准确的"N 项"，而不是一直说"运行正常"或写死"1 项"。
- *
- * 返回 NORMAL to 0 = 没有指标超阈值（与 unread==0 同时成立 → hero 显示绿色"运行正常"）。
- *
- * 实现：与网格共用同一套阈值/口径判定（见 [computePeakMetricsForLevel]），避免 hero 与下方网格互相打脸。
- */
-fun worstPeakSummary(state: MonitorState): Pair<ThresholdLevel, Int> {
-    val items = computePeakMetricsForLevel(state)
-    var worst = ThresholdLevel.NORMAL
-    items.forEach { (_, _, level) ->
-        if (level.ordinal > worst.ordinal) worst = level
-    }
-    val count = if (worst == ThresholdLevel.NORMAL) 0 else items.count { it.third == worst }
-    return worst to count
-}
-
-/**
- * v20h：仅用于 [worstPeakSummary] 的轻量派生 —— 取今日窗口内**3 个**有阈值指标的峰值 + 等级
- * （CPU / 内存 / 温度，2026-10-12 从 5 个减到 3 个，与 [computePeakMetrics] 的网格同源），
- * 不构造 PeakMetricItem（无需 label/icon/unit），减少浪费。
- */
-private fun computePeakMetricsForLevel(state: MonitorState): List<Triple<String, Double, ThresholdLevel>> {
-    val start = todayStartMillis()
-    fun levelFor(apiKey: String, value: Double, lowerIsWorse: Boolean): ThresholdLevel =
-        thresholdLevelOf(state.thresholds, apiKey, value, lowerIsWorse)
-    val out = ArrayList<Triple<String, Double, ThresholdLevel>>(3)
-    if (state.settings.enabledTypes.contains("cpu")) {
-        val v = peakSince(state.cpuHistory, start, false)
-        out += Triple("cpu", v, levelFor("cpu", v, false))
-    }
-    if (state.settings.enabledTypes.contains("memory")) {
-        val v = peakSince(state.memoryHistory, start, false)
-        out += Triple("memory", v, levelFor("memory", v, false))
-    }
-    // 2026-10-12（用户要求）：信号最差（signal_rsrp）与流量峰值（traffic_rx/tx）已从总览删除，
-    // 这里同步移除 —— 否则 hero 的取色/文案仍会被这两项驱动：用户看到"3 项严重阈值"或橙色 hero，
-    // 往下翻却找不到对应的那几格卡，等于给了一个无法下钻的结论。
-    // 现在 hero 只看 CPU / 内存 / 温度，与下方网格的三格严格同源。
-    if (state.settings.enabledTypes.contains("temperature")) {
-        val real = if (hasRealTempSince(state.temperatureHistory, start)) {
-            peakSince(state.temperatureHistory, start, false)
-        } else Double.NaN
-        out += Triple("temperature", real, levelFor("temperature", real, false))
-    }
-    return out
-}
-
-/**
- * 总览「今日峰值」区块：单卡包裹的 3×2 网格，卡内用细发丝线（1dp divider）分隔六个指标，
- * 去掉逐卡 Surface / 阴影 / 左侧彩条 + 图标三件套的 AI 模板感。分区标题已按需求移除。
- * 调用处负责把它放在摘要卡下方、事件时间轴上方。
- */
-@Composable
-fun PeakMetricsGrid(state: MonitorState, trafficSummary: TrafficSummary?, modifier: Modifier = Modifier) {
-    val items = remember(state, trafficSummary) { computePeakMetrics(state, trafficSummary) }
-    val palette = LocalResolvedPalette.current
-    val cardShape = UfiCardDefaults.shape
-    // 单卡容器（对齐项目 OverviewCard 风格：描边 + 阴影 + 基准圆角），内部网格靠发丝线分区
-    Surface(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(
-                start = Spacing.CardHorizontalMargin,
-                end = Spacing.CardHorizontalMargin,
-                top = Spacing.Small,
-                bottom = Spacing.CardBottomMargin
-            )
-            .ufiCardShadow(elevation = 4.dp, shape = cardShape)
-            .border(1.dp, palette.cardBorder, cardShape),
-        shape = cardShape,
-        color = palette.cardBg
-    ) {
-        Column(Modifier.fillMaxWidth()) {
-            // computePeakMetrics 恒返回 6 项（6 个区块每支都恰好 += 1），所以这里恒为 2×3；
-            // 不写补位分支（那是永不可达的死代码），改动 computePeakMetrics 时靠这条断言兜住。
-            // 2026-10-12：6 → 3（用户要求删掉信号最差 / 流量峰值 / 今日流量）。
-            // 保留这个 require：它是「派生函数与网格布局同宽」的护栏 —— 派生多给一项或少给一项
-            // 都会在这里直接炸，而不是静默画出一个错位的网格（chunked(3) 对 4/5 项会画出残行）。
-            require(items.size == 3) { "峰值网格需要恰好 3 项，实际 ${items.size}" }
-            items.chunked(3).forEachIndexed { rowIdx, rowItems ->
-                // 行之间加一条横向发丝线（放在行前，行数变化也不会漏画/多画）
-                if (rowIdx > 0) {
-                    Box(Modifier.fillMaxWidth().height(1.dp).background(palette.divider))
-                }
-                // height(IntrinsicSize.Min)：本网格在 LazyColumn 里，行的高度约束是无界的，
-                // 无界时 fillMaxHeight() 不起作用 → 竖向发丝线会被测成 0 高度（完全看不见）。
-                Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-                    rowItems.forEachIndexed { colIdx, item ->
-                        if (colIdx > 0) {
-                            Box(Modifier.width(1.dp).fillMaxHeight().background(palette.divider))
-                        }
-                        Box(Modifier.weight(1f)) { PeakMetricTile(item) }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/**
- * 单格峰值指标：指标名 + 状态点一行，下方峰值大数字 + 单位。
- * 无迷你趋势 / 描边 / 彩条（走势去图表页看）。空 / 未开启时显示原因并置灰。
- *
- * 2026-08-29：内容改为**整体水平居中**（原来是靠左 + 状态点被 weight(1f) 推到最右，
- * 6 格里的数字长短不一时视觉上参差不齐）。做法是 Column 加 CenterHorizontally，
- * 并把标题行的 weight(1f) 撤掉、改成 Arrangement.Center + 固定间距，
- * 这样「指标名 ● 」作为一个整体居中，而不是名字贴左、圆点贴右。
- */
-@Composable
-private fun PeakMetricTile(item: PeakMetricItem) {
-    val palette = LocalResolvedPalette.current
-    val isOk = item.enabled && item.emptyHint == null
-    val statusColor = when {
-        !isOk -> palette.divider
-        item.level == ThresholdLevel.ALERT -> palette.error
-        item.level == ThresholdLevel.WARN -> palette.warning
-        else -> palette.accent
-    }
-    val numberColor = when {
-        !isOk -> palette.textSecondary
-        item.level == ThresholdLevel.ALERT -> palette.error
-        item.level == ThresholdLevel.WARN -> palette.warning
-        else -> palette.textPrimary
-    }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .defaultMinSize(minHeight = 66.dp)
-            .padding(12.dp)
-            .alpha(if (isOk) 1f else 0.55f),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        // 指标名 + 状态点（阈值语义：红 / 橙 / 品牌蓝；空·未开启用发丝灰）
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Text(
-                text = item.label,
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.textSecondary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Box(Modifier.size(7.dp).background(statusColor, CircleShape))
-        }
-        Spacer(Modifier.height(6.dp))
-        // 峰值大数字 + 单位
-        // 2026-09-21：主数字换成公共 UfiRollingText。语义是"今日峰值"，只在出现新极值时才动，
-        // 且单位已经在隔壁独立 Text 里（不会因为自适应单位换档把整串滚一遍）。
-        Row(
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(3.dp)
-        ) {
-            UfiRollingText(
-                text = item.valueText,
-                style = UfiTextStyles.valueStrong,
-                color = numberColor
-            )
-            if (item.unit != null) {
-                Text(item.unit, style = MaterialTheme.typography.labelSmall, color = palette.textSecondary)
-            }
-        }
-
-        if (!isOk) {
-            Spacer(Modifier.height(6.dp))
-            Text(
-                text = item.emptyHint ?: "—",
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.textSecondary,
-                textAlign = TextAlign.Center
-            )
-        }
-    }
-}
-
-
+// 删除顺序（两次用户要求叠加的结果）：
+//   1. 2026-10-14 上午：总览的「今日峰值」网格（CPU / 内存 / 温度三张峰值卡）删除，
+//      连同 `PeakMetricItem` / `computePeakMetrics` / `PeakMetricTile` / `PeakMetricsGrid`。
+//   2. 2026-10-14 下午：hero 卡（`EventSummaryCard`）状态改为**完全由事件列表驱动**，
+//      不再接受「最差阈值等级」入参。
+// 于是这一整套派生失去了全部消费者，随之删除：
+//   `todayStartMillis` / `hasPointsSince` / `peakSince` / `hasRealTempSince` /
+//   `thresholdLevelOf` / `worstPeakSummary` / `computePeakMetricsForLevel`。
+//
+// 若将来要把「指标超阈值」重新接回 UI，这套派生可以从 git 历史里取回；注意
+// `thresholdLevelOf` 里那条 `enabled=false ⇒ NORMAL` 的语义坑（关掉阈值 ≠ 没配过阈值）。
 
 // ==================== v20d 事件中心 UI 重写（参考用户 UI 截图） ====================
 
@@ -1541,13 +1260,20 @@ private fun StatCard(
  * - meta 行：分类 · 严重度 + 未读时绿底"未读"胶囊
  * - 右上角时间（labelSmall）
  * - 点击 → onAckOne(id)；长按 → onDelete(id)（保留 v20c 删除入口）
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 `UfiSettingsRowCard` /
+ * `UfiSettingsGroup` 对齐；**列表调用方不要再补水平 padding**（原先 MonitorScreen 四处逐条补了
+ * 同一个 16dp，两边都留就会叠成 32dp）。
+ * [horizontalMargin] 服务于"已经身处有横向内距的容器里"的调用点：事件中心的
+ * `AlertTypeDetailDialog` 弹窗内容由 `UfiDialogShell` 统一给横向内距，那里显式传 `0.dp`。
  */
 @Composable
 fun MonitorEventCard(
     alert: AlertRecord,
     onAckOne: (Long) -> Unit,
     onDelete: ((Long) -> Unit)? = null,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    horizontalMargin: Dp = Spacing.CardHorizontalMargin
 ) {
     val palette = LocalResolvedPalette.current
     val severity = levelColor(palette, alert.level)
@@ -1562,6 +1288,7 @@ fun MonitorEventCard(
     Surface(
         modifier = modifier
             .fillMaxWidth()
+            .padding(horizontal = horizontalMargin)
             .combinedClickable(
                 onClick = { onAckOne(alert.id) },
                 onLongClick = onDelete?.let { cb -> { cb(alert.id) } }

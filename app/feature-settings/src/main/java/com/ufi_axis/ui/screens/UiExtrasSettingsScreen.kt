@@ -3,6 +3,7 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoStories
+import androidx.compose.material.icons.filled.Cast
 import androidx.compose.material.icons.filled.WbSunny
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.runtime.*
@@ -88,6 +89,18 @@ fun UiExtrasSettingsScreen(viewModel: MainViewModel, navController: NavHostContr
                                 onCheckedChange = { viewModel.poetry.setEnabled(it) }
                             )
                         }
+                    )
+                }
+
+                // DLNA 服务（2026-10-20 从设置主列表搬到本页，用户要求"小功能"里）：
+                // 它和天气/诗词一样是设备侧的一项附加能力，不属于服务器/网络设置。
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = Icons.Default.Cast,
+                        title = "DLNA 服务",
+                        description = "局域网媒体共享 · 电视直接播放",
+                        onClick = { navController.navigate(Routes.DETAIL_DLNA) },
+                        trailing = { UfiSettingsChevron() }
                     )
                 }
 

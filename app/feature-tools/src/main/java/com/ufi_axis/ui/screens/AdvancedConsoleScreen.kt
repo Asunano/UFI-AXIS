@@ -25,6 +25,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -74,6 +75,13 @@ import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.ui.input.key.*
 import androidx.compose.ui.text.input.ImeAction
 import com.ufi_axis.ui.theme.UfiMotion
+// 2026-10-14：设备属性只读区（GET /api/shell/prop/{key}）—— 只读属性不再走 shell exec 拼 getprop，
+// 理由见 DevicePropsStrip 的 KDoc。
+import com.ufi_axis.data.api.RetrofitClient
+import com.ufi_axis.util.AppPreferences
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 
 /**
  * 高级控制台 — 聊天记录式 AT 指令 + Shell 命令工具。
@@ -99,6 +107,11 @@ fun AdvancedConsoleScreen(viewModel: MainViewModel, navController: NavHostContro
         title = "高级控制台",
         navController = navController,
         showBack = true,
+        // 2026-10-14：底部输入法 inset 交给外壳统一处理（navigationBars ∪ ime）。
+        // 本页的输入栏贴在底部，键盘弹出时整块面板要上移；原先这里自己在根 Column 上挂
+        // `imePadding()`，而外壳的内容 Box 已经应用过 navigationBars，两者相加 →
+        // 输入栏悬在键盘上方约一个导航栏的高度（用户报的"输入框悬浮显示"）。
+        imeAwareBottomInset = true,
         actions = {
             val palette = LocalResolvedPalette.current
             val currentMessages = if (selectedTab == 0) state.atMessages else state.shellMessages
@@ -120,13 +133,19 @@ fun AdvancedConsoleScreen(viewModel: MainViewModel, navController: NavHostContro
         }
     ) { padding ->
         UfiPageBackgroundBox(modifier = Modifier.fillMaxSize()) {
-            Column(Modifier.fillMaxSize().imePadding()) {
+            // 2026-10-14：这里**刻意不再有 `imePadding()`** —— 底部输入法 inset 已由上面的
+            // `imeAwareBottomInset = true` 在外壳层一次性应用（union 而非相加）。
+            // 两处都加会让底部多出一个导航栏的高度，输入栏就会"悬浮"在键盘上方。
+            Column(Modifier.fillMaxSize()) {
                 UfiScrollableTabRow(
                     selectedTabIndex = selectedTab,
                     onTabSelected = { selectedTab = it },
                     tabs = listOf("AT 指令", "Shell 命令"),
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)
                 )
+
+                // 2026-10-19：设备属性只读区已按用户要求**删除**（常驻显示太占地方）。
+                // 需要看属性可到「Shell 命令」里 `getprop`，或到诊断页。
 
                 ChatConsoleContent(
                     atMessages = state.atMessages,
@@ -307,12 +326,31 @@ private fun ConsoleMessageList(
         label = "consoleList"
     ) { shell ->
         val msgs = if (shell) shellMessages else atMessages
-        val listState = rememberLazyListState()
+        // 2026-10-14 修复「每次切到 Shell 命令页都看到列表从顶部滑到底部」：
+        //
+        // 原实现是 `rememberLazyListState()`（首帧停在 index 0）＋ `LaunchedEffect(msgs.size)`
+        // 里的 `animateScrollToItem(lastIndex)`。而 [AnimatedContent] 会为每个 targetState
+        // 重建整棵内容组合 —— `rememberLazyListState` 随之重建、回到顶部，紧接着那个 effect
+        // 用**动画**把它推到底部 ⇒ 用户每次切 Tab 都要白看一段「从顶滚到底」的空滚。
+        // （副作用：两个 Tab 消息数相同时 `msgs.size` 不变，effect 不重跑，于是有时滚有时不滚。）
+        //
+        // 现在两处一起改：
+        // 1. `initialFirstVisibleItemIndex` 让**第一帧就落在最后一条**，没有可滚的行程；
+        // 2. 首次定位的收尾（超长单条消息继续下滚）也走瞬时，只有**之后新到的消息**才用动画。
+        val listState = rememberLazyListState(
+            initialFirstVisibleItemIndex = if (msgs.isEmpty()) 0 else msgs.lastIndex
+        )
+        // 首次定位是否已完成。AnimatedContent 切 Tab 会重建内容 ⇒ 该标记随之重置，
+        // 于是「切 Tab」永远走瞬时路径、「新消息」才走动画路径。
+        var initialSettled by remember { mutableStateOf(false) }
         // 新消息到达 / 切 Tab 时滚动到底部；对超长单条消息会进一步滚到其底部
         LaunchedEffect(msgs.size) {
             if (msgs.isEmpty()) return@LaunchedEffect
+            val animate = initialSettled
+            initialSettled = true
             // 先把最后一条消息的顶部对齐到视口顶部
-            listState.animateScrollToItem(msgs.lastIndex)
+            if (animate) listState.animateScrollToItem(msgs.lastIndex)
+            else listState.scrollToItem(msgs.lastIndex)
             // 若最后一条消息高度超过视口，继续向下滚动，确保其底部也可见
             val lastItem = listState.layoutInfo.visibleItemsInfo
                 .find { it.index == msgs.lastIndex }
@@ -321,7 +359,8 @@ private fun ConsoleMessageList(
                 val viewportBottom = listState.layoutInfo.viewportEndOffset
                 val overflow = itemBottom - viewportBottom
                 if (overflow > 0) {
-                    listState.animateScrollBy(overflow.toFloat())
+                    if (animate) listState.animateScrollBy(overflow.toFloat())
+                    else listState.scrollBy(overflow.toFloat())
                 }
             }
         }
@@ -642,3 +681,65 @@ private fun ConsoleInputBar(
         Spacer(Modifier.height(6.dp))
     }
 }
+
+// ==================== 设备属性只读区（2026-10-14 接入 `GET /api/shell/prop/{key}`） ====================
+
+/**
+ * 要拉取并显示的常用只读属性，顺序 = 显示顺序。
+ *
+ * key 全部落在 core 的白名单 `[a-zA-Z0-9._]` 内（`ShellRoutes.PROP_KEY_PATTERN`），
+ * 含其它字符（`-`、空格…）的属性名会被 core 直接回 400 —— 所以这里不许写花样。
+ * 只列这五个：再多就变成"又一个要滚的信息区"，而这五个覆盖了排障时最常问的
+ * 「什么机器 / 什么系统 / 序列号 / ADB 通不通 / 蜂窝制式」。
+ */
+private val DEVICE_PROP_KEYS: List<String> = listOf(
+    "ro.product.model",          // 设备型号
+    "ro.build.version.release",  // Android 版本
+    "ro.serialno",               // 序列号
+    "init.svc.adbd",             // ADB 服务状态（running / stopped）
+    "gsm.network.type"           // 蜂窝网络制式（LTE / NR / UMTS…）
+)
+
+/**
+ * 设备属性只读区（`GET /api/shell/prop/{key}`，2026-10-14 接入）。
+ *
+ * ## 为什么走这条端点，而不是 `POST /api/shell/exec` 拼 `getprop xxx`
+ * 1. **校验责任在 core**：本端点的 key 由 core 用白名单（只许 `[a-zA-Z0-9._]`）校验、
+ *    非法直接回 400（见 `ShellRoutes` 的 `get("/prop/{key}")`）。走 exec 是把一整条命令
+ *    交给 shell，转义与注入由**调用方**负责 —— 每个调用点都得自己保证拼对了。
+ * 2. **不污染终端历史**：exec 每执行一次都会由 core 的 `ConsoleHistoryRecorder` 在设备端
+ *    落一行记录，那是给用户查"我发过什么命令"用的。读几个只读属性不该在用户的历史里留痕。
+ *
+ * ## 为什么放在「高级控制台」，而不是「真 PTY 终端」页
+ * 任务原本点名 `DETAIL_PTY_TERMINAL`（真 PTY 终端）那一页，但那条路由**当前在
+ * `AppScreens.kt` 里被注释掉了**（2026-10-10 暂时隐藏），页面根本组合不出来 ——
+ * 加在那里等于给一个打不开的页面加 UI，端点依旧没有任何可达的调用方，正是这次接入要消灭的状态。
+ * 而本页（`DETAIL_TOOLS_ADVANCED`）才是**真正会发 `POST /api/shell/exec`、会写终端历史**的那一页，
+ * 上面第 2 条理由说的就是它。等 PTY 页恢复注册时，这一块可以直接搬过去：它不依赖本页任何状态，
+ * 只用 [RetrofitClient] 与 [AppPreferences]。
+ *
+ * ## 并发与容错
+ * 五个 key **并发**拉（`async` + `awaitAll`）：串行就是 5 个 RTT 叠加，而它们互不依赖。
+ * 单个 key 失败只让它那一格显示 `—`，**不**整块变错误、也**不**弹提示 —— 属性缺失
+ * （如非蜂窝设备上的 `gsm.network.type`）是常态而不是故障，而本块是排障辅助，
+ * 它自己变成一条红条只会干扰用户正在做的事。
+ *
+ * ## 版式：等宽多行读数，不是五个设置行
+ * 用一整块 `monoReadout` 文本（`key` 左对齐 + 值），像一段 `getprop` 输出。
+ * 不逐项套 `UfiSettingsItem`：五行「标题 + 副标 + 值」约占 300dp，而这一页的主体是
+ * 对话区（它靠 `weight(1f)` 吃剩余高度）—— 一个只读辅助块不该抢掉近半屏。
+ */
+@Composable
+private fun RemovedDevicePropsPlaceholder() {
+    // 2026-10-19：原 DevicePropsStrip（常驻设备属性只读区）已按用户要求删除。
+    // 保留这个空占位会显得莫名其妙，所以整个函数已移除；此处不留代码。
+}
+
+/**
+ * 一格属性的显示值：没拉完 `…`、拉到但为空 `—`、否则原值（已 trim）。
+ *
+ * 2026-10-19：`DevicePropsStrip`（常驻设备属性控件）已按用户要求删除，本函数一并移除。
+ */
+
+/** key 列宽：最长的是 `ro.build.version.release`（24 字符），留一格空格做分隔。 */
+private const val PROP_KEY_COLUMN = 25

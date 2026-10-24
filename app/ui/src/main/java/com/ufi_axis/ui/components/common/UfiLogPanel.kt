@@ -22,6 +22,9 @@ import com.ufi_axis.ui.theme.UfiTextStyles
  *
  * 只负责展示，轮询由调用方用 `LaunchedEffect(autoRefreshing)` 驱动（组件内不起协程，
  * 避免离屏后仍在轮询）。取色与圆角统一走 [LocalResolvedPalette] + [UfiCardDefaults]。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 [UfiSettingsRowCard] /
+ * [UfiSettingsGroup] 对齐；**调用方不要再补水平 padding**，那会叠成 32dp 的双重内距。
  */
 @Composable
 fun UfiLogPanel(
@@ -39,7 +42,7 @@ fun UfiLogPanel(
     val palette = LocalResolvedPalette.current
     val scroll = rememberScrollState()
     Surface(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.fillMaxWidth().padding(horizontal = Spacing.CardHorizontalMargin),
         shape = UfiCardDefaults.shape,
         color = palette.cardBg,
         border = BorderStroke(1.dp, palette.cardBorder)

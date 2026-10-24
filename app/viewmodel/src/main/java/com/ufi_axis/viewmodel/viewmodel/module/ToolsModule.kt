@@ -13,6 +13,7 @@ import com.ufi_axis.data.notification.NotifyHistoryStore
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.AppLogBuffer
 import com.ufi_axis.util.AppPreferences
+import com.ufi_axis.util.CoreCrashPolicy
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis.util.LogEntry
 import com.ufi_axis.util.OkHttpClientProvider
@@ -214,15 +215,61 @@ class ToolsModule(
      */
     private val UPDATE_BUSY_STATES = setOf("downloading", "verifying", "installing", "uploading")
 
+    /**
+     * 后端状态连续处于 busy 的起始时刻（0 = 当前不在 busy）。
+     *
+     * 2026-10-23 小修补用：以前的超时判据只看「请求失败」（[deviceUpdatePollFailures]），
+     * 于是「后端已经重启成功、接口也能返回，但状态一直停在 installing」这种情形会无限等待 ——
+     * 用户看到的就是弹窗卡在"安装中 / 等待重启"。
+     */
+    private var busySinceMs: Long = 0L
+
+    /** busy 状态允许的最长停顿。超过即判失败并给出「重置更新状态」指引。 */
+    private val busyStallTimeoutMs = 5 * 60_000L
+
     /** 单次轮询设备更新状态（suspend，供轮询循环复用）。 */
     private suspend fun doPollDeviceUpdateStatus() {
         runCatching { api.getDeviceUpdateStatus() }
-            .onSuccess {
+            .onSuccess { st ->
                 deviceUpdatePollFailures = 0
-                _updateDeviceState.value = it.copy(reconnecting = false)
+                val prev = _updateDeviceState.value
+                val prevState = prev?.state
+                val now = System.currentTimeMillis()
+
+                // ① 能连上但状态一直 busy：以前不设超时，会永远等下去。
+                if (st.state in UPDATE_BUSY_STATES) {
+                    if (busySinceMs == 0L || prevState != st.state) busySinceMs = now
+                    if (now - busySinceMs >= busyStallTimeoutMs) {
+                        _updateDeviceState.value = st.copy(
+                            state = "failed",
+                            message = "安装状态已 ${busyStallTimeoutMs / 60_000} 分钟没有变化，" +
+                                "设备端可能没有完成安装。可在本页「重置更新状态」后重试。",
+                            reconnecting = false
+                        )
+                        busySinceMs = 0L
+                        markCoreUpdating(false)
+                        return@onSuccess
+                    }
+                } else {
+                    busySinceMs = 0L
+                }
+
+                // ② 后端从 busy 回到 idle：这次安装流程已经结束（core 重启后没留下结果）。
+                //    必须当终态处理，否则弹窗会永远停在"进行中"。
+                if (st.state == "idle" && prevState in UPDATE_BUSY_STATES) {
+                    _updateDeviceState.value = st.copy(
+                        state = "done",
+                        message = "设备已重启，更新流程已结束（未读到安装结果，请到「关于」确认版本）",
+                        reconnecting = false
+                    )
+                    markCoreUpdating(false)
+                    return@onSuccess
+                }
+
+                _updateDeviceState.value = st.copy(reconnecting = false)
                 // 在线/本地任一路径到了终态都要清「更新中」标记，
                 // 否则健康检查会一直豁免掉线弹窗（见 MainViewModel.isCoreUpdateInterruptingBackend）。
-                if (it.state == "done" || it.state == "failed") {
+                if (st.state == "done" || st.state == "failed") {
                     markCoreUpdating(false)
                 }
             }
@@ -272,6 +319,10 @@ class ToolsModule(
      */
     fun startDeviceUpdatePolling() {
         updatePollJob?.cancel()
+        // 重新开始一轮等待：上一次残留的失败计数 / busy 起始时刻不能带进来，
+        // 否则新的更新一开始就被判成"失联"或"停顿超时"。
+        deviceUpdatePollFailures = 0
+        busySinceMs = 0L
         updatePollJob = scope.launch {
             while (isActive) {
                 doPollDeviceUpdateStatus()
@@ -1460,6 +1511,51 @@ class ToolsModule(
             prefs.smsCodeSeenMsgId = maxOf(prefs.smsCodeSeenMsgId, codes.maxOf { it.msgId })
         }
         _toolsState.update { it.copy(verificationCodesUnread = 0) }
+        // 2026-10-19：水位写回 core（跨设备同步）。
+        pushSeenWatermarks()
+    }
+
+    /**
+     * 已读水位的**跨设备同步**（2026-10-19）。
+     *
+     * 水位本地仍留一份镜像（读起来是同步的、角标不闪烁），但真源放 core：
+     * - 拉：首次加载时 `GET /api/config` 取 core 上的水位，与本地的取 max 合并；
+     * - 推：标记已读时 `PUT /api/config` 写回（只前推不回退）。
+     *
+     * 这样 b 设备配对后打开，拿到的是 a 设备看到的位置，而不是"全部未读"。
+     */
+    @Volatile
+    private var seenWatermarksSynced = false
+
+    private suspend fun syncSeenWatermarksFromCore() {
+        if (seenWatermarksSynced) return
+        seenWatermarksSynced = true
+        runCatching {
+            val cfg = api.getConfig()
+            val prefs = AppPreferences(appContext)
+            cfg.sms_code_seen_msg_id?.let {
+                prefs.smsCodeSeenMsgId = maxOf(prefs.smsCodeSeenMsgId, it)
+            }
+            cfg.sms_blocked_seen_msg_id?.let {
+                prefs.smsBlockedSeenId = maxOf(prefs.smsBlockedSeenId, it)
+            }
+        }
+    }
+
+    private fun pushSeenWatermarks() {
+        val prefs = AppPreferences(appContext)
+        val codeSeen = prefs.smsCodeSeenMsgId
+        val blockedSeen = prefs.smsBlockedSeenId
+        scope.launch {
+            runCatching {
+                api.updateConfig(
+                    mapOf(
+                        "sms_code_seen_msg_id" to codeSeen,
+                        "sms_blocked_seen_msg_id" to blockedSeen
+                    )
+                )
+            }
+        }
     }
 
     /**
@@ -1479,6 +1575,8 @@ class ToolsModule(
         scope.launch {
             try {
                 val resp = api.getVerificationCodes()
+                // 2026-10-19：先合并 core 上的已读水位（换设备后角标才是对的）。
+                syncSeenWatermarksFromCore()
                 val prefs = AppPreferences(appContext)
                 val onNotifyTab = _toolsState.value.smsTab == 1
                 if (onNotifyTab && resp.codes.isNotEmpty()) {
@@ -1740,6 +1838,8 @@ class ToolsModule(
         scope.launch {
             try {
                 val resp = api.getSmsBlocked(limit = SMS_BLOCKED_PAGE_SIZE)
+                // 2026-10-19：先合并 core 上的已读水位（跨设备）。
+                syncSeenWatermarksFromCore()
                 val prefs = AppPreferences(appContext)
                 val seen = prefs.smsBlockedSeenId
                 _toolsState.update {
@@ -1751,7 +1851,12 @@ class ToolsModule(
                         smsBlockedCursorId = resp.nextCursorId,
                         smsBlockedHasMore = resp.hasMore,
                         smsBlockedTotal = resp.total,
-                        smsBlockedUnviewed = resp.records.count { r -> r.id > seen }
+                        // 2026-10-19 修正：之前只在「当前已加载的一页」里数 id > 水位，
+                        // 首屏最多 50 条 ⇒ 角标最多显示 50（实际可能有几百条）。
+                        // 从没看过（水位 = 0）时直接用服务端 total；看过之后只统计已加载页里
+                        // 比水位新的那部分（更旧的分页已被丢弃，这是能做到的准确上限）。
+                        smsBlockedUnviewed = if (seen <= 0L) resp.total
+                        else resp.records.count { r -> r.id > seen }
                     )
                 }
             } catch (e: Exception) {
@@ -1818,6 +1923,8 @@ class ToolsModule(
             prefs.smsBlockedSeenId = maxOf(prefs.smsBlockedSeenId, records.maxOf { it.id })
         }
         _toolsState.update { it.copy(smsBlockedUnviewed = 0) }
+        // 2026-10-19：水位写回 core（跨设备同步）。
+        pushSeenWatermarks()
     }
 
     /** 清空全部拦截记录。成功后重拉（列表变空、游标归零），失败返回 false 交给 UI 提示。 */
@@ -3400,10 +3507,18 @@ class ToolsModule(
     // ── core 崩溃提醒（2026-09-04）──
 
     /**
-     * 拉一次 `GET /api/service/crash`，若时间戳与本地"已提示过"的不同就抛给 UI 弹窗。
+     * 拉一次 `GET /api/service/crash`，若这次崩溃**值得提示且尚未提示过**就抛给 UI 弹窗。
      *
      * 调用时机：MainActivity 首帧 + 每次重新连上设备。**失败一律静默** —— 这只是个提醒，
      * 老 core 没有这个端点（404）也走这条路，不该给用户报错。
+     *
+     * 2026-10-23：两处时序修正。
+     * - **先过滤新鲜度**：`crashed` 对三个月前的记录也恒为 true，只有 core 的 `recent`
+     *   （同一时钟算的 7 天窗口）能把它挡掉，判据集中在 [CoreCrashPolicy]。
+     * - **记账提前到发出提示之前**：原来等用户点「知道了」才写 `coreCrashShownAt`，
+     *   用户没关窗就杀进程 / 被系统回收 / 走 444 回配对页，整棵 UI 被销毁时 `onDismiss`
+     *   不会执行，标记就丢了，下次启动同一条旧崩溃再弹一次。web 端本来就是弹窗前写
+     *   localStorage，这里对齐。
      */
     fun loadCoreCrashNotice() {
         scope.launch {
@@ -3413,9 +3528,10 @@ class ToolsModule(
                 DebugLog.d("ToolsModule") { "读取 core 崩溃信息失败（忽略）：${e.message}" }
                 return@launch
             }
-            if (!report.crashed || report.timestamp <= 0L) return@launch
             val prefs = AppPreferences(appContext)
-            if (prefs.coreCrashShownAt == report.timestamp) return@launch
+            if (!CoreCrashPolicy.shouldPrompt(report, prefs.coreCrashShownAt)) return@launch
+            // 先落盘再弹：落盘失败也不影响本次提示（commit() 返回值刻意不处理）。
+            prefs.coreCrashShownAt = report.timestamp
             _coreCrashNotice.value = CoreCrashNotice(
                 timestamp = report.timestamp,
                 summary = report.summary,
@@ -3424,7 +3540,12 @@ class ToolsModule(
         }
     }
 
-    /** 弹窗已展示（或用户关闭）→ 记下时间戳，同一次崩溃不再提示。 */
+    /**
+     * 弹窗已展示（或用户关闭）→ 再写一次时间戳并清空状态。
+     *
+     * 真正的记账已经在 [loadCoreCrashNotice] 发出提示前完成，这里是**幂等兜底**：
+     * 万一将来有别的路径直接构造 `_coreCrashNotice`，关闭动作仍能保证"同一次崩溃只提示一次"。
+     */
     fun markCoreCrashNoticeShown() {
         val notice = _coreCrashNotice.value ?: return
         AppPreferences(appContext).coreCrashShownAt = notice.timestamp

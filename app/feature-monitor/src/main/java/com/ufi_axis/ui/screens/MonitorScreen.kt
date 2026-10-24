@@ -2,15 +2,18 @@ package com.ufi_axis.ui.screens
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.border
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -25,6 +28,8 @@ import androidx.compose.material3.*
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
@@ -34,11 +39,15 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
 import androidx.compose.ui.platform.LocalContext
 import android.content.Context
@@ -51,6 +60,7 @@ import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.components.EventSortMode
 import com.ufi_axis.ui.components.AggregateAlertRow
 import com.ufi_axis.ui.components.AggregatedAlertRowView
+import com.ufi_axis.ui.components.alertTypeLabel
 import com.ufi_axis.ui.components.AlertTypeDetailDialog
 import com.ufi_axis.ui.components.EventSummaryCard
 import com.ufi_axis.ui.components.MonitorEventStatCards
@@ -60,13 +70,12 @@ import com.ufi_axis.ui.components.MonitorEventCard
 import com.ufi_axis.ui.components.MonitorLevelFilter
 import com.ufi_axis.ui.components.MonitorOverviewTab
 import com.ufi_axis.ui.components.alertRangeLabel
-import com.ufi_axis.ui.components.PeakMetricsGrid
 import com.ufi_axis.ui.components.MonitorReadFilter
 import com.ufi_axis.ui.components.MonitorSortButton
 import com.ufi_axis.ui.components.MonitorSortDialog
+import com.ufi_axis.ui.components.MonitorEventsEntry
 import com.ufi_axis.ui.components.MonitorTopTab
 import com.ufi_axis.ui.components.MonitorTypeFilter
-import com.ufi_axis.ui.components.worstPeakSummary
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 // 2026-09-04（P3a）：`UfiMotion` 已迁到 ui.theme，而 components.common 仍留着同名的
@@ -239,6 +248,17 @@ fun MonitorScreen(
     ) { padding ->
         UfiPageBackgroundBox(modifier = Modifier.padding(padding)) {
             Column(Modifier.fillMaxSize()) {
+                /*
+                 * 分类 Tab（2026-10-14 用户要求：事件入口从这一行挪到下方 chip 行的右侧）。
+                 *
+                 * 这一行现在只放**页面级导航**（总览 / 图表）。「事件中心 ›」曾在 hero 卡删除后
+                 * 暂住在这里，但它和 Tab 不是一类东西，占在最右边还白吃掉那条 16dp 呼吸位；
+                 * 现在它跟「按类型聚合 / 全部明细」同一行 —— 两者回答的都是"这一屏看什么"。
+                 * 新位置见下方 `overviewFilterChips` 那个 item。
+                 *
+                 * 移走入口后这里**不留占位**：原来那层 `Box(weight(1f))` 只为把入口顶到右边，
+                 * 而 Tab 自己就 fillMaxWidth（UfiScrollableTabRow 内部如此），左边缘不会飘。
+                 */
                 MonitorTopTab(selected = overviewTab, onSelect = { overviewTab = it })
                 Spacer(Modifier.height(Spacing.Medium))
 
@@ -343,37 +363,10 @@ private fun MonitorOverviewTabContent(
     // hero 卡的 range 必须是稳定实例：MonitorTimeRange.today() 每次都是新的 Custom（含 currentTimeMillis），
     // 直接传就等于让这张卡每次重组都无法被跳过。
     val todayRange = remember(hourBucket) { MonitorTimeRange.today() }
-    // ═══ hero 阈值状态加迟滞（2026-10-12，用户报「抖一下就警告」）═══
-    //
-    // 现象：hero 卡在阈值附近反复变色 —— 一轮轮询里峰值越过阈值 → 橙，下一轮掉回来 → 绿，
-    // 用户看到的就是"闪一下"。
-    // 根因：remember 的 key 是 monitorState，而它**每轮轮询都换新实例** ⇒ 这个 remember
-    // 从来不生效，每轮都重算一遍。峰值恰好落在阈值附近时，相邻两轮的判定就会翻转。
-    //
-    // 迟滞口径（不对称是刻意的：误报比漏报更打扰人）：
-    //   · 进警告/严重：需要**连续 2 轮**都超阈值（快速确认真有问题）
-    //   · 退回正常：需要**连续 3 轮**都不超（给指标回落留余量，别一回落就变绿）
-    // ALERT 与 WARN 之间同样按这个规则走，状态只允许逐级变化，不会因为一次抖动跳级。
-    val rawPeak = remember(monitorState, hourBucket) { worstPeakSummary(monitorState) }
-    var peakStreak by remember { mutableIntStateOf(0) }   // 连续超阈值的轮数
-    var normalStreak by remember { mutableIntStateOf(0) } // 连续正常的轮数
-    var latchedPeak by remember { mutableStateOf(ThresholdLevel.NORMAL) } // 迟滞后的对外状态
-    val enterStreak = 2
-    val exitStreak = 3
-    if (rawPeak.first != ThresholdLevel.NORMAL) {
-        peakStreak++
-        normalStreak = 0
-        if (peakStreak >= enterStreak) latchedPeak = rawPeak.first
-    } else {
-        normalStreak++
-        peakStreak = 0
-        // 只在「已经处于某种告警态」时才需要数退出；本来就是正常的不用等。
-        if (normalStreak >= exitStreak && latchedPeak != ThresholdLevel.NORMAL) {
-            latchedPeak = ThresholdLevel.NORMAL
-        }
-    }
-    val worstPeak = latchedPeak
-    val worstPeakCount = if (latchedPeak == rawPeak.first) rawPeak.second else 0
+    // 2026-10-14（用户要求）：hero 卡状态改为**完全由事件列表驱动**，不再有「今日阈值/峰值」这个状态源。
+    // 随之删掉了这里原有的阈值迟滞逻辑（进 2 轮 / 退 3 轮）—— 它的唯一输入是
+    // worstPeakSummary（指标峰值的最差阈值等级），现在没有任何消费者了。
+    // 事件列表本身是边沿触发的（设备侧只在级别跃迁时入库），不需要额外迟滞。
     val palette = LocalResolvedPalette.current
 
     // ★ 2026-09-02 懒加载：告警只在「总览 Tab 真被打开」时拉 —— 本函数只在该 Tab 下组合，
@@ -389,16 +382,14 @@ private fun MonitorOverviewTabContent(
         viewModel.tools.loadAlerts()
     }
 
-    // FIX-6（2026-08-23 · 23:47）：监控中心「总览」Tab 改为按类型聚合视图。
-    // 根因：上一次修复仅下放到了 DETAIL_EVENTS（事件中心全屏页），但用户打开 MAIN 路由下的
-    // MonitorScreen 总览依然看到具体事件明细（截图 23:45 显示 500+ 条逐条堆叠），
-    // 体验割裂，本质上是聚合视图没接上主屏。
-    // 修复：默认走聚合（与事件中心保持一致），FilterChip 切换「按类型聚合 / 全部明细」，
-    // 点击聚合行 → AlertTypeDetailDialog 显示具体事件 + 内置 10/页分页（避免主列表堆叠异常），
-    // 多页时显示底部浮动分页条。
-    var aggregateMode by rememberSaveable { mutableStateOf(true) }
-    var currentPage by remember { mutableIntStateOf(0) }
+    // 2026-10-23（用户决定）：总览改成**竖向时间轴**，只显示今天的事件。
+    // 去掉：时间轴/按类型分类、聚合/明细 chip、浮动分页条。
+    // 保留：按 (type, level) 聚合的行（一行=一类一个等级，带 count/unread/lastTimestamp），
+    //       点击开明细弹窗、只统计今天。
     var detailTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+    /** 底部详情 sheet 选中的那条事件（null = 关闭）。 */
+    var selectedAlert by remember { mutableStateOf<com.ufi_axis.data.model.AlertRecord?>(null) }
+
     val overviewPageSize = 10
 
     val aggregatedRows = remember(todayAlerts) {
@@ -416,17 +407,8 @@ private fun MonitorOverviewTabContent(
             }
             .sortedByDescending { it.lastTimestampMs }
     }
-    val overviewPageCount = ufiPageCount(aggregatedRows.size, overviewPageSize)
-    // 行数缩小（轮询刷新 / 删除告警）时必须夹回最后一页：否则 currentPage 越界 → 列表空白，
-    // 同时 pageCount 掉到 1 让分页条隐藏，用户被困在空页里翻不回来。
-    LaunchedEffect(overviewPageCount) {
-        currentPage = ufiClampPage(currentPage, overviewPageCount)
-    }
-    val overviewSlice = if (currentPage * overviewPageSize >= aggregatedRows.size) emptyList()
-        else aggregatedRows.subList(
-            currentPage * overviewPageSize,
-            kotlin.math.min(currentPage * overviewPageSize + overviewPageSize, aggregatedRows.size)
-        )
+    /** 今天的未读条数：头部徽标用，与时间轴同口径（只统计 todayAlerts）。 */
+    val todayUnread = remember(todayAlerts) { todayAlerts.count { !it.acknowledged } }
 
     Box(Modifier.fillMaxSize()) {
         // 列表状态提到外面：下面那条浮动分页条要按滚动方向自动隐藏，
@@ -462,59 +444,90 @@ private fun MonitorOverviewTabContent(
                 // 本来就会在**每张图表内部**各显示一次"数据加载中…"（FixedMonitorChart），
                 // 顶部再来一句笼统的"加载中…"是纯冗余，而且它只占一行高度、数据一到就消失，
                 // 反而制造一次整列表的位移。
-                EventSummaryCard(
-                    alerts = todayAlerts,
-                    range = todayRange,
-                    worstPeakLevel = worstPeak,
-                    worstPeakCount = worstPeakCount,
-                    onEventsClick = { navController.navigate(Routes.DETAIL_EVENTS) },
-                    modifier = Modifier.padding(horizontal = 16.dp)
-                )
-            }
-
-            item(key = "grid") {
-                // ★ 懒加载：6 格（今日峰值）要用到全部启用的指标，但只有它露面才拉。
-                // key 带上 range 与启用集：窗口一换 / 设置里开关了指标，可见的它会自动重拉。
-                val gridTypes = remember(monitorState.settings.enabledTypes) {
+                //
+                // ★ 懒加载（2026-10-14 从原「今日峰值」网格那一条挪过来）。
+                // 总览现在已经不画任何指标曲线（峰值网格已删、hero 也改成只看事件列表），
+                // 但这两条副作用**刻意保留**：
+                //   ① `loadMonitorTypes` 用 state 里那个 range 记账，与启动预加载
+                //      （PreloadCoordinator.OVERVIEW_METRIC_KEYS，同一个 range 实例）对齐 ——
+                //      少一次调用会让记账 key 对不上，切到图表 Tab 时那几类被整批重拉，预热白做；
+                //   ② 用户切到图表 Tab 时数据已经是热的。
+                // 若将来要彻底去掉，必须让图表 Tab 成为唯一的登记方，并同步改预加载。
+                val heroTypes = remember(monitorState.settings.enabledTypes) {
                     monitorState.settings.enabledTypes.toList()
                 }
                 // 可见性成对上报：滚出视口后轮询就不该再刷这些指标。
-                DisposableEffect(gridTypes) {
-                    viewModel.dashboard.registerVisibleMonitorTypes(gridTypes)
-                    onDispose { viewModel.dashboard.unregisterVisibleMonitorTypes(gridTypes) }
+                DisposableEffect(heroTypes) {
+                    viewModel.dashboard.registerVisibleMonitorTypes(heroTypes)
+                    onDispose { viewModel.dashboard.unregisterVisibleMonitorTypes(heroTypes) }
                 }
-                LaunchedEffect(monitorState.selectedRange, gridTypes) {
+                LaunchedEffect(monitorState.selectedRange, heroTypes) {
                     viewModel.dashboard.loadMonitorTypes(
-                        types = gridTypes,
+                        types = heroTypes,
                         range = monitorState.selectedRange,
                     )
                 }
-                PeakMetricsGrid(
-                    state = monitorState,
-                    trafficSummary = dashboardState.trafficSummary,
-                    modifier = Modifier.padding(top = Spacing.Medium)
-                )
+                // hero 卡（EventSummaryCard）**已删除**；「事件中心 ›」入口现在挂在下面
+                // `overviewFilterChips` 那一行 chip 的右侧（见 MonitorEventsEntry）。
+                //
+                // ⚠ 这个 item 现在**没有可见内容**，只留下面那两条副作用 —— 它们不能跟着卡一起删：
+                //   ① `loadMonitorTypes` 用 state 里那个 range 记账，与启动预加载对齐，
+                //      少一次调用会让切到图表 Tab 时那几类被整批重拉，预热白做；
+                //   ② 可见性成对上报决定轮询要不要刷这些指标。
+                // （代价：item 变成 0 高、永远在视口里，于是"滚出视口就不再刷"这条不再生效 ——
+                //   现在只要总览 Tab 开着就一直刷。图表 Tab 有自己的登记，不受影响。）
             }
 
             item { Spacer(Modifier.height(Spacing.Medium)) }
 
-            // FIX-6：聚合/明细模式切换，与事件中心保持一致两 chip 默认聚合。
-            item(key = "overviewFilterChips") {
-                // 2026-08-31：两个手绘 FilterChip → 公共 UfiSingleChipSelector。
-                // 选中态由「实底 accent + onAccent 文字」变为公共基线「chipSelectedBg 淡底 + accent 文字」。
-                UfiSingleChipSelector(
-                    options = listOf("aggregate" to "按类型聚合", "detail" to "全部明细"),
-                    selectedValue = if (aggregateMode) "aggregate" else "detail",
-                    onSelect = { value ->
-                        aggregateMode = value == "aggregate"
-                        currentPage = 0
-                        detailTarget = null
-                    },
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                    wrapContent = true
-                )
+            // 2026-10-15（用户要求）：原「流量报表」入口**搬到流量管理页**去了。
+            // 它本来就是"流量"这件事的只读产物，与限额设置、流量历史同族；放在监控中心总览里，
+            // 与上面那张只统计"今天 00:00 起"的 hero 卡并列，反而要用户自己分辨两者的时间尺度。
+            // 现在入口在 `TrafficManagementScreen` 的限额设置卡里（紧跟「流量历史」）。
+
+            // 2026-10-23：头部一行替代原来的两排 chip —— 今天 N 条 · 未读 M · 事件中心 ›。
+            // 「事件中心 ›」仍按自身宽度贴右，窄屏/大字体下只会压缩左边的文字。
+            item(key = "todayHeader") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "今天",
+                        style = UfiTextStyles.panelTitleStrong,
+                        color = palette.textPrimary
+                    )
+                    Spacer(Modifier.width(Spacing.Medium))
+                    Text(
+                        text = "${aggregatedRows.size} 条",
+                        style = UfiTextStyles.caption,
+                        color = palette.textSecondary
+                    )
+                    if (todayUnread > 0) {
+                        Spacer(Modifier.width(Spacing.Medium))
+                        Surface(
+                            color = palette.error.copy(alpha = 0.12f),
+                            shape = UfiCardDefaults.pillShape
+                        ) {
+                            Text(
+                                text = "未读 $todayUnread",
+                                style = UfiTextStyles.captionStrong,
+                                color = palette.error,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                    Spacer(Modifier.weight(1f))
+                    MonitorEventsEntry(
+                        onClick = { navController.navigate(Routes.DETAIL_EVENTS) },
+                        modifier = Modifier.defaultMinSize(minHeight = Spacing.SegmentHeight)
+                    )
+                }
             }
 
+            // ↓↓↓ 以下是原来的两段 chip（已停用，保留原文仅供追溯；编译不参与）
             if (engineOff && todayAlerts.isEmpty()) {
                 // 引擎关着时事件列表必然是空的，而空态写的是「今日暂无异常事件」——
                 // 那句话在这种情况下是假的：不是没异常，是根本没在看。所以**整块换掉空态**，
@@ -541,34 +554,46 @@ private fun MonitorOverviewTabContent(
                     // 结果「今日暂无异常事件」被整屏空白顶到折叠以下，要再滚一屏才看得到。
                     UfiEmptyState(
                         icon = Icons.Default.CheckCircle,
-                        message = "今日暂无异常事件",
+                        message = "今天暂无异常事件",
                         modifier = Modifier.fillMaxWidth().padding(vertical = 48.dp)
                     )
                 }
-            } else if (aggregateMode) {
-                // 聚合视图：每行 = 类型 + 累计次数 + 最近时间 + 等级 chip；不显示具体 message。
+            } else {
+                // 2026-10-23：竖向时间轴 —— 每行 = 时刻 + 轴点 + 事件卡。
+                // 数据仍是按 (type, level) 聚合的行，按最近发生时间倒序；同一等级/类型多次会合成一行。
                 items(
-                    items = overviewSlice,
+                    items = aggregatedRows,
                     key = { "${it.type}-${it.level}" }
                 ) { row ->
-                    AggregatedAlertRowView(
+                    MonitorTimelineRow(
                         row = row,
-                        onClick = { detailTarget = row.type to row.level },
-                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
+                        onClick = { detailTarget = row.type to row.level }
                     )
                 }
-            } else {
-                // 明细视图：保留原 MonitorEventCard 逐条渲染（兼容用户想看详情的场景）。
-                items(
-                    items = todayAlerts,
-                    key = { it.id }
-                ) { alert ->
-                    com.ufi_axis.ui.components.MonitorEventCard(
-                        alert = alert,
-                        onAckOne = { id -> viewModel.dashboard.ackAlert(id) },
-                        onDelete = onDeleteAlert,
-                        modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin, vertical = 4.dp)
-                    )
+
+                // 收尾：替代原来的浮动分页条，明确"今天的数据到此为止"。
+                item(key = "todayTail") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        HorizontalDivider(
+                            modifier = Modifier.weight(1f),
+                            color = palette.divider
+                        )
+                        Text(
+                            text = "今天 00:00 起 · 共 ${todayAlerts.size} 条",
+                            style = UfiTextStyles.caption,
+                            color = palette.textSecondary,
+                            modifier = Modifier.padding(horizontal = Spacing.Medium)
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.weight(1f),
+                            color = palette.divider
+                        )
+                    }
                 }
             }
 
@@ -578,58 +603,6 @@ private fun MonitorOverviewTabContent(
             // ⇒ 胶囊重挂后发布真值时只重排这一个节点，不再整树重组（2026-09-05 P1）。
             item(key = "capsuleBottomInset") {
                 Spacer(Modifier.ufiCapsuleBottomInset(Spacing.Medium))
-            }
-        }
-
-        // 多页时显示浮动分页条（仅聚合模式生效，明细模式不分页）。
-        //
-        // 2026-09-05（P3）：可见性从恒真的 `AnimatedVisibility(visible = true)` 改为
-        // 与事件中心同一份 [rememberSmartPaginationBarVisible]。原写法外层已有
-        // `if (aggregateMode && overviewPageCount > 1)` 硬条件，里面再套 `visible = true`
-        // 就是个恒真壳：exit 永不触发，enter 在首次组合时也不播（visible 初值即 true），
-        // 两条 UfiMotion 规格是纯死代码。本页与事件中心的浮动分页条外观完全一致
-        // （同一个 [UfiPagination] 的 Floating 形态、同一档入离场规格、同样悬在底部），
-        // 可见性策略却一处自动隐藏、一处常显 —— 这正是本仓一直在收敛的那类不一致
-        // （见 UfiPagination.kt 的 2026-09-04 三合一注释）。统一后规格也真正接上了驱动。
-        if (aggregateMode && overviewPageCount > 1) {
-            val paginationBarVisible = rememberSmartPaginationBarVisible(
-                listState = listState,
-                currentPage = currentPage,
-                pageCount = overviewPageCount
-            )
-            AnimatedVisibility(
-                visible = paginationBarVisible,
-                // 2026-09-04（P2b）：入场原为裸 `tween(320)` → UfiMotion.Duration.Sweeping（同为 320，
-                // 零观感变化）；离场那行早已走 Duration.Base，两边现在都在梯度上。
-                enter = slideInVertically(initialOffsetY = { it }) + fadeIn(animationSpec = tween(UfiMotion.Duration.Sweeping)),
-                exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(animationSpec = tween(UfiMotion.Duration.Base)),
-                // ★ 2026-09-24（贴底通栏低栏，§5.21 / §7-2.9 ②）：抬升量从写死的 `-40.dp`
-                //   改为读底栏 inset（`Modifier.ufiCapsuleBottomLift`）。
-                //
-                //   -40dp 当年是对的：悬浮胶囊的窗口被 `y` 抬高 30dp，胶囊自己只有约 50dp 高且
-                //   浮在页面之上，本 Box（= 页壳内容区，底边已在「屏幕底边 − navigationBars」处）
-                //   往上 40dp 正好落在胶囊左右两侧的空档里，分页条与胶囊不重叠。
-                //   通栏低栏没有抬升、也没有左右空档：栏顶边现在在「58dp 内容 + 安全区」≈ 82~106dp 处，
-                //   40dp 的浮层整段落在栏后面 —— 被压住。
-                //
-                //   抬升量不写新数字，与 6 个列表末尾的底部留白同源（同一个
-                //   `capsuleBottomClearance`：底栏总高 − 页壳已消费的 navigationBars + 呼吸），
-                //   栏高/字号/导航模式变化时两者一起走。
-                modifier = Modifier.align(Alignment.BottomCenter).ufiCapsuleBottomLift(Spacing.Medium)
-            ) {
-                UfiPagination(
-                    currentPage = currentPage,
-                    pageCount = overviewPageCount,
-                    onPrev = { if (currentPage > 0) currentPage-- },
-                    onNext = { if (currentPage < overviewPageCount - 1) currentPage++ },
-                    modifier = Modifier
-                        .wrapContentWidth(Alignment.CenterHorizontally)
-                        .padding(horizontal = Spacing.CardHorizontalMargin),
-                    variant = UfiPaginationVariant.Floating,
-                    // 总览 Tab 没有跳页弹窗（原实现传的是空 lambda）：传 null 让页码退化为纯文本，
-                    // 不再是"点了没反应"的假按钮。
-                    onJumpClick = null
-                )
             }
         }
 
@@ -1146,18 +1119,31 @@ fun EventsCenterContent(viewModel: MainViewModel) {
     var sortMode by rememberSaveable { mutableStateOf(EventSortMode.TimeDesc) }
     var showSortDialog by remember { mutableStateOf(false) }
     var showFilterDialog by remember { mutableStateOf(false) }
-    var showPageSizeDialog by remember { mutableStateOf(false) }
-    var showJumpPageDialog by remember { mutableStateOf(false) }
     var eventDateKey by remember { mutableStateOf("all") }
     var eventCustomRange by remember { mutableStateOf<MonitorTimeRange.Custom?>(null) }
+
+    /**
+     * 日历里选中的那一天（yyyy-MM-dd，null = 不按天过滤）。
+     * 2026-10-23：事件中心改成「日历热力 + 当天时间轴」，默认选今天。
+     */
+    var selectedDayKey by rememberSaveable { mutableStateOf(localDayKey(System.currentTimeMillis())) }
+    /** 月历当前显示的月份（该月 1 日 00:00 的毫秒）。 */
+    var calendarMonthMs by rememberSaveable { mutableLongStateOf(localMonthStartMs(System.currentTimeMillis())) }
+    /** 月历 / 周条（2026-10-23）。 */
+    var calendarMode by rememberSaveable { mutableStateOf("month") }
+    var weekAnchorMs by rememberSaveable { mutableLongStateOf(System.currentTimeMillis()) }
+
 
     // FIX-3（2026-08-23）：事件中心列表"按类型聚合"模式开关。默认 true。
     // 此前每条 AlertRecord 单卡一行，导致 500+ 条堆叠、每张卡展示完整 message 冗余；
     // 改为默认按 (type, level) 聚合，每行仅显示"类型 + 累计次数 + 最近时间 + 等级 chip"，
     // 点击打开 UfiScrollableDialog 弹窗显示该类型具体事件，内置 20/页分页 + ack。
-    var aggregateMode by rememberSaveable { mutableStateOf(true) }
+
     // 弹窗展示哪个 (type, level) 的具体事件明细（null = 关闭）
     var detailTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
+    /** 底部详情 sheet 选中的那条事件（null = 关闭）。 */
+    var selectedAlert by remember { mutableStateOf<com.ufi_axis.data.model.AlertRecord?>(null) }
+
 
     LaunchedEffect(eventDateKey, eventCustomRange) {
         when (eventDateKey) {
@@ -1171,6 +1157,34 @@ fun EventsCenterContent(viewModel: MainViewModel) {
         }
     }
 
+    /** 兜底：按当前已加载的告警统计每天条数（接口失败时日历仍有数据）。 */
+    val localDayCounts = remember(monitorState.alerts) {
+        monitorState.alerts.groupingBy { localDayKey(it.timestamp) }.eachCount()
+    }
+    /** 服务端按天计数（2026-10-23 新增接口）：准确值，覆盖已加载之外的月份。 */
+    val remoteDayCounts by viewModel.dashboard.alertDailyCounts.collectAsState()
+    val dayCounts = if (remoteDayCounts.isNotEmpty()) remoteDayCounts else localDayCounts
+    LaunchedEffect(calendarMonthMs) {
+        viewModel.dashboard.loadAlertDailyCounts(
+            start = calendarMonthMs,
+            end = shiftMonth(calendarMonthMs, 1)
+        )
+    }
+    // 2026-10-23：选中某天时**按该日区间去拉数据**。
+    // 只做本地过滤会漏数据 —— loadAllAlerts() 只取一页（≤200 条），选到上个月时
+    // 那批记录根本没进内存，界面会误显示"这一天没有事件"。
+    LaunchedEffect(selectedDayKey) {
+        selectedDayKey?.let { key ->
+            val start = runCatching {
+                java.time.LocalDate.parse(key)
+                    .atStartOfDay(java.time.ZoneId.systemDefault())
+                    .toInstant().toEpochMilli()
+            }.getOrNull() ?: return@let
+            viewModel.dashboard.loadAlerts(
+                MonitorTimeRange.Custom(start, start + 86_400_000L - 1)
+            )
+        }
+    }
     val levelCounts = mapOf(
         "all" to monitorState.alerts.size,
         "warning" to monitorState.alerts.count { it.level == "warning" || it.level == "critical" },
@@ -1178,9 +1192,11 @@ fun EventsCenterContent(viewModel: MainViewModel) {
     )
     val filteredAlerts = remember(
         monitorState.alerts, eventLevelFilter, eventTypeFilter, eventReadFilter, sortMode,
-        eventDateKey, eventCustomRange
+        eventDateKey, eventCustomRange, selectedDayKey
     ) {
         var list = monitorState.alerts
+        // 日历选中日优先：它就是"当天列表"的数据源。
+        if (selectedDayKey != null) list = list.filter { localDayKey(it.timestamp) == selectedDayKey }
         when (eventDateKey) {
             "today" -> {
                 // 同上：todayStartMs() 提到 filter 外，避免每条告警 new 一个 Calendar
@@ -1212,67 +1228,9 @@ fun EventsCenterContent(viewModel: MainViewModel) {
         (if (eventTypeFilter != null) 1 else 0) + (if (eventReadFilter != "all") 1 else 0) +
         (if (eventDateKey != "all") 1 else 0)
 
-    var currentPage by remember { mutableIntStateOf(0) }
-    LaunchedEffect(eventLevelFilter, eventTypeFilter, eventReadFilter, eventDateKey, eventCustomRange, sortMode, pageSize) {
-        currentPage = 0
-    }
-    LaunchedEffect(pageSize) {
-        prefs.edit().putInt(KEY_EVENTS_PAGE_SIZE, pageSize).apply()
-    }
-    val pageStart = currentPage * pageSize
-    val pageAlerts = if (pageStart >= filteredAlerts.size) emptyList()
-        else filteredAlerts.subList(pageStart, kotlin.math.min(pageStart + pageSize, filteredAlerts.size))
-    val pageCount = ufiPageCount(filteredAlerts.size, pageSize)
-
-    // FIX-3：按 (type, level) 聚合（核心仅显示类型 + 次数 + 最近时间 + 等级 chip）。
-    // 重复 (type, level) 行核心会被 AlertEngine 聚合为 count>1，但同一 (type, normal) + (type, warning)
-    // 等多等级的同一类告警可能各自独立（正常现象），所以此处保持 (type, level) 二元聚合。
-    val aggregatedAlerts = remember(filteredAlerts, sortMode) {
-        filteredAlerts
-            .groupBy { it.type to it.level }
-            .map { (key, rows) ->
-                val (type, level) = key
-                val mostRecent = rows.maxOf { it.timestamp }
-                val unread = rows.count { !it.acknowledged }
-                AggregateAlertRow(
-                    type = type,
-                    level = level,
-                    count = rows.size,
-                    unread = unread,
-                    lastTimestampMs = mostRecent
-                )
-            }
-            .let { rows ->
-                when (sortMode) {
-                    EventSortMode.TimeDesc -> rows.sortedByDescending { it.lastTimestampMs }
-                    EventSortMode.TimeAsc -> rows.sortedBy { it.lastTimestampMs }
-                    EventSortMode.SeverityDesc -> rows.sortedWith(
-                        compareByDescending<AggregateAlertRow> { eventSeverityRank(it.level) }
-                            .thenByDescending { it.lastTimestampMs }
-                    )
-                    EventSortMode.SeverityAsc -> rows.sortedWith(
-                        compareBy<AggregateAlertRow> { eventSeverityRank(it.level) }
-                            .thenByDescending { it.lastTimestampMs }
-                    )
-                }
-            }
-    }
-    val aggPageCount = ufiPageCount(aggregatedAlerts.size, pageSize)
-    val aggPageStart = currentPage * pageSize
-    val aggPageSlice = if (aggPageStart >= aggregatedAlerts.size) emptyList()
-        else aggregatedAlerts.subList(aggPageStart, kotlin.math.min(aggPageStart + pageSize, aggregatedAlerts.size))
-    // FIX-3：当前明细模式的有效分页（明细/聚合两种模式都基于 currentPage，但分页计数不同；底部条用最大的那个）
-    // 当前模式下的**真实**总页数。2026-09-04 修 bug：这个值在收敛前是**死代码** —— 算出来了但
-    // 全库无人消费，分页栏/跳页弹窗/可见性/底部留白全部用的是明细口径 `pageCount`。
-    // 后果：500 条明细（25 页）而聚合只有 6 行（1 页）时，聚合模式下分页栏仍显示 "1 / 25" 且能翻到
-    // 第 25 页，`aggPageSlice` 从第 2 页起恒为空 → 渲染出一个空 Column（不是空态提示，因为空态判据
-    // 用的也是明细口径 `pageAlerts`，它非空）→ 用户看到一片纯白。
-    val effectivePageCount = if (aggregateMode) aggPageCount else pageCount
-    // 越界兜底：切模式、轮询刷新、删除事件都会让总页数缩小，`currentPage` 可能停在已不存在的页上。
-    // 总览 Tab 早就有这段（见 MonitorOverviewTabContent 的 overviewPageCount clamp），事件中心漏了。
-    LaunchedEffect(effectivePageCount) {
-        currentPage = ufiClampPage(currentPage, effectivePageCount)
-    }
+    /** 2026-10-23：改为滚动加载 —— 不再切片分页，全部过滤结果直接交给 LazyColumn。 */
+    val pageDayGroups: Map<String, List<com.ufi_axis.data.model.AlertRecord>> =
+        remember(filteredAlerts) { filteredAlerts.groupBy { localDayKey(it.timestamp) } }
 
     Box(Modifier.fillMaxSize()) {
         // 2026-09-08：由 Column(verticalScroll) 改为 LazyColumn —— 事件卡真正懒加载。
@@ -1280,68 +1238,107 @@ fun EventsCenterContent(viewModel: MainViewModel) {
         // 进入 Tab / 翻页 / 切筛选都要同步组合完才出画面，那正是"卡一下"的来源。
         // 头部（统计卡 + 模式切换 + 筛选行）内容是一整块、不需要各自回收，装在单个 item 里。
         val listState = rememberLazyListState()
-        val paginationBarVisible = rememberSmartPaginationBarVisible(
-            listState = listState,
-            currentPage = currentPage,
-            pageCount = effectivePageCount
-        )
-        LaunchedEffect(currentPage) {
-            // 翻页回顶部用瞬时 scrollToItem：animateScrollToItem 会让整页从旧位置"飞"回去，
-            // 观感与刷新动画无异（新一页的内容已经换好了，滚动过程只是延迟看到它）。
-            listState.scrollToItem(0)
-        }
-        val fabReservedBottom = if (effectivePageCount > 1) 56.dp else bottomPadding
+        val fabReservedBottom = bottomPadding
         LazyColumn(
             state = listState,
             modifier = Modifier
                 .fillMaxSize()
+
                 .padding(bottom = fabReservedBottom)
         ) {
             item(key = "eventsHeader") {
             Column {
             MonitorLoadingHint(visible = monitorState.isLoading && monitorState.alerts.isEmpty())
 
-            // 2026-09-05：错误横幅已移除，改由全局错误浮层统一展示（见本文件上方注释）。
-
-            MonitorEventStatCards(
-                alerts = monitorState.alerts,
-                modifier = Modifier.padding(horizontal = 16.dp)
+            // ── 日历热力（2026-10-23）：每格底色 = 当天事件量，点选某天看当天时间轴 ──
+            CalendarModeSwitch(
+                mode = calendarMode,
+                onToggle = { calendarMode = if (calendarMode == "month") "week" else "month" }
             )
-            Spacer(Modifier.height(6.dp))
+            // 2026-10-23：月/周切换加淡入淡出（Crossfade），不再瞬间替换。
+            // key 同时包含"月/周"与当前锚点：切月和切模式都有淡入淡出（2026-10-24）。
+            Crossfade(
+                targetState = calendarMode to
+                    (if (calendarMode == "month") calendarMonthMs else weekStartMs(weekAnchorMs)),
+                animationSpec = tween(220),
+                label = "calendarMode"
+            ) { target ->
+            // 旧/新两侧必须各自按 target 渲染：读外层 calendarMode 会让两边都渲染成新内容，
+            // 动画看起来就"没生效"（2026-10-24 修）。
+            val anchor = target.second
+            if (target.first == "month") {
+                AlertCalendarCard(
+                    monthStartMs = calendarMonthMs,
+                    dayCounts = dayCounts,
+                    selectedKey = selectedDayKey,
+                    onPrevMonth = { calendarMonthMs = shiftMonth(calendarMonthMs, -1) },
+                    onNextMonth = { calendarMonthMs = shiftMonth(calendarMonthMs, 1) },
+                    onSelectDay = { key ->
+                        // 兜底：即便某个格子漏了 enabled，未来日期也不接受（2026-10-24）。
+                        if (key <= localDayKey(System.currentTimeMillis())) selectedDayKey = key
+                    }
+                )
+            } else {
+                AlertWeekStrip(
+                    anchorMs = weekAnchorMs,
+                    dayCounts = dayCounts,
+                    selectedKey = selectedDayKey,
+                    onPrev = { weekAnchorMs = shiftDays(weekAnchorMs, -7) },
+                    onNext = { weekAnchorMs = shiftDays(weekAnchorMs, 7) },
+                    onSelectDay = { key ->
+                        // 兜底：即便某个格子漏了 enabled，未来日期也不接受（2026-10-24）。
+                        if (key <= localDayKey(System.currentTimeMillis())) selectedDayKey = key
+                    }
+                )
+            }
+            }
 
-            // FIX-3：聚合/明细模式切换。两 chip 一组，默认「按类型聚合」。
-            // 聚合视图：每行仅显示类型 + 累计次数 + 最近时间 + 等级 chip，悬于 5 Tab 顶部。
-            // 明细视图：恢复原有每条事件独立 MonitorEventCard 渲染（v20k 风格）。
-            // 2026-08-31：两个手绘 FilterChip → 公共 UfiSingleChipSelector（与本页概览 tab 同一套）
-            UfiSingleChipSelector(
-                options = listOf("aggregate" to "按类型聚合", "detail" to "全部明细"),
-                selectedValue = if (aggregateMode) "aggregate" else "detail",
-                // 切模式必须回第 1 页：两种模式的总页数口径完全不同（明细 25 页 / 聚合 1 页），
-                // 留在原页码会直接落到聚合模式不存在的页上，看到一片空白。
-                // 总览 Tab 的同名切换器一直有这句（见 :463 附近），事件中心此前漏了。
-                onSelect = { value ->
-                    aggregateMode = value == "aggregate"
-                    currentPage = 0
-                },
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
-                wrapContent = true
-            )
-
+            // 当天头部：日期 + 条数 + 未读 + 全部已读 / 回到今天
             Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "筛选结果 · ${filteredAlerts.size}",
-                    style = UfiTextStyles.panelTitle.copy(fontWeight = UfiWeight.Emphasis),
-                    color = palette.textPrimary,
-                    modifier = Modifier.weight(1f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                val dayLabel = selectedDayKey?.let { key ->
+                    val ms = java.time.LocalDate.parse(key)
+                        .atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                    localDayLabel(ms)
+                } ?: "全部事件"
+                Text(dayLabel, style = UfiTextStyles.panelTitleStrong, color = palette.textPrimary)
+                Spacer(Modifier.width(Spacing.Medium))
+                Text("${filteredAlerts.size} 条", style = UfiTextStyles.caption, color = palette.textSecondary)
+                val unreadToday = filteredAlerts.count { !it.acknowledged }
+                if (unreadToday > 0) {
+                    Spacer(Modifier.width(Spacing.Medium))
+                    Surface(color = palette.error.copy(alpha = 0.12f), shape = UfiCardDefaults.pillShape) {
+                        Text(
+                            text = "未读 $unreadToday",
+                            style = UfiTextStyles.captionStrong,
+                            color = palette.error,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                if (selectedDayKey != localDayKey(System.currentTimeMillis())) {
+                    TextButton(onClick = { selectedDayKey = localDayKey(System.currentTimeMillis()) }) {
+                        Text("回到今天", style = MaterialTheme.typography.labelLarge, color = palette.accent)
+                    }
+                }
+            }
+
+            // 2026-10-23：对齐 S4 预览 —— 去掉统计卡、"筛选结果"行、排序/日期小字、等级 chips
+            // （这些是旧版事件中心的三层工具，视觉上与日历+时间轴重复）。
+            // 顶部只留两个图标入口：筛选（带角标）与排序；批量已读收在筛选左侧的弹层里。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.End
+            ) {
                 if (monitorState.alerts.any { !it.acknowledged }) {
-                    // 「全部已读」原来是裸 TextButton；2026-08-30 加了「确认已恢复」之后
-                    // 这一行放不下两个文字按钮 + 筛选，所以合并成一个锚点菜单。
                     UfiPopupAnchor(
                         options = listOf(
                             UfiPopupOption(
@@ -1356,8 +1353,6 @@ fun EventsCenterContent(viewModel: MainViewModel) {
                                 icon = Icons.Filled.CheckCircle,
                                 onClick = {
                                     scope.launch {
-                                        // 仍在持续的告警保持未读 —— 只清"问题已经消失"的那些，
-                                        // 所以不需要二次确认，它不会掩盖当前故障。
                                         val updated = viewModel.dashboard.ackResolvedAlerts()
                                         toastMessage = when {
                                             updated == null -> ToastMessage("确认失败，请重试", ToastType.ERROR)
@@ -1375,84 +1370,17 @@ fun EventsCenterContent(viewModel: MainViewModel) {
                     }
                     Spacer(Modifier.width(4.dp))
                 }
-                OutlinedButton(
-                    onClick = { showFilterDialog = true },
-                    shape = UfiCardDefaults.buttonShape,
-                    border = BorderStroke(1.dp, if (activeFilterCount > 0) palette.accent else palette.divider),
-                    colors = if (activeFilterCount > 0) {
-                        ButtonDefaults.outlinedButtonColors(containerColor = palette.accent, contentColor = palette.onAccent)
-                    } else {
-                        ButtonDefaults.outlinedButtonColors(contentColor = palette.accent)
-                    },
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp)
-                ) {
-                    Icon(Icons.Filled.Tune, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(4.dp))
-                    Text("筛选", style = MaterialTheme.typography.labelLarge)
-                    if (activeFilterCount > 0) {
-                        Spacer(Modifier.width(4.dp))
-                        Box(
-                            modifier = Modifier.size(18.dp).clip(CircleShape).background(palette.error),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                if (activeFilterCount > 9) "9+" else activeFilterCount.toString(),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = Color.White
-                            )
-                        }
-                    }
-                }
-                Spacer(Modifier.width(8.dp))
-                MonitorSortButton(sortMode = sortMode, onClick = { showSortDialog = true })
+                EventToolIcon(
+                    icon = Icons.Filled.Tune,
+                    description = "筛选",
+                    active = activeFilterCount > 0,
+                    badge = activeFilterCount,
+                    onClick = { showFilterDialog = true }
+                )
                 Spacer(Modifier.width(6.dp))
-                EventsSettingsButton(onClick = { showPageSizeDialog = true })
+                MonitorSortButton(sortMode = sortMode, onClick = { showSortDialog = true })
             }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                text = eventSortModeLabel(sortMode),
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.textSecondary,
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
-            Text(
-                text = "日期 · " + when (eventDateKey) {
-                    "all" -> "全部"
-                    "today" -> "今天"
-                    "yesterday" -> "昨天"
-                    "7d" -> "近 7 天"
-                    "custom" -> eventCustomRange?.let { alertRangeLabel(it) } ?: "自定义"
-                    else -> "全部"
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.textSecondary,
-                modifier = Modifier.padding(horizontal = 16.dp)
-            )
-            Spacer(Modifier.height(6.dp))
-
-            Row(
-                modifier = Modifier.padding(horizontal = Spacing.CardHorizontalMargin),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                MonitorLevelFilter(
-                    selectedValue = if (eventReadFilter == "unread") "" else eventLevelFilter,
-                    onSelect = {
-                        eventLevelFilter = it
-                        eventReadFilter = "all"
-                    },
-                    counts = levelCounts
-                )
-                Spacer(Modifier.width(8.dp))
-                EventUnreadChip(
-                    unreadCount = monitorState.alerts.count { !it.acknowledged },
-                    selected = eventReadFilter == "unread",
-                    onSelect = {
-                        eventReadFilter = if (eventReadFilter == "unread") "all" else "unread"
-                        eventLevelFilter = "all"
-                    }
-                )
-            }
-            Spacer(Modifier.height(Spacing.Small))
+            Spacer(Modifier.height(2.dp))
             }   // header Column
             }   // item("eventsHeader")
 
@@ -1464,90 +1392,61 @@ fun EventsCenterContent(viewModel: MainViewModel) {
                 item(key = "emptyAll") {
                     UfiEmptyState(
                         icon = Icons.Default.Inbox,
-                        message = "暂无符合条件的事件",
+                        message = when {
+                            selectedDayKey != null -> "这一天没有事件"
+                            activeFilterCount > 0 -> "没有符合筛选条件的事件"
+                            else -> "今天暂无异常事件"
+                        },
                         hint = "调整筛选条件试试",
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-            } else if (pageAlerts.isEmpty()) {
-                item(key = "emptyPage") {
-                    UfiEmptyState(
-                        icon = Icons.Default.Inbox,
-                        message = "本页无事件",
-                        hint = "切换到第 1 页查看",
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            } else if (aggregateMode) {
-                // FIX-3：按 (type, level) 聚合视图。每行仅显示类型 + 累计次数 + 最近时间 + 等级 chip。
-                // 点击 → detailTarget = (type, level) → AlertTypeDetailDialog 弹出具体事件 + 内置分页。
-                items(aggPageSlice, key = { "${it.type}|${it.level}" }) { row ->
-                    AggregatedAlertRowView(
-                        row = row,
-                        onClick = { detailTarget = row.type to row.level },
-                        modifier = Modifier
-                            .padding(horizontal = Spacing.CardHorizontalMargin)
-                            .padding(vertical = 4.dp)
-                    )
-                }
             } else {
-                val start = currentPage * pageSize
-                val slice = if (start >= filteredAlerts.size) emptyList()
-                    else filteredAlerts.subList(start, kotlin.math.min(start + pageSize, filteredAlerts.size))
-                items(slice, key = { it.id }) { alert ->
-                    MonitorEventCard(
-                        alert = alert,
-                        onAckOne = { id -> viewModel.dashboard.ackAlert(id) },
-                        onDelete = { id -> pendingDeleteAlertId = id },
-                        modifier = Modifier.padding(
-                            horizontal = Spacing.CardHorizontalMargin,
-                            vertical = 4.dp
+                // 2026-10-23（S4 时间轴）：按天分组，每条事件落在自己的时刻上。
+                // 之前这里有「聚合 / 明细」两条分支，聚合行没有独立时刻，不能放时间轴。
+                pageDayGroups.forEach { (dayKey, dayAlerts) ->
+                    item(key = "day-$dayKey") {
+                        EventDayHeader(
+                            label = localDayLabel(dayAlerts.first().timestamp),
+                            count = dayAlerts.size,
+                            unread = dayAlerts.count { !it.acknowledged }
                         )
+                    }
+                    items(dayAlerts, key = { it.id }) { alert ->
+                        EventTimelineRow(
+                            alert = alert,
+                            onClick = { selectedAlert = alert },
+                            onLongClick = { pendingDeleteAlertId = alert.id }
+                        )
+                    }
+                }
+                item(key = "eventsTail") {
+                    Text(
+                        text = "已显示全部 ${filteredAlerts.size} 条",
+                        style = UfiTextStyles.caption,
+                        color = palette.textSecondary,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp)
                     )
                 }
             }
         }
 
-        AnimatedVisibility(
-            visible = paginationBarVisible,
-            // 2026-09-04（P2b）：入场原为裸 `tween(320)` → UfiMotion.Duration.Sweeping（同为 320，
-            // 零观感变化）。与上方聚合模式那份分页条保持同一档。
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(animationSpec = tween(UfiMotion.Duration.Sweeping)),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(animationSpec = tween(UfiMotion.Duration.Base)),
-            modifier = Modifier.align(Alignment.BottomCenter).offset(y = (-40).dp)
-        ) {
-            UfiPagination(
-                currentPage = currentPage,
-                pageCount = effectivePageCount,
-                onPrev = { if (currentPage > 0) currentPage-- },
-                onNext = { if (currentPage < effectivePageCount - 1) currentPage++ },
-                modifier = Modifier
-                    .wrapContentWidth(Alignment.CenterHorizontally)
-                    .padding(horizontal = Spacing.CardHorizontalMargin),
-                variant = UfiPaginationVariant.Floating,
-                onJumpClick = { showJumpPageDialog = true }
+
+        selectedAlert?.let { alert ->
+            EventDetailSheet(
+                alert = alert,
+                onDismiss = { selectedAlert = null },
+                onAck = {
+                    viewModel.dashboard.ackAlert(alert.id)
+                    selectedAlert = null
+                },
+                onDelete = {
+                    pendingDeleteAlertId = alert.id
+                    selectedAlert = null
+                }
             )
         }
-
-        PageSizeSettingsDialog(
-            visible = showPageSizeDialog,
-            current = pageSize,
-            onConfirm = { newSize ->
-                if (newSize != pageSize) pageSize = newSize
-                showPageSizeDialog = false
-            },
-            onDismiss = { showPageSizeDialog = false }
-        )
-        JumpPageDialog(
-            visible = showJumpPageDialog,
-            pageCount = effectivePageCount,
-            onConfirm = { target ->
-                val clamped = target.coerceIn(1, pageCount)
-                currentPage = clamped - 1
-                showJumpPageDialog = false
-            },
-            onDismiss = { showJumpPageDialog = false }
-        )
 
         MonitorSortDialog(
             visible = showSortDialog,
@@ -2435,6 +2334,710 @@ private fun JumpPageDialog(
                 label = "页码 (1 - $pageCount)",
                 maxLength = 4
             )
+        }
+    }
+}
+/**
+ * 总览时间轴的一行（2026-10-23）：时刻列 + 轴点 + 事件卡。
+ *
+ * 数据是 [AggregateAlertRow]（一类事件 + 一个等级聚合后的行），所以只呈现
+ * 类型 / 等级 / 次数 / 未读，**不编造值或阈值** —— 那些在点开的明细弹窗里。
+ * 未读 = 实心圆点（颜色=等级），已读 = 空心点。
+ */
+@Composable
+private fun MonitorTimelineRow(
+    row: AggregateAlertRow,
+    onClick: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val unread = row.unread > 0
+    val levelColor = when (row.level) {
+        "critical" -> palette.error
+        "warning" -> palette.warning
+        else -> palette.success
+    }
+    val levelText = when (row.level) {
+        "critical" -> "严重"
+        "warning" -> "警告"
+        else -> "提示"
+    }
+    val timeText = remember(row.lastTimestampMs) {
+        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(row.lastTimestampMs))
+    }
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = timeText,
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+            color = palette.textSecondary,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(40.dp).padding(top = 12.dp)
+        )
+        Box(
+            modifier = Modifier.width(24.dp).fillMaxHeight(),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Box(Modifier.width(1.dp).fillMaxHeight().background(palette.divider))
+            Box(
+                Modifier
+                    .padding(top = 14.dp)
+                    .size(9.dp)
+                    .clip(CircleShape)
+                    .background(if (unread) levelColor else palette.cardBg)
+                    .then(
+                        if (unread) Modifier
+                        else Modifier.border(1.5.dp, palette.divider, CircleShape)
+                    )
+            )
+        }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 8.dp, end = Spacing.CardHorizontalMargin, bottom = 10.dp)
+                .clip(UfiCardDefaults.shape)
+                .background(palette.cardBg)
+                .border(1.dp, palette.divider, UfiCardDefaults.shape)
+                .clickable(onClick = onClick)
+                .padding(horizontal = 12.dp, vertical = 10.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = alertTypeLabel(row.type),
+                    style = UfiTextStyles.sectionTitle,
+                    color = palette.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Spacer(Modifier.width(Spacing.Medium))
+                Surface(
+                    color = levelColor.copy(alpha = 0.12f),
+                    shape = UfiCardDefaults.pillShape
+                ) {
+                    Text(
+                        text = levelText,
+                        style = UfiTextStyles.caption,
+                        color = levelColor,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = if (unread) {
+                    "发生 ${row.count} 次 · 未读 ${row.unread} 条"
+                } else {
+                    "发生 ${row.count} 次 · 全部已读"
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary
+            )
+        }
+    }
+}
+// ───────────────────────────────────────────────────────────
+// 2026-10-23（S4）：事件中心时间轴的日期分组与行
+// ───────────────────────────────────────────────────────────
+
+/** 本地日期键（yyyy-MM-dd），仅用于分组。 */
+private fun localDayKey(ts: Long): String =
+    SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(ts))
+
+/** 日期展示：今天 / 昨天 / M月d日。 */
+private fun localDayLabel(ts: Long): String {
+    val cal = Calendar.getInstance().apply { timeInMillis = ts }
+    val today = Calendar.getInstance()
+    val sameYear = cal.get(Calendar.YEAR) == today.get(Calendar.YEAR)
+    val dayDiff = today.get(Calendar.DAY_OF_YEAR) - cal.get(Calendar.DAY_OF_YEAR)
+    return when {
+        today.get(Calendar.YEAR) == cal.get(Calendar.YEAR) && dayDiff == 0 -> "今天"
+        today.get(Calendar.YEAR) == cal.get(Calendar.YEAR) && dayDiff == 1 -> "昨天"
+        sameYear -> SimpleDateFormat("M月d日", Locale.getDefault()).format(Date(ts))
+        else -> SimpleDateFormat("yyyy年M月d日", Locale.getDefault()).format(Date(ts))
+    }
+}
+
+/** 日期分组头：日期 + 条数 + 未读徽标。 */
+@Composable
+private fun EventDayHeader(label: String, count: Int, unread: Int) {
+    val palette = LocalResolvedPalette.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, style = UfiTextStyles.panelTitleStrong, color = palette.textPrimary)
+        Spacer(Modifier.width(Spacing.Medium))
+        Text("$count 条", style = UfiTextStyles.caption, color = palette.textSecondary)
+        if (unread > 0) {
+            Spacer(Modifier.width(Spacing.Medium))
+            Surface(color = palette.error.copy(alpha = 0.12f), shape = UfiCardDefaults.pillShape) {
+                Text(
+                    text = "未读 $unread",
+                    style = UfiTextStyles.captionStrong,
+                    color = palette.error,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 时间轴的一行：时刻列 + 轴点 + 事件卡（2026-10-23，S4）。
+ *
+ * 与预览的差异（实现时修正）：预览里每行副行写的是"当天 N 次"，那是把聚合信息混进了单条事件 ——
+ * 时间轴一行必须是**一条事件**，所以副行只写它自己的"当前值 / 阈值"（没有则用 message）。
+ * 未读 = 实心轴点，已读 = 空心轴点；点击标记已读，长按删除。
+ */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+@Composable
+private fun EventTimelineRow(
+    alert: com.ufi_axis.data.model.AlertRecord,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val unread = !alert.acknowledged
+    val levelColor = when (alert.level) {
+        "critical" -> palette.error
+        "warning" -> palette.warning
+        else -> palette.success
+    }
+    val levelText = when (alert.level) {
+        "critical" -> "严重"
+        "warning" -> "警告"
+        else -> "提示"
+    }
+    val timeText = remember(alert.timestamp) {
+        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(alert.timestamp))
+    }
+    val detail = if (alert.value.isNotBlank() && alert.threshold.isNotBlank()) {
+        "${alert.value} / 阈值 ${alert.threshold}"
+    } else {
+        alert.message
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = timeText,
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+            color = palette.textSecondary,
+            textAlign = TextAlign.End,
+            modifier = Modifier.width(40.dp).padding(top = 11.dp)
+        )
+        Box(
+            modifier = Modifier.width(24.dp).fillMaxHeight(),
+            contentAlignment = Alignment.TopCenter
+        ) {
+            Box(Modifier.width(1.dp).fillMaxHeight().background(palette.divider))
+            Box(
+                Modifier
+                    .padding(top = 13.dp)
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(if (unread) levelColor else palette.cardBg)
+                    .then(
+                        if (unread) Modifier
+                        else Modifier.border(1.5.dp, palette.divider, CircleShape)
+                    )
+            )
+        }
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .padding(start = 8.dp, end = Spacing.CardHorizontalMargin, bottom = 8.dp)
+                .clip(UfiCardDefaults.shape)
+                .background(palette.cardBg)
+                .border(1.dp, palette.divider, UfiCardDefaults.shape)
+                .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                .padding(horizontal = 12.dp, vertical = 9.dp)
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    text = alertTypeLabel(alert.type),
+                    style = UfiTextStyles.sectionTitle,
+                    color = palette.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false)
+                )
+                Spacer(Modifier.width(Spacing.Medium))
+                Surface(color = levelColor.copy(alpha = 0.12f), shape = UfiCardDefaults.pillShape) {
+                    Text(
+                        text = levelText,
+                        style = UfiTextStyles.caption,
+                        color = levelColor,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                }
+            }
+            Text(
+                text = detail,
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+    }
+}
+/** 当月 1 日 00:00 的毫秒。 */
+private fun localMonthStartMs(ts: Long): Long = Calendar.getInstance().apply {
+    timeInMillis = ts
+    set(Calendar.DAY_OF_MONTH, 1)
+    set(Calendar.HOUR_OF_DAY, 0)
+    set(Calendar.MINUTE, 0)
+    set(Calendar.SECOND, 0)
+    set(Calendar.MILLISECOND, 0)
+}.timeInMillis
+
+/** 月份平移（delta 为月数）。 */
+private fun shiftMonth(monthStartMs: Long, delta: Int): Long =
+    Calendar.getInstance().apply {
+        timeInMillis = monthStartMs
+        add(Calendar.MONTH, delta)
+    }.timeInMillis
+
+/**
+ * 日历热力卡（2026-10-23）：每格底色 = 当天事件量（按当前已加载告警计算）。
+ *
+ * 为什么不用取模的固定色阶：最大值的格子要能随数据缩放，否则事件少时整月都是浅色、
+ * 事件多时又全黑。这里按 maxCount 线性映射到 0..50% 的 accent 混色。
+ */
+@Composable
+private fun AlertCalendarCard(
+    monthStartMs: Long,
+    dayCounts: Map<String, Int>,
+    selectedKey: String?,
+    onPrevMonth: () -> Unit,
+    onNextMonth: () -> Unit,
+    onSelectDay: (String) -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val monthCal = remember(monthStartMs) {
+        Calendar.getInstance().apply {
+            timeInMillis = monthStartMs
+            set(Calendar.DAY_OF_MONTH, 1)
+        }
+    }
+    val year = monthCal.get(Calendar.YEAR)
+    val month = monthCal.get(Calendar.MONTH)
+    val daysInMonth = monthCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+    // 周一=0 … 周日=6
+    val firstOffset = (monthCal.get(Calendar.DAY_OF_WEEK) + 5) % 7
+    val monthPrefix = String.format(Locale.US, "%04d-%02d-", year, month + 1)
+    val monthTotal = dayCounts.filterKeys { it.startsWith(monthPrefix) }.values.sum()
+    val maxCount = (dayCounts.filterKeys { it.startsWith(monthPrefix) }.values.maxOrNull() ?: 0)
+        .coerceAtLeast(1)
+    val todayKey = localDayKey(System.currentTimeMillis())
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .animateContentSize(animationSpec = tween(200))
+            .clip(UfiCardDefaults.shape)
+            .background(palette.cardBg)
+            .border(1.dp, palette.divider, UfiCardDefaults.shape)
+            .padding(12.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = SimpleDateFormat("yyyy 年 M 月", Locale.getDefault()).format(monthCal.time),
+                style = UfiTextStyles.sectionTitle,
+                color = palette.textPrimary
+            )
+            Spacer(Modifier.width(Spacing.Medium))
+            Text("$monthTotal 条", style = UfiTextStyles.caption, color = palette.textSecondary)
+            Spacer(Modifier.weight(1f))
+            CalendarNavButton("‹", onPrevMonth)
+            Spacer(Modifier.width(6.dp))
+            CalendarNavButton(
+                "›",
+                onNextMonth,
+                enabled = shiftMonth(monthStartMs, 1) <= localMonthStartMs(System.currentTimeMillis())
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth()) {
+            listOf("一", "二", "三", "四", "五", "六", "日").forEach { d ->
+                Text(
+                    text = d,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.textSecondary,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+        Spacer(Modifier.height(4.dp))
+        val totalCells = firstOffset + daysInMonth
+        // 按需行数 + 卡片高度动画：既不出现空行，也不在切月时抽搐（2026-10-24）。
+        val weeks = (totalCells + 6) / 7
+        repeat(weeks) { w ->
+            Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                repeat(7) { i ->
+                    val cellIndex = w * 7 + i
+                    val day = cellIndex - firstOffset + 1
+                    if (day in 1..daysInMonth) {
+                        val key = String.format(Locale.US, "%04d-%02d-%02d", year, month + 1, day)
+                        // 2026-10-23：未来日期不可选（选了也没有事件，只是空页）。
+                        val isFuture = key > todayKey
+                        val count = dayCounts[key] ?: 0
+                        val t = if (count == 0) 0f else (count.toFloat() / maxCount) * 0.28f
+                        val cellBg = when {
+                            isFuture -> palette.pageBg
+                            key == selectedKey -> palette.accent.copy(alpha = 0.18f)
+                            else -> lerp(palette.cardBg, palette.accent, t)
+                        }
+                        val onDark = t > 0.2f
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(38.dp)
+                                .padding(horizontal = 2.dp)
+                                .clip(UfiCardDefaults.smallShape)
+                                .background(cellBg)
+                                .then(
+                                    if (key == selectedKey) {
+                                        Modifier.border(2.dp, palette.accent, UfiCardDefaults.smallShape)
+                                    } else Modifier
+                                )
+                                .clickable(enabled = !isFuture) { onSelectDay(key) },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = day.toString(),
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = FontFamily.Monospace
+                                    ),
+                                    color = when {
+                                        isFuture -> palette.textSecondary.copy(alpha = 0.35f)
+                                        onDark -> palette.onAccent
+                                        else -> palette.textPrimary
+                                    }
+                                )
+                                if (count > 0) {
+                                    Text(
+                                        text = count.toString(),
+                                        style = UfiTextStyles.captionTiny,
+                                        color = if (onDark) palette.onAccent.copy(alpha = 0.85f)
+                                        else palette.textSecondary
+                                    )
+                                } else if (key == todayKey) {
+                                    Box(
+                                        Modifier
+                                            .padding(top = 1.dp)
+                                            .size(3.dp)
+                                            .clip(CircleShape)
+                                            .background(palette.accent)
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Spacer(Modifier.weight(1f).height(38.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalendarNavButton(text: String, onClick: () -> Unit, enabled: Boolean = true) {
+    val palette = LocalResolvedPalette.current
+    Box(
+        modifier = Modifier
+            .size(28.dp)
+            .clip(UfiCardDefaults.smallShape)
+            .background(palette.pageBg)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(text, style = MaterialTheme.typography.labelLarge, color = if (enabled) palette.textSecondary else palette.textSecondary.copy(alpha = 0.3f))
+    }
+}
+/**
+ * 单条事件的详情弹窗（2026-10-23，S4）。
+ *
+ * 原本做成底部 sheet，改为**居中公共弹窗**：内容只有 4 行 + 2 个动作，sheet 的拇指可达优势用不上，
+ * 而公共 `UfiScrollableDialog` 自带窗口模糊/压暗、退场时序、以及「弹窗在场时隐藏胶囊底栏」的广播
+ * —— 自绘 sheet 这三样都要手写，且与删除确认框（本来就是居中弹窗）形态不一致。
+ */
+@Composable
+private fun EventDetailSheet(
+    alert: com.ufi_axis.data.model.AlertRecord,
+    onDismiss: () -> Unit,
+    onAck: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val levelColor = when (alert.level) {
+        "critical" -> palette.error
+        "warning" -> palette.warning
+        else -> palette.success
+    }
+    val timeFmt = remember { SimpleDateFormat("M月d日 HH:mm", Locale.getDefault()) }
+    UfiScrollableDialog(
+        visible = true,
+        onDismiss = onDismiss,
+        title = alertTypeLabel(alert.type),
+        showCloseButton = true,
+        actions = {
+            UfiDialogActions(
+                onDismiss = onDismiss,
+                onConfirm = onAck,
+                confirmText = if (alert.acknowledged) "已读" else "标记已读",
+                dismissText = "关闭",
+                enabled = !alert.acknowledged
+            )
+        }
+    ) {
+        UfiDialogBody {
+            SheetRow("等级", when (alert.level) {
+                "critical" -> "严重"
+                "warning" -> "警告"
+                else -> "提示"
+            })
+            SheetRow("时间", timeFmt.format(Date(alert.timestamp)))
+            if (alert.value.isNotBlank() || alert.threshold.isNotBlank()) {
+                SheetRow("当前 / 阈值", "${alert.value.ifBlank { "—" }} / ${alert.threshold.ifBlank { "—" }}")
+            }
+            SheetRow("发生次数", "${alert.count} 次")
+            SheetRow("状态", if (alert.acknowledged) "已读" else "未读")
+            SheetRow("说明", alert.message)
+            TextButton(onClick = onDelete, modifier = Modifier.fillMaxWidth()) {
+                Text("删除这条事件", color = palette.error, style = MaterialTheme.typography.labelLarge)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetRow(label: String, value: String) {
+    val palette = LocalResolvedPalette.current
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(label, style = UfiTextStyles.note, color = palette.textSecondary, modifier = Modifier.width(88.dp))
+        Text(value, style = UfiTextStyles.note, color = palette.textPrimary, modifier = Modifier.weight(1f))
+    }
+}
+// ───────────────────────────────────────────────────────────
+// 2026-10-23：月历 / 周条切换
+// ───────────────────────────────────────────────────────────
+
+/** 平移 N 天（按本地日历年，跨月/跨年安全）。 */
+private fun shiftDays(ms: Long, days: Int): Long =
+    Calendar.getInstance().apply {
+        timeInMillis = ms
+        add(Calendar.DAY_OF_YEAR, days)
+    }.timeInMillis
+
+/** 所在周的周一 00:00。 */
+private fun weekStartMs(ms: Long): Long = Calendar.getInstance().apply {
+    timeInMillis = ms
+    set(Calendar.HOUR_OF_DAY, 0)
+    set(Calendar.MINUTE, 0)
+    set(Calendar.SECOND, 0)
+    set(Calendar.MILLISECOND, 0)
+    val iso = get(Calendar.DAY_OF_WEEK)
+    val offset = if (iso == Calendar.SUNDAY) 6 else iso - Calendar.MONDAY
+    add(Calendar.DAY_OF_YEAR, -offset)
+}.timeInMillis
+
+/** 月/周分段：做成等宽两段的胶囊轨道，贴在日历卡上方（不再是一个孤零零的文字按钮）。 */
+@Composable
+private fun CalendarModeSwitch(mode: String, onToggle: () -> Unit) {
+    val palette = LocalResolvedPalette.current
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.End,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(UfiCardDefaults.pillShape)
+                .background(palette.pageBg)
+                .padding(2.dp)
+        ) {
+            listOf("month" to "月历", "week" to "周条").forEach { (value, label) ->
+                val on = mode == value
+                Box(
+                    modifier = Modifier
+                        .clip(UfiCardDefaults.pillShape)
+                        .background(if (on) palette.cardBg else Color.Transparent)
+                        .clickable { if (!on) onToggle() }
+                        .padding(horizontal = 14.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text = label,
+                        style = UfiTextStyles.captionStrong,
+                        color = if (on) palette.textPrimary else palette.textSecondary
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 周条：头部一行「日期范围 + ‹ ›」，下面 7 个等宽格子。
+ *
+ * 之前把 ‹ › 塞在 7 个格子的两端，格子被压到 40dp 以下、文字挤在一起 —— 导航与内容分开排。
+ */
+@Composable
+private fun AlertWeekStrip(
+    anchorMs: Long,
+    dayCounts: Map<String, Int>,
+    selectedKey: String?,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onSelectDay: (String) -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    val start = remember(anchorMs) { weekStartMs(anchorMs) }
+    val todayKey = localDayKey(System.currentTimeMillis())
+    val keys = remember(start) { (0..6).map { localDayKey(start + it * 86_400_000L) } }
+    val maxCount = (keys.mapNotNull { dayCounts[it] }.maxOrNull() ?: 0).coerceAtLeast(1)
+    val weekTotal = keys.sumOf { dayCounts[it] ?: 0 }
+    val rangeText = runCatching {
+        val fmt = SimpleDateFormat("M月d日", Locale.getDefault())
+        "${fmt.format(Date(start))} – ${fmt.format(Date(start + 6 * 86_400_000L))}"
+    }.getOrDefault("本周")
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp)
+            .clip(UfiCardDefaults.shape)
+            .background(palette.cardBg)
+            .border(1.dp, palette.divider, UfiCardDefaults.shape)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(rangeText, style = UfiTextStyles.sectionTitle, color = palette.textPrimary)
+            Spacer(Modifier.width(Spacing.Medium))
+            Text("$weekTotal 条", style = UfiTextStyles.caption, color = palette.textSecondary)
+            Spacer(Modifier.weight(1f))
+            CalendarNavButton("‹", onPrev)
+            Spacer(Modifier.width(6.dp))
+            CalendarNavButton(
+                "›",
+                onNext,
+                enabled = shiftDays(weekStartMs(anchorMs), 7) <= System.currentTimeMillis()
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(Modifier.fillMaxWidth()) {
+            keys.forEachIndexed { index, key ->
+                val count = dayCounts[key] ?: 0
+                val isFuture = key > todayKey
+                val selected = !isFuture && key == selectedKey
+                val t = if (count == 0) 0f else (count.toFloat() / maxCount) * 0.28f
+                val cellBg = when {
+                    selected -> palette.accent
+                    count == 0 -> palette.pageBg
+                    else -> lerp(palette.cardBg, palette.accent, t)
+                }
+                val contentColor = when {
+                    isFuture -> palette.textSecondary.copy(alpha = 0.35f)
+                    selected -> palette.onAccent
+                    t > 0.2f -> palette.onAccent
+                    else -> palette.textPrimary
+                }
+                val subColor = when {
+                    isFuture -> palette.textSecondary.copy(alpha = 0.3f)
+                    selected -> palette.onAccent.copy(alpha = 0.85f)
+                    else -> palette.textSecondary
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 2.dp)
+                        .clip(UfiCardDefaults.smallShape)
+                        .background(cellBg)
+                        .clickable(enabled = !isFuture) { onSelectDay(key) }
+                        .padding(vertical = 9.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = listOf("一", "二", "三", "四", "五", "六", "日")[index],
+                        style = MaterialTheme.typography.labelSmall,
+                        color = subColor
+                    )
+                    Text(
+                        text = key.takeLast(2),
+                        style = MaterialTheme.typography.titleMedium.copy(fontFamily = FontFamily.Monospace),
+                        color = contentColor
+                    )
+                    Text(
+                        text = if (count > 0) "$count" else if (key == todayKey) "·" else " ",
+                        style = UfiTextStyles.captionTiny,
+                        color = subColor
+                    )
+                }
+            }
+        }
+    }
+}
+/** 事件中心右上角的工具图标（筛选）：激活时实底 + 数字角标。 */
+@Composable
+private fun EventToolIcon(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    active: Boolean,
+    badge: Int,
+    onClick: () -> Unit
+) {
+    val palette = LocalResolvedPalette.current
+    Box(
+        modifier = Modifier
+            .size(34.dp)
+            .clip(UfiCardDefaults.smallShape)
+            .background(if (active) palette.accent else palette.pageBg)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = description,
+            tint = if (active) palette.onAccent else palette.textSecondary,
+            modifier = Modifier.size(18.dp)
+        )
+        if (badge > 0) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(2.dp)
+                    .size(14.dp)
+                    .clip(CircleShape)
+                    .background(palette.error),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = if (badge > 9) "9" else badge.toString(),
+                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 9.sp),
+                    color = Color.White
+                )
+            }
         }
     }
 }

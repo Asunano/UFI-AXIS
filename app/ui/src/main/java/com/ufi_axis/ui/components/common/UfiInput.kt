@@ -1,7 +1,10 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.components.common
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -11,8 +14,12 @@ import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.*
 import androidx.compose.ui.text.style.TextOverflow
@@ -20,6 +27,7 @@ import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
+import com.ufi_axis.ui.theme.UfiTextStyles
 
 /** 输入框族的共享视觉常量。 */
 object UfiInputDefaults {
@@ -102,7 +110,10 @@ fun UfiPasswordField(
     errorMessage: String? = null,
     enabled: Boolean = true,
     showToggle: Boolean = true,
-    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
+    // 密码字段默认就该走密码键盘：普通文本键盘会带候选词 / 自动纠错 / 首字母大写，
+    // 对「只能输入 ASCII 的配对密码 / API Key」是纯干扰，也会让输入法组合串反复触发过滤提示。
+    keyboardOptions: KeyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+    keyboardActions: KeyboardActions = KeyboardActions.Default,
     // v3（2026-08-11）：增加 textAlign 参数支持密码框文字居中（CONFIRM 阶段需要）
     textAlign: androidx.compose.ui.text.style.TextAlign = androidx.compose.ui.text.style.TextAlign.Start
 ) {
@@ -125,6 +136,7 @@ fun UfiPasswordField(
         visualTransformation = if (visible) VisualTransformation.None else PasswordVisualTransformation(),
         textStyle = androidx.compose.ui.text.TextStyle(textAlign = textAlign),
         keyboardOptions = keyboardOptions,
+        keyboardActions = keyboardActions,
         supportingText = errorMessage?.let { { Text(it, color = palette.error) } },
         colors = ufiInputColors(),
         trailingIcon = if (showToggle) {
@@ -292,6 +304,168 @@ fun UfiDigitField(
         colors = ufiInputColors(),
         shape = UfiCardDefaults.inputShape
     )
+}
+
+/**
+ * 紧凑输入框族的共享视觉常量（2026-10-14）。
+ *
+ * 与 [UfiDropdown] 的触发器**逐项对齐**：同底色、同描边、同圆角、同内距、同最小高度 ——
+ * 两者并排出现在一行里（"输入框 + 单位下拉框"）时才会被读成一套控件。
+ */
+private val UfiCompactFieldMinHeight = 32.dp
+
+/** 紧凑输入框的描边透明度，与 [UfiDropdown] 触发器的边框同值。 */
+private const val UfiCompactFieldBorderAlpha = 0.6f
+
+/** 不可用时的整体透明度，与 [UfiDropdown] / [UfiSwitch] 同值。 */
+private const val UfiCompactFieldDisabledAlpha = 0.4f
+
+/**
+ * 紧凑输入框（2026-10-14）：与 [UfiDropdown] 的触发器同高同款的自绘输入框。
+ *
+ * ## 为什么另起一个，而不是把 [UfiTextField] 改小
+ * [UfiTextField] / [UfiDigitField] 是 M3 `OutlinedTextField`：最小高度 56dp、带浮动 label、
+ * 聚焦时 label 上浮。那是"表单页里一个大输入框"的形态，全库一百多个调用点都在用 ——
+ * 把它改小等于把整个 App 的表单观感换掉，不该混在一次细节修改里。
+ *
+ * 这里解决的是另一种场景：**设置行里"输入框 + 单位下拉框"并排**。下拉触发器只有 32dp，
+ * 旁边杵一个 56dp 的 M3 输入框就是两代设计（用户："当前输入框太大了"）。
+ *
+ * ## 跟随字体大小
+ * 高度用 `heightIn(min = …)` 而不是 `height(…)`：字体调大时输入框跟着长高、不会把字裁掉。
+ * 下拉触发器 2026-10-14 起同样改成最小高度，两者会一起长（这正是用户要的"跟随字体大小"）。
+ */
+@Composable
+fun UfiCompactTextField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    maxLength: Int = Int.MAX_VALUE,
+    enabled: Boolean = true
+) {
+    UfiCompactField(
+        value = value,
+        onValueChange = { onValueChange(it.take(maxLength)) },
+        modifier = modifier,
+        placeholder = placeholder,
+        keyboardType = KeyboardType.Text,
+        enabled = enabled
+    )
+}
+
+/** 见 [UfiCompactTextField]：数字键盘，且只收数字。 */
+@Composable
+fun UfiCompactDigitField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    maxLength: Int = Int.MAX_VALUE,
+    enabled: Boolean = true
+) {
+    UfiCompactField(
+        value = value,
+        onValueChange = { onValueChange(it.filter { c -> c.isDigit() }.take(maxLength)) },
+        modifier = modifier,
+        placeholder = placeholder,
+        keyboardType = KeyboardType.Number,
+        enabled = enabled
+    )
+}
+
+/**
+ * 见 [UfiCompactTextField]：密码形态（圆点遮蔽 + 右侧眼睛切换）。
+ *
+ * 与 [UfiPasswordField]（M3 56dp）的区别只有高度：弹窗里与下拉框并排时，
+ * 56dp 的输入框比 32dp 的下拉高出一大截（用户："输入框上下太宽，改扁一点"）。
+ */
+@Composable
+fun UfiCompactPasswordField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: String = "",
+    enabled: Boolean = true
+) {
+    var visible by remember { mutableStateOf(false) }
+    UfiCompactField(
+        value = value,
+        onValueChange = onValueChange,
+        modifier = modifier,
+        placeholder = placeholder,
+        keyboardType = KeyboardType.Password,
+        enabled = enabled,
+        visualTransformation = if (visible) {
+            VisualTransformation.None
+        } else {
+            PasswordVisualTransformation()
+        },
+        trailing = {
+            IconButton(
+                onClick = { visible = !visible },
+                modifier = Modifier.size(Spacing.IconSizeSmall + 8.dp)
+            ) {
+                Icon(
+                    imageVector = if (visible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                    contentDescription = if (visible) "隐藏密码" else "显示密码",
+                    tint = LocalResolvedPalette.current.textSecondary,
+                    modifier = Modifier.size(Spacing.IconSizeSmall)
+                )
+            }
+        }
+    )
+}
+
+@Composable
+private fun UfiCompactField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    modifier: Modifier,
+    placeholder: String,
+    keyboardType: KeyboardType,
+    enabled: Boolean,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    trailing: (@Composable () -> Unit)? = null
+) {
+    val palette = LocalResolvedPalette.current
+    val shape = UfiCardDefaults.shape
+    Row(
+        modifier = modifier
+            .heightIn(min = UfiCompactFieldMinHeight)
+            .alpha(if (enabled) 1f else UfiCompactFieldDisabledAlpha)
+            .clip(shape)
+            .background(palette.surfaceMuted)
+            .border(1.dp, palette.textSecondary.copy(alpha = UfiCompactFieldBorderAlpha), shape)
+            .padding(horizontal = Spacing.Large, vertical = Spacing.Small),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+            // 占位符画在输入框**下层**（BasicTextField 自身透明）：有内容时被文字盖住，
+            // 也不会像 M3 那样在聚焦时把 label 顶上去 —— 紧凑形态里没有"浮动"这件事。
+            if (value.isEmpty() && placeholder.isNotEmpty()) {
+                Text(
+                    text = placeholder,
+                    style = UfiTextStyles.bodyLead,
+                    color = palette.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            BasicTextField(
+                value = value,
+                onValueChange = onValueChange,
+                enabled = enabled,
+                singleLine = true,
+                textStyle = UfiTextStyles.bodyLead.copy(color = palette.textPrimary),
+                keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+                visualTransformation = visualTransformation,
+                cursorBrush = SolidColor(palette.accent),
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
+        trailing?.invoke()
+    }
 }
 
 /**

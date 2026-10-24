@@ -56,7 +56,7 @@ import com.ufi_axis.ui.theme.UfiMotion
 
 internal object UfiDialogAnim {
     /** System window background blur radius applied via FLAG_BLUR_BEHIND + blurBehindRadius (API 31+). */
-    const val BlurRadius = 110
+    const val BlurRadius = 150
 
     /**
      * 变暗（`dimAmount`）的峰值 —— **能模糊时**。
@@ -71,7 +71,7 @@ internal object UfiDialogAnim {
      * 主题里的 `backgroundDimEnabled=false` **保持不变**（那是平台默认 dim 的开关，
      * 与这里按帧写入的 `dimAmount` 是两回事，且胶囊窗口的护栏测试盯着那个主题）。
      */
-    const val DimWithBlur = 0.10f
+    const val DimWithBlur = 0.16f
 
     /**
      * 变暗峰值 —— **拿不到跨窗口模糊时**（2026-09-18 引入；2026-10-08 弃用）。
@@ -93,7 +93,7 @@ internal object UfiDialogAnim {
      * （110px / 12 ≈ 9px 一档）。同样的取舍在胶囊那侧是"相等则跳过"，见
      * `applyCapsuleWindowParams` 的 KDoc。
      */
-    const val BackdropSteps = 12
+    const val BackdropSteps = 32
 
     /**
      * 卡片离场的目标缩放（1.0 → 0.92），沿用原 `res/anim/ufi_dialog_exit.xml` 的值。
@@ -270,6 +270,14 @@ internal fun UfiDialogShell(
     // DisposableEffect 的崩溃说明）。所以离场是：先跑 ramp，跑完才真正 dismiss / 卸载。
     var mounted by remember { mutableStateOf(visible) }
 
+    // 2026-10-23：把「有弹窗在场」广播给**窗口级浮层**（底部胶囊栏）。
+    // 胶囊是独立窗口，Dialog 的 scrim/背景模糊只作用于 Activity 窗口、压不到它 ——
+    // 不广播的话，弹窗打开时底栏仍然亮着盖在弹窗上（用户报的"模糊层级不对"）。
+    DisposableEffect(visible) {
+        if (visible) UfiDialogVisibility.push()
+        onDispose { if (visible) UfiDialogVisibility.pop() }
+    }
+
     /** 正在离场。置位后所有新的关闭请求都被忽略（防连点导致 ramp 被打断重启）。 */
     val closing = remember { mutableStateOf(false) }
 
@@ -379,7 +387,7 @@ internal fun UfiDialogShell(
         // 遮罩、系统模糊没了"。且窗口 dim(0.10) 与 Compose scrim 同时生效，两层不同源的
         // 半透明叠加在不同 GPU 路径上呈现不同色阶，弹窗边缘出现"分层/色带"。
         // 现在：
-        //   - blurCapable：变暗只走窗口 dim（随 ramp 渐变，DimWithBlur=0.10）。Compose 层
+        //   - blurCapable：变暗只走窗口 dim（随 ramp 渐变，DimWithBlur=0.16）。Compose 层
         //     **不再铺任何底色**——10-08 第一版曾留 ScrimWithBlur(0.12) 的 pageBg 底色"托"
         //     弹窗，但浅色主题 pageBg 近白，12% 铺满全屏又成了一层可见白纱盖在模糊上
         //     （用户实测：模糊+白纱同时出现）。dim 单独已足够把弹窗从背景里分离出来；
@@ -561,7 +569,10 @@ internal fun UfiDialogShell(
             }
             Column(
                 modifier = Modifier
-                    .fillMaxWidth(0.90f)
+                    // 2026-10-19：0.90 → 0.94。用户反馈警告/确认类弹窗"太紧凑、太小"，
+                    // 在内容变多（长文案 + 双按钮）时可读性差。四边留白由下面的 padding 保证，
+                    // 0.94 在窄屏上仍有 8dp 左右的呼吸边。
+                    .fillMaxWidth(0.94f)
                     .heightIn(max = maxDialogH)
                     .padding(horizontal = 16.dp)
             ) {

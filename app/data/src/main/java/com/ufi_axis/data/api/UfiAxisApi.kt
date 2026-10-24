@@ -99,6 +99,22 @@ interface UfiAxisApi {
         @Query("anchor") anchor: Long? = null
     ): TrafficUsageResponse
 
+    /**
+     * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`，2026-10-06 拍板第4项）。
+     *
+     * 与 [getTrafficUsage] 的分工：那个回**给图表用的分桶序列**（桶粒度随 range 变、可左右翻页），
+     * 本端点回**按自然日聚合的报表**（日报 1 行 / 周报 7 行 / 月报 28~31 行）+ core 生成的一句话摘要。
+     * 两者数据源同为 `traffic_hourly`，消费场景不同，故是两个端点（详见 [TrafficReportResponse]）。
+     *
+     * 三处契约要点：
+     * - [period] 只认 `day` / `week` / `month`，**其它值 core 回 400**（不是像 `/usage` 那样
+     *   静默回落到 day）—— 所以调用方必须把 400 与网络错误分开处理，别把参数写错报成"设备离线"。
+     * - 区间按**自然日**出桶，`range_end` 排他，因此 `period=day` 永远只有一行、且"今天"是残缺的一天。
+     * - 空桶照样返回（没记录的那天是三个 0），客户端不需要"补空行"。
+     */
+    @GET("api/traffic/report")
+    suspend fun getTrafficReport(@Query("period") period: String = "week"): TrafficReportResponse
+
     // ========== Media Center（媒体中心，2026-09-16）==========
     //
     // core 侧查系统媒体库（MediaStore）。**播放 / 查看仍走 `/api/files/stream?path=`**，
@@ -520,6 +536,19 @@ interface UfiAxisApi {
     @POST("api/shell/exec")
     suspend fun shellExec(@Body body: ShellExecRequest): ShellExecResponse
 
+    /**
+     * 读一个系统属性（`GET /api/shell/prop/{key}`，2026-10-14 接入）。
+     *
+     * **这是读只读系统属性的唯一入口**，不要用 [shellExec] 拼 `getprop <key>`：
+     * 本端点的 key 由 core 用白名单（只许 `[a-zA-Z0-9._]`）校验、非法回 400，
+     * 而 exec 是把整条命令交给 shell、校验责任在调用方；且 exec 会在设备端的终端历史里
+     * 记一笔，读属性不该污染用户的历史。理由与形状见 [ShellPropResponse]。
+     *
+     * @param key 只许 `[a-zA-Z0-9._]`（如 `ro.product.model`）；含其它字符时 core 回 400。
+     */
+    @GET("api/shell/prop/{key}")
+    suspend fun getShellProp(@Path("key") key: String): ShellPropResponse
+
     // ========== 终端命令历史（core 存，app / web 共享） ==========
     /** @param channel `shell` / `at`，不传则两个通道混排 */
     @GET("api/console/history")
@@ -566,6 +595,13 @@ interface UfiAxisApi {
      * `cursor` 是响应里的 `nextCursor`（base64 的 `ts.id`），向更早的记录翻页；
      * `level`/`type`/`unread` 为服务端过滤，响应的 `counts` 与过滤条件一致。
      */
+    /** 按天的事件计数（2026-10-23）：月历热力用，返回 `{days:{yyyy-MM-dd:count}, total}`。 */
+    @GET("api/alerts/daily_counts")
+    suspend fun getAlertDailyCounts(
+        @Query("start") start: Long,
+        @Query("end") end: Long
+    ): JsonElement
+
     @GET("api/alerts/list")
     suspend fun getAlertList(
         @Query("limit") limit: Int = 20,
@@ -716,6 +752,9 @@ interface UfiAxisApi {
      * 上一次 core 崩溃信息（2026-09-04）。core 崩溃后由 keepalive 脚本 / START_STICKY 自动拉起，
      * app 此前完全无感（只表现为数据断一下）。连上设备后拉一次，与本地"已提示过的时间戳"
      * 比对，不同就弹一次窗。去重放本地而不是服务端 ack —— 否则 app 一 ack，web 就再也看不到。
+     *
+     * 2026-10-23：是否"值得提示"由 core 的 `recent`（同一时钟算的 7 天窗口）判定，
+     * 三个月前的历史崩溃不会再触发启动弹窗，判据见 `CoreCrashPolicy`。
      */
     @GET("api/service/crash")
     suspend fun getCoreCrashReport(): CoreCrashResponse
@@ -1529,11 +1568,21 @@ interface UfiAxisApi {
     @GET("api/pairing/status")
     suspend fun getPairingStatus(): JsonElement
 
+    /**
+     * 解除全部配对（POST api/pairing/unpair）。
+     *
+     * 2026-10-21（审计 §B1）：core 现在**要求配对密码** —— "踢掉所有人"与"踢掉一个设备"
+     * 必须是同一道门槛（之前这条反而免密码，双因素被绕过）。缺密码回 401 MISSING_PASSWORD。
+     */
     @POST("api/pairing/unpair")
-    suspend fun unpairAll(): JsonElement
+    suspend fun unpairAll(@Body body: Map<String, String>): JsonElement
 
+    /** 解除指定设备配对（POST api/pairing/unpair/{fingerprint}，同样要求配对密码）。 */
     @POST("api/pairing/unpair/{fingerprint}")
-    suspend fun unpairFingerprint(@Path("fingerprint") fingerprint: String): JsonElement
+    suspend fun unpairFingerprint(
+        @Path("fingerprint") fingerprint: String,
+        @Body body: Map<String, String>
+    ): JsonElement
 
     @PUT("api/pairing/config")
     suspend fun updatePairingConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
@@ -1560,6 +1609,45 @@ interface UfiAxisApi {
     /** 修改配对密码（root 路径免鉴权，旧密码即门禁；body {old_password, new_password}）。 */
     @POST("pairing/change-password")
     suspend fun changeDevicePassword(@Body body: Map<String, String>): JsonElement
+
+    // ========== Pairing Blacklist（2026-10-15：配对设备黑名单） ==========
+    //
+    // 读侧拦截不在这几个端点上：被拉黑设备的**配对与密码登录**由 core 的
+    // `PairingManager.confirm` 直接拦（403 DEVICE_BLOCKED），已鉴权请求由 444 拦。
+    // 这里只是管理面（增删查），写操作一律要配对密码（与移除设备同一套双因素）。
+
+    /** 黑名单列表（Bearer；GET /api/pairing/blacklist）。旧版 core 无此端点 → 404。 */
+    @GET("api/pairing/blacklist")
+    suspend fun getPairingBlacklist(): JsonElement
+
+    /** 拉黑一台设备（Bearer + 配对密码；body {fingerprint, hw_id, name, reason, password}）。 */
+    @POST("api/pairing/blacklist")
+    suspend fun blockPairedDevice(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
+
+    /** 解除拉黑（Bearer + 配对密码；body {password}）。 */
+    @HTTP(method = "DELETE", path = "api/pairing/blacklist/{fingerprint}", hasBody = true)
+    suspend fun unblockPairedDevice(
+        @Path("fingerprint") fingerprint: String,
+        @Body body: Map<String, String>
+    ): JsonElement
+
+    /** 全部解除（Bearer + 配对密码；body {password}）。 */
+    @POST("api/pairing/blacklist/clear")
+    suspend fun clearPairingBlacklist(@Body body: Map<String, String>): JsonElement
+
+    // ========== Pairing Approval（2026-10-15：新设备需机主批准） ==========
+
+    /** 待批准列表（Bearer；GET /api/pairing/approvals）。**响应含 6 位配对码**，供弹窗显示。 */
+    @GET("api/pairing/approvals")
+    suspend fun getPairingApprovals(): JsonElement
+
+    /** 机主点「允许」（Bearer；POST /api/pairing/approvals/{sid}/approve）。 */
+    @POST("api/pairing/approvals/{sid}/approve")
+    suspend fun approvePairingRequest(@Path("sid") sid: String): JsonElement
+
+    /** 机主点「拒绝」（Bearer；POST /api/pairing/approvals/{sid}/reject）。 */
+    @POST("api/pairing/approvals/{sid}/reject")
+    suspend fun rejectPairingRequest(@Path("sid") sid: String): JsonElement
 
     // ========== Tunnel (内网穿透) ==========
 
@@ -1733,6 +1821,21 @@ interface UfiAxisApi {
     /** 特权 shell 状态：`root` / `uid` / `method`。替代文档里那个不存在的 `api/adb/status`。 */
     @GET("api/shell/root")
     suspend fun getShellRoot(): ShellRootResponse
+
+    // ========== 赞助感谢名单（2026-10-14） ==========
+    //
+    // 回 `{ source: "bundled"|"remote", updatedAt, sponsors: [...] }`（core 侧 SponsorRoutes）。
+    //
+    // **刻意声明成 JsonElement 而不是新建 data class**：
+    //  1. 条目对象是**原样透传**的（core 只校验、不重塑），将来远端给某条加 `link`/`avatar`
+    //     之类的字段时，强类型模型会把它们静默丢掉 —— 而这一页展示的就是"人家给了什么"；
+    //  2. 消费端（SponsorsScreen）**必须**按 sponsors.json 的字段规则逐条校验（远端那份来自
+    //     12 小时一次的后台拉取，不经过编译期校验），校验本来就是手写 JSON 遍历，
+    //     强类型解析只是多一层会把"不合规"变成"字段缺省值"的转译 —— 那正是要避免的静默失败。
+    //
+    // 唯一的写权限新增注解就是这一条：诊断中心那一批端点全部复用上面已有的方法。
+    @GET("api/sponsors")
+    suspend fun getSponsors(): JsonElement
 }
 
 @Serializable

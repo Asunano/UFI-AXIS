@@ -1,6 +1,7 @@
 package com.ufi_axis.util
 
 import android.content.Context
+import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
 import android.content.SharedPreferences
 import android.provider.Settings
 
@@ -154,6 +155,20 @@ class AppPreferences(private val context: Context) {
         get() = prefs.getBoolean(KEY_SETUP_COMPLETE, false)
         set(value) = prefs.edit().putBoolean(KEY_SETUP_COMPLETE, value).apply()
 
+    /**
+     * 上一次"被强制退回配对引导"的原因（2026-10-22）。
+     *
+     * 只用于诊断：`ConnectionBootstrap` 在凭据被**确证**吊销（HTTP 444 阈值满足）时写一句
+     * 带时间的话，配对页启动时读一次并提示，然后清空。
+     *
+     * 为什么需要它：`isSetupComplete` 一旦被写回 false，用户只会看到"又要配对"，
+     * 而**为什么**掉线（凭据被移除？被拉黑？设备库恢复？）在界面上完全不可见 ——
+     * 这正是"每次打开都要重新登录"这类问题最难查的地方。一句话的成本，换来下一次可定位。
+     */
+    var lastLogoutReason: String
+        get() = prefs.getString(KEY_LAST_LOGOUT_REASON, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LAST_LOGOUT_REASON, value).apply()
+
     var autoRefresh: Boolean
         get() = prefs.getBoolean(KEY_AUTO_REFRESH, true)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_REFRESH, value).apply()
@@ -207,10 +222,17 @@ class AppPreferences(private val context: Context) {
      *
      * 去重放在**本地**而不是让 core 记 ack：app 与 web 是两个独立展示端，
      * 谁先 ack 另一端就永远看不到这次崩溃。
+     *
+     * 2026-10-23：写入时机从"用户关窗"提前到"决定提示"（见 `ToolsModule.loadCoreCrashNotice`），
+     * 且改用 `commit()`。这是同一次崩溃只提示一次的**唯一依据** —— `apply()` 的异步落盘
+     * 一旦在用户随后杀进程时被截断，三个月前的旧崩溃就会在每次启动时重弹。
+     * 单次写入只有几个字节，同步开销可以忽略。
      */
     var coreCrashShownAt: Long
         get() = prefs.getLong(KEY_CORE_CRASH_SHOWN_AT, 0L)
-        set(value) = prefs.edit().putLong(KEY_CORE_CRASH_SHOWN_AT, value).apply()
+        set(value) {
+            prefs.edit().putLong(KEY_CORE_CRASH_SHOWN_AT, value).commit()
+        }
 
     /**
      * 「调试入口已解锁」——**纯本机 UI 门禁**（关于页连点版本号 5 次后显形调试卡片），默认 false。
@@ -268,6 +290,22 @@ class AppPreferences(private val context: Context) {
     fun setMediaGridView(type: String, grid: Boolean) {
         prefs.edit().putBoolean("media_grid_view_$type", grid).apply()
     }
+
+    /*
+     * ── 图片时间轴的两项显示偏好（2026-10-21）──
+     *
+     * 为什么不塞进 `media_grid_view_$type` 那一族：那两族是"每类一份"的通用项，
+     * 而这两项只对图片有意义（视频/音乐都没有三列网格、也没有按天分段），
+     * 混进去会让另外两类凭空多出两个永不生效的键。
+     */
+
+    /** 图片时间轴网格列数（**3..5**，默认 3；2 列在手机上单张过大，2026-10-21 去掉）。 */
+    fun mediaImageColumns(): Int = prefs.getInt(KEY_MEDIA_IMAGE_COLUMNS, 3).coerceIn(3, 5)
+
+    fun setMediaImageColumns(columns: Int) {
+        prefs.edit().putInt(KEY_MEDIA_IMAGE_COLUMNS, columns.coerceIn(3, 5)).apply()
+    }
+
 
     /** 媒体页排序字段：`date` / `name` / `size`（与 core `/api/media/list` 的取值一致）。 */
     fun mediaSort(type: String): String =
@@ -332,7 +370,64 @@ class AppPreferences(private val context: Context) {
     var audioShuffleEnabled: Boolean
         get() = prefs.getBoolean(KEY_AUDIO_SHUFFLE, false)
         set(value) = prefs.edit().putBoolean(KEY_AUDIO_SHUFFLE, value).apply()
+    /**
+     * 是否允许**外接设备**控制播放（默认开）：蓝牙耳机 / 音响 / 车机 / 手表 / 线控耳机。
+     *
+     * 关掉后 `MediaSession.Callback.onMediaButtonEvent` 直接消费事件：这些设备的播放暂停切歌
+     * 不再生效；但通知栏与锁屏控制保留（那两处不走媒体键通道）。
+     */
+    var audioExternalControl: Boolean
+        get() = prefs.getBoolean(KEY_AUDIO_EXTERNAL_CONTROL, true)
+        set(value) = prefs.edit().putBoolean(KEY_AUDIO_EXTERNAL_CONTROL, value).apply()
 
+    /**
+     * 是否把**当前这句歌词**推到媒体通知的第二行（默认关）。
+     *
+     * 默认关的理由有两个：它会带来"每句一次"的通知更新（一首歌几十次），
+     * 以及把歌词显示在锁屏上的隐私意外 —— 需要的人自己打开。
+     * AVRCP 协议没有歌词字段，能做的最多就是通知文本（详见 `UfiAudioLyricBadge`）。
+     */
+    var audioBtLyrics: Boolean
+        get() = prefs.getBoolean(KEY_AUDIO_BT_LYRICS, false)
+        set(value) = prefs.edit().putBoolean(KEY_AUDIO_BT_LYRICS, value).apply()
+
+    /*
+     * ── 视频播放 / 显示偏好（2026-10-21）──
+     *
+     * 四项都只影响"视频"这一类，而且都只读本机偏好（core 不参与），
+     * 所以放在这里而不是 MediaModule 的 state 里：它们与播放器/海报墙的**呈现**有关，
+     * 与"这一页的列表数据"无关。
+     */
+
+    /** 海报墙列数（2..4，默认 2）。 */
+    var videoPosterColumns: Int
+        get() = prefs.getInt(KEY_VIDEO_POSTER_COLUMNS, 2).coerceIn(2, 4)
+        set(value) = prefs.edit().putInt(KEY_VIDEO_POSTER_COLUMNS, value.coerceIn(2, 4)).apply()
+
+    /** 有外挂字幕时是否自动选上第一条（默认开；关掉后要在播放页齿轮里手选）。 */
+    var videoSubtitleAuto: Boolean
+        get() = prefs.getBoolean(KEY_VIDEO_SUBTITLE_AUTO, true)
+        set(value) = prefs.edit().putBoolean(KEY_VIDEO_SUBTITLE_AUTO, value).apply()
+
+    /**
+     * 字幕字号档位：`small` / `medium` / `large`（默认 medium）。
+     *
+     * 存字符串而不是倍数：倍数以后可能微调，而"档位"是用户选过的语义。
+     */
+    var videoSubtitleSize: String
+        get() = prefs.getString(KEY_VIDEO_SUBTITLE_SIZE, "medium") ?: "medium"
+        set(value) = prefs.edit().putString(KEY_VIDEO_SUBTITLE_SIZE, value).apply()
+
+    /** 字幕是否带半透明黑底（默认关：默认那套"白字黑描边"在任何画面上都成立）。 */
+    var videoSubtitleBackground: Boolean
+        get() = prefs.getBoolean(KEY_VIDEO_SUBTITLE_BACKGROUND, false)
+        set(value) = prefs.edit().putBoolean(KEY_VIDEO_SUBTITLE_BACKGROUND, value).apply()
+
+
+    /** 视频是否续播（默认开；关掉后每次从头开始，也不弹"从 x 继续"）。 */
+    var videoResumeEnabled: Boolean
+        get() = prefs.getBoolean(KEY_VIDEO_RESUME, true)
+        set(value) = prefs.edit().putBoolean(KEY_VIDEO_RESUME, value).apply()
     // ── 媒体：播放进度（2026-09-16）──
 
 
@@ -401,8 +496,19 @@ class AppPreferences(private val context: Context) {
      * 用分隔符拼串而不是 JSON：这里只有三个字段且都不含换行，引一份序列化器不划算；
      * 路径里可能出现 `|` 的概率不为零，所以取值时按**前两个**分隔符切，第三段之后整体保留。
      */
-    fun mediaRecentPlays(): List<Triple<String, String, Long>> =
-        prefs.getString(KEY_MEDIA_RECENT, "")
+    /**
+     * 最近播放（**按媒体类型各存一份**，2026-10-21）。
+     *
+     * 视频页首页那条横向列表与音乐设置页的「最近播放」是两件事：音乐可能有几十上百首，
+     * 视频只留 6 条做推荐。所以键名带类型、条数上限也按类型分（[recentLimitOf]）。
+     *
+     * 旧数据（只有视频那会儿写的 `media_recent_plays`）在**读视频那一份时**做一次兼容回退，
+     * 不迁移也不删除 —— 迁移代码只会多一个"只跑一次且无法测试"的分支。
+     */
+    fun mediaRecentPlays(type: String): List<Triple<String, String, Long>> {
+        val raw = prefs.getString(recentKeyOf(type), null)
+            ?: if (type == MEDIA_TYPE_VIDEO) prefs.getString(KEY_MEDIA_RECENT, null) else null
+        return raw
             ?.split('\n')
             ?.filter { it.isNotBlank() }
             ?.mapNotNull { line ->
@@ -410,33 +516,42 @@ class AppPreferences(private val context: Context) {
                 if (parts.size < 3) return@mapNotNull null
                 val id = parts.last().toLongOrNull() ?: return@mapNotNull null
                 val path = parts[0]
+                // 路径里可能出现 `|`：按**前两个**分隔符切，中间整体当名字
                 val name = parts.subList(1, parts.size - 1).joinToString("|")
                 if (path.isBlank()) null else Triple(path, name, id)
             }
             ?: emptyList()
+    }
 
     /** 记一条最近播放：已存在的先摘掉再插到最前（"最近"而不是"第一次"）。 */
-    fun addMediaRecentPlay(path: String, name: String, id: Long) {
+    fun addMediaRecentPlay(type: String, path: String, name: String, id: Long) {
         if (path.isBlank()) return
         val line = "$path|${name.replace('\n', ' ')}|$id"
+        val limit = recentLimitOf(type)
         // 与 setMediaPlaybackPosition 同锁：整串读改写，并发会丢条目
         synchronized(mediaListLock) {
-            val kept = mediaRecentPlays()
+            val kept = mediaRecentPlays(type)
                 .filterNot { it.first == path }
-                .take(MEDIA_RECENT_LIMIT - 1)
+                .take(limit - 1)
                 .map { "${it.first}|${it.second}|${it.third}" }
             prefs.edit()
-                .putString(KEY_MEDIA_RECENT, (listOf(line) + kept).joinToString("\n"))
+                .putString(recentKeyOf(type), (listOf(line) + kept).joinToString("\n"))
                 .apply()
         }
     }
 
-    /** 清空最近播放（设置页给的动作；不影响播放进度记录）。 */
-    fun clearMediaRecentPlays() {
+    /** 清空某一类的最近播放（设置页给的动作；不影响播放进度记录）。 */
+    fun clearMediaRecentPlays(type: String) {
         synchronized(mediaListLock) {
-            prefs.edit().remove(KEY_MEDIA_RECENT).apply()
+            prefs.edit().remove(recentKeyOf(type)).apply()
         }
     }
+
+    private fun recentKeyOf(type: String): String = "${KEY_MEDIA_RECENT}_$type"
+
+    /** 视频只留 6 条（首页横向列表一屏恰好放 6 个）；音乐留 20 条，够翻一阵又不至于太长。 */
+    private fun recentLimitOf(type: String): Int =
+        if (type == MEDIA_TYPE_VIDEO) MEDIA_RECENT_LIMIT else AUDIO_RECENT_LIMIT
 
 
     // ── 更新源 / 镜像源设置（2026-08-10：前端直连 GitHub + 镜像加速） ──
@@ -576,19 +691,21 @@ class AppPreferences(private val context: Context) {
      * [gatewayIp] 默认值 192.168.0.1 与设备默认管理地址一致，且仍可被手动配置覆盖。
      */
     val baseUrl: String
-        get() {
-            val ip = serverIp.ifBlank { gatewayIp }
-            return "http://$ip:$serverPort/"
-        }
+        get() = buildBaseUrl(effectiveHost, serverPort)
 
     /**
      * 直接拼 URL 时使用的有效主机（不含 scheme / 端口），语义与 [baseUrl] 一致：
      * serverIp 为空时回退到网关 [gatewayIp]，避免拼出非法的 `http://:8088/...` 导致
      * 文件流 / 上传 / 安装等直连请求连不上后端。
+     *
+     * 2026-10-14：主机可以是域名（`nas.local`）。这里**只判空**、绝不判"像不像 IP"——
+     * 任何形状校验都会让已保存的域名在下一次启动时被回落到网关，表现为"昨天还能连，
+     * 今天连到了 192.168.0.1"。
      */
     val effectiveHost: String
-        get() = serverIp.ifBlank { gatewayIp }
+        get() = resolveEffectiveHost(serverIp, gatewayIp)
 
+    /** 是否配过设备地址。**只判空**：域名（`nas.local`）与 IP 一样算"已配置"。 */
     val isConfigValid: Boolean
         get() = serverIp.isNotBlank()
 
@@ -612,6 +729,9 @@ class AppPreferences(private val context: Context) {
          */
         internal const val CRED_PREFS_NAME = "ufi_axis_credentials"
         private const val KEY_SETUP_COMPLETE = "setup_complete"
+
+    /** 上次被强制退回配对引导的原因（诊断用，见 [AppPreferences.lastLogoutReason]）。 */
+    private const val KEY_LAST_LOGOUT_REASON = "last_logout_reason"
         private const val KEY_AUTO_REFRESH = "auto_refresh"
         private const val KEY_LOG_ENABLED = "log_enabled"
         private const val KEY_APP_LOG_ENABLED = "app_log_enabled"
@@ -636,6 +756,19 @@ class AppPreferences(private val context: Context) {
         /** 播放队列快照（JSON）。 */
         private const val KEY_AUDIO_QUEUE = "audio_queue_snapshot"
 
+        /** 视频：海报墙列数 / 字幕 / 续播（见对应的 getter / setter）。 */
+        private const val KEY_VIDEO_POSTER_COLUMNS = "video_poster_columns"
+        private const val KEY_VIDEO_SUBTITLE_AUTO = "video_subtitle_auto"
+        private const val KEY_VIDEO_SUBTITLE_SIZE = "video_subtitle_size"
+        private const val KEY_VIDEO_SUBTITLE_BACKGROUND = "video_subtitle_background"
+        private const val KEY_VIDEO_RESUME = "video_resume_enabled"
+
+        /** 外接设备（蓝牙耳机 / 线控 / 手表 / 车机）控制播放的开关。 */
+        private const val KEY_AUDIO_EXTERNAL_CONTROL = "audio_external_control"
+
+        /** "蓝牙歌词"：把当前句写进媒体通知的第二行。 */
+        private const val KEY_AUDIO_BT_LYRICS = "audio_bt_lyrics"
+
 
         /** 播放进度的淘汰队列（逗号分隔的 key），与 [MEDIA_POSITION_LIMIT] 配合限制条数。 */
         private const val KEY_MEDIA_POSITION_ORDER = "media_pos_order"
@@ -647,8 +780,14 @@ class AppPreferences(private val context: Context) {
         /** 最近播放（换行分隔的 `path|name|id`）。 */
         private const val KEY_MEDIA_RECENT = "media_recent_plays"
 
+        /** 图片时间轴的网格列数（见 [mediaImageColumns]）。 */
+        private const val KEY_MEDIA_IMAGE_COLUMNS = "media_image_columns"
+
         /** 最近播放条数。首页那条横向列表滑两下就到底才有"最近"的意思。 */
         private const val MEDIA_RECENT_LIMIT = 6
+
+        /** 音乐「最近播放」的条数上限（与视频那 6 条分开，见 [recentLimitOf]）。 */
+        private const val AUDIO_RECENT_LIMIT = 20
 
 
         // ── 更新源 / 镜像源设置（2026-08-10） ──
@@ -680,3 +819,23 @@ class AppPreferences(private val context: Context) {
         private const val EMULATOR_ANDROID_ID = "9774d56d682e549c"
     }
 }
+
+/**
+ * 「实际拿去拼 URL 的主机」（2026-10-14）。
+ *
+ * 抽成纯函数是为了能被单测钉住：`serverIp` 允许是域名（`nas.local`）之后，
+ * 「空则回落网关」这条判定**只能判空**。历史上这里对 127.0.0.1 / 网关的取舍出过事故
+ * （回落到 localhost 让 App 连自己），而"看起来不像 IP 就回落"这类形状判断会制造
+ * 更难查的故障：域名被静默换成 192.168.0.1，用户只看到"连不上"。
+ */
+internal fun resolveEffectiveHost(serverIp: String, gatewayIp: String): String =
+    serverIp.ifBlank { gatewayIp }
+
+/**
+ * baseUrl 拼装（`http://$host:$port/`，**带尾斜杠**）。
+ *
+ * 尾斜杠是 Retrofit `baseUrl` 的硬要求，也是各直连拼接点（`baseUrl + path`）的约定；
+ * 主机原样使用：不做大小写归一、不剥尾点、不校验形状 —— 那些都属于"地址框"的职责
+ * （App 侧见 `com.ufi_axis.ui.screens.checkServerEndpoint`）。
+ */
+internal fun buildBaseUrl(host: String, port: Int): String = "http://$host:$port/"

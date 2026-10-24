@@ -1033,6 +1033,28 @@ private fun PagerBackend(
                                     isIncoming = pageIndex == pagerState.targetPage,
                                 )
                                 tr.writeLayer(layerScratch.reusableLayer, position, ctx)
+
+                                // ★ 2026-10-14 新增：**策略判定不可见（alpha == 0）时同样短路**。
+                                //
+                                // 上面那条短路只覆盖 `|position| >= 1`（槽位与视口无交集）。但策略自己
+                                // 也可能把某一页判成不可见 —— Flip3D 的**背面剔除**就是这种：
+                                // `alpha = if (|p| > 0.5) 0 else 1`，于是过渡的**后半程整段**该页 alpha 都是 0。
+                                //
+                                // 旧写法在这里照常往下走 `applyLayer`，把 rotationY / cameraDistance /
+                                // transformOrigin 一整套 3D 变换写进图层。对一个投影宽度为零的页来说：
+                                //   · 绘制虽然被 HWUI 的零透明短路省掉，但**变换字段仍被逐帧写脏**；
+                                //   · 而「带 3D 变换的图层」会参与平台的离屏缓冲判定 —— 为一个永远不显示的
+                                //     页维持这种图层，纯属把 3D 路径的开销付了两遍。
+                                // 现在写 alpha = 0 后直接返回：图层保持恒等变换，HWUI 跳过绘制。
+                                //
+                                // 安全性同上面那条短路：Compose 每次调用本 lambda 前都会
+                                // `ReusableGraphicsLayerScope.reset()`，所以「不写」等价于「写默认值」，
+                                // 不会残留上一帧的变换。
+                                if (layerScratch.reusableLayer.alpha <= 0f) {
+                                    alpha = 0f
+                                    return@graphicsLayer
+                                }
+
                                 applyLayer(layerScratch.reusableLayer)
                             }
 
@@ -1241,7 +1263,19 @@ private fun AnimatedContentBackend(
         val enterPosition: Float = if (forward) 1f else -1f
         val isIncoming: Boolean = delta == 0
 
-        val rawPosition: Float by this.transition.animateFloat(
+        // ★★ 2026-10-14（转场卡顿 · 动画值被读进组合作用域）：这里**不要**再用 `by` 解包。 ★★
+        //
+        // 旧写法是 `val rawPosition: Float by this.transition.animateFloat(...)` —— 那是一次
+        // **组合期**的快照读：整段转场里每帧都会让本槽位的组合作用域失效，于是
+        // `page.content()`（一整页，含 LazyColumn / 卡片 / 图表）每帧重组一次，
+        // 而其中真正需要每帧变的只有下面 `graphicsLayer {}` 里的那个位移。
+        //
+        // 现在只保留 State 容器（身份稳定、跨帧不变），把 `.value` 的读取推到**图层阶段**
+        // （graphicsLayer 的 block 每帧执行，读它只订阅这一层）：
+        // 每帧省掉「整页重组 + 布局 + 组合阶段的状态分发」，只留一次位移写入。
+        // 与 PagerBackend 里那条「position 的计算放进 graphicsLayer」是同一条铁律。
+        // 观感零变化：同一个 animateFloat、同一条 spec、同一组端点值。
+        val rawPositionState: State<Float> = this.transition.animateFloat(
             transitionSpec = { finiteSpec },
             label = "ufiPagePosition",
         ) { state ->
@@ -1274,6 +1308,9 @@ private fun AnimatedContentBackend(
                         .fillMaxSize()
                         .then(if (transition.clipToBounds) Modifier.clipToBounds() else Modifier)
                         .graphicsLayer {
+                            // 见 [rawPositionState] 的说明：位移在这里（图层阶段）才读，
+                            // 组合期不解包 ⇒ 转场期间本槽位不重组。
+                            val rawPosition: Float = rawPositionState.value
                             val position: Float = if (isRtl) -rawPosition else rawPosition
                             val ctx: UfiPageLayerContext = layerScratch.contextFor(
                                 width = size.width.roundToInt(),

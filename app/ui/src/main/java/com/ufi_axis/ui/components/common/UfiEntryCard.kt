@@ -25,6 +25,9 @@ import com.ufi_axis.ui.theme.UfiTextStyles
  *
  * 用于"点进去还有下一层"的列表项（隧道列表、通道列表等）。与 [UfiActionCard]（居中大图标网格卡）
  * 的区别是本组件是**一行一项**、可带状态徽标。
+ *
+ * 2026-10-13：自带 [Spacing.CardHorizontalMargin]（16dp）横向外边距，与 [UfiSettingsRowCard] /
+ * [UfiSettingsGroup] 对齐；**调用方不要再补水平 padding**，那会叠成 32dp 的双重内距。
  */
 @Composable
 fun UfiEntryCard(
@@ -40,7 +43,7 @@ fun UfiEntryCard(
 ) {
     val palette = LocalResolvedPalette.current
     Surface(
-        modifier = modifier.fillMaxWidth().clickable(onClick = onClick),
+        modifier = modifier.fillMaxWidth().padding(horizontal = Spacing.CardHorizontalMargin).clickable(onClick = onClick),
         shape = UfiCardDefaults.shape,
         color = palette.cardBg,
         border = BorderStroke(
@@ -61,7 +64,7 @@ fun UfiEntryCard(
             Spacer(Modifier.width(Spacing.Large))
             Column(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+                verticalArrangement = Arrangement.spacedBy(Spacing.TextStackGap)
             ) {
                 Text(
                     text = title,

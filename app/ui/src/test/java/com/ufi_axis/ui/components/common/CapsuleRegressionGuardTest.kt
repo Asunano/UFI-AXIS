@@ -998,15 +998,15 @@ class CapsuleRegressionGuardTest {
             "上下两段的和不再恒等于 reservedDp（应为 `val topPadDp: Dp = reservedDp - bottomPadDp`）" +
                 "—— 这条恒等式是「栏总高不变」的全部依据：页面底部 inset、进出场滑动距离、" +
                 "窗口高度三处都按 reservedDp 算，拆分只许改**内容的位置**，不许改总高。",
-            Regex("""topPadDp\s*:\s*Dp\s*=\s*reservedDp\s*-\s*bottomPadDp""").containsMatchIn(dock)
+            Regex("""topPadDp\s*:\s*Dp\s*=\s*\(\s*reservedDp\s*-\s*bottomPadDp\s*\)""").containsMatchIn(dock)
         )
         assertTrue(
             "下半段不再取「系统栏本体」（应为 `LocalCapsuleBottomSystemBar.current` 并 " +
-                "`coerceAtMost(reservedDp)`）—— 若改回整段 reservedPx，图标会重新被手势热区" +
+                "`dockLiftDp`）—— 2026-10-20 起抬高量属于「栏总高增长」，不再夹进 reservedDp；" +
                 "顶高约 (systemGestures − navigationBars)（真机 112 vs 56 px），" +
                 "就是「图标离屏幕下部分太远」那条反馈。",
             Regex("""LocalCapsuleBottomSystemBar\.current""").containsMatchIn(dock) &&
-                Regex("""coerceAtMost\(\s*reservedDp\s*\)""").containsMatchIn(dock)
+                Regex("""dockLiftDp\.dp""").containsMatchIn(dock)
         )
     }
 

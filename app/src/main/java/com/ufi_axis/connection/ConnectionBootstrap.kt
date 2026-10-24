@@ -50,6 +50,13 @@ object ConnectionBootstrap {
         onUnauthorizedRef = java.lang.ref.WeakReference(onUnauthorized)
         RetrofitClient.onUnauthorized = {
             val runnable = Runnable {
+                // 2026-10-22：先把"为什么掉线"记下来，配对页会读一次并提示。
+                // 没有这句话时，用户只会看到"又要重新配对"，而原因（被移除/被拉黑/设备库恢复）
+                // 在界面上完全不可见 —— "每次打开都要重新登录"这类问题就无法定位。
+                prefs.lastLogoutReason = "登录凭据被设备拒绝（HTTP 444）· ${
+                    java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date())
+                }"
                 prefs.token = ""
                 prefs.isSetupComplete = false
                 onUnauthorizedRef?.get()?.invoke()

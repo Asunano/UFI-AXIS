@@ -254,7 +254,7 @@ class MainViewModel(
      */
     val poetry by lazy { PoetryModule(api, viewModelScope, crossModuleEventSink) }
 
-    /** DLNA MediaServer（2026-10-09）：设置 → DLNA 投屏。默认关。 */
+    /** DLNA MediaServer（2026-10-09）：设置 → DLNA 服务。默认关。 */
     val dlna by lazy { DlnaModule(api, viewModelScope, crossModuleEventSink) }
 
     /**
@@ -407,9 +407,14 @@ class MainViewModel(
     /**
      * App 回前台：静默探活一次后再恢复周期（见 [HealthModule.onAppForegrounded]）。
      * 由 MainActivity `ON_RESUME` 调用；与 WS 重连并行。
+     *
+     * 2026-10-21：顺带立刻拉一次**待批准列表**。App 在后台时 WS 帧可能已被系统裁掉、进程被冻，
+     * 不补这一次，机主切回 App 后还要再等最多 30s 才看见弹窗（那正是"弹窗慢"的另一半）。
+     * 不依赖推送是否到达 —— 拉一次是幂等且便宜的。
      */
     fun onAppForegrounded() {
         health.onAppForegrounded(HEALTH_CHECK_INTERVAL_MS)
+        network.loadApprovals()
     }
 
     /**
@@ -521,6 +526,14 @@ class MainViewModel(
     }
 
     private fun dispatchChanged(changedType: String) {
+        // 2026-10-21：配对待批准是**模态事件**（要立刻弹窗逼机主做决定），不能吃 P5 的
+        // 800ms 尾沿去抖 —— 它也不属于任何既有分组（device/wifi/network/tools/media），
+        // 直接短路最清楚。core 侧 `ApprovalPushNudger` 会快速补发几帧，所以这里必须
+        // 高效且幂等（`loadApprovals` 内部有在途合并）。
+        if (changedType == WsDataTopic.PAIRING_APPROVALS) {
+            network.loadApprovalsFromPush()
+            return
+        }
         // P6 联动：网络相关前缀记外部变更信号（loadNetworkAll 闸门豁免的依据）
         if (changedType == WsDataTopic.RECONNECTED ||
             changedType.startsWith(WsDataTopic.PREFIX_DEVICE) || changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
@@ -583,6 +596,10 @@ class MainViewModel(
             }
             // 2026-10-05 P5 新增：summary 失效（G7）→ dashboard
             changedType == "summary" -> dashboard.smartRefresh(changedType)
+            // 2026-10-21：配对相关（目前只有 pairing:approvals）。正常情况下已在
+            // [dispatchChanged] 里短路（不吃去抖），这条是防御性兜底 —— 别删，否则将来有人
+            // 把短路删掉时这里会静默吞掉整个批准弹窗链路。
+            changedType.startsWith(WsDataTopic.PREFIX_PAIRING) -> network.loadApprovalsFromPush()
         }
     }
 
@@ -694,6 +711,32 @@ class MainViewModel(
             startupGate()
         }
     }
+
+    /**
+     * 凭据 / 设备地址变更后重新绑定实时通道（2026-10-21，审计 §A4）。
+     *
+     * HTTP 侧靠 `RetrofitClient.dynamicHostInterceptor` 每次请求重取 baseUrl，已经没有"旧地址"问题；
+     * 但 WS 是**长连接**，它把 url 与 token 存成字段，必须显式换并重连。
+     *
+     * 之前这条更新只作用在 `MainActivity` 里 `remember { WebSocketRepository(...) }` 拿到的实例上，
+     * 而 VM 里跑的是**它自己构造时那个**实例 —— 重新配对（SetupScreen 分支重建了组合）之后，
+     * 被更新的恰恰是"从未 connect 的新实例"，真正在连的那个还在用旧 token/旧主机。
+     *
+     * @param wsUrl 新的 WebSocket 地址（`ws://host:port/ws/realtime` 的 base 部分）
+     * @param token 新设备 token
+     */
+    fun onEndpointChanged(wsUrl: String, token: String) {
+        webSocketRepository.updateConfig(wsUrl, token)
+    }
+
+    /**
+     * 本 VM 正在使用的实时通道实例（2026-10-21，审计 §A4）。
+     *
+     * Activity 的生命周期钩子（回前台重连、网络恢复重连、握手被拒回调）必须作用在**这一个**对象上：
+     * 重新配对会把 SetupScreen 分支重新组合，`remember { WebSocketRepository(...) }` 会造出一个
+     * 全新且从未 connect 的实例，钩子挂在它上面等于什么都没做。
+     */
+    fun webSocket(): WebSocketRepository = webSocketRepository
 
     /**
      * 服务器地址变更后的会话刷新（P2）。

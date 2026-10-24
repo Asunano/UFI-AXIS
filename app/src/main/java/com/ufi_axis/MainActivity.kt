@@ -39,6 +39,7 @@ import com.ufi_axis.ui.components.UnifiedUpdateDialog
 import com.ufi_axis.ui.components.common.ToastMessage
 import com.ufi_axis.ui.components.common.ToastType
 import com.ufi_axis.ui.components.common.UfiAlertToastBridge
+import com.ufi_axis.ui.components.common.UfiPairingApprovalDialog
 import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
 import com.ufi_axis.app.navigation.buildAppScreens
@@ -46,8 +47,14 @@ import com.ufi_axis.app.startup.UfiStartupOverlay
 import androidx.navigation.compose.rememberNavController
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
+import com.ufi_axis.ui.components.common.UfiConfirmHost
+import com.ufi_axis.ui.components.common.UfiConfirmRequest
+import com.ufi_axis.ui.components.common.rememberUfiDialogSuspendState
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiDialogBody
+import com.ufi_axis.ui.components.common.UfiDialogActions
+import com.ufi_axis.ui.components.common.UfiDialogPasswordField
+import com.ufi_axis.ui.components.common.UfiScrollableDialog
 import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
@@ -65,7 +72,6 @@ import com.ufi_axis.ui.theme.UFIAXISTheme
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis_core.util.UiLogBridge
-import com.ufi_axis.util.DeviceKeyStore
 import com.ufi_axis.util.NetworkMonitor
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.module.isForegroundDataFresh
@@ -265,14 +271,24 @@ class MainActivity : ComponentActivity() {
                 // 强制回到 SetupScreen（T05 / 2026-09 P1）。
                 // 必须连密钥一起删：留着旧密钥就等于留着旧设备身份，用户"换设备/重新配对"的
                 // 意图（尤其是把这台从设备列表里摘掉）就落不了地。
-                val onRepairRequested: () -> Unit = {
+                //
+                // 2026-10-21（决策 D6-4）：**先解除设备上的配对记录，再清本地**。
+                // 之前只清本地：core 会留下一条旧指纹记录（密钥已删、永远登不上），
+                // 一旦机主开了「新设备需批准」，这条死记录就满足"存在已配对设备" ——
+                // 于是新配对永远等不到批准，用户被自己挡住。现在带配对密码调 unpair。
+                var showRepairDialog by remember { mutableStateOf(false) }
+                // 2026-10-22：**不再** reset 设备密钥。
+                // 密钥就是本机在设备上的身份 —— reset 之后旧记录还在设备上却再也没人能用，
+                // 等于占掉一个"已配对设备"名额（开启批准后还会挡住自己）。
+                // 现在身份保持不变：设备侧已按本机指纹解除（unpairFingerprint），本地只丢 token。
+                val applyLocalRepair: () -> Unit = {
                     sessionVm?.prepareDeviceSwitch()
                     prefs.token = ""
-                    DeviceKeyStore.reset()
                     prefs.isSetupComplete = false
                     isSetupComplete = false
                     forceSetup = true
                 }
+                val onRepairRequested: () -> Unit = { showRepairDialog = true }
 
                 // 凭据被**确证**吊销 → 清空本地 Token 并回到配对引导（边缘情况 #1/#3）。
                 // 触发条件（444 / 连续次数 / 时间跨度 / 传输失败豁免）全在 RetrofitClient 的
@@ -282,6 +298,11 @@ class MainActivity : ComponentActivity() {
                 // 不再让 RetrofitClient 静态字段永久持有已销毁 Activity。
                 DisposableEffect(prefs) {
                     ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
+                        // 2026-10-21（审计 §B12 附项）：吊销路径也要丢会话缓存。
+                        // 主动「重新配对」那条链早就调了 prepareDeviceSwitch，而 444 这条路只把
+                        // isSetupComplete 置 false —— 于是换到另一台设备后，首屏会先闪上一台的
+                        // CPU/流量、新鲜度戳还留在窗口内导致新设备数据被跳过、播放队列也还是旧路径。
+                        sessionVm?.prepareDeviceSwitch()
                         isSetupComplete = false
                     }
                     onDispose { ConnectionBootstrap.unregisterUnauthorizedHandler() }
@@ -295,6 +316,16 @@ class MainActivity : ComponentActivity() {
                             prefs.token = token
                             ConnectionBootstrap.recreateRetrofit(prefs)
                             prefs.isSetupComplete = true
+                            // 2026-10-21（审计 §A4）：MainViewModel 是 **Activity 作用域**的，
+                            // 重新配对不会重建它，而它内部各 module 攥着配对**前**那个 api/WS 实例。
+                            // HTTP 侧已由 `RetrofitClient.dynamicHostInterceptor` 每次请求重取地址；
+                            // WS 是长连接，必须显式换 url/token 并重连，否则实时数据还挂在旧设备上。
+                            sessionVm?.onEndpointChanged(
+                                ConnectionBootstrap.rewriteWsUrl(prefs.baseUrl),
+                                token
+                            )
+                            // 换设备/重新配对都要丢掉上一台的会话缓存（Room 缓存、新鲜度戳、播放队列）
+                            sessionVm?.prepareDeviceSwitch()
                             isSetupComplete = true
                             forceSetup = false
                         }
@@ -314,10 +345,41 @@ class MainActivity : ComponentActivity() {
                         )
                     )
                     sessionVm = viewModel
+                    // 2026-10-21（审计 §A4）：真正在连的是 VM 里那个 WS 实例 ——
+                    // 重新配对走过 SetupScreen 分支后，上面 `remember` 出来的已经是一个
+                    // 从未 connect 的新对象。生命周期钩子必须作用在 VM 的实例上，否则
+                    // "回前台重连 / 网络恢复重连"全都打在一个死对象上。
+                    val wsRepo = viewModel.webSocket()
+                    // 新设备批准弹窗的「兜底轮询」是否该跑（2026-10-21）。
+                    // 只在 Activity RESUMED 时轮询：后台既弹不出窗口，也没必要耗电。
+                    // 初始值按**当前**生命周期状态取 —— 首帧组合时通常已经是 RESUMED，
+                    // 只等 ON_RESUME 回调的话这条轮询永远起不来（下面 alertPolling 同款处理）。
+                    val approvalPollActive = remember {
+                        mutableStateOf(owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+                    }
+                    // WS 握手被拒（重试用尽）→ **只提示，不清凭据、不回配对页**（2026-10-22 修正）。
+                    //
+                    // 上一版这里写的是 `isSetupComplete = false`，等于把"这次握手没通过"当成
+                    // "凭据被吊销"。而冷启动时 WS 会**先于** /health 的校时发起握手
+                    //（`MainViewModel.init` 里 dashboard.init() 在 health.startPeriodicCheck 之前），
+                    // 设备时钟漂移 >5min 时必然 1008 —— 表现就是「每次打开 App 都要重新登录」。
+                    // 凭据吊销的唯一判据仍然是 HTTP 444 的连击阈值（RetrofitClient 的 AuthRejectionPolicy），
+                    // 这里只把"实时通道断了"告诉用户。
+                    DisposableEffect(wsRepo) {
+                        wsRepo.onAuthRejected = {
+                            runOnUiThread {
+                                toastMessage = ToastMessage(
+                                    "实时通道连接被拒，实时数据暂时中断（不影响配对）",
+                                    ToastType.WARNING
+                                )
+                            }
+                        }
+                        onDispose { wsRepo.onAuthRejected = null }
+                    }
                     // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
                     // 2026-09：同时接健康检查前后台闸门 —— 后台停周期 /health，回前台静默探一次再恢复。
-                    DisposableEffect(webSocketRepository, viewModel) {
-                        webSocketRepository.bindNetworkRecovery(applicationContext)
+                    DisposableEffect(wsRepo, viewModel) {
+                        wsRepo.bindNetworkRecovery(applicationContext)
                         // 2026-09-21：任何业务请求在传输层失败都立刻驱动一次 /health 探活。
                         // 这条桥接与"是哪个域失败"无关，补上了只覆盖 5 个 state 的旧触发链。
                         ConnectionBootstrap.registerTransportFailureHandler {
@@ -326,17 +388,23 @@ class MainActivity : ComponentActivity() {
                         val observer = LifecycleEventObserver { _, event ->
                             when (event) {
                                 Lifecycle.Event.ON_RESUME -> {
-                                    webSocketRepository.onAppForegrounded()
+                                    wsRepo.onAppForegrounded()
+                                    // 内部包含一次「立刻拉待批准列表」（2026-10-21）——
+                                    // App 在后台时推送可能已被系统裁掉，回前台必须马上对齐。
                                     viewModel.onAppForegrounded()
+                                    approvalPollActive.value = true
                                 }
-                                Lifecycle.Event.ON_PAUSE -> viewModel.onAppBackgrounded()
+                                Lifecycle.Event.ON_PAUSE -> {
+                                    viewModel.onAppBackgrounded()
+                                    approvalPollActive.value = false
+                                }
                                 else -> {}
                             }
                         }
                         owner.lifecycle.addObserver(observer)
                         onDispose {
                             owner.lifecycle.removeObserver(observer)
-                            webSocketRepository.unbindNetworkRecovery()
+                            wsRepo.unbindNetworkRecovery()
                             ConnectionBootstrap.unregisterTransportFailureHandler()
                         }
                     }
@@ -399,6 +467,10 @@ class MainActivity : ComponentActivity() {
                     // core 崩溃后由 keepalive 脚本 / START_STICKY 自动拉起，app 此前完全无感 ——
                     // 用户只看到数据断了一下。这里在首帧与每次重新连上设备时拉一次
                     // `GET /api/service/crash`，同一次崩溃只提示一次（去重键是 core 的时间戳）。
+                    //
+                    // 2026-10-23：是否值得提示由 core 的 `recent`（7 天窗口）与本地
+                    // `coreCrashShownAt` 判定，判据集中在 `CoreCrashPolicy`；记账在
+                    // `loadCoreCrashNotice` 发出提示前完成，这里只负责展示与关闭。
                     val coreCrash by viewModel.tools.coreCrashNotice.collectAsState()
                     val wsState by webSocketRepository.connectionState.collectAsState()
                     // 2026-09-05（P3）：触发条件从"每次 wsState 翻转"收紧到**上升沿 + 去抖**。
@@ -453,8 +525,12 @@ class MainActivity : ComponentActivity() {
                         lastEndpoint = next
                         ConnectionBootstrap.recreateRetrofit(prefs)
                         // 刷新实时通道：更新 WS 连接参数（url/token）并重连，
-                        // 避免停留在旧地址（本实例由 MainViewModel 长期持有，更新即作用于同一连接）。
-                        webSocketRepository.updateConfig(
+                        // 避免停留在旧地址。
+                        // 2026-10-21（审计 §A4）：必须走 `sessionVm.onEndpointChanged`
+                        // → 更新的是 VM 里**真正在连的那个**实例；这里 `remember` 出来的
+                        // 那份在"重新配对走过 SetupScreen 分支"之后已经是一个从未 connect 的新对象，
+                        // 更新它等于什么都没做。
+                        sessionVm?.onEndpointChanged(
                             ConnectionBootstrap.rewriteWsUrl(prefs.baseUrl),
                             prefs.token
                         )
@@ -515,6 +591,189 @@ class MainActivity : ComponentActivity() {
                         UfiAlertToastBridge(
                             onAck = { item -> viewModel.dashboard.ackAlertByBanner(item.type) }
                         )
+
+                        // ── 新设备批准（2026-10-15）：**全局**弹窗 ──
+                        //
+                        // 为什么挂在根部而不是某个页面：批准请求可能在机主**任何页面**上到来，
+                        // 而"必须给出结论"的状态不该要求他先摸到「设置 → 安全中心」才看得到。
+                        //
+                        // 发现新请求有两条路（2026-10-21）：
+                        //   1. **主路：core 主动推送** —— 登记成功即经 WS 广播 `data_changed/pairing:approvals`，
+                        //      并快速补发几帧；App 侧 MainViewModel 收到直接 `loadApprovals()`（不吃 800ms 去抖）。
+                        //      这条路径让弹窗在 1 秒内出现。
+                        //   2. **兜底：这里的 30s 周期轮询** —— 覆盖「旧 core 不推送」「WS 一直断着」
+                        //      这两种推送必然失效的情况，保证行为不比以前差。
+                        // 旧 core 没有这组端点 → loadApprovals 内部静默降级（approvalAvailable=false），
+                        // 这里不会弹任何东西。
+                        //
+                        // ⚠ 这里轮询的是**接收方**（已配对 App），它一直是验签过的 WS 客户端 ——
+                        // 2026-10-15 那句「Web 端没凭据所以推不了」说的是**请求方**，别再把两者搞混。
+                        val pairingStateForApproval by viewModel.network.pairingState.collectAsState()
+                        LaunchedEffect(approvalPollActive.value) {
+                            if (!approvalPollActive.value) return@LaunchedEffect
+                            // 回前台那一次已由 `viewModel.onAppForegrounded()` 立刻拉过，
+                            // 所以这里从 delay 开始，只负责「周期地板」。
+                            while (true) {
+                                kotlinx.coroutines.delay(30_000L)
+                                viewModel.network.loadApprovals()
+                            }
+                        }
+                        // 已处理过的 sid：**点完就立刻收起弹窗**，不等下一次刷新。
+                        // 2026-10-17 实测 bug：点「允许」后弹窗关不掉、还反复弹 ——
+                        // 根因是服务端把已批准的条目也列了出来（已修），这里是第二道保险：
+                        // 本地先把这一条记成"处理过"，网络慢也不会让用户对着弹窗干等。
+                        var handledApprovalSid by remember { mutableStateOf<String?>(null) }
+                        // 该 sid 从列表里消失后清掉标记 —— 万一批准失败，下一轮还能再弹出来让用户重试。
+                        LaunchedEffect(pairingStateForApproval.pendingApprovals) {
+                            val handled = handledApprovalSid
+                            if (handled != null && pairingStateForApproval.pendingApprovals.none { it.sid == handled }) {
+                                handledApprovalSid = null
+                            }
+                        }
+                        pairingStateForApproval.pendingApprovals
+                            .firstOrNull { it.sid != handledApprovalSid }
+                            ?.let { pending ->
+                                UfiPairingApprovalDialog(
+                                    code = pending.code,
+                                    deviceName = pending.deviceName,
+                                    source = pending.source,
+                                    requestedAtLabel = java.text.SimpleDateFormat(
+                                        "HH:mm",
+                                        java.util.Locale.getDefault()
+                                    ).format(java.util.Date(pending.requestedAt)),
+                                    onApprove = {
+                                        handledApprovalSid = pending.sid
+                                        // 2026-10-21（审计 §B2）：失败时必须把"已处理"标记撤回 ——
+                                        // 之前失败只写 pairingState.errorMessage（只有安全中心页在渲染），
+                                        // 而弹窗已经关掉了：机主以为批了，其实那条请求还在等。
+                                        viewModel.network.approveDevice(pending.sid) { err ->
+                                            if (err != null) {
+                                                handledApprovalSid = null
+                                                toastMessage = ToastMessage(err, ToastType.ERROR)
+                                            }
+                                        }
+                                    },
+                                    onReject = {
+                                        handledApprovalSid = pending.sid
+                                        viewModel.network.rejectDevice(pending.sid) { err ->
+                                            if (err != null) {
+                                                handledApprovalSid = null
+                                                toastMessage = ToastMessage(err, ToastType.ERROR)
+                                            }
+                                        }
+                                    }
+                                )
+                            }
+
+                        // ── 重新配对：先带密码解除设备上的记录（2026-10-21 决策 D6-4）──
+                        //
+                        // 从设置页的「重新配对 / 切换设备」进来（`onRepairRequested`）。
+                        // 两步是必须的：先在**设备上**解除本机配对（需要配对密码），再清本地凭据。
+                        // 只清本地会留下一条"密钥已删、永远登不上"的旧记录，而它仍然满足
+                        // 「新设备需批准」的前提（存在已配对设备）—— 新配对就永远等不到批准。
+                        if (showRepairDialog) {
+                            // 「切换设备 / 退出」的两段确认 —— 走公共二次确认设施
+                            // （UfiDialogSuspendState + UfiConfirmHost，见 UfiConfirmHost.kt）。
+                            //
+                            // 规则由公共组件保证，这里不再手写 flag：
+                            //   · 确认框在场时父弹窗必须收起（onScreen = externalVisible && !suspended）；
+                            //   · 父弹窗 onDismiss 用 consumeProgrammaticDismiss() 分辨"程序性收起"；
+                            //   · 确认框关掉后 resume() 让父弹窗带着输入回来。
+                            var repairPwd by remember { mutableStateOf("") }
+                            var repairBusy by remember { mutableStateOf(false) }
+                            val repairSuspend = rememberUfiDialogSuspendState()
+                            var repairConfirm by remember { mutableStateOf<UfiConfirmRequest?>(null) }
+
+                            fun closeRepair() {
+                                if (repairBusy) return
+                                showRepairDialog = false
+                                repairPwd = ""
+                                repairConfirm = null
+                                repairSuspend.resume()
+                            }
+
+                            UfiScrollableDialog(
+                                visible = repairSuspend.onScreen(true),
+                                onDismiss = {
+                                    if (repairSuspend.consumeProgrammaticDismiss()) return@UfiScrollableDialog
+                                    closeRepair()
+                                },
+                                title = "解除本机配对",
+                                showCloseButton = false,
+                                actions = {
+                                    UfiDialogActions(
+                                        onDismiss = { closeRepair() },
+                                        onConfirm = {
+                                            if (repairPwd.isNotBlank()) {
+                                                // 先收起本弹窗（草稿保留），确认框独立上场。
+                                                repairSuspend.suspend()
+                                                repairConfirm = UfiConfirmRequest(
+                                                    title = "解除本机配对？",
+                                                    text = "将解除这台手机在该设备上的配对记录，并清除本机保存的连接凭据，" +
+                                                        "然后回到配对引导。\n\n" +
+                                                        "· 其他已配对的手机不受影响\n" +
+                                                        "· 设备上的其他数据不会被删除\n" +
+                                                        "· 重新使用这台手机需要再配对一次",
+                                                    confirmText = "解除",
+                                                    dismissText = "暂不解除",
+                                                    destructive = true,
+                                                    onConfirm = {
+                                                        repairConfirm = null
+                                                        repairBusy = true
+                                                        // 只解除**本机**这一条记录：unpairAll 会把设备上
+                                                        // 其他已配对手机一起踢掉 —— 那就是"切换设备导致全部配对丢失"。
+                                                        viewModel.network.unpairFingerprint(
+                                                            fingerprint = prefs.appFingerprint,
+                                                            password = repairPwd
+                                                        ) { err ->
+                                                            repairBusy = false
+                                                            if (err != null) {
+                                                                // 失败：确认框收起，父弹窗回来，密码还在，可重试。
+                                                                repairSuspend.resume()
+                                                                toastMessage = ToastMessage(err, ToastType.ERROR)
+                                                            } else {
+                                                                repairSuspend.resume()
+                                                                closeRepair()
+                                                                applyLocalRepair()
+                                                                toastMessage = ToastMessage(
+                                                                    "已解除本机配对，请重新配对",
+                                                                    ToastType.SUCCESS
+                                                                )
+                                                            }
+                                                        }
+                                                    },
+                                                    onDismiss = {
+                                                        // 「暂不解除」：回到输密码那一步，草稿保留。
+                                                        repairConfirm = null
+                                                        repairSuspend.resume()
+                                                    }
+                                                )
+                                            }
+                                        },
+                                        confirmText = "继续",
+                                        confirmDestructive = true,
+                                        enabled = repairPwd.isNotBlank() && !repairBusy
+                                    )
+                                }
+                            ) {
+                                UfiDialogBody {
+                                    Text(
+                                        "要切换到另一台设备或退出登录，需要先在设备上解除这台手机的" +
+                                            "配对记录（输入配对密码）。\n\n" +
+                                            "只会解除本机这一条，其他已配对的手机不受影响。",
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    UfiDialogPasswordField(
+                                        label = "配对密码",
+                                        value = repairPwd,
+                                        onValueChange = { repairPwd = it }
+                                    )
+                                }
+                            }
+
+                            // 确认框宿主：request 为空时不渲染任何窗口。
+                            UfiConfirmHost(repairConfirm)
+                        }
 
                         // ── 全局错误 → Toast（2026-09-05 第二版）──
                         //

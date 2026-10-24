@@ -53,13 +53,15 @@ fun CfDetailScreen(viewModel: MainViewModel, navController: NavHostController) {
             }
         }
     ) { padding ->
-        UfiPageBackground(
-            modifier = Modifier.padding(padding),
-            contentHPadding = Spacing.PagePadding
-        ) {
+        // 2026-10-13：本页**不再**给 `contentHPadding`（原为 PagePadding = 12dp）。横向留白改由
+        // 组件自带：UfiEntryCard 已内建 CardHorizontalMargin（16dp）。UfiEmptyState 自带
+        // SectionSpacing（24dp）内距，是居中空态而不是卡片，不需要再补。
+        // UfiErrorBanner 也**不需要**补：它是 Popup，横向位置由 sideMargin 独立算出（见其 KDoc）。
+        UfiPageBackground(modifier = Modifier.padding(padding)) {
+            // 平级入口卡之间的间距走 Spacing.SettingsCardGap（与网络设置页/内网穿透设置页同档）。
             Column(
                 modifier = Modifier.fillMaxWidth().padding(vertical = Spacing.Large),
-                verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
             ) {
                 state.errorMessage?.let { msg -> UfiErrorBanner(message = msg) }
 

@@ -5,7 +5,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -23,6 +25,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import android.graphics.BitmapFactory
 import androidx.navigation.NavHostController
 import com.ufi_axis.data.model.*
@@ -34,6 +39,8 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.module.APP_LIST_FRESH_MS
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -44,6 +51,10 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     var cachedDetail by remember { mutableStateOf<AppDetailResponse?>(null) }
     // 「授予全部权限」是一次性动作：结果只弹 Toast，不进 AppManageState（免得错误挂成常驻横幅）
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
+    // 静默轮询上线后（见下方轮询的说明），同一句失败文案会每隔一轮重新落到 errorMessage 上
+    // （Module 每次 load 先把 errorMessage 置 null）。记住"上一次已经提示过的文案"去重，
+    // 免得设备一直连不上时每 30s 弹一次同样的 Toast —— 只提示第一次，内容变了再提示。
+    var lastErrorToast by remember { mutableStateOf<String?>(null) }
     var grantAllRunning by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
@@ -53,6 +64,47 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     LaunchedEffect(state.filter) { viewModel.apps.loadAppList(state.filter) }
     LaunchedEffect(state.selectedApp) { if (state.selectedApp != null) cachedDetail = state.selectedApp }
 
+    // ── 静默轮询（2026-10-21）────────────────────────────────────────────────
+    // 顶栏刷新按钮删除后，本页只剩「进页面 30s 新鲜窗口 + 切页签 force + 写后回读」三条出口，
+    // 别处装 / 卸 / 冻结的应用不会自己冒出来（这一页也没有 WS 推送），所以补一条静默轮询兜住。
+    //
+    // 为什么不用 `force = true`：force 绕过的是**客户端**那道 30s 新鲜窗口，语义是
+    // "用户显式动作必须立刻真打一次"。轮询是自动路径，绕过窗口等于每轮白付一次 core 的
+    // `listApps`（4 条特权 shell，设备上是秒级）；非 force 路径在窗口内直接 return，
+    // 命中时一个请求都不发 —— 这也是 core 那 5 分钟缓存之外的第二层省。
+    //
+    // 为什么轮询不会闪骨架（关键依据，别改成 force / 别顺手把 isLoading 写回去）：
+    // `AppManagerModule.loadAppList` 只有在 `loadedFilter != filter` 时才写 `isLoading = true`，
+    // 轮询带的是**当前已加载的那个 filter**，于是 isLoading 恒不被翻，
+    // 内容区不会换成 UfiSkeletonGroup —— 列表子树、LazyListState、renderLimit 全部原地保留。
+    // 更彻底的是：`errorMessage = null` + `filter` 未变时那次 copy 与原状态结构相等，
+    // StateFlow 根本不发射，连重组都没有。
+    //
+    // 可见性判据与短信页 / 下载页同款：只在 ON_RESUME 期间跑（切后台立刻停，回前台重新起）。
+    // 本页是 DETAIL 路由，退出即整棵组合销毁、LaunchedEffect 自动取消，故不必再叠页面前台判据。
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+    LaunchedEffect(lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
+        while (true) {
+            delay(APP_LIST_POLL_MS)
+            // 每轮现读 state.filter：用户切了页签就跟着刷当前那份列表。
+            // 刻意**不**把 filter 放进 LaunchedEffect 的 key —— 切页签本身已经 force 拉过一次，
+            // 再重置定时器只会让"切来切去"永远等不到下一轮。
+            viewModel.apps.loadAppList(state.filter)
+        }
+    }
+
     // 筛选页签（复用公共 UfiScrollableTabRow，与下载管理「全部/未完成/已完成」同款胶囊滑块）
     val filterValues = listOf("user", "system", "all")
     val filterTabs = listOf("用户", "系统", "全部")
@@ -60,11 +112,13 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
 
     UfiScreenScaffold(title = "应用管理", navController = navController, showBack = true,
         actions = {
-            if (state.hasRoot) Icon(Icons.Default.VerifiedUser, null, Modifier.padding(end = 8.dp), tint = LocalResolvedPalette.current.accent)
-            // force = true：刷新按钮是用户显式动作，必须绕过新鲜窗口真打一次。
-            // 注意它绕过的是**客户端**闸门；core 侧那条 5 分钟缓存同样会被写操作/TTL 处理，
-            // 但手动刷新在"装完应用马上想看到"这个最常见的诉求下拿到的是最新数据。
-            IconButton(onClick = { viewModel.apps.loadAppList(state.filter, force = true) }) { Icon(Icons.Default.Refresh, null) }
+            // 2026-10-21（用户要求）顶栏两处删除：
+            // ① 刷新左边的 Root 徽标（`Icons.Default.VerifiedUser`，由 `state.hasRoot` 控制）——
+            //    它只说明"当前有特权 shell"，而这已经从「授予全部权限」按钮的可点状态上体现，
+            //    留在顶栏是废弃的重复标识；
+            // ② 刷新按钮本身 —— 列表在进页面时（`LaunchedEffect(state.filter)`，带 30s 新鲜窗口）
+            //    与切页签时都会真拉，安装/卸载后也有写后回读，手工重拉没有额外价值。
+            // `state.hasRoot` 仍被详情弹窗使用（见下方 AppDetailDialog），不要一并删掉。
             IconButton(onClick = { showInstallDialog = true }) { Icon(Icons.Default.Add, null) }
         }
     ) { padding ->
@@ -112,7 +166,14 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
                 }
             )
 
-            state.errorMessage?.let { UfiErrorBanner(message = it, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) }
+            // 2026-10-19：应用管理的错误提示改用 **Toast**（用户要求），不再用常驻错误横幅。
+            // 横幅的问题：它占一行、不会自己消失，而"卸载失败/安装失败"是一次性反馈。
+            LaunchedEffect(state.errorMessage) {
+                val msg = state.errorMessage ?: return@LaunchedEffect
+                if (msg == lastErrorToast) return@LaunchedEffect
+                lastErrorToast = msg
+                toastMessage = ToastMessage(msg, ToastType.ERROR)
+            }
 
             if (state.isLoading) {
                 // 2026-09-03：应用列表首次加载从居中转圈改为骨架屏。
@@ -133,8 +194,20 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
                     UfiEmptyState(icon = Icons.Default.Android, message = "未找到应用")
                 }
             } else {
-                LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    items(state.apps, key = { it.packageName }) { app ->
+                // ── 懒加载 = 渐进渲染（不是真分页）────────────────────────────────────
+                // 依据：core 的 `/api/apps/list`（AppManager.listApps）按 filter 一次性回全量，
+                // 没有 offset/limit；app 侧 `getAppList(filter)` 同样没有分页参数。要做真分页得改
+                // 服务端契约，本次不动 core，故与下载管理 / 短信同款：客户端分批挂载同一份数据。
+                // 本页尤其需要：设备上动辄两三百个包，每行还要解一次 base64 图标，
+                // 首帧少挂一批行就等于少解一批图标。
+                var renderLimit by remember(state.filter) { mutableStateOf(APP_RENDER_PAGE) }
+                val renderedApps = state.apps.take(renderLimit)
+                val listState = rememberLazyListState()
+                AppNearEndEffect(listState, renderedApps.size) {
+                    renderLimit = (renderLimit + APP_RENDER_PAGE).coerceAtMost(state.apps.size)
+                }
+                LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(renderedApps, key = { it.packageName }) { app ->
                         AppListItem(app = app, onClick = { viewModel.apps.loadAppDetail(app.packageName) })
                     }
                 }
@@ -143,6 +216,50 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
         UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
         }
     }
+}
+
+/**
+ * 渐进渲染批大小。取 30（与短信页一致）：应用行是「48dp 图标 + 两行文字」的中等高度，
+ * 30 行已经超过两屏，再多只是让首帧多解一批 base64 图标。
+ */
+private const val APP_RENDER_PAGE = 30
+
+/** 距尾部还剩几条就追加下一批（提前量，滚到底才追加会看到停顿）。 */
+private const val APP_RENDER_LOAD_AHEAD = 5
+
+/**
+ * 应用列表静默轮询间隔（ms）。
+ *
+ * 取「新鲜窗口 + 余量」而不是裸 30s，理由很具体：`loadAppList` 的非 force 路径在
+ * [APP_LIST_FRESH_MS] 窗口内直接 return，而窗口的起点是**请求成功那一刻**，
+ * 比本轮 tick 的起点晚几十毫秒到几秒（core 侧一次 `listApps` 要串 4 条特权 shell）。
+ * 若间隔恰好等于窗口，每个 tick 看到的 age 都是「30s − 那段延迟」< 30s，
+ * 全被闸门吃掉 ⇒ 实际刷新节奏退化成两轮一次（≈60s）。
+ * 留 5s 余量后节奏稳定在 ~30s，同时仍是**非 force** 调用：闸门与 core 的 5 分钟缓存都照旧生效。
+ */
+private const val APP_LIST_POLL_MS = APP_LIST_FRESH_MS + 5_000L
+
+/**
+ * 列表滚到接近末尾就回调一次 —— 与 `:app:feature-media` 的 `MediaNearEndEffect` 同构。
+ *
+ * 为什么不直接复用那个公共件：本模块（`:app:feature-apps`）依赖不到 `:app:feature-media`，
+ * 为十几行工具函数新增一条跨模块依赖不划算，所以在模块内放一份同构实现。
+ * 判定包在 `derivedStateOf` 里：`visibleItemsInfo` 每帧都在变，直接在组合里读会导致
+ * 每滚一像素就重组一次；这里只有越过阈值那一次布尔翻转会触发 [LaunchedEffect]。
+ */
+@Composable
+private fun AppNearEndEffect(
+    listState: LazyListState,
+    itemCount: Int,
+    onNearEnd: () -> Unit
+) {
+    val nearEnd by remember(itemCount) {
+        derivedStateOf {
+            val last = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            itemCount > 0 && last >= itemCount - APP_RENDER_LOAD_AHEAD
+        }
+    }
+    LaunchedEffect(nearEnd) { if (nearEnd) onNearEnd() }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -293,16 +410,21 @@ private fun AppDetailDialog(
 ) {
     // 危险操作（卸载/禁用/清数据/强停）需二次确认；安全操作（启用/冻结）直接执行（UID-004）。
     if (detail == null) return
-    var pendingAction by remember { mutableStateOf<String?>(null) }
-    // 「授予全部权限」自己一套确认态：它不属于 pendingAction 那组（文案与风险等级都不同）
-    var showGrantAllConfirm by remember { mutableStateOf(false) }
+    // 2026-10-22：确认框改走公共二次确认设施（UfiDialogSuspendState + UfiConfirmHost）。
+    // 本页两个确认都是**从详情弹窗内部**触发的，父弹窗必须先在确认框出现时收起 ——
+    // 否则两个 Dialog 窗口叠着开：backdrop 丢模糊 / 闪烁 / 确认框被前一个窗口带走。
+    val confirmSuspend = rememberUfiDialogSuspendState()
+    var confirmRequest by remember { mutableStateOf<UfiConfirmRequest?>(null) }
     // v18：icon 优先用外部传入的 list 缓存 iconBase64，detail 自带的作为 fallback（兼容老逻辑）
     val effectiveIcon = iconBase64.ifBlank { detail.iconBase64 }
     val detailIcon = remember(effectiveIcon) { decodeBase64Icon(effectiveIcon) }
     val palette = LocalResolvedPalette.current
     UfiScrollableDialog(
-        visible = visible,
-        onDismiss = onDismiss,
+        visible = confirmSuspend.onScreen(visible),
+        onDismiss = {
+            if (confirmSuspend.consumeProgrammaticDismiss()) return@UfiScrollableDialog
+            onDismiss()
+        },
         title = null, // v16：去掉弹窗标题，把"应用名"放进头部 Row 显眼展示
         showCloseButton = false,
         // v17：去掉全宽"关闭"按钮（突兀），改用头部 Row 右上角 X（IconButton）
@@ -378,6 +500,40 @@ private fun AppDetailDialog(
                 ActionSpec("uninstall", "卸载", Icons.Filled.Delete, true)
             )
             val dangerousKeys = remember { setOf("disable", "clear", "force-stop", "uninstall") }
+            // 确认文案需要的两个事实：原先在确认块里声明，确认块改走宿主后仍要用，提前取出。
+            val packageName = detail.packageName
+            val isSystemApp = detail.isSystem
+
+            fun showDangerConfirm(actionKey: String, actionLabel: String) {
+                val riskText = buildString {
+                    append("确定要对 $packageName 执行「$actionLabel」吗？\n")
+                    when (actionKey) {
+                        "uninstall" -> append("应用将被卸载，数据不可恢复。")
+                        "clear" -> append("应用数据将被清除。")
+                        "disable" -> append("应用将被禁用，需重新启用后方可使用。")
+                        "force-stop" -> append("应用将被强制停止。")
+                    }
+                    if (isSystemApp && hasRoot) {
+                        append("\n⚠ 该应用为系统应用且当前处于 Root 模式，操作可能导致设备功能异常。")
+                    }
+                }
+                confirmSuspend.suspend()
+                confirmRequest = UfiConfirmRequest(
+                    title = "确认$actionLabel",
+                    text = riskText,
+                    confirmText = "确认$actionLabel",
+                    destructive = true,
+                    onConfirm = {
+                        confirmRequest = null
+                        confirmSuspend.resume()
+                        onAction(actionKey)
+                    },
+                    onDismiss = {
+                        confirmRequest = null
+                        confirmSuspend.resume()
+                    }
+                )
+            }
             actions.chunked(3).forEach { rowActions ->
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
                     rowActions.forEach { spec ->
@@ -385,7 +541,9 @@ private fun AppDetailDialog(
                         val iconTint = if (spec.dangerous) palette.error else palette.textPrimary
                         OutlinedButton(
                             onClick = {
-                                if (spec.key in dangerousKeys) pendingAction = spec.key else onAction(spec.key)
+                                if (spec.key in dangerousKeys) {
+                                    showDangerConfirm(spec.key, spec.label)
+                                } else onAction(spec.key)
                             },
                             modifier = Modifier.weight(1f).height(50.dp),
                             shape = UfiCardDefaults.dialogShape,
@@ -418,7 +576,29 @@ private fun AppDetailDialog(
             UfiButton(
                 variant = UfiButtonVariant.Danger,
                 text = "授予全部权限",
-                onClick = { showGrantAllConfirm = true },
+                onClick = {
+                    confirmSuspend.suspend()
+                    confirmRequest = UfiConfirmRequest(
+                        title = "授予全部权限",
+                        text = buildString {
+                            append("将一次性授予 $packageName 声明的全部运行时权限，")
+                            append("可能包含定位、短信、通话记录、存储等敏感权限。\n\n")
+                            append("此操作没有「一键撤销」，之后只能逐条手动收回。")
+                            if (isSystemApp) append("\n\n⚠ 该应用为系统应用，放开全部权限的影响面更大。")
+                        },
+                        confirmText = "确认授予",
+                        destructive = true,
+                        onConfirm = {
+                            confirmRequest = null
+                            confirmSuspend.resume()
+                            onGrantAllPermissions()
+                        },
+                        onDismiss = {
+                            confirmRequest = null
+                            confirmSuspend.resume()
+                        }
+                    )
+                },
                 enabled = hasRoot && !grantAllRunning,
                 modifier = Modifier.fillMaxWidth()
             )
@@ -432,54 +612,14 @@ private fun AppDetailDialog(
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 4.dp)
             )
 
-            // ── 危险操作二次确认弹窗（卸载/禁用/清数据/强停，UID-004） ──
-            val packageName = detail.packageName
-            val isSystemApp = detail.isSystem
-
-            if (showGrantAllConfirm) {
-                UfiConfirmDialog(
-                    title = "授予全部权限",
-                    text = buildString {
-                        append("将一次性授予 $packageName 声明的全部运行时权限，")
-                        append("可能包含定位、短信、通话记录、存储等敏感权限。\n\n")
-                        append("此操作没有「一键撤销」，之后只能逐条手动收回。")
-                        if (isSystemApp) append("\n\n⚠ 该应用为系统应用，放开全部权限的影响面更大。")
-                    },
-                    confirmText = "确认授予",
-                    dismissText = "取消",
-                    destructive = true,
-                    onConfirm = { showGrantAllConfirm = false; onGrantAllPermissions() },
-                    onDismiss = { showGrantAllConfirm = false }
-                )
-            }
-
-            pendingAction?.let { actionKey ->
-                val actionLabel = actions.firstOrNull { it.key == actionKey }?.label ?: actionKey
-                val riskText = buildString {
-                    append("确定要对 $packageName 执行「$actionLabel」吗？\n")
-                    when (actionKey) {
-                        "uninstall" -> append("应用将被卸载，数据不可恢复。")
-                        "clear" -> append("应用数据将被清除。")
-                        "disable" -> append("应用将被禁用，需重新启用后方可使用。")
-                        "force-stop" -> append("应用将被强制停止。")
-                    }
-                    if (isSystemApp && hasRoot) {
-                        append("\n⚠ 该应用为系统应用且当前处于 Root 模式，操作可能导致设备功能异常。")
-                    }
-                }
-                UfiConfirmDialog(
-                    title = "确认$actionLabel",
-                    text = riskText,
-                    confirmText = "确认$actionLabel",
-                    dismissText = "取消",
-                    destructive = true,
-                    onConfirm = { onAction(actionKey); pendingAction = null },
-                    onDismiss = { pendingAction = null }
-                )
-            }
         }
     }
+
+    // 确认框宿主：request 为空时不渲染任何窗口；
+    // 两个确认（授予全部权限 / 危险操作）都从详情弹窗内部触发，父弹窗已在 suspend() 时收起。
+    UfiConfirmHost(confirmRequest)
 }
+
 /** base64（PNG）→ Compose ImageBitmap；空/非法返回 null（前端显示 fallback 默认图标）。 */
 private fun decodeBase64Icon(base64: String): ImageBitmap? = try {
     if (base64.isBlank()) null

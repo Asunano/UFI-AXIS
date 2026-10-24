@@ -2,6 +2,10 @@
 package com.ufi_axis.ui.components.common
 
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.AnimationSpec
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.foundation.clickable
@@ -113,6 +117,14 @@ fun UfiBottomDock(
 ) {
     if (tabs.isEmpty()) return
 
+    // 2026-10-24：弹窗期间不再整条消失，改为快速"下沉"（降低不透明度 + 轻微缩小 + 下移）。
+    // 140ms 完成，比原来的瞬间消失连贯；计数来自 UfiDialogShell（UfiDialogVisibility）。
+    val dialogOpen = UfiDialogVisibility.isOpen
+    val sinkSpec = tween<Float>(durationMillis = 140, easing = FastOutSlowInEasing)
+    val sinkAlpha by animateFloatAsState(if (dialogOpen) 0.32f else 1f, sinkSpec, label = "dockSinkAlpha")
+    val sinkScale by animateFloatAsState(if (dialogOpen) 0.97f else 1f, sinkSpec, label = "dockSinkScale")
+    val sinkOffsetDp by animateFloatAsState(if (dialogOpen) 10f else 0f, sinkSpec, label = "dockSinkY")
+
     val palette = LocalResolvedPalette.current
     val density = LocalDensity.current
     val layoutDirection = LocalLayoutDirection.current
@@ -139,14 +151,25 @@ fun UfiBottomDock(
     // 三键导航下 navigationBars(48dp) 通常就是 reserved 的胜出者 ⇒ topPad = 0、
     // bottomPad = 全部，与改之前完全一致（那时按键带确实需要整段让开）。
     val systemBarPx: Int = LocalCapsuleBottomSystemBar.current
-    // ★ 2026-09-24 第二轮：在系统栏本体之上再多留 [DOCK_ICON_LIFT]，把内容整体往上抬。
+    // 2026-10-20：抬升量用户可调（外观 → 底部栏抬高），默认 12dp（原写死 8dp + 4dp）。
+    // 这里单独取一份 ThemeManager（与文件内另一处同构，observeExternal = true 才能跟随设置页写入）。
+    val dockContext = LocalContext.current.applicationContext
+    val dockThemeManager = remember { ThemeManager(dockContext, observeExternal = true) }
+    DisposableEffect(dockThemeManager) { onDispose { dockThemeManager.dispose() } }
+    val dockLiftDp by dockThemeManager.dockLiftDp.collectAsState()
+    // ★ 2026-09-24 第二轮：在系统栏本体之上再多留抬升量，把内容整体往上抬。
     //   总高仍由下面那条恒等式锁住（topPad + 内容 + bottomPad ≡ reservedDp），
     //   抬升是在预留区**内部**重新分配，栏高一个像素不变。
+    //   2026-10-20：抬升量改为**用户可调**（外观 → 底部栏抬高），默认 12dp（原写死 8dp + 4dp）。
     //   `coerceAtMost(reservedDp)`：横屏 / 无导航栏时 reserved 可能比这个和还小，
     //   夹住才不会让 topPadDp 变成负数（Dp 允许负值，Spacer 会直接抛测量异常）。
-    val bottomPadDp: Dp =
-        (with(density) { systemBarPx.toDp() } + DOCK_ICON_LIFT).coerceAtMost(reservedDp)
-    val topPadDp: Dp = reservedDp - bottomPadDp
+    // 2026-10-20（修正 2）：抬高量直接进 bottomPad，且**不再夹 reservedDp**。
+    // 原因：手势导航下 reserved ≈ systemBar ≈ 37dp，`systemBar + 8/12` 必然被 coerceAtMost 夹平
+    // → 用户两次反馈"没有变化"。抬高量属于"栏总高增长"，与"预留区内部重新分配"是两件事：
+    // bottomPad = 系统栏 + 抬高量（窗口高度随之增长、内容整体上移），
+    // topPad 仍按 reserved 拆分并夹到 0（Dp 不允许负数）。
+    val bottomPadDp: Dp = with(density) { systemBarPx.toDp() } + dockLiftDp.dp
+    val topPadDp: Dp = (reservedDp - bottomPadDp).coerceAtLeast(0.dp)
 
     // 把「栏的实测总高」回写给窗口宿主。
     //
@@ -791,10 +814,9 @@ private val DOCK_MIN_TOUCH_TARGET: Dp = 48.dp
 /**
  * 内容整体上抬量（2026-09-24 用户定稿："图标往上移动 8dp"）。
  *
- * 加在 `bottomPadDp` 上、从 `topPadDp` 里扣 —— 两者之和恒等于预留区，所以**栏总高不变**。
- * 上限被 `coerceAtMost(reservedDp)` 夹住：预留区本来就很小（横屏 / 无导航栏）时不抬，
- * 否则 topPad 会变负。
+ * 2026-10-20：已改为用户可调（`ThemeManager.dockLiftDp`，默认 12dp），本常量仅保留取值来源说明。
  */
+@Suppress("unused")
 private val DOCK_ICON_LIFT: Dp = 8.dp
 
 /** 药丸相对单元格的纵向内缩（上下各一份）。 */

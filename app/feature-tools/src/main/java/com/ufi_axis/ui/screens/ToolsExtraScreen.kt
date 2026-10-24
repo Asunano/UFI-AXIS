@@ -68,6 +68,7 @@ internal val TOOLS_PRIMARY = listOf(
  * 放在最后免得手滑。
  */
 internal val TOOLS_EXTRA = listOf(
+    // 2026-10-20：DLNA 入口已按用户要求移到「设置 → 小功能」（UiExtrasSettingsScreen）。
     ToolEntry("内网穿透", Icons.Default.VpnLock, "FRP · CF Tunnel", Routes.DETAIL_TUNNEL),
     ToolEntry("定时任务", Icons.Default.Schedule, "脚本调度", Routes.DETAIL_TASKS),
     ToolEntry("应用管理", Icons.Default.Apps, "安装/卸载", Routes.DETAIL_APPS),
@@ -105,6 +106,11 @@ private val TOOL_GRID_GAP = 12.dp
 
 /**
  * 两列入口网格。一级页与进阶页共用，避免两边各调一套 padding/间距然后慢慢分叉。
+ *
+ * 2026-10-13：网格的横向外边距由这个 [FlowRow] 独家提供（`Spacing.PagePadding`），
+ * 所以逐张 [UfiGridCard] 显式传 `horizontalMargin = 0.dp` —— UfiGridCard 现在默认自带
+ * `CardHorizontalMargin`，但网格卡是 `weight(1f)` 的**列**：逐卡再加外边距会同时把
+ * 左右外边距和两列之间的间距一起撑开（12+16+16=44dp），网格直接散架。
  */
 @Composable
 internal fun ToolGrid(
@@ -124,7 +130,8 @@ internal fun ToolGrid(
                 title = entry.title,
                 icon = entry.icon,
                 description = entry.description,
-                onClick = { navController.navigate(entry.route) }
+                onClick = { navController.navigate(entry.route) },
+                horizontalMargin = 0.dp
             )
         }
     }

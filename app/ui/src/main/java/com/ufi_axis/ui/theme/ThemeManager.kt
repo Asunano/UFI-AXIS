@@ -3,6 +3,7 @@ package com.ufi_axis.ui.theme
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.compose.ui.graphics.Color
+import com.ufi_axis_core.util.UiLogBridge
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -151,6 +152,28 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
     private val _blurEnabled: MutableStateFlow<Boolean> = sharedBlurEnabled
     val blurEnabled: StateFlow<Boolean> = _blurEnabled.asStateFlow()
 
+    // 2026-10-14：二级页转场的另外两项效果开关（压暗 / 圆角）。
+    // 与 [blurEnabled] 完全同一套机制（companion 共享 flow + 独立播种标记位），因为同样要被
+    // MainNavGraph（转场层）与外观设置页两个不同实例同时读写 —— 见 [blurEnabled] 上方那段长注释。
+    //
+    // 2026-10-19：**压暗默认改为 false** —— 部分系统上渐变式压暗会频闪，
+    // 出厂默认关闭，需要时可在「外观 → 切换动画」里打开（与「过渡模糊」同口径）。
+    private val _navScrimEnabled: MutableStateFlow<Boolean> = sharedNavScrimEnabled
+    val navScrimEnabled: StateFlow<Boolean> = _navScrimEnabled.asStateFlow()
+
+    private val _navCornersEnabled: MutableStateFlow<Boolean> = sharedNavCornersEnabled
+    val navCornersEnabled: StateFlow<Boolean> = _navCornersEnabled.asStateFlow()
+
+    /**
+     * 可预测性返回（跟手预览）开关（2026-10-19）。
+     *
+     * 关掉后由 App 自己接管返回：转场按用户设置的时长完整播放，不再被"快滑"缩短。
+     * manifest 侧的 `enableOnBackInvokedCallback` 保持 true（它是编译期开关，无法运行时切），
+     * 由 `MainNavGraph` 在运行时注册一个非预测性回调来实现"关闭"。
+     */
+    private val _navPredictiveBack: MutableStateFlow<Boolean> = sharedNavPredictiveBack
+    val navPredictiveBack: StateFlow<Boolean> = _navPredictiveBack.asStateFlow()
+
     // ── 全局 UI 缩放（百分比）：整页 dp + sp 等比缩放 ──
     //
     // 落地方式是在 [UFIAXISTheme] 里覆盖 LocalDensity，而**不是**去改 Spacing / Type 常量：
@@ -177,6 +200,13 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         prefs.getInt(KEY_CAPSULE_LIFT_DP, DEFAULT_CAPSULE_LIFT_DP)
     )
     val capsuleLiftDp: StateFlow<Int> = _capsuleLiftDp.asStateFlow()
+
+    // ── 底部低栏内容抬高（dp，2026-10-20）──
+    // 用户要求：在当前基础上再抬 4dp（原写死 8dp → 默认 12dp），并开放给用户自定义。
+    // 与胶囊参数同构：实例级 flow + init 里的外部变更分支（设置页写、低栏读）。
+    private val _dockLiftDp =
+        MutableStateFlow(prefs.getInt(KEY_DOCK_LIFT_DP, DEFAULT_DOCK_LIFT_DP))
+    val dockLiftDp: StateFlow<Int> = _dockLiftDp.asStateFlow()
 
     // ── 胶囊图标尺寸（dp） ──
     private val _capsuleIconSizeDp = MutableStateFlow(
@@ -226,9 +256,20 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
                     prefs.getInt(KEY_TRANSITION_DURATION_MS, TRANSITION_DURATION_DEFAULT_MS)
                 )
             KEY_BLUR_ENABLED -> _blurEnabled.value =
-                prefs.getBoolean(KEY_BLUR_ENABLED, true)
+                prefs.getBoolean(KEY_BLUR_ENABLED, false)
+            KEY_NAV_SCRIM_ENABLED -> _navScrimEnabled.value =
+                prefs.getBoolean(KEY_NAV_SCRIM_ENABLED, false)
+            KEY_NAV_CORNERS_ENABLED -> _navCornersEnabled.value =
+                prefs.getBoolean(KEY_NAV_CORNERS_ENABLED, true)
+            // 2026-10-21：可预测性返回**刻意不在这里加分支**（原有一支，已删）。
+            // 与上面那段铁律同因：它是 companion 共享 flow，跨实例可见性由 flow 本身提供；
+            // 一旦留一支"从磁盘回读"的代码，任何磁盘写滞后（`apply()` 排队中、另一个进程
+            // 整份重写了 `ufi_axis_prefs`）都会把用户刚写进内存的 false 回灌成 true，
+            // 表现就是"拨了关、过一会儿又自己开了"。诊断日志见 [setNavPredictiveBack]。
             KEY_CAPSULE_LIFT_DP -> _capsuleLiftDp.value =
                 prefs.getInt(KEY_CAPSULE_LIFT_DP, DEFAULT_CAPSULE_LIFT_DP)
+            KEY_DOCK_LIFT_DP -> _dockLiftDp.value =
+                prefs.getInt(KEY_DOCK_LIFT_DP, DEFAULT_DOCK_LIFT_DP)
             KEY_CAPSULE_ICON_SIZE_DP -> _capsuleIconSizeDp.value =
                 prefs.getInt(KEY_CAPSULE_ICON_SIZE_DP, DEFAULT_CAPSULE_ICON_SIZE_DP)
             KEY_CAPSULE_LABEL_TEXT_SP -> _capsuleLabelTextSp.value =
@@ -264,8 +305,40 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
             // 模糊开关的播种：Boolean 没有可当哨兵的非法值（true / false 都合法），
             // 所以用一个独立的标记位表达「已读过盘」，语义等价于时长那项的 -1。
             if (!blurSeeded) {
-                sharedBlurEnabled.value = prefs.getBoolean(KEY_BLUR_ENABLED, true)
+                sharedBlurEnabled.value = prefs.getBoolean(KEY_BLUR_ENABLED, false)
                 blurSeeded = true
+            }
+            // 二级页转场效果的两项开关：播种方式与 blurEnabled 逐字一致
+            //（Boolean 没有可当哨兵的非法值，各用一个独立标记位）。
+            if (!navScrimSeeded) {
+                sharedNavScrimEnabled.value = prefs.getBoolean(KEY_NAV_SCRIM_ENABLED, false)
+                navScrimSeeded = true
+            }
+            if (!navCornersSeeded) {
+                sharedNavCornersEnabled.value = prefs.getBoolean(KEY_NAV_CORNERS_ENABLED, true)
+                navCornersSeeded = true
+            }
+            // 可预测性返回的播种（2026-10-21 加强）：
+            // 仍是「companion 共享 flow + 独立标记位」的老范式，但这里多做了两件事，
+            // 因为这一项的用户反馈是「关掉 → 杀进程重进又开启」，而"重进读到的是磁盘值
+            // 还是默认值"只有日志能分开：
+            //   ① 播种结论打日志（含 `keyPresent`）—— `keyPresent=false` 说明**从来没写成功**，
+            //      `keyPresent=true 且值=true` 说明**被写回了 true**，两种根因处置完全不同；
+            //   ② 键不存在时立刻把默认值固化到盘上。从此"键缺失"不再是一种可到达的状态，
+            //      之后任何"重进变开"都能确定是被写回了 true，而不是又一次从默认值起步。
+            if (!navPredictiveBackSeeded) {
+                val keyPresent = prefs.contains(KEY_NAV_PREDICTIVE_BACK)
+                val stored = prefs.getBoolean(KEY_NAV_PREDICTIVE_BACK, NAV_PREDICTIVE_BACK_DEFAULT)
+                sharedNavPredictiveBack.value = stored
+                navPredictiveBackSeeded = true
+                if (!keyPresent) {
+                    prefs.edit().putBoolean(KEY_NAV_PREDICTIVE_BACK, stored).commit()
+                }
+                UiLogBridge.w(
+                    TAG,
+                    "seed navPredictiveBack=$stored keyPresent=$keyPresent " +
+                        "persistedDefault=${!keyPresent} observeExternal=$observeExternal"
+                )
             }
             // 皮肤 id 的播种 + **老用户迁移**：出厂默认曾是 "aurora"，而本轮只保留 "default"，
             // 所以磁盘上可能存着已删除的 id。规整结果若与盘上不同就写回去，
@@ -450,11 +523,69 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
     }
 
     /**
+     * 二级页转场下层的**压暗**开关（2026-10-14 新增，随「过渡模糊」一起放进外观的切换动画弹窗）。
+     *
+     * 与 [setBlurEnabled] 同一套：共享 flow 负责即时跨实例可见，prefs 只负责冷启动种子。
+     */
+    fun setNavScrimEnabled(enabled: Boolean) {
+        _navScrimEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_NAV_SCRIM_ENABLED, enabled).apply()
+    }
+
+    /**
+     * 二级页转场上层的**圆角**开关（2026-10-14 新增）。
+     *
+     * 关掉后进场页是方角整屏滑入（更"硬"，也更省一次 clipPath）；开着就是圆角卡片压上来。
+     */
+    fun setNavCornersEnabled(enabled: Boolean) {
+        _navCornersEnabled.value = enabled
+        prefs.edit().putBoolean(KEY_NAV_CORNERS_ENABLED, enabled).apply()
+    }
+
+    /**
+     * 可预测性返回开关（2026-10-19）：关掉后返回一律按设定时长播放，不等手势进度。
+     *
+     * `_navPredictiveBack` 指向进程内共享的 flow（见其声明处），所以这一行写入立刻对
+     * 「外观」页开关与 `MainNavGraph` 的返回接管两侧同时可见；prefs 只负责持久化（冷启动种子）。
+     *
+     * 2026-10-21：**这一项用 `commit()` 同步落盘，而不是全类惯用的 `apply()`。**
+     * 用户验收这条设置的动作就是「拨关 → 立刻杀进程 → 重进看还在不在」，而 `apply()` 是
+     * 把写盘排到后台队列（正常退出时由 `QueuedWork` 兜住，被任务管理器/强停直接杀进程则
+     * 可能丢掉排队中的那一次写）—— 丢了就退回 `getBoolean(KEY, true)` 的默认值 `true`，
+     * 现象正是"关了、重进又自动开启"。这里只写一个布尔值，同步代价可忽略。
+     *
+     * manifest 的 `android:enableOnBackInvokedCallback` 是编译期开关，运行时改不了；
+     * "关闭"由 `MainNavGraph` 注册非预测性返回回调实现（见那里的 DisposableEffect）。
+     */
+    fun setNavPredictiveBack(enabled: Boolean) {
+        _navPredictiveBack.value = enabled
+        val committed = prefs.edit().putBoolean(KEY_NAV_PREDICTIVE_BACK, enabled).commit()
+        // 诊断（2026-10-21）：这条设置"重进又开启"的两种可能——写没落盘 / 被写回 true——
+        // 只有把「写后立刻回读」打出来才能当场分辨。`ok=false` 或 `readBack` 与入参不符
+        // 就是写入侧出了问题；两者都正常而重启后变 true，问题就只能在读取侧（种子）。
+        val readBack = prefs.getBoolean(KEY_NAV_PREDICTIVE_BACK, !enabled)
+        UiLogBridge.w(
+            TAG,
+            "set navPredictiveBack=$enabled commit=$committed readBack=$readBack " +
+                "file=ufi_axis_prefs key=$KEY_NAV_PREDICTIVE_BACK"
+        )
+        if (readBack != enabled) {
+            // 同值写失败也只重试一次：这里要的是**证据**（设备日志里能看到 RETRY 行），
+            // 不是无限重试掩盖问题。
+            prefs.edit().putBoolean(KEY_NAV_PREDICTIVE_BACK, enabled).commit()
+            UiLogBridge.w(
+                TAG,
+                "set navPredictiveBack=$enabled RETRY readBack=" +
+                    prefs.getBoolean(KEY_NAV_PREDICTIVE_BACK, !enabled)
+            )
+        }
+    }
+
+    /**
      * 设置全局 UI 缩放（百分比）。有效范围 [UI_SCALE_PERCENT_MIN] ~ [UI_SCALE_PERCENT_MAX]，超出会夹取。
      * 写法与 [setCapsuleLiftDp] 同构（coerceIn 夹取 + 同值短路，滑块拖动是高频事件）。
      */
-    fun setUiScalePercent(percent: Int) {
-        val v = percent.coerceIn(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX)
+    fun setUiScalePercent(percent: Int) {        val v = percent.coerceIn(UI_SCALE_PERCENT_MIN, UI_SCALE_PERCENT_MAX)
         if (_uiScalePercent.value == v) return
         _uiScalePercent.value = v
         prefs.edit().putInt(KEY_UI_SCALE_PERCENT, v).apply()
@@ -476,6 +607,14 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         if (_capsuleLiftDp.value == v) return
         _capsuleLiftDp.value = v
         prefs.edit().putInt(KEY_CAPSULE_LIFT_DP, v).apply()
+    }
+
+    /** 底部低栏内容抬高（2026-10-20）：范围 [DOCK_LIFT_MIN_DP] ~ [DOCK_LIFT_MAX_DP]，超出夹取。 */
+    fun setDockLiftDp(dp: Int) {
+        val v = dp.coerceIn(DOCK_LIFT_MIN_DP, DOCK_LIFT_MAX_DP)
+        if (_dockLiftDp.value == v) return
+        _dockLiftDp.value = v
+        prefs.edit().putInt(KEY_DOCK_LIFT_DP, v).apply()
     }
 
     /**
@@ -580,6 +719,22 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         private const val KEY_PAGE_TRANSITION = "ufi_page_transition"
         private const val KEY_TRANSITION_DURATION_MS = "ufi_transition_duration_ms"
         private const val KEY_BLUR_ENABLED = "ufi_blur_enabled"
+        // 2026-10-14：二级页转场效果（压暗 / 圆角）。新键，无历史包袱。
+        private const val KEY_NAV_SCRIM_ENABLED = "ufi_nav_scrim_enabled"
+        private const val KEY_NAV_CORNERS_ENABLED = "ufi_nav_corners_enabled"
+        // 2026-10-19：可预测性返回（跟手预览）开关。
+        private const val KEY_NAV_PREDICTIVE_BACK = "ufi_nav_predictive_back"
+
+        /**
+         * 可预测性返回的出厂默认值（开）。播种、写入自检与"键缺失时固化"三处共用。
+         *
+         * 刻意**不改**成"键缺失就当关"：那会把老用户（升级前从未见过这个键）的跟手预览
+         * 静默关掉，而这不是本次要修的 bug —— 本次要修的是"用户显式关掉后又自己开回来"。
+         */
+        private const val NAV_PREDICTIVE_BACK_DEFAULT = true
+
+        /** 诊断日志 tag。`:app:ui` 的日志出口经 [UiLogBridge]，最终落到「调试日志」页。 */
+        private const val TAG = "ThemeManager"
 
         /**
          * Material You 动态取色开关的持久化键。
@@ -644,7 +799,15 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         // 因此改用一个独立的标记位 —— 它承担的角色与 [TRANSITION_DURATION_UNSEEDED]
         // 完全相同：只让第一个被构造的实例真正读一次盘，之后的实例直接看内存里的最新值，
         // 免得后建的实例（如设置页那份）用磁盘旧值把用户刚改的内存值盖回去。
-        private val sharedBlurEnabled = MutableStateFlow(true)
+        private val sharedBlurEnabled = MutableStateFlow(false)
+        // 2026-10-14：二级页转场效果的两项，默认全开（与改动前的实际行为一致 ——
+        // 此前压暗与圆角是写死的，用户装上新版后观感不变，除非自己去关）。
+        private val sharedNavScrimEnabled = MutableStateFlow(false)
+        private val sharedNavCornersEnabled = MutableStateFlow(true)
+        // 2026-10-19：可预测性返回默认开（跟手预览），关掉后走固定时长。
+        // 2026-10-21：默认值抽成常量 —— 播种、写入自检日志、以及"键缺失时固化默认值"三处
+        // 必须引用同一个字面量，否则以后调默认值会留下一条不一致的兜底路径。
+        private val sharedNavPredictiveBack = MutableStateFlow(NAV_PREDICTIVE_BACK_DEFAULT)
 
         // 四个播种标记位都加 @Volatile（2026-09-05 P3）：读写在 init 的
         // `synchronized(ThemeManager::class.java)` 块内，锁本身已提供互斥与可见性；
@@ -653,6 +816,16 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         // 加它的代价只是一次 volatile 读/写，而这段代码每个实例只跑一次。
         @Volatile
         private var blurSeeded = false
+
+        // 2026-10-14：二级页转场效果两项的播种标记位（照 blurSeeded）。
+        @Volatile
+        private var navScrimSeeded = false
+
+        @Volatile
+        private var navCornersSeeded = false
+
+        @Volatile
+        private var navPredictiveBackSeeded = false
 
         // ══════════════ 2026-09-05：皮肤 id / 外观模式 / UI 缩放 并入共享 ══════════════
         //
@@ -729,13 +902,17 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         // ══════════════ 全局 UI 缩放 ══════════════
         //
         // 口径：[UI_SCALE_BASE] 是**基准**，把上一轮标定为"视觉刚好合适"的那一档（原 90%）
-        // 固化成基准，于是设置页里的 100% 就是默认视觉 —— 用户不必再理解"为什么默认 90%"。
+        // 固化成基准，设置页里的百分比是相对这一档的倍数。
         // 实际 density 乘数 = UI_SCALE_BASE × percent / 100。
+        //
+        // 2026-10-14（用户："增大一点点全局字体大小吧" → 随后："默认缩放改回 100%"）：
+        // 默认档曾在当天短暂改成 105%，用户看过之后要求改回 100% —— 保持原值。
+        // 需要放大的人走「外观 → 界面缩放」，那七档（90/95/…/120）本来就是为这件事准备的。
         //
         // 区间 90%~120%（实际 0.81×~1.08×）：下限 90% 对应 ButtonHeight 48dp × 0.81 ≈ 38.9dp，
         // 已接近 Android 48dp 触摸目标下限，再往下点击命中率会掉，所以不开放更小档；
         // 上限 120% 对应 1.08×，略大于设备原生尺寸，留给需要放大的场景。
-        // MIN/MAX 公开（非 private）：设置页滑块的 valueRange 与 setter 的 coerceIn 必须
+        // MIN/MAX 公开（非 private）：设置页的 valueRange 与 setter 的 coerceIn 必须
         // 出自同一份区间定义，否则两处会漂移。
         private const val KEY_UI_SCALE_PERCENT = "ufi_ui_scale_percent"
         const val UI_SCALE_BASE = 0.9f
@@ -763,6 +940,11 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         // 保证「UI 限幅」与「setter 夹取」出自同一份区间定义，不会两处漂移。
 
         private const val KEY_CAPSULE_LIFT_DP = "capsule_lift_dp"
+        /** 2026-10-20：底部低栏内容抬高（默认 12dp = 原写死 8dp + 用户要求的 4dp）。 */
+        private const val KEY_DOCK_LIFT_DP = "ufi_dock_lift_dp"
+        const val DEFAULT_DOCK_LIFT_DP = 12
+        const val DOCK_LIFT_MIN_DP = 0
+        const val DOCK_LIFT_MAX_DP = 32
         const val DEFAULT_CAPSULE_LIFT_DP = 30
         const val CAPSULE_LIFT_DP_MIN = 0
         const val CAPSULE_LIFT_DP_MAX = 40

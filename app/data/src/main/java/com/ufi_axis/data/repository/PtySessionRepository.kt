@@ -90,7 +90,9 @@ class PtySessionRepository(
         _lines.value = emptyList()
 
         val path = "/ws/terminal"
-        val ts = System.currentTimeMillis().toString()
+        // 2026-10-21（审计 §A5）：与 HTTP / WS 用同一个"本机 + 观测偏差"的时间戳。
+        // core 的握手验签对这条通道用的是同一个 ±5 分钟窗口，裸本机时钟在设备时钟漂移时必失败。
+        val ts = com.ufi_axis.data.api.RetrofitClient.signedTimestampMs().toString()
         val nonce = DeviceKeyStore.newNonce()
         val sig = DeviceKeyStore.sign(DeviceKeyStore.canonicalString("GET", path, ts, nonce)).orEmpty()
         val url = baseUrl.replace("http://", "ws://").replace("https://", "wss://") + path +

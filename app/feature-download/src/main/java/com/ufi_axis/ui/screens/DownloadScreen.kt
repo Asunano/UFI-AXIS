@@ -126,16 +126,9 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
                     )
                 )
             }
-            // 手动刷新：下拉手势删掉后，这里是唯一的主动刷新入口。
-            // 不传 silent → 理论上会翻 isLoading；但列表区已经不再因 isLoading 换成骨架
-            // （2026-09-04 删除，见下方 content 里的说明），且 2026-09-05 起 isLoading
-            // 只在"本进程从未成功加载过"时才写 —— 手动刷新必然已经加载过，所以这里
-            // 一个字都不写；空态 item 也不再看 isLoading，点它不会闪任何东西。
-            // force = true：用户显式动作，必须立刻打一次请求 —— 被 10s 新鲜窗口挡掉的话
-            // 这个按钮就成了"点了没反应"的假按钮。
-            IconButton(onClick = { viewModel.downloads.loadDownloads(force = true) }) {
-                Icon(Icons.Default.Refresh, contentDescription = "刷新")
-            }
+            // 2026-10-21：顶栏「刷新」按钮删除（用户要求）。
+            // 本页有 2s/6s 常驻轮询保鲜，批量刷新走溢出菜单的「重试失败」，
+            // 另留一个整页重拉按钮只会让人以为数据不会自己更新。
             // 下载设置：跳转新界面
             IconButton(onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_SETTINGS) }) {
                 Icon(Icons.Default.Settings, contentDescription = "下载设置")
@@ -148,7 +141,8 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
             // 删的理由不只是观感统一 —— 本页有 2s/6s 的常驻轮询，`isRefreshing` 接 isLoading 时，
             // 任何一次非静默重载都会在顶部甩出转圈；历史上「每 2s 闪一次刷新圈」就是这么来的
             // （靠 loadDownloads(silent = true) 修掉，那条链路本次一行未动）。
-            // 手势本身也和列表滚动抢通道。手动刷新入口已上移到顶栏（见 actions）。
+            // 手势本身也和列表滚动抢通道。原先补在顶栏的那个手动刷新按钮也在 2026-10-21 删除
+            // （页面靠轮询保鲜），本页已无手动刷新入口 —— 不要再把它接回来。
             Box(Modifier.padding(padding).fillMaxSize()) {
                 Column(Modifier.fillMaxSize()) {
                     state.errorMessage?.let { error -> UfiErrorBanner(message = error) }

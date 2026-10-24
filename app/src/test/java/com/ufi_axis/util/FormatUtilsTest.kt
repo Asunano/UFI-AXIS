@@ -69,36 +69,14 @@ class FormatUtilsTest {
     }
 
     // ========== getSignalLevel ==========
-
-    @Test
-    fun `getSignalLevel - excellent`() {
-        assertEquals("极好", FormatUtils.getSignalLevel(-75))
-    }
-
-    @Test
-    fun `getSignalLevel - good`() {
-        assertEquals("好", FormatUtils.getSignalLevel(-85))
-    }
-
-    @Test
-    fun `getSignalLevel - fair`() {
-        assertEquals("一般", FormatUtils.getSignalLevel(-95))
-    }
-
-    @Test
-    fun `getSignalLevel - poor`() {
-        assertEquals("差", FormatUtils.getSignalLevel(-110))
-    }
-
-    @Test
-    fun `getSignalLevel - very poor`() {
-        assertEquals("极差", FormatUtils.getSignalLevel(-120))
-    }
-
-    @Test
-    fun `getSignalLevel - null`() {
-        assertEquals("未知", FormatUtils.getSignalLevel(null))
-    }
+    //
+    // 2026-10-14：这一段（6 条用例）已**整体移除**，不是漏了。
+    // `FormatUtils.getSignalLevel` 在 2026-10-11 措辞改正式时被删掉并迁到了
+    // `com.ufi_axis.ui.components.common.signalLevelText`（`UfiSignalBars.kt`），
+    // 而这里的用例没跟着走 —— 于是 `:app:testDebugUnitTest` 从那天起就编译不过
+    // （调一个不存在的函数会让**整个测试任务**挂掉，不只是这一类）。
+    // 覆盖已迁到函数真正所在的模块：`app/ui/src/test/.../SignalLevelTextTest.kt`，
+    // 那里按现行措辞断言，并补上了五档的分界点。
 
     // ========== getSignalBars ==========
 

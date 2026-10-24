@@ -230,12 +230,28 @@ object UfiTextStyles {
     val panelTitle: TextStyle get() = Typography.titleMedium
     /** 面板标题强调（16sp Bold） */
     val panelTitleStrong: TextStyle get() = Typography.titleMedium.copy(fontWeight = UfiWeight.Strong)
+
+/** 引导页主标题（配对 / 登录首屏）：24sp，比 [panelTitleStrong] 大一档。 */
+val onboardingTitle: TextStyle get() = Typography.headlineSmall.copy(fontSize = 24.sp, lineHeight = 30.sp, fontWeight = UfiWeight.Strong)
+
+/** 引导页说明文字：15sp / 22sp 行高，比 [note] 大一档。 */
+val onboardingNote: TextStyle get() = Typography.bodyMedium.copy(fontSize = 15.sp, lineHeight = 22.sp)
     /** 页面 / 弹窗大标题（20sp Bold） */
     val screenTitle: TextStyle get() = Typography.titleLarge.copy(fontWeight = UfiWeight.Strong)
     /** 页面大标题·中度（20sp SemiBold，titleLarge 默认字重） */
     val screenTitleEmphasis: TextStyle get() = Typography.titleLarge
     /** 弹窗主标题（22sp SemiBold） */
-    val dialogTitle: TextStyle get() = Typography.headlineSmall
+    /**
+     * 弹窗标题。
+     *
+     * 2026-10-15（用户："公共弹窗组件的标题再增大 2sp"）：22sp → **24sp**。
+     * 只改字号与行高，不换成 `headlineMedium` —— 那个 token 还带着 Bold，而调用点
+     * （UfiDialogShell）自己会套 `UfiWeight.Strong`，两处一起改等于改了两遍字重。
+     */
+    val dialogTitle: TextStyle get() = Typography.headlineSmall.copy(
+        fontSize = 24.sp,
+        lineHeight = 30.sp
+    )
 
     // ---- 顶栏（原 Spacing.HeaderTitleSize / HeaderSubtitleSize，2026-09-01 从 Spacing 迁来）----
     // 注意：这两个刻意沿用 bodyLarge 派生，与迁移前逐像素一致；

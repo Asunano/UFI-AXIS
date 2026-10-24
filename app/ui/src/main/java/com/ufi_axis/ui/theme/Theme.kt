@@ -156,8 +156,8 @@ fun UFIAXISTheme(
             typography = Typography
         ) {
             val base = LocalDensity.current
-            // 基准 UI_SCALE_BASE：把"视觉上刚好合适"的那一档标定为 100%，
-            // 于是设置页里的 100% 就是默认值，用户不必去理解"为什么默认是 90%"。
+            // 基准 UI_SCALE_BASE：把上一轮标定为"视觉刚好合适"的那一档（原 90%）固化成基准，
+            // 于是设置页里的 100% 就是默认视觉 —— 用户不必再理解"为什么默认 90%"。
             val scale = ThemeManager.UI_SCALE_BASE * (
                 uiScalePercent
                     .coerceIn(ThemeManager.UI_SCALE_PERCENT_MIN, ThemeManager.UI_SCALE_PERCENT_MAX) / 100f

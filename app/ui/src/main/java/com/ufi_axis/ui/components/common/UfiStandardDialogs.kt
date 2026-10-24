@@ -41,7 +41,11 @@ fun UfiAlertDialog(
             Text(
                 text,
                 style = MaterialTheme.typography.bodyMedium,
-                color = palette.textSecondary
+                color = palette.textSecondary,
+                // 2026-10-19：警告/提示弹窗原来正文与标题、按钮贴得较紧（12dp 节奏），
+                // 用户反馈"太紧凑"。这里给正文上下各加 4dp，读起来松一些；
+                // 节奏仍由 UfiDialogBody 的 spacedBy(12dp) 统一，不另立一套间距。
+                modifier = Modifier.padding(vertical = 4.dp)
             )
         }
         // 关闭时序由 DialogButtonRow 统一接管（它内部经 LocalUfiDialogClose 排队），

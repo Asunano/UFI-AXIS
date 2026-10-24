@@ -24,8 +24,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -41,11 +45,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavHostController
+import com.ufi_axis.ui.animation.page.LocalUfiBlurEnabled
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiMotion
+import kotlin.math.roundToInt
 
 /**
  * 标题两侧为动作位预留的宽度（左返回键 / 右 actions 都是 48dp 触区）。
@@ -385,6 +391,116 @@ private fun UfiHeader(
 }
 
 /**
+ * 标题模糊入场的**最小有效半径**（px）。低于它肉眼无感，却仍要一次离屏渲染 + 一次图层失效。
+ *
+ * 与 `UfiPageSwitcherHost.MIN_EFFECTIVE_BLUR_PX` 同值同义（那边是私有常量，不跨模块引用）。
+ */
+private const val HEADER_BLUR_MIN_PX: Float = 0.5f
+
+// ── 页内浮层（音乐页上滑面板）的背景模糊（2026-10-20）──────────────────────────
+//
+// 用户报「上滑起步那一下有点突兀」：面板是从进度条那条线长出来的，但它身后的列表在
+// 前几十 dp 里仍是**锐利**的 —— 只压暗不模糊，看起来像"一张板盖在页面上"。
+// 这里在面板升起期间给背景页加一层真实模糊（与导航 RISE 转场的下层模糊同一套语言），
+// 并让迷你控制条同步淡出（见 MediaAudioMiniBar），两者一起把"条 → 整页"接起来。
+//
+// 强度取 [PAGE_BACKDROP_BLUR_MAX_PX] ≈ 9dp：手势里的可见背景只有面板上方那一条，
+// 再大就糊成一片；同时它是一次**整页离屏合成**，半径越小越不容易掉帧。
+
+/** 背景模糊满档的半径（px）。9dp 量级，见上面那段取舍。 */
+private const val PAGE_BACKDROP_BLUR_MAX_PX: Float = 24f
+
+/** 背景模糊的 RenderEffect 缓存上限（按 2px 量化，档数很少）。 */
+private const val PAGE_BACKDROP_BLUR_CACHE_MAX: Int = 24
+
+private val pageBackdropBlurEffects = HashMap<Int, androidx.compose.ui.graphics.RenderEffect>()
+
+/**
+ * 页内浮层给背景页加的模糊效果（0 返回 `null`，调用方据此整段跳过 RenderEffect）。
+ *
+ * 按 **2px** 量化并缓存：`graphicsLayer {}` 的块每帧执行，逐帧新建
+ * `RenderEffect.createBlurEffect` 是白付 JNI + 原生对象分配（与 [headerBlurEffect]
+ * 那次教训同源）。2px 在 24px 的半径域里是 12 档，慢速拖动也看不出台阶。
+ */
+private fun pageBackdropBlurEffect(
+    radiusPx: Float
+): androidx.compose.ui.graphics.RenderEffect? {
+    val key: Int = (radiusPx / 2f).roundToInt()
+    if (key <= 0) return null
+    pageBackdropBlurEffects[key]?.let { return it }
+    val px: Float = key * 2f
+    val effect: androidx.compose.ui.graphics.RenderEffect =
+        android.graphics.RenderEffect.createBlurEffect(
+            px, px, android.graphics.Shader.TileMode.CLAMP
+        ).asComposeRenderEffect()
+    if (pageBackdropBlurEffects.size >= PAGE_BACKDROP_BLUR_CACHE_MAX) {
+        pageBackdropBlurEffects.clear()
+    }
+    pageBackdropBlurEffects[key] = effect
+    return effect
+}
+
+/**
+ * 页内浮层此刻对背景页的效果（2026-10-20）。
+ *
+ * 写入方是音乐页的跟手面板（`UfiAudioRisePanel` 那几个入口），读方是本文件的页壳；
+ * 两者不在同一个模块，所以走**进程级单例**而不是 CompositionLocal —— 与
+ * `UfiMiniPlayerBarMetrics` / `UfiNowPlayingSlot` 是同一条理由。
+ *
+ * 为什么不直接把 `offsetPx` 传进来：ui 模块不能依赖 feature-media。这里只暴露两个
+ * 与实现无关的量：在不在场、糊到什么程度。
+ */
+/** 是不是"面板自己那棵树"。面板里的播放页不是背景，不该吃背景模糊那一层全屏图层。 */
+val LocalUfiInsideRisePanel = staticCompositionLocalOf { false }
+
+object UfiPageBackdrop {
+    /**
+     * 浮层此刻在不在屏上。
+     *
+     * 页壳在**组合期**读它决定要不要挂那层离屏图层（只在 true/false 翻转时重组一次）；
+     * 面板打开到位之后由面板侧置回 false —— 那时本页已经被整块盖住，没必要再付合成钱。
+     */
+    var active by mutableStateOf(false)
+
+    /** 模糊进度 0..1。**只在绘制期读**，逐帧变化不会触发重组。 */
+    var progress by mutableFloatStateOf(0f)
+}
+
+/** [headerBlurEffects] 的容量上限；越界整体清空，避免异常输入下无界增长。 */
+private const val HEADER_BLUR_CACHE_MAX: Int = 32
+
+/**
+ * 标题模糊入场的 [androidx.compose.ui.graphics.RenderEffect] 缓存（按 **0.5px** 量化）。
+ *
+ * 为什么需要它（2026-10-14，二级页转场卡顿排查顺带修的）：`graphicsLayer {}` 的块是
+ * **每帧执行**，而 `blurRadius` 是一条 350ms 的动画 —— 原实现每帧一次
+ * `RenderEffect.createBlurEffect`，即每进一个页面白做 ~21 次 JNI 调用 + 原生对象分配。
+ * 这段动画与导航转场完全重叠，所以它恰好压在"新页首帧 + 下层录制"最贵的那几帧上。
+ *
+ * 只保留半径、不保留进度：`RenderEffect` 不可变，跨帧 / 跨组合复用安全；
+ * 只在绘制期（主线程）访问，故用普通 `HashMap` 不加锁。
+ */
+private val headerBlurEffects = HashMap<Int, androidx.compose.ui.graphics.RenderEffect>()
+
+/**
+ * 取某一档（0.5px 量化）的标题模糊效果。
+ *
+ * 量化到 0.5px 而不是 1px：这里的半径域是 0~8px，1px 只有 8 档、台阶在慢速段可能被看出来；
+ * 0.5px 给到 16 档，仍能保证整段动画零分配。
+ */
+private fun headerBlurEffect(radiusPx: Float): androidx.compose.ui.graphics.RenderEffect {
+    val key: Int = (radiusPx * 2f).roundToInt().coerceAtLeast(0)
+    headerBlurEffects[key]?.let { return it }
+    val effect: androidx.compose.ui.graphics.RenderEffect =
+        android.graphics.RenderEffect.createBlurEffect(
+            key / 2f, key / 2f, android.graphics.Shader.TileMode.CLAMP
+        ).asComposeRenderEffect()
+    if (headerBlurEffects.size >= HEADER_BLUR_CACHE_MAX) headerBlurEffects.clear()
+    headerBlurEffects[key] = effect
+    return effect
+}
+
+/**
  * 标题栏左侧那一列：标题 / 页面说明 / 挂件小字（天气 · 诗词）。
  *
  * 抽出来是因为「有挂件」与「无挂件」两个分支的**外层布局完全不同**（Row 的 weight 项
@@ -417,11 +533,17 @@ private fun UfiHeaderTitleBlock(
             textAlign = if (centered) TextAlign.Center else TextAlign.Start,
             modifier = Modifier.graphicsLayer {
                 val r = blurRadius()
-                if (r > 0.5f) {
-                    renderEffect = android.graphics.RenderEffect.createBlurEffect(
-                        r, r, android.graphics.Shader.TileMode.CLAMP
-                    ).asComposeRenderEffect()
-                }
+                // 2026-10-14（二级页转场卡顿）：半径量化到 0.5px 后**跨帧复用** RenderEffect。
+                //
+                // 本块是图层阶段，`blurRadius()` 每帧都变 ⇒ 每帧执行一次；而原实现每帧都
+                // `RenderEffect.createBlurEffect`（JNI 调用 + 原生对象分配）。这段动画（350ms
+                // ≈ 21 帧）与「进二级页」的转场**完全重叠**，分配尖峰正好压在转场最贵的那几帧上。
+                // 量化 0.5px 后整段只剩 16 个不同半径，肉眼完全不可分辨（半径本来就是 8→0 的连续值）。
+                //
+                // 与 `UfiPageSwitcherHost.getBlurRenderEffect` 是同一套做法，但**刻意不共用**：
+                // 那边的缓存键是整数 px、峰值 12dp，两个模块的取值域与生命周期都不同，
+                // 硬合并只会让任一侧调参时误伤另一侧。
+                renderEffect = if (r > HEADER_BLUR_MIN_PX) headerBlurEffect(r) else null
                 alpha = if (r > 4f) 0.6f else 1f
             }
         )
@@ -530,6 +652,41 @@ fun UfiScreenScaffold(
     navigationIcon: @Composable (() -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {},
     onBack: (() -> Unit)? = null,
+    /**
+     * 2026-10-14：内容区的**底部** inset 是否一并考虑输入法（IME）。
+     *
+     * - `false`（默认）= 底部只避让 `navigationBars`，与历史行为完全一致；
+     * - `true` = 底部改为 `navigationBars ∪ ime` —— **取两者较大值，不是相加**。
+     *
+     * ## 为什么需要这个开关（真机 bug：输入框"悬浮"在键盘上方）
+     * 聊天类页面（高级控制台 / 短信对话）的输入栏贴在底部，键盘弹出时整块面板要上移。
+     * 它们原本各自在根 `Column` 上加 `Modifier.imePadding()` —— 但**本壳的内容 Box 已经应用过
+     * `navigationBars`**，而 Android 的 IME inset 本身就把导航栏那一段覆盖在内，于是底部被算了
+     * 两次（`navigationBars + ime`），输入栏会悬在键盘上方约一个导航栏的高度。
+     *
+     * ## 为什么不能在页面里自己修
+     * `windowInsetsPadding` 会**消费**它应用的 inset，所以内容 Box 的子级读到的
+     * `WindowInsets.navigationBars` 恒为 0 —— 页面无法自己算出「ime 减去父级已应用的导航栏」。
+     * 修复只能发生在真正应用 inset 的那一层，因此在这里开显式开关；
+     * 页面侧改为**不再自行 `imePadding()`**（否则又变回相加）。
+     *
+     * 传 `true` 的页面必须自己保证：全页只有这一处处理底部 IME inset。
+     */
+    imeAwareBottomInset: Boolean = false,
+    /**
+     * 页面级浮层（2026-10-14 新增，默认 null = 没有）。
+     *
+     * 画在本页**所有东西之上**，且铺满整屏（含标题栏与状态栏区域）—— 页壳为此多包了一层
+     * 与底色同层的 Box，理由见那一层的注释。
+     *
+     * 它存在的唯一理由是音乐页的「上滑跟手升起播放面板」：那个面板是一整页播放页，
+     * 必须盖住这一页的标题栏，而"把 `UfiScreenScaffold(...)` 再包一层 Box"会让每个调用点
+     * 整体缩进一层。收成一个参数之后，调用点只是多写一行，页面结构一个字不动。
+     *
+     * ⚠ 浮层**不参与**内容区的 inset（它铺的是整屏），所以它自己负责避让安全区 ——
+     * 传进来的东西通常是一整个页面（自带页壳），而不是一块裸内容。
+     */
+    overlay: (@Composable () -> Unit)? = null,
     content: @Composable (PaddingValues) -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -550,99 +707,147 @@ fun UfiScreenScaffold(
         else -> null
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            // ★★ 顺序不可调：**先铺满屏底色，再用 inset padding 收内容** ★★
-            //
-            // 2026-09-04（转场中上下各一道白框）：上一轮把 `statusBarsPadding()` 加到这里时
-            // **没有**给本 Column 铺底色，页面底色完全靠祖先（目的地 Box / 宿主 Scaffold
-            // 的 containerColor / `window` 背景）兜底。于是状态栏与手势条那两条带子并不是
-            // 「本页自己的像素」——转场中本页整体平移（不再缩放、不再离屏裁剪）时，
-            // 那两条带子露出的就是祖先兜底的非本页像素 —— 窗口底色，真机观感就是
-            // 「上下各一道白框，且因卡片阴影更明显」。
-            //
-            // 现在本壳自持底色：`background` 排在 `statusBarsPadding()` **之前**，
-            // 所以底色铺到屏幕物理边缘、inset 只收内容 —— 无论祖先画不画、图层怎么裁，
-            // 这两条带子永远是页面底色。
-            .background(palette.pageBg)
-            // 页面自带的渐变（可选）：铺在 pageBg 之上、inset 之前，所以标题栏与状态栏区域
-            // 都会被它盖住 —— 这正是"顶栏与内容同色"的做法。
-            .then(if (backgroundBrush != null) Modifier.background(backgroundBrush) else Modifier)
-            // ★ 状态栏安全区的唯一落点（2026-09-04 从 MainNavGraph 的 Scaffold innerPadding
-            //   移交至此，理由见本函数 KDoc）。用 statusBarsPadding() 而不是
-            //   windowInsetsPadding(safeDrawing)：底部由下面那个内容 Box 单独处理
-            //   （header 要沉浸、内容要避让），一把 safeDrawing 会把底部也顶起来，
-            //   等于给每一页都加一条与手势条同高的死白边。
-            .statusBarsPadding()
-    ) {
-        // Custom header（v3：showHeader=false 时隐藏，解决多重标题栏问题）
-        if (showHeader) {
-            UfiHeader(
-                title = title,
-                showBack = showBack,
-                // 2026-08-27 修复白屏：原来无条件 popBackStack()。当本页已是返回栈里唯一一项时，
-                // popBackStack() 会把起始目的地也弹掉，NavHost 没有目的地可渲染 → 整屏白屏，
-                // 而 Activity 还活着，看起来就是「退出后白屏卡死」。系统返回键由 NavHost 自己
-                // 在起始目的地处禁用，但手动调用不受保护，所以这里必须自己判一次。
-                onBack = when {
-                    !showBack -> null
-                    onBack != null -> onBack
-                    navController != null -> {
-                        {
-                            if (navController.previousBackStackEntry != null) {
-                                navController.popBackStack()
+    /*
+     * 2026-10-14：多包一层 Box，只为给少数页面一个**覆盖整屏**的浮层位（[overlay]）。
+     *
+     * 为什么要"整屏"：音乐页的跟手面板是一整页播放页，它必须盖住标题栏与状态栏区域 ——
+     * 放进下面那个内容 Box（`weight(1f)` + navigationBars 的槽）就只能盖住内容区，
+     * 顶上会露出音乐页自己的标题栏。放进这一层则与整页底色同层，铺到屏幕物理边缘。
+     *
+     * 没有浮层的页面（绝大多数）只多一层透传的 Box：不改约束、不裁剪、不参与测量，
+     * 子树拿到的约束与从前逐字一致。
+     */
+    Box(modifier = Modifier.fillMaxSize()) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                // 页内浮层（音乐页上滑面板）升起时，给**背景页**加一点模糊（2026-10-20）。
+                // 只在浮层在场（[UfiPageBackdrop.active]）时挂这一层：它是一次整页离屏合成，
+                // 面板完全盖住本页之后就摘掉；模糊进度在绘制期读，逐帧变化不触发重组。
+                .then(
+                    if (UfiPageBackdrop.active &&
+                        !LocalUfiInsideRisePanel.current &&
+                        LocalUfiBlurEnabled.current
+                    ) {
+                        Modifier.graphicsLayer {
+                            renderEffect = pageBackdropBlurEffect(
+                                PAGE_BACKDROP_BLUR_MAX_PX * UfiPageBackdrop.progress
+                            )
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
+                // ★★ 顺序不可调：**先铺满屏底色，再用 inset padding 收内容** ★★
+                //
+                // 2026-09-04（转场中上下各一道白框）：上一轮把 `statusBarsPadding()` 加到这里时
+                // **没有**给本 Column 铺底色，页面底色完全靠祖先（目的地 Box / 宿主 Scaffold
+                // 的 containerColor / `window` 背景）兜底。于是状态栏与手势条那两条带子并不是
+                // 「本页自己的像素」——转场中本页整体平移（不再缩放、不再离屏裁剪）时，
+                // 那两条带子露出的就是祖先兜底的非本页像素 —— 窗口底色，真机观感就是
+                // 「上下各一道白框，且因卡片阴影更明显」。
+                //
+                // 现在本壳自持底色：`background` 排在 `statusBarsPadding()` **之前**，
+                // 所以底色铺到屏幕物理边缘、inset 只收内容 —— 无论祖先画不画、图层怎么裁，
+                // 这两条带子永远是页面底色。
+                .background(palette.pageBg)
+                // 页面自带的渐变（可选）：铺在 pageBg 之上、inset 之前，所以标题栏与状态栏区域
+                // 都会被它盖住 —— 这正是"顶栏与内容同色"的做法。
+                .then(if (backgroundBrush != null) Modifier.background(backgroundBrush) else Modifier)
+                // ★ 状态栏安全区的唯一落点（2026-09-04 从 MainNavGraph 的 Scaffold innerPadding
+                //   移交至此，理由见本函数 KDoc）。用 statusBarsPadding() 而不是
+                //   windowInsetsPadding(safeDrawing)：底部由下面那个内容 Box 单独处理
+                //   （header 要沉浸、内容要避让），一把 safeDrawing 会把底部也顶起来，
+                //   等于给每一页都加一条与手势条同高的死白边。
+                .statusBarsPadding()
+        ) {
+            // Custom header（v3：showHeader=false 时隐藏，解决多重标题栏问题）
+            if (showHeader) {
+                UfiHeader(
+                    title = title,
+                    showBack = showBack,
+                    // 2026-08-27 修复白屏：原来无条件 popBackStack()。当本页已是返回栈里唯一一项时，
+                    // popBackStack() 会把起始目的地也弹掉，NavHost 没有目的地可渲染 → 整屏白屏，
+                    // 而 Activity 还活着，看起来就是「退出后白屏卡死」。系统返回键由 NavHost 自己
+                    // 在起始目的地处禁用，但手动调用不受保护，所以这里必须自己判一次。
+                    onBack = when {
+                        !showBack -> null
+                        onBack != null -> onBack
+                        navController != null -> {
+                            {
+                                if (navController.previousBackStackEntry != null) {
+                                    navController.popBackStack()
+                                }
                             }
                         }
+                        else -> null
+                    },
+                    navigationIcon = navigationIcon,
+                    // 标题栏右侧：归属由上面的 slotTarget 定，切换走 AnimatedContent（见 UfiHeaderSlotSwitcher）。
+                    // 右侧一旦有内容，标题就改为**左对齐**（见 UfiHeader）。
+                    nowPlaying = slotTarget?.let { target -> { UfiHeaderSlotSwitcher(target) } },
+                    // 标题下方小字：今日诗词。与右侧插槽互不影响，两个功能各占一处。
+                    caption = if (!showNowPlaying) null else {
+                        UfiHeaderCaptionSlot.content.value?.takeIf { UfiHeaderCaptionSlot.active.value }
+                    },
+                    actions = actions
+                )
+            }
+
+            // Content area — navigationBars padding applied ONLY here so the header
+            // sits flush under the status bar and the home indicator is immersed.
+            // 2026-08-24 修复：内容 Box 从 fillMaxSize() 改为 weight(1f)+fillMaxWidth()。
+            // 根因：DETAIL 路由走 AnimatedContent 转场，外层在某帧会给 fillMaxSize() 容器
+            // 传入 infinity 最大高度，进而让内层 verticalScroll/Column 收到 infinity 直接抛异常。
+            // 改用 weight(1f) 后，高度由 Column 父（本身 fillMaxSize、有限）分配，子滚动容器
+            // 始终拿到有限高度，从根上消除 infinity 崩溃。
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    // 2026-10-14：底部 inset 由 [imeAwareBottomInset] 决定用「导航栏」还是
+                    // 「导航栏 ∪ 输入法」。union 取较大值 —— 键盘弹出时 ime（通常 300dp）盖过
+                    // navigationBars（约 48dp），收起时反过来，两种状态都不会多算一段。
+                    //
+                    // ⚠ 默认分支**刻意保持 `windowInsetsPadding(WindowInsets.navigationBars)` 的原样字面量**：
+                    // `NavInsetHandoffGuardTest` 有两条护栏盯着这一句（页壳消费 navigationBars ↔ 胶囊底栏
+                    // 扣减 navigationBars 是配对约定，删掉任一端都会让 6 个主 Tab 页多留或少留 24~48dp）。
+                    // 改成把值存进变量再传参会让那两条护栏失去锚点，而这条不变量必须一直有人盯。
+                    .then(
+                        if (imeAwareBottomInset) {
+                            Modifier.windowInsetsPadding(
+                                WindowInsets.navigationBars.union(WindowInsets.ime)
+                            )
+                        } else {
+                            Modifier.windowInsetsPadding(WindowInsets.navigationBars)
+                        }
+                    )
+                    // 2026-09-03：点内容区空白处清焦点 + 收键盘。
+                    //
+                    // 为什么放在这里：输入框的聚焦态（边框变主色 + 底色染 5% 主色，见 UfiInputDefaults）
+                    // 在 Compose 里**不会自己消失** —— 点输入框以外的区域默认不触发 clearFocus，于是
+                    // 高亮一直挂着。桌面端有键盘导航，焦点环常驻是对的；触屏上用户"点完就走"，
+                    // 常驻高亮就成了脏状态。放在 UfiScreenScaffold 是因为全部页面都套它，一处生效。
+                    //
+                    // 不会吃掉子组件的点击：detectTapGestures 跑在 Main pass，子组件（按钮/列表项/
+                    // 输入框/滚动）会先消费 down 事件，所以 onTap 只在真正的空白处触发。
+                    .pointerInput(Unit) {
+                        detectTapGestures(onTap = {
+                            focusManager.clearFocus()
+                            keyboardController?.hide()
+                        })
                     }
-                    else -> null
-                },
-                navigationIcon = navigationIcon,
-                // 标题栏右侧：归属由上面的 slotTarget 定，切换走 AnimatedContent（见 UfiHeaderSlotSwitcher）。
-                // 右侧一旦有内容，标题就改为**左对齐**（见 UfiHeader）。
-                nowPlaying = slotTarget?.let { target -> { UfiHeaderSlotSwitcher(target) } },
-                // 标题下方小字：今日诗词。与右侧插槽互不影响，两个功能各占一处。
-                caption = if (!showNowPlaying) null else {
-                    UfiHeaderCaptionSlot.content.value?.takeIf { UfiHeaderCaptionSlot.active.value }
-                },
-                actions = actions
-            )
+            ) {
+                content(PaddingValues(0.dp))
+
+                // 2026-09-19：天气下拉浮层（覆盖在内容上方、带遮罩、从顶部滑入）。
+                // 放在 content 之后（同一个 Box 内）使它叠在内容上面。
+                UfiHeaderDrawerHost()
+            }
         }
 
-        // Content area — navigationBars padding applied ONLY here so the header
-        // sits flush under the status bar and the home indicator is immersed.
-        // 2026-08-24 修复：内容 Box 从 fillMaxSize() 改为 weight(1f)+fillMaxWidth()。
-        // 根因：DETAIL 路由走 AnimatedContent 转场，外层在某帧会给 fillMaxSize() 容器
-        // 传入 infinity 最大高度，进而让内层 verticalScroll/Column 收到 infinity 直接抛异常。
-        // 改用 weight(1f) 后，高度由 Column 父（本身 fillMaxSize、有限）分配，子滚动容器
-        // 始终拿到有限高度，从根上消除 infinity 崩溃。
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .windowInsetsPadding(WindowInsets.navigationBars)
-                // 2026-09-03：点内容区空白处清焦点 + 收键盘。
-                //
-                // 为什么放在这里：输入框的聚焦态（边框变主色 + 底色染 5% 主色，见 UfiInputDefaults）
-                // 在 Compose 里**不会自己消失** —— 点输入框以外的区域默认不触发 clearFocus，于是
-                // 高亮一直挂着。桌面端有键盘导航，焦点环常驻是对的；触屏上用户"点完就走"，
-                // 常驻高亮就成了脏状态。放在 UfiScreenScaffold 是因为全部页面都套它，一处生效。
-                //
-                // 不会吃掉子组件的点击：detectTapGestures 跑在 Main pass，子组件（按钮/列表项/
-                // 输入框/滚动）会先消费 down 事件，所以 onTap 只在真正的空白处触发。
-                .pointerInput(Unit) {
-                    detectTapGestures(onTap = {
-                        focusManager.clearFocus()
-                        keyboardController?.hide()
-                    })
-                }
-        ) {
-            content(PaddingValues(0.dp))
-
-            // 2026-09-19：天气下拉浮层（覆盖在内容上方、带遮罩、从顶部滑入）。
-            // 放在 content 之后（同一个 Box 内）使它叠在内容上面。
-            UfiHeaderDrawerHost()
-        }
+        // 页面级浮层：画在最后 = 压在所有东西之上（含标题栏与状态栏区域）。见 [overlay]。
+        overlay?.invoke()
     }
 }
 

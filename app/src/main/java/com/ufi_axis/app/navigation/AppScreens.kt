@@ -2,7 +2,9 @@ package com.ufi_axis.app.navigation
 
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import com.ufi_axis.ui.media.MediaAudioDownloadsScreen
 import com.ufi_axis.ui.media.MediaAudioGroupScreen
+import com.ufi_axis.ui.media.MediaAudioRecentScreen
 import com.ufi_axis.ui.media.MediaAudioPlayerScreen
 import com.ufi_axis.ui.media.MediaAudioScreen
 import com.ufi_axis.ui.media.MediaAudioSettingsScreen
@@ -14,9 +16,15 @@ import com.ufi_axis.ui.media.MediaPlaylistScreen
 import com.ufi_axis.ui.media.MediaVideoDownloadHistoryScreen
 import com.ufi_axis.ui.media.MediaVideoPlayerScreen
 import com.ufi_axis.ui.media.MediaVideoScreen
+import com.ufi_axis.ui.media.MediaVideoRecentScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsCoversScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsDisplayScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsPlaybackScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsScanScreen
 import com.ufi_axis.ui.media.MediaVideoSettingsScreen
 import com.ufi_axis.ui.navigation.AppScreen
 import com.ufi_axis.ui.navigation.Routes
+import com.ufi_axis.ui.resources.ResourcesScreen
 import com.ufi_axis.ui.screens.*
 import com.ufi_axis.ui.screens.AboutDeviceScreen
 import com.ufi_axis.ui.screens.DeviceControlScreen
@@ -121,7 +129,16 @@ private fun rawAppScreens(
 
     Routes.DETAIL_DEBUG_LOG to { _, nc -> DebugLogScreen(viewModel, nc) },
     Routes.DETAIL_DIAGNOSE to { _, nc -> DiagnoseScreen(viewModel, nc) },
+        // 2026-10-24：诊断中心「分组页」映射。DiagnoseScreen 早就支持 groupKey，
+        // 但这里只登记了路由、漏了映射 —— 点任一入口都会导航到未注册目的地，渲染成白屏。
+        Routes.DETAIL_DIAGNOSE_GROUP to { entry, nc ->
+            DiagnoseScreen(viewModel, nc, entry.arguments?.getString("group"))
+        },
     Routes.DETAIL_MONITOR to { _, nc -> MonitorScreen(viewModel, nc) },
+    // 流量报表（2026-10-14 接入 core 的 GET /api/traffic/report）：日报 / 周报 / 月报，
+    // 入口在监控中心总览的「流量报表」行。本页**不需要 viewModel** —— 它是一次性只读查询，
+    // 数据由页面自己经 RetrofitClient 拉（理由见 TrafficReportScreen 的文件头注释）。
+    Routes.DETAIL_TRAFFIC_REPORT to { _, nc -> TrafficReportScreen(nc) },
     Routes.DETAIL_MONITOR_SETTINGS to { _, nc -> MonitorSettingsScreen(viewModel, nc) },
     // 监控设置的分组：2026-09-03 改成独立路由（与 设置→服务器→服务器配置 同构）
     // 2026-09-08 少了 metrics / behavior 两条（分别并入 collection 的弹窗与 storage 的导出区）
@@ -166,6 +183,15 @@ private fun rawAppScreens(
     },
     Routes.DETAIL_BACKGROUND_GUARD to { _, nc -> BackgroundGuardScreen(viewModel, nc) },
     Routes.DETAIL_BACKUP_RESTORE to { _, nc -> BackupRestoreScreen(viewModel, nc) },
+    // 赞赏（2026-10-14）：`Routes.DETAIL_DONATE` 的登记已随该路由一起删除 ——
+    // 它指向的 `DonateScreen`（赞赏码独立整页）被撤销，关于页那颗「赞赏」按钮改回打开弹窗，
+    // 弹窗与那两张码的位图解码都收在 `AboutDeviceScreen` 里（同模块）。
+    // 四处（文件 / 路由常量 / appRoutes 条目 / 本登记）必须同进同退，否则
+    // `RouteBindingGuardTest` 的两条护栏会有一头红：只删常量会留下"绑定表里的孤儿"，
+    // 只删本行会留下"没有页面的白屏路由"。
+    // 赞助与感谢（2026-10-14）：只有赞助名单。**不需要 viewModel** —— 名单由页面自己
+    // 读 assets 保底那份、再经 RetrofitClient 取 GET /api/sponsors 覆盖（理由见 SponsorsScreen 的文件头）。
+    Routes.DETAIL_SPONSORS to { _, nc -> SponsorsScreen(nc) },
     Routes.DETAIL_TUNNEL to { _, nc -> TunnelScreen(viewModel, nc) },
     // FIX-9：内网穿透三拆屏
     Routes.DETAIL_TUNNEL_FRP to { _, nc -> FrpDetailScreen(viewModel, nc) },
@@ -181,6 +207,15 @@ private fun rawAppScreens(
         CfTunnelScreen(viewModel, nc, entry.arguments?.getString("name") ?: "")
     },
     Routes.DETAIL_TUNNEL_SETTINGS to { _, nc -> TunnelSettingsScreen(viewModel, nc) },
+    // 2026-10-14：通用设置拆成入口列表 + 三个子页（组件管理 / 连接与重连 / 日志与路径）。
+    // 三条子路由也必须在 SERVICE_INDEPENDENT_ROUTES 里，否则停服时会被换成占位页。
+    Routes.DETAIL_TUNNEL_SETTINGS_COMPONENTS to { _, nc -> TunnelSettingsComponentsScreen(viewModel, nc) },
+    Routes.DETAIL_TUNNEL_SETTINGS_RECONNECT to { _, nc -> TunnelSettingsReconnectScreen(viewModel, nc) },
+    Routes.DETAIL_TUNNEL_SETTINGS_LOG to { _, nc -> TunnelSettingsLogScreen(viewModel, nc) },
+    // 资源中心（2026-10-14）：Web 前端 ZIP / frpc / cloudflared 的注册表驱动收拢页。
+    // **不需要 viewModel** —— 描述符层自己经 RetrofitClient 取数，任务轮询在进程级 runner 里
+    // （理由见 ResourcesScreen 与 ResourceTaskController 的文件头）。
+    Routes.DETAIL_RESOURCES to { _, nc -> ResourcesScreen(nc) },
     Routes.DETAIL_SERVER to { _, nc ->
         ServerScreen(viewModel, onServerConfigChanged, nc, onRepairRequested)
     },
@@ -215,6 +250,24 @@ private fun rawAppScreens(
     Routes.MEDIA_VIDEO_SETTINGS to { _, nc ->
         MediaVideoSettingsScreen(viewModel, nc)
     },
+    // 2026-10-14：视频设置拆成入口列表 + 三个子页（扫描范围 / 播放与预热 / 封面与下载）。
+    // 视频设置从来不在 SERVICE_INDEPENDENT_ROUTES 里（停服时它被占位页替换），子页跟着同一口径。
+    Routes.MEDIA_VIDEO_SETTINGS_SCAN to { _, nc ->
+        MediaVideoSettingsScanScreen(viewModel, nc)
+    },
+    Routes.MEDIA_VIDEO_SETTINGS_PLAYBACK to { _, nc ->
+        MediaVideoSettingsPlaybackScreen(viewModel, nc)
+    },
+    Routes.MEDIA_VIDEO_SETTINGS_COVERS to { _, nc ->
+        MediaVideoSettingsCoversScreen(viewModel, nc)
+    },
+    // 显示与字幕：不依赖 viewModel，只读本机偏好
+    Routes.MEDIA_VIDEO_SETTINGS_DISPLAY to { _, nc ->
+        MediaVideoSettingsDisplayScreen(nc)
+    },
+    Routes.MEDIA_VIDEO_RECENT to { _, nc ->
+        MediaVideoRecentScreen(viewModel, nc)
+    },
     // 下载任务（队列 + 历史）：数据全在 MediaDownloadQueue 这个进程内单例里，不经 viewModel
     Routes.MEDIA_VIDEO_DOWNLOADS to { _, nc ->
         MediaVideoDownloadHistoryScreen(nc)
@@ -225,6 +278,13 @@ private fun rawAppScreens(
     // 已从音乐库移除的歌曲（排除名单）：有它「从音乐库移除」才是可撤销的
     Routes.MEDIA_AUDIO_EXCLUDED to { _, nc ->
         MediaExcludedScreen(viewModel, nc)
+    },
+    // 音乐的最近播放 / 下载记录：前者读本机偏好（探针写入），后者读文件链那份下载历史
+    Routes.MEDIA_AUDIO_RECENT to { _, nc ->
+        MediaAudioRecentScreen(viewModel, nc)
+    },
+    Routes.MEDIA_AUDIO_DOWNLOADS to { _, nc ->
+        MediaAudioDownloadsScreen(viewModel, nc)
     },
     Routes.MEDIA_IMAGE_SETTINGS to { _, nc ->
         MediaImageSettingsScreen(viewModel, nc)

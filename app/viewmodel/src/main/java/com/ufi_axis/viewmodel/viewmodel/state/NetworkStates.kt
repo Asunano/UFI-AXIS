@@ -330,7 +330,46 @@ data class PairedDeviceItem(
     val fingerprint: String,
     val deviceName: String,
     val lastSeen: Long,
-    val createdAt: Long
+    val createdAt: Long,
+    /**
+     * 客户端自报的硬件标识（2026-10-15 新增）。
+     *
+     * 拉黑时要把它一起记下来：指纹是权威键，但清 App 数据就会换一把；hwId 跨重装稳定，
+     * 两者并用才能挡住"清数据再配对"。**它可伪造，只提高门槛，不参与授权判定**。
+     * 旧 core 不返回该字段 → 空串（那时只按指纹拦）。
+     */
+    val hwId: String = ""
+)
+
+/**
+ * 一条被拉黑的设备（`GET /api/pairing/blacklist`）。
+ *
+ * 与 [PairedDeviceItem] 是两份独立数据：移除设备只是撤销授权，**不会**解除拉黑。
+ */
+data class BlockedDeviceItem(
+    val fingerprint: String,
+    /** 客户端自报的硬件标识；可伪造，只用于提高绕过门槛，Web 端为空。 */
+    val hwId: String = "",
+    val name: String = "",
+    val reason: String = "",
+    val blockedAt: Long = 0L,
+    val blockedBy: String = ""
+)
+
+/**
+ * 一条待批准的新设备请求（`GET /api/pairing/approvals`，2026-10-15）。
+ *
+ * [code] 是 6 位配对码 —— 弹窗要**大字显示**它，机主对不上就不该点允许。
+ * 它只出现在已鉴权的这个接口里（请求方拿不到，见 `PairedDeviceApprovalStore` 的类注释）。
+ */
+data class PendingApprovalItem(
+    val sid: String,
+    val code: String,
+    val deviceName: String = "",
+    /** 已掩码的来源（`192.168.***.***` / `隧道`）。 */
+    val source: String = "",
+    val requestedAt: Long = 0L,
+    val expiresAt: Long = 0L
 )
 
 data class PairingState(
@@ -344,7 +383,39 @@ data class PairingState(
     val pairingCode: String = "",
     val pairingEnabled: Boolean = false,
     val pairingMaxDevices: Int = 0,
+    /**
+     * 新设备配对是否需要在已配对设备上批准（2026-10-15，安全中心）。
+     * **默认 false** —— 默认关是"升级零感知"的前提（存量用户不点这个开关，配对流程与今天一致）。
+     */
+    val approvalRequired: Boolean = false,
+    /** 配对申请是否发本机系统通知（默认关）。 */
+    val notifySystem: Boolean = false,
+    /** 配对申请是否发邮件（默认关）。 */
+    val notifyEmail: Boolean = false,
+    /** 配对申请是否发 Webhook（默认关）。 */
+    val notifyWebhook: Boolean = false,
     val devices: List<PairedDeviceItem> = emptyList(),
+    /**
+     * 配对设备黑名单（2026-10-15）。
+     *
+     * 与 [devices] 是两份独立数据 —— 移除设备不会解除拉黑（见 `PairedDeviceBlacklistStore`）。
+     */
+    val blockedDevices: List<BlockedDeviceItem> = emptyList(),
+    /**
+     * 设备端是否支持黑名单（`/api/pairing/blacklist` 是否可用）。
+     *
+     * 旧版 core 没有这组端点、请求回 404 —— 那时把黑名单入口**隐藏**，而不是弹一个
+     * 用户看不懂的错误（"新 App + 旧 core"是必须支持的组合，见方案 §8.2）。
+     */
+    val blacklistAvailable: Boolean = true,
+    /**
+     * 待批准的新设备请求（2026-10-15）。
+     *
+     * 非空时 App 应弹窗（大字显示配对码 + 允许/拒绝）。空 = 没有待处理请求。
+     */
+    val pendingApprovals: List<PendingApprovalItem> = emptyList(),
+    /** 设备端是否支持批准流程（旧 core 无此端点 → 404 → 隐藏入口，与黑名单同款降级）。 */
+    val approvalAvailable: Boolean = true,
     val isLoading: Boolean = false,
     val errorMessage: String? = null
 )

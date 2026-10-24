@@ -37,8 +37,20 @@ private data class LockedCellItem(
 fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
     val palette = LocalResolvedPalette.current
-    var message by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(true) }
+
+    // 2026-10-14（修 G3）：锁站/解锁改走确认器（13 次 / 30.6s 回读 + 判据），进度弹窗必须挂在
+    // **本页**。本页是独立路由（`detail/cell-lock`，见 `AppScreens.kt:149`），进来之后 NetworkScreen
+    // 已经离开组合 —— 那边挂的那一个此时不存在，不在这里补一个的话确认器会全程无声。
+    // 挂法与其消费方式与 NetworkScreen.kt:38-44 一字不差（同一个 state、同一组回调），
+    // 页面差异只体现在这一处参数上，不做任何 id 分支。
+    val opState by viewModel.network.opController.state.collectAsState()
+    UfiOperationProgressDialog(
+        state = opState,
+        onBackground = { viewModel.network.opController.toBackground() },
+        onDismiss = { viewModel.network.opController.dismiss() },
+        onRetry = { viewModel.network.opController.retry() },
+    )
 
     // 设备能力集（批 O / 3.5）：core 对 `/api/device/cell-lock` 与 `/api/device/cell-unlock`
     // 两个写入口都有 route 门禁（同属 CELL_LOCK 域），缺能力回 501 NOT_SUPPORTED。
@@ -79,17 +91,10 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                 UfiNoticeCard(message = deviceUnsupportedNote("基站锁定"))
                 Spacer(Modifier.height(8.dp))
             }
-            message?.let {
-                Surface(
-                    color = palette.accent.copy(alpha = 0.1f),
-                    shape = UfiCardDefaults.shape,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(it, style = MaterialTheme.typography.bodySmall, color = palette.accent,
-                        modifier = Modifier.padding(12.dp))
-                }
-                Spacer(Modifier.height(8.dp))
-            }
+            // 2026-10-14（修 G3）：原来这里有一块"已发送锁定当前基站命令 / 已锁定 PCI x / 已解锁全部"
+            // 的乐观横幅。它宣称的是"命令已下发"，而确认器现在能说"设备**已经**锁上了"——
+            // 两个通道同时存在时，横幅会在超时的同时仍然写着"已锁定"，自相矛盾。故整块移除，
+            // 反馈统一由上面那个弹窗承担（running / success / failed 三态 + 后台进行）。
 
             if (isLoading) {
                 UfiLoadingBox(isLoading = true) {}
@@ -170,7 +175,6 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                         text = "锁定当前基站",
                         onClick = {
                             viewModel.network.cellLock(pci, fcn, if (is5G) "NR" else "LTE")
-                            message = "已发送锁定当前基站命令 (PCI=$pci, FCN=$fcn)"
                             isLoading = true
                         },
                         enabled = cellLockSupported
@@ -242,7 +246,6 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                                 onClick = {
                                     viewModel.network.cellLock(cell.pci, cell.earfcn,
                                         if (inferIsNRDlg(cell.band, cell.earfcn, is5G)) "NR" else "LTE")
-                                    message = "已锁定 PCI ${cell.pci}"
                                 },
                                 enabled = cellLockSupported
                             )
@@ -280,13 +283,13 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                         UfiButton(
                             variant = UfiButtonVariant.Secondary,
                             text = "刷新",
-                            onClick = { isLoading = true; viewModel.network.loadCellInfo(); message = null },
+                            onClick = { isLoading = true; viewModel.network.loadCellInfo() },
                             modifier = Modifier.weight(1f)
                         )
                         UfiButton(
                             variant = UfiButtonVariant.Danger,
                             text = "解锁全部",
-                            onClick = { viewModel.network.unlockAllCell(); message = "已解锁全部"; isLoading = true },
+                            onClick = { viewModel.network.unlockAllCell(); isLoading = true },
                             enabled = cellLockSupported,
                             modifier = Modifier.weight(1f)
                         )

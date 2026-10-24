@@ -11,6 +11,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import okhttp3.Interceptor
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import retrofit2.Retrofit
@@ -254,7 +255,7 @@ object RetrofitClient {
         // 2026-10-05 校时补偿：签名时间戳用「本机时钟 + 与 core 的观测偏差」，
         // 手机与设备时钟漂移 >5min 时不再必然 STALE_TIMESTAMP（401）。
         // 偏差由 HealthModule 每次成功的 /health 探活回写（health 响应带 core 服务器时间）。
-        val timestamp = (System.currentTimeMillis() + clockOffsetMs.get()).toString()
+        val timestamp = signedTimestampMs().toString()
         val nonce = DeviceKeyStore.newNonce()
         val signature = DeviceKeyStore.sign(
             DeviceKeyStore.canonicalString(method, uri, timestamp, nonce)
@@ -264,6 +265,47 @@ object RetrofitClient {
             "X-Nonce" to nonce,
             "X-Signature" to signature
         )
+    }
+
+    /**
+     * 签名用的时间戳：本机时钟 + 与 core 的观测偏差（2026-10-21，审计 §A5）。
+     *
+     * HTTP 一路早就在用这个补偿值，但 **WS / PTY 握手各自抄了 `System.currentTimeMillis()`**。
+     * core 的 `DeviceAuth.MAX_TIMESTAMP_DRIFT_MS` 对两条通道一视同仁（±5 分钟），
+     * 于是设备时钟漂移时会出现最费解的现象：接口一切正常、实时通道永久 1008 无限重连。
+     * 两条握手侧改成调本方法，口径就只剩这一份。
+     */
+    fun signedTimestampMs(): Long = System.currentTimeMillis() + clockOffsetMs.get()
+
+    /**
+     * 让 baseUrl 在**每次请求**时生效的拦截器（2026-10-21，审计 §A4）。
+     *
+     * ## 为什么必须有它
+     * Retrofit 在 `create()` 时就把 baseUrl 烧进每个 `ServiceMethod`，而
+     * `MainViewModel` 及其全部 module 在构造时抓住的是"那一刻"的 `UfiAxisApi` 实例。
+     * 换设备 / 改 IP/端口之后，那些 holder 仍然把请求打到**旧设备**（旧设备回 444，
+     * 还会被吊销策略清凭据，成环）。靠"重建 VM"能修，但那会连带丢掉全部页面状态；
+     * 在这里按请求改写 scheme/host/port 是最小且唯一的单点修法。
+     *
+     * ## 为什么只改 host/scheme/port
+     * 签名覆盖的是 `path + query`（core 的 `DeviceRequestVerifier` 就是这么拼的），
+     * 换主机名不改变签名对象 —— 所以这里**绝不能**碰 `encodedPath` / `encodedQuery`。
+     * 解析失败（`prefs.baseUrl` 非法）就原样放行，交给服务端回错误，不在这里抛。
+     */
+    fun dynamicHostInterceptor(prefsProvider: () -> AppPreferences): Interceptor = Interceptor { chain ->
+        val request = chain.request()
+        val target = runCatching { prefsProvider().baseUrl.toHttpUrlOrNull() }.getOrNull()
+        if (target == null) return@Interceptor chain.proceed(request)
+        val current = request.url
+        if (current.scheme == target.scheme && current.host == target.host && current.port == target.port) {
+            return@Interceptor chain.proceed(request)
+        }
+        val rewritten = current.newBuilder()
+            .scheme(target.scheme)
+            .host(target.host)
+            .port(target.port)
+            .build()
+        chain.proceed(request.newBuilder().url(rewritten).build())
     }
 
     /**
@@ -341,6 +383,9 @@ object RetrofitClient {
 
         // 复用共享单例 OkHttpClient（保留长超时 + 网络日志），叠加业务拦截器 auth / error-capture
         val client = OkHttpClientProvider.shared.newBuilder()
+            // 2026-10-21（审计 §A4）：baseUrl 不再"烧死"在 Retrofit 里。
+            // 换设备/改 IP 后，持有旧 api 实例的 module 也能打到新设备。
+            .addInterceptor(dynamicHostInterceptor { prefs })
             .addInterceptor(authInterceptor { prefs })
             .addInterceptor(errorCaptureInterceptor(baseUrl))
             .build()

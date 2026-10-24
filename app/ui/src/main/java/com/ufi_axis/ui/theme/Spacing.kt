@@ -83,6 +83,23 @@ object Spacing {
      */
     val SettingsCardGap = 10.dp
 
+    /**
+     * 卡片行内**相邻文本行**之间的纵向间距（标题 ↔ 副标题/说明；多行副标题之间也用它）。
+     *
+     * 2026-10-13 提取。此前这个语义在库里同时用着 **2dp 和 3dp** 两个裸字面量：
+     * `UfiStatusCard` / `UfiEntryCard` / `UfiListRowCard` / `DownloadTasksUi` 用 `spacedBy(2.dp)`，
+     * 而 `TunnelScreen.TunnelEntryCard` 用 `Spacer(Modifier.height(3.dp))` —— 同一件事两个值，
+     * 且都不可检索（改一处要全文搜 `2.dp`）。
+     *
+     * 取 **2dp**（多数派）而不是 3dp：标题与副标题是同一行卡里的两层文字，
+     * 紧一点才读得出"这是一个条目的两行"，而不是两个独立条目。
+     * 比 [Small]（4dp）还小是刻意的 —— [Small] 是"元素之间"的档，这里要的是"文字行之间"。
+     *
+     * ⚠️ 只用于**纵向**堆叠。横向的 `Arrangement.spacedBy(2.dp)`（如播放页的一排小控件）
+     * 语义不同，不要套这个常量。
+     */
+    val TextStackGap = 2.dp
+
     // Dialog metrics — 圆角见 CornerDialog
     val DialogPaddingH = 18.dp
     val DialogPaddingV = 24.dp
@@ -107,6 +124,11 @@ object Spacing {
 
     // Button metrics
     val ButtonHeight = 48.dp
+    /**
+     * 大号按钮（引导 / 登录首屏专用）：比 [ButtonHeight] 高 16dp。
+     * 2026-10-22：配对首屏整体放大后，48dp 的主按钮在放大后的卡片里偏小，单独加一档。
+     */
+    val ButtonHeightLarge = 64.dp
     val SmallButtonHeight = 36.dp
     // 2026-09-04（P4c 按钮收敛）：以下 4 个从 UfiButton.kt 的裸字面量提上来。
     // 五个旧按钮合并成一个 UfiButton(variant, size) 后，这些尺寸从"某个组件的私事"

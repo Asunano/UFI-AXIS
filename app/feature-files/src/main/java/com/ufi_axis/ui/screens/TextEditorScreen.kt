@@ -332,7 +332,7 @@ fun TextEditorScreen(
                 label = "下载到手机",
                 icon = Icons.Default.Download,
                 onClick = {
-                    viewModel.files.downloadFileToPhone(filePath, fileName)
+                    viewModel.files.downloadFileToPhone(filePath, fileName, source = "file")
                     toastMessage = ToastMessage("已开始下载", ToastType.INFO)
                 }
             ))
