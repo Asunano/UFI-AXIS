@@ -2,9 +2,9 @@
   <n-modal
     :show="show"
     preset="card"
-    title="流量历史"
-    class="traffic-history-modal"
-    :style="modalStyle"
+    :title="title"
+    class="modal-fit"
+    style="--modal-w: 720px; --modal-h: 720px"
     :bordered="false"
     @update:show="emit('update:show', $event)"
     @after-enter="onOpened"
@@ -26,14 +26,27 @@
       <span class="pager-label">{{ headerLabel }}</span>
     </div>
 
+    <!--
+      失败但屏幕上还有旧段数据时，必须明说它可能已过期（计划 §6.10 B9-7）：
+      原来只在「没有数据可显示」的空态里才提错误，于是翻页失败时用户看到的是一张
+      与成功时完全一样、但其实是上一段的图。
+    -->
+    <n-alert v-if="error && data" type="warning" :bordered="false" class="stale-alert">
+      数据可能已过期：{{ error }}
+    </n-alert>
+
     <!-- 手势区包住图与空态两种情形：空段也要能滑回有数据的那一段。
          pointer 事件一套覆盖触屏与鼠标拖拽，不需要分别写 touch / mouse -->
     <div class="swipe-area" @pointerdown="onPointerDown" @pointerup="onPointerUp" @pointercancel="onPointerCancel">
       <!-- n-spin 而不是整块换成骨架：翻页时旧图留在屏幕上，避免每翻一段闪一次空屏 -->
       <n-spin :show="loading">
-        <TrafficHistoryChart v-if="hasUsage" :data="data" />
+        <TrafficHistoryChart v-if="hasUsage" :data="data" :horizontal="horizontal" />
         <div v-else class="empty-box">
-          <n-empty :description="emptyText" />
+          <n-empty :description="emptyText">
+            <template #extra>
+              <n-button v-if="error" size="small" @click="load(range, anchor)">重试</n-button>
+            </template>
+          </n-empty>
         </div>
       </n-spin>
     </div>
@@ -68,7 +81,10 @@ import { getTrafficUsage, type TrafficUsageRange, type TrafficUsageResponse } fr
 import { TRAFFIC_RANGE_OPTIONS } from './trafficHistoryShared';
 import TrafficHistoryChart from './components/TrafficHistoryChart.vue';
 
-defineProps<{ show: boolean }>();
+withDefaults(defineProps<{ show: boolean; title?: string; horizontal?: boolean }>(), {
+  title: '流量历史',
+  horizontal: false,
+});
 const emit = defineEmits<{ (e: 'update:show', v: boolean): void }>();
 
 const api = useCancellableApi();
@@ -157,14 +173,13 @@ function goCurrent() {
 }
 
 /**
- * 弹窗宽度只能写成内联 style。
+ * 宽高走 `.modal-fit` + `--modal-w/--modal-h`（计划 §6.10 B9-3），不再有内联宽度常量。
  *
  * n-modal 的卡片是 teleport 到 body、由 NModal 自己 render 的节点，scoped 样式的
  * `data-v-*` 属性到不了它 —— 所以此前写在 `<style scoped>` 里的 `.traffic-history-modal`
- * 宽度规则从未生效，弹窗一直贴着屏幕两边（本仓库其它弹窗都是内联 style，如 FileInfoModal）。
- * `calc(100vw - 32px)` 保证窄屏左右各留 16px 余量。
+ * 宽度规则从未生效（该空类已删，见 §6.10 B9-7）。行内 `width` 也不行：它的优先级最高，
+ * 会把全局 `.modal-fit` 的 `min(…, 100vw - 32px)` 整个盖掉。
  */
-const modalStyle = 'width: 720px; max-width: calc(100vw - 32px)';
 
 const canGoNext = computed(() => data.value?.has_next === true);
 const headerLabel = computed(() => data.value?.label || '—');
@@ -261,11 +276,13 @@ function onPointerCancel(e: PointerEvent) {
 .swipe-area {
   touch-action: pan-y;
 }
+/* 空态高度自适应（计划 §6.10 B9-7）：原来固定 300px，矮屏（≤720 高）下与图表同高，
+   把「本段合计」和底部的关闭按钮一起挤出可视区。改成随视口收缩的下限。 */
 .empty-box {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: 300px;
+  min-height: clamp(160px, 38vh, 300px);
 }
 
 .total-row {
@@ -288,10 +305,11 @@ function onPointerCancel(e: PointerEvent) {
   font-variant-numeric: tabular-nums;
 }
 
+.stale-alert {
+  margin-bottom: 8px;
+}
+
 @media (max-width: 768px) {
-  .empty-box {
-    height: 240px;
-  }
   /* 窄屏把段落文案换行到按钮下方，避免"上一段/下一段"被挤成两行 */
   .pager-row {
     flex-direction: column;
