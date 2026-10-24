@@ -13,6 +13,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.media3.common.PlaybackParameters
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -148,7 +149,9 @@ fun rememberUfiExoPlayer(
  * 改之前先读）。这里只做开关：
  *  · [showNextPrevious] —— playlist 场景打开"上/下一集"（浮层单文件场景关掉）
  *  · 字幕按钮常开：无字幕轨时 media3 自己会隐藏它
- *  · 齿轮（倍速 / 音轨 / 字幕轨选择）是 media3 自带弹窗，不用自己写
+ *  · **齿轮里已经自带倍速**（media3 的 `COMMAND_SET_SPEED_AND_PITCH` + `PlaybackSpeedDialog`），
+ *    所以倍速不需要自写按钮（2026-10-21 撤掉了那一版自绘胶囊）。这里只负责两件事：
+ *    进入时套用上次的倍速、用户改了之后把新值落盘 —— 否则每换一个视频都要重调一次。
  *
  * @param onClose 非 null 时显示控制条右上角的关闭按钮（浮层用）；null = 隐藏（有导航栏的独立页用）
  */
@@ -161,6 +164,18 @@ fun UfiVideoSurface(
     onToggleFullscreen: (() -> Unit)? = null,
     onClose: (() -> Unit)? = null
 ) {
+    /*
+     * 倍速**不持久化**（2026-10-21 用户要求）：media3 的齿轮里能调，但每次进入都回到 1.0×。
+     *
+     * 为什么要在组件这一层归位：`ExoPlayer` 是按 key 记忆的实例，会话内换视频/换集时
+     * `PlaybackParameters` 会跟着实例留下来 —— 不归位的话"上一个视频的 1.5×"会带到下一个。
+     * 每次进入这个 composable（打开播放页 / 预览浮层）都重置一次，语义最直观。
+     */
+    DisposableEffect(player) {
+        player.setPlaybackSpeed(1f)
+        onDispose { }
+    }
+
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
@@ -217,19 +232,39 @@ fun UfiVideoSurface(
 @OptIn(UnstableApi::class)
 fun PlayerView.applyUfiSubtitleStyle() {
     val view = subtitleView ?: return
+    /*
+     * 三项用户偏好（2026-10-21 起可调，见「视频设置 → 显示与字幕」）：
+     * · 字号档位 small / medium / large → 相对 media3 默认值的倍数；
+     * · 是否加半透明黑底（默认不加：白字黑描边在任何画面上都成立，底框会挡画面）。
+     * 每次播放页组合都会调到这里，所以改完设置回到播放页立刻生效。
+     */
+    val prefs = AppPreferences(context)
+    val scale = when (prefs.videoSubtitleSize) {
+        "small" -> 1.0f
+        "large" -> 1.55f
+        else -> SUBTITLE_TEXT_SCALE
+    }
+    val withBackground = prefs.videoSubtitleBackground
     view.setApplyEmbeddedStyles(false)
     view.setStyle(
         CaptionStyleCompat(
             /* foregroundColor = */ android.graphics.Color.WHITE,
-            /* backgroundColor = */ android.graphics.Color.TRANSPARENT,
-            /* windowColor = */ android.graphics.Color.TRANSPARENT,
+            /* backgroundColor = */ if (withBackground) {
+                android.graphics.Color.argb(0x99, 0, 0, 0)
+            } else {
+                android.graphics.Color.TRANSPARENT
+            },
+            /* windowColor = */ if (withBackground) {
+                android.graphics.Color.argb(0x99, 0, 0, 0)
+            } else {
+                android.graphics.Color.TRANSPARENT
+            },
             /* edgeType = */ CaptionStyleCompat.EDGE_TYPE_OUTLINE,
             /* edgeColor = */ android.graphics.Color.BLACK,
             /* typeface = */ null
         )
     )
-    // 默认 0.0533（≈ 屏高的 5.3%）在手机上偏小，尤其横屏时。放大到 1.25 倍。
-    view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * SUBTITLE_TEXT_SCALE)
+    view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * scale)
     // 抬离底边：控制条弹出时会盖住最底部那行字
     view.setBottomPaddingFraction(SUBTITLE_BOTTOM_PADDING_FRACTION)
 }
@@ -272,9 +307,25 @@ fun UfiFullscreenSystemUiEffect(enabled: Boolean) {
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // 2026-10-20：**首次进全屏会留一条白块**（过一会自己消失，仅冷启动首次）。
+        // 原因：冷启动时 Activity 还没走完方向切换/inset 分发，这里这次 hide() 会被随后的
+        // 一次 inset 分发覆盖；而状态栏底色仍是主题的白（或系统默认），于是它短暂露出来。
+        // 处理：把状态栏底色强制透明，并在 decor 上补两次 hide（post 两帧），
+        // 保证方向切换与 inset 分发之后仍是隐藏态。退出时精确还原。
+        @Suppress("DEPRECATION")
+        val originalStatusBarColor = window.statusBarColor
+        @Suppress("DEPRECATION")
+        window.statusBarColor = android.graphics.Color.TRANSPARENT
+        window.decorView.post {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            window.decorView.post { controller.hide(WindowInsetsCompat.Type.systemBars()) }
+        }
+
         onDispose {
             activity.requestedOrientation = originalOrientation
             controller.show(WindowInsetsCompat.Type.systemBars())
+            @Suppress("DEPRECATION")
+            window.statusBarColor = originalStatusBarColor
             if (!originalKeepScreenOn) {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             }
@@ -369,7 +420,18 @@ suspend fun loadUfiSubtitleTracks(appContext: Context, videoPath: String): List<
  * 不给 default 的话"自动匹配"就成了摆设：用户每次还得自己去菜单点一下。
  */
 @OptIn(UnstableApi::class)
-fun ExoPlayer.setUfiSources(sources: List<UfiVideoSource>, startIndex: Int) {
+fun ExoPlayer.setUfiSources(
+    sources: List<UfiVideoSource>,
+    startIndex: Int,
+    /**
+     * 是否把第一条字幕标成默认（= 有字幕就自动显示）。
+     *
+     * 来自「视频设置 → 显示与字幕 → 自动显示字幕」；关掉时不加 `SELECTION_FLAG_DEFAULT`，
+     * 于是打开视频是干净的，想看再在播放页的齿轮里选 —— 比"全局禁掉字幕轨"更好：
+     * 后者连手选都会被挡住。
+     */
+    autoSubtitle: Boolean = true
+) {
     if (sources.isEmpty()) return
     setMediaItems(
         sources.map { source ->
@@ -381,7 +443,9 @@ fun ExoPlayer.setUfiSources(sources: List<UfiVideoSource>, startIndex: Int) {
                             .setMimeType(track.mimeType)
                             .setLabel(track.label.ifBlank { null })
                             .setLanguage(track.language)
-                            .setSelectionFlags(if (index == 0) C.SELECTION_FLAG_DEFAULT else 0)
+                            .setSelectionFlags(
+                                if (autoSubtitle && index == 0) C.SELECTION_FLAG_DEFAULT else 0
+                            )
                             .build()
                     }
                 )

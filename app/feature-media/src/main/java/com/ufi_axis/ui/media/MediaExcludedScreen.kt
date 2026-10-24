@@ -101,7 +101,9 @@ fun MediaExcludedScreen(
                             horizontal = Spacing.CardHorizontalMargin,
                             vertical = Spacing.Large
                         ),
-                        verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                        // 卡间距与设置页一致（10dp / Spacing.SettingsCardGap）：懒列表的间距只能自己管，
+                        // 页壳是 UfiPageBackgroundBox，包不进那层 Column
+                        verticalArrangement = Arrangement.spacedBy(Spacing.SettingsCardGap)
                     ) {
                         item {
                             UfiSectionHeader(

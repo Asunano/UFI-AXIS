@@ -14,12 +14,14 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import { Endpoints } from '@/api/contract';
 import {
   createBlobUrlPool,
+  DEFAULT_MEDIA_SORT,
   fetchMediaPage,
   fetchThumbUrl,
   MEDIA_PAGE_SIZE,
   MEDIA_THUMB_SIZE,
   type MediaItem,
   type MediaKind,
+  type MediaSort,
 } from './mediaShared';
 
 /**
@@ -44,6 +46,49 @@ export function useMediaLibrary(kind: MediaKind) {
   /** id → 缩略图 blob URL。没有该键 = 还没取到或取不到，渲染占位图标。 */
   const thumbs = ref<Record<number, string>>({});
 
+  /**
+   * 当前排序（2026-10-14 加）。默认与拆分前硬编码的口径一致（修改时间倒序）。
+   *
+   * **它必须下推到 core**（见 `fetchMediaPage` 的说明）：客户端只能排已翻出来的那 60 条，
+   * 排出来的是"页内有序、页间乱序"，比没有排序更误导。
+   */
+  const sort = ref<MediaSort>({ ...DEFAULT_MEDIA_SORT });
+
+  /** 换排序 = 换一次完整重拉（offset 归零），否则"第 2 页"在新排序下毫无意义。 */
+  function setSort(next: MediaSort) {
+    if (next.key === sort.value.key && next.order === sort.value.order) return;
+    sort.value = next;
+    reload();
+  }
+
+  /**
+   * 重新扫描媒体库（2026-10-14 加）。
+   *
+   * 用户刚用文件管理器拷进来的文件，在 MediaStore 里要等系统扫描才出现 ——
+   * 这是"我明明放进去了却看不到"的唯一出口。core 侧是异步触发（立刻返回），
+   * 所以**不能**在这里接着 reload：扫描还没完，拉到的还是旧列表。
+   * 由调用方决定"多久之后刷新一次"，或者靠 WS 的 `media:*` 推送。
+   */
+  async function rescan(): Promise<boolean> {
+    await api.post(`${Endpoints.media.rescan}?type=${kind}`);
+    return true;
+  }
+
+  /**
+   * 清空**整类**的封面缓存（2026-10-14 加）。
+   *
+   * 与 [refetchThumb]（单条重抽）是两个粒度：封面集体变糊、或换了抽帧策略之后
+   * 需要把整类推倒重来。core 侧不带 `id` 就是整类清（`MediaRoutes` 的 DELETE 分支）。
+   * 清完必须把本页已缓存的 blob 全放掉，否则界面上还是旧图 —— 用户会以为没生效。
+   */
+  async function clearThumbCache(): Promise<void> {
+    await api.delete(`${Endpoints.media.thumbnailCache}?type=${kind}`);
+    pool.releaseAll();
+    thumbs.value = {};
+    // 重新取一遍当前页的封面（列表本身不用重拉：清的是缓存，条目没变）
+    void loadThumbs(items.value);
+  }
+
   const hasMore = () => items.value.length < total.value;
 
   async function loadThumbs(list: MediaItem[]) {
@@ -67,7 +112,7 @@ export function useMediaLibrary(kind: MediaKind) {
     if (offset === 0) loading.value = true;
     else loadingMore.value = true;
     try {
-      const data = await fetchMediaPage(api, kind, offset, MEDIA_PAGE_SIZE);
+      const data = await fetchMediaPage(api, kind, offset, MEDIA_PAGE_SIZE, undefined, sort.value);
       // useCancellableApi 取消在途请求时 data 为 null，按"无结果"处理（不算失败）
       if (!data) return;
       permissionDenied.value = false;
@@ -139,11 +184,15 @@ export function useMediaLibrary(kind: MediaKind) {
     permissionDenied,
     failed,
     thumbs,
+    sort,
     hasMore,
     load,
     reload,
     loadMore,
     loadThumbs,
     refetchThumb,
+    setSort,
+    rescan,
+    clearThumbCache,
   };
 }

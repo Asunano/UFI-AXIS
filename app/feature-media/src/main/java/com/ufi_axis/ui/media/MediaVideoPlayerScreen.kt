@@ -3,12 +3,19 @@ package com.ufi_axis.ui.media
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.layout.onGloballyPositioned
+import com.ufi_axis.ui.components.common.UfiPopupMenu
+import com.ufi_axis.ui.components.common.UfiPopupOption
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -28,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,6 +84,9 @@ fun MediaVideoPlayerScreen(
     filePath: String
 ) {
     val palette = LocalResolvedPalette.current
+    val context = LocalContext.current
+    // 播放/字幕/续播的偏好：下面装字幕轨（约 150 行）与续播都要用，所以提到最前
+    val prefs = remember(context) { AppPreferences(context) }
     val media = viewModel.media
     val state by media.state.collectAsState()
     val videos = state.tab(MEDIA_TYPE_VIDEO).items
@@ -84,6 +95,10 @@ fun MediaVideoPlayerScreen(
     LaunchedEffect(Unit) { media.loadFirstPage(MEDIA_TYPE_VIDEO) }
 
     var fullscreen by remember { mutableStateOf(false) }
+
+
+
+
     var currentIndex by remember { mutableStateOf(0) }
     // 下半屏的两页：0 播放列表 / 1 视频详情（与 pager 双向同步）
     var bottomTab by remember { mutableStateOf(0) }
@@ -105,6 +120,7 @@ fun MediaVideoPlayerScreen(
     LaunchedEffect(player) {
         player.pauseAtEndOfMediaItems = true
     }
+
 
     /**
      * 外挂字幕：path → 要挂给播放器的字幕轨。
@@ -159,7 +175,11 @@ fun MediaVideoPlayerScreen(
         if (paths.isEmpty()) {
             // 列表还没到：先单曲播路由带来的那个文件，等列表到了再整体换成 playlist
             val position = player.currentPosition
-            player.setUfiSources(listOf(sourceOf(filePath)), 0)
+            player.setUfiSources(
+                sources = listOf(sourceOf(filePath)),
+                startIndex = 0,
+                autoSubtitle = prefs.videoSubtitleAuto
+            )
             if (position > 0) player.seekTo(0, position)
             player.playWhenReady = true
             return@LaunchedEffect
@@ -176,7 +196,11 @@ fun MediaVideoPlayerScreen(
             subtitlesByPath[paths.getOrNull(start)].orEmpty().size
         if (player.mediaItemCount != paths.size || subtitlesChanged) {
             val position = player.currentPosition
-            player.setUfiSources(paths.map { sourceOf(it) }, start)
+            player.setUfiSources(
+                sources = paths.map { sourceOf(it) },
+                startIndex = start,
+                autoSubtitle = prefs.videoSubtitleAuto
+            )
             if (position > 0) player.seekTo(start, position)
             player.playWhenReady = true
         }
@@ -201,8 +225,6 @@ fun MediaVideoPlayerScreen(
     //
     // 三个写入时机缺一不可：定时（进程被杀也留得下）、切片时（旧片的进度得先落地）、
     // 页面销毁时（最后一次补齐）。判定口径统一在 MediaPlaybackProgress.kt。
-    val context = LocalContext.current
-    val prefs = remember(context) { AppPreferences(context) }
     val currentPath = videos.getOrNull(currentIndex)?.path ?: filePath
     var resumeToast by remember { mutableStateOf<ToastMessage?>(null) }
 
@@ -212,6 +234,12 @@ fun MediaVideoPlayerScreen(
         if (currentPath.isBlank() || resumedPath == currentPath) return@LaunchedEffect
         if (player.mediaItemCount == 0) return@LaunchedEffect
         resumedPath = currentPath
+        /*
+         * 「续播」开关（2026-10-21，视频设置 → 播放与预热）：关掉后每次从头开始，
+         * 也不弹"已从 x 继续"—— 有人就是不想被上次的位置打断。
+         * 记录本身照旧写入（进度记忆还与"看完自动清"等逻辑共用），只是不再用它来 seek。
+         */
+        if (!prefs.videoResumeEnabled) return@LaunchedEffect
         val saved = mediaResumePosition(prefs, currentPath)
         if (saved > 0) {
             player.seekTo(saved)
@@ -292,6 +320,7 @@ fun MediaVideoPlayerScreen(
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
+
 
     UfiFullscreenSystemUiEffect(enabled = fullscreen)
 
@@ -582,29 +611,34 @@ private fun MediaVideoPlaylistRow(
                     width = PLAYLIST_THUMB_WIDTH,
                     height = PLAYLIST_THUMB_HEIGHT
                 )
-                // 播放标只在当前项上出现，用动画进出（原先是 PlayArrow↔Videocam 瞬间替换）
-                AnimatedContent(
-                    targetState = playing,
-                    transitionSpec = {
-                        fadeIn(tween(UfiMotion.Duration.Swift)) togetherWith
-                            fadeOut(tween(UfiMotion.Duration.Micro))
-                    },
-                    label = "playlist-playing-badge"
-                ) { isPlaying ->
-                    if (isPlaying) {
-                        Box(
+                // 播放标只在当前项上出现。
+                // 2026-10-19：从 AnimatedContent（淡入淡出两套内容）改为**单层 alpha 动画**。
+                // 原实现切换视频时有两层内容同时在树上：旧行在淡出「遮罩 + 播放图标」，
+                // 新行在淡入 —— 列表滚动/复用时新行常常是首次组合（没有淡入），
+                // 而旧行仍在淡出，于是观感是「遮罩先出现在还没开始播放的那条上，再跳到正确的」。
+                // 单层只改透明度，不新增/销毁节点，也没有两个内容并存的中间态。
+                val scrimAlpha by animateFloatAsState(
+                    targetValue = if (playing) 1f else 0f,
+                    animationSpec = tween(
+                        durationMillis = if (playing) UfiMotion.Duration.Swift else UfiMotion.Duration.Micro
+                    ),
+                    label = "playlist-playing-scrim"
+                )
+                if (scrimAlpha > 0.01f) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(palette.accent.copy(alpha = PLAYING_SCRIM_ALPHA * scrimAlpha)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Default.PlayArrow,
+                            contentDescription = "正在播放",
+                            tint = Color.White,
                             modifier = Modifier
-                                .fillMaxSize()
-                                .background(palette.accent.copy(alpha = PLAYING_SCRIM_ALPHA)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                Icons.Default.PlayArrow,
-                                contentDescription = "正在播放",
-                                tint = Color.White,
-                                modifier = Modifier.size(Spacing.IconSizeMedium)
-                            )
-                        }
+                                .size(Spacing.IconSizeMedium)
+                                .alpha(scrimAlpha)
+                        )
                     }
                 }
             }

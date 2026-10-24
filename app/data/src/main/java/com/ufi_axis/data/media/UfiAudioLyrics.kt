@@ -1,5 +1,8 @@
 package com.ufi_axis.data.media
 
+import android.content.Context
+import java.io.File
+
 import com.ufi_axis.data.api.UfiAxisApi
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
@@ -60,8 +63,172 @@ object UfiAudioLyrics {
     /** ID3 补取硬上限 4MB：标签里声明的长度来自文件本身，畸形值不能直接信。 */
     private const val ID3_TAG_PROBE_MAX = 4 * 1024 * 1024
 
+    /*
+     * ── 进程内歌词缓存（2026-10-14）────────────────────────────────────────────
+     *
+     * ## 为什么需要
+     * 取一次歌词要问 core / 拉旁挂 `.lrc` / 扫内嵌标签，都是磁盘或网络动作。而调用点
+     * （播放页、音乐页那张上滑面板、标题栏挂件）会**随页面生灭反复走同一条 [load]** ——
+     * 面板每次打开都从头刷一遍，用户看到的就是"歌词每次都在重新加载"。
+     *
+     * ## 为什么连"没有歌词"也缓存
+     * 那是最贵的一档：三级全部落空 = 三次请求/扫描全白跑。所以这一档也记下来（值存 null），
+     * 否则每次打开都要再扫一遍整个文件头。
+     *
+     * ## 容量与失效
+     * 2026-10-21：容量从 4 提到 [LYRICS_CACHE_MAX]，并**增加磁盘持久化**（见 [install]）。
+     *
+     * 原来只留 4 首、且不做磁盘：连听 5 首之后再回到前面的歌就要重新问 core、重新扫内嵌标签，
+     * 冷启动更是全部重来 —— 用户读到的是"歌词总要等一下才出来"。
+     * 现在两级缓存：内存（本次会话，读得最快）→ 磁盘（跨进程，仍比网络/扫标签快得多）。
+     *
+     * 失效策略刻意简单：磁盘条目带写入时间，超过 [DISK_TTL_MS] 视为过期重新取；
+     * 另给「音乐设置 → 歌词缓存 → 清空」一个手动出口（换了 .lrc 之后想立刻生效就用它）。
+     *
+     * 只在主线程（Compose 的 LaunchedEffect）访问内存表，所以不加锁；磁盘读写在对端 IO 线程上做。
+     */
+    private const val LYRICS_CACHE_MAX = 40
+    private val cache = LinkedHashMap<String, Result?>()
+
+    /** 这首歌的歌词**是否已经查过**（查到与确认没有都算）。 */
+    fun isCached(filePath: String): Boolean = cache.containsKey(filePath)
+
+    /** 已缓存的歌词；[isCached] 为 false 时没有意义（那一档表示"还没查过"）。 */
+    fun cached(filePath: String): Result? = cache[filePath]
+
+    private fun rememberResult(filePath: String, result: Result?) {
+        cache.remove(filePath)
+        cache[filePath] = result
+        while (cache.size > LYRICS_CACHE_MAX) {
+            val oldest = cache.keys.firstOrNull() ?: break
+            cache.remove(oldest)
+        }
+    }
+    // ── 磁盘缓存（2026-10-21）────────────────────────────────────────────────
+
     /**
-     * 取歌词：core 接口（有 [mediaId] 时）→ 同目录同名 `.lrc` → 内嵌 USLT/SYLT/FLAC LYRICS。
+     * 安装磁盘缓存目录（`cacheDir/lyrics`）。由 Application 在启动时调一次。
+     *
+     * 为什么是 `install(context)` 而不是给每个调用都加一个 `context` 参数：取词的三处调用
+     * （播放页、上滑面板、标题栏挂件）+ 文件管理器预览都要跟着改签名，而磁盘缓存跟"谁在问"
+     * 无关。这与 `MediaDownloadQueue.ensureLoaded(context)` 是同一个套路。
+     */
+    fun install(context: Context) {
+        diskDir = File(context.applicationContext.cacheDir, "lyrics").apply { mkdirs() }
+    }
+
+    /** 磁盘缓存目录；未 [install] 时为 null（此时退化成纯内存缓存，行为与 2026-10-21 之前一致）。 */
+    @Volatile
+    private var diskDir: File? = null
+
+    /** 磁盘条目有效期。30 天足够覆盖"这阵子在听这几首"，也让改过的 .lrc 有个自然失效点。 */
+    private const val DISK_TTL_MS = 30L * 24 * 60 * 60 * 1000
+
+    private fun diskFileOf(filePath: String): File? {
+        val dir = diskDir ?: return null
+        val digest = runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(filePath.toByteArray())
+                .take(8)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrElse { Integer.toHexString(filePath.hashCode()) }
+        return File(dir, "$digest.lyrics")
+    }
+
+    /**
+     * 读磁盘：命中返回 Result；`null` 表示"磁盘上没有 / 过期 / 坏了"（调用方继续走三级取词）。
+     *
+     * 格式是极简的行文本（首行版本 + 首行来源 + 每行一句），不用 JSON：
+     * 这里的数据只有两种字段，引一次序列化器不划算，而且坏了也只是重新取一次。
+     */
+    /**
+     * 磁盘读取结果：`null` = 没有可用条目；非 null 时 [result] 也可能是 null ——
+     * 那是"查过、确实没有歌词"这一档（与内存缓存同一个语义）。
+     *
+     * 为什么必须区分：早先的写法把"没有歌词"的条目读成一个**空 Result**，
+     * 调用方看到非 null 就当成"有歌词（0 行）"，于是永远不会再去试 `.lrc`。
+     */
+    private class DiskHit(val result: Result?)
+
+    private fun readDisk(filePath: String): DiskHit? {
+        val file = diskFileOf(filePath) ?: return null
+        if (!file.isFile) return null
+        if (System.currentTimeMillis() - file.lastModified() > DISK_TTL_MS) return null
+        return runCatching {
+            val lines = file.readLines()
+            if (lines.size < 2 || lines[0] != DISK_VERSION) return null
+            // 第二行是 `none` = 查过但没有
+            if (lines[1] == "none") return DiskHit(null)
+            val source = lines[1].removePrefix("source=")
+            val parsed = lines.drop(2).mapNotNull { row ->
+                val parts = row.split('\t')
+                if (parts.size < 2) return@mapNotNull null
+                val time = parts[0].toLongOrNull() ?: return@mapNotNull null
+                Line(time, parts.subList(1, parts.size).joinToString("\t"))
+            }
+            if (parsed.isEmpty()) DiskHit(null) else DiskHit(Result(source, parsed))
+        }.getOrNull()
+    }
+
+    /** 写磁盘（连"没有歌词"这一档也写：它是三级全落空的结果，最贵）。失败静默 —— 缓存不该影响功能。 */
+    private fun writeDisk(filePath: String, result: Result?) {
+        val file = diskFileOf(filePath) ?: return
+        runCatching {
+            val sb = StringBuilder()
+            sb.append(DISK_VERSION).append('\n')
+            if (result == null || result.lines.isEmpty()) {
+                // "查过但没有"单独记一个标记（最贵的一档，避免每次都重新扫文件头）
+                sb.append("none").append('\n')
+            } else {
+                sb.append("source=").append(result.source).append('\n')
+            }
+            result?.lines?.forEach { line ->
+                sb.append(line.timeMs).append('\t')
+                    .append(line.text.replace('\t', ' ').replace('\n', ' '))
+                    .append('\n')
+            }
+            file.writeText(sb.toString())
+        }
+        // 上限：按最后修改时间淘汰，只留 `DISK_MAX_FILES` 份
+        runCatching {
+            val dir = diskDir ?: return@runCatching
+            val all = dir.listFiles()?.filter { it.isFile }.orEmpty()
+            if (all.size > DISK_MAX_FILES) {
+                all.sortedBy { it.lastModified() }
+                    .take(all.size - DISK_MAX_FILES)
+                    .forEach { it.delete() }
+            }
+        }
+    }
+
+    /**
+     * 磁盘格式版本。**改动取词优先级 / 行格式时必须同步 +1** —— 否则用户会继续吃到
+     * 旧规则写下的缓存，看起来就是"改了没生效"（2026-10-21 升 v2：.lrc 提到 core 之前）。
+     */
+    private const val DISK_VERSION = "ufi-lyrics-v2"
+
+    /** 磁盘条目上限（300 首 × 几 KB ≈ 1~2MB，够用且不会吃空间）。 */
+    private const val DISK_MAX_FILES = 300
+
+    /** 已缓存多少首（设置页显示用）。 */
+    fun diskCacheCount(): Int = diskDir?.listFiles()?.count { it.isFile } ?: 0
+
+    /** 清空磁盘缓存，返回删掉的条数。 */
+    fun clearDiskCache(): Int {
+        val dir = diskDir ?: return 0
+        var removed = 0
+        dir.listFiles()?.forEach { if (it.delete()) removed++ }
+        cache.clear()
+        return removed
+    }
+
+    /**
+     * 取歌词：**同目录同名 `.lrc`** → core 接口（有 [mediaId] 时）→ 内嵌 USLT/SYLT/FLAC LYRICS。
+     *
+     * 2026-10-21 调整顺序：`core` 提到 `.lrc` **之后**。原因是 core 的 `/api/media/lyrics`
+     * 会把**内嵌**歌词也一起交出来，而排在第一位之后，用户自己放在歌曲旁边的同名 `.lrc`
+     * 永远轮不到 —— 表现就是"只认内嵌歌词，.lrc 不识别"。本机文件比服务端推断更贴近用户意图，
+     * 所以 `.lrc` 优先；没有 `.lrc` 时才问 core，最后才是本地扫内嵌。
      *
      * 每一级都以「解析后至少有一行」为命中标准，而不是「请求成功」：拿到一个只有 `[ti:]`
      * 元信息头的空壳文件，等于没有歌词，应当继续往下找。
@@ -76,9 +243,19 @@ object UfiAudioLyrics {
         prefs: AppPreferences,
         filePath: String
     ): Result? {
-        loadFromCore(api, mediaId)?.let { return it }
-        loadSidecarLrc(httpClient, prefs, filePath)?.let { return it }
-        return loadEmbedded(httpClient, prefs, filePath)
+        // 内存命中（含"查过但没有"那一档）直接返回，理由见 [cache]
+        if (cache.containsKey(filePath)) return cache[filePath]
+        // 内存没有 → 磁盘（跨进程也有效）；命中的话同时回填内存，后续不必再读盘
+        readDisk(filePath)?.let { disk ->
+            rememberResult(filePath, disk.result)
+            return disk.result
+        }
+        val result = loadSidecarLrc(httpClient, prefs, filePath)
+            ?: loadFromCore(api, mediaId)
+            ?: loadEmbedded(httpClient, prefs, filePath)
+        rememberResult(filePath, result)
+        writeDisk(filePath, result)
+        return result
     }
 
     /**

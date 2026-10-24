@@ -27,6 +27,21 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
             </intent-filter>
         </service>
+        <!--
+             媒体键接收器（2026-10-21）。
+
+             没有它时：进程被杀之后按蓝牙耳机 / 线控耳机上的播放键，系统找不到人接 ——
+             服务要等下次前台才起来，用户读到的是"按键没反应"。
+             有了它：MediaButtonReceiver 拉起 UfiAudioPlaybackService，服务再问
+             `MediaSession.Callback.onPlaybackResumption` 要"上次在听什么"，恢复队列并起播。
+        -->
+        <receiver
+            android:name="androidx.media3.session.MediaButtonReceiver"
+            android:exported="true" >
+            <intent-filter>
+                <action android:name="android.intent.action.MEDIA_BUTTON" />
+            </intent-filter>
+        </receiver>
     </application>
 
 </manifest>

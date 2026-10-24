@@ -21,6 +21,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.navigation.NavHostController
+import com.ufi_axis.data.model.MEDIA_GROUP_FOLDER
 import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
 import com.ufi_axis.data.model.MediaLibraryItem
 import com.ufi_axis.data.model.PlaylistEntry
@@ -211,7 +212,9 @@ fun MediaAudioScreen(
              * 与页面底色不同的缝。手势条避让也交给它内部处理，避免叠两次。
              */
             MediaAudioMiniBar(navController)
-        }
+        },
+        // 上滑跟手升起的播放面板（见 MediaAudioRisePanel.kt）：挂在页壳的整屏浮层槽上
+        overlay = { MediaAudioRisePanel(viewModel, navController) }
     ) { tab ->
         when {
             pane == PANE_ALL -> MediaAudioList(
@@ -265,8 +268,11 @@ fun MediaAudioScreen(
                 MediaAudioGroupList(
                     state = state.group(by),
                     coverUrl = { entry ->
-                        // cover_id 为 0 = 这一组一张封面都没有，此时不拼 URL（见 MediaAudioGroupList）
-                        if (entry.cover_id > 0) {
+                        // 2026-10-19：**文件夹维度一律画文件夹图标**（对齐文件管理器），
+                        // 不再拿组内某首歌的封面当缩略图 —— 与视频/图片两处同口径。
+                        if (by == MEDIA_GROUP_FOLDER) {
+                            null
+                        } else if (entry.cover_id > 0) {
                             media.thumbnailUrl(MEDIA_TYPE_AUDIO, entry.cover_id)
                         } else {
                             null

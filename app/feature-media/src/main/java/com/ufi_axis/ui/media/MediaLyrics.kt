@@ -19,6 +19,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import com.ufi_axis.ui.components.common.UfiCustomDialog
+import com.ufi_axis.ui.components.common.UfiDialogNote
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
@@ -136,8 +144,37 @@ internal fun MediaLyricsPreview(
      * 2026-09-20 修：加了 contentPadding 之后还在用旧的 −(行高 + 行距)，
      * 于是 item 被推到 `2 × (行高 + 行距)`，当前句跑到了最下面那一行。
      */
+    /*
+     * 首次定位用**瞬时**（`scrollToItem`），之后才用动画（2026-10-14）。
+     *
+     * 列表一开始停在第一句：用 `animateScrollToItem` 滚过去的话，用户看到的是"歌词从第一行
+     * 一路刷下来"，而这一刻的真实语义是"这首歌已经唱到第 N 句了"。所以第一次直接落位。
+     * 之后的换句仍然走动画 —— 整行竖向滚动是这一栏的常态反馈。
+     */
+    val firstFix = remember { mutableStateOf(true) }
     LaunchedEffect(current) {
-        listState.animateScrollToItem(current, 0)
+        if (firstFix.value) {
+            firstFix.value = false
+            listState.scrollToItem(current, 0)
+        } else {
+            listState.animateScrollToItem(current, 0)
+        }
+    }
+    /*
+     * 手动滑动后的回位（2026-10-21）：手一松、停 [LYRIC_RESUME_AFTER_SCROLL_MS] 就把当前句拉回中间。
+     *
+     * 原来只有"换下一句"时才会回位 —— 用户滑开去看后面几句之后，得等这首歌再唱一句
+     * （慢歌十几秒）才回来，主观上就是"回得很慢"。这里补一条"松手就回"，
+     * 并且**只有当前句完全不在视口里**才动，避免和我们自己的滚动动画互相打架。
+     */
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (scrolling) return@collect
+            delay(LYRIC_RESUME_AFTER_SCROLL_MS)
+            if (listState.isScrollInProgress) return@collect
+            val visible = listState.layoutInfo.visibleItemsInfo.any { it.index == current }
+            if (!visible) listState.animateScrollToItem(current, 0)
+        }
     }
 
     LazyColumn(
@@ -219,6 +256,8 @@ internal fun MediaLyricsFullView(
     }
     val synced = lines.first().timeMs >= 0L
     val listState = rememberLazyListState()
+    // 首次定位瞬时落位、之后才动画，理由与 MediaLyricsPreview 里那一段逐字相同（2026-10-14）
+    val firstFix = remember { mutableStateOf(true) }
     LaunchedEffect(index) {
         if (index < 0) return@LaunchedEffect
         /*
@@ -241,7 +280,33 @@ internal fun MediaLyricsFullView(
         val itemSize = info.visibleItemsInfo.firstOrNull { it.index == index }?.size
             ?: info.visibleItemsInfo.firstOrNull()?.size
             ?: 0
-        listState.animateScrollToItem(index, itemSize / 2)
+        if (firstFix.value) {
+            firstFix.value = false
+            listState.scrollToItem(index, itemSize / 2)
+        } else {
+            listState.animateScrollToItem(index, itemSize / 2)
+        }
+    }
+    /*
+     * 手动滑动后的回位（2026-10-21），与三行预览那条同一条理由：
+     * 手松开后停 [LYRIC_RESUME_AFTER_SCROLL_MS] 就回位，而不是等下一句歌词到点。
+     * 判据同样是"当前句不在视口里才动"，所以程序性滚动结束时不会自己再触发一次。
+     */
+    val currentIndex by rememberUpdatedState(index)
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (scrolling) return@collect
+            delay(LYRIC_RESUME_AFTER_SCROLL_MS)
+            if (listState.isScrollInProgress) return@collect
+            val idx = currentIndex
+            if (idx < 0) return@collect
+            val visible = listState.layoutInfo.visibleItemsInfo.any { it.index == idx }
+            if (!visible) {
+                val info = listState.layoutInfo
+                val itemSize = info.visibleItemsInfo.firstOrNull()?.size ?: 0
+                listState.animateScrollToItem(idx, itemSize / 2)
+            }
+        }
     }
     Column(modifier = modifier.fillMaxSize()) {
         /*
@@ -311,13 +376,57 @@ internal fun MediaLyricsFullView(
                 }
             }
         }
+        /*
+         * 歌词来源（2026-10-21 精简）：
+         *
+         * 原来直接把 `source` 整条丢出来（`内嵌歌词 · 某某某.flac` / `某某某.lrc`），文件名一长
+         * 就把这一行撑得很乱。现在只显示**类别**（内嵌歌词 / 旁挂歌词 / 服务端歌词），
+         * 点一下才展开完整来源 —— 想知道"到底从哪来的"的人一点就有，不想知道的人只看到两个字。
+         */
         if (source.isNotBlank()) {
+            var showSource by remember { mutableStateOf(false) }
             Text(
-                "词 · $source",
+                "词 · ${lyricSourceCategory(source)}",
                 style = UfiTextStyles.note,
                 color = palette.textSecondary.copy(alpha = 0.7f),
-                modifier = Modifier.padding(top = 4.dp, bottom = 4.dp)
+                modifier = Modifier
+                    .clickable { showSource = true }
+                    .padding(top = 4.dp, bottom = 4.dp, start = 12.dp, end = 12.dp)
             )
+            if (showSource) {
+                UfiCustomDialog(
+                    visible = true,
+                    onDismiss = { showSource = false },
+                    title = "歌词来源"
+                ) {
+                    UfiDialogNote(source)
+                }
+            }
         }
     }
+}
+
+/**
+ * 手动滑动之后，等多久把当前句拉回视口（毫秒）。
+ *
+ * 600ms 是"用户抬手、视线落稳"的量级：再短会在惯性滑动还没停时抢滚动，
+ * 再长就回到"要等下一句"的老观感。
+ */
+private const val LYRIC_RESUME_AFTER_SCROLL_MS = 600L
+
+/**
+ * 歌词来源 → **类别**（2026-10-21）。
+ *
+ * `UfiAudioLyrics.Result.source` 是三种形态混在一起的自由文本：
+ * · 服务端：接口回的 `source` 字段；
+ * · 旁挂：`.lrc` 的**文件名**；
+ * · 内嵌：固定为 `内嵌歌词 · 文件名`。
+ * 页脚只要"哪一类"，完整来源点开弹窗看（见 `MediaLyricsFullView` 的页脚）。
+ */
+internal fun lyricSourceCategory(source: String): String = when {
+    source.contains("内嵌") -> "内嵌歌词"
+    source.endsWith(".lrc", ignoreCase = true) -> "旁挂歌词"
+    source.contains("服务端") || source.contains("core", ignoreCase = true) -> "服务端歌词"
+    // 认不出的取值原样透出：至少是可检索的字符串，而不是一个空洞的"歌词"标签
+    else -> source
 }

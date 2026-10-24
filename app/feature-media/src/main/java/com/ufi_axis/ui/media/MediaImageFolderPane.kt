@@ -1,7 +1,9 @@
 package com.ufi_axis.ui.media
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,9 +30,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.data.model.MEDIA_TYPE_IMAGE
 import com.ufi_axis.data.model.MediaLibraryItem
@@ -64,11 +72,14 @@ import com.ufi_axis.viewmodel.MainViewModel
  * @param gridState 滚动位置由调用方（[MediaImageScreen]）持有：切 Tab 换的是一棵子树，
  *   建在本函数里的状态会随子树销毁，切回来就回到顶部。
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun MediaImageFolderPane(
     viewModel: MainViewModel,
     onOpen: (MediaLibraryItem) -> Unit,
-    gridState: LazyGridState
+    gridState: LazyGridState,
+    /** 长按一张图（2026-10-21）：与时间轴那一栏同一个回调形状，菜单由页壳托管。 */
+    onLongPress: ((MediaLibraryItem, IntRect, IntOffset) -> Unit)? = null
 ) {
     val palette = LocalResolvedPalette.current
     val media = viewModel.media
@@ -176,28 +187,31 @@ internal fun MediaImageFolderPane(
                             subtitle = "${folder.count} 张图片",
                             onClick = { media.browse(MEDIA_TYPE_IMAGE, folder.path, force = true) },
                             leading = {
-                                // 封面用子树里最新那一张；core 给 0/null 表示没有可用封面
-                                val coverId = folder.cover_id
-                                if (coverId != null && coverId > 0) {
-                                    MediaThumb(
-                                        url = media.thumbnailUrl(MEDIA_TYPE_IMAGE, coverId),
-                                        fallback = Icons.Default.Folder,
-                                        width = MEDIA_IMAGE_FOLDER_COVER_SIZE,
-                                        height = MEDIA_IMAGE_FOLDER_COVER_SIZE
-                                    )
-                                } else {
-                                    FolderIcon()
-                                }
+                                // 2026-10-19：文件夹一律用文件夹图标（对齐文件管理器），
+                                // 不再拿子树里某张图片当封面 —— 与视频/音乐三处口径一致。
+                                FolderIcon()
                             }
                         )
                     }
 
                     // 本层的图片：与时间轴那一栏同样的格子形状（同一组列数/格高常量）
                     items(view.items, key = { it.id }) { item ->
+                        var bounds by remember { mutableStateOf(IntRect.Zero) }
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { onOpen(item) }
+                                .onGloballyPositioned { bounds = mediaVideoAnchorRect(it) }
+                                .combinedClickable(
+                                    onClick = { onOpen(item) },
+                                    // 长按菜单与时间轴那一栏同一份实现（见 MediaImageActionHost）
+                                    onLongClick = {
+                                        onLongPress?.invoke(
+                                            item,
+                                            bounds,
+                                            mediaVideoAnchorCenter(bounds)
+                                        )
+                                    }
+                                )
                         ) {
                             MediaThumb(
                                 url = media.thumbnailUrl(MEDIA_TYPE_IMAGE, item.id),
