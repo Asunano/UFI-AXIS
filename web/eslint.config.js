@@ -47,6 +47,12 @@ export default tseslint.config(
     files: ['scripts/**/*.{js,mjs}'],
     languageOptions: { globals: { ...globals.node } },
   },
+  {
+    // public/sw.js 是 Service Worker：self / caches / fetch 由 SW 全局环境提供，
+    // 不是浏览器 window 那套 globals.（一直没配，`npx eslint .` 会在这里报 16 条 no-undef）
+    files: ['public/**/*.js'],
+    languageOptions: { globals: { ...globals.serviceworker, ...globals.browser } },
+  },
   // prettier 放最后：关掉所有与格式化冲突的规则，格式统一交给 prettier
   prettier
 );
