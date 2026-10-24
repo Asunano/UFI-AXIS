@@ -36,7 +36,12 @@
                 <div class="device-info">
                   <span class="device-idx">#{{ idx + 1 }}</span>
                   <div class="device-name-block">
-                    <span class="device-name">{{ dev.device_name || '未命名' }}</span>
+                    <span class="device-name">
+                      {{ dev.device_name || '未命名' }}
+                      <!-- 2026-10-21（审计 §C7）：标出"本浏览器"。之前 deviceFingerprint 只写不读，
+                           移除自己那行时没有任何提示，点完就是静默掉线。 -->
+                      <span v-if="isSelf(dev.fingerprint)" class="device-self-tag">本机</span>
+                    </span>
                     <span class="device-fp" :title="dev.fingerprint">{{ dev.fingerprint.slice(0, 16) }}...</span>
                   </div>
                 </div>
@@ -54,20 +59,16 @@
           </div>
 
           <!-- 解除全部配对 -->
-          <div v-if="status.paired" class="action-area" style="margin-top: 16px">
+          <div v-if="status.paired" class="action-area action-area--spaced">
             <n-button type="error" :loading="unpairing" @click="confirmUnpair"> 解除全部配对 </n-button>
           </div>
         </div>
       </n-spin>
     </GridCard>
 
-    <!-- 首次配对：设置配对密码（设备仍使用默认/初始密码时显示）
-         2026-09-10 第二轮改为通栏。原因是**运行时状态**：这张卡有两个变体 ——
-         首次（有默认密码）带安全告警 + Goform 子表单，实测 476.9px；设过密码后变体只有
-         三个输入框，263px。同时「配对限制配置」也随状态变（未启用限制时只剩 1 行，106px；
-         启用后 223px）。两个高度都随状态摆 2~3 倍，**同行配对本质上不成立**：
-         实测新设备（默认密码）状态下同行差 370.9px，就是一块整版空白。
-         所以本页三张卡全部通栏、不做配对 —— 这是唯一对状态免疫的排法。 -->
+    <!-- 首次配对：设置配对密码（仅在设备仍使用默认/初始密码时显示）
+         通栏：这张卡带安全告警 + Goform 子表单，而「配对限制配置」的高度也随状态变
+         （未启用限制时 1 行，启用后 3 个块），两张卡同行无法等高，统一通栏。 -->
     <GridCard v-if="isFirstRunPassword" class="full-width" title="设置配对密码">
       <n-alert class="pwd-alert" type="warning" :bordered="false">
         设备仍使用默认或初始密码，存在安全风险，请尽快设置配对密码。
@@ -118,7 +119,7 @@
           <div class="goform-mini-title">设备后台</div>
           <div class="goform-mini-grid">
             <n-input v-model:value="goformIp" placeholder="IP（默认 192.168.0.1）" class="pwd-input" />
-            <n-input-number v-model:value="goformPort" :min="1" :max="65535" placeholder="端口" style="width: 120px" />
+            <n-input-number v-model:value="goformPort" :min="1" :max="65535" placeholder="端口" class="num-compact" />
           </div>
           <n-input
             v-model:value="goformPassword"
@@ -135,59 +136,10 @@
     </GridCard>
 
     <!--
-      已设过密码后的常驻入口：修改配对密码。
-      拆成两张卡是因为原来只有 has_default_password=true 的首次配对卡，
-      密码一旦设过 web 端就再也改不了（app 端没有这个限制）。
-      这里不重复 Goform 子表单 —— 设备后台密码在「通用设置」/「高级」里已有入口，
-      抄第二份会让同一个字段有两处来源。
-      通栏理由同上面那张：它与首次配对卡是同一个卡的两个变体，高度差一倍，
-      与「配对限制配置」同行必然留白（实测新设备状态 370.9px）。
+      2026-10-24：已设过密码后的「修改配对密码」卡已删除。
+      设备后台密码在「设备」页已有入口，这里再放一份是重复的；保留首次配对的
+      「设置配对密码」（仅在设备仍使用默认密码时出现），避免新设备无入口。
     -->
-    <GridCard v-else-if="status" class="full-width" title="修改配对密码">
-      <div class="pwd-setup">
-        <n-input
-          v-model:value="curPwd"
-          type="password"
-          show-password-on="click"
-          placeholder="当前密码"
-          :input-props="{ autocomplete: 'current-password' }"
-          class="pwd-input"
-        />
-        <n-input
-          v-model:value="newPwd"
-          type="password"
-          show-password-on="click"
-          placeholder="新密码（4-64 位）"
-          :input-props="{ autocomplete: 'new-password' }"
-          class="pwd-input"
-        />
-        <n-input
-          v-model:value="newPwd2"
-          type="password"
-          show-password-on="click"
-          placeholder="确认新密码"
-          :input-props="{ autocomplete: 'new-password' }"
-          class="pwd-input"
-          @keyup.enter="setAdminPassword"
-        />
-        <!-- 强度条放在确认框之后：理由见首次配对卡里同一处的注释（2 列栅格占满整行） -->
-        <div class="pw-strength">
-          <div class="pw-strength-bars">
-            <span
-              v-for="i in 4"
-              :key="i"
-              class="pw-bar"
-              :class="{ active: i <= passwordStrength.score }"
-              :style="i <= passwordStrength.score ? { background: passwordStrength.color } : {}"
-            ></span>
-          </div>
-          <span class="pw-strength-label">{{ passwordStrength.label }}</span>
-        </div>
-        <div class="pwd-actions pwd-full">
-          <n-button type="primary" :loading="settingPwd" @click="setAdminPassword">修改密码</n-button>
-        </div>
-      </div>
-    </GridCard>
 
     <!-- 配对限制配置卡片。通栏：本卡高度也随状态变（未启用限制时只剩 1 行 106px，
          启用后 3 个块 223px），与任何卡同行都会留白。三张卡通栏后本页不再有配对，
@@ -213,7 +165,7 @@
               :min="0"
               :max="100"
               size="small"
-              style="width: 120px"
+              class="num-compact"
               @update:value="onConfigChange"
             />
           </div>
@@ -229,19 +181,66 @@
         </div>
       </div>
     </GridCard>
+
+    <!-- 新设备批准（2026-10-19）：此前只有 App 能开关 —— Web 用户根本看不到这个能力，
+         而它决定"新设备能不能只凭密码配进来"。三个通知渠道默认全关，且是额外闸门
+         （还要过通知总开关 / 免打扰），所以文案不承诺"打开就一定收到"。 -->
+    <GridCard class="full-width" title="新设备批准">
+      <div class="config-section">
+        <ToggleRow
+          v-model="approvalRequired"
+          label="新设备需在 App 上批准"
+          description="开启后，新设备配对前需要机主在已配对设备上点「允许」，或输入通知里的配对码"
+          :disabled="saving"
+          @update:model-value="onApprovalToggle"
+        />
+
+        <template v-if="approvalRequired">
+          <ToggleRow
+            v-model="notifySystem"
+            label="发本机系统通知"
+            description="把配对码推到手机通知栏，方便直接读"
+            :disabled="saving"
+            @update:model-value="onConfigChange"
+          />
+          <ToggleRow
+            v-model="notifyEmail"
+            label="发邮件"
+            description="走「邮件通知渠道」里配置的邮箱"
+            :disabled="saving"
+            @update:model-value="onConfigChange"
+          />
+          <ToggleRow
+            v-model="notifyWebhook"
+            label="发 Webhook"
+            description="走「Webhook 通知渠道」里配置的地址"
+            :disabled="saving"
+            @update:model-value="onConfigChange"
+          />
+          <p class="config-hint approval-note">
+            这三个渠道是额外闸门：还要过通知总开关与免打扰，打开不等于一定收到；配对码会明文外发（已做掩码）。
+          </p>
+        </template>
+      </div>
+    </GridCard>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, h } from 'vue';
 import { useMessage, useDialog, NInput } from 'naive-ui';
+import { useRouter } from 'vue-router';
 import { getApiClient } from '@/composables/useApi';
+import { useAppStore } from '@/stores/app';
 import { evaluatePasswordStrength } from '@/composables/utils';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
+import ToggleRow from '@/components/ToggleRow.vue';
 
 const message = useMessage();
 const dialog = useDialog();
+const router = useRouter();
+const appStore = useAppStore();
 const api = getApiClient();
 
 const loading = ref(false);
@@ -261,16 +260,22 @@ const pairedDevices = ref<{ fingerprint: string; device_name: string; last_seen:
 
 const configEnabled = ref(true);
 const configMaxDevices = ref(0);
+// 新设备批准 + 三个通知渠道（2026-10-19）。默认全关 —— 与 core 的默认值一致，
+// 老版本 core 不返回这些字段时也回落 false（等价于"功能未启用"，不会误开）。
+const approvalRequired = ref(false);
+const notifySystem = ref(false);
+const notifyEmail = ref(false);
+const notifyWebhook = ref(false);
 const pairedCount = computed(() => pairedDevices.value.length || (status.value?.paired_fingerprints?.length ?? 0));
 
-// 配对密码表单。首次配对（has_default_password=true）与日常修改共用同一组 ref、
-// 同一个提交函数：两套输入框只在模板上分卡，逻辑（尤其是 8 个错误码分支）只有一份。
+// 首次配对密码表单（仅在设备仍使用默认密码时出现）。
+// 日常「修改配对密码」卡已删除：设备后台密码在「设备」页已有入口，不在配对中心重复。
 const curPwd = ref('');
 const newPwd = ref('');
 const newPwd2 = ref('');
 const settingPwd = ref(false);
 
-/** true = 设备仍是默认/初始密码 → 首次配对向导；false = 已设过密码 → 常驻「修改配对密码」。 */
+/** true = 设备仍是默认/初始密码 → 显示首次配对向导。 */
 const isFirstRunPassword = computed(() => status.value?.has_default_password === true);
 
 /** 新密码强度：与登录页共用 evaluatePasswordStrength，不另造算法。 */
@@ -279,7 +284,6 @@ const passwordStrength = computed(() => evaluatePasswordStrength(newPwd.value));
 // 初次配对时一并写入的 Goform 后台连接配置（默认值与设备出厂一致）。
 // 注意：这三个值只在首次配对卡里出现，且**从不**从 core 读回 —— core 对
 // goform_password 是脱敏返回（12****78）并拒绝含 *** 的回写，见 GeneralPanel.vue:184。
-// 修改密码卡不含 Goform 子表单，也不会提交任何 goform_* 字段。
 const goformIp = ref('192.168.0.1');
 const goformPort = ref(8080);
 const goformPassword = ref('admin');
@@ -291,6 +295,10 @@ async function loadStatus() {
     status.value = data;
     configEnabled.value = data.pairing_enabled ?? false;
     configMaxDevices.value = data.pairing_max_devices ?? 0;
+    approvalRequired.value = data.pairing_approval_required === true;
+    notifySystem.value = data.pairing_notify_system === true;
+    notifyEmail.value = data.pairing_notify_email === true;
+    notifyWebhook.value = data.pairing_notify_webhook === true;
     // statusPayload 已内联完整的 devices 列表（fingerprint/device_name/last_seen/created_at），
     // 无需再单独请求 /api/pairing/devices
     if (Array.isArray(data.devices)) {
@@ -323,19 +331,11 @@ async function loadDevices() {
 }
 
 /**
- * 配对密码提交。两张卡（首次设置 / 日常修改）共用这一份实现：
- * 端点、请求体字段名与 8 个错误码分支全部保持原样，只有「是否带 Goform 配置」按
- * 首次配对与否分流 —— 修改密码卡里根本没有 Goform 输入框，绝不能提交那三个字段
- * （否则会把硬编码的出厂默认值 192.168.0.1/8080/admin 写回设备）。
+ * 首次配对密码提交。只在「设置配对密码」卡里调用：
+ * 当前密码留空按出厂默认 admin 处理（输入框 placeholder 已说明），
+ * 同时写入首次配对需要的 Goform 后台连接配置。
  */
 async function setAdminPassword() {
-  const firstRun = isFirstRunPassword.value;
-  // 首次配对沿用原有行为：当前密码留空按出厂默认 admin 处理（输入框 placeholder 已说明）。
-  // 修改密码时必须显式输入当前密码，否则等于让 core 去猜。
-  if (!firstRun && !curPwd.value) {
-    message.error('请输入当前密码');
-    return;
-  }
   if (!newPwd.value) {
     message.error('请输入新密码');
     return;
@@ -348,30 +348,25 @@ async function setAdminPassword() {
     message.error('两次输入的新密码不一致');
     return;
   }
-  if (firstRun) {
-    if (!goformIp.value.trim() || !goformPassword.value) {
-      message.error('请填写设备后台地址与密码');
-      return;
-    }
-    const gp = Number(goformPort.value);
-    if (!Number.isInteger(gp) || gp < 1 || gp > 65535) {
-      message.error('后台端口需在 1-65535 之间');
-      return;
-    }
+  if (!goformIp.value.trim() || !goformPassword.value) {
+    message.error('请填写设备后台地址与密码');
+    return;
+  }
+  const gp = Number(goformPort.value);
+  if (!Number.isInteger(gp) || gp < 1 || gp > 65535) {
+    message.error('后台端口需在 1-65535 之间');
+    return;
   }
   settingPwd.value = true;
   try {
-    const payload: Record<string, any> = {
-      old_password: firstRun ? curPwd.value || 'admin' : curPwd.value,
+    await api.post('/pairing/change-password', {
+      old_password: curPwd.value || 'admin',
       new_password: newPwd.value,
-    };
-    if (firstRun) {
-      payload.goform_ip = goformIp.value.trim();
-      payload.goform_port = Number(goformPort.value);
-      payload.goform_password = goformPassword.value;
-    }
-    await api.post('/pairing/change-password', payload);
-    message.success(firstRun ? '配对密码已设置' : '配对密码已修改');
+      goform_ip: goformIp.value.trim(),
+      goform_port: gp,
+      goform_password: goformPassword.value,
+    });
+    message.success('配对密码已设置');
     curPwd.value = '';
     newPwd.value = '';
     newPwd2.value = '';
@@ -403,16 +398,49 @@ function onConfigChange() {
   saveTimer = setTimeout(saveConfig, 500);
 }
 
+/**
+ * 打开「新设备需批准」时的系统通知引导（2026-10-21 决策 D5-3）。
+ *
+ * 批准弹窗只在 **App 可见**时才会出现：手机锁屏或 App 在后台时，新设备会一直等到机主打开 App。
+ * 系统通知是那种状态下唯一的快通道，而它默认关（"通知默认全关"是既有决定，这里不改默认值）——
+ * 只在这唯一一个"用户主动打开批准"的时刻把利弊说清，并给一键开启。
+ */
+function onApprovalToggle(value: boolean) {
+  onConfigChange();
+  if (!value || notifySystem.value) return;
+  dialog.info({
+    title: '建议同时开启系统通知',
+    content:
+      '批准弹窗只在 App 可见时出现：手机锁屏或 App 在后台时，新设备会一直等到机主打开 App。' +
+      '开启「发本机系统通知」后，配对码会同时推到通知栏，锁屏也能看到。不开也能用，只是锁屏期间收不到提醒。',
+    positiveText: '同时开启',
+    negativeText: '暂不',
+    onPositiveClick: () => {
+      notifySystem.value = true;
+      onConfigChange();
+    },
+  });
+}
+
 async function saveConfig() {
   saving.value = true;
   try {
     const { data } = await api.put('/api/pairing/config', {
       pairing_enabled: configEnabled.value,
       pairing_max_devices: configMaxDevices.value,
+      // 2026-10-19：新设备批准 + 三个通知渠道（此前只有 App 能改）
+      pairing_approval_required: approvalRequired.value,
+      pairing_notify_system: notifySystem.value,
+      pairing_notify_email: notifyEmail.value,
+      pairing_notify_webhook: notifyWebhook.value,
     });
     // core 回显生效后的值（无效入参会被忽略），据此回写避免显示未采纳的配置
     if (typeof data?.pairing_enabled === 'boolean') configEnabled.value = data.pairing_enabled;
     if (typeof data?.pairing_max_devices === 'number') configMaxDevices.value = data.pairing_max_devices;
+    if (typeof data?.pairing_approval_required === 'boolean') approvalRequired.value = data.pairing_approval_required;
+    if (typeof data?.pairing_notify_system === 'boolean') notifySystem.value = data.pairing_notify_system;
+    if (typeof data?.pairing_notify_email === 'boolean') notifyEmail.value = data.pairing_notify_email;
+    if (typeof data?.pairing_notify_webhook === 'boolean') notifyWebhook.value = data.pairing_notify_webhook;
     message.success('配置已保存');
   } catch (e: any) {
     message.error(e?.response?.data?.error || '保存失败');
@@ -422,37 +450,24 @@ async function saveConfig() {
   }
 }
 
+/**
+ * 解除全部配对（2026-10-21 改造，审计 §B1）。
+ *
+ * 之前走 `POST /api/pairing/unpair` 且**不带密码** —— 而"移除单台"要密码，
+ * 于是"踢掉所有人"反而是门槛最低的破坏性操作。现在 core 那两个旧端点也要求配对密码，
+ * 这里补一个密码框；成功后本浏览器自己也会掉线，所以直接把登录态清掉并回登录页。
+ */
 function confirmUnpair() {
+  const pwd = ref('');
   dialog.warning({
     title: '解除全部配对',
-    content: `确定解除全部 ${pairedCount.value} 台设备的配对？解除后所有客户端需要重新配对。`,
-    positiveText: '确定解除',
-    negativeText: '取消',
-    onPositiveClick: async () => {
-      unpairing.value = true;
-      try {
-        await api.post('/api/pairing/unpair');
-        message.success('已解除全部配对');
-        loadStatus();
-      } catch {
-        message.error('解除配对失败');
-      } finally {
-        unpairing.value = false;
-      }
-    },
-  });
-}
-
-// core 的 DELETE /api/pairing/devices/{fp} 需要配对密码（双因素），
-// 旧代码的 passwordInput 是个从未与任何输入框绑定的局部变量 → 永远发 password:undefined → 恒 401 MISSING_PASSWORD
-function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
-  const pwd = ref('');
-  const label = dev.device_name || dev.fingerprint.slice(0, 16);
-  dialog.warning({
-    title: '移除设备',
     content: () =>
       h('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
-        h('span', `移除设备 "${label}" 的配对需要验证配对密码，移除后该客户端需重新配对。`),
+        h(
+          'span',
+          // 不要写 Markdown 星号：dialog 的 content 是纯文本，`**所有**` 会原样上屏
+          `确定解除全部 ${pairedCount.value} 台设备的配对？解除后所有客户端（含当前浏览器）都需要重新配对。`
+        ),
         h(NInput, {
           value: pwd.value,
           type: 'password',
@@ -463,7 +478,69 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
           },
         }),
       ]),
-    positiveText: '移除',
+    positiveText: '确定解除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      if (!pwd.value) {
+        message.error('请输入配对密码');
+        return false;
+      }
+      unpairing.value = true;
+      try {
+        await api.post('/api/pairing/unpair', { password: pwd.value });
+        message.success('已解除全部配对，请重新配对');
+        // 自己的 token 已经随记录一起失效：主动清态回登录页，别等下一次请求撞 444。
+        appStore.setAuthFailureReason('已解除全部配对，请重新配对');
+        appStore.clearAuth({ keepBaseUrl: true });
+        router.push('/login');
+      } catch (e: any) {
+        const code = e?.response?.data?.code;
+        if (code === 'MISSING_PASSWORD') message.error('需要提供配对密码');
+        else if (code === 'INVALID_PASSWORD') message.error('配对密码错误');
+        else if (code === 'PASSWORD_LOCKED') message.error('密码错误次数过多，请 15 分钟后重试');
+        else message.error(e?.response?.data?.error || '解除配对失败');
+        return false;
+      } finally {
+        unpairing.value = false;
+      }
+    },
+  });
+}
+
+/**
+ * 移除单台设备（2026-10-21 修订，审计 §C7）。
+ *
+ * 两处修正：
+ * 1. 去掉对 `data.rotated` 的判断 —— core 的 DELETE 只回 `{success:true}`，这个字段
+ *    从来没有出现过，那一分支是死代码（会让提示永远停在"已移除设备配对"）；
+ * 2. 移除的若是**本机**，token 当场失效：主动清态回登录页并说明原因，
+ *    否则用户点完只看到界面还开着、下一次请求才被 444 踢走。
+ */
+function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
+  const pwd = ref('');
+  const label = dev.device_name || dev.fingerprint.slice(0, 16);
+  const removingSelf = isSelf(dev.fingerprint);
+  dialog.warning({
+    title: removingSelf ? '移除本机（会立即退出登录）' : '移除设备',
+    content: () =>
+      h('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
+        h(
+          'span',
+          removingSelf
+            ? `"${label}" 就是当前这个浏览器。移除后本页会立即退出登录，需要用配对密码重新配对。`
+            : `移除设备 "${label}" 的配对需要验证配对密码，移除后该客户端需重新配对。`
+        ),
+        h(NInput, {
+          value: pwd.value,
+          type: 'password',
+          showPasswordOn: 'click',
+          placeholder: '配对密码',
+          'onUpdate:value': (v: string) => {
+            pwd.value = v;
+          },
+        }),
+      ]),
+    positiveText: removingSelf ? '移除并退出' : '移除',
     negativeText: '取消',
     onPositiveClick: async () => {
       if (!pwd.value) {
@@ -471,12 +548,17 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
         return false;
       }
       try {
-        const { data } = await api.delete(`/api/pairing/devices/${encodeURIComponent(dev.fingerprint)}`, {
+        await api.delete(`/api/pairing/devices/${encodeURIComponent(dev.fingerprint)}`, {
           data: { password: pwd.value },
         });
-        // rotated=true 表示服务端轮换了 Token，其余客户端（含当前浏览器）需重新配对/登录
-        message.success(data?.rotated ? '已移除设备；服务端已轮换 Token，其他客户端需重新配对' : '已移除设备配对');
-        loadStatus();
+        message.success(removingSelf ? '已移除本机配对，请重新配对' : '已移除设备配对');
+        if (removingSelf) {
+          appStore.setAuthFailureReason('本浏览器已被移出配对列表，请重新配对');
+          appStore.clearAuth({ keepBaseUrl: true });
+          router.push('/login');
+        } else {
+          loadStatus();
+        }
       } catch (e: any) {
         const code = e?.response?.data?.code;
         if (code === 'MISSING_PASSWORD') message.error('需要提供配对密码');
@@ -488,6 +570,11 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
       }
     },
   });
+}
+
+/** 这一行是不是当前浏览器（服务端在配对响应里回显的指纹，只用于展示）。 */
+function isSelf(fingerprint: string): boolean {
+  return !!appStore.deviceFingerprint && fingerprint === appStore.deviceFingerprint;
 }
 
 // 旧代码 content 是空串且 newName 只是局部变量，弹窗里没有任何输入框 → 只能提交原名
@@ -648,6 +735,21 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 「本机」标记（2026-10-21）：标出当前浏览器那一行，移除它等于把自己踢下线。
+   品牌色走 `--accent-color`（计划 B8-1）：原先引用的是一个**不存在的令牌名** `--accent`
+   并带一个写死的兜底蓝色值，于是这两行一直是那块写死色，换肤 / 暗色都不会跟着变。 */
+.device-self-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--accent-color);
+  background: color-mix(in srgb, var(--accent-color) 14%, transparent);
+  vertical-align: middle;
+}
 .device-actions {
   display: flex;
   gap: 4px;
@@ -655,6 +757,18 @@ onUnmounted(() => {
 }
 .action-area {
   margin-top: 8px;
+}
+/* 「解除全部配对」与上面的提示条拉开一格（原先是内联 style="margin-top:16px"，计划 B8-1） */
+.action-area--spaced {
+  margin-top: var(--space-4);
+}
+/* 端口 / 最大设备数这类窄数字框：固定宽度避免 n-input-number 铺满整格 */
+.num-compact {
+  width: 120px;
+}
+/* 「新设备批准」卡尾那句说明：与原内联 style="margin:8px 0 0" 同值 */
+.approval-note {
+  margin: var(--space-2) 0 0;
 }
 .config-section {
   display: flex;
@@ -716,7 +830,9 @@ onUnmounted(() => {
   display: flex;
   justify-content: flex-end;
 }
-/* 密码强度条：与 LoginView.vue 的同名类保持一致的观感（各自 scoped，故需本地一份） */
+/* 密码强度条：与 LoginView.vue 的同名类保持一致的观感（各自 scoped，故需本地一份）。
+   算法（evaluatePasswordStrength）已经共用，重复的只有这段样式 —— 计划 §6.9 B8-1 与
+   §6.4 B3-3 都记了这一条：本轮**保留**两份（合并要动 LoginView，属 B3），不在这里抽公共件。 */
 .pw-strength {
   display: flex;
   align-items: center;

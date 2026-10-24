@@ -61,7 +61,10 @@ class PairedDevicesRoutes(
         "fingerprint" to record.fingerprint,
         "device_name" to record.deviceName,
         "last_seen" to record.lastSeen,
-        "created_at" to record.createdAt
+        "created_at" to record.createdAt,
+        // 2026-10-15 新增：拉黑时要把 hwId 一起记下来（辅助键，见 PairedDeviceBlacklistStore）。
+        // 纯增量字段，旧客户端忽略它；它可伪造，所以只用于"提高绕过门槛"，不参与任何授权判定。
+        "hw_id" to record.hwId
     )
 
     private suspend fun handleList(call: ApplicationCall) {
