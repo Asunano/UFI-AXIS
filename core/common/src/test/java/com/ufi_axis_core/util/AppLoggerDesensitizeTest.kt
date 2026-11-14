@@ -34,6 +34,13 @@ class AppLoggerDesensitizeTest {
     }
 
     @Test
+    fun `desensitize masks ticket in query string`() {
+        // 2026-10-30 F6：/files/stream?ticket=… 与 /ws/terminal?ticket=… 的票据会进访问日志
+        assertEquals("ticket***", AppLogger.desensitize("ticket=abc123"))
+        assertEquals("/files/stream?ticket***&x=1", AppLogger.desensitize("/files/stream?ticket=abc123&x=1"))
+    }
+
+    @Test
     fun `desensitize masks password equals value`() {
         assertEquals("password***", AppLogger.desensitize("password=secret123"))
     }
@@ -77,5 +84,37 @@ class AppLoggerDesensitizeTest {
         assertFalse("凭据原文泄漏: $out", out.contains("abc123"))
         assertFalse("凭据原文泄漏: $out", out.contains("s3cr3t"))
         assertTrue("非敏感键值被误吞: $out", out.contains("\"port\":8080"))
+    }
+
+    /**
+     * 下划线前缀的凭据键（2026-11-14 安全审查）。
+     *
+     * 审查报告说"`\b` 让 `old_password` 完全不脱敏" —— 实测**不成立**：正则没有前导边界，
+     * `old_password` 里的 `password` 照样命中，尾部的 `\b` 由后面的引号满足。
+     * 真正漏掉的是**不在关键字表里**的键：`pairing_code` / `approval_code`
+     * （6 位配对码 / 批准码，拿到就能配对新设备）。这条用例把两边都钉住。
+     */
+    @Test
+    fun `下划线凭据键与配对码都要脱敏`() {
+        val cases = listOf(
+            """{"old_password":"OLDVALUE"}""",
+            """{"new_password":"NEWVALUE"}""",
+            """{"goform_password":"FORMVALUE"}""",
+            """{"pairing_code":"123456"}""",
+            """{"approval_code":"654321"}""",
+        )
+        for (c in cases) {
+            val out = AppLogger.desensitize(c)
+            val secret = Regex("\"([A-Za-z0-9]{6,})\"").findAll(c).last().groupValues[1]
+            assertFalse("未脱敏：$c -> $out", out.contains(secret))
+        }
+    }
+
+    /** 普通业务字段不能被误伤（`error_code` / `exit_code` 这类不是凭据）。 */
+    @Test
+    fun `普通 code 字段不脱敏`() {
+        val out = AppLogger.desensitize("""{"error_code":"E1234","exit_code":"0"}""")
+        assertTrue(out, out.contains("E1234"))
+        assertTrue(out, out.contains("\"0\""))
     }
 }

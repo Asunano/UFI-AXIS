@@ -1,15 +1,16 @@
 package com.ufi_axis_core.deviceschema
 
 /**
- * 一类设备后台的字段/命令映射规则集合。
+ * 一类设备后台的字段与命令映射规则的集合。
  *
- * **适配新设备 = 新增一个本接口的实现**，route / web / app 都不动。
+ * 适配新设备只需新增本接口的一个实现，route / web / app 均无需改动。
  *
  * 实现要求：
  * - `readSpecs()` 返回的 `canonical` 必须取自 `core:contract` 的 `DeviceFields` 常量，
- *   不写字面量（守门脚本会扫 route 里的字段字面量，profile 是唯一允许写设备侧字面量的地方）。
- * - 同一 `group` + `canonical` 只能有一条 spec。冲突时以先出现者为准（[SpecIndex] 会记录）。
- * - 无对应字段的设备直接不登记，归一化时该 key 会被省略——**不要**登记一个假的 source。
+ *   不得写字面量。守门脚本会扫描 route 中的字段字面量；profile 是实现中唯一允许出现
+ *   设备侧字段名的位置。
+ * - 同一 `group` 与 `canonical` 组合只能登记一条 spec，出现重复时以先登记的一条为准。
+ * - 设备没有对应字段时不登记，归一化阶段会省略该 key。不得为缺失字段登记占位 source。
  */
 interface DeviceProfile {
 
@@ -37,86 +38,90 @@ interface DeviceProfile {
     fun soloCmds(group: FieldGroup): List<String> = emptyList()
 
     /**
-     * 「一次拉全量设备状态」的字段名批次（诊断 dump 用，见 `GoformSignalClient.getFullStatus`）。
+     * 「一次拉取全量设备状态」的字段名批次（供诊断 dump 使用，见 `GoformSignalClient.getFullStatus`）。
      *
-     * ## 为什么**不**做成一个新的 [FieldGroup]（阶段 0.4b 的裁决）
+     * ## 为什么不定义为新的 [FieldGroup]
      *
-     * [FieldGroup] 是穷举枚举，`GoformFieldMapper.coverageReport()` 遍历 `FieldGroup.entries`
-     * 逐组向设备查一次。加一个枚举值会让 `/api/diagnose?fields=1` 的 `field_coverage`
-     * 多出一个块（`registered` 合计与组数**必然**变），直接冲掉计划书 §16 的 2026-09-22 真机基线
-     * 与 §14.3 的判据 1（`registered` 逐组不变）/ 判据 2（`queried` 全 true —— 全量批次没有
-     * 登记 canonical，那个新组只会是 `registered=0`）。全量 dump 与「按需查询的分组」语义本来
-     * 也不同：它不参与归一化，只是把设备后台有什么原样捞一份出来看。
+     * [FieldGroup] 是穷举枚举，`GoformFieldMapper.coverageReport()` 会遍历 `FieldGroup.entries`
+     * 逐组向设备查询一次。新增一个枚举值会使 `/api/diagnose?fields=1` 的 `field_coverage`
+     * 多出一个分组，`registered` 合计与分组数量随之改变，从而破坏既有的真机基线，
+     * 以及覆盖率判据：`registered` 逐组不变、`queried` 全为 true。全量批次不登记 canonical，
+     * 新增分组必然是 `registered=0`。
      *
-     * ## 为什么返回值是 `List<List<String>>`（外层 = 批次）而不是 `List<String>`
+     * 全量 dump 与「按需查询的分组」语义本就不同：前者不参与归一化，
+     * 只用于原样读取设备后台提供的字段集合。
      *
-     * 「分几批发」是**设备事实**而不是实现细节：ZTE F50 上这份 dump 是**三次独立请求**
-     * （30 / 29 / 37 项），一次发 96 项设备会截断/返回空。用扁平 `List<String>` 表达不了批次边界，
-     * 调用点就得自己重新切片 —— 那等于把刚搬走的设备知识又搬回客户端。
-     * 本仓已有过合并查询被设备吞掉的先例（`station_list`，见 [soloCmds]），所以批次边界必须可表达。
+     * ## 返回值为什么是 `List<List<String>>`（外层为批次）而不是 `List<String>`
      *
-     * 与 [soloCmds] 的分工：[soloCmds] 描述「某个 cmd 不能和同组别人一起发」，
-     * 这里描述「一整份 dump 天生分成哪几批」，两者都不是可以随手合并的调参项。
+     * 分批数量属于设备事实，不是实现细节：ZTE F50 上的这份 dump 是三次独立请求
+     * （30 / 29 / 37 项），一次发送 96 项会触发设备截断或返回空。
+     * 扁平的 `List<String>` 无法表达批次边界，调用点只能自行切片，
+     * 等于把设备知识重新散落到客户端。`station_list` 已证明合并查询会被设备丢弃
+     * （见 [soloCmds]），批次边界必须可表达。
      *
-     * 默认空列表 = 该设备不提供全量 dump（调用点自然一条查询都不发）。
+     * 与 [soloCmds] 的分工：[soloCmds] 描述「某个 cmd 不能与同组其它命令一起发送」，
+     * 本方法描述「一份 dump 固定分成哪几批」。两者都不是可自由合并的调参项。
+     *
+     * 默认返回空列表，表示该设备不提供全量 dump，调用点因此不发出任何查询。
      */
     fun fullStatusCmds(): List<List<String>> = emptyList()
 
     /**
-     * 结构解码器：把**嵌套/非扁平**的设备响应摊平成扁平 JsonObject，供后续的字段归一化使用。
+     * 结构解码器：把嵌套或非扁平的设备响应展平为扁平 JsonObject，供后续字段归一化使用。
      *
-     * 为什么需要它：[FieldSpec] 只能表达"顶层扁平键的别名链"。个别设备把一组字段塞进
-     * 数组或子对象里，且需要"带谓词的元素选择"（例如挑出 `AccessPointSwitchStatus == "1"`
-     * 的那个 AP）、"输出键由输入值生成"（按 `ChipIndex` 拼 `wifi_chip1_*` / `wifi_chip2_*`）。
-     * 这类变换用路径表达式描述会退化成一门查询语言，因此直接给一个函数。
+     * [FieldSpec] 只能表达顶层扁平键的别名链。部分设备把一组字段放进数组或子对象，
+     * 并且需要带谓词的元素选择（例如选出 `AccessPointSwitchStatus == "1"` 的 AP）
+     * 以及由输入值生成输出键（按 `ChipIndex` 拼出 `wifi_chip1_*` / `wifi_chip2_*`）。
+     * 这类变换用路径表达式描述会退化成一门查询语言，因此以函数形式提供。
      *
-     * ## 硬性约束（缺一条就退化成透传）
+     * ## 硬性约束（任一缺失都会使解码退化为透传）
      *
-     * 1. **输出必须再过一遍 [FieldNormalizer.normalize]**（两段式：结构展平 → allowlist 归一化）。
-     *    `FieldNormalizer` 已经保证了这一点，调用方不要绕过它直接用解码器输出。
-     * 2. **必须是纯函数**：不做 I/O、不读全局状态。需要外部能力（如 base64 解码）时，
-     *    在构造 profile 时注入，不在解码器内部去取。
-     * 3. **只写在 profile 文件里**（守门脚本的白名单覆盖 `Profile.kt`，扫描范围不用改）。
-     * 4. 解码器只负责"搬键"，值格式变换仍然交给 [FieldSpec.decode]。
+     * 1. 输出必须再过一遍 [FieldNormalizer.normalize]（两段式：结构展平 → allowlist 归一化）。
+     *    `FieldNormalizer` 已保证这一点，调用方不得绕过它直接使用解码器输出。
+     * 2. 必须是纯函数：不做 I/O、不读全局状态。需要外部能力（如 base64 解码）时，
+     *    在构造 profile 时注入，不在解码器内部获取。
+     * 3. 只能在 profile 文件中实现。守门脚本的扫描白名单已覆盖 `Profile.kt`，扫描范围无需调整。
+     * 4. 解码器只负责移动键名，值格式变换仍由 [FieldSpec.decode] 承担。
      *
-     * 默认返回 null = 该分组的响应本来就是扁平的，不需要预处理。
+     * 默认返回 null，表示该分组的响应本身是扁平的，无需预处理。
      */
     fun structuralDecoder(group: FieldGroup): ((kotlinx.serialization.json.JsonObject) -> kotlinx.serialization.json.JsonObject)? = null
 
     /**
-     * WiFi 连接二维码图片在设备后台的**文件名候选**，按尝试顺序排列。
+     * WiFi 连接二维码图片在设备后台的文件名候选，按尝试顺序排列。
      *
-     * 调用方拿这些名字去拼自己那套文件端点（goform 是
-     * `/goform/goform_get_file_process/<名字>`）：路径前缀属于**传输层**、不在本契约里，
-     * 这里只回答「那张图在设备上叫什么」。
+     * 调用方用这些名字拼接自身的文件端点（goform 为
+     * `/goform/goform_get_file_process/<名字>`）：路径前缀属于传输层，不在本契约内，
+     * 本方法只描述「该图片在设备上的文件名」。
      *
-     * ## 语义：空列表 ≠ 文件不存在
+     * ## 语义：空列表与「文件不存在」不同
      *
-     * 返回**空列表** = **该设备不支持从后台取二维码图**（根本没有这个文件）。
-     * 调用方遇到空列表时的行为与「所有候选都取不到」**完全一致**：一条文件请求都不发、
-     * 返回「取不到」、并留一行 WARN（见 `GoformWifiClient.getWifiQrCode`）。
-     * **不许**把空列表读成「文件不存在 / 这一次没取到」—— 那是两件事：
-     * 前者是设备事实（这台设备永远取不到），后者是一次运行时结果（下一次可能就有了）。
-     * 也**不许**在调用方给空列表补一个兜底文件名：那等于把刚搬走的设备知识搬回客户端。
+     * 返回空列表表示该设备不支持从后台读取二维码图片，即不存在该文件。
+     * 调用方对空列表的处理与「所有候选都取不到」一致：不发出文件请求、返回取不到，
+     * 并记录一行 WARN（见 `GoformWifiClient.getWifiQrCode`）。
+     * 空列表不得解释为「文件不存在」或「本次未取到」：后者是一次运行时结果，
+     * 前者是设备事实。调用方也不得为空列表补一个兜底文件名，
+     * 否则设备知识会重新散落到客户端。
      *
-     * ## 为什么返回 `List` 而不是单个 `String`
+     * ## 返回值为什么是 `List` 而不是单个 `String`
      *
-     * 现状本来就有**多个候选 + 兜底**，而「先试哪个、取不到退回哪个」是**设备事实**的一部分：
-     * 有些固件只生成 2.4G 那一张，5G 的直接 404，此时退回一张能用的比什么都不显示更有意义
-     * （二维码内容是 SSID / 口令，两个频段通常同口令）。返回单个 `String` 表达不了
-     * 「还有兜底、且兜底排第二」，调用点就只能自己再补一份 `if` —— 同 [fullStatusCmds]
-     * 用 `List<List<String>>` 表达批次边界的理由。
+     * 设备侧存在多个候选与兜底顺序，而「先试哪个、取不到退回哪个」属于设备事实：
+     * 部分固件只生成 2.4G 的那一张，5G 的直接返回 404，此时退回一张可用的图片优于不显示
+     * （二维码内容为 SSID 与口令，两个频段通常使用同一口令）。返回单个 `String`
+     * 无法表达「存在兜底且兜底排在第二」，调用点只能自行补一份 `if`；
+     * 理由同 [fullStatusCmds] 用 `List<List<String>>` 表达批次边界。
      *
-     * 实现方**必须自己去重**：调用方按返回顺序逐个发请求、不做任何过滤，
-     * 主候选与兜底撞上同一个名字时（`chip1` + 第 1 个 SSID）列表里重复一项就是多发一次 HTTP。
+     * 实现方必须自行去重：调用方按返回顺序逐个发请求，不做任何过滤。
+     * 主候选与兜底命中同一文件名时（`chip1` 与第 1 个 SSID），
+     * 列表中的重复项会导致对同一文件重复发起 HTTP 请求。
      *
-     * @param chip 频段的**设备词汇**（`"chip1"` = 2.4G / `"chip2"` = 5G，与读侧 canonical
-     *   字段 `wifi_chip`、写侧 [SettingKey.WIFI_BAND] 的取值域一致），不是 `"2.4G"` 这种界面词汇。
-     * @param ssidIndex SSID 序号，**1 起**（对外 `GET /api/wifi/qrcode` 的 `ssid_index` 缺省就是 1，
-     *   ZTE 的扁平字段也是 `wifi_chip1_ssid1_…`）。
+     * @param chip 频段的设备词汇（`"chip1"` = 2.4G / `"chip2"` = 5G，与读侧 canonical 字段
+     *   `wifi_chip`、写侧 [SettingKey.WIFI_BAND] 的取值域一致），不是 `"2.4G"` 这类界面词汇。
+     * @param ssidIndex SSID 序号，从 1 开始（对外 `GET /api/wifi/qrcode` 的 `ssid_index`
+     *   缺省为 1，ZTE 的扁平字段同样是 `wifi_chip1_ssid1_…`）。
      *
-     * 默认实现返回空列表：新 profile 不写这一项时应当是「该设备没有这个能力」，
-     * 不是「忘了实现」—— 同 [smsSpec] / [lteAllBandsMask] 的口径。
+     * 默认实现返回空列表：新 profile 未声明该项表示该设备不具备此能力，而不是「未实现」，
+     * 口径同 [smsSpec] 与 [lteAllBandsMask]。
      */
     fun qrCodeFileNames(chip: String, ssidIndex: Int): List<String> = emptyList()
 
@@ -124,32 +129,30 @@ interface DeviceProfile {
     fun writeSpec(key: SettingKey): WriteSpec?
 
     /**
-     * 「解锁全部 LTE 频段」时要下发的频段全集掩码（逗号分隔的频段号，如 `"1,3,5,8"`）。
+     * 「解锁全部 LTE 频段」时下发的频段全集掩码（逗号分隔的频段号，如 `"1,3,5,8"`）。
      *
-     * ## 语义：`null` ≠ 空串
+     * ## 语义：`null` 与空串不同
      *
-     * - 返回**非空串** = 该设备的「解锁」动作要显式下发这一串全频段。
-     * - 返回 `null` = **该设备不需要 / 不支持显式下发「全频段」掩码**。
-     *   调用方遇到 `null` 时的行为是**不下发该 RAT 的全集**（与「空串 = 不发限制」同一侧），
-     *   并留一行 WARN；见 `GoformNetworkClient` 里那两个同名读取方法。
-     *   **不许把 `null` 当空串用**：这两件事在对外语义上是两回事 ——
-     *   「空串 = 不发限制」与「空串 = 下发全频段」换过来就是行为变更，不是搬运
-     *   （计划书 §15 的 P0-1 已就这一点裁决过）。
+     * - 返回非空串：该设备的解锁动作需要显式下发这一串全频段。
+     * - 返回 `null`：该设备不需要或不支持显式下发全频段掩码。调用方遇到 `null` 时
+     *   不下发该 RAT 的全集（与「空串 = 不发限制」同侧），并记录一行 WARN，
+     *   见 `GoformNetworkClient` 中对应的读取方法。
+     *   不得把 `null` 当空串使用：「空串 = 不发限制」与「空串 = 下发全频段」互换属于行为变更，
+     *   不是等价迁移。
      *
-     * ## 为什么它在**写侧**（命令表范畴）而不是读侧的归一化范畴
+     * ## 为什么位于写侧（命令表范畴）而不是读侧归一化
      *
-     * 频段全集是 [SettingKey.BAND_LOCK_LTE] 这条写命令的**参数值域**：
-     * 「字段归一化可以关，命令表不能关」。所以调用方必须从**非空**的那份 profile
-     * （装配层传下来的 `commandProfile`）取它，不能从可空的归一化 profile 取。
+     * 频段全集是 [SettingKey.BAND_LOCK_LTE] 这条写命令的参数值域：
+     * 字段归一化可以关闭，命令表不能关闭。因此调用方必须从非空的 profile
+     * （装配层传入的 `commandProfile`）取值，不能从可空的归一化 profile 取值。
      *
      * ## 为什么是两个方法而不是 `allBandsMask(rat: SomeEnum)`
      *
-     * 刻意不为这件小事新造一个 RAT 枚举：`core/contract` 是冻结区，新增对外类型的门槛要高，
-     * 而目前需要表达的只有 LTE / NR 两档。真到了需要第三档时再引入枚举，那时才有足够依据
-     * 决定它的值域该怎么定。
+     * `core/contract` 属于冻结区，新增对外类型的门槛较高，而当前需要表达的只有 LTE / NR 两档。
+     * 出现第三档需求时再引入枚举，届时才有足够依据确定其值域。
      *
-     * 默认实现返回 `null`：新 profile 不写这一项时应当是「没有这条设备事实」，
-     * 不是「忘了实现」—— 同 [smsSpec] 的口径。
+     * 默认实现返回 `null`：新 profile 未声明该项表示不存在这条设备事实，而不是「未实现」，
+     * 口径同 [smsSpec]。
      */
     fun lteAllBandsMask(): String? = null
 
@@ -162,39 +165,39 @@ interface DeviceProfile {
     fun nrAllBandsMask(): String? = null
 
     /**
-     * WiFi 接入控制（ACL）在设备**没有上报 mode 字段**时该按哪个档位理解。
+     * WiFi 接入控制（ACL）在设备未上报 mode 字段时应采用的档位。
      *
-     * ## 语义：`null` ≠ 空串
+     * ## 语义：`null` 与空串不同
      *
-     * - 返回**非空串** = 这台设备的 ACL 有一个默认生效档位（ZTE F50 = `"2"`，黑名单）。
-     *   读侧拿不到 mode 时用它兜底，于是「设备省略了这个字段」不会被渲染成「没有模式」。
-     * - 返回 `null` = 这台设备没有这个概念，或者它的 mode 一定会上报。
-     *   调用方遇到 `null` **保持空值原样往上传**，不许自己编一个档位出来。
+     * - 返回非空串：该设备的 ACL 存在默认生效档位（ZTE F50 为 `"2"`，黑名单）。
+     *   读侧取不到 mode 时用它兜底，避免「设备省略该字段」被渲染为「没有模式」。
+     * - 返回 `null`：该设备没有此概念，或其 mode 一定会上报。
+     *   调用方遇到 `null` 时保持空值原样上传，不得自行构造档位。
      *
-     * ## 为什么这一条必须进 profile
+     * ## 该取值必须由 profile 提供
      *
-     * 2026-09-25 之前 `GoformWifiClient` 有两处直接写 `ZteGoformProfile.ACL_MODE_BLACKLIST`，
-     * **绕过了 commandProfile 这条唯一通道**。换设备之后它仍然拿 ZTE 的 `"2"` 兜底，
-     * 而 `"2"` 在别家设备上可能是白名单、也可能压根没有这个字段 ——
-     * 结果是界面显示「黑名单生效」而设备其实在放行所有人。这种错没有任何测试会变红。
+     * 客户端若直接引用具体 profile 的常量兜底，就绕过了 commandProfile 这条唯一通道：
+     * 更换设备后仍按 ZTE 的 `"2"` 兜底，而 `"2"` 在其他设备上可能是白名单，
+     * 也可能不存在该字段。结果是界面显示「黑名单生效」而设备实际放行全部客户端，
+     * 此类错误不会被任何测试发现。
      */
     fun aclDefaultMode(): String? = null
 
     /**
      * 短信规则。不支持短信的设备返回 null（对应 `Capability.SMS` 缺失）。
      *
-     * ## 为什么短信不走 [SettingKey] + [WriteSpec]（计划书 §11.2，已决）
+     * ## 短信为什么不走 [SettingKey] + [WriteSpec]
      *
-     * 三条理由，任一都足以否掉「塞进通用写入表」：
-     * 1. [WriteSpec.encode] 必须是纯函数，而短信参数里有 `sms_time` —— 原实现的默认参数是
-     *    `System.currentTimeMillis()` + `TimeZone.getDefault()`，藏进 `encode` 就没法断言；
-     * 2. 下发之后还有**回读确认**（轮询信箱看 `tag`）。`WriteSpec` 只能表达「发一条命令」，
-     *    表达不了「发完再查」；
-     * 3. 编码是短信专有的（UCS2 正文 / `encode_type` / `ID=-1` / `sms_time` 的分号串格式），
-     *    放进通用写入表等于让一个 key 带一套只有它用的编码规则。
+     * 以下三条理由中的任意一条都足以否定「纳入通用写入表」：
+     * 1. [WriteSpec.encode] 必须是纯函数，而短信参数包含 `sms_time`，其原有默认参数为
+     *    `System.currentTimeMillis()` 与 `TimeZone.getDefault()`，放进 `encode` 后无法断言；
+     * 2. 下发之后还需回读确认（轮询信箱检查 `tag`），而 `WriteSpec` 只能表达「发送一条命令」，
+     *    无法表达「发送后再查询」；
+     * 3. 编码为短信专有（UCS2 正文 / `encode_type` / `ID=-1` / `sms_time` 的分号串格式），
+     *    纳入通用写入表意味着单个 key 携带一套只属于它的编码规则。
      *
-     * 默认返回 null 而不是抛异常：新 profile 不写短信支持时应当是「没有这个能力」，
-     * 不是「忘了实现」——上层按 null 回 `NOT_SUPPORTED` 即可。
+     * 默认返回 null 而不抛异常：新 profile 未声明短信支持表示不具备该能力，而不是「未实现」，
+     * 上层按 null 返回 `NOT_SUPPORTED` 即可。
      */
     fun smsSpec(): SmsSpec? = null
 }
@@ -202,47 +205,47 @@ interface DeviceProfile {
 /**
  * 一类设备的短信规则。
  *
- * ## 边界：这里只放「设备事实」，不放流程与调参
+ * ## 边界：只包含设备事实，不包含流程与调参
  *
- * - **流程留在客户端**：发完回读确认的那个循环（`GoformSmsClient.verifySend`）是流程，
- *   不是设备事实；但循环里的**判据**（[sentTag] / [failedTag]）必须来自本接口 ——
- *   换一台设备，tag 的取值就会变，而循环结构不变。
- * - **实测调参不进本接口**：回读的次数与间隔（ZTE 上是 3 次 × 1.2s）属于按机型实测出来的
- *   时间预算，归计划书 §3.2 的 `DeviceTuning`（阶段 4），不要往这里加 `verifyAttempts()`。
- * - **全部成员必须是纯函数**：同样的入参永远得到同样的输出。不读时钟、不读全局状态、
- *   不做 I/O。这是「没有设备也能断言」的前提，也是整个 profile 抽象的底线约束。
+ * - 流程留在客户端：发送后的回读确认循环（`GoformSmsClient.verifySend`）属于流程而非设备事实；
+ *   但循环中的判据（[sentTag] / [failedTag]）必须由本接口提供 —— 更换设备后 tag 取值会变，
+ *   循环结构不变。
+ * - 实测调参不进本接口：回读的次数与间隔（ZTE 上为 3 次 × 1.2s）是按机型实测得出的时间预算，
+ *   属于 `DeviceTuning` 的范畴，不应在此新增 `verifyAttempts()` 一类成员。
+ * - 全部成员必须是纯函数：相同入参恒定得到相同输出，不读时钟、不读全局状态、不做 I/O。
+ *   这是「没有设备也能断言」的前提，也是 profile 抽象的基本约束。
  */
 interface SmsSpec {
 
     /**
      * 下发一条短信的参数表。
      *
-     * 为什么在契约里：命令名（`goformId`）、参数键名、正文编码、时间格式**全部**按设备而异，
-     * 这四件事凑在一起就是「怎么发一条短信」这条设备知识的全部内容。
+     * 命令名（`goformId`）、参数键名、正文编码与时间格式均按设备而异，
+     * 这四项共同构成「如何发送一条短信」的全部设备知识。
      *
-     * **不许读系统时钟**：时间戳与时区由调用方传入。现有 `GoformSmsClient.formatSmsTime`
-     * 之所以能被单测覆盖，正是因为 `buildSendParams(number, message, smsTime)` 把时间作为
-     * **入参**；一旦实现里去取 `System.currentTimeMillis()`，这张参数表就再也没法断言，
-     * 而「缺 `sms_time` / 格式不对」恰恰是「短信能收不能发」的历史根因。
+     * 不得读取系统时钟：时间戳与时区由调用方传入。现有 `GoformSmsClient.formatSmsTime`
+     * 可被单测覆盖，正是因为 `buildSendParams(number, message, smsTime)` 把时间作为入参；
+     * 一旦实现内部读取 `System.currentTimeMillis()`，该参数表就无法断言，
+     * 而「缺少 `sms_time` 或格式不正确」正是「短信能收不能发」的根因。
      *
-     * @param number 目标号码，**已 trim**（是否 trim 属于调用方意图，不是设备事实）。
-     * @param message 正文明文。编码由 [encodeBody] 做。
+     * @param number 目标号码，已 trim（是否 trim 属于调用方意图，不是设备事实）。
+     * @param message 正文明文，编码由 [encodeBody] 完成。
      * @param atMillis 发送时刻（epoch 毫秒）。
-     * @param zone 渲染 `sms_time` 用的时区。
-     * @return 设备侧参数表。实现应返回**有序** map（`linkedMapOf`）：个别固件对表单字段顺序敏感，
-     *   顺序本身就是抄下来的事实之一。
+     * @param zone 渲染 `sms_time` 使用的时区。
+     * @return 设备侧参数表。实现应返回有序 map（`linkedMapOf`）：部分固件对表单字段顺序敏感，
+     *   顺序本身即为被记录下来的设备事实之一。
      */
     fun sendParams(number: String, message: String, atMillis: Long, zone: java.util.TimeZone): Map<String, String>
 
     /**
      * 信箱列表查询的 cmd 与分页参数。
      *
-     * 为什么在契约里：查信箱这件事在 goform 上是 `cmd=sms_data_total` 加一串分页/排序/存储位
-     * 参数，换一套后台就完全是另一组键 —— 上层只应该说「要第几页、每页几条」。
+     * 该查询在 goform 上为 `cmd=sms_data_total` 加一组分页、排序与存储位参数，
+     * 换一套后台就是另一组键；上层只应表达「第几页、每页几条」。
      *
-     * 实现只返回**短信专有**的键。传输层通用的那几个（goform 的 `isTest` / `multi_data` /
-     * 防缓存的 `_=时间戳`）由客户端统一追加：它们对每一次读取都一样，而 `_` 还依赖时钟，
-     * 放进来就破坏纯函数。
+     * 实现只返回短信专有的键。传输层通用键（goform 的 `isTest` / `multi_data` /
+     * 防缓存的 `_=时间戳`）由客户端统一追加：它们对每次读取都相同，而 `_` 依赖时钟，
+     * 纳入本接口会破坏纯函数约束。
      */
     fun listQuery(page: Int, perPage: Int): Map<String, String>
 
@@ -257,13 +260,12 @@ interface SmsSpec {
     /**
      * 标记若干条短信的已读状态。
      *
-     * 为什么在契约里：同上 —— 参数名、id 拼法、以及「已读/未读」在设备侧的取值都按设备而异。
+     * 参数名、id 拼法以及「已读 / 未读」在设备侧的取值均按设备而异。
      *
-     * `read` 有默认值是为了让契约的主用法保持 `markReadParams(ids)` 这一种形状；
-     * 但它**必须存在** —— 对外 `POST /api/sms/read` 支持 `read=false`（标回未读），
+     * `read` 有默认值，使契约的主用法保持 `markReadParams(ids)` 这一形状，但该参数必须存在：
+     * 对外 `POST /api/sms/read` 支持 `read=false`（标回未读），
      * 现有 `GoformSmsClient.markSmsRead(msgId, read)` 的两个分支都在被调用，
-     * 只表达「标已读」会静默丢掉一半既有行为（计划书 §11.2 列的签名里漏了这个参数，
-     * 见报告里的 P1 说明）。
+     * 只表达「标记已读」会静默丢失一半既有行为。
      */
     fun markReadParams(ids: List<String>, read: Boolean = true): Map<String, String>
 
@@ -278,8 +280,8 @@ interface SmsSpec {
     /**
      * 信箱行上「发送失败」的 tag 取值。
      *
-     * 为什么和 [sentTag] 分成两个成员：上层拿它决定「要不要重试 / 要不要计费」，
-     * 「失败」与「还没出结果」必须能分开 —— 合并成一个「终态集合」就分不出来了。
+     * 与 [sentTag] 分为两个成员的原因：上层据此决定是否重试与是否计费，
+     * 「失败」与「尚未出结果」必须可以区分，合并为一个「终态集合」后无法区分。
      */
     fun failedTag(): String
 
@@ -346,7 +348,7 @@ enum class SettingKey {
      * + `auto_clear` + `clear_date`。
      *
      * 自动清零（`wan_auto_clear_flow_data_switch` / `traffic_clear_date`）与限额同属
-     * 一条设备命令 —— 2026-08-30 真机抓包确认，别再拆。
+     * 一条设备命令，已由真机抓包确认，不得拆分。
      */
     TRAFFIC_LIMIT,
 
@@ -361,10 +363,9 @@ enum class SettingKey {
     /**
      * FOTA 自动升级开关。value: Boolean（true = 允许自动升级）。
      *
-     * 注意语义方向：这个 key 是**正向**的（true = 开）。设备侧 `UpgMode` 恰好也是
-     * 正向（1 = 开），但对外的 `POST /api/device/fota` 历史上收的是**反向**的
-     * `enabled=true → 禁用`。那次反转只在 route 的旧字段兼容分支里做一次
-     * （计划书 2.7：语义翻转只允许存在一份）。
+     * 语义方向：该 key 为正向（true = 开），设备侧 `UpgMode` 同为正向（1 = 开）；
+     * 而对外的 `POST /api/device/fota` 接收的是反向字段 `enabled=true → 禁用`。
+     * 该反转只在 route 的旧字段兼容分支中执行一次（语义翻转只允许存在一份实现）。
      */
     FOTA_AUTO_UPDATE,
 
@@ -389,13 +390,13 @@ enum class SettingKey {
     /**
      * 流量手动校准。params: `target: "data"|"time"` + `value: String`。
      *
-     * 设备侧要同时收 `data` 与 `time` 两个字段（未校准的那个填 "0"），
-     * 这份"补零"规则属于设备侧，不该让调用方拼。
+     * 设备侧需要同时接收 `data` 与 `time` 两个字段（未校准的一项填 `"0"`），
+     * 该补零规则属于设备侧，不由调用方拼接。
      */
     FLOW_CALIBRATION,
-    // ───────── 以下为计划书阶段 0 批 1 补齐的动作类/设置类写命令 ─────────
-    // 这些项此前散在 GoformDeviceClient / GoformNetworkClient / GoformWifiClient 里硬编码，
-    // 命令名与参数键逐字搬进 profile（调用点改走 writer 是下一批的事）。
+    // ───────── 动作类与设置类写命令 ─────────
+    // 这些项原先硬编码在 GoformDeviceClient / GoformNetworkClient / GoformWifiClient 中，
+    // 命令名与参数键逐字迁入 profile。
 
     /**
      * 重启设备。无参数。
@@ -407,8 +408,8 @@ enum class SettingKey {
     /**
      * 关机。无参数。
      *
-     * 比 [REBOOT] 更不可重试 —— 关机成功后设备已经不可达，这时候的"会话失效"是正常现象，
-     * 重登重试只会在日志里留一串误导人的失败。
+     * 比 [REBOOT] 更不可重试：关机成功后设备已不可达，此时的会话失效属于正常现象，
+     * 重登重试只会在日志中留下误导性的失败记录。
      */
     SHUTDOWN,
 
@@ -420,87 +421,84 @@ enum class SettingKey {
     FACTORY_RESET,
 
     /**
-     * 后台管理口令修改。params: `old_hash` + `new_hash`，两个都是**已经哈希过**的值。
-
+     * 后台管理口令修改。params: `old_hash` + `new_hash`，两者均为已哈希的值。
      *
-     * 为什么 profile 不做哈希：设备要的是 `SHA256` 大写十六进制，而这套算法与登录握手
-     * 共用 `GoformClient.sha256Hex` —— 在 profile 里复制第二份实现就有了两个真源，
-     * 哪天登录侧换算法这里不会报错、只会静默登不上。顺带一个好处是明文口令根本不进
-     * device-schema，少一处泄露面。encode 只做字段名映射（`old_hash` → `oldPassword`）。
+     * profile 不做哈希：设备要求 `SHA256` 大写十六进制，该算法与登录握手共用
+     * `GoformClient.sha256Hex`；在 profile 中复制第二份实现会产生两个真源，
+     * 登录侧更换算法后此处不会报错，只会静默登录失败。附带效果是明文口令不进入
+     * device-schema，减少一处泄露面。encode 只做字段名映射（`old_hash` → `oldPassword`）。
      *
-     * **副作用 WriteSpec 表达不了**：改成功后调用点必须紧接着
-     * `updateGoformPassword()` + `resetLogin()`，否则下一次请求还拿旧口令登录（见计划书 §11.3）。
+     * **WriteSpec 无法表达副作用**：修改成功后调用点必须紧接着执行
+     * `updateGoformPassword()` 与 `resetLogin()`，否则下一次请求仍以旧口令登录。
      */
     BACKEND_PASSWORD,
 
     /**
      * 连接模式（自动拨号 / 手动拨号）。value: String（设备侧原值 `auto_dial` / `manual_dial`）。
      *
-     * 注意它与 [ROAM] **共用同一条设备命令** `SET_CONNECTION_MODE` —— 那不是抄错，
-     * 是设备侧把"漫游开关"塞进了连接模式这条命令里（见 ZteGoformProfile 中 ROAM 的注释）。
-     * 两者的参数集不同，所以必须是两个 key，不能合并。
+     * 该 key 与 [ROAM] 共用设备命令 `SET_CONNECTION_MODE`：设备侧把漫游开关放在连接模式命令中
+     * （见 ZteGoformProfile 中 ROAM 的注释）。两者参数集不同，因此必须是两个 key，不能合并。
      */
     CONNECTION_MODE,
 
     /**
      * WiFi 发射功率档位。value: Int。
      *
-     * 值域 0~2 不是这里发明的：`WifiRoutes.kt` 的入参校验（`level must be 0-2`）
-     * 早就是这个判据，搬进 profile 是为了让"档位上限"这件设备事实只有一份。
+     * 值域 0~2 与 `WifiRoutes.kt` 的入参校验（`level must be 0-2`）一致；在此登记
+     * 是为了让「档位上限」这项设备事实只有一份。
      */
     WIFI_POWER,
 
     /**
-     * WiFi 总开关。params: `value: Boolean` + `chip: String?`（**可选**，`"chip1"` / `"chip2"`）。
+     * WiFi 总开关。params: `value: Boolean` + `chip: String?`（可选，`"chip1"` / `"chip2"`）。
      *
-     * 设备侧把「开 WiFi」和「关 WiFi」做成了**两条不同的命令**（2026-09-22 真机抓包，逐字）：
+     * 设备侧把「开 WiFi」与「关 WiFi」实现为两条不同的命令（真机抓包，逐字）：
      * - 关：`goformId=switchWiFiModule&isTest=false&SwitchOption=0&AD=…`
      * - 开：`goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0&AD=…`
      *
-     * 抓包时用户设备在 5G，所以「开」发的是 `chip2`。结合已确认的 `chip1` = 2.4G / `chip2` = 5G，
-     * `switchWiFiChip&ChipEnum=X&GuestEnable=0` 的语义是**「在频段 X 上启用 WiFi」** ——
-     * 既是「开」也是「切频段」，同一条命令。「切频段」这个独立动作是 [WIFI_BAND]。
+     * 抓包时设备处于 5G，因此「开」下发的是 `chip2`。结合已确认的 `chip1` = 2.4G / `chip2` = 5G，
+     * `switchWiFiChip&ChipEnum=X&GuestEnable=0` 的语义是「在频段 X 上启用 WiFi」，
+     * 既是「开」也是「切频段」，同属一条命令。「切频段」的独立动作是 [WIFI_BAND]。
      *
-     * 所以「开」分支必须能收一个频段：`chip` 的取值域是**设备自己的词汇**
-     * （`chip1` / `chip2`，与读侧 canonical 字段 `wifi_chip` 的取值域完全一致），
-     * 不用 `"2.4G"` / `"5G"` 这种界面词汇。
-     * - `chip` 有值 → 原样作 `ChipEnum` 下发，不在取值域内直接拒；
-     * - `chip` 缺失 → 退回 `"chip1"`。这是**调用方没告诉我当前频段时的兜底，会把设备切到 2.4G**，
-     *   属于已知的不理想分支：调用方（`GoformWifiClient`）有责任把设备当前频段传进来。
-     * - 「关」分支**不读** `chip`（传了也无害、不影响编码结果）：`switchWiFiModule` 只认 `SwitchOption`。
+     * 因此「开」分支必须能接收频段：`chip` 的取值域是设备词汇
+     * （`chip1` / `chip2`，与读侧 canonical 字段 `wifi_chip` 的取值域一致），
+     * 不使用 `"2.4G"` / `"5G"` 这类界面词汇。
+     * - `chip` 有值：原样作为 `ChipEnum` 下发，不在取值域内直接拒绝；
+     * - `chip` 缺失：退回 `"chip1"`。这是调用方未提供当前频段时的兜底，会把设备切到 2.4G，
+     *   属于已知的不理想分支；调用方（`GoformWifiClient`）有责任传入设备当前频段。
+     * - 「关」分支不读 `chip`（传入无副作用，不影响编码结果）：`switchWiFiModule` 只认 `SwitchOption`。
      *
-     * **实测边界**：`switchWiFiModule` 在本项目里只用于「关」，它的 `SwitchOption=1`（开）
-     * 从未发过、抓包里也没有 —— **至今无任何实测依据，不许出现在代码里**。
-     * 完整的事实与「原拆分方案第 2 步被证伪」的归档记在 `ZteGoformProfile` 里这一项的
-     * WriteSpec 注释上 —— 改这一项前先读那段。
+     * **实测边界**：`switchWiFiModule` 在本项目中只用于「关」，其 `SwitchOption=1`（开）
+     * 从未发送过，抓包中亦不存在，无任何实测依据，不得出现在代码中。
+     * 完整设备事实见 `ZteGoformProfile` 中该项 WriteSpec 的注释，修改该项前应先阅读该处。
      */
     WIFI_ENABLED,
 
     /**
-     * WiFi 频段选择。value: String —— 取值只有 `"chip1"`（2.4G）/ `"chip2"`（5G），其余一律拒。
+     * WiFi 频段选择。value: String —— 取值只有 `"chip1"`（2.4G）/ `"chip2"`（5G），其余一律拒绝。
      *
-     * **副作用：这条命令同时会把 WiFi 打开。** 设备侧
+     * **副作用：该命令同时会打开 WiFi。** 设备侧
      * `goformId=switchWiFiChip&isTest=false&ChipEnum=chip1|chip2&GuestEnable=0` 的语义是
-     * 「在频段 X 上启用 WiFi」，没有「只切频段、不动开关」这种形态（2026-09-22 真机抓包）。
-     * 它与 [WIFI_ENABLED] 的「开」分支是**同一条命令**：两个 key 只是对外的两个用户动作
-     * （开关 WiFi / 选频段），设备侧的事实只有一条。
+     * 「在频段 X 上启用 WiFi」，不存在「只切频段、不改开关」的形态（真机抓包）。
+     * 它与 [WIFI_ENABLED] 的「开」分支是同一条命令：两个 key 只是对外的两个用户动作
+     * （开关 WiFi / 选择频段），设备侧事实只有一条。
      *
-     * 取值域刻意用设备自己的词汇，与读侧 canonical 字段 `wifi_chip` 一致：**不接受**
-     * `"2.4G"` / `"5G"`（界面文案），也**不接受** `"0"` / `"1"`（读侧 `ChipIndex` 的原始编码）。
-     * 收了别名就等于让「界面词汇 / 读侧编码 / 设备值」三套取值域在这里悄悄互相透传。
+     * 取值域刻意使用设备词汇，与读侧 canonical 字段 `wifi_chip` 一致：不接受
+     * `"2.4G"` / `"5G"`（界面文案），也不接受 `"0"` / `"1"`（读侧 `ChipIndex` 的原始编码）。
+     * 接受别名会使「界面词汇 / 读侧编码 / 设备值」三套取值域在此互相透传。
      */
     WIFI_BAND,
 
     /**
      * 移动数据开关。value: Boolean。
      *
-     * 设备侧的两条事实都由 [WriteSpec] 承担，调用点只传一个布尔：
-     * 1. 开/关是**两条不同的命令**（开 `CONNECT_NETWORK`、关 `DISCONNECT_NETWORK`），
-     *    由 [WriteSpec.commandOf] 按取值选；
-     * 2. 主命令失败时还要发一条老命令 `SET_DATA_ENABLED`（`data=1/0`）兜底，
-     *    由 [WriteSpec.fallback] 表达（计划书 §11.3：「主失败换备用命令」属于设备事实）。
+     * 设备侧的两条事实都由 [WriteSpec] 承担，调用点只传一个布尔值：
+     * 1. 开与关是两条不同的命令（开 `CONNECT_NETWORK`、关 `DISCONNECT_NETWORK`），
+     *    由 [WriteSpec.commandOf] 按取值选择；
+     * 2. 主命令失败时还需发送旧命令 `SET_DATA_ENABLED`（`data=1/0`）兜底，
+     *    由 [WriteSpec.fallback] 表达（主命令失败后改发备用命令属于设备事实）。
      *
-     * 与 [PPP_DIAL] 的区别**只有第 2 条**。两者不能合并，理由写在 [PPP_DIAL]。
+     * 与 [PPP_DIAL] 的区别只有第 2 条，两者不能合并，理由见 [PPP_DIAL]。
      */
     MOBILE_DATA,
 
@@ -508,68 +506,67 @@ enum class SettingKey {
      * 手动拨号 / 挂断。value: Boolean（true = 拨号，false = 挂断）。
      *
      * 对应 `GoformNetworkClient.connectNetwork()` / `disconnectNetwork()` 两个独立入口
-     * （route 侧是 `POST /api/network/connect` 与 `/disconnect`）。命令名与 [MOBILE_DATA]
-     * 的主命令完全相同（`CONNECT_NETWORK` / `DISCONNECT_NETWORK`），参数也一样。
+     * （route 侧为 `POST /api/network/connect` 与 `/disconnect`）。命令名与 [MOBILE_DATA]
+     * 的主命令完全相同（`CONNECT_NETWORK` / `DISCONNECT_NETWORK`），参数也相同。
      *
-     * **它与 [MOBILE_DATA] 的区别只在于没有兜底命令，不要合并**：现有这两个方法失败就是失败，
-     * 不会再发 `SET_DATA_ENABLED`。合并等于给这两个入口偷偷加上一条它们从来没发过的命令
-     * —— 用户点「连接」失败后，设备的数据开关会被额外改一次。那是行为变更，不是重构。
+     * **与 [MOBILE_DATA] 的区别仅在于没有兜底命令，不得合并**：现有两个方法失败即为失败，
+     * 不会改发 `SET_DATA_ENABLED`。合并相当于给这两个入口增加一条它们从未发送过的命令，
+     * 导致「连接」失败后设备的数据开关被额外修改一次，属于行为变更而非重构。
      */
     PPP_DIAL,
 
     /**
      * WiFi 热点配置（SSID / 加密方式 / 口令 / 广播 / 最大接入数）。
      *
-     * params（**全部可选**，某项为 null 或不存在 → 不发对应设备键，固定值除外）：
-     * - `ssid: String?` —— SSID。**调用方负责 trim**（profile 不猜「要不要去空格」）
-     * - `auth_mode: String?` —— 认证方式，缺省 `"WPA2PSK"`；**取值域**（2026-09-22 真机抓包，
-     *   大小写敏感）：`OPEN` / `WPA2PSK` / `WPA3PSK` / `WPA2PSKWPA3PSK`，其余值被 validate 拒
-     * - `encrypt_type: String?` —— 加密方式，缺省 `"CCMP"`；`auth_mode == "OPEN"` 时**强制** `"NONE"`
-     * - `passphrase: String?` —— **明文**口令，由 encode 做 base64(UTF-8)
-     * - `max_sta_num: Int?` —— 最大接入设备数。**闭区间 `1..10`**，越界被 validate 拒
-     *   （上限 10 = 用户对中兴 F50 的实测/规格结论，2026-09-22）
+     * params（全部可选；某项为 null 或不存在时不发对应设备键，固定值除外）：
+     * - `ssid: String?` —— SSID。调用方负责 trim（profile 不判断是否去空格）
+     * - `auth_mode: String?` —— 认证方式，缺省 `"WPA2PSK"`；取值域（真机抓包，大小写敏感）：
+     *   `OPEN` / `WPA2PSK` / `WPA3PSK` / `WPA2PSKWPA3PSK`，其余值被 validate 拒绝
+     * - `encrypt_type: String?` —— 加密方式，缺省 `"CCMP"`；`auth_mode == "OPEN"` 时强制 `"NONE"`
+     * - `passphrase: String?` —— 明文口令，由 encode 做 base64(UTF-8)
+     * - `max_sta_num: Int?` —— 最大接入设备数。闭区间 `1..10`，越界被 validate 拒绝
+     *   （上限 10 为中兴 F50 的规格上限）
      * - `broadcast_disabled: Int?` —— 隐藏 SSID，缺省 `0`
      * - `chip_index: String?` —— 芯片序号，缺省 `"0"`
      *
-     * 校验只覆盖 `auth_mode` 与 `max_sta_num`；**SSID 与 `passphrase` 不做任何校验**
-     * （允许任意字符，加格式校验会把现在能设的值变成 Rejected）。
-
+     * 校验只覆盖 `auth_mode` 与 `max_sta_num`；SSID 与 `passphrase` 不做任何校验
+     * （允许任意字符，增加格式校验会把当前可设置的值变为 Rejected）。
      *
      * ## 为什么只有一个 key（而不是 WIFI_SSID + WIFI_PASSPHRASE 两个）
      *
-     * 设备侧 `setAccessPointInfo` 是**整份 AP 配置替换**：漏发一个键，那一项就按设备默认值走
-     * （已经出过两次事故 —— 改 SSID 把口令写坏、不传口令把口令清空，见 `fix(wifi)` 那个提交）。
-     * 拆成两个 key 等于让「哪些键必须一起发」这条设备事实散在两处。
+     * 设备侧 `setAccessPointInfo` 是整份 AP 配置替换：漏发一个键，该项即按设备默认值写入。
+     * 已知两类故障均由此产生：修改 SSID 时写坏口令、未传口令时清空口令。
+     * 拆成两个 key 会使「哪些键必须一起发送」这条设备事实分散在两处。
      *
-     * ## 读-改-写留在调用方（计划书 §11.3）
+     * ## 读-改-写留在调用方
      *
-     * 「先读回当前值再合并」不是纯函数（要发一次查询），所以它留在 `GoformWifiClient`；
-     * profile 只收**调用方合并后的完整参数集**。三个入口（改整份配置 / 只改 SSID / 只改口令）
-     * 的差异全部体现在「往 params 里放哪几个键」，encode 这一份对三者通用。
+     * 「先读回当前值再合并」不是纯函数（需要发起一次查询），因此留在 `GoformWifiClient`；
+     * profile 只接收调用方合并后的完整参数集。三个入口（修改整份配置 / 只改 SSID / 只改口令）
+     * 的差异全部体现在「向 params 中放入哪几个键」，encode 的实现对三者通用。
      *
-     * ## `Password` 的发送条件只看 `passphrase` 键在不在
+     * ## `Password` 的发送条件只看 `passphrase` 键是否存在
      *
-     * **不要**在 encode 里再判 `auth != OPEN && encryp != NONE`：三个入口的条件并不相同
-     * （「只改口令」这个入口对 OPEN 也发 Password）。那个条件是**调用方的意图**、
-     * 不是设备事实 —— 把它写进 encode，三处就再也共用不了同一份实现。
+     * encode 中不得再判断 `auth != OPEN && encryp != NONE`：三个入口的条件并不相同
+     * （「只改口令」入口对 OPEN 也会发送 Password）。该条件属于调用方意图而非设备事实，
+     * 写进 encode 后三处将无法共用同一份实现。
      *
-     * ## 调用方须知：`auth_mode == "OPEN"` 时**不应该**传 `passphrase`
+     * ## 调用方须知：`auth_mode == "OPEN"` 时不应传入 `passphrase`
      *
-     * 2026-09-22 真机抓包里，界面选 `OPEN` 发出的请求**没有 `Password` 字段**
+     * 真机抓包中，界面选择 `OPEN` 发出的请求不包含 `Password` 字段
      * （`…&AuthMode=OPEN&ApBroadcastDisabled=0&ApMaxStationNumber=10&EncrypType=NONE&AD=…`）。
-     * 但 encode 的规则是上面那条「`passphrase` 键非 null 就发」，**所以这件事由调用方负责** ——
-     * profile 不会替你把它删掉（删了就会让「只改口令」那个入口在 OPEN 下静默丢掉用户的输入）。
-     * 想发出与真机逐字一致的 OPEN 报文，就**不要放 `passphrase` 这个键**。
-
+     * encode 的规则是「`passphrase` 键非 null 即发送」，因此该约束由调用方负责：
+     * profile 不会代为删除（删除会使「只改口令」入口在 OPEN 下静默丢弃用户输入）。
+     * 需要发出与真机一致的 OPEN 报文时，不得放入 `passphrase` 键。
      */
     WIFI_AP_CONFIG,
 }
 
 /**
- * 会话失效时能不能重发这条命令。
+ * 会话失效时能否重发这条命令。
  *
- * 为什么不叫 `idempotent: Boolean`：「幂等」是数学性质，这里真正要表达的是
- * 「会话失效重登后能不能把同一条命令再发一次」；而且将来要加「重试几次/退避多久」时有地方放。
+ * 不使用 `idempotent: Boolean`：幂等是数学性质，此处需要表达的是
+ * 「会话失效并重新登录后能否将同一条命令再发送一次」；该枚举也为后续扩展
+ * 「重试次数 / 退避时长」保留位置。
  */
 enum class RetryPolicy {
     /** 会话失效时重登并重试一次。只给「同一取值幂等」的设置类命令。 */
@@ -583,40 +580,38 @@ enum class RetryPolicy {
  * 一个写操作的设备侧规则。
  *
  * @param command 设备侧命令标识（goform 的 `goformId`）。
- * @param encode 把 route 传入的 canonical 参数转成设备侧参数表。
-
-
- *   **这是布尔/枚举编码的唯一归属地**——设备侧布尔有 `"1"/"0"` 和 `"on"/"off"` 两套，
+ * @param encode 把 route 传入的 canonical 参数转换为设备侧参数表。
+ *   **布尔与枚举编码的唯一归属地**：设备侧布尔存在 `"1"/"0"` 与 `"on"/"off"` 两套编码，
  *   route 只应传 Kotlin `Boolean`。
- * @param validate 值域校验：返回错误描述则拒绝下发（route 回 `OUT_OF_RANGE` 等），
- *   返回 null 表示通过。**在这里挡住非法值，既是正确性也是安全性**——
+ * @param validate 值域校验：返回错误描述则拒绝下发（route 返回 `OUT_OF_RANGE` 等），
+ *   返回 null 表示通过。在此拦截非法值既是正确性要求也是安全要求：
  *   设备侧的表单拼接对特殊字符没有防护。
- *   返回的文案**不许包含参数值**（口令 / PIN / APN 凭据都会走这里并被写进日志），只说违反了哪条规则。
- * @param retry 会话失效时是否重发。默认取安全侧（[RetryPolicy.NEVER]）是因为**漏标的代价不对称**：
- *   默认重试时漏标 → 重复发短信 / 重复计费，用户看不见也撤不回；默认不重试时漏标 → 少一次
- *   自动重试，用户再点一次即可。所以设置类命令必须**显式**标 [RetryPolicy.RETRY_ON_SESSION_LOSS]
- *   （漏标就会复发「切换网络制式第一次必定失败」那个 bug，见 `GoformSettingWriter` 的注释）。
- * @param fallback 主命令返回 `Failed` 时再试一次的备用命令；默认 null = 没有备用命令。
- *   存在的理由：个别动作在设备侧就是"先试新命令、不认再发老命令"（老固件不认新 goformId），
- *   这属于设备事实，不该在客户端留一个 if。
- *   **fallback 的 [retry] 独立判定，不继承主命令的** —— 主命令可重试不代表备用命令也可重试
- *   （两条命令的副作用可以完全不同）。
- * @param commandOf **按取值选命令名**；默认 null = 该项只有一个命令名（[command]）。
+ *   返回文案不得包含参数值（口令 / PIN / APN 凭据都会经过这里并被写入日志），只描述违反的规则。
+ * @param retry 会话失效时是否重发。默认取安全侧（[RetryPolicy.NEVER]），原因是漏标的代价不对称：
+ *   默认重试时漏标会导致重复发送短信与重复计费，用户不可见且不可撤回；
+ *   默认不重试时漏标只会少一次自动重试，用户重新触发即可。因此设置类命令必须显式标注
+ *   [RetryPolicy.RETRY_ON_SESSION_LOSS]，否则「切换网络制式首次必定失败」的缺陷会复发
+ *   （见 `GoformSettingWriter` 的注释）。
+ * @param fallback 主命令返回 `Failed` 时再试一次的备用命令；默认 null 表示没有备用命令。
+ *   其存在的原因是设备侧部分动作为「先试新命令、不识别再发旧命令」（旧固件不识别新 goformId），
+ *   这属于设备事实，不应在客户端保留 `if`。
+ *   **fallback 的 [retry] 独立判定，不继承主命令**：主命令可重试不代表备用命令可重试，
+ *   两条命令的副作用可以完全不同。
+ * @param commandOf 按取值选择命令名；默认 null 表示该项只有一个命令名（[command]）。
  *
- *   为什么需要它：个别设备把「同一个用户动作的开 / 关」做成了**两条不同的命令** ——
+ *   需要它的原因：部分设备把「同一用户动作的开与关」实现为两条不同的命令 ——
  *   ZTE 的移动数据开 = `CONNECT_NETWORK`、关 = `DISCONNECT_NETWORK`；
- *   WiFi 开 = `switchWiFiChip`、关 = `switchWiFiModule`。不给这个字段，调用点就得写
- *   `if (enabled) keyA else keyB`：那段设备知识就漏在 profile 外面（换设备时会静默发错命令），
- *   而且 [SettingKey] 会为此长出一整个 `*_OFF` 系列（`MOBILE_DATA_OFF` / `WIFI_OFF`…），
- *   对外的「一个动作」在内部裂成两个 key。
+ *   WiFi 开 = `switchWiFiChip`、关 = `switchWiFiModule`。若没有该字段，调用点需要写
+ *   `if (enabled) keyA else keyB`，这段设备知识就会漏在 profile 之外
+ *   （更换设备后会静默发送错误命令），且 [SettingKey] 会为此新增一整个 `*_OFF` 系列
+ *   （`MOBILE_DATA_OFF` / `WIFI_OFF`…），对外的「一个动作」在内部裂成两个 key。
  *
- *   优先级：`commandOf` 非空时**覆盖** [command]。[command] 仍然必填，作为默认命令名
- *   与日志 / 断言用的标识（所以它**不改成可空** —— 一个 spec 永远能说出自己叫什么）。
+ *   优先级：`commandOf` 非空时覆盖 [command]。[command] 仍然必填，作为默认命令名
+ *   以及日志与断言使用的标识（因此不改为可空：一个 spec 始终能说出自身命令名）。
  *
- *   硬限制：只许「按取值选 command」。**禁止**在里面做 I/O、读全局状态、做多步编排、
- *   产生任何副作用。它和 [encode] 一样必须是**纯函数**：同一份 params 进去，永远得到
- *   同一个命令名。需要「先读回再决定」或「成功后还要做点别的」的，那不是 commandOf
- *   能表达的东西，留在调用点（计划书 §11.3）。
+ *   硬限制：只允许「按取值选择 command」。禁止在其中做 I/O、读全局状态、执行多步编排
+ *   或产生任何副作用。与 [encode] 相同，它必须是纯函数：同一份 params 输入恒得同一命令名。
+ *   需要「先读回再决定」或「成功后还要执行其它操作」的场景无法由 commandOf 表达，应留在调用点。
  */
 data class WriteSpec(
     val command: String,

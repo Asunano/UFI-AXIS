@@ -53,6 +53,8 @@ class HttpServer(
     private val alertRoutes: AlertRoutes,
     private val wifiRoutes: WifiRoutes,
     private val configRoutes: ConfigRoutes,
+    /** 运营商账单（2026-10-31）。可空仅为不破坏既有测试装配；生产必须传。 */
+    private val carrierRoutes: com.ufi_axis_core.api.routes.CarrierRoutes? = null,
     private val updateRoutes: com.ufi_axis_core.api.routes.UpdateRoutes,
     private val appRoutes: AppRoutes,
     private val shellRoutes: ShellRoutes,
@@ -84,6 +86,12 @@ class HttpServer(
     private val diagnosticRoutes: com.ufi_axis_core.api.routes.DiagnosticRoutes? = null,
     private val cpuProbeRoutes: com.ufi_axis_core.api.routes.CpuProbeRoutes? = null,
     private val planRoutes: com.ufi_axis_core.api.routes.PlanRoutes? = null,
+    /**
+     * 第三方程序商店（2026-10-30 P0）。可空 + 默认 null 是为了不破坏既有构造点
+     * （与 pairedBlacklistRoutes / smsForwardRoutes 同一约定）；生产装配必须传入，
+     * 漏传等于商店入口静默消失。
+     */
+    private val programRoutes: com.ufi_axis_core.api.routes.ProgramRoutes? = null,
     private val qosRoutes: QoSRoutes? = null,
     private val monitorRoutes: MonitorRoutes? = null,
     private val notificationRoutes: com.ufi_axis_core.api.routes.NotificationRoutes? = null,
@@ -94,6 +102,12 @@ class HttpServer(
     /** 终端命令历史（AT / Shell 两端共享），可空只为兼容尚未装配它的调用方。 */
     private val consoleRoutes: com.ufi_axis_core.api.routes.ConsoleRoutes? = null,
     private val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes? = null,
+    /**
+     * 远程屏幕路由（2026-10-31）。可空 + 默认 null 只为不破坏既有测试装配；
+     * 生产必须由 `ComponentFactory` 传入 —— 漏传的表现是 `/api/screen/…` 404，
+     * 而不是崩溃，所以由装配守卫测试盯着。
+     */
+    private val screenRoutes: com.ufi_axis_core.api.routes.ScreenRoutes? = null,
     /** 配置备份导出 / 恢复，可空同上。 */
     private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null,
     /** DLNA MediaServer 配置（2026-10-09），可空同上。 */
@@ -320,18 +334,26 @@ class HttpServer(
             } finally {
                 val cost = System.currentTimeMillis() - startMs
                 val code = call.response.status()?.value
-                val level = when {
-                    code == null -> AppLogger.LogLevel.DEBUG   // 未命中路由/静态兜底，非异常
-                    code >= 500 -> AppLogger.LogLevel.ERROR
-                    code >= 400 -> AppLogger.LogLevel.WARN
-                    else -> AppLogger.LogLevel.DEBUG
+                // 2026-10-30 F5：访问日志只在 5xx 记 ERROR，其余（含 4xx）一律 DEBUG。
+                //
+                // 原先 4xx 记 WARN，而 WARN **无视日志总开关**必落盘 —— 于是任何未授权/扫描器
+                // 打随机路径都会变成一条写盘 IO（每个不同 URI 一条）。鉴权拒绝本来就由
+                // AuthMiddleware 单独记 WARN（带原因），访问日志不需要再重复一遍。
+                val level = if (code != null && code >= 500) {
+                    AppLogger.LogLevel.ERROR
+                } else {
+                    AppLogger.LogLevel.DEBUG
                 }
-                AppLogger.net(
-                    level,
-                    "HTTP",
-                    "${call.request.httpMethod.value} ${call.request.uri} → ${code ?: "-"} " +
-                        "${cost}ms from ${call.request.local.remoteAddress}"
-                )
+                // 2026-10-30：日志页自己每 2 秒轮询一次 `/api/debug-logs`，把它也记进访问日志
+                // 等于「看日志这个动作自己制造日志」。这条路径不进访问日志。
+                if (!call.request.uri.startsWith("/api/debug-logs")) {
+                    AppLogger.net(
+                        level,
+                        "HTTP",
+                        "${call.request.httpMethod.value} ${call.request.uri} → ${code ?: "-"} " +
+                            "${cost}ms from ${call.request.local.remoteAddress}"
+                    )
+                }
             }
         }
 
@@ -379,6 +401,9 @@ class HttpServer(
             allowMethod(HttpMethod.Post)
             allowMethod(HttpMethod.Put)
             allowMethod(HttpMethod.Delete)
+            // 程序设置用 PATCH（/api/programs/{id}/settings）；同源面板不受影响，
+            // 但经隧道域名跨域访问时，预检会因缺这一项被浏览器挡掉。
+            allowMethod(HttpMethod.Patch)
             allowHeader(HttpHeaders.Authorization)
             allowHeader(HttpHeaders.ContentType)
             allowHeader("X-Timestamp")
@@ -502,6 +527,10 @@ class HttpServer(
 
     private fun Application.configureRouting() {
         routing {
+            // 第三方程序 Gateway 的一次性入口（/apps/{id}/enter?t=...）：
+            // 票据自校验、不需要 ECDSA 签名，必须注册在静态资源兜底之前。
+            programRoutes?.registerPublic(this)
+
             get("/health") {
                 val ws = webSocketManager.getStats()
                 call.respond(toJsonElement(mapOf(
@@ -551,6 +580,19 @@ class HttpServer(
                 val routes = ttydRoutes
                 if (routes == null) {
                     close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal routes not wired"))
+                } else {
+                    routes.proxy(this)
+                }
+            }
+
+            // 远程屏幕（2026-10-31）：二进制双向泵，视频下行 / 控制上行。
+            // **位置同样是硬约束**：挪到下面的 get("/{path...}") 之后，
+            // 握手会被 SPA 兜底吃掉，返回 200 + index.html，浏览器报
+            // 「Invalid frame header」并无限重连（r30 在 /ws/terminal 上踩过）。
+            webSocket("/ws/screen") {
+                val routes = screenRoutes
+                if (routes == null) {
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "screen routes not wired"))
                 } else {
                     routes.proxy(this)
                 }
@@ -630,12 +672,12 @@ class HttpServer(
                     get("/status") {
                         call.respond(toJsonElement(pairingManager.statusPayload()))
                     }
-                    // 2026-10-21（审计 §B1）：这两条旧端点**必须带配对密码**。
+
+                    // 2026-10-21（审计 §B1）：这两条端点**必须带配对密码**。
                     //
-                    // 之前它们只校验 Bearer+签名，而「移除单台设备」
-                    // （DELETE /api/pairing/devices/{fp}）与 root 的「解除全部」（POST /pairing/unpair）
-                    // 都要密码 —— 于是"踢掉所有人"反而是门槛最低的破坏性操作，双因素形同虚设。
-                    // 现在三条路一个口径：任何"让设备掉出配对"的写操作都要密码。
+                    // 同一个 handler 还挂在**免鉴权**的 `/pairing/*` 上（见上面那个 route），
+                    // 密码是那条路径上唯一的门 —— 少它等于同 WiFi 任何人都能踢掉全部配对。
+                    // 已鉴权的配对设备管理（移除单台 / 黑名单）不再要密码：那条路径只有 Bearer。
                     //
                     // 不破坏兼容的方式：缺密码回 401 MISSING_PASSWORD（不是 404/500），
                     // 客户端据此弹密码框即可（App 的 NetworkModule.unpairAll / Web 的 PairingPanel 已跟上）。
@@ -675,6 +717,18 @@ class HttpServer(
                         // 负数会被 `maxDevices > 0` 判成"不限"，但界面仍显示"已用 3 / -5"。
                         val maxDevices = body["pairing_max_devices"]?.jsonPrimitive?.contentOrNull
                             ?.toIntOrNull()?.coerceIn(0, MAX_PAIRING_DEVICES)
+                        // 关掉保护本身也要密码（**打开不需要**）。
+                        //
+                        // 不这么做的话，任何已配对客户端先发这一个请求把门关掉，后面所有破坏性操作
+                        // 就都不再要密码 —— 这道门等于装饰。判据与「改密码要旧密码」同构：
+                        // 只在**当前确实开着**、且本次请求要把它关掉时才拦。
+                        val turningGateOff = body["owner_gate_enabled"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull() == false && ctx.settings.ownerGateEnabled
+                        // [owner] PUT /api/pairing/config（条件门：关掉总开关时才要密码）
+                        if (turningGateOff && !call.requireOwner(body.ownerPassword())) {
+                            return@put
+                        }
+
                         if (enabled != null) ctx.settings.pairingEnabled = enabled
                         if (maxDevices != null) ctx.settings.pairingMaxDevices = maxDevices
                         // 2026-10-15（安全中心）：批准策略 + 它的外部通知渠道。
@@ -688,6 +742,10 @@ class HttpServer(
                             ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingNotifyEmail = it }
                         body["pairing_notify_webhook"]?.jsonPrimitive?.contentOrNull
                             ?.toBooleanStrictOrNull()?.let { ctx.settings.pairingNotifyWebhook = it }
+                        // 破坏性操作的主人密码门（OwnerGate）。**默认关**，开关本身的语义见
+                        // AppSettings.ownerGateEnabled：打开后只影响不可逆操作，安装/更新/隧道不受影响。
+                        body["owner_gate_enabled"]?.jsonPrimitive?.contentOrNull
+                            ?.toBooleanStrictOrNull()?.let { ctx.settings.ownerGateEnabled = it }
 
                         // 2026-10-24：批准策略关闭后，旧 pending 请求必须当场作废。
                         // 之前这里只改设置，`PairedDeviceApprovalStore` 里的条目继续存在，
@@ -711,7 +769,8 @@ class HttpServer(
                             "pairing_approval_required" to ctx.settings.pairingApprovalRequired,
                             "pairing_notify_system" to ctx.settings.pairingNotifySystem,
                             "pairing_notify_email" to ctx.settings.pairingNotifyEmail,
-                            "pairing_notify_webhook" to ctx.settings.pairingNotifyWebhook
+                            "pairing_notify_webhook" to ctx.settings.pairingNotifyWebhook,
+                            "owner_gate_enabled" to ctx.settings.ownerGateEnabled
                         )))
                     }
                 }
@@ -828,11 +887,15 @@ class HttpServer(
                 alertRoutes.register(this)
                 wifiRoutes.register(this)
                 configRoutes.register(this)
+                carrierRoutes?.register(this)
                 updateRoutes.register(this)
                 appRoutes.register(this)
+                // 第三方程序商店（/api/programs）。与上面 /api/apps（APK 管理）是两件事。
+                programRoutes?.register(this)
                 shellRoutes.register(this)
                 consoleRoutes?.register(this)
                 ttydRoutes?.register(this)
+                screenRoutes?.register(this)
                 backupRoutes?.register(this)
                 fileRoutes.register(this)
                 storageSourceRoutes?.register(this)

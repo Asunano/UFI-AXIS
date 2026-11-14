@@ -53,6 +53,23 @@ class TtydTicketStore(
         return entry.sessionId
     }
 
+    /**
+     * 校验并**消费**票据（一次性）：成功即从表里删除。
+     *
+     * 投屏用这个而不是 [resolve]：`/ws/screen` 的票据会出现在 URL 里（浏览器历史、
+     * 反代日志、截图），可重复使用等于把一个长期入口写在了地址栏。
+     * 终端仍用 [resolve] —— 那边"窗口内重连"是正常行为。
+     */
+    fun consume(ticket: String?): String? {
+        if (ticket.isNullOrBlank()) return null
+        val entry = tickets[ticket] ?: return null
+        if (nowMs() - entry.lastUsedAt > ttlMs) {
+            tickets.remove(ticket, entry)
+            return null
+        }
+        return if (tickets.remove(ticket, entry)) entry.sessionId else null
+    }
+
     fun revoke(ticket: String?) {
         if (!ticket.isNullOrBlank()) tickets.remove(ticket)
     }

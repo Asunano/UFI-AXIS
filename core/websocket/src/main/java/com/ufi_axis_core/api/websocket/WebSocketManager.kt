@@ -74,6 +74,25 @@ class WebSocketManager(
 
     // 所有活跃连接: session -> subscribed types
     private val connections = ConcurrentHashMap<WebSocketSession, MutableSet<String>>()
+
+    /**
+     * 每条连接属于哪台设备（2026-11-14）。
+     *
+     * 为什么要记：握手时验过身份，但**建连之后服务端不再回查配对表** ——
+     * 机主在 A 上删掉 B 的配对记录后，B 那条已经连上的 WS 照样收数据，界面看起来"还登录着"。
+     * B 又几乎只靠 WS 取数，HTTP 444 连击攒不起来，`AuthRejectionPolicy` 的清凭据阈值
+     * 永远达不到（实测：删掉模拟器的配对后，App 一直停在仪表盘、数据照常刷新）。
+     */
+    private val fingerprintBySession = ConcurrentHashMap<WebSocketSession, String>()
+
+    /**
+     * 发 close 帧用的 scope。
+     *
+     * `WebSocketSession.close()` 是挂起函数，而"删配对"是同步流程 —— 不能就地挂起。
+     * 不能只调 `cancel()`：那只把 session 从登记表里摘掉，**传输层没关**，
+     * 客户端那边会以为连接还在（实测：服务端 ws_connections 已经 -1，App 界面照旧）。
+     */
+    private val closeScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val maxConnections = com.ufi_axis_core.contract.WsChannel.MAX_CONNECTIONS  // 支持 App + Web 多客户端同时连接（契约常量，双端共用）
 
     // 2026-10-05 R1-5 修复：连接准入信号量（与 maxConnections 同值）。
@@ -155,6 +174,7 @@ class WebSocketManager(
             return
         }
 
+        if (fingerprint != null) fingerprintBySession[session] = fingerprint
         AppLogger.i(tag, "New WebSocket connection${fingerprint?.let { " fp=$it" } ?: ""}. Total: ${connections.size}")
         // 新连接建立：数据通道恢复，清除 stale 标记并通知上层
         stale.set(false)
@@ -194,6 +214,7 @@ class WebSocketManager(
             AppLogger.e(tag, "WebSocket error", e)
         } finally {
             connections.remove(session)
+            fingerprintBySession.remove(session)
             // 2026-10-05 R1-5 修复：释放准入配额，与 tryAcquire 配对
             connectionSlots.release()
             // 从订阅索引中移除该 session 的所有订阅
@@ -372,6 +393,33 @@ class WebSocketManager(
     /**
      * 获取当前连接数
      */
+    /**
+     * 断开某台设备的全部实时连接（配对被移除 / 设备被拉黑时调用）。
+     *
+     * 用 `VIOLATED_POLICY`(1008)：客户端一致把它当"鉴权失败"，会走它自己的
+     * 重试 → 停顿 → 提示流程，而不是当成一次普通断线立刻重连。
+     *
+     * @return 被断开的连接数（0 = 该设备当前没有在线连接）
+     */
+    fun closeDeviceSessions(fingerprint: String, reason: String = "Device unpaired"): Int {
+        val targets = fingerprintBySession.filterValues { it == fingerprint }.keys.toList()
+        targets.forEach { s -> closeScope.launch { runCatching { s.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, reason)) } } }
+        if (targets.isNotEmpty()) {
+            AppLogger.w(tag, "已断开设备 $fingerprint 的 ${targets.size} 条实时连接（$reason）")
+        }
+        return targets.size
+    }
+
+    /** 断开**所有**设备的实时连接（解除全部配对时）。 */
+    fun closeAllDeviceSessions(reason: String = "All pairings removed"): Int {
+        val targets = fingerprintBySession.keys.toList()
+        targets.forEach { s -> closeScope.launch { runCatching { s.close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, reason)) } } }
+        if (targets.isNotEmpty()) {
+            AppLogger.w(tag, "已断开全部 ${targets.size} 条实时连接（$reason）")
+        }
+        return targets.size
+    }
+
     fun getConnectionCount(): Int = connections.size
 
     /**

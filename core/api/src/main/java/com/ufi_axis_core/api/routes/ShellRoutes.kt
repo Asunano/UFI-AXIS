@@ -41,27 +41,19 @@ class ShellRoutes(
         private const val DEFAULT_EXEC_TIMEOUT_SEC = 10
 
         /**
-         * 危险 Shell 命令黑名单 — 阻止可能导致内核崩溃/设备重启的操作
+         * 危险 Shell 命令判据。
+         *
+         * 2026-10-30（越权审查 §2.2）：实现搬到 [ShellCommandPolicy]（`:core:common`），
+         * 因为定时任务的 `custom_shell` 动作也要用它 —— 那条路原先什么都不判，
+         * 于是「建个任务」就能执行本端点明确回 403 的命令。
+         *
+         * 保留这个名字而不是让调用点改调 `ShellCommandPolicy`：它是「本端点拦什么」的
+         * 语义锚点，换名只会让 review 时看不出两处用的是同一份判据。
+         * `ShellCommandPolicyTest` 守的是那份判据本身（两处共用），本类的调用点由
+         * `rejectIfUpdating` 之外的行为测试覆盖。
          */
-        private val DANGEROUS_SHELL_PATTERNS = listOf(
-            // 直接触发内核模块操作
-            Regex("\\binsmod\\b", RegexOption.IGNORE_CASE),
-            Regex("\\bmodprobe\\b", RegexOption.IGNORE_CASE),
-            Regex("\\brmmod\\b", RegexOption.IGNORE_CASE),
-            // service call 到 sprd HIDL 服务 (绕过 AT 黑名单)
-            Regex("service\\s+call\\s+.*sprd", RegexOption.IGNORE_CASE),
-            // 整机重启/关机
-            Regex("\\breboot\\b", RegexOption.IGNORE_CASE),
-            Regex("\\bpoweroff\\b", RegexOption.IGNORE_CASE),
-            Regex("\\bshutdown\\b", RegexOption.IGNORE_CASE),
-            // 直接写入 sysfs（可能触发内核竞态）
-            Regex("echo\\s+.*\\s*>\\s*/sys/class/(sblock|smem|smsg|mem)", RegexOption.IGNORE_CASE),
-            // 杀掉关键系统进程
-            Regex("kill\\s+-9\\s+.*(rild|modem|netd|servicemanager)", RegexOption.IGNORE_CASE)
-        )
-
         fun isDangerousShellCommand(command: String): Boolean =
-            DANGEROUS_SHELL_PATTERNS.any { it.containsMatchIn(command) }
+            com.ufi_axis_core.util.ShellCommandPolicy.isDangerous(command)
     }
 
     fun register(route: Route) {
@@ -72,6 +64,10 @@ class ShellRoutes(
                 // 杀更新进程，在更新进行中先拒绝，避免把状态机打进卡死。
                 if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
+                // 主人密码门：root shell 是本服务权限最高的入口。
+                // 放在解析 command 之前 —— 不授权的请求连参数诊断都不该拿到。
+                // [owner] POST /api/shell/exec
+                if (!call.requireOwner(body.ownerPassword())) return@post
                 val cmd = body["command"]?.jsonPrimitive?.contentOrNull ?: ""
                 val asRoot = body["as_root"]?.jsonPrimitive?.booleanOrNull ?: true
                 val timeout = (body["timeout"]?.jsonPrimitive?.intOrNull ?: DEFAULT_EXEC_TIMEOUT_SEC)

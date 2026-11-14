@@ -1,7 +1,9 @@
 package com.ufi_axis_core.collector.signal
 
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
+import com.ufi_axis_core.contract.CarrierNames
 import com.ufi_axis_core.contract.DeviceFields
+import com.ufi_axis_core.contract.SignalSanity
 import com.ufi_axis_core.core.database.SignalRecord
 import com.ufi_axis_core.deviceschema.DeviceProfile
 import com.ufi_axis_core.deviceschema.FieldGroup
@@ -94,6 +96,9 @@ class SignalCollector(
         // ── 第 1 层: Goform 独立字段 ──
         if (goformSignal != null) {
             collectLayer1GoformFields(goformSignal, result)
+            // 越界值必须在进入第 2/3 层**之前**丢掉：否则一个 30,000,000 的 goform sinr
+            // 会让 "containsKey(SINR)" 为真，邻区/Telephony 两层都不再补，最终整条 sinr 丢失。
+            sanitizeResult(result)
         }
 
         // ── 第 2 层: neighbor_cell_info + PCI 匹配 ──
@@ -101,6 +106,7 @@ class SignalCollector(
             (!result.containsKey(DeviceFields.Signal.SINR) || !result.containsKey(DeviceFields.Signal.RSRQ))
         ) {
             extractFromNeighborCells(goformSignal, result)
+            sanitizeResult(result)
         }
 
         // ── 第 3 层: TelephonyCollector 兜底 ──
@@ -122,20 +128,56 @@ class SignalCollector(
             }
         }
 
+        // 第 3 层 Telephony 也可能塞入 CellInfo.UNAVAILABLE（Int.MAX_VALUE）等哨兵值。
+        sanitizeResult(result)
+        // goform 的 network_provider 可能是 CMCC/CUCC/CHN-UNICOM；WS signal 与
+        // /network/signal 都从这里出去，统一翻成中文（只展示，不参与判断）。
+        (result[DeviceFields.Signal.OPERATOR] as? String)?.let {
+            result[DeviceFields.Signal.OPERATOR] = CarrierNames.displayName(it)
+        }
         return result
     }
 
     /**
      * 根据采集结果构建 SignalRecord。
+     *
+     * 即使上游某个消费者绕过 [collect] 直接构造 map，这里也会把越界值写成 0
+     * （既有的"无信号哨兵"），保证数据库里不会再出现 3e7 这种量级的值。
      */
     fun buildRecord(signalInfo: Map<String, Any>): SignalRecord = SignalRecord(
-        rsrp = signalInfo.intValue("rsrp"),
-        sinr = signalInfo.intValue("sinr"),
-        rsrq = signalInfo.intValue("rsrq"),
-        rssi = signalInfo.intValue("rssi"),
+        rsrp = SignalSanity.takeIfValid(DeviceFields.Signal.RSRP, signalInfo.intValue(DeviceFields.Signal.RSRP)) ?: 0,
+        sinr = SignalSanity.takeIfValid(DeviceFields.Signal.SINR, signalInfo.intValue(DeviceFields.Signal.SINR)) ?: 0,
+        rsrq = SignalSanity.takeIfValid(DeviceFields.Signal.RSRQ, signalInfo.intValue(DeviceFields.Signal.RSRQ)) ?: 0,
+        rssi = SignalSanity.takeIfValid(DeviceFields.Signal.RSSI, signalInfo.intValue(DeviceFields.Signal.RSSI)) ?: 0,
         rat = signalInfo.stringValue("rat", ""),
         operator = signalInfo.stringValue("operator", "")
     )
+
+    /**
+     * 丢弃越界信号值。只处理 [SignalSanity.NUMERIC_KEYS]，不碰 operator/rat 等字符串字段。
+     * 日志用 DEBUG 级：异常固件可能每 3 秒返回一次，INFO/WARN 会把日志刷爆。
+     */
+    private fun sanitizeResult(result: MutableMap<String, Any>) {
+        val dropped = mutableListOf<String>()
+        for (key in SignalSanity.NUMERIC_KEYS) {
+            val raw = result[key] ?: continue
+            val value = when (raw) {
+                is Number -> raw.toInt()
+                is String -> raw.toIntOrNull()
+                else -> null
+            }
+            if (value == null || !SignalSanity.isValid(key, value)) {
+                result.remove(key)
+                dropped += "$key=$raw"
+            }
+        }
+        if (dropped.isNotEmpty()) {
+            com.ufi_axis_core.util.AppLogger.d(
+                "SignalCollector",
+                "丢弃越界信号值（固件/Telephony 异常）：${dropped.joinToString()}",
+            )
+        }
+    }
 
     // ── 第 1 层: Goform 独立字段 ──
     //
@@ -203,8 +245,11 @@ class SignalCollector(
                 val obj = cell.jsonObject
                 val pci = obj[DeviceFields.CellInfo.ITEM_PCI]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
                 val rsrp = obj[DeviceFields.CellInfo.ITEM_RSRP]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    ?.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRP, it) }
                 val rsrq = obj[DeviceFields.CellInfo.ITEM_RSRQ]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    ?.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRQ, it) }
                 val sinr = obj[DeviceFields.CellInfo.ITEM_SINR]?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+                    ?.takeIf { SignalSanity.isValid(DeviceFields.Signal.SINR, it) }
                 if (pci != null) NeighborCell(pci, rsrp, rsrq, sinr) else null
             } catch (_: Exception) { null }
         }

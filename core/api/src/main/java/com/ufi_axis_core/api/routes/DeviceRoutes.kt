@@ -208,6 +208,17 @@ class DeviceRoutes(
                     )
                     return@post
                 }
+                // 元素会被**原样拼进** URL 的 query：`["signalbar&multi_data=0"]` 能追加/覆盖
+                // 参数、改变设备侧的请求语义（2026-11-14 安全审查）。这里只允许设备命令字面量，
+                // 其余直接 400 —— 不做 URL 编码是因为逗号是分隔符，编码了会改变语义。
+                val illegal = cmds.firstOrNull { !it.matches(Regex("^[A-Za-z0-9_]+$")) }
+                if (illegal != null) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "cmd 只允许字母数字与下划线：${illegal.take(32)}"
+                    )
+                    return@post
+                }
                 AppLogger.w("DeviceRoutes", "goform/query 裸命令: ${cmds.joinToString(",")}")
                 val data = goformClient.read(cmds)
                 if (data == null) {
@@ -225,8 +236,15 @@ class DeviceRoutes(
             // 写成功后清空整个 ResponseCache：裸命令可能改任何东西，无法精确判断影响哪些 key。
             post("/goform/set") {
                 if (rejectIfCommandDisabled(call)) return@post
+                // 2026-10-30（审查 §2.4）：裸通道不过 WriteSpec 值域校验，写出半条配置最容易
+                // 把设备打进不可用态，而 OTA 正在写设备时叠加一次写就是双重半写。
+                if (call.rejectIfUpdating()) return@post
 
                 val body = call.receiveJsonObject()
+                // 主人密码门：裸写通道不过 WriteSpec 值域校验，一次写错 LAN/口令就能让设备
+                // 从网络上消失（只能物理重置）。放在解析 goformId 之前 —— 不授权时连字段都不该回显。
+                // [owner] POST /api/device/goform/set
+                if (!call.requireOwner(body.ownerPassword())) return@post
                 val goformId = body["goformId"]?.jsonPrimitive?.contentOrNull?.trim().orEmpty()
                 if (goformId.isEmpty()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "goformId is required")
@@ -404,6 +422,11 @@ class DeviceRoutes(
             post("/factory-reset") {
                 // 更新互斥（2026-10-05 R4-9 修复）：同 /reboot。
                 if (call.rejectIfUpdating()) return@post
+                // 主人密码门：全仓破坏力最大的一个端点（擦除设备全部配置）。
+                // 开关 `owner_gate_enabled` 关着时（默认）这里直接放行，判据在 OwnerGate 一处。
+                val body = runCatching { call.receiveJsonObject() }.getOrNull()
+                // [owner] POST /api/device/factory-reset
+                if (!call.requireOwner(body.ownerPassword())) return@post
                 cache?.invalidate("*")
                 val success = deviceHub.device.factoryReset()
                 call.respond(
@@ -438,8 +461,28 @@ class DeviceRoutes(
                 }
                 val success = deviceHub.device.changePassword(oldPwd, newPwd)
                 if (success) {
-                    // 同步更新后端本地存储的 goform 密码，使后续请求无需重启即可生效
-                    settings?.goformPassword = newPwd
+                    // 同步更新后端本地存储的 goform 密码，使后续请求无需重启即可生效。
+                    //
+                    // 2026-10-30（审查 §2.9）：顺序是「先改设备、再改本地」，而本地写失败
+                    // （prefs 只读 / 进程被杀 / 磁盘满）会让两边永久分叉 —— 设备用新口令、
+                    // core 用旧口令，之后所有 goform 请求 503，且设备侧**没有任何读回明文的路**。
+                    // 所以本地写必须判结果，失败就把设备口令改回去；回滚也失败时如实报错，
+                    // 不能回 success=true 让用户以为改成了。
+                    // 用同步写而不是 setter（setter 是 apply()，失败也返回 Unit —— 判不出来），
+                    // 否则下面这段回滚永远不会被触发，等于没写。
+                    val localOk = settings.setGoformPasswordBlocking(newPwd)
+                    if (!localOk) {
+                        AppLogger.w("DeviceRoutes", "本机 goform 口令写入失败，尝试回滚设备口令")
+                        val rolledBack = runCatching { deviceHub.device.changePassword(newPwd, oldPwd) }
+                            .getOrDefault(false)
+                        call.respondFail(
+                            HttpStatusCode.InternalServerError,
+                            ErrorCode.OPERATION_FAILED,
+                            if (rolledBack) "本机保存失败，已回滚设备口令，请重试"
+                            else "本机保存失败且设备口令回滚失败，请在设备后台核对口令"
+                        )
+                        return@post
+                    }
                     goformClient.updateGoformPassword(newPwd)
                     cache?.invalidate("device:*")
                 }
@@ -566,7 +609,26 @@ class DeviceRoutes(
                     }
                     return toJsonElement(map)
                 }
-                call.respond(if (cache != null) cache.getOrPut("device:settings", CacheTTL.DEVICE_SETTINGS) { f() } else f())
+                /*
+                 * `?fresh=1`：**绕开读缓存，直读设备**（2026-10-31）。
+                 *
+                 * 为什么必须有这个入口：`device:settings` 的 TTL 是 5 分钟，而写成功后 core
+                 * 只清一次缓存（`NetworkRoutes.invalidateAfterModeWrite`）。制式切换的回读确认
+                 * 第一次在 +600ms 发生，那时设备还在重新注册、报的**仍是旧档位** ——
+                 * 这份旧快照会被 `getOrPut` 缓存 5 分钟，后面 12 次轮询全读同一份，
+                 * 于是确认必然超时、界面停在旧制式最长 5 分钟，弹窗里的「重新读取」也无效。
+                 * 所以「写完之后要盯着设备变没变」的读必须能穿透这层缓存。
+                 *
+                 * 读到的新值**回填缓存**：否则穿透期间其它客户端的普通读仍拿旧快照，
+                 * 确认成功后界面会在下一轮轮询里被这份旧缓存弹回去。
+                 */
+                if (call.request.queryParameters["fresh"] == "1" || cache == null) {
+                    val fresh = f()
+                    if (cache != null) cache.put("device:settings", fresh, CacheTTL.DEVICE_SETTINGS)
+                    call.respond(fresh)
+                    return@get
+                }
+                call.respond(cache.getOrPut("device:settings", CacheTTL.DEVICE_SETTINGS) { f() })
             }
 
             // FOTA 自动升级开关。
@@ -672,6 +734,9 @@ class DeviceRoutes(
 
             // 设备关机
             post("/shutdown") {
+                // 2026-10-30（审查 §2.11）：补上更新互斥 —— 原先只有 reboot/factory-reset 有，
+                // 关机对 OTA 的破坏性同级（更新脚本可能在下次开机后继续，半写状态更难恢复）。
+                if (call.rejectIfUpdating()) return@post
                 cache?.invalidate("*")
                 // 走 systemController 而不是直连 deviceHub.device：goform 失败时要有
                 // `svc power shutdown` 兜底，与 /reboot 同口径

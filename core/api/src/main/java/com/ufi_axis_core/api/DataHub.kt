@@ -1,6 +1,7 @@
 package com.ufi_axis_core.api
 
 import com.ufi_axis_core.contract.Capability
+import com.ufi_axis_core.contract.CarrierNames
 import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.core.cache.CacheTTL
 import com.ufi_axis_core.core.cache.ResponseCache
@@ -131,6 +132,15 @@ class DataHub(
 
         /** 身份信息查询失败的负缓存时长：够短能自愈，够长能挡住 3s 轮询的重复打设备。 */
         private const val IDENTITY_NEGATIVE_TTL_MS = 30_000L
+
+        /**
+         * [getLivePppStatus] 的超时。
+         *
+         * 取 3s 而不是 5s：仪表盘的 `buildNetworkStatus` 整体只有 5s 预算（超时会让整段
+         * `network_status` 变 null、卡片全空），链路读必须给其余本地聚合留出余量。
+         * 超时返回 null，调用方退回 hub 快照 —— 不会因为这一次读慢就报错。
+         */
+        private const val PPP_STATUS_READ_TIMEOUT_MS = 3_000L
     }
 
 
@@ -165,6 +175,14 @@ class DataHub(
      * 【1.8】[GoformNetworkInfo.networkType] 现在是**已映射的可读文案**（`"5G"`），
      * 不再是设备侧的数字码 —— 映射发生在 profile 的 `NETWORK_TYPE_DECODER` 里。
      * 所以 route 层不要再翻译一次（原来那份 `GoformClient.mapNetworkType()` 已删）。
+     *
+     * ⚠ **不要再拿这里的 `pppStatus` 当「移动数据开关」**（2026-11-02 修）：它是链路态，
+     * 切制式/锁频后设备会先拆链再重拨，而 30s 的 TTL 会把那个"断"钉住 —— 这正是
+     * 「切完制式开关显示关闭、过一会自己变开」的根因。需要链路态请走 [getLivePppStatus]。
+     *
+     * 反过来，这个 key 里 `network_type` / `provider` 的 30s 是**刻意**的：它们变得慢，
+     * 且读一次要打一次 goform。缓存到空对象（查询超时）也无害 —— route 侧对空串有
+     * telephony 兜底。
      */
     suspend fun getNetworkTypeInfo(): GoformNetworkInfo {
         return responseCache.getOrPutAny("hub:network-type-info", 30_000L) {
@@ -179,9 +197,41 @@ class DataHub(
             fun pick(key: String) = canon?.get(key)?.jsonPrimitive?.contentOrNull ?: ""
             GoformNetworkInfo(
                 networkType = pick(DeviceFields.Connection.NETWORK_TYPE),
-                networkProvider = pick(DeviceFields.Connection.NETWORK_PROVIDER),
+                // 统一在 core 出口翻中文：App / Web / WS 共用同一份，避免 Web 显示 CMCC。
+                networkProvider = CarrierNames.displayName(pick(DeviceFields.Connection.NETWORK_PROVIDER)),
                 pppStatus = pick(DeviceFields.Connection.PPP_STATUS),
             )
+        }
+    }
+
+    /**
+     * 蜂窝链路态（`ppp_status` 原值）——**不吃 `hub:network-type-info` 的 30s 缓存**。
+     *
+     * 为什么不复用 [getNetworkTypeInfo]：那个 key 的 30s 是给 `network_type` / `provider` 用的，
+     * 但 `ppp_status` 是**链路态**，切换制式 / 锁频 / 关飞行模式后设备会先拆链再重拨，
+     * 十几到几十秒里它必然是断的。30s 的缓存会把这个瞬态钉住，客户端看到的就是
+     * 「移动数据明明是开的却显示关，过一会刷新才变回来」（2026-11-02 真机反馈）。
+     *
+     * 开销：这里直接调 `signalClient.getConnectionInfo()`，底层 `GoformQoS` 有 2s 传输层缓存，
+     * 而 `DataScheduler` 本来就在 1.5~4.5s 采一次同一份查询 —— 大多数调用会命中那份快照，
+     * 网内不会因此多出设备请求。
+     *
+     * @return 设备原值（可能是 `ipv4_ipv6_connected` 这类固件变体）；**null = 这次没读到**
+     *   （超时/异常/字段为空）。null 与 `ppp_disconnected` 必须分开：前者是"不知道"，
+     *   拿它当"断"会让一次查询超时变成一次假关闭。
+     */
+    suspend fun getLivePppStatus(): String? {
+        return try {
+            kotlinx.coroutines.withTimeoutOrNull(PPP_STATUS_READ_TIMEOUT_MS) {
+                signalClient.getConnectionInfo()?.values
+                    ?.get(DeviceFields.Connection.PPP_STATUS)
+                    ?.jsonPrimitive?.contentOrNull
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            AppLogger.w("DataHub", "读取 ppp_status 失败: ${e.message}")
+            null
         }
     }
 

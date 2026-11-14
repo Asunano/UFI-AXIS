@@ -4,22 +4,29 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import com.ufi_axis_core.collector.at.ATChannel
+import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.devicespi.adapter.BandSelection
 import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.SignalSource
 import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 
 /**
  * 网络控制器
  * 统一管理移动数据/WiFi/飞行模式/锁频/锁网
  *
  * @param network network 域的设备适配接口（2026-09-25 批 A2b 起）。
- * @param wifi wifi 域的设备适配接口（同上）。收的是**这两个域**而不是整个 `DeviceHub`：
- *   本类只用得到 network 的 3 个写方法（移动数据 + 两个频段锁定）与 wifi 的 2 个（SSID / 口令），
+ * @param wifi wifi 域的设备适配接口（同上）。收的是**按域收窄的接口**而不是整个 `DeviceHub`：
+ *   本类只用得到 network 的写方法（移动数据 / 制式 / 两个频段锁定）、wifi 的 2 个（SSID / 口令），
+ *   以及 signal 的 1 个只读方法（切制式前判"当时开没开数据"，2026-10-31 起）。
  *   递整个 hub 等于让它看见所有域，权限比需要的大（口径同批 A2a 的 `ActionExecutorImpl`）。
  */
 class NetworkController(
@@ -27,6 +34,14 @@ class NetworkController(
     private val atChannel: ATChannel,
     private val network: NetworkControl,
     private val wifi: WifiControl,
+    /**
+     * signal 域的**只读**接口（2026-10-31）。
+     *
+     * 本类只有一个用途：切换制式前读一次 `ppp_status`，判断「用户当时开没开移动数据」——
+     * 切完之后 ppp 一定是断的，那时再读已经读不出这个意图了（见 [setNetworkMode]）。
+     * 收的是一个只读域接口而不是整个 `DeviceHub`，口径同上。
+     */
+    private val signal: SignalSource,
     /**
      * 平台适配层（阶段 4 的 4.4）：网络栈重启「发哪几条命令」这份**设备知识**住在它那里。
      *
@@ -51,15 +66,29 @@ class NetworkController(
     private val stackRestartMutex = kotlinx.coroutines.sync.Mutex()
 
     /**
+     * 「移动数据开关」的用户意图（2026-11-02）。
+     *
+     * 设备侧**没有**可读的数据开关字段（真机 96 字段 dump 与厂商 UI 的 203 个字段名都核对过，
+     * 见 [MobileDataIntent] 的类注释），能读到的只有 `ppp_status` —— 那是链路态。
+     * 切制式/锁频后设备会先拆链再重拨，这期间链路必断，拿它当开关就会「明明是开的显示关」。
+     * 所以开关态由本类每一次成功的写操作记下来，读侧统一走 [resolveMobileDataSwitch]。
+     */
+    private val mobileDataIntent = MobileDataIntent()
+
+    /**
      * 开关移动数据
      * 优先使用 goform CONNECT_NETWORK/DISCONNECT_NETWORK（与参考项目一致）
      * 失败后 fallback 到 Shell
+     *
+     * 三条路径**只有成功的那个**才把意图记进 [mobileDataIntent]：设备拒了的那次不该让
+     * 界面上的开关跟着动。
      */
     suspend fun setMobileData(enabled: Boolean): Boolean {
         AppLogger.i(tag, "Setting mobile data: $enabled")
         // 方式1: Goform API（与参考项目 KanoUtils.kt 一致）
         if (network.setMobileData(enabled)) {
             AppLogger.i(tag, "Mobile data set via goform: $enabled")
+            mobileDataIntent.onExplicitWrite(enabled)
             return true
         }
         // 方式2: settings put global (fallback)
@@ -68,11 +97,119 @@ class NetworkController(
         if (settingsResult.isSuccess) {
             ShellExecutor.executeAsRoot("am broadcast -a android.intent.action.ANY_DATA_STATE --ez state $enabled")
             AppLogger.i(tag, "Mobile data set via settings: $enabled")
+            mobileDataIntent.onExplicitWrite(enabled)
             return true
         }
         // 方式3: svc 命令
         val command = if (enabled) "svc data enable" else "svc data disable"
-        return ShellExecutor.executeAsRoot(command).isSuccess
+        val success = ShellExecutor.executeAsRoot(command).isSuccess
+        if (success) mobileDataIntent.onExplicitWrite(enabled)
+        return success
+    }
+
+    /**
+     * 手动拨号（`POST /api/network/connect`）。
+     *
+     * 改前路由直接调 `network.connectNetwork()`，绕过了本类 —— 于是这条入口不更新
+     * [mobileDataIntent]，拨号成功要等下一轮链路读数才能把开关显示成开。
+     * 统一收进本类：所有改变「数据连不连」的写操作都必须经过同一个地方记意图。
+     */
+    suspend fun connectNetwork(): Boolean {
+        val success = network.connectNetwork()
+        if (success) mobileDataIntent.onExplicitWrite(true)
+        return success
+    }
+
+    /** 手动挂断（`POST /api/network/disconnect`）。理由同 [connectNetwork]。 */
+    suspend fun disconnectNetwork(): Boolean {
+        val success = network.disconnectNetwork()
+        if (success) mobileDataIntent.onExplicitWrite(false)
+        return success
+    }
+
+    /**
+     * 结合一次链路读数，给出「移动数据开关」该显示成什么。
+     *
+     * 读侧唯一入口：`/api/network/status` 与 `/api/dashboard/summary` 都调它，
+     * 别在路由里各写一份 `ppp_status` 判断。
+     *
+     * @param linkConnected 设备当前链路：true 通 / false 断 / null 读不到
+     * @return 开关态；null = 连意图都没有（刚启动且链路也读不到），调用方退回 shell 判断
+     */
+    fun resolveMobileDataSwitch(linkConnected: Boolean?): Boolean? =
+        mobileDataIntent.resolve(linkConnected)
+
+    /**
+     * 切换网络制式（**core 侧唯一实现**，2026-10-31）。
+     *
+     * ## 为什么这里要顺带恢复移动数据
+     *
+     * 设备事实：`SET_BEARER_PREFERENCE` 要让 modem 换一组 RAT 重新驻网，当前 PDP/PPP 必须拆掉；
+     * 真机上设备**不会自己重拨**（`connection_mode` 是 manual 时必然，auto 时也可能因为重注册
+     * 未完成而不拨）。表现就是用户看到的「切完制式，移动数据变成关，得手动再开一次」。
+     *
+     * 所以：**下发前**先读一次连接状态，**写成功后**按这个意图把数据连接恢复回去。
+     * 放在 controller 而不是各个客户端（web / app / 定时任务）：三条入口最终都走这里，
+     * 客户端各自补一份必然分叉（web 那份只覆盖 web，定时任务那份压根没有）。
+     *
+     * ## 三条边界
+     *
+     * 1. **只恢复"切换前是连着的"**：用户自己关掉的数据不能被我们打开（会直接产生流量费）。
+     *    读不到连接状态时同样**不做**恢复 —— 宁可少恢复一次，也不凭空开一次数据。
+     * 2. **恢复失败不影响返回值**：制式切换本身已经受理，不能因为"上网开关没恢复"把这次
+     *    写报成失败（客户端会去重试一次已经生效的制式切换）。
+     * 3. **两次尝试**：设备重注册期间第一条 `CONNECT_NETWORK` 可能不被接受，1.5s 后补一次。
+     *    单次阻塞 ≤ 约 3s（两次 goform 写 + 一次等待），调用方本来就带着进度弹窗等这次切换。
+     *
+     * @param mode contract 的 `NetworkMode` 别名（`/mode` 与 `/bearer` 的入参是同一套值域）。
+     */
+    suspend fun setNetworkMode(mode: String): WriteOutcome {
+        // 换制式必然拆链（PDP/PPP 要先拆掉再按新 RAT 驻网）：先开豁免窗口。
+        // 否则这十几到二十几秒里读取链路的每一次轮询都会把移动数据开关报成"关"。
+        mobileDataIntent.beginLinkTransition()
+        val wasConnected = readDataConnected()
+        val outcome = network.setBearerPreference(mode)
+        if (!outcome.ok || wasConnected != true) return outcome
+        restoreMobileDataAfterModeSwitch()
+        return outcome
+    }
+
+    /**
+     * 这次切换前移动数据是否连着。
+     *
+     * @return true / false；**null = 读不到**（"不知道"与"关着"必须分开：见 [setNetworkMode] 边界 1）
+     *
+     * 超时 3s：这次读只服务于"要不要恢复"，不能把用户点的那次切换拖在那里。
+     * 读的是 `ppp_status`（[DeviceFields.Connection.isPppConnected]）。
+     *
+     * 注意：**这里要的确实是链路态**，不是开关意图。2026-11-02 起 `/api/network/status` 的
+     * `mobile_data` 改成意图（[resolveMobileDataSwitch]），两者不再共用判据 —— 那次改动只影响
+     * 展示，不影响「切换前连没连上」这个判断。
+     */
+    private suspend fun readDataConnected(): Boolean? = try {
+        val fields = withTimeoutOrNull(CONNECTION_READ_TIMEOUT_MS) { signal.getConnectionInfo() }?.values
+        val ppp = (fields?.get(DeviceFields.Connection.PPP_STATUS) as? JsonPrimitive)?.contentOrNull
+        if (ppp == null) null else DeviceFields.Connection.isPppConnected(ppp)
+    } catch (e: Exception) {
+        AppLogger.w(tag, "读连接状态失败，本次切换不恢复移动数据: ${e.message}")
+        null
+    }
+
+    /**
+     * 切制式后把移动数据恢复回去（只在"切换前是连着的"时调用）。
+     *
+     * 判成功用 **写结果**（`CONNECT_NETWORK` 被设备接受）而不是"ppp 立刻连上"：
+     * 设备这时还在重新注册，ppp 起来本来就要十几秒；命令本身对已连接状态是幂等的。
+     */
+    private suspend fun restoreMobileDataAfterModeSwitch() {
+        repeat(MOBILE_DATA_RESTORE_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(MOBILE_DATA_RESTORE_RETRY_MS)
+            if (runCatching { setMobileData(true) }.getOrDefault(false)) {
+                AppLogger.i(tag, "制式切换后已恢复移动数据（第 ${attempt + 1} 次）")
+                return
+            }
+        }
+        AppLogger.w(tag, "制式切换已受理，但恢复移动数据失败（设备可能仍在重新注册）")
     }
 
     /**
@@ -107,7 +244,29 @@ class NetworkController(
     }
 
     /**
+     * 读飞行模式状态（settings global airplane_mode_on）。
+     *
+     * 2026-11-08 补齐：`/api/network/airplane` 之前**只有写、没有读**，前端只能提供
+     * 「开启 / 关闭」两个明确动作（见 useNetworkControls 的注释），做不了开关。
+     * 这里给 `/api/network/status` 提供读侧，前端才能用 n-switch 真实反映状态。
+     *
+     * 走 root shell 而不是 Settings.Global：与写入侧（`settings put`）同一条路径，
+     * 读到的值一定与写进去的一致；Settings.Global 在某些定制 ROM 上会被缓存。
+     */
+    suspend fun isAirplaneModeOn(): Boolean {
+        val r = ShellExecutor.executeAsRoot("settings get global airplane_mode_on")
+        return r.isSuccess && r.stdout.trim() == "1"
+    }
+
+    /**
      * 开关飞行模式
+     *
+     * 开飞行模式是一次**明确的切网动作**：设备会立刻拆掉蜂窝链路，而且不会自己恢复
+     * （直到用户把飞行模式关掉）。所以这里同步把开关意图置关 —— 否则 [MobileDataIntent]
+     * 的 2 分钟宽限期会让界面在飞行模式下继续显示「移动数据 已开启」。
+     *
+     * 关飞行模式**不动意图**：由链路自己决定（设备重拨上来 ⇒ 开；没重拨 ⇒ 保持关，
+     * 与改造前的表现一致）。
      */
     suspend fun setAirplaneMode(enabled: Boolean): Boolean {
         AppLogger.i(tag, "Setting airplane mode: $enabled")
@@ -116,6 +275,7 @@ class NetworkController(
             "settings put global airplane_mode_on $value && " +
             "am broadcast -a android.intent.action.AIRPLANE_MODE --ez state $enabled"
         )
+        if (result.isSuccess && enabled) mobileDataIntent.onExplicitWrite(false)
         return result.isSuccess
     }
 
@@ -253,6 +413,9 @@ class NetworkController(
      * 重启后额外 2s 等待 modem 完全稳定这一步在适配层里（它是设备事实）。
      */
     suspend fun restartNetworkStack(): Boolean = stackRestartMutex.withLock {
+        // 重启协议栈必然拆链（AT+SFUN=5 → 4）。与切制式同一口径：先记豁免窗口，
+        // 否则锁频那一路的十几秒断链又会被显示成"移动数据被关了"（2026-11-02）。
+        mobileDataIntent.beginLinkTransition()
         platform.restartNetworkStack { cmd -> atChannel.sendCommand(cmd, 5000) }
     }
 
@@ -272,6 +435,15 @@ class NetworkController(
         result["has_wifi"] = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
 
         return result
+    }
+
+    private companion object {
+        /** 切换前读连接状态的超时。只用于"要不要恢复数据"，不参与切换的成败。 */
+        const val CONNECTION_READ_TIMEOUT_MS = 3_000L
+
+        /** 恢复移动数据的尝试次数与间隔（设备重注册期间第一条可能不被接受）。 */
+        const val MOBILE_DATA_RESTORE_ATTEMPTS = 2
+        const val MOBILE_DATA_RESTORE_RETRY_MS = 1_500L
     }
 
 }

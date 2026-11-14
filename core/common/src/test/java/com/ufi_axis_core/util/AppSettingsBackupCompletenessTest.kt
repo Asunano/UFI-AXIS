@@ -57,6 +57,10 @@ class AppSettingsBackupCompletenessTest {
         "KEY_PAIRED_AT" to "配对时刻",
         "KEY_PAIRING_CODE" to "一次性配对码",
         "KEY_ARIA2_RPC_SECRET" to "本机运行凭据（还原过去会让正在跑的 aria2 立刻鉴权失败）",
+        // 程序商店 Gateway 的 cookie 签名密钥。搬到另一台设备上等于把「能合法进程序 Web UI 的
+        // cookie」一起搬过去；而它每台设备各生成一份，删掉/重生成只是让旧 cookie 立刻失效，
+        // 用户重新点一次「打开」即可 —— 没有任何需要跨设备保留的理由。
+        "KEY_PROGRAM_GATEWAY_SECRET" to "本机 cookie 签名密钥（设备各自生成，不应跨设备搬运）",
         "KEY_POETRY_TOKEN" to "上游身份，换设备应重新签发",
         "KEY_TUNNEL_CF_TOKEN" to "旧版全局 token 槽（已废弃，见 BACKUP_FIELDS 注释）",
         "KEY_LAST_SIG_FINGERPRINT" to "签名缓存（运行态）",

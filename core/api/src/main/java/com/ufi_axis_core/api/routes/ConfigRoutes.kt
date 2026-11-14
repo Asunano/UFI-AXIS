@@ -28,6 +28,19 @@ import kotlinx.serialization.json.*
 class ConfigRoutes(
     private val settings: AppSettings,
     /**
+     * 写入 `goform_password` 前的**验证式落盘**（2026-10-30 越权审查 §2.3）。
+     *
+     * 入参是新口令；实现方应「把新口令交给传输层 → 让它真的登录一次 → 失败则把传输层
+     * 恢复成旧口令」，返回值 = 设备是否接受这个口令。只有 true 时本类才把口令写进
+     * `AppSettings`。这样一次笔误不会把 core→设备的凭据写坏（写坏的表现是所有
+     * goform 请求 503，流量/信号/短信/仪表盘一起挂，且没有读回明文的路径）。
+     *
+     * 可空是为了不破坏既有构造点（`ConfigRoutes(settings)` 的单测与局部装配）：
+     * 为空时按旧行为直接落盘，但会打一条 WARN —— 生产装配由 `ComponentFactory` 注入，
+     * 由装配守卫测试守着。
+     */
+    private val verifyGoformPassword: (suspend (String) -> Boolean)? = null,
+    /**
      * 短信拦截相关开关变更后的生效钩子（重载 `SmsRuleStore` 的内存快照）。
      *
      * 必须有：判定读的是 `@Volatile` 快照而不是 prefs，只写 `AppSettings` 等于
@@ -64,6 +77,32 @@ class ConfigRoutes(
                 val body = call.receiveJsonObject()
                 val updated = mutableListOf<String>()
                 val rejected = mutableListOf<Map<String, Any?>>()
+
+                // 条件性主人密码门（2026-11-14 门禁审计补回，旧版见 10a2f14:ConfigRoutes.kt:98-121）。
+                //
+                // 两类改动要密码，**且只在值真的变了时才要** —— 整份配置回写不会被误判，
+                // 设置页日常保存不受影响：
+                // · 「重指向」：`goform_ip` / `goform_port` 改完，core 会把**已存好的设备口令**
+                //   发到那个地址。任何配对客户端都能把地址指到自己的服务器，再触发一次读请求，
+                //   就把设备口令拿走了 —— 这条比「改错 IP 设备失联」严重得多。
+                //   `update_url` 是整个 FOTA / 组件 / Web 更新链的根 URL，改它等于换供应链入口。
+                // · 「打开危险开关」：`goform_command_enabled`（裸写通道）与 `ttyd_enabled`（真 PTY），
+                //   两者默认关，打开等于把「执行代码」的口子重新开出来。
+                val reqText = { f: String -> (body[f] as? JsonPrimitive)?.contentOrNull }
+                val reqBool = { f: String -> (body[f] as? JsonPrimitive)?.booleanOrNull }
+                val turningOnDangerous = listOf(
+                    "goform_command_enabled" to settings.goformCommandEnabled,
+                    "ttyd_enabled" to settings.ttydEnabled,
+                ).any { (field, current) -> !current && reqBool(field) == true }
+                val repointing =
+                    reqText("goform_ip")?.let { it != settings.goformIp } == true ||
+                        reqText("goform_port")?.toIntOrNull()
+                            ?.let { it != settings.goformPort } == true ||
+                        reqText("update_url")?.let { it != settings.updateUrl } == true
+                // [owner] PUT /api/config（条件门：重指向 / 打开危险开关时才要密码）
+                if ((turningOnDangerous || repointing) && !call.requireOwner(body.ownerPassword())) {
+                    return@put
+                }
 
                 fun reject(field: String, reason: String, range: IntRange? = null) {
                     rejected.add(buildMap {
@@ -107,30 +146,6 @@ class ConfigRoutes(
                     updated.add(field)
                 }
 
-                /** 密钥类字符串：空串与脱敏值都拒绝（脱敏回写会覆盖真实密钥）。 */
-                fun secretField(field: String, apply: (String) -> Unit) {
-                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
-                    when {
-                        v.isBlank() -> reject(field, ErrorCode.BLANK_VALUE)
-                        isMaskedValue(v) -> reject(field, ErrorCode.MASKED_VALUE)
-                        else -> {
-                            apply(v)
-                            updated.add(field)
-                        }
-                    }
-                }
-
-                /** 非空字符串字段。 */
-                fun textField(field: String, apply: (String) -> Unit) {
-                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
-                    if (v.isBlank()) {
-                        reject(field, ErrorCode.BLANK_VALUE)
-                    } else {
-                        apply(v)
-                        updated.add(field)
-                    }
-                }
-
                 fun boolField(field: String, apply: (Boolean) -> Unit) {
                     val raw = body[field] ?: return
                     if (raw is JsonNull) return
@@ -144,7 +159,47 @@ class ConfigRoutes(
                 }
 
 
-                secretField("goform_password") { settings.goformPassword = it }
+                // 2026-10-30（越权审查 §2.3）：goform_password 改为**验证式写入**。
+                //
+                // 原先这里是裸 `secretField` 落盘：一次只改日志级别的批量 PUT 里夹带一个错值，
+                // 就把 core→设备的口令写坏，整条 goform 链路随后 503（流量/信号/短信/仪表盘
+                // 一起挂），且没有任何回滚路径。
+                //
+                // 为什么不是"直接禁止"：Web 设置页（`GeneralPanel.vue:182`）与配对改密
+                // （`PairingRoutes` 的 change-password 走另一条路）都用这个键 —— 直接拒会让
+                // 现有页面保存失败。所以保留入口，但**先让设备认证一次**：老口令错了/新口令不对，
+                // 设备会拒绝登录，这里回 `rejected_fields` 且不落盘。
+                //
+                // 三条与旧实现一致的值域判据（空串 / 脱敏值回写），保留原错误码，
+                // 客户端不必改解析逻辑。
+                val candidate = (body["goform_password"] as? JsonPrimitive)?.contentOrNull
+                if (candidate != null) {
+                    when {
+                        candidate.isBlank() -> reject("goform_password", ErrorCode.BLANK_VALUE)
+                        candidate.contains("***") -> reject("goform_password", ErrorCode.MASKED_VALUE)
+                        else -> {
+                            // 局部 val 而不是直接读构造参数：`if (verifier != null)` 之后
+                            // Kotlin 才会把它智能转换成非空函数类型，`when` 的多分支条件
+                            // 之间不做智能转换。
+                            val verifier = verifyGoformPassword
+                            if (verifier == null) {
+                                AppLogger.w(
+                                    "ConfigRoutes",
+                                    "未装配 goform 口令探活，直接落盘（仅测试/局部装配；生产必须由 ComponentFactory 注入）"
+                                )
+                                settings.goformPassword = candidate
+                                updated.add("goform_password")
+                            } else if (runCatching { verifier(candidate) }.getOrDefault(false)) {
+                                settings.goformPassword = candidate
+                                updated.add("goform_password")
+                            } else {
+                                // 设备不认这个口令（打错 / 设备已被别处改过）：
+                                // 不落盘，并让客户端看到具体原因而不是"保存成功但权限全丢了"。
+                                reject("goform_password", ErrorCode.INVALID_GOFORM_CONFIG)
+                            }
+                        }
+                    }
+                }
 
                 intField("port", ConfigLimits.PORT) { settings.port = it }
                 intField("goform_port", ConfigLimits.GOFORM_PORT) { settings.goformPort = it }
@@ -208,6 +263,9 @@ class ConfigRoutes(
                 // 真 PTY 终端开关（ttyd 反代，默认关；关闭时 /api/terminal/pty-ticket 403）。
                 // 与 goform_command_enabled 同档位：打开等于把设备 shell 交给持 token 的客户端。
                 boolField("ttyd_enabled") { settings.ttydEnabled = it }
+                // 远程屏幕开关（2026-10-31，默认关）。关着时 /api/screen/* 全 403，
+                // 且已有会话的 WS 会在下一次握手被拒（不在跑的会话不会被主动 kill）。
+                boolField("screen_enabled") { settings.screenEnabled = it }
                 // 字段归一化总开关（决策 D7 的排障回退开关，默认开）。2026-09-22 补上写入口：
                 // 之前只有 KEY + 属性 + BACKUP_FIELDS，PUT 没登记、toMap() 也没登记，
                 // 结果只有「导入备份」改得动 —— web/app 做不出真开关。
@@ -327,29 +385,63 @@ class ConfigRoutes(
             /**
              * 恢复默认配置。
              *
-             * **需要配对密码**（设备已设过密码时）。原实现只要求「已配对身份」，
-             * 而它调的 `resetAll()` 当时会清掉密码哈希 —— 一台借出去用过、配对记录还没删的
-             * 旧手机就能远程把设备打回可接管的出厂态。同一份代码里语义更轻的 `unpair` /
-             * `removeDevice` 都要密码，这里没有理由更松。
-             *
-             * `resetAll()` 现在也不再清除身份与凭据键（见 `AppSettings.PRESERVED_ON_RESET`），
-             * 两道改动是互补的：一道防越权触发，一道限制影响范围。
+             * 0.1.0 起这里就要配对密码；本版把判定统一收到 `OwnerGate`（同一套节流与锁定），
+             * 由 `owner_gate_enabled` 开关决定是否需要 —— 默认关，关着时只要求「已配对身份」。
+             * 身份与凭据键不会被清掉（见 `AppSettings.PRESERVED_ON_RESET`），
+             * 所以即使全量重置也不会把设备打回可接管的出厂态。
              */
             post("/reset") {
                 val body = runCatching { call.receiveJsonObject() }.getOrNull()
-                val password = body?.get("password")?.jsonPrimitive?.contentOrNull ?: ""
-                if (settings.devicePasswordSet && !settings.verifyDevicePassword(password)) {
+                // [owner] POST /api/config/reset
+                if (!call.requireOwner(body.ownerPassword())) return@post
+                // 2026-10-30（审查 §2.5）：支持按域重置。
+                //
+                // 不传 `scopes` → 全量（与旧行为逐字一致，旧客户端不改代码也能跑）。
+                // 传了 → 只清这几个域，并在响应里回 `cleared_scopes` / `kept_scopes`，
+                // 让客户端能在确认框里如实写"会丢什么"。
+                // 在此之前这里只会清全量，而用户看到的是一句"已恢复默认配置"——
+                // 通知令牌、媒体扫描目录、隧道看护设置被一起清掉却毫不知情。
+                val known = settings.resetScopeNames()
+                val requested: List<String>? = (body?.get("scopes") as? JsonArray)
+                    ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull?.trim() }
+                    ?.filter { it.isNotEmpty() }
+                if (requested == null) {
+                    settings.resetAll()
+                    call.respond(toJsonElement(mapOf(
+                        "success" to true,
+                        "scope" to "all",
+                        "cleared_scopes" to known.sorted(),
+                        "kept_scopes" to emptyList<String>(),
+                        "message" to "已恢复默认配置（配对信息与配对密码保持不变），需重启服务生效"
+                    )))
+                    return@post
+                }
+
+                val unknown = requested.filterNot { it in known }
+                if (unknown.isNotEmpty()) {
                     call.respondFail(
-                        HttpStatusCode.Unauthorized,
-                        ErrorCode.INVALID_PASSWORD,
-                        "配对密码错误，无法恢复默认配置"
+                        HttpStatusCode.BadRequest,
+                        ErrorCode.BAD_REQUEST,
+                        "未知的配置域：${unknown.joinToString("、")}（可用：${known.sorted().joinToString("、")}）"
                     )
                     return@post
                 }
-                settings.resetAll()
+                if (requested.isEmpty()) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest,
+                        ErrorCode.BAD_REQUEST,
+                        "scopes 不能是空数组；要恢复全部配置请省略该参数"
+                    )
+                    return@post
+                }
+
+                settings.resetScopes(requested.toSet())
                 call.respond(toJsonElement(mapOf(
                     "success" to true,
-                    "message" to "已恢复默认配置（配对信息与配对密码保持不变），需重启服务生效"
+                    "scope" to "partial",
+                    "cleared_scopes" to requested.sorted(),
+                    "kept_scopes" to known.filterNot { it in requested }.sorted(),
+                    "message" to "已恢复所选的 ${requested.size} 个配置域（配对信息与配对密码保持不变），需重启服务生效"
                 )))
             }
         }
@@ -365,21 +457,24 @@ class ConfigRoutes(
      *
      * 客户端侧不依赖具体掩码串：web 的 GeneralPanel 读回后**无条件**把密码框清成空串
      * （web/src/views/settings/panels/GeneralPanel.vue:184-187），app 只判 isNotBlank
-     * 当作「已设置」（ToolsModule:1080）；「不许回写脱敏值」的识别在 core 自己的
-     * [isMaskedValue]（含 3 个以上连续星号），所以固定掩码必须保留 `***` 特征。
+     * 当作「已设置」（ToolsModule:1080）。掩码串固定为 8 个星号，保留 `***` 特征只是为了
+     * 让任何"看起来像掩码"的值一眼可辨。
+     *
+     * 2026-10-30（审查 §2.3）：`PUT /api/config` 对 `goform_password` 改成**验证式写入**
+     * （先让设备用新口令登录一次，成功才落盘，见构造参数 `verifyGoformPassword`），
+     * 所以「把掩码回写」依然要拦 —— 它必然登录失败，但提前判掉能给出更准确的原因
+     * （`MASKED_VALUE` 而不是 `INVALID_GOFORM_CONFIG`）。
      */
     private fun maskSecret(secret: String): String =
         if (secret.isEmpty()) "" else MASK_PLACEHOLDER
 
-    /**
-     * 检测值是否为脱敏占位符（含 3+ 连续星号），
-     * 防止前端将 GET 返回的脱敏值回写覆盖真实密钥
-     */
-    private fun isMaskedValue(value: String): Boolean =
-        value.contains("***")
-
     private companion object {
-        /** 定长脱敏占位符。含 `***`，因此回写时会被 [isMaskedValue] 拦下。 */
+        /**
+         * 定长脱敏占位符（8 个星号）。
+         *
+         * 定长 + 含 `***` 是刻意的：长度不泄漏真实口令长度，`***` 让任何"看起来像掩码"
+         * 的值一眼可辨（客户端据此避免把掩码当成真实值提交）。
+         */
         const val MASK_PLACEHOLDER = "********"
     }
 }

@@ -65,6 +65,11 @@ class TaskRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Command is required for custom_shell action")
                     return@post
                 }
+                // 主人密码门：`custom_shell` 是 root shell 的**第二入口** —— 只在 /api/shell/exec
+                // 上要密码而这里不要，等于「建个任务」就能拿到同样的 root shell。
+                // 密码在**创建时**校验、不落库：定时执行时没有人在场可问。
+                // [owner] POST /api/tasks
+                if (actionType in OWNER_GATED_TASK_TYPES && !call.requireOwner(p.ownerPassword())) return@post
 
                 val task = ScheduledTask(
                     name = p["name"]?.jsonPrimitive?.contentOrNull ?: "",
@@ -114,6 +119,10 @@ class TaskRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "Command is required for custom_shell action")
                     return@put
                 }
+                // 主人密码门：改一条 custom_shell 任务等于改「将来要执行的 root 命令」，
+                // 判据与创建时一致（actionType 缺省时已回落到 existing.actionType）。
+                // [owner] PUT /api/tasks/{id}
+                if (actionType in OWNER_GATED_TASK_TYPES && !call.requireOwner(p.ownerPassword())) return@put
 
                 val updated = existing.copy(
                     name = p["name"]?.jsonPrimitive?.contentOrNull ?: existing.name,
@@ -180,6 +189,10 @@ class TaskRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_ACTION_TYPE, "Invalid action type: $actionType")
                     return@post
                 }
+                // 主人密码门：自动化规则与定时任务是同一个执行器，custom_shell 同样是 root shell，
+                // 门槛必须一致（见 /tasks 的说明）。
+                // [owner] POST /api/rules
+                if (actionType in OWNER_GATED_TASK_TYPES && !call.requireOwner(p.ownerPassword())) return@post
                 val triggerParams = p["triggerParams"]?.jsonObject?.mapValues { it.value.jsonPrimitive } ?: emptyMap()
                 val params = p["params"]?.jsonObject?.mapValues { it.value.jsonPrimitive } ?: emptyMap()
                 val cooldownMs = p["cooldownMs"]?.jsonPrimitive?.longOrNull ?: 60_000L
@@ -211,6 +224,8 @@ class TaskRoutes(
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.INVALID_ACTION_TYPE, "Invalid action type: $actionType")
                     return@put
                 }
+                // [owner] PUT /api/rules/{id}
+                if (actionType in OWNER_GATED_TASK_TYPES && !call.requireOwner(p.ownerPassword())) return@put
                 val triggerParams = p["triggerParams"]?.jsonObject?.mapValues { it.value.jsonPrimitive } ?: existing.triggerParams
                 val params = p["params"]?.jsonObject?.mapValues { it.value.jsonPrimitive } ?: existing.params
                 val cooldownMs = p["cooldownMs"]?.jsonPrimitive?.longOrNull ?: existing.cooldownMs
@@ -243,3 +258,12 @@ class TaskRoutes(
         }
     }
 }
+
+/**
+ * 建/改这些类型的定时任务要主人密码。
+ *
+ * 判据不是"这个类型危不危险"，而是**它能不能绕过别处已经登记的门**：
+ * `custom_shell` 绕过 `POST /api/shell/exec`，`remote_backup` 绕过 `POST /api/backup/export`
+ * （后者同样能拿到整包配置，只是"什么时候发"更隐蔽）。
+ */
+private val OWNER_GATED_TASK_TYPES = setOf("custom_shell", "remote_backup")

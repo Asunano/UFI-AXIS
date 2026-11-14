@@ -193,8 +193,21 @@ class DashboardRoutes(
     private suspend fun buildNetworkStatus(hubInfo: GoformNetworkInfo?): JsonElement {
         val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
         val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }
-        val mobileDataEnabled = if (hubInfo != null) hubInfo.isPppConnected
-            else telephonyCollector?.isMobileDataEnabled() ?: false
+        // 链路态单读，不吃 hubInfo 的 30s 快照（2026-11-02）：ppp_status 是链路，不是开关态。
+        // 仪表盘卡片上的「移动数据」开关与网络页共用同一份判定（NetworkController 的意图状态机），
+        // 否则两个页面在切制式的窗口里会一个开一个关。
+        val livePpp = try {
+            dataHub?.getLivePppStatus()
+        } catch (e: Exception) {
+            AppLogger.w("DashboardRoutes", "读取 ppp_status 失败: ${e.message}")
+            null
+        }
+        val pppStatus = livePpp ?: hubInfo?.pppStatus ?: ""
+        // 空串 = 这次没读到，不能当"断"
+        val linkConnected = pppStatus.takeIf { it.isNotBlank() }
+            ?.let { DeviceFields.Connection.isPppConnected(it) }
+        val mobileDataEnabled = networkController?.resolveMobileDataSwitch(linkConnected)
+            ?: telephonyCollector?.isMobileDataEnabled() ?: false
         return toJsonElement(mapOf(
             "network" to (networkController?.getNetworkStatus() ?: mapOf(
                 "is_connected" to false, "has_internet" to false,
@@ -203,8 +216,11 @@ class DashboardRoutes(
             "mobile_data" to mobileDataEnabled,
             // 输出键沿用 canonical 名（`DeviceFields.Connection`），值已在 core 侧统一：
             // `network_type` 是可读文案，不是设备数字码。
-            DeviceFields.Connection.PPP_STATUS to (hubInfo?.pppStatus ?: ""),
+            DeviceFields.Connection.PPP_STATUS to pppStatus,
             "operator" to (goformProvider ?: telephonyCollector?.getOperatorName() ?: ""),
+            // 2026-11-08：飞行模式读侧。与 /api/network/status 同一份实现，
+            // 否则网络页读 summary 时开关永远显示「关」。
+            "airplane" to (networkController?.isAirplaneModeOn() ?: false),
             DeviceFields.Connection.NETWORK_TYPE to (goformType ?: telephonyCollector?.getNetworkType() ?: "")
         ))
     }

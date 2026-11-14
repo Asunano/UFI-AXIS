@@ -23,25 +23,25 @@ import kotlinx.serialization.json.JsonPrimitive
 /**
  * ZTE goform 系设备（F50 等）的字段映射。
  *
- * ## 怎么加一个字段（照抄即可）
+ * ## 新增字段的步骤
  *
  * ```kotlin
  * fieldOf(DeviceFields.DeviceSettings.FOO, FieldGroup.DEVICE_SETTINGS, "设备侧原名"),
- * // 有多个固件叫法不同时按优先级列出：
+ * // 多个固件叫法不同时按优先级列出：
  * fieldOf(DeviceFields.Signal.RSRP, FieldGroup.SIGNAL, "nr_rsrp", "Z5g_rsrp", "lte_rsrp"),
  * // 值需要变换时挂 decode（只做必须做的变换，见 Decoders 的 KDoc）：
  * fieldOf(DeviceFields.LanSettings.MTU, FieldGroup.LAN_SETTINGS, "mtu", decode = Decoders.NUMERIC),
  * ```
  *
- * 然后：① 若属于新分组，把 cmd 名加进 [cmdsFor]；② `DeviceFields.kt` 加常量；
- * ③ `web/src/api/contract.ts` 加镜像常量（校验器会比对两侧）；④ 补一条断言。
- * **route 不用改。**
+ * 随后：① 若属于新分组，把 cmd 名加入 [cmdsFor]；② 在 `DeviceFields.kt` 增加常量；
+ * ③ 在 `web/src/api/contract.ts` 增加镜像常量（校验器会比对两侧）；④ 补充一条断言。
+ * route 无需改动。
  *
  * ## 硬性约定
  *
- * - `canonical` 必须写 `DeviceFields.*` 常量，不写字面量。
- * - 设备侧原名只允许出现在本文件（守门脚本会扫 route 里的字段字面量）。
- * - 设备没有的字段就**不登记**，归一化会省略该 key；不要编一个假的 source。
+ * - `canonical` 必须使用 `DeviceFields.*` 常量，不得写字面量。
+ * - 设备侧原名只允许出现在本文件（守门脚本会扫描 route 中的字段字面量）。
+ * - 设备没有的字段不登记，归一化会省略该 key；不得编造 source。
  */
 object ZteGoformProfile : DeviceProfile {
 
@@ -51,23 +51,22 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * 网络类型数字码 → 可读文案。
      *
-     * **同一个字段名在不同命令里有两种编码，必须都认**：状态类命令直接回文本（真机 2026-09-15
-     * 实测 `cmd=network_type,...` 回 `"5G"`），`network_information` 容器里回数字码。
-     * 所以只有纯数字才查表，非数字原样透出——早期无条件查表导致过「明明返回 5G 却显示 未知(5G)」。
+     * 同一字段名在不同命令中有两种编码，必须都支持：状态类命令直接返回文本
+     * （`cmd=network_type,...` 返回 `"5G"`），`network_information` 容器内返回数字码。
+     * 因此仅对纯数字查表，非数字原样透出；若无条件查表，会把文本形式的 `5G` 误译为「未知(5G)」。
      * 见 [NETWORK_TYPE_DECODER]。
      *
-     * ## 这张表为什么这么短（2026-09-15 修）
+     * ## 该表只保留有依据的项
      *
-     * 原表有 44 项，是从多套厂商编码拼起来的（`8/9` = LTE(FDD)/LTE(TDD)、`12` = LTE、
-     * `13` = TDSCDMA、`14/15` = TDD/FDD LTE、`16..22` 全是 5G 变体、`40..44` 又一套）。
-     * 真机上它把 4G/5G 报的 `13` 译成了 **TDSCDMA**，App 与 Web 都原样上屏 ——
-     * 因为客户端按契约不再做二次映射（`docs/UFI-AXIS-Core-API-Reference.md` 的
-     * 「客户端不要再做一次数字码→文案的映射」）。
+     * 完整厂商编码表包含 44 项（`8/9` = LTE(FDD)/LTE(TDD)、`12` = LTE、`13` = TDSCDMA、
+     * `14/15` = TDD/FDD LTE、`16..22` 为 5G 变体、`40..44` 为另一套编码）。按整表映射时，
+     * 真机上 4G/5G 上报的 `13` 被译为 TDSCDMA，App 与 Web 原样显示 ——
+     * 客户端按契约不再做二次映射（见 `docs/UFI-AXIS-Core-API-Reference.md` 中关于
+     * 数字码→文案映射的说明）。
      *
-     * 现在只保留**有依据的**几项（依据同一份文档记录的真机对应关系：
-     * `20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G）。**不再猜**：没登记的数字码由
-     * [NETWORK_TYPE_DECODER] 输出 `未知(原值)`，在界面上一眼能看见、在响应里能直接取证，
-     * 补一项只需要一次真机对照。把没验证过的编码写进表里的代价，就是这次的 TDSCDMA。
+     * 现仅保留有文档依据的项（`20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G）。
+     * 未登记的数字码由 [NETWORK_TYPE_DECODER] 输出 `未知(原值)`，界面可直接看到、响应中可取证；
+     * 补充一项只需一次真机对照。把未验证的编码写入表内会再次产生上述误译。
      */
     private val NETWORK_TYPE_MAP: Map<String, String> = mapOf(
         "0" to "无服务",
@@ -79,50 +78,73 @@ object ZteGoformProfile : DeviceProfile {
     )
 
     /**
-     * `network_type` 的解码器，语义与 `GoformClient.mapNetworkType` 一致：
-     * 空 → 视为字段缺失（省略 key）· 纯数字 → 查表，查不到给 `未知(原值)` · 非数字 → 原样透出。
+     * 非数字的 RAT 别名 → 可读文案。
      *
-     * 空值这里返回 null（而不是 `"未知"`），因为原实现用的是 `goformStr()`——空字符串被当成
-     * 没这个字段，压根不会写进结果。保持一致，否则前端会看到一个凭空出现的"未知"。
+     * 设备侧会把 NSA 组网报成 `ENDC` / `EN-DC` / `NSA`（E-UTRAN New Radio Dual
+     * Connectivity）：它是 LTE 锚点 + 5G NR 的双连接，不是独立制式。App 在
+     * `HomeConnectionCard.mapRat` 中已做这层映射，但 Web 读取的是 core 的 `network_type`
+     * 原值，页面上会直接显示 "ENDC"。此处把同一张表下沉到 core，App 与 Web 不必各自再译。
+     *
+     * 只做别名归一化，不做数字码→文案（后者是 [NETWORK_TYPE_MAP] 的职责）。表内没有的
+     * 值原样返回：不猜测、不丢弃，界面可直接看到，补充一项只需一次真机对照。
+     */
+    private fun normalizeRatLabel(raw: String): String = when (raw.trim().lowercase()) {
+        "nr", "5g", "sa" -> "5G"
+        // NSA 双连接：EN-DC / ENDC / NSA 都是 LTE 锚点 + NR，统一显示 "5G NSA"
+        "nsa", "endc", "en-dc", "en_dc", "nr-nsa", "nr_nsa" -> "5G NSA"
+        "lte", "4g" -> "4G"
+        "wcdma", "umts", "hspa", "hsdpa" -> "3G"
+        "gprs", "edge", "2g" -> "2G"
+        else -> raw.trim()
+    }
+
+    /**
+     * `network_type` 的解码器：
+     * 空 → 视为字段缺失（省略 key）· 纯数字 → 查表，查不到给 `未知(原值)`
+     * · 非数字 → RAT 别名归一化（未知值原样透出，见 [normalizeRatLabel]）。
+     *
+     * 空值此处返回 null（而不是 `"未知"`）：空字符串必须视为字段不存在，
+     * 否则前端会出现凭空产生的「未知」。
      */
     private val NETWORK_TYPE_DECODER: (JsonElement) -> JsonElement? = Decoders.ofString { raw ->
         val s = raw.trim()
         when {
             s.isEmpty() -> null
             s.all { it.isDigit() } -> NETWORK_TYPE_MAP[s] ?: "未知($s)"
-            else -> s
+            else -> normalizeRatLabel(s)
         }
     }
 
     /**
-     * WiFi 密码解码器：base64 解出字节后 **先试 UTF-8，UTF-8 不合法才回落 GBK**。
+     * WiFi 密码解码器：base64 解码后优先按 UTF-8 解析，UTF-8 非法时才回落 GBK。
      *
-     * 放这里而不是留在 `DataHub`：编码方式是设备特性，换一款设备就换一套。
-     * 解不开或解出空串时返回 null（= 省略 key）；原实现返回 `""`，客户端两边都写
-     * `?? ''` / `?: ""`，省略更符合"缺失即省略"的契约。
+     * 放在此处而不留在 `DataHub`：编码方式属于设备特性，换一款设备即换一套。
+     * 无法解码或解出空串时返回 null（= 省略 key）：客户端两侧均以 `?? ''` / `?: ""` 兜底空值，
+     * 省略更符合「缺失即省略」的契约。
      *
-     * ## 为什么 2026-09-22 把"只用 GBK"改成"UTF-8 优先"
+     * ## 为什么以 UTF-8 优先
      *
-     * 写侧是 **UTF-8**（[base64Utf8] 与 `GoformClient.base64Encode` 都是），读侧却只用 GBK
-     * —— 这个不对称会在「读回当前口令 → 原样 base64 编码写回」这条路径上把非 ASCII 口令改坏
-     * （`GoformWifiClient.setWifiSSID` / `setWifiConfig` 走的就是这条路）。四种情形：
+     * 写侧使用 UTF-8（[base64Utf8] 与 `GoformClient.base64Encode`），若读侧只用 GBK，
+     * 该不对称会在「读回当前口令 → 原样 base64 编码写回」这条路径上损坏非 ASCII 口令
+     * （`GoformWifiClient.setWifiSSID` / `setWifiConfig` 走的就是这条路径）。四种情形：
      * - ASCII 口令：两种字符集结果一致，无影响；
-     * - 设备存 UTF-8：修好了（原来会被 GBK 解成乱码）；
-     * - 设备存 GBK（老固件）：UTF-8 解不合法 → 回落 GBK → **与改动前逐字一致**；
-     * - 两者都解不出可读文本：仍然走 GBK 那一支（GBK 解码用替换字符，不抛异常），语义不变。
+     * - 设备存 UTF-8：解码正确（若按 GBK 解会得到乱码）；
+     * - 设备存 GBK（旧固件）：UTF-8 解码非法 → 回落 GBK，结果与仅按 GBK 解码时一致；
+     * - 两者都无法解出可读文本：仍走 GBK 分支（GBK 解码使用替换字符，不抛异常），语义不变。
      *
-     * ## 判据是"能否无损往返"，不是"有没有替换字符"
+     * ## 判据是「能否无损往返」，不是「是否含替换字符」
      *
-     * 判 `String(bytes, UTF_8).toByteArray(UTF_8) == bytes`：合法 UTF-8 往返后字节完全相同，
-     * 非法序列会被换成 U+FFFD（编码回去是 `EF BF BD`）从而不相等。用"结果里有没有 U+FFFD"
-     * 当判据是错的 —— 口令本身就可以包含这个字符，那样会把合法口令误判成非法。
+     * 判据为 `String(bytes, UTF_8).toByteArray(UTF_8) == bytes`：合法 UTF-8 往返后字节完全相同，
+     * 非法序列会被替换为 U+FFFD（编码回去是 `EF BF BD`），从而不相等。
+     * 以「结果中是否含 U+FFFD」为判据是错误的 —— 口令本身可以包含该字符，
+     * 那样会把合法口令误判为非法。
      *
-     * **GBK 双字节偶有恰好是合法 UTF-8 序列的可能，这是刻意接受的权衡：先 UTF-8 是因为写侧是
-     * UTF-8，保证「读回再写回」无损优先于兼容一个尚未观测到的边缘固件。**
+     * GBK 双字节序列偶有可能恰好构成合法 UTF-8 序列，这是刻意接受的权衡：写侧为 UTF-8，
+     * 因此「读回再写回无损」优先于兼容一个尚未观测到的边缘固件。
      *
-     * ⚠ 另一份同类实现在 `GoformClient.base64Decode`（读侧），**两者的判据必须一致**
-     * （P2 同轮修）。两份判据不一致时，`/api/wifi/settings` 读出来的口令和写回去的口令会不同，
-     * 而且没有任何测试能同时看见两边。
+     * ⚠ 另一份同类实现位于 `GoformClient.base64Decode`（读侧），两者的判据必须一致。
+     * 判据不一致时，`/api/wifi/settings` 读出的口令与写回的口令会不同，
+     * 且没有任何测试能同时观察两侧。
      */
     private val WIFI_PASSWORD_DECODER: (JsonElement) -> JsonElement? = Decoders.ofString { raw ->
         if (raw.isBlank()) return@ofString null
@@ -130,7 +152,7 @@ object ZteGoformProfile : DeviceProfile {
             java.util.Base64.getDecoder().decode(raw)
         } catch (_: Exception) {
             // 不是合法 base64：保持现有语义，返回 null（省略 key）。
-            // **不要**改成返回空串 —— 空串会被下游当成"口令为空"，那是另一件事。
+            // 不得改为返回空串 —— 空串会被下游视为「口令为空」，语义不同。
             return@ofString null
         }
         decodeWifiPassword(bytes).takeIf { it.isNotBlank() }
@@ -217,8 +239,8 @@ object ZteGoformProfile : DeviceProfile {
             "dhcpEnd", "DhcpEndIP", "dhcp_end", "end_ip", decode = Decoders.NON_BLANK))
         add(fieldOf(DeviceFields.LanSettings.DHCP_LEASE, FieldGroup.LAN_SETTINGS,
             "dhcpLease", "DhcpLease", "dhcp_lease", decode = Decoders.NON_BLANK))
-        // 单位是**小时**，客户端读到后自行 *3600。不在这里换算：web 与 app 都已固化这个语义，
-        // 归一化时顺手换算会让它们的乘 3600 变成双重换算。
+        // 单位是小时，客户端读取后自行乘 3600。不在此处换算：web 与 app 已固化该语义，
+        // 归一化时换算会导致它们再次乘 3600，形成双重换算。
         add(fieldOf(DeviceFields.LanSettings.DHCP_LEASE_HOUR, FieldGroup.LAN_SETTINGS,
             "dhcpLease_hour", "dhcp_lease_hour", decode = Decoders.NON_BLANK))
         add(fieldOf(DeviceFields.LanSettings.MTU, FieldGroup.LAN_SETTINGS,
@@ -236,9 +258,9 @@ object ZteGoformProfile : DeviceProfile {
         add(fieldOf(DeviceFields.TrafficLimit.ENABLED, FieldGroup.TRAFFIC_LIMIT,
             "data_volume_limit_switch", "flux_data_volume_limit_switch", decode = Decoders.BOOL_01))
         // 复合串 data_volume_limit_size（"470_1024" = 470 GB）由 structuralDecoder
-        // 在归一化前拆成下面三条，**派生键直接用 canonical 名** —— 这样过渡期 KEEP_PRESENT
-        // 也不会把复合串当"别名"再透出一份（计划书 2.8：复合串不进对外契约）。
-        // data_volume_limit_unit 是**限额模式**（"data" 按流量 / "time" 按时长），
+        // 在归一化前拆成下面三条，派生键直接使用 canonical 名 —— 这样 KEEP_PRESENT
+        // 也不会把复合串当「别名」再透出一份（复合串不进入对外契约）。
+        // data_volume_limit_unit 是限额模式（"data" 按流量 / "time" 按时长），
         // 不是数据单位（真实单位藏在 size 的乘数里），对外没有意义，故不登记。
         add(fieldOf(DeviceFields.TrafficLimit.LIMIT_VALUE, FieldGroup.TRAFFIC_LIMIT,
             DeviceFields.TrafficLimit.LIMIT_VALUE, decode = Decoders.NON_BLANK))
@@ -252,14 +274,14 @@ object ZteGoformProfile : DeviceProfile {
             "wan_auto_clear_flow_data_switch", decode = Decoders.BOOL_01))
         add(fieldOf(DeviceFields.TrafficLimit.CLEAR_DATE, FieldGroup.TRAFFIC_LIMIT,
             "traffic_clear_date", decode = Decoders.NON_BLANK))
-        // ⚠️ 上下行**故意交叉绑定**：ZTE 固件的 monthly_rx/tx 是从「模块看 PC」的视角命名的，
-        // 与 canonical（rx = 下行/下载、tx = 上行/上传）正好相反。2026-09-01 实测同一台 F50：
-        //   monthly_rx_bytes = 985,757,259（≈940 MB，实际是**上传**）
-        //   monthly_tx_bytes = 7,530,676,294（≈7.0 GB，实际是**下载**）
-        // 所以在唯一的适配层一次性掰正，上层（TrafficLimitMapper / 流量管理 UI / web）
-        // 拿到的 canonical rx 就是下载、tx 就是上传，不需要再各自记住"这台设备是反的"。
-        // 注意：诊断端点 /api/device/goform 走 getFullStatusMasked() 不过本表，
-        // 那份 dump 就该保持设备原样（原名 + 原值），排障时才能对上设备后台。
+        // ⚠️ 上下行**故意交叉绑定**：ZTE 固件的 monthly_rx/tx 按「模块看 PC」的视角命名，
+        // 与 canonical（rx = 下行/下载、tx = 上行/上传）相反。同一台 F50 的实测值：
+        //   monthly_rx_bytes = 985,757,259（≈940 MB，实际为上传）
+        //   monthly_tx_bytes = 7,530,676,294（≈7.0 GB，实际为下载）
+        // 因此在唯一的适配层一次性纠正，上层（TrafficLimitMapper / 流量管理 UI / web）
+        // 拿到的 canonical rx 即下载、tx 即上传，无需再各自记住「这台设备是反的」。
+        // 注意：诊断端点 /api/device/goform 走 getFullStatusMasked()，不经过本表，
+        // 该 dump 保持设备原样（原名 + 原值），排障时才能与设备后台对照。
         add(fieldOf(DeviceFields.TrafficLimit.MONTHLY_RX_BYTES, FieldGroup.TRAFFIC_LIMIT,
             "monthly_tx_bytes", decode = Decoders.NON_BLANK))
         add(fieldOf(DeviceFields.TrafficLimit.MONTHLY_TX_BYTES, FieldGroup.TRAFFIC_LIMIT,
@@ -269,8 +291,8 @@ object ZteGoformProfile : DeviceProfile {
 
         // ───────── 设备身份（GoformSignalClient.getDeviceIdentity / getDeviceVersion） ─────────
         // PII：手机号 / IMEI / IMSI / ICCID 标 MASKED —— 正常响应给真值，日志与诊断端点打码。
-        // `sim_msisdn` 与 `msisdn` 是同一个号码的两个设备字段名（原始 dump 里两个都会出现），
-        // 都登记进来才能让诊断脱敏（计划书 9.2）按名字命中 —— 否则 dump 里 `sim_msisdn` 漏真值。
+        // `sim_msisdn` 与 `msisdn` 是同一号码的两个设备字段名（原始 dump 中两者都会出现），
+        // 都登记才能让诊断脱敏按名字命中 —— 否则 dump 中的 `sim_msisdn` 会漏出真值。
         add(fieldOf(DeviceFields.Identity.MSISDN, FieldGroup.IDENTITY,
             "msisdn", "sim_msisdn", sensitivity = Sensitivity.MASKED, decode = Decoders.NON_BLANK))
         add(fieldOf(DeviceFields.Identity.IMEI, FieldGroup.IDENTITY,
@@ -295,18 +317,18 @@ object ZteGoformProfile : DeviceProfile {
             "network_provider", decode = Decoders.NON_BLANK))
 
         // ───────── WiFi 设置（GoformWifiClient.getWifiSettingsMerged） ─────────
-        // canonical 就是 goform 扁平名本身（web 的 normalizeWifiSettings 与 app 的
-        // parseWifiSettings 双侧固化），所以这里 canonical == 首个扁平 source。
+        // canonical 即 goform 扁平名本身（web 的 normalizeWifiSettings 与 app 的
+        // parseWifiSettings 双侧固化），因此此处 canonical 与首个扁平 source 相同。
         //
-        // 每条别名链的**第一个**是 ZTE 原生驼峰名（`SSID` / `Password` / `AuthMode`…）：
-        // 它们由 [liftActiveAccessPoint] 从 `queryAccessPointInfo` 的 `ResponseList` 里提到顶层。
-        // 放在最前是为了逐字节复刻原 `DataHub.processModuleInfo` 的优先级——它在扁平字段
-        // 之后执行并覆盖，即 **module-info 胜过扁平查询**。
+        // 每条别名链的第一项是 ZTE 原生驼峰名（`SSID` / `Password` / `AuthMode`…）：
+        // 它们由 [liftActiveAccessPoint] 从 `queryAccessPointInfo` 的 `ResponseList` 提到顶层。
+        // 置于最前是为了保持与原 `DataHub.processModuleInfo` 相同的优先级 ——
+        // 它在扁平字段之后执行并覆盖，即 module-info 优先于扁平查询。
         add(fieldOf(DeviceFields.WifiSettings.CHIP, FieldGroup.WIFI_SETTINGS,
             "ChipIndex", "wifi_chip", "chip", decode = WIFI_CHIP_DECODER))
         add(fieldOf(DeviceFields.WifiSettings.SSID, FieldGroup.WIFI_SETTINGS,
             "SSID", "wifi_chip1_ssid1_ssid", "wifi_chip1_ssid", decode = Decoders.NON_BLANK))
-        // WiFi 明文密码（core 已 base64(GBK) 解码）。MASKED 而不是 SECRET：web 的二维码功能要真值。
+        // WiFi 明文密码（core 已做 base64 解码，UTF-8 优先、GBK 回落）。MASKED 而不是 SECRET：web 的二维码功能需要真值。
         add(fieldOf(DeviceFields.WifiSettings.PASSPHRASE, FieldGroup.WIFI_SETTINGS,
             "Password", "wifi_chip1_ssid1_passphrase", "wifi_chip1_passphrase",
             sensitivity = Sensitivity.MASKED, decode = WIFI_PASSWORD_DECODER))
@@ -338,22 +360,22 @@ object ZteGoformProfile : DeviceProfile {
         add(fieldOf(DeviceFields.CellInfo.LTE_BANDS, FieldGroup.CELL_INFO, "Lte_bands"))
         add(fieldOf(DeviceFields.CellInfo.LTE_RSRP, FieldGroup.CELL_INFO, "lte_rsrp"))
         add(fieldOf(DeviceFields.CellInfo.LTE_RSRQ, FieldGroup.CELL_INFO, "lte_rsrq"))
-        // ⚠️ LTE_SNR 的别名链第一项 `lte_snr` **不是设备原名**，是 canonical 自身
+        // ⚠️ LTE_SNR 的别名链第一项 `lte_snr` 不是设备原名，而是 canonical 自身
         // （`DeviceFields.CellInfo.LTE_SNR` == "lte_snr"）。设备原名只有大写 `Lte_snr`
-        // （2026-09-22 真机 dump：4G 驻网回 `Lte_snr`，小区参数首字母大写、
+        // （真机 dump：4G 驻网返回 `Lte_snr`，小区参数首字母大写、
         // 信号质量指标 `lte_rsrp`/`lte_rsrq`/`lte_rssi` 全小写）。
-        // 留着它只是**读侧**容错（归一化过的输入再进一次也能命中），
-        // **不许把它抄进任何 cmd 列表** —— P0-3 就是这么来的（fallback 发了一个设备上不存在的 cmd）。
+        // 保留它仅用于读侧容错（归一化过的输入再次进入也能命中），
+        // 不得把它加入任何 cmd 列表 —— 否则会发出一个设备上不存在的 cmd。
         add(fieldOf(DeviceFields.CellInfo.LTE_SNR, FieldGroup.CELL_INFO, "lte_snr", "Lte_snr"))
 
         // ───────── 信号（FieldGroup.SIGNAL） ─────────
-        // 从 SignalCollector.collectLayer1GoformFields 逐条搬过来（行为必须一致）。
+        // 与 SignalCollector.collectLayer1GoformFields 的取值保持一致。
         // 两个要点：
-        //  ① 这批 canonical 是 **core 自有的小写归一名**，同时被 WS `signal` 频道和 REST 使用，
-        //     一个都不能改（`lte_snr` 看着像设备原名，设备原名其实是 `Lte_snr`）。
-        //  ② goform 这组命名极不一致，必须逐个照抄固件原文：频点 LTE 是 `Lte_fcn`、
+        //  ① 这批 canonical 是 core 自有的小写归一名，同时被 WS `signal` 频道和 REST 使用，
+        //     一个都不能改（`lte_snr` 看似设备原名，设备原名实为 `Lte_snr`）。
+        //  ② goform 命名极不一致，必须逐个核对固件原文：频点 LTE 是 `Lte_fcn`、
         //     带宽 LTE 是 `Lte_bands_widths`（多一个 s），而 NR 侧是 `Nr_fcn` / `Nr_band_widths`。
-        //     多数字段藏在 `network_information` 子对象里，由 [structuralDecoder] 提前摊平。
+        //     多数字段位于 `network_information` 子对象内，由 [structuralDecoder] 提前展平。
 
         // 服务小区合并值：4G 驻网时装的就是 lte_* 的值
         add(fieldOf(DeviceFields.Signal.RSRP, FieldGroup.SIGNAL,
@@ -436,18 +458,17 @@ object ZteGoformProfile : DeviceProfile {
 
         FieldGroup.CONNECTION -> listOf("network_type", "network_provider", "ppp_status")
 
-        // 与 GoformWifiClient.getWifiSettingsMerged 一致，顺序也照它实际发送的顺序写：
+        // 与 GoformWifiClient.getWifiSettingsMerged 一致，顺序按其实际发送顺序排列：
         // 前 12 个是 `getWifiSettings()` 的扁平字段查询，后 2 个是 `getWifiModuleInfo()`
-        // 的 module-info（`queryAccessPointInfo` 是**容器命令**，返回 `ResponseList` 数组，
+        // 的 module-info（`queryAccessPointInfo` 是容器命令，返回 `ResponseList` 数组，
         // 由 structuralDecoder(WIFI_SETTINGS) = liftActiveAccessPoint 挑出生效 AP 后提到顶层）。
-        // 顺序与客户端逐字对齐是为了 0.4 删并行查询路径时能直接比对，不用再讨论顺序。
+        // 顺序与客户端一致，便于比对。
         //
-        // **`WiFiModuleSwitch` 不能出现在这里**（2026-09-21 修正，原来它排在第 2 位）：
-        // 它是设备的**响应键**，是 MODULE_SWITCH 别名链的首项（见上面 readSpecs），
-        // 由 `queryWiFiModuleSwitch` 这条容器命令返回 —— 它本身不是可发的 cmd 名，
-        // 发出去就是白发一次无效查询。真正该发的是链上另外两个扁平 cmd
-        // （`wifi_enable` / `wifi_onoff_state`），少了它们会让覆盖率报告里
-        // `module_switch` 永远 missing（诊断误报，不是功能缺陷 —— 线上走的是客户端那 12+2 项）。
+        // **`WiFiModuleSwitch` 不能出现在此处**：它是设备的响应键，是 MODULE_SWITCH 别名链的首项
+        // （见上面 readSpecs），由 `queryWiFiModuleSwitch` 这条容器命令返回 —— 它本身不是可发送的
+        // cmd 名，发送只会产生一次无效查询。应当发送的是链上另外两个扁平 cmd
+        // （`wifi_enable` / `wifi_onoff_state`），缺少它们会使覆盖率报告中
+        // `module_switch` 始终为 missing（诊断误报，不是功能缺陷 —— 线上走的是客户端那 12+2 项）。
         FieldGroup.WIFI_SETTINGS -> listOf(
             "wifi_chip1_ssid1_ssid", "wifi_onoff_state", "wifi_access_sta_num",
             "wifi_chip1_ssid1_access_sta_num", "wifi_5g_enable", "wifi_enable",
@@ -457,7 +478,7 @@ object ZteGoformProfile : DeviceProfile {
             "queryWiFiModuleSwitch", "queryAccessPointInfo",
         )
 
-        // station_list 必须单独查（与其它 cmd 组合时设备返回空，见 GoformWifiClient 的 2026-08-23 修复注释）
+        // station_list 必须单独查（与其它 cmd 组合时设备返回空，见 GoformWifiClient 的相应注释）
         FieldGroup.WIFI_CLIENTS -> listOf("station_list")
 
         // 与 GoformSignalClient.getCellInfo 一致。`network_information` / `network_type` 没有登记
@@ -487,25 +508,24 @@ object ZteGoformProfile : DeviceProfile {
         if (group == FieldGroup.WIFI_CLIENTS) listOf("station_list") else emptyList()
 
     /**
-     * 全量状态 dump 的三批查询（阶段 0.4b 从 `GoformSignalClient.getFullStatus()` **逐字搬来**）。
+     * 全量状态 dump 的三批查询（与 `GoformSignalClient.getFullStatus()` 一致）。
      *
-     * **三批的内容与顺序一个字都不许动**：这是 F50 上实际发出的三次请求，
-     * 改内容 = 改设备侧请求形状，改分批 = 赌设备能一次吃下 96 项（本仓已有合并查询被吞的先例）。
-     * 实测数量 **30 / 29 / 37 = 96**（搬运前源码注释写的 `30 / 28 / 30+` 与 KDoc 的「75+ 字段」
-     * 都不准，2026-09-22 逐项数过）。
+     * 三批的内容与顺序不得改动：这是 F50 上实际发出的三次请求，
+     * 改内容即改变设备侧请求形状，改分批即假设设备能一次接收 96 项（合并查询已被设备丢弃过）。
+     * 实测数量为 30 / 29 / 37 = 96。
      *
-     * 这份 dump **不过归一化**（调用点是 `getFullStatus()` / `getFullStatusMasked()`，
-     * 给诊断端点看设备后台到底有什么），所以这里出现的字段名有相当一部分**没有**登记 canonical ——
-     * 那是刻意的，不要拿 `readSpecs()` 去对它。
+     * 这份 dump 不经过归一化（调用点为 `getFullStatus()` / `getFullStatusMasked()`，
+     * 供诊断端点查看设备后台的全部字段），因此其中相当一部分字段名没有登记 canonical ——
+     * 这是刻意的，不能用 `readSpecs()` 去核对它。
      */
     override fun fullStatusCmds(): List<List<String>> = FULL_STATUS_CMD_BATCHES
 
     /**
-     * [fullStatusCmds] 的真身。外层三个元素 = 三次**独立**的 goform 查询，顺序即发送顺序
-     * （调用点按顺序 `putAll`，所以后一批的同名键会盖前一批 —— 搬运前就是这个语义，不要改顺序）。
+     * [fullStatusCmds] 的实际取值。外层三个元素 = 三次独立的 goform 查询，顺序即发送顺序
+     * （调用点按顺序 `putAll`，因此后一批的同名键会覆盖前一批）。
      *
-     * 批内分行方式与原客户端代码保持一致，方便逐字比对；`GoformCommandTableGuardTest`
-     * 把三批的数量（30 / 29 / 37）与内容整体冻结住了。
+     * 批内分行方式与原客户端代码保持一致，便于逐字比对；`GoformCommandTableGuardTest`
+     * 将三批的数量（30 / 29 / 37）与内容整体冻结。
      */
     private val FULL_STATUS_CMD_BATCHES: List<List<String>> = listOf(
         // Batch 1: 设备身份 + 网络基础 (30 字段)
@@ -601,21 +621,21 @@ object ZteGoformProfile : DeviceProfile {
     }
 
     /**
-     * 把 `queryAccessPointInfo` 返回的 `ResponseList` 里**生效那个 AP** 的字段提到顶层。
+     * 把 `queryAccessPointInfo` 返回的 `ResponseList` 中生效 AP 的字段提到顶层。
      *
-     * 取代原 `DataHub.processModuleInfo`——那是整个 core 里唯一一处字段重命名逻辑，
-     * 留在 DataHub 就等于维护第二份映射表。这里只做「结构变换」三件事：
-     *  1. 带谓词的元素选择：`AccessPointSwitchStatus == "1"` 的 AP，挑不到退回第一个；
-     *  2. 把它的 `SSID` / `Password` / `AuthMode` / `EncrypType` / `ChipIndex` /
-     *     `ApMaxStationNumber` / `ApBroadcastDisabled` 原名提到顶层；
-     *  3. 密码补位：生效 AP 的 `Password` 为空时，取所有 AP 里第一个非空的
+     * 该变换取代原先集中在 DataHub 的字段重命名逻辑：把重命名留在 DataHub 会使同一份映射表
+     * 存在两个维护点。此处只做三项结构变换：
+     *  1. 带谓词的元素选择：取 `AccessPointSwitchStatus == "1"` 的 AP，找不到时退回第一个；
+     *  2. 把该 AP 的 `SSID` / `Password` / `AuthMode` / `EncrypType` / `ChipIndex` /
+     *     `ApMaxStationNumber` / `ApBroadcastDisabled` 按原名提到顶层；
+     *  3. 密码补位：生效 AP 的 `Password` 为空时，取所有 AP 中第一个非空值
      *     （固件在双频共享密码时只在其中一个 AP 上填值）。
      *
-     * **重命名与值解码都不在这里**：提上来的还是 ZTE 原名，由 [SPECS] 的别名链吃掉，
-     * base64(GBK) 解码由 [WIFI_PASSWORD_DECODER] 负责。所以 allowlist 依然是唯一出口。
+     * 重命名与值解码都不在此处：提到顶层的仍是 ZTE 原名，由 [SPECS] 的别名链处理，
+     * base64 解码由 [WIFI_PASSWORD_DECODER] 负责。allowlist 因此仍是唯一出口。
      *
-     * 顶层同名键会被 AP 值**覆盖**（与原 processModuleInfo 的执行顺序一致）——但 ZTE 原生驼峰名
-     * 与 goform 扁平名不重名，实际不会撞；真正的优先级由别名链顺序（原名在前）表达。
+     * 顶层同名键会被 AP 值覆盖。ZTE 原生驼峰名与 goform 扁平名不重名，实际不会冲突；
+     * 真正的优先级由别名链顺序（原名在前）表达。
      */
     private fun liftActiveAccessPoint(raw: JsonObject): JsonObject {
         val list = raw["ResponseList"] as? JsonArray ?: return raw
@@ -644,22 +664,23 @@ object ZteGoformProfile : DeviceProfile {
     private fun str(el: JsonElement?): String? = (el as? JsonPrimitive)?.content
 
     /**
-     * 客户端列表：**统一成真数组** + 元素键归一。
+     * 客户端列表：统一为真正的 JSON 数组，并归一元素键。
      *
-     * 设备对 `station_list` / `lan_station_list` 有两种形态：真 JSON 数组，或**数组的 JSON 字符串**
-     * （双重编码，固件而定）。原来两端各自兜底（app `parseArrayField`、web `data?.stationList || ...`），
-     * 现在 core 一律吐真数组 —— 这是两端已支持形态的子集，不会破坏任何现有消费点。
+     * 设备对 `station_list` / `lan_station_list` 有两种形态：JSON 数组，或数组的 JSON 字符串
+     * （双重编码，取决于固件）。客户端两侧对此各自兜底（app 的 `parseArrayField`、
+     * web 的 `data?.stationList || ...`）；core 统一输出真正的数组，
+     * 该形态是两端已支持形态的子集，不会破坏现有消费点。
      *
-     * 元素键也在这里对齐（`mac` → `mac_addr`）：这是 web `c.mac_addr ?? c.mac` 那段 if 的来源。
+     * 元素键也在此对齐（`mac` → `mac_addr`），这是 web 侧 `c.mac_addr ?? c.mac` 判定的来源。
      */
     private fun normalizeStationLists(raw: JsonObject): JsonObject =
         normalizeArrayFields(raw, STATION_LIST_KEYS, STATION_ITEM_ALIASES)
 
     /**
-     * 小区列表：与 [normalizeStationLists] 同样的处理（真数组 + 元素键归一）。
+     * 小区列表：处理方式与 [normalizeStationLists] 相同（真正的数组 + 元素键归一）。
      *
-     * `neighbor_cell_info` / `locked_cell_info` 也是"数组 or 数组字符串"两形态，
-     * web 的 `parseCellArray()` 就是为此存在的。元素键别名见 [CELL_ITEM_ALIASES]。
+     * `neighbor_cell_info` / `locked_cell_info` 同样存在「数组或数组字符串」两种形态，
+     * web 的 `parseCellArray()` 即为此而设。元素键别名见 [CELL_ITEM_ALIASES]。
      */
     private fun normalizeCellLists(raw: JsonObject): JsonObject =
         normalizeArrayFields(raw, CELL_LIST_KEYS, CELL_ITEM_ALIASES)
@@ -739,8 +760,8 @@ object ZteGoformProfile : DeviceProfile {
     }
 
     // ───────────────────── 服务小区统一字段（派生） ─────────────────────
-    // 派生规则与设备无关（输入是已归一化的 canonical 字段），所以放在
-    // com.ufi_axis_core.deviceschema.ServingCell 而不是这里 —— 否则每个新 profile 都要抄一遍。
+    // 派生规则与设备无关（输入是已归一化的 canonical 字段），因此放在
+    // com.ufi_axis_core.deviceschema.ServingCell 而非本文件，避免每个新 profile 重复实现。
 
     // ───────────────── WiFi 连接二维码的文件名（读侧） ─────────────────
 
@@ -753,31 +774,30 @@ object ZteGoformProfile : DeviceProfile {
     private const val QR_CODE_FILE_SUFFIX = "_qrcode_wifikey"
 
     /**
-     * 「已知一定会生成」的那一张二维码对应的频段 + SSID 序号，用作第二候选。
+     * 「已知一定会生成」的那一张二维码对应的频段与 SSID 序号，用作第二候选。
      *
-     * 取值与 [WIFI_CHIP_FALLBACK] 的 `chip1` 同值但**不是同一件事**，刻意不合并成一个常量：
-     * 那个是写侧「开 WiFi 时读不到当前频段的兜底」，这个是读侧「取二维码图取不到时退回哪一张」。
-     * 合成一份会让两条互不相干的判据被同一次修改牵动。
+     * 取值与 [WIFI_CHIP_FALLBACK] 的 `chip1` 相同，但两者不是同一件事，刻意不合并为一个常量：
+     * 后者是写侧「开 WiFi 时读不到当前频段的兜底」，本常量是读侧「取二维码图失败时退回哪一张」。
+     * 合并会使两条互不相关的判据被同一次修改牵动。
      */
     private const val QR_CODE_FALLBACK_STEM = "chip1_ssid1"
 
     /**
-     * WiFi 二维码图片的文件名候选（阶段 2 任务 2.10 / 计划书 §15 的 P1-5）。
+     * WiFi 二维码图片的文件名候选。
      *
-     * 两个候选与它们的顺序逐字照搬 `GoformWifiClient.getWifiQrCode` 改造前那段 `linkedSetOf`：
-     * 1. `<chip>_ssid<ssidIndex>` + [QR_CODE_FILE_SUFFIX] —— 调用方要的那一张；
-     * 2. [QR_CODE_FALLBACK_STEM] + [QR_CODE_FILE_SUFFIX] —— 兜底。有些固件只生成 2.4G 那一张
-     *    （`chip2_ssid1_…` 直接 404），此时给用户一张能用的比什么都不显示更有意义：
-     *    二维码内容是 SSID / 口令，两个频段通常同口令。
+     * 两个候选及其顺序与 `GoformWifiClient.getWifiQrCode` 一致：
+     * 1. `<chip>_ssid<ssidIndex>` + [QR_CODE_FILE_SUFFIX]：调用方请求的那一张；
+     * 2. [QR_CODE_FALLBACK_STEM] + [QR_CODE_FILE_SUFFIX]：兜底。部分固件只生成 2.4G 的那一张
+     *    （`chip2_ssid1_…` 直接返回 404），此时返回一张可用的图片优于不显示：
+     *    二维码内容为 SSID 与口令，两个频段通常使用同一口令。
      *
-     * `chip == "chip1" && ssidIndex == 1` 时两个候选是同一个名字，**必须去重**（这里用
-     * `linkedSetOf` 保序去重）—— 契约规定调用方按返回顺序原样逐个发请求、不做任何过滤，
-     * 列表里重复一项就是对同一个文件多发一次 HTTP。改造前的去重也在这一层（同一个
-     * `linkedSetOf`），所以搬家后请求的文件名序列逐字不变。
+     * `chip == "chip1" && ssidIndex == 1` 时两个候选是同一个名字，必须去重（此处用
+     * `linkedSetOf` 保序去重）。契约规定调用方按返回顺序原样逐个发请求、不做任何过滤，
+     * 列表中的重复项会导致对同一文件重复发起 HTTP 请求。
      *
-     * **刻意不校验取值域**：`chip` 不在 `{chip1, chip2}` 内时照样拼出一个名字（与改造前一致）。
-     * 那一道校验在 `WifiRoutes` 的 `chip must be chip1 or chip2`；在这里再加一道会把
-     * 「取不到那张图」变成「返回空列表 = 该设备不支持取二维码」，语义就错了。
+     * 此处刻意不校验取值域：`chip` 不在 `{chip1, chip2}` 内时仍会拼出一个名字。
+     * 该项校验位于 `WifiRoutes`（`chip must be chip1 or chip2`）；在此再加一道会把
+     * 「取不到那张图」变成「返回空列表 = 该设备不支持取二维码」，语义即发生改变。
      */
     override fun qrCodeFileNames(chip: String, ssidIndex: Int): List<String> = linkedSetOf(
         "${chip}_ssid${ssidIndex}$QR_CODE_FILE_SUFFIX",
@@ -785,50 +805,48 @@ object ZteGoformProfile : DeviceProfile {
     ).toList()
 
     // ───────────────────────── 写入侧 ─────────────────────────
-    // 阶段 2 逐项迁移。已登记的这几项是从 GoformDeviceClient / GoformWifiClient /
-    // GoformNetworkClient 原样搬来的（cmd 名与参数键逐字符照抄），未登记的返回 null。
+    // 已登记的写命令由 GoformDeviceClient / GoformWifiClient / GoformNetworkClient
+    // 迁入（cmd 名与参数键逐字符一致），未登记的返回 null。
     //
     // retry 必须逐项显式写出（[WriteSpec.retry] 的默认值是安全侧的 NEVER）：
-    // 下面这些设置类命令原本走的就是 GoformSettingWriter 的 goformPostIdempotent，
-    // 漏标一项等于把「切换网络制式第一次必定失败、再点一次才成」那个已修的 bug 放回去
-    // （GoformSettingWriter 的类注释记着这次事故）。动作类 / 改口令的命令反过来必须是 NEVER。
+    // 下列设置类命令原本走 GoformSettingWriter 的 goformPostIdempotent，
+    // 漏标一项会使「切换网络制式首次必定失败、再次触发才成功」的缺陷复发
+    // （见 GoformSettingWriter 的类注释）。动作类与修改口令的命令则必须是 NEVER。
 
     override fun writeSpec(key: SettingKey): WriteSpec? = WRITE_SPECS[key]
 
     /**
      * 「解锁全部频段」时下发的频段全集。
      *
-     * 取值是从 `GoformNetworkClient` 的 companion 常量**逐字**搬过来的
-     * （原注释写的是「ZTE MU300 全 LTE 频段（解锁时使用）」），一个频段号都没动 ——
-     * 搬家的目的是消掉「同一串值三份拷贝 + `core/controller` 跨模块直读」
-     * （计划书 §15 的 P0-1 / 任务 2.9），不是重新核对频段表。
+     * 取值与 GoformNetworkClient 的 companion 常量一致（ZTE MU300 全 LTE 频段，解锁时使用），
+     * 频段号未作调整。该值由 profile 提供的目的是消除「同一串值存在三份拷贝，且 `core/controller`
+     * 跨模块直接读取」的情况，不是重新核对频段表。
      *
-     * 注意这**不是** `BAND_LOCK_LTE` 的 encode 的一部分：`encode` 仍然只做
-     * `value → lte_band_lock` 的字段名映射，空串仍然被 `validateBandList` 当「解锁」放过
-     * （= 不发限制）。把全集塞进 encode 会让「空串」从「不发限制」变成「下发全频段」,
-     * 那是对外语义变更。
+     * 该值不是 `BAND_LOCK_LTE` 的 encode 的一部分：`encode` 仍只做
+     * `value → lte_band_lock` 的字段名映射，空串仍被 `validateBandList` 视为「解锁」
+     * （= 不发限制）。把全集放进 encode 会使空串的语义从「不发限制」变为「下发全频段」，
+     * 属于对外语义变更。
      */
     override fun lteAllBandsMask(): String = "1,3,5,8,34,38,39,40,41"
 
-    /** 全 NR 频段（解锁时使用）。取值与搬家理由同 [lteAllBandsMask]。 */
+    /** 全 NR 频段（解锁时使用）。取值与迁入理由同 [lteAllBandsMask]。 */
     override fun nrAllBandsMask(): String = "1,5,8,28,41,78"
 
     /**
      * ACL 默认档位 = [ACL_MODE_BLACKLIST]（`"2"`，黑名单）。
      *
-     * 判据来自抓包：F50 的「拉黑」与「取消拉黑」下发的都是 `AclMode=2`，区别只在名单内容；
-     * 读回时设备偶尔不带 `AclMode` 键，此时按 2 理解与设备的实际行为一致。
+     * 依据来自抓包：F50 的「拉黑」与「取消拉黑」下发的都是 `AclMode=2`，区别只在名单内容；
+     * 读回时设备偶尔不带 `AclMode` 键，此时按 2 理解与设备实际行为一致。
      *
-     * 2026-09-25 搬家：此前 `GoformWifiClient` 两处直接读 `ZteGoformProfile.ACL_MODE_BLACKLIST`，
-     * 绕过了 commandProfile。现在改由本方法提供，换插件即换取值。
+     * 该取值由本方法提供而非由客户端引用常量，使更换 profile 即可更换默认档位。
      */
     override fun aclDefaultMode(): String = ACL_MODE_BLACKLIST
 
     /**
-     * 短信规则在单独的 [ZteSmsSpec] 里（本文件已经 1300+ 行，而短信那套规则自成一体）。
+     * 短信规则由独立的 [ZteSmsSpec] 提供（短信规则自成一体，与字段映射相互独立）。
      *
-     * 为什么不进 [WRITE_SPECS]：`sms_time` 让 encode 不纯、下发后还要回读确认、
-     * 编码是短信专有的 —— 三条理由见计划书 §11.2。
+     * 短信不纳入 [WRITE_SPECS] 的原因：`sms_time` 使 encode 不纯、下发后还需回读确认、
+     * 编码为短信专有，三条理由见 [DeviceProfile.smsSpec] 的 KDoc。
      */
     override fun smsSpec(): SmsSpec? = ZteSmsSpec
 
@@ -853,14 +871,14 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // WiFi 接入控制名单（拉黑）。参数照 2026-08-30 真机抓包：
-        //   goformId=setDeviceAccessControlList&AclMode=2&WhiteMacList=&BlackMacList=2a:ed:87:b3:e8:29;
-        //   &WhiteNameList=&BlackNameList=OPPO-Find-X7;
-        // 三条硬事实：
-        //   ① 四条名单每次都要发全（空也要带 key），设备是整表替换，漏发等于清空；
-        //   ② 列表用 `;` 分隔且**末尾也带 `;`**（单项也是 "mac;"）；
+        // WiFi 接入控制名单（拉黑）。参数取自真机抓包：
+        //   goformId=setDeviceAccessControlList&AclMode=2&WhiteMacList=&BlackMacList=aa:bb:cc:dd:ee:ff;
+        //   &WhiteNameList=&BlackNameList=Example-Device;
+        // 三项设备事实：
+        //   ① 四条名单每次都要发全（空也要带 key），设备为整表替换，漏发即清空；
+        //   ② 列表以 `;` 分隔且末尾也带 `;`（单项同样为 "mac;"）；
         //   ③ Mac 列表与 Name 列表按下标一一对应，长度必须相等。
-        // AclMode：2 = 黑名单生效（抓包里"取消拉黑"也仍然是 2，只是名单清空）。
+        // AclMode：2 = 黑名单生效（抓包中「取消拉黑」同样为 2，只是名单清空）。
         SettingKey.WIFI_ACL to WriteSpec(
             command = "setDeviceAccessControlList",
             encode = { p ->
@@ -875,9 +893,9 @@ object ZteGoformProfile : DeviceProfile {
             validate = { p -> validateAcl(p) },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 频段锁定：值是逗号分隔的频段号；空串 = 解锁。
-        // validate 挡住非数字字符 —— 设备侧表单是字符串拼接，未做转义，
-        // 值里带 & 或 = 会注入额外参数（见计划书 §9.2）。
+        // 频段锁定：值为逗号分隔的频段号；空串 = 解锁。
+        // validate 拦截非数字字符 —— 设备侧表单为字符串拼接且未做转义，
+        // 值中带 & 或 = 会注入额外参数。
         SettingKey.BAND_LOCK_LTE to WriteSpec(
             command = "LTE_BAND_LOCK",
             encode = { p -> mapOf("lte_band_lock" to (p["value"]?.toString() ?: "")) },
@@ -912,10 +930,9 @@ object ZteGoformProfile : DeviceProfile {
             encode = { p -> mapOf("usb_port_switch" to bool01(p["value"])) },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 漫游是"另一套布尔编码"的代表：同一个设备，这条命令要 "on"/"off"，
-        // 上面几条要 "1"/"0"。统一了设备会静默忽略（返回 200 但值没变），
-        // 所以编码规则必须逐命令登记（计划书 2.3 / 陷阱 27）。
-        // 另外它复用 SET_CONNECTION_MODE 并且必须带 ConnectionMode=auto_dial。
+        // 漫游使用另一套布尔编码：同一设备上，本命令要求 "on"/"off"，
+        // 而上面若干命令要求 "1"/"0"。编码混用后设备会静默忽略（返回 200 但值未变），
+        // 因此编码规则必须逐命令登记。此外本项复用 SET_CONNECTION_MODE 且必须带 ConnectionMode=auto_dial。
         SettingKey.ROAM to WriteSpec(
             command = "SET_CONNECTION_MODE",
             encode = { p ->
@@ -928,16 +945,16 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 流量限额：唯一有可选参数的写操作（计划书 2.4）。
-        // 复合串 `"470_1024"` 只在这里拼 —— 对外只有 limit_value + limit_unit
-        // 两个结构化参数（计划书 2.8：复合格式是设备侧事实，不是对外契约）。
+        // 流量限额：唯一带可选参数的写操作。
+        // 复合串 `"470_1024"` 只在此处拼接 —— 对外只有 limit_value 与 limit_unit
+        // 两个结构化参数（复合格式属于设备侧事实，不是对外契约）。
         //
-        // 参数集照 2026-08-30 的真机抓包（设备自带 UI，流量管理页点保存）：
+        // 参数集取自真机抓包（设备自带 UI，流量管理页保存）：
         //   isTest=false&goformId=DATA_LIMIT_SETTING
         //   &data_volume_limit_unit=data&data_volume_limit_size=472_1024
         //   &data_volume_alert_percent=90&wan_auto_clear_flow_data_switch=on
         //   &traffic_clear_date=2&data_volume_limit_switch=1&notify_deviceui_enable=0&AD=…
-        // 即：自动清零与清零日**就在这条命令里**（网上流传的参数表不全，别照它删）。
+        // 即：自动清零与清零日同属这条命令，不得省略。
         SettingKey.TRAFFIC_LIMIT to WriteSpec(
             command = "DATA_LIMIT_SETTING",
             encode = { p ->
@@ -945,9 +962,9 @@ object ZteGoformProfile : DeviceProfile {
                 out["data_volume_limit_switch"] = bool01(p["enabled"])
                 compoundLimitSize(p["limit_value"], p["limit_unit"])?.let {
                     out["data_volume_limit_size"] = it
-                    // ⚠ 这个字段是**限额模式**，不是数据单位：`data` = 按流量限，`time` = 按时长限。
-                    // 真实的 MB/GB/TB 由 size 里的乘数表示（"472_1024" = 472 GB）。
-                    // 2026-08-30 修：以前发的是 "MB"（把它当成单位字段了），固件不认 → 整条保存失败。
+                    // ⚠ 该字段是限额模式，不是数据单位：`data` = 按流量限，`time` = 按时长限。
+                    // 真实的 MB/GB/TB 由 size 中的乘数表示（"472_1024" = 472 GB）。
+                    // 若把它当作单位字段发送（例如 "MB"），固件不识别，整条保存失败。
                     // 本项目只做流量限额，故恒发 "data"。
                     out["data_volume_limit_unit"] = "data"
                 }
@@ -955,7 +972,7 @@ object ZteGoformProfile : DeviceProfile {
                 // 自动清零是 on/off 那一套（与漫游同组），不是 1/0
                 p["auto_clear"]?.let { out["wan_auto_clear_flow_data_switch"] = boolOnOff(it) }
                 p["clear_date"]?.let { out["traffic_clear_date"] = it.toString().trim() }
-                // 不让设备自己弹限额提醒（提醒由本项目发）；官方 UI 也恒发 0
+                // 不允许设备自身弹出限额提醒（提醒由本项目发送）；官方 UI 同样恒发 0
                 out["notify_deviceui_enable"] = "0"
                 out
             },
@@ -964,10 +981,10 @@ object ZteGoformProfile : DeviceProfile {
         ),
 
 
-        // LAN / DHCP（计划书 2.2 的最后一项）。
-        // 两个"跟着 dhcp_type 走"的隐含参数必须一起下发，否则设备行为和 UI 不一致：
-        //   - dhcp_reboot_flag=1：改 LAN 段后设备要重启 DHCP 服务，不带这个改了不生效；
-        //   - mac_ip_reset：开 DHCP 服务器时清掉旧的 MAC-IP 绑定（沿用官方 UI 的行为）。
+        // LAN / DHCP。
+        // 两个随 dhcp_type 变化的隐含参数必须一起下发，否则设备行为与 UI 不一致：
+        //   - dhcp_reboot_flag=1：修改 LAN 段后设备需要重启 DHCP 服务，不带该字段修改不生效；
+        //   - mac_ip_reset：开启 DHCP 服务器时清除旧的 MAC-IP 绑定（与官方 UI 行为一致）。
         SettingKey.LAN_DHCP to WriteSpec(
             command = "DHCP_SETTING",
             encode = { p ->
@@ -986,11 +1003,11 @@ object ZteGoformProfile : DeviceProfile {
             validate = { p -> validateDhcp(p) },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // FOTA 自动升级（计划书 2.7）。
-        // 这里是**正向**语义：value=true → UpgMode=1（允许自动升级）。
-        // `POST /api/device/fota` 对外的旧字段 `enabled` 是反的（true = 禁用），
-        // 那次反转只在 route 的兼容分支里做一次，不在这里再翻一遍。
-        // UpgIntervalDay / UpgRoamPermission 是设备侧必填项，取值照抄真机抓包：
+        // FOTA 自动升级。
+        // 此处为正向语义：value=true → UpgMode=1（允许自动升级）。
+        // 对外 `POST /api/device/fota` 的旧字段 `enabled` 是反向的（true = 禁用），
+        // 该反转只在 route 的兼容分支中执行一次，不在此处再次翻转。
+        // UpgIntervalDay / UpgRoamPermission 是设备侧必填项，取值取自真机抓包：
         // isTest=false&goformId=SetUpgAutoSetting&UpgMode=0&UpgIntervalDay=1&UpgRoamPermission=0
         SettingKey.FOTA_AUTO_UPDATE to WriteSpec(
             command = "SetUpgAutoSetting",
@@ -1003,9 +1020,9 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 基站锁定（计划书 2.6）：对外收制式名，设备侧要数字 RAT 码。
-        // 这个值域此前直接漏在 API 入参上，两个客户端各猜了一套：
-        // app 发 "12"/"16"（对的），web 发 cell 列表里的 rat 且兜底 'LTE'（设备不认）。
+        // 基站锁定：对外接收制式名，设备侧要求数字 RAT 码。
+        // 该值域必须由 profile 统一：app 发送 "12"/"16"（已是设备码），
+        // web 发送 cell 列表中的 rat 并以 'LTE' 兜底（设备不识别）。
         SettingKey.CELL_LOCK to WriteSpec(
             command = "CELL_LOCK",
             encode = { p ->
@@ -1033,8 +1050,8 @@ object ZteGoformProfile : DeviceProfile {
             encode = { emptyMap() },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // SIM 卡槽（计划书 2.6）：对外是 1 起的序号或 "external"，
-        // 设备侧的 0/1/2/11 是运营商预置位，映射只在这里。
+        // SIM 卡槽：对外为从 1 开始的序号或 "external"，
+        // 设备侧的 0/1/2/11 是运营商预置位，映射仅在此处。
         SettingKey.SIM_SLOT to WriteSpec(
             command = "SET_SIM_SLOT",
             encode = { p -> mapOf("sim_slot" to (simSlotOrNull(p["value"]) ?: "0")) },
@@ -1043,8 +1060,8 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 流量手动校准（计划书 2.6）：对外只有"校准哪个量 + 校准成多少"，
-        // 设备侧要 data 与 time 两个字段同时在场（未校准的填 "0"），补零规则在这里。
+        // 流量手动校准：对外只有「校准哪个量 + 校准成多少」，
+        // 设备侧要求 data 与 time 两个字段同时在场（未校准的一项填 "0"），补零规则在此处。
         SettingKey.FLOW_CALIBRATION to WriteSpec(
             command = "FLOW_CALIBRATION_MANUAL",
             encode = { p ->
@@ -1067,9 +1084,9 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 网络模式 / 承载偏好（计划书 2.6）：对外是 contract 的别名（大小写不敏感），
-        // 设备侧只认 BearerPreference 那 6 个**大小写敏感**的值。
-        // NetworkMode.toBearer 对 Bearer 取值本身是幂等的，所以已经映射过的调用方不受影响。
+        // 网络模式 / 承载偏好：对外是 contract 的别名（大小写不敏感），
+        // 设备侧只认 BearerPreference 的 6 个大小写敏感取值。
+        // NetworkMode.toBearer 对 Bearer 取值本身幂等，已映射过的调用方不受影响。
         SettingKey.NETWORK_MODE to WriteSpec(
             command = "SET_BEARER_PREFERENCE",
             encode = { p -> mapOf("BearerPreference" to NetworkMode.toBearer(p["value"]?.toString().orEmpty())) },
@@ -1078,15 +1095,15 @@ object ZteGoformProfile : DeviceProfile {
                 if (bearer in BEARER_VALUES) null
                 else "网络模式 ${p["value"]} 无法映射到设备支持的 BearerPreference"
             },
-            // 这一项就是「缺重试」那个 bug 的当事人（切制式第一次必定失败），不能是 NEVER
+            // 该项是「切换网络制式首次必定失败」缺陷的对应项，不能是 NEVER
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
 
-        // ───────── 阶段 0 批 1 新登记的项（命令名/参数键逐字抄自现有客户端） ─────────
+        // ───────── 动作类与设置类写命令 ─────────
 
-        // 三个动作类命令：设备侧都是无参，只有 goformId。
-        // retry = NEVER 不是"顺手"：重启/关机/恢复出厂重发一次的后果分别是再重启一次、
-        // 在已经断电的设备上白等一轮、以及在出厂口令下的第二次擦除。
+        // 三个动作类命令：设备侧均为无参，只有 goformId。
+        // retry = NEVER 的依据：重启 / 关机 / 恢复出厂重发一次的后果分别是再次重启、
+        // 向已经断电的设备重复发送，以及在出厂口令下执行第二次擦除。
         SettingKey.REBOOT to WriteSpec(
             command = "REBOOT_DEVICE",
             encode = { emptyMap() },
@@ -1103,12 +1120,12 @@ object ZteGoformProfile : DeviceProfile {
             retry = RetryPolicy.NEVER,
         ),
         // 后台口令修改。
-        // **哈希不在这里做**：设备要的 SHA256 大写十六进制与登录握手共用 GoformClient.sha256Hex，
-        // 在 profile 里抄第二份实现就有两个真源（登录侧哪天换算法，这里不报错、只是静默登不上）；
-        // 而且明文口令不进 device-schema 少一处泄露面。所以 encode 只做字段名映射。
-        // validate 挡住"忘了哈希直接传明文"——那会把明文口令原样发给设备，是安全问题不是格式问题。
-        // 校验文案里不许出现参数值（它会进 GoformSettingWriter 的 warn 日志）。
-        // 调用点的副作用（updateGoformPassword() + resetLogin()）WriteSpec 表达不了，见 §11.3。
+        // **哈希不在此处执行**：设备要求的 SHA256 大写十六进制与登录握手共用 GoformClient.sha256Hex，
+        // 在 profile 中复制第二份实现会产生两个真源（登录侧更换算法时此处不报错，只会静默登录失败）；
+        // 明文口令不进入 device-schema 亦可减少泄露面。因此 encode 只做字段名映射。
+        // validate 拦截「未哈希直接传明文」—— 否则明文口令会被原样发送给设备，属于安全问题而非格式问题。
+        // 校验文案不得包含参数值（该文案会进入 GoformSettingWriter 的 warn 日志）。
+        // 调用点的副作用（updateGoformPassword() 与 resetLogin()）无法由 WriteSpec 表达。
         SettingKey.BACKEND_PASSWORD to WriteSpec(
             command = "CHANGE_PASSWORD",
             encode = { p ->
@@ -1127,10 +1144,10 @@ object ZteGoformProfile : DeviceProfile {
             // 改完口令旧会话必然失效，重试只会拿着旧口令再登一次（必然失败），还会多发一次改密请求
             retry = RetryPolicy.NEVER,
         ),
-        // 连接模式：与 ROAM 共用 SET_CONNECTION_MODE（设备侧把漫游开关塞进了这条命令），
-        // 但参数集不同——这里只发 ConnectionMode，不带 roam_setting_option。
-        // 取值域照 NetworkRoutes 现有的归一结果（auto_dial / manual_dial），
-        // 设备大小写敏感，所以不做大小写兼容，认不出直接拒（也顺带挡住表单注入）。
+        // 连接模式：与 ROAM 共用 SET_CONNECTION_MODE（设备侧把漫游开关放在该命令中），
+        // 但参数集不同 —— 此处只发 ConnectionMode，不带 roam_setting_option。
+        // 取值域与 NetworkRoutes 的归一结果一致（auto_dial / manual_dial），
+        // 设备大小写敏感，因此不做大小写兼容，无法识别时直接拒绝（同时阻挡表单注入）。
         SettingKey.CONNECTION_MODE to WriteSpec(
             command = "SET_CONNECTION_MODE",
             encode = { p -> mapOf("ConnectionMode" to (p["value"]?.toString()?.trim() ?: "")) },
@@ -1140,8 +1157,8 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // WiFi 发射功率。0~2 这个值域不是新发明的：WifiRoutes 的入参校验（level must be 0-2）
-        // 一直是这个判据，搬进来是为了让"档位上限"这件设备事实只有一份。
+        // WiFi 发射功率。0~2 的取值域与 WifiRoutes 的入参校验（level must be 0-2）一致，
+        // 在此登记使「档位上限」这项设备事实只有一份。
         SettingKey.WIFI_POWER to WriteSpec(
             command = "SET_WIFI_POWER",
             encode = { p -> mapOf("wifiPowerLevel" to (p["value"]?.toString()?.trim() ?: "0")) },
@@ -1151,40 +1168,33 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // ───── 阶段 0 批 1b：开/关是两条命令的写入项（方案 b：WriteSpec.commandOf）─────
+        // ───── 开与关分属两条命令的写入项（WriteSpec.commandOf）─────
         //
-        // 下面三项（WIFI_ENABLED / MOBILE_DATA / PPP_DIAL）的共同点：一个用户动作（开/关），
-        // 设备侧却是两条不同的 goformId。
-        // 命令选择写在 commandOf 里，调用点只传一个布尔 —— 不给这个字段的话，
-        // "开发 A 命令、关发 B 命令"这段设备知识就会以 if 的形式漏在客户端里。
-        // （WIFI_BAND 夹在中间但**不属于这一类**：它只有一条命令，放这里是因为它与
-        //   WIFI_ENABLED 的"开"分支是同一条设备命令，两项要并排读才看得懂。）
+        // 下列三项（WIFI_ENABLED / MOBILE_DATA / PPP_DIAL）的共同点：一个用户动作（开 / 关），
+        // 设备侧却是两条不同的 goformId。命令选择写在 commandOf 中，调用点只传一个布尔值；
+        // 若没有该字段，「开发 A 命令、关发 B 命令」这段设备知识会以 if 的形式漏在客户端。
+        // （WIFI_BAND 不属于这一类：它只有一条命令，列在此处是因为它与 WIFI_ENABLED 的
+        //   「开」分支是同一条设备命令，两项并列阅读更易理解。）
 
         // WiFi 总开关：开与关是两条不同的命令，参数集也完全不同。
-        // 2026-09-22 真机抓包（**权威、逐字**）：
+        // 真机抓包（逐字）：
         //   关闭 WiFi：goformId=switchWiFiModule&isTest=false&SwitchOption=0&AD=...
         //   开启 WiFi：goformId=switchWiFiChip&isTest=false&ChipEnum=chip2&GuestEnable=0&AD=...
-        // 抓包时用户设备在 5G，所以"开"发的是 chip2。结合已确认的 chip1=2.4G / chip2=5G，
-        // switchWiFiChip&ChipEnum=X&GuestEnable=0 的语义是**「在频段 X 上启用 WiFi」** ——
-        // 既是"开"也是"切频段"，同一条命令。切频段的独立入口是 SettingKey.WIFI_BAND（下一项）。
+        // 抓包时设备处于 5G，因此「开」下发的是 chip2。结合已确认的 chip1=2.4G / chip2=5G，
+        // switchWiFiChip&ChipEnum=X&GuestEnable=0 的语义是「在频段 X 上启用 WiFi」，
+        // 既是「开」也是「切频段」，同属一条命令。切频段的独立入口是 SettingKey.WIFI_BAND。
         //
-        // chip 参数（可选，取值 chip1 / chip2 —— 设备自己的词汇，与读侧 wifi_chip 的取值域一致）：
-        //   有值 → 原样作 ChipEnum 下发；
-        //   缺失 → 退回 chip1。这是**调用方没告诉我当前频段时的兜底，会把设备切到 2.4G**，
-        //          属于已知的不理想分支：调用方（GoformWifiClient）有责任传设备当前频段。
-        //          在 2026-09-22 之前这里是**硬编码 chip1**，后果是用户在 5G 下点"打开 WiFi"
-        //          被静默切到 2.4G（真 bug）；现在硬编码只剩"缺参数"这一条路径。
-        //   关分支**不读 chip**：switchWiFiModule 只认 SwitchOption，传了 chip 也无害、
-        //          不影响编码结果（所以调用方不必为"关"特意去读当前频段）。
+        // chip 参数（可选，取值 chip1 / chip2 —— 设备词汇，与读侧 wifi_chip 的取值域一致）：
+        //   有值 → 原样作为 ChipEnum 下发；
+        //   缺失 → 退回 chip1。这是调用方未提供当前频段时的兜底，会把设备切到 2.4G，
+        //          属于已知的不理想分支：调用方（GoformWifiClient）有责任传入设备当前频段。
+        //          该兜底仅在缺少参数时生效，不会覆盖调用方提供的频段。
+        //   关分支不读 chip：switchWiFiModule 只认 SwitchOption，传入 chip 无副作用、
+        //          不影响编码结果（因此调用方无需为「关」读取当前频段）。
         //
-        // ── 注释归档：原「拆分方案」的第 2 步已被上面这份抓包否定 ──
-        // 2026-09-22 之前这里记着一个拆分方案，其第 2 步写的是「WIFI_ENABLED 只保留
-        // switchWiFiModule，SwitchOption=0|1，删掉 commandOf」。**那一步是错的**：开 WiFi 用的是
-        // switchWiFiChip（带频段），不是 switchWiFiModule&SwitchOption=1。
-        // **SwitchOption=1 本项目从未发过、抓包里也没有，至今无任何实测依据 —— 不许出现在代码里。**
-        // 这条记录留着是因为当时的克制是对的：那段注释明确写了「在拿到那条抓包之前不许按对称性猜」，
-        // 也正因此没把 SwitchOption=1 写进代码 —— 否则今天线上就是一条设备可能根本不认的
-        // 静默失败命令。事实部分不变：switchWiFiChip 不是纯开关，而是「带频段启用」。
+        // 实现约束：开启 WiFi 只能使用 switchWiFiChip（带频段），
+        // 不得使用 switchWiFiModule&SwitchOption=1 —— 该组合从未发送过，抓包中亦不存在，
+        // 无任何实测依据。switchWiFiChip 不是纯开关，而是「带频段启用」。
         SettingKey.WIFI_ENABLED to WriteSpec(
             command = "switchWiFiChip",
             commandOf = { p -> if (isOn(p["value"])) "switchWiFiChip" else "switchWiFiModule" },
@@ -1203,11 +1213,11 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // WiFi 频段选择：与上一项的"开"分支是**同一条命令**（switchWiFiChip），
-        // 所以它**同时会把 WiFi 打开** —— 设备侧没有"只切频段不动开关"的形态。
-        // 取值只收设备词汇 chip1 / chip2：不接受界面文案（2.4G / 5G），也不接受读侧
-        // ChipIndex 的原始编码（0 / 1）—— 收了别名就是让三套取值域在这里互相透传。
-        // 没有 fallback：这条命令没有"老固件不认换一条"的实测依据。
+        // WiFi 频段选择：与上一项的「开」分支是同一条命令（switchWiFiChip），
+        // 因此该命令同时会打开 WiFi —— 设备侧不存在「只切频段、不改开关」的形态。
+        // 取值只接收设备词汇 chip1 / chip2：不接受界面文案（2.4G / 5G），也不接受读侧
+        // ChipIndex 的原始编码（0 / 1），否则三套取值域会在此互相透传。
+        // 没有 fallback：该命令没有「旧固件不识别、改发另一条」的实测依据。
         SettingKey.WIFI_BAND to WriteSpec(
             command = "switchWiFiChip",
             encode = { p ->
@@ -1221,12 +1231,12 @@ object ZteGoformProfile : DeviceProfile {
             },
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
-        // 移动数据：逐字对齐 GoformNetworkClient.setMobileData
+        // 移动数据：与 GoformNetworkClient.setMobileData 一致
         //   主命令 → goformId=CONNECT_NETWORK（开）/ DISCONNECT_NETWORK（关）& notCallback=true
-        //   主命令失败才发 → goformId=SET_DATA_ENABLED & data=1/0（**不带** notCallback，照现有代码）
-        // notCallback=true 这个约定参数进 encode 的输出，不塞进 GoformSettingWriter 的公共 body
-        // （计划书 §4：只有这几条命令带它，塞进公共 body 等于给所有写命令都加上）。
-        // isTest=false 由 GoformCodec.buildSetFormBody 统一补，两条 spec 都不该再发一份。
+        //   主命令失败才发送 → goformId=SET_DATA_ENABLED & data=1/0（不带 notCallback，与现有代码一致）
+        // notCallback=true 属于 encode 的输出，不放进 GoformSettingWriter 的公共 body
+        // （只有这几条命令携带该参数，放进公共 body 会给所有写命令加上）。
+        // isTest=false 由 GoformCodec.buildSetFormBody 统一补充，两条 spec 都不应重复发送。
         SettingKey.MOBILE_DATA to WriteSpec(
             command = "CONNECT_NETWORK",
             commandOf = { p -> if (isOn(p["value"])) "CONNECT_NETWORK" else "DISCONNECT_NETWORK" },
@@ -1237,15 +1247,15 @@ object ZteGoformProfile : DeviceProfile {
             fallback = WriteSpec(
                 command = "SET_DATA_ENABLED",
                 encode = { p -> mapOf("data" to bool01(p["value"])) },
-                // 独立判定（不继承主命令）：它是"把数据开关设成 1/0"的纯设置类命令，
-                // 同值幂等、无计费副作用，与主命令同走 goformPostIdempotent，所以同样可重试。
+                // 独立判定（不继承主命令）：它是一条把数据开关设为 1/0 的纯设置类命令，
+                // 同值幂等、无计费副作用，与主命令同走 goformPostIdempotent，因此同样可重试。
                 retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
             ),
         ),
         // 手动拨号 / 挂断：GoformNetworkClient.connectNetwork() / disconnectNetwork()。
-        // 命令名与参数与 MOBILE_DATA 的主命令完全一样，**但没有 SET_DATA_ENABLED 兜底** ——
-        // 这两个方法现在失败就是失败。合并进 MOBILE_DATA 等于给这两个入口偷偷加一条
-        // 它们从来没发过的命令（见 SettingKey.PPP_DIAL 的 KDoc），那是行为变更。
+        // 命令名与参数与 MOBILE_DATA 的主命令完全一致，但没有 SET_DATA_ENABLED 兜底 ——
+        // 这两个方法失败即为失败。合并进 MOBILE_DATA 相当于给这两个入口增加一条
+        // 它们从未发送过的命令（见 SettingKey.PPP_DIAL 的 KDoc），属于行为变更。
         SettingKey.PPP_DIAL to WriteSpec(
             command = "CONNECT_NETWORK",
             commandOf = { p -> if (isOn(p["value"])) "CONNECT_NETWORK" else "DISCONNECT_NETWORK" },
@@ -1254,32 +1264,31 @@ object ZteGoformProfile : DeviceProfile {
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
 
-        // ───── 阶段 0 批 3：整份 WiFi 热点配置（setAccessPointInfo）─────
+        // ───── 整份 WiFi 热点配置（setAccessPointInfo）─────
         //
-        // 设备侧这条命令是**整表替换**：漏发一个键，那一项就按设备默认值走。仓库里已经为此出过
-        // 两次事故（改 SSID 把口令写成明文串、"不传口令改配置" 把口令清空），所以这里的原则是
-        // 「该发的键一个都不能少、不该发的键一个都不能多」，每一条缺省值都写在下面。
+        // 设备侧该命令是整表替换：漏发一个键，该项即按设备默认值写入。已知两类故障均由此产生
+        // （修改 SSID 时写坏口令、未传口令修改配置时清空口令），因此这里的原则是
+        // 「该发的键一个都不能少、不该发的键一个都不能多」，每条缺省值均在下方给出。
         //
-        // 读-改-写留在 GoformWifiClient（计划书 §11.3）：profile 只收**合并后的完整参数集**。
-        // 三个入口（改整份配置 / 只改 SSID / 只改口令）的差异全在「往 params 里放哪几个键」。
+        // 读-改-写留在 GoformWifiClient：profile 只接收合并后的完整参数集。
+        // 三个入口（修改整份配置 / 只改 SSID / 只改口令）的差异全部体现在「向 params 中放入哪几个键」。
         //
-        // Password 的发送条件**只看 passphrase 键在不在**，不在这里判 auth/encryp ——
-        // 「只改口令」那个入口对 OPEN 也发 Password，那是调用方的意图而不是设备事实。
-        // 把那个条件写进 encode，三处就共用不了同一份实现（见 SettingKey.WIFI_AP_CONFIG 的 KDoc）。
+        // Password 的发送条件只看 passphrase 键是否存在，不在此处判断 auth / encryp ——
+        // 「只改口令」入口对 OPEN 也会发送 Password，这属于调用方意图而非设备事实。
+        // 把该条件写进 encode 会使三处无法共用同一份实现（见 SettingKey.WIFI_AP_CONFIG 的 KDoc）。
         //
-        // validate 只覆盖 auth_mode 与 max_sta_num（2026-09-22 真机抓包给出了权威取值表，
-        // 见 validateApConfig）。**SSID 与口令仍然不校验**：它们允许任意字符（含 & 和 =），
-        // body 由 GoformCodec 统一 URL 编码；在这里给 SSID / 口令加格式校验会把现在能设的值
-        // 变成 Rejected，那是对外行为变更 —— 这也是当初整项没有 validate 的原始理由，仍然成立。
+        // validate 只覆盖 auth_mode 与 max_sta_num（权威取值表见 validateApConfig）。
+        // SSID 与口令仍然不校验：它们允许任意字符（含 & 和 =），body 由 GoformCodec 统一 URL 编码；
+        // 在此为 SSID / 口令增加格式校验会把当前可设置的值变为 Rejected，属于对外行为变更。
         SettingKey.WIFI_AP_CONFIG to WriteSpec(
             command = "setAccessPointInfo",
             encode = { p ->
                 val out = LinkedHashMap<String, String>()
-                // SSID 不做 trim：调用方已经 trim 过，profile 再 trim 一次就有两份"要不要去空格"的判断
+                // SSID 不做 trim：调用方已 trim，profile 再次 trim 会使「是否去空格」存在两处判断
                 p["ssid"]?.let { out["SSID"] = it.toString() }
                 val auth = p["auth_mode"]?.toString() ?: AP_AUTH_DEFAULT
                 out["AuthMode"] = auth
-                // OPEN 必须配 NONE：设备侧"开放热点 + 有加密算法"这个组合不成立
+                // OPEN 必须配 NONE：设备侧不允许「开放热点 + 加密算法」组合
                 out["EncrypType"] =
                     if (auth == AP_AUTH_OPEN) AP_ENCRYP_NONE
                     else (p["encrypt_type"]?.toString() ?: AP_ENCRYP_DEFAULT)
@@ -1296,14 +1305,14 @@ object ZteGoformProfile : DeviceProfile {
                 out
             },
             validate = ::validateApConfig,
-            // 设置类命令、同一取值幂等（同一份配置发两次结果一样），与其余 18 项一致
+            // 设置类命令、同一取值幂等（同一份配置发送两次结果相同）
             retry = RetryPolicy.RETRY_ON_SESSION_LOSS,
         ),
     )
 
     // ────────────────────── WiFi 热点配置的设备侧缺省值 ──────────────────────
-    // 这四个常量就是"调用方没给值时设备侧要收到什么"，逐字抄自 GoformWifiClient 的三个调用点。
-    // 提成常量而不是内联字面量：encode 与测试引用同一份，改缺省值时不会只改一处。
+    // 这些常量定义「调用方未提供取值时设备侧应收到什么」，取值与 GoformWifiClient 的三个调用点一致。
+    // 提为常量而非内联字面量：encode 与测试引用同一份，修改缺省值时不会遗漏。
 
     /** 认证方式缺省档：现有三个调用点在读不到当前值时都填这个。 */
     private const val AP_AUTH_DEFAULT = "WPA2PSK"
@@ -1321,50 +1330,48 @@ object ZteGoformProfile : DeviceProfile {
     private const val AP_CHIP_INDEX_DEFAULT = "0"
 
     /**
-     * `AuthMode` 的完整取值域（2026-09-22 真机抓包，界面四个选项逐条对齐设备参数）：
+     * `AuthMode` 的完整取值域（真机抓包，界面四个选项逐条对齐设备参数）：
      *
      * | 界面选项 | AuthMode | EncrypType | Password |
      * |---|---|---|---|
-     * | `OPEN` | `OPEN` | `NONE` | **不发** |
+     * | `OPEN` | `OPEN` | `NONE` | 不发 |
      * | `WPA2(AES)-PSK` | `WPA2PSK` | `CCMP` | 发 |
      * | `WPA3-PSK` | `WPA3PSK` | `CCMP` | 发 |
      * | `WPA2-PSK/WPA3-PSK` | `WPA2PSKWPA3PSK` | `CCMP` | 发 |
      *
-     * 设备**大小写敏感**，所以这里不做大小写兼容（`wpa2psk` 直接拒）。
-     * 缺省档 [AP_AUTH_DEFAULT] 必须在这张表里 —— 所以它是这个集合的成员而不是另写一个字面量：
-     * 调用方不传 `auth_mode` 时 encode 会填缺省档，缺省档掉出白名单就成了「校验放过、设备拒收」。
+     * 设备大小写敏感，因此不做大小写兼容（`wpa2psk` 直接拒绝）。
+     * 缺省档 [AP_AUTH_DEFAULT] 必须属于该集合 —— 因此它是集合成员而不是另写的字面量：
+     * 调用方不传 `auth_mode` 时 encode 会填入缺省档，缺省档若不在白名单内就会「校验放过、设备拒收」。
      */
     private val AP_AUTH_MODES = setOf(AP_AUTH_OPEN, AP_AUTH_DEFAULT, "WPA3PSK", "WPA2PSKWPA3PSK")
 
     /**
-     * `max_sta_num` 的合法区间：**闭区间 `1..10`**。
+     * `max_sta_num` 的合法区间：闭区间 `1..10`。
      *
-     * 依据：**用户对中兴 F50 的实测/规格结论 —— 最大支持 10 个（2026-09-22）**。
-     * 在此之前这里刻意不设上限（注释写的是「真机见过 7 与 10，固件真实上限未知」）；
-     * 现在上限有了权威来源，超过 10 就该在下发前拒掉，而不是让设备静默按自己的上限截断。
+     * 依据：中兴 F50 的最大接入设备数为 10（规格结论）。上限确定后，超过 10 的值应在下发前拒绝，
+     * 而不是让设备按自身上限静默截断。
      */
     private val AP_MAX_STA_NUM_RANGE = 1..10
 
     /**
-     * WiFi 热点配置的值域校验：**只管 `auth_mode` 与 `max_sta_num`**。
+     * WiFi 热点配置的值域校验：只覆盖 `auth_mode` 与 `max_sta_num`。
      *
-     * ## 为什么只管这两项
+     * ## 为什么只覆盖这两项
      *
-     * 只有这两项有权威取值依据（[AP_AUTH_MODES] 那张真机表 / [AP_MAX_STA_NUM_RANGE] 那条 F50 结论）。
-     * SSID 与 `passphrase` **一个都不校验**：它们允许任意字符（含 `&` 和 `=`），
-     * 加格式校验会把现在能设的值变成 Rejected。
+     * 只有这两项具备权威取值依据（[AP_AUTH_MODES] 的取值表 / [AP_MAX_STA_NUM_RANGE] 的 F50 结论）。
+     * SSID 与 `passphrase` 不做任何校验：它们允许任意字符（含 `&` 和 `=`），
+     * 增加格式校验会把当前可设置的值变为 Rejected。
      *
-     * ## 三条刻意的选择
+     * ## 三条实现约定
      *
-     * 1. **null == 不传**（不是「传了个空值」）：与 encode 的 `p["auth_mode"]?.toString() ?: 缺省`
-     *    逐字一致。用 `containsKey` 判会让「显式传 null」被拒，而那条路径今天是走缺省值的。
-     * 2. **不 trim**：encode 发的是 `toString()` 原值，这里 trim 后比对就会让 `" WPA2PSK "`
-     *    通过校验、再被原样发给设备 —— 校验与下发必须看同一个字符串。
-     * 3. `max_sta_num` 判**闭区间 [AP_MAX_STA_NUM_RANGE]**（`1..10`）：上限 10 来自用户对
-     *    中兴 F50 的实测/规格结论（2026-09-22）。越界在下发前就拒，比让设备按自己的上限
-     *    静默截断要好 —— 用户能看见原因。
+     * 1. **null 表示未提供**（而不是「提供了空值」）：与 encode 的 `p["auth_mode"]?.toString() ?: 缺省`
+     *    一致。用 `containsKey` 判定会使「显式传 null」被拒绝，而该路径当前走缺省值。
+     * 2. 不 trim：encode 发送的是 `toString()` 原值，此处 trim 后比对会使 `" WPA2PSK "`
+     *    通过校验、再被原样发送给设备 —— 校验与下发必须针对同一个字符串。
+     * 3. `max_sta_num` 判定闭区间 [AP_MAX_STA_NUM_RANGE]（`1..10`）。越界在下发前拒绝，
+     *    优于让设备按自身上限静默截断，用户可看到拒绝原因。
      *
-     * 返回文案**不含参数值**（计划书 §11.3）：这份 params 里有明文口令，被拒原因会进日志。
+     * 返回文案不包含参数值：这份 params 中含明文口令，拒绝原因会进入日志。
      */
     private fun validateApConfig(p: Map<String, Any?>): String? {
         p["auth_mode"]?.let { raw ->
@@ -1378,8 +1385,8 @@ object ZteGoformProfile : DeviceProfile {
                 return "最大接入设备数必须是 1~10 的整数（中兴 F50 最大支持 10 个）"
             }
         }
-        // 2026-10-05 R4-8 修复：chip_index 此前不经任何校验透传为 ChipIndex，"chip9"/空串等
-        // 非法值只会得到设备侧模糊失败。与 wifi_chip 写项同取值域（WIFI_CHIPS）。
+        // chip_index 必须与 wifi_chip 写项同取值域（WIFI_CHIPS）：缺少校验时它会原样透传为
+        // ChipIndex，"chip9"、空串等非法值只会得到设备侧不明确的失败。
         p["chip_index"]?.let { raw ->
             if (raw.toString().trim() !in WIFI_CHIPS) {
                 return "chip_index 只支持 chip1 / chip2"
@@ -1422,25 +1429,25 @@ object ZteGoformProfile : DeviceProfile {
      */
     private fun isOn(v: Any?): Boolean = bool01(v) == "1"
 
-    /** 设备侧 `ConnectionMode` 的取值域（大小写敏感，认不出不许猜一个下发）。 */
+    /** 设备侧 `ConnectionMode` 的取值域（大小写敏感，无法识别时不下发猜测值）。 */
     private val CONNECTION_MODES = setOf("auto_dial", "manual_dial")
 
     // ────────────────────── WiFi 频段（switchWiFiChip 的 ChipEnum） ──────────────────────
 
     /**
-     * `ChipEnum` 的取值域：`chip1` = 2.4G、`chip2` = 5G（2026-09-22 真机抓包）。
+     * `ChipEnum` 的取值域：`chip1` = 2.4G、`chip2` = 5G（真机抓包）。
      *
-     * 这套词汇与读侧 canonical 字段 `wifi_chip` 的取值域**逐字一致**（见 WIFI_CHIP_DECODER：
-     * `ChipIndex=0` → `chip1`、`1` → `chip2`）。刻意不收 `"2.4G"` / `"5G"`（界面文案）与
-     * `"0"` / `"1"`（读侧原始编码）：一旦收别名，读侧编码就会被当设备值透传。
+     * 该词汇与读侧 canonical 字段 `wifi_chip` 的取值域一致（见 WIFI_CHIP_DECODER：
+     * `ChipIndex=0` → `chip1`、`1` → `chip2`）。刻意不接受 `"2.4G"` / `"5G"`（界面文案）与
+     * `"0"` / `"1"`（读侧原始编码）：一旦接受别名，读侧编码就会被当作设备值透传。
      */
     private val WIFI_CHIPS = setOf("chip1", "chip2")
 
     /**
-     * [SettingKey.WIFI_ENABLED] 的「开」分支在**调用方没给 chip** 时用的兜底频段。
+     * [SettingKey.WIFI_ENABLED] 的「开」分支在调用方未提供 chip 时使用的兜底频段。
      *
-     * 它会把设备切到 2.4G —— 是已知的不理想分支，不是推荐路径（调用方有责任传当前频段）。
-     * 2026-09-22 之前这个值是 encode 里的硬编码字面量，现在只剩"缺参数"这一条路径会用到它。
+     * 它会把设备切到 2.4G，是已知的不理想分支，不是推荐路径（调用方有责任传入当前频段）。
+     * 该兜底仅在缺少参数时生效。
      */
     private const val WIFI_CHIP_FALLBACK = "chip1"
 
@@ -1452,12 +1459,12 @@ object ZteGoformProfile : DeviceProfile {
     private val SHA256_UPPER_HEX = Regex("^[0-9A-F]{64}$")
 
     /**
-     * 口令字段必须是**调用方算好的** SHA256 大写十六进制。
+     * 口令字段必须是调用方已计算的 SHA256 大写十六进制。
      *
-     * 这条校验的真正目的不是格式而是安全：万一调用点忘了哈希，明文口令会被原样拼进
-     * goform 表单发出去，而且设备只会回一个"失败"，没人能从日志里看出泄露已经发生。
-     * 大写是设备侧事实（现有调用点是 `client.sha256Hex(x).uppercase()`），小写没实测过，
-     * 因此一并挡住 —— 与其静默失败，不如在下发前就拒。
+     * 该校验的目的不是格式而是安全：若调用点未做哈希，明文口令会被原样拼进 goform 表单发出，
+     * 而设备只返回失败，日志中无法看出泄露已经发生。大写是设备侧要求
+     * （现有调用点为 `client.sha256Hex(x).uppercase()`），小写无实测依据，因此一并拒绝：
+     * 在下发前拒绝优于静默失败。
      */
     private fun isSha256UpperHex(v: Any?): Boolean =
         v?.toString()?.trim()?.matches(SHA256_UPPER_HEX) == true
@@ -1476,9 +1483,9 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * LAN/DHCP 参数校验。
      *
-     * 这几个值会原样进 goform 表单，所以必须挡住 `192.168.0.1&goformId=FACTORY_RESET` 这类注入
-     * （4.7 已给 body 做 URL 编码，这里是第二道）。`dhcp_start` / `dhcp_end` 允许为空 —— 关闭
-     * DHCP 服务器时官方 UI 就是发空串。
+     * 这些值会原样进入 goform 表单，因此必须拦截 `192.168.0.1&goformId=FACTORY_RESET`
+     * 这类注入（body 已做 URL 编码，此处是第二道防线）。`dhcp_start` / `dhcp_end` 允许为空 ——
+     * 关闭 DHCP 服务器时官方 UI 同样发送空串。
      */
     private fun validateDhcp(p: Map<String, Any?>): String? {
         for (key in listOf("lan_ip", "lan_netmask", "dhcp_start", "dhcp_end")) {
@@ -1509,12 +1516,11 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * 频段号列表校验。
      *
-     * 值域 1..255：与 [GoformNetworkClient] 的 `lockLteBands`/`lockNrBands` 注释
-     * （「频段号值域由 profile 的 validate 兜（1..255 的纯数字列表）」）以及路由层
-     * `NetworkRoutes` 的注释承诺一致 —— 非法值必须在这里被拒（返回原因 → 路由回
-     * 400 OUT_OF_RANGE），不能只验「是不是数字」就放行到基带。
+     * 值域 1..255，与 [GoformNetworkClient] 的 `lockLteBands` / `lockNrBands` 注释以及
+     * 路由层 `NetworkRoutes` 的约定一致：非法值必须在此处被拒绝（返回原因 → 路由返回
+     * 400 OUT_OF_RANGE），不能只校验「是否为数字」就放行到基带。
      *
-     * 空串仍是「解锁」（与 [lteAllBandsMask] 的语义同侧，见 GoformAllBandsMaskTest）。
+     * 空串仍表示「解锁」（与 [lteAllBandsMask] 的语义同侧，见 GoformAllBandsMaskTest）。
      */
     private fun validateBandList(raw: String?): String? {
         val s = raw?.trim().orEmpty()
@@ -1535,8 +1541,8 @@ object ZteGoformProfile : DeviceProfile {
     private val ACL_MAC_REGEX = Regex("^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 
     /**
-     * 拼设备侧名单串：`"a;b;"` —— 分号分隔且**末尾也带分号**（抓包形态，单项也是 `"mac;"`）。
-     * 空列表 → 空串（key 仍然要发，见 [SettingKey.WIFI_ACL] 的说明）。
+     * 拼设备侧名单串：`"a;b;"` —— 分号分隔且末尾也带分号（抓包形态，单项同样为 `"mac;"`）。
+     * 空列表 → 空串（key 仍然要发送，见 [SettingKey.WIFI_ACL] 的说明）。
      */
     private fun aclList(value: Any?): String {
         val items = when (value) {
@@ -1557,9 +1563,9 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * 校验四条名单。
      *
-     * MAC 必须是标准 `xx:xx:xx:xx:xx:xx`，名称不许含 `;`（分隔符）与 `&` `=`（设备侧表单是
-     * 字符串拼接，见计划书 §9.2）。Mac 与 Name 两条列表长度必须相等 —— 设备按下标配对，
-     * 长度不齐会把名字错配到别的 MAC 上。
+     * MAC 必须是标准 `xx:xx:xx:xx:xx:xx`，名称不得包含 `;`（分隔符）与 `&` `=`（设备侧表单为
+     * 字符串拼接）。Mac 与 Name 两条列表长度必须相等 —— 设备按下标配对，
+     * 长度不一致会把名称错配到其他 MAC 上。
      */
     private fun validateAcl(p: Map<String, Any?>): String? {
         p["mode"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let {
@@ -1591,16 +1597,16 @@ object ZteGoformProfile : DeviceProfile {
     )
 
     /**
-     * 读侧：拆设备的 `data_volume_limit_size` 复合串，派生出 `limit_value` /
+     * 读侧：拆分设备的 `data_volume_limit_size` 复合串，派生出 `limit_value` /
      * `limit_unit_display` / `limit_bytes` 三个 canonical 键。
      *
-     * 为什么放 `structuralDecoder` 而不是给复合串登记三条 `FieldSpec`：**派生键直接用
-     * canonical 名**，于是过渡期 `KEEP_PRESENT` 不会把 `data_volume_limit_size` 当别名再
-     * 输出一份 —— 复合串是计划书 2.8 明确要求不出现在响应里的（它曾让 app 的 GB 档流量告警
-     * 永不触发）。写侧的反向拼串在 [compoundLimitSize]。
+     * 之所以放在 `structuralDecoder` 而不为复合串登记三条 `FieldSpec`：派生键直接使用
+     * canonical 名，因此 `KEEP_PRESENT` 不会把 `data_volume_limit_size` 当作别名再输出一份 ——
+     * 复合串不应出现在响应中：它会使 app 的 GB 档流量告警失效。
+     * 写侧的反向拼串见 [compoundLimitSize]。
      *
-     * 没有下划线时按 MB 处理（少数固件直接给纯数字）；值非正数或解析不出时**不派生
-     * `limit_bytes`**，由"缺失 = 省略 key"的语义交给调用方按默认 0 处理。
+     * 没有下划线时按 MB 处理（少数固件直接给纯数字）；值非正数或无法解析时不派生
+     * `limit_bytes`，由「缺失 = 省略 key」的语义交给调用方按默认 0 处理。
      */
     private fun splitDataVolumeLimit(raw: JsonObject): JsonObject {
         val compound = (raw["data_volume_limit_size"] as? JsonPrimitive)?.content?.trim().orEmpty()
@@ -1662,11 +1668,10 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * 制式名 → 小区锁定命令的数字 RAT 码（`12` = LTE，`16` = NR）。
      *
-     * **这是写侧的独立取值域**，与 [NETWORK_TYPE_MAP]（读侧的 `network_type` 数字码）不是
-     * 同一套编码 —— 2026-09-15 前这里拿 `NETWORK_TYPE_MAP.keys` 当白名单，等于把两套码
-     * 绑在一起，读侧表一改写侧校验就跟着漂。
+     * 这是写侧的独立取值域，与 [NETWORK_TYPE_MAP]（读侧 `network_type` 的数字码）不是同一套编码。
+     * 若以 `NETWORK_TYPE_MAP.keys` 充作白名单，两套码会被绑定，读侧表一变写侧校验就随之漂移。
      *
-     * 也接受已经是数字码的入参：app 侧历史上直接发 `"12"` / `"16"`，兼容期内不能判成非法
+     * 同时接受已是数字码的入参：app 侧历史上直接发送 `"12"` / `"16"`，兼容期内不能判为非法
      * （契约见 `docs/UFI-AXIS-Core-API-Reference.md` 的 `/api/device/cell-lock`）。
      */
     private val CELL_LOCK_RAT_CODES = setOf("12", "16")
@@ -1687,12 +1692,12 @@ object ZteGoformProfile : DeviceProfile {
     /**
      * 对外的卡槽序号 → 设备侧卡槽值。
      *
-     * 设备侧的 0/1/2/11 是运营商预置位（移动/电信/联通/外置），不是物理槽位号；
-     * 对外只暴露 1 起的序号与 `"external"`。
+     * 设备侧的 0/1/2/11 是运营商预置位（移动 / 电信 / 联通 / 外置），不是物理槽位号；
+     * 对外只暴露从 1 开始的序号与 `"external"`。
      *
-     * **不接受设备侧原值**：旧客户端的 `goformSlot` 取值域与新序号重叠
-     * （旧的 `"1"` 是电信，新的 `1` 是第一个槽位），在这里放行会把两套语义混在一起，
-     * 所以旧值的换算留在 route 的兼容分支（`SimRoutes`）。
+     * 不接受设备侧原值：旧客户端的 `goformSlot` 取值域与新序号重叠
+     * （旧的 `"1"` 是电信，新的 `1` 是第一个槽位），在此放行会把两套语义混在一起，
+     * 因此旧值的换算留在 route 的兼容分支（`SimRoutes`）。
      */
     private fun simSlotOrNull(v: Any?): String? = when (v?.toString()?.trim().orEmpty()) {
         "1" -> "0"

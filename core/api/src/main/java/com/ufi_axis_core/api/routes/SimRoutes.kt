@@ -46,6 +46,11 @@ class SimRoutes(
             post("/switch") {
                 // 能力门禁（3.3）：缺 sim_slot_switch → 501 NOT_SUPPORTED
                 dataHub.deviceCapabilities.requireCapability(Capability.SIM_SLOT_SWITCH)
+                // 更新互斥（2026-10-05 R4-9 修复）：更新进行中不接受切卡写命令。
+                // 2026-10-30：提到参数解析**之前**，与 DeviceRoutes / ShellRoutes 的门禁顺序一致
+                //（先判状态类前置条件，再校验值域），也让「门禁必须写在 handler 开头」这条
+                // 纪律可以被 CapabilityBindingTest 机械校验。
+                if (call.rejectIfUpdating()) return@post
                 val params = call.receiveJsonObject()
                 // 规范入参：slot = 1 起的卡槽序号，或 "external"（外置卡）。
                 // 序号 → 设备值的映射在 profile 的 WriteSpec 里（计划书 2.6）。
@@ -72,8 +77,6 @@ class SimRoutes(
                         "slot is required (1/2/3 or \"external\")")
                     return@post
                 }
-                // 更新互斥（2026-10-05 R4-9 修复）：更新进行中不接受切卡写命令。
-                if (call.rejectIfUpdating()) return@post
                 // 软检查（2026-10-05 R4-9 修复）：读 TelephonyManager 的 SIM 在位状态
                 // （本地调用，不打 goform），无卡 / PUK 时切卡只会得到设备侧模糊失败。
                 // 状态取不到时放行（不因采集缺失而阻塞合法操作）。

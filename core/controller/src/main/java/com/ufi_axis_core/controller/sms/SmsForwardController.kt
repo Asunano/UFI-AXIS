@@ -480,8 +480,13 @@ class SmsForwardController(
         val store = ruleStore
         val verdict = store?.evaluate(from, body)
         if (verdict is SmsFilter.Verdict.Block) {
-            // 正文只打 50 字（沿用既有做法，避免把整条短信写进日志）
-            AppLogger.i(tag, "SMS mail blocked by rule ${verdict.ruleId}: from=$from body=${body.take(50)}")
+            // 2026-10-30 F7：正文**不再打前 50 字** —— 验证码几乎总在开头，而日志可被
+            // 任何已配对客户端读走。只留长度 + 摘要，用于回答“是不是同一条”，不落原文。
+            AppLogger.i(
+                tag,
+                "SMS mail blocked by rule ${verdict.ruleId}: from=${AppLogger.maskPhone(from)} " +
+                    AppLogger.bodyDigest(body)
+            )
             // 邮件链路拿不到设备侧短信 id（入参只有 from/body/timestamp），msg_id 落 0，
             // 由 store 按 sender + 60s 窗口与推送/入库那两条路径的记录合并。
             store.recordBlocked(msgId = 0L, sender = from, body = body, block = verdict, path = SmsRuleStore.Path.MAIL)

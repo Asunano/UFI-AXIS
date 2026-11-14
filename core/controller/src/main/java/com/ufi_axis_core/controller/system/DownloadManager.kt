@@ -1,4 +1,4 @@
-// TODO(F25): God-class 计划内拆分（DownloadManager 1094 / GoformClient 615 / Aria2Engine 577 / BackendService 570 / NetworkModule 921 / FileManagerScreen 879）。本类仅做最小安全抽取（见 GoformCodec），全量拆分需人工评审 + 编译验证。
+// TODO: 本类职责范围较大，需人工评审并做编译验证后按职责拆分；当前仅完成最小范围的安全抽取（见 GoformCodec）。
 package com.ufi_axis_core.controller.system
 
 import com.ufi_axis_core.util.AppLogger
@@ -27,18 +27,18 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
- * 无 root 的 aria2 下载管理器
+ * 无 root 的 aria2 下载管理器。
  *
  * 所有任务统一由 aria2c 子进程（JSON-RPC）驱动，支持
  * HTTP/HTTPS/FTP/magnet/torrent/metalink（多连接、P2P）。
- * 文件读写、传感器采集均走 Java File I/O / 系统 API，不依赖 root。
+ * 文件读写与传感器采集均使用 Java File I/O 与系统 API，不依赖 root。
  *
- * @param platform 平台适配层（阶段 4 的 4.3）。本类只用它的
- *   [PlatformAdapter.readTemperature] —— 热区读法已经从本类搬进 `SprdPlatform`。
- *   装配层递的是 `ComponentFactory` 里那**一份共享实例**（不要自己 `platform(ctx)` 再造一个）。
- * @param tuning 本设备的实测阈值调参（阶段 4 的 4.5）。只用于**两个地方**：
- *   「第一次创建配置」时的温度阈值初值、以及 `migrateConfig()` 抬升存量配置时的**目标值**。
- *   ⚠ **用户已经写进 `config.json` 的值仍然优先** —— tuning 不覆盖它们。
+ * @param platform 平台适配层。本类只使用其 [PlatformAdapter.readTemperature]；
+ *   温度读取实现位于 `SprdPlatform`。装配层传入 `ComponentFactory` 中的同一份共享实例，
+ *   不应另行创建。
+ * @param tuning 本设备的实测阈值参数。仅用于两处：「首次创建配置」时的温度阈值初值，
+ *   以及 `migrateConfig()` 抬升存量配置时的目标值。
+ *   用户已写入 `config.json` 的值始终优先，tuning 不覆盖它们。
  */
 class DownloadManager(
     private val appContext: android.content.Context,
@@ -70,33 +70,31 @@ class DownloadManager(
         private const val EXTERNAL_ROOT = "/storage/emulated/0"
 
         /**
-         * 存量配置的温度阈值**地板判据**，摄氏度。
+         * 存量配置的温度阈值地板判据，单位摄氏度。
          *
-         * ⚠ **这两个数与「抬到多少」不是同一个数**：地板判据回答「旧到什么程度才算需要迁移」，
-         * 目标值回答「抬到多少」。`migrateConfig()` 的原文是
-         * `< 70f` → `75f`、`< 80f` → `85f`，两侧各是一个独立的数。
+         * 地板判据与「抬升目标值」是两个独立的数值：地板判据回答「旧值低到什么程度才需要迁移」，
+         * 目标值回答「迁移到多少」。迁移规则为 `< 70f` → `75f`、`< 80f` → `85f`，两侧各自取值。
          *
-         * 4.5 只把**目标值**接到了 [DeviceTuning]（`downloadThrottleWarnC` / `downloadThrottleCriticalC`），
-         * 这两条地板判据**保持字面量** —— [DeviceTuning] 里**没有承载它们的字段**，
-         * 拿目标值去当判据会静默改掉迁移的触发范围（例如目标值 75 当判据，
-         * 就会把用户自己设成 72 的 warn 也抬到 75）。
+         * [DeviceTuning] 只承载目标值（`downloadThrottleWarnC` / `downloadThrottleCriticalC`），
+         * 这两个地板判据保持字面量：[DeviceTuning] 中没有承载它们的字段，
+         * 以目标值作为判据会静默改变迁移的触发范围（例如以 75 为判据时，
+         * 用户自行设为 72 的 warn 也会被抬到 75）。
          *
-         * 登记：地板判据同样是「换设备要重新量」的设备知识，但 tuning 现在装不下它。
-         * 要不要给 [DeviceTuning] 加两个字段是独立的一次契约变更（会动 `PluginContractTest`）。
+         * 地板判据同属「更换设备需重新测量」的设备知识，当前 [DeviceTuning] 未包含该维度。
+         * 为其增加字段属于独立的契约变更（会影响 `PluginContractTest`）。
          */
         private const val LEGACY_TEMP_WARN_FLOOR_C = 70f
         private const val LEGACY_TEMP_CRITICAL_FLOOR_C = 80f
 
         /**
-         * **第一次创建配置**（`config.json` 还不存在）时的初值：两个温度阈值取插件的实测值。
+         * 首次创建配置（`config.json` 尚不存在）时的初值：两个温度阈值取插件的实测值。
          *
-         * ⚠ 只有这一条路径吃 tuning。文件已存在时走 `loadConfig()` 的反序列化，
-         * 本函数造出来的对象会被整个替换掉 —— 也就是**用户已写的配置优先**。
+         * 只有该路径使用 tuning。文件已存在时走 `loadConfig()` 的反序列化，
+         * 本函数构造的对象会被整体替换，即用户已写入的配置优先。
          *
-         * ⚠ 还有一条**没有**吃 tuning 的兜底：json 里**缺字段**时，
-         * kotlinx 会用 [DownloadConfig] 的字段默认值（仍是字面量 75f / 85f）。
-         * 今天与 F50 的 tuning 取值相同所以无差别；登记在此，不在本批改
-         * （改它要给 [DownloadConfig] 换一套构造方式，属于序列化层的变更）。
+         * 另有一条路径不使用 tuning：json 中缺少字段时，kotlinx 使用 [DownloadConfig] 的字段
+         * 默认值（字面量 75f / 85f）。当前两者取值相同，故无行为差异；修改该路径需要调整
+         * [DownloadConfig] 的构造方式，属于序列化层变更。
          */
         internal fun initialConfig(tuning: DeviceTuning): DownloadConfig = DownloadConfig(
             throttleTempWarn = tuning.downloadThrottleWarnC,
@@ -104,11 +102,11 @@ class DownloadManager(
         )
 
         /**
-         * 老配置迁移的**纯逻辑**，原地改 [config]，返回「有没有改动」。
+         * 存量配置迁移的纯逻辑：原地修改 [config]，返回是否有改动。
          *
-         * 从 `migrateConfig()` 原样抽出来（控制流、判据、顺序一字未改），只为可单测 ——
-         * 落盘与日志仍在 `migrateConfig()` 里。两处温度迁移的**目标值**改成读 [tuning]，
-         * **地板判据**仍是 [LEGACY_TEMP_WARN_FLOOR_C] / [LEGACY_TEMP_CRITICAL_FLOOR_C]。
+         * 控制流、判据与顺序与 `migrateConfig()` 保持一致；落盘与日志仍由 `migrateConfig()`
+         * 负责。两处温度迁移的目标值取自 [tuning]，地板判据仍为
+         * [LEGACY_TEMP_WARN_FLOOR_C] / [LEGACY_TEMP_CRITICAL_FLOOR_C]。
          */
         internal fun migrateConfigInPlace(config: DownloadConfig, tuning: DeviceTuning): Boolean {
             var changed = false
@@ -126,13 +124,13 @@ class DownloadManager(
         }
 
         /**
-         * 温度等级（0 / 2 / 3 / 4），从 `checkAndThrottle()` 原样抽出来，只为可单测。
+         * 温度等级（0 / 2 / 3 / 4）。
          *
-         * 四档的判据、比较符、顺序一字未改；唯一的变化是第 4 档那个裸字面量 `+ 10`
-         * 换成了 [DeviceTuning.downloadThrottleForcePauseOffsetC]（F50 实测同样是 10f）。
+         * 四档的判据、比较符与顺序与 `checkAndThrottle()` 保持一致；第 4 档的偏移量为
+         * [DeviceTuning.downloadThrottleForcePauseOffsetC]（目标设备实测值 10f）。
          *
-         * ⚠ 两条线仍然**都取自 `config`**（用户可配），不是取自 tuning ——
-         * tuning 只在「配置初值」与「迁移目标值」两处出现，运行时判档一律看用户配置。
+         * 两条阈值线均取自 `config`（用户可配置），不取自 tuning —— tuning 只出现在
+         * 「配置初值」与「迁移目标值」两处，运行时判档一律以用户配置为准。
          */
         internal fun computeTempLevel(temp: Float, config: DownloadConfig, tuning: DeviceTuning): Int = when {
             temp >= config.throttleTempCritical + tuning.downloadThrottleForcePauseOffsetC -> 4  // 极端高温
@@ -193,10 +191,10 @@ class DownloadManager(
         var btTrackerCustomList: String = "",
         // ── 智能性能控制（阈值已由固件调参固定，仅保留开关与用户偏好）──
         var smartThrottle: Boolean = true,
-        // 2026-09-02：warn 原本是 55°C，而 F50 这类 UFI 空载就 64~66°C —— 等于开机即限速
-        // （1000KB/s + 并发砍半）且永不退出。按实测空载温度上调到 75/85。
-        // 2026-09-24（4.5）：**第一次创建配置**时这两个值由插件的 DeviceTuning 供给
-        // （见 initialConfig）；下面这两个字面量只剩一个用途 —— 反序列化时 json 缺字段的兜底。
+        // 温度阈值默认值。UFI 类设备空载温度即达 64~66°C，warn 取 55°C 会导致开机即限速
+        // （1000KB/s + 并发减半）且永不退出，故取 75/85。
+        // 首次创建配置时这两个值由插件的 DeviceTuning 供给（见 initialConfig）；
+        // 此处的字面量只用于反序列化时 json 缺字段的兜底。
         var throttleTempWarn: Float = 75f,
         var throttleTempCritical: Float = 85f,
         var throttleCpuWarn: Int = 60,
@@ -217,8 +215,8 @@ class DownloadManager(
     val aria2 = Aria2Engine(appContext)
     val trackerManager = TrackerManager(appContext)
     /**
-     * 当前配置。初值 = 插件实测值（4.5）；`init` 里的 `loadConfig()` 会在 `config.json`
-     * 存在时把它整个换成盘上的那份 —— **用户已写的配置优先**。
+     * 当前配置。初值为插件实测值；`init` 中的 `loadConfig()` 会在 `config.json` 存在时
+     * 用磁盘上的配置整体替换 —— 用户已写入的配置优先。
      */
     @Volatile var config = initialConfig(tuning)
         private set
@@ -250,8 +248,7 @@ class DownloadManager(
     @Volatile var throttleWasStopped: Boolean = false
         private set
 
-    /** DataScheduler 引用，复用已采集的传感器缓存数据，避免重复 shell 调用 */
-    // DataScheduler is in the main core module (not extracted yet); always use direct reads
+    /** 传感器数据由本类直接读取：DataScheduler 位于主 core 模块，尚未抽取到本模块，不能复用其缓存。 */
 
     init {
         val dir = File(appContext.filesDir, "downloads")
@@ -259,8 +256,8 @@ class DownloadManager(
         persistFile = File(dir, "tasks.json")
         configFile = File(dir, "config.json")
         loadConfig()
-        // 关键：调用 getExternalFilesDir 让 Android 系统创建 /Android/data/<pkg>/files/ 父目录链
-        // 否则 aria2c 子进程无法 mkdir DEFAULT_SAVE_DIR (Permission denied)
+        // 调用 getExternalFilesDir 以确保 Android 创建 /Android/data/<pkg>/files/ 父目录链，
+        // 否则 aria2c 子进程无法创建 DEFAULT_SAVE_DIR（Permission denied）。
         appContext.getExternalFilesDir(null)
         File(DEFAULT_SAVE_DIR).mkdirs()
         smartMkdir(config.saveDir)
@@ -276,8 +273,7 @@ class DownloadManager(
         // 懒加载: 探测 aria2 版本信息（不长期运行进程）
         aria2.probeVersion()
 
-        // 定时拉到的新 Tracker 列表热加载进运行中的 aria2：
-        // 原来只写缓存文件，运行中的实例要等下次引擎重启才看得到新列表。
+        // Tracker 列表热加载：只写缓存文件时，运行中的 aria2 实例要等下次引擎重启才能看到新列表。
         trackerManager.onTrackersUpdated = { list ->
             if (aria2.isRunning()) aria2.changeBtTracker(list)
         }
@@ -364,9 +360,8 @@ class DownloadManager(
                 maxOverallUploadLimit = if (config.maxOverallUploadLimit > 0) config.maxOverallUploadLimit else 0L,
                 btMaxPeers = config.btMaxPeers
             )
-            // 启动期选项改了：引擎空闲就直接重启让它生效（之前这些项写完 config.json 就没人管，
-            // 用户改完"分片数/DHT/证书校验"什么都不会发生）。有任务在跑时不能重启：
-            // 重启后 aria2 的 GID 会变，正在轮询的任务会全部对不上号。
+            // 启动期选项变更：引擎空闲时直接重启使其生效。有任务运行时不能重启 ——
+            // 重启后 aria2 的 GID 会变化，正在轮询的任务将全部对不上号。
             if (needsEngineRestart(previous, config)) {
                 val busy = tasks.values.any {
                     it.engine == "aria2" && it.status in listOf("downloading", "meta", "verifying", "pending")
@@ -402,9 +397,9 @@ class DownloadManager(
     /** 保存用户手动编辑的 Tracker 列表 */
     fun saveTrackerList(trackers: String) {
         val cleaned = trackers.trim()
-        // 2026-10-08：手动列表持久化进 meta + 写缓存（原子写）。此前直写缓存文件，
-        // 下次自动/手动刷新 refreshNow 用 fetched+customList 覆盖 —— 用户手编内容静默丢失。
-        // 现在 refreshNow 检测到 manualTrackers 非空就以手动列表为准（保存空 = 恢复自动模式）。
+        // 手动列表持久化到 meta 并原子写入缓存。若直接写缓存文件，下次自动或手动刷新
+        // 会用 fetched + customList 覆盖，用户编辑的内容静默丢失。
+        // refreshNow 检测到 manualTrackers 非空时以手动列表为准（保存空值 = 恢复自动模式）。
         trackerManager.setManualList(cleaned)
         // 热加载到运行中的 aria2
         if (aria2.isRunning() && cleaned.isNotBlank()) {
@@ -439,11 +434,10 @@ class DownloadManager(
     private suspend fun checkAndThrottle() {
         // ── 采集传感器数据（直接读取，DataScheduler 在主 core 模块尚未抽取）──
 
-        // 温度: 由平台适配层读（4.3，读法已搬进 SprdPlatform.readTemperature）。
-        // ⚠ `?: 0f` 不是随手写的兜底：原来的 readMaxTemp() 返回 Float，「一个热区都读不到」
-        // 就是 0f，而 0f 在下面的分档里落到 else 分支（= 0 档，温度不参与限速），
-        // 同时 throttleTemp 对外显示 0。adapter 改成用 null 表示读不到（不许返回 0），
-        // 所以这里把 null 折回 0f —— **读不到时的行为与改造前逐路一致**。
+        // 温度：由平台适配层读取（实现在 SprdPlatform.readTemperature）。
+        // `?: 0f` 是刻意的折算：适配层以 null 表示所有热区均不可读，而 0f 在下面的分档中
+        // 落入 else 分支（0 档，温度不参与限速），同时 throttleTemp 对外显示 0，
+        // 与适配层改造前的行为一致。
         val temp = platform.readTemperature() ?: 0f
 
         // CPU: 直接读取 /proc/stat 差值计算
@@ -601,17 +595,17 @@ class DownloadManager(
     private fun restoreOriginalSettings() {
         aria2.changeGlobalSetting(
             maxConcurrentDownloads = config.maxConcurrent,
-            // 2026-10-08：无限制必须显式传 0（引擎层把 <=0 映射成 "0"）。原来传 null 会让
-            // changeGlobalSetting 跳过该选项 —— 节流档设置的 1MB/s 限速永久残留。
+            // 解除限速必须显式传 0（引擎层把 <=0 映射为 "0"）。传 null 会让
+            // changeGlobalSetting 跳过该选项，节流档设置的 1MB/s 限速将永久残留。
             maxOverallDownloadLimit = if (config.globalSpeedLimit > 0) config.globalSpeedLimit else 0L
         )
     }
 
     // ─── 传感器读取 ──────────────────────────────────────────
 
-    // 温度读法（原 readMaxTemp()）已于 4.3 搬进 SprdPlatform.readTemperature()：
-    // 遍历 /sys/class/thermal/thermal_zone* 取最大值那段逐字搬走，本类改为经 platform 调用。
-    // CPU / 电池 / 内存三处读法本批未动（4.3 的其余部分）。
+    // 温度读取已委托给 SprdPlatform.readTemperature()：遍历 /sys/class/thermal/thermal_zone*
+    // 并取最大值的实现位于该类，本类经 platform 调用。
+    // CPU / 电池 / 内存三处读取仍由本类直接实现。
 
     /** 读取 CPU 使用率（直接读 /proc/stat，无需 shell） */
     private suspend fun readCpuUsage(): Int {
@@ -798,11 +792,10 @@ class DownloadManager(
 
     fun deleteTask(id: String, deleteFile: Boolean = false): Boolean {
         val task = tasks[id] ?: return false
-        // removeDownloadResult 必须无条件调用（此前只在 deleteFile=true 时调）：
-        // forceRemove 只是把下载挪进 tellStopped 的结果列表，BT 的 infoHash 依旧挂在
-        // aria2 的 BtRegistry 上。结果不清 → 同一个磁链再也加不进来，addUri 永远回
-        // "InfoHash … is already registered."。retryTask 走的也是这条路（deleteFile=false），
-        // 所以"重新下载"一个 BT 任务此前必然失败。
+        // removeDownloadResult 必须无条件调用：forceRemove 只是把下载移入 tellStopped 的结果列表，
+        // BT 的 infoHash 仍挂在 aria2 的 BtRegistry 上。结果未清除时，同一磁链无法再次添加，
+        // addUri 始终返回 "InfoHash … is already registered."。
+        // retryTask 也走此路径（deleteFile=false），因此缺少该调用会使 BT 任务的「重新下载」必然失败。
         task.gid?.let { aria2.remove(it); aria2.removeDownloadResult(it) }
         tasks.remove(id)
         saveTasks()
@@ -952,12 +945,12 @@ class DownloadManager(
     }
 
     /**
-     * 后台总闸关闭（用户点了「停止服务」）：停掉下载侧全部自主活动 ——
-     * aria2 状态轮询、智能限速巡检、BT Tracker 定时更新，并把在跑的任务落成 paused 后关掉 aria2 进程。
+     * 后台总闸关闭（用户点「停止服务」）：停止下载侧的全部自主活动 ——
+     * aria2 状态轮询、智能限速巡检、BT Tracker 定时更新，并把运行中的任务置为 paused 后关闭 aria2 进程。
      *
-     * 与 [shutdown] 的区别：**不 `scope.cancel()`**。scope 一旦取消，后面所有 `scope.launch`
-     * 都变 no-op，只能重建实例才能恢复 —— 那样"再次开启服务"就名存实亡。
-     * 已下载的分片与 `.aria2` 控制文件都保留，[resumeBackground] 会断点续传。
+     * 与 [shutdown] 的区别：不调用 `scope.cancel()`。scope 一旦取消，后续所有 `scope.launch`
+     * 均为空操作，只能重建实例才能恢复，「再次开启服务」因而失效。
+     * 已下载的分片与 `.aria2` 控制文件均保留，[resumeBackground] 会断点续传。
      */
     fun pauseBackground() {
         if (backgroundPaused) return
@@ -1102,10 +1095,9 @@ class DownloadManager(
     }
 
     // ── 通知钩子（由 ComponentFactory 接到 NotificationDispatcher::emit）──
-    // 下载是 core 的能力，"完成/失败"的状态跃迁只有 core 看得见。此前邮件靠 app 前台轮询下载列表、
-    // 自己比对上一次的状态后回传，app 不在线 = 永远没有下载邮件；推送则挂在另一个
-    // attachPushService 钩子上 —— 同一件事两个出口，加第三个渠道就要再缝一遍。
-    // 2026-09-08 合成一个：投给哪些渠道由分发器的注册表决定。
+    // 下载是 core 的能力，「完成/失败」的状态跃迁只有 core 可见。
+    // 状态跃迁统一投递给分发器；投给哪些渠道由分发器的注册表决定，
+    // 新增渠道不需要在下载侧增加钩子。
     @Volatile
     private var notifier: Notifier? = null
 
@@ -1179,13 +1171,13 @@ class DownloadManager(
     private val lostGidSince = ConcurrentHashMap<String, Long>()
 
     /**
-     * 任务的 GID 在 aria2 里查不到时的自愈：
-     * ① 先在现有下载里按 infoHash / URI 认领（引擎重启后 session 恢复会换 GID）；
-     * ② 认领不到就重新提交 —— 磁链优先用 bt-save-metadata 存下的 .torrent，
-     *    这样跳过 metadata 阶段，并配合 conf 里的 continue=true 续上私有目录里的分片。
+     * 任务 GID 在 aria2 中查不到时的自愈：
+     * ① 先在现有下载中按 infoHash / URI 认领（引擎重启后 session 恢复会更换 GID）；
+     * ② 认领失败则重新提交 —— 磁链优先使用 bt-save-metadata 保存的 .torrent，
+     *    从而跳过 metadata 阶段，并配合 conf 中的 continue=true 续用私有目录中的分片。
      *
-     * 之所以要这套逻辑：引擎重启（改配置/服务被拉起/进程被杀）后，磁链的载荷 GID 不在
-     * aria2 的 session 里，旧实现直接 continue，任务就永久停在"获取种子信息中"。
+     * 该逻辑的必要性：引擎重启（改配置、服务被拉起、进程被杀）后，磁链的载荷 GID 不在
+     * aria2 的 session 中；若不处理，任务会永久停留在「获取种子信息中」。
      */
     private fun resubmitLostTask(task: DownloadTask) {
         if (!aria2.isRunning()) return
@@ -1259,9 +1251,9 @@ class DownloadManager(
      * - 要连 `tellStopped` 一起看。磁链的第一阶段 GID 抓完 metadata 就变成 stopped，
      *   真正的载荷 GID 在它的 `followedBy` 里，只翻 active/waiting 会漏掉。
      * - 命中 metadata 条目时要跟着 `followedBy` 跳到载荷 GID，否则认领到一个已完成的空壳。
-     * - [ignoreOwned] = true 时不再跳过"已被其它任务记录占用"的 GID：aria2 回
-     *   "already registered" 说明这个 infoHash 确实在跑，此时宁可让两条记录指向同一个 GID，
-     *   也比无限重提交、任务永远报错要好。
+     * - [ignoreOwned] = true 时不再跳过已被其他任务记录占用的 GID：aria2 返回
+     *   "already registered" 说明该 infoHash 确实在运行；此时使两条记录指向同一个 GID，
+     *   优于无限重提交并使任务持续处于错误状态。
      */
     private fun adoptExistingGid(task: DownloadTask, ignoreOwned: Boolean = false): String? {
         val hash = magnetInfoHash(task.url)
@@ -1314,14 +1306,14 @@ class DownloadManager(
     }
 
     /**
-     * 引擎就绪后与本地任务对账：aria2 里还在跑、但本地已经没有对应记录的下载一律清掉。
+     * 引擎就绪后与本地任务对账：aria2 中仍在运行、但本地已无对应记录的下载一律清除。
      *
-     * 这种"孤儿下载"的来源是删任务时 aria2 RPC 不可达（forceRemove 与 removeDownloadResult
-     * 双双 ConnectException，2026-09-03 实测），下载继续跑、infoHash 继续占着注册，
-     * 于是同一个磁链再也添加不进来 —— 而且重启引擎会从 session 里把它恢复出来，永久生效。
+     * 这类「孤儿下载」来自删除任务时 aria2 RPC 不可达（forceRemove 与 removeDownloadResult
+     * 均返回 ConnectException）：下载继续运行、infoHash 继续占用注册，同一磁链无法再次添加，
+     * 且引擎重启会从 session 中恢复它，使问题持续存在。
      */
     private fun reconcileOrphanDownloads() {
-        // 本地一条记录都没有时不动手：可能是 tasks.json 刚被重置，宁可留着也别误删用户的下载
+        // 本地无任何记录时不执行清理：可能 tasks.json 刚被重置，保留下载优于误删用户数据。
         if (tasks.isEmpty()) return
         val ownedGids = tasks.values.mapNotNull { it.gid }.toSet()
         val ownedHashes = tasks.values.mapNotNull { magnetInfoHash(it.url) }.toSet()
@@ -1401,24 +1393,24 @@ class DownloadManager(
         for (task in aria2Tasks) {
             val gid = task.gid
             if (gid == null) {
-                // 有任务记录但没 GID：createTask 提交失败或进程在提交前被杀。
-                // 旧实现直接跳过，任务就永远躺在列表里不动。
+                // 有任务记录但无 GID：createTask 提交失败，或进程在提交前被终止。
+                // 直接跳过会使任务永远停留在列表中的当前状态。
                 if (task.status in listOf("pending", "downloading", "meta", "verifying")) resubmitLostTask(task)
                 continue
             }
             val s = aria2.tellStatus(gid)
             if (s == null) {
-                // GID 在 aria2 里查不到：引擎重启过、session 丢了或任务被外部移除。
-                // 以前这里直接 continue，任务就永久卡在旧状态（磁链表现为一直"获取种子信息中"）。
-                // 现在重新提交一次，把新 GID 记回任务。
+                // GID 在 aria2 中查不到：引擎重启过、session 丢失或任务被外部移除。
+                // 直接 continue 会使任务永久停留在旧状态（磁链表现为一直「获取种子信息中」）；
+                // 此处重新提交一次，并把新 GID 记回任务。
                 resubmitLostTask(task)
                 continue
             }
             lostGidSince.remove(task.id)
-            // 磁链/种子是两段式：第一个 GID 只下 metadata，拿到后 aria2 会另起一个 GID 下真正的内容，
-            // 并把新 GID 写进 metadata GID 的 followedBy。此前只盯着原 GID —— metadata GID 一 complete
-            // 就把任务判成"已完成"（transferToPublicDir 找不到文件），真正的内容 GID 没人轮询，
-            // 表现就是磁链要么一直"获取种子信息中"，要么秒完成却没有文件。
+            // 磁链/种子为两段式：第一个 GID 只下载 metadata，取得后 aria2 会另起一个 GID 下载实际内容，
+            // 并把新 GID 写入 metadata GID 的 followedBy。只跟踪原 GID 时，metadata GID 一旦 complete
+            // 就会把任务判为「已完成」（transferToPublicDir 找不到文件），而实际内容 GID 无人轮询，
+            // 表现为磁链一直「获取种子信息中」，或立即完成却没有文件。
             val followedGid = s["followedBy"]?.jsonArray?.firstOrNull()
                 ?.jsonPrimitive?.contentOrNull
             if (!followedGid.isNullOrBlank() && followedGid != gid) {
@@ -1434,9 +1426,9 @@ class DownloadManager(
             val prevStatus = task.status
             val totalLen = s["totalLength"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: -1L
             val completedLen = s["completedLength"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
-            // 校验（hash check）阶段：aria2 把进度记在 verifiedLength 上，completedLength 一直是 0。
-            // 不读它的话，续传/重加已有数据的 BT 任务在校验期间界面上是"完全不动"，
-            // 校验一结束又直接变 100% —— 用户看到的就是"卡住然后瞬间完成"（2026-09-03 反馈）。
+            // 校验（hash check）阶段：aria2 把进度记在 verifiedLength 上，completedLength 一直为 0。
+            // 不读取它时，续传或重加已有数据的 BT 任务在校验期间界面显示为「完全不动」，
+            // 校验结束后又直接变为 100%，用户感知为「卡住后瞬间完成」。
             val verifiedLen = s["verifiedLength"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
             val verifyPending = s["verifyIntegrityPending"]?.jsonPrimitive?.contentOrNull == "true"
             val verifying = verifiedLen > 0L || verifyPending
@@ -1448,7 +1440,7 @@ class DownloadManager(
             task.connections = s["connections"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0
             // 进度计算：区分 metadata 获取阶段、校验阶段和真正的下载阶段
             task.progress = if (totalLen > 0) {
-                // 校验中 completedLength=0，用 verifiedLength 顶上，进度条才会走
+                // 校验中 completedLength=0，改用 verifiedLength 计算，进度条才会推进
                 val done = if (completedLen == 0L && verifiedLen > 0L) verifiedLen else completedLen
                 (done.toFloat() / totalLen).coerceIn(0f, 1f)
             } else {
@@ -1483,12 +1475,12 @@ class DownloadManager(
 
             val rawStatus = s["status"]?.jsonPrimitive?.contentOrNull
             val rawError = s["errorMessage"]?.jsonPrimitive?.contentOrNull
-            // 磁链的两段式里，metadata 拿到种子后 aria2 要给载荷下载注册 infoHash；
-            // 如果同一个 infoHash 已经在跑（典型来源：上一条任务删除时 RPC 不可达，
-            // forceRemove/removeDownloadResult 双双失败，下载还在跑但本地记录没了），
-            // 注册失败，这条 metadata GID 就以 "InfoHash … is already registered." 收场。
-            // 这不是真失败 —— 那个下载好好地在跑。直接把任务改绑过去，
-            // 否则用户只能看到这行英文报错，而且怎么删了重加都一样（2026-09-03 实测）。
+            // 磁链的两段式流程中，metadata 取得种子后 aria2 需要为载荷下载注册 infoHash；
+            // 若同一 infoHash 已在运行（典型来源：上一条任务删除时 RPC 不可达，
+            // forceRemove 与 removeDownloadResult 均失败，下载仍在运行但本地记录已不存在），
+            // 注册失败，该 metadata GID 以 "InfoHash … is already registered." 收场。
+            // 这不属于真实失败 —— 该下载仍在正常运行。此时应直接把任务改绑到现有 GID，
+            // 否则用户只会看到该英文报错，且删除后重新添加仍会复现。
             if (rawStatus == "error" && rawError?.contains("already registered", ignoreCase = true) == true) {
                 val live = adoptExistingGid(task, ignoreOwned = true)
                 if (live != null && live != gid) {
@@ -1535,7 +1527,7 @@ class DownloadManager(
                 "removed" -> "error"; else -> task.status
             }
             task.status = newStatus
-            // 状态跃迁到终态才发邮件（轮询 1.5s 一次，不比对就是每轮一封）
+            // 仅在状态跃迁到终态时发送通知（轮询周期 1.5s，不比对状态则每个周期都会发送一条）
             if (newStatus != prevStatus) {
                 saveTasks()  // 状态跃迁立刻落盘，避免重启后读回过期状态
                 if (newStatus == "completed" || newStatus == "error") {
@@ -1549,12 +1541,12 @@ class DownloadManager(
     // ─── 文件转移（私有目录 → 公共下载目录）──────────────
 
     /**
-     * 启动时恢复孤儿文件：应用崩溃/重启后，私有目录中已下载完成但未转移到公共目录的文件，
-     * 在此补转移。使用三层保底链，无 root 设备也能尽力恢复。
+     * 启动时恢复孤儿文件：应用崩溃或重启后，私有目录中已下载完成但未转移到公共目录的文件
+     * 在此补做转移。使用三层保底链，无 root 设备也可恢复。
      *
-     * 2026-09-02：只跳过 .aria2 本身是不够的 —— 未下完的数据文件旁边就有同名 .aria2 控制
-     * 文件，旧实现把它也当"孤儿"搬进公共目录（实测搬走了一个 99.96% 的 mkv），用户看到的是
-     * 一个残缺文件 + 任务仍卡着。现在按 .aria2 判定未完成，未完成的一律留在私有目录。
+     * 判定未完成不能只看 .aria2 本身：未下完的数据文件旁边存在同名 .aria2 控制文件，
+     * 若把它也当作孤儿搬入公共目录，用户会得到一个残缺文件，且任务仍停留在未完成状态。
+     * 因此以 .aria2 判定未完成，未完成的一律保留在私有目录。
      */
     private fun recoverOrphanedDownloads() {
         val privateDir = File(DEFAULT_SAVE_DIR)
@@ -1674,11 +1666,11 @@ class DownloadManager(
     // MediaStore API → 直接拷贝 → 私有目录兜底
 
     /**
-     * 通过 MediaStore API 写入公共 Downloads 目录。
-     * 这是 Android 官方推荐的无权限公共目录写入方式，适配无 root 设备。
+     * 通过 MediaStore API 写入公共 Download 目录。
+     * 这是 Android 推荐的无权限公共目录写入方式，适用于无 root 设备。
      *
-     * 2026-09-02：RELATIVE_PATH 原来硬编码 "Download/UFI/"，用户改了保存目录也会被写到这里；
-     * 现在按目标路径推导，超出 MediaStore 能力（不在外置存储下）时才回落到默认目录。
+     * RELATIVE_PATH 按目标路径推导；超出 MediaStore 能力（目标不在外置存储下）时
+     * 回落到默认目录。
      */
     private fun writeViaMediaStore(src: File, dst: File): Boolean {
         val dstFileName = dst.name
@@ -1791,13 +1783,14 @@ class DownloadManager(
     private var saveTasksJob: Job? = null
 
     /**
-     * 节流写入 —— 3s 内的多次调用合并为一次磁盘写入，保护闪存。
+     * 节流写入：3s 内的多次调用合并为一次磁盘写入，降低闪存写入频率。
      *
-     * 2026-09-02：原实现每次调用都 cancel 上一个 job 再排一个 3s 的延迟写，而轮询周期是
-     * 1.5s < 3s —— 于是只要有 aria2 任务在轮询，落盘任务就永远在被取消前重排，tasks.json
-     * 一次都写不出去。表现：内存里进度/GID 正常，但磁盘上永远停在"上次非防抖保存"的快照；
-     * 服务或引擎一重启，loadTasks 读回旧快照，磁链的 GID 退回 metadata 阶段、进度归零，
-     * UI 就永久停在"获取种子信息中"。改成"已有待写任务就合并进去"，保证最多 3s 必落盘。
+     * 实现要求「已有待写任务时直接合并」，不能每次调用都取消上一个 job 再重新排期：
+     * 轮询周期为 1.5s，小于 3s，若采用取消后重排，只要有任务在轮询，落盘任务就会在每次
+     * 轮询时被取消，tasks.json 永远写不出去。表现为内存中的进度与 GID 正常，磁盘上却始终
+     * 停留在上一次非防抖保存的快照；服务或引擎重启后 loadTasks 读回旧快照，磁链的 GID
+     * 退回 metadata 阶段、进度归零，界面永久停留在「获取种子信息中」。
+     * 合并语义同时保证最多 3s 必然落盘一次。
      */
     private fun debounceSaveTasks() {
         if (saveTasksJob?.isActive == true) return
@@ -1812,11 +1805,11 @@ class DownloadManager(
         catch (e: Exception) { AppLogger.e(TAG, "saveTasks failed: ${e.javaClass.simpleName}: ${e.message}", e) }
     }
     /**
-     * 任务/配置的读写失败以前是 `catch (_: Exception) {}` 全静默的。
-     * 后果是「用户改的配置自己回默认值」这类现场完全不可查：文件权限异常、
-     * 半截 JSON、字段类型不兼容，表现都一样 —— 静静地退回默认 config、任务列表空掉。
-     * 所以这里只补日志（带文件路径 + 异常类型），控制流一个字都不改：
-     * 读失败仍然沿用默认值继续跑，不能因为一次读盘失败就让下载模块起不来。
+     * 任务与配置的读取失败必须记录日志（文件路径 + 异常类型）。
+     *
+     * 读取失败若完全静默，文件权限异常、截断的 JSON、字段类型不兼容会表现为同一种现象：
+     * 配置静默回退为默认值、任务列表变空，且现场无法追查。
+     * 控制流保持不变：读失败仍沿用默认值继续运行，单次读盘失败不应导致下载模块无法启动。
      */
     private fun loadTasks() {
         try {
@@ -1851,12 +1844,12 @@ class DownloadManager(
 
 
     /**
-     * 老配置迁移。config.json 里的值优先级高于默认值，所以光改默认值对已有设备无效：
-     * - saveDir 还指着旧的 "Downloads/UFI"（MediaStore 实际写 "Download/UFI"，两个目录）
-     * - 温度阈值还是 55/70，在空载 65°C 的 UFI 上等于永久限速
+     * 存量配置迁移。`config.json` 中的值优先级高于默认值，因此仅修改默认值对已有设备无效：
+     * - saveDir 仍指向旧的 "Downloads/UFI"（MediaStore 实际写入 "Download/UFI"，两者为不同目录）；
+     * - 温度阈值仍为 55/70，在空载 65°C 的 UFI 设备上等于持续限速。
      *
-     * 判据与控制流见 [migrateConfigInPlace]（4.5 起**抬升的目标值**来自 [DeviceTuning]，
-     * **地板判据仍是字面量**，两者不是同一个数）。本方法只留「有改动才记日志 + 落盘」。
+     * 判据与控制流见 [migrateConfigInPlace]：抬升的目标值来自 [DeviceTuning]，
+     * 地板判据仍为字面量，两者不是同一个数值。本方法只负责「有改动时记日志并落盘」。
      */
     private fun migrateConfig() {
         if (migrateConfigInPlace(config, tuning)) {

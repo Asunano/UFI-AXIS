@@ -10,6 +10,7 @@ import com.ufi_axis_core.devicespi.WriteOutcome
 import com.ufi_axis_core.devicespi.adapter.DeviceControl
 import com.ufi_axis_core.devicespi.adapter.NetworkControl
 import com.ufi_axis_core.devicespi.adapter.WifiControl
+import com.ufi_axis_core.util.ShellCommandPolicy
 import com.ufi_axis_core.util.ShellExecutor
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.boolean
@@ -53,7 +54,18 @@ class ActionExecutorImpl(
      * 流量报告（2026-10-06）：入参 period(day|week|month)，返回摘要文案；
      * null = 未装配。
      */
-    private val trafficReportAction: (suspend (String) -> String?)? = null
+    private val trafficReportAction: (suspend (String) -> String?)? = null,
+    /**
+     * 更新进行中的判据（2026-10-30 越权审查 §2.2），装配层传 `WriteGate::updateBusy`。
+     *
+     * 为什么用回调而不是直接引用 `WriteGate`：本类在 `:core`、`WriteGate` 在 `:core:api`，
+     * 直接引用会让「定时任务」这个纯服务层反向依赖路由层。默认 `{ false }` 让既有测试
+     * 与局部装配零改动（同 [speedtestAction] 等三个回调的口径）。
+     *
+     * 漏装配的代价是「OTA 进行中，定时任务仍能重启设备」—— 由装配守卫测试兜住，
+     * 见 `ComponentFactory` 里的注入点。
+     */
+    private val updateBusy: () -> Boolean = { false },
 ) : ActionExecutor {
 
     override suspend fun execute(actionType: String, params: Map<String, JsonPrimitive>): ActionResult {
@@ -64,6 +76,16 @@ class ActionExecutorImpl(
         val required = REQUIRED_CAPABILITY[actionType]
         if (required != null && required !in capabilities) {
             return ActionResult(false, "设备不支持${capabilityLabel(required)}，本次动作未下发")
+        }
+
+        // ── 更新互斥（2026-10-30 越权审查 §2.2）──
+        // route 层对 reboot / shutdown 有 `rejectIfUpdating()`（OTA 半写会让设备卡在
+        // INSTALLING），而定时任务是同一批动作的**第二条入口**：不判就等于「web 上被 409
+        // 拦住的恢复出厂/重启，挂成定时任务就能在 OTA 中途执行」。
+        // 只拦会破坏更新状态的动作（[UPDATE_SENSITIVE_ACTIONS]），不是一刀切：
+        // 流量报告 / 测速这类只读动作在更新期间照常可用，否则「更新中定时任务全哑」比漏拦更难排查。
+        if (actionType in UPDATE_SENSITIVE_ACTIONS && updateBusy()) {
+            return ActionResult(false, "更新进行中，本次动作未下发（避免 OTA 半写状态）")
         }
         return when (actionType) {
             // ── 写结果必须接住（2026-09-25 P2-1）──
@@ -149,7 +171,9 @@ class ActionExecutorImpl(
                 // T15：此前这里直接透传 UI 别名（`5G_ONLY`）且没有任何映射，goform 不认，
                 // 定时任务选「仅 5G」静默失败。
                 val bearer = NetworkMode.toBearer(mode)
-                val outcome = network.setBearerPreference(mode)
+                // 与 REST 的 /network/mode 走同一份实现（2026-10-31）：切制式会让设备拆掉 ppp
+                // 且不自己重拨，恢复移动数据这件事属于这个业务动作，不能只做在 web 那条入口上。
+                val outcome = networkController.setNetworkMode(mode)
                 val ok = outcome.ok
                 // 值域校验失败时把原因带进任务结果，别让用户只看到"切换失败"
                 val rejected = (outcome as? WriteOutcome.Rejected)?.reason
@@ -191,10 +215,19 @@ class ActionExecutorImpl(
             }
             "custom_shell" -> {
                 val cmd = params["command"]?.content ?: ""
-                if (cmd.isBlank()) ActionResult(false, "命令为空")
-                else {
-                    val result = ShellExecutor.executeAsRoot(cmd, 120_000L)
-                    ActionResult(result.isSuccess, result.stdout.take(500))
+                when {
+                    cmd.isBlank() -> ActionResult(false, "命令为空")
+                    // 2026-10-30（越权审查 §2.2）：与 `POST /api/shell/exec` 共用同一份危险命令判据。
+                    // 在此之前这里直接 `executeAsRoot`，于是 `/api/shell/exec` 明确回 403 的
+                    // `reboot` / `insmod` / `kill -9 rild`，只要「建一个定时任务」就能执行 ——
+                    // 操作 A（建任务）干了被禁止的 B（危险命令）。判据只有一份
+                    //（ShellCommandPolicy），新增危险模式时两个入口同时生效。
+                    ShellCommandPolicy.isDangerous(cmd) ->
+                        ActionResult(false, "命令被安全策略拦截（可能导致内核崩溃或设备重启）")
+                    else -> {
+                        val result = ShellExecutor.executeAsRoot(cmd, 120_000L)
+                        ActionResult(result.isSuccess, result.stdout.take(500))
+                    }
                 }
             }
             else -> ActionResult(false, "未知动作类型: $actionType")
@@ -227,6 +260,23 @@ class ActionExecutorImpl(
             "network_mode" to Capability.NETWORK_MODE,
             "performance_mode" to Capability.PERFORMANCE_MODE
         )
+
+        /**
+         * 更新进行中必须拒绝的动作（2026-10-30 越权审查 §2.2）。
+         *
+         * 判据只有一条：**这个动作会不会破坏 OTA 状态机**。
+         *
+         * - `reboot` / `shutdown`：与 route 侧的 `/api/device/reboot`（有 `rejectIfUpdating`）
+         *   是同一个动作，定时任务版原先漏了判 —— OTA 拷到一半重启会留下半写状态，
+         *   `UpdateManager` 的 BUSY_STATES 会一直卡到人工重置。
+         * - `custom_shell`：能 `rm` 更新临时文件、能杀更新进程、能 `reboot`，
+         *   等价于 route 侧 `/api/shell/exec`（同样有 `rejectIfUpdating`）。
+         *
+         * 刻意**不**包含 `network_mode` / `wifi_toggle` / `data_toggle`：它们会短暂断网，
+         * 但更新检查/下载失败本来就有重试与 NEED_PUSH 兜底，拦掉它们只会让「更新期间
+         * 定时任务集体失效」这个更难排查的问题出现在用户面前。
+         */
+        val UPDATE_SENSITIVE_ACTIONS: Set<String> = setOf("reboot", "shutdown", "custom_shell")
 
         /** 失败文案用的中文说法。只服务上表那两项，其余回落到对外 wire 名。 */
         fun capabilityLabel(capability: Capability): String = when (capability) {

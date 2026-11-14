@@ -33,6 +33,17 @@ object UiFrameGate {
     private val depth = AtomicInteger(0)
     private val _busy = MutableStateFlow(false)
 
+    /**
+     * begin/end 的互斥锁。
+     *
+     * 只有 `depth` 的 CAS 是不够的：[end] 读回 `remaining == 0` 之后、写
+     * `_busy.value = false` 之前，另一处 [begin] 完全可能把计数抬到 1 并把 `_busy` 置 true；
+     * 紧接着 [end] 那句 `false` 落地 —— 动画还在跑，闸门却放开了，`awaitIdle()` 立刻返回，
+     * 逐帧治理当场失效（注释里 2026-09-05 那次只修了"递减 + 夹 0"，没修这一半）。
+     * 把「改计数」和「改闸门」放进同一把锁，两者才对得上。
+     */
+    private val lock = Any()
+
     /** 是否正在做逐帧动画。数据层据此决定「立刻写」还是「攒着等」。 */
     val busy: StateFlow<Boolean> = _busy
 
@@ -41,8 +52,10 @@ object UiFrameGate {
 
     /** 进入逐帧动画。可重入：多处动画同时进行时按引用计数累加。 */
     fun begin() {
-        depth.incrementAndGet()
-        _busy.value = true
+        synchronized(lock) {
+            depth.incrementAndGet()
+            _busy.value = true
+        }
     }
 
     /**
@@ -56,9 +69,11 @@ object UiFrameGate {
      * 就是本次操作后的真实计数，据它决定是否放开闸门即可。
      */
     fun end() {
-        val remaining = depth.updateAndGet { (it - 1).coerceAtLeast(0) }
-        if (remaining == 0) {
-            _busy.value = false
+        synchronized(lock) {
+            val remaining = depth.updateAndGet { (it - 1).coerceAtLeast(0) }
+            if (remaining == 0) {
+                _busy.value = false
+            }
         }
     }
 

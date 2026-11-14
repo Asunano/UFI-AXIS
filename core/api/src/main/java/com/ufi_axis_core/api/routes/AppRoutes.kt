@@ -88,6 +88,9 @@ class AppRoutes(
                 // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：卸载与更新互斥（被更新目标被卸会导致半装态）
                 if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
+                // 卸载不可逆（应用数据一并消失）；与「安装」不是一类 —— 安装可以重做。
+                // [owner] POST /api/apps/uninstall
+                if (!call.requireOwner(body.ownerPassword())) return@post
                 val pkg = body["packageName"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (pkg.isBlank()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "packageName is required")
@@ -163,11 +166,30 @@ class AppRoutes(
 
             // 禁用/启用/清数据/强制停止（参数路由）
             post("/{action}") {
+                // 写门（2026-10-30 审查 §2.10）：这四个动作在更新进行中执行都可能打断 OTA
+                // （`clear` 清掉正在写数据的包、`force-stop` 杀掉安装协调进程）。
+                if (call.rejectIfUpdating()) return@post
                 val action = call.parameters["action"] ?: ""
                 val body = call.receiveJsonObject()
                 val pkg = body["packageName"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (pkg.isBlank()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "packageName is required")
+                    return@post
+                }
+                // 2026-10-30（审查 §2.8）：`clear`（清数据，不可恢复）与 `force-stop`（停进程）
+                // 共用这一个端点、同一组参数，只靠 URL 末段区分 —— 一次拼错就从"停一下"
+                // 变成"删干净"。所以 `clear` 必须显式带 confirm=true，缺了回 400 而不是沉默执行。
+                // 其余三个动作（disable/enable/force-stop）都是可逆或可重做的，按原样放行。
+                // `clear` 是**不可逆**的（应用数据一旦清掉不可恢复），与 `uninstall` 同级：
+                // 只靠调用方自己填的 `confirm=true` 拦不住任何人。
+                // [owner] POST /api/apps/{action}（action=clear）
+                if (action == "clear" && !call.requireOwner(body.ownerPassword())) return@post
+                if (action == "clear" && body["confirm"]?.jsonPrimitive?.booleanOrNull != true) {
+                    call.respondFail(
+                        HttpStatusCode.BadRequest,
+                        ErrorCode.BAD_REQUEST,
+                        "清除应用数据不可恢复，需要 confirm=true"
+                    )
                     return@post
                 }
                 val success = when (action) {

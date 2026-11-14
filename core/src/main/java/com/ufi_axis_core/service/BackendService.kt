@@ -1,4 +1,4 @@
-// TODO(F25): God-class 计划内拆分（DownloadManager 1094 / GoformClient 615 / Aria2Engine 577 / BackendService 570 / NetworkModule 921 / FileManagerScreen 879）。本类仅做最小安全抽取（见 GoformCodec），全量拆分需人工评审 + 编译验证。
+// 本类职责较多（DownloadManager / GoformClient / Aria2Engine / BackendService / NetworkModule / FileManagerScreen 均偏大）。全量拆分需人工评审并在编译后验证；当前仅保留最小安全抽取（见 GoformCodec）。
 package com.ufi_axis_core.service
 
 import android.app.AlarmManager
@@ -57,10 +57,10 @@ class BackendService : Service() {
      * SMS 轮询独立 scope：使用普通 IO（无 parallelism 限制），
      * 避免 while(isActive) 永久循环占用 limitedParallelism(8) 的稀缺线程。
      *
-     * CoroutineExceptionHandler（2026-10-05 R2-5 修复）：此前缺 handler，轮询协程里
-     * 未捕获的异常会沿 SupervisorJob 静默终止协程本身——兜底轮询从此死亡且无任何
-     * 日志，"短信不进 Provider 时 5 分钟兜底"整条链路悄悄失效。与上方 serviceScope
-     * 同口径：记录 ERROR 后放行（SupervisorJob 已隔离，不影响兄弟协程）。
+     * CoroutineExceptionHandler：缺少它时，轮询协程中未捕获的异常会沿 SupervisorJob
+     * 静默终止协程本身，且不产生任何日志，"短信不进 Provider 时 5 分钟兜底"整条链路
+     * 随之失效。与上方 serviceScope 同一口径：记录 ERROR 后放行（SupervisorJob 已隔离，
+     * 不影响兄弟协程）。
      */
     private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         AppLogger.e(tag, "SmsPollScope coroutine exception (uncaught) — 兜底轮询协程已终止", e)
@@ -75,7 +75,7 @@ class BackendService : Service() {
         /**
          * SMS 转发兜底轮询间隔：5 分钟。
          *
-         * 正常路径是 ContentObserver 即时触发（见 registerSmsObserver），这条只负责兜住
+         * 正常路径是 ContentObserver 即时触发（见 registerSmsObserver），本条只负责覆盖
          * "短信不进系统 Provider（纯 goform 设备）" 和 "observer 漏回调" 两种情况，
          * 所以间隔可以放得很松 —— 原实现 60s 一次的周期唤醒纯属浪费电。
          */
@@ -84,11 +84,11 @@ class BackendService : Service() {
         /**
          * "算新短信" 的最大回溯年龄：24 小时。
          *
-         * 2026-08-31 改：这里原来是"轮询间隔 + 1 分钟"的新鲜度窗口，与 **内存版** 判重 id 配套。
-         * 但内存 id 一重启就没，窗口就成了唯一闸门，于是任何"发现得晚"的短信（CPU 深睡期间
-         * 到达、几分钟后才被处理）都被判成历史短信丢掉。判重 id 已持久化
+         * 该窗口只用于「换 id 体系 / 首次装机」时避免补发收件箱中的历史短信，因此取 24 小时。
+         * 不能把它收窄成"轮询间隔 + 1 分钟"式的新鲜度窗口：判重 id 已持久化
          * （[com.ufi_axis_core.controller.sms.SmsForwardController.lastForwardedSmsId]），
-         * 这条只剩一个作用：换 id 体系 / 首次装机时别把收件箱里的老短信补发一遍，所以放到 24h。
+         * 但窗口若同时承担"发现得晚即丢弃"的职责，CPU 深睡期间到达、几分钟后才被处理的短信
+         * 会被判成历史短信丢弃。
          */
         private const val SMS_MAX_AGE_MS = 24 * 60 * 60 * 1000L
 
@@ -99,9 +99,9 @@ class BackendService : Service() {
         /**
          * 用户**主动**停止（MainActivity 的「停止服务」按钮）。
          *
-         * 2026-08-30 修：`onDestroy` 原来无条件 `scheduleServiceRestart()`，于是主动停止
-         * 10 秒后闹钟又把服务拉起来 —— 表现就是「点了停止，goform 采集照跑」。
-         * 有了这个标记，主动停止走「取消闹钟 + 落停止标记文件」，被杀 / 重启仍走原来的兜底。
+         * `onDestroy` 不得无条件 `scheduleServiceRestart()`：否则主动停止 10 秒后闹钟会把
+         * 服务重新拉起，表现为「点了停止，goform 采集照跑」。带此标记的主动停止走
+         * 「取消闹钟 + 落停止标记文件」，被杀 / 重启仍走原有兜底。
          *
          * 放在 companion 而不是实例上：`stop()` 是静态入口，且 Service 实例在 onDestroy 后即销毁。
          */
@@ -129,21 +129,20 @@ class BackendService : Service() {
         /**
          * 重启后端服务（`POST /api/service/restart` 的落地实现）。
          *
-         * ## 双保险（2026-09-14）
-         * 原来只有一条恢复路径：`stopService` → `onDestroy` → [scheduleServiceRestart] 的
-         * AlarmManager 闹钟。而那枚闹钟当时是 **inexact** 的，Android 12+ 的「后台启动前台服务」
-         * 豁免只给精确闹钟，于是闹钟到点时 `startForegroundService` 被 AMS 拒、异常还发生在系统侧
-         * 看不见，`FLAG_ONE_SHOT` 又已消耗 —— 结果就是「点了重启服务，设备彻底失联，只能手动去点开 app」。
-         *
-         * 现在两条路同时走，谁先到算谁（[onStartCommand] 的 `isRunning` 守卫吃得下重复拉起）：
+         * ## 双保险
+         * 恢复路径共两条，任一条先到即可（[onStartCommand] 的 `isRunning` 守卫可接受重复拉起）：
          * 1. **shell 侧**（本方法派出的 detached `am start-foreground-service`）：不受 AMS 后台限制，
-         *    与 core 自更新脚本 `ufi_update.sh` 用的是同一条已验证过的命令；
-         * 2. **闹钟侧**（[scheduleServiceRestart]，已改为精确闹钟）：不依赖 ADB 通道。
+         *    与 core 自更新脚本 `ufi_update.sh` 使用同一条已验证的命令；
+         * 2. **闹钟侧**（[scheduleServiceRestart]，使用精确闹钟）：不依赖 ADB 通道。
          *
-         * 这个功能的失败代价是「设备失联」，单点恢复不值得赌。
+         * 只保留闹钟一条路径时存在失联风险：闹钟若非精确，Android 12+ 的「后台启动前台服务」
+         * 豁免不适用，到点时 `startForegroundService` 被 AMS 拒绝，异常发生在系统侧不可见，
+         * 且两枚闹钟都是 `FLAG_ONE_SHOT`，消耗后不会再排。
          *
-         * 口径澄清（别再写成"进程级重启"）：`stopService` 只销毁 Service 组件，**进程通常仍存活**，
-         * 因此 `object` 单例与静态状态不会被清掉。
+         * 该功能的失败代价是「设备失联」，不能依赖单点恢复。
+         *
+         * 语义：`stopService` 只销毁 Service 组件，**进程通常仍存活**，因此 `object` 单例与
+         * 静态状态不会被清掉；此处不是进程级重启。
          */
         fun requestRestart(context: Context) {
             AppLogger.w("BackendService", "Full restart requested — shell + alarm 双保险")
@@ -209,13 +208,13 @@ class BackendService : Service() {
          * 邮件投递专用 WakeLock（与 [WAKELOCK_TAG] 的保活锁完全独立）。
          *
          * 保活锁只在**前端连接时**才续期（见 `DataScheduler` 的 wakeLockRenewJob），前端断开
-         * 120s 后它就过期、CPU 允许深睡 —— 这正是"必须连上前端才收到邮件"的根因：短信到达时
-         * RIL 唤醒了 CPU，但那把锁在系统广播结束就放掉，而我们的读库 + SMTP 握手是异步的，
-         * 常常在中途被挂起，等下一次 CPU 被唤醒（往往就是前端连上来）才继续。
+         * 120s 后它就过期、CPU 允许深睡 —— 这导致邮件只在「前端已连接」时才可靠送达：短信到达时
+         * RIL 唤醒了 CPU，但保活锁在系统广播结束即释放，而读库 + SMTP 握手是异步的，
+         * 常在中途被挂起，直到下一次 CPU 被唤醒（往往就是前端连上来）才继续。
          * 所以邮件链路必须自己持锁，且只在**有事件发生且邮件功能可用**时持有，平时照旧省电。
          */
         private const val MAIL_WAKELOCK_TAG = "UfiAxisCore::MailSend"
-        /** 单次投递的持锁上限：SMTP 连接/读超时各 10s，60s 足够覆盖握手 + 重试，超时自动释放兜住泄漏。 */
+        /** 单次投递的持锁上限：SMTP 连接/读超时各 10s，60s 足够覆盖握手 + 重试；超时自动释放，防止泄漏。 */
         private const val MAIL_WAKELOCK_TIMEOUT_MS = 60_000L
 
 
@@ -274,7 +273,7 @@ class BackendService : Service() {
     /**
      * shell 看门狗自愈复查循环（5 分钟一次，见 [ensureKeepAliveWatchdog]）。
      * **不受后台服务总闸控制** —— 用户点"停止服务"停的是采集等自主活动，
-     * 而看门狗是"Core 别死"的最后一道保险，它自己会读 stop-flag 决定要不要拉起。
+     * 而看门狗负责保证 Core 进程存活，它自身会读取 stop-flag 决定是否拉起。
      */
     private var keepAliveWatchdogJob: Job? = null
     /** 短信转发：observer 注册 + 5 分钟兜底轮询。 */
@@ -323,7 +322,7 @@ class BackendService : Service() {
     private fun launchMailEvent(source: String, block: suspend () -> Unit) {
         val ctl = graph?.controller?.smsForwardController ?: return
         if (!ctl.isSendable()) return
-        // 2026-10-05 R3-7 修复：acquire 移入协程内，消除「launch 未被调度则锁永不释放」的泄漏窗口
+        // acquire 必须在协程内调用，消除「launch 未被调度则锁永不释放」的泄漏窗口。
         serviceScope.launch {
             val lock = acquireMailWakeLock()
             try {
@@ -338,12 +337,12 @@ class BackendService : Service() {
 
 
     /**
-     * 注册系统短信库变更观察者：来了新短信立刻触发 [onNewSms]（亚秒级），取代 60s 轮询。
+     * 注册系统短信库变更观察者：新短信到达即触发 [onNewSms]（亚秒级），主路径不再依赖 60s 轮询。
      *
      * - 用 `notifyForDescendants = true`：写入通常落在 `content://sms/inbox/{id}` 这样的子 URI 上，
      *   只监听根 URI 会收不到。
      * - 回调在主线程 Looper，不能做 IO，因此立刻转投 [smsPollScope]。
-     * - 系统写一条短信可能触发多次 onChange；[forwardLatestSmsIfNew] 用 id 去重兜住。
+     * - 系统写一条短信可能触发多次 onChange；[forwardLatestSmsIfNew] 按 id 去重。
      * - 注册失败（无 READ_SMS 权限或设备没有短信 Provider）不算致命：兜底轮询仍在跑。
      *
      * @param isMailEnabled 邮件功能是否可用（配置齐全且开启）。**在回调里同步判一次**：
@@ -385,11 +384,11 @@ class BackendService : Service() {
      * - 配置可发信（[com.ufi_axis_core.controller.sms.SmsForwardController.isSendable]）：
      *   不可发就直接退出，绝不为此做任何 IO / 持锁；
      * - id 去重（持久化的 `lastForwardedSmsId`）：同一条只发一次，服务重启也认；
-     * - `age <= `[SMS_MAX_AGE_MS]：首次装机 / 换 id 体系时别把老短信补发一遍。
+     * - `age <= `[SMS_MAX_AGE_MS]：首次装机 / 换 id 体系时不补发收件箱中的历史短信。
      *
-     * 后两道的选取逻辑在纯函数 [com.ufi_axis_core.controller.sms.SmsForwardWindow.plan] 里
-     * （那里也写着为什么必须扫一批而不是只看最新一条：**来信与本机发出的短信几乎同时落库、
-     * 来信在先**时，只看最新一条会把那封邮件永久跳过）。
+     * 后两道的选取逻辑在纯函数 [com.ufi_axis_core.controller.sms.SmsForwardWindow.plan] 里。
+     * 必须扫一批而不是只读取最新一条：**来信与本机发出的短信几乎同时落库、来信在先**时，
+     * 只看最新一条会永久跳过该邮件。
      *
      * @param source 仅用于日志区分触发来源（observer / poll）。
      */
@@ -424,23 +423,34 @@ class BackendService : Service() {
                             "，放弃较早的 ${plan.skipped} 条邮件通知（正文仍可在 /api/sms 查到）"
                     )
                 }
-                // 先推进 lastForwardedSmsId 再投递，**顺序是刻意的**：
-                // 投递失败（含总闸关闭 / 免打扰静默期 / SMTP 挂了）时这些短信不会被下一轮补发。
-                // 反过来（先投递成功再落 id）看着更"可靠"，但那意味着用户一打开总开关就会被
-                // 静默期里攒下的一堆邮件糊脸 —— 那些通知的时效早就过了。
-                // 这是明确的取舍，不是漏改：短信正文在 /api/sms 里一直查得到，补发的只是通知。
-                // 2026-10-05 R1-14 修复：写水位改走 synchronized 的 advanceWaterMarkIfBeyond，
-                // 与读侧（同一把锁的语义经由 plan 前的 lastId 读不变，但推进与并发路径互斥），
-                // 消除「A/B 双路径并发同水位时互相覆盖/重复投递」的竞态。
+                // 先推进 lastForwardedSmsId 再投递，**顺序不可交换**：
+                // 投递失败（含总闸关闭 / 免打扰静默期 / SMTP 不可用）时这些短信不会被下一轮补发。
+                // 反序（先投递成功再落 id）会使总开关打开时集中补发静默期内累积的通知，
+                // 而这些通知的时效已过。短信正文在 /api/sms 中始终可查，补发的只是通知。
+                // 写水位走 synchronized 的 advanceWaterMarkIfBeyond，与读侧互斥，
+                // 消除「A/B 双路径并发推进同一水位时互相覆盖 / 重复投递」的竞态。
                 forwardCtl.advanceWaterMarkIfBeyond(plan.highWaterMark)
                 // **逐条串行**：forwardSms 内部持 WakeLock 走 SMTP，并发只会让几个握手互相抢锁。
                 for (msg in plan.toForward) {
-                    AppLogger.i(tag, "New SMS #${msg.id} from ${msg.address} via $source: ${msg.body.take(50)}")
+                    // 自动登录正在等这条 10086 验证码：core 自己消费掉，不再转发/推送。
+                    // （Android 默认短信 App 的系统通知不归 core 管，见 CarrierAutoLoginRuntime 注释）
+                    if (com.ufi_axis_core.controller.carrier.CarrierAutoLoginRuntime
+                            .shouldSuppress(msg.address, msg.body)
+                    ) {
+                        AppLogger.i(tag, "Auto-login consumed SMS #${msg.id}; skip forward")
+                        continue
+                    }
+                    // 号码打码 + 正文只留摘要（与 SmsForwardController 同一口径）
+                    AppLogger.i(
+                        tag,
+                        "New SMS #${msg.id} from ${AppLogger.maskPhone(msg.address)} via $source: " +
+                            AppLogger.bodyDigest(msg.body)
+                    )
                     val ok = forwardCtl.forwardSms(msg.address, msg.body, msg.date)
                     AppLogger.i(tag, "Forward result #${msg.id}: ${if (ok) "success" else "failed"}")
                 }
             } catch (e: CancellationException) {
-                // 取消不是投递失败（本仓纪律）：原样重抛，别把它记成一条 SMS 转发错误
+                // 取消不是投递失败：原样重抛，不记为一条 SMS 转发错误
                 throw e
             } catch (e: Exception) {
                 AppLogger.w(tag, "SMS forward ($source) error: ${e.javaClass.simpleName}: ${e.message}")
@@ -474,13 +484,13 @@ class BackendService : Service() {
         protectFromLmk()
         acquireWakeLock()
 
-        // 2026-08-21：ensureKeepAliveWatchdog() 移至 initializeComponents() 中
-        // ADB 特权通道初始化之后，避免 AdbShellExecutor 未就绪时 ShellExecutor.executeAsRoot
-        // fallback 到 app UID 的 ProcessBuilder，无法写入 /data/local/tmp/（鸡生蛋问题修复）。
+        // ensureKeepAliveWatchdog() 必须在 initializeComponents() 中、ADB 特权通道初始化之后调用：
+        // AdbShellExecutor 未就绪时 ShellExecutor.executeAsRoot 会 fallback 到 app UID 的
+        // ProcessBuilder，无法写入 /data/local/tmp/。
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 又被启动了 → 之前那次主动停止作废（含 shell 看门狗的停止标记）
+        // 服务被再次启动时，上一次的主动停止作废（含 shell 看门狗的停止标记）
         explicitStop = false
         clearStopFlag()
 
@@ -504,9 +514,9 @@ class BackendService : Service() {
             ensureRuntimePermissions()
         }
 
-        // isRunning / startedAtElapsed **同步**置位：原来放在 serviceScope.launch 里，
-        // 于是 AlarmManager(10s) 与 keepalive 看门狗两次 startService 有机会都通过上面的
-        // `if (isRunning)` 守卫 → ComponentFactory 走 "already built → reset 重建" 分支，
+        // isRunning / startedAtElapsed **同步**置位，不能放在 serviceScope.launch 内：
+        // 否则 AlarmManager(10s) 与 keepalive 看门狗的两次 startService 都可能通过上面的
+        // `if (isRunning)` 守卫，ComponentFactory 走 "already built → reset 重建" 分支，
         // 出现两套组件图 / 两次端口 bind，失败一路会 stopSelf() 把健康那路一起停掉。
         isRunning = true
         startedAtElapsed = SystemClock.elapsedRealtime()
@@ -594,6 +604,7 @@ class BackendService : Service() {
         // 同一条短信被回调 N 次（虽有 id 去重，但白跑 N 次 Cursor 查询）。
         stopSmsForwarding()
         stopSambaKeepAlive()
+        graph?.serverGraph?.carrierAutoLoginManager?.stop()
         instance = null
         releaseWakeLock()
         // 主动停止（MainActivity「停止服务」/ BackendService.stop）：不排重启闹钟，
@@ -682,7 +693,7 @@ class BackendService : Service() {
     }
 
     /**
-     * 端口预检与自动回退（2026-10-19）。
+     * 端口预检与自动回退。
      *
      * 端口被占时 core 会陷入"启动失败 → stopSelf → 看门狗拉起 → 再失败"的无限循环，
      * 客户端完全连不上，而远程没有任何入口能改端口（HTTP 都不在）。所以必须在 build 之前
@@ -694,7 +705,7 @@ class BackendService : Service() {
     private suspend fun ensurePortUsable() {
         val settings = AppSettings.getInstance(this)
 
-        // 2026-10-19：安全模式。连续启动失败达到阈值后，下一次启动用**最小配置**拉起：
+        // 安全模式：连续启动失败达到阈值后，下一次启动用**最小配置**拉起
         // 强制默认端口 + 关闭后台采集 —— 目标是"先让设备能被连上、能进设置页改回来"，
         // 而不是继续按原配置无限重启。成功启动后由调用方清除（一次性）。
         if (settings.safeModeActive) {
@@ -745,17 +756,17 @@ class BackendService : Service() {
             AppLogger.i(tag, "Initializing components...")
             updateNotification("正在初始化组件...")
 
-            // 2026-10-19：端口占用预检 + 自动回退。
+            // 端口占用预检 + 自动回退。
             //
-            // 为什么必须在 build() 之前：HttpServer 的端口是**构造参数**，build 之后无法改；
-            // 而端口被占时 HttpServer 只会自检失败 → stopSelf → 看门狗再拉 → 再失败，
+            // 必须在 build() 之前执行：HttpServer 的端口是**构造参数**，build 之后无法修改；
+            // 端口被占时 HttpServer 只会自检失败 → stopSelf → 看门狗再拉 → 再失败，
             // 形成无限重启（且 BackendService 在失败分支把 crashRetryCount 清零，
             // "连续 3 次就停"的保护对这条路径不生效）。
             // 设备上最常见的冲突：8080（厂商 goform 管理面）、5555（adbd）、7682（ttyd）。
             ensurePortUsable()
 
             // 初始化看门狗：build() 全程是阻塞调用（解压资产、shell 探测网关、二进制 --version、
-            // 特权 shell 迁移），任何一处卡住此前都没人发现 —— 通知栏永远停在"正在初始化组件..."，
+            // 特权 shell 迁移），任何一处卡住都不会被察觉 —— 通知栏停在"正在初始化组件..."，
             // HTTP 端口不监听，而 keepalive 脚本只检查进程存活，不会介入。
             // 心跳把已耗时写进通知栏与日志（便于定位卡在哪一步），超时则重启进程自愈。
             val initStart = SystemClock.elapsedRealtime()
@@ -784,8 +795,8 @@ class BackendService : Service() {
 
             // ── Web 前端版本检查（在 HttpServer 启动前执行，此时无 HTTP 请求进来，无竞态）──
             // 判据是内置 web 的 version（不是 buildTime，那个每次构建都变，会把用户上传的
-            // override 一重启就删掉）。读不到版本时返回 null —— 此时**不要覆写基线**，
-            // 否则基线被擦掉，下次启动会误判成"版本变了"再删一次 override。
+            // override 一重启就删掉）。读不到版本时返回 null —— 此时**不得覆写基线**，
+            // 否则基线被擦除，下次启动会误判成"版本变了"并再删一次 override。
             try {
                 val webMgr = g.serverGraph.webResourceManager
                 val settings = g.storage.settings
@@ -799,49 +810,51 @@ class BackendService : Service() {
             }
 
 
-            // ── 关键修复：优先启动 HTTP 服务，让所有接口（含 /api/device/info）尽快可用 ──
-            // 原实现把 ADB / Samba / 看门狗等阻塞式系统初始化排在 server.start() 之前，
-            // 一旦特权 shell 命令变慢或卡住，HTTP 端口迟迟不监听，前端一直“加载中”且无数据。
-            // 现在组件图构建完成即启动服务，系统级初始化放后台，绝不再阻塞 HTTP 服务。
-            // 方案 A（2026-08-24）：Core 启动即无条件启动冷数据采集（月流量/电池/SMS/信号等），
-            // 与前端是否连接解耦——避免前端（重）连接间隙或进程重启后 goform 数据永久归零
-            // （见 2026-08-24 goform 掉线复盘：11:38 进程重启后采集循环因前端未连而从未重启）。
+            // ── HTTP 服务优先启动，使所有接口（含 /api/device/info）尽快可用 ──
+            // 组件图构建完成即启动服务，ADB / Samba / 看门狗等阻塞式系统初始化放到后台：
+            // 特权 shell 命令变慢或卡住时，HTTP 端口仍能尽早监听，前端不会停在“加载中”。
+            // Core 启动即无条件启动冷数据采集（月流量 / 电池 / SMS / 信号等），
+            // 与前端是否连接解耦 —— 否则前端（重）连接间隙或进程重启后 goform 数据会永久归零。
             // 实时 WebSocket 推送的启停由 ComponentFactory 的 WS 连接回调（applyRealtimePushState）单独控制。
             // 用户显式停掉的后台采集在服务重启后必须保持停止 —— 开关真源是持久化的
-            // `AppSettings.backgroundServiceEnabled`（默认 true，即保持"启动即采集"的既有行为）。
-            // 注意：setMonitorEnabled 内部已经调用 applyColdCollectionState()，此处不要再调一次
+            // `AppSettings.backgroundServiceEnabled`（默认 true，即"启动即采集"）。
+            // 注意：setMonitorEnabled 内部已经调用 applyColdCollectionState()，此处不得重复调用
+            // （重复调用会多开一次 start/stop 窗口，放大竞态）。
             // （重复调用会多开一次 start/stop 窗口，无益且放大竞态）。
             g.serverGraph.dataScheduler.setMonitorEnabled(
                 AppSettings.getInstance(this@BackendService).backgroundServiceEnabled
             )
-            // 2026-09-03：「停止服务」= 除 HTTP 之外全停。除采集调度外，定时任务 / 隧道看护 /
-            // 下载后台轮询都在各自 init 里就起来了（ComponentFactory.build 期间），
-            // 所以关闸状态下必须在这里补一刀把它们按下去，否则重启一轮就自己复活。
+            // 「停止服务」= 除 HTTP 之外全停。除采集调度外，定时任务 / 隧道看护 /
+            // 下载后台轮询都在各自 init 中启动（ComponentFactory.build 期间），
+            // 因此关闸状态下必须在此显式停止，否则服务重启后会自动恢复。
             backgroundActive = AppSettings.getInstance(this@BackendService).backgroundServiceEnabled
             if (!backgroundActive) {
                 AppLogger.w(tag, "backgroundServiceEnabled=false — 后台自主活动保持停止（仅 HTTP 服务可用）")
                 pauseComponentBackground(g)
+            } else {
+                // 自动登录会发真实短信，必须跟后台服务总闸一起起停。
+                g.serverGraph.carrierAutoLoginManager.start()
             }
 
-            // ── 应用列表定时主动刷新（2026-10-12 应用列表缓存批次）──
-            // 为什么挂在这里（HTTP 就绪之后、而不是 ComponentFactory.build() 里）：
-            // build() 是阻塞调用且被 15s 初始化看门狗盯着，而首轮刷新要串 4 条特权 shell
-            // （pm list ×3 + dumpsys），设备上秒级 —— 放进 build 等于用一次慢 shell 去换
-            // 「通知栏卡在正在初始化 → 进程被判超时重启」。与本文件里 geo 检测同一条理由。
+            // ── 应用列表定时主动刷新 ──
+            // 启动位置在 HTTP 就绪之后，不在 ComponentFactory.build() 内：
+            // build() 是阻塞调用且受 15s 初始化看门狗监视，而首轮刷新要串 4 条特权 shell
+            // （pm list ×3 + dumpsys），设备上为秒级 —— 放进 build 会使「通知栏停在初始化 →
+            // 进程被判超时重启」。与本文件中的 geo 检测同一理由。
             //
-            // 为什么不在 AppManager 构造里起：它还有一个只做自更新安装的短命实例
-            // （BootReceiver 开机恢复），构造即起协程会给那种一次性实例也挂一条永不结束的循环。
+            // 也不在 AppManager 构造中启动：AppManager 还有一个仅做自更新安装的短暂实例
+            // （BootReceiver 开机恢复），构造即起协程会给该一次性实例挂上永不结束的循环。
             //
-            // 作用域用 serviceScope：onDestroy 里它会被 cancel，即便下方显式 stop 漏了也死得掉。
-            // 停机路径另有一刀见 stopAllComponents。
+            // 作用域使用 serviceScope：onDestroy 中会被 cancel，即使下方显式 stop 遗漏也会终止。
+            // 停机路径另有 stopAllComponents 中的显式停止。
             g.serverGraph.appManager.startPeriodicRefresh(serviceScope)
 
-            // ── 媒体索引缓存（2026-10-13）──
+            // ── 媒体索引缓存 ──
             // 与 appManager 同一套挂法：定时刷新用 serviceScope（onDestroy 会 cancel，
-            // 停机路径另有一刀见 stopAllComponents / pauseComponentBackground）。
+            // 停机路径另有 stopAllComponents / pauseComponentBackground 中的显式停止）。
             g.serverGraph.mediaIndexStore.startPeriodicRefresh(serviceScope)
-            // 启动预热一轮：定时循环的第一轮要等满 5 分钟，不预热的话用户第一次进媒体页
-            // 会撞上"冷启动同步拉取"（那时快照还不存在，只能现场查一次）。
+            // 启动时预热一轮：定时循环的第一轮要等满 5 分钟，不预热时用户首次进入媒体页
+            // 会触发"冷启动同步拉取"（此时快照还不存在，只能现场查询一次）。
             // 延迟 8s 避开启动高峰（AT 通道 / goform 登录 / update 恢复都在头几秒），
             // 而它是纯 MediaStore 元数据查询（不像 appManager 那样串 4 条特权 shell），
             // 所以不必像它那样等到 HTTP 就绪之后很久。
@@ -853,11 +866,11 @@ class BackendService : Service() {
 
             val serverOk = g.serverGraph.server.start()
             if (!serverOk) {
-                // 服务启动失败：不要静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
+                // 服务启动失败：不得静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
                 // 直接停止并记入失败计数，由 START_STICKY / 看门狗重新拉起，并在 logcat 暴露真实异常。
                 AppLogger.e(tag, "HTTP Server failed to start — stopping service to surface failure")
-                // 2026-10-19：累计"连续启动失败"次数；达到阈值就武装安全模式，
-                // 下一次启动用默认端口 + 关后台采集，避免无限重启循环里谁也改不回来。
+                // 累计"连续启动失败"次数；达到阈值即启用安全模式，
+                // 下一次启动使用默认端口 + 关闭后台采集，避免陷入无法远程修正的无限重启循环。
                 runCatching {
                     val s = AppSettings.getInstance(this@BackendService)
                     val failures = s.startupFailureCount + 1
@@ -871,8 +884,8 @@ class BackendService : Service() {
                         )
                     }
                 }.onFailure { AppLogger.w(tag, "failed to record startup failure: ${it.message}") }
-                // 2026-10-05 R3-10 修复：start 失败后短延迟再 stopSelf，避开旧 Netty event loop
-                // 未退净导致的端口冲突窗口（同进程先 stop 后立刻 start 偶发 Address already in use）
+                // start 失败后先延迟再 stopSelf，避开旧 Netty event loop 未退净导致的端口冲突窗口
+                // （同进程先 stop 后立刻 start 偶发 Address already in use）。
                 delay(3000)
                 crashRetryCount.set(0)
                 isRunning = false
@@ -880,7 +893,7 @@ class BackendService : Service() {
                 stopSelf()
                 return
             }
-            // 2026-10-19：启动成功 → 清失败计数、退出安全模式（安全模式是一次性的）。
+            // 启动成功 → 清失败计数、退出安全模式（安全模式只作用于下一次启动）。
             runCatching {
                 val s = AppSettings.getInstance(this@BackendService)
                 if (s.startupFailureCount != 0) s.startupFailureCount = 0
@@ -891,7 +904,7 @@ class BackendService : Service() {
             }
             AppLogger.i(tag, "[14] HTTP server ready")
 
-            // ── 出网国家/地区检测（2026-09-18，`/api/geo`）──
+            // ── 出网国家/地区检测（`/api/geo`）──
             //
             // 【为什么挂在这里，而不是 ComponentFactory.build() 里】
             // build() 是**阻塞**调用，且被初始化看门狗盯着（15s 一次心跳，超时直接杀进程自愈）。
@@ -899,17 +912,17 @@ class BackendService : Service() {
             // 「通知栏卡在正在初始化 → 进程被判超时重启」。放在 HTTP 就绪之后的独立协程里，
             // 端口早已监听，检测慢多久都只影响它自己。
             //
-            // 【为什么是启动这一个事件，而不是定时器】本仓明令禁止常驻定时器/周期闹钟；
-            // 国家/地区几乎不变，"core 起来时看一眼"已经足够，7 天过期兜住"设备被带出国"。
+            // 【仅启动时执行，不使用定时器】本仓不允许常驻定时器 / 周期闹钟；
+            // 国家/地区几乎不变，启动时检测一次已足够，7 天过期可覆盖"设备被带出国"的情形。
             //
-            // 【失败不重试】一次失败就等下一次 core 重启（或客户端主动调 `/api/geo`）再试，
-            // 只留一条 WARN。在这里加退避重试等于把定时器改个名字。
+            // 【失败不重试】一次失败后等下一次 core 重启（或客户端主动调用 `/api/geo`）再试，
+            // 只记录一条 WARN。在此加入退避重试等同于引入周期定时器。
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     val settings = AppSettings.getInstance(this@BackendService)
-                    // 更新下载方式的一次性迁移（2026-09-22）：老设备没有 update_source_mode 这个键，
-                    // 统一置 auto 让 core 自己按地区决定。放在这里而不是 build()：它只写一次 prefs，
-                    // 但顺带要打一条说明日志，跟地区检测是同一件事的两半。
+                    // 更新下载方式的一次性迁移：旧设备没有 update_source_mode 键时统一置 auto，
+                    // 由 core 按地区决定。放在此处而不是 build()：它只写一次 prefs，
+                    // 但需要输出一条说明日志，与地区检测同属启动后的一次性动作。
                     settings.migrateUpdateSourceModeIfAbsent()
                     if (!com.ufi_axis_core.api.geo.GeoDetector.isStale(settings)) {
                         AppLogger.i(
@@ -928,8 +941,8 @@ class BackendService : Service() {
             serviceScope.launch(Dispatchers.IO) {
                 try {
                     // ADB 特权通道（系统关键，无条件启动）
-                    // 2026-10-19 更正：`AdbController.start()` **不会**再去打开 USB_PORT ——
-                    // 那条自动切换逻辑已于 2026-08-22 移除（见 AdbController 头注释）。
+                    // `AdbController.start()` **不**打开 USB_PORT ——
+                    // 该自动切换逻辑已移除（见 AdbController 头注释）。
                     // 它只负责初始化 AdbShellExecutor（所有 executeAsRoot 依赖的 uid 2000 通道）；
                     // adbd 是否监听由设备侧决定，core 不再替用户打开。
                     try {
@@ -938,47 +951,58 @@ class BackendService : Service() {
                     } catch (e: Exception) {
                         AppLogger.e(tag, "ADB privileged channel start failed", e)
                     }
-                    // ADB 通道就绪后部署 shell 看门狗（确保 ShellExecutor.executeAsRoot 走 ADB shell）
-                    ensureKeepAliveWatchdog()
                     // 部署 Samba root shell 基础设施（socat + samba_exec.sh + smb.conf）
+                    //
+                    // **顺序要求**：必须先建立 root 通道，再部署看门狗。
+                    // 反序时 ensureRunning 拿不到 root socket，只能退回 uid 2000 的 ADB 通道
+                    //（在本机不生效），开机后需等待 5 分钟的自愈循环才能把看门狗拉起。
+                    // deploy 返回结构化结果：失败不再只有一行 W 日志，目录属主为上次安装 uid
+                    // 这类静默失败可从结果中区分。
                     try {
-                        com.ufi_axis_core.util.SambaRootShell.deploy(this@BackendService)
+                        val r = com.ufi_axis_core.util.SambaRootShell.deploy(this@BackendService)
+                        if (r.ok) {
+                            AppLogger.i(tag, "Samba root shell 就绪：${r.detail}")
+                        } else {
+                            AppLogger.w(tag, "Samba root shell 未就绪（${r.stage}）：${r.detail}")
+                        }
                     } catch (e: Exception) {
                         AppLogger.w(tag, "Samba root shell deploy failed (non-fatal): ${e.message}")
                     }
+                    // root 通道就绪后再部署 shell 看门狗（现在它默认走 root socket，uid 0）
+                    ensureKeepAliveWatchdog()
                 } catch (e: Exception) {
                     AppLogger.e(tag, "Background system init failed (non-fatal): ${e.message}", e)
                 }
             }
 
-            // 2026-08-21：定期重新触发 Samba 连接（保持 socat socket 存活）
-            // 2026-09-03：循环体抽到 startSambaKeepAlive()，受后台服务总闸控制。
+            // 定期重新触发 Samba 连接（保持 socat socket 存活）。
+            // 循环体在 startSambaKeepAlive() 中，受后台服务总闸控制。
             if (backgroundActive) startSambaKeepAlive()
 
 
 
             // ── 电池事件通知（走通知分发器） ──
-            // 走 launchMailEvent：与短信一样，投递期间自己持锁，别指望"前端连着"那把保活锁。
+            // 走 launchMailEvent：与短信一样，投递期间自行持锁，不能依赖"前端连着"的保活锁。
             //
-            // 2026-09-08：此前这里借 `forwardSms("SYSTEM", …)` **把电池事件伪装成短信**，
-            // 而 `SYSTEM` 这个伪发件人被显式排除在场景判定之外 —— 等于绕过了全部场景开关，
-            // 用户在邮件设置里一个勾都没打也会收到低电量邮件，界面上还找不到关它的地方。
-            // 现在它有自己的场景 [NotifyScenes.BATTERY]（存量用户由 `migrateScenesV3` 补进
-            // scenes，保持升级前后行为一致）。
+            // 电池事件不得借 `forwardSms("SYSTEM", …)` **伪装成短信**：
+            // `SYSTEM` 这个伪发件人被显式排除在场景判定之外，等于绕过全部场景开关 ——
+            // 用户在邮件设置里未勾选任何场景也会收到低电量邮件，且界面上没有关闭入口。
+            // 电池事件使用独立场景 [NotifyScenes.BATTERY]（存量用户由 `migrateScenesV3` 补入
+            // scenes，升级前后行为一致）。
             //
             // `exclude = {push}`：除**推送**之外的所有渠道都投（邮件、Webhook、本机短信……）。
-            // 2026-09-10 从 `channels = {mail}` 放开 —— 此前写死邮件，用户在 Webhook /
-            // 本机短信里勾了「电池状态」永远不触发，是个假开关。
+            // 不使用 `channels = {mail}` 白名单：写死邮件渠道时，用户在 Webhook /
+            // 本机短信中勾选「电池状态」不会触发，形成无效开关。
             //
-            // 单独排除推送是**核实过的事实**，不是保守：app 侧 `NotifyService` 的推送分流只认
+            // 单独排除推送的依据：app 侧 `NotifyService` 的推送分流只认
             // `sms`/`verification` 与 `download`/`tunnel`，其余带 `message` 的一律当成 AlertRecord
             // 走 `maybeNotifyNewAlerts` —— `type = "battery"` 会被记成一条阈值告警（`id = 0`），
             // 还会把告警游标推到电池事件的时间戳，把随后到达的真告警吞掉。
             // 让它进推送需要 app 侧一整套镜像（通知 channel + 分类开关 + 分流分支）外加把
             // `battery` 补进 `PushChannel.SINGLE_TOPIC_SCENES`（否则 web 的告警列表会多出一条
-            // core `alert_records` 里不存在的记录），那是新功能，见 `NotifyScenes.BATTERY`。
+            // core `alert_records` 中不存在的记录）。该能力属于新功能，见 `NotifyScenes.BATTERY`。
             //
-            // 用 exclude 而不是把渠道 id 列全：那份清单每加一条新渠道都要回来补，漏补就又是假开关。
+            // 使用 exclude 而不是枚举全部渠道 id：该清单每新增一个渠道都需要同步维护，遗漏即产生无效开关。
             val emitBattery: suspend (String, String) -> Unit = { title, body ->
                 g.serverGraph.notificationDispatcher.emit(
                     com.ufi_axis_core.notify.NotifyEvent(
@@ -1014,14 +1038,14 @@ class BackendService : Service() {
             batteryNotifier = notifier
 
             // ── SMS 转发：ContentObserver 事件驱动 + 5 分钟兜底轮询 ──
-            // 2026-09-03：循环体抽到 startSmsForwarding()，受后台服务总闸控制。
+            // 循环体在 startSmsForwarding() 中，受后台服务总闸控制。
             if (backgroundActive) startSmsForwarding(g)
 
 
-            // 注意：HTTP 服务已在组件图构建完成后提前启动（见上方“关键修复”处），
-            // 此处不再重复启动；ADB / Samba / 看门狗等系统初始化也已移至后台执行。
+            // 注意：HTTP 服务已在组件图构建完成后提前启动（见上），此处不重复启动；
+            // ADB / Samba / 看门狗等系统初始化在后台执行。
 
-            // ── 配对模式（Onboarding）：始终确保配对码存在（多设备模式下不再因已配对而跳过）──
+            // ── 配对模式（Onboarding）：始终确保配对码存在（多设备模式下不因已配对而跳过）──
             g.storage.settings.enterPairingMode()
 
             // ── 注册电池事件监听 ──
@@ -1031,8 +1055,8 @@ class BackendService : Service() {
             updateNotification("UFI-AXIS-Core 运行中 (:${g.storage.settings.port})")
             AppLogger.i(tag, "All components initialized successfully. Server listening on :${g.storage.settings.port}")
 
-            // 2026-08-22：会话诊断日志启动标记（Download/UFI-AXIS/log/core/goform-session.log）。
-            // 版本 + APK 安装时间可确认部署的构建；该文件若不存在即说明设备上还是旧构建。
+            // 会话诊断日志启动标记（Download/UFI-AXIS/log/core/goform-session.log）。
+            // 版本 + APK 安装时间可用于确认部署的构建；文件不存在说明设备上仍是旧构建。
             try {
                 val pkgInfo = packageManager.getPackageInfo(packageName, 0)
                 com.ufi_axis_core.util.GoformSessionLog.logStartupMarker(
@@ -1046,9 +1070,9 @@ class BackendService : Service() {
 
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to initialize components", e)
-            // 2026-10-07：通知栏只带 e.message 时（如 ART 的 "Null reference used for
-            // synchronization"）信息量不足，用户又常拿不到日志。把最深的 3 个应用栈帧
-            // 拼进通知，无需日志也能定位到类。
+            // 通知栏若只带 e.message（如 ART 的 "Null reference used for
+            // synchronization"）信息量不足，且用户常无法取得日志。把最深的 3 个应用栈帧
+            // 拼进通知，无需日志即可定位到类。
             val frames = e.stackTrace
                 .take(6)
                 .filter { it.className.startsWith("com.ufi_axis") }
@@ -1076,7 +1100,7 @@ class BackendService : Service() {
     /**
      * 「停止服务 / 启动服务」的落地实现：**除 HTTP 服务之外**的所有自主活动一起停/一起起。
      *
-     * 为什么 HTTP 必须留着：它是用户再把服务开回来的唯一通道，停了就把自己锁在门外了
+     * HTTP 必须保留：它是用户重新启动服务的唯一通道，停掉后无法远程恢复
      * （真正的整体停机是 MainActivity 的 `BackendService.stop()` → onDestroy → [stopAllComponents]）。
      *
      * 覆盖范围（与 [stopAllComponents] 的区别是"可逆"）：
@@ -1096,11 +1120,13 @@ class BackendService : Service() {
             if (g != null) resumeComponentBackground(g)
             startSambaKeepAlive()
             if (g != null) startSmsForwarding(g)
+            g?.serverGraph?.carrierAutoLoginManager?.start()
             registerBatteryNotifier()
         } else {
             AppLogger.w(tag, "Background services: STOP (HTTP server keeps running)")
             stopSmsForwarding()
             stopSambaKeepAlive()
+            g?.serverGraph?.carrierAutoLoginManager?.stop()
             unregisterBatteryNotifier()
             if (g != null) pauseComponentBackground(g)
         }
@@ -1109,46 +1135,49 @@ class BackendService : Service() {
     /** 停掉组件图里的自主循环（可逆，配 [resumeComponentBackground]）。 */
     private fun pauseComponentBackground(g: ComponentGraph) {
         // 读穿透闸门：客户端的读请求不再因缓存过期去打 goform，只回最后一次已知值。
-        // 这是"停止服务后还在登录 goform 后台"的根因 —— 采集停了，但任何一次 REST 读
-        // 都是 cache miss，miss 就会重新 ensureLogin()。
+        // 否则采集已停，但任何一次 REST 读都是 cache miss，miss 会重新 ensureLogin()，
+        // 表现为「停止服务后仍在登录 goform 后台」。
         try { g.storage.responseCache.setReadThroughPaused(true) } catch (e: Exception) { AppLogger.w(tag, "cache gate failed: ${e.message}") }
         try { g.serverGraph.alertEngine.stop() } catch (e: Exception) { AppLogger.w(tag, "alertEngine.stop failed: ${e.message}") }
         try { g.controller.taskScheduler.pause() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.pause failed: ${e.message}") }
         try { g.controller.tunnelManager.stopGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.stopGuard failed: ${e.message}") }
+        try { g.programManager.pause() } catch (e: Exception) { AppLogger.w(tag, "programManager.pause failed: ${e.message}") }
         try { g.controller.downloadManager.pauseBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.pauseBackground failed: ${e.message}") }
         // 应用列表定时刷新同属「自主活动」：用户点「停止服务」后不该还每 2 分钟打 4 条特权 shell。
         try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
-        // 媒体索引定时刷新同理：停了之后不该还每 5 分钟扫一遍整库（2026-10-13）。
+        // 媒体索引定时刷新同理：停止后不应仍每 5 分钟扫描一遍整库。
         try { g.serverGraph.mediaIndexStore.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "mediaIndexStore.setPeriodicRefreshEnabled failed: ${e.message}") }
+        // 自动登录会发真实短信；后台服务停止时必须一起停。
+        g.serverGraph.carrierAutoLoginManager.stop()
     }
 
     private fun resumeComponentBackground(g: ComponentGraph) {
         try { g.storage.responseCache.setReadThroughPaused(false) } catch (e: Exception) { AppLogger.w(tag, "cache gate failed: ${e.message}") }
         try { g.controller.taskScheduler.resume() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.resume failed: ${e.message}") }
         try { g.controller.tunnelManager.startGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.startGuard failed: ${e.message}") }
+        try { g.programManager.resume() } catch (e: Exception) { AppLogger.w(tag, "programManager.resume failed: ${e.message}") }
         try { g.controller.downloadManager.resumeBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.resumeBackground failed: ${e.message}") }
         try { g.serverGraph.appManager.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
-        // 媒体索引定时刷新同属「自主活动」（2026-10-13）
+        // 媒体索引定时刷新同属「自主活动」
         try { g.serverGraph.mediaIndexStore.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "mediaIndexStore.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     /**
      * Samba socket 保活：60s 一轮，连续失败 ≥3 次退到 300s。
      *
-     * 2026-08-28：这里原来是 while(true) + delay 在 try 内 + catch(Exception)。
-     * CancellationException 是 Exception 子类 → serviceScope 取消后 delay 立刻抛出、
-     * 被 catch 吞掉、循环继续，退化成每秒数千次的无延迟死循环，
-     * 单日往 app_*.log 写了 304MB（实测 2026-08-23）。
-     * 修法三处：循环条件用 isActive、delay 移到 try 外、CancellationException 先 rethrow。
+     * 循环必须同时满足三点：条件用 isActive、delay 写在 try 外、CancellationException 先 rethrow。
+     * 否则 CancellationException（Exception 子类）在 serviceScope 取消后由 delay 抛出并被
+     * catch 吞掉，循环继续，退化为每秒数千次的无延迟死循环，单日可向 app_*.log 写入
+     * 304MB（实测）。
      */
     private fun startSambaKeepAlive() {
         if (sambaKeepAliveJob?.isActive == true) return
         sambaKeepAliveJob = serviceScope.launch(Dispatchers.IO) {
             var consecutiveFailures = 0
             while (isActive) {
-                // 2026-10-08：连续失败 ≥10 次后进入「挂起」档（30min）：设备 SMB 未启用/密码不对时，
-                // 每 5 分钟 6 条连接失败 + 1 条汇总（真机 2026-10-08 日志实测）纯属刷屏——socket
-                // 不可能自己好起来。30min 仍会再试（不是放弃），部署成功或 socket 恢复即复位。
+                // 连续失败 ≥10 次后进入「挂起」档（30min）：设备 SMB 未启用 / 密码错误时，
+                // 每 5 分钟 6 条连接失败 + 1 条汇总（真机日志实测）会持续刷日志，而 socket
+                // 不会自行恢复。30min 后仍会重试（不是放弃），部署成功或 socket 恢复即复位。
                 val baseDelay = when {
                     consecutiveFailures >= 10 -> 1_800_000L
                     consecutiveFailures >= 3 -> 300_000L
@@ -1156,21 +1185,30 @@ class BackendService : Service() {
                 }
                 delay(baseDelay)
                 try {
-                    if (!com.ufi_axis_core.util.SambaRootShell.isSocketAvailable()) {
-                        if (consecutiveFailures >= 10 && consecutiveFailures % 6 == 0) {
-                            // 挂起档下每 ~3 小时才提醒一次（30min × 6），其余轮次静默
-                            AppLogger.d(tag, "Samba socket still unavailable (failCount=$consecutiveFailures), skipping trigger this round")
-                        } else {
-                            AppLogger.d(tag, "Samba socket not available, triggering connection... (failCount=$consecutiveFailures)")
-                            com.ufi_axis_core.util.SambaRootShell.triggerSambaConnection()
-                        }
-                        // triggerSambaConnection 内部没有返回值，我们通过下一次循环 checkSocket 判定
-                        consecutiveFailures++
-                    } else {
+                    if (com.ufi_axis_core.util.SambaRootShell.isSocketAvailable(this@BackendService)) {
                         if (consecutiveFailures >= 10) {
                             AppLogger.i(tag, "Samba socket recovered after $consecutiveFailures failures")
                         }
                         consecutiveFailures = 0
+                    } else if (consecutiveFailures >= 10 && consecutiveFailures % 6 == 0) {
+                        // 挂起档下每 ~3 小时才提醒一次（30min × 6），其余轮次静默
+                        AppLogger.d(tag, "Samba socket still unavailable (failCount=$consecutiveFailures), skipping trigger this round")
+                        consecutiveFailures++
+                    } else {
+                        AppLogger.d(tag, "Samba socket not available, redeploying... (failCount=$consecutiveFailures)")
+                        // 这里执行整条 deploy，而不是只触发一次连接。
+                        // 开机时 core 可能比固件写出 smb.conf 早数秒，deploy 读不到配置会直接失败；
+                        // 若只执行一次，整条 root 通道直到下次重启都不会恢复，看门狗也无法启动。
+                        // deploy 是幂等的（配置已是目标状态即跳过写入），放进这个
+                        // 60s/5min/30min 退避循环重试的代价可以忽略。
+                        val r = com.ufi_axis_core.util.SambaRootShell.deploy(this@BackendService)
+                        if (r.ok) {
+                            AppLogger.i(tag, "Samba root 通道已恢复：${r.detail}")
+                            consecutiveFailures = 0
+                        } else {
+                            AppLogger.w(tag, "Samba root 通道仍未恢复（${r.stage}）：${r.detail}")
+                            consecutiveFailures++
+                        }
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
@@ -1190,11 +1228,10 @@ class BackendService : Service() {
     /**
      * 短信转发：ContentObserver 事件驱动 + 5 分钟兜底轮询。
      *
-     * 2026-08-30：原实现是「每 60s 轮询一次，且 delay 写在循环开头」，于是从收到验证码到
-     * 发出邮件平均要等 30s、最坏 60s+，还得再加 SMTP 握手 —— 这是整条链路最大的一段延迟。
-     * 现在改成短信库变更即触发：ContentObserver 在系统写入短信那一刻回调（亚秒级），
-     * 顺带把 60s 的周期性唤醒去掉，耗电反而更低。
-     * 兜底轮询留 5 分钟一次，覆盖两种 observer 靠不住的情况：
+     * 主路径为短信库变更即触发：ContentObserver 在系统写入短信时回调（亚秒级），
+     * 且不保留 60s 的周期性唤醒，功耗更低。60s 轮询下，从收到验证码到发出邮件平均需等待
+     * 30s、最坏 60s+，再加 SMTP 握手，是整条链路最大的一段延迟。
+     * 兜底轮询保留 5 分钟一次，覆盖两种 observer 不可靠的情况：
      *   ① 短信只存在于 modem（goform）、不进系统 ContentProvider 的设备；
      *   ② observer 因进程被冻结等原因漏掉回调。
      */
@@ -1202,8 +1239,8 @@ class BackendService : Service() {
         if (smsForwardJob?.isActive == true) return
         smsForwardJob = smsPollScope.launch {
             val smsForwardCtl = g.controller.smsForwardController
-            // 2026-09-25 批 C1：sms 域迁进 DeviceAdapter 之后取值从 deviceHub.sms 拿
-            // （NetworkGraph 不再有 smsClient 字段）。拿到的仍是同一个实例，行为不变。
+            // sms 域迁入 DeviceAdapter 后取值从 deviceHub.sms 获取
+            // （NetworkGraph 不再有 smsClient 字段）。取得的是同一实例，行为不变。
             val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.network.deviceHub.sms)
             val initCfg = smsForwardCtl.loadConfig()
             AppLogger.i(tag, "SMS forward init: enabled=${initCfg.enabled}, smtpHost=${initCfg.smtpHost.takeIf { it.isNotBlank() } ?: "(empty)"}")
@@ -1214,9 +1251,9 @@ class BackendService : Service() {
                 onNewSms = { forwardLatestSmsIfNew(smsForwardCtl, smsCtl, "observer") }
             )
 
-            // 启动即查一次（不再先 delay 60s），之后 5 分钟兜底。
-            // 注意这条循环是 **机会性** 的：CPU 深睡期间 delay 不会把设备唤醒（这是有意的，
-            // 不为兜底轮询排闹钟耗电），醒着的时候才补一次。及时性靠上面的 observer 保证。
+            // 启动即查询一次（不先 delay 60s），之后每 5 分钟兜底。
+            // 该循环是 **机会性** 的：CPU 深睡期间 delay 不会唤醒设备（有意为之，
+            // 不为兜底轮询排闹钟耗电），设备醒着时才补一次。及时性由上面的 observer 保证。
             while (isActive) {
                 val lock = if (smsForwardCtl.isSendable()) acquireMailWakeLock() else null
                 try {
@@ -1247,11 +1284,11 @@ class BackendService : Service() {
         try {
             val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                // 2026-09-06：这里原来传 RECEIVER_NOT_EXPORTED，导致注册瞬间的 sticky 回放被系统丢弃：
+                // 必须传 RECEIVER_EXPORTED：sticky 广播回放时 callingUid 是 -1（不是 SYSTEM_UID），
+                // 过不了 NOT_EXPORTED 的同应用校验，注册瞬间的回放会被系统丢弃，日志为：
                 //   W BroadcastQueue: Exported Denial: sending Intent { act=...BATTERY_CHANGED },
                 //     from null (uid=-1) due to receiver ...ufi_axis_core... not specifying RECEIVER_EXPORTED
-                // sticky 广播回放时 callingUid 是 -1（不是 SYSTEM_UID），过不了 NOT_EXPORTED 的同应用校验。
-                // BATTERY_CHANGED 属于系统 protected broadcast，三方应用发不出来，用 EXPORTED 不引入攻击面。
+                // BATTERY_CHANGED 属于系统 protected broadcast，三方应用无法发送，使用 EXPORTED 不引入攻击面。
                 registerReceiver(notifier, filter, Context.RECEIVER_EXPORTED)
             } else {
                 registerReceiver(notifier, filter)
@@ -1277,14 +1314,14 @@ class BackendService : Service() {
         AppLogger.i(tag, "Stopping all components...")
         unregisterBatteryNotifier()
         val g = graph ?: return
-        // ① 先停**数据生产者**。2026-08-30 修：原顺序是 server.stop() → delay(2000) →
-        // dataScheduler.stop()，于是"停止服务"后 DataScheduler 还会继续采集整整 2 秒 ——
-        // 设备侧看到的就是"点了停止，goform 请求还在打"。生产者必须最先停。
+        // ① 先停**数据生产者**。顺序必须是 dataScheduler.stop() 先于 server.stop()：
+        // 反序（server.stop() → delay(2000) → dataScheduler.stop()）时，「停止服务」后
+        // DataScheduler 仍会继续采集约 2 秒，设备侧表现为仍在发出 goform 请求。
         try { g.serverGraph.dataScheduler.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping scheduler", e) }
         try { g.serverGraph.alertEngine.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping alert engine", e) }
         try { g.controller.taskScheduler.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping task scheduler", e) }
         // ② 再断开对外通道（WS 先关，避免 server 停了还有连接在等推送）
-        // 分发器排在最前：它先关门（之后任何触发源 emit 都是空操作）、再**挂起等在途轮次收尾** ——
+        // 分发器排在最先：它先停止接受新触发（此后任何触发源 emit 都是空操作）、再**等待在途轮次收尾** ——
         // 否则下面把 webhookChannel / wsManager / historyScope 收掉之后，还在跑的那几个协程会往
         // 已关闭的组件里投递（投递撞上被关掉的 CIO 连接池、投递记录写进已 cancel 的 scope）。
         try { g.serverGraph.notificationDispatcher.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down notification dispatcher", e) }
@@ -1312,16 +1349,23 @@ class BackendService : Service() {
         //（那组协程要活过一次 HTTP 请求，不能挂 serviceScope），只能靠 stop() 显式收。
         // 不调它的话，停止服务后最多还会多跑三次整库扫描（+3s/+15s/+45s）。
         try { g.serverGraph.mediaIndexStore.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping media index", e) }
+        // 第三方程序：runtime / supervisor / install scope 都必须显式收，否则停止服务后
+        // 程序继续跑、看护继续拉起，页面却因服务已停止不可见。
+        try { g.programManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down program manager", e) }
         // ttyd：父进程（core）退出不会带走子进程，必须显式杀，否则孤儿 shell 常驻耗电。
         // 注意顺序在 server.stop() 之后：先把 WS 反代收掉，再杀它背后的进程。
         try { g.serverGraph.ttydRoutes.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }
+        // 远程屏幕：同样必须显式停止。scrcpy-server 是 adb shell 的子进程，
+        // core 退出不会带走它；它的 socket 一断会自行退出，但「停止服务」这条路径上
+        // core 还活着，不显式杀就会留下一个仍在编码、仍持有唤醒锁的孤儿。
+        try { g.serverGraph.screenSessionManager.shutdownBlocking() } catch (e: Exception) { AppLogger.e(tag, "Error stopping screen session", e) }
         // 关闭 ADB shell 持久会话
         try { com.ufi_axis_core.util.AdbShellExecutor.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down ADB shell", e) }
         // 配对存储：同步落一次盘并收掉 lastSeen 的异步 flush 线程。
-        // 2026-09-08 事故：它的 flush 线程是 daemon，进程退出时被直接掐掉，而当时的落盘是
-        // 「截断真文件再写」，死在这个窗口里就留下半截 paired_devices.json ——
-        // 下次启动读不出任何设备，手机被判未配对、清空 token、回配对页要求输密码。
-        // 落盘现在是原子的，这里补上显式收尾：停止流程必须自己把线程收干净。
+        // 其 flush 线程是 daemon，进程退出时会被直接终止；落盘若不是原子操作，在该窗口内
+        // 退出会留下半截 paired_devices.json —— 下次启动读不出任何设备，手机被判未配对、
+        // 清空 token、回到配对页要求重新输入密码。落盘现为原子操作，此处仍须显式收尾：
+        // 停止流程必须自行回收该线程。
         try { com.ufi_axis_core.util.PairedDeviceStore.shutdownInstance() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down paired device store", e) }
         // 拦截规则 store：先把内存里累计的命中次数落盘再收协程。
         // `pendingHits` 只在「下次命中且过了 60s」或读规则列表时才写盘，不在这里 flush 的话
@@ -1339,7 +1383,7 @@ class BackendService : Service() {
 
     /**
      * 保活增强：提升线程优先级。
-     * 不再写 /proc/self/oom_score_adj（需要 root）。
+     * 不写 /proc/self/oom_score_adj（需要 root）。
      * 依赖前台服务 + START_STICKY + WakeLock 保活。
      */
     private fun protectFromLmk() {
@@ -1403,17 +1447,17 @@ class BackendService : Service() {
      * 通过 AlarmManager 定时拉起服务 — 比 START_STICKY 更可靠。
      * 覆盖场景：用户滑动清除、LMK 杀死、系统回收后重启、`POST /api/service/restart`。
      *
-     * 2026-08-26：改用 `getForegroundService`。原来的 `getService` 走的是普通 `startService`，
+     * 必须使用 `getForegroundService`：`getService` 走普通 `startService`，
      * Android 12+ 禁止后台启动普通服务（`ForegroundServiceStartNotAllowedException` / 直接被拒），
-     * 而本服务在 `onCreate` 里就 `startForeground`，属于前台服务，必须用前台启动语义。
+     * 而本服务在 `onCreate` 里就 `startForeground`，属于前台服务，必须使用前台启动语义。
      *
-     * ## 2026-09-14：必须用**精确**闹钟
-     * 原来用的是 `setAndAllowWhileIdle`（inexact），理由写的是"无需 SCHEDULE_EXACT_ALARM 权限"。
-     * 但 Android 12+ 的「后台启动前台服务」豁免**只给精确闹钟**（`setExact*`）——
+     * ## 必须使用**精确**闹钟
+     * `setAndAllowWhileIdle`（inexact）通常以"无需 SCHEDULE_EXACT_ALARM 权限"为理由选用，
+     * 但 Android 12+ 的「后台启动前台服务」豁免**只给精确闹钟**（`setExact*`）：
      * inexact 闹钟到点时进程处于 cached 状态，`startForegroundService` 会被 AMS 判为后台启动
-     * 而抛 `ForegroundServiceStartNotAllowedException`，**异常发生在系统侧，这里的 try/catch
-     * 根本看不到**，日志里只留下一句乐观的 "restart scheduled"。加上两枚闹钟都是
-     * `FLAG_ONE_SHOT`，撞一次墙就再没人排 —— 这正是「点了重启服务之后彻底失联」的成因之一。
+     * 而抛 `ForegroundServiceStartNotAllowedException`，**异常发生在系统侧，此处的 try/catch
+     * 无法捕获**，日志里只会留下一句 "restart scheduled"。且两枚闹钟都是
+     * `FLAG_ONE_SHOT`，一旦失败不会再排 —— 这是「重启服务之后彻底失联」的成因之一。
      *
      * 拿不到精确闹钟权限时仍退回 inexact：那种情况下的恢复责任落在 shell 侧
      * （[requestRestart] 派出的 detached `am start-foreground-service`），双保险里至少还有一路。
@@ -1467,14 +1511,14 @@ class BackendService : Service() {
      *   持续检测并在 15 秒内通过 `am start-foreground-service` 重新拉起 BackendService；
      * - 检测到 /data/local/tmp/ufi_update.lock 时自动跳过，避免与更新脚本互抢导致安装失败。
      *
-     * 2026-09-04 两处改动：
-     * 1. 判定与部署收敛到 [KeepAliveWatchdog] —— 原来这里和 `BootReceiver` 各写一份，
-     *    且都把「锁目录存在」当成「看门狗在跑」，而锁在 SIGKILL/掉电后残留，
-     *    看门狗被杀一次就再也起不来（日志里还写着 already running）。
-     * 2. 加 [KeepAliveWatchdog.SELF_HEAL_INTERVAL_MS] 的复查：**谁来看着看门狗**。
-     *    此前只在服务启动时部署一次，看门狗中途被 phantom process killer 带走后
-     *    要等到下一次 Core 启动才会重建 —— 而那时已经没人负责把 Core 拉起来了。
-     *    互相看护（Core 看 shell、shell 看 Core）才闭环。复查只做一次文件/proc 读，
+     * 两条设计约束：
+     * 1. 判定与部署统一收敛到 [KeepAliveWatchdog]（本处与 `BootReceiver` 不得各写一份）。
+     *    不能把「锁目录存在」当成「看门狗在跑」：锁在 SIGKILL / 掉电后残留，
+     *    看门狗被杀一次就再也起不来，日志里仍写着 already running。
+     * 2. 必须包含 [KeepAliveWatchdog.SELF_HEAL_INTERVAL_MS] 的复查，即对看门狗本身的监护。
+     *    只在服务启动时部署一次时，看门狗被 phantom process killer 带走后要等到下一次
+     *    Core 启动才会重建，而那时已没有组件负责拉起 Core。
+     *    互相看护（Core 看 shell、shell 看 Core）才构成闭环。复查只做一次文件 / proc 读取，
      *    不唤醒设备、不起闹钟。
      */
     private fun ensureKeepAliveWatchdog() {

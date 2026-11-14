@@ -37,6 +37,18 @@ core 随 APK 分发的 `assets/shell/` 目录下包含若干上游项目的预�
 
 各组件的许可证全文与版权声明见其上游仓库。
 
+## 内置的服务端 jar（`assets/screen/`）
+
+| 组件 | 许可证 | 用途 | 版本 / 校验 |
+| --- | --- | --- | --- |
+| `scrcpy-server.jar` | Apache-2.0 | 投屏服务端。core 在会话开始时把它推到 `/data/local/tmp/ufi/` 并以 `app_process` 拉起，用于采集 display 0 的 H.264 流并注入触摸 | `3.3.3`，SHA-256 `7e70323ba7f259649dd4acce97ac4fefbae8102b2c6d91e2e7be613fd5354be0`（90,164 B） |
+
+- 上游项目：<https://github.com/Genymobile/scrcpy>
+- 对应源码：<https://github.com/Genymobile/scrcpy/releases/tag/v3.3.3>
+- 该 jar 为上游 release 产物 `scrcpy-server-v3.3.3` 原样重命名，未做任何修改。
+- 版本与 web 端 `@yume-chan/scrcpy` 的 options 类、以及与 `ScrcpyServerLauncher.SERVER_VERSION`
+  三方锁死；升级时必须一起改，否则表现为「连上了但画面永远不出来」。
+
 ## 本项目自有脚本
 
 `samba_exec.sh` / `ufi_keepalive.sh` / `ufi_update.sh` 为本项目代码，

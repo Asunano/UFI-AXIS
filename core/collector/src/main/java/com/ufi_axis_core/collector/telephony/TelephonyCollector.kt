@@ -8,6 +8,9 @@ import android.net.NetworkCapabilities
 import android.os.Build
 import android.telephony.*
 import androidx.core.content.ContextCompat
+import com.ufi_axis_core.contract.CarrierNames
+import com.ufi_axis_core.contract.DeviceFields
+import com.ufi_axis_core.contract.SignalSanity
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
 
@@ -58,7 +61,7 @@ class TelephonyCollector(private val context: Context) {
      */
     fun getOperatorName(): String {
         return try {
-            telephonyManager?.networkOperatorName ?: "Unknown"
+            CarrierNames.displayName(telephonyManager?.networkOperatorName ?: "Unknown")
         } catch (e: Exception) {
             "Unknown"
         }
@@ -225,11 +228,15 @@ class TelephonyCollector(private val context: Context) {
         when (cellInfo) {
             is CellInfoLte -> {
                 val signal = cellInfo.cellSignalStrength
-                result["rsrp"] = signal.rsrp
-                result["rsrq"] = signal.rsrq
-                // Android API 在部分设备上返回 Integer.MAX_VALUE 表示 RSSI 不可用
+                // Android 用 CellInfo.UNAVAILABLE（Int.MAX_VALUE）表示不可用；
+                // 部分厂商还会给 3e7 之类的原始值。这里只接受 SignalSanity 的区间，
+                // 无效值直接不写 key（下游按"缺失"处理，而不是把哨兵值当 dB）。
+                signal.rsrp.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRP, it) }
+                    ?.let { result["rsrp"] = it }
+                signal.rsrq.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRQ, it) }
+                    ?.let { result["rsrq"] = it }
                 val rssi = signal.rssi
-                if (rssi in -120..-30) {
+                if (SignalSanity.isValid(DeviceFields.Signal.RSSI, rssi)) {
                     result["rssi"] = rssi
                 }
                 // LTE CellSignalStrength 不提供 SINR，不填充避免误导
@@ -238,13 +245,17 @@ class TelephonyCollector(private val context: Context) {
             is CellInfoNr -> {
                 val signal = cellInfo.cellSignalStrength
                 if (signal is CellSignalStrengthNr) {
-                    result["rsrp"] = signal.csiRsrp
-                    result["sinr"] = signal.csiSinr
-                    result["rsrq"] = signal.csiRsrq
+                    signal.csiRsrp.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRP, it) }
+                        ?.let { result["rsrp"] = it }
+                    signal.csiSinr.takeIf { SignalSanity.isValid(DeviceFields.Signal.SINR, it) }
+                        ?.let { result["sinr"] = it }
+                    signal.csiRsrq.takeIf { SignalSanity.isValid(DeviceFields.Signal.RSRQ, it) }
+                        ?.let { result["rsrq"] = it }
                     // CellSignalStrengthNr 不提供 RSSI，从 CSI-RSRP 估算
                     // RSSI ≈ RSRP + 10*log10(N)，典型 20MHz 约 100 RB → ~+20dB
-                    if (signal.csiRsrp != Int.MAX_VALUE && signal.csiRsrp < 0) {
-                        result["rssi"] = signal.csiRsrp + 20
+                    val csiRsrp = signal.csiRsrp
+                    if (SignalSanity.isValid(DeviceFields.Signal.RSRP, csiRsrp)) {
+                        result["rssi"] = csiRsrp + 20
                     }
                     result["rat"] = "5G"
                 }
@@ -252,7 +263,7 @@ class TelephonyCollector(private val context: Context) {
             is CellInfoWcdma -> {
                 val signal = cellInfo.cellSignalStrength
                 val rssi = signal.dbm
-                if (rssi in -120..-30) {
+                if (SignalSanity.isValid(DeviceFields.Signal.RSSI, rssi)) {
                     result["rssi"] = rssi
                 }
                 result["rat"] = "3G"
@@ -260,7 +271,7 @@ class TelephonyCollector(private val context: Context) {
             is CellInfoGsm -> {
                 val signal = cellInfo.cellSignalStrength
                 val rssi = signal.dbm
-                if (rssi in -120..-30) {
+                if (SignalSanity.isValid(DeviceFields.Signal.RSSI, rssi)) {
                     result["rssi"] = rssi
                 }
                 result["rat"] = "2G"

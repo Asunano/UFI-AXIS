@@ -139,7 +139,7 @@ interface WifiControl {
     /**
      * 读回接入控制名单。
      *
-     * 设备侧的名单是分号串（`"2a:ed:87:b3:e8:29;"`）+ CamelCase 键名，拆成结构化的
+     * 设备侧的名单是分号串（`"aa:bb:cc:dd:ee:ff;"`）+ CamelCase 键名，拆成结构化的
      * [AclEntry] 是实现侧的事，调用方只见 [AclSnapshot]。Mac 与 Name 按下标配对，
      * 缺名字的补空串。
      *

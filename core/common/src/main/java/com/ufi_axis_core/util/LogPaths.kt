@@ -96,7 +96,18 @@ object LogPaths {
         KEEPALIVE("keepalive"),
 
         /** 旧版散乱在应用根目录的日志文件的归档目标（见 `ComponentFactory.migrateLegacyLogsOnce`）。 */
-        ARCHIVE("_archive")
+        ARCHIVE("_archive"),
+
+        /**
+         * 第三方程序（应用商店）的运行日志（2026-10-30 P0）。
+         *
+         * 布局是 `log/programs/<id>/{stdout,stderr,lifecycle}.log` —— **每个程序一个子目录**：
+         * 这些日志由第三方程序自己写、量不可控（OpenList 有访问日志），
+         * 与 core 自己的 `app.log` 混在一起会把有用记录冲掉，也没法按程序清理。
+         *
+         * 与 `update.log` 同性质：**不参与按天轮转**，按各自目录内的滚动策略管理。
+         */
+        PROGRAMS("programs")
     }
 
     /** 应用根目录，如 `/sdcard/Download/UFI-AXIS`。 */

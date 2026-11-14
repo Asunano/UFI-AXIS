@@ -462,8 +462,9 @@ class MonitorRoutes(
      *
      * 桶原点是 epoch 绝对网格（DAO 里 `timestamp / bucketMs`），桶心时间 = 桶起点 + 半桶；
      * 只要 bucketMs 相同，任意窗口取出来的 `t` 都能互相对齐 —— 这是客户端按 t 去重合并的前提。
-     * 信号的 0 值（无信号哨兵）由 DAO 查询里的 `rsrp != 0` / `sinr != 0` 排除，
-     * 两条路径因此有一致的均值口径，不再出现「同一区间换个模式均值就变」。
+     * 信号的 0 值（无信号哨兵）与越界值（如固件返回 sinr=3e7）由 DAO 查询里的
+     * `!= 0` + 值域过滤排除，两条路径因此有一致的均值口径，不再出现
+     * 「同一区间换个模式均值就变」或一个尖峰拉爆整张图。
      */
     private suspend fun aggregateBetween(
         type: String,

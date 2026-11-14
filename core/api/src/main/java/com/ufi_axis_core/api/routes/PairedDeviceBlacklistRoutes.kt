@@ -5,7 +5,6 @@ import com.ufi_axis_core.api.middleware.AuthMiddleware
 import com.ufi_axis_core.api.pairing.PairingManager
 import com.ufi_axis_core.api.pairing.PairingManager.BlacklistResult
 import com.ufi_axis_core.contract.ErrorCode
-import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
@@ -15,20 +14,20 @@ import io.ktor.server.routing.Route
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
-import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 
 /**
  * 配对设备黑名单端点（2026-10-15；挂 /api 鉴权块内，Bearer token 保护）。
  *
  * - GET    /api/pairing/blacklist                  → 200 {devices:[{fingerprint, hw_id, name, reason, blocked_at, blocked_by}]}
- * - POST   /api/pairing/blacklist                  → 200 {success, already?}（需配对密码）
- * - DELETE /api/pairing/blacklist/{fingerprint}    → 200 {success}（需配对密码）
- * - POST   /api/pairing/blacklist/clear            → 200 {success, removed}（需配对密码）
+ * - POST   /api/pairing/blacklist                  → 200 {success, already?}
+ * - DELETE /api/pairing/blacklist/{fingerprint}    → 200 {success}
+ * - POST   /api/pairing/blacklist/clear            → 200 {success, removed}
  *
- * ## 为什么写操作都要配对密码
- * 与"移除已配对设备"同一套双因素：Bearer 证明"你是已配对客户端"，配对密码证明"你有管理权"。
- * 少任何一条，被偷走的一台已配对设备就能把机主**所有**设备拉黑（自锁）。
+ * ## 鉴权口径
+ * 只有 Bearer + 设备签名一条：设备是单机单人场景，能登录就说明已持有配对凭据。
+ * 原先还要求一次配对密码，为的是防"被偷走的一台已配对设备把机主所有设备拉黑"；
+ * 这个风险在单机单人场景下由「本机不可拉黑」+ 管理入口只在设置页承担。
  *
  * ## 为什么服务端还要拒绝"拉黑本机"
  * UI 会置灰，但 UI 不是安全边界：直接用 API 拉黑自己，等于一键把自己踢下线，
@@ -60,17 +59,11 @@ class PairedDeviceBlacklistRoutes(
         val fingerprint: String? = null,
         val hw_id: String? = null,
         val name: String? = null,
-        val reason: String? = null,
-        val password: String? = null
+        val reason: String? = null
     )
-
-    @Serializable
-    private data class PasswordBody(val password: String? = null)
 
     private fun fingerprintParam(call: ApplicationCall): String =
         call.parameters.getAll("fingerprint")?.joinToString("/") ?: ""
-
-    private fun clientIp(call: ApplicationCall): String = call.request.local.remoteAddress
 
     /**
      * 发起请求的**本机**设备指纹（鉴权中间件写入 attributes）。
@@ -100,8 +93,6 @@ class PairedDeviceBlacklistRoutes(
     }
 
     private suspend fun handleBlock(call: ApplicationCall) {
-        val ip = clientIp(call)
-        throttleIfNeeded(ip)
         val body = try { call.receive<BlockBody>() } catch (e: Exception) { null }
         when (
             val result = pairingManager.blockDevice(
@@ -109,8 +100,6 @@ class PairedDeviceBlacklistRoutes(
                 hwId = body?.hw_id,
                 name = body?.name,
                 reason = body?.reason,
-                password = body?.password,
-                ip = ip,
                 selfFingerprint = selfFingerprint(call)
             )
         ) {
@@ -133,20 +122,6 @@ class PairedDeviceBlacklistRoutes(
                 )
             is BlacklistResult.NotFound ->
                 call.respondFail(HttpStatusCode.NotFound, ErrorCode.DEVICE_NOT_FOUND, "Device not in blacklist")
-            is BlacklistResult.MissingPassword -> {
-                AppLogger.w(TAG, "Password required (pairing/blacklist block) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "请输入配对密码")
-            }
-            is BlacklistResult.InvalidPassword -> {
-                AppLogger.w(TAG, "Invalid device password (pairing/blacklist block) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
-            }
-            is BlacklistResult.PasswordLocked ->
-                call.respondFail(
-                    HttpStatusCode.TooManyRequests,
-                    ErrorCode.PASSWORD_LOCKED,
-                    "Too many failed password attempts, retry later"
-                )
             is BlacklistResult.Unavailable ->
                 call.respondFail(
                     HttpStatusCode.NotImplemented,
@@ -157,29 +132,17 @@ class PairedDeviceBlacklistRoutes(
     }
 
     private suspend fun handleUnblock(call: ApplicationCall) {
-        val ip = clientIp(call)
-        throttleIfNeeded(ip)
-        val body = try { call.receive<PasswordBody>() } catch (e: Exception) { null }
-        when (val result = pairingManager.unblockDevice(fingerprintParam(call), body?.password, ip)) {
+        // 主人密码门（0.1.0 起这处就要密码，本版原样保留，只是改由 OwnerGate 统一判定）。
+        // 解除黑名单 = 放一条已被拒绝的凭据重新尝试。
+        val body = runCatching { call.receiveJsonObject() }.getOrNull()
+        // [owner] DELETE /api/pairing/blacklist/{fingerprint}
+        if (!call.requireOwner(body.ownerPassword())) return
+        when (val result = pairingManager.unblockDevice(fingerprintParam(call))) {
             is BlacklistResult.Success -> call.respond(toJsonElement(mapOf("success" to true)))
             is BlacklistResult.NotFound ->
                 call.respondFail(HttpStatusCode.NotFound, ErrorCode.DEVICE_NOT_FOUND, "Device not in blacklist")
             is BlacklistResult.InvalidTarget ->
                 call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "fingerprint required")
-            is BlacklistResult.MissingPassword -> {
-                AppLogger.w(TAG, "Password required (pairing/blacklist unblock) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "请输入配对密码")
-            }
-            is BlacklistResult.InvalidPassword -> {
-                AppLogger.w(TAG, "Invalid device password (pairing/blacklist unblock) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
-            }
-            is BlacklistResult.PasswordLocked ->
-                call.respondFail(
-                    HttpStatusCode.TooManyRequests,
-                    ErrorCode.PASSWORD_LOCKED,
-                    "Too many failed password attempts, retry later"
-                )
             is BlacklistResult.Unavailable ->
                 call.respondFail(
                     HttpStatusCode.NotImplemented,
@@ -192,26 +155,13 @@ class PairedDeviceBlacklistRoutes(
     }
 
     private suspend fun handleClear(call: ApplicationCall) {
-        val ip = clientIp(call)
-        throttleIfNeeded(ip)
-        val body = try { call.receive<PasswordBody>() } catch (e: Exception) { null }
-        when (val result = pairingManager.clearBlacklist(body?.password, ip)) {
+        // 与单条解封是**同一能力**：只拦单条等于留一条绕行路（一次性放行所有被拒过的凭据）。
+        val body = runCatching { call.receiveJsonObject() }.getOrNull()
+        // [owner] POST /api/pairing/blacklist/clear
+        if (!call.requireOwner(body.ownerPassword())) return
+        when (val result = pairingManager.clearBlacklist()) {
             is BlacklistResult.Success ->
                 call.respond(toJsonElement(mapOf("success" to true, "removed" to result.removed)))
-            is BlacklistResult.MissingPassword -> {
-                AppLogger.w(TAG, "Password required (pairing/blacklist clear) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.MISSING_PASSWORD, "请输入配对密码")
-            }
-            is BlacklistResult.InvalidPassword -> {
-                AppLogger.w(TAG, "Invalid device password (pairing/blacklist clear) ip=$ip")
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, "配对密码错误")
-            }
-            is BlacklistResult.PasswordLocked ->
-                call.respondFail(
-                    HttpStatusCode.TooManyRequests,
-                    ErrorCode.PASSWORD_LOCKED,
-                    "Too many failed password attempts, retry later"
-                )
             is BlacklistResult.Unavailable ->
                 call.respondFail(
                     HttpStatusCode.NotImplemented,
@@ -221,17 +171,5 @@ class PairedDeviceBlacklistRoutes(
             else ->
                 call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "unexpected state")
         }
-    }
-
-    // 与 /pairing 下的其它端点共用同一全局失败计数：换端点也绕不开节流（正常情况恒为 0）。
-    // （注意：这里必须用行注释 —— Kotlin 的块注释会嵌套，KDoc 里写 `/pairing/*` 会把注释开成两层。）
-    private suspend fun throttleIfNeeded(ip: String) {
-        val throttle = pairingManager.passwordThrottleDelayMs()
-        if (throttle > 0) delay(throttle)
-    }
-
-    private companion object {
-        /** 与 PairingManager / PairingRoutes 共用同一日志标签，配对全流程可一次过滤出来。 */
-        private const val TAG = "Pairing"
     }
 }

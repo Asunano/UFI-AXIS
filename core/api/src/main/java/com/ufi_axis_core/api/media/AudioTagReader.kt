@@ -11,7 +11,7 @@ import java.nio.ByteBuffer
  * ## 为什么不用 MediaMetadataRetriever
  * 它走系统 extractor / codec 那一套。本机（随身 WiFi 的定制 ROM）连视频画面都解不出来，
  * FLAC 的 Vorbis Comment 也时常读不到 —— 于是 `/tags` 拿回空标签，客户端只能退回文件名，
- * 表现就是"改了接口，歌名还是 `带我走 - 杨丞琳`"。
+ * 表现就是"改了接口，歌名还是 `示例歌曲 - 示例歌手`"。
  *
  * 标签本身是**容器头部的纯字节结构**，不需要任何解码能力：
  * · FLAC → `fLaC` 魔数 + METADATA_BLOCK 链，取 `VORBIS_COMMENT`（type 4）；

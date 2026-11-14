@@ -132,7 +132,10 @@ class UpperLayerGoformFreeGuardTest {
         "core/api/src/main/java/com/ufi_axis_core/api/routes/QoSRoutes.kt" to
             setOf("GoformQoS"),
         "core/api/src/main/java/com/ufi_axis_core/api/routes/ConfigRoutes.kt" to
-            setOf("GoformQoS", "qosGoformQueryMax", "qosGoformSetMax"),
+            // `verifyGoformPassword`（2026-10-30 审查 §2.3）：写入 `goform_password` 前的
+            // 「验证式落盘」回调 —— 构造参数，把「拿新口令真的登录一次」这件事委托给装配层。
+            // 它讲的是「core → 设备后台的口令」，不是协议类型；协议本身仍在 :core:goform。
+            setOf("GoformQoS", "qosGoformQueryMax", "qosGoformSetMax", "verifyGoformPassword"),
         "core/api/src/main/java/com/ufi_axis_core/api/GoformNetworkInfo.kt" to
             setOf("GoformNetworkInfo"),
         "core/api/src/main/java/com/ufi_axis_core/api/routes/DashboardRoutes.kt" to
@@ -147,7 +150,10 @@ class UpperLayerGoformFreeGuardTest {
         "core/api/src/main/java/com/ufi_axis_core/api/routes/PairingRoutes.kt" to
             setOf("InvalidGoformConfig", "updateGoformPassword"),
         "core/api/src/main/java/com/ufi_axis_core/api/routes/DeviceRoutes.kt" to
-            setOf("updateGoformPassword"),
+            // `setGoformPasswordBlocking`（2026-10-30 审查 §2.9）：`AppSettings` 上的同步写入
+            // 方法 —— 改设备口令后要判本地写是否成功，失败就把设备改回去。`apply()` 的 setter
+            // 返回 Unit，判不出结果，所以只能调这个带返回值的。方法名带协议味，不是协议实现。
+            setOf("updateGoformPassword", "setGoformPasswordBlocking"),
         "core/collector/src/main/java/com/ufi_axis_core/collector/signal/SignalCollector.kt" to
             setOf("preFetchedGoform", "collectLayer1GoformFields"),
         "core/controller/src/main/java/com/ufi_axis_core/controller/sms/SmsController.kt" to
@@ -169,7 +175,15 @@ class UpperLayerGoformFreeGuardTest {
         // 0.1：goform 熔断健康闸门的装配。`GoformGuard` 在 :core:common、`setGoformUnhealthy`
         // 在 ResponseCache，装配层只把两者接成一条回调；不涉及具体协议类型，也不向上层暴露。
         "core/src/main/java/com/ufi_axis_core/service/ComponentFactory.kt" to
-            setOf("GoformGuard", "setGoformUnhealthy"),
+            // `verifyGoformPassword`：给 ConfigRoutes 传的那个回调的**形参名**（见上一条）；
+            // `updateGoformPassword`：`DeviceTransport` 契约层自己的方法名（见上面 C 组），
+            // 装配层只是把这两个接起来，不认识任何协议类型。
+            setOf(
+                "GoformGuard",
+                "setGoformUnhealthy",
+                "verifyGoformPassword",
+                "updateGoformPassword",
+            ),
         "core/src/main/java/com/ufi_axis_core/service/BackendService.kt" to
             setOf("GoformQoS", "GoformSessionLog"),
         "core/api/src/main/java/com/ufi_axis_core/api/DataHub.kt" to

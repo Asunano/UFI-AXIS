@@ -1,5 +1,7 @@
 package com.ufi_axis_core.api.routes
 
+import com.ufi_axis_core.api.files.StorageVolumes
+
 import android.os.Build
 import android.os.Environment
 import android.os.StatFs
@@ -40,30 +42,30 @@ import com.ufi_axis_core.util.ArchiveExtractors
 /**
  * 文件管理路由 — 无 root 的本地文件管理器（基础 NAS 能力）。
  *
- * 全部操作基于 java.io.File / java.nio.file，不再调用 su / ShellExecutor。
+ * 全部操作基于 java.io.File / java.nio.file，不调用 su / ShellExecutor。
  * 仅允许访问用户存储（内部存储 + SD 卡），任何指向系统目录的路径都被拒绝。
  *
  * [registry] 提供存储提供者的解析与分发能力。路径以 `remote:` 开头时
- * 路由到对应的远程提供者；否则走本地逻辑（行为与引入 registry 之前完全一致）。
+ * 路由到对应的远程提供者；否则走本地文件系统逻辑。
  */
 class FileRoutes(
     private val registry: FileProviderRegistry,
     /**
      * 删除文件要用 `contentResolver`（走 MediaStore 才能连索引一起清，见
-     * `POST /delete` 的说明）。可空 + 默认 null：老的组装代码不传也能编过，
+     * `POST /delete` 的说明）。可空 + 默认 null：未注入该依赖的装配仍可编译，
      * 传 null 时 `/delete` 退回纯文件系统删除，并在响应里说明索引可能残留。
      */
     private val appContext: android.content.Context? = null,
     /** 删除成功后要失效媒体列表缓存，否则客户端刷出来还是旧的那一条。 */
     private val cache: com.ufi_axis_core.core.cache.ResponseCache? = null,
     /**
-     * 媒体库内容被改动后的回调（2026-10-13）。
+     * 媒体库内容被改动后的回调。
      *
-     * 加它是因为媒体列表/分组的数据源换成了 `MediaIndexStore` 的**内存快照**：
-     * 光失效 `ResponseCache` 已经不够了，快照里还留着那条已经不存在的记录，
-     * 客户端会在列表里看到一个点不开的文件。装配层把它接到 `MediaIndexStore.invalidate()`。
+     * 媒体列表与分组的数据源是 `MediaIndexStore` 的**内存快照**：只失效 `ResponseCache`
+     * 不足以让改动生效，快照中仍保留已不存在的记录，客户端会看到无法打开的文件条目。
+     * 装配层将该回调接到 `MediaIndexStore.invalidate()`。
      *
-     * 可空 + 默认 null：与 [cache] 同一口径，老的组装代码不传也能编过。
+     * 可空 + 默认 null：与 [cache] 同一口径，未注入时构造仍成立。
      */
     private val onMediaMutated: (() -> Unit)? = null
 ) {
@@ -81,13 +83,36 @@ class FileRoutes(
         private const val INTERNAL_STORAGE = "/storage/emulated/0"
 
         /**
+         * 不经文件管理器开放的敏感目录（小写、不含尾斜杠）。
+         *
+         * 与 `LogPaths.appRoot()` 的布局保持一致：日志在 `log/`，备份在 `Backup/`
+         *（app 侧 `BACKUP_RELATIVE_PATH = "Download/UFI-AXIS/Backup/"`）。
+         * 「用户可见但对安全敏感」的目录统一在此登记，各 handler 不再各自判断。
+         */
+        private val SENSITIVE_USER_SUFFIXES = listOf(
+            "/download/ufi-axis/log",
+            "/download/ufi-axis/backup",
+        )
+
+        /**
+         * 敏感树里的**排障证据**：明确放行。
+         *
+         * 判据只有一条：**它不构成凭据泄漏，且是设备上唯一能取到的那份证据**。
+         * 崩溃 dump 已被 `AppLogger.desensitize` 处理过；`update.log` 只有版本号/URL/结果行。
+         * `goform/` 刻意不在列（会话日志带请求参数）。
+         */
+        private val SENSITIVE_USER_ALLOWED_SUBTREES = listOf(
+            "/download/ufi-axis/log/core/crash",
+            "/download/ufi-axis/log/core/update",
+        )
+
+        /**
          * 整体上传（`POST /upload`）的请求体上限，**HTTP 层与路由层共用这一个常量**。
          *
          * 定义在这里而不是 `HttpServer`：那边的 `RequestBodyLimit` 插件按路径前缀分流，
-         * 上限必须与实现这条路由的类保持一致。这正是仓库已有的做法 ——
-         * `HttpServer` 同样引用 `BackupRoutes.MAX_UPLOAD_BYTES`，而且代码里写明了理由：
-         * 「两处漂移的后果是路由层按 8MB 设计、HTTP 层按 512KB 拦」，表现为
-         * 「小文件能传、稍大的莫名 413」这种极难定位的问题。
+         * 上限必须与实现这条路由的类保持一致；`HttpServer` 同样引用
+         * `BackupRoutes.MAX_UPLOAD_BYTES`。两处取值漂移时，路由层按 8MB 设计、HTTP 层按
+         * 512KB 拦截，表现为小文件可传、稍大的请求被 413 拒绝，问题难以定位。
          */
         const val UPLOAD_BODY_LIMIT = 200L * 1024 * 1024
 
@@ -141,17 +166,15 @@ class FileRoutes(
         /**
          * `/read` 的统一响应。
          *
-         * `size` 恒为文件真实字节数（`File.length()`）。之前这个字段在 4 个分支里有 3 种语义
-         * （0 / 文件字节数 / content 的 UTF-16 字符数），前端只能靠 content 的中文前缀猜是否截断，
-         * 所以这里补一个显式的 `truncated`。
+         * `size` 恒为文件真实字节数（`File.length()`），各分支只有这一种语义；
+         * 是否截断由显式的 `truncated` 表达，客户端不需要从 content 内容推断。
          */
         /**
          * `/read` 的响应信封。
          *
          * @param reason 内容不可用的原因（[REASON_TOO_LARGE] / [REASON_BINARY] / [REASON_NOT_FILE]）；
-         *   null 表示 [content] 就是完整文件内容。2026-09-11 新增 —— 此前三种情况都只置
-         *   `truncated = true` 并把说明文字塞进 content，客户端无从区分，只能给一句含糊的提示。
-         *   `truncated` 保留是为了老客户端仍能判断"内容不可信"。
+         *   null 表示 [content] 就是完整文件内容。三种不可用情况各有独立取值，
+         *   说明文字不写入 content；`truncated` 供旧客户端判断"内容不可信"。
          * @param suspect 以 UTF-8 解码时出现了替换字符，内容可能是 GBK 等其它编码
          */
         private fun readResponse(
@@ -189,10 +212,10 @@ class FileRoutes(
         /**
          * 按 RFC 6266 / RFC 5987 拼 Content-Disposition。
          *
-         * 之前是直接把文件名插进 `filename="$name"`：一旦名字里带 `"` 或 `\`，
-         * 参数会提前闭合，整个头从那里被截断 —— 比非 ASCII 乱码严重得多。
-         * 所以给两个参数：ASCII 兜底的 `filename`（不安全字符换成 `_`）+ 精确的 `filename*`。
-         * 换行类字符不用单独处理，Ktor 的 checkHeaderValue 会先拒掉所有 < 0x20。
+         * 文件名不得直接拼进 `filename="$name"`：名字含 `"` 或 `\` 时参数提前闭合，
+         * 整个头从该处被截断，后果重于非 ASCII 乱码。
+         * 因此输出两个参数：ASCII 兜底的 `filename`（不安全字符替换为 `_`）与精确的 `filename*`。
+         * 换行类字符无需单独处理，Ktor 的 checkHeaderValue 会先拒掉所有 < 0x20。
          */
         internal fun contentDisposition(disposition: String, fileName: String): String {
             val ascii = fileName
@@ -227,9 +250,9 @@ class FileRoutes(
         /**
          * 流式传输缓冲区。
          *
-         * 2026-09-14 由 8KB 提到 64KB：1080p 视频约 5-15 Mbps，8KB 意味着每秒上千次
-         * read/write syscall，而 core 常跑在随身 WiFi 这类弱设备上，CPU 全花在系统调用上。
-         * 64KB 是「一次 syscall 搬更多字节」与「不为小文件白占内存」之间的常规折中。
+         * 取值 64KB：1080p 视频约 5-15 Mbps，8KB 缓冲区对应每秒上千次 read/write syscall，
+         * 而 core 常运行在随身 WiFi 这类性能有限的设备上，CPU 大量消耗在系统调用上。
+         * 64KB 是「单次 syscall 搬运更多字节」与「不为小文件白占内存」之间的折中。
          */
         private const val STREAM_BUFFER_SIZE = 64 * 1024
     }
@@ -244,7 +267,7 @@ class FileRoutes(
     private val mediaTicketStore = MediaTicketStore()
 
     /**
-     * 为 DLNA 内容目录签发流媒体票据（2026-10-09）。
+     * 为 DLNA 内容目录签发流媒体票据。
      *
      * DlnaService browse 时为每个媒体文件现场换票 —— 与 web 端 `/stream-ticket` 走的是
      * 同一份票据表与同一条 `/media/stream` 校验路径，但 DLNA 播放器不能调 HTTP 换票
@@ -316,18 +339,18 @@ class FileRoutes(
                 }
                 call.respond(toJsonElement(mapOf(
                     "isExternalStorageManager" to granted,
-                    // ── 上传能力位（2026-09-19）──
-                    // 客户端据此决定走整体还是分片，并且**不再硬编码上限**。
-                    // 老固件不回这些 key，客户端回落到自己那份保守常量即可。
+                    // ── 上传能力位 ──
+                    // 客户端据此决定走整体还是分片，并且**不硬编码上限**。
+                    // 不返回这些 key 的旧固件，由客户端回落到自身保守常量。
                     "max_upload_bytes" to UPLOAD_BODY_LIMIT,
                     "supports_chunked_upload" to true,
                     "chunk_size" to UPLOAD_CHUNK_SIZE,
                     "max_chunked_upload_bytes" to MAX_CHUNKED_UPLOAD_BYTES,
                     "upload_session_ttl_seconds" to uploadSessions.ttlSeconds,
-                    // 远端上传（手机 → core 暂存 → 外部存储源）。老 app 不认这个 key，
-                    // 于是继续按"远端不能上传"隐藏入口，不会点到一个必然 400 的动作。
+                    // 远端上传（手机 → core 暂存 → 外部存储源）。不识别该 key 的旧客户端
+                    // 继续按"远端不能上传"隐藏入口，不会触发必然返回 400 的操作。
                     "supports_remote_upload" to true,
-                    // ── 存储源列表（Phase 1）──
+                    // ── 存储源列表 ──
                     "sources" to registry.listSources().map { mapOf(
                         "id" to it.id, "label" to it.label, "protocol" to it.protocol,
                         "enabled" to it.enabled
@@ -337,7 +360,7 @@ class FileRoutes(
 
             get("/list") {
                 val path = call.request.queryParameters["path"] ?: INTERNAL_STORAGE
-                // ── remote: 前缀路由（Phase 1）──
+                // ── remote: 前缀路由 ──
                 if (path.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
                     val (provider, remotePath) = try {
                         registry.resolve(path)
@@ -380,12 +403,12 @@ class FileRoutes(
                 withContext(Dispatchers.IO) {
                     val raw = dir.listFiles().orEmpty()
                     // ── 分片残留清理（清理闸门 3）──
-                    // 这是覆盖「core 被杀 / 设备断电」的那一道：内存里的会话表全丢之后，
-                    // 磁盘上的 `.ufipart` 没有任何人知道它存在。选在列目录时顺手清，
-                    // 是因为这里已经拿到了 listFiles() 的结果 —— 零额外 IO，
-                    // 且不需要定时器、不需要启动扫描、不需要全卷 walk。
-                    // 代价：没人访问过的目录里的残留会一直留着。由开会话时的配额闸门兜住，
-                    // 而且那种残留本身无害。
+                    // 该路径覆盖「core 被杀 / 设备断电」场景：内存中的会话表丢失后，
+                    // 磁盘上的 `.ufipart` 不再有记录可查。清理放在列目录时执行，
+                    // 因为此处已取得 listFiles() 的结果，零额外 IO，
+                    // 且不需要定时器、启动扫描或全卷 walk。
+                    // 代价：未访问过的目录中的残留会长期保留；这类残留本身无害，
+                    // 其总量由开会话时的配额闸门限制。
                     purgeStaleParts(raw.toList())
                     val files = raw
                         // 分片文件对用户不可见：它是传输中间态，不是"文件"。
@@ -489,11 +512,11 @@ class FileRoutes(
                         return@withContext
                     }
                     // 到这里 bytes.size <= MAX_READ_SIZE，而 UTF-8 解出的字符数不会多于字节数，
-                    // 所以不可能再需要二次截断 —— 旧的 text.length > MAX_READ_SIZE 分支是死代码。
+                    // 所以不需要二次截断。
                     val text = String(bytes, charset)
-                    // U+FFFD 是解码器遇到非法字节序列时填的替换字符。只在按 UTF-8 读时才作为
-                    // "编码可能不对"的信号：用户显式选了 GBK 还出现替换字符，那是文件本身的问题，
-                    // 再提示一次"可能不是 GBK"只会让人反复换编码试。
+                    // U+FFFD 是解码器遇到非法字节序列时填入的替换字符。仅在按 UTF-8 读取时
+                    // 作为"编码可能不对"的信号：显式选择 GBK 时出现替换字符属于文件本身的问题，
+                    // 再次提示编码可疑只会导致反复更换编码尝试。
                     val suspect = charset == Charsets.UTF_8 && text.contains('\uFFFD')
                     call.respond(readResponse(
                         text, fileSize, truncated = false,
@@ -542,8 +565,8 @@ class FileRoutes(
              * body: `{ "path": "…" }`；`remote:` 前缀交给对应存储源的 provider。
              *
              * ## 单个文件为什么先走 MediaStore
-             * `File.delete()` 只删磁盘上的字节，**MediaStore 的索引还在** —— 媒体库里会留下一条
-             * 指向不存在文件的僵尸记录：列表里看得见、点进去播放失败，重新扫描也不一定清得掉
+             * `File.delete()` 只删磁盘上的字节，**MediaStore 的索引仍在** —— 媒体库里会留下一条
+             * 指向不存在文件的失效记录：列表可见、播放失败，重新扫描也不一定清除
              *（扫描只补新增，不一定回收失效项）。`contentResolver.delete` 把文件与索引一起处理。
              * 删到 0 行（文档、压缩包这类本来就不在 MediaStore 里的）才退回文件系统删除。
              *
@@ -580,7 +603,7 @@ class FileRoutes(
                     return@post
                 }
                 // "denied" 单独一档：其余失败（不存在 / 删不动）都回 success=false，
-                // 与这个接口原本的语义保持一致，不改成 4xx/5xx（老客户端只看 success）
+                // 与该接口既有语义保持一致，不改为 4xx/5xx（旧客户端只读取 success）
                 val outcome = withContext(Dispatchers.IO) {
                     runCatching {
                         val f = File(realPath)
@@ -600,10 +623,10 @@ class FileRoutes(
                 }
                 when (outcome) {
                     "ok" -> {
-                        // 媒体库列表里那一条得跟着消失，否则客户端刷出来还是旧的
+                        // 媒体库列表中的对应条目必须同步失效，否则客户端仍会读到旧数据
                         cache?.invalidate("media:*")
-                        // 2026-10-13：列表/分组现在读 MediaIndexStore 的内存快照，
-                        // 光清 ResponseCache 不够 —— 快照里那条记录还在。
+                        // 列表与分组读取 MediaIndexStore 的内存快照，
+                        // 只清 ResponseCache 不够 —— 快照里那条记录仍在。
                         onMediaMutated?.invoke()
                         call.respond(toJsonElement(mapOf(
                             "success" to true, "deleted" to true, "path" to realPath
@@ -886,12 +909,11 @@ class FileRoutes(
             get("/stream") {
                 val filePath = call.request.queryParameters["path"] ?: ""
                 if (filePath.startsWith(FileProviderRegistry.REMOTE_PREFIX)) {
-                    // ── 远端流式播放（2026-09-21 补上 Range）──
+                    // ── 远端流式播放（支持 Range）──
                     //
-                    // 之前这里**忽略客户端的 Range 头**，每次都向远端发一个不带 Range 的整文件 GET。
-                    // 两个后果：① 播放器无法 seek；② 相当多的网盘 / 反代对"不带 Range 的大文件 GET"
-                    // 直接回 502，于是视频根本放不出来（ExoPlayer 报 2004），而目录列表却是好的 ——
-                    // 现象上很像"远端存储坏了"，实际只差一个头。
+                    // 必须把客户端的 Range 头转给远端。忽略它会带来两个后果：① 播放器无法 seek；
+                    // ② 相当多的网盘 / 反代对"不带 Range 的大文件 GET"直接回 502，
+                    // 视频无法播放（ExoPlayer 报 2004），而目录列表正常，容易误判为远端存储故障。
                     val (provider, remotePath) = try { registry.resolve(filePath) } catch (e: FileProvider.ProviderException) {
                         call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, e.message ?: "Invalid remote path")
                         return@get
@@ -940,12 +962,11 @@ class FileRoutes(
             }
 
             /**
-             * 签发媒体流播放票据（2026-09-14）。
+             * 签发媒体流播放票据。
              *
              * 只给 **web 端**用：浏览器的 `<audio src>` / `<video src>` 无法附加鉴权头，
-             * 拿不到 `/api/files/stream`，此前只能 `fetch` 整个文件成 blob 再播
-             * （100MB 上限 + 必须下载完 + 电影进不了预览）。本端点走正常头部鉴权换一张短时票据，
-             * 之后浏览器用 `/media/stream?ticket=…` 直接流式播放，Range 与 seek 全由浏览器负责。
+             * 不能直接使用 `/api/files/stream`，只能 `fetch` 整个文件成 blob 再播放
+             * （100MB 上限 + 必须下载完 + 影片无法预览）。本端点走正常头部鉴权换一张短时票据，
              *
              * app 端**不需要**它：ExoPlayer 走 OkHttp，能带头，继续用 `/api/files/stream`。
              *
@@ -968,7 +989,7 @@ class FileRoutes(
                 val ticket = mediaTicketStore.issue(realPath)
                 call.respond(toJsonElement(mapOf(
                     "ticket" to ticket,
-                    // 直接把可用 URL 给出去，省得客户端各自拼（拼错一次就是"能放不能 seek"这类怪问题）
+                    // 直接返回可用 URL，避免客户端自行拼接（拼错会导致可播放但无法 seek）
                     "url" to "$MEDIA_STREAM_PATH?ticket=${URLEncoder.encode(ticket, "UTF-8")}",
                     "expires_in" to mediaTicketStore.ttlSeconds,
                     "size" to f.length(),
@@ -1043,14 +1064,14 @@ class FileRoutes(
                 }
             }
 
-            // ───────── 分片上传（2026-09-19）─────────
+            // ───────── 分片上传 ─────────
             //
-            // 为什么要它：整体上传断了从零重来，2GB 视频按 5MB/s 算 400 秒，
-            // 任何一次抖动全废；而且老实现先落 app 内部存储的临时文件再 Files.copy 到目标，
-            // 峰值占用 2× 文件大小、目标在 SD 卡时还是跨卷复制。
+            // 整体上传一旦中断必须从零重来：2GB 视频按 5MB/s 计算需要 400 秒，
+            // 单次网络抖动即导致全部作废；且整传先写 app 内部存储的临时文件再 Files.copy
+            // 到目标，峰值占用 2× 文件大小，目标位于 SD 卡时还需跨卷复制。
             //
             // 三个端点 + 一个删除。语义与所有边缘情况见 [UploadSessionStore] 的类注释。
-            // `/upload`（整体）**保留不动**：老客户端与小文件继续走它，不需要多一次往返。
+            // `/upload`（整体）**保留**：旧客户端与小文件继续使用，不需要多一次往返。
 
             /**
              * 开会话。同时承担四件事：路径校验、自动改名、空间/配额检查、续传探测。
@@ -1125,7 +1146,7 @@ class FileRoutes(
                     remoteProvider = provider
                     remoteSourceId = sourceId
                     remoteRelDir = resolved.second
-                    // 顺手清一次孤儿暂存文件（core 被杀 / 断电后的残留），同惰性清理的口径
+                    // 同时清理一次孤儿暂存文件（core 被杀 / 断电后的残留），与惰性清理同一口径
                     withContext(Dispatchers.IO) { remotePush.purgeStaleStaging() }
                     remotePush.stagingDirFor(sourceId, resolved.second).absolutePath
                 } else {
@@ -1170,7 +1191,7 @@ class FileRoutes(
                 }
 
                 // 空间检查：留出余量，否则传完正好写满、连 rename 的元数据都可能写不下。
-                // 远端上传查的是**暂存所在的内部存储**，不是远端服务器 —— 远端的余量我们查不到，
+                // 远端上传查的是**暂存所在的内部存储**，不是远端服务器 —— 远端剩余空间无法查询，
                 // 那种失败只能在第二阶段（推送）暴露，所以推送失败必须是可见、可重试的。
                 val free = withContext(Dispatchers.IO) { freeSpaceOf(realDir) }
                 if (free in 1 until (size + FREE_SPACE_HEADROOM)) {
@@ -1199,7 +1220,7 @@ class FileRoutes(
                     return@post
                 }
 
-                // 自动改名（用户已确认的策略 B）：目标已存在时落成 `video (1).mp4`，不静默覆盖。
+                // 自动改名：目标已存在时落成 `video (1).mp4`，不静默覆盖。
                 // 传大文件时覆盖掉的可能是几 GB 的东西，静默覆盖的风险远高于小文件。
                 val provider = remoteProvider
                 val finalName = if (isRemote && provider != null) {
@@ -1404,7 +1425,7 @@ class FileRoutes(
                         stagedFile = dest,
                         totalBytes = actual
                     )
-                    // `staged: true` 是给客户端的关键信号：**别提示"上传完成"**，
+                    // `staged: true` 是给客户端的关键信号：**不得提示"上传完成"**，
                     // 这时候文件只在 core 上，真正的落点还要看推送作业。
                     call.respond(toJsonElement(mapOf(
                         "success" to true,
@@ -1437,7 +1458,7 @@ class FileRoutes(
                 call.respond(toJsonElement(mapOf("success" to true)))
             }
 
-            // ───────── 远端推送作业（core 暂存 → 外部存储源，2026-09-21）─────────
+            // ───────── 远端推送作业（core 暂存 → 外部存储源）─────────
             //
             // 这四个端点存在的唯一理由：**第二阶段必须可见、可管理**。
             // 手机那一段有进度条，而「core → 远端」发生在之后、在设备上、可能排队几分钟，
@@ -1739,13 +1760,13 @@ class FileRoutes(
     /**
      * 目标目录里不冲突的文件名。已存在时按 `name (1).ext` 递增。
      *
-     * 这是用户选定的「自动改名」策略：传大文件时静默覆盖的代价远高于小文件
-     * （覆盖掉的可能是几 GB 的东西），而弹确认又会打断流程。
+     * 「自动改名」策略：传大文件时静默覆盖的代价远高于小文件
+     * （覆盖的可能是数 GB 的数据），而每次弹确认会打断流程。
      *
      * 扩展名按**最后一个点**切分，且点在首位时不算扩展名（`.bashrc` 应该变成
      * `.bashrc (1)` 而不是 ` (1).bashrc`）。
      *
-     * 上限 9999 次：真撞到那么多同名就直接用带随机后缀的名字，避免死循环。
+     * 上限 9999 次：同名达到该上限时改用带随机后缀的名字，避免无限探测。
      */
     private fun uniqueChildName(dir: File, name: String): String {
         if (!File(dir, name).exists()) return name
@@ -1764,9 +1785,9 @@ class FileRoutes(
      * Range 流式响应 —— `/api/files/stream`（头部鉴权，app 端）与 [MEDIA_STREAM_PATH]
      * （票据鉴权，web 端）**共用同一份实现**。
      *
-     * 抽出来的理由很实际：两个入口的鉴权方式不同，但「怎么把字节吐出去」必须逐字节一致。
-     * 各写一份的话，将来只在其中一处修 Range 边界或缓冲，就会出现「app 能 seek、web 不能」
-     * 这类只在一端复现的问题。
+     * 抽取的理由：两个入口的鉴权方式不同，但字节输出逻辑必须逐字节一致。
+     * 各自实现时，只在其中一处修正 Range 边界或缓冲区，就会出现「app 能 seek、web 不能」
+     * 这类只在一端复现的缺陷。
      *
      * 语义：
      * - 带 `Range: bytes=…` → 206 + `Content-Range` + `Accept-Ranges`（支持 `bytes=-500` 后缀式）；
@@ -1873,6 +1894,8 @@ class FileRoutes(
             val suffix = base.removePrefix(ancestor.path).replace(Regex("/+"), "/")
             "$canonAncestor$suffix".replace(Regex("/+"), "/")
         }
+        // 日志与备份目录不经文件管理器开放，见 [isSensitiveUserPath]。
+        if (isSensitiveUserPath(resolved)) return null
         return if (isUserStoragePath(resolved)) resolved else null
     }
 
@@ -1911,70 +1934,17 @@ class FileRoutes(
         }
     }
 
-    private fun collectDiskUsage(): List<Map<String, String>> {
-        val disks = mutableListOf<Map<String, String>>()
-        // 内部存储
-        runCatching {
-            val sf = StatFs(INTERNAL_STORAGE)
-            val total = sf.totalBytes
-            if (total > 0) {
-                val avail = sf.availableBytes
-                val used = total - avail
-                disks.add(diskMap("内部存储", INTERNAL_STORAGE, total, used, avail))
-            }
+    /**
+     * 统一走 [StorageVolumes]：商店的"内容位置"选择器用的是同一份枚举。
+     *
+     * 这里只负责把结构化数据格式化成历史字段（`size`/`used`/`available`/`usePercent`），
+     * 枚举本身（内部 + StorageManager 卷表 + 兜底列目录）已经搬进 [StorageVolumes] ——
+     * 两份枚举必然漂移，而"文件管理里看得到、商店里选不到"这种 bug 用户一定会报。
+     */
+    private fun collectDiskUsage(): List<Map<String, String>> =
+        StorageVolumes.list(appContext).map { v ->
+            diskMap(v.label, v.mount, v.totalBytes, v.usedBytes, v.availableBytes)
         }
-        // SD 卡：优先走系统 StorageManager（framework 的卷表，不依赖列 /storage 目录；
-        // targetSdk 30+ 上 File("/storage").listFiles() 可能因挂载视图受限返回空/残缺，
-        // 卷就"凭空消失"且 runCatching 吞了错误 —— 2026-10-09 实机 SD 卡不识别即此）。
-        var sawSdCard = false
-        runCatching {
-            val sm = appContext?.getSystemService(android.content.Context.STORAGE_SERVICE)
-                as? android.os.storage.StorageManager ?: return@runCatching
-            sm.storageVolumes.forEach { v ->
-                val dir = runCatching { v.directory }.getOrNull() ?: return@forEach
-                if (!dir.isDirectory) return@forEach
-                val abs = dir.absolutePath.trimEnd('/')
-                // 内部存储已在上面登记；emulated/0 与 INTERNAL_STORAGE 同卷跳过
-                if (abs == INTERNAL_STORAGE || abs == "/storage/emulated" || abs == "/storage/self") return@forEach
-                runCatching {
-                    val sf = StatFs(abs)
-                    val total = sf.totalBytes
-                    if (total > 0) {
-                        sawSdCard = true
-                        val avail = sf.availableBytes
-                        disks.add(diskMap(v.getDescription(appContext) ?: "SD卡", abs, total, total - avail, avail))
-                    }
-                }.onFailure {
-                    AppLogger.w("FileRoutes", "StatFs failed for volume $abs: ${it.message}")
-                }
-            }
-        }.onFailure {
-            AppLogger.w("FileRoutes", "StorageManager volume enumeration failed: ${it.message}")
-        }
-        // 兜底：StorageManager 拿不到（context 为 null / ROM 裁剪）再退回列 /storage 目录
-        if (!sawSdCard) {
-            val storageRoot = File("/storage")
-            storageRoot.listFiles().orEmpty().forEach { d ->
-                if (!d.isDirectory) return@forEach
-                val name = d.name
-                if (name == "emulated" || name == "self") return@forEach
-                runCatching {
-                    val sf = StatFs(d.absolutePath)
-                    val total = sf.totalBytes
-                    if (total > 0) {
-                        val avail = sf.availableBytes
-                        disks.add(diskMap("SD卡", d.absolutePath, total, total - avail, avail))
-                    }
-                }.onFailure {
-                    AppLogger.w("FileRoutes", "StatFs failed for ${d.absolutePath}: ${it.message}")
-                }
-            }
-        }
-        if (disks.isEmpty()) {
-            disks.add(diskMap("内部存储", INTERNAL_STORAGE, 0, 0, 0))
-        }
-        return disks
-    }
 
     private fun diskMap(label: String, mount: String, total: Long, used: Long, avail: Long): Map<String, String> {
         return mapOf(
@@ -2031,6 +2001,40 @@ class FileRoutes(
     }
 
     /** 仅允许内部存储与 SD 卡路径（不含系统目录）。 */
+    /**
+     * 敏感目录：**默认不向文件管理器开放**。
+     *
+     * 两个目录各有一条「专用出口」，走文件 API 只是把它们变成一键外带的口子：
+     *
+     * - `Download/UFI-AXIS/log/…` —— 运行日志里有设备身份、goform 会话（含登录参数）、
+     *   AT 指令与错误堆栈。要看日志走 `GET /api/debug-logs`（有分页与级别过滤），
+     *   不是把目录整个暴露。
+     * - `Download/UFI-AXIS/Backup/…` —— 备份包（`.ufibak`）里含 `goform_password` 与
+     *   `tunnel_cf_token`；**明文导出**的包更是一份可直接读的口令清单。要备份走
+     *   `POST /api/backup/export`，要恢复走 `/api/backup/import`。
+     *
+     * ## 例外：崩溃现场与更新日志
+     *
+     * 这两类**必须**能从设备上取走（设备通常没有 adb 与屏幕），且不含口令：
+     * `log/core/crash/crash_<ms>.txt` 与 `log/core/update/update.log`。
+     * 它们由 [SENSITIVE_USER_ALLOWED_SUBTREES] 放行；缺此例外时，导出崩溃现场
+     * 只能拆机。`goform/` 不放行（会话日志含请求参数）。
+     *
+     * 判据用「小写 + 后缀」而不是绝对前缀：`/sdcard` 在真机上会 canonical 成
+     * `/storage/emulated/0`（或 `/storage/XXXX-XXXX`），写死前缀会在某些机型上漏掉。
+     * 代价是用户自建的同名目录也会被挡 —— 但那正是需要保护的位置。
+     */
+    private fun isSensitiveUserPath(path: String): Boolean {
+        val normalized = path.replace(Regex("/+"), "/").trimEnd('/').lowercase()
+        fun hit(suffix: String) =
+            normalized == suffix || normalized.endsWith(suffix) || normalized.contains("$suffix/")
+
+        if (SENSITIVE_USER_SUFFIXES.none(::hit)) return false
+        // 排障证据放行（在敏感树内，但明确不敏感）
+        if (SENSITIVE_USER_ALLOWED_SUBTREES.any(::hit)) return false
+        return true
+    }
+
     private fun isUserStoragePath(path: String): Boolean {
         // 前缀带分隔符比对：裸 startsWith("/sdcard") 会放过 `/sdcardXYZ` 这类同前缀的旁路目录
         val userPrefixes = listOf("/sdcard", "/storage", "/mnt/media_rw")

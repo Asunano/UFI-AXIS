@@ -38,15 +38,17 @@ class AppManager(
     private val iconCache = ConcurrentHashMap<String, String>()
 
     /**
-     * 系统应用 APK 路径权威判定前缀集合。
-     * 覆盖 /system、/system_ext、/vendor、/product、/oem、/system_carrier 等常见系统分区，
-     * 解决原 `apkPath.contains("/system/")` 大小写敏感且仅覆盖单一路径导致的分类错误
-     * （如 /data/app/ 下的应用被错误归到系统、/system_ext 等路径漏判）。
+     * 系统应用 APK 路径的权威判定前缀集合。
+     * 覆盖 /system、/system_ext、/vendor、/product、/oem、/system_carrier 等常见系统分区。
+     *
+     * 采用前缀集合而非单一 `/system/` 判定：后者区分大小写且只覆盖一条路径，
+     * 会把 /data/app 下的应用误判为系统应用，并漏判 /system_ext 等分区。
      */
     private val SYSTEM_PATH_PREFIXES = listOf(
         "/system/", "/system_ext/", "/vendor/", "/product/app/", "/product/priv-app/",
         "/oem/app/", "/oem/priv-app/", "/system_carrier/", "/system_ext/priv-app/",
-        // APEX（Android 11+ 镜像）：/apex/ 下挂载的系统模块视为系统应用（2026-08-19 修复 devicelockcontroller 误判为 user）。
+        // APEX（Android 11+ 镜像）：/apex/ 下挂载的系统模块按系统应用处理，
+        // 否则 devicelockcontroller 一类 APEX 模块会被误判为普通应用。
         "/apex/"
     )
 
@@ -60,21 +62,21 @@ class AppManager(
     suspend fun hasRoot(): Boolean = ShellExecutor.hasRootAccess()
 
     /**
-     * 应用列表入口：**先命中缓存再打 shell**（2026-10-12 应用列表缓存批次）。
+     * 应用列表入口：先命中缓存，未命中再执行 shell。
      *
-     * 慢的根因就在下面 [loadAllAppsUncached]：一次要串 4 条特权 shell
+     * 开销集中在 [loadAllAppsUncached]：一次需要串行执行 4 条特权 shell
      * （`pm list packages -f` / `pm list packages -d` / `pm list packages --suspended` /
-     * `dumpsys package packages | grep`），设备上是**秒级**开销。而「已安装哪些应用」是
-     * 变化极慢的数据（人手动装/卸一次），于是改成：全量列表只拉一次并带时间戳缓存住，
-     * `type` 过滤在内存里做（三个页签共用同一份全量，不必各拉一次）。
+     * `dumpsys package packages | grep`），在设备上为秒级开销。而已安装应用集合变化极慢
+     * （仅在人工安装或卸载时变化），因此全量列表只拉取一次并带时间戳缓存，
+     * `type` 过滤在内存中完成（三个页签共用同一份全量数据，不必各自拉取）。
      *
      * 语义要点：
-     * - **首次仍是同步拉取**：用户第一次进页面时该等的还是要等（没有旧值可给），
-     *   但并发到达的多个请求由 [appListMutex] 合并，**只跑一次 shell**（不形成击穿风暴）。
-     * - **空结果不入缓存**：`pm` 失败时本方法返回空列表（保持原行为），若把空列表也缓存住，
-     *   一次瞬时失败会让页面在 TTL 内一直空着。设备上"一个包都没有"不可能发生
-     *   （系统至少有几十个包），所以这个判据不会误伤真实的空设备。
-     * - **写操作一律失效**：见 [invalidateAppListCache] 的调用点清单。
+     * - 首次请求仍是同步拉取：用户第一次进入页面时无旧值可用，必须等待；但并发到达的多个请求
+     *   由 [appListMutex] 合并，只执行一次 shell，避免并发重复拉取。
+     * - 空结果不入缓存：`pm` 失败时本方法返回空列表（保持原有行为）；若缓存空列表，一次瞬时
+     *   失败会使页面在 TTL 内持续为空。设备上不存在「一个包都没有」的情形（系统至少有数十个
+     *   包），因此该判据不会误伤真实的空设备。
+     * - 写操作一律失效：调用点清单见 [invalidateAppListCache]。
      */
     suspend fun listApps(type: String = "all"): List<Map<String, Any>> {
         freshAppListCache()?.let { return it.filterByType(type) }
@@ -106,14 +108,14 @@ class AppManager(
         appListCache?.takeIf { !it.isExpired(System.currentTimeMillis(), APP_LIST_CACHE_TTL_MS) }
 
     /**
-     * 全量拉取入口的**可替换缝**（测试用）。
+     * 全量拉取入口的可替换缝（仅用于测试）。
      *
-     * 默认指向 [loadAllAppsUncached]（真的 4 条特权 shell）。单测把它换成计数器 + 假数据，
-     * 于是"第二次调用到底跑没跑 shell"可以被**数出来**，而不是靠 mock ShellExecutor
-     * （那是 object + 静态方法，mock 起来比重写实现还脆）。
+     * 默认指向 [loadAllAppsUncached]（实际执行 4 条特权 shell）。单测将其替换为计数器与假数据，
+     * 从而可通过计数判断「第二次调用是否真的执行了 shell」，避免 mock ShellExecutor
+     * （object + 静态方法，mock 成本高于替换实现）。
      *
-     * 用 `var` 而不是构造参数：它是**测试缝**，不是依赖 —— 生产路径永远是默认值，
-     * 不该让每个构造点都多传一个参数（`BootReceiver` 也 new 了一个只用来 installApk 的实例）。
+     * 使用 `var` 而非构造参数：它是测试缝，不是依赖 —— 生产路径始终使用默认值，
+     * 不应要求每个构造点额外传参（`BootReceiver` 也创建了一个仅用于 installApk 的实例）。
      */
     @Volatile
     internal var listLoader: suspend () -> List<Map<String, Any>> = { loadAllAppsUncached() }
@@ -124,11 +126,11 @@ class AppManager(
         val timestampMs: Long
     ) {
         /**
-         * 内存二次过滤：`system` / `user` / 其它（= 全量）。
+         * 内存二次过滤：`system` / `user` / 其他（= 全量）。
          *
-         * 判据与 [loadAllAppsUncached] 里原来那段 `when` 完全一致（先标 isSystem 再过滤），
-         * 抽成函数是为了让"缓存命中路径"和"拉取路径"走**同一份**过滤逻辑 ——
-         * 两处各写一遍的话，缓存命中的结果迟早会和首次拉取不一致。
+         * 判据与 [loadAllAppsUncached] 中的分类逻辑一致（先标记 isSystem 再过滤）。
+         * 抽为函数是为了让缓存命中路径与拉取路径使用同一份过滤逻辑：两处各写一遍会使
+         * 缓存命中的结果与首次拉取不一致。
          */
         fun filterByType(type: String): List<Map<String, Any>> = when (type) {
             "system" -> all.filter { it["isSystem"] == true }
@@ -145,12 +147,12 @@ class AppManager(
     private var appListCache: AppListCacheEntry? = null
 
     /**
-     * 应用列表刷新的互斥锁 —— **刷新与请求共用同一把**。
+     * 应用列表刷新的互斥锁 —— 刷新与请求共用同一把。
      *
-     * 场景：定时刷新正在跑（持锁、4 条 shell 飞着），此时用户进页面来读。
-     * 共用一把锁意味着用户要等这一次跑完（几秒）而不是又并发开一轮 —— 后者会让设备
-     * 同时跑 8 条 `pm`/`dumpsys`，在随身 WiFi 这种小内存设备上明显更慢甚至互相拖死。
-     * 「后台刷新」的价值在于把用户这次等待**前置**到定时轮次里，而不是让它变快。
+     * 场景：定时刷新正在执行（持锁，4 条 shell 在途），此时用户进入页面读取列表。
+     * 共用一把锁意味着用户需等待该轮完成（数秒），而不是并发再开一轮 —— 后者会使设备
+     * 同时执行 8 条 `pm`/`dumpsys`，在小内存设备上明显更慢，甚至互相阻塞。
+     * 后台刷新的作用是把该等待前置到定时轮次中，而不是缩短单次耗时。
      */
     private val appListMutex = Mutex()
 
@@ -163,44 +165,28 @@ class AppManager(
     private var appListRefreshScope: CoroutineScope? = null
 
     /**
-     * 应用列表缓存 TTL（5 分钟）与定时刷新周期（2 分钟）。
-     *
-     * 为什么不用 `ResponseCache.CacheTTL`：那个常量住在 `:core:cache`，而 `AppManager`
-     * 在 `:core:controller` —— `:core:controller` 现在**没有**对 `:core:cache` 的依赖
-     * （缓存是 API 响应层的 JsonElement 缓存，语义也不同：它按 key 存 JSON，
-     * 这里存的是已解析好的 `List<Map<String,Any>>`）。为复用一个数字引入模块依赖不划算，
-     * 故就地定义并写清取值理由。
-     *
-     * - **TTL 5 分钟**：应用集合是人手动的变化（装/卸/冻结），系统自身不会自己增删包。
-     *   5 分钟内最多让用户看到一次"刚装的应用没出现"，而页面上的刷新按钮、以及任何写操作
-     *   都会立刻失效缓存，所以可感知窗口很短。
-     * - **刷新周期 2 分钟 < TTL**：定时刷新每 2 分钟把 TTL 顶回去，于是进页面时**几乎总是命中**
-     *   （最坏情况数据年龄 = TTL - 周期 = 3 分钟）。若周期 >= TTL，就会出现"进页面恰好
-     *   卡在过期点"而现场跑 4 条 shell —— 那正是这次要消掉的体感。
-     */
-    /**
-     * 让缓存失效 —— **所有会改变应用列表的写操作后都必须调用**。
+     * 让缓存失效 —— 所有会改变应用列表的写操作之后都必须调用。
      *
      * 取舍（保守失效）：`forceStop` / `clearAppData` / `grantPermission` /
-     * `revokePermission` / `grantAllPermissionsViaAdb` 其实**不改变列表内容**
+     * `revokePermission` / `grantAllPermissionsViaAdb` 并不改变列表内容
      * （列表字段只有 packageName/appName/apkPath/isSystem/versionName/enabled/isFrozen/icon），
-     * 理论上可以不失效。但一律失效的代价只是"下一次进页面重新拉一次（core 侧还有 iconCache 兜底）"，
-     * 而漏失效的代价是用户看到"我明明禁用了它，列表还显示启用"且**没有任何自愈路径**
-     * （没有事件、没有推送）。省下的那点开销不值这个风险，故保守。
+     * 理论上可以不失效。但一律失效的代价仅为「下次进入页面重新拉取一次（core 侧还有
+     * iconCache 兜底）」，而漏失效的代价是用户看到「已禁用的应用仍显示为启用」且没有任何
+     * 自愈路径（无事件、无推送）。该开销不值得承担此风险，故采用保守策略。
      *
-     * 注意这里**不**顺带触发立即刷新：写操作刚跑完多条 shell，紧接着再串 4 条
-     * 只会让写请求自己变慢（客户端正在等这个写的结果）。写后回读由客户端显式重发列表请求完成。
+     * 此处不触发立即刷新：写操作刚执行完多条 shell，紧接着再串行 4 条只会使写请求本身变慢
+     * （客户端正在等待该写操作的结果）。写后回读由客户端显式重发列表请求完成。
      */
     private fun invalidateAppListCache() {
         appListCache = null
     }
 
     /**
-     * 包变化（安装 / 卸载 / 更新 / 启用停用）→ **立即失效缓存并后台重拉**（2026-10-19）。
+     * 包变化（安装 / 卸载 / 更新 / 启用停用）→ 立即失效缓存并在后台重新拉取。
      *
-     * 用户反馈：在应用管理里卸载/安装后，列表要等 5 分钟 TTL 或手动刷新才变。
-     * 根因是缓存只在 core 自己的写操作里失效；**通过其它途径**（系统设置、第三方商店、
-     * `pm uninstall`）改包时，core 完全不知道。因此在定时刷新启动时顺带注册包变化广播。
+     * 缓存原本只在 core 自身的写操作中失效；通过其他途径（系统设置、第三方商店、
+     * `pm uninstall`）修改包时，core 无法感知，列表要等 TTL 到期或手动刷新才会更新。
+     * 因此在定时刷新启动时同时注册包变化广播。
      */
     fun onPackagesChanged() {
         invalidateAppListCache()
@@ -239,22 +225,22 @@ class AppManager(
     }
 
     /**
-     * 启动定时主动刷新（用户要的"core 主动获取缓存并定时更新"）。
+     * 启动定时主动刷新（core 主动获取并周期性更新缓存）。
      *
-     * **刻意不在构造里起**：`AppManager` 还有一个只用来做自更新安装的短命实例
-     * （`BootReceiver` 的开机恢复），构造即起协程等于给那种一次性实例也挂一条永不结束的循环。
-     * 真正的持有者是 `ComponentFactory.build()` 里那个实例，它随 `ComponentGraph` 生灭，
-     * 所以由 `BackendService` 在拿到图之后显式启动、`onDestroy` 路径显式停止。
+     * 刻意不在构造时启动：`AppManager` 另有一个仅用于自更新安装的短生命周期实例
+     * （`BootReceiver` 的开机恢复），构造即启动协程会为该一次性实例挂上永不结束的循环。
+     * 真正的持有者是 `ComponentFactory.build()` 中的实例，它随 `ComponentGraph` 生灭，
+     * 因此由 `BackendService` 在取得组件图后显式启动，并在 `onDestroy` 路径显式停止。
      *
-     * @param scope 必须来自 `BackendService.serviceScope`（它在 `onDestroy` 里被 cancel），
-     *   这样即便漏掉显式 stop，协程也会随服务一起死 —— 双保险。
+     * @param scope 必须来自 `BackendService.serviceScope`（在 `onDestroy` 中被 cancel），
+     *   这样即使遗漏显式 stop，协程也会随服务结束 —— 双保险。
      */
     fun startPeriodicRefresh(scope: CoroutineScope) {
         if (appListRefreshJob?.isActive == true) return
         appListRefreshScope = scope
         appListRefreshJob = scope.launch(Dispatchers.IO) {
-            // 启动后先等一个周期再刷：core 刚起来时设备上 pm/dumpsys 可能还在被别的初始化
-            // 抢（AT 通道初始化、updateManager 恢复…），立刻刷只是给启动期添乱。
+            // 启动后先等待一个周期再刷新：core 刚启动时设备上的 pm/dumpsys 可能仍被其他初始化占用
+            // （AT 通道初始化、updateManager 恢复等），立即刷新只会加重启动期负载。
             while (isActive) {
                 delay(APP_LIST_REFRESH_INTERVAL_MS)
                 refreshAppListInBackground()
@@ -268,9 +254,9 @@ class AppManager(
     /**
      * 后台刷新一轮（定时器与「启动/恢复后台」两个入口共用）。
      *
-     * 失败/空结果一律**不写缓存**：保留上一份好数据比写空强（失败写空 = 让页面在 TTL 内全空）。
-     * 只在"跑完真的变了"时不需要通知客户端 —— 本仓没有应用列表的 WS 推送，
-     * 客户端进页面拿到的就是它，不需要额外广播（别为此新增频道）。
+     * 失败或空结果一律不写缓存：保留上一份有效数据优于写入空数据（写入空数据会使页面在 TTL 内
+     * 持续为空）。刷新完成后无需通知客户端 —— 本仓没有应用列表的 WS 推送，客户端进入页面时
+     * 读取的即为缓存结果，不需要额外广播，也不应为该需求新增推送频道。
      */
     private suspend fun refreshAppListInBackground() {
         try {
@@ -293,10 +279,10 @@ class AppManager(
      * 暂停/恢复定时刷新 —— 对齐 [com.ufi_axis_core.service.BackendService] 的
      * 「停止服务 = 除 HTTP 外全停」语义（`pauseComponentBackground` / `resumeComponentBackground`）。
      *
-     * 不接这一层的话，用户点「停止服务」之后后台仍在每 2 分钟跑 4 条特权 shell，
-     * 与该开关的既有语义（read-through 闸门 / 任务调度 / 隧道看护 / 下载轮询都停）自相矛盾。
+     * 若不接入该层，用户点「停止服务」之后后台仍会每 2 分钟执行 4 条特权 shell，
+     * 与该开关的既有语义（read-through 闸门、任务调度、隧道看护、下载轮询均停止）矛盾。
      *
-     * 暂停 = 取消协程（而不是置一个 flag 让循环空转）：设备上少 4 条 shell 比多一次唤醒便宜。
+     * 暂停即取消协程（而不是置标志让循环空转）：设备上少执行 4 条 shell 的收益高于多一次唤醒。
      */
     fun setPeriodicRefreshEnabled(enabled: Boolean) {
         val scope = appListRefreshScope
@@ -307,8 +293,8 @@ class AppManager(
             AppLogger.i(tag, "App list periodic refresh paused")
             return
         }
-        // 恢复需要当初那个 scope；没有（从没启动过）就保持不启动 —— 宁可不刷，也别自己造一个
-        // 与服务生命周期脱钩的 scope（那就是本批次要消灭的泄漏形态）。
+        // 恢复需要启动时记录的作用域；不存在（从未启动过）则保持不启动 ——
+        // 不自行创建与服务生命周期脱钩的作用域，该形态会导致协程泄漏。
         if (scope != null) startPeriodicRefresh(scope)
     }
 
@@ -357,7 +343,7 @@ class AppManager(
                     "appName" to (getApplicationLabel(pkg).takeIf { it.isNotBlank() } ?: pkg),
                     "apkPath" to apkPath,
                     "isSystem" to isSystemApp(apkPath),
-                    // v17：dumpsys 解析不到时 fallback PackageManager（避免列表 v0 显示）
+                    // dumpsys 解析不到 versionName 时回退 PackageManager，避免该字段为空。
                     "versionName" to (versionNames[pkg] ?: getVersionFromPackageManager(pkg).first),
                     "enabled" to (pkg !in disabledPkgs),
                     "isFrozen" to (pkg in suspendedPkgs),
@@ -368,7 +354,7 @@ class AppManager(
             }
         }
         // 返回**全量**（不按 type 过滤）：过滤已上移到 [AppListCacheEntry.filterByType]，
-        // 这样缓存只存一份全量、三个页签共用（原来每次调用都各自重拉一遍全量再过滤）。
+        // 缓存因此只存一份全量，三个页签共用，不需要每次调用各自拉取后过滤。
         return all
     }
 
@@ -376,12 +362,13 @@ class AppManager(
 
     suspend fun getAppInfo(packageName: String): Map<String, Any>? {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        // v18 性能优化：全部改 PackageManager（binder <100ms），不再用 pm path / dumpsys root shell（雷电上每次 200-800ms，累计 0.6-2.4s）
+        // 详情路径全部使用 PackageManager（binder 调用通常 <100ms），不使用 pm path / dumpsys 的
+        // root shell（单次 200-800ms，多条累计 0.6-2.4s）。
         val ctx = context ?: return null
         val pm = ctx.packageManager
-        // 2026-08-22 修复详情 404：列表来自 shell pm（可见全部包，含对当前用户
-        // 隐藏/已卸载残留的包），而 App 进程 PackageManager 默认视图查不到这些包 →
-        // NameNotFoundException → 404。带上 MATCH_UNINSTALLED_PACKAGES 对齐两种视图。
+        // 列表来自 shell pm（可见全部包，含对当前用户隐藏或已卸载残留的包），
+        // 而应用进程的 PackageManager 默认视图查不到这些包，会抛 NameNotFoundException 导致 404。
+        // 带上 MATCH_UNINSTALLED_PACKAGES 以对齐两种视图。
         val appInfo = try {
             if (android.os.Build.VERSION.SDK_INT >= 33) {
                 pm.getApplicationInfo(packageName, android.content.pm.PackageManager.ApplicationInfoFlags.of(MATCH_UNINSTALLED_PKGS.toLong()))
@@ -404,7 +391,7 @@ class AppManager(
         val isEnabled = appInfo.enabled
         // isSystem 判定：与 listApps 对齐，统一用 APK 路径前缀权威判定
         val isSystem = isSystemApp(apkPath)
-        // 应用名（label）：v16 需求 — 弹窗头部展示"应用名"（如"Google Play 服务"）而非包名段
+        // 应用名（label）：详情弹窗头部展示应用名（如「Google Play 服务」）而非包名段。
         val applicationLabel = getApplicationLabel(packageName)
 
         return mapOf(
@@ -420,7 +407,7 @@ class AppManager(
             "enabled" to isEnabled,
             "isEnabled" to isEnabled,
             "apkPath" to apkPath
-            // v18：iconBase64 不再在详情接口返回（4-5KB base64 是响应体大头），前端从 list 缓存复用
+            // iconBase64 不在详情接口返回：4-5KB 的 base64 占响应体主要部分，前端从列表缓存复用。
         )
     }
 
@@ -528,32 +515,32 @@ class AppManager(
 
     suspend fun installApk(apkPath: String, isSelfUpdate: Boolean = false): InstallResult {
         require(validateShellArg(apkPath)) { "Invalid APK path: $apkPath" }
-        // 先清扫历史残留：自更新（安装 core 自己）时进程会被安装器直接杀掉，
-        // 函数末尾的 rm 永远执行不到。原来临时文件名带时间戳，于是每次自更新都在
-        // /data/local/tmp 留下一个 ~60MB 的 APK —— 实测累积 40 个、2.1GB。
+        // 先清扫历史残留：自更新（安装 core 自身）时进程会被安装器直接终止，
+        // 函数末尾的 rm 无法执行。临时文件名原先带时间戳，每次自更新都会在
+        // /data/local/tmp 留下一个约 60MB 的 APK，累积可达数十个、数 GB。
         sweepStaleInstallApks()
-        // SELinux/fuse：/sdcard 文件对 shell(uid 2000) 与 adb client(uid=app) 不可读，
-        // 复制到 /data/local/tmp 并 chmod 644 使其 world-readable，供 adb install 读取推送。
+        // SELinux/fuse：/sdcard 上的文件对 shell(uid 2000) 与 adb client(uid=app) 不可读。
+        // 先复制到 /data/local/tmp 并 chmod 644 使其 world-readable，供 adb install 读取推送。
         // 固定文件名（不带时间戳）：天然覆盖，最多只占一份。
         val tmpApk = "/data/local/tmp/appmgr_install.apk"
         ShellExecutor.executeAsRoot("cp -f \"$apkPath\" \"$tmpApk\" && chmod 644 \"$tmpApk\"", 10_000L)
-        // 主通道：adb connect localhost:5555 && adb install -r（uid 2000 shell，天然安装特权，
-        // 无需 appops 放行、无需 PackageInstaller API，彻底规避旧通道"本地推送更新从未安装"）。
+        // 主通道：adb connect localhost:5555 && adb install -r（uid 2000 shell 天然具备安装特权，
+        // 无需 appops 放行、无需 PackageInstaller API，避免旧通道下本地推送更新无法安装的问题）。
         val adbResult = installApkViaAdb(tmpApk)
         val result = if (adbResult.success) {
             adbResult
         } else {
-            // adb 不可用/失败：回退 InstallService → PackageInstaller API（老通道，需 appops 放行）
+            // adb 不可用或失败：回退 InstallService → PackageInstaller API（备用通道，需 appops 放行）
             AppLogger.w(tag, "adb install 主通道失败/不可用，回退多策略安装: ${adbResult.message}")
             installApkMultiStrategy(tmpApk, isSelfUpdate)
         }
-        // 2026-08-28：删除「安装后自动授予运行时权限」。
-        // 主通道 adb install -r 是覆盖安装，运行时权限本身会被系统继承，这一步是多余的；
-        // 需要手动授权仍可走 POST /api/apps/grant-all-permissions（web 应用页的按钮）。
+        // 安装后不自动授予运行时权限：主通道 adb install -r 为覆盖安装，运行时权限由系统继承，
+        // 该步骤是多余的。需要手动授权时仍可通过 POST /api/apps/grant-all-permissions
+        // （web 应用页的按钮）完成。
         deleteTmpFile(tmpApk)
-        // 失效点⑩：安装成功会在包里多一个/多一个版本，列表（版本名/isSystem/图标）都要变。
-        // 失败也失效：adb 主通道失败后 PackageInstaller 仍可能已经装上（结果判据不唯一），
-        // 宁可多失效一次，也不能让用户看着"装成功了但列表里没有"。
+        // 安装成功会改变包集合（版本名 / isSystem / 图标均可能变化）。
+        // 失败时同样失效：adb 主通道失败后 PackageInstaller 仍可能已安装成功（结果判据不唯一），
+        // 多失效一次的代价低于让用户看到「安装成功但列表中没有」。
         invalidateAppListCache()
         return result
     }
@@ -561,7 +548,7 @@ class AppManager(
     /**
      * 清扫 `/data/local/tmp` 下遗留的安装临时 APK（含历史带时间戳的 `appmgr_install_*.apk`）。
      *
-     * 自更新会在删除前杀掉进程，所以残留只能靠「下一次安装开始时」兜底清理。
+     * 自更新会在删除前终止进程，因此残留只能在下一次安装开始时兜底清理。
      */
     private suspend fun sweepStaleInstallApks() {
         runCatching {
@@ -578,7 +565,7 @@ class AppManager(
         }
     }
 
-    /** 删除临时文件：先普通权限，再退回 root（这台设备无 root，普通删除才是主路径）。 */
+    /** 删除临时文件：先以普通权限删除，失败后回退 root。 */
     private suspend fun deleteTmpFile(path: String) {
         if (runCatching { java.io.File(path).delete() }.getOrDefault(false)) return
         runCatching { ShellExecutor.execute("rm -f \"$path\"", timeoutMs = 5_000L) }
@@ -588,30 +575,30 @@ class AppManager(
     /**
      * 从 URL 下载 APK 并静默安装。
      *
-     * 2026-10-05 P0-2 修复（对齐 UpdateManager 的防护水准）：
-     * - `expectedSha256` **必填**：APK 内容哈希（小写 hex）。下载后流式计算比对，
-     *   不匹配即删临时文件拒绝安装——此前任意 URL 下载后直接 root 安装，等于局域网内
-     *   明文投毒通道（P0-1 的 body 签名缺口在修好前也压不住这条路径）。
-     * - URL 强制 HTTPS（同 UpdateManager.requireSecureUrl 的豁免口径：localhost/内网
-     *   调试地址允许 http——那是开发场景，生产-facing 的 URL 不豁免会被内网代理打穿）。
-     * - 域名白名单**不在此层做**：白名单挡内容投毒挡不住镜像缓存污染，而哈希校验
-     *   同时防两者且零维护成本；route 层与调用方（web UI）各自给出哈希来源即可。
+     * 安全约束（与 UpdateManager 的防护口径一致）：
+     * - `expectedSha256` 必填：APK 内容哈希（小写 hex）。下载后流式计算并比对，不匹配即删除
+     *   临时文件并拒绝安装。缺少该校验时，任意 URL 下载后直接以 root 安装，等同于局域网内的
+     *   明文投毒通道。
+     * - URL 强制 HTTPS（豁免口径与 UpdateManager.requireSecureUrl 一致：localhost 与内网调试
+     *   地址允许 http，属于开发场景；生产 URL 不豁免会被内网代理绕过）。
+     * - 域名白名单不在此层实现：白名单无法防御镜像缓存污染，而哈希校验同时覆盖两者且无维护
+     *   成本；route 层与调用方（web UI）各自提供哈希来源即可。
      */
     suspend fun installApkFromUrl(url: String, expectedSha256: String): InstallResult {
         require(validateShellArg(url)) { "Invalid URL: $url" }
-        // 2026-09-02：URL 会被插值进特权 curl/wget 命令。除了字符白名单（validateShellArg
-        // 现已拦掉引号/换行），再加协议白名单——避免 file:// 之类把本地文件当"下载"读出来。
+        // URL 会被插值进特权 curl/wget 命令。除字符白名单（validateShellArg 已拦截引号与换行）外，
+        // 再加协议白名单，避免 file:// 一类协议把本地文件当作下载内容读取。
         require(url.startsWith("http://") || url.startsWith("https://")) { "Invalid URL scheme: $url" }
-        // P0-2：HTTPS 强制（localhost/内网调试地址豁免，口径对齐 UpdateManager.requireSecureUrl）
+        // HTTPS 强制（localhost / 内网调试地址豁免，口径与 UpdateManager.requireSecureUrl 一致）。
         require(isSecureDownloadUrl(url)) { "URL 必须使用 HTTPS（内网调试地址除外）: $url" }
-        // P0-2：sha256 必填，格式校验（64 位 hex，大小写归一在比较时做）
+        // sha256 必填并校验格式（64 位 hex，大小写归一在比较时处理）。
         val expectedSha = expectedSha256.trim().lowercase()
         require(expectedSha.matches(Regex("^[0-9a-f]{64}$"))) {
             "sha256 必填且为 64 位十六进制（防任意 APK 静默安装）"
         }
         val tmpPath = "/data/local/tmp/install_${System.currentTimeMillis()}.apk"
-        // 2026-10-05 R3-3 修复：任何失败路径都必须清掉已下载的临时 APK（/data 分区空间敏感，
-        // 90MB 级 APK 反复失败会在 /data/local/tmp 堆积占满空间，后续下载全部 ENOSPC）。
+        // 任何失败路径都必须清除已下载的临时 APK：/data 分区空间敏感，
+        // 90MB 级 APK 反复失败会在 /data/local/tmp 堆积并占满空间，导致后续下载全部 ENOSPC。
         val download = ShellExecutor.executeAsRoot("curl -sL -o \"$tmpPath\" \"$url\" 2>/dev/null && echo OK || echo FAIL", 120_000L)
         if (!download.stdout.contains("OK")) {
             val wgetResult = ShellExecutor.executeAsRoot("wget -q -O \"$tmpPath\" \"$url\" 2>/dev/null && echo OK || echo FAIL", 120_000L)
@@ -620,7 +607,7 @@ class AppManager(
                 return InstallResult(false, "下载失败: 不支持 curl/wget")
             }
         }
-        // P0-2：下载内容哈希比对——不匹配即拒绝（同时拦内容投毒与镜像缓存污染）
+        // 下载内容哈希比对：不匹配即拒绝安装（同时拦截内容投毒与镜像缓存污染）。
         val actualSha = fileSha256Hex(tmpPath)
         if (actualSha == null) {
             deleteTmpFile(tmpPath)
@@ -637,16 +624,17 @@ class AppManager(
         val result = installApkViaAdb(tmpPath).let { adbRes ->
             if (adbRes.success) adbRes else installApkMultiStrategy(tmpPath)
         }
-        // 2026-08-28：同 installApk，删除安装后自动授权（adb install -r 覆盖安装本就继承权限）
+        // 与 installApk 一致：不自动授予权限（adb install -r 覆盖安装本就会继承权限）。
         deleteTmpFile(tmpPath)
-        // 失效点⑪：同 [installApk]
+        // 与 [installApk] 相同，安装后失效应用列表缓存。
         invalidateAppListCache()
         return result
     }
 
-    // ── ADB 安装通道（2026-08-23：安装主通道改为 adb connect localhost:5555 && adb install -r）──
-    // uid 2000 shell 经 adb 安装天然具备特权，无需 appops 放行、无需 PackageInstaller API，
-    // 彻底规避旧通道"本地推送更新从未安装"（app uid 10101 缺 REQUEST_INSTALL_PACKAGES → PI 前置检查 abort）。
+    // ── ADB 安装通道（安装主通道：adb connect localhost:5555 && adb install -r）──
+    // uid 2000 的 shell 经 adb 安装天然具备特权，无需 appops 放行、无需 PackageInstaller API，
+    // 避免旧通道下本地推送更新无法安装的问题（app uid 缺少 REQUEST_INSTALL_PACKAGES，
+    // PackageInstaller 前置检查直接 abort）。
 
     /** 定位内置 adb 二进制（与 [grantAllPermissionsViaAdb] 同候选列表）。 */
     private fun resolveAdbBinary(): String? {
@@ -749,24 +737,17 @@ class AppManager(
     }
 
     /**
-     * 多策略 APK 安装（adb 主通道不可用时的回退）：
-     * 策略1 (首选): am startservice → InstallService → Java PackageInstaller API，
-     *   在 app 进程内执行，UID 为 app 自身，绕过 shell pm install 的 AppOpsService.checkPackage NPE。
-     *   （am broadcast 在某些 ROM 上 exit=255，改用 am startservice 更可靠）
-     * 策略2-4 (fallback): cmd package install / pm install --full / pm install 标准方式。
-     */
-    /**
      * 确保本应用具备 PackageInstaller 静默安装权限。
      *
-     * 2026-08-22 设计定案（用户澄清）：本设备 sh 脚本安装（pm/cmd package install）不可用，
-     * 安装唯一走 InstallService 的 PackageInstaller API；sh 脚本仅作 watchdog。
-     * 普通侧载 App 默认既无特权 INSTALL_PACKAGES、也未获用户"安装未知应用"授权，
-     * PackageInstaller 前置检查会 abort "no install permission"——这正是此前本地推送
-     * 更新从未安装的根因。adb shell (uid 2000) 可通过 appops 放行（幂等）。
+     * 本设备的 sh 脚本安装（pm / cmd package install）不可用，安装仅通过 InstallService 的
+     * PackageInstaller API 完成，sh 脚本只作为 watchdog。普通侧载应用默认既无特权
+     * INSTALL_PACKAGES，也未获得「安装未知应用」授权，PackageInstaller 前置检查会以
+     * "no install permission" 中止 —— 这是旧通道下本地推送更新始终无法安装的根因。
+     * adb shell (uid 2000) 可通过 appops 放行（幂等）。
      */
     private suspend fun ensurePackageInstallerPermission(): Boolean {
         val pkg = context?.packageName ?: "com.ufi_axis_core"
-        // 2026-08-23 性能优化：优先检查是否已具有权限，避免不必要的 root shell 调用
+        // 先检查是否已具备权限，避免不必要的 root shell 调用。
         try {
             val pm = context?.packageManager
             if (pm != null && pm.canRequestPackageInstalls()) return true
@@ -784,9 +765,13 @@ class AppManager(
         }
     }
 
+    /**
+     * adb 主通道不可用时的回退安装：通过 InstallService / InstallReceiver 调用
+     * PackageInstaller API，在应用进程内执行（UID 为应用自身），
+     * 绕过 shell `pm install` 在部分 ROM 上触发的 AppOpsService.checkPackage NPE。
+     * 安装前先确保 appops 安装权限，否则 InstallService 会因权限不足中止。
+     */
     private suspend fun installApkMultiStrategy(apkPath: String, isSelfUpdate: Boolean = false): InstallResult {
-        // 唯一安装通道：InstallService/InstallReceiver → PackageInstaller API。
-        // 安装前先确保 appops 安装权限，否则 InstallService 会权限 abort。
         ensurePackageInstallerPermission()
 
         val resultFile = "/data/local/tmp/ufi_install_result.txt"
@@ -815,9 +800,9 @@ class AppManager(
             }
         }
 
-        // 轮询结果文件：PI 失败路径 1~2s 内写入；
-        // 自更新成功路径进程会被 PackageInstaller 杀掉、写不了文件 → 超时视为已提交。
-        // 非自更新：InstallReceiver 正常写入 SUCCESS/FAILED，等满 120s。
+        // 轮询结果文件：PI 失败路径在 1~2s 内写入；
+        // 自更新成功路径中进程会被 PackageInstaller 终止，无法写入文件，因此超时按已提交处理。
+        // 非自更新：InstallReceiver 正常写入 SUCCESS/FAILED，等待满 120s。
         val waitSecs = if (isSelfUpdate) 25 else 120
         var waited = 0
         while (waited < waitSecs) {
@@ -848,9 +833,9 @@ class AppManager(
 
     suspend fun uninstallApp(packageName: String): InstallResult {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
-        // 2026-08-23 修复：移除 -k 标志以进行干净卸载，并显式指定 --user 0
+        // 不带 -k 标志以完成干净卸载，并显式指定 --user 0。
         val result = ShellExecutor.executeAsRoot("pm uninstall --user 0 \"$packageName\" 2>/dev/null", 30_000L)
-        // 失效点①：卸载直接改变包集合（且最容易被用户当场验证 —— 卸完刷新应当看不到它）
+        // 卸载直接改变包集合，必须失效缓存（用户卸载后刷新应立即看不到该应用）。
         invalidateAppListCache()
         // pm uninstall 成功时输出通常包含 "Success"
         return parseInstallResult(result)
@@ -859,7 +844,7 @@ class AppManager(
     suspend fun disableApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("pm disable \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点②：enabled 字段直接由 `pm list packages -d` 决定
+        // enabled 字段由 `pm list packages -d` 决定，必须失效缓存。
         invalidateAppListCache()
         return ok
     }
@@ -867,7 +852,7 @@ class AppManager(
     suspend fun enableApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点③：同 disable，enabled 字段会变
+        // 同 disableApp：enabled 字段会变化。
         invalidateAppListCache()
         return ok
     }
@@ -875,7 +860,7 @@ class AppManager(
     suspend fun clearAppData(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("pm clear \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点④（保守）：清数据不改列表内容，见 [invalidateAppListCache] 的取舍说明
+        // 保守失效：清数据不改变列表内容，理由见 [invalidateAppListCache]。
         invalidateAppListCache()
         return ok
     }
@@ -883,7 +868,7 @@ class AppManager(
     suspend fun forceStop(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("am force-stop \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点⑤（保守）：强停不动列表字段，但统一失效免得为它单开一条例外分支
+        // 保守失效：强停不改变列表字段，但统一失效，避免为此增加例外分支。
         invalidateAppListCache()
         return ok
     }
@@ -892,7 +877,7 @@ class AppManager(
         require(validatePackageName(pkg)) { "Invalid package name: $pkg" }
         require(validateShellArg(perm)) { "Invalid permission name: $perm" }
         val ok = ShellExecutor.executeAsRoot("pm grant \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
-        // 失效点⑥（保守）：权限不进列表字段，见 [invalidateAppListCache] 的取舍说明
+        // 保守失效：权限不属于列表字段，理由见 [invalidateAppListCache]。
         invalidateAppListCache()
         return ok
     }
@@ -945,9 +930,9 @@ class AppManager(
                     redirectErrorStream(true)
                 }.start()
 
-                // 2026-10-05 R3-2 修复：原来 readText() 在 waitFor 之前，adb 僵死不输出时
-                // readText 永远阻塞（流不 EOF），30s 超时形同虚设 → 请求协程永久挂起。
-                // 改为 waitFor 先行（bounded），再读已结束进程的输出。
+                // 必须先 waitFor（有界）再读取输出：原先在 waitFor 之前调用 readText，
+                // adb 僵死且不输出时流不会 EOF，readText 永久阻塞，30s 超时形同虚设，
+                // 请求协程会永久挂起。
                 val finished = proc.waitFor(30, java.util.concurrent.TimeUnit.SECONDS)
                 val output = if (finished) {
                     proc.inputStream.bufferedReader().readText()
@@ -963,9 +948,10 @@ class AppManager(
                 false to "exception: ${e.message}"
             }
         }.also {
-            // 失效点⑫（保守）：它会顺带改 appops（影响可见性行为），且权限不进列表字段；
-            // 与 [grantPermission] 同口径统一失效。放在 `also` 上是为了覆盖内部所有返回分支
-            // （正常 / context 为空 / adb 找不到 / 超时），漏一条分支就等于漏一次失效。
+            // 该调用同时修改 appops（影响应用可见性行为），且权限不属于列表字段；
+            // 与 [grantPermission] 采用同一口径，统一失效。
+            // 放在 `also` 上是为了覆盖内部所有返回分支（正常 / context 为空 / adb 不存在 / 超时），
+            // 遗漏任一分支即遗漏一次失效。
             invalidateAppListCache()
         }
     }
@@ -974,7 +960,7 @@ class AppManager(
         require(validatePackageName(pkg)) { "Invalid package name: $pkg" }
         require(validateShellArg(perm)) { "Invalid permission name: $perm" }
         val ok = ShellExecutor.executeAsRoot("pm revoke \"$pkg\" \"$perm\" 2>/dev/null").isSuccess
-        // 失效点⑦（保守）：同 [grantPermission]
+        // 保守失效：同 [grantPermission]。
         invalidateAppListCache()
         return ok
     }
@@ -983,7 +969,7 @@ class AppManager(
     suspend fun freezeApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("pm disable-user --user 0 \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点⑧：冻结走 disable-user，同时改变 enabled 与 isFrozen 两个字段
+        // 冻结通过 disable-user 实现，同时改变 enabled 与 isFrozen 两个字段。
         invalidateAppListCache()
         return ok
     }
@@ -992,7 +978,7 @@ class AppManager(
     suspend fun unfreezeApp(packageName: String): Boolean {
         require(validatePackageName(packageName)) { "Invalid package name: $packageName" }
         val ok = ShellExecutor.executeAsRoot("pm enable \"$packageName\" 2>/dev/null").isSuccess
-        // 失效点⑨：解冻改变 enabled 与 isFrozen
+        // 解冻改变 enabled 与 isFrozen 两个字段。
         invalidateAppListCache()
         return ok
     }
@@ -1005,17 +991,9 @@ class AppManager(
     }
 
     /**
-     * 校验 shell 参数：拒绝任何可能改变命令结构的字符。
-     * 2026-08-23：允许空格，APK 文件名常含空格。
-     * 2026-09-02 安全修复：原实现只拦 `$ ` ; | &`，**放过了引号与换行**。
-     * 调用方普遍把参数包在单引号里（`'$arg'`），一个 `'` 就能闭合引号并追加任意命令；
-     * 换行同样能在 `sh -c` 里起新语句。此处一并拦掉引号、换行、重定向与子 shell 括号。
-     */
-    /**
-     * P0-2：下载 URL 安全协议检查。口径对齐 UpdateManager.requireSecureUrl（2026-10-05）：
-     * 强制 HTTPS；localhost/127.0.0.1/内网段/.local 视为本地调试地址允许 http。
-     * 这里不能用 java.net.URL 吗？可以，但签名保持 String 进 String 出更贴调用方——
-     * 内部仍用 URL 解析，解析失败按不安全处理（fail-secure）。
+     * 下载 URL 的安全协议检查。口径与 UpdateManager.requireSecureUrl 一致：
+     * 强制 HTTPS；localhost / 127.0.0.1 / 内网地址段 / .local 视为本地调试地址，允许 http。
+     * 内部使用 URL 解析，解析失败按不安全处理（fail-secure）。
      */
     private fun isSecureDownloadUrl(urlStr: String): Boolean {
         val u = try {
@@ -1035,9 +1013,10 @@ class AppManager(
     }
 
     /**
-     * P0-2：对下载落地的 APK 流式计算 SHA-256（90MB 级文件不能整读进内存）。
-     * 文件不可读/为空返回 null（调用方 fail-secure 拒装）。root 写的文件本进程（shell uid）
-     * 经 chmod 644 前可能读不了——所以先提权补一次 chmod 再算，失败仍返回 null。
+     * 对下载落地的 APK 流式计算 SHA-256（90MB 级文件不能整读进内存）。
+     * 文件不可读或为空时返回 null（调用方按 fail-secure 拒绝安装）。
+     * root 写入的文件在本进程（shell uid）执行 chmod 644 之前可能不可读，
+     * 因此先提权补一次 chmod 再计算，仍失败则返回 null。
      */
     private suspend fun fileSha256Hex(path: String): String? = try {
         ShellExecutor.executeAsRoot("chmod 644 \"$path\"", 5_000L)
@@ -1059,6 +1038,13 @@ class AppManager(
         null
     }
 
+    /**
+     * 校验 shell 参数：拒绝任何可能改变命令结构的字符。
+     *
+     * 允许空格（APK 文件名常含空格）。调用方普遍把参数包在单引号中（`'$arg'`），
+     * 单个 `'` 即可闭合引号并追加任意命令；换行同样能在 `sh -c` 中开始新语句。
+     * 因此一并拦截引号、换行、重定向与子 shell 括号。
+     */
     private fun validateShellArg(arg: String): Boolean {
         if (arg.isBlank()) return false
         if (arg.any { it == '\n' || it == '\r' || it == '\u0000' }) return false
@@ -1088,20 +1074,19 @@ class AppManager(
         /**
          * 应用列表缓存 TTL（5 分钟）与定时刷新周期（2 分钟）。
          *
-         * 为什么不用 `ResponseCache.CacheTTL`：那个常量住在 `:core:cache`，而 `AppManager`
-         * 在 `:core:controller` —— `:core:controller` 现在**没有**对 `:core:cache` 的依赖
-         * （那里缓存的是 API 响应的 JsonElement，语义也不同：按 key 存 JSON，
-         * 而这里存的是已解析好的 `List<Map<String,Any>>`）。为复用一个数字引入模块依赖不划算，
-         * 故就地定义并写清取值理由。
+         * 不复用 `ResponseCache.CacheTTL`：该常量位于 `:core:cache`，而 `AppManager` 位于
+         * `:core:controller`，后者当前不依赖 `:core:cache`（其中缓存的是 API 响应的 JsonElement，
+         * 语义也不同：按 key 存 JSON，而此处存的是已解析的 `List<Map<String,Any>>`）。
+         * 为复用一个数值引入模块依赖不划算，故就地定义并说明取值理由。
          *
-         * - **TTL 5 分钟**：应用集合是人手动的变化（装/卸/冻结），系统自身不会自己增删包。
-         *   5 分钟内最多让用户看到一次"刚装的应用没出现"，而页面上的刷新按钮、以及任何写操作
-         *   都会立刻失效缓存，所以可感知窗口很短。
-         * - **刷新周期 2 分钟 < TTL**：定时刷新每 2 分钟把 TTL 顶回去，于是进页面时**几乎总是命中**
-         *   （最坏情况数据年龄 = TTL − 周期 = 3 分钟）。若周期 >= TTL，就会出现"进页面恰好
-         *   卡在过期点"而现场跑 4 条 shell —— 那正是这次要消掉的体感。
+         * - TTL 5 分钟：应用集合由人工操作改变（安装 / 卸载 / 冻结），系统不会自行增删包。
+         *   5 分钟内最多出现一次「刚安装的应用未显示」，而页面刷新按钮及任何写操作都会立即
+         *   失效缓存，可感知窗口很短。
+         * - 刷新周期 2 分钟 < TTL：定时刷新每 2 分钟重新写入缓存时间戳，进入页面时几乎总是命中
+         *   （最坏数据年龄 = TTL − 周期 = 3 分钟）。若周期 >= TTL，会出现进入页面时恰好命中
+         *   过期点、需现场执行 4 条 shell 的情形。
          *
-         * 放 companion 而非类体：`const val` 在 Kotlin 里只允许出现在顶层 / 具名 object /
+         * 放在 companion 而非类体：`const val` 在 Kotlin 中只允许出现在顶层、具名 object 或
          * companion object 中（编译报 `Const 'val' is only allowed on top level...`）。
          */
         private const val APP_LIST_CACHE_TTL_MS = 5 * 60 * 1000L

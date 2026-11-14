@@ -3,352 +3,510 @@ package com.ufi_axis_core.util
 import android.content.Context
 import android.net.LocalSocket
 import android.net.LocalSocketAddress
+import jcifs.context.SingletonContext
+import jcifs.smb.SmbFile
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import java.io.BufferedReader
 import java.io.BufferedWriter
 import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
-import jcifs.context.SingletonContext
-import jcifs.smb.SmbFile
 
 /**
- * Samba root shell — 利用 ZTE F50 Samba root preexec 机制获取 root shell。
+ * Samba root shell —— 借 ZTE F50 固件 `smbd` 的 `root preexec` 拿 **uid 0**。
  *
- * 原理：
- * 1. BackendService 启动时，将 socat 二进制和 samba_exec.sh 部署到 /data/local/tmp/ufi_axis/
- * 2. 修改 /data/samba/etc/smb.conf 添加 root preexec 指向我们的脚本
- * 3. Samba 客户端连接时，smbd 以 root 身份执行脚本 → 启动 socat Unix socket 监听器
- * 4. App 通过 LocalSocket 连接 socket → 获得 root shell → 执行 pm install -r -g
+ * ## 原理（2026-11-05 真机取证，不是推测）
  *
- * 部署路径：
- * - socat:       /data/local/tmp/ufi_axis/socat
- * - 脚本:        /data/local/tmp/ufi_axis/samba_exec.sh
- * - socket:      /data/local/tmp/ufi_axis/root.sock
- * - smb.conf:    /data/samba/etc/smb.conf（追加 root preexec）
+ * `smbd` 以 root 运行，`root preexec` 是 Samba 的**服务级**参数：客户端 TREE_CONNECT
+ * 到某个共享时，smbd 以 root fork 执行这条命令。实测日志：
  *
- * 参考：UFI-TOOLS (com.minikano.f50_sms) 的 RootShell + samba_exec.sh 实现。
+ * ```
+ * preexec fired uid=0 user=root
+ * uid=0(root) gid=0(root) groups=0(root) context=u:r:su:s0
+ * ```
+ *
+ * 之所以能改 `/data/samba/etc/smb.conf`，是因为固件把它放在 777 目录、且 SELinux 为
+ * permissive —— **不是**攻破了 smbd。
+ *
+ * ## 三条必须守住的实测结论
+ *
+ * 1. **脚本必须 `exit 0`**：root preexec 非 0 时 Samba 判定**该次连接失败**
+ *    （源码里的 `"root preexec gave %d - failing connection"`）。脚本报错会把用户的
+ *    SMB 共享一起弄挂。
+ * 2. **socket 要显式 chmod**：socket 由 root 创建、连接方是 app uid，默认 755 会让
+ *    `LocalSocket.connect()` 报 EACCES。
+ * 3. **不需要重启 smbd**：Samba 每次连接都重读配置，写完下一次连接即生效。
+ *
+ * ## 路径为什么在 app 私有目录（2026-11-05 重写）
+ *
+ * 旧实现把 socat/脚本/socket 放在固定的 `/data/local/tmp/ufi_axis`。那个路径**跨安装共享**：
+ * 重装后 uid 从 10101 变成 10110，目录仍是 `drwx------ u0_a101`，新进程和 adb shell(2000)
+ * 都进不去 → `deploy()` 在拷贝阶段就 `return`，`smb.conf` 永远拿不到 `root preexec`，
+ * 整条链静默失效（真机现场就是这种状态）。
+ *
+ * 挪进 `filesDir/root_shell` 一次解决三个问题：
+ * - 不再和任何一次旧安装撞车（卸载即清理）；
+ * - app 必然能读写自己的目录，不需要 adb/root 帮忙；
+ * - socket 落在 0700 的应用目录里，**同机其它应用无法遍历到**，比放在 777 的
+ *   `/data/local/tmp` 更安全。
+ *
+ * 代价：依赖 `/data` 的 FBE 已解锁（无锁屏的 CPE 开机即解锁），以及 smbd 的 root 进程
+ * 能读到应用私有目录（permissive 下成立）。
+ *
+ * ## 现状
+ *
+ * 本类目前**没有生产调用方消费 socket**：`pm install -g` 走的是 `UpdateManager` 的脚本
+ * 通道，[installViaRootShell] 暂无调用点。保活循环仍每 60s 检查一次，保证通道可用。
  */
 object SambaRootShell {
 
     private const val TAG = "SambaRootShell"
 
-    /** 共享目录（ADB shell 可写，root 可读，App 可读） */
-    const val BASE_DIR = "/data/local/tmp/ufi_axis"
+    /** 部署目录名（相对 `filesDir`）。 */
+    const val DIR_NAME = "root_shell"
+    const val SOCAT_NAME = "socat"
+    const val SCRIPT_NAME = "samba_exec.sh"
+    const val SOCKET_NAME = "root.sock"
 
-    /** socat 二进制路径 */
-    const val SOCAT_PATH = "$BASE_DIR/socat"
-
-    /** root shell socket 路径 */
-    const val SOCKET_PATH = "$BASE_DIR/root.sock"
-
-    /** UFI-TOOLS 的 root shell socket 路径（同一 Samba 机制，可复用） */
-    private const val UFI_TOOLS_SOCKET_PATH = "/data/data/com.minikano.f50_sms/files/kano_root_shell.sock"
-
-    /** 部署脚本路径 */
-    const val SCRIPT_PATH = "$BASE_DIR/samba_exec.sh"
-
-    /** Samba 配置文件路径 */
+    /** 固件 Samba 配置。 */
     private const val SMB_CONF = "/data/samba/etc/smb.conf"
 
+    /** INI 段名。 */
+    private val SECTION_RE = Regex("""^\s*\[([^\]]+)]\s*$""")
+
+    /** 这几个段不是可连接的共享，不能拿来触发 preexec。 */
+    private val RESERVED_SECTIONS = setOf("global", "homes", "printers", "print$", "ipc$")
+
+    // ─────────── 路径 ───────────
+
+    fun baseDir(context: Context): File = File(context.filesDir, DIR_NAME)
+
+    fun socatFile(context: Context): File = File(baseDir(context), SOCAT_NAME)
+
+    fun scriptFile(context: Context): File = File(baseDir(context), SCRIPT_NAME)
+
+    fun socketFile(context: Context): File = File(baseDir(context), SOCKET_NAME)
+
+    /** 部署结果：失败时 [stage] 指出卡在哪一步，便于直接显示给用户或写诊断日志。 */
+    data class DeployResult(
+        val ok: Boolean,
+        /** `prepare` / `patch` / `trigger` / `verify` */
+        val stage: String,
+        val detail: String
+    )
+
+    // ─────────── 部署 ───────────
+
     /**
-     * 部署 Samba root shell 基础设施：
-     * 1. 从 assets 提取 socat + samba_exec.sh 到 app filesDir/shell/
-     * 2. 通过 ADB shell 复制到 /data/local/tmp/ufi_axis/
-     * 3. 修改 smb.conf 添加 root preexec
+     * 部署并尝试启用 root 通道。**不依赖 ADB**：全部走 app 自己的文件操作 + jCIFS。
      *
-     * 须在 ADB 通道就绪后调用（ShellExecutor.executeAsRoot 走 ADB shell）。
+     * 幂等：目录/文件已存在会覆盖，`smb.conf` 已是目标状态则跳过写入。
      */
-    suspend fun deploy(context: Context) {
-        try {
-            // ① 从 assets 提取到 filesDir/shell/（AssetExtractor 会覆盖已有文件）
-            AssetExtractor.extractAll(context, "shell")
-            val localSocat = File(context.filesDir, "shell/socat")
-            val localScript = File(context.filesDir, "shell/samba_exec.sh")
-
-            if (!localSocat.exists()) {
-                AppLogger.w(TAG, "socat binary not found in assets: ${localSocat.absolutePath}")
-                return
-            }
-            if (!localScript.exists()) {
-                AppLogger.w(TAG, "samba_exec.sh not found in assets: ${localScript.absolutePath}")
-                return
-            }
-
-            // ② 创建共享目录 + 复制文件（ADB shell uid 2000 可写 /data/local/tmp/）
-            // 复制 socat（Samba root shell 用）+ samba_exec.sh（root preexec 脚本）+ adb（脚本 pm install 用）
-            val localAdb = File(context.filesDir, "shell/adb")
-            var copyCmd = "mkdir -p $BASE_DIR && " +
-                "cp -f '${localSocat.absolutePath}' '$SOCAT_PATH' && " +
-                "cp -f '${localScript.absolutePath}' '$SCRIPT_PATH' && " +
-                "chmod 755 '$SOCAT_PATH' && " +
-                "chmod 755 '$SCRIPT_PATH'"
-            if (localAdb.exists()) {
-                copyCmd += " && cp -f '${localAdb.absolutePath}' '$BASE_DIR/adb' && chmod 755 '$BASE_DIR/adb'"
-            }
-            val copyResult = ShellExecutor.executeAsRoot(copyCmd, timeoutMs = 15_000L)
-            if (!copyResult.isSuccess) {
-                AppLogger.w(TAG, "File deploy FAILED (exit=${copyResult.exitCode}): ${copyResult.stderr.ifBlank { copyResult.stdout }}. " +
-                    "Likely ADB unavailable → executeAsRoot fell back to uid=10101 which cannot write $BASE_DIR")
-                return
-            }
-            // 验证文件确实存在
-            val verify = ShellExecutor.executeAsRoot("ls -la $SOCAT_PATH $SCRIPT_PATH 2>&1", 5_000L)
-            if (!verify.isSuccess || verify.stdout.contains("No such file")) {
-                AppLogger.w(TAG, "File deploy verification FAILED: socat/script not found at $BASE_DIR after copy")
-                return
-            }
-            AppLogger.i(TAG, "Files deployed to $BASE_DIR (verified)")
-
-            // ③ 修改 smb.conf 添加 root preexec
-            writeSmbConf()
-
-            // ④ 自动触发 Samba 连接 → root preexec → socat socket
-            // 使用 jCIFS 从设备自身连接 Samba 共享，smbd 以 root 身份执行 root preexec
-            Thread {
-                try {
-                    triggerSambaConnection()
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "Samba auto-trigger failed (non-fatal): ${e.message}")
-                }
-            }.start()
-
-            AppLogger.i(TAG, "Samba root shell infrastructure deployed, auto-trigger started")
-        } catch (e: Exception) {
-            AppLogger.w(TAG, "deploy failed: ${e.message}")
+    suspend fun deploy(context: Context): DeployResult = withContext(Dispatchers.IO) {
+        // ── ① 目录与二进制 ──
+        val dir = baseDir(context)
+        if (!dir.exists() && !dir.mkdirs()) {
+            return@withContext DeployResult(false, "prepare", "无法创建目录 $dir")
         }
-    }
-
-    /**
-     * 修改 /data/samba/etc/smb.conf，添加 root preexec 指向我们的脚本。
-     * 处理 chattr +i 锁定（UFI-TOOLS 或其他工具可能已锁定）。
-     */
-    private suspend fun writeSmbConf() {
-        // 先尝试解锁（可能被 UFI-TOOLS 的 chattr +i 锁定）
-        ShellExecutor.executeAsRoot(
-            "chattr -i $SMB_CONF 2>/dev/null; chmod 666 $SMB_CONF 2>/dev/null",
-            timeoutMs = 5_000L
-        )
-
-        // 检查是否已有我们的 root preexec
-        val check = ShellExecutor.executeAsRoot(
-            "grep -c 'ufi_axis/samba_exec.sh' $SMB_CONF 2>/dev/null",
-            timeoutMs = 5_000L
-        )
-        if (check.stdout.trim().toIntOrNull() ?: 0 > 0) {
-            AppLogger.i(TAG, "smb.conf already has our root preexec")
-            return
+        if (!dir.canWrite()) {
+            return@withContext DeployResult(false, "prepare", "目录不可写：$dir")
         }
 
-        // 追加 root preexec 到 smb.conf 的 [global] 段
-        // 使用 sed 在 [global] 段末尾（下一个 [ 之前）插入
-        val preexecLine = "   root preexec = /system/bin/sh $SCRIPT_PATH"
-        val result = ShellExecutor.executeAsRoot(
-            // 方案1：如果 smb.conf 存在且有 [global] 段，在 [global] 后插入
-            "if [ -f '$SMB_CONF' ] && grep -q '\\[global\\]' $SMB_CONF 2>/dev/null; then " +
-                "sed -i '/^\\[global\\]/a\\$preexecLine' $SMB_CONF 2>/dev/null; " +
-            // 方案2：如果 smb.conf 存在但没有 [global]，追加到文件开头
-            "elif [ -f '$SMB_CONF' ]; then " +
-                "echo '$preexecLine' > /tmp/ufi_smb_new.conf 2>/dev/null; " +
-                "cat $SMB_CONF >> /tmp/ufi_smb_new.conf 2>/dev/null; " +
-                "mv /tmp/ufi_smb_new.conf $SMB_CONF 2>/dev/null; " +
-            // 方案3：smb.conf 不存在，创建完整配置
-            "else " +
-                "mkdir -p /data/samba/etc 2>/dev/null; " +
-                "echo '[global]' > $SMB_CONF 2>/dev/null; " +
-                "echo '   workgroup = SAMBA' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   security = user' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   map to guest = bad user' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   guest account = nobody' >> $SMB_CONF 2>/dev/null; " +
-                "echo '$preexecLine' >> $SMB_CONF 2>/dev/null; " +
-                "echo '' >> $SMB_CONF 2>/dev/null; " +
-                "echo '[share]' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   path = /sdcard' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   browseable = yes' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   writable = yes' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   guest ok = yes' >> $SMB_CONF 2>/dev/null; " +
-                "echo '   public = yes' >> $SMB_CONF 2>/dev/null; " +
-            "fi",
-            timeoutMs = 10_000L
-        )
-
-        if (result.isSuccess) {
-            AppLogger.i(TAG, "smb.conf updated with root preexec")
-        } else {
-            AppLogger.w(TAG, "smb.conf update failed: exit=${result.exitCode} stderr=${result.stderr}")
+        AssetExtractor.extractAll(context, "shell")
+        val srcSocat = File(AssetExtractor.getPath(context, SOCAT_NAME))
+        val srcScript = File(AssetExtractor.getPath(context, SCRIPT_NAME))
+        if (!srcSocat.exists() || srcSocat.length() == 0L) {
+            return@withContext DeployResult(false, "prepare", "socat 资产缺失：$srcSocat")
         }
-    }
-
-    /**
-     * 自动触发 Samba 连接 — 使用 jCIFS 从设备自身连接 Samba 共享。
-     *
-     * 原理：ZTE F50 的 Samba 服务配置了 root preexec，每次有客户端连接时以 root 执行脚本。
-     * 通过 jCIFS 库从 app 进程连接 localhost 的 Samba 共享 → smbd 执行 root preexec →
-     * samba_exec.sh 启动 socat 监听 Unix socket → root shell 可用。
-     *
-     * 参考：UFI-TOOLS 的 SmbThrottledRunner 使用相同机制。
-     */
-    fun triggerSambaConnection() {
-        // ZTE F50 作为 WiFi 热点，自身 IP 为 192.168.0.1
-        // 尝试多个 share 名称（不同 ROM 版本可能不同）
-        val hosts = listOf("192.168.0.1", "127.0.0.1")
-        val shares = listOf("internal_storage", "share", "sdcard")
-
-        for (host in hosts) {
-            for (share in shares) {
-                val url = "smb://$host/$share/"
-                try {
-                    AppLogger.i(TAG, "Trying SMB connect: $url")
-                    val ctx = SingletonContext.getInstance()
-                    val smbFile = SmbFile(url, ctx)
-                    if (smbFile.exists()) {
-                        AppLogger.i(TAG, "SMB auto-trigger SUCCESS: $url (root preexec triggered)")
-                        return
-                    }
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "SMB connect failed: $url — ${e.message?.take(80)}")
-                }
-            }
+        if (!srcScript.exists() || srcScript.length() == 0L) {
+            return@withContext DeployResult(false, "prepare", "脚本资产缺失：$srcScript")
         }
-        AppLogger.w(TAG, "SMB auto-trigger: all hosts/shares failed")
-    }
 
-    /**
-     * 检查 root shell socket 是否可用。
-     * 先检查我们自己的 socket，再检查 UFI-TOOLS 的 socket（同一 Samba 机制，可复用）。
-     * @return true 如果任一 socket 文件存在且可连接
-     */
-    fun isSocketAvailable(): Boolean {
-        // 先检查我们自己的 socket
-        if (checkSocket(SOCKET_PATH)) return true
-        // 再检查 UFI-TOOLS 的 socket（如果设备装了 UFI-TOOLS，它的 Samba root preexec 已启动 socat）
-        if (checkSocket(UFI_TOOLS_SOCKET_PATH)) return true
-        return false
-    }
+        val socat = socatFile(context)
+        val script = scriptFile(context)
+        runCatching { srcSocat.copyTo(socat, overwrite = true) }
+            .onFailure { return@withContext DeployResult(false, "prepare", "拷贝 socat 失败：${it.message}") }
+        runCatching { srcScript.copyTo(script, overwrite = true) }
+            .onFailure { return@withContext DeployResult(false, "prepare", "拷贝脚本失败：${it.message}") }
 
-    /**
-     * 返回 Samba 部署状态的诊断字符串（用于写入 update log）。
-     * 检查：socat/script/adb 文件是否存在、smb.conf 是否包含 root preexec、socket 是否可用。
-     */
-    suspend fun deployDiagnostic(): String {
-        val parts = mutableListOf<String>()
-        // 检查 /data/local/tmp/ufi_axis/ 下的文件
-        val baseFiles = listOf("socat" to SOCAT_PATH, "samba_exec.sh" to SCRIPT_PATH, "adb" to "$BASE_DIR/adb")
-        for ((name, path) in baseFiles) {
-            val f = File(path)
-            parts.add("$name=${if (f.exists()) "OK" else "MISSING"}($path)")
-        }
-        // 检查 socket
-        parts.add("socket=${if (isSocketAvailable()) "READY" else "NOT_READY"}(${availableSocketPath() ?: "none"})")
-        // 检查 smb.conf 是否有 root preexec（通过 ShellExecutor）
-        try {
-            val check = ShellExecutor.executeAsRoot(
-                "grep -c 'ufi_axis/samba_exec.sh' $SMB_CONF 2>/dev/null",
-                timeoutMs = 3_000L
+        // root preexec 以 `/system/bin/sh <script>` 调用，脚本只需可读；
+        // socat 需要真 exec（permissive 下 app_data_file 才允许 execute_no_trans）。
+        script.setReadable(true, false)
+        socat.setExecutable(true, true)
+        socat.setReadable(true, false)
+        if (!socat.canExecute()) {
+            return@withContext DeployResult(
+                false, "prepare",
+                "socat 不可执行（enforcing SELinux 下会这样，见 NativeExecProbe）：$socat"
             )
-            val count = check.stdout.trim().toIntOrNull() ?: 0
-            parts.add("smbConf=${if (count > 0) "PATCHED" else "NOT_PATCHED"}")
-        } catch (e: Exception) {
-            parts.add("smbConf=CHECK_FAILED(${e.message?.take(40)})")
         }
-        return parts.joinToString(", ")
+
+        // ── ② 注入 root preexec ──
+        //
+        // 2026-11-07：开机瞬间 `smb.conf` 可能还没被固件写出来（真机见过：core 比 smbd 早几秒
+        // 起来，此时文件不存在）。deploy 只在启动时跑一次，读到 null 就直接放弃了 ——
+        // 结果整条 root 通道要到下次重启才有机会。这里给 3 次重试（共约 6 秒）。
+        var current: String? = null
+        repeat(3) { attempt ->
+            current = readConf(context)
+            if (current == null && attempt < 2) delay(2_000L)
+        }
+        val conf = current
+            ?: return@withContext DeployResult(false, "patch", "读不到 $SMB_CONF（固件不是 ZTE Samba？）")
+        val patched = patchConf(conf, script.absolutePath)
+        if (patched != conf) {
+            // chattr +i 只有 root 能解；解不掉也不致命，写入会自己失败并报出来
+            ShellExecutor.executeAsRoot("chattr -i '$SMB_CONF' 2>/dev/null", 3_000L)
+            writeConf(context, patched)?.let { err ->
+                return@withContext DeployResult(false, "patch", err)
+            }
+            AppLogger.i(TAG, "smb.conf 已注入 root preexec → ${script.absolutePath}")
+        } else {
+            AppLogger.i(TAG, "smb.conf 已是目标状态，跳过写入")
+        }
+
+        // ── ③ 触发一次 TREE_CONNECT ──
+        val shares = sharesOf(conf)
+        if (shares.isEmpty()) {
+            return@withContext DeployResult(false, "trigger", "smb.conf 里没有可连接的共享段")
+        }
+        val triggered = triggerSambaConnection(context, shares)
+
+        // ── ④ 确认 socket ──
+        return@withContext if (isSocketAvailable(context)) {
+            AppLogger.i(TAG, "root 通道就绪：${socketFile(context)}")
+            DeployResult(true, "verify", "socket ready：${socketFile(context).absolutePath}")
+        } else {
+            val why = if (triggered) "已连上共享但 socket 未出现" else "所有 host×share 组合都没连上"
+            AppLogger.w(TAG, "root 通道未就绪：$why（shares=$shares）")
+            DeployResult(false, "verify", "$why（shares=$shares）")
+        }
     }
 
-    /** 当前可用的 socket 路径（我们自己的或 UFI-TOOLS 的） */
-    fun availableSocketPath(): String? {
-        if (checkSocket(SOCKET_PATH)) return SOCKET_PATH
-        if (checkSocket(UFI_TOOLS_SOCKET_PATH)) return UFI_TOOLS_SOCKET_PATH
-        return null
+    // ─────────── 触发 ───────────
+
+    /**
+     * 连一次共享，让 smbd 执行 root preexec。
+     *
+     * @param shares 为空时从 smb.conf 现读。**必须用真实段名**：旧实现硬编码
+     *   `internal_storage/share/sdcard`，而本机固件的段名是 `F50`，于是永远触发不到。
+     * @return 是否在 [timeoutMs] 内等到 socket
+     */
+    suspend fun triggerSambaConnection(
+        context: Context,
+        shares: List<String>? = null,
+        timeoutMs: Long = 5_000L
+    ): Boolean = withContext(Dispatchers.IO) {
+        val names = shares?.takeIf { it.isNotEmpty() } ?: sharesOf(readConf(context).orEmpty())
+        if (names.isEmpty()) {
+            AppLogger.w(TAG, "smb.conf 里没有可连接的共享段，无法触发 root preexec")
+            return@withContext false
+        }
+
+        // 192.168.0.1 是 F50 作为热点时的自身地址；127.0.0.1 兜底。
+        val hosts = listOf("192.168.0.1", "127.0.0.1")
+        for (host in hosts) {
+            for (share in names) {
+                val url = "smb://$host/$share/"
+                val reachable = runCatching {
+                    SmbFile(url, SingletonContext.getInstance()).exists()
+                }.getOrElse { e ->
+                    AppLogger.d(TAG, "连接 $url 失败：${e.message?.take(80)}")
+                    false
+                }
+                if (!reachable) continue
+
+                AppLogger.i(TAG, "SMB 连接成功（已触发 root preexec）：$url")
+                if (awaitSocket(context, timeoutMs)) return@withContext true
+            }
+        }
+
+        AppLogger.w(TAG, "触发失败：hosts=$hosts，shares=$names")
+        false
     }
 
-    private fun checkSocket(path: String): Boolean {
-        return try {
-            val socket = LocalSocket()
-            val address = LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM)
-            socket.connect(address)
-            socket.close()
+    private suspend fun awaitSocket(context: Context, timeoutMs: Long): Boolean {
+        val path = socketFile(context).absolutePath
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (checkSocket(path)) return true
+            delay(200L)
+        }
+        return checkSocket(path)
+    }
+
+    // ─────────── socket ───────────
+
+    /**
+     * 只看**我们自己的** socket。
+     *
+     * 2026-11-07 安全修正：原实现会在自己的 socket 不可用时回落到 UFI-TOOLS 的
+     * `/data/data/com.minikano.f50_sms/files/kano_root_shell.sock`。那是一个**别的应用**
+     * 提供的通道 —— 谁能起那个 socket，谁就能冒充 core 的 root 通道，而 [runAsRoot] 拿到
+     * 的返回值没有任何身份校验。既然本机自己的通道已经能稳定工作，这个回落只有风险没有收益，
+     * 直接删掉。
+     */
+    fun isSocketAvailable(context: Context): Boolean =
+        checkSocket(socketFile(context).absolutePath)
+
+    /** 当前可用的 socket 路径（只有我们自己的那份）。 */
+    fun availableSocketPath(context: Context): String? {
+        val own = socketFile(context).absolutePath
+        return if (checkSocket(own)) own else null
+    }
+
+    private fun checkSocket(path: String): Boolean = try {
+        val socket = LocalSocket()
+        socket.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
+        socket.close()
+        true
+    } catch (_: Exception) {
+        false
+    }
+
+    // ─────────── 通过 root shell 执行命令 ───────────
+
+    /**
+     * 通过 root socket 执行一条命令，返回输出；socket 不可用或超时返回 null。
+     *
+     * 这是当前**唯一**能让 core 稳定拿到 uid 0 的通道（ADB 自连在本机实测不生效，
+     * 见 `SambaRootShell` 类注释）。调用方需自行判断返回内容 —— 本方法只负责把命令送进去。
+     *
+     * 注意：命令由 socket 那头的常驻 `sh` 执行，**不会**继承 app 的 cwd/环境变量，
+     * 也不要在命令里依赖交互式输入。
+     */
+    suspend fun runAsRoot(context: Context, command: String, timeoutMs: Int = 30_000): String? {
+        val sockPath = availableSocketPath(context) ?: return null
+        // 先确认这确实是一个 uid 0 的 shell，再把调用方的命令送进去。
+        // 每次调用都验：socket 文件可被替换，缓存等于只防一次（见下方说明）。
+        if (!verifySocketIsRoot(sockPath)) return null
+        return sendCommand(command, sockPath, timeoutMs)
+    }
+
+    // 2026-11-14：**不缓存**校验结果。
+    //
+    // 原先这里记一个 `verifiedSocketPath`，同一条路径只验一次。可这道校验存在的全部理由
+    // 就是"socket 文件可能被 unlink 后重建"—— 缓存在路径上，等于攻击者只要等我们验过一次，
+    // 之后再替换就能一路畅通，防线只生效一次。每次用之前重验，`id -u` 是一次本地 socket
+    // 往返，代价可以忽略。
+
+    /**
+     * 确认 [sockPath] 那头是 root。
+     *
+     * 为什么需要：socket 是我们起的，但 socket 文件本身可被替换/预置（同一个文件系统上
+     * 有写权限的主体都能 `unlink` 后重建一个同名 socket）。之前只有 [installViaRootShell]
+     * 做了 whoami 校验，[runAsRoot] 没有 —— 等于给了一条"命令送进别人 shell"的路。
+     */
+    private suspend fun verifySocketIsRoot(sockPath: String): Boolean {
+        val uid = sendCommand("id -u", sockPath, 5_000)?.trim()
+        return if (uid == "0") {
             true
-        } catch (_: Exception) {
+        } else {
+            AppLogger.e(TAG, "root socket 身份校验失败（id -u=$uid），拒绝使用：$sockPath")
             false
         }
     }
 
     /**
-     * 通过 root shell socket 执行 pm install -r -g。
+     * 通过 root shell socket 执行 `pm install -r -g`。
      *
-     * @param apkPath APK 文件路径（须是 root 可读的路径，如 /data/local/tmp/ 或 /sdcard/）
-     * @return Pair<是否成功, 日志信息>
+     * 当前无生产调用方（更新走 `UpdateManager` 的脚本通道），保留作为既有能力。
      */
-    fun installViaRootShell(apkPath: String): Pair<Boolean, String> {
-        val sockPath = availableSocketPath() ?: return false to "root shell socket not available (需启用 Samba 并从电脑连接一次共享)"
+    suspend fun installViaRootShell(context: Context, apkPath: String): Pair<Boolean, String> {
+        val sockPath = availableSocketPath(context)
+            ?: return false to "root shell socket not available（需 Samba 在跑且已注入 root preexec）"
 
-        // 先验证 socket 确实是 root
-        val whoami = sendCommand("whoami", sockPath) ?: return false to "socket connect failed"
+        val whoami = sendCommand("whoami", sockPath) ?: return false to "socket 连接失败"
         if (!whoami.contains("root")) {
-            AppLogger.w(TAG, "socket is not root: whoami=$whoami")
-            return false to "socket is not root (uid=${whoami.trim()})"
+            AppLogger.w(TAG, "socket 返回的不是 root：whoami=$whoami")
+            return false to "socket is not root（uid=${whoami.trim()}）"
         }
 
-        // 通过 root shell 执行 pm install
-        val installCmd = "pm install -r -g '$apkPath' 2>&1"
-        val result = sendCommand(installCmd, sockPath, timeoutMs = 120_000)
-
-        if (result == null) {
-            return false to "root shell command timeout"
-        }
-
-        val output = result.trim()
-        AppLogger.i(TAG, "pm install via root shell ($sockPath): $output")
-
-        // pm install 成功输出 "Success"
-        val success = output.contains("Success", ignoreCase = true)
-        return success to output
+        val out = sendCommand("pm install -r -g '$apkPath' 2>&1", sockPath, 120_000)
+            ?: return false to "root shell 命令超时"
+        val text = out.trim()
+        AppLogger.i(TAG, "pm install via root shell（$sockPath）：$text")
+        return text.contains("Success", ignoreCase = true) to text
     }
 
-    /**
-     * 通过 root shell socket 发送命令并读取输出。
-     *
-     * @param command 要执行的 shell 命令
-     * @param socketPath socket 文件路径
-     * @param timeoutMs 超时毫秒数
-     * @return 命令输出，失败返回 null
-     */
-    private fun sendCommand(command: String, socketPath: String, timeoutMs: Int = 30_000): String? {
+    private suspend fun sendCommand(
+        command: String,
+        socketPath: String,
+        timeoutMs: Int = 30_000
+    ): String? = withContext(Dispatchers.IO) {
         val socket = LocalSocket()
         val address = LocalSocketAddress(socketPath, LocalSocketAddress.Namespace.FILESYSTEM)
-        return try {
+        try {
             socket.connect(address)
             socket.soTimeout = timeoutMs
 
             val writer = BufferedWriter(OutputStreamWriter(socket.outputStream))
             val reader = BufferedReader(InputStreamReader(socket.inputStream))
 
+            // 用随机结束标记界定输出边界：socket 那头是常驻 sh，不会 EOF。
             val endTag = "__UFI_AXIS_END_${java.util.UUID.randomUUID()}__"
-
-            // 发送命令 + 结束标记
             writer.write(command)
             writer.write("\n")
             writer.write("printf '%s\\n' '$endTag'\n")
             writer.flush()
 
-            // 读取直到结束标记
             val result = StringBuilder()
             while (true) {
                 val line = reader.readLine() ?: break
-                val endIdx = line.indexOf(endTag)
-                if (endIdx >= 0) {
-                    val before = line.substring(0, endIdx)
-                    if (before.isNotEmpty()) result.append(before)
+                val idx = line.indexOf(endTag)
+                if (idx >= 0) {
+                    if (idx > 0) result.append(line.substring(0, idx))
                     break
                 }
                 result.appendLine(line)
             }
-
             result.toString().trimEnd()
         } catch (e: Exception) {
-            AppLogger.w(TAG, "sendCommand error: ${e.message}")
+            AppLogger.w(TAG, "sendCommand 失败：${e.message}")
             null
         } finally {
-            try { socket.close() } catch (_: Exception) {}
+            runCatching { socket.close() }
         }
+    }
+
+    // ─────────── smb.conf ───────────
+
+    /**
+     * 读配置。三级降级：直接读 → **root socket（uid 0）** → ADB（uid 2000）。
+     *
+     * 2026-11-07 补 root 通道：一旦按"加固"建议把 `/data/samba` 收成 0700 root
+     *（现在是 777 + permissive，等于任何 app 都能改），前两级都会失效，只剩 uid 0 能读。
+     * 没有这一级的话，收紧权限后的下一次 deploy 会读不到配置 → root 通道永久失联。
+     */
+    private suspend fun readConf(context: Context): String? {
+        runCatching { File(SMB_CONF).readText() }
+            .getOrNull()?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        runAsRoot(context, "cat '$SMB_CONF' 2>/dev/null")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { return it }
+
+        val r = ShellExecutor.executeAsRoot("cat '$SMB_CONF' 2>/dev/null", 3_000L)
+        return r.stdout.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * 写配置。**原地写**（保留 inode/属主/权限）—— 若换成 `mv` 覆盖，文件属主会变成 app，
+     * 之后 adb shell(2000) 就再也改不动它了。
+     *
+     * @return null 表示成功；否则是给人看的中文原因
+     */
+    private suspend fun writeConf(context: Context, text: String): String? {
+        val file = File(SMB_CONF)
+
+        // ① 直接写（777 + permissive 下可行，保留 inode/属主/权限）
+        val directErr = runCatching { file.writeText(text) }.exceptionOrNull()
+        if (directErr == null && readConfEquals(text)) return null
+
+        // ② 退 root socket（uid 0）—— 权限收紧后**唯一**还能写的通道。
+        //    临时文件放 app 私有目录（root 读得到），不放 /data/local/tmp：
+        //    那条路径世界可写，是攻击面。
+        val privTmp = File(context.cacheDir, "smb.conf.new")
+        if (runCatching { privTmp.writeText(text) }.isSuccess) {
+            val out = runAsRoot(
+                context,
+                "cat '${privTmp.absolutePath}' > '$SMB_CONF' && rm -f '${privTmp.absolutePath}' && echo UFI_CONF_WRITTEN",
+                8_000
+            )
+            if (out?.contains("UFI_CONF_WRITTEN") == true && readConfEquals(text)) return null
+            runCatching { privTmp.delete() }
+        }
+
+        // ③ 退 ADB（uid 2000）。临时文件必须落到 /data/local/tmp —— uid 2000 读不到 app 私有目录。
+        val pubTmp = File("/data/local/tmp/ufi_smb_conf.tmp")
+        if (runCatching { pubTmp.writeText(text) }.isSuccess) {
+            val r = ShellExecutor.executeAsRoot(
+                "cat '${pubTmp.absolutePath}' > '$SMB_CONF' && rm -f '${pubTmp.absolutePath}'",
+                8_000L
+            )
+            if (r.isSuccess && readConfEquals(text)) return null
+        }
+
+        return "写 $SMB_CONF 失败" +
+            (directErr?.let { "（直接写：${it.message}）" } ?: "（直接写后内容校验不符）") +
+            "；root socket 与 ADB 通道都没成功。是否被 chattr +i 锁定？"
+    }
+
+    private fun readConfEquals(text: String): Boolean =
+        runCatching { File(SMB_CONF).readText() }.getOrNull() == text
+
+    /**
+     * 生成打了 root preexec 的配置。纯函数，可单测。
+     *
+     * 两件事：
+     * 1. **先删掉本机制留下的旧行** —— 旧安装会写 `/data/local/tmp/ufi_axis/samba_exec.sh`，
+     *    那个文件早就不存在了。留着的话 smbd 每次连接都会执行失败，进而**让连接失败**。
+     * 2. 插到**第一个真实共享段**里（不是 `[global]`）：`root preexec` 是服务级参数，
+     *    写进具体段最准确；写在 `[global]` 只能当"所有共享的默认值"用。
+     */
+    internal fun patchConf(raw: String, scriptPath: String): String {
+        val lines = raw.split("\n").toMutableList()
+        lines.removeAll { line ->
+            val t = line.trim()
+            t.startsWith("root preexec") && t.contains(SCRIPT_NAME)
+        }
+
+        val preexec = "   root preexec = /system/bin/sh $scriptPath"
+        val shareIdx = lines.indexOfFirst { isRealShare(it) }
+        val globalIdx = lines.indexOfFirst { it.trim().equals("[global]", ignoreCase = true) }
+
+        when {
+            shareIdx >= 0 -> lines.add(shareIdx + 1, preexec)
+            globalIdx >= 0 -> lines.add(globalIdx + 1, preexec)
+            else -> {
+                lines.add(0, "[global]")
+                lines.add(1, preexec)
+            }
+        }
+        return lines.joinToString("\n")
+    }
+
+    /** 从配置里取可连接的共享段名。 */
+    internal fun sharesOf(raw: String): List<String> =
+        raw.split("\n")
+            .mapNotNull { sectionNameOf(it) }
+            .filter { it.lowercase() !in RESERVED_SECTIONS }
+            .distinct()
+
+    private fun sectionNameOf(line: String): String? =
+        SECTION_RE.find(line)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun isRealShare(line: String): Boolean {
+        val name = sectionNameOf(line) ?: return false
+        return name.lowercase() !in RESERVED_SECTIONS
+    }
+
+    // ─────────── 诊断 ───────────
+
+    /** 一行式诊断，写进 update log 或排障页。 */
+    suspend fun deployDiagnostic(context: Context): String {
+        val dir = baseDir(context)
+        val socat = socatFile(context)
+        val script = scriptFile(context)
+        val conf = readConf(context)
+
+        val parts = mutableListOf<String>()
+        parts += "dir=${if (dir.isDirectory) "OK" else "MISSING"}($dir)"
+        parts += "dirWritable=${dir.canWrite()}"
+        parts += "socat=${if (socat.canExecute()) "OK" else "MISSING"}(${socat.absolutePath})"
+        parts += "script=${if (script.isFile) "OK" else "MISSING"}(${script.absolutePath})"
+        parts += when {
+            conf == null -> "smbConf=UNREADABLE($SMB_CONF)"
+            conf.contains(script.absolutePath) -> "smbConf=PATCHED"
+            else -> "smbConf=NOT_PATCHED"
+        }
+        parts += "shares=${conf?.let { sharesOf(it) } ?: emptyList<String>()}"
+        parts += "socket=${if (isSocketAvailable(context)) "READY" else "NOT_READY"}" +
+            "(${availableSocketPath(context) ?: "none"})"
+        parts += "adb=${if (AdbShellExecutor.isAvailable) "UP" else "DOWN"}"
+        return parts.joinToString(", ")
     }
 }

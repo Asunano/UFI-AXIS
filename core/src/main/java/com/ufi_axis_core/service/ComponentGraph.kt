@@ -42,7 +42,9 @@ data class ComponentGraph(
     val collector: CollectorGraph,
     val storage: StorageGraph,
     val controller: ControllerGraph,
-    val serverGraph: ServerGraph
+    val serverGraph: ServerGraph,
+    /** 第三方程序：服务启停必须能收掉 runtime / supervisor / install scope。 */
+    val programManager: com.ufi_axis_core.service.program.ProgramManager
 ) {
     // ── 子图聚合：调用方直接经 network / collector / storage / controller / serverGraph 子图访问组件 ──
 }
@@ -160,5 +162,15 @@ data class ServerGraph(
      * 「重新扫描」的追赶刷新（它必须活过那次 HTTP 请求，见 `MediaIndexStore` 的类 KDoc）。
      * 那个自持作用域只能靠显式 `stop()` 收，所以停机路径必须调到它。
      */
-    val mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore
+    val mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore,
+
+    /**
+     * 远程屏幕会话（2026-10-31）。暴露它的理由与 [ttydRoutes] 同源：
+     * 停机时必须显式收掉 scrcpy-server 进程与 `adb reverse`，否则「停止服务」之后
+     * 那个进程还在跑（客户端看不到画面，但设备侧仍在编码、还在持有唤醒锁）。
+     */
+    val screenSessionManager: com.ufi_axis_core.controller.screen.ScreenSessionManager,
+
+    /** 移动自动登录调度器：停机必须显式停，否则「停止服务」后仍会周期性发真实验证码短信。 */
+    val carrierAutoLoginManager: com.ufi_axis_core.controller.carrier.CarrierAutoLoginManager
 )

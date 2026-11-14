@@ -171,7 +171,7 @@ class PairingBlacklistGateTest {
         assertTrue(device.pair(manager, settings, "secret123") is PairingManager.PairingConfirmResult.Success)
         block(device.fingerprint)
 
-        val removed = manager.removeDevice(device.fingerprint, "secret123", "127.0.0.1")
+        val removed = manager.removeDevice(device.fingerprint)
         assertTrue("前置：设备应被成功移除，实际=$removed", removed is PairingManager.RemoveResult.Success)
         assertTrue(
             "移除设备只是撤销授权，不该顺手取消拉黑",
@@ -272,8 +272,6 @@ class PairingBlacklistGateTest {
             hwId = "HW-COMMON",
             name = null,
             reason = null,
-            password = "secret123",
-            ip = "127.0.0.1",
             selfFingerprint = null // 指纹不同，只有 hwId 相同
         )
         assertTrue(

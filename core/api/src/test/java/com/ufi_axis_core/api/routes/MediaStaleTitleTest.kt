@@ -4,13 +4,13 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 /**
- * MediaStore 陈旧标题的识别（2026-10-13）。
+ * MediaStore 陈旧标题的识别。
  *
- * 真机样本：
- *   磁盘文件名： `阳光下的星星-金海心.flac`
- *   MediaStore TITLE：`阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2`
+ * 示例样本：
+ *   磁盘文件名： `示例歌曲-示例歌手.flac`
+ *   MediaStore TITLE：`示例歌曲 -示例歌手.flac.29894902._TEMP123`
  *
- * `.29894902` 是下载分片的字节数、`_CEujVT6XmHgTkI2` 是网易云音乐的临时文件标记。
+ * `.29894902` 是下载分片的字节数、`_TEMP123` 是网易云音乐的临时文件标记。
  * 所以这不是编码乱码，而是**文件改名后 MediaStore 没重扫**，库里留着下载期的临时标题。
  *
  * 本测试锁定的是判据（「陈旧」的特征），不是某个具体文件名：
@@ -30,7 +30,7 @@ class MediaStaleTitleTest {
     fun `陈旧下载临时名 -真机样本 -应判为陈旧`() {
         assertEquals(
             true,
-            isStale("阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2", "阳光下的星星-金海心")
+            isStale("示例歌曲 -示例歌手.flac.29894902._TEMP123", "示例歌曲-示例歌手")
         )
     }
 
@@ -39,11 +39,11 @@ class MediaStaleTitleTest {
         // 同一个下载器每次的分片大小都不同，只认死后缀的话换个文件就漏。
         assertEquals(
             true,
-            isStale("阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2", "阳光下的星星-金海心")
+            isStale("示例歌曲 -示例歌手.flac.29894902._TEMP123", "示例歌曲-示例歌手")
         )
         assertEquals(
             true,
-            isStale("带我走.flac.1048576._8XyZqLmNpQrStUvW", "带我走")
+            isStale("示例歌曲.flac.1048576._8XyZqLmNpQrStUvW", "示例歌曲")
         )
     }
 

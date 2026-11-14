@@ -44,19 +44,19 @@ import java.nio.charset.Charset
 import java.util.Locale
 
 /**
- * 媒体库路由 —— 「媒体中心」的数据源（2026-09-16 新增）。
+ * 媒体库路由 —— 「媒体中心」的数据源。
  *
  * ## 为什么不复用文件接口（`/api/files/list` 与 `/api/files/search`）
  * 媒体中心要的是「这台设备上所有视频 / 音乐 / 图片」，而文件接口只有两种能力：
  * `/files/list` 单层列目录，`/files/search` 按**文件名**子串递归找（`MAX_SEARCH_RESULTS = 50`
- * 硬顶、深度 ≤ 8、10s 墙钟）。拿它们凑媒体库要么漏、要么慢到不可用。
+ * 硬顶、深度 ≤ 8、10s 墙钟）。二者都不足以支撑媒体库：前者会漏，后者过慢。
  *
  * ## 数据来源：系统媒体库（MediaStore），不自建索引
  * 系统已经把整卡的媒体索引好了（含时长、分辨率、专辑、艺术家，还有缓存好的缩略图）。
- * 自己写扫描器 + Room 索引表意味着要重做一遍增量与失效，而且会和系统媒体库两份数据长期打架。
+ * 自己写扫描器 + Room 索引表意味着要重做一遍增量与失效，且与系统媒体库形成两份长期并存的索引。
  * 所以这里只做三件事：查 MediaStore、按配置的目录过滤、把缩略图转 JPEG 吐出去。
  *
- * 代价（必须让客户端能表达出来，不许假装没有）：
+ * 代价（客户端必须能表达这些状态）：
  *  · Android 13+ 起 MediaStore 查询按 `READ_MEDIA_VIDEO/AUDIO/IMAGES` **分别**授权，
  *    所以 `/status` 是三态回报，某一类没授权时对应分栏要明说，而不是显示"没有媒体"；
  *  · `.nomedia` 屏蔽的目录、刚 push 进来还没被扫到的文件，媒体库里没有 —— 这是
@@ -82,20 +82,20 @@ class MediaRoutes(
      */
     private val cache: ResponseCache,
     /**
-     * 「从音乐库移除」的排除名单。可空 + 默认 null：老的组装代码不传它也能编过，
-     * 传 null 就是"没有任何排除"（[filterListItems] 里 `orEmpty()` 兜住）。
+     * 「从音乐库移除」的排除名单。可空 + 默认 null：未注入时为"没有任何排除"
+     *（[filterListItems] 中由 `orEmpty()` 处理）。
      */
     private val exclusions: com.ufi_axis_core.api.media.MediaExclusionStore? = null,
     /**
-     * 2026-10-07：手动预热钩子（ComponentFactory 注入 `ThumbPrewarmWorker.runOnce(forceIdle=true)`，
-     * 广播闭包与调度侧同一份）。null = 老装配（无此能力）时端点回 501。
+     * 手动预热钩子（ComponentFactory 注入 `ThumbPrewarmWorker.runOnce(forceIdle=true)`，
+     * 广播闭包与调度侧同一份）。null = 未装配该能力时端点返回 501。
      */
     private val manualPrewarm: (suspend () -> Unit)? = null,
     /**
-     * 媒体索引缓存（2026-10-13）。装配层（`ComponentFactory`）注入同一个实例，
+     * 媒体索引缓存。装配层（`ComponentFactory`）注入同一个实例，
      * 这样 `BackendService` 能按服务生命周期起停它的定时刷新。
      *
-     * 不传（单测 / 老装配）时就地建一个功能等价的实例：缓存与单飞语义完全一致，
+     * 不传（单测 / 未装配）时就地建一个功能等价的实例：缓存与单飞语义完全一致，
      * 只是没有定时刷新 —— 读路径靠 TTL 与冷启动同步拉取照样正确。
      */
     indexStore: com.ufi_axis_core.api.media.MediaIndexStore? = null
@@ -115,10 +115,10 @@ class MediaRoutes(
     }
 
     /*
-     * 这里刻意**不**再暴露 startPeriodicRefresh / invalidate / stats 之类的转发方法：
-     * 装配层（ComponentFactory）拿到的是同一个 MediaIndexStore 实例，已经直接把它给了
-     * ServerGraph（生命周期起停）与 FileRoutes（删除后失效），多一层转发只是多一条
-     * "两处都能改同一个东西"的路径。MediaRoutes 只负责**注册 loader**与**读快照**。
+     * 这里**不**暴露 startPeriodicRefresh / invalidate / stats 之类的转发方法：
+     * 装配层（ComponentFactory）拿到的是同一个 MediaIndexStore 实例，已直接交给
+     * ServerGraph（生命周期起停）与 FileRoutes（删除后失效）；多一层转发只会多一条
+     * "两处都能修改同一状态"的路径。MediaRoutes 只负责**注册 loader** 与**读快照**。
      */
 
     companion object {
@@ -132,15 +132,15 @@ class MediaRoutes(
          */
         private val KIND_KEYS = listOf("video", "audio", "image")
 
-        /** 一页的条数：默认 100，上限 500。媒体库上千项，不分页会把整份 JSON 一次性怼给客户端。 */
+        /** 一页的条数：默认 100，上限 500。媒体库上千项，不分页会把整份 JSON 一次性返回给客户端。 */
         private const val DEFAULT_PAGE_SIZE = 100
         private const val MAX_PAGE_SIZE = 500
 
         /**
          * 缩略图边长夹取范围。
          *
-         * 上限 2026-09-16 由 512 提到 1024：音乐播放页的封面容器是 260dp，在 xxhdpi 上约 780 物理像素，
-         * 请求 512 会被放大 1.5 倍 —— 这就是"封面很模糊"的原因。列表用的默认值仍是 256。
+         * 上限 1024：音乐播放页的封面容器是 260dp，在 xxhdpi 上约 780 物理像素，
+         * 请求 512 会被放大 1.5 倍，导致封面模糊。列表用的默认值仍是 256。
          */
         private const val MIN_THUMB_SIZE = 96
         private const val MAX_THUMB_SIZE = 1024
@@ -148,21 +148,19 @@ class MediaRoutes(
         private const val THUMB_JPEG_QUALITY = 82
 
         /*
-         * 2026-10-13 删掉了 `VIDEO_FRAME_RATIOS` / `VIDEO_FRAME_FALLBACK_US` /
-         * `DARK_LUMA_THRESHOLD` / `LUMA_SAMPLE_GRID`：它们是 MMR 自行抽帧那条路的
-         * "候选位置 + 黑帧判定"参数，随 `videoFrameThumbnail` 一起删除。
-         * 黑帧/全零帧的判定并没有丢 —— ffmpeg 的输出仍然过 `FrameValidator`（G3 四判据）。
+         * MMR 自行抽帧那条路的参数（候选位置 + 黑帧判定）已随 `videoFrameThumbnail` 删除。
+         * 黑帧 / 全零帧的判定未丢失：ffmpeg 的输出仍经过 `FrameValidator`（四判据）。
          */
 
         /**
          * 缩略图缓存目录（`filesDir` 下）。
          *
-         * 加这一层的理由（2026-09-16，2026-10-13 更新）：本机（随身 WiFi 的定制 ROM）
+         * 缓存层的必要性：目标设备的定制 ROM 无法桥接硬件 VPU，
          * **解不出视频画面** —— `MediaProvider` 与 `MediaMetadataRetriever` 走同一套 codec，
          * 双双失败（实测 `FileNotFoundException: Failed to create thumbnail` + 抽帧返回 null 帧）。
-         * 所以封面必须**算一次就存住**：core 侧 ffmpeg 抽帧是秒级开销，
-         * 客户端回传（历史路径）也是别人的算力成果，都不该被重复支付。
-         * 存住之后 Web 端与第二台手机也能直接拿到。
+         * 因此封面必须**计算一次后落盘**：core 侧 ffmpeg 抽帧是秒级开销，
+         * 客户端回传的也是已有算力成果，都不应重复支付。
+         * 落盘后 Web 端与第二台手机可直接复用。
          *
          * 放 `filesDir` 而不是 `cacheDir`：这是算出来的结果，被系统清掉就得再算一次
          * （还要再读一遍视频头部）。容量由 [THUMB_CACHE_LIMIT_BYTES] 自己管。
@@ -175,16 +173,15 @@ class MediaRoutes(
         /**
          * 封面取不到时的失败冷却（6h）。
          *
-         * 与 `ThumbPrewarmWorker.FAIL_COOLDOWN_MS` 取同一个值：都是"这条确实出不了图"的
-         * 同一类判据，口径一致才好解释。没有它，一张无封面的歌每次列表刷新都会重跑
-         * MMR + 解码 —— 那是"滑动时解码风暴"的另一个来源。
+         * 与 `ThumbPrewarmWorker.FAIL_COOLDOWN_MS` 取同一值：两者判定的是同一类
+         * "确实出不了图"的情况，口径一致便于解释。否则一张无封面的歌每次列表刷新都会重跑
+         * MMR + 解码，形成滑动时的解码风暴。
          */
         private const val COVER_FAIL_COOLDOWN_MS = 6L * 60 * 60 * 1000
 
         /*
-         * 2026-10-13 删掉了 `thumbSystemSemaphore`（对 MediaProvider 调用的闸门）。
-         * 它保护的唯一对象是 `loadThumbnail`，而那个调用已整体退役。
-         * 解码闸门没有消失，只是换了语义并搬到 `MediaDecodeGate`：
+         * 系统缩略图闸门（`thumbSystemSemaphore`）已随 `loadThumbnail` 退役而删除。
+         * 解码闸门仍然存在，语义改为 `MediaDecodeGate`：
          * heavy = ffmpeg 抽帧，light = 图片降采样 / 封面字节读取。
          */
 
@@ -236,9 +233,9 @@ class MediaRoutes(
         private const val MAX_RESCAN_FILES = 5000
 
         /**
-         * 索引缓存单个 kind 的条目上限（2026-10-13）。
+         * 索引缓存单个 kind 的条目上限。
          *
-         * 这是一个**内存保护**，不是产品语义：整库常驻内存是本批次刻意的取舍
+         * 这是一个**内存保护**，不是产品语义：整库常驻内存是刻意的取舍
          *（见 `MediaIndexStore` 类 KDoc），代价必须有个封顶。30000 条 × 约 400B ≈ 12MB/类，
          * 三类最坏约 36MB —— 在 1.5GB 的设备上可接受，而"单类超过 3 万个媒体文件"
          * 对这台随身 WiFi 来说已经是极反常的库。
@@ -248,7 +245,7 @@ class MediaRoutes(
          */
         private const val MAX_INDEX_ITEMS_PER_KIND = 30_000
         /**
-         * 单次 `MediaScannerConnection.scanFile` 的路径数上限（2026-10-12）。
+         * 单次 `MediaScannerConnection.scanFile` 的路径数上限。
          *
          * 5000 个绝对路径一次性跨进程传递会把系统媒体进程顶到 500MB —— 接收端要把整批
          * 读进内存做归类与聚合。200 个约 12KB，Binder 侧安全，接收端峰值内存也可控。
@@ -283,12 +280,11 @@ class MediaRoutes(
         private fun isAllowedDir(abs: String): Boolean =
             ALLOWED_DIR_PREFIXES.any { abs == it || abs.startsWith("$it/") }
 
-        // ─────────────────── 音频分组聚合（/groups，2026-09-20） ───────────────────
+    // ─────────────────── 音频分组聚合（/groups） ───────────────────
 
         /*
-         * 2026-10-13 删掉了 `GROUPS_CACHE_PREFIX = "media:groups"`：
-         * `/groups` 不再走 ResponseCache（改为读 [index] 索引快照 + 内存聚合），
-         * 那个 key 已经没有写入点，留着只会让人以为还存在一层缓存。
+         * `/groups` 不走 ResponseCache（读取 [index] 索引快照 + 内存聚合），
+         * 因此 `GROUPS_CACHE_PREFIX` 这类缓存键已无写入点，不再保留。
          */
 
         /**
@@ -318,9 +314,8 @@ class MediaRoutes(
         private const val MEDIASTORE_UNKNOWN = "<unknown>"
 
         /*
-         * 2026-10-13 删掉了 `GROUPS_PROJECTION`（原来给 `/groups` 用的"只取四列"窄投影）。
-         * 分组现在读索引快照，而快照是按 [projectionOf] 取的完整条目 —— 保留那份窄投影
-         * 只会留下"两个投影必须保持一致"的隐患，而它已经没有任何调用点了。
+         * `/groups` 的窄投影 `GROUPS_PROJECTION` 已删除：分组读取索引快照，
+         * 快照按 [projectionOf] 取完整条目，保留第二份投影只会带来"两个投影必须保持一致"的隐患。
          */
     }
 
@@ -336,7 +331,7 @@ class MediaRoutes(
         }
     }
 
-    /** G5：探测结果扁平化响应（审查修复时从主路径抽出复用）。 */
+    /** 探测结果扁平化响应（从主路径抽出复用）。 */
     private suspend fun respondVideoInfo(
         call: io.ktor.server.application.ApplicationCall,
         id: Long,
@@ -400,7 +395,7 @@ class MediaRoutes(
     /**
      * 这一类已配置的扫描目录（规范化后的绝对路径）。空 = 这一类不限目录。
      *
-     * 2026-09-16 起**按类型各存一份**：媒体中心拆成三个独立页后，每页只改自己那一份，
+     * **按类型各存一份**：媒体中心拆成三个独立页后，每页只改自己那一份，
      * 所以三页各有可写入口也不会互相覆盖。三类扫同一个目录不冲突（MediaStore 分表查）。
      */
     private fun scanDirs(kind: Kind): List<String> {
@@ -427,27 +422,25 @@ class MediaRoutes(
     private fun filterParam(raw: String?): String? = raw?.trim()?.takeIf { it.isNotBlank() }
 
     /*
-     * 2026-10-13 删掉了 `dirSelection` 与 `listSelection`（原来把扫描目录 / album / artist /
-     * dir / 排除名单拼成 MediaStore selection 的那两个函数）。
+     * 列表与分组读取 [index] 内存快照，过滤全部在内存执行，因此不存在把扫描目录 /
+     * album / artist / dir / 排除名单拼成 MediaStore selection 的第二套实现。
+     * 保留 SQL 与内存两条过滤路径会产生两份必须保持一致的逻辑，其中一份难以被测试覆盖，
+     * 容易出现"列表与分组看到的范围不一致"。
      *
-     * 列表与分组现在读 [index] 内存快照，过滤全在内存做，所以这两个函数**没有任何调用点**了。
-     * 保留它们只会留下两条必须保持一致的过滤实现（SQL 一份、内存一份），而其中一份永远不会
-     * 被测试覆盖到 —— 那正是最容易长出"列表和分组看到的范围不一样"这类 bug 的地方。
-     *
-     * 语义搬到了 [filterListItems]（/list）与 `audioGroupsPayload`（/groups），
-     * 两处都逐条注明了对应的是原来哪一句 SQL。**排除名单那个 300 条上限的由来**
-     *（SQLite 绑定变量 999，超了直接抛异常）记在 `MediaExclusionStore` 的类 KDoc 里，
-     * 那条约束在内存过滤路径上已不存在，但上限本身作为产品约束仍然保留。
+     * 语义位于 [filterListItems]（/list）与 `audioGroupsPayload`（/groups）。
+     * 排除名单的 300 条上限源自 SQLite 绑定变量上限（999，超过即抛异常），
+     * 该约束在内存过滤路径上已不存在，但上限本身作为产品约束仍然保留
+     *（详见 `MediaExclusionStore` 的类 KDoc）。
      */
 
     /**
-     * 排序键（2026-10-13 改为内存比较器）。
+     * 排序键（内存比较器）。
      *
-     * 改造前这里返回 MediaStore 的**列名**交给 SQL 排（`sortColumnOf`）。现在数据在内存快照里，
-     * 排序也在内存里做，所以直接给出比较器。刻意不再保留"列名"这一层中间表示：
-     * 那样 SQL 与内存两条路会对同一个 `sort` 参数各解释一遍，迟早不一致。
+     * 数据位于内存快照，排序也在内存中执行，因此直接返回比较器。
+     * 不保留"列名"这一层中间表示：否则 SQL 与内存两条路径会对同一个 `sort` 参数
+     * 各自解释一次，最终必然不一致。
      *
-     * 取值与改造前的列映射一一对应：`name` → DISPLAY_NAME、`size` → SIZE、其它 → DATE_MODIFIED。
+     * 取值与 MediaStore 列映射一一对应：`name` → DISPLAY_NAME、`size` → SIZE、其它 → DATE_MODIFIED。
      * 字符串比较用 Kotlin 默认的码元序，与 SQLite 默认的 BINARY 排序对 ASCII 是一致的。
      */
     private fun listComparator(sort: String?): Comparator<Map<String, Any?>> = when (sort) {
@@ -467,9 +460,9 @@ class MediaRoutes(
     }
 
     /**
-     * `/list` 的过滤（2026-10-13 由 SQL 改为内存，语义逐条对齐原来的 `listSelection`）。
+     * `/list` 的过滤（内存实现，逐条对齐原 SQL 的 `listSelection` 语义）。
      *
-     * 四层条件与原来的 SQL 完全一致：
+     * 四层条件与 SQL 版本完全一致：
      *  1. **扫描目录边界**（所有类型）：`DATA LIKE '<dir>/%'`，**任意深度**。
      *     空列表 = 这一类不限目录。这是用户在设置里划定的媒体库边界。
      *  2. **album / artist 等值**（只对音频）：`ALBUM / ARTIST` 是 `MediaStore.Audio` 独有的列，
@@ -480,9 +473,9 @@ class MediaRoutes(
      *     `LIKE 'dir/%' AND NOT LIKE 'dir/%/%'` 表达，这里用"相对路径不含分隔符"等价实现。
      *  4. **排除名单**（只对音频）：`DATA NOT IN (…)`，即"从音乐库移除"的那些路径。
      *
-     * 与 `MediaExclusionStore` 的 KDoc 呼应：原来那 300 条上限是 **SQLite 绑定变量上限**
-     * 逼出来的（超了直接抛异常）。改成内存 `Set` 判成员之后这个约束在过滤路径上不再存在，
-     * 但上限本身仍保留 —— 它同时是"管理页别无限膨胀"的产品约束，不该因为实现变了就悄悄放开。
+     * 与 `MediaExclusionStore` 的 KDoc 呼应：300 条上限源自 **SQLite 绑定变量上限**
+     *（超过即抛异常）。改为内存 `Set` 判成员后该约束在过滤路径上不再存在，
+     * 但上限本身仍保留 —— 它同时是"管理页不得无限膨胀"的产品约束，不因实现变更而放开。
      */
     private fun filterListItems(
         kind: Kind,
@@ -520,8 +513,8 @@ class MediaRoutes(
      * 游标一行 → 客户端媒体项。
      *
      * `/list`（整库分页）与 `/browse`（单层目录）必须给出**同一种**形状的 item ——
-     * 两边各写一份的话，加字段时总会漏一处，客户端就会出现"列表模式有时长、
-     * 文件夹模式没有"这种莫名差异。
+     * 分别实现时，新增字段总会遗漏一处，客户端会出现"列表模式有时长、
+     * 文件夹模式没有"这类差异。
      */
     private fun itemOf(
         c: Cursor,
@@ -550,8 +543,8 @@ class MediaRoutes(
                 put("album", c.stringOr(MediaStore.Audio.Media.ALBUM))
                 put("artist", c.stringOr(MediaStore.Audio.Media.ARTIST))
                 // 内嵌曲名。系统扫描时已解析好；**没有标签时系统会把文件名
-                // 填进 TITLE**，那不是曲名，要按"没有"处理（见 realTitleOf）。
-                // 列表这一层刻意不逐首解字节 —— 一页几十首就是几十次开文件；
+                // 填进 TITLE**，那不是曲名，应按"没有"处理（见 realTitleOf）。
+                // 列表这一层不逐首解字节 —— 一页几十首就是几十次开文件；
                 // 需要精确标签的场合走 `/api/media/tags`（单首、可缓存）。
                 put("title", realTitleOf(c.stringOr(MediaStore.Audio.Media.TITLE), name))
             }
@@ -602,9 +595,8 @@ class MediaRoutes(
                 base += MediaStore.MediaColumns.DURATION
                 base += MediaStore.Audio.Media.ALBUM
                 base += MediaStore.Audio.Media.ARTIST
-                // 2026-09-16 补 TITLE：这是**内嵌标签里的曲名**（系统扫描时就解析好了），
-                // 与 DISPLAY_NAME（文件名）是两回事。缺它的后果是客户端只能拿文件名当歌名，
-                // 播放页上显示的就是 `带我走-杨丞琳.flac` 这种东西。
+                // 内嵌标签中的曲名（系统扫描时已解析）。与 DISPLAY_NAME（文件名）不同。
+                // 缺少它时客户端只能以文件名作为歌名，播放页会显示带扩展名的文件名。
                 base += MediaStore.Audio.Media.TITLE
             }
 
@@ -616,7 +608,7 @@ class MediaRoutes(
         return base.toTypedArray()
     }
 
-    // ═══════════════════ 索引缓存的取数侧（2026-10-13） ═══════════════════
+    // ═══════════════════ 索引缓存的取数侧 ═══════════════════
 
     /**
      * 拉取**一个 kind 的整库条目**（索引缓存的 loader，由 `init` 注册进 [index]）。
@@ -634,9 +626,8 @@ class MediaRoutes(
      * 两者必须区分：把"没授权"当成空列表，客户端会显示成"这台设备没有媒体"。
      *
      * ## 只查元数据，不解码
-     * 这是与 [thumbnailBytes] 那条路的根本分工 —— 本函数绝不调用任何会解码的 API，
-     * 所以它不参与 471MB 那件事，只是把跨进程查询次数从"每次请求"降到"每 5 分钟"。
-     * （2026-10-13 之前这里写的是"与 systemThumbnail 分工"，那个函数已随系统解码退役而删除。）
+     * 这是与 [thumbnailBytes] 那条路的根本分工 —— 本函数不调用任何会解码的 API，
+     * 因此不产生解码内存压力，只是把跨进程查询次数从"每次请求"降到"每 5 分钟"。
      */
     private suspend fun loadKindUncached(kind: Kind): List<Map<String, Any?>>? =
         withContext(Dispatchers.IO) {
@@ -653,8 +644,8 @@ class MediaRoutes(
                         "${MediaStore.MediaColumns._ID} ASC"
                     )
                 }
-                // 字幕计数的目录缓存：整库构建时一个目录只 listFiles 一次。
-                // 改造前这个 map 只活在单次请求内，滑动列表时同一个目录会被反复扫。
+                // 字幕计数的目录缓存：整库构建时每个目录只 listFiles 一次；
+                // 若仅在单次请求内有效，滑动列表时同一目录会被反复扫描。
                 val subtitleCache = mutableMapOf<String, List<String>>()
                 appContext.contentResolver.query(
                     contentUriOf(kind), projectionOf(kind), args, null
@@ -681,9 +672,9 @@ class MediaRoutes(
     /**
      * 读这一类媒体的条目：**优先内存快照，快照不覆盖时才实时查**。
      *
-     * 正常路径（服务起来预热过、或定时刷新跑过）永远走第 1 条 —— 零跨进程调用。
+     * 正常路径（服务起来预热过、或定时刷新跑过）始终走第 1 条 —— 零跨进程调用。
      * 第 2 条只覆盖"建快照时这一类还没授权、之后才授权"这个窗口，
-     * 走的是**与改造前完全一致**的实时查询，所以既不会退化成空列表，
+     * 走与 SQL 版本一致的实时查询，因此既不会退化成空列表，
      * 也不会在下次刷新（≤5 分钟）或索引失效之后继续走它。
      */
     private suspend fun indexItems(kind: Kind): List<Map<String, Any?>> {
@@ -718,7 +709,7 @@ class MediaRoutes(
             val out = HashMap<String, Map<String, Any?>>(wanted.size)
 
             /*
-             * ① 先用索引快照（2026-10-13）。
+             * ① 先用索引快照。
              *
              * 快照存的是**整库未过滤**条目，正好符合本方法"不受扫描目录约束"的口径
              *（见上方 KDoc），所以可以直接拿来回答。命中率通常接近 100%，
@@ -786,19 +777,12 @@ class MediaRoutes(
     }
 
     /*
-     * ═══ 2026-10-13：系统解码入口整体退役 ═══
+     * ═══ 系统解码入口已整体移除 ═══
      *
-     * 这里原本是 `systemThumbnail(uri, size)` —— 全文件唯一允许出现
-     * `contentResolver.loadThumbnail` 的地方，靠 `thumbSystemSemaphore`（Mutex）串行化，
-     * 用来压住 `android.process.media` 涨到 471MB。
-     *
-     * 现在它和那把闸门都删了，因为**根本不再需要**：ffmpeg 已接入且稳定，图片与音频封面
-     * 本来就不需要 VPU。详见 [thumbnailBytes] 的 KDoc。
-     *
-     * 留下的教训（值得记住，因为它是上一版修复失败的原因）：闸门加在**调用点**上时，
-     * 每新增一个调用点就漏一次 —— 上一版只包了 `thumbnailBytes`，漏了 `audioCoverBytes`
-     * （音频列表热路径、恒定请求 1024px），于是 471MB 照旧复现。
-     * 所以现在的做法不是"给每个调用点加锁"，而是**把那条调用整个删掉**。
+     * 全文件不得出现 `contentResolver.loadThumbnail`。该调用曾以 Mutex 串行化，
+     * 用于限制 `android.process.media` 的内存增长，但闸门加在调用点上时每新增一个调用点
+     * 就会遗漏一次（`audioCoverBytes` 是恒定请求 1024px 的热路径），因此改为
+     * **删除整条调用路径**。
      *
      * 闸门本身没有消失，只是换了语义：见 `MediaDecodeGate`（heavy = ffmpeg 抽帧，
      * light = 图片降采样 / 封面字节读取）。
@@ -841,14 +825,14 @@ class MediaRoutes(
     /**
      * 一次缩略图尝试的结果。
      *
-     * [reason] 是**给人看的失败原因**，会随 404 一起回给客户端。加它的理由（2026-09-16）：
+     * [reason] 是**给人看的失败原因**，会随 404 一起回给客户端。加它的理由：
      * 设备端日志要连 ADB 才能看，而客户端只看到一个"缩略图不可用" ——
      * 权限问题 / 解码栈缺失 / 文件损坏在两侧都长得一样。原因带回去之后，
      * 抓一份 app 的 HTTP 日志就能定位到具体是哪一层。
      *
      * 只包含异常类名与消息，不含路径、token 之类的敏感信息。
      */
-    // source = 供 `X-Thumb-Source` 响应头。2026-10-13 起取值收敛为：
+    // source = 供 `X-Thumb-Source` 响应头。取值收敛为：
     //   cache（落盘命中）| ffmpeg（软解抽帧）| image（图片降采样）|
     //   tag（容器内嵌封面字节解析）| extractor（MMR 读封面原子）
     private data class ThumbnailAttempt(
@@ -866,14 +850,14 @@ class MediaRoutes(
      * | 图片 | `BitmapFactory` 按 `inSampleSize` 降采样 | `MediaDecodeGate.light` |
      * | 音频 | 内嵌封面（`AudioTagReader`）→ MMR 提取器兜底 | `MediaDecodeGate.light` |
      *
-     * ## 为什么不再用系统解码（2026-10-13 的结论，取代此前那条已作废的"不做 ffmpeg"决策）
-     * 此前第一级是 `contentResolver.loadThumbnail()`（MediaProvider），第二级是
-     * `MediaMetadataRetriever` 抽帧。两者走的是**同一套系统 codec 栈**，而本机（随身 WiFi 的
-     * 定制 ROM）桥接不到硬件 VPU：实测 `getFrameAtTime` 恒返回 null、`loadThumbnail` 报
-     * `Failed to create thumbnail`。也就是说这两级在这台设备上**必然失败**，唯一的"收益"是
-     * 让 `android.process.media` 白解一次 —— 那正是它涨到 471MB 且**不回落**的原因。
+     * ## 为什么不用系统解码
+     * 系统解码路径是 `contentResolver.loadThumbnail()`（MediaProvider）与
+     * `MediaMetadataRetriever` 抽帧。两者使用**同一套系统 codec 栈**，而目标设备
+     *（随身 WiFi 的定制 ROM）无法桥接硬件 VPU：实测 `getFrameAtTime` 恒返回 null、
+     * `loadThumbnail` 报 `Failed to create thumbnail`。这两级在该设备上**必然失败**，
+     * 唯一代价是让 `android.process.media` 无谓解码一次 —— 即其内存涨到 471MB 且不回落的原因。
      *
-     * ffmpeg 现已接入且稳定（4KB 页版本的 `libffmpeg_bridge.so`，见 `FfmpegFrameExtractor`），
+     * ffmpeg 已接入且稳定（4KB 页版本的 `libffmpeg_bridge.so`，见 `FfmpegFrameExtractor`），
      * 而图片与音频封面**本来就不需要 VPU**：前者是纯软件解码（libjpeg/skia），
      * 后者只是**读文件头部的字节结构**（见 `AudioTagReader` 的类 KDoc）。所以两级系统解码整体删除。
      *
@@ -934,11 +918,11 @@ class MediaRoutes(
         }
 
         /*
-         * 失败原因要能区分"ffmpeg 不可用"与"这一帧解不出来"（2026-10-13）。
+         * 失败原因要能区分"ffmpeg 不可用"与"这一帧解不出来"。
          *
          * 前者是**整类**失败（视频封面会全空，要重新打包 / 换 ABI / 查 RELRO），
          * 后者只影响这一条。混成同一句话，用户与排查者都只能靠猜 ——
-         * 而这正是本仓反复吃过亏的地方（见 `/thumbnail` 路由 KDoc 里那段可观测性说明）。
+         * 而这属于必须避免的可观测性缺失（见 `/thumbnail` 路由 KDoc）。
          */
         val reason = generated.exceptionOrNull()
             ?.let { "${kind.key} 生成失败 ${it.javaClass.simpleName}: ${it.message}" }
@@ -955,25 +939,25 @@ class MediaRoutes(
     }
 
     /**
-     * 视频封面：**ffmpeg 软解抽帧**（2026-10-13 起是唯一来源）。
+     * 视频封面：**ffmpeg 软解抽帧**（唯一来源）。
      *
      * 挂起、内部串行（`MediaDecodeGate.heavy`）+ 20s 超时 + 超时冷却；
      * 失败返回 null（不是异常），由 [thumbnailBytes] 统一转成 404 + reason。
      *
      * 位置策略：首次传 0，由 JNI 内部取片长 40% 处 —— 不取第 0 帧是因为很多视频首帧是
      * 黑场或渐入，抽出来就是一张纯黑图，那和没有封面没区别。
-     * 暗帧/全零帧的判定不在这里，统一走 `FrameValidator`（G3 四判据），
+     * 暗帧/全零帧的判定不在这里，统一走 `FrameValidator`（四判据），
      * 与"抽帧成功"分开 —— ffmpeg exit 0 只保证解出了一帧，不保证这帧有意义。
      *
-     * 早于 2026-10-13 的版本在本函数之前还有两级：系统缩略图（`loadThumbnail`）与
-     * `MediaMetadataRetriever` 抽帧。两者走同一套坏掉的系统 codec 栈，已整体退役，
+     * 本函数之前不再有系统缩略图与 `MediaMetadataRetriever` 抽帧两级：
+     * 两者使用同一套不可用的系统 codec 栈，已整体移除，
      * 理由见 [thumbnailBytes] 的 KDoc。
      */
     private suspend fun ffmpegThumbnail(uri: android.net.Uri, size: Int): ByteArray? {
         val bytes = com.ufi_axis_core.media.FfmpegThumbnailService
             .extractJpeg(appContext, uri, size, atSeconds = 0.0)
         if (bytes == null) return null
-        // 2026-10-05 G3（修 F5）：ffmpeg exit 0 ≠ 内容有效 —— 全零帧/占位图在这里拦截
+        // ffmpeg exit 0 ≠ 内容有效 —— 全零帧 / 占位图在这里拦截
         when (val v = com.ufi_axis_core.media.FrameValidator.validate(bytes)) {
             is com.ufi_axis_core.media.FrameValidator.Verdict.Valid -> {
                 AppLogger.i(TAG, "ffmpeg 抽帧成功(${bytes.size / 1024}KB)")
@@ -991,19 +975,14 @@ class MediaRoutes(
     }
 
     /*
-     * 2026-10-13 删掉了 `videoFrameThumbnail`（MediaMetadataRetriever 抽帧）与配套的
-     * `Bitmap.averageLuma` / `VIDEO_FRAME_RATIOS` / `VIDEO_FRAME_FALLBACK_US` /
-     * `DARK_LUMA_THRESHOLD` / `LUMA_SAMPLE_GRID`。
-     *
-     * 删它的理由不止"在这台设备上必然失败"（定制 ROM 桥接不到 VPU，`getFrameAtTime` 恒返回
-     * null）——**即使它哪天能用了，它也比 ffmpeg 那条路危险得多**：
-     *  · `getFrameAtTime(OPTION_CLOSEST_SYNC)` 返回的是**全分辨率**帧
-     *    （4K = 3840×2160 ARGB ≈ 33MB），而且原实现对最多 5 个位置循环尝试；
-     *  · 它当时**没有任何并发闸门**，几十个并发请求就是几十份 33MB。
-     * 相比之下 ffmpeg 路径有 `MediaDecodeGate.heavy` 串行、且直接输出目标尺寸。
-     *
-     * 也就是说 MMR 抽帧此前是"没闸门 + 可能一次吃 33MB"，只是靠"本机必然失败"侥幸没事 ——
-     * 那不是设计，是运气。黑帧/全零帧的判定并没有丢：ffmpeg 的输出仍然过 `FrameValidator`。
+     * `videoFrameThumbnail`（MediaMetadataRetriever 抽帧）与配套的 `Bitmap.averageLuma` /
+     * 亮度与位置参数已删除。原因不只是"在该设备上必然失败"（定制 ROM 桥接不到 VPU，
+     * `getFrameAtTime` 恒返回 null）：即使可用，该路径的风险也高于 ffmpeg：
+     *  · `getFrameAtTime(OPTION_CLOSEST_SYNC)` 返回**全分辨率**帧
+     *    （4K = 3840×2160 ARGB ≈ 33MB），原实现对最多 5 个位置循环尝试；
+     *  · 它**没有任何并发闸门**，几十个并发请求即几十份 33MB。
+     * ffmpeg 路径有 `MediaDecodeGate.heavy` 串行，且直接输出目标尺寸。
+     * 黑帧 / 全零帧的判定未丢失：ffmpeg 的输出仍经过 `FrameValidator`。
      */
 
     /**
@@ -1012,7 +991,7 @@ class MediaRoutes(
      * 不整图解码再缩：一张 4000×3000 的照片整图进内存是 48MB，为了一个 256px 的格子不值得，
      * 大图还会直接 OOM。
      *
-     * ⚠️ **调用方必须持有 `MediaDecodeGate.light`**（见 [thumbnailBytes]）。本函数内部
+     * 注意：**调用方必须持有 `MediaDecodeGate.light`**（见 [thumbnailBytes]）。本函数内部
      * **不取**闸门 —— 两处都取会死锁（`Semaphore` 不可重入）。
      */
     private fun downscaledImageThumbnail(uri: android.net.Uri, size: Int): Result<ByteArray?> = runCatching {
@@ -1032,7 +1011,7 @@ class MediaRoutes(
         }
     }
 
-    /** 等比缩到最长边 = [size]（已经更小就原样返回，不放大：放大只会更糊还更费流量）。 */
+    /** 等比缩到最长边 = [size]（已更小时原样返回，不放大：放大只会更模糊并增加流量）。 */
     private fun Bitmap.scaledDown(size: Int): Bitmap {
         val longest = maxOf(width, height)
         if (longest <= size || longest <= 0) return this
@@ -1070,7 +1049,7 @@ class MediaRoutes(
         }
     }.getOrNull()
 
-    // ── 外挂字幕（2026-09-19）──────────────────────────────────────────────
+    // ── 外挂字幕 ──────────────────────────────────────────────
 
     /**
      * 目录 → 该目录下的字幕文件名列表。
@@ -1103,8 +1082,8 @@ class MediaRoutes(
      * 规则：字幕名去掉后缀后，必须等于视频名（`movie.srt`），
      * 或以「视频名 + 分隔符」开头（`movie.zh.srt`、`movie.chs&eng.ass`、`movie - 中文.srt`）。
      *
-     * 为什么不用 `startsWith(base)` 了事：那会让 `movie2.srt` 命中 `movie`，
-     * 同一目录下有 `movie.mp4` / `movie2.mp4` 时字幕就串台了。必须卡住紧跟其后的分隔符。
+     * 不能使用 `startsWith(base)`：那会让 `movie2.srt` 命中 `movie`，
+     * 同一目录下存在 `movie.mp4` / `movie2.mp4` 时字幕会错误匹配。必须校验紧跟其后的分隔符。
      */
     private fun subtitleBelongsTo(subtitleName: String, videoBase: String): Boolean {
         val stem = subtitleName.substringBeforeLast('.', subtitleName)
@@ -1150,8 +1129,8 @@ class MediaRoutes(
      *    ass/ssa 要额外的渲染插件（libass），ttml 则没有通用方案。
      *
      * 所以 web 侧另有一份自己的能力映射（`web/src/composables/subtitleFormat.ts`），
-     * 与这里**刻意不同**。不要为了"统一"把两边合成一份 —— 合了之后必然有一端在说谎：
-     * 要么 web 把 ttml 当能播（选了却什么都不显示），要么 app 把能播的 ass 标成不支持。
+     * 与这里**刻意不同**。不得为了"统一"把两边合成一份 —— 合并后必然有一端描述失真：
+     * 要么 web 把 ttml 当作可播放（选中后无显示），要么 app 把可播放的 ass 标成不支持。
      */
     private fun subtitleEntryOf(file: File, videoBase: String): Map<String, Any?> {
         val ext = file.name.substringAfterLast('.', "").lowercase(Locale.ROOT)
@@ -1193,7 +1172,7 @@ class MediaRoutes(
      *
      * ## 为什么必须由 core 转码
      * 客户端播放器（media3）的字幕解析器按 **UTF-8** 解字节，而中文字幕现实中大量是
-     * GB18030/Big5 —— 直接把原始文件喂给播放器，出来的就是一屏乱码，且播放器不提供
+     * GB18030/Big5 —— 直接把原始文件交给播放器，输出即为一屏乱码，且播放器不提供
      * "换个编码重试"的入口。core 在这里一次转干净，客户端永远只见 UTF-8。
      *
      * 探测顺序（没有第三方依赖，靠解码器自身的合法性判定）：
@@ -1234,8 +1213,8 @@ class MediaRoutes(
      *
      * 三级，从可信到不可信：
      *  1. [AudioTagReader]：直接读容器头部的 FLAC Vorbis Comment / ID3v2 帧。不依赖 codec，
-     *     所以在本机（解不出视频画面的定制 ROM）上照样准 —— 这是 2026-09-16 加它的原因：
-     *     此前只用 `MediaMetadataRetriever`，FLAC 上经常拿回空标签；
+     *     因此在本机（无法解出视频画面的定制 ROM）上仍然准确。仅使用
+     *     `MediaMetadataRetriever` 时，FLAC 经常返回空标签；
      *  2. `MediaMetadataRetriever`：容器本身不认识（m4a 等）时还能捞一把；
      *  3. `MediaStore` 的 title/artist/album：系统扫描的结果，可能是空或 `<unknown>`。
      *
@@ -1335,7 +1314,7 @@ class MediaRoutes(
      * 判断 `MediaStore.Audio.Media.TITLE` 是不是**真的曲名**。
      *
      * 系统扫描到没有标签的文件时，会把去掉扩展名的**文件名**填进 TITLE。原样透出去，
-     * 客户端就会把 `带我走 - 杨丞琳` 当成曲名显示（还压掉了"按分隔符拆成歌名+歌手"的兜底）。
+     * 客户端会把文件名当成曲名显示（还压掉了"按分隔符拆成歌名+歌手"的兜底）。
      * 所以与文件名一致时按"没有标签"处理，回空串。
      */
     private fun realTitleOf(rawTitle: String, displayName: String): String {
@@ -1343,29 +1322,19 @@ class MediaRoutes(
         if (title.isEmpty()) return ""
         val base = displayName.substringBeforeLast('.', missingDelimiterValue = displayName).trim()
         if (title.equals(base, ignoreCase = true)) return ""
-        // 2026-10-13：MediaStore 里的陈旧标题（用户真机报"歌名后面跟一串英文乱码"）。
+        // MediaStore 中的陈旧标题。
         //
-        // 真实样本：
-        //   磁盘上真正的文件名：  阳光下的星星-金海心.flac
-        //   MediaStore 里的 TITLE：阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2
+        // 现象：文件下载时以临时名被扫入 MediaStore，之后被改名为正常名称，但 MediaStore
+        // 未重新扫描，导致 TITLE 中残留「基名 + 扩展名 + 分片字节数 + 下载器临时标记」。
+        // 该残留不是编码问题（不是 GBK / UTF-8 嗅探错误）。
         //
-        // 那个 `29894902` 是下载分片的字节数、`_CEujVT6XmHgTkI2` 是网易云音乐的临时文件标记 ——
-        // 所以这**不是编码乱码**（不是 GBK/UTF-8 嗅探错），而是：文件下载时以临时名被扫进
-        // MediaStore，之后被改名成正常名字，但 MediaStore 没有重新扫，那条 TITLE 就烂在库里了。
+        // 原逻辑只挡"TITLE == 文件名基名"，与基名不一致的陈旧标题会被当作真曲名透出。
         //
-        // 老逻辑只挡"TITLE == 文件名基名"，这条烂标题与基名不一致（多了 `.flac.29894902._CE…`），
-        // 于是被当成真曲名原样透出去，显示成"阳光下的星星 -金海心.flac.29894902._CEujVT6XmHgTkI2"。
+        // 判据：**归一化后以基名开头、且比基名更长** —— 多出的部分即下载残留。
+        // 归一化是必需的：MediaStore 与磁盘名之间常存在空格差异。
         //
-        // 这里按"陈旧扫描"特征识别并丢弃，回空串让客户端走文件名兜底
-        // （`splitFileNameTitleArtist` 能正确拆出 `阳光下的星星` + `金海心`）。
-        //
-        // 判据只有一条：**归一化后以基名开头、且比基名更长** —— 多出来的那截正是下载残留
-        //（`.flac.29894902._CEujVT6XmHgTkI2`）。归一化是必需的：样本里基名是
-        // `阳光下的星星-金海心` 而 TITLE 是 `阳光下的星星 -金海心…`，**多了一个空格**。
-        //
-        // 刻意**没有**采用"点数 ≥ 2 就当陈旧"这种更宽的规则：它会把
-        // `Dr. A. Livingstone` 这类真实存在的曲名判掉。宁可漏判（多显示几秒残缺名，
-        // 下次重扫 MediaStore 就好了）也不能误伤真曲名。
+        // 不采用"点数 ≥ 2 即视为陈旧"等更宽的规则：那会误判 `Dr. A. Livingstone`
+        // 这类真实曲名。宁可漏判（短暂显示残缺名，重新扫描后恢复），也不误伤真曲名。
         val t = title.normalizedTitleKey()
         val b = base.normalizedTitleKey()
         val looksStale = b.isNotEmpty() && t.length > b.length && t.startsWith(b)
@@ -1375,9 +1344,8 @@ class MediaRoutes(
     /**
      * 曲名比较用的归一化：去空白 + 转小写 + 全角转半角。
      *
-     * 样本里基名是 `阳光下的星星-金海心` 而TITLE 是 `阳光下的星星 -金海心.flac.29894902._CE…`
-     * ——**多了一个空格**。MediaStore 与磁盘名不一致的空格/全角在中文歌名上很常见，
-     * 不归一化就永远判不出"它是同一个名字的旧版本"。
+     * MediaStore 与磁盘文件名之间常存在空格 / 全角差异（中文歌名尤其常见），
+     * 不归一化就无法判定"它是同一名称的旧版本"。
      */
     private fun String.normalizedTitleKey(): String =
         trim().lowercase().replace('\u3000', ' ').replace(Regex("\\s+"), "")
@@ -1404,13 +1372,13 @@ class MediaRoutes(
     )
 
     /**
-     * 音频封面（2026-10-13 重写：**不再调用系统解码**）。
+     * 音频封面（**不调用系统解码**）。
      *
      * ## 三级（顺序即优先级）
-     *  1. **落盘缓存**（[coverCacheRead]）→ 零解码、零文件读。这一层是本次修复的关键：
-     *     `/cover` 原来是**纯实时**的，而列表是**按行**请求封面的
+     *  1. **落盘缓存**（[coverCacheRead]）→ 零解码、零文件读。该层是避免解码风暴的关键：
+     *     `/cover` 若为**纯实时**，而列表是**按行**请求封面
      *     （`MediaAudioGroupList` 的 LazyColumn 每行一个 `MediaThumb(url = coverUrl(entry))`），
-     *     滑动就是几十个并发解码。
+     *     滑动即产生几十个并发解码。
      *  2. **[AudioTagReader.readCover]** → 解 ID3v2 `APIC` / FLAC `PICTURE`。
      *     封面只是**容器头部的字节结构**，与文本标签一样不需要任何解码能力
      *     （见那个类的 KDoc）。这是 core 自有的主路径。
@@ -1418,17 +1386,17 @@ class MediaRoutes(
      *     只读容器里的封面原子、不碰 codec —— MP4/M4A 的 `covr` 走的就是这条，
      *     而 `AudioTagReader` 目前不解析 MP4 原子，所以没有它 M4A 封面就没有来路。
      *
-     * ## 删掉了什么
-     * 原来的第 3 级是 `contentResolver.loadThumbnail()`（MediaProvider **解码**），
-     * 而且因为 `thumbnailBytes` 也会先调一次，**一次音频缩略图请求最多能触发两次**
-     * MediaProvider 解码。那是 471MB 的元凶之一，现已整体退役。
+     * ## 不再调用系统解码
+     * 原第 3 级是 `contentResolver.loadThumbnail()`（MediaProvider **解码**），
+     * 且因 `thumbnailBytes` 也会先调用一次，**一次音频缩略图请求最多触发两次**
+     * MediaProvider 解码。该路径已整体移除。
      *
-     * ## 为什么不再有 size 参数
-     * 内嵌封面是**原图字节**，不重新编码 —— 要"小图"是客户端缩放的事（它本来就要按不同尺寸
-     * 显示），core 侧缩放只会平白损失画质并多做一次编码。原来那个 `size` 只服务于
-     * `loadThumbnail`，随它一起消失。
+     * ## 为什么没有 size 参数
+     * 内嵌封面是**原图字节**，不重新编码 —— 需要小图时由客户端缩放（客户端本就按不同尺寸
+     * 显示），core 侧缩放只会损失画质并多做一次编码。原 `size` 只服务于
+     * `loadThumbnail`，已随之移除。
      *
-     * ⚠️ **调用方必须持有 `MediaDecodeGate.light`**（见 [thumbnailBytes] 与 `/cover`）。
+     * 注意：**调用方必须持有 `MediaDecodeGate.light`**（见 [thumbnailBytes] 与 `/cover`）。
      * 本函数内部**不取**闸门 —— 两处都取会死锁（`Semaphore` 不可重入）。
      *
      * @return null = 确实拿不到封面，由调用方回 404 并写冷却标记。
@@ -1464,7 +1432,7 @@ class MediaRoutes(
             }
         }.getOrNull()
         if (embedded != null && embedded.isNotEmpty()) {
-            // 内嵌封面常见是 JPEG，也可能是 PNG：按魔数判，别一律声明成 JPEG
+            // 内嵌封面常见是 JPEG，也可能是 PNG：按魔数判定，不得一律声明为 JPEG
             val isPng = embedded.size > 8 && embedded[0] == 0x89.toByte() &&
                 embedded[1] == 'P'.code.toByte()
             val type = if (isPng) ContentType.Image.PNG else ContentType.Image.JPEG
@@ -1475,7 +1443,7 @@ class MediaRoutes(
         return null
     }
 
-    // ─────────────────── 音频封面的落盘缓存（2026-10-13） ───────────────────
+    // ─────────────────── 音频封面的落盘缓存 ───────────────────
 
     /**
      * 封面缓存文件。按 (id, 扩展名) 编 —— 扩展名就是**内容类型**的载体：
@@ -1503,9 +1471,9 @@ class MediaRoutes(
     /**
      * 记一次"这张确实取不到封面"。
      *
-     * 没有它的话，一张无封面的歌每次列表刷新都会重跑一遍
-     * `AudioTagReader.readCover` + MMR 提取 —— 那是"滑动时解码风暴"的另一个来源。
-     * 冷却期与 `ThumbPrewarmWorker.FAIL_COOLDOWN_MS` 取同一个值（6h），口径一致。
+     * 否则一张无封面的歌每次列表刷新都会重跑一遍
+     * `AudioTagReader.readCover` + MMR 提取，形成滑动时的解码风暴。
+     * 冷却期与 `ThumbPrewarmWorker.FAIL_COOLDOWN_MS` 取同一值（6h），口径一致。
      *
      * 原子写：半写的 `.fail` 会把时间戳写坏 → `toLongOrNull()` 得 0 → 冷却失效。
      */
@@ -1555,7 +1523,7 @@ class MediaRoutes(
     }
 
 
-    // ═══════════════════ 音频分组聚合（/groups，2026-09-20） ═══════════════════
+    // ═══════════════════ 音频分组聚合（/groups） ═══════════════════
 
     /**
      * 分组维度。
@@ -1574,8 +1542,8 @@ class MediaRoutes(
     /**
      * 聚合过程中的可变累加器。
      *
-     * 一次游标遍历就把三种维度需要的东西都攒齐，**不对每个分组再回查一次库** ——
-     * 那是 N+1：500 个专辑就是 501 次 MediaStore 查询，在这台设备上是秒级的事。
+     * 一次游标遍历即收集三种维度所需的数据，**不对每个分组回查数据库** ——
+     * 否则即 N+1：500 个专辑就是 501 次 MediaStore 查询，在本设备上为秒级开销。
      */
     private class GroupAccumulator {
         var count = 0
@@ -1621,13 +1589,13 @@ class MediaRoutes(
     /**
      * 按 [by] 把音频聚合成分组列表。
      *
-     * ## 2026-10-13：从「每次整表扫」改成「读索引快照」
-     * 原来每次调用都现场 `query` 整张音频表（几千行游标推进），而客户端在音乐页里来回切
-     * 专辑 / 歌手 / 文件夹三个视图就是三次整表扫描。现在数据来自 [index] 的内存快照
-     *（后台每 5 分钟刷一次），这里只做纯内存聚合。
+     * ## 数据源：索引快照
+     * 每次调用不再现场 `query` 整张音频表（几千行游标推进），而客户端在音乐页里切换
+     * 专辑 / 歌手 / 文件夹三个视图即三次整表扫描。数据来自 [index] 的内存快照
+     *（后台每 5 分钟刷新一次），此处只做纯内存聚合。
      *
-     * 顺带不再需要原来那份"只取四列"的窄投影 `GROUPS_PROJECTION` —— 快照本来就是为了
-     * 列表页取的完整条目，聚合直接用同一份；少一套投影就少一处会跟 `projectionOf` 写岔的地方。
+     * 因此也不再需要"只取四列"的窄投影 `GROUPS_PROJECTION`：快照本就为列表页取完整条目，
+     * 聚合直接复用同一份，可避免第二套投影与 `projectionOf` 不一致。
      *
      * 目录过滤沿用 [scanDirs]（与 `/list` 同一口径）：分组视图与列表视图看到的必须是同一个
      * 媒体库范围，否则会出现"分组里有 12 首、点进去只有 8 首"。
@@ -1719,11 +1687,11 @@ class MediaRoutes(
     fun register(route: Route) {
         route.route("/media") {
 
-            // ── 「从音乐库移除」排除名单（2026-09-23）────────────────────────
+            // ── 「从音乐库移除」排除名单 ────────────────────────
             //
-            // 语义边界：这组接口**只动名单，永远不动文件**。删文件是
-            // `POST /api/files/delete` 的事，两者刻意分开 —— 一个可撤销、一个不可逆，
-            // 混在一个接口里用参数区分，迟早有客户端传错那个参数。
+            // 语义边界：这组接口**只操作名单，不修改文件**。删除文件由
+            // `POST /api/files/delete` 负责，两者刻意分开 —— 一个可撤销、一个不可逆，
+            // 混在同一接口中用参数区分，客户端容易误传参数。
 
             /** 当前排除名单。客户端用它渲染「已从音乐库移除的歌曲」管理页。 */
             get("/excluded") {
@@ -1789,13 +1757,13 @@ class MediaRoutes(
                     }
                 }
 
-                // 名单变了，列表结果就变了。不失效的话客户端刷出来还是旧的那一份，
-                // 用户会以为"移除没生效"。
+                // 名单变更后列表结果随之变化。不失效会使客户端读到旧数据，
+                // 用户会认为"移除未生效"。
                 //
-                // 2026-10-13：主失效对象改成 [index] 快照 —— 列表与分组都从它读。
-                // 快照存的是**未过滤**的整库条目，排除名单是读时才套的，所以严格说
-                // 连失效都不必要（下一次读自然就用上新名单了）；这里仍然清一次是保守做法，
-                // 代价只是下一次读重拉一轮。`media:*` 那行保留：它还被 FileRoutes 的删除路径共用。
+                // 主失效对象是 [index] 快照 —— 列表与分组都从它读取。
+                // 快照存的是**未过滤**的整库条目，排除名单在读时才应用，严格说
+                // 无需失效（下一次读自然使用新名单）；此处仍清除一次是保守做法，
+                // 代价只是下一次读重新拉取一轮。`media:*` 那行保留：FileRoutes 的删除路径也使用它。
                 index.invalidate()
                 cache.invalidate("media:*")
 
@@ -1813,8 +1781,8 @@ class MediaRoutes(
             /**
              * 三类媒体各自的授权状态 + 当前扫描目录。
              *
-             * 客户端据此决定"这个分栏是显示列表、还是显示未授权引导" —— 不许在没权限时
-             * 显示一个空列表（那就是骗用户"设备里没有视频"）。
+             * 客户端据此决定"这个分栏是显示列表、还是显示未授权引导" —— 不得在无权限时
+             * 显示空列表（会使客户端误判为设备上没有视频）。
              */
             get("/status") {
                 call.respond(
@@ -1831,12 +1799,12 @@ class MediaRoutes(
             }
 
             /**
-             * 列某一类媒体。分页 + 排序 + 目录过滤都在 SQL 侧完成，不把整表拉进内存。
+             * 列某一类媒体。分页 + 排序 + 目录过滤在内存快照上完成，不把整表传给客户端。
              *
              * `total` 单独数一次（同 selection、只取 _ID）：客户端要用它算"还有没有下一页"，
              * 而 `items.size` 只能说明这一页有多少。
              *
-             * ## 可选过滤：album / artist / dir（2026-09-20）
+             * ## 可选过滤：album / artist / dir
              * 给「音频分组」用的回查入口 —— `/groups` 给出分组的 `key`，客户端把它原样送回
              * 对应参数就能拿到组内曲目，core 侧不需要为"专辑详情"再开一个端点。
              * 三个参数只对 `type=audio` 生效（理由见 [filterListItems]），与扫描目录过滤是 AND。
@@ -1845,7 +1813,7 @@ class MediaRoutes(
              * 叠内存缓存只会多出一份要失效的状态 —— 所以过滤参数也不存在"串缓存"的问题。
              */
             /**
-             * 2026-10-05 G5（FFmpeg 接入计划书 §4.1）：视频元信息探测。
+             * 视频元信息探测。
              *
              * ## 为什么需要它
              * `/list` 的 duration/width/height 全来自 MediaStore 列，而本机 MediaProvider
@@ -1854,8 +1822,8 @@ class MediaRoutes(
              *
              * ## 缓存策略
              * 媒体文件不可变：结果落 filesDir/video_info/ 缓存（单条 <1KB）。探测走 ffmpeg
-             * （fd 通道 + 20s 超时）。注意：缓存目录不做 rescan 清理（2026-10-05 审查修正，
-             * 此前注释误称会清理）——MediaStore id 复用时旧结果会一直命中，量级可忽略
+             * （fd 通道 + 20s 超时）。注意：缓存目录不做 rescan 清理 —— MediaStore id 复用时
+             * 旧结果会一直命中，量级可忽略（单文件 <1KB）；DELETE /thumbnail-cache 在清视频/全量时连带清 video_info/。
              * （单文件 <1KB）；DELETE /thumbnail-cache 在清视频/全量时连带清 video_info/。
              *
              * 404：无法解析（损坏/不支持容器/ffmpeg 不可用）——reason 随 404 带回；
@@ -1875,7 +1843,7 @@ class MediaRoutes(
                 val json = if (cacheFile.isFile) {
                     withContext(Dispatchers.IO) { cacheFile.readBytes().decodeToString() }
                 } else {
-                    // 404 冷却（审查修复）：冷却期内直接回 404，不再重探
+                    // 404 冷却：冷却期内直接回 404，不再重探
                     if (failMark.isFile) {
                         val until = withContext(Dispatchers.IO) {
                             runCatching { failMark.readText().trim().toLongOrNull() }.getOrNull()
@@ -1892,7 +1860,7 @@ class MediaRoutes(
                     val probed = com.ufi_axis_core.media.FfmpegThumbnailService
                         .probeVideoInfo(appContext, uri)
                     if (probed == null) {
-                        // 2026-10-05 审查修复：404 也落冷却标记（6h），坏文件不再反复打满探测槽位
+                        // 404 也落冷却标记（6h），坏文件不再反复占满探测槽位
                         withContext(Dispatchers.IO) {
                             runCatching {
                                 failMark.parentFile?.mkdirs()
@@ -1910,7 +1878,7 @@ class MediaRoutes(
                     withContext(Dispatchers.IO) {
                         runCatching {
                             cacheFile.parentFile?.mkdirs()
-                            // 唯一临时名（审查修复）：并发 miss 不互踩同一 tmp
+                            // 唯一临时名：并发 miss 不互相覆盖同一 tmp
                             val tmp = File(
                                 cacheFile.parentFile,
                                 cacheFile.name + "." + java.util.UUID.randomUUID() + ".tmp"
@@ -1923,13 +1891,13 @@ class MediaRoutes(
                     probed
                 }
 
-                // 解析 JNI JSON → 扁平响应（计划书 §4.1 口径：duration_ms/width/... + source）
+                // 解析 JNI JSON → 扁平响应（duration_ms/width/... + source）
                 val obj = runCatching {
                     kotlinx.serialization.json.Json.parseToJsonElement(json)
                         .let { it as kotlinx.serialization.json.JsonObject }
                 }.getOrNull()
                 if (obj == null) {
-                    // 2026-10-05 审查修复：坏缓存自愈——删除后重新探测，不再永久 500
+                    // 坏缓存自愈：删除后重新探测，不再永久 500
                     withContext(Dispatchers.IO) { runCatching { cacheFile.delete() } }
                     val probed = com.ufi_axis_core.media.FfmpegThumbnailService
                         .probeVideoInfo(appContext, uri)
@@ -2010,18 +1978,18 @@ class MediaRoutes(
                 val dirFilter = filterParam(call.request.queryParameters["dir"])?.trimEnd('/')
 
                 /*
-                 * 2026-10-13：数据源从「现场查 MediaStore」改成 [index] 内存快照。
+                 * 数据源为 [index] 内存快照。
                  *
-                 * 改造前这里每次请求都要跨进程跑**两条**查询（一条 `_ID` 计数拿 total、
-                 * 一条带排序与分页拿当页），滑动列表就是几十次 IPC 打到 android.process.media。
-                 * 现在取一次快照（后台每 5 分钟刷新），过滤 / 排序 / 分页全在内存里做。
+                 * 若每次请求都跨进程执行**两条**查询（一条 `_ID` 计数拿 total、
+                 * 一条带排序与分页拿当页），滑动列表即几十次 IPC 到 android.process.media。
+                 * 现在取一次快照（后台每 5 分钟刷新），过滤 / 排序 / 分页全部在内存执行。
                  *
-                 * 语义逐条对齐了原来的 SQL：
+                 * 语义逐条对齐 SQL 版本：
                  *  · 扫描目录 = `DATA LIKE '<dir>/%'`（任意深度）；
                  *  · 排除名单 = `DATA NOT IN (…)`，只对音频生效；
-                 *  · album / artist = 等值，只对音频生效（视频/图片忽略，与改造前一致）；
+                 *  · album / artist = 等值，只对音频生效（视频/图片忽略，与原行为一致）；
                  *  · dir = 只要**直接位于**该目录下的文件（原 `LIKE 'dir/%' AND NOT LIKE 'dir/%/%'`）；
-                 *  · total = 过滤后的**总数**（不是当页条数），分页在排序之后做。
+                 *  · total = 过滤后的**总数**（不是当页条数），分页在排序之后执行。
                  */
                 withContext(Dispatchers.IO) {
                     val matched = filterListItems(
@@ -2090,13 +2058,13 @@ class MediaRoutes(
                     return@get
                 }
 
-                // 2026-10-13：去掉了原来叠在这里的 ResponseCache（`media:groups:*`）。
-                // 聚合的数据源已经是 [index] 的内存快照（后台每 5 分钟刷一次），
-                // 聚合本身是纯内存遍历（几百个分组），再套一层 JSON 缓存只多一处失效点：
-                // 排除名单变更 / 扫描目录变更 / 索引刷新三件事都得记得把它清掉，
-                // 漏一个用户就看到陈旧分组。直接算，反正不比查表慢。
+                // 不叠加 ResponseCache（`media:groups:*`）。
+                // 聚合的数据源已是 [index] 内存快照（后台每 5 分钟刷新），
+                // 聚合本身是纯内存遍历（几百个分组），再套一层 JSON 缓存只会增加失效点：
+                // 排除名单变更 / 扫描目录变更 / 索引刷新三件事都必须记得清除它，
+                // 遗漏任一即导致客户端读到陈旧分组。直接计算不慢于查表。
                 //
-                // `by` 仍要区分（三个视图各算一份），但那是入参，不再是缓存 key 的一部分。
+                // `by` 仍需区分（三个视图各算一份），但它是入参，不是缓存 key 的一部分。
                 call.respond(withContext(Dispatchers.IO) { toJsonElement(audioGroupsPayload(by)) })
             }
 
@@ -2184,12 +2152,12 @@ class MediaRoutes(
 
                 withContext(Dispatchers.IO) {
                     /*
-                     * 2026-10-13：与 /list 一样改为读 [index] 内存快照。
+                     * 与 /list 一样读取 [index] 内存快照。
                      *
-                     * 改造前这里最坏要跑 1 + 200 条跨进程查询（本层文件 1 条，每个子目录再 1 条
-                     * 拿计数与封面）—— MAX_BROWSE_FOLDERS 就是 200，进一次文件夹视图
-                     * 就是两百次 IPC 打到 android.process.media。现在按路径前缀在内存里聚合，
-                     * 一次跨进程调用都没有。
+                     * 若现场查询，最坏要执行 1 + 200 条跨进程查询（本层文件 1 条，每个子目录再 1 条
+                     * 取计数与封面）—— MAX_BROWSE_FOLDERS 即 200，进入一次文件夹视图
+                     * 就是两百次 IPC 到 android.process.media。现在按路径前缀在内存中聚合，
+                     * 无任何跨进程调用。
                      */
                     val all = indexItems(kind)
 
@@ -2300,7 +2268,7 @@ class MediaRoutes(
                         return@get
                     }
                     call.response.header(HttpHeaders.ETag, cachedEtag)
-                    // 2026-10-05 G4：来源标记 —— 客户端可区分"真出图"与"404 兜底"，
+                    // 来源标记 —— 客户端可区分"真出图"与"404 兜底"，
                     // app 端据此决定是否触发本机抽帧回传（X-Thumb-Source: cache = 已有图，不抽）
                     call.response.header("X-Thumb-Source", "cache")
                     call.response.header(HttpHeaders.CacheControl, "private, max-age=86400")
@@ -2325,10 +2293,10 @@ class MediaRoutes(
                 val bytes = attempt.bytes
                 if (bytes == null || bytes.isEmpty()) {
                     /*
-                     * 失败原因随 404 一起回去（2026-09-16）。
+                     * 失败原因随 404 一起返回。
                      *
-                     * 设备端日志要连 ADB 才看得到，而客户端原来只拿到一句"缩略图不可用" ——
-                     * 权限被拒、解码栈缺失、文件损坏在两侧长得完全一样，等于没有可观测性。
+                     * 设备端日志需连接 ADB 才能查看，而客户端原先只得到一句"缩略图不可用" ——
+                     * 权限被拒、解码栈缺失、文件损坏在两侧表现完全相同，等同于没有可观测性。
                      * 现在 message 里带异常类型与消息（不含路径与凭据），抓一份客户端 HTTP 日志
                      * 就能定位到是哪一层。
                      */
@@ -2340,30 +2308,29 @@ class MediaRoutes(
                     return@get
                 }
                 call.response.header(HttpHeaders.ETag, etag)
-                // 2026-10-05 G4：system=系统缩略图 / mmr=自行抽帧 / ffmpeg=软解（attempt.source 由链路带回）
+                // 来源标记：ffmpeg=软解 / image=图片降采样 / tag=内嵌封面 / cache=落盘命中（attempt.source 由链路带回）
                 call.response.header("X-Thumb-Source", attempt.source)
                 call.response.header(HttpHeaders.CacheControl, "private, max-age=86400")
                 call.respondBytes(bytes, ContentType.Image.JPEG)
             }
 
             /*
-             * ═══ 2026-10-13：删除了 `PUT /thumbnail`（客户端回传抽好的帧）═══
+             * ═══ `PUT /thumbnail`（客户端回传抽好的帧）已删除 ═══
              *
-             * 它存在的理由是「谁有解码能力谁干活」：core 那台设备解不出视频画面，
-             * 所以让手机把帧抽好交上来，core 只存与发。ffmpeg 接入并稳定之后这个理由消失了
-             *（core 自己就能抽），而**两个客户端都已不再调用它** ——
-             * app 侧注释写明「本机抽帧兜底已整体删除」，web 侧从来没有过。
+             * 它存在的理由是「谁有解码能力谁干活」：core 无法解出视频画面时，由手机抽帧后交上来，
+             * core 只负责存储与下发。ffmpeg 接入并稳定后该理由消失（core 自身即可抽帧），
+             * 且**两个客户端都不再调用它**（app 侧的本机抽帧兜底已删除，web 侧从未使用）。
              *
-             * 于是它只剩成本：一个接收 ≤512KB 任意 JPEG 的写入口、一套内容校验、
-             * 以及"缓存目录会被塞进孤儿文件"的风险面。留着是纯负债，直接删。
+             * 保留它只剩成本：一个接收 ≤512KB 任意 JPEG 的写入口、一套内容校验，
+             * 以及缓存目录被写入孤儿文件的风险。
              *
-             * 覆盖式写入的能力没有丢：`ThumbPrewarmWorker` 与 GET 路径都会按 (type,id)
-             * 原子落盘同一批 `filesDir/thumbs/<type>_<id>.jpg`，需要重抽时用
-             * `DELETE /thumbnail-cache?type=&id=` 清掉再拉即可（app 的「手动重抽封面」走的就是它）。
+             * 覆盖式写入能力没有丢失：`ThumbPrewarmWorker` 与 GET 路径都会按 (type,id)
+             * 原子落盘同一批 `filesDir/thumbs/<type>_<id>.jpg`；需要重抽时用
+             * `DELETE /thumbnail-cache?type=&id=` 清除后重新拉取（app 的「手动重抽封面」使用该路径）。
              */
 
             /**
-             * 清空**设备侧**的缩略图缓存（2026-09-20）。
+             * 清空**设备侧**的缩略图缓存。
              *
              * ## 为什么必须有这条
              * 缩略图一共有三层缓存，缺了这条就有一层永远清不掉：
@@ -2372,9 +2339,9 @@ class MediaRoutes(
              *  3. **本目录**（`filesDir/thumbs/`，客户端回传的成果）。
              *
              * `/thumbnail` 是"缓存命中就直接返回"，而 URL 只含 (type, id) 不含内容指纹 ——
-             * 于是一旦某张图算错了（典型：抽到黑场），它会一直被原样发下去。
-             * 之前客户端只能清掉第 2 层，清完再请求又被本层的旧图命中，
-             * 表现就是"怎么清都还是那张黑图"。
+             * 一旦某张图计算错误（典型：抽到黑场），它会一直按原样下发。
+             * 若只能清理第 2 层，清理后再次请求仍会命中本层的旧图，
+             * 表现为"清理后仍是同一张错误封面"。
              *
              * `type` 省略则清全部；给了就只清那一类（换了抽帧策略时通常只需要重算视频）。
              */
@@ -2388,15 +2355,15 @@ class MediaRoutes(
                     )
                     return@delete
                 }
-                // 2026-10-07：可选 id —— 传了就只清那一条（手动"重新获取封面"用），
-                // 不带 id 保持整类/全部清空的旧语义，老客户端不受影响。
+                // 可选 id —— 传了就只清那一条（手动"重新获取封面"用），
+                // 不带 id 保持整类/全部清空的既有语义，旧客户端不受影响。
                 val singleId = call.request.queryParameters["id"]?.toLongOrNull()
-                // video_info/ 一并清（2026-10-05 审查遗留补口）：探测缓存与 .fail 冷却标记
+                // video_info/ 一并清：探测缓存与 .fail 冷却标记
                 // 都随"换抽帧策略/排查黑图"的场景该重置；只在清视频（或不带 type）时清，
                 // 音频/图片场景与它无关。
                 val clearVideoInfo = kind == null || kind == Kind.VIDEO
                 val result = if (singleId != null) {
-                    // 2026-10-07：单条路径 —— 封面缓存 + video_info（探测缓存/冷却标记）各删一份，
+                    // 单条路径 —— 封面缓存 + video_info（探测缓存/冷却标记）各删一份，
                     // 汇总口径与整类清除一致（removed=0 时不报错，调用方按语义当"本来就没有"）。
                     withContext(Dispatchers.IO) {
                         val cache = thumbCacheDir()
@@ -2463,7 +2430,7 @@ class MediaRoutes(
             }
 
             /**
-             * 2026-10-07：手动跑一轮封面预热（app 设置页「立即预热」按钮）。
+             * 手动执行一轮封面预热（app 设置页「立即预热」按钮）。
              * 忽略闲时门（手动=现在就要跑），总开关仍需开启；重复点击被 Worker 的
              * start/stop 互斥挡住（返回 busy）。
              */
@@ -2489,11 +2456,11 @@ class MediaRoutes(
             }
 
             /**
-             * 2026-10-07：封面预热状态查询（GET /thumbnail-prewarm）。
+             * 封面预热状态查询（GET /thumbnail-prewarm）。
              *
-             * 解决"点击立即预热后退出页面、重进看不到任何状态"——之前进度只活在
-             * WS 广播里，页面不在就丢了。现在 Worker 每处理一条都落盘快照，
-             * 这里读回快照 + 内存实时值：`snapshot=false` 表示 core 重启后还没跑过任何一轮。
+             * 用于解决"点击立即预热后退出页面、重新进入时无任何状态"的问题：若进度只存在于
+             * WS 广播中，页面不在时即丢失。Worker 每处理一条都落盘快照，
+             * 这里读回快照 + 内存实时值：`snapshot=false` 表示 core 重启后尚未跑过任何一轮。
              */
             get("/thumbnail-prewarm") {
                 val p = com.ufi_axis_core.media.ThumbPrewarmWorker.readPersisted(appContext)
@@ -2521,7 +2488,7 @@ class MediaRoutes(
             /**
              * 音频封面（**原始内嵌图字节**，不重新编码）。
              *
-             * 与 `/thumbnail?type=audio` 分开的理由：那个是给**列表**用的（可缓存、能糊），
+             * 与 `/thumbnail?type=audio` 分开的理由：那个供**列表**使用（可缓存、允许有损），
              * 这个是给**播放页**用的，要的是尽量清楚。内嵌封面本身就是原图字节，
              * 直接透传不重新编码是能拿到的最高画质 —— 也因此它**不再有 size 参数**：
              * 要小图是客户端缩放的事，core 侧缩放只会白丢画质还多一次编码。
@@ -2547,7 +2514,7 @@ class MediaRoutes(
                     return@get
                 }
 
-                // 2026-10-13 改动：
+                // 行为约束：
                 //  ① 冷却中的"确实没封面"直接 404，不重复跑字节解析 + MMR 提取；
                 //  ② 取不到时写冷却标记，否则每次列表刷新都会重跑一遍；
                 //  ③ 过 MediaDecodeGate.light（音频封面读取属于"轻解码"）——
@@ -2575,7 +2542,7 @@ class MediaRoutes(
              *
              * **只找旁挂文件**：MediaStore 不索引歌词，`MediaMetadataRetriever` 也没有歌词字段，
              * 想读 ID3 的 USLT 帧就得在 core 里塞一个 ID3 解析器 —— 那是另一件事。
-             * 找不到就如实回 `found = false`，让客户端显示"没有歌词"，而不是拿文件名假装一行歌词。
+             * 找不到就如实回 `found = false`，让客户端显示"没有歌词"，而不是以文件名充当歌词。
              *
              * 时间轴解析（`[mm:ss.xx]`）留在客户端：那是纯展示格式化，且高亮要跟着播放进度走。
              */
@@ -2613,7 +2580,7 @@ class MediaRoutes(
             }
 
             /**
-             * 某个视频可用的**外挂字幕列表**（2026-09-19）。
+             * 某个视频可用的**外挂字幕列表**。
              *
              * ## 为什么必须由 core 来列
              * `/list` 与 `/browse` 的数据来自 MediaStore 的视频集合，而 `.srt` 不是视频，
@@ -2628,7 +2595,7 @@ class MediaRoutes(
              *    现实里字幕名和视频名经常对不上（压制组命名、单独下载的字幕包）。
              *
              * `supported = false` 的条目照样返回（MicroDVD `.sub`、SAMI `.smi`）：
-             * 让客户端显示"格式不支持"，而不是让用户对着目录里明明存在的文件怀疑 App 瞎了。
+             * 让客户端显示"格式不支持"，而不是让用户怀疑 App 漏掉了目录中确实存在的文件。
              */
             get("/subtitles") {
                 val videoPath = call.request.queryParameters["path"]
@@ -2640,12 +2607,13 @@ class MediaRoutes(
                     return@get
                 }
                 // 远端存储源（`remote:<id>/…`）：回**空列表**而不是 400。
-                // 2026-09-21：播放器打开任何视频都会先探一次字幕，远端路径过不了
-                // `safeUserFile`（它只认本机用户存储），于是每次播远端视频都在日志里
-                // 留一条 `HTTP 400 path 必须是用户存储内的真实文件` —— 那看起来像是
-                // 播放失败的原因，实际只是探测本身不适用，真正的失败在别处。
-                // 远端字幕要能用，得先有"读远端字幕内容"的链路（`/media/subtitle` 同样只认本地），
-                // 那是另一件事；在它到位之前，诚实地回"没有可用字幕"。
+                // 远端存储源（`remote:<id>/…`）：返回**空列表**而不是 400。
+                // 播放器打开任何视频都会先探测一次字幕，而远端路径无法通过
+                // `safeUserFile`（只接受本机用户存储），若返回 400，每次播放远端视频都会在日志中
+                // 留下一条 `HTTP 400 path 必须是用户存储内的真实文件` —— 看似是播放失败原因，
+                // 实际只是该探测不适用，真正的失败在别处。
+                // 远端字幕要可用，需先具备"读取远端字幕内容"的链路（`/media/subtitle` 同样只接受本地），
+                // 在该链路就绪前，返回"没有可用字幕"。
                 if (videoPath?.startsWith("remote:") == true) {
                     call.respond(
                         toJsonElement(
@@ -2703,7 +2671,7 @@ class MediaRoutes(
             }
 
             /**
-             * 字幕文件内容，**统一转成 UTF-8** 后原样输出（2026-09-19）。
+             * 字幕文件内容，**统一转成 UTF-8** 后原样输出。
              *
              * ## 为什么不让客户端直接拉 `/files/stream`
              * 那样拿到的是原始字节，而 media3 的字幕解析器按 UTF-8 解 ——
@@ -2775,7 +2743,7 @@ class MediaRoutes(
              *
              * 用 [MediaMetadataRetriever]：它只读容器头部的标签，不需要音频解码能力
              * （本机 ROM 解不出视频画面，但读标签没问题；真失败就回落 MediaStore 那份）。
-             * 歌词不在这里 —— 歌词有独立的 `/lyrics`（旁挂文件），两件事不要混。
+             * 歌词不在这里 —— 歌词有独立的 `/lyrics`（旁挂文件），两者相互独立。
              */
             get("/tags") {
                 val id = call.request.queryParameters["id"]?.toLongOrNull() ?: run {
@@ -2819,8 +2787,8 @@ class MediaRoutes(
              * 校验三条：必须在用户存储白名单内（与文件接口同一口径）、去重、不超过
              * [MAX_SCAN_DIRS] 条。**不要求目录当前存在** —— SD 卡拔出时配置不该被清掉。
              *
-             * 按类型分开写（2026-09-16）：视频页改视频的、音乐页改音乐的，互不覆盖；
-             * 三类指向同一个目录也没问题，MediaStore 本来就是分表查的。
+             * 按类型分开写：视频页修改视频的配置、音乐页修改音乐的配置，互不覆盖；
+             * 三类指向同一目录亦可，MediaStore 本就按类型分表查询。
              */
             put("/config") {
                 val kind = Kind.of(call.request.queryParameters["type"]) ?: run {
@@ -2879,8 +2847,8 @@ class MediaRoutes(
              * 查不到。这里不自建索引，只把文件路径交给系统扫描器（`MediaScannerConnection`），
              * 收录完成后照常走 `/list`。
              *
-             * 只提交**本类型**的文件（2026-09-16）：在视频页点重扫就该只重扫视频，
-             * 顺手把同目录下的音乐图片也塞给扫描器会让这颗按钮的语义变成"整卡重扫"。
+             * 只提交**本类型**的文件：在视频页点重扫即只重扫视频；
+             * 若同时把同目录下的音乐与图片一并提交，该按钮的语义会变成"整卡重扫"。
              *
              * 提交量有上限（[MAX_RESCAN_FILES] / 深度 [MAX_RESCAN_DEPTH]）——
              * 把整卡塞给扫描器会让系统忙上几分钟。
@@ -2898,10 +2866,10 @@ class MediaRoutes(
                 /*
                  * 目录来源三级回退：请求体 → 该类型已配置目录 → 主外置存储根。
                  *
-                 * 第三级是 2026-09-16 补的：`/list` 的口径是「未配置目录 = 整个媒体库」，
-                 * 而 rescan 原来在这种情况下直接回 400「请先选择目录」——于是默认状态下
-                 * 「重新扫描」这颗按钮点下去必然报错，等于一颗假按钮。既然列表不限目录，
-                 * 重扫的默认范围就该是整卡。
+                 * 第三级为默认回退：`/list` 的口径是「未配置目录 = 整个媒体库」，
+                 * 而 rescan 原先在这种情况下直接回 400「请先选择目录」—— 默认状态下
+                 * 「重新扫描」按钮必然报错，等同于无效按钮。列表既不限目录，
+                 * 重扫的默认范围即整卡。
                  */
                 val configured = requested?.takeIf { it.isNotEmpty() } ?: scanDirs(kind)
                 val candidates = configured.ifEmpty {
@@ -2948,7 +2916,7 @@ class MediaRoutes(
                 }
 
                 if (paths.isNotEmpty()) {
-                    // ═══ 分批提交扫描（2026-10-12，修 android.process.media 内存暴涨）═══
+                    // ═══ 分批提交扫描（避免 android.process.media 内存暴涨）═══
                     //
                     // 现象：点一次「重新扫描」，系统媒体进程 `android.process.media` 内存涨到
                     // 500MB，要重启 core 才释放。
@@ -2972,7 +2940,7 @@ class MediaRoutes(
                 }
 
                 /*
-                 * ═══ 提交后追赶重建索引（2026-10-13，用户明确要求）═══
+                 * ═══ 提交后追赶重建索引 ═══
                  *
                  * 为什么不能"提交完立刻重建一次"就完事：`MediaScannerConnection.scanFile`
                  * 是**异步 fire-and-forget**，它返回时文件还没入库 —— 立刻重建拿到的必然是旧库，

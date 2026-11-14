@@ -65,6 +65,8 @@ class ComponentRoutes(
             }
 
             post("/{id}/install") {
+                // 更新互斥（2026-10-30 §2.10）：组件下载/落盘与 OTA 抢同一块盘和带宽。
+                if (call.rejectIfUpdating()) return@post
                 val id = call.parameters["id"].orEmpty()
                 val error = componentManager.install(id)
                 if (error != null) {
@@ -75,6 +77,9 @@ class ComponentRoutes(
             }
 
             post("/{id}/uninstall") {
+                // 更新互斥（2026-10-30 §2.10）：更新期间卸载/重装组件会让隧道看护在
+                // 「二进制不在了」与「更新正在重启 core」之间反复抖动，先拒。
+                if (call.rejectIfUpdating()) return@post
                 val id = call.parameters["id"].orEmpty()
                 if (tunnelManager.hasRunningInstances(id)) {
                     call.respond(
@@ -101,6 +106,12 @@ class ComponentRoutes(
             // raw body 而非 multipart：组件动辄几十 MB，multipart 那套先攒 ByteArray 的写法
             // 在 256MB RAM 的低端设备上会直接 OOM，这里必须边收边落盘。
             post("/{id}/upload") {
+                // 更新互斥（2026-10-30 §2.10）：组件下载/落盘与 OTA 抢同一块盘和带宽。
+                if (call.rejectIfUpdating()) return@post
+                // 与程序上传同级：字节来自客户端、随后由 ProcessBuilder 直接执行（frpc/cloudflared），
+                // 且这条路径**跳过 sha256**（没有期望值）。body 是裸流，凭据走头。
+                // [owner] POST /api/components/{id}/upload
+                if (!call.requireOwnerFromHeader()) return@post
                 val id = call.parameters["id"].orEmpty()
                 if (tunnelManager.hasRunningInstances(id)) {
                     call.respond(

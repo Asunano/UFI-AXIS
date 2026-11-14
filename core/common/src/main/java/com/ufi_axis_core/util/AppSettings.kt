@@ -23,10 +23,10 @@ class AppSettings(context: Context) {
         private const val KEY_PORT = "server_port"
         private const val KEY_AUTO_START = "auto_start_on_boot"
         private const val KEY_BG_SERVICE_ENABLED = "background_service_enabled"
-        // 2026-10-19：启动失败计数 + 安全模式（跨重启生效，见 startupFailureCount / safeModeActive）
+        // 启动失败计数 + 安全模式（跨重启生效，见 startupFailureCount / safeModeActive）
         private const val KEY_STARTUP_FAILURES = "startup_failure_count"
         private const val KEY_SAFE_MODE = "safe_mode_active"
-        // 2026-10-19：验证码通知 / 拦截记录的**已读水位**（跨设备同步用，运行态、不进备份）。
+        // 验证码通知 / 拦截记录的**已读水位**（跨设备同步用，运行态、不进备份）。
         private const val KEY_SMS_CODE_SEEN_MSG_ID = "sms_code_seen_msg_id"
         private const val KEY_SMS_BLOCKED_SEEN_MSG_ID = "sms_blocked_seen_msg_id"
         private const val KEY_GOFORM_IP = "goform_ip"
@@ -37,6 +37,7 @@ class AppSettings(context: Context) {
         private const val KEY_GOFORM_DUMP_ENABLED = "goform_dump_enabled"
         private const val KEY_GOFORM_COMMAND_ENABLED = "goform_command_enabled"
         private const val KEY_TTYD_ENABLED = "ttyd_enabled"
+        private const val KEY_SCREEN_ENABLED = "screen_enabled"
         private const val KEY_DEBUG_MODE = "debug_mode"
         private const val KEY_LOG_ENABLED = "log_enabled"
         private const val KEY_CORE_LOG_ENABLED = "core_log_enabled"
@@ -59,29 +60,29 @@ class AppSettings(context: Context) {
         // 今日诗词的用户 token：上游用它区分用户，永久有效。同一设备必须固定一个 ——
         // 裸调会让它每次新签一个，同 IP 多 token 会被判成多用户、拉低推荐质量。
         private const val KEY_POETRY_TOKEN = "poetry_token"
-        // 出网国家/地区检测结果（2026-09-18，`/api/geo`）：值 + 检测时刻分两个键存 ——
-        // "什么时候测的" 决定要不要重测，跟"测出来是哪"是两件事，合成一个字符串就没法各自备份。
+        // 出网国家/地区检测结果（`/api/geo`）：值与检测时刻分两个键存储 ——
+        // 前者决定是否重测，后者是检测结果；分成两个键，备份才能分别处理。
         private const val KEY_GEO_COUNTRY = "geo_country"
         private const val KEY_GEO_DETECTED_AT = "geo_detected_at"
         private const val KEY_MEDIA_SCAN_DIRS = "media_scan_dirs"
 
-        // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+        // ── 媒体封面预热 ──
         private const val KEY_THUMB_PREWARM_ENABLED = "thumb_prewarm_enabled"
         private const val KEY_THUMB_PREWARM_WIFI_ONLY = "thumb_prewarm_wifi_only"
         private const val KEY_ARIA2_RPC_SECRET = "aria2_rpc_secret"
 
-        // ── 更新通道（2026-08-10：后端自拉取更新）──
+        // ── 更新通道（后端自拉取更新）──
         private const val KEY_UPDATE_URL = "update_url"
 
-        // ── 更新镜像前缀（2026-08-12：可配置，空串=直连）──
+        // ── 更新镜像前缀（可配置，空串 = 直连）──
         private const val KEY_UPDATE_MIRROR_BASE = "update_mirror_base"
 
-        // ── 更新下载方式（2026-09-22：决策下沉 core，见 docs/update-source-core-plan.md）──
-        // 这是**唯一决策字段**；KEY_UPDATE_MIRROR_BASE 自此降级为「自定义前缀覆盖」，
-        // 不再表达「用不用镜像」。
+        // ── 更新下载方式（由 core 决策）──
+        // 这是**唯一决策字段**；KEY_UPDATE_MIRROR_BASE 仅表示「自定义前缀覆盖」，
+        // 不表达「是否使用镜像」。
         private const val KEY_UPDATE_SOURCE_MODE = "update_source_mode"
 
-        // ── 更新状态持久化（2026-08-10 P0-4/P0-2：RESULT 机制最小版）──
+        // ── 更新状态持久化（RESULT 机制）──
         private const val KEY_PENDING_UPDATE = "pending_update"
         private const val KEY_PENDING_LOCAL_INSTALL_LUT = "pending_local_install_lut"
         private const val KEY_LAST_UPDATE_RESULT = "last_update_result"
@@ -109,24 +110,35 @@ class AppSettings(context: Context) {
         private const val KEY_PAIRING_ENABLED = "pairing_enabled"
         private const val KEY_PAIRING_MAX_DEVICES = "pairing_max_devices"
 
-        // ── 新设备需批准（2026-10-15）──
-        /** 新设备配对是否需要机主在已配对设备上批准。**默认关**（用户 2026-10-15 决定）。 */
+        // ── 新设备需批准 ──
+        /** 新设备配对是否需要机主在已配对设备上批准。**默认关**。 */
         private const val KEY_PAIRING_APPROVAL_REQUIRED = "pairing_approval_required"
 
         /**
-         * 配对申请的外部通知渠道（2026-10-15）。**三个都默认关**（用户明确要求）：
-         * 配对码会经这些渠道明文外发（已做掩码），必须由机主自己打开并确认风险。
+         * 配对申请的外部通知渠道。**三个渠道均默认关**：
+         * 配对码会经这些渠道明文外发（已做掩码），必须由机主自行打开并确认风险。
          */
         private const val KEY_PAIRING_NOTIFY_SYSTEM = "pairing_notify_system"
         private const val KEY_PAIRING_NOTIFY_EMAIL = "pairing_notify_email"
         private const val KEY_PAIRING_NOTIFY_WEBHOOK = "pairing_notify_webhook"
 
-        // ── 配对密码（配对认证，2026-08-11）──
+        // ── 破坏性操作需主人密码 ──
+        /**
+         * 破坏性操作（恢复出厂 / 恢复备份 / root shell / 自定义 shell 任务 / 删日志 /
+         * 移除配对设备 / 解封黑名单）是否额外要求配对密码。**默认关**。
+         *
+         * 为什么默认关：v0.1.0 只在其中三处要密码，2026-10-30 的审查把门铺到 40 个端点后
+         * 用户的反馈是「装个程序也要输密码」。这里回到「够用就好」：默认不打扰，
+         * 想要更严的机主自己打开。
+         */
+        private const val KEY_OWNER_GATE_ENABLED = "owner_gate_enabled"
+
+        // ── 配对密码（配对认证）──
         // 字段名与 key 沿用 `device_password*` / `KEY_DEVICE_PASSWORD_*`：它们是持久化 key 的一部分，
         // 改名会让存量设备读不出已设置的密码（等于把人锁在门外），所以只统一注释口径。
         private const val KEY_DEVICE_PASSWORD_HASH = "device_password_hash"
         private const val KEY_DEVICE_PASSWORD_SET = "device_password_set"
-        // 2026-09-08：PBKDF2 化（见 setDevicePassword / verifyDevicePassword）。
+        // 口令派生使用 PBKDF2（见 setDevicePassword / verifyDevicePassword）。
         private const val KEY_DEVICE_PASSWORD_SALT = "device_password_salt"
         private const val KEY_DEVICE_PASSWORD_VERSION = "device_password_version"
 
@@ -150,6 +162,86 @@ class AppSettings(context: Context) {
             KEY_DEVICE_PASSWORD_SALT,
             KEY_DEVICE_PASSWORD_VERSION,
             KEY_ARIA2_RPC_SECRET
+        )
+
+        /**
+         * [resetScopes] 可清理的**配置域**。
+         *
+         * 每项是一个「键 → 是否属于本域」的判据，用谓词而不是固定集合，因为
+         * `media_scan_dirs_video|audio|image` 这类键是**带后缀**的（见 [mediaScanDirsJson]），
+         * 用 `startsWith` 才能在新增类型时自动纳入。
+         *
+         * ## 划分口径
+         *
+         * 与 `BACKUP_FIELDS` 同粒度：一个功能域一组键。运行态键不得放进任何域
+         * （`pending_update`、`traffic_auto_off_state`、`sms_high_water_mark`、
+         * `last_crash_*` 之类）—— 它们描述"这台设备进行到哪了"，清掉只会造成状态错乱，
+         * 与「恢复默认配置」无关。这些键仅能被 [resetAll] 清除，属于既有的全量语义。
+         *
+         * ## 刻意不进任何域的
+         *
+         * - `tunnel_cf_token`：隧道凭据。清掉等于让正在跑的 cloudflared 失去身份，
+         *   而「恢复默认配置」不该顺带吊销一个外部账号的授权（要换 token 有专门的入口）。
+         * - `goform_password`：它在 `device` 域里（沿用 [resetAll] 的旧语义），
+         *   但**写入**路径已收口到 `POST /api/device/password`。
+         */
+        private val RESET_SCOPES: Map<String, (String) -> Boolean> = mapOf(
+            "server" to { k ->
+                k in setOf(KEY_PORT, KEY_AUTO_START, KEY_BG_SERVICE_ENABLED, KEY_ADB_AUTO_START)
+            },
+            "device" to { k ->
+                k in setOf(
+                    KEY_GOFORM_IP, KEY_GOFORM_PORT, KEY_GOFORM_PASSWORD, KEY_DEVICE_PROFILE_ID,
+                    KEY_FIELD_NORMALIZATION, KEY_GOFORM_DUMP_ENABLED, KEY_GOFORM_COMMAND_ENABLED,
+                    KEY_TTYD_ENABLED,
+                )
+            },
+            "logging" to { k ->
+                k in setOf(KEY_DEBUG_MODE, KEY_LOG_ENABLED, KEY_CORE_LOG_ENABLED, KEY_APP_LOG_ENABLED)
+            },
+            "qos" to { k ->
+                k in setOf(
+                    KEY_QOS_ENABLED, KEY_QOS_SHELL_MAX, KEY_QOS_CACHE_TTL,
+                    KEY_QOS_GOFORM_QUERY_MAX, KEY_QOS_GOFORM_SET_MAX,
+                )
+            },
+            "pairing" to { k ->
+                k in setOf(
+                    KEY_PAIRING_ENABLED, KEY_PAIRING_MAX_DEVICES, KEY_PAIRING_APPROVAL_REQUIRED,
+                    KEY_PAIRING_NOTIFY_SYSTEM, KEY_PAIRING_NOTIFY_EMAIL, KEY_PAIRING_NOTIFY_WEBHOOK,
+                    // 与同组开关同域：按域恢复时一起回到默认（关）。
+                    KEY_OWNER_GATE_ENABLED,
+                )
+            },
+            "sms" to { k ->
+                k in setOf(
+                    KEY_SMS_CODE_ENABLED, KEY_SMS_CODE_CLEANUP_HOURS, KEY_SMS_CODE_AUTO_COPY,
+                    KEY_SMS_FILTER_EXEMPT_VC, KEY_SMS_FILTER_STORE_FULL_BODY,
+                )
+            },
+            "notify" to { k -> k in setOf(KEY_NOTIFICATION_CONFIG, KEY_ALERT_CONFIG) },
+            "monitor" to { k -> k == KEY_MONITOR_PREFERENCES },
+            "media" to { k ->
+                k == KEY_THUMB_PREWARM_ENABLED || k == KEY_THUMB_PREWARM_WIFI_ONLY ||
+                    k.startsWith("${KEY_MEDIA_SCAN_DIRS}_")
+            },
+            "environment" to { k ->
+                k in setOf(
+                    KEY_WEATHER_CONFIG, KEY_POETRY_CONFIG, KEY_POETRY_TOKEN,
+                    KEY_GEO_COUNTRY, KEY_GEO_DETECTED_AT,
+                )
+            },
+            "update" to { k ->
+                k in setOf(KEY_UPDATE_URL, KEY_UPDATE_MIRROR_BASE, KEY_UPDATE_SOURCE_MODE)
+            },
+            "tunnel" to { k ->
+                k in setOf(
+                    KEY_TUNNEL_FRP_ACTIVE, KEY_TUNNEL_CF_ACTIVE, KEY_TUNNEL_FRP_DESIRED,
+                    KEY_TUNNEL_CF_DESIRED, KEY_TUNNEL_AUTO_RECONNECT, KEY_TUNNEL_RECONNECT_INTERVAL,
+                    KEY_TUNNEL_NOTIFY_ON_FAILURE,
+                )
+            },
+            "traffic" to { k -> k == KEY_TRAFFIC_AUTO_OFF_CONFIG },
         )
 
         /**
@@ -183,7 +275,7 @@ class AppSettings(context: Context) {
             BackupField(KEY_FIELD_NORMALIZATION, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_DUMP_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_COMMAND_ENABLED, BackupValueType.BOOL),
-            // 真 PTY 终端（2026-10-06）：开关进备份，恢复后语义与原机一致
+            // 真 PTY 终端：开关进备份，恢复后语义与原机一致
             BackupField(KEY_TTYD_ENABLED, BackupValueType.BOOL),
             // 日志
             BackupField(KEY_DEBUG_MODE, BackupValueType.BOOL),
@@ -214,7 +306,7 @@ class AppSettings(context: Context) {
             // 更新源
             BackupField(KEY_UPDATE_URL, BackupValueType.STRING),
             BackupField(KEY_UPDATE_MIRROR_BASE, BackupValueType.STRING),
-            // 下载方式（2026-09-22）：还原到另一台设备时 `auto` 最安全 —— 它按新设备的地区重判
+            // 下载方式：还原到另一台设备时 `auto` 最安全 —— 它按新设备的地区重新判定
             BackupField(KEY_UPDATE_SOURCE_MODE, BackupValueType.STRING),
             // 短信
             BackupField(KEY_SMS_CODE_ENABLED, BackupValueType.BOOL),
@@ -225,15 +317,19 @@ class AppSettings(context: Context) {
             // 配对配额（不是凭据，是策略）
             BackupField(KEY_PAIRING_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_MAX_DEVICES, BackupValueType.INT, 0, 100),
-            // 2026-10-15：批准策略与它的通知渠道。都是"用户设定的配置、换设备仍成立"，
-            // 所以进备份（与配对配额同一判据）。**不进备份的是黑名单条目本身之外的东西** ——
-            // 那些是运行态（冷却、退避计数），见各自类的注释。
+            // 批准策略与它的通知渠道：均为"用户设定的配置、换设备仍成立"，
+            // 因此进备份（与配对配额同一判据）。黑名单条目之外的冷却、退避计数等运行态
+            // 不进备份，见各自类的注释。
             BackupField(KEY_PAIRING_APPROVAL_REQUIRED, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_NOTIFY_SYSTEM, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_NOTIFY_EMAIL, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_NOTIFY_WEBHOOK, BackupValueType.BOOL),
-            // ── 2026-10-15 补漏（换设备后应该跟过去的配置，之前漏登记了）──
-            //
+            // 破坏性操作的主人口令门：用户设定的策略，换设备仍成立，与上面几项同一判据。
+            BackupField(KEY_OWNER_GATE_ENABLED, BackupValueType.BOOL),
+            // 远程屏幕开关（`screen_enabled`，默认关）：与上面的开关同一判据 —— 用户设定的策略，
+            // 换设备后应当保持。注意它**不是**运行态：关着时 core 根本不起 adb 进程。
+            BackupField(KEY_SCREEN_ENABLED, BackupValueType.BOOL),
+            // ── 换设备后应随备份迁移的配置 ──
             // DLNA：开关与共享目录。类型都是 **STRING** 而不是 BOOL —— `DlnaService` 用的是
             // `getRawString` / `setRawString`（存的是 "true"/"false" 文本），备份的 typed 编码
             // 按**实际存储类型**走，写 BOOL 会在恢复时把 String 当 Boolean 读。
@@ -247,7 +343,7 @@ class AppSettings(context: Context) {
             BackupField("${KEY_MEDIA_SCAN_DIRS}_video", BackupValueType.STRING),
             BackupField("${KEY_MEDIA_SCAN_DIRS}_audio", BackupValueType.STRING),
             BackupField("${KEY_MEDIA_SCAN_DIRS}_image", BackupValueType.STRING),
-            // 媒体封面预热（G6）：用户偏好，换设备仍成立
+            // 媒体封面预热：用户偏好，换设备仍成立
             BackupField(KEY_THUMB_PREWARM_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_THUMB_PREWARM_WIFI_ONLY, BackupValueType.BOOL),
             // 隧道
@@ -258,11 +354,11 @@ class AppSettings(context: Context) {
             BackupField(KEY_TUNNEL_CF_ACTIVE, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_FRP_DESIRED, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_CF_DESIRED, BackupValueType.STRING),
-            // 2026-09-21 移除 KEY_TUNNEL_CF_TOKEN：它是旧版单隧道时代的**全局** token 槽，
-            // 现在 token 每条隧道一个文件（由 BackupAssembler 按文件备份）。留在这里的后果是
-            // 恢复备份会把陈旧 token 写回 prefs，而 migrateLegacyCfToken 会凭它凭空重建一条
-            // 叫 `default` 的隧道、还可能顶掉「当前选中」—— 一个全局槽能伪造出一条隧道，
-            // 正是「多目标配置各存一份」要禁掉的形态。
+            // KEY_TUNNEL_CF_TOKEN 不进备份：它是旧版单隧道时代的**全局** token 槽，
+            // 现在 token 每条隧道一个文件（由 BackupAssembler 按文件备份）。把它放进备份时，
+            // 恢复会把陈旧 token 写回 prefs，而 migrateLegacyCfToken 会凭它重建一条
+            // 名为 `default` 的隧道、并可能替换「当前选中」—— 一个全局槽即可伪造出一条隧道，
+            // 与「多目标配置各存一份」的原则冲突。
             // 采集调度（范围与各自 getter 的夹取一致）
             BackupField(KEY_MON_RETENTION_DAYS, BackupValueType.INT, 1, 90),
             BackupField(KEY_MON_FLUSH_SEC, BackupValueType.INT, 5, 300),
@@ -294,26 +390,29 @@ class AppSettings(context: Context) {
         private const val PASSWORD_VERSION_PBKDF2 = 2
 
         // ── Web 前端独立更新（版本追踪）──
-        // 2026-08-28：旧 key last_seen_bundled_web_build_time 已弃用（buildTime 每次构建都变，
-        // 会误删用户上传的 override），改用内置 version 字段 + 新 key。
+        // 旧键 last_seen_bundled_web_build_time 已弃用（buildTime 每次构建都变，
+        // 会误删用户上传的 override），改用内置 version 字段 + 新键。
         private const val KEY_LAST_SEEN_BUNDLED_WEB_VERSION = "last_seen_bundled_web_version"
 
-        // ── 内网穿透（2026-08-20：FRP + Cloudflare Tunnel）──
+        // ── 内网穿透（FRP + Cloudflare Tunnel）──
         private const val KEY_TUNNEL_FRP_ACTIVE = "tunnel_frp_active"
         private const val KEY_TUNNEL_CF_ACTIVE = "tunnel_cf_active"
         private const val KEY_TUNNEL_CF_TOKEN = "tunnel_cf_token"
         private const val KEY_TUNNEL_AUTO_RECONNECT = "tunnel_auto_reconnect"
+
+        /** 程序商店 Gateway 的 cookie 密钥；首次用到时生成并持久化 */
+        private const val KEY_PROGRAM_GATEWAY_SECRET = "program_gateway_secret"
         private const val KEY_TUNNEL_RECONNECT_INTERVAL = "tunnel_reconnect_interval_sec"
         private const val KEY_TUNNEL_NOTIFY_ON_FAILURE = "tunnel_notify_on_failure"
         private const val KEY_TUNNEL_FRP_DESIRED = "tunnel_frp_desired"
         private const val KEY_TUNNEL_CF_DESIRED = "tunnel_cf_desired"
 
-        // ── core 崩溃标记（2026-09-04：崩溃重启后通知前端）──
+        // ── core 崩溃标记（崩溃重启后通知前端）──
         private const val KEY_LAST_CRASH_AT = "last_crash_at"
         private const val KEY_LAST_CRASH_SUMMARY = "last_crash_summary"
         private const val KEY_LAST_CRASH_FILE = "last_crash_file"
 
-        // ── 采集调度（2026-09-03：原来全是 DataScheduler 里的编译期常量，用户改不了）──
+        // ── 采集调度（由 AppSettings 提供，可由用户调整）──
         private const val KEY_MON_RETENTION_DAYS = "monitor_retention_days"
         private const val KEY_MON_FLUSH_SEC = "monitor_flush_interval_sec"
         private const val KEY_MON_ALERT_SCAN_SEC = "monitor_alert_scan_sec"
@@ -323,7 +422,7 @@ class AppSettings(context: Context) {
         private const val KEY_MON_THERMAL_PAUSE_SEC = "monitor_thermal_pause_sec"
         private const val KEY_MON_BOOT_GRACE_MS = "monitor_boot_grace_ms"
         private const val KEY_ALERT_LEVEL_STATE = "alert_level_state_json"
-        // 2026-09-08 补齐：这两个是 2026-09-03 那次改造漏掉的最后两个编译期常量
+        // 套餐限额检查间隔与设备事件比对间隔：DataScheduler 不再持有对应编译期常量。
         private const val KEY_MON_TRAFFIC_LIMIT_CHECK_SEC = "monitor_traffic_limit_check_sec"
         private const val KEY_MON_DEVICE_EVENT_CHECK_SEC = "monitor_device_event_check_sec"
 
@@ -333,23 +432,23 @@ class AppSettings(context: Context) {
         const val DEFAULT_AUTO_START = true
         const val DEFAULT_GOFORM_IP = "192.168.0.1"
         const val DEFAULT_GOFORM_PORT = 8080
-        // 设备 modem 真实默认口令，非 UFI-AXIS 私钥；不可随机化，建议经设置页修改（接受风险）
+        // 设备 modem 的出厂默认口令，非 UFI-AXIS 私钥；不可随机化，建议经设置页修改（接受风险）
         private const val DEFAULT_GOFORM_PASSWORD = "admin"
         // 设备配对默认密码（仅用于 hasDefaultPassword 判定与旧版 App 兼容兜底；绝不回显/落明文）
         private const val DEFAULT_DEVICE_PASSWORD = "admin"
         const val DEFAULT_DEBUG_MODE = false
 
         /**
-         * 连续启动失败多少次后进入安全模式（2026-10-19）。
+         * 连续启动失败多少次后进入安全模式。
          *
          * 取 2：一次失败可能是瞬时（端口刚开始释放/系统抖动），两次连续失败基本可以确定
          * "再按原配置启动也会失败"。安全模式本身是**一次性**的：用最小配置启动成功即清除，
-         * 用户若没改配置、下次又失败，计数会重新累积 —— 不会把设备永久钉在安全模式里。
+         * 用户若未改配置、下次仍失败，计数会重新累积 —— 设备不会永久停留在安全模式。
          */
         const val SAFE_MODE_THRESHOLD = 2
 
         /**
-         * 日志总开关默认 **false**（2026-09-04 由 true 改）。
+         * 日志总开关默认 **false**。
          *
          * 「所有日志都只在用户显式开启后才记录」—— 出厂状态下两端一条业务日志都不写，
          * 不写 logcat、不落盘、不进内存缓冲。用户到日志页把总开关打开才开始记。
@@ -357,12 +456,12 @@ class AppSettings(context: Context) {
          * **崩溃日志不受此开关约束**：`UfiAxisCoreApplication` 的未捕获异常处理器与 app 侧
          * `CrashHandler` 都是直接写文件（不经 `AppLogger`/`DebugLog` 的闸门），所以关掉日志
          * 依然留得下崩溃证据。代价是崩溃文件里的「日志现场」段会是空的（内存缓冲同样被关掉），
-         * 只剩堆栈 + 本进程 logcat —— 这是用户明确接受的取舍。
+         * 只剩堆栈 + 本进程 logcat —— 这是既定的取舍。
          */
         const val DEFAULT_LOG_ENABLED = false
 
-        // 两个子开关仍默认 true：它们与总闸是「与」关系，总闸关着时开不开都不产生日志；
-        // 保持 true 是为了用户打开总闸后两侧立即都有日志，而不是还要再点两下。
+        // 两个子开关默认 true：它们与总闸是「与」关系，总闸关闭时无论真假都不产生日志；
+        // 默认 true 使用户打开总闸后两侧立即都有日志，无需额外操作。
         const val DEFAULT_CORE_LOG_ENABLED = true
         const val DEFAULT_APP_LOG_ENABLED = true
         const val DEFAULT_QOS_ENABLED = true
@@ -377,7 +476,7 @@ class AppSettings(context: Context) {
         /** 默认更新镜像前缀（与旧写死行为一致：设备在国内访问 GitHub 时自动加速） */
         const val DEFAULT_UPDATE_MIRROR_BASE = "https://mirror.drxian.qzz.io/"
 
-        // ── 更新下载方式（2026-09-22）──
+        // ── 更新下载方式 ──
         // 三端（core / app / web）共用这三个取值；core 是唯一决策方。
         const val UPDATE_MODE_AUTO = "auto"
         const val UPDATE_MODE_MIRROR = "mirror"
@@ -468,11 +567,11 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_PAIRING_ENABLED, value).apply()
 
     /**
-     * 新设备配对是否需要机主在**已配对设备**上批准（2026-10-15）。
+     * 新设备配对是否需要机主在**已配对设备**上批准。
      *
      * **默认关**：打开之后，任何未配对的指纹都要先经过一次批准（App 点允许，或在网页上
-     * 回传从外部通知里读到的配对码）。默认关是为了"升级零感知" —— 存量用户不点这个开关，
-     * 配对流程与今天逐字一致。
+     * 回传从外部通知里读到的配对码）。默认关保证升级无感知 —— 存量用户不打开该开关时，
+     * 配对流程与既有行为完全一致。
      */
     var pairingApprovalRequired: Boolean
         get() = prefs.getBoolean(KEY_PAIRING_APPROVAL_REQUIRED, false)
@@ -493,21 +592,32 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_PAIRING_NOTIFY_WEBHOOK, false)
         set(value) = prefs.edit().putBoolean(KEY_PAIRING_NOTIFY_WEBHOOK, value).apply()
 
+    /**
+     * 破坏性操作是否额外要求配对密码（`OwnerGate`，默认关）。
+     *
+     * 打开后只影响 [OwnerGate] 登记表里的那些不可逆操作；安装 APK / 装程序 / 组件更新 /
+     * 隧道配置一律不受影响 —— 这是本开关与 2026-10-30 那版 40 处全覆盖的关键区别。
+     * 设备从未设过配对密码时，本开关即使打开也不会要求密码（否则首次配置会自己锁死）。
+     */
+    var ownerGateEnabled: Boolean
+        get() = prefs.getBoolean(KEY_OWNER_GATE_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_OWNER_GATE_ENABLED, value).apply()
+
     /** 最大配对设备数，0 表示无限制。仅在 pairingEnabled=true 时生效。 */
     var pairingMaxDevices: Int
         get() = prefs.getInt(KEY_PAIRING_MAX_DEVICES, 0)
         set(value) = prefs.edit().putInt(KEY_PAIRING_MAX_DEVICES, value.coerceAtLeast(0)).apply()
 
-    // ── 配对密码（配对认证，2026-08-11）──
+    // ── 配对密码（配对认证）──
     // 哈希存 SharedPreferences，明文永不落库/回显。
     // 首次 confirm 时（devicePasswordSet=false）将请求密码直接落库=“设置密码”；
     // 之后 confirm / 删除设备 / 改密 一律校验密码。
     //
-    // 2026-09-08 算法升级（v1 → v2）：原来是 `HashUtil.sha256(pw)` —— 单轮、无 salt。
-    // 单轮 SHA-256 在消费级 GPU 上是百亿量级/秒，无 salt 又能被彩虹表直接命中；
-    // 而这台设备本身跑着 root 工具链，「攻击者能读到 SharedPreferences」并不是苛刻前提。
-    // 现在改成 PBKDF2-HMAC-SHA256 + 每密码随机 salt（平台自带，无新依赖）。
-    // 旧哈希不强制用户改密：校验旧密码成功的那一刻手里就有明文，就地重算成 v2 写回。
+    // 当前算法 v2 为 PBKDF2-HMAC-SHA256 + 每密码随机 salt（平台自带，无新依赖）。
+    // v1（单轮 SHA-256、无 salt）不可继续使用：单轮 SHA-256 在消费级 GPU 上达百亿量级/秒，
+    // 无 salt 又能被彩虹表直接命中；而本设备运行 root 工具链，
+    // 「攻击者可读取 SharedPreferences」是现实前提。
+    // 旧哈希不强制用户改密：校验旧密码成功时仍持有明文，就地重算为 v2 写回。
 
     /** 配对密码派生结果（hex）。未设置过时为空串。格式由 [KEY_DEVICE_PASSWORD_VERSION] 决定。 */
     private var devicePasswordHash: String
@@ -520,10 +630,10 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_DEVICE_PASSWORD_SET, value).apply()
 
     /** 是否仍为默认密码：从未设置 或 哈希等于 sha256("admin")。 */
-    // 2026-08-11 修正：仅判断"是否设过密码"，去掉 hash==sha256("admin") 兼容兜底
-    // 之前 bug：用户首次配对用 fallback admin 落库 → passwordSet=true + hash=admin → hasDefaultPassword=true
-    //         → App 端走"设置密码"分支（错误）；正确逻辑：设备已设过密码（即使是 admin）→ App 端应"输入密码"。
-    // 修正后：devicePasswordSet=true → 已设过（任意密码）→ hasDefaultPassword=false（App 端走"输入密码"）
+    // 判据仅为"是否设过密码"，不比较 hash 是否等于 sha256("admin")：
+    // 设备已设过密码（即使是 admin）时 hasDefaultPassword 必须为 false，
+    // 客户端应走"输入密码"分支而不是"设置密码"。
+    // 即 devicePasswordSet=true → 已设过（任意密码）→ hasDefaultPassword=false。
     val hasDefaultPassword: Boolean
         get() = !devicePasswordSet
 
@@ -618,13 +728,13 @@ class AppSettings(context: Context) {
     }
 
     /**
-     * 立刻轮换配对码（2026-10-15）。
+     * 立刻轮换配对码。
      *
      * ## 为什么需要它
-     * 配对码是 6 位、一次性，但它原来**失败不换** —— 攻击者可以对着同一个码无限次尝试，
-     * 配合 confirm 的按 IP 限速仍是一条可爆破的路。改成"每次 confirm 失败即轮换"之后，
-     * 暴力猜码彻底失效：每失败一次靶子就被换掉。合法用户的代价只是重新看一眼设备上显示的码
-     *（本来就得读它才能配对）。
+     * 配对码是 6 位、一次性，但仅在成功时消耗 —— 攻击者可对同一个码无限次尝试，
+     * 配合 confirm 的按 IP 限速仍是一条可爆破的路径。要求"每次 confirm 失败即轮换"后，
+     * 每失败一次即更换新码，暴力猜码失去意义。合法用户的代价仅是重新读取设备上显示的码
+     *（配对本就需要读取它）。
      *
      * ## 为什么只在"设备尚未初始化"时轮换
      * 已初始化设备的配对码本来就是空串（`infoPayload` 不下发），这时凭空生成一个新码
@@ -773,7 +883,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_AUTO_START, value).apply()
 
     /**
-     * 连续启动失败次数（2026-10-19）。
+     * 连续启动失败次数。
      *
      * 由 `BackendService` 在"HTTP 服务启动失败"或"进程初始化失败"时自增、启动成功时清零。
      * 达到 [SAFE_MODE_THRESHOLD] 后置位 [safeModeActive]，下一次启动以最小配置启动。
@@ -785,7 +895,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putInt(KEY_STARTUP_FAILURES, value.coerceIn(0, 100)).apply()
 
     /**
-     * 安全模式标记（2026-10-19）：下一次启动强制用**默认端口**、并关闭后台采集，
+     * 安全模式标记：下一次启动强制用**默认端口**、并关闭后台采集，
      * 让设备先回到"能被连上"的最小状态；启动成功后自动清除（一次性）。
      *
      * 只在连续启动失败到阈值时置位，用于把"某个配置把 core 弄挂 / 端口被占"从
@@ -796,11 +906,11 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_SAFE_MODE, value).apply()
 
     /**
-     * 「通知」页签的已读水位（2026-10-19，跨设备同步）。
+     * 「通知」页签的已读水位（跨设备同步）。
      *
-     * 背景：这个水位原来只存在 App 本地（`AppPreferences.smsCodeSeenMsgId`），换一台设备配对后
-     * 水位为 0 ⇒ 把所有历史验证码都算未读，角标显示成"总数"。现在真源放在 core：
-     * 客户端标记已读时写回这里，另一台设备加载时先从这里取。
+     * 真源放在 core：水位若只存在 App 本地（`AppPreferences.smsCodeSeenMsgId`），
+     * 换一台设备配对后水位为 0，所有历史验证码都会被算作未读，角标显示为总数。
+     * 客户端标记已读时写回这里，另一台设备加载时先从这里读取。
      *
      * 语义与客户端一致：`msgId > 水位` 视为未读；只前推不回退。
      */
@@ -808,7 +918,7 @@ class AppSettings(context: Context) {
         get() = prefs.getLong(KEY_SMS_CODE_SEEN_MSG_ID, 0L)
         set(value) = prefs.edit().putLong(KEY_SMS_CODE_SEEN_MSG_ID, value.coerceAtLeast(0L)).apply()
 
-    /** 「已拦截」角标的已读水位（2026-10-19，跨设备同步；语义同 [smsCodeSeenMsgId]）。 */
+    /** 「已拦截」角标的已读水位（跨设备同步；语义同 [smsCodeSeenMsgId]）。 */
     var smsBlockedSeenMsgId: Long
         get() = prefs.getLong(KEY_SMS_BLOCKED_SEEN_MSG_ID, 0L)
         set(value) = prefs.edit().putLong(KEY_SMS_BLOCKED_SEEN_MSG_ID, value.coerceAtLeast(0L)).apply()
@@ -816,8 +926,8 @@ class AppSettings(context: Context) {
     /**
      * 后台采集服务开关（`/api/service/start|stop` 的真源，默认开）。
      * 与 [autoStartOnBoot] 的区别：本开关不影响进程/HTTP 服务，只决定 `DataScheduler`
-     * 的采集循环是否运行；持久化的目的是让"用户显式停掉采集"在服务重启后仍然生效
-     * （此前 `/api/monitor/control` 只写内存，重启即回 true）。
+     * 的采集循环是否运行；持久化使"用户显式停掉采集"在服务重启后仍然生效
+     * （内存实现会在重启后回到 true）。
      */
     var backgroundServiceEnabled: Boolean
         get() = prefs.getBoolean(KEY_BG_SERVICE_ENABLED, true)
@@ -837,7 +947,23 @@ class AppSettings(context: Context) {
         get() = prefs.getString(KEY_GOFORM_PASSWORD, DEFAULT_GOFORM_PASSWORD) ?: DEFAULT_GOFORM_PASSWORD
         set(value) = prefs.edit().putString(KEY_GOFORM_PASSWORD, value).apply()
 
-    // --- 设备适配层（计划书 3.2） ---
+    /**
+     * **同步**写入 goform 口令，返回是否实际落盘。
+     *
+     * 为什么需要单独一个方法：上面的 setter 用 `apply()`（异步、无返回值），调用方
+     * 无法知道写没写进去。而 `POST /api/device/password` 的语义是「设备口令已改 → 本机
+     * 必须同步」，写失败时两边会永久分叉（设备用新口令、core 用旧口令 → 所有 goform
+     * 请求 503，且设备侧没有读回明文的路）。那里必须拿到真实结果才能决定是否回滚。
+     *
+     * 用 `commit()` 的代价是一次同步磁盘写；这个端点本来就要等设备改口令（秒级），
+     * 多一次 prefs 写入可以忽略。
+     */
+    // 使用 commit()（见上）：此处需要确认真实落盘，而非吞吐。
+    @Suppress("ApplySharedPref")
+    fun setGoformPasswordBlocking(value: String): Boolean =
+        prefs.edit().putString(KEY_GOFORM_PASSWORD, value).commit()
+
+    // --- 设备适配层 ---
 
     /**
      * 设备 profile 的 id（`DeviceProfile.id`，如 `"zte-goform"`）。
@@ -852,7 +978,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putString(KEY_DEVICE_PROFILE_ID, value.trim()).apply()
 
     /**
-     * 字段归一化总开关（回退用，决策 D7）。
+     * 字段归一化总开关（排障回退用）。
      *
      * false = 设备客户端层原样透传设备字段（`profile = null`），用于"归一化改坏了某个页面"
      * 时紧急恢复。**代价是对外字段名会变回设备原名**，web/app 会读不到 canonical 键，
@@ -867,12 +993,12 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_FIELD_NORMALIZATION, value).apply()
 
     /**
-     * `GET /api/device/goform`（设备原始 dump，75+ 字段）的显式开关，**默认关**（计划书 9.3）。
+     * `GET /api/device/goform`（设备原始 dump，75+ 字段）的显式开关，**默认关**。
      *
      * 这个端点的用途是排障时看"设备后台到底有什么字段"，不是业务接口 ——
      * 长期开着等于把整个设备后台暴露在 API 上。关闭时端点回 403 `FORBIDDEN`。
      *
-     * 打开后响应仍然是脱敏的（PII 与凭据按 `Sensitivity` + 字段名兜底打码，见 9.2），
+     * 打开后响应仍然是脱敏的（PII 与凭据按 `Sensitivity` + 字段名兜底打码），
      * 开关管的是"要不要给这份 dump"，脱敏管的是"给了也不能带真值"，两者不互相替代。
      */
     var goformDumpEnabled: Boolean
@@ -898,7 +1024,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_GOFORM_COMMAND_ENABLED, value).apply()
 
     /**
-     * 真 PTY 终端开关（ttyd 反代，2026-10-06）：**默认关**。
+     * 真 PTY 终端开关（ttyd 反代）：**默认关**。
      *
      * 与 goform_dump_enabled / goform_command_enabled 同一防御模型：开关本身就是安全边界。
      * 打开后 core 会按需 spawn assets/shell/ttyd（只绑 127.0.0.1），浏览器凭 PTY 票据经
@@ -911,10 +1037,24 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_TTYD_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_TTYD_ENABLED, value).apply()
 
+    /**
+     * 远程屏幕（投屏）开关：**默认关**。
+     *
+     * 与 [ttydEnabled] 同一防御模型 —— 开关本身就是安全边界。打开后 core 会把
+     * `scrcpy-server.jar` 推到 `/data/local/tmp/ufi/`、以 shell uid 拉起服务端，
+     * 并允许已配对客户端通过 `/ws/screen` 拿到**设备的画面与触摸注入**。
+     *
+     * 与终端的差别值得写清楚：终端给的是命令行，投屏给的是"替你点屏幕"——
+     * 在无屏设备上，后者等价于物理接触，所以默认关、且会话结束即回收。
+     */
+    var screenEnabled: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_SCREEN_ENABLED, value).apply()
+
     // --- Debug ---
 
     /**
-     * 日志总开关（2026-08-27）：false = **两端**都完全不记录任何日志
+     * 日志总开关：false = **两端**都完全不记录任何日志
      * （内存缓冲 / logcat / 文件 / Download 镜像 / goform 会话日志全停），用于省电与省 IO。
      *
      * 开关三层：本项是总闸，[coreLogEnabled] / [appLogEnabled] 分别管两侧，
@@ -925,7 +1065,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_LOG_ENABLED, value).apply()
 
     /**
-     * core 端日志子开关（2026-08-27）。core 常驻写盘，是日志体积增长的那一侧，
+     * core 端日志子开关。core 常驻写盘，是日志体积增长的那一侧，
      * 因此需要能「只关后端、保留手机端」。由 `AppLogger.setCoreLogEnabled` 生效。
      */
     var coreLogEnabled: Boolean
@@ -933,7 +1073,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_CORE_LOG_ENABLED, value).apply()
 
     /**
-     * app 端日志子开关（2026-08-27）。**core 自己不用这个值**，只是替 app 保管真源 ——
+     * app 端日志子开关。**core 自己不用这个值**，只是替 app 保管真源 ——
      * 放在这里 web 才能一起控制，且多台手机连同一台设备时开关一致（对齐「core 是唯一真源」）。
      * app 侧由 `AppPreferences.appLogEnabled` → `DebugLog.appEnabled` 落地。
      */
@@ -945,7 +1085,7 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_DEBUG_MODE, DEFAULT_DEBUG_MODE)
         set(value) = prefs.edit().putBoolean(KEY_DEBUG_MODE, value).apply()
 
-    // --- core 崩溃标记（2026-09-04）---
+    // --- core 崩溃标记 ---
 
     /**
      * 上一次 core 崩溃的时间戳（毫秒，0 = 从未崩溃 / 已被清空）。
@@ -975,7 +1115,7 @@ class AppSettings(context: Context) {
             .commit()
     }
 
-    // --- Update（2026-08-10：后端自拉取更新，update_url 指向版本清单 JSON）---
+    // --- Update（后端自拉取更新，update_url 指向版本清单 JSON）---
 
     /** 更新源 URL：指向仓库根 version.json（`{"frontend":{...},"backend":{"version":"0.2","apkUrl":"https://...","apkSha256":"..."}}`），后端 GET 后比对版本并下载 apkUrl */
     var updateUrl: String
@@ -983,9 +1123,9 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putString(KEY_UPDATE_URL, value).apply()
 
     /**
-     * 更新镜像前缀（gh-proxy 风格，直接拼接在 GitHub 完整 URL 前；2026-08-12 由写死常量改为可配置）。
+     * 更新镜像前缀（gh-proxy 风格，直接拼接在 GitHub 完整 URL 前；可配置）。
      *
-     * **2026-09-22 起语义变更**：它不再表达「用不用镜像」——那由 [updateSourceMode] 决定。
+     * **语义限定**：它不表达「是否使用镜像」——那由 [updateSourceMode] 决定。
      * 这里只是「自定义前缀覆盖」：非空且不在内置列表里时，作为候选列表的第一个
      * （见 `MirrorResolver`）。老配置里的自定义前缀因此不会失效。
      * 仅对 GitHub 相关域名生效，非 GitHub 域名不受影响。
@@ -995,7 +1135,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putString(KEY_UPDATE_MIRROR_BASE, value).apply()
 
     /**
-     * 更新下载方式：`auto` / `mirror` / `direct`（2026-09-22，决策下沉 core）。
+     * 更新下载方式：`auto` / `mirror` / `direct`（由 core 决策）。
      *
      * 这是**唯一决策字段**，app 与 web 只读写它。取值非法时回落 [DEFAULT_UPDATE_SOURCE_MODE]
      * 并打 WARN —— 静默当成 auto 会让「客户端写错了值」这件事永远查不出来。
@@ -1021,12 +1161,12 @@ class AppSettings(context: Context) {
         get() = prefs.contains(KEY_UPDATE_SOURCE_MODE)
 
     /**
-     * 老配置迁移（2026-09-22）：没有 [KEY_UPDATE_SOURCE_MODE] 的设备一律置为 `auto`，
-     * 由 core 自己按地区决定走不走镜像。
+     * 旧配置迁移：没有 [KEY_UPDATE_SOURCE_MODE] 的设备一律置为 `auto`，
+     * 由 core 按地区决定是否走镜像。
      *
-     * **刻意不按 `update_mirror_base` 推断**（空→direct / 非空→mirror）：那样会把
-     * 「老 web 上随手清空过前缀」当成用户的长期意图。统一 auto 的代价是——曾经刻意
-     * 设成直连的国内设备迁移后会变成走镜像，所以这里必须打一条日志把原值写出来，
+     * **不按 `update_mirror_base` 推断**（空→direct / 非空→mirror）：那样会把
+     * 「旧版 web 上清空过前缀」当成用户的长期意图。统一 auto 的代价是：原本刻意
+     * 设成直连的国内设备迁移后会改走镜像，因此这里必须记录一条包含原值的日志，
      * 否则用户会遇到一次无法解释的行为变化。
      *
      * 判据是「键是否存在」而不是「值是否等于默认」：后者分不清「没迁移过」和「主动选了 auto」。
@@ -1047,7 +1187,7 @@ class AppSettings(context: Context) {
         return true
     }
 
-    // ── 更新状态持久化（2026-08-10 P0-4：RESULT 机制最小版）──
+    // ── 更新状态持久化（RESULT 机制）──
     // pendingUpdate：安装前置位（目标版本）。安装中被杀/断电后，新进程启动时据此恢复状态：
     //   当前版本 == pending → 写回 DONE；否则写回 FAILED。
     // lastUpdateResult：最近一次更新结果（OK:<ver> / FAILED:<原因> / WARN:SIG_CHANGED:<ver>）。
@@ -1117,7 +1257,7 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_ADB_AUTO_START, false)
         set(value) = prefs.edit().putBoolean(KEY_ADB_AUTO_START, value).apply()
 
-    // 2026-08-22：adbUsbToggleBootCount 已随 USB_PORT_SETTING 自动切换功能一并删除。
+    // adbUsbToggleBootCount 已随 USB_PORT_SETTING 自动切换功能一并移除，不再读写。
 
     // --- Alert Config ---
 
@@ -1214,9 +1354,9 @@ class AppSettings(context: Context) {
 
     // --- Media Scan Dirs（视频 / 音乐 / 图片各自的扫描目录，两端共享的设备配置） ---
     //
-    // 2026-09-16：媒体中心从"一页三栏"拆成三个独立页（视频 / 音乐 / 图片），扫描范围随之
-    // **按类型各存一份** —— 每页只改自己那一份，所以三页各有可写入口也不会出现
-    //「同一份配置三处能改」。三类扫同一个目录不冲突：MediaStore 本来就是分表查的。
+    // 媒体中心按类型分为视频 / 音乐 / 图片三个独立页，扫描范围因此
+    // **按类型各存一份** —— 每页只修改自己那一份，三页各有可写入口也不会出现
+    //「同一份配置三处可改」。三类扫描同一目录不冲突：MediaStore 本就按类型分表查询。
     //
     // 每份的形状不变：`["/storage/emulated/0/Movies", ...]`
     //   空数组 / 缺省 = 这一类不限目录，列整个媒体库里的该类型；
@@ -1239,8 +1379,8 @@ class AppSettings(context: Context) {
     // --- Notification Config（客户端通知渠道开关，两端共享的设备配置） ---
     //
     // 与 monitorPreferencesJson 同构：单 key 存整份 JSON。
-    // 【边界】这里是「客户端要不要投递通知」，与 `AlertConfig.perType`（服务端要不要产生告警）
-    // 是两件事，不要互相当对方的开关用。
+    // 【边界】这里是「客户端是否投递通知」，与 `AlertConfig.perType`（服务端是否产生告警）
+    // 相互独立，不得互为开关。
     // 【不含】隧道失败通知 —— 它的真源是 tunnelNotifyOnFailure（`PUT /api/tunnel/settings`），
     // 放进来会造成同一概念两份真源。
     var notificationConfigJson: String?
@@ -1269,7 +1409,7 @@ class AppSettings(context: Context) {
     // --- 今日诗词（标题栏下方小字，两端共享的设备配置） ---
     //
     // 与 weatherConfigJson 同构：单 key 存整份 JSON（开关 / 是否显示出处）。
-    // 没有"选标签"这类字段 —— 标签由上游按地区/天气/时辰/农历自动匹配，我们无从指定。
+    // 没有"选标签"这类字段 —— 标签由上游按地区/天气/时辰/农历自动匹配，客户端无法指定。
     var poetryConfigJson: String?
         get() = prefs.getString(KEY_POETRY_CONFIG, null)
         set(value) {
@@ -1294,7 +1434,7 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
-    // --- 出网国家/地区（`/api/geo`，2026-09-18）---
+    // --- 出网国家/地区（`/api/geo`）---
     //
     // 【为什么在 core】判据是**出网 IP 的归属**，而设备才是真正的出网点。app 走设备热点时
     // 出网 IP 与这里相同，但把检测放在各客户端会让每端各存一份、结果可能不一致。
@@ -1350,10 +1490,10 @@ class AppSettings(context: Context) {
      *
      * 语义（`SmsFilter.evaluate` 是唯一实现）：开启时被判定为验证码的短信跳过
      * `scope=body` 的规则，但 `scope=sender` 的号码黑名单、以及 `scope=both` 的 sender 侧
-     * 仍然生效 —— 拉黑一个号码是明确意图，不该被「它这次发的是验证码」绕过；
+     * 仍然生效 —— 拉黑号码是明确意图，不因「本条是验证码」而绕过；
      * 关键词是模糊匹配，误伤验证码的代价最高。
      *
-     * 改这个开关之后必须让 `SmsRuleStore` 重载快照，否则是个假开关。
+     * 修改该开关后必须让 `SmsRuleStore` 重载快照，否则开关不生效。
      */
     var smsFilterExemptVerificationCode: Boolean
         get() = prefs.getBoolean(KEY_SMS_FILTER_EXEMPT_VC, true)
@@ -1362,8 +1502,8 @@ class AppSettings(context: Context) {
     /**
      * 拦截记录是否留存短信**全文**。默认 false（只存 120 字 snippet）。
      *
-     * 拦截记录是短信正文第一次成规模落进 core 的 DB（此前只有验证码存正文），
-     * 所以全文留存做成显式开关且默认关 —— 想看全文的人自己打开，不替所有人做决定。
+     * 拦截记录是短信正文首次成规模写入 core 的 DB（此前只有验证码保存正文），
+     * 因此全文留存为显式开关且默认关 —— 需要全文的用户自行打开。
      */
     var smsFilterStoreFullBody: Boolean
         get() = prefs.getBoolean(KEY_SMS_FILTER_STORE_FULL_BODY, false)
@@ -1375,11 +1515,11 @@ class AppSettings(context: Context) {
      * 上次启动时检测到的 APK 内置 web `version.json` 的 **version**，
      * 用于判断内置面板是否换了版本（换了才清除用户上传的 override）。
      *
-     * 2026-08-28：从 buildTime 改为 version，并换了新 key。buildTime 由 vite 每次构建
-     * 用 `new Date()` 生成，等于"每份新 core 包都不一样"，于是换一次 core 就把用户上传的
-     * 面板连备份一起删掉 —— 用户看到的就是"设备/服务一重启就恢复成内置版本"。
-     * 换新 key 是为了让升级后的第一次启动读到 null 走"只记录不清除"分支，
-     * 不会因为新旧值格式不同而误删一次。
+     * 判据必须是 version 而不是 buildTime：buildTime 由 vite 每次构建用 `new Date()` 生成，
+     * 每份新 core 包都不同，会导致换一次 core 就把用户上传的面板连同备份一起删除 ——
+     * 表现为"设备/服务一重启就恢复成内置版本"。
+     * 使用独立的新键，使升级后的第一次启动读到 null 并走"只记录不清除"分支，
+     * 不会因新旧值格式不同而误删一次。
      */
     var lastSeenBundledWebVersion: String?
         get() = prefs.getString(KEY_LAST_SEEN_BUNDLED_WEB_VERSION, null)
@@ -1392,7 +1532,7 @@ class AppSettings(context: Context) {
 
     // --- Helpers ---
 
-    // ── 内网穿透（2026-08-20：FRP + Cloudflare Tunnel）──
+    // ── 内网穿透（FRP + Cloudflare Tunnel）──
 
     /**
      * 当前选中的 FRP 通道名（空=未选中）。
@@ -1414,7 +1554,7 @@ class AppSettings(context: Context) {
 
     /**
      * 旧版单隧道 CF token —— **仅用于一次性迁移**（迁移进 tunnels/default.token 后清空），
-     * 新代码不要再读写它。
+     * 新代码不得再读写它。
      */
     var tunnelCfToken: String
         get() = prefs.getString(KEY_TUNNEL_CF_TOKEN, "") ?: ""
@@ -1424,14 +1564,24 @@ class AppSettings(context: Context) {
      * 隧道看护：断开自动重连 + 服务启动时恢复上次在跑的实例。
      * 关闭时看护协程什么都不做（进程退出就退出，不会被拉起）。
      */
+    /**
+     * 程序商店 Gateway 的 cookie 密钥。
+     *
+     * 只在本机使用：用来给"某个程序的 Web UI"签发一个访问 cookie。
+     * 换掉它 = 立刻吊销所有已发出的 cookie（用户重新从控制台点"打开"即可）。
+     */
+    var programGatewaySecret: String
+        get() = prefs.getString(KEY_PROGRAM_GATEWAY_SECRET, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_PROGRAM_GATEWAY_SECRET, value).apply()
+
     var tunnelAutoReconnect: Boolean
         get() = prefs.getBoolean(KEY_TUNNEL_AUTO_RECONNECT, true)
         set(value) = prefs.edit().putBoolean(KEY_TUNNEL_AUTO_RECONNECT, value).apply()
 
-    // --- 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）---
+    // --- 媒体封面预热 ---
 
     /**
-     * 后台自动封面预热总开关。默认**关**（首次引入保守上线，见计划书 §8-1）：
+     * 后台自动封面预热总开关。默认**关**：
      * 开启后 DataScheduler 在闲时逐条给 MediaStore 视频补 ffmpeg 封面。
      */
     var thumbPrewarmEnabled: Boolean
@@ -1470,12 +1620,12 @@ class AppSettings(context: Context) {
         get() = prefs.getString(KEY_TUNNEL_CF_DESIRED, "") ?: ""
         set(value) = prefs.edit().putString(KEY_TUNNEL_CF_DESIRED, value).apply()
 
-    // ── 采集调度（2026-09-03）──
-    // 这一组原本是 DataScheduler 里的 private const，用户无从调整；现在提到设置里，
-    // 由 DataScheduler 在**每轮循环内**读取，所以改完立即生效，不需要重启采集。
-    // getter 也做钳制：历史越界值或别的入口写脏都不会把设备打挂。
+    // ── 采集调度 ──
+    // 这一组取值由 AppSettings 提供（不再是 DataScheduler 内的 private const），
+    // 由 DataScheduler 在**每轮循环内**读取，修改后立即生效，不需要重启采集。
+    // getter 同时做钳制：历史越界值或其它入口写入的非法值不会导致设备异常。
 
-    /** 监控历史保留天数，1..90。原先硬编码 3 天，手动清理却写 7 天，两处说法不一致 */
+    /** 监控历史保留天数，1..90。手动清理与自动清理必须使用同一取值。 */
     var monitorRetentionDays: Int
         get() = prefs.getInt(KEY_MON_RETENTION_DAYS, 7).coerceIn(1, 90)
         set(value) = prefs.edit().putInt(KEY_MON_RETENTION_DAYS, value.coerceIn(1, 90)).apply()
@@ -1503,7 +1653,7 @@ class AppSettings(context: Context) {
         set(value) = prefs.edit().putLong(KEY_MON_BOOT_GRACE_MS, value.coerceIn(10_000L, 300_000L)).apply()
 
     /**
-     * 告警边沿状态快照（`{"temperature":"warning", ...}`，2026-09-21）。
+     * 告警边沿状态快照（`{"temperature":"warning", ...}`）。
      *
      * `AlertEngine.lastLevelByType` 的持久化载体。不落盘的话每次 core 启动
      * （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当成
@@ -1533,11 +1683,10 @@ class AppSettings(context: Context) {
         get() = prefs.getInt(KEY_MON_THERMAL_PAUSE_SEC, 20).coerceIn(5, 300)
         set(value) = prefs.edit().putInt(KEY_MON_THERMAL_PAUSE_SEC, value.coerceIn(5, 300)).apply()
 
-    // ── 2026-09-08 补齐的两项 ──
-    // 2026-09-03 那次把 flush/alertScan/idle/thermal 提到设置里时，漏了 DataScheduler 的
-    // TRAFFIC_LIMIT_CHECK_INTERVAL_MS 与 DEVICE_EVENT_CHECK_INTERVAL_MS，于是「套餐限额预警」
-    // 与「设备接入/离开提醒」这三类告警的实时性完全不可调 —— 用户把告警扫描间隔调到 5 秒，
-    // 它们还是 5 分钟 / 60 秒。现在两个常量都删了，真源就在这里。
+    // ── 套餐限额 / 设备事件检查间隔 ──
+    // 这两项与 flush / alertScan / idle / thermal 同属采集调度配置，真源在本文件：
+    // 若仍留在 DataScheduler 的编译期常量里，「套餐限额预警」与「设备接入/离开提醒」的
+    // 实时性将不可调 —— 即使把告警扫描间隔调到 5 秒，它们仍固定为 5 分钟 / 60 秒。
 
     /**
      * 套餐限额百分比的检查间隔（秒），60..3600，默认 300。
@@ -1573,7 +1722,7 @@ class AppSettings(context: Context) {
     fun toMap(): Map<String, Any> = mapOf(
         "port" to port,
         "auto_start_on_boot" to autoStartOnBoot,
-        // 2026-10-19：跨设备的已读水位（客户端 GET /api/config 时读取）。
+        // 跨设备的已读水位（客户端 GET /api/config 时读取）。
         "sms_code_seen_msg_id" to smsCodeSeenMsgId,
         "sms_blocked_seen_msg_id" to smsBlockedSeenMsgId,
         "goform_ip" to goformIp,
@@ -1584,14 +1733,14 @@ class AppSettings(context: Context) {
         "app_log_enabled" to appLogEnabled,
         "goform_dump_enabled" to goformDumpEnabled,
         "goform_command_enabled" to goformCommandEnabled,
-        // 2026-10-06：真 PTY 终端开关。BACKUP_FIELDS / toMap / ConfigRoutes 三处必须同步
-        // 登记 —— 漏一处就是「开关永远显示默认值」那个老 bug 的复刻（见 field_normalization_enabled 的事故注释）。
+        // 真 PTY 终端开关。BACKUP_FIELDS / toMap / ConfigRoutes 三处必须同步登记 ——
+        // 漏一处就会出现「开关永远显示默认值」（见 field_normalization_enabled 的说明）。
         "ttyd_enabled" to ttydEnabled,
-        // 2026-09-22：本键就是下面那段「漏一个键 = 开关永远显示默认值」的实例 —— KEY 常量、
-        // 读写属性、BACKUP_FIELDS 都齐了，只漏了这一行，于是只有「导入备份」改得动它，
-        // web/app 侧永远读回默认 true。补登记。
-        // 注意它与上面两个排障开关不同：**不热生效**，只在构造组件图时读一次
-        // （ComponentFactory.kt:802，调用点 ComponentFactory.kt:152），改完要重启后台服务。
+        // 本键即为「漏一个键 = 开关永远显示默认值」的实例：KEY 常量、读写属性、
+        // BACKUP_FIELDS 都齐全，只漏了这一行，于是只有「导入备份」能修改它，
+        // web/app 侧始终读回默认 true。
+        // 注意它与上面两个排障开关不同：**不热生效**，只在构造组件图时读取一次
+        // （见 ComponentFactory 的构造流程），修改后需重启后台服务。
         "field_normalization_enabled" to fieldNormalizationEnabled,
         "qos_enabled" to qosEnabled,
         "qos_shell_max_concurrent" to qosShellMaxConcurrent,
@@ -1609,9 +1758,9 @@ class AppSettings(context: Context) {
         "sms_filter_store_full_body" to smsFilterStoreFullBody,
         "update_url" to updateUrl,
         "update_mirror_base" to updateMirrorBase,
-        // 下载方式（2026-09-22）：客户端靠 GET 回读当前值做基线，漏了它 web 的差量提交就永远发不出去
+        // 下载方式：客户端靠 GET 回读当前值做基线，遗漏它会使 web 的差量提交无法发出
         "update_source_mode" to updateSourceMode,
-        // 媒体封面预热（2026-10-05 G6）：客户端靠 GET 回读做基线，漏登记 = 界面永远显示默认值
+        // 媒体封面预热：客户端靠 GET 回读做基线，漏登记即导致界面始终显示默认值
         "thumb_prewarm_enabled" to thumbPrewarmEnabled,
         "thumb_prewarm_wifi_only" to thumbPrewarmWifiOnly
     )
@@ -1655,7 +1804,7 @@ class AppSettings(context: Context) {
         applyBackupFields(values, replace, dryRun = false)
 
     /**
-     * 预览导入：只算"会应用哪些键、会拒哪些键"，**不写任何东西**（2026-10-19）。
+     * 预览导入：只计算"会应用哪些键、会拒绝哪些键"，**不写入任何数据**。
      *
      * 为什么需要：备份导入是一次性写 60+ 个键（含端口、goform、配对策略）的批量操作，
      * 用户点"恢复"之前应该先看到将发生什么。与 [importBackupFields] 共用同一套校验，
@@ -1715,10 +1864,10 @@ class AppSettings(context: Context) {
                     val v = raw as? String
                     when {
                         v == null -> rejected[key] = "需要字符串"
-                        // 2026-10-19：两个"改错就失联"的字符串键做格式校验。
-                        // 备份包可以被手工编辑，之前 STRING 只校验类型 —— 写入一个非法 goform_ip
-                        // 会让 core 永远连不上设备后台，非法 update_url 会让更新链路失效。
-                        // 空串放行：它是"清空/回默认"的合法语义。
+                        // 两个"改错即失联"的字符串键必须做格式校验。
+                        // 备份包可被手工编辑，STRING 类型若只校验类型 —— 写入非法 goform_ip
+                        // 会使 core 无法连接设备后台，非法 update_url 会使更新链路失效。
+                        // 空串放行：它是"清空 / 回默认"的合法语义。
                         key == KEY_GOFORM_IP && v.isNotBlank() &&
                             !BACKUP_HOST_PATTERN.matches(v.trim()) ->
                             rejected[key] = "IP / 主机名格式不合法"
@@ -1757,10 +1906,10 @@ class AppSettings(context: Context) {
      *
      * **不清除身份与凭据键**（[PRESERVED_ON_RESET]）。
      *
-     * 2026-09-10：原实现是 `prefs.edit().clear()`，会把 `device_password_hash` / `salt` /
+     * 不能用 `prefs.edit().clear()`：那会连同 `device_password_hash` / `salt` /
      * `device_password_set` / 配对指纹 / `device_id` 一起抹掉，而 `paired_devices.json` 不在
-     * 这份 prefs 里、不受影响 —— 结果是「已配对客户端照常能用，但设备退回出厂默认密码态，
-     * `/pairing/info` 重新向局域网散发配对码」，任何人都能重新初始化并设一个新密码。
+     * 这份 prefs 中、不受影响 —— 结果是「已配对客户端照常可用，但设备退回出厂默认密码态，
+     * `/pairing/info` 重新向局域网散发配对码」，任何人都能重新初始化并设置新密码。
      * 而 `/api/config/reset` 只要求已配对身份、不要求配对密码，成本远低于物理重置。
      *
      * 「恢复默认配置」的语义是恢复**配置**，不包含放弃设备所有权。
@@ -1772,15 +1921,51 @@ class AppSettings(context: Context) {
     }
 
     /**
-     * 彻底恢复出厂（2026-10-19）：连身份与凭据一起清，等价于"放弃设备所有权"。
+     * 按**配置域**恢复默认。
+     *
+     * ## 为什么需要它
+     *
+     * [resetAll] 是「清掉除身份凭据之外的一切」，因此一次「恢复默认配置」会连带清除：
+     * 通知渠道令牌（`notification_config`）、天气 / 诗词配置、监控偏好、媒体扫描目录、
+     * 隧道看护设置等。这些在用户认知中不属于「默认配置」，而响应只有一句
+     * 「已恢复默认配置」，操作前无法得知影响范围。
+     *
+     * 本方法只清**调用方点名的那几个域**；域的划分与 `BackupField` 的白名单同粒度
+     * （一个功能域一组键），新增功能时在这里补一行即可。
+     *
+     * ## 与 [resetAll] 的关系
+     *
+     * 不是替代：`SettingsActivity` 的「恢复默认」仍用 [resetAll]（本机操作，全量语义）。
+     * `/api/config/reset` 走本方法，`scopes` 缺省时由路由层退化成 [resetAll]，
+     * 所以旧客户端的行为不变。
+     *
+     * 身份/凭据键即使被某个域命中也不清（[PRESERVED_ON_RESET] 仍然生效）——
+     * 两道判据取交集，不靠调用方自觉。
+     */
+    fun resetScopes(scopes: Set<String>) {
+        val predicates = RESET_SCOPES.filterKeys { it in scopes }.values
+        if (predicates.isEmpty()) return
+        val editor = prefs.edit()
+        prefs.all.keys
+            .filterNot { it in PRESERVED_ON_RESET }
+            .filter { key -> predicates.any { it(key) } }
+            .forEach { editor.remove(it) }
+        editor.apply()
+    }
+
+    /** 可用的配置域名（供路由层校验 `scopes` 参数与回显）。 */
+    fun resetScopeNames(): Set<String> = RESET_SCOPES.keys
+
+    /**
+     * 彻底恢复出厂：连同身份与凭据一起清除，等价于"放弃设备所有权"。
      *
      * ## 为什么必须和 [resetAll] 分开
      * [resetAll] 刻意保留 `PRESERVED_ON_RESET`（密码哈希、配对指纹、device_id、aria2 secret）——
      * 因为**远程**重置不该把设备变成"任何人都能重新初始化"的状态（`/api/config/reset`
      * 只要求已配对身份，成本很低）。而本方法只在**本机设置页**（物理在场 / adb 投屏）触发，
-     * 语义是"我把这台设备交出去了"，清干净才是正确的。
+     * 语义是"放弃这台设备的所有权"，清除干净才是正确的。
      *
-     * ⚠ 只清本 prefs 文件。配对记录（`filesDir/paired_devices.json`）与配对黑名单
+     * 注意：只清本 prefs 文件。配对记录（`filesDir/paired_devices.json`）与配对黑名单
      * （`paired_blacklist` 独立 prefs）是另外两处存储，调用方必须同时清 —— 见
      * `SettingsActivity.factoryReset()` 的三连清。
      */

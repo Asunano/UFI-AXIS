@@ -114,12 +114,9 @@ class PairedDevicesRoutesTest {
 
     private suspend fun HttpClient.deleteSigned(
         uri: String,
-        device: TestDeviceIdentity,
-        body: String
+        device: TestDeviceIdentity
     ): HttpResponse = delete(uri) {
         device.authorize(this, "DELETE", uri)
-        contentType(ContentType.Application.Json)
-        setBody(body)
     }
 
     private suspend fun HttpResponse.json(): JsonObject =
@@ -209,57 +206,13 @@ class PairedDevicesRoutesTest {
     }
 
     @Test
-    fun `DELETE with wrong password returns 401 and keeps device`() {
-        val device = pairDevice("Device One")
-        testApplication {
-            application { registerApi() }
-            val resp = client.deleteSigned(
-                "/api/pairing/devices/${device.fingerprint}", device, """{"password":"wrongpw"}"""
-            )
-            assertEquals(HttpStatusCode.Unauthorized, resp.status)
-            assertTrue("设备应仍在", store.list().isNotEmpty())
-        }
-    }
-
-    @Test
-    fun `DELETE without password returns 401 MISSING_PASSWORD`() {
-        val device = pairDevice("Device One")
-        testApplication {
-            application { registerApi() }
-            val resp = client.deleteSigned("/api/pairing/devices/${device.fingerprint}", device, "{}")
-            assertEquals(HttpStatusCode.Unauthorized, resp.status)
-            assertEquals("MISSING_PASSWORD", resp.json()["code"]?.jsonPrimitive?.content)
-        }
-    }
-
-    @Test
-    fun `DELETE locked after 5 wrong passwords returns 429`() {
-        val device = pairDevice("Device One")
-        val uri = "/api/pairing/devices/${device.fingerprint}"
-        testApplication {
-            application { registerApi() }
-            repeat(4) {
-                assertEquals(
-                    HttpStatusCode.Unauthorized,
-                    client.deleteSigned(uri, device, """{"password":"wrongpw"}""").status
-                )
-            }
-            val fifth = client.deleteSigned(uri, device, """{"password":"wrongpw"}""")
-            assertEquals(HttpStatusCode.TooManyRequests, fifth.status)
-            assertEquals("PASSWORD_LOCKED", fifth.json()["code"]?.jsonPrimitive?.content)
-        }
-    }
-
-    @Test
     fun `removing a device invalidates only that device token`() {
         // 定向吊销：这是每设备 token 取代全局 token 的核心收益。
         val victim = pairDevice("Device One")
         val survivor = pairDevice("Device Two")
         testApplication {
             application { registerApi() }
-            val resp = client.deleteSigned(
-                "/api/pairing/devices/${victim.fingerprint}", survivor, """{"password":"secret123"}"""
-            )
+            val resp = client.deleteSigned("/api/pairing/devices/${victim.fingerprint}", survivor)
             assertEquals(HttpStatusCode.OK, resp.status)
             assertEquals(true, resp.json()["success"]?.jsonPrimitive?.boolean)
             assertFalse("被删设备应从记录中消失", store.fingerprints().contains(victim.fingerprint))
@@ -278,9 +231,7 @@ class PairedDevicesRoutesTest {
         val device = pairDevice("Device One")
         testApplication {
             application { registerApi() }
-            val resp = client.deleteSigned(
-                "/api/pairing/devices/nope", device, """{"password":"secret123"}"""
-            )
+            val resp = client.deleteSigned("/api/pairing/devices/nope", device)
             assertEquals(HttpStatusCode.NotFound, resp.status)
             assertEquals("DEVICE_NOT_FOUND", resp.json()["code"]?.jsonPrimitive?.content)
         }

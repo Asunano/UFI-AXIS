@@ -202,6 +202,27 @@ class SignalCollectorTest {
     }
 
     @Test
+    fun `Telephony 返回异常大的 SINR 时被丢弃且不写入记录`() {
+        val telephony = mockk<TelephonyCollector> {
+            every { getSignalInfo() } returns mapOf(
+                "rsrp" to -85,
+                "sinr" to 30_000_000,
+            )
+            every { getOperatorName() } returns "CHN-UNICOM"
+            every { getNetworkType() } returns "5G"
+            every { isNetworkRegistered() } returns true
+        }
+        val collector = SignalCollector(FakeSignalSource(null), telephony, ZteGoformProfile)
+
+        val out = runBlocking { collector.collect() }
+        val record = collector.buildRecord(out)
+
+        assertTrue("越界 SINR 不能出现在对外 signal map 里", DeviceFields.Signal.SINR !in out)
+        assertEquals(-85, out[DeviceFields.Signal.RSRP])
+        assertEquals("越界 SINR 入库时必须写成 0 哨兵", 0, record.sinr)
+    }
+
+    @Test
     fun `buildRecord 的六列取自同一份输出`() {
         val raw = loadRaw("zte_f50_goform_signal_raw.json")
         val collector = SignalCollector(FakeSignalSource(null), telephony(), ZteGoformProfile)
@@ -212,6 +233,6 @@ class SignalCollectorTest {
         assertEquals(17, record.sinr)
         assertEquals(-11, record.rsrq)
         assertEquals(-72, record.rssi)
-        assertEquals("CHN-UNICOM", record.operator)
+        assertEquals("中国联通", record.operator)
     }
 }

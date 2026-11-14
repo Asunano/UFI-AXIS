@@ -195,5 +195,40 @@ class AppLoggerSwitchTest {
         )
         assertEquals(false, AppLogger.isLogEnabled())
     }
+
+    // ── 2026-10-30 F10 / F11：查询参数的两处健壮性 ──
+
+    @Test
+    fun `limit 为负数时不抛异常`() {
+        AppLogger.restoreSwitches(logEnabled = true, coreLogEnabled = true, debugMode = true)
+        AppLogger.clearBuffer()
+        AppLogger.w("SwitchTest", "limit-negative-line")
+
+        // 旧实现直接 takeLast(limit) → IllegalArgumentException → HTTP 500
+        val logs = AppLogger.getBufferedLogs(limit = -1)
+        assertTrue("负数 limit 应返回空列表而不是抛异常", logs.isEmpty())
+
+        // 负数同样不能把调用方搞崩；0 也必须是合法值
+        assertTrue(AppLogger.getBufferedLogs(limit = 0).isEmpty())
+    }
+
+    @Test
+    fun `级别过滤按标签精确匹配而不是子串`() {
+        AppLogger.restoreSwitches(logEnabled = true, coreLogEnabled = true, debugMode = true)
+        AppLogger.clearBuffer()
+        // DEBUG 行里故意包含 "WARN" 字样（模拟访问日志 `/api/debug-logs?level=WARN`）
+        AppLogger.d("FilterTest", "GET /api/debug-logs?level=WARN -> 200")
+        AppLogger.w("FilterTest", "real-warn-line")
+
+        val onlyWarn = AppLogger.getBufferedLogs(level = "WARN", limit = 100)
+        assertTrue("应包含真正的 WARN 行", onlyWarn.any { "real-warn-line" in it })
+        assertTrue(
+            "不应把消息体里含 WARN 的 DEBUG 行也算进来（子串匹配的旧缺陷）",
+            onlyWarn.none { "GET /api/debug-logs" in it }
+        )
+
+        // 未知级别当作“不过滤”，而不是空结果
+        assertEquals(2, AppLogger.getBufferedLogs(level = "VERBOSE", limit = 100).size)
+    }
 }
 

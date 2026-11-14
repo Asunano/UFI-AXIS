@@ -95,6 +95,51 @@ class ConfigRoutesTest {
         }
     }
 
+    /**
+     * 2026-10-30（越权审查 §2.3）：`goform_password` 是**验证式写入** ——
+     * 只有设备用新口令登录成功才落盘。
+     *
+     * 未装配探活器的实例（本类 setup 里的那个）走旧行为直接落盘；
+     * 装配了探活器的实例必须在设备拒绝时进 `rejected_fields` 且不改 `settings`。
+     */
+    @Test
+    fun `goform password is persisted only when the device accepts it`() {
+        val before = settings.goformPassword
+        settings.goformPassword = "old-pass"
+
+        val rejecting = ConfigRoutes(settings, verifyGoformPassword = { false })
+        putConfigOf(rejecting, """{"goform_password":"typo-pass"}""") { body ->
+            assertEquals(
+                ErrorCode.INVALID_GOFORM_CONFIG,
+                body.rejected("goform_password")!!["reason"]!!.jsonPrimitive.content
+            )
+            assertTrue("设备拒绝时不得写进 updated_fields", body.updatedFields().isEmpty())
+        }
+        assertEquals("设备拒绝时本地口令必须保持原值", "old-pass", settings.goformPassword)
+
+        val accepting = ConfigRoutes(settings, verifyGoformPassword = { true })
+        putConfigOf(accepting, """{"goform_password":"new-pass"}""") { body ->
+            assertTrue(body["rejected_fields"]!!.jsonArray.isEmpty())
+            assertTrue(body.updatedFields().contains("goform_password"))
+        }
+        assertEquals("设备接受后才落盘", "new-pass", settings.goformPassword)
+
+        settings.goformPassword = before
+    }
+
+    private fun putConfigOf(routes: ConfigRoutes, body: String, assert: (JsonObject) -> Unit) = testApplication {
+        application {
+            install(ContentNegotiation) { json() }
+            routing { routes.register(this) }
+        }
+        val res = client.put("/config") {
+            contentType(ContentType.Application.Json)
+            setBody(body)
+        }
+        assertEquals(HttpStatusCode.OK, res.status)
+        assert(Json.parseToJsonElement(res.bodyAsText()).jsonObject)
+    }
+
     @Test
     fun `wrong type is reported instead of silently dropped`() {
         putConfig("""{"port":"not-a-number","qos_enabled":"yes"}""") { body ->

@@ -35,6 +35,9 @@ class DiagnosticRoutes {
     companion object {
         private const val MAX_OUTPUT_LINES = 64
         private const val DEFAULT_COUNT = 4
+        /** 网络诊断四条共用的默认目标；客户端不得各自维护一份。 */
+        private const val DEFAULT_NETWORK_HOST = "www.baidu.com"
+        private const val DEFAULT_NETWORK_PORT = 443
         private val HOST_RE = Regex("^[A-Za-z0-9._-]{1,253}$")
     }
 
@@ -65,6 +68,20 @@ class DiagnosticRoutes {
 
     fun register(route: Route) {
         route.route("/diagnostic") {
+            /**
+             * 网络诊断的默认目标。
+             *
+             * 这是 app 与 web 的唯一真源：两端只负责把预设填进输入框，
+             * 不再各自写一份 223.5.5.5 / 192.168.0.1:80，避免同一设备两端默认目标不一致。
+             * 老客户端忽略本端点即可，不影响原有 POST。
+             */
+            get("/presets") {
+                call.respondText(
+                    """{"network":{"host":"$DEFAULT_NETWORK_HOST","port":$DEFAULT_NETWORK_PORT}}""",
+                    ContentType.Application.Json
+                )
+            }
+
             // ── ping ──
             post("/ping") {
                 val body = call.receiveJsonObject()

@@ -15,10 +15,12 @@ import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DeviceAuth
 import com.ufi_axis_core.util.ShellExecutor
+import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
 import io.ktor.server.request.receive
+import io.ktor.server.response.header
 import io.ktor.server.response.respond
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -148,6 +150,14 @@ class PairingRoutes(
      */
     private val rateLimitMs: Long = 500L
 ) {
+    /**
+     * 就地 sleep 的上限：超过它就改回 429 + `Retry-After`。
+     *
+     * 2 秒：正常节流窗口（500ms 级）与首次 1s 退避仍在服务端消化，用户感觉是"慢了一下"；
+     * 再长就该让界面显示倒计时，而不是让 HTTP 超时替他做决定。
+     */
+    private val MAX_INLINE_WAIT_MS = 2_000L
+
     // 2026-10-05 R1-8 修复：限速表容量上限与条目过期时间，防无界增长。
     // （作为常量放在类级 private 字段；类已有 companion object，不能再开一个。）
     private val RATE_LIMIT_PRUNE_THRESHOLD = 512
@@ -363,11 +373,30 @@ class PairingRoutes(
             )
             return
         }
-        throttlePassword()
-        // 双键退避（2026-10-15）：指纹 / hwId 各自计数、取最严。与上面按 IP 的密码节流**并存** ——
+        // 双键退避（2026-10-15）：指纹 / hwId 各自计数、取最严。与按 IP 的密码节流**并存** ——
         // 那条的前提是"换源地址有成本"，而局域网内换 IP / 走隧道成本极低；这两条键跟着设备走，
         // 换 IP 甩不掉。正常用户在这里恒为 0（没有任何失败记录）。
+        val passwordWait = pairingManager.passwordThrottleDelayMs()
         val attemptDelay = pairingManager.attemptDelayMsFor(body?.device_pubkey, body?.device_hwid)
+
+        // 长等待**不在这里 sleep**（2026-11-14）。
+        //
+        // 阶梯是 1s→2s→4s→8s→30s→2min→10min，而客户端 `readTimeout` 是 30s：
+        // 第 5 次失败之后的每一次 confirm 都必然先超时，界面把"正在限流"报成
+        // 「设备不可达」，用户按网络问题手动重试，计数继续涨到 2min/10min（只有成功才清零）。
+        // 改成回 429 + `Retry-After`，让客户端用它已有的倒计时文案提示，而不是干等超时。
+        val totalWait = passwordWait + attemptDelay
+        if (totalWait > MAX_INLINE_WAIT_MS) {
+            val seconds = (totalWait / 1000).coerceAtLeast(1)
+            call.response.header(HttpHeaders.RetryAfter, seconds.toString())
+            call.respondFail(
+                HttpStatusCode.TooManyRequests,
+                ErrorCode.PASSWORD_LOCKED,
+                "密码尝试过于频繁，请 $seconds 秒后再试"
+            )
+            return
+        }
+        if (passwordWait > 0) delay(passwordWait)
         if (attemptDelay > 0) delay(attemptDelay)
         val result = pairingManager.confirm(
             code = code,

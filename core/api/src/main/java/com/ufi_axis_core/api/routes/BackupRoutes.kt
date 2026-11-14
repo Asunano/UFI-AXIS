@@ -112,6 +112,11 @@ class BackupRoutes(
 
             put("/remote-config") {
                 val body = runCatching { call.receiveJsonObject() }.getOrNull() ?: JsonObject(emptyMap())
+                // 远端备份的出口：改了它就能让整包配置（含 goform 口令、通知/告警全文、
+                // 短信规则、隧道配置）在下一次定时任务时发到任意服务器，且口令由调用方自己定
+                // → 他能解密。与 `POST /backup/export`（已登记）同一件事，只是"什么时候发"更隐蔽。
+                // [owner] PUT /api/backup/remote-config
+                if (!call.requireOwner(body.ownerPassword())) return@put
                 val sourceId = if (body.containsKey("source_id")) {
                     (body["source_id"] as? JsonPrimitive)?.contentOrNull.orEmpty()
                 } else {
@@ -140,6 +145,10 @@ class BackupRoutes(
 
             post("/export") {
                 val body = runCatching { call.receiveJsonObject() }.getOrNull() ?: JsonObject(emptyMap())
+                // 凭据外发：包里含 goform_password / tunnel_cf_token，明文模式可直接读。
+                // 注意这里的 `password` 与导出用的 `passphrase` 是两个字段，互不影响。
+                // [owner] POST /api/backup/export
+                if (!call.requireOwner(body.ownerPassword())) return@post
                 val encrypted = body["encrypted"]?.jsonPrimitive?.booleanOrNull ?: true
                 val passphrase = body["passphrase"]?.jsonPrimitive?.contentOrNull ?: ""
                 if (encrypted) {
@@ -212,6 +221,11 @@ class BackupRoutes(
                 // 备份导入是 60+ 键的批量写入口（含端口/goform/配对策略），
                 // 客户端应先预览再确认，避免"恢复一份别人的包"直接把设备改到连不上。
                 val dryRun = call.request.queryParameters["dry_run"] == "1"
+                // 主人密码门：真正写盘才要密码，预览不要 —— 要求预览也输入密码，
+                // 等于把"先看看会发生什么"这个最安全的动作变成门槛最高的一步。
+                // 密码走 `X-Owner-Password` 头：这里的 body 是备份包原始流，塞 JSON 会破坏包格式。
+                // [owner] POST /api/backup/import
+                if (!dryRun && !call.requireOwnerFromHeader()) return@post
                 val pack = readPackage(call) ?: return@post
                 val entries = withContext(Dispatchers.IO) {
                     openPayload(call, pack) ?: return@withContext null
@@ -400,7 +414,9 @@ class BackupRoutes(
                 )
                 BackupCrypto.open(sealed, chars, B64D.decode(saltB64), iterations, pack.manifestBytes)
             } catch (e: BackupCrypto.InvalidPassphraseException) {
-                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.INVALID_PASSWORD, e.message ?: "口令错误")
+                // 独立 code：客户端据此显示"备份口令错误"，而不是弹"输入配对密码"
+                // （`INVALID_PASSWORD` 是主人密码门的判据，两者语义无关）。
+                call.respondFail(HttpStatusCode.Unauthorized, ErrorCode.WRONG_BACKUP_PASSPHRASE, e.message ?: "备份口令错误")
                 return null
             } catch (e: IllegalArgumentException) {
                 // KDF 轮数低于安全下限，或 base64 盐损坏

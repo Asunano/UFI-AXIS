@@ -68,6 +68,9 @@ class WebUpdateRoutes(
             }
 
             post("/update") {
+                // 2026-10-30（越权审查 §2.10）：换 Web 前端与 core 自更新共用同一个
+                // 资源目录与重启链路，更新中替换会在重启后拿到"新 core + 半旧前端"的组合。
+                if (call.rejectIfUpdating()) return@post
                 try {
                     val multipart = call.receiveMultipart()
                     var zipBytes: ByteArray? = null
@@ -131,6 +134,7 @@ class WebUpdateRoutes(
             }
 
             post("/rollback") {
+                if (call.rejectIfUpdating()) return@post
                 val result = webResourceManager.rollback()
                 result.fold(
                     onSuccess = { info ->

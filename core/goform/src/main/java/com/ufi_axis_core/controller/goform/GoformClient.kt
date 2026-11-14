@@ -33,25 +33,24 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Goform 客户端（ZTE 设备私有协议防腐层实现）。
+ * Goform 客户端：ZTE 设备私有协议的防腐层实现。
  *
- * 认证模型（与 UFI-TOOLS 对齐，已在备份版本验证可用）：
- *  - 每次 read / readOne / write 前都先 ensureLogin()；
- *  - 登录优先 goformId=LOGIN_MULTI_USER（带 IP=localhost），失败则回退 LOGIN；
- *  - 加密口令：encPwd = sha256( sha256(password) + LD )，均为大写十六进制；
- *  - 写操作需在 body 附带 AD = sha256( sha256(wa+cr) + RD )，均为大写；
- *  - 登录态带 TTL 缓存与 session 校验，避免频繁登录；失败退避。
+ * 认证模型：
+ *  - 每次 read / readOne / write 之前都先调用 [ensureLogin]；
+ *  - 登录优先使用 goformId=LOGIN_MULTI_USER（附带 IP=localhost），失败后回退 goformId=LOGIN；
+ *  - 口令摘要：encPwd = sha256Hex(sha256Hex(password) + LD)，两级均为大写十六进制；
+ *  - 写操作须在请求体附带 AD = sha256Hex(sha256Hex(wa + cr) + RD)，两级均为大写；
+ *  - 登录态带 TTL 缓存与 session 校验，避免频繁登录；登录失败按指数退避。
  *
- * 注意：读/写均依赖登录态（携带 Set-Cookie 返回的 session）。这与设备 goform
- * 的要求一致；裸读会被设备以 "none secure connection" / "not logged in" 拒绝。
+ * 读与写都依赖登录态（登录响应 Set-Cookie 下发的 session），与设备 goform 的要求一致：
+ * 未携带会话的读取会被设备以 "none secure connection" / "not logged in" 拒绝。
  */
 class GoformClient(
     private val deviceIp: String = "192.168.0.1",
     private val port: Int = 8080,
-    // 无默认值：口令必须由调用方显式注入（唯一构造点 ComponentFactory.buildNetworkGraph
-    // 传的是 settings.goformPassword）。此前默认值是 "YWRtaW4="（base64 of admin），
-    // 而它会被**原样**当作 sha256Hex(password) 的输入，与 AppSettings.DEFAULT_GOFORM_PASSWORD
-    // （明文 "admin"）算出的 hash 不一致 —— 依赖默认值的调用方会静默登录失败。
+    // 无默认值：口令必须由调用方显式注入（设备插件经 TransportConfig.password 传入设备的
+    // goform 明文口令）。该值直接作为 sha256Hex(password) 的输入，因此必须是明文；传入
+    // base64 等派生形式会得到与设备不一致的摘要，表现为静默登录失败，且没有明确的错误日志。
     private val password: String
 ) : GoformTransport {
 
@@ -85,20 +84,19 @@ class GoformClient(
 
     private val loginMutex = Mutex()
     private val consecutiveLoginFailures = AtomicInteger(0)
-    // ── 会话/退避状态一律 @Volatile ──
-    // 这些字段在 loginMutex 内被读，却同时被 query/post 路径（`lastGiveWayAt`）和
-    // invalidateSession()/resetLogin()（`lastValidatedAt`）在**锁外**写，
-    // 而且写方与读方跑在不同的 Dispatchers.IO 协程上。非 volatile 时写可能对读方不可见，
-    // 让位窗口与指数退避会静默失效 —— 正是 ensureLogin 那段注释想防的登录风暴。
+    // ── 会话与退避状态一律 @Volatile ──
+    // 这些字段在 loginMutex 内被读取，但 lastGiveWayAt 同时由 query/post 路径在锁外写入，
+    // lastValidatedAt 同时由 invalidateSession() / resetLogin() 在锁外写入，读写双方运行在
+    // 不同的 Dispatchers.IO 协程上。缺少 volatile 时写操作对读方不可见，让位窗口与指数退避
+    // 会静默失效，进而引发重复登录。
 
     /**
-     * 会话快照：cookie 与「是否已登录」**必须一起换**，所以合成一个不可变对象整体替换。
+     * 会话快照：cookie 与「是否已登录」必须同时变更，因此合并为一个不可变对象整体替换。
      *
-     * 2026-09-08：原来这是两个独立的 `@Volatile` 字段。`ensureLogin()` 的快速路径在锁外
-     * 读 `isLoggedIn` 判定「可以发请求了」，请求构建时再回头读一次 `sessionCookie` ——
-     * 这两次读之间 `invalidateSession()` 可以把 cookie 置 null，于是这一次请求带着**空 Cookie**
-     * 发出去，必然被设备判未鉴权。改成快照之后，判定与取 cookie 用的是同一份不可变值：
-     * 判定通过就一定有当时那个 cookie，[invalidateSession] 只影响**下一次**判定。
+     * 若二者分属两个独立的 @Volatile 字段，[ensureLogin] 的快速路径会在锁外读取登录态判定
+     * 可发送请求，请求构建时再读取一次 cookie；两次读取之间 [invalidateSession] 可将 cookie
+     * 置为 null，该请求便携带空 Cookie 发出，被设备判为未鉴权。使用快照后，判定与取 cookie
+     * 依据同一份不可变值：判定通过即保证对应 cookie 存在，[invalidateSession] 只影响下一次判定。
      */
     private class SessionSnapshot(val cookie: String?, val loggedIn: Boolean)
 
@@ -108,42 +106,39 @@ class GoformClient(
     @Volatile private var lastLoginAttempt = 0L
     @Volatile private var lastValidatedAt = 0L
     @Volatile private var lastGiveWayAt = 0L
-    // 2026-10-08：partial 响应的「升级重登」节流戳。F50 固件过载/会话半死时会对多 key
-    // 查询持续回 200+空体（R2-11 之后我们不再自动重登，数据就一直缺失，表现为
-    // /api/device/traffic-limit 503、信号/WiFi/邻区全空）。真机验证：设备重启即恢复，
-    // 说明重登可救。这里每 60s 只允许一次 partial→重登升级，兼顾自愈与防登录风暴。
+    // partial 响应「升级重登」的节流时间戳。部分固件过载或会话半失效时，会对多 key 查询
+    // 持续返回 200 + 空体；若不做升级重登，数据会持续缺失（表现为 /api/device/traffic-limit
+    // 返回 503、信号 / WiFi / 邻区字段为空）。设备重启可使该状态恢复，说明重新登录有效。
+    // 每 60s 只允许一次 partial→重登升级，兼顾自愈与防止登录风暴。
     private val lastPartialRecoveryAt = java.util.concurrent.atomic.AtomicLong(0L)
 
     /**
-     * partial 自愈的**连续失败次数**（2026-10-08 主动自愈版）。
+     * partial 自愈的连续失败次数。
      *
-     * 语义：每次「升级重登后仍然 partial」就 +1，下一次升级的等待时间指数拉长
-     * （60s → 120s → 240s → … 封顶 10min）；任何一次**完整**响应（非 partial 成功）
-     * 都把计数清零、退避复位 —— 设备恢复正常后立刻回到 60s 的灵敏档。
+     * 每次「升级重登后仍为 partial」加一，下一次升级的等待时间随之指数增长
+     * （60s → 120s → 240s → …，上限 10min）；任一次完整（非 partial 的）成功响应都会将计数
+     * 清零并复位退避，使设备恢复后立即回到 60s 的初始间隔。
      *
-     * 这样固件半死态的恢复节奏是「主动、持续、越救越慢但永不放弃」：
-     * 最坏情况（病一直不好）每 10min 也一定会再试一次，而不是 9541125 初版的
-     * 固定 60s（病不好时每分钟白登一次，纯耗 QoS 配额与登录风险）。
+     * 由此，固件处于半失效状态时仍会持续尝试，最坏情况下每 10min 尝试一次；不使用固定 60s
+     * 间隔，以免设备持续异常时每分钟重复登录，额外消耗 QoS 配额并抬高登录风险。
      */
     private val partialRecoveryFailures = java.util.concurrent.atomic.AtomicInteger(0)
 
-    /** 首次升级等待（60s）；之后按 2^n 指数拉长。 */
+    /** 首次升级等待（60s）；之后按 2^n 指数增长。 */
     private val PARTIAL_RECOVERY_BASE_MS = 60_000L
 
-    /** 升级等待上限（10min）：病再顽固也保持这个节奏持续尝试。 */
+    /** 升级等待上限（10min）：设备持续异常时仍保持该间隔继续尝试。 */
     private val PARTIAL_RECOVERY_MAX_MS = 600_000L
 
     /** 第 [failures] 次连续失败后的升级等待：BASE × 2^n，封顶 MAX。 */
     private fun partialRecoveryWaitMs(failures: Int): Long =
         (PARTIAL_RECOVERY_BASE_MS shl failures.coerceIn(0, 16)).coerceAtMost(PARTIAL_RECOVERY_MAX_MS)
-    // 2026-10-05 R2-8 修复：最近一次 validateSession 是否因网络错而「通过」。
-    // 只在 loginMutex 内的 forceValidate 消费点读；null = 本次校验真实验证了会话。
+    // 最近一次 validateSession 是否因网络错误而被视为通过。仅在 loginMutex 内的
+    // forceValidate 消费点读取；null 表示本次校验真实验证了会话。
     @Volatile private var lastValidateNetworkDown: String? = null
 
-    // 2026-09-26：会话 TTL / 校验间隔 / 登录退避基数与上限 / 让位窗口这四组**数值与判定**
-    // 已搬到 [GoformSessionPolicy]（数值、注释、判定顺序逐字未变）。搬出去的唯一目的是让
-    // 「强制校验绕过 60s 间隔，但**不**绕过让位窗口与登录退避」这几条能在不起 HTTP 的前提下
-    // 被单测钉住。本类只留**状态**（上面那三个时间戳），判定一律问 policy。
+    // 会话 TTL、校验间隔、登录退避基数与上限、让位窗口这四组数值与判定均位于
+    // [GoformSessionPolicy]；本类只保存状态（上方三个时间戳），判定一律委托给 policy。
 
 
     private val resolveMutex = Mutex()
@@ -155,10 +150,10 @@ class GoformClient(
         else if (port == 80) "http://$deviceIp" else "http://$deviceIp:$port"
 
     /**
-     * 解析出真正可达的 base url（`http://192.168.0.1:8080` / `http://127.0.0.1:8080` / …）。
+     * 解析实际可达的 base url（如 `http://<设备地址>:8080` 或 `http://127.0.0.1:8080`）。
      *
-     * 上 [GoformTransport]（module 内可见）：文件类端点（二维码等）不走 [ensureLogin]，
-     * 但同样要先把 base url 定下来，否则 [baseUrl] 只能返回未验证的拼装值，端口/宿主不对就直接连不上。
+     * 文件类端点（二维码等）不经过 [ensureLogin]，但同样需要先确定 base url；否则 [baseUrl]
+     * 只能返回未经验证的拼装值，宿主或端口不符时请求会直接失败。
      */
     override suspend fun ensureBaseUrlResolved() {
         if (baseUrlResolved) return
@@ -178,9 +173,9 @@ class GoformClient(
     }
 
     private suspend fun isReachable(cand: String): Boolean = withContext(Dispatchers.IO) {
-        // 2026-10-17：这里用的是**阻塞** HttpURLConnection。以前它直接在调用方线程上跑，
-        // 而 HTTP 服务器的 callGroupSize=1 —— 一旦首次解析 base url 时它卡住，
-        // **整个后端的请求都会停**。切到 IO 线程后，最坏也只是这次解析慢。
+        // 此处使用阻塞式 HttpURLConnection。调用方的 HTTP 服务器 callGroupSize=1，若该调用
+        // 运行在调用方线程上，首次解析 base url 时的阻塞会挂起整个后端的请求处理。因此必须
+        // 切到 IO 线程：最坏情况下只有本次解析变慢。
         try {
             val url = URL(cand)
             withTimeout(1000) {
@@ -203,12 +198,11 @@ class GoformClient(
     // ============ HTTP helpers ============
 
     /**
-     * 直接 GET 一个设备侧 URL（文件类端点用：二维码图片、短信附件等）。
+     * 直接 GET 一个设备侧 URL（用于文件类端点：二维码图片、短信附件等）。
      *
-     * **必须带 session Cookie**：设备的 `goform_get_file_process` 与 goform_get/set 一样受
-     * session 保护，不带 Cookie 时不会返回 401，而是回一个 200 的登录页 HTML ——
-     * 调用方按图片解析就得到"坏图"。这里漏带 Cookie 曾让 WiFi 分享二维码一直是错的
-     * （read/write 两条路径都带，只有本方法忘了）。
+     * 必须携带 session Cookie：设备的 `goform_get_file_process` 与 goform_get / set 一样受
+     * session 保护；未携带 Cookie 时设备不返回 401，而是返回 200 的登录页 HTML，调用方按
+     * 图片解析即得到无效图像。read / write 两条路径均携带 Cookie，本方法不得例外。
      */
     override suspend fun httpGet(url: String): HttpResponse {
         val base = baseUrl()
@@ -226,11 +220,11 @@ class GoformClient(
     }
 
     /**
-     * 附带**指定快照**里的 session Cookie。
+     * 附带指定快照中的 session Cookie。
      *
-     * 快照必须由调用链上游（[ensureSession] 的返回值）传进来，不允许在这里回头读
-     * [session] —— 那就又回到「判定用一份、发请求用另一份」的 check-then-act：
-     * 判空与解引用之间被 [invalidateSession] 插空，请求会带着空 Cookie 发出去被设备判未鉴权。
+     * 快照必须由调用链上游（[ensureSession] 的返回值）传入，不得在此处重新读取 [session]：
+     * 否则判定与发送依据不同的值，构成 check-then-act；判定与解引用之间若被
+     * [invalidateSession] 插入，请求会携带空 Cookie 发出并被设备判为未鉴权。
      */
     private fun HttpRequestBuilder.attachSessionCookie(snapshot: SessionSnapshot?) {
         val cookie = snapshot?.cookie
@@ -242,46 +236,45 @@ class GoformClient(
     override suspend fun ensureLogin(): Boolean = ensureSession() != null
 
     /**
-     * **强制校验**版的 [ensureLogin]：绕过 60s 校验间隔，下发前先确认会话真的还活着。
+     * 强制校验版的 [ensureLogin]：绕过 60s 校验间隔，在请求下发前确认会话仍然有效。
      *
-     * ## 为什么需要它（2026-09-26，接「首次发短信必 500」那一批）
+     * ## 用途
      *
-     * `SEND_SMS` 已经走 [writeSessionSafe]，会话失效（登录页 / 非 200 / AD 算不出来）时会
-     * 重登重试一次。但真机上有一个**已知变体**：部分固件在会话陈旧时**不回登录页，而是回
-     * 200 + 业务失败体**（判据与踩坑记录见 [GoformWritePolicy.shouldRetryBusinessFailure]）。
-     * 那一档落 [GoformWriteResult.Accepted] ⇒ `isSuccess` 为假 ⇒ `SendVerdict` 判 `REJECTED`
-     * 且**不重发**（重复计费红线，不能破）⇒ 用户看到的还是"第一次发失败"。
+     * `SEND_SMS` 经由 [writeSessionSafe] 发送，会话失效（登录页 / 非 200 / AD 无法计算）时会
+     * 重新登录并重试一次。部分固件在会话陈旧时不返回登录页，而是返回 200 + 业务失败体
+     * （判据见 [GoformWritePolicy.shouldRetryBusinessFailure]）。该响应归入
+     * [GoformWriteResult.Accepted]，`isSuccess` 为假，`SendVerdict` 判为 `REJECTED` 且不重发
+     * （重复计费不可接受），最终表现为首次发送失败。在下发前消除「会话陈旧」这一前提即可
+     * 避免该结果。
      *
-     * 所以真正的修法是把「会话陈旧」这个前提消掉：下发**之前**就校验一次。
+     * ## 语义边界
      *
-     * ## 语义边界（三条都不许放宽）
+     * 1. 只跳过校验间隔（[GoformSessionPolicy.SESSION_VALIDATION_INTERVAL_MS]），强制执行一次
+     *    [validateSession]（一次轻量 `cmd=RD` GET）；
+     * 2. 仅在校验失败时重新登录，不每次强制重登：重登需要 LD + LOGIN 两到三次往返，还会触发
+     *    [consecutiveLoginFailures] 退避与官方后台让位窗口，反而增加首次失败的概率；
+     * 3. 让位窗口与登录退避照常生效（见 [ensureSession] 中对应短路的注释）。「强制」仅指多
+     *    执行一次校验，不改变这两条保护。
      *
-     * 1. **只跳过校验间隔**（[GoformSessionPolicy.SESSION_VALIDATION_INTERVAL_MS]），
-     *    强制做一次 [validateSession]（一次轻量 `cmd=RD` GET）；
-     * 2. **校验失败才重登**，不是每次都强制重登 —— 重登要走 LD + LOGIN 两三个往返，
-     *    还会去撞 [consecutiveLoginFailures] 退避与官方后台让位窗口，反而制造新的首次失败；
-     * 3. **让位窗口与登录退避照旧生效**（见 [ensureSession] 里那两条短路上的注释）。
-     *    那两条是踩过坑的保护，"强制"指的是多校验一次，不是硬抢。
+     * ## 成本与适用范围
      *
-     * ## 成本：每次调用多一次轻量 GET —— 所以只许用在用户发起的单次操作上
+     * 每次调用增加一次轻量 GET：一次 `cmd=RD` 往返在设备上为几十毫秒级，对用户发起的单次
+     * 操作（该路径随后还需回读信箱 3 次，每次 1.2s）可以接受。
      *
-     * 一次 `cmd=RD` 的往返在真机上是几十毫秒级，对**用户点了发送**这种单次操作完全可以接受
-     * （那条路后面还要回读信箱 3 次 × 1.2s）。
+     * 不得接入自动或批量路径，例如短信转发、日报、告警通知等由调度器驱动、单轮可能连续发送
+     * 多条的场景。高频调用会为设备额外增加等量的 goform 请求，占满 [GoformQoS] 的许可，并使
+     * 读路径一并变慢（长时间断连即由此累积）。这些路径继续使用 [ensureLogin]：它们本身处在
+     * 重试流程中，多一轮延迟没有用户可感知的代价。
      *
-     * **但不要把它接到自动 / 批量路径上** —— 例如 SMS 转发、日报、告警通知这些由调度器驱动、
-     * 一轮可能连发多条的地方。它们高频调用会给设备平白多出等量的 goform 请求，
-     * 把 [GoformQoS] 的许可占满，最后连读路径一起变慢（历史上「长时间断连」就是这么攒出来的）。
-     * 那些路径继续用 [ensureLogin]：它们本来就在重试圈里，慢一轮没有用户可感的代价。
-     *
-     * 目前唯一调用点：`GoformSmsClient.sendSms`。
+     * 当前唯一调用点：`GoformSmsClient.sendSms`。
      */
     override suspend fun ensureFreshLogin(): Boolean = ensureSession(forceValidate = true) != null
 
     /**
-     * 与 [ensureLogin] 同一套判定，但返回**当次判定所依据的会话快照**（null = 不可用）。
+     * 与 [ensureLogin] 使用同一套判定，但返回当次判定所依据的会话快照（null 表示不可用）。
      *
-     * 请求构建必须用这个返回值取 cookie，不要回头再读 [session]：判定与取 cookie 之间
-     * 隔着一次 goform 往返，`invalidateSession()` 完全来得及把 cookie 置 null。
+     * 请求构建必须使用该返回值取 cookie，不得回读 [session]：判定与取 cookie 之间隔着一次
+     * goform 往返，`invalidateSession()` 可能在此期间将 cookie 置为 null。
      *
      * @param forceValidate 见 [ensureFreshLogin]：只跳过校验间隔，不跳过让位窗口与登录退避。
      */
@@ -295,9 +288,9 @@ class GoformClient(
             == GoformSessionPolicy.SessionGate.USE_CACHED
         ) return fast
 
-        // 2026-10-05 R1-11 修复：锁外预检。原实现排队进锁之后才做退避/让位判定——
-        // 设备断连恢复窗口里，N 个调用者先排长队再逐个被拒，排队成本全白付。
-        // 预检只是快速路径优化：锁内二次检查保留（预检与进锁之间状态可能变化）。
+        // 锁外预检：若在入锁后才做退避 / 让位判定，设备断连恢复窗口内 N 个调用者会先排队、
+        // 再逐个被拒，排队成本全部浪费。预检仅为快速路径优化，锁内仍保留二次检查：预检与
+        // 入锁之间状态可能变化。
         val failCountPre = consecutiveLoginFailures.get()
         if (GoformSessionPolicy.inLoginBackoff(failCountPre, lastLoginAttempt, now) ||
             GoformSessionPolicy.shouldGiveWay(lastGiveWayAt, now)
@@ -313,22 +306,22 @@ class GoformClient(
                 GoformSessionPolicy.SessionGate.USE_CACHED -> return@withLock current
                 // ── 到达验证周期（或调用方要求强制校验）：执行 validate ──
                 GoformSessionPolicy.SessionGate.VALIDATE -> {
-                    // forceValidate 这三条日志是真机上**唯一**能证明「下发前那次强制校验真的发生了」
-                    // 的痕迹：validateSession 成功时本身是静默的（只在网络错/失效时才打）。
+                    // forceValidate 的三条日志是确认「下发前强制校验确实执行」的唯一痕迹：
+                    // validateSession 成功时本身不输出日志（仅在网络错误或会话失效时输出）。
                     // 排障关键字：`[session] force validate`。
                     if (forceValidate) {
                         AppLogger.i(tag, "[session] force validate before dispatch " +
                                 "(sinceValidated=${nowLocked - lastValidatedAt}ms)")
                     }
-                    // 2026-10-05 R2-8 修复：forceValidate 时记录校验是否因网络错而「通过」。
+                    // forceValidate 时记录本次校验是否因网络错误而被视为通过。
                     lastValidateNetworkDown = null
                     if (validateSession(current) { lastValidateNetworkDown = it }) {
                         lastValidatedAt = nowLocked
                         if (forceValidate) AppLogger.i(tag, "[session] force validate passed, reusing session")
-                        // 2026-10-05 R2-8 修复：forceValidate 时若校验是因网络错而「通过」的，
-                        // 这次强制校验什么都没验证到（设备不可达/假死）。按未登录返回 null，
-                        // 让 sendSms 在下发前直接归 REJECTED，而不是等 POST 撞超时后 NO_RESPONSE。
-                        // 普通读路径不受影响（仍信任上次登录态）。
+                        // forceValidate 下若校验仅因网络错误而被视为通过，则本次强制校验没有
+                        // 验证任何内容（设备不可达或无响应）。按未登录返回 null，使 sendSms 在
+                        // 下发前直接判为 REJECTED，而不必等 POST 超时后归入 NO_RESPONSE。
+                        // 普通读路径不传回调，行为不变（仍信任上次登录态）。
                         if (forceValidate && lastValidateNetworkDown != null) {
                             AppLogger.w(tag, "[session] force validate passed only via network error " +
                                     "(device unreachable?), treating as unavailable: $lastValidateNetworkDown")
@@ -336,9 +329,9 @@ class GoformClient(
                         }
                         return@withLock current
                     }
-                    // 校验没通过：validateSession 内部已经 invalidateSession() 了，往下走重登。
-                    // 这条是 WARN（release 包只保留 WARN 以上）：它正是「陈旧会话被拦在下发之前」
-                    // 这个修复真正起作用的那一刻，必须留证据。
+                    // 校验未通过：validateSession 内部已调用 invalidateSession()，继续走重登。
+                    // 该日志为 WARN（release 构建仅输出 WARN 及以上）：它是「陈旧会话在下发前
+                    // 被拦截」的直接证据，必须保留。
                     if (forceValidate) AppLogger.w(tag, "[session] force validate failed, re-login before dispatch")
                 }
                 // 没有登录态 / 连 TTL 都过了：直接重登，不浪费一次校验 GET。
@@ -348,17 +341,17 @@ class GoformClient(
             val failCount = consecutiveLoginFailures.get()
 
             // ── 检查让位状态 ──
-            // ⚠ 这一条与下面的登录退避对 forceValidate **同样生效**：强制的只是「多校验一次」，
-            // 不是「硬抢登录」。为了"强制"把它们绕过去，就会去撞官方后台正在用的会话与
-            // 指数退避 —— 那只会制造新的首次失败，正是这两条保护当初要防的。
+            // 该判定与下方的登录退避对 forceValidate 同样生效：「强制」仅表示多校验一次，
+            // 不表示抢占登录。绕过这两条保护会与官方后台正在使用的会话冲突，并触发指数退避，
+            // 从而制造新的首次失败。
             if (GoformSessionPolicy.shouldGiveWay(lastGiveWayAt, nowLocked)) {
                 val remainsSec = (GoformSessionPolicy.GIVE_WAY_DURATION_MS - (nowLocked - lastGiveWayAt)) / 1000
                 AppLogger.d(tag, "ensureLogin: Giving way to official UI (remains ${remainsSec}s)")
                 return@withLock null
             }
 
-            // 2026-08-24: 不论 isLoggedIn 是否为 true，只要有失败记录就应用退避。
-            // 否则在连续登录失败且 isLoggedIn=false 时会陷入无退避的死循环，压满 QoS。
+            // 不论当前是否处于登录态，只要存在失败记录就应用退避；否则在连续登录失败且未
+            // 登录时会形成无退避的重试循环，占满 QoS。
             if (GoformSessionPolicy.inLoginBackoff(failCount, lastLoginAttempt, nowLocked)) {
                 return@withLock null
             }
@@ -445,7 +438,7 @@ class GoformClient(
         session.updateAndGet { SessionSnapshot(cookie, it.loggedIn) }
     }
 
-    /** 只落「未登录」，**保留 cookie** —— 与改造前 `isLoggedIn = false` 的语义逐字一致。 */
+    /** 仅置为未登录状态，保留 cookie。 */
     private fun markLoggedOut() {
         session.updateAndGet { SessionSnapshot(it.cookie, false) }
     }
@@ -467,28 +460,27 @@ class GoformClient(
             ok
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) {
-            // 网络/解析异常：信任上次登录态，**仅短暂标记「不可达」**，不增加 failCount
-            // —— 频繁网络抖动下原逻辑会把 failCount 推到退避上限 60s（虽然目前已降到 10s，
-            // 但性质仍不对：网络错不会让 cookie 失效，下次请求正常就行）。
+            // 网络/解析异常：保留上次登录态，仅标记「不可达」，不增加 failCount。
+            // 网络错误不会使 cookie 失效，下一次请求通常即可恢复；若在此处累加计数，
+            // 频繁的网络抖动会把 failCount 推至退避上限，使所有调用路径被拒。
             AppLogger.w(tag, "validateSession network error (keeping login state): ${e.message}")
-            // 2026-10-05 R2-8 修复：把「网络错 ≠ 会话活着」暴露给调用方，forceValidate
-            // 路径据此提前定性（普通读路径不传回调，行为不变）。
+            // 将「网络错误不等于会话仍然有效」告知调用方，forceValidate 路径据此提前定性；
+            // 普通读路径不传回调，行为不变。
             networkDown(e.message ?: "network error")
             true
         }
     }
 
     /**
-     * 2026-08-23 改造：仅标记「下次重登」，不再自增 [consecutiveLoginFailures]。
+     * 标记「下次重新登录」，不递增 [consecutiveLoginFailures]。
      *
-     * 原因（旧版实现）：连续 invalidateSession 会把 failCount ++，而退避 backoff
-     * = 1500 * 2^failCount（封顶 [GoformSessionPolicy.MAX_LOGIN_BACKOFF_MS]）。长会话运行 +
-     * 偶发心跳失败 + ZTE 官方后台在线顶「session active」，会让 failCount 几小时内叠到接近
-     * 那个上限。所有路径（前端 DataScheduler 轮询、信号采集、登出、
-     * API 路由）都被 loginMutex 拒绝 → 「长时间断连，需要手动重启核心服务」。
+     * 退避时长为 1500 * 2^failCount（上限 [GoformSessionPolicy.MAX_LOGIN_BACKOFF_MS]）。若在
+     * 此处递增计数，长时间运行中的偶发心跳失败与 ZTE 官方后台在线导致的 "session active"
+     * 会使 failCount 在数小时内累积至上限，此后所有路径（前端 DataScheduler 轮询、信号采集、
+     * 登出、API 路由）都会被 loginMutex 拒绝，形成长时间断连，且需要重启核心服务才能恢复。
      *
-     * 真正**登录失败**（LD/AD 错误等）由 `ensureLogin()` 的 catch 自行递增，
-     * 不应把 cookie 失效 + 网络抖动混为一谈。
+     * 真正的登录失败（LD/AD 错误等）由 `ensureLogin()` 的 catch 分支递增计数；cookie 失效与
+     * 网络抖动不得计入该计数。
      */
     override fun invalidateSession() {
         session.set(SessionSnapshot(null, false))
@@ -517,15 +509,14 @@ class GoformClient(
     /**
      * 会话/鉴权失败判定。
      *
-     * 2026-09-08：原实现是一串 `body.contains(...)`，其中 `contains("redirect")`
-     * 与 `contains("\"result\":\"session\"")` 会把**正常业务响应**误判成掉线：
-     * 设备 JSON 里只要出现 `redirect_url`、`session_timeout` 这类字段名就中招，
-     * 后果是白白 invalidateSession() → 强制重登 → 撞上登录退避，表现成随机断连。
-     * 现在的口径分两路：
-     *  - body 是 JSON：只按 `result` 字段**精确等值**比较（外加显式的 `Error` 字段）；
-     *  - body 不是 JSON（设备把未鉴权请求返回 login.html，回的是 HTML）：才退回子串匹配。
-     * 判 HTML 走子串这一路是常态而非异常，所以只在「看起来像 JSON」时才调 parseJson，
-     * 免得 HTML 每次都在日志里刷一条 parseJson failed。
+     * 判定分两路：
+     *  - body 为 JSON：仅对 `result` 字段做精确等值比较（另加显式的 `Error` 字段）；
+     *  - body 非 JSON（设备对未鉴权请求返回 login.html）：退回子串匹配。
+     *
+     * 不得对 JSON 响应使用子串匹配：正常业务响应中出现 `redirect_url`、`session_timeout` 等
+     * 字段名即会被误判为掉线，导致无谓的 invalidateSession() → 强制重登 → 撞上登录退避，
+     * 表现为随机断连。HTML 走子串属于常态路径，因此仅在 body 以 `{` 开头时才调用 parseJson，
+     * 避免每次 HTML 响应都输出一条 parseJson failed。
      */
     override fun isAuthFailure(body: String): Boolean {
         if (body.isBlank()) return false
@@ -536,7 +527,7 @@ class GoformClient(
             if (obj != null) {
                 val result = (obj["result"] as? JsonPrimitive)?.contentOrNull?.trim()?.lowercase(Locale.ROOT)
                 if (result != null && result in AUTH_FAILURE_RESULTS) return true
-                // 设备也会把错误塞进 Error 字段（历史上见过 "Error":"..."），非空即失败
+                // 设备也会通过 Error 字段表达失败；该字段非空即视为失败
                 val err = (obj["Error"] as? JsonPrimitive)?.contentOrNull
                 return !err.isNullOrBlank()
             }
@@ -569,47 +560,44 @@ class GoformClient(
         (postMeasured(params, retryOnSessionLost = false) as? GoformWriteResult.Accepted)?.body
 
     /**
-     * **幂等**写操作专用入口：会话失效时重登并只重试一次，并把
-     * 「会话失效 / 连不上 / 设备表过态」三件事分开返回（判据见 [GoformWriteResult]）。
+     * 幂等写操作专用入口：会话失效时重新登录并只重试一次，并将「会话失效 / 连不上 /
+     * 设备已表态」三种结果分别返回（判据见 [GoformWriteResult]）。
      *
-     * 为什么不让 [write] 一律重试：`SEND_SMS` 这类命令**非幂等**，重发一次可能就是
-     * 第二笔话费（见 `GoformSmsClient.sendSms` 的 `NO_RESPONSE` 判据）。重试与否必须由
-     * 调用方按命令语义显式选择，所以这里另开一条路，而不是把重试塞进公共 POST。
+     * [write] 不得一律重试：`SEND_SMS` 这类命令非幂等，重发一次可能产生第二笔费用
+     * （见 `GoformSmsClient.sendSms` 的 `NO_RESPONSE` 判据）。是否重试必须由调用方按命令语义
+     * 显式选择，因此重试逻辑放在本入口，不放入公共 POST 路径。
      *
-     * 设置类命令（`goformId=SET_*` / `SET_BEARER_PREFERENCE` 等）对同一取值幂等，
-     * 重发安全 —— 这也是修「切换网络制式第一次必定失败」的落点：读路径早就有这套重试
-     * （见 [queryInternal]），写路径一直没有，于是一次会话抖动就等于一次用户可见的失败。
+     * 设置类命令（`goformId=SET_*` / `SET_BEARER_PREFERENCE` 等）对同一取值幂等，重发安全。
+     * 写路径此前没有与读路径（见 [queryInternal]）对应的重试，一次会话抖动即等于一次用户可见
+     * 的失败；本入口补上该重试。
      */
     override suspend fun writeIdempotent(params: Map<String, String>): GoformWriteResult =
         postMeasured(params, retryOnSessionLost = true)
 
     /**
-     * **非幂等但"没发出就该重发"**的写操作专用入口（`SEND_SMS` 的落点）。
+     * 非幂等但「未发出即应重发」的写操作专用入口（`SEND_SMS` 的落点）。
      *
-     * 三件必须一起记住的事：
+     * 三条约束：
      *
-     * 1. **只对「确定没发出」重试。** 只有 [GoformWriteResult.SessionLost] 会触发重登重发 ——
-     *    那一态的语义是命令**根本没落到固件**（未登录 / AD 前置查询拿不到 wa·cr·RD /
-     *    设备回登录页 / HTTP 非 200，判据见 [GoformWriteResult]），所以重发**不会**产生
-     *    第二笔话费。
-     * 2. **业务失败绝不重试。** [GoformWriteResult.Accepted] 意味着设备已经收下并表过态，
-     *    即使 body 说失败，也**排除不了"其实已经进了发送队列"** —— 重发就是可能的第二条
-     *    真短信、第二笔钱。所以这里把 `retryOnBusinessFailure` 显式关掉，不能图省事改用
-     *    [writeIdempotent]（那条是开着的）。
-     * 3. **[GoformWriteResult.Unreachable] 也不重试**：拿不到设备表态，同样排除不了已发出。
+     * 1. 仅对「确定未发出」重试。只有 [GoformWriteResult.SessionLost] 会触发重登重发：该状态
+     *    表示命令未到达固件（未登录 / AD 前置查询取不到 wa、cr、RD / 设备返回登录页 / HTTP
+     *    非 200，判据见 [GoformWriteResult]），重发不会产生第二笔费用。
+     * 2. 业务失败绝不重试。[GoformWriteResult.Accepted] 表示设备已接收并表态；即使 body 表示
+     *    失败，也无法排除命令已进入发送队列，重发可能产生第二条真实短信与第二笔费用。因此
+     *    此处显式关闭 `retryOnBusinessFailure`，不得改用 [writeIdempotent]（后者已开启）。
+     * 3. [GoformWriteResult.Unreachable] 同样不重试：无法获得设备表态，同样无法排除已发出。
      *
-     * ## 三个写入口的分工（改动前先读完这张表）
+     * ## 三个写入口的分工
      *
-     * | 入口 | 会话失效 | 200 + 业务失败 | 谁在用 |
+     * | 入口 | 会话失效 | 200 + 业务失败 | 使用方 |
      * |---|---|---|---|
-     * | [write] | 不重试 | 不重试 | `RetryPolicy.NEVER` 的命令（REBOOT / SHUTDOWN / FACTORY_RESET…）、删信箱 / 标已读 |
-     * | [writeIdempotent] | 重试一次 | 重试一次 | `SET_*` 这类**对同一取值幂等**的设置命令 |
-     * | [writeSessionSafe] | 重试一次 | **不重试** | `SEND_SMS`（非幂等，但"没发出"可以安全重发） |
+     * | [write] | 不重试 | 不重试 | `RetryPolicy.NEVER` 的命令（REBOOT / SHUTDOWN / FACTORY_RESET…）、删除信箱 / 标记已读 |
+     * | [writeIdempotent] | 重试一次 | 重试一次 | `SET_*` 这类对同一取值幂等的设置命令 |
+     * | [writeSessionSafe] | 重试一次 | 不重试 | `SEND_SMS`（非幂等，但「未发出」可安全重发） |
      *
-     * 为什么需要第三条路：`SEND_SMS` 原来走 [write]，整圈重试被 `retryOnSessionLost = false`
-     * 跳过，于是"冷启动 / 会话被官方后台顶掉后第一次发短信必 500、再点一次就好"在写路径上
-     * 是**必然**（第一次的失败路径顺带作废了会话，第二次因此走全新登录）。短信读路径 2026 年
-     * 改走 ContentResolver 之后没有任何东西在给 goform 会话续期，这条必然性只会更容易撞上。
+     * `SEND_SMS` 若走 [write]，整圈重试被 `retryOnSessionLost = false` 跳过，则冷启动或会话被
+     * 官方后台抢占后的首次发送必然失败，第二次发送因已重新登录而成功。常规短信读取路径由
+     * ContentResolver 提供，不再持续为 goform 会话续期，该失败模式更易出现。
      */
     override suspend fun writeSessionSafe(params: Map<String, String>): GoformWriteResult =
         postMeasured(params, retryOnSessionLost = true, retryOnBusinessFailure = false)
@@ -617,29 +605,28 @@ class GoformClient(
     /**
      * 一次写操作的完整编排：重试圈 + 最终判据日志 + QoS 记账。
      *
-     * @param retryOnSessionLost 会话失效（命令确定没落到固件）时重登重试一次。**同时是整圈
-     *   重试的总闸**：false ⇒ 一次都不重试（[write] 就是这条）。
-     * @param retryOnBusinessFailure 设备回 200 但 body 说失败时，也重登重试一次。
-     *   默认 **true**：这是 2026-09-15 修「冷启动后第一次切制式必失败」时定下的行为，
-     *   [write] / [writeIdempotent] 两个既有调用者都不传这个参数，因此行为逐位不变。
-     *   只有 [writeSessionSafe] 显式传 false（重发有重复计费风险，见那边的 KDoc）。
+     * @param retryOnSessionLost 会话失效（命令确定未到达固件）时重登并重试一次。该参数同时是
+     *   整个重试圈的总开关：false 表示一次都不重试（[write] 即此路径）。
+     * @param retryOnBusinessFailure 设备返回 200 但 body 表示失败时，也重登并重试一次。
+     *   默认为 true；[write] / [writeIdempotent] 的既有调用方均不传该参数，行为不变。
+     *   仅 [writeSessionSafe] 显式传 false（重发存在重复计费风险，见该方法的 KDoc）。
      */
     private suspend fun postMeasured(
         params: Map<String, String>,
         retryOnSessionLost: Boolean,
         retryOnBusinessFailure: Boolean = true
     ): GoformWriteResult = withContext(GoformGuard.dispatcher) {
-        // 2026-10-17：写路径也走 goform 专用调度器（原来是通用 Dispatchers.IO）——
-        // 写操作要等登录 + 前置查询 + POST，占线程时间长，和文件/数据库抢同一个池没有好处。
+        // 写路径同样使用 goform 专用调度器：写操作需要等待登录、前置查询与 POST，占用线程
+        // 时间较长，与文件、数据库共用同一线程池没有收益。
         val start = System.currentTimeMillis()
-        // 2026-10-05 R2-10 修复：写路径整体预算 20s（读路径早有 withTimeout 先例）。设备半死时
-        // 一次写 = 登录链 + AD 三次前置查询 + POST + 重试圈，单次传输层各 10s 超时但无整体
-        // 预算，最坏挂 ~40s（客户端早已超时，用户重试还可能与仍在进行的写并发落到设备）。
-        // 超时归 Unreachable：不能归 SessionLost（那会触发上层重发），也不能归 Accepted。
+        // 写路径整体预算 20s。设备半失效时一次写操作包含登录链、AD 的三次前置查询、POST 与
+        // 重试圈；传输层单次超时为 10s，缺少整体预算时最坏可挂起约 40s（客户端此时已超时，
+        // 用户重试还可能与该写操作并发落到设备）。
+        // 超时归入 Unreachable：不能归 SessionLost（会触发上层重发），也不能归 Accepted。
         try {
             withTimeout(20_000L) {
-        // 循环体住在 GoformWritePolicy（2026-09-26 原样搬过去的，判定顺序与日志文案逐字未变），
-        // 为的是让「SessionLost 重试一次 / 业务失败绝不重发」两条能在不起 HTTP 的前提下被断言。
+        // 循环体位于 GoformWritePolicy，使「SessionLost 重试一次 / 业务失败绝不重发」两条规则
+        // 可在不发起 HTTP 的前提下被断言；判定顺序与日志文案与该策略保持一致。
         val attempted = GoformWritePolicy.runAttempts(
             goformId = params["goformId"],
             retryOnSessionLost = retryOnSessionLost,
@@ -658,10 +645,10 @@ class GoformClient(
             }
         }
         val cost = System.currentTimeMillis() - start
-        // 任何写操作都会让 GoformQoS 的 2 秒查询快照过时。不清的话，写完立刻回读会命中
-        // 旧快照拿到写入前的值 —— 表现为「开关点了没反应、状态弹回原值、要点好几次」。
-        // 上层 ResponseCache.invalidate 挡不住这一层，因为它在更下游。
-        // 写操作频率远低于查询，整体清空的代价可以接受。
+        // 任何写操作都会使 GoformQoS 的 2 秒查询快照失效。未清除时，写入后立即回读会命中旧
+        // 快照并得到写入前的值（表现为开关点击后无反应或状态回退）。上层
+        // ResponseCache.invalidate 位于更下游，无法覆盖这一层。写操作频率远低于查询，整体
+        // 清空的代价可以接受。
         GoformQoS.clearCache()
         GoformQoS.adaptiveAdjust(
             targetQueryPermits = 6,
@@ -671,8 +658,8 @@ class GoformClient(
         result
         }
         } catch (e: TimeoutCancellationException) {
-            // 2026-10-05 R2-10 修复：整体预算超时。Unreachable 的语义排除不了「命令已落到设备」，
-            // 与超时同性质；NEVER 命令（如 REBOOT）不会因此被上层重发，红线保持。
+            // 整体预算超时。Unreachable 的语义已排除「确定未发出」，与超时性质一致；
+            // NEVER 类命令（如 REBOOT）不会因此被上层重发。
             AppLogger.w(tag, "[goform_set] overall budget (20s) exceeded, goformId=${params["goformId"]}")
             GoformWriteResult.Unreachable("overall timeout 20s")
         }
@@ -682,9 +669,9 @@ class GoformClient(
     /**
      * 单次 `goform_set_cmd_process` 往返。
      *
-     * 传输层异常在这里就地收成 [GoformWriteResult.Unreachable]，**不再往上抛** ——
-     * 原来它会一路冒到 Ktor 的兜底处理器变成一个没有 body 语义的 500，
-     * 客户端只能显示「服务器内部错误」。
+     * 传输层异常在此就地转换为 [GoformWriteResult.Unreachable]，不再向上抛出；若向上抛出，
+     * 该异常会进入 Ktor 的兜底处理器，成为一个不含业务语义的 500，客户端只能显示
+     * 「服务器内部错误」。
      */
     private suspend fun goformPostOnce(params: Map<String, String>): GoformWriteResult {
         val snapshot = ensureSession()
@@ -693,9 +680,9 @@ class GoformClient(
             return GoformWriteResult.SessionLost
         }
         return GoformQoS.withSetPermit {
-            // AD 由 wa_inner_version / cr_version / RD 三次前置查询算出来。会话已死时这三次
-            // 查询拿回来的是登录页，解析不出字段 → computeAd 返回 null。所以「AD 算不出来」
-            // 在实测里就是「会话失效」最常见的外观，必须归到可重试一侧。
+            // AD 由 wa_inner_version / cr_version / RD 三次前置查询计算得出。会话失效时这三次
+            // 查询返回登录页，无法解析字段，computeAd 返回 null。因此「AD 无法计算」是会话失效
+            // 最常见的外观，必须归入可重试一侧。
             val ad = try {
                 computeAd(params, snapshot)
             } catch (e: CancellationException) {
@@ -752,18 +739,18 @@ class GoformClient(
     }
 
     /**
-     * 重试**必须**在许可释放之后发起。
+     * 重试必须在许可释放之后发起。
      *
-     * 早期实现直接在 `withQueryPermit { … }` 块内递归调用自身，等于「持有一个许可再去申请
-     * 第二个」。`GoformQoS.querySemaphore` 的许可数会被自适应调节压到 2（DataScheduler 温度
-     * 临界）甚至 1（`ConfigRoutes` 的 adaptiveAdjust，minPermits=1），而 kotlinx 的
-     * `Semaphore.acquire()` 没有超时 —— 许可为 1 时任意一次重试即永久挂死，许可为 2 时两个
-     * 并发重试即挂死，整条 goform 读路径再也不恢复（表现为「长时间断连，必须重启核心服务」）。
+     * 若在 `withQueryPermit { … }` 块内递归调用自身，等于持有一个许可再申请第二个。
+     * `GoformQoS.querySemaphore` 的许可数会被自适应调节压到 2（DataScheduler 温度临界）甚至
+     * 1（`ConfigRoutes` 调用 adaptiveAdjust，许可下限为 1），而 kotlinx 的
+     * `Semaphore.acquire()` 没有超时：许可为 1 时任意一次重试即永久挂起，许可为 2 时两次并发
+     * 重试即挂起，整条 goform 读路径不再恢复。
      */
     private suspend fun queryInternal(commands: List<String>, retry: Boolean): JsonObject? {
-        // 2026-10-17（goform 隔离改造）：熔断 → 整体预算 → 独立调度器，三者缺一不可。
-        // 没有熔断，设备坏的时候每个请求都要重新等满超时；没有预算，读路径最坏能串到 ~50s；
-        // 没有独立调度器，goform 会和文件操作抢同一个 IO 池（无卡启动时"文件管理也打不开"就是这么来的）。
+        // 熔断 → 整体预算 → 独立调度器，三者缺一不可。缺少熔断时，设备异常期间每个请求都要
+        // 等待超时；缺少预算时，单次读的耗时无法约束；缺少独立调度器时，goform 会与文件操作
+        // 争用同一 IO 池（无存储卡启动时文件管理不可用即由此产生）。
         if (GoformGuard.isOpen()) {
             GoformGuard.recordFastFail()
             return null
@@ -778,8 +765,8 @@ class GoformClient(
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            // 读路径以前会把传输异常直接抛给路由层 → 500。现在统一收成 null（与"读失败返回 null"
-            // 同一契约），路由层走它既有的 503/空值分支，不会因为设备后台抽风而变成未处理异常。
+            // 读路径将传输异常统一收为 null（与「读失败返回 null」同一契约），路由层因此走既有
+            // 的 503/空值分支，不会因设备侧异常产生未处理异常。
             AppLogger.w(tag, "[goform_get] transport error: ${e.javaClass.simpleName}: ${e.message}")
             null
         }
@@ -819,11 +806,10 @@ class GoformClient(
         snapshot: SessionSnapshot,
         onAuthLost: () -> Unit
     ): JsonObject? {
-        // 缓存边界（计划书 1.0.3）：这一层是**传输层**缓存，key 是 cmd 名集合，
-        // value 是设备**原始**响应。字段归一化在它的下游（GoformFieldMapper /
-        // GoformXxxClient），上层业务缓存（ResponseCache / DataHub）存的才是 canonical 数据。
-        // 不要在这一层改字段名或改值 —— 否则 QoS 快照会同时污染所有调用方，
-        // 而且归一化会变成"有时做有时不做"（缓存命中时被跳过）。
+        // 缓存边界：本层是传输层缓存，key 为 cmd 名集合，value 为设备原始响应。字段归一化位于
+        // 其下游（GoformFieldMapper / GoformXxxClient），上层业务缓存（ResponseCache / DataHub）
+        // 保存的才是 canonical 数据。不得在本层修改字段名或字段值：否则 QoS 快照会同时影响所有
+        // 调用方，且归一化会在缓存命中时被跳过，导致处理不一致。
         val key = commands.sorted().joinToString(",")
         GoformQoS.getCachedQuery(key)?.let {
             AppLogger.d(tag, "[cache HIT] $key")
@@ -840,13 +826,12 @@ class GoformClient(
         val status = resp.status
         AppLogger.net(AppLogger.LogLevel.DEBUG, GOFORM_NET_TAG, "[goform_get] cmd=$cmdParam status=$status body=${rawBody.take(200)}")
 
-        // 2026-08-24: 增强校验。部分设备在负载过高时会返回截断/非完整的 JSON。
-        // 如果请求了多个字段但返回字段数过少（且非 auth 错误），标记为失效。
+        // 响应完整性校验。部分设备在负载过高时会返回截断或非完整的 JSON：请求多个字段而返回
+        // 字段数过少（且非鉴权错误）时，按 partial 处理。
         //
-        // 2026-09-08：字段数原来用 `countJsonFields()`（数 body 里 ':' 的个数）估算，
-        // 而字符串值里的冒号（URL、"12:00"、base64 短信正文）会把计数虚高。
-        // 误判成 partial 就白白 invalidateSession() 强制重登；漏判则把截断的数据
-        // 当权威值往上游灌。反正下面就要解析，直接数**解析出来的顶层 key**，两处共用一次解析。
+        // 字段数按解析后的顶层 key 数量统计，不用 body 中 ':' 的出现次数估算：字符串值中的冒号
+        // （URL、"12:00"、base64 短信正文）会使计数偏高。误判为 partial 会导致无谓的
+        // invalidateSession() 强制重登；漏判则会把截断的数据当作权威值上传。
         val authFailure = isAuthFailure(rawBody)
         val obj = if (status == HttpStatusCode.OK && !authFailure) parseJson(rawBody) else null
         val isPartial = status == HttpStatusCode.OK && !authFailure &&
@@ -854,20 +839,20 @@ class GoformClient(
 
         if (status != HttpStatusCode.OK || authFailure || isPartial) {
             if (isPartial) {
-                // 2026-10-08：R2-11 的修正版——partial 保留「不每次都重登」的原则，但补回自愈路径。
-                // 真机结论（2026-10-08，F50）：固件对多 key 查询会持续回 200+空体（会话半死态），
-                // 设备重启即恢复 → 说明重登可救；而 R2-11 的「永远只本轮 null」让这种病一旦发作
-                // 就再也不自愈（/api/device/traffic-limit 503、信号/WiFi/邻区全空）。
-                // 折衷：60s 内只允许一次 partial→失效会话→重登升级（CAS 认领，并发读不会重复升级），
-                // 窗口内其余 partial 仍按 R2-11 处理（本轮 null、会话保留）。onAuthLost 交由
-                // queryInternal 走既有的「许可外重登+重试」路径。
+                // partial 的恢复策略：保留「不每次重登」的原则，同时提供自愈路径。
+                // 部分固件对多 key 查询持续返回 200 + 空体（会话半失效），设备重启后恢复，说明
+                // 重新登录可修复该状态；若每次 partial 均只返回 null，该状态不会自愈
+                // （/api/device/traffic-limit 返回 503、信号 / WiFi / 邻区字段为空）。
+                // 折衷方案：60s 内只允许一次 partial→失效会话→重登升级（CAS 认领，并发读不会
+                // 重复升级），窗口内其余 partial 仍返回 null 并保留会话。onAuthLost 交由
+                // queryInternal 走既有的「许可外重登 + 重试」路径。
                 val now = System.currentTimeMillis()
                 val last = lastPartialRecoveryAt.get()
                 val failures = partialRecoveryFailures.get()
                 val waitMs = partialRecoveryWaitMs(failures)
                 if (now - last >= waitMs && lastPartialRecoveryAt.compareAndSet(last, now)) {
-                    // last != 0 表示上一次升级重登之后**又**看到 partial ⇒ 上次没救回来，计数 +1，
-                    // 下一次等待按指数拉长（60s→120s→240s…封顶 10min）。首次（last==0）不计失败。
+                    // last != 0 表示上一次升级重登之后再次出现 partial，即上次未恢复，计数 +1，
+                    // 下一次等待按指数增长（60s→120s→240s…，上限 10min）。首次（last==0）不计失败。
                     if (last != 0L) partialRecoveryFailures.incrementAndGet()
                     AppLogger.w(tag, "[goform_get] Partial response ($cmdParam, keys=${obj?.size ?: 0})" +
                             " — self-heal: invalidate session + relogin (attempt=${failures + 1}," +
@@ -893,8 +878,8 @@ class GoformClient(
             AppLogger.w(tag, "[goform_get] parse failed: ${rawBody.take(200)}")
             return null
         }
-        // 主动自愈（2026-10-08）：完整响应 = 设备已恢复。清零失败计数、退避复位到 60s 档，
-        // 下次再发作时立刻以最灵敏的节奏去救。
+        // 自愈状态复位：完整响应表示设备已恢复。清零失败计数并将退避复位到 60s 档，使下次
+        // 异常时立即以最短间隔尝试恢复。
         if (partialRecoveryFailures.get() != 0 || lastPartialRecoveryAt.get() != 0L) {
             partialRecoveryFailures.set(0)
             lastPartialRecoveryAt.set(0L)
@@ -912,7 +897,7 @@ class GoformClient(
 
     /** 重试在许可之外发起，理由同 [queryInternal]。 */
     private suspend fun querySingleInternal(command: String, retry: Boolean): JsonElement? {
-        // 2026-10-17：与 queryInternal 同一套隔离（熔断 / 预算 / 独立调度器）。
+        // 与 queryInternal 使用同一套隔离（熔断 / 预算 / 独立调度器）。
         if (GoformGuard.isOpen()) {
             GoformGuard.recordFastFail()
             return null
@@ -1069,13 +1054,13 @@ class GoformClient(
     /**
      * 登录响应是否表示失败。
      *
-     * 2026-09-08：原实现是对整个 body 做小写子串匹配，其中 `b.contains("session")`
-     * 会把任何**恰好带 session 字样**的合法响应（如含 `session_timeout` 字段）判成登录失败 ——
-     * 而这个判定的代价很重：直接 `consecutiveLoginFailures++`，退避是 1500 * 2^n，
-     * 几次误判就把整条 goform 路径按到退避上限，表现成「长时间断连」。
-     * 现在只按 `result` 字段精确比较；子串匹配仅保留给**非 JSON**的 HTML 登录页/明文错误串。
-     * 未知 result 一律不判失败（保持既有宽松语义，不新增「登不进去」的失败模式），
-     * 但打一条 WARN 留证据 —— 真遇到新固件的取值，日志里能看见再收紧。
+     * 仅按 `result` 字段精确比较；子串匹配仅用于非 JSON 的 HTML 登录页或明文错误串。
+     * 不得对整个 body 做子串匹配：合法响应中出现 `session_timeout` 等字段即会被判为登录失败，
+     * 而该判定的代价是 `consecutiveLoginFailures++`，退避为 1500 * 2^n，数次误判即可使整条
+     * goform 路径停在退避上限。
+     *
+     * 未知 result 一律不判失败（保持既有宽松语义，不新增登录失败模式），但输出一条 WARN：
+     * 遇到新固件的取值时可在日志中观察到后再收紧。
      */
     internal fun isLoginFailed(body: String?): Boolean {
         if (body.isNullOrBlank()) return false
@@ -1109,25 +1094,24 @@ class GoformClient(
         return bytes.joinToString("") { "%02x".format(it) }
     }
 
-    // 写侧字符集固定 UTF-8。读侧（[decodeDeviceText]）必须先试 UTF-8 才对称 —— 见
-    // companion 的 [Companion.decodeDeviceText] 的注释。**不要**把这里改成 GBK 去「迁就」读侧。
+    // 写侧字符集固定为 UTF-8；读侧（[decodeDeviceText]）必须先尝试 UTF-8 以保持对称，见
+    // companion 中 [Companion.decodeDeviceText] 的注释。不得改为 GBK 以迁就读侧。
     internal fun base64Encode(input: String): String =
         java.util.Base64.getEncoder().encodeToString(input.toByteArray(Charsets.UTF_8))
 
     /**
-     * 解 base64 并把字节按设备文本字符集还原成字符串。
+     * 解 base64 并将字节按设备文本字符集还原为字符串。
      *
-     * 失败语义（**刻意保留，不要改**）：input 不是合法 base64 时打一条 ERROR 后返回**空串**，
-     * 不抛异常、不返回 null。`/api/wifi/settings` 的读路径
-     * （`GoformWifiClient.getCurrentWifiConfig`）依赖这条。
-     * 既有陷阱：空串会被上层当成「口令为空」而不是「解码失败」——
-     * 这个坑在 `getCurrentWifiConfig` 的 KDoc 里也记了一条；要改得单独一轮，
-     * 连带上层的「空 vs 失败」区分一起改，别混在字符集这一轮里。
+     * 失败语义（有意保留）：input 不是合法 base64 时输出一条 ERROR 并返回空串，不抛异常、
+     * 不返回 null。`/api/wifi/settings` 的读路径（`GoformWifiClient.getCurrentWifiConfig`）
+     * 依赖该行为。已知限制：空串会被上层当作「口令为空」而非「解码失败」
+     * （`getCurrentWifiConfig` 的 KDoc 亦有记录）。修正需同时调整上层对「空值」与「失败」的
+     * 区分，不能只改本方法。
      *
-     * 本方法只负责「怎么报错」；解码逻辑在纯函数 [Companion.base64DecodeOrEmpty] /
-     * [Companion.decodeDeviceText]，
-     * 单测打在那两个上面（这个类一构造就起 Ktor client，[AppLogger] 又依赖 android.util.Log，
-     * 实例方法在 JVM 单测里不可用 —— 所以是**测委托目标**，不是为了可测性改生产类型）。
+     * 本方法只负责错误上报；解码逻辑位于纯函数 [Companion.base64DecodeOrEmpty] /
+     * [Companion.decodeDeviceText]，单测针对这两个函数。本类一构造即启动 Ktor client，
+     * [AppLogger] 又依赖 android.util.Log，实例方法在 JVM 单测中不可用，因此测试对象是委托
+     * 目标，而非为可测性改动生产类型。
      */
     override fun decodeDeviceText(input: String): String =
         base64DecodeOrEmpty(input) { e -> AppLogger.e(tag, "base64Decode failed", e) }
@@ -1153,41 +1137,37 @@ class GoformClient(
         AppLogger.d(tag, "setQosEnabled($enabled) -> delegated to GoformQoS singleton")
     }
 
-    // 2026-08-29（计划书 13.2.4 收尾）：`NETWORK_TYPE_MAP` + `mapNetworkType()` 已删。
-    // 那 44 项数字码→制式名的映射属于**设备知识**，现在只存在于
-    // `ZteGoformProfile.NETWORK_TYPE_MAP` / `NETWORK_TYPE_DECODER`（逐条搬过去、语义一致，
-    // 含"纯数字才查表、非数字原样透出"这条踩过坑的规则）。
-    // 读侧的 `network_type` 在归一化时就已经是可读文案，调用方不需要再翻译一次。
+    // `NETWORK_TYPE_MAP` 与 `mapNetworkType()` 已移除。数字码到制式名的映射属于设备知识，仅
+    // 存在于 `ZteGoformProfile.NETWORK_TYPE_MAP` / `NETWORK_TYPE_DECODER`，语义一致，其中
+    // 「纯数字才查表、非数字原样返回」的规则必须保留。读侧的 `network_type` 在归一化时已是
+    // 可读文案，调用方不需要再次翻译。
 
     companion object {
-        /** 老固件（以及备份版实现）假定的设备文本字符集。只作为 UTF-8 不成立时的回落。 */
+        /** 老固件假定的设备文本字符集，仅作为 UTF-8 不成立时的回落。 */
         private val GBK: Charset = Charset.forName("GBK")
 
         /**
-         * 把设备返回的字节按「先 UTF-8，不合法才 GBK」还原成字符串。
+         * 将设备返回的字节按「先 UTF-8，不合法才使用 GBK」还原为字符串。
          *
-         * 2026-09-22：修字符集不对称。改前写侧是 [base64Encode] = UTF-8，读侧却无条件
-         * `String(bytes, GBK)` —— 写 UTF-8 / 读 GBK。ASCII 下两者一致所以一直没暴露，
-         * 但 2026-09-21 修完 `setWifiSSID` / `setWifiConfig` 那两个 Password bug 后，
-         * 「读回明文 → base64Encode 写回」成了常规路径，非 ASCII（中文）口令会在一次
-         * 「读回再写回」里被改坏。改成先试 UTF-8 后：
-         *  - ASCII：两种字符集编码相同，无任何行为变化；
-         *  - 设备存 UTF-8：修好了（改前被 GBK 解错）；
-         *  - 设备存 GBK（老固件）：UTF-8 解不合法 → 回落 GBK → 与改前一致。
+         * 写侧 [base64Encode] 使用 UTF-8，读侧必须与之对称：无条件按 GBK 解码时，ASCII 内容因
+         * 两种字符集编码相同而看不出差异，但非 ASCII（中文）口令在「读回明文 → base64Encode
+         * 写回」的流程中会被改坏，而该流程是 WiFi 口令与配置回写的常规路径。改为先试 UTF-8 后：
+         *  - ASCII：两种字符集编码相同，行为不变；
+         *  - 设备存 UTF-8：正确还原；
+         *  - 设备存 GBK（老固件）：UTF-8 解码不合法 → 回落 GBK → 与原有行为一致。
          *
-         * 判据是「**能否无损往返**」：UTF-8 解出来再编回去，字节与原字节逐一相等才算
-         * 「这堆字节本来就是 UTF-8」。为什么不用「解出来含不含 U+FFFD 替换字符」：
-         *  - 漏判：JDK 的 `String(bytes, UTF_8)` 对非法序列**不抛异常**，只替换成 U+FFFD，
-         *    所以「有没有异常」根本不是判据；
-         *  - 误判：设备真存了一个 U+FFFD（EF BF BD）时，那是**合法** UTF-8，
-         *    按「含替换字符就算失败」会被错误地回落 GBK。
-         *  往返判据同时覆盖这两种情况：替换过的字节必然编回成 EF BF BD 而与原字节不等，
-         *  真 U+FFFD 则往返相等。
+         * 判据是「能否无损往返」：UTF-8 解码后再编码，字节与原字节逐一相等，才认定该字节串为
+         * UTF-8。不使用「解码结果是否含 U+FFFD 替换字符」作为判据：
+         *  - 漏判：JDK 的 `String(bytes, UTF_8)` 对非法序列不抛异常，只替换为 U+FFFD，因此
+         *    「是否抛异常」不构成判据；
+         *  - 误判：设备确实存储 U+FFFD（EF BF BD）时，该字节序列是合法 UTF-8，按「含替换字符
+         *    即失败」会被错误地回落 GBK。
+         * 往返判据同时覆盖两种情况：被替换过的字节编码后必然变为 EF BF BD，与原字节不等；
+         * 真实的 U+FFFD 则往返相等。
          *
-         * 刻意接受的权衡：GBK 双字节序列偶有恰好也是合法 UTF-8 的可能，这种输入会被判成
-         * UTF-8 而解错。接受它是因为**写侧是 UTF-8**：保证「读回再写回」无损，
-         * 优先于兼容一个尚未在真机上观测到的边缘固件。反过来（先 GBK）则会让每一个
-         * UTF-8 口令的回写都损坏 —— 那是已经能复现的问题。
+         * 已知权衡：GBK 双字节序列偶尔也构成合法 UTF-8，此类输入会被判为 UTF-8 而解码错误。
+         * 接受该权衡的原因是写侧固定使用 UTF-8：保证「读回再写回」无损优先于兼容尚未在设备上
+         * 观测到的边缘固件。反之（优先 GBK）会使每个 UTF-8 口令的回写都损坏。
          */
         internal fun decodeDeviceText(bytes: ByteArray): String {
             val asUtf8 = String(bytes, Charsets.UTF_8)
@@ -1196,12 +1176,12 @@ class GoformClient(
         }
 
         /**
-         * 实例方法 `decodeDeviceText(String)` 的纯函数体：合法 base64 → [decodeDeviceText] 的结果；
-         * 非法 base64 → 调一次 [onError] 后返回**空串**（与改造前逐字同义）。
+         * 实例方法 `decodeDeviceText(String)` 的纯函数体：合法 base64 → [decodeDeviceText] 的
+         * 结果；非法 base64 → 调用一次 [onError] 后返回空串。
          *
-         * 「怎么报错」用参数传进来，是为了让这段逻辑能在 JVM 单测里跑：
-         * 实例方法传的是 `AppLogger.e`（依赖 android.util.Log），单测传默认的空实现。
-         * 这样测的就是生产路径本身，不需要构造 [GoformClient]（构造即起 Ktor client）。
+         * 错误上报通过参数传入，使该逻辑可在 JVM 单测中执行：实例方法传入 `AppLogger.e`
+         * （依赖 android.util.Log），单测传入默认的空实现。这样测试覆盖的是生产路径本身，无需
+         * 构造 [GoformClient]（构造即启动 Ktor client）。
          */
         internal inline fun base64DecodeOrEmpty(
             input: String,

@@ -863,21 +863,29 @@ class ZteGoformProfileTest {
     }
 
     @Test
-    fun `network_type 数字走映射表未知值带原文非数字原样透出`() {
-        assertEquals(
-            JsonPrimitive("5G"),
-            canonicalOnly(FieldGroup.SIGNAL, "network_type" to "20")[DeviceFields.Signal.RAT],
-        )
-        assertEquals(
-            JsonPrimitive("未知(999)"),
-            canonicalOnly(FieldGroup.SIGNAL, "network_type" to "999")[DeviceFields.Signal.RAT],
-        )
-        // 固件已经给了可读文案时不要再包一层"未知(...)"
-        assertEquals(
-            JsonPrimitive("NSA"),
-            canonicalOnly(FieldGroup.SIGNAL, "network_type" to "NSA")[DeviceFields.Signal.RAT],
-        )
-        assertNull("空串视为字段缺失", canonicalOnly(FieldGroup.SIGNAL, "network_type" to "")[DeviceFields.Signal.RAT])
+    fun `network_type 数字走映射表非数字做 RAT 别名归一化`() {
+        fun rat(raw: String) = canonicalOnly(FieldGroup.SIGNAL, "network_type" to raw)[DeviceFields.Signal.RAT]
+
+        assertEquals(JsonPrimitive("5G"), rat("20"))
+        assertEquals(JsonPrimitive("未知(999)"), rat("999"))
+
+        // 2026-11-10：固件报 NSA 别名时统一成可读文案。
+        // 之前只有 App 端 mapRat 认识 ENDC，Web 直接拿到原值，界面上显示 "ENDC"。
+        assertEquals(JsonPrimitive("5G NSA"), rat("NSA"))
+        assertEquals(JsonPrimitive("5G NSA"), rat("ENDC"))
+        assertEquals(JsonPrimitive("5G NSA"), rat("EN-DC"))
+        assertEquals(JsonPrimitive("5G NSA"), rat("nr_nsa"))
+
+        // 其它常见别名与 App 的 mapRat 表保持一致
+        assertEquals(JsonPrimitive("5G"), rat("NR"))
+        assertEquals(JsonPrimitive("5G"), rat("SA"))
+        assertEquals(JsonPrimitive("4G"), rat("LTE"))
+        assertEquals(JsonPrimitive("3G"), rat("WCDMA"))
+        assertEquals(JsonPrimitive("2G"), rat("EDGE"))
+
+        // 表里没有的值原样透出：不猜、不吞
+        assertEquals(JsonPrimitive("XYZ"), rat("XYZ"))
+        assertNull("空串视为字段缺失", rat(""))
     }
 
     /**
@@ -1033,7 +1041,7 @@ class ZteGoformProfileTest {
         assertFalse("band_width 缺失时不能出现在响应里", cell.containsKey(DeviceFields.Signal.BAND_WIDTH))
     }
 
-    /** 不看 `rat` 字符串：NSA 下 network_type 是 "NSA"，两侧都有值时仍取 NR。 */
+    /** 不看 `rat` 字符串：NSA 下 network_type 是 "NSA"（归一化后为 "5G NSA"），两侧都有值时仍取 NR。 */
     @Test
     fun `NSA 双连接下取 NR 侧`() {
         val cell = ServingCell.derive(
@@ -1272,17 +1280,17 @@ class ZteGoformProfileTest {
     @Test
     fun `接入控制名单四条都发全且末尾带分号`() {
         // 断言照 2026-08-30 真机抓包：
-        // goformId=setDeviceAccessControlList&AclMode=2&WhiteMacList=&BlackMacList=2a:ed:87:b3:e8:29;
-        // &WhiteNameList=&BlackNameList=OPPO-Find-X7;
+        // goformId=setDeviceAccessControlList&AclMode=2&WhiteMacList=&BlackMacList=aa:bb:cc:dd:ee:ff;
+        // &WhiteNameList=&BlackNameList=Example-Device;
         val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ACL)!!
         assertEquals("setDeviceAccessControlList", spec.command)
         val out = spec.encode(mapOf(
-            "black_macs" to listOf("2a:ed:87:b3:e8:29"),
-            "black_names" to listOf("OPPO-Find-X7"),
+            "black_macs" to listOf("aa:bb:cc:dd:ee:ff"),
+            "black_names" to listOf("Example-Device"),
         ))
         assertEquals("2", out["AclMode"])
-        assertEquals("单项也要带结尾分号", "2a:ed:87:b3:e8:29;", out["BlackMacList"])
-        assertEquals("OPPO-Find-X7;", out["BlackNameList"])
+        assertEquals("单项也要带结尾分号", "aa:bb:cc:dd:ee:ff;", out["BlackMacList"])
+        assertEquals("Example-Device;", out["BlackNameList"])
         // 设备是整表替换：空名单也必须带 key，漏发等于把那张表清空
         assertEquals("", out["WhiteMacList"])
         assertEquals("", out["WhiteNameList"])
@@ -1301,18 +1309,18 @@ class ZteGoformProfileTest {
     fun `接入控制名单拦住非法 MAC 与长度不齐`() {
         val spec = ZteGoformProfile.writeSpec(SettingKey.WIFI_ACL)!!
         assertNull(spec.validate(mapOf(
-            "black_macs" to listOf("2a:ed:87:b3:e8:29"),
-            "black_names" to listOf("OPPO-Find-X7"),
+            "black_macs" to listOf("aa:bb:cc:dd:ee:ff"),
+            "black_names" to listOf("Example-Device"),
         )))
         assertNotNull("MAC 必须是六段十六进制", spec.validate(mapOf("black_macs" to listOf("2a-ed-87"))))
         assertNotNull(
             "Mac 与 Name 按下标一一对应，长度必须相等",
-            spec.validate(mapOf("black_macs" to listOf("2a:ed:87:b3:e8:29"), "black_names" to emptyList<String>()))
+            spec.validate(mapOf("black_macs" to listOf("aa:bb:cc:dd:ee:ff"), "black_names" to emptyList<String>()))
         )
         assertNotNull(
             "名称不许含 goform 的分隔符",
             spec.validate(mapOf(
-                "black_macs" to listOf("2a:ed:87:b3:e8:29"),
+                "black_macs" to listOf("aa:bb:cc:dd:ee:ff"),
                 "black_names" to listOf("bad;name"),
             ))
         )

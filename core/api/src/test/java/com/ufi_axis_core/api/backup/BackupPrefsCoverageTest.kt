@@ -48,7 +48,12 @@ class BackupPrefsCoverageTest {
      * 整份搬会把身份与凭据也带过去（见 `AppSettingsBackupCompletenessTest`）。
      */
     private val notBackedUp: Map<String, String> = mapOf(
-        "ufi_axis_settings" to "主设置文件：走 BACKUP_FIELDS 白名单逐键搬，不整份复制"
+        "ufi_axis_settings" to "主设置文件：走 BACKUP_FIELDS 白名单逐键搬，不整份复制",
+        // 2026-10-31 运营商账单：Cookie/手机号等同账号会话，绝不能进备份包；
+        // 限流时间戳是设备本地运行态，换机后重置才是对的。
+        "ufi_carrier" to "运营商账号会话：PII/Cookie，禁止导出到备份",
+        "ufi_carrier_limits" to "发码限流时间戳：设备本地运行态，不参与备份",
+        "ufi_carrier_auto" to "自动登录尝试次数/上次成功时间：设备本地运行态，不参与备份"
     )
 
     @Test

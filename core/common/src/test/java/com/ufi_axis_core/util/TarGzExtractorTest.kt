@@ -49,6 +49,15 @@ class TarGzExtractorTest {
     }
 
     @Test
+    fun `同名条目全为空文件时失败`() {
+        val archive = writeTarGz(tmp.newFile("empty.tar.gz"), "dir/frpc" to ByteArray(0))
+        val result = TarGzExtractor.extractEntry(archive, "frpc", File(tmp.root, "frpc"), 1024)
+
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull()?.message?.contains("空文件") == true)
+    }
+
+    @Test
     fun `条目超过上限时失败且不写出文件`() {
         val archive = writeTarGz(
             tmp.newFile("big.tar.gz"),
@@ -60,6 +69,40 @@ class TarGzExtractorTest {
 
         assertTrue(result.isFailure)
         assertTrue("超限时不应写出文件", !out.exists())
+    }
+
+    @Test
+    fun `同名条目取最大的那个（Syncthing 的 etc 脚本陷阱）`() {
+        val script = "#!/bin/sh\n".repeat(20).toByteArray()
+        val binary = ByteArray(4096) { 2 }
+        val archive = writeTarGz(
+            tmp.newFile("syncthing.tar.gz"),
+            "syncthing-linux-arm64-v2.1.7/etc/freebsd-rc/syncthing" to script,
+            "syncthing-linux-arm64-v2.1.7/etc/firewall-ufw/syncthing" to script,
+            "syncthing-linux-arm64-v2.1.7/syncthing" to binary
+        )
+        val out = File(tmp.root, "syncthing")
+
+        val size = TarGzExtractor.extractEntry(archive, "syncthing", out, 1024 * 1024).getOrThrow()
+
+        assertEquals(binary.size.toLong(), size)
+        assertTrue("必须提取到真正的二进制，而不是 etc 下的同名脚本", out.readBytes().contentEquals(binary))
+    }
+
+    @Test
+    fun `大条目之后出现的小同名条目不会覆盖`() {
+        val binary = ByteArray(4096) { 3 }
+        val script = "#!/bin/sh\n".repeat(20).toByteArray()
+        val archive = writeTarGz(
+            tmp.newFile("reverse.tar.gz"),
+            "pkg/syncthing" to binary,
+            "pkg/etc/syncthing" to script
+        )
+        val out = File(tmp.root, "syncthing")
+
+        TarGzExtractor.extractEntry(archive, "syncthing", out, 1024 * 1024).getOrThrow()
+
+        assertTrue(out.readBytes().contentEquals(binary))
     }
 
     /**

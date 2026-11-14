@@ -215,17 +215,56 @@ interface SignalDao {
     @Insert
     suspend fun insertAll(records: List<SignalRecord>)
 
-    @Query("SELECT * FROM signal_history ORDER BY timestamp DESC LIMIT 1")
-    suspend fun getLatest(): SignalRecord?
-
-    @Query("SELECT * FROM signal_history WHERE timestamp >= :startTime ORDER BY timestamp ASC")
+    /**
+     * 信号值域过滤（2026-11-09）。
+     *
+     * 采集层已经用 `SignalSanity` 拦住了新写入的越界值，但历史上可能已有 3e7 这类坏行；
+     * 图表/详情/导出都不能再看到它们。这里在 SQL 层再过滤一遍：
+     * - `0` 是既有的"无信号"哨兵，保留（由调用方/聚合再按 !=0 处理）；
+     * - 区间与本文件外的 `SignalSanity` 保持一致（rsrp -160..-20、rsrq -30..0、
+     *   sinr -50..50、rssi -120..-20）。
+     */
+    @Query("""
+        SELECT * FROM signal_history
+        WHERE timestamp >= :startTime
+          AND (sinr = 0 OR sinr BETWEEN -50 AND 50)
+          AND (rsrp = 0 OR rsrp BETWEEN -160 AND -20)
+          AND (rsrq = 0 OR rsrq BETWEEN -30 AND 0)
+          AND (rssi = 0 OR rssi BETWEEN -120 AND -20)
+        ORDER BY timestamp ASC
+    """)
     suspend fun getRecordsSince(startTime: Long): List<SignalRecord>
 
-    @Query("SELECT * FROM signal_history WHERE timestamp >= :startTime ORDER BY timestamp DESC LIMIT :limit")
+    @Query("""
+        SELECT * FROM signal_history
+        WHERE timestamp >= :startTime
+          AND (sinr = 0 OR sinr BETWEEN -50 AND 50)
+          AND (rsrp = 0 OR rsrp BETWEEN -160 AND -20)
+          AND (rsrq = 0 OR rsrq BETWEEN -30 AND 0)
+          AND (rssi = 0 OR rssi BETWEEN -120 AND -20)
+        ORDER BY timestamp DESC LIMIT :limit
+    """)
     suspend fun getRecordsSinceLimited(startTime: Long, limit: Int): List<SignalRecord>
 
-    @Query("SELECT timestamp, rsrp, sinr FROM signal_history WHERE timestamp >= :startTime ORDER BY timestamp ASC")
+    @Query("""
+        SELECT timestamp,
+               CASE WHEN rsrp BETWEEN -160 AND -20 THEN rsrp ELSE 0 END AS rsrp,
+               CASE WHEN sinr BETWEEN -50 AND 50 THEN sinr ELSE 0 END AS sinr
+        FROM signal_history
+        WHERE timestamp >= :startTime
+        ORDER BY timestamp ASC
+    """)
     suspend fun getLightweightSince(startTime: Long): List<SignalLight>
+
+    @Query("""
+        SELECT * FROM signal_history
+        WHERE (sinr = 0 OR sinr BETWEEN -50 AND 50)
+          AND (rsrp = 0 OR rsrp BETWEEN -160 AND -20)
+          AND (rsrq = 0 OR rsrq BETWEEN -30 AND 0)
+          AND (rssi = 0 OR rssi BETWEEN -120 AND -20)
+        ORDER BY timestamp DESC LIMIT 1
+    """)
+    suspend fun getLatest(): SignalRecord?
 
     /**
      * 区间桶聚合（SQL 层降采样）：rsrp
@@ -234,7 +273,9 @@ interface SignalDao {
      */
     @Query("""
         SELECT (timestamp / :bucketMs) AS bucket, AVG(rsrp) AS avgVal, MIN(rsrp) AS minVal, MAX(rsrp) AS maxVal
-        FROM signal_history WHERE timestamp >= :startTime AND timestamp <= :endTime AND rsrp != 0
+        FROM signal_history
+        WHERE timestamp >= :startTime AND timestamp <= :endTime
+          AND rsrp != 0 AND rsrp BETWEEN -160 AND -20
         GROUP BY bucket ORDER BY bucket ASC
     """)
     suspend fun getAggregatedRsrpBetween(startTime: Long, endTime: Long, bucketMs: Long): List<SignalAggregateBucket>
@@ -246,12 +287,21 @@ interface SignalDao {
      */
     @Query("""
         SELECT (timestamp / :bucketMs) AS bucket, AVG(sinr) AS avgVal, MIN(sinr) AS minVal, MAX(sinr) AS maxVal
-        FROM signal_history WHERE timestamp >= :startTime AND timestamp <= :endTime AND sinr != 0
+        FROM signal_history
+        WHERE timestamp >= :startTime AND timestamp <= :endTime
+          AND sinr != 0 AND sinr BETWEEN -50 AND 50
         GROUP BY bucket ORDER BY bucket ASC
     """)
     suspend fun getAggregatedSinrBetween(startTime: Long, endTime: Long, bucketMs: Long): List<SignalAggregateBucket>
 
-    @Query("SELECT * FROM signal_history ORDER BY timestamp DESC LIMIT :limit")
+    @Query("""
+        SELECT * FROM signal_history
+        WHERE (sinr = 0 OR sinr BETWEEN -50 AND 50)
+          AND (rsrp = 0 OR rsrp BETWEEN -160 AND -20)
+          AND (rsrq = 0 OR rsrq BETWEEN -30 AND 0)
+          AND (rssi = 0 OR rssi BETWEEN -120 AND -20)
+        ORDER BY timestamp DESC LIMIT :limit
+    """)
     suspend fun getRecentRecords(limit: Int): List<SignalRecord>
 
     @Query("DELETE FROM signal_history WHERE timestamp < :cutoff")

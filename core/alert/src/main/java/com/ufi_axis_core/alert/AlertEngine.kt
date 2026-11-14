@@ -31,8 +31,8 @@ import kotlinx.serialization.Serializable
  *
  * 特性:
  * - 防抖: 同一告警 5 分钟内不重复触发；connectivity 60s
- * - 状态变化检测（2026-08-11 P1-E 补丁）: connectivity 仅在 online↔offline 切换时触发，
- *   避免周期采集反复触发"网络已恢复"告警堆叠（WiFi 抖动场景下每分钟一条堆积 50 条）
+ * - 状态变化检测: connectivity 仅在 online↔offline 切换时触发，
+ *   避免周期采集反复触发「网络已恢复」告警堆叠（网络抖动场景下会持续堆积）
  * - 分级: info / warning / critical
  * - 投递（WS 推送 + 邮件）统一交给 [NotificationDispatcher]（见 [attachNotifier]）
  * - SQLite 持久化
@@ -43,14 +43,14 @@ class AlertEngine(
     private val webSocketManager: WebSocketManager,
     private val appSettings: AppSettings,
     /**
-     * 温度告警的回差带宽，摄氏度。来自 `DeviceTuning.thermalJitterC`（设备插件的实测值）。
+     * 温度告警的回差带宽，单位摄氏度。来自 `DeviceTuning.thermalJitterC`（设备插件的实测值）。
      *
-     * **收一个 Double 而不是收整个 `DeviceTuning`**：`:core:alert` 不该认识插件层，
-     * 更重要的是 `DeviceTuning` 里还躺着 `downloadThrottleWarnC = 75f`，而本类的
-     * `AlertConfig.temperatureCritical` 默认也是 75.0 —— 两者数值相同、语义相反。
-     * 把整个 tuning 递进来，就给「看到两边都是 75 就接线」留了一个静默改坏告警的口子。
+     * **接收 Double 而不是整个 `DeviceTuning`**：`:core:alert` 不应依赖插件层；
+     * 更重要的是 `DeviceTuning` 中还含 `downloadThrottleWarnC = 75f`，而本类的
+     * `AlertConfig.temperatureCritical` 默认值同样是 75.0 —— 两者数值相同、语义相反。
+     * 传入整个 tuning 会使「看到两边都是 75 就接线」的错误难以被发现。
      *
-     * 默认值 = [DEFAULT_TEMP_HYSTERESIS_C]，所以既有测试与任何不传的调用点行为不变。
+     * 默认值 = [DEFAULT_TEMP_HYSTERESIS_C]，因此既有测试与未显式传入的调用点行为不变。
      */
     private val temperatureHysteresisC: Double = DEFAULT_TEMP_HYSTERESIS_C
 ) {
@@ -59,18 +59,18 @@ class AlertEngine(
 
     // 边沿触发缓存: alertType -> 上次评估的级别（normal/warning/critical）。
     // 仅当级别发生跃迁（normal→warning、warning→normal 等）时才触发告警，
-    // 替代旧的电平触发 + 5 分钟防抖（稳态下仍会 288 条/天堆积）。
+    // 替代电平触发 + 5 分钟防抖（稳态下会持续堆积）。
     //
-    // 2026-09-21 改为**持久化**：此前是纯内存 Map，缺省 normal，于是每次 core 启动
-    // （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当成
-    // normal→warning 跃迁重报一遍 —— 用户看到的是一批莫名其妙的重复告警。
+    // 该状态必须持久化：纯内存 Map 缺省为 normal，core 每次启动
+    // （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当作
+    // normal→warning 跃迁重新上报，表现为一批重复告警。
     private val lastLevelByType = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     init {
         restoreLevelState()
     }
 
-    /** 从 SharedPreferences 恢复边沿状态。解析失败按空处理（退化为旧的"全部 normal"行为）。 */
+    /** 从 SharedPreferences 恢复边沿状态。解析失败按空处理（等效于全部 normal）。 */
     private fun restoreLevelState() {
         val json = appSettings.alertLevelStateJson?.takeIf { it.isNotBlank() } ?: return
         try {
@@ -99,14 +99,15 @@ class AlertEngine(
     }
 
     /**
-     * 带回差（hysteresis）的三档判级，**「越大越坏」**方向（温度 / 流量 / 使用百分比）。
+     * 带回差（hysteresis）的三档判级，适用于「越大越坏」方向（温度 / 流量 / 使用百分比）。
      *
-     * 升级用原阈值，降级要求回落到 `阈值 - band` 以下。
+     * 升级使用原阈值，降级要求回落到 `阈值 - band` 以下。
      *
-     * 为什么必须有回差：边沿触发 + 零回差的组合下，指标在阈值上下微抖会让级别每个采集周期
-     * 都跃迁一次 —— 每次进 warning 推一条、首条还发邮件/Webhook/短信，每次回 normal 又把
-     * `resolvedAt` 写上、下一次 `bumpExisting` 再清掉。表现是「一条告警次数无限上涨、
-     * 已恢复标记反复闪烁」，并烧光通知配额。信号常年在 -100 附近、温度在阈值附近都会踩到。
+     * 回差是必需的：边沿触发与零回差组合下，指标在阈值上下微抖会使级别在每个采集周期
+     * 都跃迁一次 —— 每次进入 warning 推送一条（首条还发送邮件 / Webhook / 短信），
+     * 每次回到 normal 又写入 `resolvedAt`、下一次 `bumpExisting` 再清除。
+     * 表现为「同一条告警次数无限上涨、已恢复标记反复变化」，并耗尽通知配额。
+     * 信号长期在 -100 附近、温度在阈值附近都会触发该问题。
      *
      * 「越小越坏」的指标（RSRP / 电量）取负后复用同一套判据，见 [checkSignal] / [checkBattery]。
      */
@@ -156,15 +157,11 @@ class AlertEngine(
     /**
      * 通知投递钩子（装配层接到 `NotificationDispatcher::emit`）。
      *
-     * 2026-08-31 加：在此之前告警邮件的**唯一**生产者是 app —— app 收到 WS 推送 → 弹系统通知 →
-     * 再回传给 core 发信。于是 app 没连上（或没装）时，温度/电量/信号/流量/离线告警一封邮件都发
-     * 不出来，与"邮件通知是 core 的独立能力"的初衷相反。那条回传端点已于 2026-09-10 删除。
+     * 只有这一个钩子：推送与邮件都由分发器的渠道列表决定，不存在邮件专用通道。
+     * 投递必须由 core 直接完成，不得依赖 app 转发 —— app 未连接或未安装时，
+     * 温度 / 电量 / 信号 / 流量 / 离线告警将无法投递。
      *
-     * 2026-09-08 阶段 1：原来这里是一个 5 参数的**邮件专用**钩子（type/level/message/value/
-     * threshold），推送则是另一条路（构造参数里的 `pushService`）—— 同一件事两个出口，
-     * 加第三个渠道要再缝一遍。现在只有这一个钩子，推送与邮件都由分发器的渠道列表决定。
-     *
-     * 总开关与免打扰不在这里判 —— 闸门在分发器，这里判一遍就成了两份真源。
+     * 总开关与免打扰不在此处判定 —— 闸门在分发器，此处再判会产生两份真源。
      */
     @Volatile
     private var notifier: Notifier? = null
@@ -201,8 +198,8 @@ class AlertEngine(
                     // AlertRecord、web 靠它筛选与配色。两者粒度不同，见 NotifyEvent.type。
                     type = type,
                     level = NotifyLevel.fromWire(level),
-                    // title 走告警文案本身：**邮件主题**要看得出发生了什么，
-                    // 放固定词等于收件箱里一排一模一样的标题。
+                    // title 使用告警文案本身：邮件主题需要反映具体事件，
+                    // 固定文案会使收件箱中所有主题相同。
                     title = message,
                     // 推送那一侧仍是固定串「设备告警」——那是线上契约里的既有取值，
                     // `alert` topic 上还有 web 与 app 主进程 UI 在消费同一份 payload，
@@ -236,11 +233,11 @@ class AlertEngine(
     /**
      * 「告警 type → 通知场景」的映射表。
      *
-     * 2026-09-08 从 `ComponentFactory` 搬进来：装配层不该替告警引擎翻译自己的 type ——
-     * 新增一个 type 时该改的地方就在这个文件里，而不是在一层之外的 lambda 里。
+     * 该映射属于告警引擎而非装配层：新增 type 时应修改本文件，
+     * 而不是在装配层之外新增 lambda。
      *
-     * 未登记的 type 归 [NotifyScenes.ALERT]（阈值告警是默认族），所以漏登记的后果是
-     * "归到阈值告警场景"而不是"通知发不出去"。
+     * 未登记的 type 归 [NotifyScenes.ALERT]（阈值告警是默认族），因此漏登记的后果是
+     * 「归入阈值告警场景」而不是「通知无法发送」。
      */
     private fun sceneOf(type: String): String = when (type) {
         "connectivity" -> NotifyScenes.CONNECTIVITY
@@ -248,52 +245,52 @@ class AlertEngine(
         "traffic_limit" -> NotifyScenes.TRAFFIC_80
         "device_online", "device_offline" -> NotifyScenes.EVENTS
         "plan_expiry" -> NotifyScenes.PLAN_EXPIRY
-        // 安全事件（2026-10-15：配对黑名单命中 / 冷却）归"事件"场景，与设备上下线同族 ——
-        // 它们都是"发生了一件事"，不是"某个指标超阈值"。
+        // 安全事件（配对黑名单命中 / 冷却）归「事件」场景，与设备上下线同族 ——
+        // 它们都是「发生了一件事」，不是「某个指标超阈值」。
         "pairing_blocked_hit", "pairing_block_cooldown" -> NotifyScenes.EVENTS
         else -> NotifyScenes.ALERT
     }
 
-    // P1-E 补丁（2026-08-11）：connectivity 上次网络状态记忆（防止周期采集重复触发"网络已恢复"告警）
-    // 仅 online↔offline 切换时触发。2026-08-23 去重改造：其余 4 类指标改用统一的边沿触发 evaluate()，
+    // connectivity 上次网络状态记忆（防止周期采集重复触发「网络已恢复」告警）
+    // 仅 online↔offline 切换时触发。其余 4 类指标使用统一的边沿触发 evaluate()，
     // 阈值穿越（如温度跨过警告线）只产生 1 条告警，稳态持续超标不再反复入库。
     @Volatile private var lastNetworkConnected: Boolean? = null
     @Volatile private var lastNetworkType: String = ""
 
-    // 2026-09-04 抖动抑制：状态变化必须**连续保持** CONNECTIVITY_CONFIRM_MS 才算真变化。
-    // 采集节拍是 ~3s，一次搜网/切网的瞬时空档以前会立刻产出「网络已断开」+「网络已恢复」两条告警
-    // （还会各发一封邮件）。这里记住「待确认的新状态」及其首次出现时间。
+    // 抖动抑制：状态变化必须连续保持 CONNECTIVITY_CONFIRM_MS 才算真实变化。
+    // 采集节拍约为 3s，一次搜网 / 切网的瞬时空档会产生「网络已断开」+「网络已恢复」两条告警
+    // （各发一封邮件）。此处记录「待确认的新状态」及其首次出现时间。
     @Volatile private var pendingConnected: Boolean? = null
     @Volatile private var pendingConnectedSince: Long = 0L
     @Volatile private var pendingType: String = ""
     @Volatile private var pendingTypeSince: Long = 0L
 
     // 告警配置
-    // ════════════ 多端同步真源约定（P2 核心） ════════════
+    // ════════════ 多端同步真源约定 ════════════
     // - enabled / perType / 阈值 等全部以 core 端 SharedPreferences 为唯一权威。
-    // - 手机端只是镜像：连接 core 即 GET /config 拉取；仅用户「显式切换」时才 PUT（带 configVersion）。
-    // - 严禁「连接即写默认 enabled=true」——这是 ab 设备回弹的根因，已清除。
+    // - 手机端只是镜像：连接 core 即 GET /config 拉取；仅用户显式切换时才 PUT（带 configVersion）。
+    // - 不得在连接时写入默认 enabled=true —— 该行为会使配置在多端之间反复回弹。
     // - configVersion 单调递增守门：旧版本 PUT 返回 409，调用方须 GET 最新后重试。
     @Serializable
     data class AlertConfig(
         // ── 总开关（唯一真源：false → 引擎不检测/不入库/不广播） ──
-        // 2026-09-07：默认 false（用户要求告警不默认开启）。与 app 侧
-        // `com.ufi_axis.data.model.AlertConfig.enabled` / UI 兜底 `?: false` 逐字一致。
+        // 默认 false（告警默认不开启）。与 app 侧
+        // `com.ufi_axis.data.model.AlertConfig.enabled` / UI 兜底 `?: false` 一致。
         val enabled: Boolean = false,
         // ── 分类开关：type -> 是否启用该类型告警（缺键视为**关闭**，见 typeEnabled） ──
         val perType: Map<String, Boolean> = emptyMap(),
-        // 2026-09-07 / 2026-09-21 累计删除三个假开关（只被持久化 / 同步，引擎从来不读）：
-        // - `edgeTriggeredOnly`：无论真假都一律走 evaluate() 边沿触发；
-        // - `maxRows`：环形裁剪写死用 MAX_ALERT_ROWS；
-        // - `minIntervalSec`（2026-09-21 删）：号称「同 (type,level) 最小聚合间隔秒」，
-        //   但聚合走的是 `bumpExisting`（同 type+level 未确认行就累加），压根没有时间窗；
-        //   web 的注释还把它当成真配置在展示。留着只会让人以为改了有效果。
-        // 真要做成可配，得先让 triggerAlert 读它。
+        // 已移除三个无效开关（仅被持久化 / 同步，引擎从不读取）：
+        // - `edgeTriggeredOnly`：无论取值均走 evaluate() 边沿触发；
+        // - `maxRows`：环形裁剪固定使用 MAX_ALERT_ROWS；
+        // - `minIntervalSec`：声明为「同 (type,level) 最小聚合间隔秒」，
+        //   但聚合实际由 `bumpExisting` 完成（同 type+level 未确认行累加），不存在时间窗；
+        //   web 的注释曾将其作为有效配置展示。保留只会造成「修改后仍有效果」的误解。
+        // 如需真正可配，必须先让 triggerAlert 读取该字段。
         // ── 多端同步版本号（单调递增；PUT 守门用） ──
         val configVersion: Long = 1L,
-        // ── 阈值（2026-09-21：重定温度阈值以适配 Unisoc 随身WiFi 实测）──
-        // 旧默认 45/55 与温控熔断 `monitorThermalWarnC=70` 自相矛盾；
-        // Unisoc 稳态 50~60°C，45 开机后很快就恒 critical。
+        // ── 阈值（温度阈值按 Unisoc 随身 WiFi 实测重定）──
+        // 旧默认 45/55 与温控熔断 `monitorThermalWarnC=70` 冲突；
+        // Unisoc 稳态为 50~60°C，45 会在开机后很快恒为 critical。
         // 新值 65/75 留出稳态余量，且与温控熔断量级一致。
         val temperatureWarning: Double = 65.0,
         val temperatureCritical: Double = 75.0,
@@ -321,18 +318,17 @@ class AlertEngine(
     val config: StateFlow<AlertConfig> = _config
 
     /**
-     * 单个告警类型是否应当检测（2026-08-27 T40-13）。
+     * 单个告警类型是否应当检测。
      *
-     * 此前 `perType` 只被持久化 / 版本守门 / 多端同步，引擎从不查它：用户在设置页关掉
-     * 「温度告警」后引擎照旧检测、照旧入库、照旧广播，关闭动作只改变了那个 Switch 的显示。
+     * `perType` 必须由引擎实际读取：若只被持久化、版本守门与多端同步使用，
+     * 用户在设置页关闭「温度告警」后引擎仍会检测、入库与广播，关闭动作只影响开关显示。
      *
      * 语义：
-     * - 总开关 `enabled=false` → 一律不检测（原有语义不变）；
+     * - 总开关 `enabled=false` → 一律不检测；
      * - `perType[type] == false` → 该类型不检测；
-     * - **键缺省视为关闭**（2026-09-07 由 `!= false` 改为 `== true`）：用户要求告警分类
-     *   不默认开启，app 侧 UI 兜底也统一改成了 `?: false`（AlertSettingsScreen /
-     *   NotificationsGuardScreen）。引擎判据必须与 UI 同口径，否则会出现
-     *   「UI 显示关但引擎照旧检测入库」的假开关。
+     * - 键缺省视为关闭（判据为 `== true`）：告警分类默认不开启，app 侧 UI 兜底同样为
+     *   `?: false`（AlertSettingsScreen / NotificationsGuardScreen）。引擎判据必须与 UI 一致，
+     *   否则会出现「UI 显示关闭但引擎仍检测入库」的无效开关。
      */
     private fun typeEnabled(cfg: AlertConfig, type: String): Boolean =
         cfg.enabled && cfg.perType[type] == true
@@ -343,9 +339,9 @@ class AlertEngine(
     private fun loadConfig(): AlertConfig {
         val json = appSettings.alertConfigJson ?: return AlertConfig()
         val parsed = try {
-            // 必须用 ConfigJson（ignoreUnknownKeys=true），不能用裸 Json：
-            // 裸 Json 严格模式下，任何一次字段增删都会让**已存在的整份配置**解析失败，
-            // 落到下面的 catch 里静默重置成默认值 —— 用户的告警开关与阈值一起丢。
+            // 必须使用 ConfigJson（ignoreUnknownKeys=true），不得使用裸 Json：
+            // 裸 Json 的严格模式下，任何一次字段增删都会使已存在的整份配置解析失败，
+            // 落到下面的 catch 中静默重置为默认值，用户的告警开关与阈值会一并丢失。
             ConfigJson.decodeFromString(AlertConfig.serializer(), json)
         } catch (e: Exception) {
             AppLogger.w(tag, "Failed to parse alert config, using defaults: ${e.message}")
@@ -355,15 +351,15 @@ class AlertEngine(
     }
 
     /**
-     * 一次性迁移：把旧版写下的配置按**旧语义**补齐 `enabled` / `perType`。
+     * 一次性迁移：把旧版本写下的配置按旧语义补齐 `enabled` / `perType`。
      *
-     * 旧版本用裸 `Json`（`encodeDefaults=false`）持久化，等于默认值的字段根本不落盘；
-     * 而当时 `enabled` 默认 **true**、`typeEnabled` 的判据是 `!= false`（缺键=开）。
-     * 2026-09-07 把默认改成 false、判据改成 `== true` 之后，这些旧配置重新解析出来
-     * 就变成「引擎关 + 所有分类关」—— 用户没动过任何开关，告警却全哑了。
+     * 旧版本使用裸 `Json`（`encodeDefaults=false`）持久化，等于默认值的字段不会落盘；
+     * 而当时 `enabled` 默认 true、`typeEnabled` 的判据是 `!= false`（缺键 = 开启）。
+     * 默认值改为 false、判据改为 `== true` 后，这些旧配置重新解析会得到
+     * 「引擎关闭 + 所有分类关闭」—— 用户未修改任何开关，告警却全部失效。
      *
-     * 判据只看 JSON 里有没有 `enabled` 键：现在写盘一律 `encodeDefaults=true`，
-     * 所以缺这个键 ⇔ 这份配置是旧版写的。迁移后立即回写，因此只会发生一次。
+     * 判据只看 JSON 中是否存在 `enabled` 键：当前写盘一律 `encodeDefaults=true`，
+     * 因此缺少该键等价于该配置由旧版本写入。迁移后立即回写，只会发生一次。
      */
     private fun migrateLegacyConfig(rawJson: String, parsed: AlertConfig): AlertConfig {
         val keys = try {
@@ -420,13 +416,13 @@ class AlertEngine(
 
     companion object {
         /**
-         * 告警**推送**的固定标题（`PushNotification.title`）。
+         * 告警推送的固定标题（`PushNotification.title`）。
          *
-         * 与 [NotifyEvent.title]（= 告警文案）刻意不同：邮件主题要看得出发生了什么，
-         * 而推送的 title 是**线上契约里的既有取值**，逐字保持不变。
-         * app 的 `NotifyService` 确实不读它（它从 type/level/message/extra 重建 `AlertRecord`），
+         * 与 [NotifyEvent.title]（= 告警文案）刻意不同：邮件主题需要反映具体事件，
+         * 而推送的 title 是线上契约中的既有取值，逐字保持不变。
+         * app 的 `NotifyService` 不读取该字段（它从 type/level/message/extra 重建 `AlertRecord`），
          * 但 `alert` topic 上还有 web 与 app 主进程 UI 在消费同一份 payload，
-         * 是否渲染 title 未逐一核实 —— 契约字段不做"顺手改良"。
+         * 其是否渲染 title 未逐一核实 —— 契约字段不做顺带修改。
          */
         private const val PUSH_TITLE = "设备告警"
 
@@ -450,28 +446,27 @@ class AlertEngine(
         /**
          * 告警配置对外（HTTP 响应 / WS 广播 / 合并基线）的序列化器。
          *
-         * **`encodeDefaults = true` 是必需的**：默认 Json 会省略与默认值相等的字段，
-         * 于是全新设备的 `GET /api/alerts/config` 会返回 `{}` —— web 只能靠 `?? 45` 之类的
-         * 兜底猜阈值，而 C02 的版本守门更会因为拿不到 `configVersion` 让第一次保存必然 409。
+         * `encodeDefaults = true` 是必需的：默认 Json 会省略与默认值相等的字段，
+         * 全新设备的 `GET /api/alerts/config` 因此返回 `{}` —— web 只能靠 `?? 45` 之类的兜底
+         * 猜测阈值，而版本守门也会因取不到 `configVersion` 使第一次保存必然返回 409。
          */
         val ConfigJson = com.ufi_axis_core.util.ConfigJson
 
         /**
-         * C02：把「部分字段的请求体」合并到当前配置上，得到完整的 [AlertConfig]。
+         * 把仅含部分字段的请求体合并到当前配置上，得到完整的 [AlertConfig]。
          *
-         * 【为什么必须合并而不是直接 decode】
-         * kotlinx 对**缺省字段取 data class 默认值**，所以 `receive<AlertConfig>()` 的语义是
-         * "客户端少传一个键 = 显式把它写回默认值"：少传 `perType` 会清空别端的分类开关，
-         * 少传 `minIntervalSec` 会被重置成 1800。这直接诱导客户端"必须先 GET 完整对象再整体 PUT"，
-         * 任何一次漏字段都会静默覆盖别端配置（ab 设备回弹的同一类根因）。
+         * ## 必须合并而不是直接 decode
+         * kotlinx 对缺省字段取 data class 默认值，因此 `receive<AlertConfig>()` 的语义是
+         * 「客户端少传一个键 = 显式将其写回默认值」：少传 `perType` 会清空其他端的分类开关。
+         * 这迫使客户端「先 GET 完整对象再整体 PUT」，任何一次漏字段都会静默覆盖其他端配置。
          *
          * 合并规则：
-         * - 只覆盖 [patch] 里**显式出现**的顶层键，其余保持 [current] 原值；
-         * - 值为 JSON null 的键视为"未提供"（而不是把非空字段写成 null 导致 500）；
-         * - `perType` 这类对象是**整体替换**（顶层键级合并，不做深合并）：
-         *   分类开关是一个完整的 map 语义，深合并会让"删除某个 type 的显式设置"变得不可表达。
+         * - 只覆盖 [patch] 中显式出现的顶层键，其余保持 [current] 原值；
+         * - 值为 JSON null 的键视为未提供（而不是把非空字段写成 null 导致 500）；
+         * - `perType` 这类对象整体替换（顶层键级合并，不做深合并）：
+         *   分类开关是一个完整的 map 语义，深合并会使「删除某个 type 的显式设置」不可表达。
          *
-         * 合并语义是覆盖语义的超集：客户端只要按 [ConfigJson] 的口径发完整对象，结果与旧覆盖语义一致。
+         * 合并语义是覆盖语义的超集：客户端按 [ConfigJson] 的口径发送完整对象时，结果与旧覆盖语义一致。
          */
         fun mergeConfigPatch(current: AlertConfig, patch: JsonObject): AlertConfig {
             val effective = patch.filterValues { it !is JsonNull }
@@ -535,8 +530,8 @@ class AlertEngine(
 
     /**
      * 检查流量告警（边沿触发）
-     * 流量为月累计值，跨过警告/严重阈值那一刻触发一次；持续超标期间不再重复入库
-     * （旧实现电平触发 + 防抖，月流量一旦超 2GB 即永久超标、每天堆叠 288 条）。
+     * 流量为月累计值，跨过警告 / 严重阈值那一刻触发一次；持续超标期间不再重复入库
+     * （电平触发 + 防抖会使月流量一旦超过 2GB 便永久超标，每天堆积 288 条）。
      */
     suspend fun checkTraffic(totalMb: Long) {
         val cfg = _config.value
@@ -555,13 +550,12 @@ class AlertEngine(
     /**
      * 检查「套餐限额百分比」告警（边沿触发）。
      *
-     * 2026-08-31：此判定原先写在 app 侧（`NotificationCenter.maybeNotifyTrafficThresholdReached`），
-     * 手机不在线就永远不会预警——与「邮件通知是独立功能」的初衷矛盾。现按
-     * 「核心业务归 core、app 只做展示」的架构收归此处：
-     * - 与 [checkTraffic] 的区别：那个比的是**固定 MB 阈值**（用户在告警设置里填的），
-     *   这个比的是**设备侧套餐限额的百分比**（goform `getDataUsage()` 的 limit + alert_percent）；
+     * 该判定属于 core 而非 app：若由 app 执行，手机不在线时永远不会预警。
+     * 与「核心业务归 core、app 只做展示」的架构一致：
+     * - 与 [checkTraffic] 的区别：后者比较固定 MB 阈值（用户在告警设置中填写），
+     *   本方法比较设备侧套餐限额的百分比（goform `getDataUsage()` 的 limit + alert_percent）；
      * - 限额未配置（limitBytes <= 0）直接返回，不产生噪声；
-     * - 走 [evaluate] 边沿触发，天然实现旧 app 端 `KEY_TRAFFIC_80_NOTIFIED` 的「只提醒一次」语义，
+     * - 走 [evaluate] 边沿触发，等价于旧 app 端 `KEY_TRAFFIC_80_NOTIFIED` 的「只提醒一次」语义，
      *   且月初限额重置回落 normal 后会自动解除，无需额外的 reset 调用。
      *
      * @param usedBytes   已用流量（月累计 rx+tx，字节）
@@ -587,19 +581,19 @@ class AlertEngine(
     }
 
     /**
-     * 套餐到期检查（2026-10-07，fixed 模式专用；monthly 模式内部自动绝迹）。
+     * 套餐到期检查（fixed 模式专用；monthly 模式下不会触发）。
      *
-     * 与 checkTrafficLimit 不同：这是**日历事件**不是连续量，无回差概念；
+     * 与 checkTrafficLimit 不同：这是日历事件而不是连续量，无回差概念；
      * 「每天最多一条 + 级别跃迁当天重发」的去重已在 [PlanProfileManager.dueNotification]
-     * 内做掉（返回 null = 今天已发过/不在窗口），这里只转发。
+     * 内完成（返回 null = 今天已发送 / 不在窗口），此处只转发。
      *
-     * @param level  warning/critical/info（dueNotification 的第一返回值）
-     * @param body   人话正文（第二返回值）
+     * @param level  warning/critical/info（dueNotification 的第一个返回值）
+     * @param body   面向用户的正文（第二个返回值）
      */
     suspend fun checkPlanExpiry(level: String, body: String) {
         val cfg = _config.value
         if (!typeEnabled(cfg, "plan_expiry")) return
-        // 第 4/5 参是 value/threshold 展示位：日历事件没有采集值，用剩余天数/提醒窗口
+        // 第 4/5 参数为 value / threshold 展示位：日历事件没有采集值，value 复用正文，threshold 留空
         triggerAlert("plan_expiry", level, body, body, "")
     }
 
@@ -622,13 +616,13 @@ class AlertEngine(
     }
 
     /**
-     * 边沿触发统一入口（2026-08-23 去重改造）
+     * 边沿触发统一入口
      *
-     * 将各指标当前级别与 [lastLevelByType] 记忆的级别比较：
+     * 将各指标当前级别与 [lastLevelByType] 记录的级别比较：
      * - 级别未变（稳态）→ 跳过，不入库；
      * - 级别跃迁（如 normal→warning）→ 触发告警；
-     * - 回到 normal → 标记该 type 最近一条未确认告警为"已恢复"（resolvedAt），
-     *   便于事件中心展示"已恢复"语义，且不产生冗余告警行。
+     * - 回到 normal → 标记该 type 最近一条未确认告警为「已恢复」（resolvedAt），
+     *   便于事件中心展示「已恢复」语义，且不产生冗余告警行。
      *
      * @param type    告警类型
      * @param currentLevel 当前级别 normal/warning/critical
@@ -646,19 +640,18 @@ class AlertEngine(
         val cfg = _config.value
         if (!typeEnabled(cfg, type)) return
         val prev = lastLevelByType[type] ?: "normal"
-        // 2026-08-28：这里原来有一行 "Alert $type level unchanged, skip" 的 DEBUG。
-        // evaluate() 由信号(~3s)/流量(15s)/温度(30s) 三条采集循环调用，稳态下 99% 的调用都走这个分支，
-        // 单日几万条一字不差的日志，而"没有变化"本身没有任何排障价值 —— 直接删掉。
+        // 此处不记录「级别未变」的 DEBUG：evaluate() 由信号（~3s）/ 流量（15s）/ 温度（30s）
+        // 三条采集循环调用，稳态下绝大多数调用都走该分支，且「没有变化」本身没有排障价值。
         if (currentLevel == prev) return
         lastLevelByType[type] = currentLevel
         persistLevelState()
         if (currentLevel == "normal") {
             val updated = alertDao.markResolved(type, System.currentTimeMillis())
             AppLogger.i(tag, "Alert $type recovered (markResolved=$updated)")
-            // 2026-09-21：critical → normal 额外发一条 info「已恢复」通知。
-            // 只对 critical 发、不对 warning 发：warning 的恢复本身不值得再打扰一次
-            // （事件中心的「已恢复」标记足够），而 critical 曾经把用户从睡梦中叫起来过，
-            // 不告诉他"好了"就等于逼他自己去翻界面确认。
+            // critical → normal 额外发送一条 info「已恢复」通知。
+            // 只对 critical 发送、不对 warning 发送：warning 的恢复无需再次打扰
+            // （事件中心的「已恢复」标记足够），而 critical 属于高强度提醒，
+            // 需要明确告知已恢复，避免用户自行进入界面确认。
             if (prev == "critical") {
                 triggerAlert(type, "info", "${recoveryLabel(type)}已恢复正常", value, threshold)
             }
@@ -678,19 +671,19 @@ class AlertEngine(
     }
 
     /**
-     * 检查设备联网状态（P1-E + 2026-08-11 边沿触发 + 2026-09-04 抖动确认窗口）
+     * 检查设备联网状态。
      *
      * 由 DataScheduler 的信号采集循环（~3s）与 scanLocalAlerts（60s）调用。
      *
-     * 判定依据是**设备外网是否实际可达**（调用方传 `TelephonyCollector.isDeviceOnline()`，
+     * 判定依据是设备外网是否实际可达（调用方传 `TelephonyCollector.isDeviceOnline()`，
      * 基于 `NET_CAPABILITY_VALIDATED`），不是 modem 注册态 —— 后者在搜网瞬间会短暂变空，
-     * 而欠费/PPP 未拨通时又恒为 true，两个方向都报错。
+     * 而欠费 / PPP 未拨通时又恒为 true，两个方向都会误报。
      *
      * 三层防噪：
-     * 1. **边沿触发**：状态没变直接返回（2026-08-11，此前每次采集都入库）；
-     * 2. **确认窗口**：变化必须连续保持 [CONNECTIVITY_CONFIRM_MS] 才算真变化 ——
-     *    网络抖动、蜂窝↔WiFi 中继切换的瞬时空档不再产出「已断开 + 已恢复」两条告警和两封邮件；
-     * 3. **冷启动不报**：`prevConnected == null` 只记忆。
+     * 1. 边沿触发：状态未变直接返回（否则每次采集都会入库）；
+     * 2. 确认窗口：变化必须连续保持 [CONNECTIVITY_CONFIRM_MS] 才算真实变化 ——
+     *    网络抖动、蜂窝 ↔ WiFi 中继切换的瞬时空档不再产生「已断开 + 已恢复」两条告警和两封邮件；
+     * 3. 冷启动不报：`prevConnected == null` 时只记录状态。
      *
      * @param isConnected 设备当前是否真的能上外网
      * @param networkType 网络类型（4G/5G/3G/2G/WiFi），断网时传空串
@@ -731,9 +724,9 @@ class AlertEngine(
             )
 
         if (!statusChanged && !typeChanged) {
-            // 状态未变（周期采集重复）或变化尚未坐实 → 跳过。
-            // 2026-08-28：这里原来打一条 DEBUG，但本函数由 collectSignal() 每 ~3-4.5s 调用
-            // （注释里写的"每分钟一次"与实际不符），稳态下单日 8000+ 条一字不差的日志。
+            // 状态未变（周期采集重复）或变化尚未确认 → 跳过。
+            // 此处不记录 DEBUG：本函数由 collectSignal() 每 ~3-4.5s 调用一次，
+            // 稳态下每天会产生 8000 条以上完全相同的日志。
             return
         }
 
@@ -791,18 +784,18 @@ class AlertEngine(
     }
 
     /**
-     * 记录设备事件：WiFi 客户端接入 / 离开（2026-08-31 新增）。
+     * 记录设备事件：WiFi 客户端接入 / 离开。
      *
-     * 走告警表而不是另建一张事件表：事件中心、WS 推送（notification + alert 双频道）、
-     * 邮件转投（[attachMailForwarder]）、app 端通知展示这四条链路都已经围绕告警行建好，
-     * 再造一套只会多出四份需要同步的逻辑。
+     * 复用告警表而不另建事件表：事件中心、WS 推送（notification + alert 双频道）、
+     * 邮件转投（[Notifier]）、app 端通知展示这四条链路都已围绕告警行建好，
+     * 另建一套会多出四份需要同步的逻辑。
      *
-     * 上线 / 下线用**两个 type**（不是同 type 不同 level）：[triggerAlert] 的聚合键是
-     * (type, level)，同 type 会把「A 上线」和「B 下线」合并成一行 count++，历史就没了。
+     * 上线 / 下线使用两个 type（不是同 type 不同 level）：[triggerAlert] 的聚合键是
+     * (type, level)，同 type 会把「A 上线」与「B 下线」合并为一行 count++，历史记录丢失。
      *
-     * 门控分两层：这里只管 `perType`（告警设置里的分类开关），
+     * 门控分两层：此处只处理 `perType`（告警设置中的分类开关），
      * 「设备事件通知总开关」`NotificationConfig.device_events_enabled` 在采集侧
-     * （`DataScheduler` 的供给器 lambda）判 —— 关掉时连 station_list 都不查。
+     * （`DataScheduler` 的供给器 lambda）判定 —— 关闭时连 station_list 都不查询。
      *
      * @param online true=接入，false=离开
      * @param label  展示名（hostname，缺失时回落 IP，再回落 MAC）
@@ -817,7 +810,7 @@ class AlertEngine(
     }
 
     /**
-     * 触发告警（2026-08-23 去重改造：聚合更新 + 环形上限）
+     * 触发告警（聚合更新 + 环形上限）
      *
      * 1. 先尝试聚合：同 (type,level) 且未确认的告警行若存在，累加 count + 刷新时间戳 + 清除恢复标记，
      *    不再插入新行（边沿触发已保证稳态下几乎不重复，此处为安全网）；
@@ -837,24 +830,23 @@ class AlertEngine(
     ) {
         val now = System.currentTimeMillis()
 
-        // 不做聚合的类型：设备事件 + 安全事件（2026-10-15 扩充）。
-        // 聚合键是 (type,level)，而这两族恒为同一 level —— A 设备接入和 B 设备接入会并成一行
-        // count++，文案只剩最后一台；安全事件更糟：把"三台不同设备在试探"并成一行，
-        // 机主就看不到攻击面了。它们天然低频（边沿触发 / 真的有人在尝试），逐条落行才对。
+        // 不做聚合的类型：设备事件与安全事件。
+        // 聚合键是 (type,level)，而这两族始终为同一 level —— A 设备接入和 B 设备接入会并成一行
+        // count++，文案只剩最后一台；安全事件的问题更严重：把「三台不同设备在试探」并成一行，
+        // 管理员将无法看到完整的攻击面。两者天然低频（边沿触发 / 确有尝试），应逐条落行。
         val noAggregate = type == "device_online" || type == "device_offline" ||
             type == "pairing_blocked_hit" || type == "pairing_block_cooldown"
 
         // 1) 聚合：同 (type,level) 未确认行累加计数（返回受影响行数）
-        // 2026-08-25：获取现有记录 ID 以便推送给前端做精确去重
+        // 获取现有记录 ID，以便推送给前端做精确去重
         val existing = if (noAggregate) null else alertDao.getUnacknowledged(type, level)
         val bumped = if (noAggregate) 0 else alertDao.bumpExisting(type, level, now)
         if (bumped > 0 && existing != null) {
             AppLogger.i(tag, "Alert aggregated: [$level] $message (count++)")
-            // **只推送、不发邮件**：聚合意味着"同一件事又发生了一次"，前端要靠它把 badge 数字
-            // 往上加，但邮件不能跟着发 —— 稳态持续超标会变成邮件轰炸（这是 2026-08-31
-            // 加邮件钩子时就定下的语义，接分发器不能把它丢掉）。
-            // 限定渠道而不是"这里不调 notifier"：将来加 Webhook / 短信渠道时，
-            // "聚合只走实时渠道"这条语义会自动跟着 channels 走，不需要再各处判一遍。
+            // 只推送、不发送邮件：聚合意味着「同一件事又发生了一次」，前端依赖它递增 badge，
+            // 但邮件不能随之发送 —— 稳态持续超标会产生大量重复邮件。
+            // 通过限定渠道而不是跳过 notifier：将来增加 Webhook / 短信渠道时，
+            // 「聚合只走实时渠道」这条语义会自动随 channels 生效，无需各处重复判定。
             emitAlert(
                 type = type, level = level, message = message,
                 value = value, threshold = threshold,
@@ -893,22 +885,21 @@ class AlertEngine(
     }
 
     /**
-     * 记录一次**安全事件**（2026-10-15：配对设备黑名单命中 / 冷却）。
+     * 记录一次安全事件（配对设备黑名单命中 / 冷却）。
      *
-     * ## 为什么不受 perType 分类开关约束，只看总开关
-     * `typeEnabled` 的口径是"分类开关**缺省视为关闭**"（2026-09-07 的既定决策）。
-     * 新增的安全类型在用户存量配置里必然缺省 → 会被静默丢掉，机主永远看不到
-     * "有人在反复尝试连接"。所以这里只尊重**总开关** `cfg.enabled`：
-     * 总开关的语义是"我不看告警"（那就不记），分类开关的语义是"这一类指标我不关心"，
+     * ## 不受 perType 分类开关约束，只看总开关
+     * `typeEnabled` 的口径是「分类开关缺省视为关闭」。新增的安全类型在用户存量配置中必然缺省，
+     * 因此会被静默丢弃，管理员将看不到「有人在反复尝试连接」。此处只尊重总开关 `cfg.enabled`：
+     * 总开关的语义是「不关注告警」，分类开关的语义是「不关注这一类指标」，
      * 而安全事件不属于任何一类指标。
      *
-     * ## 为什么只走实时渠道，不发邮件 / 不弹系统通知
-     * 命中是**被拉黑者可控**的：对方每试一次就发一封邮件或弹一次通知，
-     * 等于给攻击者一个"远程刷屏机主"的能力。所以这里只落库 + WS 推送（事件中心可见、
-     * badge 会涨）；要升级成系统通知，由调用方按连击次数显式决定（见方案 §6.3）。
+     * ## 只走实时渠道，不发送邮件 / 不弹系统通知
+     * 命中次数由被拉黑方控制：对方每尝试一次就发送一封邮件或弹一次通知，
+     * 相当于为攻击者提供「远程刷屏」的能力。因此此处只入库 + WS 推送（事件中心可见、
+     * badge 会递增）；如需升级为系统通知，由调用方按连续命中次数显式决定。
      *
      * @param type `pairing_blocked_hit`（被拉黑设备尝试连接）/ `pairing_block_cooldown`（进入冷却）
-     * @param value 落库到 value 列，放指纹前缀 / 设备名，便于事件中心展示与排查
+     * @param value 落库到 value 列，存放指纹前缀 / 设备名，便于事件中心展示与排查
      */
     suspend fun recordSecurityEvent(
         type: String,
@@ -961,7 +952,7 @@ class AlertEngine(
         return alertDao.deleteById(id)
     }
 
-    // ===================== P1 列表 API（2026-08-23） =====================
+    // ===================== 列表 API =====================
 
     /**
      * 游标分页 + 多维过滤（事件中心列表）。
@@ -986,7 +977,7 @@ class AlertEngine(
     /**
      * 聚合计数（事件中心分类胶囊 + hero 统计）。
      */
-    /** 按天计数（月历热力，2026-10-23）：返回本地日期 `yyyy-MM-dd` → 条数。 */
+    /** 按天计数（月历热力）：返回本地日期 `yyyy-MM-dd` → 条数。 */
     suspend fun getDailyCounts(start: Long, end: Long): Map<String, Int> =
         alertDao.getDailyCounts(start, end).associate { it.day to it.count }
 

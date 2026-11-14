@@ -30,6 +30,18 @@
     *** INSTANCE;
 }
 
+# ── 第三方程序商店（2026-10-30）──────────────────────────────────────────────
+# 上面那条只保留 `INSTANCE`，**不够**：serializer 内部引用的 Companion / 字段类
+# 被裁掉之后，`ProgramInstalledMeta.serializer()` 在运行时抛
+# `ExceptionInInitializerError`，随后的访问变成 `NoClassDefFoundError: <混淆名>`
+# （真机表现：启动程序失败，界面只显示一个混淆类名如 "p12"，日志里什么都没有）。
+#
+# 这个包是清单/元数据的编解码核心，类不多（10 个左右），直接整包 keep，
+# 用体积换"release 与 debug 行为一致"。
+-keep class com.ufi_axis_core.controller.program.** { *; }
+-keep class com.ufi_axis_core.util.program.** { *; }
+-keep,includedescriptorclasses class com.ufi_axis_core.controller.program.**$$serializer { *; }
+
 # Room
 -keep class * extends androidx.room.RoomDatabase
 -keep @androidx.room.Entity class *

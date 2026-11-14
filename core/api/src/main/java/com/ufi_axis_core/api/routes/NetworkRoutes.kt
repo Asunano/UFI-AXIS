@@ -63,24 +63,43 @@ class NetworkRoutes(
 
             // 网络状态（通过 DataHub 统一缓存，消除与 DeviceRoutes /info 的重复 goform 查询）
             get("/status") {
-                // DataHub.getNetworkTypeInfo() 30s TTL 缓存，合并 network_type + provider + ppp_status 为单次 goform 查询
+                // DataHub.getNetworkTypeInfo() 30s TTL：只用于 network_type / provider（变得慢）。
+                // ppp_status **不能**从这份快照取（2026-11-02 修）：切制式/锁频后设备先拆链再重拨，
+                // 30s 的旧值会把那个"断"钉住，客户端看到的就是「移动数据明明是开的却显示关」。
                 val hubInfo = try {
                     dataHub?.getNetworkTypeInfo()
                 } catch (e: Exception) {
                     AppLogger.w("NetworkRoutes", "Failed to get network type info: ${e.message}")
                     null
                 }
+                // 链路态单读：底层 GoformQoS 有 2s 传输层缓存，DataScheduler 本来就在采同一份，
+                // 所以这条不会额外压设备。
+                val livePpp = try {
+                    dataHub?.getLivePppStatus()
+                } catch (e: Exception) {
+                    AppLogger.w("NetworkRoutes", "Failed to read live ppp_status: ${e.message}")
+                    null
+                }
 
                 val goformType = hubInfo?.networkType?.takeIf { it.isNotBlank() }
                 val goformProvider = hubInfo?.networkProvider?.takeIf { it.isNotBlank() }
-                val pppStatus = hubInfo?.pppStatus
-                val mobileDataEnabled = if (hubInfo != null) hubInfo.isPppConnected
-                    else telephonyCollector.isMobileDataEnabled()
+                // 单读失败时退回 hub 快照（可能是 30s 前的），总比空串好；两者都没有就是空串（契约）
+                val pppStatus = livePpp ?: hubInfo?.pppStatus ?: ""
+                // 空串 = 这次没读到，**不能当"断"** —— 一次查询超时不该变成一次假关闭
+                val linkConnected = pppStatus.takeIf { it.isNotBlank() }
+                    ?.let { DeviceFields.Connection.isPppConnected(it) }
+                // 开关态 = 用户意图（core 记的）+ 链路（MobileDataIntent 的宽限规则）。
+                // 只有在"连意图都没有"（刚启动且链路也读不到）时才退回 shell 读系统设置。
+                val mobileDataEnabled = networkController.resolveMobileDataSwitch(linkConnected)
+                    ?: telephonyCollector.isMobileDataEnabled()
                 call.respond(toJsonElement(mapOf(
                     "network" to networkController.getNetworkStatus(),
                     "mobile_data" to mobileDataEnabled,
-                    DeviceFields.Connection.PPP_STATUS to (pppStatus ?: ""),
+                    DeviceFields.Connection.PPP_STATUS to pppStatus,
                     "operator" to (goformProvider ?: telephonyCollector.getOperatorName()),
+                    // 飞行模式读侧（2026-11-08）：之前只有 POST /airplane，前端只能给两个按钮。
+                    // 每 10s 一次的 status 轮询各读一次 shell，代价约几十毫秒，不做额外缓存。
+                    "airplane" to networkController.isAirplaneModeOn(),
                     // 值已在 core 侧统一成可读文案（profile 的 NETWORK_TYPE_DECODER），不再套 mapNetworkType
                     DeviceFields.Connection.NETWORK_TYPE to (goformType ?: telephonyCollector.getNetworkType())
                 )))
@@ -103,6 +122,11 @@ class NetworkRoutes(
                 val params = call.receiveJsonObject()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val success = networkController.setAirplaneMode(enabled)
+                // 2026-11-07：飞行模式会连带关掉/恢复蜂窝数据，ppp_status 与 network_type
+                // 都会变。原来这里**一条失效都不发**，于是另一端（web / app）在飞行模式
+                // 切换后看不到任何变化，只能等下一次偶然的前台刷新。与 mobile-data 同口径：
+                // 清 hub:network-type-info + network:*，让两端的 data_changed 监听立即回读。
+                if (success) dataHub?.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "airplane_mode" to enabled))
@@ -224,7 +248,10 @@ class NetworkRoutes(
                     "bearer" to bearerValue,
                     "mode_label" to NetworkMode.label(mode)
                 )
-                val outcome = network.setBearerPreference(mode)
+                // 走 controller 而不是直接调 adapter（2026-10-31）：切制式会让设备拆掉 ppp 且不自己重拨，
+                // 「恢复移动数据」与这次写是同一个业务动作，实现只能在 NetworkController.setNetworkMode 一处
+                // —— 否则定时任务的 /network_mode 那条入口又会漏掉（它同样调这个方法）。
+                val outcome = networkController.setNetworkMode(mode)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次网络制式切换", echo)) return@post
                 invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
@@ -257,7 +284,8 @@ class NetworkRoutes(
                     "preference" to preference,
                     "bearer" to NetworkMode.toBearer(preference)
                 )
-                val outcome = network.setBearerPreference(preference)
+                // 与 /mode 同一条设备命令、同一个业务动作：恢复移动数据的编排也在 controller 里
+                val outcome = networkController.setNetworkMode(preference)
                 if (call.respondWriteFailure(outcome, "设备拒绝了本次承载偏好设置", echo)) return@post
                 invalidateAfterModeWrite()
                 call.respond(toJsonElement(buildMap<String, Any?> {
@@ -270,7 +298,9 @@ class NetworkRoutes(
             post("/connect") {
                 // P3-11：原来这里有一段 `if (network == null) 503 "Goform client not available"`。
                 // `network` 非空 → 分支永不成立，且那句文案把协议名吐给了客户端。
-                val success = network.connectNetwork()
+                // 2026-11-02：走 controller 而不是直接调 adapter —— 这条入口同样改变"数据连不连"，
+                // 必须和 /data 一样把用户意图记进 MobileDataIntent，否则开关显示要等链路读数才跟上。
+                val success = networkController.connectNetwork()
                 if (success) dataHub.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
@@ -281,7 +311,7 @@ class NetworkRoutes(
             // 断开网络
             post("/disconnect") {
                 // P3-11：同 /connect，死分支 + 泄漏协议名的文案一起删。
-                val success = network.disconnectNetwork()
+                val success = networkController.disconnectNetwork()
                 if (success) dataHub.invalidateNetwork()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,

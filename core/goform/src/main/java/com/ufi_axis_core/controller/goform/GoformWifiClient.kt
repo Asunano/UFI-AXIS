@@ -353,8 +353,8 @@ class GoformWifiClient(
      *
      * 设备返回：
      * ```json
-     * { "AclMode": "2", "WhiteMacList": "", "BlackMacList": "2a:ed:87:b3:e8:29;",
-     *   "WhiteNameList": "", "BlackNameList": "OPPO-Find-X7;" }
+     * { "AclMode": "2", "WhiteMacList": "", "BlackMacList": "aa:bb:cc:dd:ee:ff;",
+     *   "WhiteNameList": "", "BlackNameList": "Example-Device;" }
      * ```
      * 这里就把分号串拆成结构化的 [AclEntry]，设备侧的 CamelCase 键名不出本模块
      * （route 只见 [AclSnapshot]）。Mac 与 Name 按下标配对，缺名字的补空串。

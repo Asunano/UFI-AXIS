@@ -18,6 +18,9 @@ import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.contract.Capability
+import com.ufi_axis_core.controller.carrier.CarrierAutoLoginManager
+import com.ufi_axis_core.controller.carrier.CarrierBillRefresher
+import com.ufi_axis_core.controller.carrier.CarrierBillService
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 import com.ufi_axis_core.controller.system.SystemController
@@ -70,6 +73,10 @@ object ComponentFactory {
     /** 远端备份（2026-10-06）的延迟引用：构造晚于控制器子图，回调只在运行期触发。 */
     @Volatile
     private var backupAssemblerRef: com.ufi_axis_core.api.backup.BackupAssembler? = null
+
+    /** 自动登录调度器；reset 时先停，避免重建后两个实例同时发码。 */
+    @Volatile
+    private var carrierAutoLoginRef: com.ufi_axis_core.controller.carrier.CarrierAutoLoginManager? = null
     @Volatile
     private var storageSourceManagerRef: com.ufi_axis_core.api.files.StorageSourceManager? = null
 
@@ -127,6 +134,8 @@ object ComponentFactory {
      * 在服务停止后调用，支持服务重启场景。
      */
     fun reset() {
+        carrierAutoLoginRef?.stop()
+        carrierAutoLoginRef = null
         built = false
         AppLogger.i(TAG, "ComponentFactory reset")
     }
@@ -695,8 +704,212 @@ object ComponentFactory {
                 (result as? com.ufi_axis_core.util.DeviceRequestVerifier.Result.Ok)?.device?.fingerprint
             }
         )
+        // 远程屏幕（投屏，2026-10-31）：开关默认关，关着时 /api/screen/… 全 403、不会起任何进程。
+        //
+        // AdbChannel 的 keyDir 必须是 cacheDir —— 与 AdbShellExecutor 的 ANDROID_ADB_HOME 同源，
+        // 那里躺着生产上**已被设备授权**的 adbkey。指向别处会生成新钥匙串，
+        // adbd 弹 RSA 授权而无屏设备没人能点「允许」，表现只是"连不上"。
+        val screenAdbChannel = com.ufi_axis_core.adb.AdbChannel(context.cacheDir)
+        val screenSessionManager = com.ufi_axis_core.controller.screen.ScreenSessionManager(
+            context = context,
+            channel = screenAdbChannel,
+        )
+        val screenRoutes = com.ufi_axis_core.api.routes.ScreenRoutes(
+            settings = settings,
+            manager = screenSessionManager,
+            // 与 ttyd / wsManager 同一鉴权源、同一参数名，web 端零新增
+            wsAuthenticator = { token, ts, nonce, sig, path ->
+                val result = deviceVerifier.verify(
+                    token = token, timestamp = ts, nonce = nonce, signature = sig,
+                    method = "GET", uri = path
+                )
+                (result as? com.ufi_axis_core.util.DeviceRequestVerifier.Result.Ok)?.device?.fingerprint
+            }
+        )
+
         // 配置备份：Assembler 负责各段内容，Routes 负责 ZIP / manifest / 加密
         val backupAssembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database)
+
+        // ── 12.7 第三方程序商店（2026-10-30 P0 骨架）──
+        // 分发模型是**外挂式**：APK 里只有 assets/programs/catalog.json 这几 KB 元数据，
+        // 二进制一律在用户点安装时从上游直链下载（与 frpc/cloudflared 同一套路子）。
+        // 这里只建"清单 + 存储 + 进程槽 + 看护"的骨架，不做任何阻塞 I/O：
+        // build() 全程被 120s 硬超时盯着，任何慢 IO 都会把整个 core 拖进重启。
+        val programPaths = com.ufi_axis_core.util.program.ProgramPaths(context)
+        val programStore = com.ufi_axis_core.controller.program.ProgramStore(programPaths)
+        val programCatalog = com.ufi_axis_core.controller.program.ProgramCatalog()
+        // 适配器是编译期注册的 Kotlin（不是下载来的插件代码）—— 否则"插件系统"会成为第二条 RCE 通道
+        // 幂等注册：服务重启（不换进程）会重新走 build()，无条件 register 会覆盖实例，
+        // 把 OpenList 只存在内存里的管理员口令冲掉 —— 用户看到的是"口令又没了"。
+        com.ufi_axis_core.controller.program.ProgramAdapterRegistry.registerIfAbsent(
+            com.ufi_axis_core.controller.program.OpenListAdapter()
+        )
+        // Cloudreve 的相对 DBFile 会被解析到"可执行文件目录/data/"，绕过 {DATA} 的配额统计；
+        // 适配器在启动前把 conf.ini 的 DBFile 改成 {DATA} 下的绝对路径（详见其 KDoc）。
+        com.ufi_axis_core.controller.program.ProgramAdapterRegistry.registerIfAbsent(
+            com.ufi_axis_core.controller.program.CloudreveAdapter()
+        )
+        // dufs 的口令只能来自配置：适配器生成随机口令写进 {CONF}/dufs.yaml（详见其 KDoc）。
+        com.ufi_axis_core.controller.program.ProgramAdapterRegistry.registerIfAbsent(
+            com.ufi_axis_core.controller.program.DufsAdapter()
+        )
+        // Gateway 的 cookie 密钥：首次用到时生成一次并持久化。
+        // 生成失败（prefs 不可写）时退化为空数组 = 不启用访问入口，但程序本身照常可跑。
+        val gatewaySecret: ByteArray = runCatching {
+            val existing = settings.programGatewaySecret
+            val value = existing.ifBlank {
+                val generated = java.util.UUID.randomUUID().toString().replace("-", "") +
+                    java.util.UUID.randomUUID().toString().replace("-", "")
+                settings.programGatewaySecret = generated
+                generated
+            }
+            value.toByteArray(Charsets.UTF_8)
+        }.getOrDefault(ByteArray(0))
+
+        val programRuntime = com.ufi_axis_core.controller.program.ProgramRuntime(
+            paths = programPaths,
+            store = programStore,
+            gatewaySecret = gatewaySecret,
+            totalMemMb = {
+                // 总内存只用于"多实例总量预算"，与 availMem 同源（ActivityManager），
+                // 不用 /proc/meminfo：后者在部分 ROM 上给的是去掉保留区之前的数。
+                runCatching {
+                    val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                        as android.app.ActivityManager
+                    val mi = android.app.ActivityManager.MemoryInfo()
+                    am.getMemoryInfo(mi)
+                    mi.totalMem / 1024 / 1024
+                }.getOrNull()
+            },
+            availableMemMb = {
+                // 用 ActivityManager 而不是 /proc/meminfo：前者给的是"系统认为的可用内存"，
+                // 与 LMK 的判据同源；后者把可回收的 cache 也算进 MemAvailable，会高估。
+                runCatching {
+                    val am = context.getSystemService(android.content.Context.ACTIVITY_SERVICE)
+                        as android.app.ActivityManager
+                    val mi = android.app.ActivityManager.MemoryInfo()
+                    am.getMemoryInfo(mi)
+                    mi.availMem / 1024 / 1024
+                }.getOrNull()
+            },
+            networkAvailable = {
+                // online-only 的清单在启动前先确认设备确实有 validated 互联网；
+                // 本地只有局域网/WiFi 无外网时按不可用处理；读不到也按不可用，避免反复启动失败。
+                runCatching {
+                    val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                        as android.net.ConnectivityManager
+                    val network = cm.activeNetwork ?: return@runCatching false
+                    val caps = cm.getNetworkCapabilities(network) ?: return@runCatching false
+                    caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                }.getOrDefault(false)
+            }
+        )
+        val programSupervisor = com.ufi_axis_core.controller.program.ProgramSupervisor(
+            store = programStore,
+            runtime = programRuntime,
+            catalog = programCatalog
+        )
+        // 两者互相依赖（退出要通知看护、看护要拉起进程），用 setter 破环
+        programRuntime.onExit = { id, code, reason -> programSupervisor.onExit(id, code, reason) }
+
+        val programInstaller = com.ufi_axis_core.api.program.ProgramInstaller(programPaths, programStore, settings)
+
+        // 内置清单只含元数据（几 KB）。远端清单（version.json 的 programs 段）留到 P1，
+        // 届时按 id 覆盖这里的条目 —— 内置清单的价值是"断网时商店不是白页"。
+        runCatching {
+            val text = context.assets.open("programs/catalog.json").bufferedReader().use { it.readText() }
+            val parsed = com.ufi_axis_core.controller.program.ProgramManifestCodec
+                .parseCatalog(text).getOrThrow()
+            programCatalog.replace(parsed.ok)
+            programCatalog.replaceSkeleton(
+                parsed.ok.associate {
+                    it.id to com.ufi_axis_core.controller.program.ProgramCatalog.SkeletonEntry(it.name, it.summary)
+                }
+            )
+            if (parsed.bad.isNotEmpty()) {
+                AppLogger.w(TAG, "内置程序清单有 ${parsed.bad.size} 条被丢弃: ${parsed.bad}")
+            }
+            AppLogger.i(TAG, "[12.7] 程序清单加载 ${parsed.ok.size} 条")
+        }.onFailure {
+            // 清单坏了不能影响 core 启动：商店显示为空，其余功能照常
+            AppLogger.w(TAG, "[12.7] 内置程序清单加载失败（商店将为空）: ${it.message}")
+        }
+
+        val programRoutes = com.ufi_axis_core.api.routes.ProgramRoutes(
+            catalog = programCatalog,
+            paths = programPaths,
+            store = programStore,
+            runtime = programRuntime,
+            supervisor = programSupervisor,
+            installer = programInstaller,
+            // 内容目录的可选落点：内部 / 公共存储 / 可移除卷（SD 卡）。
+            // 用 getExternalFilesDirs 而不是硬编码 /sdcard：只有它知道这台机器插了哪张卡。
+            volumes = {
+                // 与「文件管理 → 存储与外接设备」共用同一份枚举（内部 + StorageManager 卷表），
+                // 否则两个界面看到的卡会不一样。
+                val out = mutableListOf<com.ufi_axis_core.api.routes.ProgramRoutes.VolumeOption>()
+                val vols = com.ufi_axis_core.api.files.StorageVolumes.list(context)
+                // 内部卷也要带上真实容量：以前只给了 label/path，前端把默认的 0 格式化后
+                // 显示成「17.1GB 可用 / 0B」，三个数字互相矛盾。
+                val internalVol = vols.firstOrNull {
+                    it.mount == com.ufi_axis_core.api.files.StorageVolumes.INTERNAL
+                }
+                out += com.ufi_axis_core.api.routes.ProgramRoutes.VolumeOption(
+                    id = "internal",
+                    label = "内部存储（应用私有）",
+                    path = null,
+                    removable = false,
+                    mountPoint = null,
+                    totalBytes = internalVol?.totalBytes ?: 0L,
+                    usedBytes = internalVol?.usedBytes ?: 0L
+                )
+                internalVol?.let { v ->
+                    out += com.ufi_axis_core.api.routes.ProgramRoutes.VolumeOption(
+                        id = "shared",
+                        label = "公共存储 /sdcard/Download/UFI-AXIS",
+                        path = programPaths.externalContentRoot().absolutePath,
+                        removable = false,
+                        mountPoint = com.ufi_axis_core.api.files.StorageVolumes.INTERNAL,
+                        totalBytes = v.totalBytes,
+                        usedBytes = v.usedBytes
+                    )
+                }
+                vols.filter { it.mount != com.ufi_axis_core.api.files.StorageVolumes.INTERNAL }
+                    .forEach { v ->
+                        out += com.ufi_axis_core.api.routes.ProgramRoutes.VolumeOption(
+                            id = "vol:" + v.mount.substringAfterLast('/'),
+                            label = (if (v.removable) "外接存储" else "存储卷") + "（${v.label}）",
+                            // 自动补全成 `<卷>/UFI-AXIS/content`，用户只选卷、不填路径
+                            path = "${v.mount}/UFI-AXIS/${com.ufi_axis_core.util.program.ProgramPaths.CONTENT_DIR}",
+                            removable = v.removable,
+                            mountPoint = v.mount,
+                            totalBytes = v.totalBytes,
+                            usedBytes = v.usedBytes
+                        )
+                    }
+                out
+            },
+            // enforcing 机型上整条功能不可用（filesDir 无法 exec），要在列表里直接告诉前端
+            nativeExecOk = {
+                com.ufi_axis_core.util.NativeExecProbe.cachedResult()?.executable ?: true
+            },
+            gatewaySecret = gatewaySecret
+        )
+        // 远端清单：15s 后首刷，失败保留内置；不阻塞 core 启动。
+        val programCatalogUpdater = com.ufi_axis_core.api.program.ProgramCatalogUpdater(
+            settings = settings,
+            catalog = programCatalog
+        )
+        // 看护：desired=true 但没在跑的程序会被退避拉起（首轮延迟 10s，避开启动风暴）
+        val programManager = com.ufi_axis_core.service.program.ProgramManager(
+            routes = programRoutes,
+            supervisor = programSupervisor,
+            runtime = programRuntime,
+            paths = programPaths,
+            catalogUpdater = programCatalogUpdater
+        )
+        programManager.start()
         backupAssemblerRef = backupAssembler
         val backupRoutes = com.ufi_axis_core.api.routes.BackupRoutes(
             settings = settings,
@@ -711,7 +924,25 @@ object ComponentFactory {
         val atRoutes = ATRoutes(collector.atChannel, consoleRecorder)
         val alertRoutes = AlertRoutes(alert)
         val wifiRoutes = WifiRoutes(routeCtx)
-        val configRoutes = ConfigRoutes(settings) { smsRuleStore.reloadRules() }
+        val configRoutes = ConfigRoutes(
+            settings = settings,
+            // 2026-10-30（越权审查 §2.3）：goform 口令**验证式落盘**。
+            //
+            // 顺序很重要：先把新口令交给传输层 → 真的登录一次 → 失败就把传输层恢复成旧口令。
+            // 这样「一次只改日志级别的批量 PUT 夹带错口令」不会把 core→设备的凭据写坏
+            // （写坏的表现是所有 goform 请求 503，流量/信号/短信/仪表盘一起挂，且没有读回明文的路径）。
+            // `updateGoformPassword` 内部会重置登录态（见 DeviceTransport 的签名注释），
+            // 所以 ensureLogin() 必然走一次真实登录，不会被旧 session 命中。
+            verifyGoformPassword = { candidate ->
+                val transport = routeCtx.goformClient
+                val previous = settings.goformPassword
+                transport.updateGoformPassword(candidate)
+                val ok = runCatching { transport.ensureLogin() }.getOrDefault(false)
+                if (!ok) transport.updateGoformPassword(previous)
+                ok
+            },
+            onSmsFilterConfigChanged = { smsRuleStore.reloadRules() },
+        )
         // 2026-08-10 设备更新：后端自拉取 + ADB 静默安装（P1 B2 改走 v4 守护脚本执行通道）
         // 读取已提取的 assets/shell/ufi_update.sh 模板（ComponentFactory 顶部已 extractAll），
         // 供 UpdateManager 覆盖写到 /data/local/tmp/ufi_update.sh 后 fire-and-forget 执行
@@ -882,6 +1113,23 @@ object ComponentFactory {
         val taskRoutes = TaskRoutes(controller.taskScheduler, controller.conditionEngine)
         val speedTestRoutes = SpeedTestRoutes(coordinator = controller.speedTestCoordinator)
         val debugLogRoutes = DebugLogRoutes()
+        // 运营商账单（2026-10-31）：会话/Cookie 加密在 core，App/Web 只拿脱敏账单。
+        // 2026-11-12：刷新/保活/每日短信收敛成一份设备策略，刷新器、自动登录、发码器共享同一个 store。
+        val carrierBillSettingsStore = com.ufi_axis_core.controller.carrier.CarrierBillSettingsStore(context)
+        val carrierService = CarrierBillService(context, billSettings = carrierBillSettingsStore)
+        // 账单后台刷新与自动登录共用后台总闸（见 CarrierAutoLoginManager.start/stop）。
+        val carrierBillRefresher = CarrierBillRefresher(
+            carrierService,
+            settings = { carrierBillSettingsStore.get() },
+        )
+        val carrierAutoLoginManager = CarrierAutoLoginManager(
+            context,
+            carrierService,
+            billSettingsStore = carrierBillSettingsStore,
+            billRefresher = carrierBillRefresher,
+        )
+        carrierAutoLoginRef = carrierAutoLoginManager
+        val carrierRoutes = CarrierRoutes(carrierService, carrierAutoLoginManager)
         val diagnosticRoutes = com.ufi_axis_core.api.routes.DiagnosticRoutes()
         val cpuProbeRoutes = com.ufi_axis_core.api.routes.CpuProbeRoutes()
         val planRoutes = com.ufi_axis_core.api.routes.PlanRoutes(routeCtx)
@@ -933,7 +1181,19 @@ object ComponentFactory {
             blockCooldown = pairedBlockCooldown,
             // 新设备批准（2026-10-15）：默认关（pairing_approval_required=false）→ 整体跳过。
             approvalStore = pairedApprovalStore
-        )
+        ).also { pm ->
+            // 配对被移除 / 设备被拉黑时，**当场断开它已经建好的实时连接**。
+            // 只改存储的话，被删的设备会继续通过既有的 WS 收数据（HTTP 已拒，但它够用了），
+            // 表现就是"删了配对，App 还登录着、还在刷新"。断开用 1008，客户端会走
+            // "鉴权失败 → 停止重连 → 提示"那条路，而不是当成普通掉线立刻重连。
+            pm.onDeviceRevoked = { fingerprint ->
+                if (fingerprint == null) {
+                    wsManager.closeAllDeviceSessions()
+                } else {
+                    wsManager.closeDeviceSessions(fingerprint)
+                }
+            }
+        }
         val pairingRoutes = PairingRoutes(
             routeCtx,
             pairingManager,
@@ -951,8 +1211,22 @@ object ComponentFactory {
                 )
             }
         )
+        // 破坏性操作的主人密码门（`OwnerGate`）。
+        //
+        // 与 WriteGate 同款（object + 装配层注入）：密码在请求体里，而 Ktor 请求体只能消费一次，
+        // 所以门禁不能做成拦截器，只能由 handler 显式调用；判据在这里注入，是因为 :core:api 的
+        // route 拿不到 PairingManager（那是 HttpServer 的构造参数）。
+        //
+        // `enabled` 读 `settings.ownerGateEnabled`，**默认 false** —— 关着时 requireOwner 直接放行，
+        // 行为与没有这道门完全一致。打开后也只盖 DestructiveEndpoints 里那几条不可逆操作。
+        com.ufi_axis_core.api.routes.OwnerGate.install(
+            enabled = { settings.ownerGateEnabled },
+            passwordSet = { settings.devicePasswordSet },
+            verify = { password, ip -> pairingManager.verifyOwnerPassword(password, ip) },
+            throttleDelayMs = { pairingManager.passwordThrottleDelayMs() },
+        )
         val pairedDevicesRoutes = PairedDevicesRoutes(pairingManager)
-        // 黑名单管理端点（2026-10-15）：与配对设备管理并列，走同一套双因素（Bearer + 配对密码）。
+        // 黑名单管理端点（2026-10-15）：与配对设备管理并列，只要求 Bearer + 设备签名。
         // 读侧拦截不经过路由（在 PairingManager.confirm 里），所以这里漏传只影响"增删条目"。
         val pairedBlacklistRoutes =
             com.ufi_axis_core.api.routes.PairedDeviceBlacklistRoutes(pairingManager)
@@ -1076,8 +1350,10 @@ object ComponentFactory {
             alertRoutes = alertRoutes,
             wifiRoutes = wifiRoutes,
             configRoutes = configRoutes,
+            carrierRoutes = carrierRoutes,
             updateRoutes = updateRoutes,
             appRoutes = appRoutes,
+            programRoutes = programRoutes,
             shellRoutes = shellRoutes,
             fileRoutes = fileRoutes,
             storageSourceRoutes = storageSourceRoutes,
@@ -1113,6 +1389,7 @@ object ComponentFactory {
             componentRoutes = componentRoutes,
             consoleRoutes = consoleRoutes,
             ttydRoutes = ttydRoutes,
+            screenRoutes = screenRoutes,
             backupRoutes = backupRoutes,
             dlnaRoutes = dlnaRoutes
         )
@@ -1128,6 +1405,7 @@ object ComponentFactory {
             collector = collector,
             storage = storage,
             controller = controller,
+            programManager = programManager,
             serverGraph = buildServerGraph(
                 server = server,
                 wsManager = wsManager,
@@ -1144,7 +1422,10 @@ object ComponentFactory {
                 // 应用列表定时刷新的起停钩子（见 ServerGraph.appManager 的说明）
                 appManager = appManager,
                 // 媒体索引定时刷新的起停钩子（2026-10-13，理由同上）
-                mediaIndexStore = mediaIndexStore
+                mediaIndexStore = mediaIndexStore,
+                // 投屏会话（2026-10-31）：停机要杀 scrcpy-server + 拆 reverse
+                screenSessionManager = screenSessionManager,
+                carrierAutoLoginManager = carrierAutoLoginManager
             )
         )
     }
@@ -1257,7 +1538,11 @@ object ComponentFactory {
         // `DevicePlugin.platform` 的纪律每次新建，适配层无跨调用状态（网络栈重启的互斥锁
         // 留在 NetworkController，理由见它的构造参数注释）。
         val networkController = NetworkController(
-            context, atChannel, deviceHub.network, deviceHub.wifi, platform
+            context, atChannel, deviceHub.network, deviceHub.wifi,
+            // signal 域只读接口：`setNetworkMode` 在切制式前读一次 ppp_status，
+            // 判断"用户当时开没开移动数据"（设备切完就不再报这个意图了）。
+            deviceHub.signal,
+            platform
         )
         AppLogger.i(TAG, "[5] Controllers initialized")
 
@@ -1399,7 +1684,11 @@ object ComponentFactory {
                     settings = AppSettings.getInstance(context)
                 )
                 runner.runOnce()
-            }
+            },
+            // 2026-10-30（越权审查 §2.2）：定时任务/自动化与 route 层共用同一个更新互斥判据。
+            // 传 lambda 而不是让 ActionExecutorImpl 直接引 WriteGate：本类是装配点，
+            // 服务层不该反向依赖路由层（同 speedtestAction / remoteBackupAction 的口径）。
+            updateBusy = { com.ufi_axis_core.api.routes.WriteGate.updateBusy() },
         )
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
@@ -1437,7 +1726,9 @@ object ComponentFactory {
         webResourceManager: com.ufi_axis_core.util.WebResourceManager,
         ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
         appManager: com.ufi_axis_core.controller.system.AppManager,
-        mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore
+        mediaIndexStore: com.ufi_axis_core.api.media.MediaIndexStore,
+        screenSessionManager: com.ufi_axis_core.controller.screen.ScreenSessionManager,
+        carrierAutoLoginManager: com.ufi_axis_core.controller.carrier.CarrierAutoLoginManager
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -1452,7 +1743,9 @@ object ComponentFactory {
             webResourceManager = webResourceManager,
             ttydRoutes = ttydRoutes,
             appManager = appManager,
-            mediaIndexStore = mediaIndexStore
+            mediaIndexStore = mediaIndexStore,
+            screenSessionManager = screenSessionManager,
+            carrierAutoLoginManager = carrierAutoLoginManager
         )
     }
 }

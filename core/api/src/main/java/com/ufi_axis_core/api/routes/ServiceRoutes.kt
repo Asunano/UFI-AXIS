@@ -60,6 +60,9 @@ class ServiceRoutes(
 
             /** 启动后台采集服务（幂等）。 */
             post("/start") {
+                // 2026-10-30（越权审查 §2.10）：后台服务的启停会连带重启采集与调度，
+                // 更新脚本正靠这两者之外的进程完成安装 —— 更新中启停等于把状态机搅乱。
+                if (call.rejectIfUpdating()) return@post
                 applySwitch(true)
                 AppLogger.i(tag, "Background service started via REST")
                 call.respond(statusPayload())
@@ -67,6 +70,7 @@ class ServiceRoutes(
 
             /** 停止后台采集服务（幂等）。HTTP 服务保持运行，可随时再 start。 */
             post("/stop") {
+                if (call.rejectIfUpdating()) return@post
                 applySwitch(false)
                 AppLogger.w(tag, "Background service stopped via REST (HTTP server keeps running)")
                 call.respond(statusPayload())
@@ -77,6 +81,7 @@ class ServiceRoutes(
              * 服务被 AlarmManager 在约 10 秒后拉起，期间 HTTP 不可用。
              */
             post("/restart") {
+                if (call.rejectIfUpdating()) return@post
                 call.respond(
                     toJsonElement(
                         mapOf(
