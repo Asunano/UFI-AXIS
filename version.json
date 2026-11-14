@@ -22,12 +22,12 @@
   "web": {
     "version": "0.1.1",
     "versionCode": 5,
-    "apkUrl": "",
-    "apkSha256": "",
+    "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.1/web-update-0.1.1.zip",
+    "apkSha256": "e3957c7299a50d5be6d3e56db817af2ccfc5350298306b6600b087f469dd01a1",
     "changelog": "随 Core 端（管理后台）一同发布，更新内容见 Core 端更新日志。\n本轮新增：\n- 话费账单页：多账号并存（移动 / 联通 / 云上卡 / 小鲸卡），余额、流量、套餐与到期\n- 远程投屏页：scrcpy 画面与触控/键盘\n- 应用商店页：安装、启停、日志与访问\n- 全局致命错误浮层：组件异常不再白屏，给出可关闭的提示与刷新入口",
-    "apkSize": 0,
-    "publishedAt": "",
-    "tagName": ""
+    "apkSize": 2060421,
+    "publishedAt": "2026-11-14T18:36:04Z",
+    "tagName": "v0.1.1"
   },
   "components": {
     "frpc": {

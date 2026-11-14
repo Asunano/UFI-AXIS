@@ -378,7 +378,12 @@ jobs:
           BASE_WEB="$(printf '%s\n%s\n' "$CUR_WEB" "$MAIN_WEB" | sort -V | tail -n1)"
           HIGHEST_WEB="$(printf '%s\n%s\n' "$WEB_VERSION" "$BASE_WEB" | sort -V | tail -n1)"
           FILTER='.frontend.apkUrl = $fapk | .frontend.apkSize = $fsize | .frontend.apkSha256 = $fsha | .frontend.publishedAt = $fpub | .frontend.tagName = $ftag | .backend.apkUrl = $bapk | .backend.apkSize = $bsize | .backend.apkSha256 = $bsha | .backend.publishedAt = $bpub | .backend.tagName = $btag'
-          if [ "$HIGHEST_WEB" = "$WEB_VERSION" ] && [ "$WEB_VERSION" != "$BASE_WEB" ]; then
+          # 条件只需「本次 web 包是三者中最高」：`HIGHEST_WEB == WEB_VERSION` 已经同时排除了
+          # 「main 上有更高的 web-only 发布」这一保护场景（那时 HIGHEST 取的是那个更高的版本）。
+          # 2026-11-15 修：原先还要求 `WEB_VERSION != BASE_WEB` —— 而基线包含本次提交自己的
+          # `version.json.web.version`（发布时总会把它抬到本次版本），于是两者恒等，
+          # web.* 每次都被跳过：0.1.1 的清单里 web.apkUrl 为空，独立更新通道拿不到包。
+          if [ "$HIGHEST_WEB" = "$WEB_VERSION" ]; then
             FILTER="$FILTER | .web.apkUrl = \$wapk | .web.apkSize = \$wsize | .web.apkSha256 = \$wsha | .web.publishedAt = \$wpub | .web.tagName = \$wtag"
             echo "web.* 回写：本次 $WEB_VERSION > 基线 $BASE_WEB（main=$MAIN_WEB / 清单=$CUR_WEB）"
           else
