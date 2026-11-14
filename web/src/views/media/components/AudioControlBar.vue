@@ -10,7 +10,7 @@
   ## 状态从哪来
   全部读写 `stores/player.ts`（播放状态必须比页面活得久，见那个文件头）。
   本组件**不持有任何播放状态**，只派发 store 动作；页面只通过三个事件决定"弹哪一层"：
-  `open-queue`（队列下拉）、`toggle-lyrics`（歌词显隐）、`open-stage`（进入沉浸）。
+  `open-queue`（队列下拉）、`toggle-lyrics`（歌词显隐，仅沉浸层）、`open-stage`（进入沉浸）。
 
   ## 按钮层级
   主走带（随机 / 上一首 / 播放 / 下一首 / 循环）永远居中；音量、倍速在左，
@@ -70,13 +70,18 @@
       <div class="acb-transport">
         <button
           type="button"
-          class="acb-icon"
-          :class="{ on: player.shuffle }"
-          :aria-pressed="player.shuffle"
-          :title="player.shuffle ? '随机播放：已开（只改播放顺序，不动队列）' : '随机播放：已关'"
-          @click="player.toggleShuffle()"
+          class="acb-icon acb-mode"
+          :class="{ on: player.playMode !== 'sequential' }"
+          :aria-label="playModeTitle"
+          :aria-pressed="player.playMode !== 'sequential'"
+          :title="playModeTitle"
+          @click="player.cyclePlayMode()"
         >
-          <n-icon :size="17"><ShuffleOutline /></n-icon>
+          <n-icon :size="17">
+            <ShuffleOutline v-if="player.playMode === 'shuffle'" />
+            <RepeatOutline v-else />
+          </n-icon>
+          <span v-if="player.playMode === 'repeat-one'" class="acb-mode-one" aria-hidden="true">1</span>
         </button>
         <button type="button" class="acb-icon" :disabled="!player.hasPrev" title="上一首" @click="player.prev()">
           <n-icon :size="18"><PlaySkipBackOutline /></n-icon>
@@ -89,15 +94,6 @@
         </button>
         <button type="button" class="acb-icon" :disabled="!player.hasNext" title="下一首" @click="player.next()">
           <n-icon :size="18"><PlaySkipForwardOutline /></n-icon>
-        </button>
-        <button
-          type="button"
-          class="acb-icon"
-          :class="{ on: player.repeatMode !== 'off' }"
-          :title="repeatTitle"
-          @click="player.cycleRepeat()"
-        >
-          <n-icon :size="17"><RepeatOutline /></n-icon>
         </button>
       </div>
     </div>
@@ -125,7 +121,11 @@
       </span>
 
       <span class="acb-side acb-side--right">
+        <!-- 歌词只在沉浸层里存在：资料库那一层的「歌词」以前是"点一下就跳进沉浸页"，
+             和右边的「沉浸播放」按钮完全重复，还容易让人以为资料库能直接看歌词。
+             所以这里只在 variant=immersive 的沉浸控制条里出现。 -->
         <button
+          v-if="variant === 'immersive'"
           type="button"
           class="acb-text"
           :class="{ on: lyricsOpen }"
@@ -236,10 +236,20 @@ const volumePercent = computed(() => Math.round((player.volume || 0) * 100));
 const rateLabel = computed(() => `${player.playbackRate}×`);
 const rateOptions = [0.75, 1, 1.25, 1.5, 1.75, 2].map((r) => ({ label: `${r}×`, key: String(r) }));
 
-const repeatTitle = computed(() => {
-  if (player.repeatMode === 'one') return '单曲循环：已开';
-  if (player.repeatMode === 'all') return '列表循环：已开';
-  return '循环：关';
+const playModeTitle = computed(() => {
+  const next: Record<string, string> = {
+    sequential: '随机播放',
+    shuffle: '列表循环',
+    'repeat-all': '单曲循环',
+    'repeat-one': '顺序播放',
+  };
+  const current: Record<string, string> = {
+    sequential: '顺序播放',
+    shuffle: '随机播放',
+    'repeat-all': '列表循环',
+    'repeat-one': '单曲循环',
+  };
+  return `${current[player.playMode]}：点击切换${next[player.playMode]}`;
 });
 
 const sleepTitle = computed(() => {
@@ -524,6 +534,19 @@ function cancelSleep() {
 .acb-icon.on {
   color: var(--accent-color);
 }
+.acb-mode {
+  position: relative;
+}
+.acb-mode-one {
+  position: absolute;
+  top: 2px;
+  right: 5px;
+  color: var(--accent-color);
+  font-size: 8px;
+  font-weight: 700;
+  line-height: 1;
+  pointer-events: none;
+}
 .acb-rate,
 .acb-text {
   border: 0;
@@ -622,12 +645,13 @@ function cancelSleep() {
   background: var(--brand-glow-soft);
   color: var(--brand-ink);
 }
-.acb.is-immersive .acb-play {
-  width: 44px;
-  height: 44px;
-  background: var(--brand-logo-bg);
-  color: var(--brand-panel-1);
-}
+/* 播放按钮在两条控制条上**必须一模一样**（2026-10-30）。
+   这里原本有一条 44px + `--brand-logo-bg/--brand-panel-1` 的覆盖：
+   亮色下尺寸差 4px、暗色下底色从 `#e0e0e0` 变成纯白 —— 切换沉浸层时
+   同一个按钮会"长大变白"，看起来像两个不同的控件。
+   沉浸层的品牌变量（`--brand-*`）是给封面/歌词那套场景用的，播放按钮不需要跟着变：
+   全局的 `--text-primary` / `--card-bg` 在亮色沉浸层（白底）和暗色沉浸层（深底）
+   上都已经是正确的反色搭配，直接用即可。 */
 .acb.is-immersive .acb-text,
 .acb.is-immersive .acb-rate {
   color: var(--brand-ink);

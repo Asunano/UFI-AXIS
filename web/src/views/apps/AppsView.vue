@@ -1,5 +1,19 @@
 <template>
   <div class="apps-view">
+    <!--
+      页内返回（2026-11-11）：不再用路由 meta.back 让全局顶栏渲染返回键。
+      「应用管理」的唯一入口在设备页，返回目标是设备；按钮留在页面内，
+      顶栏就不会为了这个二级页多出一颗返回键和一行标题。
+    -->
+    <header class="apps-back">
+      <n-button quaternary size="small" class="apps-back-btn" @click="goBack">
+        <template #icon>
+          <n-icon :size="16"><ArrowBackOutline /></n-icon>
+        </template>
+        设备
+      </n-button>
+    </header>
+
     <!-- 顶部工具栏 -->
     <GridCard title="应用管理">
       <div class="top-bar">
@@ -193,7 +207,8 @@ import GridCard from '@/components/GridCard.vue';
 //（用法对照 views/network/NetworkView.vue 与 components/modals/BandLockModal.vue）
 import { useApiOperation } from '@/composables/useApiOperation';
 import OperationProgressModal from '@/components/common/OperationProgressModal.vue';
-import { SearchOutline, RefreshOutline, EllipsisHorizontalOutline } from '@vicons/ionicons5';
+import { ArrowBackOutline, SearchOutline, RefreshOutline, EllipsisHorizontalOutline } from '@vicons/ionicons5';
+import { useRouter } from 'vue-router';
 
 interface AppInfo {
   packageName: string;
@@ -208,6 +223,7 @@ interface AppInfo {
 
 const message = useMessage();
 const dialog = useDialog();
+const router = useRouter();
 const api = getApiClient();
 
 // ── 状态 ──
@@ -220,6 +236,16 @@ const appsLoaded = ref(false);
 const searchQuery = ref('');
 const filter = ref('all');
 const root = ref(false);
+
+/**
+ * 页内返回：优先历史上一页（保留设备页的滚动位置），刷新/深链接直达时回落到设备页。
+ * 与 DefaultLayout 的 goBack 同一判据（history.state.back 由 vue-router 写入）。
+ */
+function goBack() {
+  const hasInAppPrev = !!(window.history.state as { back?: string | null } | null)?.back;
+  if (hasInAppPrev) router.back();
+  else void router.push({ name: 'device' });
+}
 
 // ── 安装 ──
 const showInstallApk = ref(false);
@@ -670,6 +696,15 @@ loadApps();
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.apps-back {
+  display: flex;
+  align-items: center;
+  /* 上移一格：按钮与第一张卡的间距仍由 .apps-view 的 16px 控制，避免顶部多出一整段空白 */
+  margin-bottom: calc(var(--space-2) * -1);
+}
+.apps-back-btn {
+  padding-left: 6px;
 }
 
 /* ── 顶部工具栏 ── */

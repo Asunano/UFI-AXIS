@@ -17,13 +17,40 @@
  * 放在这里而不是页面里，是因为描述符的 `run()` 必须读到它，而描述符不认识组件实例。
  */
 import { reactive } from 'vue';
+import { Endpoints } from '@/api/contract';
+import { getApiClient } from '@/composables/useApi';
 
 /**
  * `port` 允许 `null`：`n-input-number` 被清空时给的就是 null，而它的 `value` 形参类型是
  * `number | null` —— 这里声明成 `number` 会让 vue-tsc 在 `v-model:value` 上报 TS2322。
  * 消费侧用 `?? DEFAULT_TCP_PORT` 兜回默认值。
  */
-export const networkTarget = reactive<{ host: string; port: number | null }>({ host: '', port: 443 });
+export const networkTarget = reactive<{ host: string; port: number | null }>({
+  host: 'www.baidu.com',
+  port: 443,
+});
 
 /** 端口留空时 TCP 探测用的默认值（与旧 `DiagnosticModal` 的初值一致）。 */
 export const DEFAULT_TCP_PORT = 443;
+
+let presetsLoaded = false;
+/**
+ * 从 core 读默认目标。调用方在诊断页挂载时调用一次；失败保留内置 fallback，
+ * 不让网络诊断因为一个装饰性端点不可用而无法操作。
+ */
+export async function loadNetworkPresets(): Promise<void> {
+  if (presetsLoaded) return;
+  presetsLoaded = true;
+  try {
+    const { data } = await getApiClient().get(Endpoints.diagnostic.presets);
+    const network = data?.network;
+    if (typeof network?.host === 'string' && network.host.trim()) {
+      networkTarget.host = network.host.trim();
+    }
+    if (Number.isInteger(network?.port) && network.port >= 1 && network.port <= 65535) {
+      networkTarget.port = network.port;
+    }
+  } catch {
+    /* 旧 core 没有该端点：保留 fallback */
+  }
+}

@@ -609,6 +609,8 @@ const tooltip = computed(() => {
 // ── 帧循环与尺寸同步 ──
 let raf = 0;
 let observer: ResizeObserver | null = null;
+/** 同一帧内的多次 resize 通知合并成一次处理（见 onMounted 里的说明） */
+let resizePending = false;
 /** 曲线的离屏层（尺寸与主画布一致）。只为了左端渐隐能用 destination-out 而不牵连网格线。 */
 let layer: HTMLCanvasElement | null = null;
 let layerCtx: CanvasRenderingContext2D | null = null;
@@ -632,6 +634,9 @@ function syncSize() {
   const w = host.clientWidth;
   const h = host.clientHeight;
   if (!w || !h) return;
+  // 尺寸没变就不动：ResizeObserver 在"回调里改布局"时会再通知一次，
+  // 如果每次通知都无条件写 canvas 宽高 + 响应式 ref，就会跨帧来回震荡。
+  if (w === cssW.value && h === cssH.value && canvas.width > 0) return;
   cssW.value = w;
   cssH.value = h;
   const dpr = window.devicePixelRatio || 1;
@@ -657,7 +662,18 @@ onMounted(() => {
   mountedAt = Date.now();
   syncSize();
   if (typeof ResizeObserver !== 'undefined' && plotRef.value) {
-    observer = new ResizeObserver(() => syncSize());
+    // 回调必须**推迟到下一帧**再动布局：在 ResizeObserver 回调里同步改被观察元素的
+    // 尺寸（canvas 宽高、响应式宽高都会引起重排），浏览器会在同一帧内再派发一次通知，
+    // 于是抛出 "ResizeObserver loop completed with undelivered notifications"。
+    // 用 rAF + 合帧标志，同一帧内的多次通知只处理一次。
+    observer = new ResizeObserver(() => {
+      if (resizePending) return;
+      resizePending = true;
+      requestAnimationFrame(() => {
+        resizePending = false;
+        syncSize();
+      });
+    });
     observer.observe(plotRef.value);
   }
   raf = requestAnimationFrame(frame);
@@ -665,6 +681,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   cancelAnimationFrame(raf);
+  resizePending = false;
   observer?.disconnect();
 });
 

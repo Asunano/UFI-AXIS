@@ -5,6 +5,7 @@ import { router } from '@/router';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 import { calibrateClockOffset } from '@/composables/deviceIdentity';
 import { releaseActiveTab } from '@/composables/tabLock';
+import { clearCachedOwnerPassword, getCachedOwnerPassword, requestOwnerPassword } from '@/composables/ownerPassword';
 
 let apiClient: AxiosInstance | null = null;
 
@@ -76,6 +77,8 @@ export function getApiClient(): AxiosInstance {
         );
         // 保留设备地址：掉线是"这台设备不认我了"，不是"我不知道设备在哪"。
         appStore.clearAuth({ keepBaseUrl: true });
+        // 换过一次身份了，旧设备的主人口令不该留在内存里继续给下一次操作用。
+        clearCachedOwnerPassword();
         // 2026-10-21（决策 D7-3）：掉线即释放"活跃标签页"锁 —— 否则同源其它标签页
         // 会一直被提示"已被另一个标签页接管"，而实际上那个标签页已经退出了。
         releaseActiveTab();
@@ -97,12 +100,48 @@ export function getApiClient(): AxiosInstance {
         router.push('/login');
         return Promise.reject(err);
       }
+      // ── 主人密码门（core 的 OwnerGate）──
+      //
+      // 只有「破坏性操作保护」开关打开时 core 才会回这个码；关着时整段不会命中，
+      // 默认配置下用户永远不会看到密码框。
+      //
+      // 重试走请求头而不是改请求体：这个拦截器不认识每个端点的 body 形状（有的是 JSON，
+      // 有的是备份包文件流），而 core 的 `requireOwner` 已经支持 body 缺失时读
+      // `X-Owner-Password`。一次输入之后缓存在内存里，同一次会话的后续操作不再弹框。
+      const { code: errorCode, message: errorMessage } = await readErrorBody(err);
+      if (errorCode === 'INVALID_PASSWORD') {
+        // 缓存的那个不再有效（改过密码 / 之前输错）：清掉，并**再问一次**。
+        // 只清不重问的话，用户看到的是一次「保存失败」，既不知道是密码错、也没机会重输
+        // （App 端 2026-11-14 修的是同一个问题，这里对齐成最多追问 2 次）。
+        clearCachedOwnerPassword();
+        if (status === 401 && !err.config?._ufiOwnerRetried) {
+          err.config._ufiOwnerRetried = true;
+          const password = await requestOwnerPassword('配对密码不正确，请重新输入');
+          if (!password) return Promise.reject(err);
+          applyOwnerPasswordHeader(err.config, password);
+          return client.request(err.config);
+        }
+      }
+      if (status === 401 && errorCode === 'MISSING_PASSWORD' && !err.config?._ufiOwnerRetried) {
+        err.config._ufiOwnerRetried = true;
+        const password = getCachedOwnerPassword() ?? (await requestOwnerPassword(errorMessage));
+        if (!password) return Promise.reject(err);
+        applyOwnerPasswordHeader(err.config, password);
+        // 重发走同一个实例：请求拦截器会重新签名（时间戳/nonce 复用会触发重放拒绝）。
+        return client.request(err.config);
+      }
+
       // 2026-10-21（审计 §A3）：校准重试只对**要签名**的 /api/* 有意义。
       // `/pairing/*` 走的是挑战-应答、不验签名，重试纯属副作用：
       // 它会打到 confirm 的 500ms 每 IP 限频上（把"密码错"变成 429"操作过于频繁"），
       // 慢一点的情况还会把一次密码失败记成两次（提前 15 分钟锁定）。
       const url = String(err.config?.url ?? '');
-      if (status === 401 && !err.config?._ufiClockRetried && !url.startsWith('/pairing/')) {
+      // 只对「签名/时间戳」这类**可自愈**的 401 做校时重试。
+      // 密码错（`INVALID_PASSWORD`）也是 401：重试只会用同一个错密码再撞一次，
+      // 而 core 的 PasswordAttemptLimiter 每次失败都计数（5 次 / 15 分钟）——
+      // 一次手滑就变成两次，默认配置下「解除全部配对」输错 3 次就锁 15 分钟。
+      const clockRetryable = errorCode == null || errorCode === 'STALE_TIMESTAMP' || errorCode === 'INVALID_SIGNATURE';
+      if (status === 401 && clockRetryable && !err.config?._ufiClockRetried && !url.startsWith('/pairing/')) {
         err.config._ufiClockRetried = true;
         const recalibrated = await recalibrateClockFromHealth(client, err.config);
         if (recalibrated) {
@@ -137,6 +176,50 @@ async function recalibrateClockFromHealth(client: AxiosInstance, config: { baseU
   } catch {
     return false;
   }
+}
+
+/**
+ * 取 core 错误体里的 `code` 与 `error`。
+ *
+ * ## 为什么不能直接读 `err.response.data.code`
+ *
+ * 备份导出用 `responseType: 'blob'`（`BackupPanel.vue:386`），错误体也是 **Blob** ——
+ * `data.code` 恒为 `undefined`，于是「主人密码门」在导出这一条上完全失效：
+ * 既不弹密码框，也不重发，用户只看到 core 原文「请输入配对密码」，界面上无处可输。
+ *
+ * 这里把 Blob 先读成文本再解析；解析不出来就当作"没有 code"，交给调用方走保守分支。
+ */
+async function readErrorBody(err: any): Promise<{ code?: string; message?: string }> {
+  const data = err?.response?.data;
+  if (data == null) return {};
+  // Blob / File：只有这两种才有 text()（JSON 对象没有）
+  if (typeof data === 'object' && typeof data.text === 'function') {
+    try {
+      const parsed = JSON.parse(await data.text());
+      return {
+        code: typeof parsed?.code === 'string' ? parsed.code : undefined,
+        message: typeof parsed?.error === 'string' ? parsed.error : undefined,
+      };
+    } catch {
+      return {};
+    }
+  }
+  return {
+    code: typeof data?.code === 'string' ? data.code : undefined,
+    message: typeof data?.error === 'string' ? data.error : undefined,
+  };
+}
+
+/**
+ * 把主人密码写进请求头，准备重发。
+ *
+ * axios 的 config.headers 在 v1 里是 `AxiosHeaders`（有 `set`），但历史配置可能塞的是
+ * 普通对象；两种都兜住，否则重试会静默不带头、然后稳定 401。
+ */
+function applyOwnerPasswordHeader(config: any, password: string): void {
+  const headers = config.headers ?? (config.headers = {});
+  if (typeof headers.set === 'function') headers.set('X-Owner-Password', password);
+  else headers['X-Owner-Password'] = password;
 }
 
 /**

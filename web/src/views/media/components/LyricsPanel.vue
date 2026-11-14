@@ -91,7 +91,7 @@ function setLineRef(el: unknown, i: number) {
 }
 
 /** 缓动滚到目标 scrollTop；连续切换时打断上一段，避免动画叠罗汉掉帧。 */
-function animateScrollTo(panel: HTMLElement, to: number, duration = 420) {
+function animateScrollTo(panel: HTMLElement, to: number, duration = 560) {
   if (raf) cancelAnimationFrame(raf);
   const from = panel.scrollTop;
   const target = Math.max(0, to);
@@ -99,7 +99,8 @@ function animateScrollTo(panel: HTMLElement, to: number, duration = 420) {
   const start = performance.now();
   const step = (now: number) => {
     const t = Math.min(1, (now - start) / duration);
-    const e = 1 - Math.pow(1 - t, 3);
+    // easeInOutCubic：起步和收尾都更柔和，长歌词跳转不会像被“拽”过去
+    const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
     panel.scrollTop = from + (target - from) * e;
     raf = t < 1 ? requestAnimationFrame(step) : 0;
   };
@@ -172,16 +173,12 @@ onBeforeUnmount(() => {
   padding: 0 6px;
   /* 滚到底不该把外层页面接着往下带 */
   overscroll-behavior: contain;
-  /* 上下渐隐让"当前行在中间"看起来是自然的；滚动时改成不遮，减少每帧重绘。
+  /* 上下渐隐让"当前行在中间"看起来是自然的；滚动期间也保持，避免遮罩一隐一现。
      ui-baseline-allow: 遮罩只取 alpha 通道，色值写 #000 还是 #fff 渲染完全一样，接主题令牌没有意义 */
   mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   scrollbar-width: none;
   -ms-overflow-style: none;
-}
-.lyrics-panel.scrolling {
-  mask-image: none;
-  -webkit-mask-image: none;
 }
 .lyrics-panel::-webkit-scrollbar {
   width: 6px;
@@ -237,9 +234,10 @@ onBeforeUnmount(() => {
   text-align: center;
   opacity: 0.45;
   transition:
-    opacity 0.22s ease,
-    color 0.22s ease,
-    font-size 0.22s ease;
+    opacity 0.34s ease,
+    color 0.34s ease,
+    font-size 0.34s ease,
+    transform 0.34s ease;
   contain: layout style;
   will-change: opacity;
 }
@@ -275,6 +273,7 @@ onBeforeUnmount(() => {
 }
 .lyrics-panel.large .lyrics-line.current {
   font-size: 26px;
+  transform: translateY(-1px);
 }
 
 @media (max-width: 768px) {

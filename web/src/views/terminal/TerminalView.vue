@@ -122,19 +122,6 @@
         <n-tag v-for="q in activeQuick" :key="q.key" size="small" class="quick-tag" @click="runQuick(q.cmd)">
           {{ q.label }}
         </n-tag>
-        <template v-if="activeTab === 'shell'">
-          <span class="quick-sep">getprop:</span>
-          <!--
-            只读属性面板（2026-10-14 改）：值走 `GET /api/shell/prop/{key}` 并发取，
-            不再把 `getprop xxx` 拼成命令送进 /api/shell/exec —— 那会在终端历史里
-            记下一笔「用户从没敲过的命令」。整块只读，点标签不再执行任何东西。
-          -->
-          <n-tag v-for="k in quickProps" :key="k" size="small" class="prop-tag" :title="k">
-            <span class="prop-key">{{ k }}</span>
-            <span class="prop-value">{{ propValue(k) }}</span>
-          </n-tag>
-          <n-button size="tiny" quaternary :loading="quickPropsLoading" @click="loadQuickProps()"> 刷新属性 </n-button>
-        </template>
       </div>
 
       <!-- ── 吸底输入栏（AT/Shell 共用，按 activeTab 绑数据）── -->
@@ -157,8 +144,6 @@
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { getApiClient } from '@/composables/useApi';
-import { useCancellableApi } from '@/composables/useCancellableApi';
-import { Endpoints } from '@/api/contract';
 import { useWebSocketStore } from '@/stores/websocket';
 import ConsoleMessageList from './components/ConsoleMessageList.vue';
 // 2026-10-10 随「真 PTY」tab 一并隐藏（整套功能未完工，2026-10 再做）。
@@ -170,15 +155,6 @@ import ConsoleInputBar from './components/ConsoleInputBar.vue';
 import { nextId, ensureSeqAbove, type ConsoleMessage } from './components/types';
 
 const api = getApiClient();
-/**
- * 只读探测（getprop）单独用一个可取消客户端。
- *
- * 不能把它和上面那个 `api` 合成一个：`useCancellableApi` 会用作用域里的 signal
- * **覆盖**调用方传入的 signal，而 exec / at 那条链路靠自己的 AbortController 管取消
- * （见下方 activeControllers），两者混用会让「发送中取消」失效。
- * 分开之后，本页卸载时在途的属性请求会自动 abort，不需要手工登记。
- */
-const readApi = useCancellableApi();
 const message = useMessage();
 const wsStore = useWebSocketStore();
 
@@ -220,49 +196,6 @@ const quickShellCmds = [
   { key: 'uptime', cmd: 'uptime', label: 'uptime' },
   { key: 'dmesg | tail -20', cmd: 'dmesg | tail -20', label: 'dmesg' },
 ];
-// ── 系统属性（只读探测）──
-/**
- * getprop 快捷项：原来是「点一下就把 `getprop <key>` 送进 exec」，现在改成
- * **只读展示 + 并发读取**（2026-10-14）。两处取舍：
- *
- * ① 走 `GET /api/shell/prop/{key}` 而不是 `POST /api/shell/exec`：
- *    core 这条路由对 key 做白名单校验（只许 `[a-zA-Z0-9._]`，防命令注入），
- *    而 exec 是把拼好的字符串交给 shell、校验责任全在调用方；更要紧的是 exec
- *    会在终端历史里记一笔 —— 读几个只读属性不该把用户真正的操作淹掉。
- * ② 并发（Promise.allSettled）而不是逐个 await：5 个属性各走一轮 shell，
- *    串行会比并发明显慢一个数量级。
- *
- * 失败不弹 toast：设备离线 / 属性不存在都是常态，单条失败只影响它自己那格，
- * 显示 `—` 即可（整块失败也一样，不打断用户）。
- */
-const quickProps = ['ro.product.model', 'ro.build.version.release', 'ro.serialno', 'init.svc.adbd', 'gsm.network.type'];
-const propValues = ref<Record<string, string>>({});
-const quickPropsLoading = ref(false);
-
-/** 空值 / 读取失败统一显示 `—`：留白会让人分不清「没这个属性」和「没取到」 */
-function propValue(key: string): string {
-  return propValues.value[key] || '—';
-}
-
-async function loadQuickProps() {
-  quickPropsLoading.value = true;
-  try {
-    const results = await Promise.allSettled(quickProps.map((key) => readApi.get(Endpoints.shell.prop(key))));
-    const next: Record<string, string> = {};
-    results.forEach((r, i) => {
-      const key = quickProps[i];
-      if (key === undefined) {
-        return;
-      }
-      // value 是 getprop 的原始 stdout（含结尾换行），必须自己 trim
-      next[key] = r.status === 'fulfilled' ? String(r.value.data?.value ?? '').trim() : '';
-    });
-    propValues.value = next;
-  } finally {
-    quickPropsLoading.value = false;
-  }
-}
-
 const activeQuick = computed(() => (activeTab.value === 'at' ? quickAtCmds : quickShellCmds));
 
 // ── 消息流（对话化）──
@@ -584,8 +517,6 @@ onMounted(async () => {
   loadHistory('shell');
   loadAtStatus();
   loadShellRoot();
-  // 只读属性与 shell 状态同批探测：并发 5 个小请求，换来切到 Shell tab 时面板已是热的
-  loadQuickProps();
   // 直接挂载隐藏的 Shell 列表；只渲染最近 80 条，切 Tab 时不再创建几百个气泡
   shellMounted.value = true;
 });
@@ -747,25 +678,6 @@ onUnmounted(() => {
 }
 .quick-tag {
   cursor: pointer;
-}
-/* 属性标签是只读展示（没有 cursor: pointer，点了不执行任何东西）。
-   n-tag 的内容被包在 .n-tag__content 里，key / value 的间距只能从那里给。 */
-.prop-tag :deep(.n-tag__content) {
-  display: inline-flex;
-  align-items: baseline;
-  gap: 6px;
-}
-.prop-key {
-  color: var(--text-muted);
-}
-.prop-value {
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-.quick-sep {
-  font-size: 12px;
-  color: var(--text-muted);
-  margin-left: 4px;
 }
 
 /* ── 响应式 ── */

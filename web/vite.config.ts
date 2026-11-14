@@ -3,7 +3,39 @@ import vue from '@vitejs/plugin-vue';
 import Components from 'unplugin-vue-components/vite';
 import { NaiveUiResolver } from 'unplugin-vue-components/resolvers';
 import { resolve } from 'path';
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
+
+/**
+ * `public/sw.js` 里缓存名那一行的**原样文本**。构建期整行被替换成带版本的缓存名。
+ *
+ * 用整行匹配而不是正则替换：sw.js 是这个文件之外的独立产物，正则写宽了会把注释里
+ * 的举例一起换掉，写窄了又会漏。整行匹配的代价是
+ * 「改 sw.js 里那行必须同步改这里」—— 漏改时构建直接失败，而不是静默留下一个
+ * 永不失效的缓存（那正是这次要修的问题）。
+ */
+const SW_CACHE_MARKER = "const CACHE = 'ufi-shell-dev';";
+
+/**
+ * 给 `dist/sw.js` 的缓存名打上版本号（2026-10-30）。
+ *
+ * 不这么做的话，`sw.js` 的 `activate` 里那句「删掉除当前名字外的所有 cache」永远不生效：
+ * 名字固定 ⇒ 新旧构建共用同一个 cache ⇒ 每次 OTA 只增不减。
+ *
+ * 找不到标记就抛错：宁可让构建红，也不要发一个「用户浏览器缓存只涨不回收」的版本。
+ */
+function stampSwCacheVersion(webVersion: string): void {
+  const swPath = resolve(__dirname, 'dist/sw.js');
+  if (!existsSync(swPath)) return; // 只构建资源 / 跳过 web 时不处理
+  const src = readFileSync(swPath, 'utf-8');
+  if (!src.includes(SW_CACHE_MARKER)) {
+    throw new Error(
+      `[web-version] dist/sw.js 里找不到缓存名标记 ${SW_CACHE_MARKER} —— ` +
+        '改过 public/sw.js 的话，请同步更新 vite.config.ts 的 SW_CACHE_MARKER，' +
+        '否则用户浏览器上的旧缓存永远不会被回收。'
+    );
+  }
+  writeFileSync(swPath, src.replace(SW_CACHE_MARKER, `const CACHE = 'ufi-shell-${webVersion}';`), 'utf-8');
+}
 
 /** 构建结束时自动生成 dist/version.json，供 APK 内置版本追踪和独立更新校验。
  *  版本号以仓库根 version.json 的 web.version 为准（单一更新配置源），package.json 仅兜底 */
@@ -11,6 +43,9 @@ function webVersionPlugin(): Plugin {
   return {
     name: 'web-version',
     enforce: 'post',
+    // 只在 build 运行：dev 下 closeBundle 会在 dev server 关闭时触发，
+    // 那时 dist/ 可能是上一次的产物，写 version.json / 改 sw.js 都会污染它。
+    apply: 'build',
     closeBundle() {
       const pkg = JSON.parse(readFileSync('package.json', 'utf-8'));
       let webVersion = pkg.version;
@@ -25,6 +60,9 @@ function webVersionPlugin(): Plugin {
         buildTime: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'),
       };
       writeFileSync('dist/version.json', JSON.stringify(versionJson, null, 2) + '\n');
+      // 顺序有讲究：先写 version.json（它不依赖 sw），再改 sw.js ——
+      // 后者失败会让整个构建失败，此时 version.json 已经不是本次构建的产物。
+      stampSwCacheVersion(webVersion);
     },
   };
 }

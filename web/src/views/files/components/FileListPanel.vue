@@ -25,10 +25,10 @@
         <div v-if="!selMode" class="file-actions" @click.stop>
           <!-- 窄屏（≤768）只留「更多」：预览/下载在 ⋮ 菜单里都有，
                把 156px 的文件名区让回来，行内也不会挤成三颗小按钮 -->
-          <n-button v-if="canPreview(f)" class="quick" size="tiny" text @click="emit('preview', f)">预览</n-button>
-          <n-button v-if="!f.isDirectory" class="quick" size="tiny" text @click="emit('download', f)">下载</n-button>
+          <n-button v-if="canPreview(f)" class="quick" size="small" @click="emit('preview', f)">预览</n-button>
+          <n-button v-if="!f.isDirectory" class="quick" size="small" @click="emit('download', f)">下载</n-button>
           <n-dropdown :options="fileActions(f)" trigger="click" @select="(k: string) => emit('action', k, f)">
-            <n-button size="tiny" text title="更多操作">
+            <n-button class="more" size="small" title="更多操作">
               <template #icon
                 ><n-icon><EllipsisHorizontalOutline /></n-icon
               ></template>
@@ -134,8 +134,8 @@ function fileActions(f: FileEntry) {
     if (canExtract(f)) {
       opts.unshift({ label: '解压', key: 'extract' });
     }
-    // 文件专属：校验和 + 压缩成本地 zip
-    opts.push({ label: '校验和', key: 'checksum' });
+    // 文件专属：校验（哈希）+ 压缩成本地 zip
+    opts.push({ label: '校验', key: 'checksum' });
     opts.push({ label: '压缩', key: 'compress' });
   }
   // 文件夹也可整体压缩
@@ -219,10 +219,18 @@ function fileActions(f: FileEntry) {
 .file-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  /* 原来 2px：三个按钮贴在一起，鼠标经常点串（预览点成下载）。
+     6px + 各自 8px 内边距后，命中区互不重叠。 */
+  gap: 6px;
   flex-shrink: 0;
-  opacity: 0.55;
+  opacity: 0.7;
   transition: opacity 0.12s ease;
+}
+
+/* 只有图标的「更多」：给一个方形命中区，避免只有 14px 宽。
+   高度/字号一律交给 naive 的 size="small"，不再自造一套尺寸。 */
+.file-actions :deep(.more) {
+  min-width: 28px;
 }
 .file-item:hover .file-actions,
 .file-item.selected .file-actions {

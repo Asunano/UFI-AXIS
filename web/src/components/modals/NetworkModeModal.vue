@@ -50,13 +50,15 @@
     <n-text v-if="switching" :depth="3" class="mode-hint"> 正在切换，设备重新搜网需要一点时间 </n-text>
     <n-text v-else-if="timedOut" type="warning" class="mode-hint"> 设备尚未完成切换，可稍后刷新查看 </n-text>
     <!--
-      读数陈旧的诚实说明：`GET /api/device/settings` 在设备端有 5 分钟缓存
+      读数陈旧的诚实说明：`GET /api/device/settings` 在 core 侧有 5 分钟缓存
       （`CacheTTL.DEVICE_SETTINGS`），而它只在 core 自己写入后才失效。
-      从手机端或设备自带面板改过档位时，这里最长要等 5 分钟才跟上 —— 不写出来，
+      从手机端或设备自带面板改过档位时，**自动刷新**最长要等 5 分钟才跟上 —— 不写出来，
       用户只会以为网页坏了。
+      2026-10-31：「重新读取」改走 `?fresh=1` 直读设备（见 useNetworkControls 的
+      refreshDeviceSettings），所以那句话现在只说自动刷新，并明确告诉用户可以点按钮。
     -->
     <n-text v-else :depth="3" class="mode-hint">
-      设备端对该配置有最长 5 分钟的读缓存；若刚在手机端或设备面板改过，这里可能稍后才跟上。
+      自动刷新受设备端 5 分钟读缓存限制；若刚在手机端或设备面板改过，点「重新读取」可直接向设备查询。
     </n-text>
 
     <template #footer>

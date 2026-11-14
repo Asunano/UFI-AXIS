@@ -175,7 +175,6 @@
           <n-button size="small" type="primary" :loading="saving" @click="save">保存</n-button>
         </template>
         <template v-else>
-          <n-button size="small" @click="show = false">关闭</n-button>
           <n-button size="small" :loading="loading" @click="load">刷新</n-button>
         </template>
       </div>

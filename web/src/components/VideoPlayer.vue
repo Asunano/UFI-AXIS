@@ -1,50 +1,50 @@
 <!--
   统一视频播放器。媒体页与文件预览两处共用。
 
-  ## 为什么要抽出来
-  之前两处各写一个裸 `<video :src>`（`MediaVideoView.vue` 与 `PreviewModal.vue`），
-  既不判格式也不听 `error`。结果放不了的文件就是一个**黑框**，用户无从判断原因。
-  格式判定、错误文案、customType 注册这三件事如果留在各自的 SFC 里，一定会分叉。
+  ## 组件职责
+  组件集中承担三件事：格式分档、错误文案、ArtPlayer `customType` 注册。
+  这三件事若留在各自的调用方 SFC 里必然产生行为分叉；此前两处各自渲染裸
+  `<video :src>`，既不判格式也不监听 `error`，无法播放的文件统一表现为无提示的黑框。
 
   ## 三档处置（判据全在 composables/videoFormat.ts）
-  - **unsupported**：**不创建播放器**，直接出提示卡片 + 下载入口。
-    mkv/avi/rmvb 这类 MSE 根本不认，而 core 侧转码方案已放弃（ffmpeg .so 的
-    16KB page size 与本机 4KB 页冲突），所以"试着放一下"只会得到黑框。
+  - **unsupported**：**不创建播放器**，直接显示原因卡片与下载入口。
+    mkv/avi/rmvb 等容器不被解码管线接受，且服务端转码不可用（预编译 ffmpeg .so 按
+    16KB page size 链接，与设备的 4KB 页不兼容），因此"先试播一次"只会得到黑框。
   - **custom**：flv/m3u8/mpd/ts，动态 `import()` 对应解复用库喂给 MSE。
-  - **native**：交给浏览器解码，**同时监听 error 兜底** ——
-    容器对了不代表编码对了（HEVC / AC3 / ProRes 都会在这里失败）。
+  - **native**：交由浏览器解码，**同时监听 error 兜底** ——
+    容器可识别不代表内部编码可解码（HEVC / AC3 / ProRes 均在该档失败）。
 
-  ## 两个容易踩的实现点
-  1. **必须显式传 `type`**：播放地址是 `/media/stream?ticket=…`，没有文件后缀，
-     ArtPlayer 按后缀猜不出格式（其文档专门警告过 `?type=` 这种形式解析不了）。
-  2. **`id` 必须是稳定值**：播放位置记忆（`autoPlayback`）默认用 `url` 当缓存 key，
-     而我们的 url 每次都带一张**新票据** —— 不给 `id` 的话每次都是新 key，记忆永远不生效。
-     这里用设备上的文件路径作为 `id`。
+  ## 两个实现约束
+  1. **必须显式指定 `type`**：播放地址是 `/media/stream?ticket=…`，没有文件后缀，
+     ArtPlayer 无法按后缀推断格式（其文档明确说明 `?type=` 形式无法解析）。
+  2. **`id` 必须是稳定值**：播放位置记忆（`autoPlayback`）默认以 `url` 作为缓存 key，
+     而该 url 每次都携带**新票据** —— 不提供 `id` 时每次都是新 key，记忆永不命中。
+     此处以设备上的文件路径作为 `id`。
 
-  ## 起播失败（2026-10-22 补）
-  C 档由 `canPlayType` 判定；A/B 档靠 `video:error` 兜底。但 Chromium 对某些 MKV
-  **根本不发 error**，只发一个 `stalled`，然后 `readyState` 永远是 0 —— 用户看到的是
-  无限转圈，和"网速慢"完全同形。所以对 **native 档**额外监听 `video:stalled` 并给
-  15 秒宽限（见 [STALL_GRACE_MS]）：期间没有任何可播数据就按"加载超时"处理（**不**断言容器不支持），
-  给出明确文案与下载入口。`error.code === 3/4` 的文案也会说到容器这一层
-  （见 [runtimeErrorText]）。
+  ## 起播失败
+  unsupported 档由 `canPlayType` 判定；native / custom 档依靠 `video:error` 兜底。
+  Chromium 对部分 MKV 不发出 error，只发出 `stalled`，且 `readyState` 恒为 0，
+  表现为无限加载，与网络缓慢无法区分。因此 **native 档**额外监听 `video:stalled`
+  并给 15 秒宽限（见 [STALL_GRACE_MS]）：宽限期内没有出现任何可播数据即按
+  "加载超时"处理（**不**断言容器不支持），给出明确文案与下载入口。
+  `error.code === 3/4` 的文案同样定位到容器层（见 [runtimeErrorText]）。
 
   ## 外挂字幕
-  三段都走"**先用 axios 把文本取下来**"，因为 `/api/media/subtitle` 要验签，
-  而播放器内部的 fetch 带不上签名头（详见 [fetchSubtitleText]）：
+  三条路径**均先用 axios 取出文本**，因为 `/api/media/subtitle` 需要验签，
+  而播放器内部发起的 fetch 无法携带签名头（详见 [fetchSubtitleText]）：
   - vtt / srt → 文本包成 blob URL 交给 `art.subtitle.switch`；
-  - ass / ssa → 文本喂 assjs（直接用库，不用 artplayer 的插件包，原因见 [assInstance]）；
-  - 其余（ttml/sub/smi…）→ 在选择器里列出但标注不支持（判据在 composables/subtitleFormat.ts）。
+  - ass / ssa → 文本直接交给 assjs（直接使用该库而非 artplayer 插件包，原因见 [assInstance]）；
+  - 其余（ttml/sub/smi…）→ 在选择器里列出并标注不支持（判据在 composables/subtitleFormat.ts）。
 -->
 <template>
-  <!-- C 档：不挂播放器，只给说明与出路 -->
+  <!-- unsupported 档：不创建播放器，只显示原因与下载入口 -->
   <div v-if="tier === 'unsupported'" class="vp-unsupported">
     <n-icon :size="40" color="var(--text-muted)"><VideocamOffOutline /></n-icon>
     <p class="vp-reason">{{ unsupportedReason }}</p>
     <n-button v-if="canDownload" size="small" @click="emit('download')">下载此文件</n-button>
   </div>
 
-  <!-- 运行时失败（A/B 档共用）：容器识别了但解码失败，或网络中断 -->
+  <!-- 运行时失败（native / custom 档共用）：容器已识别但解码失败，或网络中断 -->
   <div v-else-if="runtimeError" class="vp-unsupported">
     <n-icon :size="40" color="var(--text-muted)"><VideocamOffOutline /></n-icon>
     <p class="vp-reason">{{ runtimeError }}</p>
@@ -110,49 +110,49 @@ const emit = defineEmits<{ download: []; error: [message: string] }>();
 // ArtPlayer 的 container 类型要求 HTMLDivElement（不是宽泛的 HTMLElement）
 const hostEl = ref<HTMLDivElement | null>(null);
 /**
- * ArtPlayer 实例。刻意用 `any`：它的 d.ts 把 `customType` 处理函数的签名收得很紧
- * （要求同步返回 void），而我们的 handler 必须是 async（动态 import 解复用库）。
- * 逐个断言的噪音大于收益。
+ * ArtPlayer 实例。此处使用 `any`：其类型声明将 `customType` 处理函数的签名约束为
+ * 同步返回 void，而本组件的处理函数必须为 async（需动态 import 解复用库）。
+ * 逐处类型断言的维护成本高于收益。
  */
 let art: any = null;
-/** B 档解复用器实例，销毁时要一并回收（否则 MSE buffer 与 worker 泄漏） */
+/** custom 档解复用器实例，销毁时必须一并回收，否则 MSE buffer 与 worker 泄漏 */
 let demuxer: any = null;
 /**
- * assjs 渲染实例（ass/ssa 字幕用）。与 [demuxer] 同理，销毁时要收掉。
+ * assjs 渲染实例（ass/ssa 字幕用）。与 [demuxer] 同理，销毁时必须回收。
  *
- * **直接用 assjs、不用 `artplayer-plugin-assjs`**：那个插件的工厂里写的是
- * `show: ass.show(), hide: ass.hide()` —— 两个都是**立即调用**而不是方法引用，
- * 于是构造时就先 show 再 hide，字幕一上来就被藏了（2026-09-20 "字幕能加载到、
- * 显示 200，但播放器没挂上"就是这个原因），而且那两个属性根本不是函数没法调。
- * assjs 自身的 `show()`/`hide()`/`destroy()` 是正常的。
+ * **直接使用 assjs，不使用 `artplayer-plugin-assjs`**：该插件的工厂函数写作
+ * `show: ass.show(), hide: ass.hide()`，两处均为**立即调用**而非方法引用，
+ * 构造时先 show 再 hide，字幕层随即被隐藏（表现为字幕请求返回 200 但播放器上没有输出）；
+ * 且这两个属性并非函数，无法在运行时补救。assjs 自身的 `show()` / `hide()` /
+ * `destroy()` 行为正确。
  *
- * 它是**懒加载**的：只有真遇到 ass 字幕才 `import('assjs')`，
- * 所以那 50KB 在只放 srt 的会话里不会被下载。
+ * 该实例**懒加载**：仅在遇到 ass 字幕时才 `import('assjs')`，
+ * 只播放 srt 的会话不会下载这 50KB。
  */
 let assInstance: ASS | null = null;
 /**
  * 字幕请求的代数。
  *
- * [applySubtitle] 中间有一次 await（取文本）+ 一次 await（懒加载 assjs），
- * 用户连点两条字幕时两次调用会交错，后发的先回就会被先发的覆盖。
- * 每次进入自增，回来后不是最新一代就丢弃。
+ * [applySubtitle] 中间有一次 await（取文本）与一次 await（懒加载 assjs），
+ * 连续切换两条字幕时两次调用会交错，先发起的请求后返回时会覆盖后发起的结果。
+ * 每次进入自增，返回时不是最新一代即丢弃。
  */
 let subtitleSeq = 0;
 /**
  * 播放器创建的代数。与 [subtitleSeq] 同一套路。
  *
- * [createPlayer] 里 `art` 要等 `nextTick` 与 `import('artplayer')` 两次 await 之后才赋值，
- * watch(url/name) 短时间触发两次时，后一次开头的 destroyPlayer 读到的 art 还是 null ——
- * 先完成的那个实例被覆盖且永远不会 destroy，留下孤儿 video / 事件监听 / 解复用器
- * （表现为两层画面或两路声音）。每个 await 之后与实例化后都校验代数，不是最新代就地收掉。
+ * [createPlayer] 中 `art` 要等 `nextTick` 与 `import('artplayer')` 两次 await 之后才赋值，
+ * watch(url/name) 在短时间内触发两次时，后一次开头的 destroyPlayer 读到的 art 仍为 null ——
+ * 先完成的实例被覆盖且永不销毁，残留 video 元素、事件监听与解复用器
+ * （表现为两层画面或两路声音）。每个 await 之后与实例化之后都校验代数，非最新代就地销毁。
  */
 let createSeq = 0;
 /**
  * 当前挂载的字幕走哪条渲染路径，空串 = 没挂。
  *
  * 用途只有一个：字幕外观设置只能作用于 ArtPlayer 内建字幕层（vtt/srt），
- * ass 的字号/颜色/位置都写在字幕文件里、由 assjs 照着画。用户在 ass 轨道上
- * 调外观时要**当场说明为什么没反应**，而不是让他以为开关坏了。
+ * ass 的字号、颜色与位置由字幕文件内定义、由 assjs 按其渲染。用户在 ass 轨道上
+ * 调整外观时需**当场说明该设置为何不生效**，避免误判为开关失效。
  */
 let activeRender: '' | 'vtt' | 'srt' | 'ass' = '';
 
@@ -166,10 +166,10 @@ const subtitleBlobUrls: string[] = [];
 
 const tier = computed<VideoTier>(() => videoTierOf(props.name));
 /**
- * 已知容器名的中文说法。只用于把失败原因**说到容器这一层**：
- * `canPlayType` 判死、`error.code === 4`、起播一直 stalled，这三种情况用户需要看到
- * "浏览器不支持 MKV 容器"，而不是笼统的"不支持该视频" —— 前者能直接告诉他
- * "换容器/换浏览器/下载"，后者只能让他怀疑文件坏了。
+ * 已知容器名的显示名称。仅用于把失败原因**定位到容器层**：
+ * `canPlayType` 判定不可用、`error.code === 4`、起播持续 stalled，这三种情况都需要
+ * 显示"浏览器不支持 MKV 容器"而非笼统的"不支持该视频" —— 前者能直接指向
+ * "更换容器 / 更换浏览器 / 下载"，后者只会让人怀疑文件损坏。
  */
 const CONTAINER_LABELS: Record<string, string> = {
   mkv: 'MKV',
@@ -193,17 +193,17 @@ function containerUnsupportedText(name: string): string {
 }
 
 /**
- * C 档的文案。优先说容器（「浏览器不支持 MKV 容器…」），
- * 表里没有的扩展名才退回 `videoFormat` 里的通用说法。
+ * unsupported 档的文案。优先说明容器（「浏览器不支持 MKV 容器…」），
+ * 表中没有的扩展名才退回 `videoFormat` 中的通用说法。
  */
 const unsupportedReason = computed(() => containerUnsupportedText(props.name) || unsupportedReasonOf(props.name));
 
 /**
- * `error.code` 的文案。`mediaErrorTextOf` 负责把码值翻成人话，这里在它前面补一层
- * 容器/编码的判据：
- *  · code 4（SRC_NOT_SUPPORTED）：与 `canPlayType` 判死是同一类失败 —— 直接说容器；
- *  · code 3（DECODE）：容器进去了、内部编码解不了 —— 把容器名和常见编码带上，
- *    用户才知道"不是文件坏了，是浏览器不收这个编码"。
+ * `error.code` 对应的文案。`mediaErrorTextOf` 负责把码值翻译成说明，此处在其之前
+ * 增加一层容器 / 编码判据：
+ *  · code 4（SRC_NOT_SUPPORTED）：与 `canPlayType` 判定不可用属同一类失败 —— 直接说明容器；
+ *  · code 3（DECODE）：容器可解析、内部编码无法解码 —— 同时给出容器名与常见编码，
+ *    使用户能判断"并非文件损坏，而是浏览器不支持该编码"。
  */
 function runtimeErrorText(err: MediaError | null | undefined): string {
   const ext = videoExtOf(props.name).toUpperCase();
@@ -225,10 +225,10 @@ function runtimeErrorText(err: MediaError | null | undefined): string {
 /**
  * stalled 的宽限期（毫秒）。
  *
- * 播放地址是局域网直连：正常文件 1–3 秒内就该 `loadedmetadata`。而容器/编码不被接受时，
- * Chromium 往往不发 error，只发 `stalled` 且 `readyState` 停在 0 —— 无限转圈与"网速慢"
- * 长得一模一样。8 秒是保守值：真慢的网络里 `readyState` 会推进（于是计时被清掉），
- * 到了这个时间仍然一个字节都没解出来，更可能是格式问题。
+ * 播放地址是局域网直连，正常文件应在 1–3 秒内触发 `loadedmetadata`。而容器或编码
+ * 不被接受时，Chromium 通常不发出 error，只发出 `stalled` 且 `readyState` 停在 0，
+ * 无限加载与"网络缓慢"的外观完全一致。15 秒为保守取值：网络确实缓慢时 `readyState`
+ * 会推进（计时随即被清除），到达该时长仍无任何数据解出，更可能是格式问题。
  */
 const STALL_GRACE_MS = 15000;
 let stallTimer: number | null = null;
@@ -240,11 +240,11 @@ function clearStallTimer() {
 }
 
 /**
- * 收掉 assjs 实例。
+ * 回收 assjs 实例。
  *
- * assjs **没有"换内容"的 API**，所以换字幕轨也走这里：destroy 会摘掉它挂在 video 上的
- * 5 个事件监听、停掉 rAF 循环、移除字幕层与 ResizeObserver，然后重新 new 一个。
- * 必须在 `art.destroy()` **之前**调用 —— 它 destroy 时要访问 video 元素摘监听。
+ * assjs **没有"更换内容"的 API**，切换字幕轨同样经由此处：destroy 会移除它挂在 video 上的
+ * 5 个事件监听、停止 rAF 循环、移除字幕层与 ResizeObserver，之后重新构造实例。
+ * 必须在 `art.destroy()` **之前**调用 —— 后者销毁时需要访问 video 元素以摘除监听。
  */
 function destroyAss() {
   if (!assInstance) return;
@@ -257,11 +257,11 @@ function destroyAss() {
 }
 
 function destroyPlayer() {
-  // 起播宽限计时必须在收播放器之前停掉：否则换片/关页之后它仍会醒来，
-  // 对着一条已经不存在的流报"不支持"（art 为 null 时有守卫，但没必要留一颗定时炸弹）
+  // 起播宽限计时必须在销毁播放器之前停止：否则换片或关闭页面后计时器仍会触发，
+  // 对一条已不存在的流报"不支持"（art 为 null 时有守卫，但不应保留这类悬挂计时器）
   clearStallTimer();
-  // 先收解复用器再销毁播放器：反过来的话 art already destroyed 时 demuxer 还挂在
-  // 一个已解绑的 video 上，某些版本会抛
+  // 必须先回收解复用器再销毁播放器：反序时 demuxer 仍挂在一个已解绑的 video 上，
+  // 部分版本会抛异常
   if (demuxer) {
     try {
       demuxer.destroy();
@@ -270,31 +270,31 @@ function destroyPlayer() {
     }
     demuxer = null;
   }
-  // assjs 自己持有 DOM、rAF 与 video 监听，必须在 art 之前显式收
+  // assjs 持有 DOM 节点、rAF 循环与 video 事件监听，必须在 art 之前显式回收
   destroyAss();
-  // 让在途的字幕请求失效，否则它回来时会往一个已销毁的 art 上挂
+  // 使在途的字幕请求失效，否则其返回时会向已销毁的 art 挂载渲染实例
   subtitleSeq += 1;
   activeRender = '';
   if (art) {
-    // 音量在这里落盘而不是监听 volumechange：拖音量条会连发几十个事件，
-    // 每个都写一次 localStorage 没有必要。退出播放器时取最终值就够了
+    // 音量在此处持久化，而非监听 volumechange：拖动音量条会连续触发数十次事件，
+    // 无需每次写入 localStorage；销毁播放器时读取最终值即可
     if (typeof art.volume === 'number') patchVideoPrefs({ volume: art.volume });
     try {
-      // true = 同时移除 DOM。不传的话容器里会留一个空壳，换片时叠加
+      // 入参 true 表示同时移除 DOM；省略时容器里会残留空壳，换片时层层叠加
       art.destroy(true);
     } catch {
       /* 同上 */
     }
     art = null;
   }
-  // 字幕文本的 blob URL：不 revoke 会一直持有整份文本
+  // 字幕文本的 blob URL：未 revoke 时会持续持有整份文本
   while (subtitleBlobUrls.length > 0) {
     const u = subtitleBlobUrls.pop();
     if (u) URL.revokeObjectURL(u);
   }
 }
 
-/** 动态加载 FLV 解复用器。只在真遇到 flv/ts 时才拉这个 chunk。 */ async function attachMpegts(
+/** 动态加载 FLV 解复用器；仅在遇到 flv/ts 时加载该分块。 */ async function attachMpegts(
   video: HTMLVideoElement,
   url: string,
   isFlv: boolean
@@ -308,7 +308,7 @@ function destroyPlayer() {
   demuxer = player;
 }
 
-/** 动态加载 HLS。Safari 原生支持 m3u8，优先用原生（省一个 150KB 的 chunk）。 */
+/** 动态加载 HLS。Safari 原生支持 m3u8，优先使用原生实现（省去一个 150KB 的分块）。 */
 async function attachHls(video: HTMLVideoElement, url: string) {
   if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = url;
@@ -324,8 +324,8 @@ async function attachHls(video: HTMLVideoElement, url: string) {
 }
 
 async function attachDash(video: HTMLVideoElement, url: string) {
-  // dash.js 没有装：DASH 在设备本地文件里几乎不会出现（它是切片+清单的流式格式）。
-  // 真遇到就如实报错，而不是静默黑框。
+  // 未引入 dash.js：DASH 在设备本地文件中极少出现（其形态为分片加清单的流式格式）。
+  // 遇到时如实报错，不以静默黑框代替。
   void video;
   void url;
   throw new Error('暂不支持 DASH（.mpd）播放，请下载后用本地播放器打开');
@@ -336,7 +336,7 @@ async function attachDash(video: HTMLVideoElement, url: string) {
 /**
  * 拉这个视频的字幕列表。
  *
- * **两次取法是刻意的**（core 的 `scope` 参数就是为此设计的）：
+ * **分两次取列表是有意设计**（core 的 `scope` 参数即为此提供）：
  *  1. 先 `scope=matched` —— 只有按文件名判定属于本视频的才可能被**自动挂载**；
  *  2. matched 为空时再 `scope=folder` 补一份列表，但**不自动挂** ——
  *     同目录里 `other.srt` 不属于本片，自动挂上就是挂错字幕。
@@ -368,17 +368,16 @@ async function loadSubtitles(): Promise<SubtitleEntry[]> {
 /**
  * 取字幕**文本**（不是 URL）。
  *
- * ## 为什么必须自己取、不能把 URL 丢给播放器
- * `/api/media/subtitle` 在 `/api` 下，core 的 AuthMiddleware **强制**校验
- * `X-Timestamp`/`X-Nonce`/`X-Signature`，缺一即 444。而 `art.subtitle.switch(url)`
- * 是 ArtPlayer 自己发 fetch，**带不上这些头** —— 2026-09-19 的"字幕完全不生效"
- * 就是这个原因（和 `<img src>` 取不到缩略图、`<video src>` 取不到视频流是同一类问题，
- * 那两处分别用 blob URL 和票据解决了）。
+ * ## 必须由本组件取文本
+ * `/api/media/subtitle` 位于 `/api` 下，core 的 AuthMiddleware **强制**校验
+ * `X-Timestamp` / `X-Nonce` / `X-Signature`，缺一即返回 444。而 `art.subtitle.switch(url)`
+ * 由 ArtPlayer 自行发起 fetch，**无法携带这些请求头**（与 `<img src>` 取缩略图、
+ * `<video src>` 取视频流属同一类限制，那两处分别以 blob URL 与票据解决）。
  *
- * ## 必须用相对路径
- * axios 实例在拦截器里会把 `config.baseURL` 设成 `appStore.baseUrl`，并用
- * `client.getUri(config)` 算签名 URI。这里若传一个**已经带 baseUrl 的完整 URL**，
- * 会拼成 `baseUrl + baseUrl + path`，签名 URI 对不上 → 同样 444。
+ * ## 必须使用相对路径
+ * axios 实例在拦截器里把 `config.baseURL` 设为 `appStore.baseUrl`，并以
+ * `client.getUri(config)` 计算签名 URI。此处若传入**已包含 baseUrl 的完整 URL**，
+ * 会被拼接为 `baseUrl + baseUrl + path`，签名 URI 不匹配，同样返回 444。
  */
 async function fetchSubtitleText(entry: SubtitleEntry): Promise<string> {
   const { data } = await getApiClient().get(Endpoints.media.subtitle, {
@@ -391,10 +390,10 @@ async function fetchSubtitleText(entry: SubtitleEntry): Promise<string> {
 }
 
 /**
- * 把字幕文本变成 **blob URL** 交给 ArtPlayer。
+ * 把字幕文本转换为 **blob URL** 交给 ArtPlayer。
  *
- * blob URL 是本地的，不经过网络、不需要鉴权 —— 这正是绕过上面那个鉴权限制的办法。
- * 生成的 URL 登记在 [subtitleBlobUrls] 里，销毁播放器时统一回收（不回收会一直持有文本）。
+ * blob URL 是本地资源，不经过网络、不需要鉴权 —— 这是绕过上述鉴权限制的方式。
+ * 生成的 URL 登记在 [subtitleBlobUrls] 中，销毁播放器时统一回收（不回收会持续持有文本）。
  */
 function subtitleBlobUrl(text: string, mime: string): string {
   const url = URL.createObjectURL(new Blob([text], { type: mime }));
@@ -405,7 +404,7 @@ function subtitleBlobUrl(text: string, mime: string): string {
 /**
  * 挂载一条字幕。`entry` 为 null = 关闭字幕。
  *
- * 两条路径，但**都先把文本取下来**（见 [fetchSubtitleText] 的说明）：
+ * 两条路径，但**都先取出文本**（见 [fetchSubtitleText] 的说明）：
  *  · vtt / srt → 包成 blob URL 给 `art.subtitle.switch`（srt→vtt 由 ArtPlayer 内部转）；
  *  · ass / ssa → 文本直接喂 assjs（它吃字符串不吃 URL），assjs 懒加载。
  */
@@ -416,8 +415,8 @@ async function applySubtitle(entry: SubtitleEntry | null) {
     art.subtitle.show = false;
     destroyAss();
     activeRender = '';
-    // 空串 = "用户主动关了"，和"没记录"是两件事（见 videoPlayerPrefs 的说明），
-    // 否则下次打开又被自动挂回来，字幕就成了关不掉的
+    // 空串表示"用户主动关闭"，与"没有记录"是两种状态（见 videoPlayerPrefs 的说明）；
+    // 否则下次打开会被自动重新挂载，字幕将无法保持关闭
     rememberSubtitle(props.path, '');
     return;
   }
@@ -425,11 +424,11 @@ async function applySubtitle(entry: SubtitleEntry | null) {
   if (render === 'unsupported') return;
   try {
     const text = await fetchSubtitleText(entry);
-    // 取回来时用户可能已经换过字幕/关了弹窗；只有最后一次点击算数
+    // 返回时用户可能已切换字幕或关闭弹窗；仅最后一次点击的结果有效
     if (!text || !art || seq !== subtitleSeq) return;
 
     if (render === 'ass') {
-      // assjs 不支持原地换内容，换轨即重建
+      // assjs 不支持原地更换内容，切换轨即重建实例
       destroyAss();
       const ASSRenderer = (await import('assjs')).default;
       if (!art || seq !== subtitleSeq) return;
@@ -440,9 +439,9 @@ async function applySubtitle(entry: SubtitleEntry | null) {
         // （如 1280x720），此时四种取值等价；只有比例不一致时才有差别，没有依据认为哪种更对
         container: art.template.$player,
       });
-      // assjs 的渲染循环挂在 video 的 play/playing 事件上，而我们是在 `ready` 之后
-      // 又等了一次网络请求才 new 出来的 —— 此时视频**早就在播了**，那两个事件不会再来，
-      // 结果只有构造瞬间那一帧字幕、之后永远不动。已经在播就补发一次把 rAF 循环踢起来。
+      // assjs 的渲染循环由 video 的 play/playing 事件启动，而该实例是在 `ready` 之后、
+      // 又经过一次网络请求才构造的 —— 此时视频**已在播放**，这两个事件不会再次触发，
+      // 结果只有构造瞬间渲染的一帧字幕。若视频已在播放，则补发一次事件以启动 rAF 循环。
       if (!art.video.paused) art.video.dispatchEvent(new Event('playing'));
       // ass 由 assjs 自己画，ArtPlayer 内建字幕层必须关掉，否则两层字幕叠在一起
       art.subtitle.show = false;
@@ -459,9 +458,8 @@ async function applySubtitle(entry: SubtitleEntry | null) {
     activeRender = render;
     rememberSubtitle(props.path, entry.path, entry.label ?? '');
   } catch (err) {
-    // 字幕失败不影响放视频，但**绝不能静默**：2026-09-20 排查"字幕不显示"时，
-    // 这里原本是个空 catch，把 assjs 解析 1.7MB ASS 时的真实异常整个吞掉了，
-    // 表现就是"请求 200、什么也不发生"，无从下手。
+    // 字幕失败不影响视频播放，但**不得静默**：空 catch 会吞掉 assjs 解析大型 ASS 文件时
+    // 的真实异常，表现为请求返回 200 而界面无任何变化，无法定位。
     console.error('[VideoPlayer] 字幕挂载失败', entry.path, err);
     if (art) {
       art.notice.show = `字幕加载失败：${err instanceof Error ? err.message : String(err)}`;
@@ -472,12 +470,12 @@ async function applySubtitle(entry: SubtitleEntry | null) {
 /**
  * 决定打开视频时自动挂哪条字幕。`null` = 不挂。
  *
- * 三级优先，前面命中就不看后面：
- *  1. **这个视频上次选的那条** —— 最强信号，用户已经明确表达过；
- *     记录是空串说明他上次主动关了，这里必须返回 null（否则关不掉）。
- *  2. **全局语言偏好**（上次选中字幕的 `label`，如 `SC`/`TC`）——
- *     一季番里用户只想选一次"简体"，不该每集都点一遍。
- *  3. core 排序的第一条可用字幕（core 已把"能解析的"排在前面）。
+ * 三级优先，前一级命中即不再向下判断：
+ *  1. **该视频上次选中的字幕** —— 信号最强，属于用户的显式选择；
+ *     记录为空串表示用户上次主动关闭，此处必须返回 null（否则无法保持关闭）。
+ *  2. **全局语言偏好**（上次选中字幕的 `label`，如 `SC` / `TC`）——
+ *     同一系列的多集内容只需选择一次语言，无需逐集设置。
+ *  3. core 排序中的第一条可用字幕（core 已将"可解析的"排在前面）。
  */
 function pickAutoSubtitle(list: SubtitleEntry[]): SubtitleEntry | null {
   const playable = list.filter(isWebPlayable);
@@ -487,7 +485,7 @@ function pickAutoSubtitle(list: SubtitleEntry[]): SubtitleEntry | null {
   if (remembered) {
     const hit = playable.find((e) => e.path === remembered);
     if (hit) return hit;
-    // 记住的那条被删/改名了 —— 往下走默认逻辑，不要因此什么都不挂
+    // 记录的那条已被删除或改名 —— 继续走默认逻辑，不因此放弃挂载
   }
   const lang = readVideoPrefs().subtitleLang.trim().toLowerCase();
   if (lang) {
@@ -517,7 +515,7 @@ function applySubtitleStyle() {
   art.subtitle.style('textShadow', shadowCssOf(shadow));
 }
 
-/** ass 轨道下调外观不会有任何反应，当场说明原因，别让用户以为开关坏了。 */
+/** ass 轨道下调整外观不会产生任何效果，需当场说明原因，避免用户误判为设置失效。 */
 function noticeIfAssActive() {
   if (art && activeRender === 'ass') {
     art.notice.show = 'ASS/SSA 字幕的字号与位置写在字幕文件里，由字幕组决定，此设置不影响它';
@@ -527,9 +525,9 @@ function noticeIfAssActive() {
 /**
  * 把字幕做成播放器设置面板里的一个选择器。
  *
- * 不支持的格式**也列出来但标注**（`subtitleDisplayName` 会在名字里写"（XXX 不支持）"）——
- * 与 core 的 `supported: false` 仍然返回同一个道理：让用户看到"文件在、但这个格式不行"，
- * 而不是对着目录里明明存在的 .ttml 怀疑程序瞎了。选中它的效果等同于"关闭"。
+ * 不支持的格式**同样列出但加以标注**（`subtitleDisplayName` 会在名称里写"（XXX 不支持）"）——
+ * 与 core 对 `supported: false` 仍返回条目同理：让用户看到"文件存在，但该格式无法渲染"，
+ * 避免对目录中确实存在的 .ttml 文件产生误判。选中该项等同于"关闭字幕"。
  */
 function buildSubtitleSetting(list: SubtitleEntry[], auto: SubtitleEntry | null) {
   if (!art || list.length === 0) return;
@@ -557,13 +555,13 @@ function buildSubtitleSetting(list: SubtitleEntry[], auto: SubtitleEntry | null)
 /**
  * 字幕外观三项：字号 / 位置 / 描边。
  *
- * **只对 vtt/srt 生效**，标题里就写清楚 —— ass 的样式写在字幕文件里由字幕组决定，
- * 这是 ASS 格式的本意，不该被播放器覆盖（app 端选的是相反的取舍：
- * `setApplyEmbeddedStyles(false)` 丢掉 ASS 样式统一成白字黑边。两端刻意不同）。
- * 用户在 ass 轨道上动这些项时 [noticeIfAssActive] 会当场说明。
+ * **仅对 vtt/srt 生效**，并在标题中写明 —— ass 的样式由字幕文件定义、由字幕组决定，
+ * 这是 ASS 格式的本意，不应被播放器覆盖（app 端采用相反取舍：
+ * `setApplyEmbeddedStyles(false)` 丢弃 ASS 内嵌样式，统一为白字黑边；两端有意不同）。
+ * 用户在 ass 轨道上调整这些项时，[noticeIfAssActive] 会当场说明原因。
  *
- * 只在**存在 vtt/srt 轨道**或**根本没有字幕**时都不加？—— 不。始终加：
- * 用户可能先挂 ass、再换到同目录的 srt，设置项不能中途出现/消失。
+ * 该项始终添加，不随当前字幕轨类型变化：用户可能先挂 ass，再切换到同目录的 srt，
+ * 设置项不能中途出现或消失。
  */
 function buildSubtitleStyleSetting() {
   if (!art) return;
@@ -641,9 +639,9 @@ async function createPlayer() {
   const instance = new Artplayer({
     container: host,
     url: props.url,
-    // 显式给 type：url 没后缀，猜不出来（见文件头）
+    // 显式指定 type：url 无后缀，无法推断（见文件头）
     type,
-    // 稳定 key，否则位置记忆永远不命中（url 每次票据都不同）
+    // 稳定 key，否则位置记忆永不命中（url 每次的票据都不同）
     id: props.path || props.name,
     autoPlayback: true, // 播放位置记忆
     poster: props.poster,
@@ -655,25 +653,25 @@ async function createPlayer() {
     lang: 'zh-cn',
     setting: true,
     playbackRate: true,
-    // 画面比例：设备上的片源比例五花八门（4:3 老番、21:9 电影、竖屏手机录像），
-    // 而我们的容器是固定 16/9，没有这个入口就只能接受上下/左右黑边
+    // 画面比例：设备上的片源比例差异很大（4:3、21:9、竖屏手机录像），
+    // 而容器固定为 16/9；缺少该入口时只能接受上下或左右黑边
     aspectRatio: true,
-    // 镜像/翻转：前摄录的视频是左右反的，翻一下才能看清字
+    // 镜像/翻转：前置摄像头录制的视频左右相反，翻转后方可正常阅读画面文字
     flip: true,
     pip: true,
     fullscreen: true,
     fullscreenWeb: true,
     screenshot: true,
     hotkey: true,
-    // 控制条收起后在底边留一条细进度条，不然全屏看片时完全不知道进度
+    // 控制条收起后在底边保留一条细进度条，全屏播放时仍可判断进度
     miniProgressBar: true,
-    // 移动端：锁住控制条（防误触）+ 左右滑进度/上下滑音量 + 长按快进
+    // 移动端：锁定控制条以防误触，并启用左右滑动调节进度、上下滑动调节音量、长按快进
     lock: true,
     gesture: true,
     fastForward: true,
-    // Safari 的隔空播放。非 Safari 下 ArtPlayer 自己不会渲染这个按钮
+    // Safari 的隔空播放（AirPlay）；非 Safari 环境下 ArtPlayer 不渲染该按钮
     airplay: true,
-    // 页面里同时只允许一个播放器出声（媒体页的音乐播放器也可能在放）
+    // 同一页面内只允许一个播放器出声（媒体页的音乐播放器可能同时在播放）
     mutex: true,
     // 网页全屏时按视频比例转屏
     autoOrientation: true,
@@ -686,7 +684,7 @@ async function createPlayer() {
   });
 
   if (seq !== createSeq) {
-    // 期间又触发了一次重建：这个实例已经没人认领，就地收掉（含 DOM）
+    // 期间又触发了一次重建：该实例已无引用，就地销毁（含 DOM）
     try {
       instance.destroy(true);
     } catch {
@@ -696,7 +694,7 @@ async function createPlayer() {
   }
   art = instance;
 
-  // A 档的第二道兜底：容器对了不代表编码对了（HEVC / AC3 / ProRes 都在这里失败）
+  // native 档的第二道兜底：容器可识别不代表编码可解码（HEVC / AC3 / ProRes 均在此失败）
   art.on('video:error', () => {
     const msg = runtimeErrorText(art?.video?.error);
     runtimeError.value = msg;
@@ -704,7 +702,7 @@ async function createPlayer() {
     // 报错后把播放器收掉：留着它只会显示一个黑框盖住上面的提示
     destroyPlayer();
   });
-  // customType 内部抛出的错误（解复用器不支持 / DASH 未接）走这里
+  // customType 处理函数内部抛出的错误（解复用器不可用 / DASH 未接入）进入此分支
   art.on('error', (err: unknown) => {
     const msg = err instanceof Error ? err.message : mediaErrorTextOf(null, props.name);
     runtimeError.value = msg;
@@ -715,30 +713,29 @@ async function createPlayer() {
   /**
    * 起播阶段的 stalled：`error` 不一定来（见文件头「起播失败」）。
    *
-   * 只在"还没有任何可播数据"时计时：`readyState > 0` 或已经开始播的都不算
-   * （播放中途网络抖动是另一回事，交给控制条自己的缓冲提示）。
+   * 仅在"尚未获得任何可播数据"时计时：`readyState > 0` 或已开始播放均不计时
+   * （播放中途的网络抖动属于另一类情况，由控制条的缓冲提示反映）。
    */
   art.on('video:stalled', () => {
     if (!art) return;
-    // 只对 native 档做这件事：B 档（flv / hls / ts）的启动本来就交给解复用器，
-    // MSE 首帧慢是常态，拿时间判"不支持"会误伤；它们的失败走 `art.on('error')`。
+    // 仅对 native 档生效：custom 档（flv / hls / ts）的启动由解复用器负责，
+    // MSE 首帧延迟属于常态，按时间判定"不支持"会产生误报；该档失败由 `art.on('error')` 处理。
     if (tier.value !== 'native') return;
     const v = art.video as HTMLVideoElement;
     if (v.readyState > 0 || v.currentTime > 0) return;
-    // 已经在计时就不再续期：stalled 可能每隔几秒反复发一次，
-    // 每发一次都重置计时的话这个宽限期永远不会到点。
+    // 已在计时时不重新计时：`stalled` 可能每隔数秒重复触发，
+    // 每次都重置将使该宽限期永不到期。
     if (stallTimer !== null) return;
     stallTimer = window.setTimeout(() => {
       stallTimer = null;
       if (!art) return;
       const video = art.video as HTMLVideoElement;
-      // 宽限期内只要解出过一帧/拿到元数据，就说明容器是对的，不当格式问题处理
+      // 宽限期内只要解出过一帧或取得元数据，即说明容器可用，不按格式问题处理
       if (video.readyState > 0 || video.currentTime > 0) return;
-      // 注意：这里**不能**再说"浏览器不支持 MKV 容器"。
-      // 容器能不能放已经由 `videoTierOf` + `canPlayType` 判过（能走到 native 档就说明
-      // 容器是认的）；15 秒没数据更可能是设备读取慢 / 网络卡住 / 内部编码解不出。
-      // 之前直接把 `containerUnsupportedText()` 放在这里，导致"网速慢的 MKV"被误报成
-      // "浏览器不支持 MKV"，用户按提示去下载也能播 —— 那是错的诊断。
+      // 此处**不得**输出"浏览器不支持 MKV 容器"：容器可用性已由 `videoTierOf` +
+      // `canPlayType` 判定（进入 native 档即说明容器被接受），15 秒内无数据更可能是
+      // 设备读取缓慢、网络阻塞或内部编码无法解码。若在此处直接使用
+      // `containerUnsupportedText()`，会把网络缓慢的 MKV 误报为容器不支持，构成错误诊断。
       const msg =
         '视频在 15 秒内没有开始播放。可能是设备读取或网络较慢，也可能是文件内部编码（如 H.265 / AC3）不被当前浏览器支持。可点「重试」再试一次，或下载后用本地播放器播放。';
       runtimeError.value = msg;
@@ -755,19 +752,19 @@ async function createPlayer() {
   // `art.subtitle.switch` 都要求播放器已初始化完成。
   art.on('ready', async () => {
     try {
-      // 外观偏好先落到播放器上：晚于挂字幕的话会看到一帧默认字号再跳变
+      // 先应用外观偏好：若晚于字幕挂载，会先出现一帧默认字号再跳变
       applySubtitleStyle();
       buildSubtitleStyleSetting();
       const list = await loadSubtitles();
-      // 期间用户可能已经关了弹窗 / 换了片
+      // 期间用户可能已关闭弹窗或切换文件
       if (!art || list.length === 0) return;
       const auto = pickAutoSubtitle(list);
-      // 选择器的默认勾选必须和真正要挂的那条一致，否则面板显示 A、画面放 B
+      // 选择器的默认选中项必须与实际挂载的字幕一致，否则面板显示与画面内容不符
       buildSubtitleSetting(list, auto);
       if (auto) await applySubtitle(auto);
     } catch (err) {
-      // 这个 handler 是 async 且由 ArtPlayer 调用，抛出去只会变成
-      // unhandled rejection（栈里看不出是字幕流程）。自己收下并标明来源
+      // 该处理函数为 async 且由 ArtPlayer 调用，向外抛出只会形成 unhandled rejection
+      // （调用栈无法表明来源为字幕流程）；在此捕获并标注来源
       console.error('[VideoPlayer] 字幕流程异常', err);
     }
   });
@@ -778,8 +775,8 @@ function retry() {
   void createPlayer();
 }
 
-// url 或文件换了就重建。不复用实例：ArtPlayer 换 url 时 customType 的绑定不会重来，
-// 从 flv 切到 mp4 会带着上一个解复用器
+// url 或文件变化时重建实例，不复用：ArtPlayer 更换 url 时不会重新绑定 customType，
+// 从 flv 切换到 mp4 会沿用上一个解复用器
 watch(
   () => [props.url, props.name],
   () => void createPlayer(),
@@ -790,8 +787,8 @@ onBeforeUnmount(destroyPlayer);
 </script>
 
 <style scoped>
-/* 视频画布。信箱边（letterbox）必须是纯黑，与影片本身同色，
-   接 --card-bg 会在暗色下与卡片糊成一片、在浅色下把画面框成一个白边方块。
+/* 视频画布。信箱边（letterbox）必须为纯黑，与影片画面同色；
+   若改用 --card-bg，暗色主题下会与卡片融为一体，浅色主题下会把画面框成白色方块。
    ui-baseline-allow: 视频画布底色，两种主题下都必须是纯黑 */
 .vp-host {
   width: 100%;
@@ -800,8 +797,8 @@ onBeforeUnmount(destroyPlayer);
   overflow: hidden;
   background: #000;
 }
-/* ArtPlayer 默认给 video 宽高 100% 且不设 object-fit，4:3/竖屏源会被硬拉成
-   16:9。这里必须 contain：窗口固定 16:9，非 16:9 的画面留黑边，不拉伸。 */
+/* ArtPlayer 默认将 video 宽高设为 100% 且不设 object-fit，4:3 与竖屏片源会被拉伸为
+   16:9。此处必须使用 contain：容器固定 16:9，非 16:9 的画面保留黑边，不做拉伸。 */
 .vp-host :deep(video.art-video) {
   object-fit: contain;
   /* ui-baseline-allow: 视频信箱边必须是纯黑，不能跟随主题 */
@@ -813,14 +810,14 @@ onBeforeUnmount(destroyPlayer);
   所以必须用 :deep()。
 
   z-index 是必要的：assjs 的 .ASS-box 自身不设 z-index，而它作为**最后一个**子节点
-  插进 $player，按文档顺序会画在控制条（.art-bottom）之上 —— 字幕会糊在进度条上。
-  这里压到控制层之下。它本身带 pointer-events: none，不影响点击。
+  插入 $player，按文档顺序会绘制在控制条（.art-bottom）之上，使字幕遮盖进度条。
+  此处将其压到控制层之下。该元素自带 pointer-events: none，不影响点击。
 */
 :deep(.ASS-box) {
   z-index: 10;
 }
 
-/* C 档 / 运行时失败的提示卡片。高度与播放器接近，避免弹窗高度跳变 */
+/* unsupported 档与运行时失败的提示卡片。高度与播放器接近，避免弹窗高度跳变 */
 .vp-unsupported {
   display: flex;
   flex-direction: column;

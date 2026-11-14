@@ -40,33 +40,45 @@
         用户点了「诊断中心」却看到顶栏写着 UFI-AXIS，会怀疑自己点错了。
         `#/gallery` 是同样的处境（它也没标题，因为它只给改 UI 的人用）。
       -->
-      <h2 class="dx-page-title">诊断中心</h2>
+      <div class="dx-head-row">
+        <BackButton />
+        <h2 class="dx-page-title">诊断中心</h2>
+      </div>
       <p class="dx-intro">
-        设备环境与服务快照都是只读检查。不会自动开始：点上方「开始检查」才跑，一次只跑一条（串行）—— CPU 探针本身要 5~15
-        秒，并发发出去只会把设备的 shell 通道打满、把彼此拖到超时。
-        网络工具会真的向目标发包，所以要点哪条跑哪条。跑完可以导出一份 .txt 诊断包：
-        包含全量快照、各检查项结果与最近日志，可以直接贴进 issue。
+        只读检查。自动项串行运行，网络工具按需运行；目标使用设备端统一的默认预设，可在网络组内修改。
       </p>
-      <!--
-        归属角标的图例（2026-10-14 补）。**必须有这一句**：角标只有 `core` / `本端` 两个词，
-        不解释一句没人知道它回答的是"**另一端有没有这一项**"（而不是"这一项重不重要"）。
-        单独一段而不是并进上面那段：上面讲"这一页怎么用"，这段讲"角标怎么读"，
-        两件事混在一段里读者会直接跳过。它也**只出现一次** —— 写在每张卡上就是噪声。
-      -->
-      <p class="dx-intro">
-        每张卡右上角的角标说明这一项的归属：core = 查设备 / core 自己的状态，App 与网页端都有； 本端 =
-        只在这一端才有（浏览器通知授权、本页的实时推送通道）。哪些检查两端都有，由 scripts/check-diagnostics-scope.mjs
-        核对，缺一端会直接报错。
-      </p>
+      <p class="dx-scope-legend"><b>core</b> = 设备 / core · <b>本端</b> = 浏览器</p>
       <div class="dx-toolbar-actions">
         <n-button size="small" :loading="busyCount > 0" @click="run.runAuto()">开始检查</n-button>
         <n-button size="small" type="primary" :loading="exporting" @click="onExport">导出诊断包</n-button>
       </div>
     </div>
 
-    <section v-for="g in DIAGNOSTIC_GROUPS" :key="g.key" class="dx-group">
+    <!-- 结果优先：先回答“有没有问题”，再决定看不看通过项 -->
+    <div class="dx-outcome">
+      <div class="dx-outcome-main">
+        <strong>{{ hasAnyResult ? issueCount || '—' : '—' }}</strong>
+        <span>{{ !hasAnyResult ? '尚未检查' : issueCount ? '项需要关注' : '全部通过' }}</span>
+      </div>
+      <div class="dx-outcome-counts">
+        <span
+          >通过 <b>{{ passedCount }}</b></span
+        >
+        <span
+          >未运行 <b>{{ unrunCount }}</b></span
+        >
+        <span v-if="infoCount"
+          >信息 <b>{{ infoCount }}</b></span
+        >
+      </div>
+      <button v-if="hasAnyResult" class="dx-filter" type="button" @click="showOnlyIssues = !showOnlyIssues">
+        {{ showOnlyIssues ? '显示全部' : '只看问题' }}
+      </button>
+    </div>
+
+    <section v-for="g in visibleGroups" :key="g.key" class="dx-group">
       <h3 class="dx-group-title">{{ g.title }}</h3>
-      <p class="dx-group-desc">{{ g.desc }}</p>
+      <p class="dx-group-desc">{{ g.items.length }} 项 · {{ g.key === 'network' ? '手动运行' : '自动运行' }}</p>
       <!--
         该组共用的输入区。**页面不知道它是干什么的** —— 注册表说这一组有 toolbar，就渲染它。
         目前只有网络组有（四条工具共用一份目标地址，见 NetworkTargetBar 的注释）。
@@ -76,7 +88,7 @@
       <component :is="g.toolbar" v-if="g.toolbar" />
       <div class="dx-cards">
         <DiagnosticCard
-          v-for="item in itemsOfGroup(g.key)"
+          v-for="item in g.items"
           :key="item.id"
           :item="item"
           :state="run.stateOf(item.id)"
@@ -84,15 +96,23 @@
         />
       </div>
     </section>
+
+    <div v-if="!visibleGroups.length" class="dx-empty">
+      <strong>当前没有需要处理的检查</strong>
+      <span>已通过的检查已收起。</span>
+      <n-button size="small" @click="showOnlyIssues = false">显示全部检查</n-button>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useMessage } from 'naive-ui';
+import BackButton from '@/components/BackButton.vue';
 import DiagnosticCard from './components/DiagnosticCard.vue';
 import { DIAGNOSTIC_GROUPS, DIAGNOSTICS, itemsOfGroup, reasonOf } from './diagnosticRegistry';
 import { useDiagnosticRun } from './useDiagnosticRun';
+import { loadNetworkPresets } from './networkTarget';
 import { exportDiagnosticBundle } from './diagnosticExport';
 
 const message = useMessage();
@@ -113,6 +133,32 @@ const busyCount = computed(
 );
 
 const exporting = ref(false);
+/** 结果优先：默认收起已通过项，只看问题与未运行项。 */
+const showOnlyIssues = ref(true);
+const allStates = computed(() => DIAGNOSTICS.map((item) => ({ item, state: run.stateOf(item.id) })));
+const hasAnyResult = computed(() => allStates.value.some(({ state }) => !!state.result));
+const issueCount = computed(
+  () => allStates.value.filter(({ state }) => state.result?.status === 'warn' || state.result?.status === 'fail').length
+);
+const passedCount = computed(() => allStates.value.filter(({ state }) => state.result?.status === 'ok').length);
+const unrunCount = computed(
+  () => allStates.value.filter(({ state }) => !state.result && !state.running && !state.queued).length
+);
+const infoCount = computed(() => allStates.value.filter(({ state }) => state.result?.status === 'info').length);
+const visibleGroups = computed(() =>
+  DIAGNOSTIC_GROUPS.map((group) => ({
+    ...group,
+    items: itemsOfGroup(group.key).filter((item) => {
+      if (!showOnlyIssues.value) return true;
+      const result = run.stateOf(item.id).result;
+      return !result || result.status === 'warn' || result.status === 'fail';
+    }),
+  })).filter((group) => group.items.length > 0)
+);
+
+onMounted(() => {
+  void loadNetworkPresets();
+});
 
 /**
  * 导出诊断包。
@@ -151,9 +197,15 @@ async function onExport() {
   justify-content: space-between;
   gap: var(--space-3);
 }
-/* 标题独占一行（见模板里的注释：顶栏那个标题对本页不成立） */
-.dx-page-title {
+/* 返回与标题同一行；返回不再依赖全局顶栏 */
+.dx-head-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   flex: 1 1 100%;
+}
+.dx-page-title {
+  flex: none;
   margin: 0;
   font-size: var(--font-xl);
   font-weight: 600;
@@ -170,6 +222,94 @@ async function onExport() {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
+}
+
+.dx-scope-legend {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+}
+
+.dx-scope-legend b {
+  color: var(--text-secondary);
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.dx-outcome {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  padding: 13px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--card-bg);
+}
+
+.dx-outcome-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.dx-outcome-main strong {
+  color: var(--warning);
+  font-size: 25px;
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+
+.dx-outcome-main span {
+  color: var(--text-secondary);
+  font-size: var(--font-sm);
+}
+
+.dx-outcome-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px 14px;
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+}
+
+.dx-outcome-counts b {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.dx-filter {
+  margin-left: auto;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--card-bg);
+  color: var(--text-secondary);
+  font-size: var(--font-xs);
+}
+
+.dx-filter:hover {
+  border-color: var(--accent-color);
+  color: var(--accent-color);
+}
+
+.dx-empty {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px 12px;
+  padding: 18px 16px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--card-bg);
+  color: var(--text-secondary);
+  font-size: var(--font-sm);
+}
+
+.dx-empty strong {
+  color: var(--text-primary);
 }
 
 /* ── 分组 ── */

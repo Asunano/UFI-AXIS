@@ -1,7 +1,7 @@
 <!--
   顶栏全局播放器（2026-10-24 改版）。
 
-  · 只保留「封面 + 曲名/歌手 + 走带 + 随机/循环/倍速 + 进度」；
+  · 只保留「封面 + 曲名/歌手 + 走带 + 进度」；队列/随机/循环/倍速入口已移除；
   · 不再在顶栏里展开完整播放器：悬停或点击封面，浮层只显示歌词；
   · 歌词浮层与播放器同宽（窄屏取最小可读宽度），不显示时间轴、不显示滚动条；
   · 当前行只加粗，不加背景色；
@@ -88,53 +88,6 @@
       </button>
     </div>
 
-    <div class="ha-toggles">
-      <button
-        type="button"
-        class="ha-chip"
-        :class="{ on: player.shuffle }"
-        :aria-pressed="player.shuffle"
-        title="随机播放"
-        aria-label="随机播放"
-        @click="player.toggleShuffle()"
-      >
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path
-            fill="currentColor"
-            d="M10.59 9.17 5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z"
-          />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="ha-chip"
-        :class="{ on: player.repeatMode !== 'off' }"
-        :aria-pressed="player.repeatMode !== 'off'"
-        :title="repeatTitle"
-        :aria-label="repeatTitle"
-        @click="player.cycleRepeat()"
-      >
-        <svg v-if="player.repeatMode === 'one'" viewBox="0 0 24 24" aria-hidden="true">
-          <path
-            fill="currentColor"
-            d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-2V9h-1l-2 1v1h1.5v4H13z"
-          />
-        </svg>
-        <svg v-else viewBox="0 0 24 24" aria-hidden="true">
-          <path fill="currentColor" d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" />
-        </svg>
-      </button>
-      <button
-        type="button"
-        class="ha-chip rate"
-        :title="`播放速度 ${rateText}`"
-        :aria-label="`播放速度 ${rateText}`"
-        @click="player.cyclePlaybackRate()"
-      >
-        {{ rateText }}
-      </button>
-    </div>
-
     <div v-if="player.durationSec > 0" class="ha-progress">
       <div class="ha-track"><div class="ha-fill" :style="{ width: `${progressPercent}%` }" /></div>
       <input
@@ -197,12 +150,6 @@ watch(
 );
 
 const playTitle = computed(() => (player.buffering ? '缓冲中' : player.playing ? '暂停' : '播放'));
-const repeatTitle = computed(() => {
-  if (player.repeatMode === 'one') return '单曲循环';
-  if (player.repeatMode === 'all') return '列表循环';
-  return '循环关闭';
-});
-const rateText = computed(() => `${player.playbackRate}×`);
 const titleTip = computed(() => player.errorText || player.displayTitle);
 
 // ── 进度（唯一的本地状态） ──
@@ -243,7 +190,7 @@ const rootEl = ref<HTMLElement | null>(null);
 const panelEl = ref<HTMLElement | null>(null);
 const lyricsBodyEl = ref<HTMLElement | null>(null);
 const lyricsOpen = ref(false);
-const panelPos = ref({ top: 0, left: 0, width: 360 });
+const panelPos = ref({ top: 0, left: 0, width: 300 });
 const panelStyle = computed(() => ({
   top: `${panelPos.value.top}px`,
   left: `${panelPos.value.left}px`,
@@ -366,17 +313,17 @@ onBeforeUnmount(() => {
 .header-audio {
   position: relative;
   box-sizing: border-box;
-  width: 360px;
-  max-width: 360px;
-  flex: 0 1 360px;
+  width: 300px;
+  max-width: 300px;
+  flex: 0 1 300px;
   height: 40px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 6px;
-  padding: 0 10px;
+  gap: var(--space-1);
+  padding: 0 var(--space-2);
   border: 0;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   background: var(--card-bg);
   box-shadow: 0 3px 12px -9px var(--shadow-color-strong);
   overflow: hidden;
@@ -389,7 +336,7 @@ onBeforeUnmount(() => {
 .ha-now {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex: 0 1 150px;
   max-width: 150px;
   min-width: 0;
@@ -406,10 +353,10 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
+  width: 34px;
+  height: 34px;
   overflow: hidden;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   color: var(--accent-color);
   background: var(--surface-hover);
   box-shadow: inset 0 0 0 1px var(--neutral-light-bg);
@@ -434,7 +381,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 12px;
+  font-size: var(--font-sm);
   font-weight: 600;
   line-height: 1.2;
   color: var(--text-primary);
@@ -447,7 +394,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  font-size: 10px;
+  font-size: var(--font-xs);
   line-height: 1.2;
   color: var(--text-muted);
 }
@@ -471,7 +418,7 @@ onBeforeUnmount(() => {
   width: 24px;
   height: 26px;
   border: 0;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -487,7 +434,7 @@ onBeforeUnmount(() => {
 .ha-btn.primary {
   width: 27px;
   height: 27px;
-  margin: 0 2px;
+  margin: 0 var(--space-1);
   border-radius: 50%;
   color: var(--card-bg);
   background: var(--text-primary);
@@ -515,42 +462,11 @@ onBeforeUnmount(() => {
   }
 }
 
-.ha-toggles {
-  display: flex;
-  align-items: center;
-  gap: 1px;
-  flex: none;
-}
-.ha-chip {
-  appearance: none;
-  height: 22px;
-  padding: 0 5px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 10px;
-  display: inline-flex;
-  align-items: center;
-  cursor: pointer;
-}
-.ha-chip svg {
-  width: 12px;
-  height: 12px;
-}
-.ha-chip:hover {
-  background: var(--surface-hover);
-  color: var(--text-secondary);
-}
-.ha-chip.on {
-  color: var(--text-primary);
-  background: var(--surface-active, var(--surface-hover));
-}
-
 .ha-progress {
   position: absolute;
-  left: 10px;
-  right: 10px;
+  /* 封面 34px + 左右各一格 --space-2：进度条从封面右侧开始，不再压在封面下方。 */
+  left: calc(var(--space-2) + 34px + var(--space-2));
+  right: var(--space-2);
   bottom: 0;
   height: 8px;
 }
@@ -583,7 +499,7 @@ onBeforeUnmount(() => {
   z-index: 4000;
   padding: 0;
   border: 1px solid var(--border-subtle);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   background: var(--card-bg);
   box-shadow: 0 22px 56px -26px var(--shadow-color-strong);
   overflow: hidden;
@@ -603,7 +519,7 @@ onBeforeUnmount(() => {
 .ha-lyrics-body {
   max-height: 170px;
   overflow-y: auto;
-  padding: 12px 18px;
+  padding: var(--space-3) var(--space-4);
   text-align: center;
   scrollbar-width: none;
   -ms-overflow-style: none;
@@ -619,7 +535,7 @@ onBeforeUnmount(() => {
   margin: 0;
   padding: 3px 6px;
   border-radius: 7px;
-  font-size: 11.5px;
+  font-size: var(--font-sm);
   line-height: 1.6;
   color: var(--text-secondary);
   transition:
@@ -628,7 +544,7 @@ onBeforeUnmount(() => {
 }
 .ha-lyric.current {
   padding: 6px;
-  font-size: 17px;
+  font-size: var(--font-lg);
   font-weight: 650;
   line-height: 1.45;
   color: var(--text-primary);
@@ -636,43 +552,38 @@ onBeforeUnmount(() => {
 .ha-lyrics-empty {
   margin: 0;
   padding: 22px 0;
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
 }
 
 @media (max-width: 1180px) {
   .header-audio {
-    width: 340px;
-    max-width: 340px;
-    flex-basis: 340px;
-  }
-  .ha-chip.rate {
-    display: none;
+    width: 280px;
+    max-width: 280px;
+    flex-basis: 280px;
   }
 }
 @media (max-width: 1024px) {
   .header-audio {
-    width: 320px;
-    max-width: 320px;
-    flex-basis: 320px;
+    width: 260px;
+    max-width: 260px;
+    flex-basis: 260px;
   }
-  .ha-toggles {
-    display: none;
-  }
-  .ha-title {
-    max-width: 120px;
+  .ha-title,
+  .ha-sub {
+    max-width: 110px;
   }
 }
 @media (max-width: 720px) {
   .header-audio {
-    width: 320px;
-    max-width: 320px;
-    flex-basis: 320px;
-    padding: 0 10px;
+    width: 240px;
+    max-width: 240px;
+    flex-basis: 240px;
+    padding: 0 var(--space-2);
   }
   .ha-now {
     flex: 1 1 auto;
-    max-width: 150px;
+    max-width: 140px;
   }
   .ha-title,
   .ha-sub {
@@ -687,17 +598,17 @@ onBeforeUnmount(() => {
 }
 @media (max-width: 660px) {
   .header-audio {
-    width: 180px;
-    max-width: 180px;
-    flex-basis: 180px;
-    padding: 0 8px;
+    width: 200px;
+    max-width: 200px;
+    flex-basis: 200px;
+    padding: 0 var(--space-2);
   }
   .ha-now {
-    max-width: 110px;
+    max-width: 120px;
   }
   .ha-title,
   .ha-sub {
-    max-width: 80px;
+    max-width: 88px;
   }
 }
 @media (max-width: 480px) {
@@ -712,7 +623,8 @@ onBeforeUnmount(() => {
     flex: none;
   }
   .ha-text,
-  .ha-controls {
+  .ha-controls,
+  .ha-progress {
     display: none;
   }
 }

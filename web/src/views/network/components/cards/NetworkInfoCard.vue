@@ -1,111 +1,111 @@
 <template>
   <GridCard title="网络信息">
-    <!-- 上排：gauge(左,96px) + 标题/运营商/2 项开关(右)。
-         拨号模式下拉已按用户裁决删除（2026-10-10）。
-         WiFi 热点开关已移到下方「WiFi 热点」卡的状态行，避免同一状态出现两次。 -->
-    <div class="conn-horizontal">
-      <div class="conn-gauge">
-        <GaugeChart
-          :value="rsrpGaugeValue"
-          :max="100"
-          :size="96"
-          :stroke-width="8"
-          :color="rsrpColor || 'auto'"
-          :display-value="rsrpDisplay"
-          label="RSRP"
-          unit="dBm"
-        />
-      </div>
-
-      <div class="conn-facts">
-        <div class="conn-title-row">
-          <span class="net-dot" :class="isConnected ? 'on' : 'off'"></span>
+    <!-- 头部横跨两栏：左=制式/状态/运营商，右=信号条。
+         2026-11-08 改版：去掉环形仪表（读弧长不如读数字快），参数与控制分左右两列。 -->
+    <div class="ni-head">
+      <div class="ni-id">
+        <div class="ni-title">
+          <span class="net-dot" :class="isConnected ? 'on' : 'off'" />
           <span class="conn-type">{{ connType }}</span>
           <span class="conn-state">{{ connState }}</span>
         </div>
         <div class="conn-operator">{{ operator }}</div>
-
-        <!-- 2 项一行：移动数据 / 数据漫游。WiFi 热点开关归下方 WiFi 卡。 -->
-        <div class="ctrl-bar">
-          <div class="config-item switch-item">
-            <span class="config-label">移动数据</span>
-            <n-switch
-              :value="!!mobileData"
-              size="small"
-              :rubber-band="false"
-              :loading="mobileDataSaving"
-              @update:value="emit('update:mobile-data', $event)"
-            />
-          </div>
-          <div class="config-item switch-item">
-            <span class="config-label">数据漫游</span>
-            <n-switch
-              :value="roamingEnabled"
-              size="small"
-              :rubber-band="false"
-              :loading="roamingSaving"
-              @update:value="emit('update:roaming', $event)"
-            />
-          </div>
-        </div>
+      </div>
+      <div class="sig-bars" :title="`RSRP ${rsrpText} dBm`" :aria-label="`信号 ${signalBars} 格`">
+        <i v-for="n in 5" :key="n" :class="{ on: n <= signalBars }" />
       </div>
     </div>
 
-    <!-- 中段：3 个信号指标一行横排；只保留一个中文标签，英文键放在 title 里 -->
-    <div class="metric-strip">
-      <div v-for="m in signalMetrics" :key="m.key" class="metric-cell" :title="`${m.key} · ${m.label}`">
-        <div class="metric-label">{{ m.label }}</div>
-        <div class="metric-value-row">
-          <span class="metric-value">{{ m.display }}</span>
-          <span class="metric-unit">{{ m.unit }}</span>
+    <div class="ni-grid">
+      <!-- 左：只读参数 -->
+      <div class="ni-col">
+        <div v-for="m in paramRows" :key="m.label" class="ni-row">
+          <span class="ni-ic"><component :is="m.icon" /></span>
+          <span class="ni-lab">{{ m.label }}</span>
+          <span class="ni-track"><i :style="{ width: m.percent + '%' }" /></span>
+          <span class="ni-val">{{ m.display }}</span>
         </div>
       </div>
-    </div>
 
-    <template #footer>
-      <!--
-        2026-10-10 用户裁决：删掉页脚那个连接模式下拉（自动拨号 / 手动拨号）。
-        **只删 UI**：`/api/device/settings` 里的 `dial_mode` 与 composable 的下发逻辑都保留
-        （用户裁决 A）。2026-10-21 补齐：已无 UI 的三个 props 与 `update:connection-mode`
-        事件也一并从本组件删除，父组件不再透传。
-        footer 现在只剩这一组按钮，GridCard 的 footer 自带 flex-end + wrap，
-        原先那层 `.footer-row`(space-between) 会把它推到左边，已去掉。
-      -->
-      <n-popconfirm @positive-click="emit('airplane-on')">
-        <template #trigger><n-button size="small">开启飞行模式</n-button></template>
-        开启飞行模式会切断蜂窝网络与当前拨号连接，确认继续？
-      </n-popconfirm>
-      <n-button size="small" @click="emit('airplane-off')">关闭飞行模式</n-button>
-      <n-button v-if="!isConnected" size="small" type="primary" @click="emit('ppp-connect')">拨号连接</n-button>
-      <n-popconfirm v-else @positive-click="emit('ppp-disconnect')">
-        <template #trigger><n-button size="small">断开连接</n-button></template>
-        断开后设备将失去蜂窝上网，确认继续？
-      </n-popconfirm>
-    </template>
+      <!-- 右：可写控制 -->
+      <div class="ni-col is-rhs">
+        <div class="ni-row">
+          <span class="ni-ic"><CellularOutline /></span>
+          <span class="ni-lab">移动数据</span>
+          <n-switch
+            class="ni-switch"
+            :value="!!mobileData"
+            size="small"
+            :rubber-band="false"
+            :loading="mobileDataSaving"
+            @update:value="emit('update:mobile-data', $event)"
+          />
+        </div>
+        <div class="ni-row">
+          <span class="ni-ic"><AirplaneOutline /></span>
+          <span class="ni-lab">飞行模式</span>
+          <n-switch
+            class="ni-switch"
+            :value="!!airplaneOn"
+            size="small"
+            :rubber-band="false"
+            :loading="airplaneSaving"
+            @update:value="(v: boolean) => (v ? emit('airplane-on') : emit('airplane-off'))"
+          />
+        </div>
+        <button
+          type="button"
+          class="ni-row ni-link"
+          :disabled="modeUnsupported"
+          :title="modeHint"
+          @click="emit('open-mode')"
+        >
+          <span class="ni-ic"><SwapHorizontalOutline /></span>
+          <span class="ni-lab">网络模式</span>
+          <span class="ni-val" :class="{ muted: !modeText }">{{ modeText || '--' }}</span>
+          <span class="ni-chev"><ChevronForwardOutline /></span>
+        </button>
+      </div>
+    </div>
   </GridCard>
 </template>
 
 <script setup lang="ts">
 import { computed } from 'vue';
 import GridCard from '@/components/GridCard.vue';
-import GaugeChart from '@/components/GaugeChart.vue';
-import { networkTypeWithBand, signalColor } from '@/composables/utils';
+import {
+  AirplaneOutline,
+  CellularOutline,
+  ChevronForwardOutline,
+  PulseOutline,
+  SpeedometerOutline,
+  SwapHorizontalOutline,
+} from '@vicons/ionicons5';
+import { networkTypeWithBand } from '@/composables/utils';
 
 const props = defineProps<{
   netStatus: any;
   signal: any;
   mobileDataSaving: boolean;
-  roamingEnabled: boolean;
-  roamingSaving: boolean;
+  /** 飞行模式开关是否在写（core 的 airplane 接口没有读，读侧 2026-11-08 才补进 /network/status） */
+  airplaneSaving?: boolean;
+  /** 「网络模式」当前值文案（父组件已有 modeTileLabel） */
+  modeText?: string;
+  /** 当前设备/固件是否支持切网络模式 */
+  modeUnsupported?: boolean;
+  /** 不支持时的原因（title 提示） */
+  modeHint?: string;
+  /** 「频段锁定」当前值文案 */
+  bandText?: string;
 }>();
 
 const emit = defineEmits<{
   'update:mobile-data': [boolean];
-  'update:roaming': [boolean];
   'airplane-on': [];
   'airplane-off': [];
   'ppp-connect': [];
   'ppp-disconnect': [];
+  'open-mode': [];
 }>();
 
 const isConnected = computed(() => !!props.netStatus?.network?.is_connected);
@@ -116,21 +116,53 @@ const operator = computed(() => props.netStatus?.operator || '--');
 
 // RSRP 仪表盘：归一化 -140~-44 dBm 到 0-100。
 // 判空一律 `!= null`：0 是合法数值（家规第 5 条），不能当"没有值"。
-const rsrpGaugeValue = computed(() => {
-  const r = props.signal?.rsrp;
-  if (r == null) return 0;
-  return Math.max(0, Math.min(100, ((r + 140) / 96) * 100));
-});
-const rsrpDisplay = computed(() => (props.signal?.rsrp != null ? `${props.signal.rsrp}` : '--'));
-const rsrpColor = computed(() => (props.signal?.rsrp != null ? signalColor(props.signal.rsrp) : undefined));
 
-// 指标只保留中文标签；英文键（SINR/RSRQ/RSSI）放 title，避免同一行出现两次说明。
-const signalMetrics = computed(() => {
+/** 飞行模式：读 /api/network/status 的 airplane 字段（core 2026-11-08 新增读侧） */
+const airplaneOn = computed(() => !!props.netStatus?.airplane);
+
+/** 信号格数（1–5）：按 RSRP 分档；无读数时一格不亮，不用满格误导 */
+const signalBars = computed(() => {
+  const r = Number(props.signal?.rsrp);
+  if (!Number.isFinite(r) || r === 0) return 0;
+  if (r >= -80) return 5;
+  if (r >= -90) return 4;
+  if (r >= -100) return 3;
+  if (r >= -110) return 2;
+  return 1;
+});
+const rsrpText = computed(() => (props.signal?.rsrp != null ? String(props.signal.rsrp) : '--'));
+
+/**
+ * 三个参数的百分比：只是为了给条一个长度，范围按工程经验取
+ * （RSRP −110~−60 / SINR 0~30 / RSRQ −20~0），越界夹紧到 0–100。
+ * 拿不到值时不画条（percent 为 null，模板里 v-if 掉）。
+ */
+function pct(v: number | undefined | null, min: number, max: number): number | null {
+  if (v == null || !Number.isFinite(Number(v))) return null;
+  return Math.max(0, Math.min(100, ((Number(v) - min) / (max - min)) * 100));
+}
+
+const paramRows = computed(() => {
   const s = props.signal;
   return [
-    { key: 'SINR', label: '信噪比', unit: 'dB', display: s?.sinr != null ? String(s.sinr) : '--' },
-    { key: 'RSRQ', label: '接收质量', unit: 'dB', display: s?.rsrq != null ? String(s.rsrq) : '--' },
-    { key: 'RSSI', label: '信号强度', unit: 'dBm', display: s?.rssi != null ? String(s.rssi) : '--' },
+    {
+      label: '信号强度',
+      display: s?.rsrp != null ? `${s.rsrp} dBm` : '--',
+      percent: pct(s?.rsrp, -110, -60),
+      icon: CellularOutline,
+    },
+    {
+      label: '信噪比',
+      display: s?.sinr != null ? `${s.sinr} dB` : '--',
+      percent: pct(s?.sinr, 0, 30),
+      icon: PulseOutline,
+    },
+    {
+      label: '接收质量',
+      display: s?.rsrq != null ? `${s.rsrq} dB` : '--',
+      percent: pct(s?.rsrq, -20, 0),
+      icon: SpeedometerOutline,
+    },
   ];
 });
 </script>
@@ -278,6 +310,204 @@ const signalMetrics = computed(() => {
   }
   .metric-cell {
     padding: 0 7px;
+  }
+}
+
+/* ── 2026-11-08 改版：头部跨栏 + 左右两列等高行 ── */
+.ni-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding-bottom: 10px;
+}
+.ni-id {
+  min-width: 0;
+}
+.ni-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ni-head .sig-bars {
+  margin-left: auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  height: 24px;
+}
+.sig-bars i {
+  width: 6px;
+  border-radius: 2px;
+  background: var(--border-subtle);
+}
+.sig-bars i.on {
+  background: var(--accent-color);
+}
+.sig-bars i:nth-child(1) {
+  height: 6px;
+}
+.sig-bars i:nth-child(2) {
+  height: 11px;
+}
+.sig-bars i:nth-child(3) {
+  height: 16px;
+}
+.sig-bars i:nth-child(4) {
+  height: 20px;
+}
+.sig-bars i:nth-child(5) {
+  height: 24px;
+}
+
+/* 两列共用同一行高：左侧第 n 行与右侧第 n 行永远对齐 */
+.ni-grid {
+  /* 默认双栏：左参数 / 右控制。右列只剩两个开关，高度天然矮于左列，
+     用 justify-content:center 让它们垂直居中，空白对称分布在上下而不是全堆在底部。 */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+.ni-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.ni-col.is-rhs {
+  border-left: 1px solid var(--border-subtle);
+  justify-content: center;
+}
+.ni-col.is-rhs .ni-row:first-child {
+  border-top: 0;
+}
+.ni-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  height: 40px;
+  padding: 0 12px;
+  border-top: 1px solid var(--border-subtle);
+  min-width: 0;
+  width: 100%;
+  background: transparent;
+  border-left: 0;
+  border-right: 0;
+  border-bottom: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+.ni-col .ni-row {
+  padding-left: 0;
+  padding-right: 0;
+}
+/* 分隔线两侧留内距（2026-11-10）：上面把两列行的左右 padding 都清零后，
+   左列的值（"-85 dBm" 等）直接顶在分隔线上、右列的图标紧贴分隔线另一侧，
+   看起来就是左值被"截断"、右栏内容挤在一起。只在双列布局下补内距，单列不缩进。 */
+@media (min-width: 601px) {
+  /* 内距加在**行内容**上而不是列上：行边框要横贯到中间那条竖分隔线，
+     加在列上会让每行的上边框在分隔线前断掉 14px。 */
+  .ni-col:not(.is-rhs) .ni-row {
+    padding-right: 14px;
+  }
+  .ni-col.is-rhs .ni-row {
+    padding-left: 14px;
+  }
+}
+/* 右列是控制行：开关贴右，与左列参数值的右对齐落在同一条视觉轴上 */
+.ni-switch {
+  margin-left: auto;
+}
+.ni-col .ni-row:first-child {
+  border-top: 1px solid var(--border-subtle);
+}
+.ni-head + .ni-grid .ni-col .ni-row:first-child {
+  border-top: 1px solid var(--border-subtle);
+}
+.ni-link {
+  cursor: pointer;
+}
+.ni-link:hover .ni-lab {
+  color: var(--accent-color);
+}
+.ni-row:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.ni-row:disabled:hover .ni-lab {
+  color: var(--text-muted);
+}
+.ni-ic {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: var(--surface-elevated, var(--card-bg));
+}
+.ni-ic > svg {
+  width: 13px;
+  height: 13px;
+}
+.ni-lab {
+  /* 四个字（信号强度 / 接收质量）和三个字（信噪比）必须占同一列宽，
+     否则进度条起点会因标签长度差一个字而左移一格。 */
+  flex: 0 0 4em;
+  width: 4em;
+  white-space: nowrap;
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+}
+.ni-track {
+  flex: 1;
+  min-width: 24px;
+  max-width: 110px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border-subtle);
+  overflow: hidden;
+}
+.ni-track > i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent-color);
+}
+.ni-val {
+  margin-left: auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.ni-val.muted {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+.ni-chev {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 15px;
+  margin-left: -4px;
+}
+.ni-chev > svg {
+  width: 14px;
+  height: 14px;
+}
+
+/* 窄屏：两列拆成一列，控制行接在参数行之后 */
+@media (max-width: 600px) {
+  /* 窄屏堆叠：右侧控制列接在参数列下面，补一条上边框当分隔 */
+  .ni-grid {
+    grid-template-columns: 1fr;
+  }
+  .ni-col.is-rhs {
+    border-left: 0;
+    border-top: 1px solid var(--border-subtle);
+    justify-content: flex-start;
+    margin-top: 4px;
   }
 }
 </style>

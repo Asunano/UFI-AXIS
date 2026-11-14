@@ -14,204 +14,234 @@
       ③ 面板组件本身不改：它们各自在卡片底部保存，详情页只负责把它整块放到内容区。
   -->
   <div ref="rootEl" class="settings-shell">
-    <!-- ── 聚合页 ── -->
-    <div v-if="!activeCategory" class="settings-home">
-      <header class="page-head">
-        <div>
-          <div class="page-eyebrow">UFI-AXIS · 设置</div>
-          <h1>设置</h1>
+    <!--
+      聚合页 ↔ 详情页的切换动效（2026-10-30）。
+      两个分支都是 <div>，**必须各给一个 key**：否则 Vue 会按同类型复用同一个元素，
+      v-if 只是打补丁而不是替换，<Transition> 根本不会触发。
+      方向由 `swapDir` 决定（进详情 forward / 返回 back），见脚本里的 watch。
+    -->
+    <Transition :name="`settings-swap-${swapDir}`">
+      <!-- ── 聚合页 ── -->
+      <div v-if="!activeCategory" key="home" class="settings-home">
+        <header class="page-head">
+          <div>
+            <h1>设置</h1>
+          </div>
+          <div class="head-meta">
+            <n-tag v-if="coreVersion" size="small" :bordered="false">v{{ coreVersion }}</n-tag>
+          </div>
+        </header>
+
+        <div class="toolbar">
+          <n-input
+            v-model:value="query"
+            class="search-input"
+            size="large"
+            clearable
+            placeholder="搜索设置分栏或关键词，例如：端口、缓存、配对码、重启"
+          >
+            <template #prefix>
+              <n-icon :size="17"><SearchOutline /></n-icon>
+            </template>
+          </n-input>
         </div>
-        <div class="head-meta">
-          <n-tag v-if="coreVersion" size="small" :bordered="false">v{{ coreVersion }}</n-tag>
-        </div>
-      </header>
 
-      <div class="toolbar">
-        <n-input
-          v-model:value="query"
-          class="search-input"
-          size="large"
-          clearable
-          placeholder="搜索设置分栏或关键词，例如：端口、缓存、配对码、重启"
-        >
-          <template #prefix>
-            <n-icon :size="17"><SearchOutline /></n-icon>
-          </template>
-        </n-input>
-      </div>
-
-      <!-- 功能中心：独立页面，不进入设置详情；状态标签来自 core，读不到就整颗不显示 -->
-      <section v-show="!query.trim()" class="feature-band">
-        <div class="band-head">
-          <h2>功能中心</h2>
-          <p>独立功能页面</p>
-        </div>
-        <div class="feature-grid">
-          <button type="button" class="feature" @click="go('tasks')">
-            <span class="feature-icon"
-              ><n-icon :size="20"><TimerOutline /></n-icon
-            ></span>
-            <span class="feature-main">
-              <span class="feature-title">
-                定时任务
-                <n-tag v-if="taskTag" size="small" :type="taskTagType" :bordered="false">{{ taskTag }}</n-tag>
-              </span>
-              <span class="feature-desc">按计划执行设备操作，如重启设备、开关 WiFi、切换网络制式</span>
-            </span>
-            <n-icon class="feature-go" :size="14"><ChevronForwardOutline /></n-icon>
-          </button>
-
-          <button type="button" class="feature" @click="go('tunnel')">
-            <span class="feature-icon"
-              ><n-icon :size="20"><GlobeOutline /></n-icon
-            ></span>
-            <span class="feature-main">
-              <span class="feature-title">
-                内网穿透
-                <n-tag v-if="tunnelTag" size="small" :type="tunnelTagType" :bordered="false">{{ tunnelTag }}</n-tag>
-              </span>
-              <span class="feature-desc">通过 frp / Cloudflare 隧道将内网服务映射至公网</span>
-            </span>
-            <n-icon class="feature-go" :size="14"><ChevronForwardOutline /></n-icon>
-          </button>
-
-          <button type="button" class="feature" @click="go('resources')">
-            <span class="feature-icon"
-              ><n-icon :size="20"><CloudDownloadOutline /></n-icon
-            ></span>
-            <span class="feature-main">
-              <span class="feature-title">
-                资源中心
-                <n-tag v-if="resourceTag" size="small" :type="resourceTagType" :bordered="false">{{
-                  resourceTag
-                }}</n-tag>
-              </span>
-              <span class="feature-desc">安装与更新 frpc、cloudflared 等插件组件</span>
-            </span>
-            <n-icon class="feature-go" :size="14"><ChevronForwardOutline /></n-icon>
-          </button>
-        </div>
-      </section>
-
-      <div class="home-grid">
-        <div class="home-main">
-          <section v-for="g in visibleGroups" :key="g.title" class="group-card">
-            <div class="group-head">
-              <div>
-                <h2>{{ g.title }}</h2>
-                <p>{{ g.desc }}</p>
+        <div class="home-grid">
+          <div class="home-main">
+            <!-- 功能中心：独立页面，不进入设置详情；状态标签来自 core，读不到就整颗不显示 -->
+            <section v-show="!query.trim()" class="feature-band">
+              <div class="band-head">
+                <h2>功能中心</h2>
+                <p>独立功能页面</p>
               </div>
-              <span class="group-count">{{ g.items.length }} 个分栏</span>
-            </div>
-            <div class="group-entries">
-              <button
-                v-for="c in g.items"
-                :key="c.key"
-                type="button"
-                class="group-entry"
-                @pointerenter="preloadPanel(c)"
-                @focus="preloadPanel(c)"
-                @click="open(c)"
-              >
-                <span class="entry-icon"
-                  ><n-icon :size="17"><component :is="c.icon" /></n-icon
-                ></span>
-                <span class="entry-main">
-                  <span class="entry-title">{{ c.label }}</span>
-                  <span class="entry-desc">{{ c.desc }}</span>
-                </span>
-                <n-icon class="entry-chev" :size="14"><ChevronForwardOutline /></n-icon>
-              </button>
-            </div>
-          </section>
+              <div class="feature-grid">
+                <EntryTile
+                  :icon="TimerOutline"
+                  title="定时任务"
+                  desc="按计划执行设备操作，如重启设备、开关 WiFi、切换网络制式"
+                  @click="go('tasks')"
+                >
+                  <template #title-extra>
+                    <n-tag v-if="taskTag" size="small" :type="taskTagType" :bordered="false">{{ taskTag }}</n-tag>
+                  </template>
+                  <template #extra>
+                    <n-icon :size="14"><ChevronForwardOutline /></n-icon>
+                  </template>
+                </EntryTile>
+                <EntryTile
+                  :icon="GlobeOutline"
+                  title="内网穿透"
+                  desc="通过 frp / Cloudflare 隧道将内网服务映射至公网"
+                  @click="go('tunnel')"
+                >
+                  <template #title-extra>
+                    <n-tag v-if="tunnelTag" size="small" :type="tunnelTagType" :bordered="false">{{ tunnelTag }}</n-tag>
+                  </template>
+                  <template #extra>
+                    <n-icon :size="14"><ChevronForwardOutline /></n-icon>
+                  </template>
+                </EntryTile>
+                <EntryTile
+                  :icon="WalletOutline"
+                  title="话费账单"
+                  desc="余额 · 流量 · 到期提醒（移动 / 联通）"
+                  @click="go('bill')"
+                >
+                  <template #extra>
+                    <n-icon :size="14"><ChevronForwardOutline /></n-icon>
+                  </template>
+                </EntryTile>
+              </div>
+            </section>
 
-          <div v-if="!visibleGroups.length" class="no-result">未找到匹配的设置，请尝试更短的关键词。</div>
-        </div>
+            <section v-for="g in visibleGroups" :key="g.title" class="group-card">
+              <div class="group-head">
+                <div>
+                  <h2>{{ g.title }}</h2>
+                  <p>{{ g.desc }}</p>
+                </div>
+              </div>
+              <div class="group-entries">
+                <EntryTile
+                  v-for="c in g.items"
+                  :key="c.key"
+                  :icon="c.icon"
+                  :title="c.label"
+                  :desc="c.desc"
+                  @pointerenter="preloadPanel(c)"
+                  @focus="preloadPanel(c)"
+                  @click="activate(c)"
+                >
+                  <template #extra>
+                    <n-icon :size="14"><ChevronForwardOutline /></n-icon>
+                  </template>
+                </EntryTile>
+              </div>
+            </section>
 
-        <aside class="home-rail">
-          <section class="rail-card">
-            <div class="rail-head"><h3>常用开关</h3></div>
-            <div class="rail-row">
-              <span class="rail-label">后台服务</span>
-              <n-switch
-                size="small"
-                :value="serviceStore.enabled"
-                :loading="serviceStore.busy"
-                :disabled="!serviceStore.loaded || serviceStore.busy"
-                @update:value="toggleService"
-              />
-            </div>
-            <div class="rail-row">
-              <span class="rail-label">开机自启</span>
-              <n-switch
-                size="small"
-                :value="serviceStore.autoStartOnBoot"
-                :disabled="!serviceStore.loaded || serviceStore.busy"
-                @update:value="toggleAutoStart"
-              />
-            </div>
-            <div class="rail-row">
-              <span class="rail-label">浏览器通知</span>
-              <n-switch size="small" :value="browserNotifyOn" @update:value="toggleBrowserNotify" />
-            </div>
-          </section>
+            <div v-if="!visibleGroups.length" class="no-result">未找到匹配的设置，请尝试更短的关键词。</div>
+          </div>
 
-          <section class="rail-card">
-            <div class="rail-head"><h3>快捷入口</h3></div>
-            <!--
+          <aside class="home-rail">
+            <section class="rail-card">
+              <div class="rail-head"><h3>常用开关</h3></div>
+              <div class="rail-row">
+                <span class="rail-label">后台服务</span>
+                <n-switch
+                  size="small"
+                  :value="serviceStore.enabled"
+                  :loading="serviceStore.busy"
+                  :disabled="!serviceStore.loaded || serviceStore.busy"
+                  @update:value="toggleService"
+                />
+              </div>
+              <div class="rail-row">
+                <span class="rail-label">开机自启</span>
+                <n-switch
+                  size="small"
+                  :value="serviceStore.autoStartOnBoot"
+                  :disabled="!serviceStore.loaded || serviceStore.busy"
+                  @update:value="toggleAutoStart"
+                />
+              </div>
+              <div class="rail-row">
+                <span class="rail-label">浏览器通知</span>
+                <n-switch size="small" :value="browserNotifyOn" @update:value="toggleBrowserNotify" />
+              </div>
+            </section>
+
+            <section class="rail-card">
+              <div class="rail-head"><h3>快捷入口</h3></div>
+              <!--
               这里是"跳到对应分栏"，不是即时动作。
               重启服务 / 导出备份这类动作各自有确认弹窗、口令或健康检查轮询，
               留在面板里执行；在聚合页放一颗"一键重启"只会绕过那些保护。
             -->
-            <div class="quick-grid">
-              <button v-for="q in QUICK_ENTRIES" :key="q.key" type="button" class="quick-btn" @click="openByKey(q.key)">
-                <n-icon :size="14"><component :is="q.icon" /></n-icon>
-                <span>{{ q.label }}</span>
-              </button>
-            </div>
-          </section>
+              <div class="quick-grid">
+                <button
+                  v-for="q in QUICK_ENTRIES"
+                  :key="q.key"
+                  type="button"
+                  class="quick-btn"
+                  @click="openByKey(q.key)"
+                >
+                  <n-icon :size="14"><component :is="q.icon" /></n-icon>
+                  <span>{{ q.label }}</span>
+                </button>
+              </div>
+            </section>
 
-          <section class="rail-card">
-            <div class="rail-head"><h3>设备状态</h3></div>
-            <div class="rail-row">
-              <span class="rail-label">后台服务</span><span class="rail-value">{{ serviceStateText }}</span>
-            </div>
-            <div class="rail-row">
-              <span class="rail-label">已运行</span><span class="rail-value">{{ uptimeText }}</span>
-            </div>
-            <div class="rail-row">
-              <span class="rail-label">存储</span><span class="rail-value">{{ storageText }}</span>
-            </div>
-            <div class="rail-row">
-              <span class="rail-label">core</span><span class="rail-value">{{ coreVersion || '—' }}</span>
-            </div>
-          </section>
-        </aside>
+            <section class="rail-card">
+              <div class="rail-head"><h3>设备状态</h3></div>
+              <div class="rail-row">
+                <span class="rail-label">后台服务</span><span class="rail-value">{{ serviceStateText }}</span>
+              </div>
+              <div class="rail-row">
+                <span class="rail-label">已运行</span><span class="rail-value">{{ uptimeText }}</span>
+              </div>
+              <div class="rail-row">
+                <span class="rail-label">存储</span><span class="rail-value">{{ storageText }}</span>
+              </div>
+              <div class="rail-row">
+                <span class="rail-label">core</span><span class="rail-value">{{ coreVersion || '—' }}</span>
+              </div>
+            </section>
+          </aside>
+        </div>
       </div>
-    </div>
 
-    <!-- ── 详情：同一内容区，不是弹窗 ── -->
-    <div v-else class="settings-detail">
-      <header class="detail-head">
-        <n-button quaternary size="small" class="back-btn" @click="closeDetail">
-          <template #icon>
-            <n-icon :size="16"><ArrowBackOutline /></n-icon>
-          </template>
-          设置
-        </n-button>
-        <div class="detail-crumb">设置 / {{ activeGroup }}</div>
-        <h1 class="detail-title">{{ activeCategory.label }}</h1>
-        <p class="detail-desc">{{ activeCategory.desc }}</p>
-      </header>
-      <div class="detail-body">
-        <component :is="activePanelComponent" v-if="activePanelComponent" />
+      <!-- ── 详情：同一内容区，不是弹窗 ── -->
+      <div v-else key="detail" class="settings-detail">
+        <header class="detail-head">
+          <n-button quaternary size="small" class="back-btn" @click="closeDetail">
+            <template #icon>
+              <n-icon :size="16"><ArrowBackOutline /></n-icon>
+            </template>
+            设置
+          </n-button>
+          <div class="detail-crumb">设置 / {{ activeGroup }}</div>
+          <h1 class="detail-title">{{ activeCategory.label }}</h1>
+          <p class="detail-desc">{{ activeCategory.desc }}</p>
+        </header>
+        <div class="detail-body">
+          <!--
+            同一详情分支内换 tab（关于 → 更新/备份）不会触发外层的 home/detail 过渡，
+            因为两个分支的 key 都是 detail。这里给面板本身一个短促的换页动画，
+            和外壳的 160–180ms 保持同一节奏。
+          -->
+          <Transition name="settings-panel-swap" mode="out-in">
+            <component :is="activePanelComponent" v-if="activePanelComponent" :key="activeCategory.key" />
+          </Transition>
+        </div>
       </div>
-    </div>
+    </Transition>
+
+    <!--
+      连接与端口：4 个输入框不值得一条路由 + 一次转场 + 一整屏留白（2026-11-12）。
+      依然按需加载，第一次点开才拉 chunk；表单逻辑与 `?tab=general` 深链接页共用
+      `ConnectionSettingsForm.vue`，不存在第二份保存实现。
+    -->
+    <!--
+      小设置弹窗：入口仍然是主栏卡片，只有点开才进入弹窗，不占独立路由。
+      连接与端口用共享表单；服务控制 / 小功能 / 服务更新直接挂原面板，
+      避免为大页面重写一份 UI。
+    -->
+    <n-modal
+      v-model:show="smallModalOpen"
+      preset="card"
+      :title="smallModalCategory?.label ?? ''"
+      class="modal-fit"
+      :style="{ '--modal-w': smallModalWidth }"
+    >
+      <!-- 不在 close 时清空 component：NModal 的离场动画期间内容继续存在，
+           不会再出现“字先没了、框还在”的闪断。 -->
+      <component :is="smallModalComponent" v-if="smallModalComponent" />
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onMounted, ref, type Component } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onMounted, ref, shallowRef, watch, type Component } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useMessage } from 'naive-ui';
 import {
@@ -225,6 +255,7 @@ import {
   LinkOutline,
   DocumentTextOutline,
   ArchiveOutline,
+  WalletOutline,
   InformationCircleOutline,
   TimerOutline,
   GlobeOutline,
@@ -237,7 +268,29 @@ import { getApiClient } from '@/composables/useApi';
 import { disableBrowserNotify, enableBrowserNotify, isBrowserNotifyEnabled } from '@/composables/browserNotify';
 import { useServiceStore } from '@/stores/service';
 import PanelSkeleton from './PanelSkeleton.vue';
-import { formatUptime } from './settingsShared';
+import ConnectionSettingsForm from './components/ConnectionSettingsForm.vue';
+
+/**
+ * 哪些设置项走弹窗。
+ *
+ * 只收「内容少、没有长流程」的面板：连接与端口、服务控制、小功能。
+ * 服务更新有在线更新/上传/重启流程，弹窗会变成一屏半，仍走页面；
+ * 设备/配对/日志/通知等长面板同理。
+ */
+const SMALL_MODAL_KEYS = new Set(['general', 'service', 'uiExtras']);
+const smallModalKey = ref<string | null>(null);
+const smallModalOpen = ref(false);
+/**
+ * 弹窗内容必须**先加载完**再打开 —— 否则会出现用户看到的问题：
+ * 弹窗先出来、里面空白，过 ~200ms 才补上内容；关闭时内容又先消失。
+ *
+ * 这里直接 await `c.load()`，拿到组件定义后同时设置 component + open，
+ * 不使用 defineAsyncComponent 的异步包装（包装会先渲染空占位）。
+ */
+const smallModalComponent = shallowRef<Component | null>(null);
+const smallModalCategory = computed(() => CATEGORIES.find((c) => c.key === smallModalKey.value) ?? null);
+const smallModalWidth = computed(() => (smallModalKey.value === 'general' ? '460px' : '640px'));
+import { formatUptimeMs } from './settingsShared';
 
 interface Category {
   key: string;
@@ -330,7 +383,7 @@ const CATEGORIES: Category[] = [
   {
     key: 'about',
     label: '关于',
-    desc: '版本、系统信息与诊断（只读）',
+    desc: '版本、来源与维护入口',
     icon: InformationCircleOutline,
     load: () => import('./panels/AboutPanel.vue'),
   },
@@ -378,17 +431,13 @@ const GROUPS: Array<{ title: string; desc: string; items: Category[] }> = [
   {
     title: '后台服务',
     desc: '连接参数、采集服务启停、性能与排障配置',
+    // 连接与端口不再作为大瓦片：4 个输入框走弹窗，入口收在右栏「常用开关」卡里一行。
     items: pick('general', 'service', 'performance', 'logs'),
   },
   {
-    title: '设备',
-    desc: '设备本体维护、配对与授权、危险操作',
-    items: pick('device', 'pairing'),
-  },
-  {
-    title: '版本与数据',
-    desc: '服务更新、备份与恢复、版本与系统信息',
-    items: pick('update', 'backup', 'about'),
+    title: '设备与系统',
+    desc: '设备本体、配对授权与版本信息',
+    items: pick('device', 'pairing', 'about'),
   },
   {
     title: '提醒与外观',
@@ -399,8 +448,6 @@ const GROUPS: Array<{ title: string; desc: string; items: Category[] }> = [
 
 const QUICK_ENTRIES: Array<{ key: string; label: string; icon: Component }> = [
   { key: 'service', label: '服务控制', icon: ServerOutline },
-  { key: 'update', label: '服务更新', icon: CloudDownloadOutline },
-  { key: 'backup', label: '备份', icon: ArchiveOutline },
   { key: 'pairing', label: '配对码', icon: LinkOutline },
 ];
 
@@ -426,10 +473,52 @@ const activeKey = computed(() => {
 
 const activeCategory = computed(() => CATEGORIES.find((c) => c.key === activeKey.value) ?? null);
 
+/**
+ * 聚合页 ↔ 详情页的切换方向（决定动效往哪边滑），2026-10-30。
+ *
+ * 看的是路由里的 `?tab=`，而不是在 `open()` / `closeDetail()` 里手动置位：
+ * 浏览器前进后退、手改 URL、以及将来新加的入口都会自动拿到正确方向，
+ * 不会出现"从历史回来时反向滑"的错位。
+ * 同一个 key 的 query 变化（例如以后加 `&q=`）直接忽略，不算导航。
+ */
+const swapDir = ref<'forward' | 'back'>('forward');
+watch(
+  () => route.query.tab,
+  (to, from) => {
+    const next = typeof to === 'string' ? to : '';
+    const prev = typeof from === 'string' ? from : '';
+    if (next === prev) return;
+    swapDir.value = next ? 'forward' : 'back';
+  }
+);
+
+/*
+ * `?tab=general` 深链接（收藏 / 旧链接）不再渲染详情页，改为直接打开同一个弹窗。
+ * 打开后把 tab 从 URL 里去掉：否则用户关掉弹窗、再点返回，会被这个参数重新弹一次。
+ */
+watch(
+  () => route.query.tab,
+  (tab) => {
+    if (typeof tab !== 'string' || !SMALL_MODAL_KEYS.has(tab)) return;
+    const c = CATEGORIES.find((x) => x.key === tab);
+    if (!c) return;
+    void openSmallModal(c).then((opened) => {
+      if (!opened) return;
+      const rest = { ...route.query };
+      delete rest.tab;
+      void router.replace({ name: 'settings', query: rest });
+    });
+  },
+  { immediate: true }
+);
+
 const activeGroup = computed(() => {
   const cat = activeCategory.value;
   if (!cat) return '';
-  return GROUPS.find((g) => g.items.some((i) => i.key === cat.key))?.title ?? '';
+  return (
+    GROUPS.find((g) => g.items.some((i) => i.key === cat.key))?.title ??
+    (cat.key === 'update' || cat.key === 'backup' || cat.key === 'about' ? '关于' : '')
+  );
 });
 
 const activePanelComponent = computed<Component | null>(() => {
@@ -464,6 +553,32 @@ async function open(c: Category) {
   getScroller()?.scrollTo({ top: 0, behavior: 'auto' });
 }
 
+/**
+ * 先加载、再打开，避免出现“弹窗已开、内容为空”的 200ms 占位。
+ * `c.load()` 的模块 Promise 会被 Vite 缓存；悬停预取过的卡片通常直接命中。
+ */
+async function openSmallModal(c: Category): Promise<boolean> {
+  try {
+    const component = c.key === 'general' ? ConnectionSettingsForm : (await c.load()).default;
+    smallModalComponent.value = component;
+    smallModalKey.value = c.key;
+    smallModalOpen.value = true;
+    return true;
+  } catch {
+    message.error('设置内容加载失败，请重试');
+    return false;
+  }
+}
+
+/** 卡片入口：小设置开弹窗，其余照旧进入详情页。 */
+function activate(c: Category) {
+  if (!SMALL_MODAL_KEYS.has(c.key)) {
+    void open(c);
+    return;
+  }
+  void openSmallModal(c);
+}
+
 function openByKey(key: string) {
   const c = CATEGORIES.find((x) => x.key === key);
   if (c) void open(c);
@@ -471,7 +586,9 @@ function openByKey(key: string) {
 
 /** 关闭详情：replace 而不是 push —— 浏览器返回键应该离开设置页，而不是逐个关详情。 */
 async function closeDetail() {
-  await router.replace({ name: 'settings', query: {} });
+  // 从「关于 → 更新/备份」进来的详情，返回应该回 About，而不是设置首页。
+  const fromAbout = route.query.from === 'about';
+  await router.replace({ name: 'settings', query: fromAbout ? { tab: 'about' } : {} });
   await nextTick();
   getScroller()?.scrollTo({ top: homeScrollTop, behavior: 'auto' });
 }
@@ -484,7 +601,6 @@ function go(name: string) {
 // ── 功能中心 / 设备状态的数据 ──
 const taskCount = ref<number | null>(null);
 const tunnelCount = ref<number | null>(null);
-const updateCount = ref<number | null>(null);
 const coreVersion = ref('');
 const storageText = ref('—');
 
@@ -500,19 +616,13 @@ const tunnelTag = computed(() => {
 });
 const tunnelTagType = computed<'default' | 'success'>(() => (tunnelCount.value ? 'success' : 'default'));
 
-const resourceTag = computed(() => {
-  if (updateCount.value === null) return '';
-  return updateCount.value > 0 ? `${updateCount.value} 项可更新` : '已是最新';
-});
-const resourceTagType = computed<'default' | 'warning'>(() => (updateCount.value ? 'warning' : 'default'));
-
 const serviceStateText = computed(() => {
   if (!serviceStore.loaded) return '未知';
   if (!serviceStore.enabled) return '已停止';
   return serviceStore.collecting ? '运行中' : '未采集';
 });
 
-const uptimeText = computed(() => (serviceStore.loaded ? formatUptime(serviceStore.uptimeMs) : '—'));
+const uptimeText = computed(() => (serviceStore.loaded ? formatUptimeMs(serviceStore.uptimeMs) : '—'));
 
 /**
  * 拉聚合页需要的只读状态。三个功能标签都是"取不到就整颗不显示"，不写死 0：
@@ -523,11 +633,10 @@ const uptimeText = computed(() => (serviceStore.loaded ? formatUptime(serviceSto
  */
 async function loadAuxStatus() {
   const api = getApiClient();
-  const [tasks, rules, tunnel, components, version, storage] = await Promise.allSettled([
+  const [tasks, rules, tunnel, version, storage] = await Promise.allSettled([
     api.get(Endpoints.tasks.root),
     api.get(Endpoints.tasks.rules),
     api.get('/api/tunnel/status'),
-    api.get(Endpoints.components.list),
     api.get(Endpoints.config.version),
     api.get(Endpoints.diagnostics.diskUsage),
   ]);
@@ -553,13 +662,6 @@ async function loadAuxStatus() {
     // 三种失败形态之一：HTTP 200 + success=false（见 tunnelShared 的说明）
     if (data && data.success !== false && (data.frp || data.cf_tunnel)) {
       tunnelCount.value = Number(data.frp?.running_count ?? 0) + Number(data.cf_tunnel?.running_count ?? 0);
-    }
-  }
-
-  if (components.status === 'fulfilled') {
-    const list = components.value.data?.components;
-    if (Array.isArray(list)) {
-      updateCount.value = list.filter((c: any) => c?.update_available === true).length;
     }
   }
 
@@ -622,10 +724,93 @@ onMounted(() => {
 <style scoped>
 .settings-shell {
   padding: 0;
+  /* 两个分支在切换时叠在同一格里（见下面的动效段）：
+     叠层让离场元素仍占位，页面高度取两者较大值，不会出现
+     「旧内容抽走 → 内容区高度归零 → 滚动条跳一下」的闪动。 */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
 }
+.settings-home,
+.settings-detail {
+  grid-area: 1 / 1;
+}
+/* ── 详情面板内部换 tab（关于 → 更新/备份）── */
+.settings-panel-swap-enter-active,
+.settings-panel-swap-leave-active {
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+}
+
+.settings-panel-swap-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}
+
+.settings-panel-swap-leave-to {
+  opacity: 0;
+  transform: translateY(-3px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-panel-swap-enter-active,
+  .settings-panel-swap-leave-active {
+    transition: none;
+  }
+}
+
+/* ── 聚合页 ↔ 详情页切换动效（2026-10-30）──
+   只动 transform / opacity，不碰 height：设置页在内容区滚动容器里，
+   一旦改高度会连带触发滚动条重算，看起来是"页面抖一下"。
+   方向语义：进详情 forward（新页从右进、旧页向左退），返回 back（反向）。
+   时长 160–180ms：比路由切换本身快，不会让人觉得"点了没反应"。 */
+.settings-swap-forward-enter-from {
+  opacity: 0;
+  transform: translateX(18px);
+}
+.settings-swap-forward-leave-to {
+  opacity: 0;
+  transform: translateX(-14px);
+}
+.settings-swap-back-enter-from {
+  opacity: 0;
+  transform: translateX(-18px);
+}
+.settings-swap-back-leave-to {
+  opacity: 0;
+  transform: translateX(14px);
+}
+.settings-swap-forward-enter-active,
+.settings-swap-back-enter-active {
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+.settings-swap-forward-leave-active,
+.settings-swap-back-leave-active {
+  transition:
+    opacity 0.16s ease,
+    transform 0.16s ease;
+  /* 离场元素已经"不是当前页"了，别再接收点击 */
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-swap-forward-enter-active,
+  .settings-swap-forward-leave-active,
+  .settings-swap-back-enter-active,
+  .settings-swap-back-leave-active {
+    transition: none;
+  }
+}
+
 .settings-home {
-  width: min(1220px, 100%);
-  margin: 0 auto;
+  /* 2026-10-30：去掉 `width: min(1220px, 100%)` + `margin: 0 auto`。
+     宽屏上内容被钉在 1220px 居中，窗口一大两侧就各留出几百像素空白 ——
+     与 `.settings-panel` 2026-09-10 撤掉 max-width 是同一类问题：
+     内边距由外层 `.main-content` 统一给，内容铺满即可。
+     超宽屏不靠限宽、而靠分组卡片换排布（见下面 min-width: 1400 那段）。 */
+  width: 100%;
 }
 
 /* ── 页面标题 ── */
@@ -636,16 +821,9 @@ onMounted(() => {
   gap: 20px;
   padding: 0 2px 18px;
 }
-.page-eyebrow {
-  margin-bottom: 6px;
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.09em;
-  color: var(--accent-color);
-}
 .page-head h1 {
   margin: 0;
-  font-size: 28px;
+  font-size: var(--font-3xl);
   font-weight: 700;
   letter-spacing: -0.025em;
   line-height: 1.2;
@@ -654,7 +832,7 @@ onMounted(() => {
 .page-head p {
   max-width: 680px;
   margin: 6px 0 0;
-  font-size: 13px;
+  font-size: var(--font-base);
   line-height: 1.65;
   color: var(--text-secondary);
 }
@@ -691,77 +869,21 @@ onMounted(() => {
 }
 .band-head h2 {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--font-base);
   font-weight: 600;
   color: var(--text-primary);
 }
 .band-head p {
   margin: 0;
-  font-size: 11.5px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
 }
 .feature-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 9px;
-}
-.feature {
-  display: flex;
-  align-items: center;
-  gap: 11px;
-  min-width: 0;
-  padding: 11px 12px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--card-bg);
-  text-align: left;
-  cursor: pointer;
-  transition:
-    border-color 0.15s,
-    box-shadow 0.15s,
-    transform 0.15s;
-}
-.feature:hover {
-  border-color: var(--accent-color);
-  box-shadow: 0 10px 24px -22px var(--shadow-color-strong);
-  transform: translateY(-1px);
-}
-.feature-icon {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  border-radius: 11px;
-  background: var(--accent-color-light);
-  color: var(--accent-color);
-}
-.feature-main {
-  flex: 1;
-  min-width: 0;
-}
-.feature-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-.feature-desc {
-  display: block;
-  margin-top: 2px;
-  overflow: hidden;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--text-muted);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.feature-go {
-  flex: none;
-  color: var(--text-muted);
-  opacity: 0.7;
+  /* 与网络页「网络设置」卡的 .entry-grid 同口径（--space-3 = 12px）：
+     入口瓦片之间留出和瓦片内边距相称的呼吸，9px 在宽屏下显得挤在一起。 */
+  gap: var(--space-3);
 }
 
 /* ── 聚合主体 ── */
@@ -771,12 +893,35 @@ onMounted(() => {
   gap: 18px;
   align-items: start;
 }
-.group-card {
-  margin-bottom: 14px;
-  padding: 15px 15px 9px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--card-bg);
+/* 宽屏：4 张分组卡排成 2×2。
+   为什么不用 auto-fit：一共就 4 组，自动排布在较宽时会变成「3 + 1」，
+   最后一张孤零零占半行；2 列在任何宽度下都是整齐的 2×2。
+   阈值 1600 是反推出来的，不是拍的：两列时每张卡至少要有 ~520px，
+   否则卡内的 2 列入口会掉到 190px 左右（图标 + 两行文字开始互相挤）。
+     main = 视口 − 侧栏 220 − 内容内距 48 − rail 300 − 列间距 18
+     520 × 2 + 14 = 1054 ⇒ 视口 ≈ 1054 + 220 + 48 + 300 + 18 ≈ 1640
+   取整到 1600（常见 1600×900 就进两列），此时每张卡 ~500px，仍可读。
+   这是**区间判据**（"从多宽开始换排布"），不是新建设备档位 ——
+   check-breakpoints.mjs 只守 max-width / max-height，min-width 表达的是区间。 */
+@media (min-width: 1600px) {
+  .home-main {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+    /* stretch 而不是 start：四组入口数不同（4/2/3/2），start 会让同一行的短卡
+       提前结束、在下一行之前留出一块空白；拉伸后同一行的卡片底边对齐，
+       下一行从同一条基线开始（2026-11-11 用户反馈）。 */
+    align-items: stretch;
+  }
+  /* 卡片之间由 gap 控制间距，不要和原来的 margin-bottom 叠加成 28px */
+  .home-main > .group-card {
+    margin-bottom: 0;
+  }
+  /* 功能中心和「提醒与外观」通栏；设备与后台服务各占半格。 */
+  .home-main > .feature-band {
+    grid-column: 1 / -1;
+    margin-bottom: 0;
+  }
 }
 .group-head {
   display: flex;
@@ -786,82 +931,22 @@ onMounted(() => {
 }
 .group-head h2 {
   margin: 0;
-  font-size: 13.5px;
+  font-size: var(--font-base);
   font-weight: 600;
   color: var(--text-primary);
 }
 .group-head p {
   margin: 3px 0 0;
-  font-size: 11.5px;
+  font-size: var(--font-xs);
   line-height: 1.5;
   color: var(--text-muted);
-}
-.group-count {
-  margin-left: auto;
-  padding-top: 1px;
-  font-size: 11px;
-  color: var(--text-muted);
-  white-space: nowrap;
 }
 .group-entries {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 2px 8px;
-}
-.group-entry {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-  padding: 9px 8px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: none;
-  text-align: left;
-  cursor: pointer;
-  color: inherit;
-}
-.group-entry:hover {
-  border-color: var(--border-subtle);
-  background: var(--surface-hover);
-}
-.entry-icon {
-  display: grid;
-  flex: none;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 9px;
-  background: var(--accent-color-light);
-  color: var(--accent-color);
-}
-.entry-main {
-  flex: 1;
-  min-width: 0;
-}
-.entry-title {
-  display: block;
-  overflow: hidden;
-  font-size: 12.5px;
-  font-weight: 600;
-  color: var(--text-primary);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.entry-desc {
-  display: block;
-  margin-top: 2px;
-  overflow: hidden;
-  font-size: 11px;
-  line-height: 1.45;
-  color: var(--text-muted);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.entry-chev {
-  flex: none;
-  color: var(--text-muted);
-  opacity: 0.65;
+  /* 行距原来只有 2px：瓦片本身是带边框的卡片，纵向贴在一起像一条长列表。
+     对齐网络页 .entry-grid：行 12px、列 12px。 */
+  gap: var(--space-3);
 }
 .no-result {
   padding: 30px 16px;
@@ -869,7 +954,7 @@ onMounted(() => {
   border-radius: var(--radius-md);
   background: var(--card-bg);
   color: var(--text-muted);
-  font-size: 12.5px;
+  font-size: var(--font-sm);
   text-align: center;
 }
 
@@ -890,7 +975,7 @@ onMounted(() => {
 }
 .rail-head h3 {
   margin: 0;
-  font-size: 12.5px;
+  font-size: var(--font-sm);
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -901,7 +986,7 @@ onMounted(() => {
   gap: 10px;
   padding: 9px 0;
   border-top: 1px solid var(--border-subtle);
-  font-size: 12px;
+  font-size: var(--font-sm);
 }
 .rail-row:first-of-type {
   border-top: 0;
@@ -911,7 +996,7 @@ onMounted(() => {
 }
 .rail-value {
   color: var(--text-muted);
-  font-size: 11.5px;
+  font-size: var(--font-xs);
   text-align: right;
 }
 .quick-grid {
@@ -929,7 +1014,7 @@ onMounted(() => {
   border-radius: var(--radius-sm);
   background: var(--surface-elevated);
   color: var(--text-secondary);
-  font-size: 11.5px;
+  font-size: var(--font-xs);
   text-align: left;
   cursor: pointer;
 }
@@ -938,10 +1023,14 @@ onMounted(() => {
   color: var(--accent-color);
 }
 
-/* ── 详情 ── */
+/* ── 详情 ──
+   2026-10-31：去掉 `width: min(960px, 100%)` + `margin: 0 auto`，与聚合页同口径。
+   改前聚合页已经铺满（见 .settings-home 的注释），只有详情页还把内容钉在 960px 居中：
+   宽屏上进 `?tab=device` 这类子页面，两侧会各空出几百像素 —— 与「设置首页左右留白正常、
+   子页面间距异常大」的现象完全对应。内边距统一由外层 `.main-content` 给（24px），
+   面板自己按 `.settings-panel` 的固定 2 列排布，这里不再插一层限宽。 */
 .settings-detail {
-  width: min(960px, 100%);
-  margin: 0 auto;
+  width: 100%;
   padding-bottom: 32px;
 }
 .detail-head {
@@ -952,19 +1041,19 @@ onMounted(() => {
 }
 .detail-crumb {
   margin-bottom: 7px;
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
 }
 .detail-title {
   margin: 0;
-  font-size: 24px;
+  font-size: var(--font-2xl);
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--text-primary);
 }
 .detail-desc {
   margin: 5px 0 0;
-  font-size: 12.5px;
+  font-size: var(--font-sm);
   line-height: 1.6;
   color: var(--text-secondary);
 }
@@ -998,10 +1087,10 @@ onMounted(() => {
     padding-bottom: 14px;
   }
   .page-head h1 {
-    font-size: 23px;
+    font-size: var(--font-2xl);
   }
   .page-head p {
-    font-size: 12px;
+    font-size: var(--font-sm);
   }
   .head-meta {
     display: none;
@@ -1025,8 +1114,16 @@ onMounted(() => {
     padding-bottom: 24px;
   }
   .detail-title {
-    font-size: 22px;
+    font-size: var(--font-xl);
   }
+}
+
+/* 连接弹窗里的一句说明：小一号、压在表单上方 */
+.connection-hint {
+  margin: 0 0 10px;
+  color: var(--text-secondary);
+  font-size: var(--font-sm);
+  line-height: 1.5;
 }
 
 /* 手机端：先看设备状态 / 常用开关 / 快捷入口，再看设置分组。

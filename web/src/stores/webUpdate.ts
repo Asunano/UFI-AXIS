@@ -11,47 +11,47 @@ import {
 } from '@/views/settings/components/updateResult';
 
 /**
- * 前端资源（web 资源）更新的全局状态（2026-10-14）。
+ * 前端资源（web 资源）更新的全局状态。
  *
  * ## 用途
- * `/api/web/*` 这一套的状态、轮询与上传进度：core 自己从更新源拉 ZIP 覆盖（自动通道），
- * 以及管理员手选 ZIP 上传覆盖（手动通道）。UI 侧是设置页「前端资源」卡 +
- * `views/settings/components/WebUpdateModal.vue`。
+ * 覆盖 `/api/web/*` 的状态、轮询与上传进度，包含两条通道：
+ * core 从更新源拉取 ZIP 覆盖（自动通道），以及管理员手选 ZIP 上传覆盖（手动通道）。
+ * UI 侧为设置页「前端资源」卡与 `views/settings/components/WebUpdateModal.vue`。
  *
- * ## 为什么必须提到 store（与 `stores/update.ts` 的三条理由同源）
- * ① 状态原来只活在 `UpdatePanel.vue` 的组件局部 `reactive` 里，**刷新页面 / 关掉设置弹窗
- *    再回来**组件重建即归零 —— 而 core 侧的下载/校验/安装其实还在跑；
- * ② 轮询原来用 `useInterval`（组件级，`onUnmounted` 主动 `stop()`）+ `useCancellableApi`
- *    （卸载 abort 在途请求），离开设置页就没人盯着这次更新，且**没有任何入口恢复现场**；
- * ③ ZIP 上传进度原来也是组件局部 ref，关掉弹窗就丢，用户看不到"还在传"。
+ * ## 状态放在 store 中的原因
+ * · 组件局部状态在组件卸载后归零，而 core 侧的下载、校验与安装仍在进行；
+ * · 轮询与请求取消原绑定于组件生命周期，离开设置页后该次更新即无观察者，
+ *   且没有入口恢复现场；
+ * · ZIP 上传进度原为组件局部状态，关闭弹窗即丢失，用户无法看到传输仍在进行。
  *
- * 所以这里与 `stores/update.ts` 同一套骨架：`getApiClient()`（**不带**取消）+ 自己的
- * `setInterval`，生命周期跟着 store 走，不跟着任何组件走。
+ * 因此本 store 与 `stores/update.ts` 使用同一套骨架：`getApiClient()`（不绑定取消）
+ * 与自持的 `setInterval`，生命周期跟随 store，不跟随任何组件。
  *
- * ## 为什么不能并进 `stores/update.ts`（core APK 那套）
- * · 失败信封不同：`/api/web/*` 只回 `{ error }`，`/api/update/*` 回真实 HTTP 码 +
- *   `{success,ok,error,message,code}`；
- * · 安装后果不同：core APK 安装会杀掉 core 进程，轮询必须容忍"连不上属预期"并跨重启等
- *   `/health`；web 资源是 ZIP 原子覆盖、**不重启**，没有这一段；
- * · 时序不同：`POST /api/web/update` 是**同步**端点（core 收完 body 就地解压安装再回包），
- *   所以上传成功即安装完成，没有第二条"安装"请求 —— 与 APK 的
- *   `upload` → `install-local` 两段式完全不同。合并只会得到一个到处 `if (isWeb)` 的 store。
+ * ## 不能并入 `stores/update.ts` 的原因
+ * core APK 更新与 web 资源更新的端点语义不同：
+ * · 失败信封：`/api/web/*` 只返回 `{ error }`（部分端点另带 `message`），
+ *   `/api/update/*` 返回真实 HTTP 状态码与 `{success,ok,error,message,code}`；
+ * · 安装后果：core APK 安装会终止 core 进程，轮询必须容忍连接失败并跨重启等待
+ *   `/health`；web 资源是 ZIP 原子覆盖，不重启进程，无此阶段；
+ * · 时序：`POST /api/web/update` 是同步端点，core 收完 body 就地解压安装再回包，
+ *   上传成功即安装完成，没有第二个安装请求；APK 更新为
+ *   `upload` → `install-local` 两段式。合并后只能得到内部按资源类型分支的 store。
  *
- * ## 否决过的替代方案
- * · 只给 `UpdatePanel.vue` 补一个 `resume()`、状态仍留组件：设置页是弹窗，关掉即卸载面板，
- *   状态与轮询照样丢 —— 那正是本次要修的 P0；
- * · 让 `WebUpdateModal.vue` 自己持有状态：同上，"关掉弹窗 = 更新消失"。
+ * ## 未采用的替代方案
+ * · 仅在 `UpdatePanel.vue` 内补充 `resume()`、状态仍留在组件：设置页为弹窗，
+ *   关闭即卸载面板，状态与轮询同样丢失；
+ * · 由 `WebUpdateModal.vue` 自行持有状态：同样存在关闭弹窗即丢失更新状态的问题。
  */
 
 /**
  * `/api/web/status` 的 `state`。
  *
- * core 的 `WebUpdateManager.State` 只有
- * `IDLE / DOWNLOADING / VERIFYING / INSTALLING / DONE / FAILED / NEED_PUSH` 七档
- * （见 `core/api/.../update/WebUpdateManager.kt` 的枚举），**没有** `checking` 与
- * `uploading`：前者是前端发起 `POST /api/web/check` 那一下的本地态，后者是
- * 「浏览器正在把 ZIP 推给 core」的本地态（core 的手动通道根本不进状态机）。
- * 两档都保留在类型里，是因为卡片的标签表要按同一个键取值 —— 认不出的键会退化成裸 state 串。
+ * core 的 `WebUpdateManager.State` 仅含
+ * `IDLE / DOWNLOADING / VERIFYING / INSTALLING / DONE / FAILED / NEED_PUSH` 七种取值
+ * （见 `core/api/.../update/WebUpdateManager.kt` 的枚举），不包含 `checking` 与
+ * `uploading`：前者是前端发起 `POST /api/web/check` 时的本地状态，后者是
+ * 浏览器向 core 推送 ZIP 时的本地状态（core 的手动通道不进入状态机）。
+ * 两种本地状态保留在类型中，因为卡片的标签表按同一键取值，未知键会退化为原始 state 字符串。
  */
 export type WebUpdateState =
   | 'idle'
@@ -64,45 +64,44 @@ export type WebUpdateState =
   | 'failed'
   | 'need_push';
 
-/** 「这次更新还在走」的 core 侧状态。`resume()` 据此决定要不要重新起轮询。 */
+/** 表示更新仍在进行的 core 侧状态；`resume()` 据此决定是否重新启动轮询。 */
 export const WEB_BUSY_STATES: WebUpdateState[] = ['checking', 'downloading', 'verifying', 'installing', 'uploading'];
 
-/** 终态：轮询到此为止。`idle` 也算（core 比对后认为已是最新）。 */
+/** 终态：轮询就此停止。`idle` 同样属于终态（core 比对后认为已是最新）。 */
 const WEB_TERMINAL_STATES: WebUpdateState[] = ['idle', 'done', 'failed', 'need_push'];
 
 const KNOWN_STATES: WebUpdateState[] = [...WEB_BUSY_STATES, ...WEB_TERMINAL_STATES];
 
-/** 轮询 `/api/web/status` 的间隔（沿用改造前的 1000ms） */
+/** 轮询 `/api/web/status` 的间隔（1000ms）。 */
 const STATUS_POLL_MS = 1000;
 /**
  * 盯守上限。
  *
- * web 更新是「下载 ZIP + 原子覆盖」，正常几十秒内结束。超过这个时间还停在忙态，说明设备侧
- * 卡住了（或页面已经连不上它）—— 停表并提示，别让一个 1s 的定时器永久挂着。
- * 与 `stores/update.ts` 的 deadline 同一用意，只是 web 侧只有一段（不重启 core）。
- * 用户想再确认一次：点卡片上的「检查更新」（core 对重复触发是静默忽略并回当前状态，
- * 所以那颗按钮天然就是"重新检查状态"）。
+ * web 更新是「下载 ZIP + 原子覆盖」，正常在数十秒内结束。超过该时长仍处于忙态，
+ * 说明设备侧阻塞或页面已无法连接设备：此时停止计时并提示，避免 1s 定时器无限运行。
+ * 与 `stores/update.ts` 的 deadline 用意相同，但 web 侧只有一段（不重启 core）。
+ * 需要重新确认状态时可点击卡片上的「检查更新」：core 对重复触发静默忽略并返回当前状态，
+ * 因此该按钮同时承担重新检查状态的作用。
  */
 const WATCH_DEADLINE_MS = 10 * 60 * 1000;
-/** 单次状态请求超时：core 只读内存状态，慢到 5s 就是有问题，快速失败进入下一轮 */
+/** 单次状态请求超时：core 只读取内存状态，耗时超过 5s 即异常，应快速失败进入下一轮。 */
 const STATUS_TIMEOUT_MS = 5000;
 /**
- * 手动上传成功后刷新页面的延迟。
+ * 手动上传成功后刷新页面的延迟（1200ms）。
  *
- * 与改造前逐字一致（原来 `handleFileSelect` 里是 `message.success` 后
- * `setTimeout(reload, 1200)`）：core 侧 web 资源已覆盖，但**当前页面跑的还是旧 bundle**，
- * 而 `/assets/*` 带 immutable 长缓存，不刷新用户会以为"点了没反应"。
+ * core 侧 web 资源已覆盖，但当前页面运行的仍是旧 bundle，且 `/assets/*` 使用
+ * immutable 长缓存，不刷新会使操作看起来没有生效。
  */
 const RELOAD_DELAY_MS = 1200;
 
 /**
- * 一次性提示：store 里产生，由面板消费后调 `clearNotice()`（避免重挂载重复弹）。
+ * 一次性提示：由 store 产生，面板消费后调用 `clearNotice()`（避免重新挂载时重复弹出）。
  *
- * 2026-10-14 **降级**：它只承载"这一刻弹一下"的即时反馈（用户在页面上时的 toast），
- * **不再是结论的载体** —— 结论在 [UpdateLastResult]，由「前端资源」卡上那一行常驻渲染。
- * 分工的理由与 core APK 那条链路逐字相同（见 `stores/update.ts` 的 `UpdateNotice`）：
- * notice 易失（面板一卸载就没人消费、`clearNotice()` 之后即消失、刷新整页随 store 归零），
- * 而结论必须活过弹窗开合与整页刷新。每个终态两处都写，谁都不许只写一处。
+ * 该字段只承载即时反馈（用户停留在页面时的 toast），不是结论的载体：
+ * 结论存放在 [UpdateLastResult]，由「前端资源」卡上的常驻行渲染。
+ * 与 core APK 链路的分工相同（见 `stores/update.ts` 的 `UpdateNotice`）：
+ * notice 易失（面板卸载后无人消费、`clearNotice()` 后消失、整页刷新后随 store 归零），
+ * 而结论必须跨弹窗开合与整页刷新存活。每个终态必须同时写入两处。
  */
 export interface WebUpdateNotice {
   id: number;
@@ -110,7 +109,7 @@ export interface WebUpdateNotice {
   text: string;
 }
 
-/** `/api/web/*` 的失败信封只有 `{ error }`（部分端点另带 `message`），两个键都要认。 */
+/** `/api/web/*` 的失败信封只有 `{ error }`（部分端点另带 `message`），两个键都需要读取。 */
 function webErr(e: unknown, fallback: string): string {
   const d = (e as { response?: { data?: { error?: string; message?: string } } })?.response?.data;
   if (d?.error) return d.error;
@@ -125,7 +124,7 @@ function normalizeState(raw: unknown): WebUpdateState {
 }
 
 export const useWebUpdateStore = defineStore('webUpdate', () => {
-  /** core 侧 `GET /api/web/status` 的镜像 */
+  /** core 侧 `GET /api/web/status` 的镜像。 */
   const state = ref<WebUpdateState>('idle');
   const progress = ref(0);
   const message = ref('');
@@ -133,64 +132,64 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   const latestVersion = ref('');
   /**
    * ZIP 上传上限（`/api/web/status` 的 `max_upload_bytes`，core 侧 50MB）。
-   * 0 = 还没读到（老 core 不回这个字段），此时预检放行、交给服务端拦
+   * 0 表示尚未读到（老 core 不返回该字段），此时预检放行，由服务端拦截
    * （判定见 `composables/uploadLimit.ts`）。
    */
   const maxUploadBytes = ref(0);
-  /** `POST /api/web/check` 在途（按钮转圈用；core 没有 checking 这一档状态） */
+  /** `POST /api/web/check` 在途（用于按钮加载态；core 没有 `checking` 这一档状态）。 */
   const checking = ref(false);
-  /** ZIP 上传在途（浏览器 → core） */
+  /** ZIP 上传在途（浏览器 → core）。 */
   const uploading = ref(false);
   const uploadPercent = ref(0);
   const uploadBytes = ref(0);
   const uploadTotalBytes = ref(0);
   const notice = ref<WebUpdateNotice | null>(null);
   /**
-   * 「上次更新结果」—— 结论的**唯一**落点（2026-10-14 修"关掉设置弹窗 / 刷新整页就再也
-   * 看不到更新结论"）。与 `stores/update.ts` 的 `lastResult` 同一形状、同一手法，
-   * 只是键与"载体名词"不同（ZIP）。成功 / 失败 / 超时三个终态都写，并落 sessionStorage。
+   * 「上次更新结果」：结论的唯一存放位置，用于在设置弹窗关闭或整页刷新后仍能看到更新结论。
+   * 与 `stores/update.ts` 的 `lastResult` 同一形状、同一手法，仅键与载体名词不同（ZIP）。
+   * 成功、失败、超时三个终态都写入，并持久化到 sessionStorage。
    *
-   * 为什么不能只靠 notice / core 的 `state`：设置页是弹窗（关掉即卸载面板），那一刻更新完成
-   * 就没人消费 notice 了；而 `state` 会被下一次 check 覆盖、刷新后还要重新问一次 core。
+   * 不能只依赖 notice 或 core 的 `state`：设置页是弹窗，关闭即卸载面板，
+   * 此时更新完成无人消费 notice；而 `state` 会被下一次 check 覆盖，刷新后还需重新查询 core。
    * 详见 `views/settings/components/updateResult.ts` 的文件头。
    *
-   * 初值从 sessionStorage 恢复：刷新后重进设置页，卡片上那一行直接就有内容。
+   * 初值从 sessionStorage 恢复，刷新后重进设置页即可在卡片上看到结论。
    */
   const lastResult = ref<UpdateLastResult | null>(readLastResult(UPDATE_RESULT_KEYS.web));
   /**
-   * 「本次更新会话」：用户从卡片或弹窗发起的这次更新，还没被「完成 / 知道了」结束。
+   * 「本次更新会话」：用户从卡片或弹窗发起、尚未被「完成 / 知道了」结束的一次更新。
    *
-   * 为什么需要它：`/api/web/status` 是**历史结论的载体** —— 上一次检查成功后它会一直停在
-   * `done`。弹窗只按 core 状态决定显示什么的话，用户下次点「本地更新」看到的是上一次的结论、
-   * 连选文件的机会都没有。会话标记让"这次的结论"与"上次的结论"分得开。
+   * `/api/web/status` 承载的是历史结论：上一次检查成功后它会一直停留在 `done`。
+   * 弹窗若只按 core 状态决定显示内容，下次点击「本地更新」看到的会是上一次的结论，
+   * 没有选择文件的机会。会话标记用于区分本次结论与上次结论。
    */
   const session = ref(false);
 
-  // 定时器句柄不进 return（仿 stores/update.ts：非响应式内部状态用闭包变量）
+  // 定时器句柄不暴露到返回值：非响应式内部状态使用闭包变量（与 stores/update.ts 一致）。
   let timer: ReturnType<typeof setInterval> | null = null;
   let ticking = false;
   let noticeSeq = 0;
-  /** 本轮盯守的截止时间戳（0 = 没在盯） */
+  /** 当前盯守的截止时间戳（0 = 未在盯守）。 */
   let deadlineAt = 0;
 
-  /** 是否在盯守。定时器句柄本身不是响应式的，而 UI 需要判断"这个忙态还有人在跟" */
+  /** 是否处于盯守状态。定时器句柄本身不是响应式数据，UI 需据此判断忙态是否仍有观察者。 */
   const watching = ref(false);
 
-  /** 是否在盯这次更新（含 ZIP 上传这一段本地链路） */
+  /** 本次更新是否在进行（包含 ZIP 上传这一段本地链路）。 */
   const busy = computed(() => checking.value || uploading.value || WEB_BUSY_STATES.includes(state.value));
 
   /**
-   * 给 UI 用的状态键。
+   * 提供给 UI 的状态键。
    *
-   * 为什么需要它：`uploading` 只存在于本地（core 的手动通道不进状态机），
-   * 不合成的话卡片会在上传期间显示上一次的 `idle`，看着像"没在传"。
+   * `uploading` 只存在于本地（core 的手动通道不进入状态机）。若不合成，
+   * 卡片会在上传期间显示上一次的 `idle`，表现为没有在上传。
    */
   const displayState = computed<WebUpdateState>(() => (uploading.value ? 'uploading' : state.value));
 
-  /** 给 UI 用的百分比：上传期间是**浏览器 → core** 的本地进度，其余时候是 core 侧进度 */
+  /** 提供给 UI 的百分比：上传期间为浏览器 → core 的本地进度，其余时间为 core 侧进度。 */
   const displayProgress = computed(() => (uploading.value ? uploadPercent.value : progress.value));
 
-  /** 卡片上那块状态区要不要出现（空闲且没在传时不显示） */
+  /** 卡片状态区是否显示（空闲且未上传时不显示）。 */
   const showStatus = computed(() => busy.value || state.value !== 'idle');
 
   function pushNotice(type: WebUpdateNotice['type'], text: string) {
@@ -203,8 +202,8 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   }
 
   /**
-   * 记一条结论：进响应式字段（卡片那一行立刻跟着变）+ 落 sessionStorage（扛刷新）。
-   * 版本号在 `saveLastResult` 里统一剥 `v` 前缀（core 回的可能是 `v0.0.6`，而卡片文案会自己补 `v`）。
+   * 记录一条结论：写入响应式字段（卡片行立即更新）并持久化到 sessionStorage（跨刷新）。
+   * 版本号在 `saveLastResult` 中统一去除 `v` 前缀（core 可能返回 `v0.0.6`，卡片文案会自行补 `v`）。
    */
   function recordResult(ok: boolean, version: string, message: string) {
     lastResult.value = saveLastResult(UPDATE_RESULT_KEYS.web, ok, version, message);
@@ -213,10 +212,10 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   /**
    * 合并 core 状态。
    *
-   * 空响应体（`undefined`）**保持原状态不动** —— 与 `stores/update.ts` 的 `applyStatus`
-   * 同一口径：`d?.state || 'idle'` 那种写法会在请求被取消/无 body 时把忙态静默打回
-   * `idle`，界面看起来"更新凭空结束了"。
-   * `max_upload_bytes` 同理只在服务端给出正数时才覆盖（老 core 不回该字段）。
+   * 空响应体（`undefined`）保持原状态不变，与 `stores/update.ts` 的 `applyStatus` 同一规则：
+   * `d?.state || 'idle'` 这类写法会在请求被取消或无 body 时把忙态静默改回 `idle`，
+   * 界面表现为更新意外结束。
+   * `max_upload_bytes` 同理，仅在服务端返回正数时覆盖（老 core 不返回该字段）。
    */
   function applyStatus(d: unknown): boolean {
     if (!d || typeof d !== 'object') return false;
@@ -232,7 +231,7 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
     return true;
   }
 
-  // ── 轮询骨架（与 stores/update.ts 同一套单飞写法）──
+  // ── 轮询骨架（与 stores/update.ts 相同的单飞实现）──
 
   function stopTimer() {
     if (timer) {
@@ -247,7 +246,7 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   async function pollTick() {
     if (deadlineAt && Date.now() >= deadlineAt) {
       stopTimer();
-      // 超时也是"结论"：写进 lastResult，否则用户错过这条 toast 就再也看不到这次更新怎么了
+      // 超时同样构成结论：写入 lastResult，否则错过 toast 后无法再获知本次更新结果。
       const text = '前端资源更新长时间没有结果，已停止轮询。可点「检查更新」再确认一次状态。';
       recordResult(false, '', text);
       pushNotice('warning', text);
@@ -257,13 +256,13 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
       const { data } = await getApiClient().get(Endpoints.webAssets.status, { timeout: STATUS_TIMEOUT_MS });
       if (applyStatus(data) && WEB_TERMINAL_STATES.includes(state.value)) settle();
     } catch {
-      // 轮询失败不能当成"更新失败"：core 只读内存状态，偶发抖动重试下一轮即可。
-      // 真正的失败由 core 自己置 state=failed 表达（改造前这里直接 stop + 弹错，
-      // 一次网络抖动就会让进度永远停在原地）。
+      // 轮询失败不能视为更新失败：core 只读取内存状态，偶发抖动重试下一轮即可。
+      // 真正的失败由 core 置 state=failed 表达；在此停止轮询并报错会使一次网络抖动
+      // 导致进度永久停住。
     }
   }
 
-  /** 单飞轮询：上一轮没跑完就跳过本轮 */
+  /** 单飞轮询：上一次轮询未完成时跳过本次触发。 */
   function startTimer() {
     stopTimer();
     deadlineAt = Date.now() + WATCH_DEADLINE_MS;
@@ -277,12 +276,12 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
     }, STATUS_POLL_MS);
   }
 
-  /** 停止盯守（不改 core 侧任何东西，仅收摊本地定时器） */
+  /** 停止盯守：不改动 core 侧状态，仅清理本地定时器。 */
   function stopWatch() {
     stopTimer();
   }
 
-  /** 落到终态：停表 + 把结论写进 lastResult（常驻）+ 交给面板做即时 toast */
+  /** 进入终态：停止计时，把结论写入 lastResult（常驻），并交由面板显示即时 toast。 */
   function settle() {
     stopTimer();
     const s = state.value;
@@ -296,19 +295,19 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
       recordResult(false, '', text);
       pushNotice('error', text);
     } else if (s === 'need_push') {
-      // need_push 算"没成"：更新源不可达，这次自动更新根本没发生（要用户手动传 ZIP）
+      // need_push 视为未成功：更新源不可达，本次自动更新没有发生，需手动上传 ZIP。
       const text = message.value || '更新源不可用，可手动上传 ZIP 安装包';
       recordResult(false, '', text);
       pushNotice('warning', text);
     } else {
-      // idle = core 比完版本认为无事可做（已是最新）：**不是一次更新结果**，不写 lastResult
+      // idle 表示 core 比对版本后认为无需更新（已是最新），不构成一次更新结果，不写入 lastResult。
       pushNotice('info', message.value || '前端资源已是最新版本');
     }
   }
 
   /**
-   * 手动刷新一次状态（面板「刷新」按钮 / `resume()` 的第一步）。
-   * 该端点无副作用，顺带把 `max_upload_bytes` 读进来。
+   * 手动刷新一次状态（面板「刷新」按钮与 `resume()` 的第一步）。
+   * 该端点无副作用，同时读取 `max_upload_bytes`。
    */
   async function refreshStatus(): Promise<boolean> {
     try {
@@ -320,14 +319,14 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   }
 
   /**
-   * 「检查更新」= 让 core 自己去更新源拉包并安装（自动通道）。
-   * `POST /api/web/check` 立即返回当前状态，进度靠轮询。
+   * 「检查更新」：由 core 从更新源拉取并安装（自动通道）。
+   * `POST /api/web/check` 立即返回当前状态，进度通过轮询获取。
    */
   async function check(): Promise<void> {
     if (checking.value) return;
     checking.value = true;
     session.value = true;
-    // 乐观置 checking：POST 在途时卡片要显示「检查中」，否则按钮转圈但状态行还是上一次的结论
+    // 乐观置为 checking：POST 在途时卡片需显示「检查中」，否则按钮加载态与状态行不一致。
     const prevState = state.value;
     const prevMessage = message.value;
     state.value = 'checking';
@@ -339,10 +338,10 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
       if (WEB_TERMINAL_STATES.includes(state.value)) settle();
       else startTimer();
     } catch (e) {
-      // 失败**回到检查前的状态**，不是置 failed：这是"检查"没打成（网络/更新源问题），
-      // 与"更新失败"是两件事，置 failed 会让卡片谎报一次不存在的更新失败。
-      // 真正的失败由 core 自己置 state=failed 表达（它比客户端更清楚装没装上）。
-      // 同理**不写 lastResult**：这是一次查询失败，不是一次更新的结论。
+      // 失败时回到检查前的状态，而不是置为 failed：这是检查请求失败（网络或更新源问题），
+      // 与更新失败不同；置为 failed 会使卡片报告一次并不存在的更新失败。
+      // 真正的失败由 core 置 state=failed 表达（它比客户端更清楚安装是否成功）。
+      // 同理不写 lastResult：这是一次查询失败，不是一次更新的结论。
       state.value = prevState;
       message.value = prevMessage;
       pushNotice('error', webErr(e, '检查前端资源更新失败'));
@@ -352,16 +351,15 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   }
 
   /**
-   * 手动上传 ZIP（手动通道）。**同步端点**：core 收完 body 就地解压安装再回包，
-   * 所以 2xx + `success` 就是"已装好"，没有第二步。
+   * 手动上传 ZIP（手动通道）。同步端点：core 收完 body 就地解压安装再回包，
+   * 因此 2xx 且 `success` 即表示安装完成，没有第二步。
    *
-   * 为什么用 `getApiClient()` 而不是 `useCancellableApi()`：上传必须活过弹窗与设置页
-   * （「后台运行」/ 关掉设置页都不能把上传掐掉）。代价是拿不到"取消"语义 ——
-   * 因此这里的 `data === undefined` 只可能是服务端回了空 body，一律按失败处理，
-   * 不会出现"把取消当失败弹错"那条坑。
+   * 使用 `getApiClient()` 而非 `useCancellableApi()`：上传必须存活于弹窗与设置页之外
+   * （「后台运行」或关闭设置页都不能中断上传）。代价是拿不到取消语义，
+   * 因此这里的 `data === undefined` 只可能是服务端返回空 body，一律按失败处理。
    *
-   * @param onProgress 可选的本地进度回调（当前 UI 直接读 store 的 `uploadPercent`，
-   *   留这个口子是为了将来别的入口复用上传能力时不改签名）
+   * @param onProgress 可选的本地进度回调（当前 UI 直接读取 store 的 `uploadPercent`，
+   *   保留该参数以便其他入口复用上传能力时不改动签名）
    * @returns 是否上传并安装成功
    */
   async function upload(file: File, onProgress?: (percent: number) => void): Promise<boolean> {
@@ -373,15 +371,15 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
     uploadTotalBytes.value = file.size;
     try {
       const formData = new FormData();
-      // 字段名必须是 file：core 只认这一个 multipart 字段名
+      // 字段名必须为 file：core 仅接受该 multipart 字段名。
       formData.append('file', file);
       const { data } = await getApiClient().post(Endpoints.webAssets.update, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
-        // 默认 15s 超时对 50MB 的 ZIP 太短：设备 Wi-Fi 下传到一半就被客户端掐断，
-        // 而 core 其实还在收（改造前没有这一行，正是这个坑）
+        // 默认 15s 超时对 50MB 的 ZIP 过短：设备 Wi-Fi 下传输到一半会被客户端中断，
+        // 而 core 仍在接收。
         timeout: 0,
         onUploadProgress: (ev: { loaded: number; total?: number }) => {
-          // e.total 在个别浏览器/代理下缺失，回落到 file.size（与 APK 上传同一处理）
+          // ev.total 在部分浏览器或代理下缺失，回退到 file.size（与 APK 上传处理一致）。
           const total = ev.total || file.size;
           if (!total) return;
           const loaded = Math.min(ev.loaded, total);
@@ -400,8 +398,8 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
         progress.value = 100;
         const v = String(data.version ?? '');
         message.value = v ? `前端资源已更新到 v${v}` : '前端资源已更新';
-        // 手动通道**不走 settle()**（它不经过 core 的状态机），所以结论要在这里补记：
-        // 上传成功即安装完成（同步端点），这就是终态
+        // 手动通道不经过 settle()（它不进入 core 的状态机），因此结论在此补记：
+        // 上传成功即安装完成（同步端点），此时即为终态。
         recordResult(true, v, message.value);
         pushNotice('success', '前端已更新，即将刷新页面…');
         scheduleReload();
@@ -421,48 +419,46 @@ export const useWebUpdateStore = defineStore('webUpdate', () => {
   function failWith(text: string) {
     state.value = 'failed';
     message.value = text;
-    // 上传/安装被 core 明确拒掉：这是一次更新的失败终态，两处都写（结论 + 即时 toast）
+    // 上传或安装被 core 明确拒绝：这是本次更新的失败终态，两处都写入（结论与即时 toast）。
     recordResult(false, '', text);
     pushNotice('error', text);
   }
 
   /**
-   * 结束本次更新会话（弹窗按「完成 / 知道了」时调）。
+   * 结束本次更新会话（弹窗点击「完成 / 知道了」时调用）。
    *
-   * **不动 core 状态**：卡片上的「状态」行要继续如实显示上一次的结论
-   * （`done` / `failed` 都是事实），这里只是让弹窗回到"可以重新选文件"的状态。
+   * 不改动 core 状态：卡片的状态行需继续如实显示上一次的结论（`done` / `failed` 均为事实），
+   * 此函数只让弹窗回到可以重新选择文件的状态。
    */
   function endSession() {
     session.value = false;
   }
 
   /**
-   * 刷新页面让新 bundle 生效。
+   * 刷新页面使新 bundle 生效。
    *
-   * 为什么放在 store 而不是弹窗里：上传会活过弹窗（「后台运行」关掉弹窗、或用户离开设置页），
-   * 而"当前页面跑的是旧 bundle"这件事与弹窗无关 —— 刷新不能因为弹窗没了就不做。
-   * 时机与改造前一致（成功后 1200ms），留出时间让用户看见"更新完成"。
+   * 放在 store 而非弹窗中：上传会存活于弹窗之外（「后台运行」关闭弹窗或离开设置页），
+   * 而当前页面运行旧 bundle 与弹窗无关，刷新不能因弹窗关闭而跳过。
+   * 时机为成功后 1200ms，留出时间显示更新完成。
    */
   function scheduleReload() {
     window.setTimeout(() => window.location.reload(), RELOAD_DELAY_MS);
   }
 
   /**
-   * 恢复现场：拉一次 `/api/web/status`，**core 若仍在进行中就重新起轮询**。
+   * 恢复现场：读取一次 `/api/web/status`，若 core 仍在进行中则重新启动轮询。
    *
-   * 这就是「刷新页面 / 关掉设置弹窗再回来，进行中的 web 更新仍然看得见」的关键
-   * （改造前完全没有：状态只在组件里，轮询还挂在组件生命周期上）。
-   * 已经在盯守（`timer` 非空）或本地正在传 ZIP 时原地不动，别重复起表。
+   * 这是刷新页面或关闭设置弹窗后重新进入时仍能看到进行中 web 更新的关键。
+   * 已在盯守（`timer` 非空）或本地正在上传 ZIP 时直接返回，避免重复启动定时器。
    */
   async function resume(): Promise<void> {
     if (timer || uploading.value) return;
     const ok = await refreshStatus();
     if (!ok) return;
     if (WEB_BUSY_STATES.includes(state.value)) startTimer();
-    // 终态（done/failed/need_push）**不**自动起轮询：那是上次更新的结论，
-    // 页面每次打开都重放一遍只会重复弹提示。要看结论读 `lastResult` 就够了
-    // （它的初值从 sessionStorage 恢复）—— 这里省掉的只是"重新问一遍"，
-    // 不是"让用户看不到结果"。
+    // 终态（done/failed/need_push）不自动启动轮询：那是上次更新的结论，
+    // 每次打开页面重放只会重复弹出提示。结论由 `lastResult` 提供
+    // （其初值从 sessionStorage 恢复）。
   }
 
   return {

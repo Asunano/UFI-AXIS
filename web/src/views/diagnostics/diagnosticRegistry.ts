@@ -57,7 +57,7 @@ import { getApiClient } from '@/composables/useApi';
 import { useCapabilitiesStore } from '@/stores/capabilities';
 import { useWebSocketStore } from '@/stores/websocket';
 import { enableBrowserNotify, isBrowserNotifyEnabled } from '@/composables/browserNotify';
-import { formatBytes, formatUptime } from '@/composables/utils';
+import { formatBytes, formatUptimeSec } from '@/composables/utils';
 import NetworkTargetBar from './components/NetworkTargetBar.vue';
 import { DEFAULT_TCP_PORT, networkTarget } from './networkTarget';
 
@@ -862,7 +862,7 @@ async function runServiceStatus(): Promise<DiagnosticResult> {
   const rows: DiagnosticRow[] = [
     { label: '服务开关', value: enabled ? '已开启' : '已关闭' },
     { label: '采集循环', value: collecting ? '运行中' : '未运行' },
-    { label: '已运行', value: num(s.uptime_ms) > 0 ? formatUptime(num(s.uptime_ms) / 1000) : '--' },
+    { label: '已运行', value: num(s.uptime_ms) > 0 ? formatUptimeSec(num(s.uptime_ms) / 1000) : '--' },
     { label: '开机自启', value: s.auto_start_on_boot === true ? '是' : '否' },
     { label: 'HTTP 服务', value: s.http_running === true ? '运行中' : '--' },
     {

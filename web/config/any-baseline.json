@@ -1,0 +1,6 @@
+{
+  "_comment": "类型逃逸（any）基线：只卡增量，不回填。校验脚本见 scripts/check-any-baseline.mjs（口径写在那个文件头：计 : any / as any / <any> / any[]，不计 Record<string, any>、*.spec.ts、components.d.ts 与注释）。抬高基线请在 PR 里写清理由。",
+  "_resnapshot20261030": "首次建立。实测口径下的存量值，包含 utils/stores/api 里为了接 axios 响应与设备原始 JSON 而保留的 any。这一轮同时把 types/index.ts 的 9 处 `[key: string]: any` 索引签名删掉了（那不是注解，是让整个接口失去类型检查的洞），所以这个数字比『全仓 grep』的结果小。",
+  "exempt": [],
+  "anyOccurrences": 313
+}

@@ -7,40 +7,41 @@
       <n-button size="small" quaternary type="primary" @click="emit('open-limit')">设限额</n-button>
     </template>
 
-    <div class="usage-wide">
-      <!-- 左：今日流量（进度条上方）+ 使用进度条 -->
-      <div class="usage-bar-col">
-        <div class="usage-bar-head">
-          <span class="usage-bar-label">今日</span>
-          <span class="usage-bar-value">{{ todayUsageText }}</span>
-        </div>
-        <!-- 进度条按「剩余额度」倒数：100% → 0%，越少越红（颜色见 usageColor） -->
-        <template v-if="hasMonthLimit">
-          <n-progress
-            class="usage-bar"
-            type="line"
-            :percentage="monthRemainPercent"
-            :color="usageColor"
-            rail-color="var(--border-subtle)"
-            :height="8"
-            :border-radius="4"
-            :show-indicator="false"
-          />
-          <div class="usage-bar-meta">
-            <span :style="{ color: usageColor }">剩余 {{ monthRemainPercentText }}%</span>
-            <span>提醒线 {{ alertPercent }}%</span>
-          </div>
-        </template>
-        <!-- 没有有效额度时这里不再补一句「未启用限额 / 已启用但未设置额度」：
-             卡头那颗 tag（usageStatusText，五档状态）已经把这件事说得更全，
-             同一句话在一张卡上说两遍是最容易出现「两处不一致」的地方。 -->
+    <!-- C 方案（2026-11-07）：已用大数字 + 条上标提醒线 + 三格明细。
+         提醒线以前只是 legend 里一句话，没有空间位置；画成刻度后能直接看出"离红线还有多远"。 -->
+    <div class="usage-c">
+      <div class="c-top">
+        <span class="c-used" :style="{ color: usageColor }">{{ monthUsageText }}</span>
+        <span class="c-of">
+          {{ hasMonthLimit ? `/ ${monthLimitText} 本月` : '本月已用 · 未设置限额' }}
+        </span>
       </div>
 
-      <!-- 右：本月总流量。已用值独占一行当主角，额度与说明各自换行退到次要位置 -->
-      <div class="usage-hero">
-        <span class="usage-hero-value" :style="{ color: usageColor }">{{ monthUsageText }}</span>
-        <span v-if="hasMonthLimit" class="usage-hero-total">/ {{ monthLimitText }}</span>
-        <span class="usage-hero-label">本月总流量</span>
+      <template v-if="hasMonthLimit">
+        <div class="c-bar">
+          <i :style="{ width: usedPercent + '%', background: usageColor }" />
+          <span class="c-mark" :style="{ left: alertPercent + '%' }" />
+        </div>
+        <div class="c-legend">
+          <span :style="{ color: usageColor }">已用 {{ usedPercentText }}%</span>
+          <span>{{ toAlertText }}</span>
+        </div>
+      </template>
+
+      <div class="c-cells" :class="{ 'is-two': !hasDailyAvg }">
+        <div class="c-cell">
+          <span class="c-cell-label">今日</span>
+          <span class="c-cell-value">{{ todayUsageText }}</span>
+        </div>
+        <div class="c-cell">
+          <span class="c-cell-label">剩余</span>
+          <span class="c-cell-value">{{ monthRemainText }}</span>
+        </div>
+        <!-- 没有小时采样数据时整格不渲染：显示一个 `--` 只会让人以为"日均是 0"或坏了 -->
+        <div v-if="hasDailyAvg" class="c-cell" :title="dailyAvgHint">
+          <span class="c-cell-label">日均</span>
+          <span class="c-cell-value">{{ dailyAvgText }}</span>
+        </div>
       </div>
     </div>
 
@@ -59,11 +60,13 @@
  * 反过来把 traffic_summary / traffic_limit 当 props 传进来，只会多一层转发。
  * 限额的**写**留在父组件：保存后要 settleDelay + loadSummary，那是页面级的取数节奏。
  */
-import { computed, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useChartColors } from '@/composables/chartTheme';
 import { formatBytes, get } from '@/composables/utils';
 import GridCard from '@/components/GridCard.vue';
+import { getApiClient } from '@/composables/useApi';
+import { getTrafficUsage } from '@/api/traffic';
 import TrafficHistoryModal from '@/views/traffic/TrafficHistoryModal.vue';
 
 const emit = defineEmits<{ (e: 'open-limit'): void }>();
@@ -129,13 +132,6 @@ const monthLimitPercent = computed(() => {
   if (!Number.isFinite(p)) return null;
   return Math.min(100, Math.max(0, p));
 });
-/**
- * 剩余额度百分比：进度条与文案都按「倒数」呈现（满额 100% → 用尽 0%），
- * 比「已用 N%」更贴合「还能用多少」这个真正要看的问题。
- * 无有效额度时按满额处理 —— 此时进度条本身不渲染，这个值只是兜底不让模板拿到 null。
- */
-const monthRemainPercent = computed(() => (monthLimitPercent.value === null ? 100 : 100 - monthLimitPercent.value));
-const monthRemainPercentText = computed(() => String(Math.round(monthRemainPercent.value)));
 const monthLimitText = computed(() => {
   if (!hasMonthLimit.value) return '未设置限额';
   return `${trafficLimit.value?.limit_value ?? ''} ${trafficLimit.value?.limit_unit_display ?? ''}`.trim();
@@ -180,83 +176,176 @@ const usageStatusText = computed(() => {
   if (p >= alert * 0.6) return '用量偏高';
   return '正常';
 });
+
+/** 已用百分比（无额度时 null，模板不渲染进度条） */
+const usedPercent = computed(() => monthLimitPercent.value ?? 0);
+const usedPercentText = computed(() =>
+  monthLimitPercent.value === null ? '--' : String(Math.round(monthLimitPercent.value))
+);
+
+/** 剩余额度（字节）：只在有有效额度时有意义 */
+const monthRemainBytes = computed(() =>
+  hasMonthLimit.value ? Math.max(0, monthLimitBytes.value - monthUsedBytes.value) : 0
+);
+const monthRemainText = computed(() => (hasMonthLimit.value ? formatBytes(monthRemainBytes.value) : '--'));
+
+/** 距提醒线还有多少：过了就明确说"已过提醒线"，不显示负数 */
+const toAlertText = computed(() => {
+  if (monthLimitPercent.value === null) return '';
+  const gap = alertPercent.value - monthLimitPercent.value;
+  return gap > 0 ? `距提醒线 ${Math.round(gap)}%` : '已过提醒线';
+});
+
+/**
+ * 日均用量。
+ *
+ * 数据来自 `GET /api/traffic/usage?range=month`（每小时增量累加出来的本月日桶）。
+ * **口径要说清**：接口只支持「自然日/周/月/年」窗口，没有"最近 30 天"，
+ * 所以这里算的是**本月日均** = 本月桶合计 ÷ 已过天数（今天几号就算几天）。
+ *
+ * 为什么不拿 `monthUsedBytes / 天数`：那是设备侧当月累计（goform），与小时采样是两条链路，
+ * 混着算会把"上线前没采样"的日子摊进平均值。这里只用一个来源，宁可显示 `--`。
+ */
+const monthBucketBytes = ref(0);
+const elapsedDays = ref(0);
+const hasDailyAvg = computed(() => monthBucketBytes.value > 0 && elapsedDays.value > 0);
+const dailyAvgText = computed(() =>
+  hasDailyAvg.value ? formatBytes(Math.round(monthBucketBytes.value / elapsedDays.value)) : '--'
+);
+const dailyAvgHint = computed(() =>
+  monthBucketBytes.value
+    ? `本月累计 ${formatBytes(monthBucketBytes.value)} ÷ ${elapsedDays.value} 天（按每小时采样累加）`
+    : '本月还没有小时采样数据'
+);
+
+let avgTimer: number | undefined;
+async function loadDailyAvg(): Promise<void> {
+  try {
+    const res = await getTrafficUsage(getApiClient(), 'month');
+    if (!res) return;
+    monthBucketBytes.value = res.total_bytes ?? 0;
+    // 窗口是整月（含未来桶），所以"已过天数"只能取今天几号
+    elapsedDays.value = new Date().getDate();
+  } catch {
+    // 取不到就保持 `--`：这张卡的主数据不依赖它，不能因为一个次要指标把卡片打成错误态
+  }
+}
+
+onMounted(() => {
+  void loadDailyAvg();
+  // 5 分钟刷一次：日桶按小时累加，没必要跟着 summary 的 10s 轮询跑
+  avgTimer = window.setInterval(loadDailyAvg, 5 * 60 * 1000);
+});
+onBeforeUnmount(() => {
+  if (avgTimer !== undefined) window.clearInterval(avgTimer);
+});
 </script>
 
 <style scoped>
-/* 左：今日流量 + 使用进度条（吃掉剩余宽度）；右：本月总流量大数值。
-   「剩余」已按需求去掉 —— 有进度条和「总/额度」并排就够读出剩余，多一格反而分散重点。 */
-.usage-wide {
+/**
+ * 2026-11-07 改版（C 方案）：从"左今日+进度条 / 右本月大数字"的两栏，
+ * 改成"上行已用大数字 → 进度条（带提醒线刻度）→ 三格明细"的纵向结构。
+ *
+ * 为什么值得换：旧版把「剩余百分比」和「进度条」并排说同一件事，
+ * 而提醒线只是一句文字、没有空间位置；新版把提醒线画成条上的刻度，
+ * "离红线还有多远"一眼可见，三格再补上今日/剩余/提醒线的绝对数字。
+ */
+.usage-c {
   display: flex;
-  align-items: center;
-  gap: var(--space-6);
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 8px;
 }
-.usage-bar-col {
-  flex: 1;
-  min-width: 180px;
-}
-/* 进度条上方的今日流量：标签 + 值同一行，不占额外高度 */
-.usage-bar-head {
+
+.c-top {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  margin-bottom: 6px;
+  flex-wrap: wrap;
 }
-.usage-bar-label {
-  font-size: var(--font-sm);
-  color: var(--text-muted);
-}
-.usage-bar-value {
-  font-size: var(--font-base);
-  font-weight: 600;
-  color: var(--text-primary);
+.c-used {
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.1;
   font-variant-numeric: tabular-nums;
 }
-.usage-bar-meta {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 6px;
-  font-size: var(--font-sm);
+.c-of {
+  font-size: 12.5px;
   color: var(--text-muted);
 }
 
-.usage-hero {
+/* 进度条 = 已用比例；提醒线 = 条上的 2px 刻度（伸出条外 3px，避免被圆角吃掉） */
+.c-bar {
+  position: relative;
+  height: 12px;
+  border-radius: 6px;
+  background: var(--border-subtle);
+  overflow: hidden;
+  margin-top: 2px;
+}
+.c-bar > i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  transition: width 0.25s ease;
+}
+.c-mark {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  width: 2px;
+  background: var(--warning);
+  opacity: 0.85;
+}
+
+.c-legend {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.c-cells {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 2px;
+}
+/* 没有日均那格时只剩两格：两等分，不要让它们只占左边 2/3 */
+.c-cells.is-two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.c-cell {
   display: flex;
   flex-direction: column;
-  /* 靠右对齐：这块被放到卡片右侧，标签与数值都贴右边才不会看着像左栏的续行 */
-  align-items: flex-end;
-  gap: 2px;
+  gap: 1px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  background: var(--surface-elevated, var(--card-bg));
+  border: 1px solid var(--border-subtle);
+  min-width: 0;
 }
-.usage-hero-label {
-  font-size: var(--font-sm);
+.c-cell-label {
+  font-size: 10.5px;
   color: var(--text-muted);
 }
-/* 已用值 / 额度 / 说明各占一行（.usage-hero 是竖排 flex），
-   已用值靠字号与字重独占视觉重心，额度退成一行小字参照 */
-.usage-hero-value {
-  font-size: var(--font-2xl);
-  font-weight: 700;
-  line-height: 1.15;
-  letter-spacing: -0.02em;
+.c-cell-value {
+  font-size: 13px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
-}
-.usage-hero-total {
-  font-size: var(--font-base);
-  color: var(--text-secondary);
-  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-@media (max-width: 768px) {
-  /* 窄屏时横排放不下：进度条列与总流量数值上下堆叠，数值改回左对齐 */
-  .usage-wide {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 14px;
+/* 窄屏：三格改成两列（今日那格内容最长，独占一行），避免数字被截断 */
+@media (max-width: 400px) {
+  /* 三格放不下：今日那格内容最长（`620M↓ / 12M↑`），独占一行 */
+  .c-cells:not(.is-two) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .usage-hero {
-    align-items: flex-start;
+  .c-cells:not(.is-two) .c-cell:first-child {
+    grid-column: 1 / -1;
   }
 }
 </style>

@@ -61,6 +61,8 @@ import {
   type ConfigRejectedField,
   type UpdateSourceModeValue,
 } from '@/api/contract';
+import { fetchConfig, updateConfig } from '@/api/config';
+import { toApiErrorMessage } from '@/composables/utils';
 import CoreUpdateCard from '@/views/settings/components/CoreUpdateCard.vue';
 import ResourceCard from '@/views/resources/components/ResourceCard.vue';
 import { WEB_RESOURCE } from '@/views/resources/resourceRegistry';
@@ -96,7 +98,7 @@ const savingUpdateMode = ref(false);
 
 async function loadUpdateSource() {
   try {
-    const { data } = await api.get('/api/config');
+    const data = await fetchConfig(api);
     // useCancellableApi：面板卸载时在途请求 resolve 成 data=undefined。这里直接返回，
     // 不要把已经读到的基线抹成「未加载」—— 那会让下拉在返回本页时先灰一下。
     if (!data) return;
@@ -123,7 +125,7 @@ async function onUpdateModeChange(mode: UpdateSourceModeValue) {
   const previous = updateMode.value;
   savingUpdateMode.value = true;
   try {
-    const { data } = await api.put('/api/config', { [UPDATE_SOURCE_KEY]: mode });
+    const data = await updateConfig(api, { [UPDATE_SOURCE_KEY]: mode });
     // 取消（面板已卸载）：不置位、不报错
     if (!data) return;
     const updated: string[] = data.updated_fields || [];
@@ -141,9 +143,9 @@ async function onUpdateModeChange(mode: UpdateSourceModeValue) {
     // 选了自动但还没测过地区：顺手测一次，让用户立刻看到判定依据。
     // 测不出来也不改模式 —— core 侧「地区未知」按直连走，且会在检查更新时自己重试。
     if (mode === UpdateSourceMode.AUTO && !geoCountry.value) detectGeo(true);
-  } catch (e: any) {
+  } catch (e) {
     updateMode.value = previous;
-    message.error(e?.response?.data?.error || '保存失败，下载方式已回滚');
+    message.error(toApiErrorMessage(e, '保存失败，下载方式已回滚'));
   } finally {
     savingUpdateMode.value = false;
   }

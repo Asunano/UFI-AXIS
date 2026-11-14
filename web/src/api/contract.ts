@@ -1,18 +1,18 @@
 /**
- * core:contract 的 web 镜像 —— 与 `core/contract/src/main/kotlin/com/ufi_axis_core/contract/` 一一对应。
+ * core:contract 的 web 镜像，与 `core/contract/src/main/kotlin/com/ufi_axis_core/contract/` 一一对应。
  *
- * **改动这里必须同步改 Kotlin 侧，反之亦然。**
- * 校验器：`node scripts/verify-api-contract.mjs`（端点差集 + WS 频道差集，P0 必须为空）。
+ * **改动本文件必须同步修改 Kotlin 侧，反之亦然。**
+ * 校验器：`node scripts/verify-api-contract.mjs`（端点差集 + WS 频道差集，输出的 P0 级差异必须为空）。
  *
- * 为什么是手抄而不是代码生成：当前没有 exportContract → gen-types 链路（T03 第 4 步，可延后）。
- * 手抄的代价由校验器兜住 —— 端点写错会被报成 P0。
+ * 本文件为手工同步，未采用代码生成：当前不存在 exportContract → gen-types 链路。
+ * 手工同步的正确性由上述校验器保证 —— 端点声明与 core 不一致会以 P0 级差异报出。
  */
 
 /**
  * 端点路径（**带前导斜杠**，与 axios 调用现状一致）。
  *
- * 只列**真实存在的端点**，不列模块前缀（形如 api + 模块名 的前缀不是端点，
- * 写进来会被校验器当成"客户端声明了不存在的端点"报 P0）。
+ * 只登记真实存在的端点，不登记模块前缀：形如 api + 模块名的前缀不是端点，
+ * 写入本表会被校验器判定为「客户端声明了不存在的端点」并报 P0。
  */
 export const Endpoints = {
   alerts: {
@@ -35,9 +35,9 @@ export const Endpoints = {
     control: '/api/monitor/control',
   },
   /**
-   * 后台服务控制（2026-08-26 新增）。
-   * stop 只停数据采集与告警检测，HTTP 服务不停 → start 永远可达；
-   * restart 重启后端服务（Service 组件重建，非进程级），接口中断约 10 秒。
+   * 后台服务控制。
+   * stop 只停止数据采集与告警检测，不停止 HTTP 服务，因此 start 始终可达；
+   * restart 重启后端服务（重建 Service 组件，非进程级），接口中断约 10 秒。
    */
   service: {
     status: '/api/service/status',
@@ -47,33 +47,31 @@ export const Endpoints = {
     autostart: '/api/service/autostart',
   },
   /**
-   * DLNA MediaServer（2026-10-09）。
+   * DLNA MediaServer。
    *
-   * 开关门控在 core：目录未配置（status.ready=false）时 enabled=true 会被 400 拒掉，
-   * 前端据此把开关置灰而不是等报错。
+   * 开关门控在 core：目录未配置（status.ready=false）时 enabled=true 会被 400 拒绝，
+   * 前端据此把开关置灰，而不是等请求报错。
    */
   dlna: {
     status: '/api/dlna/status',
     config: '/api/dlna/config',
   },
   /**
-   * 设备能力与设备侧只读信息（2026-10-14 新增这三条）。
+   * 设备能力与设备侧只读信息。
    *
-   * ## 为什么这里单开一组，而其它 `/api/device/*` 是裸字面量
-   * 历史原因：`/api/device/led`、`/api/device/samba`、`/api/device/thermal` 这些
-   * 散在各视图里直接写字符串（`DeviceView.vue`、`ThermalModal.vue`…），契约里从来没有
-   * 一组 `device`。那是不一致，但**本批不顺手改它们** —— 一次提交里同时"加功能"和
-   * "把十几处裸字面量搬进契约"会让 review 分不清哪行是行为变更。
-   * 新加的这三条**至少要有单一出处**：`capabilities` 尤其要在能力门禁的基座里被引用，
-   * 散成四个字面量迟早写岔一个。
+   * ## 单独分组的理由
+   * `/api/device/led`、`/api/device/samba`、`/api/device/thermal` 等端点目前仍以裸字符串
+   * 写在各个视图里（`DeviceView.vue`、`ThermalModal.vue` 等），契约中此前没有 `device` 组。
+   * 这种不一致不改变本组的约定：**新增端点必须有单一出处**。
+   * `capabilities` 尤其要被能力门禁的基座引用 —— 同一取值散成多处字面量必然出现分歧。
    */
   device: {
     /**
      * 设备能力集。`{ plugin_id, capabilities: string[] }`。
      *
-     * ★ **数组而不是 `{sms:true}` 的 map**（core 侧刻意如此）：map 形状让旧客户端分不出
-     * 「这是个我不认识的新能力」还是「设备不支持」——两者的界面行为完全相反。
-     * 所以判断一律走 `capabilities.includes(wire)`，**不要**写 `caps.sms === false`。
+     * 返回**数组**而非 `{sms:true}` 形式的 map（core 侧刻意如此）：map 形状让旧客户端
+     * 无法区分「这是一个未知的新能力」与「设备不支持」，而两者的界面行为完全相反。
+     * 因此判断一律使用 `capabilities.includes(wire)`，不得使用 `caps.sms === false`。
      *
      * 取值是 `Capability` 的 wire 名，见本文件下方的 `Capability` 常量（两端镜像，
      * 守门测试在 `core/contract/.../CapabilityWireTest.kt`）。
@@ -82,22 +80,22 @@ export const Endpoints = {
     /**
      * EPS 承载 QoS：`{ available, cid, qci, downlink_kbps, uplink_kbps, downlink_display, uplink_display }`。
      *
-     * 两个必须照做的点：
-     * ① **失败也回 HTTP 200**，只是 `available: false` + 空字段（AT 通道在很多机型上
-     *    根本不可用，那是预期状态不是错误）⇒ 客户端据 `available` 显示「—」，不要按网络错误处理；
-     * ② `*_display` 是 core 已经换算好的文案（如 `500 Mbps`），**直接用**，
-     *    两端各写一份换算逻辑迟早对不上（一个显示 500 Mbps、一个显示 500.0 Mbps）。
-     * core 侧 5 分钟缓存（`CacheTTL.DEVICE_QOS`），前端不必自己节流。
+     * 两条必须遵守的约束：
+     * ① **失败也返回 HTTP 200**，只是 `available: false` + 空字段（AT 通道在很多机型上
+     *    不可用，这属于预期状态而非错误）⇒ 客户端按 `available` 显示「—」，不得按网络错误处理；
+     * ② `*_display` 是 core 已换算好的文案（如 `500 Mbps`），**必须直接使用**：
+     *    两端各写一份换算逻辑会出现不一致（如 500 Mbps 与 500.0 Mbps）。
+     * core 侧有 5 分钟缓存（`CacheTTL.DEVICE_QOS`），前端无需自行节流。
      */
     qos: '/api/device/qos',
     /**
      * 流量校准：body `{ target: 'data' | 'time', value: string }` → `{ success }`。
      *
-     * `target=data` 校准已用流量、`target=time` 校准已用时长；`value` 是**字符串**
-     * （设备侧按文本收，传数字会在 profile 的 WriteSpec 里对不上）。
-     * 设备拒绝（值非法/越界）回 **400**，成功时 core 失效 `device:traffic-limit` 缓存。
+     * `target=data` 校准已用流量、`target=time` 校准已用时长；`value` **必须是字符串**
+     * （设备侧按文本接收，传数字会与 profile 的 WriteSpec 类型不匹配）。
+     * 设备拒绝（值非法/越界）返回 **400**，成功时 core 失效 `device:traffic-limit` 缓存。
      *
-     * 旧字段 `way` + `data`/`time` 三件套仍兼容但会打 WARN，新代码一律用 `target` + `value`。
+     * 旧字段 `way` + `data`/`time` 仍兼容，但会记录 WARN 日志；新代码统一使用 `target` + `value`。
      */
     flowCalibration: '/api/device/flow-calibration',
   },
@@ -115,22 +113,22 @@ export const Endpoints = {
     /** 执行一条 shell 命令；与 at 通道共用终端页历史（服务端在写侧记账） */
     exec: '/api/shell/exec',
     /**
-     * 读一条系统属性（2026-10-14 web 接入）：`{ key, value }`。
+     * 读一条系统属性：`{ key, value }`。
      *
-     * **优先用它而不是 `shell.exec('getprop …')`**：core 侧这条会做 key 白名单校验
-     * （只许 `[a-zA-Z0-9._]`，防命令注入），而走 `exec` 是把拼好的命令交给 shell，
-     * 校验责任落在调用方；而且 `exec` 会在终端历史里记一笔，读几个只读属性不该污染历史。
+     * **优先使用本端点，而不是 `shell.exec('getprop …')`**：core 侧会校验 key 白名单
+     * （仅允许 `[a-zA-Z0-9._]`，防命令注入），而 `exec` 把拼好的命令交给 shell，
+     * 校验责任落在调用方；此外 `exec` 会写入终端历史，读取只读属性不应污染历史记录。
      *
-     * key 非法回 **400**（不是 500）。`value` 是 `getprop` 的原始 stdout（含结尾换行），
-     * 客户端要自己 `trim()`。
+     * key 非法返回 **400**（不是 500）。`value` 是 `getprop` 的原始 stdout（含结尾换行），
+     * 客户端需自行 `trim()`。
      */
     prop: (key: string) => `/api/shell/prop/${encodeURIComponent(key)}`,
   },
   /**
-   * AT 命令通道（2026-09-12 入 contract）。
+   * AT 命令通道。
    *
    * `command` 执行单条 AT 指令，`status` / `platform` 是只读探测。
-   * 执行历史不由本组写入 —— 真源是服务端在 shell / at 路由执行后记的账。
+   * 执行历史不由本组写入 —— 真源是服务端在 shell / at 路由执行后记录的历史。
    */
   at: {
     command: '/api/at/command',
@@ -142,8 +140,8 @@ export const Endpoints = {
     rules: '/api/rules',
   },
   /**
-   * 应用管理（2026-10-05 P0-2 入 contract：install-url 的 sha256 现为必填，
-   * core 下载后流式校验，不匹配拒绝安装——防任意 URL 静默 root 安装）。
+   * 应用管理。install-url 的 sha256 为必填：core 下载后流式校验，不匹配则拒绝安装，
+   * 防止任意 URL 触发静默 root 安装。
    */
   apps: {
     root: '/api/apps',
@@ -153,20 +151,20 @@ export const Endpoints = {
     uninstall: '/api/apps/uninstall',
   },
   /**
-   * 短信拦截：规则（号码黑名单 + 关键词）与拦截记录（2026-09-08）。
+   * 短信拦截：规则（号码黑名单 + 关键词）与拦截记录。
    *
-   * 挂在既有的 sms 组下而不是新开一个 sms-filter 组，与 core 的 `RootSmsRoutes` 一致
-   * （注意：这段说明里不要写带前导斜杠的 api 路径字面量，契约校验器会把它当成
-   * 「客户端声明了该端点」，模块前缀必然报 P0）。
+   * 挂在既有的 sms 组下，不新开 sms-filter 组，与 core 的 `RootSmsRoutes` 一致。
+   * 注意：本段说明中不得写入带前导斜杠的 api 路径字面量 —— 契约校验器会将其视为
+   * 「客户端声明了该端点」，而模块前缀必然报 P0。
    *
-   * 两个坑：
-   * ① `PUT rules/{id}` 是**字段级合并** —— 只想切 `enabled` 就只传 `enabled`，
-   *    全量提交会把 pattern/scope 一起覆盖回表单里的值；
+   * 两条约束：
+   * ① `PUT rules/{id}` 是**字段级合并**：只修改 `enabled` 就只传 `enabled`，
+   *    全量提交会把 pattern/scope 一并覆盖为表单中的值；
    * ② `GET blocked` 的列表字段名是 **`records`**（不是 `logs`），
    *    keyset 游标参数是 `limit` / `cursor_ts` / `cursor_id`，
-   *    响应回 `next_cursor_ts` / `next_cursor_id` / `has_more`。
+   *    响应返回 `next_cursor_ts` / `next_cursor_id` / `has_more`。
    *
-   * 「验证码豁免关键词拦截」不在这里，它是布尔配置项，走既有的 config 端点
+   * 「验证码豁免关键词拦截」不在本组：它是布尔配置项，走既有的 config 端点
    * （键名 `sms_filter_exempt_verification_code`，默认 true）。
    */
   sms: {
@@ -175,43 +173,44 @@ export const Endpoints = {
     blocked: '/api/sms/blocked',
     blockedRecord: (id: number) => `/api/sms/blocked/${id}`,
     /**
-     * 批量删除多条短信（2026-09-21 core 侧，2026-10-14 web 接入）。
-     * body `{ ids: number[] }` → `{ success, deleted, requested }`；`ids` 为空回 **400**。
+     * 批量删除多条短信。
+     * body `{ ids: number[] }` → `{ success, deleted, requested }`；`ids` 为空返回 **400**。
      *
-     * 与 `/api/sms/delete`（单条）和 `/api/sms/delete-conversation`（按号码整段）刻意分成三条：
-     * 三者的"删多少"语义不同，合成一条带 mode 的接口后，调用点就再也说不清自己删了什么。
+     * 本端点与 `/api/sms/delete`（单条）、`/api/sms/delete-conversation`（按号码整段）
+     * 刻意分为三条：三者的删除范围语义不同，合并成一条带 mode 的接口后，
+     * 调用点无法表达自己删除了什么。
      *
-     * ⚠ `deleted` 可能**小于** `requested`（其中几条已经不在了），而 `success` 判据是
-     * `deleted > 0` —— 所以"一条都没删掉"会回 `success: false`。文案要按 `deleted` 说，
-     * 不要把 `success: false` 直接报成"删除失败"。
+     * 注意：`deleted` 可能**小于** `requested`（部分记录已不存在），而 `success` 的判据是
+     * `deleted > 0` —— 因此「一条都没删掉」返回 `success: false`。文案必须按 `deleted` 陈述，
+     * 不得把 `success: false` 直接报成「删除失败」。
      */
     deleteBatch: '/api/sms/delete-batch',
   },
   /**
-   * 邮件通知（2026-08-27 web 接入；2026-08-29 由「短信转发」改名，只剩 SMTP 一种通道）。
-   * 路径**保持 `sms-forward` 不变**：app 与 API 手册都按它引用，改名只会破坏跨端契约。
-   * 写操作是 **POST 而非 PUT**；`POST /config` 是字段级合并，凭据字段传空串等于不传
-   * （保留原值，无法用该端点清空）。
-   * `POST /test` 用的是已持久化的配置，未保存的改动不生效；且失败也是 HTTP 200 + `{success:false,error}`。
+   * 邮件通知（仅 SMTP 一种通道）。
+   * 路径**保持 `sms-forward` 不变**：app 与 API 手册均按此引用，改名会破坏跨端契约。
+   * 写操作是 **POST 而非 PUT**；`POST /config` 是字段级合并，凭据字段传空串等同于不传
+   * （保留原值，无法通过该端点清空）。
+   * `POST /test` 使用已持久化的配置，未保存的改动不生效；失败同样返回 HTTP 200 + `{success:false,error}`。
    *
-   * **`POST /config` 从"永不报错"变成了可能 400**（2026-09-10 规则同构）：`daily_limit` 越界或
-   * `min_level` 认不出时回 400 + 中文 `error`。客户端必须有这条错误分支 —— 沿用"保存必成功"的
-   * 假设会让用户看到"已保存"而设备侧根本没写进去。
+   * **`POST /config` 可能返回 400**：`daily_limit` 越界或 `min_level` 无法识别时返回 400 + 中文 `error`。
+   * 客户端必须实现这条错误分支 —— 沿用「保存必成功」的假设会让用户看到「已保存」，
+   * 而设备侧并未写入。
    *
-   * `history` 是**三条渠道共用**的投递记录（`mail_send_records` 表，`channel` 列区分），
-   * 不只是邮件的 —— 路径留在 sms-forward 组是因为表和端点都先有邮件。三个坑：
-   * ① `cursor_ts` 与 `cursor_id` **必须成对**，缺一个 core 就当首页（只带 ts 会让
-   *    `id < NULL` 恒为 NULL，同一毫秒的边界行被整段跳过）；
-   * ② `DELETE` 的 `channel` 参数**不传就是全清**，所以按渠道的清空按钮必须带上它；
-   * ③ `failed_total` 与 `skipped_total` 是两个独立计数，**不能相加**（跳过不是失败），
+   * `history` 是**三条渠道共用**的投递记录（`mail_send_records` 表，按 `channel` 列区分），
+   * 不限于邮件；路径留在 sms-forward 组是因为表与端点先有邮件。三条约束：
+   * ① `cursor_ts` 与 `cursor_id` **必须成对**，缺一个 core 按首页处理（只带 ts 时
+   *    `id < NULL` 恒为 NULL，同一毫秒的边界行会被整段跳过）；
+   * ② `DELETE` 的 `channel` 参数**不传即全部清除**，按渠道清空时必须带上它；
+   * ③ `failed_total` 与 `skipped_total` 是两个独立计数，**不得相加**（跳过不是失败），
    *    且都是该渠道的全表计数，不随 `result` 筛选变化。
    *
-   * `historyStats` 与 `historyRecord` 是三条渠道共用的另两条（core 侧一直存在，2026-09-19 web 接入）：
-   * ④ `historyStats` 的 `channel` **缺失或空 = 全渠道**（与 `history` / `DELETE history` 同口径），
-   *    回的是 `total` / `sent` / `failed` / `skipped` / `last_sent_at` —— 比列表响应多出
+   * `historyStats` 与 `historyRecord` 是三条渠道共用的另两条端点：
+   * ④ `historyStats` 的 `channel` **缺失或为空 = 全渠道**（与 `history` / `DELETE history` 同口径），
+   *    返回 `total` / `sent` / `failed` / `skipped` / `last_sent_at` —— 比列表响应多出
    *    `sent` 与 `last_sent_at` 两项，且**不受 `result` 筛选影响**；
-   * ⑤ `historyRecord` 删单条，`deleted = 0`（行已不在）**仍回 `success: true`**：
-   *    客户端可直接把本地行摘掉，不要把"本来就没有"报成删除失败。
+   * ⑤ `historyRecord` 删除单条，`deleted = 0`（行已不存在）**仍返回 `success: true`**：
+   *    客户端可直接移除本地行，不得把「本来就没有」报成删除失败。
    */
   smsForward: {
     config: '/api/sms-forward/config',
@@ -222,27 +221,27 @@ export const Endpoints = {
     historyRecord: (id: number) => `/api/sms-forward/history/${id}`,
   },
   /**
-   * 另两条通知渠道（2026-09-09 web 接入）：Webhook 与本机短信。
-   * 与上面的 smsForward（邮件）并列，三条渠道各自独立存配置，都不进 notifications 那一组
-   * ——那一组管的是「客户端要不要弹通知」。
+   * 另两条通知渠道：Webhook 与本机短信。
+   * 与上面的 smsForward（邮件）并列，三条渠道各自独立存储配置，均不属于 notifications 组
+   * —— 那一组管理的是「客户端是否弹出通知」。
    *
-   * 这段说明里的路径一律写成 api/notify/... （**不带前导斜杠**）：契约校验器会把注释里
-   * 带前导斜杠的 api 路径字面量也算成「web 声明了该端点」，模块前缀必然报 P0。
+   * 本段说明中的路径统一写作 api/notify/...（**不带前导斜杠**）：契约校验器会把注释中
+   * 带前导斜杠的 api 路径字面量也算作「web 声明了该端点」，而模块前缀必然报 P0。
    *
-   * 四处坑：
+   * 四条约束：
    * ① 写操作是 **PUT 且字段级合并**（未出现或为 null 的键保留服务端现值），
-   *    唯一例外是 Webhook 的 `headers` —— 传了就**整体替换**，所以改任何一个头部
-   *    都必须提交全量 map，否则删不掉旧的 Authorization；
-   * ② 取值域与预设表由 GET 回（Webhook 的 `presets` / `placeholders`，**三条渠道共有**的
+   *    唯一例外是 Webhook 的 `headers`：传入即**整体替换**，因此修改任一头部
+   *    都必须提交全量 map，否则无法删除旧的 Authorization；
+   * ② 取值域与预设表由 GET 返回（Webhook 的 `presets` / `placeholders`，**三条渠道共有**的
    *    `levels` / `daily_limit_min` / `daily_limit_max`，见 [ChannelRules]），客户端只渲染，
-   *    不要手抄第二份。`placeholders` 是 `{ name, desc }` 对象数组（说明文案的真源在 core）；
-   *    每个预设还带 `secret_label` / `secret_marker` / `secret_target`（`none` / `url` / `body`）
-   *    ——「用户只要填这一样」的机器可读声明，替换时必须整段连尖括号一起换掉，
-   *    留下裸 `<` 会让 core 判定未配置齐全、渠道永远不投递；
-   * ③ 两个 test 端点**失败也是 HTTP 200** + `{ success: false, error }`；
-   *    Webhook 的 `status_code` 为 null 表示请求没走完（超时 / 连不上 / DNS / TLS）；
-   * ④ 本机短信的 test **真的从设备 SIM 发出一条短信**、产生费用并占用一条今日配额，
-   *    调用前必须让用户确认。
+   *    不得手抄第二份。`placeholders` 是 `{ name, desc }` 对象数组（文案真源在 core）；
+   *    每个预设还带 `secret_label` / `secret_marker` / `secret_target`（`none` / `url` / `body`），
+   *    即「用户只需填写这一项」的机器可读声明；替换时必须整段连同尖括号一并替换，
+   *    残留裸 `<` 会让 core 判定配置不完整、渠道永不投递；
+   * ③ 两个 test 端点**失败也返回 HTTP 200** + `{ success: false, error }`；
+   *    Webhook 的 `status_code` 为 null 表示请求未完成（超时 / 连接失败 / DNS / TLS）；
+   * ④ 本机短信的 test **会真的通过设备 SIM 发出一条短信**，产生费用并占用一条当日配额，
+   *    调用前必须由用户确认。
    */
   notify: {
     webhookConfig: '/api/notify/webhook/config',
@@ -261,20 +260,19 @@ export const Endpoints = {
     config: '/api/notifications/config',
   },
   /**
-   * 流量统计（2026-09-19 进契约）。
+   * 流量统计。
    *
-   * `usage` 的响应形状与取数封装在 [api/traffic.ts](../api/traffic.ts) 里，那份文件原先自己留了
-   * 一个路径字面量并注明"刻意不进契约表"——理由是"只有一半 traffic 路径会更糟"。
-   * 现在四条一起登记，那个理由不再成立。
+   * `usage` 的响应形状与取数封装在 [api/traffic.ts](../api/traffic.ts)；四条 traffic 路径
+   * 统一在本组登记，调用点不得再写裸路径字面量。
    *
-   * 三处坑：
-   * ① `realtime` 在调度器尚未预热时回的是 **HTTP 200 + 失败信封**（`code = NO_DATA_YET`），
-   *    不是 4xx —— 按 HTTP 码判断成功会把"还没数据"当成有数据，读到一堆 undefined；
+   * 三条约束：
+   * ① `realtime` 在调度器尚未预热时返回 **HTTP 200 + 失败信封**（`code = NO_DATA_YET`），
+   *    不是 4xx —— 按 HTTP 码判断成功会把「尚无数据」当成有数据，读到大量 undefined；
    * ② `history` 的 `records[]` 字段是 **camelCase**（`rxBytes` / `txSpeed` / `timestamp`），
-   *    直接序列化 Room 实体的结果，与全仓 snake_case 的惯例相反，别照别的端点抄；
-   * ③ `usage` 的 `range` / `anchor` **都不会回 400**：range 认不出 → `day`，anchor 解析不出 → now。
-   *    翻页锚点一律原样透传响应里的 `prev_anchor` / `next_anchor`，不要在前端做日历运算
-   *    （月长度、闰年、DST 都已经在 core 算对了）。
+   *    这是直接序列化 Room 实体的结果，与全仓 snake_case 惯例相反，不得照其它端点推断；
+   * ③ `usage` 的 `range` / `anchor` **都不会返回 400**：range 无法识别 → `day`，anchor 解析失败 → now。
+   *    翻页锚点一律原样透传响应中的 `prev_anchor` / `next_anchor`，前端不得自行做日历运算
+   *    （月长度、闰年、DST 已由 core 计算）。
    */
   traffic: {
     realtime: '/api/traffic/realtime',
@@ -282,31 +280,31 @@ export const Endpoints = {
     summary: '/api/traffic/summary',
     usage: '/api/traffic/usage',
     /**
-     * 流量日/周/月报（2026-10-06 core 侧，2026-10-14 web 接入）。
-     * query `period` ∈ `day|week|month`（**默认 week**，其它值回 400）。
+     * 流量日/周/月报。
+     * query `period` ∈ `day|week|month`（**默认 week**，其它值返回 400）。
      *
-     * 回 `{ ok, period, range_start, range_end, rx_bytes, tx_bytes, total_bytes, summary, days[] }`，
-     * `days[]` 每项是 `{ day_start, day_label, rx_bytes, tx_bytes, total_bytes }` ——
-     * `day_label` 是 core 用 `MM-dd` 格式化好的，客户端**不要再自己格式化**
-     * （时区/补零两边写法不一致就会出现 10-4 与 10-04 并存）。
+     * 返回 `{ ok, period, range_start, range_end, rx_bytes, tx_bytes, total_bytes, summary, days[] }`，
+     * `days[]` 每项是 `{ day_start, day_label, rx_bytes, tx_bytes, total_bytes }`；
+     * `day_label` 已由 core 按 `MM-dd` 格式化，客户端**不得再次格式化**
+     * （时区与补零写法不一致会出现 10-4 与 10-04 并存）。
      *
-     * 按**自然日**出桶（不是滑动 24h），所以"今天"是残缺的一天，看趋势要用 week/month。
+     * 按**自然日**分桶（不是滑动 24 小时），因此「今天」是不完整的一天，看趋势应使用 week/month。
      */
     report: '/api/traffic/report',
   },
   /**
-   * 天气（2026-09-19 web 接入；core 侧 `WeatherRoutes`，上游 Open-Meteo，**无需 API key**）。
+   * 天气（core 侧 `WeatherRoutes`，上游 Open-Meteo，**无需 API key**）。
    *
-   * 四处坑：
-   * ① `GET /api/weather` 有**两种 200 形状**：未设城市时只回
-   *    `{configured: false, enabled, message}`，其余字段一个都没有 —— 见 [WeatherNow]。
-   *    直接读 `temperature` 会拿到 undefined，必须先判 `configured`；
-   * ② 上游不可达是 **502**（`OPERATION_FAILED`），不是 200 + 失败信封；
-   * ③ `weather_code` → 中文描述的映射在 **core** 里做好了（响应的 `description` 字段），
-   *    客户端不要再抄一张 WMO 码表 —— 那张表一分叉就会和手机端说两种天气；
+   * 四条约束：
+   * ① `GET /api/weather` 有**两种 200 响应形状**：未设置城市时只返回
+   *    `{configured: false, enabled, message}`，其余字段均不存在 —— 见 [WeatherNow]。
+   *    直接读取 `temperature` 会得到 undefined，必须先判断 `configured`；
+   * ② 上游不可达返回 **502**（`OPERATION_FAILED`），不是 200 + 失败信封；
+   * ③ `weather_code` → 中文描述的映射已在 **core** 完成（响应的 `description` 字段），
+   *    客户端不得另建 WMO 码表 —— 两份映射一旦分歧，会与手机端给出不同的天气描述；
    * ④ `PUT /config` 是字段级 patch，但会**校验**：纬度 -90..90、经度 -180..180、
-   *    `unit` 只认 `celsius` / `fahrenheit`、`city` ≤ 64 字符，越界回 400。
-   *    `latitude = 0 && longitude = 0` 是"未设置"的哨兵，不是几内亚湾。
+   *    `unit` 仅接受 `celsius` / `fahrenheit`、`city` ≤ 64 字符，越界返回 400。
+   *    `latitude = 0 && longitude = 0` 是「未设置」的哨兵值，不是有效坐标。
    */
   weather: {
     now: '/api/weather',
@@ -314,24 +312,24 @@ export const Endpoints = {
     config: '/api/weather/config',
   },
   /**
-   * 每日诗词（2026-09-19 web 接入；core 侧 `PoetryRoutes`，上游 jinrishici.com，**无需 API key**）。
+   * 每日诗词（core 侧 `PoetryRoutes`，上游 jinrishici.com，**无需 API key**）。
    *
-   * 两处坑：
-   * ① `refresh=1` 只绕过 **core 本地那 10 分钟缓存**，上游自己也有约 10 分钟的缓存 ——
-   *    所以"刷新"完全可能拿回同一首，这不是 bug，界面上不要承诺"换一首"；
+   * 两条约束：
+   * ① `refresh=1` 只绕过 **core 本地的 10 分钟缓存**，上游自身也有约 10 分钟缓存 ——
+   *    因此「刷新」可能返回同一首。这是上游缓存行为而非缺陷，界面不得承诺「换一首」；
    * ② 没有 tag 参数：选哪首由上游按设备出口 IP 的地理位置、当地天气、时辰与节气决定，
-   *    命中的标签在响应的 `match_tags` 里回读。
+   *    命中的标签在响应的 `match_tags` 中回读。
    */
   poetry: {
     now: '/api/poetry',
     config: '/api/poetry/config',
   },
   /**
-   * 国家/地区探测（2026-09-19 进契约）。诗词与天气的上游选源都依赖它。
+   * 国家/地区探测。诗词与天气的上游选源都依赖它。
    *
    * `country` 是 ISO 3166-1 alpha-2，**空串 = 从未探测成功**；此时 `source` 一定是 `unknown`
-   * （即便刚刚真的发起过一次抓取），所以判"有没有结果"只看 `country` 是否非空。
-   * `POST /detect` 在三个地理源全部不可达时回 **502**，并保留上一次的结果不清空。
+   * （即便刚刚确实发起过一次抓取），因此判断「有无结果」只看 `country` 是否非空。
+   * `POST /detect` 在三个地理源全部不可达时返回 **502**，并保留上一次的结果不清空。
    */
   geo: {
     root: '/api/geo',
@@ -341,52 +339,52 @@ export const Endpoints = {
    * 设备本机媒体库（core 侧 `MediaRoutes`）。
    * web 侧界面在 `views/media/`（视频 / 音乐 / 图片三个独立页面）与文件预览弹窗。
    *
-   * 六处坑，改动前必须读：
-   * ① 几乎每条都要 `type` ∈ `video` / `audio` / `image`，缺失或认不出回 400；
-   *    权限不足回的是 **403 但 code 仍是 `BAD_REQUEST`**（没有专用错误码），
-   *    带 `extra = {permission, type}`；
-   * ② `thumbnail` / `cover` 回的是**二进制图片**（带 ETag + `Cache-Control: private, max-age=86400`），
-   *    不是 JSON。浏览器里只能用 `<img>` + blob URL，因为 `<img src>` 带不上 Bearer 头与设备签名 ——
-   *    与 APK 下载同一个限制（见 [Endpoints.update] 的说明）；
+   * 六条约束：
+   * ① 几乎每条都要 `type` ∈ `video` / `audio` / `image`，缺失或无法识别返回 400；
+   *    权限不足返回 **403，但 code 仍是 `BAD_REQUEST`**（没有专用错误码），
+   *    并带 `extra = {permission, type}`；
+   * ② `thumbnail` / `cover` 返回**二进制图片**（带 ETag + `Cache-Control: private, max-age=86400`），
+   *    不是 JSON。浏览器中只能使用 `<img>` + blob URL，因为 `<img src>` 无法携带 Bearer 头与设备签名 ——
+   *    与 APK 下载受同一限制（见 [Endpoints.update] 的说明）；
    * ③ `PUT /thumbnail` 的 body 是**裸 JPEG 字节**（不是 JSON、不是 multipart），
-   *    上限 512 KB，且必须以 `FF D8 FF` 开头，否则 400；
-   * ④ `browse` 在"配置了多个根目录且没传 path"时回的是**选根目录**的形状：
-   *    `path: ''` + `parent: null` + 非空 `roots` + 空 `folders`/`items`，不是"这个目录是空的"；
-   * ⑤ **播放字节流不在这一组**：走 `/media/stream?ticket=…`（挂在 `/api` 之外的免鉴权区），
-   *    要先 `POST /api/files/stream-ticket` 换一张只授权那一个文件、滑动过期 10 分钟的票据；
-   *    **必须用响应里的 `url`**，别自己拼；
-   * ⑥ `subtitles` 的 `supported` 字段**不能直接当"我能播"** —— 见该字段的说明。
+   *    上限 512 KB，且必须以 `FF D8 FF` 开头，否则返回 400；
+   * ④ `browse` 在「配置了多个根目录且未传 path」时返回**选择根目录**的形状：
+   *    `path: ''` + `parent: null` + 非空 `roots` + 空 `folders`/`items`，不是「该目录为空」；
+   * ⑤ **播放字节流不在本组**：走 `/media/stream?ticket=…`（挂在 `/api` 之外的免鉴权区），
+   *    需先 `POST /api/files/stream-ticket` 换取一张只授权该文件、滑动过期 10 分钟的票据；
+   *    **必须使用响应中的 `url`**，不得自行拼接；
+   * ⑥ `subtitles` 的 `supported` 字段**不能直接当作「能播放」** —— 见该字段的说明。
    */
   media: {
     status: '/api/media/status',
     list: '/api/media/list',
     /**
-     * 音频分组聚合（专辑 / 歌手 / 文件夹），2026-10-14 web 侧接入
-     * （界面在 `views/media/components/GroupBrowserPanel.vue`，取数在 `views/media/mediaGroups.ts`）。
+     * 音频分组聚合（专辑 / 歌手 / 文件夹）。
+     * 界面在 `views/media/components/GroupBrowserPanel.vue`，取数在 `views/media/mediaGroups.ts`。
      *
-     * query：`type` 必须是 `audio`（其它值回 400 —— `album` / `artist` 是 MediaStore.Audio
-     * 独有的维度，视频与图片没有等价物，它们的"文件夹视图"走 [Endpoints.media.browse]）；
-     * `by` ∈ `album` / `artist` / `folder`，其它值也回 400。未授权回 **403 但 code 仍是
+     * query：`type` 必须是 `audio`（其它值返回 400 —— `album` / `artist` 是 MediaStore.Audio
+     * 独有的维度，视频与图片没有等价物，它们的「文件夹视图」走 [Endpoints.media.browse]）；
+     * `by` ∈ `album` / `artist` / `folder`，其它值同样返回 400。未授权返回 **403，但 code 仍是
      * `BAD_REQUEST`**，与 [Endpoints.media.list] 同一约定。
      *
-     * 回 `{ type, by, groups: [{ key, title, subtitle, count, cover_id }], total }`。
-     * `total` 是**分组总数**，不是曲目总数（曲目数在每组的 `count` 里）。
+     * 返回 `{ type, by, groups: [{ key, title, subtitle, count, cover_id }], total }`。
+     * `total` 是**分组总数**，不是曲目总数（曲目数在每组的 `count` 中）。
      *
-     * 三处必须照做，否则会静默给出错的结果：
-     * ① 排序由 core 做（`count` 降序 → `title` 升序），客户端**不要再排一次**；
-     * ② 组内曲目要拿 `key` 回查 [Endpoints.media.list]：`by=album` → `?album=<key>`、
+     * 三条必须遵守，否则会静默给出错误结果：
+     * ① 排序由 core 完成（`count` 降序 → `title` 升序），客户端**不得再次排序**；
+     * ② 组内曲目要用 `key` 回查 [Endpoints.media.list]：`by=album` → `?album=<key>`、
      *    `by=artist` → `?artist=<key>`、`by=folder` → `?dir=<key>`
      *    （**是 `dir` 不是 `folder`**，见 `mediaShared.MediaFilter`）。
-     *    `album` / `artist` 里没有标签的曲目会聚成一个 `key` 为空串的分组
-     *    （`title` 是「未知专辑」/「未知歌手」）——空 `key` 送回 `/list` 会被当成"没传"
-     *    而返回整库，所以这一组只能当展示用，不能当作筛选条件；
+     *    `album` / `artist` 中无标签的曲目会聚成一个 `key` 为空串的分组
+     *    （`title` 是「未知专辑」/「未知歌手」）；空 `key` 送回 `/list` 会被当作「未传」
+     *    而返回整库，因此该分组只能用于展示，不能作为筛选条件；
      * ③ 封面走 `GET [Endpoints.media.thumbnail]?type=audio&id=<cover_id>`；`cover_id <= 0`
-     *    表示组内没有可用条目（`_ID` 从 1 开始，所以 0 天然表示"没有"），此时
-     *    **不要发缩略图请求** —— 与 [Endpoints.playlists] 的 `cover_id` 同一约定。
+     *    表示组内没有可用条目（`_ID` 从 1 开始，因此 0 天然表示「没有」），此时
+     *    **不得发起缩略图请求** —— 与 [Endpoints.playlists] 的 `cover_id` 同一约定。
      */
     groups: '/api/media/groups',
     /**
-     * 2026-10-05 G5：视频元信息（ffmpeg 探测）。query: id。
+     * 视频元信息（ffmpeg 探测）。query: id。
      * MediaStore 列在本机经常缺 duration/width/height（codec 栈缺失），
      * core 用 ffmpeg 自主探测真值；结果永久缓存（媒体文件不可变）。
      * 404 = 无法解析。source: cache|ffmpeg。
@@ -394,9 +392,9 @@ export const Endpoints = {
     videoInfo: '/api/media/video-info',
     browse: '/api/media/browse',
     thumbnail: '/api/media/thumbnail',
-    // 2026-10-07：单条重抽封面用（type+id 查询参数）；不带 id 仍是整类/全部清除
+    // 单条重抽封面用（type+id 查询参数）；不带 id 表示整类或全部清除
     thumbnailCache: '/api/media/thumbnail-cache',
-    // 2026-10-07：手动触发一轮封面预热（POST；开关未开时 core 回 409）
+    // 手动触发一轮封面预热（POST；开关未开启时 core 返回 409）
     thumbnailPrewarm: '/api/media/thumbnail-prewarm',
     cover: '/api/media/cover',
     lyrics: '/api/media/lyrics',
@@ -406,69 +404,69 @@ export const Endpoints = {
     /**
      * 某个视频可用的**外挂字幕列表**。
      *
-     * 为什么必须由 core 来列：`.srt` 不是视频，**永远不会出现在 MediaStore 的视频集合里**，
-     * 所以 `/list` 与 `/browse` 都发现不了它；而"哪个字幕属于哪个视频"的匹配规则
-     * （同名、`movie.zh.srt`、`movie - 中文.srt`…）放到客户端就得在每个播放入口各写一遍。
+     * 必须由 core 列举的原因：`.srt` 不是视频，**永远不会出现在 MediaStore 的视频集合里**，
+     * 因此 `/list` 与 `/browse` 都发现不了它；而「哪个字幕属于哪个视频」的匹配规则
+     * （同名、`movie.zh.srt`、`movie - 中文.srt` 等）若放在客户端，就得在每个播放入口各写一遍。
      *
      * query：`path`（视频真实路径）、`scope`
-     *  · `matched`（默认）：只回按文件名判定属于该视频的 → 打开就自动挂载用；
-     *  · `folder`：同目录**所有**字幕 → 手动选字幕用（现实里字幕名和视频名经常对不上）。
+     *  · `matched`（默认）：只返回按文件名判定属于该视频的字幕，用于打开时自动挂载；
+     *  · `folder`：同目录**所有**字幕，用于手动选字幕（实际使用中字幕名与视频名经常不一致）。
      *
-     * ⚠️ **`supported` 不等于"客户端能播"**：它的语义是「core 能转码并给出字幕 MIME」，
-     * 对齐的是 **app 端 media3** 的解析能力。浏览器 `<track>` **只认 WebVTT** ——
-     * srt 靠播放器内部转换、ass/ssa 要额外渲染插件、ttml 没有通用方案。
-     * 所以 web 侧另有一份自己的能力映射（`composables/subtitleFormat.ts`），
-     * 两份**刻意不同**，不要为了"统一"合并 —— 合了必然有一端在说谎。
+     * 注意：**`supported` 不等于「客户端能播放」**。它的语义是「core 能转码并给出字幕 MIME」，
+     * 对齐的是 **app 端 media3** 的解析能力。浏览器 `<track>` **只支持 WebVTT** ——
+     * srt 依赖播放器内部转换、ass/ssa 需要额外渲染插件、ttml 没有通用方案。
+     * 因此 web 侧另有一份自己的能力映射（`composables/subtitleFormat.ts`），
+     * 两份**刻意保持独立**，不得为了「统一」而合并 —— 合并会导致至少一端给出错误结论。
      *
-     * `supported: false` 的条目**照样返回**（MicroDVD `.sub`、SAMI `.smi`）：
-     * 让客户端显示"格式不支持"，而不是让用户对着目录里明明存在的文件怀疑程序瞎了。
+     * `supported: false` 的条目**仍然返回**（MicroDVD `.sub`、SAMI `.smi`）：
+     * 让客户端显示「格式不支持」，而不是让用户面对目录中确实存在的文件怀疑程序漏扫。
      */
     subtitles: '/api/media/subtitles',
     /**
      * 字幕文件内容，**已由 core 统一转成 UTF-8**（响应头显式带 `charset=utf-8`）。
      *
-     * 为什么不直接拉字节流：字幕解析器按 UTF-8 解，而中文字幕现实中大量是 GB18030/Big5，
-     * 直接喂原始字节出来就是一屏乱码，且播放器不提供"换编码重试"的入口。
+     * 不直接拉取字节流的原因：字幕解析器按 UTF-8 解码，而中文字幕大量是 GB18030/Big5，
+     * 直接使用原始字节会得到乱码，且播放器不提供「更换编码重试」的入口。
      * core 把探测与转码收在服务端（BOM → **严格** UTF-8 → GB18030 → Big5 → Latin-1 兜底），
-     * 客户端永远只会见到 UTF-8。**这是本端点存在的全部意义。**
+     * 客户端只会见到 UTF-8。**这正是本端点存在的原因。**
      *
-     * query：`path`（字幕真实路径）。后缀不认回 **415**，读取失败回 500。
+     * query：`path`（字幕真实路径）。后缀无法识别返回 **415**，读取失败返回 500。
      */
     subtitle: '/api/media/subtitle',
     /**
-     * 排除名单：「从音乐库移除」的那一份路径清单（2026-09-23）。**只对 `type=audio` 生效。**
+     * 排除名单：「从音乐库移除」的路径清单。**只对 `type=audio` 生效。**
      *
-     * `GET {excluded}` → `{ paths, total, max, full }`。`max` **不是产品上的取舍**：
-     * 名单会变成 `/list` 查询里的 `_data NOT IN (?,…)`，每条占一个 SQLite 绑定变量（上限 999）。
-     * `full` 是 core 算好的 `total >= max`，客户端据此**提前**提示，别让用户点完才发现没生效。
+     * `GET {excluded}` → `{ paths, total, max, full }`。`max` **不是产品层面的取舍**：
+     * 名单会变成 `/list` 查询中的 `_data NOT IN (?,…)`，每条占用一个 SQLite 绑定变量（上限 999）。
+     * `full` 是 core 计算好的 `total >= max`，客户端据此**提前**提示，避免用户操作后才发现未生效。
      *
      * `POST {exclude}` body `{ paths: string[], action: 'add' | 'remove' | 'clear' }`
      * → `{ success, action, affected, requested, total, full }`。
-     * **`affected < requested` 是客户端唯一能发现"只生效了一部分"的途径**（撞上限被截断）。
+     * **`affected < requested` 是客户端发现「只生效了一部分」的唯一途径**（达到上限被截断）。
      *
-     * 与删文件刻意分成两条接口，不要合并成带 mode 的一条：这一条只改名单、**随时能撤销**；
-     * 删文件是 `POST /api/files/delete`，不可逆。合在一起，"能撤销"这件事在调用点上就消失了。
+     * 本端点与删文件刻意分为两条接口，不得合并成带 mode 的一条：本端点只改名单、**随时可撤销**；
+     * 删文件是 `POST /api/files/delete`，不可逆。合并后「可撤销」这一性质在调用点上就消失了。
      *
-     * 被排除的路径**从 `/list` 的结果里直接消失**，所以客户端拿不到它们的元数据 ——
-     * 管理界面只能按路径显示文件名。写操作成功后 core 失效 `media:*` 缓存并推
-     * `media:playlists`（复用那个 topic，目前没有独立的）。
+     * 被排除的路径**从 `/list` 的结果中直接消失**，因此客户端拿不到它们的元数据 ——
+     * 管理界面只能按路径显示文件名。写操作成功后 core 失效 `media:*` 缓存并推送
+     * `media:playlists`（复用该 topic，目前没有独立 topic）。
      */
     excluded: '/api/media/excluded',
     exclude: '/api/media/exclude',
   },
   /**
-   * 音频歌单（core 侧 `PlaylistRoutes`，2026-09-21）。
+   * 音频歌单（core 侧 `PlaylistRoutes`）。
    * web 侧界面是音乐页里的歌单面板（`views/media/components/PlaylistPanel.vue`）。
    *
-   * 四处必须知道的约定：
-   * ① **曲目以真实路径为标识**，不是 MediaStore 的 id —— id 重扫会变，歌单会整份失效。
+   * 四条必须遵守的约定：
+   * ① **曲目以真实路径为标识**，不是 MediaStore 的 id —— id 在重扫后会变，导致歌单整份失效。
    *    所有加歌 / 移出 / 重排的 body 都是 `{ paths: string[] }`；
-   * ② `GET {root}/:id/items` 回的 item 与 media.list 的 `items[]` **形状完全一致**，
-   *    额外多一个 `missing` 布尔。`missing: true` 的条目 `id` 为 0（媒体库里查不到，
-   *    文件被删 / 卡没插 / 还没被扫到），要画"已失效"占位并禁止播放，
-   *    **不要自动帮用户移出** —— 拔一次卡就清空歌单是不可接受的；
-   * ③ `items` 的顺序就是播放顺序，由用户决定。前端不要再按时间 / 名称排一次；
-   * ④ 移出用 DELETE。body 与 `?path=` 都支持（部分代理会丢 DELETE 的 body），
+   * ② `GET {root}/:id/items` 返回的 item 与 media.list 的 `items[]` **形状完全一致**，
+   *    额外多一个 `missing` 布尔。`missing: true` 的条目 `id` 为 0（媒体库中查不到：
+   *    文件被删 / 存储卡未插入 / 尚未被扫描），必须渲染「已失效」占位并禁止播放，
+   *    **不得自动移出** —— 存储卡短暂拔出就清空歌单是不可接受的；
+   * ③ `items` 的顺序就是播放顺序，由用户决定。前端不得再按时间 / 名称排序；
+   * ④ 移出用 DELETE。body 与 `?path=` 都支持（部分代理会丢弃 DELETE 的 body），
    *    axios 侧走 `{ data: { paths } }`。
    *
    * 失败码全部复用通用码：歌单不存在 404 `NOT_FOUND`、名称空 400 `BLANK_VALUE`、
@@ -482,31 +480,31 @@ export const Endpoints = {
     one: (id: string) => `/api/playlists/${id}`,
   },
   /**
-   * SIM 卡（2026-08-27 web 接入）。
-   * 本组只有 switch 一条：core 原先那个「SIM 信息」查询端点与 dashboard summary 的
-   * device_info.identity 同源却多 15 分钟缓存、phone_type 恒为 GSM、sim_state 更粗糙，
-   * 两端都不该用，T40-15 已在 core 侧删除。
+   * SIM 卡。
+   * 本组只有 switch 一条：core 原先的「SIM 信息」查询端点与 dashboard summary 的
+   * device_info.identity 同源，却多一层 15 分钟缓存、phone_type 恒为 GSM、sim_state 更粗糙，
+   * 两端均不应使用，该端点已在 core 侧删除。
    * PIN/PUK 状态查询端点同样已在 core 侧删除，web 不再展示 PIN 信息。
    */
   sim: {
     switch: '/api/sim/switch',
   },
   /**
-   * 后端 APK 自更新（2026-08-27 web 接入）与前端 ZIP 更新是**两套独立通道**：
-   * update 组管 core APK，web 组管 web 资源，各有自己的 status/state 机。
+   * 后端 APK 自更新与前端 ZIP 更新是**两套独立通道**：
+   * update 组管理 core APK，web 组管理 web 资源，各有独立的 status/state 机。
    *
-   * 注意：本文件里描述端点时不要用反引号包 api 路径通配写法（形如 update 斜杠星号），
-   * 契约校验器会把带引号的 api 路径字面量当成「客户端声明了该端点」，通配路径必然报 P0。
+   * 注意：本文件中描述端点时不得用反引号包裹 api 路径通配写法（形如 update 斜杠星号）：
+   * 契约校验器会把带引号的 api 路径字面量视为「客户端声明了该端点」，通配路径必然报 P0。
    *
-   * 两处坑：①update 组的失败信封是真实 HTTP 码 + `{success,ok,error,message,code}`，
-   * 而 web 组只回 `{error}`；②安装 core 时进程会自杀重启，轮询失败属预期，不能当错误。
+   * 三条约束：① update 组的失败信封是真实 HTTP 码 + `{success,ok,error,message,code}`，
+   * 而 web 组只返回 `{error}`；② 安装 core 时进程会自杀重启，轮询失败属预期，不得当作错误；
+   * ③ **check 不是只读检查**，而是「检查 + 下载 + 校验 + 安装 + 重启」的完整流程，
+   * 调用即开始安装。需要「先确认有无新版本」时必须请求 backendInfo（只读清单 + 版本比对，
+   * 不触碰 core 的更新状态机），确认有新版并取得用户二次确认后才允许调用 check。
+   *
    * frontendInfo 是「手机 App 安装包」信息（读清单，缓存 5 分钟）；core 另有一个带鉴权的
-   * APK 代理下载端点，web 用不了（`<a download>` 带不上 Bearer 头），所以 web 直接给
-   * 清单里的 `apk_url` 上游直链。
-   *
-   * 第三处坑（2026-09-06）：**check 不是「检查」**，它是「检查+下载+校验+安装+重启」一条龙，
-   * 点下去就直接开装。要"先看看有没有新版"必须打 backendInfo（只读清单 + 版本比对，
-   * 不碰 core 的更新状态机），确认有新版并让用户二次确认后才允许打 check。
+   * APK 代理下载端点，web 无法使用（`<a download>` 无法携带 Bearer 头），因此 web 直接使用
+   * 清单中的 `apk_url` 上游直链。
    */
   update: {
     check: '/api/update/check',
@@ -518,10 +516,9 @@ export const Endpoints = {
     /** 只检查 core 自身版本：{ current_version, latest_version, has_update, changelog, apk_url, apk_size, sha256 } */
     backendInfo: '/api/update/backend-info',
     /**
-     * 更新源决策快照（2026-09-22，只读、无入参）：
-     * `{ mode, country, use_mirror, mirror_prefixes }`。
-     * 给 app 用（它的 APK 自更新不走 core 代理，只取决策自己拼 URL）；web 目前不需要它，
-     * 因为 web 不下载任何东西 —— 登记在这里是为了让契约完整、不被当成"野端点"。
+     * 更新源决策快照（只读、无入参）：`{ mode, country, use_mirror, mirror_prefixes }`。
+     * 供 app 使用（其 APK 自更新不经 core 代理，只取决策自行拼接 URL）；web 目前不需要它，
+     * 因为 web 不下载任何内容 —— 登记在此是为了保持契约完整，避免被当作未登记端点。
      */
     source: '/api/update/source',
   },
@@ -534,22 +531,22 @@ export const Endpoints = {
     clear: '/api/web/clear',
   },
   /**
-   * 可选二进制组件（frpc / cloudflared）。2026-10-14 借「资源中心」接入时补登记。
+   * 可选二进制组件（frpc / cloudflared）。
    *
-   * ## 为什么现在才补
-   * 这一组自 2026-09-01 就在用，但调用点（`composables/useComponentInstaller.ts`）写的是
-   * 裸字面量 —— 既有漂移。资源中心是**第二个**消费者，两个调用点各写一遍字面量迟早写岔
-   * （尤其 `/{id}/install` 这种带参路径），所以借这次收进契约。那个 composable 本次**不改**
-   * （它在别的一次改造的范围内），漂移由本组兜住。
+   * ## 登记原因
+   * 该组端点此前已在调用点（`composables/useComponentInstaller.ts`）以裸字面量使用。
+   * 「资源中心」是**第二个**消费者，两个调用点各写一遍字面量必然出现分歧
+   * （尤其 `/{id}/install` 这类带参路径），因此统一登记在本组。
+   * 既有调用点尚未改为引用本组，新增调用点必须引用本组。
    *
-   * ## 三条必须照做的约定
+   * ## 三条必须遵守的约定
    * ① 进度是**真百分比**：`GET /api/components/status` 的 `percent` 是 0-100 的实数；
-   *    而且 `ComponentManager.State` 比 `WebUpdateManager.State` **多一档 `EXTRACTING`**
-   *    （裸 tar.gz 要先解包），前端词表见 `updateShared.ts` 的 `COMPONENT_STATE_META`。
+   *    并且 `ComponentManager.State` 比 `WebUpdateManager.State` **多一档 `EXTRACTING`**
+   *    （裸 tar.gz 需要先解包），前端词表见 `updateShared.ts` 的 `COMPONENT_STATE_META`。
    * ② 上传走 **raw body**（`application/octet-stream`），不是 multipart —— cloudflared
-   *    裸二进制约 36MB，multipart 那套要先在内存里攒一份，低端设备会 OOM。
-   * ③ 上传上限在**列表端点**的 `max_upload_bytes`（core 侧 96MB），**不在** status 端点里；
-   *    前端据此在选文件时就挡掉超限的包（413 要等 body 全推完才读得到，几十 MB 上行白烧）。
+   *    裸二进制约 36MB，multipart 方案需要先在内存中完整缓存，低端设备会 OOM。
+   * ③ 上传上限在**列表端点**的 `max_upload_bytes`（core 侧 96MB），**不在** status 端点中；
+   *    前端据此在选文件时即拦截超限的包（413 需要等 body 全部推送完才能读到，几十 MB 上行会被浪费）。
    */
   components: {
     /** `{ components: [...], max_upload_bytes, id, state, percent, message, manifest_error, ... }` */
@@ -564,16 +561,52 @@ export const Endpoints = {
     upload: (id: string) => `/api/components/${encodeURIComponent(id)}/upload`,
   },
   /**
-   * 配置备份与恢复（2026-09-12 web 接入；Kotlin 侧见同名 Endpoints.Backup）。
+   * 第三方程序商店（core `ProgramRoutes`）。
    *
-   * 四个端点都在鉴权块内。三个坑：
-   * ① 明文导出（`encrypted: false`）**必须**带 `acknowledge_plaintext: true`，否则 400 ——
-   *    包里含设备后台密码与隧道凭据，服务端不接受"悄悄导出"。调用前必须已经向用户
-   *    展示过风险（本页的明文确认弹窗就是那个展示）；
+   * 与上面的 `components` 不是同一类：components 是 frpc/cloudflared 单文件组件，
+   * programs 是带 data/conf/run/state 的第三方 Linux 程序（OpenList 等）。
+   *
+   * 注意单槽运行时：同一时刻最多只有一个程序在运行。start/stop/restart/open 都会校验
+   * 目标 id 与 currentId；UI 侧也必须按「一个活动程序」呈现，不得把列表中的每一行都
+   * 当作可独立启动。
+   */
+  programs: {
+    /** `{ programs, count, native_exec, total_bytes }` */
+    list: '/api/programs',
+    /** 全局安装进度：`{ id, phase, downloaded_bytes, total_bytes, candidate_index, message }` */
+    status: '/api/programs/status',
+    /** 内容目录可选落点：`{ volumes: [{ id, label, path, removable, free_bytes }] }` */
+    volumes: '/api/programs/volumes',
+    detail: (id: string) => `/api/programs/${encodeURIComponent(id)}`,
+    /** POST，标准鉴权；200 accepted，409 = 已有安装任务/程序在运行 */
+    install: (id: string) => `/api/programs/${encodeURIComponent(id)}/install`,
+    upload: (id: string) => `/api/programs/${encodeURIComponent(id)}/upload`,
+    uninstall: (id: string) => `/api/programs/${encodeURIComponent(id)}/uninstall`,
+    start: (id: string) => `/api/programs/${encodeURIComponent(id)}/start`,
+    stop: (id: string) => `/api/programs/${encodeURIComponent(id)}/stop`,
+    restart: (id: string) => `/api/programs/${encodeURIComponent(id)}/restart`,
+    accessMode: (id: string) => `/api/programs/${encodeURIComponent(id)}/access-mode`,
+    /** PATCH；设置弹窗：`access_mode` / `internal_port` / `external_port` / `autostart`。运行中改端口会被 409 拒绝 */
+    settings: (id: string) => `/api/programs/${encodeURIComponent(id)}/settings`,
+    open: (id: string) => `/api/programs/${encodeURIComponent(id)}/open`,
+    /** POST；返回一次性初始口令并消费 */
+    secret: (id: string) => `/api/programs/${encodeURIComponent(id)}/secret`,
+    /** POST；停止后重置管理员口令（旧数据/丢失口令） */
+    resetSecret: (id: string) => `/api/programs/${encodeURIComponent(id)}/reset-secret`,
+    /** GET；程序 stdout/stderr 尾部（可能含 token） */
+    logs: (id: string) => `/api/programs/${encodeURIComponent(id)}/logs`,
+  },
+  /**
+   * 配置备份与恢复（Kotlin 侧见同名 Endpoints.Backup）。
+   *
+   * 四个端点都在鉴权块内。三条约束：
+   * ① 明文导出（`encrypted: false`）**必须**带 `acknowledge_plaintext: true`，否则返回 400 ——
+   *    备份包含设备后台密码与隧道凭据，服务端不接受静默导出。调用前必须已向用户
+   *    展示风险（本页的明文确认弹窗即该展示）；
    * ② preview / import 的 body 是备份包二进制，口令走 `X-Backup-Passphrase` 请求头
-   *    （不要塞进 query：query 会进访问日志与浏览器历史）；
-   * ③ 导出响应是二进制附件，axios 要带 `responseType: 'blob'`，错误响应体也会是 Blob，
-   *    读错误文案前得先 `.text()`（见 BackupPanel 的 readBlobError）。
+   *    （不得放入 query：query 会进入访问日志与浏览器历史）；
+   * ③ 导出响应是二进制附件，axios 需带 `responseType: 'blob'`；错误响应体同样是 Blob，
+   *    读取错误文案前需先 `.text()`（见 BackupPanel 的 readBlobError）。
    */
   backup: {
     info: '/api/backup/info',
@@ -582,13 +615,13 @@ export const Endpoints = {
     import: '/api/backup/import',
   },
   /**
-   * 终端命令历史（2026-09-12 web 接入）。
+   * 终端命令历史。
    *
-   * **只读写历史、不执行命令** —— 历史的真源是设备端实际执行过什么，由 shell / AT 路由
-   * 在执行后写入。import 是把升级前的本地历史一次性搬进来，由客户端保证只调一次
-   * （服务端不去重，重复调只会在列表里多出重复行）。
+   * **只读写历史、不执行命令** —— 真源是设备端实际执行过的命令，由 shell / AT 路由
+   * 在执行后写入。import 用于把升级前的本地历史一次性导入，客户端必须保证只调用一次
+   * （服务端不去重，重复调用只会在列表中产生重复行）。
    *
-   * 分页是 keyset 游标：`limit` / `cursor_ts` / `cursor_id`，响应回
+   * 分页是 keyset 游标：`limit` / `cursor_ts` / `cursor_id`，响应返回
    * `next_cursor_ts` / `next_cursor_id` / `has_more`。
    */
   console: {
@@ -607,33 +640,35 @@ export const Endpoints = {
     root: '/api/speedtest',
     upload: '/api/speedtest/upload',
     relay: '/api/speedtest/relay',
-    /** POST：手动触发一轮定时测速（跑+入库+WS 广播+通知，2026-10-06） */
+    /** POST：手动触发一轮定时测速（执行 + 入库 + WS 广播 + 通知） */
     run: '/api/speedtest/run',
     /** GET ?limit=：定时测速历史（新的在前） */
     history: '/api/speedtest/history',
   },
-  /** 网络诊断工具集（2026-10-06）：ping/DNS/TCP/TTL traceroute，全部无 root */
+  /** 网络诊断工具集：ping/DNS/TCP/TTL traceroute，全部无需 root */
   diagnostic: {
+    /** GET；app / web 共用的默认目标，不各自硬编码 */
+    presets: '/api/diagnostic/presets',
     ping: '/api/diagnostic/ping',
     dns: '/api/diagnostic/dns',
     tcp: '/api/diagnostic/tcp',
     traceroute: '/api/diagnostic/traceroute',
   },
   /**
-   * 诊断中心（`/diagnostics`，2026-10-14）用的**只读探针**端点。
+   * 诊断中心（`/diagnostics`）使用的**只读探针**端点。
    *
-   * ## 为什么不并进上面的 [diagnostic] 组
-   * 那一组是「网络诊断工具集」：四条 POST、必须吃 host 入参、跑的是 ping 与 Java socket，
-   * 语义是"对某个**外部目标**做一次主动探测"。本组是"把**设备自己**的状态读出来"：
-   * 全是 GET、无入参、与目标地址无关。两者的入参形状、失败模式、调用方都不同，
-   * 合成一组会让"这一条要不要 host"变成必须翻实现才知道的隐式问题。
+   * ## 不并入 [diagnostic] 组的原因
+   * 那一组是「网络诊断工具集」：四条 POST、必须传入 host、执行的是 ping 与 Java socket，
+   * 语义是对某个**外部目标**做一次主动探测。本组是读取**设备自身**的状态：
+   * 全部为 GET、无入参、与目标地址无关。两者的入参形状、失败模式、调用方都不同，
+   * 合并成一组会让「该条是否需要 host」变成必须查看实现才能确定的隐式问题。
    *
-   * ## 为什么这里只有七条
-   * `monitor/storage`、`media/status`、`service/status`、`diagnose` 早就在各自的组里，
-   * 诊断中心**直接引用那些既有条目**，不在这里重复登记 —— 同一路径有两处出处必然漂移。
-   * 本组只收本轮**新登记**的：此前 web 侧要么没用过、要么写的是裸字面量
-   * （裸字面量在 `views/network/components/modals/DiagnosticModal.vue` 那批里已经有先例，
-   * 那种写法在契约校验器眼里与没登记等价）。
+   * ## 只登记七条的原因
+   * `monitor/storage`、`media/status`、`service/status`、`diagnose` 已在各自的组中，
+   * 诊断中心**直接引用那些既有条目**，不在此重复登记 —— 同一路径存在两处出处必然出现分歧。
+   * 本组只收此前 web 侧未使用、或仍以裸字面量使用的端点
+   * （裸字面量的先例见 `views/network/components/modals/DiagnosticModal.vue`；
+   * 这种写法在契约校验器看来与未登记等价）。
    */
   diagnostics: {
     /**
@@ -672,11 +707,11 @@ export const Endpoints = {
      * 上一次 core 崩溃：`{ success, ok, crashed, timestamp, summary, file, age_ms, recent, uptime_ms }`。
      *
      * `crashed` 是 `timestamp > 0` 的派生值，**没有 ack 接口**（app 与 web 是两个独立展示端，
-     * 谁先 ack 另一端就再也看不到）—— 去重放各自的本地存储。
+     * 任一端先 ack 都会导致另一端永远看不到）—— 去重由各端存入本地存储。
      *
-     * 2026-10-23 新增 `age_ms` / `recent`：`recent` 是 core 用**自己这台设备的时钟**算出的
-     * 7 天新鲜度窗口（`age_ms` 是原始年龄，-1 = 从未崩溃）。`crashed` 对三个月前的记录也恒为
-     * true，两端只在 `recent` 为真时弹窗；旧 core 不带这两个字段，按"新鲜"处理以保持兼容。
+     * `recent` 是 core 用**自身设备时钟**计算出的 7 天新鲜度窗口（`age_ms` 是原始年龄，
+     * -1 = 从未崩溃）。`crashed` 对三个月前的记录也恒为 true，两端只在 `recent` 为真时弹窗；
+     * 旧 core 不返回这两个字段，此时按「新鲜」处理以保持兼容。
      */
     serviceCrash: '/api/service/crash',
     /**
@@ -688,116 +723,117 @@ export const Endpoints = {
     qosStatus: '/api/qos/status',
     /**
      * 落盘的日志**文件清单**：`{ files: [{ name, size, modified }], total, total_bytes, dir }`，
-     * `name` 是相对路径（`2026-08-28/app.log`，日志按日期分目录）。
+     * `name` 是相对路径（形如 `YYYY-MM-DD/app.log`，日志按日期分目录）。
      *
-     * ⚠ 与下面的 [debugLogs] 那个**内存缓冲**是两回事：那个回 `{ logs, total }` 且带
-     * `limit`/`level`。本页只要文件名与大小（"日志有没有在落盘"），读内容属于设置页的日志面板。
+     * 注意：与下面的 [debugLogs] **内存缓冲**是两回事 —— 后者返回 `{ logs, total }` 且带
+     * `limit`/`level`。本页只需文件名与大小（判断日志是否在落盘），读取内容属于设置页的日志面板。
      */
     debugLogFiles: '/api/debug-logs/files',
     /**
-     * 内存里的调试日志缓冲：`{ logs: string[], total }`，`logs` 是**字符串数组**
+     * 内存中的调试日志缓冲：`{ logs: string[], total }`，`logs` 是**字符串数组**
      * （格式 `HH:mm:ss.SSS [LEVEL] [TAG] message`，不是对象数组），支持 `limit` / `level`。
      *
-     * 登记进来的原因：诊断包（导出 `.txt`）要附最近一段日志，而它是本页第二个消费者。
-     * 设置页 `LogsPanel` 仍在用裸字面量读同一个端点 —— 那是**既有漂移，本批不改那个文件**，
-     * 由本组兜住（同 [components] 组当初的处境）。
+     * 登记原因：诊断包（导出 `.txt`）需要附带最近一段日志，诊断中心是该端点的第二个消费者。
+     * 设置页 `LogsPanel` 目前仍以裸字面量读取同一端点（既有漂移），该调用点不在本组范围内；
+     * 新增调用点必须引用本组。
      */
     debugLogs: '/api/debug-logs',
     /**
      * 设备数据分区占用（`StatFs("/data")`）：`{ total, available, used, usage_percent }`，
-     * `usage_percent` 是 0-100 的浮点数；**读取抛异常时回空对象 `{}`**（不是 null、不是错误码）。
+     * `usage_percent` 是 0-100 的浮点数；**读取抛异常时返回空对象 `{}`**（不是 null、不是错误码）。
      *
-     * 登记进来的原因与 [debugLogFiles] 同一条：此前 web 侧只有「关于」面板的
-     * `SYSTEM_ENDPOINTS.storage` 一个裸字面量在用（那个本地映射的注释写着"contract.ts 目前没有
-     * system 分组"），而诊断中心是本端点的第二个消费者。**同一路径两处出处必然漂移**，
-     * 所以收进这里；「关于」面板那处属既有漂移，本批不改那个文件。
+     * 登记原因与 [debugLogFiles] 相同：web 侧此前只有「关于」面板的
+     * `SYSTEM_ENDPOINTS.storage` 一个裸字面量在使用，诊断中心是该端点的第二个消费者。
+     * **同一路径存在两处出处必然出现分歧**，因此收进本组；「关于」面板的调用点仍以裸字面量读取，
+     * 属既有不一致。
      *
-     * ★ 与 [monitor.storage]（监控数据库各表占用）**不是一回事**：那个答"我们自己的数据占了多少"，
-     * 这个答"设备还有没有地方写"。
+     * 与 [monitor.storage]（监控数据库各表占用）**不是同一概念**：后者回答「自身数据占用了多少」，
+     * 本端点回答「设备是否还有可用空间」。
      */
     diskUsage: '/api/system/storage',
     /**
      * 服务端响应缓存统计：`{ count, max_entries, any_cache_count, total_bytes_estimate, stale, entries[] }`。
      *
-     * 登记进来的原因同 [diskUsage]：设置页 `PerformancePanel`（真源，含清空 / 按模式失效两个
-     * **写入**动作）一直用裸字面量读它，诊断中心现在要读同一份做**只读**健康摘要。
+     * 登记原因同 [diskUsage]：设置页 `PerformancePanel`（真源，含清空 / 按模式失效两个
+     * **写入**动作）一直以裸字面量读取该端点，诊断中心需要读取同一份数据生成**只读**健康摘要。
      *
-     * ⚠ 两个字段值得单独说，它们只在诊断页被展示（core 侧确实会回，见 `ResponseCache.getStats`）：
-     *  · `stale` —— 缓存被标记为"可能过期"（WS 客户端全部断开、内部刷新失败）；
-     *  · `expired_count` —— 已过期但**惰性删除还没触发**的条目数，健康态应远小于 `count`。
-     *    它不在 core 手册的响应示例里，但 `ResponseCache.kt` 会回这个键 —— 别按手册的字段表写死。
+     * 两个字段需要特别注意，它们只在诊断页展示（core 侧确实会返回，见 `ResponseCache.getStats`）：
+     *  · `stale` —— 缓存被标记为「可能过期」（WS 客户端全部断开、内部刷新失败）；
+     *  · `expired_count` —— 已过期但**惰性删除尚未触发**的条目数，健康状态下应远小于 `count`。
+     *    它不出现在 core 手册的响应示例中，但 `ResponseCache.kt` 会返回该键 ——
+     *    不得按手册的字段表写死。
      */
     cacheStats: '/api/cache/stats',
     /**
-     * Core **自身**的权限自检（core `PermissionRoutes`，2026-10-14）。
+     * Core **自身**的权限自检（core `PermissionRoutes`）。
      *
-     * ## 为什么需要它（旧 core 没有这一条）
-     * 「core 需要哪些权限」的真源是 core 自己的 AndroidManifest，而真正执行授予的只有
-     * 安装脚本（`scripts/UFI-AXIS-Core-install-*`）与 Android 安装器 —— **升级 core 时都不会重跑**。
-     * 于是新版本新增的权限没人补：界面在、点了没用、日志里也没有一句"权限不足"。
-     * 客户端自己算不出来（看不见 manifest，也读不到 appop 模式），所以判据必须由 core 现场查：
-     * `requestedPermissions`（要哪些）+ `checkPermission`（runtime 授没授）+
-     * `AppOpsManager`（appop 放没放行）。**不是**"能不能用"的间接猜测。
+     * ## 存在原因
+     * 「core 需要哪些权限」的真源是 core 自身的 AndroidManifest，而实际执行授予的只有
+     * 安装脚本（`scripts/UFI-AXIS-Core-install-*`）与 Android 安装器，**升级 core 时都不会重跑**。
+     * 因此新版本新增的权限无人补充：界面存在、点击无效、日志中也没有「权限不足」记录。
+     * 客户端无法自行推导（既看不到 manifest，也读不到 appop 模式），判据必须由 core 现场查询：
+     * `requestedPermissions`（需要哪些）+ `checkPermission`（runtime 是否授予）+
+     * `AppOpsManager`（appop 是否放行）。**不是**对「能否使用」的间接推测。
      *
      * ## 响应
      * `{ package, sdk_int, uid, shell_method, shell_privileged, requested_count, granted_count,
      *    missing_count, missing[], blocked[], not_applicable[], granted[], checked_at }`。
      *
-     * 三条必读：
-     * ① `missing[]` 与 `blocked[]` **不是一回事**：`missing` 是"缺、且 shell 能补"（每条带
-     *    `fixable: true` 与原文 `fix_command`），`blocked` 是"缺、但 shell 补不了"（签名级权限，
-     *    只有以系统应用方式安装才拿得到）—— 界面上必须分开说，否则用户会去点一个必然失败的按钮；
-     * ② `not_applicable[]` 是**本机不需要**的那一类（`kind` 为 `superseded` / `unknown`）：
+     * 三条必须理解：
+     * ① `missing[]` 与 `blocked[]` **不是同一类**：`missing` 是「缺失且 shell 可补」（每条带
+     *    `fixable: true` 与原文 `fix_command`），`blocked` 是「缺失但 shell 无法补」（签名级权限，
+     *    只有以系统应用方式安装才能获得）—— 界面必须分开表述，否则用户会点击一个必然失败的按钮；
+     * ② `not_applicable[]` 是**本机不需要**的一类（`kind` 为 `superseded` / `unknown`）：
      *    典型是 `WRITE_EXTERNAL_STORAGE`（Android 11 起对 targetSdk≥30 不再授予）与
-     *    `READ_EXTERNAL_STORAGE`（Android 13 起被 `READ_MEDIA_*` 取代）。**既不算缺失也不算
-     *    补不了** —— 把它们报成缺失会让用户去补一个补了也没用的权限（core 侧按
+     *    `READ_EXTERNAL_STORAGE`（Android 13 起被 `READ_MEDIA_*` 取代）。**既不算缺失，也不算
+     *    不可补** —— 报成缺失会让用户去补一个补了也无用的权限（core 侧按
      *    `SUPERSEDED_MAX_SDK` 排除，与安装脚本的 maxSdk 同口径）；
-     * ③ `shell_privileged` 是"能不能补"的前提：`pm grant` 要求 uid 0/2000（core 走内置 adb 自连接），
-     *    通道不可用时本端点会**逐条失败**而不是假装成功。为 false 时界面应当给"先去修 ADB 通道"，
-     *    而不是给补全按钮。
+     * ③ `shell_privileged` 是「能否补全」的前提：`pm grant` 要求 uid 0/2000（core 通过内置 adb
+     *    自连接），通道不可用时本端点会**逐条失败**而不是伪装成功。为 false 时界面应提示
+     *    「先修复 ADB 通道」，而不是提供补全按钮。
      *
-     * ⚠ 旧 core 上这条是 **404**（不是 500）。客户端要把 404 说成"这台 core 还没有自检端点"，
+     * 注意：旧 core 上该端点是 **404**（不是 500）。客户端必须把 404 表述为「该 core 尚无自检端点」，
      * 并给出可手工执行的兜底命令（见 `diagnosticRegistry.ts` 的 `core-permission`）。
      */
     corePermissions: '/api/system/permissions',
     /**
-     * 补全 core 缺失的权限（**写动作**，2026-10-14）。
+     * 补全 core 缺失的权限（**写动作**）。
      *
-     * body 可空；`{ permissions: ['READ_MEDIA_AUDIO', …] }` 只补指定几条（短名/全名都认），
-     * 不传则补全部"缺且可补"的。回 `{ success, attempted, granted, failed, results[],
-     * auto_revoke, permissions }` —— `permissions` 是**补完之后重新探测**的完整快照
-     * （结论是"现在实际是什么"，不是"我们发过命令了"）。
+     * body 可为空；`{ permissions: ['READ_MEDIA_AUDIO', …] }` 只补指定条目（短名与全名均支持），
+     * 不传则补全所有「缺失且可补」的权限。返回 `{ success, attempted, granted, failed, results[],
+     * auto_revoke, permissions }` —— `permissions` 是**补全后重新探测**的完整快照
+     * （表达的是实际状态，而不是「已发送过命令」）。
      *
-     * ## 这是写动作，调用方必须二次确认
-     * 它会改设备状态（`pm grant` / `appops set … allow`），并且**不可由本端点撤销**
-     * （没有 revoke 端点 —— 撤销 core 自己的权限只会让功能坏掉）。想回退只能用原文命令：
+     * ## 写动作，调用方必须二次确认
+     * 本端点会修改设备状态（`pm grant` / `appops set … allow`），且**无法通过本端点撤销**
+     * （没有 revoke 端点 —— 撤销 core 自身的权限只会导致功能失效）。回退只能使用原文命令：
      * runtime 走 `pm revoke <pkg> <perm>`、appop 走 `appops set <pkg> <OP> default`。
      *
-     * 顺带把 `AUTO_REVOKE_PERMISSIONS_IF_UNUSED` 设为 `ignore`（防"补完过一阵又被系统收走"），
-     * 结果在 `auto_revoke` 里回；这一步失败**不算整体失败**。
+     * 本端点还会把 `AUTO_REVOKE_PERMISSIONS_IF_UNUSED` 设为 `ignore`（避免补全后一段时间
+     * 又被系统回收），结果在 `auto_revoke` 中返回；该步骤失败**不计为整体失败**。
      */
     corePermissionsGrant: '/api/system/permissions/grant',
   },
   /**
-   * 赞助感谢名单（`/sponsors`，2026-10-14）。
+   * 赞助感谢名单（`/sponsors`）。
    *
-   * 回 `{ source: 'bundled' | 'remote', updatedAt, sponsors: [...] }`。
-   * **消费方必须假定这份数据可能是坏的**：core 侧那份来自 12 小时一次的后台刷新
-   * （从仓库 main 分支拉 sponsors.json），拉到的内容不经过编译期校验，
-   * 所以 web 与 core 都要按 `sponsors.json` 的字段规则逐条校验，
-   * **不合规整份丢弃**（保留上一层：远端坏了就退内置那份，内置坏了就整块不渲染）。
+   * 返回 `{ source: 'bundled' | 'remote', updatedAt, sponsors: [...] }`。
+   * **消费方必须假定该数据可能无效**：core 侧数据来自 12 小时一次的后台刷新
+   * （从仓库 main 分支拉取 sponsors.json），内容不经过编译期校验，
+   * 因此 web 与 core 都必须按 `sponsors.json` 的字段规则逐条校验，
+   * **不合规时整份丢弃**（保留上一层：远端无效则回退内置版本，内置无效则整块不渲染）。
    *
-   * 字段规则（与仓库根 sponsors.json 的 `_note` 同源）：
-   * 每条**恰好**有 `name`（非空、trim 后 ≤32）或 `anonymous: true` 之一；
+   * 字段规则（与仓库根 `sponsors.json` 的 `_note` 同源）：
+   * 每条**恰好**包含 `name`（非空、trim 后 ≤32）或 `anonymous: true` 之一；
    * `at` 必填且形如 `YYYY-MM` 或 `YYYY-MM-DD`；`version` 必须等于支持值。
    *
-   * 这份数据是**保底 + 更新**两层：页面先用构建期打进 bundle 的那份渲染（0 延迟、不白屏），
-   * 拿到本端点且校验通过才替换。core 不可达就停在保底那份 —— 这正是"保底"的意义。
+   * 数据分为**保底 + 更新**两层：页面先用构建期打入 bundle 的版本渲染（0 延迟、不白屏），
+   * 取得本端点且校验通过后才替换。core 不可达时停留在保底版本 —— 这正是「保底」的含义。
    */
   sponsors: {
     root: '/api/sponsors',
   },
-  /** 套餐档案（2026-10-07 到量/到期融合）：core 侧语义层，goform 无套餐概念 */
+  /** 套餐档案（用量到量与到期融合）：core 侧语义层，goform 无套餐概念 */
   plan: {
     read: '/api/device/plan',
     write: '/api/device/plan',
@@ -851,6 +887,11 @@ export const ACTION_TYPES_ALL: string[] = Object.values(ActionType);
 export const WsChannel = {
   TRAFFIC: 'traffic',
   SIGNAL: 'signal',
+  /**
+   * 实时连接态（`ppp_status`），与 `SIGNAL` 同频推送，不额外请求设备。
+   * 只表示链路态；移动数据开关是用户意图（`mobile_data`），不得混用。
+   */
+  CONNECTION: 'connection',
   CPU: 'cpu',
   MEMORY: 'memory',
   ALERT: 'alert',
@@ -866,9 +907,9 @@ export const WS_CHANNELS_ALL: string[] = Object.values(WsChannel);
  * `data_changed` 帧里 `data.changed` 的取值表（对齐 Kotlin `WsDataTopic`）。
  * 注意这些**不是**频道名，频道只有 `data_changed` 一个。
  *
- * 消费端一律按完整 key 匹配（或按 `namespace:` 前缀分流）。2026-09-21 踩过：
- * core 的 `ResponseCache.invalidate` 把 `device:traffic-limit` 截成了 `device`，
- * 两端的精准刷新全部静默失效。新增取值请同步 Kotlin 侧。
+ * 消费端一律按完整 key 匹配（或按 `namespace:` 前缀分流）：`ResponseCache.invalidate`
+ * 若把 `device:traffic-limit` 截成 `device`，两端的精准刷新会全部静默失效。
+ * 新增取值必须同步 Kotlin 侧。
  */
 export const WsDataTopic = {
   TASK_LIST: 'task:list',
@@ -879,11 +920,11 @@ export const WsDataTopic = {
   /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
   MEDIA_PLAYLISTS: 'media:playlists',
   /**
-   * 2026-10-21：新设备批准请求有变化（core 在登记成功后主动推送，App 收到即拉
-   * `/api/pairing/approvals` 弹窗）。载荷里**没有配对码**，只是一次唤醒。
+   * 新设备批准请求有变化（core 在登记成功后主动推送，App 收到后即请求
+   * `/api/pairing/approvals` 并弹窗）。载荷中**没有配对码**，只是一次唤醒。
    *
-   * Web 端目前**不消费**这个键（它正是发出请求的一方）；这里登记它只为与 Kotlin
-   * `WsDataTopic` 保持一致，避免下次有人对表时以为漏了一个取值。
+   * Web 端目前**不消费**该键（它是发出请求的一方）；在此登记仅为与 Kotlin
+   * `WsDataTopic` 保持一致。
    */
   PAIRING_APPROVALS: 'pairing:approvals',
 } as const;
@@ -891,17 +932,17 @@ export const WsDataTopic = {
 /**
  * 设备能力（`GET /api/device/capabilities` 的 `capabilities` 数组取值）。
  *
- * ## 这是 Kotlin `Capability.wire` 的**手抄镜像**
+ * ## Kotlin `Capability.wire` 的**手工镜像**
  * 单一出处是 `core/contract/src/main/kotlin/com/ufi_axis_core/contract/Capabilities.kt`，
- * 守门测试 `CapabilityWireTest.kt` 把那 11 个字符串逐个写死了。两端镜像的一致性测试
- * **core 侧明确写了"本批不做"**（见那个测试的类注释），所以这里没有编译期约束 ——
- * 改任何一个字符串都要**同时**改 Kotlin 侧，否则 web 会把"设备不支持"看成
- * "我不认识这个能力"（反之亦然），而两者的界面行为正好相反。
+ * 守门测试 `CapabilityWireTest.kt` 把那 11 个字符串逐个写死。两端镜像的一致性测试
+ * 在 core 侧尚未建立（见该测试的类注释），因此这里没有编译期约束 ——
+ * 修改任何一个字符串都必须**同时**修改 Kotlin 侧，否则 web 会把「设备不支持」理解成
+ * 「未知能力」（反之亦然），而两者的界面行为正好相反。
  *
- * ## 为什么是字符串常量而不是收窄的联合类型用在运行时判断上
- * 与服务端保持同一形状：服务端就是 `string[]`。`CapabilityWire` 联合类型只用来标注
- * **我们主动查询的那几个**；服务端多下发的未知 wire 必须能被安静忽略
- * （旧客户端遇到新能力的正确行为是"当它不存在"，不是崩在类型断言上）。
+ * ## 使用字符串常量而非收窄联合类型做运行时判断的原因
+ * 与服务端保持同一形状：服务端返回的就是 `string[]`。`CapabilityWire` 联合类型只用于标注
+ * **我们主动查询的能力**；服务端多下发的未知 wire 必须能被安静忽略
+ * （旧客户端遇到新能力的正确行为是「视其不存在」，而不是在类型断言上崩溃）。
  */
 export const Capability = {
   SMS: 'sms',
@@ -920,13 +961,13 @@ export const Capability = {
 export type CapabilityWire = (typeof Capability)[keyof typeof Capability];
 
 /**
- * 网络模式（T15）：与 Kotlin `NetworkMode` 对齐。
+ * 网络模式：与 Kotlin `NetworkMode` 对齐。
  *
  * 两个取值域必须分清：
  * - **别名集**（客户端提交给 `POST /api/network/mode` 与定时任务 `network_mode.mode`，大小写不敏感）；
  * - **BearerPreference**（设备实际取值，大小写敏感，如 `Only_5G`）—— 只出现在
- *   `GET /api/device/settings` 的回读与 `POST /api/network/mode` 响应的 `bearer` 字段里。
- * 客户端**不要**直接提交 BearerPreference。
+ *   `GET /api/device/settings` 的回读与 `POST /api/network/mode` 响应的 `bearer` 字段中。
+ * 客户端**不得**直接提交 BearerPreference。
  */
 export const NetworkMode = {
   AUTO: 'AUTO',
@@ -952,12 +993,12 @@ export const NetworkModeOptions: ReadonlyArray<{ label: string; value: string }>
  *
  * 与 Kotlin `NetworkMode.fromBearer` 同步：真机/老固件会回 `NR5G_ONLY`、`LTE_NR5G`、
  * `WCDMA_AND_LTE_AND_5G`、小写 `only_5g` 等写法，漏映射会让切换回读永远对不上目标档位。
- * **查表统一走 [bearerToNetworkMode]**（先转大写），不要直接下标取值。
+ * **查表统一走 [bearerToNetworkMode]**（先转大写），不得直接下标取值。
  */
 export const BearerToNetworkMode: Record<string, string> = {
   WL_AND_5G: NetworkMode.AUTO,
   AUTO: NetworkMode.AUTO,
-  // 真机默认档位（2026-09 F50）：语义等于 5G/4G/3G 自动
+  // 真机默认档位（F50）：语义等于 5G/4G/3G 自动
   WCDMA_AND_LTE_AND_5G: NetworkMode.AUTO,
   ONLY_5G: NetworkMode.ONLY_5G,
   NR5G_ONLY: NetworkMode.ONLY_5G,
@@ -979,8 +1020,8 @@ export const BearerToNetworkMode: Record<string, string> = {
 /**
  * 设备回读值 → 别名（大小写不敏感，与 Kotlin `fromBearer` 的 `uppercase()` 对齐）。
  *
- * 设备侧同一档位有多种大小写写法（`Only_5G` / `only_5g`），原来靠在表里各列一遍，
- * 少列一种就静默落到"未知"。认不出来的取值**原样返回**，不伪装成「自动」。
+ * 设备侧同一档位有多种大小写写法（`Only_5G` / `only_5g`），若在表中逐一列举，
+ * 漏列一种就会静默落到「未知」。无法识别的取值**原样返回**，不伪装成「自动」。
  */
 export function bearerToNetworkMode(raw: string): string {
   const key = String(raw ?? '').trim();
@@ -991,13 +1032,13 @@ export function bearerToNetworkMode(raw: string): string {
 /**
  * 切换制式后的「回读确认」预算，与 Kotlin `NetworkMode.SwitchProbe` 逐字对齐。
  *
- * 为什么需要：`POST /api/network/mode` 返回成功只代表**固件收下了**这条命令，设备还要重新
- * 注册网络，这期间 `GET /api/device/settings` 报的**仍是旧档位**。
- * 写完只回读一次就渲染，界面会停在切换前的档位，直到别处偶然又拉了一次设置才自己变对
- * —— 这正是 2026-09-11 真机上"切换生效了但界面还显示旧制式"。
+ * 需要该预算的原因：`POST /api/network/mode` 返回成功只表示**固件已接受**该命令，设备还需
+ * 重新注册网络，此期间 `GET /api/device/settings` 返回的**仍是旧档位**。
+ * 写入后只回读一次就渲染，界面会停留在切换前的档位，直到其它位置偶然再次拉取设置
+ * —— 表现为「切换已生效但界面仍显示旧制式」。
  *
- * 上限是硬要求：每次回读都真打设备（core 写成功后会清 `device:settings` 缓存），
- * 无上限轮询会把 goform 查询许可耗在这一件事上。
+ * 上限是硬要求：每次回读都会真实请求设备（core 写成功后清除 `device:settings` 缓存），
+ * 无上限轮询会耗尽 goform 查询配额。
  */
 export const NetworkModeSwitchProbe = {
   /** 下发成功后到第一次回读的等待（设备写入到查询接口可见约 600ms）。 */
@@ -1020,11 +1061,11 @@ export function modeProbeIntervalMs(attemptNo: number): number {
 }
 
 /**
- * 总时长上限，给**超时文案**用。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。
+ * 总时长上限，用于**超时文案**。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。
  *
- * 2026-10-14：确认器超时那句提示（`useApiOperation.ts` 的
- * `${title}未在预期时间内完成（已等待约 N 秒）…`）就取这个常量算 N —— 文案里的秒数
- * 必须跟着预算走，不要再写死一个数字（改前它是个没人引用的死常量，用户看不到要等多久）。
+ * 确认器超时提示（`useApiOperation.ts` 的
+ * `${title}未在预期时间内完成（已等待约 N 秒）…`）由该常量计算 N —— 文案中的秒数
+ * 必须随预算变化，不得写死具体数字。
  */
 export const NetworkModeSwitchBudgetMs = (() => {
   let total = NetworkModeSwitchProbe.firstDelayMs;
@@ -1033,13 +1074,13 @@ export const NetworkModeSwitchBudgetMs = (() => {
 })();
 
 /**
- * 还要不要再回读一次。与 Kotlin `SwitchProbe.shouldKeepProbing` 同一判据。
+ * 是否需要再次回读。与 Kotlin `SwitchProbe.shouldKeepProbing` 同一判据。
  *
  * @param attemptNo 刚刚完成的是第几次回读（从 1 开始）
  * @param reachedTarget 这次回读到的档位是否已等于目标档位
  *
- * 两个终止条件都是硬的：读到目标就停（成功），次数到顶就停（超时）。
- * 不要再叠一层"按总时长判断"——两套上限并存时谁先到谁生效会变成偶发行为。
+ * 两个终止条件都是硬性的：读到目标即停止（成功），次数达到上限即停止（超时）。
+ * 不得再叠加「按总时长判断」：两套上限并存时，谁先生效会变成偶发行为。
  */
 export function shouldKeepProbingMode(attemptNo: number, reachedTarget: boolean): boolean {
   return !reachedTarget && attemptNo < NetworkModeSwitchProbe.maxAttempts;
@@ -1052,13 +1093,13 @@ export function shouldKeepProbingMode(attemptNo: number, reachedTarget: boolean)
 /**
  * 界面上「加密方式」的一档 = 设备侧 **两个**参数（`auth_mode` + `encryp_type`）。
  *
- * 取值来自 2026-09-22 真机抓包。core 侧 `WifiRoutes.kt` 的 `/wifi/config` 只是把
- * `auth_mode` / `encryp_type` 原样透传给 goform（仅对 OPEN 特判），所以**配对关系由客户端负责**。
+ * 取值来自真机抓包。core 侧 `WifiRoutes.kt` 的 `/wifi/config` 只是把
+ * `auth_mode` / `encryp_type` 原样透传给 goform（仅对 OPEN 特判），因此**配对关系由客户端负责**。
  *
- * 为什么绑成一档而不给两个下拉：这两个参数在设备侧必须配对下发，分开选就能造出
- * 「WPA3PSK + NONE」这种设备收下了却不生效的组合 —— 又一个假开关。
+ * 绑定为一档而不提供两个下拉的原因：这两个参数在设备侧必须配对下发，分开选择可能造出
+ * 「WPA3PSK + NONE」这类设备接受却不生效的组合，等于制造一个无效开关。
  *
- * 注意字段名是 `encryp_type`（**不是** `encrypt_type`），与设备后台同名。
+ * 注意字段名是 `encryp_type`（**不是** `encrypt_type`），与设备后台一致。
  */
 export interface WifiSecurityPreset {
   /** 下拉显示名 */
@@ -1089,23 +1130,23 @@ export function findWifiSecurityPreset(authMode: string | undefined | null): Wif
 }
 
 /**
- * 这一档要不要密码框。
+ * 该档是否需要密码输入框。
  *
- * 表外写法按「要密码」处理：宁可多留一个输入框，也不要把一个已加密的网络
- * 当成开放网络提交（那会把密码丢掉，所有已连设备立刻掉线）。
+ * 表外写法按「需要密码」处理：宁可多保留一个输入框，也不得把已加密网络
+ * 当作开放网络提交（那会丢弃密码，导致所有已连接设备立即掉线）。
  */
 export function wifiSecurityNeedsPassphrase(authMode: string | undefined | null): boolean {
   return findWifiSecurityPreset(authMode)?.needsPassphrase ?? true;
 }
 
 /**
- * 下拉选项 = 4 个权威档位 +（设备当前值如果是表外写法就置顶并入）。
+ * 下拉选项 = 4 个标准档位 +（设备当前值若为表外写法则置顶并入）。
  *
- * 并入当前值是必须的：不然 select 对一台回读 `WPAPSK` 的设备显示空白，
- * 用户随手一保存就把加密方式改成了别的档 —— 他并没有要求改这一项。
+ * 并入当前值是必须的：否则 select 对回读 `WPAPSK` 的设备显示空白，
+ * 用户保存其余字段时会把加密方式一并改成其它档位。
  *
  * 返回**可变数组**：naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，
- * 给 readonly 会在 vue-tsc 里报 TS4104。
+ * 传入 readonly 会在 vue-tsc 中报 TS4104。
  */
 export function wifiSecurityOptions(currentAuthMode?: string | null): Array<{ label: string; value: string }> {
   const base = WifiSecurityPresets.map((p) => ({ label: p.label, value: p.value }));
@@ -1119,8 +1160,8 @@ export function wifiSecurityOptions(currentAuthMode?: string | null): Array<{ la
 /**
  * `max_sta_num` 的合法闭区间 `[1, 10]`。
  *
- * 上限 10 来自用户对**中兴 F50** 的规格结论（2026-09-22），与 core 侧
- * `ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 用它拒 1..10 之外的值）对齐。
+ * 上限 10 对应**中兴 F50** 的规格，与 core 侧
+ * `ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 用它拒绝 1..10 之外的值）对齐。
  * 导出是为了让两个 WiFi 表单的 `n-input-number :min/:max` 与本文件的提交守门共用同一份取值，
  * 而不是各写一个字面量。
  */
@@ -1129,12 +1170,12 @@ export const WifiMaxStaNumRange = { min: 1, max: 10 } as const;
 /**
  * `max_sta_num` 是否可提交。
  *
- * `null` = 留空，语义是「不修改」（core 不传时压根不下发 ApMaxStationNumber）。
- * 其余必须是 [WifiMaxStaNumRange] 闭区间内的整数：越界值 core 侧 `validateApConfig`
- * 会直接 Rejected，在这里先拦下来，用户才看得到原因而不是一句「保存失败」。
+ * `null` = 留空，语义是「不修改」（core 未收到该字段时不下发 ApMaxStationNumber）。
+ * 其余必须是 [WifiMaxStaNumRange] 闭区间内的整数：越界值会被 core 侧 `validateApConfig`
+ * 拒绝，在此提前拦截，用户才能看到具体原因而不是「保存失败」。
  *
- * 这一层是**必须**的：`n-input-number` 的 `:max` 只在用步进器时硬夹，
- * 用户手打 `99` 仍会落进 form。
+ * 这一层是**必须**的：`n-input-number` 的 `:max` 只在用步进器时强制夹取，
+ * 用户手工输入 `99` 仍会进入表单值。
  */
 export function isWifiMaxStaNumAcceptable(v: number | null | undefined): boolean {
   if (v === null || v === undefined) return true;
@@ -1162,7 +1203,7 @@ export const WIFI_MAX_STA_NUM_KEEP_LABEL = '保持不变';
  * 都会被既有判据挡住。
  *
  * 它只活在控件层：过边界要先经 [wifiMaxStaNumForPayload] 折成 `null`，
- * **不许**泄漏到 [WifiConfigFormInput] 之外。
+ * **不得**泄漏到 [WifiConfigFormInput] 之外。
  */
 export const WIFI_MAX_STA_NUM_KEEP_VALUE = 0;
 
@@ -1170,22 +1211,22 @@ export const WIFI_MAX_STA_NUM_KEEP_VALUE = 0;
  * 「最大连接数」下拉的选项 = 「保持不变」([WIFI_MAX_STA_NUM_KEEP_VALUE]) + [WifiMaxStaNumRange]
  * 闭区间内每个整数。
  *
- * 2026-09-22 用户裁决：选择类控件统一成下拉。十选一的值域由**选项本身**守，
- * 用户打不出 `99`，也就没有「打完再被拒」这条路径（`n-input-number` 的 `:max`
- * 只在用步进器时硬夹，手打仍会落进 form）。提交守门 [isWifiMaxStaNumAcceptable]
- * 仍然留着，它同时管「不下发」这个语义，**不许放宽**。
+ * 选择类控件统一使用下拉：十选一的值域由**选项本身**约束，
+ * 用户无法输入 `99`，因此不存在「输入后被拒」这条路径（`n-input-number` 的 `:max`
+ * 只在用步进器时强制夹取，手工输入仍会进入 form）。提交守门 [isWifiMaxStaNumAcceptable]
+ * 仍然保留，它同时约束「不下发」这一语义，**不得放宽**。
  *
  * 首项是**显式**的「保持不变」而不是 `clearable`：与 app 侧
  * `WifiSettingsDialog.kt` 的 `maxStaOptions = listOf<Int?>(null) + WIFI_MAX_STA_RANGE`
  * 两端同构，且显式选项比清除按钮更容易被发现。
  *
- * 值域唯一来源仍是 [WifiMaxStaNumRange]：改上限只改那一处，这里跟着变，
+ * 值域唯一来源仍是 [WifiMaxStaNumRange]：修改上限只需改该处，这里随之变化，
  * 两个 WiFi 弹窗共用这一份，不存在第二份 1..10。
  *
- * 保持 `ReadonlyArray`（取值域常量不该被外部 push / 改写）。naive-ui 的
- * `n-select :options` 形参是 `SelectMixedOption[]`，直接喂 readonly 会报 TS4104 ——
- * 妥协放在调用点：组件里 `[...WifiMaxStaNumOptions]` 浅拷贝一次（setup 里算一次，
- * 不在模板表达式里拷，免得每次渲染都重建 treemate）。
+ * 保持 `ReadonlyArray`（取值域常量不应被外部 push / 改写）。naive-ui 的
+ * `n-select :options` 形参是 `SelectMixedOption[]`，直接传入 readonly 会报 TS4104；
+ * 妥协放在调用点：组件里 `[...WifiMaxStaNumOptions]` 浅拷贝一次（在 setup 中计算一次，
+ * 不在模板表达式中拷贝，避免每次渲染都重建 treemate）。
  */
 export const WifiMaxStaNumOptions: ReadonlyArray<{ label: string; value: number }> = [
   { label: WIFI_MAX_STA_NUM_KEEP_LABEL, value: WIFI_MAX_STA_NUM_KEEP_VALUE },
@@ -1199,11 +1240,11 @@ export const WifiMaxStaNumOptions: ReadonlyArray<{ label: string; value: number 
  * 选择器控件层取值 → [WifiConfigFormInput.maxStaNum]（`null` = 不下发）。
  *
  * 唯一的折算处，两个 WiFi 弹窗共用：哨兵 `0`（「保持不变」）以及任何**不可提交**的值
- * 一律折成 `null`。判据直接复用 [isWifiMaxStaNumAcceptable]，这里不另写一遍区间比较
- * —— 抄第二份迟早与守门漂移。
+ * 一律折成 `null`。判据直接复用 [isWifiMaxStaNumAcceptable]，不另写一遍区间比较
+ * —— 两份实现必然与守门条件产生分歧。
  *
  * 结论：经过这一步之后，`0` 不可能出现在 `max_sta_num` 上（[buildWifiConfigPayload]
- * 还会再判一次），控件层的哨兵到不了 HTTP 报文。
+ * 还会再判一次），控件层的哨兵不会进入 HTTP 报文。
  */
 export function wifiMaxStaNumForPayload(selected: number): number | null {
   return isWifiMaxStaNumAcceptable(selected) ? selected : null;
@@ -1214,18 +1255,18 @@ export function wifiMaxStaNumForPayload(selected: number): number | null {
 // ────────────────────────────────────────────────────────────
 
 /**
- * 频段的**传输取值域**，用设备自己的词汇。
+ * 频段的**传输取值域**，使用设备自身的词汇。
  *
- * 设备侧只有一条命令能真的换频段：
- * `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`（2026-09-22 真机抓包，
- * chip1 = 2.4G、chip2 = 5G），core 把它包成 `POST /api/wifi/band` 收 `{ chip }`。
+ * 设备侧只有一条命令能真正切换频段：
+ * `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`（真机抓包验证，
+ * chip1 = 2.4G、chip2 = 5G），core 将其封装为 `POST /api/wifi/band`，接收 `{ chip }`。
  *
- * 曾经走的 `POST /api/wifi/config` 的 `chip_index` 落到设备的 `setAccessPointInfo` →
- * `ChipIndex`，**设备不认这条路**，用户实测「改了没反应」—— 那条映射已经从
- * [buildWifiConfigPayload] 里摘掉，不要再加回来。
+ * 经 `POST /api/wifi/config` 的 `chip_index` 落到设备 `setAccessPointInfo` → `ChipIndex`
+ * 的方式**设备不接受**（修改后不生效），该映射已从 [buildWifiConfigPayload] 中移除，
+ * 不得重新引入。
  *
- * 只认 `chip1` / `chip2`：**不要**另造 `'1'` / `'2'`（那是读侧展示字段 `chip_index` 的编码）
- * 或 `'2.4G'` / `'5G'`（那是界面文案）作为传输值，core 侧 profile 的 validate 会直接 400。
+ * 只接受 `chip1` / `chip2`：**不得**另造 `'1'` / `'2'`（那是读侧展示字段 `chip_index` 的编码）
+ * 或 `'2.4G'` / `'5G'`（那是界面文案）作为传输值，否则 core 侧 profile 的 validate 会直接返回 400。
  */
 export const WifiBands = ['chip1', 'chip2'] as const;
 export type WifiBand = (typeof WifiBands)[number];
@@ -1251,7 +1292,7 @@ export const WifiBandOptions: ReadonlyArray<{ label: string; value: WifiBand }> 
  * 读侧字段 `chip_index`（`'1'` / `'2'`，由 `normalizeWifiSettings` 从 `wifi_chip` 归一出来，
  * **只用于展示**）→ 写侧取值域 [WifiBand]。
  *
- * 表单要拿「设备当前频段」和用户的选择比对才知道要不要下发，而它手上只有展示字段，
+ * 表单需要用「设备当前频段」与用户的选择比对才能判断是否下发，而它只有展示字段，
  * 这个翻译必须有且只有一处：读侧编码一旦改动，跟着改这里就够了。
  */
 export function wifiBandFromChipIndex(chipIndex: string | null | undefined): WifiBand {
@@ -1275,30 +1316,30 @@ export interface WifiConfigFormInput {
 /**
  * 拼 `POST /api/wifi/config` 的报文。**两个 WiFi 设置表单共用这一份**。
  *
- * 为什么收敛到这里：OPEN 档不能带 `passphrase`、`encryp_type` 不传会被 core 硬写成 CCMP，
- * 这两条规则抄两份就一定会有一份漏掉（原来两个表单各自拼报文，`encryp_type` 也各写了一遍）。
+ * 收敛到此处的原因：OPEN 档不能携带 `passphrase`，`encryp_type` 不传会被 core 强制写成 CCMP；
+ * 这两条规则若各写两份，必然有一份遗漏。
  */
 export function buildWifiConfigPayload(input: WifiConfigFormInput): Record<string, unknown> {
   const preset = findWifiSecurityPreset(input.authMode);
   const payload: Record<string, unknown> = {
     ssid: input.ssid,
     auth_mode: input.authMode,
-    // 预设档用配对值；表外写法把设备回读值原样带回去。
-    // 都不传时 core 会把 EncrypType 硬写成 CCMP，等于改 SSID 顺手改坏了加密方式。
+    // 预设档使用配对值；表外写法把设备回读值原样带回。
+    // 两者都不传时 core 会把 EncrypType 强制写成 CCMP，等同于修改 SSID 时破坏了加密方式。
     encryp_type: preset ? preset.encrypType : input.fallbackEncrypType || undefined,
-    // 语义是「隐藏」：1 = 隐藏（不广播），0 = 广播。别按字面当成「广播开关」。
+    // 语义是「隐藏」：1 = 隐藏（不广播），0 = 广播。不得按字面理解为「广播开关」。
     broadcast_disabled: input.hidden ? 1 : 0,
   };
-  // 频段**不在这里**：`chip_index` 走 setAccessPointInfo，设备不认（用户实测「改了没反应」），
-  // 真正换频段要发 `POST /api/wifi/band`，取值域见 [WifiBands]。
-  // 留空 / 越界都不下发：core 不传时保持设备现值，比下发一个设备会拒的值安全。
-  // 判定复用 [isWifiMaxStaNumAcceptable]（它对 null 返回 true，所以还要排掉 null）——
-  // 在这里另写一遍区间比较，两处迟早会漂移（原来这里写的是 `> 0`，与守门条件各说各话）。
+  // 频段**不在此处**：`chip_index` 走 setAccessPointInfo，设备不接受（修改后不生效）；
+  // 真正切换频段需请求 `POST /api/wifi/band`，取值域见 [WifiBands]。
+  // 留空 / 越界均不下发：core 未收到该字段时保持设备现值，比下发一个设备会拒绝的值更安全。
+  // 判定复用 [isWifiMaxStaNumAcceptable]（它对 null 返回 true，因此还需排除 null）：
+  // 在此另写一遍区间比较会与守门条件产生分歧。
   if (input.maxStaNum !== null && isWifiMaxStaNumAcceptable(input.maxStaNum)) {
     payload.max_sta_num = input.maxStaNum;
   }
-  // 开放网络**不带** passphrase：真机 OPEN 档只发 AuthMode=OPEN + EncrypType=NONE，
-  // 多带一个密码字段会让设备按「有密码」处理，结果是选了开放却连不上。
+  // 开放网络**不携带** passphrase：真机 OPEN 档只发 AuthMode=OPEN + EncrypType=NONE，
+  // 多带一个密码字段会让设备按「有密码」处理，导致选择开放网络后无法连接。
   if (preset ? preset.needsPassphrase : true) payload.passphrase = input.passphrase;
   return payload;
 }
@@ -1320,10 +1361,9 @@ export const WS_MAX_CONNECTIONS = 4;
  * 告警类型 / 级别（注意：core 侧目前**无白名单校验**，这是约定而非强制）。
  * 与 Kotlin `Alerts.Type.ALL` / `Alerts.Level` 对齐。
  *
- * 后三类 2026-09-07 补齐：`AlertEngine` 一直在检测它们（checkTrafficLimit / recordDeviceEvent），
- * 但从未出现在任何清单与 UI 里，而 `typeEnabled` 的判据是 `perType[type] == true`（**缺键 = 关**），
- * 于是这三类在实际使用中是死的。分类开关按本数组渲染，补进来才能真正打开它们。
- * `traffic_limit` 是**按套餐用量百分比**预警，与按绝对 MB 阈值的 `traffic` 是两类，不要混用。
+ * 后三类由 `AlertEngine` 检测（checkTrafficLimit / recordDeviceEvent），但 `typeEnabled` 的判据是
+ * `perType[type] == true`（**缺键 = 关**），因此它们必须出现在本数组中，分类开关才能真正开启。
+ * `traffic_limit` 是**按套餐用量百分比**预警，与按绝对 MB 阈值的 `traffic` 是两类，不得混用。
  */
 export const AlertType = [
   'temperature',
@@ -1418,7 +1458,7 @@ export interface SmsRuleItem {
  * `GET /api/sms/blocked` 的条目（响应里的键是 `records`）。
  *
  * `rule_*` 是命中规则的**快照**：表间无外键，规则删掉之后这条记录还得读得懂，
- * 所以展示命中规则一律用 `rule_pattern`，不要拿 `rule_id` 反查规则表。
+ * 因此展示命中规则一律使用 `rule_pattern`，不得用 `rule_id` 反查规则表。
  */
 export interface SmsBlockedRecord {
   id: number;
@@ -1450,15 +1490,15 @@ export const DeliveryChannel = {
 export type DeliveryChannel = (typeof DeliveryChannel)[keyof typeof DeliveryChannel];
 
 /**
- * 三条渠道（邮件 / Webhook / 本机短信）的 config 响应里**同构**的那一组规则字段。
+ * 三条渠道（邮件 / Webhook / 本机短信）的 config 响应里**同构**的规则字段。
  * 与 Kotlin 侧 `ChannelRules` 对应。
  *
- * 2026-09-10 core 把规则做成同构：每条渠道都有「最低级别」+「每日上限」，字段名与语义
- * 逐字一致，只有取值域刻意不同（见 [daily_limit_min] / [daily_limit_max]）。所以这里只登记
- * **一份**形状，三处配置界面共用 —— 各写一份的结果是三处各自跑偏成三种语义。
+ * 三条渠道的规则同构：每条渠道都有「最低级别」+「每日上限」，字段名与语义逐字一致，
+ * 只有取值域刻意不同（见 [daily_limit_min] / [daily_limit_max]）。因此这里只登记
+ * **一份**形状，三处配置界面共用 —— 各写一份会让三处演变成三种语义。
  *
- * 每条渠道各有**独立的计数器**（core 侧物理隔离在三份 prefs 里）：共享一个计数器意味着
- * 邮件发多了会吃掉本机短信的额度，而那种故障在账面上看不出任何异常。
+ * 每条渠道各有**独立的计数器**（core 侧物理隔离在三份 prefs 中）：共享计数器意味着
+ * 邮件发送量会占用本机短信的额度，而这类故障在统计上看不出异常。
  */
 export interface ChannelRules {
   /**
@@ -1473,14 +1513,14 @@ export interface ChannelRules {
   /**
    * 只读：今天还剩几条。**`daily_limit = 0`（不限）时是 `null`**。
    *
-   * 必须渲染成「不限」而不是 0：0 的含义是"已经用尽"，与"不限"恰好相反 ——
-   * 照着数字显示会把承诺说反，用户会以为这条渠道今天已经不发了。
+   * 必须渲染成「不限」而不是 0：0 的含义是「已经用尽」，与「不限」恰好相反 ——
+   * 按数字直接显示会给出相反结论，用户会误以为该渠道当日不再发送。
    */
   quota_remaining: number | null;
   /**
-   * 级别取值域（下拉按它渲染）。**显示名一律取 core 下发的 `label`**，见 [NotifyLevelOption]：
-   * web 不留第二份级别表 —— 手抄一份时 core 加一档不会报错，只会在界面上少一项，
-   * 而措辞也必然与手机端、与 core 的 `NotifyLevel.label` 各自跑偏（那正是这次改造的起因）。
+   * 级别取值域（下拉按其渲染）。**显示名一律取 core 下发的 `label`**，见 [NotifyLevelOption]：
+   * web 不保留第二份级别表 —— 手抄一份时 core 新增一档不会报错，只会导致界面少一项，
+   * 且措辞必然与手机端、与 core 的 `NotifyLevel.label` 产生分歧。
    */
   levels: NotifyLevelWire[];
   /**
@@ -1492,11 +1532,11 @@ export interface ChannelRules {
 }
 
 /**
- * 级别取值域里的一项：wire name + **core 给的显示名**（Kotlin 侧 `NotifyLevel.name/label`）。
+ * 级别取值域中的一项：wire name + **core 下发的显示名**（Kotlin 侧 `NotifyLevel.name/label`）。
  *
- * 为什么显示名必须由 core 下发：级别名此前在 app 与 web 各有一张映射表，措辞已经分叉
- * （app「一般（info）」vs web「一般及以上（全部通知）」），而同一档在两端叫两个名字
- * 会让人以为那是两道不同的闸。core 的 `NotifyLevel.label` 是唯一真源，客户端只渲染。
+ * 显示名必须由 core 下发的原因：级别名此前在 app 与 web 各有一张映射表，措辞已经分歧，
+ * 同一档在两端使用不同名称会让人误以为是两道不同的限制机制。
+ * core 的 `NotifyLevel.label` 是唯一真源，客户端只负责渲染。
  */
 export interface NotifyLevelOption {
   /** wire name（**小写**），提交给 `min_level` 的就是这个值。 */
@@ -1520,9 +1560,9 @@ export type NotifyLevelWire = string | NotifyLevelOption;
 /**
  * 把 `levels` 归一成 [NotifyLevelOption]。
  *
- * 老 core 只回字符串时**用 wire name 当显示名**（界面上就是 `info` / `warning` / `critical`）——
- * 刻意不在 web 侧补一张兜底级别表：那张表正是这次要拆掉的东西，而它在 core 加一档时
- * 不会报错，只会静默显示错的名字。认不出的形状整项丢掉（不足以渲染成一个可选项）。
+ * 旧 core 只返回字符串时**以 wire name 作为显示名**（界面上即 `info` / `warning` / `critical`）——
+ * 刻意不在 web 侧补充兜底级别表：该表在 core 新增一档时不会报错，只会静默显示错误的名称。
+ * 无法识别的形状整项丢弃（不足以渲染为一个可选项）。
  */
 export function normalizeNotifyLevels(levels: readonly NotifyLevelWire[] | undefined | null): NotifyLevelOption[] {
   if (!Array.isArray(levels)) return [];
@@ -1540,7 +1580,7 @@ export function normalizeNotifyLevels(levels: readonly NotifyLevelWire[] | undef
 /**
  * `daily_limit` 的「不限」哨兵（Kotlin 侧 `ChannelRules.UNLIMITED`）。
  *
- * 用 0 而不是 -1：0 是"一条都不许发"在语义上唯一说不通的取值（那种诉求用渠道开关表达）。
+ * 使用 0 而不是 -1：0 是「一条都不发送」在语义上唯一不合理的取值（该诉求由渠道开关表达）。
  * 本机短信的 `daily_limit_min` 是 1，**它不接受这个值**。
  */
 export const DAILY_LIMIT_UNLIMITED = 0;
@@ -1575,7 +1615,7 @@ export interface MailSendRecord {
   /**
    * 三态结果原值（core DB v12 新增的 `outcome` 列）：`sent` / `failed` / `skipped`。
    *
-   * **不要直接比这个字符串做分类**，走 [deliveryOutcomeOf] —— 那是全 web 唯一一处判定。
+   * **不得直接比较该字符串进行分类**，一律走 [deliveryOutcomeOf] —— 全 web 唯一一处判定。
    */
   outcome?: string;
   /**
@@ -1588,10 +1628,10 @@ export interface MailSendRecord {
    * 结果说明：failed 是摊平的异常链，skipped 是**跳过原因的中文说明**（core 侧 `SkipReason.label`，
    * 如「通知总开关已关闭」「处于免打扰时段」），sent 是空串。
    *
-   * 文案由 core 生成，web 侧**不维护第二张原因映射表** —— 抄一份的结果是 core 加了一种原因、
-   * 这边显示成空白。**也不要按这段文案做分类或高亮**：分类只认 `outcome`（见 [deliveryOutcomeOf]），
-   * 按文案匹配是"core 改一句措辞就静默失效"的判定 —— 2026-09-10 把 `GATE` 拆成
-   * `MASTER_OFF`（通知总开关已关闭）与 `QUIET_HOURS`（处于免打扰时段）正是这样一次改动。
+   * 文案由 core 生成，web 侧**不维护第二张原因映射表** —— 手抄一份会导致 core 新增原因时
+   * 界面显示空白。**也不得按这段文案做分类或高亮**：分类只认 `outcome`（见 [deliveryOutcomeOf]），
+   * 按文案匹配属于「core 调整措辞即静默失效」的判定方式 —— 把 `GATE` 拆成
+   * `MASTER_OFF`（通知总开关已关闭）与 `QUIET_HOURS`（处于免打扰时段）即属此类改动。
    */
   error: string;
   sent_at: number;
@@ -1600,9 +1640,9 @@ export interface MailSendRecord {
 /**
  * `GET /api/sms-forward/history` 的响应（keyset 游标，形态与 [SmsBlockedRecord] 那个列表一致）。
  *
- * `failed_total` / `skipped_total` 都是该渠道的**全表**计数、**互不包含也不能相加**：
- * 跳过是闸门按用户自己的配置拦下的，并进失败数会让人去排一个不存在的故障。
- * 两者也不随 `result` 筛选变化，所以摘要在任何筛选档下都是同一组数字。
+ * `failed_total` / `skipped_total` 都是该渠道的**全表**计数、**互不包含也不得相加**：
+ * 跳过是按用户配置主动拦截，计入失败数会让人排查一个不存在的故障。
+ * 两者也不随 `result` 筛选变化，因此摘要在任何筛选档下都是同一组数字。
  */
 export interface MailHistoryResponse {
   records: MailSendRecord[];
@@ -1621,15 +1661,15 @@ export type DeliveryOutcome = 'sent' | 'failed' | 'skipped';
 /**
  * `GET /api/sms-forward/history/stats` 的响应（三条渠道共用，`channel` 缺失 = 全渠道）。
  *
- * 与 [MailHistoryResponse] 里那三个计数**是同一批数字的另一种切法**，多出来的是
- * `sent` 与 `last_sent_at` —— 列表响应只给 total/failed/skipped，"已发出多少条"得自己减，
- * 而 `total - failed - skipped` 在 core 尚未全量升到 DB v12 的设备上会算错
- * （那种 core 不产生 skipped 行，减出来的数没错，但它也不回这个端点 —— 见下面那句）。
+ * 与 [MailHistoryResponse] 中那三个计数**是同一批数据的另一种切分**，多出的是
+ * `sent` 与 `last_sent_at` —— 列表响应只提供 total/failed/skipped，「已发出多少条」需要自行相减，
+ * 而 `total - failed - skipped` 在 core 尚未升级到 DB v12 的设备上会算错
+ * （这类 core 不产生 skipped 行，相减虽无误，但也不提供本端点）。
  *
- * **老固件没有这条端点**：404 时不要把整张记录视图判成失败，回落到列表响应里的三个计数即可
+ * **旧固件没有该端点**：返回 404 时不得把整张记录视图判为失败，回落到列表响应中的三个计数即可
  * （少显示 `sent` 与 `last_sent_at` 两项，其余功能不受影响）。
  *
- * `last_sent_at` 是全表最后一条记录的时间戳（ms），**不是"最后成功"的时间**；无记录时为 0。
+ * `last_sent_at` 是全表最后一条记录的时间戳（ms），**不是「最后一次成功」的时间**；无记录时为 0。
  */
 export interface DeliveryHistoryStats {
   total: number;
@@ -1642,14 +1682,14 @@ export interface DeliveryHistoryStats {
 /**
  * 把 [MailSendRecord.outcome] 读成三态结论。**全 web 唯一一处分类判定。**
  *
- * `outcome` 缺失时回落到 `success`。这不是兼容 shim，是**外部响应的版本容错**：
+ * `outcome` 缺失时回落到 `success`。这不是兼容 shim，而是**外部响应的版本容错**：
  * web 资源与 core 是两套独立更新的产物（前端 ZIP / core APK 各有自己的更新通道），
- * 用户完全可能 web 已经是这一版、设备上的 core 还是 DB v11（没有 `outcome` 列）。
- * 而这是一个诊断视图 —— 把「失败」渲染成「已发出」是它最不能犯的错，用户会因此停止排查。
- * 老 core 只记发起过投递的行，那时 `success` 就是完整判据，回落不会把任何东西说错
- * （那种 core 根本不产生 skipped 行）。
+ * 可能出现 web 已是当前版本、设备上的 core 仍为 DB v11（没有 `outcome` 列）的情况。
+ * 这是一个诊断视图 —— 把「失败」渲染成「已发出」是它最严重的错误，会导致用户停止排查。
+ * 旧 core 只记录发起过投递的行，此时 `success` 即完整判据，回落不会产生错误结论
+ * （这类 core 根本不产生 skipped 行）。
  *
- * core 全量升到 v12（`outcome` 恒有值）之后，`!outcome` 那两个分支可以删掉。
+ * core 全量升级到 v12（`outcome` 恒有值）之后，`!outcome` 的两个分支可以删除。
  */
 export function deliveryOutcomeOf(record: Pick<MailSendRecord, 'outcome' | 'success'>): DeliveryOutcome {
   switch (record.outcome) {
@@ -1681,8 +1721,8 @@ export const HistoryResultFilter = {
 export const HistoryListLimits = { min: 1, max: 200, default: 50 } as const;
 
 /**
- * /api/config 取值范围。C03 之后 core 会把越界字段回报到 `rejected_fields`（带 min/max），
- * 但客户端仍应先钳制输入框，避免用户提交注定被拒的值。
+ * /api/config 取值范围。core 会把越界字段回报到 `rejected_fields`（带 min/max），
+ * 但客户端仍应先钳制输入框，避免用户提交注定被拒绝的值。
  */
 export const ConfigLimits = {
   port: [1024, 65535],
@@ -1695,12 +1735,12 @@ export const ConfigLimits = {
 } as const;
 
 /**
- * 更新下载方式（2026-09-22：决策下沉 core，见 `docs/update-source-core-plan.md`）。
+ * 更新下载方式（决策下沉至 core）。
  *
- * `update_source_mode` 是**唯一决策字段**，客户端只读写它；「用不用镜像 / 用哪个镜像 /
- * 失败怎么换源」全部由 core 的 `MirrorResolver` 决定。`update_url` 与 `update_mirror_base`
- * 自此是 core 的实现细节（清单地址 + 自定义前缀覆盖），**web 只读不写** ——
- * 写了就等于又多出一个决策方，而那正是这次改造要消除的东西。
+ * `update_source_mode` 是**唯一决策字段**，客户端只读写它；「是否使用镜像 / 使用哪个镜像 /
+ * 失败后如何换源」全部由 core 的 `MirrorResolver` 决定。`update_url` 与 `update_mirror_base`
+ * 是 core 的实现细节（清单地址 + 自定义前缀覆盖），**web 只读不写**：写入等于引入
+ * 第二个决策方，与单一决策源的约定冲突。
  */
 export const UpdateSourceMode = {
   /** 按设备出口地区：`CN` 走镜像，其他地区与「未测出」都直连 */
@@ -1744,7 +1784,7 @@ export function describeConfigReject(r: ConfigRejectedField): string {
 
 /** 单位与哨兵值约定，与 Kotlin 侧 Units.kt 对齐。 */
 export const Units = {
-  /** 时间戳全链路 ms，**不要再 * 1000** */
+  /** 时间戳全链路 ms，**不得再 * 1000** */
   timestamp: 'ms',
   /** rx_speed / tx_speed 是 bytes/s；Mbps = *8/1e6 */
   trafficSpeed: 'bytes/s',
@@ -1762,25 +1802,25 @@ export const Units = {
 
 /**
  * 失败信封：**HTTP 200 也可能是失败**（`{ success: false }` / `{ ok: false, error }`）。
- * core 尚未统一（C01 会做 ok()/fail()），客户端两种键都要认。
+ * core 尚未统一失败信封（`ok()` / `fail()` 尚未落地），客户端必须同时识别两种键。
  */
 export const isFailure = (body: any): boolean =>
   body != null && typeof body === 'object' && (body.success === false || body.ok === false);
 
 /**
- * 设备数据字段契约 —— 与 Kotlin 侧 `DeviceFields.kt` 一一对应的手抄镜像。
+ * 设备数据字段契约 —— 与 Kotlin 侧 `DeviceFields.kt` 一一对应的手工镜像。
  *
- * 这是「不管设备（goform）侧字段怎么变，core 对外始终返回这些 key」的冻结清单。
+ * 这是「无论设备（goform）侧字段如何变化，core 对外始终返回这些 key」的冻结清单。
  * 设备侧的可变性由 core 的 `:core:device-schema` / `DeviceProfile` 吸收，
- * **前端只跟 core 打交道，永远不直接请求 goform**。
+ * **前端只与 core 交互，永远不直接请求 goform**。
  *
  * 三条约定（与 Kotlin 侧同源）：
- * 1. 既有 key 一律不改名（命名混乱是从透传时代继承的历史债，冻结即接受）
- * 2. 新增 key 必须 snake_case
- * 3. 字段缺失 = 该 key 不出现，而不是 `null`
+ * 1. 既有 key 一律不改名（命名不一致是从透传时期继承的历史遗留，冻结即接受）
+ * 2. 新增 key 必须使用 snake_case
+ * 3. 字段缺失 = 该 key 不出现，而不是值为 `null`
  *
  * 每个分组的 `all` 数组会被 `scripts/verify-api-contract.mjs` 与 Kotlin 侧的
- * `ALL` 列表逐项比对，漂移会报 P0。
+ * `ALL` 列表逐项比对，不一致会报 P0。
  */
 export const DeviceFields = {
   version: 'v1',
@@ -1854,7 +1894,7 @@ export const DeviceFields = {
     broadcastSsid: 'wifi_chip1_ssid1_broadcast_ssid',
     maxStaNum: 'wifi_chip1_ssid1_max_sta_num',
     moduleSwitch: 'WiFiModuleSwitch',
-    /** @deprecated core 不再输出（已归一到 moduleSwitch），阶段 4.1 起响应里没有它 */
+    /** @deprecated core 不再输出（已归一到 moduleSwitch），响应中不包含该字段 */
     enable: 'wifi_enable',
     /** @deprecated 同 enable */
     onoffState: 'wifi_onoff_state',
@@ -1890,9 +1930,9 @@ export const DeviceFields = {
   },
 
   /**
-   * POST /api/network/band 响应的半失败透传字段（2026-10-05 R2-4）。
-   * LTE/NR 是两次独立 goform 写，一路成功一路失败时 success 仍为 true
-   * （网络栈已按「新值+旧值」混合状态重启），客户端凭 partial 提示部分未生效。
+   * POST /api/network/band 响应的半失败透传字段。
+   * LTE/NR 是两次独立的 goform 写入；一路成功一路失败时 success 仍为 true
+   * （网络栈已按「新值 + 旧值」的混合状态重启），客户端凭 partial 提示部分未生效。
    */
   bandLockApply: {
     lteApplied: 'lte_applied',
@@ -1931,8 +1971,8 @@ export const DeviceFields = {
 
   /**
    * GET /api/device/traffic-limit
-   * 设备侧的复合串（'470_1024' = 470 GB）与恒为 'MB' 的 unit 字段已被 core 吃掉（core 2.8）：
-   * 读用 limit_value / limit_unit_display / limit_bytes，写用 limit_value + limit_unit。
+   * 设备侧的复合串（'470_1024' = 470 GB）与恒为 'MB' 的 unit 字段已由 core 归一：
+   * 读使用 limit_value / limit_unit_display / limit_bytes，写使用 limit_value + limit_unit。
    */
   trafficLimit: {
     enabled: 'enabled',
@@ -2041,7 +2081,7 @@ export const DeviceFields = {
    * 不属于稳定契约的端点：原始 dump / 无白名单平铺 / 裸 goform 命令通道，
    * 客户端不应依赖其字段名。
    * 两个 device/goform 子路径是 POST 命令通道（默认关，开关 `goform_command_enabled`），
-   * 返回值不归一化也不脱敏 —— 只供排障，不要接到界面上。
+   * 返回值不归一化也不脱敏 —— 只供排查故障，不得接入界面。
    */
   unstableEndpoints: ['api/device/goform', 'api/device/goform/query', 'api/device/goform/set', 'api/wifi/module-info'],
 } as const;
@@ -2051,11 +2091,10 @@ export const DeviceFields = {
 // ────────────────────────────────────────────────────────────
 
 /**
- * 小区信息里的「数组字段」取值：真数组，或**数组的 JSON 字符串**（双重编码，固件而定）。
+ * 小区信息里「数组字段」的取值：真数组，或**数组的 JSON 字符串**（双重编码，取决于固件）。
  *
- * 这段逻辑原来只活在 `CellInfoModal.vue` 的 `parseCellArray()` 里（展示用）。2026-10-14 起
- * 锁小区要走 A 级回读确认，判据同样要解这两个形态 —— 抄第二份迟早与展示那份分叉，
- * 所以收敛到这里（core 侧 `ZteGoformProfile.normalizeCellLists` 也在做同一件事，
+ * 展示与锁小区的回读确认需要解析同样的两种形态，因此统一收敛到此处：
+ * 两份实现必然出现分歧（core 侧 `ZteGoformProfile.normalizeCellLists` 也在做同一件事，
  * 但客户端不能假设所有固件都被 core 归一过，见 `DeviceFields.CellInfo` 的 KDoc）。
  */
 export function parseCellList(v: unknown): any[] {
@@ -2108,7 +2147,7 @@ export function cellInfoLockedCells(raw: unknown): Array<{ pci: string; earfcn: 
   }));
 }
 
-/** `GET /api/weather/config` 配置。`0, 0` 是"未设城市"的哨兵，不是几内亚湾。 */
+/** `GET /api/weather/config` 配置。`0, 0` 是「未设置城市」的哨兵值，不是有效坐标。 */
 export const WeatherUnit = { CELSIUS: 'celsius', FAHRENHEIT: 'fahrenheit' } as const;
 export type WeatherUnit = (typeof WeatherUnit)[keyof typeof WeatherUnit];
 
@@ -2117,7 +2156,7 @@ export type WeatherUnit = (typeof WeatherUnit)[keyof typeof WeatherUnit];
  * 未配置时只有 `{ configured: false, enabled, message }`。
  *
  * `hourly_times` / `hourly_temperatures` 是等长的 24 点数组（index 0 = 当前小时）。
- * `weather_code` 是 WMO 码；中文描述取 `description`，**不要在 web 侧再翻译一次**。
+ * `weather_code` 是 WMO 码；中文描述取 `description`，**不得在 web 侧再次翻译**。
  */
 export interface WeatherNow {
   configured: boolean;

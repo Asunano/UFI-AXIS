@@ -133,6 +133,8 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 import { ConfigLimits } from '@/api/contract';
+import { fetchConfig, updateConfig } from '@/api/config';
+import { toApiErrorMessage } from '@/composables/utils';
 import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
 
 const message = useMessage();
@@ -275,7 +277,7 @@ async function loadQosConfig() {
   if (qosConfigState.value !== 'ok') qosConfigState.value = 'loading';
   qosConfigLoading.value = true;
   try {
-    const { data } = await api.get('/api/config');
+    const data = await fetchConfig(api);
     if (!data) return;
     const qosKeys = [
       'qos_enabled',
@@ -323,14 +325,14 @@ async function saveQos() {
   }
   savingQos.value = true;
   try {
-    const { data } = await api.put('/api/config', payload);
+    const data = await updateConfig(api, payload);
     // 取消（面板已卸载）：直接返回。不能把 undefined 交给 commitConfigSave ——
     // 它会把 payload 里每个键都判成「被拒」并弹一条假报错。
     if (!data) return;
     commitConfigSave(payload, data, qosOriginal, 'QoS 配置', message, loadQosConfig);
     loadQosStatus();
-  } catch (e: any) {
-    message.error(e?.response?.data?.error || '保存失败');
+  } catch (e) {
+    message.error(toApiErrorMessage(e, '保存失败'));
   } finally {
     savingQos.value = false;
   }

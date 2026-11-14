@@ -1,20 +1,18 @@
 <template>
   <GridCard title="网络设置">
     <div class="entry-grid">
-      <!--
-        流量与校准（2026-10-22 合并）：原先「流量限额」「流量校准」两个瓦片 + 两个弹窗，
-        合并成一个入口、一个弹窗（栏内分「限额 / 校准」，见
-        `../modals/TrafficAndCalibrationModal.vue`）。
-
-        为什么合成一个：两者改的是**同一套统计**（设备侧已用流量 / 已用时长）—— 限额决定
-        "到多少提醒 / 断网"，校准把计数器手动改成某个值。两个入口分列会让用户以为它们无关；
-        而两个弹窗都是模态，本来也开不了两个。
-
-        门禁（2026-10-22 随合并不再把整块瓦片置灰）：校准确有 `Capability.TRAFFIC_LIMIT` 门禁，
-        但限额栏读配置 / 看用量即使设备不支持写入也有意义，原先置灰的也只是「流量校准」那一格。
-        所以门禁下沉到弹窗里的校准栏（原因就地显示 + 「执行校准」按钮置灰），
-        本瓦片不再有 `disabled` / `hint` 两个 prop。
-      -->
+      <!-- 2026-11-10：网络模式入口移到「网络信息」右栏（用户要求），本卡剩 6 项。
+           按用途排列（连接 → 流量与局域网 → 排查工具），但**不写分组标题**：
+           组与组之间只留一行间距，靠图标配色区分（绿=连接 / 蓝=配置 / 琥珀=工具）。 -->
+      <EntryTile
+        :icon="LockClosedOutline"
+        title="频段锁定"
+        desc="锁定 LTE / NR 频段"
+        :disabled="bandUnsupported"
+        :hint="bandHint"
+        @click="emit('open-band')"
+      />
+      <EntryTile :icon="CellularOutline" title="基站信息" desc="服务小区 / 邻区 / 锁定" @click="emit('open-cell')" />
       <EntryTile
         :icon="OptionsOutline"
         title="流量与校准"
@@ -27,6 +25,13 @@
         desc="LAN IP / 掩码 / 地址池 / 租约"
         @click="emit('open-lan')"
       />
+      <EntryTile
+        :icon="PulseOutline"
+        title="网络诊断"
+        desc="Ping / DNS / TCP / 路由追踪（点开不自动执行）"
+        @click="emit('open-diag')"
+      />
+      <EntryTile :icon="SpeedometerOutline" title="网速测试" desc="下行 / 上行速率" @click="emit('open-speed')" />
     </div>
   </GridCard>
 </template>
@@ -46,12 +51,27 @@
  * 2026-10-22：瓦片从 3 个回到 2 个（限额 + 校准合并），栅格保持 `auto-fit, minmax(240px, 1fr)`：
  * 整幅卡宽下两项各占一半，窄屏自然回落 2 列 / 1 列，不留空洞。
  */
-import { GitNetworkOutline, OptionsOutline } from '@vicons/ionicons5';
+import {
+  CellularOutline,
+  GitNetworkOutline,
+  LockClosedOutline,
+  OptionsOutline,
+  PulseOutline,
+  SpeedometerOutline,
+} from '@vicons/ionicons5';
 import GridCard from '@/components/GridCard.vue';
 import EntryTile from '@/components/EntryTile.vue';
 
+defineProps<{
+  bandUnsupported: boolean;
+  bandHint: string;
+}>();
+
 const emit = defineEmits<{
-  /** 打开「流量与校准」弹窗（限额 / 校准两栏） */
+  'open-band': [];
+  'open-cell': [];
+  'open-diag': [];
+  'open-speed': [];
   'open-traffic-calibration': [];
   'open-lan': [];
 }>();

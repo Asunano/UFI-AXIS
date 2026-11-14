@@ -30,7 +30,7 @@
       </button>
       <button v-if="queueLength" type="button" @click="emit('clear')">清空</button>
     </div>
-    <div class="qp-list">
+    <div ref="listRef" class="qp-list">
       <button
         v-for="(t, i) in tracks"
         :key="t.path"
@@ -61,6 +61,7 @@
 </template>
 
 <script setup lang="ts">
+import { nextTick, onMounted, ref } from 'vue';
 import { PauseOutline, VolumeHighOutline } from '@vicons/ionicons5';
 import type { PlaylistTrack } from '../playlistShared';
 import { formatDuration, trackArtistOf, trackTitleOf } from '../mediaShared';
@@ -92,6 +93,35 @@ const emit = defineEmits<{
 
 /** 与 MediaAudioView 同一句文案；抽出组件后不再从页面传一个常量进来。 */
 const MISSING_NOTE = '文件已不在媒体库';
+
+const listRef = ref<HTMLElement | null>(null);
+
+/**
+ * 把当前播放项滚到列表中间。
+ *
+ * 打开队列时默认停在第一首，用户得自己往下翻 —— 歌多的时候等于没有定位。
+ * 这里用**相对容器算 scrollTop**，不用 `scrollIntoView`：后者会连带滚动所有祖先容器
+ * （沉浸层是全屏布局，表现为"背景跟着跳一下"）。
+ *
+ * 找不到当前行就什么都不做：队列来自"媒体库平铺 + 分页"，当前歌可能还没加载到这一页，
+ * 也可能被搜索过滤掉了 —— 这两种情况下硬滚会把用户带到错误的位置。
+ */
+function revealCurrent(): void {
+  const list = listRef.value;
+  if (!list) return;
+  const row = list.querySelector<HTMLElement>('.qp-row.is-current');
+  if (!row) return;
+  const listRect = list.getBoundingClientRect();
+  const rowRect = row.getBoundingClientRect();
+  // 让当前行的中线对齐可视区中线；顶部/底部越界时由浏览器夹住
+  list.scrollTop += rowRect.top - listRect.top - (list.clientHeight - rowRect.height) / 2;
+}
+
+onMounted(() => {
+  // 等一帧再量：浮层是 v-if 挂载的，首个 tick 里列表高度可能还是 0；
+  // 用 rAF 而不是 setTimeout，避免在动画帧之外改动滚动位置导致抖动。
+  nextTick(() => requestAnimationFrame(revealCurrent));
+});
 </script>
 
 <style scoped>

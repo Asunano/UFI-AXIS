@@ -223,6 +223,21 @@
         </template>
       </div>
     </GridCard>
+
+    <!-- 破坏性操作的主人口令门（默认关）。
+         刻意不铺到「安装 / 更新 / 隧道」：那些操作可重做，拦它的收益远小于打断用户的成本。
+         2026-10-30 那版把门铺到 40 个端点，实机反馈是「装个程序也要输密码」，所以这版收窄了。 -->
+    <GridCard class="full-width" title="破坏性操作保护">
+      <div class="config-section">
+        <ToggleRow
+          v-model="ownerGateEnabled"
+          label="恢复出厂 / 恢复备份等不可逆操作需配对密码"
+          description="只影响不可逆操作：恢复出厂、恢复默认配置、恢复备份、root shell、自定义 shell 任务、删除全部日志、移除配对设备、解除黑名单。安装 APK、装程序、组件更新、隧道配置不受影响。设备从未设过配对密码时不生效。"
+          :disabled="saving"
+          @update:model-value="onConfigChange"
+        />
+      </div>
+    </GridCard>
   </div>
 </template>
 
@@ -263,6 +278,10 @@ const configMaxDevices = ref(0);
 // 新设备批准 + 三个通知渠道（2026-10-19）。默认全关 —— 与 core 的默认值一致，
 // 老版本 core 不返回这些字段时也回落 false（等价于"功能未启用"，不会误开）。
 const approvalRequired = ref(false);
+// 破坏性操作的主人口令门（默认关）。关着时不打扰任何人；打开后只影响不可逆操作
+//（恢复出厂 / 恢复备份 / root shell / 自定义 shell 任务 / 删日志 / 移除设备 / 解封黑名单），
+// 安装 APK、装程序、组件更新、隧道配置一律不受影响。
+const ownerGateEnabled = ref(false);
 const notifySystem = ref(false);
 const notifyEmail = ref(false);
 const notifyWebhook = ref(false);
@@ -296,6 +315,7 @@ async function loadStatus() {
     configEnabled.value = data.pairing_enabled ?? false;
     configMaxDevices.value = data.pairing_max_devices ?? 0;
     approvalRequired.value = data.pairing_approval_required === true;
+    ownerGateEnabled.value = data.owner_gate_enabled === true;
     notifySystem.value = data.pairing_notify_system === true;
     notifyEmail.value = data.pairing_notify_email === true;
     notifyWebhook.value = data.pairing_notify_webhook === true;
@@ -433,6 +453,7 @@ async function saveConfig() {
       pairing_notify_system: notifySystem.value,
       pairing_notify_email: notifyEmail.value,
       pairing_notify_webhook: notifyWebhook.value,
+      owner_gate_enabled: ownerGateEnabled.value,
     });
     // core 回显生效后的值（无效入参会被忽略），据此回写避免显示未采纳的配置
     if (typeof data?.pairing_enabled === 'boolean') configEnabled.value = data.pairing_enabled;
@@ -441,6 +462,7 @@ async function saveConfig() {
     if (typeof data?.pairing_notify_system === 'boolean') notifySystem.value = data.pairing_notify_system;
     if (typeof data?.pairing_notify_email === 'boolean') notifyEmail.value = data.pairing_notify_email;
     if (typeof data?.pairing_notify_webhook === 'boolean') notifyWebhook.value = data.pairing_notify_webhook;
+    if (typeof data?.owner_gate_enabled === 'boolean') ownerGateEnabled.value = data.owner_gate_enabled;
     message.success('配置已保存');
   } catch (e: any) {
     message.error(e?.response?.data?.error || '保存失败');
@@ -515,42 +537,22 @@ function confirmUnpair() {
  *    从来没有出现过，那一分支是死代码（会让提示永远停在"已移除设备配对"）；
  * 2. 移除的若是**本机**，token 当场失效：主动清态回登录页并说明原因，
  *    否则用户点完只看到界面还开着、下一次请求才被 444 踢走。
+ *
+ * 鉴权只有 Bearer + 设备签名：已配对就说明持有凭据，不再额外要一次配对密码。
  */
 function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
-  const pwd = ref('');
   const label = dev.device_name || dev.fingerprint.slice(0, 16);
   const removingSelf = isSelf(dev.fingerprint);
   dialog.warning({
     title: removingSelf ? '移除本机（会立即退出登录）' : '移除设备',
-    content: () =>
-      h('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
-        h(
-          'span',
-          removingSelf
-            ? `"${label}" 就是当前这个浏览器。移除后本页会立即退出登录，需要用配对密码重新配对。`
-            : `移除设备 "${label}" 的配对需要验证配对密码，移除后该客户端需重新配对。`
-        ),
-        h(NInput, {
-          value: pwd.value,
-          type: 'password',
-          showPasswordOn: 'click',
-          placeholder: '配对密码',
-          'onUpdate:value': (v: string) => {
-            pwd.value = v;
-          },
-        }),
-      ]),
+    content: removingSelf
+      ? `"${label}" 就是当前这个浏览器。移除后本页会立即退出登录，需要用配对密码重新配对。`
+      : `移除设备 "${label}" 的配对，移除后该客户端需重新配对。`,
     positiveText: removingSelf ? '移除并退出' : '移除',
     negativeText: '取消',
     onPositiveClick: async () => {
-      if (!pwd.value) {
-        message.error('请输入配对密码');
-        return false;
-      }
       try {
-        await api.delete(`/api/pairing/devices/${encodeURIComponent(dev.fingerprint)}`, {
-          data: { password: pwd.value },
-        });
+        await api.delete(`/api/pairing/devices/${encodeURIComponent(dev.fingerprint)}`);
         message.success(removingSelf ? '已移除本机配对，请重新配对' : '已移除设备配对');
         if (removingSelf) {
           appStore.setAuthFailureReason('本浏览器已被移出配对列表，请重新配对');
@@ -561,10 +563,7 @@ function confirmUnpairOne(dev: { fingerprint: string; device_name: string }) {
         }
       } catch (e: any) {
         const code = e?.response?.data?.code;
-        if (code === 'MISSING_PASSWORD') message.error('需要提供配对密码');
-        else if (code === 'INVALID_PASSWORD') message.error('配对密码错误');
-        else if (code === 'PASSWORD_LOCKED') message.error('密码错误次数过多，请 15 分钟后重试');
-        else if (code === 'DEVICE_NOT_FOUND') message.error('该设备已不在配对列表中');
+        if (code === 'DEVICE_NOT_FOUND') message.error('该设备已不在配对列表中');
         else message.error(e?.response?.data?.error || '操作失败');
         return false;
       }

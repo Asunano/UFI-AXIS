@@ -1,303 +1,241 @@
 <template>
-  <div class="device-grid">
+  <div class="device-page">
     <!--
-      #/device 单页布局（2026-10-14 第二次调整，用户裁决）：
-        行 1 = SIM 卡      ｜ 电池
-        行 2 = 连接统计     ｜ 温度传感器（摘要）
-        行 3 = 承载 QoS（通栏，只读）
-        行 4 = 设备控制（通栏，六项**平铺**在页面上）
-      本轮变化：
-        · 行 3 新增「承载 QoS」卡（2026-10-14，见卡片内注释：为什么是通栏、为什么不做轮询）；
-        · 设备控制里的 LED / 性能 / Samba / USB / 定时重启 / FOTA **从弹窗搬回页面**（用户要求）；
-        · 「重启设备 / 恢复出厂」移到设置页（设置 › 设备）；
-        · 「流量限额 / LAN·DHCP」移到 #/network；「后台密码 / 原始数据 / 关机」移到设置页。
-      温度传感器仍保留入口 + 弹窗：传感器条目数不定，摊在页面上会把整页高度拉得不可预期，
-      而它平时只需要一个"最高多少度"的摘要。
+      #/device 布局（2026-11-11 按 docs/mockups/device-page-layout-proposal-2026-11-11.html 重排）。
+
+      与原版的差别只在**结构与容器**，读数来源一个没改：
+        行 1 = 设备身份 ｜ 硬件状态   （原来 SIM / 电池 / 温度传感器三张卡）
+        行 2 = 诊断指标（通栏一条）   （原来「连接统计」卡 + 「承载 QoS」通栏卡）
+        行 3 = 设备控制（通栏，3/2/1 列）
+        行 4 = 更多（页面级列表）      （原来「应用管理」通栏卡只装一行）
+
+      为什么要合：连接计数与承载参数都是诊断量，原来各占一张卡 —— 承载 QoS 一条通栏
+      只放 3 个键值对（标签与数值相距 356px），连接统计在 390 视口退化成 5 个满宽瓦片
+      （500px，整页 22%）。合起来后同一批数字占一条带子，窄屏只多两行。
+
+      「更多」不再用卡片：卡片是容器，为一个入口包一层容器不表达任何分组关系。
     -->
-    <!-- 行 1 左：SIM 卡 -->
-    <!-- summary 未到 / summary 已到但 device_info 为 null（core 侧 goform 超时会静默返回 null）/
-         请求失败，三种状态原先在 UI 上长得完全一样（一片空白），用户无法判断是在加载还是读取失败。
-         现在：加载中交给 GridCard 的骨架，失败态带重试，空值才落到「--」 -->
-    <GridCard title="SIM 卡" :loading="simCardState === 'loading'">
-      <template #extra>
-        <n-button size="tiny" quaternary :loading="summaryLoading" @click="refreshSummary">刷新</n-button>
-      </template>
-      <n-empty v-if="simCardState === 'failed'" size="small" description="设备信息读取失败，请刷新重试">
-        <template #extra>
-          <n-button size="tiny" :loading="summaryLoading" @click="refreshSummary">重试</n-button>
-        </template>
-      </n-empty>
-      <div v-else>
-        <InfoRow label="SIM 状态" :value="simState" />
-        <InfoRow label="本机号码" :value="deviceText('identity.msisdn')" />
-        <InfoRow label="IMEI" :value="deviceText('identity.imei')" />
-        <InfoRow label="IMSI" :value="deviceText('identity.imsi')" />
-        <InfoRow label="ICCID" :value="deviceText('identity.iccid')" />
-      </div>
-    </GridCard>
-
-    <!-- 行 1 右：电池 -->
-    <GridCard title="电池" :loading="batteryCardState === 'loading'">
-      <template #extra>
-        <n-button size="tiny" quaternary :loading="summaryLoading" @click="refreshSummary">刷新</n-button>
-      </template>
-      <!-- 与 SIM 卡同理：电量同样只来自 summary，加载中与读取失败必须能区分 -->
-      <n-empty v-if="batteryCardState === 'failed'" size="small" description="设备信息读取失败，请刷新重试">
-        <template #extra>
-          <n-button size="tiny" :loading="summaryLoading" @click="refreshSummary">重试</n-button>
-        </template>
-      </n-empty>
-      <div v-else>
-        <InfoRow
-          label="电量"
-          :value="batteryInfo?.percent != null && batteryInfo.percent >= 0 ? `${batteryInfo.percent}%` : '--'"
-        />
-        <InfoRow label="状态" :value="batteryStatus" />
-        <!-- 电源来源是英文枚举（AC / USB / Wireless / None），不是布尔：
-             原先的 `plugged || '--'` 既把英文键名直接上屏，又把 `None`（没插电这个事实）
-             当成了有效值 —— 判空改成 `!= null`，取值走中文映射（见 batteryPlugged） -->
-        <InfoRow label="电源" :value="batteryPlugged" />
-        <!--
-          2026-10-14 修复：温度/电压此前用**真值判断**（`batteryInfo?.temperature ? … : '--'`），
-          这个写法**两头都错**：
-            ① `0°C` / `0V` 是合法读数，会被误判成"没有数据"（0°C 在寒冷环境完全可能出现）；
-            ② 更关键的是 core 对这两项的**哨兵值是 `-1.0`**（SystemCollector.getBatteryInfo：
-               `temperature > 0` 取真值 → 否则 sysfs 兜底 → 再否则 `-1.0`）。真值判断把 `-1.0`
-               当成"有值"，于是渲染成 `-1°C` / `-0.00V` —— 一个看着像故障的假读数。
-          现在统一成 `!= null && >= 0`：哨兵被挡掉，0 正常显示。
-          同一张卡的「电量」行本来就是这个口径（`percent != null && percent >= 0`），本次是对齐它。
-        -->
-        <InfoRow
-          label="温度"
-          :value="
-            batteryInfo?.temperature != null && batteryInfo.temperature >= 0 ? `${batteryInfo.temperature}°C` : '--'
-          "
-        />
-        <InfoRow
-          label="电压"
-          :value="
-            batteryInfo?.voltage != null && batteryInfo.voltage >= 0 ? `${batteryInfo.voltage.toFixed(2)}V` : '--'
-          "
-        />
-        <!--
-          2026-10-14 新增：core 在 battery map 里带了一个 `supported` 字段
-          （SystemCollector.getBatteryInfo 第一行就填、刻意放在 try 之外 —— 任何一步读取失败它都还在），
-          语义是「这个型号声明了 Capability.BATTERY 吗」。core 的 KDoc 明确写了客户端该怎么用：
-          **读数照原样渲染，只额外提示可信度**（"抹成 -1%"的旧方案已被用户推翻，
-          理由是红色的 -1% 比假的 50% 更像故障）。
-          此前 web 完全没用这个字段 —— 于是 F50 这类无电池机型会一路显示系统恒报的 50%，
-          用户没有任何线索知道这个数字不可信。
-        -->
-        <div v-if="batterySupported === false" class="battery-hint">可能无电池或检测不到</div>
-      </div>
-    </GridCard>
-
-    <!-- 行 2 左：连接统计 -->
-    <!-- 版式走全局 .stat-grid / .stat-cell（原先本文件自写了一套同名的 stat-row/stat-item），
-         只把「等分五格的数字瓦片」这点差异留在 .conn-grid 里 -->
-    <GridCard title="连接统计">
-      <n-spin :show="connectionsLoading">
-        <div class="stat-grid conn-grid">
-          <div class="stat-cell">
-            <span class="stat-label">TCP</span>
-            <span class="stat-value">{{ connections.tcp ?? '--' }}</span>
-          </div>
-          <div class="stat-cell">
-            <span class="stat-label">TCP6</span>
-            <span class="stat-value">{{ connections.tcp6 ?? '--' }}</span>
-          </div>
-          <div class="stat-cell">
-            <span class="stat-label">UDP</span>
-            <span class="stat-value">{{ connections.udp ?? '--' }}</span>
-          </div>
-          <div class="stat-cell">
-            <span class="stat-label">UDP6</span>
-            <span class="stat-value">{{ connections.udp6 ?? '--' }}</span>
-          </div>
-          <div class="stat-cell">
-            <span class="stat-label">Unix</span>
-            <span class="stat-value">{{ connections.unix ?? '--' }}</span>
-          </div>
-        </div>
-        <!-- 失败时保留上一次的读数（它们是"刚才的值"），但要说明这次没读到；
-             全部为 `--` 时若不给这句，就分不出「读失败」与「设备真的没有连接」 -->
-        <div v-if="connectionsFailed" class="client-empty">连接数读取失败，稍后自动重试</div>
-      </n-spin>
-    </GridCard>
-
-    <!-- 行 2 右：温度传感器（摘要 + 入口） -->
-    <GridCard title="温度传感器">
-      <template #extra>
-        <n-button size="tiny" quaternary @click="showThermal = true">查看详情</n-button>
-      </template>
-      <n-spin :show="thermalLoading">
-        <div v-if="maxTempView.visible" class="thermal-summary">
-          <div class="thermal-max">
-            <span class="thermal-max-value" :style="{ color: maxTempView.color }">{{ maxTempView.text }}</span>
-            <span class="thermal-max-label">最高温度</span>
-          </div>
-          <div class="thermal-count">共 {{ thermalZones.length }} 个传感器</div>
-        </div>
-        <!-- 失败与「真的没有传感器」是两件事：原先都渲染成一句「暂无数据」 -->
-        <div v-else-if="thermalFailed" class="client-empty">
-          温度读取失败
-          <n-button size="tiny" quaternary @click="loadThermal">重试</n-button>
-        </div>
-        <!-- 首次读取期间不要先闪一句「没有传感器」 -->
-        <div v-else-if="thermalLoading" class="client-empty">正在读取温度…</div>
-        <div v-else class="client-empty">设备没有返回温度传感器</div>
-      </n-spin>
-    </GridCard>
-
-    <!--
-      行 3（通栏）：承载 QoS（EPS bearer QoS，2026-10-14 新增）。
-
-      ## 为什么是通栏
-      本页是两列栅格，而它是**奇数张**只读信息卡：半宽放在任何一行都会让那一行空出一角
-      （栅格不会把后面的通栏卡塞进剩下的半格），观感就是"缺一块"。通栏 + 卡内三列排布
-      既不留空洞，也不必打乱用户刚裁决过的 SIM/电池/连接统计/温度 四宫格顺序。
-
-      ## 为什么不做 10s 轮询
-      QoS 是低频量：core 侧 `CacheTTL.DEVICE_QOS` 5 分钟缓存，且它是"承载建立时协商出来的
-      参数"，不是流量/温度那样的实时量。跟着本页的 10s 轮询走只会每 10s 打一次必然命中
-      缓存的请求（热点流量白花）。所以：挂载时拉一次 + 卡片右上角的「刷新」手动拉。
-
-      ## 为什么没有能力门禁
-      QoS 与 `Capability.NETWORK_MODE` 不是同一个能力（前者是"读承载参数"，后者是
-      "切换制式"），拿它门禁会误伤。AT 通道在很多机型上不可用是**预期状态**，
-      core 对此回 200 + `available:false`，所以这张卡靠 `available` 字段表达"查不到"。
-    -->
-    <GridCard class="full-width" title="承载 QoS">
-      <template #extra>
-        <!-- 灰字说明而不是报错：AT 通道不可用是机型事实，不是故障（core 也刻意回 200） -->
-        <span v-if="qosLoaded && !qos.available" class="qos-hint">本机型不支持查询</span>
-        <!-- 一次都没读到过：三个 `—` 与「不支持查询」必须分得开，否则用户以为机型不行 -->
-        <span v-else-if="qosFailed" class="qos-hint">读取失败，可点刷新重试</span>
-        <n-button size="tiny" quaternary :loading="qosLoading" @click="loadQos">刷新</n-button>
-      </template>
-      <div class="qos-grid">
-        <!-- 三个值一律走 qosText()：available=false 或缺字段都显示 `—`，绝不显示空串 -->
-        <InfoRow label="QCI" :value="qosText(qos.qci)" />
-        <InfoRow label="下行 AMBR" :value="qosText(qos.downlinkDisplay)" />
-        <InfoRow label="上行 AMBR" :value="qosText(qos.uplinkDisplay)" />
-      </div>
-    </GridCard>
-
-    <!--
-      行 4（通栏）：设备控制 —— 六项**平铺**（2026-10-14 用户要求，不再收进弹窗）。
-      写入逻辑与注释来自原 ControlTab（经 DeviceControlModal 中转），一字未改：
-      那套「成功后乐观置位 → 等 600ms → 静默回读」的范式是这个页面里最容易抄错的部分。
-    -->
-    <GridCard class="full-width" title="设备控制" :loading="controlLoading">
-      <!-- 读失败时六个开关会一起停在「关」—— 那是一个看着像真值的假状态。
-           这里不替换开关（保留上一次读到的值），只说明可信度并给重试 -->
-      <div v-if="controlFailed" class="client-empty">
-        设备设置读取失败，开关状态可能不是最新的
-        <n-button size="tiny" quaternary @click="loadControlSettings()">重试</n-button>
-      </div>
-      <div class="ctl-grid">
-        <ToggleRow
-          label="LED 指示灯"
-          description="控制设备前面板 LED 指示灯的开关"
-          :model-value="controlSettings.ledEnabled"
-          :loading="toggleLoading.led"
-          @update:model-value="(v: boolean) => postToggle('/api/device/led', v, 'led', 'ledEnabled')"
-        />
-        <!--
-          能力门禁（2026-10-14）：性能模式 / Samba / FOTA 三项按设备声明的 `Capability` 门禁。
-
-          ① 判据一律 `caps.unsupported(wire)`（只有"确实不在设备声明的集合里"才 true），
-             **绝不用** `!caps.supports(wire)` —— 后者在"能力集还没拉到 / 那次请求失败"时
-             同样为真，会把这一页所有开关集体变灰（见 stores/capabilities.ts 文件头）。
-          ② 置灰必须给出原因：`n-tooltip` 包住整行，内容是 `caps.hintOf(wire)`
-             （「该机型未声明性能模式能力」这类如实说明，而不是只灰不说）。
-          ③ tooltip 的 trigger 直接就是 ToggleRow 的根节点（不额外套 span）：
-             这样悬停行内任意位置（含标签/说明）都能出提示；套一层的话热区只剩那一层。
-             行的分隔线不依赖 ToggleRow 自带的 :first-child/:last-child，改由 `.ctl-grid`
-             统一接管（双列栅格里那两条不变量本来也不成立，见下方样式注释）。
-        -->
-        <n-tooltip :disabled="!performanceUnsupported" :title="performanceHint">
-          <template #trigger>
-            <ToggleRow
-              label="性能模式"
-              description="启用高性能模式，提升处理器运行频率"
-              :model-value="controlSettings.performanceEnabled"
-              :loading="toggleLoading.performance"
-              :disabled="performanceUnsupported"
-              @update:model-value="
-                (v: boolean) => postToggle('/api/device/performance', v, 'performance', 'performanceEnabled')
-              "
-            />
-          </template>
-        </n-tooltip>
-        <n-tooltip :disabled="!sambaUnsupported" :title="sambaHint">
-          <template #trigger>
-            <ToggleRow
-              label="Samba 共享"
-              description="启用 Samba 文件共享服务，允许局域网访问存储"
-              :model-value="controlSettings.sambaEnabled"
-              :loading="toggleLoading.samba"
-              :disabled="sambaUnsupported"
-              @update:model-value="(v: boolean) => postToggle('/api/device/samba', v, 'samba', 'sambaEnabled')"
-            />
-          </template>
-        </n-tooltip>
-        <ToggleRow
-          label="USB 端口"
-          description="对应设备 usb_port_switch，关闭后 USB 数据口停用"
-          :model-value="controlSettings.usbPortEnabled"
-          :loading="toggleLoading.usbPort"
-          @update:model-value="(v: boolean) => postToggle('/api/device/debug', v, 'usbPort', 'usbPortEnabled')"
-        />
-        <ToggleRow
-          label="定时重启"
-          description="设置每日自动重启时间，保持系统稳定运行"
-          :model-value="controlSettings.restartScheduleEnabled"
-          :loading="toggleLoading.restartSchedule"
-          @update:model-value="(v: boolean) => postRestartSchedule(v)"
-        />
-        <n-tooltip :disabled="!fotaUnsupported" :title="fotaHint">
-          <template #trigger>
-            <ToggleRow
-              label="FOTA 自动检查更新"
-              description="开启后设备按运营商策略自动检查并下载固件更新（UpgMode）"
-              :model-value="controlSettings.fotaAutoUpdate"
-              :loading="toggleLoading.fota"
-              :disabled="fotaUnsupported"
-              @update:model-value="(v: boolean) => setFotaAutoUpdate(v)"
-            />
-          </template>
-        </n-tooltip>
-      </div>
-      <!-- 定时重启时间：只在开启时出现（原来那张独立卡的条件不变） -->
-      <div v-if="controlSettings.restartScheduleEnabled" class="restart-time">
-        <label>每日重启时间</label>
-        <n-input
-          v-model:value="controlSettings.restartScheduleTime"
-          class="restart-input"
-          placeholder="HH:MM"
-          size="small"
-          @blur="postRestartScheduleTime"
-        />
-        <span class="restart-hint">格式 HH:MM，失焦即保存</span>
-      </div>
-    </GridCard>
-
-    <!--
-      应用管理（2026-10-14）：原侧栏独立入口，按"侧栏太多太杂"的重排并入设备页 ——
-      "这台设备上装了哪些包"本来就属于设备本体。
-      用**一行入口**而不是瓦片格：本页只有这一个跳页入口，为它铺一张瓦片卡反而更乱。
-      路由 `/apps` 照旧可直接打开（深链接与收藏不受影响）。
-    -->
-    <GridCard class="full-width" title="应用管理">
-      <button class="app-entry" @click="router.push({ name: 'apps' })">
-        <span class="app-entry-main">
-          <span class="app-entry-title">已安装应用</span>
-          <span class="app-entry-desc">查看 / 安装 / 卸载设备上的应用包</span>
-        </span>
-        <span class="app-entry-arrow">›</span>
+    <div class="page-actions">
+      <!-- 页面级唯一的刷新：原来 SIM / 电池 / QoS 各有一个「刷新」，动作相同却看起来范围不同 -->
+      <button type="button" class="refresh-all" :disabled="refreshing" @click="refreshAll">
+        <span v-if="refreshing" class="refresh-dot" aria-hidden="true" />
+        {{ refreshing ? '刷新中' : '刷新' }}
       </button>
-    </GridCard>
+    </div>
+
+    <div class="device-grid">
+      <!-- 行 1 左：设备身份（SIM 状态 + 本机号码做摘要，三个号码做明细） -->
+      <GridCard title="设备身份" :loading="simCardState === 'loading'">
+        <div v-if="simCardState === 'failed'" class="state-empty">
+          设备信息读取失败
+          <button type="button" class="state-retry" @click="refreshSummary">重试</button>
+        </div>
+        <div v-else>
+          <div class="id-summary">
+            <div class="id-cell">
+              <span class="id-k">SIM 状态</span>
+              <span class="id-state" :class="{ ok: simStateOk }">{{ simState }}</span>
+            </div>
+            <div class="id-cell">
+              <span class="id-k">本机号码</span>
+              <span class="id-v">{{ deviceText('identity.msisdn') }}</span>
+            </div>
+          </div>
+          <InfoRow class="id-row-first" label="IMEI" :value="deviceText('identity.imei')" />
+          <InfoRow label="IMSI" :value="deviceText('identity.imsi')" />
+          <InfoRow label="ICCID" :value="deviceText('identity.iccid')" />
+        </div>
+      </GridCard>
+
+      <!-- 行 1 右：硬件状态（电量/温度升为大数字，电源/电压降为行，传感器入口留在行末） -->
+      <GridCard title="硬件状态" :loading="batteryCardState === 'loading'">
+        <!-- 充放电状态放卡头：它回答「现在是在充还是在放」，与下面那行「电源来源」不是同一件事 -->
+        <template #extra>
+          <span class="hw-hint">{{ batteryStatus }}</span>
+        </template>
+        <div v-if="batteryCardState === 'failed'" class="state-empty">
+          设备信息读取失败
+          <button type="button" class="state-retry" @click="refreshSummary">重试</button>
+        </div>
+        <div v-else>
+          <div class="metrics">
+            <div class="metric">
+              <span class="metric-k">
+                电量
+                <!-- core 的 battery.supported=false = 这个型号没声明电池能力：
+                     读数照常显示，但必须说明可信度（F50 会恒报系统给的 50%） -->
+                <span
+                  v-if="batterySupported === false"
+                  class="metric-note"
+                  title="该机型可能没有电池，读数是系统占位值"
+                >
+                  读数可能不准
+                </span>
+              </span>
+              <span class="metric-v"> {{ batteryPercent ?? '--' }}<small v-if="batteryPercent != null">%</small> </span>
+            </div>
+            <div class="metric">
+              <span class="metric-k">温度</span>
+              <span class="metric-v"> {{ batteryTemp ?? '--' }}<small v-if="batteryTemp != null">°C</small> </span>
+            </div>
+          </div>
+          <InfoRow label="电源" :value="batteryPlugged" />
+          <InfoRow label="电压" :value="batteryVoltageText" />
+          <div class="thermal-line">
+            <span class="thermal-text">{{ thermalSummaryText }}</span>
+            <button type="button" class="thermal-link" @click="showThermal = true">查看详情 ›</button>
+          </div>
+        </div>
+      </GridCard>
+
+      <!-- 行 2：诊断指标（连接计数 + 承载参数） -->
+      <DiagnosticStrip
+        class="full-width"
+        :connections="connections"
+        :qos-qci="qosText(qos.qci)"
+        :qos-down="qosText(qos.downlinkDisplay)"
+        :qos-up="qosText(qos.uplinkDisplay)"
+        :failed-text="diagFailedText"
+        @retry="retryDiagnostics"
+      />
+
+      <!--
+        行 3：设备控制 —— 六项平铺（用户 2026-10-14 要求从弹窗搬回页面）。
+        写入逻辑一字未改：成功后乐观置位 → 等 600ms → 静默回读（见 postToggle）。
+        变化只在版式：三列紧凑行（ToggleRow inline），标签与开关的视线行程收在一列内。
+      -->
+      <GridCard class="full-width" title="设备控制" :loading="controlLoading">
+        <div v-if="controlFailed" class="state-empty">
+          设备设置读取失败，开关状态可能不是最新的
+          <button type="button" class="state-retry" @click="loadControlSettings()">重试</button>
+        </div>
+        <div class="ctl">
+          <div class="ctl-cell">
+            <ToggleRow
+              inline
+              label="LED 指示灯"
+              description="控制设备前面板 LED 指示灯的开关"
+              :model-value="controlSettings.ledEnabled"
+              :loading="toggleLoading.led"
+              @update:model-value="(v: boolean) => postToggle('/api/device/led', v, 'led', 'ledEnabled')"
+            />
+          </div>
+          <!--
+            能力门禁（2026-10-14）：性能模式 / Samba / FOTA 三项按设备声明的 Capability 门禁。
+            ① 判据一律 caps.unsupported(wire)；② 置灰必须给出原因（tooltip 包整行）；
+            ③ tooltip 的 trigger 直接是 ToggleRow 根节点，悬停行内任意位置都能出提示。
+          -->
+          <div class="ctl-cell">
+            <n-tooltip :disabled="!performanceUnsupported" :title="performanceHint">
+              <template #trigger>
+                <ToggleRow
+                  inline
+                  label="性能模式"
+                  description="启用高性能模式，提升处理器运行频率"
+                  :model-value="controlSettings.performanceEnabled"
+                  :loading="toggleLoading.performance"
+                  :disabled="performanceUnsupported"
+                  @update:model-value="
+                    (v: boolean) => postToggle('/api/device/performance', v, 'performance', 'performanceEnabled')
+                  "
+                />
+              </template>
+            </n-tooltip>
+          </div>
+          <div class="ctl-cell">
+            <n-tooltip :disabled="!sambaUnsupported" :title="sambaHint">
+              <template #trigger>
+                <ToggleRow
+                  inline
+                  label="Samba 共享"
+                  description="启用 Samba 文件共享服务，允许局域网访问存储"
+                  :model-value="controlSettings.sambaEnabled"
+                  :loading="toggleLoading.samba"
+                  :disabled="sambaUnsupported"
+                  @update:model-value="(v: boolean) => postToggle('/api/device/samba', v, 'samba', 'sambaEnabled')"
+                />
+              </template>
+            </n-tooltip>
+          </div>
+          <div class="ctl-cell">
+            <ToggleRow
+              inline
+              label="USB 端口"
+              description="对应设备 usb_port_switch，关闭后 USB 数据口停用"
+              :model-value="controlSettings.usbPortEnabled"
+              :loading="toggleLoading.usbPort"
+              @update:model-value="(v: boolean) => postToggle('/api/device/debug', v, 'usbPort', 'usbPortEnabled')"
+            />
+          </div>
+          <div class="ctl-cell">
+            <ToggleRow
+              inline
+              label="定时重启"
+              description="设置每日自动重启时间，保持系统稳定运行"
+              :model-value="controlSettings.restartScheduleEnabled"
+              :loading="toggleLoading.restartSchedule"
+              @update:model-value="(v: boolean) => postRestartSchedule(v)"
+            />
+          </div>
+          <div class="ctl-cell">
+            <n-tooltip :disabled="!fotaUnsupported" :title="fotaHint">
+              <template #trigger>
+                <ToggleRow
+                  inline
+                  label="FOTA 自动检查更新"
+                  description="开启后设备按运营商策略自动检查并下载固件更新（UpgMode）"
+                  :model-value="controlSettings.fotaAutoUpdate"
+                  :loading="toggleLoading.fota"
+                  :disabled="fotaUnsupported"
+                  @update:model-value="(v: boolean) => setFotaAutoUpdate(v)"
+                />
+              </template>
+            </n-tooltip>
+          </div>
+        </div>
+        <!-- 定时重启时间：只在开启时出现（条件与原版一致） -->
+        <div v-if="controlSettings.restartScheduleEnabled" class="restart-time">
+          <label>每日重启时间</label>
+          <n-input
+            v-model:value="controlSettings.restartScheduleTime"
+            class="restart-input"
+            placeholder="HH:MM"
+            size="small"
+            @blur="postRestartScheduleTime"
+          />
+          <span class="restart-hint">格式 HH:MM，失焦即保存</span>
+        </div>
+      </GridCard>
+
+      <!-- 行 4：更多（页面级列表，不再包一张只装一行的卡） -->
+      <section class="more">
+        <h2 class="more-title">更多</h2>
+        <button type="button" class="entry" @click="router.push({ name: 'apps' })">
+          <span class="entry-ico" aria-hidden="true">
+            <svg
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
+              <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
+              <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
+              <rect x="13.5" y="13.5" width="7" height="7" rx="1.6" />
+            </svg>
+          </span>
+          <span class="entry-text">
+            <b>应用管理</b>
+            <span>查看 / 安装 / 卸载设备上的应用包</span>
+          </span>
+          <span class="entry-chev" aria-hidden="true">›</span>
+        </button>
+      </section>
+    </div>
 
     <!-- 温度明细弹窗（本页唯一保留的弹窗；其余入口已按用户要求移出） -->
     <ThermalModal v-model:show="showThermal" />
@@ -318,8 +256,9 @@ import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
 
+import DiagnosticStrip from './components/DiagnosticStrip.vue';
 import ThermalModal from './components/modals/ThermalModal.vue';
-import { formatThermalTemp, normalizeThermalZones, thermalColor, type ThermalZone } from './useThermal';
+import { formatThermalTemp, normalizeThermalZones, type ThermalZone } from './useThermal';
 
 const dashboardStore = useDashboardStore();
 // 能力集在应用壳（DefaultLayout）里已经拉过一次；各页只读同一个 store，
@@ -332,12 +271,10 @@ const message = useMessage();
 const showThermal = ref(false);
 
 // ── SIM / 电池：都来自 dashboard summary ──
-const summaryLoading = ref(false);
 /** 最近一次 summary 补拉是否失败 —— 失败且 store 里也没有快照时，卡片必须说「读失败」而不是一直转圈。 */
 const summaryFailed = ref(false);
 
 async function refreshSummary() {
-  summaryLoading.value = true;
   try {
     const { data } = await api.get('/api/dashboard/summary');
     dashboardStore.updateSummary(data);
@@ -345,8 +282,6 @@ async function refreshSummary() {
   } catch {
     // 不再全静默：布局层会继续周期刷新，但本页两张卡要能说明「这次没读到」
     summaryFailed.value = true;
-  } finally {
-    summaryLoading.value = false;
   }
 }
 
@@ -379,6 +314,9 @@ const simState = computed(() => {
   if (typeof sim === 'string') return sim;
   return sim?.sim_state || '--';
 });
+
+/** `Ready` 才点亮状态点；其它取值（PIN 锁定 / 未插卡 / 未知）保持中性灰，不假装正常。 */
+const simStateOk = computed(() => simState.value.toLowerCase() === 'ready');
 
 /**
  * goform 对「未写入」的字段返回空串而不是缺字段（例如 SIM 未写 MSISDN），
@@ -418,8 +356,26 @@ const batteryPlugged = computed(() => {
   return BATTERY_PLUGGED_LABELS[key] ?? key;
 });
 
+/**
+ * 大数字只渲染**有效读数**：`null` 时模板显示 `--` 且不拼单位。
+ *
+ * 口径与原版一致（`!= null && >= 0`）：core 对温度/电压的哨兵值是 `-1.0`，
+ * 真值判断会把 `-1` 当成有值渲染成「-1°C / -0.00V」——一个看着像故障的假读数。
+ */
+const batteryPercent = computed<number | null>(() => {
+  const v = batteryInfo.value?.percent;
+  return typeof v === 'number' && v >= 0 ? v : null;
+});
+const batteryTemp = computed<number | null>(() => {
+  const v = batteryInfo.value?.temperature;
+  return typeof v === 'number' && v >= 0 ? v : null;
+});
+const batteryVoltageText = computed(() => {
+  const v = batteryInfo.value?.voltage;
+  return typeof v === 'number' && v >= 0 ? `${v.toFixed(2)} V` : '--';
+});
+
 // ── 连接统计 ──
-const connectionsLoading = ref(false);
 /** 最近一次读取是否失败（读数保留，卡片上另给一句说明）。 */
 const connectionsFailed = ref(false);
 // core SystemCollector.getConnectionCounts 返回 tcp / tcp6 / udp / udp6 / unix，IPv6 两项之前没展示
@@ -431,7 +387,6 @@ const connections = reactive<Record<'tcp' | 'tcp6' | 'udp' | 'udp6' | 'unix', nu
   unix: null,
 });
 async function loadConnections() {
-  connectionsLoading.value = true;
   try {
     const { data } = await api.get('/api/device/connections');
     connections.tcp = data.tcp ?? null;
@@ -443,8 +398,6 @@ async function loadConnections() {
   } catch {
     // 读数保留上一次的（10s 轮询里一次抖动不该清空整张卡），但要把失败标出来
     connectionsFailed.value = true;
-  } finally {
-    connectionsLoading.value = false;
   }
 }
 
@@ -477,8 +430,23 @@ const maxTemp = computed<number | null>(() => {
 /** 最高温的展示形态：文案 / 颜色 / 是否渲染一起算好（模板里不必再从可空数字里二次判断）。 */
 const maxTempView = computed(() => {
   const t = maxTemp.value;
-  if (t === null) return { visible: false, text: '', color: '' };
-  return { visible: true, text: formatThermalTemp(t), color: thermalColor(t) };
+  if (t === null) return { visible: false, text: '' };
+  return { visible: true, text: formatThermalTemp(t) };
+});
+
+/**
+ * 传感器摘要（原「温度传感器」卡的那两行，搬进硬件状态卡的行末）。
+ *
+ * 失败与「真的没有传感器」必须分开说：原版两张卡各自判过这两态，
+ * 合并后仍然保留同样的四分法，只是空间从一张卡缩到一行。
+ */
+const thermalSummaryText = computed(() => {
+  if (maxTempView.value.visible) {
+    return `传感器 ${thermalZones.value.length} 个 · 最高 ${maxTempView.value.text}`;
+  }
+  if (thermalFailed.value) return '温度读取失败';
+  if (thermalLoading.value) return '正在读取温度…';
+  return '设备没有返回温度传感器';
 });
 
 // ── 承载 QoS（EPS bearer QoS）──
@@ -492,9 +460,7 @@ const maxTempView = computed(() => {
 //   ② `*_display` 是 core 已经换算好的文案（如 `500 Mbps`），**直接用**，
 //      不在这里把 kbps 再换算一次 —— 两端各写一份换算必然分叉（一个显示 500 Mbps、
 //      一个显示 500.0 Mbps）。
-const qosLoading = ref(false);
 /** 是否已经拿到过一次响应（用于区分"还没拉到"与"拉到了但查不到"，后者才显示灰字说明）。 */
-const qosLoaded = ref(false);
 /** 最近一次读取是否失败：一次都没读到过时，三个 `—` 不能被读成「机型不支持」。 */
 const qosFailed = ref(false);
 const qos = reactive({
@@ -505,7 +471,6 @@ const qos = reactive({
 });
 
 async function loadQos() {
-  qosLoading.value = true;
   try {
     const { data } = await api.get(Endpoints.device.qos);
     // 组件卸载导致请求被取消时 data 是 undefined：此时**不能**把 available 写成 false，
@@ -515,13 +480,10 @@ async function loadQos() {
     qos.qci = data.qci ?? '';
     qos.downlinkDisplay = data.downlink_display ?? '';
     qos.uplinkDisplay = data.uplink_display ?? '';
-    qosLoaded.value = true;
     qosFailed.value = false;
   } catch {
     // 仍不弹 toast（AT 不可用是预期状态），但记下来让卡片能区分「没读到」与「不支持」
     qosFailed.value = true;
-  } finally {
-    qosLoading.value = false;
   }
 }
 
@@ -530,6 +492,40 @@ function qosText(v: string | number): string {
   if (!qos.available) return '—';
   const s = String(v ?? '').trim();
   return s === '' ? '—' : s;
+}
+
+/** 诊断条的行末说明：两个端点各自可能失败，合并成一句，避免两行噪音。 */
+const diagFailedText = computed(() => {
+  const parts: string[] = [];
+  if (connectionsFailed.value) parts.push('连接数读取失败');
+  if (qosFailed.value) parts.push('承载参数读取失败');
+  return parts.join('；');
+});
+
+/** 诊断条上的「重试」：只补拉失败的那一侧，不顺手把没失败的那半也打一遍。 */
+function retryDiagnostics() {
+  if (connectionsFailed.value) loadConnections();
+  if (qosFailed.value) loadQos();
+}
+
+// ── 页面级刷新 ──
+// 原来 SIM / 电池 / QoS 三个「刷新」按钮调用的是同一批端点，看起来却像三种范围。
+// 现在只有一个入口：把这一页所有来源都拉一遍（读数、连接、温度、控制项、承载）。
+const refreshing = ref(false);
+async function refreshAll() {
+  if (refreshing.value) return;
+  refreshing.value = true;
+  try {
+    await Promise.allSettled([
+      refreshSummary(),
+      loadConnections(),
+      loadThermal(),
+      loadControlSettings(true),
+      loadQos(),
+    ]);
+  } finally {
+    refreshing.value = false;
+  }
 }
 
 // ── 设备控制的能力门禁 ──
@@ -724,174 +720,283 @@ useInterval(() => {
 </script>
 
 <style scoped>
-/* 两列（2026-10-14 用户裁决：「改成 2 列布局，当前下方即可还是一行」）：
-     行 1 = SIM 卡 ｜ 电池；行 2 = 连接统计 ｜ 温度传感器。
-   这四张都是"读一个值"的只读卡，成对放两列才不浪费横向空间；
-   行 3 起（承载 QoS / 设备控制 / 应用管理）通栏 —— 用户明确下方保持一行。
+/*
+  设备页版式（2026-11-11，对应 docs/mockups/device-page-layout-proposal-2026-11-11.html）
 
-   `align-items: start` 而不是 stretch：两列高度天然不齐（SIM 五行、电池四到五行、
-   连接统计一行、温度摘要两行），stretch 会把短卡拉到与长卡同高、卡内留一大片空白；
-   start 让每张卡按自己的内容收口 —— 上沿对齐、下沿参差，这是用户点名的做法。
+  两列断点从 768 提到 900：1024 时两列各 367px 已经成立，而 768 时可用 734px
+  却被压成单列（页面 1947px，只比 390 手机短 355px）。900 是「两张卡各 ≥400px」的下界。
 
-   通栏用 :deep() 而不是裸类名：类名落在子组件（GridCard）根节点上。 */
+  小字用公共 --text-secondary(#666)：全站 --text-muted(#999) 在白底只有 2.85:1，
+  这一页的说明文字是 11–12px，达不到 AA 4.5:1；--text-secondary 在明暗两档都 ≥5:1。
+  全站令牌没动 —— 那是另一轮。
+*/
+.device-page {
+  /* ui-baseline-allow: 本页两个小字链接/警示色是公共色对比度不足的替代，取值同账单页 */
+  /* 小字一律用公共 --text-secondary(#666)：全站 --text-muted(#999) 在白底只有 2.85:1，
+     这一页的说明文字是 11–12px，达不到 AA 4.5:1。--text-secondary 本就 ≥5:1，
+     不需要再造一个本页私有的灰色令牌。 */
+  /* 两个本页局部色，都是公共色在浅底做小字时对比度不够的替代：
+     · --dv-link：公共 --accent-color(#18a058) 约 3.2:1，12px 链接达不到 AA 4.5:1；
+     · --dv-warn：公共 --warning(#f0a020) 约 1.9:1，11px 的「读数可能不准」不可读。
+     取值与账单页 --bill-warn 同一档。除此之外的字体/间距/表面色全部走公共令牌。 */
+  --dv-link: #0f7a43;
+  --dv-warn: #b45309;
+  display: grid;
+  gap: var(--space-4);
+}
+.dark .device-page {
+  /* ui-baseline-allow: 暗色档的链接/警示色对应取值，浅底那组在深底不可读 */
+  --dv-link: #4ade80;
+  --dv-warn: #f0a020;
+}
+
+/* ── 页面级刷新 ── */
+.page-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: calc(var(--space-2) * -1);
+}
+.refresh-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  appearance: none;
+  border: 1px solid var(--border-subtle);
+  background: var(--card-bg);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--font-sm);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.refresh-all:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-hover);
+}
+.refresh-all:disabled {
+  cursor: default;
+  color: var(--text-secondary);
+}
+.refresh-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  border-top-color: transparent;
+  animation: dv-spin 0.8s linear infinite;
+}
+@keyframes dv-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── 栅格 ── */
 .device-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--space-4);
   align-items: start;
 }
+/* 通栏：类名落在子组件（GridCard）根节点上，所以要 :deep() 穿透 */
 .device-grid > :deep(.full-width) {
   grid-column: 1 / -1;
 }
-
-/* ── 连接统计 ──
-   版式基本走全局 `.stat-grid / .stat-cell / .stat-label / .stat-value`
-   （原先本文件自己写了一份同名的 stat-row / stat-item），这里只覆盖差异：
-   等分五列、瓦片底色、数字档位。scoped 选择器 (0,2,0) 压过 main.css 的 (0,1,0)，
-   与源码顺序无关（与 WifiInfoCard 的 .wifi-stat-grid 同一做法）。 */
-.conn-grid {
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: var(--space-4);
-}
-.conn-grid .stat-cell {
-  align-items: center;
-  padding: var(--space-3) var(--space-2);
-  background: var(--page-bg);
-  border-radius: var(--radius-sm);
-}
-.conn-grid .stat-label {
-  margin-bottom: var(--space-1);
-}
-.conn-grid .stat-value {
-  font-size: var(--font-xl);
-  font-weight: 700;
+@media (max-width: 900px) {
+  .device-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
-/* 应用管理入口：一行可点，右侧箭头提示"会跳走"（与页面上那些开关区分开） */
-.app-entry {
-  display: flex;
-  align-items: center;
+/* ── 设备身份 ── */
+.id-summary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   gap: var(--space-3);
-  width: 100%;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: transparent;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  text-align: left;
-  transition:
-    border-color 0.15s,
-    background 0.15s;
+  padding-bottom: var(--space-3);
 }
-.app-entry:hover {
-  border-color: var(--accent-color);
-  background: var(--surface-hover);
-}
-.app-entry-main {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  flex: 1;
+.id-cell {
+  display: grid;
+  gap: 2px;
   min-width: 0;
 }
-.app-entry-title {
+.id-k {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+}
+.id-v {
   font-size: var(--font-md);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* SIM 状态：只有 Ready 才点亮状态点（中性灰 = 未知/未就绪，不假装正常） */
+.id-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: var(--font-base);
   font-weight: 600;
   color: var(--text-primary);
 }
-.app-entry-desc {
-  font-size: var(--font-sm);
-  color: var(--text-muted);
+.id-state::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-secondary);
 }
-.app-entry-arrow {
-  font-size: var(--font-xl);
-  line-height: 1;
-  color: var(--text-muted);
-  flex-shrink: 0;
+.id-state.ok::before {
+  background: var(--accent-color);
 }
-/* 「可能无电池或检测不到」—— core 的 battery.supported === false 时才出现。
-   与只读说明同档（12px / text-muted）：它是可信度说明、不是错误，
-   所以刻意不用 error 色，避免把"这台机器本来就没电池"渲染成故障。 */
-.battery-hint {
-  margin-top: var(--space-1);
-  font-size: var(--font-sm);
-  color: var(--text-muted);
-}
-
-/* ── 承载 QoS ──
-   通栏卡里三列排布：三行 InfoRow 若整幅拉满，会变成"标签贴最左、值贴最右"的
-   一眼扫不到一起的两端（本页半宽卡的 InfoRow 间距是合适的，通栏不合适）。 */
-.qos-grid {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 0 var(--space-6);
-}
-/* InfoRow 自带的分隔线只给"非末行"，那是为竖排列表设计的；这里是**一行三格**，
-   末格没有线会看着像漏画。选择器刻意比子组件里的 `.info-row:last-child` 更具体
-   （多一个 :last-child，0-4-0 > 0-3-0），这样不用 !important 也能补齐。 */
-.qos-grid :deep(.info-row:last-child) {
-  border-bottom: 1px solid var(--border-subtle);
-}
-/* 「本机型不支持查询」：与只读说明同档（12px / text-muted）。
-   刻意不用 error 色 —— AT 通道不可用是机型事实，不是故障（core 也刻意回 200）。 */
-.qos-hint {
-  font-size: var(--font-sm);
-  color: var(--text-muted);
-}
-
-/* ── 温度摘要 ── */
-.thermal-summary {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-.thermal-max {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-}
-.thermal-max-value {
-  font-size: var(--font-2xl);
-  font-weight: 700;
-  font-variant-numeric: tabular-nums;
-}
-.thermal-max-label {
-  font-size: var(--font-sm);
-  color: var(--text-secondary);
-}
-.thermal-count {
-  font-size: var(--font-sm);
-  color: var(--text-muted);
-}
-
-/* ── 设备控制：六项两列平铺（通栏卡够宽，两列比一列省一半高度） ── */
-.ctl-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 var(--space-6);
-}
-/* ToggleRow 的分隔策略是给**单列列表**设计的（`:first-child` 去上内距、`:last-child`
-   去下边框），进了双列栅格这两条不变量就失效：首行右格多一段上内距，
-   倒数第二项（第 5 项）留着一条没配对的底边框。
-   所以这里由栅格自己接管：每行等距，分隔线画成「行首」（从第 3 项起 = 第二行开始），
-   双列时每个格子上沿各一条（列间有 24px 间距，线在中间断开，与卡内两列的分栏一致）。
-   选择器把 `.toggle-row` 写两遍是为了压过 ToggleRow 里的 `.toggle-row:first-child`
-   （同为 0,3,0）—— 两个 SFC 的样式顺序由打包顺序决定，不能靠源码顺序赌。 */
-.ctl-grid :deep(.toggle-row.toggle-row) {
-  padding: var(--space-3) 0;
-  border-bottom: none;
-}
-.ctl-grid :deep(.toggle-row.toggle-row:nth-child(n + 3)) {
+/* 摘要与明细之间的那条线画在第一个 InfoRow 上：InfoRow 自己是「行间有底线、末行没有」 */
+.id-row-first {
   border-top: 1px solid var(--border-subtle);
 }
-/* 被能力门禁禁用的开关，把指针事件让给它所在的那一行（tooltip 的 trigger 是整行）：
-   浏览器对 disabled 的表单控件不派发鼠标事件，悬停开关那一小块时提示出不来 ——
-   而用户看到灰开关的第一反应正是去悬停/点它。悬停标签本来就能出提示，这里补的是开关本身。 */
-.ctl-grid :deep(.n-switch--disabled) {
-  pointer-events: none;
+
+/* ── 硬件状态 ── */
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+  padding-bottom: var(--space-2);
 }
+.metric {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.metric-k {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.metric-note {
+  font-size: var(--font-xs);
+  color: var(--dv-warn, var(--warning));
+}
+.metric-v {
+  font-size: var(--font-2xl);
+  font-weight: 650;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.metric-v small {
+  margin-left: 1px;
+  font-size: var(--font-base);
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+}
+.hw-hint {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+}
+.thermal-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.thermal-text {
+  min-width: 0;
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.thermal-link {
+  flex: none;
+  margin-left: auto;
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--font-sm);
+  color: var(--dv-link);
+  cursor: pointer;
+}
+.thermal-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+/* ── 设备控制：三列 / 两列 / 单列 ──
+   边框与间距由栅格接管（ToggleRow inline 变体不带边框）：多列里组件自带的
+   「首行去上内距 / 末行去底边框」会错位，这里用单元格自己画行首线。 */
+.ctl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: var(--space-5);
+}
+.ctl-cell {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 58px;
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border-subtle);
+}
+.ctl-cell:nth-child(-n + 3) {
+  border-top: 0;
+  padding-top: 0;
+}
+/* ToggleRow 是 flex:1 的行，放进单元格后要占满（tooltip 的 trigger 也才是整格可悬停） */
+.ctl-cell > :deep(.toggle-row) {
+  width: 100%;
+  min-width: 0;
+}
+
+@media (max-width: 1060px) {
+  .ctl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .ctl-cell:nth-child(-n + 3) {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: var(--space-3);
+  }
+  .ctl-cell:nth-child(-n + 2) {
+    border-top: 0;
+    padding-top: 0;
+  }
+}
+@media (max-width: 700px) {
+  .ctl {
+    /* 单列也要 minmax(0,1fr)：默认的 1fr 最小尺寸是 min-content，
+       长描述（FOTA 那条）会把整格撑到 379px，超出卡内 336px 的内容区。 */
+    grid-template-columns: minmax(0, 1fr);
+  }
+  /* 单列时每一格都是「行首」，只把第一格的上内距去掉 */
+  .ctl-cell,
+  .ctl-cell:nth-child(-n + 2),
+  .ctl-cell:nth-child(-n + 3) {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: var(--space-3);
+  }
+  .ctl-cell:first-child {
+    border-top: 0;
+    padding-top: 0;
+  }
+}
+/* 触摸屏：行高再放一点，整行仍是热区（开关可见尺寸不变） */
+@media (pointer: coarse) {
+  .ctl-cell {
+    min-height: 52px;
+  }
+}
+
 .restart-time {
   display: flex;
   align-items: center;
@@ -905,46 +1010,90 @@ useInterval(() => {
   font-size: var(--font-base);
   color: var(--text-secondary);
 }
-/* 定时重启时间框：原先写在模板上的 inline `width: 120px` */
-.restart-input {
-  width: 120px;
+.restart-time :deep(.restart-input) {
+  width: 96px;
 }
 .restart-hint {
   font-size: var(--font-sm);
-  color: var(--text-muted);
+  color: var(--text-secondary);
 }
 
-/* ── 1024 档（768–1024 仍是两列，但卡内可用宽约 250px）──
-   五格数字按 5 等分时每格只剩 ~45px，「TCP6 / 1024」会被压成两行；
-   改 3 列（3 + 2）后每格约 70px，数字与标签都放得下。 */
-@media (max-width: 1024px) {
-  .conn-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: var(--space-3);
-  }
+/* ── 失败态 ── */
+.state-empty {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+}
+.state-retry {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  font-size: var(--font-sm);
+  color: var(--dv-link);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
 }
 
-/* 窄屏（手机）塌成单列。
-   断点取 768px 而不是另起一个 720px：main.css 的「断点约定」写明全站只用
-   768 / 1024 两档，新引入第三个数值会让"什么时候塌"在各页之间对不上；
-   768 本来就是"移动形态"那一档，语义一致。 */
-@media (max-width: 768px) {
-  .device-grid {
-    grid-template-columns: 1fr;
-  }
-  .conn-grid {
-    grid-template-columns: 1fr;
-  }
-  .ctl-grid {
-    grid-template-columns: 1fr;
-  }
-  /* 单列时「行首」按相邻兄弟算：第 2 项也要有分隔线（第 3 项起已被上面的 nth-child 规则覆盖） */
-  .ctl-grid :deep(.toggle-row + .toggle-row) {
-    border-top: 1px solid var(--border-subtle);
-  }
-  /* 三列在 298px 卡内每格不足 100px，「下行 AMBR / 500 Mbps」会互相挤压，折单列 */
-  .qos-grid {
-    grid-template-columns: 1fr;
-  }
+/* ── 更多：页面级列表（不是一张只装一行的卡） ── */
+.more {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: var(--space-2);
+}
+.more-title {
+  margin: 0;
+  font-size: var(--font-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.entry {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  background: var(--card-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.entry:hover {
+  background: var(--surface-hover);
+}
+.entry-ico {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-color-light);
+  color: var(--accent-color);
+}
+.entry-text {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.entry-text b {
+  font-size: var(--font-base);
+  font-weight: 600;
+}
+.entry-text span {
+  font-size: var(--font-xs);
+  color: var(--text-secondary);
+}
+.entry-chev {
+  color: var(--text-secondary);
+  font-size: var(--font-lg);
 }
 </style>

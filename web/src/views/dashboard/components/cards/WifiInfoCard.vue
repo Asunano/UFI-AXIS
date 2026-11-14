@@ -2,46 +2,49 @@
   <!-- WiFi 与局域网设置都走弹窗，不在概览里铺开 -->
   <GridCard class="panel-card" title="WiFi 信息" :loading="showSkeleton">
     <template #extra>
-      <!-- 开关即状态：不再另放一个「已开启/已关闭」的 tag，避免两处说同一件事却可能不一致 -->
-      <n-switch :value="wifiEnabled" size="small" @update:value="(v: boolean) => emit('toggle-enabled', v)" />
+      <!-- 开关放在「WiFi 设置」右侧，不写可见文案；用 title / aria-label 补语义，
+           避免纯图标开关对读屏用户变成没有名字的控件（2026-11-11 用户指定）。 -->
       <n-button size="small" quaternary type="primary" @click="emit('open-settings')">WiFi 设置</n-button>
+      <n-switch
+        size="small"
+        :value="wifiEnabled"
+        aria-label="WiFi 开关"
+        title="WiFi 开关"
+        @update:value="(v: boolean) => emit('toggle-enabled', v)"
+      />
     </template>
 
     <!--
-      信息与二维码左右并排：二维码是这张卡最常用的东西，占右侧固定列，
+      左信息 / 右二维码。二维码是这张卡最常用的东西，占右侧固定列；
       信息列自适应剩余宽度（窄屏回落成上下，见 @media）。
       图不能直接 <img src="/api/wifi/qrcode">：img 请求不带 Authorization 头会被 core 拦掉，
       所以走 composable 里注入 Bearer 的 axios 取 blob 再转 object URL。
     -->
     <div class="wifi-layout">
       <div class="wifi-info">
-        <div v-if="wifiSettings" class="stat-grid wifi-stat-grid">
-          <div class="stat-cell">
-            <span class="stat-label">SSID</span>
-            <span class="stat-value">{{ wifiSettings.ssid || '--' }}</span>
+        <div v-if="wifiSettings" class="wifi-rows">
+          <div class="wifi-row">
+            <span class="wifi-label">SSID</span>
+            <span class="wifi-value" :title="wifiSettings.ssid">{{ wifiSettings.ssid || '--' }}</span>
           </div>
-          <div class="stat-cell">
-            <span class="stat-label">加密方式</span>
-            <span class="stat-value">{{ wifiAuthText }}</span>
+          <div class="wifi-row">
+            <span class="wifi-label">加密方式</span>
+            <span class="wifi-value">{{ wifiAuthText }}</span>
           </div>
-          <div class="stat-cell">
-            <span class="stat-label">频段</span>
-            <span class="stat-value">{{ wifiBandText }}</span>
+          <div class="wifi-row">
+            <span class="wifi-label">频段</span>
+            <span class="wifi-value">{{ wifiBandText }}</span>
           </div>
-          <div class="stat-cell">
-            <span class="stat-label">SSID 广播</span>
-            <span class="stat-value">{{ wifiSettings.broadcast_disabled ? '已隐藏' : '开启' }}</span>
+          <div class="wifi-row">
+            <span class="wifi-label">SSID 广播</span>
+            <span class="wifi-value">{{ wifiSettings.broadcast_disabled ? '已隐藏' : '开启' }}</span>
           </div>
-          <div class="stat-cell">
-            <span class="stat-label">最大接入数</span>
-            <span class="stat-value">{{ maxStaNumText }}</span>
+          <div class="wifi-row">
+            <span class="wifi-label">最大接入数</span>
+            <span class="wifi-value">{{ maxStaNumText }}</span>
           </div>
         </div>
-        <!--
-          「加载中」由 GridCard 的 :loading（骨架）承担，所以走到这里只剩「没读到」这一种：
-          原来这里是 `v-else` 直接把「还没加载」和「读取失败」一起渲染成「读取失败」，
-          而且没有重试入口。现在给文案 + 重试（读取失败不会自动恢复，只能等下一轮 10s 轮询）。
-        -->
+        <!-- 加载中由 GridCard 骨架承担，这里只剩"没读到"：给文案 + 重试 -->
         <div v-else class="client-empty wifi-fail">
           <span>WiFi 信息读取失败</span>
           <n-button size="tiny" quaternary type="primary" @click="emit('retry')">重试</n-button>
@@ -143,11 +146,38 @@ const maxStaNumText = computed(() => {
   flex: 1 1 auto;
   min-width: 0;
 }
-/* 信息列只剩半卡宽，全局 .stat-grid 的 auto-fit(120px) 会挤成 1 列。
-   固定两列更稳：五个字段排成 3 行，高度刚好和右侧二维码相当。
-   scoped 选择器 (0,2,0) 压过 main.css 里的 .stat-grid (0,1,0)，与源码顺序无关。 */
-.wifi-stat-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+/* 信息列：一行一个字段（label 左、值右）。
+   原来用 2×3 的 stat-grid，半卡宽下会被 auto-fit 挤成一列；行式布局与
+   二维码列并排时高度也更接近，不会出现"右边一小块、左边一大片"。 */
+.wifi-rows {
+  display: flex;
+  flex-direction: column;
+}
+.wifi-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--border-subtle);
+  min-width: 0;
+}
+.wifi-row:first-child {
+  border-top: 0;
+}
+.wifi-label {
+  flex: none;
+  font-size: var(--font-sm);
+  color: var(--text-muted);
+}
+.wifi-value {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 /* 失败态：文案 + 重试按钮竖排居中（.client-empty 已给居中与内距） */
 .wifi-fail {

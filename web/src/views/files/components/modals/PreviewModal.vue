@@ -8,7 +8,7 @@
     @update:show="emit('update:show', $event)"
   >
     <n-spin :show="loading" class="preview-spin">
-      <!-- ── 图片：可缩放 / 拖拽（变换直接写 DOM，避免 Vue 每帧重排） ── -->
+      <!-- ── 图片：缩放与拖拽（变换直接写入 DOM，避免 Vue 每帧重渲染） ── -->
       <div v-if="kind === 'image'" class="preview-stage image-stage">
         <div class="stage-toolbar">
           <n-button size="tiny" quaternary @click="zoomBy(1.25)">放大</n-button>
@@ -33,9 +33,9 @@
         </div>
       </div>
 
-      <!-- ── 视频：统一走 VideoPlayer（格式分档 / customType / 字幕 / 错误兜底都在它里面）──
-           此前是裸 `<video controls>`：解不了的容器只会显示一个黑框。
-           不再在下面叠一行文件名 —— 弹窗标题已经有了，播放时重复一遍只是挤压播放区。 -->
+      <!-- ── 视频：统一使用 VideoPlayer（格式分档 / customType / 字幕 / 错误兜底均在其中）──
+           不使用原生 `<video controls>`：无法解码的容器只会显示黑框。
+           不在其下重复显示文件名：弹窗标题已包含文件名，重复显示会压缩播放区。 -->
       <div v-else-if="kind === 'video'" class="preview-stage video-stage">
         <VideoPlayer
           :url="url"
@@ -46,9 +46,9 @@
         />
       </div>
 
-      <!-- ── 音频：Apple Music 式「左封面/信息/控制 + 右歌词」 ──
-           左列自上而下是一条阅读线：大封面 → 标题层次 → 进度 → 控制 → 音量，
-           视觉重心压在封面与播放键上；歌词单独占右列，滚动只发生在它内部。 -->
+      <!-- ── 音频：左列封面 / 信息 / 控制，右列歌词 ──
+           左列自上而下为：封面 → 标题层次 → 进度 → 控制 → 音量，视觉重心位于封面与
+           播放键；歌词独占右列，滚动仅发生在歌词面板内部。 -->
       <div v-else-if="kind === 'audio'" class="preview-stage audio-stage">
         <div class="audio-body" :class="{ 'lyrics-off': !lyricsOpen }">
           <div class="audio-left">
@@ -63,7 +63,7 @@
               <div class="song-artist" :title="songArtist">{{ songArtist }}</div>
               <div v-if="songAlbum" class="song-album" :title="songAlbum">{{ songAlbum }}</div>
             </div>
-            <!-- 已播 / 剩余分列两端：剩余带负号，和 Apple Music 一致，读数比总时长更有用 -->
+            <!-- 已播与剩余分列两端：剩余时间带负号；播放过程中剩余时间比总时长更具参考价值 -->
             <div class="seek-row">
               <span class="seek-time">{{ formatTime(scrubbing ? scrubPos : currentTime) }}</span>
               <input
@@ -86,9 +86,9 @@
               <button type="button" class="ctrl-btn" title="后退 10 秒" aria-label="后退 10 秒" @click="skip(-10)">
                 <svg viewBox="0 0 24 24" class="ctrl-icon" aria-hidden="true">
                   <path fill="currentColor" d="M12 5V2L7 6.5 12 11V8a5 5 0 1 1-5 5H5a7 7 0 1 0 7-8z" />
-                  <!-- 环形箭头的内孔是以 (12,13) 为心、半径 5 的圆：字号必须让 "10" 的外接框
-                       落在这个圆内（7.2px 粗体两位数约 8px 宽 / 5px 高，四角距圆心 ≈4.7 < 5），
-                       原来的 8.5 会让数字两端压到弧线上。 -->
+                  <!-- 环形箭头内孔为以 (12,13) 为圆心、半径 5 的圆：字号须使 "10" 的外接框
+                       落在该圆内（7.2px 粗体两位数约 8px 宽、5px 高，四角距圆心约 4.7 < 5）；
+                       8.5px 会使数字两端压到弧线上。 -->
                   <text x="12" y="15.6" text-anchor="middle" font-size="7.2" font-weight="700" fill="currentColor">
                     10
                   </text>
@@ -103,7 +103,7 @@
                 </svg>
               </button>
               <button type="button" class="ctrl-btn" title="前进 10 秒" aria-label="前进 10 秒" @click="skip(10)">
-                <!-- 同一条弧线镜像即可，避免再维护一份镜像路径；数字不能跟着翻，所以放在组外 -->
+                <!-- 通过镜像复用同一条弧线路径，避免维护第二份路径；数字不能随之镜像，因此置于组外 -->
                 <svg viewBox="0 0 24 24" class="ctrl-icon" aria-hidden="true">
                   <g transform="translate(24 0) scale(-1 1)">
                     <path fill="currentColor" d="M12 5V2L7 6.5 12 11V8a5 5 0 1 1-5 5H5a7 7 0 1 0 7-8z" />
@@ -115,9 +115,9 @@
               </button>
             </div>
             <div class="bottom-row">
-              <!-- 音量：常态只是一个按钮，悬浮（或触屏常驻）才展开滑条。
-                   收起靠 volumeActive = hover | 拖动 | 键盘聚焦，拖动中一律不收，
-                   否则鼠标拖到容器外滑条会中途消失、音量停在半路。 -->
+              <!-- 音量：常态仅显示按钮，悬浮（触屏下常驻）时展开滑条。
+                   展开条件为 volumeActive = hover | 拖动 | 键盘聚焦；拖动期间一律不收起，
+                   否则指针移出容器时滑条中途消失，音量停在中间值。 -->
               <div
                 class="volume-wrap"
                 :class="{ open: volumeActive }"
@@ -135,7 +135,7 @@
                   @click="volumeHover = true"
                 >
                   <svg class="vol-icon" viewBox="0 0 24 24" aria-hidden="true">
-                    <!-- 图标随档位换：静音 / 小 / 大。三条 d 是同一只喇叭加不同数量的声波弧 -->
+                    <!-- 图标随音量档位切换：静音 / 小 / 大。三条 d 为同一喇叭主体加不同数量的声波弧 -->
                     <path v-if="volume <= 0" fill="currentColor" :d="VOL_ICON_MUTE" />
                     <path v-else-if="volume < 0.5" fill="currentColor" :d="VOL_ICON_LOW" />
                     <path v-else fill="currentColor" :d="VOL_ICON_HIGH" />
@@ -158,7 +158,7 @@
                   <span class="vol-pct">{{ volumePercent }}%</span>
                 </div>
               </div>
-              <!-- 收起歌词后左列独占宽度、封面随之变大；矮屏也多一条"腾高度"的退路 -->
+              <!-- 收起歌词后左列独占宽度，封面随之放大；矮屏下亦可用于释放纵向空间 -->
               <button
                 type="button"
                 class="lyrics-toggle"
@@ -183,8 +183,8 @@
             @scroll.passive="onLyricsScroll"
           >
             <template v-if="lyrics.length">
-              <!-- 上下半高垫片：让首尾行也能滚到面板中央（高度按面板，不是按宽度%）。
-                   纯文本歌词没有"居中当前行"这回事，垫片只会把首行推到面板中间，故不渲染。 -->
+              <!-- 上下半高垫片：使首尾行也能滚动到面板中央（高度基于面板高度，非宽度百分比）。
+                   纯文本歌词不存在「当前行居中」，垫片只会把首行推到面板中部，因此不渲染。 -->
               <div v-if="lyricsSynced" class="lyrics-pad" aria-hidden="true" />
               <div
                 v-for="(line, i) in lyrics"
@@ -223,12 +223,13 @@
 /**
  * 媒体预览。
  *
- * 视频：统一走 `VideoPlayer`（格式分档 / customType / 字幕 / 错误兜底都在它里面），
- *       这里不再自绘 `<video>`，也不再另起一层文件名。
- * 音频：Apple Music 式版式 —— 左列大封面 + 标题层次 + 细轨进度 + 大播放键，右列歌词。
- *       进度/音量坚持用原生 `<input type="range">`（填充色靠自绘渐变），不引第三方 slider。
- * 图片：缩放/平移在手势期间直接改 img.style.transform（不走 Vue 响应式重渲染），避免卡顿。
- * 图标一律用 inline SVG，全站禁止 emoji。
+ * 视频：统一使用 `VideoPlayer`（格式分档 / customType / 字幕 / 错误兜底均在其中），
+ *       本组件不自绘 `<video>`，也不额外显示文件名。
+ * 音频：左列封面 + 标题层次 + 细轨进度 + 主播放键，右列歌词。
+ *       进度与音量使用原生 `<input type="range">`，填充色由渐变绘制，不引入第三方 slider。
+ * 图片：缩放与平移在手势期间直接修改 `img.style.transform`，不经过 Vue 响应式重渲染，
+ *       以避免卡顿。
+ * 图标一律使用内联 SVG；全站禁用 emoji。
  */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue';
 import VideoPlayer from '@/components/VideoPlayer.vue';
@@ -246,11 +247,11 @@ const props = defineProps<{
 const emit = defineEmits<{ (e: 'update:show', v: boolean): void }>();
 
 /**
- * 「下载此文件」——VideoPlayer 在 C 档（浏览器解不了的容器）里给出的出路。
+ * 「下载此文件」：VideoPlayer 在 C 档（浏览器无法解码的容器）中提供的下载入口。
  *
- * 直接用手里的票据 URL + `<a download>`：票据地址挂在 `/api` 之外的免鉴权区，
- * 裸 GET 就能取（而 `/api/files/download` 要签名头，`<a>` 带不上）。
- * 这样不用新增 emit、也不用把下载逻辑透传回 FilesView。
+ * 直接使用已有的票据 URL 与 `<a download>`：票据地址位于 `/api` 之外的免鉴权区，
+ * 可通过裸 GET 获取；`/api/files/download` 需要签名头，`<a>` 无法携带。
+ * 该实现无需新增 emit，也无需将下载逻辑透传回 FilesView。
  */
 function downloadCurrent() {
   if (!url.value || !props.file) return;
@@ -279,7 +280,7 @@ const scrubPos = ref(0);
 const imgEl = ref<HTMLImageElement | null>(null);
 const imgViewportEl = ref<HTMLElement | null>(null);
 
-/** 手势热路径只改这些普通数字，用 rAF 写 DOM；结束后再同步到 zoomPct */
+/** 手势热路径仅修改这些普通数值，通过 rAF 写入 DOM，结束后再同步到 zoomPct。 */
 let zoom = 1;
 let panX = 0;
 let panY = 0;
@@ -301,8 +302,8 @@ const coverUrl = ref('');
 /**
  * 剩余时长（秒）。
  *
- * 进度条右端显示 `-剩余` 而不是总时长：总时长在同一屏里是常量、看一次就够，
- * 剩余量才是播放中真正会被反复扫视的信息（与 Apple Music 一致）。
+ * 进度条右端显示「-剩余」而非总时长：总时长在一次播放中为常量，剩余时长才是
+ * 播放过程中会被反复查看的信息。
  */
 const remainSeconds = computed(() => {
   const d = duration.value;
@@ -314,9 +315,9 @@ const remainSeconds = computed(() => {
 /**
  * 已播比例（0–100）。
  *
- * 进度/音量条都改成了 `appearance: none` 自绘轨道（见 style 里的说明），
- * 原生的 `accent-color` 填充随之失效，已播那一段必须由 CSS 自己用渐变画 ——
- * 这两个值就是喂给 `--pct` 的唯一数据源。
+ * 进度条与音量条均为 `appearance: none` 的自绘轨道（见样式注释），
+ * 原生 `accent-color` 填充随之失效，已播部分必须由 CSS 渐变绘制。
+ * 本值与 `volumePercent` 是 `--pct` 的唯一数据源。
  */
 const seekPercent = computed(() => {
   const d = duration.value;
@@ -327,19 +328,19 @@ const seekPercent = computed(() => {
 const volumePercent = computed(() => Math.round(volume.value * 100));
 
 /**
- * 音量条的展开态。
+ * 音量条的展开条件。
  *
- * 平时只露一个按钮，hover / 键盘聚焦 / **正在拖动** 三者任一为真才展开。
- * 拖动必须单独算一条：原生 range 没有 dragstart，鼠标按住后拖出容器会触发 mouseleave，
- * 若只看 hover，滑条会在手指还按着的时候收起来。
+ * 常态仅显示按钮，hover、键盘聚焦、正在拖动三者任一为真时才展开。
+ * 拖动必须单独计入：原生 range 没有 `dragstart` 事件，按住后拖出容器会触发 `mouseleave`；
+ * 若仅依据 hover，滑条会在指针仍按下时收起。
  */
 const volumeHover = ref(false);
 
 /**
  * 音量图标的三档 path（静音 / 小声 / 大声）。
  *
- * 提到 script 里而不是写在 template 上：这三条 `d` 单行都超 120 字符，会卡
- * prettier 的 printWidth；而且喇叭主体那段路径三档完全相同，写在 template 里是三份拷贝。
+ * 定义在 script 中而非 template 内：三条 `d` 单行均超过 120 字符，会超出 prettier 的
+ * printWidth；且喇叭主体路径三档完全相同，写在 template 中会重复三次。
  */
 const VOL_ICON_MUTE =
   'M3 9v6h4l5 5V4L7 9H3zM21.8 9.6 21 8.8 17.6 12.2 14.3 8.8 13.4 9.6 16.8 13 13.4 16.4 14.3 17.2 17.6 13.8 21 17.2 21.8 16.4 18.4 13z';
@@ -351,14 +352,14 @@ const volumeDragging = ref(false);
 const volumeActive = computed(() => volumeHover.value || volumeFocused.value || volumeDragging.value);
 
 /**
- * 只认**键盘**带来的聚焦。
+ * 仅处理键盘产生的聚焦。
  *
- * 弹窗打开时浏览器（以及 Naive UI 的 modal）会把焦点丢给内部第一个可聚焦元素，
- * 而音量滑条正好排在前面 —— 照单全收 `focusin` 的话，用户什么都没做，
- * 音量面板就自己展开了、光标也停在滑条上（按方向键会直接改音量）。
+ * 弹窗打开时，浏览器（及 Naive UI 的 modal）会将焦点移至内部第一个可聚焦元素，
+ * 音量滑条恰好在较前位置。若响应全部 `focusin` 事件，用户未作任何操作时音量面板
+ * 即自行展开，且光标停留在滑条上（方向键会直接修改音量）。
  *
- * `:focus-visible` 正是"这次聚焦该不该给视觉反馈"的浏览器判据：键盘 Tab 命中，
- * 程序化聚焦与鼠标点击不命中。鼠标场景由 hover 负责，不需要 focus 再兜一次。
+ * `:focus-visible` 是浏览器判断「本次聚焦是否需要视觉反馈」的判据：键盘 Tab 命中，
+ * 程序化聚焦与鼠标点击不命中。鼠标场景由 hover 处理，无需再由 focus 兜底。
  */
 function onVolumeFocusIn(e: FocusEvent) {
   const el = e.target as HTMLElement | null;
@@ -373,13 +374,13 @@ function endVolumeDrag() {
 
 function onVolumeDragStart() {
   volumeDragging.value = true;
-  // 挂到 window：松手可能发生在容器外，元素上的 pointerup 收不到
+  // 监听挂在 window 上：指针释放可能发生在容器之外，元素上的 pointerup 不会触发
   window.addEventListener('pointerup', endVolumeDrag);
   window.addEventListener('pointercancel', endVolumeDrag);
 }
 
 const lyrics = ref<Array<[number, string]>>([]);
-/** 纯 UI 开关：收起歌词后左列独占整宽（封面变大），矮屏也能靠它腾出竖向空间 */
+/** 纯 UI 开关：收起歌词后左列独占整宽（封面放大），矮屏下亦可释放纵向空间。 */
 const lyricsOpen = ref(true);
 const lyricsPanelEl = ref<HTMLElement | null>(null);
 const lyricsScrolling = ref(false);
@@ -401,7 +402,7 @@ function setLyricLineRef(el: unknown, i: number) {
 
 /**
  * 歌词是否带时间轴。纯文本歌词（[LYRIC_TIME_UNSYNCED]）不高亮、不自动滚动、不可点击跳转，
- * 只当作可手动滚动的静态文本 —— 否则会假装"当前行"骗人。与 app 端 `LyricsPanel` 同一口径。
+ * 仅作为可手动滚动的静态文本，否则会呈现虚假的「当前行」。与 app 端 `LyricsPanel` 口径一致。
  */
 const lyricsSynced = computed(() => lyrics.value.some((l) => l[0] !== LYRIC_TIME_UNSYNCED));
 
@@ -420,7 +421,7 @@ const currentLyricIndex = computed(() => {
 
 let lyricsScrollRaf = 0;
 
-/** 缓动滚到目标 scrollTop；连续切换时打断上一段，避免动画叠罗汉掉帧。 */
+/** 以缓动滚动到目标 scrollTop；连续切换时中断上一段动画，避免动画叠加导致掉帧。 */
 function animateScrollTo(panel: HTMLElement, to: number, duration = 420) {
   if (lyricsScrollRaf) cancelAnimationFrame(lyricsScrollRaf);
   const from = panel.scrollTop;
@@ -440,7 +441,7 @@ function animateScrollTo(panel: HTMLElement, to: number, duration = 420) {
   lyricsScrollRaf = requestAnimationFrame(step);
 }
 
-/** 当前行滚到面板垂直居中（用 offsetTop，避免每帧 getBoundingClientRect 强制布局）。 */
+/** 将当前行滚动到面板垂直居中位置。使用 offsetTop 计算，避免每帧调用 getBoundingClientRect 触发强制布局。 */
 function scrollLyricCenter(i: number) {
   const panel = lyricsPanelEl.value;
   const line = lyricLineEls.get(i);
@@ -453,7 +454,7 @@ watch(currentLyricIndex, (i) => {
   if (i >= 0) scrollLyricCenter(i);
 });
 
-// 歌词首次加载后也把当前行居中（布局完成后）
+// 歌词首次加载后将当前行居中（需等待布局完成）
 watch(lyrics, async () => {
   if (!lyrics.value.length) return;
   await nextTick();
@@ -461,7 +462,8 @@ watch(lyrics, async () => {
   if (i >= 0) scrollLyricCenter(i);
 });
 
-// 收起再展开后面板是重新挂载的（scrollTop 归零），要补一次居中，否则要等下一行才回到视野
+// 收起后再展开时面板重新挂载（scrollTop 归零），需补充一次居中，
+// 否则须等到下一行变化才回到视野
 watch(lyricsOpen, async (open) => {
   if (!open) return;
   await nextTick();
@@ -503,12 +505,12 @@ function applyTransform() {
 }
 
 /**
- * [url] 当前是不是 `blob:` objectURL。
+ * [url] 当前是否为 `blob:` objectURL。
  *
- * 图片/文本仍走「整份读成 blob」，音视频改成了票据流式 URL（普通 http URL）。
- * 两者的清理方式不同：objectURL 必须 `revokeObjectURL` 否则内存不释放，
- * 而对普通 URL 调它虽然无害，却会掩盖"这里到底该不该释放"这个区别。
- * 票据本身不需要主动作废 —— core 侧滑动过期 10 分钟自动回收。
+ * 图片与文本仍采用「整份读取为 blob」的方式，音视频使用票据流式 URL（普通 HTTP URL）。
+ * 两者清理方式不同：objectURL 必须调用 `revokeObjectURL`，否则内存不会释放；
+ * 对普通 URL 调用它虽然无害，但会掩盖两者的区别。票据无需主动作废：
+ * core 侧滑动过期 10 分钟后自动回收。
  */
 let urlIsObjectUrl = false;
 
@@ -539,11 +541,11 @@ async function load() {
   loading.value = true;
   try {
     if (k === 'audio' || k === 'video') {
-      // 媒体走「票据 + 浏览器原生流式」：`<audio src>` / `<video src>` 由渲染引擎发起请求，
-      // **无法附加鉴权头**，所以此前只能 fetch 整个文件成 blob 再喂进去 ——
-      // 代价是 100MB 上限、必须下载完才能播、电影根本进不了预览。
-      // 现在换一张短时票据（POST /api/files/stream-ticket，走正常头部鉴权），
-      // 之后 Range 与 seek 全交给浏览器，边下边播。详见 core 的 MediaTicketStore。
+      // 媒体使用「票据 + 浏览器原生流式」：`<audio src>` / `<video src>` 由渲染引擎发起请求，
+      // 无法附加鉴权头；若将整个文件 fetch 为 blob 再传入，会受 100MB 上限限制，
+      // 且必须下载完成后才能播放。因此先换取短时票据
+      // （POST /api/files/stream-ticket，使用正常头部鉴权），随后 Range 请求与 seek
+      // 全部交由浏览器处理，实现边下边播。详见 core 的 MediaTicketStore。
       url.value = await requestStreamUrl(f.path);
       urlIsObjectUrl = false;
     } else {
@@ -580,10 +582,10 @@ async function load() {
 }
 
 /**
- * 换取可直接塞进 `<audio src>` / `<video src>` 的流式 URL。
+ * 换取可直接用于 `<audio src>` / `<video src>` 的流式 URL。
  *
  * 票据由 core 侧 `POST /api/files/stream-ticket` 签发：可重复使用（否则浏览器的第二个
- * Range 请求就会被拒、播放当场断）、滑动过期 10 分钟、只授权这一个文件。
+ * Range 请求会被拒绝，播放中断）、滑动过期 10 分钟、仅授权单个文件。
  */
 async function requestStreamUrl(path: string): Promise<string> {
   const uri = '/api/files/stream-ticket';
@@ -603,10 +605,10 @@ async function requestStreamUrl(path: string): Promise<string> {
 }
 
 /**
- * 音频元数据 + 封面 + 歌词。
+ * 音频元数据、封面与歌词。
  *
- * 取字节与回退顺序都在 `../../audioMetaProbe`（音乐页复用同一份，见那里的说明），
- * 这里只负责把结果写进本组件的 state 并处理"过期结果丢弃"。
+ * 字节读取与回退顺序位于 `../../audioMetaProbe`（音乐页复用同一实现，见该处说明），
+ * 本函数仅负责将结果写入组件状态，并丢弃过期结果。
  */
 async function loadAudioMetaAndLyrics(path: string, fileSize?: number) {
   audioLoadPath = path;
@@ -625,7 +627,7 @@ async function loadAudioMetaAndLyrics(path: string, fileSize?: number) {
       if (tags.artist) id3Artist.value = tags.artist;
       if (tags.album) id3Album.value = tags.album;
     },
-    // 探测器只负责生成 objectURL，释放在 release() / 下一次加载开头
+    // 探测器仅负责生成 objectURL；释放在 release() 或下一次加载开始时执行
     onCover: (u) => {
       coverUrl.value = u;
     },
@@ -639,11 +641,11 @@ async function loadAudioMetaAndLyrics(path: string, fileSize?: number) {
 let audioLoadPath = '';
 
 /**
- * 这条异步链是否已经过期，过期就丢弃结果、不要写进 state。
+ * 判断该异步链是否已过期；过期时丢弃结果，不写入状态。
  *
- * 只判 `props.show` 和 `kind` 不够：切到**另一首音频**时 `kind` 仍然是 `'audio'`，
- * 上一首在飞的封面 / 歌词请求返回后会把结果盖到当前歌上（封面串台、歌词对不上）。
- * 所以必须再比对 path。
+ * 仅判断 `props.show` 与 `kind` 不足：切换到另一首音频时 `kind` 仍为 `'audio'`，
+ * 上一首尚未返回的封面 / 歌词请求会把结果写入当前曲目，造成封面与歌词错配。
+ * 因此必须同时比较 path。
  */
 function audioLoadStale(path: string): boolean {
   return !props.show || kind.value !== 'audio' || audioLoadPath !== path;
@@ -663,7 +665,7 @@ function onVolume(ev: Event) {
   if (audioEl.value) audioEl.value.volume = v;
 }
 
-/** 打开预览即尝试自动播；浏览器拦截时静默失败，用户仍可点播放。 */
+/** 打开预览时尝试自动播放；被浏览器拦截时静默失败，用户仍可手动播放。 */
 function tryAutoplayAudio() {
   const el = audioEl.value;
   if (!el || !url.value || !autoPlayAudio) return;
@@ -707,9 +709,9 @@ function syncAudioTime() {
 }
 
 /**
- * 只有在「确实无法解码且尚未开始播放」时才提示。
- * 空 src、关闭时清 src、Range 探测中的瞬时 error 都会触发 error 事件；
- * 用户反馈「能播但弹不支持」——这些一律吞掉。
+ * 仅在「确实无法解码且尚未开始播放」时提示。
+ * 空 src、关闭时清空 src、Range 探测期间的瞬时 error 都会触发 error 事件；
+ * 这些情况必须一律忽略，避免出现「可播放却提示不支持」。
  */
 function onMediaError(ev: Event) {
   if (!url.value) return;
@@ -720,7 +722,7 @@ function onMediaError(ev: Event) {
   message.warning('当前浏览器可能不支持该媒体编码，请下载后用本地播放器打开');
 }
 
-// ── 图片：热路径直接写 style，不用 Vue :style 绑定 ──
+// ── 图片：热路径直接写入 style，不使用 Vue 的 :style 绑定 ──
 function resetZoom() {
   zoom = 1;
   panX = 0;
@@ -802,7 +804,7 @@ onUnmounted(() => {
   if (lyricsScrollTimer != null) window.clearTimeout(lyricsScrollTimer);
   if (lyricsScrollRaf) cancelAnimationFrame(lyricsScrollRaf);
   if (panRaf) cancelAnimationFrame(panRaf);
-  // 拖音量时组件被卸载（关弹窗）：window 上那对监听必须跟着走
+  // 拖动音量期间组件被卸载（关闭弹窗）：window 上的监听必须一并移除
   endVolumeDrag();
   release();
 });
@@ -854,30 +856,29 @@ onUnmounted(() => {
   transform-origin: center center;
   user-select: none;
   pointer-events: auto;
-  /* 手势期由 JS 写 transform；初始清掉绑定带来的重排 */
+  /* 手势期间由 JS 写入 transform；初始值用于清除绑定引起的重排 */
   transform: translate3d(0, 0, 0) scale(1);
   will-change: transform;
   backface-visibility: hidden;
 }
 
-/* ── 音频：Apple Music 式版式 ──
-   左列一条竖向阅读线（封面 → 标题层次 → 进度 → 控制 → 音量），右列只有歌词。
-   之所以把控制区放在封面正下方而不是贴容器底部：容器高度是弹性的，贴底会让
-   控制区随视口上下漂移，跟着封面走才有"一整块播放器"的整体感。 */
+/* ── 音频版式 ──
+   左列为竖向阅读线（封面 → 标题层次 → 进度 → 控制 → 音量），右列仅放置歌词。
+   控制区置于封面正下方而非容器底部：容器高度是弹性的，贴底会使控制区随视口上下漂移，
+   跟随封面可保持播放器整体的视觉连贯性。 */
 .audio-stage {
   padding: 0;
   min-height: 0;
 }
 /**
- * 高度策略（2026-09-14 重做）。
+ * 高度策略。
  *
- * 原来是 height + min-height:340px + max-height:min(64vh,460px) 三条一起写：
- * 视口高不足约 530px 时 min/max 直接矛盾，左列又是居中且不裁剪，
- * 结果封面的上下缘会溢出到容器外面。
+ * 不得同时设置 `height`、`min-height: 340px` 与 `max-height: min(64vh, 460px)`：
+ * 视口高度不足约 530px 时 min/max 相互矛盾，而左列居中且不裁剪，封面上下缘会溢出容器。
  *
- * 现在只留**一个确定高度**：确定高度会往下传给左列，左列里封面是唯一可收缩项，
- * 空间不够时先压封面而不是溢出；歌词面板始终是全局唯一的滚动容器，
- * 所以不会出现"外层 + 内层"两条滚动条。
+ * 当前仅保留一个确定高度：确定高度向下传递给左列，左列中封面是唯一可收缩项，
+ * 空间不足时优先压缩封面而非溢出；歌词面板始终是唯一的滚动容器，
+ * 因此不会出现外层与内层两条滚动条。
  */
 .audio-body {
   display: grid;
@@ -886,28 +887,28 @@ onUnmounted(() => {
   height: min(68vh, 520px);
   align-items: stretch;
 }
-/* 收起歌词：左列独占整宽，封面顺势放大 */
+/* 收起歌词：左列独占整宽，封面随之放大 */
 .audio-body.lyrics-off {
   grid-template-columns: minmax(0, 1fr);
 }
 .audio-left {
-  /* 封面基准尺寸集中在这一个变量里，媒体查询只改它，不用重写盒模型 */
+  /* 封面基准尺寸集中在该变量中；媒体查询只修改它，无需重写盒模型 */
   --cover-size: min(272px, 32vh);
-  /* 封面圆角比常规卡片再圆一档（Apple Music 是大圆角 + 明显投影），但仍从令牌推导 */
+  /* 封面圆角大于常规卡片一级，但仍由设计令牌推导 */
   --cover-radius: calc(var(--radius-lg) + 4px);
   display: flex;
   flex-direction: column;
   align-items: center;
-  /* 用 auto margin 做"安全居中"而不是 justify-content:center：
-     空间富余时两端 auto 均分 ⇒ 视觉居中；空间不足时 auto 归零 ⇒
-     内容从顶部排起，不会像居中那样朝上下两个方向同时溢出。 */
+  /* 使用 auto margin 实现安全居中，而不使用 justify-content: center：
+     空间富余时两端 auto 均分，形成视觉居中；空间不足时 auto 归零，
+     内容自顶部排列，不会像居中那样向上下两个方向同时溢出。 */
   justify-content: flex-start;
   gap: var(--space-4);
   min-width: 0;
   min-height: 0;
   height: 100%;
   padding: var(--space-2) var(--space-2) 0;
-  /* 极端矮视口（封面已压到下限仍放不下）时兜底裁剪，避免内容压到弹窗外面 */
+  /* 极端矮视口下的兜底裁剪（封面已压缩至下限仍无法容纳），避免内容溢出弹窗 */
   overflow: hidden;
 }
 .audio-body.lyrics-off .audio-left {
@@ -916,9 +917,9 @@ onUnmounted(() => {
 /**
  * 封面。
  *
- * 只给高度基准、宽度交给图片比例，所以横版/竖版封面都按原始比例完整显示 ——
- * 之前是固定 168×168 配 object-fit:cover，非方形封面会被裁掉两头。
- * 同时它是左列里唯一 flex-shrink 不为 0 的元素，承担矮屏的高度让位。
+ * 仅约束高度，宽度由图片比例决定，因此横版与竖版封面均按原始比例完整显示。
+ * 不得改用固定 168×168 配合 `object-fit: cover`：非方形封面会被裁切。
+ * 该元素是左列中唯一 `flex-shrink` 不为 0 的元素，承担矮屏下的高度压缩。
  */
 .cover-box {
   display: flex;
@@ -931,8 +932,8 @@ onUnmounted(() => {
   min-width: 0;
   margin-top: auto;
 }
-/* 只有"没封面"才需要一块方形占位底板。有封面时容器不画底色也不画圆角，
-   否则 contain 留出的空档会露出底板颜色，看着像图片被一层遮罩挡住。 */
+/* 仅无封面时显示方形占位底板。有封面时容器不绘制底色与圆角，
+   否则 contain 产生的留白会露出底板颜色，表现为图片被遮罩覆盖。 */
 .cover-box.is-empty {
   aspect-ratio: 1 / 1;
   background: var(--surface-hover);
@@ -950,7 +951,7 @@ onUnmounted(() => {
   object-fit: contain;
   border-radius: var(--cover-radius);
   display: block;
-  /* 阴影是"浮起"这个层级语义，不是配色 —— 令牌只给颜色（含暗色档），几何留在这里 */
+  /* 阴影表达「浮起」的层级语义，而非配色：令牌仅提供颜色（含暗色档），几何参数保留在此处 */
   box-shadow: 0 14px 34px var(--shadow-color-strong);
 }
 .song-meta {
@@ -960,8 +961,8 @@ onUnmounted(() => {
   text-align: center;
   flex: 0 0 auto;
 }
-/* 三级文字层次：标题最重、艺人用主色（Apple Music 里艺人/专辑是可点的强调色）、
-   专辑最轻。层次靠字号+字重+颜色三者一起拉开，只改字号在中文里区分度不够。 */
+/* 三级文字层次：标题最重，艺人使用主色（作为可点击强调色），专辑最轻。
+   层次由字号、字重、颜色三者共同区分；仅调整字号在中文排版中区分度不足。 */
 .song-title {
   font-size: 25px;
   font-weight: 700;
@@ -989,8 +990,8 @@ onUnmounted(() => {
   white-space: nowrap;
   text-overflow: ellipsis;
 }
-/* 音量与歌词开关同排：两个都是"次要设置"，各占一行会把控制区的重心冲淡。
-   两端对齐而不是居中：音量展开时只朝中间长，右边的歌词 pill 不会跟着左右跳。 */
+/* 音量与歌词开关同排：二者均为次要设置，各占一行会削弱控制区的视觉重心。
+   采用两端对齐而非居中：音量展开时向左列中部扩展，右侧歌词按钮位置不变。 */
 .bottom-row {
   display: flex;
   align-items: center;
@@ -1003,10 +1004,10 @@ onUnmounted(() => {
   padding-bottom: var(--space-2);
 }
 /**
- * 音量：常态只露一个按钮，滑条悬浮才展开。
+ * 音量：常态仅显示按钮，滑条在悬浮时展开。
  *
- * 展开用 width + opacity 过渡，而不是 display:none —— 后者根本没有过渡这回事。
- * 收起态再补一条 pointer-events:none：0 宽但仍在文档里的滑条不该抢指针。
+ * 展开使用 width 与 opacity 过渡，不使用 `display: none`（该属性无过渡）。
+ * 收起态须同时设置 `pointer-events: none`：宽度为 0 但仍在文档流中的滑条不应接收指针事件。
  */
 .volume-wrap {
   display: flex;
@@ -1032,7 +1033,7 @@ onUnmounted(() => {
   opacity: 1;
   pointer-events: auto;
 }
-/* 触屏没有 hover，展开态永远不会到来 ⇒ 滑条常驻，否则音量彻底调不了 */
+/* 触屏设备没有 hover，展开态不会触发，因此滑条常驻显示；否则无法调节音量 */
 @media (hover: none) {
   .volume-slot {
     width: 136px;
@@ -1040,8 +1041,9 @@ onUnmounted(() => {
     pointer-events: auto;
   }
 }
-/* 音量键沿用 .ctrl-btn 的圆形视觉，只降一档尺寸：它是次要控件，不该和 ±10s 抢注意力。
-   写成 .ctrl-btn.vol-btn 是为了压过矮屏媒体查询里的 .ctrl-btn 尺寸（同特异度、后写者胜）。 */
+/* 音量键沿用 .ctrl-btn 的圆形外观，尺寸降低一档：其次要控件，不应与 ±10s 按钮争夺
+   注意力。选择器写作 .ctrl-btn.vol-btn 以覆盖矮屏媒体查询中的 .ctrl-btn 尺寸
+   （同特异度，后写者优先）。 */
 .ctrl-btn.vol-btn {
   width: 34px;
   height: 34px;
@@ -1090,7 +1092,7 @@ onUnmounted(() => {
   height: 13px;
 }
 .lyrics-panel {
-  position: relative; /* line.offsetTop 相对面板，居中计算不用 getBoundingClientRect */
+  position: relative; /* line.offsetTop 相对面板计算，居中时无需 getBoundingClientRect */
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -1100,7 +1102,7 @@ onUnmounted(() => {
   overflow-x: hidden;
   padding: 0 6px;
   overscroll-behavior: contain;
-  /* 遮罩在滚动时改成不遮，减少每帧重绘 */
+  /* 滚动期间移除以减少每帧重绘 */
   mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   -webkit-mask-image: linear-gradient(180deg, transparent, #000 12%, #000 88%, transparent);
   scrollbar-width: none;
@@ -1151,13 +1153,13 @@ onUnmounted(() => {
   cursor: pointer;
   line-height: 1.5;
   text-align: center;
-  /* 只动 opacity/color：scale 会让每行都建合成层，切歌时容易掉帧 */
+  /* 仅改变 opacity 与 color：使用 scale 会为每行创建合成层，切换歌曲时易掉帧 */
   opacity: 0.45;
   transition:
     opacity 0.22s ease,
     color 0.22s ease,
     font-size 0.22s ease;
-  /* 减少滚动时的文字重排开销 */
+  /* 降低滚动时的文字重排开销 */
   contain: layout style;
   will-change: opacity;
 }
@@ -1166,8 +1168,8 @@ onUnmounted(() => {
   opacity: 0.8;
   background: transparent;
 }
-/* 当前行走 --text-primary 而不是主色：这一列里"当前"已经靠字号+字重+不透明度
-   区分得很清楚了，主色留给左列的艺人名与播放键，免得同一屏出现三处主色抢注意力。 */
+/* 当前行使用 --text-primary 而非主色：该列中「当前」已由字号、字重与不透明度区分，
+   主色保留给左列的艺人名与播放键，避免同一屏出现多处主色。 */
 .lyrics-line.current {
   color: var(--text-primary);
   font-size: 21px;
@@ -1176,8 +1178,8 @@ onUnmounted(() => {
   background: transparent;
   will-change: auto;
 }
-/* 无时间轴的纯文本歌词：没有"当前行"概念，所有行等亮度常显、不给点击手型
-   （点了也无处可跳）。字号沿用未激活行，避免整段都是 21px 撑爆面板。 */
+/* 无时间轴的纯文本歌词：不存在「当前行」，所有行等亮度显示，且不显示点击手型
+   （点击无跳转目标）。字号沿用未激活行，避免整段 21px 导致面板内容过长。 */
 .lyrics-line.plain {
   cursor: default;
   opacity: 0.85;
@@ -1206,31 +1208,31 @@ onUnmounted(() => {
   text-align: right;
 }
 /**
- * 进度 / 音量滑条：`appearance: none` 之后 track 与 thumb 全部自绘。
+ * 进度与音量滑条：`appearance: none` 后 track 与 thumb 全部自绘。
  *
- * 注意：不要改回「transform: scaleY() 把轨道撑粗」那一版。
- * 在 WebKit/Blink 里 thumb（`::-webkit-slider-thumb`）是 `::-webkit-slider-runnable-track`
- * 的**子节点**，父级的 transform 会连带作用在它身上：轨道竖向放大 1.9 倍，
- * 圆点就被同比拉成竖椭圆 —— 这正是"悬浮时圆点被压扁"的根因；Firefox 的
- * `::-moz-range-track` / `::-moz-range-thumb` 同理。所以定死三条：
- *   1. 轨道加粗只允许改 track 自己的 height；
- *   2. thumb 变大只允许改 thumb 自己的 width/height；
- *   3. 这两个伪元素里都不许出现 transform。
+ * 不得使用 `transform: scaleY()` 加粗轨道。在 WebKit/Blink 中，thumb
+ * （`::-webkit-slider-thumb`）是 `::-webkit-slider-runnable-track` 的子节点，
+ * 父级 transform 会一并作用于它：轨道纵向放大 1.9 倍时，圆点被同比拉伸为竖椭圆，
+ * 即悬浮态圆点变形的原因。Firefox 的 `::-moz-range-track` / `::-moz-range-thumb` 同理。
+ * 因此约定三条：
+ *   1. 轨道加粗只能修改 track 自身的 height；
+ *   2. thumb 放大只能修改 thumb 自身的 width / height；
+ *   3. 这两个伪元素中不得出现 transform。
  *
- * 另外 `appearance: none` 会让原生 `accent-color` 填充一起失效，已播的那一段必须自己
- * 用 linear-gradient 画，比例由 template 上的 `--pct`（seekPercent / volumePercent）给。
+ * 此外 `appearance: none` 会使原生 `accent-color` 填充失效，已播部分必须由
+ * `linear-gradient` 绘制，比例来自 template 上的 `--pct`（seekPercent / volumePercent）。
  */
 .seek,
 .volume {
   --track-h: 4px;
   --thumb-size: 10px;
-  /* 轨道底色走令牌：--border-subtle 是浅/深两态都看得清的中性线色，不硬编码颜色 */
+  /* 轨道底色使用令牌：--border-subtle 在浅色与深色两态下均清晰，不硬编码颜色值 */
   --track-bg: var(--border-subtle);
   appearance: none;
   -webkit-appearance: none;
   width: 100%;
   min-width: 0;
-  /* 元素高度只决定命中区（细轨很难点中），轨道视觉厚度由 --track-h 给 */
+  /* 元素高度仅决定命中区域（细轨难以点中）；轨道视觉厚度由 --track-h 决定 */
   height: 16px;
   margin: 0;
   padding: 0;
@@ -1259,7 +1261,7 @@ onUnmounted(() => {
   border: none;
   border-radius: 50%;
   background: var(--accent-color);
-  /* WebKit 不会替你居中 thumb：靠负 margin 把它压回轨道中线 */
+  /* WebKit 不会自动居中 thumb：通过负 margin 对齐轨道中线 */
   margin-top: calc((var(--track-h) - var(--thumb-size)) / 2);
   transition:
     width 0.15s ease,
@@ -1273,7 +1275,7 @@ onUnmounted(() => {
   background: linear-gradient(to right, var(--accent-color) 0 var(--pct, 0%), var(--track-bg) var(--pct, 0%) 100%);
   transition: height 0.15s ease;
 }
-/* Firefox 自己会把 thumb 对齐轨道中线，不需要 margin 修正 */
+/* Firefox 会自动将 thumb 对齐轨道中线，无需 margin 修正 */
 .seek::-moz-range-thumb,
 .volume::-moz-range-thumb {
   width: var(--thumb-size);
@@ -1289,9 +1291,9 @@ onUnmounted(() => {
   cursor: default;
   opacity: 0.5;
 }
-/* 控制区：中央播放键最大、两侧 ±10s 次之，尺寸差是唯一的层次手段（都不带边框）。
-   整体升一档（40→48 / 60→64）：±10s 的图标里嵌着 "10" 两位数，
-   40px 按钮下环形箭头和数字会挤成一团。 */
+/* 控制区：中央播放键最大，两侧 ±10s 按钮次之；尺寸差是唯一的层次手段（均无边框）。
+   整体尺寸提高一档（40→48 / 60→64）：±10s 图标内嵌 "10" 两位数字，
+   40px 按钮下环形箭头与数字会相互挤压。 */
 .ctrl-row {
   display: flex;
   justify-content: center;
@@ -1320,8 +1322,8 @@ onUnmounted(() => {
   background: var(--surface-hover);
   color: var(--text-primary);
 }
-/* 主键用「主色淡底 + 主色图标」而不是「主色实底 + 白字」：淡底在明暗两态下都不抢戏，
-   实底会让这一颗按钮在深色播放面板里过亮（现在已有 --on-accent，但这里是取舍不是缺令牌）。 */
+/* 主按钮使用「主色淡底 + 主色图标」而非「主色实底 + 白字」：淡底在明暗两态下均不突显，
+   实底会使该按钮在深色播放面板中过亮。虽已提供 --on-accent 令牌，此处为设计取舍。 */
 .ctrl-btn.primary {
   color: var(--accent-color);
   width: 64px;
@@ -1349,12 +1351,12 @@ onUnmounted(() => {
   font-size: 13px;
 }
 
-/* 矮屏：把左列那些"固定高度"的块整体压小一档。封面能自己收缩，但如果标题/控制/音量
-   维持原尺寸，收缩额度会全被它们吃掉、封面直接掉到 72px 下限还是紧绷 ——
-   所以这里主动降一档，给封面留出比例。
-   2026-10-21：断点由 `max-height: 560px` 并入全站唯一的 720 高度档（计划 §3.2 只允许
-   768 / 1024 / 720高 三档）。这些声明在 720 块里没有等价项，所以不能删 ——
-   直接抬到 720：560–720 之间只是播放器小一档，不会溢出（左列 overflow:hidden 兜底）。 */
+/* 矮屏：将左列中固定高度的块整体缩小一档。封面可自行收缩，但若标题、控制、音量维持
+   原尺寸，收缩额度会被它们占用，封面降至 72px 下限仍然紧凑；因此主动降低一档，
+   为封面保留比例。
+   断点使用全站统一的 720 高度档（允许的断点仅为 768 / 1024 / 720 高度三档）。
+   这些声明在统一的 720 块中没有等价项，不得删除；断点提升至 720 后，
+   560–720 区间内播放器仅缩小一档，不会溢出（左列 overflow: hidden 兜底）。 */
 @media (max-height: 720px) {
   .audio-body {
     gap: var(--space-3);
@@ -1376,7 +1378,7 @@ onUnmounted(() => {
   .song-album {
     margin-top: 2px;
   }
-  /* 控制键跟着降一档，但仍留出让 ±10s 图标里的 "10" 看得清的余量（40/24 是下限） */
+  /* 控制键同步缩小一档，但仍保留使 ±10s 图标中 "10" 清晰可辨的余量（40 / 24 为下限） */
   .ctrl-row {
     gap: var(--space-4);
   }
@@ -1413,9 +1415,9 @@ onUnmounted(() => {
   }
 }
 
-/* 窄屏（断点 2026-10-21 由 720 并回 768）：单列。歌词行用 minmax(0,1fr) 而不是给最小高度 ——
-   容器高度是确定的，行高之和只要可能超过它就会溢出，让歌词吃"剩下的"最稳；
-   面板自己能滚，所以行数再多也不会把播放器顶出去。 */
+/* 窄屏（断点 768）：单列布局。歌词行使用 minmax(0, 1fr) 而非固定最小高度：
+   容器高度确定，行高之和超过容器即溢出，因此由歌词占用剩余空间；
+   面板自身可滚动，行数增加不会把播放器挤出视口。 */
 @media (max-width: 768px) {
   .audio-body {
     grid-template-columns: minmax(0, 1fr);
@@ -1436,7 +1438,7 @@ onUnmounted(() => {
     --cover-size: min(240px, 34vh);
     height: 100%;
   }
-  /* 单列下左列高度是内容自适应的，auto margin 没有可分配的空间，写着也无意义 */
+  /* 单列下左列高度由内容自适应，auto margin 无可分配空间，因此在此覆盖为 0 */
   .cover-box,
   .bottom-row {
     margin-top: 0;

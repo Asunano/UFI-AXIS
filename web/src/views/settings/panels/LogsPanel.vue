@@ -139,6 +139,62 @@
         </div>
       </div>
     </GridCard>
+
+    <!--
+      Card: 落盘日志文件（2026-10-30 F13 / F15）
+
+      在此之前只有 App 有落盘日志入口，Web 只能看内存里的最近 200 条 —— 重启即丢。
+      这里补上列表 / 查看 / 删除；`crash/` 与 `update/` 也由 core 的 `listLogFiles()`
+      一并返回（F15），所以崩溃现场也能远程取走。
+    -->
+    <GridCard title="落盘日志文件">
+      <template #extra>
+        <div class="log-header-actions">
+          <n-button size="tiny" quaternary :loading="logFilesLoading" @click="loadLogFiles">刷新</n-button>
+          <n-button size="tiny" type="error" quaternary @click="deleteLogFiles">删除全部</n-button>
+        </div>
+      </template>
+      <div v-if="logFilesDegraded" class="log-warn">存储空间不足，core 已暂停写日志文件（内存日志仍可查看）。</div>
+      <div v-else-if="logFilesHeavy" class="log-warn">
+        日志已占用 {{ formatBytes(logFilesBytes) }}。core 不按天删除日志（按天分目录保存），
+        长期开启会持续增长；可在此删除，或关闭「日志总开关」。
+      </div>
+      <div class="log-files-meta">
+        <span class="log-files-dir">目录：{{ logFilesDir || '—' }}</span>
+        <span>共 {{ logFiles.length }} 个 · {{ formatBytes(logFilesBytes) }}</span>
+        <span v-if="logDays > 0">跨度 {{ logDays }} 天</span>
+        <span v-if="logTodayBytes > 0">今日 {{ formatBytes(logTodayBytes) }}</span>
+        <span v-if="logDiskFree >= 0">剩余空间 {{ formatBytes(logDiskFree) }}</span>
+      </div>
+      <div class="log-files-hint">按天分目录保存；不会自动按天删除，仅在存储不足（剩余 &lt; 256MB）时暂停写入。</div>
+      <div v-if="logFileView" class="log-file-view">
+        <div class="log-file-view-head">
+          <span class="log-file-name">{{ logFileView.name }}</span>
+          <n-button size="tiny" quaternary @click="closeLogFileView">返回列表</n-button>
+        </div>
+        <pre class="log-file-text">{{ logFileView.text }}</pre>
+      </div>
+      <div v-else class="log-list log-file-list">
+        <div v-if="logFilesError" class="log-error">
+          <span>{{ logFilesError }}</span>
+          <n-button text type="primary" size="tiny" :loading="logFilesLoading" @click="loadLogFiles"> 重试 </n-button>
+        </div>
+        <div v-else-if="logFilesLoading && logFiles.length === 0" class="client-empty">正在读取…</div>
+        <div v-else-if="logFiles.length === 0" class="client-empty">暂无落盘文件</div>
+        <div
+          v-for="file in logFiles"
+          :key="file.name"
+          class="log-file-item"
+          role="button"
+          tabindex="0"
+          @click="openLogFile(file.name)"
+          @keyup.enter="openLogFile(file.name)"
+        >
+          <span class="log-file-name">{{ file.name }}</span>
+          <span class="log-file-size">{{ formatBytes(file.size) }}</span>
+        </div>
+      </div>
+    </GridCard>
   </div>
 </template>
 
@@ -151,6 +207,8 @@ import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
 import { describeConfigReject, type ConfigRejectedField } from '@/api/contract';
+import { fetchConfig, updateConfig } from '@/api/config';
+import { toApiErrorMessage } from '@/composables/utils';
 import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
 
 const message = useMessage();
@@ -202,7 +260,9 @@ const logForm = reactive({
 
 async function loadLogConfig() {
   try {
-    const { data } = await configApi.get('/api/config');
+    const data = await fetchConfig(configApi);
+    // 空响应（core 未就绪）与取消都按「没读到」处理：不要用它去刷表单
+    if (!data) return;
     const mapping: Record<string, string> = {
       log_enabled: 'logEnabled',
       core_log_enabled: 'coreLogEnabled',
@@ -273,10 +333,10 @@ async function saveLogSwitches() {
   }
   savingLogSwitches.value = true;
   try {
-    const { data } = await configApi.put('/api/config', payload);
+    const data = await updateConfig(configApi, payload);
     commitConfigSave(payload, data, configOriginal, '日志开关', message, loadLogConfig);
-  } catch (e: any) {
-    message.error(e?.response?.data?.error || '保存失败');
+  } catch (e) {
+    message.error(toApiErrorMessage(e, '保存失败'));
   } finally {
     savingLogSwitches.value = false;
   }
@@ -386,7 +446,7 @@ async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
   const previous = logForm[formKey];
   probeSaving[apiKey] = true;
   try {
-    const { data } = await configApi.put('/api/config', { [apiKey]: value });
+    const data = await updateConfig(configApi, { [apiKey]: value });
     const updated: string[] = data?.updated_fields || [];
     if (!updated.includes(apiKey)) {
       // 没进 updated_fields 就是没生效（老 core 没有 rejected_fields，只能这样推断），
@@ -405,9 +465,9 @@ async function saveProbeSwitch(apiKey: ProbeApiKey, value: boolean) {
     // 需重启的那一项用 warning 而不是 success：说「保存成功」会让用户以为行为已经变了。
     if (PROBE_NEEDS_RESTART[apiKey]) message.warning(`${verb}，需重启后台服务才会生效`);
     else message.success(`${verb}，立即生效`);
-  } catch (e: any) {
+  } catch (e) {
     logForm[formKey] = previous;
-    message.error(e?.response?.data?.error || '保存失败，开关已回滚');
+    message.error(toApiErrorMessage(e, '保存失败，开关已回滚'));
   } finally {
     probeSaving[apiKey] = false;
   }
@@ -489,14 +549,16 @@ function onLogLevelChange() {
 
 function clearLogs() {
   dialog.warning({
-    title: '清空日志',
-    content: '确定清空所有调试日志？',
+    title: '清空内存日志',
+    // 2026-10-30 F12：这条只清内存缓冲，落盘文件在下一张卡片里单独删 ——
+    // 旧文案「清空所有调试日志」会让人以为磁盘也干净了。
+    content: '清空内存中的日志列表？落盘文件不会被删除（可在「落盘日志文件」卡片里删）。',
     positiveText: '清空',
     negativeText: '取消',
     onPositiveClick: async () => {
       try {
         await api.delete('/api/debug-logs');
-        message.success('日志已清空');
+        message.success('内存日志已清空');
         loadDebugLogs();
       } catch {
         message.error('清空失败');
@@ -521,6 +583,97 @@ function onVisible() {
 }
 
 // ══════════════════════════════════════════════
+//  落盘日志文件（2026-10-30 F13）
+// ══════════════════════════════════════════════
+
+interface LogFileEntry {
+  name: string;
+  size: number;
+  modified: number;
+}
+
+const logFiles = ref<LogFileEntry[]>([]);
+const logFilesLoading = ref(false);
+const logFilesError = ref('');
+const logFilesDir = ref('');
+/** core 因低磁盘暂停写文件（F4）；此时列表会停在最后一次成功写入的状态。 */
+const logFilesDegraded = ref(false);
+const logDiskFree = ref(-1);
+/** 日志跨度（日期目录个数）；日志不按天删除，这个值只用于展示。 */
+const logDays = ref(0);
+/** 今天的写入量。 */
+const logTodayBytes = ref(0);
+const logFileView = ref<{ name: string; text: string } | null>(null);
+
+const logFilesBytes = computed(() => logFiles.value.reduce((sum, file) => sum + (Number(file.size) || 0), 0));
+
+/** 占用超过 500MB 就在页面上提示一次（不阻止、不删除，只让用户知道）。 */
+const logFilesHeavy = computed(() => logFilesBytes.value > 500 * 1024 * 1024);
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+async function loadLogFiles() {
+  logFilesLoading.value = true;
+  logFilesError.value = '';
+  try {
+    const { data } = await api.get('/api/debug-logs/files');
+    logFiles.value = Array.isArray(data?.files) ? data.files : [];
+    logFilesDir.value = typeof data?.dir === 'string' ? data.dir : '';
+    logFilesDegraded.value = data?.degraded === true;
+    logDiskFree.value = typeof data?.disk_free_bytes === 'number' ? data.disk_free_bytes : -1;
+    logDays.value = typeof data?.days === 'number' ? data.days : 0;
+    logTodayBytes.value = typeof data?.today_bytes === 'number' ? data.today_bytes : 0;
+  } catch (e) {
+    // 失败不清空上次列表（与日志列表同口径：读失败不等于没有）
+    logFilesError.value = toApiErrorMessage(e, '读取落盘日志失败');
+  } finally {
+    logFilesLoading.value = false;
+  }
+}
+
+async function openLogFile(name: string) {
+  logFilesLoading.value = true;
+  try {
+    // name 形如 `2026-10-30/app.log` 或 `crash/crash_123.txt`；core 用 `{name...}` 匹配多段路径
+    const { data } = await api.get(`/api/debug-logs/files/${name}`, { responseType: 'text' });
+    logFileView.value = { name, text: typeof data === 'string' ? data : String(data ?? '') };
+  } catch (e) {
+    message.error(toApiErrorMessage(e, '读取文件失败'));
+  } finally {
+    logFilesLoading.value = false;
+  }
+}
+
+function closeLogFileView() {
+  logFileView.value = null;
+}
+
+function deleteLogFiles() {
+  dialog.warning({
+    title: '删除落盘日志',
+    content: '将删除 core 的全部落盘日志（含崩溃现场），不可恢复。确定继续？',
+    positiveText: '删除',
+    negativeText: '取消',
+    onPositiveClick: async () => {
+      try {
+        await api.delete('/api/debug-logs/files');
+        message.success('落盘日志已删除');
+        logFileView.value = null;
+        await loadLogFiles();
+      } catch (e) {
+        message.error(toApiErrorMessage(e, '删除失败'));
+      }
+    },
+  });
+}
+
+// ══════════════════════════════════════════════
 //  Lifecycle
 // ══════════════════════════════════════════════
 
@@ -533,6 +686,7 @@ onMounted(() => {
   // 面板是弹窗内容，只在被打开时挂载，所以这两次取数不会挤在首屏（见 SettingsView 注释）
   loadLogConfig();
   loadDebugLogs();
+  loadLogFiles();
   document.addEventListener('visibilitychange', onVisible);
 });
 
@@ -545,6 +699,75 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* ── 落盘日志文件（2026-10-30 F13）── */
+.log-warn {
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--warning, #d48806);
+  background: var(--warning-soft, rgba(212, 136, 6, 0.12));
+}
+.log-files-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.log-files-dir {
+  word-break: break-all;
+}
+.log-files-hint {
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.log-file-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  cursor: pointer;
+}
+.log-file-item:last-child {
+  border-bottom: none;
+}
+.log-file-item:hover {
+  background: var(--surface-hover);
+}
+.log-file-name {
+  word-break: break-all;
+}
+.log-file-size {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+.log-file-view-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 12px;
+}
+.log-file-text {
+  margin: 0;
+  padding: 10px;
+  max-height: 360px;
+  overflow: auto;
+  font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 /* .settings-panel 栅格与断点已统一到 src/styles/main.css（全局，8 个面板共用一份） */
 
 /* ── Config layout ──

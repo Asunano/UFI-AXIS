@@ -39,6 +39,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 import { getApiClient } from '@/composables/useApi';
+import { updateConfig } from '@/api/config';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 import { useAppStore } from '@/stores/app';
 
@@ -83,7 +84,7 @@ async function stopDaemon() {
 
 async function enableTtyd() {
   try {
-    await api.put('/api/config', { ttyd_enabled: true }); // 2026-10-07 修复：/api/config 只有 GET/PUT，POST 一律 405
+    await updateConfig(api, { ttyd_enabled: true }); // 2026-10-07 修复：/api/config 只有 GET/PUT，POST 一律 405
     enabled.value = true;
     connect();
   } catch {

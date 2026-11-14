@@ -31,14 +31,12 @@ export interface BatteryInfo {
   temperature: number;
   voltage: number;
   technology: string;
-  [key: string]: any;
 }
 
 export interface StorageInfo {
   total: number;
   available: number;
   used: number;
-  [key: string]: any;
 }
 
 /**
@@ -49,7 +47,6 @@ export interface StorageInfo {
 export interface UptimeInfo {
   uptime_seconds: number;
   uptime_display: string;
-  [key: string]: any;
 }
 
 export interface TrafficSummary {
@@ -102,9 +99,10 @@ export interface NetworkStatus {
     has_internet: boolean;
     has_cellular: boolean;
     has_wifi: boolean;
-    [key: string]: any;
   };
+  /** 移动数据**开关**（用户意图）。换制式的重拨窗口里仍为 true，不能当链路态用。 */
   mobile_data: boolean;
+  /** 链路态（设备原值，空串 = 这次没读到）。判断"现在通不通"读它，不是 mobile_data。 */
   ppp_status: string;
   operator: string;
   network_type: string;
@@ -125,13 +123,21 @@ export interface SignalInfo {
   band_width?: number;
   signal_strength?: number;
   pci?: number;
+  // 下面三个是 `/api/network/signal` 的顶层字段（core SignalCollector 落库，见 API 文档 1752 行）。
+  // 原先接口里没有它们，而 `[key: string]: any` 让 `signal.operator` 这样的读取静默通过 ——
+  // 2026-10-30 去掉索引签名时，编译期只在这一处报错，正好补上声明（值确实来自设备）。
+  /** 运营商名。驻网即有；WS 还没推第一帧时用 summary.device_info.network.operator 兜底 */
+  operator?: string;
+  /** 小区 ID。值域可能超出 Int，core 按字符串返回 */
+  cell_id?: string;
+  /** 是否已注册到网络（命中缓存时 core 只实时补这一个字段） */
+  network_registered?: boolean;
   // 制式专属字段：core 只在对应制式驻网时下发，缺失即表示当前不在该制式。
   // 只在需要看 NSA 双连接两侧数据时才读它们（旧的 lte_bands / nr_bands 是错的字段名，已删）。
   nr_band?: string;
   nr_arfcn?: number;
   lte_band?: string;
   lte_arfcn?: number;
-  [key: string]: any;
 }
 
 export interface CpuInfo {
@@ -170,7 +176,6 @@ export interface WifiSettings {
   chip_index: string;
   /** WiFi 模块开关；由 normalizeWifiSettings 从 WiFiModuleSwitch / wifi_enable / wifi_onoff_state 归一 */
   enabled: boolean;
-  [key: string]: any;
 }
 
 export interface BandStatus {
@@ -182,7 +187,6 @@ export interface WifiClient {
   hostname: string;
   ip_addr: string;
   mac: string;
-  [key: string]: any;
 }
 
 /** WiFi 接入控制名单里的一台设备（`/api/wifi/acl`）。`name` 可能是空串。 */
@@ -210,7 +214,6 @@ export interface CellInfo {
   serving_cell?: Record<string, any>;
   neighbor_cells?: NeighborCell[];
   locked_cells?: Record<string, any>[];
-  [key: string]: any;
 }
 
 export interface NeighborCell {
@@ -220,7 +223,6 @@ export interface NeighborCell {
   rsrq: number;
   sinr: number;
   rat: string;
-  [key: string]: any;
 }
 
 export interface PairingInfo {

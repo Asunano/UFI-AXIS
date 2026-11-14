@@ -8,5 +8,7 @@
     "strict": true,
     "skipLibCheck": true
   },
-  "include": ["vite.config.ts"]
+  // vitest.config.ts 也在这个项目里：它有 node 侧 import（node:url），
+  // 与 vite.config.ts 同类。不列进来等于让单测配置永远不过类型检查。
+  "include": ["vite.config.ts", "vitest.config.ts"]
 }

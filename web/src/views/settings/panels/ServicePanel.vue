@@ -140,7 +140,7 @@ import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 import { Endpoints } from '@/api/contract';
-import { formatUptime } from '@/views/settings/settingsShared';
+import { formatUptimeMs } from '@/views/settings/settingsShared';
 import { useServiceStore } from '@/stores/service';
 import { useServiceRestart } from '@/composables/useServiceRestart';
 
@@ -215,9 +215,9 @@ const serviceRestartType = computed<'warning' | 'success' | 'error'>(() => {
   if (serviceRestarting.value) return 'warning';
   return 'success';
 });
-// 共享版 settingsShared.formatUptime 与拆分前的实现一致，收的是**毫秒**（内部自己 /1000），
+// settingsShared.formatUptimeMs 与拆分前的实现一致，收的是**毫秒**（内部自己 /1000），
 // 所以这里直接传 uptime_ms，不要再换算。
-const serviceUptimeText = computed(() => (service.loaded ? formatUptime(service.uptimeMs) : '--'));
+const serviceUptimeText = computed(() => (service.loaded ? formatUptimeMs(service.uptimeMs) : '--'));
 
 // ── 缓存管理 ──
 // 2026-10-14 整体移到 PerformancePanel：cacheStats / cachePattern / cacheLoading / loadCacheStats /

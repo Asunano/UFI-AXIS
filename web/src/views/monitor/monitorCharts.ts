@@ -36,8 +36,14 @@ function emptyTitle(len: number, colors: ChartColors): Option {
   };
 }
 
-function legendOf(data: string[], colors: ChartColors): Option {
-  return { data, textStyle: { color: colors.textSecondary, fontSize: 11 }, top: 0, right: 0 };
+function legendOf(data: string[], colors: ChartColors, formatter?: (name: string) => string): Option {
+  return {
+    data,
+    textStyle: { color: colors.textSecondary, fontSize: 11 },
+    top: 0,
+    right: 0,
+    ...(formatter ? { formatter } : {}),
+  };
 }
 
 function tooltipOf(colors: ChartColors, formatter: (params: any) => string): Option {
@@ -214,7 +220,9 @@ export function signalChartOption(rsrpData: Pt[] | undefined, sinrData: Pt[] | u
   return {
     color: [ctx.colors.info, ctx.colors.warning],
     title: emptyTitle(rsrp.length + sinr.length, ctx.colors),
-    legend: legendOf(['RSRP', 'SINR'], ctx.colors),
+    // 图例和其他图一样靠右；单位挪到图例文字里，避免右 Y 轴名称
+    // “SINR (dB)”再贴右上角和图例叠在一起。
+    legend: legendOf(['RSRP', 'SINR'], ctx.colors, (name) => (name === 'RSRP' ? 'RSRP (dBm)' : 'SINR (dB)')),
     grid: { top: 30, right: 50, bottom: 24, left: 50 },
     tooltip: tooltipOf(ctx.colors, (params: any) => {
       if (!params?.length) return '';
@@ -226,7 +234,8 @@ export function signalChartOption(rsrpData: Pt[] | undefined, sinrData: Pt[] | u
       return html;
     }),
     xAxis: timeAxis(ctx),
-    yAxis: [axis('RSRP (dBm)', 'left', true), axis('SINR (dB)', 'right', false)],
+    // 轴单位已写进图例；不再把两个轴名贴到左右上角，避免与右对齐图例抢位置。
+    yAxis: [axis('', 'left', true), axis('', 'right', false)],
     series: [series('RSRP', rsrp, 0), series('SINR', sinr, 1)],
   };
 }

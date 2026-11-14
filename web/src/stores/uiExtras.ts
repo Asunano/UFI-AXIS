@@ -50,10 +50,38 @@ function emptyPoetryConfig(): PoetryConfig {
   return { enabled: false, show_origin: true };
 }
 
+/**
+ * 顶栏挂件的最后一次数据快照。
+ *
+ * 顶栏在每次刷新时都会先看到空 store：配置接口回来之前天气/诗句都不渲染，
+ * 用户看到的就是一块空白（实测网络慢时尤其明显）。缓存只服务于「先画出来」，
+ * 真实数据回来后仍会被 fetch 覆盖；配置关掉时条目会被清掉，避免隐藏的旧值复活。
+ */
+const WEATHER_CACHE_KEY = 'ufi-weather-cache-v1';
+const POETRY_CACHE_KEY = 'ufi-poetry-cache-v1';
+
+function readCache<T>(key: string): T | null {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key: string, value: unknown | null) {
+  try {
+    if (value) localStorage.setItem(key, JSON.stringify(value));
+    else localStorage.removeItem(key);
+  } catch {
+    /* 隐私模式 / 配额满：缓存只是加速，不影响主路径 */
+  }
+}
+
 export const useUiExtrasStore = defineStore('uiExtras', () => {
   // ── 天气 ──
   const weatherConfig = ref<WeatherConfig>(emptyWeatherConfig());
-  const weather = ref<WeatherNow | null>(null);
+  const weather = ref<WeatherNow | null>(readCache<WeatherNow>(WEATHER_CACHE_KEY));
   const weatherLoading = ref(false);
   /** 配置是否已回读成功。设置面板靠它决定开关能不能动 —— 没读到就切换等于拿本地初值覆盖设备真值。 */
   const weatherConfigLoaded = ref(false);
@@ -61,7 +89,7 @@ export const useUiExtrasStore = defineStore('uiExtras', () => {
 
   // ── 诗词 ──
   const poetryConfig = ref<PoetryConfig>(emptyPoetryConfig());
-  const poetry = ref<PoetryNow | null>(null);
+  const poetry = ref<PoetryNow | null>(readCache<PoetryNow>(POETRY_CACHE_KEY));
   const poetryLoading = ref(false);
   const poetryConfigLoaded = ref(false);
   let poetryFetchedAt = 0;
@@ -119,7 +147,10 @@ export const useUiExtrasStore = defineStore('uiExtras', () => {
     try {
       const { data } = await getApiClient().get<WeatherNow>(Endpoints.weather.now);
       // `configured: false` 也照样收下：顶栏要据此显示"未设城市"而不是空白
-      if (data) weather.value = data;
+      if (data) {
+        weather.value = data;
+        writeCache(WEATHER_CACHE_KEY, data.configured ? data : null);
+      }
       weatherFetchedAt = Date.now();
     } catch {
       /* 上游不可达是 502，静默保留上一次的值 */
@@ -142,7 +173,10 @@ export const useUiExtrasStore = defineStore('uiExtras', () => {
       const { data } = await getApiClient().get<PoetryNow>(Endpoints.poetry.now, {
         params: force ? { refresh: 1 } : undefined,
       });
-      if (data?.content) poetry.value = data;
+      if (data?.content) {
+        poetry.value = data;
+        writeCache(POETRY_CACHE_KEY, data);
+      }
       poetryFetchedAt = Date.now();
     } catch {
       /* 上游不可达是 502，静默保留上一次的值 */
@@ -171,6 +205,7 @@ export const useUiExtrasStore = defineStore('uiExtras', () => {
     if (!weatherConfig.value.enabled) {
       // 关掉时清空数据：留着旧值会在下次打开的瞬间闪一下过时的温度
       weather.value = null;
+      writeCache(WEATHER_CACHE_KEY, null);
     } else {
       await fetchWeather(true);
     }
@@ -188,6 +223,7 @@ export const useUiExtrasStore = defineStore('uiExtras', () => {
     poetryFetchedAt = 0;
     if (!poetryConfig.value.enabled) {
       poetry.value = null;
+      writeCache(POETRY_CACHE_KEY, null);
     } else {
       await fetchPoetry(true);
     }

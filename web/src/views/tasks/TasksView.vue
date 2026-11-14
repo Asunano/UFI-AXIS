@@ -1,5 +1,10 @@
 <template>
   <div class="tasks-view">
+    <!-- 页面标题由下方卡片的 tab 标题承担（定时任务 / 自动化规则），这里只放返回，避免同一标题出现两次 -->
+    <div class="page-head">
+      <BackButton />
+    </div>
+
     <GridCard :title="activeTab === 'scheduled' ? '定时任务' : '自动化规则'">
       <template #extra>
         <div class="top-actions">
@@ -124,6 +129,7 @@ import { useInterval } from '@/composables/useRealtime';
 import { useMessage, useDialog } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useWebSocketStore } from '@/stores/websocket';
+import BackButton from '@/components/BackButton.vue';
 import GridCard from '@/components/GridCard.vue';
 import PresetChips from './components/PresetChips.vue';
 import RuleTemplateChips from './components/RuleTemplateChips.vue';
@@ -380,6 +386,12 @@ onUnmounted(() => unsubTasks());
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.page-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
 }
 .tab-hint {
   margin: 4px 0 14px;

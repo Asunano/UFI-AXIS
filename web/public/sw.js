@@ -12,9 +12,19 @@
  * index.html 里的 controllerchange 一次性 reload，避免旧页面跑在新壳上的半新半旧态。
  * 注意 core 的 WebUpdateManager 独立更新整个 web 目录（zip 替换），sw.js 也会被
  * 一并换掉，浏览器按字节对比自动发现新版本 —— 两条更新链路不打架。
+ *
+ * ## 缓存名带版本（2026-10-30）
+ * 下面这行在**构建期**会被 `vite.config.ts` 的 `webVersionPlugin` 替换成
+ * `ufi-shell-<根 version.json 的 web.version>`；开发环境（vite dev 直接发这个文件）
+ * 保持 `ufi-shell-dev`。
+ *
+ * 为什么必须带版本：`activate` 里那句"删掉除当前名字以外的所有 cache"只有在新旧名字
+ * **不同**时才起作用。此前名字固定为 `ufi-shell-v1`，于是每次 OTA 都只是往同一个 cache
+ * 里再塞一批新的 hash 资源，旧的那批永远不会被回收 —— 用户浏览器占用的体积只增不减。
+ * 改名前请同步改 `vite.config.ts` 里的 `SW_CACHE_MARKER`，否则构建会直接失败（故意的）。
  */
 
-const CACHE = 'ufi-shell-v1';
+const CACHE = 'ufi-shell-dev';
 const SHELL = ['/', '/index.html', '/favicon.svg', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {

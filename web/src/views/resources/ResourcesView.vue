@@ -15,7 +15,10 @@
 <template>
   <div class="resources-view">
     <header class="res-head">
-      <h1>插件与组件</h1>
+      <div class="res-head-main">
+        <BackButton />
+        <h1>插件与组件</h1>
+      </div>
       <n-button size="small" tertiary @click="goServiceUpdates">前往服务更新</n-button>
     </header>
 
@@ -27,6 +30,7 @@
 import { onMounted, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useRouter } from 'vue-router';
+import BackButton from '@/components/BackButton.vue';
 import ResourceCard from './components/ResourceCard.vue';
 import { COMPONENT_RESOURCES } from './resourceRegistry';
 import { useResourceTask, type ResourceNotice } from './useResourceTask';
@@ -87,6 +91,12 @@ function goServiceUpdates() {
   justify-content: space-between;
   gap: 16px;
   padding: 0 2px 4px;
+}
+.res-head-main {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
 }
 .res-head h1 {
   margin: 0;

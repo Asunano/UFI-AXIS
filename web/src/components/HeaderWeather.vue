@@ -8,35 +8,62 @@
   2. 关着、未设城市、或还没取到数时**整个挂件不渲染**。顶栏空间紧，
      显示一个"--°C"的占位只会让人以为功能坏了；未设城市的引导放在设置面板里。
 -->
+<!--
+  2026-10-31：这里的 n-popover **不能**用 `v-if="visible"`。
+  那样在 visible 由 true 变 false 时（数据轮询、换一句、路由跳转）会直接卸载组件，
+  跳过内部 <Transition> 的离场动画，Vue 抛 runtime-15
+  「Cannot read properties of null (reading 'parentNode')」。
+  改成常驻 + :disabled 控制交互、trigger 用 v-show 保持"关着不占位"的视觉。
+-->
 <template>
-  <n-popover v-if="visible" trigger="click" placement="bottom-end" :width="300">
+  <n-popover trigger="click" :disabled="!visible" placement="bottom-end" :width="300">
     <template #trigger>
-      <div class="weather-chip" :title="chipTitle">
-        <span class="weather-temp">{{ tempText }}</span>
-        <span class="weather-desc">{{ w?.description || '' }}</span>
+      <div
+        v-show="visible || loading"
+        class="weather-chip"
+        :class="{ 'weather-loading': loading }"
+        :title="loading ? '天气加载中' : chipTitle"
+      >
+        <template v-if="visible">
+          <span class="weather-temp">{{ tempText }}</span>
+          <span class="weather-desc">{{ w?.description || '' }}</span>
+        </template>
+        <span v-else class="weather-loading-text">天气加载中…</span>
       </div>
     </template>
 
-    <!-- 详情：与手机端 WeatherDetailDialog 同一组字段、同一顺序 -->
+    <!-- 详情浮层（2026-11-07 改版）：温度优先，指标卡片化；
+         与手机端 WeatherDetailDialog 同一组字段，顺序一致。 -->
     <div class="weather-detail">
-      <div class="detail-head">
-        <span class="detail-city">{{ w?.city }}</span>
+      <div class="wx-hero">
+        <span class="wx-temp">{{ tempText }}</span>
+        <span class="wx-hero-right">
+          <span v-if="wxGlyph" class="wx-glyph" aria-hidden="true">{{ wxGlyph }}</span>
+          <span class="wx-desc">{{ w?.description }}</span>
+        </span>
+      </div>
+
+      <div class="wx-sub">
+        <span class="wx-city">{{ w?.city }}</span>
+        <span v-if="updatedShort" class="wx-updated">· {{ updatedShort }} 更新</span>
+        <span class="wx-grow"></span>
         <n-button size="tiny" quaternary :loading="store.weatherLoading" @click="store.fetchWeather(true)">
           刷新
         </n-button>
       </div>
-      <div class="detail-now">
-        <span class="detail-temp">{{ tempText }}</span>
-        <span class="detail-desc">{{ w?.description }}</span>
-      </div>
-      <div class="detail-grid">
-        <div v-for="row in detailRows" :key="row.label" class="detail-row">
-          <span class="detail-label">{{ row.label }}</span>
-          <span class="detail-value">{{ row.value }}</span>
+
+      <div class="wx-metrics">
+        <div v-for="m in metrics" :key="m.label" class="wx-metric">
+          <span class="wx-metric-label">{{ m.label }}</span>
+          <span class="wx-metric-value">{{ m.value }}</span>
         </div>
       </div>
-      <!-- core 的 15 分钟缓存意味着这个时间可能比"刚点的刷新"早不少，所以显式标出来 -->
-      <div v-if="updatedText" class="detail-foot">数据时间：{{ updatedText }}</div>
+
+      <div class="wx-extra">
+        <span v-for="e in extras" :key="e.label"
+          >{{ e.label }} <b>{{ e.value }}</b></span
+        >
+      </div>
     </div>
   </n-popover>
 </template>
@@ -52,6 +79,10 @@ const w = computed(() => store.weather);
 
 /** `configured: false` 时 core 只回一句 message，没有任何数值 —— 那种情况不渲染。 */
 const visible = computed(() => store.weatherConfig.enabled && w.value?.configured === true);
+/** 配置已开但数据还没回来（首次打开 / 网络慢）：顶栏先显示一个轻量占位，避免整块空白。 */
+const loading = computed(
+  () => store.weatherConfigLoaded && store.weatherConfig.enabled && !w.value && store.weatherLoading
+);
 
 /** 单位符号取响应里的 `unit`（而不是本地配置）：配置刚改完、数据还是上一单位时不会说错。 */
 const unitSuffix = computed(() => (w.value?.unit === WeatherUnit.FAHRENHEIT ? '°F' : '°C'));
@@ -66,18 +97,46 @@ const chipTitle = computed(() => {
   return [c.city, c.description, tempText.value].filter(Boolean).join(' · ');
 });
 
-const detailRows = computed(() => {
+/** 四项主指标：体感 / 今日范围 / 湿度 / 风速（顺序与手机端一致） */
+const metrics = computed(() => {
   const c = w.value;
   if (!c) return [];
   return [
-    { label: '体感温度', value: fmt(c.apparent_temperature) },
-    { label: '今日范围', value: `${fmt(c.temp_min)} ~ ${fmt(c.temp_max)}` },
+    { label: '体感', value: fmt(c.apparent_temperature) },
+    { label: '今日', value: `${fmt(c.temp_min)} ~ ${fmt(c.temp_max)}` },
     { label: '湿度', value: typeof c.humidity === 'number' ? `${c.humidity}%` : '--' },
-    { label: '降水', value: typeof c.precipitation === 'number' ? `${c.precipitation} mm` : '--' },
     // 风速单位由上游给定（km/h），core 不换算，这里也不换算
     { label: '风速', value: typeof c.wind_speed === 'number' ? `${c.wind_speed} km/h` : '--' },
-    { label: '日出 / 日落', value: [hhmm(c.sunrise), hhmm(c.sunset)].join(' / ') },
   ];
+});
+
+/** 次级信息：降水与日出日落，压成一行 */
+const extras = computed(() => {
+  const c = w.value;
+  if (!c) return [];
+  return [
+    { label: '降水', value: typeof c.precipitation === 'number' ? `${c.precipitation} mm` : '--' },
+    { label: '日出', value: hhmm(c.sunrise) },
+    { label: '日落', value: hhmm(c.sunset) },
+  ];
+});
+
+/**
+ * 天气图标：core 只下发中文描述，没有天气码，所以按关键字粗分五档。
+ * 匹配不到就返回空串（宁可没有图标，也不要显示一个错的太阳）。
+ * 更稳的做法是让 core 在天气接口里带一个 code —— 那时这里换查表即可。
+ */
+const wxGlyph = computed(() => {
+  const d = w.value?.description || '';
+  if (!d) return '';
+  if (d.includes('雷')) return '⚡';
+  if (d.includes('雪') || d.includes('冻')) return '❄';
+  if (d.includes('雨')) return '☂';
+  if (d.includes('雾') || d.includes('霾') || d.includes('沙')) return '≡';
+  if (d.includes('阴')) return '☁';
+  if (d.includes('云')) return '⛅';
+  if (d.includes('晴')) return '☀';
+  return '';
 });
 
 /**
@@ -116,9 +175,14 @@ function toMillis(ts: unknown): number | null {
   return null;
 }
 
-const updatedText = computed(() => {
+const updatedShort = computed(() => {
   const ms = toMillis(w.value?.updated_at);
-  return ms == null ? '' : new Date(ms).toLocaleString('zh-CN', { hour12: false });
+  if (ms == null) return '';
+  return new Date(ms).toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 });
 </script>
 
@@ -161,6 +225,11 @@ const updatedText = computed(() => {
   font-weight: 600;
   white-space: nowrap;
 }
+.weather-loading-text {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
 .weather-desc {
   white-space: nowrap;
   overflow: hidden;
@@ -168,68 +237,108 @@ const updatedText = computed(() => {
   color: var(--text-secondary);
 }
 
-/* ── 详情浮层 ── */
+/* ── 详情浮层（B 方案：温度优先 + 指标小卡；无渐变底色） ── */
 .weather-detail {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-.detail-head {
+
+.wx-hero {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.detail-city {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-}
-.detail-now {
-  display: flex;
-  align-items: baseline;
   gap: 10px;
 }
-.detail-temp {
-  font-size: 26px;
-  font-weight: 600;
+.wx-temp {
+  font-size: 36px;
+  font-weight: 700;
   line-height: 1;
   color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
 }
-.detail-desc {
+.wx-hero-right {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+}
+.wx-glyph {
+  font-size: 22px;
+  line-height: 1;
+  color: var(--warning, #e0a020);
+}
+.wx-desc {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 城市与更新时间：比其他次要文字大一档，避免"浮层里最看不清的是地名" */
+.wx-sub {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-size: 13px;
   color: var(--text-secondary);
 }
-.detail-grid {
+.wx-city {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.wx-updated {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+.wx-grow {
+  flex: 1;
+}
+
+.wx-metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.wx-metric {
   display: flex;
   flex-direction: column;
+  gap: 1px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--surface-elevated, var(--card-bg));
+  min-width: 0;
 }
-.detail-row {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 5px 0;
-  border-bottom: 1px solid var(--border-subtle);
-}
-.detail-row:last-child {
-  border-bottom: none;
-}
-.detail-label {
-  font-size: 12px;
-  color: var(--text-muted);
-}
-.detail-value {
-  font-size: 12px;
-  color: var(--text-primary);
-  text-align: right;
-}
-.detail-foot {
+.wx-metric-label {
   font-size: 11px;
   color: var(--text-muted);
 }
+.wx-metric-value {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-/* 手机上只留温度：顶栏已经很挤，描述换行会把顶栏撑成两行 */
+.wx-extra {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.wx-extra b {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
 @media (max-width: 768px) {
   .weather-desc {
     display: none;

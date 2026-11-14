@@ -1,19 +1,18 @@
 /**
  * 设备网络类写操作的唯一实现处。
  *
- * 为什么要有这个文件：这批 handler 原来全挤在 `views/network/NetworkView.vue` 里，
- * 仪表盘想加同样的快捷开关只能再抄一份。而抄一份必错 —— 每个写操作背后有三条
- * 「不写出来就一定会踩」的设备约定：
+ * 集中实现的原因：这批 handler 原先全部位于 `views/network/NetworkView.vue`，仪表盘若要提供
+ * 同样的快捷开关只能复制一份，而复制必然出错 —— 每个写操作背后有三条设备约定：
  *
- *   1. **写完不能立刻回读**。设备 goform 写入到查询接口能看到新值之间有延迟（~600ms），
- *      立刻回读拿到的是旧值，会把开关刷回改动前的状态。
- *   2. **移动数据 / 飞行模式 / 拨号要等更久**（2–3s）：settings 落盘后 ppp 状态才跟上。
- *   3. **HTTP 200 不等于成功**。core 有一批端点走「信封失败」：`{ success: false, error }`
- *      配 200 返回，只 catch 异常会把失败报成成功。
+ *   1. **写入后不能立即回读**。设备 goform 写入到查询接口可见新值之间存在延迟（约 600ms），
+ *      立即回读得到的是旧值，会把开关刷回修改前的状态。
+ *   2. **移动数据 / 飞行模式 / 拨号需要更长时间**（2–3s）：settings 落盘后 ppp 状态才跟上。
+ *   3. **HTTP 200 不等于成功**。core 有一批端点使用「信封失败」：`{ success: false, error }`
+ *      配 200 返回，只捕获异常会把失败报成成功。
  *
- * ── 怎么加一个新的控制（这是本文件的扩展点）──
+ * ── 新增控制的方式（本文件的扩展点）──
  *
- * 一律走 `runWrite()`，不要自己写 try/catch/toast：
+ * 一律通过 `runWrite()`，不得自行编写 try/catch/toast：
  *
  *   const ledSaving = ref(false);
  *   const setLed = (enabled: boolean) =>
@@ -24,32 +23,31 @@
  *       after: { reload: loadDeviceSettings, always: true },
  *     });
  *
- * 然后在下面 return 里加一行导出即可。要删一个控制就删掉这两处，没有别的地方要同步。
- * `after` 那四个字段已经覆盖了目前设备侧全部的回读节奏，新控制基本只需要挑组合：
+ * 然后在文件末尾的 return 中增加一行导出。删除控制时删除这两处即可，不存在其它同步点。
+ * `after` 的四个字段已覆盖目前设备侧全部回读节奏，新控制只需选择组合：
  *   · 普通开关       → `{ reload: 回读函数, always: true }`
  *   · ppp 拨号/断开  → `{ delayMs: DIAL_SETTLE_MS, reload: refreshNetworkStatus, detached: true }`
- *     （飞行模式已不在这一档：它要等重新注册，走 A 级 `ops.run()` 轮询确认，见下面两类操作）
+ *     （飞行模式不在此档：它需要等待重新注册，走 A 级 `ops.run()` 轮询确认，见下）
  *   · 只写不读       → 省略 `after`
  *
- * 本文件不碰任何布局，也不 import 任何组件：调用方自己决定用什么控件、放在哪张卡。
+ * 本文件不涉及任何布局，也不 import 任何组件：控件与摆放位置由调用方决定。
  *
- * ── 两类操作，两种"状态放哪"（2026-10-14）──
+ * ── 两类操作与状态存放位置 ──
  *
- *   · **B 级（普通开关）** 走 `runWrite()`：一次写 + 一次回读，秒级完成，
- *     状态位（`xxxSaving`）留在本 composable 的实例里是对的 —— 切页时那次写已经结束了。
+ *   · **B 级（普通开关）** 走 `runWrite()`：一次写入 + 一次回读，秒级完成，
+ *     状态位（`xxxSaving`）保存在本 composable 的实例中是合理的 —— 切页时该次写入已结束。
  *   · **A 级（WiFi 总开关 / 移动数据 / 飞行模式 / 制式切换 / WiFi 频段 / 基站锁定·解锁）**
- *     走 `ops.run()`：下发后要**轮询回读**十几秒才知道设备有没有生效，这段"进行中"比页面活得久。
- *     所以状态位与执行器都在 `stores/networkOps`（由 DefaultLayout 挂载），
- *     本文件只负责"这次操作做什么"：标题文案、submit、verify。
+ *     走 `ops.run()`：下发后需要**轮询回读**十几秒才能确定设备是否生效，这段「进行中」状态
+ *     的生命周期长于页面。因此状态位与执行器都在 `stores/networkOps`（由 DefaultLayout 挂载），
+ *     本文件只负责「这次操作做什么」：标题文案、submit、verify。
  *
- *     2026-10-14：后两项（WiFi 频段、基站锁定）是本次补进来的 —— 它们原来在各自的弹窗里
- *     `POST` 完等 600ms 单读一次就渲染，而设备侧这两条命令都会重启 WiFi 模块 / 重新驻留小区，
- *     600ms 时界面拿到的还是旧值（详见 [switchWifiBand] 与 [lockCell] 的注释）。
+ *     WiFi 频段与基站锁定同属 A 级：这两条命令在设备侧会重启 WiFi 模块 / 重新驻留小区，
+ *     写入后单次回读在 600ms 时得到的仍是旧值（详见 [switchWifiBand] 与 [lockCell] 的注释）。
  *
- * ⚠ A 级操作的 submit / verify 一律用 [opApi]（**不随页面卸载取消**）而不是 [api]。
- * 这是 2026-10-14 这次改造的关键一步：改前页面一卸载，`useCancellableApi` 就把在途请求
- * abort 成 `{ __canceled: true }`，回读被当成"没到达"，轮询空转到预算用尽 —— 于是"切页"
- * 会直接把一次正在进行的操作判死。现在这次操作的生命周期跟着 store 走，请求自然也不能被页面带走。
+ * 注意：A 级操作的 submit / verify 一律使用 [opApi]（**不随页面卸载取消**），而不是 [api]。
+ * 原因：`useCancellableApi` 在页面卸载时会把在途请求 abort 成 `{ __canceled: true }`，
+ * 回读被判定为「未到达」，轮询空转到预算耗尽 —— 切换页面即会中断一次正在进行的操作。
+ * 操作生命周期跟随 store，请求同样不能被页面带走。
  */
 import { ref, computed, onScopeDispose, toRef, watch } from 'vue';
 import { useMessage } from 'naive-ui';
@@ -68,16 +66,14 @@ import {
   wifiBandFromChipIndex,
 } from '@/api/contract';
 import type { WifiBand } from '@/api/contract';
-// 2026-10-05 P3 修复：A 级操作（WiFi 总开关 / 移动数据 / 飞行模式 / 制式切换）接入确认器。
-// 2026-10-14：确认器的**状态**移到 stores/networkOps（切页不丢），这里只留"这次操作做什么"。
+// A 级操作（WiFi 总开关 / 移动数据 / 飞行模式 / 制式切换）通过确认器执行。
+// 确认器的**状态**位于 stores/networkOps（切页不丢失），本文件只保留「这次操作做什么」。
 import { useNetworkOpsStore } from '@/stores/networkOps';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
 
 /** 设备 goform 写入到查询接口可见的延迟补偿。见文件头约定 1。 */
 const SETTLE_MS = 600;
-/** ppp 相关状态（移动数据 / 飞行模式）落盘后要更久才反映出来。见约定 2。 */
-// 2026-10-05 P3 修复：这两类操作改走确认器轮询回读，固定 2s 延迟补偿不再需要
-/** 拨号动作最慢，给 3s。 */
+/** 拨号动作最慢，延迟补偿取 3s。见文件头约定 2。 */
 const DIAL_SETTLE_MS = 3_000;
 
 /** 写完之后怎么回读。四个字段覆盖了目前全部节奏，加新控制时挑组合即可。 */
@@ -94,7 +90,7 @@ export interface AfterWrite {
   always?: boolean;
   /**
    * true = 不 await，改用 setTimeout 挂到后台。
-   * 给 2–3s 才生效的动作用：否则按钮的 loading 要转满 3 秒。
+   * 适用于 2–3s 才生效的动作，避免按钮的 loading 状态持续 3 秒。
    */
   detached?: boolean;
 }
@@ -121,28 +117,27 @@ export function useNetworkControls() {
   const api = useCancellableApi();
   const dashboardStore = useDashboardStore();
   /**
-   * A 级操作的宿主（状态 + 执行器）。**每次调用 useNetworkControls() 拿到的是同一个 store**，
-   * 这正是"两个页面共用一份进度"的实现方式（改前是各页一份实例级 ref，见文件头 2026-10-14）。
+   * A 级操作的宿主（状态 + 执行器）。**每次调用 useNetworkControls() 得到的是同一个 store**，
+   * 这是「两个页面共用一份进度」的实现方式。
    */
   const ops = useNetworkOpsStore();
   /**
    * A 级操作的读写客户端：**不随页面卸载取消**。
    *
-   * 为什么必须单独一个：这批操作的生命周期已经跟着 store 走了（切页要继续轮询回读），
-   * 而 `useCancellableApi` 会在页面卸载时 abort 掉在途请求、把结果变成 `{ __canceled: true }`，
-   * 回读于是恒判"没到达"。用它就等于"页面一走，这次操作自动判失败"——那正是本次要修的毛病。
-   * B 级操作（runWrite）不受影响，继续用 [api]：那些写完就结束，切页时本来就该收摊。
+   * 必须单独一个的原因：这批操作的生命周期跟随 store（切页后仍需继续轮询回读），
+   * 而 `useCancellableApi` 会在页面卸载时 abort 在途请求、把结果变成 `{ __canceled: true }`，
+   * 回读因此恒判「未到达」，等同于「页面离开即操作失败」。
+   * B 级操作（runWrite）不受影响，继续使用 [api]：这些操作写入后即结束，切页时本应终止。
    */
   const opApi = getApiClient();
 
   /**
-   * detached 回读的 timer 句柄：卸载后这次回读没有意义，dispose 里统一清掉。
+   * detached 回读的 timer 句柄：页面卸载后该次回读已无意义，在 dispose 中统一清除。
    *
-   * 2026-10-14：这里原来还有一个 `disposed` 标志（"本页还在不在"），A 级操作的轮询循环
-   * 靠它提前收摊。那批操作的状态与轮询已经搬到 `stores/networkOps`（由应用壳承载），
-   * **页面卸载不再意味着这次操作作废**，于是这个标志没有读者了，删掉。
-   * B 级写操作（runWrite）本来就不需要它：`useCancellableApi` 把卸载后的请求
-   * resolve 成 `{ __canceled: true }`，runWrite 显式识别这个分支（不 toast、不回读）。
+   * A 级操作的状态与轮询位于 `stores/networkOps`（由应用壳承载），**页面卸载不代表该次操作
+   * 作废**，因此这里不维护「本页是否存在」的标志。
+   * B 级写操作（runWrite）同样不需要：`useCancellableApi` 会把卸载后的请求
+   * resolve 成 `{ __canceled: true }`，runWrite 显式识别该分支（不 toast、不回读）。
    */
   const detachedTimers = new Set<ReturnType<typeof setTimeout>>();
   onScopeDispose(() => {
@@ -151,14 +146,14 @@ export function useNetworkControls() {
   });
 
   /**
-   * 这次回读拿到的到底是不是「一份有内容的设备字段集合」。
+   * 判断本次回读得到的是否为「一份有内容的设备字段集合」。
    *
-   * 为什么每次 verify 都要先问一句（2026-10-14）：A 级操作的判据都是从回读值里**取出一个位**
-   * 再与目标比，而"取不到"与"取到了相反的值"在归一化之后长得一模一样 ——
+   * 每次 verify 必须先做该判断：A 级操作的判据都是从回读值中**取出一个字段**再与目标比较，
+   * 而「取不到」与「取到了相反的值」在归一化之后无法区分 ——
    * `normalizeWifiSettings({})` 的 `enabled` 是 `false`、`chip_index` 是 `'1'`，
-   * `cellInfoLockedCells({})` 是空表。于是一次读失败（200 + 空体、或设备只回了个错误信封）
-   * 会被当成"设备已经是目标状态"，直接弹成功 —— 正是这一批修复要消灭的假开关。
-   * core 在真读不到时通常回 5xx，这里兜的是剩下那条不报错的路径。
+   * `cellInfoLockedCells({})` 是空表。因此一次读取失败（200 + 空体，或设备只返回错误信封）
+   * 会被判定为「设备已处于目标状态」并直接提示成功，即一个无效开关。
+   * core 在确实读不到时通常返回 5xx，此处覆盖的是其余不报错的路径。
    */
   function readbackHasFields(data: unknown): boolean {
     return !!data && typeof data === 'object' && Object.keys(data as Record<string, unknown>).length > 0;
@@ -195,8 +190,8 @@ export function useNetworkControls() {
     }
 
     // 被取消（组件卸载 / 路由切走）视为无结果：不 toast、不回读。
-    // 注意这个分支不能省 —— data 为 undefined 时 `undefined?.success !== false` 为真，
-    // 会掉进成功分支弹一条假的成功提示。
+    // 该分支不得省略 —— data 为 undefined 时 `undefined?.success !== false` 为真，
+    // 会进入成功分支并弹出错误提示。
     if (outcome === 'canceled') return false;
 
     if (outcome === 'ok') {
@@ -236,12 +231,11 @@ export function useNetworkControls() {
   const networkModes = NetworkModeOptions;
 
   /**
-   * **设备当前真实档位**（别名）。空串 = 还没读到。
+   * **设备当前真实档位**（别名）。空串 = 尚未读取。
    *
-   * 与 [selectedMode] 是两个语义不同的值，2026-09-19 拆开：
-   * 原来只有一个 `selectedMode`，而弹窗用 `v-model` 直接改它 —— 于是用户在弹窗里点一下
-   * （还没应用、甚至点了取消），"更多设置"卡上的制式标签就跟着变了，显示的是一个
-   * 设备上并不成立的档位。标签一律读这个，弹窗的待选项读 [selectedMode]。
+   * 与 [selectedMode] 语义不同，两者必须分开：弹窗通过 `v-model` 直接修改 [selectedMode]，
+   * 若标签也读它，用户在弹窗中点击（尚未应用、甚至取消）就会改变「更多设置」卡上的制式标签，
+   * 显示一个设备上并不成立的档位。标签一律读本值，弹窗的待选项读 [selectedMode]。
    */
   const currentMode = ref('');
   /**
@@ -259,6 +253,27 @@ export function useNetworkControls() {
   const modeRefreshing = ref(false);
 
   /**
+   * 「网络模式」弹窗打开 = 用户正在编辑待选档位。
+   *
+   * 需要该标志：两个页面都在以 10s 间隔轮询 [loadDeviceSettings]，而该函数会把回读值写回
+   * [selectedMode]（仅挡住了「切换进行中」）。弹窗打开超过 10 秒后，用户刚选的档位会被
+   * 设备真值覆盖，表现为「选中项自行跳回」「应用按钮变为禁用」。
+   * 编辑期间必须以用户的选择为准，回读只更新 [currentMode] 一侧。
+   *
+   * 由调用方在弹窗显隐变化时调用 [beginModeEdit] / [endModeEdit]；本 composable 不持有弹窗状态。
+   */
+  const modeEditing = ref(false);
+  /**
+   * 用户在**本次**弹窗会话中是否修改过待选项。
+   *
+   * 仅有 [modeEditing] 不足以覆盖该场景：弹窗可能在第一次设备读取返回之前打开
+   * （`currentMode` 仍为空串），此时 [beginModeEdit] 没有可同步的值，[selectedMode] 停留在
+   * 默认的 AUTO；若编辑闸门同时阻止后续回读，用户会在「设备当前：仅4G」的弹窗中看到 AUTO 被选中，
+   * 点击应用即把设备切回自动。因此闸门按该标志收窄：**用户尚未选择过**时，回读仍可更新待选项。
+   */
+  const modeSelectionTouched = ref(false);
+
+  /**
    * 制式标签（"更多设置"卡上那一行）。**读设备真值，不读待选项** —— 见 [currentMode] 的注释。
    *
    * 优先用 core 给的中文名；没有时按别名查本地表；两者都没有才显示原始值。
@@ -273,12 +288,12 @@ export function useNetworkControls() {
   /**
    * 正在切换中的**目标**制式；null = 没有进行中的切换。
    *
-   * 它同时是 [loadDeviceSettings] 的闸门：切换期间设备仍报旧档位，回读值**不许**覆盖
-   * [selectedMode]，否则界面会被弹回切换前的档位（2026-09-11 真机缺陷）。
+   * 它同时是 [loadDeviceSettings] 的闸门：切换期间设备仍返回旧档位，回读值**不得**覆盖
+   * [selectedMode]，否则界面会回到切换前的档位。
    *
-   * 2026-10-14：从本 composable 的实例级 ref 挪到 store（用 toRef 取回同一个 ref）。
-   * "切换中"是一次 A 级操作的进行中状态，必须跨页可见 —— 改前在 A 页发起切换、切到 B 页，
-   * B 页的闸门是 null，于是它的回读会把待选档位刷回旧值；现在闸门是全站一份。
+   * 该状态保存在 store 中（通过 toRef 取回同一个 ref）：「切换中」是一次 A 级操作的进行中状态，
+   * 必须跨页可见 —— 若各页各持一份，在 A 页发起切换后切到 B 页，B 页闸门为 null，
+   * 其回读会把待选档位刷回旧值。闸门必须全局唯一。
    */
   const switchingMode = toRef(ops, 'switchingMode');
   /** 上一次切换在 `NetworkModeSwitchProbe` 的预算内没等到设备报出目标档位。同样跨页可见。 */
@@ -293,8 +308,8 @@ export function useNetworkControls() {
 
   /**
    * WiFi 休眠时间在 /api/device/settings 的 sleep_sysIdleTimeToSleep，不在 /api/wifi/settings。
-   * **单位是分钟**（core 的 WriteSpec.validate 明写「非负整数（分钟）」）——
-   * 曾按秒展示过，点一次「5 分钟」实际下发 300 分钟 = 5 小时。
+   * **单位是分钟**（core 的 WriteSpec.validate 明确要求「非负整数（分钟）」）——
+   * 按秒处理会把「5 分钟」下发为 300 分钟（5 小时）。
    */
   const sleepTime = ref(0);
   const sleepLoading = ref(false);
@@ -305,23 +320,35 @@ export function useNetworkControls() {
    * 注意：网络模式/漫游在这个端点（net_select / BearerPreference / roam_setting_option /
    * connection_mode），而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
    *
-   * @param client 用哪个客户端读。默认 [api]（随页面取消）；A 级操作的轮询回读传 [opApi]
-   *   —— 那次回读必须活过页面（见文件头 2026-10-14）。两者都是 AxiosInstance 的 `get` 子集。
+   * @param client 使用的读取客户端。默认 [api]（随页面取消）；A 级操作的轮询回读传 [opApi]
+   *   —— 该次回读必须在页面卸载后继续存活。两者都是 AxiosInstance 的 `get` 子集。
+   * @param opts.fresh true = 带 `?fresh=1` 直读设备，绕开 core 那个 5 分钟的 `device:settings`
+   *   读缓存（理由见下）。**仅用于「写入后必须确认设备状态是否变化」的读取**，普通轮询不得开启 ——
+   *   那正是缓存要省的那批 goform 查询。
    * @returns 这次读到的网络制式别名（读失败返回 null），供切换回读确认比对目标档位。
    */
-  async function loadDeviceSettings(client: Pick<AxiosInstance, 'get'> = api): Promise<string | null> {
+  async function loadDeviceSettings(
+    client: Pick<AxiosInstance, 'get'> = api,
+    opts: { fresh?: boolean } = {}
+  ): Promise<string | null> {
     try {
-      const res = await client.get('/api/device/settings');
+      /*
+       * fresh 的必要性：core 的 `device:settings` TTL 是 5 分钟，写成功后只清除一次缓存。
+       * 制式切换的第一次回读在 +600ms，此时设备仍在重新注册、返回的是旧档位 ——
+       * 该旧快照会被缓存 5 分钟，后续 12 次轮询读取同一份数据，确认必然超时，
+       * 界面停留在旧制式上（最长 5 分钟），「重新读取」同样无效。
+       */
+      const res = await client.get('/api/device/settings', opts.fresh ? { params: { fresh: 1 } } : undefined);
       // 请求被取消（组件卸载 / 路由切走）时 useCancellableApi resolve 成 { __canceled: true }，
-      // data 为 undefined。不显式识别的话制式会被读成 ''、回读值塌成 'AUTO'：
-      // 既会把选中项刷成"自动"，也会让切换回读把"没读到"误判成"已经到目标档位"。
+      // data 为 undefined。若不显式识别，制式会被读成 ''、回读值退化为 'AUTO'：
+      // 既会把选中项刷成「自动」，也会让切换回读把「未读到」误判成「已到达目标档位」。
       if ((res as { __canceled?: boolean })?.__canceled === true) return null;
       const data = res.data;
       if (data == null) return null;
       // 制式回读**以 net_select 为准**，BearerPreference 只作回落 —— 与 app
-      // （DeviceSettingsResponse.networkMode）同一口径。原来只读 BearerPreference：
-      // 真机切换后变的是 net_select，而 BearerPreference 缺失时这里会塌成 'AUTO'，
-      // 于是 app 显示新档位、web 恒显示「5G/4G/3G」，回读确认也永远判超时。
+      // （DeviceSettingsResponse.networkMode）同一口径。真机切换后变化的是 net_select；
+      // 若只读 BearerPreference，该字段缺失时会退化为 'AUTO'，导致 app 显示新档位、
+      // web 恒显示「5G/4G/3G」，回读确认也会一直判超时。
       const raw = String(data?.net_select || data?.BearerPreference || '');
       // 未知取值不静默显示成「自动」，直接透出原始值，避免误导；空值也不当成 AUTO。
       const readback = bearerToNetworkMode(raw);
@@ -333,9 +360,18 @@ export function useNetworkControls() {
         // 时清空，由 modeLabel 回落到本地查表。
         currentModeLabel.value = String(data?.network_mode_label || '');
       }
-      // 待选项在切换期间**不许**被回读值覆盖：设备重新注册时报的还是旧档位，
-      // 覆盖就会把弹窗里的选择弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
-      if (switchingMode.value === null && readback) selectedMode.value = readback;
+      // 待选项在切换期间**不得**被回读值覆盖：设备重新注册期间返回的仍是旧档位，
+      // 覆盖会把弹窗中的选择还原为切换前的档位。
+      // 同理，弹窗打开（用户正在编辑）时也不得覆盖 —— 10s 轮询会把刚选的档位刷回。
+      if (switchingMode.value === null && (!modeEditing.value || !modeSelectionTouched.value) && readback) {
+        selectedMode.value = readback;
+      }
+      /*
+       * 上一次切换判定为「尚未完成」，但设备随后返回了该目标档位（切换慢于 30.6s 预算时常见）
+       * —— 该结论已过期，标记必须自行清除，否则界面会一直保留「· 尚未完成」，
+       * 直到下一次切换。
+       */
+      if (readback && readback === ops.modeSwitchTarget) modeSwitchTimedOut.value = false;
       const roam = String(data?.roam_setting_option ?? data?.dial_roam_setting_option ?? '');
       roamingEnabled.value = roam === 'on' || roam === '1';
       const mode = String(data?.connection_mode ?? '').toLowerCase();
@@ -343,7 +379,7 @@ export function useNetworkControls() {
       if (data?.sleep_sysIdleTimeToSleep != null) {
         sleepTime.value = Number(data.sleep_sysIdleTimeToSleep) || 0;
       }
-      // 读到空串时返回 null（= 没读到），不要让回读确认把它当成一个档位去比对
+      // 读到空串时返回 null（= 未读到），避免回读确认将其当作档位比较
       return readback || null;
     } catch {
       /* 保持默认 */
@@ -362,30 +398,63 @@ export function useNetworkControls() {
   }
 
   /**
-   * 给「网络模式」弹窗的手动重新读取（带自己的 loading）。
+   * 供「网络模式」弹窗手动重新读取（带独立的 loading）。
    *
-   * 注意它**绕不过设备端的读缓存**：`GET /api/device/settings` 在 core 侧的 TTL 是 5 分钟
-   * （`CacheTTL.DEVICE_SETTINGS`），且只在 core 自己写入后才失效。从手机端或设备自带面板
-   * 改过档位时，这里点几次也仍会拿到同一份快照 —— 弹窗里那句提示就是为了把这件事说清楚，
-   * 而不是让用户以为按钮没生效。
+   * 使用 `?fresh=1`：否则读取的是 `device:settings` 的 5 分钟缓存，从手机端或设备面板修改档位后
+   * 点击刷新会一直返回同一份旧快照。该调用会真实请求一次设备并回填缓存。
+   * 弹窗中「设备端有最长 5 分钟读缓存」的提示仍然成立：它描述的是**不调用本函数时**的默认行为。
    */
   async function refreshDeviceSettings() {
     modeRefreshing.value = true;
     try {
-      await loadDeviceSettings();
+      await loadDeviceSettings(api, { fresh: true });
     } finally {
       modeRefreshing.value = false;
     }
   }
 
+  /**
+   * 弹窗打开：进入「编辑中」，并把待选项同步为设备真值。
+   *
+   * 同步是有意的：上一次取消 / 超时残留的选择不代表用户本次的意图，
+   * 重开弹窗时不得高亮上次未应用的档位。
+   */
+  function beginModeEdit() {
+    modeEditing.value = true;
+    modeSelectionTouched.value = false;
+    if (currentMode.value) selectedMode.value = currentMode.value;
+  }
+
+  /** 弹窗关闭：放开闸门，回读重新接管待选项（下次打开会再同步一次）。 */
+  function endModeEdit() {
+    modeEditing.value = false;
+    modeSelectionTouched.value = false;
+  }
+
+  /**
+   * 记下"用户真的选过了"。
+   *
+   * 判据是「和当前设备值不同」而不是「发生过赋值」：`v-model` 在弹窗里改的是同一个 ref，
+   * 而 [beginModeEdit] 与回读也会给它赋值 —— 那些都不是用户的选择。
+   */
+  watch(selectedMode, (value) => {
+    if (modeEditing.value && value !== currentMode.value) modeSelectionTouched.value = true;
+  });
+
   /** 网络状态写回 store：拨号 / 移动数据 / 飞行模式写完都要刷这个 */
   async function refreshNetworkStatus() {
     try {
       const { data } = await api.get('/api/network/status');
-      if (dashboardStore.summary) {
-        dashboardStore.summary.network_status = data;
-      } else {
-        dashboardStore.updateSummary({ network_status: data } as any);
+      if (data) {
+        // 空 ppp_status = 本次读取未取到值，不是断开。connection WS 可能刚推送了非空值，
+        // 不得被这次 REST 覆盖回空串（与 core /network/status 的同一约定）。
+        const prevPpp = dashboardStore.summary?.network_status?.ppp_status;
+        if (!data.ppp_status && prevPpp) data.ppp_status = prevPpp;
+        if (dashboardStore.summary) {
+          dashboardStore.summary.network_status = data;
+        } else {
+          dashboardStore.updateSummary({ network_status: data } as any);
+        }
       }
     } catch {
       /* 静默 */
@@ -400,8 +469,9 @@ export function useNetworkControls() {
   const roamingSaving = ref(false);
   const connModeSaving = ref(false);
 
-  // 2026-10-05 P3 修复：移动数据接成 A 级——verify 判 ppp 连接态与目标一致（E-13：关数据轮询全失败时 connected 判 false 即命中）
-  // 2026-10-14：状态与执行器移到 stores/networkOps；submit/verify 改用 opApi（切页不中断回读）
+  // 移动数据接成 A 级：verify 判定 ppp 连接态与目标是否一致（关闭数据时轮询全部失败，
+  // connected 判为 false 即视为命中）。
+  // 状态与执行器位于 stores/networkOps；submit/verify 使用 opApi（切页不中断回读）。
   const setMobileData = (enabled: boolean) =>
     ops.run({
       title: '移动数据',
@@ -420,8 +490,8 @@ export function useNetworkControls() {
       // onApplied 里的"刷本地状态源"由下面 finishedSeq 的统一回读接管（见那里的说明）
     });
 
-  /** core /api/network/airplane 只有写、没有读，所以调用方要用两个明确动作而不是一个开关 */
-  // 2026-10-05 P3 修复：飞行模式同构接成 A 级（开启=断网；关闭=等重新连上）
+  /** core /api/network/airplane 只有写、没有读，因此调用方使用两个明确动作，而不是一个开关 */
+  // 飞行模式同构接成 A 级（开启 = 断网；关闭 = 等待重新连上）。
   const setAirplane = (enabled: boolean) =>
     ops.run({
       title: '飞行模式',
@@ -442,8 +512,8 @@ export function useNetworkControls() {
       setBusy: (on) => (roamingSaving.value = on),
       request: () => api.post('/api/device/roaming', { enabled }),
       ok: enabled ? '数据漫游已开启' : '数据漫游已关闭',
-      // core setRoaming 会顺手把 ConnectionMode 置为 auto_dial（GoformNetworkClient.kt:238-246），
-      // 所以必须回读，不能就地假设状态
+      // core 的 setRoaming 会同时把 ConnectionMode 置为 auto_dial（GoformNetworkClient.kt:238-246），
+      // 因此必须回读，不能就地假设状态
       after: { reload: loadDeviceSettings, always: true },
     });
 
@@ -472,10 +542,10 @@ export function useNetworkControls() {
       ok: '已断开',
       fail: '断开失败',
       /*
-       * 断开在设备上不是立即生效：ppp 掉线要走完拆链流程，`SETTLE_MS`（600ms）那次回读
-       * 拿到的**一定**还是「已连接」，界面于是停在错误状态直到下一轮 10s 轮询 —— 与
-       * [pppConnect] 用 [DIAL_SETTLE_MS] 是同一条理由，两个方向必须对称。
-       * detached 的理由同 [pppConnect]：不让按钮的 loading 白转满 3 秒。
+       * 断开在设备上不是立即生效：ppp 掉线需要完成拆链流程，`SETTLE_MS`（600ms）时的回读
+       * 得到的**必然**仍是「已连接」，界面会停在错误状态直到下一轮 10s 轮询 —— 与
+       * [pppConnect] 使用 [DIAL_SETTLE_MS] 理由相同，两个方向必须对称。
+       * detached 的理由同 [pppConnect]：避免按钮的 loading 状态持续 3 秒。
        */
       after: { delayMs: DIAL_SETTLE_MS, reload: refreshNetworkStatus, detached: true, always: true },
     });
@@ -483,21 +553,25 @@ export function useNetworkControls() {
   /**
    * 切换网络制式（A 级）。
    *
-   * 与其他写操作不同，这里**不用** `runWrite` 的 `after` 回读：`after` 只读一次，而设备
-   * 在重新注册期间报的还是旧档位，读一次就渲染 = 界面停在切换前的档位。
-   * 需要的是"下发 → 有上限地轮询回读 → 终态"。
+   * 与其他写操作不同，这里**不使用** `runWrite` 的 `after` 回读：`after` 只读取一次，
+   * 而设备在重新注册期间返回的仍是旧档位，读取一次即渲染会使界面停在切换前的档位。
+   * 需要的流程是「下发 → 有上限地轮询回读 → 终态」。
    *
-   * 2026-10-14：这段轮询原来由本文件的 [probeNetworkMode] 自己实现了一遍 —— 它和
-   * `useApiOperation` 第 2 步用的是**同一套 contract 预算**（`NetworkModeSwitchProbe` +
-   * `modeProbeIntervalMs` + `shouldKeepProbingMode`），两份实现迟早会分叉；
-   * 而且它跑在页面作用域里，切页就停（`disposed` 一置真，回读恒判"没到达"，
-   * 于是刚切走就显示"尚未完成"）。现在整条链交给 store 的确认器：
-   * 预算仍是 contract 那一套，只是执行者换成了比页面活得久的那个。
+   * 该轮询完全由 store 的确认器执行，预算取自 contract
+   * （`NetworkModeSwitchProbe` + `modeProbeIntervalMs` + `shouldKeepProbingMode`），
+   * 执行者比页面存活更久 —— 若轮询运行在页面作用域内，切页即停止，回读恒判「未到达」，
+   * 刚离开页面就会显示「尚未完成」。
    */
   const applyNetworkMode = async (): Promise<boolean> => {
     const target = selectedMode.value;
     /** 回读是否真的跑过：只有"跑过但没等到"才算"尚未完成"，下发被拒是另一回事（原因在弹窗里） */
     let probed = false;
+    /*
+     * 注意：切换制式会把设备的移动数据一并关闭（PPP 被拆除且设备不会自行重拨）。
+     * 恢复由 **core** 负责：`NetworkController.setNetworkMode` 在下发前记录连接状态，
+     * 写成功后按该意图重新发送一次 CONNECT_NETWORK。web 不得自行补发：
+     * 两处都做会各发一条命令，且 app / 定时任务的调用路径无法覆盖。
+     */
     return ops.run({
       title: '网络模式',
       running: '正在切换网络模式',
@@ -506,12 +580,14 @@ export function useNetworkControls() {
       onStart: () => {
         // 下发前就置"切换中"：这一整段（含 POST 本身）设备都还报着旧档位
         switchingMode.value = target;
+        // 记下目标：超时后设备补上这个档位时，[loadDeviceSettings] 靠它把"尚未完成"消掉
+        ops.modeSwitchTarget = target;
         modeSwitchTimedOut.value = false;
         probed = false;
       },
       submit: async () => {
-        // loading 只覆盖这一次 POST（与改前 runWrite 的 setBusy 同宽）：
-        // 回读可能十几秒，让按钮转那么久没有意义，进度由进度弹窗呈现
+        // loading 只覆盖这一次 POST（范围与 runWrite 的 setBusy 相同）：
+        // 回读可能持续十几秒，按钮不应维持 loading 状态，进度由进度弹窗呈现
         modeLoading.value = true;
         try {
           return await opApi.post('/api/network/mode', { mode: target });
@@ -519,15 +595,22 @@ export function useNetworkControls() {
           modeLoading.value = false;
         }
       },
-      // 回读走 opApi：关掉弹窗、切到别的页面之后，这次确认还得继续问设备
+      // 回读走 opApi：关掉弹窗、切到别的页面之后，这次确认还得继续问设备。
+      // 并且必须 fresh：默认读会命中 core 的 5 分钟缓存，那份快照正是"切换前"的档位。
       verify: async () => {
         probed = true;
-        return (await loadDeviceSettings(opApi)) === target;
+        return (await loadDeviceSettings(opApi, { fresh: true })) === target;
       },
       onSettled: (reached) => {
         // 闸门放开：成功时待选项等于 target，超时时由下面的统一回读把它拉回设备当前值
         switchingMode.value = null;
         modeSwitchTimedOut.value = probed && !reached;
+        /*
+         * 弹窗可能还开着（切换期间所有选项都是禁用的，用户没有可丢的选择）：
+         * 成功时把待选同步成目标，否则切完之后弹窗里还高亮着切换前的档位，
+         * 而「应用」此时是可点的 —— 一次误点就把设备切回去。
+         */
+        if (reached && modeEditing.value) selectedMode.value = target;
       },
     });
   };
@@ -579,9 +662,9 @@ export function useNetworkControls() {
     }
   }
 
-  // 2026-10-05 P3 修复：WiFi 总开关接成 A 级——模块重启级操作，回读命中前不给成功反馈
-  // 2026-10-14：状态/执行器在 stores/networkOps（进度弹窗全仓只挂 DefaultLayout 一份），
-  // 这里只剩"这次操作做什么"；回读用 opApi，切页不中断
+  // WiFi 总开关接成 A 级：模块重启级操作，回读命中前不给出成功反馈。
+  // 状态与执行器位于 stores/networkOps（进度弹窗全仓只挂载 DefaultLayout 一份），
+  // 本文件只负责「这次操作做什么」；回读使用 opApi，切页不中断。
   const toggleWifiEnabled = (enabled: boolean) =>
     ops.run({
       title: 'WiFi 开关',
@@ -590,55 +673,52 @@ export function useNetworkControls() {
       hint: 'WiFi 模块重启期间已连接设备会短暂掉线',
       submit: () => opApi.post('/api/wifi/enable', { enabled }),
       verify: async () => {
-        // 复用 loadWifiSettings 的回读端点，但只关心 enabled 一位。
-        // 注意这个端点有 120s 缓存（见 [switchWifiBand] 里那段 core 侧限制的说明）：
-        // 第一次回读拿到什么，后面 12 次基本就是同一份。
+        // 复用 loadWifiSettings 的回读端点，但只关心 enabled 字段。
+        // 注意该端点有 120s 缓存（见 [switchWifiBand] 中 core 侧限制的说明）：
+        // 第一次回读得到的值，在后续 12 次中基本相同。
         const { data } = await opApi.get('/api/wifi/settings');
-        // 2026-10-14：先确认这次读有内容再比 —— 空体时 normalized.enabled 恒为 false，
-        // 「关 WiFi」会被立刻判成已生效（见 readbackHasFields）
+        // 先确认本次读取有内容再比较 —— 空体时 normalized.enabled 恒为 false，
+        // 「关闭 WiFi」会被立即判为已生效（见 readbackHasFields）
         if (!readbackHasFields(data)) return false;
         return normalizeWifiSettings(data).enabled === enabled;
       },
     });
 
   /**
-   * 切换 WiFi 频段（A 级，2026-10-14 新增）。
+   * 切换 WiFi 频段（A 级）。
    *
-   * 为什么必须走确认器：`POST /api/wifi/band` 在设备侧就是
+   * 必须走确认器的原因：`POST /api/wifi/band` 在设备侧即
    * `switchWiFiChip&ChipEnum=X&GuestEnable=0`（`GoformWifiClient.kt:490-521`），
-   * 语义是「在该频段上**启用** WiFi」—— 它会重启 WiFi 模块。
-   * core 写成功只清了读缓存（`WifiRoutes.kt:199-208` 的 `invalidateWifi()`，所以回读确实打设备），
-   * 但模块这时还没起来：改前 `WifiEditModal` 发完 `emit('saved')` → `onWifiSaved` 等 600ms
-   * 单读一次就渲染，界面拿到的仍是旧频段，要等下一轮 10s 轮询才自己变对
-   * ——「切了频段但界面没变」就是这么来的。
+   * 语义是「在该频段上**启用** WiFi」，会重启 WiFi 模块。
+   * core 写成功只清除了读缓存（`WifiRoutes.kt:199-208` 的 `invalidateWifi()`，因此回读确实请求设备），
+   * 但此时模块尚未启动：若写入后 600ms 单次回读即渲染，界面得到的仍是旧频段，
+   * 需要等下一轮 10s 轮询才会更正。
    *
-   * 判据（**先归一再比**，同 [bearerToNetworkMode] 的做法）：
-   *   回读的展示字段 `chip_index`（`'1'`/`'2'`）经 [wifiBandFromChipIndex] 翻成写侧词汇
-   *   `chip1`/`chip2`，再与目标比 —— 两侧编码不同，直接比原始串永远不相等。
-   *   `wifi_chip` 是设备的**生效频段**，模块在新频段上起来之前它不会变，所以它一命中
-   *   就等于「设备已经在目标频段上服务了」，这正是这条命令要确认的事实。
+   * 判据（**先归一化再比较**，同 [bearerToNetworkMode] 的做法）：
+   *   回读的展示字段 `chip_index`（`'1'`/`'2'`）经 [wifiBandFromChipIndex] 转换为写侧词汇
+   *   `chip1`/`chip2`，再与目标比较 —— 两侧编码不同，直接比较原始串永远不会相等。
+   *   `wifi_chip` 是设备的**生效频段**，模块在新频段启动之前不会变化，因此它一旦命中
+   *   即表示「设备已在目标频段上提供服务」，这正是该命令需要确认的事实。
    *
-   * ⚠ 一处 core 侧的**已知限制**（不是本入口能修的，记在这里免得下次当成"轮询没生效"）：
+   * 注意 core 侧的一项**已知限制**（web 侧无法修复）：
    * `GET /api/wifi/settings` 走 `DataHub.getWifiSettingsMerged` 的 `ResponseCache`，
    * TTL 是 `CacheTTL.WIFI_SETTINGS` = **120s**（`ResponseCache.kt:548`），而写成功后 core 只
-   * `invalidateWifi()` 一次。于是第一次回读（600ms）若是旧值，那份旧值会被**缓存 120s**
-   * ——比本确认器的 30.6s 预算长得多，后面 12 次回读拿到的都是同一份缓存。
-   * core 里已经有现成的正确做法（`WifiRoutes.kt:320-352` 的 `respondWifiConfigResult`：
-   * 写完立刻回读时**刻意绕开 dataHub**，不把"可能还是旧值"的结果写进缓存）；
-   * 这条读路径要彻底解决得在 core 侧补一个同样的旁路，web 侧无解。
-   * 本入口仍然值得存在：命中判定、终态 toast、失败原因与统一回读都由它收敛，
-   * 而不是像改前那样"发完就当成功"。
+   * `invalidateWifi()` 一次。若第一次回读（600ms）得到旧值，该旧值会被**缓存 120s**，
+   * 远长于本确认器的 30.6s 预算，后续 12 次回读得到的都是同一份缓存。
+   * core 中已有正确做法（`WifiRoutes.kt:320-352` 的 `respondWifiConfigResult`：
+   * 写入后立即回读时**刻意绕过 dataHub**，不把「可能仍是旧值」的结果写入缓存）；
+   * 该读路径要彻底解决需在 core 侧增加同样的旁路。
+   * 本入口仍然必要：命中判定、终态提示、失败原因与统一回读都由它收敛。
    *
-   * ⚠ 判据里**刻意不含 SSID**（与最初设想不同，理由写在下面，别顺手加回来）：
-   * 设备把每个 chip 的 AP 当**各自独立的一份配置**（`queryAccessPointInfo` 的 `ResponseList`
-   * 里每个 chip 一个主 AP，各带自己的 `SSID`/`ChipIndex`，由 `AccessPointSwitchStatus` 选出生效那个
-   * ——见 `ZteGoformProfile.liftActiveAccessPoint` 与 `ZteGoformProfileTest` 的夹具
-   * `Idle2G` / `Live5G`）。而写侧固定发 `AccessPointIndex=0` + `ChipIndex=<当前生效 chip>`
-   * （`ZteGoformProfile.kt:1293-1295` 的 encode，`chip_index` 取值来自写前回读的生效 AP），
-   * 即**SSID 落在切换前那个 chip 的 AP 上**；切过去之后回读到的自然是目标 chip 那个 AP 自己的 SSID。
-   * 把它当判据，会让「改了 SSID 又切频段」这一类**正常操作**每次都白等 30.6s 再报「未完成」
-   * ——正是本次要消灭的那类假失败。若哪天确认真机上两个频段共享同一个 SSID，
-   * 再把 SSID 比对加成判据也不迟（那时它才是"更强的证据"而不是"必然对不上"）。
+   * 判据中**刻意不含 SSID**（理由如下，不得作为「更强的证据」加入）：
+   * 设备把每个 chip 的 AP 当作**各自独立的一份配置**（`queryAccessPointInfo` 的 `ResponseList`
+   * 中每个 chip 一个主 AP，各带自己的 `SSID`/`ChipIndex`，由 `AccessPointSwitchStatus` 选出生效项
+   * —— 见 `ZteGoformProfile.liftActiveAccessPoint` 与 `ZteGoformProfileTest` 的夹具
+   * `Idle2G` / `Live5G`）。写侧固定发送 `AccessPointIndex=0` + `ChipIndex=<当前生效 chip>`
+   * （`ZteGoformProfile.kt:1293-1295` 的编码，`chip_index` 取值来自写前回读的生效 AP），
+   * 即 **SSID 落在切换前那个 chip 的 AP 上**；切换后回读到的自然是目标 chip 的 AP 自己的 SSID。
+   * 若将其作为判据，「修改 SSID 并切换频段」这类**正常操作**每次都会等待 30.6s 后报「未完成」。
+   * 若日后确认真机上两个频段共享同一 SSID，再评估是否加入 SSID 比对。
    */
   const switchWifiBand = (target: WifiBand) =>
     ops.run({
@@ -657,17 +737,17 @@ export function useNetworkControls() {
     });
 
   /**
-   * A 级操作收敛后的统一回读（2026-10-14）。
+   * A 级操作收敛后的统一回读。
    *
-   * 为什么需要它：改前每个 A 级操作在自己的 `onApplied` 里刷本地状态源
-   * （WiFi 开关刷 wifiSettings / wifiClients，移动数据与飞行模式刷 network_status）。
-   * 那些回调捕获的是**发起它的那一页**的 ref —— 状态外置之后，一次操作完全可能
-   * 由 A 页发起、在 B 页结束，回调就刷到了一个已经卸载的页面。
+   * 必要性：若各 A 级操作在自己的 `onApplied` 中刷新本地状态源
+   * （WiFi 开关刷 wifiSettings / wifiClients，移动数据与飞行模式刷 network_status），
+   * 这些回调捕获的是**发起操作的那个页面**的 ref —— 状态外置之后，一次操作可能
+   * 由 A 页发起、在 B 页结束，回调会写入一个已经卸载的页面。
    *
-   * 所以改成订阅 store 的终态计数器：**谁活着谁刷新**。
-   * 一个页面同时只有一份 useNetworkControls，两个页面的实例各订一次，不会重复。
+   * 因此改为订阅 store 的终态计数器：**存活页面各自刷新**。
+   * 一个页面同时只有一份 useNetworkControls，两个页面的实例各订阅一次，不会重复。
    * 计数器在成功、失败、超时三种终态上都会 +1（见 stores/networkOps 的 run），
-   * 所以超时那一路也能把界面拉回设备的真实值。
+   * 因此超时路径也能把界面更新为设备的真实值。
    */
   watch(
     () => ops.finishedSeq,
@@ -675,7 +755,13 @@ export function useNetworkControls() {
       loadWifiSettings();
       loadWifiClients();
       refreshNetworkStatus();
-      loadDeviceSettings();
+      /*
+       * 这次回读必须 fresh：A 级操作刚刚写入，缓存中的快照很可能仍是写入之前的
+       * （例如制式切换期间某次普通轮询把旧档位写入了 5 分钟缓存）。
+       * 在此直读一次设备，既让界面取得真值，也把缓存回填为真值 ——
+       * 否则下一轮普通轮询会把界面退回旧状态。每次 A 级操作只增加一次设备查询。
+       */
+      loadDeviceSettings(api, { fresh: true });
     }
   );
 
@@ -786,33 +872,32 @@ export function useNetworkControls() {
   // 基站锁定（GET /api/network/cell-info 回读确认）
   // ══════════════════════════════════════════════════════════
   //
-  // 2026-10-14：这两个写操作原来是 `CellInfoModal.vue` 里直发的 —— 写完等 600ms **单读一次、
-  // 无判据**，界面停在旧小区直到下一次偶然刷新。而设备侧「锁定后重新驻留」要十几秒：
-  // 600ms 时服务小区还是原来那个，锁定看起来"没生效"。现在统一走确认器。
+  // 这两个写操作统一走确认器：设备侧「锁定后重新驻留」需要十几秒，写入后 600ms 单次回读
+  // 得到的仍是原服务小区，会被误判为未生效，界面停留在旧小区直到下一次刷新。
   //
-  // 契约来源（不是猜的）：`core/api/.../routes/DeviceRoutes.kt:618-671` 写明入参是
-  // `pci` + `earfcn` + `network_type`（`LTE`|`NR`），写成功会清 `network:cell-info`
-  // 与 `device:settings` 缓存（所以下面的回读确实打设备）；
+  // 契约来源（core 实现）：`core/api/.../routes/DeviceRoutes.kt:618-671` 声明入参为
+  // `pci` + `earfcn` + `network_type`（`LTE`|`NR`），写成功会清除 `network:cell-info`
+  // 与 `device:settings` 缓存（因此下面的回读确实请求设备）；
   // 回读字段名见 `core/contract/.../DeviceFields.kt:245-268`（`Lte_pci` / `Lte_fcn` /
   // `locked_cell_info`，元素键 `pci` / `earfcn`）。
-  // 回读端点自身有 20s 缓存（`CacheTTL.CELL_INFO`，`ResponseCache.kt:590`）：比 30.6s 预算短，
-  // 所以预算内至少能真打设备两次（600ms 那次与 20s 后那次）。代价是**确认的分辨率就是这 20s**
-  // ——设备 1 秒就驻留好了，界面也要等到 20s 后那次真读才命中。这是缓存粒度决定的，
-  // 不是轮询写错了；要更快就得在 core 侧给这条读路径加一个"写后绕开缓存"的旁路
+  // 回读端点自身有 20s 缓存（`CacheTTL.CELL_INFO`，`ResponseCache.kt:590`），短于 30.6s 预算，
+  // 因此预算内至少能真实请求设备两次（600ms 与 20s 后）。代价是**确认分辨率为 20s**：
+  // 设备 1 秒完成驻留，界面仍需等到 20s 后那次真实读取才能命中。该粒度由缓存决定，
+  // 并非轮询实现问题；要提高精度需在 core 侧为该读路径增加「写后绕过缓存」的旁路
   // （同 `WifiRoutes.kt:320-352` 的 respondWifiConfigResult）。
 
   /**
    * 锁定一个邻区（A 级）。
    *
-   * 判据：**服务小区的 pci + earfcn 同时等于目标** —— 锁定的目的就是让设备驻留到那个小区，
-   * 而 `locked_cell_info` 里出现目标只说明命令被记下了，不代表已经驻留（那正是"受理≠生效"）。
+   * 判据：**服务小区的 pci + earfcn 同时等于目标** —— 锁定的目的即让设备驻留到该小区；
+   * `locked_cell_info` 中出现目标只说明命令已被记录，不代表已经驻留（受理不等于生效）。
    *
-   * ⚠ NR 目标走一条**明确的兜底**：`/api/network/cell-info` 的服务小区只有 LTE 那一组字段
+   * 注意：NR 目标走一条**明确的兜底**：`/api/network/cell-info` 的服务小区只有 LTE 那一组字段
    * （`Lte_pci` / `Lte_fcn`；NR 的 `Nr_pci` 归 SIGNAL 分组，见 `DeviceFields.CellInfo` 与
-   * `ServingCell.kt`），NSA 下锁 NR 小区时 LTE 锚点不变 —— 严格判据**永远**不可能命中，
-   * 那会让每一次 5G 锁定都白等 30.6s 再报「未完成」。所以 NR 目标额外接受
-   * 「设备已把目标记进 `locked_cell_info`」这一较弱但仍来自设备的证据。
-   * 不确定处：真机上锁 NR 小区后 cell-info 的服务小区会不会变，本次没有真机可验。
+   * `ServingCell.kt`）。NSA 下锁定 NR 小区时 LTE 锚点不变，严格判据**永远不会**命中，
+   * 会导致每次 5G 锁定都等待 30.6s 后报「未完成」。因此 NR 目标额外接受
+   * 「设备已将目标记入 `locked_cell_info`」这一较弱但仍来自设备的证据。
+   * 尚未验证：真机上锁定 NR 小区后 cell-info 的服务小区是否变化。
    */
   const lockCell = (cell: { pci: string; earfcn: string; networkType: 'LTE' | 'NR' }) =>
     ops.run({
@@ -847,8 +932,8 @@ export function useNetworkControls() {
    *
    * 判据：`locked_cell_info` 变成空表 —— 解锁没有"目标小区"可比，设备侧的终态就是锁定名单清空
    * （`POST /api/device/cell-unlock` → `unlockAllCell()`，`DeviceRoutes.kt:655-671`）。
-   * 注意它**不是**「服务小区变了」：解锁后设备可能仍驻留在原小区（它本来就是个合法小区），
-   * 拿服务小区当判据会永远判不中。
+   * 注意它**不是**「服务小区变了」：解锁后设备可能仍驻留在原小区（它本身也是合法小区），
+   * 以服务小区为判据将永远无法命中。
    */
   const unlockCells = () =>
     ops.run({
@@ -865,7 +950,7 @@ export function useNetworkControls() {
     });
 
   return {
-    // 扩展点：加新控制时用它，不要自己写 try/catch/toast
+    // 扩展点：新增控制时使用它，不得自行编写 try/catch/toast
     runWrite,
 
     // 读
@@ -887,14 +972,16 @@ export function useNetworkControls() {
     refreshDeviceSettings,
     modeLabel,
     applyNetworkMode,
-    // 「切换中」中间态：调用方据此显示"正在切换 / 尚未完成"，不要自己去猜回读值。
-    // 2026-10-14：两个都是 store 里的 ref（本页只是转接），所以两个页面看到的是同一份状态。
+    // 弹窗显隐变化时调用：编辑期间回读不得覆盖待选档位（见 modeEditing 的注释）
+    beginModeEdit,
+    endModeEdit,
+    // 「切换中」中间态：调用方据此显示「正在切换 / 尚未完成」，不得自行推断回读值。
+    // 两者都是 store 中的 ref（此处仅作转接），因此两个页面看到的是同一份状态。
     switchingMode,
     modeSwitchTimedOut,
-    // 2026-10-14：原来这里还导出 wifiOp（useApiOperation 实例）与 modeOpState（进度状态位），
-    // 供各页自己挂一份 OperationProgressModal。进度状态与弹窗现在统一在
-    // stores/networkOps + DefaultLayout，页面不再需要它们 —— 删掉是为了让"只能有一份"
-    // 这件事在类型上就无法绕过（没有第二个入口可以挂第二份弹窗）。
+    // 进度状态与弹窗统一位于 stores/networkOps + DefaultLayout，因此这里不导出
+    // useApiOperation 实例与进度状态位 —— 「只能有一份」由类型约束保证：
+    // 不存在第二个入口可以挂载第二份进度弹窗。
 
     // 连接
     roamingEnabled,
@@ -916,7 +1003,7 @@ export function useNetworkControls() {
     wifiLoading,
     wifiEnabled,
     toggleWifiEnabled,
-    // 2026-10-14 新增：切频段（模块重启级）必须走确认器，见 [switchWifiBand]
+    // 切换频段（模块重启级）必须走确认器，见 [switchWifiBand]
     switchWifiBand,
     onWifiSaved,
     sleepTime,
@@ -939,7 +1026,7 @@ export function useNetworkControls() {
     unblockDevice,
     clearBlockedDevices,
 
-    // 基站锁定（2026-10-14 新增：原来是弹窗里 600ms 单次回读）
+    // 基站锁定（设备侧重新驻留需要十几秒，必须走确认器）
     lockCell,
     unlockCells,
   };

@@ -22,6 +22,19 @@ export const useDashboardStore = defineStore('dashboard', () => {
     lastUpdated.value = Date.now();
   }
 
+  /**
+   * 实时连接态（`connection` 频道）→ `summary.network_status.ppp_status`。
+   *
+   * 只改 ppp 一个字段：`mobile_data` 是用户意图、`network_type`/`operator` 由 signal/summary
+   * 维护，不能因为这条推送整体覆盖 network_status。
+   */
+  function updateConnectionStatus(pppStatus: string) {
+    if (!pppStatus) return;
+    const current = summary.value;
+    if (!current?.network_status) return;
+    current.network_status.ppp_status = pppStatus;
+  }
+
   function updateRealtime(type: RealtimeType, data: SignalInfo | CpuInfo | TrafficRealtime | BatteryInfo | MemoryInfo) {
     switch (type) {
       case 'signal':
@@ -53,5 +66,6 @@ export const useDashboardStore = defineStore('dashboard', () => {
     realtimeMemory,
     updateSummary,
     updateRealtime,
+    updateConnectionStatus,
   };
 });

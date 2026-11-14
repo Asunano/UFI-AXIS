@@ -1,5 +1,5 @@
 <template>
-  <div class="toggle-row" :class="{ 'toggle-disabled': disabled }">
+  <div class="toggle-row" :class="{ 'toggle-disabled': disabled, 'toggle-inline': inline }">
     <div class="toggle-info">
       <span class="toggle-label">{{ label }}</span>
       <span v-if="description" class="toggle-desc">{{ description }}</span>
@@ -23,6 +23,16 @@ defineProps<{
   description?: string;
   /** 用 #control 自定义右侧控件时不需要传 */
   modelValue?: boolean;
+  /**
+   * 紧凑行（2026-11-11 设备页重排）：标签与开关贴在同一行内、描述压成单行省略。
+   *
+   * 默认形态是「整行设置项」——行宽随卡片走，在 1172px 的通栏里一行能拉出 500px 以上的
+   * 标签→开关距离，六行就是六次长距离横扫。`inline` 让调用方把行放进窄栅格
+   * （设备页是三列），视线行程自然收在一列内。
+   *
+   * 边框也一并交给栅格容器：本组件默认的「首行去上内距 / 末行去底边框」只在单列堆叠里成立，
+   * 多列栅格里那两条会错位（第 1 行右格多一段上内距、最后一格少一条底边框）。 */
+  inline?: boolean;
   loading?: boolean;
   disabled?: boolean;
 }>();
@@ -61,16 +71,46 @@ defineSlots<{ control?(): any }>();
   flex: 1;
 }
 .toggle-label {
-  font-size: 14px;
+  font-size: var(--font-md);
   font-weight: 500;
   color: var(--text-primary);
 }
 .toggle-desc {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   line-height: 1.4;
 }
 .toggle-disabled {
   opacity: 0.5;
+}
+
+/* ── 紧凑行：由调用方的栅格决定边框与间距，这里只留内容 ── */
+.toggle-row.toggle-inline {
+  padding: 0;
+  border-bottom: none;
+  gap: var(--space-3);
+  min-height: 42px;
+  min-width: 0;
+}
+.toggle-inline .toggle-info {
+  overflow: hidden;
+}
+.toggle-inline .toggle-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.toggle-inline .toggle-label {
+  font-size: var(--font-base);
+  font-weight: 600;
+}
+.toggle-inline .toggle-desc {
+  font-size: var(--font-sm);
+  color: var(--text-secondary);
+  /* 单行：描述是补充，换行会把行高撑成宽度敏感量（三列时每列 300px 左右必然折行） */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 </style>

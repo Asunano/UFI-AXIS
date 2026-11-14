@@ -110,7 +110,7 @@ export function commitConfigSave(
  * 「服务控制」的运行时长和「系统信息」的开机时长都直接把毫秒差传进来，
  * 换成收秒会让两处都显示错值。
  */
-export function formatUptime(ms: number): string {
+export function formatUptimeMs(ms: number): string {
   if (!ms || ms <= 0) return '--';
   const totalSec = Math.floor(ms / 1000);
   const d = Math.floor(totalSec / 86400);

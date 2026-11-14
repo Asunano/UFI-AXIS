@@ -1,47 +1,47 @@
 /**
- * 全局音频播放器。**播放状态从音乐页搬到了这里**（2026-10-14）。
+ * 全局音频播放器。**播放状态由音乐页迁移至此**。
  *
- * ──── 为什么必须搬 ────
- * 原来 `<audio>`、队列、当前曲目、音量全都活在 `MediaAudioView.vue` 的 setup 里。
- * 于是"离开音乐页"就等于"停止播放"：Vue 卸载组件时 `onUnmounted` 里的
- * `audioEl.pause()` 直接把歌掐了，回到音乐页还要从头选一遍。
- * 用户要的是「切页不断、刷新能接上」，那播放状态就必须比页面活得久 ——
- * 只有两种落点：路由级的 keep-alive，或者一个 store + 一个常驻宿主组件。
+ * ──── 迁移原因 ────
+ * 原先 `<audio>`、队列、当前曲目、音量都位于 `MediaAudioView.vue` 的 setup 中。
+ * 因此离开音乐页即等于停止播放：Vue 卸载组件时 `onUnmounted` 中的 `audioEl.pause()`
+ * 会直接中断播放，返回音乐页后需要重新选择。
+ * 播放必须做到「切页不断、刷新可恢复」，播放状态的生命周期因此必须长于页面 ——
+ * 只有两种实现：路由级 keep-alive，或一个 store + 一个常驻宿主组件。
  *
- * 选后者：keep-alive 会把整个音乐页（列表、缩略图 blob、歌词、歌单面板）
- * 一起缓存下来，三页媒体各来一份就是三份内存；而且它救不了"刷新"。
+ * 选择后者：keep-alive 会缓存整个音乐页（列表、缩略图 blob、歌词、歌单面板），
+ * 三个媒体页面各一份即三份内存；且无法覆盖刷新的情况。
  *
  * ──── 职责边界 ────
- * · 本 store 持有**全部**播放状态与 `<audio>` 元素（通过 [attach] 拿引用）；
- * · `components/GlobalAudioPlayer.vue` 只负责渲染那个 `<audio>` 并 attach，没有任何 UI；
- * · `components/HeaderAudioBar.vue` 与音乐页的 `AudioControlBar.vue` 都是**只读展示 + 派发动作**，
- *   它们不持有播放状态 —— 两处 UI 同时存在时，"谁是播放状态的真源"必须只有一个。
+ * · 本 store 持有**全部**播放状态与 `<audio>` 元素（通过 [attach] 获取引用）；
+ * · `components/GlobalAudioPlayer.vue` 只负责渲染该 `<audio>` 并 attach，没有任何 UI；
+ * · `components/HeaderAudioBar.vue` 与音乐页的 `AudioControlBar.vue` 均为**只读展示 + 派发动作**，
+ *   不持有播放状态 —— 多处 UI 并存时，播放状态的真源必须唯一。
  *
  * ──── 队列的所有权 ────
- * 队列由**音乐页推给 store**（[setQueue]），因为"媒体库列表"和"歌单曲目"都只有音乐页知道。
- * 顶栏迷你条只是读它。这样做的代价是：没进过音乐页就没有队列（刷新后直接去别的页面时），
- * 所以刷新恢复还要额外把队列快照存进 sessionStorage —— 见 [persist] / [restoreFromSession]。
+ * 队列由**音乐页推给 store**（[setQueue]），因为「媒体库列表」与「歌单曲目」只有音乐页知道。
+ * 顶栏迷你条只读取它。其代价是：未进入过音乐页时没有队列（刷新后直接访问其它页面时），
+ * 因此刷新恢复还需把队列快照存入 sessionStorage —— 见 [persist] / [restoreFromSession]。
  *
- * ──── 刷新恢复为什么用 sessionStorage 而不是 localStorage ────
- * sessionStorage 是**每标签页**的：同一个浏览器开两个标签页听不同的歌，
- * 用 localStorage 会互相覆盖（后开的那个把前一个的队列顶掉）。
+ * ──── 刷新恢复使用 sessionStorage 而非 localStorage ────
+ * sessionStorage 是**每标签页**的：同一浏览器打开两个标签页播放不同曲目时，
+ * 使用 localStorage 会互相覆盖（后打开的标签页会覆盖前一个的队列）。
  *
- * ──── 刷新恢复为什么不存播放地址 ────
- * `POST /api/files/stream-ticket` 回的 `url` 带 `ticket=…`，**滑动过期 10 分钟**，
- * 而且它只授权那一个文件。把 blob URL 或票据 URL 存起来，刷新后拿到的是一张必然失效的票
- * （blob URL 更是刷新即作废，它绑在原来那个 document 上）。
- * 所以只存"**听的是哪一首、听到第几秒**"，恢复后**重新换票**。
- * 这也是为什么快照里只有元数据，没有 src。
+ * ──── 刷新恢复不保存播放地址 ────
+ * `POST /api/files/stream-ticket` 返回的 `url` 带 `ticket=…`，**滑动过期 10 分钟**，
+ * 且只授权那一个文件。保存 blob URL 或票据 URL 后，刷新得到的是必然失效的票据
+ * （blob URL 更是在刷新后立即作废，它绑定在原来的 document 上）。
+ * 因此只保存「**正在播放哪一首、播放到第几秒**」，恢复后**重新换取票据**。
+ * 这也是快照中只有元数据、没有 src 的原因。
  *
- * ──── 关于"顺序"这层间接 ────
- * `queue` 是**展示顺序**（音乐页列表按修改时间倒序、歌单按用户排的顺序），
- * `order` 是**播放顺序**（一个下标置换）。随机播放就是换掉 `order`，而不是打乱 `queue` ——
- * 打乱 queue 会让音乐页的列表跟着乱跳，用户下次找歌就找不到原来那一行在哪了。
+ * ──── 关于「顺序」这层间接 ────
+ * `queue` 是**展示顺序**（音乐页列表按修改时间倒序、歌单按用户排列的顺序），
+ * `order` 是**播放顺序**（一个下标置换）。随机播放替换的是 `order`，而不是打乱 `queue` ——
+ * 打乱 queue 会使音乐页的列表随之跳动，用户下次无法找到原来的位置。
  *
- * 这层间接的代价是**队列编辑必须同时照顾两层**（2026-10-14 补队列操作时踩的正是这里）：
- * 动过 `queue` 之后 `order` 里存的下标就全错位了，`orderPos` 也会指向别人 ——
- * 那不是"顺序有点乱"，而是"下一首"会跳到一首完全无关的曲目上。
- * 所以移除 / 重排 / 插入一律走 [remapOrder] / [rebuildOrder] 重建，绝不手改 `order` 的元素。
+ * 这层间接的代价是**队列编辑必须同时维护两层**：修改 `queue` 之后 `order` 中保存的下标
+ * 全部错位，`orderPos` 也会指向其它曲目 —— 结果不是「顺序略有不同」，而是「下一首」
+ * 会跳到一首完全无关的曲目。因此移除 / 重排 / 插入一律通过 [remapOrder] / [rebuildOrder]
+ * 重建，禁止手工修改 `order` 的元素。
  */
 import { defineStore } from 'pinia';
 import { computed, ref, shallowRef } from 'vue';
@@ -76,18 +76,19 @@ export type PlayerSource =
 
 /** 循环模式。`one` 只影响**自动续播**，用户手动点下一首仍然换歌（与 app 一致）。 */
 export type RepeatMode = 'off' | 'all' | 'one';
+export type PlayMode = 'sequential' | 'shuffle' | 'repeat-all' | 'repeat-one';
 
 /** 倍速档位。0.5–2.0 覆盖播客/有声书与快速试听两端，再多档位在一条下拉里读不过来。 */
 export const PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
 /**
- * 睡眠定时的模式（2026-10-14 补）。
+ * 睡眠定时的模式。
  *
- * `countdown` = 到点**直接暂停**（可能停在一首歌中间）；`end-of-track` = 放完**当前这一首**再停。
+ * `countdown` = 到点**直接暂停**（可能停在曲目中间）；`end-of-track` = 播放完**当前这一首**再停。
  *
- * app 把后者做成了一个"到点后是否先放完当前这首"的开关（默认开，见 `MediaSleepTimer`），
- * web 这边把它做成**并列的一档**：播放条右侧只有一个下拉/浮层的宽度，塞不进一个开关，
- * 而"今晚听完这首就睡"本身就是最常用的一种意图，值得单独一档。
+ * app 把后者实现为「到点后是否先播完当前曲目」的开关（默认开启，见 `MediaSleepTimer`），
+ * web 将其实现为**并列的一档**：播放条右侧的空间只够一个下拉/浮层，无法容纳开关，
+ * 且「播完这首再停」本身是最常用的意图之一，值得单独成档。
  */
 export type SleepTimerMode = 'off' | 'countdown' | 'end-of-track';
 
@@ -96,7 +97,7 @@ export const SLEEP_PRESET_MINUTES = [10, 20, 30, 60] as const;
 
 /**
  * 自定义时长的区间（分钟）。上限 1440 = 24 小时，与 app 的 `UFI_SLEEP_CUSTOM_MIN/MAX` 一致 ——
- * 上限存在的意义只是挡住"手滑多打两个 0"，而不是真的有人要定 24 小时。
+ * 上限的作用是拦截明显的输入错误，而不是表示需要支持 24 小时定时。
  */
 export const SLEEP_CUSTOM_MIN = 1;
 export const SLEEP_CUSTOM_MAX = 1440;
@@ -105,12 +106,12 @@ export const SLEEP_CUSTOM_MAX = 1440;
 const SS_KEY = 'ufi.player.session';
 
 /**
- * 快照里队列的条数上限。
+ * 快照中队列的条数上限。
  *
- * 音乐页的队列来自分页加载（一页 60）或歌单（core 侧上限几百），现实中到不了这个数。
- * 留这个上限纯粹是为了防御"某天 core 回了一个几万条的列表"把 sessionStorage 写爆
- * （配额通常 5MB，超了 `setItem` 直接抛 QuotaExceededError）。
- * **截断时保证当前曲目一定在里面**，否则恢复出来就是个空条。
+ * 音乐页的队列来自分页加载（每页 60）或歌单（core 侧上限为几百），实际不会达到该值。
+ * 该上限用于防御异常规模的列表（例如 core 返回数万条）导致 sessionStorage 超出配额
+ * （配额通常为 5MB，超出后 `setItem` 会抛出 QuotaExceededError）。
+ * **截断时必须保证当前曲目在结果中**，否则恢复后队列为空。
  */
 const MAX_SNAPSHOT_QUEUE = 2000;
 
@@ -139,7 +140,7 @@ export const usePlayerStore = defineStore('player', () => {
   const currentTrack = shallowRef<PlayerTrack | null>(null);
 
   const playing = ref(false);
-  /** 在等数据（换票 / 缓冲）。UI 用它显示转圈，不要拿它当"暂停"。 */
+  /** 正在等待数据（换票 / 缓冲）。UI 据此显示加载状态，不得当作「暂停」。 */
   const buffering = ref(false);
   const positionMs = ref(0);
   const durationMs = ref(0);
@@ -147,6 +148,14 @@ export const usePlayerStore = defineStore('player', () => {
   const playbackRate = ref(1);
   const shuffle = ref(false);
   const repeatMode = ref<RepeatMode>('off');
+
+  /** 单按钮循环的播放模式：顺序 → 随机 → 列表循环 → 单曲循环。 */
+  const playMode = computed<PlayMode>(() => {
+    if (repeatMode.value === 'one') return 'repeat-one';
+    if (shuffle.value) return 'shuffle';
+    if (repeatMode.value === 'all') return 'repeat-all';
+    return 'sequential';
+  });
   /** 播放失败的文案。空串 = 没有错误。 */
   const errorText = ref('');
 
@@ -164,11 +173,11 @@ export const usePlayerStore = defineStore('player', () => {
   const attached = ref(false);
 
   /**
-   * 睡眠定时的模式（2026-10-14 补）。默认 `off`。
+   * 睡眠定时的模式。默认 `off`。
    *
-   * 它住在 store 而不是播放条里，理由与播放状态搬进 store 完全相同：
-   * 用户完全可能"设 30 分钟然后离开音乐页去刷别的"，而播放条随音乐页一起卸载 ——
-   * 定时器挂在那上面等于"一离开这一页定时就没了"。
+   * 保存在 store 而不是播放条中，理由与播放状态迁移至此相同：
+   * 用户可能设置 30 分钟后离开音乐页，而播放条随音乐页一并卸载 ——
+   * 定时器挂在播放条上会随页面卸载而失效。
    */
   const sleepMode = ref<SleepTimerMode>('off');
   /** 倒计时剩余秒数，由 [tickSleep] 每秒刷新。`end-of-track` 模式下恒为 0（没有倒计时可言）。 */
@@ -211,11 +220,11 @@ export const usePlayerStore = defineStore('player', () => {
   let lastPositionSaveAt = 0;
   let el: HTMLAudioElement | null = null;
   /**
-   * 睡眠定时的截止时刻（`Date.now()` 基准）。0 = 没开。
+   * 睡眠定时的截止时刻（`Date.now()` 基准）。0 = 未启用。
    *
-   * **不用"剩余秒数"当唯一真源**：后台标签页里 `setInterval` 会被节流（可能一分钟才跑一次），
-   * 递减式的倒计时会越走越慢，表现是"定了 30 分钟，两小时后还在放"。
-   * 记截止时刻、每次 tick 现算，节流最多让收口晚一点，不会累积误差。
+   * **不得以「剩余秒数」作为唯一真源**：后台标签页中的 `setInterval` 会被节流
+   * （可能每分钟才执行一次），递减式倒计时会持续偏慢，导致 30 分钟的定时实际运行两小时。
+   * 记录截止时刻并在每次 tick 时重新计算，节流最多推迟结束时刻，不会累积误差。
    */
   let sleepDeadline = 0;
   /** 倒计时的 interval id。`end-of-track` 模式不需要它（那一档没有倒计时）。 */
@@ -308,9 +317,9 @@ export const usePlayerStore = defineStore('player', () => {
    *
    * `mapOld` 把"变化前的展示下标"翻成"变化后的展示下标"，返回 -1 表示这一项已经不在队列里。
    *
-   * ──── 为什么不能图省事直接调 [rebuildOrder] ────
-   * 那个函数在随机开着时会**重掷**一次置换：用户只是删掉一首，接下来的十首却全换了，
-   * 与"随机播放"这个开关给人的预期不符（"下一首"应该还是本来会听到的那一首）。
+   * ──── 不能直接调用 [rebuildOrder] 的原因 ────
+   * 该函数在随机开启时会**重新生成**一次置换：用户只删除一首，后续十首却全部改变，
+   * 与「随机播放」开关的预期不符（「下一首」应当仍是原本会听到的那一首）。
    * 所以这里做**外科式重映射**：从 `order` 里抽掉这一项、把受影响的下标整体平移，
    * 置换里活下来的那些下标的相对顺序原样保留。
    *
@@ -334,15 +343,14 @@ export const usePlayerStore = defineStore('player', () => {
    * 从队列里移除一项。`index` 是**展示顺序**（也就是音乐页那一列）的下标。
    *
    * ──── 移除的若是正在播的那一首 ────
-   * **接着播播放顺序里的下一首**。这是与 app 对齐的行为：media3 的 `removeMediaItem`
-   * 删掉当前项时自己会跳到下一首（见 `UfiAudioPlayback.ufiRemoveFromQueue` 的 KDoc）。
-   * 这样 `currentTrack` 仍在队列里、`orderPos` 仍然有效，两条不变量天然成立，
-   * 也不会出现"删掉当前这首之后按下一首却跳回队首"的怪事。
+   * **继续播放播放顺序中的下一首**。这是与 app 对齐的行为：media3 的 `removeMediaItem`
+   * 删除当前项时会自行跳到下一首（见 `UfiAudioPlayback.ufiRemoveFromQueue` 的 KDoc）。
+   * 这样 `currentTrack` 仍在队列中、`orderPos` 仍然有效，两条不变量自然成立，
+   * 也不会出现「删除当前曲目后按下一首却回到队首」的情况。
    *
-   * 后面已经没有可播的条目（删的是播放顺序里的最后一个）时**暂停**，并把这一首留在
-   * `currentTrack` 上（`orderPos = -1`，即"当前曲目不在队列里"这个既有状态）：
-   * 这时**不替用户挑一首**（静默换成别的歌更没道理），停下来、保留进度，
-   * 按一下播放键还能接着听完。
+   * 后续已无可播条目（删除的是播放顺序中的最后一个）时**暂停**，并把该曲目保留在
+   * `currentTrack` 上（`orderPos = -1`，即「当前曲目不在队列中」这一既有状态）：
+   * 此时**不得替用户选择其它曲目**，应停止播放并保留进度，用户按播放键可继续听完。
    */
   async function removeFromQueue(index: number) {
     const track = queue.value[index];
@@ -369,12 +377,12 @@ export const usePlayerStore = defineStore('player', () => {
   /**
    * 队列内重排：把第 [index] 项往 [dir] 方向挪一位（`dir` 只取 ±1）。
    *
-   * ──── 为什么重排会顺手关掉随机 ────
-   * 与 app 的 `onMove` 同一条决策（`MediaAudioPlayerScreen` 里那段注释）：`queue` 是展示顺序、
-   * `order` 是播放顺序，随机开着时**手动排的顺序对播放没有任何影响** —— 用户排了半天，
-   * 听的时候还是按打乱的顺序走，那是"看起来生效了其实没有"，比不给排更糟。
-   * 他既然在手排顺序，就是想按这个顺序听，所以这里把随机关掉；**提示由调用方负责**
-   * （store 不碰 UI，见文件头"职责边界"）。
+   * ──── 重排会关闭随机的原因 ────
+   * 与 app 的 `onMove` 采用同一决策（见 `MediaAudioPlayerScreen` 中的注释）：`queue` 是展示顺序、
+   * `order` 是播放顺序，随机开启时**手动排列的顺序对播放没有任何影响** —— 用户完成重排后，
+   * 播放仍按打乱的顺序进行，属于「看似生效、实际未生效」，比不提供重排更差。
+   * 用户主动排序即表示希望按该顺序播放，因此此处关闭随机；**提示由调用方负责**
+   * （store 不涉及 UI，见文件头「职责边界」）。
    *
    * 关掉随机之后 [rebuildOrder] 会把 `order` 重建为恒等置换，展示顺序从此就是播放顺序。
    */
@@ -392,13 +400,13 @@ export const usePlayerStore = defineStore('player', () => {
   /**
    * 清空队列。
    *
-   * **不抹掉正在听的那一首**：它只是掉出了队列（`orderPos = -1`），与"切歌单"是同一种状态 ——
-   * 用户按一下播放还能接着听完，不会因为清个队列丢掉进度。
-   * 但播放要**停下来**：队列都没了，"接下来放什么"无从谈起，继续放会让用户以为清空没生效
-   * （app 侧同样是"队列空了就 stop"，见 `UfiAudioPlayback.ufiRemoveFromQueue`）。
+   * **不清除正在播放的曲目**：它只是不再属于队列（`orderPos = -1`），与「切换歌单」是同一种状态 ——
+   * 用户按播放可继续听完，不会因清空队列丢失进度。
+   * 但播放必须**停止**：队列为空后「接下来播放什么」无从确定，继续播放会让用户误认为清空未生效
+   * （app 侧同样采用「队列为空即 stop」，见 `UfiAudioPlayback.ufiRemoveFromQueue`）。
    *
-   * `source` 刻意保留：它描述的是"这份队列从哪来"，清空之后这个来源依然成立，
-   * 顶栏那行"在放哪个歌单"也还要读它。
+   * `source` 刻意保留：它描述「该队列的来源」，清空之后来源依然成立，
+   * 顶栏「正在播放哪个歌单」仍需读取它。
    */
   function clearQueue() {
     queue.value = [];
@@ -411,10 +419,10 @@ export const usePlayerStore = defineStore('player', () => {
   /**
    * 「下一首播放」：把这一首插到**当前曲目之后**（直接操作 [order]，不碰 [queue]）。
    *
-   * ──── 为什么动 order 而不是 queue ────
-   * 随机开着时 `order` 是一份置换，"插到当前曲目的后一位"在置换里同样成立；而在 `queue` 里
-   * 挪一行只会改**展示**顺序、对播放毫无影响 —— 那正是这个功能要避免的"看起来生效了其实没有"。
-   * 所以这里只重排 `order`，音乐页那一列原样不动（用户找歌的位置不会因为插一首歌而乱掉）。
+   * ──── 修改 order 而非 queue 的原因 ────
+   * 随机开启时 `order` 是一份置换，「插入到当前曲目之后」在置换中同样成立；而在 `queue` 中
+   * 移动一行只会改变**展示**顺序，对播放没有影响 —— 正是本功能需要避免的「看似生效、实际未生效」。
+   * 因此这里只重排 `order`，音乐页的列表保持不变（用户定位曲目的位置不会因插入而改变）。
    *
    * 当前曲目不在队列里（`orderPos = -1`）时插到**播放顺序的队首**：那种状态下"下一首"本来
    * 就是从队首开始（见 [step]），插到队首才等于"紧接着放它"。
@@ -467,8 +475,8 @@ export const usePlayerStore = defineStore('player', () => {
   /** 清空队列与当前曲目，并停止播放。退出登录 / 切服务器时用。 */
   function reset() {
     playSeq++;
-    // 定时器也要一起收掉：切了服务器还留着上一个会话的定时，用户会听到"新账号的歌
-    // 放了几分钟自己停了"这种无从解释的行为。
+    // 定时器必须一并清除：切换服务器后若保留上一会话的定时，
+    // 会出现「新账号的曲目播放数分钟后自行停止」这类无法解释的行为。
     cancelSleepTimer();
     currentTrack.value = null;
     queue.value = [];
@@ -570,7 +578,7 @@ export const usePlayerStore = defineStore('player', () => {
     pendingSeekSec = opts.startSec > 0 ? opts.startSec : null;
     try {
       const src = await fetchStreamUrl(api, track.path);
-      // 期间用户已经点了别的歌：这张票连 src 都不要赋，否则会把新的覆盖掉
+      // 期间用户已选择其它曲目：该票据不得写入 src，否则会覆盖新的地址
       if (seq !== playSeq) return;
       el.src = src;
       if (opts.autoplay) await el.play();
@@ -708,6 +716,26 @@ export const usePlayerStore = defineStore('player', () => {
   function cycleRepeat() {
     const nextMode: RepeatMode = repeatMode.value === 'off' ? 'all' : repeatMode.value === 'all' ? 'one' : 'off';
     repeatMode.value = nextMode;
+    persist(true);
+  }
+
+  /**
+   * 播放顺序 + 循环模式合并成一个按钮循环：
+   * 顺序 → 随机 → 列表循环 → 单曲循环 → 顺序。
+   * 互斥设置：进入随机时关循环，进入循环时关随机，避免两个状态同时生效造成图标/行为不一致。
+   */
+  function cyclePlayMode() {
+    const next: PlayMode =
+      playMode.value === 'sequential'
+        ? 'shuffle'
+        : playMode.value === 'shuffle'
+          ? 'repeat-all'
+          : playMode.value === 'repeat-all'
+            ? 'repeat-one'
+            : 'sequential';
+    shuffle.value = next === 'shuffle';
+    repeatMode.value = next === 'repeat-all' ? 'all' : next === 'repeat-one' ? 'one' : 'off';
+    rebuildOrder();
     persist(true);
   }
 
@@ -955,7 +983,7 @@ export const usePlayerStore = defineStore('player', () => {
   /**
    * 播放出错。
    *
-   * 两类要分开，不能一句"浏览器不支持该编码"了事：
+   * 两类情况必须区分，不能统一提示「浏览器不支持该编码」：
    *  · **票据过期**（滑动过期 10 分钟）—— 长时间暂停后按播放/拖进度就会撞上。
    *    表现是网络类错误，而"重新换一张票、seek 回原位继续"完全可以自动完成；
    *  · 真的解不了 —— 交给 `mediaErrorTextOf` 按 MediaError 的 code 给准确文案
@@ -1064,8 +1092,8 @@ export const usePlayerStore = defineStore('player', () => {
     playbackRate.value = Number(snap.playbackRate) || 1;
     shuffle.value = !!snap.shuffle;
     repeatMode.value = snap.repeatMode === 'all' || snap.repeatMode === 'one' ? snap.repeatMode : 'off';
-    // 音量不恢复：它已经在 localStorage 里（readAudioVolume 的初值），
-    // 两条通道同时写会在"改了音量但没听歌"时互相打架。
+    // 音量不恢复：它已保存在 localStorage 中（作为 readAudioVolume 的初值），
+    // 两条通道同时写入会在「修改音量但未播放」时互相覆盖。
     playing.value = false;
     rebuildOrder();
     // 封面/歌词重新取一遍：blob URL 刷新即作废，持久化它没有意义
@@ -1090,6 +1118,7 @@ export const usePlayerStore = defineStore('player', () => {
     playbackRate,
     shuffle,
     repeatMode,
+    playMode,
     errorText,
     coverUrl,
     lyricLines,
@@ -1130,6 +1159,7 @@ export const usePlayerStore = defineStore('player', () => {
     cyclePlaybackRate,
     toggleShuffle,
     cycleRepeat,
+    cyclePlayMode,
     startSleepTimer,
     sleepAfterCurrentTrack,
     toggleSleepAfterCurrentTrack,

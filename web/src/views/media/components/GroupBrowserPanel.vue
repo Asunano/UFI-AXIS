@@ -55,7 +55,12 @@
       <span v-if="total > 0" class="gp-total">{{ totalText }}</span>
     </div>
 
-    <div class="gp-list">
+    <div v-if="layout === 'list'" class="gp-table-head" aria-hidden="true">
+      <span class="gp-th-name">名称</span>
+      <span class="gp-th-count">数量</span>
+    </div>
+
+    <div class="gp-list" :class="{ 'is-grid': layout === 'grid' }">
       <div v-if="loading && groups.length === 0" class="gp-loading">
         <n-spin size="small" />
       </div>
@@ -75,7 +80,7 @@
         >
           <img v-if="by !== 'folder' && thumbs[g.cover_id]" :src="thumbs[g.cover_id]" alt="" class="gp-cover" />
           <span v-else class="gp-cover gp-cover-fallback" :class="{ 'is-folder': by === 'folder' }">
-            <n-icon :size="16">
+            <n-icon :size="layout === 'grid' ? 36 : 16">
               <FolderOutline v-if="by === 'folder'" />
               <MusicalNotesOutline v-else />
             </n-icon>
@@ -119,6 +124,8 @@ const props = defineProps<{
   inline?: boolean;
   /** 音乐页搜索框的关键词；按组名/副标题过滤。 */
   query?: string;
+  /** `list`（一行一项）或 `grid`（封面卡片）；窄屏下网格自动降成单列。 */
+  layout?: 'list' | 'grid';
 }>();
 
 /** 唯一的出口：进入某个分组的曲目列表。见文件头"为什么只有一个 emit"。 */
@@ -316,6 +323,88 @@ onUnmounted(() => pool.releaseAll());
   min-height: 0;
   overflow-y: auto;
 }
+/* 列表模式：与「歌曲列表」同一套表头 + 平铺行，不再套白卡。
+   白卡会和点进歌单/专辑后的曲目表产生容器语言差异（2026-11-11 用户反馈）。 */
+.gp-table-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 8px 0 54px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+}
+.gp-list:not(.is-grid) {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+}
+.gp-list:not(.is-grid) .gp-item {
+  border-radius: var(--radius-md);
+}
+
+/* 网格视图：封面放大成方形卡片，标题/副标题/条数落在封面下面。
+   列表视图继续用 40px 小封面 + 单行，两者共用同一份 DOM。 */
+.gp-list.is-grid {
+  /* display:grid 不能省：上一版把基类的 display:grid 移给了 :not(.is-grid) 的 flex，
+     这里只剩 grid-template-columns —— 没有 display:grid 时列定义不生效，
+     每张卡退化成整宽一块（用户反馈「一个网格占据所有内容」）。 */
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px;
+  padding: 4px;
+  /* 不加 align-content 时，grid 默认 stretch 会把行高拉到容器剩余高度：
+     两行卡片在 900 高的视口里各被撑到 689px（用户反馈「一个网格占据所有内容」）。 */
+  align-content: start;
+}
+.gp-list.is-grid .gp-item {
+  flex-direction: column;
+  /* stretch 而不是 flex-start：竖排后 align-items 作用在横轴上，
+     flex-start 会让文本块按内容宽度收缩，「N 项」也跟着参差（与歌单网格同一个坑）。 */
+  align-items: stretch;
+  gap: 6px;
+  padding: 8px;
+  border-radius: var(--radius-md);
+  height: 100%;
+}
+.gp-list.is-grid .gp-cover,
+.gp-list.is-grid .gp-cover-fallback {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: var(--radius-md);
+  /* 封面底色 --surface-elevated 与页面底色几乎同色，没有描边时方块边界看不出来
+     （与「歌单」网格同一套处理，2026-11-11）。 */
+  border: 1px solid var(--border-subtle);
+  font-size: 28px;
+}
+.gp-list.is-grid .gp-text {
+  width: 100%;
+  /* 不要 flex:1：那会让文本块吃掉卡片剩余高度，标题与「N 项」被推到两端 */
+  flex: none;
+}
+.gp-list.is-grid .gp-title {
+  /* 与歌单网格一致：两行截断，长专辑名不再半截省略 */
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.4;
+}
+.gp-list.is-grid .gp-count {
+  /* 钉在卡片底部：同一行卡片等高时，「N 项」的基线才齐 */
+  margin-top: auto;
+  align-self: flex-start;
+}
+
+/* 提示类内容（加载中 / 空态 / 权限）不参与分列，横跨整行 */
+.gp-loading,
+.gp-note {
+  grid-column: 1 / -1;
+}
 
 .gp-loading {
   display: flex;
@@ -328,7 +417,7 @@ onUnmounted(() => pool.releaseAll());
 .gp-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   width: 100%;
   padding: 6px 8px;
   border: none;
@@ -384,14 +473,14 @@ onUnmounted(() => pool.releaseAll());
   min-width: 0;
 }
 .gp-title {
-  font-size: 13px;
+  font-size: var(--font-base);
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .gp-sub {
-  font-size: 11px;
+  font-size: var(--font-xs);
   color: var(--text-muted);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -399,7 +488,9 @@ onUnmounted(() => pool.releaseAll());
 }
 .gp-count {
   flex-shrink: 0;
-  font-size: 11px;
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }

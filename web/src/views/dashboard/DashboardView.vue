@@ -6,7 +6,6 @@
     <div class="dashboard-top">
       <TrafficUsageCard @open-limit="showTrafficModal = true" />
       <NetworkInfoCard
-        :roaming-enabled="roamingEnabled"
         :mobile-data-saving="mobileDataSaving"
         @set-mobile-data="setMobileData"
         @open-mode="showModeModal = true"
@@ -101,7 +100,7 @@
  * 反过来，纯读 dashboardStore 的卡（流量、系统状态、网络信息里的 network_status）
  * 直接读 store —— Pinia 是单例，不存在分叉，多传一层 props 只是噪音。
  */
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useCancellableApi } from '@/composables/useCancellableApi';
@@ -155,10 +154,12 @@ const {
   refreshDeviceSettings,
   modeLabel,
   applyNetworkMode,
+  // 弹窗打开期间回读不许覆盖待选档位（见 composable 的 modeEditing）
+  beginModeEdit,
+  endModeEdit,
   // 「切换中 / 尚未完成」中间态：与网络页共用同一份 composable 状态
   switchingMode,
   modeSwitchTimedOut,
-  roamingEnabled,
   mobileDataSaving,
   setMobileData,
   wifiSettings,
@@ -216,6 +217,12 @@ const showWifiModal = ref(false);
 const showTrafficModal = ref(false);
 const showModeModal = ref(false);
 const showAclModal = ref(false);
+/**
+ * 制式弹窗的显隐要通知 composable（2026-10-31）：编辑期间它不会再让 10s 轮询把回读值
+ * 写回待选档位（否则用户选的档位会自己跳回去）；打开时同步一次设备真值，
+ * 丢掉上一次取消 / 超时留下的残留选择。
+ */
+watch(showModeModal, (open) => (open ? beginModeEdit() : endModeEdit()));
 
 // 频段锁定是懒加载弹窗：挂载与显隐必须分两拍，否则首帧 show 就是 true、进出场动画全丢
 const bandModal = useLazyModal(() => import('@/components/modals/BandLockModal.vue'));
@@ -385,7 +392,9 @@ useInterval(() => {
 useInterval(() => {
   loadDeviceInfo();
   refreshNetworkStatus();
-  loadDeviceSettings();
+  // 制式切换期间不读 device settings（2026-10-31）：这次普通读会把「设备还没切完」的
+  // 旧档位写进 core 的 5 分钟缓存，把随后 fresh 回读确认拿到的结果覆盖回去。
+  if (switchingMode.value === null) loadDeviceSettings();
 }, 10_000);
 useInterval(() => {
   // 二维码不跟着轮询重取：它是 blob，只在挂载与改完 WiFi 配置后取

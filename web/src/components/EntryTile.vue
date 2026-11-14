@@ -32,9 +32,11 @@
             <n-icon :size="20"><component :is="icon" /></n-icon>
           </span>
           <span class="entry-text">
-            <span class="entry-title">{{ title }}</span>
+            <span class="entry-title"> {{ title }}<slot name="title-extra" /> </span>
             <span v-if="desc" class="entry-desc">{{ desc }}</span>
           </span>
+          <!-- 右侧尾部：箭头 / 状态徽标等。放在按钮内部，仍是整块可点面积的一部分。 -->
+          <span v-if="$slots.extra" class="entry-extra"><slot name="extra" /></span>
         </button>
       </span>
     </template>
@@ -77,6 +79,15 @@ const gatedHint = computed(() => props.disabled && props.hint !== '');
 <style scoped>
 /* 栅格子项（原先直接是 button）。min-width:0 让过长的说明能在瓦片内折行，
    而不是把栅格列顶宽。 */
+/* 尾部插槽（箭头 / 徽标）：不参与拉伸，靠 flex 贴右 */
+.entry-extra {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 4px;
+}
+
 .entry-tile-wrap {
   display: flex;
   min-width: 0;

@@ -225,7 +225,7 @@
 import { ref, reactive, computed, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useCancellableApi } from '@/composables/useCancellableApi';
-import { formatBytes, formatUptime } from '@/composables/utils';
+import { formatBytes, formatUptimeSec } from '@/composables/utils';
 import { Endpoints } from '@/api/contract';
 import InfoRow from '@/components/InfoRow.vue';
 import ToggleRow from '@/components/ToggleRow.vue';
@@ -371,8 +371,8 @@ const valuePlaceholder = computed(() => (calibForm.target === 'data' ? '例如 1
 
 const usedBytesText = computed(() => (usage.usedBytes === null ? '--' : formatBytes(usage.usedBytes)));
 // monthly_time 是"本月在线时长（秒）"（API 参考 1298 行 + app 侧同样按 3600 折算），
-// 所以这里用 formatUptime（它收秒）
-const usedTimeText = computed(() => (usage.monthlyTime === null ? '--' : formatUptime(usage.monthlyTime)));
+// 所以这里用 formatUptimeSec（它收秒）
+const usedTimeText = computed(() => (usage.monthlyTime === null ? '--' : formatUptimeSec(usage.monthlyTime)));
 
 /**
  * 拉当前用量。
@@ -427,7 +427,7 @@ async function loadUsage() {
  *     只是文档作者随手写的，profile 测试那个 `"1024"` 测的是 encode 编码而不是单位；
  *  ② 校准的语义是"把设备的计数器改成这个数"，那么单位必然与**计数器本身**一致 ——
  *     设备的计数器是 `monthly_*_bytes`（字节）与 `monthly_time`（API 参考写「秒」，
- *     本栏那两行现值也是按秒用 `formatUptime` 渲染的）；
+ *     本栏那两行现值也是按秒用 `formatUptimeSec` 渲染的）；
  *  ③ 按"原值提交"实现的后果是**静默错 1048576 倍**：用户填 1024 MB 实际只校准了 1 KB，
  *     而界面上会显示"已校准为 1024 MB"。错了还看不出来，比多一处换算危险得多。
  * 所以：`data` 走 MB/GB 下拉并换算成字节，`time` 固定按分钟换算成秒。

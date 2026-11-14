@@ -1,20 +1,20 @@
 <template>
   <!--
-    登录 / 首次配对（2026-10-22 按 docs-dev/login-mockups/02-split-brand.html 落地）。
+    登录 / 首次配对。
 
-    结构：左侧品牌栏（LoginBrand）+ 右侧卡片；卡片内是**五选一**的视图：
+    结构：左侧品牌栏（LoginBrand）+ 右侧卡片；卡片内为**五选一**的互斥视图：
       login    普通登录
       pair     首次配对（三步：配对密码 → 设备后台 → 确认）
       waiting  等待机主批准
       rejected 机主拒绝
       expired  申请过期
 
-    为什么改成"一次只渲染一种状态"：原来批准等待是叠在表单上方的一条 alert，
-    表单与提示同时占位，手机上点完登录会看到两套内容抢注意力。现在等待/拒绝/过期
-    各自占满卡片，标题、说明、动作都只属于当前那件事。
+    视图互斥的原因：批准等待若以表单上方的 alert 呈现，表单与提示同时占位，
+    移动端会出现两套内容争夺注意力。互斥之后，等待 / 拒绝 / 过期各自占满卡片，
+    标题、说明与动作均只属于当前状态。
 
-    全部请求与校验逻辑没有重写：handleLogin / beginApproval / 轮询 / 错误映射原样保留，
-    这里只负责把 view 映射到界面。pairSteps 的 validate 契约继续复用（拦下原因就地显示）。
+    请求与校验逻辑集中于本组件：handleLogin / beginApproval / 轮询 / 错误映射，
+    此处只负责把 view 映射到界面。pairSteps 的 validate 契约继续复用（拦下原因就地显示）。
   -->
   <div class="login-shell">
     <LoginBrand />
@@ -236,7 +236,7 @@
           </n-alert>
         </section>
 
-        <!-- ③ 等待批准（独立视图，不再叠在表单上方） -->
+        <!-- ③ 等待批准（独立视图，不叠加在表单上方） -->
         <section v-else-if="view === 'waiting'" class="view view-waiting" data-view="waiting">
           <div class="orb">
             <n-icon :size="34"><LockClosedOutline /></n-icon>
@@ -294,8 +294,8 @@
             >
           </div>
           <button v-if="!hasDefaultPassword" class="link-btn" @click="backToLogin">改用配对密码登录</button>
-          <!-- 2026-10-22：与 App 同口径的自救入口。只在设备确实还有配对记录时显示，
-               因为批准必然意味着 paired_count >= 1；文案按条数生成，不用"唯一设备"这种断言。 -->
+          <!-- 与 App 同口径的自救入口。仅在设备确实存在配对记录时显示：
+               批准必然意味着 paired_count >= 1；文案按记录条数生成，不使用唯一设备的断言。 -->
           <button v-if="pairedCount > 0" class="link-btn" @click="showRescue = true">
             {{
               pairedCount === 1
@@ -338,8 +338,8 @@
         </section>
       </div>
 
-      <!-- 自救：清除设备上的全部配对记录（破坏性，必须输配对密码）。
-           与 App 的「这台手机就是唯一已配对设备？」入口同一口径：按条数说明后果。 -->
+      <!-- 自救：清除设备上的全部配对记录（破坏性操作，必须输入配对密码）。
+           与 App 中同名入口同一口径：按记录条数说明后果。 -->
       <n-modal
         v-model:show="showRescue"
         preset="card"
@@ -409,35 +409,35 @@ import {
   type ApprovalStatus,
 } from './usePairingApproval';
 
-// 配对记录里的显示名。设备**身份**不再由任何常量决定（见 deviceIdentity.ts）：
-// 旧代码用固定的 WEB_FINGERPRINT 上报指纹，服务端把所有浏览器当成同一台设备，
-// 于是"配对设备上限"对 Web 端完全无效——任意多个浏览器只要知道密码就能登录。
+// 配对记录中的显示名。设备**身份**不由任何常量决定（见 deviceIdentity.ts）：
+// 若以固定指纹上报，服务端会把所有浏览器视为同一台设备，
+// 使"配对设备上限"对 Web 端失效 —— 任意多个浏览器只要知道密码即可登录。
 const WEB_DEVICE_NAME = 'Web 管理后台';
 
 const router = useRouter();
 const appStore = useAppStore();
-// 「下一步」的分步校验用 message 即时提示；请求类错误走**表单上方**的 error 提示条
-// （2026-10-21 B3-3：原先在提交按钮下方，矮屏上会被推到折叠线外）
+// 「下一步」的分步校验使用 message 即时提示；请求类错误使用**表单上方**的 error 提示条：
+// 提示条位于提交按钮下方时，在低高度屏幕上会被推到折叠线之外。
 const message = useMessage();
-// 多标签互斥的确认框（2026-10-21 决策 D7-3）
+// 多标签互斥的确认框
 const dialog = useDialog();
-/** 用户已在"另一个标签页已登录"的提示里点了继续 —— 本次登录不再拦截。 */
+/** 用户已在"另一个标签页已登录"的提示中选择继续 —— 本次登录不再拦截。 */
 let tabOverride = false;
 
-// 同源检测：如果当前页面是从设备本身 serve 的，则自动使用当前 origin
+// 同源检测：页面由设备自身提供时，自动使用当前 origin
 const currentOrigin = computed(() => window.location.origin);
 const isSameOrigin = computed(() => {
-  // 开发环境 (vite dev server) 不算同源
+  // 开发环境（vite dev server）不计为同源
   if (import.meta.env.DEV) return false;
   return true;
 });
 
 /**
- * 当前是否处于「明文 http + 身份密钥可被脚本读取」的模式（2026-10-21，审计 §B11）。
+ * 当前是否处于「明文 HTTP + 身份密钥可被脚本读取」的模式。
  *
- * `crypto.subtle` 只在安全上下文（https / localhost）可用；设备默认以
- * `http://192.168.x.x:8088` 提供服务，此时 deviceIdentity 走的是纯 JS 回退 ——
- * 私钥是 IndexedDB 里的 32 字节裸标量，任何同源脚本都能读走。
+ * `crypto.subtle` 仅在安全上下文（https / localhost）可用；设备默认以
+ * `http://<设备地址>:8088` 提供服务，此时 deviceIdentity 使用纯 JS 回退实现 ——
+ * 私钥是 IndexedDB 中的 32 字节裸标量，任何同源脚本均可读取。
  */
 const identityExposedOnPlainHttp = computed(() => typeof window !== 'undefined' && !window.isSecureContext);
 
@@ -447,7 +447,7 @@ const form = reactive({
   confirmPassword: '',
 });
 
-// 初次配对时一并写入的 Goform 后台连接配置（默认值与设备出厂一致）
+// 初次配对时一并写入的 Goform 后台连接配置（默认值与设备出厂值一致）
 const goformIp = ref('192.168.0.1');
 const goformPort = ref(8080);
 const goformPassword = ref('admin');
@@ -455,20 +455,20 @@ const goformPassword = ref('admin');
 const loading = ref(false);
 const error = ref('');
 
-// ── 跨设备批准（2026-10-15）──
+// ── 跨设备批准 ──
 //
-// 只在 confirm 回 403 APPROVAL_REQUIRED 之后才启用。**不能**"每次登录都先请求一次"：
-// 那样即使机主把批准关着，每次网页登录也会凭空造出一条待批准记录，
-// 把 App 的批准弹窗与外部通知叫醒（等于给任何人一个骚扰机主的开关）。
+// 仅在 confirm 返回 403 APPROVAL_REQUIRED 之后才启用。**不得**在每次登录时预先请求：
+// 那样即使机主已关闭批准，每次网页登录也会创建一条待批准记录，
+// 触发 App 的批准弹窗与外部通知（等同于为任何访问者提供骚扰机主的开关）。
 const approvalWaiting = ref(false);
 /**
- * 设备上现有配对记录数（`/pairing/info.paired_count`，2026-10-22 core 新增）。
+ * 设备上现有配对记录数（`/pairing/info.paired_count`）。
  *
- * 只用于自救入口的显示与文案：批准必然意味着 >= 1，但"1 条陈旧记录"与"多台正常设备"
- * 的处置完全不同，不能再用"唯一设备"这种断言糊过去。
+ * 仅用于自救入口的显示与文案：批准必然意味着 >= 1，但"1 条陈旧记录"与
+ * "多台正常设备"的处置方式完全不同，不能以"唯一设备"这类断言概括。
  */
 const pairedCount = ref(0);
-/** 自救弹窗（清除设备上的全部配对记录）—— 破坏性操作，必须输配对密码。 */
+/** 自救弹窗（清除设备上的全部配对记录）—— 破坏性操作，必须输入配对密码。 */
 const showRescue = ref(false);
 const rescuePwd = ref('');
 const rescueBusy = ref(false);
@@ -477,28 +477,28 @@ const approvalStatus = ref<ApprovalStatus>('idle');
 const approvalCode = ref('');
 const approvalSid = ref('');
 /**
- * 批准申请有效期（分钟），展示用。
+ * 批准申请有效期（分钟），仅用于展示。
  *
- * 优先用后端 `POST /pairing/request-approval` 回的 `expires_in`；拿不到时按 core 的
- * 15 分钟 TTL 兜底（`PairedDeviceApprovalStore` 的既有取值）。刷新页面恢复等待态时
- * 拿不到秒数（状态接口只回一个字符串），同样落回兜底值 —— 不编造"剩 N 分钟"。
+ * 优先使用后端 `POST /pairing/request-approval` 返回的 `expires_in`；缺失时按 core 的
+ * 15 分钟 TTL 兜底（`PairedDeviceApprovalStore` 的既定取值）。刷新页面恢复等待态时
+ * 无法取得剩余秒数（状态接口只返回一个字符串），同样使用兜底值，不虚构剩余时间。
  */
 const approvalTtlMin = ref(15);
 let approvalTimer: ReturnType<typeof setTimeout> | null = null;
-/** 本轮轮询的起始时刻（自适应节奏用，2026-10-21）。 */
+/** 本轮轮询的起始时刻（用于自适应节奏）。 */
 let approvalPollStartedAt = 0;
-/** 轮询「代次」：stop/重启时自增，落单的异步回调据此丢弃自己的结果（2026-10-21）。 */
+/** 轮询代次：stop / 重启时自增，落后的异步回调据此丢弃自身结果。 */
 let approvalPollSeq = 0;
 const hasDefaultPassword = ref(false);
 
 /**
- * 控件尺寸（2026-10-22）。
+ * 控件尺寸。
  *
- * 为什么用内联变量而不是 scoped CSS：naive 把 `--n-height` / `--n-font-size` /
- * `--n-border-radius` 写在组件根节点的**内联 style** 上，外部样式表改不动它
- * （行内自定义属性优先级高于类选择器）。所以在模板上按视口传值，桌面 48 / 手机 46。
+ * 使用内联变量而非 scoped CSS 的原因：naive 将 `--n-height` / `--n-font-size` /
+ * `--n-border-radius` 写在组件根节点的**内联 style** 上，外部样式表无法覆盖
+ * （行内自定义属性优先级高于类选择器）。因此在模板上按视口传值，尺寸由 `--u` 等比派生。
  *
- * 手机输入框字号必须 ≥16px：iOS 上聚焦小于 16px 会把整页放大。
+ * 移动端输入框字号必须 ≥16px：iOS 上聚焦小于 16px 的输入框会放大整个页面。
  */
 const buttonVars = {
   '--n-height': 'calc(44 * var(--u))',
@@ -508,20 +508,20 @@ const buttonVars = {
 const controlVars = {
   '--n-height': 'calc(44 * var(--u))',
   '--n-border-radius': 'calc(10 * var(--u))',
-  // 输入框字号下限 16px：iOS 聚焦时小于 16px 会把整页放大
+  // 输入框字号下限 16px：iOS 聚焦小于 16px 时会放大整个页面
   '--n-font-size': 'max(16px, calc(15 * var(--u)))',
 };
 
 /**
- * 当前视图：一次只渲染一种状态（2026-10-22）。
+ * 当前视图：一次只渲染一种状态。
  *
- * 映射完全由既有状态派生，不新增业务状态：
- *   · rejected / expired  —— 轮询写入 approvalStatus 后由这里接管
+ * 映射完全由既有状态派生，不引入新的业务状态：
+ *   · rejected / expired  —— 轮询写入 approvalStatus 后由此接管
  *   · waiting             —— 已提交申请（approvalWaiting）或刚被批准、正在重试登录
- *   · pair / login        —— 设备是否仍是出厂默认密码
+ *   · pair / login        —— 依据设备是否仍为出厂默认密码
  *
- * 为什么不做成"提示条叠在表单上"：表单与等待两套内容同时占位时，手机上用户会
- * 分不清"我到底还在登录，还是在等别人点允许"。视图互斥之后，标题与按钮都只属于当前那件事。
+ * 视图互斥而非在表单上叠加提示条：两套内容同时占位时，移动端用户无法区分
+ * "仍在登录"与"正在等待机主确认"。互斥之后，标题与按钮均只属于当前状态。
  */
 type LoginViewName = 'login' | 'pair' | 'waiting' | 'rejected' | 'expired';
 
@@ -532,23 +532,23 @@ const view = computed<LoginViewName>(() => {
   return hasDefaultPassword.value ? 'pair' : 'login';
 });
 
-/** 手机上（≤960，单列布局）切换视图时回到顶部：等待/结果比表单短，停在原位会只剩半屏 */
+/** 移动端（≤960，单列布局）切换视图时回到顶部：等待与结果视图较短，保持原位置会只剩半屏内容 */
 watch(view, () => {
   if (typeof window !== 'undefined' && window.innerWidth <= 960) {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
 });
 
-/** 等待视图的标题与状态胶囊：批准后文案立刻变成"正在登录" */
+/** 等待视图的标题与状态胶囊：批准后文案立即切换为"正在登录" */
 const waitingTitle = computed(() => (approvalStatus.value === 'approved' ? '已批准，正在登录' : '等待机主批准'));
 const waitingPill = computed(() => (approvalStatus.value === 'approved' ? '已批准' : '等待中'));
 
 /**
- * 6 位码在界面上拆成 6 个格子。
+ * 6 位码在界面上拆分为 6 个输入格。
  *
- * 内部仍以 `approvalCode` 为准（它会被 onApprovalCodeInput 归一化成大写字母数字），
- * 这里只是显示层：逐格输入时把六格拼起来再回写，粘贴走单独分支。
- * 留空格子组成不足 6 位的串时，handleLogin 会先拦下并提示格式，不会白耗一次 confirm。
+ * 数据仍以 `approvalCode` 为准（由 onApprovalCodeInput 归一化为大写字母与数字），
+ * 此处仅为显示层：逐格输入时拼接六格后回写，粘贴走单独分支。
+ * 存在空格子、组成不足 6 位时，handleLogin 会先行拦截并提示格式，避免无效的 confirm 请求。
  */
 const codeBoxes = ref<string[]>(['', '', '', '', '', '']);
 
@@ -591,11 +591,10 @@ function onCodePaste(e: ClipboardEvent) {
 }
 
 /**
- * 重新申请（拒绝 / 过期 / 等待页的「重新申请」）。
+ * 重新申请（拒绝 / 过期 / 等待视图中的「重新申请」）。
  *
- * 先丢掉旧 sid 再发起：core 的批准记录以 sid 为单位，复用同一个 sid 会被旧状态
- * 直接弹回（2026-10-21 审计 §A2 就是这么修的）。随后走一次完整登录，
- * 服务端若仍要求批准会重新返回 403 并登记一条新申请。
+ * 先丢弃旧 sid 再发起：core 的批准记录以 sid 为单位，复用同一 sid 会直接返回旧状态。
+ * 随后执行一次完整登录；服务端若仍要求批准，会重新返回 403 并登记一条新申请。
  */
 function reapply() {
   stopApprovalPolling();
@@ -610,13 +609,13 @@ function reapply() {
 }
 
 /**
- * 自救：清除设备上的全部配对记录（2026-10-22）。
+ * 自救：清除设备上的全部配对记录。
  *
- * 场景：设备里留着一条**已经死掉**的旧配对记录（这台浏览器清过数据 / 换过环境，WebCrypto
- * 身份已丢），它仍然满足"存在已配对设备"，于是本次配对永远等不到批准。
+ * 适用场景：设备中残留一条**已失效**的旧配对记录（本浏览器清除过数据或更换过环境，
+ * WebCrypto 身份已丢失），该记录仍满足"存在已配对设备"的条件，使本次配对永远等不到批准。
  *
- * 与 App 的自救入口同一口径：走 `POST /pairing/unpair`（需要配对密码），清空后重新取
- * `/pairing/info` 回到表单。**破坏性**：所有已配对设备都会掉线，所以必须二次确认 + 输密码。
+ * 与 App 的自救入口同一口径：调用 `POST /pairing/unpair`（需要配对密码），清空后重新获取
+ * `/pairing/info` 回到表单。**破坏性**：所有已配对设备都会掉线，因此必须二次确认并输入密码。
  */
 async function doRescue() {
   if (!rescuePwd.value || rescueBusy.value) return;
@@ -626,7 +625,7 @@ async function doRescue() {
     await getApiClient().post('/pairing/unpair', { password: rescuePwd.value });
     showRescue.value = false;
     rescuePwd.value = '';
-    // 收尾批准等待态：sid 已经作废，留着会让下次打开页面"恢复"出一个不存在的等待。
+    // 结束批准等待态：sid 已作废，保留会使下次打开页面"恢复"出并不存在的等待。
     stopApprovalPolling();
     clearSid();
     approvalSid.value = '';
@@ -637,13 +636,13 @@ async function doRescue() {
     pairedCount.value = 0;
     error.value = '';
     message.success('已清空设备上的配对记录，请重新登录');
-    // 重新取一次 info：unpair 不会重置配对密码，所以这里通常回到"密码登录"表单。
+    // 重新获取一次 info：unpair 不会重置配对密码，因此通常回到"密码登录"表单。
     try {
       const { data } = await getApiClient().get('/pairing/info');
       hasDefaultPassword.value = !!data?.has_default_password;
       pairedCount.value = Number(data?.paired_count ?? 0);
     } catch {
-      // 忽略：下一次点击登录会再取
+      // 忽略：下次点击登录时会重新获取
     }
   } catch (e: any) {
     const status = e?.response?.status;
@@ -658,7 +657,7 @@ async function doRescue() {
   }
 }
 
-/** 返回登录/配对表单：停轮询但不丢当前申请（用户可能只是去改密码再提交） */
+/** 返回登录 / 配对表单：停止轮询但不丢弃当前申请（用户可能只是修改密码后重新提交） */
 function backToLogin() {
   stopApprovalPolling();
   approvalWaiting.value = false;
@@ -667,11 +666,11 @@ function backToLogin() {
 }
 
 /**
- * 6 位配对码输入：统一转大写并剔除非字母数字（2026-10-21，审计 §C5）。
+ * 6 位配对码输入：统一转为大写并剔除非字母数字字符。
  *
- * 码的字符集是大写（`PairedDeviceApprovalStore.CODE_ALPHABET`），机主是照通知逐字敲的，
- * 敲成小写完全正常。服务端现在也按大小写不敏感比较，这里再顺手归一化一次，
- * 免得用户看着"我明明输对了"却过不去。
+ * 码的字符集为大写（`PairedDeviceApprovalStore.CODE_ALPHABET`），而机主需按通知逐字输入，
+ * 输入小写属于正常情况。服务端按大小写不敏感比较，此处再归一化一次，
+ * 避免用户输入正确却无法通过校验。
  */
 function onApprovalCodeInput(value: string) {
   approvalCode.value = (value || '')
@@ -681,12 +680,12 @@ function onApprovalCodeInput(value: string) {
 }
 
 // 首次配对的分步下标：0=配对密码，1=设备后台，2=确认（对应 app SetupScreen 的 confirmStep）。
-// 普通登录模式不使用它（那一侧不渲染向导）。
+// 普通登录模式不使用（该视图不渲染向导）。
 const pairStep = ref(0);
 
 // 模式变化（fetchPairingInfo 刷新后 true→false 或反向）时回到第 1 步：
-// 否则可能停在一个已经不该存在的步上。提交失败不会走到这里，
-// 用户已填的密码/GoForm 内容原样保留。
+// 否则可能停留在已不存在的步骤上。提交失败不会触发此逻辑，
+// 用户已填写的密码与 Goform 内容保持不变。
 watch(hasDefaultPassword, () => {
   pairStep.value = 0;
 });
@@ -695,13 +694,12 @@ watch(hasDefaultPassword, () => {
 const passwordStrength = computed(() => evaluatePasswordStrength(form.password));
 
 /**
- * 强度条的着色档（2026-10-21，B3-3）。
+ * 强度条的着色档。
  *
- * `evaluatePasswordStrength()` 返回的是**写死的 hex**（`composables/utils.ts` 属 A1 独占，
- * 本批次不能改），在模板里 `:style` 直接绑色值等于在视图里又抄一份色值。
- * 这里只按 score 选一个类，颜色全部落在 `--error / --warning / --success` 上；
+ * `evaluatePasswordStrength()` 返回**令牌引用**（`var(--error)` 等），在模板中以 `:style`
+ * 绑定不会脱离主题。此处仍按 score 选择类名而非绑定行内样式：颜色全部落在
+ * `--error / --warning / --success` 上，换肤时只需修改 main.css 一处。
  * 分档与 utils 保持一致：0–1 弱、2 中、3–4 强。
- * （A1 若把 utils 的 `color` 改成令牌，可以退回单行 `:style` 绑定。）
  */
 const pwBarClass = computed(() => {
   const score = passwordStrength.value.score;
@@ -710,7 +708,7 @@ const pwBarClass = computed(() => {
   return 'pw-bar--weak';
 });
 
-/** 确认页上的密码回显：位数 + 强度，不回显明文（改它的地方是第 1 步的输入框）。 */
+/** 确认页的密码回显：仅显示位数与强度，不回显明文（明文在第 1 步的输入框中修改）。 */
 const passwordReview = computed(() =>
   form.password
     ? `${maskSecret(form.password)}（${form.password.length} 位 · ${passwordStrength.value.label}）`
@@ -723,8 +721,8 @@ function maskSecret(value: string): string {
 }
 
 /**
- * 首次配对的三步。heading 写成「这一步要回答什么」，
- * validate 决定能不能离开本步 —— 由本文件的 blockReason 在 computed 里求值，所以边打字边生效。
+ * 首次配对的三步。heading 描述「本步骤需要回答的内容」，
+ * validate 决定能否离开本步骤 —— 由本文件的 blockReason 在 computed 中求值，因此输入时即时生效。
  */
 const pairSteps = computed<WizardStep[]>(() => [
   {
@@ -749,12 +747,12 @@ const pairSteps = computed<WizardStep[]>(() => [
   },
 ]);
 
-/** 当前步能否离开（由 pairSteps[i].validate 回答；null = 可以） */
+/** 当前步骤能否离开（由 pairSteps[i].validate 回答；null 表示可以） */
 const blockReason = computed(() => pairSteps.value[pairStep.value]?.validate?.() ?? null);
 
 /**
- * 点步骤条跳转（与旧 StepWizard 的行为一致）：可回退；向前跳要求途经的每一步都合法，
- * 否则停在原地并把原因说出来（置灰/静默不跳都是"点了没反应"）。
+ * 点击步骤条跳转（与 StepWizard 行为一致）：可回退；向前跳要求途经的每个步骤均合法，
+ * 否则停留在原步骤并提示原因（置灰或静默不跳会使点击无反馈）。
  */
 function jumpToStep(target: number) {
   if (target === pairStep.value) return;
@@ -776,9 +774,9 @@ function goPrev() {
   if (pairStep.value > 0) pairStep.value -= 1;
 }
 
-// 同源模式：挂载即拉取配对信息，用于判断是否处于初次配对（与主登录流程解耦）
+// 同源模式：挂载时即获取配对信息，用于判断是否处于初次配对（与主登录流程解耦）
 onMounted(async () => {
-  // 2026-10-21（审计 §B8）：444 掉线时留了一句原因，这里读一次就清空。
+  // 444 掉线时记录的原因在此读取一次并清空。
   const failReason = appStore.consumeAuthFailureReason();
   if (failReason) error.value = failReason;
 
@@ -788,21 +786,21 @@ onMounted(async () => {
       hasDefaultPassword.value = !!data?.has_default_password;
       pairedCount.value = Number(data?.paired_count ?? 0);
     } catch {
-      // 忽略，登录时再取
+      // 忽略，登录时重新获取
     }
   }
-  // 2026-10-21（审计 §C6）：刷新页面后把「等待批准」恢复出来
+  // 刷新页面后恢复「等待批准」状态
   void restoreApprovalState();
 });
 
 /**
- * 刷新后恢复「等待批准」的状态（2026-10-21，审计 §C6）。
+ * 刷新后恢复「等待批准」状态。
  *
- * 之前所有状态都在内存 ref 里，刷新就没了，而 sid 还在 sessionStorage、服务端 pending 也还在 ——
- * 用户只看到一张普通的登录表单，不知道自己其实还在等机主点允许。
+ * 该状态仅存于内存 ref，刷新后即丢失；而 sid 仍在 sessionStorage、服务端记录仍为 pending，
+ * 用户只会看到一张普通登录表单，无法得知自己仍在等待机主确认。
  *
- * 这里**只查一次**、不发新申请：`GET /pairing/approval-status` 无副作用，
- * 而且"还在不在等"必须由服务端回答（15 分钟 TTL 是它的）。
+ * 此处**只查询一次**、不发新申请：`GET /pairing/approval-status` 无副作用，
+ * 且"是否仍在等待"必须由服务端回答（15 分钟 TTL 由服务端维护）。
  */
 async function restoreApprovalState() {
   const sid = peekSid();
@@ -814,7 +812,7 @@ async function restoreApprovalState() {
     approvalStatus.value = 'pending';
     startApprovalPolling();
   } else if (st === 'rejected' || st === 'expired') {
-    // 收尾态：丢掉 sid，让下一次登录成为一次干净的新申请
+    // 结束态：丢弃 sid，使下一次登录成为一次全新的申请
     clearSid();
     approvalSid.value = '';
   }
@@ -829,8 +827,8 @@ async function fetchPairingInfo(): Promise<string | null> {
 }
 
 /**
- * core 的 /pairing/info 有每 IP 500ms 的限频，而本页挂载时已请求过一次，
- * 用户很快点击登录会直接吃到 429 → 登录被中断。命中 429 时等待后重试一次。
+ * core 的 /pairing/info 按 IP 限频 500ms，而本页挂载时已请求过一次；
+ * 用户快速点击登录会直接收到 429 并中断登录。命中 429 时等待后重试一次。
  */
 async function fetchPairingInfoWithRetry(): Promise<string | null> {
   try {
@@ -843,9 +841,9 @@ async function fetchPairingInfoWithRetry(): Promise<string | null> {
 }
 
 /**
- * 第 1 步「配对密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次一致。
- * 通过返回 null，否则返回**拦下的原因**（渲染在操作栏上方）。
- * 普通登录模式下这份校验也在 handleLogin() 里跑 —— 分步不削弱最终门禁。
+ * 第 1 步「配对密码」的校验：设备地址（仅跨域）、密码非空、长度 4-64、两次输入一致。
+ * 通过返回 null，否则返回**拦截原因**（渲染在操作栏上方）。
+ * 普通登录模式下同一份校验在 handleLogin() 中执行 —— 分步不削弱最终校验。
  */
 function validatePasswordStep(): string | null {
   if (!isSameOrigin.value && !form.serverUrl) return '请输入设备地址';
@@ -860,7 +858,7 @@ function validatePasswordStep(): string | null {
   return null;
 }
 
-/** 第 2 步「设备后台」的校验。默认值即设备出厂值，一般直接通过。 */
+/** 第 2 步「设备后台」的校验。默认值即设备出厂值，通常直接通过。 */
 function validateGoformStep(): string | null {
   if (!goformIp.value.trim()) return '请填写设备后台 IP 地址';
   if (!goformPassword.value) return '请填写设备后台密码';
@@ -870,8 +868,8 @@ function validateGoformStep(): string | null {
 }
 
 /**
- * 输入框上的回车 = 点一下主按钮：当前步合法就往下走，最后一步则提交。
- * 向导自己的按钮走 goNextStep / goPrev，不经过这里。
+ * 输入框回车等同于点击主按钮：当前步骤合法则前进，最后一步则提交。
+ * 向导自身的按钮直接调用 goNextStep / goPrev，不经过此处。
  */
 function goNextStep() {
   const err = pairSteps.value[pairStep.value]?.validate?.() ?? null;
@@ -886,20 +884,20 @@ function goNextStep() {
 }
 
 /**
- * 登录 / 初次配对：镜像 Android app 的配对流程。
- * 1) GET /pairing/info 取配对码
- * 2) POST /pairing/confirm（配对码 + Web 指纹 + 配对密码）换 token
- *    —— 设备未设密码时，该密码即被设为新配对密码（对应 app 的“初次配对设置密码”）
+ * 登录 / 初次配对：与 Android app 的配对流程一致。
+ * 1) GET /pairing/info 获取配对码
+ * 2) POST /pairing/confirm（配对码 + 设备公钥 + 挑战签名 + 配对密码）换取 token
+ *    —— 设备未设密码时，该密码即被设为新的配对密码（对应 app 的「初次配对设置密码」）
  * 3) 写回 token，校验连通性后进入仪表盘
  */
 async function handleLogin() {
   error.value = '';
-  // 2026-10-21（审计 §B10）：批准轮询在 approved 时会自动重登，机主也可能同时点
-  // 「我已填好，重新验证」。两条 confirm 并发会各自换一次 token：后完成的覆盖前一个，
-  // 先完成的后续请求立刻 444 —— 表现就是"刚批完又被踢回登录页"。
+  // 批准轮询在 approved 时会自动重登，机主也可能同时点击「我已填好，重新验证」。
+  // 两条 confirm 并发会各自换取一次 token：后完成的覆盖前一个，
+  // 先完成的后续请求立即返回 444，表现为刚批准就被退回登录页。
   if (loading.value) return;
-  // 2026-10-21（决策 D7-3）：同一浏览器同一时间只能有一个标签页保持登录 ——
-  // 再次 confirm 会轮换 token，另一个标签页随即 444。这里把"静默互踢"变成知情选择。
+  // 同一浏览器同一时间只能有一个标签页保持登录：再次 confirm 会轮换 token，
+  // 另一个标签页随即收到 444。此处将静默互踢改为显式确认。
   if (!tabOverride && isAnotherTabActive()) {
     dialog.warning({
       title: '本设备已在另一个标签页登录',
@@ -915,24 +913,24 @@ async function handleLogin() {
     });
     return;
   }
-  // 第 1 步字段（设备地址 / 密码长度 / 两次一致）——与「下一步」共用同一份校验。
-  // 分步只是 UI，这里仍然跑全量校验：即使用户绕过第 1 步也过不了这道门禁。
+  // 第 1 步字段（设备地址 / 密码长度 / 两次输入一致）——与「下一步」共用同一份校验。
+  // 分步仅为 UI，此处仍执行全量校验：即使绕过第 1 步也无法通过。
   const stepErr = validatePasswordStep();
   if (stepErr) {
     error.value = stepErr;
-    // 出错字段在第 1 步上，退回去让用户看得见（这不是提交失败，是校验没过）
+    // 出错字段位于第 1 步，退回该步以便用户看到（属于校验未通过，而非提交失败）
     if (hasDefaultPassword.value) pairStep.value = 0;
     return;
   }
-  // 2026-10-21（审计 §C5）：6 位码本地先校验一遍 —— 少一个字符就发出去会白耗一次
-  // confirm（还会轮换掉配对码），而用户看不出任何原因。
+  // 6 位码先做本地校验：字符不足即发出会浪费一次 confirm 请求
+  // （并轮换配对码），且用户无法看出失败原因。
   const approvalCodeInput = (approvalCode.value || '').trim().toUpperCase();
   if (approvalCodeInput && !/^[A-Z0-9]{6}$/.test(approvalCodeInput)) {
     error.value = '配对码是 6 位字母或数字，请核对后重试';
     return;
   }
   if (hasDefaultPassword.value) {
-    // Goform 后台连接配置校验（与设备出厂默认值一致，一般无需改动）
+    // Goform 后台连接配置校验（与设备出厂默认值一致，通常无需修改）
     const goformErr = validateGoformStep();
     if (goformErr) {
       error.value = goformErr;
@@ -945,14 +943,14 @@ async function handleLogin() {
   try {
     resetApiClient();
     // 同源模式：不设置 baseUrl，axios 使用相对路径（当前 origin）
-    // 跨域模式：先定位设备，后续 /pairing/info、/pairing/confirm 才能打到设备
+    // 跨域模式：先确定设备地址，后续 /pairing/info、/pairing/confirm 才能请求到设备
     const serverUrl = isSameOrigin.value ? '' : form.serverUrl;
     if (!isSameOrigin.value) appStore.setBaseUrl(serverUrl);
 
     const api = getApiClient();
 
-    // 1. 取配对码
-    // 设备已初始化（非默认密码）时允许空配对码：后端支持凭配对密码登录（登录=自动配对），
+    // 1. 获取配对码
+    // 设备已初始化（非默认密码）时允许配对码为空：后端支持凭配对密码登录（登录即自动配对），
     // 一次性配对码仅在设备首次初始化（配对）时必需。
     let pairingCode: string | null = null;
     try {
@@ -968,20 +966,19 @@ async function handleLogin() {
       return;
     }
     if (!pairingCode && hasDefaultPassword.value) {
-      // 局域网来源在 has_default_password=true 时一定拿得到配对码，所以「有默认密码却没有码」
-      // 只有一种成因：请求是从隧道转发进来的，core 有意不下发（见 PairingRoutes 的隧道来源降级）。
+      // 局域网来源在 has_default_password=true 时必定能取得配对码，因此「有默认密码却无码」
+      // 只有一种成因：请求经隧道转发，core 有意不下发（见 PairingRoutes 的隧道来源降级）。
       error.value = '首次配对只能在设备所在的局域网内完成';
       return;
     }
 
-    // 2. 挑战-应答 + 配对密码换 token（初次配对时该密码即被设为新密码）
+    // 2. 挑战-应答 + 配对密码换取 token（初次配对时该密码即被设为新密码）
     // Goform 后台配置仅在首次配对（初始化设备）时提交；普通登录不携带，
     // 避免用表单默认值覆盖设备上已配置的 Goform 连接设置。
     //
-    // 设备身份 = IndexedDB 里**不可导出**的 ECDSA 私钥（见 deviceIdentity.ts）。
-    // 这里上报公钥并对服务端下发的一次性挑战签名，服务端据公钥自行计算指纹。
-    // 旧实现上报常量 WEB_FINGERPRINT，导致所有浏览器在服务端看来是同一台设备，
-    // 配对上限完全失效——这是本次改造要修掉的根因，别再退回去。
+    // 设备身份 = IndexedDB 中**不可导出**的 ECDSA 私钥（见 deviceIdentity.ts）。
+    // 此处上报公钥并对服务端下发的一次性挑战签名，服务端据公钥自行计算指纹。
+    // 若改为上报固定常量，所有浏览器在服务端将被视为同一台设备，配对上限随之失效。
     let confirmRes;
     try {
       const devId = await loadDeviceIdentity();
@@ -999,8 +996,8 @@ async function handleLogin() {
         signature: await devId.signChallenge(challenge),
         password: form.password || undefined,
         device_name: WEB_DEVICE_NAME,
-        // 批准流程（2026-10-15）：登记过的会话随机数 + 机主从通知里读到的配对码。
-        // 没走批准时两者都为空 —— 服务端按"不需要批准"处理（开关默认关）。
+        // 批准流程：已登记的会话随机数 + 机主从通知中读取的配对码。
+        // 未走批准流程时两者均为空 —— 服务端按"不需要批准"处理（该开关默认关闭）。
         ...(approvalSid.value ? { sid: approvalSid.value } : {}),
         ...(approvalCodeInput ? { approval_code: approvalCodeInput } : {}),
         ...(hasDefaultPassword.value
@@ -1022,17 +1019,17 @@ async function handleLogin() {
       return;
     }
     appStore.setToken(token);
-    // 服务端算出的指纹：配对界面据此高亮"本浏览器"，不再由前端自行推导
+    // 服务端计算的指纹：配对界面据此高亮"本浏览器"，不再由前端自行推导
     appStore.setDeviceFingerprint(confirmRes.data?.fingerprint ?? '');
 
     // 3. 连通性 + 鉴权校验。
-    // /health 免鉴权且带 core 服务器时间 → 先校准签名时钟，再打需要签名的 uptime，
-    // 否则本机时钟漂移 >5min 时这一步必然 STALE_TIMESTAMP（而配对端点不验时间戳，
-    // 于是表现成"能配对、一用就失败"）。
+    // /health 免鉴权且返回 core 服务器时间 → 先校准签名时钟，再请求需要签名的 uptime；
+    // 否则本机时钟漂移 >5min 时此步骤必然返回 STALE_TIMESTAMP（而配对端点不校验时间戳，
+    // 表现为能够配对、但后续请求全部失败）。
     //
-    // 2026-10-21（审计 §B9）：token 只能在这之前落库（uptime 要签名），所以校验失败时
-    // **必须把这次写入回滚** —— 否则界面说"登录失败"，而刷新页面（路由守卫只看 token
-    // 在不在）却能直接进 dashboard，提示和事实互相矛盾，还白占了上一份 token 的轮换。
+    // token 必须先落库才能对 uptime 请求签名，因此校验失败时**必须回滚本次写入** ——
+    // 否则界面提示"登录失败"，而刷新页面后（路由守卫只检查 token 是否存在）却可直接进入
+    // dashboard，提示与事实矛盾，同时也浪费了上一份 token 的轮换。
     try {
       const healthRes = await api.get('/health');
       calibrateClockOffset(healthRes.data?.timestamp);
@@ -1044,7 +1041,7 @@ async function handleLogin() {
       return;
     }
 
-    // 2026-10-21（决策 D7-3）：占住"活跃标签页"这把锁，其它标签页再登录时会先收到提示。
+    // 占用"活跃标签页"标记，其它标签页再次登录时会先收到提示。
     markActiveTab();
     tabOverride = false;
     router.push('/dashboard');
@@ -1056,10 +1053,10 @@ async function handleLogin() {
 }
 
 /**
- * 启动批准流程（2026-10-15）：登记一次请求 + 轮询状态。
+ * 启动批准流程：登记一次请求并轮询状态。
  *
- * 登记幂等（同一 sid 重复请求不会新建记录、也不会重复通知）—— 所以用户连点登录
- * 不会把机主的手机刷屏。
+ * 登记是幂等的（同一 sid 重复请求不会新建记录，也不会重复通知），
+ * 因此用户连续点击登录不会向机主设备重复推送。
  */
 async function beginApproval() {
   try {
@@ -1073,11 +1070,11 @@ async function beginApproval() {
       WEB_DEVICE_NAME
     );
     if (!res.ok) {
-      // 提交失败就**别进等待态**：否则用户会对着"等待批准"干等，最后只等到一句
-      // "已过期"（2026-10-17 线上就是这个表现：路由 404 → 等待 → 轮询也 404 → 过期）。
+      // 提交失败时**不得进入等待态**：否则用户会在"等待批准"界面空等，
+      // 最终只得到"已过期"（登记接口与状态轮询同时返回 404 时即为此表现）。
       //
-      // 2026-10-21（审计 §B7）：区分 HTTP 成因。之前除 501 之外一律说"设备端版本过旧"，
-      // 而最常见的其实是 429（同 IP 15 分钟最多 5 条新申请）—— 用户按提示重试永远撞墙。
+      // 按 HTTP 成因区分提示：其它失败原因（尤其 429：同一 IP 15 分钟内最多 5 条新申请）
+      // 若统一提示为设备端版本过旧，用户按提示重试将无法成功。
       if (res.status === 'unsupported') {
         error.value = '设备端未启用批准流程，请改用局域网配对';
       } else if (res.httpStatus === 429) {
@@ -1089,8 +1086,8 @@ async function beginApproval() {
       }
       return;
     }
-    // 旧 core（未修 rejected 复用）可能把一次被拒的 sid 原样回 `rejected`：
-    // 这时不要进等待态，换一个全新 sid 让用户能真正重新申请。
+    // 部分 core 版本会把已拒绝的 sid 原样返回 `rejected`：
+    // 此时不进入等待态，改为使用全新 sid，使用户可以真正重新申请。
     if (res.status === 'rejected' || res.status === 'expired') {
       clearSid();
       approvalSid.value = '';
@@ -1100,8 +1097,8 @@ async function beginApproval() {
     approvalWaiting.value = true;
     approvalStatus.value = 'pending';
     error.value = '';
-    // 后端给了 expires_in 就用它（秒 → 分钟，至少 1 分钟以免显示「0 分钟」）；
-    // 没给则按 core 的 15 分钟 TTL 兜底，不编造具体秒数。
+    // 后端返回 expires_in 时使用该值（秒 → 分钟，下限 1 分钟以免显示「0 分钟」）；
+    // 未返回时按 core 的 15 分钟 TTL 兜底，不虚构具体秒数。
     approvalTtlMin.value = res.expiresIn > 0 ? Math.max(1, Math.round(res.expiresIn / 60)) : 15;
     message.info('已提交配对申请：请在已配对设备上点「允许」，或输入通知里的配对码');
     startApprovalPolling();
@@ -1111,15 +1108,15 @@ async function beginApproval() {
 }
 
 /**
- * 等待批准期间的状态轮询节奏（毫秒，2026-10-21）。
+ * 等待批准期间的状态轮询节奏（毫秒）。
  *
- * 原来是**固定 3 秒**。core 现在能在 1 秒内把弹窗推到 App（`ApprovalPushNudger`），
- * 剩下的时间几乎全花在「机主看到弹窗 → 点允许」上；而**点完到网页真正进去**还要等
- * 下一次轮询 —— 固定 3 秒就等于在用户觉得"明明已经点了"的地方再加平均 1.5 秒。
+ * core 可在 1 秒内将弹窗推送到 App（`ApprovalPushNudger`），其余时间主要用于
+ * 「机主看到弹窗 → 点击允许」；而从点击到网页完成登录还需等待下一次轮询。
+ * 固定 3 秒间隔会在该环节额外引入平均 1.5 秒延迟。
  *
- * 所以改成自适应：刚开始最密（机主大概率就在旁边，点了要立刻过），越等越稀
- * （多半是没人在，别在 15 分钟 TTL 里白打几百个请求）。
- * `/pairing/approval-status` 是免鉴权、纯内存查询、无独立限速的读接口，单次成本可以忽略。
+ * 因此采用自适应间隔：起始最密集（机主通常就在附近，批准后应立即生效），随后逐步放缓
+ * （多数情况是无人在场，避免在 15 分钟 TTL 内发起数百次请求）。
+ * `/pairing/approval-status` 为免鉴权、纯内存查询、无独立限速的读接口，单次成本可忽略。
  */
 function approvalPollDelay(elapsedMs: number): number {
   if (elapsedMs < 20_000) return 700;
@@ -1128,41 +1125,41 @@ function approvalPollDelay(elapsedMs: number): number {
 }
 
 /**
- * 启动状态轮询：批准即带着同一个 sid 重试登录，拒绝/过期则收尾。
+ * 启动状态轮询：批准时携带同一 sid 重试登录，拒绝 / 过期则结束流程。
  *
- * ## 为什么不是 `setInterval`（2026-10-21 改写）
- * 1. `setInterval` **不等**上一次请求返回 —— 网络一慢就叠出几个并发 GET，
- *    回来顺序还可能乱（后发的先回，把新状态覆盖成旧的）；「问完再排下一次」没有这个问题；
- * 2. 自适应节奏本来就要每次重算间隔。
+ * ## 不使用 `setInterval` 的原因
+ * 1. `setInterval` **不等待**上一次请求返回 —— 网络缓慢时会叠加多个并发 GET，
+ *    返回顺序也可能错乱（后发先回，用旧状态覆盖新状态）；「请求完成后再排下一次」不受影响；
+ * 2. 自适应节奏本身需要在每一轮重新计算间隔。
  */
 function startApprovalPolling() {
   stopApprovalPolling();
   approvalPollStartedAt = Date.now();
-  // stopApprovalPolling() 刚自增过代次，本轮用这个值；之后任何人 stop 都会让 seq 对不上
+  // stopApprovalPolling() 刚自增过代次，本轮使用该值；此后任何 stop 都会使 seq 不匹配
   const seq = approvalPollSeq;
 
   const tick = async () => {
     if (seq !== approvalPollSeq) return;
     const st = await fetchApprovalStatus(getApiClient() as any, approvalSid.value);
-    // 请求期间可能已经被 stop（已批准 / 已拒绝 / 离开页面）—— 落单的结果必须丢掉，
-    // 否则会出现「已经进了 dashboard，又被一个迟到的 expired 打回登录页」
+    // 请求期间可能已被 stop（已批准 / 已拒绝 / 离开页面）—— 落后的结果必须丢弃，
+    // 否则会出现「已进入 dashboard 后又被迟到的 expired 退回登录页」
     if (seq !== approvalPollSeq) return;
-    // null = 这次请求本身失败（网络抖动 / 服务端报错）—— **不**当作过期，
-    // 继续等下一轮；真正的过期由服务端返回 expired 或 TTL 决定。
+    // null 表示本次请求本身失败（网络抖动 / 服务端报错），**不**视为过期，
+    // 继续等待下一轮；真正的过期由服务端返回 expired 或 TTL 决定。
     if (st !== null) {
       approvalStatus.value = st;
       if (st === 'approved') {
         stopApprovalPolling();
         approvalWaiting.value = false;
-        // 已批准：重试登录。这一次服务端不会再回 403（同一 sid 已标记 approved）。
+        // 已批准：重试登录。本次服务端不再返回 403（同一 sid 已标记为 approved）。
         void handleLogin();
         return;
       }
       if (st === 'rejected' || st === 'expired') {
         stopApprovalPolling();
         approvalWaiting.value = false;
-        // 2026-10-21（审计 §A2）：收尾态必须丢掉 sid —— 否则用户再点登录还是同一次申请，
-        // 服务端（旧版本）会一直回同一个 rejected，15 分钟 TTL 内变成死胡同。
+        // 结束态必须丢弃 sid —— 否则用户再次登录仍是同一次申请，
+        // 服务端会持续返回同一个 rejected，在 15 分钟 TTL 内无法继续。
         clearSid();
         approvalSid.value = '';
         error.value =
@@ -1179,8 +1176,8 @@ function startApprovalPolling() {
     );
   };
 
-  // 立刻先问一次：登记那一下状态必然是 pending，这一步主要是让"提交成功 → 显示等待中"
-  // 之间没有空窗，同时覆盖「刚登记就被批准」这种极快的情况。
+  // 立即先查询一次：登记完成时状态必然为 pending，此步骤用于消除
+  // "提交成功 → 显示等待中"之间的空窗，同时覆盖「刚登记即被批准」的情况。
   approvalTimer = setTimeout(() => {
     void tick();
   }, 0);
@@ -1205,7 +1202,7 @@ function handleConfirmError(e: any) {
   } else if (status === 401 && code === 'INVALID_PASSWORD') {
     error.value = '配对密码错误';
   } else if (status === 401 && (code === 'INVALID_DEVICE_KEY' || code === 'INVALID_CHALLENGE')) {
-    // 挑战一次性且 2 分钟过期；重新点登录会重新走 challenge，不需要用户改任何输入
+    // 挑战为一次性且 2 分钟后过期；重新点击登录会重新发起 challenge，无需用户修改输入
     error.value = '设备身份校验失败，请重新点击登录';
   } else if (status === 429 && code === 'PASSWORD_LOCKED') {
     error.value = '配对密码错误次数过多，已锁定，请 15 分钟后再试';
@@ -1218,20 +1215,20 @@ function handleConfirmError(e: any) {
   } else if (status === 400) {
     error.value = '请求参数缺失';
   } else if (status === 403 && code === 'APPROVAL_REQUIRED') {
-    // 2026-10-15：新设备需要机主批准。**不是错误**，而是一个"去走批准流程"的指令 ——
-    // 所以这里不写 error.value，而是启动登记 + 轮询。
+    // 新设备需要机主批准。**这不是错误**，而是"进入批准流程"的指令 ——
+    // 因此不写入 error.value，而是启动登记与轮询。
     void beginApproval();
   } else if (status === 403 && code === 'DEVICE_BLOCKED') {
-    // 2026-10-21（决策 D4）：core 现在会带 `retry_after_seconds`。
-    // 解除拉黑**不会**立即生效（冷却最长 1 小时），之前只能写"最长 1 小时"，
-    // 用户不知道该等 5 分钟还是一小时 —— 反复重试反而在刷新冷却计数。
+    // core 会返回 `retry_after_seconds`。
+    // 解除拉黑**不会**立即生效（冷却最长 1 小时）；缺少该字段时无法区分
+    // 应等待数分钟还是一小时，且反复重试会刷新冷却计数。
     const secs = Number(e.response?.data?.retry_after_seconds ?? 0);
     const wait = secs > 0 ? (secs < 60 ? `${secs} 秒` : `${Math.ceil(secs / 60)} 分钟`) : '';
     error.value = wait
       ? `本设备已被拉黑，无法配对或登录。还需等待约 ${wait}（解除拉黑不会立即生效）。`
       : '本设备已被拉黑，无法配对或登录。';
   } else if (status === 403) {
-    // core 把「首次配对」限制在局域网内，文案由服务端给出（含具体动作名）
+    // core 将「首次配对」限制在局域网内，提示文案由服务端给出（含具体动作名）
     error.value = e.response?.data?.error || '该操作只能在设备所在的局域网内完成';
   } else if (status === 429) {
     error.value = '操作过于频繁，请稍后重试';
@@ -1242,9 +1239,9 @@ function handleConfirmError(e: any) {
 
 function handleNetworkError(e: any) {
   if (e.response?.status === 401) {
-    // 2026-10-05 修复：core 的 401 语义是「这次请求本身有问题（时间戳/签名），凭据仍有效」，
-    // 只有 444 才是吊销（AuthMiddleware 三档设计）。旧文案把时钟漂移说成"凭据已失效"，
-    // 用户反复重登毫无用处 —— 按响应体的 code 给出真正可执行的指引。
+    // core 的 401 语义是「本次请求本身有问题（时间戳 / 签名），凭据仍然有效」，
+    // 只有 444 表示凭据被吊销（AuthMiddleware 的三档设计）。若把时钟漂移描述为
+    // "凭据已失效"，用户反复重新登录无效 —— 因此按响应体的 code 给出可执行的指引。
     const code = e.response?.data?.code;
     if (code === 'STALE_TIMESTAMP') {
       error.value = '设备时间校验失败：请检查本机时间是否准确（设置→自动确定时间），并与设备时间保持一致';
@@ -1267,21 +1264,20 @@ function handleNetworkError(e: any) {
 /*
   登录页的尺寸全部由一个视口比例单位 `--u` 派生：
     --u = clamp(0.94px, 100vw / 1200, 1px)
-  1200px 及以上**恒为 1px**（= 设计稿 02-split-brand 的原尺寸）；更窄按比例缩，
-  下限 0.94px 保证手机上的输入框/按钮仍接近 44~46px 的触控高度。
-  所有 `calc(N * var(--u))` 里的 N 都是"1200px 视口下的设计值"，
-  于是不同设备上**只有整体比例变化**，元素之间的相对关系不变。
+  1200px 及以上**恒为 1px**（即设计稿原尺寸）；更窄时按比例缩小，
+  下限 0.94px 保证移动端输入框与按钮仍接近 44~46px 的触控高度。
+  所有 `calc(N * var(--u))` 中的 N 均为"1200px 视口下的设计值"，
+  因此不同设备上**只有整体比例变化**，元素之间的相对关系保持不变。
 
-  为什么必须有上限（2026-10-23）：设计稿的尺寸是绝对 px（卡片 520、标题 24、输入 48）。
-  此前写成 `max(0.94px, 100vw / 1200)`，1920px 视口下 u=1.6 —— 卡片 832、标题 38、
-  输入框 77，整页比设计稿大一圈，正是"自适应之后整体变大"的来源。
-  左栏是 47% 百分比、卡片是按 u 算的固定宽，两者本来就不需要同步放大：
-  宽屏多出来的空间应当变成留白，而不是继续撑大控件。宽屏要更紧凑就把上限往下调
-  （例如 0.92px），所有尺寸会一起等比缩小。
+  上限的必要性：设计稿尺寸为绝对 px（卡片 520、标题 24、输入 48）。
+  若写成 `max(0.94px, 100vw / 1200)`，1920px 视口下 u=1.6 —— 卡片 832、标题 38、
+  输入框 77，整页明显大于设计稿。左栏为 47% 百分比、卡片为按 u 计算的固定宽度，
+  两者不需要同步放大：宽屏多出的空间应转为留白，而非继续放大控件。
+  需要更紧凑时可下调上限（例如 0.92px），所有尺寸将等比缩小。
 */
 .login-shell {
   --u: clamp(0.94px, calc(100vw / 1200), 1px);
-  /* 登录页锁在视口内：内容再长也不让整页滚动，卡片自己成为滚动边界 */
+  /* 登录页限制在视口内：内容再长也不产生整页滚动，卡片自身为滚动边界 */
   height: 100vh;
   height: 100dvh;
   min-height: 0;
@@ -1303,7 +1299,7 @@ function handleNetworkError(e: any) {
 .login-card {
   width: 100%;
   max-width: calc(460 * var(--u));
-  /* 卡片高度不超过可用区域；正常登录内容会直接放下，只有更长的配对/等待视图才内部滚动 */
+  /* 卡片高度不超过可用区域；登录视图内容通常可直接容纳，仅较长的配对 / 等待视图内部滚动 */
   max-height: 100%;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1371,7 +1367,7 @@ function handleNetworkError(e: any) {
   font-size: calc(13 * var(--u));
   color: var(--text-muted);
   white-space: nowrap;
-  /* 步骤条是可点的按钮（回退 / 前跳），这里把浏览器默认按钮样式清掉 */
+  /* 步骤条为可点击的按钮（回退 / 前跳），此处清除浏览器默认按钮样式 */
   background: none;
   border: 0;
   padding: 0;
@@ -1547,7 +1543,7 @@ function handleNetworkError(e: any) {
   color: var(--text-muted);
   line-height: 1.55;
 }
-/* HTTP 提示是安全提醒，但不能把卡片重新撑出视口；字号/内边距压紧 */
+/* HTTP 提示属于安全提醒，但不得把卡片重新撑出视口；因此收紧字号与内边距 */
 .login-insecure {
   margin-top: calc(12 * var(--u));
 }
@@ -1679,7 +1675,7 @@ function handleNetworkError(e: any) {
   min-width: 0;
   height: calc(56 * var(--u));
   text-align: center;
-  /* 码格字号同时满足 iOS 的 16px 下限；两侧都用同一比例，高宽比保持稳定 */
+  /* 码格字号满足 iOS 的 16px 下限；宽高使用同一比例，保持稳定 */
   font-size: max(16px, calc(22 * var(--u)));
   font-weight: 700;
   border: 1px solid var(--input-border);
@@ -1777,13 +1773,13 @@ function handleNetworkError(e: any) {
   margin: 0 auto calc(24 * var(--u));
 }
 
-/* ── 布局断点只改"排几列"，字号与内距继续由 --u 等比缩放 ──
-   单列阈值与 mockup 02-split-brand 对齐为 960：769–960 的平板仍算"手机形态"，
-   用轻抬头 + 单列卡片；961 以上一律桌面两栏。品牌区在 961–1024 的收紧规则
-   放在 LoginBrand.vue（与 mockup 的 1024 断点一致）。 */
+/* ── 布局断点仅改变列数，字号与内边距继续由 --u 等比缩放 ──
+   单列阈值取 960：769–960 的平板仍按移动端形态处理，
+   使用轻量品牌头部与单列卡片；961 以上一律使用桌面两栏布局。
+   品牌区在 961–1024 的收紧规则位于 LoginBrand.vue（断点为 1024）。 */
 
 @media (max-width: 960px) {
-  /* 手机：单列（品牌条由 LoginBrand 自己切换） */
+  /* 移动端：单列（品牌条由 LoginBrand 自行切换） */
   .login-shell {
     grid-template-columns: 1fr;
     grid-template-rows: auto 1fr;
@@ -1797,8 +1793,8 @@ function handleNetworkError(e: any) {
     min-height: 0;
     overflow: visible;
     padding: calc(8 * var(--u)) calc(12 * var(--u)) calc(20 * var(--u) + env(safe-area-inset-bottom));
-    /* 卡片在品牌栏以下的剩余空间里垂直居中；内容高于视口时按 safe center
-       退化为顶部对齐，页面继续自然滚动，不会被裁掉。 */
+    /* 卡片在品牌栏下方的剩余空间内垂直居中；内容高于视口时由 safe center
+       退化为顶部对齐，页面继续自然滚动，内容不被裁切。 */
     align-items: center;
     align-items: safe center;
   }
@@ -1813,7 +1809,7 @@ function handleNetworkError(e: any) {
 }
 
 @media (max-width: 420px) {
-  /* 只改排列：后台 IP/端口竖排、长按钮竖排 */
+  /* 仅改变排列：后台 IP / 端口竖排，长按钮竖排 */
   .goform-grid {
     grid-template-columns: 1fr;
     gap: 0;

@@ -33,6 +33,18 @@ declare module 'vue-router' {
      */
     diagTool?: string;
     /**
+     * 路由切换过渡（2026-10-30）。
+     *
+     * 只有声明了这一项的路由才参与淡入淡出 —— 由 `DefaultLayout` 的 `router.afterEach`
+     * 判断「目标或来源任一声明」后启用，所以**进出都有动画**：
+     * 设置 → 定时任务（to 声明）、定时任务 → 设置（from 声明）。
+     *
+     * 刻意不做成"全站所有路由都淡入淡出"：媒体页有沉浸层、文件页有滚动位置、
+     * 登录页在壳层之外 —— 统一加过渡会把它们的入场时序全部搅一遍。
+     */
+    transition?: 'fade';
+
+    /**
      * 内容区全出血（2026-10-23）：去掉 `main-content` 的 24px/14px 内边距。
      * 音乐页需要一条贴视口底的播放条，并且沉浸层默认正好铺满**内容区**；
      * 保留壳层 padding 会让两者都缩进 24px，看起来像没对齐。
@@ -114,11 +126,20 @@ const routes: RouteRecordRaw[] = [
         redirect: { name: 'settings', query: { tab: 'notify' } },
       },
       {
+        // 话费账单（2026-10-31）：移动短信/联通扫码，入口在设置 › 功能中心。
+        path: 'bill',
+        name: 'bill',
+        component: () => import('@/views/bill/BillView.vue'),
+        // 返回入口改由页面自己在内容区渲染（顶部状态栏不承载页面级返回）
+        meta: { title: '话费账单', menuKey: 'settings', transition: 'fade' },
+      },
+      {
         path: 'tasks',
         name: 'tasks',
         component: () => import('@/views/tasks/TasksView.vue'),
-        // 侧栏瘦身后只从「设置 › 更多功能」进入：需要标题、父入口高亮与返回目标（见 RouteMeta 的说明）
-        meta: { title: '定时任务', menuKey: 'settings', back: { name: 'settings' } },
+        // 侧栏瘦身后只从「设置 › 功能中心」进入：标题与父入口高亮在这里声明；
+        // 返回由页面自己在内容区渲染（2026-11-10，同话费账单页），不再走顶栏的 meta.back
+        meta: { title: '定时任务', menuKey: 'settings', transition: 'fade' },
       },
       {
         path: 'monitor',
@@ -131,6 +152,13 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/terminal/TerminalView.vue'),
       },
       {
+        // 远程屏幕（2026-10-31）：默认对所有人可见，但后端 /api/screen/* 默认 403，
+        // 开关在设置里。这里不做前端隐藏 —— 隐藏式入口比显式报错更难排障。
+        path: 'screen',
+        name: 'screen',
+        component: () => import('@/views/screen/RemoteScreenView.vue'),
+      },
+      {
         path: 'alerts',
         name: 'alerts',
         component: () => import('@/views/alerts/AlertsView.vue'),
@@ -141,8 +169,9 @@ const routes: RouteRecordRaw[] = [
         path: 'apps',
         name: 'apps',
         component: () => import('@/views/apps/AppsView.vue'),
-        // 唯一的入口在「设备」页的应用列表，侧栏同样没有这一项
-        meta: { title: '应用管理', menuKey: 'device', back: { name: 'device' } },
+        // 唯一的入口在「设备」页的应用列表，侧栏同样没有这一项。
+        // 返回键由 AppsView 页内渲染（2026-11-11）：不再让全局顶栏出现返回键/标题。
+        meta: { menuKey: 'device' },
       },
       {
         path: 'files',
@@ -181,7 +210,8 @@ const routes: RouteRecordRaw[] = [
         path: 'tunnel',
         name: 'tunnel',
         component: () => import('@/views/tunnel/TunnelView.vue'),
-        meta: { title: '内网穿透', menuKey: 'settings', back: { name: 'settings' } },
+        // 返回由页面自己渲染（2026-11-10）
+        meta: { title: '内网穿透', menuKey: 'settings', transition: 'fade' },
       },
       {
         // 资源中心（2026-10-14 新建；2026-10-23 职责收窄）：**只负责插件组件**
@@ -195,8 +225,8 @@ const routes: RouteRecordRaw[] = [
         name: 'resources',
         component: () => import('@/views/resources/ResourcesView.vue'),
         // 2026-10-22：侧栏移除该入口（仍可从设置「服务更新」与隧道页跳入）。
-        // 没有菜单项就没有 label 可查，顶栏必须靠 meta.title；返回与高亮按「设置子页」处理。
-        meta: { title: '资源中心', menuKey: 'settings', back: { name: 'settings' } },
+        // 2026-11-10：返回由页面自己渲染（页面里的 h1 是「插件与组件」），顶栏不再出现返回键与标题。
+        meta: { title: '资源中心', menuKey: 'settings', transition: 'fade' },
       },
       {
         // 诊断中心（2026-10-14）：设备环境 / 网络工具 / 服务快照三段只读检查 + 导出诊断包。
@@ -211,7 +241,7 @@ const routes: RouteRecordRaw[] = [
         meta: {
           title: '诊断中心',
           menuKey: 'settings',
-          back: { name: 'settings', query: { tab: 'about' } },
+          transition: 'fade',
         },
       },
       {
@@ -224,6 +254,7 @@ const routes: RouteRecordRaw[] = [
         meta: {
           title: '赞赏',
           menuKey: 'settings',
+          transition: 'fade',
           back: { name: 'settings', query: { tab: 'about' } },
         },
       },
@@ -236,8 +267,16 @@ const routes: RouteRecordRaw[] = [
         meta: {
           title: '赞助与感谢',
           menuKey: 'settings',
+          transition: 'fade',
           back: { name: 'settings', query: { tab: 'about' } },
         },
+      },
+      {
+        // 第三方程序（应用商店）。与「应用管理」的 APK 是两件事：这里装的是
+        // Linux 可执行文件，由 core 用 ProcessBuilder 拉起并负责生死。
+        path: 'programs',
+        name: 'programs',
+        component: () => import('@/views/programs/ProgramsView.vue'),
       },
       {
         path: 'settings',

@@ -80,24 +80,19 @@
           </n-button>
         </n-dropdown>
 
-        <!-- 原生 input 而不是 n-upload：n-upload 自己发 XHR、只能带静态请求头，
-             而 core 对 /api/files/upload 强校验每次都变的时间戳签名（必然 444）；
-             它内建的进度条又依赖它自己那条请求。所以只借它选文件的能力已无意义，
-             直接用隐藏 input，请求交给 FilesView 的上传队列。 -->
-        <input ref="fileInputRef" class="tb-file-input" type="file" multiple @change="onFilePicked" />
-        <n-button quaternary :size="btnSize" title="上传文件到当前目录" @click="fileInputRef?.click()">
+        <!-- 点「上传」先开暂存弹窗（可拖拽、可选整个文件夹、可清空后再传），
+             真正的选择与请求都在 UploadDialog + useFileUpload 里 ——
+             工具栏不直接持有 input，也就不会出现"选了立刻传、选错收不回"。
+             n-upload 仍然不用：它自己发 XHR、只能带静态请求头，而 core 的
+             /api/files/upload 强校验每次都变的时间戳签名。 -->
+        <n-button :size="btnSize" title="上传文件 / 文件夹到当前目录" @click="emit('open-upload')">
           <template #icon
             ><n-icon><CloudUploadOutline /></n-icon
           ></template>
           上传
         </n-button>
 
-        <n-button
-          quaternary
-          :size="btnSize"
-          title="多选（进入后可复制 / 移动 / 压缩 / 删除）"
-          @click="emit('tool', 'multi')"
-        >
+        <n-button :size="btnSize" title="多选（进入后可复制 / 移动 / 压缩 / 删除）" @click="emit('tool', 'multi')">
           <template #icon
             ><n-icon><CheckboxOutline /></n-icon
           ></template>
@@ -109,15 +104,17 @@
           trigger="click"
           placement="bottom-start"
           to="body"
-          :menu-props="menuProps"
+          :menu-props="sortMenuProps"
           @select="onSort"
         >
-          <n-button quaternary :size="btnSize" title="排序方式">
-            <template #icon
-              ><n-icon><SwapVerticalOutline /></n-icon
-            ></template>
-            排序
-          </n-button>
+          <span ref="sortTriggerRef" class="sort-trigger">
+            <n-button quaternary :size="btnSize" title="排序方式">
+              <template #icon
+                ><n-icon><SwapVerticalOutline /></n-icon
+              ></template>
+              排序
+            </n-button>
+          </span>
         </n-dropdown>
 
         <!-- 「更多」用 bottom-end：它是行2 最右的按钮，居中对齐会让菜单右半边出屏 -->
@@ -140,7 +137,7 @@
 
       <!-- 选择模式工具条 -->
       <div v-else class="tb-selbar">
-        <n-button quaternary :size="btnSize" @click="emit('tool', 'exit-select')">
+        <n-button :size="btnSize" @click="emit('tool', 'exit-select')">
           <template #icon
             ><n-icon><CloseOutline /></n-icon
           ></template>
@@ -149,34 +146,28 @@
         <span class="sel-count"
           >已选 <b>{{ selCount }}</b> / {{ totalCount }} 项</span
         >
-        <n-button quaternary :size="btnSize" :disabled="!totalCount" @click="emit('tool', 'select-all')">全选</n-button>
-        <n-button quaternary :size="btnSize" :disabled="!selCount" @click="emit('tool', 'invert')">反选</n-button>
+        <n-button :size="btnSize" :disabled="!totalCount" @click="emit('tool', 'select-all')">全选</n-button>
+        <n-button :size="btnSize" :disabled="!selCount" @click="emit('tool', 'invert')">反选</n-button>
         <span class="tb-divider" />
-        <n-button quaternary :size="btnSize" :disabled="!selCount" @click="emit('tool', 'copy-selected')">
+        <n-button :size="btnSize" :disabled="!selCount" @click="emit('tool', 'copy-selected')">
           <template #icon
             ><n-icon><CopyOutline /></n-icon
           ></template>
           复制
         </n-button>
-        <n-button quaternary :size="btnSize" :disabled="!selCount" @click="emit('tool', 'move-selected')">
+        <n-button :size="btnSize" :disabled="!selCount" @click="emit('tool', 'move-selected')">
           <template #icon
             ><n-icon><MoveOutline /></n-icon
           ></template>
           移动
         </n-button>
-        <n-button quaternary :size="btnSize" :disabled="!selCount" @click="emit('tool', 'compress-selected')">
+        <n-button :size="btnSize" :disabled="!selCount" @click="emit('tool', 'compress-selected')">
           <template #icon
             ><n-icon><ArchiveOutline /></n-icon
           ></template>
           压缩
         </n-button>
-        <n-button
-          quaternary
-          type="error"
-          :size="btnSize"
-          :disabled="!selCount"
-          @click="emit('tool', 'delete-selected')"
-        >
+        <n-button type="error" :size="btnSize" :disabled="!selCount" @click="emit('tool', 'delete-selected')">
           <template #icon
             ><n-icon><TrashOutline /></n-icon
           ></template>
@@ -294,7 +285,7 @@ const emit = defineEmits<{
   (e: 'open-search'): void;
   (e: 'create', key: 'mkdir' | 'touch'): void;
   (e: 'tool', key: string): void;
-  (e: 'upload', files: File[]): void;
+  (e: 'open-upload'): void;
 }>();
 
 const SORT_LABEL: Record<string, string> = { name: '名称', size: '大小', date: '日期', type: '类型' };
@@ -334,6 +325,15 @@ const createOptions: DropdownOption[] = [
  * 非 scoped 样式里（那边才能用 `dvh` 兜底手机地址栏，见那里的注释）。
  */
 const menuProps = () => ({ class: 'files-toolbar-dropdown-menu' });
+/** 排序菜单跟随触发按钮宽度：在打开时读取按钮真实宽度，避免手机/桌面两档尺寸写死。 */
+const sortTriggerRef = ref<HTMLElement | null>(null);
+const sortMenuProps = () => {
+  const width = sortTriggerRef.value?.offsetWidth ?? 0;
+  return {
+    class: 'files-toolbar-dropdown-menu files-sort-menu',
+    ...(width ? { style: `width: ${width}px; min-width: ${width}px;` } : {}),
+  };
+};
 
 const sortOptions = computed<DropdownOption[]>(() =>
   Object.entries(SORT_LABEL).map(([key, label]) => ({
@@ -461,35 +461,15 @@ const primaryDisk = computed(() => {
   };
 });
 const primaryDiskHot = computed(() => (primaryDisk.value ? primaryDisk.value.usedPct > 90 : false));
-
-// ── 上传 ──
-const fileInputRef = ref<HTMLInputElement | null>(null);
-
-/**
- * 选完文件只上报，不发请求。
- * 选完后必须清空 `input.value`：否则再选同一个文件不会触发 change（浏览器认为值没变），
- * 表现为「第二次点上传没反应」。
- */
-function onFilePicked(e: Event) {
-  const input = e.target as HTMLInputElement;
-  const files = Array.from(input.files || []);
-  input.value = '';
-  if (files.length) emit('upload', files);
-}
 </script>
 
 <style scoped>
 /**
  * 配色/圆角/间距/字号一律走令牌（main.css :root），不写死取值 ——
  * 写死值不跟暗色与换肤走，且会顶破 `scripts/check-ui-baseline.mjs` 的增量门禁。
- * 按钮沿用 n-button（quaternary / primary）：语义色由 naiveTheme.ts 从同一批 CSS 变量派生，
+ * 按钮沿用 n-button（默认 / primary；只有图标按钮用 quaternary）：语义色由 naiveTheme.ts 从同一批 CSS 变量派生，
  * 暗色下文字色自动正确，自绘按钮反而要自己处理这套。
  */
-/* 隐藏的文件选择器：只借它弹系统选择框，视觉入口是旁边那颗按钮 */
-.tb-file-input {
-  display: none;
-}
-
 .toolbar {
   display: flex;
   flex-direction: column;
@@ -638,6 +618,11 @@ function onFilePicked(e: Event) {
 .is-mobile .tb-storage {
   height: 40px;
 }
+.sort-trigger {
+  display: inline-flex;
+  flex: none;
+}
+
 .tb-bar {
   width: 68px;
   height: 6px;
@@ -725,6 +710,8 @@ function onFilePicked(e: Event) {
  * （与 main.css 的 `.modal-fit` 同一套写法）。
  */
 .files-toolbar-dropdown-menu {
+  /* 四个短选项按内容收缩会比触发按钮窄，视觉上像"左右被裁" */
+  min-width: 96px;
   /* ui-baseline-allow: 200px 是「应用顶栏 56 + 页面内距 14~24 + 工具栏两行约 112」的布局上界，令牌表里没有"页面顶部到工具按钮底边"这个量；它约束的是视口余量，不是版式间距 */
   max-height: calc(100vh - 200px);
   max-height: calc(100dvh - 200px);
@@ -732,5 +719,9 @@ function onFilePicked(e: Event) {
   overflow-y: auto;
   /* 滚到菜单尽头不把滚动接力给页面（否则手指一滑整页跟着动） */
   overscroll-behavior: contain;
+}
+/* 排序菜单的宽度由打开时的按钮实测宽度内联覆盖；80px 只是极端情况下保底 */
+.files-sort-menu {
+  min-width: 80px;
 }
 </style>

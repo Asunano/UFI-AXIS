@@ -38,6 +38,33 @@
         <n-switch v-model:value="wifiForm.broadcastHidden" />
       </n-form-item>
     </n-form>
+
+    <!-- 2026-11-08：休眠定时从「更多设置」移到 WiFi 设置弹窗。
+         它改的是 `sleep_sysIdleTimeToSleep`（设备在 WiFi 空闲后关机/休眠），
+         和本弹窗的 SSID/密码/频段属于同一类"热点行为"，放在一起比单独一个入口更好找。 -->
+    <n-divider style="margin: 14px 0 12px" />
+    <div class="sleep-head">
+      <div>
+        <div class="sleep-title">休眠定时</div>
+        <div class="sleep-hint">WiFi 空闲超过设定时长后休眠；0 表示永不休眠</div>
+      </div>
+      <n-button size="tiny" :loading="sleepSaving" @click="emit('save-sleep')">保存</n-button>
+    </div>
+    <div class="sleep-controls">
+      <n-input-number v-model:value="sleepModel" :min="0" :step="5" size="small" style="width: 150px">
+        <template #suffix>分钟</template>
+      </n-input-number>
+      <n-button
+        v-for="opt in SLEEP_PRESETS"
+        :key="opt"
+        size="tiny"
+        :type="sleepModel === opt ? 'primary' : 'default'"
+        @click="sleepModel = opt"
+      >
+        {{ opt === 0 ? '不休眠' : `${opt} 分钟` }}
+      </n-button>
+    </div>
+
     <template #action>
       <n-button @click="show = false">取消</n-button>
       <n-button type="primary" :loading="wifiSaving" @click="saveWifi">保存</n-button>
@@ -67,7 +94,15 @@ import {
 import type { WifiBand } from '@/api/contract';
 import type { WifiSettings } from '@/types';
 
-const props = defineProps<{ show: boolean; wifiSettings: WifiSettings | null }>();
+const props = defineProps<{
+  show: boolean;
+  wifiSettings: WifiSettings | null;
+  /** 休眠定时（分钟）：状态仍由页面持有（useNetworkControls），这里只做编辑与提交 */
+  sleepTime?: number;
+  sleepSaving?: boolean;
+}>();
+
+const SLEEP_PRESETS = [0, 5, 15, 30];
 const emit = defineEmits<{
   'update:show': [boolean];
   saved: [];
@@ -78,7 +113,15 @@ const emit = defineEmits<{
    * 回读到的 SSID 是目标 chip 那个 AP 自己的，拿它比对必然对不上 —— 见 composable 里的说明）。
    */
   'switch-band': [chip: WifiBand];
+  'update:sleepTime': [value: number];
+  'save-sleep': [];
 }>();
+
+/** 受控输入：直接改 props 会报警告，统一走 emit 回给页面 */
+const sleepModel = computed({
+  get: () => props.sleepTime ?? 0,
+  set: (v: number) => emit('update:sleepTime', Number(v) || 0),
+});
 
 const show = computed({
   get: () => props.show,

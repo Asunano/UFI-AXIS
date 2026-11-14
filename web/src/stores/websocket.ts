@@ -107,7 +107,7 @@ export const useWebSocketStore = defineStore('websocket', () => {
         // 同时分发给通配符订阅
         const allHandlers = messageHandlers.get('*');
         if (allHandlers) allHandlers.forEach((h) => h(msg));
-      } catch (e) {
+      } catch {
         wsParseFailures++;
         if (wsParseFailures === 1 || wsParseFailures % 50 === 0) {
           console.warn('[ws] parse failure #' + wsParseFailures, event.data?.slice?.(0, 120));

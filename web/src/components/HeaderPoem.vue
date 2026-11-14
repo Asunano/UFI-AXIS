@@ -8,11 +8,19 @@
      上游自己也有约 10 分钟缓存。所以按钮文案是"换一句"而提示写明"可能仍是同一首"，
      不承诺一定会变。
 -->
+<!--
+  2026-10-31：这里的 n-popover **不能**用 `v-if="visible"`。
+  那样在 visible 由 true 变 false 时（数据轮询、换一句、路由跳转）会直接卸载组件，
+  跳过内部 <Transition> 的离场动画，Vue 抛 runtime-15
+  「Cannot read properties of null (reading 'parentNode')」。
+  改成常驻 + :disabled 控制交互、trigger 用 v-show 保持"关着不占位"的视觉。
+-->
 <template>
-  <n-popover v-if="visible" trigger="click" placement="bottom" :width="320">
+  <n-popover trigger="click" :disabled="!visible" placement="bottom" :width="320">
     <template #trigger>
-      <span class="poem-trigger" :title="p?.content">
-        <span class="poem-line">{{ p?.content }}</span>
+      <span v-show="visible || loading" class="poem-trigger" :title="loading ? '诗句加载中' : p?.content">
+        <span v-if="visible" class="poem-line">{{ p?.content }}</span>
+        <span v-else class="poem-line poem-loading">诗句加载中…</span>
         <!--
           手机（≤768px）上整条收成这一个「诗」字，而不是把挂件 display:none 掉。
           原先直接隐藏，结果是挂了件却在手机上**静默消失** —— 用户以为功能坏了
@@ -62,6 +70,10 @@ const store = useUiExtrasStore();
 const p = computed(() => store.poetry);
 
 const visible = computed(() => store.poetryConfig.enabled && !!p.value?.content);
+/** 与天气同理：配置已开、内容还没到时不把整块留白。 */
+const loading = computed(
+  () => store.poetryConfigLoaded && store.poetryConfig.enabled && !p.value?.content && store.poetryLoading
+);
 
 const showOrigin = computed(() => store.poetryConfig.show_origin);
 
@@ -95,6 +107,10 @@ const authorLine = computed(() => {
 .poem-trigger:hover .poem-line {
   color: var(--text-secondary);
 }
+.poem-loading {
+  color: var(--text-muted);
+  opacity: 0.8;
+}
 /* 手机上不再用单个「诗」字替换原句：一句诗本身就是挂件的意义。 */
 .poem-mini {
   display: none;
@@ -105,6 +121,36 @@ const authorLine = computed(() => {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* 长诗（《长恨歌》这类上百行）会把浮层一路顶出视口：限高 + 内部滚动。
+     高度取 min(60vh, 420px)：矮屏（横屏手机）按视口走，桌面封顶 420。
+     `overscroll-behavior: contain` 防止滚到底后把背后的页面一起带着滚。 */
+  max-height: min(60vh, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
+}
+
+/* 浮层内滚动条收细，避免和圆角/内边距打架 */
+.poem-detail::-webkit-scrollbar {
+  width: 6px;
+}
+.poem-detail::-webkit-scrollbar-thumb {
+  background: var(--border-subtle);
+  border-radius: 3px;
+}
+
+/* 「换一句」贴着滚动区底部：长诗滚到中段时也够得着 */
+.poem-actions {
+  position: sticky;
+  bottom: 0;
+  background: var(--card-bg);
+  padding-top: 6px;
+}
+
+/* 单行过长（长句、连续无空格、译文长段）时按词/字符断行，不产生横向溢出 */
+.poem-full-line,
+.poem-translate-line {
+  overflow-wrap: anywhere;
 }
 .poem-head {
   display: flex;

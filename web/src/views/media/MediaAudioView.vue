@@ -1,30 +1,30 @@
 <!--
-  音乐页（2026-10-23 按 A + B + D 方案重做）。
+  音乐页。
 
   ## 版式
-  · **A 资料库（桌面/平板）**：页头只留浏览动作（分类页签 / 搜索 / 排序 / 刷新 / 设置），
-    下面直接是当前队列列表，底部一条两行式播放控制条。
-    「最近添加 / 接下来播放」架子已删除（2026-10-23）：它占掉 280px+ 高度，
-    在矮屏会把列表压到 0 行，而快速入口和列表本身重复。
-  · **B 沉浸播放**：点封面 / 歌词 / 展开钮进入覆盖层：大封面 + 同步歌词 + 同一套控制条。
+  · **资料库（桌面 / 平板）**：页头只保留浏览动作（分类页签 / 搜索 / 排序 / 刷新 / 设置），
+    下方为当前队列列表，底部为两行式播放控制条。
+    「最近添加 / 接下来播放」入口不保留：它占用 280px+ 高度，在矮屏上会把列表压缩到 0 行，
+    且快速入口与列表本身重复。
+  · **沉浸播放**：点击封面 / 歌词 / 展开钮进入覆盖层：大封面 + 同步歌词 + 同一套控制条。
     默认只铺满内容区，顶栏右侧的全屏钮可覆盖顶栏与侧栏。
-    队列不再常驻右栏，改成控制条上的「队列」下拉面板（桌面 340px，手机全宽）。
-  · **D 手机（≤768）**：列表 + 底部迷你条；点迷你条进同一个沉浸覆盖层（全屏），
-    控制条自动切到手机排布。桌面播放条用 `v-if` 隐藏，避免 CSS 硬挤。
+    队列不常驻右栏，改为控制条上的「队列」下拉面板（桌面 340px，移动端全宽）。
+  · **移动端（≤768）**：列表 + 底部迷你条；点击迷你条进入同一个沉浸覆盖层（全屏），
+    控制条自动切换为移动端排布。桌面播放条以 `v-if` 隐藏，避免通过 CSS 强行挤压。
 
   ## 分类（歌单 / 专辑 / 艺人 / 文件夹）
-  顶部页签只切换**下方列表区的内容**，不再开侧边抽屉：
-  歌单页签显示歌单列表，分组页签显示对应维度的分组列表；点进一项后在同一区域
-  换成曲目，列表头的 `‹ xxx` 退回上一层。GroupBrowserPanel 以 `inline` 模式复用。
+  顶部页签只切换**下方列表区的内容**，不使用侧边抽屉：
+  歌单页签显示歌单列表，分组页签显示对应维度的分组列表；选中一项后在同一区域
+  换为曲目，列表头的 `‹ xxx` 返回上一层。GroupBrowserPanel 以 `inline` 模式复用。
 
   ## 播放状态
-  仍然全部在 `stores/player.ts`：本页只把队列推给 store、把行上的意图翻译成 store 动作。
-  `<audio>` 宿主在常驻的 `GlobalAudioPlayer`，顶栏迷你条与本页**共用同一份真源**。
-  新控制条 `AudioControlBar.vue` 同时用于底部播放条与沉浸层（variant 区分明暗与布局）。
+  全部位于 `stores/player.ts`：本页只把队列推给 store、把行上的操作转换为 store 动作。
+  `<audio>` 宿主位于常驻的 `GlobalAudioPlayer`，顶栏迷你条与本页**共用同一数据源**。
+  `AudioControlBar.vue` 同时用于底部播放条与沉浸层（variant 区分明暗与布局）。
 
   ## 歌词
-  沉浸层右侧（手机在封面下方）是 `LyricsPanel`；资料库里点「歌词」直接进入沉浸，
-  不再保留一条常驻歌词列 —— 它先把列表挤窄，又和"正在听"这件事重复。
+  沉浸层右侧（移动端在封面下方）为 `LyricsPanel`；资料库中点击「歌词」直接进入沉浸层，
+  不保留常驻歌词列：该列既挤压列表宽度，又与"正在播放"信息重复。
 -->
 <template>
   <div class="audio-page" :class="{ 'stage-open': stageOpen, 'has-mini-bar': player.currentTrack && isMobile }">
@@ -60,37 +60,13 @@
           </MediaScanDirsSettings>
         </div>
       </div>
-      <nav class="source-tabs" role="tablist" aria-label="浏览分类">
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="browseMode === 'all'"
-          :class="{ on: browseMode === 'all' }"
-          @click="showAll"
-        >
-          全部
-        </button>
-        <button
-          type="button"
-          role="tab"
-          :aria-selected="browseMode === 'playlist'"
-          :class="{ on: browseMode === 'playlist' }"
-          @click="openPlaylistTab"
-        >
-          歌单
-        </button>
-        <button
-          v-for="g in GROUP_CHIPS"
-          :key="g.by"
-          type="button"
-          role="tab"
-          :aria-selected="browseMode === g.by"
-          :class="{ on: browseMode === g.by }"
-          @click="openGroupTab(g.by)"
-        >
-          {{ g.label }}
-        </button>
-      </nav>
+      <!-- 分类页签使用公共 n-tabs（type=line），与应用 / 下载 / 短信页保持一致；
+           避免自写 <button role="tab"> 并另行实现下划线、悬停与选中态。 -->
+      <n-tabs :value="browseMode" type="line" size="small" class="source-tabs" @update:value="onBrowseTab">
+        <n-tab name="all">全部</n-tab>
+        <n-tab name="playlist">歌单</n-tab>
+        <n-tab v-for="g in GROUP_CHIPS" :key="g.by" :name="g.by">{{ g.label }}</n-tab>
+      </n-tabs>
     </header>
 
     <MediaEmptyState
@@ -107,27 +83,40 @@
         <Transition name="view-swap" mode="out-in">
           <div :key="viewKey" class="view-host">
             <div class="list-head" :class="{ 'is-browse': browseView !== 'tracks' }">
-              <button
+              <!-- 返回上一层：使用公共 n-button（size="small"，与 #/monitor 一致），
+                   与页面其它按钮共用同一套样式与尺寸。 -->
+              <n-button
                 v-if="showBrowseBack"
-                type="button"
+                size="small"
+                quaternary
                 class="list-back"
                 :title="`返回${backLabel}列表`"
                 @click="backToBrowse"
               >
-                ‹ {{ backLabel }}
-              </button>
+                <template #icon>
+                  <n-icon :size="14"><ChevronBackOutline /></n-icon>
+                </template>
+                {{ backLabel }}
+              </n-button>
               <span class="list-title">{{ listTitle }}</span>
               <span class="list-count">{{ listCountText }}</span>
               <span class="grow"></span>
-              <n-button v-if="browseView === 'playlists'" size="tiny" quaternary @click="openCreatePlaylist">
-                新建歌单
-              </n-button>
+              <n-radio-group
+                v-if="browseView !== 'tracks'"
+                :value="browseLayout"
+                size="small"
+                aria-label="显示方式"
+                @update:value="setBrowseLayout"
+              >
+                <n-radio-button value="list">列表</n-radio-button>
+                <n-radio-button value="grid">网格</n-radio-button>
+              </n-radio-group>
+              <n-button v-if="browseView === 'playlists'" size="small" @click="openCreatePlaylist"> 新建歌单 </n-button>
               <template v-else-if="browseView === 'tracks'">
                 <span class="list-actions">
                   <n-button
                     v-if="!isLibraryQueue"
-                    size="tiny"
-                    quaternary
+                    size="small"
                     :disabled="playableCount === 0"
                     title="按列表顺序从第一首开始播放（会关闭随机播放）"
                     @click="playAllQueue(false)"
@@ -136,8 +125,7 @@
                   </n-button>
                   <n-button
                     v-if="!isLibraryQueue"
-                    size="tiny"
-                    quaternary
+                    size="small"
                     :disabled="playableCount === 0"
                     title="打乱顺序播放这一份队列里的全部曲目（会开启随机播放）"
                     @click="playAllQueue(true)"
@@ -146,8 +134,7 @@
                   </n-button>
                   <n-button
                     v-if="queueTracks.length"
-                    size="tiny"
-                    quaternary
+                    size="small"
                     title="清空播放队列（不影响正在听的那一首，也不删任何文件）"
                     @click="confirmClearQueue"
                   >
@@ -171,16 +158,16 @@
               </div>
 
               <n-spin :show="queueLoading && queueTracks.length === 0" class="list-spin">
-                <!-- 原生 overflow 滚动，不用 n-scrollbar：n-scrollbar 内部的
-                 `.n-scrollbar-container` 需要一层层把高度撑满，真机 WebView 上曾出现
-                 “看得见行、拖不动”的状态。原生滚动容器只依赖 `.list-spin` 的确定高度，
-                 滚轮 / 触摸 / 滚动条都由浏览器实现，跨 WebView 更稳。 -->
+                <!-- 使用原生 overflow 滚动，不使用 n-scrollbar：后者内部的
+                 `.n-scrollbar-container` 需要逐层撑满高度，在 WebView 上会出现
+                 行可见但无法拖动的情况。原生滚动容器只依赖 `.list-spin` 的确定高度，
+                 滚轮 / 触摸 / 滚动条均由浏览器实现，跨 WebView 更稳定。 -->
                 <div class="list-scroll" role="list" aria-label="歌曲列表">
                   <div v-if="query && !filtered.length" class="list-empty">没有匹配「{{ query }}」的曲目</div>
                   <!--
-                  一行 = 可点的曲目按钮 + 右侧「⋯」。两者必须是兄弟而不是嵌套：
-                  按钮里套按钮是非法 HTML，浏览器会把内层提出来，点「⋯」会连带触发播放。
-                  key 用 path 而不是 id —— 歌单里已失效的条目 id 全是 0，按 id 做 key 会撞。
+                  一行 = 可点击的曲目按钮 + 右侧「⋯」。两者必须是兄弟节点而非嵌套：
+                  按钮嵌套按钮属于非法 HTML，浏览器会把内层节点提出，点击「⋯」会一并触发播放。
+                  key 使用 path 而非 id —— 歌单中已失效的条目 id 全为 0，按 id 做 key 会冲突。
                 -->
                   <div
                     v-for="(t, i) in filtered"
@@ -217,7 +204,7 @@
                       <span class="q-dur">{{ formatDuration(t.duration_ms) }}</span>
                     </button>
                     <n-dropdown trigger="click" :options="rowMenuOptions" @select="(k: string) => onRowMenu(k, t)">
-                      <n-button size="tiny" quaternary class="q-more" aria-label="更多操作">⋯</n-button>
+                      <n-button size="small" class="q-more" aria-label="更多操作">⋯</n-button>
                     </n-dropdown>
                   </div>
                   <div v-if="isLibraryQueue && hasMore()" class="list-more">
@@ -229,36 +216,47 @@
               </n-spin>
             </template>
 
-            <!-- ── 歌单浏览：直接占满下方列表区，不再往侧边抽屉里塞 ── -->
-            <div v-else-if="browseView === 'playlists'" class="browse-scroll">
-              <div v-if="playlistsLoading && playlists.length === 0" class="list-empty">加载歌单…</div>
-              <div v-else-if="!filteredPlaylists.length" class="list-empty">
-                {{ query ? `没有匹配「${query}」的歌单` : '还没有歌单，点右上角「新建歌单」' }}
+            <!-- ── 歌单浏览：占满下方列表区，不使用侧边抽屉 ── -->
+            <template v-else-if="browseView === 'playlists'">
+              <div v-if="browseLayout === 'list'" class="browse-table-head" aria-hidden="true">
+                <div class="browse-table-main">
+                  <span class="bh-name">名称</span>
+                  <span class="bh-count">歌曲数</span>
+                </div>
+                <span class="bh-more"></span>
               </div>
-              <div v-for="p in filteredPlaylists" :key="p.id" class="browse-row">
-                <button type="button" class="browse-main" @click="selectPlaylist(p.id)">
-                  <span class="browse-cover">
-                    <n-icon :size="20"><MusicalNotesOutline /></n-icon>
-                  </span>
-                  <span class="browse-text">
-                    <b>{{ p.name }}</b>
-                  </span>
-                  <span class="browse-count">{{ p.count }} 首</span>
-                </button>
-                <n-dropdown
-                  trigger="click"
-                  :options="playlistMenuOptions"
-                  @select="(k: string) => onPlaylistMenu(k, p)"
-                >
-                  <n-button size="tiny" quaternary class="browse-more" aria-label="更多操作">⋯</n-button>
-                </n-dropdown>
+              <div class="browse-scroll" :class="{ 'is-grid': browseLayout === 'grid' }">
+                <div v-if="playlistsLoading && playlists.length === 0" class="list-empty">加载歌单…</div>
+                <div v-else-if="!filteredPlaylists.length" class="list-empty">
+                  {{ query ? `没有匹配「${query}」的歌单` : '还没有歌单，点右上角「新建歌单」' }}
+                </div>
+                <div v-for="p in filteredPlaylists" :key="p.id" class="browse-row">
+                  <button type="button" class="browse-main" @click="selectPlaylist(p.id)">
+                    <span class="browse-cover">
+                      <!-- 网格模式下封面为整块正方形，20px 图标会显得空旷；列表模式保持 20px -->
+                      <n-icon :size="browseLayout === 'grid' ? 36 : 20"><MusicalNotesOutline /></n-icon>
+                    </span>
+                    <span class="browse-text">
+                      <b>{{ p.name }}</b>
+                    </span>
+                    <span class="browse-count">{{ p.count }} 首</span>
+                  </button>
+                  <n-dropdown
+                    trigger="click"
+                    :options="playlistMenuOptions"
+                    @select="(k: string) => onPlaylistMenu(k, p)"
+                  >
+                    <n-button size="small" class="browse-more" aria-label="更多操作">⋯</n-button>
+                  </n-dropdown>
+                </div>
               </div>
-            </div>
+            </template>
 
             <!-- ── 分组浏览：专辑 / 艺人 / 文件夹都直接铺在列表区 ── -->
             <div v-else class="browse-groups">
               <GroupBrowserPanel
                 inline
+                :layout="browseLayout"
                 :active-key="activeGroup?.key ?? ''"
                 :active-by="activeGroup?.by ?? groupBy"
                 :initial-by="groupBy"
@@ -290,11 +288,19 @@
           <b>{{ player.displayTitle }}</b>
           <span>{{ player.displayArtist }}</span>
         </span>
-        <button type="button" class="mini-btn" :title="player.playing ? '暂停' : '播放'" @click.stop="player.toggle()">
+        <button
+          type="button"
+          class="mini-btn mini-btn--play"
+          :title="player.playing ? '暂停' : '播放'"
+          @click.stop="player.toggle()"
+        >
           <n-icon :size="18">
             <PauseOutline v-if="player.playing" />
             <PlayOutline v-else />
           </n-icon>
+        </button>
+        <button type="button" class="mini-btn" title="播放队列" aria-label="播放队列" @click.stop="openStageWithQueue">
+          <n-icon :size="16"><ListOutline /></n-icon>
         </button>
         <button type="button" class="mini-btn" title="展开播放页" @click.stop="openStage">
           <n-icon :size="16"><ExpandOutline /></n-icon>
@@ -302,15 +308,10 @@
       </div>
 
       <!-- ═══ 播放条 dock（桌面 / 平板） ═══
-           播放条与队列浮层共用一个定位父级：队列从播放条上沿弹出，
-           不再写死 `bottom: 86px`（播放条高度会随窄桌面两行排布变化）。 -->
+           播放条与队列浮层共用同一个定位父级：队列从播放条上沿弹出，
+           不使用固定的 `bottom: 86px`（播放条高度会随窄桌面两行排布变化）。 -->
       <div v-if="player.currentTrack && !isMobile" class="player-dock" @mouseenter="warmStageSoon">
-        <AudioControlBar
-          :lyrics-open="lyricsOpen"
-          @open-queue="queueOpen = !queueOpen"
-          @toggle-lyrics="onToggleLyrics"
-          @open-stage="openStage"
-        />
+        <AudioControlBar :lyrics-open="lyricsOpen" @open-queue="toggleQueue" @open-stage="openStage" />
         <Transition name="queue-pop">
           <QueuePop
             v-if="queueOpen && !stageOpen"
@@ -334,13 +335,13 @@
       </div>
     </template>
 
-    <!-- 资料库层的队列遮罩；沉浸层有自己的一份（在 overlay 内部） -->
+    <!-- 资料库层的队列遮罩；沉浸层内另有一份（位于 overlay 内部） -->
     <Transition name="queue-fade">
       <div v-if="queueOpen && !stageOpen" class="queue-backdrop" @click="queueOpen = false"></div>
     </Transition>
 
-    <!-- ═══ 沉浸播放（B）：大封面 + 歌词 + 同一套控制条
-         默认只铺满内容区（不盖顶栏/侧栏）；顶栏右侧的全屏钮切到 fixed 铺满视口。 ═══ -->
+    <!-- ═══ 沉浸播放：大封面 + 歌词 + 同一套控制条
+         默认只铺满内容区（不覆盖顶栏 / 侧栏）；顶栏右侧的全屏钮切换为 fixed 铺满视口。 ═══ -->
     <div
       v-if="stageWarm && player.currentTrack"
       class="immersive"
@@ -384,15 +385,17 @@
             <span :title="player.displayArtist">{{ player.displayArtist }}</span>
           </div>
         </div>
-        <div class="im-lyrics">
-          <LyricsPanel
-            :lyric-lines="player.lyricLines"
-            :current-sec="player.positionSec"
-            :active="stageOpen"
-            large
-            @seek="player.seek($event)"
-          />
-        </div>
+        <Transition name="lyrics-panel-fade">
+          <div v-if="lyricsOpen" class="im-lyrics">
+            <LyricsPanel
+              :lyric-lines="player.lyricLines"
+              :current-sec="player.positionSec"
+              :active="stageOpen"
+              large
+              @seek="player.seek($event)"
+            />
+          </div>
+        </Transition>
       </div>
       <!-- 遮罩只在浮层内：不能让点击穿透到 im-body，也不能跨层影响资料库 -->
       <Transition name="queue-fade">
@@ -406,8 +409,8 @@
         <AudioControlBar
           variant="immersive"
           :lyrics-open="lyricsOpen"
-          @open-queue="queueOpen = !queueOpen"
-          @toggle-lyrics="lyricsOpen = !lyricsOpen"
+          @open-queue="toggleQueue"
+          @toggle-lyrics="toggleLyrics"
           @close="closeStage"
         />
         <Transition name="queue-pop">
@@ -455,9 +458,10 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useDialog, useMessage } from 'naive-ui';
 import {
+  ChevronBackOutline,
   ContractOutline,
   ExpandOutline,
   MusicalNotesOutline,
@@ -496,20 +500,21 @@ import MediaEmptyState from './components/MediaEmptyState.vue';
 import MediaExcludedManager from './components/MediaExcludedManager.vue';
 import MediaScanDirsSettings from './components/MediaScanDirsSettings.vue';
 import MediaSortControl from './components/MediaSortControl.vue';
-// 「重扫之后隔多久补拉」的共用节奏（视频页 / 图片页用同一份，见该文件头）
+// 「重扫后延迟补拉」的共用节奏（视频页 / 图片页共用同一实现，见该文件头）
 import { useRescanRefresh } from './components/mediaRescanRefresh';
+import { useAudioStage } from './useAudioStage';
 
 const message = useMessage();
 const dialog = useDialog();
 const wsStore = useWebSocketStore();
 /**
- * 全局播放器。**这一页不再持有任何播放状态**（2026-10-14）：
- * 当前曲目、队列、`<audio>`、音量、封面、歌词全在 store 里，
- * 这样切页/刷新都不会把歌掐掉。详见 `stores/player.ts` 的文件头。
+ * 全局播放器。**本页不持有任何播放状态**：
+ * 当前曲目、队列、`<audio>`、音量、封面与歌词均在 store 中，
+ * 因此切换页面或刷新不会中断播放。详见 `stores/player.ts` 的文件头。
  */
 const player = usePlayerStore();
 const appStore = useAppStore();
-/** ≤768：用独立的迷你条 + 全屏播放页，而不是把桌面三列压窄 */
+/** ≤768：使用独立的迷你条与全屏播放页，而非压缩桌面三列布局 */
 const isMobile = useIsMobile();
 const {
   api,
@@ -530,162 +535,97 @@ const {
 
 const query = ref('');
 
-/** 歌词列是否展开。收起后队列/大封面独占整宽。 */
+/**
+ * 歌单 / 专辑 / 艺人 / 文件夹的显示方式。
+ *
+ * 记忆保存在 localStorage 而非随路由：这是设备级的浏览偏好，不应每次进入页面重新选择。
+ * 读取失败（隐私模式）时退回默认布局。
+ */
+type BrowseLayout = 'list' | 'grid';
+const BROWSE_LAYOUT_KEY = 'ufi.media.browseLayout';
+const browseLayout = ref<BrowseLayout>(
+  (() => {
+    try {
+      // 默认使用网格布局：仅当明确存过 'list' 时使用列表，
+      // 未存过或读取 localStorage 失败均按网格处理。
+      return localStorage.getItem(BROWSE_LAYOUT_KEY) === 'list' ? 'list' : 'grid';
+    } catch {
+      return 'grid';
+    }
+  })()
+);
+/** naive 的 radio-group 回调给的是 `string | number | boolean`，这里做一次收敛。 */
+function setBrowseLayout(next: string | number | boolean): void {
+  const value: BrowseLayout = next === 'grid' ? 'grid' : 'list';
+  browseLayout.value = value;
+  try {
+    localStorage.setItem(BROWSE_LAYOUT_KEY, value);
+  } catch {
+    /* 无法写入时仅在本页生效 */
+  }
+}
+
+/** 歌词列是否展开。收起后队列与大封面独占整宽。 */
 const lyricsOpen = ref(true);
 /** 沉浸视图：主列从队列换成大封面。 */
-const stageOpen = ref(false);
 /**
- * 沉浸层是否覆盖顶栏/侧栏。
+ * 沉浸播放层（stage）：状态与行为集中于 `useAudioStage.ts`。
  *
- * 默认 **false**：沉浸层只铺满内容区（用户仍能看见自己在哪一页、能点侧栏切走）。
- * 顶栏右侧的全屏钮把它切成 `position: fixed; inset: 0`，覆盖整个视口。
- * 关闭沉浸时复位，下次进来默认仍是"内容区"模式。
+ * 边界：全屏、滚动锁、焦点还原、空闲预挂载、Esc 逐层关闭均由该文件负责。
+ * `queueOpen` / `lyricsOpen` 保留在本文件 —— 它们同时被资料库侧的播放条使用，
+ * 由本文件传入，避免 composable 反向依赖视图。
  */
-const stageFullscreen = ref(false);
-/** 封面 URL 失效时退回占位图标，避免正在播放页出现浏览器破图 + alt 文本。 */
-const stageCoverBroken = ref(false);
-watch(
-  () => player.coverUrl,
-  () => {
-    stageCoverBroken.value = false;
-  }
-);
-/** 顶栏状态文案：能定位到队列时显示"第 n / m 首"。 */
-const stageStatusText = computed(() => {
-  const path = player.currentTrack?.path;
-  const idx = path ? player.queue.findIndex((t) => t.path === path) : -1;
-  return idx >= 0 ? `正在播放 · 第 ${idx + 1} / ${player.queue.length} 首` : '正在播放';
-});
-/**
- * 打开沉浸前的焦点。关闭时还回去，键盘用户不会掉到 body 上。
- * 只做「打开时聚焦层、关闭时还原」，不在这里实现焦点陷阱：默认档顶栏/侧栏
- * 本来就是可交互的，过度限制反而让用户不能用导航离开。
- */
-let stageReturnFocus: HTMLElement | null = null;
-/** 队列下拉（控制条上的「队列」按钮） */
 const queueOpen = ref(false);
-/**
- * 沉浸层是否已在后台挂载。
- *
- * 第一次打开沉浸页要现挂整套控制条/歌词/封面，低端机上会有一次明显掉帧。
- * 在选歌后（或鼠标移到播放条上时）用 requestIdleCallback 预挂载，打开时只切
- * v-show，不再走首次创建；隐藏时 display:none，不参与布局/绘制。
- */
-const stageWarm = ref(false);
-let stageWarmTimer: number | null = null;
-type IdleCapableWindow = Window & {
-  requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
-  cancelIdleCallback?: (id: number) => void;
-};
-function warmStageSoon() {
-  if (stageWarm.value || !player.currentTrack || stageWarmTimer !== null) return;
-  const run = () => {
-    stageWarmTimer = null;
-    if (player.currentTrack) stageWarm.value = true;
-  };
-  const idleWindow = window as IdleCapableWindow;
-  stageWarmTimer = idleWindow.requestIdleCallback
-    ? idleWindow.requestIdleCallback(run, { timeout: 1200 })
-    : window.setTimeout(run, 800);
-}
-watch(
-  () => player.currentTrack?.path,
-  (path) => {
-    if (path) warmStageSoon();
-    else stageWarm.value = false;
-  },
-  { immediate: true }
-);
-
-/** 进入沉浸播放：清掉上次的浮层与全屏状态，默认停在内容区模式。 */
-function openStage() {
-  const active = document.activeElement;
-  stageReturnFocus = active instanceof HTMLElement && active !== document.body ? active : null;
-  queueOpen.value = false;
-  stageFullscreen.value = false;
-  stageWarm.value = true;
-  stageOpen.value = true;
-}
-
-function toggleStageFullscreen() {
-  stageFullscreen.value = !stageFullscreen.value;
-}
 
 /**
- * 沉浸打开时锁住壳层滚动。
- *
- * 沉浸层默认是 absolute（只盖内容区），页面若还能滚，用户一滑就会把整层带走；
- * 全屏模式虽然 fixed 不会跟着滚，但背后内容仍会被滚轮带着走。两种模式都锁。
- * 类挂在 <html> 上，样式见 main.css 的 `html.stage-locked`。
+ * 队列与歌词是互斥的两个浮层：同时打开时队列会覆盖歌词栏（窄屏尤为明显），
+ * 且两者关闭方式不同（队列点击遮罩、歌词点击按钮），容易误判为无法关闭。
+ * 因此打开一个即收起另一个 —— 单向关闭，不记忆"关闭队列后恢复歌词"的状态：
+ * 该恢复逻辑在切换曲目或退出沉浸时会与 `openStage()` 的复位冲突。
  */
-watch(stageOpen, async (open) => {
-  document.documentElement.classList.toggle('stage-locked', open);
-  if (!open) {
-    stageFullscreen.value = false;
-    stageReturnFocus?.focus();
-    stageReturnFocus = null;
-    return;
-  }
-  await nextTick();
-  (document.querySelector('.immersive') as HTMLElement | null)?.focus();
-});
-onUnmounted(() => document.documentElement.classList.remove('stage-locked'));
-onUnmounted(() => {
-  if (stageWarmTimer === null) return;
-  (window as IdleCapableWindow).cancelIdleCallback?.(stageWarmTimer);
-  window.clearTimeout(stageWarmTimer);
-  stageWarmTimer = null;
-});
+function toggleQueue(): void {
+  queueOpen.value = !queueOpen.value;
+  if (queueOpen.value) lyricsOpen.value = false;
+}
 
-/** 切到手机布局时没有桌面播放条可挂队列浮层；不在沉浸层里就收起它。 */
-watch(isMobile, (mobile) => {
-  if (mobile && !stageOpen.value) queueOpen.value = false;
-});
-
-/** 歌词按钮：资料库里点它 = 进沉浸播放（歌词只在那儿）；沉浸里点它 = 显隐歌词。 */
-function onToggleLyrics() {
-  if (!player.currentTrack) {
-    message.info('先选一首歌再打开歌词');
-    return;
-  }
-  if (!stageOpen.value) {
-    lyricsOpen.value = true;
-    openStage();
-    return;
-  }
+function toggleLyrics(): void {
   lyricsOpen.value = !lyricsOpen.value;
+  if (lyricsOpen.value) queueOpen.value = false;
 }
+const {
+  stageOpen,
+  stageFullscreen,
+  stageCoverBroken,
+  stageStatusText,
+  stageWarm,
+  warmStageSoon,
+  openStage,
+  toggleStageFullscreen,
+  closeStage,
+  onAudioKeydown,
+} = useAudioStage({ player, isMobile, queueOpen });
 
-/** 退出沉浸：同时收起队列下拉与全屏状态，避免回到资料库后浮层还挂着。 */
-function closeStage() {
-  stageOpen.value = false;
-  stageFullscreen.value = false;
-  queueOpen.value = false;
-}
-
-/** Esc 逐层关闭：队列下拉 → 全屏（退回内容区）→ 沉浸播放。 */
-function onAudioKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return;
-  if (queueOpen.value) {
-    queueOpen.value = false;
-    return;
-  }
-  if (stageOpen.value) {
-    if (stageFullscreen.value) {
-      stageFullscreen.value = false;
-      return;
-    }
-    closeStage();
-  }
+/**
+ * 移动端迷你条上的「队列」：先进入沉浸层（队列浮层挂在沉浸控制条上），再打开队列。
+ *
+ * `openStage()` 内部会将 `queueOpen` 置为 false（避免从资料库切入时保留上一次的浮层），
+ * 因此此处在同一 tick 内将其覆盖回 true —— 两个 ref 赋值均为同步，最终状态确定，
+ * 无需借助 nextTick 调整时序。
+ */
+function openStageWithQueue(): void {
+  openStage();
+  queueOpen.value = true;
+  // 与 toggleQueue 同一条规则：进沉浸并开队列时，先收起歌词，避免队列压住歌词栏
+  lyricsOpen.value = false;
 }
 
 /**
  * 当前页签：全部 / 歌单 / 专辑 / 艺人 / 文件夹。
  *
- * 页签只决定**下方列表显示什么**，不再开侧边抽屉：
+ * 页签只决定**下方列表显示的内容**，不使用侧边抽屉：
  *   · 全部 → 媒体库歌曲；
- *   · 歌单 → 歌单列表（选中后在同一列表区换成曲目）；
- *   · 专辑 / 艺人 / 文件夹 → 对应分组列表（选中后同一区域换成曲目）。
+ *   · 歌单 → 歌单列表（选中后在同一列表区切换为曲目）；
+ *   · 专辑 / 艺人 / 文件夹 → 对应分组列表（选中后同一区域切换为曲目）。
  */
 type BrowseMode = 'all' | 'playlist' | MediaGroupBy;
 const browseMode = ref<BrowseMode>('all');
@@ -696,6 +636,19 @@ const BROWSE_LABELS: Record<MediaGroupBy, string> = {
   artist: '艺人',
   folder: '文件夹',
 };
+/** n-tabs 的选中回调：映射到三个入口（全部 / 歌单 / 分组） */
+function onBrowseTab(name: string): void {
+  if (name === 'all') {
+    showAll();
+    return;
+  }
+  if (name === 'playlist') {
+    openPlaylistTab();
+    return;
+  }
+  openGroupTab(name as MediaGroupBy);
+}
+
 const GROUP_CHIPS: Array<{ by: MediaGroupBy; label: string }> = [
   { by: 'album', label: BROWSE_LABELS.album },
   { by: 'artist', label: BROWSE_LABELS.artist },
@@ -706,35 +659,35 @@ const GROUP_CHIPS: Array<{ by: MediaGroupBy; label: string }> = [
 
 const playlists = ref<PlaylistEntry[]>([]);
 const playlistsLoading = ref(false);
-/** 当前选中的歌单 id；null = 全部音乐（队列 = 媒体库列表）。 */
+/** 当前选中的歌单 id；null 表示全部音乐（队列即媒体库列表）。 */
 const activePlaylistId = ref<string | null>(null);
 const activePlaylistName = ref('');
 const playlistTracks = ref<PlaylistTrack[]>([]);
 const playlistTracksLoading = ref(false);
 const playlistMissingCount = ref(0);
-/** 序号守卫：loadPlaylistTracks 的两个入口（selectPlaylist / ws data_changed）可能并发 */
+/** 序号守卫：loadPlaylistTracks 的两个调用入口（selectPlaylist / ws data_changed）可能并发 */
 let plTrackSeq = 0;
 
-/** 已失效条目在队列里那一行的副标题。 */
+/** 已失效条目在队列中的副标题文案。 */
 const MISSING_NOTE = '文件已不在媒体库';
 
 // ── 分组浏览（详见 mediaGroups） ──
 
 /**
- * 当前选中的分组。null = 队列不是按分组来的。
+ * 当前选中的分组。null 表示队列不按分组组织。
  *
  * 与 [activePlaylistId] **互斥**：同一时刻队列只能有一个来源。
- * 两者都不选 = 队列是媒体库的平铺列表。
+ * 两者均为 null 时，队列为媒体库的平铺列表。
  */
 const activeGroup = ref<{ by: MediaGroupBy; key: string; title: string } | null>(null);
 
-/** 当前分组浏览的维度：选中的分组优先，否则看页签。 */
+/** 当前分组浏览的维度：优先取选中的分组，否则取页签。 */
 const groupBy = computed<MediaGroupBy>(() => {
   if (activeGroup.value) return activeGroup.value.by;
   return browseMode.value === 'artist' || browseMode.value === 'folder' ? browseMode.value : 'album';
 });
 
-/** 下方列表当前该画什么：歌曲 / 歌单列表 / 分组列表。 */
+/** 下方列表当前渲染的内容：歌曲 / 歌单列表 / 分组列表。 */
 const browseView = computed<'tracks' | 'playlists' | 'groups'>(() => {
   if (activePlaylistId.value || activeGroup.value) return 'tracks';
   if (browseMode.value === 'playlist') return 'playlists';
@@ -742,7 +695,7 @@ const browseView = computed<'tracks' | 'playlists' | 'groups'>(() => {
   return 'groups';
 });
 
-/** 切换视图的动画 key：分类页签、进入歌单/分组都换 key。 */
+/** 视图切换动画的 key：切换分类页签、进入歌单或分组时均更换。 */
 const viewKey = computed(() => {
   if (activePlaylistId.value) return `playlist:${activePlaylistId.value}`;
   if (activeGroup.value) return `group:${activeGroup.value.by}:${activeGroup.value.key}`;
@@ -758,7 +711,7 @@ const backLabel = computed(() => {
   return '';
 });
 
-/** 清掉当前选中的歌单/分组，回到同类列表（不改变当前页签）。 */
+/** 清除当前选中的歌单 / 分组，回到同类列表（不改变当前页签）。 */
 function clearActiveSource() {
   activePlaylistId.value = null;
   activeGroup.value = null;
@@ -768,7 +721,7 @@ function clearActiveSource() {
   playlistMissingCount.value = 0;
 }
 
-/** 切页签：清掉上一个来源，避免标题、列表和播放队列三者指向不同东西。 */
+/** 切换页签：清除上一个来源，避免标题、列表与播放队列指向不同数据源。 */
 function setBrowseMode(mode: BrowseMode) {
   browseMode.value = mode;
   clearActiveSource();
@@ -803,18 +756,18 @@ function backToBrowse() {
 
 const groupTracks = ref<PlaylistTrack[]>([]);
 const groupTracksLoading = ref(false);
-/** 序号守卫：分组面板可以连点，先发后到的响应必须丢掉 */
+/** 序号守卫：分组面板可连续点击，先发后到的响应必须丢弃 */
 let groupTrackSeq = 0;
 
-/** 队列是否就是"媒体库平铺列表"。只有它是分页的，才谈得上"加载更多"。 */
+/** 队列是否为"媒体库平铺列表"。仅该来源分页，因此只有它存在"加载更多"。 */
 const isLibraryQueue = computed(() => !activePlaylistId.value && !activeGroup.value);
 
 /**
  * 排序控件的禁用说明。
  *
- * 禁用态必须**说得出理由**：一个灰掉的控件如果没有任何解释，用户只会以为页面坏了。
- * 这条文案同时也是"为什么只有媒体库能排序"的答案 —— 歌单与分组的顺序是用户 / core 排定的，
- * 排序对它们没有意义（见模板里那段的说明）。
+ * 禁用态必须**给出理由**：无说明的置灰控件会被理解为页面故障。
+ * 该文案同时说明"仅媒体库列表可排序"的原因 —— 歌单与分组的顺序由用户 / core 确定，
+ * 排序对它们没有意义。
  */
 const sortHint = computed(() => {
   if (browseView.value !== 'tracks') return '排序只对歌曲列表生效：歌单 / 分组列表由 core 排定';
@@ -845,11 +798,11 @@ const queueCountText = computed(() => {
 /**
  * 当前列表显示的曲目。
  *
- * **读页面自己的来源数组，而不是 `player.queue`**（2026-10-23 修闪烁）：
- * 切歌单/分组时 `player.queue` 要等 `syncQueue` 推上去，慢一帧；那一帧里
- * 列表会先画上一份队列（常见表现是“闪一下全部歌曲”）。这里直接返回
- * `playlistTracks / groupTracks / items`，空就是空（配 n-spin 显示加载），
- * 不会拿旧队列顶一帧。播放器仍以 store 为真源，`syncQueue` 负责同步。
+ * **读取页面自身的来源数组，而非 `player.queue`**：切换歌单 / 分组时，
+ * `player.queue` 需等待 `syncQueue` 推送，存在一帧延迟；该帧内列表会先绘制上一份队列
+ * （表现为短暂显示全部歌曲）。此处直接返回 `playlistTracks / groupTracks / items`，
+ * 为空即渲染空态（配合 n-spin 显示加载），不使用旧队列填充。
+ * 播放器仍以 store 为数据源，由 `syncQueue` 负责同步。
  */
 const queueTracks = computed<PlaylistTrack[]>(() => {
   if (activeGroup.value) return groupTracks.value;
@@ -866,23 +819,30 @@ const filtered = computed(() => {
 });
 
 /**
- * 队列里真正**可播**的条数（`missing` 的条目点了也不会响）。
+ * 队列中真正**可播放**的条数（`missing` 条目播放时不会出声）。
  *
- * 「播放全部 / 随机播放」的亮灭读它而不是 `queueTracks.length`：一个整份都已失效的歌单
- * 是可能存在的（文件被删/移走），此时按钮亮着而按下去什么都不发生，比灰着更让人困惑。
+ * 「播放全部 / 随机播放」的可用状态依据该值而非 `queueTracks.length`：
+ * 整份条目均已失效的歌单是可能存在的（文件被删除或移动），此时按钮可用却无任何效果，
+ * 比置灰更易造成困惑。
  */
 const playableCount = computed(() => queueTracks.value.filter((t) => !t.missing).length);
 
-const showEmpty = computed(
-  () => !loading.value && (permissionDenied.value || failed.value || items.value.length === 0)
-);
+const showEmpty = computed(() => {
+  if (loading.value) return false;
+  // 无权限 / 读取失败：任何页签都是全屏占位（这时下面没数据可画）
+  if (permissionDenied.value || failed.value) return true;
+  // 歌单页签拥有独立空态（「还没有歌单，点右上角…」）：曲库为空时仍需可进入、
+  // 可新建，不应被「没有音频文件」整页占位阻挡。
+  if (browseMode.value === 'playlist') return false;
+  return items.value.length === 0;
+});
 
 const headSub = computed(() => {
   if (permissionDenied.value) return '未授权';
   return total.value ? `共 ${total.value} 首` : '';
 });
 
-/** 搜索框提示随当前列表变化：歌曲列表搜歌名/艺人，歌单/分组列表搜名称。 */
+/** 搜索框提示随当前列表变化：歌曲列表搜索歌名 / 艺人，歌单与分组列表搜索名称。 */
 const searchPlaceholder = computed(() => {
   if (browseView.value === 'playlists') return '搜索歌单';
   if (browseView.value === 'groups') return `搜索${BROWSE_LABELS[groupBy.value]}`;
@@ -895,7 +855,7 @@ const filteredPlaylists = computed(() => {
   return playlists.value.filter((p) => p.name.toLowerCase().includes(q));
 });
 
-/** 排序只对歌曲列表有意义；歌单/分组浏览时禁用。 */
+/** 排序仅对歌曲列表有意义；歌单与分组浏览时禁用。 */
 const sortAvailable = computed(() => browseView.value === 'tracks' && isLibraryQueue.value);
 
 const listTitle = computed(() => {
@@ -922,20 +882,20 @@ function onPlaylistMenu(key: string, entry: PlaylistEntry) {
 // ── 队列同步 ──
 
 /**
- * 选中一个分组：把它整组的曲目换成当前队列。
+ * 选中一个分组：以该分组的全部曲目作为当前队列。
  *
- * **不自动开始播放**，与 [selectPlaylist] 保持一致 —— 点分组表达的是"我要看这张专辑有什么"，
- * 播放意图由用户点某一首来表达。自动播放会把"只想看看"变成"被迫换歌"。
+ * **不自动开始播放**，与 [selectPlaylist] 保持一致 —— 选中分组表达的是查看意图，
+ * 播放意图由点击具体曲目表达。自动播放会使仅想查看的操作用户被迫切换曲目。
  */
 function onGroupOpen(group: { key: string; title: string }, by: MediaGroupBy) {
   browseMode.value = by;
   activePlaylistId.value = null;
   activeGroup.value = { by, key: group.key, title: group.title };
-  // 先清空：不清的话新分组的曲目到达之前，队列里还挂着上一个分组的内容，
-  // 而标题已经换成了新的 —— 那几秒里列表和标题是矛盾的。
+  // 先清空：否则新分组曲目返回之前，队列仍保留上一个分组的内容，而标题已更新，
+  // 该时间段内列表与标题不一致。
   groupTracks.value = [];
-  // 主动切来源：立刻把空队列推给 store，别让上一份队列（全部歌曲/上一张专辑）
-  // 在列表里多留一帧。当前正在听的那一首由 store 保留，不会被清掉。
+  // 主动切换来源：立即把空队列推给 store，避免上一份队列（全部歌曲 / 上一张专辑）
+  // 在列表中多显示一帧。当前正在播放的曲目由 store 保留，不会被清除。
   syncQueue(true);
   void loadGroupTracks(activeGroup.value);
 }
@@ -961,15 +921,15 @@ async function loadGroupTracks(g: { by: MediaGroupBy; key: string; title: string
 /**
  * 把当前来源的曲目推给全局 store。
  *
- * ## 为什么要那个"列表为空就跳过"的守卫
- * 页面刚挂载时三个列表都还是空的（`items` / `playlistTracks` / `groupTracks`），
- * 而 store 里的队列可能**正是刷新恢复出来的、顶栏还显示着的那一首**。
- * 无条件 `setQueue([])` 会把它擦掉 —— 表现就是"刷新后顶栏还在显示那首歌，
- * 一进音乐页就没了"。所以"新列表为空 且 已经有当前曲目"时跳过，等真正的数据到了再同步。
+ * ## 空列表守卫的作用
+ * 页面刚挂载时三个列表均为空（`items` / `playlistTracks` / `groupTracks`），
+ * 而 store 中的队列可能**正是刷新恢复出来的、顶栏仍在显示的那一首**。
+ * 无条件调用 `setQueue([])` 会清除该队列，表现为刷新后顶栏仍显示该曲目，
+ * 但进入音乐页后即丢失。因此"新列表为空且已存在当前曲目"时跳过，待数据到达后再同步。
  *
- * 反过来，用户**主动**切来源（点歌单 / 点分组）时必须立刻同步，哪怕新列表还没到 ——
- * 那时"当前曲目掉出队列"（store 里 `orderPos = -1`）正是预期行为：
- * 新来源里确实没有"这首的下一首"。
+ * 反之，用户**主动**切换来源（点击歌单 / 分组）时必须立即同步，即使新列表尚未返回：
+ * 此时"当前曲目脱离队列"（store 中 `orderPos = -1`）属于预期行为，
+ * 新来源中确实不存在该曲目的下一首。
  */
 function syncQueue(force = false) {
   const hasCurrent = !!player.currentTrack;
@@ -1002,23 +962,24 @@ function syncQueue(force = false) {
 /**
  * 队列同步的触发点。
  *
- * `deep` 刻意不开：这几个 ref 在加载时都是**整体替换**（`items.value = page`、
- * `playlistTracks.value = resp.items`），引用变了就够；开 deep 会在一次加载里
- * 触发十几次 setQueue，而每次都要重算随机播放的置换。
+ * 不启用 `deep`：这些 ref 在加载时均为**整体替换**（`items.value = page`、
+ * `playlistTracks.value = resp.items`），引用变化即可触发；启用 deep 会在一次加载中
+ * 触发十余次 setQueue，而每次都需要重算随机播放的置换。
  */
 watch([items, playlistTracks, groupTracks, activePlaylistId, activeGroup], () => syncQueue());
 
-// ── 重新扫描：延迟补拉（2026-10-14 补）──
+// ── 重新扫描：延迟补拉 ──
 
 /**
- * core 侧扫描是异步的（`POST /api/media/rescan` 立刻返回，扫描在后台跑），
- * 所以 `@rescanned` 之后**不能立刻 reload** —— 那时扫描还没完，拉到的还是旧列表，
- * 用户会以为"重扫没生效"。
+ * core 侧扫描是异步的（`POST /api/media/rescan` 立即返回，扫描在后台执行），
+ * 因此 `@rescanned` 之后**不能立即 reload** —— 此时扫描尚未完成，取回的仍是旧列表，
+ * 会被理解为"重扫未生效"。
  *
- * 节奏（3s / 8s / 15s 三档补拉）**刻意不在这里自己定**：视频页与图片页用的是同一件事，
- * 各写一份就会出现三种节奏，而"隔多久补拉"没有任何页间差异 ——
- * 差异只在"刷新之后还要不要做别的"（视频页要顺带刷一次预热快照），那由调用方在回调里做。
- * 组件卸载时那一串定时器由它自己清掉（见 `mediaRescanRefresh` 的说明）。
+ * 补拉节奏（3s / 8s / 15s 三档）**不在此处自行定义**：视频页与图片页使用同一逻辑，
+ * 各自实现会产生三种节奏，而"补拉间隔"在各页面之间没有差异 ——
+ * 差异仅在于"刷新之后是否还需执行其它操作"（视频页需顺带刷新预热快照），
+ * 该部分由调用方在回调中完成。组件卸载时相关定时器由该模块自行清除
+ * （见 `mediaRescanRefresh` 的说明）。
  */
 const { refreshAfterRescan } = useRescanRefresh();
 
@@ -1026,21 +987,22 @@ function onRescanned() {
   refreshAfterRescan(reload);
 }
 
-// ── 队列编辑（2026-10-14 补）──
+// ── 队列编辑 ──
 //
-// 队列的真源在 `stores/player.ts`，这里只负责把"行上的意图"翻成 store 动作。
+// 队列的数据源在 `stores/player.ts`，此处只把行上的操作转换为 store 动作。
 //
-// ⚠ **索引一律按 path 反查 `player.queue`，绝不用 `filtered` 里的下标**：
-// 搜索框一开，DOM 里的行号与队列下标就错位了，用错一次就会移除/移动另一首歌
-// （而那是不可撤销的：队列是页面推给 store 的临时状态，不是歌单）。
+// ⚠ **索引一律按 path 反查 `player.queue`，不得使用 `filtered` 中的下标**：
+// 启用搜索后，DOM 行号与队列下标会错位，误用会移除 / 移动其它曲目，
+// 且该操作不可撤销（队列是页面推给 store 的临时状态，不是歌单）。
 //
-// ⚠ 队列编辑只**在本次停留期间**有效：这一页会在来源列表变化时重新把队列推给 store
-// （见 [syncQueue] 的 watch），所以点「加载更多」/ 换来源 / 刷新页面都会按来源的顺序重排，
-// 手排的顺序与移除掉的条目会回来。app 侧靠 `AudioQueueOwner.userEdited` 标记"用户动过队列"
-// 来避免这种重装；web 这一轮**刻意没做**那套标记 —— 它会牵动"刷新恢复"与"切来源不打断播放"
-// 两条既有语义（标记什么时候清、切来源算不算用户编辑），那是独立的一轮工作。
+// ⚠ 队列编辑仅在**本次停留期间**有效：来源列表变化时本页会重新把队列推给 store
+// （见 [syncQueue] 的 watch），因此「加载更多」、切换来源、刷新页面都会按来源顺序重排，
+// 手动调整的顺序与被移除的条目会重新出现。app 侧以 `AudioQueueOwner.userEdited`
+// 标记"用户修改过队列"以避免该重装；web 未实现该标记 —— 它会牵动"刷新恢复"与
+// "切换来源不打断播放"两条既有语义（标记的清除时机、切换来源是否计入用户编辑），
+// 需独立处理。
 
-/** 在**展示队列**里按路径反查下标。找不到返回 -1（这一行已经不在队列里了）。 */
+/** 在**展示队列**中按路径反查下标。找不到时返回 -1（该行已不在队列中）。 */
 function queueIndexOf(track: PlaylistTrack): number {
   return player.queue.findIndex((t) => t.path === track.path);
 }
@@ -1052,9 +1014,10 @@ function onQueuePlayNext(track: PlaylistTrack) {
 /**
  * 队列内上移 / 下移一位。
  *
- * 随机开着时 store 会顺手把它关掉（见 `moveInQueue` 的注释）：手排顺序与"打乱的播放顺序"
- * 是互斥的两种意图，不关的话用户排完听的时候还是按打乱的走。**提示必须在这里发** ——
- * store 不碰 UI，而"随机被关了"这件事不说出来就等于静默改了用户的设置。
+ * 随机播放开启时 store 会同时将其关闭（见 `moveInQueue` 的注释）：手动顺序与
+ * 打乱的播放顺序是互斥的两种意图，否则用户排序后播放仍按打乱顺序进行。
+ * **提示必须在此处发出** —— store 不处理 UI，而"随机播放已关闭"若不提示，
+ * 等同于静默修改了用户设置。
  */
 function onQueueMove(track: PlaylistTrack, dir: 1 | -1) {
   const idx = queueIndexOf(track);
@@ -1078,9 +1041,9 @@ function onQueueRemove(track: PlaylistTrack) {
 /**
  * 「播放全部 / 随机播放」。
  *
- * 点歌单 / 分组卡片那条路（只换队列、不播）保持不变，这两颗按钮才是"开始听"的显式入口。
- * `random` 那一档会**打开**随机、另一档会关掉它：两者都是用户按这颗按钮时明确表达的意图
- * （"随机播放"这个词本身就是这个意思），不是我们替他改设置。
+ * 点击歌单 / 分组卡片（仅切换队列、不播放）的行为保持不变；这两个按钮才是开始播放的
+ * 显式入口。`random` 分支**开启**随机播放，另一分支将其关闭：两者均为用户按下按钮时
+ * 明确表达的意图（"随机播放"的字面含义即为此），不构成对设置的擅自修改。
  */
 function playAllQueue(random: boolean) {
   if (playableCount.value === 0) return;
@@ -1090,9 +1053,9 @@ function playAllQueue(random: boolean) {
 /**
  * 清空队列。
  *
- * 二次确认是必须的：这一列的「清空」挨着每一行的「⋯」，而它一次性抹掉整份队列，
- * 误点之后用户没有任何办法恢复（队列是页面推给 store 的临时状态，不是歌单）。
- * 文案要说清"不删文件、正在听的那一首也还在"：这两条正是用户最容易误解的地方。
+ * 必须二次确认：该按钮与每行的「⋯」相邻，且会一次性清除整份队列，
+ * 误操作后无法恢复（队列是页面推给 store 的临时状态，不是歌单）。
+ * 文案需明确"不删除文件、正在播放的曲目仍保留"，这两点最容易被误解。
  */
 function confirmClearQueue() {
   dialog.warning({
@@ -1109,8 +1072,8 @@ function confirmClearQueue() {
 
 // ── 歌单：取数、选择与写操作 ──
 //
-// 歌单本体存在 core，这里只是镜像：写完一律重拉，不做本地乐观更新 ——
-// 加歌的真实结果（跳过了几条、有没有撞上限）只有 core 知道。
+// 歌单数据存储于 core，此处仅为镜像：写操作后一律重新拉取，不做本地乐观更新 ——
+// 加歌的真实结果（跳过条数、是否触达上限）只有 core 能够确定。
 
 async function reloadPlaylists() {
   playlistsLoading.value = true;
@@ -1128,7 +1091,7 @@ async function loadPlaylistTracks(id: string) {
   playlistTracksLoading.value = true;
   try {
     const resp = await fetchPlaylistItems(api, id);
-    // useCancellableApi 取消在途请求时为 null，按"没结果"处理，不要清空已有列表
+    // useCancellableApi 取消在途请求时返回 null，按"无结果"处理，不清空已有列表
     if (!resp) return;
     if (seq !== plTrackSeq) return; // 先发后到，丢弃过期结果
     activePlaylistName.value = resp.name;
@@ -1148,12 +1111,11 @@ async function loadPlaylistTracks(id: string) {
 /**
  * 切换队列来源（歌单 ↔ 媒体库）。
  *
- * **不碰播放器**：切歌单只是换"接下来从哪挑歌"，正在听的那一首继续放。
- * 代价是当前曲目可能不在新来源里（store 里 `orderPos = -1`），此时"上一首"会置灰、
- * "下一首"变成"从新来源的队首开始" —— 那是如实的：新来源里确实没有"这首的下一首"。
+ * **不影响播放器**：切换歌单仅改变后续曲目的来源，正在播放的曲目继续播放。
+ * 代价是当前曲目可能不在新来源中（store 中 `orderPos = -1`），此时"上一首"置灰、
+ * "下一首"变为从新来源的队首开始 —— 该行为符合实际：新来源中确实不存在该曲目的下一首。
  *
- * 2026-10-14：队列真源搬到 store 之后，这里不再直接改队列内容，只改**来源**，
- * 由 [syncQueue] 的 watch 把结果推上去。
+ * 队列数据源位于 store，此处只修改**来源**，由 [syncQueue] 的 watch 推送结果。
  */
 function selectPlaylist(id: string | null) {
   activeGroup.value = null;
@@ -1165,9 +1127,9 @@ function selectPlaylist(id: string | null) {
     return;
   }
   browseMode.value = 'playlist';
-  // 先清空：新歌单的曲目到达之前，队列里还挂着上一个歌单的内容而标题已经换了
+  // 先清空：新歌单曲目返回之前，队列仍保留上一个歌单的内容，而标题已更新
   playlistTracks.value = [];
-  // 主动切来源：立刻同步空队列，避免旧队列在列表里多闪一帧。
+  // 主动切换来源：立即同步空队列，避免旧队列在列表中多显示一帧。
   syncQueue(true);
   void loadPlaylistTracks(id);
 }
@@ -1178,44 +1140,42 @@ const NEW_PLAYLIST_KEY = '__new__';
 /**
  * 队列行「⋯」菜单：加入歌单（二级菜单列出全部歌单）+ 从本歌单移出 + 从音乐库移除。
  *
- * 「从音乐库移除」（2026-10-14 补）走的是 `POST /api/media/exclude` 的 `add` 动作，
- * 与「已从音乐库移除的歌曲」管理弹窗是同一份名单的两个方向。此前 web 只有"移回"没有
- * "移出"，名单只能由 app 写入 —— 那样这一整套界面在 web 上等于只读，用户看到一首不想听的
- * 歌只能去手机上处理。
+ * 「从音乐库移除」调用 `POST /api/media/exclude` 的 `add` 动作，与「已从音乐库移除的歌曲」
+ * 管理弹窗操作同一份名单的两个方向。若名单只能由 app 写入，该界面在 web 上将退化为只读。
  *
- * ⚠ 它**只动名单、永远不动文件**（core 那段 KDoc 写死了这条边界），而且可撤销
- * （在音乐页「设置 → 已从音乐库移除」里移回），所以确认文案必须说清这一点 ——
- * 用户看到"移除"两个字很容易理解成删文件。
+ * ⚠ 该操作**只修改名单、不修改文件**（core 侧的 KDoc 已明确该边界），且可撤销
+ * （在本页「设置 → 已从音乐库移除」中移回）。确认文案必须说明这一点 ——
+ * "移除"容易被理解为删除文件。
  */
 const rowMenuOptions = computed(() => {
   const children: Array<{ label: string; key: string }> = playlists.value.map((p) => ({
     label: `${p.name}（${p.count}）`,
     key: `${ADD_PREFIX}${p.id}`,
   }));
-  // 一个歌单都没有时这一条就是唯一入口 —— 否则用户得先去建一个再回来
+  // 无任何歌单时该项为唯一入口，避免用户需先新建歌单再返回操作
   children.push({ label: '＋ 新建歌单…', key: `${ADD_PREFIX}${NEW_PLAYLIST_KEY}` });
   /**
-   * 队列编辑那一组（2026-10-14 补）。
+   * 队列编辑项。
    *
-   * ⚠ 这份 options 是**所有行共用**的一份（`n-dropdown` 逐行渲染但选项集合只有一份），
-   * 所以"首行不给上移 / 末行不给下移"这种逐行的条件在这里表达不了 ——
-   * 与下面「从音乐库移除」那条是同一个限制。越界的情况由 [onQueueMove] 拦下并给一句提示，
-   * 而不是把菜单项藏掉（藏掉需要逐行的 options，那是另一轮改动）。
+   * ⚠ 该 options 由**所有行共用**（`n-dropdown` 逐行渲染，但选项集合只有一份），
+   * 因此无法表达"首行禁用上移 / 末行禁用下移"这类逐行条件 ——
+   * 与下方「从音乐库移除」受同一限制。越界情况由 [onQueueMove] 拦截并提示，
+   * 而非隐藏菜单项（隐藏需要逐行的 options）。
    */
   const opts: Array<Record<string, unknown>> = [
     { label: '下一首播放', key: 'play-next' },
     { label: '上移', key: 'move-up' },
     { label: '下移', key: 'move-down' },
-    // 「从播放队列移除」而不是「从本歌单移出」：两条都在这个菜单里，必须一眼看出区别
-    // （前者只动这次的播放队列，后者动的是 core 里那份歌单）。
+    // 使用「从播放队列移除」而非「从本歌单移出」：两者同在该菜单中，需可明确区分
+    // （前者仅修改本次播放队列，后者修改 core 中的歌单）。
     { label: '从播放队列移除', key: 'remove-from-queue' },
     { type: 'divider', key: 'd-queue' },
   ];
   opts.push({ label: '加入歌单', key: 'add', children });
   if (activePlaylistId.value) opts.push({ label: '从本歌单移出', key: 'remove' });
-  // 「从音乐库移除」**无条件列出**：这一份 options 是给所有行共用的一个 computed
-  // （`n-dropdown` 逐行渲染但选项集合只有一份），在里面按"当前这一行"做条件判断
-  // 是做不到的 —— 那需要一个逐行的 options。已失效的条目在 [confirmExclude] 里拦。
+  // 「从音乐库移除」**无条件列出**：该 options 是所有行共用的 computed
+  // （`n-dropdown` 逐行渲染但选项集合只有一份），无法按当前行做条件判断，
+  // 那需要逐行生成的 options。已失效条目在 [confirmExclude] 中拦截。
   opts.push({ label: '从音乐库移除', key: 'exclude' });
   return opts;
 });
@@ -1256,14 +1216,14 @@ function onRowMenu(key: string, track: PlaylistTrack) {
 }
 
 /**
- * 「从音乐库移除」的二次确认 + 执行。
+ * 「从音乐库移除」的二次确认与执行。
  *
- * 确认文案要同时说清三件事：不删文件、可以从哪里撤销、以及它会让这首歌从列表里消失
- * （用户点完看到的第一个现象就是"列表少了一首"，不说清楚会以为出了 bug）。
+ * 确认文案需同时说明三件事：不删除文件、可在何处撤销、以及该曲目将从列表中消失
+ * （操作后的直接现象是"列表少了一首"，缺少说明会被判断为缺陷）。
  */
 function confirmExclude(track: PlaylistTrack) {
-  // 已失效的条目：文件已经不在媒体库里，没有"从库里移除"这回事。
-  // 拦在这里而不是在 rowMenuOptions 里，是因为那份 options 是所有行共用的一份（见那里的注释）。
+  // 已失效条目：文件已不在媒体库中，不存在"从库中移除"的操作。
+  // 在此处拦截而非在 rowMenuOptions 中，因为该 options 由所有行共用（见相关注释）。
   if (track.missing) {
     message.warning('这首歌的文件已不在媒体库，无需移除');
     return;
@@ -1281,10 +1241,10 @@ function confirmExclude(track: PlaylistTrack) {
 async function doExclude(track: PlaylistTrack) {
   try {
     const r = await excludePaths(api, 'add', [track.path]);
-    if (!r) return; // 取消（组件卸载）：不弹任何 toast
+    if (!r) return; // 取消（组件卸载）：不显示任何提示
     message.success(excludeResultText('add', r));
-    // 被排除的路径**从 /list 的结果里直接消失**，所以必须重拉列表，不能只改本地数组 ——
-    // 本地删一行的话，刷新后它又会回来（core 侧过滤才是唯一真相）。
+    // 被排除的路径**会直接从 /list 结果中消失**，因此必须重新拉取列表，不能仅修改本地数组 ——
+    // 本地删除的行在刷新后会重新出现（core 侧过滤才是唯一数据来源）。
     reload();
     if (activePlaylistId.value) await loadPlaylistTracks(activePlaylistId.value);
   } catch (e: any) {
@@ -1386,7 +1346,7 @@ async function submitName() {
 function confirmRemovePlaylist(entry: PlaylistEntry) {
   dialog.warning({
     title: '删除歌单',
-    // 说清"不删文件"：歌单里存的是路径，用户很容易以为删歌单会连歌一起删
+    // 明确"不删除文件"：歌单中保存的是路径，容易被理解为删除歌单会一并删除曲目
     content: `删除歌单「${entry.name}」？里面的 ${entry.count} 首歌不会被删除。`,
     positiveText: '删除',
     negativeText: '取消',
@@ -1394,7 +1354,7 @@ function confirmRemovePlaylist(entry: PlaylistEntry) {
       try {
         await deletePlaylist(api, entry.id);
         message.success('歌单已删除');
-        // 正在看的就是它：退回歌单列表，但**不停止播放**
+        // 当前正在查看的歌单：退回歌单列表，但**不停止播放**
         if (activePlaylistId.value === entry.id) selectPlaylist(null);
         await reloadPlaylists();
       } catch (e: any) {
@@ -1407,8 +1367,8 @@ function confirmRemovePlaylist(entry: PlaylistEntry) {
 onMounted(() => document.addEventListener('keydown', onAudioKeydown));
 
 onMounted(() => {
-  // 队列来源要从 store 恢复：用户上次在放"某个歌单/某个分组"里的歌，刷新回到这一页
-  // 不该被重置成"全部音乐" —— 否则顶栏那条还在放，列表却指向别处，上/下一首也会错。
+  // 队列来源需从 store 恢复：上次播放的是某个歌单 / 分组中的曲目时，刷新回到本页
+  // 不应重置为"全部音乐" —— 否则顶栏仍在播放，列表却指向其它来源，上 / 下一首随之错误。
   const src = player.source;
   if (src?.kind === 'playlist') {
     browseMode.value = 'playlist';
@@ -1423,16 +1383,15 @@ onMounted(() => {
   if (activePlaylistId.value) void loadPlaylistTracks(activePlaylistId.value);
   if (activeGroup.value) void loadGroupTracks(activeGroup.value);
 });
-// 2026-10-14：这里**不再有 onUnmounted 停播**。
-// 原来卸载时会 `audioEl.pause()` 并把音量落盘 —— 那正是"切页就停播"的根因。
-// 现在 `<audio>` 与音量都归全局 store（见 stores/player.ts），
-// 页面卸载与停止播放是两件互不相干的事。
+// 此处**不注册 onUnmounted 停播**：页面卸载时暂停 `audioEl` 并持久化音量会导致
+// 切换页面即中断播放。`<audio>` 与音量均归全局 store（见 stores/player.ts），
+// 页面卸载与停止播放是两件互不相关的事。
 
 /**
- * 实时：另一端（app）改了歌单集合就立即对齐。
+ * 实时同步：另一端（app）修改歌单集合后立即对齐。
  *
- * 自己的写操作也会收到这一帧，于是会多重拉一次 —— 与 `views/tasks` 同一取舍：
- * 多一次 GET 换"两端永远一致"，比为自己的写操作去重更省心。
+ * 自身写操作也会收到该事件，因而会重复拉取一次 —— 与 `views/tasks` 采用同一取舍：
+ * 以一次额外的 GET 换取两端一致，比为自身写操作去重的实现成本更低。
  */
 const unsubPlaylists = wsStore.on('data_changed', (payload: any) => {
   if (String(payload?.changed ?? '') !== WsDataTopic.MEDIA_PLAYLISTS) return;
@@ -1451,8 +1410,8 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   flex-direction: column;
   height: 100%;
   min-height: 0;
-  /* 列表必须被页面裁住：否则滚动容器的行会穿出页面、
-     看起来像"播放条浮在列表中间"（2026-10-23 实机截图问题）。 */
+  /* 列表必须由页面裁剪：否则滚动容器的行会溢出到页面之外，
+     呈现为"播放条浮在列表中间"。 */
   overflow: hidden;
 }
 
@@ -1498,64 +1457,19 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   justify-content: flex-end;
   min-width: 0;
 }
-/* ── 分类页签：细下划线式，不再是一排灰色胶囊 ── */
+/* ── 分类页签：细下划线式，不使用胶囊按钮 ── */
+/* 页签容器：交互与下划线交给 n-tabs，这里只负责占满宽度、不产生横向溢出 */
 .source-tabs {
-  display: flex;
-  align-items: center;
-  gap: 2px;
   align-self: stretch;
-  border-bottom: 1px solid var(--border-subtle);
-  overflow-x: auto;
-  scrollbar-width: none;
+  min-width: 0;
 }
-.source-tabs::-webkit-scrollbar {
-  display: none;
-}
-.source-tabs button {
-  position: relative;
-  flex: none;
-  border: 0;
-  background: none;
-  padding: 8px 14px;
-  font: inherit;
-  font-size: 13px;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: color 0.15s ease;
-}
-.source-tabs button:hover {
-  color: var(--text-primary);
-}
-.source-tabs button.on {
-  color: var(--text-primary);
-  font-weight: 600;
-}
-.source-tabs button.on::after {
-  content: '';
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: -1px;
-  height: 2px;
-  border-radius: 2px;
-  background: var(--accent-color);
+.source-tabs :deep(.n-tabs-nav-scroll-content) {
+  gap: 2px;
 }
 
-/* 列表头的「‹ 歌单 / ‹ 专辑」返回上一层 */
+/* 返回按钮使用公共 n-button 后仅承担布局职责 */
 .list-back {
   flex: none;
-  border: 0;
-  background: none;
-  border-radius: var(--radius-sm);
-  padding: 3px 7px 3px 3px;
-  font: inherit;
-  font-size: var(--font-sm);
-  color: var(--text-secondary);
-  cursor: pointer;
-}
-.list-back:hover {
-  color: var(--text-primary);
-  background: var(--surface-hover);
 }
 
 /* 歌单 / 分组浏览列表：占满列表区，原生滚动 */
@@ -1565,9 +1479,139 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   min-height: 0;
   min-width: 0;
   width: 100%;
-  /* 宽屏上不要把 40px 的封面拉到 1200px 另一端：内容限宽，
-     计数和「⋯」仍在右侧，但不会隔着一整屏空白。 */
-  max-width: 920px;
+  /* 不在此处限制宽度：≥1100px 时列表按 GroupBrowserPanel 的自动列数排成多列，
+     固定 920px 会使宽屏右半区留空。 */
+  max-width: none;
+}
+/* 歌单网格：与同页「专辑 / 艺人 / 文件夹」的网格（GroupBrowserPanel）采用同一套版式 ——
+   无边框卡片 + 8px 内距 + 圆角方形封面 + 名称与首数，右上角绝对定位「⋯」。
+   `.browse-row` 在网格模式下必须 stretch：沿用 center 会把子项压成内容宽度（实测 46px），
+   封面缩为小方块居于卡片中央。 */
+.browse-scroll.is-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 14px;
+  align-content: start;
+  padding: 4px;
+}
+.browse-scroll.is-grid .list-empty {
+  grid-column: 1 / -1;
+}
+.browse-scroll.is-grid .browse-row {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  padding: 8px;
+  border-radius: var(--radius-md);
+}
+.browse-scroll.is-grid .browse-row:hover {
+  background: var(--surface-hover);
+}
+.browse-scroll.is-grid .browse-main {
+  /* 竖向撑满卡片：名称贴着封面、「N 首」用 margin-top:auto 钉在底部，
+     同一行卡片等高时计数基线才会齐（比给标题预留两行更自然）。 */
+  flex: 1;
+  width: 100%;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 0;
+  border-radius: 0;
+}
+.browse-scroll.is-grid .browse-cover {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-subtle);
+  font-size: 28px;
+}
+.browse-scroll.is-grid .browse-text {
+  flex: none;
+  padding: 0;
+}
+.browse-scroll.is-grid .browse-text b {
+  font-size: var(--font-base);
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  line-height: 1.4;
+}
+.browse-scroll.is-grid .browse-count {
+  margin: auto 0 0;
+  padding: 0;
+}
+/* 直接定位「⋯」按钮本身：n-dropdown 不生成包裹元素，
+   `.browse-row > .n-dropdown` 这类选择器不会匹配，按钮会退回正常流。 */
+.browse-scroll.is-grid .browse-more {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  margin: 0;
+  background: color-mix(in srgb, var(--card-bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.browse-scroll {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  padding-bottom: 8px;
+}
+/* 列表模式：与「歌曲列表」采用同一套表头与平铺行。
+   歌单 / 分组列表与曲目表必须使用同一容器语言：表头一行（名称 / 歌曲数）+
+   无边框平铺行 + 整行悬停，与歌曲表结构一致。 */
+.browse-table-head {
+  flex: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  align-items: center;
+  padding: 0 14px 0 8px;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: var(--font-xs);
+}
+.browse-table-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+.browse-table-head .bh-name {
+  /* 36 封面 + 10 gap = 46：表头文字与行内标题同一条基线 */
+  padding-left: 46px;
+}
+.browse-table-head .bh-count {
+  text-align: right;
+}
+.browse-scroll:not(.is-grid) {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+}
+.browse-scroll:not(.is-grid) .browse-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px;
+  align-items: center;
+  padding-right: 4px;
+  border-radius: var(--radius-md);
+}
+.browse-scroll:not(.is-grid) .browse-row:hover {
+  background: var(--surface-hover);
+}
+.browse-scroll:not(.is-grid) .browse-main {
+  padding: 6px 8px;
+  gap: 10px;
+}
+.browse-scroll:not(.is-grid) .browse-cover {
+  width: 36px;
+  height: 36px;
 }
 .browse-scroll {
   overflow-y: auto;
@@ -1584,8 +1628,9 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 .browse-row {
   display: flex;
   align-items: center;
-  border-radius: var(--radius-md);
-  /* 长列表只渲染视口内的行，避免切分类时一次性布局所有歌单/分组 */
+  min-width: 0;
+  border-radius: var(--radius-sm);
+  /* 长列表切换分类时避免一次性布局全部歌单 / 分组 */
 }
 .browse-row:hover {
   background: var(--surface-hover);
@@ -1595,11 +1640,11 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   border: 0;
   background: none;
-  border-radius: var(--radius-md);
-  padding: 10px 8px;
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
   font: inherit;
   color: inherit;
   text-align: left;
@@ -1607,8 +1652,8 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .browse-cover {
   flex: none;
-  width: 44px;
-  height: 44px;
+  width: 36px;
+  height: 36px;
   display: grid;
   place-items: center;
   border-radius: var(--radius-sm);
@@ -1623,7 +1668,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   gap: 2px;
 }
 .browse-text b {
-  font-size: 13px;
+  font-size: var(--font-md);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -1631,8 +1676,9 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .browse-count {
   flex: none;
-  margin-left: 12px;
-  font-size: 11px;
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1666,10 +1712,10 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   gap: 8px;
   padding: 6px 8px 8px;
 }
-/* 歌单/分组浏览时列表限宽 920px，标题与「新建歌单」也跟列表同宽 */
+/* 歌单/分组浏览时标题与「新建歌单」跟着列表走；列表已铺满，这里不再限宽 */
 .list-head.is-browse {
   width: 100%;
-  max-width: 920px;
+  max-width: none;
 }
 .list-title {
   min-width: 0;
@@ -1682,7 +1728,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .list-count {
   flex: none;
-  font-size: var(--font-xs);
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -1693,18 +1739,26 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 .list-actions {
   display: flex;
   align-items: center;
-  gap: 4px;
+  /* 4px 时三个孪生按钮贴在一起，误点率高；与文件列表同一套间距语言 */
+  gap: 6px;
   flex: none;
+}
+
+/* 仅含「⋯」的按钮使用方形命中区（列宽 34px，28px 不会破坏布局）。
+   高度与字号统一交给 naive 的 size="small"，不另行定义尺寸。 */
+.browse-more,
+.q-more {
+  min-width: 28px;
 }
 .list-spin {
   flex: 1;
   min-height: 0;
   overflow: hidden;
 }
-/* n-spin 会把内容包一层 `.n-spin-content`，它默认按内容高度长。
-   列表有 60 条时这层会到 2900px+，滚动容器因此拿不到可滚动高度（实测
-   `.list-spin` 327px、`.n-spin-content` 2934px），列表被裁掉、播放条位置也失去约束。
-   撑满后原生滚动容器才真正在列表内部滚。与 PlaylistPanel 的 `.pl-spin` 同一手法。 */
+/* n-spin 会将内容包一层 `.n-spin-content`，该层默认按内容高度增长。
+   列表达到 60 条时该层可达 2900px+，滚动容器因此无法取得可滚动高度（实测
+   `.list-spin` 327px、`.n-spin-content` 2934px），列表被裁剪且播放条位置失去约束。
+   撑满高度后原生滚动容器才会在列表内部滚动。与 PlaylistPanel 的 `.pl-spin` 同一做法。 */
 .list-spin :deep(.n-spin-content) {
   height: 100%;
 }
@@ -1725,10 +1779,10 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 .table-head {
   display: grid;
   /* 外层与 `.queue-row` 同构：1fr 内容列 + 34px「更多」列。
-     表头单元格放进 `.th-main`，它的栅格与 `.queue-item` 逐列一致 —— 之前表头直接
-     用 6 列、行是 5 列套 34px，艺人/专辑/时长会左偏 5–10px（2026-10-23 实测）。
-     右侧 14px = 8px 基础内边距 + 6px 原生滚动条预留；列表内容宽度同样少了 6px。 */
-  grid-template-columns: minmax(0, 1fr) 34px;
+     表头单元格置于 `.th-main` 内，其栅格与 `.queue-item` 逐列一致；若表头直接使用
+     6 列而行为 5 列加 34px，艺人 / 专辑 / 时长列会左偏 5–10px。
+     右侧 14px = 8px 基础内边距 + 6px 原生滚动条预留；列表内容宽度同样减少 6px。 */
+  grid-template-columns: minmax(0, 1fr) 44px;
   align-items: center;
   padding: 0 14px 0 8px;
   border-bottom: 1px solid var(--border-subtle);
@@ -1747,7 +1801,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .queue-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 34px;
+  grid-template-columns: minmax(0, 1fr) 44px;
   align-items: center;
   border-radius: var(--radius-md);
 }
@@ -1779,7 +1833,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .q-index {
   text-align: right;
-  font-size: var(--font-xs);
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1810,7 +1864,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .q-title {
   display: block;
-  font-size: 13px;
+  font-size: var(--font-md);
   color: var(--text-primary);
   white-space: nowrap;
   overflow: hidden;
@@ -1826,7 +1880,7 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .q-artist,
 .q-album {
-  font-size: 12px;
+  font-size: var(--font-base);
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
@@ -1834,11 +1888,14 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 }
 .q-dur {
   text-align: right;
-  font-size: var(--font-xs);
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
+/* 时长列与「更多操作」之间的间距：外层「更多」列由 34px 改为 44px，
+   按钮左移 6px 以留出间隔（右侧相应减少 2px，保证按钮仍在列内并与表头列边界对齐）。 */
 .q-more {
+  margin-left: 6px;
   margin-right: 4px;
 }
 .list-more {
@@ -2029,31 +2086,51 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   color: var(--stage-button-ink);
   cursor: pointer;
   font-size: 12px;
-  /* 中文按钮在 390px 顶栏里曾被挤成两行（40px 宽 × 46px 高）；
-     按钮不参与收缩，宽度不够时由标题先让位。 */
+  /* 中文按钮在 390px 顶栏中会被挤成两行（40px 宽 × 46px 高）；
+     按钮不参与收缩，宽度不足时由标题先让位。 */
   white-space: nowrap;
 }
 .im-top button:hover {
   background: var(--stage-soft-hover);
 }
+/* 仅含图标的按钮必须显式定义尺寸。
+   `.im-top button` 的 `padding: 5px 9px`（移动端 5px 7px）是为**带文字**的按钮设计的：
+   套用在 16px 图标上时，按钮尺寸由「图标 + 行盒」决定，而 inline 图标基线下方仍保留
+   字体度量的空隙，纵向位置因而偏上，表现为右上角全屏钮图标未居中。
+   此处定义为 32×32 方格并使用 grid 居中，横纵均由盒模型对齐，不受字体度量影响。
+   圆角沿用继承的 8px，不为该处单独更换形状。 */
+.im-top .im-fullscreen {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+}
 .im-body {
   flex: 1;
   min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(0, 340px) minmax(0, 1fr);
-  /* 单行吃满内容区高度：歌词面板必须是「有确定高度」的滚动容器，
-     否则 .lyrics-panel 的 height:100% 会退化成内容高度（5000px），
-     由外层 overflow:hidden 裁掉，既不能滑也不会自动居中。 */
-  grid-template-rows: minmax(0, 1fr);
-  gap: 40px;
-  padding: 4px 40px 10px;
+  display: flex;
+  align-items: stretch;
+  /* 左右分开：封面靠左、歌词靠右，两侧保留页面边距；中间空白由 space-between 吃掉。 */
+  justify-content: space-between;
+  gap: clamp(32px, 6vw, 120px);
+  padding: 4px clamp(24px, 6vw, 96px) 10px;
   overflow: hidden;
+}
+.im-body .im-track {
+  flex: 0 1 380px;
+  width: auto;
+  min-width: 220px;
+}
+.im-body .im-lyrics {
+  flex: 0 1 620px;
+  min-width: 260px;
 }
 .im-track {
   align-self: center;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 20px;
   min-width: 0;
   width: 100%;
 }
@@ -2114,8 +2191,8 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   flex: 1;
   min-height: 0;
 }
-/* 歌词面板内部用的是全局 text 令牌；沉浸层不跟随主题，必须在这里覆盖成
-   中性浅色，否则浅色主题下“当前行”会变成深灰、几乎看不见。 */
+/* 歌词面板内部使用全局 text 令牌；沉浸层不跟随主题，必须在此处覆盖为
+   中性浅色，否则浅色主题下当前行会呈现为深灰、对比度不足。 */
 .im-lyrics :deep(.lyrics-line) {
   color: var(--stage-lyric);
 }
@@ -2134,12 +2211,19 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
 .im-lyrics :deep(.empty-hint) {
   color: var(--stage-dim);
 }
-.lyrics-hidden .im-lyrics {
-  display: none;
+.lyrics-panel-fade-enter-active,
+.lyrics-panel-fade-leave-active {
+  transition:
+    opacity 0.36s ease,
+    transform 0.36s ease;
+}
+.lyrics-panel-fade-enter-from,
+.lyrics-panel-fade-leave-to {
+  opacity: 0;
+  transform: translateX(14px);
 }
 .lyrics-hidden .im-body {
-  grid-template-columns: 1fr;
-  justify-items: center;
+  justify-content: center;
 }
 .lyrics-hidden .im-track {
   max-width: 340px;
@@ -2186,8 +2270,8 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
     display: none;
   }
   .queue-item {
-    /* q-index / q-artist / q-album 在下面被隐藏；列数必须同步收成 2 列。
-       保留 44px 第一列会让 q-main 被塞进 44px，歌名宽度变成 0（2026-10-23 修）。 */
+    /* q-index / q-artist / q-album 在下方被隐藏，列数必须同步收为 2 列。
+       保留 44px 第一列会使 q-main 被压缩到 44px，歌名宽度变为 0。 */
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
     padding: 8px 4px;
@@ -2327,6 +2411,20 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   .mini-btn:hover {
     background: var(--surface-hover);
   }
+  /* 播放键与播放条 / 沉浸层使用同一控件语言：深色实心圆 + 表面色图标。
+     使用 32px 透明图标钮会与沉浸层的实心圆不一致，同一"播放"操作呈现为不同控件。
+     尺寸按迷你条密度取 36（封面为 38），形状、配色与悬停状态与两条控制条保持一致。 */
+  .mini-btn--play {
+    width: 36px;
+    height: 36px;
+    background: var(--text-primary);
+    color: var(--card-bg);
+    flex: none;
+  }
+  .mini-btn--play:hover {
+    background: var(--text-primary);
+    opacity: 0.9;
+  }
   /* 队列浮层的宽度交给 QueuePop 自己；这里只把它钉在 dock 上沿，
      并覆盖桌面档的 right:16px，让手机左右各留 8px。 */
   .player-dock .queue-pop,
@@ -2336,11 +2434,21 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
     width: auto;
   }
   .im-body {
-    grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     gap: 10px;
     padding: 0 16px 6px;
-    justify-items: center;
+  }
+  .im-body .im-track {
+    flex: 0 1 auto;
+    width: 100%;
+    min-width: 0;
+  }
+  .im-body .im-lyrics {
+    flex: 0 1 auto;
+    width: 100%;
+    min-width: 0;
   }
   .im-cover {
     width: min(62vw, 240px);
@@ -2364,10 +2472,14 @@ onUnmounted(() => document.removeEventListener('keydown', onAudioKeydown));
   .queue-pop {
     transition: none;
   }
+  .lyrics-panel-fade-enter-active,
+  .lyrics-panel-fade-leave-active {
+    transition: none;
+  }
 }
-/* ── 响应式列（放在最后：覆盖上面的基础栅格，保证顺序稳定） ──
-   必须排除 ≤768：手机档把 q-index/q-artist/q-album 隐藏后只用两列，
-   这条四列规则若继续命中手机，会把 q-main 重新塞回 24px 第一列。 */
+/* ── 响应式列（置于最后：覆盖上方基础栅格，保证顺序稳定） ──
+   必须排除 ≤768：移动端隐藏 q-index / q-artist / q-album 后仅使用两列，
+   该四列规则若继续命中移动端，会把 q-main 重新压回 24px 第一列。 */
 @media (min-width: 769px) and (max-width: 1024px) {
   .th-main {
     grid-template-columns: 24px minmax(0, 1.6fr) minmax(0, 1fr) 52px;

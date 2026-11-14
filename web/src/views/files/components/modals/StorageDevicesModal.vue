@@ -16,105 +16,73 @@
     preset="card"
     title="存储与外接设备"
     class="modal-fit storage-devices-modal"
-    style="--modal-w: 560px"
+    style="--modal-w: 480px"
     :bordered="false"
   >
     <!-- 宽高与滚动由全局 .modal-fit 统一约束：头尾固定，内容区自己滚，
          卡片不会被不可预知长度的列表顶出视口 -->
     <div class="sd-body">
-      <!-- ── 本机卷（内部存储 / SD 卡 / U 盘）── -->
-      <section class="sd-section">
-        <div class="sd-section-head">
-          <span class="sd-section-title">本机存储</span>
-          <span class="sd-section-hint">{{ browsingRemote ? '当前浏览的是远端源' : '点击切换到该存储' }}</span>
-        </div>
+      <!-- 一行摘要：几个卷、几个远端源。不给"合计容量"——
+           卷的容量是格式化字符串（17.0G），再解析回来求和容易和实际值不一致。 -->
+      <p class="sd-sum">
+        {{ volumes.length }} 个本机卷 · {{ remoteSources.length }} 个远端源
+        <span v-if="browsingRemote" class="sd-sum-note">当前在远端源</span>
+      </p>
 
-        <!-- 打开弹窗时就地刷新读数，所以先有一瞬间「列表还是空的」：
-             那一段必须显示「正在读取」而不是「还没有读到」，否则每次打开都闪一次失败腔调 -->
-        <div v-if="loading && !volumes.length" class="sd-empty">正在读取本机存储信息…</div>
-        <div v-else-if="volumes.length" class="sd-vol-list">
-          <button
-            v-for="d in volumes"
-            :key="d.mount || d.label"
-            type="button"
-            class="sd-vol"
-            :class="{ 'is-current': isCurrentVolume(d.mount) }"
-            :aria-current="isCurrentVolume(d.mount) ? 'true' : undefined"
-            @click="pickVolume(d.mount)"
-          >
-            <div class="sd-vol-head">
-              <span class="sd-vol-label">{{ d.label }}</span>
-              <ValueBadge v-if="isCurrentVolume(d.mount)" class="sd-badge" size="sm" value="当前" />
-              <span class="sd-vol-pct">{{ d.usedPct }}<small>% 已用</small></span>
-            </div>
+      <!-- ── 本机存储：一行一个卷，点整行切换 ── -->
+      <div class="sd-label">本机存储</div>
+      <div v-if="loading && !volumes.length" class="sd-empty">正在读取本机存储信息…</div>
+      <div v-else-if="volumes.length" class="sd-list">
+        <button
+          v-for="d in volumes"
+          :key="d.mount || d.label"
+          type="button"
+          class="sd-row"
+          :class="{ 'is-current': isCurrentVolume(d.mount) }"
+          :aria-current="isCurrentVolume(d.mount) ? 'true' : undefined"
+          :disabled="!d.mount"
+          @click="pickVolume(d.mount)"
+        >
+          <span class="sd-glyph">▣</span>
+          <span class="sd-who">
+            <span class="sd-name" :title="d.label">{{ d.label }}</span>
+            <span class="sd-kind" :title="d.mount">{{ d.mount || '未知挂载点' }}</span>
+          </span>
+          <span class="sd-size">
+            <b>{{ d.available }}</b>
+            <small>共 {{ d.size }}</small>
+          </span>
+          <span v-if="isCurrentVolume(d.mount)" class="sd-tag">当前</span>
+          <span v-else class="sd-switch">切换</span>
+        </button>
+      </div>
+      <div v-else class="sd-empty">还没有读到本机存储信息，请稍后刷新。</div>
 
-            <div class="sd-bar">
-              <i
-                :style="{
-                  width: d.usedPct + '%',
-                  background: d.usedPct > 90 ? 'var(--error)' : 'var(--accent-color)',
-                }"
-              />
-            </div>
+      <!-- ── 远端存储源：同一套行，协议走 chip；点整行切换 ── -->
+      <div class="sd-label">远端存储源</div>
+      <div v-if="remoteSources.length" class="sd-list">
+        <button
+          v-for="s in remoteSources"
+          :key="s.id"
+          type="button"
+          class="sd-row"
+          :class="{ 'is-current': isCurrentRemote(s.id) }"
+          :aria-current="isCurrentRemote(s.id) ? 'true' : undefined"
+          @click="pickRemote(s.id)"
+        >
+          <span class="sd-proto">{{ protoLabel(s.protocol) }}</span>
+          <span class="sd-who">
+            <span class="sd-name" :title="s.label || s.id">{{ s.label || s.id }}</span>
+            <span class="sd-kind mono" :title="addrOf(s)">{{ addrOf(s) }}</span>
+          </span>
+          <span v-if="isCurrentRemote(s.id)" class="sd-tag">当前</span>
+          <span v-else class="sd-switch">切换</span>
+        </button>
+      </div>
+      <div v-else class="sd-empty">
+        还没有配置远端存储源。配置后，远端目录会和本机卷一样出现在文件列表里，可直接浏览、上传与下载。
+      </div>
 
-            <div class="sd-stats stat-grid">
-              <div class="stat-cell">
-                <span class="stat-label">可用空间</span>
-                <span class="stat-value">{{ d.available }}</span>
-              </div>
-              <div class="stat-cell">
-                <span class="stat-label">已用空间</span>
-                <span class="stat-value">{{ d.used }}</span>
-              </div>
-              <div class="stat-cell">
-                <span class="stat-label">总容量</span>
-                <span class="stat-value">{{ d.size }}</span>
-              </div>
-            </div>
-
-            <div v-if="d.mount" class="sd-mount">
-              <span>挂载点</span><b class="mono">{{ d.mount }}</b>
-            </div>
-            <div v-if="d.mount && !isCurrentVolume(d.mount)" class="sd-enter">点击切换到此存储</div>
-          </button>
-        </div>
-        <div v-else class="sd-empty">还没有读到本机存储信息，请稍后刷新。</div>
-      </section>
-
-      <!-- ── 远端存储源（2026-10-14）：只列启用中的源，停用的源在 core 侧同样不可解析 ── -->
-      <section class="sd-section">
-        <div class="sd-section-head">
-          <span class="sd-section-title">远端存储源</span>
-          <span class="sd-section-hint">FTP / WebDAV / SMB / S3</span>
-        </div>
-
-        <div v-if="remoteSources.length" class="sd-remote-list">
-          <button
-            v-for="s in remoteSources"
-            :key="s.id"
-            type="button"
-            class="sd-remote"
-            :class="{ 'is-current': isCurrentRemote(s.id) }"
-            :aria-current="isCurrentRemote(s.id) ? 'true' : undefined"
-            @click="pickRemote(s.id)"
-          >
-            <div class="sd-remote-main">
-              <div class="sd-remote-title">
-                <span class="sd-remote-label">{{ s.label || s.id }}</span>
-                <ValueBadge class="sd-proto" size="sm" :value="protoLabel(s.protocol)" />
-                <ValueBadge v-if="isCurrentRemote(s.id)" class="sd-badge" size="sm" value="当前" />
-              </div>
-              <div class="sd-remote-addr">{{ addrOf(s) }}</div>
-              <div v-if="capsTextOf(s)" class="sd-remote-caps">{{ capsTextOf(s) }}</div>
-            </div>
-          </button>
-        </div>
-        <div v-else class="sd-empty">
-          还没有配置远端存储源。配置后，远端目录会和本机卷一样出现在文件列表里，可直接浏览、上传与下载。
-        </div>
-      </section>
-
-      <!-- 两个管理入口：原来贴在 popover 底部，现在放在内容区末尾（窄屏可换行，不挤页脚） -->
       <div class="sd-links">
         <n-button text type="primary" size="small" @click="emit('manage-sources')">管理远端存储源…</n-button>
         <n-button text type="primary" size="small" @click="emit('open-push')">
@@ -122,12 +90,6 @@
         </n-button>
       </div>
     </div>
-
-    <template #footer>
-      <div class="sd-footer">
-        <n-button size="small" @click="show = false">关闭</n-button>
-      </div>
-    </template>
   </n-modal>
 </template>
 
@@ -153,8 +115,7 @@
  * 弹窗留着会挡住刚打开的列表。
  */
 import { computed } from 'vue';
-import ValueBadge from '@/components/ValueBadge.vue';
-import { REMOTE_PREFIX, capsTextOf, diskPercent, normalizePath, volumeRootOf } from '../../filesShared';
+import { REMOTE_PREFIX, diskPercent, normalizePath, volumeRootOf } from '../../filesShared';
 
 const props = withDefaults(
   defineProps<{
@@ -268,223 +229,204 @@ function addrOf(s: any): string {
 
 <style scoped>
 /**
- * 配色/圆角/间距一律走 main.css 的令牌，不写死取值（check-ui-baseline.mjs 卡增量）。
- * 自适应策略：
- *   · 宽高都交给全局 `.modal-fit`（main.css）：宽 = min(560px, 视口 − 32/24px)，
- *     高 = min(720px, 视口 − 48/24px)，头尾固定、内容区自己滚；
- *   · 卷卡片的三列读数在窄屏折成两列，长挂载点用 anywhere 断行，不产生横向溢出。
+ * 2026-11-07 改版：从"一个卷一张卡（标题/进度条/三列读数/挂载点）"改成
+ * **一行一个卷**，本机卷与远端源共用同一套行样式。
+ *
+ * 取舍：卡片能塞下比例条与三列读数，但四张卡就要滚屏，且同一套字段重复四遍；
+ * 个人设备上"哪个还有空间"才是主问题，一行里"可用 / 总量 + 当前/切换"足够回答。
+ * 宽高与滚动仍交给全局 `.modal-fit`（头尾固定、内容区自己滚）。
  */
 .sd-body {
   min-width: 0;
 }
 
-.sd-section + .sd-section {
-  margin-top: var(--space-4);
+.sd-sum {
+  margin: 0 0 var(--space-2);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.sd-sum-note {
+  margin-left: 6px;
+  color: var(--accent-color);
 }
 
-.sd-section-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-2);
-  margin-bottom: var(--space-2);
-  flex-wrap: wrap;
-}
-.sd-section-title {
-  font-size: var(--font-sm);
+.sd-label {
+  /* 吸顶：滚动容器是 naive 的 .n-card-content，长列表里始终能看到"自己在看哪一段" */
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--card-bg);
+  margin: var(--space-3) 0 var(--space-1);
+  font-size: 11px;
   font-weight: 600;
-  color: var(--text-secondary);
-}
-.sd-section-hint {
-  font-size: var(--font-xs);
+  letter-spacing: 0.04em;
   color: var(--text-muted);
 }
 
-.sd-vol-list,
-.sd-remote-list {
+.sd-list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
 }
 
-/* 整张卡就是切换入口：用原生 button 拿键盘/回车，同时把浏览器默认外观清零 */
-.sd-vol,
-.sd-remote {
-  appearance: none;
-  display: block;
+/* 一行：图标 / 名称+地址 / 可用+总量 / 当前|切换 */
+.sd-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   width: 100%;
-  margin: 0;
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: var(--card-bg);
+  padding: 10px 6px;
+  border: 0;
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
-  transition:
-    background 0.15s ease,
-    box-shadow 0.15s ease;
+  border-radius: var(--radius-sm);
 }
-.sd-vol:hover,
-.sd-remote:hover {
+.sd-row:hover:not(:disabled) {
   background: var(--surface-hover);
 }
-.sd-vol.is-current,
-.sd-remote.is-current {
+.sd-row.is-current {
   background: var(--accent-color-light);
-  box-shadow: inset 3px 0 0 var(--accent-color);
   cursor: default;
 }
+.sd-row:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
 
-.sd-vol-head {
+.sd-glyph,
+.sd-proto {
+  flex: none;
+  width: 30px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--surface-elevated);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.sd-proto {
+  width: 52px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--accent-color);
+  background: var(--accent-color-light);
+}
+
+.sd-who {
+  flex: 1;
+  min-width: 0;
   display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 1px;
 }
-.sd-vol-label {
-  font-size: var(--font-md);
+.sd-name {
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-primary);
-  overflow-wrap: anywhere;
-}
-/* 「当前」徽标与协议 chip 都是 ValueBadge（原先各写一份 999px 胶囊）；
-   这里只保留「不许被长名字挤扁」这一条布局约束，配色交给组件与令牌。 */
-.sd-badge {
-  flex-shrink: 0;
-}
-.sd-vol-pct {
-  margin-left: auto;
-  font-size: var(--font-lg);
-  font-weight: 600;
-  color: var(--text-primary);
-  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
-.sd-vol-pct small {
-  margin-left: 2px;
-  font-size: var(--font-xs);
-  font-weight: 400;
+.sd-kind {
+  font-size: 11px;
   color: var(--text-muted);
-}
-
-.sd-bar {
-  height: 8px;
-  margin: var(--space-2) 0;
-  border-radius: var(--radius-pill);
-  background: var(--border-subtle);
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.sd-bar > i {
-  display: block;
-  height: 100%;
-  transition: width 0.4s ease;
-}
-
-/* 三列读数走全局 `.stat-grid / .stat-cell`，这里只把列数从 auto-fit 收窄成固定三列
-   （scoped 选择器特异性高于 main.css，无需改全局） */
-.sd-stats {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+.sd-kind.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-.sd-mount {
+.sd-size {
+  flex: none;
   display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-  font-size: var(--font-xs);
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+.sd-size b {
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+.sd-size small {
+  font-size: 11px;
   color: var(--text-muted);
-  min-width: 0;
+  font-variant-numeric: tabular-nums;
 }
-.sd-mount > span {
-  flex-shrink: 0;
+
+/* 当前 = 标签；其余 = 一个不抢眼的「切换」提示（整行都可点） */
+.sd-tag {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--accent-color);
+  background: var(--accent-color-light);
 }
-.sd-mount > b {
-  min-width: 0;
-  font-weight: 400;
+.sd-switch {
+  flex: none;
+  padding: 2px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
   color: var(--text-secondary);
-  word-break: break-all;
 }
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-.sd-enter {
-  margin-top: var(--space-1);
-  font-size: var(--font-xs);
+.sd-row:hover:not(:disabled) .sd-switch {
+  border-color: var(--accent-color);
   color: var(--accent-color);
 }
 
-.sd-remote-main {
-  min-width: 0;
-}
-.sd-remote-title {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
-}
-.sd-remote-label {
-  font-size: var(--font-md);
-  font-weight: 600;
-  color: var(--text-primary);
-  overflow-wrap: anywhere;
-}
-.sd-proto {
-  flex-shrink: 0;
-}
-.sd-remote-addr {
-  margin-top: 2px;
-  font-size: var(--font-sm);
-  color: var(--text-secondary);
-  word-break: break-all;
-}
-.sd-remote-caps {
-  margin-top: 2px;
-  font-size: var(--font-xs);
-  color: var(--text-muted);
-  overflow-wrap: anywhere;
-}
-
 .sd-empty {
-  padding: var(--space-3);
-  border: 1px dashed var(--border-subtle);
-  border-radius: var(--radius-md);
-  font-size: var(--font-sm);
-  line-height: 1.6;
+  padding: 10px 6px;
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--text-muted);
+  border-top: 1px solid var(--border-subtle);
 }
 
 .sd-links {
   display: flex;
-  align-items: center;
-  gap: var(--space-4);
   flex-wrap: wrap;
-  margin-top: var(--space-4);
-  padding-top: var(--space-3);
-  border-top: 1px solid var(--border-subtle);
+  gap: 12px;
+  margin-top: var(--space-3);
 }
 
-.sd-footer {
-  display: flex;
-  justify-content: flex-end;
-}
-
-/* 窄屏（断点 2026-10-21 由 480 并回 768）：三列读数折两列，
-   避免每列只剩 60px 时数字被拆行 */
-@media (max-width: 768px) {
-  .sd-stats {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+/* 窄屏（≤420，含 320 宽的老机型）：模态宽 = 视口 − 24，内容区再减 padding，
+   360 下留给"名称"的宽度只剩 ~110px。收紧图标/间距/次要字号，把空间让给名称，
+   名称与地址本来就有 ellipsis，长卷名不会撑破布局。行高仍 ≥44px（触屏最小命中区）。 */
+@media (max-width: 420px) {
+  .sd-row {
+    gap: 8px;
+    padding: 9px 4px;
   }
-  .sd-section-head {
-    align-items: flex-start;
+  .sd-glyph {
+    width: 26px;
   }
-  .sd-vol,
-  .sd-remote {
-    padding: var(--space-2);
+  .sd-proto {
+    width: 46px;
+    font-size: 10px;
+  }
+  .sd-size b {
+    font-size: 12.5px;
+  }
+  .sd-switch {
+    padding: 2px 7px;
+    font-size: 11.5px;
+  }
+  .sd-size small {
+    /* 手机上"共 XX"不是首要信息，让出来的宽度给名称/挂载点 */
+    display: none;
   }
   .sd-links {
-    gap: var(--space-2);
+    gap: 8px;
   }
 }
 </style>

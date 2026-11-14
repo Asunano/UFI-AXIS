@@ -124,8 +124,14 @@ export function formatSpeed(bytesPerSec: number): string {
   return `${bytesPerSec} B/s`;
 }
 
-/** 格式化运行时间 */
-export function formatUptime(seconds: number): string {
+/**
+ * 格式化运行时间（**秒**）。
+ *
+ * 名字带单位是刻意的：`views/settings/settingsShared.ts` 里还有一份收**毫秒**的
+ * `formatUptimeMs`，两者输出格式也不同。2026-10-30 之前它们同名 `formatUptime`，
+ * 传错单位只会显示成「1分钟」而不是报错（86400 秒 = 1 天，当毫秒算就成了 86 秒）。
+ */
+export function formatUptimeSec(seconds: number): string {
   const d = Math.floor(seconds / 86400);
   const h = Math.floor((seconds % 86400) / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -406,14 +412,17 @@ export interface PasswordStrength {
 }
 
 export function evaluatePasswordStrength(pw: string): PasswordStrength {
-  if (!pw) return { score: 0, label: '空', color: '#d03050' };
+  if (!pw) return { score: 0, label: '空', color: 'var(--error)' };
   let score = 0;
   if (pw.length >= 8) score++;
   if (/[a-z]/.test(pw) && /[A-Z]/.test(pw)) score++;
   if (/\d/.test(pw)) score++;
   if (/[^A-Za-z0-9]/.test(pw)) score++;
   const labels = ['弱', '弱', '中', '强', '很强'];
-  const colors = ['#d03050', '#d03050', '#f0a020', '#18a058', '#18a058'];
+  // 返回**令牌引用**而不是色值（2026-10-30）。这四处原先写死 #d03050 / #f0a020 / #18a058，
+  // 而 UI 基线门禁只扫 SFC 的 `<style>`，扫不到 TS 里的字符串 —— 于是它们既不跟暗色模式、
+  // 也不跟换肤走，是"绕过令牌"的漏网之鱼。消费方把它绑在 `:style` 上，`var()` 在那里有效。
+  const colors = ['var(--error)', 'var(--error)', 'var(--warning)', 'var(--success)', 'var(--success)'];
   const idx = Math.min(score, 4);
-  return { score: idx, label: labels[idx] ?? '弱', color: colors[idx] ?? '#d03050' };
+  return { score: idx, label: labels[idx] ?? '弱', color: colors[idx] ?? 'var(--error)' };
 }

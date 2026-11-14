@@ -12,9 +12,11 @@ export {}
 declare module 'vue' {
   export interface GlobalComponents {
     AclModal: typeof import('./components/modals/AclModal.vue')['default']
+    BackButton: typeof import('./components/BackButton.vue')['default']
     BandLockModal: typeof import('./components/modals/BandLockModal.vue')['default']
     DeviceTopBar: typeof import('./components/DeviceTopBar.vue')['default']
     EntryTile: typeof import('./components/EntryTile.vue')['default']
+    FatalErrorOverlay: typeof import('./components/FatalErrorOverlay.vue')['default']
     GaugeChart: typeof import('./components/GaugeChart.vue')['default']
     GlobalAudioPlayer: typeof import('./components/GlobalAudioPlayer.vue')['default']
     GoformModal: typeof import('./components/modals/GoformModal.vue')['default']
@@ -33,6 +35,7 @@ declare module 'vue' {
     NBreadcrumbItem: typeof import('naive-ui')['NBreadcrumbItem']
     NButton: typeof import('naive-ui')['NButton']
     NButtonGroup: typeof import('naive-ui')['NButtonGroup']
+    NCard: typeof import('naive-ui')['NCard']
     NCheckbox: typeof import('naive-ui')['NCheckbox']
     NCheckboxGroup: typeof import('naive-ui')['NCheckboxGroup']
     NCollapse: typeof import('naive-ui')['NCollapse']
@@ -87,6 +90,7 @@ declare module 'vue' {
     NText: typeof import('naive-ui')['NText']
     NTooltip: typeof import('naive-ui')['NTooltip']
     OperationProgressModal: typeof import('./components/common/OperationProgressModal.vue')['default']
+    OwnerPasswordDialog: typeof import('./components/OwnerPasswordDialog.vue')['default']
     PasswordModal: typeof import('./components/modals/PasswordModal.vue')['default']
     QrModal: typeof import('./components/modals/QrModal.vue')['default']
     RingGauge: typeof import('./components/RingGauge.vue')['default']

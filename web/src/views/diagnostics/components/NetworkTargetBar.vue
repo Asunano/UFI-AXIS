@@ -27,7 +27,7 @@
     <n-input-number v-model:value="networkTarget.port" class="ntb-port" :min="1" :max="65535" placeholder="端口" />
     <!-- 端口只被 TCP 探测读走（core 侧 ping / dns / traceroute 都不吃它）——
          不说清楚的话，用户会以为改端口会影响其它三条。 -->
-    <span class="ntb-note">端口只被 TCP 探测使用；其余三条只吃目标地址。</span>
+    <span class="ntb-note">默认目标由设备端统一下发；端口只被 TCP 探测使用，其余三条只吃目标地址。</span>
   </div>
 </template>
 

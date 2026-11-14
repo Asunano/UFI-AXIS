@@ -1,5 +1,10 @@
 <template>
   <div class="tunnel-view">
+    <div class="page-head">
+      <BackButton />
+      <h1 class="page-title">内网穿透</h1>
+    </div>
+
     <!--
       2026-09-05 重排：页面默认只有「概览」+「隧道」两张通栏卡。
       原来是 2 列栅格里塞 5 张卡，概览与看护设置各占半宽、旁边空一半；
@@ -108,6 +113,7 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { errText, type Instance } from './tunnelShared';
 import TunnelRunBar from './components/cards/TunnelRunBar.vue';
+import BackButton from '@/components/BackButton.vue';
 import TunnelListCard from './components/cards/TunnelListCard.vue';
 // 四个弹窗都是按需加载，组件本体与显隐时序由 useLazyModal 管（见下方 guardModal 等）。
 // 2026-10-14：组件安装弹窗 ComponentsModal 已移到资源中心，这里不再有它。
@@ -445,5 +451,17 @@ useInterval(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.page-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.page-title {
+  margin: 0;
+  font-size: var(--font-lg);
+  font-weight: 700;
+  color: var(--text-primary);
 }
 </style>

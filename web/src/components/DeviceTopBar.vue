@@ -2,7 +2,7 @@
 import { ref, computed } from 'vue';
 import { useDashboardStore } from '@/stores/dashboard';
 import { getApiClient } from '@/composables/useApi';
-import { formatUptime, networkTypeWithBand, signalColor, get } from '@/composables/utils';
+import { formatUptimeSec, networkTypeWithBand, signalColor, get } from '@/composables/utils';
 
 const dashboardStore = useDashboardStore();
 
@@ -30,7 +30,7 @@ const firmwareText = computed(() => firmwareVersion.value);
  */
 const uptimeText = computed(() => {
   const u = get(dashboardStore.summary, 'uptime', null) || get(summaryDeviceInfo.value, 'uptime', null);
-  if (u?.uptime_seconds != null && Number(u.uptime_seconds) >= 0) return formatUptime(Number(u.uptime_seconds));
+  if (u?.uptime_seconds != null && Number(u.uptime_seconds) >= 0) return formatUptimeSec(Number(u.uptime_seconds));
   if (u?.uptime_display) return String(u.uptime_display);
   return '--';
 });
