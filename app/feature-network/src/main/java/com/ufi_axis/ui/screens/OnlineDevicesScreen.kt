@@ -3,31 +3,31 @@ package com.ufi_axis.ui.screens
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavHostController
+// 2026-09-25：OnlineStation 与它的解析（双键容错 / 合并去重）已搬到 :app:data
+// —— 仪表盘弹窗要用同一份，而两个 feature 模块之间没有依赖边。搬移理由见该文件头注释。
+import com.ufi_axis.data.model.OnlineStation
+import com.ufi_axis.data.model.parseOnlineStations
 import com.ufi_axis.data.model.WifiAclEntry
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.LocalResolvedPalette
-import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiStandardCard
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
 
 /**
  * 在线设备页（`GET /api/wifi/clients`）。
@@ -47,6 +47,20 @@ import kotlinx.serialization.json.contentOrNull
 fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostController) {
     val state by viewModel.networkState.collectAsState()
 
+    // ── lifecycle 门控（2026-09-21）──
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     LaunchedEffect(Unit) {
         viewModel.network.refreshWifi()
         viewModel.network.loadWifiAcl()
@@ -54,23 +68,28 @@ fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostControll
 
     // 设备上下线是随时发生的，只在进页面拉一次会让列表一直停在进来那一刻的快照
     // （之前必须退出重进才刷新）。5s 轮询，与 TunnelScreen / CfTunnelScreen 同一套做法；
-    // 离开页面时 LaunchedEffect 随组合销毁自动取消，不会在后台一直打设备。
-    // 名单不跟着轮询：它只会被本 App 改，每次写完 core 都回读并覆盖，没必要 5s 一次。
+    // 2026-09-21：加 lifecycleResumed 门控——后台不继续打设备。
     //
     // 2026-09-05：`force = true` 是必须的 —— `refreshWifi` 默认带 10s 新鲜度闸门
     // （为了消掉首页横滑落定后那次无谓重拉），不绕过它这条 5s 轮询会被节流成 10s，
     // 等于降级本页「设备上下线随时可见」的产品要求。
-    LaunchedEffect(Unit) {
+    LaunchedEffect(lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         while (true) {
             delay(5_000)
             viewModel.network.refreshWifi(force = true)
         }
     }
 
-    val stations = rememberOnlineStations(
-        wifiList = state.wifiClients?.stations,
-        lanList = state.wifiClients?.lanStations
-    )
+    // 2026-09-25：原来是本文件私有的 `rememberOnlineStations(...)`（@Composable + 内部 remember）。
+    // 解析搬去 :app:data 之后那边是纯函数，`remember` 留在这里做 —— key 仍是同样那两个
+    // JsonArray，缓存命中行为与搬之前等价。
+    val stations = remember(state.wifiClients?.stations, state.wifiClients?.lanStations) {
+        parseOnlineStations(
+            wifiList = state.wifiClients?.stations,
+            lanList = state.wifiClients?.lanStations
+        )
+    }
     val palette = LocalResolvedPalette.current
     val blocked = state.wifiAcl?.blackList.orEmpty()
     // 名单里的 MAC 一律按小写比对：设备回读是小写，客户端展示用大写。
@@ -145,8 +164,14 @@ fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostControll
                         stations.forEachIndexed { index, station ->
                             if (index > 0) UfiDivider()
                             val mac = station.mac.lowercase()
-                            OnlineDeviceRow(
-                                station = station,
+                            // 2026-09-25：行视觉搬到公共层 [UfiOnlineDeviceRow]（原本文件私有的
+                            // OnlineDeviceRow），与仪表盘 hero 卡的在线设备弹窗共用同一份。入参是
+                            // 裸值 —— app/ui 看不到 OnlineStation，字段映射就落在这里。
+                            UfiOnlineDeviceRow(
+                                hostname = station.hostname,
+                                ip = station.ip,
+                                mac = station.mac,
+                                viaLan = station.viaLan,
                                 blocked = mac in blockedMacs,
                                 // MAC 为空的元素没法拉黑（设备名单以 MAC 为主键）
                                 actionEnabled = mac.isNotEmpty() && state.aclPendingMac != mac,
@@ -176,26 +201,35 @@ fun OnlineDevicesScreen(viewModel: MainViewModel, navController: NavHostControll
         onDismiss = { confirmBlock = null },
         title = "拉黑设备",
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { confirmBlock = null }, modifier = Modifier)
+            // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+            // local 必须在弹窗自己的 slot 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close { confirmBlock = null } }, modifier = Modifier)
         },
         confirmButton = {
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 size = UfiButtonSize.Small,
                 text = "拉黑",
                 modifier = Modifier,
                 onClick = {
-                    pending?.let { viewModel.network.blockDevice(it.mac, it.hostname) }
-                    confirmBlock = null
+                    close {
+                        pending?.let { viewModel.network.blockDevice(it.mac, it.hostname) }
+                        confirmBlock = null
+                    }
                 }
             )
         }
     ) {
-        Text(
-            text = "将「${pending?.hostname?.ifEmpty { "未知设备" } ?: ""}」（${pending?.mac?.uppercase() ?: ""}）" +
-                "加入 WiFi 黑名单？该设备会立刻断开，之后无法再连接本热点。",
-            style = MaterialTheme.typography.bodyMedium,
-            color = palette.textSecondary
-        )
+        // 间距统一到 UfiDialogBody（12dp）
+        UfiDialogBody {
+            Text(
+                text = "将「${pending?.hostname?.ifEmpty { "未知设备" } ?: ""}」（${pending?.mac?.uppercase() ?: ""}）" +
+                    "加入 WiFi 黑名单？该设备会立刻断开，之后无法再连接本热点。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.textSecondary
+            )
+        }
     }
 
     BlockedDevicesDialog(
@@ -241,15 +275,15 @@ private fun BlockedDevicesDialog(
             }
         }
     ) {
-        if (blocked.isEmpty()) {
-            Text(
-                text = "还没有拉黑任何设备。在下方在线设备列表里点「拉黑」即可。",
-                style = MaterialTheme.typography.bodyMedium,
-                color = palette.textSecondary
-            )
-            return@UfiScrollableDialog
-        }
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        UfiDialogBody {
+            if (blocked.isEmpty()) {
+                Text(
+                    text = "还没有拉黑任何设备。在下方在线设备列表里点「拉黑」即可。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = palette.textSecondary
+                )
+                return@UfiDialogBody
+            }
             blocked.forEachIndexed { index, entry ->
                 if (index > 0) UfiDivider()
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -285,121 +319,15 @@ private fun BlockedDevicesDialog(
     }
 }
 
-/** 一台在线客户端。字段全部按"缺失即空串"处理，UI 侧再决定占位符。 */
-private data class OnlineStation(
-    val hostname: String,
-    val ip: String,
-    val mac: String,
-    val viaLan: Boolean
-)
+// ═══════════════════════════════════════════════════════════════════════
+// 2026-09-25：以下四样东西已从本文件搬走，**不要在这里重建**：
+//   · `OnlineStation` 数据类          → :app:data `com.ufi_axis.data.model.OnlineStation`
+//   · `rememberOnlineStations`        → 同上文件的纯函数 `parseOnlineStations`
+//                                       （`remember` 留在本页调用点，key 不变）
+//   · `JsonElement.toOnlineStation`   → 同上文件（private，双键容错逐字保留）
+//   · `OnlineDeviceRow`               → app/ui `UfiOnlineDeviceRow`
+// 搬移原因：仪表盘 hero 卡「已连接设备」要弹一个同源的在线设备列表，而
+// :app:feature-dashboard 不依赖 :app:feature-network —— 留在本文件就只能抄第二份解析，
+// 那是本仓明令禁止的。详细的「哪些行为必须逐字不变」写在 OnlineStation.kt 头注释里。
+// ═══════════════════════════════════════════════════════════════════════
 
-/**
- * 合并两个客户端容器并去重。
- *
- * 两个容器都要读：`lan_station_list` 不保证出现，但出现时是另一批客户端，只读
- * `station_list` 会漏显示；合并后按 MAC 去重（手册的参考做法），MAC 为空时退化为按 IP 去重。
- */
-@Composable
-private fun rememberOnlineStations(wifiList: JsonArray?, lanList: JsonArray?): List<OnlineStation> =
-    remember(wifiList, lanList) {
-        buildList {
-            wifiList?.forEach { it.toOnlineStation(viaLan = false)?.let(::add) }
-            lanList?.forEach { it.toOnlineStation(viaLan = true)?.let(::add) }
-        }.distinctBy { it.mac.lowercase().ifEmpty { it.ip } }
-    }
-
-/**
- * 客户端数组元素**没有稳定字段契约**（见 API 手册 `/api/wifi/clients`）：
- * 正常路径下 core 已把 `mac`→`mac_addr`、`ip`→`ip_addr`、`host_name`→`hostname` 归一，
- * 但关掉 `field_normalization_enabled` 排障时会原样透出 —— 所以两套键都读。
- * IP 与 MAC 全空的元素视为脏数据丢弃（固件偶尔塞占位对象）。
- */
-private fun JsonElement.toOnlineStation(viaLan: Boolean): OnlineStation? {
-    val obj = this as? JsonObject ?: return null
-    fun str(vararg keys: String): String = keys.firstNotNullOfOrNull { k ->
-        (obj[k] as? JsonPrimitive)?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
-    } ?: ""
-    val ip = str("ip_addr", "ip")
-    val mac = str("mac_addr", "mac")
-    if (ip.isEmpty() && mac.isEmpty()) return null
-    return OnlineStation(hostname = str("hostname", "host_name"), ip = ip, mac = mac, viaLan = viaLan)
-}
-
-@Composable
-private fun OnlineDeviceRow(
-    station: OnlineStation,
-    blocked: Boolean,
-    actionEnabled: Boolean,
-    onBlock: () -> Unit,
-    onUnblock: () -> Unit
-) {
-    val palette = LocalResolvedPalette.current
-    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        Surface(shape = CircleShape, color = palette.accent.copy(alpha = 0.12f), modifier = Modifier.size(34.dp)) {
-            Box(contentAlignment = Alignment.Center) {
-                Icon(
-                    if (station.viaLan) Icons.Default.SettingsEthernet else Icons.Default.PhoneAndroid,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp),
-                    tint = palette.accent
-                )
-            }
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                text = station.hostname.ifEmpty { "未知设备" },
-                style = UfiTextStyles.bodyEmphasis,
-                color = palette.textPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            // 接入方式并到第二行：右侧要留给拉黑按钮，再摆一个 WiFi/LAN 标签会挤掉 IP/MAC。
-            Text(
-                text = listOf(
-                    if (station.viaLan) "LAN" else "WiFi",
-                    station.ip,
-                    station.mac.uppercase()
-                ).filter { it.isNotEmpty() }.joinToString("  ·  "),
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.textSecondary.copy(alpha = 0.8f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 2.dp)
-            )
-        }
-        Spacer(Modifier.width(8.dp))
-        // 拉黑只作用于 WiFi 接入，LAN（USB/网线）侧设备挡不住，所以那一行不给按钮。
-        if (!station.viaLan) {
-            if (blocked) {
-                // 同样是行内按钮：Small 档默认不铺满宽度（见上方 P4c 注释）
-                UfiButton(
-                    variant = UfiButtonVariant.Subtle, size = UfiButtonSize.Small,
-                    text = "解除",
-                    onClick = onUnblock,
-                    enabled = actionEnabled
-                )
-            } else {
-                UfiButton(
-                    size = UfiButtonSize.Small,
-                    text = "拉黑",
-                    onClick = onBlock,
-                    modifier = Modifier,
-                    enabled = actionEnabled
-                )
-            }
-        } else {
-            Surface(
-                color = palette.accent.copy(alpha = 0.1f),
-                shape = UfiCardDefaults.microShape
-            ) {
-                Text(
-                    text = "LAN",
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = palette.accent
-                )
-            }
-        }
-    }
-}

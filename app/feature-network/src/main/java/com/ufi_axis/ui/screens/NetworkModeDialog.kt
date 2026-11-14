@@ -9,6 +9,8 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
@@ -18,20 +20,43 @@ import com.ufi_axis_core.contract.NetworkMode
 
 
 /**
- * 网络制式档位的中文标签。键是 **contract 别名**（`NetworkMode.UI_OPTIONS`），
- * 顺序由 `UI_OPTIONS` 决定；下发走别名，core 侧 `toBearer()` 负责换算成设备取值。
- * `NetworkModeScreen` 与 `NetworkModeDialog` 共用这一份，避免两处漂移。
+ * 网络制式中文标签：**不再在 App 维护第二份**。
+ * 文案真源是 core `NetworkMode.LABELS`；下发走 contract 别名，core `toBearer()` 换算设备值。
+ * 优先读 API 回的 `network_mode_label`，缺省时用 contract 映射。
  */
-internal val NETWORK_MODE_LABELS: Map<String, String> = mapOf(
-    NetworkMode.AUTO to "自动 (4G/5G)",
-    NetworkMode.ONLY_5G to "5G SA",
-    NetworkMode.LTE_AND_5G to "4G/5G NSA",
-    NetworkMode.ONLY_LTE to "仅 4G",
-    NetworkMode.WCDMA_AND_LTE to "4G/3G",
-    NetworkMode.ONLY_WCDMA to "仅 3G"
-)
+internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
 
-/** 连接模式 & 网络制式设置弹窗 */
+/**
+ * 网络制式设置弹窗。
+ *
+ * 2026-10-10 用户裁决（三轮迭代）：
+ * ① 由独立页面 `detail/network-mode` 收进蜂窝高级设置页；
+ * ② 删掉「连接模式 / 自动拨号·手动拨号」这一块 UI（**设备侧 `dial_mode` 配置不动**，
+ * 见文件末尾说明）；
+ * ③ 制式选择改用公共 chip（⑤ 之后见下）；
+ * ④ 顶部**不要**浅色着色块：改成左「制式名 + 信号强度」右「网络信息 2×2」的左右布局；
+ * ⑤ 左右互换 + 读数改 2×2 + 制式名放大 + 下拉改 chip + 加确认/取消（2026-10-10）；
+ * ⑥ chip 换成真正的 [CategoryChip]、制式名锁单行（2026-10-11，修「界面错乱、
+ *    没有固定布局、chip 调用错误」）；
+ * ⑦ 制式名放大到 displayMedium、信号评级改 [UfiBadge] 居中、2×2 改 [UfiInfoCell]
+ *    上下排（修「频点换行、没有间隔」）；
+ * ⑧ 整体间距加宽（用户「太挤了」）。
+ *
+ * ## 数据来源（④ 新增）
+ * PCI / 频点 / SINR / RSRQ 全部读 [NetworkState.signalInfo]（`GET /api/device/signal` 的
+ * `SignalInfo`），与基站信息页 / CellLockDialog 同一个数据源、同一批字段 ——
+ * core 已按「NR 优先、LTE 兜底」合并过（band_label / pci / arfcn / signal_strength），
+ * 所以**客户端不要按制式 if**，直接读统一字段。
+ *
+ * 信号强度文案与颜色复用 `signalLevelText` / `signalColor`（`UfiSignalBars.kt`），
+ * 不在本页自建第二套分档 —— 那些函数注释里明确写了「与外部调用点同源，别分叉」。
+ *
+ * ## 刷新时机（用户裁决：开时拉一次，不轮询）
+ * `LaunchedEffect(visible)`：弹窗打开才`refreshNetwork(silent = true)`，关闭不轮询 ——
+ * 弹窗是短时查看场景，常驻轮询只会白耗电。
+ * 切换制式后**不需要**本弹窗再拉：`NetworkModule.awaitNetworkModeApplied` 尾部已经调了
+ * `refreshNetwork()`（全量，含 signalInfo），重新搜网后的信号值会自动跟上。
+ */
 @Composable
 fun NetworkModeDialog(
     viewModel: MainViewModel,
@@ -42,7 +67,13 @@ fun NetworkModeDialog(
     val deviceSettingsState by viewModel.deviceSettingsState.collectAsState()
     val palette = LocalResolvedPalette.current
 
-    val connModeJson = connModeOf(deviceSettingsState.settings)
+    // 开弹窗拉一次信号数据；关闭时不轮询（见 KDoc「刷新时机」）。
+    // 用 refreshSignalOnly 而不是 refreshNetwork —— 后者会连带拉 WiFi 设置与客户端列表，
+    // 为看 4 个信号读数付 4 个请求不划算。
+    LaunchedEffect(visible) {
+        if (visible) viewModel.network.refreshSignalOnly()
+    }
+
     val netModeJson = netModeOf(deviceSettingsState.settings)
 
     // T15：档位键统一为 contract 别名（下发时由 core 的 NetworkMode.toBearer 换算成设备取值）。
@@ -55,147 +86,226 @@ fun NetworkModeDialog(
     val displayMode = pendingMode ?: currentMode
     val switching = pendingMode != null
 
+    val modeLabel = deviceSettingsState.settings?.networkModeLabel
+        ?: NetworkMode.label(displayMode)
+
+    // 2026-10-10：下拉改成 [UfiSingleChipSelector] + 确认/取消按钮后，选择不再即时下发 ——
+    // 弹窗内先选、再按「确定」才下发，「取消」直接丢弃。
+    // 与旧下拉的关键差别：下拉是"点开→选中即刻生效"，而制式切换会让设备重新搜网、断流数秒，
+    // 让用户在浮层里一按就触发副作用、又没有反悔余地。
+    // 每次打开弹窗重置为设备当前档位（见下面的 LaunchedEffect(visible)）。
+    var pendingSelection by remember(visible) { mutableStateOf(displayMode) }
+    val selectionChanged = pendingSelection != displayMode
 
     UfiCustomDialog(
         visible = visible,
         onDismiss = onDismiss,
-        title = "连接与网络模式",
+        title = "网络制式",
         icon = rememberVectorPainter(Icons.Filled.SignalCellularAlt),
-        showCloseButton = false
+        showCloseButton = false,
+        // 按钮走壳子自带的 confirmButton / dismissButton 槽位，**不塞进 content**。
+        // 两个坑（都写在 UfiCustomDialog 的 KDoc 里）：
+        // 1. 塞进 content 的话按钮不会吸底，弹窗内容一多就跟着滚走；
+        // 2. 壳子已在 weight(1f) Box 内包裹两键（2026-08-11 修的「Standard 档UfiButton
+        //    默认 fillWidth=true 会占满整行、把确认键挤出屏幕，只剩取消」）。
+        // 所以这里只给按钮本体，weight / 分隔线 / 间距都由壳子负责。
+        confirmButton = {
+            UfiButton(
+                text = "确定",
+                enabled = selectionChanged && !switching && !state.modeSwitchTimedOut,
+                // 无改动时置灰：没有要下发的东西，别让用户以为已经生效。
+                onClick = {
+                    // 只在真有改动时下发，避免"按确定"却跑一趟无意义的重新搜网。
+                    if (selectionChanged) viewModel.network.setNetworkMode(pendingSelection)
+                    onDismiss()
+                }
+            )
+        },
+        dismissButton = {
+            UfiButton(
+                text = "取消",
+                variant = UfiButtonVariant.Secondary,
+                // 取消**不跟随**确认键的 enabled：enabled 表达的是"确认动作当前能否执行"，
+                // 而"放弃并关闭"在任何状态下都应点得动（见 UfiDialogActions 的同名注释）。
+                onClick = onDismiss
+            )
+        }
     ) {
         UfiDialogBody {
-            // ── 当前状态概览 ──
-            Row(Modifier.fillMaxWidth()) {
-                UfiStatItem(
-                    value = if (connModeJson == "auto") "自动拨号" else "手动拨号",
-                    label = "连接模式",
-                    modifier = Modifier.weight(1f)
-                )
-                UfiStatItem(
-                    value = NETWORK_MODE_LABELS[displayMode] ?: netModeJson,
-                    label = if (switching) "网络制式（切换中）" else "网络制式",
-                    modifier = Modifier.weight(1f),
-                    valueColor = when (displayMode) {
-                        NetworkMode.ONLY_WCDMA, NetworkMode.ONLY_LTE -> palette.error
-                        NetworkMode.LTE_AND_5G -> palette.accentSecondary
-                        NetworkMode.ONLY_5G -> palette.accent
-                        else -> Color.Unspecified
-                    }
-                )
-            }
-
-            // ── 连接模式 ──
-            UfiDialogField("连接模式") {
-                // 2026-08-31：两个手绘 FilterChip → 公共 UfiOptionGrid（双栏，leading 槽位保留勾选图标）
-                val isAuto = connModeJson == "auto"
-                UfiOptionGrid(
-                    options = listOf(
-                        UfiOptionItem(
-                            value = "auto",
-                            label = "自动拨号",
-                            leading = {
-                                Icon(
-                                    if (isAuto) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp)
-                                )
-                            }
-                        ),
-                        UfiOptionItem(
-                            value = "manual",
-                            label = "手动拨号",
-                            leading = {
-                                Icon(
-                                    if (!isAuto) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp)
-                                )
-                            }
+            // 2026-10-11 用户「间隔加宽、当前太挤」。
+            //
+            // [UfiDialogBody] 的块间距是全站统一的 Spacing.Large(12dp)，而它的 KDoc
+            // 明确写了「块与块之间一律 12dp，上下边距由 shell 负责」——那是公共节奏，
+            // 不该在单页私自改。所以这里在 Body 内**自己套一层 Column** 控制块间距，
+            // 而不是去改公共组件或给 Body 传参（Body 也没有间距参数）。
+            Column(verticalArrangement = Arrangement.spacedBy(Spacing.XLarge)) {
+            // ── 顶部：左「制式名 + 信号强度」，右「网络信息 2×2」──
+            //
+            // 2026-10-10 用户裁决：左右互换（制式在左），四行读数改 2×2 网格，
+            // 制式名字号放大到与 2×2 那一块的上下宽度对齐。
+            //
+            // 为什么左右两边都 weight(1f)：制式名「5G/4G/3G」这类最长文案要能撑住左半，
+            // 而右边 2×2 每格label+值也要够宽 —— 任一边固定宽度都会让另一边挤。
+            Row(
+                Modifier.fillMaxWidth(),
+                // 2026-10-11 用户「制式和 2×2 信息中间间隔增大一点」：
+                // Medium(8) → **XLarge(16dp)**。这一行是弹窗内唯一的横向分隔，
+                // 8dp 在 displayMedium 大字旁边显得太紧，两栏内容糊成一片。
+                horizontalArrangement = Arrangement.spacedBy(Spacing.XLarge)
+            ) {
+                // 左：制式名（大字）+ 紧邻其下的信号强度评级
+                Column(
+                    Modifier.weight(1f),
+                    // 居中：制式名 / 信号徽章 / 状态徽章成一列，同一条中轴线。
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    // 2026-10-11 用户「间隔加宽、当前太挤」：块内间距 Small(4) → Large(12)。
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                ) {
+                    // 制式名是这个弹窗的主角，用 displaySmall（比 dialogTitle 大两档）。
+                    //
+                    // 2026-10-11「界面错乱、没有固定布局」的另一半根因：原来 maxLines = 2 让
+                    // 「5G/4G/3G」这类长文案折成两行 → 左栏高度随文案长度跳变，
+                    // 与右边**恒为两行**的 2×2 网格对不齐，两栏看起来一高一低。
+                    // 左边是一个"值"、右边是一个固定形状的网格，两者高度必须恒定才对得起来。
+                    //
+                    // 所以 maxLines = 1：代价是极端长文案会被 ellipsis 截断，
+                    // 换来的是**布局恒定** —— 对「当前状态展示区」而言恒定布局优先于完整文案。
+                    // 制式名本身很短（最长「5G/4G/3G」），实际极少触发截断。
+                    // 制式名是这个弹窗的主角。2026-10-11 用户要求"再大一点"：
+                    // displaySmall → **displayMedium**（再上一档）。
+                    // maxLines = 1 + Ellipsis：左边是一个"值"、右边是恒为两行的 2×2 网格，
+                    // 高度必须恒定才对得起来（见本文件 KDoc ⑥）。
+                    Text(
+                        text = modeLabel,
+                        style = MaterialTheme.typography.displayMedium.copy(fontWeight = UfiWeight.Strong),
+                        color = palette.textPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth(),
+                        textAlign = TextAlign.Center
+                    )
+                    // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
+                    // 5G SA 下常为 null，所以**不用它判等级**，只当右侧那格读数展示 ——
+                    // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
+                    //
+                    // 2026-10-11：文字 → 公共 [UfiBadge]，与制式名同列居中。
+                    // 之前是 bodySmall 裸文字，和右边读数同一档、看不出是"状态"；
+                    // badge 有底色和描边，一眼就能和静态读数区分开。
+                    val rsrp = state.signalInfo?.rsrp
+                    UfiBadge(
+                        text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
+                        // 徽章色走 [signalBars] 的等级（1..5），**不自己判 dBm 阈值**。
+                        // signalLevelText / signalBars 是唯一分档真源（UfiSignalBars.kt:20-42），
+                        // 那里的 KDoc 明确写了「与外部调用点同源，别分叉」——
+                        // 本轮之前我就在这里手写过一套 -90/-105 的阈值，把「差」错标成 INFO。
+                        type = when (rsrp?.let { signalBars(it) }) {
+                            4, 5 -> UfiBadgeType.SUCCESS
+                            3 -> UfiBadgeType.INFO
+                            else -> UfiBadgeType.WARNING
+                        },
+                        modifier = Modifier.align(Alignment.CenterHorizontally)
+                    )
+                    if (switching || state.modeSwitchTimedOut) {
+                        UfiBadge(
+                            text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
+                            type = UfiBadgeType.WARNING,
+                            modifier = Modifier.align(Alignment.CenterHorizontally)
                         )
-                    ),
-                    selectedValue = if (isAuto) "auto" else "manual",
-                    onSelect = { viewModel.network.setConnectionMode(it) },
-                    columns = 2
-                )
-            }
-
-            // ── 网络制式 ──
-            UfiDialogField("网络制式") {
-                Text(
-                    when {
-                        // 切换中：说清"设备在搜网"，让用户知道要等
-                        switching -> "正在切换到「${NETWORK_MODE_LABELS[displayMode] ?: displayMode}」，设备重新搜网需要一点时间"
-                        // 回读预算用尽仍未报出目标档位：明说，不静默停在旧值上
-                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看"
-                        else -> "切换后设备将重新搜网"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (state.modeSwitchTimedOut && !switching) palette.error else palette.textSecondary
-                )
-                Spacer(Modifier.height(8.dp))
-                Column(Modifier.fillMaxWidth()) {
-                    NetworkMode.UI_OPTIONS.forEach { key ->
-                        val label = NETWORK_MODE_LABELS[key] ?: key
-                        val isSelected = key == displayMode
-                        val chipColor = when {
-                            isSelected -> palette.accent
-                            key == NetworkMode.ONLY_WCDMA || key == NetworkMode.ONLY_LTE -> palette.error.copy(alpha = 0.7f)
-                            key == NetworkMode.ONLY_5G -> palette.accent.copy(alpha = 0.7f)
-                            else -> palette.textSecondary
-                        }
-                        Surface(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 2.dp),
-                            shape = UfiCardDefaults.inputShape,
-                            color = if (isSelected) palette.accent.copy(alpha = 0.08f) else palette.cardBg,
-                            onClick = { viewModel.network.setNetworkMode(key) }
-                        ) {
-                            Row(
-                                Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    if (isSelected) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                                    null, Modifier.size(18.dp), tint = chipColor
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Text(
-                                    label,
-                                    style = UfiTextStyles.body.copy(
-                                        fontWeight = if (isSelected) UfiWeight.Strong else UfiWeight.Regular
-                                    ),
-                                    color = palette.textPrimary
-                                )
-                                Spacer(Modifier.weight(1f))
-                                if (isSelected) {
-                                    Surface(
-                                        color = palette.accent.copy(alpha = 0.15f),
-                                        shape = UfiCardDefaults.trackShape
-                                    ) {
-                                        Text(
-                                            if (switching) "切换中" else "当前",
-                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
-                                            style = MaterialTheme.typography.labelSmall, color = palette.accent
-                                        )
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
+                // 右：PCI / 频点 / SINR / RSRQ —— 2×2 网格
+                //
+                // 2026-10-11 用 [UfiInfoCell] 而不是 [UfiDialogInfoRow]：
+                // 后者是**左右**分列（Row: 左 label 右 value），格子只有半屏宽时长值
+                // 会被挤进省略号或直接换行（用户报的"频点出现换行"）。而 [UfiInfoCell] 是
+                // **上下**排 —— 标签一行、值一行，值固定 maxLines=1 + Ellipsis。
+                // 它的 KDoc 早就写明了这条取舍：「格子宽度只有半屏时，左右分列会让长值
+                // 立刻被挤进省略号，所以网格里必须上下排」「值换行会把同排另一格顶歪」。
+                // 换句话说：这不是新需求，是公共组件早就为这种网格准备好的形态。
+                Column(
+                    Modifier.weight(1f),
+                    // 行间 Medium(8) → Large(12)（同上，用户反馈太挤）
+                    verticalArrangement = Arrangement.spacedBy(Spacing.Large)
+                ) {
+                    // 行内横向留 Spacing.Medium：两格都是 weight(1f)，不给间距时
+                    // 「频点」的长值会紧贴右边那格的标签（用户报的"没有间隔"）。
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                    ) {
+                        UfiInfoCell("PCI", state.signalInfo?.pci?.toString() ?: "--", Modifier.weight(1f))
+                        UfiInfoCell("频点", state.signalInfo?.arfcn?.toString() ?: "--", Modifier.weight(1f))
+                    }
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
+                    ) {
+                        UfiInfoCell("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", Modifier.weight(1f))
+                        UfiInfoCell("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", Modifier.weight(1f))
+                    }
+                }
+            }
+
+            // ── 切换制式：chip 单选 + 确认/取消 ──
+            //
+            // 2026-10-10 用户裁决：下拉改 chip 选择器，并加确认/取消按钮。
+            // 两处一起改有因果：下拉是"点开浮层选中即刻生效"，没有反悔余地；
+            // 而制式切换会让设备重新搜网、断流数秒。改成先选、再按「确定」才下发，
+            // 「取消」能真正丢弃选择。
+            //
+            // 2026-10-11 用 [CategoryChip] 而**不是** [UfiSingleChipSelector]：
+            // 后者名字里有 "Chip"，实际是**分段控件**——轨道底色 + [UfiSegment] + 滑块动画，
+            // 滑块位置/宽度由 `onSizeChanged` 量出的段宽算出（见 UfiChipSelector.kt:135-147）。
+            // 6 段在 FlowRow 里各自宽度不同 → 几何失效，滑块飞掉、整体看起来就是"错乱"。
+            // [CategoryChip] 是项目里真正的 chip（描边 + 淡底 + 选中态填色），不依赖几何。
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                // chip 之间 Small(4) → Medium(8)：6 个 chip 挤在一起分不清边界
+                horizontalArrangement = Arrangement.spacedBy(Spacing.Medium),
+                verticalArrangement = Arrangement.spacedBy(Spacing.Medium)
+            ) {
+                NetworkMode.UI_OPTIONS.forEach { mode ->
+                    CategoryChip(
+                        label = NetworkMode.label(mode),
+                        selected = mode == pendingSelection,
+                        onClick = { pendingSelection = mode }
+                    )
+                }
+            }
+            // 异常态走 warning 语义（底色块），正常态走 note（弱化）。
+            if (switching || state.modeSwitchTimedOut) {
+                UfiDialogWarning(
+                    when {
+                        state.modeSwitchTimedOut -> "设备尚未完成切换，可稍后刷新查看。"
+                        else -> "正在切换到「${NetworkMode.label(displayMode)}」，设备重新搜网需要一点时间。"
+                    }
+                )
+            } else if (selectionChanged) {
+                // 选了新档位但还没确认：把"将要发生什么"讲在确认键之前。
+                UfiDialogNote("确定后将切换到「${NetworkMode.label(pendingSelection)}」，设备会重新搜网并短暂断流。")
+            } else {
+                UfiDialogNote("切换后设备将重新搜网，短时间内可能断流。")
+            }
             }
         }
     }
 }
 
-internal fun connModeOf(settings: DeviceSettingsResponse?): String =
-    if (settings?.manualConnection == true) "manual" else "auto"
+// 2026-10-10：原 `connModeOf`（读 manualConnection → auto/manual）随「连接模式」UI
+// 一起删除 —— 删掉最后一个调用者（NetworkModeScreen）后它成了死代码。
+// **设备侧拨号配置本身没动**：`DeviceSettingsResponse.manualConnection` 字段、
+// `NetworkModule.setConnectionMode()`、`POST /api/network/connection-mode` 与
+// DeviceResponsesTest 里的相关单测全部保留，恢复 UI 时把本函数按原样加回即可。
 
 /**
- * 读取设备当前档位。**优先 `BearerPreference`**：写入侧（`POST /api/network/mode` → goform
- * `SET_BEARER_PREFERENCE`）改的就是这个字段，web 的 `NetworkView` 也读它；`net_select` 是老字段，
- * 取值域未经证实，仅作回退（优先级判断在 [DeviceSettingsResponse.networkMode] 里）。
- * 交给 `NetworkMode.fromBearer()` 换算（未识别值原样返回，因此老设备回 `AUTO` 这类
- * 别名同名值时仍能正确高亮）。
+ * 读取设备当前档位。
+ *
+ * 优先 **`net_select`**（2026-09 真机：切换后 goform 回读里真正变化的是它，
+ * 形如 `WL_AND_5G` / `Only_5G`）。`BearerPreference` 是写入侧字段，可能为空或未应用，
+ * 仅在 net_select 缺失时回退。再经 [NetworkMode.fromBearer] 换成 contract 别名。
  */
-internal fun netModeOf(settings: DeviceSettingsResponse?): String =
-    settings?.networkMode ?: NetworkMode.AUTO
+internal fun netModeOf(settings: DeviceSettingsResponse?): String {
+    val netSelect = settings?.netSelect?.takeIf { it.isNotBlank() }
+    if (netSelect != null) return netSelect
+    return settings?.bearerPreference?.takeIf { it.isNotBlank() } ?: NetworkMode.AUTO
+}
