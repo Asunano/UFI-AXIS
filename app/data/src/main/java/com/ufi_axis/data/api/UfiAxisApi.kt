@@ -1,5 +1,6 @@
 package com.ufi_axis.data.api
 
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
 import com.ufi_axis.data.model.*
@@ -10,6 +11,7 @@ import com.ufi_axis.data.notification.NotificationConfigUpdateResponse
 import okhttp3.ResponseBody
 import retrofit2.Response
 import okhttp3.MultipartBody
+import kotlinx.serialization.json.JsonObject
 import retrofit2.http.*
 
 interface UfiAxisApi {
@@ -27,6 +29,18 @@ interface UfiAxisApi {
 
     @GET("api/device/version")
     suspend fun getDeviceVersion(): DeviceVersionResponse
+
+    /**
+     * EPS 承载 QoS（QCI / 上下行 AMBR，2026-09-22）。
+     *
+     * core 侧走 `AT+CGEQOSRDP`，5 分钟缓存。**不要放进仪表盘的 10s 轮询** ——
+     * AT 通道全局互斥，抢锁超时会把整张仪表盘一起拖住。进页面静默拉一次就够
+     * （`DashboardModule.loadDeviceQosSilently`，与固件版本同一手法）。
+     *
+     * AT 不可用时仍回 200 + `available = false`，不抛异常。
+     */
+    @GET("api/device/qos")
+    suspend fun getDeviceQos(): DeviceQosResponse
 
     @GET("api/device/model")
     suspend fun getDeviceModel(): DeviceModel
@@ -69,6 +83,391 @@ interface UfiAxisApi {
 
     @GET("api/traffic/summary")
     suspend fun getTrafficSummary(): TrafficSummary
+
+    /**
+     * 分段流量用量（「流量管理 → 流量历史」卡片）。
+     *
+     * 与 [getTrafficHistory] 的分工：后者回**原始速率采样**（近 N 小时逐条），
+     * 本端点回**按段聚合后的完整桶序列** + 中文文案，见 [TrafficUsageResponse]。
+     *
+     * @param range `day` / `week` / `month` / `year`（core 对非法值回落到 day，不回 400）
+     * @param anchor 锚点时刻（epoch ms）；null = core 按"当前所在的那一段"取
+     */
+    @GET("api/traffic/usage")
+    suspend fun getTrafficUsage(
+        @Query("range") range: String,
+        @Query("anchor") anchor: Long? = null
+    ): TrafficUsageResponse
+
+    // ========== Media Center（媒体中心，2026-09-16）==========
+    //
+    // core 侧查系统媒体库（MediaStore）。**播放 / 查看仍走 `/api/files/stream?path=`**，
+    // 这里不出现第二条取字节流的路径；缩略图是唯一的例外（它是 core 生成的 JPEG，不是原文件）。
+
+    /** 三类媒体各自的授权状态 + 当前扫描目录。某类未授权时界面要显示引导，不许显示空列表。 */
+    @GET("api/media/status")
+    suspend fun getMediaStatus(): MediaStatusResponse
+
+    /**
+     * 2026-10-05 G5：视频元信息（ffmpeg 探测，core 永久缓存）。
+     * MediaStore 列在本机经常缺 duration/width/height，此端点给真值。
+     * 404 = 无法解析（损坏/不支持容器）。
+     */
+    @GET("api/media/video-info")
+    suspend fun getVideoInfo(@Query("id") id: Long): VideoInfoResponse
+
+    /**
+     * 列某一类媒体（分页）。
+     *
+     * @param type [MEDIA_TYPE_VIDEO] / [MEDIA_TYPE_AUDIO] / [MEDIA_TYPE_IMAGE]
+     * @param sort `date`（默认）/ `name` / `size`
+     * @param order `desc`（默认）/ `asc`
+     * @param album 只列这个专辑（**仅音频**，取 [getMediaGroups] 回的 key 原值）
+     * @param artist 只列这个歌手（**仅音频**）
+     * @param dir 只列这个目录（**仅音频**，目录绝对路径）
+     *
+     * 后三个是 2026-09-20 为音频分组回查加的，与 core 侧的扫描目录过滤是 **AND** 关系
+     * （超出扫描范围的专辑筛不出东西是预期行为）。传空串等于没传 —— core 按"参数缺失"处理，
+     * 会回整库，所以分组里 key 为空串的那一组不能走这条路回查。
+     *
+     * ## 后三个必须传**已编码**的值（`encoded = true`，2026-09-21 修"专辑里没有歌"）
+     * Retrofit 默认会帮忙编码，但它底层的 OkHttp 在 query 里**不编码 `+`** ——
+     * 而 Ktor 解 query 时按 form 语义把 `+` 当空格。于是专辑名 `万岁2001 新曲+精选`
+     * 传到 core 变成 `万岁2001 新曲 精选`，一条曲目都匹配不上。
+     * 现在由调用方用 `encodeUriComponent` 编好（它把 `+` 编成 `%2B`、空格编成 `%20`），
+     * 这里只负责原样带上。调用点见 `MediaModule.groupFilters`。
+     */
+    @GET("api/media/list")
+    suspend fun getMediaList(
+        @Query("type") type: String,
+        @Query("sort") sort: String? = null,
+        @Query("order") order: String? = null,
+        @Query("limit") limit: Int? = null,
+        @Query("offset") offset: Int? = null,
+        @Query("album", encoded = true) album: String? = null,
+        @Query("artist", encoded = true) artist: String? = null,
+        @Query("dir", encoded = true) dir: String? = null
+    ): MediaListResponse
+
+    /**
+     * 按专辑 / 歌手 / 文件夹聚合音频（`type` 只支持 [MEDIA_TYPE_AUDIO]）。
+     *
+     * 与 [getMediaList] 的分工：这个回"有哪些组"（不分页，core 一次算完），
+     * 点进某一组再用 [getMediaList] 的 album / artist / dir 回查组内曲目。
+     *
+     * @param by [MEDIA_GROUP_ALBUM] / [MEDIA_GROUP_ARTIST] / [MEDIA_GROUP_FOLDER]
+     */
+    @GET("api/media/groups")
+    suspend fun getMediaGroups(
+        @Query("type") type: String,
+        @Query("by") by: String
+    ): MediaGroupsResponse
+
+    /**
+     * 按目录列一层（媒体库的文件夹视图）：子目录 + 这一层的媒体文件。
+     *
+     * 与 [getMediaList] 的分工：那个是整库平铺分页，这个是"这一层有什么"（不分页）。
+     * [path] 留空时由 core 决定起点：只配了一个扫描目录就直接进那一个，配了多个则回
+     * `roots` 让用户先选。
+     */
+    @GET("api/media/browse")
+    suspend fun browseMedia(
+        @Query("type") type: String,
+        @Query("path") path: String? = null,
+        @Query("sort") sort: String? = null,
+        @Query("order") order: String? = null
+    ): MediaBrowseResponse
+
+    /** 读某一类的扫描目录。 */
+    @GET("api/media/config")
+    suspend fun getMediaConfig(@Query("type") type: String): MediaConfigResponse
+    /**
+     * 写某一类的扫描目录。空数组 = 这一类不限目录（列整个媒体库里的该类型）。
+     *
+     * 按类型分开存（2026-09-16 媒体中心拆成三页）：视频页只改视频那一份，
+     * 所以三页各有可写入口也不会互相覆盖。
+     */
+    @PUT("api/media/config")
+    suspend fun putMediaConfig(
+        @Query("type") type: String,
+        @Body body: MediaDirsRequest
+    ): MediaConfigResponse
+
+    // ── DLNA MediaServer（/api/dlna，2026-10-09） ──
+
+    @GET("api/dlna/status")
+    suspend fun getDlnaStatus(): DlnaStatusResponse
+
+    @PUT("api/dlna/config")
+    suspend fun putDlnaConfig(@Body body: DlnaConfigRequest): DlnaStatusResponse
+
+    /**
+     * 请系统重新收录某一类的目录（`dirs` 为空时用该类型已配置的目录）。
+     * 只提交该类型的文件；收录是异步的：成功返回不代表 [getMediaList] 立刻能查到新文件。
+     */
+    @POST("api/media/rescan")
+    suspend fun rescanMedia(
+        @Query("type") type: String,
+        @Body body: MediaDirsRequest
+    ): MediaRescanResponse
+
+    /**
+     * 旁挂歌词（同名 `.lrc` / `.txt`）。没有歌词时回 `found = false`（不是 404）。
+     *
+     * 封面走 `api/media/cover?id=`（原始内嵌图，播放页用），**不在这里声明** ——
+     * 那是给 Coil 直接吃的图片 URL，不经 Retrofit。
+     */
+    @GET("api/media/lyrics")
+    suspend fun getMediaLyrics(@Query("id") id: Long): MediaLyricsResponse
+
+    /**
+     * 某个视频可用的**外挂字幕**（`.srt` / `.ass` / `.vtt` …）。
+     *
+     * [scope]：
+     *  · 省略或 `matched` —— 只回按文件名判定属于这个视频的，用于"打开就自动挂上字幕"；
+     *  · `folder` —— 回同目录**全部**字幕，用于"手动选字幕文件"的列表
+     *    （现实里字幕名常和视频名对不上：压制组命名、单独下载的字幕包）。
+     *
+     * 匹配规则写在 core（`subtitleBelongsTo`），客户端不复制一份 —— 两个播放入口
+     * 各写一遍必然分叉。
+     *
+     * 字幕**内容**不在这里取：见 `api/media/subtitle?path=`，那条会把 GB18030/Big5
+     * 统一转成 UTF-8（播放器只认 UTF-8），所以必须走 core 而不是直接拉 `/files/stream`。
+     */
+    @GET("api/media/subtitles")
+    suspend fun getMediaSubtitles(
+        @Query("path") path: String,
+        @Query("scope") scope: String? = null
+    ): MediaSubtitlesResponse
+
+    /**
+     * 清空**设备侧**的缩略图缓存。
+     *
+     * ## 为什么必须有这一条
+     * 缩略图一共三层缓存，缺了它就有一层永远清不掉：
+     *  1. 图片加载库（磁盘 + 内存，按 URL 命中）；
+     *  2. App 自己抽帧的成果（`media-thumbs/`）；
+     *  3. **设备上客户端回传的成果**（core 的 `filesDir/thumbs/`）← 本条清的是这层。
+     *
+     * `/thumbnail` 是"缓存命中就直接返回"，而 URL 只含 (type, id) 不含内容指纹。
+     * 于是一张算错的图（典型：抽到黑场）会一直被原样发下去 ——
+     * 只清前两层的话，再次请求又被设备上的旧图命中，表现就是"怎么清都还是那张黑图"。
+     *
+     * [type] 省略清全部；给了只清那一类（换抽帧策略时通常只需重算 video）。
+     */
+    /**
+     * 2026-10-07：手动重抽封面用 —— 拿 Response 以便读取 X-Thumb-Source 头与 404 reason
+     * （普通 ResponseBody 变体拿不到这两样）。
+     */
+    @GET("api/media/thumbnail")
+    suspend fun fetchThumbnailMeta(
+        @Query("type") type: String,
+        @Query("id") id: Long,
+        @Query("size") size: Int = 256
+    ): Response<okhttp3.ResponseBody>
+
+    /** 2026-10-07：手动跑一轮封面预热（需先开 thumb_prewarm_enabled；进度走 WS 广播）。 */
+    @POST("api/media/thumbnail-prewarm")
+    suspend fun runThumbnailPrewarm(): JsonElement
+
+    /**
+     * 2026-10-07：封面预热状态快照（core 落盘，随时可查——解决"退出页面重进看不到状态"）。
+     * snapshot=false = core 从未跑过预热；其余字段 done/total/failed/running/current_name/
+     * started_at/updated_at。
+     */
+    @GET("api/media/thumbnail-prewarm")
+    suspend fun getThumbnailPrewarmState(): JsonElement
+
+    /** 2026-10-07：真 PTY 终端状态（enabled=开关、running=ttyd 进程）。 */
+    @GET("api/terminal/status")
+    suspend fun ttydStatus(): JsonElement
+
+    /** 2026-10-07：停掉设备后台常驻的 ttyd 进程（开关保持）。 */
+    @POST("api/terminal/stop")
+    suspend fun ttydStop(): JsonElement
+
+    /**
+     * 2026-10-10：签发真 PTY 票据（app 端原生终端用）。
+     * 返回 `{"ticket": "...", "session_id": "...", "port": 17682}`。
+     * 403 = `ttyd_enabled` 开关未开（与 core 侧同一防御模型）。
+     */
+    @POST("api/terminal/pty-ticket")
+    suspend fun ptyTicket(): JsonElement
+
+    @DELETE("api/media/thumbnail-cache")
+    suspend fun clearMediaThumbnailCache(
+        @Query("type") type: String? = null,
+        // 2026-10-07：可选 id —— 传了只清那一条（「重新获取封面」菜单项用）
+        @Query("id") id: Long? = null
+    ): JsonElement
+
+    /**
+     * 单首音频的标签（曲名 / 艺术家 / 专辑 / 时长）。
+     *
+     * `/list` 里已经带了同名字段（来自系统扫描），这一条是**缺失时的补强**：
+     * core 会直接对文件再读一次标签。播放页进页面就能拉到正确的歌名，
+     * 不必等播放器解出容器元数据才更新。
+     */
+    @GET("api/media/tags")
+    suspend fun getMediaTags(@Query("id") id: Long): MediaTagsResponse
+
+    // ========== 音频歌单（2026-09-21）==========
+    //
+    // 歌单存在 core，app 与 web 看同一份。曲目以**真实路径**为标识（MediaStore id 重扫会变，
+    // 拿它存歌单等于存一个会失效的引用），所以写操作传的都是 paths。
+
+    /** 全部歌单（不含曲目明细）。 */
+    @GET("api/playlists")
+    suspend fun getPlaylists(): PlaylistsResponse
+
+    /**
+     * 某个歌单的曲目。
+     *
+     * 回的 item 与 [getMediaList] 的完全同构（多一个 `missing`），所以曲目列表组件可以直接复用。
+     * **顺序就是播放顺序** —— 不要再按音乐页的排序偏好重排；已失效的条目照样在列表里
+     * （`missing = true`，`id = 0`），画占位而不是隐藏。
+     */
+    @GET("api/playlists/{id}/items")
+    suspend fun getPlaylistItems(@Path("id") id: String): PlaylistItemsResponse
+
+    /** 新建歌单。id 由 core 生成 —— 客户端传 id 不被接受。 */
+    @POST("api/playlists")
+    suspend fun createPlaylist(@Body body: PlaylistNameRequest): PlaylistCreateResponse
+
+    /** 重命名。同名（忽略大小写）会被 core 以 409 `ALREADY_EXISTS` 拒绝。 */
+    @PUT("api/playlists/{id}")
+    suspend fun renamePlaylist(
+        @Path("id") id: String,
+        @Body body: PlaylistNameRequest
+    ): JsonElement
+
+    @DELETE("api/playlists/{id}")
+    suspend fun deletePlaylist(@Path("id") id: String): JsonElement
+
+    /**
+     * 加歌。不在媒体库里的路径会被 core 跳过并计入 `skipped`（不会变成一条坏数据）。
+     * `position` 省略即追加到尾部。
+     */
+    @POST("api/playlists/{id}/items")
+    suspend fun addPlaylistItems(
+        @Path("id") id: String,
+        @Body body: PlaylistPathsRequest
+    ): PlaylistAddResponse
+
+    /**
+     * 移出曲目。
+     *
+     * 走**重复 query 参数**（`?path=a&path=b`）而不是 DELETE 带 body：Retrofit 的 `@DELETE`
+     * 不允许 `@Body`（要加就得换成 `@HTTP(hasBody=true)`），而带 body 的 DELETE 在部分代理上
+     * 还会被丢掉。core 两种写法都收（web 侧用的是 body）。
+     *
+     * `paths` 必须是**已编码**的值（`encoded = true`），理由同 [getMediaList] 的 album/artist/dir：
+     * OkHttp 在 query 里不编码 `+`，而 Ktor 解 query 时把 `+` 当空格 —— 路径含 `+` 的曲目
+     * （`C++.mp3`、`新曲+精选/…`）会因此永远移不掉，只回「已移出 0 首」。
+     * 调用方用 `encodeUriComponent` 编好再传。
+     */
+    @DELETE("api/playlists/{id}/items")
+    suspend fun removePlaylistItems(
+        @Path("id") id: String,
+        @Query("path", encoded = true) paths: List<String>
+    ): PlaylistRemoveResponse
+
+    /**
+     * 整表重排：`paths` 是新的完整顺序。
+     *
+     * 语义是「只调顺序，不增不删」—— 不在歌单里的 path 被忽略，没提到的条目留在尾部。
+     */
+    @PUT("api/playlists/{id}/items")
+    suspend fun reorderPlaylistItems(
+        @Path("id") id: String,
+        @Body body: PlaylistPathsRequest
+    ): JsonElement
+
+    // ========== 从音乐库移除 / 删除文件（2026-09-23）==========
+    //
+    // 两件事刻意分成两个接口，**不要**合成一个带 mode 参数的：
+    // 一个可撤销（只改名单）、一个不可逆（删磁盘上的字节）。合在一起迟早有客户端传错那个参数。
+
+    /**
+     * 当前「从音乐库移除」的路径名单。
+     *
+     * 给管理页用 —— 没有这个页面就不该放开排除功能，误操作无法恢复。
+     * 响应里的 `max` / `full` 是硬上限（名单会变成 SQL 的 `NOT IN (?,…)`，绑定变量有限），
+     * 客户端据此提前提示，而不是让用户点了才发现没生效。
+     */
+    @GET("api/media/excluded")
+    suspend fun getExcludedMedia(): MediaExcludedResponse
+
+    /**
+     * 加入 / 移出排除名单。**只改名单，永远不动文件。**
+     *
+     * `action`：`add` / `remove` / `clear`（`clear` 时 `paths` 可为空）。
+     * 返回的 `affected` 小于 `requested` 说明撞上了上限被截断。
+     */
+    @POST("api/media/exclude")
+    suspend fun excludeMedia(@Body body: MediaExcludeRequest): MediaExcludeResponse
+
+    // 删除文件走的是既有的 `deleteFile(Map<String, String>)`（本文件下方文件管理那一段）——
+    // `POST /api/files/delete` 只有一条，不为音乐库再开一个同路径的重载：那样两处签名迟早分叉。
+    // 没有「所有文件访问权限」时 core 回 403 + `needsAllFilesAccess`，调用方按状态码引导授权。
+
+    // ========== Weather（2026-09-17，core 代理 Open-Meteo）==========
+
+    /**
+     * 当前天气。默认用设备上保存的坐标；[lat]/[lon] 只在「设置页里选了城市、想先看一眼」
+     * 时传（保存前的预览），正常显示不要传。
+     */
+    @GET("api/weather")
+    suspend fun getWeatherNow(
+        @Query("lat") lat: Double? = null,
+        @Query("lon") lon: Double? = null,
+        @Query("city") city: String? = null
+    ): WeatherNowResponse
+
+    /** 城市搜索（core 侧缓存 1 天）。 */
+    @GET("api/weather/search")
+    suspend fun searchWeatherCity(
+        @Query("name") name: String,
+        @Query("lang") lang: String = "zh"
+    ): WeatherSearchResponse
+
+    @GET("api/weather/config")
+    suspend fun getWeatherConfig(): WeatherConfigResponse
+
+    /** 字段级合并：只传要改的字段。 */
+    @PUT("api/weather/config")
+    suspend fun updateWeatherConfig(@Body body: WeatherConfigRequest): WeatherConfigUpdateResponse
+
+    // ========== 今日诗词（2026-09-18，core 代理 jinrishici v2）==========
+
+    /**
+     * 当前推荐的一句诗。标签匹配由上游按设备 IP 自动完成（季节/天气/时辰/地理），
+     * 命中的标签在 `match_tags` 里回传。
+     *
+     * @param refresh 传 `"1"` 绕过 core 的本地缓存；上游对同一 token 有约 10 分钟的
+     *   预生成缓存，所以短时间内仍可能是同一句 —— 这是它的机制，不是失败。
+     */
+    @GET("api/poetry")
+    suspend fun getPoetry(@Query("refresh") refresh: String? = null): PoetryResponse
+
+    @GET("api/poetry/config")
+    suspend fun getPoetryConfig(): PoetryConfigResponse
+
+    /** 字段级合并：只传要改的字段。 */
+    @PUT("api/poetry/config")
+    suspend fun updatePoetryConfig(@Body body: PoetryConfigRequest): PoetryConfigUpdateResponse
+
+    // ========== 出网国家/地区（2026-09-18，检测在 core）==========
+
+    /**
+     * 设备的出网国家/地区。**app 不再自己做地理检测** —— 判据是出网 IP 的归属，
+     * 而设备才是出网点；每端各测一次只会得到几份可能不一致的结果。
+     *
+     * core 在自己启动时已经测过一次并落盘，这里通常是直接读那份结果（`source=cache`）；
+     * 结果缺失或超过 7 天时 core 会顺手重测（`source=fresh`），故本调用偶尔会慢几秒。
+     */
+    @GET("api/geo")
+    suspend fun getGeo(): GeoResponse
 
     // ========== Network ==========
     @GET("api/network/signal")
@@ -212,6 +611,23 @@ interface UfiAxisApi {
     @POST("api/wifi/config")
     suspend fun setWifiConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
+    /**
+     * WiFi 频段切换（`POST /api/wifi/band`，body `{ "chip": "chip1" | "chip2" }`）。
+     *
+     * **和 `/config` 是两条路**：频段不能塞进 `setWifiConfig` 的 `chip_index` —— 那一项落到
+     * 设备的 `setAccessPointInfo → ChipIndex`，**设备不认**（用户实测「改了没反应」）。
+     * 真正换频段的设备命令是 `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`
+     * （2026-09-22 真机抓包，chip1 = 2.4G、chip2 = 5G），core 把它包成本端点。
+     *
+     * 取值只认 `chip1` / `chip2`：`"0"`/`"1"`（读侧编码）与 `"2.4G"`/`"5G"`（界面文案）都不是
+     * 传输值，core 侧 profile 的 validate 会直接回 400 + 原因。
+     *
+     * **副作用**：这条命令等于「在该频段上启用 WiFi」—— 会重启 WiFi 模块，正通过 WiFi 连着的
+     * 客户端（包括本机）会掉线，且原本关着的 WiFi 会被打开。调用前必须让用户确认。
+     */
+    @POST("api/wifi/band")
+    suspend fun setWifiBand(@Body body: Map<String, String>): SuccessResponse
+
     @POST("api/wifi/power")
     suspend fun setWifiPower(@Body body: Map<String, Int>): SuccessResponse
 
@@ -314,6 +730,13 @@ interface UfiAxisApi {
     @POST("api/device/data-limit")
     suspend fun setDataLimit(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
+    // 套餐档案（2026-10-07 到量/到期融合）：core 语义层，goform 无套餐概念
+    @GET("api/device/plan")
+    suspend fun getPlanProfile(): PlanProfileResponse
+
+    @POST("api/device/plan")
+    suspend fun savePlanProfile(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
+
     @POST("api/device/flow-calibration")
     suspend fun calibrateFlow(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
@@ -350,6 +773,14 @@ interface UfiAxisApi {
     // ========== SMS / SIM Actions ==========
     @POST("api/sms/delete")
     suspend fun deleteSms(@Body body: Map<String, String>): SmsActionResponse
+
+    /** 按号码删除整段会话（2026-09-21）。 */
+    @POST("api/sms/delete-conversation")
+    suspend fun deleteConversation(@Body body: Map<String, String>): SmsActionResponse
+
+    /** 批量删除多条短信（2026-09-21）。 */
+    @POST("api/sms/delete-batch")
+    suspend fun deleteBatch(@Body body: Map<String, @JvmSuppressWildcards Any>): SmsActionResponse
 
     @POST("api/sms/read")
     suspend fun markSmsRead(@Body body: Map<String, String>): SmsActionResponse
@@ -537,6 +968,13 @@ interface UfiAxisApi {
     @PUT("api/config")
     suspend fun updateUpdateSource(@Body body: Map<String, @JvmSuppressWildcards Any>): ConfigUpdateResponse
 
+    /**
+     * core 的更新源决策（2026-09-22）。app 的 APK 自更新刻意不走 core 代理
+     * （core 挂了也得能更新自己），所以只取决策、自己拼 URL 下载。
+     */
+    @GET("api/update/source")
+    suspend fun getUpdateSource(): UpdateSourceInfo
+
     @POST("api/config/reset")
     suspend fun resetConfig(): ConfigResetResponse
 
@@ -647,6 +1085,22 @@ interface UfiAxisApi {
     suspend fun clearMailHistory(
         @Query("channel") channel: String? = null
     ): SmsForwardSaveResponse
+
+    /**
+     * 删单条投递记录（详情弹窗「删除」）。
+     *
+     * 旧 core 无此端点会回 404/405，调用方需按「设备端不支持」提示，不要当网络故障重试刷屏。
+     */
+    @DELETE("api/sms-forward/history/{id}")
+    suspend fun deleteMailHistoryById(
+        @Path("id") id: Long
+    ): MailHistoryDeleteResponse
+
+    /** 三渠道配置页统计卡（总投递 / 失败 / 拦截 / 最近成功）。 */
+    @GET("api/sms-forward/history/stats")
+    suspend fun getMailHistoryStats(
+        @Query("channel") channel: String
+    ): MailHistoryStatsResponse
 
     // ========== 通用 Webhook 通知渠道 ==========
     /**
@@ -784,6 +1238,12 @@ interface UfiAxisApi {
     @POST("api/device/cell-unlock")
     suspend fun unlockAllCell(): SuccessResponse
 
+    // ========== Device Capabilities ==========
+    // 设备能力集（计划书 §7 阶段 3 的 3.5）。core 侧在装配组件图时算一次的**静态快照**，
+    // 不发任何设备查询，所以 app 侧缓存到进程生命周期就够（见 NetworkModule.loadDeviceCapabilities）。
+    @GET("api/device/capabilities")
+    suspend fun getDeviceCapabilities(): DeviceCapabilitiesResponse
+
     // ========== Shutdown ==========
     @POST("api/device/shutdown")
     suspend fun shutdownDevice(): DeviceControlResponse
@@ -815,6 +1275,14 @@ interface UfiAxisApi {
      */
     @POST("api/speedtest/upload")
     suspend fun speedTestUpload(@Body body: okhttp3.RequestBody): ResponseBody
+
+    /**
+     * 定时测速历史（2026-10-06 批C；core SpeedTestRoutes /history，新的在前）。
+     * 返回 `{ "items": [ { timestamp, download_mbps, upload_mbps, latency_ms, jitter_ms, trigger } ] }`，
+     * 数值是字符串化的（core 侧用 "%.2f".format 产出），消费端按 Double.parseDouble 解。
+     */
+    @GET("api/speedtest/history")
+    suspend fun speedTestHistory(@Query("limit") limit: Int = 30): JsonObject
 
     // ========== Debug Logs ==========
     @GET("api/debug-logs")
@@ -904,6 +1372,58 @@ interface UfiAxisApi {
     /** 校验和：body { path, algorithms? }；默认 md5/sha1/sha256，可选 sha512。 */
     @POST("api/files/checksum")
     suspend fun checksumFile(@Body body: Map<String, String>): ArchiveChecksumResponse
+
+    // ── 远端上传的第二阶段：core 暂存 → 外部存储源 ──
+    // 第一阶段（手机 → core）走 `upload/session|chunk|complete`，那条链路是裸 OkHttp
+    // （要按偏移切片、逐字节推进度，见 ChunkedFileUploader）。第二阶段只是查状态与下指令，
+    // 走 Retrofit 即可，不必再手搓。
+
+    /** 列出推送作业（新的在前，含 6 小时内的已完成/失败记录）。UI 靠轮询它驱动任务面板。 */
+    @GET("api/files/remote-push")
+    suspend fun listRemotePushJobs(): RemotePushListResponse
+
+    /** 取消在途作业。已结束的作业回 `success:false`（正常竞态，不是错误）。 */
+    @DELETE("api/files/remote-push")
+    suspend fun cancelRemotePushJob(@Query("job") jobId: String): SuccessResponse
+
+    /** 重试失败/已取消的作业：body { job_id }。暂存文件已被清理时 core 回 409。 */
+    @POST("api/files/remote-push/retry")
+    suspend fun retryRemotePushJob(@Body body: Map<String, String>): SuccessResponse
+
+    /** 清掉所有已结束的记录（失败作业的暂存文件一并删除）。 */
+    @POST("api/files/remote-push/clear")
+    suspend fun clearRemotePushJobs(): SuccessResponse
+
+    // ========== External Storage Sources ==========
+    //
+    // 外部存储源（FTP / WebDAV）的增删改查。这里**只管配置**：真正的列目录 / 读写
+    // 仍然走上面那套 `/api/files/*`，路径写成 `remote:<sourceId>/<相对路径>`，
+    // core 侧按前缀派发给对应 provider。也就是说 app 不需要第二套文件 API，
+    // 远端与本地在文件层面是同一条链路（见 [FileItem.source]）。
+
+    @GET("api/storage/sources")
+    suspend fun listStorageSources(): StorageSourcesResponse
+
+    @GET("api/storage/sources/{id}")
+    suspend fun getStorageSource(@Path("id") id: String): StorageSourceInfo
+
+    @POST("api/storage/sources")
+    suspend fun addStorageSource(@Body body: StorageSourceRequest): StorageSourceMutationResponse
+
+    /** 改配置。`password` 传 `"********"` 表示「不动原密码」（core 侧约定，响应里也从不回密码）。 */
+    @PUT("api/storage/sources/{id}")
+    suspend fun updateStorageSource(@Path("id") id: String, @Body body: StorageSourceRequest): SuccessResponse
+
+    @DELETE("api/storage/sources/{id}")
+    suspend fun deleteStorageSource(@Path("id") id: String): SuccessResponse
+
+    /** 测已保存的源（用库里那份密码）。 */
+    @POST("api/storage/sources/{id}/test")
+    suspend fun testStorageSource(@Path("id") id: String): StorageSourceTestResponse
+
+    /** 测还没保存的配置（整份配置进 body），供「先测通再保存」。 */
+    @POST("api/storage/sources/test")
+    suspend fun testStorageSourceConfig(@Body body: StorageSourceRequest): StorageSourceTestResponse
 
     // ========== Monitor ==========
     // points 默认 240（2026-08-26 性能：原 360）——图表宽度只有约 1000px，
@@ -1162,6 +1682,16 @@ interface UfiAxisApi {
     @POST("api/components/{id}/uninstall")
     suspend fun uninstallComponent(@Path("id") id: String): JsonElement
 
+    /**
+     * CPU 控制能力探测（2026-10-08，GET /api/cpu-probe）。
+     * core 会发 20+ 条只读/写回原值的 shell 命令（5~15s），返回 cpufreq policy 矩阵、
+     * per-cpu online 节点可写性、governor 可选值与 thermal zone 快照。
+     * 用 [JsonElement] 承接：结果形状按内核漂移（policy 数、键集合），强类型解析遇新键就空白，
+     * 诊断场景要求"能认的都显示出来"，与 field_coverage 同一处理方式。
+     */
+    @GET("api/cpu-probe")
+    suspend fun getCpuProbe(): JsonElement
+
     // ========== 诊断 / 运维（2026-08-30：喂给「运行诊断」页） ==========
     // 这一组读的都是 **core 自己的状态**，不打设备，所以可以随页面刷新自由调用。
     // 唯一例外是 [getDiagnose] 带 fields=1 的那条路径 —— 见它的 KDoc。
@@ -1211,6 +1741,40 @@ data class MagiskStatus(
     val version: String
 )
 
+/**
+ * 一条「core 暂存 → 远端存储源」的推送作业（`GET /api/files/remote-push` 的 `jobs` 项）。
+ *
+ * 字段名与 core 的 `FileRoutes.pushJobJson` 一一对应，snake_case 直接映射，不做重命名 ——
+ * 两端对不上时报的是"字段缺失默认值"这种静默错误，改名只会让它更难查。
+ *
+ * @param state `queued` / `pushing` / `success` / `failed` / `cancelled`
+ * @param retryable 失败/取消后还能重试吗（暂存文件还在才行）
+ */
+@Serializable
+data class RemotePushJobInfo(
+    val id: String = "",
+    val file_name: String = "",
+    val source_id: String = "",
+    val source_label: String = "",
+    val dest_path: String = "",
+    val state: String = "",
+    val progress: Float = -1f,
+    val sent_bytes: Long = 0,
+    val total_bytes: Long = 0,
+    val error: String? = null,
+    /** 完整错误详情（异常链 + 推送上下文），供「错误详情」弹窗展示与一键复制。 */
+    val error_detail: String? = null,
+    val created_at: Long = 0,
+    val finished_at: Long = 0,
+    val retryable: Boolean = false
+)
+
+@Serializable
+data class RemotePushListResponse(
+    val jobs: List<RemotePushJobInfo> = emptyList(),
+    val active_count: Int = 0
+)
+
 @Serializable
 data class FileItem(
     val name: String,
@@ -1219,8 +1783,111 @@ data class FileItem(
     val size: Long = 0,
     val lastModified: Long = 0,
     val permissions: String = "",
-    val isSymlink: Boolean = false
+    val isSymlink: Boolean = false,
+    /**
+     * 这一条来自哪个存储源：本地是 `"local"`，远端是 `"<protocol>:<sourceId>"`（如 `ftp:abc123`）。
+     *
+     * 本地响应**不带**这个字段，所以缺省值必须是 `"local"` —— 少了缺省，历史 core 的
+     * 本地列表会直接解析失败（而不是"少个字段"这么温和）。
+     */
+    val source: String = "local"
 )
+
+// ── 外部存储源（FTP / WebDAV / SMB / S3）配置模型 ──
+// 契约要点：响应里**永远没有** password 字段（core 不回传密码）；
+// 改配置时把 password 传成 "********" 表示沿用原密码。
+// S3 复用凭据字段：username = Access Key，password = Secret Key。
+
+@Serializable
+data class StorageSourcesResponse(
+    val sources: List<StorageSourceInfo> = emptyList()
+)
+
+/**
+ * 一个已保存的外部存储源。
+ *
+ * @param capabilities core 报告的能力清单（`LIST` / `READ` / `WRITE` / `DELETE` / `RENAME` /
+ *   `MKDIR` / `UPLOAD` / `DOWNLOAD` …）。UI 必须据此隐藏做不到的动作 —— FTP / WebDAV 都没有
+ *   「解压 / 压缩 / 校验和」这类需要在设备本地跑计算的能力，菜单里留着就是点了必然失败的项。
+ */
+@Serializable
+data class StorageSourceInfo(
+    val id: String = "",
+    val label: String = "",
+    val protocol: String = "",
+    val host: String = "",
+    val port: Int = 0,
+    /**
+     * 用户名 / Access Key。**会回显**——它不是秘密，而且不回显的话编辑弹窗一保存
+     * 就把它清成空串（密码靠 `"********"` 占位兜住，用户名没有等价机制）。
+     */
+    val username: String = "",
+    val basePath: String = "/",
+    val useTls: Boolean = false,
+    val passive: Boolean = true,
+    val encoding: String = "UTF-8",
+    val trustAllCerts: Boolean = false,
+    /** SMB 专用：Windows 域 / 工作组，留空表示无域。 */
+    val domain: String = "",
+    /** SMB 专用：共享名（NAS 上的共享文件夹名）。 */
+    val share: String = "",
+    /** S3 专用：Bucket 名。 */
+    val bucket: String = "",
+    /** S3 专用：Region（MinIO 等自建服务用 us-east-1 即可）。 */
+    val region: String = "us-east-1",
+    /** S3 专用：自定义 endpoint 主机名（不含协议前缀），留空走 AWS 官方地址。 */
+    val endpoint: String = "",
+    /** S3 专用：路径式寻址（MinIO 必须开启）。 */
+    val pathStyle: Boolean = true,
+    val timeoutSec: Int = 15,
+    val enabled: Boolean = true,
+    val capabilities: List<String> = emptyList()
+)
+
+/** 新增 / 修改 / 试连的请求体（三处共用一份，字段集完全一致）。 */
+@Serializable
+data class StorageSourceRequest(
+    val label: String,
+    val protocol: String,
+    val host: String,
+    val port: Int,
+    val username: String = "",
+    val password: String = "",
+    val basePath: String = "/",
+    val useTls: Boolean = false,
+    val passive: Boolean = true,
+    val encoding: String = "UTF-8",
+    val trustAllCerts: Boolean = false,
+    /** SMB 专用：Windows 域 / 工作组，留空表示无域。 */
+    val domain: String = "",
+    /** SMB 专用：共享名（NAS 上的共享文件夹名）。SMB 源必填。 */
+    val share: String = "",
+    /** S3 专用：Bucket 名。S3 源必填。 */
+    val bucket: String = "",
+    /** S3 专用：Region（MinIO 等自建服务用 us-east-1 即可）。 */
+    val region: String = "us-east-1",
+    /** S3 专用：自定义 endpoint 主机名（不含协议前缀），留空走 AWS 官方地址。 */
+    val endpoint: String = "",
+    /** S3 专用：路径式寻址（MinIO 必须开启）。 */
+    val pathStyle: Boolean = true,
+    val timeoutSec: Int = 15,
+    val enabled: Boolean = true
+)
+
+@Serializable
+data class StorageSourceMutationResponse(
+    val success: Boolean = false,
+    val source: StorageSourceInfo? = null,
+    val message: String? = null
+)
+
+@Serializable
+data class StorageSourceTestResponse(
+    val success: Boolean = false,
+    val message: String = "",
+    @SerialName("latency_ms") val latencyMs: Long = 0
+)
+
 
 @Serializable
 data class FileListResponse(

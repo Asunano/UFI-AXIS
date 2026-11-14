@@ -1,0 +1,1411 @@
+package com.ufi_axis.viewmodel.module
+
+import android.content.Context
+import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.model.MEDIA_GROUP_ALBUM
+import com.ufi_axis.data.model.MEDIA_GROUP_ARTIST
+import com.ufi_axis.data.model.MEDIA_GROUP_FOLDER
+import com.ufi_axis.data.model.MEDIA_TYPE_AUDIO
+import com.ufi_axis.data.model.MEDIA_TYPE_VIDEO
+import com.ufi_axis.data.model.MediaDirsRequest
+import com.ufi_axis.data.model.MediaExcludeRequest
+import com.ufi_axis.data.model.MediaLibraryItem
+import com.ufi_axis.data.model.MediaSubtitleEntry
+import com.ufi_axis.data.model.MediaTagsResponse
+import com.ufi_axis.data.model.PlaylistAddResponse
+import com.ufi_axis.data.model.PlaylistNameRequest
+import com.ufi_axis.data.model.PlaylistPathsRequest
+import com.ufi_axis.data.model.VideoInfoResponse
+import com.ufi_axis.util.AppPreferences
+import com.ufi_axis.util.encodeUriComponent
+import com.ufi_axis_core.contract.WsDataTopic
+import com.ufi_axis.viewmodel.state.AudioQueueScope
+import com.ufi_axis.viewmodel.state.MEDIA_GROUP_KINDS
+import com.ufi_axis.viewmodel.state.MEDIA_KINDS
+import com.ufi_axis.viewmodel.state.MEDIA_ORDER_DESC
+import com.ufi_axis.viewmodel.state.MEDIA_SORT_DATE
+import com.ufi_axis.viewmodel.state.MediaBrowseState
+import com.ufi_axis.viewmodel.state.MediaExcludedState
+import com.ufi_axis.viewmodel.state.MediaGroupState
+import com.ufi_axis.viewmodel.state.MediaLibraryState
+import com.ufi_axis.viewmodel.state.MediaPlaylistDetailState
+import com.ufi_axis.viewmodel.state.MediaPlaylistState
+import com.ufi_axis.viewmodel.state.MediaTabState
+import com.ufi_axis.viewmodel.state.mediaGroupItemsKey
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.boolean
+import com.ufi_axis.util.DebugLog
+import java.net.URLEncoder
+
+/**
+ * 媒体库（工具 → 视频 / 音乐 / 图片三个独立页）的取数与状态。
+ *
+ * 数据全部来自 core 的 `/api/media` 一组端点 —— core 查系统媒体库（MediaStore），
+ * app 只做展示与分页。**这里不做任何"什么算视频""扫哪些目录"的判定**：
+ * 扩展名归类在 MediaStore、目录范围是 core 侧的设备配置。
+ *
+ * 三个页面共用本模块**一份**状态（[MediaLibraryState]），每类各占一个槽
+ * （[MediaLibraryState.tabs]）：从视频页去音乐页再回来，视频列表还在，不重新拉。
+ *
+ * 2026-09-16（媒体中心拆成三页）：扫描目录、重扫状态、提示文案都变成**按类型各一份**，
+ * 所以 [setScanDirs] / [rescan] 都要带 type —— 视频页只改视频那一份。
+ * 排序是**展示偏好**，只放内存 / 客户端，不往 core 写；扫描目录才是设备配置。
+ */
+class MediaModule(
+    private val api: UfiAxisApi,
+    private val appContext: Context,
+    private val scope: CoroutineScope
+) {
+
+    companion object {
+        /** 一页条数。与 core 的默认值一致；媒体库上千项，靠分页而不是一次拉完。 */
+        const val PAGE_SIZE = 100
+
+        /** 缩略图默认边长（core 侧夹在 96..1024）。 */
+        const val THUMB_SIZE = 256
+
+        /** [allItems] 的枚举上限：一次枚举上万项本身就不合理。 */
+        const val ALL_ITEMS_LIMIT = 2000
+
+        /**
+         * 点了"无标签"那一组时给用户的说法。
+         *
+         * core 侧把没有专辑/歌手标签的文件聚成 key 为空串的一组，而空 key 送回
+         * `/api/media/list` 会被当成"没传过滤条件"—— 那样点进去看到的是整库，比报错更糟。
+         * 所以这里拦下来并解释原因，而不是静默什么都不做（用户只会以为 App 卡了）。
+         */
+        const val GROUP_KEY_MISSING_MESSAGE = "这一组没有标签信息，无法单独查看"
+    }
+
+    private val _state = MutableStateFlow(initialState())
+    val state: StateFlow<MediaLibraryState> = _state.asStateFlow()
+
+    /**
+     * 从本地 prefs 还原三页各自的展示偏好（视图 / 排序）。
+     *
+     * 与文件管理器 `FileManagerModule` 同款做法：进程启动时读一次，不做异步 —— 这是几个
+     * boolean/string，走 `SharedPreferences` 同步读比引入一次状态跃迁便宜得多。
+     * 扫描目录**不**在这里还原：那是 core 侧的设备配置，由 [loadStatus] 拉。
+     */
+    private fun initialState(): MediaLibraryState {
+        val prefs = AppPreferences(appContext)
+        return MediaLibraryState(
+            tabs = MEDIA_KINDS.associate { (type, _) ->
+                type to MediaTabState(
+                    type = type,
+                    sort = runCatching { prefs.mediaSort(type) }.getOrDefault(MEDIA_SORT_DATE),
+                    order = runCatching { prefs.mediaOrder(type) }.getOrDefault(MEDIA_ORDER_DESC),
+                    gridView = runCatching { prefs.mediaGridView(type) }.getOrDefault(type == "image")
+                )
+            }
+        )
+    }
+
+    private fun updateTab(type: String, transform: (MediaTabState) -> MediaTabState) {
+        _state.update { s ->
+            val current = s.tab(type)
+            s.copy(tabs = s.tabs + (type to transform(current)))
+        }
+    }
+
+    /**
+     * 读三类媒体的授权状态与各自的扫描目录。
+     *
+     * 进入任一媒体页时调一次。授权状态**必须**先拿到：没权限时界面要显示引导，
+     * 而不是先显示一个空列表再解释（那是"假空态"）。
+     */
+    fun loadStatus() {
+        scope.launch {
+            try {
+                val status = api.getMediaStatus()
+                _state.update { s ->
+                    s.copy(
+                        allFilesAccess = status.all_files_access,
+                        statusLoaded = true,
+                        errorMessage = null,
+                        tabs = s.tabs.mapValues { (type, tab) ->
+                            tab.copy(
+                                granted = status.granted[type] ?: status.all_files_access,
+                                scanDirs = status.scan_dirs[type] ?: tab.scanDirs
+                            )
+                        }
+                    )
+                }
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(statusLoaded = true, errorMessage = "读取媒体库状态失败: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 取某一类的第一页（[force] = false 且已经加载过则跳过）。
+     *
+     * 与 [loadMore] 分开是刻意的：首屏用 `isLoading`、翻页用 `isAppending`，
+     * 共用一个标志会让翻页时整块退回骨架屏。
+     */
+    fun loadFirstPage(type: String, force: Boolean = false) {
+        val tab = _state.value.tab(type)
+        if (!force && tab.loadedOnce) return
+        if (tab.isLoading) return
+        updateTab(type) { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getMediaList(
+                    type = type,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = 0
+                )
+                updateTab(type) {
+                    it.copy(
+                        items = resp.items,
+                        total = resp.total,
+                        isLoading = false,
+                        loadedOnce = true,
+                        granted = true,
+                        errorMessage = null,
+                        scanDirs = resp.scan_dirs
+                    )
+                }
+            } catch (e: Exception) {
+                // 403 = 这一类没授权：把 granted 落到 false，界面切成授权引导
+                val denied = e.message?.contains("403") == true
+                updateTab(type) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        granted = if (denied) false else it.granted,
+                        errorMessage = if (denied) null else "加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 文件夹视图：列某一层（[path] 为空时由 core 决定起点）。
+     *
+     * 不分页 —— core 单层有条数上限，而"一个目录里几百个文件还要翻页"这种目录结构本身
+     * 就该整理一下。排序沿用该类型的排序偏好，与平铺列表保持一致。
+     */
+    fun browse(type: String, path: String? = null, force: Boolean = false) {
+        val current = _state.value.folderView(type)
+        val target = path ?: current.path.takeIf { it.isNotBlank() }
+        if (!force && current.loadedOnce && target == current.path.takeIf { it.isNotBlank() }) return
+        if (current.isLoading) return
+        val tab = _state.value.tab(type)
+        updateBrowse(type) { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.browseMedia(
+                    type = type,
+                    path = target,
+                    sort = tab.sort,
+                    order = tab.order
+                )
+                updateBrowse(type) {
+                    it.copy(
+                        path = resp.path,
+                        parent = resp.parent,
+                        roots = resp.roots,
+                        folders = resp.folders,
+                        items = resp.items,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateBrowse(type) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "打开目录失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 回到上一级；已经在根上就什么都不做（界面那颗按钮此时也不该出现）。 */
+    fun browseUp(type: String) {
+        val parent = _state.value.folderView(type).parent ?: return
+        browse(type, parent, force = true)
+    }
+
+    /**
+     * 把某一类**整库**拉齐（分页循环），给需要全集的操作用。
+     *
+     * 不进 [state]：这是一次性的枚举结果，塞进列表状态会和分页浏览打架
+     * （用户明明只滚到第 2 页，列表却突然有了 800 项）。
+     * 上限 [ALL_ITEMS_LIMIT] 是防呆：真有上万个视频时，整库枚举不该一次做完。
+     */
+    suspend fun allItems(type: String): List<MediaLibraryItem> {
+        val tab = _state.value.tab(type)
+        val collected = mutableListOf<MediaLibraryItem>()
+        var offset = 0
+        while (collected.size < ALL_ITEMS_LIMIT) {
+            val resp = try {
+                api.getMediaList(
+                    type = type,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = offset
+                )
+            } catch (e: CancellationException) {
+                // 取消 ≠ 请求失败：吞掉会把残缺列表当成全集返回
+                throw e
+            } catch (e: Exception) {
+                break
+            }
+            if (resp.items.isEmpty()) break
+            collected += resp.items
+            offset += resp.items.size
+            if (offset >= resp.total) break
+        }
+        return collected.distinctBy { it.id }
+    }
+
+    /**
+     * 取某个**播放作用域**下的全部曲目（拉齐所有分页），供装载播放队列用。
+     *
+     * 与 [loadGroupItems] 的区别：后者只拉一页、写进 `audioGroupItems` 给**浏览**用；
+     * 这里要的是"这个范围里到底有哪些歌"，必须拉齐 —— 否则专辑第 101 首之后的歌
+     * 进不了队列，「下一首」会在第 100 首处莫名停下。
+     *
+     * 排序沿用音乐页的排序偏好（与 [loadGroupItems] 同口径）：从列表点进专辑，
+     * 曲目顺序突然换一套只会让人困惑。
+     *
+     * 失败或范围为空时回空列表 —— 调用方（播放页）自己有单曲兜底分支。
+     */
+    suspend fun queueItemsOf(scope: AudioQueueScope): List<MediaLibraryItem> {
+        if (scope.isAll) return allItems(MEDIA_TYPE_AUDIO)
+        // 歌单必须在分组判定之前：它不走 `/api/media/list`，顺序也不是音乐页那套排序偏好，
+        // 而是用户在歌单里排定的顺序（core 原样给出）。已失效的条目排掉 ——
+        // 它们没有可播地址，留在队列里会让播放器在那一首上报错卡住。
+        if (scope.isPlaylist) {
+            return try {
+                api.getPlaylistItems(scope.key).items.filterNot { it.missing }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        }
+        if (!scope.isGroup) return emptyList()
+
+        val (album, artist, dir) = groupFilters(scope.kind, scope.key)
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        val collected = mutableListOf<MediaLibraryItem>()
+        var offset = 0
+        while (collected.size < ALL_ITEMS_LIMIT) {
+            val resp = try {
+                api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = offset,
+                    album = album,
+                    artist = artist,
+                    dir = dir
+                )
+            } catch (e: CancellationException) {
+                // 取消 ≠ 请求失败：吞掉会让队列只剩前几页的歌
+                throw e
+            } catch (e: Exception) {
+                break
+            }
+            if (resp.items.isEmpty()) break
+            collected += resp.items
+            offset += resp.items.size
+            if (offset >= resp.total) break
+        }
+        return collected.distinctBy { it.id }
+    }
+
+
+    private fun updateBrowse(type: String, transform: (MediaBrowseState) -> MediaBrowseState) {
+        _state.update { s ->
+            s.copy(browse = s.browse + (type to transform(s.folderView(type))))
+        }
+    }
+
+    /** 追加下一页。没有更多、正在加载、或正在首屏加载时都不发请求。 */
+    fun loadMore(type: String) {
+        val tab = _state.value.tab(type)
+        if (tab.isLoading || tab.isAppending || !tab.hasMore) return
+        updateTab(type) { it.copy(isAppending = true) }
+        scope.launch {
+            try {
+                val resp = api.getMediaList(
+                    type = type,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = tab.items.size
+                )
+                updateTab(type) { current ->
+                    // 按 id 去重：翻页期间媒体库可能新增/删除，offset 会错位
+                    val existing = current.items.mapTo(HashSet()) { it.id }
+                    current.copy(
+                        items = current.items + resp.items.filter { it.id !in existing },
+                        total = resp.total,
+                        isAppending = false
+                    )
+                }
+            } catch (e: Exception) {
+                updateTab(type) {
+                    it.copy(isAppending = false, errorMessage = "加载更多失败: ${e.message}")
+                }
+            }
+        }
+    }
+
+    // ── 音频分组（专辑 / 歌手 / 文件夹）──
+    //
+    // 聚合由 core 一次算完（`/api/media/groups`），app 不在本地对整库做 groupBy ——
+    // 那要先把上千首全拉下来，且分组口径会和 core / Web 端对不上。
+    // 点进某一组之后列曲目仍走 `/api/media/list`（带 album/artist/dir 过滤），
+    // 不新造"列某组曲目"的接口。
+
+    private fun updateGroup(by: String, transform: (MediaGroupState) -> MediaGroupState) {
+        _state.update { s ->
+            s.copy(audioGroups = s.audioGroups + (by to transform(s.group(by))))
+        }
+    }
+
+    private fun updateGroupItems(
+        by: String,
+        key: String,
+        transform: (MediaTabState) -> MediaTabState
+    ) {
+        _state.update { s ->
+            val slot = mediaGroupItemsKey(by, key)
+            s.copy(audioGroupItems = s.audioGroupItems + (slot to transform(s.groupItems(by, key))))
+        }
+    }
+
+    /** `by` 是不是 core 支持的分组维度。非法值一律当"没这个功能"，不发请求。 */
+    private fun isGroupBy(by: String): Boolean = MEDIA_GROUP_KINDS.any { (value, _) -> value == by }
+
+    /**
+     * 把组的 key 翻成 `/api/media/list` 的过滤参数。
+     *
+     * 三个维度对应三个不同的 query，映射只写在这一处：写在调用点会在"加载首页"和"加载更多"
+     * 各来一份，改起来必然漏一个。
+     *
+     * ## 值要**先编码**（2026-09-21 修"专辑里没有歌"）
+     * `getMediaList` 的这三个参数声明成 `encoded = true`，因为 Retrofit/OkHttp 在 query 里
+     * 不编码 `+`，而 Ktor 解 query 时把 `+` 当空格 —— 专辑名 `万岁2001 新曲+精选`
+     * 会在服务端变成 `万岁2001 新曲 精选`，一条都匹配不上。
+     * [encodeUriComponent] 把 `+` 编成 `%2B`、空格编成 `%20`，两端就对得上了。
+     */
+    private fun groupFilters(by: String, key: String): Triple<String?, String?, String?> {
+        val encoded = encodeUriComponent(key)
+        return when (by) {
+            MEDIA_GROUP_ALBUM -> Triple(encoded, null, null)
+            MEDIA_GROUP_ARTIST -> Triple(null, encoded, null)
+            MEDIA_GROUP_FOLDER -> Triple(null, null, encoded)
+            else -> Triple(null, null, null)
+        }
+    }
+
+    /**
+     * 取某个维度的分组列表（专辑 / 歌手 / 文件夹）。
+     *
+     * 不分页：core 一次给全量分组。[force] = false 且已经拉过就跳过 —— 分组页会随着
+     * 维度切换反复进入，每次都打一次网络没有必要（媒体库变了由下拉刷新 force 重来）。
+     */
+    fun loadGroups(by: String, force: Boolean = false) {
+        if (!isGroupBy(by)) return
+        val current = _state.value.group(by)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updateGroup(by) { it.copy(by = by, isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getMediaGroups(MEDIA_TYPE_AUDIO, by)
+                updateGroup(by) {
+                    it.copy(
+                        by = by,
+                        groups = resp.groups,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroup(by) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "加载分组失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 取某一组里的第一页曲目。
+     *
+     * 排序沿用音乐页的排序偏好：从列表点进专辑，曲目顺序突然换一套只会让人困惑。
+     * [key] 为空串（无标签兜底组）时不发请求，改成给一条能看懂的提示 —— 见
+     * [GROUP_KEY_MISSING_MESSAGE]。
+     */
+    fun loadGroupItems(by: String, key: String, force: Boolean = false) {
+        if (!isGroupBy(by)) return
+        if (key.isEmpty()) {
+            updateGroupItems(by, key) {
+                it.copy(isLoading = false, loadedOnce = true, errorMessage = GROUP_KEY_MISSING_MESSAGE)
+            }
+            return
+        }
+        val current = _state.value.groupItems(by, key)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        updateGroupItems(by, key) { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val (album, artist, dir) = groupFilters(by, key)
+                val resp = api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = 0,
+                    album = album,
+                    artist = artist,
+                    dir = dir
+                )
+                updateGroupItems(by, key) {
+                    it.copy(
+                        items = resp.items,
+                        total = resp.total,
+                        isLoading = false,
+                        loadedOnce = true,
+                        granted = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroupItems(by, key) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 组内曲目的下一页。守卫与 [loadMore] 一致：首屏加载中、正在追加、已到底都不发请求。 */
+    fun loadMoreGroupItems(by: String, key: String) {
+        if (!isGroupBy(by) || key.isEmpty()) return
+        val current = _state.value.groupItems(by, key)
+        if (current.isLoading || current.isAppending || !current.hasMore) return
+        val tab = _state.value.tab(MEDIA_TYPE_AUDIO)
+        updateGroupItems(by, key) { it.copy(isAppending = true) }
+        scope.launch {
+            try {
+                val (album, artist, dir) = groupFilters(by, key)
+                val resp = api.getMediaList(
+                    type = MEDIA_TYPE_AUDIO,
+                    sort = tab.sort,
+                    order = tab.order,
+                    limit = PAGE_SIZE,
+                    offset = current.items.size,
+                    album = album,
+                    artist = artist,
+                    dir = dir
+                )
+                updateGroupItems(by, key) { slot ->
+                    // 与 loadMore 同理：翻页期间媒体库可能增删，offset 会错位，按 id 去重
+                    val existing = slot.items.mapTo(HashSet()) { it.id }
+                    slot.copy(
+                        items = slot.items + resp.items.filter { it.id !in existing },
+                        total = resp.total,
+                        isAppending = false
+                    )
+                }
+            } catch (e: Exception) {
+                updateGroupItems(by, key) {
+                    it.copy(isAppending = false, errorMessage = "加载更多失败: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * 丢掉某一组的曲目缓存（离开分组详情页时调）。
+     *
+     * 分组列表本身留着（那只有几十条，且切回来就要用），但"每个逛过的专辑都留一份曲目"
+     * 会在内存里堆出几十份没人再看的列表。
+     */
+    fun clearGroupItems(by: String, key: String) {
+        _state.update { s ->
+            s.copy(audioGroupItems = s.audioGroupItems - mediaGroupItemsKey(by, key))
+        }
+    }
+
+    // ── 音频歌单（2026-09-21）──
+    //
+    // 歌单存在 core（`/api/playlists`），app 只做展示与转发：这里没有任何"哪首歌该在哪个
+    // 歌单里"的判定，去重、上限、失效标记全在 core 算完。写操作成功后重拉受影响的那一份，
+    // 不在本地拼乐观更新 —— 加歌的实际结果（跳过了几条、截断没截断）只有 core 知道。
+
+    private fun updatePlaylists(transform: (MediaPlaylistState) -> MediaPlaylistState) {
+        _state.update { s -> s.copy(playlists = transform(s.playlists)) }
+    }
+
+    private fun updatePlaylistDetail(
+        id: String,
+        transform: (MediaPlaylistDetailState) -> MediaPlaylistDetailState
+    ) {
+        _state.update { s ->
+            s.copy(playlistItems = s.playlistItems + (id to transform(s.playlistDetail(id))))
+        }
+    }
+
+    /**
+     * 拉歌单列表。
+     *
+     * [force] = false 且已经拉过就跳过（同 [loadGroups]：音乐页会反复在几个视图间切换）。
+     * 写操作与 WS 的 `media:playlists` 信号都走 force = true。
+     */
+    fun loadPlaylists(force: Boolean = false) {
+        val current = _state.value.playlists
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updatePlaylists { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getPlaylists()
+                updatePlaylists {
+                    it.copy(
+                        playlists = resp.playlists,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updatePlaylists {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "歌单加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 拉某个歌单的曲目。不分页 —— core 一次给全量，顺序就是用户排定的顺序。 */
+    fun loadPlaylistItems(id: String, force: Boolean = false) {
+        if (id.isBlank()) return
+        val current = _state.value.playlistDetail(id)
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updatePlaylistDetail(id) { it.copy(id = id, isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getPlaylistItems(id)
+                updatePlaylistDetail(id) {
+                    it.copy(
+                        id = resp.id.ifBlank { id },
+                        name = resp.name,
+                        items = resp.items,
+                        missingCount = resp.missing_count,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updatePlaylistDetail(id) {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "歌单曲目加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /** 丢掉某个歌单的曲目缓存（离开歌单详情页时调）。理由同 [clearGroupItems]。 */
+    fun clearPlaylistItems(id: String) {
+        _state.update { s -> s.copy(playlistItems = s.playlistItems - id) }
+    }
+
+    /**
+     * 新建歌单，可选地立刻把 [thenAddPaths] 加进去。
+     *
+     * 两步合成一个入口是为了「新建歌单并加入」那个常见动作：拆成两次调用会让页面自己去串
+     * "创建成功 → 拿到 id → 再加歌"，而中途失败时用户会得到一个空歌单却不知道歌没进去。
+     */
+    fun createPlaylist(name: String, thenAddPaths: List<String> = emptyList()) {
+        if (name.isBlank()) return
+        scope.launch {
+            try {
+                val created = api.createPlaylist(PlaylistNameRequest(name.trim()))
+                if (thenAddPaths.isNotEmpty() && created.id.isNotBlank()) {
+                    val added = api.addPlaylistItems(
+                        created.id,
+                        PlaylistPathsRequest(thenAddPaths)
+                    )
+                    updatePlaylists { it.copy(message = addResultMessage(created.name, added)) }
+                } else {
+                    updatePlaylists { it.copy(message = "已创建歌单「${created.name}」") }
+                }
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("创建歌单", e)) }
+            }
+        }
+    }
+
+    fun renamePlaylist(id: String, name: String) {
+        if (id.isBlank() || name.isBlank()) return
+        scope.launch {
+            try {
+                api.renamePlaylist(id, PlaylistNameRequest(name.trim()))
+                updatePlaylists { it.copy(message = "已重命名为「${name.trim()}」") }
+                loadPlaylists(force = true)
+                // 详情页的标题也要跟着变；没打开过的歌单不会有这一份，force 重拉是安全的
+                if (_state.value.playlistItems.containsKey(id)) loadPlaylistItems(id, force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("重命名", e)) }
+            }
+        }
+    }
+
+    /**
+     * 删除歌单。
+     *
+     * **不动播放器**：正在播的队列已经在 `MediaSessionService` 里，删掉歌单不该让音乐停下来
+     * （用户只是整理列表）。下一次进播放页时作用域取不到曲目，会自然落到单曲兜底分支。
+     */
+    fun deletePlaylist(id: String) {
+        if (id.isBlank()) return
+        scope.launch {
+            try {
+                api.deletePlaylist(id)
+                clearPlaylistItems(id)
+                updatePlaylists { it.copy(message = "歌单已删除") }
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("删除歌单", e)) }
+            }
+        }
+    }
+
+    /** 把曲目加进歌单。跳过与截断的口径由 core 给出，这里只把结果翻成一句话。 */
+    fun addToPlaylist(playlistId: String, paths: List<String>) {
+        if (playlistId.isBlank() || paths.isEmpty()) return
+        scope.launch {
+            try {
+                val resp = api.addPlaylistItems(playlistId, PlaylistPathsRequest(paths))
+                val name = _state.value.playlists.playlists
+                    .firstOrNull { it.id == playlistId }?.name ?: "歌单"
+                updatePlaylists { it.copy(message = addResultMessage(name, resp)) }
+                loadPlaylists(force = true)
+                if (_state.value.playlistItems.containsKey(playlistId)) {
+                    loadPlaylistItems(playlistId, force = true)
+                }
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("加入歌单", e)) }
+            }
+        }
+    }
+
+    /** 把曲目移出歌单。已失效的条目也走这条 —— 用户手动清理，不是 App 自动删。 */
+    fun removeFromPlaylist(playlistId: String, paths: List<String>) {
+        if (playlistId.isBlank() || paths.isEmpty()) return
+        scope.launch {
+            try {
+                // path 必须先编码：这条走的是重复 query 参数，Retrofit 声明成 encoded = true
+                // （OkHttp 不编码 `+`，Ktor 又把 `+` 当空格 —— 不编的话含 `+` 的曲目移不掉）
+                val resp = api.removePlaylistItems(playlistId, paths.map(::encodeUriComponent))
+                updatePlaylists { it.copy(message = "已移出 ${resp.removed} 首") }
+                loadPlaylistItems(playlistId, force = true)
+                loadPlaylists(force = true)
+            } catch (e: Exception) {
+                updatePlaylists { it.copy(errorMessage = playlistErrorText("移出歌单", e)) }
+            }
+        }
+    }
+
+    /** 页面显示过提示/错误之后调用，避免重组时反复弹同一条。 */
+    fun clearPlaylistMessage() {
+        updatePlaylists { it.copy(message = null, errorMessage = null) }
+    }
+
+    // ── 排除名单（「从音乐库移除」）与删除文件 ────────────────────────────────────
+    // 两件事刻意走两条链路：排除只改 core 的一份路径名单、**随时能撤销**；删除动的是文件本身、
+    // 不可逆。合成一个带 mode 参数的入口，会让"这一个能撤销、那一个不能"在调用点上看不出来。
+
+    private fun updateExcluded(transform: (MediaExcludedState) -> MediaExcludedState) {
+        _state.update { s -> s.copy(excluded = transform(s.excluded)) }
+    }
+
+    /**
+     * 拉排除名单。管理页进入时调；排除 / 恢复成功后由那两个方法自己 force 重拉。
+     *
+     * 三个列表页**不**调这个：core 已经在 `/api/media/list` 里把被排除的路径滤掉了，
+     * app 侧再拿一份名单做二次过滤只会多一处可能与 core 不一致的判定。
+     */
+    fun loadExcludedMedia(force: Boolean = false) {
+        val current = _state.value.excluded
+        if (!force && current.loadedOnce) return
+        if (current.isLoading) return
+        updateExcluded { it.copy(isLoading = true, errorMessage = null) }
+        scope.launch {
+            try {
+                val resp = api.getExcludedMedia()
+                updateExcluded {
+                    it.copy(
+                        paths = resp.paths,
+                        total = resp.total,
+                        max = resp.max,
+                        full = resp.full,
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = null
+                    )
+                }
+            } catch (e: Exception) {
+                updateExcluded {
+                    it.copy(
+                        isLoading = false,
+                        loadedOnce = true,
+                        errorMessage = "排除名单加载失败: ${e.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * 把曲目移出音乐库（加入排除名单）。**不动文件**，可在管理页撤销。
+     *
+     * @return null = 干净成功，什么都不用说；非 null = **必须告诉用户的话**
+     *   （失败原因，或"只生效了一部分"）。
+     *
+     * 为什么是 suspend 而不是 `scope.launch` 就返回：这条由长按菜单直接触发，用户点完就在等
+     * 结果。走 state 里的 message 字段也能显示，但那要求调用页自己接一套"显示过就清掉"的
+     * 逻辑（[clearPlaylistMessage] 那一套），而长按菜单的宿主是个临时组件，没有那个生命周期。
+     */
+    suspend fun excludeFromLibrary(paths: List<String>): String? {
+        val targets = paths.filter { it.isNotBlank() }.distinct()
+        if (targets.isEmpty()) return null
+        return try {
+            val resp = api.excludeMedia(MediaExcludeRequest(paths = targets, action = "add"))
+            dropAudioItems(targets.toSet())
+            loadExcludedMedia(force = true)
+            refreshAudioLists()
+            // affected < requested 只有一个原因：名单撞上了上限被截断。不说出来的话，
+            // 用户会以为都移除了，回头在列表里又看到那几首
+            if (resp.affected < resp.requested) {
+                "名单已满（上限 ${resp.total}），只移除了 ${resp.affected} / ${resp.requested} 首"
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            libraryErrorText("从音乐库移除", e)
+        }
+    }
+
+    /** 撤销排除（管理页的「恢复」）。恢复后那首歌会重新出现在列表里。 */
+    suspend fun restoreToLibrary(paths: List<String>): String? {
+        val targets = paths.filter { it.isNotBlank() }.distinct()
+        if (targets.isEmpty()) return null
+        return try {
+            api.excludeMedia(MediaExcludeRequest(paths = targets, action = "remove"))
+            loadExcludedMedia(force = true)
+            // 恢复只能靠重拉：本地没有那几首的 item，没法插回去
+            refreshAudioLists()
+            null
+        } catch (e: Exception) {
+            libraryErrorText("恢复到音乐库", e)
+        }
+    }
+
+    /**
+     * 删除文件本身。**不可逆** —— 调用方必须已经做过二次确认。
+     *
+     * core 走 MediaStore 删除，所以媒体索引会一起清掉；没有「所有文件访问权限」时回 403，
+     * 这里翻成"去授权"而不是笼统的"删除失败"（见 [libraryErrorText]）。
+     */
+    suspend fun deleteMediaFile(path: String): String? {
+        if (path.isBlank()) return "路径为空"
+        return try {
+            val resp = api.deleteFile(mapOf("path" to path))
+            if (!resp.success) return "删除失败：文件可能已被移动，或正被其他程序占用"
+            dropAudioItems(setOf(path))
+            // 歌单里那一条不会消失（歌单存的是路径），但会变成 missing —— 由 core 判定，
+            // 所以打开过的歌单要重拉，不在本地改标记
+            _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+            refreshAudioLists()
+            null
+        } catch (e: Exception) {
+            libraryErrorText("删除文件", e)
+        }
+    }
+
+    /** 管理页显示过提示/错误之后调用。 */
+    fun clearExcludedMessage() {
+        updateExcluded { it.copy(message = null, errorMessage = null) }
+    }
+
+    /**
+     * 把几个路径从**已加载的音频列表**里摘掉。
+     *
+     * 这是少数几个做本地乐观更新的地方，判据很硬：排除与删除都是"这个路径以后一定不在
+     * `/api/media/list` 的结果里"，不像加歌那样还有 core 才知道的去重与截断。不这么做的话，
+     * 重拉回来之前那一行还留在屏幕上，用户会以为没生效而再点一次。
+     *
+     * 只动音频：视频/图片页不提供这两个动作。
+     */
+    private fun dropAudioItems(paths: Set<String>) {
+        if (paths.isEmpty()) return
+        _state.update { s ->
+            s.copy(
+                tabs = s.tabs.mapValues { (type, tab) ->
+                    if (type != MEDIA_TYPE_AUDIO) tab else tab.withoutPaths(paths)
+                },
+                audioGroupItems = s.audioGroupItems.mapValues { (_, tab) -> tab.withoutPaths(paths) }
+            )
+        }
+    }
+
+    private fun MediaTabState.withoutPaths(paths: Set<String>): MediaTabState {
+        val kept = items.filterNot { it.path in paths }
+        if (kept.size == items.size) return this
+        // total 是"符合条件的总数"，不减的话 hasMore 会一直为真，列表底部挂着一个永远
+        // 加载不出东西的加载中
+        return copy(items = kept, total = (total - (items.size - kept.size)).coerceAtLeast(kept.size))
+    }
+
+    /**
+     * 重拉音频列表与已加载的分组维度。
+     *
+     * 分组计数（某个专辑还剩几首）只有 core 算得对，所以哪怕本地已经摘掉了那一行，
+     * 分组那一层还是要重拉。分组**详情**页不在这里重拉：它的 key 由 `by + key` 拼成，
+     * 从 map 的键反推回两个字段不可靠（key 本身可能含分隔符），而 [dropAudioItems] 已经
+     * 把那一行从详情列表里摘掉了。
+     */
+    private fun refreshAudioLists() {
+        loadFirstPage(MEDIA_TYPE_AUDIO, force = true)
+        _state.value.audioGroups.keys.forEach { loadGroups(it, force = true) }
+    }
+
+    /**
+     * 排除 / 删除的失败文案。
+     *
+     * 403 有明确的下一步（去授权），与"删不掉"必须分开说 —— 否则用户只会对着同一句
+     * "删除失败"反复重试。判据用 HTTP 状态码而不是 core 的 message（后者是给人看的，会改）。
+     */
+    private fun libraryErrorText(action: String, e: Exception): String {
+        val code = (e as? retrofit2.HttpException)?.code()
+        return when (code) {
+            403 -> "没有「所有文件访问权限」，无法$action。在设备设置里授权后再试"
+            404 -> "文件不存在（可能已在别处被删除）"
+            400 -> "$action 失败：core 拒绝了这个路径"
+            else -> "$action 失败: ${e.message}"
+        }
+    }
+
+    /**
+     * WS `data_changed` 的精准刷新入口（由 `MainViewModel.collectDataChangedEvents` 分发）。
+     *
+     * 目前只认 [WsDataTopic.MEDIA_PLAYLISTS]：另一端（通常是 web）建 / 改 / 删歌单、加歌移歌
+     * 都会推这一条。已经打开过的歌单曲目一并重拉 —— 只刷列表的话，正在看的那个歌单
+     * 里被另一端加的歌不会出现。
+     *
+     * 认不出的 topic 直接忽略：媒体库本身（`/api/media/list`）不走 WS，core 也没在推。
+     */
+    fun smartRefresh(changedType: String) {
+        // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 断线窗口的歌单变更未知，补拉一轮。
+        // 与 MEDIA_PLAYLISTS 分支同语义（force=true）：重连补拉每轮连接至多一次，
+        // loadPlaylists 等请求幂等，风暴风险可忽略，保新鲜优先。
+        if (changedType == WsDataTopic.RECONNECTED) {
+            loadPlaylists(force = true)
+            _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+            return
+        }
+        if (changedType != WsDataTopic.MEDIA_PLAYLISTS) return
+        loadPlaylists(force = true)
+        _state.value.playlistItems.keys.forEach { loadPlaylistItems(it, force = true) }
+    }
+
+    /**
+     * 加歌结果 → 一句话。
+     *
+     * 把 `skipped` / `truncated` 说出来而不是只报"已加入"：用户选了 20 首却只进去 3 首时，
+     * 一句笼统的成功提示会让人以为是 App 丢了歌。
+     */
+    private fun addResultMessage(playlistName: String, resp: PlaylistAddResponse): String {
+        val head = "已加入「$playlistName」${resp.added} 首"
+        val tail = buildList {
+            if (resp.skipped > 0) add("${resp.skipped} 首已在歌单里或不在媒体库")
+            if (resp.truncated) add("歌单条数已达上限")
+        }
+        return if (tail.isEmpty()) head else "$head（${tail.joinToString("，")}）"
+    }
+
+    /**
+     * 歌单写操作的失败文案。
+     *
+     * 409 与 400 各有明确的下一步（换个名字 / 删几个歌单），所以不能都说成"操作失败"。
+     * 判据用 HTTP 状态码而不是 core 的 message —— 后者是给人看的，会改。
+     */
+    private fun playlistErrorText(action: String, e: Exception): String {
+        val code = (e as? retrofit2.HttpException)?.code()
+        return when (code) {
+            409 -> "已有同名歌单，换个名字再试"
+            404 -> "歌单不存在（可能已在别处被删除）"
+            403 -> "媒体权限未授权，无法读取歌单曲目"
+            else -> "$action 失败: ${e.message}"
+        }
+    }
+
+    /**
+     * 改排序（展示偏好，不写 core，但**持久化到本地 prefs**）。
+     *
+     * 立刻重拉第一页 —— 排序变了，已加载的页码没有意义（core 是按 offset 分页的）。
+     */
+    fun setSort(type: String, sort: String = MEDIA_SORT_DATE, order: String = MEDIA_ORDER_DESC) {
+        val tab = _state.value.tab(type)
+        if (tab.sort == sort && tab.order == order) return
+        runCatching { AppPreferences(appContext).setMediaSort(type, sort, order) }
+        updateTab(type) {
+            it.copy(sort = sort, order = order, items = emptyList(), total = 0, loadedOnce = false)
+        }
+        loadFirstPage(type, force = true)
+    }
+
+    /**
+     * 切换列表 / 网格（展示偏好，持久化到本地 prefs，按类型各一份）。
+     *
+     * **不重拉数据**：视图只是同一份数据的两种画法。重拉会让"切一下视图"变成一次网络往返，
+     * 而且会把已经滚到的位置丢掉。
+     */
+    fun setGridView(type: String, grid: Boolean) {
+        if (_state.value.tab(type).gridView == grid) return
+        runCatching { AppPreferences(appContext).setMediaGridView(type, grid) }
+        updateTab(type) { it.copy(gridView = grid) }
+    }
+
+    /**
+     * 写**这一类**的扫描目录（设备配置，存在 core）。
+     *
+     * 只作废这一类的列表：视频的扫描范围变了，音乐和图片的列表没有任何理由被清空。
+     * 这也是把 scanDirs 下沉到 [MediaTabState] 之后才能做到的事。
+     */
+    fun setScanDirs(type: String, dirs: List<String>) {
+        scope.launch {
+            try {
+                val resp = api.putMediaConfig(type, MediaDirsRequest(dirs))
+                updateTab(type) {
+                    it.copy(
+                        scanDirs = resp.dirs,
+                        items = emptyList(),
+                        total = 0,
+                        loadedOnce = false,
+                        message = if (resp.dirs.isEmpty()) {
+                            "已改为扫描整个媒体库"
+                        } else {
+                            "已更新扫描目录"
+                        }
+                    )
+                }
+                loadFirstPage(type, force = true)
+            } catch (e: Exception) {
+                updateTab(type) { it.copy(errorMessage = "保存扫描目录失败: ${e.message}") }
+            }
+        }
+    }
+
+    /**
+     * 请系统重新收录**这一类**的目录（默认用该类型已配置的目录）。
+     *
+     * 收录是**异步**的：这里成功返回只代表已提交给系统扫描器，所以完成后重拉这一类的列表，
+     * 但可能仍看不到最新文件 —— 文案要说"已提交"，不能说"已完成"。
+     */
+    fun rescan(type: String, dirs: List<String> = emptyList()) {
+        if (_state.value.tab(type).isRescanning) return
+        updateTab(type) { it.copy(isRescanning = true, errorMessage = null, message = null) }
+        scope.launch {
+            try {
+                val resp = api.rescanMedia(type, MediaDirsRequest(dirs))
+                updateTab(type) {
+                    it.copy(
+                        isRescanning = false,
+                        message = if (resp.submitted == 0) {
+                            "没有找到可收录的文件"
+                        } else {
+                            "已提交 ${resp.submitted} 个文件给系统收录" +
+                                if (resp.truncated) "（数量过多，已截断，可再执行一次）" else ""
+                        }
+                    )
+                }
+                loadFirstPage(type, force = true)
+            } catch (e: Exception) {
+                updateTab(type) { it.copy(isRescanning = false, errorMessage = "扫描失败: ${e.message}") }
+            }
+        }
+    }
+
+    /** 清掉某一类页面上的提示与错误（离开页面 / 用户已读）。 */
+    fun clearMessages(type: String) {
+        updateTab(type) { it.copy(message = null, errorMessage = null) }
+    }
+
+    /**
+     * 目录选择器用：列出某个目录下的**子目录**，顺带回它的父目录。
+     *
+     * 走已有的 `/api/files/list`，不给"选目录"这件事新造一条列目录的接口。
+     * 失败回空列表 + null 父目录，让界面显示"这个目录读不到"，不抛到全局错误浮层。
+     */
+    suspend fun browseDirs(path: String): Pair<List<String>, String?> = try {
+        val resp = api.listFiles(path)
+        val dirs = resp.files.filter { it.isDirectory }.map { it.path }.toMutableSet()
+        // 列 /storage 时并上 disk-usage 的真实卷（走 core StorageManager，准）：
+        // Android 11+ 上 File("/storage").listFiles() 可能只见 emulated/self 或为空，
+        // 外接 SD 卡（/storage/XXXX-XXXX）会"消失" —— 2026-10-10 实机反馈选择器失效即此。
+        if (path.trimEnd('/') == "/storage") {
+            runCatching { api.getDiskUsage() }.getOrNull()?.disks?.forEach { dirs += it.mount }
+        }
+        dirs.sorted() to resp.parent
+    } catch (e: Exception) {
+        emptyList<String>() to null
+    }
+
+    /** 清掉全部提示（三类 + 全局），仅在需要整体复位时用。 */
+    fun clearAllMessages() {
+        _state.update { s ->
+            s.copy(
+                errorMessage = null,
+                tabs = s.tabs.mapValues { (_, tab) -> tab.copy(message = null, errorMessage = null) }
+            )
+        }
+    }
+
+    /** 三类都还没拉过时用得上：把没加载过的那几类各拉一页（不动已有数据）。 */
+    fun prefetchAll() {
+        MEDIA_KINDS.forEach { (type, _) -> loadFirstPage(type) }
+    }
+
+    // ── URLs ──
+    //
+    // 与 FileManagerModule.getStreamUrl 同一口径（同一个 host/port 来源）。
+    // 播放 / 查看原文件走 /api/files/stream；缩略图与封面是 core 生成/取出的图片。
+
+    /** 原文件字节流（支持 Range，播放器与图片查看器都用它）。 */
+    fun streamUrl(path: String): String {
+        val prefs = AppPreferences(appContext)
+        return "http://${prefs.effectiveHost}:${prefs.serverPort}" +
+            "/api/files/stream?path=${URLEncoder.encode(path, "UTF-8")}"
+    }
+
+    /** 缩略图（JPEG）。同一 (type,id,size) 稳定可缓存，core 侧带了 ETag。 */
+    fun thumbnailUrl(type: String = MEDIA_TYPE_VIDEO, id: Long, size: Int = THUMB_SIZE): String {
+        val prefs = AppPreferences(appContext)
+        return "http://${prefs.effectiveHost}:${prefs.serverPort}" +
+            "/api/media/thumbnail?type=$type&id=$id&size=$size"
+    }
+
+    /**
+     * 字幕内容 URL，**直接塞给播放器**（`MediaItem.SubtitleConfiguration`）。
+     *
+     * 为什么不用 [streamUrl]（`/api/files/stream`）：那条给的是原始字节，而播放器的字幕
+     * 解析器按 UTF-8 解 —— 中文字幕大量是 GB18030/Big5，直接喂过去就是一屏乱码，
+     * 且播放器没有"换编码重试"的入口。`/api/media/subtitle` 在服务端统一转好 UTF-8，
+     * 并按后缀给准确的字幕 MIME。
+     *
+     * 鉴权：这条 URL 由播放器的 OkHttpDataSource 拉取，那个 client 带了设备签名拦截器
+     * （见 `UfiStreamHttpClient`），所以和视频流走同一套鉴权，不需要额外的票据。
+     */
+    fun subtitleUrl(path: String): String {
+        val prefs = AppPreferences(appContext)
+        return "http://${prefs.effectiveHost}:${prefs.serverPort}" +
+            "/api/media/subtitle?path=${URLEncoder.encode(path, "UTF-8")}"
+    }
+
+    /**
+     * 拉某个视频的外挂字幕列表。
+     *
+     * [folderScope] = true 时回同目录全部字幕（"手动选字幕文件"用）；
+     * 否则只回 core 判定属于这个视频的（自动挂载用）。
+     *
+     * 失败回空列表而不是抛：字幕是增强项，拉不到就当没有，不该把播放页搞崩。
+     */
+    suspend fun subtitlesOf(path: String, folderScope: Boolean = false): List<MediaSubtitleEntry> =
+        try {
+            api.getMediaSubtitles(path, if (folderScope) "folder" else null).items
+        } catch (e: Exception) {
+            emptyList()
+        }
+
+    /**
+     * 让**设备侧**丢掉已缓存的缩略图。
+     *
+     * ## 为什么需要这个
+     * 缩略图有三层缓存，只清一层等于没清：
+     *  1. 图片加载库（按 URL 命中的磁盘 + 内存缓存）；
+     *  3. **设备上客户端回传的成果** ← 本方法清的是这层。
+     *
+     * `/thumbnail` 的 URL 只含 (type, id)、不含内容指纹，命中即原样返回。
+     * 所以一张算错的图（典型：抽到黑场）会一直被发下去；只清 1、2 层的话，
+     * 下一次请求立刻被设备上的旧图命中，用户看到的是"清了没反应"。
+     *
+     * 失败回 false 不抛：清缓存是便利操作，设备没响应不该让界面崩。
+     */
+    suspend fun clearRemoteThumbnails(type: String? = null): Boolean = try {
+        api.clearMediaThumbnailCache(type)
+        true
+    } catch (e: Exception) {
+        false
+    }
+
+    /**
+     * 2026-10-07：手动重抽单条视频的封面准备 —— 清设备上那一条的封面缓存与
+     * video_info 探测缓存（含 .fail 冷却标记），下一次 GET /thumbnail 就会重新走
+     * 系统 → MMR → ffmpeg 三级。失败回 false（老 core 没有 id 参数会清掉整类，
+     * 那也可接受，只是范围大些）。
+     */
+    suspend fun resetThumbnail(type: String, id: Long): Boolean = try {
+        api.clearMediaThumbnailCache(type, id)
+        // 2026-10-07：本机抽帧已删除，这里只失效 Coil 侧由 URL 命中的来源记录。
+        com.ufi_axis.data.api.ThumbSourceRegistry.invalidate(thumbnailUrl(type, id))
+        true
+    } catch (e: Exception) {
+        DebugLog.w("MediaModule", "重置封面缓存失败: $type/$id ${e.javaClass.simpleName}")
+        false
+    }
+
+    /**
+     * 2026-10-07：手动重抽封面 —— 带鉴权拉一次并**直接记录来源**（X-Thumb-Source / 404 reason）。
+     *
+     * 为什么不用 Coil：列表里该条没渲染时不会发请求，Coil 拦截器就永远没有记录，
+     * 详情弹窗的「封面来源」行什么都不显示（用户报的"点了没效果"）。
+     * 返回 (成功?, 来源标签或失败原因)。
+     */
+    suspend fun refetchThumbnailWithSource(type: String, id: Long): Pair<Boolean, String> = try {
+        val resp = api.fetchThumbnailMeta(type, id)
+        if (resp.isSuccessful) {
+            val src = resp.headers()["X-Thumb-Source"] ?: "unknown"
+            com.ufi_axis.data.api.ThumbSourceRegistry.record(thumbnailUrl(type, id), src)
+            true to src
+        } else {
+            val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
+            val reason = Regex("\"message\"\\s*:\\s*\"([^\"]*)\"").find(body)?.groupValues?.getOrNull(1)
+                ?: "HTTP ${resp.code()}"
+            com.ufi_axis.data.api.ThumbSourceRegistry.recordFailure(thumbnailUrl(type, id), reason)
+            false to reason
+        }
+    } catch (e: Exception) {
+        DebugLog.w("MediaModule", "重取封面失败: $type/$id ${e.javaClass.simpleName}")
+        false to (e.message ?: "网络错误")
+    }
+
+    /**
+     * 2026-10-07：手动跑一轮设备端封面预热（忽略闲时门；需预热总开关已开）。
+     * 返回 (是否受理, 错误文案)；进度经 WS media:thumb-progress 广播回来。
+     */
+    suspend fun runPrewarmNow(): Pair<Boolean, String> = try {
+        api.runThumbnailPrewarm()
+        true to ""
+    } catch (e: Exception) {
+        val msg = when {
+            e.message?.contains("409") == true -> "预热开关未开启，请先打开上方开关"
+            else -> e.message ?: "请求失败"
+        }
+        false to msg
+    }
+
+    /** 2026-10-07：读某条封面的最后来源（供详情弹窗显示）；没记录返回 null。 */
+    fun thumbSource(type: String, id: Long): String? =
+        com.ufi_axis.data.api.ThumbSourceRegistry.sourceOf(thumbnailUrl(type, id))
+
+    // ── 2026-10-07：封面预热进度（core 经 data_changed/media:thumb-progress 广播）──
+    // MainViewModel 的 WS 收集器解析后喂进 [onThumbPrewarmProgress]；设置页 collect 显示。
+    data class ThumbPrewarmProgress(
+        val done: Int,
+        val total: Int,
+        val failed: Int,
+        val running: Boolean,
+        val currentName: String = "",
+        val startedAt: String = "",
+        val updatedAt: String = ""
+    )
+
+    private val _thumbPrewarmProgress = kotlinx.coroutines.flow.MutableStateFlow<ThumbPrewarmProgress?>(null)
+
+    /** 最近一次预热进度；null = 本次连接没收到过（未开启或 core 旧版本）。 */
+    val thumbPrewarmProgress: kotlinx.coroutines.flow.StateFlow<ThumbPrewarmProgress?> = _thumbPrewarmProgress
+
+    fun onThumbPrewarmProgress(
+        done: Int, total: Int, failed: Int, running: Boolean, currentName: String = ""
+    ) {
+        // 只覆盖进度字段：WS 不带 started_at/updated_at，别把 GET 快照里读到的清掉
+        val prev = _thumbPrewarmProgress.value
+        _thumbPrewarmProgress.value = ThumbPrewarmProgress(
+            done = done, total = total, failed = failed, running = running,
+            currentName = currentName,
+            startedAt = prev?.startedAt.orEmpty(),
+            updatedAt = prev?.updatedAt.orEmpty()
+        )
+    }
+
+    /**
+     * 2026-10-07：带 cache-bust 参数的封面 URL。手动重抽后用 `&v=<时间戳>`
+     * 绕开 Coil 按 URL 命中的磁盘/内存缓存（Coil3 没有"作废单条 URL"的公开 API）。
+     */
+    fun thumbnailUrlBusted(type: String = MEDIA_TYPE_VIDEO, id: Long, size: Int = THUMB_SIZE): String =
+        thumbnailUrl(type, id, size) + "&v=" + System.currentTimeMillis()
+
+
+    /**
+     * 音频封面（原始内嵌图）。播放页用这个而不是 [thumbnailUrl]：
+     * 260dp 的容器在 xxhdpi 上约 780 物理像素，喂 256px 的缩略图必然是糊的。
+     */
+    fun coverUrl(id: Long): String {
+        val prefs = AppPreferences(appContext)
+        return "http://${prefs.effectiveHost}:${prefs.serverPort}/api/media/cover?id=$id"
+    }
+
+    /**
+     * 取单首音频的标签（曲名 / 艺术家 / 专辑），失败或取不到回 null。
+     *
+     * 与 [MediaLibraryState] 无关：这是**当前这一首**的东西，跟着播放页生命周期走，
+     * 放进全局状态后换歌、退出页面都要额外清理。列表里的 `title/artist` 已经够用，
+     * 本接口只在它们缺失时补强（core 侧会直接读文件标签）—— 所以调用方拿 null 时
+     * 应当继续用列表里的值。
+     */
+    suspend fun tagsOf(id: Long): MediaTagsResponse? = try {
+        api.getMediaTags(id)
+    } catch (e: Exception) {
+        null
+    }
+
+    /**
+     * 2026-10-05 G7（FFmpeg 接入计划书 §4.3）：视频元信息（ffmpeg 探测，core 永久缓存）。
+     * 详情弹窗用：MediaStore 列在本机经常缺 duration/width/height，这里给真值。
+     * 失败（损坏 / 不支持容器 / ffmpeg 不可用 → 404）回 null，由调用方展示
+     * 「设备无法解析此文件」—— 比空白有信息量。
+     */
+    suspend fun videoInfoOf(id: Long): VideoInfoResponse? = try {
+        api.getVideoInfo(id)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
+    }
+
+    // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+    // 真源在 core（GET/PUT /api/config 的 thumb_prewarm_*）。null = core 未返回（老版本），
+    // UI 据此禁用开关；改法与 ToolsModule 的字段归一化开关同一套"读真值 → PUT 单键 →
+    // 校验 updated_fields → 成功才动镜像"三步，不引入"假开关"。
+
+    /** 预热开关当前镜像值（null = 未读到真值 / 老 core）。 */
+    private var thumbPrewarmValue: Boolean? = null
+
+    /** true = 有 PUT 在飞，回读要被丢弃。 */
+    @Volatile
+    private var thumbPrewarmSaving = false
+
+    /**
+     * 回读预热开关真值（进视频设置页时调用）。失败不动镜像、只置 read 标记。
+     */
+    suspend fun loadThumbPrewarm(): Boolean = try {
+        val cfg = api.getConfig()
+        if (!thumbPrewarmSaving) {
+            thumbPrewarmValue = cfg.thumb_prewarm_enabled
+        }
+        true
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        false
+    }
+
+    /** 当前镜像值（UI 进页面先调 [loadThumbPrewarm] 再读）。null = 未读到 / 老 core。 */
+    fun thumbPrewarmCurrent(): Boolean? = thumbPrewarmValue
+
+    /**
+     * 下发预热开关（`PUT /api/config` 单键）。
+     * @return null = 成功；非 null = 失败原因（UI 直接展示）。
+     */
+    suspend fun setThumbPrewarm(enabled: Boolean): String? {
+        if (thumbPrewarmSaving) return "上一个请求还在进行中"
+        thumbPrewarmSaving = true
+        try {
+            val resp = api.updateConfig(mapOf("thumb_prewarm_enabled" to enabled))
+            if ("thumb_prewarm_enabled" !in resp.updated_fields) {
+                val rejected = resp.rejected_fields.firstOrNull { it.field == "thumb_prewarm_enabled" }
+                return rejected?.describe() ?: "设备未接受该设置（thumb_prewarm_enabled）"
+            }
+            thumbPrewarmValue = enabled
+            return null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            return "保存失败：${e.message}"
+        } finally {
+            thumbPrewarmSaving = false
+        }
+    }
+
+    /**
+     * 2026-10-07：拉一次预热状态快照（GET /api/media/thumbnail-prewarm）。
+     * 进设置页时先调一次 → 退出重进也能看到上一轮的进度/结果；预热中轮询也走它。
+     * @return null = core 从未跑过（或旧 core 无此端点）。
+     */
+    suspend fun refreshPrewarmState(): ThumbPrewarmProgress? {
+        return try {
+            val o = api.getThumbnailPrewarmState().jsonObject
+            val snap = o["snapshot"]?.jsonObject
+            if (snap == null) {
+                _thumbPrewarmProgress.value = null
+                null
+            } else {
+                fun k(name: String) = snap[name]?.jsonPrimitive
+                val p = ThumbPrewarmProgress(
+                    running = k("running")?.boolean ?: false,
+                    done = k("done")?.int ?: 0,
+                    failed = k("failed")?.int ?: 0,
+                    total = k("total")?.int ?: 0,
+                    currentName = k("current_name")?.content ?: "",
+                    startedAt = k("started_at")?.content ?: "",
+                    updatedAt = k("updated_at")?.content ?: ""
+                )
+                _thumbPrewarmProgress.value = p
+                p
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+}

@@ -46,19 +46,49 @@ object ConnectionBootstrap {
         prefs: AppPreferences,
         onUnauthorized: () -> Unit
     ) {
+        // 2026-10-05 R3-9 修复：弱引用持有回调 + 配对注销，避免静态字段滞留已销毁 Activity
+        onUnauthorizedRef = java.lang.ref.WeakReference(onUnauthorized)
         RetrofitClient.onUnauthorized = {
             val runnable = Runnable {
                 prefs.token = ""
                 prefs.isSetupComplete = false
-                onUnauthorized()
+                onUnauthorizedRef?.get()?.invoke()
             }
             if (context is ComponentActivity) context.runOnUiThread(runnable) else runnable.run()
         }
     }
 
+    // 2026-10-05 R3-9 修复：注销回调，与 registerUnauthorizedHandler 生命周期配对
+    private var onUnauthorizedRef: java.lang.ref.WeakReference<(() -> Unit)?>? = null
+
+    fun unregisterUnauthorizedHandler() {
+        onUnauthorizedRef = null
+        RetrofitClient.onUnauthorized = null
+    }
+
     /** 重建 Retrofit 实例（凭据 / 服务器配置变更后）。 */
     fun recreateRetrofit(prefs: AppPreferences) {
         RetrofitClient.recreate(prefs)
+    }
+
+    /**
+     * 注册「任何业务请求传输层失败 → 立刻探活」的桥接（2026-09-21）。
+     *
+     * 为什么必须有这一条：原来「失败 → 探活 → 提示」只由 5 个 state 的 `errorMessage`
+     * combine 触发，文件 / 媒体 / 下载 / 隧道 / 应用管理这些域的失败压根不在链上，
+     * 于是设备离线时用户看到一堆行内红条却永远等不到那句「设备未连接」。
+     * 现在从 OkHttp 拦截器直接出信号，**与是哪个域无关**。
+     *
+     * 回调跑在 OkHttp 的网络线程上，所以这里只做转发；去抖与协程调度都在
+     * `HealthModule.notifyTransportFailure()` 里。
+     */
+    fun registerTransportFailureHandler(onTransportFailure: () -> Unit) {
+        RetrofitClient.onTransportFailure = onTransportFailure
+    }
+
+    /** 解绑（Activity 销毁时调用，避免持有已死的 VM）。 */
+    fun unregisterTransportFailureHandler() {
+        RetrofitClient.onTransportFailure = null
     }
 
     /** 构造 MainViewModel 的 factory（原 MainActivity 手写 VM factory 提取）。 */

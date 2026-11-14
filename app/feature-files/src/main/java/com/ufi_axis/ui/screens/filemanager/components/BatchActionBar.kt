@@ -51,6 +51,10 @@ import com.ufi_axis.ui.theme.ufiStandardCard
  * @param onCompress 点击「压缩」（将选中项打包成单个 .zip）
  * @param onDelete 点击「删除」（warning 橙）
  * @param onCancel 点击「取消」（退出多选模式）
+ * @param showCopy 当前目录是否支持复制（远端源按 provider 能力清单，FTP 就没有 COPY）
+ * @param showCut 当前目录是否支持移动（FTP / S3 都没有 MOVE）
+ * @param showCompress 当前目录是否支持压缩（core 的 `/api/files/compress` 没有远端分支）
+ * @param showDelete 当前目录是否支持删除
  * @param modifier 修饰符
  */
 @Composable
@@ -62,6 +66,10 @@ fun BatchActionBar(
     onCompress: () -> Unit,
     onDelete: () -> Unit,
     onCancel: () -> Unit,
+    showCopy: Boolean = true,
+    showCut: Boolean = true,
+    showCompress: Boolean = true,
+    showDelete: Boolean = true,
     modifier: Modifier = Modifier
 ) {
     val palette = LocalResolvedPalette.current
@@ -94,33 +102,41 @@ fun BatchActionBar(
                         tint = palette.textSecondary
                     )
                 }
-                IconButton(onClick = onCopy) {
-                    Icon(
-                        imageVector = Icons.Filled.ContentCopy,
-                        contentDescription = "复制",
-                        tint = palette.textSecondary
-                    )
+                if (showCopy) {
+                    IconButton(onClick = onCopy) {
+                        Icon(
+                            imageVector = Icons.Filled.ContentCopy,
+                            contentDescription = "复制",
+                            tint = palette.textSecondary
+                        )
+                    }
                 }
-                IconButton(onClick = onCut) {
-                    Icon(
-                        imageVector = Icons.Filled.ContentCut,
-                        contentDescription = "剪切",
-                        tint = palette.textSecondary
-                    )
+                if (showCut) {
+                    IconButton(onClick = onCut) {
+                        Icon(
+                            imageVector = Icons.Filled.ContentCut,
+                            contentDescription = "剪切",
+                            tint = palette.textSecondary
+                        )
+                    }
                 }
-                IconButton(onClick = onCompress) {
-                    Icon(
-                        imageVector = Icons.Filled.Archive,
-                        contentDescription = "压缩",
-                        tint = palette.textSecondary
-                    )
+                if (showCompress) {
+                    IconButton(onClick = onCompress) {
+                        Icon(
+                            imageVector = Icons.Filled.Archive,
+                            contentDescription = "压缩",
+                            tint = palette.textSecondary
+                        )
+                    }
                 }
-                IconButton(onClick = onDelete) {
-                    Icon(
-                        imageVector = Icons.Filled.Delete,
-                        contentDescription = "删除",
-                        tint = palette.warning
-                    )
+                if (showDelete) {
+                    IconButton(onClick = onDelete) {
+                        Icon(
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = "删除",
+                            tint = palette.warning
+                        )
+                    }
                 }
                 IconButton(onClick = onCancel) {
                     Icon(

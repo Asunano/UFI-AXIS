@@ -33,7 +33,7 @@ import com.ufi_axis.data.model.AlertRecord
  *   放在 onStartCommand 而不是 onCreate：纯 bind 也会触发 onCreate（「后台守护」页一进页面就绑），
  *   在那里发通知等于「开着页面就凭空多一条常驻通知」，且 onCreate 早于快照落地（见其内注释）；
  * - 进程内初始化 [NotificationCenter] + [GuardScheduler]（GuardScheduler 构造期会自动
- *   按 prefs 幂等补 enqueue 周期任务，进程重启后 WorkManager 调度不丢失）；
+ *   按 prefs 幂等补 enqueue 周期任务；**保活开启时会取消主进程 Worker**，轮询只在本进程）；
  * - 实现 AIDL [INotificationConfigService]：UI 进程跨进程同步开关/间隔/免打扰并触发重调度。
  *
  * 注意：
@@ -488,6 +488,8 @@ class NotifyService : Service() {
         fun startKeepAlive(context: Context) {
             if (!shouldRun(context)) {
                 DebugLog.i(TAG, "startKeepAlive 跳过：「前台服务保活」未开启")
+                // 保活关着时才允许 Worker 兜底；开着时必须先取消，避免主进程被周期拉起。
+                GuardScheduler.syncSchedule(context)
                 return
             }
             val intent = Intent(context, NotifyService::class.java)
@@ -495,6 +497,8 @@ class NotifyService : Service() {
                 .putExtra(NotifyDispatchReceiver.EXTRA_SWITCH_SNAPSHOT, NotifyPrefs.snapshot(context))
             try {
                 context.startForegroundService(intent)
+                // 保活已开：取消主进程 BackgroundGuardWorker（轮询归 :ufi_notify）
+                GuardScheduler.syncSchedule(context)
             } catch (e: Exception) {
                 // 后台 FGS 启动受限（Android 12+/14+）或权限缺失：静默失败，WorkManager 仍兜底
                 DebugLog.w(TAG, "startKeepAlive 失败: ${e.message}")
@@ -546,6 +550,8 @@ class NotifyService : Service() {
             } catch (e: Exception) {
                 DebugLog.w(TAG, "stopKeepAlive 失败: ${e.message}")
             }
+            // 保活已关：若「后台轮询」仍开着，重新 enqueue 主进程 Worker 作兜底。
+            GuardScheduler.syncSchedule(context)
         }
     }
 }

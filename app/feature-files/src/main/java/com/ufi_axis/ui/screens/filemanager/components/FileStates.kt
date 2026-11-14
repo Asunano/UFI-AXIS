@@ -1,54 +1,40 @@
 package com.ufi_axis.ui.screens.filemanager.components
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
-import com.ufi_axis.ui.theme.LocalResolvedPalette
-import androidx.compose.foundation.layout.fillMaxWidth
-import com.ufi_axis.ui.components.common.UfiSkeletonList
-import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.components.common.UfiListEmptyState
+import com.ufi_axis.ui.components.common.UfiListErrorState
+import com.ufi_axis.ui.components.common.UfiListLoadingState
 
 /**
  * 文件管理器空/加载/错误状态组件集（T6）。
  *
- * 三个组件均完全无状态，且根布局接受并应用外部传入的 [modifier]，便于调用方
- * 通过 `Modifier.weight(1f)` 在 [androidx.compose.foundation.layout.Column] 中占满剩余空间。
+ * 2026-09-16：三个形态全部**转发公共层**
+ * （[UfiListLoadingState] / [UfiListEmptyState] / [UfiListErrorState]）。
+ * 本文件现在只剩"文件管理器的文案与参数"这一层薄壳 —— 骨架条数、空态版式、错误态按钮
+ * 的实现只有公共层那一份。
  *
- * 设计系统约束：
- *  - 颜色统一走 [com.ufi_axis.ui.theme.LocalResolvedPalette.current]，禁止 `colorScheme.tertiary`。
- *  - 这些组件位于 [androidx.compose.foundation.layout.Column] 作用域，禁止 `Modifier.align()`，
- *    居中统一通过 [Box] 的 `contentAlignment` 或 [Column] 的 `Arrangement`/`horizontalAlignment` 实现。
+ * 历史沿革（别再走回头路）：
+ *  · 最初这里手搓 5 张静态灰卡，与公共 `UfiSkeleton` 的扫光骨架并存，同一个 App 两种骨架观感；
+ *  · 2026-09-04 加载态改成转发 `UfiSkeletonList`（骨架统一）；
+ *  · 2026-09-16 媒体库拆成三页时同样需要这三态，于是把「何时骨架、空态长什么样、
+ *    错误态带不带重试」这套编排一并上提，错误态的裸 M3 `Button` 顺势换成 `UfiButton`。
+ *
+ * 保留这三个薄壳函数而不是让 `FileManagerRoot` 直接调公共件：文案（"暂无文件"）与
+ * 骨架条数是**本页的决定**，散到调用点后下次改文案要在几个 when 分支里找。
+ *
+ * 用法约束不变：无状态，根布局接受外部 [Modifier]（调用方通常传 `Modifier.weight(1f)`），
+ * 且因为位于 `Column` 作用域内，内部不使用 `Modifier.align()`。
  */
 
 /**
- * 加载态：首屏骨架屏。
- *
- * 2026-09-04：本函数原来自己手搓了 5 张卡 × (40dp 图标块 + 两条文字条)，用的是
- * `palette.divider` 纯色 —— 形状对，但是**静态死灰块**，且与公共 `UfiSkeleton` 那套
- * 扫光骨架并存，同一个 App 里出现两种骨架观感。现在整体转发公共组件
- * [com.ufi_axis.ui.components.common.UfiSkeletonList]（同款左图标 + 两行文字条比例，
- * 外加统一的 shimmer 与「降低动效」降级），本页不再持有第二份实现。
- *
- * 条数由 5 提到 6：公共默认值，铺满一屏更完整；差一条不构成观感回归。
+ * 加载态：首屏骨架屏（6 条，40dp 圆形前置槽 —— 与 [FileRowCard] 的 40dp 图标容器同形）。
  *
  * @param modifier 根布局修饰符（调用方通常传 `Modifier.weight(1f)`）
  */
 @Composable
 fun FileLoadingState(modifier: Modifier = Modifier) {
-    UfiSkeletonList(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(horizontal = Spacing.CardHorizontalMargin, vertical = 8.dp)
-    )
+    UfiListLoadingState(modifier = modifier)
 }
 
 /**
@@ -64,39 +50,17 @@ fun FileErrorState(
     onRetry: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
-    val palette = LocalResolvedPalette.current
-    Column(
-        modifier = modifier.fillMaxSize(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text(text = message, color = palette.warning)
-        if (onRetry != null) {
-            Button(
-                onClick = onRetry,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = palette.accent,
-                    contentColor = palette.onAccent
-                )
-            ) {
-                Text(text = "重试")
-            }
-        }
-    }
+    UfiListErrorState(message = message, modifier = modifier, onRetry = onRetry)
 }
 
 /**
- * 空态：居中显示「暂无文件」。
+ * 空态：居中显示「这个目录是空的」。
+ *
+ * 文案不用"暂无文件"：目录为空与"筛选/搜索没命中"是两件事，前者该说清"是这个目录空"。
  *
  * @param modifier 根布局修饰符（调用方通常传 `Modifier.weight(1f)`）
  */
 @Composable
 fun FileEmptyState(modifier: Modifier = Modifier) {
-    val palette = LocalResolvedPalette.current
-    Box(
-        modifier = modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        Text(text = "暂无文件", color = palette.textSecondary)
-    }
+    UfiListEmptyState(text = "这个目录是空的", modifier = modifier)
 }

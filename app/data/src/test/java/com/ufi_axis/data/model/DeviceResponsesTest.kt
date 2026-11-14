@@ -26,8 +26,9 @@ class DeviceResponsesTest {
 
     @Test
     fun `设备设置的键与 DeviceFields 逐字对齐`() {
+        val expected = DeviceFields.DeviceSettings.ALL + listOf("network_mode_label")
         assertEquals(
-            DeviceFields.DeviceSettings.ALL,
+            expected,
             DeviceSettingsResponse.serializer().descriptor.elementNames.toList(),
         )
     }
@@ -179,12 +180,18 @@ class DeviceResponsesTest {
     }
 
     @Test
-    fun `网络模式优先 BearerPreference 老固件才回退 net_select`() {
-        // 写入侧改的是 BearerPreference，net_select 取值域未经证实，只作回退
+    fun `网络模式优先 net_select 无 net_select 才回退 BearerPreference`() {
+        // 真机：切换后 goform 回读里变化的是 net_select；BearerPreference 是写入侧字段
+        assertEquals(
+            "LTE_ONLY",
+            AppJson.decodeFromString<DeviceSettingsResponse>(
+                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G","net_select":"LTE_ONLY"}"""
+            ).networkMode,
+        )
         assertEquals(
             "WCDMA_AND_LTE_AND_5G",
             AppJson.decodeFromString<DeviceSettingsResponse>(
-                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G","net_select":"LTE_ONLY"}"""
+                """{"BearerPreference":"WCDMA_AND_LTE_AND_5G"}"""
             ).networkMode,
         )
         assertEquals(
@@ -212,9 +219,9 @@ class DeviceResponsesTest {
     @Test
     fun `信号响应带服务小区统一字段 制式由 band_label 判定`() {
         val nr = AppJson.decodeFromString<SignalInfo>(
-            """{"rsrp":-85,"band":"78","band_label":"n78","arfcn":633984,"pci":301,"signal_strength":-60}"""
+            """{"rsrp":-85,"band":"78","band_label":"N78","arfcn":633984,"pci":301,"signal_strength":-60}"""
         )
-        assertEquals("n78", nr.band_label)
+        assertEquals("N78", nr.band_label)
         assertEquals(633984L, nr.arfcn)
         assertEquals(301, nr.pci)
         assertTrue(nr.isNr)
@@ -224,5 +231,34 @@ class DeviceResponsesTest {
 
         // 带宽固件普遍不填 → 省略 key → null（不能是 0，0 会被当成「带宽 0」显示）
         assertNull(nr.band_width)
+    }
+
+    /**
+     * 2026-10-11：`bandLabelDisplay` 只在**显示层**转大写，`band_label` 原值不动。
+     *
+     * 这条区分很要紧：`band_label` 的小写 `n` 被当作**判据**使用 ——
+     * [SignalInfo.isNr] 用 `startsWith("n")` 判 5G，core 的 `ServingCell.derive`
+     * 与 SignalCollectorTest / ZteGoformProfileTest 也按 `n78` 断言。
+     * 所以正确做法是"值不变、显示转大写"，而不是去改 core 拼出来的字符串。
+     */
+    @Test
+    fun `频段由 core 拼大写 isNr 判定大小写不敏感`() {
+        val nr = AppJson.decodeFromString<SignalInfo>("""{"band_label":"N78","rsrp":-85}""")
+        assertEquals("N78", nr.bandLabelDisplay)
+        // core 源头已拼大写（ServingCell.derive 用 "N$num"），客户端不再转大小写
+        assertEquals("N78", nr.band_label)
+        // 判据不挑大小写 —— 这是"在源头改大小写"能成立的前提，必须钉住
+        assertTrue(nr.isNr)
+        // 即便设备/旧 core 送来小写 n78，判定仍是 5G（向后兼容）
+        assertTrue(AppJson.decodeFromString<SignalInfo>("""{"band_label":"n78"}""").isNr)
+
+        // LTE 本来就是大写 B，转大写后不变，且不误判成 5G
+        val lte = AppJson.decodeFromString<SignalInfo>("""{"band_label":"B3"}""")
+        assertEquals("B3", lte.bandLabelDisplay)
+        assertFalse(lte.isNr)
+
+        // 空白 / 缺字段 → null，让调用方走各自的「无数据」处理，不显示成空字符串
+        assertNull(AppJson.decodeFromString<SignalInfo>("""{"band_label":"  "}""").bandLabelDisplay)
+        assertNull(AppJson.decodeFromString<SignalInfo>("""{}""").bandLabelDisplay)
     }
 }

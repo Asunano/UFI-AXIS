@@ -122,6 +122,7 @@ dependencies {
     implementation(project(":app:feature-dashboard"))
     implementation(project(":app:feature-tools"))
     implementation(project(":app:feature-files"))
+    implementation(project(":app:feature-media"))
     implementation(project(":app:feature-download"))
     implementation(project(":app:feature-sms"))
     implementation(project(":app:feature-apps"))

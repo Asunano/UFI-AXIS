@@ -8,43 +8,52 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.DeveloperBoard
-import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.SimCard
-import androidx.compose.material.icons.filled.Smartphone
-import androidx.compose.material.icons.filled.SystemUpdate
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.ufi_axis.ui.components.common.UfiInfoCell
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.viewmodel.state.DashboardState
 
 /**
- * 设备信息紧凑列表卡 — 替换首页底部「常用功能」2×2 快捷入口网格。
+ * 设备信息卡（首页四环下方）。
  *
- * 6 行系统信息（全部取自 [DashboardState]，无需新增任何后端 API 调用）：
- *   1. 设备型号   2. 固件版本   3. 系统版本   4. 内核   5. 运行时间   6. SIM 卡
+ * ## 2026-09-22 C1「纯层级」方案
  *
- * 容器样式使用同包卡片通用的
- * `Box + ufiCardShadow(4.dp) + clip(UfiCardDefaults.shape) + background(cardBg) + border(1.dp, divider)`。
- * 卡片内部使用普通 [Column]（非滚动），仅以 `Arrangement.spacedBy` 控制行间距，
- * 以符合 `UfiPageBackground` 不得再套滚动容器的约束。
+ * 三段式，靠字号差（20sp / 13sp / 11sp）和一条分隔线分层，不使用渐变、色块或图标：
+ *
+ * ```
+ *  ZTE MU5001                    ← 20sp 标题级
+ *  Android 13 · SDK 33           ← 13sp 副信息
+ *  ─────────────────────────────
+ *  QCI        下行       上行     ← 三列等宽 UfiInfoCell
+ *  8          500 Mbps   100 Mbps
+ *  ─────────────────────────────
+ *  固件版本                       ← 长值独占整行
+ *  MU5001_V1.0.0B05
+ *  内核
+ *  5.4.147-perf-g9f2c1b8
+ * ```
+ *
+ * ## QoS 缺失时
+ * AT 通道不可用（非展锐平台 / HAL 被裁）时 QoS 区**整段不渲染**（含它上面那条分隔线），
+ * 卡片退化成"型号 + 副信息 + 分隔线 + 固件 + 内核"，不留空。
+ *
+ * ## 5G 胶囊
+ * 预览里的 `5G` 描边胶囊**没有接入**：那个值来自信号那边的 `rat` 字段（`network:signal`），
+ * 不在这张卡现有的数据源（`/api/dashboard/summary` + `/api/device/version` + `/api/device/qos`）里。
+ * 接进来要改 `DashboardState` 的取数逻辑。留了 TODO 注释，你说要的时候我再接。
  */
 @Composable
 fun HomeDeviceInfoCard(
@@ -54,36 +63,25 @@ fun HomeDeviceInfoCard(
     val palette = LocalResolvedPalette.current
     val cardShape = UfiCardDefaults.shape
 
-    // ── 6 行取值（防御空值，统一降级 "—"） ──
     val device = state.deviceInfo?.device
+
+    // ── 数据 ──
 
     val deviceModel = buildString {
         append(device?.brand ?: "")
         append(" ")
         append(device?.model ?: "")
-    }.trim().ifEmpty { "—" }
+    }.trim().ifEmpty { PLACEHOLDER }
 
-    val firmware = buildString {
-        val cr = state.deviceVersion?.cr_version?.trim()
-        val wa = state.deviceVersion?.wa_inner_version?.trim()
-        if (!cr.isNullOrBlank()) append(cr)
-        if (!cr.isNullOrBlank() && !wa.isNullOrBlank()) append("\n")
-        if (!wa.isNullOrBlank()) append(wa)
-    }.ifEmpty { "—" }
+    val systemVersion = device?.let { "Android ${it.android_version} · SDK ${it.sdk_version}" }
+        ?: PLACEHOLDER
 
-    val systemVersion = device?.let { "Android ${it.android_version} (SDK ${it.sdk_version})" } ?: "—"
-    val kernel = state.deviceInfo?.kernel ?: "—"
-    val uptime = state.uptimeInfo?.uptime_display ?: "—"
-    val simState = state.deviceInfo?.sim?.sim_state ?: "—"
+    val firmware = state.deviceVersion?.cr_version?.trim().orEmpty().ifEmpty { PLACEHOLDER }
+    val kernel = state.deviceInfo?.kernel?.trim().orEmpty().ifEmpty { PLACEHOLDER }
 
-    val rows = listOf(
-        DeviceInfoRow(Icons.Default.Smartphone, "设备型号", deviceModel),
-        DeviceInfoRow(Icons.Default.Build, "固件版本", firmware),
-        DeviceInfoRow(Icons.Default.SystemUpdate, "系统版本", systemVersion),
-        DeviceInfoRow(Icons.Default.DeveloperBoard, "内核", kernel),
-        DeviceInfoRow(Icons.Default.Schedule, "运行时间", uptime),
-        DeviceInfoRow(Icons.Default.SimCard, "SIM 卡", simState)
-    )
+    val qos = state.deviceQos
+
+    // ── 卡片外壳 ──
 
     Box(
         modifier = modifier
@@ -96,57 +94,92 @@ fun HomeDeviceInfoCard(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+                .padding(horizontal = 18.dp, vertical = 17.dp)
         ) {
-            rows.forEach { row ->
-                DeviceInfoRowItem(row = row)
+            // ── 头部：型号 + 副信息 ──
+
+            // TODO：5G 胶囊（从信号的 rat 字段接入后，在标题右侧放一个 accent 描边的圆角标签）
+            Text(
+                text = deviceModel,
+                style = UfiTextStyles.bodyLeadStrong.copy(fontSize = TITLE_SIZE),
+                color = palette.textPrimary,
+                maxLines = 1
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                text = systemVersion,
+                style = UfiTextStyles.noteLead,
+                color = palette.textSecondary,
+                maxLines = 1
+            )
+
+            // ── QoS 区（有数据才渲染）──
+
+            if (qos != null && qos.hasData) {
+                Spacer(Modifier.height(SECTION_GAP))
+                Divider(palette.divider)
+                Spacer(Modifier.height(SECTION_GAP))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
+                ) {
+                    UfiInfoCell(
+                        modifier = Modifier.weight(1f),
+                        label = "QCI",
+                        value = qos.qci.toString()
+                    )
+                    UfiInfoCell(
+                        modifier = Modifier.weight(1f),
+                        label = "下行",
+                        value = qos.downlink_display.ifEmpty { PLACEHOLDER }
+                    )
+                    UfiInfoCell(
+                        modifier = Modifier.weight(1f),
+                        label = "上行",
+                        value = qos.uplink_display.ifEmpty { PLACEHOLDER }
+                    )
+                }
             }
+
+            // ── 固件 + 内核 ──
+
+            Spacer(Modifier.height(SECTION_GAP))
+            Divider(palette.divider)
+            Spacer(Modifier.height(SECTION_GAP))
+
+            UfiInfoCell(
+                modifier = Modifier.fillMaxWidth(),
+                label = "固件版本",
+                value = firmware
+            )
+            Spacer(Modifier.height(ITEM_GAP))
+            UfiInfoCell(
+                modifier = Modifier.fillMaxWidth(),
+                label = "内核",
+                value = kernel
+            )
         }
     }
 }
 
-/** 单行数据模型：图标 + 标签 + 值。 */
-private data class DeviceInfoRow(
-    val icon: ImageVector,
-    val label: String,
-    val value: String
-)
-
-/**
- * 单行渲染：图标（accent 着色，20dp）+ 标签（labelSmall / textSecondary，左对齐，单行防压扁）
- * + 值（bodyMedium / textPrimary，右对齐，占满剩余宽度）。值过长时折为两行并以省略号收尾。
- */
+/** 卡内分隔线。1dp 实线，不用 M3 的 `HorizontalDivider`（那个带 padding 约定，行为不受控）。 */
 @Composable
-private fun DeviceInfoRowItem(row: DeviceInfoRow) {
-    val palette = LocalResolvedPalette.current
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            imageVector = row.icon,
-            contentDescription = null,
-            tint = palette.accent,
-            modifier = Modifier.size(20.dp)
-        )
-        Spacer(Modifier.width(12.dp))
-        Text(
-            text = row.label,
-            style = MaterialTheme.typography.labelSmall,
-            color = palette.textSecondary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Spacer(Modifier.width(12.dp))
-        Text(
-            text = row.value,
-            style = UfiTextStyles.bodyEmphasis,
-            color = palette.textPrimary,
-            textAlign = TextAlign.End,
-            maxLines = 2,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f)
-        )
-    }
+private fun Divider(color: Color) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(1.dp)
+            .background(color)
+    )
 }
+
+/** 标题字号。20sp 在标题层级里介于 headerTitle(26sp) 和 panelTitle(16sp) 之间。 */
+private val TITLE_SIZE = 20.sp
+/** 分隔线上下间距。 */
+private val SECTION_GAP = 14.dp
+
+/** 同一区内信息格之间的纵向间距。 */
+private val ITEM_GAP = 12.dp
+
+private const val PLACEHOLDER = "—"

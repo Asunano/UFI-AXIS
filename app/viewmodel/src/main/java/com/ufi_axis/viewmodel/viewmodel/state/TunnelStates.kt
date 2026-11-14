@@ -24,8 +24,15 @@ data class TunnelState(
     val cfInstances: List<TunnelInstanceInfo> = emptyList(),
     val cfTunnelItems: List<CfTunnelInfo> = emptyList(), // 隧道列表（列表页展示）
     val cfActiveTunnel: String = "",                     // 当前"选中"的隧道名（≠ 正在运行）
-    val cfTokenText: String = "",                        // 已加载的 token（详情页编辑用）
-    val cfTokenName: String = "",                        // cfTokenText 属于哪条隧道（防止串台）
+    /**
+     * 各隧道已加载的 token，**按隧道名隔离**（理由同 [cfLogs]）。
+     *
+     * 2026-09-21：原来是 `cfTokenText` + `cfTokenName` 一对全局单槽。详情页虽然用
+     * `cfTokenName == tunnelName` 兜住了"显示"，但"是否有未保存改动"的判定比的是那份
+     * 全局值 —— A 的迟到响应落地后，B 页面会误报「token 有未保存的改动」。
+     * 日志早就是 Map 了，token 没跟上，这里补齐。
+     */
+    val cfTokens: Map<String, String> = emptyMap(),
     /** 各隧道日志，按隧道名隔离（理由同 frpLogs） */
     val cfLogs: Map<String, String> = emptyMap(),
 
@@ -77,6 +84,9 @@ data class TunnelState(
 
     /** 某条 CF 隧道已加载的日志 */
     fun cfLogOf(name: String): String = cfLogs[name] ?: ""
+
+    /** 某条 CF 隧道已加载的 token；null = 还没读过（≠ 读到空串） */
+    fun cfTokenOf(name: String): String? = cfTokens[name]
 
     /** 正在运行的 FRP 通道数 */
     val frpRunningCount: Int get() = frpInstances.count { it.running }

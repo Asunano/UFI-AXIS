@@ -3,6 +3,7 @@ package com.ufi_axis.data.repository
 import com.ufi_axis.data.model.SubscriptionRequest
 import com.ufi_axis.data.model.WebSocketMessage
 import com.ufi_axis_core.contract.WsChannel
+import com.ufi_axis_core.contract.WsDataTopic  // 2026-10-05 P5：RECONNECTED sentinel
 import com.ufi_axis.util.ApiErrorLogger
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.DebugLog
@@ -36,11 +37,9 @@ class WebSocketRepository(
     private var token: String
 ) {
     private var webSocket: WebSocket? = null
-    private val client = OkHttpClient.Builder()
-        // 应用层心跳：NAT/移动网络静默断链时 OkHttp 会在约 20s 内触发 onFailure → 走重连退避，
-        // 否则只能等下一次写失败才发现连接已死（后台进程可能几分钟都收不到推送）。
-        .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    // 2026-10-05 R3-12 修复：OkHttpClient 进程级单例，Activity 重建不再新建 client
+    // （连接池 / Dispatcher 线程池 / WS ping 调度器不随组合重建而泄漏堆积）
+    private val client = SHARED_CLIENT
 
     // 增加 buffer 容量 + DROP_OLDEST 策略，防止下游处理慢时 emit 挂起
     // extraBufferCapacity=64 可缓存约 64 条消息，DROP_OLDEST 丢弃最早消息避免 OOM
@@ -60,8 +59,18 @@ class WebSocketRepository(
     val dataChanged: SharedFlow<String> = _dataChanged
 
     private var retryCount = 0
+    // 2026-10-05 P5（修 G1）：首连/重连判据 —— 重连成功的 onOpen 才补发 RECONNECTED sentinel
+    private var everConnected = false
     private var retryJob: Job? = null
     private var scope: CoroutineScope? = null
+
+    /**
+     * 用户主动断开标志（2026-10-05 R3-1 修复）。
+     * disconnect() 后 OkHttp 的 onClosed 回调仍会触发，原实现无条件 scheduleReconnect
+     * → 用户刚点了断开，WS 又自己连回去了。置位后回调直接放弃重连；connect() 时清零。
+     */
+    @Volatile
+    private var userDisconnected = false
 
     /** 当前订阅频道（重连后按此列表重新订阅）。 */
     private var subscribedTopics: List<String> = DEFAULT_TOPICS
@@ -85,6 +94,7 @@ class WebSocketRepository(
         this.scope = scope
         this.subscribedTopics = topics
         hasConnectedOnce = true
+        userDisconnected = false // 2026-10-05 R3-1：重新 connect 即恢复自动重连资格
         _connectionState.value = ConnectionState.CONNECTING
 
         // 握手鉴权全部走 query（token/ts/nonce/sig）：core 的 WebSocketManager 只读 query，
@@ -118,6 +128,12 @@ class WebSocketRepository(
                 scope.launch {
                     _dataChanged.emit("console:at")
                     _dataChanged.emit("console:shell")
+                    // 2026-10-05 P5（修 G1）：断线窗口的 device/network/wifi/media 事件已丢
+                    //（replay=0，重连只补 console），重连补发 sentinel，各 Module 按各自
+                    // 新鲜度策略补拉。首连不发（页面 LaunchedEffect 与预加载协调器负责），
+                    // 只有重连才发。
+                    if (everConnected) _dataChanged.emit(WsDataTopic.RECONNECTED)
+                    everConnected = true
                 }
             }
 
@@ -163,7 +179,8 @@ class WebSocketRepository(
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 _connectionState.value = ConnectionState.DISCONNECTED
-                scheduleReconnect(scope)
+                // 2026-10-05 R3-1 修复：用户主动断开时不再自动重连
+                if (!userDisconnected) scheduleReconnect(scope)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
@@ -183,7 +200,8 @@ class WebSocketRepository(
                     exception = t,
                     requestLine = "WS $baseUrl/ws/realtime Authorization: Bearer ***"
                 )
-                scheduleReconnect(scope)
+                // 2026-10-05 R3-1 修复：用户主动断开后 close 引发的 onFailure 也不重连
+                if (!userDisconnected) scheduleReconnect(scope)
             }
         })
     }
@@ -233,6 +251,8 @@ class WebSocketRepository(
     }
 
     fun disconnect() {
+        // 2026-10-05 R3-1 修复：先置位再关闭，onClosed/onFailure 回调据此放弃重连
+        userDisconnected = true
         retryJob?.cancel()
         webSocket?.close(1000, "Client disconnect")
         _connectionState.value = ConnectionState.DISCONNECTED
@@ -275,15 +295,35 @@ class WebSocketRepository(
     }
 
     companion object {
+        // 2026-10-05 R3-12 修复：OkHttpClient 进程级单例，Activity 重建不再新建 client
+        // （连接池 / Dispatcher 线程池 / WS ping 调度器不随组合重建而泄漏堆积）
+        val SHARED_CLIENT: OkHttpClient = OkHttpClient.Builder()
+            // 应用层心跳：NAT/移动网络静默断链时 OkHttp 会在约 20s 内触发 onFailure → 走重连退避，
+            // 否则只能等下一次写失败才发现连接已死（后台进程可能几分钟都收不到推送）。
+            .pingInterval(20, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
         /**
-         * UI 进程默认订阅频道 —— 直接用契约的 [WsChannel.UI_TOPICS]（= core 广播全集去掉
-         * `notification`，因为 core 对同一告警会 `notification` + `alert` 双发，UI 只认 `alert`）。
+         * UI 进程默认订阅频道 = 契约的 [WsChannel.UI_TOPICS] **加上** `notification`。
+         *
+         * 为什么必须加回 `notification`（2026-09-14）：短信 / 验证码这两类推送 core 只广播到
+         * `notification` 一个频道（`PushChannel.SINGLE_TOPIC_SCENES`，不镜像到 `alert`），
+         * 而订阅了 `notification` 的只有 `:ufi_notify`，那个进程又只在「前台服务保活」开启后
+         * 才建 WS（`NotifyService.onStartCommand` 的闸门在 `startBackgroundChannelsIfNeeded` 之前）。
+         * 于是保活关着时短信 / 验证码 / 下载完成的系统通知**一条都发不出来**，而邮件由 core 自己
+         * 发、完全正常 —— 用户看到的就是「开关全开却只有邮件」。主进程订上这个频道后，
+         * 业务类推送经 `NotificationCenter.notify` 的进程门转交给 `:ufi_notify` 发射
+         * （广播会自动拉起那个进程），不再依赖保活。
+         *
+         * 不会造成告警双处理：core 对告警是 `notification` + `alert` 双发，而
+         * `DashboardModule` 的 `notification` 分支**只认业务类** type（sms / verification /
+         * download / tunnel），告警形状的载荷一概忽略，仍由 `alert` 分支独家处理。
          *
          * 注意：core 侧按订阅索引广播（`WebSocketManager.broadcast` 无订阅即静默丢弃），
          * 且采集循环会在 `getConnectionCount() > 0` 时从 60s 提速到 3s —— 订阅越多、连接越久，
          * 设备端采集负载越高，因此后台进程应改用 [NOTIFY_TOPICS]。
          */
-        val DEFAULT_TOPICS = WsChannel.UI_TOPICS
+        val DEFAULT_TOPICS = WsChannel.UI_TOPICS + WsChannel.NOTIFICATION
 
         /**
          * 通知守护进程（`:ufi_notify`）专用频道：只要告警推送（见 [WsChannel.NOTIFY_TOPICS]）。

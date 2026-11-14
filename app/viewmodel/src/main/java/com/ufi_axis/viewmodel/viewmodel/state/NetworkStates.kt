@@ -141,6 +141,21 @@ enum class SpeedTestPhase { IDLE, CONNECTING, LATENCY, DOWNLOAD, UPLOAD, DONE, E
  * 2026-08-26 第三轮：按 LibreSpeed 的测量方法论补齐 —— 多流并发（[streams]）、
  * 独立探针算出的抖动（[jitterMs]）、上行吞吐（[uploadMbps]）。
  */
+/**
+ * 定时测速历史条目（2026-10-06 批C；core /api/speedtest/history）。
+ * core 返回的数值是字符串化的（"%.2f".format），这里解析成 Double 存。
+ */
+@Immutable
+data class SpeedTestHistoryEntry(
+    val timestamp: Long,
+    val downloadMbps: Double,
+    val uploadMbps: Double,
+    val latencyMs: Int,
+    val jitterMs: Int,
+    /** "scheduled"（定时任务）| "manual"（手动在设备上测） */
+    val trigger: String,
+)
+
 @Immutable
 data class SpeedTestState(
     val phase: SpeedTestPhase = SpeedTestPhase.IDLE,

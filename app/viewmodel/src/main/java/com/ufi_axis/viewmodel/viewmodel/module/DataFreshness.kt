@@ -39,6 +39,38 @@ package com.ufi_axis.viewmodel.module
 const val FOREGROUND_REFRESH_INTERVAL_MS: Long = 10_000L
 
 /**
+ * 网络页整套数据（信号 / 网络状态 / WiFi / 频段 / 基站 / LAN / 身份）的新鲜度窗口（ms）。
+ *
+ * 比 [FOREGROUND_REFRESH_INTERVAL_MS] 长得多，因为**这一页没有轮询**：它的数据不是"随时在变
+ * 的读数"，而是配置类字段（网络模式、频段锁定、LAN 段、本机号码）。取 30s 是对着 core 端
+ * 那几个响应缓存的 TTL 定的 —— `CELL_INFO` 20s 是里面最短的一档，再短就只是在打一个必定
+ * 命中 core 缓存的请求。
+ *
+ * 这个窗口就是"切到网络页要不要重新发那 6 个请求"的唯一判据（见 `NetworkModule.loadNetworkAll`）。
+ * 调小 = 切页更容易触发重拉，调大 = 切回去看到的数据可能更旧。
+ */
+const val NETWORK_ALL_FRESH_MS: Long = 30_000L
+
+/**
+ * 应用列表（`GET /api/apps`）的新鲜度窗口（ms）。
+ *
+ * 取 30s，对齐 [NETWORK_ALL_FRESH_MS] 而不是更长的 core 侧缓存 TTL：
+ * - 30s 内**重进页面**（或者用户自己来回切页签）直接复用列表，一个请求都不发。
+ *   这一页的服务端成本天然很高 —— core 侧一次 `listApps` 要串 4 条特权 shell
+ *   （`pm list packages -f` / `-d` / `--suspended` + `dumpsys package packages | grep`），
+ *   设备上是秒级；2026-10-12 起 core 自己加了 5 分钟 TTL 的进程内缓存把它压到毫秒级，
+ *   但客户端仍不该在几秒内重复问同一件事。
+ * - 窗口不能盖住 core 的 5 分钟 TTL：窗口与 TTL 同长的话，"刚装的应用迟迟不出现"
+ *   会被放大到 5 分钟，且这一页**没有** WS 推送，用户只能手动刷新来打破。
+ *   30s 是"复用与新鲜"之间对本页最划算的一档。
+ *
+ * 超窗之后不是"卡住不动"：调用方照旧发请求，而 core 那次请求命中的是它自己的缓存，
+ * 仍是毫秒级 —— 详见 `AppManagerModule.loadAppList` 里 `silent` 那一支。
+ */
+const val APP_LIST_FRESH_MS: Long = 30_000L
+
+
+/**
  * 前台化时「第一次请求还要等多久」（ms，纯函数，可单测）。
  *
  * `0` = 立刻请求（数据从未拉取过 / 已过期）；`> 0` = 数据仍新鲜，返回的是**剩余新鲜时长**，

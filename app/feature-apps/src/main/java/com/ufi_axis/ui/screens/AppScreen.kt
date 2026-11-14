@@ -47,6 +47,9 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     var grantAllRunning by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
+    // 进页面：force = false —— 30s 新鲜窗口（APP_LIST_FRESH_MS）内复用内存里那份列表，一个请求都不发。
+    // 首次进入 / 超出窗口时照旧真打一次，而 core 侧自己有 5 分钟进程内缓存
+    // （AppManager.listApps），所以那次"真打"在 core 上也是毫秒级而不是 4 条特权 shell。
     LaunchedEffect(state.filter) { viewModel.apps.loadAppList(state.filter) }
     LaunchedEffect(state.selectedApp) { if (state.selectedApp != null) cachedDetail = state.selectedApp }
 
@@ -58,7 +61,10 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
     UfiScreenScaffold(title = "应用管理", navController = navController, showBack = true,
         actions = {
             if (state.hasRoot) Icon(Icons.Default.VerifiedUser, null, Modifier.padding(end = 8.dp), tint = LocalResolvedPalette.current.accent)
-            IconButton(onClick = { viewModel.apps.loadAppList(state.filter) }) { Icon(Icons.Default.Refresh, null) }
+            // force = true：刷新按钮是用户显式动作，必须绕过新鲜窗口真打一次。
+            // 注意它绕过的是**客户端**闸门；core 侧那条 5 分钟缓存同样会被写操作/TTL 处理，
+            // 但手动刷新在"装完应用马上想看到"这个最常见的诉求下拿到的是最新数据。
+            IconButton(onClick = { viewModel.apps.loadAppList(state.filter, force = true) }) { Icon(Icons.Default.Refresh, null) }
             IconButton(onClick = { showInstallDialog = true }) { Icon(Icons.Default.Add, null) }
         }
     ) { padding ->
@@ -66,7 +72,9 @@ fun AppManagerScreen(viewModel: MainViewModel, prefs: Any? = null, navController
         Column(Modifier.fillMaxSize()) {
             UfiScrollableTabRow(
                 selectedTabIndex = filterIndex,
-                onTabSelected = { viewModel.apps.loadAppList(filterValues[it]) },
+                // 页签切换必须真拉（force = true）：内存里那份是**另一个 filter** 的，
+                // 闸门在 AppManagerModule 里已按 loadedFilter 放行，这里 force 只是把语义写在调用点。
+                onTabSelected = { viewModel.apps.loadAppList(filterValues[it], force = true) },
                 tabs = filterTabs,
                 modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
             )
@@ -156,16 +164,20 @@ private fun InstallAppDialog(
         title = "安装应用",
         showCloseButton = false,
         confirmButton = {
+            // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+            // local 必须在弹窗自己的 slot 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+            val close = LocalUfiDialogClose.current
             UfiButton(
                 text = "安装",
                 enabled = !isLoading && ((useUrl && url.isNotBlank()) || (!useUrl && path.isNotBlank())),
                 onClick = {
-                    if (useUrl) onInstallUrl(url) else onInstallPath(path)
+                    close { if (useUrl) onInstallUrl(url) else onInstallPath(path) }
                 }
             )
         },
         dismissButton = {
-            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = onDismiss)
+            val close = LocalUfiDialogClose.current
+            UfiButton(variant = UfiButtonVariant.Secondary, text = "取消", onClick = { close(onDismiss) })
         }
     ) {
         UfiDialogBody {
@@ -178,13 +190,12 @@ private fun InstallAppDialog(
                 style = MaterialTheme.typography.bodyMedium,
                 color = LocalResolvedPalette.current.textPrimary
             )
-            Spacer(Modifier.height(6.dp))
+            // 间距统一到 UfiDialogBody（12dp）
             UfiScrollableTabRow(
                 selectedTabIndex = sourceIndex,
                 onTabSelected = { useUrl = sourceValues[it] == "url" },
                 tabs = sourceTabs
             )
-            Spacer(Modifier.height(12.dp))
             if (useUrl) {
                 UfiDialogTextField(
                     label = "APK 下载 URL",
@@ -340,7 +351,9 @@ private fun AppDetailDialog(
                     }
                 }
                 // v17：右上角 X 关闭（替代突兀的全宽"关闭"按钮）；v18：主题 accent 着色
-                IconButton(onClick = onDismiss) {
+                // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+                val closeDetail = LocalUfiDialogClose.current
+                IconButton(onClick = { closeDetail(onDismiss) }) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = "关闭",
@@ -348,7 +361,6 @@ private fun AppDetailDialog(
                     )
                 }
             }
-            Spacer(Modifier.height(16.dp))
             // 版本：v15 优化 — versionName 为空时仅显示 versionCode
             val versionLabel = if (detail.versionName.isBlank()) "${detail.versionCode}" else "${detail.versionName} (${detail.versionCode})"
             UfiDialogInfoRow("版本", versionLabel)

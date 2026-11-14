@@ -74,7 +74,15 @@ val FileKind.label: String
         FileKind.UNKNOWN -> "未知"
     }
 
-/** 长按菜单里「打开」那一项的文案 —— 说清点下去会发生什么。 */
+/**
+ * 长按菜单里「打开」那一项的文案 —— 说清点下去会发生什么。
+ *
+ * 判据是 `FileManagerRoot.resolveOpenRoute` **实际**会做什么，不是这个类型"语义上该做什么"：
+ * - [FileKind.APK] 给"详情"而不是"安装"：`resolveOpenRoute` 对 apk 走 else 分支弹详情弹窗，
+ *   安装在详情弹窗的主操作按钮（以及长按菜单单独的「安装APK」项）上。写"安装"是假文案；
+ * - [FileKind.ARCHIVE] 同样给"详情"：2026-09-15 起单击压缩包不再直接解压（解压会立刻改设备
+ *   文件系统，此前点一下就执行且无确认），改为落详情弹窗，由那里的「解压」主操作触发。
+ */
 val FileKind.openActionLabel: String
     get() = when (this) {
         FileKind.DIRECTORY -> "进入"
@@ -82,15 +90,31 @@ val FileKind.openActionLabel: String
         FileKind.VIDEO -> "播放视频"
         FileKind.AUDIO -> "播放音频"
         FileKind.TEXT -> "查看 / 编辑"
-        FileKind.APK -> "安装"
-        // 这三类没有内置预览，点击落到详情弹窗
-        FileKind.ARCHIVE, FileKind.DOCUMENT, FileKind.UNKNOWN -> "详情"
+        // 这四类没有内置预览/直接动作，点击落到详情弹窗
+        FileKind.APK, FileKind.ARCHIVE, FileKind.DOCUMENT, FileKind.UNKNOWN -> "详情"
     }
 
 /** 是否有内置的预览 / 播放页。为 false 时点击落到详情弹窗。 */
 val FileKind.hasViewer: Boolean
     get() = this == FileKind.IMAGE || this == FileKind.VIDEO ||
         this == FileKind.AUDIO || this == FileKind.TEXT
+
+/**
+ * 是否可被后端解压：zip / tar.gz / tgz / tar / gz（与 web 端 `filesShared.canExtract` 一致）。
+ *
+ * rar / 7z / bz2 / xz 也归 [FileKind.ARCHIVE]（图标就该是压缩包），但后端**不支持**解压，
+ * 所以"能不能解压"这件事必须单独判，不能用 `kind == ARCHIVE` 代替 —— 否则会给 rar
+ * 长出一个点了就报错的解压按钮。
+ *
+ * 2026-09-14：本函数原是 `FileManagerRoot.kt` 的 `private fun`。详情弹窗（另一个包）也要按
+ * 「能否解压」决定是否给解压按钮，所以搬到这份扩展名真源里，而不是在弹窗里再抄一份后缀表 ——
+ * 两份后缀表一旦有一份忘改，就会重演本文件开头描述的"图标与行为对不上"。
+ */
+fun canExtract(name: String): Boolean {
+    val lower = name.lowercase()
+    return lower.endsWith(".zip") || lower.endsWith(".tar.gz") || lower.endsWith(".tgz") ||
+        lower.endsWith(".tar") || lower.endsWith(".gz")
+}
 
 /** 按文件名判类别。目录优先，不看扩展名。 */
 fun fileKindOf(name: String, isDirectory: Boolean = false): FileKind {
@@ -118,7 +142,10 @@ private val EXTENSION_KINDS: Map<String, FileKind> = buildMap {
         "txt", "log", "md", "csv", "ini", "conf", "cfg", "prop", "properties",
         "json", "xml", "yaml", "yml", "toml", "svg",
         "html", "htm", "css", "js", "ts", "kt", "kts", "java", "gradle",
-        "sh", "bash", "zsh", "py", "c", "cpp", "h", "hpp", "go", "rs", "sql", "env"
+        "sh", "bash", "zsh", "py", "c", "cpp", "h", "hpp", "go", "rs", "sql", "env",
+        // lrc 是纯文本歌词（2026-09-14 补）。此前它落 UNKNOWN —— 音频预览会自动读它，
+        // 但用户想在列表里点开改一个错字却只能看到详情弹窗，两处行为对不上。
+        "lrc"
     ).forEach { put(it, FileKind.TEXT) }
     listOf("zip", "tgz", "tar", "gz", "bz2", "xz", "rar", "7z").forEach { put(it, FileKind.ARCHIVE) }
     put("apk", FileKind.APK)

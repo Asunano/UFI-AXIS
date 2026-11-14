@@ -1,24 +1,29 @@
 package com.ufi_axis
 
 import android.content.Intent
+import android.graphics.Color as AndroidColor
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.SystemClock
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -37,17 +42,22 @@ import com.ufi_axis.ui.components.common.UfiAlertToastBridge
 import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
 import com.ufi_axis.app.navigation.buildAppScreens
+import com.ufi_axis.app.startup.UfiStartupOverlay
 import androidx.navigation.compose.rememberNavController
-import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.components.common.UfiButton
 import com.ufi_axis.ui.components.common.UfiButtonVariant
 import com.ufi_axis.ui.components.common.UfiCustomDialog
 import com.ufi_axis.ui.components.common.UfiDialogBody
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.page.registerBuiltInTransitions
 import com.ufi_axis.ui.navigation.MainNavGraph
+import com.ufi_axis.ui.components.common.UfiNowPlayingSlot
+import com.ufi_axis.ui.media.UfiAudioNowPlayingChip
+import com.ufi_axis.ui.media.UfiAudioNowPlayingProbe
 import com.ufi_axis.ui.screens.SetupScreen
+import com.ufi_axis.ui.screens.UfiHeaderCaptionProbe
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.ThemeMode
@@ -81,7 +91,29 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // ★ 2026-09-24：**显式**指定两条系统栏的 scrim，不用 `enableEdgeToEdge()` 的默认值。
+        //
+        // androidx.activity 1.8.0 的默认值是（`EdgeToEdge.kt:72-73`）：
+        //     statusBarStyle     = SystemBarStyle.auto(TRANSPARENT, TRANSPARENT)
+        //     navigationBarStyle = SystemBarStyle.auto(DefaultLightScrim, DefaultDarkScrim)
+        // 其中 `DefaultLightScrim = Color.argb(0xe6, 0xFF, 0xFF, 0xFF)` —— **90% 白**（`:38`），
+        // 而 `auto()` 的 `detectDarkMode` 读的是**系统**夜间模式，与本应用的 `ThemeMode` 无关：
+        // 系统浅色 + 应用内深色 ⇒ 取 lightScrim ⇒ 深色界面底部压一条 90% 白。
+        //
+        // `SystemBarStyle.dark(TRANSPARENT)` 把 lightScrim 与 darkScrim 都设成透明，
+        // 且 `nightMode = MODE_NIGHT_YES` ⇒ `isNavigationBarContrastEnforced` 在
+        // `EdgeToEdgeApi29`（`:293-294`）里直接算出 false，不必再靠下面那行补救
+        //（那行保留，作为「将来换库版本、默认值又变回 auto」的双保险）。
+        // appearance（图标明暗）由下方 setContent 里那个 LaunchedEffect 按**应用内** isDark 覆盖。
+        //
+        // ⚠ 复盘：这一处**不是**真机上那条「底部白带」的因（换成透明后白带照旧）。
+        //   真因是底栏那个 Dialog 窗口缺 `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS`，
+        //   见 `UfiCapsuleBlurHost.CAPSULE_WINDOW_FLAGS_ON`。这里保留是因为默认值确实不对
+        //   （API < 29 的分支会直接把 90% 白写进 navigationBarColor），但别指望它修那类问题。
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT)
+        )
         // 2026-08-20：禁用导航栏对比度增强层，消除手势导航模式下的底部白色遮罩（scrim）。
         // enableEdgeToEdge() 默认 isNavigationBarContrastEnforced=true，系统会在导航栏区域
         // 叠加半透明 scrim 以保证对比度——表现为「底部小白条沉浸不彻底」。
@@ -107,6 +139,12 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val themeManager = remember { ThemeManager(applicationContext) }
+            // 这里走的是 observeExternal 的默认值 true，所以 ThemeManager 在 init 里往
+            // applicationContext 的 prefs 上注册了监听 —— 而 prefs 活到进程结束，Activity 不是。
+            // Activity 每次重建（切主题、转屏、字体缩放）都会新造一个 ThemeManager 再注册一次，
+            // 旧的那个没人解绑 ⇒ 监听器逐次累积。所以这里必须配对 dispose()。
+            // 不能改成 observeExternal = false：设置页改完要实时联动，关掉监听就退化成「重启才生效」。
+            DisposableEffect(themeManager) { onDispose { themeManager.dispose() } }
 
             // 系统「移除动画」无障碍设置探测（开发者选项把动画时长缩放调为 0 亦命中）。
             // 只在首次组合读一次：该设置改变会重启 Activity，无需实时监听。
@@ -147,6 +185,31 @@ class MainActivity : ComponentActivity() {
             // 直到别的原因触发重组才"忽然"变色。
             val palette = remember(selectedThemeId, dynamicEnabled, customSeedColor) {
                 themeManager.getCurrentPalette()
+            }
+
+            // ★ 2026-09-24：系统栏图标 / 手势小白条的明暗必须跟**应用内**主题走。
+            //
+            // `enableEdgeToEdge()` 只在 onCreate 里按 `Configuration.uiMode`（**系统**夜间模式）
+            // 定过一次 appearance，之后不再更新。本应用的外观是自己的设置项
+            //（`ThemeMode.LIGHT/DARK/AUTO` + 多套皮肤），两者可以完全相反：
+            // 系统深色 + 应用内浅色 ⇒ 系统仍按"深背景"渲染 ⇒ 状态栏图标与手势小白条都是**白**的，
+            // 压在浅色页面上直接看不见。贴底通栏之后小白条正好落在栏里，这条就更明显了。
+            //
+            // 判据用**本应用**算出来的 `isDark`（`ThemeMode` + 系统夜间模式的最终结论），
+            // 而不是 `enableEdgeToEdge()` 内部那份只看 `Configuration.uiMode` 的判断。
+            // 这里拿不到解析后的 `pageBg`（它在 UFIAXISTheme 里面才 provide），
+            // 而 `isDark` 已经足够：页面底色的明暗本来就由它决定。
+            // 底栏所在的 Dialog 窗口是另一个窗口、有自己的 appearance，判据更精细
+            //（按栏底色的实际亮度），见 `UfiCapsuleBlurHost` 的 `CapsuleWindowMetrics.lightNavHandleSurface`。
+            val lightSystemBarIcons = !isDark
+            LaunchedEffect(lightSystemBarIcons) {
+                val controller = WindowInsetsControllerCompat(window, window.decorView)
+                if (controller.isAppearanceLightNavigationBars != lightSystemBarIcons) {
+                    controller.isAppearanceLightNavigationBars = lightSystemBarIcons
+                }
+                if (controller.isAppearanceLightStatusBars != lightSystemBarIcons) {
+                    controller.isAppearanceLightStatusBars = lightSystemBarIcons
+                }
             }
 
             UFIAXISTheme(palette = palette, darkTheme = isDark, uiScalePercent = uiScalePercent) {
@@ -193,10 +256,17 @@ class MainActivity : ComponentActivity() {
                 // 主动重新配对开关：由设置页「重新配对 / 切换设备」触发（UID-001，T05）。
                 var forceSetup by remember { mutableStateOf(false) }
 
-                // 主动重新配对：清空凭据 + 丢弃设备身份密钥，强制回到 SetupScreen（T05）。
+                // 主 UI 分支里创建的 VM：切换设备时要清它的会话缓存。
+                // 用 var 槽而不是把 lambda 放到 VM 之后 —— onRepairRequested 必须在
+                // if/else 之前就绪（SetupScreen 分支也要能用，且 appScreens 要记住稳定实例）。
+                var sessionVm by remember { mutableStateOf<MainViewModel?>(null) }
+
+                // 主动重新配对：清空凭据 + 丢弃设备身份密钥 + 丢掉上一台设备的会话缓存，
+                // 强制回到 SetupScreen（T05 / 2026-09 P1）。
                 // 必须连密钥一起删：留着旧密钥就等于留着旧设备身份，用户"换设备/重新配对"的
                 // 意图（尤其是把这台从设备列表里摘掉）就落不了地。
                 val onRepairRequested: () -> Unit = {
+                    sessionVm?.prepareDeviceSwitch()
                     prefs.token = ""
                     DeviceKeyStore.reset()
                     prefs.isSetupComplete = false
@@ -208,8 +278,13 @@ class MainActivity : ComponentActivity() {
                 // 触发条件（444 / 连续次数 / 时间跨度 / 传输失败豁免）全在 RetrofitClient 的
                 // 鉴权策略里，这里只是装配；一次瞬时 401 不再把人踢下线（2026-09-08 事故）。
                 // F22：全局回调集中到 ConnectionBootstrap。
-                ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
-                    isSetupComplete = false
+                // 2026-10-05 R3-9 修复：注册移入 DisposableEffect，随组合销毁注销，
+                // 不再让 RetrofitClient 静态字段永久持有已销毁 Activity。
+                DisposableEffect(prefs) {
+                    ConnectionBootstrap.registerUnauthorizedHandler(this@MainActivity, prefs) {
+                        isSetupComplete = false
+                    }
+                    onDispose { ConnectionBootstrap.unregisterUnauthorizedHandler() }
                 }
 
                 if (!isSetupComplete || forceSetup) {
@@ -232,24 +307,39 @@ class MainActivity : ComponentActivity() {
                             prefs.token
                         )
                     }
-                    // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
                     val owner = LocalLifecycleOwner.current
-                    DisposableEffect(webSocketRepository) {
-                        webSocketRepository.bindNetworkRecovery(applicationContext)
-                        val observer = LifecycleEventObserver { _, event ->
-                            if (event == Lifecycle.Event.ON_RESUME) webSocketRepository.onAppForegrounded()
-                        }
-                        owner.lifecycle.addObserver(observer)
-                        onDispose {
-                            owner.lifecycle.removeObserver(observer)
-                            webSocketRepository.unbindNetworkRecovery()
-                        }
-                    }
                     val viewModel: MainViewModel = viewModel(
                         factory = ConnectionBootstrap.mainViewModelFactory(
                             api, webSocketRepository, networkMonitor, applicationContext
                         )
                     )
+                    sessionVm = viewModel
+                    // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
+                    // 2026-09：同时接健康检查前后台闸门 —— 后台停周期 /health，回前台静默探一次再恢复。
+                    DisposableEffect(webSocketRepository, viewModel) {
+                        webSocketRepository.bindNetworkRecovery(applicationContext)
+                        // 2026-09-21：任何业务请求在传输层失败都立刻驱动一次 /health 探活。
+                        // 这条桥接与"是哪个域失败"无关，补上了只覆盖 5 个 state 的旧触发链。
+                        ConnectionBootstrap.registerTransportFailureHandler {
+                            viewModel.onApiTransportFailure()
+                        }
+                        val observer = LifecycleEventObserver { _, event ->
+                            when (event) {
+                                Lifecycle.Event.ON_RESUME -> {
+                                    webSocketRepository.onAppForegrounded()
+                                    viewModel.onAppForegrounded()
+                                }
+                                Lifecycle.Event.ON_PAUSE -> viewModel.onAppBackgrounded()
+                                else -> {}
+                            }
+                        }
+                        owner.lifecycle.addObserver(observer)
+                        onDispose {
+                            owner.lifecycle.removeObserver(observer)
+                            webSocketRepository.unbindNetworkRecovery()
+                            ConnectionBootstrap.unregisterTransportFailureHandler()
+                        }
+                    }
 
                     // 2026-08-25: 启动全局告警轮询（UI 进程），确保在非监控页也能弹出 Toast（应用内 banner）。
                     // 与独立进程 NotifyService 的后台轮询配合：独立进程管系统通知，UI 进程管前台 banner。
@@ -353,7 +443,14 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    // 保存连接前记住上一次端点，用于 P2「同机轻刷新 / 换机丢缓存」分流。
+                    var lastEndpoint by remember {
+                        mutableStateOf("${prefs.serverIp}:${prefs.serverPort}")
+                    }
                     val onServerConfigChanged: () -> Unit = {
+                        val next = "${prefs.serverIp}:${prefs.serverPort}"
+                        val hostChanged = next != lastEndpoint
+                        lastEndpoint = next
                         ConnectionBootstrap.recreateRetrofit(prefs)
                         // 刷新实时通道：更新 WS 连接参数（url/token）并重连，
                         // 避免停留在旧地址（本实例由 MainViewModel 长期持有，更新即作用于同一连接）。
@@ -361,7 +458,11 @@ class MainActivity : ComponentActivity() {
                             ConnectionBootstrap.rewriteWsUrl(prefs.baseUrl),
                             prefs.token
                         )
-                        viewModel.dashboard.refreshDashboard()
+                        sessionVm?.onServerEndpointChanged(hostChanged)
+                        // 通知守护进程（token/IP 变更时 prefs setter 已 dispatch；此处兜底再推一次快照）
+                        com.ufi_axis.data.notification.NotifyDispatchReceiver.dispatchConnectionChange(
+                            applicationContext, prefs.baseUrl, prefs.token
+                        )
                     }
 
                     CompositionLocalProvider(LocalUfiReduceMotion provides reduceMotion) {
@@ -380,8 +481,32 @@ class MainActivity : ComponentActivity() {
                             themeManager = themeManager,
                             navController = navController,
                             pendingSmsPhone = pendingSmsPhone,
-                            pendingAlertDeepLink = pendingAlertDeepLink
+                            pendingAlertDeepLink = pendingAlertDeepLink,
+                            // 胶囊活在独立 Dialog 窗口里，主窗口的全屏浮层盖不住它 ——
+                            // 启动页期间必须从这里关掉，否则加载页上浮着一条胶囊。
+                            suppressCapsule = viewModel.startupOverlayVisible.collectAsState().value
                         )
+
+                        // ── 「正在播放」：常驻探测 + 注入到各页标题栏右侧 ──
+                        //
+                        // 音乐跑在前台服务里、离开播放页也不停，控制入口得跟着用户走。
+                        // 之前试过悬浮迷你条（底部/顶部都试了）—— 无论放哪都在遮内容，还得配
+                        // 最小化/上滑关闭/自动收起才不烦人，那是在给"遮挡"打补丁。改放标题栏
+                        // 右侧动作区：不占内容空间、不需要收起逻辑，每页位置一致。
+                        //
+                        // 探测器必须挂在这里（Activity 顶层）而不是控件内部：标题栏要先知道
+                        // "有没有东西要显示"才能决定版式，写在控件里就成了「不渲染 ⇒ 探测不到」的死结。
+                        UfiAudioNowPlayingProbe(viewModel)
+                        // 槽位是**进程级**单例，lambda 捕获了 navController：
+                        // 离开时必须清掉，否则 Activity 销毁后槽里还攥着一个已死的 navController。
+                        DisposableEffect(navController) {
+                            UfiNowPlayingSlot.content.value =
+                                { UfiAudioNowPlayingChip(navController) }
+                            onDispose { UfiNowPlayingSlot.content.value = null }
+                        }
+                        // 标题栏「标题下方小字」：天气 + 今日诗词（2026-09-18）。
+                        // 天气原来在标题栏右侧、与正在播放抢位置，现在两者各有其位。
+                        UfiHeaderCaptionProbe(viewModel)
                         // 告警浮层：2026-08-30 起复用**普通 Toast**（UfiToastOverlay），
                         // 原来那套独立的应用内 banner（UfiAlertBanner* 三个文件）已删除 ——
                         // 两套都是"挂在 decorView 的顶部浮层"，没有理由维护两份。
@@ -422,61 +547,63 @@ class MainActivity : ComponentActivity() {
                             toastMessage = ToastMessage(err.message, ToastType.ERROR)
                         }
 
-                        // ── 后端掉线提示（2026-09-12）──
-                        // 数据加载出错且复查 /health 也失败时弹出，带「重试」与「进入服务器设置」两个动作。
-                        // 触发与去抖逻辑在 MainViewModel.collectBackendDownSignal / backendDownDialogState。
-                        val backendDown by viewModel.backendDownDialogState.collectAsState()
-                        backendDown?.let { dialog ->
-                            UfiCustomDialog(
-                                visible = true,
-                                onDismiss = { viewModel.dismissBackendDownDialog() },
-                                // 后端掉线属于必须处理的状态：禁止点外部 / 按返回键关闭，
-                                // 强制用户在「重试」与「进入服务器设置」之间二选一。
-                                dismissOnClickOutside = false,
-                                dismissOnBackPress = false,
-                                title = "无法连接后端服务",
-                                confirmButton = {
-                                    UfiButton(
-                                        text = "重试",
-                                        onClick = { viewModel.retryFromBackendDown() }
-                                    )
-                                },
-                                dismissButton = {
-                                    UfiButton(
-                                        variant = UfiButtonVariant.Secondary,
-                                        text = "服务器设置",
-                                        onClick = {
-                                            viewModel.dismissBackendDownDialog()
-                                            navController.navigate(Routes.DETAIL_SERVER_CONFIG)
-                                        }
-                                    )
-                                }
-                            ) {
-                                UfiDialogBody {
-                                    Text(
-                                        text = "无法访问后端服务（健康检查接口无响应），很可能是后端服务已停止或连接地址不可达。",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        color = LocalResolvedPalette.current.textSecondary
-                                    )
-                                    dialog.errorMessage?.let { em ->
-                                        Spacer(Modifier.height(Spacing.Small))
-                                        Text(
-                                            text = "原始错误：$em",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = LocalResolvedPalette.current.textSecondary
-                                        )
-                                    }
-                                    dialog.healthErrorMessage?.let { he ->
-                                        Spacer(Modifier.height(Spacing.Small))
-                                        Text(
-                                            text = "健康检查：$he",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = LocalResolvedPalette.current.textSecondary
-                                        )
-                                    }
-                                }
-                            }
+                        // ── 写操作成功提示（2026-09-22）──
+                        //
+                        // 与上面的全局错误共用同一个 toast 宿主（宿主是平台层单例，后来的覆盖先来的）。
+                        // 挂在 Activity 顶层的理由和错误通道完全一样：写进各个页面就会抄 N 遍，
+                        // 漏一个页面就变成"保存了但没提示"。
+                        //
+                        // 这里**刻意不做**错误通道那套 30s 同文案去重：连续保存两次就该看到两次确认。
+                        // LaunchedEffect 的 key 用整个 notice（含自增 seq），保证同文案也能重新触发。
+                        val writeNotice by viewModel.writeNotice.collectAsState()
+                        LaunchedEffect(writeNotice) {
+                            val notice = writeNotice ?: return@LaunchedEffect
+                            viewModel.dismissWriteNotice()
+                            toastMessage = ToastMessage(
+                                text = notice.message,
+                                type = ToastType.SUCCESS,
+                                subtitle = notice.subtitle
+                            )
                         }
+
+                        // ── 启动加载页 ＋「连不上设备」的唯一展示面（2026-09-22）──
+                        //
+                        // 叠在导航图**之上**而不是替换它：替换的话导航图要等浮层消失才开始组合、
+                        // 各页的 LaunchedEffect 才开始取数，预加载省下的时间又还回去了。
+                        // 现在下面正常取数，浮层淡出时已经是有数据的界面。
+                        //
+                        // 这一页同时接管了原来那个「无法连接后端服务」模态弹窗的职责
+                        //（那段代码已删）。判据没变，还是 `connectivity`（/health 连击确证）；
+                        // 变的是展示形态 —— 冷启动连不上时弹窗底下是个没数据的空界面，
+                        // 用一整页写清病因和下一步更清楚。仪表盘卡内状态条保留作被动残留。
+                        //
+                        // 消失条件全在 MainViewModel：`startupOverlayVisible`（两个挡的理由）
+                        // 与 `startupGate`（"加载中"那一态的三条终局，防止永远停在加载中）。
+                        val startupVisible by viewModel.startupOverlayVisible.collectAsState()
+                        val preloadProgress by viewModel.preloadProgress.collectAsState()
+                        val startupProblem by viewModel.startupProblem.collectAsState()
+                        UfiStartupOverlay(
+                            visible = startupVisible,
+                            progress = preloadProgress,
+                            problem = startupProblem,
+                            // 重试**不让页面消失**：探活结果才是答案，通了页面自己会走。
+                            // 但必须给一句反馈 —— 不然点下去屏幕上什么都不动，
+                            // 看起来像按钮坏了（探活最长 15s 才出结论）。
+                            onRetry = {
+                                toastMessage = ToastMessage("正在重新连接设备…", ToastType.INFO)
+                                viewModel.retryConnectivity()
+                            },
+                            // 去别的页面前必须先让这一页让开，否则它会把目标页整个盖住
+                            onOpenServerConfig = {
+                                viewModel.skipConnectionNotice()
+                                navController.navigate(Routes.DETAIL_SERVER_CONFIG)
+                            },
+                            onSetup = {
+                                viewModel.skipConnectionNotice()
+                                forceSetup = true
+                            },
+                            onSkip = { viewModel.skipConnectionNotice() }
+                        )
                     }
                 }
                 UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })

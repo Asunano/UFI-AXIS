@@ -16,6 +16,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.platform.LocalContext
+import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.components.common.ToastMessage
 import com.ufi_axis.ui.components.common.ToastType
 import com.ufi_axis.ui.components.common.UfiButton
@@ -73,17 +74,24 @@ fun CrashLogDialog(
                 horizontalArrangement = Arrangement.spacedBy(Spacing.Small, Alignment.End),
                 verticalArrangement = Arrangement.spacedBy(Spacing.Small)
             ) {
+                // 「清除全部」「删除此条」会关掉本弹窗，关闭动作交给 shell 排时序：
+                // 离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。必须在弹窗自己的
+                // content lambda 内部读，在弹窗外面读会拿到"直接执行"的默认实现。
+                // 「导出」「复制」不关闭弹窗，因此不包。
+                val close = LocalUfiDialogClose.current
                 UfiButton(
                     text = "清除全部",
-                    onClick = onCleared,
+                    onClick = { close(onCleared) },
                     variant = UfiButtonVariant.Danger,
                     size = UfiButtonSize.Small
                 )
                 UfiButton(
                     text = "删除此条",
                     onClick = {
-                        file.delete()
-                        onDismiss()
+                        close {
+                            file.delete()
+                            onDismiss()
+                        }
                     },
                     variant = UfiButtonVariant.Danger,
                     size = UfiButtonSize.Small

@@ -198,6 +198,13 @@ data class ToolsState(
      */
     val deliveryHistoryResult: String? = null,
     /**
+     * 渠道投递统计（`GET history/stats`）。与列表 state 分开：统计卡进页就要，
+     * 且不依赖分页游标 / 筛选。
+     */
+    val deliveryStatsChannel: String? = null,
+    val deliveryStats: com.ufi_axis.data.model.MailHistoryStatsResponse? = null,
+    val deliveryStatsLoaded: Boolean = false,
+    /**
      * 当前装的是哪个渠道的记录（`"mail"` / `"webhook"` / `"local_sms"`，null = 全部渠道）。
      *
      * 三条渠道页共用同一个槽位，各自的入口行摘要必须先比对这个字段 ——
@@ -217,6 +224,25 @@ data class AlertsState(
 
 // ========== Tasks ==========
 
+/**
+ * 定时任务页状态（任务 + 条件规则双 Tab 共用）。
+ *
+ * ## 为什么 in-flight 位要分四个（2026-09-20 重构）
+ * 原来只有一个 `isLoading`，而 `loadTaskList` 与 `loadRuleList` 是**并发**发起的
+ * （`TaskScreen` 同一个 `LaunchedEffect` 里连着调两下），两边都写那一位、也都清那一位。
+ * 于是谁先回来谁就把"还在读"这件事宣布结束 —— 界面的
+ * `if (tasks.isEmpty() && !isLoading)` 当即认定"没有任务"并画出空态，
+ * 而任务请求其实还在路上。用户看到的就是"Web 端新建的任务，App 第一次进去看不到，
+ * 退出再进才有"（第二次进去读到的是第一次那个迟到响应）。
+ *
+ * 形状照 [WebhookState] —— 那边三位分开是同一个教训的产物（见其 KDoc）。
+ *
+ * ## 为什么还要 `*Loaded` 闩锁
+ * 只看 `!loading` 不足以决定"该不该画空态"：请求失败、或者还没发出去时它也是 false。
+ * `tasksLoaded` / `rulesLoaded` 是**单调闩锁**（只 false→true，成功读到才置位），
+ * 空态只在闩锁置位后才显示。这是 SMS 那几个页面已经在用的写法
+ * （`smsContactsLoaded` / `verificationCodesLoaded`…）。
+ */
 data class TasksState(
     val tasks: List<ScheduledTask> = emptyList(),
     val taskLogs: Map<String, List<ExecutionLog>> = emptyMap(),
@@ -224,9 +250,19 @@ data class TasksState(
     val rules: List<AutomationRule> = emptyList(),
     // 历史遗留字段名 taskLogs；规则日志单独存，避免与 task 日志混淆
     val ruleLogs: Map<String, List<ExecutionLog>> = emptyMap(),
-    val isLoading: Boolean = false,
+    /** 任务列表在读。**只有 `loadTaskList` 能动它**。 */
+    val tasksLoading: Boolean = false,
+    /** 规则列表在读。**只有 `loadRuleList` 能动它**。 */
+    val rulesLoading: Boolean = false,
+    /** 任务列表成功读到过至少一次。空态门看它，不看 loading。 */
+    val tasksLoaded: Boolean = false,
+    /** 规则列表成功读到过至少一次。 */
+    val rulesLoaded: Boolean = false,
     val errorMessage: String? = null
-)
+) {
+    /** 有任何一侧在读（只给"页面整体转圈"这种粗粒度场景用，别拿它当空态门）。 */
+    val isLoading: Boolean get() = tasksLoading || rulesLoading
+}
 
 // ========== SMS Forward ==========
 
@@ -242,7 +278,19 @@ data class SmsForwardState(
     val loaded: Boolean = false,
     /** `GET /api/sms-forward/diagnose` 的结果；null = 还没成功读到过（UI 不画诊断区）。 */
     val diagnose: SmsForwardDiagnose? = null,
-    val isLoading: Boolean = false,
+    /**
+     * 正在读配置。**只有 `loadSmsForwardConfig` 能动它。**
+     *
+     * 2026-09-20：三个位从原来共用的一个 `isLoading` 拆开。
+     * 共用那一位正是 [WebhookState] KDoc 里点名的反面教材 ——
+     * "刚进页面自动加载"把测试按钮置灰、"点测试"让保存按钮转圈。
+     * 那边早就改成三位分开，这一侧一直没迁移。
+     */
+    val loading: Boolean = false,
+    /** 正在写配置。用于禁用重复提交。 */
+    val saving: Boolean = false,
+    /** 正在发测试信。 */
+    val testing: Boolean = false,
     /**
      * 最近一次「测试发送」返回的 `auto_notify_enabled`；null = 本次会话还没测过。
      *
@@ -252,9 +300,16 @@ data class SmsForwardState(
      */
     val lastTestAutoNotifyEnabled: Boolean? = null,
     val errorMessage: String? = null
-)
-
-// ========== Webhook 通知渠道 ==========
+) {
+    /**
+     * 有任何一个动作在进行中。
+     *
+     * 给"页面级别的忙碌"用（`EmailNotifyScreen` 靠它的下降沿 + `pending` 归属做结算提示）。
+     * **别拿它控制单个按钮的禁用/转圈** —— 那是共用一位的老毛病，
+     * 保存时测试按钮跟着转圈。按钮各读 [loading] / [saving] / [testing]。
+     */
+    val isLoading: Boolean get() = loading || saving || testing
+}
 
 /**
  * 通用 Webhook 渠道的页面状态（`/api/notify/webhook/…`）。
@@ -417,6 +472,9 @@ data class CoreCrashNotice(
  *   旧版本 core 缺某个端点就会让页面顶部常驻一条红条。
  * - [fieldCoverageRequested] 记住用户是否点过「检测字段覆盖率」：那条路径会逐分组向设备发查询
  *   （最多 10 组），绝不能随页面刷新自动带上。
+ *
+ * 唯一的**可写**项是字段归一化开关那几个字段（2026-09-22）—— 它与覆盖率卡是同一个排障场景
+ * （覆盖率看归一化后的结果，开关关掉归一化去比对设备原始字段），所以放进同一份状态。
  */
 data class DiagnoseState(
     val diagnose: DiagnoseResponse? = null,
@@ -427,16 +485,91 @@ data class DiagnoseState(
     val isLoading: Boolean = false,
     val isBusy: Boolean = false,
     val fieldCoverageRequested: Boolean = false,
+    /**
+     * `field_normalization_enabled` 的**配置值**（`GET /api/config` 回来的那一个）。
+     *
+     * `null` 的两种来源都必须让 UI 把开关**禁用**：还没读到，或 core 的响应里根本没这个键
+     * （2026-09-22 之前的 core 没把它登记进 `AppSettings.toMap()`）。两者靠
+     * [fieldNormalizationRead] 区分。**绝不能 `?: true` 冒充默认值** —— 那正是本仓禁止的假开关：
+     * 开关能拖，但那台 core 收不到、也不返回这个键。
+     *
+     * 它也**不等于运行时的实际闸门**：core 只在构造组件图时读一次，所以从改完到重启之间，
+     * 这个值与 `diagnose.device_profile.normalization_enabled`（运行时实际值）会不一致，
+     * UI 要把这层差异显式说出来。
+     */
+    val fieldNormalizationEnabled: Boolean? = null,
+    /** 是否**成功读过一次** `GET /api/config`（用来区分「还没读到」与「读到了但没这个键」）。 */
+    val fieldNormalizationRead: Boolean = false,
+    /** 正在 PUT：期间禁用开关，防连点产生互相覆盖的并发请求（同 [LogSwitchState.isSaving] 口径）。 */
+    val fieldNormalizationSaving: Boolean = false,
+    /** 归一化开关回读/下发失败的原因，由 UI 弹一次 toast 后清掉；与下面的 [errorMessage] 分开。 */
+    val fieldNormalizationError: String? = null,
+    /**
+     * CPU 控制能力探测结果（GET /api/cpu-probe）。null = 还没探测过。
+     * JsonElement 承接（形状随内核漂移，同 field_coverage 的理由）。
+     */
+    val cpuProbe: kotlinx.serialization.json.JsonElement? = null,
+    /** 探测进行中：core 侧要发 20+ 条 shell（5~15s），期间按钮转圈防连点。 */
+    val cpuProbing: Boolean = false,
     val errorMessage: String? = null
 )
 
 // ========== Traffic Management ==========
 data class TrafficManagementState(
     val limitConfig: TrafficLimitConfig? = null,
+    /** 套餐档案（2026-10-07，GET /api/device/plan）；null = 未拉取 */
+    val planProfile: com.ufi_axis.data.model.PlanProfileResponse? = null,
     val isLoading: Boolean = false,
     val isSaving: Boolean = false,
     val errorMessage: String? = null,
     val successMessage: String? = null
+)
+
+/**
+ * 「流量历史」卡片状态（工具 → 流量管理，`GET /api/traffic/usage`）。
+ *
+ * ## 为什么按 range 各存一份，而不是一个 `data: TrafficUsageResponse?`
+ * range 是「选一个」的配置：切到「周」时若把「日」那份清掉，切回来必然白屏一次
+ * （请求最快也要一个 RTT）。按项目既有约定 —— 每份独立存、切换只改「当前选中」——
+ * 切换时先渲染已有的那份，再由后台刷新覆盖。[data] 就是「当前选中那一份」。
+ */
+data class TrafficHistoryState(
+    val range: String = TRAFFIC_HISTORY_RANGE_DAY,
+    /**
+     * 当前查看的锚点（epoch ms）；null = 当前这一段（今天 / 本周 / 本月 / 本年）。
+     *
+     * 左右滑动翻页时改这个值，用的是接口回的 `prev_anchor` / `next_anchor` ——
+     * 客户端不做月长度、闰年、DST 这些日历运算，core 已经算对了。
+     */
+    val anchor: Long? = null,
+    val dataByKey: Map<String, TrafficUsageResponse> = emptyMap(),
+    /** 只在**当前段还没有任何数据**时才为 true（有图时翻它不改变任何像素）。 */
+    val isLoading: Boolean = false,
+    val errorMessage: String? = null
+) {
+    /** 缓存键：range 与 anchor 组合。同一 range 的不同天要各存一份，否则来回翻页每次都白拉。 */
+    val key: String get() = cacheKeyOf(range, anchor)
+
+    /** 当前段的数据；null = 这一段还没成功拉到过。 */
+    val data: TrafficUsageResponse? get() = dataByKey[key]
+
+    companion object {
+        fun cacheKeyOf(range: String, anchor: Long?): String = "$range@${anchor ?: 0L}"
+    }
+}
+
+/** 流量历史的四个区间标识，与 core `/api/traffic/usage` 的 `range` 参数取值一致。 */
+const val TRAFFIC_HISTORY_RANGE_DAY = "day"
+const val TRAFFIC_HISTORY_RANGE_WEEK = "week"
+const val TRAFFIC_HISTORY_RANGE_MONTH = "month"
+const val TRAFFIC_HISTORY_RANGE_YEAR = "year"
+
+/** 下拉菜单的展示文案。顺序即菜单顺序。 */
+val TRAFFIC_HISTORY_RANGES: List<Pair<String, String>> = listOf(
+    TRAFFIC_HISTORY_RANGE_DAY to "日",
+    TRAFFIC_HISTORY_RANGE_WEEK to "周",
+    TRAFFIC_HISTORY_RANGE_MONTH to "月",
+    TRAFFIC_HISTORY_RANGE_YEAR to "年"
 )
 
 // ========== Frontend App Update（2026-08-10 C5：前端 App 自更新） ==========

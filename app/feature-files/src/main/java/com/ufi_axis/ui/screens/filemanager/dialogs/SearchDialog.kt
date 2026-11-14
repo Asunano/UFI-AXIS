@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import com.ufi_axis.ui.components.common.UfiDialogTextField
+import com.ufi_axis.ui.theme.Spacing
 
 @Composable
 fun SearchDialog(
@@ -52,7 +53,8 @@ fun SearchDialog(
             onDismiss = onDismiss,
             onConfirm = { onSearch(query.trim(), depth) },
             confirmText = "搜索",
-            dismissText = "取消"
+            dismissText = "取消",
+            topSpacing = Spacing.Large
         )
     }
 }

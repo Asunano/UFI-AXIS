@@ -11,7 +11,10 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.decodeFromJsonElement
 import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.data.notification.NotificationCenter
+import com.ufi_axis.data.notification.NotifyPrefs
 import com.ufi_axis.util.*
+// 2026-10-05 P5：smartRefresh 消费 summary / RECONNECTED sentinel（contract 唯一取值表）
+import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis_core.util.UiFrameGate
 import com.ufi_axis.viewmodel.repository.AlertPrefsRepository
 import com.ufi_axis.viewmodel.state.*
@@ -30,7 +33,21 @@ class DashboardModule(
     private val networkMonitor: NetworkMonitor,
     private val appContext: Context,
     private val scope: CoroutineScope,
-    private val alertPrefs: AlertPrefsRepository
+    private val alertPrefs: AlertPrefsRepository,
+    /**
+     * 跨模块 UI 事件出口（2026-09-22，阶段 3.3）。
+     *
+     * **刻意不把 [_events] 整条转发到这个 sink**（Network / Tools 是那么做的）：
+     * `_events` 现在只跑 `AlertDeleted`，由 `MonitorScreen` 直接收集 `dashboard.events` 处理；
+     * 整条转发会让 `AlertDeleted` 也流经 `MainViewModel.collectCrossModuleEvents`，
+     * 虽然那边现在是空分支、行为不变，但等于给一条已经工作的链路加了第二个订阅者。
+     * 写操作提示直投 sink，两条路各自独立 —— 改这一条不会碰到删除成功那一条。
+     *
+     * 给了默认值只为让**单元测试**能继续用原来的 6 参构造（它们测的是取数与并发，
+     * 不关心提示通道）。生产路径由 `MainViewModel` 显式传入真 sink。
+     */
+    private val crossModuleEventSink: MutableSharedFlow<UiEvent> =
+        MutableSharedFlow(extraBufferCapacity = 16)
 ) {
     // ── State ──
     private val _dashboardState = MutableStateFlow(DashboardState())
@@ -52,6 +69,17 @@ class DashboardModule(
     // 同构于 ToolsModule/NetworkModule 的 _events，但仅面向 UI（不转发跨模块 sink）。
     private val _events = MutableSharedFlow<UiEvent>(extraBufferCapacity = 16)
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
+
+    /**
+     * 写操作成功提示（2026-09-22）：直投 [crossModuleEventSink] → `MainViewModel.writeNotice`
+     * → Activity 级 Toast 宿主，与失败提示同一个出口。
+     *
+     * 文案要说清**是哪一项**生效了：监控设置四个二级页共用同一个 [setMonitorSettings]，
+     * 「保存成功」这种泛化文案让用户分不清落地的是采集间隔还是保留天数。
+     */
+    private fun emitWriteNotice(message: String, subtitle: String? = null) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    }
 
     private val _updateState = MutableStateFlow(UpdateState())
     val updateState: StateFlow<UpdateState> = _updateState.asStateFlow()
@@ -175,6 +203,16 @@ class DashboardModule(
         saveDebounceJob?.cancel()
         webSocketRepository.disconnect()
         cacheManager.shutdown()
+    }
+
+    /**
+     * 丢掉本机仪表盘 Room 缓存（切换/退出设备时）。
+     *
+     * 缓存是**全局一份**、不按设备分桶：换到另一台 Core 后若不清，
+     * 首屏会先 paint 上一台的 CPU/流量再被新数据盖掉，看起来像「数据串台」。
+     */
+    suspend fun clearDashboardCache() {
+        runCatching { cacheManager.clearCache() }
     }
 
     // ── Cache ──
@@ -357,34 +395,61 @@ class DashboardModule(
                             }
                         }
                         "notification" -> {
-                            // 2026-08-25：新公共通知服务推送，逻辑与 alert 兼容
+                            // 业务类推送（短信 / 验证码 / 下载 / 隧道）的**主进程入口**。
+                            //
+                            // 2026-09-14：主进程此前不订阅 `notification`（`WsChannel.UI_TOPICS` 把它剔除了），
+                            // 而短信 / 验证码只在这个频道广播（`PushChannel.SINGLE_TOPIC_SCENES`），
+                            // 唯一订阅方 `:ufi_notify` 又只在「前台服务保活」开启后才建 WS ——
+                            // 于是保活关着时这几类系统通知一条都发不出来（邮件由 core 自己发，照常）。
+                            // 现在主进程订上该频道并把载荷交给 NotificationCenter，由它的进程门
+                            // 转交 `:ufi_notify` 发射（显式广播会自动拉起那个进程）。
+                            //
+                            // 这里**只认业务类 type**：告警形状的载荷仍由 `alert` 分支独家处理，
+                            // 否则 core 的 `notification` + `alert` 双发会让同一条告警被处理两遍。
                             try {
                                 val dataObj = message.data as? JsonObject
-                                // 2026-09-04：短信 / 验证码分流，**不能**当告警处理。
-                                // core 的 DataScheduler 在"发现新短信"的边沿推 type=sms|verification；
-                                // 走 parsePushedAlert 会把短信塞进告警列表、并受告警总闸约束。
-                                // 这条分支管的是「app 在前台但不在短信页」的场景；
-                                // app 在后台/被回收时由 :ufi_notify 的 NotifyService 弹（同一份 payload）。
                                 val pushType = dataObj?.get("type")?.jsonPrimitive?.content
-                                if (pushType == "sms" || pushType == "verification") {
-                                    val extra = dataObj?.get("extra") as? JsonObject
-                                    val sender = extra?.get("sender")?.jsonPrimitive?.content ?: ""
-                                    if (pushType == "verification") {
-                                        val code = extra?.get("code")?.jsonPrimitive?.content ?: ""
-                                        if (code.isNotEmpty()) notificationCenter.notifyVerificationCode(sender, code)
-                                    } else {
-                                        val snippet = extra?.get("snippet")?.jsonPrimitive?.content ?: ""
-                                        notificationCenter.notifyNewSms(sender, snippet)
+                                // 保活开着时 `:ufi_notify` 已订阅同一条推送并直接发射，主进程再转交就是双发。
+                                // 判据复用保活的唯一闸门（KeepAliveGate），不引入第二套状态。
+                                if (pushType != null && NotifyPrefs.keepAliveShouldRun(appContext)) {
+                                    // 交给 :ufi_notify，本进程不处理
+                                } else when (pushType) {
+                                    "sms", "verification" -> {
+                                        val extra = dataObj?.get("extra") as? JsonObject
+                                        val sender = extra?.get("sender")?.jsonPrimitive?.content ?: ""
+                                        if (pushType == "verification") {
+                                            val code = extra?.get("code")?.jsonPrimitive?.content ?: ""
+                                            if (code.isNotEmpty()) notificationCenter.notifyVerificationCode(sender, code)
+                                        } else {
+                                            val snippet = extra?.get("snippet")?.jsonPrimitive?.content ?: ""
+                                            notificationCenter.notifyNewSms(sender, snippet)
+                                        }
                                     }
-                                } else if (isNonAlertPush(dataObj)) {
-                                    // 见 [isNonAlertPush]：下载 / 隧道不是告警记录，显式丢弃。
-                                } else if (dataObj != null) {
-                                    val pushedAlert = parsePushedAlert(dataObj)
-                                    _monitorState.update { s ->
-                                        val next = (listOf(pushedAlert) + s.alerts.filter { it.id != pushedAlert.id }).take(500)
-                                        s.copy(alerts = next)
+                                    // 终态判定（"这次才刚变成完成/失败"、"重连到达上限才放弃"）与隧道的
+                                    // `tunnel_notify_on_failure` 闸门都在 core，推送到达即代表该提醒；
+                                    // 这里只把 core 给的 title/message 渲染出来，不比状态。
+                                    // 它们也不进 `MonitorState.alerts` —— core 不写 alert_records，见 [isNonAlertPush]。
+                                    "download", "tunnel" -> {
+                                        val extra = dataObj?.get("extra") as? JsonObject
+                                        val title = dataObj?.get("title")?.jsonPrimitive?.content ?: ""
+                                        val body = dataObj?.get("message")?.jsonPrimitive?.content ?: ""
+                                        if (pushType == "download") {
+                                            notificationCenter.notifyDownloadResult(
+                                                title = title.ifBlank { "下载任务" },
+                                                message = body,
+                                                isError = extra?.get("status")?.jsonPrimitive?.content == "error"
+                                            )
+                                        } else {
+                                            notificationCenter.notifyTunnelFailure(
+                                                kind = extra?.get("kind")?.jsonPrimitive?.content ?: "",
+                                                name = extra?.get("name")?.jsonPrimitive?.content ?: "",
+                                                title = title.ifBlank { "隧道异常" },
+                                                message = body
+                                            )
+                                        }
                                     }
-                                    notificationCenter.maybeNotifyNewAlerts(listOf(pushedAlert))
+                                    // 其余（告警形状）忽略：由 `alert` 分支处理，见本分支开头注释。
+                                    else -> Unit
                                 }
                             } catch (e: Exception) {
                                 DebugLog.e("Dashboard", "Parse notification failed", e)
@@ -444,6 +509,37 @@ class DashboardModule(
     fun refreshDashboard(forceRefresh: Boolean = false) {
         refreshJob?.cancel()
         refreshJob = scope.launch { refreshDashboardInternal(forceRefresh) }
+    }
+
+    /**
+     * 预加载 / 前台化用的刷新入口。与 [refreshDashboard] 的**唯一**区别：
+     * 不取消在飞的刷新，数据够新时直接不发请求。
+     *
+     * 为什么需要单独一个入口：[refreshDashboard] 无条件 `refreshJob?.cancel()`，
+     * 那是"手动刷新"该有的语义（用户按了按钮，上一次的结果已经不重要了）。
+     * 但预加载与页面自身的首次加载几乎同时发生，两边都调 [refreshDashboard] 就是
+     * 后来的把前面的掐掉、来回浪费一次聚合请求。这里改成"已经有人在拉就让它拉完"。
+     *
+     * 新鲜度窗口用默认的 [FOREGROUND_REFRESH_INTERVAL_MS]（= 页面轮询周期），
+     * 语义与 `startAutoRefresh` 的首轮 hold-off 一致，不会出现"轮询刚刷过、
+     * 前台化又认为该拉"的自相矛盾。
+     */
+    fun refreshDashboardIfStale() {
+        if (refreshJob?.isActive == true) return
+        if (_dashboardState.value.deviceInfo != null &&
+            isForegroundDataFresh(dashboardSuccessElapsed, SystemClock.elapsedRealtime())
+        ) {
+            return
+        }
+        refreshJob = scope.launch { refreshDashboardInternal(false) }
+    }
+
+    /**
+     * 换设备 / 换地址后丢掉新鲜度基准。与 [clearDashboardCache] 同一批调用 ——
+     * 只清 Room 不清戳，新设备首屏会因为旧戳还在窗口内而跳过请求。
+     */
+    fun resetFreshness() {
+        dashboardSuccessElapsed = 0L
     }
 
     /**
@@ -533,6 +629,15 @@ class DashboardModule(
                 if (_dashboardState.value.deviceVersion == null) {
                     loadDeviceVersionSilently()
                 }
+                // 2026-09-22：EPS 承载 QoS（AT+CGEQOSRDP）同样走独立端点。
+                //
+                // 只在**还没拿到**时拉，绝不跟着 10s 轮询走：AT 通道全局互斥，
+                // core 侧虽然有 5 分钟缓存挡着，但缓存过期那一次仍要真发 AT，
+                // 落在 summary 的关键路径上就可能把整张仪表盘拖住。
+                // 重新驻网后的新值靠用户重进页面（或 App 重启）刷新，够用。
+                if (_dashboardState.value.deviceQos == null) {
+                    loadDeviceQosSilently()
+                }
             } catch (e: Exception) {
                 // 更加鲁棒的取消判定：只要 coroutine 被取消，或者 OkHttp 抛出 Canceled 异常，均视为正常取消。
                 val isCancelled = e is CancellationException || 
@@ -570,6 +675,20 @@ class DashboardModule(
      * 期间数据并不会变旧到看得出来：cpu / 内存 / 流量 / 信号四项走 WebSocket 实时推送，
      * 被跳过的只有 dashboard/summary 那批"分钟级才会变"的字段（设备信息 / 电池 / 存储 / 运行时长）。
      */
+    /**
+     * 周期取数暂停闸门（2026-09-14）。返回 true 时下面两个轮询**跳过本轮请求**、只 delay。
+     *
+     * 目前唯一的接线方是 `MainViewModel`，接的是「设备端 Core 正在更新」。
+     * 升级期间 HTTP 必然中断约 1 分钟，这两条轮询会持续失败并把 errorMessage 写进 state，
+     * 用户看到满屏「加载告警失败」「连接失败」。
+     *
+     * 为什么是「跳过一轮」而不是 cancel job：这两个 job 的启停归 UI 宿主
+     * （`MainActivity` 管告警轮询、`DashboardScreen` 管首页刷新），从这里 cancel 之后
+     * 谁负责重启就变成了一个需要跨层协调的问题 —— 而且很容易在 Activity 处于后台时
+     * 把轮询重新拉起来。跳过一轮则**零协调、自动恢复**：闸门一放开，下一轮自然继续。
+     */
+    var pollGate: () -> Boolean = { false }
+
     fun startAutoRefresh(intervalMs: Long = 5_000L) {
         stopAutoRefresh()
         autoRefreshJob = scope.launch {
@@ -580,7 +699,7 @@ class DashboardModule(
             )
             if (holdOff > 0L) delay(holdOff)
             while (isActive) {
-                refreshDashboardInternal()  // 直接 suspend，等待完成后才 delay
+                if (!pollGate()) refreshDashboardInternal()  // 直接 suspend，等待完成后才 delay
                 delay(intervalMs)
             }
         }
@@ -598,7 +717,8 @@ class DashboardModule(
         alertPollingJob = scope.launch {
             while (isActive) {
                 // 2026-08-25: 使用 silent=true 避免非监控页刷新时闪烁
-                loadAlerts(_monitorState.value.alertRange, silent = true)
+                // 注意 silent 只压 isLoading、压不住 errorMessage，所以更新期间必须靠 pollGate 跳过
+                if (!pollGate()) loadAlerts(_monitorState.value.alertRange, silent = true)
                 delay(intervalMs)
             }
         }
@@ -660,17 +780,25 @@ class DashboardModule(
                 val info = runCatching { api.getBackendUpdateInfo() }
                     .onFailure { DebugLog.w("Dashboard", "core backend-info 不可用: ${it.message}") }
                     .getOrNull()
-                _updateState.value = UpdateState(
-                    hasUpdate = info?.has_update == true,
-                    // current_version 由 core 从自身 packageInfo 读；拿不到时回退 config/version
-                    serverVersion = info?.current_version?.takeIf { it.isNotBlank() } ?: versionInfo.version,
-                    latestVersion = info?.latest_version?.takeIf { it.isNotBlank() },
-                    changelog = info?.changelog.orEmpty(),
-                    updateUrl = versionInfo.update_url,
-                    checking = false
-                )
+                _updateState.update {
+                    it.copy(
+                        hasUpdate = info?.has_update == true,
+                        // current_version 由 core 从自身 packageInfo 读；拿不到时回退 config/version
+                        serverVersion = info?.current_version?.takeIf { v -> v.isNotBlank() } ?: versionInfo.version,
+                        latestVersion = info?.latest_version?.takeIf { v -> v.isNotBlank() },
+                        changelog = info?.changelog.orEmpty(),
+                        updateUrl = versionInfo.update_url,
+                        checking = false,
+                        errorMessage = null
+                    )
+                }
             } catch (e: Exception) {
-                _updateState.value = UpdateState(checking = false, errorMessage = "检查更新失败: ${e.message}")
+                // 只写失败原因，**不要构造新 state** —— 构造会把上一次成功读到的
+                // serverVersion/latestVersion/changelog 全部清空，等于设备临时不可达一次
+                // 就把关于页那行「Core x.y.z」也一起打掉（与本函数 KDoc 的降级约定相反）。
+                _updateState.update {
+                    it.copy(checking = false, errorMessage = "检查更新失败: ${e.message}")
+                }
             }
         }
     }
@@ -687,6 +815,36 @@ class DashboardModule(
             _dashboardState.update { it.copy(deviceVersion = ver) }
         } catch (_: Exception) {
             // 静默：版本加载失败仅留空，不影响首页其余信息
+        }
+    }
+
+    /**
+     * 静默加载 EPS 承载 QoS（`AT+CGEQOSRDP` → QCI / 上下行 AMBR），2026-09-22。
+     *
+     * 与 [loadDeviceVersionSilently] 同一手法：非关键展示字段，失败只留空，不弹错误条。
+     *
+     * core 侧已经保证「AT 不可用」回的是 200 + `available = false`，所以这里 catch 到的
+     * 只会是真正的网络/序列化异常。两者最终都表现为卡片上显示"—"，UI 不需要区分。
+     */
+    private suspend fun loadDeviceQosSilently() {
+        try {
+            val qos = api.getDeviceQos()
+            _dashboardState.update { it.copy(deviceQos = qos) }
+        } catch (_: Exception) {
+            // 静默：AT 通道在很多设备上本就不存在，这不是错误
+        }
+    }
+
+    // 2026-10-08 只读监控档：热区温度拉取（CPU 弹窗展示关键热区）。失败静默——热区读不到
+    // 弹窗就不显示该区，不影响仪表盘其它数据。
+    private suspend fun loadThermalZonesSilently() {
+        try {
+            val resp = AppJson.decodeFromJsonElement<ThermalZonesResponse>(api.getThermalZones())
+            if (resp.zones.isNotEmpty()) {
+                _dashboardState.update { it.copy(thermalZones = resp.zones) }
+            }
+        } catch (_: Exception) {
+            // 静默：热区在部分固件上读不到，非致命
         }
     }
 
@@ -894,7 +1052,7 @@ class DashboardModule(
     fun loadAlerts(range: MonitorTimeRange = MonitorTimeRange.today(), silent: Boolean = false) {
         scope.launch {
             if (!silent) {
-                _monitorState.update { it.copy(isLoading = true) }
+                _monitorState.update { it.copy(alertsLoading = true) }
             }
             val start = range.queryStartMs
             val end = range.queryEndMs
@@ -909,11 +1067,18 @@ class DashboardModule(
                 }
             }.getOrElse { e ->
                 DebugLog.e("Dashboard", "loadAlerts failed", e)
-                _monitorState.update { s -> s.copy(errorMessage = "加载告警失败: ${e.message}", isLoading = false) }
+                _monitorState.update { s -> s.copy(errorMessage = "加载告警失败: ${e.message}", alertsLoading = false) }
                 return@launch
             }
             DebugLog.d("Dashboard", "loadAlerts first page: ${firstPage.alerts.size} hasMore=${firstPage.hasMore}")
-            _monitorState.update { s -> s.copy(alerts = firstPage.alerts, alertRange = range, isLoading = false) }
+            _monitorState.update { s ->
+                s.copy(
+                    alerts = firstPage.alerts,
+                    alertRange = range,
+                    alertsLoading = false,
+                    alertsLoaded = true
+                )
+            }
             // 2026-08-25: 修复多进程去重逻辑后，在此处触发主进程 Toast
             notificationCenter.maybeNotifyNewAlerts(firstPage.alerts)
 
@@ -1244,6 +1409,14 @@ class DashboardModule(
                 val pending: List<String> = types.filter { type ->
                     type in settings.enabledTypes && (force || type !in loadedMonitorTypes)
                 }
+                // 诊断日志（2026-10-12，临时；定位「图表暂无数据」用，定位完删）：
+                // pending 为空但界面没数据 =记账说"拉过了"而实际没数据，是记账与取数脱节；
+                // 这两种情况在UI 上都是"暂无数据"，必须靠这行日志区分。
+                DebugLog.i("ChartDbg") {
+                    "loadMonitorTypes req=${types.joinToString(",")} pending=${pending.joinToString(",")} " +
+                        "loaded=${loadedMonitorTypes.joinToString(",")} force=$force " +
+                        "collectEnabled=${settings.collectEnabled} rangeKey=$loadedMonitorRangeKey"
+                }
                 if (pending.isEmpty()) return@launch
                 // 先记账再发请求：两个区块共享同一类指标（例如都要 traffic）时不会各拉一遍。
                 loadedMonitorTypes.addAll(pending)
@@ -1278,7 +1451,12 @@ class DashboardModule(
                         if (silent) next else next.copy(isLoading = false)
                     }
                     // 失败的类型撤销记账：下次露面或下一轮轮询还能重试，否则会永久空着。
-                    loaded.forEach { (type, resp) -> if (resp == null) loadedMonitorTypes.remove(type) }
+                    loaded.forEach { (type, resp) ->
+                        if (resp == null) loadedMonitorTypes.remove(type)
+                        DebugLog.i("ChartDbg") {
+                            "fetch $type ok=${resp != null} points=${resp?.points?.size ?: -1} bucketMs=${resp?.bucket_ms ?: -1} bucketSec=${resp?.bucket_seconds ?: -1} count=${resp?.count ?: -1} raw=${resp?.raw_count ?: -1}"
+                        }
+                    }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     loadedMonitorTypes.removeAll(pending.toSet())
@@ -1449,31 +1627,105 @@ class DashboardModule(
      *   任意无关设置（时长/间隔/指标开关…）都无条件重发本地默认值 `true`，会把用户在设置页
      *   或 web 端显式停掉的后台服务静默改回"已启动"。
      * - 个性化 7 项（T40-5）同理只在真正变化时 `PUT /api/monitor/preferences`，并以服务端回显覆盖本地。
-     * - 后端调用 fire-and-forget，失败静默不阻断 UI。
+     *
+     * ## 2026-09-22：从"fire-and-forget + 只打日志"改成有反馈（阶段 3.3）
+     * 原来两个请求都是发出去就不管了，失败只 `DebugLog.w` —— 而这里是**即改即存**的界面，
+     * 没有保存按钮可以停在"保存中"，用户唯一能观察到的就是"我改的设置过一会儿又变回去了"
+     *（下次进页面回读被服务端值覆盖）。原注释自己写下了这个症状。
+     *
+     * 现在：成功发 [emitWriteNotice]（说清是哪一项），失败写 `monitorState.errorMessage`
+     *（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast）并**回读服务端真值**，
+     * 让界面上那个已经被用户拨过去的开关/滑杆立刻弹回设备真值（§4.11），
+     * 而不是留一个"看着改了、其实没改"的假状态。
+     *
+     * 两个请求合并进**同一个协程**串行发（原来是两个 `scope.launch`）：一次保存最多只该
+     * 出现一条提示，拆成两个协程时"同时改了总开关和采集间隔"会弹两条、失败时还会写两次
+     * errorMessage 互相覆盖。
      */
     fun setMonitorSettings(settings: MonitorSettings) {
         val previous = _monitorState.value.settings
         monitorPreferences.save(settings)
         _monitorState.update { it.copy(settings = settings) }
-        if (settings.collectEnabled != previous.collectEnabled) {
-            scope.launch {
-                runCatching { api.setMonitorControl(mapOf("enabled" to settings.collectEnabled)) }
-            }
-        }
+
+        val collectChanged = settings.collectEnabled != previous.collectEnabled
         val payload = settings.toRemotePayload()
-        if (payload == previous.toRemotePayload()) return
+        val prefsChanged = payload != previous.toRemotePayload()
+        if (!collectChanged && !prefsChanged) return
+
+        // 文案在发请求之前算：算的是"用户这次改了什么"，与请求结果无关
+        val label = monitorSettingsChangeLabel(previous, settings)
+
         scope.launch {
-            val result = runCatching { api.updateMonitorPreferences(payload) }
-            val echoed = result.getOrNull()?.takeIf { it.success }?.preferences
-            if (echoed == null) {
-                // 不打扰用户，但必须留痕：写失败意味着本地缓存已经和 core 真源不一致，
-                // 下次进页面回读时会被服务端值覆盖（表现为"我改的设置又变回去了"）。
-                DebugLog.w("Monitor", "监控偏好下发失败，本地已改但 core 未更新: ${result.exceptionOrNull()?.message}")
-                return@launch
+            if (collectChanged) {
+                val ok = runCatching { api.setMonitorControl(mapOf("enabled" to settings.collectEnabled)) }
+                if (ok.isFailure) {
+                    monitorSettingsFailed("后台采集", ok.exceptionOrNull())
+                    return@launch
+                }
             }
-            // 以服务端回显为准：core 会做取值域校验，若本地传了越界值，服务端返回的才是真实生效值。
-            applyRemotePreferences(echoed)
+            if (prefsChanged) {
+                val result = runCatching { api.updateMonitorPreferences(payload) }
+                val echoed = result.getOrNull()?.takeIf { it.success }?.preferences
+                if (echoed == null) {
+                    monitorSettingsFailed(label, result.exceptionOrNull())
+                    return@launch
+                }
+                // 以服务端回显为准：core 会做取值域校验，若本地传了越界值，服务端返回的才是真实生效值。
+                applyRemotePreferences(echoed)
+            }
+            // 开关类说"已开启/已关闭"，数值类说"已保存"：对开关而言"已保存"没有告诉用户
+            // 现在是开还是关，而这恰恰是他刚做的那个决定。
+            emitWriteNotice(
+                if (collectChanged) {
+                    if (settings.collectEnabled) "后台采集已开启" else "后台采集已关闭"
+                } else {
+                    "$label 已保存"
+                }
+            )
         }
+    }
+
+    /**
+     * 监控设置下发失败的统一收尾。
+     *
+     * 回读放在写 errorMessage **之后**：`refreshMonitorSettingsFromBackend` 内部对
+     * "两个请求都失败"是直接 return（沿用本地缓存），不会把刚写的错误文案顶掉；
+     * 而它一旦成功，`settings` 变化会让界面上的控件自己回到设备真值。
+     */
+    private suspend fun monitorSettingsFailed(label: String, cause: Throwable?) {
+        val reason = cause?.message ?: "设备未接受这次修改"
+        DebugLog.w("Monitor", "监控设置下发失败（$label）: $reason", cause)
+        _monitorState.update { it.copy(errorMessage = "$label 保存失败：$reason") }
+        // 本地缓存已经被乐观地改过了，必须拉回 core 真值，否则界面停在一个没落地的值上
+        refreshMonitorSettingsFromBackend()
+    }
+
+    /**
+     * 这次改动最该被报出来的那一项（名词短语，调用方自己拼"已保存"之类的尾巴）。
+     *
+     * 为什么要挑一项而不是笼统说「监控设置」：四个二级页（采集 / 图表 / 调度 / 导出）共用
+     * 本方法，每页又有好几个滑杆，泛化文案等于没说（§4.15）。UI 一次交互只改一个字段，
+     * 所以"第一个不相等的字段"就是用户刚动的那个；真出现多字段同时变（指标开关弹窗的
+     * 批量勾选）时按声明顺序取第一个，仍然指向用户正在看的那一组。
+     */
+    private fun monitorSettingsChangeLabel(prev: MonitorSettings, next: MonitorSettings): String = when {
+        prev.collectEnabled != next.collectEnabled -> "后台采集"
+        prev.enabledTypes != next.enabledTypes -> "采集指标"
+        prev.defaultHours != next.defaultHours -> "默认时间范围"
+        prev.refreshIntervalSec != next.refreshIntervalSec -> "自动刷新间隔"
+        prev.fixedYAxis != next.fixedYAxis -> "Y 轴固定"
+        prev.fillAlpha != next.fillAlpha -> "图表填充透明度"
+        prev.exportZip != next.exportZip -> "导出方式"
+        prev.retentionDays != next.retentionDays -> "历史保留天数"
+        prev.flushIntervalSec != next.flushIntervalSec -> "采集刷写间隔"
+        prev.alertScanSec != next.alertScanSec -> "告警扫描间隔"
+        prev.idleIntervalSec != next.idleIntervalSec -> "空闲采集间隔"
+        prev.thermalWarnC != next.thermalWarnC -> "温控预警阈值"
+        prev.thermalCriticalC != next.thermalCriticalC -> "温控熔断阈值"
+        prev.thermalPauseSec != next.thermalPauseSec -> "熔断暂停时长"
+        prev.trafficLimitCheckSec != next.trafficLimitCheckSec -> "套餐限额检查间隔"
+        prev.deviceEventCheckSec != next.deviceEventCheckSec -> "设备接入检查间隔"
+        else -> "监控设置"
     }
 
     /**
@@ -1566,6 +1818,11 @@ class DashboardModule(
 
     fun smartRefresh(changedType: String) {
         when {
+            // 2026-10-05 P5：summary 失效事件（P1 invalidateAll 广播）复用既有 summary 拉取
+            changedType == "summary" -> refreshDashboard()
+            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 全量补拉一轮（非 force，
+            // 走既有新鲜度/轮询闸门，断线短时多数被挡住）
+            changedType == WsDataTopic.RECONNECTED -> refreshDashboard()
             changedType.startsWith("device:") -> refreshDashboard(forceRefresh = true)
         }
     }

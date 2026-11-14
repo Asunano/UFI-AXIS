@@ -16,7 +16,11 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
+import com.ufi_axis.viewmodel.module.FileManagerModule
 import com.ufi_axis.viewmodel.state.StorageVolume
+
+/** 远端路径前缀，真源在 [FileManagerModule.REMOTE_PREFIX]（这里只是别名，不另立一份字面量）。 */
+private const val REMOTE_PATH_PREFIX = FileManagerModule.REMOTE_PREFIX
 
 /**
  * 面包屑路径栏（无状态展示组件，T5）。
@@ -38,6 +42,10 @@ import com.ufi_axis.viewmodel.state.StorageVolume
  * @param volumes 已知存储卷列表（用于匹配卷标签）
  * @param onNavigate 点击某路径前缀时的回调，参数为目标前缀路径
  * @param onRoot 点击根 crumb 时的回调（回到父级/虚拟根）
+ * @param remoteSourceLabel 当前路径所在**远端源**的显示名（本地路径传 null）。
+ *   2026-09-21 新增：远端路径形如 `remote:abc123/photos/2024`，原样切分会把
+ *   `remote:abc123` 这串内部 id 当成第一段渲染出来 —— 那是给 core 看的，不是给人看的。
+ *   有这个参数时第一段显示源标签，其余段照旧按 `/` 切。
  * @param modifier 修饰符
  */
 @Composable
@@ -46,10 +54,14 @@ fun BreadcrumbBar(
     volumes: List<StorageVolume>,
     onNavigate: (String) -> Unit,
     onRoot: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    remoteSourceLabel: String? = null
 ) {
     val palette = LocalResolvedPalette.current
     val isRoot = currentPath.isEmpty()
+
+    // 远端路径单独一条渲染分支：卷匹配对它完全无意义（它没有挂载点）。
+    val isRemote = currentPath.startsWith(REMOTE_PATH_PREFIX)
 
     // 最长前缀匹配：找到 currentPath 所属卷（mountPath 最长者），用于卷根/子目录判定与卷标签。
     val matchedVolume = volumes
@@ -80,7 +92,44 @@ fun BreadcrumbBar(
                         .size(22.dp),
                     tint = palette.accent
                 )
-                if (isVolumeRoot) {
+                if (isRemote) {
+                    // ── 远端源分支 ──
+                    // 第一段是源标签（点它回源根），其余按 `/` 切；累加前缀时必须带上
+                    // `remote:<id>/` 这一头，否则点中间那一段会跳到一条 core 认不出的路径。
+                    val sourceId = currentPath.removePrefix(REMOTE_PATH_PREFIX).substringBefore('/')
+                    val sourceRoot = "$REMOTE_PATH_PREFIX$sourceId/"
+                    val atSourceRoot = currentPath.trimEnd('/') == sourceRoot.trimEnd('/')
+                    Text(
+                        text = remoteSourceLabel ?: sourceId,
+                        color = palette.accent,
+                        style = UfiTextStyles.pathSegment.copy(fontWeight = UfiWeight.Medium),
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp, vertical = 2.dp)
+                            // 已经在源根上：再点它只能是"回到能挑别的存储那一层"。
+                            .clickable(onClick = if (atSourceRoot) onRoot else ({ onNavigate(sourceRoot) }))
+                    )
+                    val relative = currentPath.removePrefix(sourceRoot).trimStart('/')
+                    var remoteAccumulated = sourceRoot.trimEnd('/')
+                    relative.split("/").filter { it.isNotEmpty() }.forEach { segment ->
+                        remoteAccumulated = "$remoteAccumulated/$segment"
+                        // 同上：迭代内用 val 捕获，否则每一段都会跳到最终路径。
+                        val target = remoteAccumulated
+                        Text(
+                            text = " / ",
+                            color = palette.textSecondary,
+                            style = UfiTextStyles.pathSegment,
+                            modifier = Modifier.padding(horizontal = 2.dp)
+                        )
+                        Text(
+                            text = segment,
+                            color = palette.accent,
+                            style = UfiTextStyles.pathSegment.copy(fontWeight = UfiWeight.Medium),
+                            modifier = Modifier
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                                .clickable(onClick = { onNavigate(target) })
+                        )
+                    }
+                } else if (isVolumeRoot) {
                     // 卷根：只渲染卷标签（点击回到虚拟根），不拆分挂载路径。
                     Text(
                         text = rootLabel,

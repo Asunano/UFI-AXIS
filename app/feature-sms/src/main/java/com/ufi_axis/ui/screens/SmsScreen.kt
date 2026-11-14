@@ -28,6 +28,9 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.*
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.*
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -66,6 +69,8 @@ import com.ufi_axis.ui.theme.UfiWeight
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.util.FormatUtils
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis.ui.navigation.LocalPendingSmsPhone
 import com.ufi_axis.ui.navigation.Routes
 import java.text.SimpleDateFormat
@@ -91,6 +96,36 @@ private const val CONTACTS_AUTO_REFRESH_MS = 10_000L
 fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val palette = LocalResolvedPalette.current
     val toolsState by viewModel.toolsState.collectAsState()
+
+    // 设备能力集（批 O / 3.5）：core 只在 `POST /api/sms/send` 上有门禁
+    // （`RootSmsRoutes.kt:103`，判据是 profile.smsSpec()，短信不走 SettingKey）。
+    // 那是全仓唯一一条「往外发短信」的入口，所以本页只灰**发信**入口：
+    // 新建短信 FAB + 对话里的输入栏 + 长按菜单的「重新发送」。
+    //
+    // 信箱的读 / 删 / 标已读 / 验证码 / 黑名单 / 转发规则**一律不灰** —— 它们不在这个域里，
+    // 也没有门禁。「这台设备不能发短信」不等于「不能看收到的短信」。
+    //
+    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可发。
+    val capabilities by viewModel.network.capabilityState.collectAsState()
+    val smsSupported = capabilities.supports(Capability.SMS)
+    // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+    LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
+
+    // ── lifecycle 门控（2026-09-21）──
+    // 不轮询时在后台白打 HTTP；本页不是底部 Tab 页，不需要 pageForeground。
+    var lifecycleResumed by remember { mutableStateOf(true) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
+
     // 一次性动作（如「全部标为已读」）用它起协程等结果再弹 Toast，不进 ViewModel 状态。
     val scope = rememberCoroutineScope()
     var isComposing by remember { mutableStateOf(false) }
@@ -105,6 +140,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 提到屏幕层持有而不是放在行里：确认结果要弹 Toast，而 UfiToastHost 挂在这一层；
     // 放在行内的话，列表刷新（10s 静默轮询）重组时那一行连带弹窗会被整块换掉。
     var pendingBlacklistPhone by remember { mutableStateOf<String?>(null) }
+    var pendingDeleteConversationPhone by remember { mutableStateOf<String?>(null) }
     // 「查看原对话」跳走前暂存的那条：对话关闭后原样弹回来，让用户回到点跳转之前的状态
     var reopenCodeAfterConversation by remember { mutableStateOf<VerificationCode?>(null) }
     // 两个列表的滚动位置提到屏幕级持有。对话页是根 AnimatedContent 的另一层，
@@ -149,7 +185,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 会话列表自动刷新：设备收到新短信、或短信从别处发出，都不会主动推给 app ——
     // 不轮询的话列表要等用户下拉 / 重进页面才更新。静默刷新，不点亮下拉指示器。
     // 只在「消息」页签且没打开对话时跑：对话层有自己的刷新路径，页面离开时 LaunchedEffect 自动取消。
-    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
+    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 0 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
         while (true) {
             delay(CONTACTS_AUTO_REFRESH_MS)
@@ -157,11 +194,12 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 验证码（通知页签）同样需要实时刷新：自动复制验证码的触发点就在 loadVerificationCodes()
-    // 内部（ToolsModule.autoCopyNewestVerificationCode），不轮询则新到的验证码不会被拉取、
-    // 也就不会自动复制到剪贴板，表现为「自动复制功能失效」。仅「通知」页签且没打开对话时跑，
-    // 复用联系人轮询同样的间隔与生命周期（页面离开 / 切页签时 LaunchedEffect 自动取消）。
-    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone) {
+    // 验证码（通知页签）实时刷新：
+    // 2026-09-13 修复：自动复制验证码已迁移至 `:ufi_notify` 进程后台触发（见 NotificationCenter），
+    // 不再依赖本页面的 UI 轮询。这里的轮询仅用于「通知」页签列表刷新和未读角标计算。
+    // 仅「通知」页签且没打开对话时跑，复用联系人轮询同样的间隔与生命周期。
+    LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
+        if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 1 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
         while (true) {
             delay(CONTACTS_AUTO_REFRESH_MS)
@@ -315,7 +353,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     val enteringConversation = targetState != null
                     // 2026-09-04（P2b）：下面两处 `fadeOut(tween(240))` → Duration.Fluid（250，+10ms，
                     // 在吸附容差内）。240 与梯度上的 250 是同一种「离场比进场快半拍」的手感，
-                    // 全库不该保留两个数；顺带与弹窗离场（UfiDialogAnim.ExitDuration）走了同一档。
+                    // 全库不该保留两个数；顺带与弹窗离场（UfiMotion.Duration.Fluid）走了同一档。
                     val transform = if (enteringConversation) {
                         // push：新页整幅宽度滑入压在上面，旧页只走 1/4 宽做视差（M3 的做法，
                         // 两页等速对滑会像"翻牌"，视差才有层级）
@@ -367,6 +405,16 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                             badges = listOf(null, toolsState.verificationCodesUnread)
                         )
 
+                        // 置灰原因（只在不支持时出现，且只在「消息」页签 —— 「通知」页签里
+                        // 全是本地解析出来的验证码，跟能不能发短信无关）。
+                        // 只说「设备不支持」：这台设备压根没有发信能力，没有任何地方可开。
+                        if (!smsSupported && toolsState.smsTab == 0) {
+                            UfiNoticeCard(
+                                message = deviceUnsupportedNote("发送短信"),
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                            )
+                        }
+
                         // 内容区。用 BoxWithConstraints 是为了让 FAB 的边距按**实际可用区域**
                         // 取百分比（见下方 fabEndPad / fabBottomPad），而不是写死 dp ——
                         // 写死值在小屏上顶边、在平板上又离内容太远。
@@ -403,6 +451,19 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                                         else ToastMessage("操作失败，请重试", ToastType.ERROR)
                                                     }
                                                 },
+                                                onMarkUnread = { phone ->
+                                                    // 把该会话最新一条**收到的**短信标未读 —— 会话行的未读角标
+                                                    // 数的就是收到方未读数，标发出方不会让角标亮起来。
+                                                    val latest = toolsState.smsList
+                                                        .filter { it.phoneNumber == phone && it.direction == "received" }
+                                                        .maxByOrNull { it.timestamp }
+                                                    if (latest != null) {
+                                                        viewModel.tools.markSmsUnread(latest.id)
+                                                    } else {
+                                                        toastMessage = ToastMessage("没有可标记的短信", ToastType.ERROR)
+                                                    }
+                                                },
+                                                onRequestDeleteConversation = { pendingDeleteConversationPhone = it },
                                                 onRequestBlacklist = { pendingBlacklistPhone = it }
                                             )
                                         }
@@ -463,6 +524,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     icon = Icons.Default.ChatBubbleOutline,
                                     onClick = { isComposing = true },
                                     contentDescription = "新建短信",
+                                    enabled = smsSupported,
                                     modifier = Modifier.align(Alignment.BottomEnd)
                                         .padding(end = fabEndPad, bottom = fabBottomPad)
                                 )
@@ -508,7 +570,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     viewModel.tools.setSmsCodeEnabled(true)
                 },
                 confirmText = "开启",
-                dismissText = "取消"
+                dismissText = "取消",
+                topSpacing = Spacing.Large
             )
         }
     }
@@ -620,15 +683,21 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
                 // 跳转走公共 UfiButton（variant = Secondary）：原来是 M3 原生 TextButton 挤在标题行右侧，
                 // 既不是公共组件、点击区域也只有文字那么大。
+                //
+                // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
+                // 这个 local 必须在弹窗自己的 lambda 内部读，在外面读会拿到"直接执行"的默认实现。
+                val closeDetail = LocalUfiDialogClose.current
                 UfiButton(
                     variant = UfiButtonVariant.Secondary,
                     text = "查看原对话",
                     onClick = {
-                        // 暂存当前这条：对话关掉后弹窗自动回来，不切页签也不丢滚动位置。
-                        // 同时把 msgId 带过去 —— 对话打开后直接滚到并高亮这条验证码短信。
-                        reopenCodeAfterConversation = vc
-                        codeDetail = null
-                        viewModel.tools.openVerificationCodeSource(vc.source, vc.msgId)
+                        closeDetail {
+                            // 暂存当前这条：对话关掉后弹窗自动回来，不切页签也不丢滚动位置。
+                            // 同时把 msgId 带过去 —— 对话打开后直接滚到并高亮这条验证码短信。
+                            reopenCodeAfterConversation = vc
+                            codeDetail = null
+                            viewModel.tools.openVerificationCodeSource(vc.source, vc.msgId)
+                        }
                     }
                 )
             }
@@ -664,6 +733,22 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 条数 / 全部标为已读）+ 一个「打开时才拉 /api/sms/count」的 LaunchedEffect。
     // 整段已搬到独立页面 SmsSettingsScreen（齿轮改为 navigate），弹窗与状态一并删除 ——
     // 同一个设置留两个入口，改了一边另一边就是错的。
+
+    // ── 会话行长按「删除整段会话」的二次确认 ──
+    pendingDeleteConversationPhone?.let { phone ->
+        UfiConfirmDialog(
+            visible = true,
+            title = "删除整段会话",
+            text = "将删除与 $phone 的全部短信记录，此操作不可恢复。",
+            confirmText = "删除全部",
+            destructive = true,
+            onDismiss = { pendingDeleteConversationPhone = null },
+            onConfirm = {
+                pendingDeleteConversationPhone = null
+                viewModel.tools.deleteConversation(phone)
+            }
+        )
+    }
 }
 
 // ═══════════════════════════════════════════════
@@ -694,6 +779,10 @@ private fun SmsConversationList(
     onMarkAllRead: () -> Unit,
     /** 长按菜单「标记已读」：整段会话标已读，结果由屏幕层弹 Toast。 */
     onMarkRead: (String) -> Unit,
+    /** 长按菜单「标记未读」：把该会话最新一条收到的短信标未读（2026-09-21）。 */
+    onMarkUnread: (String) -> Unit,
+    /** 长按菜单「删除整段会话」：只上报意图，二次确认与删除在屏幕层做（2026-09-21）。 */
+    onRequestDeleteConversation: (String) -> Unit,
     /** 长按菜单「加入黑名单」：只上报意图，二次确认与写入在屏幕层做。 */
     onRequestBlacklist: (String) -> Unit
 ) {
@@ -761,6 +850,8 @@ private fun SmsConversationList(
                 contact = contact,
                 onClick = { viewModel.tools.openConversation(contact.phoneNumber) },
                 onMarkRead = { onMarkRead(contact.phoneNumber) },
+                onMarkUnread = { onMarkUnread(contact.phoneNumber) },
+                onDeleteConversation = { onRequestDeleteConversation(contact.phoneNumber) },
                 onRequestBlacklist = { onRequestBlacklist(contact.phoneNumber) }
             )
         }
@@ -794,6 +885,8 @@ private fun SmsConversationRow(
     contact: SmsContact,
     onClick: () -> Unit,
     onMarkRead: () -> Unit,
+    onMarkUnread: () -> Unit,
+    onDeleteConversation: () -> Unit,
     onRequestBlacklist: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -962,7 +1055,7 @@ private fun SmsConversationRow(
                         }
                     )
                 )
-                // 没有未读时不给这一项：点了也是白发一次请求。
+                // 没有未读时不给「标记已读」；反过来有未读时不给「标记未读」
                 if (hasUnread) {
                     add(
                         UfiPopupOption(
@@ -975,8 +1068,32 @@ private fun SmsConversationRow(
                             }
                         )
                     )
+                } else {
+                    add(
+                        UfiPopupOption(
+                            id = "unread",
+                            label = "标记未读",
+                            icon = Icons.Default.MarkEmailUnread,
+                            onClick = {
+                                onMarkUnread()
+                                showActions = false
+                            }
+                        )
+                    )
                 }
                 add(UfiPopupOption.divider())
+                add(
+                    UfiPopupOption(
+                        id = "delete-conversation",
+                        label = "删除整段会话",
+                        icon = Icons.Default.DeleteOutline,
+                        isDestructive = true,
+                        onClick = {
+                            onDeleteConversation()
+                            showActions = false
+                        }
+                    )
+                )
                 add(
                     UfiPopupOption(
                         id = "blacklist",
@@ -1206,6 +1323,9 @@ private fun SmsConversationView(
         ChatInputBar(
             value = messageText,
             onValueChange = { messageText = it },
+            // 发信能力（批 O / 3.5）。判据与 SmsScreen 那处同源，都读 network.capabilityState。
+            enabled = viewModel.network.capabilityState.collectAsState().value
+                .supports(Capability.SMS),
             onSend = {
                 if (messageText.isNotBlank()) {
                     viewModel.tools.sendSms(phone, messageText)
@@ -1474,6 +1594,10 @@ private fun ChatBubbleRow(
                     )
                 }
 
+                // 「重新发送」也走 POST /api/sms/send，所以同样受 Capability.SMS 门禁。
+                // 判据必须取在这里而不是下面的 buildList 里 —— 那个 lambda 不是 @Composable，
+                // collectAsState() 放进去编译不过。
+                val smsSupported by viewModel.network.capabilityState.collectAsState()
                 UfiPopupMenu(
                     visible = showActions,
                     onDismiss = { showActions = false },
@@ -1492,7 +1616,10 @@ private fun ChatBubbleRow(
                                 }
                             )
                         )
-                        if (!isReceived) {
+                        // 不支持发信时**整项不加**，而不是灰着显示：长按菜单不是设置面板，
+                        // 没有放原因文案的位置，灰掉一行却不说为什么只会让人反复戳。
+                        // 原因由对话输入栏的占位文字与消息列表页顶那张说明卡承担。
+                        if (!isReceived && smsSupported.supports(Capability.SMS)) {
                             add(
                                 UfiPopupOption(
                                     id = "resend",
@@ -1591,10 +1718,16 @@ private fun SmsAvatarMini(identifier: String, modifier: Modifier = Modifier) {
 private fun ChatInputBar(
     value: String,
     onValueChange: (String) -> Unit,
-    onSend: () -> Unit
+    onSend: () -> Unit,
+    /**
+     * `false` = 这台设备不支持发短信（批 O / 3.5）。输入框不可编辑、发送键灰掉，
+     * 占位文字换成原因 —— 输入栏本身就是"在这里写字然后发出去"的承诺，
+     * 让人打完一段字才发现发不出去，比一开始就说清楚更糟。
+     */
+    enabled: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
-    val canSend = value.isNotBlank()
+    val canSend = value.isNotBlank() && enabled
     var isFocused by remember { mutableStateOf(false) }
 
     Column(
@@ -1621,6 +1754,7 @@ private fun ChatInputBar(
                     .padding(vertical = 8.dp)
                     .onFocusChanged { isFocused = it.isFocused },
                 maxLines = 5,
+                enabled = enabled,
                 cursorBrush = SolidColor(palette.accent),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = palette.textPrimary),
                 // 短信是多行正文，Enter 必须换行，所以这里不像控制台那样绑 ImeAction.Send
@@ -1629,7 +1763,7 @@ private fun ChatInputBar(
                     Box {
                         if (value.isEmpty()) {
                             Text(
-                                text = "输入短信\u2026",
+                                text = if (enabled) "输入短信\u2026" else deviceUnsupportedNote("发送短信"),
                                 style = MaterialTheme.typography.bodyLarge,
                                 color = palette.textSecondary
                             )

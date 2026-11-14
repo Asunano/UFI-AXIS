@@ -2,6 +2,19 @@ package com.ufi_axis.app.navigation
 
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import com.ufi_axis.ui.media.MediaAudioGroupScreen
+import com.ufi_axis.ui.media.MediaAudioPlayerScreen
+import com.ufi_axis.ui.media.MediaAudioScreen
+import com.ufi_axis.ui.media.MediaAudioSettingsScreen
+import com.ufi_axis.ui.media.MediaExcludedScreen
+import com.ufi_axis.ui.media.MediaImageScreen
+import com.ufi_axis.ui.media.MediaImageSettingsScreen
+import com.ufi_axis.ui.media.MediaImageViewerScreen
+import com.ufi_axis.ui.media.MediaPlaylistScreen
+import com.ufi_axis.ui.media.MediaVideoDownloadHistoryScreen
+import com.ufi_axis.ui.media.MediaVideoPlayerScreen
+import com.ufi_axis.ui.media.MediaVideoScreen
+import com.ufi_axis.ui.media.MediaVideoSettingsScreen
 import com.ufi_axis.ui.navigation.AppScreen
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.screens.*
@@ -9,6 +22,8 @@ import com.ufi_axis.ui.screens.AboutDeviceScreen
 import com.ufi_axis.ui.screens.DeviceControlScreen
 import com.ufi_axis.ui.screens.RuleEditScreen
 import com.ufi_axis.ui.screens.TaskEditScreen
+import com.ufi_axis.ui.screens.filemanager.RemotePushScreen
+import com.ufi_axis.ui.screens.filemanager.StorageSourceEditScreen
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 
@@ -56,6 +71,13 @@ private fun rawAppScreens(
 
     Routes.DETAIL_SERVER_CONFIG to { _, nc -> ServerConfigScreen(viewModel, onServerConfigChanged, nc) },
     Routes.DETAIL_TOOLS_ADVANCED to { _, nc -> AdvancedConsoleScreen(viewModel, nc) },
+    // 2026-10-10 暂时隐藏：真 PTY 终端的路由注册也一并撤下。
+    // 只藏 UI 入口不够 —— 路由表留着的话，任何能触发导航的地方（深链、外部 Intent、
+    // 后续误加的入口）仍能直接把这页打开。恢复时解除下面一行注释即可。
+    // 真 PTY 终端（app 端原生，2026-10-10）：ttyd 真 PTY 会话，与上面的逐条 exec 不同。
+    // Routes.DETAIL_PTY_TERMINAL to { _, nc -> PtyTerminalScreen(viewModel, nc) },
+    // 进阶工具页只是一页入口网格，不碰 viewModel
+    Routes.DETAIL_TOOLS_EXTRA to { _, nc -> ToolsExtraScreen(nc) },
     Routes.DETAIL_SPEED_TEST to { _, nc -> SpeedTestScreen(viewModel, nc) },
     Routes.DETAIL_TRAFFIC_MGMT to { _, nc -> TrafficManagementScreen(viewModel, nc) },
     Routes.DETAIL_SMS to { _, nc -> SmsScreen(viewModel, nc) },
@@ -75,9 +97,28 @@ private fun rawAppScreens(
     // 渠道页里的「邮件」行指向上面同一个 EmailNotifyScreen，不做第二份。
     Routes.DETAIL_PUSH_CHANNELS to { _, nc -> PushChannelsScreen(viewModel, nc) },
     Routes.DETAIL_WEBHOOK_NOTIFY to { _, nc -> WebhookNotifyScreen(viewModel, nc) },
+    // Webhook 首次配置向导：只从 WebhookNotifyScreen 的「还没配好」入口进（configured=false 时才有）
+    Routes.DETAIL_WEBHOOK_SETUP to { _, nc -> WebhookSetupWizardScreen(viewModel, nc) },
     // 本机短信回发（2026-09-09 阶段 3）：唯一走信令网的渠道，按条计费。
     Routes.DETAIL_LOCAL_SMS_NOTIFY to { _, nc -> LocalSmsNotifyScreen(viewModel, nc) },
     Routes.DETAIL_FILES to { _, nc -> FileManagerScreen(viewModel, nc) },
+    // 推送任务页：外部存储上传的第二阶段（core 暂存 → 远端）。
+    // 入口在各外部存储源的工具栏右上角，`source` 带上该源的 id 以便只看这一个源的作业。
+    Routes.DETAIL_REMOTE_PUSH to { entry, nc ->
+        RemotePushScreen(
+            viewModel = viewModel,
+            navController = nc,
+            sourceId = entry.arguments?.getString("source")?.takeIf { it.isNotBlank() }
+        )
+    },
+    // 存储源编辑器：id 空=新增，非空=编辑；表单分 4 步走公共向导 UfiWizard。
+    // 入口在文件管理器的**存储列表**（长按一行→编辑 / 末尾行→添加）——
+    // 2026-09-21 起不再有独立的「外部存储」列表页，它与存储列表完全重复。
+    Routes.DETAIL_STORAGE_SOURCE_EDIT to { entry, nc ->
+        val id = entry.arguments?.getString("id").orEmpty()
+        StorageSourceEditScreen(viewModel = viewModel, navController = nc, sourceId = id)
+    },
+
     Routes.DETAIL_DEBUG_LOG to { _, nc -> DebugLogScreen(viewModel, nc) },
     Routes.DETAIL_DIAGNOSE to { _, nc -> DiagnoseScreen(viewModel, nc) },
     Routes.DETAIL_MONITOR to { _, nc -> MonitorScreen(viewModel, nc) },
@@ -98,13 +139,16 @@ private fun rawAppScreens(
     Routes.DETAIL_DOWNLOAD_ADVANCED to { _, nc -> DownloadAdvancedSettingsScreen(viewModel, nc) },
     Routes.DETAIL_DATA_MANAGEMENT to { _, nc -> DataManagementScreen(viewModel, nc) },
     Routes.DETAIL_CELL_LOCK to { _, nc -> CellLockScreen(viewModel, nc) },
-    Routes.DETAIL_NETWORK_MODE to { _, nc -> NetworkModeScreen(viewModel, nc) },
     Routes.DETAIL_BAND_LOCK to { _, nc -> BandLockScreen(viewModel, nc) },
     Routes.DETAIL_CELLULAR_ADVANCED to { _, nc -> CellularAdvancedScreen(viewModel, nc) },
-    Routes.DETAIL_NETWORK_FEATURES to { _, nc -> NetworkFeaturesScreen(viewModel, nc) },
     Routes.DETAIL_ONLINE_DEVICES to { _, nc -> OnlineDevicesScreen(viewModel, nc) },
     Routes.DETAIL_PAIRING to { _, nc -> PairingConfigScreen(viewModel, nc) },
     Routes.DETAIL_APPEARANCE to { _, nc -> AppearanceSettingsScreen(viewModel, nc) },
+    // 界面小功能（2026-09-17）：2026-09-18 起只是入口页，天气与诗词各自一页
+    Routes.DETAIL_UI_EXTRAS to { _, nc -> UiExtrasSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_DLNA to { _, nc -> DlnaSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_WEATHER to { _, nc -> WeatherSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_POETRY to { _, nc -> PoetrySettingsScreen(viewModel, nc) },
     // 组件画廊：纯 UI 预览，不需要 viewModel（组件本身在 :app:ui，画廊也放在那）
     Routes.DETAIL_UI_GALLERY to { _, nc -> UfiGalleryScreen(nc) },
     Routes.DETAIL_DEVICE_CONTROL to { _, nc -> DeviceControlScreen(viewModel, nc) },
@@ -125,6 +169,8 @@ private fun rawAppScreens(
     Routes.DETAIL_TUNNEL to { _, nc -> TunnelScreen(viewModel, nc) },
     // FIX-9：内网穿透三拆屏
     Routes.DETAIL_TUNNEL_FRP to { _, nc -> FrpDetailScreen(viewModel, nc) },
+    // FRP 新建隧道向导：8 个字段结构化收齐后生成 TOML（原来只问名字、写一份空值模板）
+    Routes.DETAIL_TUNNEL_FRP_NEW to { _, nc -> FrpNewChannelScreen(viewModel, nc) },
     // FRP 单隧道配置页：name 由 Routes.tunnelFrpChannel(Uri.encode) 编码，Navigation 已解码，这里不再解码
     Routes.DETAIL_TUNNEL_FRP_CHANNEL to { entry, nc ->
         FrpChannelScreen(viewModel, nc, entry.arguments?.getString("name") ?: "")
@@ -135,7 +181,9 @@ private fun rawAppScreens(
         CfTunnelScreen(viewModel, nc, entry.arguments?.getString("name") ?: "")
     },
     Routes.DETAIL_TUNNEL_SETTINGS to { _, nc -> TunnelSettingsScreen(viewModel, nc) },
-    Routes.DETAIL_SERVER to { _, nc -> ServerScreen(viewModel, onServerConfigChanged, nc) },
+    Routes.DETAIL_SERVER to { _, nc ->
+        ServerScreen(viewModel, onServerConfigChanged, nc, onRepairRequested)
+    },
     Routes.DETAIL_NOTIFICATIONS_GUARD to { _, nc -> NotificationsGuardScreen(viewModel, nc) },
 
     // 条件规则编辑器：id 空=新建，非空=编辑；编辑器从 viewModel.tasksState 读规则数据
@@ -152,5 +200,67 @@ private fun rawAppScreens(
     Routes.FILE_EDITOR to { entry, nc ->
         val path = entry.arguments?.getString("path") ?: ""
         TextEditorScreen(viewModel, nc, java.net.URLDecoder.decode(path, "UTF-8"))
+    },
+
+    // 媒体库：工具页三个入口（视频 / 音乐 / 图片）+ 各自的播放 / 查看页（2026-09-16）
+    Routes.MEDIA_LIBRARY_VIDEO to { _, nc ->
+        MediaVideoScreen(viewModel, nc)
+    },
+    Routes.MEDIA_LIBRARY_AUDIO to { _, nc ->
+        MediaAudioScreen(viewModel, nc)
+    },
+    Routes.MEDIA_LIBRARY_IMAGE to { _, nc ->
+        MediaImageScreen(viewModel, nc)
+    },
+    Routes.MEDIA_VIDEO_SETTINGS to { _, nc ->
+        MediaVideoSettingsScreen(viewModel, nc)
+    },
+    // 下载任务（队列 + 历史）：数据全在 MediaDownloadQueue 这个进程内单例里，不经 viewModel
+    Routes.MEDIA_VIDEO_DOWNLOADS to { _, nc ->
+        MediaVideoDownloadHistoryScreen(nc)
+    },
+    Routes.MEDIA_AUDIO_SETTINGS to { _, nc ->
+        MediaAudioSettingsScreen(viewModel, nc)
+    },
+    // 已从音乐库移除的歌曲（排除名单）：有它「从音乐库移除」才是可撤销的
+    Routes.MEDIA_AUDIO_EXCLUDED to { _, nc ->
+        MediaExcludedScreen(viewModel, nc)
+    },
+    Routes.MEDIA_IMAGE_SETTINGS to { _, nc ->
+        MediaImageSettingsScreen(viewModel, nc)
+    },
+    // 分组详情：by/key 由 mediaAudioGroupRouteOf(encodeUriComponent) 编码。
+    //
+    // **这里不要再解码**（2026-09-21 修"专辑里没有歌"）：Navigation 取 query 参数时已经做过
+    // 一次 `Uri.decode`。原来这里又叠了一次 `URLDecoder.decode`，而后者把 `+` 当空格 ——
+    // 于是专辑名 `万岁2001 新曲+精选` 里那个真的 `+` 被吃成空格，拿它去查曲目一条都查不到。
+    // 编码侧改用 encodeUriComponent（空格也编成 %20，结果里不留裸 `+`）之后，一次解码就够。
+    Routes.MEDIA_AUDIO_GROUP to { entry, nc ->
+        val by = entry.arguments?.getString("by") ?: ""
+        val key = entry.arguments?.getString("key") ?: ""
+        MediaAudioGroupScreen(viewModel, nc, by, key)
+    },
+    // 歌单详情：id 是 core 生成的短 id。同样只靠 Navigation 那一次解码
+    Routes.MEDIA_AUDIO_PLAYLIST to { entry, nc ->
+        MediaPlaylistScreen(viewModel, nc, entry.arguments?.getString("id") ?: "")
+    },
+    Routes.MEDIA_VIDEO to { entry, nc ->
+        MediaVideoPlayerScreen(viewModel, nc, entry.arguments?.getString("path") ?: "")
+    },
+    Routes.MEDIA_AUDIO to { entry, nc ->
+        val path = entry.arguments?.getString("path") ?: ""
+        /*
+         * 播放范围（2026-09-21）。**空串 = 没指定范围**（不是整库）——
+         * 迷你条 / 标题栏挂件 / 通知栏进来时就是空的，播放页收到空值不会去重建队列。
+         * 「全部」页点歌会显式带 `scope=all`。语义见 AudioQueueScope.of。
+         */
+        MediaAudioPlayerScreen(
+            viewModel, nc, path,
+            scopeKind = entry.arguments?.getString("scope") ?: "",
+            scopeKey = entry.arguments?.getString("scopeKey") ?: ""
+        )
+    },
+    Routes.MEDIA_IMAGE to { entry, nc ->
+        MediaImageViewerScreen(viewModel, nc, entry.arguments?.getString("path") ?: "")
     }
 )

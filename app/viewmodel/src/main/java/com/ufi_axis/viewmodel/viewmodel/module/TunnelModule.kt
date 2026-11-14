@@ -449,17 +449,15 @@ class TunnelModule(
             try {
                 val element = withContext(Dispatchers.IO) { api().getCfTunnel(name) }
                 if (element is JsonObject) {
-                    _state.value = _state.value.copy(
-                        cfTokenText = element["token"]?.jsonPrimitive?.contentOrNull ?: "",
-                        cfTokenName = name
-                    )
+                    val token = element["token"]?.jsonPrimitive?.contentOrNull ?: ""
+                    _state.update { it.copy(cfTokens = it.cfTokens + (name to token)) }
                 }
             } catch (e: Exception) {
                 if (e is HttpException && e.code() == 404) {
-                    _state.value = _state.value.copy(cfTokenText = "", cfTokenName = name)
+                    _state.update { it.copy(cfTokens = it.cfTokens + (name to "")) }
                     loadCfTunnels()
                 } else {
-                    _state.value = _state.value.copy(errorMessage = "读取隧道失败: ${e.message}")
+                    _state.update { it.copy(errorMessage = "读取隧道失败: ${e.message}") }
                 }
             }
         }
@@ -471,17 +469,30 @@ class TunnelModule(
             try {
                 val body = mapOf<String, Any>("token" to token)
                 withContext(Dispatchers.IO) { api().saveCfTunnel(name, body) }
-                _state.value = _state.value.copy(cfTokenText = token, cfTokenName = name)
+                _state.update { it.copy(cfTokens = it.cfTokens + (name to token)) }
                 loadCfTunnels()
             } catch (e: Exception) {
+                // 400 时优先回显 core 给出的**具体原因**（token 不是合法 base64 / 缺 a,t,s /
+                // 看起来是 Tunnel ID 等）。此前这里写死一句笼统文案，把 core 好不容易
+                // 给出的判定结果丢掉了，用户只能靠猜。
                 val msg = if (e is HttpException && e.code() == 400) {
-                    "隧道名或 token 不可用（名称不能为空或含 \\ / : * ? \" < > | 等字符，token 不能为空）"
+                    serverMessageOf(e) ?: "隧道名或 token 不可用（名称不能含 \\ / : * ? \" < > | 等字符）"
                 } else {
                     "保存隧道失败: ${e.message}"
                 }
-                _state.value = _state.value.copy(errorMessage = msg)
+                _state.update { it.copy(errorMessage = msg) }
             }
         }
+    }
+
+    /** 从 HTTP 错误体里取 core 的 `message` 字段；取不到返回 null。 */
+    private fun serverMessageOf(e: HttpException): String? = try {
+        val raw = e.response()?.errorBody()?.string()?.takeIf { it.isNotBlank() } ?: return null
+        (kotlinx.serialization.json.Json.parseToJsonElement(raw) as? JsonObject)
+            ?.get("message")?.jsonPrimitive?.contentOrNull
+            ?.takeIf { it.isNotBlank() }
+    } catch (_: Exception) {
+        null
     }
 
     /** 删除某条隧道（后端会先停掉正在运行的它）；隧道已不存在时后端 404 */
