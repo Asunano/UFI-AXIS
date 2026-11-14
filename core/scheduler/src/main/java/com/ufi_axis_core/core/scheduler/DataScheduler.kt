@@ -6,35 +6,37 @@ import com.ufi_axis_core.collector.system.CpuInfoLite
 import com.ufi_axis_core.collector.system.MemoryInfo
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.GoformSignalClient
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.deviceschema.DeviceProfile
-import com.ufi_axis_core.deviceschema.profile.ZteGoformProfile
+import com.ufi_axis_core.devicespi.adapter.SignalSource
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.core.database.AppDatabase
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.contentOrNull
 import com.ufi_axis_core.core.database.CpuHistoryRecord
 import com.ufi_axis_core.core.database.SignalRecord
 import com.ufi_axis_core.core.database.TrafficRecord
+import com.ufi_axis_core.core.database.TrafficHourlyAccumulator
 import com.ufi_axis_core.core.database.MemoryHistoryRecord
 import com.ufi_axis_core.core.database.BatteryHistoryRecord
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
+import com.ufi_axis_core.util.StationListShape
+import com.ufi_axis_core.util.celsiusToMilliC
+import com.ufi_axis_core.util.parseStationList
+import com.ufi_axis_core.devicespi.PlatformAdapter
 import com.ufi_axis_core.notify.NotifyEvent
 import com.ufi_axis_core.notify.NotifyLevel
 import com.ufi_axis_core.notify.NotifyScenes
 import com.ufi_axis_core.notify.Notifier
 import com.ufi_axis_core.notify.PushChannel
 import com.ufi_axis_core.api.websocket.WebSocketManager
-import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -96,8 +98,35 @@ class DataScheduler(
     private val telephonyCollector: TelephonyCollector,
     private val database: AppDatabase,
     private val webSocketManager: WebSocketManager,
-    private val signalClient: GoformSignalClient? = null,
-    private val smsClient: GoformSmsClient? = null,
+    /**
+     * 平台适配层（阶段 4 的 4.3 / 批 I）—— 本类唯一的热区读数来源，见 [readMaxCpuTemp]。
+     *
+     * **不接受 null**：温控熔断与温度告警都挂在它上面，给一个「读不到」的默认实现
+     * 等于让热保护默默失效，而那正是 [PlatformAdapter.readTemperature] 第 1 条硬约束要防的事。
+     *
+     * ⚠ 装配层必须传**整个组件图共享的那一份**实例（`ComponentFactory.build()` 里的 `val platform`），
+     * 不要在这里现场 `plugin.platform(ctx)` 再造一个 —— 理由见那行的注释。
+     */
+    private val platform: PlatformAdapter,
+    /**
+     * **这个型号声明了 `Capability.BATTERY` 吗**（2026-09-24 批 M / 方案 D）。
+     * 由装配层从 `runtime.plugin.capabilities` 算出来的**不可变布尔**，
+     * 与递给 `SystemCollector` 的是同一个值（在 `ComponentFactory` 里只算一次）。
+     *
+     * 只有两个用途，都在「写侧」：[collectBattery] 跳过入库与告警、[scanLocalAlerts] 跳过电量告警门。
+     *
+     * ⚠ **它不改变任何对外读数**。`SystemCollector.getBatteryInfo()` 照原样下发系统值
+     * （F50 上 percent 恒为 50，那是个假值但是系统就这么报的），
+     * `_latestBattery` 也照常赋值 —— 两个读端点靠它。
+     * 「读数可信吗」由 battery map 里的 `supported` 字段回答，不由这里回答。
+     *
+     * 为什么写侧仍要跳过：`percent` 恢复系统值只解决**显示**问题，
+     * 「数据库里存一条永远 50% 的假曲线」「电池告警引擎按假值判级别」这两件事还在。
+     * 跳过它们不改变任何一个下发字段，所以与「按系统值显示」的要求不冲突。
+     */
+    private val batteryDeclared: Boolean,
+    private val signalClient: SignalSource? = null,
+    private val smsClient: SmsControl? = null,
     private val alertEngine: com.ufi_axis_core.alert.AlertEngine? = null,
     private val dynamicThreadPool: DynamicThreadPool = DynamicThreadPool(),
     private val wakeLockRenew: (() -> Unit)? = null,
@@ -120,10 +149,25 @@ class DataScheduler(
      * **不接受 null**：`SignalCollector` 的第 1 层就是归一化，关掉等于信号数据全空，
      * 而 WS `signal` 频道与 REST 共用这份输出。所以字段归一化的回退开关不覆盖这里，
      * 只影响 goform 客户端层的透传查询。
+     *
+     * **无默认值**（2026-09-25 去掉了原来的 `= ZteGoformProfile`）：默认值等于
+     * 「漏传就按 ZTE F50 处理」，而本类驱动全部周期采集 —— 接第二台设备时漏传这一处，
+     * 得到的不是编译错误，而是整条采集链用别家设备的字段名解析本机响应。
      */
-    private val deviceProfile: DeviceProfile = ZteGoformProfile,
+    private val deviceProfile: DeviceProfile,
     /** 条件引擎（自动化规则）：在各采集点并联评估，零额外采集开销。 */
-    private var conditionEngine: ConditionEngine? = null
+    private var conditionEngine: ConditionEngine? = null,
+    /**
+     * 开机预热期的**设备默认值**，毫秒。来自 `DeviceTuning.bootGraceMs`（插件的实测值）。
+     *
+     * 优先级：用户配置（`AppSettings.monitorBootGraceMs`）> 本参数 > [BOOT_GRACE_DEFAULT_MS]。
+     * 换一台启动更快/更慢的设备时，要改的是插件里那个值，不是这里的常量。
+     *
+     * **只收一个 Long 而不是整个 `DeviceTuning`**：那个类里还有三条**下载限速**的温度阈值，
+     * 与本文件里的采集降频阈值（`monitorThermal*` 70/80）是两套不同的东西。
+     * 把整个 tuning 递进来等于把三套同名不同义的阈值摆在同一个作用域里。
+     */
+    private val bootGraceDeviceDefaultMs: Long = BOOT_GRACE_DEFAULT_MS
 ) {
     private val tag = "DataScheduler"
     // 使用 Dispatchers.IO 而非 Default — DataScheduler 所有协程都在做 IO（shell/http/db），
@@ -131,9 +175,19 @@ class DataScheduler(
     private val schedulerScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
         AppLogger.e(tag, "DataScheduler coroutine exception (uncaught)", e)
     })
+    // 2026-10-05 R1-2 修复：stop() 的收尾协程挂在独立 scope 上，
+    // 收尾里取消 schedulerScope 子协程时不会取消它自己。
+    private val stopScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     // isRunning / monitorEnabled 由 service 协程写、由 Netty worker 线程读（/api/service/status 回读），
     // 因此必须 @Volatile，否则回读到的可能是过期值。
     @Volatile private var isRunning = false
+
+    /**
+     * start/stop 互斥锁（2026-10-05 R1-1 修复）。
+     * `isRunning` 的 check-then-act 在并发 start/start 或 start/stop 交错时可双启动/状态撕裂；
+     * 置位动作统一收进这把锁。锁只护标志位读写，不覆盖采集循环体（避免长时间持锁）。
+     */
+    private val startStopLock = Any()
     /** 监控总开关（REST /monitor/control 设置）。仅控制冷采集循环是否运行，与前端连接无关。 */
     @Volatile private var monitorEnabled = true
     /**
@@ -145,6 +199,9 @@ class DataScheduler(
      */
     @Volatile private var stopGeneration = 0    /** 实时推送开关（方案 A·2026-08-24）：仅当存在前端 WebSocket 连接时为 true。 */
     @Volatile private var realtimePushEnabled = false
+
+    /** 温度告警日志的状态沿记录（2026-10-08）：最近一次记日志时的整数 °C；null = 当前不在告警态。 */
+    @Volatile private var lastThermalWarnLoggedC: Int? = null
 
     /** 套餐限额供给器（见 [attachTrafficLimitProvider]）。 */
     @Volatile private var trafficLimitProvider: (suspend () -> JsonObject?)? = null
@@ -159,6 +216,27 @@ class DataScheduler(
     @Volatile private var deviceEventSink: (suspend (online: Boolean, label: String, mac: String) -> Unit)? = null
     /** 上一轮已连接客户端：mac -> 展示名。null = 还没有基线（首轮 / 上一轮查询失败）。 */
     @Volatile private var knownStations: Map<String, String>? = null
+
+    /** 设备事件 per-MAC 同向冷却器（2026-10-07 审计修复）。 */
+    private val deviceEventCooldown = DeviceEventCooldown()
+
+    // ── SmartLoop（2026-10-07 智能循环第一批迁移：月流量统计 + 电池温度）──
+    // 节拍 = base × 流量档 × 负载 × 前端在线。阈值可经 smart_loop_* 键调，smart_loop_enabled=false 一键回退固定值。
+    private fun makeSmartLoop(name: String, baseMs: Long) = com.ufi_axis_core.util.SmartLoop(
+        name = name,
+        baseMs = baseMs,
+        trafficSource = { _latestTraffic.value?.let { it.rxSpeed to it.txSpeed } },
+        loadSource = {
+            val goformLoad = 1.0 - (com.ufi_axis_core.util.GoformQoS.queryAvailablePermits.toDouble() /
+                com.ufi_axis_core.util.GoformQoS.queryTotalPermits.coerceAtLeast(1))
+            goformLoad.coerceIn(0.0, 0.5)
+        },
+        frontConnected = { webSocketManager.getConnectionCount() > 0 },
+        tuningProvider = { settings?.let { com.ufi_axis_core.util.SmartLoopTuning.read(it) }
+            ?: com.ufi_axis_core.util.SmartLoopTuning.defaults() },
+    )
+    private val goformTrafficLoop by lazy { makeSmartLoop("goform-traffic", 15_000L) }
+    private val batteryLoop by lazy { makeSmartLoop("battery", 30_000L) }
 
     /** 采集循环是否正在运行（供 `/api/service/status` 回读，此前外部无法得知）。 */
     val collecting: Boolean get() = isRunning
@@ -233,6 +311,39 @@ class DataScheduler(
         stationListProvider = provider
         deviceEventSink = sink
         AppLogger.i(tag, "DeviceEventWatcher attached")
+    }
+
+    /**
+     * 注入媒体封面预热任务（2026-10-05 G6，FFmpeg 接入计划书 §4.2）。
+     *
+     * 与 [attachTrafficLimitProvider] 同一个解耦口径：预热的全部判据与执行
+     * （开关、闲时门、ffmpeg 抽帧、thumbCache 落盘）都在 `:core:api` 的
+     * `ThumbPrewarmWorker` 里，scheduler 层只负责「何时跑」——注册一个
+     * 低频 idle 循环，开关关闭时该回调内部第一行就返回，成本为零。
+     * 未 attach（测试/降级装配）时循环不启动。
+     */
+    fun attachThumbPrewarmTask(task: suspend () -> Unit) {
+        thumbPrewarmTask = task
+        if (isRunning) startThumbPrewarmLoop()
+        AppLogger.i(tag, "ThumbPrewarmTask attached")
+    }
+
+    @Volatile
+    private var thumbPrewarmTask: (suspend () -> Unit)? = null
+    private var thumbPrewarmJob: Job? = null
+
+    /**
+     * 预热 idle 循环：5 分钟一轮。判据全在被调方（开关 / 电量 / 写门），
+     * 这里只给节拍；对齐计划书 §4.2「预热永远让位给前台交互」。
+     */
+    private fun startThumbPrewarmLoop() {
+        thumbPrewarmJob?.cancel()
+        thumbPrewarmJob = launchLoop {
+            while (isActive) {
+                delay(5 * 60_000L)
+                thumbPrewarmTask?.invoke()
+            }
+        }
     }
 
     /**
@@ -395,6 +506,13 @@ class DataScheduler(
     private val _todayTraffic = MutableStateFlow(0L to 0L)   // (rxBytes, txBytes)
     val todayTraffic: StateFlow<Pair<Long, Long>> = _todayTraffic
 
+    // ── 每小时流量用量采样器（流量历史）──
+    // 与上面的「今日基线」是两件事：那个是"今天从哪儿起算"，这个是"上一次看到的月累计"。
+    // 每小时用量 = 逐次采样的 (本次月累计 − 上次月累计) 累加进当前小时桶（traffic_hourly）。
+    // 判定逻辑全在 TrafficHourlyAccumulator 里（纯函数，可单测），这里只做载入 / 持久化 / 落库。
+    @Volatile private var hourlySamplerLoaded = false
+    @Volatile private var hourlySample: TrafficHourlyAccumulator.Sample? = null
+
     // 基线的内存副本：避免每个采集周期都读 SharedPreferences；首次使用时从 prefs 惰性载入。
     // settings 为 null（测试/降级装配）时退化为纯内存基线，重启即失效。
     @Volatile private var baselineLoaded = false
@@ -415,9 +533,37 @@ class DataScheduler(
     // 而字节增量上的 coerceAtLeast(0) 只兜住了分子，兜不住分母。
     @Volatile private var lastMonthlyElapsedMs: Long = 0L
 
+    /**
+     * 开机预热期（boot grace period，2026-09-21）。
+     *
+     * Unisoc + Android 13 + 1.5GB RAM 的设备，开机后 ~60s 系统服务才基本稳定
+     * （zygote / AMS / PMS / dex2oat 等初始化会打满全部 CPU 核心）。
+     * grace period 内：
+     * - CPU / 内存 / 信号 / 电池的 **WS 实时推送照常**（前端要看到实时值）；
+     * - **不写入 DB**（不污染历史图表）；
+     * - **不触发告警**（温度 / 联网等边沿触发不会被开机瞬态误触）。
+     *
+     * 用 `SystemClock.elapsedRealtime()`（单调时钟，从开机起算），不受 NTP 校时影响。
+     * 取值优先级：用户配置 `AppSettings.monitorBootGraceMs` > 设备插件的
+     * [bootGraceDeviceDefaultMs]（`DeviceTuning.bootGraceMs`）> [BOOT_GRACE_DEFAULT_MS]。
+     */
+    private val bootGraceMs: Long get() = settings?.monitorBootGraceMs ?: bootGraceDeviceDefaultMs
+
+    /** grace period 是否已过。**每次采集都查**（elapsedRealtime 很便宜，纳秒级）。 */
+    // 诊断用（2026-10-12，临时）：上一次成功写库的时刻，用于检测写库间隔异常。
+    private var lastCpuFlushAtMs: Long = 0L
+
+    private fun isBootGracePassed(): Boolean =
+        android.os.SystemClock.elapsedRealtime() >= bootGraceMs
+
     fun start() {
-        if (isRunning) return
-        isRunning = true
+        // start/stop 并发互斥（2026-10-05 R1-1 修复）：原 `if (isRunning) return; isRunning = true`
+        // 是 check-then-act，两个线程同时通过检查会各启动一套采集循环（双份写库、双份推送）。
+        // stop() 在同一把锁上置位，保证互斥；锁外逻辑不变。
+        synchronized(startStopLock) {
+            if (isRunning) return
+            isRunning = true
+        }
         // 抢跑标记：让任何"正在等 flush 的 stop 收尾"放弃它的 cancelChildren（见 stopGeneration）
         stopGeneration++
         AppLogger.i(tag, "Starting data scheduler")
@@ -478,11 +624,12 @@ class DataScheduler(
             }
         }
 
-        // ── 【冷数据】月流量统计: 15s 固定间隔
+        // ── 【冷数据】月流量统计: SmartLoop（2026-10-07 迁移）——大流量时快于 15s 降图表
+        // 阶梯化，零流量时慢至 ~22.5s 省电；上限 90s 保底新鲜度。
         schedulerScope.launch {
             while (isActive) {
                 collectGoformTraffic()
-                delay(15_000L)
+                goformTrafficLoop.delaySuspend()
             }
         }
 
@@ -503,11 +650,12 @@ class DataScheduler(
             }
         }
 
-        // ── 【冷数据】电池/温度: 30s
+        // ── 【冷数据】电池/温度: SmartLoop（2026-10-07 迁移）——本地读不占 goform，
+        // 但没必要在深夜零流量时空转 30s；大流量时略提频让温度告警更跟手。
         schedulerScope.launch {
             while (isActive) {
                 collectBattery()
-                delay(30_000L)
+                batteryLoop.delaySuspend()
             }
         }
 
@@ -518,6 +666,23 @@ class DataScheduler(
             while (isActive) {
                 checkDeviceEvents()
                 delay(deviceEventCheckIntervalMs)
+            }
+        }
+
+        // ── 套餐到期检查（2026-10-07，fixed 模式专用）────────────────────────
+        // 日历事件，固定 1h 足够（去重由 PlanProfileManager.dueNotification 的
+        // 「每天一条 + 级别跃迁当天重发」语义兜住，AlertEngine 侧 plan_expiry
+        // 类型开关默认关，用户在通知设置里开启后才发）。monthly 模式下
+        // expiryState()=null，循环体直接空转，不产生任何请求。
+        schedulerScope.launch {
+            val sm = settings ?: return@launch
+            val planManager = com.ufi_axis_core.util.plan.PlanProfileManager(sm)
+            while (isActive) {
+                runCatching {
+                    val due = planManager.dueNotification()
+                    if (due != null) alertEngine?.checkPlanExpiry(due.first, due.second)
+                }.onFailure { AppLogger.w(tag, "plan expiry check failed: ${it.message}") }
+                delay(PLAN_EXPIRY_CHECK_INTERVAL_MS)
             }
         }
 
@@ -544,6 +709,9 @@ class DataScheduler(
                 cleanOldData()
             }
         }
+
+        // ── 【媒体封面预热】(2026-10-05 G6)：attach 过才启动；5 分钟一轮，判据在被调方 ──
+        if (thumbPrewarmTask != null) startThumbPrewarmLoop()
     }
 
     /**
@@ -552,12 +720,23 @@ class DataScheduler(
      * 三段各自 try/catch：任一数据源读失败（例如某些设备没有 thermal_zone）不能拖累另外两段。
      * 不写缓冲区、不广播 WS —— 纯粹为了让 [AlertEngine] 早点看到值；
      * 入库/推送由 AlertEngine 在真的发生级别跃迁时自己做。
+     *
+     * 2026-09-21：**这条循环才是全部本地告警的真正入口**（温度 / 电量 / 联网三类都从这里出），
+     * 所以 boot grace 的闸必须开在这里 —— 之前只加在 collectCpu/collectMemory/collectSignal/
+     * collectBattery 上，而这四个函数里的告警调用要么被本函数抢先、要么节拍慢得多，
+     * 开机瞬态照样能在 15 秒内穿过这条路径触发温度与断网告警。
      */
     private suspend fun scanLocalAlerts() {
         val engine = alertEngine ?: return
+        // 开机预热期内一律不判告警：此刻全核满载、热区飙高、还没搜到网都是系统行为。
+        if (!isBootGracePassed()) return
 
         try {
-            // readMaxCpuTemp() 返回毫摄氏度（与 THERMAL_*_THRESHOLD 同单位），告警阈值用摄氏度
+            // readMaxCpuTemp() 返回毫摄氏度（与 THERMAL_*_THRESHOLD 同单位），告警阈值用摄氏度。
+            // 2026-09-21：这里是 temperature 告警的**唯一**入口（collectCpu 那条已移除）——
+            // 两个来源取值不同（这里取全热区最大值、那边只读 zone0，Unisoc 上稳定差数度），
+            // 同一个边沿状态机被两个值驱动会在 warning↔normal 之间每 10~15 秒来回跃迁，
+            // 表现是「次数无限上涨 + 已恢复标记反复闪烁」，还会烧光邮件/短信配额。
             val milli = readMaxCpuTemp()
             if (milli > 0) engine.checkTemperature(milli / 1000.0)
         } catch (e: Exception) {
@@ -565,11 +744,26 @@ class DataScheduler(
         }
 
         try {
-            val battery = systemCollector.getBatteryInfo()
-            val level = (battery["percent"] as? Int)
-                ?: (battery["level"] as? Number)?.toInt()
-            if (level != null) {
-                engine.checkBattery(level, battery["is_charging"] as? Boolean ?: false)
+            // 未声明 Capability.BATTERY = 这个型号没有电池（2026-09-24 批 M）。
+            // 与 collectBattery 同一个口径：读数照下发，但不拿假值去判告警 ——
+            // F50 恒报 50%，在这里会被当成一个真实电量喂给边沿状态机。
+            // 放在读取之前：连 getBatteryInfo() 都不必调，这条路径 15s 一轮。
+            //
+            // 文案固定、不拼任何变动内容（repeatGate 按 (级别, tag, 完整消息) 折叠，见 AppLogger）。
+            // ⚠ 与 collectBattery 那条**刻意不同文**：两处 tag 都是 DataScheduler，文案一样的话
+            // 折叠键就完全相同、两条会互相顶掉，从日志上看不出另一道门也在生效。
+            if (!batteryDeclared) {
+                AppLogger.w(tag, "scanLocalAlerts: 本机型未声明电池能力，跳过电量告警检查（电量只用于显示）")
+            } else {
+                val battery = systemCollector.getBatteryInfo()
+                val level = (battery["percent"] as? Int)
+                    ?: (battery["level"] as? Number)?.toInt()
+                // level < 0 = 这台设备取不到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
+                // 少了这道判断会被当成「电量 -1%」，每 15s 触发一次 critical 低电量告警 ——
+                // collectBattery 早就挡了这个值（见那里的注释），这条路径 2026-09-21 才补上。
+                if (level != null && level >= 0) {
+                    engine.checkBattery(level, battery["is_charging"] as? Boolean ?: false)
+                }
             }
         } catch (e: Exception) {
             AppLogger.w(tag, "scanLocalAlerts: 电池检查失败: ${e.message}")
@@ -588,7 +782,8 @@ class DataScheduler(
     }
 
     fun stop() {
-        isRunning = false
+        // 与 start() 同锁置位（2026-10-05 R1-1 修复）：保证 start/stop 交错时状态一致。
+        synchronized(startStopLock) { isRunning = false }
         val token = ++stopGeneration
         AppLogger.i(tag, "Stopping data scheduler")
         
@@ -596,11 +791,20 @@ class DataScheduler(
         performanceMonitorJob?.cancel()
         flushJob?.cancel()
         wakeLockRenewJob?.cancel()
+        // 2026-10-05 R1-2 修复：取消采集协程改在收尾协程**外部**做。原实现在收尾协程体内
+        // 调 schedulerScope.coroutineContext.cancelChildren()，而收尾协程本身是
+        // schedulerScope 的子协程——cancelChildren 会把它自己一并取消，
+        // 其后所有清理逻辑（含"Data scheduler stopped"日志）都成死代码。
+        // 现在：flush 等待结束后，由 cancelAllLoops() 精确取消采集相关 Job；
+        // 收尾协程挂在独立 stopScope 上，永不自伤。
+        if (token == stopGeneration && !isRunning) {
+            cancelAllLoops()
+        }
         
         // 异步刷写剩余缓冲数据后停止,避免阻塞主线程
         // 2026-08-23 修复:不在 NonCancellable 中调用 cancelChildren,
         // 避免正在进行的 goform 查询被强制中断导致协程卡死
-        schedulerScope.launch {
+        stopScope.launch {
             try {
                 // 等待当前采集周期完成(最多 5s)
                 withTimeout(5_000L) {
@@ -616,10 +820,31 @@ class DataScheduler(
                 AppLogger.w(tag, "Stop finalization skipped: scheduler was restarted during flush")
                 return@launch
             }
-            // 取消所有子协程(包括正在进行的 goform 查询)
-            schedulerScope.coroutineContext.cancelChildren()
+            // 取消所有采集协程（含正在进行的 goform 查询）——见上方 R1-2 说明
+            cancelAllLoops()
             AppLogger.i(tag, "Data scheduler stopped")
         }
+    }
+
+    /**
+     * 2026-10-05 R1-2 修复：集中取消所有采集相关协程。
+     * 不再用 schedulerScope.coroutineContext.cancelChildren()（会把调用者自己取消），
+     * 改为逐个取消已注册的 Job；start() 期间新起的循环也统一登记到 [loopJobs]。
+     */
+    private val loopJobs = java.util.concurrent.CopyOnWriteArrayList<Job>()
+
+    /** 采集循环统一从这里 launch，自动登记以便 stop() 精确取消。 */
+    private fun launchLoop(block: suspend kotlinx.coroutines.CoroutineScope.() -> Unit): Job =
+        schedulerScope.launch { block() }.also { loopJobs.add(it) }
+
+    private fun cancelAllLoops() {
+        loopJobs.forEach { it.cancel() }
+        loopJobs.clear()
+        // 兜底：仍可能有历史路径直接挂在 schedulerScope 上的零散协程；
+        // 收尾协程已在 stopScope 上，不会被误伤。
+        schedulerScope.coroutineContext[Job]?.children
+            ?.filter { it !in loopJobs }
+            ?.forEach { runCatching { it.cancel() } }
     }
 
     /**
@@ -707,7 +932,20 @@ class DataScheduler(
                         }
                         maxTemp > thermalWarnMilliC -> {
                             // 75°C: 警告（频率降低已由 getAdaptiveDelay 处理）
-                            AppLogger.w(tag, "Thermal warning: ${maxTemp / 1000}°C > ${thermalWarnMilliC / 1000}°C")
+                            // 2026-10-08：按"状态沿"打日志——进入告警态记 1 条，温度每升 1°C
+                            // 记 1 条，回落到阈值下再记 1 条恢复。此前每轮检查（约 3s~5s）都打，
+                            // 72~73°C 平台期每 1~2 分钟刷一条，把 debug 日志窗口刷满没有信息量。
+                            val tempC = maxTemp / 1000
+                            if (lastThermalWarnLoggedC == null || tempC > lastThermalWarnLoggedC!!) {
+                                AppLogger.w(tag, "Thermal warning: ${tempC}°C > ${thermalWarnMilliC / 1000}°C")
+                                lastThermalWarnLoggedC = tempC
+                            }
+                        }
+                        else -> {
+                            if (lastThermalWarnLoggedC != null) {
+                                AppLogger.i(tag, "Thermal recovered: ${maxTemp / 1000}°C ≤ ${thermalWarnMilliC / 1000}°C")
+                                lastThermalWarnLoggedC = null
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -795,8 +1033,8 @@ class DataScheduler(
                 ))
             }
 
-            // 告警检查: 流量超额
-            if (rxBytes > 0 || txBytes > 0) {
+            // 告警检查: 流量超额（grace 期内不判 —— 与其余告警入口保持同一口径）
+            if ((rxBytes > 0 || txBytes > 0) && isBootGracePassed()) {
                 val totalMb = (rxBytes + txBytes) / (1024 * 1024)
                 alertEngine?.checkTraffic(totalMb)
                 checkTrafficLimitThrottled(rxBytes + txBytes, now)
@@ -837,15 +1075,54 @@ class DataScheduler(
             val enabled = limit["enabled"]?.jsonPrimitive?.content?.let { it == "true" || it == "1" } ?: true
             if (!enabled) return
             val limitBytes = limit["limit_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
-            if (limitBytes <= 0L) return
+            if (limitBytes <= 0L) {
+                // 2026-10-07 审计修复：enabled=true 且设备确实报了总量值、但 core 解析出 0 字节
+                // ——这是「字段一个不缺、值全错」的排障盲区（归一化关掉 / 固件复合串缺乘数时
+                // 会走到这里）。此时预警静默失效，用户只会觉得「限额设了但不提醒」。
+                // 纯静默不变，但留一条带原始值的 WARN（只在真配了限额时才打，避免刷日志）。
+                val rawValue = limit["limit_value"]?.jsonPrimitive?.contentOrNull
+                if (rawValue != null && rawValue != "0") {
+                    AppLogger.w(
+                        tag,
+                        "traffic limit enabled but limit_bytes=0 (raw limit_value=$rawValue) " +
+                            "—— 预警与自动关网本轮跳过，请检查归一化开关/固件字段"
+                    )
+                }
+                return
+            }
             val alertPercent = (limit["alert_percent"]?.jsonPrimitive?.longOrNull ?: 80L).toInt()
-            engine?.checkTrafficLimit(usedBytes, limitBytes, alertPercent)
-            guard?.invoke(usedBytes, limitBytes, alertPercent)
+            // 套餐口径分流（2026-10-07 偏差1补齐）：fixed（累计有效期包）的用量不能拿固件
+            // 月计数器——固件按 clear_date 月清会打断「100G×3个月」的累计口径。改用
+            // traffic_hourly 在 [生效日, now) 的累加（与 GET /api/device/plan 的
+            // fixed_usage_bytes 同源）。monthly 模式仍走固件计数器（真源）。
+            val effectiveUsed = planUsageOverride() ?: usedBytes
+            if (effectiveUsed != usedBytes) {
+                AppLogger.i(tag, "traffic limit using fixed-plan accumulated usage ($effectiveUsed) instead of device monthly counter ($usedBytes)")
+            }
+            engine?.checkTrafficLimit(effectiveUsed, limitBytes, alertPercent)
+            guard?.invoke(effectiveUsed, limitBytes, alertPercent)
         } catch (e: TimeoutCancellationException) {
             AppLogger.w(tag, "checkTrafficLimit timed out (8s)")
         } catch (e: Exception) {
             AppLogger.w(tag, "checkTrafficLimit failed: ${e.message}")
         }
+    }
+
+    /**
+     * fixed（累计有效期包）模式的用量覆盖：返回 null = monthly/未配 → 用调用方原值。
+     * 累计 = traffic_hourly 在 [生效日 00:00, now) 的 rx+tx 求和，与 PlanRoutes 的
+     * fixed_usage_bytes 同口径（PlanProfileManager.fixedUsageWindow 单源日期运算）。
+     * 查询失败静默回退固件计数器（预警可用性优先于口径严格）。
+     */
+    private suspend fun planUsageOverride(): Long? {
+        val plan = com.ufi_axis_core.util.plan.PlanProfileManager(
+            { settings?.getRawString(it) }, { k, v -> settings?.setRawString(k, v) }
+        )
+        val window = plan.fixedUsageWindow() ?: return null
+        return runCatching {
+            database.trafficHourlyDao().listBetween(window.first, window.second)
+                .sumOf { it.rxBytes + it.txBytes }
+        }.getOrNull()
     }
 
     /**
@@ -856,7 +1133,16 @@ class DataScheduler(
      *   全当成「刚接入」报一遍；
      * - 供给器返回 null（开关关闭或查询失败）时**丢弃基线**，下一次成功查询重新建基线 ——
      *   宁可漏报一轮，也不要因为中间断了几分钟而把一批设备误判成上下线；
-     * - MAC 统一小写去空白后作键，设备在不同接口里大小写不一致。
+     * - MAC 统一小写去空白后作键，设备在不同接口里大小写不一致；
+     * - **`station_list` 解析不出来时保留基线、不产生任何事件**（2.11 / P1-29）：
+     *   设备对这个字段有两种形态（真数组 / 数组的 JSON 字符串），排障开关关掉归一化时
+     *   会原样透出后者。此前这里直读 `jsonArray` 会抛 → 被下面的 catch 吞掉 → 基线清空，
+     *   于是「设备接入/离开」在整个排障期间**不报也不报错**。
+     *   刻意**不**在这条路径上清基线：那种场景每轮都失败，清了就等于永久静默停摆；
+     *   保留基线则解析一恢复就能和失败前的集合做差，把这段时间真实的上下线补报出来。
+     * - **同一 MAC 的同向事件有冷却窗**（2026-10-07 审计修复）：一台设备反复断连/重连时，
+     *   每 60s 一轮的差分会连环产出事件刷屏（WS/邮件首条跟着发）。同一 MAC 同方向
+     *   [DEVICE_EVENT_COOLDOWN_MS] 内只报第一次；反向事件不受限（断了立刻回连是值得报的）。
      */
     private suspend fun checkDeviceEvents() {
         val provider = stationListProvider ?: return
@@ -867,7 +1153,22 @@ class DataScheduler(
                 knownStations = null
                 return
             }
-            val list = json["station_list"]?.jsonArray ?: return
+            val list = when (val shape = parseStationList(json["station_list"])) {
+                is StationListShape.Available -> shape.stations
+                // 设备没给这个字段：正常形态之一，静默跳过（打 WARN 会每分钟刷一条无用日志）
+                StationListShape.Missing -> return
+                // 有值但解不出数组：真解析失败，必须留痕。文案逐字固定，
+                // 好让 AppLogger.repeatGate 按「级别+tag+完整消息」折叠成 1 条/分钟 ——
+                // 不许把设备数据拼进来（那会让基数无界、折叠失效）。
+                StationListShape.Malformed -> {
+                    AppLogger.w(
+                        tag,
+                        "station_list 解析失败：既不是数组、也不是数组的 JSON 字符串" +
+                            " —— 本轮跳过设备事件判定，基线保留（这不是「没有接入设备」）"
+                    )
+                    return
+                }
+            }
             val current = LinkedHashMap<String, String>()
             for (element in list) {
                 val row = element.jsonObject
@@ -883,11 +1184,28 @@ class DataScheduler(
                 AppLogger.i(tag, "Device event baseline established: ${current.size} clients")
                 return
             }
-            for ((mac, label) in current) if (!prev.containsKey(mac)) sink(true, label, mac)
-            for ((mac, label) in prev) if (!current.containsKey(mac)) sink(false, label, mac)
+            val nowEvt = System.currentTimeMillis()
+            for ((mac, label) in current) if (!prev.containsKey(mac)) {
+                if (deviceEventCooldown.allow(mac, true, nowEvt)) sink(true, label, mac)
+            }
+            for ((mac, label) in prev) if (!current.containsKey(mac)) {
+                if (deviceEventCooldown.allow(mac, false, nowEvt)) sink(false, label, mac)
+            }
         } catch (e: TimeoutCancellationException) {
             AppLogger.w(tag, "checkDeviceEvents timed out (8s)")
             knownStations = null
+        } catch (e: CancellationException) {
+            // ⚠ 这一条**必须**排在 [TimeoutCancellationException] 之后 —— 后者是它的**子类**。
+            // 顺序写反的话 `withTimeout(8s)` 的超时会先落进这里被原样抛出去，而本函数是
+            // start() 里那条 60s 设备事件循环（`while (isActive) { checkDeviceEvents(); delay(…) }`）
+            // 直接调用的：抛出去就把整条循环打断了，设备接入/离开通知从此静默停摆 ——
+            // 而超时本该只是「本轮跳过、基线清空」（上面那条分支）。
+            //
+            // 排在后面之后，能到这里的只剩**外部取消**（stop() 的 cancelChildren()）。
+            // 它被下面的泛型 catch 吞掉时，本协程会继续跑完剩下的活，stop() 等的就是一个
+            // 不肯结束的子协程 —— 与本文件 collectTraffic() 里那条 CancellationException
+            // 分支同一口径：取消不是采集失败，原样抛回去。
+            throw e
         } catch (e: Exception) {
             AppLogger.w(tag, "checkDeviceEvents failed: ${e.message}")
             knownStations = null
@@ -902,6 +1220,19 @@ class DataScheduler(
                 kotlinx.coroutines.withTimeout(5_000L) {
                     signalClient?.getSignalInfo()
                 }
+            } catch (_: TimeoutCancellationException) {
+                // 5s 拿不到 = 本轮没有 goform 数据，按 null 继续（下游 collect(null) 会退回
+                // 本机 telephony 采集）。⚠ 顺序与 checkDeviceEvents 同一条纪律：
+                // TimeoutCancellationException 是 CancellationException 的**子类**，
+                // 必须排在下面那条重抛**之前**，否则超时会被当成外部取消抛出去，
+                // 把整条秒级采集循环打断 —— 而超时本该只是「这一轮少一份数据」。
+                null
+            } catch (e: CancellationException) {
+                // 排在超时之后，能到这里的只剩**外部取消**（stop() 的 cancelChildren()）。
+                // 这里原来是 `catch (_: Exception) { null }`，把取消吞成「本轮没数据」，
+                // 于是停机瞬间本协程还会把剩下的 collect / 写 buffer / WebSocket 广播全跑完，
+                // stop() 等的就是一个不肯结束的子协程。取消不是采集失败，原样抛回去。
+                throw e
             } catch (_: Exception) {
                 null
             }
@@ -938,6 +1269,9 @@ class DataScheduler(
                 webSocketManager.broadcast("signal", cleanSignalInfo)
             }
 
+            // Boot grace period 内不写 DB、不触发告警（信号在开机初期可能还没注册上网络）
+            if (!isBootGracePassed()) return
+
             val rsrp = (signalInfo["rsrp"] as? Number)?.toInt() ?: 0
             if (rsrp != 0) {
                 alertEngine?.checkSignal(rsrp)
@@ -967,15 +1301,7 @@ class DataScheduler(
             val cpuInfo = systemCollector.getCpuInfo()
             _latestCpu.value = CpuInfoLite(cpuInfo.usage_percent, cpuInfo.core_count, cpuInfo.temperature)
 
-            val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
-            val cpuRecord = CpuHistoryRecord(
-                usagePercent = cpuInfo.usage_percent,
-                coreCount = cpuInfo.core_count,
-                maxFreqMhz = maxFreq,
-                temperature = cpuInfo.temperature
-            )
-            cpuBuffer.offerBounded(cpuRecord, cpuBufferSize)
-
+            // WS 实时推送照常（前端要看到实时值，即使在 grace period 内）
             if (realtimePushEnabled) {
                 webSocketManager.broadcast("cpu", mapOf(
                     "usage_percent" to cpuInfo.usage_percent,
@@ -985,19 +1311,69 @@ class DataScheduler(
                 ))
             }
 
-            // 告警检查: CPU 温度
-            alertEngine?.checkTemperature(cpuInfo.temperature)
+            // Boot grace period 内不写 DB、不触发告警 —— 开机初始化阶段 CPU 100% / 高温
+            // 是系统行为而非用户负载，写入会污染历史图表，告警会误报。
+            if (!isBootGracePassed()) {
+                // 诊断（2026-10-12，临时）：开机宽限期内不写库是**既有正确行为**，
+                // 但它与「采集异常被吞」在图表上长得一样（都表现为数据少一段），
+                // 所以必须能从日志上区分：这里打 i 级并带 elapsedRealtime。
+                AppLogger.i(
+                    tag,
+                    "Diag: boot grace 未过，CPU 不写库 elapsed=${android.os.SystemClock.elapsedRealtime()}ms grace=${bootGraceMs}ms"
+                )
+                return
+            }
+
+            val maxFreq = cpuInfo.cores.maxOfOrNull { it.freq_mhz } ?: 0.0
+            val cpuRecord = CpuHistoryRecord(
+                usagePercent = cpuInfo.usage_percent,
+                coreCount = cpuInfo.core_count,
+                maxFreqMhz = maxFreq,
+                temperature = cpuInfo.temperature
+            )
+            cpuBuffer.offerBounded(cpuRecord, cpuBufferSize)
+
+            // 2026-09-21 移除 `alertEngine?.checkTemperature(cpuInfo.temperature)`：
+            // temperature 告警的唯一入口收敛到 scanLocalAlerts()（那里用 readMaxCpuTemp 取
+            // 全热区最大值）。这里读的是 zone0，与那边取值不同 —— 同一个边沿状态机被两个值
+            // 驱动会永久抖动，详见 scanLocalAlerts 的注释。温度仍然照常入库与 WS 推送。
         } catch (e: CancellationException) {
             throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to collect CPU", e)
+            // 诊断（2026-10-12，临时）：单次采集失败在图表上就少一个点，
+            // 但连续失败会连成一段（用户看到的"断层"）。记下时刻便于和图表断层对齐。
+            AppLogger.i(
+                tag,
+                "Diag: CPU 采集失败 elapsed=${android.os.SystemClock.elapsedRealtime()}ms " +
+                    "err=${e.javaClass.simpleName}:${e.message}"
+            )
         }
     }
 
     private suspend fun collectBattery() {
         try {
             val batteryInfo = systemCollector.getBatteryInfo()
+            // ⚠ 顺序：**先赋值，再判断跳过**。两个读端点（/api/system/battery 与
+            // /api/dashboard 的 battery 段）优先读这份缓存，不赋值就等于无电池机型上两个端点
+            // 永远拿空 map —— 而批 M 的要求恰恰是「照系统值显示」。
+            // 下面跳过的只有「入库」与「告警」，一个下发字段都不动。
             _latestBattery.value = batteryInfo
+
+            // 未声明 Capability.BATTERY = 这个型号压根没有电池（2026-09-24 批 M）。
+            // 读数照上面下发（F50 上 percent 恒为 50），但那是**假值**：
+            // 存进 battery_history 就是一条永远 50% 的假曲线，喂给告警引擎就是按假值判级别。
+            // 两件事都与显示无关，所以跳过它们不违反「按系统值显示」。
+            //
+            // 为什么不能靠下面那条 level < 0：F50 的 sticky intent 带 level=50/scale=100，
+            // 负值分支一条都不进（这正是批 L 查出来的根因）。判据只能来自设备事实。
+            //
+            // 文案固定、不拼任何变动内容：AppLogger 的 repeatGate 按 (级别, tag, 完整消息) 折叠，
+            // 拼进 percent 之类会变的值就会让这条每次都是"新消息"，折叠失效、日志被刷爆。
+            if (!batteryDeclared) {
+                AppLogger.w(tag, "collectBattery: 本机型未声明电池能力，电量只用于显示，不入库、不告警")
+                return
+            }
 
             // percent < 0 = 这台设备这一轮压根没取到电量（见 SystemCollector.getBatteryInfo 的三级兜底）。
             // 既不能入库也不能拿去判告警：入库会在电量曲线上留一段 -1 的深坑，
@@ -1008,6 +1384,9 @@ class DataScheduler(
                 return
             }
             val isCharging = batteryInfo["is_charging"] as? Boolean ?: false
+
+            // Boot grace period 内不写 DB、不触发告警
+            if (!isBootGracePassed()) return
 
             // 持久化电池历史 — 使用 buffer 批量写入，与其他采集器统一
             val record = BatteryHistoryRecord(
@@ -1036,14 +1415,6 @@ class DataScheduler(
             val memoryInfo = systemCollector.getMemoryInfo()
             _latestMemory.value = memoryInfo
 
-            // 缓冲内存历史记录，批量写入减少 I/O
-            memoryBuffer.offerBounded(MemoryHistoryRecord(
-                total = memoryInfo.total,
-                used = memoryInfo.used,
-                available = memoryInfo.available,
-                usagePercent = memoryInfo.usage_percent
-            ), memoryBufferSize)
-
             if (realtimePushEnabled) {
                 webSocketManager.broadcast("memory", mapOf(
                     "total" to memoryInfo.total,
@@ -1055,6 +1426,17 @@ class DataScheduler(
                     "usage_percent" to memoryInfo.usage_percent
                 ))
             }
+
+            // Boot grace period 内不写 DB（内存在开机初期同样虚高）
+            if (!isBootGracePassed()) return
+
+            // 缓冲内存历史记录，批量写入减少 I/O
+            memoryBuffer.offerBounded(MemoryHistoryRecord(
+                total = memoryInfo.total,
+                used = memoryInfo.used,
+                available = memoryInfo.available,
+                usagePercent = memoryInfo.usage_percent
+            ), memoryBufferSize)
         } catch (e: CancellationException) {
             throw e // 停机取消不是采集失败，见 collectTraffic
         } catch (e: Exception) {
@@ -1069,12 +1451,19 @@ class DataScheduler(
                 signalClient?.getTrafficStats()
             }
             if (stats != null && stats.isNotEmpty()) {
-                // 月累计（canonical：rx=下载、tx=上传，方向已由 profile 掰正，见 ZteGoformProfile）
+                // 月累计（canonical：rx=下载、tx=上传，方向已由 profile 掰正，见 ZteGoformProfile）。
+                // 这个不变量**连排障模式也成立**：TRAFFIC_LIMIT 在 GoformFieldMapper.NORMALIZE_ALWAYS
+                // 清单里，所以 field_normalization_enabled=false 时这一组仍然归一化（其余组才透传）。
+                // 靠的就是那份清单 —— 把 TRAFFIC_LIMIT 从清单里拿掉，下面两行就会拿到设备原值，
+                // 而设备把上下行报反，recordHourlyUsage() 会把颠倒的月累计落库且不可回滚。
                 val rx = stats["monthly_rx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 val tx = stats["monthly_tx_bytes"]?.jsonPrimitive?.longOrNull ?: 0L
                 if (rx > 0 || tx > 0) {
                     _goformTraffic.value = Pair(rx, tx)
                     advanceTodayTraffic(rx, tx)
+                    // 每小时用量落库（流量历史的唯一数据源）。与今日流量分开：今日只在内存里，
+                    // 而历史必须落库才可能回看。
+                    recordHourlyUsage(rx, tx)
                     // 冷数据：不通过 WebSocket 推送，前端通过 /api/dashboard/summary REST API 获取
                 }
                 // 实时吞吐量（Modem 固件直接上报，bytes/s）
@@ -1139,6 +1528,99 @@ class DataScheduler(
 
         _todayTraffic.value =
             (monthRx - baselineRx).coerceAtLeast(0) to (monthTx - baselineTx).coerceAtLeast(0)
+    }
+
+    /**
+     * 把「本次月累计 − 上次月累计」累加进当前小时桶（`traffic_hourly`），流量历史的唯一写入口。
+     *
+     * 判定全部委托给 [TrafficHourlyAccumulator.decide]（纯函数、可单测）：首次采样、时间倒流、
+     * 离线过久、计数器归零这四种情形只更新基准、不落增量 —— 宁可少一段，不能凭空多一段。
+     *
+     * 基准（上一次采样）持久化在 `AppSettings.trafficHourlySamplerJson`，否则 core 每次重启都会
+     * 丢掉"重启前最后一次采样 → 重启后第一次采样"之间的量。settings 为 null（测试/降级装配）时
+     * 退化为纯内存基准，重启即失效 —— 与今日基线同一取舍。
+     *
+     * 整个函数吞异常：流量历史是附加功能，它写不进去不能影响采集主链路。
+     *
+     * **调用不变量**：只由 [collectGoformTraffic] 调用，而后者只在采集主循环这一个协程里跑 ——
+     * 所以 `hourlySamplerLoaded` / `hourlySample` 的"读-判断-改"三步是串行的。
+     * 将来若出现第二个写入方，这两个字段必须改成 Mutex 保护或合并成一个 AtomicReference。
+     */
+    private suspend fun recordHourlyUsage(monthRx: Long, monthTx: Long) {
+        try {
+            if (!hourlySamplerLoaded) {
+                hourlySamplerLoaded = true
+                val stored = settings?.trafficHourlySamplerJson
+                if (stored != null) {
+                    try {
+                        val obj = kotlinx.serialization.json.Json.parseToJsonElement(stored).jsonObject
+                        val at = obj["at"]?.jsonPrimitive?.longOrNull
+                        val rx = obj["rx"]?.jsonPrimitive?.longOrNull
+                        val tx = obj["tx"]?.jsonPrimitive?.longOrNull
+                        hourlySample = if (at != null && rx != null && tx != null) {
+                            TrafficHourlyAccumulator.Sample(at, rx, tx)
+                        } else null
+                    } catch (e: Exception) {
+                        AppLogger.w(tag, "小时用量基准解析失败，按首次采样处理: ${e.message}")
+                        hourlySample = null
+                    }
+                }
+            }
+
+            val decision = TrafficHourlyAccumulator.decide(
+                prev = hourlySample,
+                nowMs = System.currentTimeMillis(),
+                monthRx = monthRx,
+                monthTx = monthTx,
+                zone = java.time.ZoneId.systemDefault()
+            )
+
+            val next = when (decision) {
+                is TrafficHourlyAccumulator.Decision.SkipDelta -> {
+                    // no-change 每个采样周期都会命中（没跑流量时），别在这条上刷日志
+                    if (decision.reason != TrafficHourlyAccumulator.NO_CHANGE_REASON) {
+                        AppLogger.d(tag, "小时用量丢弃本次增量: ${decision.reason}")
+                    }
+                    decision.next
+                }
+                is TrafficHourlyAccumulator.Decision.Record -> decision.next
+            }
+
+            // 内存基准每轮都前进：`at` 不前进的话，空闲 20 分钟后的第一笔真实增量会被
+            // 离线守卫（OFFLINE_GAP_MS）误判成"core 离线过久"而整块丢掉。
+            hourlySample = next
+
+            // 但**只在累计值真的动过时才落 prefs**：没跑流量时每个采集周期都是 no-change，
+            // 照写就是每十几秒一次无效的 SharedPreferences 落盘（纯白烧 IO 与闪存寿命）。
+            // 代价是空闲期间进程被杀后基准的 at 偏旧，重启后第一笔增量会被离线守卫丢掉一次 ——
+            // 方向是"少记"，可接受。
+            val cumulativeChanged =
+                decision !is TrafficHourlyAccumulator.Decision.SkipDelta ||
+                    decision.reason != TrafficHourlyAccumulator.NO_CHANGE_REASON
+            if (cumulativeChanged) {
+                settings?.trafficHourlySamplerJson = kotlinx.serialization.json.buildJsonObject {
+                    put("at", JsonPrimitive(next.atMs))
+                    put("rx", JsonPrimitive(next.rx))
+                    put("tx", JsonPrimitive(next.tx))
+                }.toString()
+            }
+
+            // 基准**先**落 prefs、再落库：顺序反过来的话，进程在"库已写、prefs 未写"之间被杀
+            // 且在 OFFLINE_GAP_MS 内重启，同一段增量会被再累加一次（图上凭空多一截）。
+            // 现在这个顺序最坏情况是丢一段（约一个采样间隔的量），肉眼不可见。
+            if (decision is TrafficHourlyAccumulator.Decision.Record) {
+                database.trafficHourlyDao().addUsage(
+                    hourStart = decision.hourStart,
+                    rxDelta = decision.rxDelta,
+                    txDelta = decision.txDelta,
+                    now = decision.next.atMs
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e // 停机取消不是失败，见 collectTraffic
+        } catch (e: Exception) {
+            AppLogger.w(tag, "小时用量落库失败: ${e.message}")
+        }
     }
 
     // ── SMS 已读状态管理 ──
@@ -1246,35 +1728,45 @@ class DataScheduler(
 
             val newMax = latest.maxOf { it.id }
             if (newMax <= lastPollMaxSmsId) return  // 无新消息，跳过后续的未读标记、聚合和广播
-            lastPollMaxSmsId = newMax
-
-            // ── SMS 已读状态：检测新消息并写入未读状态 ──
-            val highWaterMark = settings?.smsHighWaterMark ?: 0L
-            // ID 体系切换（goform id → 系统 _id，如后端升级后首次运行）：系统 _id 可能
-            // 小于历史 goform 水位线 → 新消息永远不触发未读标记；检测到回退时重置水位线
-            if (newMax < highWaterMark) {
-                settings?.smsHighWaterMark = newMax
-            }
-            for (m in latest) {
-                if (m.id > (settings?.smsHighWaterMark ?: 0L)) {
-                    // 只有接收的新消息才标记未读，发送的默认已读。
-                    //
-                    // 2026-09-08：被拦截的短信也直接标记已读 —— `getUnreadCount` 是纯 DB COUNT，
-                    // 而 DB 里**没有正文**，关键词规则在 DB 层无从判断。在唯一能看到正文的地方
-                    // （这里）把它写成已读，未读数就天然不含被拦短信，`getUnreadCount` 一行不用改，
-                    // 联系人列表的 unread 聚合也自动一致。
-                    //
-                    // **明确不做追溯**：先收到短信、后加规则的那些历史 `sms_read_state` 不回改。
-                    // 追溯要拿正文重跑全表判定，成本高，而且语义可疑 ——
-                    // 「我刚加了条规则，历史未读数突然变了」比未读数偏大更让人不安。
-                    val blocked = ruleStore?.isBlocked(m.address, m.body) == true
-                    smsReadStateDao?.insert(com.ufi_axis_core.core.database.SmsReadState(
-                        msg_id = m.id,
-                        read = (m.direction == "sent" || blocked),
-                        phone = m.address
-                    ))
+            // 2026-10-05 R2-6 修复：不再先推进内存水位。未读标记写失败（磁盘满/DB 锁超时）
+            // 时若已推进，下一轮 `newMax <= lastPollMaxSmsId` 直接 return，这条短信的未读
+            // 状态永久丢失。改为：先写 DAO（insert 用 msg_id 主键，重试天然幂等），成功后再推进。
+            var unreadMarked = true
+            try {
+                val highWaterMark = settings?.smsHighWaterMark ?: 0L
+                // ID 体系切换（goform id → 系统 _id，如后端升级后首次运行）：系统 _id 可能
+                // 小于历史 goform 水位线 → 新消息永远不触发未读标记；检测到回退时重置水位线
+                if (newMax < highWaterMark) {
+                    settings?.smsHighWaterMark = newMax
                 }
+                for (m in latest) {
+                    if (m.id > (settings?.smsHighWaterMark ?: 0L)) {
+                        // 只有接收的新消息才标记未读，发送的默认已读。
+                        //
+                        // 2026-09-08：被拦截的短信也直接标记已读 —— `getUnreadCount` 是纯 DB COUNT，
+                        // 而 DB 里**没有正文**，关键词规则在 DB 层无从判断。在唯一能看到正文的地方
+                        // （这里）把它写成已读，未读数就天然不含被拦短信，`getUnreadCount` 一行不用改，
+                        // 联系人列表的 unread 聚合也自动一致。
+                        //
+                        // **明确不做追溯**：先收到短信、后加规则的那些历史 `sms_read_state` 不回改。
+                        // 追溯要拿正文重跑全表判定，成本高，而且语义可疑 ——
+                        // 「我刚加了条规则，历史未读数突然变了」比未读数偏大更让人不安。
+                        val blocked = ruleStore?.isBlocked(m.address, m.body) == true
+                        smsReadStateDao?.insert(com.ufi_axis_core.core.database.SmsReadState(
+                            msg_id = m.id,
+                            read = (m.direction == "sent" || blocked),
+                            phone = m.address
+                        ))
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 2026-10-05 R2-6 修复：写入失败时水位暂不推进，下一轮重试同批消息（insert 幂等）。
+                unreadMarked = false
+                AppLogger.w(tag, "SMS 未读标记写入失败，下一轮重试（水位暂不推进）: ${e.message}")
             }
+            if (unreadMarked) lastPollMaxSmsId = newMax
             // 2026-09-04：本轮**真正新增**的接收消息，供下面推 WS 通知用。
             // 必须在推进水位之前算，且用的是与未读标记同一条判据 —— 水位是持久化的
             // （`lastPollMaxSmsId` 只在内存里，进程重启会归零，拿它做通知去重会重复轰炸）。
@@ -1556,20 +2048,13 @@ class DataScheduler(
         val signalBatch = mutableListOf<SignalRecord>()
         val batteryBatch = mutableListOf<BatteryHistoryRecord>()
         try {
-            while (true) { cpuBuffer.poll()?.let { cpuBatch.add(it) } ?: break }
-            cpuBufferSize.getAndSet(0)  // 原子重置：drain 期间新增的 item 也计入
-
-            while (true) { memoryBuffer.poll()?.let { memBatch.add(it) } ?: break }
-            memoryBufferSize.getAndSet(0)
-
-            while (true) { trafficBuffer.poll()?.let { trafficBatch.add(it) } ?: break }
-            trafficBufferSize.getAndSet(0)
-
-            while (true) { signalBuffer.poll()?.let { signalBatch.add(it) } ?: break }
-            signalBufferSize.getAndSet(0)
-
-            while (true) { batteryBuffer.poll()?.let { batteryBatch.add(it) } ?: break }
-            batteryBufferSize.getAndSet(0)
+            // 2026-10-05 R1-6 修复：drain 与计数走同一协议，消除「drain 后 getAndSet(0)」与生产者
+            // offerBounded 交错造成的 counter 与队列内容漂移（漂移后逐出判定失效 → 缓冲无界增长）。
+            cpuBuffer.drainBounded(cpuBufferSize, cpuBatch)
+            memoryBuffer.drainBounded(memoryBufferSize, memBatch)
+            trafficBuffer.drainBounded(trafficBufferSize, trafficBatch)
+            signalBuffer.drainBounded(signalBufferSize, signalBatch)
+            batteryBuffer.drainBounded(batteryBufferSize, batteryBatch)
 
             val totalFlushed = cpuBatch.size + memBatch.size + trafficBatch.size + signalBatch.size + batteryBatch.size
             if (totalFlushed > 0) {
@@ -1577,12 +2062,37 @@ class DataScheduler(
                 database.flushAllBuffers(cpuBatch, memBatch, trafficBatch, signalBatch, batteryBatch)
                 AppLogger.d(tag, "Flushed buffers: cpu=${cpuBatch.size}, mem=${memBatch.size}, traffic=${trafficBatch.size}, signal=${signalBatch.size}, battery=${batteryBatch.size}")
                 lastFlushError = null
+                // 诊断日志（2026-10-12，临时；定位「采集间断导致图表断层」用，定位完删）。
+                // 打的是**写进去的最后一个时间点**与本轮间隔：断层如果出现在库里的相邻点之间，
+                // 这里能直接看出是「采集中断」还是「写入失败重入队」。
+                // 用 AppLogger.i 而不是 d：d 级默认不进文件，间断问题恰恰要事后翻文件才看得见。
+                val nowMs = System.currentTimeMillis()
+                val cpuGap = nowMs - lastCpuFlushAtMs
+                if (lastCpuFlushAtMs > 0L && cpuGap > FLUSH_GAP_WARN_MS) {
+                    AppLogger.i(
+                        tag,
+                        "Diag: 写库间隔异常 prev=${lastCpuFlushAtMs} now=$nowMs gap=${cpuGap}ms " +
+                            "batch=cpu:${cpuBatch.size},mem:${memBatch.size},traffic:${trafficBatch.size},signal:${signalBatch.size}"
+                    )
+                }
+                lastCpuFlushAtMs = nowMs
             }
+        } catch (e: CancellationException) {
+            // 2026-10-05 R2-7 修复：stop() 的 cancelChildren 打在 flushAllBuffers 挂起点上时，
+            // 取消不是 flush 失败。批次重新入队也不会再有下一次 flush，原样抛回让协程正常退出，
+            // 不再在停机瞬间留下误导性的「Failed to flush buffers」ERROR。（停机丢最后一批
+            // buffer 是既有取舍，见 stop() 的 5s flush 预算。）
+            throw e
         } catch (e: Exception) {
             // 关键路径：刷新失败不要静默吞掉已 drain 的数据（会导致持久化状态错乱/丢点），
             // 重新入队以便下次重试，并置错误态供监控/诊断感知。
             AppLogger.e(tag, "Failed to flush buffers, re-enqueuing for retry", e)
             lastFlushError = e.message ?: e.javaClass.simpleName
+            AppLogger.i(
+                tag,
+                "Diag: flush 失败，批次重新入队 batch=cpu:${cpuBatch.size},mem:${memBatch.size}," +
+                    "traffic:${trafficBatch.size},signal:${signalBatch.size} err=${e.javaClass.simpleName}:${e.message}"
+            )
             cpuBatch.forEach { cpuBuffer.offerBounded(it, cpuBufferSize) }
             memBatch.forEach { memoryBuffer.offerBounded(it, memoryBufferSize) }
             trafficBatch.forEach { trafficBuffer.offerBounded(it, trafficBufferSize) }
@@ -1623,6 +2133,8 @@ class DataScheduler(
                 { cutoff, limit -> database.batteryHistoryDao().deleteOlderThanBatched(cutoff, limit) },
                 monitorCutoff, tag = "battery_history"
             )
+            // 测速历史: 与监控历史同窗清理（2026-10-06 定时测速；一天至多几十条，无需分批）
+            val speedtestDeleted = database.speedTestDao().deleteOlderThan(monitorCutoff)
             // 告警记录: 保留 30 天（告警量少，无需分批）
             val alertDeleted = database.alertDao().deleteOlderThan(now - 30L * 24 * 60 * 60 * 1000L)
             // 短信记录: 永久保留，不自动清理
@@ -1633,7 +2145,7 @@ class DataScheduler(
                 vcDao?.deleteOlderThan(now - cleanupHours * 3600_000L) ?: 0
             } else 0
 
-            if (cpuDeleted + memoryDeleted + trafficDeleted + signalDeleted + batteryDeleted + alertDeleted + vcDeleted > 0) {
+            if (cpuDeleted + memoryDeleted + trafficDeleted + signalDeleted + batteryDeleted + speedtestDeleted + alertDeleted + vcDeleted > 0) {
                 AppLogger.i(tag, "Cleaned data: cpu=$cpuDeleted, memory=$memoryDeleted, traffic=$trafficDeleted, signal=$signalDeleted, battery=$batteryDeleted, alert=$alertDeleted, vc=$vcDeleted")
 
                 // WAL checkpoint(TRUNCATE)：合并 WAL 文件回主库，回收磁盘空间
@@ -1661,33 +2173,87 @@ class DataScheduler(
      * 使用 AtomicInteger 计数器实现 O(1) 大小检查，
      * 替代 ConcurrentLinkedQueue.size() 的 O(n) 链表遍历。
      */
-    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) {
-        while (counter.get() >= MAX_BUFFER_SIZE) {
-            if (poll() != null) counter.decrementAndGet() else break
+    // 2026-10-05 R1-6 修复：drain 也走「计数占减 + 队列 poll」配对协议，drain 不再 getAndSet(0)，
+    // 消除与生产者 offerBounded 交错时的计数漂移。
+    private fun <T> ConcurrentLinkedQueue<T>.drainBounded(counter: AtomicInteger, into: MutableList<T>) {
+        while (true) {
+            val n = counter.updateAndGet { cur -> if (cur <= 0) cur else cur - 1 } // 先占减计数
+            if (n <= 0) { counter.set(0); break }
+            val e = poll()
+            if (e == null) { counter.incrementAndGet(); break } // 队列已空：回滚占减
+            into.add(e)
         }
-        offer(item)
-        counter.incrementAndGet()
+    }
+
+    private fun <T> ConcurrentLinkedQueue<T>.offerBounded(item: T, counter: AtomicInteger) {
+        // 2026-10-05 R1-6 修复：入队/逐出改为 CAS 配对协议（占计数即得名额，poll 与计数严格配对），
+        // 替代原「循环 poll + decrementAndGet」的 get-then-put 序列，避免并发下 counter 与队列内容漂移。
+        while (true) {
+            val cur = counter.get()
+            if (cur < MAX_BUFFER_SIZE) {
+                if (counter.compareAndSet(cur, cur + 1)) { offer(item); return }
+            } else {
+                // 已达上限：占减一个名额（丢最旧一条），再入队新记录
+                if (counter.compareAndSet(cur, cur - 1)) {
+                    poll()
+                    offer(item)
+                    return
+                }
+            }
+        }
     }
 
     /**
-     * 读取 CPU 最高温度（毫摄氏度）
-     * 从 /sys/class/thermal/ 下所有 thermal_zone 的 temp 文件读取，返回最大值
-     * 直接读取 sysfs，无需 root 权限，避免 shell fork 开销
+     * 读取 CPU 最高温度（**毫摄氏度**）—— 阶段 4 的 4.3（批 I）起改由
+     * [PlatformAdapter.readTemperature] 供值，本类不再自己遍历 `/sys/class/thermal`。
+     *
+     * 单位换算走 `core/common` 的 [celsiusToMilliC]（℃ Float? → 毫℃ Int，有单测）。
+     * **必须 `roundToInt()`，不许 `toInt()`**：截断会让一部分毫度值往返后少 1
+     * （实测 20~100°C 的 80001 个值里有 555 个，最小的是 32002 → 32.002f → 32001.998f → 32001；
+     * `roundToInt()` 则是 0 个不匹配）。依据与数字记在 [celsiusToMilliC] 的 KDoc 里。
+     *
+     * ## 这不是等价搬迁 —— 四点语义变更（用户已裁决接受）
+     *
+     * 原实现与 adapter 的读法有四处差异，收拢后本方法的行为随 adapter 变：
+     *
+     * 1. **多了目录与文件守卫**：adapter 先 `thermalDir.exists()`、每个 `temp` 先 `canRead()`。
+     *    原实现两者都没有，但**「没有 thermal 目录」这一种情形取值不变**：
+     *    `listFiles()` 对不存在的目录返回 `null`，整条 `?.` 链短路到 `?: 0` —— 原来也是 0，
+     *    而且**原来是静默的**（外层 `catch` 根本没被触发）。
+     *    唯一的行为差别是：这种设备现在每轮会多一条 WARN（折叠后 1 条/分钟，见下）。
+     *    这是刻意的 —— 「热区读不到 ⇒ 温控熔断失效」本来就该留痕。
+     * 2. **异常粒度从「整轮」细化到「每热区」**：原实现只有一层外层 `try`，
+     *    任一热区 `readText()` 抛异常（权限 / EIO / 热区消失）→ 整轮退化成 `0` 并记一条 WARN；
+     *    adapter 是每热区独立 `try` + `canRead()` 预检，坏的跳过、其余照算。
+     *    → **「部分热区损坏」时本方法现在给出其余热区的真实最大值，而不是 0**。这是改善，
+     *    也是本批唯一一处**会改变熔断判定**的差异（原来那种情形会误判成「最凉」）。
+     *    全部热区都读不动时仍然是 `null` → 0 + WARN，与原来一致。
+     * 3. **负数被地板夹成 0**：原实现的 `maxOrNull()` 能返回负数，adapter 的 max 从 `0f` 起。
+     *    负数只会出现在「热区未就绪写了 -1 之类」的场景，而它在下游本来也只与 `> 0` /
+     *    `> 70000` 比较 —— 负数与 0 在三条降频档和熔断 `when` 上判定完全相同，
+     *    唯一的差别在 `scanLocalAlerts()` 的 `if (milli > 0)`，而那里负数与 0 同样都不进。
+     * 4. **不可解析内容**：原实现 `mapNotNull` 跳过，adapter 是 `toLongOrNull() ?: 0L` 当 0 参与 max
+     *    —— max 从 0 起、0 不会抬升结果，**运行时等价**。
+     *
+     * ## 「读不到」仍然打一条 WARN
+     *
+     * 失败判定搬到 adapter 里了（返 `null`），但**不许静默** —— 温控熔断失效是必须留痕的事。
+     * 文案**逐字固定、不拼任何每次都变的内容**（异常消息、热区名、时间…）：
+     * `AppLogger.repeatGate` 按「级别 + tag + **完整消息**」折叠成 1 条/分钟，
+     * 拼了变量就会让 key 基数无界、折叠失效（计划书 §15 的 P1-35）。
+     * 这也是原文案去掉 `e.message` 插值的原因 —— 顺带把原来那条的折叠也修好了。
+     *
+     * ## 调度器
+     *
+     * 不再自己 `withContext(Dispatchers.IO)`：adapter 内部已经包了一层
+     * （见 `SprdPlatform.readTemperature` 的「调度器」段），这里再包一层是空切换。
      */
-    private suspend fun readMaxCpuTemp(): Int = withContext(Dispatchers.IO) {
-        try {
-            val thermalDir = File("/sys/class/thermal")
-            thermalDir.listFiles()
-                ?.filter { it.name.startsWith("thermal_zone") }
-                ?.mapNotNull { zone ->
-                    File(zone, "temp").readText().trim().toIntOrNull()
-                }
-                ?.maxOrNull() ?: 0
-        } catch (e: Exception) {
-            // 不再静默吞掉：温度读取失败会影响温控熔断判定，至少记录日志以便诊断
-            AppLogger.w(tag, "Failed to read CPU temperature, defaulting to 0: ${e.message}")
-            0
+    private suspend fun readMaxCpuTemp(): Int {
+        val celsius = platform.readTemperature()
+        if (celsius == null) {
+            AppLogger.w(tag, "Failed to read CPU temperature, defaulting to 0")
         }
+        return celsiusToMilliC(celsius)
     }
 
     // ── 采集调度参数（2026-09-03）──
@@ -1710,7 +2276,35 @@ class DataScheduler(
     private val deviceEventCheckIntervalMs: Long
         get() = (settings?.monitorDeviceEventCheckSec ?: 60) * 1000L
 
+    /** 套餐到期检查间隔：1h（日历事件，分钟级精度无意义） */
+    private val PLAN_EXPIRY_CHECK_INTERVAL_MS: Long get() = 3_600_000L
+
+    /**
+     * 设备事件冷却器（键 = 方向+MAC）：断连风暴（AP 重启、省电抖动）下同向事件
+     * [DEVICE_EVENT_COOLDOWN_MS] 内只出一条；反向不受限。
+     */
+    private class DeviceEventCooldown {
+        private val last = HashMap<String, Long>()
+        fun allow(mac: String, online: Boolean, now: Long): Boolean {
+            val key = if (online) "on:$mac" else "off:$mac"
+            val prev = last[key]
+            if (prev != null && now - prev < DEVICE_EVENT_COOLDOWN_MS) return false
+            last[key] = now
+            if (last.size > 512) last.entries.removeIf { now - it.value > DEVICE_EVENT_COOLDOWN_MS }
+            return true
+        }
+    }
+
     private companion object {
+        /** 设备事件 per-MAC 同向冷却窗：采集节拍 60s，5 分钟内同一 MAC 同向只报一次。 */
+        const val DEVICE_EVENT_COOLDOWN_MS = 5 * 60_000L
+        /**
+         * 写库间隔超过这个值就打诊断日志（2026-10-12，临时，定位图表断层用）。
+         * 正常 flushIntervalMs = 10s，留足余量取 5 分钟。
+         */
+        const val FLUSH_GAP_WARN_MS = 5 * 60_000L
+        /** 默认 boot grace = 90 秒。Unisoc 实测 ~60s 稳定，留 30s 余量。 */
+        const val BOOT_GRACE_DEFAULT_MS = 90_000L
         const val PERFORMANCE_CHECK_INTERVAL_MS = 60_000L    // 性能监控: 60s
         const val BATTERY_COLLECTION_INTERVAL_MS = 60_000L
         // 刷写间隔 / 空闲采集间隔 / 告警扫描间隔 / 保留天数 / 温控档位

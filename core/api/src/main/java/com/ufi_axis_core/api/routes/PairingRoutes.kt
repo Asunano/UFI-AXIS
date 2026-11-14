@@ -139,6 +139,10 @@ class PairingRoutes(
      */
     private val rateLimitMs: Long = 500L
 ) {
+    // 2026-10-05 R1-8 修复：限速表容量上限与条目过期时间，防无界增长。
+    // （作为常量放在类级 private 字段；类已有 companion object，不能再开一个。）
+    private val RATE_LIMIT_PRUNE_THRESHOLD = 512
+    private val RATE_LIMIT_ENTRY_TTL_MS = 60_000L
 
     private val settings get() = ctx.settings
 
@@ -219,12 +223,21 @@ class PairingRoutes(
         }
     }
 
+    // 2026-10-05 R1-8 修复：限速「读-判-写」与容量清理纳入同一把锁，保证原子性；
+    // 各表条目有界（超阈值时清理过期项），防伪造/轮换源 IP 造成 Map 无界增长。
+    private val rateLock = Any()
+
     private fun rateLimited(ip: String, store: ConcurrentHashMap<String, Long>): Boolean {
         val now = System.currentTimeMillis()
-        val last = store[ip]
-        if (last != null && now - last < rateLimitMs) return true
-        store[ip] = now
-        return false
+        synchronized(rateLock) {
+            val last = store[ip]
+            if (last != null && now - last < rateLimitMs) return true
+            store[ip] = now
+            if (store.size >= RATE_LIMIT_PRUNE_THRESHOLD) {
+                store.entries.removeAll { now - it.value >= RATE_LIMIT_ENTRY_TTL_MS }
+            }
+            return false
+        }
     }
 
     /**

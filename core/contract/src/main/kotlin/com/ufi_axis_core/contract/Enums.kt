@@ -21,7 +21,21 @@ enum class ActionType(val wire: String) {
     PERFORMANCE_MODE("performance_mode"),
     ROAMING_TOGGLE("roaming_toggle"),
     NETWORK_MODE("network_mode"),
-    CUSTOM_SHELL("custom_shell");
+    CUSTOM_SHELL("custom_shell"),
+    /**
+     * 定时测速（2026-10-06）：core 本地跑一轮测速并入库 + 推送。
+     * 参数：notify（Boolean，默认 true —— 完成后走通知渠道）。
+     */
+    SPEEDTEST("speedtest"),
+    /**
+     * 配置自动备份到远端（2026-10-06）：加密备份包推送到已配置的远端存储源，
+     * 滚动保留 7 份。配置见 remote_backup_source_id / remote_backup_passphrase。
+     */
+    REMOTE_BACKUP("remote_backup"),
+    /**
+     * 流量报告（2026-10-06）：生成日/周/月报并推送。参数：period（day|week|month，默认 week）。
+     */
+    TRAFFIC_REPORT("traffic_report");
 
     companion object {
         val ALL: List<String> = entries.map { it.wire }
@@ -49,7 +63,17 @@ enum class ActionType(val wire: String) {
  */
 object NetworkMode {
 
-    /** 客户端可选的别名（大小写不敏感，core 侧 `uppercase()` 后匹配）。 */
+    /**
+     * 客户端可选的别名（大小写不敏感，core 侧 `uppercase()` 后匹配）。
+     *
+     * 含义与设备真机档位一一对应（2026-09 校准）：
+     * - [AUTO] → goform `WL_AND_5G`（5G/4G/3G）
+     * - [LTE_AND_5G] → `LTE_AND_5G`（5G NSA）
+     * - [ONLY_5G] → `Only_5G`（5G SA）
+     * - [WCDMA_AND_LTE] → `WCDMA_AND_LTE`（4G/3G）
+     * - [ONLY_LTE] → `Only_LTE`（仅4G）
+     * - [ONLY_WCDMA] → `Only_WCDMA`（仅3G）
+     */
     const val AUTO = "AUTO"
     const val ONLY_5G = "5G_ONLY"
     const val LTE_AND_5G = "LTE_AND_5G"
@@ -57,8 +81,32 @@ object NetworkMode {
     const val ONLY_WCDMA = "WCDMA_ONLY"
     const val WCDMA_AND_LTE = "WCDMA_AND_LTE"
 
-    /** 给 UI 用的别名清单（对用户暴露的档位，顺序即展示顺序）。 */
-    val UI_OPTIONS: List<String> = listOf(AUTO, ONLY_5G, LTE_AND_5G, ONLY_LTE, WCDMA_AND_LTE, ONLY_WCDMA)
+    /**
+     * 给 UI 用的别名清单（顺序即展示顺序，对齐真机 Web 面板档位顺序）。
+     * 5G/4G/3G → 5G NSA → 5G SA → 4G/3G → 仅4G → 仅3G
+     */
+    val UI_OPTIONS: List<String> = listOf(
+        AUTO, LTE_AND_5G, ONLY_5G, WCDMA_AND_LTE, ONLY_LTE, ONLY_WCDMA
+    )
+
+    /**
+     * 别名 → 用户可见中文名。**全仓唯一文案真源**（App / Web / 定时任务共用）。
+     * App 侧不要再维护第二份 map，否则改一处漏一处。
+     */
+    val LABELS: Map<String, String> = mapOf(
+        AUTO to "5G/4G/3G",
+        LTE_AND_5G to "5G NSA",
+        ONLY_5G to "5G SA",
+        WCDMA_AND_LTE to "4G/3G",
+        ONLY_LTE to "仅4G",
+        ONLY_WCDMA to "仅3G"
+    )
+
+    /** 别名 → 中文名；未登记时原样返回（避免界面空白）。 */
+    fun label(alias: String): String = LABELS[alias] ?: alias
+
+    /** 设备 BearerPreference（或等价写法）→ 中文名。 */
+    fun labelFromBearer(bearer: String): String = label(fromBearer(bearer))
 
     /** goform BearerPreference 实际取值（**大小写敏感**，设备只认这一组）。 */
     object Bearer {
@@ -71,13 +119,16 @@ object NetworkMode {
     }
 
     /**
-     * 别名 → BearerPreference。与 `NetworkRoutes.kt` 的 `when` 完全等价（含全部历史别名）。
+     * 别名 → BearerPreference。
+     *
+     * 入参同时接受：contract 别名、设备侧 BearerPreference、以及真机/老固件上
+     * 出现过的等价写法（`NR5G_ONLY` / `LTE_NR5G` 等）。对 Bearer 取值幂等。
      * 未识别的取值原样返回（保持 core 现有的"直接透传"行为，不在此处改变语义）。
      */
     fun toBearer(mode: String): String = when (mode.uppercase()) {
-        "AUTO", "WL_AND_5G" -> Bearer.WL_AND_5G
-        "5G_ONLY", "ONLY_5G", "5G_SA" -> Bearer.ONLY_5G
-        "5G_NSA", "LTE_AND_5G" -> Bearer.LTE_AND_5G
+        "AUTO", "WL_AND_5G", "WCDMA_AND_LTE_AND_5G" -> Bearer.WL_AND_5G
+        "5G_ONLY", "ONLY_5G", "5G_SA", "NR5G_ONLY", "ONLY_NR5G" -> Bearer.ONLY_5G
+        "5G_NSA", "LTE_AND_5G", "LTE_NR5G", "LTE_AND_NR5G", "NR5G_NSA" -> Bearer.LTE_AND_5G
         "LTE_ONLY", "ONLY_LTE", "4G_ONLY" -> Bearer.ONLY_LTE
         "WCDMA_ONLY", "ONLY_WCDMA" -> Bearer.ONLY_WCDMA
         "LTE_WCDMA", "WCDMA_AND_LTE" -> Bearer.WCDMA_AND_LTE
@@ -85,26 +136,28 @@ object NetworkMode {
     }
 
     /**
-     * BearerPreference → 别名（`toBearer` 的逆映射，与 web 的 `BearerToNetworkMode` 一一对应）。
-     * 设备回读的 `BearerPreference` 是 Bearer 取值域，UI 若用别名做选中比对必须先经此函数换算。
-     * 未识别的取值（例如老字段 `net_select` 可能回的 `AUTO`）原样返回。
+     * BearerPreference → contract 别名（`toBearer` 的逆映射）。
+     *
+     * 设备回读的 `BearerPreference` 不一定与写入值逐字相同：profile 测试与部分固件
+     * 会回 `NR5G_ONLY`、老字段 `net_select` 会回 `only_5g`。App 的切换回读确认
+     * （`awaitNetworkModeApplied`）拿这里的结果与 UI 目标别名比对，**漏一档就会
+     * 永远超时**——写入成功却提示「设备尚未完成切换」（2026-09 App 缺陷）。
+     *
+     * 未识别取值原样返回，避免把未知制式伪装成「自动」。
      */
     fun fromBearer(bearer: String): String = when (bearer.uppercase()) {
-        "WL_AND_5G" -> AUTO
-        "ONLY_5G" -> ONLY_5G
-        "LTE_AND_5G" -> LTE_AND_5G
-        "ONLY_LTE" -> ONLY_LTE
-        "ONLY_WCDMA" -> ONLY_WCDMA
-        "WCDMA_AND_LTE" -> WCDMA_AND_LTE
+        "WL_AND_5G", "WCDMA_AND_LTE_AND_5G" -> AUTO
+        "ONLY_5G", "NR5G_ONLY", "ONLY_NR5G" -> ONLY_5G
+        "LTE_AND_5G", "LTE_NR5G", "LTE_AND_NR5G", "NR5G_NSA", "5G_NSA" -> LTE_AND_5G
+        "ONLY_LTE", "LTE_ONLY" -> ONLY_LTE
+        "ONLY_WCDMA", "WCDMA_ONLY" -> ONLY_WCDMA
+        "WCDMA_AND_LTE", "LTE_WCDMA" -> WCDMA_AND_LTE
         else -> bearer
     }
 
-    /** band lock 的"解锁"= 锁全部频段（来自 `GoformNetworkClient`）。 */
-    const val LTE_ALL_BANDS = "1,3,5,8,34,38,39,40,41"
-    const val NR_ALL_BANDS = "1,5,8,28,41,78"
-
     /**
      * 切换制式后的「回读确认」预算（2026-09-11 真机缺陷修复）。
+
      *
      * ## 为什么需要它
      *
@@ -131,14 +184,36 @@ object NetworkMode {
          */
         const val FIRST_DELAY_MS = 600L
 
-        /** 之后每次回读的间隔。 */
+        /** 之后每次回读的间隔（前 [FAST_ATTEMPTS] 次用它，见 [intervalMsAfter]）。 */
         const val INTERVAL_MS = 1_500L
 
-        /** 回读次数上限（**含**第一次）。到顶还没读到目标档位就报超时，不许再读。 */
-        const val MAX_ATTEMPTS = 10
+        /**
+         * 慢档间隔：设备开始重新注册后，回读频率降下来。
+         *
+         * 每次回读都是一次真打设备的 goform 查询（写成功后 core 会清 `device:settings` 缓存），
+         * 30 秒预算里用 1.5s 匀速就是 20 次查询，会把 `GoformQoS` 的查询许可耗在这一件事上。
+         */
+        const val SLOW_INTERVAL_MS = 3_000L
 
-        /** 总时长上限，= [FIRST_DELAY_MS] + (次数-1) × [INTERVAL_MS]，给文案与守卫用。 */
-        const val TOTAL_BUDGET_MS = FIRST_DELAY_MS + (MAX_ATTEMPTS - 1) * INTERVAL_MS
+        /** 前几次用快档间隔：多数切换在头几秒就完成，先给快反馈。 */
+        const val FAST_ATTEMPTS = 5
+
+        /**
+         * 回读次数上限（**含**第一次）。到顶还没读到目标档位就报「尚未完成」，不许再读。
+         *
+         * 2026-09-15 调整：原来是 10 次 × 1.5s = 14.1s，而真机弱信号下切制式要十几到二十几秒，
+         * 于是「切完了但仍提示未完成」变成常态。现在 13 次、前 5 次 1.5s 之后 3s，
+         * 总预算 [TOTAL_BUDGET_MS] = 30.6s。
+         */
+        const val MAX_ATTEMPTS = 13
+
+        /** 第 [attemptNo] 次回读之后要等多久再读下一次。 */
+        fun intervalMsAfter(attemptNo: Int): Long =
+            if (attemptNo < FAST_ATTEMPTS) INTERVAL_MS else SLOW_INTERVAL_MS
+
+        /** 总时长上限（首次等待 + 各次间隔之和），给文案与守卫用。 */
+        val TOTAL_BUDGET_MS: Long =
+            FIRST_DELAY_MS + (1 until MAX_ATTEMPTS).sumOf { intervalMsAfter(it) }
 
         /**
          * 还要不要再回读一次。
@@ -179,9 +254,12 @@ object Alerts {
         const val DEVICE_ONLINE = "device_online"
         const val DEVICE_OFFLINE = "device_offline"
 
+        /** 套餐到期（2026-10-07）：fixed 模式（累计有效期包）的日历到期提醒 */
+        const val PLAN_EXPIRY = "plan_expiry"
+
         val ALL: List<String> = listOf(
             TEMPERATURE, BATTERY, TRAFFIC, SIGNAL, CONNECTIVITY,
-            TRAFFIC_LIMIT, DEVICE_ONLINE, DEVICE_OFFLINE
+            TRAFFIC_LIMIT, DEVICE_ONLINE, DEVICE_OFFLINE, PLAN_EXPIRY
         )
     }
 
@@ -287,6 +365,62 @@ object WsChannel {
     const val WELCOME = "connected"
 
     const val MAX_CONNECTIONS = 4
+}
+
+/**
+ * `data_changed` 帧里 `data.changed` 的取值表（**不是**频道名，频道只有
+ * [WsChannel.DATA_CHANGED] 一个）。
+ *
+ * 为什么需要这张表：这里的值是 core 广播方和两端消费方之间**唯一**的约定，而两边
+ * 都是裸字符串字面量。2026-09-21 就踩过一次：`ResponseCache.invalidate` 把
+ * `"device:traffic-limit"` 截成了 `"device"`，而 app/web 全按完整 key 匹配 ——
+ * 整条精准刷新链路端到端静默失效，没有任何报错。新增取值请一律加到这里，
+ * 广播端和消费端都引用常量，别再写字面量。
+ *
+ * 约定格式 `namespace:key`：消费端既可精确匹配（`== TASK_LIST`），
+ * 也可按前缀分流（`startsWith("task:")`）。
+ */
+object WsDataTopic {
+    /** 定时任务集合变了（增删改 / 触发后写执行日志 / 一次性任务触发后自动禁用）。 */
+    const val TASK_LIST = "task:list"
+
+    /** 自动化规则集合变了（增删改 / 规则触发后写执行日志）。 */
+    const val TASK_RULES = "task:rules"
+
+    /** 控制台历史变了，`console:<channel>`，channel = `at` / `shell`。 */
+    const val CONSOLE_AT = "console:at"
+    const val CONSOLE_SHELL = "console:shell"
+
+    /** 流量上限 / 流量校准写入成功。 */
+    const val DEVICE_TRAFFIC_LIMIT = "device:traffic-limit"
+
+    /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
+    const val MEDIA_PLAYLISTS = "media:playlists"
+
+    /**
+     * 2026-10-05 G6（FFmpeg 接入计划书 §4.2）：封面预热进度变了
+     * （data: { done: Int, total: Int, failed: Int, running: Boolean }）。
+     * 设置页据此展示预热进度；媒体列表端收到后可做一次缩略图静默重拉。
+     */
+    /** 封面预热进度（G6）。payload: {done,total,failed,running}。
+     *  语义（2026-10-05 审查注明）：done 只累计本轮**新增**成功数，缓存命中不计入；
+     *  total 是全库视频数。消费端勿把它当"整体完成度"画进度条——稳定态下 done 恒为 0。 */
+    const val MEDIA_THUMB_PREWARM = "media:thumb-progress"
+
+    /** 前缀：按命名空间分流用。 */
+    const val PREFIX_TASK = "task:"
+    const val PREFIX_CONSOLE = "console:"
+    const val PREFIX_DEVICE = "device:"
+    const val PREFIX_NETWORK = "network:"
+    const val PREFIX_WIFI = "wifi:"
+    const val PREFIX_MEDIA = "media:"
+
+    /**
+     * 2026-10-05 P5 端侧 WS 重连 sentinel（仅 app 内部语义，core 不发送，web 不需要）。
+     * 断线窗口的 data_changed 事件已丢（replay=0），重连成功后由 app 侧
+     * WebSocketRepository 补发本值，各 Module 按各自新鲜度策略做一次 silent 全量补拉。
+     */
+    const val RECONNECTED = "__reconnected__"
 }
 
 /**

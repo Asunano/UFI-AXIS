@@ -44,15 +44,32 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * 三者的**唯一真源都是 core 的 [AppSettings]**（app 与 web 都经 `GET/PUT /api/config` 读写），
  * 进程启动时必须用 [restoreSwitches] 一次性恢复 —— 见该方法上的注释，
  * 「日志自动开启」的根因就是曾经漏恢复其中一个。
+ *
+ * 2026-09-24（计划书 §15 P1-32，用户裁决方案 ①）：**WARN/ERROR 无视总开关始终落地**，
+ * INFO/DEBUG 行为不变。判定收敛到 [shouldEmit]，两条入口（[log] 与 [e] 的提前返回）都走它。
  */
 object AppLogger {
 
     private const val TAG = "UFI-AXIS-Core"
-    private const val MAX_LOG_FILES = 7  // 保留最近 7 天
+    // ═══ 2026-10-13：用户要求取消日志保留上限 ═══
+    //
+    // 背景：core 日志是定位图表断层唯一的证据来源。原来的三级上限（7 天 / 单文件 5MB / 目录 40MB）
+    // 在长时间抓日志时会把关键记录直接轮转掉 —— 用户导出时发现日志内容缺失，于是要求取消。
+    //
+    // 为什么这里不设「更大一点」的上限而是直接取消：
+    // · 5MB/文件 → 轮转覆盖 .log.1，同一分钟内的高频日志只留最新一段，开头直接消失；
+    // · 40MB 目录 → enforceTotalBudget() 按修改时间删最旧，同样会吃掉当天的证据。
+    //
+    // 风险与代价（明说，不回避）：日志目录现在只受设备存储容量约束，不设内部上限，
+    // 长期开日志的设备上它会持续增长。这是用户显式要求的行为；
+    // 若以后要收敛，应该改成「按天保留 + 用户可见的占用提示」，而不是偷偷截断。
+    private const val MAX_LOG_FILES = 3650  // 约 10 年；实质等于不删，只避免清理时误删今天之前很久的目录
     private const val MAX_BUFFER_SIZE = 500  // 内存缓冲区最大条目数
     private const val ERROR_DEDUP_WINDOW_MS = 5 * 60 * 1000L  // 错误去重窗口：5 分钟
-    private const val MAX_LOG_FILE_BYTES = 5L * 1024 * 1024  // 单个日志文件上限 5MB（所有类型）
-    private const val MAX_LOG_DIR_BYTES = 40L * 1024 * 1024  // 整个 logs 目录总量上限 40MB
+    // 2026-10-13：按用户要求取消单文件 5MB 轮转（见 MAX_LOG_FILES 上方说明）
+    private const val MAX_LOG_FILE_BYTES = Long.MAX_VALUE
+    // 2026-10-13：按用户要求取消目录 40MB 总预算（同上）
+    private const val MAX_LOG_DIR_BYTES = Long.MAX_VALUE
 
     /**
      * 详细日志关闭时，内存缓冲仍然收录的最低级别。
@@ -137,6 +154,10 @@ object AppLogger {
     // 文件写入器缓存 (key = "prefix_date"，自动按天切换)
     private val writerCache = ConcurrentHashMap<String, BufferedWriter>()
 
+    // 落盘串行化：getOrPut、轮转（close/remove/重建）、write/flush 必须在同一临界区里，
+    // 否则多协程并发会写出交错行，或对轮转时已关闭的流写入（Stream closed）。
+    private val writerLock = Any()
+
     // 最近一次落盘所属日期，用于跨天触发 cleanOldLogs()（core 常驻不重启也能清理过期文件）
     @Volatile
     private var lastWriteDate: String? = null
@@ -184,10 +205,12 @@ object AppLogger {
 
 
     /**
-     * 日志总开关（2026-08-27 新增，真源 `AppSettings.logEnabled`，默认 true）。
+     * 日志总开关（2026-08-27 新增，真源 `AppSettings.logEnabled`，**持久化默认值 false**）。
      *
-     * false = **两端都完全不记录任何日志**：不进内存缓冲、不写 logcat、不写文件、不镜像到 Download。
-     * 这是为省电/省 IO 提供的硬开关。
+     * false 的语义是「省电/省 IO 的硬开关」：不进内存缓冲、不写 logcat、不写文件。
+     *
+     * 2026-09-24 起有**一个例外**：WARN/ERROR 无视本开关（见 [shouldEmit]）。
+     * 本开关仍然完整地管住 INFO/DEBUG —— 那两级才是体积与功耗的来源。
      */
     @Volatile
     private var loggingEnabled = AppSettings.DEFAULT_LOG_ENABLED
@@ -198,12 +221,78 @@ object AppLogger {
      * 与 [loggingEnabled] 是「与」关系：总开关是前置条件，这一个只关 core 这一侧，
      * app 侧对应的是 `com.ufi_axis.util.DebugLog.appEnabled`（真源 `AppSettings.appLogEnabled`）。
      * 这样用户可以「只关后端日志、保留手机端日志」——core 常驻写盘，是体积增长的那一侧。
+     *
+     * **它与 [loggingEnabled] 语义不同，所以 2026-09-24 的「WARN/ERROR 无视开关」没有无视它**：
+     * 这一个是「按侧静音」的选择（用户明确表达「这台设备的 core 我不要日志」），
+     * 而总开关是「全局静音」且持久化默认就是关 —— 后者会让从未碰过开关的用户拿不到任何
+     * 排障线索，前者不会（用户至少主动关过一次，且手机侧日志还在）。见 [shouldEmit]。
      */
     @Volatile
     private var coreLogEnabled = AppSettings.DEFAULT_CORE_LOG_ENABLED
 
     /** core 实际是否记录日志：总开关与 core 子开关都开才算。 */
     private val active: Boolean get() = loggingEnabled && coreLogEnabled
+
+    /**
+     * 无视 [loggingEnabled] 的最低级别（见 [shouldEmit]）。
+     *
+     * 取 WARN 而不是 ERROR：排障判据级事件（「未登记写入项，忽略本次写入」「未提供频段全集掩码」
+     * 「未知 deviceProfileId，回落」「主命令未成功，改发备用命令」）全是 WARN，
+     * 计划书 §6 验收 2.11 的判据就是「必须有一行 WARN」。只放行 ERROR 等于这条纪律照样不成立。
+     */
+    private val MASTER_BYPASS_MIN_LEVEL = LogLevel.WARN
+
+    /**
+     * 这一条是否应当落地（logcat + 文件 + 内存缓冲三条路共用的总闸判定）。
+     *
+     * ## 为什么 WARN/ERROR 要无视日志总开关（计划书 §15 P1-32，2026-09-23 用户裁决方案 ①）
+     *
+     * 「不许静默失败」是全仓纪律：解不出字段、写入项没登记、profile 回落，都必须留下一行日志。
+     * 但 [loggingEnabled] 的**持久化默认值是 false**（[AppSettings.DEFAULT_LOG_ENABLED]，
+     * 2026-09-04 由 true 改），而 [log] 的第一步就是按总闸提前返回 ——
+     * 于是**在默认部署下，排障级 WARN 一条都不落地**，这条纪律等于不成立。
+     * 用户要排障就得：先开总开关 → 重启 core → 再复现一次；
+     * 而「掩码缺失」「写入项未登记」这类事件往往在复现之前就已经过去了。
+     *
+     * 所以 WARN/ERROR（[MASTER_BYPASS_MIN_LEVEL] 及以上）**不看 [loggingEnabled]**。
+     *
+     * ## 为什么刻意没把 INFO 一起放行
+     *
+     * 噪音与存储。INFO 里有 HTTP 访问日志（每个请求一行）、AT 指令日志（[at] 全部走 INFO）、
+     * WebSocket 连接生命周期等，落盘量直接与请求量挂钩 —— 2026-08-27 治理日志体积时
+     * 单日就写出过 25-34MB（极端情况 304MB）。总开关对用户的承诺「关掉就不长了」
+     * 必须继续成立，而 WARN/ERROR 的量级与 INFO 不可同日而语（见下面的成本说明）。
+     *
+     * ## 放行的是**全部三条路**，不是只放行 logcat
+     *
+     * 这台设备没有 root，用户拿不到 logcat；只放行 logcat 等于「排障线索仍然取不回来」，
+     * 验收判据（默认部署下排障 WARN 落地）不成立。文件那条路的体积已经被三层既有闸门兜住：
+     * - [repeatGate]：同一 (级别, tag, 完整消息) 每 [REPEAT_WINDOW_MS] 只放行 1 条
+     *   —— 周期任务里逐 tick 重复的 WARN（离线时的 `checkTrafficLimit failed` 一类）
+     *   最坏也就 1 条/分钟/文本；
+     * - [e] 的错误去重：相同 (message + 堆栈指纹) 每 [ERROR_DEDUP_WINDOW_MS]（5 分钟）1 条；
+     * - [MAX_LOG_FILE_BYTES]（单文件 5MB 轮转）+ [MAX_LOG_DIR_BYTES]（目录总量 40MB）
+     *   + [MAX_LOG_FILES]（7 天）—— 无论频率多高，占用都有硬上限。
+     *
+     * ## [coreLogEnabled] 不在放行范围内
+     *
+     * 见该字段的注释：它是「按侧静音」的**主动选择**且默认 true，不存在「用户没碰过开关
+     * 就拿不到线索」的问题。两个开关都无视会让「只关后端日志」这个功能失去意义。
+     *
+     * @param level 本条日志的级别
+     * @param loggingEnabled 日志总开关（`log_enabled`）
+     * @param coreLogEnabled core 侧子开关（`core_log_enabled`）
+     */
+    internal fun shouldEmit(level: LogLevel, loggingEnabled: Boolean, coreLogEnabled: Boolean): Boolean {
+        if (!coreLogEnabled) return false
+        if (loggingEnabled) return true
+        return level.ordinal >= MASTER_BYPASS_MIN_LEVEL.ordinal
+    }
+
+    /** [shouldEmit] 的当前状态重载：读两个 `@Volatile` 镜像，调用点只需给级别。 */
+    private fun shouldEmit(level: LogLevel): Boolean =
+        shouldEmit(level, loggingEnabled, coreLogEnabled)
+
 
     /**
      * 一次性恢复三层开关（唯一真源 [AppSettings]）。
@@ -235,10 +324,26 @@ object AppLogger {
         if (!active) stopWriting()
     }
 
+    /**
+     * 两个开关是否都开着。
+     *
+     * **不要用它来判断某一条日志会不会落地** —— 那是 [shouldEmit] 的事（WARN/ERROR 无视总开关）。
+     * 这里保留「与」语义是因为调用方问的是另一个问题：`GoformSessionLog` 用它决定
+     * 要不要开自己那份**会话诊断文件**（`log/core/goform/goform.log`，全量请求/响应，
+     * 与级别无关），那份的体积口径必须继续跟着总开关走。
+     */
     fun isLogEnabled(): Boolean = active
 
-    /** 关闭后清空缓冲并释放文件句柄（writerCache 清空后重新开启会自动重建）。 */
+    /**
+     * 关闭后清空缓冲并释放文件句柄（writerCache 清空后重新开启会自动重建）。
+     *
+     * 2026-09-24 起 WARN/ERROR 不再受总开关约束（[shouldEmit]），所以本方法的效果从
+     * 「此后一条不写」退化为「**把此刻已有的现场清掉**，随后 WARN/ERROR 会重新把缓冲与
+     * 文件句柄建起来」。刻意不改：拨动开关是用户的显式动作，而「从未碰过开关的默认部署」
+     * （P1-32 要修的那个场景）根本走不到这里。
+     */
     private fun stopWriting() {
+
         logBuffer.clear()
         repeatMap.clear()
         closeWriters()
@@ -251,9 +356,10 @@ object AppLogger {
      *
      * 2026-08-27：以前这里只管内存缓冲，DEBUG/INFO 照样落盘 —— 叠加每请求一行的 HTTP
      * 访问日志后，`app_*.log` 的增长直接与请求量挂钩，这是 core 日志目录变大的主因之一。
-     * WARN/ERROR 不受本开关影响（关掉日志也要留错误痕迹），但受 [setLogEnabled] /
-     * [setCoreLogEnabled] 约束。
+     * WARN/ERROR 不受本开关影响（关掉日志也要留错误痕迹）；2026-09-24 起也不再受
+     * [setLogEnabled] 约束（见 [shouldEmit]），只剩 [setCoreLogEnabled] 能把它们拦住。
      *
+
      * 2026-09-04：关闭时不再 `logBuffer.clear()`，改为**只丢弃低于 [BUFFER_MIN_LEVEL_QUIET]
      * 的行**。整个清空会连同错误链一起抹掉，于是「关掉详细日志」等于「/api/debug-logs 空」
      * 且「崩溃 dump 无现场」——正是要修的那个缺陷。
@@ -292,8 +398,10 @@ object AppLogger {
     fun i(tag: String, message: String) = log(LogLevel.INFO, LogType.APP, tag, message)
     fun w(tag: String, message: String) = log(LogLevel.WARN, LogType.APP, tag, message)
     fun e(tag: String, message: String, throwable: Throwable? = null) {
-        // 开关关闭时提前返回：否则仍会做堆栈字符串化 + 指纹计算（这是 e() 里最贵的一步）
-        if (!active) return
+        // 不该落地时提前返回：否则仍会做堆栈字符串化 + 指纹计算（这是 e() 里最贵的一步）。
+        // 判定与 [log] 同源（[shouldEmit]）—— ERROR 只在 core 子开关关掉时才被拦住。
+        if (!shouldEmit(LogLevel.ERROR)) return
+
 
         // 错误去重：相同 (message + 堆栈指纹) 在 5 分钟内只记 1 次（首次记，后续计数累计，窗口结束时追加"重复 N 次"汇总行）
         val fingerprint = errorFingerprint(message, throwable)
@@ -408,8 +516,10 @@ object AppLogger {
     }
 
     private fun log(level: LogLevel, type: LogType, tag: String, message: String) {
-        // 开关：关闭后直接返回，连脱敏正则和时间格式化都不做（这两项在高频日志下才是真开销）
-        if (!active) return
+        // 开关：不该落地就直接返回，连脱敏正则和时间格式化都不做（这两项在高频日志下才是真开销）。
+        // WARN/ERROR 无视日志总开关，见 [shouldEmit]。
+        if (!shouldEmit(level)) return
+
 
         // 重复行折叠：周期任务里逐 tick 重复的同一条消息只放行 1 条/窗口
         val gated = repeatGate(level, tag, message) ?: return
@@ -419,18 +529,45 @@ object AppLogger {
         val time = LocalTime.now().format(timeFormat)
         val entry = "$time [${level.name}] [$tag] $safeMessage"
 
-        // Logcat 输出
-        when (level) {
-            LogLevel.DEBUG -> Log.d("$TAG/$tag", safeMessage)
-            LogLevel.INFO -> Log.i("$TAG/$tag", safeMessage)
-            LogLevel.WARN -> Log.w("$TAG/$tag", safeMessage)
-            LogLevel.ERROR -> Log.e("$TAG/$tag", safeMessage)
+        // Logcat 输出。
+        //
+        // 2026-09-24（P1-32 的连带修）：这里必须**吞掉异常**。
+        // 在裸 JVM 单测里 `android.util.Log` 是抛 `RuntimeException("Method w ... not mocked")`
+        // 的桩，而本次改动之后 WARN/ERROR 不再被日志总开关拦在门外 ——
+        // 于是任何**不用 Robolectric** 的单测只要路过一条 WARN 就会从被测业务代码里炸出来
+        // （实测 `NotificationDispatcherTest` 6 个用例，栈顶是 `AppLogger.log` 而不是业务断言）。
+        // 真机上 `Log.*` 不抛，所以这个 catch 在生产里永不触发；
+        // 而即使真触发了，下面的文件与内存缓冲两条路照样收到这一行 —— 线索不会丢。
+        try {
+            when (level) {
+                LogLevel.DEBUG -> Log.d("$TAG/$tag", safeMessage)
+                LogLevel.INFO -> Log.i("$TAG/$tag", safeMessage)
+                LogLevel.WARN -> Log.w("$TAG/$tag", safeMessage)
+                LogLevel.ERROR -> Log.e("$TAG/$tag", safeMessage)
+            }
+        } catch (_: Throwable) {
+            // 故意不做任何事：日志设施不许把调用方搞崩，也不许在这里再调一次 Log。
         }
 
+
         // 文件持久化（复用 BufferedWriter）。
-        // DEBUG/INFO 只在 debug_mode 开启时落盘 —— 否则每个 HTTP 请求一行 DEBUG 访问日志
-        // 会让 app_*.log 的增长与请求量成正比（这是 core 日志目录变大的主因）。
-        if (level >= LogLevel.WARN || verboseEnabled) {
+        //
+        // 2026-10-12（用户报告"开了 core 日志开关但诊断日志一条都没落盘"）：
+        // INFO 落盘原本只认 [verboseEnabled]（= debug_mode），而 debug_mode 与
+        // `core_log_enabled` 是**两个独立开关**、默认都false。用户去设置里打开
+        // 「core 日志」，verboseEnabled 仍是 false —— 于是本该落盘的 INFO 一条没进文件，
+        // 而界面上没有任何提示说"你还需要开另一个开关"，表现就是诊断日志凭空消失。
+        //
+        // 现在 INFO 的落盘闸门是 `verboseEnabled || coreLogEnabled`：
+        // 「core 日志」这个开关的语义本来就是"我要 core 的运行日志"，INFO 属于运行日志，
+        // 不该再被一个藏在别处的 debug_mode 把住。DEBUG 仍然只认 debug_mode
+        // —— 每个 HTTP 请求一行 DEBUG，放开它才是日志目录变大的主因。
+        //
+        // [shouldEmit] 已经先判过 coreLogEnabled，所以这里不必再判 coreLogEnabled 为 false 的情况。
+        val persist = level >= LogLevel.WARN ||
+            (level == LogLevel.INFO && (verboseEnabled || coreLogEnabled)) ||
+            (level == LogLevel.DEBUG && verboseEnabled)
+        if (persist) {
             writeToFile(type, entry)
         }
 
@@ -489,42 +626,44 @@ object AppLogger {
             cleanOldLogs()
         }
 
-        try {
-            val dayDir = File(root, date)
-            if (!dayDir.exists() && !dayDir.mkdirs()) return
-            val currentFile = File(dayDir, "${type.prefix}.log")
-            val writer = writerCache.getOrPut(key) {
-                BufferedWriter(FileWriter(currentFile, true), 4096)
-            }
-            // 写入前检查：单文件超过 5MB 时 rotate 到 .log.1（覆盖最旧），新建当前文件继续。
-            // 2026-08-27：此前只有 error 类型有上限，app.log / at.log 可以无限长。
-            if (currentFile.exists() && currentFile.length() > MAX_LOG_FILE_BYTES) {
-                try {
-                    writer.flush()
-                    writer.close()
-                } catch (e: Exception) {
-                    Log.e("$TAG/Logger", "rotate close failed: ${e.message}")
+        synchronized(writerLock) {
+            try {
+                val dayDir = File(root, date)
+                if (!dayDir.exists() && !dayDir.mkdirs()) return
+                val currentFile = File(dayDir, "${type.prefix}.log")
+                val writer = writerCache.getOrPut(key) {
+                    BufferedWriter(FileWriter(currentFile, true), 4096)
                 }
+                // 写入前检查：单文件超过 5MB 时 rotate 到 .log.1（覆盖最旧），新建当前文件继续。
+                // 2026-08-27：此前只有 error 类型有上限，app.log / at.log 可以无限长。
+                if (currentFile.exists() && currentFile.length() > MAX_LOG_FILE_BYTES) {
+                    try {
+                        writer.flush()
+                        writer.close()
+                    } catch (e: Exception) {
+                        Log.e("$TAG/Logger", "rotate close failed: ${e.message}")
+                    }
+                    writerCache.remove(key)
+                    val rotated = File(dayDir, "${type.prefix}.log.1")
+                    if (rotated.exists()) rotated.delete()
+                    currentFile.renameTo(rotated)
+                    val fresh = BufferedWriter(FileWriter(currentFile, false), 4096)
+                    writerCache[key] = fresh
+                    fresh.write(entry)
+                    fresh.newLine()
+                    fresh.flush()
+                    // 轮转是目录变大的自然节点，顺手校一次总量预算
+                    enforceTotalBudget()
+                    return
+                }
+                writer.write(entry)
+                writer.newLine()
+                writer.flush()
+            } catch (e: Exception) {
+                // 写日志文件失败时移除缓存 writer，下次重新创建
                 writerCache.remove(key)
-                val rotated = File(dayDir, "${type.prefix}.log.1")
-                if (rotated.exists()) rotated.delete()
-                currentFile.renameTo(rotated)
-                val fresh = BufferedWriter(FileWriter(currentFile, false), 4096)
-                writerCache[key] = fresh
-                fresh.write(entry)
-                fresh.newLine()
-                fresh.flush()
-                // 轮转是目录变大的自然节点，顺手校一次总量预算
-                enforceTotalBudget()
-                return
+                Log.e("$TAG/Logger", "Failed to write log file: ${e.message}")
             }
-            writer.write(entry)
-            writer.newLine()
-            writer.flush()
-        } catch (e: Exception) {
-            // 写日志文件失败时移除缓存 writer，下次重新创建
-            writerCache.remove(key)
-            Log.e("$TAG/Logger", "Failed to write log file: ${e.message}")
         }
     }
 
@@ -533,14 +672,16 @@ object AppLogger {
      * 关闭所有文件写入器（进程退出前调用）
      */
     fun closeWriters() {
-        writerCache.values.forEach {
-            try {
-                it.close()
-            } catch (e: Exception) {
-                Log.e("$TAG/Logger", "close failed: ${e.message}")
+        synchronized(writerLock) {
+            writerCache.values.forEach {
+                try {
+                    it.close()
+                } catch (e: Exception) {
+                    Log.e("$TAG/Logger", "close failed: ${e.message}")
+                }
             }
+            writerCache.clear()
         }
-        writerCache.clear()
     }
 
     /**
@@ -582,15 +723,18 @@ object AppLogger {
         val files = allLogFiles().sortedBy { it.lastModified() }
         var total = files.sumOf { it.length() }
         if (total <= MAX_LOG_DIR_BYTES) return
-        for (f in files) {
-            if (total <= MAX_LOG_DIR_BYTES) break
-            val size = f.length()
-            // 正在写的 writer 必须先关掉，否则删除后 writer 仍指向已删除的 inode，日志静默丢失
-            val key = "${f.name.removeSuffix(".log.1").removeSuffix(".log")}_${f.parentFile?.name}"
-            writerCache.remove(key)?.let {
-                try { it.close() } catch (_: Exception) {}
+        // 关 writer + 删文件与落盘走同一把锁：否则可能在别的线程正写这个 writer 时把它关掉
+        synchronized(writerLock) {
+            for (f in files) {
+                if (total <= MAX_LOG_DIR_BYTES) break
+                val size = f.length()
+                // 正在写的 writer 必须先关掉，否则删除后 writer 仍指向已删除的 inode，日志静默丢失
+                val key = "${f.name.removeSuffix(".log.1").removeSuffix(".log")}_${f.parentFile?.name}"
+                writerCache.remove(key)?.let {
+                    try { it.close() } catch (_: Exception) {}
+                }
+                if (f.delete()) total -= size
             }
-            if (f.delete()) total -= size
         }
         Log.w("$TAG/Logger", "log dir over budget, trimmed to ${total / 1024}KB")
     }

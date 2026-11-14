@@ -1,0 +1,38 @@
+{
+  "network_type": "19",
+  "network_provider": "CHN-UNICOM",
+  "rssi": "4",
+  "signalbar": "4",
+  "ppp_status": "ppp_connected",
+  "network_information": {
+    "Nr_fcn": "633984",
+    "Nr_pci": "301",
+    "Nr_bands": "78",
+    "Nr_band_widths": "100000",
+    "Nr_cell_id": "1234567890123",
+    "Nr_signal_strength": "-72",
+    "Nr_snr": "17",
+    "nr_rsrp": "-85",
+    "nr_rsrq": "-11",
+    "nr_rssi": "-70",
+    "Lte_fcn": "1850",
+    "Lte_bands": "3",
+    "Lte_bands_widths": "20000",
+    "Lte_signal_strength": "-80",
+    "network_type": "19"
+  },
+  "lte_rsrp": "-95",
+  "Lte_snr": "9",
+  "lte_rsrq": "-13",
+  "lte_rssi": "-78",
+  "cell_id": "12345678",
+  "Lte_pci": "117",
+  "Lte_ca_status": "off",
+  "neighbor_cell_info": [
+    { "pci": "301", "earfcn": "633984", "rsrp": "-85", "rsrq": "-11", "sinr": "17" },
+    { "pci": "117", "earfcn": "1850", "rsrp": "-95", "rsrq": "-13", "sinr": "9" }
+  ],
+  "realtime_tx_thrpt": "1024",
+  "realtime_rx_thrpt": "8192",
+  "unknown_firmware_field": "should never reach the signal map"
+}

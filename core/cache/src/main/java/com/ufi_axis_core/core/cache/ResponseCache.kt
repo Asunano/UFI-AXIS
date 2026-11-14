@@ -232,12 +232,51 @@ class ResponseCache(
     }
 
     /**
+     * 2026-10-05 R1-7 修复：公开 per-key 防击穿锁包装。
+     * 供 getOrPut 结构不适合的场景（如「成功长 TTL / 失败短负缓存」的二分写入）复用
+     * 同一套 acquireLock/releaseLock/cleanupLocks，避免调用方手搓 per-key 锁导致
+     * 锁条目回收竞态。调用方必须在 block 正常返回或抛异常时由 finally 语义完成注销。
+     */
+    suspend fun <T> withKeyLock(key: String, block: suspend () -> T): T {
+        val keyLock = acquireLock(key)
+        return try {
+            keyLock.mutex.withLock { block() }
+        } finally {
+            // 与 [getOrPut] 相同顺序：先注销等待者再清理。
+            releaseLock(keyLock)
+            cleanupLocks()
+        }
+    }
+
+    /**
      * 按模式失效缓存条目，并异步触发通知回调。
      * - "*" 清空全部（包括泛型缓存）
      * - "wifi:*" 失效所有 wifi: 开头的 key
      * - "device:info" 精确失效
      */
     suspend fun invalidate(pattern: String) {
+        val removed = invalidateCount(pattern)
+        // 通知 WebSocket 客户端数据已变更
+        if (removed > 0 && onInvalidate != null) {
+            try {
+                // 2026-09-21 修复：这里原来是 `pattern.substringBefore(":")`，
+                // 于是 `invalidate("device:traffic-limit")` 上线变成 `changed:"device"`。
+                // 两端的消费者都是按**完整** key 匹配的（app 侧 `MainViewModel` 要求
+                // `startsWith("device:")`、`ToolsModule.smartRefresh` 要求
+                // `== "device:traffic-limit"`），截断后的 `"device"` 两个条件都不满足
+                // —— 结果整条 data_changed 链路端到端是死的（流量上限、LAN 设置、
+                // 设备设置、小区信息的精准刷新从来没生效过）。现在原样透传 pattern，
+                // 通配形式（`wifi:*`）也能被 `startsWith("wifi:")` 命中。
+                onInvalidate.invoke(pattern)
+            } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * P1（整合计划书 §3.2）：invalidate 的纯删除内核（返回删除条数，不广播）。
+     * 供 [invalidate]（单 pattern）与 [invalidateAll]（合并广播）共用同一套删除逻辑。
+     */
+    private fun invalidateCount(pattern: String): Int {
         val removed = synchronized(lock) {
             when (pattern) {
                 "*" -> {
@@ -271,12 +310,21 @@ class ResponseCache(
                 }
             }
         }
-        // 通知 WebSocket 客户端数据已变更
-        if (removed > 0 && onInvalidate != null) {
-            try {
-                val changedType = pattern.substringBefore(":")
-                onInvalidate.invoke(changedType)
-            } catch (_: Exception) {}
+        return removed
+    }
+
+    /**
+     * P1（整合计划书 §3.2）：批量失效 + **单次广播**。
+     * 一次写操作常清多个 key（制式切换 3 个起）。逐个 invalidate 会广播 N 条 data_changed，
+     * 客户端每条各跑一轮 smartRefresh → 一次切换 N 轮请求扇出，恰好复现缓存防压要防的问题。
+     * 合并为一条 "k1,k2,k3" 事件，客户端（P5 配套）split 后一轮刷完。
+     * 删到任一条目即广播一次（部分删除场景多刷一个未变 key 可接受，见裁决 R3）。
+     */
+    suspend fun invalidateAll(vararg patterns: String) {
+        var removedAny = false
+        for (p in patterns) if (invalidateCount(p) > 0) removedAny = true
+        if (removedAny && onInvalidate != null) {
+            try { onInvalidate.invoke(patterns.joinToString(",")) } catch (_: Exception) {}
         }
     }
 
@@ -299,6 +347,10 @@ class ResponseCache(
                 "count" to cache.size,
                 "max_entries" to maxEntries,
                 "any_cache_count" to anyCache.size,
+                // P1（整合计划书 §3.4 / D-5）：过期但尚未被读触发的惰性删除所滞留的条目数。
+                // 健康态应远小于 count；长期逼近 count 说明存在大量"写入后无人再读"的 key
+                // ——那是 TTL 设置问题，不是需要清扫的信号。纯观测，不驱动任何自动行为。
+                "expired_count" to cache.values.count { isExpired(it) },
                 "total_bytes_estimate" to cache.entries.sumOf { it.value.sizeBytes },
                 "stale" to stale.get(),
                 "entries" to entries.take(50)
@@ -370,9 +422,17 @@ class ResponseCache(
     /**
      * 精确失效泛型缓存条目
      */
-    fun invalidateAny(key: String) {
-        synchronized(lock) {
-            anyCache.remove(key)
+    /**
+     * P1（整合计划书 §3.1，修 G2）：原来只删 anyCache、不走 onInvalidate —— 清了缓存
+     * 但客户端收不到 data_changed，`hub:network-type-info` 这类泛型 key 的变更端到端
+     * 是哑的（制式切换后 /api/network/status 无通知，即「网络界面不刷新」直接原因）。
+     * 改为与 [invalidate] 同一条通知链路；删到了才广播，与 invalidate 的 removed>0
+     * 语义一致。改 suspend 以复用挂起回调（调用方全在协程内，编译器强制检查调用链）。
+     */
+    suspend fun invalidateAny(key: String) {
+        val removed = synchronized(lock) { anyCache.remove(key) != null }
+        if (removed && onInvalidate != null) {
+            try { onInvalidate.invoke(key) } catch (_: Exception) {}
         }
     }
 
@@ -416,9 +476,16 @@ class ResponseCache(
     private val globRegexCache = ConcurrentHashMap<String, Regex>()
     
     private fun globToRegex(pattern: String): Regex {
-        return globRegexCache.getOrPut(pattern) {
-            Regex("^${Regex.escape(pattern).replace("\\*", ".*")}$")
+        // 2026-10-05 P1 修复：原实现 Regex.escape(pattern).replace("\\*", ".*") 是死代码——
+        // escape 产出 \Qwifi:*\E，引号段内不存在 "\*" 子串形态，replace 永不命中，
+        // 通配失效（invalidate("wifi:*") 等全仓 10 处生产调用）实际全为空操作。
+        // 逐字符转义：* → .*，其余字符字面匹配。
+        val body = buildString {
+            for (ch in pattern) {
+                if (ch == '*') append(".*") else append(Regex.escape(ch.toString()))
+            }
         }
+        return globRegexCache.getOrPut(pattern) { Regex("^$body$") }
     }
 
     /**
@@ -502,6 +569,16 @@ object CacheTTL {
     /** 设备固件版本 — 几乎不变，30分钟（原10分钟） */
     const val DEVICE_VERSION = 1_800_000L
 
+    /**
+     * EPS 承载 QoS（`AT+CGEQOSRDP` 的 QCI / 上下行 AMBR）— 5 分钟。
+     *
+     * 2026-09-22 新增。比 [DEVICE_VERSION] 短得多是因为它**会变**：重新驻网、切换制式、
+     * 换 APN 都会重新协商。但也不该短 —— AT 通道是全局互斥的（`ATChannel` 有 500ms 最小间隔
+     * 与失败退避），查得勤会和网络栈重启、控制台透传那些 AT 用途抢锁。
+     * 5 分钟是"用户重进页面看到的是新鲜值，又不会把 AT 通道占住"的折中。
+     */
+    const val DEVICE_QOS = 300_000L
+
     // ════════════════════════════════════════════════════════
     // 【实时数据】— 变化快，短 TTL 维持不变
     // ════════════════════════════════════════════════════════
@@ -511,4 +588,40 @@ object CacheTTL {
 
     /** 基站信息 — 实时数据（移动中变化），保持20秒不变 */
     const val CELL_INFO = 20_000L
+
+    // ════════════════════════════════════════════════════════
+    // 【外部 API】— TTL 是唯一的配额保护手段，给足
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * 当前天气（Open-Meteo）— 15 分钟。
+     *
+     * 上游本身也是按 15 分钟粒度更新的，再短只是白烧免费额度；而 `/api` 下没有限流，
+     * 客户端轮询多快都拦不住，所以这条 TTL 就是唯一的上游保护。
+     */
+    const val WEATHER_NOW = 900_000L
+
+    /** 城市搜索（Open-Meteo Geocoding）— 1 天。同一个搜索词的经纬度不会变。 */
+    const val WEATHER_GEOCODE = 86_400_000L
+
+    /**
+     * 今日诗词（jinrishici v2）— 10 分钟。
+     *
+     * 上游对每个 token **预生成推荐数据并缓存**，约 10 分钟更新一次（响应里的 `cacheAt`）。
+     * 取同一档：更短只是重复拿到同一句、白打请求。
+     */
+    const val POETRY = 600_000L
+
+    // ════════════════════════════════════════════════════════
+    // 【本机媒体库】— 聚合类查询，TTL 要盖住"来回切视图"又不能盖住重扫
+    // ════════════════════════════════════════════════════════
+
+    /**
+     * 音频分组聚合（`GET /api/media/groups`）— 60 秒。
+     *
+     * 一次分组要整表扫一遍游标，而客户端在音乐页里会反复切专辑 / 歌手 / 文件夹三个视图，
+     * 所以必须缓存。上限压在 1 分钟：媒体库平时不怎么变，但 `POST /api/media/rescan`
+     * 之后用户就等着看到新收录的歌 —— TTL 再长会让人以为扫描没生效。
+     */
+    const val MEDIA_GROUPS = 60_000L
 }

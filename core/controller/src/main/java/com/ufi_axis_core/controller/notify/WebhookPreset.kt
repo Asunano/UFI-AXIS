@@ -6,7 +6,7 @@ package com.ufi_axis_core.controller.notify
  * ## 为什么不做成运行时分支
  *
  * 存储里存的是**最终的** url / method / headers / body（用户可以随便改），[WebhookConfig.preset]
- * 只用于 UI 回显"当初选的是哪一个"。如果按 preset 在投递路径上分支，七个预设就是七套
+ * 只用于 UI 回显"当初选的是哪一个"。如果按 preset 在投递路径上分支，每个预设就是一套
  * 各自的投递代码 —— 用户改了模板之后行为还会跟 UI 显示的不一致（他改的是模板，
  * 生效的是分支里写死的那份）。所以 [WebhookChannel.deliver] 里**没有** `when (preset)`。
  *
@@ -17,7 +17,7 @@ package com.ufi_axis_core.controller.notify
  *
  * ## 「用户要填的那一样东西」
  *
- * 七个预设里用户真正要填的只有一样（device key / topic / SENDKEY / token…），但它的位置
+ * 各预设里用户真正要填的只有一样（device key / topic / SENDKEY / token…），但它的位置
  * 不同：多数在 URL 里，PushPlus 在**请求体**里。[secretLabel] / [secretMarker] /
  * [secretTarget] 把这件事声明成机器可读的元数据，客户端据此只渲染**一个**输入框、
  * 其余字段收进「高级设置」。
@@ -163,6 +163,28 @@ enum class WebhookPreset(
         defaultHeaders = emptyMap(),
         defaultContentType = JSON_CONTENT_TYPE,
         defaultBody = """{"title":"{{title}}","desp":"{{message}}"}"""
+    ),
+
+    /**
+     * 钉钉群机器人（自定义机器人 Webhook）。
+     *
+     * 地址形如 `https://oapi.dingtalk.com/robot/send?access_token=xxx`（加签/关键词安全设置
+     * 由用户在钉钉侧配置；本预设只填 token，不碰加签 secret —— 加签要在 URL query 里额外
+     * 算 timestamp+sign，超出「填一个密钥」的预设职责，需要时用自定义档）。
+     *
+     * body 与企业微信同构：`msgtype:text` + `text.content`，标题与正文用 `\n` 拼一行。
+     */
+    DINGTALK(
+        displayName = "钉钉群机器人",
+        userFills = "机器人 Webhook 地址（含 access_token）",
+        secretLabel = "access_token",
+        secretMarker = "<access_token>",
+        secretTarget = SecretTarget.URL,
+        defaultUrl = "https://oapi.dingtalk.com/robot/send?access_token=<access_token>",
+        defaultMethod = "POST",
+        defaultHeaders = emptyMap(),
+        defaultContentType = JSON_CONTENT_TYPE,
+        defaultBody = """{"msgtype":"text","text":{"content":"{{title}}\n{{message}}"}}"""
     );
 
     companion object {

@@ -69,12 +69,17 @@ object DeviceFields {
         const val WIFI_SLEEP_IDLE_MINUTES = "sleep_sysIdleTimeToSleep"
 
         /**
-         * 网络模式（承载偏好）。值域是设备侧的 BearerPreference 字符串，
+         * 网络模式（承载偏好）的**写入侧**字段。值域是设备侧的 BearerPreference 字符串，
          * 双向映射见 [NetworkMode.toBearer] / [NetworkMode.fromBearer]。
+         *
+         * 回读时它可能为空或停留在未应用的值，**判断切换是否完成要读 [NET_SELECT]**。
          */
         const val BEARER_PREFERENCE = "BearerPreference"
 
-        /** 老固件的网络模式字段，[BEARER_PREFERENCE] 缺失时的回退。 */
+        /**
+         * 网络模式的**回读真源**（2026-09 真机：切换后变化的是它，形如 `WL_AND_5G` / `Only_5G`，
+         * 老固件回小写）。缺失时才回落 [BEARER_PREFERENCE]。
+         */
         const val NET_SELECT = "net_select"
 
         /** 连接模式。`"auto"` 或 `"manual"`；部分固件填 `"1"` / `"hand"` 表示手动。 */
@@ -219,6 +224,18 @@ object DeviceFields {
         val ALL = listOf(LTE_BAND_LOCK, NR_BAND_LOCK)
     }
 
+    /**
+     * 2026-10-05 R2-4 修复：POST /api/network/band 响应新增的半失败透传字段。
+     * 「LTE 成功、NR 失败」等部分失败时 success 仍为 true（栈已按混合状态重启），
+     * 客户端凭这两个布尔提示「部分频段未生效」。键名不带 goform 前缀，
+     * 但与 BandStatus 同域，TS 手抄镜像见 contract.ts `bandLockApply`。
+     */
+    object BandLockApply {
+        const val APPLIED_LTE = "lte_applied"
+        const val APPLIED_NR = "nr_applied"
+        const val PARTIAL = "partial"
+    }
+
     // ──────── GET /api/network/cell-info · /api/network/neighbor-cells ────────
 
     /**
@@ -346,7 +363,7 @@ object DeviceFields {
         /** 服务小区频段号，纯数字（`"78"` / `"3"`）。 */
         const val BAND = "band"
 
-        /** 频段显示名，由 core 拼好（`"n78"` / `"B3"`）。前端直接显示，不要自己拼前缀。 */
+        /** 频段显示名，由 core 拼好（`"N78"` / `"B3"`，前缀大写）。前端直接显示，不要自己拼前缀。 */
         const val BAND_LABEL = "band_label"
 
         /** 服务小区频点（NR-ARFCN 或 EARFCN）。 */

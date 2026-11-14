@@ -2,9 +2,10 @@ package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
-import java.io.File
+import com.ufi_axis_core.util.ThermalZones
 import io.ktor.server.application.call
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
@@ -26,11 +27,26 @@ class QoSRoutes(
             get("/status") {
                 val poolInfo = dynamicThreadPool.getThreadPoolInfo()
 
-                // 读取 CPU 温度（非 root，轻量级）
+                // ── CPU 温度：走 ThermalZones（2026-09-25 P3-4）──
+                // 这里原来内联 `File("/sys/class/thermal/thermal_zone0/temp")` 只读 zone0 ——
+                // 正是缺陷 C 要消灭的那个判据（zone0 在很多平台是电池/外壳，不是 CPU），
+                // 而 `ThermalZones` 自称全仓唯一的热区读法。
+                //
+                // ⚠ 对外契约**一点没动**：`cpu_temp` 仍是**毫摄氏度原始整数**、读失败仍是 `0`。
+                //   三处消费方按这个口径写死了 —— `DiagnosticsModels.cpuTempCelsius`（判 <=0 回 null）、
+                //   `web/.../PerformancePanel.vue`、API 文档那句「别直接当摄氏度显示」。
+                //   所以这里既**不**换成摄氏度、也**不**换成可空，读不到时保留 0 并打一条带
+                //   detail 的 warn（原来是完全静默）。
                 val cpuTemp = withContext(Dispatchers.IO) {
-                    try {
-                        File("/sys/class/thermal/thermal_zone0/temp").readText().trim().toIntOrNull() ?: 0
-                    } catch (_: Exception) { 0 }
+                    val reading = ThermalZones.readMax()
+                    val milliC = reading.maxMilliC
+                    if (milliC == null) {
+                        // detail 里只有结构性事实（路径/热区名/个数），可以被 repeatGate 正常折叠
+                        AppLogger.w("QoSRoutes", "QoS 状态里的 cpu_temp 读不到，按 0 下发：${reading.detail}")
+                        0
+                    } else {
+                        milliC.toInt()
+                    }
                 }
 
                 call.respond(toJsonElement(mapOf(

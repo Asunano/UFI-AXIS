@@ -32,7 +32,13 @@ import java.net.URL
 class UpdateRoutes(
     private val updateManager: UpdateManager
 ) {
-    /** 上传接口动态请求体上限（透传 UpdateManager：清单 apkSize×1.2+10MB 缓冲，未知回落 100MB） */
+    /**
+     * 上传接口动态请求体上限（透传 [UpdateManager.uploadLimitBytes]）。
+     *
+     * 当前口径：清单 apkSize × 1.5 + 20MB，下限 50MB，清单未知时回落 200MB。
+     * 具体数字与调整理由见那个方法的 KDoc —— **不要在这里重复写数字**，
+     * 2026-09-19 就是因为两处各写一份，这里的注释还停在早已改掉的 `×1.2+10MB / 100MB`。
+     */
     fun uploadLimitBytes(): Long = updateManager.uploadLimitBytes()
 
     private val UPDATE_DIR = "/sdcard/Download/UFI-AXIS/update"
@@ -56,6 +62,12 @@ class UpdateRoutes(
                 call.respond(toJsonElement(updateManager.statusToMap()))
             }
 
+            // 更新源决策快照（2026-09-22，只读、无入参）：mode / country / use_mirror / mirror_prefixes。
+            // app 的 APK 自更新不走 core 代理（core 挂了也得能更新自己），所以它从这里取决策后自己拼 URL。
+            get("/source") {
+                call.respond(toJsonElement(updateManager.updateSourceSnapshot()))
+            }
+
             // 兜底：前端推送 APK（multipart，field=file）——用法与 FileRoutes /upload 完全一致
             // P0-8：增加 50MB 大小限制 + APK magic 头（PK\x03\x04）校验，防上传接口滥用/非 APK 文件
             // P1 A3/E25：上传互斥（download/install 进行中返回 409）+ 写临时名 .part 完成后 rename 原子提交
@@ -70,6 +82,9 @@ class UpdateRoutes(
                 }
                 var savedPath: String? = null
                 var uploadError: String? = null
+                // 包名不匹配与「上传失败」要分开报：前者是用户选错了包，重试同一个包没有意义，
+                // 客户端需要据此提示"换一个包"而不是"稍后重试"
+                var packageRejected = false
                 try {
                     try {
                         val multipart = call.receiveMultipart()
@@ -81,6 +96,14 @@ class UpdateRoutes(
                                             File(UPDATE_DIR).mkdirs()
                                             val partFile = File(UPDATE_DIR, "ufi-core-uploaded.apk.part")
                                             val target = File(UPDATE_DIR, "ufi-core-uploaded.apk")
+                                            // 先清掉上一次遗留：失败态刻意不清理残留（保留供重试），
+                                            // 于是错包会一直占着这个固定文件名。每次上传开头先删，
+                                            // 保证"这次上传要么放上新包、要么这里什么都没有"，
+                                            // 不会出现"以为推上去了、其实装的是上次那个旧包"。
+                                            if (target.exists() && !target.delete()) {
+                                                AppLogger.w("UpdateRoutes", "旧上传包删除失败: ${target.absolutePath}")
+                                            }
+                                            if (partFile.exists()) partFile.delete()
                                             part.streamProvider().use { input ->
                                                 // APK magic 头校验：PK\x03\x04（ZIP 魔数）
                                                 val header = ByteArray(4)
@@ -104,6 +127,17 @@ class UpdateRoutes(
                                                         out.write(buf, 0, n)
                                                     }
                                                 }
+                                            }
+                                            // 包名校验必须在 rename **之前**：magic 头只能证明"是个 ZIP"，
+                                            // 证明不了"是 core 自己"。装错包的后果是 adb install -r 把**别的 app**
+                                            // 装上去，core 不会被替换、进程不死，状态机就卡在 INSTALLING，
+                                            // 此后所有上传恒 409（见 UpdateManager.selfHealStuckState）。
+                                            // 拦在这里，错包连落地成固定文件名的机会都没有，也就不存在占位。
+                                            val reject = updateManager.rejectReasonForApk(partFile)
+                                            if (reject != null) {
+                                                partFile.delete()
+                                                packageRejected = true
+                                                throw IllegalArgumentException(reject)
                                             }
                                             // 原子提交：.part → 最终文件名（并发上传只会写各自的 .part，rename 覆盖）
                                             if (target.exists()) target.delete()
@@ -134,7 +168,11 @@ class UpdateRoutes(
                 if (savedPath != null) {
                     call.respond(toJsonElement(mapOf("ok" to true, "apk_path" to savedPath)))
                 } else {
-                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, (uploadError ?: "未收到 APK 文件"))
+                    call.respondFail(
+                        HttpStatusCode.BadRequest,
+                        if (packageRejected) ErrorCode.INVALID_PACKAGE else ErrorCode.BAD_REQUEST,
+                        (uploadError ?: "未收到 APK 文件")
+                    )
                 }
             }
 
@@ -305,12 +343,23 @@ class UpdateRoutes(
     }
 }
 
-/** UpdateStatus → JSON map（供路由与前端展示；state 统一小写以匹配前端状态机约定） */
+/**
+ * UpdateStatus → JSON map（供路由与前端展示；state 统一小写以匹配前端状态机约定）
+ *
+ * `upload_limit_bytes`（2026-09-19 新增）：APK 上传上限是**动态值**
+ * （[UpdateManager.uploadLimitBytes] 按清单 apkSize 算），客户端无法硬编码。
+ *
+ * 不下发的后果是前端只能盲传。服务端的 413 虽然在 `onCall` 阶段就抛、并没有真的收下
+ * 整个包，但 HTTP 的现实是客户端在没有 `Expect: 100-continue` 协商时请求头发出后就无条件
+ * 开始推 body，而浏览器要等 body 发完才去处理响应 —— 于是进度条一路跑到 100% 才报错，
+ * 几十 MB 的上行带宽白烧。下发之后前端在**选文件时**就能挡住。
+ */
 fun UpdateManager.statusToMap(): Map<String, Any?> = mapOf(
     "state" to status.state.name.lowercase(),
     "progress" to status.progress,
     "message" to status.message,
     "current_version" to status.currentVersion,
     "latest_version" to status.latestVersion,
-    "apk_path" to status.apkPath
+    "apk_path" to status.apkPath,
+    "upload_limit_bytes" to uploadLimitBytes()
 )

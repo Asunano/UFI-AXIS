@@ -101,12 +101,6 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "META-INF/INDEX.LIST"
             excludes += "META-INF/io.netty.*"
-            // 这两个是 JavaMail 的 DataContentHandler 注册表，被排除后 javax.activation
-            // 查不到 text/html、multipart/* 的 handler，发信时抛 UnsupportedDataTypeException
-            // （IOException 子类），被 SMTPTransport 包成
-            // “MessagingException: IOException while sending message”。
-            // 排除保留（多依赖重复资源），改由 SmsForwardController.ensureMailcap() 在运行时
-            // 手动注册 MailcapCommandMap；两者必须成对存在，删任一边都会重现发信失败。
             excludes += "META-INF/mailcap"
             excludes += "META-INF/mimetypes.default"
             excludes += "META-INF/NOTICE.md"
@@ -157,8 +151,16 @@ dependencies {
     implementation(project(":core:common"))
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
+    // 2026-09-25：`WriteOutcome` 从 :core:goform 搬到 :core:device-spi 之后显式声明。
+    // 本模块的 `ActionExecutorImpl` 直接用它，装配层还直接用 DeviceRuntime / DevicePlugin /
+    // PlatformAdapter / DeviceTuning —— 全是直接依赖，不该靠 goform 的 api 传递。
+    implementation(project(":core:device-spi"))
     // 设备适配层：profile 选型在 ComponentFactory 里做（计划书 3.2）
     implementation(project(":core:device-schema"))
+    // 设备插件注册表。**装配层是唯一知道「有哪些插件」的地方**（计划书 3.3）：
+    // 中间控制层 DeviceRuntime 与上层一律只依赖 :core:device-spi（契约），
+    // 谁都不许 import 具体插件 —— 这条依赖只许出现在本模块。
+    implementation(project(":core:device-plugins"))
     implementation(project(":core:collector"))
     // ★ Phase 2
     implementation(project(":core:cache"))
@@ -168,6 +170,17 @@ dependencies {
     implementation(project(":core:controller"))
     implementation(project(":core:api"))
     implementation(project(":core:network"))
+
+    // ── DLNA MediaServer（2026-10-09）：jUPnP 纯 Java UPnP 栈 + Android 网络层 + slf4j 桥 ──
+    implementation(libs.jupnp.core)
+    implementation(libs.jupnp.android)
+    implementation(libs.jupnp.support)
+    implementation(libs.slf4j.android)
+    // jUPnP POM 把 Jetty 标 provided 不传递（POM 里根本没有），运行期 JettyServletContainer
+    // 初始化 NoClassDefFoundError —— 必须显式带上（版本=jUPnP 3.0.5 父 POM 的 jetty.version）。
+    implementation(libs.jetty.server)
+    implementation(libs.jetty.servlet)
+    implementation(libs.jetty.client)
 }
 
 // ── Web 产物与 assets 合并之间的显式依赖（2026-09-06，缺陷 4）──

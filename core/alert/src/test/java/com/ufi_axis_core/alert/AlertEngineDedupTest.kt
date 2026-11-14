@@ -216,11 +216,19 @@ class AlertEngineDedupTest {
         assertEquals(1, temps.first().count)
     }
 
+    // 2026-09-21：温度用例改为**从配置推导**测试值，不再写死 50 / 60。
+    // 上一版写死的是当时的默认阈值（45/55），阈值一改（现为 65/75）整批用例就红 ——
+    // 测的是「跃迁语义」而不是「阈值取值」，取值必须跟着 getConfig() 走。
+    // 回差（leveledWithHysteresis）也要照顾到：回落必须低于 `warning - band`。
+    private fun warnTemp() = engine.getConfig().temperatureWarning + 1.0
+    private fun critTemp() = engine.getConfig().temperatureCritical + 1.0
+    private fun normalTemp() = engine.getConfig().temperatureWarning - 20.0
+
     @Test
     fun `edge trigger - level transition normal to warning then critical produces 2 rows`() = runTest {
-        engine.checkTemperature(30.0) // normal
-        engine.checkTemperature(50.0) // warning 跃迁
-        engine.checkTemperature(60.0) // critical 跃迁
+        engine.checkTemperature(normalTemp()) // normal
+        engine.checkTemperature(warnTemp())  // warning 跃迁
+        engine.checkTemperature(critTemp())  // critical 跃迁
         val temps = dao.rows.filter { it.type == "temperature" }
         assertEquals(2, temps.size)
         assertTrue(temps.any { it.level == "warning" })
@@ -229,10 +237,50 @@ class AlertEngineDedupTest {
 
     @Test
     fun `recovery - type back to normal marks resolvedAt`() = runTest {
-        engine.checkTemperature(60.0) // critical 跃迁
-        engine.checkTemperature(30.0) // normal 恢复
+        engine.checkTemperature(critTemp())   // critical 跃迁
+        engine.checkTemperature(normalTemp()) // normal 恢复
         val crit = dao.rows.first { it.type == "temperature" && it.level == "critical" }
         assertNotNull("恢复后原 critical 行应标记 resolvedAt", crit.resolvedAt)
+    }
+
+    // 回差带宽来自构造参数，不是类内写死的常量（2026-09-25 / 计划书阶段 4 的 4.5）。
+    //
+    // 装配层从 `DeviceTuning.thermalJitterC` 取值递进来。**没有这条用例，接线被删掉也不会有
+    // 任何测试变红** —— F50 的 3f 与旧常量 3.0 相同，行为会悄悄退回写死值，而下一台设备
+    // 填的带宽从此被静默忽略。所以这里用「宽带宽 + 阴性对照」把读参数这件事钉住。
+    @Test
+    fun `温度回差带宽由构造参数决定`() = runTest {
+        val wideDao = FakeAlertDao()
+        val wide = AlertEngine(
+            wideDao, ws,
+            AppSettings(ApplicationProvider.getApplicationContext<Application>()),
+            temperatureHysteresisC = 20.0
+        )
+        wide.updateConfig(
+            wide.getConfig().copy(enabled = true, perType = ALERT_TYPES.associateWith { true })
+        )
+        val warning = wide.getConfig().temperatureWarning
+        // 先显式落到 normal：边沿状态会持久化到 SharedPreferences，不先压平就要依赖
+        // 「上一个用例留下了什么」，那是测试之间的隐式耦合。
+        wide.checkTemperature(warning - 30.0)
+        wide.checkTemperature(warning + 1.0)
+        assertEquals("warning", wideDao.rows.first { it.type == "temperature" }.level)
+        // 回落到 warning-5：带宽 20°C 时仍在回差区间内（要低于 warning-20 才算恢复）。
+        wide.checkTemperature(warning - 5.0)
+        assertNull(
+            "带宽 20°C 时 warning-5 仍在回差区间内，不该判成恢复",
+            wideDao.rows.first { it.type == "temperature" }.resolvedAt
+        )
+
+        // 阴性对照：同一串输入喂给默认带宽（3°C）的实例必须判成恢复。
+        // 两边都成立才说明读的是参数而不是常量 —— 只验一边的话，把参数忽略掉也能过。
+        engine.checkTemperature(warning - 30.0)
+        engine.checkTemperature(warning + 1.0)
+        engine.checkTemperature(warning - 5.0)
+        assertNotNull(
+            "默认带宽 3°C 时 warning-5 应判成恢复",
+            dao.rows.first { it.type == "temperature" }.resolvedAt
+        )
     }
 
     @Test
@@ -267,13 +315,13 @@ class AlertEngineDedupTest {
      * 断言改动说明（2026-08-26）：
      * 原用例读 `engine.lastBroadcast`（Map<String,Any?>）断言 `payload["aggregated"] == false`。
      * 主源码已把告警下发改道到公共组件 NotificationPushService.pushAlert()，
-     * aggregated 以字符串 "false"/"true" 放进 PushNotification.extra；
-     * `lastBroadcast` 字段虽仍存在，但 triggerAlert 已不再写它（恒为 null）。
+     * aggregated 以字符串 "false"/"true" 放进 PushNotification.extra。
      * 因此断言改为观测推送负载 —— 这是当前主源码真实的对外语义。
+     * （`lastBroadcast` 字段已于 2026-09-21 从主源码删除：它恒为 null，是第四个死钩子。）
      */
     @Test
     fun `push payload carries aggregated flag on new alert`() = runTest {
-        engine.checkTemperature(60.0) // 新行
+        engine.checkTemperature(critTemp()) // 新行
         assertEquals("新告警应推送 1 条", 1, push.pushed.size)
         val notification = push.pushed.first()
         assertEquals("temperature", notification.type)
@@ -289,7 +337,7 @@ class AlertEngineDedupTest {
     @Test
     fun `push payload carries aggregated true when existing row is bumped`() = runTest {
         dao.insert(AlertRecord(type = "temperature", level = "critical", message = "old", value = "", threshold = ""))
-        engine.checkTemperature(60.0) // normal→critical 跃迁，但已有未确认 critical 行 → 聚合
+        engine.checkTemperature(critTemp()) // normal→critical 跃迁，但已有未确认 critical 行 → 聚合
         assertEquals("聚合路径不应插入新行", 1, dao.rows.size)
         assertEquals(2, dao.rows.first().count)
         assertEquals("true", push.pushed.single().extra["aggregated"])

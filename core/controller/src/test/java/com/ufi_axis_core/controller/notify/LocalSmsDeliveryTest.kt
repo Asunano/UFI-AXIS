@@ -1,6 +1,7 @@
 package com.ufi_axis_core.controller.notify
 
-import com.ufi_axis_core.controller.goform.GoformSmsClient
+import com.ufi_axis_core.devicespi.adapter.SendOutcome
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
 import com.ufi_axis_core.notify.DeliveryOutcome
 import com.ufi_axis_core.notify.NotifyLevel
 import org.junit.Assert.assertEquals
@@ -29,8 +30,8 @@ class LocalSmsDeliveryTest {
         /** 单条预算，与被测常量同源（写死 70 会让改常量时这个测试仍然绿）。 */
         val BUDGET = LocalSmsDelivery.SINGLE_SMS_CHARS
 
-        fun outcome(verdict: GoformSmsClient.SendVerdict, detail: String = "d") =
-            GoformSmsClient.SendOutcome(verdict, detail)
+        fun outcome(verdict: SendVerdict, detail: String = "d") =
+            SendOutcome(verdict, detail)
     }
 
     // ══════════════════ 正文拼装与裁剪 ══════════════════
@@ -227,7 +228,7 @@ class LocalSmsDeliveryTest {
     fun `SENT 映射成 Sent`() {
         assertEquals(
             DeliveryOutcome.Sent,
-            LocalSmsDelivery.classify(outcome(GoformSmsClient.SendVerdict.SENT))
+            LocalSmsDelivery.classify(outcome(SendVerdict.SENT))
         )
     }
 
@@ -235,7 +236,7 @@ class LocalSmsDeliveryTest {
     @Test
     fun `FAILED 不可重试`() {
         val result = LocalSmsDelivery.classify(
-            outcome(GoformSmsClient.SendVerdict.FAILED, "信箱 tag=3")
+            outcome(SendVerdict.FAILED, "信箱 tag=3")
         )
         val failed = result as DeliveryOutcome.Failed
 
@@ -252,7 +253,7 @@ class LocalSmsDeliveryTest {
      */
     @Test
     fun `PENDING 既不可重试也不算送达`() {
-        val result = LocalSmsDelivery.classify(outcome(GoformSmsClient.SendVerdict.PENDING))
+        val result = LocalSmsDelivery.classify(outcome(SendVerdict.PENDING))
 
         assertTrue(result is DeliveryOutcome.Failed)
         assertFalse((result as DeliveryOutcome.Failed).retryable)
@@ -267,7 +268,7 @@ class LocalSmsDeliveryTest {
     @Test
     fun `PENDING 文案写明可能已发出`() {
         val failed = LocalSmsDelivery.classify(
-            outcome(GoformSmsClient.SendVerdict.PENDING, "3.6s 内未看到最终状态")
+            outcome(SendVerdict.PENDING, "3.6s 内未看到最终状态")
         ) as DeliveryOutcome.Failed
 
         assertTrue("必须说明设备没回报最终状态", failed.error.contains("未回报最终状态"))
@@ -278,7 +279,7 @@ class LocalSmsDeliveryTest {
     /** 设备**明确回了拒收**：它说了"没收下"，重试不会重复发 → 唯一可重试的一档。 */
     @Test
     fun `REJECTED 可重试`() {
-        val result = LocalSmsDelivery.classify(outcome(GoformSmsClient.SendVerdict.REJECTED))
+        val result = LocalSmsDelivery.classify(outcome(SendVerdict.REJECTED))
 
         assertTrue((result as DeliveryOutcome.Failed).retryable)
     }
@@ -292,7 +293,7 @@ class LocalSmsDeliveryTest {
     @Test
     fun `NO_RESPONSE 不可重试且文案写明无法确认`() {
         val failed = LocalSmsDelivery.classify(
-            outcome(GoformSmsClient.SendVerdict.NO_RESPONSE, "resp=null")
+            outcome(SendVerdict.NO_RESPONSE, "resp=null")
         ) as DeliveryOutcome.Failed
 
         assertFalse("拿不到设备表态时重试会重复计费", failed.retryable)
@@ -308,8 +309,8 @@ class LocalSmsDeliveryTest {
      */
     @Test
     fun `明确拒收与拿不到表态在可重试性与配额上正好相反`() {
-        val rejected = outcome(GoformSmsClient.SendVerdict.REJECTED)
-        val noResponse = outcome(GoformSmsClient.SendVerdict.NO_RESPONSE)
+        val rejected = outcome(SendVerdict.REJECTED)
+        val noResponse = outcome(SendVerdict.NO_RESPONSE)
 
         assertTrue(
             "设备说了没收下 → 重试安全",
@@ -334,7 +335,7 @@ class LocalSmsDeliveryTest {
      */
     @Test
     fun `只有 REJECTED 不计入配额，且它正是唯一可重试的一档`() {
-        for (verdict in GoformSmsClient.SendVerdict.entries) {
+        for (verdict in SendVerdict.entries) {
             val o = outcome(verdict)
             val counted = LocalSmsDelivery.countsTowardQuota(o)
             val retryable = (LocalSmsDelivery.classify(o) as? DeliveryOutcome.Failed)?.retryable == true
@@ -344,11 +345,11 @@ class LocalSmsDeliveryTest {
                 counted, !retryable
             )
         }
-        assertFalse(LocalSmsDelivery.countsTowardQuota(outcome(GoformSmsClient.SendVerdict.REJECTED)))
-        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(GoformSmsClient.SendVerdict.SENT)))
-        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(GoformSmsClient.SendVerdict.FAILED)))
-        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(GoformSmsClient.SendVerdict.PENDING)))
-        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(GoformSmsClient.SendVerdict.NO_RESPONSE)))
+        assertFalse(LocalSmsDelivery.countsTowardQuota(outcome(SendVerdict.REJECTED)))
+        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(SendVerdict.SENT)))
+        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(SendVerdict.FAILED)))
+        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(SendVerdict.PENDING)))
+        assertTrue(LocalSmsDelivery.countsTowardQuota(outcome(SendVerdict.NO_RESPONSE)))
     }
 
     // ══════════════════ 配置校验 ══════════════════

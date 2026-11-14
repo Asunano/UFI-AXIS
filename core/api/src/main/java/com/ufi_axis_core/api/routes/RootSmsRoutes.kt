@@ -1,6 +1,8 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.requireCapability
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.controller.sms.SmsController
 import com.ufi_axis_core.controller.sms.SmsFilter
@@ -22,7 +24,18 @@ class RootSmsRoutes(
      * 挂在 `/api/sms` 下而不是新开一个 `/api/sms-filter`：规则和记录都是短信功能的一部分，
      * 而 `/api/sms` 的 owner 本来就是这个类 —— 拆出去只会让「短信相关端点在哪」这个问题多一个答案。
      */
-    private val ruleStore: SmsRuleStore? = null
+    private val ruleStore: SmsRuleStore? = null,
+    /**
+     * 选中插件声明的能力集（阶段 3 的 3.3）。只用于 `/sms/send` 的门禁。
+     *
+     * **刻意没有默认值**：给它一个 `emptySet()` 缺省，等于让「装配层忘了接线」表现成
+     * 「这台设备不支持发短信」—— 501 是不可恢复语义，前端会直接把发送按钮灰掉，
+     * 而真正的原因是接线漏了。所以宁可编译不过。
+     *
+     * 本类没有 `RouteContext`（它只要 SmsController + 规则库），所以直接持有这个 Set，
+     * 而不是为了一个门禁把整个 `DataHub` 递进来。
+     */
+    private val deviceCapabilities: Set<Capability>
 ) {
     fun register(route: Route) {
         route.route("/sms") {
@@ -84,11 +97,35 @@ class RootSmsRoutes(
             }
 
             post("/send") {
+                // 能力门禁（3.3）：缺 sms → 501 NOT_SUPPORTED。
+                // 判据是 profile.smsSpec()（短信不走 SettingKey，见计划书 §11.2）。
+                //
+                // ⚠ 这是「用户主动发短信」的唯一入口，但**不是**全仓唯一一条往外发短信的出口
+                // （2026-09-25 P3-6 更正，原注释那句话是假的）。第二条出口是通知渠道
+                // `LocalSmsChannel`：告警 / 下载 / 隧道 / 流量自动关网的事件会让设备自己发一条短信，
+                // 它同样调 `SmsControl.sendSms`。那条出口自己在 `isConfigured()` 里判
+                // `Capability.SMS`，判据与本行同源（装配层递的都是 `deviceHub.capabilities`）——
+                // 加新的短信出口时这两处都要想到。
+                // 信箱的读 / 删 / 标已读不在此域内。
+                deviceCapabilities.requireCapability(Capability.SMS)
                 val body = call.receiveJsonObject()
-                val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""
-                val message = body["message"]?.jsonPrimitive?.contentOrNull ?: ""
+                // R4-11 修复：改用严格 strField，数字/布尔入参回 400 而非静默转字符串。
+                val phone = body.strField("phone") ?: ""
+                val message = body.strField("message") ?: ""
                 if (phone.isEmpty() || message.isEmpty()) {
                     call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "phone and message required")
+                    return@post
+                }
+                // 2026-10-05 R4-7 修复：号码格式与正文长度上限。此前 " "、"abc"、2KB 串都直接
+                // 下发 Number 字段；超长正文 UCS2 编码后可能超设备单命令缓冲（spec 只有单条路径）。
+                if (!Regex("^\\+?[0-9]{3,20}$").matches(phone.trim())) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "phone 必须是 3..20 位数字（可带 + 前缀）")
+                    return@post
+                }
+                if (message.length > 1000) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST,
+                        "message 过长（${message.length} 字符，上限 1000；长文请分段）")
                     return@post
                 }
                 val result = smsController.send(phone, message)
@@ -110,6 +147,30 @@ class RootSmsRoutes(
                 }
                 val success = smsController.delete(id)
                 call.respond(toJsonElement(mapOf("success" to success, "id" to id)))
+            }
+
+            // 按号码删除整段会话（2026-09-21）
+            post("/delete-conversation") {
+                val body = call.receiveJsonObject()
+                val phone = body["phone"]?.jsonPrimitive?.contentOrNull ?: ""
+                if (phone.isBlank()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "phone required")
+                    return@post
+                }
+                val deleted = smsController.deleteConversation(phone)
+                call.respond(toJsonElement(mapOf("success" to (deleted >= 0), "phone" to phone, "deleted" to deleted)))
+            }
+
+            // 批量删除多条短信（2026-09-21）
+            post("/delete-batch") {
+                val body = call.receiveJsonObject()
+                val ids = body["ids"]?.jsonArray?.mapNotNull { it.jsonPrimitive.longOrNull } ?: emptyList()
+                if (ids.isEmpty()) {
+                    call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, "ids required (array of numbers)")
+                    return@post
+                }
+                val deleted = smsController.deleteBatch(ids)
+                call.respond(toJsonElement(mapOf("success" to (deleted > 0), "deleted" to deleted, "requested" to ids.size)))
             }
 
             post("/read") {

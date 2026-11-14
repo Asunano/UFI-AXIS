@@ -179,4 +179,18 @@ class DeviceAuthTest {
         assertTrue(cache.accept("fresh", t0 + 5_000))
         assertTrue("过期项应被清掉", cache.size() <= 4)
     }
+
+    @Test
+    fun `nonce cache overflow keeps unexpired entries instead of clearing them`() {
+        // 2026-10-05 回归锁：旧实现超限时 seen.clear()，把未过期 nonce 一起抹掉，
+        // 攻击者灌满缓存即可重放任意已用 nonce。现在只按 ttl 淘汰。
+        val cache = DeviceAuth.NonceCache(ttlMs = 60_000, maxEntries = 4)
+        val t0 = 1_000_000L
+        assertTrue(cache.accept("used-once", t0))
+        // 灌满缓存触发超限清理（"used-once" 远未过期）
+        repeat(6) { assertTrue(cache.accept("flood-$it", t0 + 1)) }
+        // 必须传 t0 系列时钟：默认参数是真实系统时间，会把 t0 当成"早已过期"清掉，
+        // 那样测的就不是"超限清理"而是"过期清理"了（这正是本条用例第一版踩的坑）。
+        assertFalse("未过期 nonce 即使超限也绝不能被清掉，否则可重放", cache.accept("used-once", t0 + 2))
+    }
 }

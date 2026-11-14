@@ -116,6 +116,11 @@ class AuthMiddleware(
      *
      * 配对端点本就挂在 root 而非 /api，这里再放行一次是纵深防御：将来若被移进 /api，
      * 也不会因为"配对时还没有 token"而变成死锁。
+     *
+     * **不要**把凭票流式播放（`/media/stream`，见 `FileRoutes.registerPublic`）加进来。
+     * 它刻意挂在 `/api` 之外的顶层 routing 上，本拦截器压根不会经过它；
+     * 一旦这里出现「带 ticket 参数就放行」之类的例外，这道唯一鉴权闸门就有了口子 ——
+     * 之后每加一个 `/api` 端点都得先确认会不会被那条例外命中。
      */
     private fun isPublic(uri: String): Boolean =
         uri == "/health" || uri.startsWith("/ws/") ||

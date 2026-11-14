@@ -76,11 +76,35 @@ class WebSocketManager(
     private val connections = ConcurrentHashMap<WebSocketSession, MutableSet<String>>()
     private val maxConnections = com.ufi_axis_core.contract.WsChannel.MAX_CONNECTIONS  // 支持 App + Web 多客户端同时连接（契约常量，双端共用）
 
-    // 广播序列化缓存：同类型 500ms 内复用预序列化的 JSON 文本
-    private val broadcastCache = ConcurrentHashMap<String, Pair<String, Long>>()
+    // 2026-10-05 R1-5 修复：连接准入信号量（与 maxConnections 同值）。
+    // finally 释放，与 tryAcquire 严格配对，见 handleConnection。
+    private val connectionSlots = java.util.concurrent.Semaphore(maxConnections)
+
+    // 广播序列化缓存：同类型 + **同 payload** 在 500ms 内复用预序列化的 JSON 文本。
+    // payload 必须参与命中判断 —— 见 [BroadcastCacheEntry]。
+    private val broadcastCache = ConcurrentHashMap<String, BroadcastCacheEntry>()
+
+    /**
+     * 一条已序列化好的广播帧。
+     *
+     * 2026-09-21 修复：这里原来是 `Pair<String, Long>`（只有文本 + 时间戳），命中条件仅看
+     * type 和 TTL。对 cpu/memory 这种"一个频道只有一种含义"的周期推送没问题，但对
+     * `data_changed` 是**实打实的丢消息**：`{"changed":"task:list"}` 之后 500ms 内再推
+     * `{"changed":"device:traffic-limit"}`，第二帧会原样复用第一帧的文本，流量上限的
+     * 刷新信号就凭空消失了。现在把 payload 一起存下来，只有 payload 相等才复用。
+     * 缓存仍以 type 为 key，所以条目数被频道数限死，不会因 payload 变化而无界增长。
+     */
+    private data class BroadcastCacheEntry(
+        val text: String,
+        val timestamp: Long,
+        val data: Map<String, Any?>
+    )
 
     // 按订阅类型分组的连接索引，避免广播时遍历所有连接检查订阅类型
     private val subscriptions = ConcurrentHashMap<String, MutableSet<WebSocketSession>>()
+
+    // 2026-10-05 R1-13 修复：订阅替换（摘除+重挂）与广播读侧快照的串行化锁
+    private val subscribeLock = Any()
 
     private companion object {
         private const val BROADCAST_CACHE_TTL_MS = 500L
@@ -115,15 +139,19 @@ class WebSocketManager(
         }
 
         val subscribedTypes = mutableSetOf<String>()
+        // 2026-10-05 R1-5 修复：准入裁决前置为原子 tryAcquire。
+        // 原实现「先注册再检查 size 再回滚」三步非原子：并发握手可同时越过上限检查，
+        // 且拒绝路径的 remove 与 finally 的 isEmpty 判定竞争，可把 stale 误置 true
+        // （前端显示「数据可能过期」）。信号量把裁决收成单一原子操作，注册路径必然在配额内。
+        if (!connectionSlots.tryAcquire()) {
+            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) exceeded")
+            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
+            return
+        }
         val existing = connections.putIfAbsent(session, subscribedTypes)
         if (existing != null) {
             AppLogger.w(tag, "WebSocket session already registered, skipping")
-            return
-        }
-        if (connections.size > maxConnections) {
-            AppLogger.w(tag, "WebSocket connection rejected: max connections ($maxConnections) exceeded")
-            connections.remove(session)
-            session.close(CloseReason(CloseReason.Codes.TRY_AGAIN_LATER, "Too many connections"))
+            connectionSlots.release()
             return
         }
 
@@ -166,6 +194,8 @@ class WebSocketManager(
             AppLogger.e(tag, "WebSocket error", e)
         } finally {
             connections.remove(session)
+            // 2026-10-05 R1-5 修复：释放准入配额，与 tryAcquire 配对
+            connectionSlots.release()
             // 从订阅索引中移除该 session 的所有订阅
             subscriptions.values.forEach { it.remove(session) }
             // 全部客户端断开 → 手机端缓存视为可能过期（F27）
@@ -191,16 +221,20 @@ class WebSocketManager(
 
             // 处理订阅请求
             jsonObject["subscribe"]?.jsonArray?.let { types ->
-                // 从订阅索引中移除旧的订阅
-                subscribedTypes.forEach { subscriptions[it]?.remove(session) }
-                subscribedTypes.clear()
-                types.forEach {
-                    val type = it.jsonPrimitive.content
-                    subscribedTypes.add(type)
-                    // computeIfAbsent 而非 getOrPut：后者是 get-then-put 两步，不是原子操作。
-                    // 两个客户端并发订阅同一 type 时会各自建一个 Set，其中一个被覆盖，
-                    // 那个客户端从此静默收不到该 type 的任何广播。
-                    subscriptions.computeIfAbsent(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                // 2026-10-05 R1-13 修复：摘除+重挂与广播读侧快照共用 subscribeLock 串行化，
+                // 消除「已摘除、未重挂」窗口内广播漏帧（尤其 data_changed 失效通知）。
+                synchronized(subscribeLock) {
+                    // 从订阅索引中移除旧的订阅
+                    subscribedTypes.forEach { subscriptions[it]?.remove(session) }
+                    subscribedTypes.clear()
+                    types.forEach {
+                        val type = it.jsonPrimitive.content
+                        subscribedTypes.add(type)
+                        // computeIfAbsent 而非 getOrPut：后者是 get-then-put 两步，不是原子操作。
+                        // 两个客户端并发订阅同一 type 时会各自建一个 Set，其中一个被覆盖，
+                        // 那个客户端从此静默收不到该 type 的任何广播。
+                        subscriptions.computeIfAbsent(type) { ConcurrentHashMap.newKeySet() }.add(session)
+                    }
                 }
                 AppLogger.i(tag, "Client subscribed to: $subscribedTypes")
             }
@@ -257,14 +291,16 @@ class WebSocketManager(
      */
     suspend fun broadcast(type: String, data: Map<String, Any?>) {
         // 死连接清理由 Ktor 协议层 ping/pong 统一处理，无需每次广播遍历检查
-        val subscribers = subscriptions[type] ?: return
+        // 2026-10-05 R1-13 修复：订阅者快照在 subscribeLock 内 copy 出来，锁外发送 ——
+        // 避免 re-subscribe 的「已摘除、未重挂」窗口漏帧；锁内只做 toList，无 IO。
+        val subscribers = synchronized(subscribeLock) { subscriptions[type]?.toList() } ?: return
         if (subscribers.isEmpty()) return
 
         val now = System.currentTimeMillis()
 
-        // 100ms 内同类型广播复用上次序列化结果
-        val text = broadcastCache[type]?.let { (cachedText, ts) ->
-            if (now - ts < BROADCAST_CACHE_TTL_MS) cachedText else null
+        // 同类型 + 同 payload 且在 TTL 内 → 复用上次序列化结果
+        val text = broadcastCache[type]?.let { cached ->
+            if (now - cached.timestamp < BROADCAST_CACHE_TTL_MS && cached.data == data) cached.text else null
         } ?: run {
             val message = buildJsonObject {
                 put("type", JsonPrimitive(type))
@@ -277,7 +313,7 @@ class WebSocketManager(
                 put("timestamp", JsonPrimitive(now))
             }
             json.encodeToString(JsonElement.serializer(), message).also {
-                broadcastCache[type] = Pair(it, now)
+                broadcastCache[type] = BroadcastCacheEntry(it, now, data)
             }
         }
 

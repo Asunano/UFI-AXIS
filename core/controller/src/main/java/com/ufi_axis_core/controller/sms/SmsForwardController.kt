@@ -403,6 +403,24 @@ class SmsForwardController(
         get() = prefs.getLong(KEY_LAST_FORWARDED_SMS_ID, -1L)
         set(value) { prefs.edit().putLong(KEY_LAST_FORWARDED_SMS_ID, value).apply() }
 
+    /**
+     * 2026-10-05 R1-14 修复：水位推进的原子原语。
+     * [lastForwardedSmsId] 是跨协程共享的 check-then-act 状态（读水位→过滤→投递→写水位），
+     * prefs get/set 各自原子但序列不原子：两条转发路径并发时可能重发/漏发。
+     * [advanceWaterMarkIfBeyond] 把「比较 + 推进」收成 synchronized 单一原子操作，
+     * 单调只增语义；调用方投递循环内不再直接 set（走本方法推进）。
+     */
+    private val waterMarkLock = Any()
+
+    /** 仅当 [newId] 大于当前水位时推进，返回推进后的水位值。 */
+    fun advanceWaterMarkIfBeyond(newId: Long): Long = synchronized(waterMarkLock) {
+        val cur = prefs.getLong(KEY_LAST_FORWARDED_SMS_ID, -1L)
+        if (newId > cur) {
+            prefs.edit().putLong(KEY_LAST_FORWARDED_SMS_ID, newId).apply()
+            newId
+        } else cur
+    }
+
     fun loadStats(): MailStats = MailStats(
         success = prefs.getInt(KEY_STAT_SUCCESS, 0),
         failed = prefs.getInt(KEY_STAT_FAILED, 0),
@@ -738,6 +756,39 @@ class SmsForwardController(
         return Triple(dao.countAll(channel), dao.countFailed(channel), dao.countSkipped(channel))
     }
 
+    /**
+     * 三渠道共用的投递统计（渠道配置页 Hero / 发送统计卡）。
+     *
+     * 口径与 [listMailHistory] 的 `mail_send_records` 一致，**含 skipped**——
+     * 与邮件 `/diagnose` 里那套「只计发起过 SMTP 的 success/failed」不同：
+     * 配置页要回答「一共记了多少条、多少失败、多少被闸门拦下」。
+     *
+     * @param channel 必填语义由路由保证；null = 全表（一般不给用户看）。
+     */
+    suspend fun deliveryHistoryStats(channel: String?): DeliveryHistoryStats {
+        val dao = mailHistoryDao ?: return DeliveryHistoryStats()
+        val total = dao.countAll(channel)
+        val failed = dao.countFailed(channel)
+        val skipped = dao.countSkipped(channel)
+        val sent = dao.countSent(channel)
+        val lastSentAt = dao.lastSentAt(channel) ?: 0L
+        return DeliveryHistoryStats(
+            total = total,
+            sent = sent,
+            failed = failed,
+            skipped = skipped,
+            lastSentAt = lastSentAt
+        )
+    }
+
+    data class DeliveryHistoryStats(
+        val total: Int = 0,
+        val sent: Int = 0,
+        val failed: Int = 0,
+        val skipped: Int = 0,
+        val lastSentAt: Long = 0L
+    )
+
 
     /**
      * 清空投递记录。
@@ -748,6 +799,17 @@ class SmsForwardController(
     suspend fun clearMailHistory(channel: String? = null) {
         val dao = mailHistoryDao ?: return
         if (channel == null) dao.deleteAll() else dao.deleteByChannel(channel)
+    }
+
+    /**
+     * 按 id 删单条投递记录。
+     *
+     * @return 受影响行数（0 = 目标已不存在）。调用方仍应回 success，避免客户端把「本来就没有」
+     *   当成故障重试。
+     */
+    suspend fun deleteMailHistoryById(id: Long): Int {
+        if (id <= 0L) return 0
+        return mailHistoryDao?.deleteById(id) ?: 0
     }
 
 

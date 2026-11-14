@@ -4,6 +4,7 @@ import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.contract.ConfigLimits
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.lib_api.BuildConfig
+import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.GoformQoS
 import com.ufi_axis_core.util.ShellQoS
@@ -135,8 +136,29 @@ class ConfigRoutes(
                 intField("port", ConfigLimits.PORT) { settings.port = it }
                 intField("goform_port", ConfigLimits.GOFORM_PORT) { settings.goformPort = it }
 
-                textField("goform_ip") { settings.goformIp = it }
-                textField("update_url") { settings.updateUrl = it }
+                // 2026-10-05 R4-13 修复：goform_ip / update_url 格式校验。此前走宽松 textField
+                // 任意串落盘：非法 goform_ip 令 goform 全链路 503；update_url 是整个 FOTA/组件/Web
+                // 更新链的根 URL，无 scheme 白名单等于供应链面敞开。校验规则与 PairingManager
+                // 的 GOFORM_HOST_PATTERN（长度 ≤253）对齐，复用现成判据。
+                fun hostField(field: String, apply: (String) -> Unit) {
+                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
+                    val GOFORM_HOST_PATTERN = Regex("^[a-zA-Z0-9]([a-zA-Z0-9.\\-]*[a-zA-Z0-9])?$")
+                    when {
+                        v.isBlank() -> reject(field, ErrorCode.BLANK_VALUE)
+                        v.length > 253 || !GOFORM_HOST_PATTERN.matches(v) -> reject(field, ErrorCode.WRONG_TYPE)
+                        else -> { apply(v); updated.add(field) }
+                    }
+                }
+                fun urlField(field: String, apply: (String) -> Unit) {
+                    val v = (body[field] as? JsonPrimitive)?.contentOrNull ?: return
+                    if (v.isBlank() || (!v.startsWith("http://") && !v.startsWith("https://"))) {
+                        reject(field, ErrorCode.WRONG_TYPE)
+                    } else {
+                        apply(v); updated.add(field)
+                    }
+                }
+                hostField("goform_ip") { settings.goformIp = it }
+                urlField("update_url") { settings.updateUrl = it }
 
                 boolField("auto_start_on_boot") { settings.autoStartOnBoot = it }
                 // 日志三层开关：总闸 → 两侧子开关 → 详细级别
@@ -161,6 +183,27 @@ class ConfigRoutes(
                 // 裸 goform 命令通道开关（默认关；关闭时 /api/device/goform/query|set 回 403）
                 // set 会绕过 profile 的 WriteSpec 值域校验，返回值也不脱敏，只在排障时临时打开
                 boolField("goform_command_enabled") { settings.goformCommandEnabled = it }
+                // 真 PTY 终端开关（ttyd 反代，默认关；关闭时 /api/terminal/pty-ticket 403）。
+                // 与 goform_command_enabled 同档位：打开等于把设备 shell 交给持 token 的客户端。
+                boolField("ttyd_enabled") { settings.ttydEnabled = it }
+                // 字段归一化总开关（决策 D7 的排障回退开关，默认开）。2026-09-22 补上写入口：
+                // 之前只有 KEY + 属性 + BACKUP_FIELDS，PUT 没登记、toMap() 也没登记，
+                // 结果只有「导入备份」改得动 —— web/app 做不出真开关。
+                //
+                // **与上面两个开关的关键差异：这一项不热生效。**
+                // goform_dump_enabled / goform_command_enabled 是每次请求现读 prefs
+                // （DeviceRoutes.kt:72 / :117），PUT 完下一个请求就生效；
+                // 而 fieldNormalizationEnabled 只在构造组件图时读一次
+                // （ComponentFactory.resolveDeviceProfile()，
+                //  core/src/main/java/com/ufi_axis_core/service/ComponentFactory.kt:802，
+                //  唯一调用点 ComponentFactory.kt:152），
+                // 之后 profile 被固化进各设备客户端与 SignalCollector。所以这里的 PUT 只改 prefs，
+                // **必须重启后台服务才会变**（计划书 §11.10「运行期不允许热换插件」，
+                // docs/device-plugin-framework-plan.md:1587-1592）。别照着上面两行类推成即时生效。
+                //
+                // 另注：下面 needsRestart 的清单只覆盖认证/端口（hint 文案也只提这两类），
+                // 没有把本键算进去 —— 客户端不能靠 needs_restart 判断这一项，要由 UI 自己提示重启。
+                boolField("field_normalization_enabled") { settings.fieldNormalizationEnabled = it }
 
                 // QoS 参数
                 boolField("qos_enabled") { settings.qosEnabled = it }
@@ -189,6 +232,11 @@ class ConfigRoutes(
                 }
                 boolField("sms_code_auto_copy") { settings.smsCodeAutoCopy = it }
 
+                // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）。每次循环迭代现读 prefs，
+                // PUT 完下一轮就生效，无需重启。
+                boolField("thumb_prewarm_enabled") { settings.thumbPrewarmEnabled = it }
+                boolField("thumb_prewarm_wifi_only") { settings.thumbPrewarmWifiOnly = it }
+
                 // SMS 拦截（黑名单 + 关键词）的两个开关。规则本身走 /api/sms/rules，不在这里。
                 boolField("sms_filter_exempt_verification_code") {
                     settings.smsFilterExemptVerificationCode = it
@@ -202,10 +250,45 @@ class ConfigRoutes(
 
                 // update_mirror_base 允许设为空串 = 直连（因此不能用 textField）；
                 // contentOrNull 对 JsonNull/数字/布尔返回 null，只有显式传字符串才会进入此分支。
-                body["update_mirror_base"]?.jsonPrimitive?.contentOrNull?.let {
+                val mirrorBaseWritten = body["update_mirror_base"]?.jsonPrimitive?.contentOrNull?.let {
                     settings.updateMirrorBase = it
                     updated.add("update_mirror_base")
+                    it
                 }
+
+                // ── 下载方式（2026-09-22：core 成为唯一决策方）──
+                // 取值非法时进 rejected_fields 而不是静默回落：客户端写错了值必须能被发现。
+                val modeWritten = body["update_source_mode"]?.jsonPrimitive?.contentOrNull?.let { raw ->
+                    val v = raw.trim().lowercase()
+                    if (v in AppSettings.UPDATE_MODES) {
+                        settings.updateSourceMode = v
+                        updated.add("update_source_mode")
+                        v
+                    } else {
+                        reject("update_source_mode", ErrorCode.OUT_OF_RANGE)
+                        null
+                    }
+                }
+
+                // 老客户端兼容：只写了 update_mirror_base、没写 update_source_mode 时推导模式。
+                // 老 app 的 direct 写空串、auto 与 mirror 都写同一个前缀；不推导的话，
+                // 老 app 上用户选的「直连」会被新 core 当成 auto，在国内变成走镜像。
+                // auto 而不是 mirror：老 app 的 auto / mirror 不可区分，取更安全的那个。
+                if (modeWritten == null && mirrorBaseWritten != null) {
+                    val derived = if (mirrorBaseWritten.isBlank()) {
+                        AppSettings.UPDATE_MODE_DIRECT
+                    } else {
+                        AppSettings.UPDATE_MODE_AUTO
+                    }
+                    settings.updateSourceMode = derived
+                    updated.add("update_source_mode")
+                    AppLogger.i(
+                        "ConfigRoutes",
+                        "老客户端只下发了 update_mirror_base，已推导 update_source_mode=$derived"
+                    )
+                }
+
+
 
                 val needsRestart = updated.any { it in listOf("port", "goform_ip", "goform_port", "goform_password") }
 

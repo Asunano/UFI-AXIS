@@ -31,6 +31,24 @@ object ErrorCode {
     const val INTERNAL_ERROR = "INTERNAL_ERROR"
     /** 依赖的下层能力不可用（设备/goform/root shell/上游），HTTP 502/503 或 200+success:false。 */
     const val UNAVAILABLE = "UNAVAILABLE"
+
+    /**
+     * **当前设备不支持该功能**（HTTP 501），由能力集门禁产生（计划书 §7 / §11.6）。
+     *
+     * 2026-09-24 阶段 3 新增。与另两种「不可用」严格分开 —— 三者混成一个码的直接后果是
+     * 客户端无法决定下一步：
+     * - 本码（501）= **不可恢复**：换台设备才有用，前端应把开关灰掉并写明原因，**不要重试**；
+     * - [UNAVAILABLE]（503）= 设备离线 / 会话失效 / 提权失败，**同一台设备换个时机就可能成功**，
+     *   应退避重试，绝不能报成「不支持」；
+     * - [OUT_OF_RANGE]（400）= 取值非法，改参数才有用。
+     *
+     * 产生位置只有一处：route 层门禁抛 `CapabilityMissing`（`:core:api`），
+     * 由 `HttpServer` 的 `StatusPages` 统一映射。**不要在 handler 里就地回这个码** ——
+     * 那就等于把「设备支持什么」这件事散到每个 handler 里各判一次。
+     *
+     * 能力域的值域见 [Capability]。
+     */
+    const val NOT_SUPPORTED = "NOT_SUPPORTED"
     /** 操作被设备或系统拒绝（命令执行失败、goform 返回失败）。 */
     const val OPERATION_FAILED = "OPERATION_FAILED"
     /** 数据尚未就绪（采集未预热），如 `/api/traffic/realtime`。 */
@@ -93,6 +111,16 @@ object ErrorCode {
 
     /** 更新任务进行中，拒绝并发操作。 */
     const val UPDATE_IN_PROGRESS = "UPDATE_IN_PROGRESS"
+    /**
+     * 上传的 APK 不是 Core 自己（包名不匹配 / 无法解析包名），HTTP 400。
+     *
+     * 与 [BAD_REQUEST] 分开是为了让客户端给出**正确的下一步**：这类失败重试同一个包
+     * 永远不会成功，用户该做的是换一个包，而不是"稍后重试"。
+     *
+     * 2026-09-14 新增。背景：推错包会让 `adb install -r` 装上**别的 app**，
+     * core 自己没被替换、进程不死，状态机就卡在 `installing`，此后所有上传恒 409。
+     */
+    const val INVALID_PACKAGE = "INVALID_PACKAGE"
     /** 上游（镜像/下载源）不可用或返回非 2xx。 */
     const val UPSTREAM_FAILED = "UPSTREAM_FAILED"
 

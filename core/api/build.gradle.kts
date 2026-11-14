@@ -36,10 +36,23 @@ dependencies {
     //   - :core:collector  → 部分 Route 直接调用采集器
     //   - :core:cache      → ResponseCache 直连
     //   - :core:database   → AppDatabase 直连
+    implementation(project(":core:websocket"))
     implementation(project(":core:common"))
     implementation(project(":core:contract"))
     implementation(project(":core:database"))
     implementation(project(":core:goform"))
+    // 2026-09-25：`WriteOutcome` 从 :core:goform 搬到 :core:device-spi 之后显式声明。
+    // 用 `api` 而不是 `implementation`，判据就是本文件自己写的那条「公开签名里出现的类型
+    // 要让依赖方看得见」：`WriteOutcome` 在 `CallJsonExt` 的公开扩展签名上，
+    // 批 A1 之后 `DeviceHub` 又出现在 `NetworkDeps` / `RouteContext` 的公开签名上 ——
+    // 装配层 `:core` 要构造 `NetworkDeps`，拿不到这两个类型就编译不过。
+    // （现在 `:core` 自己也声明了 device-spi，但那是巧合，不该靠它。）
+    api(project(":core:device-spi"))
+    // 2026-09-25（批 B1）：`NormalizedFields` 出现在 `Goform*Client` 读方法的返回类型上，
+    // 本模块的 route / DataHub 要对它调 `.values` 解包 —— 直接依赖就显式声明，
+    // 不靠 `:core:device-spi` 的 `api(":core:device-schema")` 传递（口径同 `:core:scheduler`
+    // 里那条注释：直接依赖的模块要显式声明，别吃别人的实现细节）。
+    implementation(project(":core:device-schema"))
     implementation(project(":core:collector"))
     implementation(project(":core:cache"))
     implementation(project(":core:controller"))
@@ -51,11 +64,28 @@ dependencies {
     // Ktor Server (for routing DSL)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.websockets)
+    // 2026-10-06：ttyd WS 反代需要 client 侧 websocket（core → 127.0.0.1:ttyd）
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.cio)
+    implementation(libs.ktor.client.websockets)
     implementation(libs.ktor.server.status.pages)
     implementation(libs.ktor.serialization.kotlinx.json)
     // Room Database (for AppDatabase subclasses)
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
+    // OkHttp (for WebDAV provider)
+    implementation(libs.okhttp.core)
+    // Apache Commons Net (for FTP provider)
+    implementation("commons-net:commons-net:3.11.1")
+    // smbj (for SMB/CIFS provider) —— 与 commons-net 同口径用字面量声明，未进版本目录
+    // 排掉 bouncycastle：smbj 自带 bcprov-jdk18on:1.75，而 :core:common 的 jcifs-ng 已经带了
+    // bcprov-jdk15on:1.69，两个 artifact 装的是同一批 org.bouncycastle 类，同时进包会在
+    // checkBenchmarkDuplicateClasses 直接失败（几千条 Duplicate class）。
+    // 保留旧的那份而不是反过来：1.69 是 jcifs-ng 验证过的版本，而 smbj 只用到 crypto 原语
+    // （MD4/MD5/HMac/AES-CCM/GCM），1.69 全都有，让新依赖去适配存量比反过来安全。
+    implementation("com.hierynomus:smbj:0.13.0") {
+        exclude(group = "org.bouncycastle")
+    }
 
     // ===== 单元测试（QA 新增，仅 test 作用域，不影响正式构建） =====
     testImplementation(libs.junit)

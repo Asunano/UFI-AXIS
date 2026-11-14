@@ -90,7 +90,12 @@ class SmsRuleRoutesTest {
         ruleStore: SmsRuleStore? = store,
         block: suspend (io.ktor.client.HttpClient) -> Unit
     ) = testApplication {
-        val routes = RootSmsRoutes(smsController, null, ruleStore)
+        // deviceCapabilities 只用于 /sms/send 的门禁（阶段 3 的 3.3）；本类测的是拦截规则与
+        // 拦截记录那几个端点，所以给全量能力集，免得将来有人在这里被 501 绕进去。
+        val routes = RootSmsRoutes(
+            smsController, null, ruleStore,
+            deviceCapabilities = com.ufi_axis_core.contract.Capability.entries.toSet(),
+        )
         application {
             install(ContentNegotiation) { json() }
             routing { routes.register(this) }

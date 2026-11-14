@@ -21,6 +21,35 @@ data class TrafficRecord(
 )
 
 /**
+ * 每小时流量用量实体（流量历史的唯一数据来源）。
+ *
+ * ## 为什么必须单独建一张表
+ * [TrafficRecord] 存的是**速率采样** + 当月累计快照，答不出「昨天用了多少 GB」：
+ * 用「桶内 max − 桶内 min」硬推增量，会被跨月归零、用户流量校准、设备重启全部打穿；
+ * 而且它受 `retentionDays` 清理，撑不到「年」维度。
+ * 「今日流量」也不落库（内存里算 `当月累计 − 当日基线`），同样不可回溯。
+ *
+ * ## 语义
+ * - [hourStart]：**设备本地时区**的整点 epoch ms，主键。用本地时区而非 UTC，是因为
+ *   「日/周/月/年」的边界对用户来说是本地日历边界；存 UTC 整点在 UTC+8 会让每天的
+ *   第一个桶落在前一天。
+ * - [rxBytes] / [txBytes]：该小时内的**增量**（不是累计快照），由
+ *   `DataScheduler` 用「本次月累计 − 上次月累计」累加得到，异常增量会被丢弃而不是记进来。
+ *
+ * ## 保留策略
+ * **不纳入 `retentionDays` 清理** —— 一年 8760 行、每行几十字节，体积可忽略，
+ * 而这是「年」维度能成立的前提。谁要给它加清理，先想清楚年视图还剩什么。
+ */
+@Serializable
+@Entity(tableName = "traffic_hourly")
+data class TrafficHourlyUsage(
+    @PrimaryKey val hourStart: Long,
+    val rxBytes: Long,
+    val txBytes: Long,
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
+/**
  * 信号历史实体
  * 记录信号质量变化历史
  */

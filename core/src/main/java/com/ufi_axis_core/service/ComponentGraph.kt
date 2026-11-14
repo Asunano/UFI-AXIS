@@ -8,7 +8,6 @@ import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
 import com.ufi_axis_core.controller.adb.AdbController
-import com.ufi_axis_core.controller.goform.*
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.sms.SmsForwardController
 import com.ufi_axis_core.controller.sms.SmsRuleStore
@@ -21,6 +20,8 @@ import com.ufi_axis_core.core.scheduler.ConditionEngine
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.scheduler.TaskScheduler
 import com.ufi_axis_core.core.server.HttpServer
+import com.ufi_axis_core.devicespi.DeviceTransport
+import com.ufi_axis_core.devicespi.adapter.DeviceHub
 import com.ufi_axis_core.util.AppSettings
 import com.ufi_axis_core.util.DynamicThreadPool
 import com.ufi_axis_core.util.WebResourceManager
@@ -46,16 +47,37 @@ data class ComponentGraph(
     // ── 子图聚合：调用方直接经 network / collector / storage / controller / serverGraph 子图访问组件 ──
 }
 
-/** 网络相关：全部 Goform 客户端 + 网络 / SIM 控制器。 */
+/** 网络相关：传输层 + 集中处理器 + 网络控制器。 */
 data class NetworkGraph(
-    /** 防腐层接口（F9）：子图对外只暴露 [GoformGateway]，具体实现只有 ComponentFactory 知道。 */
-    val goformClient: GoformGateway,
-    val signalClient: GoformSignalClient,
-    val wifiClient: GoformWifiClient,
-    val networkClient: GoformNetworkClient,
-    val deviceClient: GoformDeviceClient,
-    val smsClient: GoformSmsClient,
-    val simClient: GoformSimClient,
+    /** 防腐层接口（F9）：子图对外只暴露 [DeviceTransport]，具体实现只有 ComponentFactory 知道。 */
+    val goformClient: DeviceTransport,
+    /**
+     * 集中处理器（2026-09-25 批 A1）。替掉了原来的 `simClient: GoformSimClient` ——
+     * `GoformSimClient` 现在只被 `ZteGoformAdapter` 持有，子图对外只暴露 [DeviceHub]。
+     *
+     * 批 A2a 起 `deviceClient: GoformDeviceClient` 同样只被 `ZteGoformAdapter` 持有：
+     * device 域整体迁进 `DeviceControl`，该客户端没有读方法，所以没有读侧残留要留字段。
+     *
+     * 批 A2b 起 `networkClient: GoformNetworkClient` 同理（它是纯写客户端，
+     * 两个频段全集方法只是写命令的参数值域，现在只有 adapter 用得到）。
+     *
+     * 批 B2 起 `signalClient: GoformSignalClient` 也一样：signal 域的 16 个查询方法与
+     * `profileId` 整体迁进 `SignalSource`，**没有读侧残留**，所以本子图不再单独留那个字段。
+     * 需要 signal 取数的两处（`DataScheduler` / `DataHub`）现在都收 `deviceHub.signal`。
+     *
+     * 批 C1 起 `smsClient: GoformSmsClient` 也一样：sms 域的 5 个 public 方法与 3 个结论类型
+     * 整体迁进 `SmsControl`（信箱的读方法也进去了 —— 短信没有 profile 字段映射，
+     * 理由见那个接口的类 KDoc），所以本子图不再留那个字段。需要短信的四处
+     * （`SmsController` / `LocalSmsChannel` / `DataScheduler` / `LocalSmsDelivery` 的签名）
+     * 现在都收 `deviceHub.sms` 或契约层的结论类型。
+     *
+     * 批 C2 起 `wifiClient: GoformWifiClient` 也一样：WiFi 的**读侧**（状态 / 已连客户端 /
+     * 二维码 / 接入控制名单）与 `setAccessControlList` 整体迁进 `WifiControl`
+     * （`AclEntry` / `AclSnapshot` 随之落到 `:core:device-spi`），读侧残留归零，
+     * 所以本子图不再留那个字段。三个消费点（`DataHub` 的构造 /
+     * `attachDeviceEventWatcher` 的 provider / `RouteContext`）现在都收 `deviceHub.wifi`。
+     */
+    val deviceHub: DeviceHub,
     val networkController: NetworkController
 )
 
@@ -85,7 +107,9 @@ data class ControllerGraph(
     val downloadManager: DownloadManager,
     val taskScheduler: TaskScheduler,
     val conditionEngine: ConditionEngine,
-    val tunnelManager: TunnelManager
+    val tunnelManager: TunnelManager,
+    /** 定时测速调度中心（2026-10-06）：SpeedTestRoutes 的 /run、/history 共用。 */
+    val speedTestCoordinator: com.ufi_axis_core.api.speedtest.SpeedTestCoordinator
 )
 
 /** 服务端相关：HTTP Server + 推送 / 鉴权 / 告警 / 调度 / 线程池。 */
@@ -108,5 +132,20 @@ data class ServerGraph(
     val alertEngine: AlertEngine,
     val dataScheduler: DataScheduler,
     val dynamicThreadPool: DynamicThreadPool,
-    val webResourceManager: WebResourceManager
+    val webResourceManager: WebResourceManager,
+    /** 真 PTY（2026-10-06）：停机必须显式收（杀 ttyd 进程 + 关反代 HttpClient），否则孤儿进程常驻。 */
+    val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
+    /**
+     * 应用列表管理器（2026-10-12 应用列表缓存批次）。
+     *
+     * 暴露它**只**为了让 [com.ufi_axis_core.service.BackendService] 按服务生命周期起停它的
+     * 定时刷新协程 —— 理由与本子图里的 pushService / notificationDispatcher / webhookChannel
+     * 完全同源：组件自己持有 CoroutineScope，不在停机流程里显式收，它会在服务停掉之后继续跑
+     * （这里的表现是每 2 分钟继续打 4 条特权 shell）。
+     *
+     * 放 ServerGraph 而不是 ControllerGraph：它构造在 build() 主流程里（供 UpdateManager /
+     * AppRoutes 共用同一个实例），**晚于** buildControllerGraph 调用点，放后者就得把构造
+     * 顺序整条倒过来（牵动一大片），不值得 —— 语义归置优先于就近。
+     */
+    val appManager: com.ufi_axis_core.controller.system.AppManager
 )

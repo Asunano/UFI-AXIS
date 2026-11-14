@@ -1,7 +1,9 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
+import com.ufi_axis_core.api.requireCapability
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.ErrorCode
 import com.ufi_axis_core.util.AppLogger
 import io.ktor.http.*
@@ -21,26 +23,29 @@ import kotlinx.serialization.json.*
  * 结果，web 侧从未引用 —— 属于「core 存在但无真实消费者」的重复能力，按真源唯一原则删除，
  * 不留兼容壳。KDoc 里原先还写着 `POST /api/sim/ussd`，那个端点从来没被注册过，一并删掉。
  *
+ * 2026-09-25（批 A1）：切卡改走 [RouteContext.deviceHub]（`deviceHub.sim.switchSimSlot`），
+ * 不再直接拿 `GoformSimClient`。同时删掉了原先 `if (client == null)` 那个分支 ——
+ * `NetworkDeps` 里那个字段声明的是**非空**类型，那个分支永远不成立，
+ * 它回的 `"Goform client not available"` 也把协议名吐给了客户端。
+ * 行为没变（该分支从来没被执行过），响应形状一字未动。
+ *
  * 注意: SMS 路由(/api/sms/)统一由 RootSmsRoutes 管理
  */
 class SimRoutes(
     private val ctx: RouteContext
 ) {
     // ── 反向兼容 getter ──
-    private val simClient get() = ctx.simClient
+    private val deviceHub get() = ctx.deviceHub
     private val cache get() = ctx.responseCache
+    private val dataHub get() = ctx.dataHub
 
     fun register(route: Route) {
         // 注意: SMS 路由(/api/sms/*)统一由 RootSmsRoutes 管理，此处仅注册 /sim 路由
         route.route("/sim") {
             // SIM 卡槽切换
             post("/switch") {
-                val client = simClient
-                if (client == null) {
-                    call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
-                        "Goform client not available")
-                    return@post
-                }
+                // 能力门禁（3.3）：缺 sim_slot_switch → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.SIM_SLOT_SWITCH)
                 val params = call.receiveJsonObject()
                 // 规范入参：slot = 1 起的卡槽序号，或 "external"（外置卡）。
                 // 序号 → 设备值的映射在 profile 的 WriteSpec 里（计划书 2.6）。
@@ -67,13 +72,31 @@ class SimRoutes(
                         "slot is required (1/2/3 or \"external\")")
                     return@post
                 }
-                val outcome = client.switchSimSlot(slot)
+                // 更新互斥（2026-10-05 R4-9 修复）：更新进行中不接受切卡写命令。
+                if (call.rejectIfUpdating()) return@post
+                // 软检查（2026-10-05 R4-9 修复）：读 TelephonyManager 的 SIM 在位状态
+                // （本地调用，不打 goform），无卡 / PUK 时切卡只会得到设备侧模糊失败。
+                // 状态取不到时放行（不因采集缺失而阻塞合法操作）。
+                runCatching { ctx.telephonyCollector.getSimInfo()["sim_state"] }.getOrNull()
+                    ?.let { simState ->
+                        if (simState is String && !simState.equals("Ready", ignoreCase = true)) {
+                            call.respondFail(HttpStatusCode.Conflict, ErrorCode.CONFLICT,
+                                "SIM 未就绪（sim_state=$simState），切卡将被设备拒绝")
+                            return@post
+                        }
+                    }
+                val outcome = deviceHub.sim.switchSimSlot(slot)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 // 换卡后失效的是 device:* 那几份缓存（device:info / device:identity / device:goform
                 // 都带 imei/imsi/iccid）。原来写的是 `sim:*`，那是已删除的 /api/sim/info 的键，
                 // 现在没有任何缓存项匹配它，客户端也不会因此刷新真正展示 SIM 的那几个接口。
-                if (success) cache?.invalidate("device:*")
+                if (success) {
+                    cache?.invalidate("device:*")
+                    // 2026-10-05 P1（§3.3.3，修 G10）：换卡后运营商/制式随卡变，
+                    // 网络状态与制式文案一并失效，合并一条事件。
+                    cache?.invalidateAll("hub:network-type-info", "network:band-status", "summary")
+                }
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success, "slot" to slot))

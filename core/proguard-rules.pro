@@ -90,3 +90,41 @@
 -keep class javax.activation.** { *; }
 -keep class com.sun.activation.** { *; }
 -dontwarn javax.activation.**
+
+# Apache Commons Net（FTP 存储源，阶段 5）
+# DefaultFTPFileEntryParserFactory 对非内置 SYST 关键字走 Class.forName(key) 反射实例化
+# 目录解析器（NT / OS400 / MVS / Netware / VMS 等）。R8 看不到这条引用会把它们剥掉，
+# 表现为「连上服务器但列目录恒空」—— 与上面 Netty 那次同一类问题（反射面不可达即被删）。
+# 整包保留：FTP 解析器一共十来个类，体积代价远低于排查成本。
+-keep class org.apache.commons.net.** { *; }
+-dontwarn org.apache.commons.net.**
+
+# smbj（SMB/CIFS 存储源）：内部大量用反射解析 SMB 消息结构体与 NtStatus 枚举，
+# R8 看不到这些引用；不 keep 的话混淆包能连上但解析响应时抛 NoSuchMethodException。
+-keep class com.hierynomus.** { *; }
+-dontwarn com.hierynomus.**
+# smbj 依赖 bouncycastle 做 NTLM / SMB3 加密。注意：smbj 自带的 bcprov-jdk18on 已在
+# core/api/build.gradle.kts 里排掉（与 jcifs-ng 的 bcprov-jdk15on 重类），运行期用的是
+# jcifs-ng 那份，smbj 通过 Class.forName("org.bouncycastle.crypto.Digest") 探测后启用
+# BCSecurityProvider —— 探测失败会退回 JCE，而 Android 的 JCE 没有 MD4，NTLM 直接不可用。
+-dontwarn org.bouncycastle.**
+# smbj 用 mbassador 当内部事件总线（连接/会话关闭事件），它按 @Handler 注解反射派发，
+# 混淆掉方法名就收不到事件；整包保留（库本身很小）。
+-keep class net.engio.mbassy.** { *; }
+-dontwarn net.engio.mbassy.**
+
+# jUPnP（DLNA MediaServer，2026-10-09）
+# AnnotationLocalServiceBinder 反射读 @UpnpService/@UpnpAction/@UpnpStateVariable，
+# 类/方法/字段名与注解必须原样；jUPnP android jar 自带的 META-INF/proguard 规则只 keep
+# 注解没 keep Signature，且 jar 形式的规则 AGP 不自动消费 —— 必须在这里补。
+# 关键：support 包的 AbstractContentDirectoryService 有 CSV<String> 状态变量，
+# CSV 无参构造走 Reflections.getTypeArguments() 沿 getGenericSuperclass() 读泛型签名，
+# Signature 被 R8 剥离后返回裸 Class → "(ParameterizedType) type" ClassCastException
+# （真机实锤：DLNA start failed）。所以 -keepattributes Signature 必须配合类名 keep。
+-keepattributes Signature
+-keep class org.jupnp.** { *; }
+-keepnames @org.jupnp.binding.annotations.UpnpService class *
+-dontwarn org.jupnp.**
+# mbassador 的 EL 过滤器引用 javax.el（Java EE 可选依赖，Android 上不存在）。
+# 我们不用表达式过滤，dontwarn 即可 —— 不加这条 R8 直接以 Missing class 失败。
+-dontwarn javax.el.**

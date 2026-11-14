@@ -1,5 +1,6 @@
 package com.ufi_axis_core.core.server
 
+import com.ufi_axis_core.api.CapabilityMissing
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.api.middleware.AuthMiddleware
 import com.ufi_axis_core.api.pairing.PairingManager
@@ -30,6 +31,8 @@ import io.netty.buffer.PooledByteBufAllocator
 import io.netty.channel.ChannelOption
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import io.ktor.websocket.CloseReason
+import io.ktor.websocket.close
 import kotlinx.serialization.json.*
 import java.time.Duration
 
@@ -65,6 +68,9 @@ class HttpServer(
     private val taskRoutes: TaskRoutes? = null,
     private val speedTestRoutes: SpeedTestRoutes? = null,
     private val debugLogRoutes: DebugLogRoutes? = null,
+    private val diagnosticRoutes: com.ufi_axis_core.api.routes.DiagnosticRoutes? = null,
+    private val cpuProbeRoutes: com.ufi_axis_core.api.routes.CpuProbeRoutes? = null,
+    private val planRoutes: com.ufi_axis_core.api.routes.PlanRoutes? = null,
     private val qosRoutes: QoSRoutes? = null,
     private val monitorRoutes: MonitorRoutes? = null,
     private val notificationRoutes: com.ufi_axis_core.api.routes.NotificationRoutes? = null,
@@ -74,16 +80,70 @@ class HttpServer(
     private val componentRoutes: com.ufi_axis_core.api.routes.ComponentRoutes? = null,
     /** 终端命令历史（AT / Shell 两端共享），可空只为兼容尚未装配它的调用方。 */
     private val consoleRoutes: com.ufi_axis_core.api.routes.ConsoleRoutes? = null,
+    private val ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes? = null,
     /** 配置备份导出 / 恢复，可空同上。 */
-    private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null
+    private val backupRoutes: com.ufi_axis_core.api.routes.BackupRoutes? = null,
+    /** DLNA MediaServer 配置（2026-10-09），可空同上。 */
+    private val dlnaRoutes: com.ufi_axis_core.api.routes.DlnaRoutes? = null,
+    /**
+     * 媒体中心（`/api/media` 下的一组端点，2026-09-16）：查系统媒体库 + 缩略图 + 扫描目录配置。
+     * 可空只为兼容尚未装配它的调用方；播放字节流仍由 [fileRoutes] 的 `/api/files/stream` 提供。
+     */
+    private val mediaRoutes: com.ufi_axis_core.api.routes.MediaRoutes? = null,
+    /**
+     * 音频歌单（`/api/playlists`，2026-09-21）：歌单本身的 CRUD + 曲目增删/重排。
+     * 曲目回查依赖 [mediaRoutes]（它实现了 `AudioItemLookup`），所以装配顺序上要在它之后。
+     */
+    private val playlistRoutes: com.ufi_axis_core.api.routes.PlaylistRoutes? = null,
+    /** 天气（`/api/weather`，2026-09-17）：代理 Open-Meteo + TTL 缓存。可空同上。 */
+    private val weatherRoutes: com.ufi_axis_core.api.routes.WeatherRoutes? = null,
+    /** 今日诗词（`/api/poetry`，2026-09-18）：代理 jinrishici v2 + TTL 缓存。可空同上。 */
+    private val poetryRoutes: com.ufi_axis_core.api.routes.PoetryRoutes? = null,
+    /** 出网国家/地区（`/api/geo`，2026-09-18）：结果存 settings，检测由 core 启动时触发。可空同上。 */
+    private val geoRoutes: com.ufi_axis_core.api.routes.GeoRoutes? = null,
+    /**
+     * 远程存储源管理（`/api/storage/sources`，阶段 2-4）：FTP / WebDAV 配置的 CRUD + 连接测试。
+     * 文件操作本身仍走 [fileRoutes]（路径带 `remote:<sourceId>/` 前缀由 FileProviderRegistry 分发），
+     * 这里只管配置与 provider 注册，可空同上。
+     */
+    private val storageSourceRoutes: com.ufi_axis_core.api.routes.StorageSourceRoutes? = null
 ) {
     companion object {
         private const val MAX_REQUEST_BODY_SIZE = 512 * 1024L  // 512KB（普通路由：防滥用 + 内存安全）
-        private const val FILE_UPLOAD_BODY_SIZE = 200L * 1024 * 1024  // 文件管理器上传上限 200MB
+
+        /**
+         * 文件管理器上传上限。**引用 [com.ufi_axis_core.api.routes.FileRoutes.UPLOAD_BODY_LIMIT]，
+         * 不另写字面量** —— 理由与下面 [BACKUP_UPLOAD_BODY_SIZE] 完全一致（见其 KDoc）。
+         * 2026-09-19 从这里的 200MB 字面量改成引用：`/api/files/status` 现在会把这个值
+         * 下发给客户端做入队前预检，三处（HTTP 层 / 路由层 / 客户端）必须是同一个数。
+         */
+        private val FILE_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.FileRoutes.UPLOAD_BODY_LIMIT
+
+        /**
+         * 单个上传分片的上限。同样引用路由层常量：分片大小由 `/files/status` 下发，
+         * 客户端按它切片，HTTP 层的闸门必须留在同一侧。
+         */
+        private val CHUNK_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.FileRoutes.CHUNK_BODY_LIMIT
+
         private const val FALLBACK_UPLOAD_BODY_SIZE = 100L * 1024 * 1024  // 兜底 100MB（清单未知时）
-        private const val WEB_UPDATE_BODY_SIZE = 50L * 1024 * 1024  // Web 资源 ZIP 上传上限 50MB
-        // 可选二进制组件本地上传上限：cloudflared 裸二进制约 36MB，留足余量
-        private const val COMPONENT_UPLOAD_BODY_SIZE = 96L * 1024 * 1024
+
+        /**
+         * Web 资源 ZIP 上传上限。**引用 [com.ufi_axis_core.api.routes.WebUpdateRoutes.MAX_ZIP_UPLOAD]**，
+         * 不再自己写一份 50MB —— 2026-09-19 修：两处各存一个数早晚分叉，理由同下面的
+         * [BACKUP_UPLOAD_BODY_SIZE]（见其 KDoc 里那段"路由层按 8MB 设计、HTTP 层按 512KB 拦"）。
+         */
+        private val WEB_UPDATE_BODY_SIZE =
+            com.ufi_axis_core.api.routes.WebUpdateRoutes.MAX_ZIP_UPLOAD
+
+        /**
+         * 可选二进制组件本地上传上限。同样改为引用路由层常量
+         * （[com.ufi_axis_core.api.routes.ComponentRoutes.MAX_UPLOAD_BYTES]），
+         * 该值现在也经 `GET /api/components` 下发给客户端做入队前预检，三处必须是同一个数。
+         */
+        private val COMPONENT_UPLOAD_BODY_SIZE =
+            com.ufi_axis_core.api.routes.ComponentRoutes.MAX_UPLOAD_BYTES
 
         /**
          * backup 前缀下各端点的请求体上限。
@@ -124,6 +184,9 @@ class HttpServer(
             val limit = when {
                 path.startsWith("/api/update/upload") -> updateRoutes.uploadLimitBytes()
                 path.startsWith("/api/web/update") -> WEB_UPDATE_BODY_SIZE
+                // 分片必须排在 /api/files/upload 之前：后者是前缀，会把 chunk 也吞掉，
+                // 那样单片就被按 200MB 放行了（虽然不至于出错，但闸门形同虚设）
+                path.startsWith("/api/files/upload/chunk") -> CHUNK_UPLOAD_BODY_SIZE
                 path.startsWith("/api/files/upload") -> FILE_UPLOAD_BODY_SIZE
                 path.startsWith("/api/backup") -> BACKUP_UPLOAD_BODY_SIZE
                 path.startsWith("/api/components/") && path.endsWith("/upload") -> COMPONENT_UPLOAD_BODY_SIZE
@@ -167,6 +230,10 @@ class HttpServer(
                 connectionGroupSize = 1
                 workerGroupSize = 1
                 callGroupSize = 1
+                // Ktor Netty 默认 responseWriteTimeoutSeconds=15：写出停滞 15s 即 WriteTimeoutException
+                // 掐断连接。DLNA 播放器（WiFi 边下边播、暂停缓冲）经常触发 —— 实机表现为拖进度条
+                // 断流回 0。流式大文件本来就可能长时间慢写，放宽到 120s（仍能兜住真死连接）。
+                responseWriteTimeoutSeconds = 120
                 configureBootstrap = {
                     option(ChannelOption.SO_BACKLOG, 128)
                     option(ChannelOption.SO_REUSEADDR, true)
@@ -183,10 +250,30 @@ class HttpServer(
                 configureRouting()
             }.start(wait = false)
 
-            AppLogger.i(tag, "HTTP server started on :$port")
+            // 监听自检（2026-10-07）：start(wait=false) 返回只代表 Ktor 发起了 bind，
+            // Netty 在 event loop 内部的异步 bind 失败不会走到上面的 catch ——
+            // 症状就是「日志显示 HTTP server started，外部全部 connection refused」。
+            // 这里用回环真实连一次，3 秒内连不上按启动失败处理（返回 false 触发
+            // BackendService 的失败路径：stopSelf + 看门狗重拉 + 真实异常暴露）。
+            val selfCheckOk = runCatching {
+                java.net.Socket().use { s ->
+                    s.connect(java.net.InetSocketAddress("127.0.0.1", port), 3_000)
+                    true
+                }
+            }.getOrDefault(false)
+            if (!selfCheckOk) {
+                AppLogger.e(tag, "HTTP server self-check failed: port $port not accepting after start — treating as start failure")
+                runCatching { server?.stop(0, 500) }
+                server = null
+                return false
+            }
+
+            AppLogger.i(tag, "HTTP server started on :$port (self-check ok)")
             true
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to start HTTP server: ${e.javaClass.name}: ${e.message}", e)
+            // 2026-10-05 R3-10 修复：失败路径回收已创建的 Netty event loop，避免线程泄漏
+            runCatching { server?.stop(0, 500) }
             server = null
             false
         }
@@ -287,6 +374,25 @@ class HttpServer(
                     toJsonElement(mapOf("error" to cause.message))
                 )
             }
+            // 当前设备不支持该功能（能力集门禁，计划书 §7 的 3.3）→ 501 + NOT_SUPPORTED。
+            //
+            // 这是**唯一**的出口：route 侧只写一行 `requireCapability(...)`，
+            // 状态码 / 错误码 / 文案三件事都由 CapabilityMissing 自己带过来
+            // （定义在 :core:api 的 CapabilityGate.kt，那里也写了为什么不放 :core:contract：
+            //  本模块看不见 Capability 这个类型，所以日志里用它给的 capabilityWire 字符串）。
+            // 必须在下面的 exception<Throwable> 之前成立 —— 否则「不支持」会被兜底成 500，
+            // 客户端只能显示「服务器内部错误」，而这恰恰是不可恢复、应该灰掉开关的那一种。
+            exception<CapabilityMissing> { call, cause ->
+                AppLogger.w(
+                    "StatusPages",
+                    "501 capability missing: ${cause.capabilityWire} " +
+                        "(${call.request.httpMethod.value} ${call.request.uri})"
+                )
+                call.respond(
+                    cause.status,
+                    com.ufi_axis_core.api.ResponseHelper.fail(cause.errorCode, cause.userMessage)
+                )
+            }
             // 请求体非法（如 JSON 语法错误、不是 JSON 对象）→ 400 而不是落到下面的 500 兜底。
             // 历史教训：请求体解析失败曾被 exception<Throwable> 统一吞成 500，
             // 前端只看到"操作无反应"，排查成本极高。
@@ -361,6 +467,36 @@ class HttpServer(
             // 2026-08-25：`QoSMiddleware`（对客户端请求数限流并回 429）已整体删除，见下面 /api 块的说明。
             route("/pairing") {
                 pairingRoutes.register(this)
+            }
+
+            // ══ 【注册顺序不变量】WebSocket 路由必须在下面那个 catch-all 静态资源路由之前 ══
+            //
+            // 2026-10-10 实机根因（r30，web 终端页「Invalid frame header」）：本块原本注册在
+            // `get("/{path...}")` **之后**。Ktor 的路由匹配按注册顺序取第一个能处理请求的路由，
+            // catch-all `/{path...}` 会把 `GET /ws/terminal` 当成一个前端路径吃掉，返回
+            // **200 + index.html**；浏览器要的却是 `101 Switching Protocols`，
+            // 于是抛「Invalid frame header」并不断重连（重连再打同一个坑，故日志刷屏）。
+            //
+            // 为什么 /ws/realtime 没暴露这个问题：它同样注册在 catch-all 之后，但 Ktor 对
+            // `GET` + `Upgrade: websocket` 有内建分流，在 pipeline 层先于 route 匹配生效 ——
+            // **但那只在 WS 路由确实是 GET 可达时**；/ws/terminal 的请求带着 Upgrade 头却被
+            // catch-all 以普通 GET 处理，于是返回 HTML。结论：WS 路由的位置不是风格问题，
+            // 是能否握上手的决定因素，别把它移到 catch-all 后面。
+            webSocket("/ws/realtime") {
+                webSocketManager.handleConnection(this)
+            }
+
+            // 真 PTY 终端反代（2026-10-07 票据鉴权，2026-10-10 移位 + 日志可见化）：
+            // 浏览器 WebSocket 发不了自定义头，与 /ws/realtime 同理挂 /api 之外、凭 PTY
+            // 票据鉴权（票据由 POST /api/terminal/pty-ticket 签发，签发走完整头部鉴权 +
+            // ttyd_enabled 开关）。ttyd 只绑 127.0.0.1，这是唯一外部入口。
+            webSocket("/ws/terminal") {
+                val routes = ttydRoutes
+                if (routes == null) {
+                    close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "terminal routes not wired"))
+                } else {
+                    routes.proxy(this)
+                }
             }
 
             // ── Web 前端静态资源 + SPA fallback（通过 WebResourceManager 实现 override + assets 回退）──
@@ -512,6 +648,28 @@ class HttpServer(
                     // 设备 profile 状态（计划书 10.2）：便宜的元信息，不发设备查询。
                     // status 的四态是排障用的：型号填错时 core 会静默回落默认 profile，
                     // 没有这一行就只能去翻启动日志里的 WARN。
+                    //
+                    // plugin_id / selection 是阶段 2 的 2.8 新增的两个键（只新增，上面四个键的
+                    // 推导逻辑一个字符都没动）：
+                    //
+                    // - plugin_id：**选中插件**的 id（如 zte-f50）。恒非空 —— 认不出设备也会回落到
+                    //   默认插件，所以它和 active 不同，不会因为排障开关而空掉。
+                    // - selection：这次选型是怎么定下来的，值域固定四个小写 snake：
+                    //   configured（配置项命中）/ probed（probe 打分选出）/ default（没配，用注册表默认）/
+                    //   fallback（配了但匹配不上，已回落）。
+                    //   probed 自 2026-09-24（probe 选型落地）起是**零配置部署的常态取值** ——
+                    //   没填 device_profile_id、后台可达、有插件认领时就是它；
+                    //   同样零配置但没人认领（比如后台探不通）时才回落 default。
+                    //   也就是说 selection 现在隐含了「探测通不通」这一层信息。
+                    //   ⚠ 早先这里写的是「probed 当前版本不会出现」，那是 probe 上线前的描述，已作废。
+                    //
+                    // ⚠ 已知不一致（**刻意不修**）：selection 与 status 可以互相矛盾。
+                    // 典型场景：device_profile_id 填的是 plugin id（zte-f50），选型命中 →
+                    // selection=configured；但 active 走的是 profile id（zte-goform），于是
+                    // configured != active，status 按上面那个 when 判成 fallback，看上去像「型号填错了」。
+                    // status 的这套判据是既有行为，改它就是行为变更，所以这里只如实下发 selection。
+                    // 显示口径（status 与 selection 谁说了算、app/web 的诊断页怎么写）留给 UI 那一批；
+                    // 在那之前**以 selection 为准**看选型结果。
                     val configuredProfile = ctx.settings.deviceProfileId
                     val activeProfile = ctx.dataHub.deviceProfileId
                     diag["device_profile"] = mapOf(
@@ -523,7 +681,10 @@ class HttpServer(
                             configuredProfile.isBlank() -> "default"   // 没配，用注册表默认
                             configuredProfile == activeProfile -> "configured"
                             else -> "fallback"                          // 配了但注册表里没有，已回落
-                        }
+                        },
+                        // 2.8 新增：取值在装配层就定死了（DeviceRuntime → DataHub），这里不做任何推导
+                        "plugin_id" to ctx.dataHub.devicePluginId,
+                        "selection" to ctx.dataHub.deviceSelection
                     )
 
                     // 字段覆盖率（计划书 10.1）：只在显式要求时算，它会逐分组向设备发查询。
@@ -553,8 +714,13 @@ class HttpServer(
                 appRoutes.register(this)
                 shellRoutes.register(this)
                 consoleRoutes?.register(this)
+                ttydRoutes?.register(this)
                 backupRoutes?.register(this)
                 fileRoutes.register(this)
+                storageSourceRoutes?.register(this)
+                mediaRoutes?.register(this)
+                dlnaRoutes?.register(this)
+                playlistRoutes?.register(this)
                 dashboardRoutes.register(this)
                 pairedDevicesRoutes.register(this)
                 smsForwardRoutes?.register(this)
@@ -563,6 +729,9 @@ class HttpServer(
                 taskRoutes?.register(this)
                 speedTestRoutes?.register(this)
                 debugLogRoutes?.register(this)
+                diagnosticRoutes?.register(this)
+                cpuProbeRoutes?.register(this)
+                planRoutes?.register(this)
                 qosRoutes?.register(this)
                 monitorRoutes?.register(this)
                 notificationRoutes?.register(this)
@@ -570,12 +739,18 @@ class HttpServer(
                 serviceRoutes?.register(this)
                 tunnelRoutes?.register(this)
                 componentRoutes?.register(this)
+                weatherRoutes?.register(this)
+                poetryRoutes?.register(this)
+                geoRoutes?.register(this)
                 webUpdateRoutes.register(this)
             }
 
-            webSocket("/ws/realtime") {
-                webSocketManager.handleConnection(this)
-            }
+            // 凭票流式播放（2026-09-14）：刻意挂在 `/api` **之外**。
+            // 浏览器的 <audio src> / <video src> 无法附加鉴权头，拿不到 /api/files/stream；
+            // 而把「带 ticket 就放行」做成 AuthMiddleware 的例外会给唯一鉴权闸门开口子。
+            // 票据由 POST /api/files/stream-ticket 签发（走正常头部鉴权），
+            // 只授权那一个已通过路径校验的文件，滑动过期 10 分钟。见 FileRoutes.registerPublic。
+            fileRoutes.registerPublic(this)
         }
     }
 }

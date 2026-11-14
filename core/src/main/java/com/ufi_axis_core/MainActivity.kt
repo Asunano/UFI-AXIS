@@ -40,14 +40,30 @@ class MainActivity : Activity() {
         private const val REQUEST_CODE_NOTIFICATION = 1001
         private const val REQUEST_CODE_CORE_PERMISSIONS = 1002
 
-        /** 后端运行所需的全部运行时权限 */
-        val REQUIRED_PERMISSIONS = arrayOf(
-            android.Manifest.permission.ACCESS_FINE_LOCATION,
-            android.Manifest.permission.ACCESS_COARSE_LOCATION,
-            android.Manifest.permission.READ_PHONE_STATE,
-            android.Manifest.permission.READ_SMS,
-            android.Manifest.permission.SEND_SMS
-        )
+        /**
+         * 后端运行所需的全部运行时权限。
+         *
+         * 2026-09-16 补 `READ_MEDIA_VIDEO/AUDIO/IMAGES`：manifest 里早就声明了，但从没在运行时
+         * 申请过 —— 于是 Android 13+ 上 `checkSelfPermission(READ_MEDIA_VIDEO)` 恒为 DENIED，
+         * `/api/media` 下的那组端点全靠「所有文件访问」那条短路活着。而 **MediaProvider 交付缩略图
+         * 时按细分媒体读权限判，不看 All Files Access**，`contentResolver.loadThumbnail()` 因此一直
+         * 失败，表现就是"列表有、缩略图全是占位图标"。
+         *
+         * 三个权限只在 API 33+ 存在；低版本上申请一个不存在的权限会被系统直接拒，
+         * 所以按版本拼数组。
+         */
+        val REQUIRED_PERMISSIONS: Array<String> = buildList {
+            add(android.Manifest.permission.ACCESS_FINE_LOCATION)
+            add(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+            add(android.Manifest.permission.READ_PHONE_STATE)
+            add(android.Manifest.permission.READ_SMS)
+            add(android.Manifest.permission.SEND_SMS)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(android.Manifest.permission.READ_MEDIA_VIDEO)
+                add(android.Manifest.permission.READ_MEDIA_AUDIO)
+                add(android.Manifest.permission.READ_MEDIA_IMAGES)
+            }
+        }.toTypedArray()
     }
 
     private val refreshRunnable = object : Runnable {
@@ -78,18 +94,9 @@ class MainActivity : Activity() {
         // event loop 线程死亡导致 HTTP 服务器瘫痪。现对齐 Application 层：
         // ① 良性协程异常仅记日志跳过；② 其余异常弹窗后 rethrow 给原 default
         // handler（保持 Application 层崩溃落盘 + 进程退出语义）。
-        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            val isBenign = throwable.javaClass.name == "kotlinx.coroutines.CompletionHandlerException"
-            if (isBenign) {
-                AppLogger.w("MainActivity", "Coroutine completion handler issue (benign) on '${thread.name}': ${throwable.message}")
-                return@setDefaultUncaughtExceptionHandler
-            }
-            AppLogger.e("MainActivity", "Uncaught in thread '${thread.name}': ${throwable.javaClass.name}: ${throwable.message}")
-            runOnUiThread { showCrashDialog("后台线程崩溃 (${thread.name})", throwable) }
-            // rethrow：交还原处理器（Application 层：崩溃日志落盘 + 系统默认退出/重启）
-            defaultHandler?.uncaughtException(thread, throwable)
-        }
+        // 2026-10-05 R3-8 修复：删除 Activity 级全局 UncaughtExceptionHandler——
+        // 进程级 handler 不应放在 Activity（重建即叠加包装、永久持有 Activity 引用），
+        // 良性过滤与崩溃落盘已由 UfiAxisCoreApplication 的进程级 handler 统一承担。
     }
 
     private fun initViews() {

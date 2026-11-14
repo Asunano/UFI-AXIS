@@ -53,13 +53,30 @@ class TaskScheduler(
     private val actionExecutor: ActionExecutor
 ) {
     private val tag = "TaskScheduler"
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    // CoroutineExceptionHandler（2026-10-05 R2-5② 修复）：SupervisorJob 只隔离子协程失败，
+    // 不吞异常——没有 handler 时调度协程抛未捕获异常会静默死亡（Default dispatcher 无默认处理器），
+    // 表现为"定时任务从此再也不触发"。记日志让死亡可观测。
+    private val exceptionHandler = CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "TaskScheduler coroutine crashed (uncaught)", e)
+    }
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob() + exceptionHandler)
     private val tasks = ConcurrentHashMap<String, ScheduledTask>()
     private val triggeredToday = ConcurrentHashMap<String, String>() // taskId → dateStr
+    // 2026-10-05 R1-15 修复：cron 任务的分钟桶去重独立成表，不再覆盖 triggeredToday 的日界语义
+    // （原实现把桶键写进 taskId→dateStr 的值里，桶翻转后去重失效且污染旧路径判定）。
+    private val cronBuckets = ConcurrentHashMap<String, String>() // taskId → minuteBucket
     private val prefs = context.getSharedPreferences("scheduled_tasks", Context.MODE_PRIVATE)
 
+    // reschedule 互斥锁（2026-10-05 R1-3 修复）：reschedule 被 add/remove/update/clear、
+    // 5 分钟轮询、触发后递归三条路径并发调用，原来"cancel 旧 Job → launch 新 Job"两步之间
+    // 有窗口：两次并发 reschedule 各自 cancel 再各自 launch → **双调度链**，同一时刻任务触发两次；
+    // 且 lastScheduleDate 的跨日检查也可能交错重复清 triggeredToday。整段收进锁。
+    private val rescheduleLock = Any()
     private var mainJob: Job? = null
     private var pollJob: Job? = null
+
+    /** 跨日校准指针。多条写路径经 [rescheduleLock] 互斥后已无撕裂；volatile 供将来无锁读。 */
+    @Volatile
     private var lastScheduleDate: String? = null
 
     /**
@@ -75,6 +92,29 @@ class TaskScheduler(
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
     private val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
     private val minuteFormat = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+
+    /**
+     * 「任务集合变了」的推送回调，由 [attachChangeBroadcaster] 注入。
+     *
+     * 为什么走 attach 而不是构造参数：本类在 `ComponentFactory.buildControllerGraph` 里构造，
+     * 那一层拿不到 `WebSocketManager`（同 `attachConditionEngine` / `attachRuleStore` 的处境）。
+     * null = 不推（单测、或 WS 还没装配好），调度本身照跑。
+     *
+     * 谁需要它：web 端新建任务后，app 只有重新进页面才看得到 —— 因为任务列表是纯 REST
+     * 拉取、没有任何失效通知。现在每次集合变化都推一帧，两端收到就重拉。
+     */
+    @Volatile
+    private var onTasksChanged: (suspend () -> Unit)? = null
+
+    fun attachChangeBroadcaster(broadcaster: suspend () -> Unit) {
+        onTasksChanged = broadcaster
+    }
+
+    /** 非 suspend 调用点用：丢进自己的 scope 发，绝不让推送失败影响增删改的返回值。 */
+    private fun notifyTasksChanged() {
+        val cb = onTasksChanged ?: return
+        scope.launch { runCatching { cb() } }
+    }
 
     init {
         loadTasks()
@@ -95,6 +135,7 @@ class TaskScheduler(
         tasks[task.id] = task
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "Task added: ${task.name} (${task.id}) at ${"%02d".format(task.hour)}:${"%02d".format(task.minute)}")
         return true
     }
@@ -102,8 +143,10 @@ class TaskScheduler(
     fun remove(id: String): Boolean {
         tasks.remove(id) ?: return false
         triggeredToday.remove(id)
+        cronBuckets.remove(id) // 2026-10-05 R1-15 修复：随日界表同步清理
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "Task removed: $id")
         return true
     }
@@ -112,16 +155,20 @@ class TaskScheduler(
         if (!tasks.containsKey(task.id)) return false
         tasks[task.id] = task
         triggeredToday.remove(task.id)
+        cronBuckets.remove(task.id) // 2026-10-05 R1-15 修复：任务更新时重置分钟桶去重
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         return true
     }
 
     fun clear() {
         tasks.clear()
         triggeredToday.clear()
+        cronBuckets.clear() // 2026-10-05 R1-15 修复：随日界表同步清理
         saveTasks()
         reschedule()
+        notifyTasksChanged()
         AppLogger.i(tag, "All tasks cleared")
     }
 
@@ -132,30 +179,36 @@ class TaskScheduler(
      * 只维护一个主 Job，取消旧 Job 后启动新 Job。
      */
     fun reschedule() {
-        mainJob?.cancel()
-        if (paused) return
+        // 整段互斥（2026-10-05 R1-3 修复）：cancel 与 launch 之间不再有窗口，
+        // 并发调用时后进者取消的必然是先进者刚创建的 Job，保证任一时刻只有一条调度链。
+        synchronized(rescheduleLock) {
+            mainJob?.cancel()
+            if (paused) return
 
-        // 检查是否跨日，如是则重置 hasTriggered
-        val todayStr = dateFormat.format(Date())
-        if (lastScheduleDate != todayStr) {
-            lastScheduleDate = todayStr
-            triggeredToday.clear()
-            AppLogger.d(tag, "New day ($todayStr), reset daily triggers")
-        }
+            // 检查是否跨日，如是则重置 hasTriggered
+            val todayStr = dateFormat.format(Date())
+            if (lastScheduleDate != todayStr) {
+                lastScheduleDate = todayStr
+                triggeredToday.clear()
+                cronBuckets.clear() // 2026-10-05 R1-15 修复：跨日同步清分钟桶表
+                AppLogger.d(tag, "New day ($todayStr), reset daily triggers")
+            }
 
-        val nextTriggerMs = getNextTriggerTimeMillis() ?: run {
-            AppLogger.d(tag, "No upcoming triggers, idle")
-            return
-        }
+            val nextTriggerMs = getNextTriggerTimeMillis() ?: run {
+                AppLogger.d(tag, "No upcoming triggers, idle")
+                mainJob = null
+                return
+            }
 
-        val delayMs = (nextTriggerMs - System.currentTimeMillis()).coerceAtLeast(0)
-        val triggerTimeStr = timeFormat.format(Date(nextTriggerMs))
-        AppLogger.i(tag, "Next trigger: $triggerTimeStr (delay=${delayMs / 1000}s)")
+            val delayMs = (nextTriggerMs - System.currentTimeMillis()).coerceAtLeast(0)
+            val triggerTimeStr = timeFormat.format(Date(nextTriggerMs))
+            AppLogger.i(tag, "Next trigger: $triggerTimeStr (delay=${delayMs / 1000}s)")
 
-        mainJob = scope.launch {
-            delay(delayMs)
-            triggerMatchedTasks()
-            reschedule() // 递归调度下一个
+            mainJob = scope.launch {
+                delay(delayMs)
+                triggerMatchedTasks()
+                reschedule() // 递归调度下一个
+            }
         }
     }
 
@@ -229,9 +282,10 @@ class TaskScheduler(
             // 防止重复触发
             if (task.cron != null) {
                 // cron 周期任务按「分钟桶」去重（同分钟只触发一次）
-                val bucketKey = "${task.id}@$minuteBucket"
-                if (triggeredToday[task.id] == bucketKey) continue
-                triggeredToday[task.id] = bucketKey
+                // 2026-10-05 R1-15 修复：桶键移入独立的 cronBuckets 表，不再写入
+                // triggeredToday（那里语义是 taskId → dateStr）
+                if (cronBuckets[task.id] == minuteBucket) continue
+                cronBuckets[task.id] = minuteBucket
             } else {
                 if (task.repeatDaily) {
                     if (triggeredToday[task.id] == todayStr) continue
@@ -262,6 +316,8 @@ class TaskScheduler(
                     val updatedLogs = (tasks[task.id]?.logs ?: emptyList()) + log
                     tasks[task.id] = task.copy(logs = updatedLogs.takeLast(50))
                     saveTasks()
+                    // 执行日志也属于"任务集合变了"：两端的任务详情直接读 task.logs
+                    runCatching { onTasksChanged?.invoke() }
                     AppLogger.i(tag, "Task '${task.name}' ${if (result.success) "succeeded" else "failed"}: ${result.message}")
                 } catch (e: Exception) {
                     val log = ExecutionLog(
@@ -272,6 +328,7 @@ class TaskScheduler(
                     val updatedLogs = (tasks[task.id]?.logs ?: emptyList()) + log
                     tasks[task.id] = task.copy(logs = updatedLogs.takeLast(50))
                     saveTasks()
+                    runCatching { onTasksChanged?.invoke() }
                     AppLogger.e(tag, "Task '${task.name}' exception: ${e.message}")
                 }
             }
@@ -284,7 +341,12 @@ class TaskScheduler(
             shouldPersist = true
         }
 
-        if (shouldPersist) saveTasks()
+        if (shouldPersist) {
+            saveTasks()
+            // 一次性任务触发后自动禁用 —— 这是**无用户操作**的状态变化，不推的话
+            // 两端的开关会一直显示"已启用"，直到用户手动离开再回来。
+            notifyTasksChanged()
+        }
     }
 
     // ──────────── 持久化 ────────────

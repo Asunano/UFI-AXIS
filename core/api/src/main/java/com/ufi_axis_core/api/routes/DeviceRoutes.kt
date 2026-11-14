@@ -1,7 +1,11 @@
 package com.ufi_axis_core.api.routes
 
 import com.ufi_axis_core.api.routes.RouteContext
+import com.ufi_axis_core.api.requireCapability
+import com.ufi_axis_core.contract.Capability
+import com.ufi_axis_core.contract.DeviceFields
 import com.ufi_axis_core.contract.ErrorCode
+import com.ufi_axis_core.contract.NetworkMode
 import io.ktor.http.*
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.call
@@ -12,6 +16,7 @@ import io.ktor.server.routing.*
 import kotlinx.serialization.json.*
 import com.ufi_axis_core.api.ResponseHelper.toJsonElement
 import com.ufi_axis_core.core.cache.CacheTTL
+import com.ufi_axis_core.collector.at.CgeqosrdpParser
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 
 import com.ufi_axis_core.util.AppLogger
@@ -28,14 +33,76 @@ import kotlinx.coroutines.withContext
 class DeviceRoutes(
     private val ctx: RouteContext
 ) {
+    private companion object {
+        /**
+         * 危险 goformId 黑名单（2026-10-05 R4-5 修复）— 裸通道 /device/goform/set 的命令过滤。
+         *
+         * 这些命令与 ATRoutes.DANGEROUS_AT_PATTERNS / ShellRoutes 黑名单同口径：会触发整机
+         * 重启、关机、擦除用户数据。核心层走受控封装（GoformDeviceClient.rebootDevice 等，
+         * 有 UI 确认链路）；裸通道是调试入口，不应能直达这些动作。
+         * 命名字符串逐字取自 ZteGoformProfile 的 WriteSpec 表（:1090-1104）。
+         */
+        val DANGEROUS_GOFORM_IDS = listOf(
+            "REBOOT_DEVICE",      // 整机重启
+            "SHUTDOWN_DEVICE",    // 关机
+            "FACTORY_RESET"       // 恢复出厂（擦除全部配置）
+        )
+
+        /**
+         * DHCP 池跨字段语义校验（2026-10-05 R4-4 修复）。
+         * 返回 null = 通过；否则返回给客户端的错误文案。
+         *
+         * 三条判据（自锁防线）：
+         * 1. 起/止必须是合法 IPv4；
+         * 2. 起 ≤ 止（按无符号整数比较）；
+         * 3. 起/止必须落在 LAN 子网（lanIp AND mask）内 —— 否则设备会把池建在
+         *    管理面网段之外，客户端换到新网段后回不来。
+         */
+        fun validateDhcpRange(lanIp: String, lanNetmask: String, start: String, end: String): String? {
+            val ipToLong = { s: String ->
+                val parts = s.split(".")
+                if (parts.size != 4 || parts.any { it.isEmpty() || it.length > 3 || it.toIntOrNull() !in 0..255 }) null
+                else parts.fold(0L) { acc, p -> (acc shl 8) or (p.toLong() and 0xFF) }
+            }
+            val lan = ipToLong(lanIp) ?: return "LAN IP 非法: $lanIp"
+            val mask = ipToLong(lanNetmask) ?: return "子网掩码非法: $lanNetmask"
+            val s = ipToLong(start) ?: return "DHCP 起始 IP 非法: $start"
+            val e = ipToLong(end) ?: return "DHCP 结束 IP 非法: $end"
+            if (s > e) return "DHCP 起始 IP 不能大于结束 IP"
+            val network = lan and mask
+            if ((s and mask) != network || (e and mask) != network) {
+                return "DHCP 池必须与 LAN ($lanIp/$lanNetmask) 在同一子网内"
+            }
+            return null
+        }
+        /**
+         * `/device/qos` 查不到时的响应骨架。
+         *
+         * 字段**一个不少**（只是空值），这样客户端不需要为"AT 不可用"写第二套解析分支。
+         * `available = false` 专指"这台设备没有 AT 通道"（非展锐平台 / HAL 被裁 / 熔断）；
+         * 通道在但解不出记录时会把它改成 true —— 两种情况的下一步完全不同，
+         * 前者是"这台设备不支持"，后者值得看日志。
+         */
+        val QOS_UNAVAILABLE: Map<String, Any> = mapOf(
+            "available" to false,
+            "cid" to 0,
+            "qci" to 0,
+            "downlink_kbps" to 0L,
+            "uplink_kbps" to 0L,
+            "downlink_display" to "",
+            "uplink_display" to ""
+        )
+    }
+
     // ── 反向兼容 getter，使已有方法无需修改 ──
     private val systemCollector get() = ctx.systemCollector
     private val telephonyCollector get() = ctx.telephonyCollector
     private val atChannel get() = ctx.atChannel
     private val goformClient get() = ctx.goformClient
-    private val signalClient get() = ctx.signalClient
-    private val networkClient get() = ctx.networkClient
-    private val deviceClient get() = ctx.deviceClient
+    // 批 B2 起走 signal 域的设备适配接口（原来是 ctx.signalClient = GoformSignalClient）。
+    // 名字刻意不改：路由体里的调用点一行没动，方法名与语义逐字相同。
+    private val signalClient get() = ctx.deviceHub.signal
+    private val deviceHub get() = ctx.deviceHub
     private val systemController get() = ctx.systemController
     private val cache get() = ctx.responseCache
     private val dataHub get() = ctx.dataHub
@@ -142,7 +209,7 @@ class DeviceRoutes(
                     return@post
                 }
                 AppLogger.w("DeviceRoutes", "goform/query 裸命令: ${cmds.joinToString(",")}")
-                val data = goformClient.query(cmds)
+                val data = goformClient.read(cmds)
                 if (data == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
@@ -168,12 +235,26 @@ class DeviceRoutes(
                 val extraParams = (body["params"] as? JsonObject)?.mapValues { (_, v) ->
                     (v as? JsonPrimitive)?.contentOrNull ?: v.toString()
                 } ?: emptyMap()
+
+                // 危险 goformId 黑名单（2026-10-05 R4-5 修复）：裸通道原本除了 rejectIfCommandDisabled
+                // 没有任何命令过滤 —— REBOOT_DEVICE / FACTORY_RESET / SET_DEVICE_MODE(重启类) /
+                // 静默 OTA 等可从 API 直达设备，与 ATRoutes/ShellRoutes 的黑名单口径不齐。
+                // 命中即 403，不记入 device:goform 缓存失效（命令未执行）。
+                // 注意大小写不敏感：goform 协议历史上两种风格都出现过。
+                val blocked = DANGEROUS_GOFORM_IDS.firstOrNull { it.equals(goformId, ignoreCase = true) }
+                if (blocked != null) {
+                    AppLogger.w("DeviceRoutes", "goform/set 危险命令已拦截: goformId=$goformId")
+                    call.respondFail(HttpStatusCode.Forbidden, ErrorCode.FORBIDDEN,
+                        "危险命令已被禁止通过裸通道执行: $goformId")
+                    return@post
+                }
+
                 // 只记键名：参数值可能是 WiFi 密码 / PIN / APN 凭据
                 AppLogger.w(
                     "DeviceRoutes",
                     "goform/set 裸命令: goformId=$goformId params=[${extraParams.keys.joinToString(",")}]"
                 )
-                val response = goformClient.goformPost(mapOf("goformId" to goformId) + extraParams)
+                val response = goformClient.write(mapOf("goformId" to goformId) + extraParams)
                 if (response == null) {
                     call.respondFail(
                         HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
@@ -205,14 +286,14 @@ class DeviceRoutes(
             // 一次 goform 超时就让本机号码/IMEI/IMSI/ICCID 空掉半小时，刷新页面也无效。
             // 缓存只由 DataHub 负责（它存的已经是归一化后的 canonical 数据）。
             get("/identity") {
-                val data = dataHub?.getDeviceIdentity() ?: signalClient.getDeviceIdentity()
+                val data = dataHub?.getDeviceIdentity() ?: signalClient.getDeviceIdentity()?.values
                 call.respond(toJsonElement(data ?: emptyMap<String, Any>()))
             }
 
             // 设备固件版本（通过 DataHub 获取）
             get("/version") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { getDeviceVersion() } ?: signalClient.getDeviceVersion()
+                    val data = (dataHub?.signalQuery { getDeviceVersion() } ?: signalClient.getDeviceVersion())?.values
                     return toJsonElement(mapOf(
                         "language" to (data?.get("Language")?.jsonPrimitive?.contentOrNull ?: ""),
                         "cr_version" to (data?.get("cr_version")?.jsonPrimitive?.contentOrNull ?: ""),
@@ -226,12 +307,91 @@ class DeviceRoutes(
                 call.respond(toJsonElement(systemController.getDeviceModel()))
             }
 
+            /**
+             * 设备能力集（计划书 §7 的 3.4，2026-09-24 新增）。
+             *
+             * 形状：`{ "plugin_id": "zte-f50", "capabilities": ["sms", "band_lock", …] }`
+             *
+             * ## 三个决定
+             *
+             * 1. **独立端点，不并入 `/api/diagnose`**：能力集是画开关时要读的业务数据，
+             *    不该让前端为了渲染一个开关去拉排障端点（那个端点还会跑 shell 探测）。
+             * 2. **数组而不是 `{"sms": true}` 的 map**：加一项新能力时，map 形状让旧客户端
+             *    分不出「这是个我不认识的新能力」还是「设备不支持」—— 两者的界面行为完全不同。
+             * 3. **带上 `plugin_id`**：与 `/api/diagnose` 的 `device_profile.plugin_id`
+             *    **同源同值**（都取 `DataHub.devicePluginId`），前端画设备卡片时只拉这一个端点就够。
+             *
+             * 顺序按 `Capability` 的声明序，不按 Set 的迭代序 —— 响应稳定才好做快照对比。
+             * 鉴权跟着 `/api` 块的 `AuthMiddleware` 走，**没有任何豁免**。
+             * 不发任何设备查询：取值在装配组件图时就定死了。
+             */
+            get("/capabilities") {
+                val caps = dataHub.deviceCapabilities
+                call.respond(toJsonElement(mapOf(
+                    "plugin_id" to dataHub.devicePluginId,
+                    "capabilities" to Capability.entries.filter { it in caps }.map { it.wire }
+                )))
+            }
+
+
+            /**
+             * EPS 承载 QoS（`AT+CGEQOSRDP`，2026-09-22）。
+             *
+             * 返回默认承载（优先 cid=1）协商到的 QCI 与上下行 AMBR，供仪表盘设备信息卡显示。
+             *
+             * ## 为什么是独立端点而不是塞进 /api/dashboard/summary
+             * summary 是仪表盘 10s 一次的主链路。AT 通道全局互斥、有 500ms 最小间隔与失败退避，
+             * 一次抢锁超时（`ATChannel` 里是 10s）就会把整张仪表盘一起拖住。独立端点 + 5 分钟缓存
+             * 之后，AT 最多每 5 分钟走一次，summary 完全不受影响。
+             *
+             * ## 失败一律回 200 + 空字段，不回 4xx/5xx
+             * AT 通道在很多设备上根本不可用（非展锐平台、HAL 名字不同、被厂商裁掉），
+             * 那是**预期状态**而不是错误。回错误码会让客户端弹一个没法处理的提示；
+             * 回空字段客户端只需要显示"—"。`available` 标明到底是"没这能力"还是"查出来是空"。
+             */
+            get("/qos") {
+                suspend fun fetch(): JsonElement {
+                    if (!atChannel.isConnected || atChannel.isDisabled) {
+                        AppLogger.w("DeviceRoutes", "AT channel unavailable, QoS skipped")
+                        return toJsonElement(QOS_UNAVAILABLE)
+                    }
+                    // 查询类给 5s（ATChannel 默认 3s 偏短，与 NetworkController 的 AT 调用同口径）
+                    val raw = atChannel.sendCommand("AT+CGEQOSRDP", 5000)
+                    val bearer = CgeqosrdpParser.pickPrimary(raw)
+                    if (bearer == null) {
+                        AppLogger.w("DeviceRoutes", "AT+CGEQOSRDP 无可解析记录: ${raw?.take(120)}")
+                        return toJsonElement(QOS_UNAVAILABLE + mapOf("available" to true))
+                    }
+                    return toJsonElement(
+                        mapOf(
+                            "available" to true,
+                            "cid" to bearer.cid,
+                            "qci" to bearer.qci,
+                            // 原始 kbps 一并给出：客户端要换算单位、或以后要画图都不必重新解析
+                            "downlink_kbps" to bearer.downlinkKbps,
+                            "uplink_kbps" to bearer.uplinkKbps,
+                            // 展示文案在 core 生成：两端各写一份换算逻辑迟早对不上
+                            // （一个显示 500 Mbps 一个显示 500.0 Mbps 这种）
+                            "downlink_display" to (CgeqosrdpParser.formatRate(bearer.downlinkKbps) ?: ""),
+                            "uplink_display" to (CgeqosrdpParser.formatRate(bearer.uplinkKbps) ?: "")
+                        )
+                    )
+                }
+                call.respond(
+                    if (cache != null) cache.getOrPut("device:qos", CacheTTL.DEVICE_QOS) { fetch() }
+                    else fetch()
+                )
+            }
+
+
             get("/magisk") {
                 call.respond(toJsonElement(systemController.getMagiskStatus()))
             }
 
             // 重启设备
             post("/reboot") {
+                // 更新互斥（2026-10-05 R4-9 修复）：OTA 拷贝到一半重启可致半写状态。
+                if (call.rejectIfUpdating()) return@post
                 cache?.invalidate("device:*")
                 val success = systemController.reboot()
                 call.respond(
@@ -242,8 +402,10 @@ class DeviceRoutes(
 
             // 恢复出厂设置
             post("/factory-reset") {
+                // 更新互斥（2026-10-05 R4-9 修复）：同 /reboot。
+                if (call.rejectIfUpdating()) return@post
                 cache?.invalidate("*")
-                val success = deviceClient.factoryReset()
+                val success = deviceHub.device.factoryReset()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -252,9 +414,11 @@ class DeviceRoutes(
 
             // 调试模式 (ADB)
             post("/debug") {
+                // 能力门禁（3.3）：缺 usb_debug → 501 NOT_SUPPORTED（由 StatusPages 统一出口）
+                dataHub.deviceCapabilities.requireCapability(Capability.USB_DEBUG)
                 val params = call.receiveJsonObject()
                 val enabled = params["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = deviceClient.setDebugMode(enabled)
+                val success = deviceHub.device.setDebugMode(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
@@ -272,7 +436,7 @@ class DeviceRoutes(
                         "old_password and new_password are required")
                     return@post
                 }
-                val success = deviceClient.changePassword(oldPwd, newPwd)
+                val success = deviceHub.device.changePassword(oldPwd, newPwd)
                 if (success) {
                     // 同步更新后端本地存储的 goform 密码，使后续请求无需重启即可生效
                     settings?.goformPassword = newPwd
@@ -310,7 +474,7 @@ class DeviceRoutes(
 
             // 流量限额配置查询（通过 DataHub 从 goform 读取）
             get("/traffic-limit") {
-                val raw = dataHub?.signalQuery { getDataUsage() } ?: signalClient.getDataUsage()
+                val raw = (dataHub?.signalQuery { getDataUsage() } ?: signalClient.getDataUsage())?.values
                 if (raw == null) {
                     call.respondFail(HttpStatusCode.ServiceUnavailable, ErrorCode.UNAVAILABLE,
                         "无法查询设备流量限额配置，请检查设备连接")
@@ -350,6 +514,8 @@ class DeviceRoutes(
             //   {"mode": "balanced"}    ↔ perfVal=0
             //   {"enabled": true}       ↔ perfVal=1
             post("/performance") {
+                // 能力门禁（3.3）：缺 performance_mode → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.PERFORMANCE_MODE)
                 val p = call.receiveJsonObject()
                 val perfVal = when {
                     p.containsKey("enabled") -> if (p["enabled"]?.jsonPrimitive?.booleanOrNull == true) 1 else 0
@@ -358,7 +524,7 @@ class DeviceRoutes(
                         if (mode == "performance") 1 else 0
                     }
                 }
-                val success = deviceClient.setPerformanceMode(perfVal)
+                val success = deviceHub.device.setPerformanceMode(perfVal)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "performance_mode" to perfVal)))
             }
@@ -367,7 +533,7 @@ class DeviceRoutes(
             post("/led") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: true
-                val success = deviceClient.setIndicatorLight(enabled)
+                val success = deviceHub.device.setIndicatorLight(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -376,7 +542,7 @@ class DeviceRoutes(
             post("/roaming") {
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = networkClient.setRoaming(enabled)
+                val success = deviceHub.network.setRoaming(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -384,8 +550,21 @@ class DeviceRoutes(
             // 查询设备设置状态（通过 DataHub 获取）
             get("/settings") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings()
-                    return toJsonElement(data ?: emptyMap<String, Any>())
+                    val data = (dataHub?.signalQuery { queryDeviceSettings() } ?: signalClient.queryDeviceSettings())
+                        ?.values
+                    val map = (data ?: emptyMap()).toMutableMap()
+                    // 制式中文名由 contract 统一给出（App/Web 不再各译一份）。
+                    // 取 net_select（真机切换后变化的就是它），缺失才回落 BearerPreference；
+                    // 都空则不注入该 key。两端的回读口径与这里一致。
+                    val bearer = map[DeviceFields.DeviceSettings.NET_SELECT]
+                        ?.let { (it as? JsonPrimitive)?.contentOrNull }
+                        ?: map[DeviceFields.DeviceSettings.BEARER_PREFERENCE]
+                            ?.let { (it as? JsonPrimitive)?.contentOrNull }
+                    if (!bearer.isNullOrBlank()) {
+                        map["network_mode_label"] =
+                            JsonPrimitive(NetworkMode.labelFromBearer(bearer))
+                    }
+                    return toJsonElement(map)
                 }
                 call.respond(if (cache != null) cache.getOrPut("device:settings", CacheTTL.DEVICE_SETTINGS) { f() } else f())
             }
@@ -396,6 +575,9 @@ class DeviceRoutes(
             // 历史入参 `enabled` 是**反向**的（true = 禁用），保留一版兼容；
             // 设备侧的 UpgMode 编码在 profile 的 WriteSpec 里，这里只做旧字段翻转（计划书 2.7）。
             post("/fota") {
+                // 能力门禁（3.3）：缺 fota → 501 NOT_SUPPORTED。
+                // 指的是**设备固件**的自动升级开关，与 core 自己的 api/update 那组无关。
+                dataHub.deviceCapabilities.requireCapability(Capability.FOTA)
                 val p = call.receiveJsonObject()
                 val autoUpdate = p["auto_update"]?.jsonPrimitive?.booleanOrNull
                     ?: p["enabled"]?.jsonPrimitive?.booleanOrNull?.let { legacyDisable ->
@@ -404,7 +586,7 @@ class DeviceRoutes(
                         !legacyDisable
                     }
                     ?: true
-                val success = deviceClient.setFotaEnabled(autoUpdate)
+                val success = deviceHub.device.setFotaEnabled(autoUpdate)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf(
                     "success" to success,
@@ -424,9 +606,11 @@ class DeviceRoutes(
 
             // SAMBA 文件共享
             post("/samba") {
+                // 能力门禁（3.3）：缺 samba → 501 NOT_SUPPORTED
+                dataHub.deviceCapabilities.requireCapability(Capability.SAMBA)
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
-                val success = deviceClient.setSambaSetting(enabled)
+                val success = deviceHub.device.setSambaSetting(enabled)
                 if (success) cache?.invalidate("device:settings")
                 call.respond(toJsonElement(mapOf("success" to success, "enabled" to enabled)))
             }
@@ -439,6 +623,11 @@ class DeviceRoutes(
             // web 从邻区列表取 rat 且兜底 'LTE'（设备不认，锁定静默失败）。
             // 名字→数字码的映射现在在 profile 的 WriteSpec 里（计划书 2.6）。
             post("/cell-lock") {
+                // 能力门禁（3.3）：缺 cell_lock → 501 NOT_SUPPORTED。
+                //
+                // 本域的另一个写入口 /cell-unlock **同样要拦**：Capability 是功能域，
+                // 域内所有写入口都必须被同一个门禁覆盖，漏一个就等于留了一条绕过门禁的路。
+                dataHub.deviceCapabilities.requireCapability(Capability.CELL_LOCK)
                 val p = call.receiveJsonObject()
                 val pci = p["pci"]?.jsonPrimitive?.contentOrNull ?: ""
                 val earfcn = p["earfcn"]?.jsonPrimitive?.contentOrNull ?: ""
@@ -453,7 +642,7 @@ class DeviceRoutes(
                         "pci, earfcn, network_type are required")
                     return@post
                 }
-                val outcome = deviceClient.cellLock(pci, earfcn, networkType)
+                val outcome = deviceHub.device.cellLock(pci, earfcn, networkType)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) {
@@ -465,7 +654,15 @@ class DeviceRoutes(
 
             // 解锁所有基站
             post("/cell-unlock") {
-                val success = deviceClient.unlockAllCell()
+                // 能力门禁（3.3）：缺 cell_lock → 501 NOT_SUPPORTED。
+                //
+                // 与 /cell-lock 各拦一次，**不是重复**：Capability 是**功能域**，
+                // 域内**所有写入口**都必须被同一个门禁覆盖。放行本入口，等于给前端留了一条
+                // 绕过门禁、把 goform 请求打到设备再失败的路 —— 那正是阶段 3 要消除的失败模式。
+                // 「解锁在不支持的设备上反正是空操作」不是理由：对外表现必须是明确的
+                // 501「不支持」，而不是一次打到设备的请求 + 一个含义不明的 success。
+                dataHub.deviceCapabilities.requireCapability(Capability.CELL_LOCK)
+                val success = deviceHub.device.unlockAllCell()
                 if (success) {
                     cache?.invalidate("network:cell-info")
                     cache?.invalidate("device:settings")
@@ -476,7 +673,9 @@ class DeviceRoutes(
             // 设备关机
             post("/shutdown") {
                 cache?.invalidate("*")
-                val success = deviceClient.shutdownDevice()
+                // 走 systemController 而不是直连 deviceHub.device：goform 失败时要有
+                // `svc power shutdown` 兜底，与 /reboot 同口径
+                val success = systemController.shutdown()
                 call.respond(
                     if (success) HttpStatusCode.OK else HttpStatusCode.InternalServerError,
                     toJsonElement(mapOf("success" to success))
@@ -488,7 +687,7 @@ class DeviceRoutes(
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 val time = p["time"]?.jsonPrimitive?.contentOrNull ?: "00:00"
-                val outcome = deviceClient.setRestartSchedule(enabled, time)
+                val outcome = deviceHub.device.setRestartSchedule(enabled, time)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:settings")
@@ -505,7 +704,22 @@ class DeviceRoutes(
                 val dhcpStart = p["dhcp_start"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpEnd = p["dhcp_end"]?.jsonPrimitive?.contentOrNull ?: ""
                 val dhcpLease = p["dhcp_lease"]?.jsonPrimitive?.contentOrNull ?: "86400"
-                val outcome = deviceClient.setDhcpSetting(lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease)
+
+                // 语义校验（2026-10-05 R4-4 修复）：此前只靠 profile 的语法校验（是否是 IP 字面量），
+                // 起 > 止、跨网段、甚至起止不在 LAN 子网内都能下发 —— DHCP 池错乱后客户端拿不到
+                // 正确的租约，管理面 IP 一旦漂出旧网段就自锁（只能恢复出厂）。
+                // 在 API 层拦下（profile 只管单字段语法，跨字段语义在这里）。
+                if (dhcpType == "SERVER") {
+                    val fail = validateDhcpRange(lanIp, lanNetmask, dhcpStart, dhcpEnd)
+                    if (fail != null) {
+                        call.respondFail(HttpStatusCode.BadRequest, ErrorCode.BAD_REQUEST, fail)
+                        return@post
+                    }
+                }
+
+                val outcome = deviceHub.device.setDhcpSetting(
+                    lanIp, lanNetmask, dhcpType, dhcpStart, dhcpEnd, dhcpLease
+                )
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:lan")
@@ -520,6 +734,11 @@ class DeviceRoutes(
             // 其中一份（app NotificationCenter.parseLimitMb）解析不出复合格式，
             // 导致流量告警在 GB 档位下永不触发。
             post("/data-limit") {
+                // 能力门禁（3.3）：缺 traffic_limit → 501 NOT_SUPPORTED。
+                // 放在**读请求体之前**：这个端点顺带落盘 core 自制的「到阈值自动关网」开关，
+                // 设备侧限额写不下去时那个开关单独打开也没有意义（它的判据就是设备的限额与用量），
+                // 所以整个端点一起不可用，不做「只写 core 那半边」的半成功。
+                dataHub.deviceCapabilities.requireCapability(Capability.TRAFFIC_LIMIT)
                 val p = call.receiveJsonObject()
                 val enabled = p["enabled"]?.jsonPrimitive?.booleanOrNull ?: false
                 var limitValue = p["limit_value"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
@@ -552,7 +771,7 @@ class DeviceRoutes(
                     )
                     if (next != cur) TrafficAutoOffGuard.writeConfig(s, next)
                 }
-                val outcome = networkClient.setDataLimit(
+                val outcome = deviceHub.network.setDataLimit(
                     enabled, limitValue, limitUnit, alertPercent, autoClear, clearDate)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
@@ -577,7 +796,7 @@ class DeviceRoutes(
                 val value = p["value"]?.jsonPrimitive?.contentOrNull
                     ?: (if (target == "time") p["time"] else p["data"])?.jsonPrimitive?.contentOrNull
                     ?: "0"
-                val outcome = networkClient.calibrateFlow(target, value)
+                val outcome = deviceHub.network.calibrateFlow(target, value)
                 if (call.respondRejected(outcome)) return@post
                 val success = outcome.ok
                 if (success) cache?.invalidate("device:traffic-limit")
@@ -588,7 +807,7 @@ class DeviceRoutes(
 
             get("/lan-settings") {
                 suspend fun f(): JsonElement {
-                    val data = dataHub?.signalQuery { getLanSettings() } ?: signalClient.getLanSettings()
+                    val data = (dataHub?.signalQuery { getLanSettings() } ?: signalClient.getLanSettings())?.values
                     return toJsonElement(data ?: emptyMap<String, Any>())
                 }
                 call.respond(if (cache != null) cache.getOrPut("device:lan", CacheTTL.LAN_SETTINGS) { f() } else f())

@@ -68,6 +68,9 @@ class ShellRoutes(
         route.route("/shell") {
             // 执行命令（需 root）
             post("/exec") {
+                // 写门（2026-10-05 P0-2 批次补全 R4-9 覆盖面）：root shell 可 rm 更新临时文件 /
+                // 杀更新进程，在更新进行中先拒绝，避免把状态机打进卡死。
+                if (call.rejectIfUpdating()) return@post
                 val body = call.receiveJsonObject()
                 val cmd = body["command"]?.jsonPrimitive?.contentOrNull ?: ""
                 val asRoot = body["as_root"]?.jsonPrimitive?.booleanOrNull ?: true

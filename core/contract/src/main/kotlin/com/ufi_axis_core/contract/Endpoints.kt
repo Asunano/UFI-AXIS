@@ -117,6 +117,25 @@ object Endpoints {
         const val CONNECTION_MODE = "$BASE/connection-mode"
     }
 
+    /**
+     * 设备（`DeviceRoutes`）。**只登记本次改到的那一个** ——
+     * `/device` 下还有二十多个端点未搬进来，按本文件的规则不追求一次性覆盖。
+     */
+    object Device {
+        const val BASE = "$API/device"
+
+        /**
+         * 设备能力集（2026-09-24 阶段 3.4 新增）：`{ plugin_id, capabilities: ["sms", …] }`。
+         *
+         * 取值域是 [Capability] 的 `wire` 名。**刻意不并入 [DIAGNOSE]**：
+         * 能力集是画开关时要读的业务数据，不该让前端为了渲染一个开关去拉排障端点。
+         *
+         * 形状是**数组**而不是 `{"sms": true}` 这种 map：新增一项时，
+         * map 形状让旧客户端分不出「这是个新能力」还是「设备不支持」。
+         */
+        const val CAPABILITIES = "$BASE/capabilities"
+    }
+
     object Shell {
         const val BASE = "$API/shell"
 
@@ -149,6 +168,22 @@ object Endpoints {
         const val UPLOAD = "$BASE/upload"
         /** GET/POST：`url` 必须是白名单外网节点地址；转发 Range / 流式 body */
         const val RELAY = "$BASE/relay"
+        /** POST：手动触发一轮定时测速（跑+入库+广播+通知，2026-10-06） */
+        const val RUN = "$BASE/run"
+        /** GET ?limit=：测速历史（新的在前） */
+        const val HISTORY = "$BASE/history"
+    }
+
+    /**
+     * 网络诊断工具集（2026-10-06 实用功能批·拍板第1项）。
+     * 全部无 root：ping/系统 resolver/TCP connect/TTL traceroute。
+     */
+    object Diagnostic {
+        const val BASE = "$API/diagnostic"
+        const val PING = "$BASE/ping"
+        const val DNS = "$BASE/dns"
+        const val TCP = "$BASE/tcp"
+        const val TRACEROUTE = "$BASE/traceroute"
     }
 
     /**
@@ -310,4 +345,32 @@ object Endpoints {
 
     /** WebSocket 实时通道，订阅协议见 [WsChannel]。 */
     const val WS_REALTIME = "ws/realtime"
+
+    /**
+     * 配对 / 安全通道（`PairingRoutes`，2026-10-05 R4-12 入 contract）。
+     * web 首次连接走 challenge→confirm 换取会话令牌；change-password 修改配对口令。
+     */
+    object Pairing {
+        const val BASE = "pairing"
+        const val CHALLENGE = "$BASE/challenge"
+        const val CONFIRM = "$BASE/confirm"
+        const val CHANGE_PASSWORD = "$BASE/change-password"
+    }
+
+    /**
+     * 应用管理（`AppRoutes`，2026-10-05 P0-2 入 contract）。
+     *
+     * [Apps.INSTALL_URL] 的 `sha256` **必填**（64 hex）：core 下载后流式校验，
+     * 不匹配即删临时文件拒装 —— 此前任意 URL 下载后直接 root 静默安装，
+     * 是 P0-2 定级的局域网投毒通道。
+     */
+    object Apps {
+        const val BASE = "$API/apps"
+        const val INSTALL = "$BASE/install"
+        const val INSTALL_URL = "$BASE/install-url"
+        const val UNINSTALL = "$BASE/uninstall"
+    }
+
+    /** 健康检查（core 进程存活探针，无鉴权）。 */
+    const val HEALTH = "health"
 }

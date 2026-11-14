@@ -48,6 +48,16 @@ class TunnelManager(private val appContext: android.content.Context) {
 
     private val guardScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * startGuard/stopGuard 的互斥锁（2026-10-05 R1-4 修复）。
+     *
+     * **必须声明在 init{} 之前**：init 块会调 startGuard() → synchronized(guardLock)。
+     * 曾因声明在 startGuard 函数之后（Kotlin 按声明序初始化属性）导致 init 先跑、
+     * 锁还是 null → ART "Null reference used for synchronization (monitor-enter)"，
+     * core 起不来（2026-10-07 真机 R8 包复现，retrace 定位到本行）。
+     */
+    private val guardLock = Any()
+
     @Volatile private var guardJob: Job? = null
 
     /** name → 连续重连失败次数；用户手动启动会清零 */
@@ -219,16 +229,22 @@ class TunnelManager(private val appContext: android.content.Context) {
      * 所以用户在设置页开关一下即时生效，不需要重启服务。
      */
     fun startGuard() {
-        if (guardJob?.isActive == true) return
-        guardJob = guardScope.launch {
-            delay(FIRST_PASS_DELAY_MS)
-            while (isActive) {
-                try {
-                    guardPass()
-                } catch (e: Exception) {
-                    AppLogger.w(TAG, "Tunnel guard pass failed: ${e.message}")
+        // check-then-act 互斥（2026-10-05 R1-4 修复）：原来 `if (guardJob?.isActive == true) return`
+        // 后再 launch，两次并发调用可各自通过检查 → 双看护循环。双循环的恶果是每一轮
+        // guardPass 都跑两遍：失败计数翻倍增速、重复拉起隧道进程、日志混淆。
+        // synchronized 块内完成"检查+赋值"，cancel 掉任何残留旧 job 后再起新的。
+        synchronized(guardLock) {
+            if (guardJob?.isActive == true) return
+            guardJob = guardScope.launch {
+                delay(FIRST_PASS_DELAY_MS)
+                while (isActive) {
+                    try {
+                        guardPass()
+                    } catch (e: Exception) {
+                        AppLogger.w(TAG, "Tunnel guard pass failed: ${e.message}")
+                    }
+                    delay(settings.tunnelReconnectIntervalSec * 1000L)
                 }
-                delay(settings.tunnelReconnectIntervalSec * 1000L)
             }
         }
         AppLogger.i(TAG, "Tunnel guard started")
@@ -236,8 +252,13 @@ class TunnelManager(private val appContext: android.content.Context) {
 
     /** 停止看护。**必须在 [shutdown] 停实例之前调用**，否则看护会跟停止流程抢着重启。 */
     fun stopGuard() {
-        guardJob?.cancel()
-        guardJob = null
+        // 同锁取消（2026-10-05 R1-4 修复）：防止与 startGuard 交错时 cancel 掉新启动的 job。
+        val job = synchronized(guardLock) {
+            val j = guardJob
+            guardJob = null
+            j
+        }
+        job?.cancel()
     }
 
     /** 一轮巡检：期望在跑但实际没在跑 → 拉起；配置已被删 → 移出期望集合 */
@@ -518,6 +539,12 @@ class TunnelManager(private val appContext: android.content.Context) {
 
     // ── CF 隧道 CRUD ──
 
+    /** legacy token 迁移只跑一次的闸门（见 [migrateLegacyCfToken]）。 */
+    @Volatile private var legacyCfMigrated = false
+
+    /** CF token 的格式校验（供 API 层在 PUT 时返回具体拒绝原因）。null = 通过。 */
+    fun cfTokenRejectReason(rawToken: String): String? = cfEngine.tokenRejectReason(rawToken)
+
     /** 当前选中的 CF 隧道（自愈规则同 FRP） */
     fun activeCfTunnel(): String {
         migrateLegacyCfToken()
@@ -530,19 +557,29 @@ class TunnelManager(private val appContext: android.content.Context) {
     }
 
     /**
-     * 一次性迁移旧版单隧道 token：prefs 里的 token → tunnels/default.token，成功后清空 prefs。
+     * 一次性迁移旧版单隧道 token：prefs 里的 token → tunnels/default.token，之后**无条件**清空 prefs。
+     *
+     * 2026-09-21 两处修正：
+     * 1. 进程内只跑一次（[legacyCfMigrated]）。此前它被 [activeCfTunnel] 每次调用都跑一遍，
+     *    也就是每个 `GET /api/tunnel/cf/tunnels` 都跑 —— 一旦 `tunnel_cf_token` 被备份恢复
+     *    写回 prefs，下一次列表刷新就会凭那个陈旧 token 凭空重建一条叫 `default` 的隧道，
+     *    还可能把「当前选中」顶成它。这是"选中异常 + 启动报 token 无效"的一条真实路径。
+     * 2. 无论保存成功与否都清空 prefs。`saveTunnel` 现在会做结构校验，陈旧/损坏的 legacy token
+     *    会被拒绝；若沿用旧的"仅成功才清空"，这条坏 token 会永久留在 prefs 里反复重试。
      */
     fun migrateLegacyCfToken() {
+        if (legacyCfMigrated) return
+        legacyCfMigrated = true
         val legacy = settings.tunnelCfToken
         if (legacy.isBlank()) return
-        if (cfEngine.tunnelExists("default")) {
-            settings.tunnelCfToken = ""
-            return
-        }
+        // 先清 prefs：后面无论走哪条分支都不该再留着它
+        settings.tunnelCfToken = ""
+        if (cfEngine.tunnelExists("default")) return
         if (cfEngine.saveTunnel("default", legacy)) {
-            settings.tunnelCfToken = ""
             if (settings.tunnelCfActiveTunnel.isBlank()) settings.tunnelCfActiveTunnel = "default"
             AppLogger.i(TAG, "Migrated legacy CF token into tunnels/default.token")
+        } else {
+            AppLogger.w(TAG, "Legacy CF token rejected by validation; dropped (no tunnel created)")
         }
     }
 

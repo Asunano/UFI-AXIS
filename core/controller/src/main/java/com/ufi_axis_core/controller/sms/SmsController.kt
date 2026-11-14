@@ -2,11 +2,12 @@ package com.ufi_axis_core.controller.sms
 
 import android.content.Context
 import android.net.Uri
-import com.ufi_axis_core.controller.goform.GoformSmsClient
 import com.ufi_axis_core.core.database.SmsReadState
 import com.ufi_axis_core.core.database.SmsReadStateDao
 import com.ufi_axis_core.core.database.SmsVerificationCode
 import com.ufi_axis_core.core.database.SmsVerificationCodeDao
+import com.ufi_axis_core.devicespi.adapter.SendVerdict
+import com.ufi_axis_core.devicespi.adapter.SmsControl
 import com.ufi_axis_core.util.AppLogger
 import kotlinx.coroutines.CancellationException
 import kotlinx.serialization.json.*
@@ -27,7 +28,7 @@ import kotlinx.serialization.json.*
  */
 class SmsController(
     private val context: Context? = null,
-    private val smsClient: GoformSmsClient? = null,
+    private val smsClient: SmsControl? = null,
     private val smsReadStateDao: SmsReadStateDao? = null,
     private val vcDao: SmsVerificationCodeDao? = null,
     /**
@@ -288,6 +289,85 @@ class SmsController(
     }
 
 
+    /**
+     * 按号码删除整段会话（2026-09-21）。
+     *
+     * ContentResolver 优先（`content://sms` WHERE address=phone）；ContentResolver 失败时
+     * 走 goform 兜底——先拉列表定位全部 goform id，再逐条删除。
+     * 级联清理：本地已读状态 + 验证码缓存。
+     *
+     * @return 删除的短信数量，-1 表示全部失败
+     */
+    suspend fun deleteConversation(phone: String): Int {
+        if (phone.isBlank()) return -1
+        // ① ContentResolver 批量删（address=phone 的全部行）
+        try {
+            val ctx = context
+            if (ctx != null) {
+                // 先收集该号码下全部 id（供级联清理验证码缓存用）
+                val ids = mutableListOf<Long>()
+                ctx.contentResolver.query(
+                    Uri.parse("content://sms"), arrayOf("_id"),
+                    "address=?", arrayOf(phone), null
+                )?.use { c -> while (c.moveToNext()) ids.add(c.getLong(0)) }
+
+                val rows = ctx.contentResolver.delete(
+                    Uri.parse("content://sms"), "address=?", arrayOf(phone)
+                )
+                if (rows > 0) {
+                    // 级联清理验证码缓存
+                    ids.forEach { id ->
+                        try { vcDao?.deleteByMsgId(id) } catch (e: CancellationException) { throw e } catch (_: Exception) {}
+                    }
+                    AppLogger.i(tag, "deleteConversation(${phone.maskPhone()}): deleted $rows via ContentResolver")
+                    return rows
+                }
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            AppLogger.w(tag, "deleteConversation via ContentResolver failed for phone=${phone.maskPhone()}: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        // ② goform 兜底：拉列表 → 按号码过滤 → 逐条删
+        try {
+            smsClient?.let { gc ->
+                val smsData = gc.getSmsList(perPage = 500) ?: return@let
+                val arr = smsData["messages"]?.jsonArray ?: return@let
+                val targetIds = arr.mapNotNull { el ->
+                    val obj = el.jsonObject
+                    val num = obj["number"]?.jsonPrimitive?.contentOrNull ?: ""
+                    if (num == phone) obj["id"]?.jsonPrimitive?.longOrNull else null
+                }
+                if (targetIds.isEmpty()) return 0
+                var deleted = 0
+                for (gfId in targetIds) {
+                    if (gc.deleteSms(gfId.toString())) deleted++
+                }
+                AppLogger.i(tag, "deleteConversation(${phone.maskPhone()}): deleted $deleted/${targetIds.size} via goform")
+                return deleted
+            }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) {
+            AppLogger.w(tag, "deleteConversation via goform failed for phone=${phone.maskPhone()}: ${e.javaClass.simpleName}: ${e.message}")
+        }
+        return -1
+    }
+
+    /** 日志里的号码只留尾四位：诊断够用，完整手机号属于个人信息，不该落在日志里。 */
+    private fun String.maskPhone(): String = if (length <= 4) "***" else "***" + takeLast(4)
+
+    /**
+     * 批量删除多条短信（2026-09-21）。逐条调 [delete]。
+     * @return 成功删除的数量
+     */
+    suspend fun deleteBatch(ids: List<Long>): Int {
+        var deleted = 0
+        for (id in ids) {
+            if (delete(id)) deleted++
+        }
+        return deleted
+    }
+
     suspend fun delete(id: Long): Boolean {
         // ① ContentResolver 直删（Android 4.4+ 非默认短信应用通常被拒，静默降级）
         try {
@@ -432,8 +512,8 @@ class SmsController(
 
 
     /**
-     * 发送短信。唯一通道是 goform `SEND_SMS`（见 `GoformSmsClient.sendSms`）——
-     * 读取走 ContentResolver、发送走 goform 是刻意的不对称，理由见类注释。
+     * 发送短信。唯一通道是 sms 域的 `SmsControl.sendSms`（goform 系的实现是 `GoformSmsClient`
+     * 的 `SEND_SMS`）—— 读取走 ContentResolver、发送走设备侧是刻意的不对称，理由见类注释。
      *
      * 结果直接采用客户端**回读设备信箱**后的结论：固件回 `success` 只表示进了发送队列，
      * 真发失败时信箱行 `tag=3`，那种情况必须报错，不能让 UI 显示假的"发送成功"。
@@ -446,15 +526,20 @@ class SmsController(
         return try {
             val outcome = gc.sendSms(phoneNumber, message)
             when (outcome.verdict) {
-                GoformSmsClient.SendVerdict.SENT -> SendResult(true, "已发送")
+                SendVerdict.SENT -> SendResult(true, "已发送")
                 // 未确认不等于失败（设备可能只是慢），按成功回但把状态说清楚
-                GoformSmsClient.SendVerdict.PENDING -> SendResult(true, "已提交设备：${outcome.detail}")
-                GoformSmsClient.SendVerdict.FAILED -> SendResult(false, outcome.detail)
+                SendVerdict.PENDING -> SendResult(true, "已提交设备：${outcome.detail}")
+                SendVerdict.FAILED -> SendResult(false, outcome.detail)
                 // 两档"没发成功"对手动发送是同一个结果（失败 + 说明），只是原因不同：
                 // REJECTED 是设备明确拒收、NO_RESPONSE 是拿不到设备表态（可能已发出，别盲目重发）。
-                GoformSmsClient.SendVerdict.REJECTED,
-                GoformSmsClient.SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
+                SendVerdict.REJECTED,
+                SendVerdict.NO_RESPONSE -> SendResult(false, "发送失败：${outcome.detail}")
             }
+        } catch (e: CancellationException) {
+            // 与本文件其它 suspend 方法同一条纪律：取消**不是**业务失败。
+            // 吞掉它会让「请求被客户端断开 / 上层 scope 取消」变成一条假的"发送失败"
+            // 提示给用户，而用户看到失败就会去手动重发 —— 那才是真花钱。
+            throw e
         } catch (e: Exception) {
             AppLogger.e(tag, "send failed", e)
             SendResult(false, "发送失败（${e.javaClass.simpleName}: ${e.message ?: "-"}）")

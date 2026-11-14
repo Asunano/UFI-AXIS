@@ -30,6 +30,7 @@ class AppSettings(context: Context) {
         private const val KEY_FIELD_NORMALIZATION = "field_normalization_enabled"
         private const val KEY_GOFORM_DUMP_ENABLED = "goform_dump_enabled"
         private const val KEY_GOFORM_COMMAND_ENABLED = "goform_command_enabled"
+        private const val KEY_TTYD_ENABLED = "ttyd_enabled"
         private const val KEY_DEBUG_MODE = "debug_mode"
         private const val KEY_LOG_ENABLED = "log_enabled"
         private const val KEY_CORE_LOG_ENABLED = "core_log_enabled"
@@ -42,10 +43,25 @@ class AppSettings(context: Context) {
         private const val KEY_ADB_AUTO_START = "adb_auto_start_on_boot"
         private const val KEY_ALERT_CONFIG = "alert_config"
         private const val KEY_TRAFFIC_DAILY_BASELINE = "traffic_daily_baseline"
+        private const val KEY_TRAFFIC_HOURLY_SAMPLER = "traffic_hourly_sampler"
         private const val KEY_TRAFFIC_AUTO_OFF_CONFIG = "traffic_auto_off_config"
         private const val KEY_TRAFFIC_AUTO_OFF_STATE = "traffic_auto_off_state"
         private const val KEY_MONITOR_PREFERENCES = "monitor_preferences"
         private const val KEY_NOTIFICATION_CONFIG = "notification_config"
+        private const val KEY_WEATHER_CONFIG = "weather_config"
+        private const val KEY_POETRY_CONFIG = "poetry_config"
+        // 今日诗词的用户 token：上游用它区分用户，永久有效。同一设备必须固定一个 ——
+        // 裸调会让它每次新签一个，同 IP 多 token 会被判成多用户、拉低推荐质量。
+        private const val KEY_POETRY_TOKEN = "poetry_token"
+        // 出网国家/地区检测结果（2026-09-18，`/api/geo`）：值 + 检测时刻分两个键存 ——
+        // "什么时候测的" 决定要不要重测，跟"测出来是哪"是两件事，合成一个字符串就没法各自备份。
+        private const val KEY_GEO_COUNTRY = "geo_country"
+        private const val KEY_GEO_DETECTED_AT = "geo_detected_at"
+        private const val KEY_MEDIA_SCAN_DIRS = "media_scan_dirs"
+
+        // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+        private const val KEY_THUMB_PREWARM_ENABLED = "thumb_prewarm_enabled"
+        private const val KEY_THUMB_PREWARM_WIFI_ONLY = "thumb_prewarm_wifi_only"
         private const val KEY_ARIA2_RPC_SECRET = "aria2_rpc_secret"
 
         // ── 更新通道（2026-08-10：后端自拉取更新）──
@@ -53,6 +69,11 @@ class AppSettings(context: Context) {
 
         // ── 更新镜像前缀（2026-08-12：可配置，空串=直连）──
         private const val KEY_UPDATE_MIRROR_BASE = "update_mirror_base"
+
+        // ── 更新下载方式（2026-09-22：决策下沉 core，见 docs/update-source-core-plan.md）──
+        // 这是**唯一决策字段**；KEY_UPDATE_MIRROR_BASE 自此降级为「自定义前缀覆盖」，
+        // 不再表达「用不用镜像」。
+        private const val KEY_UPDATE_SOURCE_MODE = "update_source_mode"
 
         // ── 更新状态持久化（2026-08-10 P0-4/P0-2：RESULT 机制最小版）──
         private const val KEY_PENDING_UPDATE = "pending_update"
@@ -144,6 +165,8 @@ class AppSettings(context: Context) {
             BackupField(KEY_FIELD_NORMALIZATION, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_DUMP_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_GOFORM_COMMAND_ENABLED, BackupValueType.BOOL),
+            // 真 PTY 终端（2026-10-06）：开关进备份，恢复后语义与原机一致
+            BackupField(KEY_TTYD_ENABLED, BackupValueType.BOOL),
             // 日志
             BackupField(KEY_DEBUG_MODE, BackupValueType.BOOL),
             BackupField(KEY_LOG_ENABLED, BackupValueType.BOOL),
@@ -161,9 +184,20 @@ class AppSettings(context: Context) {
             BackupField(KEY_TRAFFIC_AUTO_OFF_CONFIG, BackupValueType.STRING),
             BackupField(KEY_MONITOR_PREFERENCES, BackupValueType.STRING),
             BackupField(KEY_NOTIFICATION_CONFIG, BackupValueType.STRING),
+            // 天气（城市与坐标是"这台设备放在哪"，换设备仍成立，故在列）
+            BackupField(KEY_WEATHER_CONFIG, BackupValueType.STRING),
+            // 今日诗词（只有开关与展示偏好；token 不备份 —— 它是"这台设备在上游的身份"，
+            // 换设备应重新签发，跟着备份走反而会让两台设备共用一个 token）
+            BackupField(KEY_POETRY_CONFIG, BackupValueType.STRING),
+            // 出网国家/地区（`/api/geo`）：换设备通常还在同一地区，还原过去能省掉一次出网检测。
+            // 检测时刻 `geo_detected_at` **不在列** —— 那是"这台设备什么时候测的"，跟着备份走
+            // 只会让新设备以为刚测过、迟迟不重测；它缺省为 0 正好等于"没测过"，会立刻重测一次。
+            BackupField(KEY_GEO_COUNTRY, BackupValueType.STRING),
             // 更新源
             BackupField(KEY_UPDATE_URL, BackupValueType.STRING),
             BackupField(KEY_UPDATE_MIRROR_BASE, BackupValueType.STRING),
+            // 下载方式（2026-09-22）：还原到另一台设备时 `auto` 最安全 —— 它按新设备的地区重判
+            BackupField(KEY_UPDATE_SOURCE_MODE, BackupValueType.STRING),
             // 短信
             BackupField(KEY_SMS_CODE_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_SMS_CODE_CLEANUP_HOURS, BackupValueType.INT, 1, 720),
@@ -173,6 +207,9 @@ class AppSettings(context: Context) {
             // 配对配额（不是凭据，是策略）
             BackupField(KEY_PAIRING_ENABLED, BackupValueType.BOOL),
             BackupField(KEY_PAIRING_MAX_DEVICES, BackupValueType.INT, 0, 100),
+            // 媒体封面预热（G6）：用户偏好，换设备仍成立
+            BackupField(KEY_THUMB_PREWARM_ENABLED, BackupValueType.BOOL),
+            BackupField(KEY_THUMB_PREWARM_WIFI_ONLY, BackupValueType.BOOL),
             // 隧道
             BackupField(KEY_TUNNEL_AUTO_RECONNECT, BackupValueType.BOOL),
             BackupField(KEY_TUNNEL_RECONNECT_INTERVAL, BackupValueType.INT, 10, 120),
@@ -181,7 +218,11 @@ class AppSettings(context: Context) {
             BackupField(KEY_TUNNEL_CF_ACTIVE, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_FRP_DESIRED, BackupValueType.STRING),
             BackupField(KEY_TUNNEL_CF_DESIRED, BackupValueType.STRING),
-            BackupField(KEY_TUNNEL_CF_TOKEN, BackupValueType.STRING, sensitive = true),
+            // 2026-09-21 移除 KEY_TUNNEL_CF_TOKEN：它是旧版单隧道时代的**全局** token 槽，
+            // 现在 token 每条隧道一个文件（由 BackupAssembler 按文件备份）。留在这里的后果是
+            // 恢复备份会把陈旧 token 写回 prefs，而 migrateLegacyCfToken 会凭它凭空重建一条
+            // 叫 `default` 的隧道、还可能顶掉「当前选中」—— 一个全局槽能伪造出一条隧道，
+            // 正是「多目标配置各存一份」要禁掉的形态。
             // 采集调度（范围与各自 getter 的夹取一致）
             BackupField(KEY_MON_RETENTION_DAYS, BackupValueType.INT, 1, 90),
             BackupField(KEY_MON_FLUSH_SEC, BackupValueType.INT, 5, 300),
@@ -234,6 +275,8 @@ class AppSettings(context: Context) {
         private const val KEY_MON_THERMAL_WARN_C = "monitor_thermal_warn_c"
         private const val KEY_MON_THERMAL_CRIT_C = "monitor_thermal_critical_c"
         private const val KEY_MON_THERMAL_PAUSE_SEC = "monitor_thermal_pause_sec"
+        private const val KEY_MON_BOOT_GRACE_MS = "monitor_boot_grace_ms"
+        private const val KEY_ALERT_LEVEL_STATE = "alert_level_state_json"
         // 2026-09-08 补齐：这两个是 2026-09-03 那次改造漏掉的最后两个编译期常量
         private const val KEY_MON_TRAFFIC_LIMIT_CHECK_SEC = "monitor_traffic_limit_check_sec"
         private const val KEY_MON_DEVICE_EVENT_CHECK_SEC = "monitor_device_event_check_sec"
@@ -278,6 +321,22 @@ class AppSettings(context: Context) {
 
         /** 默认更新镜像前缀（与旧写死行为一致：设备在国内访问 GitHub 时自动加速） */
         const val DEFAULT_UPDATE_MIRROR_BASE = "https://mirror.drxian.qzz.io/"
+
+        // ── 更新下载方式（2026-09-22）──
+        // 三端（core / app / web）共用这三个取值；core 是唯一决策方。
+        const val UPDATE_MODE_AUTO = "auto"
+        const val UPDATE_MODE_MIRROR = "mirror"
+        const val UPDATE_MODE_DIRECT = "direct"
+
+        /** 合法取值集合。收到集合外的值一律回落 [UPDATE_MODE_AUTO] 并打 WARN。 */
+        val UPDATE_MODES = setOf(UPDATE_MODE_AUTO, UPDATE_MODE_MIRROR, UPDATE_MODE_DIRECT)
+
+        /**
+         * 默认下载方式。
+         * `auto` 而不是 `mirror`：镜像只在国内更快，海外走 gh-proxy 往往更慢甚至不可达，
+         * 所以「不知道设备在哪」时的正确默认是让 core 自己去看地区。
+         */
+        const val DEFAULT_UPDATE_SOURCE_MODE = UPDATE_MODE_AUTO
 
         // 默认 goform 口令的只读访问器（非 const val，避免被调用方字节码内联）。
         val defaultGoformPassword: String get() = DEFAULT_GOFORM_PASSWORD
@@ -691,6 +750,20 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_GOFORM_COMMAND_ENABLED, false)
         set(value) = prefs.edit().putBoolean(KEY_GOFORM_COMMAND_ENABLED, value).apply()
 
+    /**
+     * 真 PTY 终端开关（ttyd 反代，2026-10-06）：**默认关**。
+     *
+     * 与 goform_dump_enabled / goform_command_enabled 同一防御模型：开关本身就是安全边界。
+     * 打开后 core 会按需 spawn assets/shell/ttyd（只绑 127.0.0.1），浏览器凭 PTY 票据经
+     * core 的 WS 反代获得一个**可交互**的设备 shell —— 等于把整台设备的命令行交给
+     * 持 token 的客户端，所以必须由用户显式打开（设置里手动拨开关），且随手可关。
+     * 关闭时：pty-ticket 端点 403、已有 WS 反代连接被拒，但**不主动 kill** 已在跑的
+     * ttyd 进程（惰性退出：core 重启后自然消失；需要立即回收用 /api/service/restart）。
+     */
+    var ttydEnabled: Boolean
+        get() = prefs.getBoolean(KEY_TTYD_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_TTYD_ENABLED, value).apply()
+
     // --- Debug ---
 
     /**
@@ -764,12 +837,68 @@ class AppSettings(context: Context) {
 
     /**
      * 更新镜像前缀（gh-proxy 风格，直接拼接在 GitHub 完整 URL 前；2026-08-12 由写死常量改为可配置）。
-     * 默认 `https://mirror.drxian.qzz.io/` 维持现有自动镜像行为；设为空串 = 直连 GitHub。
-     * 仅对 GitHub 相关域名生效（见 UpdateManager.GITHUB_HOSTS），非 GitHub 域名不受影响。
+     *
+     * **2026-09-22 起语义变更**：它不再表达「用不用镜像」——那由 [updateSourceMode] 决定。
+     * 这里只是「自定义前缀覆盖」：非空且不在内置列表里时，作为候选列表的第一个
+     * （见 `MirrorResolver`）。老配置里的自定义前缀因此不会失效。
+     * 仅对 GitHub 相关域名生效，非 GitHub 域名不受影响。
      */
     var updateMirrorBase: String
         get() = prefs.getString(KEY_UPDATE_MIRROR_BASE, DEFAULT_UPDATE_MIRROR_BASE) ?: DEFAULT_UPDATE_MIRROR_BASE
         set(value) = prefs.edit().putString(KEY_UPDATE_MIRROR_BASE, value).apply()
+
+    /**
+     * 更新下载方式：`auto` / `mirror` / `direct`（2026-09-22，决策下沉 core）。
+     *
+     * 这是**唯一决策字段**，app 与 web 只读写它。取值非法时回落 [DEFAULT_UPDATE_SOURCE_MODE]
+     * 并打 WARN —— 静默当成 auto 会让「客户端写错了值」这件事永远查不出来。
+     */
+    var updateSourceMode: String
+        get() {
+            val raw = prefs.getString(KEY_UPDATE_SOURCE_MODE, DEFAULT_UPDATE_SOURCE_MODE)
+                ?: DEFAULT_UPDATE_SOURCE_MODE
+            if (raw in UPDATE_MODES) return raw
+            AppLogger.w("AppSettings", "update_source_mode 取值非法($raw)，按 $DEFAULT_UPDATE_SOURCE_MODE 处理")
+            return DEFAULT_UPDATE_SOURCE_MODE
+        }
+        set(value) {
+            val normalized = if (value in UPDATE_MODES) value else DEFAULT_UPDATE_SOURCE_MODE
+            if (normalized != value) {
+                AppLogger.w("AppSettings", "拒绝写入非法 update_source_mode($value)，已存 $normalized")
+            }
+            prefs.edit().putString(KEY_UPDATE_SOURCE_MODE, normalized).apply()
+        }
+
+    /** 下载方式这个键是否已经落过盘（用来区分「从未迁移」和「用户主动选了 auto」）。 */
+    val hasUpdateSourceMode: Boolean
+        get() = prefs.contains(KEY_UPDATE_SOURCE_MODE)
+
+    /**
+     * 老配置迁移（2026-09-22）：没有 [KEY_UPDATE_SOURCE_MODE] 的设备一律置为 `auto`，
+     * 由 core 自己按地区决定走不走镜像。
+     *
+     * **刻意不按 `update_mirror_base` 推断**（空→direct / 非空→mirror）：那样会把
+     * 「老 web 上随手清空过前缀」当成用户的长期意图。统一 auto 的代价是——曾经刻意
+     * 设成直连的国内设备迁移后会变成走镜像，所以这里必须打一条日志把原值写出来，
+     * 否则用户会遇到一次无法解释的行为变化。
+     *
+     * 判据是「键是否存在」而不是「值是否等于默认」：后者分不清「没迁移过」和「主动选了 auto」。
+     * 迁移只发生一次——写入后键就存在了。
+     *
+     * @return true 表示本次真的迁移了
+     */
+    fun migrateUpdateSourceModeIfAbsent(): Boolean {
+        if (hasUpdateSourceMode) return false
+        val legacyBase = prefs.getString(KEY_UPDATE_MIRROR_BASE, null)
+        prefs.edit().putString(KEY_UPDATE_SOURCE_MODE, DEFAULT_UPDATE_SOURCE_MODE).apply()
+        AppLogger.i(
+            "AppSettings",
+            "更新下载方式迁移：统一置为 $DEFAULT_UPDATE_SOURCE_MODE（原 update_mirror_base=" +
+                (if (legacyBase == null) "<未设置>" else if (legacyBase.isBlank()) "<空串=直连>" else legacyBase) +
+                "）。国内设备若原先是直连，之后会改走镜像；可在设置里改回直连。"
+        )
+        return true
+    }
 
     // ── 更新状态持久化（2026-08-10 P0-4：RESULT 机制最小版）──
     // pendingUpdate：安装前置位（目标版本）。安装中被杀/断电后，新进程启动时据此恢复状态：
@@ -873,6 +1002,24 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
+    // --- 每小时流量用量采样器的"上一次月累计"（流量历史） ---
+    //
+    // 与 [trafficDailyBaselineJson] 不同：那个是"今天从哪儿起算"，这个是"上一次看到的月累计是多少"。
+    // 每小时用量 = 逐次采样的 (本次月累计 − 上次月累计) 累加进当前小时桶（traffic_hourly 表）。
+    //
+    // 必须持久化，否则 core 每次重启都要丢掉"重启前最后一次采样到重启后第一次采样"之间的量。
+    // 同时存 at（上次采样时刻），用来识别"core 离线了很久"——离线期间产生的流量无法归属到
+    // 具体小时，只能整块丢弃，否则会把几天的量全堆到重启后的那一个小时上。
+    // 形如 {"at":1757800000000,"rx":123,"tx":456}；置 null 即为重置（下一次采样只记基线、不计增量）。
+    var trafficHourlySamplerJson: String?
+        get() = prefs.getString(KEY_TRAFFIC_HOURLY_SAMPLER, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_TRAFFIC_HOURLY_SAMPLER, value)
+            else editor.remove(KEY_TRAFFIC_HOURLY_SAMPLER)
+            editor.apply()
+        }
+
     // --- 到达限额自动关闭移动数据（core 自制功能，不是设备字段） ---
     //
     // 拆成两个 key 是刻意的：**配置由客户端写、运行状态由 core 写**。
@@ -918,6 +1065,30 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
+    // --- Media Scan Dirs（视频 / 音乐 / 图片各自的扫描目录，两端共享的设备配置） ---
+    //
+    // 2026-09-16：媒体中心从"一页三栏"拆成三个独立页（视频 / 音乐 / 图片），扫描范围随之
+    // **按类型各存一份** —— 每页只改自己那一份，所以三页各有可写入口也不会出现
+    //「同一份配置三处能改」。三类扫同一个目录不冲突：MediaStore 本来就是分表查的。
+    //
+    // 每份的形状不变：`["/storage/emulated/0/Movies", ...]`
+    //   空数组 / 缺省 = 这一类不限目录，列整个媒体库里的该类型；
+    //   非空时只列这些目录**及其子目录**下的该类型媒体（core 侧转成 MediaStore 路径前缀条件）。
+    //
+    // 放在 core 而不是各客户端：这是「这台设备的媒体库范围」，app 与 web 必须看到同一份。
+    // 而「列表还是网格」「按名称还是按时间」这类纯展示偏好留在各客户端本地，不进这里。
+    //
+    // @param type `video` / `audio` / `image`（core 侧 MediaRoutes 的 Kind.key，与 API 取值一致）
+    fun mediaScanDirsJson(type: String): String? =
+        prefs.getString("${KEY_MEDIA_SCAN_DIRS}_$type", null)
+
+    fun setMediaScanDirsJson(type: String, value: String?) {
+        val editor = prefs.edit()
+        val key = "${KEY_MEDIA_SCAN_DIRS}_$type"
+        if (value != null) editor.putString(key, value) else editor.remove(key)
+        editor.apply()
+    }
+
     // --- Notification Config（客户端通知渠道开关，两端共享的设备配置） ---
     //
     // 与 monitorPreferencesJson 同构：单 key 存整份 JSON。
@@ -934,8 +1105,74 @@ class AppSettings(context: Context) {
             editor.apply()
         }
 
-    // --- SMS 已读状态（本地管理） ---
+    // --- Weather Config（标题栏天气小功能，两端共享的设备配置） ---
+    //
+    // 与 notificationConfigJson 同构：单 key 存整份 JSON（开关 / 城市名 / 坐标 / 单位）。
+    // 【为什么是设备级而不是各客户端本地】位置说的是"这台随身 WiFi 现在在哪"，
+    // 两端看到的应当是同一个城市；坐标存两份必然分叉。
+    var weatherConfigJson: String?
+        get() = prefs.getString(KEY_WEATHER_CONFIG, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_WEATHER_CONFIG, value)
+            else editor.remove(KEY_WEATHER_CONFIG)
+            editor.apply()
+        }
 
+    // --- 今日诗词（标题栏下方小字，两端共享的设备配置） ---
+    //
+    // 与 weatherConfigJson 同构：单 key 存整份 JSON（开关 / 是否显示出处）。
+    // 没有"选标签"这类字段 —— 标签由上游按地区/天气/时辰/农历自动匹配，我们无从指定。
+    var poetryConfigJson: String?
+        get() = prefs.getString(KEY_POETRY_CONFIG, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_POETRY_CONFIG, value)
+            else editor.remove(KEY_POETRY_CONFIG)
+            editor.apply()
+        }
+
+    /**
+     * 今日诗词的用户 token（上游签发，永久有效）。
+     *
+     * 由 `PoetryRoutes` 在**首次请求的响应里收割**后写入，此后每次请求都带上它。
+     * 不参与备份：它是"这台设备在上游的身份"，两台设备共用一个会让推荐互相干扰。
+     */
+    var poetryToken: String?
+        get() = prefs.getString(KEY_POETRY_TOKEN, null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value != null) editor.putString(KEY_POETRY_TOKEN, value)
+            else editor.remove(KEY_POETRY_TOKEN)
+            editor.apply()
+        }
+
+    // --- 出网国家/地区（`/api/geo`，2026-09-18）---
+    //
+    // 【为什么在 core】判据是**出网 IP 的归属**，而设备才是真正的出网点。app 走设备热点时
+    // 出网 IP 与这里相同，但把检测放在各客户端会让每端各存一份、结果可能不一致。
+    // 目前唯一消费方是 app 的更新源自动选择（CN → 走镜像，其余直连）。
+
+    /**
+     * ISO 3166-1 alpha-2 国家码（如 `CN` / `US`）；`""` = 从未测出结果。
+     *
+     * 写入方只有 `GeoDetector.detectAndSave`。进备份白名单：换设备通常还在同一地区。
+     */
+    var geoCountry: String
+        get() = prefs.getString(KEY_GEO_COUNTRY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_GEO_COUNTRY, value).apply()
+
+    /**
+     * 上次成功检测的时刻（epoch ms），0 = 从未测过。
+     *
+     * 只用来回答"要不要重测"（见 `GeoDetector.isStale`）。**不进备份**：它描述的是这台设备的
+     * 检测进度，还原到新设备会让它以为刚测过。
+     */
+    var geoDetectedAt: Long
+        get() = prefs.getLong(KEY_GEO_DETECTED_AT, 0L)
+        set(value) = prefs.edit().putLong(KEY_GEO_DETECTED_AT, value).apply()
+
+    // --- SMS 已读状态（本地管理） ---
     /** 已处理的最大 goform 消息 ID，用于检测新短信 */
     var smsHighWaterMark: Long
         get() = prefs.getLong(KEY_SMS_HIGH_WATER_MARK, 0L)
@@ -1044,6 +1281,24 @@ class AppSettings(context: Context) {
         get() = prefs.getBoolean(KEY_TUNNEL_AUTO_RECONNECT, true)
         set(value) = prefs.edit().putBoolean(KEY_TUNNEL_AUTO_RECONNECT, value).apply()
 
+    // --- 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）---
+
+    /**
+     * 后台自动封面预热总开关。默认**关**（首次引入保守上线，见计划书 §8-1）：
+     * 开启后 DataScheduler 在闲时逐条给 MediaStore 视频补 ffmpeg 封面。
+     */
+    var thumbPrewarmEnabled: Boolean
+        get() = prefs.getBoolean(KEY_THUMB_PREWARM_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_THUMB_PREWARM_ENABLED, value).apply()
+
+    /**
+     * 预热仅限充电/电量充足时进行的开关（默认 true）。core 本身就是网关不存在"流量"
+     * 顾虑，保留该语义是给用户一个"闲时才干活"的一键开关。
+     */
+    var thumbPrewarmWifiOnly: Boolean
+        get() = prefs.getBoolean(KEY_THUMB_PREWARM_WIFI_ONLY, true)
+        set(value) = prefs.edit().putBoolean(KEY_THUMB_PREWARM_WIFI_ONLY, value).apply()
+
     /** 看护巡检间隔（秒），10..120；过小会把设备的 CPU 耗在无谓的 /proc 扫描上 */
     var tunnelReconnectIntervalSec: Int
         get() = prefs.getInt(KEY_TUNNEL_RECONNECT_INTERVAL, 30).coerceIn(10, 120)
@@ -1087,6 +1342,29 @@ class AppSettings(context: Context) {
     var monitorAlertScanSec: Int
         get() = prefs.getInt(KEY_MON_ALERT_SCAN_SEC, 15).coerceIn(5, 300)
         set(value) = prefs.edit().putInt(KEY_MON_ALERT_SCAN_SEC, value.coerceIn(5, 300)).apply()
+
+    /**
+     * 开机预热期（毫秒），10_000..300_000。
+     *
+     * 预热期内 DataScheduler 的 CPU / 内存 / 信号 / 电池数据**不写入 DB**（WS 实时推送照常），
+     * 且 `scanLocalAlerts()` 整条本地告警扫描（温度 / 电量 / 联网）**不判不报** ——
+     * 避免系统初始化阶段的虚高数据污染历史图表并产生误报。
+     * Unisoc + Android 13 + 1.5GB RAM 实测 ~60s 后系统服务基本稳定，默认 90s。
+     */
+    var monitorBootGraceMs: Long
+        get() = prefs.getLong(KEY_MON_BOOT_GRACE_MS, 90_000L).coerceIn(10_000L, 300_000L)
+        set(value) = prefs.edit().putLong(KEY_MON_BOOT_GRACE_MS, value.coerceIn(10_000L, 300_000L)).apply()
+
+    /**
+     * 告警边沿状态快照（`{"temperature":"warning", ...}`，2026-09-21）。
+     *
+     * `AlertEngine.lastLevelByType` 的持久化载体。不落盘的话每次 core 启动
+     * （设备开机 / 服务重启 / 崩溃重启）都会把「当前正处于异常」的类型当成
+     * normal→warning 跃迁重报一遍。null / 空串 = 无历史，退化为全部 normal。
+     */
+    var alertLevelStateJson: String?
+        get() = prefs.getString(KEY_ALERT_LEVEL_STATE, null)
+        set(value) = prefs.edit().putString(KEY_ALERT_LEVEL_STATE, value).apply()
 
     /** 无前端连接时的采集间隔（秒），10..600。有连接时走 QoS 自适应，不受这里影响 */
     var monitorIdleIntervalSec: Int
@@ -1156,6 +1434,15 @@ class AppSettings(context: Context) {
         "app_log_enabled" to appLogEnabled,
         "goform_dump_enabled" to goformDumpEnabled,
         "goform_command_enabled" to goformCommandEnabled,
+        // 2026-10-06：真 PTY 终端开关。BACKUP_FIELDS / toMap / ConfigRoutes 三处必须同步
+        // 登记 —— 漏一处就是「开关永远显示默认值」那个老 bug 的复刻（见 field_normalization_enabled 的事故注释）。
+        "ttyd_enabled" to ttydEnabled,
+        // 2026-09-22：本键就是下面那段「漏一个键 = 开关永远显示默认值」的实例 —— KEY 常量、
+        // 读写属性、BACKUP_FIELDS 都齐了，只漏了这一行，于是只有「导入备份」改得动它，
+        // web/app 侧永远读回默认 true。补登记。
+        // 注意它与上面两个排障开关不同：**不热生效**，只在构造组件图时读一次
+        // （ComponentFactory.kt:802，调用点 ComponentFactory.kt:152），改完要重启后台服务。
+        "field_normalization_enabled" to fieldNormalizationEnabled,
         "qos_enabled" to qosEnabled,
         "qos_shell_max_concurrent" to qosShellMaxConcurrent,
         "qos_cache_ttl_ms" to qosCacheTtlMs,
@@ -1171,7 +1458,12 @@ class AppSettings(context: Context) {
         "sms_filter_exempt_verification_code" to smsFilterExemptVerificationCode,
         "sms_filter_store_full_body" to smsFilterStoreFullBody,
         "update_url" to updateUrl,
-        "update_mirror_base" to updateMirrorBase
+        "update_mirror_base" to updateMirrorBase,
+        // 下载方式（2026-09-22）：客户端靠 GET 回读当前值做基线，漏了它 web 的差量提交就永远发不出去
+        "update_source_mode" to updateSourceMode,
+        // 媒体封面预热（2026-10-05 G6）：客户端靠 GET 回读做基线，漏登记 = 界面永远显示默认值
+        "thumb_prewarm_enabled" to thumbPrewarmEnabled,
+        "thumb_prewarm_wifi_only" to thumbPrewarmWifiOnly
     )
 
     // ────────────────────────────────────────────────────────────
@@ -1268,6 +1560,16 @@ class AppSettings(context: Context) {
             needsRestart = applied.any { it == KEY_PORT || it == KEY_DEVICE_PROFILE_ID }
         )
     }
+
+    // ────────────────────────────────────────────────────────────
+    // 通用原始键读写（供 StorageSourceManager 等外部模块直接操作自定义键）
+    // ────────────────────────────────────────────────────────────
+
+    /** 读取任意字符串键的原始值（不经属性封装），不存在时返回 null。 */
+    fun getRawString(key: String): String? = prefs.getString(key, null)
+
+    /** 写入任意字符串键的原始值（不经属性封装）。 */
+    fun setRawString(key: String, value: String) = prefs.edit().putString(key, value).apply()
 
     /**
      * 恢复默认配置。

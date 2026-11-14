@@ -4,25 +4,49 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import com.ufi_axis_core.collector.at.ATChannel
-import com.ufi_axis_core.controller.goform.GoformNetworkClient
-import com.ufi_axis_core.controller.goform.GoformWifiClient
-import com.ufi_axis_core.controller.goform.WriteOutcome
+import com.ufi_axis_core.devicespi.PlatformAdapter
+import com.ufi_axis_core.devicespi.WriteOutcome
+import com.ufi_axis_core.devicespi.adapter.BandSelection
+import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.util.AppLogger
 import com.ufi_axis_core.util.ShellExecutor
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.withLock
 
 /**
  * 网络控制器
  * 统一管理移动数据/WiFi/飞行模式/锁频/锁网
+ *
+ * @param network network 域的设备适配接口（2026-09-25 批 A2b 起）。
+ * @param wifi wifi 域的设备适配接口（同上）。收的是**这两个域**而不是整个 `DeviceHub`：
+ *   本类只用得到 network 的 3 个写方法（移动数据 + 两个频段锁定）与 wifi 的 2 个（SSID / 口令），
+ *   递整个 hub 等于让它看见所有域，权限比需要的大（口径同批 A2a 的 `ActionExecutorImpl`）。
  */
 class NetworkController(
     private val context: Context,
     private val atChannel: ATChannel,
-    private val networkClient: GoformNetworkClient,
-    private val wifiClient: GoformWifiClient
+    private val network: NetworkControl,
+    private val wifi: WifiControl,
+    /**
+     * 平台适配层（阶段 4 的 4.4）：网络栈重启「发哪几条命令」这份**设备知识**住在它那里。
+     *
+     * 由装配层（`ComponentFactory.buildNetworkGraph`）传 `runtime.plugin.platform(context)` ——
+     * 本类**不许**自己 new 插件或问 `PluginRegistry`：那会让「当前是哪台设备」在仓里出现第二个答案
+     * （唯一答案是 `DeviceRuntime.resolve()` 的结果，见 `ComponentFactory` 里那段注释）。
+     *
+     * 参数排在最后是为了让现有调用点不必改实参顺序（全仓只有一处 `NetworkController(...)`）。
+     */
+    private val platform: PlatformAdapter
 ) {
     private val tag = "NetworkController"
+
+    /**
+     * 2026-10-05 R2-3 修复：WiFi 缓存失效钩子。setWifiSSID「SSID 成功、口令失败」的部分失败
+     * 也必须让 /api/wifi 回读拿到设备实况（SSID 已变）。由装配层注入（dataHub.invalidateWifi），
+     * 控制器层不反向依赖 api/cache —— null 时静默跳过（等价旧行为）。
+     */
+    @Volatile var wifiCacheInvalidator: (suspend () -> Unit)? = null
+
     // 网络栈重启互斥锁 — 防止并发 AT+SFUN 调用
     private val stackRestartMutex = kotlinx.coroutines.sync.Mutex()
 
@@ -34,7 +58,7 @@ class NetworkController(
     suspend fun setMobileData(enabled: Boolean): Boolean {
         AppLogger.i(tag, "Setting mobile data: $enabled")
         // 方式1: Goform API（与参考项目 KanoUtils.kt 一致）
-        if (networkClient.setMobileData(enabled)) {
+        if (network.setMobileData(enabled)) {
             AppLogger.i(tag, "Mobile data set via goform: $enabled")
             return true
         }
@@ -52,23 +76,34 @@ class NetworkController(
     }
 
     /**
-     * 修改 WiFi 热点 SSID
+     * 修改 WiFi 热点 SSID（2026-10-05 R2-1 修复：三态透传）。
+     * 双写部分失败：SSID 成功但口令失败 → 返回口令阶段的结果（Rejected 带原因 / Failed），
+     * 客户端能知道卡在哪一步；不在此层做回滚（设备无事务语义，重发 SSID 反而是第三次写）。
      */
-    suspend fun setWifiSSID(ssid: String, password: String? = null): Boolean {
+    suspend fun setWifiSSID(ssid: String, password: String? = null): WriteOutcome {
         AppLogger.i(tag, "Setting WiFi SSID: $ssid")
-        val ssidResult = wifiClient.setWifiSSID(ssid)
-        if (ssidResult && password != null) {
-            return wifiClient.setWifiPassword(password)
+        val ssidResult = wifi.setWifiSSID(ssid)
+        if (ssidResult is WriteOutcome.Ok && password != null) {
+            val pwdResult = wifi.setWifiPassword(password)
+            // 2026-10-05 R2-3 修复：SSID 写成功、密码写失败时，设备态已变（SSID=新值），
+            // 但按 WriteOutcome 只能回一个失败态 → 路由 500、客户端显示「修改失败」，
+            // 而此刻 /api/wifi 缓存若不失效，30s 内回读还是旧 SSID——三层状态互相矛盾。
+            // 最小改法：部分失败也强制失效缓存，让下一次回读拿到设备实况（SSID 已变）。
+            if (pwdResult !is WriteOutcome.Ok) {
+                wifiCacheInvalidator?.invoke()
+            }
+            return pwdResult
         }
+        // SSID 本身写失败：设备态未变（SSID 仍是旧值），无需失效
         return ssidResult
     }
 
     /**
-     * 修改 WiFi 密码
+     * 修改 WiFi 密码（2026-10-05 R2-1 修复：三态透传）。
      */
-    suspend fun setWifiPassword(password: String): Boolean {
+    suspend fun setWifiPassword(password: String): WriteOutcome {
         AppLogger.i(tag, "Setting WiFi password")
-        return wifiClient.setWifiPassword(password)
+        return wifi.setWifiPassword(password)
     }
 
     /**
@@ -109,7 +144,18 @@ class NetworkController(
          * **没有向设备发任何请求** —— route 应回 400 `OUT_OF_RANGE` 而不是 500（计划书 9.5）。
          */
         val rejectedReason: String? = null,
-    )
+        /**
+         * 2026-10-05 R2-4 修复：各路写结果明细。LTE 与 NR 是两次独立 goform 写，
+         * 可独立失败；`success`（任一路成功即重启栈）无法表达「半失败」。
+         * 客户端凭 [partial] 提示「部分频段未生效」，不再被整体 success 掩盖。
+         */
+        val lteOk: Boolean? = null,
+        val nrOk: Boolean? = null,
+    ) {
+        /** 至少一路成功、但另一路失败：栈已按「新值+旧值」混合状态重启，必须让客户端可见。 */
+        val partial: Boolean
+            get() = success && ((lteOk == false) || (nrOk == false))
+    }
 
 
     suspend fun lockBands(
@@ -118,24 +164,29 @@ class NetworkController(
         unlockAll: Boolean = false
     ): BandLockResult {
         // unlockAll：同时发全频段 = 解除所有限制
-        val lteValue = when {
-            unlockAll -> GoformNetworkClient.LTE_ALL_BANDS
-            lteBands != null -> lteBands
-            else -> ""   // 未选 LTE → 清空该 RAT 限制（参考项目：lte_bands.join(',') 空数组→空串）
-        }
-        val nrValue = when {
-            unlockAll -> GoformNetworkClient.NR_ALL_BANDS
-            nrBands != null -> nrBands
-            else -> ""   // 未选 NR → 清空该 RAT 限制
-        }
+        //
+        // 2026-09-25 批 A2b：这里原来先问 `networkClient.lteAllBands()` / `nrAllBands()` 拿
+        // **goform 的频段全集掩码串**，再把它当普通频段列表发下去 —— 掩码串是协议细节，
+        // 出现在这一层等于规定「别人家的设备也得用掩码串表达全部频段」。现在本类只表达
+        // **意图**（[BandSelection.All]），掩码由 adapter 的 goform 实现去问那两个方法
+        // （连同 profile 没给掩码时的空串折叠 + WARN，仍在 `GoformNetworkClient` 里，
+        // 本批没有重新实现第二份）。**下发给设备的取值逐字未变**。
+        //
+        // 非 unlockAll 路径的取值仍是这两个串（空串 = 清除该 RAT 限制，
+        // 参考项目：lte_bands.join(',') 空数组→空串），下面的空串判断与 modeDesc 用的就是它们。
+        val lteValue = lteBands ?: ""
+        val nrValue = nrBands ?: ""
+
 
         if (!unlockAll && lteValue.isEmpty() && nrValue.isEmpty())
             return BandLockResult(false, "no_bands", false)
 
         // 始终发送两个 goform 请求（参考项目 Promise.all）
-        AppLogger.i(tag, "Band lock goform: LTE=\"$lteValue\" NR=\"$nrValue\"")
-        val lteOutcome = networkClient.lockLteBands(lteValue)
-        val nrOutcome = networkClient.lockNrBands(nrValue)
+        val lteSelection = if (unlockAll) BandSelection.All else BandSelection.Only(lteValue)
+        val nrSelection = if (unlockAll) BandSelection.All else BandSelection.Only(nrValue)
+        AppLogger.i(tag, "Band lock goform: LTE=${describe(lteSelection)} NR=${describe(nrSelection)}")
+        val lteOutcome = network.lockLteBands(lteSelection)
+        val nrOutcome = network.lockNrBands(nrSelection)
         val lteOk = lteOutcome.ok
         val nrOk = nrOutcome.ok
         AppLogger.i(tag, "Band lock result: LTE=$lteOk NR=$nrOk")
@@ -157,7 +208,9 @@ class NetworkController(
         }
 
         val goformSuccess = lteOk || nrOk
-        val result = BandLockResult(success = goformSuccess, mode = modeDesc, stackRestarted = false)
+        // 2026-10-05 R2-4 修复：携带各路明细，partial 语义见 BandLockResult
+        val result = BandLockResult(success = goformSuccess, mode = modeDesc, stackRestarted = false,
+            lteOk = lteOk, nrOk = nrOk)
 
         // goform 写入成功后重启网络协议栈让频段立即生效
         if (result.success) {
@@ -169,39 +222,38 @@ class NetworkController(
     }
 
     /**
+     * 频段选择在日志里的写法。
+     *
+     * [BandSelection.Only] 逐字保留改造前的 `"取值"` 形式；[BandSelection.All] 只能打**意图** ——
+     * 掩码串现在只在 adapter 实现里出现（批 A2b），本类拿不到它。这是本批唯一一处可观测差异：
+     * `unlockAll` 时这一行从掩码串变成 `<全部频段>`，**下发给设备的取值没变**。
+     * 掩码想核对的话看 adapter / profile（`lteAllBandsMask()`）。
+     */
+    private fun describe(selection: BandSelection): String = when (selection) {
+        BandSelection.All -> "<全部频段>"
+        is BandSelection.Only -> "\"${selection.bands}\""
+    }
+
+    /**
      * 重启网络协议栈（AT+SFUN=5→延时→AT+SFUN=4）
      *
-     * 参考 UFI-TOOLS-REF: networkStackSwitch()
-     * AT+SFUN=5 关闭网络栈 → 等待芯片重新加载配置 → AT+SFUN=4 重启
-     * 这使得 goform 写入的频段限制无需设备重启即可生效。
+     * 阶段 4 的 4.4 起，「发哪几条命令、什么顺序、中间等多久、怎么判成功」这份**设备知识**
+     * 搬到了 [PlatformAdapter.restartNetworkStack]（F50 那份在
+     * `:core:device-plugins` 的 `SprdPlatform`，命令 / 顺序 / 等待 / 判据 / 日志文案逐字未改）。
+     * 本方法只剩**策略**这两件事：
      *
-     * 安全措施：
-     * - 互斥锁防止并发 AT+SFUN 调用
-     * - 重启后额外 2s 等待 modem 完全稳定
+     * - **互斥锁防止并发 AT+SFUN 调用** —— 留在这里，理由见下；
+     * - **执行通道与超时** —— 由本类注入：它本来就持有 [ATChannel]（限流 / 退避 / 熔断那一层），
+     *   超时值仍是原来的 5000ms。
+     *
+     * 为什么锁不跟着搬：`DevicePlugin.platform(ctx)` 每次调用都新建一个适配层实例
+     * （插件不缓存），锁放在适配层就是「每个实例各锁自己」= 等于没锁；
+     * 而且「同一时刻只许一次 AT+SFUN」是我们的策略，不是这台设备的事实。
+     *
+     * 重启后额外 2s 等待 modem 完全稳定这一步在适配层里（它是设备事实）。
      */
     suspend fun restartNetworkStack(): Boolean = stackRestartMutex.withLock {
-        AppLogger.i(tag, "Restarting network stack (AT+SFUN=5/4)...")
-        try {
-            val off = atChannel.sendCommand("AT+SFUN=5", 5000)
-            if (off?.contains("OK") != true) {
-                AppLogger.w(tag, "AT+SFUN=5 failed: $off, stack restart skipped")
-                return false
-            }
-            AppLogger.i(tag, "Network stack off, waiting 500ms...")
-            delay(500)
-            val on = atChannel.sendCommand("AT+SFUN=4", 5000)
-            if (on?.contains("OK") != true) {
-                AppLogger.w(tag, "AT+SFUN=4 failed: $on")
-                return false
-            }
-            AppLogger.i(tag, "Network stack restarted, waiting 2s for modem stabilization...")
-            delay(2000)
-            AppLogger.i(tag, "Network stack restart complete")
-            return true
-        } catch (e: Exception) {
-            AppLogger.e(tag, "Network stack restart exception: ${e.message}")
-            return false
-        }
+        platform.restartNetworkStack { cmd -> atChannel.sendCommand(cmd, 5000) }
     }
 
     /**

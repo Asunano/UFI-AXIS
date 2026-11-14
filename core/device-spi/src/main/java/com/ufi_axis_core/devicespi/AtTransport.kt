@@ -1,4 +1,4 @@
-package com.ufi_axis_core.collector.at
+package com.ufi_axis_core.devicespi
 
 /**
  * AT 下发通道的统一形状。

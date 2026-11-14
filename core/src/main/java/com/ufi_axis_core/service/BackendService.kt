@@ -56,8 +56,15 @@ class BackendService : Service() {
     /**
      * SMS 轮询独立 scope：使用普通 IO（无 parallelism 限制），
      * 避免 while(isActive) 永久循环占用 limitedParallelism(8) 的稀缺线程。
+     *
+     * CoroutineExceptionHandler（2026-10-05 R2-5 修复）：此前缺 handler，轮询协程里
+     * 未捕获的异常会沿 SupervisorJob 静默终止协程本身——兜底轮询从此死亡且无任何
+     * 日志，"短信不进 Provider 时 5 分钟兜底"整条链路悄悄失效。与上方 serviceScope
+     * 同口径：记录 ERROR 后放行（SupervisorJob 已隔离，不影响兄弟协程）。
      */
-    private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val smsPollScope = CoroutineScope(Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e ->
+        AppLogger.e(tag, "SmsPollScope coroutine exception (uncaught) — 兜底轮询协程已终止", e)
+    })
 
     companion object {
         const val CHANNEL_ID = "ufi_axis_core_service_v2"
@@ -121,18 +128,66 @@ class BackendService : Service() {
 
         /**
          * 重启后端服务（`POST /api/service/restart` 的落地实现）。
-         * `stopService` → `onDestroy` → `scheduleServiceRestart()`（AlarmManager，[RESTART_DELAY_MS] 后
-         * 以**前台服务**语义拉起，另有一枚 3 倍延迟的备份闹钟），期间 HTTP 不可用。
+         *
+         * ## 双保险（2026-09-14）
+         * 原来只有一条恢复路径：`stopService` → `onDestroy` → [scheduleServiceRestart] 的
+         * AlarmManager 闹钟。而那枚闹钟当时是 **inexact** 的，Android 12+ 的「后台启动前台服务」
+         * 豁免只给精确闹钟，于是闹钟到点时 `startForegroundService` 被 AMS 拒、异常还发生在系统侧
+         * 看不见，`FLAG_ONE_SHOT` 又已消耗 —— 结果就是「点了重启服务，设备彻底失联，只能手动去点开 app」。
+         *
+         * 现在两条路同时走，谁先到算谁（[onStartCommand] 的 `isRunning` 守卫吃得下重复拉起）：
+         * 1. **shell 侧**（本方法派出的 detached `am start-foreground-service`）：不受 AMS 后台限制，
+         *    与 core 自更新脚本 `ufi_update.sh` 用的是同一条已验证过的命令；
+         * 2. **闹钟侧**（[scheduleServiceRestart]，已改为精确闹钟）：不依赖 ADB 通道。
+         *
+         * 这个功能的失败代价是「设备失联」，单点恢复不值得赌。
          *
          * 口径澄清（别再写成"进程级重启"）：`stopService` 只销毁 Service 组件，**进程通常仍存活**，
-         * 因此 `object` 单例与静态状态不会被清掉；也因此 shell 看门狗（判的是 `pgrep` 进程存活）
-         * **在这条路径上不会介入**，恢复依赖上面的闹钟。
+         * 因此 `object` 单例与静态状态不会被清掉。
          */
         fun requestRestart(context: Context) {
-            AppLogger.w("BackendService", "Full restart requested — stopping service, AlarmManager will bring it back")
+            AppLogger.w("BackendService", "Full restart requested — shell + alarm 双保险")
+            dispatchShellRestart(context)
             // 不能走 stop()：那会置 explicitStop，onDestroy 就不排重启闹钟了，服务再也回不来。
             context.stopService(Intent(context, BackendService::class.java))
         }
+
+        /**
+         * 派一个 detached shell 把服务拉回来。
+         *
+         * 几个细节都是必须的：
+         * - `nohup setsid` —— 脱离本进程的进程组。本进程随后可能被系统回收，子 shell 必须能活下去；
+         * - `sleep` —— 必须等 `stopService` 走完 `onDestroy`（那里才真正停 Ktor / 采集），
+         *   否则 `am` 拉起的新实例会被随后的销毁流程一起带走；
+         * - `-f 0x00000020`（`FLAG_INCLUDE_STOPPED_PACKAGES`）—— 与自更新脚本一致；
+         * - 不发 `am kill`：这里是重启**服务**而不是替换 APK，进程留着还能让闹钟那条路生效。
+         * - 老 ROM 没有 `start-foreground-service` 时退回 `am startservice`。
+         *
+         * ADB 通道不可用时 `executeAsRoot` 会回退到 app uid 的普通 shell，那种情况下
+         * `am start-foreground-service` 会被 AMS 拒 —— 这正是还要保留闹钟那一路的原因。
+         */
+        private fun dispatchShellRestart(context: Context) {
+            val component = "${context.packageName}/com.ufi_axis_core.service.BackendService"
+            val cmd = "nohup setsid sh -c 'sleep ${SHELL_RESTART_DELAY_SEC}; " +
+                "am start-foreground-service --user 0 -f 0x00000020 -n $component || " +
+                "am startservice --user 0 -f 0x00000020 -n $component' >/dev/null 2>&1 &"
+            // 用独立 scope：serviceScope 会在 onDestroy 里被 cancel，而这条命令必须在那之前派出去。
+            // 进程不会因 stopService 而死，所以这个 launch 有机会跑完。
+            CoroutineScope(Dispatchers.IO).launch {
+                val r = runCatching { ShellExecutor.executeAsRoot(cmd, SHELL_DISPATCH_TIMEOUT_MS) }
+                r.onSuccess {
+                    AppLogger.i("BackendService", "shell 重启已派发（${SHELL_RESTART_DELAY_SEC}s 后执行）")
+                }.onFailure {
+                    AppLogger.w("BackendService", "shell 重启派发失败，仅剩闹钟兜底: ${it.message}")
+                }
+            }
+        }
+
+        /** shell 侧延迟拉起的秒数：必须长于 `onDestroy` 停组件所需时间。 */
+        private const val SHELL_RESTART_DELAY_SEC = 4
+
+        /** 派发命令本身的超时（只是 `&` 出去，不等 sleep 结束）。 */
+        private const val SHELL_DISPATCH_TIMEOUT_MS = 10_000L
 
 
 
@@ -268,8 +323,9 @@ class BackendService : Service() {
     private fun launchMailEvent(source: String, block: suspend () -> Unit) {
         val ctl = graph?.controller?.smsForwardController ?: return
         if (!ctl.isSendable()) return
-        val lock = acquireMailWakeLock()
+        // 2026-10-05 R3-7 修复：acquire 移入协程内，消除「launch 未被调度则锁永不释放」的泄漏窗口
         serviceScope.launch {
+            val lock = acquireMailWakeLock()
             try {
                 block()
             } catch (e: Exception) {
@@ -373,7 +429,10 @@ class BackendService : Service() {
                 // 反过来（先投递成功再落 id）看着更"可靠"，但那意味着用户一打开总开关就会被
                 // 静默期里攒下的一堆邮件糊脸 —— 那些通知的时效早就过了。
                 // 这是明确的取舍，不是漏改：短信正文在 /api/sms 里一直查得到，补发的只是通知。
-                forwardCtl.lastForwardedSmsId = plan.highWaterMark
+                // 2026-10-05 R1-14 修复：写水位改走 synchronized 的 advanceWaterMarkIfBeyond，
+                // 与读侧（同一把锁的语义经由 plan 前的 lastId 读不变，但推进与并发路径互斥），
+                // 消除「A/B 双路径并发同水位时互相覆盖/重复投递」的竞态。
+                forwardCtl.advanceWaterMarkIfBeyond(plan.highWaterMark)
                 // **逐条串行**：forwardSms 内部持 WakeLock 走 SMTP，并发只会让几个握手互相抢锁。
                 for (msg in plan.toForward) {
                     AppLogger.i(tag, "New SMS #${msg.id} from ${msg.address} via $source: ${msg.body.take(50)}")
@@ -696,11 +755,27 @@ class BackendService : Service() {
                 pauseComponentBackground(g)
             }
 
+            // ── 应用列表定时主动刷新（2026-10-12 应用列表缓存批次）──
+            // 为什么挂在这里（HTTP 就绪之后、而不是 ComponentFactory.build() 里）：
+            // build() 是阻塞调用且被 15s 初始化看门狗盯着，而首轮刷新要串 4 条特权 shell
+            // （pm list ×3 + dumpsys），设备上秒级 —— 放进 build 等于用一次慢 shell 去换
+            // 「通知栏卡在正在初始化 → 进程被判超时重启」。与本文件里 geo 检测同一条理由。
+            //
+            // 为什么不在 AppManager 构造里起：它还有一个只做自更新安装的短命实例
+            // （BootReceiver 开机恢复），构造即起协程会给那种一次性实例也挂一条永不结束的循环。
+            //
+            // 作用域用 serviceScope：onDestroy 里它会被 cancel，即便下方显式 stop 漏了也死得掉。
+            // 停机路径另有一刀见 stopAllComponents。
+            g.serverGraph.appManager.startPeriodicRefresh(serviceScope)
+
             val serverOk = g.serverGraph.server.start()
             if (!serverOk) {
                 // 服务启动失败：不要静默继续（否则端口不监听，外部只能看到 ERR_CONNECTION_REFUSED）。
                 // 直接停止并记入失败计数，由 START_STICKY / 看门狗重新拉起，并在 logcat 暴露真实异常。
                 AppLogger.e(tag, "HTTP Server failed to start — stopping service to surface failure")
+                // 2026-10-05 R3-10 修复：start 失败后短延迟再 stopSelf，避开旧 Netty event loop
+                // 未退净导致的端口冲突窗口（同进程先 stop 后立刻 start 偶发 Address already in use）
+                delay(3000)
                 crashRetryCount.set(0)
                 isRunning = false
                 g.serverGraph.server.stop()
@@ -708,6 +783,39 @@ class BackendService : Service() {
                 return
             }
             AppLogger.i(tag, "[14] HTTP server ready")
+
+            // ── 出网国家/地区检测（2026-09-18，`/api/geo`）──
+            //
+            // 【为什么挂在这里，而不是 ComponentFactory.build() 里】
+            // build() 是**阻塞**调用，且被初始化看门狗盯着（15s 一次心跳，超时直接杀进程自愈）。
+            // 这个检测最坏要串三个上游 × 8s = 24s，放进 build() 等于用一次外网抖动去换
+            // 「通知栏卡在正在初始化 → 进程被判超时重启」。放在 HTTP 就绪之后的独立协程里，
+            // 端口早已监听，检测慢多久都只影响它自己。
+            //
+            // 【为什么是启动这一个事件，而不是定时器】本仓明令禁止常驻定时器/周期闹钟；
+            // 国家/地区几乎不变，"core 起来时看一眼"已经足够，7 天过期兜住"设备被带出国"。
+            //
+            // 【失败不重试】一次失败就等下一次 core 重启（或客户端主动调 `/api/geo`）再试，
+            // 只留一条 WARN。在这里加退避重试等于把定时器改个名字。
+            serviceScope.launch(Dispatchers.IO) {
+                try {
+                    val settings = AppSettings.getInstance(this@BackendService)
+                    // 更新下载方式的一次性迁移（2026-09-22）：老设备没有 update_source_mode 这个键，
+                    // 统一置 auto 让 core 自己按地区决定。放在这里而不是 build()：它只写一次 prefs，
+                    // 但顺带要打一条说明日志，跟地区检测是同一件事的两半。
+                    settings.migrateUpdateSourceModeIfAbsent()
+                    if (!com.ufi_axis_core.api.geo.GeoDetector.isStale(settings)) {
+                        AppLogger.i(
+                            tag,
+                            "地理位置无需重测（${settings.geoCountry}，7 天内测过）— 本次启动不出网"
+                        )
+                        return@launch
+                    }
+                    com.ufi_axis_core.api.geo.GeoDetector.refreshIfStale(settings)
+                } catch (e: Exception) {
+                    AppLogger.w(tag, "启动时地理位置检测失败（非致命，等下次启动再试）: ${e.message}")
+                }
+            }
 
             // ── 系统关键但非接口前置的初始化：放后台，绝不阻塞 HTTP 服务 ──
             serviceScope.launch(Dispatchers.IO) {
@@ -829,7 +937,16 @@ class BackendService : Service() {
 
         } catch (e: Exception) {
             AppLogger.e(tag, "Failed to initialize components", e)
-            updateNotification("UFI-AXIS-Core 启动失败: ${e.message}")
+            // 2026-10-07：通知栏只带 e.message 时（如 ART 的 "Null reference used for
+            // synchronization"）信息量不足，用户又常拿不到日志。把最深的 3 个应用栈帧
+            // 拼进通知，无需日志也能定位到类。
+            val frames = e.stackTrace
+                .take(6)
+                .filter { it.className.startsWith("com.ufi_axis") }
+                .take(3)
+                .joinToString(" ← ") { "${it.className.substringAfterLast('.').substringBefore("Kt")}.${it.methodName}:${it.lineNumber}" }
+            val detail = if (frames.isNotBlank()) "${e.message} @ $frames" else e.message
+            updateNotification("UFI-AXIS-Core 启动失败: $detail")
 
             // 防止 START_STICKY 无限重启循环：连续失败 3 次后主动停止
             val retries = crashRetryCount.incrementAndGet()
@@ -890,6 +1007,8 @@ class BackendService : Service() {
         try { g.controller.taskScheduler.pause() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.pause failed: ${e.message}") }
         try { g.controller.tunnelManager.stopGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.stopGuard failed: ${e.message}") }
         try { g.controller.downloadManager.pauseBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.pauseBackground failed: ${e.message}") }
+        // 应用列表定时刷新同属「自主活动」：用户点「停止服务」后不该还每 2 分钟打 4 条特权 shell。
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     private fun resumeComponentBackground(g: ComponentGraph) {
@@ -897,6 +1016,7 @@ class BackendService : Service() {
         try { g.controller.taskScheduler.resume() } catch (e: Exception) { AppLogger.w(tag, "taskScheduler.resume failed: ${e.message}") }
         try { g.controller.tunnelManager.startGuard() } catch (e: Exception) { AppLogger.w(tag, "tunnelManager.startGuard failed: ${e.message}") }
         try { g.controller.downloadManager.resumeBackground() } catch (e: Exception) { AppLogger.w(tag, "downloadManager.resumeBackground failed: ${e.message}") }
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(true) } catch (e: Exception) { AppLogger.w(tag, "appManager.setPeriodicRefreshEnabled failed: ${e.message}") }
     }
 
     /**
@@ -913,15 +1033,30 @@ class BackendService : Service() {
         sambaKeepAliveJob = serviceScope.launch(Dispatchers.IO) {
             var consecutiveFailures = 0
             while (isActive) {
-                val baseDelay = if (consecutiveFailures >= 3) 300_000L else 60_000L
+                // 2026-10-08：连续失败 ≥10 次后进入「挂起」档（30min）：设备 SMB 未启用/密码不对时，
+                // 每 5 分钟 6 条连接失败 + 1 条汇总（真机 2026-10-08 日志实测）纯属刷屏——socket
+                // 不可能自己好起来。30min 仍会再试（不是放弃），部署成功或 socket 恢复即复位。
+                val baseDelay = when {
+                    consecutiveFailures >= 10 -> 1_800_000L
+                    consecutiveFailures >= 3 -> 300_000L
+                    else -> 60_000L
+                }
                 delay(baseDelay)
                 try {
                     if (!com.ufi_axis_core.util.SambaRootShell.isSocketAvailable()) {
-                        AppLogger.d(tag, "Samba socket not available, triggering connection... (failCount=$consecutiveFailures)")
-                        com.ufi_axis_core.util.SambaRootShell.triggerSambaConnection()
+                        if (consecutiveFailures >= 10 && consecutiveFailures % 6 == 0) {
+                            // 挂起档下每 ~3 小时才提醒一次（30min × 6），其余轮次静默
+                            AppLogger.d(tag, "Samba socket still unavailable (failCount=$consecutiveFailures), skipping trigger this round")
+                        } else {
+                            AppLogger.d(tag, "Samba socket not available, triggering connection... (failCount=$consecutiveFailures)")
+                            com.ufi_axis_core.util.SambaRootShell.triggerSambaConnection()
+                        }
                         // triggerSambaConnection 内部没有返回值，我们通过下一次循环 checkSocket 判定
                         consecutiveFailures++
                     } else {
+                        if (consecutiveFailures >= 10) {
+                            AppLogger.i(tag, "Samba socket recovered after $consecutiveFailures failures")
+                        }
                         consecutiveFailures = 0
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -954,7 +1089,9 @@ class BackendService : Service() {
         if (smsForwardJob?.isActive == true) return
         smsForwardJob = smsPollScope.launch {
             val smsForwardCtl = g.controller.smsForwardController
-            val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.network.smsClient)
+            // 2026-09-25 批 C1：sms 域迁进 DeviceAdapter 之后取值从 deviceHub.sms 拿
+            // （NetworkGraph 不再有 smsClient 字段）。拿到的仍是同一个实例，行为不变。
+            val smsCtl = com.ufi_axis_core.controller.sms.SmsController(this@BackendService, g.network.deviceHub.sms)
             val initCfg = smsForwardCtl.loadConfig()
             AppLogger.i(tag, "SMS forward init: enabled=${initCfg.enabled}, smtpHost=${initCfg.smtpHost.takeIf { it.isNotBlank() } ?: "(empty)"}")
 
@@ -1054,6 +1191,13 @@ class BackendService : Service() {
         try { g.controller.adbController.destroy() } catch (e: Exception) { AppLogger.e(tag, "Error stopping adb", e) }
         try { g.controller.downloadManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down download manager", e) }
         try { g.controller.tunnelManager.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down tunnel manager", e) }
+        // 应用列表定时刷新：持有自己的 CoroutineScope，不显式收的话服务停掉后仍每 2 分钟
+        // 打 4 条特权 shell（serviceScope 虽会在 onDestroy 被 cancel，但 stopAllComponents 也走
+        // 「停止服务」而不销毁 Service 的路径 —— 那条路上 serviceScope 还活着）。
+        try { g.serverGraph.appManager.setPeriodicRefreshEnabled(false) } catch (e: Exception) { AppLogger.e(tag, "Error stopping app list refresh", e) }
+        // ttyd：父进程（core）退出不会带走子进程，必须显式杀，否则孤儿 shell 常驻耗电。
+        // 注意顺序在 server.stop() 之后：先把 WS 反代收掉，再杀它背后的进程。
+        try { g.serverGraph.ttydRoutes.stop() } catch (e: Exception) { AppLogger.e(tag, "Error stopping ttyd", e) }
         // 关闭 ADB shell 持久会话
         try { com.ufi_axis_core.util.AdbShellExecutor.shutdown() } catch (e: Exception) { AppLogger.e(tag, "Error shutting down ADB shell", e) }
         // 配对存储：同步落一次盘并收掉 lastSeen 的异步 flush 线程。
@@ -1139,43 +1283,60 @@ class BackendService : Service() {
     }
 
     /**
-     * 通过 AlarmManager 定时拉起重服务 — 比 START_STICKY 更可靠。
+     * 通过 AlarmManager 定时拉起服务 — 比 START_STICKY 更可靠。
      * 覆盖场景：用户滑动清除、LMK 杀死、系统回收后重启、`POST /api/service/restart`。
-     * 使用 setAndAllowWhileIdle 无需 SCHEDULE_EXACT_ALARM 权限。
      *
      * 2026-08-26：改用 `getForegroundService`。原来的 `getService` 走的是普通 `startService`，
      * Android 12+ 禁止后台启动普通服务（`ForegroundServiceStartNotAllowedException` / 直接被拒），
-     * 而本服务在 `onCreate` 里就 `startForeground`，属于前台服务，必须用前台启动语义
-     * ——否则 `/api/service/restart` 之后可能起不来，而看门狗判的是"进程存活"（进程通常还在），
-     * 不会介入，等于把客户端锁在门外。
+     * 而本服务在 `onCreate` 里就 `startForeground`，属于前台服务，必须用前台启动语义。
+     *
+     * ## 2026-09-14：必须用**精确**闹钟
+     * 原来用的是 `setAndAllowWhileIdle`（inexact），理由写的是"无需 SCHEDULE_EXACT_ALARM 权限"。
+     * 但 Android 12+ 的「后台启动前台服务」豁免**只给精确闹钟**（`setExact*`）——
+     * inexact 闹钟到点时进程处于 cached 状态，`startForegroundService` 会被 AMS 判为后台启动
+     * 而抛 `ForegroundServiceStartNotAllowedException`，**异常发生在系统侧，这里的 try/catch
+     * 根本看不到**，日志里只留下一句乐观的 "restart scheduled"。加上两枚闹钟都是
+     * `FLAG_ONE_SHOT`，撞一次墙就再没人排 —— 这正是「点了重启服务之后彻底失联」的成因之一。
+     *
+     * 拿不到精确闹钟权限时仍退回 inexact：那种情况下的恢复责任落在 shell 侧
+     * （[requestRestart] 派出的 detached `am start-foreground-service`），双保险里至少还有一路。
      */
     private fun scheduleServiceRestart() {
         try {
             val intent = Intent(this, BackendService::class.java).apply {
                 action = ACTION_RESTART
             }
-            val pendingIntent = PendingIntent.getForegroundService(
-                this, 0, intent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
-            )
             val alarmManager = getSystemService(ALARM_SERVICE) as AlarmManager
-            alarmManager.setAndAllowWhileIdle(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + RESTART_DELAY_MS,
-                pendingIntent
-            )
+            val canExact = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                alarmManager.canScheduleExactAlarms()
+            } else true
+
+            fun schedule(requestCode: Int, delayMs: Long) {
+                val pi = PendingIntent.getForegroundService(
+                    this, requestCode, intent,
+                    PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+                )
+                val triggerAt = SystemClock.elapsedRealtime() + delayMs
+                if (canExact) {
+                    alarmManager.setExactAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi
+                    )
+                } else {
+                    alarmManager.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pi
+                    )
+                }
+            }
+
+            schedule(0, RESTART_DELAY_MS)
             // 备份闹钟（不同 requestCode，否则会覆盖上面那枚）：主闹钟被系统吞掉时兜底。
             // 重复拉起是安全的 —— onStartCommand 的 isRunning 守卫已改为同步置位。
-            val backupIntent = PendingIntent.getForegroundService(
-                this, 1, intent,
-                PendingIntent.FLAG_ONE_SHOT or PendingIntent.FLAG_IMMUTABLE
+            schedule(1, RESTART_DELAY_MS * 3)
+            AppLogger.i(
+                tag,
+                "Service restart scheduled in ${RESTART_DELAY_MS / 1000}s " +
+                    "(backup ${RESTART_DELAY_MS * 3 / 1000}s, exact=$canExact)"
             )
-            alarmManager.setAndAllowWhileIdle(
-                AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + RESTART_DELAY_MS * 3,
-                backupIntent
-            )
-            AppLogger.i(tag, "Service restart scheduled in ${RESTART_DELAY_MS / 1000}s via AlarmManager (backup at ${RESTART_DELAY_MS * 3 / 1000}s)")
         } catch (e: Exception) {
             AppLogger.w(tag, "Failed to schedule restart: ${e.message}")
         }

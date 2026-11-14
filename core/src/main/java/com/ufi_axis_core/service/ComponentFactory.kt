@@ -1,5 +1,9 @@
-// 防腐层（F9）：本文件是**唯一**知道 GoformClient 具体类型的地方——它负责 new 出实现；
-// 组件图对外只暴露 GoformGateway 接口（见 ComponentGraph.NetworkGraph.goformClient）。
+// 防腐层（F9）：本文件**不认识任何具体协议实现**。
+// 传输层与六个域的实现都由插件交付（`DevicePlugin.createTransport` / `createAdapter`），
+// 本文件只经 DeviceTransport / DeviceAdapter 两个契约类型接线。
+// 2026-09-25 批 A3 之前这里写的是「本文件是唯一知道 GoformClient 具体类型的地方 —— 它负责
+// new 出实现」：当时装配层要自己 new 六个协议客户端，为此把传输层向下转型成具体实现类。
+// 那句**已作废**，转型移进了 `ZteF50Plugin.createAdapter`（谁造的谁认识）。
 package com.ufi_axis_core.service
 
 import android.content.Context
@@ -13,13 +17,22 @@ import com.ufi_axis_core.api.websocket.WebSocketPushService
 import com.ufi_axis_core.collector.at.ATChannel
 import com.ufi_axis_core.collector.system.SystemCollector
 import com.ufi_axis_core.collector.telephony.TelephonyCollector
-import com.ufi_axis_core.controller.goform.*
+import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.controller.network.NetworkController
 import com.ufi_axis_core.controller.network.TrafficAutoOffGuard
 import com.ufi_axis_core.controller.system.SystemController
 import com.ufi_axis_core.core.database.AppDatabase
-import com.ufi_axis_core.deviceschema.DeviceProfile
-import com.ufi_axis_core.deviceschema.profile.DeviceProfiles
+import com.ufi_axis_core.deviceplugins.PluginRegistry
+import com.ufi_axis_core.deviceplugins.probe.ProbeEnvCollector
+import com.ufi_axis_core.devicespi.AtTransport
+import com.ufi_axis_core.devicespi.DeviceRuntime
+import com.ufi_axis_core.devicespi.PlatformAdapter
+import com.ufi_axis_core.devicespi.ProbeEnv
+import com.ufi_axis_core.devicespi.TransportConfig
+import com.ufi_axis_core.devicespi.adapter.DeviceControl
+import com.ufi_axis_core.devicespi.adapter.DeviceHub
+import com.ufi_axis_core.devicespi.adapter.NetworkControl
+import com.ufi_axis_core.devicespi.adapter.WifiControl
 import com.ufi_axis_core.core.scheduler.DataScheduler
 import com.ufi_axis_core.core.server.HttpServer
 import com.ufi_axis_core.util.AppLogger
@@ -47,6 +60,18 @@ import kotlinx.coroutines.*
  * 各 [1]..[14] 步骤日志完整保留。
  */
 object ComponentFactory {
+    /**
+     * NotificationDispatcher 的延迟引用（2026-10-06）：它构造晚于控制器子图，而测速回调
+     * 只在运行期触发。volatile：build() 在服务协程，回调在测速协程。
+     */
+    @Volatile
+    private var notificationDispatcherRef: com.ufi_axis_core.notify.NotificationDispatcher? = null
+
+    /** 远端备份（2026-10-06）的延迟引用：构造晚于控制器子图，回调只在运行期触发。 */
+    @Volatile
+    private var backupAssemblerRef: com.ufi_axis_core.api.backup.BackupAssembler? = null
+    @Volatile
+    private var storageSourceManagerRef: com.ufi_axis_core.api.files.StorageSourceManager? = null
 
     private const val TAG = "ComponentFactory"
     private var built = false
@@ -144,13 +169,78 @@ object ComponentFactory {
         val database = AppDatabase.getInstance(context)
         AppLogger.i(TAG, "[1] Database initialized")
 
+        // ── 2. 设备插件选型 ──
+        // 设备插件与 profile 在整个组件图里只选一次（计划书 3.2 / 3.3），
+        // 网络子图、SignalCollector 与 AT 通道共用同一个结果。
+        // 取值（配置项两条）在这里读、传进 resolve() —— :core:device-spi 是纯契约层，
+        // 不依赖 AppSettings / Context（理由写在 DeviceRuntime 的 KDoc 上）。
+        //
+        // ⚠ 位置在 buildCollectorGraph 之前（阶段 4 批 F 起）：AT 通道的下发实现现在由
+        // 插件的 PlatformAdapter 提供，ATChannel 自己不 new 具体实现，所以必须先有 runtime。
+        //
+        // 2026-09-24（阶段 5 的 5.1）：**先采一份 ProbeEnv**，位置在 resolve() 之前。
+        // 口径同下面那个 `val platform` —— 组件图只造/只采一份，全程共享：
+        //   - ATChannel 的平台判定（4.6，见 buildCollectorGraph）；
+        //   - 插件选型的 probe 打分（5.2，下面 resolve() 的 probeEnv 参数）。
+        // 两个消费者吃的必须是**同一个对象**：各采一份就会有两套指纹，
+        // 「AT 判成展锐、probe 却按另一份打分」这种不一致在真机上几乎无法归因。
+        // 设备 IP 与端口的口径与传输层完全一致（`goformIp` 空则回落网关），
+        // 所以这个表达式**只写一处**、同时喂给探测与 TransportConfig（见 buildNetworkGraph 的入参）。
+        val deviceIp = settings.goformIp.ifBlank { gatewayIp }
+        val probeEnv = ProbeEnvCollector.collect(deviceIp = deviceIp, port = settings.goformPort)
+        AppLogger.i(TAG, "[1.5] Probe env collected (goform_ld_reachable=${probeEnv.goformLdReachable})")
+
+        // 2026-09-24（阶段 5 的 5.2/5.3/5.4）：resolve() 现在是 suspend 且收 probeEnv ——
+        // 配置项为空时它会逐个插件 probe() 打分（选型规则与对外影响写在 DeviceRuntime 的 KDoc 上）。
+        // 本函数早就是 suspend，所以这次改签名在装配层只多了一行实参。
+        val runtime = DeviceRuntime.resolve(
+            plugins = PluginRegistry.ALL,
+            default = PluginRegistry.DEFAULT,
+            configuredId = settings.deviceProfileId,
+            normalizationEnabled = settings.fieldNormalizationEnabled,
+            probeEnv = probeEnv,
+            warn = { AppLogger.w(TAG, it) },
+            info = { AppLogger.i(TAG, it) },
+        )
+
+        // 平台适配层：**整个组件图只造一份**。
+        // `DevicePlugin.platform(ctx)` 每次调用都新建实例，所以「调两次」就是两个对象 ——
+        // 今天 SprdPlatform 无状态所以无害，但那是定时炸弹：哪天 adapter 缓存了热区路径
+        // 或探测结果，两个实例就会各探一次、各缓存一份，行为还不一致。
+        // 共享一份也让「互斥锁能不能放进 adapter」这个问题直接消失（见 NetworkController 的构造参数注释）。
+        val platform = runtime.plugin.platform(context)
+
         // ── 2-3. 采集器子图（AT 通道 + system/telephony 采集器） ──
-        val collector = buildCollectorGraph(context)
+        // probeEnv 传的是上面那份**共享的**指纹：ATChannel 的平台判定（4.6）现在从它派生，
+        // 不再自己读 /proc/cpuinfo。
+        //
+        // batteryDeclared（2026-09-24 批 M）：把「这个型号声明了 Capability.BATTERY 吗」这个
+        // **设备事实**在这里折成一个 Boolean 再往下递。装配层是唯一知道「当前是哪台设备」的地方，
+        // 下游只该拿到结论、不该拿到选型对象（口径同批 B2）。
+        //
+        // ⚠ 算**一次**、递给两个消费方（SystemCollector 与 DataScheduler），刻意不在两处各算一遍：
+        // 两处各算就有「口径漂移」的空间（谁哪天改成 `!= null` 或多判一项都不会有人发现），
+        // 而这两处必须永远是同一个答案 —— 一处填 `supported` 字段、另一处据它跳过入库与告警。
+        //
+        // ⚠ 它**不参与任何读数计算**。批 L 那个同源的 `batterySupported` 会把 percent 抹成 -1，
+        // 用户已推翻（改方案 D）：读数照系统值下发，可信度由 `supported` 字段单独表达。
+        val batteryDeclared = Capability.BATTERY in runtime.plugin.capabilities
+
+        // 设备调优值（阶段 4 的 4.5）。整图只取一份，口径同 `val platform`：
+        // `tuning()` 是插件上的函数，多调几次就多造几个对象，也就多了「两处拿到的不是同一份」
+        // 这种只在换插件时才暴露的错。三个消费方（下载限速 / 告警回差 / 预热期）都从这一份取。
+        val tuning = runtime.plugin.tuning()
+        val collector = buildCollectorGraph(
+            context,
+            platform.atTransports(),
+            probeEnv,
+            batteryDeclared = batteryDeclared
+        )
 
         // ── 4-5. 网络子图（Goform 客户端层 + 网络/ SIM 控制器） ──
-        // 设备 profile 在整个组件图里只选一次（计划书 3.2），网络子图与 SignalCollector 共用。
-        val deviceProfile = resolveDeviceProfile(settings)
-        val network = buildNetworkGraph(settings, gatewayIp, collector.atChannel, database, context, deviceProfile)
+        // deviceIp 由 [build] 算好传进来（`goformIp` 空则回落网关）：LD 探测与传输层必须是
+        // **同一个地址**，否则「探到了 A、连的是 B」会让 5.2 的打分对不上实际连的设备。
+        val network = buildNetworkGraph(settings, deviceIp, collector.atChannel, database, context, runtime, platform)
 
         // ── 5.5 配对设备存储 + 设备请求验证器 ──
         // 位置提前到 WebSocket 之前：WS 握手与 /api 请求都要按 token 哈希查设备、用记录里的
@@ -186,7 +276,12 @@ object ComponentFactory {
         // ── 7. 告警引擎 ──
         // 告警系统通知统一由手机端 NotificationCenter 负责，device 端仅入库 + 广播（避免双进程重复弹通知）
         // 投递（推送 + 邮件）在下面统一 attachNotifier，引擎本身不再持有 pushService。
-        val alert = AlertEngine(database.alertDao(), wsManager, settings)
+        // 回差带宽（4.5）：从插件的 tuning 取，不再用 AlertEngine 自己的私有常量。
+        // F50 的 thermalJitterC = 3f 与原常量 3.0 相同，所以本次接线对现有行为零影响。
+        val alert = AlertEngine(
+            database.alertDao(), wsManager, settings,
+            temperatureHysteresisC = tuning.thermalJitterC.toDouble()
+        )
         AppLogger.i(TAG, "[7] Alert engine initialized")
 
         // ── 8. 共享组件 ──
@@ -209,7 +304,7 @@ object ComponentFactory {
             broadcaster = { type, data -> wsManager.broadcast(type, data) }
         )
         val smsController = com.ufi_axis_core.controller.sms.SmsController(
-            context, network.smsClient, database.smsReadStateDao(), database.smsVerificationCodeDao(), smsRuleStore
+            context, network.deviceHub.sms, database.smsReadStateDao(), database.smsVerificationCodeDao(), smsRuleStore
         )
 
         // ── 9. 数据采集调度器 ──
@@ -218,8 +313,16 @@ object ComponentFactory {
             telephonyCollector = collector.telephonyCollector,
             database = database,
             webSocketManager = wsManager,
-            signalClient = network.signalClient,
-            smsClient = network.smsClient,
+            // 热区读数（4.3 / 批 I）：`readMaxCpuTemp()` 已改为调 platform.readTemperature()。
+            // 传的是上面那份**共享实例**，不是现场新造的（见 `val platform` 那行的注释）。
+            platform = platform,
+            // 电池能力（2026-09-24 批 M）：与上面递给 SystemCollector 的是**同一个** val，
+            // 不在这里重算。scheduler 只用它决定「要不要入库 / 要不要告警」，不影响任何下发读数。
+            batteryDeclared = batteryDeclared,
+            // 批 B2：signal 取数口是域接口 SignalSource，从 hub 上取（原来是 network.signalClient）。
+            signalClient = network.deviceHub.signal,
+            // 批 C1：短信取数口是域接口 SmsControl，从 hub 上取（原来是 network.smsClient）。
+            smsClient = network.deviceHub.sms,
             alertEngine = alert,
             dynamicThreadPool = dynamicThreadPool,
             wakeLockRenew = wakeLockRenew,
@@ -229,8 +332,11 @@ object ComponentFactory {
             smsController = smsController,
             ruleStore = smsRuleStore,
             // SignalCollector 的字段映射表。它不吃"关归一化"那个开关（第 1 层就是归一化），
-            // 所以关闭时也回落默认 profile。
-            deviceProfile = deviceProfile ?: DeviceProfiles.DEFAULT
+            // 所以关闭时也回落非空那份（命令表口径，来自选中的插件）。
+            deviceProfile = runtime.commandProfile,
+            // 预热期的设备默认值（4.5）。用户在 AppSettings 里配过就以用户为准，这只是兜底口径。
+            // F50 的 bootGraceMs = 90_000L 与 DataScheduler 原常量相同，本次接线对现有行为零影响。
+            bootGraceDeviceDefaultMs = tuning.bootGraceMs
         )
         AppLogger.i(TAG, "[9] DataScheduler initialized")
 
@@ -247,16 +353,36 @@ object ComponentFactory {
         // ── 11-12. 控制器子图（ADB / SMS 转发 / 任务 / 下载 / System 控制器） ──
         val controller = buildControllerGraph(
             context = context,
-            deviceClient = network.deviceClient,
+            deviceControl = network.deviceHub.device,
             systemCollector = collector.systemCollector,
             networkController = network.networkController,
-            wifiClient = network.wifiClient,
-            networkClient = network.networkClient,
-            smsRuleStore = smsRuleStore
+            wifiControl = network.deviceHub.wifi,
+            networkControl = network.deviceHub.network,
+            // P3-5：定时任务的能力门禁判据。与 route 层门禁同一个来源
+            // （`DataHub.deviceCapabilities` 也是这份），不另存一份。
+            capabilities = network.deviceHub.capabilities,
+            smsRuleStore = smsRuleStore,
+            platform = platform,
+            tuning = tuning,
+            database = database,
+            wsManager = wsManager,
+            notificationDispatcherProvider = { notificationDispatcherRef },
+            backupAssemblerProvider = { backupAssemblerRef!! },
+            storageSourceManagerProvider = { storageSourceManagerRef!! }
         )
 
         // 条件引擎挂载到数据采集调度器（在各采集点并联评估，零额外采集开销）
         scheduler.attachConditionEngine(controller.conditionEngine)
+
+        // 任务 / 规则集合变更推送（2026-09-21）：两个调度器都在 buildControllerGraph 里构造，
+        // 那一层拿不到 wsManager，所以走 attach。不挂的话任务列表是纯 REST 拉取、
+        // 零失效通知 —— web 端建完任务，app 必须退出页面再进才看得见。
+        controller.taskScheduler.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.TASK_LIST)
+        }
+        controller.conditionEngine.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.TASK_RULES)
+        }
 
         // 邮件路径的拦截判定（2026-09-08）：SmsForwardController 在 buildControllerGraph 里构造，
         // 那一层拿不到 AppDatabase，所以规则 store 走 attach 注入。
@@ -338,6 +464,7 @@ object ComponentFactory {
             gate = notifyGate,
             criticalOverride = { NotificationRoutes.read(settings).critical_override_enabled }
         )
+        notificationDispatcherRef = notificationDispatcher
         // 注册顺序 = 投递顺序（分发器串行投递）。push 放前面：它是内存操作、几乎立即返回，
         // 而邮件那条要持 WakeLock 做 SMTP 握手，最坏几十秒。先把实时的那条发出去。
         notificationDispatcher.register(com.ufi_axis_core.notify.PushChannel(pushService))
@@ -358,11 +485,13 @@ object ComponentFactory {
         )
         notificationDispatcher.register(webhookChannel)
         // 本机短信（阶段 3）：唯一走**信令网**的渠道 —— 数据断了 / 套餐用尽 / 自动关网时，
-        // 邮件与 Webhook 恰恰都发不出去。发送出口复用 network.smsClient（全仓唯一那条
-        // goform SEND_SMS 通道），投递记录同样写进 mail_send_records 的 channel 列。
+        // 邮件与 Webhook 恰恰都发不出去。发送出口是 sms 域（批 C1 起从 deviceHub 上取，
+        // 全仓唯一那条发信通道），投递记录同样写进 mail_send_records 的 channel 列。
         val localSmsChannel = com.ufi_axis_core.controller.notify.LocalSmsChannel(
             store = localSmsStore,
-            smsClient = network.smsClient,
+            smsClient = network.deviceHub.sms,
+            // P3-6：渠道自己判「这台设备支不支持发短信」，判据与 RootSmsRoutes 的门禁同源。
+            capabilities = network.deviceHub.capabilities,
             history = com.ufi_axis_core.controller.notify.DeliveryHistoryRecorder {
                 channelId, scene, subject, target, outcome, detail ->
                 controller.smsForwardController.recordChannelHistory(
@@ -393,8 +522,25 @@ object ComponentFactory {
 
 
         // ── 12.5 DataHub: 统一请求数据中心（集中管理所有 goform 查询缓存，消除路由间重复请求）──
-        val dataHub = DataHub(scheduler, network.signalClient, network.wifiClient, responseCache)
+        // 后三个参数只供「显示与门禁」，不参与取数：传**值**不传 runtime，
+        // 理由写在 DataHub 的类 KDoc（不让 :core:api 依赖 :core:device-spi、
+        // 不把选型对象的生命周期扩散到数据层）。
+        // selection 在这里就转成对外的小写 snake（Selection.wire），数据层与 route 层都不做映射 ——
+        // 「枚举 → 线上取值」的唯一定义点在枚举自己身上。
+        // capabilities 是阶段 3 的 3.3 新增：插件声明的能力集原样递下去（Capability 在
+        // :core:contract，两边看到的是同一份冻结区类型，不需要在这里做任何翻译）。
+        val dataHub = DataHub(
+            scheduler, network.deviceHub.signal, network.deviceHub.wifi, responseCache,
+            devicePluginId = runtime.plugin.id,
+            deviceSelection = runtime.selection.wire,
+            deviceCapabilities = runtime.plugin.capabilities,
+        )
         AppLogger.i(TAG, "[12.5] DataHub initialized")
+
+        // 2026-10-05 R2-3 修复：DataHub 建好后再挂 WiFi 缓存失效钩子（NetworkController 在
+        // buildNetworkGraph 内先于 DataHub 创建，故用延迟赋值）。setWifiSSID 部分失败
+        // （SSID 成功、口令失败）时也会失效缓存，保证下一位读方拿到新状态。
+        network.networkController.wifiCacheInvalidator = { dataHub.invalidateWifi() }
 
         // 流量套餐限额预警（2026-08-31 从 app 侧下沉）：判定在 AlertEngine，取数走 DataHub 的 10s 缓存。
         // 开关在 lambda 里查，关闭时连 goform 都不查（scheduler 引不到 NotificationConfig，见 attachTrafficLimitProvider）。
@@ -423,7 +569,7 @@ object ComponentFactory {
         scheduler.attachDeviceEventWatcher(
             provider = {
                 if (!NotificationRoutes.read(settings).device_events_enabled) null
-                else network.wifiClient.getConnectedClients()
+                else network.deviceHub.wifi.getConnectedClients()?.values
             },
             sink = { online, label, mac -> alert.recordDeviceEvent(online, label, mac) }
         )
@@ -439,11 +585,7 @@ object ComponentFactory {
             ),
             network = NetworkDeps(
                 goformClient = network.goformClient,
-                signalClient = network.signalClient,
-                networkClient = network.networkClient,
-                deviceClient = network.deviceClient,
-                wifiClient = network.wifiClient,
-                simClient = network.simClient,
+                deviceHub = network.deviceHub,
                 networkController = network.networkController
             ),
             storage = StorageDeps(
@@ -471,10 +613,29 @@ object ComponentFactory {
             dao = database.consoleHistoryDao(),
             recorder = consoleRecorder
         )
+        // 真 PTY 终端（ttyd 反代，2026-10-06）：开关默认关，关着时不会 spawn 任何进程。
+        // 二进制路径用 AssetExtractor 的释放位（filesDir/shell/ttyd），与 aria2c/socat 同源。
+        val ttydManager = com.ufi_axis_core.api.terminal.TtydManager(
+            binaryPath = com.ufi_axis_core.util.AssetExtractor.getPath(context, "ttyd")
+        )
+        val ttydRoutes = com.ufi_axis_core.api.routes.TtydRoutes(
+            settings = settings,
+            manager = ttydManager,
+            // 与 wsManager 同一鉴权源：/ws/terminal 反代握手必须过 query 验签
+            wsAuthenticator = { token, ts, nonce, sig, path ->
+                val result = deviceVerifier.verify(
+                    token = token, timestamp = ts, nonce = nonce, signature = sig,
+                    method = "GET", uri = path
+                )
+                (result as? com.ufi_axis_core.util.DeviceRequestVerifier.Result.Ok)?.device?.fingerprint
+            }
+        )
         // 配置备份：Assembler 负责各段内容，Routes 负责 ZIP / manifest / 加密
+        val backupAssembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database)
+        backupAssemblerRef = backupAssembler
         val backupRoutes = com.ufi_axis_core.api.routes.BackupRoutes(
             settings = settings,
-            assembler = com.ufi_axis_core.api.backup.BackupAssembler(context, settings, database),
+            assembler = backupAssembler,
             tunnelActive = { controller.tunnelManager.anyRunning() }
         )
         val deviceRoutes = DeviceRoutes(routeCtx)
@@ -522,11 +683,104 @@ object ComponentFactory {
         } catch (e: Exception) {
             com.ufi_axis_core.util.AppLogger.w("ComponentFactory", "recoverFromPending 异常: ${e.message}")
         }
+        // 2026-10-05 R4-9 修复：把更新状态机的忙/闲接入全局写门（WriteGate），
+        // 重启 / 恢复出厂 / 切卡在更新进行中回 409，避免 OTA 半写状态。
+        com.ufi_axis_core.api.routes.WriteGate.updateBusy = {
+            updateManager.status.state in setOf(
+                com.ufi_axis_core.api.update.UpdateManager.State.DOWNLOADING,
+                com.ufi_axis_core.api.update.UpdateManager.State.VERIFYING,
+                com.ufi_axis_core.api.update.UpdateManager.State.INSTALLING,
+                com.ufi_axis_core.api.update.UpdateManager.State.UPLOADING
+            )
+        }
         val updateRoutes = com.ufi_axis_core.api.routes.UpdateRoutes(updateManager)
         val appRoutes = AppRoutes(appManager)
         val shellRoutes = ShellRoutes(consoleRecorder)
-        val fileRoutes = FileRoutes()
-        val rootSmsRoutes = RootSmsRoutes(smsController, scheduler, smsRuleStore)
+        val fileProviderRegistry = com.ufi_axis_core.api.files.FileProviderRegistry()
+        fileProviderRegistry.register(com.ufi_axis_core.api.files.LocalFileProvider())
+        // context / responseCache 是给 POST /api/files/delete 用的：走 MediaStore 删除才能
+        // 把媒体索引一起清掉（File.delete 会留下指向不存在文件的僵尸条目），
+        // 删完再失效 media:* 缓存，客户端刷出来才是新的
+        val fileRoutes = FileRoutes(fileProviderRegistry, context, responseCache)
+        // 远程存储源（阶段 2-4）：FTP / WebDAV 配置存在 settings 的 storage_sources 键上，
+        // 启动时把已启用的源注册进 registry —— FileRoutes 的 `remote:<id>/...` 路径解析靠它。
+        // 建连失败不阻塞启动：initializeProviders 内部按源吞异常并记 WARN。
+        val storageSourceManager = com.ufi_axis_core.api.files.StorageSourceManager(
+            settings, fileProviderRegistry
+        )
+        storageSourceManagerRef = storageSourceManager
+        storageSourceManager.initializeProviders()
+        val storageSourceRoutes = com.ufi_axis_core.api.routes.StorageSourceRoutes(storageSourceManager)
+        // 媒体中心（2026-09-16）：查系统媒体库列视频 / 音乐 / 图片 + 缩略图 + 扫描目录配置。
+        // 播放仍走 fileRoutes 的 /api/files/stream，这里不碰字节流。
+        // responseCache 只给 /media/groups 用（整表聚合，客户端会来回切三个分组视图）。
+        // 「从音乐库移除」的排除名单（2026-09-23）：单文件级，扫描目录管不了单首。
+        // 它被 MediaRoutes.listSelection 用来在 SQL 里排掉那些路径 ——
+        // 所以必须先建它再建 mediaRoutes。名单变更走 data_changed，
+        // 否则在一端移除、另一端要退页面才看得见。
+        val mediaExclusions = com.ufi_axis_core.api.media.MediaExclusionStore(context)
+        mediaExclusions.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
+        }
+        // 预热进度广播闭包（2026-10-07：抽出来给调度侧与手动触发共用一份口径）
+        val thumbPrewarmBroadcast: suspend (Int, Int, Int, Boolean, String) -> Unit = { done, total, failed, running, currentName ->
+            wsManager.broadcast(
+                "data_changed",
+                mapOf(
+                    "changed" to com.ufi_axis_core.contract.WsDataTopic.MEDIA_THUMB_PREWARM,
+                    "done" to done, "total" to total,
+                    "failed" to failed, "running" to running, "current_name" to currentName
+                )
+            )
+        }
+        val mediaRoutes = com.ufi_axis_core.api.routes.MediaRoutes(
+            context, settings, responseCache, mediaExclusions,
+            // 2026-10-07：手动预热（POST /api/media/thumbnail-prewarm）与调度侧同一条执行路径，
+            // forceIdle=true 表示用户点按钮时忽略闲时门。
+            manualPrewarm = {
+                com.ufi_axis_core.media.ThumbPrewarmWorker.runOnce(
+                    context = context,
+                    throttledPerItem = { kotlinx.coroutines.delay(2_000L) },
+                    broadcast = thumbPrewarmBroadcast,
+                    forceIdle = true
+                )
+            }
+        )
+
+        // 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）：把 ThumbPrewarmWorker
+        // 挂到 DataScheduler 的 idle 循环上。开关/闲时/写门判据全在 Worker 里（每轮现读），
+        // 这里只递「每张之间 delay(2s) 的节流」与「data_changed 进度广播」两个闭包。
+        scheduler.attachThumbPrewarmTask {
+            com.ufi_axis_core.media.ThumbPrewarmWorker.runOnce(
+                context,
+                throttledPerItem = { kotlinx.coroutines.delay(2_000L) },
+                broadcast = thumbPrewarmBroadcast
+            )
+        }
+        // 音频歌单（2026-09-21）：歌单本身存 prefs（曲目只记路径），曲目回查复用 mediaRoutes
+        // 的 MediaStore 查询（它实现了 AudioItemLookup）——「路径 → 曲目」只在 core 存在一份，
+        // app 与 web 都不必自己拼。集合变更走 data_changed，否则一端加歌另一端要退页面才看得见。
+        val playlistStore = com.ufi_axis_core.api.media.PlaylistStore(context)
+        playlistStore.attachChangeBroadcaster {
+            wsManager.broadcastDataChanged(com.ufi_axis_core.contract.WsDataTopic.MEDIA_PLAYLISTS)
+        }
+        val playlistRoutes =
+            com.ufi_axis_core.api.routes.PlaylistRoutes(playlistStore, mediaRoutes)
+        // 天气（2026-09-17）：代理 Open-Meteo，位置存在 settings，结果走 responseCache 的 TTL。
+        val weatherRoutes = com.ufi_axis_core.api.routes.WeatherRoutes(settings, responseCache)
+        // 今日诗词（2026-09-18）：代理 jinrishici v2，token 存在 settings、结果走 responseCache 的 TTL。
+        val poetryRoutes = com.ufi_axis_core.api.routes.PoetryRoutes(settings, responseCache)
+        // 出网国家/地区（2026-09-18）：结果就存在 settings 的 geo_country / geo_detected_at 两个键上，
+        // 所以不接 responseCache —— "多久之内不重测"由落盘时间戳表达，再叠内存 TTL 会造出第二个口径。
+        // 启动时的自动检测不在这里触发（build() 是阻塞的，出网最坏 24s 会顶到初始化看门狗），
+        // 见 BackendService 里 HTTP 服务就绪之后那段。
+        val geoRoutes = com.ufi_axis_core.api.routes.GeoRoutes(settings)
+        // 短信路由：能力集只用于 /sms/send 的门禁（阶段 3 的 3.3）。
+        // 这个类没有 RouteContext，所以直接递不可变的 Set，不为一个门禁把 DataHub 递进去。
+        val rootSmsRoutes = RootSmsRoutes(
+            smsController, scheduler, smsRuleStore,
+            deviceCapabilities = runtime.plugin.capabilities,
+        )
         val smsForwardRoutes = SmsForwardRoutes(controller.smsForwardController, notifier)
         // Webhook 渠道（阶段 2）：配置 + 测试。gate 传的是同一个谓词（按 webhook 渠道绑好
         // respectDnd），只用于 /test 响应里的 auto_notify_enabled —— 不拦投递。
@@ -544,8 +798,11 @@ object ComponentFactory {
             gate = { notifyGateOpen(com.ufi_axis_core.controller.notify.LocalSmsChannel.ID) }
         )
         val taskRoutes = TaskRoutes(controller.taskScheduler, controller.conditionEngine)
-        val speedTestRoutes = SpeedTestRoutes()
+        val speedTestRoutes = SpeedTestRoutes(coordinator = controller.speedTestCoordinator)
         val debugLogRoutes = DebugLogRoutes()
+        val diagnosticRoutes = com.ufi_axis_core.api.routes.DiagnosticRoutes()
+        val cpuProbeRoutes = com.ufi_axis_core.api.routes.CpuProbeRoutes()
+        val planRoutes = com.ufi_axis_core.api.routes.PlanRoutes(routeCtx)
         val qosRoutes = QoSRoutes(routeCtx)
         val monitorRoutes = MonitorRoutes(database, scheduler, settings) { enabled ->
             BackendService.applyBackgroundServices(enabled)
@@ -598,6 +855,36 @@ object ComponentFactory {
         val webUpdateRoutes = com.ufi_axis_core.api.routes.WebUpdateRoutes(webResourceManager, webUpdateManager)
         AppLogger.i(TAG, "[13.6] Web resource manager initialized")
 
+        // ── 13.7 DLNA MediaServer（2026-10-09）──
+        // 依赖 fileRoutes 的票据签发（同一份 MediaTicketStore）与 core 的 HTTP 端口。
+        // 启动与否由持久化的 enabled 决定；目录未配置时不启动（DlnaService 内二次校验）。
+        val dlnaService = DlnaService(
+            androidContext = context.applicationContext,
+            settings = settings,
+            corePort = settings.port,
+            issueTicket = { f -> fileRoutes.issueStreamTicketFor(f.absolutePath) ?: "" },
+        )
+        // 启动必须在 build() 阻塞路径之外：startup() → router.enable() 同步绑 Jetty +
+        // 多播/DatagramIO，而 build() 被 15s 初始化看门狗盯着，超时杀进程 —— r25 前的
+        // 「一直初始化组件」卡死即此。DLNA 晚几秒起没有功能影响，故丢到后台线程。
+        if (dlnaService.isEnabled() && dlnaService.readyToEnable()) {
+            Thread({ dlnaService.start() }, "dlna-start").apply { isDaemon = true }.start()
+        }
+        val dlnaRoutes = com.ufi_axis_core.api.routes.DlnaRoutes(
+            status = {
+                com.ufi_axis_core.api.routes.DlnaRoutes.DlnaStatus(
+                    enabled = dlnaService.isEnabled(),
+                    running = dlnaService.isRunning,
+                    ready = dlnaService.readyToEnable(),
+                    dirs = dlnaService.dirs(),
+                )
+            },
+            applyConfig = { cfg ->
+                cfg.dirs?.let { dlnaService.setDirs(it) }
+                cfg.enabled?.let { dlnaService.setEnabled(it) }
+            }
+        )
+
         // ── 14. HTTP Server ──
         val server = HttpServer(
             port = settings.port,
@@ -618,6 +905,12 @@ object ComponentFactory {
             appRoutes = appRoutes,
             shellRoutes = shellRoutes,
             fileRoutes = fileRoutes,
+            storageSourceRoutes = storageSourceRoutes,
+            mediaRoutes = mediaRoutes,
+            playlistRoutes = playlistRoutes,
+            weatherRoutes = weatherRoutes,
+            poetryRoutes = poetryRoutes,
+            geoRoutes = geoRoutes,
             rootSmsRoutes = rootSmsRoutes,
             smsForwardRoutes = smsForwardRoutes,
             webhookRoutes = webhookRoutes,
@@ -625,6 +918,9 @@ object ComponentFactory {
             taskRoutes = taskRoutes,
             speedTestRoutes = speedTestRoutes,
             debugLogRoutes = debugLogRoutes,
+            diagnosticRoutes = diagnosticRoutes,
+            cpuProbeRoutes = cpuProbeRoutes,
+            planRoutes = planRoutes,
             qosRoutes = qosRoutes,
             monitorRoutes = monitorRoutes,
             notificationRoutes = notificationRoutes,
@@ -639,7 +935,9 @@ object ComponentFactory {
             tunnelRoutes = tunnelRoutes,
             componentRoutes = componentRoutes,
             consoleRoutes = consoleRoutes,
-            backupRoutes = backupRoutes
+            ttydRoutes = ttydRoutes,
+            backupRoutes = backupRoutes,
+            dlnaRoutes = dlnaRoutes
         )
         AppLogger.i(TAG, "[14] HTTP server ready (with API cache)")
 
@@ -663,24 +961,45 @@ object ComponentFactory {
                 alertEngine = alert,
                 dataScheduler = scheduler,
                 dynamicThreadPool = dynamicThreadPool,
-                webResourceManager = webResourceManager
+                webResourceManager = webResourceManager,
+                // 停机钩子要能收 ttyd（杀进程 + 关反代 HttpClient；否则孤儿进程常驻，2026-10-06）
+                ttydRoutes = ttydRoutes,
+                // 应用列表定时刷新的起停钩子（见 ServerGraph.appManager 的说明）
+                appManager = appManager
             )
         )
     }
 
     // ==================== 子图 builders（Phase 2 #2 拆分） ====================
 
-    /** 采集器子图：AT 通道 + system / telephony 采集器（原步骤 2-3）。 */
-    private suspend fun buildCollectorGraph(context: Context): CollectorGraph {
+    /** 采集器子图：AT 通道 + system / telephony 采集器（原步骤 2-3）。
+     *
+     * [atTransports] 由调用方从 `runtime.plugin.platform(ctx).atTransports()` 取来
+     * （阶段 4 批 F）：`ATChannel` 是策略层（限流/退避/熔断），**不认识任何具体实现** ——
+     * `ServiceCallAtExecutor` 现在住在 `:core:device-plugins` 的 `platform/sprd/`。
+     *
+     * [probeEnv] 同理（阶段 4 的 4.6）：`ATChannel` 不再自己读 `/proc/cpuinfo`，
+     * 平台判定从这份**组件图唯一的**指纹派生。
+     *
+     * [batteryDeclared] 是 `Capability.BATTERY` 折出来的**一个不可变值**（2026-09-24 批 M）：
+     * 递 Boolean 而不是整个 capabilities 集合 —— 采集器不该认识能力集语义，
+     * 否则「往集合里加一项」就会变成「去采集器里加一个分支」。
+     * `SystemCollector` 只用它填 battery map 的 `supported` 字段，**不参与任何读数计算**。 */
+    private suspend fun buildCollectorGraph(
+        context: Context,
+        atTransports: List<AtTransport>,
+        probeEnv: ProbeEnv,
+        batteryDeclared: Boolean
+    ): CollectorGraph {
         val atChannel = ATChannel()
         val atConnected = try {
-            withTimeoutOrNull(10_000L) { atChannel.init() } ?: false
+            withTimeoutOrNull(10_000L) { atChannel.init(atTransports, probeEnv) } ?: false
         } catch (e: Exception) {
             AppLogger.e(TAG, "AT channel init exception", e); false
         }
         AppLogger.i(TAG, "[2] AT channel: ${if (atConnected) "connected" else "not available"}")
 
-        val systemCollector = SystemCollector(context)
+        val systemCollector = SystemCollector(context, batteryDeclared = batteryDeclared)
         val telephonyCollector = TelephonyCollector(context)
         AppLogger.i(TAG, "[3] Collectors initialized")
 
@@ -691,73 +1010,83 @@ object ComponentFactory {
         )
     }
 
-    /** 网络子图：Goform 客户端层 + NetworkController（原步骤 4-5）。
-     * 注意：SystemController 依赖 deviceClient，归入 [buildControllerGraph]。 */
+    /** 网络子图：传输层 + 集中处理器（[DeviceHub]）+ NetworkController（原步骤 4-5）。
+     * 注意：SystemController 依赖 device 域（`deviceHub.device`），归入 [buildControllerGraph]。
+     *
+     * [runtime] 由 [build] 选好后注入（计划书 3.2 / 3.3）：本函数**不再自己读 settings 里的选型配置**，
+     * 「当前是哪台设备」全仓只有一处答案。 */
     private fun buildNetworkGraph(
         settings: AppSettings,
-        gatewayIp: String,
+        deviceIp: String,
         atChannel: ATChannel,
         database: AppDatabase,
         context: Context,
-        profile: DeviceProfile?
+        runtime: DeviceRuntime,
+        platform: PlatformAdapter
     ): NetworkGraph {
-        val goformIp = settings.goformIp.ifBlank { gatewayIp }
-        val goform = GoformClient(
-            deviceIp = goformIp,
-            port = settings.goformPort,
-            password = settings.goformPassword
+        // 传输层由插件造（阶段 2 批 B 取代了原先的私有 createTransport()）。三个取值与此前逐字一致：
+        // 设备 IP 仍是 `goformIp` 空则回落网关（2026-09-24 起那个表达式移到 [build]，
+        // 与 ProbeEnv 的 LD 探测共用同一份 —— 两处各算一遍就会有两个口径），
+        // 端口与密码仍直取配置项（符号名中立、配置键仍叫 goform*，见 TransportConfig 的 KDoc）。
+        //
+        // 2026-09-25 批 A3：**这里原来有一句向下转型**（`transport as? GoformClient`）加一段注释，
+        // 说的是「6 个协议客户端的构造参数是 core/goform 模块内部那层传输接口，用 DeviceTransport
+        // 接不上，而本文件不许写那个内部接口的类型名，所以本文件是唯一知道具体实现类型的地方；
+        // 真正消掉它要等把 6 个客户端收进插件」。那段话**已作废** —— 客户端的 new 与那句转型
+        // 现在都在插件里（`ZteF50Plugin.createAdapter` → `ZteGoformAdapter` 的公开构造函数），
+        // 装配层只认 `DeviceTransport` 与 `DeviceAdapter` 两个契约类型。
+        // 当时停手的真实原因（WiFi 读侧与 sms 域还没有域接口，装配层必须把那两个具体客户端
+        // 交给 5 个上层消费点）由批 C1 / C2 解除。
+        //
+        // ⚠ transport **整图只造一份**：它持有会话（cookie、wa / cr 版本号）、登录退避与
+        // HTTP 连接池，造第二份等于两套会话互相顶下线。所以这一行仍然在装配层 ——
+        // 同一个实例既进 `NetworkGraph.goformClient`（`PairingRoutes` / `DeviceRoutes` 的
+        // updateGoformPassword 靠它），又递给 `createAdapter`。
+        val transport = runtime.plugin.createTransport(
+            TransportConfig(
+                deviceIp = deviceIp,
+                port = settings.goformPort,
+                password = settings.goformPassword
+            )
         )
-        // profile 由调用方选好后注入（计划书 3.2）。
-        // 此前每个客户端的构造参数各带一个 `= ZteGoformProfile` 默认值 —— 等于选型逻辑
-        // 散在 6 个签名里，换设备要改 6 处且漏一处不会报错。
-        val signalClient = GoformSignalClient(goform, profile)
-        val wifiClient = GoformWifiClient(goform, profile)
-        val networkClient = GoformNetworkClient(goform, profile)
-        val deviceClient = GoformDeviceClient(goform, profile)
-        val smsClient = GoformSmsClient(goform)
-        val simClient = GoformSimClient(goform, profile)
+        // 集中处理器（2026-09-25 批 A1 立，批 A2a 加 device 域，批 A3 起整条链由插件交付）：
+        // 上层（SimRoutes / DeviceRoutes / SystemController / ActionExecutorImpl）只认 DeviceHub
+        // 或它交付的域接口，具体协议客户端只有插件模块知道。
+        //
+        // 两份 profile 的分工（原来写在这里那六行 new 上面，逐字未变，只是搬到了插件里）：
+        // **可空**的 `runtime.profile` 管归一化 —— 排障开关关掉归一化时它就是 null，
+        // `enabled` / `profileId`（→ /api/diagnose 的 normalization_enabled）靠的就是这个 null；
+        // **非空**的 `runtime.commandProfile` 管命令表，且兜的是**选中插件**的 profile、
+        // 不是注册表默认插件（否则排障开关会顺带把命令表换成默认设备的 —— 接第二台设备就是
+        // 「向 B 发 A 的 cmd」，见 DeviceRuntime.commandProfile 的 KDoc）。
+        // id / capabilities 也不在这里传了：插件自己交出 adapter，取的就是它自己的属性 ——
+        // 能力集是「设备支不支持某个动作」的唯一判据，不许有第二份。
+        val deviceHub = DeviceHub(
+            runtime.plugin.createAdapter(
+                transport = transport,
+                commandProfile = runtime.commandProfile,
+                normalizeProfile = runtime.profile,
+            )
+        )
         AppLogger.i(TAG, "[4] Goform clients initialized")
 
-        val networkController = NetworkController(context, atChannel, networkClient, wifiClient)
+        // 平台适配层由装配层给（阶段 4 的 4.4）：`NetworkController.restartNetworkStack()`
+        // 现在只留策略（互斥锁 + 注入执行通道与 5000ms 超时），
+        // 「AT+SFUN=5 / AT+SFUN=4 怎么发」那份设备知识在 PlatformAdapter 里。
+        // `platform` 由 [build] 造好一份传进来（整个组件图共享同一个实例，理由见那里的注释）。
+        // 与第 167 行取 atTransports() 时那次调用是**两个实例** —— `platform(ctx)` 按
+        // `DevicePlugin.platform` 的纪律每次新建，适配层无跨调用状态（网络栈重启的互斥锁
+        // 留在 NetworkController，理由见它的构造参数注释）。
+        val networkController = NetworkController(
+            context, atChannel, deviceHub.network, deviceHub.wifi, platform
+        )
         AppLogger.i(TAG, "[5] Controllers initialized")
 
         return NetworkGraph(
-            goformClient = goform,
-            signalClient = signalClient,
-            wifiClient = wifiClient,
-            networkClient = networkClient,
-            deviceClient = deviceClient,
-            smsClient = smsClient,
-            simClient = simClient,
+            goformClient = transport,
+            deviceHub = deviceHub,
             networkController = networkController
         )
-    }
-
-    /**
-     * 选设备 profile（计划书 3.2 / 10.2）。
-     *
-     * - `fieldNormalizationEnabled = false` → 返回 null，设备客户端层退回原样透传（决策 D7 的回退开关）。
-     * - `deviceProfileId` 为空 → 注册表默认值（现有部署零配置继续工作）。
-     * - 填了但注册表里没有 → **仍然回落默认值** + WARN。型号不认识不能导致整个不工作。
-     *
-     * 只在构造组件图时读一次；改了配置要重启后台服务。这样"切换后缓存里还躺着上一种形状的
-     * 数据"（计划书 1.0.2）在设计上就不成立 —— 组件图重建时各级缓存都是新的。
-     */
-    private fun resolveDeviceProfile(settings: AppSettings): DeviceProfile? {
-        if (!settings.fieldNormalizationEnabled) {
-            AppLogger.w(TAG, "字段归一化已关闭（排障开关），设备字段将原样透传，对外字段名会变回设备原名")
-            return null
-        }
-        val id = settings.deviceProfileId
-        if (id.isBlank()) return DeviceProfiles.DEFAULT
-        val picked = DeviceProfiles.byId(id)
-        if (picked == null) {
-            AppLogger.w(TAG, "未知的 deviceProfileId=$id，回落 ${DeviceProfiles.DEFAULT.id}" +
-                "（可选：${DeviceProfiles.ALL.joinToString { it.id }}）")
-            return DeviceProfiles.DEFAULT
-        }
-        AppLogger.i(TAG, "设备 profile: ${picked.id}（${picked.displayName}）")
-        return picked
     }
 
     /** 存储子图：settings + database + responseCache（原步骤 1 + 8）。 */
@@ -773,19 +1102,41 @@ object ComponentFactory {
         )
     }
 
-    /** 控制器子图：System / ADB / SMS 转发 / 任务 / 下载 控制器（原步骤 5 的 SystemController + 11-12）。 */
+    /** 控制器子图：System / ADB / SMS 转发 / 任务 / 下载 控制器（原步骤 5 的 SystemController + 11-12）。
+     *
+     * [platform] / [tuning] 只服务 `DownloadManager`（阶段 4 的 4.3 + 4.5）：
+     * 热区读法收进了 `PlatformAdapter.readTemperature()`，下载限速的两个温度阈值初值
+     * 与迁移目标值收进了 `DeviceTuning`。[platform] 递的是 `build()` 里那**一份共享实例**。 */
     private fun buildControllerGraph(
         context: Context,
-        deviceClient: GoformDeviceClient,
+        deviceControl: DeviceControl,
         systemCollector: SystemCollector,
         networkController: NetworkController,
-        wifiClient: GoformWifiClient,
-        networkClient: GoformNetworkClient,
+        wifiControl: WifiControl,
+        networkControl: NetworkControl,
+        /**
+         * 设备声明的能力集，只递给 [ActionExecutorImpl]（P3-5 的定时任务门禁）。
+         * 递集合而不是递布尔，是因为门禁要按 actionType 查表，需要的是整份集合。
+         */
+        capabilities: Set<com.ufi_axis_core.contract.Capability>,
         /** 只为放进 [ControllerGraph] 供停机流程收尾用，本函数不参与它的装配。 */
-        smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore
+        smsRuleStore: com.ufi_axis_core.controller.sms.SmsRuleStore,
+        platform: PlatformAdapter,
+        tuning: com.ufi_axis_core.devicespi.DeviceTuning,
+        /** 定时测速（2026-10-06）：入库 + WS 广播 + 通知都依赖外层已装配好的这三个组件。 */
+        database: com.ufi_axis_core.core.database.AppDatabase,
+        wsManager: WebSocketManager,
+        /**
+         * 通知分发器的**延迟引用**（2026-10-06）：NotificationDispatcher 在本函数之后才装配
+         * （它依赖 pushService / 邮件渠道），而测速回调只在运行期触发，届时引用必已就绪。
+         */
+        notificationDispatcherProvider: () -> com.ufi_axis_core.notify.NotificationDispatcher?,
+        /** 远端备份（2026-10-06）：ControllerGraph 构造早于 ServerGraph，由外层传引用 */
+        backupAssemblerProvider: () -> com.ufi_axis_core.api.backup.BackupAssembler,
+        storageSourceManagerProvider: () -> com.ufi_axis_core.api.files.StorageSourceManager
     ): ControllerGraph {
-        // SystemController 依赖 deviceClient，与原步骤 5 同阶段构造
-        val systemController = SystemController(deviceClient)
+        // SystemController 依赖 device 域（DeviceControl），与原步骤 5 同阶段构造
+        val systemController = SystemController(deviceControl)
 
         // ── 11. ADB 控制器（2026-08-22：移除 Goform USB_PORT_SETTING 依赖，仅管理自连接） ──
         val adbController = com.ufi_axis_core.controller.adb.AdbController(context)
@@ -793,15 +1144,95 @@ object ComponentFactory {
 
         // ── 12. 扩展组件 ──
         val smsForwardController = com.ufi_axis_core.controller.sms.SmsForwardController(context, systemCollector)
-        val actionExecutor = ActionExecutorImpl(networkController, systemController, deviceClient, wifiClient, networkClient)
+        // 测速调度中心（2026-10-06）：跑一轮 → 入库 → WS 广播 + 通知（场景 speedtestResult，
+        // 渠道与是否发送由用户的通知设置决定）。ActionExecutorImpl 的 speedtest 动作与
+        // POST /api/speedtest/run 共用这一个实例。
+        val speedTestCoordinator = com.ufi_axis_core.api.speedtest.SpeedTestCoordinator(
+            runner = com.ufi_axis_core.api.speedtest.SpeedTestRunner(),
+            dao = database.speedTestDao(),
+            onResult = { result, record ->
+                // WS 实时广播：web/app 监听 data_changed/traffic 后刷新测速历史
+                wsManager.broadcast(
+                    com.ufi_axis_core.contract.WsChannel.TRAFFIC,
+                    mapOf(
+                        "speedtest" to mapOf(
+                            "timestamp" to record.timestamp.toString(),
+                            "download_mbps" to "%.2f".format(result.downloadMbps),
+                            "upload_mbps" to "%.2f".format(result.uploadMbps),
+                            "latency_ms" to result.latencyMs.toString(),
+                            "jitter_ms" to result.jitterMs.toString(),
+                            "trigger" to record.trigger,
+                        )
+                    )
+                )
+                // 通知（PushChannel + Mail + Webhook 按用户场景勾选与级别门槛决定）
+                notificationDispatcherProvider()?.emit(
+                    com.ufi_axis_core.notify.NotifyEvent(
+                        scene = com.ufi_axis_core.notify.NotifyScenes.SPEEDTEST_RESULT,
+                        level = com.ufi_axis_core.notify.NotifyLevel.INFO,
+                        title = "测速完成：下行 %.1f Mbps".format(result.downloadMbps),
+                        body = buildString {
+                            append("下行 ").append("%.1f".format(result.downloadMbps)).append(" Mbps")
+                            if (result.uploadMbps >= 0) append("，上行 ").append("%.1f".format(result.uploadMbps)).append(" Mbps")
+                            if (result.latencyMs >= 0) append("，延迟 ").append(result.latencyMs).append(" ms")
+                            if (result.jitterMs >= 0) append("（抖动 ").append(result.jitterMs).append(" ms）")
+                        },
+                        extra = mapOf(
+                            "download_mbps" to "%.2f".format(result.downloadMbps),
+                            "upload_mbps" to "%.2f".format(result.uploadMbps),
+                            "latency_ms" to result.latencyMs.toString(),
+                            "trigger" to record.trigger,
+                        ),
+                    )
+                )
+            }
+        )
+        val actionExecutor = ActionExecutorImpl(
+            networkController, systemController, deviceControl, wifiControl, networkControl, capabilities,
+            speedtestAction = action@{
+                val r = speedTestCoordinator.runAndStore("scheduled") ?: return@action null
+                buildString {
+                    append("下行 %.1f Mbps".format(r.downloadMbps))
+                    if (r.uploadMbps >= 0) append(" / 上行 %.1f Mbps".format(r.uploadMbps))
+                    if (r.latencyMs >= 0) append(" / 延迟 ${r.latencyMs} ms")
+                }
+            },
+            trafficReportAction = report@{ period ->
+                val generator = com.ufi_axis_core.api.traffic.TrafficReportGenerator(database.trafficHourlyDao())
+                val report = generator.generate(period)
+                val summary = generator.summarize(report)
+                val detailed = generator.summarizeDetailed(report)
+                notificationDispatcherRef?.emit(
+                    com.ufi_axis_core.notify.NotifyEvent(
+                        scene = com.ufi_axis_core.notify.NotifyScenes.TRAFFIC_REPORT,
+                        level = com.ufi_axis_core.notify.NotifyLevel.INFO,
+                        title = "流量报告",
+                        // 正文带每日明细（2026-10-06 用户要求「周报显示一周内每日使用情况」）
+                        body = detailed,
+                    )
+                )
+                summary
+            },
+            remoteBackupAction = {
+                val runner = com.ufi_axis_core.api.backup.RemoteBackupRunner(
+                    assembler = backupAssemblerProvider(),
+                    storageSourceManager = storageSourceManagerProvider(),
+                    settings = AppSettings.getInstance(context)
+                )
+                runner.runOnce()
+            }
+        )
         val taskScheduler = com.ufi_axis_core.core.scheduler.TaskScheduler(context, actionExecutor)
         // 条件引擎（自动化规则 / 当…就…）：复用 actionExecutor 执行动作
         val conditionEngine = com.ufi_axis_core.core.scheduler.ConditionEngine(context, actionExecutor)
-        val downloadManager = com.ufi_axis_core.controller.system.DownloadManager(context.applicationContext)
+        val downloadManager = com.ufi_axis_core.controller.system.DownloadManager(
+            context.applicationContext, platform, tuning
+        )
         val tunnelManager = com.ufi_axis_core.controller.system.TunnelManager(context.applicationContext)
         AppLogger.i(TAG, "[12] Extended components initialized")
 
         return ControllerGraph(
+            speedTestCoordinator = speedTestCoordinator,
             systemController = systemController,
             adbController = adbController,
             smsForwardController = smsForwardController,
@@ -824,7 +1255,9 @@ object ComponentFactory {
         alertEngine: AlertEngine,
         dataScheduler: DataScheduler,
         dynamicThreadPool: DynamicThreadPool,
-        webResourceManager: com.ufi_axis_core.util.WebResourceManager
+        webResourceManager: com.ufi_axis_core.util.WebResourceManager,
+        ttydRoutes: com.ufi_axis_core.api.routes.TtydRoutes,
+        appManager: com.ufi_axis_core.controller.system.AppManager
     ): ServerGraph {
         return ServerGraph(
             server = server,
@@ -836,7 +1269,9 @@ object ComponentFactory {
             alertEngine = alertEngine,
             dataScheduler = dataScheduler,
             dynamicThreadPool = dynamicThreadPool,
-            webResourceManager = webResourceManager
+            webResourceManager = webResourceManager,
+            ttydRoutes = ttydRoutes,
+            appManager = appManager
         )
     }
 }

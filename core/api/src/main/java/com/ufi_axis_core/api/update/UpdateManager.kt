@@ -113,6 +113,14 @@ class UpdateManager(
     /** P0-5 更新互斥：checkAndUpdate / installLocalApk 统一入口 CAS，防并发/重入/跨链路并发 install */
     private val updateMutex = AtomicBoolean(false)
 
+    /**
+     * 自更新安装线程已启动标志（2026-10-05 R3-4 修复）。
+     * checkAndUpdate 的 finally 据此决定是否放 updateMutex：安装是 fire-and-forget 裸线程，
+     * 锁必须移交给线程（失败/异常时放）而不是在安装仍在跑时被 finally 提前放掉。
+     * 仅在 checkAndUpdate 单次调用的协程内部读写，无需 volatile。
+     */
+    private var selfUpdateInstallLaunched = false
+
     /** P1 E25 上传互斥：upload 期间禁止 check/install，且 check/install 期间 upload 返回 409 */
     private val uploadMutex = AtomicBoolean(false)
 
@@ -148,7 +156,19 @@ class UpdateManager(
         val message: String = "",
         val currentVersion: String = "",
         val latestVersion: String? = null,
-        val apkPath: String? = null
+        val apkPath: String? = null,
+        /**
+         * 进入当前 [state] 的时刻（`System.currentTimeMillis()`）。
+         *
+         * 2026-09-14 新增，用途只有一个：[selfHealStuckState] 的超时判据。
+         * 之前 UpdateStatus 不带时间，于是 `INSTALLING` 一旦卡住就**永久**卡住 ——
+         * 而 [tryBeginUpload] 看的正是 `state in BUSY_STATES`，用户此后每次推包都恒 409。
+         *
+         * 注意用 `copy()` 改状态时**不会**自动更新它（copy 保留原值），这是有意的：
+         * 同一阶段内的进度刷新不该重置超时计时。真正的阶段跃迁一律走
+         * `UpdateStatus(...)` 全量构造，那时它自然取新的 now。
+         */
+        val stateSince: Long = System.currentTimeMillis()
     )
 
     @Volatile
@@ -161,21 +181,27 @@ class UpdateManager(
         private set
 
     /**
-     * /api/update/upload 动态请求体上限（2026-08-10）：
-     * 优先取清单 apkSize × 1.2 + 10MB 缓冲（比实际 APK 略大，兼容签名后体积微增）；
-     * 清单未知时回落 100MB 兜底；下限 20MB（防小文件时上限过小）。
+     * /api/update/upload 动态请求体上限（2026-08-10，2026-09-19 上调）：
+     *
+     * 优先取清单 apkSize × 1.5 + 20MB 缓冲；清单未知时回落 200MB 兜底。
+     *
+     * 2026-09-19 上调理由：原先的 `× 1.2 + 10MB` 余量太薄 ——
+     * 清单记录的是**老版本**体积时会把上限收紧到装不下新包的值（实测 core 体积略涨就踩线 413），
+     * 而 `未知回落 100MB` 对 debug 包（比 release 大 2~3 倍）也只剩 3~4 倍余量。
+     * 改为 `× 1.5 + 20MB` / `回落 200MB`，下限从 20MB 提到 50MB。
+     * 这几个数字只是防呆闸门，放宽本身没有代价：真正的体积校验是安装前的 SHA-256。
      */
     fun uploadLimitBytes(): Long {
-        val size = backendApkSizeBytes ?: return 100L * 1024 * 1024
-        val buffered = (size * 1.2).toLong() + 10L * 1024 * 1024
-        return buffered.coerceAtLeast(20L * 1024 * 1024)
+        val size = backendApkSizeBytes ?: return 200L * 1024 * 1024
+        val buffered = (size * 1.5).toLong() + 20L * 1024 * 1024
+        return buffered.coerceAtLeast(50L * 1024 * 1024)
     }
 
     private val UPDATE_DIR = "/sdcard/Download/UFI-AXIS/update"
     private val APK_FILE = "$UPDATE_DIR/ufi-core.apk"
     private val APK_PART_FILE = "$UPDATE_DIR/ufi-core.apk.part"
     private val CORE_PACKAGE = "com.ufi_axis_core"
-    private val MAX_APK_BYTES = 50L * 1024 * 1024
+    private val MAX_APK_BYTES = 200L * 1024 * 1024
     /** P1 E24：守护脚本固定执行副本 + 结果日志（shell 可写、普通 App 不可写） */
     private val SCRIPT_PATH = "/data/local/tmp/ufi_update.sh"
     /**
@@ -192,30 +218,66 @@ class UpdateManager(
     }
     private val BUSY_STATES = setOf(State.DOWNLOADING, State.VERIFYING, State.INSTALLING, State.UPLOADING)
 
-    /** GitHub 相关域名（命中即走镜像；gh-proxy 风格前缀拼接在完整 URL 前） */
-    private val GITHUB_HOSTS = listOf(
-        "github.com",
-        "raw.githubusercontent.com",
-        "objects.githubusercontent.com",
-        "codeload.github.com"
-    )
+    /**
+     * 逐候选拉取清单文本（2026-09-22：镜像决策下沉 [MirrorResolver]，并从「单地址」升级为「候选降级」）。
+     *
+     * 之前这里是 `applyMirrorToUrl(settings.updateUrl)` 单地址 —— 镜像挂了就整条更新链路挂掉，
+     * 而 app 侧早就有三级镜像 + 直连兜底，于是「app 能更新、core 更新不了」是可达状态。
+     *
+     * @param maxCandidates 候选上限。前端同步等待的只读查询（backend-info / frontend-info）
+     *        要压到 2，否则最坏要等 5 个候选逐个超时；后台安装流程可以用全部候选。
+     * @throws Exception 全部候选失败（消息里带每个候选的失败原因，便于定位是镜像挂了还是清单本身错了）
+     */
+    private fun fetchManifestWithFallback(
+        what: String = "更新源",
+        timeoutMs: Int = 15_000,
+        maxCandidates: Int = Int.MAX_VALUE
+    ): String {
+        val candidates = MirrorResolver.candidates(settings, settings.updateUrl).take(maxCandidates)
+        if (candidates.isEmpty()) throw Exception("$what 未配置（update_url 为空）")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, what)
+                val text = fetchUrl(url, timeoutMs)
+                if (text != null) {
+                    if (index > 0) {
+                        AppLogger.i(TAG, "$what 第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                    }
+                    return text
+                }
+                "不可达"
+            } catch (e: Exception) {
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
+        }
+        throw Exception("$what 全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
+    }
 
     /**
-     * 基础镜像支持：GitHub 域名的 URL 前拼接 [AppSettings.updateMirrorBase] 后返回；
-     * - 镜像前缀为空串（update_mirror_base=""）→ 直连，不拼接；
-     * - 非 GitHub 域名原样返回（自建 CDN / 本地地址不受影响）。
-     * 2026-08-12：镜像前缀由写死常量改为读 settings（前端「同步到设备」可下发）。
+     * 逐候选下载 APK，返回文件 SHA-256。
+     * 换候选前清掉半截 `.part`，避免上一个候选的残留字节混进下一次下载。
      */
-    private fun applyMirrorToUrl(urlStr: String): String {
-        if (urlStr.isBlank()) return urlStr
-        val base = settings.updateMirrorBase.trim().trimEnd('/')
-        if (base.isEmpty()) return urlStr   // 空串 = 直连
-        val host = try { URL(urlStr).host?.lowercase() } catch (e: Exception) { return urlStr }
-        if (host.isNullOrBlank()) return urlStr
-        if (host in GITHUB_HOSTS || host.endsWith(".githubusercontent.com")) {
-            return "$base/$urlStr"
+    private fun downloadApkWithFallback(rawUrl: String, target: File, timeoutMs: Int = 60_000): String {
+        val candidates = MirrorResolver.candidates(settings, rawUrl)
+        if (candidates.isEmpty()) throw Exception("APK 下载地址为空")
+        val errors = mutableListOf<String>()
+        candidates.forEachIndexed { index, url ->
+            val failure = try {
+                requireSecureUrl(url, "APK 下载地址")
+                val hash = downloadApk(url, target, timeoutMs)
+                if (index > 0) {
+                    AppLogger.i(TAG, "APK 下载第 ${index + 1}/${candidates.size} 个候选成功: $url")
+                }
+                return hash
+            } catch (e: Exception) {
+                target.delete()
+                e.message ?: e.javaClass.simpleName
+            }
+            errors += "[${index + 1}] $url → $failure"
         }
-        return urlStr
+        throw Exception("APK 下载全部 ${candidates.size} 个候选都失败：\n" + errors.joinToString("\n"))
     }
 
     /** 触发检查 + 自动更新（异步；立即返回当前状态，进度经 [status] 轮询） */
@@ -232,11 +294,13 @@ class UpdateManager(
                 logUpdateFile("checkAndUpdate start (current=$current)")
 
                 // ① 拉取版本清单（update_url → version.json）；强制 HTTPS（本地调试 IP 例外）
-                // 2026-08-10：GitHub 域名自动拼镜像前缀（设备在国内访问 GitHub 被墙）
-                val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                requireSecureUrl(manifestUrl, "更新源")
-                val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                    ?: throw NeedPushException("更新源不可达: $manifestUrl")
+                // 2026-09-22：镜像决策交给 MirrorResolver，并逐候选降级（镜像挂了还能直连）
+                MirrorResolver.prepare(settings)
+                val manifestJson = try {
+                    fetchManifestWithFallback()
+                } catch (e: Exception) {
+                    throw NeedPushException(e.message ?: "更新源不可达")
+                }
                 val manifest = try {
                     // C5 双对象兼容：优先取 backend 对象；无 backend 字段回退整份（旧 flat 格式）
                     val root = json.parseToJsonElement(manifestJson).jsonObject
@@ -260,12 +324,11 @@ class UpdateManager(
                 status = UpdateStatus(State.DOWNLOADING, 0, "发现新版 v$latest，开始下载...", current, latest)
 
                 // ③ 下载 APK（.part 原子写 + 磁盘预检 + SHA-256 流式计算比对）
-                requireSecureUrl(apkUrl, "APK 下载地址")
                 val partFile = File(APK_PART_FILE)
                 partFile.delete()
                 val apkHash = try {
-                    // 2026-08-10：GitHub 域名 APK 下载同样走镜像（设备在国内拉 GitHub 被墙）
-                    downloadApk(applyMirrorToUrl(apkUrl), partFile)
+                    // 2026-09-22：候选逐个降级（镜像 1/2/3 → 直连兜底），HTTPS 校验在每个候选上做
+                    downloadApkWithFallback(apkUrl, partFile)
                 } catch (e: Exception) {
                     partFile.delete()
                     throw NeedPushException("APK 下载失败: ${e.message}")
@@ -300,7 +363,14 @@ class UpdateManager(
                 val pendingInstallFile = File("/data/local/tmp/ufi_pending_install.txt")
                 runCatching {
                     // MED1：第4行 mode 统一为 2（与实时启动脚本语义一致），BootReceiver 恢复时同走脚本接管安装
-                    pendingInstallFile.writeText("${apkFile.absolutePath}\n$latest\n$targetSha\n2")
+                    // 2026-10-05 R3-5 修复：原子写（tmp + rename）——BootReceiver 可能在写一半时读到此文件，
+                    // 半行内容会让恢复链路拿到错的 apk 路径/SHA。
+                    val tmp = File(pendingInstallFile.absolutePath + ".tmp")
+                    tmp.writeText("${apkFile.absolutePath}\n$latest\n$targetSha\n2")
+                    if (!tmp.renameTo(pendingInstallFile)) {
+                        tmp.delete()
+                        error("pending install rename failed")
+                    }
                 }
 
                 // 清除旧 RESULT 行（防止上次残留误判）
@@ -362,10 +432,17 @@ class UpdateManager(
                             // 仅当明确失败时才在此记录。
                             if (!success) {
                                 writeResultToLog("INSTALL_FAILED:$message")
+                                // 2026-10-05 R3-4 修复：自更新路径的互斥锁由外层 finally 释放的时代
+                                // 已经结束 —— 安装还在跑时 finally 就放锁，第二次 checkAndUpdate 立刻
+                                // 进来并发双装。现在：明确失败 = 安装已结束 → 在这里放锁；
+                                // 成功/超时 = 进程即将被杀（watchdog 接管）→ 锁随进程一起销毁，
+                                // 不会有人再拿到，也就不会有人并发进来。
                             }
                         } catch (e: Throwable) {
                             AppLogger.e(TAG, "checkAndUpdate installApk 异常", e)
                             writeResultToLog("INSTALL_FAILED:exception:${e.message}")
+                            // 异常路径安装线程已终止，放锁允许重试（2026-10-05 R3-4）
+                            releaseUpdate()
                         }
                     }
                 }.start()
@@ -373,6 +450,9 @@ class UpdateManager(
                 status = UpdateStatus(State.INSTALLING, 100, "更新执行中，设备将重启生效", current, latest, apkFile.absolutePath)
                 logUpdateFile("checkAndUpdate: 安装已后台启动 (target=$latest)")
                 broadcastUpdate()
+                // 2026-10-05 R3-4 修复：自更新路径到此返回时**不放锁** —— 锁的生命周期已移交
+                // 给安装线程（失败时它放，异常时它放）或随进程死亡。外层 finally 需要知道这一点。
+                selfUpdateInstallLaunched = true
             } catch (e: NeedPushException) {
                 // P1 A4：更新源不可用（不可达/非 JSON/下载失败）→ NEED_PUSH，引导前端走推送兜底
                 AppLogger.w(TAG, "checkAndUpdate 更新源不可用: ${e.message}")
@@ -386,7 +466,12 @@ class UpdateManager(
                 logUpdateFile("checkAndUpdate FAILED: ${e.message}")
                 broadcastUpdate()
             } finally {
-                releaseUpdate()
+                // 2026-10-05 R3-4 修复：自更新安装已启动时不释放锁（见上），否则安装期间
+                // 第二次触发可并发双装。标志位只在本次调用作用域内有意义，读完即清。
+                if (!selfUpdateInstallLaunched) {
+                    releaseUpdate()
+                }
+                selfUpdateInstallLaunched = false
             }
         }
     }
@@ -429,7 +514,13 @@ class UpdateManager(
             val pendingInstallFile = File("/data/local/tmp/ufi_pending_install.txt")
             runCatching {
                 // MED1：第4行 mode 统一为 2（与实时启动脚本语义一致），BootReceiver 恢复时同走脚本接管安装
-                pendingInstallFile.writeText("${f.absolutePath}\nlocal\n$apkSha\n2")
+                // 2026-10-05 R3-5 修复：原子写（tmp + rename），防 BootReceiver 读到半行内容。
+                val tmp = File(pendingInstallFile.absolutePath + ".tmp")
+                tmp.writeText("${f.absolutePath}\nlocal\n$apkSha\n2")
+                if (!tmp.renameTo(pendingInstallFile)) {
+                    tmp.delete()
+                    error("pending install rename failed")
+                }
             }
 
             // 清除旧 RESULT 行（防止上次残留误判）
@@ -520,8 +611,11 @@ class UpdateManager(
         runCatching {
             val f = File(coreLogDir(), CORE_UPDATE_LOG)
             if (f.exists()) {
-                val lines = f.readLines().filter { !it.trim().startsWith("RESULT=") }
-                f.writeText(lines.joinToString("\n") + "\n")
+                val filtered = f.readLines().filter { !it.trim().startsWith("RESULT=") }
+                // 2026-10-05 R3-11 修复：写临时文件后原子 rename，避免覆写窗口内崩溃丢整份日志
+                val tmp = File(f.parentFile, f.name + ".tmp")
+                tmp.writeText(filtered.joinToString("\n") + "\n")
+                if (!tmp.renameTo(f)) tmp.delete()
             }
         }
     }
@@ -599,8 +693,60 @@ class UpdateManager(
 
     // ── P1 A3/E25：上传互斥（UpdateRoutes.upload 调用）──
 
+    /**
+     * `INSTALLING` 卡死的超时阈值。
+     *
+     * 取 15 分钟：守护脚本自己的校验超时是 600s（10 分钟），留 5 分钟缓冲，
+     * 确保「脚本还在正常跑」绝不会被误判成卡死。
+     */
+    private val INSTALL_STUCK_TIMEOUT_MS = 15 * 60 * 1000L
+
+    /**
+     * 卡死状态自愈（2026-09-14）。
+     *
+     * ## 为什么必须有
+     * `installLocalApk` 是 fire-and-forget：起一个线程装包，然后把 state 置成 `INSTALLING`
+     * 就返回。此后复位只有三条路 —— core 被替换并重启、前端轮询到日志里的 RESULT 行、
+     * 或有人 POST `/api/update/reset`。
+     *
+     * **推错包会同时切断前两条**：装上去的是别的 app，core 自己没被替换、进程不死、不重启；
+     * 而 watchdog 比对的是 core 的版本基线，10 分钟内不会写 RESULT 行。前端这边
+     * `AboutDeviceScreen` 每次进关于页都会停掉轮询且**不调后端 reset**，于是
+     * 「推错包 → 返回 → 再进来重推」之后 `INSTALLING` 永久驻留 ——
+     * 而 [tryBeginUpload] 看的正是 `state in BUSY_STATES`，用户此后每次推包都恒 409。
+     *
+     * ## 为什么放在这里而不是起个定时器
+     * 这是**惰性判定**：只在真正有人要用这个状态机时（上传/安装/查状态）检查一次。
+     * 常驻定时器会为一个罕见分支持续占用调度资源，与本仓「事件驱动、不常驻」的取向相悖。
+     *
+     * @return 是否发生了自愈（调用方一般不关心，仅日志/测试用）
+     */
+    private fun selfHealStuckState(reason: String): Boolean {
+        val s = status
+        if (s.state != State.INSTALLING) return false
+        val elapsed = System.currentTimeMillis() - s.stateSince
+        if (elapsed <= INSTALL_STUCK_TIMEOUT_MS) return false
+        AppLogger.w(
+            TAG,
+            "检测到安装状态卡死（已 ${elapsed / 1000}s，阈值 ${INSTALL_STUCK_TIMEOUT_MS / 1000}s），" +
+                "自动置为失败并清理残留 [$reason]"
+        )
+        status = UpdateStatus(
+            state = State.FAILED,
+            message = "上一次安装超过 ${INSTALL_STUCK_TIMEOUT_MS / 60000} 分钟未返回结果，已自动重置。" +
+                "若推送的不是 UFI-AXIS Core 的安装包，设备不会重启，这是正常现象。",
+            currentVersion = currentVersionName()
+        )
+        // pendingUpdate 留着会让下次启动恢复逻辑拿它当"待确认的安装"，必须一起清
+        runCatching { settings.pendingUpdate = null }
+        cleanupInstallArtifacts("self-heal-stuck-install")
+        return true
+    }
+
     /** 尝试进入上传态：check/install 进行中或已有上传占用 → false（路由返回 409） */
     fun tryBeginUpload(): Boolean {
+        // 先给卡死状态一次自愈机会，否则「上一次推错包」会让此后所有上传恒 409
+        selfHealStuckState("tryBeginUpload")
         if (status.state in BUSY_STATES) {
             AppLogger.i(TAG, "tryBeginUpload 拒绝：更新进行中 (state=${status.state})")
             return false
@@ -609,8 +755,51 @@ class UpdateManager(
             AppLogger.i(TAG, "tryBeginUpload 拒绝：已有上传占用")
             return false
         }
-        status = status.copy(state = State.UPLOADING, message = "正在接收 APK 上传...")
+        status = UpdateStatus(
+            state = State.UPLOADING,
+            message = "正在接收 APK 上传...",
+            currentVersion = status.currentVersion.ifBlank { currentVersionName() },
+            latestVersion = status.latestVersion
+        )
         return true
+    }
+
+    /**
+     * 校验一个 APK 是不是 UFI-AXIS Core 自己。
+     *
+     * ## 为什么必须在「落地成固定文件名之前」做
+     * 上传落盘用的是固定路径 `ufi-core-uploaded.apk`，而失败态**刻意不清理**残留
+     * （保留供重试）。所以一旦错包被 rename 成那个名字，它就永久占住那个位置。
+     * 校验放在 rename 之前 + 失败即删 `.part`，错包连落地的机会都没有。
+     *
+     * ## 为什么装错包的后果值得一道硬闸
+     * 安装走的是 `adb install -r`，包名不同 ⇒ 系统装的是**那个 app**，core 没被替换，
+     * 于是状态机卡在 `INSTALLING`（见 [selfHealStuckState]），用户还会以为"更新成功了"。
+     *
+     * @return null 表示校验通过；非 null 是给用户看的拒绝原因
+     */
+    fun rejectReasonForApk(apkFile: File): String? {
+        val ctx = appContext ?: run {
+            // 拿不到 Context 就无法解析包名。此时不硬拦（否则在没有 Context 的部署形态下
+            // 连正常更新都推不上去），但要留下明确日志，便于回溯"这台设备没做包名校验"。
+            AppLogger.w(TAG, "无 appContext，跳过 APK 包名校验")
+            return null
+        }
+        val info = runCatching {
+            ctx.packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+        }.getOrNull()
+            ?: return "无法解析该 APK（文件损坏或不是有效的 Android 安装包）"
+        val pkg = info.packageName.orEmpty()
+        val selfPkg = ctx.packageName
+        if (pkg.isBlank()) return "无法读取该 APK 的包名"
+        // 与运行中的 core 自身包名比对，而不是与写死的常量：调试/渠道包的 applicationId
+        // 可能带后缀，用常量会把自己的调试包也拦掉。CORE_PACKAGE 仅作兜底。
+        val expected = selfPkg.ifBlank { CORE_PACKAGE }
+        if (pkg != expected) {
+            return "包名不匹配：该 APK 是「$pkg」，而设备端 Core 是「$expected」。" +
+                "请选择 UFI-AXIS Core 的安装包。"
+        }
+        return null
     }
 
     /** 上传结束释放互斥；成功时把落地路径写进 status，失败置 FAILED 展示原因 */
@@ -626,9 +815,12 @@ class UpdateManager(
         }
     }
 
-    /** 重置状态（UI 关闭/重试前） */
+    /** 重置状态（UI 关闭/重试前）。同时清掉上传残留，避免固定文件名被旧包占位。 */
     fun reset() {
         status = UpdateStatus(currentVersion = currentVersionName())
+        // reset 的语义就是"回到干净状态"，此时 state 已是 IDLE，cleanupInstallArtifacts
+        // 的 BUSY_STATES 闸门不会挡住它
+        cleanupInstallArtifacts("manual-reset")
     }
 
     // ── 前端 App 更新信息（2026-08-10 C5：Core 转发给前端 App）──
@@ -657,11 +849,10 @@ class UpdateManager(
         // 外网阻塞 IO 切到 IO 线程池，避免占用 Ktor 事件循环线程
         return withContext(Dispatchers.IO) {
             try {
-                // 2026-08-10：GitHub 域名自动拼镜像前缀（设备在国内访问 GitHub 被墙）
-                val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                requireSecureUrl(manifestUrl, "更新源")
-                val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                    ?: throw Exception("更新源不可达: $manifestUrl")
+                // 2026-09-22：镜像决策交给 MirrorResolver。候选压到 2（首选 + 兜底）——
+                // 这是前端同步等待的只读查询，让它最坏等 5 个候选逐个超时是不可接受的。
+                MirrorResolver.prepare(settings)
+                val manifestJson = fetchManifestWithFallback(timeoutMs = 8_000, maxCandidates = 2)
                 val root = json.parseToJsonElement(manifestJson).jsonObject
                 val obj = root["frontend"]?.jsonObject ?: root
                 val info = json.decodeFromJsonElement(FrontendUpdateInfo.serializer(), obj)
@@ -678,6 +869,26 @@ class UpdateManager(
 
     /** 最近一次成功缓存的 frontend apk_url（frontend-apk 代理同源校验用） */
     fun cachedFrontendApkUrl(): String? = frontendInfoCache?.apk_url
+
+    /**
+     * 更新源决策快照（`GET /api/update/source`，2026-09-22）。
+     *
+     * 给 app 用：它的 APK 自更新刻意**不走 core 代理**（core 挂了也得能更新自己），
+     * 所以 core 只把决策给出去，由 app 自己拼 URL 下载。这里**不接受任何入参** ——
+     * 「给我一个 URL 我帮你改写」会凭空多出一个 SSRF 面，而 core 已经有一个带白名单的
+     * frontend-apk 代理了，不需要第二个。
+     *
+     * - `mode`：`auto` / `mirror` / `direct`
+     * - `country`：出网地区（空串 = 从未测出，**不等于海外**）
+     * - `use_mirror`：按当前 mode + 地区算出的结论，客户端直接用，不要自己再判一遍
+     * - `mirror_prefixes`：按优先级排列，客户端逐个降级，最后回落原地址
+     */
+    fun updateSourceSnapshot(): Map<String, Any?> = mapOf(
+        "mode" to settings.updateSourceMode,
+        "country" to settings.geoCountry,
+        "use_mirror" to MirrorResolver.useMirror(settings),
+        "mirror_prefixes" to MirrorResolver.mirrorPrefixes(settings)
+    )
 
     // ── 后端 core 更新信息（2026-09-06：只检查、不下载、不安装）──
     //
@@ -729,10 +940,9 @@ class UpdateManager(
             // 外网阻塞 IO 切到 IO 线程池，避免占用 Ktor 事件循环线程
             withContext(Dispatchers.IO) {
                 try {
-                    val manifestUrl = applyMirrorToUrl(settings.updateUrl)
-                    requireSecureUrl(manifestUrl, "更新源")
-                    val manifestJson = fetchUrl(manifestUrl, timeoutMs = 15_000)
-                        ?: throw Exception("更新源不可达: $manifestUrl")
+                    // 2026-09-22：同 fetchFrontendUpdateInfo —— 前端同步等待，候选压到 2
+                    MirrorResolver.prepare(settings)
+                    val manifestJson = fetchManifestWithFallback(timeoutMs = 8_000, maxCandidates = 2)
                     val root = json.parseToJsonElement(manifestJson).jsonObject
                     val obj = root["backend"]?.jsonObject ?: root
                     val parsed = json.decodeFromJsonElement(BackendManifest.serializer(), obj)
@@ -991,9 +1201,15 @@ class UpdateManager(
     /**
      * 运行中轮询刷新（P1 B2）：status 处于 INSTALLING 时，前端 GET /status 顺带读日志 RESULT 行，
      * 使「脚本已失败但 Core 未重启」的场景也能及时反映（旧版完好，可直接重试）。
+     *
+     * 2026-09-14：读日志之前先跑一次 [selfHealStuckState]。日志里没有 RESULT 行时
+     * `recoverResultFromLog` 什么都不做 —— 推错包正是这种情况（core 没被替换、watchdog
+     * 也还没写结果），于是状态永久停在 INSTALLING。有了超时自愈，前端只要还在轮询，
+     * 15 分钟后就能自己走出来。
      */
     suspend fun refreshResultFromLogIfInstalling() {
         if (status.state != State.INSTALLING) return
+        if (selfHealStuckState("refreshResultFromLogIfInstalling")) return
         recoverResultFromLog()
     }
 
@@ -1146,18 +1362,24 @@ class UpdateManager(
     // ── 工具 ──
 
     /** GET URL 返回文本（版本清单） */
-    private fun fetchUrl(urlStr: String, timeoutMs: Int): String? = try {
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            connectTimeout = timeoutMs
-            readTimeout = timeoutMs
-            requestMethod = "GET"
-            setRequestProperty("User-Agent", "UFI-AXIS-Core/1.0")
-            instanceFollowRedirects = true
+    // 2026-10-05 R3-6 修复：disconnect 移入 finally，异常路径不再泄漏 keep-alive 连接
+    private fun fetchUrl(urlStr: String, timeoutMs: Int): String? {
+        var conn: HttpURLConnection? = null
+        return try {
+            conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+                connectTimeout = timeoutMs
+                readTimeout = timeoutMs
+                requestMethod = "GET"
+                setRequestProperty("User-Agent", "UFI-AXIS-Core/1.0")
+                instanceFollowRedirects = true
+            }
+            conn.inputStream.bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            AppLogger.w(TAG, "fetchUrl 失败: ${e.message}")
+            null
+        } finally {
+            conn?.disconnect()
         }
-        conn.inputStream.bufferedReader().use { it.readText() }.also { conn.disconnect() }
-    } catch (e: Exception) {
-        AppLogger.w(TAG, "fetchUrl 失败: ${e.message}")
-        null
     }
 
     /**
