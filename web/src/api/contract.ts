@@ -46,6 +46,16 @@ export const Endpoints = {
     restart: '/api/service/restart',
     autostart: '/api/service/autostart',
   },
+  /**
+   * DLNA MediaServer（2026-10-09）。
+   *
+   * 开关门控在 core：目录未配置（status.ready=false）时 enabled=true 会被 400 拒掉，
+   * 前端据此把开关置灰而不是等报错。
+   */
+  dlna: {
+    status: '/api/dlna/status',
+    config: '/api/dlna/config',
+  },
   network: {
     status: '/api/network/status',
     /** 入参走 NetworkMode 的别名集，core 会映射成 BearerPreference 再下发 */
@@ -74,6 +84,17 @@ export const Endpoints = {
   tasks: {
     root: '/api/tasks',
     rules: '/api/rules',
+  },
+  /**
+   * 应用管理（2026-10-05 P0-2 入 contract：install-url 的 sha256 现为必填，
+   * core 下载后流式校验，不匹配拒绝安装——防任意 URL 静默 root 安装）。
+   */
+  apps: {
+    root: '/api/apps',
+    install: '/api/apps/install',
+    /** POST { url, sha256 } —— sha256 必填（64 hex），http:// 仅内网调试地址豁免 */
+    installUrl: '/api/apps/install-url',
+    uninstall: '/api/apps/uninstall',
   },
   /**
    * 短信拦截：规则（号码黑名单 + 关键词）与拦截记录（2026-09-08）。
@@ -116,12 +137,21 @@ export const Endpoints = {
    * ② `DELETE` 的 `channel` 参数**不传就是全清**，所以按渠道的清空按钮必须带上它；
    * ③ `failed_total` 与 `skipped_total` 是两个独立计数，**不能相加**（跳过不是失败），
    *    且都是该渠道的全表计数，不随 `result` 筛选变化。
+   *
+   * `historyStats` 与 `historyRecord` 是三条渠道共用的另两条（core 侧一直存在，2026-09-19 web 接入）：
+   * ④ `historyStats` 的 `channel` **缺失或空 = 全渠道**（与 `history` / `DELETE history` 同口径），
+   *    回的是 `total` / `sent` / `failed` / `skipped` / `last_sent_at` —— 比列表响应多出
+   *    `sent` 与 `last_sent_at` 两项，且**不受 `result` 筛选影响**；
+   * ⑤ `historyRecord` 删单条，`deleted = 0`（行已不在）**仍回 `success: true`**：
+   *    客户端可直接把本地行摘掉，不要把"本来就没有"报成删除失败。
    */
   smsForward: {
     config: '/api/sms-forward/config',
     diagnose: '/api/sms-forward/diagnose',
     test: '/api/sms-forward/test',
     history: '/api/sms-forward/history',
+    historyStats: '/api/sms-forward/history/stats',
+    historyRecord: (id: number) => `/api/sms-forward/history/${id}`,
   },
   /**
    * 另两条通知渠道（2026-09-09 web 接入）：Webhook 与本机短信。
@@ -163,6 +193,190 @@ export const Endpoints = {
     config: '/api/notifications/config',
   },
   /**
+   * 流量统计（2026-09-19 进契约）。
+   *
+   * `usage` 的响应形状与取数封装在 [api/traffic.ts](../api/traffic.ts) 里，那份文件原先自己留了
+   * 一个路径字面量并注明"刻意不进契约表"——理由是"只有一半 traffic 路径会更糟"。
+   * 现在四条一起登记，那个理由不再成立。
+   *
+   * 三处坑：
+   * ① `realtime` 在调度器尚未预热时回的是 **HTTP 200 + 失败信封**（`code = NO_DATA_YET`），
+   *    不是 4xx —— 按 HTTP 码判断成功会把"还没数据"当成有数据，读到一堆 undefined；
+   * ② `history` 的 `records[]` 字段是 **camelCase**（`rxBytes` / `txSpeed` / `timestamp`），
+   *    直接序列化 Room 实体的结果，与全仓 snake_case 的惯例相反，别照别的端点抄；
+   * ③ `usage` 的 `range` / `anchor` **都不会回 400**：range 认不出 → `day`，anchor 解析不出 → now。
+   *    翻页锚点一律原样透传响应里的 `prev_anchor` / `next_anchor`，不要在前端做日历运算
+   *    （月长度、闰年、DST 都已经在 core 算对了）。
+   */
+  traffic: {
+    realtime: '/api/traffic/realtime',
+    history: '/api/traffic/history',
+    summary: '/api/traffic/summary',
+    usage: '/api/traffic/usage',
+  },
+  /**
+   * 天气（2026-09-19 web 接入；core 侧 `WeatherRoutes`，上游 Open-Meteo，**无需 API key**）。
+   *
+   * 四处坑：
+   * ① `GET /api/weather` 有**两种 200 形状**：未设城市时只回
+   *    `{configured: false, enabled, message}`，其余字段一个都没有 —— 见 [WeatherNow]。
+   *    直接读 `temperature` 会拿到 undefined，必须先判 `configured`；
+   * ② 上游不可达是 **502**（`OPERATION_FAILED`），不是 200 + 失败信封；
+   * ③ `weather_code` → 中文描述的映射在 **core** 里做好了（响应的 `description` 字段），
+   *    客户端不要再抄一张 WMO 码表 —— 那张表一分叉就会和手机端说两种天气；
+   * ④ `PUT /config` 是字段级 patch，但会**校验**：纬度 -90..90、经度 -180..180、
+   *    `unit` 只认 `celsius` / `fahrenheit`、`city` ≤ 64 字符，越界回 400。
+   *    `latitude = 0 && longitude = 0` 是"未设置"的哨兵，不是几内亚湾。
+   */
+  weather: {
+    now: '/api/weather',
+    search: '/api/weather/search',
+    config: '/api/weather/config',
+  },
+  /**
+   * 每日诗词（2026-09-19 web 接入；core 侧 `PoetryRoutes`，上游 jinrishici.com，**无需 API key**）。
+   *
+   * 两处坑：
+   * ① `refresh=1` 只绕过 **core 本地那 10 分钟缓存**，上游自己也有约 10 分钟的缓存 ——
+   *    所以"刷新"完全可能拿回同一首，这不是 bug，界面上不要承诺"换一首"；
+   * ② 没有 tag 参数：选哪首由上游按设备出口 IP 的地理位置、当地天气、时辰与节气决定，
+   *    命中的标签在响应的 `match_tags` 里回读。
+   */
+  poetry: {
+    now: '/api/poetry',
+    config: '/api/poetry/config',
+  },
+  /**
+   * 国家/地区探测（2026-09-19 进契约）。诗词与天气的上游选源都依赖它。
+   *
+   * `country` 是 ISO 3166-1 alpha-2，**空串 = 从未探测成功**；此时 `source` 一定是 `unknown`
+   * （即便刚刚真的发起过一次抓取），所以判"有没有结果"只看 `country` 是否非空。
+   * `POST /detect` 在三个地理源全部不可达时回 **502**，并保留上一次的结果不清空。
+   */
+  geo: {
+    root: '/api/geo',
+    detect: '/api/geo/detect',
+  },
+  /**
+   * 设备本机媒体库（core 侧 `MediaRoutes`）。
+   * web 侧界面在 `views/media/`（视频 / 音乐 / 图片三个独立页面）与文件预览弹窗。
+   *
+   * 六处坑，改动前必须读：
+   * ① 几乎每条都要 `type` ∈ `video` / `audio` / `image`，缺失或认不出回 400；
+   *    权限不足回的是 **403 但 code 仍是 `BAD_REQUEST`**（没有专用错误码），
+   *    带 `extra = {permission, type}`；
+   * ② `thumbnail` / `cover` 回的是**二进制图片**（带 ETag + `Cache-Control: private, max-age=86400`），
+   *    不是 JSON。浏览器里只能用 `<img>` + blob URL，因为 `<img src>` 带不上 Bearer 头与设备签名 ——
+   *    与 APK 下载同一个限制（见 [Endpoints.update] 的说明）；
+   * ③ `PUT /thumbnail` 的 body 是**裸 JPEG 字节**（不是 JSON、不是 multipart），
+   *    上限 512 KB，且必须以 `FF D8 FF` 开头，否则 400；
+   * ④ `browse` 在"配置了多个根目录且没传 path"时回的是**选根目录**的形状：
+   *    `path: ''` + `parent: null` + 非空 `roots` + 空 `folders`/`items`，不是"这个目录是空的"；
+   * ⑤ **播放字节流不在这一组**：走 `/media/stream?ticket=…`（挂在 `/api` 之外的免鉴权区），
+   *    要先 `POST /api/files/stream-ticket` 换一张只授权那一个文件、滑动过期 10 分钟的票据；
+   *    **必须用响应里的 `url`**，别自己拼；
+   * ⑥ `subtitles` 的 `supported` 字段**不能直接当"我能播"** —— 见该字段的说明。
+   */
+  media: {
+    status: '/api/media/status',
+    list: '/api/media/list',
+    /**
+     * 2026-10-05 G5：视频元信息（ffmpeg 探测）。query: id。
+     * MediaStore 列在本机经常缺 duration/width/height（codec 栈缺失），
+     * core 用 ffmpeg 自主探测真值；结果永久缓存（媒体文件不可变）。
+     * 404 = 无法解析。source: cache|ffmpeg。
+     */
+    videoInfo: '/api/media/video-info',
+    browse: '/api/media/browse',
+    thumbnail: '/api/media/thumbnail',
+    // 2026-10-07：单条重抽封面用（type+id 查询参数）；不带 id 仍是整类/全部清除
+    thumbnailCache: '/api/media/thumbnail-cache',
+    // 2026-10-07：手动触发一轮封面预热（POST；开关未开时 core 回 409）
+    thumbnailPrewarm: '/api/media/thumbnail-prewarm',
+    cover: '/api/media/cover',
+    lyrics: '/api/media/lyrics',
+    tags: '/api/media/tags',
+    config: '/api/media/config',
+    rescan: '/api/media/rescan',
+    /**
+     * 某个视频可用的**外挂字幕列表**。
+     *
+     * 为什么必须由 core 来列：`.srt` 不是视频，**永远不会出现在 MediaStore 的视频集合里**，
+     * 所以 `/list` 与 `/browse` 都发现不了它；而"哪个字幕属于哪个视频"的匹配规则
+     * （同名、`movie.zh.srt`、`movie - 中文.srt`…）放到客户端就得在每个播放入口各写一遍。
+     *
+     * query：`path`（视频真实路径）、`scope`
+     *  · `matched`（默认）：只回按文件名判定属于该视频的 → 打开就自动挂载用；
+     *  · `folder`：同目录**所有**字幕 → 手动选字幕用（现实里字幕名和视频名经常对不上）。
+     *
+     * ⚠️ **`supported` 不等于"客户端能播"**：它的语义是「core 能转码并给出字幕 MIME」，
+     * 对齐的是 **app 端 media3** 的解析能力。浏览器 `<track>` **只认 WebVTT** ——
+     * srt 靠播放器内部转换、ass/ssa 要额外渲染插件、ttml 没有通用方案。
+     * 所以 web 侧另有一份自己的能力映射（`composables/subtitleFormat.ts`），
+     * 两份**刻意不同**，不要为了"统一"合并 —— 合了必然有一端在说谎。
+     *
+     * `supported: false` 的条目**照样返回**（MicroDVD `.sub`、SAMI `.smi`）：
+     * 让客户端显示"格式不支持"，而不是让用户对着目录里明明存在的文件怀疑程序瞎了。
+     */
+    subtitles: '/api/media/subtitles',
+    /**
+     * 字幕文件内容，**已由 core 统一转成 UTF-8**（响应头显式带 `charset=utf-8`）。
+     *
+     * 为什么不直接拉字节流：字幕解析器按 UTF-8 解，而中文字幕现实中大量是 GB18030/Big5，
+     * 直接喂原始字节出来就是一屏乱码，且播放器不提供"换编码重试"的入口。
+     * core 把探测与转码收在服务端（BOM → **严格** UTF-8 → GB18030 → Big5 → Latin-1 兜底），
+     * 客户端永远只会见到 UTF-8。**这是本端点存在的全部意义。**
+     *
+     * query：`path`（字幕真实路径）。后缀不认回 **415**，读取失败回 500。
+     */
+    subtitle: '/api/media/subtitle',
+    /**
+     * 排除名单：「从音乐库移除」的那一份路径清单（2026-09-23）。**只对 `type=audio` 生效。**
+     *
+     * `GET {excluded}` → `{ paths, total, max, full }`。`max` **不是产品上的取舍**：
+     * 名单会变成 `/list` 查询里的 `_data NOT IN (?,…)`，每条占一个 SQLite 绑定变量（上限 999）。
+     * `full` 是 core 算好的 `total >= max`，客户端据此**提前**提示，别让用户点完才发现没生效。
+     *
+     * `POST {exclude}` body `{ paths: string[], action: 'add' | 'remove' | 'clear' }`
+     * → `{ success, action, affected, requested, total, full }`。
+     * **`affected < requested` 是客户端唯一能发现"只生效了一部分"的途径**（撞上限被截断）。
+     *
+     * 与删文件刻意分成两条接口，不要合并成带 mode 的一条：这一条只改名单、**随时能撤销**；
+     * 删文件是 `POST /api/files/delete`，不可逆。合在一起，"能撤销"这件事在调用点上就消失了。
+     *
+     * 被排除的路径**从 `/list` 的结果里直接消失**，所以客户端拿不到它们的元数据 ——
+     * 管理界面只能按路径显示文件名。写操作成功后 core 失效 `media:*` 缓存并推
+     * `media:playlists`（复用那个 topic，目前没有独立的）。
+     */
+    excluded: '/api/media/excluded',
+    exclude: '/api/media/exclude',
+  },
+  /**
+   * 音频歌单（core 侧 `PlaylistRoutes`，2026-09-21）。
+   * web 侧界面是音乐页里的歌单面板（`views/media/components/PlaylistPanel.vue`）。
+   *
+   * 四处必须知道的约定：
+   * ① **曲目以真实路径为标识**，不是 MediaStore 的 id —— id 重扫会变，歌单会整份失效。
+   *    所有加歌 / 移出 / 重排的 body 都是 `{ paths: string[] }`；
+   * ② `GET {root}/:id/items` 回的 item 与 media.list 的 `items[]` **形状完全一致**，
+   *    额外多一个 `missing` 布尔。`missing: true` 的条目 `id` 为 0（媒体库里查不到，
+   *    文件被删 / 卡没插 / 还没被扫到），要画"已失效"占位并禁止播放，
+   *    **不要自动帮用户移出** —— 拔一次卡就清空歌单是不可接受的；
+   * ③ `items` 的顺序就是播放顺序，由用户决定。前端不要再按时间 / 名称排一次；
+   * ④ 移出用 DELETE。body 与 `?path=` 都支持（部分代理会丢 DELETE 的 body），
+   *    axios 侧走 `{ data: { paths } }`。
+   *
+   * 失败码全部复用通用码：歌单不存在 404 `NOT_FOUND`、名称空 400 `BLANK_VALUE`、
+   * 同名 409 `ALREADY_EXISTS`、数量到顶 400 `OUT_OF_RANGE`、无媒体权限 403 `FORBIDDEN`。
+   */
+  playlists: {
+    root: '/api/playlists',
+    /** 某个歌单的曲目集合：GET 取、POST 加、DELETE 移出、PUT 整表重排。 */
+    items: (id: string) => `/api/playlists/${id}/items`,
+    /** 单个歌单本体：GET 取元信息、PUT 重命名、DELETE 删除。 */
+    one: (id: string) => `/api/playlists/${id}`,
+  },
+  /**
    * SIM 卡（2026-08-27 web 接入）。
    * 本组只有 switch 一条：core 原先那个「SIM 信息」查询端点与 dashboard summary 的
    * device_info.identity 同源却多 15 分钟缓存、phone_type 恒为 GSM、sim_state 更粗糙，
@@ -198,6 +412,13 @@ export const Endpoints = {
     frontendInfo: '/api/update/frontend-info',
     /** 只检查 core 自身版本：{ current_version, latest_version, has_update, changelog, apk_url, apk_size, sha256 } */
     backendInfo: '/api/update/backend-info',
+    /**
+     * 更新源决策快照（2026-09-22，只读、无入参）：
+     * `{ mode, country, use_mirror, mirror_prefixes }`。
+     * 给 app 用（它的 APK 自更新不走 core 代理，只取决策自己拼 URL）；web 目前不需要它，
+     * 因为 web 不下载任何东西 —— 登记在这里是为了让契约完整、不被当成"野端点"。
+     */
+    source: '/api/update/source',
   },
   webAssets: {
     check: '/api/web/check',
@@ -251,6 +472,22 @@ export const Endpoints = {
     root: '/api/speedtest',
     upload: '/api/speedtest/upload',
     relay: '/api/speedtest/relay',
+    /** POST：手动触发一轮定时测速（跑+入库+WS 广播+通知，2026-10-06） */
+    run: '/api/speedtest/run',
+    /** GET ?limit=：定时测速历史（新的在前） */
+    history: '/api/speedtest/history',
+  },
+  /** 网络诊断工具集（2026-10-06）：ping/DNS/TCP/TTL traceroute，全部无 root */
+  diagnostic: {
+    ping: '/api/diagnostic/ping',
+    dns: '/api/diagnostic/dns',
+    tcp: '/api/diagnostic/tcp',
+    traceroute: '/api/diagnostic/traceroute',
+  },
+  /** 套餐档案（2026-10-07 到量/到期融合）：core 侧语义层，goform 无套餐概念 */
+  plan: {
+    read: '/api/device/plan',
+    write: '/api/device/plan',
   },
   diagnose: '/api/diagnose',
   wsRealtime: '/ws/realtime',
@@ -313,6 +550,24 @@ export const WsChannel = {
 export const WS_CHANNELS_ALL: string[] = Object.values(WsChannel);
 
 /**
+ * `data_changed` 帧里 `data.changed` 的取值表（对齐 Kotlin `WsDataTopic`）。
+ * 注意这些**不是**频道名，频道只有 `data_changed` 一个。
+ *
+ * 消费端一律按完整 key 匹配（或按 `namespace:` 前缀分流）。2026-09-21 踩过：
+ * core 的 `ResponseCache.invalidate` 把 `device:traffic-limit` 截成了 `device`，
+ * 两端的精准刷新全部静默失效。新增取值请同步 Kotlin 侧。
+ */
+export const WsDataTopic = {
+  TASK_LIST: 'task:list',
+  TASK_RULES: 'task:rules',
+  CONSOLE_AT: 'console:at',
+  CONSOLE_SHELL: 'console:shell',
+  DEVICE_TRAFFIC_LIMIT: 'device:traffic-limit',
+  /** 音频歌单集合变了（新建 / 重命名 / 删除 / 加歌 / 移出 / 重排）。 */
+  MEDIA_PLAYLISTS: 'media:playlists',
+} as const;
+
+/**
  * 网络模式（T15）：与 Kotlin `NetworkMode` 对齐。
  *
  * 两个取值域必须分清：
@@ -330,48 +585,94 @@ export const NetworkMode = {
   ONLY_WCDMA: 'WCDMA_ONLY',
 } as const;
 
-/** UI 档位（顺序即展示顺序），与 Kotlin `NetworkMode.UI_OPTIONS` 一致。 */
+/** UI 档位（顺序与中文名对齐 Kotlin `NetworkMode.UI_OPTIONS` / `LABELS`）。 */
 export const NetworkModeOptions: ReadonlyArray<{ label: string; value: string }> = [
-  { label: '自动', value: NetworkMode.AUTO },
-  { label: '仅 5G', value: NetworkMode.ONLY_5G },
-  { label: '5G 优先', value: NetworkMode.LTE_AND_5G },
-  { label: '仅 4G', value: NetworkMode.ONLY_LTE },
-  { label: '4G / 3G', value: NetworkMode.WCDMA_AND_LTE },
-  { label: '仅 3G', value: NetworkMode.ONLY_WCDMA },
+  { label: '5G/4G/3G', value: NetworkMode.AUTO },
+  { label: '5G NSA', value: NetworkMode.LTE_AND_5G },
+  { label: '5G SA', value: NetworkMode.ONLY_5G },
+  { label: '4G/3G', value: NetworkMode.WCDMA_AND_LTE },
+  { label: '仅4G', value: NetworkMode.ONLY_LTE },
+  { label: '仅3G', value: NetworkMode.ONLY_WCDMA },
 ];
 
-/** 设备回读的 BearerPreference → 别名（上面映射的反向）。 */
+/**
+ * 设备回读的 BearerPreference / net_select → 别名。
+ *
+ * 与 Kotlin `NetworkMode.fromBearer` 同步：真机/老固件会回 `NR5G_ONLY`、`LTE_NR5G`、
+ * `WCDMA_AND_LTE_AND_5G`、小写 `only_5g` 等写法，漏映射会让切换回读永远对不上目标档位。
+ * **查表统一走 [bearerToNetworkMode]**（先转大写），不要直接下标取值。
+ */
 export const BearerToNetworkMode: Record<string, string> = {
   WL_AND_5G: NetworkMode.AUTO,
-  Only_5G: NetworkMode.ONLY_5G,
+  AUTO: NetworkMode.AUTO,
+  // 真机默认档位（2026-09 F50）：语义等于 5G/4G/3G 自动
+  WCDMA_AND_LTE_AND_5G: NetworkMode.AUTO,
+  ONLY_5G: NetworkMode.ONLY_5G,
+  NR5G_ONLY: NetworkMode.ONLY_5G,
+  ONLY_NR5G: NetworkMode.ONLY_5G,
+  '5G_ONLY': NetworkMode.ONLY_5G,
   LTE_AND_5G: NetworkMode.LTE_AND_5G,
-  Only_LTE: NetworkMode.ONLY_LTE,
+  LTE_NR5G: NetworkMode.LTE_AND_5G,
+  LTE_AND_NR5G: NetworkMode.LTE_AND_5G,
+  NR5G_NSA: NetworkMode.LTE_AND_5G,
+  '5G_NSA': NetworkMode.LTE_AND_5G,
+  ONLY_LTE: NetworkMode.ONLY_LTE,
+  LTE_ONLY: NetworkMode.ONLY_LTE,
   WCDMA_AND_LTE: NetworkMode.WCDMA_AND_LTE,
-  Only_WCDMA: NetworkMode.ONLY_WCDMA,
+  LTE_WCDMA: NetworkMode.WCDMA_AND_LTE,
+  ONLY_WCDMA: NetworkMode.ONLY_WCDMA,
+  WCDMA_ONLY: NetworkMode.ONLY_WCDMA,
 };
+
+/**
+ * 设备回读值 → 别名（大小写不敏感，与 Kotlin `fromBearer` 的 `uppercase()` 对齐）。
+ *
+ * 设备侧同一档位有多种大小写写法（`Only_5G` / `only_5g`），原来靠在表里各列一遍，
+ * 少列一种就静默落到"未知"。认不出来的取值**原样返回**，不伪装成「自动」。
+ */
+export function bearerToNetworkMode(raw: string): string {
+  const key = String(raw ?? '').trim();
+  if (!key) return '';
+  return BearerToNetworkMode[key.toUpperCase()] || key;
+}
 
 /**
  * 切换制式后的「回读确认」预算，与 Kotlin `NetworkMode.SwitchProbe` 逐字对齐。
  *
  * 为什么需要：`POST /api/network/mode` 返回成功只代表**固件收下了**这条命令，设备还要重新
- * 注册网络，这期间 `GET /api/device/settings` 的 `BearerPreference` **仍报旧档位**。
+ * 注册网络，这期间 `GET /api/device/settings` 报的**仍是旧档位**。
  * 写完只回读一次就渲染，界面会停在切换前的档位，直到别处偶然又拉了一次设置才自己变对
  * —— 这正是 2026-09-11 真机上"切换生效了但界面还显示旧制式"。
  *
- * 上限是硬要求：设备在弱信号下可能十几秒都注册不上，无上限轮询会一直打 goform 查询。
+ * 上限是硬要求：每次回读都真打设备（core 写成功后会清 `device:settings` 缓存），
+ * 无上限轮询会把 goform 查询许可耗在这一件事上。
  */
 export const NetworkModeSwitchProbe = {
   /** 下发成功后到第一次回读的等待（设备写入到查询接口可见约 600ms）。 */
   firstDelayMs: 600,
-  /** 之后每次回读的间隔。 */
+  /** 快档间隔：前 `fastAttempts` 次用它。 */
   intervalMs: 1500,
-  /** 回读次数上限（**含**第一次）。 */
-  maxAttempts: 10,
+  /** 慢档间隔：设备重新注册期间降频。 */
+  slowIntervalMs: 3000,
+  /** 快档次数。 */
+  fastAttempts: 5,
+  /** 回读次数上限（**含**第一次）。13 次 ≈ 30.6s，覆盖真机十几到二十几秒的切换时间。 */
+  maxAttempts: 13,
 } as const;
 
+/** 第 attemptNo 次回读之后等多久再读。与 Kotlin `SwitchProbe.intervalMsAfter` 同一判据。 */
+export function modeProbeIntervalMs(attemptNo: number): number {
+  return attemptNo < NetworkModeSwitchProbe.fastAttempts
+    ? NetworkModeSwitchProbe.intervalMs
+    : NetworkModeSwitchProbe.slowIntervalMs;
+}
+
 /** 总时长上限，给文案用。与 Kotlin `SwitchProbe.TOTAL_BUDGET_MS` 同一算式。 */
-export const NetworkModeSwitchBudgetMs =
-  NetworkModeSwitchProbe.firstDelayMs + (NetworkModeSwitchProbe.maxAttempts - 1) * NetworkModeSwitchProbe.intervalMs;
+export const NetworkModeSwitchBudgetMs = (() => {
+  let total = NetworkModeSwitchProbe.firstDelayMs;
+  for (let i = 1; i < NetworkModeSwitchProbe.maxAttempts; i += 1) total += modeProbeIntervalMs(i);
+  return total;
+})();
 
 /**
  * 还要不要再回读一次。与 Kotlin `SwitchProbe.shouldKeepProbing` 同一判据。
@@ -384,6 +685,264 @@ export const NetworkModeSwitchBudgetMs =
  */
 export function shouldKeepProbingMode(attemptNo: number, reachedTarget: boolean): boolean {
   return !reachedTarget && attemptNo < NetworkModeSwitchProbe.maxAttempts;
+}
+
+// ────────────────────────────────────────────────────────────
+// WiFi 安全模式 —— POST /api/wifi/config 的 auth_mode + encryp_type
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 界面上「加密方式」的一档 = 设备侧 **两个**参数（`auth_mode` + `encryp_type`）。
+ *
+ * 取值来自 2026-09-22 真机抓包。core 侧 `WifiRoutes.kt` 的 `/wifi/config` 只是把
+ * `auth_mode` / `encryp_type` 原样透传给 goform（仅对 OPEN 特判），所以**配对关系由客户端负责**。
+ *
+ * 为什么绑成一档而不给两个下拉：这两个参数在设备侧必须配对下发，分开选就能造出
+ * 「WPA3PSK + NONE」这种设备收下了却不生效的组合 —— 又一个假开关。
+ *
+ * 注意字段名是 `encryp_type`（**不是** `encrypt_type`），与设备后台同名。
+ */
+export interface WifiSecurityPreset {
+  /** 下拉显示名 */
+  label: string;
+  /** 下拉 value，同时就是要下发的 `auth_mode`（设备参数值即键，省掉一层映射） */
+  value: string;
+  /** 与 value 配对下发的 `encryp_type` */
+  encrypType: string;
+  /** false = 开放网络，提交时**不带** `passphrase` */
+  needsPassphrase: boolean;
+}
+
+export const WifiSecurityPresets: ReadonlyArray<WifiSecurityPreset> = [
+  { label: '开放（无密码）', value: 'OPEN', encrypType: 'NONE', needsPassphrase: false },
+  { label: 'WPA2(AES)-PSK', value: 'WPA2PSK', encrypType: 'CCMP', needsPassphrase: true },
+  { label: 'WPA3-PSK', value: 'WPA3PSK', encrypType: 'CCMP', needsPassphrase: true },
+  { label: 'WPA2-PSK/WPA3-PSK', value: 'WPA2PSKWPA3PSK', encrypType: 'CCMP', needsPassphrase: true },
+];
+
+/** 读不到设备当前值时的兜底档位，与 core 缺省写的 `WPA2PSK` 一致。 */
+export const WIFI_AUTH_MODE_DEFAULT = 'WPA2PSK';
+
+/** 按 `auth_mode` 找预设。找不到 = 设备用了表外写法（老固件/别的型号），返回 undefined。 */
+export function findWifiSecurityPreset(authMode: string | undefined | null): WifiSecurityPreset | undefined {
+  const key = String(authMode ?? '').trim();
+  if (!key) return undefined;
+  return WifiSecurityPresets.find((p) => p.value === key);
+}
+
+/**
+ * 这一档要不要密码框。
+ *
+ * 表外写法按「要密码」处理：宁可多留一个输入框，也不要把一个已加密的网络
+ * 当成开放网络提交（那会把密码丢掉，所有已连设备立刻掉线）。
+ */
+export function wifiSecurityNeedsPassphrase(authMode: string | undefined | null): boolean {
+  return findWifiSecurityPreset(authMode)?.needsPassphrase ?? true;
+}
+
+/**
+ * 下拉选项 = 4 个权威档位 +（设备当前值如果是表外写法就置顶并入）。
+ *
+ * 并入当前值是必须的：不然 select 对一台回读 `WPAPSK` 的设备显示空白，
+ * 用户随手一保存就把加密方式改成了别的档 —— 他并没有要求改这一项。
+ *
+ * 返回**可变数组**：naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，
+ * 给 readonly 会在 vue-tsc 里报 TS4104。
+ */
+export function wifiSecurityOptions(currentAuthMode?: string | null): Array<{ label: string; value: string }> {
+  const base = WifiSecurityPresets.map((p) => ({ label: p.label, value: p.value }));
+  const cur = String(currentAuthMode ?? '').trim();
+  if (cur && !findWifiSecurityPreset(cur)) {
+    return [{ label: `${cur}（设备当前值，保持不变）`, value: cur }, ...base];
+  }
+  return base;
+}
+
+/**
+ * `max_sta_num` 的合法闭区间 `[1, 10]`。
+ *
+ * 上限 10 来自用户对**中兴 F50** 的规格结论（2026-09-22），与 core 侧
+ * `ZteGoformProfile.AP_MAX_STA_NUM_RANGE`（`validateApConfig` 用它拒 1..10 之外的值）对齐。
+ * 导出是为了让两个 WiFi 表单的 `n-input-number :min/:max` 与本文件的提交守门共用同一份取值，
+ * 而不是各写一个字面量。
+ */
+export const WifiMaxStaNumRange = { min: 1, max: 10 } as const;
+
+/**
+ * `max_sta_num` 是否可提交。
+ *
+ * `null` = 留空，语义是「不修改」（core 不传时压根不下发 ApMaxStationNumber）。
+ * 其余必须是 [WifiMaxStaNumRange] 闭区间内的整数：越界值 core 侧 `validateApConfig`
+ * 会直接 Rejected，在这里先拦下来，用户才看得到原因而不是一句「保存失败」。
+ *
+ * 这一层是**必须**的：`n-input-number` 的 `:max` 只在用步进器时硬夹，
+ * 用户手打 `99` 仍会落进 form。
+ */
+export function isWifiMaxStaNumAcceptable(v: number | null | undefined): boolean {
+  if (v === null || v === undefined) return true;
+  return Number.isInteger(v) && v >= WifiMaxStaNumRange.min && v <= WifiMaxStaNumRange.max;
+}
+
+/**
+ * 「保持不变」档的文案。选项首项用它 —— 「不下发 `max_sta_num`」在界面上只有这一种说法。
+ *
+ * 与 app 侧 `WifiSettingsDialog.kt` 的 `optionLabel = { it?.toString() ?: "保持不变" }` 同字。
+ */
+export const WIFI_MAX_STA_NUM_KEEP_LABEL = '保持不变';
+
+/**
+ * 「保持不变」档在**选择器控件层**的取值（哨兵）。
+ *
+ * 为什么不是 `null`：naive-ui 的 `n-select` 在 `value === null` 时直接判「无选中」
+ *（`_internal/select-menu/src/SelectOption.mjs` 的 `if (value === null) return false`
+ * 与 `select/src/Select.mjs` 的 `selectedOptionRef`），那一档既不高亮也不打勾，
+ * 只能靠 placeholder 假装 —— 而 app 侧同一个弹窗的「保持不变」是能正常高亮的
+ *（`UfiDropdown` 按值比较，`Int?` 的 `null` 正常选中），两端观感必须一致。
+ *
+ * 为什么用 `0` 而不另造一个哨兵：`0` 本来就已经被 [isWifiMaxStaNumAcceptable] 判为不合法
+ *（区间是 `[1, 10]`），也就是说这个哨兵**不需要额外的守门**，任何把它当真值下发的路径
+ * 都会被既有判据挡住。
+ *
+ * 它只活在控件层：过边界要先经 [wifiMaxStaNumForPayload] 折成 `null`，
+ * **不许**泄漏到 [WifiConfigFormInput] 之外。
+ */
+export const WIFI_MAX_STA_NUM_KEEP_VALUE = 0;
+
+/**
+ * 「最大连接数」下拉的选项 = 「保持不变」([WIFI_MAX_STA_NUM_KEEP_VALUE]) + [WifiMaxStaNumRange]
+ * 闭区间内每个整数。
+ *
+ * 2026-09-22 用户裁决：选择类控件统一成下拉。十选一的值域由**选项本身**守，
+ * 用户打不出 `99`，也就没有「打完再被拒」这条路径（`n-input-number` 的 `:max`
+ * 只在用步进器时硬夹，手打仍会落进 form）。提交守门 [isWifiMaxStaNumAcceptable]
+ * 仍然留着，它同时管「不下发」这个语义，**不许放宽**。
+ *
+ * 首项是**显式**的「保持不变」而不是 `clearable`：与 app 侧
+ * `WifiSettingsDialog.kt` 的 `maxStaOptions = listOf<Int?>(null) + WIFI_MAX_STA_RANGE`
+ * 两端同构，且显式选项比清除按钮更容易被发现。
+ *
+ * 值域唯一来源仍是 [WifiMaxStaNumRange]：改上限只改那一处，这里跟着变，
+ * 两个 WiFi 弹窗共用这一份，不存在第二份 1..10。
+ *
+ * 保持 `ReadonlyArray`（取值域常量不该被外部 push / 改写）。naive-ui 的
+ * `n-select :options` 形参是 `SelectMixedOption[]`，直接喂 readonly 会报 TS4104 ——
+ * 妥协放在调用点：组件里 `[...WifiMaxStaNumOptions]` 浅拷贝一次（setup 里算一次，
+ * 不在模板表达式里拷，免得每次渲染都重建 treemate）。
+ */
+export const WifiMaxStaNumOptions: ReadonlyArray<{ label: string; value: number }> = [
+  { label: WIFI_MAX_STA_NUM_KEEP_LABEL, value: WIFI_MAX_STA_NUM_KEEP_VALUE },
+  ...Array.from({ length: WifiMaxStaNumRange.max - WifiMaxStaNumRange.min + 1 }, (_, i) => {
+    const n = WifiMaxStaNumRange.min + i;
+    return { label: String(n), value: n };
+  }),
+];
+
+/**
+ * 选择器控件层取值 → [WifiConfigFormInput.maxStaNum]（`null` = 不下发）。
+ *
+ * 唯一的折算处，两个 WiFi 弹窗共用：哨兵 `0`（「保持不变」）以及任何**不可提交**的值
+ * 一律折成 `null`。判据直接复用 [isWifiMaxStaNumAcceptable]，这里不另写一遍区间比较
+ * —— 抄第二份迟早与守门漂移。
+ *
+ * 结论：经过这一步之后，`0` 不可能出现在 `max_sta_num` 上（[buildWifiConfigPayload]
+ * 还会再判一次），控件层的哨兵到不了 HTTP 报文。
+ */
+export function wifiMaxStaNumForPayload(selected: number): number | null {
+  return isWifiMaxStaNumAcceptable(selected) ? selected : null;
+}
+
+// ────────────────────────────────────────────────────────────
+// WiFi 频段 —— POST /api/wifi/band
+// ────────────────────────────────────────────────────────────
+
+/**
+ * 频段的**传输取值域**，用设备自己的词汇。
+ *
+ * 设备侧只有一条命令能真的换频段：
+ * `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`（2026-09-22 真机抓包，
+ * chip1 = 2.4G、chip2 = 5G），core 把它包成 `POST /api/wifi/band` 收 `{ chip }`。
+ *
+ * 曾经走的 `POST /api/wifi/config` 的 `chip_index` 落到设备的 `setAccessPointInfo` →
+ * `ChipIndex`，**设备不认这条路**，用户实测「改了没反应」—— 那条映射已经从
+ * [buildWifiConfigPayload] 里摘掉，不要再加回来。
+ *
+ * 只认 `chip1` / `chip2`：**不要**另造 `'1'` / `'2'`（那是读侧展示字段 `chip_index` 的编码）
+ * 或 `'2.4G'` / `'5G'`（那是界面文案）作为传输值，core 侧 profile 的 validate 会直接 400。
+ */
+export const WifiBands = ['chip1', 'chip2'] as const;
+export type WifiBand = (typeof WifiBands)[number];
+
+/** 读不到设备当前频段时的兜底值（设备只有单频段在跑，2.4G 是出厂档）。 */
+export const WIFI_BAND_DEFAULT: WifiBand = 'chip1';
+
+/**
+ * 频段选择器的选项。文案是人话（「2.4 GHz」），value 是设备词汇（`chip1`）——
+ * 界面上看到什么与线上发出去什么在这里一次对齐，免得组件里各写一份字面量。
+ *
+ * 保持 `ReadonlyArray`：这是**取值域常量**，不该被外部 push / 改写。
+ * naive-ui 的 `n-select :options` 形参是 `SelectMixedOption[]`，直接喂 readonly 会报
+ * TS4104，妥协放在调用点 —— 组件里 `[...WifiBandOptions]` 浅拷贝一次（同
+ * [WifiMaxStaNumOptions]、[wifiSecurityOptions] 的处理）。
+ */
+export const WifiBandOptions: ReadonlyArray<{ label: string; value: WifiBand }> = [
+  { label: '2.4 GHz', value: 'chip1' },
+  { label: '5 GHz', value: 'chip2' },
+];
+
+/**
+ * 读侧字段 `chip_index`（`'1'` / `'2'`，由 `normalizeWifiSettings` 从 `wifi_chip` 归一出来，
+ * **只用于展示**）→ 写侧取值域 [WifiBand]。
+ *
+ * 表单要拿「设备当前频段」和用户的选择比对才知道要不要下发，而它手上只有展示字段，
+ * 这个翻译必须有且只有一处：读侧编码一旦改动，跟着改这里就够了。
+ */
+export function wifiBandFromChipIndex(chipIndex: string | null | undefined): WifiBand {
+  return chipIndex === '2' ? 'chip2' : WIFI_BAND_DEFAULT;
+}
+
+/** 表单侧的 WiFi 配置输入，由 [buildWifiConfigPayload] 翻成 `POST /api/wifi/config` 的报文。 */
+export interface WifiConfigFormInput {
+  ssid: string;
+  /** 加密方式下拉的 value，即要下发的 `auth_mode` */
+  authMode: string;
+  passphrase: string;
+  /** null = 留空不修改 */
+  maxStaNum: number | null;
+  /** true = **隐藏** SSID，对应 `broadcast_disabled=1` */
+  hidden: boolean;
+  /** 设备回读的 `encryp_type`，仅在 authMode 是表外写法时作为透传兜底 */
+  fallbackEncrypType?: string;
+}
+
+/**
+ * 拼 `POST /api/wifi/config` 的报文。**两个 WiFi 设置表单共用这一份**。
+ *
+ * 为什么收敛到这里：OPEN 档不能带 `passphrase`、`encryp_type` 不传会被 core 硬写成 CCMP，
+ * 这两条规则抄两份就一定会有一份漏掉（原来两个表单各自拼报文，`encryp_type` 也各写了一遍）。
+ */
+export function buildWifiConfigPayload(input: WifiConfigFormInput): Record<string, unknown> {
+  const preset = findWifiSecurityPreset(input.authMode);
+  const payload: Record<string, unknown> = {
+    ssid: input.ssid,
+    auth_mode: input.authMode,
+    // 预设档用配对值；表外写法把设备回读值原样带回去。
+    // 都不传时 core 会把 EncrypType 硬写成 CCMP，等于改 SSID 顺手改坏了加密方式。
+    encryp_type: preset ? preset.encrypType : input.fallbackEncrypType || undefined,
+    // 语义是「隐藏」：1 = 隐藏（不广播），0 = 广播。别按字面当成「广播开关」。
+    broadcast_disabled: input.hidden ? 1 : 0,
+  };
+  // 频段**不在这里**：`chip_index` 走 setAccessPointInfo，设备不认（用户实测「改了没反应」），
+  // 真正换频段要发 `POST /api/wifi/band`，取值域见 [WifiBands]。
+  // 留空 / 越界都不下发：core 不传时保持设备现值，比下发一个设备会拒的值安全。
+  // 判定复用 [isWifiMaxStaNumAcceptable]（它对 null 返回 true，所以还要排掉 null）——
+  // 在这里另写一遍区间比较，两处迟早会漂移（原来这里写的是 `> 0`，与守门条件各说各话）。
+  if (input.maxStaNum !== null && isWifiMaxStaNumAcceptable(input.maxStaNum)) {
+    payload.max_sta_num = input.maxStaNum;
+  }
+  // 开放网络**不带** passphrase：真机 OPEN 档只发 AuthMode=OPEN + EncrypType=NONE，
+  // 多带一个密码字段会让设备按「有密码」处理，结果是选了开放却连不上。
+  if (preset ? preset.needsPassphrase : true) payload.passphrase = input.passphrase;
+  return payload;
 }
 
 /**
@@ -415,6 +974,7 @@ export const AlertType = [
   'signal',
   'connectivity',
   'traffic_limit',
+  'plan_expiry',
   'device_online',
   'device_offline',
 ] as const;
@@ -701,6 +1261,27 @@ export interface MailHistoryResponse {
 export type DeliveryOutcome = 'sent' | 'failed' | 'skipped';
 
 /**
+ * `GET /api/sms-forward/history/stats` 的响应（三条渠道共用，`channel` 缺失 = 全渠道）。
+ *
+ * 与 [MailHistoryResponse] 里那三个计数**是同一批数字的另一种切法**，多出来的是
+ * `sent` 与 `last_sent_at` —— 列表响应只给 total/failed/skipped，"已发出多少条"得自己减，
+ * 而 `total - failed - skipped` 在 core 尚未全量升到 DB v12 的设备上会算错
+ * （那种 core 不产生 skipped 行，减出来的数没错，但它也不回这个端点 —— 见下面那句）。
+ *
+ * **老固件没有这条端点**：404 时不要把整张记录视图判成失败，回落到列表响应里的三个计数即可
+ * （少显示 `sent` 与 `last_sent_at` 两项，其余功能不受影响）。
+ *
+ * `last_sent_at` 是全表最后一条记录的时间戳（ms），**不是"最后成功"的时间**；无记录时为 0。
+ */
+export interface DeliveryHistoryStats {
+  total: number;
+  sent: number;
+  failed: number;
+  skipped: number;
+  last_sent_at: number;
+}
+
+/**
  * 把 [MailSendRecord.outcome] 读成三态结论。**全 web 唯一一处分类判定。**
  *
  * `outcome` 缺失时回落到 `success`。这不是兼容 shim，是**外部响应的版本容错**：
@@ -754,6 +1335,23 @@ export const ConfigLimits = {
   qosGoformSetMax: [1, 4],
   smsCodeCleanupHours: [0, 720],
 } as const;
+
+/**
+ * 更新下载方式（2026-09-22：决策下沉 core，见 `docs/update-source-core-plan.md`）。
+ *
+ * `update_source_mode` 是**唯一决策字段**，客户端只读写它；「用不用镜像 / 用哪个镜像 /
+ * 失败怎么换源」全部由 core 的 `MirrorResolver` 决定。`update_url` 与 `update_mirror_base`
+ * 自此是 core 的实现细节（清单地址 + 自定义前缀覆盖），**web 只读不写** ——
+ * 写了就等于又多出一个决策方，而那正是这次改造要消除的东西。
+ */
+export const UpdateSourceMode = {
+  /** 按设备出口地区：`CN` 走镜像，其他地区与「未测出」都直连 */
+  AUTO: 'auto',
+  MIRROR: 'mirror',
+  DIRECT: 'direct',
+} as const;
+
+export type UpdateSourceModeValue = (typeof UpdateSourceMode)[keyof typeof UpdateSourceMode];
 
 /** `PUT /api/config` 响应 `rejected_fields[].reason`，与 Kotlin `ErrorCode` 同名同值。 */
 export const ConfigRejectReason = {
@@ -933,6 +1531,17 @@ export const DeviceFields = {
     all: ['lte_band_lock', 'nr_band_lock'],
   },
 
+  /**
+   * POST /api/network/band 响应的半失败透传字段（2026-10-05 R2-4）。
+   * LTE/NR 是两次独立 goform 写，一路成功一路失败时 success 仍为 true
+   * （网络栈已按「新值+旧值」混合状态重启），客户端凭 partial 提示部分未生效。
+   */
+  bandLockApply: {
+    lteApplied: 'lte_applied',
+    nrApplied: 'nr_applied',
+    partial: 'partial',
+  },
+
   /** GET /api/network/cell-info · /api/network/neighbor-cells */
   cellInfo: {
     neighborCellInfo: 'neighbor_cell_info',
@@ -1078,6 +1687,71 @@ export const DeviceFields = {
    */
   unstableEndpoints: ['api/device/goform', 'api/device/goform/query', 'api/device/goform/set', 'api/wifi/module-info'],
 } as const;
+
+/** `GET /api/weather/config` 配置。`0, 0` 是"未设城市"的哨兵，不是几内亚湾。 */
+export const WeatherUnit = { CELSIUS: 'celsius', FAHRENHEIT: 'fahrenheit' } as const;
+export type WeatherUnit = (typeof WeatherUnit)[keyof typeof WeatherUnit];
+
+/**
+ * `GET /api/weather` 在**已配置**（`configured: true`）时的完整形状。
+ * 未配置时只有 `{ configured: false, enabled, message }`。
+ *
+ * `hourly_times` / `hourly_temperatures` 是等长的 24 点数组（index 0 = 当前小时）。
+ * `weather_code` 是 WMO 码；中文描述取 `description`，**不要在 web 侧再翻译一次**。
+ */
+export interface WeatherNow {
+  configured: boolean;
+  enabled?: boolean;
+  message?: string;
+  city?: string;
+  temperature?: number;
+  apparent_temperature?: number;
+  humidity?: number;
+  precipitation?: number;
+  wind_speed?: number;
+  weather_code?: number;
+  description?: string;
+  is_day?: boolean;
+  temp_max?: number;
+  temp_min?: number;
+  sunrise?: string;
+  sunset?: string;
+  hourly_times?: string[];
+  hourly_temperatures?: number[];
+  unit?: string;
+  timezone?: string;
+  updated_at?: number;
+}
+
+/** `GET /api/weather/search` 的响应。 */
+export interface WeatherSearchResult {
+  name: string;
+  latitude: number;
+  longitude: number;
+  country: string;
+  admin1?: string;
+  timezone?: string;
+}
+
+/** `GET /api/poetry` 的响应。 */
+export interface PoetryNow {
+  content: string;
+  title: string;
+  dynasty: string;
+  author: string;
+  full_content: string[];
+  translate: string[];
+  match_tags: string[];
+  popularity: number;
+  updated_at: number;
+}
+
+/** `GET /api/geo` 的响应。 */
+export interface GeoInfo {
+  country: string;
+  detected_at: number;
+  source: 'cache' | 'fresh' | 'unknown';
+}
 
 /** 设备侧布尔判定，与 Kotlin 侧 DeviceFields.Bool.isTrue 同语义。 */
 export const isDeviceTrue = (raw: unknown): boolean =>

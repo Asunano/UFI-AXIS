@@ -117,7 +117,7 @@ watch(
   padding: 24px 0;
 }
 .log-list {
-  max-height: 400px;
+  max-height: min(400px, 56vh);
   overflow-y: auto;
 }
 .log-item {

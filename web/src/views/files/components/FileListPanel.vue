@@ -1,24 +1,28 @@
 <template>
   <n-spin :show="loading">
-    <div class="file-list">
-      <div v-if="searchInfo" class="search-header">
-        搜索 "{{ searchInfo.query }}" — {{ searchInfo.count }} 个结果
-        <n-button size="tiny" text @click="emit('clear-search')">清除</n-button>
-      </div>
+    <div class="file-list" :class="{ selmode: selMode }">
       <div
         v-for="f in files"
         :key="f.path"
         class="file-item"
-        :class="{ selected: selectedPath === f.path }"
-        @click="emit('select', f)"
-        @dblclick="emit('open', f)"
+        :class="{ selected: isRowSelected(f) }"
+        @click="onRowClick(f)"
+        @dblclick="onRowDblClick(f)"
       >
+        <!-- 多选模式的勾选态。刻意不用 n-checkbox：整行就是热区，
+             再套一个可独立点击的复选框只会带来「点复选框算选中、点行算打开」的歧义 -->
+        <span v-if="selMode" class="sel-box" :class="{ on: isSelected(f) }">
+          <n-icon><CheckmarkOutline /></n-icon>
+        </span>
+
         <FileKindIcon :file="f" />
         <div class="file-info">
           <span class="file-name">{{ f.name }}</span>
           <span class="file-meta">{{ fileMeta(f) }}</span>
         </div>
-        <div class="file-actions" @click.stop>
+
+        <!-- 多选态隐藏行内操作：批量动作已上提到顶栏的选择工具条 -->
+        <div v-if="!selMode" class="file-actions" @click.stop>
           <n-button v-if="canPreview(f)" size="tiny" text @click="emit('preview', f)">预览</n-button>
           <n-button v-if="!f.isDirectory" size="tiny" text @click="emit('download', f)">下载</n-button>
           <n-dropdown :options="fileActions(f)" trigger="click" @select="(k: string) => emit('action', k, f)">
@@ -30,41 +34,69 @@
           </n-dropdown>
         </div>
       </div>
-      <div v-if="!files.length && !loading" class="empty-state">
-        {{ searchInfo ? '无匹配结果' : '空目录' }}
-      </div>
+      <div v-if="!files.length && !loading" class="empty-state">空目录</div>
     </div>
   </n-spin>
 </template>
 
 <script setup lang="ts">
 /**
- * 文件列表。纯展示 + 意图上报：排序后的数组由页面给（搜索结果与目录列表共用同一个出口），
- * 每行的动作只 emit key，具体请求在页面里。
+ * 文件列表。纯展示 + 意图上报：排序/过滤后的数组由页面给，每行的动作只 emit key，
+ * 具体请求在页面里。
  *
- * `searchInfo` 非空即表示「当前展示的是搜索结果」——
- * 空态文案要据此区分「无匹配结果」和「空目录」，用 files.length 判不出来。
+ * 有两种「选中」语义，别混：
+ *  · `selectedPath` —— 普通浏览时的**单选**高亮（点一下选中，供后续操作参考）；
+ *  · `selMode + selectedPaths` —— **多选**模式下的勾选集合（批量复制/移动/删除的输入）。
+ * 多选态下单选高亮不再参与渲染，否则同一行会出现两种高亮叠加。
+ *
+ * 搜索结果不再走本组件：`/search` 的结果必须显示「在哪一层目录」，
+ * 而列表行只有文件名 + 元信息（`/search` 连 size 都不返回），同名文件无法区分。
+ * 现在统一在 SearchModal 里呈现。
  */
 import { canExtract, canPreview, fileMeta, isTextEditable, type FileEntry } from '../filesShared';
 import FileKindIcon from './FileKindIcon.vue';
-import { EllipsisHorizontalOutline } from '@vicons/ionicons5';
+import { CheckmarkOutline, EllipsisHorizontalOutline } from '@vicons/ionicons5';
 
-defineProps<{
-  files: FileEntry[];
-  loading: boolean;
-  selectedPath: string;
-  /** null = 正常目录浏览；非 null = 搜索结果视图 */
-  searchInfo: { query: string; count: number } | null;
-}>();
+const props = withDefaults(
+  defineProps<{
+    files: FileEntry[];
+    loading: boolean;
+    selectedPath: string;
+    /** 多选模式：整行点击 = 切换勾选，行内操作隐藏 */
+    selMode?: boolean;
+    /** 多选模式下已勾选的路径集合 */
+    selectedPaths?: string[];
+  }>(),
+  { selMode: false, selectedPaths: () => [] }
+);
 
 const emit = defineEmits<{
   (e: 'select', f: FileEntry): void;
   (e: 'open', f: FileEntry): void;
+  (e: 'toggle-select', f: FileEntry): void;
   (e: 'preview', f: FileEntry): void;
   (e: 'download', f: FileEntry): void;
   (e: 'action', key: string, f: FileEntry): void;
-  (e: 'clear-search'): void;
 }>();
+
+function isSelected(f: FileEntry): boolean {
+  return props.selectedPaths.includes(f.path);
+}
+
+function isRowSelected(f: FileEntry): boolean {
+  return props.selMode ? isSelected(f) : props.selectedPath === f.path;
+}
+
+function onRowClick(f: FileEntry) {
+  if (props.selMode) emit('toggle-select', f);
+  else emit('select', f);
+}
+
+/** 多选态下双击不打开：连点两下会把勾选切两次再弹预览，行为不可预期 */
+function onRowDblClick(f: FileEntry) {
+  if (props.selMode) return;
+  emit('open', f);
+}
 
 function fileActions(f: FileEntry) {
   const ext = f.name.split('.').pop()?.toLowerCase();
@@ -105,22 +137,14 @@ function fileActions(f: FileEntry) {
 <style scoped>
 .file-list {
   border: 1px solid var(--border-subtle);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   overflow: hidden;
-}
-.search-header {
-  padding: 8px 12px;
-  background: var(--surface-elevated);
-  font-size: 13px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 .file-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   cursor: pointer;
   border-bottom: 1px solid var(--border-subtle);
   transition: background 0.12s ease;
@@ -134,9 +158,28 @@ function fileActions(f: FileEntry) {
 }
 .file-item.selected {
   background: var(--accent-color-light);
+  /* 左侧强调条：不只靠底色表达选中（底色在暗色下对比度低） */
+  box-shadow: inset 3px 0 0 var(--accent-color);
 }
-.file-icon {
+.sel-box {
   flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  border: 1.5px solid var(--border-subtle);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-base);
+  color: transparent;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
+}
+.sel-box.on {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+  color: var(--card-bg);
 }
 .file-info {
   flex: 1;
@@ -146,13 +189,13 @@ function fileActions(f: FileEntry) {
   gap: 2px;
 }
 .file-name {
-  font-size: 14px;
+  font-size: var(--font-md);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .file-meta {
-  font-size: 12px;
+  font-size: var(--font-sm);
   color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
@@ -168,10 +211,16 @@ function fileActions(f: FileEntry) {
 .file-item.selected .file-actions {
   opacity: 1;
 }
+/* 触屏没有 hover：行内操作必须常驻可见，否则在手机上等于不存在 */
+@media (hover: none) {
+  .file-actions {
+    opacity: 1;
+  }
+}
 .empty-state {
   padding: 48px 16px;
   text-align: center;
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: var(--font-md);
 }
 </style>

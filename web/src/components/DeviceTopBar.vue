@@ -163,8 +163,13 @@ function goDetail() {
 
 <template>
   <div class="device-top-bar">
+    <!--
+      trigger="click" 而不是 hover（2026-09-19 改）：这层浮层里装的是运营商 / 固件版本 /
+      SELinux / Magisk / IMEI —— 触屏设备上没有 hover 事件，改之前这些字段在手机与
+      平板上**根本打不开**。桌面端点击同样自然（顶栏那颗「详情」本来就长得像按钮）。
+    -->
     <n-popover
-      trigger="hover"
+      trigger="click"
       placement="bottom"
       :show-arrow="false"
       raw
@@ -375,7 +380,7 @@ function goDetail() {
 }
 .dtb-dot.is-online {
   background: var(--success);
-  box-shadow: 0 0 0 3px rgba(24, 160, 88, 0.18);
+  box-shadow: 0 0 0 3px var(--accent-ring);
 }
 .dtb-dot.is-offline {
   background: var(--text-muted);
@@ -392,6 +397,11 @@ function goDetail() {
   移动端：**不再把信号与运行时间整块 display:none**（那是之前「有的信息看不到」的一半原因）。
   只藏掉运行时间这一段 —— 它是四项里最不需要在顶栏盯着的，
   型号 / 在线点 / 制式 / 信号都保留。
+
+  2026-09-19 补：这一段在 ≤768px 下**曾经是死代码** —— DefaultLayout 用
+  `v-if="!isMobile"`（isMobile = innerWidth < 768）把整个组件卸掉了，手机上
+  型号/制式/信号一个都看不到，与上面这段注释的意图正好相反。现在 DefaultLayout
+  改为在移动端把本组件移入抽屉顶部（不再卸载），所以这一段终于生效了。
 */
 @media (max-width: 768px) {
   .dtb-seg {
@@ -409,16 +419,22 @@ function goDetail() {
   .dtb-more {
     margin-left: 2px;
   }
+  /* 抽屉里横向空间充裕（240px 宽），但仍可能放不下 4 段 —— 允许换行 */
+  .dtb-bar {
+    flex-wrap: wrap;
+  }
 }
 
 /* ── 设备详情面板（Popover 内）── */
+/* 阴影颜色走令牌（--shadow-color-* 自带暗色档），所以下面不再需要
+   `.dark .dev-panel` 那条只为了加深阴影而存在的覆盖 */
 .dev-panel {
   width: 320px;
   background: var(--card-bg);
   border-radius: var(--radius-md);
   box-shadow:
-    0 6px 24px rgba(0, 0, 0, 0.12),
-    0 2px 8px rgba(0, 0, 0, 0.06);
+    0 6px 24px var(--shadow-color-strong),
+    0 2px 8px var(--shadow-color-soft);
   overflow: hidden;
 }
 .dev-panel-header {
@@ -544,12 +560,5 @@ function goDetail() {
 .dev-badge-info {
   background: var(--accent-color-light);
   color: var(--accent-color);
-}
-
-/* 暗色模式微调 */
-.dark .dev-panel {
-  box-shadow:
-    0 8px 32px rgba(0, 0, 0, 0.35),
-    0 2px 8px rgba(0, 0, 0, 0.2);
 }
 </style>

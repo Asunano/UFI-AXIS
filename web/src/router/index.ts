@@ -76,6 +76,28 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/downloads/DownloadsView.vue'),
       },
       {
+        // 媒体库拆成三条独立路由，与 app 的 MEDIA_LIBRARY_VIDEO / _AUDIO / _IMAGE 一一对应。
+        // 不做成"一页三个标签"：三类的列表版式、播放方式与页内状态都不同，
+        // 合在一页时切标签要把上一类的播放器与 blob URL 全部收干净，那条清理链很容易漏。
+        path: 'media',
+        redirect: { name: 'media-video' },
+      },
+      {
+        path: 'media/video',
+        name: 'media-video',
+        component: () => import('@/views/media/MediaVideoView.vue'),
+      },
+      {
+        path: 'media/audio',
+        name: 'media-audio',
+        component: () => import('@/views/media/MediaAudioView.vue'),
+      },
+      {
+        path: 'media/image',
+        name: 'media-image',
+        component: () => import('@/views/media/MediaImageView.vue'),
+      },
+      {
         path: 'tunnel',
         name: 'tunnel',
         component: () => import('@/views/tunnel/TunnelView.vue'),

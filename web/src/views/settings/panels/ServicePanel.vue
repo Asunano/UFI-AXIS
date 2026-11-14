@@ -37,6 +37,66 @@
       </div>
     </GridCard>
 
+    <!-- Card: DLNA MediaServer（2026-10-09） -->
+    <GridCard title="DLNA 投屏">
+      <template #extra>
+        <n-tag :type="dlna.running ? 'success' : 'default'" size="small" :bordered="false">{{
+          dlna.loaded ? (dlna.running ? '运行中' : dlna.enabled ? '已开启' : '关闭') : '--'
+        }}</n-tag>
+      </template>
+      <div class="config-grid">
+        <div class="config-item switch-item">
+          <span class="config-label">共享到局域网</span>
+          <n-switch
+            :value="dlna.enabled && dlna.ready"
+            :disabled="!dlna.loaded || dlnaBusy || !dlna.ready"
+            :loading="dlnaBusy"
+            @update:value="toggleDlna"
+          />
+        </div>
+      </div>
+      <InfoRow label="共享目录" :value="dlnaDirsText" />
+      <div v-if="dlna.loaded && !dlna.ready" class="text-muted" style="margin-top: 8px; font-size: 12px">
+        请先添加至少一个共享目录，否则开关不可用。
+      </div>
+      <div class="card-actions">
+        <n-button size="small" @click="openDlnaDirs">选择共享目录</n-button>
+      </div>
+      <n-modal v-model:show="dlnaDirsModal" preset="card" title="选择 DLNA 共享目录" style="max-width: 520px">
+        <div style="margin-bottom: 8px; font-size: 12px; opacity: 0.7">当前：{{ dlnaBrowsePath }}</div>
+        <n-breadcrumb style="margin-bottom: 8px">
+          <n-breadcrumb-item v-for="c in dlnaCrumbs" :key="c.path" @click="browseDlna(c.path)">
+            {{ c.name }}
+          </n-breadcrumb-item>
+        </n-breadcrumb>
+        <n-spin :show="dlnaBrowsing">
+          <n-list v-if="dlnaChildren.length" hoverable clickable size="small">
+            <n-list-item v-for="d in dlnaChildren" :key="d.path" @click="browseDlna(d.path)">
+              <div style="display: flex; justify-content: space-between; align-items: center">
+                <span>{{ d.name }}</span>
+                <n-button
+                  size="tiny"
+                  :type="dlnaPicked.includes(d.path) ? 'primary' : 'default'"
+                  @click.stop="togglePick(d.path)"
+                  >{{ dlnaPicked.includes(d.path) ? '已选' : '选择' }}</n-button
+                >
+              </div>
+            </n-list-item>
+          </n-list>
+          <div v-else style="padding: 16px; text-align: center; opacity: 0.6">无子目录</div>
+        </n-spin>
+        <template #footer>
+          <div style="display: flex; justify-content: space-between; align-items: center">
+            <span style="font-size: 12px; opacity: 0.7">已选 {{ dlnaPicked.length }} 个目录</span>
+            <n-space>
+              <n-button size="small" @click="dlnaDirsModal = false">取消</n-button>
+              <n-button size="small" type="primary" :loading="dlnaBusy" @click="saveDlnaDirs">保存</n-button>
+            </n-space>
+          </div>
+        </template>
+      </n-modal>
+    </GridCard>
+
     <!-- Card 5: 缓存管理 -->
     <GridCard title="缓存管理">
       <InfoRow label="条目数" :value="cacheStats.entries" />
@@ -238,6 +298,127 @@ function formatCacheSize(bytes: number): string {
   return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
 }
 
+// ── DLNA MediaServer（2026-10-09）──
+// ready=false（未配目录）时开关置灰：core 也会拒（400），这里提前拦住体验更好。
+const dlna = reactive({ loaded: false, enabled: false, running: false, ready: false, dirs: [] as string[] });
+const dlnaBusy = ref(false);
+const dlnaDirsText = computed(() =>
+  dlna.dirs.length ? dlna.dirs.join('、') : '未配置（至少需要一个目录）'
+);
+
+async function loadDlnaStatus() {
+  try {
+    const { data } = await api.get(Endpoints.dlna.status);
+    dlna.enabled = !!data.enabled;
+    dlna.running = !!data.running;
+    dlna.ready = !!data.ready;
+    dlna.dirs = Array.isArray(data.dirs) ? data.dirs : [];
+    dlna.loaded = true;
+  } catch {
+    dlna.loaded = false;
+  }
+}
+
+async function toggleDlna(value: boolean) {
+  dlnaBusy.value = true;
+  try {
+    const { data } = await api.put(Endpoints.dlna.config, { enabled: value });
+    dlna.enabled = !!data.enabled;
+    dlna.running = !!data.running;
+    dlna.ready = !!data.ready;
+    dlna.dirs = Array.isArray(data.dirs) ? data.dirs : [];
+    message.success(value ? 'DLNA 已开启' : 'DLNA 已关闭');
+  } catch (e: unknown) {
+    const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+    message.error(msg || '保存失败');
+  } finally {
+    dlnaBusy.value = false;
+  }
+}
+
+// 目录选择弹层：走 /api/files/list 浏览（与文件页同源），多选后一次 PUT。
+// 根用 /storage：内部存储与 SD 卡（/storage/XXXX-XXXX）平级可见，起点写死 emulated/0 会永远看不到外接卷
+const PRIMARY_ROOT = '/storage';
+const dlnaDirsModal = ref(false);
+const dlnaBrowsePath = ref(PRIMARY_ROOT);
+const dlnaChildren = ref<{ path: string; name: string }[]>([]);
+const dlnaBrowsing = ref(false);
+const dlnaPicked = ref<string[]>([]);
+
+const dlnaCrumbs = computed(() => {
+  const crumbs = [{ path: PRIMARY_ROOT, name: '存储' }];
+  const rel = dlnaBrowsePath.value.startsWith(PRIMARY_ROOT + '/')
+    ? dlnaBrowsePath.value.slice(PRIMARY_ROOT.length)
+    : '';
+  let acc = PRIMARY_ROOT;
+  for (const seg of rel.split('/').filter(Boolean)) {
+    acc += '/' + seg;
+    crumbs.push({ path: acc, name: seg });
+  }
+  return crumbs;
+});
+
+async function browseDlna(path: string) {
+  dlnaBrowsing.value = true;
+  try {
+    const { data } = await api.get('/api/files/list', { params: { path } });
+    dlnaBrowsePath.value = path;
+    const children = (data.files || [])
+      .filter((f: { is_directory?: boolean }) => f.is_directory !== false)
+      .map((f: { path: string }) => ({
+        path: f.path,
+        name: f.path.split('/').filter(Boolean).pop() || f.path,
+      }));
+    // 列 /storage 时并上 disk-usage 的真实卷：Android 11+ 上 listFiles('/storage')
+    // 可能只见 emulated/self，外接 SD 卡（/storage/XXXX-XXXX）会"消失"。
+    if (path.replace(/\/+$/, '') === '/storage') {
+      try {
+        const du = await api.get('/api/files/disk-usage');
+        for (const d of du.data?.disks || []) {
+          if (d.mount && !children.some((c: { path: string }) => c.path === d.mount)) {
+            children.push({ path: d.mount, name: d.label || d.mount });
+          }
+        }
+      } catch { /* disk-usage 失败不阻塞浏览 */ }
+    }
+    dlnaChildren.value = children;
+  } catch {
+    message.error('加载目录失败');
+  } finally {
+    dlnaBrowsing.value = false;
+  }
+}
+
+function togglePick(path: string) {
+  const i = dlnaPicked.value.indexOf(path);
+  if (i >= 0) dlnaPicked.value.splice(i, 1);
+  else dlnaPicked.value.push(path);
+}
+
+function openDlnaDirs() {
+  dlnaPicked.value = [...dlna.dirs];
+  dlnaDirsModal.value = true;
+  browseDlna(PRIMARY_ROOT);
+}
+
+async function saveDlnaDirs() {
+  dlnaBusy.value = true;
+  try {
+    const { data } = await api.put(Endpoints.dlna.config, { dirs: dlnaPicked.value });
+    dlna.enabled = !!data.enabled;
+    dlna.running = !!data.running;
+    dlna.ready = !!data.ready;
+    dlna.dirs = Array.isArray(data.dirs) ? data.dirs : [];
+    dlnaDirsModal.value = false;
+    message.success('共享目录已保存');
+  } catch (e: unknown) {
+    const msg = (e as { response?: { data?: { error?: string } } })?.response?.data?.error;
+    message.error(msg || '保存失败');
+  } finally {
+    dlnaBusy.value = false;
+  }
+}
+
 // ══════════════════════════════════════════════
 //  Lifecycle
 // ══════════════════════════════════════════════
@@ -245,6 +426,7 @@ function formatCacheSize(bytes: number): string {
 onMounted(() => {
   loadServiceStatus();
   loadCacheStats();
+  loadDlnaStatus();
 });
 
 onUnmounted(() => {

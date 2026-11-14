@@ -44,6 +44,13 @@ export interface BackendStatus {
   currentVersion: string;
   latestVersion: string;
   apkPath: string;
+  /**
+   * 手动上传 APK 的体积上限（core 的 `upload_limit_bytes`，按清单 apkSize 动态算）。
+   *
+   * 0 = 老 core 不回这个字段；此时前端放行、交给服务端拦
+   * （判定见 `composables/uploadLimit.ts` 的 `uploadSizeError`）。
+   */
+  uploadLimitBytes: number;
 }
 
 /** `GET /api/update/backend-info` 响应（只检查，不下载不安装）。 */
@@ -80,7 +87,15 @@ const RESTART_DEADLINE_MS = 90_000;
 const PROBE_TIMEOUT_MS = 5000;
 
 function emptyStatus(): BackendStatus {
-  return { state: 'idle', progress: 0, message: '', currentVersion: '', latestVersion: '', apkPath: '' };
+  return {
+    state: 'idle',
+    progress: 0,
+    message: '',
+    currentVersion: '',
+    latestVersion: '',
+    apkPath: '',
+    uploadLimitBytes: 0,
+  };
 }
 
 /** `/api/update/*` 的失败信封是 `{ error, message, code }`，两个键都要认。 */
@@ -167,6 +182,10 @@ export const useUpdateStore = defineStore('update', () => {
     const raw = d as Record<string, unknown>;
     if (raw.state === undefined) return false;
     const apkPath = typeof raw.apk_path === 'string' && raw.apk_path ? raw.apk_path : status.value.apkPath;
+    // 与 apk_path 同一处理：老 core 不回 upload_limit_bytes 时保留已有值，
+    // 别用 0 覆盖掉刚读到的上限（否则预检会退化成"放行一切"）
+    const rawLimit = Number(raw.upload_limit_bytes);
+    const uploadLimitBytes = Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : status.value.uploadLimitBytes;
     status.value = {
       state: normalizeState(raw.state),
       progress: typeof raw.progress === 'number' ? raw.progress : 0,
@@ -174,6 +193,7 @@ export const useUpdateStore = defineStore('update', () => {
       currentVersion: typeof raw.current_version === 'string' ? raw.current_version : '',
       latestVersion: typeof raw.latest_version === 'string' ? raw.latest_version : '',
       apkPath,
+      uploadLimitBytes,
     };
     return true;
   }

@@ -65,7 +65,7 @@ import { getApiClient } from '@/composables/useApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 import { ConfigLimits } from '@/api/contract';
-import { buildChangedPayload, commitConfigSave } from '@/views/settings/settingsShared';
+import { buildChangedPayload, commitConfigSave, findUnbaselinedKeys } from '@/views/settings/settingsShared';
 
 const message = useMessage();
 const api = getApiClient();
@@ -180,6 +180,12 @@ async function saveQos() {
     goformQueryLimit: 'qos_goform_query_max',
     goformSetLimit: 'qos_goform_set_max',
   };
+  // 无条件提示「core 不认的键」：缺基线的控件显示的是这里的前端默认值（如 cacheTtlMs: 5000），
+  // 不是设备真实取值，buildChangedPayload 又会把它整个跳过 —— 用户只会看到「没有更改」。
+  const unbaselined = findUnbaselinedKeys(formKeys, qosOriginal);
+  if (unbaselined.length > 0) {
+    message.warning(`以下配置项当前 core 版本不支持，已忽略：${unbaselined.join('、')}`);
+  }
   const payload = buildChangedPayload(formKeys, qosForm, qosOriginal);
   if (Object.keys(payload).length === 0) {
     message.info('没有更改');

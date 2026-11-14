@@ -4,7 +4,7 @@
     :show="show"
     preset="card"
     title="看护设置"
-    style="max-width: 560px"
+    style="width: 560px; max-width: calc(100vw - 32px)"
     @update:show="emit('update:show', $event)"
   >
     <ToggleRow

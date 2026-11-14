@@ -32,13 +32,11 @@ export function errText(e: any, fallback: string): string {
   return d?.message || d?.error || fallback;
 }
 
+/**
+ * 状态文案。只有异常态需要它 —— 运行/停止由列表行左侧的状态点表达
+ * （2026-09-21 行版式重排后，原先那个 `statusTagType()` 已无消费方，一并删除）。
+ */
 export function statusLabel(s: string): string {
   const map: Record<string, string> = { Running: '运行中', Stopped: '已停止', Error: '异常' };
   return map[s] || s;
-}
-
-export function statusTagType(s: string): 'default' | 'success' | 'error' {
-  if (s === 'Running') return 'success';
-  if (s === 'Error') return 'error';
-  return 'default';
 }

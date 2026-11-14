@@ -287,7 +287,7 @@ const saving = ref(false);
 
 // core 的 PUT /api/alerts/config 用 configVersion 做版本守门（不一致返回 409），
 // 且 mergeConfigPatch 只做**顶层键合并**：少传一个键 = 把它写回默认值（少传 perType 会
-// 清空别端的分类开关，少传 minIntervalSec 会被重置成 1800）。
+// 清空别端的分类开关，少传某个阈值会被重置成默认阈值）。
 // 因此保留完整的原始配置对象，保存时在其上覆盖本页字段，configVersion 原样带回。
 const rawConfig = ref<Record<string, any>>({});
 
@@ -324,6 +324,10 @@ const ALERT_TYPE_META: Record<AlertTypeKey, Omit<AlertTypeSwitch, 'type'>> = {
     label: '套餐限额预警',
     hint: '按套餐用量百分比提醒（阈值取设备侧设置，默认 80%）；与按绝对 MB 的「流量告警」是两类',
     gate: 'traffic_80_enabled',
+  },
+  plan_expiry: {
+    label: '套餐到期',
+    hint: '固定有效期套餐的到期提醒（在流量限额设置里配置）',
   },
   device_online: {
     label: '设备接入提醒',

@@ -285,8 +285,27 @@ function randomNonce(): string {
  * @param uri **服务端可见的 path + query**（含原始百分号编码）。传完整 URL 会导致验签失败，
  *   因为 core 拿到的是 `call.request.uri`（不含 scheme/host）。
  */
+/**
+ * 本机时钟相对 core 服务器时钟的偏差毫秒数（server − local）。
+ *
+ * 2026-10-05：签名时间戳改为「本机 + 偏差」，根治浏览器/设备时钟漂移 >5min 导致的
+ * STALE_TIMESTAMP 401。偏差来源：/health 响应自带服务器时间（免费鉴权），登录第 3 步
+ * 与各视图的探活都能顺带校准（见 calibrateClockOffset）。
+ * 默认 0 = 不补偿；观测到微小偏差（<2s）不采纳，避免 RTT 抖动造成来回震荡。
+ */
+let clockOffsetMs = 0;
+
+/** 用服务器当前时间校准签名时钟；serverNowMs 为 /health 响应的 timestamp（毫秒数字符串或数字）。 */
+export function calibrateClockOffset(serverNowMs: number | string): void {
+  const server = Number(serverNowMs);
+  if (!Number.isFinite(server) || server <= 0) return;
+  const observed = server - Date.now();
+  if (Math.abs(observed - clockOffsetMs) < 2_000) return;
+  clockOffsetMs = observed;
+}
+
 export async function signRequest(method: string, uri: string): Promise<SignedHeaders> {
-  const timestamp = String(Date.now());
+  const timestamp = String(Date.now() + clockOffsetMs);
   const nonce = randomNonce();
   const canonical = [method.toUpperCase(), uri, timestamp, nonce].join('\n');
   const payload = new TextEncoder().encode(canonical);

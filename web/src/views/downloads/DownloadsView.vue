@@ -906,10 +906,14 @@ onUnmounted(() => {
   flex-wrap: wrap;
   gap: 12px;
 }
+/* 状态条塞 8~12 个片段（状态点、aria2 运行中、版本、活跃数、Tracker 数、节流原因…），
+   节流原因单独就有 ~260px。必须允许换行，否则 298px 的卡内它直接溢出，
+   而被推出去的恰好是「为什么在节流」这条最需要看到的信息。 */
 .status-info {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px 6px;
   font-size: 13px;
   color: var(--text-secondary);
 }
@@ -957,24 +961,32 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: 8px 12px;
 }
 .task-name {
   font-size: 13px;
   color: var(--text-primary);
   word-break: break-all;
   flex: 1;
+  /* 不给 min-width:0，break-all 也救不了：flex 基准仍是内容宽，
+     名字会先把 .task-actions（flex-shrink:0）顶出行外 */
+  min-width: 0;
   line-height: 1.4;
 }
 .task-actions {
   display: flex;
   gap: 4px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
+/* 每行 6 段（状态、已下载/总量、速度、连接数、做种数、协议）≈350px，
+   在 298px 卡内不换行就溢出，被推出去的是大小与速度。 */
 .task-meta {
   display: flex;
   align-items: center;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 4px 10px;
   margin-top: 6px;
   font-size: 12px;
   color: var(--text-muted);
@@ -1067,6 +1079,12 @@ onUnmounted(() => {
   .top-bar {
     flex-direction: column;
     align-items: flex-start;
+  }
+  /* 3 颗按钮（配置 / Tracker / 新建下载 ≈212px）在 298px 内没有余量，
+     320px 设备直接溢出 —— 允许换行并占满整行 */
+  .top-actions {
+    flex-wrap: wrap;
+    width: 100%;
   }
   .tracker-info {
     flex-direction: column;

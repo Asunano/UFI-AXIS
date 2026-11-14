@@ -33,6 +33,23 @@ export function buildChangedPayload(
   return payload;
 }
 
+/**
+ * 找出「表单里有、但 GET /api/config 没回」的配置键。
+ *
+ * 为什么需要它：buildChangedPayload 对没有基线的键直接 continue（否则会把一个
+ * 当前 core 不认的键提交上去），于是那个控件会变成空转开关——拖得动、保存时被吞、
+ * 只提示「没有更改」。本函数让调用方能把这件事说出来。
+ *
+ * 只看键在不在、不看值有没有被改过 —— 调用方应当**无条件**提示：缺基线时控件显示的是
+ * 前端默认值而不是设备真实状态，就算用户没碰过它，「这个开关在这台设备上根本不存在」也得说。
+ *
+ * 刻意不动 buildChangedPayload 的签名与返回类型：hasUnsavedChanges 靠它返回值的 `.length`
+ * 判断有没有未保存改动，签名一变那边就得跟着改。
+ */
+export function findUnbaselinedKeys(formKeys: Record<string, string>, original: Record<string, any>): string[] {
+  return Object.values(formKeys).filter((apiKey) => !(apiKey in original));
+}
+
 /** 最小的 message API 形状，避免把 naive-ui 的类型拖进来 */
 interface MessageLike {
   success(content: string): void;

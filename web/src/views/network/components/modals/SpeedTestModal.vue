@@ -14,8 +14,12 @@
           <div class="st-node">{{ nodeLabel }}</div>
 
           <div class="st-pills" :class="{ visible: showData }">
-            <span class="st-pill">PING <b>{{ formatMs(state.latencyMs) }}</b></span>
-            <span class="st-pill">JITTER <b>{{ formatMs(state.jitterMs) }}</b></span>
+            <span class="st-pill"
+              >PING <b>{{ formatMs(state.latencyMs) }}</b></span
+            >
+            <span class="st-pill"
+              >JITTER <b>{{ formatMs(state.jitterMs) }}</b></span
+            >
           </div>
 
           <div class="st-dial-slot">
@@ -32,13 +36,7 @@
                   :y2="t % 6 === 1 ? 22 : 18"
                 />
               </g>
-              <circle
-                class="dial-progress"
-                cx="100"
-                cy="100"
-                r="88"
-                :style="{ strokeDasharray: dialDash }"
-              />
+              <circle class="dial-progress" cx="100" cy="100" r="88" :style="{ strokeDasharray: dialDash }" />
               <g class="dial-needle" :transform="`rotate(${-120 + gaugeFraction * 240} 100 100)`">
                 <line x1="100" y1="36" x2="100" y2="52" />
                 <circle cx="100" cy="36" r="2.5" />
@@ -98,12 +96,7 @@
 
           <div class="st-actions">
             <n-button v-if="isRunning" secondary block @click="cancel">取消测速</n-button>
-            <n-button
-              v-else-if="state.phase === 'done' || state.phase === 'error'"
-              type="primary"
-              block
-              @click="start"
-            >
+            <n-button v-else-if="state.phase === 'done' || state.phase === 'error'" type="primary" block @click="start">
               重新测速
             </n-button>
           </div>
@@ -158,14 +151,37 @@
                   :paused="chartPaused"
                 />
                 <div class="st-stats">
-                  <div class="st-stat"><span>用时</span><b>{{ state.elapsedSec.toFixed(1) }}s</b></div>
-                  <div class="st-stat"><span>峰值</span><b>{{ fmtMbps(state.peakMbps) }}</b></div>
-                  <div class="st-stat"><span>已传</span><b>{{ formatBytes(state.totalBytes) }}</b></div>
-                  <div class="st-stat"><span>并发</span><b>{{ state.streams || '—' }}</b></div>
+                  <div class="st-stat">
+                    <span>用时</span><b>{{ state.elapsedSec.toFixed(1) }}s</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>峰值</span><b>{{ fmtMbps(state.peakMbps) }}</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>已传</span><b>{{ formatBytes(state.totalBytes) }}</b>
+                  </div>
+                  <div class="st-stat">
+                    <span>并发</span><b>{{ state.streams || '—' }}</b>
+                  </div>
                 </div>
               </div>
               <div v-else key="empty" class="st-right-empty" />
             </Transition>
+          </div>
+
+          <!-- 定时测速历史（core 侧跑的轮次：定时任务 / 手动触发，2026-10-06） -->
+          <div v-if="history.length || historyLoaded" class="st-history">
+            <div class="st-history-head">
+              <span class="st-history-title">定时测速历史</span>
+              <n-button size="tiny" quaternary :disabled="isRunning" @click="runOnDevice">在设备上测一次</n-button>
+            </div>
+            <div v-for="r in history" :key="r.timestamp" class="st-history-row">
+              <span class="st-h-time">{{ r.time }}</span>
+              <span class="st-h-dl">↓ {{ r.download_mbps }} Mbps</span>
+              <span class="st-h-up">↑ {{ r.upload_mbps }} Mbps</span>
+              <span class="st-h-lat">{{ r.latency_ms }} ms</span>
+              <span class="st-h-trig" :class="r.trigger">{{ r.trigger === 'scheduled' ? '定时' : '手动' }}</span>
+            </div>
           </div>
         </div>
       </div>
@@ -184,6 +200,8 @@
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useAppStore } from '@/stores/app';
+import { useWebSocketStore } from '@/stores/websocket';
+import { WsChannel } from '@/api/contract';
 import { loadDeviceIdentity } from '@/composables/deviceIdentityLazy';
 import { useChartColors } from '@/composables/chartTheme';
 import ScrollingLineChart from '@/components/ScrollingLineChart.vue';
@@ -279,9 +297,7 @@ const state = ref<SpeedState>({
 });
 
 const activeNode = computed(() => EXTERNAL_NODES.find((n) => n.id === targetId.value) || null);
-const isRunning = computed(() =>
-  ['connecting', 'latency', 'download', 'upload'].includes(state.value.phase)
-);
+const isRunning = computed(() => ['connecting', 'latency', 'download', 'upload'].includes(state.value.phase));
 /** 开始测速后才展示网络信息（对齐「点测试后才显示」） */
 const showData = computed(() => isRunning.value || state.value.phase === 'done' || state.value.phase === 'error');
 
@@ -469,14 +485,31 @@ async function cancel() {
   if (j) await j.catch(() => undefined);
 }
 
+const wsStore = useWebSocketStore();
+function onSpeedtestBroadcast(data: any): void {
+  const item = data?.speedtest;
+  if (!item) return;
+  historyLoaded.value = true;
+  history.value = [
+    { ...item, time: new Date(Number(item.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) },
+    ...history.value,
+  ].slice(0, 30);
+}
+/** 组件常驻订阅（modal 常驻挂载，重复注册由 wsStore 的 Set 去重）；unmount 时摘除。 */
+const offSpeedtestBroadcast = wsStore.on(WsChannel.TRAFFIC, onSpeedtestBroadcast);
+
 watch(
   () => props.show,
   (v) => {
-    if (!v) cancel();
+    if (v) void loadHistory();
+    else cancel();
   }
 );
 
-onUnmounted(() => cancelAll());
+onUnmounted(() => {
+  cancelAll();
+  offSpeedtestBroadcast();
+});
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -785,16 +818,10 @@ async function runUploadPhase(
   uploadUrl: string | null,
   downloadBase: number
 ): Promise<{ avg: number; bytes: number; elapsed: number; streams: number } | null> {
-  const uri = uploadUrl
-    ? `/api/speedtest/relay?url=${encodeURIComponent(uploadUrl)}`
-    : '/api/speedtest/upload';
+  const uri = uploadUrl ? `/api/speedtest/relay?url=${encodeURIComponent(uploadUrl)}` : '/api/speedtest/upload';
   const url = `${appStore.baseUrl || ''}${uri}`;
   let headers: Record<string, string> = { 'Content-Type': 'application/octet-stream' };
-  try {
-    headers = { ...(await speedHeaders('POST', uri)), ...headers };
-  } catch (e) {
-    throw e;
-  }
+  headers = { ...(await speedHeaders('POST', uri)), ...headers };
 
   // crypto.getRandomValues 单次上限 65536 字节：先取一块再重复拼满，内容不影响速率
   const seed = new Uint8Array(65536);
@@ -1061,6 +1088,54 @@ async function start() {
 onUnmounted(() => {
   cancelAll();
 });
+
+// ── 定时测速（core 侧执行，2026-10-06）─────────────────────────
+interface SpeedHistoryItem {
+  timestamp: string;
+  download_mbps: string;
+  upload_mbps: string;
+  latency_ms: string;
+  jitter_ms?: string;
+  trigger: string;
+}
+const history = ref<(SpeedHistoryItem & { time: string })[]>([]);
+const historyLoaded = ref(false);
+
+async function loadHistory(): Promise<void> {
+  try {
+    const uri = '/api/speedtest/history?limit=30';
+    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { headers: await speedHeaders('GET', uri) });
+    if (!res.ok) return;
+    historyLoaded.value = true;
+    const data = (await res.json()) as { items?: SpeedHistoryItem[] };
+    history.value = (data.items ?? []).map((r) => ({
+      ...r,
+      time: new Date(Number(r.timestamp)).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }),
+    }));
+  } catch {
+    // 历史加载失败不打扰：列表区域直接隐藏
+  }
+}
+
+async function runOnDevice(): Promise<void> {
+  try {
+    const uri = '/api/speedtest/run';
+    const res = await fetch(`${appStore.baseUrl || ''}${uri}`, { method: 'POST', headers: await speedHeaders('POST', uri) });
+    if (res.status === 409) {
+      message.warning('已有测速在跑');
+      return;
+    }
+    if (!res.ok) {
+      message.error(`设备测速失败（HTTP ${res.status}）`);
+      return;
+    }
+    message.success('设备测速完成，已记入历史');
+    await loadHistory();
+  } catch (e: any) {
+    message.error(`设备测速失败: ${e?.message || '未知错误'}`);
+  }
+}
+
 </script>
 
 <style scoped>
@@ -1123,7 +1198,9 @@ onUnmounted(() => {
 }
 .st-fade-enter-active,
 .st-fade-leave-active {
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition:
+    opacity 0.2s ease,
+    transform 0.2s ease;
 }
 .st-fade-enter-from {
   opacity: 0;
@@ -1152,10 +1229,14 @@ onUnmounted(() => {
   }
 }
 .st-pills {
-  transition: opacity 0.25s ease, margin 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    margin 0.25s ease;
 }
 .st-dir-col {
-  transition: opacity 0.25s ease, color 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    color 0.25s ease;
 }
 .st-dial-slot {
   transition: opacity 0.25s ease;
@@ -1230,12 +1311,14 @@ onUnmounted(() => {
 }
 .dial-progress {
   fill: none;
-  stroke: var(--accent-color, #4f8cff);
+  stroke: var(--accent-color);
   stroke-width: 7;
   stroke-linecap: round;
   transform: rotate(150deg);
   transform-origin: 100px 100px;
-  filter: drop-shadow(0 0 6px rgba(79, 140, 255, 0.35));
+  /* 2026-09-15：这里原来是写死的蓝色光晕（旧主色残留），主色改绿之后
+     绿弧上罩着一层蓝光。改接 --accent-glow，跟着主色/皮肤走。 */
+  filter: drop-shadow(0 0 6px var(--accent-glow));
 }
 .dial-ticks line {
   stroke: var(--text-muted);
@@ -1243,12 +1326,12 @@ onUnmounted(() => {
   opacity: 0.45;
 }
 .dial-needle line {
-  stroke: var(--accent-color, #4f8cff);
+  stroke: var(--accent-color);
   stroke-width: 2.5;
   stroke-linecap: round;
 }
 .dial-needle circle {
-  fill: var(--accent-color, #4f8cff);
+  fill: var(--accent-color);
 }
 .st-dial-center {
   position: absolute;
@@ -1269,14 +1352,16 @@ onUnmounted(() => {
   font-size: 22px;
   font-weight: 700;
   letter-spacing: 0.06em;
-  color: #fff;
-  background: var(--accent-color, #4f8cff);
-  box-shadow: 0 8px 24px rgba(79, 140, 255, 0.35);
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  color: var(--on-accent);
+  background: var(--accent-color);
+  box-shadow: 0 8px 24px var(--accent-glow);
+  transition:
+    transform 0.15s ease,
+    box-shadow 0.15s ease;
 }
 .st-go:hover {
   transform: scale(1.04);
-  box-shadow: 0 10px 28px rgba(79, 140, 255, 0.45);
+  box-shadow: 0 10px 28px var(--accent-glow);
 }
 .st-go:active {
   transform: scale(0.98);
@@ -1334,11 +1419,13 @@ onUnmounted(() => {
   align-items: center;
   gap: 2px;
   opacity: 0.45;
-  transition: opacity 0.25s ease, color 0.25s ease;
+  transition:
+    opacity 0.25s ease,
+    color 0.25s ease;
 }
 .st-dir-col.on {
   opacity: 1;
-  color: var(--accent-color, #4f8cff);
+  color: var(--accent-color);
 }
 .st-dir-ico {
   width: 18px;
@@ -1412,7 +1499,7 @@ onUnmounted(() => {
 }
 .st-error {
   font-size: 12px;
-  color: var(--error, #e88080);
+  color: var(--error);
   text-align: center;
 }
 .st-actions:empty {
@@ -1435,15 +1522,18 @@ onUnmounted(() => {
   cursor: pointer;
   text-align: left;
   color: inherit;
-  transition: border-color 0.15s ease, background 0.15s ease, opacity 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    opacity 0.15s ease;
 }
 .st-target:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
 .st-target.active {
-  border-color: var(--accent-color, #4f8cff);
-  background: var(--accent-color-light, rgba(79, 140, 255, 0.1));
+  border-color: var(--accent-color);
+  background: var(--accent-color-light);
 }
 .st-target:hover {
   background: var(--surface-hover);
@@ -1474,7 +1564,57 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .st-target.active .st-t-dot {
-  border-color: var(--accent-color, #4f8cff);
-  background: var(--accent-color, #4f8cff);
+  border-color: var(--accent-color);
+  background: var(--accent-color);
+}
+
+.st-history {
+  margin-top: 12px;
+  border-top: 1px dashed var(--divider-color, rgba(128, 128, 128, 0.25));
+  padding-top: 8px;
+}
+.st-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.st-history-title {
+  font-size: 12px;
+  opacity: 0.65;
+}
+.st-history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 3px 0;
+  font-variant-numeric: tabular-nums;
+}
+.st-h-time {
+  opacity: 0.6;
+  min-width: 78px;
+}
+.st-h-dl {
+  color: var(--cat-cyan-fg, #00838f);
+  min-width: 104px;
+}
+.st-h-up {
+  min-width: 96px;
+  opacity: 0.8;
+}
+.st-h-lat {
+  opacity: 0.7;
+  min-width: 64px;
+}
+.st-h-trig {
+  font-size: 11px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: var(--cat-neutral-bg, rgba(128, 128, 128, 0.15));
+}
+.st-h-trig.scheduled {
+  background: var(--cat-cyan-bg, #e0f2f1);
+  color: var(--cat-cyan-fg, #00838f);
 }
 </style>

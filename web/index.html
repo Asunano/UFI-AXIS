@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>UFI-AXIS</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- PWA（2026-10-06）：可安装到主屏幕；SW 策略见 public/sw.js 头注释 -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#101014" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <style>
       /* FOUC 防闪：在 Vue 挂载前隐藏内容 */
       #app {
@@ -19,5 +24,20 @@
   <body>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
+    <script>
+      // SW 注册 + 新版本接管后一次性刷新（避免旧页面跑在新壳上的半新半旧态）。
+      // 仅 https 或 localhost 注册（SW 的安全要求）；设备 http 直连场景静默跳过。
+      if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+        window.addEventListener('load', () => {
+          var refreshing = false;
+          navigator.serviceWorker.addEventListener('controllerchange', () => {
+            if (refreshing) return;
+            refreshing = true;
+            location.reload();
+          });
+          navigator.serviceWorker.register('/sw.js').catch(function () { /* 静默：PWA 是增强项 */ });
+        });
+      }
+    </script>
   </body>
 </html>

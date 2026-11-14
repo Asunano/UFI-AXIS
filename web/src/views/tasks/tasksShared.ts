@@ -68,6 +68,12 @@ export const actionOptions = [
   { label: '漫游', value: 'roaming_toggle' },
   { label: '网络模式', value: 'network_mode' },
   { label: '自定义命令', value: 'custom_shell' },
+  // 定时测速（2026-10-06）：跑一轮测速并入库，结果走通知渠道（speedtestResult 场景）
+  { label: '定时测速', value: 'speedtest' },
+  // 远端备份（2026-10-06）：加密配置包推送到远端存储源，滚动保留 7 份
+  { label: '远端备份', value: 'remote_backup' },
+  // 流量报告（2026-10-06）：生成日/周/月报并推送，参数 period
+  { label: '流量报告', value: 'traffic_report' },
 ];
 
 /** 这些动作的参数是一个开关（params.enabled），摘要文案要说「开启/关闭」 */
@@ -98,6 +104,57 @@ export const presets = [
 
 export type TaskPreset = (typeof presets)[number];
 
+/**
+ * 自动化规则模板（2026-10-05）。与 presets（定时任务预设）同思路：
+ * 点一下把触发+动作预填进表单，用户只需微调阈值。字段名与 core
+ * ConditionEngine 的 triggerType/triggerParams、ActionType 的 params 契约严格对应，
+ * 提交路径与手工创建完全一致（POST /api/rules），core 侧零改动。
+ */
+export interface RuleTemplate {
+  label: string;
+  /** 模板说明（chips 的 tooltip / aria） */
+  desc: string;
+  triggerType: string;
+  triggerParams: Record<string, any>;
+  actionType: string;
+  params: Record<string, any>;
+}
+
+export const ruleTemplates: RuleTemplate[] = [
+  {
+    label: '流量超限关数据',
+    desc: '当月累计流量达到 30GB 时自动关闭移动数据',
+    triggerType: 'traffic_total_reached',
+    triggerParams: { thresholdBytes: 30 * 1024 * 1024 * 1024 },
+    actionType: 'data_toggle',
+    params: { enabled: false },
+  },
+  {
+    label: '低电量省电',
+    desc: '电量低于 20%（未充电）时关数据、关指示灯',
+    triggerType: 'battery_below',
+    triggerParams: { levelPercent: 20 },
+    actionType: 'data_toggle',
+    params: { enabled: false },
+  },
+  {
+    label: '回落 4G 锁回 5G',
+    desc: '网络从 5G 跳变到 4G 时自动把网络模式切回 5G/4G',
+    triggerType: 'network_type_changed',
+    triggerParams: { targetType: '4G' },
+    actionType: 'network_mode',
+    params: { mode: 'LTE_AND_5G' },
+  },
+  {
+    label: '断网自动重启',
+    desc: '蜂窝网络断开并确认后自动重启设备（冷却 10 分钟）',
+    triggerType: 'disconnect',
+    triggerParams: {},
+    actionType: 'reboot',
+    params: {},
+  },
+];
+
 // ── 图标映射 ──
 const actionIconMap: Record<string, Component> = {
   data_toggle: PhonePortraitOutline,
@@ -110,6 +167,7 @@ const actionIconMap: Record<string, Component> = {
   roaming_toggle: GlobeOutline,
   network_mode: CellularOutline,
   custom_shell: TerminalOutline,
+  speedtest: SpeedometerOutline,
 };
 
 const triggerIconMap: Record<string, Component> = {

@@ -47,16 +47,24 @@
     </div>
 
     <!-- 弹窗：受控子组件，保存逻辑留在父组件以保证行为不变 -->
-    <WifiModal v-model:show="showWifiModal" :wifi-settings="wifiSettings" @save="saveWifiEdit" />
+    <WifiModal ref="wifiModalRef" v-model:show="showWifiModal" :wifi-settings="wifiSettings" @save="saveWifiEdit" />
     <TrafficLimitModal v-model:show="showTrafficModal" :traffic-limit="trafficLimit" @save="saveTrafficLimit" />
 
-    <!-- 与网络页共用的弹窗（同一份组件、同一份 handler） -->
+    <!-- 与网络页共用的弹窗（同一份组件、同一份 handler）
+         switching / timed-out 必须传：不传的话仪表盘这份弹窗看不到「正在切换 / 尚未完成」，
+         同一个操作在两个页面上的反馈会不一致 -->
     <NetworkModeModal
       v-model:show="showModeModal"
       v-model:selected-mode="selectedMode"
       :mode-loading="modeLoading"
       :network-modes="networkModes"
+      :current-mode="currentMode"
+      :current-label="modeLabel"
+      :refreshing="modeRefreshing"
+      :switching="switchingMode !== null"
+      :timed-out="modeSwitchTimedOut"
       @apply="applyModeAndClose"
+      @refresh="refreshDeviceSettings"
     />
     <!-- 懒加载弹窗一律走 useLazyModal，否则首帧 show 就是 true，进出场动画全丢 -->
     <component :is="bandComponent" v-if="bandComponent" :show="bandShow" @update:show="bandModal.setShow" />
@@ -66,6 +74,28 @@
       :acl-pending="aclPending"
       @unblock="unblockDevice"
       @clear="clearBlockedDevices"
+    />
+
+    <!-- 2026-10-05 P3 修复：A 级操作统一进度弹窗（本页是可写操作消费方之一，与网络页各挂一份） -->
+    <OperationProgressModal
+      :state="wifiOp.state.value"
+      title="WiFi 开关"
+      running-text="正在切换 WiFi"
+      success-text="WiFi 设置已完成"
+      hint="WiFi 模块重启期间已连接设备会短暂掉线"
+      :fail-text="wifiOp.failReason.value"
+      :close="wifiOp.close"
+      :to-background="wifiOp.toBackground"
+    />
+    <OperationProgressModal
+      :state="modeOpState"
+      title="网络模式"
+      running-text="正在切换网络模式"
+      success-text="网络模式已切换"
+      hint="设备重新搜网需要一点时间"
+      fail-text="设备尚未完成切换，可稍后刷新查看"
+      :close="closeModeOp"
+      :to-background="noop"
     />
   </div>
 </template>
@@ -90,6 +120,7 @@ import { useInterval } from '@/composables/useRealtime';
 import { useNetworkControls } from '@/composables/useNetworkControls';
 import { useLazyModal } from '@/composables/useLazyModal';
 import { get } from '@/composables/utils';
+import { buildWifiConfigPayload } from '@/api/contract';
 import TrafficUsageCard from './components/cards/TrafficUsageCard.vue';
 import NetworkInfoCard from './components/cards/NetworkInfoCard.vue';
 import SystemStatusCard from './components/cards/SystemStatusCard.vue';
@@ -101,6 +132,8 @@ import TrafficLimitModal from './components/modals/TrafficLimitModal.vue';
 // 与网络页共用的弹窗（已从 views/network 提到 src/components/modals）
 import NetworkModeModal from '@/components/modals/NetworkModeModal.vue';
 import AclModal from '@/components/modals/AclModal.vue';
+// 2026-10-05 P3 修复：A 级操作（WiFi 开关 / 移动数据 / 飞行模式 / 制式切换）进度弹窗
+import OperationProgressModal from '@/components/common/OperationProgressModal.vue';
 // 频段锁定较重，按需加载；组件本体与显隐时序由 useLazyModal 管（见 bandModal）
 import type { WifiSettings } from '@/types';
 
@@ -127,8 +160,15 @@ const {
   refreshNetworkStatus,
   networkModes,
   selectedMode,
+  currentMode,
   modeLoading,
+  modeRefreshing,
+  refreshDeviceSettings,
+  modeLabel,
   applyNetworkMode,
+  // 「切换中 / 尚未完成」中间态：与网络页共用同一份 composable 状态
+  switchingMode,
+  modeSwitchTimedOut,
   roamingEnabled,
   connectionMode,
   mobileDataSaving,
@@ -137,6 +177,9 @@ const {
   wifiClients,
   wifiEnabled,
   toggleWifiEnabled,
+  // 2026-10-05 P3 修复：A 级操作确认器状态（WiFi 开关 / 移动数据 / 飞行模式）与制式切换进度态
+  wifiOp,
+  modeOpState,
   qrUrl,
   qrLoading,
   qrError,
@@ -161,49 +204,63 @@ const bandModal = useLazyModal(() => import('@/components/modals/BandLockModal.v
 const bandComponent = bandModal.component;
 const bandShow = bandModal.show;
 
+// 2026-10-05 P3 修复：制式切换进度弹窗的关闭/后台动作（状态位在 composable，这里只收敛）
+const closeModeOp = () => { modeOpState.value = { kind: 'idle' }; };
+const noop = () => {};
+const wifiModalRef = ref<InstanceType<typeof WifiModal> | null>(null);
+
 function applyModeAndClose() {
   applyNetworkMode().finally(() => {
     showModeModal.value = false;
   });
 }
 
-// ── WiFi 设置保存（逻辑保持原样：带 encryp_type / max_sta_num / chip_index 当前值，避免改 SSID 顺手改坏）──
+// ── WiFi 设置保存（报文统一由 contract.buildWifiConfigPayload 拼，规则见那里）──
 interface WifiSavePayload {
   enabled: boolean;
   ssid: string;
   password: string;
   auth_mode: string;
+  maxStaNum: number | null;
   broadcastHidden: boolean;
   cur: WifiSettings | null;
 }
 async function saveWifiEdit(payload: WifiSavePayload) {
+  // 2026-10-05 P3 修复：保存结果回传 WifiModal（notifySaved）——ok 才关窗，失败显示 core 具体原因
+  let ok = false;
+  let failText: string | undefined;
   try {
     const cur = payload.cur;
-    // core WifiRoutes.kt 读的是 passphrase（不是 password）；encryp_type / max_sta_num 不传时
-    // core 会把 EncrypType 硬写成 CCMP 且完全不下发 ApMaxStationNumber
-    // （GoformWifiClient.kt:108,121），所以带上设备当前值，别让改 SSID 顺手改掉这两项。
-    // chip_index 在写接口里是 "0"/"1"（chip1=2.4G → "0"，chip2=5G → "1"）
-    await api.post('/api/wifi/config', {
-      ssid: payload.ssid,
-      passphrase: payload.password,
-      auth_mode: payload.auth_mode,
-      encryp_type: cur?.encryp_type || undefined,
-      max_sta_num: cur?.max_sta_num || undefined,
-      chip_index: cur?.chip_index === '2' ? '1' : '0',
-      broadcast_disabled: payload.broadcastHidden ? 1 : 0,
-    });
+    // 报文里 passphrase 的 OPEN 特例、encryp_type 的配对/透传、broadcast_disabled 的方向
+    // 都在 buildWifiConfigPayload 里（与网络页的 WifiEditModal 共用同一份规则）。
+    // 频段不在这个表单里（本弹窗没有频段控件），换频段是 POST /api/wifi/band 的独立动作
+    await api.post(
+      '/api/wifi/config',
+      buildWifiConfigPayload({
+        ssid: payload.ssid,
+        authMode: payload.auth_mode,
+        passphrase: payload.password,
+        maxStaNum: payload.maxStaNum,
+        hidden: payload.broadcastHidden,
+        fallbackEncrypType: cur?.encryp_type,
+      })
+    );
     // 开关是独立接口，只有真的变了才下发，避免每次保存都重启一遍 WiFi 模块
     if (cur && payload.enabled !== cur.enabled) {
       await api.post('/api/wifi/enable', { enabled: payload.enabled });
     }
+    ok = true;
     message.success('WiFi 设置已保存');
-    showWifiModal.value = false;
-  } catch {
-    message.error('保存失败');
+  } catch (e: any) {
+    // 具体原因替代笼统文案：能拿到 core 的 error 就透出
+    failText = e?.response?.data?.error || e?.message || '保存失败';
   }
   // 设备写入到查询接口可见有延迟，立刻回读会拿回改动前的 SSID / 加密方式
   await settleDelay();
-  loadWifiSettings();
+  loadWifiSettings().then(() => {
+    // 回读落地后再通知弹窗关/留，避免窗口已关还显示 loading
+    wifiModalRef.value?.notifySaved(ok, failText);
+  });
   loadWifiClients();
   // WiFi 配置一改，按旧 SSID/密码生成的二维码就是错的：丢掉旧 blob 重新取一张
   releaseQrUrl();
@@ -213,6 +270,10 @@ async function saveWifiEdit(payload: WifiSavePayload) {
 // ── 流量限额保存 ──
 // goform 限额单位靠乘数表达：1=MB、1024=GB、1048576=TB
 interface TrafficSavePayload {
+  // 套餐模式（2026-10-07）：档案写入由 TrafficLimitModal 内直接 POST /api/device/plan，
+  // 父组件只负责设备侧 data-limit；planMode/plan 仅透传不使用
+  planMode?: 'monthly' | 'fixed';
+  plan?: { start_date: string; duration_days: number; notify_days: number } | null;
   enabled: boolean;
   limit_size: number;
   limit_unit: string;

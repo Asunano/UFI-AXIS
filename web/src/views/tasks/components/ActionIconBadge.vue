@@ -79,4 +79,8 @@ const px = computed(() => `${props.size}px`);
   background: var(--cat-neutral-bg);
   color: var(--cat-neutral-fg);
 }
+.action-speedtest {
+  background: var(--cat-cyan-bg, var(--cat-neutral-bg));
+  color: var(--cat-cyan-fg, var(--cat-neutral-fg));
+}
 </style>

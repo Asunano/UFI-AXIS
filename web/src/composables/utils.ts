@@ -176,17 +176,22 @@ export function networkTypeLabel(type: string): string {
  * 网络类型 + 当前注册频段，如 `5G n78` / `4G B3`。
  *
  * 频段直接读 `/api/network/signal`（及同源 WS signal 推送）的 **`band_label`** ——
- * 它是 core 派生的服务小区统一字段，前缀已经拼好（`"n78"` / `"B3"`）。
+ * 它是 core 派生的服务小区统一字段，前缀已经拼好（`"N78"` / `"B3"`，大写）。
  *
  * 2026-08-29 修：原来自己按 `networkTypeLabel(type)` 分制式，5G 取 `nr_band` 拼 `N`、
  * 否则取 `lte_band` 拼 `B`。两个问题：① 拼前缀的规则在 core 与 web 各有一份，会漂移
  * （core 用小写 `n`）；② NSA 双连接时 `network_type` 是 `"NSA"`，`networkTypeLabel` 不认，
  * 于是走进 LTE 分支贴上 4G 频段，而 core 的 `ServingCell.derive` 明确按字段存在性取 NR。
  * `band_label` 缺失（两侧都没值）就只显示制式，不编造。
+ *
+ * 2026-10-11 用户裁决：频段前缀在 **core 源头**就拼成大写（`N78` / `B3`），
+ * 所以这里**不需要**再 toUpperCase —— 源头改一次、app 与 web 两端自动都对，
+ * 不必各改一处、各出一个包。判据一侧不受影响：app `SignalInfo.isNr` 用
+ * `startsWith("n", ignoreCase = true)`，大小写不敏感。
  */
 export function networkTypeWithBand(type: string, signal?: Record<string, any> | null): string {
   const label = networkTypeLabel(type);
-  const band = signal?.band_label ? String(signal.band_label) : '';
+  const band = signal?.band_label ? String(signal.band_label).trim() : '';
   return band ? `${label} ${band}` : label;
 }
 
@@ -231,8 +236,25 @@ export function toApiErrorMessage(e: unknown, fallback = '操作失败'): string
  * navigator.clipboard 只在安全上下文（https / localhost）下存在，本面板通常通过
  * http://<局域网IP>:8088 访问，此时它是 undefined，直接调用会抛 TypeError。
  * 因此先做特性检测，失败再退回 textarea + execCommand('copy')。
+ *
+ * ## 为什么需要 `container`
+ * 兜底路径要先把一个临时 textarea 插进文档、`focus()` + `select()` 选中它，再让
+ * `execCommand('copy')` 抄走「当前选区」。**这一步会被焦点陷阱整段废掉**：
+ * naive-ui 的 `n-modal` / `n-drawer` 默认 `trap-focus`，内部 VFocusTrap 在 activate 时注册了
+ * `document.addEventListener('focus', handler, true)`（捕获阶段，见 vueuc 的 focus-trap/src/index.js）；
+ * 只要拿到焦点的元素不在弹窗那棵子树里，它立刻 `resetFocusTo('first')` 把焦点抢回弹窗首个可聚焦元素。
+ * textarea 默认插在 `document.body` 上 —— 而弹窗内容是 teleport 到 body 的**兄弟**节点，
+ * 所以每次都判定为"外面"：焦点与选区在同一拍内被夺走，`execCommand` 于是复制到空内容
+ * 或直接返回 false。表现就是"点了复制按钮没反应"（有时还会弹一句复制失败）。
+ *
+ * 所以在弹窗 / 抽屉这类有焦点陷阱的场景里，必须把 `container` 指到**弹窗自己的 DOM 子树**里的
+ * 任意元素上（给弹窗内容挂个 ref 即可），让陷阱的 `mainEl.contains(target)` 判定为"里面"从而放行。
+ * 普通页面不传，行为与从前完全一致（仍然插在 `document.body`）。
+ *
+ * @param text 要复制的文本
+ * @param container 临时 textarea 的挂载容器；缺省为 `document.body`
  */
-export async function copyToClipboard(text: string): Promise<boolean> {
+export async function copyToClipboard(text: string, container?: HTMLElement | null): Promise<boolean> {
   if (navigator.clipboard?.writeText) {
     try {
       await navigator.clipboard.writeText(text);
@@ -241,6 +263,9 @@ export async function copyToClipboard(text: string): Promise<boolean> {
       /* 权限被拒或 WebView 限制，继续走兜底方案 */
     }
   }
+  const host = container ?? document.body;
+  // 复制完把焦点还回原处：textarea 被移除后焦点会掉到 body，键盘用户的 Tab 序列要从头开始
+  const prevActive = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   try {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -249,11 +274,16 @@ export async function copyToClipboard(text: string): Promise<boolean> {
     ta.style.position = 'fixed';
     ta.style.top = '-9999px';
     ta.style.opacity = '0';
-    document.body.appendChild(ta);
+    host.appendChild(ta);
+    // 必须显式 focus()：select() 在部分浏览器里不保证把焦点移过来，没有焦点的选区不是
+    // document 的当前选区，execCommand('copy') 会抄到空。preventScroll 是因为这个 textarea
+    // 定位在 top:-9999px，默认的 focus 会把页面滚上去。
+    ta.focus({ preventScroll: true });
     ta.select();
     ta.setSelectionRange(0, text.length);
     const ok = document.execCommand('copy');
-    document.body.removeChild(ta);
+    ta.remove();
+    prevActive?.focus({ preventScroll: true });
     return ok;
   } catch {
     return false;

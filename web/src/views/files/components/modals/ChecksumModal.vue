@@ -1,5 +1,11 @@
 <template>
-  <n-modal :show="show" preset="card" title="文件校验和" style="width: 460px" @update:show="emit('update:show', $event)">
+  <n-modal
+    :show="show"
+    preset="card"
+    title="文件校验和"
+    style="width: 460px"
+    @update:show="emit('update:show', $event)"
+  >
     <div v-if="result" class="cs-grid">
       <InfoRow label="文件" :value="result.path" />
       <div v-for="(hash, algo) in result.algorithms" :key="algo" class="cs-row">

@@ -158,7 +158,10 @@ withDefaults(
     justify-content: flex-end;
   }
   .channel-fact-value {
-    max-width: 60vw;
+    /* 60vw 是视口相对量，与实际容器无关 —— 在被嵌进 sub-panel（可用 ~274px）时
+       60vw=216px + 标签 52px + gap 6 = 274px，刚好贴住边界。
+       改成 100% 让它跟容器走，由 `text-overflow: ellipsis`（基础样式已有）兜底。 */
+    max-width: 100%;
   }
 }
 </style>

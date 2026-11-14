@@ -122,7 +122,11 @@
     >
       <n-form label-placement="left" label-width="80">
         <n-form-item label="APK地址" required>
-          <n-input v-model:value="installUrl" placeholder="http(s):// 下载地址" />
+          <n-input v-model:value="installUrl" placeholder="https:// 下载地址" />
+        </n-form-item>
+        <n-form-item label="SHA-256" required>
+          <!-- P0-2（2026-10-05）：APK 内容哈希必填，缺失/不匹配 core 拒绝安装 -->
+          <n-input v-model:value="installSha256" placeholder="APK 文件的 SHA-256（64 位十六进制）" />
         </n-form-item>
       </n-form>
     </n-modal>
@@ -191,6 +195,8 @@ const showInstallApk = ref(false);
 const showInstallUrl = ref(false);
 const installPath = ref('');
 const installUrl = ref('');
+// P0-2（2026-10-05）：SHA-256 必填，防任意 APK 静默安装
+const installSha256 = ref('');
 const installing = ref(false);
 
 // ── 权限管理 ──
@@ -265,11 +271,18 @@ async function installFromUrl() {
     message.error('请输入APK下载地址');
     return false;
   }
+  // P0-2（2026-10-05）：sha256 必填，core 端同样强校验
+  const sha = installSha256.value.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(sha)) {
+    message.error('请输入 64 位十六进制 SHA-256');
+    return false;
+  }
   installing.value = true;
   try {
-    const { data } = await api.post('/api/apps/install-url', { url: installUrl.value.trim() });
+    const { data } = await api.post('/api/apps/install-url', { url: installUrl.value.trim(), sha256: sha });
     message.success(data.message || '安装请求已提交');
     installUrl.value = '';
+    installSha256.value = '';
     loadApps();
     return true;
   } catch (e: any) {

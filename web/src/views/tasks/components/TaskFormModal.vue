@@ -498,6 +498,30 @@ function prefillFromPreset(p: Record<string, any>) {
   form.name = p.label;
 }
 
+/**
+ * 规则模板预填（2026-10-05）：触发+动作按模板带默认值，名称取模板 label，
+ * 用户只需微调阈值。thresholdBytes 换算回表单的 MB 粒度（手工创建同一单位）。
+ */
+function prefillFromRuleTemplate(t: Record<string, any>) {
+  editingId.value = null;
+  resetForm('rule');
+  form.name = t.label || '';
+  form.triggerType = t.triggerType;
+  const tp = t.triggerParams || {};
+  if (tp.thresholdBytes != null) form.thresholdMb = Math.round(Number(tp.thresholdBytes) / 1024 / 1024);
+  if (tp.targetType != null) form.targetType = String(tp.targetType);
+  if (tp.rsrp != null) form.rsrp = Number(tp.rsrp);
+  if (tp.levelPercent != null) form.levelPercent = Number(tp.levelPercent);
+  form.actionType = t.actionType;
+  const params = t.params || {};
+  // 目标状态只看 params.enabled；network_mode/performance_mode 走各自的 mode 字段
+  if (toggleActions.includes(form.actionType)) form.enabled = params.enabled ?? false;
+  if (form.actionType === 'network_mode') form.mode = params.mode || NetworkMode.LTE_AND_5G;
+  if (form.actionType === 'performance_mode') form.perfMode = Number(params.mode ?? 0);
+  // 模板自带更合理的冷却（如断网重启 10 分钟），没有就保持默认 60s
+  if (t.cooldownSec != null) form.cooldownSec = Number(t.cooldownSec);
+}
+
 // 弹窗提交：仅做校验 + 构造请求体，真正的接口写入留在父组件（onTaskFormSubmit），
 // 与 4.1/4.2 受控子组件范式一致。返回 false 阻止 n-modal 在接口完成前自行关闭。
 function onPositiveClick() {
@@ -570,7 +594,8 @@ watch(
       if (props.kind === 'task') prefillFromTask(props.editing);
       else prefillFromRule(props.editing);
     } else if (props.preset) {
-      prefillFromPreset(props.preset);
+      if (props.kind === 'rule') prefillFromRuleTemplate(props.preset);
+      else prefillFromPreset(props.preset);
     } else {
       resetForm(props.kind);
     }

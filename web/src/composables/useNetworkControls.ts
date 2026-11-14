@@ -32,7 +32,7 @@
  *
  * 本文件不碰任何布局，也不 import 任何组件：调用方自己决定用什么控件、放在哪张卡。
  */
-import { ref, computed } from 'vue';
+import { ref, computed, onScopeDispose } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useDashboardStore } from '@/stores/dashboard';
 import { useCancellableApi } from '@/composables/useCancellableApi';
@@ -40,16 +40,22 @@ import { normalizeWifiSettings, normalizeWifiClients } from '@/composables/utils
 import {
   NetworkMode,
   NetworkModeOptions,
-  BearerToNetworkMode,
+  bearerToNetworkMode,
   NetworkModeSwitchProbe,
+  modeProbeIntervalMs,
   shouldKeepProbingMode,
+  wifiBandFromChipIndex,
 } from '@/api/contract';
+// 2026-10-05 P3 修复：A 级操作（WiFi 总开关 / 移动数据 / 飞行模式）接入确认器；
+// 制式切换只挂状态位换 UI 壳（保留原 runWrite+probe 逻辑与 toast）
+import { useApiOperation } from '@/composables/useApiOperation';
+import type { OperationDialogState } from '@/composables/useApiOperation';
 import type { WifiSettings, WifiClient, WifiAcl } from '@/types';
 
 /** 设备 goform 写入到查询接口可见的延迟补偿。见文件头约定 1。 */
 const SETTLE_MS = 600;
 /** ppp 相关状态（移动数据 / 飞行模式）落盘后要更久才反映出来。见约定 2。 */
-const PPP_SETTLE_MS = 2_000;
+// 2026-10-05 P3 修复：这两类操作改走确认器轮询回读，固定 2s 延迟补偿不再需要
 /** 拨号动作最慢，给 3s。 */
 const DIAL_SETTLE_MS = 3_000;
 
@@ -93,6 +99,22 @@ export function useNetworkControls() {
   const message = useMessage();
   const api = useCancellableApi();
   const dashboardStore = useDashboardStore();
+
+  /**
+   * 作用域已销毁（组件卸载 / 路由切走）。
+   *
+   * 卸载后 useCancellableApi 让每个请求都 resolve 成「无结果」，回读一律判成「没到达」——
+   * 轮询会一直跑到预算用尽，最后还在别的页面上弹一条误导的提示。所以带 await 的循环与
+   * 所有 toast 之前都要看这个标志。
+   */
+  let disposed = false;
+  /** detached 回读的 timer 句柄：卸载后这次回读没有意义，dispose 里统一清掉。 */
+  const detachedTimers = new Set<ReturnType<typeof setTimeout>>();
+  onScopeDispose(() => {
+    disposed = true;
+    for (const t of detachedTimers) clearTimeout(t);
+    detachedTimers.clear();
+  });
 
   /** 写操作统一外壳：toast、loading、信封失败判定、回读节奏都只在这里实现一次。 */
   async function runWrite<T>(opts: RunWriteOptions<T>): Promise<boolean> {
@@ -141,7 +163,12 @@ export function useNetworkControls() {
     if (after?.reload && (succeeded || after.always)) {
       const wait = after.delayMs ?? SETTLE_MS;
       if (after.detached) {
-        setTimeout(() => after.reload?.(), wait);
+        // 句柄登记进 detachedTimers：不登记的话卸载后这个 setTimeout 仍会醒来回读
+        const timer = setTimeout(() => {
+          detachedTimers.delete(timer);
+          after.reload?.();
+        }, wait);
+        detachedTimers.add(timer);
       } else {
         await new Promise((r) => setTimeout(r, wait));
         after.reload();
@@ -159,11 +186,41 @@ export function useNetworkControls() {
    * 提交的一定是别名，core 负责映射成 BearerPreference。
    */
   const networkModes = NetworkModeOptions;
+
+  /**
+   * **设备当前真实档位**（别名）。空串 = 还没读到。
+   *
+   * 与 [selectedMode] 是两个语义不同的值，2026-09-19 拆开：
+   * 原来只有一个 `selectedMode`，而弹窗用 `v-model` 直接改它 —— 于是用户在弹窗里点一下
+   * （还没应用、甚至点了取消），"更多设置"卡上的制式标签就跟着变了，显示的是一个
+   * 设备上并不成立的档位。标签一律读这个，弹窗的待选项读 [selectedMode]。
+   */
+  const currentMode = ref('');
+  /**
+   * 设备当前档位的中文名，**取 core 下发的 `network_mode_label`**。
+   *
+   * core 的 `NetworkMode.LABELS` 是全仓唯一文案真源（`GET /api/device/settings` 会注入
+   * 这个 key）。老固件的 core 不回它时回落到本地 [networkModes] 查表。
+   */
+  const currentModeLabel = ref('');
+
+  /** 用户在弹窗里正要应用的档位。初值等设备读回来后由 [loadDeviceSettings] 同步。 */
   const selectedMode = ref<string>(NetworkMode.AUTO);
   const modeLoading = ref(false);
-  const modeLabel = computed(
-    () => networkModes.find((m) => m.value === selectedMode.value)?.label || selectedMode.value
-  );
+  /** 只为弹窗的「重新读取」按钮转圈 */
+  const modeRefreshing = ref(false);
+
+  /**
+   * 制式标签（"更多设置"卡上那一行）。**读设备真值，不读待选项** —— 见 [currentMode] 的注释。
+   *
+   * 优先用 core 给的中文名；没有时按别名查本地表；两者都没有才显示原始值。
+   */
+  const modeLabel = computed(() => {
+    if (currentModeLabel.value) return currentModeLabel.value;
+    const alias = currentMode.value;
+    if (!alias) return '--';
+    return networkModes.find((m) => m.value === alias)?.label || alias;
+  });
 
   /**
    * 正在切换中的**目标**制式；null = 没有进行中的切换。
@@ -174,6 +231,11 @@ export function useNetworkControls() {
   const switchingMode = ref<string | null>(null);
   /** 上一次切换在 `NetworkModeSwitchProbe` 的预算内没等到设备报出目标档位。 */
   const modeSwitchTimedOut = ref(false);
+  /**
+   * 2026-10-05 P3 修复：制式切换的进度弹窗状态位。逻辑仍走 runWrite + probeNetworkMode，
+   * 只把 UI 壳从「弹窗内文案」换成统一进度弹窗（仅状态位，不接管 toast，E-8）。
+   */
+  const modeOpState = ref<OperationDialogState>({ kind: 'idle' });
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -195,8 +257,8 @@ export function useNetworkControls() {
 
   /**
    * 一次请求把 /api/device/settings 里用到的字段全取出来。
-   * 注意：网络模式/漫游在这个端点（BearerPreference / roam_setting_option / connection_mode），
-   * 而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
+   * 注意：网络模式/漫游在这个端点（net_select / BearerPreference / roam_setting_option /
+   * connection_mode），而不是 /api/device/info（后者只有 brand/model/android_version 等静态字段）。
    *
    * @returns 这次读到的网络制式别名（读失败返回 null），供切换回读确认比对目标档位。
    */
@@ -204,25 +266,38 @@ export function useNetworkControls() {
     try {
       const res = await api.get('/api/device/settings');
       // 请求被取消（组件卸载 / 路由切走）时 useCancellableApi resolve 成 { __canceled: true }，
-      // data 为 undefined。不显式识别的话 BearerPreference 会被读成 ''、回读值塌成 'AUTO'：
+      // data 为 undefined。不显式识别的话制式会被读成 ''、回读值塌成 'AUTO'：
       // 既会把选中项刷成"自动"，也会让切换回读把"没读到"误判成"已经到目标档位"。
       if ((res as { __canceled?: boolean })?.__canceled === true) return null;
       const data = res.data;
       if (data == null) return null;
-      const raw = String(data?.BearerPreference ?? '');
-      // 未知取值不静默显示成「自动」，直接透出原始值，避免误导
-      const readback = BearerToNetworkMode[raw] || raw || 'AUTO';
-      // 切换期间**不许**用回读值覆盖选中项：设备重新注册时报的还是旧档位，
-      // 覆盖就会把界面弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
-      if (switchingMode.value === null) selectedMode.value = readback;
+      // 制式回读**以 net_select 为准**，BearerPreference 只作回落 —— 与 app
+      // （DeviceSettingsResponse.networkMode）同一口径。原来只读 BearerPreference：
+      // 真机切换后变的是 net_select，而 BearerPreference 缺失时这里会塌成 'AUTO'，
+      // 于是 app 显示新档位、web 恒显示「5G/4G/3G」，回读确认也永远判超时。
+      const raw = String(data?.net_select || data?.BearerPreference || '');
+      // 未知取值不静默显示成「自动」，直接透出原始值，避免误导；空值也不当成 AUTO。
+      const readback = bearerToNetworkMode(raw);
+      if (readback) {
+        // 设备真值一律更新（**不受切换闸门影响**）：标签读的是它，而切换期间也该能看到
+        // 设备还停在旧档位这个事实。
+        currentMode.value = readback;
+        // 中文名优先用 core 注入的 network_mode_label（唯一文案真源）；老固件没有这个 key
+        // 时清空，由 modeLabel 回落到本地查表。
+        currentModeLabel.value = String(data?.network_mode_label || '');
+      }
+      // 待选项在切换期间**不许**被回读值覆盖：设备重新注册时报的还是旧档位，
+      // 覆盖就会把弹窗里的选择弹回切换前的档位（这正是用户看到的"界面仍显示仅 5G"）。
+      if (switchingMode.value === null && readback) selectedMode.value = readback;
       const roam = String(data?.roam_setting_option ?? data?.dial_roam_setting_option ?? '');
       roamingEnabled.value = roam === 'on' || roam === '1';
       const mode = String(data?.connection_mode ?? '').toLowerCase();
-      connectionMode.value = ['manual', '1', 'hand'].includes(mode) ? 'manual' : 'auto';
+      connectionMode.value = ['manual', 'manual_dial', '1', 'hand'].includes(mode) ? 'manual' : 'auto';
       if (data?.sleep_sysIdleTimeToSleep != null) {
         sleepTime.value = Number(data.sleep_sysIdleTimeToSleep) || 0;
       }
-      return readback;
+      // 读到空串时返回 null（= 没读到），不要让回读确认把它当成一个档位去比对
+      return readback || null;
     } catch {
       /* 保持默认 */
       return null;
@@ -236,6 +311,23 @@ export function useNetworkControls() {
       await loadDeviceSettings();
     } finally {
       sleepLoading.value = false;
+    }
+  }
+
+  /**
+   * 给「网络模式」弹窗的手动重新读取（带自己的 loading）。
+   *
+   * 注意它**绕不过设备端的读缓存**：`GET /api/device/settings` 在 core 侧的 TTL 是 5 分钟
+   * （`CacheTTL.DEVICE_SETTINGS`），且只在 core 自己写入后才失效。从手机端或设备自带面板
+   * 改过档位时，这里点几次也仍会拿到同一份快照 —— 弹窗里那句提示就是为了把这件事说清楚，
+   * 而不是让用户以为按钮没生效。
+   */
+  async function refreshDeviceSettings() {
+    modeRefreshing.value = true;
+    try {
+      await loadDeviceSettings();
+    } finally {
+      modeRefreshing.value = false;
     }
   }
 
@@ -261,20 +353,41 @@ export function useNetworkControls() {
   const roamingSaving = ref(false);
   const connModeSaving = ref(false);
 
+  // 2026-10-05 P3 修复：移动数据接成 A 级——verify 判 ppp 连接态与目标一致（E-13：关数据轮询全失败时 connected 判 false 即命中）
   const setMobileData = (enabled: boolean) =>
-    runWrite({
-      setBusy: (on) => (mobileDataSaving.value = on),
-      request: () => api.post('/api/network/data', { enabled }),
-      ok: enabled ? '移动数据已开启' : '移动数据已关闭',
-      after: { delayMs: PPP_SETTLE_MS, reload: refreshNetworkStatus, detached: true },
+    wifiOp.run({
+      title: '移动数据',
+      running: enabled ? '正在开启移动数据' : '正在关闭移动数据',
+      success: enabled ? '移动数据已开启' : '移动数据已关闭',
+      hint: '拨号状态更新需要几秒钟',
+      submit: () => api.post('/api/network/data', { enabled }),
+      verify: async () => {
+        // /api/network/status 的连接态真源是 ppp_status（非空且非 disconnected），
+        // 不是不存在的顶层 connected 字段——类型见 web/src/types 的 NetworkStatus
+        const { data } = await api.get('/api/network/status');
+        const ppp = String((data as any)?.ppp_status ?? '');
+        const connected = !!ppp && !/disconnect/i.test(ppp);
+        return connected === enabled;
+      },
+      onApplied: () => refreshNetworkStatus(),
     });
 
   /** core /api/network/airplane 只有写、没有读，所以调用方要用两个明确动作而不是一个开关 */
+  // 2026-10-05 P3 修复：飞行模式同构接成 A 级（开启=断网；关闭=等重新连上）
   const setAirplane = (enabled: boolean) =>
-    runWrite({
-      request: () => api.post('/api/network/airplane', { enabled }),
-      ok: enabled ? '飞行模式已开启' : '飞行模式已关闭',
-      after: { delayMs: PPP_SETTLE_MS, reload: refreshNetworkStatus, detached: true },
+    wifiOp.run({
+      title: '飞行模式',
+      running: enabled ? '正在开启飞行模式' : '正在关闭飞行模式',
+      success: enabled ? '飞行模式已开启' : '飞行模式已关闭',
+      hint: '拨号状态更新需要几秒钟',
+      submit: () => api.post('/api/network/airplane', { enabled }),
+      verify: async () => {
+        const { data } = await api.get('/api/network/status');
+        const ppp = String((data as any)?.ppp_status ?? '');
+        const connected = !!ppp && !/disconnect/i.test(ppp);
+        return connected === !enabled;
+      },
+      onApplied: () => refreshNetworkStatus(),
     });
 
   const setRoaming = (enabled: boolean) =>
@@ -340,6 +453,8 @@ export function useNetworkControls() {
       await loadDeviceSettings();
       return false;
     }
+    // 2026-10-05 P3 修复：换 UI 壳——下发受理后驱动统一进度弹窗（状态位保留，NetworkModeModal 仍在消费）
+    modeOpState.value = { kind: 'running' };
     return await probeNetworkMode(target);
   };
 
@@ -355,15 +470,30 @@ export function useNetworkControls() {
     let attempt = 0;
     let reached = false;
     for (;;) {
+      // 卸载后回读恒返回 null（= 判成没到达），再轮下去只是把预算跑满
+      if (disposed) return false;
       attempt += 1;
       reached = (await loadDeviceSettings()) === target;
       if (!shouldKeepProbingMode(attempt, reached)) break;
-      await sleep(NetworkModeSwitchProbe.intervalMs);
+      await sleep(modeProbeIntervalMs(attempt));
     }
     switchingMode.value = null;
     modeSwitchTimedOut.value = !reached;
     // 闸门放开后补一次回读，让选中项与设备一致：成功时等于 target，超时时回到设备当前值
     await loadDeviceSettings();
+    // 2026-10-05 P3 修复：回读结束把进度弹窗状态位收敛（成功对勾停留 300ms 后自动关，超时进失败态）
+    if (reached) {
+      modeOpState.value = { kind: 'success' };
+      await sleep(300);
+      modeOpState.value = { kind: 'idle' };
+    } else {
+      modeOpState.value = { kind: 'failed' };
+    }
+    // 组件已经不在了：这条 toast 会弹在用户当前所在的页面上，纯误导
+    if (disposed) {
+      modeOpState.value = { kind: 'idle' };
+      return reached;
+    }
     if (reached) message.success('网络模式已切换');
     else message.warning('设备尚未完成切换，可稍后刷新查看');
     return reached;
@@ -416,13 +546,28 @@ export function useNetworkControls() {
     }
   }
 
+  // 2026-10-05 P3 修复：A 级操作共享确认器（WiFi 开关 / 移动数据 / 飞行模式）；
+  // 进度弹窗挂在本 composable 的两个消费方根组件（NetworkView / DashboardView）各一份
+  const wifiOp = useApiOperation();
+
+  // 2026-10-05 P3 修复：WiFi 总开关接成 A 级——模块重启级操作，回读命中前不给成功反馈
   const toggleWifiEnabled = (enabled: boolean) =>
-    runWrite({
-      request: () => api.post('/api/wifi/enable', { enabled }),
-      ok: enabled ? 'WiFi 已开启' : 'WiFi 已关闭',
-      onOk: () => (wifiEnabled.value = enabled),
-      // WiFi 模块开关在设备上要过一会儿才反映到查询接口，立刻回读会把开关刷回原样
-      after: { reload: loadWifiSettings, always: true },
+    wifiOp.run({
+      title: 'WiFi 开关',
+      running: '正在切换 WiFi',
+      success: enabled ? 'WiFi 已开启' : 'WiFi 已关闭',
+      hint: 'WiFi 模块重启期间已连接设备会短暂掉线',
+      submit: () => api.post('/api/wifi/enable', { enabled }),
+      verify: async () => {
+        // 复用 loadWifiSettings 的回读端点，但只关心 enabled 一位
+        const { data } = await api.get('/api/wifi/settings');
+        return normalizeWifiSettings(data).enabled === enabled;
+      },
+      onApplied: () => {
+        loadWifiSettings();
+        loadWifiClients();
+        wifiEnabled.value = enabled;
+      },
     });
 
   /**
@@ -459,7 +604,7 @@ export function useNetworkControls() {
     qrError.value = '';
     qrLoading.value = true;
     try {
-      const chip = wifiSettings.value?.chip_index === '2' ? 'chip2' : 'chip1';
+      const chip = wifiBandFromChipIndex(wifiSettings.value?.chip_index);
       const { data } = await api.get('/api/wifi/qrcode', {
         params: { chip, ssid_index: 1 },
         responseType: 'blob',
@@ -543,12 +688,19 @@ export function useNetworkControls() {
     // 网络模式
     networkModes,
     selectedMode,
+    // 设备真值 + core 给的中文名：制式标签一律读这两个，不读 selectedMode
+    currentMode,
+    currentModeLabel,
     modeLoading,
+    modeRefreshing,
+    refreshDeviceSettings,
     modeLabel,
     applyNetworkMode,
     // 「切换中」中间态：调用方据此显示"正在切换 / 尚未完成"，不要自己去猜回读值
     switchingMode,
     modeSwitchTimedOut,
+    // 2026-10-05 P3 修复：制式切换进度弹窗状态位（消费方根组件挂 OperationProgressModal）
+    modeOpState,
 
     // 连接
     roamingEnabled,
@@ -570,6 +722,8 @@ export function useNetworkControls() {
     wifiLoading,
     wifiEnabled,
     toggleWifiEnabled,
+    // 2026-10-05 P3 修复：A 级操作确认器状态（消费方根组件据此挂 OperationProgressModal）
+    wifiOp,
     onWifiSaved,
     sleepTime,
     sleepLoading,

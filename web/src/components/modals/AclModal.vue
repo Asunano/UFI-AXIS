@@ -107,4 +107,27 @@ const show = computed({
   font-size: 13px;
   color: var(--text-muted);
 }
+
+@media (max-width: 768px) {
+  /* 弹窗内可用仅 ~280px：固定 56px 操作列 + 2×12px 间距 = 80px，
+     剩 200px 按 1:1.3 分 ⇒ 名称 87px、MAC 113px。
+     而 MAC 是 17 个等宽字符 ≈117px > 113px ⇒ 渲染成 `AA:BB:CC:DD:E…`。
+     MAC 正是这一行的主键（名称常常只是「未知设备」），截掉就没法确认要解除哪一台。
+     改成两行栅格：第一行「名称 + 操作」，第二行 MAC 整宽。 */
+  .acl-row {
+    grid-template-columns: minmax(0, 1fr) 56px;
+    gap: 2px 12px;
+  }
+  .lan-mac {
+    /* 第二行整宽，不再需要省略号 */
+    grid-column: 1 / -1;
+    white-space: normal;
+    word-break: break-all;
+  }
+  .lan-act {
+    /* 操作按钮留在第一行右侧，与名称同行 */
+    grid-row: 1;
+    grid-column: 2;
+  }
+}
 </style>

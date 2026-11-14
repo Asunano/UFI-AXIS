@@ -182,7 +182,7 @@ async function loadGoform() {
   background: var(--page-bg);
   padding: 12px;
   border-radius: 8px;
-  max-height: 500px;
+  max-height: min(500px, 56vh);
   overflow-y: auto;
   line-height: 1.5;
 }

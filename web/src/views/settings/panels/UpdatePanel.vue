@@ -158,6 +158,7 @@ import { useCancellableApi } from '@/composables/useCancellableApi';
 import GridCard from '@/components/GridCard.vue';
 import InfoRow from '@/components/InfoRow.vue';
 import { formatBytes } from '@/composables/utils';
+import { readByteLimit, uploadSizeError } from '@/composables/uploadLimit';
 import { Endpoints } from '@/api/contract';
 import { useUpdateStore, BACKEND_BUSY_STATES, type BackendUpdateInfo } from '@/stores/update';
 
@@ -175,6 +176,13 @@ const webVersion = reactive({
   hasBackup: false,
 });
 const webUploading = ref(false);
+/** 前端 ZIP 上传的本地进度（浏览器 → core）。ZIP 通常 1-5MB，但设备 Wi-Fi 下仍要几秒 */
+const webUploadPercent = ref(0);
+/**
+ * 前端 ZIP 上传上限（`/api/web/status` 的 `max_upload_bytes`，core 侧 50MB）。
+ * 0 = 还没读到，此时放行交给服务端拦。
+ */
+const webMaxUploadBytes = ref(0);
 const fileInputRef = ref<HTMLInputElement | null>(null);
 
 // ── Web 自动更新（从 root version.json 的 `web` 对象自拉取）──
@@ -289,12 +297,29 @@ async function handleFileSelect(e: Event) {
   const file = input.files?.[0];
   if (!file) return;
   input.value = ''; // reset so same file can be re-selected
+
+  // 选文件时就挡住超限：413 虽然在服务端 onCall 阶段就抛，但浏览器要把整个 body
+  // 推完才会去读那个响应，不预检就是白烧一遍上行带宽（详见 composables/uploadLimit.ts）
+  const tooBig = uploadSizeError(file, webMaxUploadBytes.value);
+  if (tooBig) {
+    message.warning(tooBig);
+    return;
+  }
+
   webUploading.value = true;
+  webUploadPercent.value = 0;
   try {
     const formData = new FormData();
     formData.append('file', file);
     const { data } = await api.post('/api/web/update', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      // 没有进度时只有一个转圈按钮，用户分不清"在传"和"卡死了"。
+      // e.total 在个别浏览器/代理下缺失，回落到 file.size（与 APK 上传同一处理）。
+      onUploadProgress: (ev: { loaded: number; total?: number }) => {
+        const total = ev.total || file.size;
+        if (!total) return;
+        webUploadPercent.value = Math.floor((Math.min(ev.loaded, total) / total) * 100);
+      },
     });
     if (data.success) {
       message.success('前端已更新，即将刷新页面…');
@@ -308,6 +333,7 @@ async function handleFileSelect(e: Event) {
     message.error(err?.response?.data?.error || '上传失败');
   } finally {
     webUploading.value = false;
+    webUploadPercent.value = 0;
   }
 }
 
@@ -524,6 +550,16 @@ async function handleApkSelect(e: Event) {
   const file = input.files?.[0];
   if (!file) return;
   input.value = '';
+
+  // 选文件时就挡住超限。这一条对 APK 尤其要紧：上限是 core 按清单 apkSize 动态算的
+  // （`upload_limit_bytes`），用户拿一个更大的包来传，不预检就会把几十 MB 白传一遍
+  // 才看到 413（浏览器要等 body 推完才读响应，详见 composables/uploadLimit.ts）
+  const tooBig = uploadSizeError(file, backendStatus.value.uploadLimitBytes);
+  if (tooBig) {
+    message.warning(tooBig);
+    return;
+  }
+
   apkUploading.value = true;
   apkUploadPercent.value = 0;
   apkUploadLabel.value = `准备上传 ${file.name}（${formatBytes(file.size)}）`;
@@ -649,8 +685,18 @@ watch(
 
 onMounted(() => {
   loadWebVersion();
+  // 前端 ZIP 的上传上限只在 /api/web/status 里；该端点无副作用，拉一次即可
+  api
+    .get('/api/web/status')
+    .then(({ data }) => {
+      webMaxUploadBytes.value = readByteLimit(data, 'max_upload_bytes');
+    })
+    .catch(() => {
+      /* 老 core 不回这个字段，预检退化为放行、交给服务端拦 */
+    });
   // resume：拉一次 /api/update/status，**若 core 仍处忙态就自动续上轮询**
   // —— 刷新页面 / 切走再回来后进度继续走，而不是冻在原地。
+  // 顺带把 APK 上传上限（upload_limit_bytes）读进 store。
   updateStore.resume();
   loadAppApkInfo();
 });

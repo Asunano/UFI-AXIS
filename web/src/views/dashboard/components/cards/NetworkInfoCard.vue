@@ -32,10 +32,11 @@
         <span class="stat-label">数据漫游</span>
         <span class="stat-value">{{ roamingEnabled ? '开启' : '关闭' }}</span>
       </div>
-      <div class="stat-cell">
-        <span class="stat-label">连接模式</span>
-        <span class="stat-value">{{ connectionMode === 'auto' ? '自动拨号' : '手动拨号' }}</span>
-      </div>
+      <!--
+        2026-10-10 用户裁决：删掉「连接模式」这一格（自动拨号 / 手动拨号）。
+        **只删显示**：`connectionMode` prop 与 `update:connection-mode` 事件、以及
+        composable 里的下发逻辑全部保留 —— 设备侧 `dial_mode` 配置不动（用户裁决 A）。
+      -->
     </div>
   </GridCard>
 </template>
