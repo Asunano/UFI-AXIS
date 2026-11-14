@@ -35,7 +35,10 @@ class AdbCommandException(
 ) : AdbException(message)
 
 /** 对端关闭了连接 */
-class AdbConnectionClosedException(message: String = "ADB 连接已被设备关闭") : AdbException(message)
+class AdbConnectionClosedException(
+    message: String = "ADB 连接已被设备关闭",
+    cause: Throwable? = null
+) : AdbException(message, cause)
 
 /** 协议数据异常 */
 class AdbProtocolException(message: String) : AdbException(message)

@@ -2,7 +2,6 @@ package com.ufi_axis.adbcore
 
 import java.io.File
 import java.io.FileInputStream
-import java.io.OutputStream
 
 /**
  * SYNC 子协议：把本地文件推送到设备。
@@ -154,7 +153,4 @@ object AdbSync {
             // AdbStream.write 内部已 flush 到底层 socket
         }
     }
-
-    @Suppress("unused")
-    private fun unusedOutputStream(): OutputStream? = null
 }

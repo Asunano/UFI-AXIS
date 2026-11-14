@@ -1,12 +1,19 @@
 package com.ufi_axis.adbcore
 
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 
 /** shell 命令执行结果 */
 data class ShellResult(
     val stdout: String,
     val stderr: String,
-    val exitCode: Int
+    val exitCode: Int,
+    /**
+     * exit code 是否可信。
+     * shell v1 通道拿不到 exit code（只有 stdout 一条字节流），此时为 false，
+     * 调用方必须改用输出文本判断成败，否则会把失败的命令当成成功。
+     */
+    val exitCodeKnown: Boolean = true
 ) {
     val isSuccess: Boolean get() = exitCode == 0
 
@@ -84,26 +91,31 @@ object AdbShell {
      * [id:1=CLOSE_STDIN][length:4=0][]  // 通知对端 EOF
      * ```
      *
-     * @param stdin    喂给命令 stdin 的完整字节（如 APK 内容）
+     * stdin 走**流式**读取，不把整包读进内存（几十 MB 的 APK 在低内存设备上会 OOM）。
+     *
+     * @param stdin     喂给命令 stdin 的数据源（调用方负责关闭）
+     * @param stdinSize 数据总长度，仅用于进度回调
      * @param onStdinProgress 每写出一片 stdin 后的进度回调（已写字节 / 总字节）
      */
     fun execWithStdin(
         connection: AdbConnection,
         command: String,
-        stdin: ByteArray,
+        stdin: InputStream,
+        stdinSize: Long,
         timeoutMs: Long = AdbStream.INSTALL_TIMEOUT_MS,
         onStdinProgress: ((sent: Long, total: Long) -> Unit)? = null
     ): ShellResult {
         val stream = connection.openStream("shell,v2,raw:$command")
         try {
-            val total = stdin.size.toLong()
             // 1) 把 stdin 分片写入
-            var off = 0
-            while (off < stdin.size) {
-                val chunk = minOf(stdin.size - off, MAX_V2_PAYLOAD)
-                stream.write(buildV2Frame(ID_STDIN, stdin.copyOfRange(off, off + chunk)))
-                off += chunk
-                onStdinProgress?.invoke(off.toLong(), total)
+            val buf = ByteArray(STDIN_CHUNK)
+            var sent = 0L
+            while (true) {
+                val n = stdin.read(buf)
+                if (n <= 0) break
+                stream.write(buildV2Frame(ID_STDIN, buf.copyOfRange(0, n)))
+                sent += n
+                onStdinProgress?.invoke(sent, stdinSize)
             }
             // 2) 关闭 stdin，通知对端 APK 已发送完毕
             stream.write(buildV2Frame(ID_CLOSE_STDIN, AdbProtocol.EMPTY))
@@ -145,7 +157,8 @@ object AdbShell {
             return ShellResult(
                 stdout = stdout.toString(Charsets.UTF_8.name()),
                 stderr = stderr.toString(Charsets.UTF_8.name()),
-                exitCode = if (sawExit) exitCode else 0
+                exitCode = if (sawExit) exitCode else 0,
+                exitCodeKnown = sawExit
             )
         } finally {
             stream.close()
@@ -208,7 +221,8 @@ object AdbShell {
             return ShellResult(
                 stdout = stdout.toString(Charsets.UTF_8.name()),
                 stderr = stderr.toString(Charsets.UTF_8.name()),
-                exitCode = if (sawExit) exitCode else 0
+                exitCode = if (sawExit) exitCode else 0,
+                exitCodeKnown = sawExit
             )
         } finally {
             stream.close()
@@ -237,14 +251,14 @@ object AdbShell {
                 out.write(stream.readAvailable())
                 if (stream.isClosed && stream.available() == 0) break
             }
-            // v1 拿不到 exit code，只能返回 0，调用方需按文本判断。
+            // v1 拿不到 exit code，exitCodeKnown=false，调用方必须按文本判断成败。
             // 注意：若对端其实返回的是 v2 帧（v2 握手偶发抖动时），这里也能正确解析，
             // 避免把裸 v2 字节当成文本导致判据失效。
             val raw = out.toByteArray()
             return if (raw.isNotEmpty() && raw[0].toInt() and 0xFF in listOf(ID_STDOUT, ID_STDERR, ID_EXIT)) {
                 parseV2Stream(raw)
             } else {
-                ShellResult(out.toString(Charsets.UTF_8.name()), "", 0)
+                ShellResult(out.toString(Charsets.UTF_8.name()), "", 0, exitCodeKnown = false)
             }
         } finally {
             stream.close()
@@ -283,9 +297,13 @@ object AdbShell {
         return ShellResult(
             stdout.toString(Charsets.UTF_8.name()),
             stderr.toString(Charsets.UTF_8.name()),
-            if (sawExit) exitCode else 0
+            if (sawExit) exitCode else 0,
+            exitCodeKnown = sawExit
         )
     }
 
     private const val MAX_V2_PAYLOAD = 4 * 1024 * 1024
+
+    /** stdin 流式分片大小。64KB 与 SYNC 的 CHUNK_SIZE 对齐，避免大 APK 占内存。 */
+    private const val STDIN_CHUNK = 64 * 1024
 }

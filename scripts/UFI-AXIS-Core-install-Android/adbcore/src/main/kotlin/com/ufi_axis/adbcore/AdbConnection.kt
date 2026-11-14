@@ -98,14 +98,17 @@ class AdbConnection(
 
     /** 建立 TCP 连接并完成 ADB 握手。失败抛 [AdbConnectException] / [AdbHandshakeException]。 */
     fun connect() {
+        val s = Socket()
         try {
-            val s = Socket()
             s.tcpNoDelay = true
             s.connect(InetSocketAddress(host, port), connectTimeoutMs)
             socket = s
             input = DataInputStream(s.getInputStream())
             output = s.getOutputStream()
         } catch (e: Exception) {
+            // 失败也必须关掉 socket，否则重试 5 次会累积 fd
+            try { s.close() } catch (_: Exception) { }
+            socket = null
             throw AdbConnectException(
                 "无法连接到 $host:$port —— 请检查：设备已开启 ADB over TCP、" +
                     "手机与设备在同一网络、设备上如有授权弹窗请点允许。（${e.message}）",
@@ -314,7 +317,7 @@ class AdbConnection(
         val it = streams.values.iterator()
         while (it.hasNext()) {
             val s = it.next()
-            s.onClose()
+            s.onClose(cause)
             it.remove()
         }
     }
@@ -325,12 +328,18 @@ class AdbConnection(
 
     private class AdbFrame(val header: AdbHeader, val payload: ByteArray)
 
-    /** 读一个完整报文；timeoutMs<=0 表示使用 socket 默认（阻塞） */
+    /**
+     * 读一个完整报文；timeoutMs<=0 表示无限阻塞。
+     *
+     * 必须**每次都显式设置** soTimeout：握手期会把它设成「剩余握手时间」（用户在设备上点授权
+     * 花掉的时间越长，剩余值越小），若这里在 timeoutMs<=0 时不复位成 0，reader 线程就会继承
+     * 那个残值，`pm install` 的数十秒静默期会被误判成连接断开（表现为「安装失败：未知错误」，
+     * 且因错误文本不含 restorecon 关键字而不触发流式安装回退）。
+     * 空闲上限由上层 [AdbStream] 的 deadline 负责，不依赖 socket 超时。
+     */
     private fun readFrame(timeoutMs: Long): AdbFrame {
         val ins = input ?: throw AdbConnectionClosedException("连接已关闭")
-        if (timeoutMs > 0) {
-            socket?.soTimeout = timeoutMs.toInt().coerceAtLeast(1)
-        }
+        socket?.soTimeout = if (timeoutMs > 0) timeoutMs.toInt().coerceAtLeast(1) else 0
         val headerBuf = ByteArray(AdbProtocol.HEADER_SIZE)
         ins.readFully(headerBuf)
         val header = AdbProtocol.decodeHeader(headerBuf)

@@ -1,6 +1,7 @@
 package com.ufi_axis.installer.core
 
 import android.content.Context
+import com.ufi_axis.installer.logging.InstallLogger
 import java.io.File
 import java.io.IOException
 
@@ -34,6 +35,8 @@ object AssetApkProvider {
         val names = try {
             context.assets.list(ASSET_DIR) ?: emptyArray()
         } catch (e: IOException) {
+            // 不能静默吞掉：否则真实的 IO 错误会被报成「assets 下没有 APK」
+            InstallLogger.error("读取 assets/$ASSET_DIR/ 失败：${e.message ?: e.javaClass.simpleName}")
             return emptyList()
         }
 

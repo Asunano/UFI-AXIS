@@ -37,7 +37,8 @@ UI 复用 UFI-AXIS 主应用（客户端）统一的设计语言。全流程与 
   （APK 经 stdin 交给 pm，由 pm 自己打上下文），仍失败再回退推到 `/sdcard`。
 - **内置 Core APK**：Core 以 `noCompress` 原样打进 `assets/`，安装器只做分发与安装，不依赖外部文件。
 - **三级包名识别**：固定包名 → 第三方包差集 → 手动输入，逐级兜底。
-- **权限授予不中断**：12 项权限逐项 `pm grant`，失败自动回退 `appops set`，单项失败不影响整体。
+- **权限授予不中断**：按 core manifest 对齐的 16 项权限逐项授权（dangerous 走 `pm grant`，
+  appop 控制的直接走 `appops set`），本机不适用的按 API level 跳过而不报失败，单项失败不影响整体。
 - **统一设计语言**：对齐 UFI-AXIS 主应用（客户端）默认中性皮肤（近黑实底 + 中性灰阶 + 12dp 圆角 +
   柔和灰影），并内置**深色模式**（跟随系统）。
 - **前台服务保障**：安装全程挂在前台服务里，锁屏 / 切后台不被冻结，通知栏实时显示进度。
@@ -50,12 +51,12 @@ UI 复用 UFI-AXIS 主应用（客户端）统一的设计语言。全流程与 
 | # | PC 端脚本的动作 | 安装器里的对应实现 |
 |---|---|---|
 | 1 | 检查 `adb.exe` / `core/` / `core/*.apk` | 启动时检查 `assets/ufi-axis-core/`，缺文件直接禁用「开始安装」 |
-| 2 | 输入设备地址，无端口补 `:5555`，抽出纯 IP | `AddressParser`，还会剥掉从教程复制的 `adb connect ` 前缀 |
-| 3 | `adb connect` + 校验 `device` 状态，失败给检查清单、最多重试 5 次 | `InstallEngine.connectWithRetry()`，失败时弹「重试 / 改地址 / 取消」 |
+| 2 | 输入设备地址，无端口补 `:5555`，抽出纯 IP | `AddressParser`，还会剥掉从教程复制的 `adb connect ` 前缀；任何容错（端口非法回退、剥前缀）都会在日志里写明原因 |
+| 3 | `adb connect` + 校验 `device` 状态，失败给检查清单、最多重试 5 次 | `InstallEngine.connectWithRetry()`，失败时弹「重试 / 改地址 / 取消」；「设备此刻是否真能执行命令」由确认后的 READY 阶段用 `echo` 探活（`AdbClient.checkReady()`）负责 |
 | 4 | 列出待装 APK，问 Y/N | 安装前 AlertDialog，显示 APK 名 + 大小 + 目标地址 |
-| 5 | `pm list packages -3` → 逐个 `adb install -r -d` | 推送 + `pm install -r -d`，带百分比进度；restorecon 失败自动回退 `pm install -S` |
-| 6 | 识别包名（固定 → 差集 → 手工） | `InstallEngine.resolvePackageName()` 三级回退 |
-| 7 | 12 项权限 `pm grant`，失败回退 `appops set` | `PermissionGranter`，逐项打日志，单项失败不中断 |
+| 5 | `pm list packages -3` → 逐个 `adb install -r -d` | 推送 + `pm install -r -d`，带百分比进度；restorecon 失败自动回退 `pm install -S`（回退原因写进日志） |
+| 6 | 识别包名（固定 → 差集 → 手工） | `InstallEngine.resolvePackageName()` 三级回退；差集是**安装前后两次 `pm list packages -3` 的真实差集** |
+| 7 | 12 项权限 `pm grant`，失败回退 `appops set` | `PermissionGranter`，清单按 **core 的 AndroidManifest** 对齐（当前 16 项），逐项打日志（含失败原因），本机不适用的按 API level 跳过，单项失败不中断 |
 | 8 | `cmd package resolve-activity` → `am start`，失败回退 `monkey` | `AppLauncher` |
 | 9 | `timeout 5` 后 `curl /health`，6 次 × 5 秒，判 `status` + `ok` | `HealthChecker`，同样 6 次 × 5 秒 |
 | 10 | 全程写 `log/install_<时间戳>.log` | `InstallLogger` 落盘 + 界面实时彩显 + 一键分享/复制 |
@@ -75,16 +76,26 @@ UFI-AXIS-Core-install-Android/
 │       ├── AdbShell.kt         shell v2（回退 v1）命令执行 + stdin 流式写入
 │       ├── AdbSync.kt          push 文件（SEND/DATA/DONE，兼容 sendrecv_v2）
 │       ├── AdbClient.kt        门面：装包 / 授权 / 启动 / 查包（含 layered install 回退）
+│       ├── PortProbe.kt        连接前的 TCP 端口可达性探测
 │       └── AdbException.kt     异常体系
+│
+├── goform/                                   Android 库模块：ZTE goform 私有 Web 协议防腐层
+│   └── src/main/java/com/ufi_axis/installer/goform/
+│       ├── GoformGateway.kt    对外契约（登录 / 查询 / 写命令）
+│       ├── GoformClient.kt     实现：LOGIN 鉴权、AD 计算、会话缓存与退避
+│       ├── GoformCodec.kt      表单体与摘要编码
+│       ├── GoformWritePolicy.kt / GoformWriteResult.kt  写操作重试策略与三态结果
+│       └── GoformLog.kt        日志包装（可挂 sink 转发到安装日志）
 │
 └── app/                                      Android 应用层
     ├── src/main/java/com/ufi_axis/installer/
-    │   ├── InstallerApp.kt       Application
-    │   ├── MainActivity.kt       单页界面（XML/View，遵循 UFI-AXIS 设计令牌）
+    │   ├── InstallerApp.kt      Application
+    │   ├── MainActivity.kt      分屏向导主界面（XML/View，遵循 UFI-AXIS 设计令牌）
+    │   ├── LogActivity.kt       独立日志界面
     │   ├── core/
-    │   │   ├── AddressParser.kt        地址解析
+    │   │   ├── AddressParser.kt        地址解析（带容错说明）
     │   │   ├── AssetApkProvider.kt     内置 APK 枚举 / 挑选 / 落地
-    │   │   ├── PermissionGranter.kt    12 项权限授权
+    │   │   ├── PermissionGranter.kt    权限清单与授权（清单对齐 core manifest）
     │   │   ├── AppLauncher.kt          启动应用
     │   │   ├── HealthChecker.kt        /health 探活
     │   │   └── NotificationHelper.kt   前台通知
@@ -94,11 +105,16 @@ UFI-AXIS-Core-install-Android/
     │   ├── state/
     │   │   ├── InstallStage.kt         阶段枚举
     │   │   ├── InstallState.kt         状态快照
-    │   │   └── InstallEngine.kt        流程编排（单例）
+    │   │   └── InstallEngine.kt        安装流程编排（单例）
+    │   ├── remoteadb/                  「开启远程 ADB」引导流程（走 goform 开 5555）
+    │   │   ├── RemoteAdbActivity.kt    引导界面（面板可见性由状态推导）
+    │   │   ├── RemoteAdbEngine.kt      流程编排（单例，与安装互斥）
+    │   │   └── RemoteAdbStage.kt / RemoteAdbState.kt
     │   ├── service/
-    │   │   └── InstallerService.kt     前台服务
+    │   │   └── InstallerService.kt     前台服务（含安装期 WakeLock，结束即停）
     │   └── ui/
-    │       └── LogAdapter.kt           日志列表适配器
+    │       ├── LogAdapter.kt           日志列表适配器
+    │       └── RingProgressView.kt     环形进度控件
     └── src/main/res/values*/          设计令牌（颜色 / 字号 / 圆角 / 暗色主题）
 ```
 
@@ -224,7 +240,7 @@ adb logcat | grep -i ufi
 | 连接设备 | 日志出现 `已连接：device::...` | 检查 5555 是否可达；若提示设备要求允许，去设备上点确认 |
 | 推送 APK | 进度条走到 100% | 卡住多半是 sync 协议问题，抓日志 |
 | 识别包名 | 出现 `命中固定包名：com.ufi_axis_core` | 若走差集或要求手输，说明包名和预期不符，看日志里的候选 |
-| 授予权限 | 12 行 `[n/12] PERMISSION` | 失败项会标 `（失败，已跳过）`，属正常，部分 ROM 不支持个别权限 |
+| 授予权限 | 16 行 `[n/16] PERMISSION` | 标「本机不适用，跳过」的是按设备 API level 主动跳过（正常）；标「失败，已跳过」的才是真没授上，会附带原因 |
 | 启动应用 | `启动指令已发送（am start）` | 回退到 monkey 也可接受 |
 | 健康检查 | `健康检查通过（第 1 次）` | 失败会连试 6 次，每次间隔 5 秒，失败时日志会附带「目标进程是否在运行」 |
 
@@ -269,13 +285,63 @@ Android 11+ 的「无线调试」用的是 TLS + SPAKE2 配对码，握手流程
 
 ### 连接期间必须保持屏幕
 
-安装全程可能要 1~3 分钟（推 APK + 12 项授权 + 启动等待 5 秒 + 健康检查最多 30 秒）。
+安装全程可能要 1~3 分钟（推 APK + 16 项授权 + 启动等待 5 秒 + 健康检查最多约 70 秒：
+6 次尝试，每次 HTTP 超时 8 秒、间隔 5 秒）。
 这段逻辑挂在**前台服务**里，锁屏或切后台都不会被冻结，通知栏会实时显示进度。
+
+前台服务只保证进程优先级，不保证灭屏后 CPU 不挂起，所以服务在**安装期间**额外持一把
+`PARTIAL_WAKE_LOCK`，结束（成功 / 失败 / 取消）立刻释放，不常驻；安装结束后服务会自行停止，
+通知转为可划掉的结束态。若 `startForeground` 被系统拒绝（Android 12+ 后台启动限制、
+Android 14 的 FGS 类型校验），日志会记 ERROR 并提示「请保持应用在前台、不要锁屏」，
+而不是静默降级。
+
+未授予通知权限（Android 13+）时通知是被系统静默丢弃的，此时安装仍能跑完，
+界面会 Toast 提示「进度只能在本界面查看」。
 
 ### `am start` 的成功判定是「尽力而为」
 
 `am start` 就算目标 Activity 起不来，exit code 也常常是 0。
 所以安装器不把它的返回值当最终结论，真正的判据是之后的健康检查。
+
+### 取消是「立即」的：会主动断开连接
+
+推送 / shell / HTTP 都是不可中断的阻塞调用，只 cancel 协程最坏要等到 180 秒超时。
+所以「取消」除了 cancel 协程还会直接 `close()` ADB 连接，让阻塞的 socket 立刻抛错；
+由此产生的连接异常会按「已取消」收敛，不会给用户报成莫名的连接错误。
+
+### 「开启远程 ADB」是另一条链路
+
+设备只开了 goform 后台（默认 `192.168.0.1:8080`）而没开 5555 时，可以先走首页的
+「远程 ADB」：`goform` 模块登录设备后台 → 下发 `USB_PORT_SETTING` 打开 USB/ADB 端口 →
+**在 30 秒窗口内轮询等待** 5555 真正可用（每 2 秒一次轻量 TCP 探测，可达后才做完整 ADB 握手）；
+等满仍不通才**弹窗询问**是否重启设备，用户确认后才下发 `REBOOT_DEVICE`，重启后 90 秒内继续轮询；
+仍不通则重新登录再下发一次并再等一轮。
+
+几个刻意的设计：
+
+- **端口命令下发后不会立刻判失败**。设备侧要几秒到十几秒才真正 listen 5555，
+  单打一次连接必然失败，会让用户看到「刚开完端口就被要求重启」。
+- **重启永远等用户点确认**，引擎不会自动下发；弹窗会说明「会中断设备网络约 1 分钟」，
+  并给「暂不重启」出口，选了不重启会得到一份可自查的清单（局域网、数据线、是否被其他 adb 占用），
+  而不是一句笼统的失败。
+- **「连上」的判据是能执行命令**：握手成功后还要跑一条 `echo`（`AdbClient.checkReady()`）。
+  否则「未授权 / 已被其他 adb 客户端占用」也会被当成成功，最后给用户一条连不上的命令。
+- 连上 5555 后**不再**发 `tcpip:5555`。`tcpip:<port>` 这个服务名本身是对的（adbd 会回
+  `restarting in TCP mode port: 5555`），但它只在「当前连接不走该端口」（典型是 USB 通道）时才有意义；
+  我们本来就是从 5555 连进去的，再发一次只会让 adbd 重启、踢掉刚建立的连接，且什么也没改变。
+- **持久化只能靠 `persist.adb.tcp.port`**。`tcpip` 写的是 `service.adb.tcp.port`，
+  goform 的 `USB_PORT_SETTING` 同样不跨重启。所以连上后会尽力执行
+  `setprop persist.adb.tcp.port 5555` 并**回读校验**（`AdbClient.persistTcpPort()`，
+  判据是回读值而不是 exit code——shell v1 通道拿不到 exit code）。多数固件不允许 shell 写
+  `persist.adb.*`，失败属正常，此时结果页会明确写「本次开启在设备重启后会失效」，而不是假装永久生效。
+- `REBOOT_DEVICE` 走**非幂等**入口（`GoformClient.goformPost`），会话失效也不重发，避免设备被重启两次；
+  `USB_PORT_SETTING` 是幂等设置，走 `goformPostIdempotent` 并按 `GoformWriteResult`
+  区分「会话失效 / 不可达 / 设备拒绝」，不把三者压成一句笼统错误；下发后还会回读
+  `usb_port_switch` 记一行诊断日志（部分固件不支持该查询，仅供参考，不参与判定）。
+- 与安装流程**互斥**：安装进行中首页的「远程 ADB」按钮置灰，引擎侧也会拒绝并说明原因
+  （它可能重启设备，绝不能和安装并发）。
+- 两个确认弹窗都带超时（5 分钟）与取消出口；界面被关掉且流程正卡在等待弹窗时会自动中止，
+  不会把引擎永久锁住。
 
 ---
 
