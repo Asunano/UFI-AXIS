@@ -1,30 +1,30 @@
 {
   "frontend": {
-    "version": "0.1.0",
-    "versionCode": 4,
+    "version": "0.1.1",
+    "versionCode": 5,
     "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.0/UFI-AXIS-app-0.1.0.apk",
     "apkSha256": "3bfceb54f36aca4fef7faadc65aa59d845b57273378376c3be97329da8cbf91d",
-    "changelog": "App 端更新：\n- 新增定时关闭：10 / 20 / 30 / 60 分钟或自定义，默认放完当前这首再停\n- 播放页支持从底部迷你条上滑拉起：跟手滑动、封面过渡、下拉关闭\n- 新增蓝牙歌词（把当前句同步到媒体通知，默认关闭）与「外接设备控制播放」开关\n- 视频设置补全：字幕自动显示、字号、半透明底（自动显示默认开），海报墙列数可调，最近播放可续播\n- 视频详情新增编码 / 像素格式 / 码率 / 帧率；长按可重新获取封面，并显示封面来源\n- 封面预热接入 App：可手动触发预热并查看进度\n- 图片长按菜单支持重命名 / 下载 / 复制路径 / 删除，网格列数可调\n- 网络页新增 WiFi 二维码；网络制式弹窗重做，切换结果与信号读数更直观\n- 频段统一显示为 N78 / B3，首页网络卡直接显示制式与频段\n- 新增统一的操作进度弹窗：失败可重试，可转到后台继续\n- CPU 弹窗新增关键热区温度\n- 优化下拉栏组件与弹窗样式，界面更统一\n- 新增 DLNA 服务入口（设置 → 小功能，默认关闭）\n- 新增资源中心：统一安装与更新 Web 前端包、frpc、cloudflared\n- 新增配对审批与设备黑名单（默认关闭）\n- 新增诊断中心：环境 / 网络 / 服务 / 高级四组检查，可导出诊断包\n- 流量管理新增流量报表（日 / 周 / 月）与套餐模式（每月循环 / 固定有效期）\n- 自动化规则新增 4 个常用模板\n- 关于页新增赞助与感谢名单；服务器地址支持域名\n- 修复：WiFi 保存后窗口不关、热点重启导致误报失败；通知渠道被系统权限误禁用\n- 修复：更新期间误报「无法连接到设备」；文件管理器远端源不可达时无法退出；输入框底部留白重复\n- 修复：歌词切句、播放队列排序、封面缓存与视频全屏首帧白块\n- 升级注意：DLNA / 配对审批 / 封面预热 / 流量报表 / 套餐模式需 Core 0.1 配套，旧版 Core 上相关入口自动隐藏",
+    "changelog": "App 端更新：\n- 新增话费账单：多账号并存（移动 / 联通 / 电信 / 物联卡），余额、流量、语音短信余量、套餐明细\n- 新增自动登录与保活：会话失效自动收码重登，可设检查间隔、重登间隔与每日短信上限（仅移动，需 SIM 在位）\n- 新增远程投屏：基于 scrcpy 3.3.3，画质三档可调，支持触控与键盘（默认关闭，在设置中手动打开）\n- 新增第三方程序商店：OpenList / Syncthing / Cloudreve / dufs / ddns-go 的安装、启停与打开\n- 新增「不可逆操作需配对密码」开关（默认关）：恢复出厂、恢复备份、root shell 等操作需再输一次配对密码\n- 安全中心新增自动登录与账单策略入口；设备页重排，控制项与小字对比度按 AA 调整\n- 修复：状态栏图标与应用内明暗不同步；二级页进场卡顿（转场期间不再整页重组）\n- 升级注意：投屏与不可逆操作保护两个开关默认关闭，升级无感知",
     "apkSize": 9380679,
     "publishedAt": "2026-10-24T17:40:14Z",
     "tagName": "v0.1.0"
   },
   "backend": {
-    "version": "0.1.0",
-    "versionCode": 4,
+    "version": "0.1.1",
+    "versionCode": 5,
     "apkUrl": "https://github.com/Asunano/UFI-AXIS/releases/download/v0.1.0/UFI-AXIS-core-0.1.0.apk",
     "apkSha256": "e8c6c719df1b3f3ac455a444c5cdbbd6f0f9068a3d58118e23fa467fc197e551",
-    "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 新增 DLNA 媒体服务器：可指定共享目录，电视 / 播放器能直接发现并播放，默认关闭\n- 新增网络诊断（ping / DNS / TCP / 路由追踪），无需 root\n- 新增流量报表（日 / 周 / 月）与套餐模式（每月循环 / 固定有效期）\n- 新增定时测速：可手动执行或加入定时任务，结果入库并推送通知\n- 新增配对审批与设备黑名单：新设备接入需确认，被拉黑设备立即断开\n- 新增远端自动备份：定时把加密备份推到已配置的存储源，滚动保留 7 份\n- 新增权限自检与一键补全、赞助名单、CPU 能力探测、告警日统计\n- 媒体：新增视频信息探测与封面预热；缩略图统一由设备生成并落盘，列表不再反复重算\n- 设备协议自愈：设备网页半死状态下自动重新登录并恢复数据；读写出超时与熔断保护\n- 稳定性：服务启动自检，连续启动失败自动进入安全模式；应用列表改为缓存加速\n- 修复：缓存失效不生效、监控图表断档、WiFi 配置并发覆盖、下载限速残留、adb 输出阻塞\n- 修复：缩略图并发解码过高、媒体标题过期、JNI 符号不匹配、keepalive 脚本写入失败\n- 修复：安装包下载强制校验哈希与 HTTPS；危险命令、非法告警参数与超长 WiFi 参数被拒绝\n- 升级注意：数据库升到 15（自动迁移，新增测速历史表）\n- 升级注意：移除客户端回传缩略图接口；封面来源标记收敛；封面接口去掉尺寸参数\n- 升级注意：日志不再自动截断，长期开启会持续占用存储\n- 升级注意：视频封面依赖 arm64-v8a 的 FFmpeg 库；自定义设备插件需适配新的写接口",
+    "changelog": "Core 管理后台（含 Web 前端，随 Core 一同发布）：\n- 新增运营商账单接口 /api/carrier/*（30 个端点）：多账号、移动/联通/电信/物联卡登录、账单与自动登录保活\n- 新增远程投屏 /api/screen/* 与 /ws/screen：自研 adb 协议客户端 + scrcpy-server，默认关闭\n- 新增第三方程序商店 /api/programs/*：多实例运行、内存总量预算、内容目录可选、Gateway 与一次性入口票据\n- 新增「破坏性操作的主人口令门」（默认关）：18 个不可逆/交出凭据的端点可要求配对密码，\n  另有两个条件门（改 goform 地址要密码、关掉保护本身要密码）；安装/更新/隧道/终端不受影响\n- 新增自研 adb 协议客户端与 SMB root shell 通道；tar 解包改为取包内最大的同名条目\n- 存储卷枚举统一到一处，文件管理与程序商店共用\n- 修复：adb 开流时 OKAY 后紧跟的 CLSE 被误判为「OPEN 被拒」（偶发「服务不可用」）；\n  网络制式 ENDC/NSA 归一化为 5G NSA；Goform 依赖守门测试恢复绿色\n- 升级注意：数据库仍为 v15，无需迁移；投屏与主人口令门默认关闭\n- 已知限制：物联卡账单接口只提供明文 HTTP，充值号与约 100 天会话 cookie 走明文信道（详见 dev-docs/ACKNOWLEDGED-RISKS.md（开发文档，不入库））",
     "apkSize": 25151553,
     "publishedAt": "2026-10-24T17:40:14Z",
     "tagName": "v0.1.0"
   },
   "web": {
-    "version": "0.1.0",
-    "versionCode": 4,
+    "version": "0.1.1",
+    "versionCode": 5,
     "apkUrl": "",
     "apkSha256": "",
-    "changelog": "随 Core 端（管理后台）一同发布，更新内容见 Core 端更新日志。\n本轮新增：\n- 全局音乐播放器：切页不断播，顶栏迷你条可展开歌词；音乐页改为全部 / 歌单 / 专辑 / 艺人 / 文件夹五页签，配沉浸播放与同步歌词\n- 文件管理新增批量操作（可逐项取消 / 重试）、远端存储源管理与推送进度\n- 监控新增 CSV 导出、流量报表与监控设置弹窗\n- 网络页新增诊断工具（ping / DNS / TCP / 路由追踪）与流量校准合并弹窗\n- 新增设备热控面板、验证码与短信实时卡片、浏览器通知（默认关）、PWA 离线外壳（https 或 localhost 下生效）\n- 登录新增品牌页与多标签互斥；开启配对审批后，新设备需在已登录设备上确认\n- 新增诊断中心（一键检查 + 导出诊断包）、资源中心、服务更新页（Web 前端可独立在线更新）\n- 新增赞助与赞赏页；定时任务支持测速动作与规则模板\n- 设置页新增「设备」面板，设备页四个 tab 合并为单页、侧栏精简；备份页新增远端自动备份配置\n- 修复：更新期间误报「无法连接到设备」、时钟漂移导致整片 401、CSV 负值变公式、封面内存泄漏\n- 升级注意：流量限额并入「流量与校准」\n- 升级注意：Web 前端改为可独立发布，ZIP 经「服务更新」安装",
+    "changelog": "随 Core 端（管理后台）一同发布，更新内容见 Core 端更新日志。\n本轮新增：\n- 话费账单页：多账号并存（移动 / 联通 / 物联卡），余额、流量、套餐与到期\n- 远程投屏页：scrcpy 画面 + 触控/键盘，默认关闭，需在设备端打开开关\n- 第三方程序页：安装、启停、日志与访问\n- 前端质量门禁：vitest 单测、any / 断点 / UI 基线并入 npm run lint\n- 全局致命错误浮层：组件异常不再白屏，给出可关闭提示与刷新入口",
     "apkSize": 0,
     "publishedAt": "",
     "tagName": ""
@@ -48,5 +48,460 @@
       "archive": "raw",
       "entry": ""
     }
-  }
+  },
+  "programs": [
+    {
+      "schema": 1,
+      "id": "openlist",
+      "name": "OpenList",
+      "summary": "支持多存储的文件列表程序（AList 的社区分支），自带 Web 界面",
+      "homepage": "https://github.com/OpenListTeam/OpenList",
+      "license": "AGPL-3.0",
+      "artifact": {
+        "version": "4.2.9",
+        "url": "https://github.com/OpenListTeam/OpenList/releases/download/v4.2.9/openlist-android-arm64.tar.gz",
+        "sha256": "b2a3e98488276de2aefa7dbbfd933772b92859d1869989cfe897c6dcb0e65603",
+        "size": 51816779,
+        "archive": "tar.gz",
+        "entry": "openlist",
+        "abi": "arm64-v8a",
+        "linkage": "android-dynamic"
+      },
+      "run": {
+        "argv": [
+          "server",
+          "--data",
+          "{DATA}"
+        ],
+        "env": {
+          "TMPDIR": "{CACHE}",
+          "HOME": "{DATA}"
+        },
+        "cwd": "{DATA}",
+        "internal_port": 5244,
+        "bind": "any",
+        "external_port": 18080,
+        "health": {
+          "kind": "http",
+          "path": "/ping",
+          "accept_status": [
+            200,
+            401,
+            403
+          ],
+          "expect_contains": "pong",
+          "timeout_ms": 2000,
+          "interval_s": 30,
+          "fail_threshold": 3,
+          "startup_grace_s": 30,
+          "startup_grace_max_s": 240,
+          "stall_timeout_s": 90,
+          "startup_grace_extend_max_s": 600
+        },
+        "stop": {
+          "signal": "TERM",
+          "grace_s": 10
+        },
+        "singleton": true
+      },
+      "resources": {
+        "rss_warn_mb": 128,
+        "rss_restart_mb": 220,
+        "rss_kill_mb": 360,
+        "start_min_avail_mb": 200,
+        "nice": 10,
+        "data_quota_mb": 2048,
+        "log_quota_mb": 32,
+        "max_processes": 8
+      },
+      "restart": {
+        "backoff_s": [
+          5,
+          15,
+          60,
+          300,
+          900
+        ],
+        "crash_loop_window_s": 120,
+        "give_up_after": 8
+      },
+      "requires": {
+        "privileged_port": false,
+        "root": false,
+        "network": "online-only",
+        "private_data": true
+      },
+      "content": {
+        "enabled": true,
+        "default_root": "internal",
+        "required": false
+      },
+      "first_run": {
+        "adapter": "openlist"
+      },
+      "ui": {
+        "open_path": "/",
+        "title": "OpenList"
+      }
+    },
+    {
+      "schema": 1,
+      "id": "syncthing",
+      "name": "Syncthing",
+      "summary": "点对点文件同步（手机 ↔ 设备），Web 界面经后台转发访问",
+      "homepage": "https://github.com/syncthing/syncthing",
+      "license": "MPL-2.0",
+      "artifact": {
+        "version": "2.1.7",
+        "url": "https://github.com/syncthing/syncthing/releases/download/v2.1.7/syncthing-linux-arm64-v2.1.7.tar.gz",
+        "sha256": "48e456690cd2b97e7d26b02b5ac35f62a3b36172267b144cfeaf02c993ab955c",
+        "size": 12866755,
+        "archive": "tar.gz",
+        "entry": "syncthing",
+        "abi": "arm64-v8a",
+        "linkage": "static"
+      },
+      "run": {
+        "argv": [
+          "serve",
+          "--home={DATA}",
+          "--gui-address=http://{BIND}:{INTERNAL_PORT}",
+          "--no-browser",
+          "--no-upgrade",
+          "--no-restart"
+        ],
+        "env": {
+          "TMPDIR": "{CACHE}",
+          "HOME": "{DATA}"
+        },
+        "cwd": "{DATA}",
+        "internal_port": 18103,
+        "bind": "loopback",
+        "external_port": 18104,
+        "health": {
+          "kind": "http",
+          "path": "/rest/noauth/health",
+          "accept_status": [
+            200
+          ],
+          "expect_contains": "OK",
+          "timeout_ms": 2000,
+          "interval_s": 30,
+          "fail_threshold": 3,
+          "startup_grace_s": 30,
+          "startup_grace_max_s": 240,
+          "stall_timeout_s": 90,
+          "startup_grace_extend_max_s": 600
+        },
+        "stop": {
+          "signal": "TERM",
+          "grace_s": 10
+        },
+        "singleton": true,
+        "storage": "internal"
+      },
+      "resources": {
+        "rss_warn_mb": 160,
+        "rss_restart_mb": 260,
+        "rss_kill_mb": 400,
+        "start_min_avail_mb": 200,
+        "nice": 10,
+        "data_quota_mb": 4096,
+        "log_quota_mb": 32,
+        "max_processes": 12
+      },
+      "restart": {
+        "backoff_s": [
+          5,
+          15,
+          60,
+          300,
+          900
+        ],
+        "crash_loop_window_s": 120,
+        "give_up_after": 8
+      },
+      "requires": {
+        "privileged_port": false,
+        "root": false,
+        "network": "offline-ok",
+        "private_data": true
+      },
+      "ui": {
+        "open_path": "/",
+        "title": "Syncthing"
+      }
+    },
+    {
+      "schema": 1,
+      "id": "cloudreve",
+      "name": "Cloudreve",
+      "summary": "自建网盘：上传、分享、WebDAV，数据落在设备本地，自带账号体系",
+      "homepage": "https://cloudreve.org/",
+      "license": "GPL-3.0",
+      "artifact": {
+        "version": "4.19.1",
+        "url": "https://github.com/cloudreve/cloudreve/releases/download/4.19.1/cloudreve_4.19.1_linux_arm64.tar.gz",
+        "sha256": "f55d77e0e5eb8bc699a9a6bb1216b0ee3afa3bfe8d7c9d405ca9845339ae7b0e",
+        "size": 35248035,
+        "archive": "tar.gz",
+        "entry": "cloudreve",
+        "abi": "arm64-v8a",
+        "linkage": "static"
+      },
+      "run": {
+        "argv": [
+          "-w",
+          "server",
+          "-c",
+          "{CONF}/conf.ini"
+        ],
+        "env": {
+          "TMPDIR": "{CACHE}",
+          "HOME": "{DATA}"
+        },
+        "cwd": "{DATA}",
+        "internal_port": 5212,
+        "bind": "any",
+        "external_port": 18105,
+        "health": {
+          "kind": "http",
+          "path": "/api/v4/site/ping",
+          "accept_status": [
+            200
+          ],
+          "expect_contains": "\"code\":0",
+          "timeout_ms": 2000,
+          "interval_s": 30,
+          "fail_threshold": 3,
+          "startup_grace_s": 30,
+          "startup_grace_max_s": 240,
+          "stall_timeout_s": 90,
+          "startup_grace_extend_max_s": 600
+        },
+        "stop": {
+          "signal": "TERM",
+          "grace_s": 15
+        },
+        "singleton": true,
+        "storage": "internal"
+      },
+      "resources": {
+        "rss_warn_mb": 180,
+        "rss_restart_mb": 280,
+        "rss_kill_mb": 420,
+        "start_min_avail_mb": 200,
+        "nice": 10,
+        "data_quota_mb": 4096,
+        "log_quota_mb": 32,
+        "max_processes": 12
+      },
+      "restart": {
+        "backoff_s": [
+          5,
+          15,
+          60,
+          300,
+          900
+        ],
+        "crash_loop_window_s": 120,
+        "give_up_after": 8
+      },
+      "requires": {
+        "privileged_port": false,
+        "root": false,
+        "network": "offline-ok",
+        "private_data": true
+      },
+      "content": {
+        "enabled": true,
+        "default_root": "internal"
+      },
+      "first_run": {
+        "adapter": "cloudreve"
+      },
+      "ui": {
+        "open_path": "/",
+        "title": "Cloudreve"
+      }
+    },
+    {
+      "schema": 1,
+      "id": "dufs",
+      "name": "dufs",
+      "summary": "单文件文件服务器：浏览 / 下载 / 上传 + WebDAV，口令由设备生成",
+      "homepage": "https://github.com/sigoden/dufs",
+      "license": "MIT OR Apache-2.0",
+      "artifact": {
+        "version": "0.47.0",
+        "url": "https://github.com/sigoden/dufs/releases/download/v0.47.0/dufs-v0.47.0-aarch64-unknown-linux-musl.tar.gz",
+        "sha256": "faf1c961ad47c5d636b14956b6279e1278453517cd5d3c274d21d522b495800a",
+        "size": 1896343,
+        "archive": "tar.gz",
+        "entry": "dufs",
+        "abi": "arm64-v8a",
+        "linkage": "static"
+      },
+      "run": {
+        "argv": [
+          "--config",
+          "{CONF}/dufs.yaml"
+        ],
+        "env": {
+          "TMPDIR": "{CACHE}",
+          "HOME": "{DATA}"
+        },
+        "cwd": "{DATA}",
+        "internal_port": 18110,
+        "bind": "any",
+        "health": {
+          "kind": "http",
+          "path": "/__dufs__/health",
+          "accept_status": [
+            200,
+            401
+          ],
+          "expect_contains": "",
+          "timeout_ms": 2000,
+          "interval_s": 30,
+          "fail_threshold": 3,
+          "startup_grace_s": 20,
+          "startup_grace_max_s": 120,
+          "stall_timeout_s": 60,
+          "startup_grace_extend_max_s": 300
+        },
+        "stop": {
+          "signal": "TERM",
+          "grace_s": 10
+        },
+        "singleton": true,
+        "storage": "internal"
+      },
+      "resources": {
+        "rss_warn_mb": 64,
+        "rss_restart_mb": 120,
+        "rss_kill_mb": 180,
+        "start_min_avail_mb": 120,
+        "nice": 10,
+        "data_quota_mb": 0,
+        "log_quota_mb": 16,
+        "max_processes": 6
+      },
+      "restart": {
+        "backoff_s": [
+          5,
+          15,
+          60,
+          300,
+          900
+        ],
+        "crash_loop_window_s": 120,
+        "give_up_after": 8
+      },
+      "requires": {
+        "privileged_port": false,
+        "root": false,
+        "network": "offline-ok",
+        "private_data": true
+      },
+      "content": {
+        "enabled": true,
+        "default_root": "internal",
+        "required": true
+      },
+      "first_run": {
+        "adapter": "dufs"
+      },
+      "ui": {
+        "open_path": "/",
+        "title": "dufs"
+      }
+    },
+    {
+      "schema": 1,
+      "id": "ddns-go",
+      "name": "ddns-go",
+      "summary": "动态 DNS：自动把域名解析指向设备当前公网 IP（阿里云、腾讯云、Cloudflare 等）",
+      "homepage": "https://github.com/jeessy2/ddns-go",
+      "license": "MIT",
+      "artifact": {
+        "version": "6.17.7",
+        "url": "https://github.com/jeessy2/ddns-go/releases/download/v6.17.7/ddns-go_6.17.7_android_arm64.tar.gz",
+        "sha256": "1e9dd881e81e5043820f145a82d0df71bfe9b66f4a4d8813bdea5a7f131925fd",
+        "size": 4472145,
+        "archive": "tar.gz",
+        "entry": "ddns-go",
+        "abi": "arm64-v8a",
+        "linkage": "android-dynamic"
+      },
+      "run": {
+        "argv": [
+          "-l",
+          "{BIND}:{INTERNAL_PORT}",
+          "-c",
+          "{DATA}/ddns-go.yaml"
+        ],
+        "env": {
+          "TMPDIR": "{CACHE}",
+          "HOME": "{DATA}"
+        },
+        "cwd": "{DATA}",
+        "internal_port": 9876,
+        "bind": "loopback",
+        "external_port": 18106,
+        "health": {
+          "kind": "http",
+          "path": "/login",
+          "accept_status": [
+            200
+          ],
+          "expect_contains": "",
+          "timeout_ms": 2000,
+          "interval_s": 30,
+          "fail_threshold": 3,
+          "startup_grace_s": 15,
+          "startup_grace_max_s": 120,
+          "stall_timeout_s": 60,
+          "startup_grace_extend_max_s": 300
+        },
+        "stop": {
+          "signal": "TERM",
+          "grace_s": 10
+        },
+        "singleton": true,
+        "storage": "internal"
+      },
+      "resources": {
+        "rss_warn_mb": 48,
+        "rss_restart_mb": 96,
+        "rss_kill_mb": 160,
+        "start_min_avail_mb": 100,
+        "nice": 10,
+        "data_quota_mb": 64,
+        "log_quota_mb": 16,
+        "max_processes": 6
+      },
+      "restart": {
+        "backoff_s": [
+          5,
+          15,
+          60,
+          300,
+          900
+        ],
+        "crash_loop_window_s": 120,
+        "give_up_after": 8
+      },
+      "requires": {
+        "privileged_port": false,
+        "root": false,
+        "network": "offline-ok",
+        "private_data": true
+      },
+      "ui": {
+        "open_path": "/",
+        "title": "ddns-go"
+      }
+    }
+  ]
 }

@@ -1,6 +1,6 @@
 # UFI-AXIS Core Backend API Reference
 
-> 本文档覆盖 UFI-AXIS 后端 core 模块的全部 API 接口，供 Web 前端开发对接使用。  
+> 本文档覆盖 UFI-AXIS 后端 core 模块的全部 API 接口，供 Web 前端与移动端对接使用。  
 > 默认端口 `8088`，内容格式 `application/json; charset=UTF-8`。
 
 ---
@@ -54,6 +54,8 @@
 - [缓存管理 /api/cache](#缓存管理-apicache)
 - [诊断 /api/diagnose](#诊断-apidiagnose)
 - [WebSocket /ws/realtime](#websocket-wsrealtime)
+- [运营商账单 /api/carrier](#运营商账单-apicarrier)
+- [远程屏幕 /api/screen](#远程屏幕-apiscreen)
 
 ---
 
@@ -101,8 +103,8 @@
 
 三条硬性约定：
 
-- **既有 key 不改名。** 命名是混的（`lte_band_lock` snake、`BearerPreference` Pascal、  
-  `dhcpLease_hour` camel+snake），这是透传时代的历史债，冻结即接受。
+- **既有 key 不改名。** 命名风格不统一（`lte_band_lock` snake、`BearerPreference` Pascal、  
+  `dhcpLease_hour` camel+snake），属于历史遗留，冻结后接受现状。
 - **新增 key 一律 `snake_case`。**
 - **字段缺失 = 省略该 key，不输出 `null`。** 客户端普遍写 `pick(...) ?? ''` / `?: default`，  
   省略与 null 行为一致；数值型"无数据"用 `-1` 哨兵（如 `pci` / `arfcn`）。
@@ -110,8 +112,8 @@
 未登记的设备字段**不会出现在响应里**（allowlist 默认拒绝）。四个例外端点保持原样透传，仅供诊断，  
 客户端不应依赖其字段名：`GET /api/device/goform`、`GET /api/wifi/module-info`、  
 `POST /api/device/goform/query`、`POST /api/device/goform/set`。  
-`GET /api/device/goform` 默认关闭（配置项 `goform_dump_enabled`，关着回 403），打开后 PII 与凭据类字段值也会打成 `***`；  
-**`/api/wifi/module-info` 既没有开关也没有脱敏**，`Password` 等字段是设备原始明文，别把它当"安全的诊断端点"往界面上摆；  
+`GET /api/device/goform` 默认关闭（配置项 `goform_dump_enabled`，关着回 403），打开后 PII 与凭据类字段值也会替换为 `***`；  
+**`/api/wifi/module-info` 既没有开关也没有脱敏**，`Password` 等字段是设备原始明文，不应将其作为「安全的诊断端点」在界面上展示；  
 两个 `POST /api/device/goform/*` 是裸命令通道，字段名完全由调用方传入的 cmd 决定，**不归一化也不脱敏**，  
 默认关闭（配置项 `goform_command_enabled`）。
 
@@ -120,18 +122,18 @@
 goform 客户端层，用的是另一份非空 profile）。此时容器字段可能是"数组的 JSON 字符串"而不是数组 ——  
 客户端解容器时两种形态都要能吃（见 `/api/wifi/clients`）。
 
-**哪些端点会变回设备原名**（2026-09-22 起逐组核实，共 9 组）：`/api/wifi/settings`、  
+**哪些端点会变回设备原名**（共 9 组）：`/api/wifi/settings`、  
 `/api/wifi/clients`、`/api/network/cell-info` 与 `/api/network/neighbor-cells`、  
 `/api/network/band-status`、`/api/device/identity`、`/api/device/lan-settings`、  
 `/api/device/settings`，以及 `ppp_status` / `network_type` 那一组连接状态字段。  
 **唯一的例外是流量限额**：`/api/device/traffic-limit` 与 `/api/dashboard/summary` 的 `traffic_limit`  
-**不受这个开关影响**（2026-09-22 起），原因见该端点一节 —— 简单说，它的字段是 core  
+**不受这个开关影响**，原因见该端点一节：它的字段是 core  
 **按 canonical 重组**出来的（值要拆、上下行方向要掰、三个键在设备上根本不存在），  
 跟着降级不会得到"设备原样"，只会得到一份没有报错但值全错的响应。  
 要看设备原始字段名请走 `POST /api/device/goform`（原始 dump）或 `GET /api/diagnose?fields=1`  
 （逐组列出 canonical ← 命中的设备原名）。
 
-两个注意点：它**可读可写**（2026-09-22 起 `AppSettings.toMap()` 与 `PUT /api/config` 都登记了这个键，  
+两个注意点：它**可读可写**（`AppSettings.toMap()` 与 `PUT /api/config` 都登记了这个键，  
 所以 `GET` 看得到、`PUT` 改得动），但**只在构造组件图时读一次，改完必须重启后台服务才生效**；  
 且 `PUT` 响应的 `needs_restart` 清单**不含**这个键（只有 port / goform_* 那四个），  
 客户端不能靠响应判断，要自己在界面上写明"需重启后台服务"。  
@@ -151,7 +153,7 @@ goform 客户端层，用的是另一份非空 profile）。此时容器字段�
 | 各端点的布尔                                               | 自己比较 `"1"`/`"on"`/`"true"`/`"SERVER"`                      | 仍是这几种编码，但**只保留一个 key**；判定用统一 helper（app `DeviceFields.Bool.isTrue`）                         |
 | 写入侧                                                  | `way` / `data` / `time` / `rat` 等设备风格入参                    | 规范入参（如 `lte_bands` / `nr_bands` / `limit_value` + `limit_unit`），旧格式仍兼容一版                    |
 
-**制式判断不要看 `rat` 文案**：它是 44 项映射表的输出（含 `"NSA"` / `"未知(xx)"`）。判 5G 用  
+**制式判断不应依据 `rat` 文案**：它是 44 项映射表的输出（含 `"NSA"` / `"未知(xx)"`）。判 5G 用  
 `/api/network/signal` 的 `band_label` 是否以 `n` 开头 —— 这个字段由 core 按"NR 优先、LTE 兜底"派生。
 
 #### 写操作的值域校验：400 `OUT_OF_RANGE`
@@ -167,7 +169,7 @@ core 不会向设备发任何请求**，直接回 `400` + `OUT_OF_RANGE` + 具�
 这与"命令发出去了但设备没写成"是**两种不同的结果**，客户端要分开处理：`OUT_OF_RANGE` 是自己传错了、  
 重试无用；设备侧失败可以重试。
 
-**但别用 HTTP 状态码来区分这两者** —— 设备失败时各端点回的码历史上就不一致，至今没统一  
+**但不应以 HTTP 状态码区分这两者**：设备失败时各端点返回的状态码并不一致，且未统一  
 （统一会改掉客户端在看的响应形状）：
 
 - 回 **200** + `{"success": false}`：`/api/device/cell-lock`、`/api/device/restart-schedule`、  
@@ -177,7 +179,7 @@ core 不会向设备发任何请求**，直接回 `400` + `OUT_OF_RANGE` + 具�
 - 回 **400** + `{"success": false}`：`/api/network/band`（**设备失败也是 400**，  
   和值域被拒同码不同体）
 
-可靠的判定方式只有两条，**别看状态码**：
+可靠的判定方式只有两条，**不以状态码为准**：
 
 1. 值域被拒 ⟺ 响应体里 `code == "OUT_OF_RANGE"`（失败体统一由 `ResponseHelper.fail` 生成，  
    固定含 `success:false` / `ok:false` / `error` / `message` / `code`，`error` 与 `message` 都是拒绝原因）；
@@ -189,11 +191,11 @@ core 不会向设备发任何请求**，直接回 `400` + `OUT_OF_RANGE` + 具�
 
 ### QoS 安全阀
 
-QoS 限的是 **core 自己往下打的量**，不是客户端往 core 打的量 —— 它保护的是设备后台和这台机器的  
+QoS 限制的是 **core 向设备发出的请求量**，而非客户端向 core 发出的请求量；它保护的是设备后台与本机的  
 CPU/温度，不是防刷。两个独立的自适应信号量（`GET /api/qos/status` 可看实时状态）：
 
 - **`GoformQoS`**（后端 → 设备 goform HTTP）：查询 4 并发（动态 1~~8）、写入 2 并发（动态 1~~4），  
-  外加 2 秒 TTL 的查询缓存。防的是"多个页面同时刷 + 后台采集"把设备后台打满 —— goform 并发一高  
+  外加 2 秒 TTL 的查询缓存。用于避免「多个页面同时刷新 + 后台采集」使设备后台过载：goform 并发过高  
   就会超时或返回空。
 - **`ShellQoS`**（后端 → 本机 shell）：root 5 并发（动态 2~~6）、普通 5 并发（2~~8）+ 2 秒缓存 + 批量合并。  
   防的是频繁 fork shell 进程导致 CPU 占用与温度飙升。
@@ -203,8 +205,8 @@ CPU/温度，不是防刷。两个独立的自适应信号量（`GET /api/qos/st
 `qos_enabled` / `qos_shell_max_concurrent` / `qos_cache_ttl_ms` / `qos_goform_query_max` /  
 `qos_goform_set_max` 这几个 `PUT /api/config` 字段调的就是这里。
 
-**HTTP 层没有全局限流。** 早期有个 `QoSMiddleware` 会对请求数限流并回 429，已于 2026-08-25  
-整个移除（`/api/*` 依赖鉴权拒绝，不再限频）。现在只有两处会因频率回 `429`：  
+**HTTP 层没有全局限流。** 请求数限流中间件（`QoSMiddleware`，超限返回 429）已移除  
+（`/api/*` 依赖鉴权拒绝，不再限频）。只有两处会因频率返回 `429`：  
 `/pairing/*`（每 IP 500ms 一次 + 密码错误锁定）与 `/api/speedtest/*`（并发位耗尽）。  
 客户端**不需要**为 `/api/*` 的 429 写重试逻辑。
 
@@ -212,12 +214,12 @@ CPU/温度，不是防刷。两个独立的自适应信号量（`GET /api/qos/st
 
 ## 认证与授权
 
-> 2026-08-28 起是**严格设备独立性**方案：每台设备一对 ECDSA P-256 密钥 + 一个独占 token。  
+> 认证采用**严格设备独立性**方案：每台设备一对 ECDSA P-256 密钥 + 一个独占 token。  
 > 权威实现 `core/common/.../DeviceAuth.kt`（验签方）、`app` 的 `DeviceKeyStore`、  
 > `web/src/composables/deviceIdentity.ts`。三端必须逐字节一致。
 >
-> **没有共享 secret，也没有全局 token**。旧文档里的「可选 HMAC 签名」「默认 Token 拒绝 403」  
-> 已随该方案一并废除，照旧文档实现的客户端一个请求都过不去。
+> **没有共享 secret，也没有全局 token**。可选的 HMAC 签名与「默认 Token 拒绝 403」策略  
+> 均不适用；按该策略实现的客户端无法通过任何请求。
 
 ### 每个请求必须同时满足四条
 
@@ -230,7 +232,7 @@ CPU/温度，不是防刷。两个独立的自适应信号量（`GET /api/qos/st
 | `X-Nonce`       | 客户端随机串（建议 16 字节 base64url），窗口内不可重复                        |
 | `X-Signature`   | 用设备私钥对下面的规范串做 ECDSA-SHA256 签名                             |
 
-**签名不是可选项。** 旧实现是「客户端不发头就跳过」，等于形同虚设；现在缺头直接拒。
+**签名不是可选项。** 缺少签名头时请求直接被拒绝。
 
 ### 规范签名串
 
@@ -245,7 +247,7 @@ METHOD \n URI \n TIMESTAMP_MS \n NONCE
 
 签名编码两端不同、由 core 归一化：Android Keystore 输出 **DER**（68-72 字节），  
 WebCrypto 输出 **raw r||s**（固定 64 字节），core 按长度判定后统一转 DER。  
-客户端**不要**自己做 DER 包装。base64 标准字母表与 base64url 都接受。
+客户端**不应**自行做 DER 包装。base64 标准字母表与 base64url 都接受。
 
 请求体**不在**签名内（Ktor 不缓存 body，为覆盖 body 而把 200MB 上传缓冲进内存不可接受）。  
 签名保证的是「请求来自持有私钥的设备且非重放」。
@@ -259,7 +261,7 @@ WebCrypto 输出 **raw r||s**（固定 64 字节），core 按长度判定后统
 ### 鉴权失败的响应
 
 失败体形状固定为 `{ "error": "...", "code": "..." }`，**状态码本身就是给客户端的指令**  
-（2026-09-08 拆分，此前一律回 444）：
+（客户端据此决定后续动作）：
 
 | 状态码        | 含义             | 客户端应做的事                       |
 | ---------- | -------------- | ----------------------------- |
@@ -277,11 +279,65 @@ WebCrypto 输出 **raw r||s**（固定 64 字节），core 按长度判定后统
 | `STALE_TIMESTAMP`        | 401  | `X-Timestamp` 超出 ±5min 窗口 → 校时后重试            |
 | `AUTH_STORE_UNAVAILABLE` | 503  | 服务端 `paired_devices.json` 读不出来，**判不了**你是否已配对 |
 
-为什么要拆 401/503 出来：444 在两端的约定是"清凭据、重新配对"。  
+区分 401/503 的原因：444 在两端的约定是「清除凭据、重新配对」。  
 时钟漂移、少发一个签名头、以及服务端配对文件损坏，都是**可自愈**的临时故障；  
-把它们也映射成 444，等于让一次临时故障销毁用户凭据 ——  
-2026-09-08 就发生过「Core 重启后配对文件损坏 → 全部客户端被判未配对 → 用户被迫重新输密码」。  
-降级态回 503 把这个事故从"全员重新配对"降级成"客户端退避重试"。
+若一并映射为 444，一次临时故障即会销毁用户凭据：  
+Core 重启后配对文件损坏曾导致全部客户端被判定为未配对，用户被迫重新输入密码。  
+降级状态返回 503，可将该故障的处理从「全部重新配对」降为「客户端退避重试」。
+
+### 破坏性操作的主人口令门（可选）
+
+> 默认**关闭**。开关是 `owner_gate_enabled`，经 `PUT /api/pairing/config` 写入
+>（`GET /api/pairing/status` 会回显当前值）。关着时下面这套完全不存在，端点行为与本手册其余部分一致。
+
+打开后，一批**不可逆 / 交出凭据**的端点会额外要一次**配对密码**：同一个密码、同一套节流
+（与「移除设备」「解除配对」共用 `PasswordAttemptLimiter`：同 IP 连错 5 次锁定，且校验前有全局递增延时）。
+
+**失败响应：**
+
+| HTTP | `code` | 含义 | 客户端应做的事 |
+|---|---|---|---|
+| 401 | `MISSING_PASSWORD` | 没带配对密码 | 弹一次输入框，带上密码重发 |
+| 401 | `INVALID_PASSWORD` | 密码错（未锁定） | 提示重输；**不要**拿同一个错误值重试，会把锁定额度撞掉 |
+| 429 | `PASSWORD_LOCKED` | 该 IP 连续错太多次 | 退避，别继续试 |
+
+**密码放在哪：**
+
+- 绝大多数端点：JSON 请求体的 `password` 字段（与其它参数并列）。
+- **body 是文件流或没有 body** 的端点（备份导入、删日志、程序卸载/取口令）：请求头
+  `X-Owner-Password`。
+
+> 请求体里的 `password` 优先，缺失时回落读头。所以客户端只需要一套重试逻辑：
+> 收到 `401 MISSING_PASSWORD` → 问用户要密码 → **给同一个请求加 `X-Owner-Password` 重发**，
+> 不用为每个端点判断密码该放 body 还是头。成功过一次的密码可以缓存在内存里（不要落盘），
+> 下次遇到 `INVALID_PASSWORD` 再清掉。
+
+**受保护的端点**（开关打开时）：
+
+| 分类 | 端点 |
+|---|---|
+| 设备擦除 | `POST /api/device/factory-reset`、`POST /api/device/goform/set`、`POST /api/config/reset`、`POST /api/backup/import` |
+| 执行代码 | `POST /api/shell/exec`、`POST /api/tasks` / `PUT /api/tasks/{id}` / `POST /api/rules` / `PUT /api/rules/{id}`（仅 `actionType=custom_shell`） |
+| 证据与授权销毁 | `DELETE /api/debug-logs/files`、`DELETE /api/pairing/devices/{fingerprint}`、`DELETE /api/pairing/blacklist/{fingerprint}`、`POST /api/pairing/blacklist/clear`、`POST /api/apps/uninstall`、`POST /api/programs/{id}/uninstall` |
+| 凭据外发 | `POST /api/programs/{id}/secret`、`POST /api/backup/export` |
+
+**两个条件门**（只在特定改动时要密码，日常保存不受影响）：
+
+- `PUT /api/config`：仅当**值真的变了**且属于「重指向」（`goform_ip` / `goform_port` / `update_url`）
+  或「打开危险开关」（`goform_command_enabled` / `ttyd_enabled` 由关变开）时要求密码。
+  改 `goform_ip` 之后 core 会把已存的设备口令发到那个地址，所以这条必须拦。
+- `PUT /api/pairing/config`：**关掉总开关本身**要密码（打开不需要）——
+  否则任何已配对客户端发一个请求就能把门关掉，这道门等于装饰。
+
+**明确不受影响**（这是本门刻意收窄的部分）：安装 APK、安装/启停第三方程序、组件安装与更新、
+替换 Web 前端包、隧道增删改、`/ws/terminal` 的交互式终端。
+
+> 设备**从未设过配对密码**时，开关即使打开也不会要求密码（首次配对必然设密码，
+> 所以实际只影响从很早的版本升级上来、从未设过密码的存量设备）。
+>
+> **回归脚本**：`node scripts/verify-owner-gate.mjs --base <url> --password <配对密码>` ——
+> 自己配对、自己签名，逐条打这道门（含两个条件门）。需要一台跑着 core 的设备或模拟器，
+> 不进 CI：`adb -s <serial> forward tcp:18088 tcp:8088` 后指向 `http://127.0.0.1:18088` 即可。
 
 ### 免鉴权范围
 
@@ -290,7 +346,7 @@ WebCrypto 输出 **raw r||s**（固定 64 字节），core 按长度判定后统
 - `/api/**` 之外的一切（`/health`、`/pairing/**`、`/ws/realtime`、`/` 与 SPA 静态资源）  
   本来就不过鉴权中间件；
 - 中间件内部另有一份 `isPublic` 白名单（`/health`、`/ws/`、`/pairing/`、`/pair`、`/`），  
-  那是纵深防御 —— 将来若把配对端点搬进 `/api` 也不会死锁。
+  那是纵深防御：将来若将配对端点迁入 `/api`，也不会产生鉴权死锁。
 
 WebSocket 有自己的一套握手鉴权（query 参数，见 [WebSocket /ws/realtime](#websocket-wsrealtime)）。
 
@@ -332,7 +388,7 @@ WebSocket 有自己的一套握手鉴权（query 参数，见 [WebSocket /ws/rea
 | 429 | 请求过于频繁 / 密码错误锁定 / 测速并发位耗尽                                                                                                                               |
 | 444 | **`/api/**` 凭据失效**（自定义码：没带 token / token 不认识 / 记录缺公钥），客户端据此判「需重新配对」                                                                                     |
 | 500 | 服务器内部错误                                                                                                                                                 |
-| 503 | `/api/**` 配对存储不可读（`AUTH_STORE_UNAVAILABLE`），带 `Retry-After`，**不要**清凭据                                                                                   |
+| 503 | `/api/**` 配对存储不可读（`AUTH_STORE_UNAVAILABLE`），带 `Retry-After`，**不得**清凭据                                                                                   |
 
 `/api/**` 的鉴权失败按「是不是可自愈」分流：凭据真失效走 444，  
 签名/时间戳这类请求级问题走 401，服务端存储降级走 503（见[认证与授权](#认证与授权)）。
@@ -382,8 +438,8 @@ WebSocket 有自己的一套握手鉴权（query 参数，见 [WebSocket /ws/rea
 3. `POST /pairing/confirm` —— 带 `device_pubkey` + `challenge` + 对 challenge 的签名 + 密码，  
    换回该设备独占的 `token` 与服务端计算的 `fingerprint`。
 
-**指纹由服务端据公钥算，不接受客户端自报。** 旧版 Web 上报常量指纹，导致所有浏览器在服务端  
-看来是同一台设备、配对上限完全失效 —— 这是本方案要修的根因，不要退回去。
+**指纹由服务端根据公钥计算，不接受客户端自报。** 若客户端上报常量指纹，所有浏览器在服务端将  
+被视为同一台设备，配对上限完全失效；因此客户端不得上报自报指纹。
 
 #### 从零到能调 API 的最短路径
 
@@ -402,9 +458,9 @@ POST /pairing/confirm
        "device_pubkey": "<SPKI DER base64>",
        "challenge": "Zm9vYmFy...",
        "signature": "<sign(challenge)>",
-       "password": "mypass123",          # 首次配对：这就是新配对密码
+       "password": "<配对密码>",          # 首次配对：这就是新配对密码
        "device_name": "My Browser" }
-     → { "token": "abc...", "fingerprint": "Xy9..." }
+     → { "token": "<token>", "fingerprint": "<fingerprint>" }
 
 # ④ 之后每个 /api 请求都要四件套（缺一即 401 INVALID_SIGNATURE）
 GET /api/dashboard/summary
@@ -475,12 +531,12 @@ GET /api/dashboard/summary
   "device_pubkey": "<X.509 SPKI DER 的 base64>",
   "challenge": "<上一步拿到的挑战原文>",
   "signature": "<用设备私钥对 challenge 原文的 ECDSA-SHA256 签名>",
-  "password": "device-password",
+  "password": "<配对密码>",
   "device_name": "My Phone",
   "device_hwid": "<硬件派生稳定标识，可选>",
   "goform_ip": "192.168.0.1",
   "goform_port": 80,
-  "goform_password": "admin"
+  "goform_password": "<设备后台密码>"
 }
 ```
 
@@ -523,7 +579,7 @@ Goform 配置格式 → 密码 → 落库。
 - `409` — `{ "error": "Device already paired", "code": "ALREADY_PAIRED" }`（**语义是配对数已达 `pairing_max_devices`**，不是"这台已配对"；已配对指纹允许刷新）
 - `429` — `{ "error": "Too many failed password attempts, retry later", "code": "PASSWORD_LOCKED" }`
 
-> `error` 是**给人看的**提示文案，会随产品措辞调整（配对密码相关的几条已是中文）；`code` 才是**给程序判断的**稳定标识。客户端一律按 `code` 分支，不要匹配 `error` 内容。core 侧日志仍记英文原文，便于与历史日志对照。
+> `error` 是**给人看的**提示文案，会随产品措辞调整（配对密码相关的几条已是中文）；`code` 才是**给程序判断的**稳定标识。客户端一律按 `code` 分支，不得匹配 `error` 内容。core 侧日志仍记录英文原文，便于与历史日志对照。
 
 #### `POST /pairing/change-password`
 
@@ -536,11 +592,11 @@ Goform 配置格式 → 密码 → 落库。
 
 ```json
 {
-  "old_password": "old-pass",
-  "new_password": "new-pass",
+  "old_password": "<旧配对密码>",
+  "new_password": "<新配对密码>",
   "goform_ip": "192.168.0.1",
   "goform_port": 80,
-  "goform_password": "admin"
+  "goform_password": "<设备后台密码>"
 }
 ```
 
@@ -638,18 +694,37 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 
 解除所有设备的配对，并清掉调用方 IP 的配对速率限制。
 
+设备已设过配对密码时**必须带密码**：同一个 handler 还挂在**免鉴权**的 `/pairing/*` 上，
+密码是那条路径上唯一的门，少它等于同 WiFi 任何人都能踢掉全部配对。
+
+**请求体：**
+
+```json
+{ "password": "配对密码" }
+```
+
 **响应：** `{ "success": true, "message": "All devices unpaired, re-entered pairing mode" }`
+
+**错误码：** `401 MISSING_PASSWORD`（没带）、`401 INVALID_PASSWORD`（密码错）、
+`429 PASSWORD_LOCKED`（连续错到阈值）。
 
 #### `POST /api/pairing/unpair/{fingerprint}`
 
-解除指定指纹的设备配对（**不校验配对密码**；需要双因素的版本见  
-`DELETE /api/pairing/devices/{fingerprint}`）。
+解除指定指纹的设备配对。与上面同样要配对密码。
 
 **路径参数：**
 
 - `fingerprint` — 要解除配对的设备指纹
 
+**请求体：**
+
+```json
+{ "password": "配对密码" }
+```
+
 **响应：** `{ "success": true, "message": "Device unpaired" }`
+
+**错误码：** 同 `POST /api/pairing/unpair`。
 
 #### `PUT /api/pairing/config`
 
@@ -739,21 +814,11 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 
 #### `DELETE /api/pairing/devices/{fingerprint}`
 
-解除指定设备的配对（**双因素**：已鉴权 + 配对密码）。
+解除指定设备的配对。只要求已配对身份（Bearer + 设备签名），**没有请求体**。
 
 **路径参数：**
 
 - `fingerprint` — 要解除配对的设备指纹（同上，可含 `/`）
-
-**请求体：**
-
-```json
-{
-  "password": "device-password"
-}
-```
-
-- `password` — 必填，配对密码。请求体解析失败等同未传 → `MISSING_PASSWORD`
 
 **响应：**
 
@@ -766,17 +831,13 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 删除即吊销：每台设备持有独占 token（记录里只存哈希），删掉记录后该 token 立即失效，  
 其余设备不受影响 —— **不再有 `rotated` 字段**，也不存在「移除最后一台就轮换全局凭据」那种连坐设计。
 
+撤销授权不等于拒绝回来：对方要重新配对仍需配对密码；要彻底拒绝请用黑名单。
+
 **错误码：**
 
-- `401 MISSING_PASSWORD` — `请输入配对密码`
-- `401 INVALID_PASSWORD` — `配对密码错误`
 - `404 DEVICE_NOT_FOUND` — `Device not found`
-- `429 PASSWORD_LOCKED` — `Too many failed password attempts, retry later`
 
-> 密码失败计数与免认证的 `/pairing/*` **共用同一个全局节流器**：在那边试错被锁，这里同样会先被 `delay` 拖住再返回 —— 换端点绕不开节流。所以本端点的响应时间可能被人为拉长，客户端超时别设得太短。  
-> 自己删自己也是允许的：删掉当前设备的记录后，本次请求用的 token 立即失效，后续请求会 401。
-
-- `429` — `{ "error": "Too many failed password attempts, retry later", "code": "PASSWORD_LOCKED" }`
+> 自己删自己也是允许的：删掉当前设备的记录后，本次请求用的 token 立即失效，后续请求会 444。
 
 ---
 
@@ -880,6 +941,9 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
   `network_status` 每段都包在 `runCatching + withTimeout`（device_info 8s，其余 5s）里，  
   超时或抛异常那一段就是 `null` 而**整个请求仍回 200**。客户端必须对每段做空判断，  
   不能假设字段一定存在。`device_info.identity` 同理（取不到时为 `null`）。
+- **`network_status` 与 `GET /api/network/status` 是同一份判定**：`mobile_data` 是开关意图
+  （不是 `ppp_status` 的投影），`ppp_status` 是链路态，两者在换制式的重拨窗口里会**不一致**
+  （开关开、链路断）—— 这是预期行为，说明见 `/api/network/status` 那一节。
 
 电池字段名是 `is_charging`（snake_case），**不是 `isCharging`**；`level` 是原始电量、  
 `percent` 才是换算后的百分比（`level*100/scale`，取不到时为 `-1`）。  
@@ -956,7 +1020,7 @@ Web 面板直接挂在**根路径**，没有 `/web` 前缀。
 Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分钟。**默认关闭，且响应经过脱敏。**
 
 - **开关**：配置项 `goform_dump_enabled`（默认 `false`）。关闭时回 `403` `FORBIDDEN`，  
-  这不是鉴权失败，客户端不要据此跳登录页。
+  这不是鉴权失败，客户端不应据此跳转登录页。
 - **脱敏**：打开后手机号 / IMEI / IMSI / ICCID（含 `sim_msisdn`、`sim_imsi` 这类同义字段名）  
   以及任何名字里带 `passphrase`/`password`/`passwd`/`pwd`/`secret`/`token` 的字段，值一律是 `***`。  
   key 本身保留（这个端点的用途就是看设备到底有哪些字段）。要真值请走对应的业务端点。
@@ -969,7 +1033,7 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 用于读取 profile 白名单之外的字段，**不属于稳定契约**。
 
 - **开关**：配置项 `goform_command_enabled`（默认 `false`）。关闭时回 `403` `FORBIDDEN`  
-  （不是鉴权失败，别跳登录页）。
+  （不是鉴权失败，不应跳转登录页）。
 - **鉴权**：路由在 `/api` 下，与其它 `/api` 端点一样要带 Bearer + `X-Timestamp`/`X-Nonce`/`X-Signature`  
   （见[认证与授权](#认证与授权)）；缺任一项回 401 `INVALID_SIGNATURE`。
 - **不脱敏**：返回值是设备真值 —— 密码、IMEI、ICCID 都不打码。这是它必须默认关的原因。  
@@ -1007,6 +1071,7 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
   参数正确性由调用方自负，写坏设备配置的后果也由调用方承担。
 - **审计**：每次调用记 WARN 日志，只记 `goformId` 与参数**键名**（不记值，避免密码进日志）。
 - **缓存**：写成功后**清空整个 `ResponseCache`**（裸命令可能改任何东西，无法精确失效）。
+- **更新进行中拒绝**：`409 UPDATE_IN_PROGRESS`（与 OTA 抢同一块盘会写出半条配置）。
 
 **入参：**
 
@@ -1078,7 +1143,7 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 
 #### `GET /api/device/qos`
 
-当前 EPS 承载协商到的 QoS（QCI 与上下行 AMBR）。**全仓唯一以 AT 指令作为数据源的读端点**。
+当前 EPS 承载协商到的 QoS（QCI 与上下行 AMBR）。**仓库内唯一以 AT 指令作为数据源的读端点**。
 缓存 5 分钟（`CacheTTL.DEVICE_QOS`）。实现见 `DeviceRoutes` 的 `/qos` 与
 `core/collector/.../at/CgeqosrdpParser.kt`。
 
@@ -1097,7 +1162,7 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 上例即 QCI 8、下行 500000 kbps = 500 Mbps、上行 100000 kbps = 100 Mbps。
 
 解析是宽容的：非 `+CGEQOSRDP:` 的行（回显、`OK`、空行）跳过；前缀允许被回显污染
-（实测见过 `Q+CGEQOSRDP:` 这种吃掉一个字符的形态）；单行字段不足或关键位非数字只丢那一行，
+（实测存在 `Q+CGEQOSRDP:` 这类丢失一个字符的形态）；单行字段不足或关键位非数字时只丢弃该行，
 不会让一行坏数据毁掉整次解析。
 
 **响应：**
@@ -1139,10 +1204,10 @@ Goform 协议完整设备状态（75+ 字段，分 3 批查询）。缓存 5 分
 
 **调用方约定**
 
-不要放进高频轮询。AT 通道是全局互斥的（`ATChannel` 有 500ms 最小间隔、失败指数退避、
-连续 20 次失败熔断），抢锁超时是 10s；落在仪表盘 10s 轮询的关键路径上会把整页拖住。
+不应放入高频轮询。AT 通道为全局互斥（`ATChannel` 具有 500ms 最小间隔、失败指数退避、
+连续 20 次失败熔断），获取锁的超时为 10s；若位于仪表盘 10s 轮询的关键路径上，会阻塞整个页面。
 app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSilently`，与
-`/api/device/version` 同一手法），重新驻网后的新值靠重进页面刷新。
+`/api/device/version` 同一方式），重新驻网后的新值靠重进页面刷新。
 
 #### `GET /api/device/model`
 
@@ -1174,7 +1239,7 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 
 #### `GET /api/device/magisk`
 
-特权 shell 状态（无缓存）。**端点名是历史遗留** —— 早期检测 Magisk，现在实现换成了  
+特权 shell 状态（无缓存）。**端点名为历史遗留**：最初用于检测 Magisk，当前实现已改为  
 `SystemController.getPrivilegedShellStatus()`，报告的是 ADB shell 可用性与当前 uid，  
 **与 Magisk 无关**。
 
@@ -1190,7 +1255,7 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 
 - `method` 只有两个值：`"adb_shell"`（可用）/ `"none"`；
 - `uid` 是 `id` 命令的**原始 stdout**，执行失败时是字符串 `"unavailable"`；
-- **没有 `hasRoot` / `magiskVersion` 字段**，别按它们判 root。要判有没有特权，  
+- **没有 `hasRoot` / `magiskVersion` 字段**，不应据此判断 root。要判断是否具备特权，  
   看 `adb_shell` 或 `GET /api/diagnose` 的 `root` 字段。
 
 #### `GET /api/device/thermal`
@@ -1212,10 +1277,10 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 | 字段          | 类型     | 说明                                                                        |
 | ----------- | ------ | ------------------------------------------------------------------------- |
 | name        | string | 取自各 zone 的 `type` 文件；读不到时回落成目录名（如 `"thermal_zone3"`）                      |
-| temperature | double | 摄氏度（内核给的是毫摄氏度，core 已 `/1000`）。**读不到或解析失败是 `0.0`，不是 null** —— 别把 0 当"0℃"展示 |
+| temperature | double | 摄氏度（内核给的是毫摄氏度，core 已 `/1000`）。**读不到或解析失败时为 `0.0`，不是 null** —— 不应将 0 作为「0℃」展示 |
 | count       | int    | `zones` 长度                                                                |
 
-> `/sys/class/thermal` 不存在时返回 `{"zones": [], "count": 0}`（不报错）。zone 的数量与命名完全由内核决定，同型号不同固件都可能变，客户端别按固定下标取值。
+> `/sys/class/thermal` 不存在时返回 `{"zones": [], "count": 0}`（不报错）。zone 的数量与命名完全由内核决定，同型号不同固件均可能变化，客户端不应按固定下标取值。
 
 #### `GET /api/device/connections`
 
@@ -1260,7 +1325,7 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 }
 ```
 
-**别拿它当"今日/本月用量"用**，实现有两个硬限制：
+**不应将其作为「今日/本月用量」使用**，实现存在两个硬限制：
 
 - **不按时间切分**：`getCellularDataUsage(start, end)` 收了时间参数但**根本没用**，读的是  
   sysfs 累计计数器（自上次网络栈重置以来）。所以 `today` 与 `month` 恒等，都是"至今累计"；
@@ -1292,7 +1357,7 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 | `alert_percent`      | string  | 告警百分比，缺省 `"80"`                                                                                                                                                                                                                                            |
 | `auto_clear`         | boolean | 是否按月自动清零                                                                                                                                                                                                                                                   |
 | `clear_date`         | string  | 清零日，缺省 `"1"`                                                                                                                                                                                                                                               |
-| `used_bytes`         | number  | 本月已用 = `monthly_rx_bytes + monthly_tx_bytes`（core 算好，客户端别再加一遍）                                                                                                                                                                                             |
+| `used_bytes`         | number  | 本月已用 = `monthly_rx_bytes + monthly_tx_bytes`（由 core 计算，客户端不应重复累加）                                                                                                                                                                                             |
 | `monthly_rx_bytes`   | number  | 本月下行（下载）。⚠️ ZTE 固件的同名字段其实是上行，方向已在设备适配层（`ZteGoformProfile`）掰正，客户端拿到的就是下载                                                                                                                                                                                    |
 | `monthly_tx_bytes`   | number  | 本月上行（上传）。同上，对应固件的 `monthly_rx_bytes`                                                                                                                                                                                                                       |
 | `monthly_time`       | number  | 本月在线时长（秒）                                                                                                                                                                                                                                                  |
@@ -1318,16 +1383,16 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 
 > **旧字段 `limit_size` / `limit_unit` 已不再输出。** 设备侧把限额存成 `"470_1024"` 复合串  
 > （乘数 `1=MB / 1024=GB / 1048576=TB`），而 `data_volume_limit_unit` 恒为 `"MB"` 不代表真实单位 ——  
-> 这两个坑现在完全被 core 吃掉，复合串只存在于 profile 的 `WriteSpec.encode`。  
+> 两处差异完全由 core 处理，复合串只存在于 profile 的 `WriteSpec.encode`。  
 > 写入侧（`POST /api/device/data-limit`）收 `limit_value` + `limit_unit`。
 
-> ⚠ **本端点不受排障开关 `field_normalization_enabled` 影响（2026-09-22 起）。**  
+> ⚠ **本端点不受排障开关 `field_normalization_enabled` 影响。**  
 > 其余读端点关掉那个开关会变回设备原名，**这一个不会** ——「本月已用」「限额」「告警百分比」  
 > 照旧是上面那套 canonical 字段。原因是这里不是透传出口，而是**按 canonical 重组**的派生出口：  
 > `limit_value` / `limit_unit_display` / `limit_bytes` 是 core 从复合串拆出来的派生键，  
 > **设备上不存在任何同名字段**；`monthly_rx_bytes` / `monthly_tx_bytes` 的方向是 core 掰正的  
 > （固件把上下行报反）。  
-> 2026-09-22 实测过跟着降级的后果，所以这个例外是刻意的：  
+> 该例外是刻意的，原因如下：  
 > ① `limit_bytes` 等三个键谁都兜不到，响应会退化成默认值（`enabled:false`、`limit_value:""`、  
 > `limit_unit_display:"GB"`、`limit_bytes:0`、`alert_percent:"80"`、`clear_date:"1"`），  
 > **字段一个不缺、HTTP 200、没有任何错误码，但值全错**；  
@@ -1343,6 +1408,11 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 设备开关类设置。缓存 5 分钟。**值域全是字符串**（goform 时代遗留），布尔用 `"1"`/`"0"`，  
 个别字段额外接受 `"on"`/`"off"`。字段缺失即省略该 key。
 
+**`?fresh=1`：绕开 5 分钟读缓存，直读设备，并将读到的值回填缓存。**
+用于「写入后需确认设备状态是否变化」的客户端：制式切换的回读确认首次在 +600ms 发生，
+那时设备还在重新注册、报的还是旧档位；若这次读进了缓存，后面整个轮询窗口读到的都是同一份
+旧快照，确认必然超时，界面也会停在旧值上直到缓存过期。普通轮询不应携带该参数。
+
 **响应字段：**
 
 | 字段                         | 说明                                                     |
@@ -1355,7 +1425,7 @@ app 侧的做法是进页面静默拉一次（`DashboardModule.loadDeviceQosSile
 | `restart_time`             | 定时重启时间，`"HH:mm"`                                       |
 | `sleep_sysIdleTimeToSleep` | WiFi 休眠空闲分钟数，`"0"` = 不休眠                               |
 | `BearerPreference`         | 网络模式（承载偏好）的**写入侧**字段，设备侧枚举串；回读可能为空或停留在未应用的值            |
-| `net_select`               | 网络模式的**回读真源**（真机切换后变化的是它）；缺失时才回落 `BearerPreference`      |
+| `net_select`               | 网络模式的**回读依据**（真机切换后变化的是该字段）；缺失时才回落 `BearerPreference`      |
 | `connection_mode`          | 连接模式，`"auto"` / `"manual"`；部分固件填 `"1"` / `"hand"` 表示手动 |
 | `roam_setting_option`      | 数据漫游，`"1"` 或 `"on"` = 开                                |
 | `dial_roam_setting_option` | 拨号漫游，`roam_setting_option` 的同义字段（部分固件只填这个）             |
@@ -1412,7 +1482,7 @@ LAN / DHCP 设置。缓存 10 分钟。值域全是字符串，缺失即省略�
 ```
 
 > 旧字段 `lan_ip` / `dhcp_type` 已不存在。`dhcpLease` 与 `dhcpLease_hour` 是**两个不同字段**  
-> （秒 / 小时）而不是别名，取到前者用前者，否则后者 ×3600。命名不规范但已被两端固化，不改。  
+> （秒 / 小时）而不是别名，取到前者用前者，否则后者 ×3600。命名不规范但已被两端固化，不再修改。  
 > 写入侧是 `POST /api/device/dhcp`。
 
 ---
@@ -1435,15 +1505,20 @@ LAN / DHCP 设置。缓存 10 分钟。值域全是字符串，缺失即省略�
 
 **请求体：** 无
 
-**响应：** `{ "success": true }`；失败 `500 { "success": false }`
+**响应：** `{ "success": true }`；失败 `500 { "success": false }`  
+更新进行中 → `409 CONFLICT` + `code=UPDATE_IN_PROGRESS`（OTA 半写保护）
 
 #### `POST /api/device/factory-reset`
 
 恢复出厂设置。**先失效全部缓存**（`invalidate("*")`，含非 device 前缀），再下发命令。
 
+擦除设备全部配置，且会让设备回到「任何人都能重新初始化」的状态 —— 客户端应在确认框里
+明确写出这一点，并避免做成一次点击即可触发。
+
 **请求体：** 无
 
-**响应：** `{ "success": true }`；失败 `500 { "success": false }`
+**响应：** `{ "success": true }`；失败 `500 { "success": false }`  
+更新进行中 → `409 CONFLICT` + `code=UPDATE_IN_PROGRESS`
 
 #### `POST /api/device/shutdown`
 
@@ -1451,7 +1526,8 @@ LAN / DHCP 设置。缓存 10 分钟。值域全是字符串，缺失即省略�
 
 **请求体：** 无
 
-**响应：** `{ "success": true }`；失败 `500 { "success": false }`
+**响应：** `{ "success": true }`；失败 `500 { "success": false }`  
+更新进行中 → `409 CONFLICT` + `code=UPDATE_IN_PROGRESS`（与 `reboot` 一致）
 
 #### `POST /api/device/debug`
 
@@ -1475,8 +1551,8 @@ LAN / DHCP 设置。缓存 10 分钟。值域全是字符串，缺失即省略�
 
 ```json
 {
-  "old_password": "old123",
-  "new_password": "new456"
+  "old_password": "<旧密码>",
+  "new_password": "<新密码>"
 }
 ```
 
@@ -1600,7 +1676,7 @@ Samba 文件共享开关。失效 `device:settings` 缓存。
 **校验：** 三个字段必填；`pci` / `earfcn` 只能是数字；`network_type` 取 `LTE` / `NR`  
 （也收设备侧数字码 `12` / `16`）。不合法回 400 `OUT_OF_RANGE`，**不向设备发请求**。
 
-> 兼容一版：旧入参用设备风格的 `rat`（如 `"lte"`），收到会当 `network_type` 用并打 warn。新代码别用。
+> 兼容一版：旧入参使用设备风格的 `rat`（如 `"lte"`），收到后按 `network_type` 处理并记录 warn 日志。新代码不应使用该入参。
 
 **响应：** `{ "success": true }`
 
@@ -1698,7 +1774,7 @@ DHCP 设置。成功后失效 `device:lan` 缓存。
 
 设备侧的 `"470_1024"` 复合串由 profile 的 `WriteSpec` 拼，**客户端不该看见它**。
 
-> 兼容一版：仍收旧的复合串 `limit_size: "470_1024"`，收到会**覆盖**同请求里的 `limit_value`/`limit_unit` 并打 warn 日志。新代码别用；也别两种一起发。
+> 兼容一版：仍收旧的复合串 `limit_size: "470_1024"`，收到会**覆盖**同请求里的 `limit_value`/`limit_unit` 并打 warn 日志。新代码不应使用该入参，也不应同时提交两种格式。
 
 **响应：** `{ "success": true }`
 
@@ -1715,7 +1791,7 @@ DHCP 设置。成功后失效 `device:lan` 缓存。
 }
 ```
 
-`target` 取 `"data"`（默认，其他任意值也按 data 走）或 `"time"`；`value` 是要校准成的值，**缺省是 `"0"`** —— 忘传就等于把计数器清零，别靠默认值。
+`target` 取 `"data"`（默认，其他任意值也按 data 走）或 `"time"`；`value` 是要校准成的值，**缺省为 `"0"`** —— 遗漏该字段会将计数器清零，不应依赖默认值。
 
 > 兼容一版：旧入参是设备侧三件套 `way` / `data` / `time`（未校准的那个要自己填 `"0"`），  
 > 收到 `way` 会打 warn。补零规则现在在 profile 的 `WriteSpec` 里。
@@ -1775,19 +1851,19 @@ DHCP 设置。成功后失效 `device:lan` 缓存。
 | 字段                | 说明                                                 |
 | ----------------- | -------------------------------------------------- |
 | `band`            | 频段号，纯数字（`"78"` / `"3"`）                            |
-| `band_label`      | 频段显示名，core 拼好（`"n78"` / `"B3"`）。**前端直接显示，不要自己拼前缀** |
+| `band_label`      | 频段显示名，core 拼好（`"n78"` / `"B3"`）。**前端直接显示，不应自行拼接前缀** |
 | `arfcn`           | 服务小区频点（NR-ARFCN 或 EARFCN）                          |
 | `band_width`      | 带宽 kHz。设备经常不填，缺失即省略该 key                           |
 | `signal_strength` | 服务小区信号强度 dBm                                       |
 | `pci`             | 服务小区物理小区标识                                         |
 
 这几个是 core **派生**的字段，选择规则是「**按字段是否存在判定，NR 优先、LTE 兜底**」。  
-NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n` 开头，**不要解析 `rat` 文案**  
+NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n` 开头，**不应解析 `rat` 文案**  
 （它是 44 项映射表的输出，含 `"NSA"` / `"未知(xx)"`，固件加新值时按它分支会静默走错）。  
 `nr_*` / `lte_*` 原字段全部保留，需要看双连接的场景仍读那两组。
 
 > sinr 和 rsrq 值为原始值（部分固件需除以 10 得到 dB；本机固件的 `Lte_snr` / `Nr_snr`  
-> 直接就是 dB，客户端不要无条件除 10）。
+> 直接就是 dB，客户端不应无条件除以 10）。
 >
 > `rsrp` / `sinr` / `rsrq` / `rssi` / `cell_id` 是**当前服务小区的合并值**，4G 驻网时装的是  
 > `lte_*` 的数据。`nr_*` 与 `lte_*` 两组是制式专属字段（源自 goform `network_information`），  
@@ -1825,7 +1901,7 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 
 #### `GET /api/network/status`
 
-网络状态（Android 连通性 + 设备侧 PPP / 运营商 / 网络制式）。goform 部分由 DataHub 缓存 30 秒（单次查询合并 `network_type` + `provider` + `ppp_status`，5s 超时）。
+网络状态（Android 连通性 + 设备侧 PPP / 运营商 / 网络制式）。`network_type` / `operator` 由 DataHub 缓存 30 秒（单次查询合并，5s 超时）；**`ppp_status` 与开关判定用的链路读数不吃这份缓存**，每次单独读（底层有 2s 传输层缓存，不额外压设备）。
 
 **响应：**
 
@@ -1847,18 +1923,35 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 | 字段             | 说明                                                                                                                    |
 | -------------- | --------------------------------------------------------------------------------------------------------------------- |
 | `network`      | **嵌套对象**（不是字符串），来自 Android `ConnectivityManager`：4 个布尔键 `is_connected` / `has_internet` / `has_cellular` / `has_wifi` |
-| `mobile_data`  | 优先取设备侧 PPP 连通状态；DataHub 不可用时退回 Android `isMobileDataEnabled()`                                                        |
-| `ppp_status`   | 设备原值，取不到时是**空串**（不是 null）                                                                                             |
+| `mobile_data`  | **移动数据开关（用户意图）**，不是链路态：core 记下每一次成功的开/关，换制式后的重拨窗口里仍报「开」。详见下方说明 |
+| `ppp_status`   | 设备原值（链路态），取不到时是**空串**（不是 null）。**每次都单独实时读，不吃 30s 缓存** |
 | `operator`     | 设备侧 provider，为空时退回 Android `getOperatorName()`                                                                        |
 | `network_type` | **已经是可读文案**（`"5G"` / `"4G"`…），设备数字码在 core 的 profile 解码器里翻译完了                                                          |
 
-> 客户端**不要再做一次数字码→文案的映射**：core 侧 `NETWORK_TYPE_DECODER` 已经翻译过，
-> 原来两端各有一份 `mapNetworkType()` 已删。
-> 状态类命令直接回文本（真机 2026-09-15：`cmd=network_type,...` 回 `"5G"`），非数字**原样透出**；
+> **`mobile_data` 与 `ppp_status` 含义不同。**
+> 设备侧**没有**可读的数据开关字段（真机 96 字段 dump 与厂商 Web UI 的 203 个字段名均已核对），
+> 唯一能表达连接状态的是 `ppp_status`。但切换制式、锁频、关闭飞行模式都会使设备**先拆链再重拨**，
+> 在此期间的十几到几十秒内 `ppp_status` 必然为断开状态；若直接以其作为开关，web 与 app 上会出现
+> 「实际为开启却显示关闭，刷新后才恢复」。
+>
+> `mobile_data` 由 core 的 `MobileDataIntent` 维护：显式写操作（`/network/data`、`/connect`、
+> `/disconnect`、切制式后的自动恢复）记录意图；链路连通则报告为开。链路断开时分两种情形：
+>
+> - **已知会拆链的操作**（切制式 / `/bearer`、锁频重启网络栈、拨号）具有 **120s 豁免窗口**，
+>   窗口内的断链一律报告为「开」，即「切换制式造成的短暂断开不计为关闭」；
+> - **来源不明**的断链仅容忍 **30s**（信号抖动或厂商 UI 手动断开），超时才判定为确实关闭。
+>
+> 判断「当前能否上网」应读取 `ppp_status` 或 `network.has_internet`，
+> **不得**由 `mobile_data` 推断链路状态。
+
+
+> 客户端**不应再次进行数字码到文案的映射**：core 侧 `NETWORK_TYPE_DECODER` 已完成翻译，
+> 两端原有的 `mapNetworkType()` 均已删除。
+> 状态类命令直接返回文本（真机验证：`cmd=network_type,...` 返回 `"5G"`），非数字**原样透出**；
 > 纯数字才查表，表里只有**已验证**的对应关系：`20`→5G、`19`→5G NSA、`13`→4G、`9`→3G、`4`→2G、`0`→无服务。
-> 没验证过的数字码一律输出 `未知(原值)` —— 补表前先真机对照一次。
-> （2026-09-15 前那张 44 项表是多套厂商编码拼的，把 `13` 译成 `TDSCDMA`，4G/5G 驻网时两端界面
-> 都显示 TDSCDMA。别再凭猜往表里加。）
+> 未验证的数字码一律输出 `未知(原值)`；扩充映射表前需在真机上核对。
+> （既有的 44 项映射表由多套厂商编码拼合而成，曾将 `13` 译为 `TDSCDMA`，导致 4G/5G 驻网时两端界面
+> 均显示 TDSCDMA；不得在无实测依据的情况下向表中添加条目。）
 
 #### `GET /api/network/band-status`
 
@@ -1901,7 +1994,7 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 与 `station_list` 同理，数组值可能是数组也可能是数组的 JSON 字符串，两种都要能解。
 
 > **本端点只带 LTE 侧字段。** `network_type` 与 `Nr_*` 归 SIGNAL 分组，  
-> 从 2026-08-29 的分组白名单起**不再出现在这里** —— 当前服务小区（NR 优先）读  
+> 自分组白名单起**不再出现在这里** —— 当前服务小区（NR 优先）读  
 > `/api/network/signal` 的 `band` / `band_label` / `arfcn` / `pci` / `signal_strength`。  
 > 少拉一个接口的后果是：5G 驻网时基站页会静默显示 4G 的 PCI/频点。  
 > 旧文档写的 `serving_cell` / `neighbor_cells` / `locked_cell` 三段嵌套结构从来不是实际形状。
@@ -1926,7 +2019,12 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 
 #### `POST /api/network/data`
 
-移动数据开关。成功后失效 DataHub 网络缓存。
+移动数据开关。成功后失效 DataHub 网络缓存，并把这次开关记为「用户意图」——
+`/api/network/status` 的 `mobile_data` 立刻反映目标值，不必等设备完成拨号/拆链
+（`mobile_data` 反映开关意图，与链路状态解耦）。
+
+返回 `success` 只代表命令被设备接受，**不代表已经连上/断开**：确认要读 `ppp_status`
+（与 web / app 的确认器同一判据）。`POST /api/network/connect`、`/disconnect` 同样会更新这份意图。
 
 **请求体：**
 
@@ -1994,10 +2092,10 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 
 设置网络模式。写成功后失效三个读缓存：`device:settings`、`network:band-status`、`hub:network-type-info`。
 
-> **2026-09-15 修**：原来只失效 `network:band-status`，而客户端确认切换是否生效读的是
+> **三个缓存必须同时失效**：客户端确认切换是否生效时读取的是
 > `GET /api/device/settings`（TTL 5 分钟）与 `GET /api/network/status`（TTL 30 秒）。
-> 两者不清，回读在整个预算窗口内拿到的都是**写入前的快照**，于是「设备其实切完了，界面仍报
-> 未完成切换」。改缓存策略时**三个 key 一起清**，少一个就会复现。
+> 若仅失效其中之一，回读在整个确认窗口内得到的都是**写入前的快照**，
+> 表现为「设备已完成切换，界面仍报告未完成切换」。修改缓存策略时**必须同时清除三个 key**。
 
 **请求体：**
 
@@ -2029,15 +2127,31 @@ NSA 双连接下两侧都有值时取 NR。判 5G 用 `band_label` 是否以 `n`
 **返回成功 ≠ 已切换完成。** 只代表固件收下了命令：设备要重新注册网络，真机上要十几到二十几秒。
 客户端应按 contract 的回读预算确认（Kotlin `NetworkMode.SwitchProbe` / web `NetworkModeSwitchProbe`
 是同一套节奏）：首次等 600ms，前 5 次间隔 1.5s、之后 3s，共 13 次 ≈ **30.6s**；到顶还没读到目标
-档位就报「尚未完成切换」，不要静默停在旧值上。
+档位即报告「尚未完成切换」，不得静默停留在旧值。
 回读读 `GET /api/device/settings`，**以 `net_select` 为准、`BearerPreference` 回落**（真机切换后
-变化的是前者），值经 `fromBearer()` 换算成别名再与目标比对。
+变化的是前者），值经 `fromBearer()` 换算成别名再与目标比对。回读要带 `?fresh=1`（见该端点），
+否则 +600ms 那次读到的旧档位会被缓存 5 分钟，整个确认窗口都在读同一份快照。
+
+**移动数据会被一并恢复。** 切换制式需要 modem 更换 RAT 重新驻网，当前 PDP/PPP 必须拆除，
+而设备**不会自动重拨**，表现为「切换制式后移动数据变为关闭，需手动再次开启」。
+因此 core 在下发前读取一次 `ppp_status`，写成功后按该状态补发一次 `CONNECT_NETWORK`：
+
+- 切换前**已连接** → 恢复（首次失败会在 1.5s 后重试一次）；
+- 切换前**已断开** → 不发送任何数据命令（代用户开启会直接产生流量费用）；
+- **读不到**连接状态 → 同样不发送（未知状态不视为开启）。
+
+恢复失败**不影响本次响应**（制式切换本身已受理）。该编排仅在 `NetworkController.setNetworkMode`
+一处实现，REST 的 `/mode`、`/bearer` 与定时任务的 `network_mode` 动作全部复用，客户端不应重复实现。
+
+开关显示不随重拨变化：重拨过程需十几到二十几秒，此期间 `ppp_status` 必然为断开。
+移动数据开关读取的是 `mobile_data`（用户意图，见 `GET /api/network/status`），宽限期内保持「开」；
+判断是否已连接仍以 `ppp_status` 为准。
 
 #### `POST /api/network/bearer`
 
 设置 Bearer Preference。与 `/api/network/mode` **走的是同一条写通道和同一套别名映射**，  
 区别只有回显字段名 —— `preference` 也要填上表左列的别名，不是设备侧的 `BearerPreference` 原值，  
-映射不出来同样回 400 `OUT_OF_RANGE`（早期版本这里是直通设备的，已收掉）。
+映射不出来同样回 400 `OUT_OF_RANGE`；不接受设备侧的 `BearerPreference` 原值。
 
 **请求体：**
 
@@ -2076,7 +2190,7 @@ goform 客户端不可用 → `503 UNAVAILABLE`；设备写失败 → `500` + `s
 { "mode": "auto" }
 ```
 
-**入参归一化在 core**（2026-09-15）：`manual` / `manual_dial` / `hand` / `1` → 设备值 `manual_dial`，
+**入参归一化在 core**：`manual` / `manual_dial` / `hand` / `1` → 设备值 `manual_dial`，
 其余一律 `auto_dial`。原来是原样透传，于是 app 发的 `auto`/`manual` 静默无效（设备只认 `*_dial`），
 缺省值还写着 `AUTO`。客户端不需要再各自映射一份。
 
@@ -2301,7 +2415,7 @@ Root 权限检查。
 ```
 
 - `total_*` 与 `month_*` 是**同一个值的两种命名**（都取设备当月累计），保留双份是为兼容旧客户端；
-- `today_*_bytes` 是数值字段，优先用它做换算/百分比，不要反解 `*_display` 字符串；
+- `today_*_bytes` 是数值字段，优先用它做换算或百分比，不应反解 `*_display` 字符串；
 - 「今日」不是设备字段（goform 只给当月累计），由 `DataScheduler` 用「当月累计 − 当日基线」  
   自算，基线持久化，所以重启不归零、跨天自动重置；
 - `*_display` 是 1024 进制、GB 两位小数 / MB·KB 一位小数（`TrafficSummaryMapper.formatBytes`）。
@@ -2346,7 +2460,7 @@ Root 权限检查。
   前端靠它画完整 X 轴，缺桶会让「还没到的日子」和「那天没用流量」长得一样；
 - `peak_bytes` = 所有桶 `total_bytes` 的最大值，核心侧算好，省得两端各写一遍 Y 轴峰值逻辑；
 - `earliest_data_at` = 表里最早的小时起点，**表为空时是 `null`（不是 0）**。用它提示
-  「历史从 X 月 X 日起才有数据」，别把上线前的空桶当成「那天真的没用流量」；
+  「历史从某月某日起才有数据」，不应将上线前的空桶当作「当天确实没有使用流量」；
 - 窗口**不截断到今天**：本周/本月还没到的桶照常返回，值为 0。
 
 **四种 range 的桶数与文案：**
@@ -2379,7 +2493,7 @@ Root 权限检查。
 
 > 需要认证。仅卡槽切换。
 >
-> 2026-08-27（T40-15）：原 SIM 信息查询端点已删除 —— imei/imsi/iccid 与设备信息里的  
+> 原 SIM 信息查询端点已删除：imei/imsi/iccid 与设备信息中的  
 > identity 同源却带 15 分钟缓存，`phone_type` 恒为 `"GSM"`，`sim_state` 也比设备信息里  
 > `sim.sim_state`（Android TelephonyManager，可区分 Absent / PIN Required / PUK Required）  
 > 更粗糙；app 侧虽有 Retrofit 方法但从不渲染，web 从未引用。要 SIM 身份信息请读  
@@ -2403,7 +2517,7 @@ profile 的 `WriteSpec` 里，客户端看不到设备值。非法值回 400 `OU
 
 > 兼容一版：旧入参 `goformSlot` 是设备侧运营商预置位（`"0"`=移动 `"1"`=电信 `"2"`=联通 `"11"`=外置），  
 > 收到会**先换算成序号**再下发并打 warn。注意两者取值域重叠（旧 `"1"` 是电信 = 新的槽位 `2`），  
-> 别把读到的设备值直接当 `slot` 回填。
+> 不应将读到的设备值直接作为 `slot` 回填。
 
 **响应：** `{ "success": true, "slot": "1" }`
 
@@ -2495,10 +2609,10 @@ AT 通道状态。
 
 - 值为 JSON `null` 的键视为"未提供"（不会把字段清空）；
 - `perType` 是**整体替换**（不做深合并），传 `{}` 即清空所有分类开关；
-- `perType` 的语义（2026-08-27 起引擎真的生效）：`type -> false` 该类型**不检测、不入库、不广播**；  
-  **键缺省视为关闭**（2026-09-07 起：清空 `perType` = 全部关闭；用户须显式打开每个类型）；总开关 `enabled` 默认 `false`，为 `false` 时一律不检测。  
+- `perType` 的语义：`type -> false` 该类型**不检测、不入库、不广播**；  
+  **键缺省视为关闭**（清空 `perType` 等于全部关闭；每个类型需显式开启）；总开关 `enabled` 默认 `false`，为 `false` 时一律不检测。  
   可用的 type：`temperature` / `battery` / `traffic` / `signal` / `connectivity`；
-- 与 `PUT /api/notifications/config` 的通知开关是两件事：这里控制**服务端要不要产生告警**，那里控制**客户端要不要投递通知**；
+- 与 `PUT /api/notifications/config` 的通知开关含义不同：这里控制**服务端是否产生告警**，那里控制**客户端是否投递通知**；
 - 必须带 `configVersion` 且与服务端当前值一致，否则返回 `409`（缺省 `configVersion` 同样按陈旧写处理）；
 - 字段类型不合法（如 `"enabled": "yes"`）返回 `400`，`code = BAD_REQUEST`。
 
@@ -2659,7 +2773,7 @@ AT 通道状态。
 
 ## 通知配置 /api/notifications
 
-> 需要认证。通知场景开关、免打扰、后台守护参数。**app 与 web 共用这一份真源**，任一端修改另一端回读即可见。
+> 需要认证。通知场景开关、免打扰、后台守护参数。**app 与 web 共用同一份数据**，任一端修改另一端回读即可见。
 
 #### `GET /api/notifications/config`
 
@@ -2693,25 +2807,25 @@ AT 通道状态。
 
 | 字段                                 | 类型      | 默认       | 说明                                                                                                                                                                                                                                                                                          |
 | ---------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| master_enabled                     | boolean | false    | **L1 全局通知总闸**（2026-09-08 新增）：管所有渠道——客户端状态栏与设备端邮件。关掉后一条都不发；「发送测试通知」刻意豁免，便于排查链路                                                                                                                                                                                                               |
-| mail_respect_dnd                   | boolean | false    | 邮件是否也遵守免打扰时段。状态栏**恒定**遵守；邮件默认不受影响（事后可查的渠道，半夜静音诉求通常只针对会响铃的状态栏）。**邮件开不开**的真源是 `SmsForwardController.isSendable()`（`/api/sms-forward/config` 的 `enabled` + SMTP 必填项），本组不再放第二份                                                                                                                  |
-| alert_enabled                      | boolean | false    | 阈值告警分类（温度/电量/流量/信号）。2026-09-08 起**只是分类开关**，不再兼任总闸                                                                                                                                                                                                                                           |
+| master_enabled                     | boolean | false    | **L1 全局通知总闸**：管理所有渠道（客户端状态栏与设备端邮件）。关掉后一条都不发；「发送测试通知」刻意豁免，便于排查链路                                                                                                                                                                                                               |
+| mail_respect_dnd                   | boolean | false    | 邮件是否也遵守免打扰时段。状态栏**恒定**遵守；邮件默认不受影响（事后可查的渠道，半夜静音诉求通常只针对会响铃的状态栏）。**邮件是否发送**的来源是 `SmsForwardController.isSendable()`（`/api/sms-forward/config` 的 `enabled` + SMTP 必填项），本组不再放第二份                                                                                                                  |
+| alert_enabled                      | boolean | false    | 阈值告警分类（温度/电量/流量/信号）。**仅作为分类开关**，不兼任总闸                                                                                                                                                                                                                                           |
 | connectivity_enabled               | boolean | false    | 设备离线/上线通知。客户端按「离线只报一次、报过离线才报恢复」成对去重                                                                                                                                                                                                                                                         |
 | sms_enabled                        | boolean | false    | 新短信通知                                                                                                                                                                                                                                                                                       |
-| verification_enabled               | boolean | false    | 验证码提取通知。2026-09-08 起**独立**于 `sms_enabled`（此前投递路径只查短信键，"只留验证码"做不到）                                                                                                                                                                                                                           |
+| verification_enabled               | boolean | false    | 验证码提取通知。**独立**于 `sms_enabled`（若共用短信键，则无法实现「仅保留验证码」）                                                                                                                                                                                                                           |
 | download_enabled                   | boolean | false    | 下载完成/失败通知                                                                                                                                                                                                                                                                                   |
 | traffic_80_enabled                 | boolean | false    | 流量达限额 80% 预警                                                                                                                                                                                                                                                                                |
 | device_events_enabled              | boolean | false    | 设备事件（WiFi 客户端上下线等）                                                                                                                                                                                                                                                                          |
-| tunnel_enabled                     | boolean | false    | 隧道失败通知的**客户端分类开关**（2026-09-08 新增）。与 `AppSettings.tunnelNotifyOnFailure`（设备端要不要推）串联，不是第二份真源；此前 app 侧借用 `alert_enabled`                                                                                                                                                                       |
+| tunnel_enabled                     | boolean | false    | 隧道失败通知的**客户端分类开关**。与 `AppSettings.tunnelNotifyOnFailure`（设备端是否推送）串联，不是另一份开关来源；app 侧不得借用 `alert_enabled`                                                                                                                                                                       |
 | dnd_enabled                        | boolean | false    | 免打扰时段开关，仅 critical 可突破。时段由下面两项决定                                                                                                                                                                                                                                                            |
 | dnd_start_hour                     | int     | 23       | 免打扰起始小时，0-23。`start > end` 表示跨零点（23→7 = 当晚 23:00 至次日 07:00）；与 `dnd_end_hour` 相等视为零长度窗口 = 不静默                                                                                                                                                                                                |
 | dnd_end_hour                       | int     | 7        | 免打扰结束小时，0-23（右端开区间）                                                                                                                                                                                                                                                                         |
-| guard_enabled                      | boolean | false    | 后台守护轮询开关。2026-09-08 起它是守护的**唯一**闸门（此前 `alert_notification_enabled` 关掉会连带静默停掉巡检）                                                                                                                                                                                                             |
+| guard_enabled                      | boolean | false    | 后台守护轮询开关。它是守护的**唯一**闸门（关闭 `alert_notification_enabled` 不得连带停止巡检）                                                                                                                                                                                                             |
 | guard_interval_minutes             | int     | 30       | 守护轮询间隔，取值 15-60                                                                                                                                                                                                                                                                             |
 | guard_foreground_keepalive_enabled | boolean | false    | 前台服务保活（常驻通知）                                                                                                                                                                                                                                                                                |
-| history_max_rows                   | int     | 500      | 通知历史保留条数，取值 100-5000。**一个字段管两张表**：设备端邮件投递记录（`mail_send_records`）与客户端状态栏通知历史（app `notify_history`）——同一件事的两个渠道，给两个旋钮只会让人猜"我改的是哪一个"。两侧都在每次裁剪时现取当前值（不缓存，改完立即生效）；清理按批触发（每写入 20 条一次），实际条数可能略高于设定值                                                                                                 |
-| history_max_age_days               | int     | 30       | 通知历史保留天数，取值 0-365，**0 = 不按时间清理**。与 `history_max_rows` 是「先到者生效」的两道上限，同样一个字段管两张表。两道都必须可见：此前 app 侧藏着一条写死的 7 天规则，用户把条数调到 5000 也只留得下 7 天，而界面上没有任何地方提到时间                                                                                                                                          |
-| critical_override_enabled          | boolean | **true** | **CRITICAL 兜底**（2026-09-10 新增）。**本组唯一默认开启的字段** —— 客户端的本地初值必须逐字跟上，写成 false 就会出现「界面显示关着、设备上其实开着」的反向假开关。开启时，级别为 `critical` 的事件（断网 / 套餐用尽 / 自动关网这一档）**穿透**免打扰时段、该渠道未勾选的触发场景、该渠道的最低级别门槛；**永远穿不透** `master_enabled`、渠道配置不完整、当日配额已用尽。穿透时 core 侧留一行 WARN。判定只有一处：`NotificationDispatcher.deliverTo`。 |
+| history_max_rows                   | int     | 500      | 通知历史保留条数，取值 100-5000。**一个字段管两张表**：设备端邮件投递记录（`mail_send_records`）与客户端状态栏通知历史（app `notify_history`）——同一功能的两条渠道，分开设置会导致无法确定所修改的是哪一侧。两侧都在每次裁剪时现取当前值（不缓存，改完立即生效）；清理按批触发（每写入 20 条一次），实际条数可能略高于设定值                                                                                                 |
+| history_max_age_days               | int     | 30       | 通知历史保留天数，取值 0-365，**0 = 不按时间清理**。与 `history_max_rows` 是「先到者生效」的两道上限，同样一个字段管两张表。两道都必须可见：若 app 侧另有一条写死的 7 天规则，用户将条数调到 5000 也只保留 7 天，而界面上没有任何提示                                                                                                                                          |
+| critical_override_enabled          | boolean | **true** | **CRITICAL 兜底**。**本组唯一默认开启的字段** —— 客户端的本地初值必须逐字跟上，写成 false 就会出现「界面显示关着、设备上其实开着」的反向假开关。开启时，级别为 `critical` 的事件（断网 / 套餐用尽 / 自动关网这一档）**穿透**免打扰时段、该渠道未勾选的触发场景、该渠道的最低级别门槛；**永远穿不透** `master_enabled`、渠道配置不完整、当日配额已用尽。穿透时 core 侧留一行 WARN。判定只有一处：`NotificationDispatcher.deliverTo`。 |
 
 #### `PUT /api/notifications/config`
 
@@ -2741,24 +2855,24 @@ AT 通道状态。
 
 **边界说明：**
 
-- **隧道有两个开关，各管一件事**：`tunnel_enabled`（本组，本机要不要弹状态栏）与 `AppSettings.tunnelNotifyOnFailure`（`PUT /api/tunnel/settings` 的 `notify_on_failure`，设备端要不要推）串联，不是同一概念的两份真源。
-- 本组只管「是否发通知」，**告警阈值本身在 `/api/alerts/config`**。两组的交集已在 2026-09-08 消除：`AlertConfig.notifyEnabled` 已删除（它自称"投递总闸"，实际全 core 只有邮件转发读它），邮件是否放行改由本组的 `master_enabled` + `mail_respect_dnd` 决定；**本组没有 `mail_enabled`** —— 邮件通道开不开的真源是 `/api/sms-forward/config` 的 `enabled` + SMTP 必填项。
+- **隧道有两个开关，职责不同**：`tunnel_enabled`（本组，本机是否弹出状态栏）与 `AppSettings.tunnelNotifyOnFailure`（`PUT /api/tunnel/settings` 的 `notify_on_failure`，设备端是否推送）串联，不是同一概念的两个来源。
+- 本组只管「是否发通知」，**告警阈值本身在 `/api/alerts/config`**。两组的交集已消除：`AlertConfig.notifyEnabled` 已删除（该字段名义上为「投递总闸」，实际仅邮件转发读取），邮件是否放行改由本组的 `master_enabled` + `mail_respect_dnd` 决定；**本组没有 `mail_enabled`** —— 邮件通道是否开启的权威来源是 `/api/sms-forward/config` 的 `enabled` + SMTP 必填项。
 
 ---
 
 ## 媒体中心 /api/media
 
 数据源是**系统媒体库（MediaStore）**，core 不自建索引：系统已经把整卡的媒体索引好了（时长、分辨率、专辑、艺术家，还有缓存好的缩略图），
-再写一套扫描器 + 索引表等于把增量与失效逻辑重做一遍，而且会与系统媒体库长期两份数据打架。
+再实现一套扫描器与索引表等于重做增量与失效逻辑，且会与系统媒体库长期存在两份不一致的数据。
 
-**2026-10-13 起加了一层内存索引缓存**（`MediaIndexStore`）：后台每 5 分钟把整库元数据查一次存进内存，
+**内存索引缓存**（`MediaIndexStore`）：后台每 5 分钟把整库元数据查一次存进内存，
 用户读 `/list`、`/groups`、`/browse` 时**只读内存快照**，过滤 / 排序 / 分页都在内存里做。
 改造前这三个端点每次请求都要现场查 MediaStore（`/browse` 最坏是 1 + 200 次跨进程查询）。
 快照存的是**未过滤的整库**，扫描目录与「从音乐库移除」名单在读时才套 —— 这样改设置立刻生效，
 且歌单回查（刻意不受扫描目录约束）不会把库外的歌判成已失效。
 `/rescan` 提交扫描后会按 +3s/+15s/+45s 追赶重建（`MediaScannerConnection` 是异步的，立刻重建只会拿到旧库）。
 
-缩略图与封面由 core 自己解码（2026-10-13 起**不再调用系统解码**）：视频 ffmpeg、图片降采样、
+缩略图与封面由 core 自行解码（**不调用系统解码**）：视频 ffmpeg、图片降采样、
 音频读容器头部的内嵌封面字节。理由与取舍见下面的 `GET /api/media/thumbnail`。
 
 **不复用 `/api/files/list` 与 `/api/files/search`**：前者只能单层列目录，后者按**文件名**子串递归找且有 50 条硬顶、深度 ≤ 8、10s 墙钟。
@@ -2796,7 +2910,7 @@ AT 通道状态。
 }
 ```
 
-`scan_dirs` 自 2026-09-16 起**按类型各存一份**（媒体中心拆成三个独立页，每页只改自己那一份，所以三页都有可写入口也不会互相覆盖）；
+`scan_dirs` **按类型各存一份**（媒体中心拆成三个独立页，每页只改自己那一份，所以三页都有可写入口也不会互相覆盖）；
 某一类为空数组 = 这一类不限目录，列整个媒体库里的该类型。
 
 **错误：** 无失败分支 —— 权限不足不是错误，它就在 `granted` 里逐类回报。
@@ -2818,7 +2932,7 @@ AT 通道状态。
 | artist | 否 | **仅 `type=audio` 生效**：精确匹配 `MediaStore.Audio.Media.ARTIST` |
 | dir | 否 | **仅 `type=audio` 生效**：只要**直接位于**该目录下的文件（不含子目录），传绝对路径 |
 
-`album` / `artist` / `dir` 是给 `GET /api/media/groups` 做回查用的（把分组的 `key` 原样送回来），2026-09-20 新增：
+`album` / `artist` / `dir` 是给 `GET /api/media/groups` 做回查用的（把分组的 `key` 原样送回来）：
 
 - 三个参数**只对 `type=audio` 生效**，传给 `video` / `image` 时被**忽略**而不是报错 —— `ALBUM` / `ARTIST` 是
   `MediaStore.Audio` 独有的列，拿去查另外两张表会直接「unknown column」；而媒体中心三个分栏共用同一套请求构造，
@@ -2837,15 +2951,15 @@ AT 通道状态。
   "items": [
     {
       "id": 10231,
-      "name": "带我走-杨丞琳.flac",
-      "path": "/storage/emulated/0/Music/带我走-杨丞琳.flac",
+      "name": "example-track.flac",
+      "path": "/storage/emulated/0/Music/example-track.flac",
       "size": 31457280,
       "date_modified": 1757990000000,
       "mime": "audio/flac",
       "duration_ms": 245000,
-      "album": "半熟宣言",
-      "artist": "杨丞琳",
-      "title": "带我走"
+      "album": "示例专辑",
+      "artist": "示例歌手",
+      "title": "示例曲目"
     }
   ],
   "total": 412,
@@ -2861,7 +2975,7 @@ AT 通道状态。
 `duration_ms` 对图片不返回、`width`/`height` 对音频不返回 —— 缺字段的含义是「这个类型没有这个概念」，不是「这一项没有时长」。
 
 **`title` 为什么可能是空串**：MediaStore 在文件没有内嵌标签时会把**去掉扩展名的文件名**填进 `MediaStore.Audio.Media.TITLE`。
-原样透出去，客户端就会把 `带我走 - 杨丞琳` 当成曲名显示，还压掉了「按分隔符拆成歌名 + 歌手」的兜底。
+原样透出去，客户端就会把 `示例曲目 - 示例歌手` 当成曲名显示，还压掉了「按分隔符拆成歌名 + 歌手」的兜底。
 所以 core 用 `realTitleOf` 比对：与文件名一致时按「没有标签」处理、回空串，由客户端决定怎么兜底。
 同理 `artist` / `album` 里的 `<unknown>` 是 MediaStore 的占位符，会被清成空串。
 
@@ -2901,7 +3015,7 @@ app 与 Web 两端也不必各写一份口径可能不同的统计逻辑。
   "type": "audio",
   "by": "album",
   "groups": [
-    { "key": "摩登蔷薇", "title": "摩登蔷薇", "subtitle": "杨丞琳", "count": 12, "cover_id": 10345 }
+    { "key": "示例专辑", "title": "示例专辑", "subtitle": "示例歌手", "count": 12, "cover_id": 10345 }
   ],
   "total": 37
 }
@@ -3001,7 +3115,7 @@ MediaStore 查询失败时不报错，而是回空 `groups` + `total: 0` 并在 
 
 缩略图（JPEG）。**两级：落盘缓存 → core 自行解码**。
 
-2026-10-13 起**不再调用系统解码**。此前的一级是系统缩略图（`MediaProvider.loadThumbnail`）、
+**不调用系统解码**。既有一级方案为系统缩略图（`MediaProvider.loadThumbnail`）、
 二级是 `MediaMetadataRetriever` 抽帧，两者走同一套系统 codec 栈，而 core 跑的随身 WiFi 用的是精简 ROM
 （桥接不到硬件 VPU），实测 `getFrameAtTime` 恒返回 null、`loadThumbnail` 报 `Failed to create thumbnail`。
 也就是说这两级在这类设备上**必然失败**，唯一的"收益"是让 `android.process.media` 白解一次 ——
@@ -3026,7 +3140,7 @@ ffmpeg 的输出仍要过 `FrameValidator` 的四判据（字节数 / 尺寸 / �
 | id | 是 | MediaStore 行 id |
 | size | 否 | 最长边像素，默认 256，夹取到 96..1024；命中落盘缓存时该参数被忽略 |
 
-`size` 上限 2026-09-16 由 512 提到 1024：音乐播放页的封面容器是 260dp，在 xxhdpi 上约 780 物理像素，请求 512 会被放大 1.5 倍 —— 这就是「封面很模糊」的原因。
+`size` 上限为 1024：音乐播放页的封面容器为 260dp，在 xxhdpi 上约 780 物理像素，请求 512 会被放大 1.5 倍，这是封面模糊的原因。
 
 **响应：** `200` + `image/jpeg` 字节流，带强 ETag（`"media-<type>-<id>-<size>"`，命中落盘缓存时是 `"media-<type>-<id>-c<mtime>"`）与 `Cache-Control: private, max-age=86400`。
 带 `If-None-Match` 且一致时回 `304`。
@@ -3044,11 +3158,11 @@ ffmpeg 的输出仍要过 `FrameValidator` 的四判据（字节数 / 尺寸 / �
 | 403 | 该类型媒体权限未授权 |
 | 404 | 拿不到图，`message` 与 `reason` 里带**失败原因**（异常类名 + 消息） |
 
-404 带原因是 2026-09-16 补的可观测性：设备端日志要连 ADB 才看得到，而客户端原来只拿到一句「缩略图不可用」——
+404 附带原因文本是出于可观测性：设备端日志需经 ADB 才能查看，而客户端仅能得到「缩略图不可用」一句提示——
 权限被拒、解码栈缺失、文件损坏在两侧长得完全一样。原因里不含路径与凭据。
 **绝不回一张破图或空 200**：客户端据 404 画占位图标。
 
-> **已删除（2026-10-13）：`PUT /api/media/thumbnail`。**
+> **已删除：`PUT /api/media/thumbnail`。**
 > 它原本用于「谁有解码能力谁干活」—— 让手机抽好帧回传给 core。ffmpeg 接入后这个理由消失，
 > 而 app 与 web **都已不再调用它**（app 侧注释写明「本机抽帧兜底已整体删除」），
 > 于是只剩成本：一个接收任意 ≤512KB JPEG 的写入口与孤儿文件风险。
@@ -3058,7 +3172,7 @@ ffmpeg 的输出仍要过 `FrameValidator` 的四判据（字节数 / 尺寸 / �
 
 音频封面。取**内嵌封面原图字节**（ID3 APIC / FLAC PICTURE，**不重新编码** → 能拿到的最高画质）。
 
-2026-10-13 起不再有 `size` 参数、也不再退回 `loadThumbnail`：内嵌封面本身就是原图字节，
+不再有 `size` 参数，也不退回 `loadThumbnail`：内嵌封面本身就是原图字节，
 要「小图」是客户端缩放的事，core 侧缩放只会白丢画质还多一次编码。
 
 三级回退：**落盘缓存** → `AudioTagReader` 解容器头部字节（ID3 `APIC` / FLAC `PICTURE`，不依赖任何 codec）
@@ -3067,7 +3181,7 @@ M4A 的 `covr` 走的就是这条）。
 
 取不到会写 6h 冷却标记，避免无封面的歌每次列表刷新都重跑一遍解析。
 
-与 `/thumbnail` 分开的理由：列表要的是「小而快」（256px、可缓存、能糊），播放页要的是「尽量清楚」。
+与 `/thumbnail` 分开的理由：列表要的是「小而快」（256px、可缓存、允许画质下降），播放页要的是「尽量清楚」。
 
 **查询参数：** `id`（必填，音频的 MediaStore id）
 
@@ -3093,7 +3207,7 @@ M4A 的 `covr` 走的就是这条）。
 **响应：**
 
 ```json
-{ "found": true, "source": "带我走-杨丞琳.lrc", "text": "[00:00.00]带我走\n[00:12.35]..." }
+{ "found": true, "source": "example-track.lrc", "text": "[00:00.00]示例曲目\n[00:12.35]..." }
 ```
 
 找不到时回 **200** + `{ "found": false, "source": "", "text": "" }`，不是 404 ——「这首没有歌词」是正常状态，客户端照实显示「没有歌词」，不拿文件名假装一行歌词。
@@ -3117,8 +3231,8 @@ MediaStore 偶尔会漏（刚拷进来还没扫到、或某些 FLAC/APE 只填�
 **三级回退，从可信到不可信：**
 
 1. `AudioTagReader`：**自己解容器头部的字节**（FLAC 的 `fLaC` 魔数 + METADATA_BLOCK 链里的 `VORBIS_COMMENT`；MP3 的 ID3v2 帧 `TIT2/TPE1/TALB`，v2.2 是 `TT2/TP1/TAL`）。
-   标签是纯字节结构、不需要任何解码能力，所以在解不出视频画面的定制 ROM 上照样准 —— 这正是 2026-09-16 加它的原因：
-   此前只用 `MediaMetadataRetriever`，FLAC 上经常拿回空标签，表现就是「改了接口，歌名还是 `带我走 - 杨丞琳`」。
+   标签为纯字节结构、不需要任何解码能力，因此在无法解出视频画面的定制 ROM 上依然准确：
+   仅使用 `MediaMetadataRetriever` 时，FLAC 上经常返回空标签，表现为「接口已修改，歌名仍为 `示例曲目 - 示例歌手`」。
    只读文件头（≤1MB），不为了标签把几十 MB 的无损文件拉进内存；文本编码按 UTF-8 → GBK → Latin-1 严格嗅探（一堆国产工具在标注成 Latin-1 的帧里塞 GBK）。
 2. `MediaMetadataRetriever`：第 1 级不认识的容器（m4a、老格式）还能捞一把，只补第 1 级仍然缺的字段。
 3. `MediaStore` 的 `title/artist/album`：系统扫描的结果，作为兜底。
@@ -3132,11 +3246,11 @@ MediaStore 偶尔会漏（刚拷进来还没扫到、或某些 FLAC/APE 只填�
 ```json
 {
   "id": 10231,
-  "name": "带我走-杨丞琳.flac",
-  "path": "/storage/emulated/0/Music/带我走-杨丞琳.flac",
-  "title": "带我走",
-  "artist": "杨丞琳",
-  "album": "半熟宣言",
+  "name": "example-track.flac",
+  "path": "/storage/emulated/0/Music/example-track.flac",
+  "title": "示例曲目",
+  "artist": "示例歌手",
+  "album": "示例专辑",
   "duration_ms": 245000
 }
 ```
@@ -3144,7 +3258,7 @@ MediaStore 偶尔会漏（刚拷进来还没扫到、或某些 FLAC/APE 只填�
 带 `Cache-Control: private, max-age=86400`：同一 id 的标签只随文件改动而变。
 取不到的字段是**空串** —— core 不拿文件名冒充曲名，兜底显示策略由 UI 层决定。
 
-歌词不在这里：那是独立的 `GET /api/media/lyrics`（旁挂文件），两件事不要混。
+歌词不在此端点：由独立的 `GET /api/media/lyrics`（旁挂文件）提供，两者不可混用。
 
 **错误：**
 
@@ -3189,7 +3303,7 @@ MediaStore 偶尔会漏（刚拷进来还没扫到、或某些 FLAC/APE 只填�
 ```
 
 校验三条：必须落在用户存储白名单内（`/storage/`、`/sdcard`、`/mnt/media_rw/`，与文件接口同一口径且不含 `..`）、去重、不超过 16 条。
-**不要求目录当前存在** —— SD 卡拔出时配置不该被清掉。
+**不要求目录当前存在**：SD 卡拔出时配置不应被清除。
 按类型各存一份，视频页改视频的、音乐页改音乐的，互不覆盖；三类指向同一个目录也没问题，MediaStore 本来就是分表查的。
 
 **错误：**
@@ -3217,7 +3331,7 @@ core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收�
 ```
 
 目录三级回退：请求体 `dirs` → 该类型已配置的扫描目录 → 主外置存储根。
-第三级是 2026-09-16 补的：`/list` 的口径是「未配置目录 = 整个媒体库」，而 rescan 原来在这种情况下直接回 400「请先选择目录」——
+第三级兜底：`/list` 的口径是「未配置目录 = 整个媒体库」，而 rescan 原来在这种情况下直接回 400「请先选择目录」——
 于是默认状态下这颗按钮点下去必然报错，等于一颗假按钮。既然列表不限目录，重扫的默认范围就该是整卡。
 
 **响应：**
@@ -3226,7 +3340,7 @@ core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收�
 { "success": true, "type": "video", "dirs": ["/storage/emulated/0"], "submitted": 1873, "truncated": false }
 ```
 
-只提交**本类型**的文件（按扩展名推 MIME 前缀）：在视频页点重扫就该只重扫视频，顺手把同目录的音乐图片也塞给扫描器会让这颗按钮的语义变成「整卡重扫」。
+只提交**本类型**的文件（按扩展名推 MIME 前缀）：在视频页点重扫就该只重扫视频，若同时将同目录的音乐与图片交给扫描器，该按钮的语义将变为「整卡重扫」。
 单次上限 5000 个文件、递归深度 12，撞上限时 `truncated: true`，客户端应提示再点一次或缩小范围。
 
 收录是**异步**的：提交给扫描器就返回（它自己排队，可能几十秒），所以 `success: true` 不代表 `/list` 立刻就能查到新文件。
@@ -3254,7 +3368,7 @@ core 不自建索引，只把文件路径交给 `MediaScannerConnection`，收�
 ```
 
 `max` **不是产品上的取舍**：名单会拼进 `/list` 查询的 `_data NOT IN (?,…)`，每条占一个 SQLite 绑定变量（硬上限 999）。
-`full` 等价于 `total >= max`，由 core 算好，客户端据此**提前**提示，别让用户点完才发现没生效。
+`full` 等价于 `total >= max`，由 core 算好，客户端据此**提前**提示，避免用户操作后才发现未生效。
 
 ---
 
@@ -3301,13 +3415,13 @@ app 与 web 看的是同一份。实现见 `core/api/.../routes/PlaylistRoutes.k
 （回查在 core 做，一次批量 `DATA IN (...)` 查询，分批上限 200 条以避开 SQLite 的绑定变量硬顶）。
 
 **③ `missing: true` 的条目照样返回**（文件被删 / 卡没插 / 还没被系统扫到），此时 `id` 为 0、
-其余字段取加入歌单时的快照。客户端要画"已失效"占位并禁止播放，**不要自动帮用户移出** ——
+其余字段取加入歌单时的快照。客户端应显示「已失效」占位并禁止播放，**不得自动移除用户曲目** ——
 拔一次卡就清空歌单是不可接受的。
 
 ### 顺序即播放顺序
 
 `items` 的顺序由用户排定（追加 / 插入 / 整表重排），core 原样给出。
-客户端**不要**再按音乐页的 sort/order 重排一次。
+客户端**不得**再按音乐页的 sort/order 重排。
 
 ### 上限与失败码
 
@@ -3337,7 +3451,7 @@ app 与 web 看的是同一份。实现见 `core/api/.../routes/PlaylistRoutes.k
 
 - `count`：曲目数，**含已失效的** —— 拔一次卡不该让"共 23 首"变少。
 - `cover_id`：首曲的 MediaStore id，封面走 `GET /api/media/cover?id=`。
-  `0` = 空歌单或首曲已失效，此时客户端不要发封面请求（与 `/api/media/groups` 同一约定）。
+  `0` = 空歌单或首曲已失效，此时客户端不应发起封面请求（与 `/api/media/groups` 同一约定）。
 
 #### `GET /api/playlists/{id}`
 
@@ -3353,9 +3467,9 @@ app 与 web 看的是同一份。实现见 `core/api/.../routes/PlaylistRoutes.k
   "id": "a1b2c3d4",
   "name": "通勤",
   "items": [
-    { "id": 1042, "name": "带我走.flac", "path": "/storage/emulated/0/Music/带我走.flac",
+    { "id": 1042, "name": "example-track.flac", "path": "/storage/emulated/0/Music/example-track.flac",
       "size": 31457280, "date_modified": 1758300000000, "mime": "audio/flac",
-      "duration_ms": 241000, "album": "点水", "artist": "杨丞琳", "title": "带我走",
+      "duration_ms": 241000, "album": "示例专辑", "artist": "示例歌手", "title": "示例曲目",
       "missing": false }
   ],
   "total": 1,
@@ -3366,7 +3480,7 @@ app 与 web 看的是同一份。实现见 `core/api/.../routes/PlaylistRoutes.k
 ```
 
 无媒体读取权限时回 **403** `FORBIDDEN`（带 `type: "audio"`）——
-**不会**回一份全是 `missing` 的列表，那等于告诉用户"你的歌全丢了"。
+**不会**返回全部为 `missing` 的列表，那会被理解为全部曲目丢失。
 
 #### `POST /api/playlists`
 
@@ -3398,9 +3512,9 @@ id 由服务端生成（8 位十六进制），**不接受客户端传 id**。
 { "success": true, "added": 1, "skipped": 0, "truncated": false, "total": 24 }
 ```
 
-加之前 core 会逐条确认"这确实是媒体库里的一首音频"：不在库里的路径不会入库，而是计入
+加入前 core 会逐条确认该路径确为媒体库中的音频：不在库中的路径不会入库，而是计入
 `skipped`。三个计数分别对应三种"没进去"的原因，客户端应如实说出来 ——
-用户选了 20 首只进 3 首时，一句笼统的"已加入"会被当成 App 丢了歌。
+用户选择 20 首而仅加入 3 首时，笼统的「已加入」提示会被理解为 App 丢失了曲目。
 
 - `added`：真加进去的条数
 - `skipped`：已在本歌单里 **或** 不在媒体库里的条数
@@ -3420,7 +3534,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 整表重排。body `{ "paths": [...] }` = 新的完整顺序 → `{ "success": true, "total": 24 }`。
 
 语义刻意定成「**只调顺序，不增不删**」：
-- 传进来但不在歌单里的 path 一律忽略 —— 重排接口能顺手加歌的话，客户端一次误传
+- 传入但不在歌单中的 path 一律忽略：若重排接口同时具备添加歌曲的能力，客户端一次误传
   （把整库列表当成歌单提交）就会灌进几千首；
 - 歌单里有、但本次没提及的条目**保留并追加到尾部**，不是删掉 —— 拖拽 UI 常常只提交
   可见的那一屏，按"没提到就删"处理等于滚动一下就丢歌。
@@ -3558,7 +3672,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 
 **边界说明：**
 
-- `enabled` 只管「客户端要不要在标题栏显示天气」。**即便关掉，本组接口仍可访问** —— 设置页要能在关闭状态下先搜城市、看一眼读数再决定打开。
+- `enabled` 只管「客户端是否在标题栏显示天气」。**即便关闭，本组接口仍可访问**：设置页需在关闭状态下先搜索城市、查看读数，再决定是否开启。
 - 配置存在 `AppSettings.weather_config`（单 key 整份 JSON），已进备份白名单：城市与坐标是「这台设备放在哪」，换设备仍成立。
 - 客户端侧另有 10 分钟节流（`WeatherModule.MIN_REFRESH_INTERVAL_MS`），且**没有周期任务**：刷新时机是进首页 Tab / 回前台 / 改城市。
 
@@ -3570,7 +3684,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 域名写死在 `PoetryRoutes` 内且强制 https，理由同天气（可填 URL 等于把 core 变成任意外网请求的代理）。
 `/api` 下没有限流，对上游的唯一保护是 TTL 缓存：10 分钟（`CacheTTL.POETRY`）。
 
-**智能推荐是上游做的，不是我们做的。** 它按**发起请求的 IP** 解析地区、抓当地实时天气，再结合北京时间与农历日期匹配标签
+**智能推荐由上游服务生成。** 它按**发起请求的 IP** 解析地区、抓当地实时天气，再结合北京时间与农历日期匹配标签
 （气象：晴/雨/雪/寒冷/炎热…；时间：日出/正午/晚上/凌晨…；日期：春夏秋冬/节日…；地理：华南/江南/长安…），命中的标签在 `match_tags` 里回传。
 所以「夏天只出夏天的诗」这件事**不需要也无法传 tag**（v2 接口没有该参数），而是必须保证请求从**设备**发出 ——
 这也正是把它放在 core 而不是让 app 直连的理由：app 直连时出网 IP 虽然也经设备，但地区解析与 token 归属都会随客户端漂移。
@@ -3610,8 +3724,8 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 `translate` 只有部分诗词才有，没有时是空数组。`match_tags` 可直接当「推荐理由」显示。
 `updated_at` 是 core 生成这份响应的时间（epoch ms），不是上游的 `cacheAt`。
 
-**`refresh=1` 不保证换一句**：上游对每个 token 预生成并缓存推荐结果、约 10 分钟更新一次（响应里的 `cacheAt`），
-所以 TTL 取同一档 —— 更短只是重复拿到同一句、白打请求。短时间内连续刷到同一句是上游的机制，不是失败。
+**`refresh=1` 不保证更换内容**：上游对每个 token 预生成并缓存推荐结果，约 10 分钟更新一次（响应中的 `cacheAt`），
+因此 TTL 采用同一档位；更短只会重复获取同一内容，产生无效请求。短时间内连续刷到同一句是上游的机制，不是失败。
 
 **错误：**
 
@@ -3627,7 +3741,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 { "enabled": false, "show_origin": true }
 ```
 
-只有两个开关，**没有「选标签」这类选项** —— 标签由上游按地区/天气/时间自动匹配，我们无从指定。
+只有两个开关，**没有「选择标签」这类选项**：标签由上游按地区、天气与时间自动匹配，无法指定。
 
 ### PUT /api/poetry/config
 
@@ -3653,7 +3767,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 
 **边界说明：**
 
-- `enabled` 只管「客户端要不要在标题栏下方显示诗句」。**即便关掉，本组接口仍可访问** —— 设置页要能在关闭状态下先看一眼再决定打开（与天气同口径）。
+- `enabled` 只管「客户端是否在标题栏下方显示诗句」。**即便关闭，本组接口仍可访问**：设置页需在关闭状态下先查看，再决定是否开启（与天气一致）。
 - `show_origin` 关闭时客户端只显示诗句本身，不显示 `《题目》· 朝代 · 作者` 那一行。这是纯展示开关，不影响响应字段。
 - 配置存在 `AppSettings.poetry_config`（单 key 整份 JSON）；token 存在 `AppSettings.poetryToken`，**属于设备身份而非用户偏好**，换设备后重新签一个即可。
 
@@ -3669,13 +3783,13 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 
 **为什么放在 core。** 检测靠的是**出网 IP 的归属**，而设备才是真正的出网点。app 走设备热点时出网 IP 虽然也一样，
 但把检测放在 app 会让每个客户端各存一份结果、彼此可能不一致（换 WiFi、开代理都会让某一端测出别的答案）。
-放在 core 只有一份真源，两端读同一个值。目前唯一消费方是 app 的更新源自动选择（`CN` → 走镜像，其余直连）。
+仅存于 core 一份，两端读取同一个值。目前唯一消费方是 app 的更新源自动选择（`CN` → 走镜像，其余直连）。
 
 **检测何时发生。** 只有事件触发，**没有任何定时器**：
 1. **core 启动时**自动测一次 —— 且只在"没测过、或距上次超过 7 天"时才真的出网，否则直接跳过；
    失败不重试、不阻塞启动（只留一条 WARN），等下次重启再试。挂在 HTTP 服务就绪之后，
    因为串三个上游最坏 24s，放进组件初始化会顶到初始化看门狗（15s 心跳 / 超时杀进程自愈）。
-2. `GET /api/geo` 发现结果缺失或已过 7 天时顺手补一次（core 启动那次失败时这里就是自愈点）。
+2. `GET /api/geo` 发现结果缺失或已超过 7 天时补充一次（core 启动时的失败可在此处自愈）。
 3. `POST /api/geo/detect` 显式强制重测。
 
 **结果存哪。** `AppSettings.geo_country` + `geo_detected_at`。前者进备份白名单（换设备通常还在同一地区），
@@ -3749,7 +3863,7 @@ DELETE 在部分代理上会被丢掉，只支持一种会出现"某些环境下
 | `WiFiModuleSwitch`                | WiFi 模块总开关，`"1"` = 开              |
 
 > **旧字段 `wifi_enable` / `wifi_onoff_state` 已不再输出**，两者都归一到 `WiFiModuleSwitch`；  
-> 客户端不要再写"三个键任取一个"的探测。字段名带 `chip1_ssid1` 是设备扁平命名的历史债，  
+> 客户端不应再实现「三个键任取一个」的探测。字段名带 `chip1_ssid1` 属于设备扁平命名的历史遗留，  
 > 当前芯片由 `wifi_chip` 指示（`"chip2"` 即 5G 频段那一路）。
 
 #### `GET /api/wifi/module-info`
@@ -3758,7 +3872,7 @@ WiFi 模块原始信息（AuthMode、EncrypType、Password 等设备原始值）
 
 **响应：** 原样透传，**不属于稳定契约**（见「全局说明 › 设备字段契约」的例外端点），仅供诊断。  
 **没有开关也没有脱敏**：`Password` 是明文，与默认关闭 + 打码的 `/api/device/goform` 不同，  
-别按"诊断端点都安全"的印象来用它。
+不应基于「诊断端点均安全」的假设使用该端点。
 
 #### `GET /api/wifi/clients`
 
@@ -3807,7 +3921,7 @@ WiFi 连接二维码。**这是本手册里少数不返回 JSON 的端点** —�
 读不到时 → `503 UNAVAILABLE` + JSON 失败信封（`无法从设备读取 WiFi 二维码`）。
 
 > 二维码由**设备**生成，core 只是转发；所以它反映的是设备当前的 SSID/密码，  
-> 改完 WiFi 配置后要重新拉取。别按 JSON 解析响应体。
+> 修改 WiFi 配置后需重新拉取。不应按 JSON 解析响应体。
 
 ---
 
@@ -3826,7 +3940,7 @@ WiFi 开关。
 **响应：** `{ "success": true, "enabled": true }`
 
 > ⚠ **`enabled: true` 会开在「设备当前的频段」上，不是固定 2.4G。** 设备侧「开 WiFi」与「切频段」
-> 是同一条命令（`switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`，2026-09-22 真机抓包），
+> 是同一条命令（`switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`，经真机抓包验证），
 > 本端点只收一个布尔，core 会先回读 `wifi_chip` 再下发；**读不到或读到域外值才退回 `chip1`**
 > （此时日志有一条 WARN，表现是 5G 下开 WiFi 被切到 2.4G）。
 > 「关」走的是另一条命令（`switchWiFiModule&SwitchOption=0`），不读频段、不受影响。
@@ -3852,8 +3966,8 @@ WiFi 开关。
 > 并且会**重启设备的 WiFi 模块** —— 正通过 WiFi 连接的客户端（包括发起请求的那一台）会断开。
 > 客户端**必须**在调用前让用户确认并说明后果。
 >
-> 不要用 `POST /api/wifi/config` 的 `chip_index` 切频段：那个参数落到设备的
-> `setAccessPointInfo` → `ChipIndex`，**实测无效**（这是「WiFi 频段修改无效」的根因）。
+> 不应使用 `POST /api/wifi/config` 的 `chip_index` 切换频段：该参数落到设备的
+> `setAccessPointInfo` → `ChipIndex`，**实测无效**，这是「WiFi 频段修改无效」的成因。
 > 写侧已不再发它；读侧看当前频段用 `GET /api/wifi/settings` 的 `wifi_chip`。
 
 #### `POST /api/wifi/ssid`
@@ -3865,7 +3979,7 @@ WiFi 开关。
 ```json
 {
   "ssid": "MyWiFi",
-  "password": "12345678"
+  "password": "<WiFi 密码>"
 }
 ```
 
@@ -3880,7 +3994,7 @@ WiFi 开关。
 **请求体：**
 
 ```json
-{ "password": "newpassword123" }
+{ "password": "<新密码>" }
 ```
 
 `password` 必填。
@@ -3905,8 +4019,8 @@ WiFi 开关。
 }
 ```
 
-> ⚠ **`chip_index` 切不了频段，别再发它。** 它落到设备的 `setAccessPointInfo` → `ChipIndex`，
-> 实测无效（这就是「WiFi 频段修改无效」的根因）。core 仍然接受这个参数（老客户端兼容，
+> ⚠ **`chip_index` 无法切换频段，不应再提交该参数。** 它落到设备的 `setAccessPointInfo` → `ChipIndex`，
+> 实测无效（即「WiFi 频段修改无效」的成因）。core 仍然接受该参数（兼容旧客户端，
 > 不传就走设备现值），但 web / app 写侧已经不发了。要切频段用 `POST /api/wifi/band`。
 
 所有字段可选。**值域是设备事实，不合法的值在下发前就被拒**（`400 OUT_OF_RANGE` + 中文原因，
@@ -3918,7 +4032,7 @@ WiFi 开关。
 | `encryp_type` | 与 `auth_mode` 成对：`OPEN` → `NONE`（core 强制），其余 → `CCMP`           |
 | `max_sta_num` | 闭区间 **1..10**（中兴 F50 最大支持 10 个），不传 = 不修改                        |
 
-`auth_mode` 为 `OPEN` 时**不要**带 `passphrase`（开放热点没有口令）；`ssid` 与 `passphrase`
+`auth_mode` 为 `OPEN` 时**不得**携带 `passphrase`（开放热点无口令）；`ssid` 与 `passphrase`
 **不做任何格式校验**（允许任意字符，含 `&` 与 `=`）。
 
 **响应：** `{ "success": true }`
@@ -3961,7 +4075,7 @@ WiFi 休眠定时器。
 > 不需要、也不应该自己拼完整名单 —— 两个客户端同时操作才不会互相覆盖。
 >
 > 名单**不缓存**（条数极少，且拉黑后要立刻看到结果）。三个写端点写完都会**回读设备**，  
-> 响应里的名单是设备的真实状态，不是我们以为写进去的那份 —— 前端直接拿它覆盖本地列表即可。
+> 响应中的名单是设备的真实状态，而非写入时的期望值；前端应直接以它覆盖本地列表。
 
 #### `GET /api/wifi/acl`
 
@@ -3972,14 +4086,14 @@ WiFi 休眠定时器。
 ```json
 {
   "mode": "2",
-  "black_list": [ { "mac": "2a:ed:87:b3:e8:29", "name": "OPPO-Find-X7" } ],
+  "black_list": [ { "mac": "aa:bb:cc:dd:ee:ff", "name": "Example-Device" } ],
   "white_list": []
 }
 ```
 
 | 字段                          | 说明                                                                                           |
 | --------------------------- | -------------------------------------------------------------------------------------------- |
-| `mode`                      | 设备的 ACL 档位原样字符串。`"2"` = 黑名单生效。**清空黑名单后它仍是 `"2"`**，所以别用 `mode` 判断"有没有拉黑"，要看 `black_list` 是否为空 |
+| `mode`                      | 设备的 ACL 档位原样字符串。`"2"` = 黑名单生效。**清空黑名单后它仍是 `"2"`**，因此不应以 `mode` 判断是否存在黑名单，应检查 `black_list` 是否为空 |
 | `black_list` / `white_list` | `{mac, name}` 数组。`mac` 是设备回读的小写形式；`name` 可能是空串（设备没记住主机名时）                                    |
 
 读不到 → `503 UNAVAILABLE`（`无法从设备读取接入控制名单`）。
@@ -3991,7 +4105,7 @@ WiFi 休眠定时器。
 **请求体：**
 
 ```json
-{ "mac": "2a:ed:87:b3:e8:29", "name": "OPPO-Find-X7" }
+{ "mac": "aa:bb:cc:dd:ee:ff", "name": "Example-Device" }
 ```
 
 `mac` 必填（缺失 → `400 BAD_REQUEST`），必须是 `xx:xx:xx:xx:xx:xx` 形式，否则  
@@ -4031,7 +4145,7 @@ WiFi 休眠定时器。
 {
   "contacts": [
     {
-      "phoneNumber": "+8613800138000",
+      "phoneNumber": "+8613800000000",
       "total": 5,
       "unread": 2,
       "latestMsg": "您的验证码是 1234",
@@ -4053,7 +4167,7 @@ WiFi 休眠定时器。
 | latestDirection | string | `received` / `sent`                    |
 
 **`total` 不是该号码的历史总数**：聚合前只读**最近 100 条**短信（`readSms(null, 100, 0, null)`），  
-所以老会话会被截断、甚至完全不出现在列表里。要完整历史请带 `phone` 参数走  
+因此较早的会话会被截断，甚至不出现在列表中。获取完整历史需携带 `phone` 参数走  
 `GET /api/sms/list`。列表按 `latestTimestamp` 倒序；读取抛异常时返回空数组（不报错）。
 
 #### `GET /api/sms/list`
@@ -4074,7 +4188,7 @@ WiFi 休眠定时器。
   "messages": [
     {
       "id": 1,
-      "phoneNumber": "+8613800138000",
+      "phoneNumber": "+8613800000000",
       "content": "Hello",
       "direction": "received",
       "timestamp": 1234567890000,
@@ -4088,7 +4202,7 @@ WiFi 休眠定时器。
 
 | 字段        | 类型      | 说明                                                                                         |
 | --------- | ------- | ------------------------------------------------------------------------------------------ |
-| direction | string  | **只有两个值**：`received` / `sent`。`inbox`/`sent` 是 `folder` 的**查询值**，别把 `inbox` 当 direction 匹配 |
+| direction | string  | **只有两个值**：`received` / `sent`。`inbox`/`sent` 是 `folder` 的**查询值**，不应将 `inbox` 作为 direction 匹配 |
 | timestamp | long    | 毫秒级时间戳                                                                                     |
 | read      | boolean | 已读状态由本地 DB merge 得来，不是设备侧字段                                                                |
 | count     | int     | 本批实际条数（≤ `limit`）                                                                          |
@@ -4122,7 +4236,7 @@ WiFi 休眠定时器。
 ```json
 {
   "id": 1,
-  "phoneNumber": "+8613800138000",
+  "phoneNumber": "+8613800000000",
   "content": "Hello",
   "direction": "received",
   "timestamp": 1234567890000,
@@ -4143,17 +4257,17 @@ WiFi 休眠定时器。
 
 ```json
 {
-  "phone": "+8613800138000",
+  "phone": "+8613800000000",
   "message": "Hello World"
 }
 ```
 
 `phone` 和 `message` 均必填且非空串，否则 `400 BAD_REQUEST`（`phone and message required`）。
 
-**响应 (200)：** `{ "success": true, "message": "<发送结果说明>", "phone": "+8613800138000" }`
+**响应 (200)：** `{ "success": true, "message": "<发送结果说明>", "phone": "+8613800000000" }`
 
 > **失败是 `500` + 同结构 body**（`{success:false, message:"<失败原因>", phone}`），**不是** respondFail 信封 —— 没有 `ok`/`code`/`error` 字段。客户端要单独认这一种。  
-> 响应里的 `message` 是**发送结果说明**，不是你发出去的正文，别拿它做回显。
+> 响应中的 `message` 是**发送结果说明**，而非发出的正文，不应将其用于回显。
 
 #### `POST /api/sms/delete`
 
@@ -4195,12 +4309,12 @@ WiFi 休眠定时器。
 **请求体：**
 
 ```json
-{ "phone": "+8613800138000" }
+{ "phone": "+8613800000000" }
 ```
 
 `phone` 必填非空白，否则 `400 BAD_REQUEST`（`phone required`）。
 
-**响应：** `{ "success": true, "phone": "+8613800138000" }`
+**响应：** `{ "success": true, "phone": "+8613800000000" }`
 
 #### `POST /api/sms/mark-all-read`
 
@@ -4236,22 +4350,22 @@ WiFi 休眠定时器。
 | 字段        | 类型     | 说明                                                                                                          |
 | --------- | ------ | ----------------------------------------------------------------------------------------------------------- |
 | msgId     | long   | 来源短信 ID，可与 `GET /api/sms/{id}` 对应                                                                           |
-| code      | string | 提取到的 4 位或 6 位数字，**字符串**（前导 0 会保留，别当整数解析）                                                                    |
+| code      | string | 提取到的 4 位或 6 位数字，**字符串**（保留前导 0，不应按整数解析）                                                                    |
 | source    | string | 发送方号码                                                                                                       |
 | snippet   | string | 正文预览，**超过 80 字会被截断并补 `...`** —— 拿它当完整正文会丢内容，要全文用 `body`                                                     |
 | body      | string | 来源短信**全文**，不截断。DB v8 起入库；v8 之前的旧记录首次被读取时，core 会按 `msgId` 回查原短信自动回填并写回 DB。仅当原短信已被删除时才会是空串，此时读取方回退到 `snippet` |
 | timestamp | long   | 来源短信时间（ms）                                                                                                  |
 | keyword   | string | 命中的关键词，取值来自固定词表：`验证码` / `校验码` / `动态码` / `确认码` / `口令` / `密码` / `code` / `OTP`                                |
 
-> 解析规则（2026-09-08 起两条路径统一到 `SmsCodeExtractor`）：命中关键词后在**附近 20 字符**内找不与其他数字相连的 **4-8 位**数字，取距离关键词最近的那个。同一份判据也用于邮件转发的场景判定，避免「邮件认这条是验证码、验证码库不认」。  
+> 解析规则（两条路径统一由 `SmsCodeExtractor` 实现）：命中关键词后在**附近 20 字符**内找不与其他数字相连的 **4-8 位**数字，取距离关键词最近的那个。同一份判据也用于邮件转发的场景判定，避免「邮件认这条是验证码、验证码库不认」。  
 > 缓存表读取失败时返回 `{"codes": [], "count": 0}`（不报错），所以空数组既可能是「没有验证码」也可能是「DAO 不可用」。
 
 ### 短信拦截（黑名单 + 关键词）
 
-> 2026-09-08 新增。取代旧的 `sms-forward.blacklist`（一个 StringSet，每条同时匹配发件人**和**正文，无法区分「拉黑号码」与「屏蔽关键词」）。
+> 取代旧的 `sms-forward.blacklist`（StringSet，每条同时匹配发件人**和**正文，无法区分「拉黑号码」与「屏蔽关键词」）。
 >
 > 拦截在 core 侧的 **6 个接入点**统一生效，判定函数只有一份（`SmsFilter`）：邮件转发不发、WS 通知不推、验证码不入库、短信列表滤掉、总数/联系人同口径扣除、未读数不计入。  
-> 客户端**不需要也不应该**自己再过滤一遍。
+> 客户端**无需且不应**再次自行过滤。
 >
 > **不提供规则试算端点**：`contains/equals/prefix/suffix` 行为可预测，「规则有没有生效」看 `hit_count` 与拦截记录。  
 > **不使用 `configVersion` 版本门**：规则是逐条增删改，没有整对象覆盖问题。
@@ -4390,7 +4504,7 @@ WiFi 休眠定时器。
 | blocked_path | string | 命中的路径，逗号拼接去重：`mail`（邮件未发） / `push`（通知未推） / `vc`（验证码未入库）。同一条短信多路径命中**只有一行记录**，路径合并进这个字段 |
 | blocked_at   | long   | 拦截时间（ms）                                                                               |
 
-> 环形上限**写死 500 条**，insert 之后立即裁剪最旧的。**不做成配置项** —— 历史上 `AlertConfig.maxRows` 就是「存了但引擎从不读」的假开关，最后被删掉。  
+> 环形上限**写死 500 条**，insert 之后立即裁剪最旧的。**不做成配置项**：`AlertConfig.maxRows` 曾是「已存储但引擎从不读取」的无效配置项，已被删除。  
 > 读路径（列表 / 计数 / 联系人）只过滤、**不产生记录**，否则每次下拉刷新都会刷出一批重复行。
 
 #### `DELETE /api/sms/blocked`
@@ -4417,6 +4531,16 @@ WiFi 休眠定时器。
 ### 路径安全规则
 
 仅允许 `/sdcard`、`/storage/`、`/mnt/media_rw/` 前缀。阻止 `..`、shell 元字符和系统目录。
+
+**两个目录不再经文件 API 开放**（返回与「路径越权」相同的失败）：
+
+- `Download/UFI-AXIS/log/…` —— 日志里有设备身份、goform 会话与 AT 指令；
+  看日志走 `GET /api/debug-logs`。
+- `Download/UFI-AXIS/Backup/…` —— 备份包含 `goform_password` / `tunnel_cf_token`；
+  备份走 `POST /api/backup/export`，恢复走 `/api/backup/import`。
+
+判据是「小写后缀匹配」（`/sdcard` 在真机会 canonical 成 `/storage/emulated/0` 或
+`/storage/XXXX-XXXX`，写死绝对前缀会在部分机型漏掉）。
 
 ### 状态与列表
 
@@ -4488,7 +4612,7 @@ WiFi 休眠定时器。
 }
 ```
 
-> **`owner` / `group` 恒为空串** —— 字段保留着但没有实现（没有走 `stat`），别拿来展示。  
+> **`owner` / `group` 恒为空串** —— 字段保留但未实现（未调用 `stat`），不应在界面展示。  
 > 文件不存在 → `404 NOT_FOUND`（`文件不存在`）；路径非法 → `400 BAD_REQUEST`。
 
 #### `GET /api/files/search`
@@ -4576,7 +4700,7 @@ WiFi 休眠定时器。
 
 `size` 恒为**文件真实字节数**（`File.length()`），与 `/api/files/info` 的 `size` 同源，可直接对比。
 
-> **失败也走 200**，靠 `truncated` 判别（`content` 同时给出可读占位文案，但不要拿文案做判断）：
+> **失败也走 200**，靠 `truncated` 判别（`content` 同时给出可读占位文案，但不应以文案作为判断依据）：
 >
 > - `truncated = true` 表示 `content` 不是完整文件内容，直接保存回去会损坏文件，UI 必须转只读；
 > - 三种情况：非文件/不存在（`size = 0`）、超过 512KB、前 4096 字节里含 `0x00` 的二进制文件。  
@@ -4612,7 +4736,7 @@ WiFi 休眠定时器。
 `deleted` 与 `success` **恒等**（同一个布尔），保留是为了兼容旧客户端。递归删除，目录也能删。  
 文件不存在时返回 `success:false`（200，不是 404）。命中危险路径黑名单 → `400 DANGEROUS_PATH`。
 
-**单个文件先走 MediaStore**（2026-09-23）：`contentResolver.delete` 把文件与媒体索引一起处理。
+**单个文件先走 MediaStore**：`contentResolver.delete` 把文件与媒体索引一起处理。
 只用 `File.delete()` 的话索引还在，媒体库里会留下一条指向不存在文件的僵尸记录 —— 列表里看得见、
 点进去播放失败，重新扫描也不一定清得掉。删到 0 行（文档、压缩包这类本来就不在 MediaStore 里的）
 才退回文件系统删除。**目录仍然只走 `deleteRecursively()`**：逐个查 MediaStore 的代价随目录规模膨胀，
@@ -4620,7 +4744,7 @@ WiFi 休眠定时器。
 
 没有「所有文件访问权限」时 resolver 抛 SecurityException，单独归类成
 `403 FORBIDDEN` + `extra = { needsAllFilesAccess: true }` —— 客户端据此引导去授权，
-而不是让用户对着笼统的"删除失败"反复重试。可以先用 `GET /api/files/status` 的
+而不是让用户面对笼统的「删除失败」反复重试。可先用 `GET /api/files/status` 的
 `isExternalStorageManager` 预判。
 
 #### `POST /api/files/rename`
@@ -4851,7 +4975,7 @@ WiFi 休眠定时器。
 
 #### `GET /api/apps`
 
-应用列表。**开销很大**：内部要跑 `pm list packages -f` / `-d` / `--suspended` 与 `dumpsys package packages`，并为每个包取 label + 图标，几百个包时是秒级响应。别放进轮询。
+应用列表。**开销较大**：内部要跑 `pm list packages -f` / `-d` / `--suspended` 与 `dumpsys package packages`，并为每个包取 label + 图标，数百个包时响应为秒级。不应放入轮询。
 
 **查询参数：**
 
@@ -4922,7 +5046,7 @@ WiFi 休眠定时器。
 
 | 字段                                | 类型         | 说明                                                             |
 | --------------------------------- | ---------- | -------------------------------------------------------------- |
-| versionCode                       | **string** | 是 `longVersionCode` 转的**字符串**（取不到为 `"0"`），不是数字 —— 别直接 `int` 解析 |
+| versionCode                       | **string** | 是 `longVersionCode` 转的**字符串**（取不到时为 `"0"`），并非数字 —— 不应直接按 `int` 解析 |
 | firstInstallTime / lastUpdateTime | string     | **已格式化的时间串**，不是时间戳                                             |
 | appName / applicationLabel        | string     | 同一个值的两个键（历史兼容），这里取不到时是**空串**（与列表回落包名的行为不同）                     |
 | enabled / isEnabled               | boolean    | 同一个值的两个键                                                       |
@@ -4936,6 +5060,9 @@ WiFi 休眠定时器。
 #### `POST /api/apps/install`
 
 从设备路径安装 APK。
+
+> **装包 = 执行任意代码**：这条路收任意设备路径并做 root 安装，与
+> `/api/update/install-local` 等价。只要求已配对身份（Bearer + 设备签名）。
 
 **请求体：**
 
@@ -4953,10 +5080,13 @@ WiFi 休眠定时器。
 
 从 URL 下载安装 APK。core 先下载到临时文件再走本地安装，**同步等待**，大包会长时间挂住连接。
 
+> 调用方自带的 `sha256` 只防传输损坏、**不是信任锚**（攻击者可以自己算），
+> 所以这条等价于「从任意 URL 执行任意代码」。只要求已配对身份（Bearer + 设备签名）。
+
 **请求体：**
 
 ```json
-{ "url": "https://example.com/app.apk" }
+{ "url": "https://example.com/app.apk", "sha256": "<64-hex>" }
 ```
 
 `url` 必填非空白，否则 `400 BAD_REQUEST`（`url is required`）。
@@ -4969,6 +5099,9 @@ WiFi 休眠定时器。
 
 卸载应用。
 
+> 卸载不可恢复（应用数据一并消失），客户端应保留一次显式确认。
+> 只要求已配对身份（Bearer + 设备签名）。
+
 **请求体：**
 
 ```json
@@ -4979,7 +5112,7 @@ WiFi 休眠定时器。
 
 **响应 (200)：** `{ "success": true, "message": "<pm uninstall 输出>" }`
 
-**错误码：** `500 OPERATION_FAILED`。
+**错误码：** `500 OPERATION_FAILED`；`401`/`429` 见上；更新中 `409 UPDATE_IN_PROGRESS`。
 
 #### `POST /api/apps/permission`
 
@@ -5004,6 +5137,9 @@ WiFi 休眠定时器。
 #### `POST /api/apps/grant-all-permissions`
 
 一次性授予某应用**清单里声明的全部**运行时权限（走 adb/root shell 批量 `pm grant`）。
+
+> 这条会把短信/通讯录/定位/存储等全部运行时权限一次性授给**任意包**，比单条
+> `/api/apps/permission` 危险得多。只要求已配对身份（Bearer + 设备签名）。
 
 **请求体：**
 
@@ -5055,11 +5191,22 @@ WiFi 休眠定时器。
 { "packageName": "com.example.app" }
 ```
 
+`clear` **额外要求**：
+
+```json
+{ "packageName": "com.example.app", "confirm": true }
+```
+
+> **注意**：`clear`（清除数据，不可恢复）与 `force-stop`（停止进程）共用同一个端点、
+> 同一组参数，只靠 URL 末段区分。为防止「一次拼错就从停一下变成删干净」，
+> `clear` 必须带 **`confirm=true`**；其余三个动作不变（可逆，不加门槛）。
+> 更新进行中该端点统一回 `409 UPDATE_IN_PROGRESS`。
+
 **响应：** `{ "success": true, "action": "force-stop", "packageName": "com.example.app" }`
 
 **错误码：**
 
-- `400 BAD_REQUEST` — `packageName is required`
+- `400 BAD_REQUEST` — `packageName is required`；或 `clear` 缺 `confirm=true`
 - `400 INVALID_ACTION_TYPE` — `Unknown action: <action>`（注意错误码不是 `BAD_REQUEST`）
 
 > **freeze / unfreeze / {action} 这五个操作失败都是 `200` + `success: false`**，HTTP 状态码看不出来。  
@@ -5076,6 +5223,9 @@ WiFi 休眠定时器。
 #### `POST /api/shell/exec`
 
 执行 Shell 命令。危险命令被拦截（insmod、modprobe、rmmod、service call *sprd、reboot、poweroff、shutdown、echo 到 /sys/class/sblock|smem|smsg|mem、kill -9 rild|modem|netd|servicemanager）。
+
+> root shell 是本服务权限最高的入口。危险命令黑名单与定时任务的 `custom_shell` 动作
+> 共用同一份判据（`ShellCommandPolicy`），所以「建个定时任务绕过黑名单」这条路也堵上了。
 
 **请求体：**
 
@@ -5142,7 +5292,7 @@ WiFi 休眠定时器。
 > 需要认证。`POST /api/shell/exec` 与 `POST /api/at/command` 执行完后由 core 自动落库，  
 > **app 与 web 读的是同一份记录**（DB v13 的 `console_history` 表）。
 
-本组端点**不执行命令**，只读写历史 —— 历史的真源是「core 实际执行过什么」，  
+本组端点**不执行命令**，只读写历史 —— 历史记录以 core 的实际执行结果为来源，  
 客户端不能自由往里塞行（唯一例外是下面的 `/import`）。
 
 每通道保留最近 500 条（`shell` / `at` 各自计数，互不挤占）；`stdout` / `stderr`  
@@ -5187,7 +5337,7 @@ WiFi 休眠定时器。
 }
 ```
 
-- `exit_code` **可为 null**：AT 通道与被拦下的命令没有退出码，**不要**当成 0 处理；
+- `exit_code` **可为 null**：AT 通道与被拦下的命令没有退出码，**不得**当作 0 处理；
 - `source` 是客户端在执行时自报的 `app` / `web`（不认识的值归一为 `unknown`），  
   只用于展示，不参与任何判定；
 - `duration_ms` 是 core 在路由层量的端到端耗时。
@@ -5255,7 +5405,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 `sms_filter_exempt_verification_code`、`sms_filter_store_full_body`、`update_url`、  
 `update_mirror_base`。
 
-**这里没有 `token` / `secret`。** 随「严格设备独立性」改造（2026-08-28），全局 token 与 HMAC  
+**这里没有 `token` / `secret`。** 在「严格设备独立性」方案下，全局 token 与 HMAC  
 共享 secret 已整体删除 —— 凭据现在是每设备一份、由配对流程签发，只能在  
 `/api/pairing/devices` 里增删，不能通过配置端点读写。
 
@@ -5271,7 +5421,7 @@ web 存在 `localStorage['ufi.console.history']`）。
   "auto_start_on_boot": true,
   "goform_ip": "192.168.0.1",
   "goform_port": 8080,
-  "goform_password": "admin",
+  "goform_password": "<设备后台密码>",
   "log_enabled": true,
   "core_log_enabled": true,
   "app_log_enabled": true,
@@ -5297,13 +5447,38 @@ web 存在 `localStorage['ufi.console.history']`）。
 `token` / `secret` 已不再是配置项，传了也是被忽略；`GET /api/config` 回的  
 `adb_auto_start_on_boot` 属于"只读不可写"；`device_profile_id` 连 GET 都不返回  
 （见「设备字段契约 › 排障开关」）。  
-`field_normalization_enabled` **已经可读可写**（2026-09-22 起），但它不热生效 —— 见下面 `needs_restart` 那一段。  
+`field_normalization_enabled` **已经可读可写**，但它不热生效 —— 见下面 `needs_restart` 那一段。  
 字段被拒时**不会**写入，且会出现在响应的 `rejected_fields` 里（C03）：
 
 - `OUT_OF_RANGE` —— 越界，附带 `min` / `max`：`port` 1024..65535、`goform_port` 1..65535、`qos_shell_max_concurrent` 1..10、`qos_cache_ttl_ms` 500..30000、`qos_goform_query_max` 1..8、`qos_goform_set_max` 1..4、`sms_code_cleanup_hours` 0..720；
 - `MASKED_VALUE` —— 回写了 `GET` 返回的脱敏值（含 `***`）；
 - `BLANK_VALUE` —— `goform_password` / `goform_ip` / `update_url` 不允许空串（`update_mirror_base` 允许空串 = 直连）；
-- `WRONG_TYPE` —— 键存在但值类型不对（如 `"port": "8088"`）。
+- `WRONG_TYPE` —— 键存在但值类型不对（如 `"port": "8088"`）；
+- `INVALID_GOFORM_CONFIG` —— `goform_password` **验证失败**（为验证式写入，见下）。
+
+### `goform_password` 是**验证式写入**
+
+写入前 core 会将新口令交给设备传输层并**实际登录一次**：设备不接受（口令错误、设备已在其他位置被修改）
+就回 `rejected_fields`（`INVALID_GOFORM_CONFIG`）且**不落盘**，`goform_password` 也不会出现在
+`updated_fields` 里。这样一次「只改日志级别的批量 PUT」夹带错口令不会把 core→设备的凭据写坏
+（写坏的表现是所有 goform 请求 503，且没有读回明文的路径）。
+
+值域判据：空串 → `BLANK_VALUE`，回写 `GET` 返回的掩码（含 `***`）→ `MASKED_VALUE`。
+若装配层未注入探活器（仅见于单元测试或局部装配），则退化为直接落盘并记录 WARN。
+
+### 危险开关
+
+下面这些字段打开后会把设备最危险的能力挂到 HTTP 上，**客户端必须在 UI 上明确警示**：
+
+1. `goform_dump_enabled` / `goform_command_enabled` / `ttyd_enabled` / `screen_enabled` ——
+   裸 goform 读（不脱敏）、裸 goform 写（不过 `WriteSpec` 值域校验）、真 PTY 终端、
+   屏幕画面 + 触摸注入。
+2. `goform_ip` / `goform_port` —— 改完 core 会把已存好的设备口令发到那个地址。
+3. `update_url` —— 改完下次检查更新就从那里拉 APK（供应链入口）。
+
+这些变更**不需要额外提供配对密码**：设备为单机单人场景，
+「已配对」本身已证明持有凭据，不再逐操作二次确认。写入校验本身不变：
+值域、掩码回写、空串、`goform_password` 的验证式写入都照旧。
 
 `needs_restart` 为 true 的字段：`port` / `goform_ip` / `goform_port` / `goform_password`。  
 `hint` 文案也只针对这四个（固定为「修改了认证或端口配置，需重启服务生效」）。
@@ -5314,13 +5489,13 @@ web 存在 `localStorage['ufi.console.history']`）。
 > 而它不在上面那份清单里，`needs_restart` 会回 `false`、`hint` 是空串 ——  
 > 客户端必须自己在界面上写明"需重启后台服务"，不能靠响应推断。  
 > 另外两个排障开关（`goform_dump_enabled` / `goform_command_enabled`）是每次请求现读 prefs，  
-> PUT 完下一个请求就生效，**别按它们类推**。
+> PUT 后下一个请求即生效，**不得据此类推其他配置项**。
 
-日志相关开关是**分三层**的，客户端不要当成同一个（都是「与」关系）：
+日志相关开关分为**三层**，客户端不应视为同一开关（三层为「与」关系）：
 
 - `log_enabled`（默认 `true`）—— **总闸**。置 `false` 后 core 立刻清空内存缓冲、关闭日志文件写入器，之后所有级别（含 WARN/ERROR）、logcat、`<日期>/{app|at|error}.log` 落盘与 goform 会话日志**全部停写**，`GET /api/debug-logs` 会一直返回空数组。
 - `core_log_enabled`（默认 `true`）—— **core 侧子开关**，效果同上但只作用于 core。core 常驻写盘，这是控制后端日志体积的开关。
-- `app_log_enabled`（默认 `true`）—— **app 侧子开关**。core **自己不使用这个值**，只替手机端保管真源（放这里 web 才能一起控制、多台手机连同一设备时开关一致）；app 通过 `GET /api/config` 回读后作用于自己的 `DebugLog`。
+- `app_log_enabled`（默认 `true`）—— **app 侧子开关**。core **自己不使用这个值**，只替手机端保管唯一来源（放这里 web 才能一起控制、多台手机连同一设备时开关一致）；app 通过 `GET /api/config` 回读后作用于自己的 `DebugLog`。
 - `debug_mode`（默认 `false`）—— **详细开关**。只在上面几项为 true 时有意义，控制 DEBUG/INFO 是否记录**以及是否落盘**；关闭时仍会记 WARN/ERROR。
 
 > 日志文件：所有类型单文件上限 5MB，超出后轮转为 `<prefix>_<date>.log.1`（只保留 1 个历史文件）；跨天写入时自动清理 7 天前的文件。
@@ -5350,11 +5525,34 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 #### `POST /api/config/reset`
 
-恢复默认配置。
+恢复默认配置（**配对信息与配对密码保持不变**）。
 
-**请求体：** 无
+**请求体：** 无（或只带 `scopes`）。身份只有 Bearer + 设备签名一条。
 
-**响应：** `{ "success": true, "message": "Configuration reset to defaults" }`
+**按域恢复**：可传 `scopes` 只清指定域，避免「恢复默认配置」顺带清掉通知令牌、
+媒体扫描目录、隧道看护设置等与之无关的数据。
+
+```json
+{ "scopes": ["logging", "qos"] }
+```
+
+可用域：`server` / `device` / `logging` / `qos` / `pairing` / `sms` / `notify` / `monitor` /
+`media` / `environment` / `update` / `tunnel` / `traffic`。未知域名 → `400 BAD_REQUEST`；
+空数组 → `400 BAD_REQUEST`（要清全部请省略该参数）。
+
+**响应：**
+
+```json
+{
+  "success": true,
+  "scope": "partial",
+  "cleared_scopes": ["logging", "qos"],
+  "kept_scopes": ["server", "device", "…"],
+  "message": "已恢复所选的 2 个配置域（配对信息与配对密码保持不变），需重启服务生效"
+}
+```
+
+`scopes` 省略时 `scope` 为 `"all"`。
 
 ---
 
@@ -5393,11 +5591,11 @@ web 存在 `localStorage['ufi.console.history']`）。
 - `installing`：core 会通过 watchdog 脚本重启**自身**，此期间 HTTP 服务短暂不可达，客户端轮询失败属预期，不应报错终止。
 - `progress` 是下载百分比 0..100。
 - `latest_version` 与 `apk_path` **可为 `null`**（未拉过清单 / 尚无本地 APK 时）；`current_version` 与 `message` 恒为字符串（读不到版本名时是空串）。
-- `apk_path` 在 `POST /api/update/upload` 成功后会被写入状态（2026-09-06 修：此前只改 `state`/`message`，  
+- `apk_path` 在 `POST /api/update/upload` 成功后会被写入状态（不仅修改 `state`/`message`，  
   导致上传完回读 `status` 拿到的仍是 `null`，客户端据此渲染的「安装已上传的包」入口会立刻消失）。  
   该值随 `POST /api/update/reset` 清空，也随进程重启丢失 —— **core 重启后 `apk_path` 会回到 `null`**，  
   且上传的文件本身也可能已被启动期清理（`cleanupInstallArtifacts` 会扫掉 update 目录下所有  
-  `*.apk` / `*.part`），所以重启后一律按"需要重新上传"处理，不要缓存路径直接调 `install-local`。
+  `*.apk` / `*.part`），因此重启后一律按「需要重新上传」处理，不应缓存路径后直接调用 `install-local`。
 
 #### `GET /api/update/status`
 
@@ -5436,6 +5634,13 @@ web 存在 `localStorage['ufi.console.history']`）。
 ```
 
 `apk_path` 必填（取 `upload` 响应或 `status` 里的 `apk_path`），缺失返回 `400 BAD_REQUEST`。
+
+> **两道约束**：
+> 1. **包名校验**：APK 的包名必须与设备端 Core 一致，否则 `ok:false` 且 `status.message`
+>    写明「包名不匹配」（此前这条路收任意绝对路径且不校验，等于可装任意 APK）。
+> 2. **签名校验**：APK 的签名摘要必须与**已安装的 Core** 一致，
+>    否则 `ok:false` 并写明「签名不一致」。系统安装器本来也会拒，这里提前判是为了
+>    把原因写进 `status.message`，而不是让状态机卡在 `installing`。
 
 **响应：**
 
@@ -5559,6 +5764,9 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 上传 ZIP 覆盖安装前端资源（multipart/form-data）。
 
+> 上传的 ZIP 会**整包替换**浏览器端 JS，而浏览器里存着 API token —— 一段脚本就能把它发走。
+> 鉴权只有 Bearer + 设备签名；更新进行中 → `409`。
+
 **请求：** multipart 表单，字段名固定为 `file`（其他字段名一律忽略）；ZIP **上限硬编码 50MB**，是流式累计判定，超限即中止并返回 400。
 
 **响应：** `{ "success": true, "...": "同 GET /api/web/version 的字段" }`（安装后的版本信息 + `success`）
@@ -5597,7 +5805,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 }
 ```
 
-`500`，本组唯一带 `success` 字段的失败信封。触发条件是删除后复核 `hasOverride()` 仍为 true（文件被占用导致删不干净）—— 此时**不能**按成功处理，否则用户以为已回内置版本、实际还在跑坏掉的 override。
+`500`，本组唯一带 `success` 字段的失败信封。触发条件是删除后复核 `hasOverride()` 仍为 true（文件被占用导致删不干净）—— 此时**不得**按成功处理，否则用户会认为已回退到内置版本，而实际仍在运行损坏的 override。
 
 ---
 
@@ -5615,6 +5823,10 @@ web 存在 `localStorage['ufi.console.history']`）。
 > `status` 值域：`Running` / `Stopped` / `Error`。
 >
 > **desired（看护期望）语义**：`start` 成功会把名字加入 desired，`stop` 会移出 —— 用户主动停的通道不会被自动重连拉起。
+>
+> **「对外暴露」档**（决策 #2）：`PUT/DELETE /config/{name}`、`POST /config/{name}/activate|start`、
+> `PUT/DELETE /tunnel/{name}`、`POST /tunnel/{name}/activate|start` 会让内网服务暴露到公网，
+> 客户端应在确认框里写明目标与访问方式。鉴权与其他 `/api` 端点相同（Bearer + 设备签名）。
 
 ### 通用 / 看护
 
@@ -5669,7 +5881,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 }
 ```
 
-`max_reconnect_attempts` 是**只读常量**（3）。`notify_on_failure` 是**隧道失败通知的唯一真源**（通知配置端点 `/api/notifications/config` 故意不含该字段）。开关入口在 app 的「内网穿透设置」页；实际投递仍受 `/api/notifications/config` 的 `alert_enabled` 总闸约束，总闸未开时 app 会 toast 引导用户去打开。
+`max_reconnect_attempts` 是**只读常量**（3）。`notify_on_failure` 是**隧道失败通知的唯一来源**（通知配置端点 `/api/notifications/config` 故意不含该字段）。开关入口在 app 的「内网穿透设置」页；实际投递仍受 `/api/notifications/config` 的 `alert_enabled` 总闸约束，总闸未开时 app 会 toast 引导用户去打开。
 
 #### `PUT /api/tunnel/settings`
 
@@ -5717,7 +5929,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 | ---- | ------ | -- | ------------------------------------------------------------- |
 | toml | string | 是  | 缺失 / null / **全空白** → `400 BAD_REQUEST`（`"toml is required"`） |
 
-- 空白拒绝是 T40-2 修的：此前漏传会把通道配置**静默写成空文件并回 `success:true`**。
+- 空白拒绝：漏传会将通道配置**静默写成空文件并返回 `success:true`**。
 - `name` 空 → 400；名字被 sanitize 会改动即视为非法（禁止 `\ / : * ? " < > |`、**逗号**、控制字符、`..`，长度 ≤ 64），保存失败 → 400（`"invalid config name or save failed"`）。**不会静默改名**。
 - `toml` 传成对象/数组会走到未捕获异常 → **500 + `{error}`**（形态 3），不是 400。
 - 写盘是 tmp + rename 原子提交；首条配置保存后若无选中项会自动选中它。
@@ -5826,15 +6038,15 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 > 需要认证。邮件通知配置（可选模块）。
 >
-> 2026-08-29：原「短信转发」改名「邮件通知」，通道只剩 SMTP —— `method` 字段与  
+> 渠道名称已由「短信转发」改为「邮件通知」，通道仅保留 SMTP：`method` 字段与  
 > curl 回调 / 钉钉机器人的全部字段（`curl_url` / `curl_template` / `dingtalk_token` /  
 > `dingtalk_secret`）已从 core 删除，传了也会被忽略。  
 > **路径未改名**（仍是 `/api/sms-forward/*`）：app 与 web 都按它引用，改名只会破坏跨端契约。  
 > 新增 `scenes`（通知场景白名单）与 `POST /notify`（app 通知转邮件）。  
-> 2026-09-08：新增 `GET/DELETE /history`（投递历史，逐条留档成败与失败原因）。  
-> 2026-09-10（DB v12）：投递记录改为**三态** —— 记录多了 `outcome`（`sent` / `failed` / `skipped`）、  
+> 提供 `GET/DELETE /history`（投递历史，逐条记录成败与失败原因）。  
+> （DB v12）投递记录为**三态**：记录包含 `outcome`（`sent` / `failed` / `skipped`）、  
 > `GET /history` 多了 `result=skipped` 与 `skipped_total`、`DELETE /history` 多了 `channel` 参数。  
-> 2026-09-10（规则同构）：配置多了 `min_level` 与 `daily_limit`（+ `sent_today` / `quota_remaining` /  
+> （规则同构）配置包含 `min_level` 与 `daily_limit`（+ `sent_today` / `quota_remaining` /  
 > `levels` / `daily_limit_min` / `daily_limit_max` 五个只读位），三条渠道的字段名与语义逐字一致；  
 > **`POST /config` 从"永不报错"变成了可能 400**。
 
@@ -5869,7 +6081,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 `alert` / `connectivity` / `sms` / `verification` / `download` / `traffic80` / `events` / `tunnel` / `battery`。  
 底层是 `StringSet`，**顺序不保证**。
 
-**投递规则（2026-09-10「规则同构」新增，三条渠道字段名与语义逐字一致）：**
+**投递规则（三条渠道字段名与语义一致）：**
 
 | 字段                                | 类型             | 默认      | 说明                                                                                                                               |
 | --------------------------------- | -------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
@@ -5877,7 +6089,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 | daily_limit                       | int            | 0       | 每日封数上限，范围 **0–500**，**0 = 不限**。按设备本地日期跨天重置。上限 500 是因为免费 SMTP 的日发信量普遍限制在几百封，撞上之后账号会被临时锁定                                          |
 | sent_today                        | int            | —       | 只读。今天已发出几封（只有 `Sent` 计一封 —— SMTP 250 应答是确定结论）                                                                                    |
 | quota_remaining                   | int | **null** | —       | 只读。今天还剩几封，已钳到 0；**`daily_limit = 0`（不限）时是 `null`**。客户端必须渲染成「不限」而不是 0 —— 0 的含义是"已经用尽"，与"不限"恰好相反                                   |
-| levels                            | string[]       | —       | 只读。级别取值域，供客户端渲染下拉。**不要手抄第二份**：core 加一档时手抄的那份不会报错，只会少一项                                                                           |
+| levels                            | string[]       | —       | 只读。级别取值域，供客户端渲染下拉。**不得另行维护副本**：core 增加一档时，副本不会报错，只会缺少一项                                                                           |
 | daily_limit_min / daily_limit_max | int            | 0 / 500 | 只读。取值域。三条渠道**刻意不同**：邮件 0..500、Webhook 0..1000、本机短信 **1..50（不允许 0）**                                                              |
 
 > **计数器是本渠道独占的**（`sms_forward` 的一对 `quota_day` / `quota_count`），与 Webhook、本机短信那两份物理隔离。共享一个计数器意味着邮件发多了会吃掉短信的额度，而那种故障在账面上看不出任何异常。
@@ -5921,7 +6133,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 #### `POST /api/sms-forward/config`
 
-保存邮件通知配置。**字段级合并**（T40-1）：只覆盖请求体里出现的字段，未出现的字段保留 core 当前值，因此可以只提交 `{"enabled": true}`。
+保存邮件通知配置。**字段级合并**：只覆盖请求体里出现的字段，未出现的字段保留 core 当前值，因此可以只提交 `{"enabled": true}`。
 
 **请求体：**
 
@@ -5943,13 +6155,13 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 **响应：** `{ "success": true }`（成功时恒为 true，且**不回传新配置** —— 保存后需要重新 `GET /config` 才能刷新 `*_set` 屏蔽位）
 
-**400 校验（2026-09-10 新增，`code = BAD_REQUEST`）：**
+**400 校验（`code = BAD_REQUEST`）：**
 
-这个端点从"永不报错"变成了**可能返回 400**。客户端必须有这条错误分支 —— 沿用"保存必成功"的假设会让用户看到「已保存」而设备侧根本没写进去。两个条件：
+该端点**可能返回 400**，客户端必须处理该错误分支：若沿用「保存必成功」的假设，用户会看到「已保存」而设备侧并未写入。两个条件：
 
 | 条件                                                | 报错（中文，直接展示给用户）                                                                        |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `min_level` 不是 `info` / `warning` / `critical` 之一 | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做"认不出就回落" —— 静默回落会让用户以为自己设的门槛生效了 |
+| `min_level` 不是 `info` / `warning` / `critical` 之一 | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做「无法识别即回落」：静默回落会让用户误认为所设门槛已生效 |
 | `daily_limit` 不在 0–500                            | `每日封数上限（daily_limit）需在 0..500 之间（0 = 不限），收到 …`                                        |
 
 **需要客户端自己兜住的边界（这两项之外 core 侧无校验）：**
@@ -5964,7 +6176,7 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 发送测试邮件。**用的是已持久化的配置**，未保存的改动不生效。
 
-**手动触发不受通知总开关与免打扰约束**：用户刚按下"发送测试"，静默什么都不发比发出去更难排查。响应里的 `auto_notify_enabled` 说明闸门（`master_enabled` +（`mail_respect_dnd` 时的）静默窗口）当前放不放行自动通知 —— `false` 意味着"这封测试发出去了，但自动通知此刻是关的"。
+**手动触发不受通知总开关与免打扰约束**：测试通知静默失败比实际发出更难排查。响应里的 `auto_notify_enabled` 说明闸门（`master_enabled` +（`mail_respect_dnd` 时的）静默窗口）当前放不放行自动通知 —— `false` 意味着"这封测试发出去了，但自动通知此刻是关的"。
 
 **请求体：** 无（body 被忽略）
 
@@ -5975,11 +6187,11 @@ web 存在 `localStorage['ufi.console.history']`）。
 
 > SMTP 投递带**有界重试**（最多 3 次，退避 2s + 6s，只重试超时/连接失败这类网络错误；账号密码错、地址非法、收件人全部无效只试 1 次）。所以一次失败的 `/test` 最坏要等约 40s 才返回，`error` 里会带上实际尝试次数。整轮投递只写 **1 条** `mail_send_records`。
 
-> **旧端点 `POST sms-forward/notify` 已于 2026-09-10 删除**（此处刻意不写带 `/api` 前缀的完整路径：契约校验器会把文档里的路径字面量当成"手册声明了该端点"，而 core 已经没有它了）。那是 core 接管告警判定之前的遗留通路：温度/电量/信号阈值由 app 判定、弹完通知再回传给 core 发信。判定搬进 `AlertEngine` 之后它就没有调用方了（删除前核实：app 与 web 全仓都不请求），而留着会让 app 有能力绕过 core 的判定直接指定场景发通知，与「判定与投递都在 core」的分工冲突。客户端不需要做任何事 —— 通知由 core 自己产生并投递。
+> **旧端点 `POST sms-forward/notify` 已删除**（此处刻意不写带 `/api` 前缀的完整路径：契约校验器会把文档中的路径字面量视为「手册声明了该端点」，而 core 已不提供该端点）。该端点是 core 接管告警判定之前的遗留通路：温度/电量/信号阈值由 app 判定、弹完通知再回传给 core 发信。判定迁入 `AlertEngine` 后已无调用方（删除前核实：app 与 web 均不请求），保留会使 app 能够绕过 core 的判定直接指定场景发通知，与「判定与投递均在 core」的分工冲突。客户端无需改动：通知由 core 产生并投递。
 
 #### `GET /api/sms-forward/history`
 
-投递历史（2026-09-08 新增，`mail_send_records` 表；AppDatabase v11 起带 `channel` 列，**v12 起带三态的 `outcome` 列**）。
+投递历史（`mail_send_records` 表；AppDatabase v11 起含 `channel` 列，**v12 起含三态 `outcome` 列**）。
 
 > **表名保留、口径已扩大**：这张表现在是**多渠道共用**的投递记录（邮件 / Webhook / 本机短信），  
 > `channel` 列区分。路径与表名都没改 —— app 与 web 都按它引用，改名只会破坏跨端契约。
@@ -6023,9 +6235,9 @@ web 存在 `localStorage['ufi.console.history']`）。
 }
 ```
 
-keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一致（DAO 层全仓没有 `OFFSET`）。`cursor_ts` 与 `cursor_id` 必须成对回传：只带 `cursor_ts` 会让 SQL 里的 `id < :cursorId` 变成 `id < NULL`（恒为 NULL），同一毫秒的边界行被整段跳过，所以 core 干脆把"只带一个"当首页处理。
+keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一致（DAO 层仓库内不使用 `OFFSET`）。`cursor_ts` 与 `cursor_id` 必须成对回传：只带 `cursor_ts` 会让 SQL 里的 `id < :cursorId` 变成 `id < NULL`（恒为 NULL），同一毫秒的边界行被整段跳过，所以 core 干脆把"只带一个"当首页处理。
 
-**`outcome` 是三态，且是唯一真源**（v12 新增）：
+**`outcome` 是三态，且为唯一来源**（v12 新增）：
 
 | outcome   | 含义                                     | `error` 列                                                                                                 |
 | --------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -6033,15 +6245,15 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 | `failed`  | 发起过投递但失败（重试耗尽后的终态）                     | 摊平的异常链或状态码摘要，开头带尝试次数                                                                                      |
 | `skipped` | **没发起**，被闸门按用户自己的配置拦下                  | 跳过原因的**中文说明**（**六档**：`通知总开关已关闭` / `处于免打扰时段` / `渠道配置不完整` / `该渠道未勾选此触发场景` / `事件级别低于该渠道的最低级别` / `当日发送配额已用尽`） |
 
-`success` 字段从 v12 起只是 `outcome == "sent"` 的**副本**，保留只为不破坏既有调用方。**客户端不要用它做分类** —— `skipped` 行的 `success` 也是 `false`，照它渲染会把"被跳过"说成"发送失败"。跳过原因由 core 直接给中文，客户端**不要再维护一张原因映射表**：core 加一档新原因时那张表不会报错，只会在界面上显示成空白。
+`success` 字段从 v12 起只是 `outcome == "sent"` 的**副本**，保留只为不破坏既有调用方。**客户端不得用它分类**：`skipped` 行的 `success` 同样为 `false`，依据它渲染会把「被跳过」显示为「发送失败」。跳过原因由 core 直接提供中文，客户端**不得再维护原因映射表**：core 加一档新原因时那张表不会报错，只会在界面上显示成空白。
 
 **`skipped` 的噪声闸：只在渠道已配置时才记。** 判据是渠道自己的 `isConfigured()`，不是"原因不是配置不完整" —— 总开关/免打扰那两道闸排在配置检查**之前**，SMTP 一项没填的渠道在免打扰时段拿到的是"处于免打扰时段"这一档，只看原因照样会把表刷满（默认 500 条的环形缓冲几十条就冲满，真正的失败记录被挤出去）。所以：**没配全的渠道在这张表里什么都不会有**，那种情况去看设备日志。
 
-> **不要按 `error` 文案做分类或高亮**：那段中文是给人看的显示文本，core 改一句措辞就会让匹配静默失效 —— 2026-09-10 把 `通知总开关关闭或处于免打扰时段` 拆成 `通知总开关已关闭` 与 `处于免打扰时段` 两档正是这样一次改动。分类只认 `outcome`。
+> **不得按 `error` 文案分类或高亮**：该中文为显示文本，core 调整措辞会使匹配静默失效（如将 `通知总开关关闭或处于免打扰时段` 拆分为 `通知总开关已关闭` 与 `处于免打扰时段` 两档）。分类只依据 `outcome`。
 
 `failed_total` 与 `skipped_total` 是**两个独立计数，不能相加**：跳过不是失败，把两者并成一个数会让"失败 12 条"里其实有 11 条是"免打扰时段没发"。两者都是该渠道（受 `channel` 影响）的**全表**计数，**不受 `result` 筛选影响** —— 客户端可以在任何筛选档下用同一组数字做摘要。`/diagnose` 的 `sent_*` 三个计数器口径**没变**：那边仍然只统计发起过投递的两态。
 
-整轮重试**只写 1 条**（重试三次写三条的话，用户看到的是"三封发不出去"，与事实不符）。
+整轮重试**只写入 1 条**（若重试三次写入三条，用户会看到「三封发送失败」，与事实不符）。
 
 **不存正文**：正文可能含验证码与短信全文，历史只需要回答"发了什么主题、成没成"。`recipient` 列按渠道脱敏：邮件是收件地址原文，Webhook 只写 **scheme + host**，本机短信只写**前 3 后 2** 的号码 —— path/query 里的 device key 与完整手机号都不该落进用户可导出的记录。
 
@@ -6061,7 +6273,7 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 
 ## Webhook 通知 /api/notify/webhook
 
-> 需要认证。**通知渠道之一**（阶段 2，2026-09-09）：把一条通知按用户配的模板 POST 到用户配的 URL。
+> 需要认证。**通知渠道之一**：按用户配置的模板将通知 POST 到用户配置的 URL。
 >
 > 有了它，Bark / ntfy / 企业微信群机器人 / 飞书 / PushPlus / Server 酱 / 自建服务全部变成"填 URL + 贴模板"。
 >
@@ -6072,7 +6284,7 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 > （每个预设各存一份，见下面的存储模型）。
 >
 > 渠道 id 是 **`webhook`**；配置存独立 prefs（`notify_webhook`），**不进 `/api/notifications/config`** ——  
-> 那一组是"客户端要不要弹通知"的开关，渠道配置归渠道自己（与邮件的 `sms_forward`、  
+> 那一组是「客户端是否弹出通知」的开关，渠道配置归渠道自己（与邮件的 `sms_forward`、  
 > 本机短信的 `notify_local_sms` 同做法）。
 
 #### `GET /api/notify/webhook/config`
@@ -6126,27 +6338,27 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 | 字段            | 类型       | 默认                                | 说明                                                                                                                                                                                                                            |
 | ------------- | -------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | enabled       | boolean  | false                             | 渠道开关                                                                                                                                                                                                                          |
-| preset        | string   | `CUSTOM`                          | 预设枚举名（`presets[].name`）。**不参与投递判定**，但它决定 per-preset 字段读写哪一份（见下面的存储模型）。认不出的名字 PUT 时回 **400**（大小写不敏感，只拒真不存在的）；`GET` 读到一份坏掉的 prefs 时仍回落 `CUSTOM` —— 那是"别让整份配置读不出来"，不是入参回落                                                        |
-| url           | string   | ""                                | 请求地址。填了就必须是 `http://` / `https://`（scheme 白名单全仓一份，见下）                                                                                                                                                                         |
+| preset        | string   | `CUSTOM`                          | 预设枚举名（`presets[].name`）。**不参与投递判定**，但它决定 per-preset 字段读写哪一份（见下面的存储模型）。认不出的名字 PUT 时回 **400**（大小写不敏感，只拒真不存在的）；`GET` 读到一份坏掉的 prefs 时仍回落 `CUSTOM` —— 该回落的目的是避免整份配置不可读，不属于入参回落                                                        |
+| url           | string   | ""                                | 请求地址。填了就必须是 `http://` / `https://`（scheme 白名单全仓库共用一份，见下）                                                                                                                                                                         |
 | method        | string   | `POST`                            | 只支持 `POST` / `GET` / `PUT`。放开任意 method 等于把配置项变成通用 HTTP 客户端；`GET` **不带 body**                                                                                                                                                  |
 | headers       | object   | {}                                | 自定义请求头。**值里可以用占位符**，头部名不替换（名字是配置的一部分，不该随每条通知变化）                                                                                                                                                                               |
 | body_template | string   | `CUSTOM` 的默认模板                    | 请求体模板，占位符见 `placeholders`                                                                                                                                                                                                     |
-| content_type  | string   | `application/json; charset=utf-8` | 决定占位符走不走 JSON 转义（判据是"含 `json` 字样"，大小写不敏感）。解析不了时回落 `application/json`。**客户端要把它做成可编辑的自由文本**：预设只提供默认值，`CUSTOM` 用户在 JSON 与纯文本之间切换靠的就是这一项；别做成"JSON / 纯文本"二选一的下拉 —— 自建服务可能要 `application/x-www-form-urlencoded` 之类的 MIME。校验只有"不能为空" |
+| content_type  | string   | `application/json; charset=utf-8` | 决定占位符走不走 JSON 转义（判据是"含 `json` 字样"，大小写不敏感）。解析不了时回落 `application/json`。**客户端要把它做成可编辑的自由文本**：预设只提供默认值，`CUSTOM` 用户在 JSON 与纯文本之间切换靠的就是这一项；不应做成「JSON / 纯文本」二选一的下拉 —— 自建服务可能要 `application/x-www-form-urlencoded` 之类的 MIME。校验只有"不能为空" |
 | timeout_ms    | long     | 10000                             | 单次请求超时，范围 **1000–60000**。下限 1s 是因为再短连 TLS 握手都做不完；上限 60s 是因为三次尝试 × 60s + 退避 8s 已接近 3 分钟，而 `TrafficAutoOffGuard` 那类"等通报到位再动作"的链路会一直悬着                                                                                           |
 | scenes        | string[] | []                                | 勾选的场景 id（与邮件 / 本机短信同一套词表）。空集 = 只有手动测试会发出去                                                                                                                                                                                     |
-| respect_dnd   | boolean  | **true**                          | 免打扰时段要不要连 Webhook 一起静默。默认 true —— Bark / ntfy / 群机器人跟状态栏一样会响铃；邮件默认 false 是因为邮件是"事后可查"的渠道                                                                                                                                      |
-| min_level     | string   | `info`                            | **规则同构的旋钮之一**（2026-09-10 新增）：最低投递级别（`info` / `warning` / `critical`）。低于它 `Skipped(LEVEL_TOO_LOW)`。默认 `info` 是为了不改变存量用户观察到的行为（此前这条渠道没有门槛，给个 `critical` 等于让所有人升级后突然收不到通知）                                                       |
+| respect_dnd   | boolean  | **true**                          | 免打扰时段是否同时静默 Webhook。默认 true —— Bark / ntfy / 群机器人同样会响铃；邮件默认 false，因为邮件属于「事后可查」的渠道                                                                                                                                      |
+| min_level     | string   | `info`                            | **规则同构的旋钮之一**：最低投递级别（`info` / `warning` / `critical`）。低于它 `Skipped(LEVEL_TOO_LOW)`。默认 `info` 是为了不改变存量用户观察到的行为（此前这条渠道没有门槛，给个 `critical` 等于让所有人升级后突然收不到通知）                                                       |
 | daily_limit   | int      | 0                                 | **规则同构的旋钮之二**：每日条数上限，范围 **0–1000**，**0 = 不限**，按设备本地日期跨天重置。上限 1000 是因为 1000 条/天已经是平均 1.4 分钟一条，再多就不是通知而是日志流                                                                                                                     |
 
-**只读回显字段**（客户端不要自己算第二套）：
+**只读回显字段**（客户端不应自行计算第二套）：
 
 | 字段                                         | 说明                                                                                                                                               |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------ |
 | configured                                 | 能不能投，读的就是渠道那一份 `isConfigured()`。判据见下                                                                                                             |
 | sent_today                                 | 今天已发出几条（只有 HTTP 2xx 的 `Sent` 计一条）                                                                                                                |
 | quota_remaining                            | 今天还剩几条，已钳到 0；**`daily_limit = 0`（不限）时是 `null`** —— 客户端必须渲染成「不限」而不是 0，0 的含义是"已经用尽"，恰好相反                                                           |
-| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不要手抄第二份**；三条渠道的值域刻意不同（邮件 0..500、本机短信 1..50 且不允许 0）                                                                        |
-| placeholders                               | 模板里可用的占位符，**对象数组**：每项含 `name`（占位符名，模板里写成 `{{name}}`）与 `desc`（中文说明，给界面上的按钮 / 提示用）。数组顺序即建议的展示顺序；**不含 URL** —— URL 不做替换。说明文案的唯一真源在 core，客户端不要维护第二张表 |
+| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不得另行维护副本**；三条渠道的值域刻意不同（邮件 0..500、本机短信 1..50 且不允许 0）                                                                        |
+| placeholders                               | 模板里可用的占位符，**对象数组**：每项含 `name`（占位符名，模板里写成 `{{name}}`）与 `desc`（中文说明，给界面上的按钮 / 提示用）。数组顺序即建议的展示顺序；**不含 URL** —— URL 不做替换。说明文案的唯一来源在 core，客户端不得维护第二张表 |
 | presets                                    | 七个内置预设的完整默认值表（含「用户要填的那一样东西」的元数据 `secret_label` / `secret_marker` / `secret_target`），见下                                                           |
 
 > **计数器是本渠道独占的**（`notify_webhook` 的一对 `quota_day` / `quota_count`），与邮件、本机短信那两份物理隔离 —— 共享计数器意味着一条渠道发多了会吃掉另一条的额度。级别与场景两道**会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），配额不会。
@@ -6160,14 +6372,14 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 | 顶层（跨预设共享） | `preset`（当前选中）/ `enabled` / `scenes` / `respect_dnd` / `min_level` / `daily_limit`，以及配额计数器 | 就是字段名，如 `enabled`                                                                           |
 | 每预设一份     | `url` / `method` / `headers` / `body_template` / `content_type` / `timeout_ms`             | `<预设名小写>.<字段>`，如 `bark.url`、`pushplus.body_template`（headers 那一项的键是 `<预设名小写>.headers_json`） |
 
-分层的判据是「这个取值属于**这个目标**，还是属于**这条渠道**」：地址与模板是"发到哪、怎么发"，跟着预设走；开关、场景、级别、上限是"这条渠道要不要发、什么时候发"，与目标无关。`timeout_ms` 跟着预设是因为它和 url 一起构成"这个目标怎么连"。
+分层的判据是「这个取值属于**这个目标**，还是属于**这条渠道**」：地址与模板决定「发到哪、如何发送」，随预设走；开关、场景、级别、上限决定「该渠道是否发送、何时发送」，与目标无关。`timeout_ms` 随预设走，因为它与 url 共同决定「该目标如何连接」。
 
 **配额计数器留在顶层**：那是渠道级额度。跟着预设分家的话，用户换个预设就能重开一天的量 —— 等于把「每日条数上限」做成假开关。
 
 直接后果（客户端必须照这个来）：
 
-- **切换预设不覆盖任何东西**。只改顶层那个"当前选哪个"，其它预设那几份原样躺着，切回来读到的还是上次填的那份。所以客户端**不要**再弹「切换会覆盖当前配置」这类确认 —— 覆盖行为已经不存在。
-- **某个预设"从未配过"是一个有意义的状态**：那一份的键不存在时，`GET` 回该预设的默认值（`presets[]` 里那份）并且**不落盘**。因此客户端**不要**把预设默认值填进表单再提交 —— 提交一次就把"从未配过"坐实成"配过"，将来改了预设默认模板就传不到这些用户，而界面上看不出任何原因。
+- **切换预设不覆盖任何东西**。仅修改顶层的「当前选中项」，其他预设的数据保持不变，切回后读取的仍是上次填写的内容。因此客户端**不应**再弹出「切换会覆盖当前配置」类确认：覆盖行为已不存在。
+- **某个预设"从未配过"是一个有意义的状态**：那一份的键不存在时，`GET` 回该预设的默认值（`presets[]` 里那份）并且**不落盘**。因此客户端**不应**将预设默认值填入表单后提交：提交一次即把「从未配过」变为「已配过」，此后修改预设默认模板不会同步到这些配置，且界面上无明显提示。
 - **切换后必须重新 `GET`**（或用 PUT 的回显）重画界面：本地表单里那份是**上一个**预设的值。
 
 > **一次性搬迁**：改造之前的版本把那六个字段直接摆在 prefs 根上（`url` / `method` / `headers_json` / `body_template` / `content_type` / `timeout_ms`）。首次 `load()` 时会把它们搬到**顶层 `preset` 记着的那个预设**名下（不是 `custom` —— 那六个值就是用户当时正在用的那一份，塞进自定义会让一个用 Bark 的用户升级后看到"Bark 未配置"，而 device key 躺在自定义那一栏里），搬完即删旧键。判据是"旧 `url` 键在、新 `<preset>.url` 键不在"，因此幂等，不需要额外的版本号或标记位。**接口形状不受影响**，客户端不用为此做任何事。
@@ -6176,7 +6388,7 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 
 1. `enabled` 为 true；
 2. `url` 非空且以 `http://` / `https://` 开头；
-3. **`url` 里不含 `<`** —— 预设地址里的 `<device_key>` / `<topic>` / `<key>` / `<token>` / `<SENDKEY>` 是**示例占位**，直接发出去会打到一个不存在的目标上，而用户看到的只是"配好了但收不到"。所以留着尖括号就算没配完。
+3. **`url` 里不含 `<`** —— 预设地址里的 `<device_key>` / `<topic>` / `<key>` / `<token>` / `<SENDKEY>` 是**示例占位**，直接发出会请求到不存在的目标，而用户只会看到「已配置但收不到」。因此只要保留尖括号即视为未配置完成。
 
 > **已知边界**：这道 `<占位>` 检查**只看 URL**。`PUSHPLUS` 的 token 在 **body 模板**里（`{"token":"<token>",…}`，即 `secret_target = body`），所以它的 `configured` 会是 true 而请求仍然会被目标拒收（PushPlus 回业务错误码）。客户端可以按 `secret_target` 自己认出这一档并在界面上提示"密钥还没填"；排查时看 `/test` 响应的 `response_body`。
 
@@ -6220,9 +6432,9 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 | `PUSHPLUS`   | PushPlus     | 请求体模板里的 PushPlus Token     | PushPlus Token | `<token>`      | **`body`**    | `https://www.pushplus.plus/send`（固定，不需要用户改）                  | JSON           |
 | `SERVERCHAN` | Server 酱     | SENDKEY（URL 末段）            | SENDKEY        | `<SENDKEY>`    | `url`         | `https://sctapi.ftqq.com/<SENDKEY>.send`                     | JSON           |
 
-`secret_target` 三档：`none` = 没有这样一个字段（`CUSTOM` 全手填）；`url` = marker 在**默认 URL** 里；`body` = marker 在**默认请求体模板**里（只有 `PUSHPLUS`）。不用"要不要填"的布尔，是因为布尔分不出后两处，而替换错地方的表现是"密钥根本没进请求"，界面上看不出任何异常。
+`secret_target` 三档：`none` = 没有这样一个字段（`CUSTOM` 全手填）；`url` = marker 在**默认 URL** 里；`body` = marker 在**默认请求体模板**里（只有 `PUSHPLUS`）。不使用「是否需要填写」的布尔值：布尔值无法区分后两处，而替换位置错误的表现为「密钥未进入请求」，界面上无异常提示。
 
-> **客户端替换时必须把 marker 整段连尖括号一起换掉。** 写成 `<abc123>` 这种半截值会踩 `configured` 的第三条判据（URL 含裸 `<` 即"未配置齐全"），渠道会永远不投递；`body` 档虽然不进那条判据，但半截值同样会被目标服务拒收。
+> **客户端替换时必须把 marker 整段连尖括号一起换掉。** 写成 `<abc123>` 这种半截值会命中 `configured` 的第三条判据（URL 含裸 `<` 即「未配置齐全」），该渠道将始终不投递；`body` 档虽然不进那条判据，但半截值同样会被目标服务拒收。
 >
 > 存储里存的是**替换完的**最终 url / body_template，**没有"密钥"这个独立字段**。所以客户端要做"只填一个输入框"的双向换算时，参照系只能是预设默认值：把默认值按 marker 切成前缀 + 后缀，当前值以该前缀开头、以该后缀结尾时，中间那段就是已填的密钥；对不上就说明用户改过别的部分，此时应当退回完整字段编辑（硬替换会吃掉他的改动）。
 
@@ -6230,7 +6442,7 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 
 - `CUSTOM` — `{"title":"{{title}}","message":"{{message}}","level":"{{level}}","scene":"{{scene}}","type":"{{type}}","time":"{{time}}"}`（六个常用占位符摊开，方便对着自建服务改）
 - `BARK` — `{"title":"{{title}}","body":"{{message}}","level":"{{level}}"}`
-- `NTFY` — `{{message}}`（**纯文本**；标题走 `Title` 头）。默认头是 `Title: {{title}}`、`Priority: default`、`Tags: {{level}}`。`Priority` 刻意给**固定值**而不是 `{{level}}`：ntfy 只认 `min/low/default/high/max`（或 1..5），塞 `warning` / `critical` 会被 400 拒掉 —— 那样预设一开箱就是坏的。级别改放 `Tags`（自由字符串，会显示在消息上）
+- `NTFY` — `{{message}}`（**纯文本**；标题走 `Title` 头）。默认头是 `Title: {{title}}`、`Priority: default`、`Tags: {{level}}`。`Priority` 刻意给**固定值**而不是 `{{level}}`：ntfy 只认 `min/low/default/high/max`（或 1..5），传入 `warning` / `critical` 会被 400 拒绝，导致该预设的初始状态即不可用。级别改放 `Tags`（自由字符串，会显示在消息上）
 - `WECOM` — `{"msgtype":"text","text":{"content":"{{title}}\n{{message}}"}}`
 - `FEISHU` — `{"msg_type":"text","content":{"text":"{{title}}\n{{message}}"}}`
 - `PUSHPLUS` — `{"token":"<token>","title":"{{title}}","content":"{{message}}"}`（URL 固定，token 在 body 里 —— 这就是 `secret_target = body` 的那一处）
@@ -6240,7 +6452,7 @@ keyset 游标分页，参数名与 `/api/sms/blocked`、`/api/alerts/list` 一�
 
 #### `PUT /api/notify/webhook/config`
 
-**字段级合并**：body 是配置字段的任意子集，未出现（或值为 `null`）的键**保留服务端现值**。所以"只切一个开关"不会把 URL / 模板顺手清空。
+**字段级合并**：body 是配置字段的任意子集，未出现（或值为 `null`）的键**保留服务端现值**。因此「仅切换一个开关」不会清空 URL 或模板。
 
 > **`headers` 是唯一的例外 —— 传了就整体替换。** 按键合并的话用户永远删不掉一个头部（少传即保留 = 永远删不掉），而"改完发现旧的 `Authorization` 还在"是安全问题。**改任何一个头部时必须传全量 map。**
 
@@ -6253,15 +6465,15 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 | patch                    | 语义                | 落盘                                                |
 | ------------------------ | ----------------- | ------------------------------------------------- |
 | **只带** `preset`（可再带顶层字段） | **纯切换**：只改"当前选哪个" | 只写顶层，per-preset 那一份**一个键都不碰**（目标预设"从未配过"就保持从未配过）  |
-| `preset` + per-preset 字段 | 切到 X 并顺手填好它       | 那些字段写到 **X** 那一份下；合并的"底"取的是 **X 上次存的那份**，不是当前预设的值 |
+| `preset` + per-preset 字段 | 切到 X 并填写其字段       | 那些字段写到 **X** 那一份下；合并的"底"取的是 **X 上次存的那份**，不是当前预设的值 |
 | 不带 `preset`              | 改当前那一份            | 写顶层 + 当前预设那一份                                     |
 
-判据是"键出现过"而不是"值和现值不同"：显式传 `"url": null` 在本接口的口径里是"这个字段我没意见"，那种 patch 也不会把目标那一份落盘。
+判据是"键出现过"而不是"值和现值不同"：显式传 `"url": null` 在本接口的口径里表示「该字段无需修改」，此类 patch 同样不会将目标预设的数据落盘。
 
-**客户端口径**（两条，踩了就是数据丢失类的表现）：
+**客户端约定**（两条，违反会导致数据丢失）：
 
-1. **切换预设只发 `{"preset":"X"}`**，不要把本地表单里那份 url / 模板 / headers 一起发 —— 它们会被写进**新**预设的槽位，把"从未配过"变成"配成了旧预设的值"。切完**重新 `GET`**（或读 PUT 的回显）重画，别拿本地旧值渲染。
-2. **不要提交预设默认值。** 默认值是 core 在"读不到"时给的且刻意不落盘；客户端替用户提交一次，将来改预设默认模板就传不到这些用户。
+1. **切换预设只发 `{"preset":"X"}`**，不应同时提交本地表单中的 url / 模板 / headers：它们会被写入**新**预设的槽位，把「从未配过」变为「配成了旧预设的值」。切换后**重新 `GET`**（或读取 PUT 回显）重绘，不得以本地旧值渲染。
+2. **不得提交预设默认值。** 默认值是 core 在「读不到」时返回且刻意不落盘的；客户端代为提交一次后，修改预设默认模板不会同步到这些配置。
 
 **请求：**
 
@@ -6283,16 +6495,16 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 | header **值**含换行                                | `header 值不能含换行（换行会被下游解析成额外的头部）`                                                                                                                                                              |
 | `scenes` 含未知场景 id                              | `scenes 含未知场景：…`                                                                                                                                                                             |
 | `daily_limit` 不在 0..1000                       | `每日条数上限（daily_limit）需在 0..1000 之间（0 = 不限），收到 …`                                                                                                                                              |
-| `min_level` 不是 `info` / `warning` / `critical` | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做"认不出就回落"—— 静默回落会让用户以为自己设的门槛生效了                                                                                                         |
-| `preset` 不在预设表里                                | `preset 只支持 CUSTOM/BARK/NTFY/WECOM/FEISHU/PUSHPLUS/SERVERCHAN，收到 …`（大小写不敏感，`bark` 与 `BARK` 都认）。**严格拒绝**：配置按预设分开存之后，把 `Barkk` 静默落进 `custom.*` 的表现是"我配好的 Bark 不见了"，而日志里没有任何异常。客户端应当把这条报错原文显示出来 |
+| `min_level` 不是 `info` / `warning` / `critical` | `min_level 只支持 info/warning/critical，收到 …`。**严格拒绝**，不做「无法识别即回落」：静默回落会让用户误认为所设门槛已生效                                                                                                         |
+| `preset` 不在预设表里                                | `preset 只支持 CUSTOM/BARK/NTFY/WECOM/FEISHU/PUSHPLUS/SERVERCHAN，收到 …`（大小写不敏感，`bark` 与 `BARK` 都认）。**严格拒绝**：配置按预设分开存储后，将 `Barkk` 静默写入 `custom.*` 的表现为「已配置的 Bark 消失」，且日志中无异常记录。客户端应原样显示该报错 |
 
 `url` 为空**是合法的**（= 还没配完，`configured` 会是 false）。校验通过但字段类型不对（例如 `timeout_ms` 传了字符串）也回 400，文案是 `Webhook 配置字段类型不合法：…`。
 
-> **headers 为什么不脱敏回显**：`Authorization` 这类值是凭据，但**它必须能被回显** —— 用户要在界面上改它，而"星号回显、原值保留"那套（`smtp_pass_set`）只在单个固定字段上说得通；headers 是任意键值对，回显成星号再提交就把真值覆盖掉了。而且 Bark / Server 酱的凭据本来就在 URL 里，只脱敏 headers 是自欺欺人。**日志与投递记录里仍然脱敏**（日志里凭据类头部的值换成 `***(长度)`，投递记录只写 URL 的 scheme+host）—— 那两处是会被导出、被贴出来的。
+> **headers 为什么不脱敏回显**：`Authorization` 这类值是凭据，但**它必须能被回显** —— 用户要在界面上改它，而"星号回显、原值保留"那套（`smtp_pass_set`）只在单个固定字段上说得通；headers 是任意键值对，回显成星号再提交就把真值覆盖掉了。且 Bark / Server 酱的凭据本身位于 URL 中，仅脱敏 headers 无法提供有效保护。**日志与投递记录里仍然脱敏**（日志里凭据类头部的值换成 `***(长度)`，投递记录只写 URL 的 scheme+host）—— 那两处是会被导出、被贴出来的。
 
 #### `POST /api/notify/webhook/test`
 
-发一条测试通知。**不受总开关、免打扰与场景勾选约束**（`manual = true`），但仍要求配置齐全 —— URL 没填的"测试"发不出去是事实。事件用 `scene = test`、`level = info`、`channels = {webhook}`，正文是固定串「这是一条来自 UFI-AXIS 的 Webhook 测试通知」（写清楚"这是测试" —— 它会同时出现在群机器人里，别让同事以为设备真出事了）。
+发一条测试通知。**不受总开关、免打扰与场景勾选约束**（`manual = true`），但仍要求配置齐全 —— URL 没填的"测试"发不出去是事实。事件用 `scene = test`、`level = info`、`channels = {webhook}`，正文是固定串「这是一条来自 UFI-AXIS 的 Webhook 测试通知」（正文明确标注「这是测试」：该通知会同时出现在群机器人中，避免其他使用者误判设备故障）。
 
 **响应：**
 
@@ -6315,7 +6527,7 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 | response_body       | 响应体摘要，**最多 200 字**（只读前 8 KB 再截断 —— 目标是用户填的任意 URL，指向一个几百 MB 的文件也完全可能）                                                                    |
 | attempted_at        | 那一次尝试的时间戳（毫秒）                                                                                                                           |
 
-`status_code` / `response_body` 是排 Webhook 时**唯一**有用的信息（`{"code":40001,"msg":"invalid token"}` 这种）：投递结果里没有它们，core 专门从渠道的"最后一次尝试"快照里捞出来回给 UI。**成功也要显示** —— 某些服务用 `200` 回业务错误，只说"成功"会让用户停止排查。
+`status_code` / `response_body` 是排 Webhook 时**唯一**有用的信息（`{"code":40001,"msg":"invalid token"}` 这种）：投递结果里没有它们，core 专门从渠道的"最后一次尝试"快照里捞出来回给 UI。**成功也要显示** —— 部分服务以 `200` 返回业务错误，仅显示「成功」会使用户停止排查。
 
 **状态码 → 重试策略**（这也是自动通知的判据，不只是 `/test`）：
 
@@ -6331,13 +6543,13 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 
 **投递记录**：与邮件 / 本机短信共用 `mail_send_records`（`channel = "webhook"`），可用 `GET /api/sms-forward/history?channel=webhook` 查。`recipient` 列只写 **scheme + host**（丢掉 path 与 query）—— Bark 的 device key、Server 酱的 SENDKEY、企业微信的 key 全都在 path / query 里，那就是密钥，写进用户可导出的记录等于把它泄漏出去。
 
-**送达确认的连带后果**：Webhook 的 2xx 会被 `TrafficAutoOffGuard` 的"通报到位"判定采信 —— 只配了 Bark、没配 SMTP 的用户，自动关网会照常执行。这正是那个判定想要的语义（"用户确实收到通报了"），不是副作用。
+**送达确认的连带后果**：Webhook 的 2xx 会被 `TrafficAutoOffGuard` 的"通报到位"判定采信 —— 只配了 Bark、没配 SMTP 的用户，自动关网会照常执行。这正是该判定所需的语义（「用户确实收到通报」），不属于副作用。
 
 ---
 
 ## 本机短信通知 /api/notify/sms
 
-> 需要认证。**通知渠道之一**（阶段 3，2026-09-09）：用设备自己的 SIM 把通知发成一条短信。
+> 需要认证。**通知渠道之一**：使用设备自身的 SIM 将通知发送为短信。
 >
 > 存在的理由是**链路互补**：邮件与 Webhook 都走**数据网**，本渠道走**信令网**。而"数据断了 /  
 > 套餐用尽 / 自动关网"这几类最该通知的场景，恰恰是前两条发不出去的时候。
@@ -6345,7 +6557,7 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 > **这条渠道会产生短信费用**，所以有三道刹车：最低级别（默认只投 `critical`）、每日条数上限  
 > （默认 5 条，本地日期跨天重置）、场景勾选。渠道 id 是 **`local_sms`**（不是 `sms` —— 那是场景 id）。
 >
-> 配置存独立 prefs（`notify_local_sms`），**不进 `/api/notifications/config`** —— 那一组是"客户端要不要  
+> 配置存独立 prefs（`notify_local_sms`），**不进 `/api/notifications/config`** —— 那一组是「客户端是否  
 > 弹通知"的开关，渠道配置归渠道自己（与邮件的 `sms_forward`、Webhook 的 `notify_webhook` 同做法）。
 
 #### `GET /api/notify/sms/config`
@@ -6357,7 +6569,7 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 ```json
 {
   "enabled": false,
-  "target_number": "13800138000",
+  "target_number": "13800000000",
   "min_level": "critical",
   "daily_limit": 5,
   "scenes": ["connectivity", "traffic80"],
@@ -6376,20 +6588,20 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 | enabled       | boolean  | false      | 渠道开关                                                                                                                                                      |
 | target_number | string   | ""         | 目标号码。允许数字 / `+` / `-` / 空格；投递前去掉分隔符。空 = 未配完                                                                                                               |
 | min_level     | string   | `critical` | 最低投递级别（`info` / `warning` / `critical`）。低于它的事件 `Skipped(LEVEL_TOO_LOW)`，**不发**。与另两条渠道**同名同义**，只是默认值不同（那两条默认 `info`）；读坏配置时这条渠道刻意回落 `critical` —— 退化成最省钱的一档 |
-| daily_limit   | int      | 5          | 每日条数上限，范围 **1–50**，**不允许 0**。这是与另两条渠道**刻意不同**的一处：邮件与 Webhook 的 0 表示"不限"，而这条渠道按条计费，"不限"是账单事故。客户端要把这条差异写在界面上，别让用户撞一次 400 才知道。**按设备本地日期跨天重置**（不是 24 小时滑动窗口）  |
+| daily_limit   | int      | 5          | 每日条数上限，范围 **1–50**，**不允许 0**。这是与另两条渠道**刻意不同**的一处：邮件与 Webhook 的 0 表示「不限」，而本渠道按条计费，「不限」会导致费用失控。客户端应在界面上说明该差异，避免用户触发 400 后才发现。**按设备本地日期跨天重置**（不是 24 小时滑动窗口）  |
 | scenes        | string[] | []         | 勾选的场景 id（与邮件 / Webhook 同一套词表）。空集 = 只有手动测试会发出去                                                                                                             |
-| respect_dnd   | boolean  | true       | 免打扰时段要不要连本渠道一起静默。默认 true（短信会半夜把人叫醒）                                                                                                                       |
+| respect_dnd   | boolean  | true       | 免打扰时段是否同时静默本渠道。默认 true（短信会在夜间触发提醒）                                                                                                                       |
 
-**只读回显字段**（客户端不要自己算第二套）：
+**只读回显字段**（客户端不应自行计算第二套）：
 
 | 字段                                         | 说明                                                                                                                                                |
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | configured                                 | 能不能投 = `enabled && 号码合法`。读的就是渠道那一份 `isConfigured()`                                                                                               |
 | sent_today                                 | 今天已发出几条。**受理即计一条**（详见 `/test`）                                                                                                                    |
 | quota_remaining                            | 今天还剩几条，已钳到 0（用户把上限从 20 调到 5 时不会出现负数）。契约上这个字段在 `daily_limit = 0`（不限）时是 `null`，但**这条渠道的下限是 1**，所以实际不会出现 null —— 客户端仍按 `int \| null` 解析（三条渠道共用同一份形状） |
-| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不要手抄第二份**                                                                                                                  |
+| levels / daily_limit_min / daily_limit_max | 可选值与值域，供客户端渲染下拉与校验输入。**不得另行维护副本**                                                                                                                  |
 
-> **计数器是本渠道独占的**（`notify_local_sms` 的一对 `quota_day` / `quota_count`），与邮件、Webhook 那两份物理隔离 —— 共享的话邮件发多了会吃掉短信额度，而"某天突然收不到关键短信"这类故障在账面上看不出任何异常。级别与场景两道**会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），**配额不会**（穿透它就是无上限烧钱）。
+> **计数器是本渠道独占的**（`notify_local_sms` 的一对 `quota_day` / `quota_count`），与邮件、Webhook 那两份物理隔离 —— 共享的话邮件发多了会吃掉短信额度，而"某天突然收不到关键短信"这类故障在账面上看不出任何异常。级别与场景两道**会被 CRITICAL 兜底穿透**（`NotificationConfig.critical_override_enabled`，默认开启），**配额不会**（穿透会导致无上限计费）。
 
 #### `PUT /api/notify/sms/config`
 
@@ -6415,7 +6627,7 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 发一条测试短信。**不受总开关、免打扰与场景勾选约束**（`manual = true`），但**仍受最低级别与每日配额约束** —— 那两道是花钱的闸，不能被"测试"绕过。事件用 `scene = test`、`level = critical`、`channels = {local_sms}`。
 
 > **这个端点会真的从设备 SIM 发出一条短信、产生费用、并消耗一条今日配额。**  
-> 客户端必须在调用之前让用户确认。
+> 客户端必须在调用前要求用户确认。
 
 **响应：**
 
@@ -6489,7 +6701,7 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 }
 ```
 
-**字段名是驼峰**（与 `/api/downloads` 的蛇形不同，别混）。`id` 是 8 位随机串。  
+**字段名为驼峰式**（与 `/api/downloads` 的蛇形命名不同，需区分）。`id` 是 8 位随机串。  
 `logs` 直接内嵌在任务对象里（与 `/api/tasks/{id}/logs` 同一份数据）。  
 `triggerMode` / `scheduleType` / `cron` 是可空扩展字段，旧的「每天 hour:minute」任务里都是 `null`。
 
@@ -6540,6 +6752,10 @@ per-preset 字段（`url` / `method` / `headers` / `body_template` / `content_ty
 `actionType` 可选值（权威来源 `ActionType` 枚举，**共 10 个**）：`data_toggle`、`wifi_toggle`、  
 `airplane_toggle`、`reboot`、`shutdown`、`led_toggle`、`performance_mode`、`roaming_toggle`、  
 `network_mode`、`custom_shell`。越界 → `400 INVALID_ACTION_TYPE`。
+
+> **`actionType=custom_shell` 是 root shell 的第二入口**：它绕过 `/api/shell/exec` 的同步调用，
+> 在无人值守时执行任意命令。客户端必须在创建或修改时向用户展示命令原文并请求确认。
+> 同一语义适用于 `PUT /api/tasks/{id}`、`POST /api/rules`、`PUT /api/rules/{id}`。
 
 > 注意默认值差异（**不是笔误**）：本端点缺省 `actionType` 是 `custom_shell`，  
 > 而 `/api/rules` 缺省是 `data_toggle`。  
@@ -7143,14 +7359,14 @@ signal_history / battery_history / alert_records / sms_records）。
 
 - `400 BAD_REQUEST` — 统一失败信封，`message` = `"enabled (boolean) required"`
 
-> 2026-08-26：该开关已持久化到 `AppSettings.backgroundServiceEnabled`（此前只写内存，服务重启后  
-> 被重置为开启）。它与 `/api/service/start|stop` 是**同一份状态**，任意一端修改都互相可见。
+> 该开关持久化到 `AppSettings.backgroundServiceEnabled`（仅写内存时，服务重启后  
+> 将被重置为开启）。它与 `/api/service/start|stop` 是**同一份状态**，任意一端修改都互相可见。
 
 ---
 
 #### `GET /api/monitor/preferences`
 
-监控中心个性化偏好（设备级配置，app 与 web 共享同一份真源）。
+监控中心个性化偏好（设备级配置，app 与 web 共享同一份数据）。
 
 **响应：**
 
@@ -7176,7 +7392,7 @@ signal_history / battery_history / alert_records / sms_records）。
 
 未写入过时返回上面这份默认值（不会返回 `{}`），因此客户端不需要自己兜默认值。
 
-> **边界**：采集总开关 `collectEnabled` **不在本端点**。它的真源是  
+> **边界**：采集总开关 `collectEnabled` **不在本端点**。其来源是  
 > `AppSettings.backgroundServiceEnabled`，读用 `GET /api/service/status`，写用  
 > `POST /api/monitor/control` 或 `POST /api/service/start|stop`。
 
@@ -7216,7 +7432,7 @@ signal_history / battery_history / alert_records / sms_records）。
 
 ## 服务控制 /api/service
 
-> 需要认证。2026-08-26 新增。
+> 需要认证。
 
 **语义边界（重要）：**
 
@@ -7251,7 +7467,7 @@ signal_history / battery_history / alert_records / sms_records）。
 }
 ```
 
-- `enabled` — 用户可见的服务开关（持久化真源）。
+- `enabled` — 用户可见的服务开关（持久化来源）。
 - `collecting` — 采集循环的实际运行状态；与 `enabled` 可能短暂不一致（停止时的收尾是异步的）。
 - `http_running` — 恒为 `true`（能收到响应就说明 HTTP 在跑），保留字段让客户端不必特判。
 - `uptime_ms` — 后端服务已运行时长；服务未在运行时为 `0`。
@@ -7266,7 +7482,7 @@ signal_history / battery_history / alert_records / sms_records）。
   - `detail` — 给人看的一句话；失败时带原始异常（enforcing 下通常是  
     `error=13, Permission denied`）。
   `executable=false` 时**下载引擎、网页终端、Samba 均不可用**，且各调用点历史上都是静默  
-  `catch`，只能靠这个字段判定，不要再去猜网络或配置问题。
+  `catch`，只能依据该字段判定，不应再推测网络或配置问题。
 
 #### `POST /api/service/start`
 
@@ -7321,19 +7537,24 @@ signal_history / battery_history / alert_records / sms_records）。
 
 **查询参数：**
 
-- `level` — 日志级别过滤（可选）
-- `limit` — 返回数量，默认 200
+- `level` — 日志级别过滤（可选，`DEBUG` / `INFO` / `WARN` / `ERROR`）。
+  **按行首标签精确匹配**（`[WARN]`），不是子串 —— 消息体里出现 “WARN” 不会被误命中。
+  未知级别当作“不过滤”。
+- `limit` — 返回数量；默认 200，**被夹在 1..500**（内存缓冲上限 500）。
 
 **响应：**
 
 ```json
 {
   "logs": [
-    { "level": "INFO", "tag": "HttpServer", "message": "Server started on port 8088", "timestamp": 1234567890 }
+    "12:00:00.123 [INFO] [HttpServer] Server started on port 8088"
   ],
-  "total": 200
+  "total": 1
 }
 ```
+
+> `logs` 是**字符串数组**（`HH:mm:ss.SSS [LEVEL] [tag] message`），不是对象数组；`total` 是本次
+> 返回的条数，不是缓冲里的总数。两端都按这个格式解析（见 `contract/Units.kt#DEBUG_LOGS_SHAPE`）。
 
 #### `DELETE /api/debug-logs`
 
@@ -7343,11 +7564,17 @@ signal_history / battery_history / alert_records / sms_records）。
 
 ### 落盘日志文件 /api/debug-logs/files
 
-> 2026-08-28 新增。core 的日志目录已从 app 私有目录搬到用户可直接浏览的  
-> `/sdcard/Download/UFI-AXIS/log/core/<yyyy-MM-dd>/`（先按日期分目录、再按类型分文件：  
-> `app.log` / `at.log` / `error.log`，单文件超 5MB 轮转为 `*.log.1`，目录总量上限 40MB，  
-> 保留最近 7 天）。外部存储不可用时才回退到 `<dataDir>/logs`。  
-> 这些接口是给 app / web **远程**列目录和读尾部用的；在设备上用文件管理器直接看同一路径即可。
+> core 的日志目录位于用户可直接浏览的  
+> `/sdcard/Download/UFI-AXIS/log/core/<yyyy-MM-dd>/`（先按日期分目录、再按类型分文件：
+> `app.log` / `at.log` / `error.log`）。外部存储不可用时才回退到 `<dataDir>/logs`。
+>
+> **体积策略**：不设单文件 5MB 轮转、目录 40MB 预算与 7 天保留；
+> 日志仅受设备存储容量约束。作为保护措施，**可用空间低于 256MB 时停止写文件**
+> （logcat 与内存缓冲照旧），并通过下面响应里的 `degraded` / `disk_free_bytes` 暴露。
+>
+> 这些接口是给 app / web **远程**列目录和读尾部用的；在设备上用文件管理器直接看同一路径即可
+> （`log/` 目录本身不对文件 API 开放，见「文件管理 › 路径安全规则」；`log/core/crash` 与
+> `log/core/update` 例外放行）。
 
 #### `GET /api/debug-logs/files`
 
@@ -7360,13 +7587,28 @@ signal_history / battery_history / alert_records / sms_records）。
   ],
   "total": 1,
   "total_bytes": 20480,
-  "dir": "/sdcard/Download/UFI-AXIS/log/core"
+  "today_bytes": 20480,
+  "days": 1,
+  "oldest_day": "2026-08-28",
+  "dir": "/sdcard/Download/UFI-AXIS/log/core",
+  "degraded": false,
+  "disk_free_bytes": 5368709120
 }
 ```
 
+字段口径：
+- `total_bytes`：全部落盘日志（按天运行日志 + `crash/` + `update/`）之和；
+- `today_bytes`：只算今天那个日期目录；
+- `days` / `oldest_day`：日期目录个数与最早一天（**仅展示**，日志不按天删除）；
+- `degraded` / `disk_free_bytes`：低磁盘保护状态（剩余 < 256MB 时停写文件）。
+
 #### `DELETE /api/debug-logs/files`
 
-删除**全部落盘日志文件**（含正在写的，会先关 writer；内存缓冲用 `DELETE /api/debug-logs` 清）。  
+> 这条会连同崩溃现场一起删掉，属破坏性操作 —— 客户端应保留一次显式确认。
+> 鉴权与其他 `/api` 端点相同（Bearer + 设备签名）。
+
+删除**全部落盘日志文件**（含正在写的，会先关 writer；内存缓冲用 `DELETE /api/debug-logs` 清；
+落盘集合 = 按天运行日志 + `crash/crash_*.txt` + `update/update.log`）。  
 **只动 core 这一侧** —— 手机 APP 自己的日志在 `/sdcard/Download/UFI-AXIS/log/app/`，由 app 端  
 单独清，两侧互不牵连。
 
@@ -7376,15 +7618,17 @@ signal_history / battery_history / alert_records / sms_records）。
 #### `GET /api/debug-logs/files/{name...}`
 
 只返回文件**尾部**（`text/plain`）。`max_bytes` 可选，默认 256KB，取值被夹在 1KB~2MB ——  
-单文件可达几十 MB，整读会 OOM。路径按 `^\d{4}-\d{2}-\d{2}/(app|at|error)\.log(\.1)?$` 白名单  
-校验，防目录穿越；从中间截断时会丢掉首个半行。文件不存在返回 404。
+单文件可达几十 MB，整读会 OOM。路径按
+`^(?:\d{4}-\d{2}-\d{2}/(?:app|at|error)\.log(?:\.1)?|crash/crash_\d+\.txt|update/update\.log)$`
+白名单校验，防目录穿越；从中间截断时会丢掉首个半行（整段没有换行时返回空，不给半行）。
+文件不存在返回 404。
 
 > **路径形状只有一种。** core 是**单条尾通配路由** `get("/{name...}")`，把捕获的各段用 `/`  
 > 拼回一个相对路径再做白名单校验；`{name...}` 里的 `name` = `GET /api/debug-logs/files` 返回的  
 > `name` 字段原值（如 `2026-08-28/app.log`），**不是** `date` + `file` 两个独立参数。  
-> 2026-08-30 前本节写成 `{date}/{file}`，容易被读成两个参数、进而在客户端拼错。
+> `{date}/{file}` 形式易被理解为两个参数，导致客户端拼接错误。
 >
-> 客户端必须让斜杠**原样出现在 URL 里**，不要转义成 `%2F`：Ktor 解码后虽仍能匹配，但 `%2F`  
+> 客户端必须让斜杠**原样出现在 URL 里**，不应转义为 `%2F`：Ktor 解码后虽仍能匹配，但 `%2F`  
 > 会被很多反向代理规范化或拒绝，经内网穿透（frp / cloudflared）远程访问时就会单独坏掉。  
 > app 侧对应 `@Path(value = "name", encoded = true)`。
 
@@ -7433,7 +7677,7 @@ signal_history / battery_history / alert_records / sms_records）。
   没有 `available` / `total`；
 - `goform_qos` 来自 `GoformQoS.getStatus()`，除四个信号量字段外还有 `cache_size` / `cache_ttl_ms`；
 - `cpu_temp` 是 `/sys/class/thermal/thermal_zone0/temp` 的**原始值**（该设备上是毫摄氏度，  
-  如 `45000`），读失败为 `0`。**别直接当摄氏度显示**，也别用 0 判"温度正常"；
+  如 `45000`），读失败为 `0`。**不应直接作为摄氏度显示**，也不应以 0 判断「温度正常」；
 - **没有 `frontend_safety` 字段**（前端并发闸早已移除）。
 
 ---
@@ -7506,7 +7750,7 @@ signal_history / battery_history / alert_records / sms_records）。
 综合诊断。
 
 **查询参数：** `fields=1` —— 额外返回字段覆盖率（`field_coverage`）。**会逐分组向设备发查询**  
-（最多 10 组），只在排障时带，别放进轮询。
+（最多 10 组），仅在排障时携带，不应放入轮询。
 
 **响应：**
 
@@ -7527,11 +7771,11 @@ signal_history / battery_history / alert_records / sms_records）。
 }
 ```
 
-字段类型别照直觉猜：只有 `root` 是布尔，`adbd`（`getprop init.svc.adbd`）与 `mobile_data`  
+字段类型不应按直觉推断：只有 `root` 是布尔，`adbd`（`getprop init.svc.adbd`）与 `mobile_data`  
 （`settings get global mobile_data`）都是**shell 原始输出字符串**，取不到时是 `"unknown"`；  
 `gateway` 有两级兜底 —— 解析不出默认路由时依次试 `dhcp.wlan0.gateway` / `dhcp.wlan.gateway`，  
 仍为空则**硬编码** `"192.168.0.1"`（所以这个值可能纯属猜测），整段抛异常才是 `"unknown"`；  
-`app_version` 目前是硬编码的 `"0.1"`，别拿它做版本判断（真版本走 `GET /api/update/status`）。
+`app_version` 目前是硬编码的 `"0.1"`，不应据此判断版本（版本以 `GET /api/update/status` 为准）。
 
 > 本端点会 fork 若干 root shell（`id` / `getprop` / `settings get` / `ip route`），不适合高频轮询。
 
@@ -7565,7 +7809,7 @@ signal_history / battery_history / alert_records / sms_records）。
 
 `missing` 就是适配新设备时的 TODO 清单：这些 canonical 字段登记了，但本机一个 source 都没命中。
 
-> 覆盖率统计自身失败时，`field_coverage` 会退化成 `{ "error": "<原因>" }` —— 整个请求仍是 `200`，别按对象结构直接解 `groups`。
+> 覆盖率统计自身失败时，`field_coverage` 会退化成 `{ "error": "<原因>" }` —— 整个请求仍为 `200`，不应直接按对象结构解析 `groups`。
 
 ---
 
@@ -7591,12 +7835,12 @@ GET \n /ws/realtime \n <ts> \n <nonce>
 ```
 
 **只含 path，不含 query** —— 签名没法覆盖自己，把 query 纳入就得约定「去掉 sig 后再拼」，  
-两端各实现一遍这种剪裁规则是典型踩坑点；而 token / ts / nonce 本身都被服务端独立校验。
+两端各自实现该剪裁规则容易产生不一致；而 token / ts / nonce 本身都被服务端独立校验。
 
 其余规则与 `/api/**` 一致：ts 容差 5 分钟、nonce 窗口内不可复用、签名可为 DER 或 raw r||s。
 
 **连接限制：** 最多 4 个并发连接（`WsChannel.MAX_CONNECTIONS`）。超出以 `TRY_AGAIN_LATER`(1013)  
-关闭；鉴权失败以 `VIOLATED_POLICY`(1008) 关闭。web 端据这两个码区分「不要重连」与「稍后重试」。
+关闭；鉴权失败以 `VIOLATED_POLICY`(1008) 关闭。web 端据这两个码区分「不重连」与「稍后重试」。
 
 **心跳：** pingPeriod=15s，timeout=30s，maxFrameSize=64KB。
 
@@ -7616,21 +7860,26 @@ GET \n /ws/realtime \n <ts> \n <nonce>
 
 ```json
 {
-  "subscribe": ["signal", "cpu", "traffic", "memory", "alert", "data_changed", "config_changed", "update"]
+  "subscribe": ["signal", "connection", "cpu", "traffic", "memory", "alert", "data_changed", "config_changed", "update"]
 }
 ```
 
 **替换语义**（收到即清空旧订阅再加）；增量移除用 `{"unsubscribe": [...]}`。  
-core 按频道严格过滤 —— **没订阅就永远收不到**。
+core 按频道严格过滤：**未订阅的频道不会收到任何消息**。
 
-可用频道（`WsChannel.ALL`）：`traffic`、`signal`、`cpu`、`memory`、`alert`、`notification`、  
+可用频道（`WsChannel.ALL`）：`traffic`、`signal`、`connection`、`cpu`、`memory`、`alert`、`notification`、  
 `data_changed`、`config_changed`、`update`。
 
-- **前台 UI 不要订 `notification`**：core 对同一条告警先发 `notification` 再发 `alert`  
-  （同 payload 双发，为兼容旧客户端），两个都订会让一条告警响两次。UI 只认 `alert`；  
+- **`connection` 与 `signal` 同源同频（约 3~4.5s）**：core 在采集 signal 的同一次 goform  
+  查询里已经读到 `ppp_status`，不需要额外查询设备。载荷只有 `{ ppp_status }`；空串表示  
+  “这轮没读到”，客户端应保留上一帧，不能当成断开。移动数据开关（`mobile_data`）是用户  
+  意图，不从 `ppp_status` 反推。
+
+- **前台 UI 不应订阅 `notification`**：core 对同一条告警先发 `notification` 再发 `alert`  
+  （同一 payload 发送两次，为兼容旧客户端）；同时订阅两者会导致一条告警触发两次提醒。UI 只认 `alert`；  
   `notification` 留给 app 的 `:ufi_notify` 守护进程。
-- **`battery` / `sms_contacts` 不是频道**，core 从不广播，订了只是白占位  
-  （守门脚本 `verify-api-contract.mjs` 会把订阅它们报成 P0）。电量走  
+- **`battery` / `sms_contacts` 不是频道**，core 从不广播，订阅后不会产生任何消息  
+  （守门脚本 `verify-api-contract.mjs` 会将其报告为高优先级问题）。电量走  
   `GET /api/dashboard/summary`。
 
 #### 取消订阅（客户端 → 服务端）
@@ -7656,6 +7905,7 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 | 频道             | 数据内容                                                               | 说明               |
 | -------------- | ------------------------------------------------------------------ | ---------------- |
 | `signal`       | `{ rsrp, sinr, rsrq, rat, ... }`                                   | 信号质量             |
+| `connection`   | `{ ppp_status }`                                                   | 实时连接态，与 `signal` 同频 |
 | `cpu`          | `{ usage_percent, core_count, cores, temperature }`                | CPU 状态           |
 | `traffic`      | `{ rx_speed, tx_speed }`                                           | 实时网速             |
 | `battery`      | `{ level, isCharging, temperature, voltage }`                      | 电池状态             |
@@ -7673,26 +7923,373 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 
 ---
 
+## 运营商账单 /api/carrier
+
+> 对应 `CarrierRoutes`。全部端点都在 `/api` 鉴权内（Bearer + 设备签名）。
+>
+> **会产生真实费用**：两条登录链路都会让设备真的去发短信 / 走运营商登录流程（移动 = 验证码短信，
+> 联通 = 扫码或服务密码）。服务端**不做二次确认**，客户端在触发前必须自己问一次。
+>
+> **不下发的内容**：会话 Cookie、完整手机号一律不出 core。手机号统一走 `phoneMasked`
+> （前 3 + `****` + 后 4）；验证码、Cookie、`token_online` 只存在 core 进程与磁盘，响应里永远没有。
+
+### 两套并存的路径
+
+| 家族 | 形态 | 语义 |
+|---|---|---|
+| 当前账号（v0.1） | `/api/carrier/status`、`/bill`、`/mobile/login/*`、`/unicom/login/*`、`/auto-login` | 语义固定为「当前活动账号」，**行为不再变化**，老客户端照旧 |
+| 账号维度（多账号） | `/api/carrier/accounts/{id}/…` | 每个账号各有自己的会话、账单与自动登录配置 |
+
+> **兼容探测**：只实现单账号的旧 core 对 `/accounts/…` 返回 **404**，客户端据此降级为单账号模式。
+> 新 core 里两套同时可用 —— 当前账号那一套等价于「对 active 账号的简写」。
+
+账号对象字段：`id`、`label`、`phone`（掩码）、`carrier`、`access_method`、`state`、`created_at`。
+`state` 取值 `not_configured` / `login_required` / `code_sent` / `qr_pending` / `ready` / `error`。
+`carrier` 只接受 `mobile` / `unicom` / `telecom` / `broadnet`（`cbn` 与 `broadnet` 同义），其余 400。
+
+### 状态
+
+#### `GET /api/carrier/status`
+
+当前活动账号状态的简写，**同时内联账号列表**（进页面一个请求就够，不用先调 `/accounts`）：
+
+```json
+{
+  "state": "ready",
+  "carrier": "mobile",
+  "phone": "138****8000",
+  "active_id": "a1b2",
+  "accounts": [ { "id": "a1b2", "label": "主卡", "phone": "138****8000",
+                  "carrier": "mobile", "access_method": "carrier",
+                  "state": "ready", "created_at": 1762000000000 } ]
+}
+```
+
+`state` 为 `login_required` 时还会带 `message`；`code_sent` 带 `expires_in` / `retry_after`；
+`qr_pending` 带 `status` / `expires_in`。旧客户端只读 `state` / `carrier` / `phone`，新字段可安全忽略。
+
+### 账号管理
+
+#### `GET /api/carrier/accounts`
+
+```json
+{ "active_id": "a1b2", "accounts": [ { "id": "a1b2", "label": "主卡", "phone": "138****8000",
+  "carrier": "mobile", "access_method": "carrier", "state": "ready", "created_at": 1762000000000 } ] }
+```
+
+#### `POST /api/carrier/accounts`
+
+新增账号，返回该账号摘要。
+
+- 普通号：`{ "carrier": "mobile", "phone": "13800138000", "label": "主卡" }`
+- 物联网卡：`{ "access_method": "iot"|"iot_card", "card"|"phone": "…", "provider"|"iot_provider": "cloud", "label": "" }`
+  （`provider` 缺省 `cloud`）
+
+#### `POST /api/carrier/accounts/{id}/activate`
+
+切换活动账号（`active_id`），返回该账号摘要。
+
+#### `PATCH /api/carrier/accounts/{id}`
+
+改备注名：`{ "label": "新名字" }` → `{ "success": true }`。
+
+#### `DELETE /api/carrier/accounts/{id}`
+
+删除账号，并清掉它在调度器里的内存态与自动登录计数 —— **同一号码重新加回来不会继承旧的参与位与发码次数**。
+
+### 登录
+
+#### `POST /api/carrier/accounts/{id}/login/mobile/request`
+
+请求移动验证码：`{ "phone": "13800138000" }` →
+`{ "state": "code_sent", "carrier": "mobile", "phone": "138****8000", "expires_in": 300, "retry_after": 60 }`
+
+#### `POST /api/carrier/accounts/{id}/login/mobile/verify`
+
+提交验证码：`{ "code": "123456" }`，**必须是 6 位数字**否则 400。成功 → `{ "state": "ready", "carrier": "mobile", "phone": "…" }`。
+
+#### `POST /api/carrier/accounts/{id}/login/unicom/qr`
+
+取联通扫码登录二维码，`?refresh=1` 强制换新 →
+`{ "state": "qr_pending", "qr_png_base64": "<PNG base64>", "expires_in": 120, "poll_after_ms": 2000 }`
+
+#### `GET /api/carrier/accounts/{id}/login/unicom/status`
+
+轮询扫码状态（按上一条给的 `poll_after_ms` 节奏）。
+
+#### `POST /api/carrier/accounts/{id}/login/unicom/password`
+
+联通服务密码登录：`{ "phone": "…", "password": "…" }`。密码被拒时 401 `CARRIER_PASSWORD_REJECTED`。
+
+#### `POST /api/carrier/accounts/{id}/login/cloud`
+
+物联网卡登录：`{ "card": "…", "verify": "…" }`（`card` 缺省时取 `phone`）。
+
+**当前账号版本**（语义同上，去掉 `/accounts/{id}` 前缀）：
+`POST /api/carrier/mobile/login/request`、
+`POST /api/carrier/mobile/login/verify`、
+`POST /api/carrier/unicom/login/qr`、
+`GET /api/carrier/unicom/login/status`、
+`POST /api/carrier/unicom/login/password`、
+`POST /api/carrier/account`（换账号）、
+`POST /api/carrier/logout`（清会话，回 `{ "state": "login_required" }`）。
+
+### 账单
+
+#### `GET /api/carrier/bill?refresh=1`
+
+当前活动账号的账单。`refresh=1`（或 `true`）绕缓存直取；不带则可能命中缓存（`stale` / `cached_at` 会说明）。
+
+#### `GET /api/carrier/accounts/{id}/bill?refresh=1`
+
+指定账号的账单，与上一条**共用同一个响应体**：
+
+```json
+{
+  "state": "ready",
+  "fetched_at": 1762000000000,
+  "login_required": false,
+  "stale": false,
+  "cached_at": 1761999000000,
+  "bill": {
+    "carrier": "mobile", "access_method": "carrier", "phone": "138****8000",
+    "plan_name": "…", "balance_yuan": 42.5, "current_bill_yuan": 12.3,
+    "flow": { "general_used_gb": 12.4, "general_total_gb": 30, "general_remaining_gb": 17.6,
+              "directed_used_gb": 0, "directed_total_gb": 30, "directed_remaining_gb": 30,
+              "general_unlimited": false },
+    "voice": { "used": 60, "total": 500, "remaining": 440 },
+    "sms": { "used": 3, "total": 100, "remaining": 97 },
+    "cloud_card": { "provider_id": "…", "provider_name": "…", "card_no": "…" },
+    "packages": [ { "kind": "…", "name": "…", "remaining_gb": 1.2, "total_gb": 10 } ]
+  },
+  "warnings": []
+}
+```
+
+> `state = "login_required"` 时 `bill` **仍可能存在** —— 那是磁盘缓存里的最近一次数据，
+> 供「先给个旧数、再引导登录」的界面用。只认 409 的旧客户端会忽略它，继续显示登录卡片。
+
+#### `GET /api/carrier/bill/settings`
+
+设备级账单策略（单份）：
+
+```json
+{ "refresh": { "enabled": true, "interval_minutes": 30 },
+  "keepalive": { "enabled": true, "check_interval_minutes": 5, "relogin_interval_minutes": 25,
+                 "daily_sms_limit": 8, "attempts_today": 1, "next_check_at": 1762000300000 },
+  "accounts": [ { "id": "a1b2", "label": "主卡", "phone": "138****8000", "carrier": "mobile",
+                 "participating": true, "supported": true, "phase": "idle", "attempts_today": 1 } ] }
+```
+
+#### `PUT /api/carrier/bill/settings`
+
+改策略，**只改传入的字段**（未传的保持原值）：
+
+```json
+{ "refresh": { "enabled": true, "interval_minutes": 30 },
+  "keepalive": { "enabled": true, "check_interval_minutes": 5, "relogin_interval_minutes": 25, "daily_sms_limit": 8 } }
+```
+
+#### `PUT /api/carrier/bill/settings/accounts/{id}`
+
+设置该账号是否参与保活：`{ "participating": true }`（缺 `participating` → 400）。返回整份策略快照。
+
+### 自动登录 / 保活
+
+#### `GET /api/carrier/auto-login`
+
+读当前活动账号的自动登录状态。
+
+#### `PUT /api/carrier/auto-login`
+
+改配置并返回生效后的状态：
+`{ "enabled": true, "phone": "…", "check_interval_minutes": 5, "relogin_interval_minutes": 25, "max_attempts_per_day": 8 }`。
+
+#### `POST /api/carrier/auto-login/run`
+
+立即跑一次（不等下一个检查周期），返回当前状态。
+
+#### `GET /api/carrier/accounts/{id}/auto-login`
+
+读指定账号的自动登录状态。
+
+#### `PUT /api/carrier/accounts/{id}/auto-login`
+
+改指定账号的配置，字段同上。
+
+#### `POST /api/carrier/accounts/{id}/auto-login/run`
+
+立即跑一次指定账号的自动登录。
+
+状态响应字段：`supported`（该运营商是否支持）、`carrier`、`sim_operator`、`operator_name`、`enabled`、
+`phone`、`phase`、`message`、`last_login_at`、`next_check_at`、`attempts_today`、`participating`、
+`check_interval_minutes`、`relogin_interval_minutes`、`max_attempts_per_day`。
+后四项是设备策略的**只读回显**，客户端用它们初始化输入框，避免拿默认值覆盖真实配置。
+
+> 不带 `/accounts/{id}` 的六个端点作用于当前活动账号；带 id 的作用于指定账号。
+
+### 错误码
+
+| 状态 | `code` | 含义 |
+|---|---|---|
+| 400 | `BAD_REQUEST` | 参数不合法（未知 `carrier`、验证码不是 6 位、`participating` 缺失） |
+| 401 | `CARRIER_PASSWORD_REJECTED` | 联通服务密码被拒；`forced_sms` 表示运营商要求改用短信验证码 |
+| 404 | `NOT_FOUND` | 账号 id 不存在 |
+| 409 | `CARRIER_LOGIN_REQUIRED` | 需要先登录才能取账单 |
+| 409 | `CARRIER_CODE_EXPIRED` | 验证码过期，需重新请求 |
+| 429 | `TOO_MANY_REQUESTS` | 发码太频繁，`retry_after`（秒）指明最快下次 |
+| 501 | `NOT_SUPPORTED` | 自动登录未装配（极简装配或测试环境） |
+| 502 | `UNAVAILABLE` | 运营商接口失败（上游变更 / 网络不通） |
+
+---
+
+## 远程屏幕 /api/screen
+
+> 对应 `ScreenRoutes`。把设备的画面通过 **scrcpy-server 3.3.3** 投到浏览器 / App。
+>
+> **默认关闭**：开关是 `screen_enabled`，经 `PUT /api/config` 的 `screen_enabled` 字段写入。
+> 关着时 `/session` 与 `/screenshot` 一律 **403**、`/ws/screen` 直接 **1008** 关闭，
+> 且 core **不会起任何进程**（会话是在 WS 握手成功那一刻才建立的）——
+> 所以"关着"是零成本状态，不是"起了但不给看"。
+> `/status` 不受开关拦截：它本来就要能回答「现在是关的」。
+>
+> **为什么 WS 挂在 `/api` 之外**：浏览器原生 WebSocket 发不了自定义头，凭据只能进 query；
+> `/ws/` 在 `AuthMiddleware` 里整体豁免，所以这条路由**自己**做握手验签，见下。
+
+### 会话票据
+
+#### `POST /api/screen/session`
+
+签发一次性票据。真正的会话在 WS 握手成功那一刻才建立 —— 这里只发票，
+避免"点了但没连上"在设备上留下一个空转的 scrcpy 进程。
+
+**请求体（可空）：**
+
+```json
+{ "max_size": 848, "max_fps": 20, "bit_rate": 2000000 }
+```
+
+**响应：**
+
+```json
+{
+  "ticket": "…",
+  "ws_path": "/ws/screen",
+  "expires_in": 60,
+  "scrcpy_version": "3.3.3",
+  "size_source": "video_stream_metadata",
+  "max_size": 848,
+  "max_fps": 20,
+  "bit_rate": 2000000
+}
+```
+
+- 票据 **60 秒滑动有效**（每次使用续期），同时最多 **4** 张 —— 超限淘汰**最久未使用**的那张。
+  它不是一次性的：握手失败可在窗口内重试；超过 60 秒重新签一张。
+- 回显的三个画质参数是**服务端钳制后**的实际值 —— 前端滑块越界时以这里为准。
+- `size_source` 恒为 `video_stream_metadata`：**真实宽高不在这里给**，以视频流 metadata 为准
+  （`max_size` 会被向下取整到 8 的倍数，请求 850 实际得到 848；写死宽高会与画布对不上）。
+
+### 截屏
+
+#### `GET /api/screen/screenshot`
+
+设备原生像素的 PNG，**原样透传**。
+
+- 与投屏互不干扰：没有活动会话也能截（`screencap` 是另一条 adb 命令）。
+- 同一时刻只跑一张：上一次没结束直接 **429**（`screencap` 单次 300–800ms，轮询手快就会叠起来）。
+- 取回来的字节**必须**是 PNG 魔数才下发；否则 **503**，绝不把 HTML 或半截数据当图片发。
+- 响应头 `Cache-Control: no-store`（每次都是新画面）。
+
+**响应：** `200 image/png`（二进制）。
+
+### 状态
+
+#### `GET /api/screen/status`
+
+```json
+{
+  "enabled": false,
+  "active": false,
+  "scrcpy_version": "3.3.3",
+  "downstream_bytes": 0,
+  "upstream_bytes": 0,
+  "pid": 0
+}
+```
+
+`downstream_bytes = 0` 说明**一条控制消息都没到 core**；有增长但设备无反应则是 server 侧不认这些消息。
+
+### WebSocket /ws/screen
+
+```
+GET /ws/screen?ticket=<票据>&token=<配对 token>&ts=<毫秒时间戳>&nonce=<随机串>&sig=<签名>
+               &maxsize=848&fps=20&bitrate=2000000
+```
+
+**两道闸**：
+
+1. `WsAuthenticator`：`token/ts/nonce/sig` 验签，参数名与 `/ws/realtime` 完全一致；
+   签名路径用的是 `/ws/screen`。
+2. `ticket`：由 `POST /api/screen/session` 签发，一次性。
+
+> 注意画质参数在 HTTP 与 WS 上**名字不同**：HTTP 是 `max_size` / `max_fps` / `bit_rate`，
+> WS 是 `maxsize` / `fps` / `bitrate`。钳制区间两边一致。
+
+| 参数 | 默认 | 区间 |
+|---|---|---|
+| `maxsize` | 848 | 240–1280，**向下取 8 的倍数** |
+| `fps` | 20 | 5–60 |
+| `bitrate` | 2 000 000 | 500 000–16 000 000 |
+
+**帧格式**：只接受/只发送 **二进制帧**。文本帧一律 `1008` 关闭（说明对端不是本实现）。
+
+- 下行：`InputStream.read` 读多少发多少（≤32KB/帧），**不攒包** —— 攒包等于给交互加延迟。
+  core 的全局 `maxFrameSize = 64KB` 不改，靠分块满足。
+- 上行：帧内容被原样写进 scrcpy 的 **control socket**（与视频流是两条连接；
+  写成一条的表现是"画面正常、操作无反应"）。
+- 上行限流 **240 帧/秒**（1 秒滑动窗口）：正常手速 60–120，超过说明客户端在刷屏，
+  继续转发只会把设备 `InputManager` 打满 → `1008`。
+- 空闲 **10 分钟**双向无字节即断开。注意静态画面**不产生下行字节**（scrcpy 只在内容变化时出帧），
+  所以判据是"两个方向都静默"，不是"没有视频"。
+
+**关闭码：**
+
+| 码 | 含义 |
+|---|---|
+| 1008 | 验签失败 / 票据无效或过期 / 开关关闭 / 收到文本帧 / 上行超速 |
+| 1013 | 已有会话在跑（BUSY）或设备、adb 暂不可用 —— 等一会儿重试即可 |
+| 1001 | 空闲超时，或对端 EOF（reason 里带 `scrcpy-eof bytes=N`，N 是不依赖日志开关的排障线索） |
+
+
+---
+
 ## 接口统计
 
 > 下面的数字会过期。**权威口径跑 `node scripts/verify-api-contract.mjs`**：  
 > 它从 core 路由、app Retrofit 注解、web 调用、本手册四个来源各自抽端点集合再交叉比对，  
 > 「本手册声明但 core 不存在」的必须为空。
 
-守门脚本最近一次统计（2026-09-09，退出码 1 —— 唯一的 P0 是 web `TasksView.vue` 里一条被误抽成 `/api/:p/:p` 的通配路径，与本手册无关）：
+守门脚本统计结果（2026-11-14，补完 `/api/carrier` 与 `/api/screen` 之后）：
 
 | 来源          | 端点数 |
 | ----------- | --- |
-| core 路由声明   | 230 |
-| 本手册         | 220 |
-| Android app | 217 |
-| web 面板      | 199 |
+| core 路由声明   | 366 |
+| 本手册         | 287 |
+| Android app | 328 |
+| web 面板      | 337 |
+
+脚本仍报 4 条 `P0`，**都不是真的端点缺失**：`/api`、`/api/x` 来自 web 的
+`contract.spec.ts` / `deviceIdentity.spec.ts`（测试里手写的字符串），
+`/pairing/approval-status` / `/pairing/request-approval` 是 `PairedDeviceApprovalRoutes`
+注册在 `route("/pairing") { … }` 之内、静态抽取看不到外层前缀（core 侧同一批端点会以
+`/approval-status`、`/request-approval` 出现在「无任何端引用」的提示里，也是同一个原因）。
 
 （三侧比 core 少是正常的：core 有不少端点只被单侧消费，手册也不逐条列举静态资源与通配路由。）
 
 ### 按模块分布
 
-下面是**人工估算**，加总与上表对不上，只用来快速定位模块规模，别当口径：
+以下为**人工估算**，合计值与上表不一致，仅用于快速定位模块规模，不作为口径依据：
 
 | 模块                   | 端点数 |
 | -------------------- | --- |
@@ -7702,6 +8299,8 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 | /api/files           | 16  |
 | /api/downloads       | 15  |
 | /api/apps            | 10  |
+| /api/carrier         | 30  |
+| /api/screen          | 3   |
 | /api/sms             | 10  |
 | /api/system          | 8   |
 | /api/tasks           | 7   |
@@ -7737,14 +8336,14 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 
 ## 文档幻影端点（已从本手册移除）
 
-以下端点曾出现在本手册中，但 `core/` 从未实现过。由 `node scripts/verify-api-contract.mjs` 于 2026-08-26 检出并删除，登记在此避免再次被"补写"进文档或客户端：
+以下端点曾出现在本手册中，但 `core/` 从未实现。已由 `node scripts/verify-api-contract.mjs` 检出并删除，登记于此以避免再次被补写进文档或客户端：
 
 - `GET /api/adb/status`、`GET /api/adb/ping`、`GET /api/adb/auto-start`、`POST /api/adb/start`、`POST /api/adb/stop`、`POST /api/adb/auto-start`
   - 替代方案：ADB / 特权 shell 的只读状态由 `/api/shell/root`（GET，返回 `root`/`uid`/`method`）与 `/api/diagnose`（GET，返回 `adbd`）提供，不新增路由。
 - `POST /api/device/usb-mode`
-  - core 全仓无 `usb-mode` / `usb_mode` 实现；app 侧 `UfiAxisApi.kt` 也未声明该方法。USB 模式切换目前无后端能力。
+  - core 内无 `usb-mode` / `usb_mode` 实现；app 侧 `UfiAxisApi.kt` 也未声明该方法。USB 模式切换目前无后端能力。
 
-以下 10 个端点由 2026-08-29 的阶段 4.1b 复核检出并删除（`core/api/.../DeviceRoutes.kt`  
+以下 10 个端点经复核检出并删除（`core/api/.../DeviceRoutes.kt`  
 与 `WifiRoutes.kt` 的路由声明里都没有它们，app / web 也从未调用）。  
 **写替代方案时把动词写在路径后面**（如 “`/api/wifi/config`（POST）”）：  
 本小节里 `POST /api/x` 这种「动词+路径」写法会被守门脚本当成负面清单条目，  
@@ -7757,7 +8356,7 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
   - SIM/PIN 无专用端点。SIM 状态从 `/api/device/info`（GET）的 identity 段或  
     `/api/dashboard/summary`（GET）的 `sim` 段读；`/api/sim` 下只有卡槽切换 `/api/sim/switch`（POST）。
 - `GET /api/device/access-control`、`POST /api/device/access-control`
-  - 这两个**路径**不存在。MAC 访问控制（拉黑）在 2026-08-30 落地了，但挂在 WiFi 段：  
+  - 这两个**路径**不存在。MAC 访问控制（拉黑）已实现，但挂在 WiFi 段：  
     读 `/api/wifi/acl`（GET），写 `/api/wifi/acl/block`、`/api/wifi/acl/unblock`、  
     `/api/wifi/acl/clear`（POST）。已连设备列表读 `/api/wifi/clients`（GET）。
 - `POST /api/device/tr069`
@@ -7769,7 +8368,60 @@ core 按频道严格过滤 —— **没订阅就永远收不到**。
 - `POST /api/wifi/adv-config`、`POST /api/wifi/guest`
   - 信道/模式/国家码、访客网络均无后端能力。
 - `POST /api/wifi/chip`
-  - 没有这个路径名。切频段的能力已经有了，见「WiFi 控制」一节的频段端点（2026-09-22 起）。
-    **不要**用 `/api/wifi/config` 的 `chip_index` —— 那个参数实测切不了频段。
+  - 没有这个路径名。切换频段的能力已提供，见「WiFi 控制」一节的频段端点。
+    **不得**使用 `/api/wifi/config` 的 `chip_index`：该参数实测无法切换频段。
 
-**约束：** 新增端点必须先落到 `core/`，再更新本手册与客户端；`scripts/verify-api-contract.mjs` 的 P0 列表必须为空。
+**约束：** 新增端点必须先落到 `core/`，再更新本手册与客户端；`scripts/verify-api-contract.mjs` 的高优先级列表必须为空。
+
+---
+
+## 第三方程序商店（`/api/programs`）
+
+> 对应 `ProgramRoutes`。程序是**带 data/conf/run/state 的第三方 Linux 程序**（OpenList / Syncthing / Cloudreve / dufs），
+> 与 `/api/components` 的 frpc/cloudflared 单文件组件不同。
+>
+> **多实例运行时**：允许**同时运行多个**程序，运行时状态按 id 隔离
+> （进程、代际号、日志管道、Gateway、健康监测各归各的槽）。只有「同一个 id 已在跑」才会被拒绝。
+> 内存有**总量预算**（物理内存 × 55%，夹在 384–6144MB）：启动时按「已在跑 RSS + 本程序 `rss_warn_mb`」准入，
+> 运行中超出则停掉占用最大的那个，并清掉它的 `desired`（避免 10 秒后被看护进程再次拉起）。
+>
+> **鉴权**：全部端点走标准 Bearer + 请求签名；其中 `/{id}/uninstall` 与 `/{id}/secret`
+> 在「[破坏性操作的主人口令门](#破坏性操作的主人口令门可选)」打开时还要配对密码。
+> 这个功能本质是「下载并执行任意二进制」，
+> 客户端应在安装/启动前明确告知风险。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/programs` | 列表：`{ programs, count, native_exec, total_bytes }`。`total_bytes` 有 60s 缓存；**列表不统计目录占用**（`used_bytes/log_bytes/cache_bytes/content_bytes` 恒为 0），详情才统计 |
+| GET | `/api/programs/volumes` | 内容目录候选卷：`{ volumes: [{ id, label, path, removable, total_bytes, used_bytes, free_bytes }] }`；与「文件管理 → 存储与外接设备」共用同一份枚举 |
+| GET | `/api/programs/status` | 全局安装进度：`{ id, phase, downloaded_bytes, total_bytes, candidate_index, message }` |
+| GET | `/api/programs/{id}` | 单程序详情（含磁盘占用统计） |
+| GET | `/api/programs/{id}/logs?tail=200` | stdout/stderr 尾部 |
+| POST | `/api/programs/{id}/install?storage=internal\|external&access_mode=direct\|gateway&content_root=<绝对路径>` | 异步安装/更新；200 accepted；409 = 已有安装任务 / **该程序**正在运行。`content_root` 只接受 `/api/programs/volumes` 返回过的路径，否则 400 |
+| POST | `/api/programs/{id}/upload` | raw body 本地上传安装；同步返回；同样校验 `content_root` |
+| POST | `/api/programs/{id}/uninstall` | 卸载并删除数据（含内容目录）；**该程序**在运行会拒绝 |
+| POST | `/api/programs/{id}/start` | 启动；只拦「这个 id 已在跑」；内存预算不足会拒绝并说明原因 |
+| POST | `/api/programs/{id}/stop` | 按 id 停止；不影响其它程序 |
+| POST | `/api/programs/{id}/restart` | 停止该 id 再启动 |
+| POST | `/api/programs/{id}/access-mode?mode=direct\|gateway` | 切换访问方式；该程序在运行会拒绝 |
+| POST | `/api/programs/{id}/open` | 返回 `{ scheme, port, path }`；gateway 模式会 Set-Cookie（HttpOnly） |
+| POST | `/api/programs/{id}/secret` | 消费并返回初始口令（按 id；多实例下不会串号） |
+| POST | `/api/programs/{id}/reset-secret` | 停止程序后重置口令（旧数据/丢失口令） |
+
+程序项字段：`private_data`（数据目录含凭据 → 禁止外部存储）、`content_enabled` / `content_dir` / `content_bytes`（内容目录，可放 SD 卡）、`log_bytes` / `cache_bytes`。
+
+清单新增字段（`version.json.programs[]`）：
+
+| 字段 | 语义 |
+|---|---|
+| `requires.private_data` | 数据目录含凭据（token / 私钥 / 口令哈希）时置 true → 安装时拒绝 `storage=external` |
+| `content.enabled` / `default_root` / `required` | 是否有独立内容目录、默认放内部还是公共存储、卡拔掉时是否必须拒绝启动 |
+| `run.argv` 占位符 | 新增 `{CONTENT}`（内容目录）；未知占位符在**安装期**就被清单校验拒绝 |
+| `resources.log_quota_mb` | **每程序日志总量**（stdout+stderr 两路 × 3 份滚动文件），不再是「单文件上限」 |
+| `resources.data_quota_mb` | 统计口径是 **二进制 + 数据 + 内容**；超限只告警，但**下次启动会被拒绝** |
+
+程序项里的 `phase` **按 id 可信**：多实例之后每个程序有自己的槽位，未运行的程序返回 `installed`，
+不会把 A 的 pid/rss/uptime 套到 B 上（单槽时代的"错 id 返回 409"约束已随之取消）。
+
+清单来源：APK 内置 `assets/programs/catalog.json` 为兜底；Core 启动 15s 后、之后每 6h 从 `update_url` 的 `version.json.programs` 段拉取远端清单（经 MirrorResolver 候选回退 + 清单校验），远端按 id 覆盖内置，失败保留内置。列表接口无需额外刷新参数，下一次轮询即可看到远端新增/更新的程序。
+

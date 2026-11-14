@@ -551,7 +551,7 @@ class ProgramRuntime(
             val extraEnv = ProgramArgs.expandEnv(manifest.run.env, env).getOrElse { e ->
                 return Result.failure(IllegalStateException(e.message ?: "环境变量展开失败"))
             }
-            // 环境变量白名单：清单来自远端（见 docs/ACKNOWLEDGED-RISKS.md R3），
+            // 环境变量白名单：清单来自远端（见 dev-docs/ACKNOWLEDGED-RISKS.md R3，开发文档不入库），
             // 而 `putAll(extraEnv)` 在 TMPDIR/HOME/PATH 之后执行、能覆盖一切 ——
             // 一个 `LD_PRELOAD={DATA}/libx.so` 就能在"sha256 从未变过"的合法二进制里执行任意代码。
             val rejectedEnv = extraEnv.keys.filterNot { it in ALLOWED_ENV_KEYS }
