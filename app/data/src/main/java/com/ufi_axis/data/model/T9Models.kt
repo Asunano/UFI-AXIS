@@ -462,9 +462,17 @@ data class DiskUsageResponse(
     val disks: List<StorageVolumeRaw> = emptyList()
 )
 
-/** #21 files/status 响应：Core 后端的存储管理权限状态。 */
+/** #21 files/status 响应：Core 后端的存储管理权限状态 + 上传能力位。 */
 @Serializable
 data class StorageStatusResponse(
-    val isExternalStorageManager: Boolean = false
+    val isExternalStorageManager: Boolean = false,
+    /**
+     * 设备端是否支持「上传到外部存储源」（手机 → core 暂存 → 远端推送）。
+     *
+     * 默认 false 是**必须**的：老固件的 `/api/files/upload*` 完全没有 `remote:` 分支，
+     * 带前缀的路径会被 `safeResolve` 判成非法路径回 400。UI 据此决定远端目录里
+     * 要不要放出上传入口 —— 放一个必然失败的按钮比不放更糟。
+     */
+    val supports_remote_upload: Boolean = false
 )
 

@@ -53,8 +53,8 @@ private fun asArray(el: JsonElement?): JsonArray? {
 /**
  * 设备开关类设置（[DeviceFields.DeviceSettings]）。
  *
- * [bearerPreference] 与 [netSelect] **不是别名**：前者是写入侧真正改的字段
- * （`SET_BEARER_PREFERENCE`），后者是老固件字段，取值域未经证实，仅作回退 → [networkMode]。
+ * 制式回读以 **`net_select` 为准**（真机切换后变化的字段）；[bearerPreference] 是写入侧
+ * 字段，仅作回退 → [networkMode]。
  * [roam] 与 [dialRoam] 同理（部分固件只填其中一个）→ [roamingEnabled]。
  */
 @Serializable
@@ -89,9 +89,23 @@ data class DeviceSettingsResponse(
     val roamingEnabled: Boolean
         get() = DeviceFields.Bool.isTrue(roam) || DeviceFields.Bool.isTrue(dialRoam)
 
-    /** 网络模式（Bearer 取值域），优先写入侧字段，老固件回落 [netSelect]。 */
+    /**
+     * 网络模式（Bearer 取值域）。
+     *
+     * **优先 [netSelect]**（2026-09 真机校准）：设备切换后真正变化的是 goform 的 `net_select`
+     * （如 `WL_AND_5G` / `Only_5G`）；`BearerPreference` 是写入侧字段，回读可能为空或停留在
+     * 未应用的值，拿它做「切换是否完成」的判据会永远对不上（表现为切换成功却一直提示未完成）。
+     * `BearerPreference` 仅在 `net_select` 缺失时作回退。
+     */
     val networkMode: String?
-        get() = bearerPreference?.takeIf { it.isNotBlank() } ?: netSelect?.takeIf { it.isNotBlank() }
+        get() = netSelect?.takeIf { it.isNotBlank() } ?: bearerPreference?.takeIf { it.isNotBlank() }
+
+    /**
+     * 网络模式中文名（core `GET /api/device/settings` 注入）。
+     * 文案真源在 `NetworkMode.LABELS`；本字段缺失时 UI 回落到 `NetworkMode.labelFromBearer`。
+     */
+    @SerialName("network_mode_label")
+    val networkModeLabel: String? = null
 
     /** 连接模式，归一成 `"auto"` / `"manual"`（部分固件用 `"1"` / `"hand"` 表示手动）。 */
     val manualConnection: Boolean

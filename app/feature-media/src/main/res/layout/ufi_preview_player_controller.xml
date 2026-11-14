@@ -1,0 +1,488 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  视频预览自定义 controller（沉浸式）。
+
+  ============================================================================
+  【根因：为什么不能再用 <include layout="@layout/exo_player_control_view" />】
+  ============================================================================
+  media3-ui 1.10.0 的默认 exo_player_control_view.xml（<merge> 根，宿主是
+  PlayerControlView 这个 FrameLayout）里，子 View 的声明顺序是：
+
+      1. exo_controls_background
+      2. exo_bottom_bar            （高 60dp，layout_gravity=bottom）
+      3. exo_progress_placeholder  （高 48dp，marginBottom 52dp，gravity=bottom）
+      4. exo_minimal_controls
+      5. exo_center_controls       （高 52dp，layout_gravity=center）
+      6. exo_top_controls
+
+  两个关键事实：
+  A. exo_progress 是「悬浮在距底 52dp 处、独立于底部条」的一层，触摸区（
+     DefaultTimeBar 的 touch_target_height，默认 48dp = exo_styled_progress_
+     touch_target_height）纵向占 y ∈ [H-100, H-52]。
+  B. exo_center_controls 在 FrameLayout 里排在 exo_progress **之后**。
+     FrameLayout 的 dispatchTouchEvent 是 **逆序** 命中测试（后声明的在最上层、
+     先吃事件），所以中央的 播放/快退/快进 一排（52dp 高、垂直居中，
+     y ∈ [H/2-26, H/2+26]）会盖在进度条触摸区上面。
+
+  几何上只要 H/2+26 > H-100 即 H < 252dp，两者就重叠；而本项目非全屏时视频容器
+  高度 = 卡片宽(屏宽×0.96) × 9/16 ≈ 屏宽dp × 0.54，411dp 宽机型约 222dp、
+  360dp 宽机型约 194dp —— **永远 < 252dp，所以进度条上半部分永远被中央按钮吃掉
+  触摸事件**，表现就是「进度条看得见但拖不动 / 一拖就变成暂停」。
+
+  另外 PlayerControlViewLayoutManager.useMinimalMode() 的阈值是
+      centerControlHeight + 2 × getHeightWithMargins(exo_bottom_bar)
+  默认 = 52 + 2×(60+10) = 192dp。容器高度 ≤ 192dp 就进 minimal mode，届时
+  updateLayoutForSizeChange() 会执行 DefaultTimeBar.hideScrubber(disableScrubber
+  Padding=true) 并把 exo_bottom_bar 置 INVISIBLE、进度条 bottomMargin 归 0 ——
+  小屏 / 大字号机型直接连拖拽圆点都没有。
+
+  ============================================================================
+  【本布局的做法：结构上让重叠不可能发生】
+  ============================================================================
+  1. 进度条与底部按钮行分处两个纵向不相交的区块，中央控制再用 paddingBottom
+     整体上抬，三者 y 区间互不重叠（见下方尺寸表）。
+  2. exo_progress 直接声明为 androidx.media3.ui.DefaultTimeBar（不用
+     exo_progress_placeholder），这样可以用 XML 属性把 touch_target_height 从
+     48dp 压到 28dp —— 触摸区变矮是「不重叠」的前提。
+  3. exo_progress 在 FrameLayout 里声明在 exo_center_controls **之后**，
+     即便未来有人改尺寸导致万一重叠，进度条也会赢下命中测试（双保险）。
+  4. exo_center_controls 用 **paddingBottom** 而不是 layout_marginBottom 来上抬：
+     useMinimalMode() 里 centerControlHeight 会 **减掉** paddingTop+paddingBottom、
+     但会 **加上** margin，所以用 padding 上抬不会推高 minimal mode 阈值，用
+     margin 反而会（这两个诉求是互斥的，必须选 padding）。
+
+  ============================================================================
+  【尺寸表 / 纵向 y 区间（单位 dp，H = 容器高度）】
+  ============================================================================
+  exo_progress        : 高 28，marginBottom 52  → y ∈ [H-80, H-52]
+                        touch_target_height=28 且 bar_gravity=center，
+                        DefaultTimeBar.onMeasure 在 EXACTLY 下取满 28，
+                        seekBounds = 整个 28 高 ⇒ 触摸区就是 [H-80, H-52]
+  exo_bottom_bar      : 高 48，gravity=bottom   → y ∈ [H-48, H]
+                        （内部 40dp 图标垂直居中 → y ∈ [H-44, H-4]）
+  exo_center_controls : 内容 48 + paddingBottom 48 = 96，gravity=center
+                        → 盒子 y ∈ [(H-96)/2, (H+96)/2]
+                        → 图标实际占上半 48：y ∈ [(H-96)/2, (H-96)/2+48]
+
+  H=194（360dp 宽机型）: 中央图标 [49, 97] | 进度条 [114, 142] | 底部条 [146, 194]
+  H=222（411dp 宽机型）: 中央图标 [63, 111] | 进度条 [142, 170] | 底部条 [174, 222]
+  H=420（全屏横屏）    : 中央图标 [162, 210]| 进度条 [340, 368]| 底部条 [372, 420]
+  三种高度下「中央图标 / 进度条 / 底部按钮行」两两不相交，最小间隙 4dp
+  （进度条底 H-52 与底部条顶 H-48 之间）。
+
+  minimal mode 阈值 = centerControlHeight + 2 × heightWithMargins(exo_bottom_bar)
+                    = (96 - paddingBottom 48) + 2 × (48 + 0)
+                    = 48 + 96 = 144dp
+  ⇒ 194dp / 222dp / 420dp 都远高于 144dp，不会进 minimal mode；
+    容器高度要低于 144dp（≈ 267dp 宽的屏幕）才会退化，实际机型不存在。
+
+  进度条 marginBottom 特意取 52dp（= @dimen/exo_styled_progress_margin_bottom）：
+  PlayerControlViewLayoutManager.updateLayoutForSizeChange() 在非 minimal mode 下
+  会把 timeBar 的 bottomMargin **强制写成** 这个值。取同值⇒该回调无论何时触发都
+  不会改变本布局的几何（幂等）。改小它会被运行时改回去，别改。
+
+  【保留的 exo id 说明】
+  凡是 PlayerControlView / PlayerControlViewLayoutManager 会 findViewById 的 id，
+  这里全部提供（源码里都有 null 保护，但缺了对应功能会静默失效）。
+  刻意省略的只有：
+    - exo_rew_with_amount / exo_ffwd_with_amount：源码是
+      `if (exo_rew != null) {...} else if (exo_rew_with_amount != null) {...}`，
+      提供了简单版 exo_rew/exo_ffwd 就走第一分支，两者互斥。
+    - exo_playback_speed / exo_audio_track：仅 `if (x != null)` 注册点击，
+      倍速/音轨已经在 exo_settings 齿轮弹窗里，不需要独立按钮。
+  exo_media_route_button_placeholder 必须保留：setMediaRouteButtonViewProvider()
+  在找不到它时会直接 throw IllegalStateException（唯一无 null 保护的地方）。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:layoutDirection="ltr">
+
+    <!-- 半透明压暗底：宽高写 0dp 是 media3 的要求，实际尺寸由
+         PlayerControlViewLayoutManager.onLayout() 用 layout(0,0,w,h) 撑满，
+         避免它影响父容器 wrap_content 的测量（ExoPlayer issue #8726）。
+         必须是第一个子 View —— 它在最底层，不能吃掉任何控件的触摸。 -->
+    <View
+        android:id="@id/exo_controls_background"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:background="@color/exo_black_opacity_60" />
+
+    <!-- 中央控制（快退 / 播放暂停 / 快进；上一个下一个由 Kotlin 侧
+         setShowNextButton(false)/setShowPreviousButton(false) 置 GONE）。
+         paddingBottom=48dp 是「整体上抬」的手段，不用 layout_marginBottom：
+         见文件头第 4 条 —— margin 会推高 minimal mode 阈值，padding 不会。
+         clipToPadding=false 保证 ripple 不被 padding 裁掉。 -->
+    <LinearLayout
+        android:id="@id/exo_center_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@android:color/transparent"
+        android:clipToPadding="false"
+        android:gravity="center"
+        android:layoutDirection="ltr"
+        android:paddingBottom="48dp">
+
+        <ImageButton
+            android:id="@id/exo_prev"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginLeft="@dimen/exo_icon_horizontal_margin"
+            android:layout_marginRight="@dimen/exo_icon_horizontal_margin"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_previous_description"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_previous"
+            android:visibility="gone" />
+
+        <ImageButton
+            android:id="@id/exo_rew"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginLeft="@dimen/exo_icon_horizontal_margin"
+            android:layout_marginRight="@dimen/exo_icon_horizontal_margin"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_rewind_description"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_rewind" />
+
+        <ImageButton
+            android:id="@id/exo_play_pause"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginLeft="@dimen/exo_icon_horizontal_margin"
+            android:layout_marginRight="@dimen/exo_icon_horizontal_margin"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_play_description"
+            android:padding="2dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_play" />
+
+        <ImageButton
+            android:id="@id/exo_ffwd"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginLeft="@dimen/exo_icon_horizontal_margin"
+            android:layout_marginRight="@dimen/exo_icon_horizontal_margin"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_fastforward_description"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_fastforward" />
+
+        <ImageButton
+            android:id="@id/exo_next"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginLeft="@dimen/exo_icon_horizontal_margin"
+            android:layout_marginRight="@dimen/exo_icon_horizontal_margin"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_next_description"
+            android:padding="8dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_next"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+    <!-- 进度条：独占一条 28dp 高的横带，紧贴在底部按钮行上方（marginBottom 52dp）。
+         声明位置在 exo_center_controls **之后** ⇒ FrameLayout 逆序命中测试下它比
+         中央按钮更靠上层，是「万一将来尺寸被改动」的第二道保险。
+
+         直接写成 DefaultTimeBar（而不是 exo_progress_placeholder），目的是能用
+         XML 属性控制几何：
+         - touch_target_height=28dp：默认 48dp 才是撞上中央控制的元凶，压到 28dp
+           后与自身 layout_height 一致，seekBounds 正好铺满整条，不多占一分。
+         - bar_gravity=center：让 3dp 的进度线在 28dp 带子里垂直居中，视觉上和
+           触摸区中心对齐（默认 bottom 会让线贴在触摸区底边，手感偏下）。
+         - scrubber_enabled_size / scrubber_dragged_size 沿用 media3 默认的
+           10dp / 14dp，保证「有圆点可以按住拖」。
+         - 左右各留 12dp margin：DefaultTimeBar 内部 scrubberPadding =
+           (max(scrubber sizes)+1)/2 ≈ 7dp，加上这段 margin 让圆点拖到两端时
+           不会顶着屏幕边缘、也避开系统侧滑手势区。
+         颜色只用 media3 自带的 @color/exo_*（这是 View 体系，拿不到 Compose
+         的 palette，不能硬编码项目主题色）。 -->
+    <androidx.media3.ui.DefaultTimeBar
+        android:id="@id/exo_progress"
+        android:layout_width="match_parent"
+        android:layout_height="28dp"
+        android:layout_gravity="bottom"
+        android:layout_marginLeft="12dp"
+        android:layout_marginRight="12dp"
+        android:layout_marginBottom="52dp"
+        app:bar_gravity="center"
+        app:bar_height="3dp"
+        app:played_color="@color/exo_white"
+        app:scrubber_color="@color/exo_white"
+        app:scrubber_dragged_size="14dp"
+        app:scrubber_enabled_size="10dp"
+        app:touch_target_height="28dp" />
+
+    <!-- 底部按钮行 = exo_bottom_bar。
+         注意：这里 **只放按钮 + 时间文本，不放进度条**。
+         exo_bottom_bar 的高度会被 useMinimalMode() 乘 2 计入阈值
+         （阈值 = 中央控制高 + 2×底部条高含 margin），把进度条塞进来会让阈值涨到
+         48+2×(48+28)=200dp，194dp 的机型立刻退化成 minimal mode（没有拖拽圆点）。
+         保持 48dp 单行 ⇒ 阈值 144dp，所有真实机型都安全。
+         背景沿用 media3 的 exo_bottom_bar_background，给小图标兜底对比度。 -->
+    <FrameLayout
+        android:id="@id/exo_bottom_bar"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_gravity="bottom"
+        android:background="@color/exo_bottom_bar_background"
+        android:layoutDirection="ltr">
+
+        <!-- 当前时间 · 总时长。必须整组包在 exo_time 里且保持 wrap_content：
+             PlayerControlViewLayoutManager.onLayoutWidthChanged() 用
+             getWidthWithMargins(exo_time) 参与「按钮是否要收进溢出菜单」的宽度
+             核算，如果把 exo_time 做成撑满整行的容器，核算永远超宽，底部按钮会被
+             全部塞进溢出菜单只剩一个 ">" 箭头。
+             也正因如此，进度条没有夹在 position 和 duration 中间。 -->
+        <LinearLayout
+            android:id="@id/exo_time"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical|start"
+            android:importantForAccessibility="noHideDescendants"
+            android:layoutDirection="ltr"
+            android:paddingLeft="12dp"
+            android:paddingRight="8dp">
+
+            <TextView
+                android:id="@id/exo_position"
+                style="@style/ExoStyledControls.TimeText.Position"
+                android:textSize="12sp" />
+
+            <TextView
+                style="@style/ExoStyledControls.TimeText.Separator"
+                android:textSize="12sp" />
+
+            <TextView
+                android:id="@id/exo_duration"
+                style="@style/ExoStyledControls.TimeText.Duration"
+                android:textSize="12sp" />
+
+        </LinearLayout>
+
+        <!-- 右侧功能按钮。exo_overflow_show 必须是 **最后一个** 子 View：
+             onLayoutWidthChanged() 把 basicControls 的「最后一个孩子」当成溢出
+             展开按钮跳过，顺序错了会把它也搬进溢出菜单。
+             图标 40dp（默认 48dp 在 48dp 行里塞不下），padding 9dp 让视觉大小
+             与 media3 默认（48dp - 12dp padding = 24dp 图案）接近。
+             exo_vr / exo_shuffle 本项目不用，先置 gone（Kotlin 侧没开启，
+             PlayerControlView 也会 setShowButton(false) 把它们设成 GONE）。 -->
+        <LinearLayout
+            android:id="@id/exo_basic_controls"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical|end"
+            android:layoutDirection="ltr"
+            android:paddingRight="4dp">
+
+            <ImageButton
+                android:id="@id/exo_vr"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_vr_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_vr"
+                android:visibility="gone" />
+
+            <ImageButton
+                android:id="@id/exo_shuffle"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_shuffle_off_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_shuffle_off"
+                android:visibility="gone" />
+
+            <!-- 循环：Kotlin 侧 setRepeatToggleModes(DEFAULT_REPEAT_TOGGLE_MODES)
+                 依赖这个 id 才能出现三态切换。 -->
+            <ImageButton
+                android:id="@id/exo_repeat_toggle"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_repeat_off_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_repeat_off" />
+
+            <!-- 字幕：Kotlin 侧 setShowSubtitleButton(true) 依赖这个 id。 -->
+            <ImageButton
+                android:id="@id/exo_subtitle"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_cc_disabled_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_subtitle_off" />
+
+            <!-- 设置齿轮：倍速 / 音轨 / 字幕轨选择弹窗的入口，缺这个 id 倍速就没了。
+                 它的图标 media3 不在代码里设置，必须由布局给 src。 -->
+            <ImageButton
+                android:id="@id/exo_settings"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_settings_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_settings" />
+
+            <!-- 全屏：Kotlin 侧 setFullscreenButtonClickListener/State 依赖这个 id。
+                 初始 GONE 由 PlayerControlView.initializeFullscreenButton() 设置，
+                 注册 listener 后才显示，不要在这里写 visibility。 -->
+            <ImageButton
+                android:id="@id/exo_fullscreen"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_fullscreen_enter_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_fullscreen_enter" />
+
+            <ImageButton
+                android:id="@id/exo_overflow_show"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_marginLeft="1dp"
+                android:layout_marginRight="1dp"
+                android:background="?android:attr/selectableItemBackground"
+                android:contentDescription="@string/exo_controls_overflow_show_description"
+                android:padding="9dp"
+                android:scaleType="fitCenter"
+                android:src="@drawable/exo_styled_controls_overflow_show" />
+
+        </LinearLayout>
+
+        <!-- 溢出容器：宽度不够时 onLayoutWidthChanged() 会把 basicControls 里的
+             按钮搬进 exo_extra_controls。必须和 exo_basic_controls 同位置叠放
+             （同一个 FrameLayout、同样的 center_vertical|end），否则搬过去的按钮
+             会跑到别的地方。exo_overflow_hide 必须是 exo_extra_controls 的
+             **最后一个** 子 View。 -->
+        <HorizontalScrollView
+            android:id="@id/exo_extra_controls_scroll_view"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center_vertical|end"
+            android:visibility="invisible">
+
+            <LinearLayout
+                android:id="@id/exo_extra_controls"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layoutDirection="ltr">
+
+                <ImageButton
+                    android:id="@id/exo_overflow_hide"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:layout_marginLeft="1dp"
+                    android:layout_marginRight="1dp"
+                    android:background="?android:attr/selectableItemBackground"
+                    android:contentDescription="@string/exo_controls_overflow_hide_description"
+                    android:padding="9dp"
+                    android:scaleType="fitCenter"
+                    android:src="@drawable/exo_styled_controls_overflow_hide" />
+
+            </LinearLayout>
+
+        </HorizontalScrollView>
+
+    </FrameLayout>
+
+    <!-- minimal mode 兜底（容器高 ≤ 144dp 时才会用到，本项目实际到不了）。
+         必须存在：PlayerControlViewLayoutManager 拿它做 isMinimalMode 的
+         显隐切换；exo_minimal_fullscreen 缺了则 minimal 态下没有全屏按钮。
+         初始写 invisible：非 minimal 态下它本来就该隐身，避免 show() 之前的
+         那一帧里它压在底部按钮行右下角。 -->
+    <LinearLayout
+        android:id="@id/exo_minimal_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginBottom="@dimen/exo_styled_minimal_controls_margin_bottom"
+        android:gravity="center_vertical"
+        android:layoutDirection="ltr"
+        android:orientation="horizontal"
+        android:visibility="invisible">
+
+        <ImageButton
+            android:id="@id/exo_minimal_fullscreen"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginLeft="1dp"
+            android:layout_marginRight="1dp"
+            android:background="?android:attr/selectableItemBackground"
+            android:contentDescription="@string/exo_controls_fullscreen_enter_description"
+            android:padding="9dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/exo_styled_controls_fullscreen_enter" />
+
+    </LinearLayout>
+
+    <!-- 顶部控制容器：本项目沉浸式预览不要标题栏，所以里面只留 media3 要求的
+         投屏按钮占位（GONE）。整个 LinearLayout 因此测量成 0×0，不会遮住右上角
+         的关闭按钮。
+         不能删：PlayerControlView.setMediaRouteButtonViewProvider() 找不到
+         exo_media_route_button_placeholder 会直接抛 IllegalStateException，
+         这是 media3 里唯一没有 null 保护的 findViewById。 -->
+    <LinearLayout
+        android:id="@id/exo_top_controls"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:background="@android:color/transparent">
+
+        <View
+            android:id="@id/exo_media_route_button_placeholder"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:visibility="gone" />
+
+    </LinearLayout>
+
+    <!-- 右上角关闭按钮：半透黑底圆 + 白色 ×，随控制条一起显示/隐藏。
+         id 不能改：Kotlin 侧 findViewById<ImageButton>(R.id.ufi_preview_close)
+         绑定关闭回调。
+         声明在最后 ⇒ FrameLayout 逆序命中测试里它在最上层、优先吃点击；
+         位置在 top|end，与底部区块（bottom）天然不重叠，
+         上方唯一的邻居 exo_top_controls 是 0×0，也挡不住它。 -->
+    <ImageButton
+        android:id="@+id/ufi_preview_close"
+        android:layout_width="44dp"
+        android:layout_height="44dp"
+        android:layout_gravity="top|end"
+        android:layout_margin="10dp"
+        android:background="@drawable/ufi_close_bg"
+        android:contentDescription="关闭"
+        android:padding="10dp"
+        android:scaleType="centerInside"
+        android:src="@drawable/ufi_ic_close" />
+
+</FrameLayout>
