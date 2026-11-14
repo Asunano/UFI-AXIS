@@ -629,13 +629,98 @@ function scanFieldLeaks() {
   return hits.sort((a, b) => a.file.localeCompare(b.file))
 }
 
+/**
+ * 2026-10-05 R4-12 修复：Kotlin contract 清单（Endpoints.kt）↔ 客户端差集检查。
+ *
+ * 背景：Endpoints.kt 文件头自述「以本清单为权威」，但此前校验器只查「TS/文档 vs core
+ * 运行时路由」这一层，**谁都不检查 Endpoints.kt 本身**——TS 251 条端点里 36 条在
+ * Kotlin 清单无对应常量，清单必然持续腐烂。
+ *
+ * 口径：把 Endpoints.kt 的 `const val` 值展开（含 `$BASE` / `$API` 前缀拼接）成路径集合，
+ * 与「web + app 实际引用的端点」比对。路径参数已由 norm() 归一化，两端写法差异被抹平。
+ * Kotlin 侧多出的「仅前缀」条目（文件头自述的豁免规则）不报。
+ *
+ * P1（非 P0）：清单腐烂不立刻破坏运行时，但「以 Endpoints.kt 为真源」的约定失效本身
+ * 是契约机制的结构性缺口，需要显式可见。
+ */
+function scanKtContractDrift(web, app) {
+  const ktFile = join(ROOT, 'core', 'contract', 'src', 'main', 'kotlin', 'com', 'ufi_axis_core', 'contract', 'Endpoints.kt')
+  if (!existsSync(ktFile)) return { ktPaths: new Set(), ktOnly: [], clientOnly: [] }
+
+  const text = stripComments(readFileSync(ktFile, 'utf8'))
+
+  // 1. 按嵌套 object 作用域收集 `const val`。
+  //    必须分作用域：每个 object 都有自己的 `BASE`（`Alerts.BASE` / `Files.BASE` …），
+  //    平铺成一张表会让后面的 BASE 覆盖前面的，`$BASE/xxx` 全部错解析到同一前缀。
+  const consts = new Map() // "Scope.Sub.NAME" -> literal
+  const scope = []
+  for (const line of text.split('\n')) {
+    const objM = line.match(/^\s*object\s+(\w+)\s*\{/)
+    const constM = line.match(/^\s*const\s+val\s+(\w+)\s*(?::\s*\w+)?\s*=\s*"([^"]*)"/)
+    if (constM) {
+      consts.set([...scope, constM[1]].join('.'), constM[2])
+    }
+    if (objM) {
+      scope.push(objM[1])
+      continue
+    }
+    // 作用域因 `}` 收窄：本文件缩进严格（4 空格/层），用缩进还原嵌套深度
+    const indentObj = line.match(/^(\s*)\}/)
+    if (indentObj && scope.length) {
+      const depth = Math.floor(indentObj[1].length / 4)
+      while (scope.length > depth) scope.pop()
+    }
+  }
+
+  // 2. 展开 `$XXX`：先查当前作用域链（内层优先），再查根 `Endpoints` 作用域。
+  const resolve = (raw, scopePath) => {
+    let out = raw
+    for (let i = 0; i < 6; i++) {
+      let changed = false
+      const parts = scopePath.split('.')
+      out = out.replace(/\$(\w+)/g, (_, name) => {
+        changed = true
+        for (let d = parts.length; d >= 0; d--) {
+          const key = [...parts.slice(0, d), name].join('.')
+          if (consts.has(key)) return consts.get(key)
+        }
+        return name.toLowerCase()
+      })
+      if (!changed) break
+    }
+    return out
+  }
+  const ownerOf = (key) => key.split('.').slice(0, -1).join('.')
+  const ktPaths = new Set()
+  for (const [key] of consts) {
+    // WS_REALTIME 是 WebSocket 通道（ws:// 直连），不是 HTTP 端点，
+    // 客户端不会以 HTTP 路径形式引用它 —— 排除出差集比较（2026-10-05 R4-12）。
+    if (key.endsWith('.WS_REALTIME')) continue
+    const p = norm(resolve(consts.get(key), ownerOf(key)))
+    if (isContractPath(p)) ktPaths.add(p)
+  }
+
+  // 3. 客户端引用集合（web + app，均为 norm 后的路径）
+  const clientPaths = new Set([...web.keys(), ...app.keys()])
+
+  // 4. 差集。前缀豁免：Kotlin 侧条目若是客户端路径的段前缀（如 `api/media`），
+  //    按文件头「仅前缀」规则豁免；反向同理。
+  const isPrefix = (short, long) => long.startsWith(short + '/')
+  const ktOnly = [...ktPaths].filter(
+    (kt) => !clientPaths.has(kt) && ![...clientPaths].some((c) => isPrefix(kt, c) || isPrefix(c, kt))
+  )
+  const clientOnly = [...clientPaths].filter(
+    (c) => !ktPaths.has(c) && ![...ktPaths].some((kt) => isPrefix(kt, c) || isPrefix(c, kt))
+  )
+  return { ktPaths, ktOnly: ktOnly.sort(), clientOnly: clientOnly.sort() }
+}
+
 function main() {
 
   const core = parseCore()
   const app = parseApp()
   const web = parseWeb()
   const { found: docs, negative: docsNegative } = parseDocs()
-
 
   const missingInCore = [] // P0：客户端/文档有，core 没有
   const seen = new Set()
@@ -689,6 +774,8 @@ function main() {
   const deviceFieldDiff = diffDeviceFields(parseDeviceFields())
   // core route 里的设备侧字段名字面量（阶段 4.4 起 P0 阻断）
   const fieldLeaks = scanFieldLeaks()
+  // Kotlin Endpoints.kt 清单 ↔ 客户端端点差集（2026-10-05 R4-12）
+  const ktDrift = scanKtContractDrift(web, app)
 
   const result = {
     counts: { core: core.size, app: app.size, web: web.size, docs: docs.size },
@@ -697,6 +784,7 @@ function main() {
     p0_device_fields_drift: deviceFieldDiff,
     p0_goform_field_leaks: fieldLeaks,
     p1_stale_negative: staleNegative.sort((a, b) => a.localeCompare(b)),
+    p1_kt_contract_drift: ktDrift,
     info_ws_unsubscribed: wsUnsubscribed,
     info_unused_in_core: unusedInCore.sort((a, b) => a.path.localeCompare(b.path)),
   }
@@ -761,6 +849,23 @@ function main() {
       console.log('  （无）')
     } else {
       for (const p of result.p1_stale_negative) console.log(`  - /${p}`)
+    }
+    console.log('')
+    console.log(`【P1】Kotlin Endpoints.kt 清单漂移（2026-10-05 R4-12）`)
+    const ktDrift = result.p1_kt_contract_drift
+    console.log(
+      `  清单=${ktDrift.ktPaths.size} 条；客户端引用未登记 ${ktDrift.clientOnly.length} 条；清单孤儿 ${ktDrift.ktOnly.length} 条`
+    )
+    if (ktDrift.clientOnly.length) {
+      console.log('  —— 客户端在用但 Endpoints.kt 未登记（按「本次改到的端点必须走 contract」应补齐）：')
+      for (const p of ktDrift.clientOnly.slice(0, 60)) console.log(`    - /${p}`)
+      if (ktDrift.clientOnly.length > 60) {
+        console.log(`    ... 其余 ${ktDrift.clientOnly.length - 60} 条省略（用 --json 查看全部）`)
+      }
+    }
+    if (ktDrift.ktOnly.length) {
+      console.log('  —— 清单里有但没有任何客户端引用（确认后删除或标注「仅前缀」豁免）：')
+      for (const p of ktDrift.ktOnly.slice(0, 40)) console.log(`    - /${p}`)
     }
     console.log('')
     console.log(`【提示】core 存在但无任何端引用（${result.info_unused_in_core.length}）`)

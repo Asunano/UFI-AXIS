@@ -219,19 +219,18 @@ theme/
 > **现行模型（Material 共享轴 + 深度 / Android 预测性返回的标准做法）**：
 > - **进场页**：只平移，**不缩放、不圆角、不投影**，始终满屏铺满 ⇒ 任何时刻都盖住下层，
 >   缝无从出现，同时省掉最贵的两项；
-> - **离场页**（在下层、被进场页覆盖）：`scale 1 → 0.96` + `scrim` 淡入到 12%，
->   深度感由"下层后退变暗"提供；
-> - pop 方向整套反向：回到的上级页 `0.96 → 1` + scrim 淡出，被关掉那页只平移出屏。
+> - **离场页**（在下层、被进场页覆盖）：只叠 `scrim` 淡入到 30%，深度感由"下层后退变暗"提供；
+>   不再缩放（`scale` 曾是预测性返回掉帧与首帧飞角的根因，2026-09-13 移除）；
+> - pop 方向整套反向：回到的上级页 scrim 淡出，被关掉那页只平移出屏。
 
 | 想改 | 文件 : 行 | 符号 | 影响面 |
 |---|---|---|---|
-| **时长 / 总开关** | `navigation/Navigation.kt` | `ufiNavTransitionDurationMs(rawMs, systemReduceMotion)` | **唯一来源**。把 `ThemeManager.transitionDurationMs`（150~600，`0`=关闭）与系统降低动效合并成一个数：`>0` 是 tween 时长，`0` ⇒ 平移/后退缩放/scrim **一并**不生效。`-1`（未播种哨兵）回落默认档而不是"关闭" |
-| 曲线 | 同上 | `ufiNavTransitionSpec<T>(durationMillis)` | 平移、淡入、后退进度共用它 ⇒ 不会出现"位移停了 scrim 还在淡"。曲线 = `Easing.Standard` |
-| 进度 | 同上 | `ufiNavRecedeLayer` 里的 `transition.animateFloat` | 挂在 NavHost 的 `Transition<EnterExitState>` 上，**可被可预测性手势返回逐帧 seek**。⚠ 不要改成 `animateXxxAsState` —— 那是第二个时长来源（P2c 修过的漂移） |
-| 幅度映射 | 同上 | `UfiNavRecedeProfile`（纯函数） | 只剩 `recedingScale` / `scrimAlpha`。纯 JVM 可测，见 `UfiNavRecedeProfileTest` |
-| 角色判定（谁是**下层**） | `navigation/Navigation.kt` | `UfiNavRecedeRole.recedingEntryId`，由 `detailExit`（push ⇒ `initialState.id`）/ `detailPopEnter`（pop ⇒ `targetState.id`）写入；图层侧 `ufiNavRecedeLayer(isReceding = …)` 比对 id | ⚠ **不要改回 `navController.visibleEntries` 栈顶**（2026-09-05 P0 修）。`populateVisibleEntries()` 先收 `transitionsInProgress` 里 `maxLifecycle < STARTED` 的 entry（含已出栈、正在跑退场动画的那页）再收 `backQueue`，所以 `.last()` 的语义是「**进场页**」而不是「前景页」—— pop 时进场页恰恰是下层 ⇒ 角色判反，返回动画里 detail 吃缩放+scrim、宿主完全不动。也**不要**改用 `PostExit`（那是「离场页」，pop 方向同样错）。「下层」必须由**方向**决定，而方向就藏在「哪一组转场函数被调用」里。持有者刻意是普通 `var`（非 `MutableState`）⇒ 只在 `graphicsLayer` / `drawWithContent` 的 lambda 里读，零重组 |
-| 缩放幅度 | `MotionTokens.kt:309`（`NavRecede`） | `ScaleTo 0.96:316` | 只作用于**离场页**。整屏量级只能落在 0.94~0.97（面积越大缩得越少，与 `PressScale` 同一条规律）。⚠ **不要再加"进场页缩放"档位**（原 `CardScaleFrom 0.94` 已删）—— 见本节开头第 2 条 |
-| 离场页遮罩浓度 | `MotionTokens.kt:324` | `NavRecede.ScrimAlpha = 0.12f`，色取 `palette.scrim` | 只取峰值 0.12：scrim 原强度是弹窗遮罩（黑 35%/50%），整屏用原值会让返回过程中下层黑成一片。scrim 画在**同一条 modifier 链**的 `drawWithContent` 里（不另起 `Box` + `background`，那样多一个 layout 节点与一层绘制） |
+| **时长 / 总开关** | `navigation/Navigation.kt` | `ufiNavTransitionDurationMs(rawMs, systemReduceMotion)` | **唯一来源**。把 `ThemeManager.transitionDurationMs`（150~600，`0`=关闭）与系统降低动效合并成一个数：`>0` 是 tween 时长，`0` ⇒ 平移/scrim **一并**不生效。`-1`（未播种哨兵）回落默认档而不是"关闭" |
+| 曲线 | 同上 | `sharedAxisSpec`（内部 `tween(Easing.Standard)`） | 平移 / 后退进度共用它 ⇒ 不会出现"位移停了 scrim 还在淡"。曲线 = `Easing.Standard` |
+| 进度 | 同上 | `ufiSharedAxisLayer` 里的 `transition.animateFloat` | 挂在 NavHost 的 `Transition<EnterExitState>` 上，**可被可预测性手势返回逐帧 seek**。⚠ 不要改成 `animateXxxAsState` —— 那是第二个时长来源（P2c 修过的漂移） |
+| 幅度映射 | 同上 | `sharedAxisScrimAlpha()`（取 `MotionTokens.NavRecede.ScrimAlpha`） | scrim 幅度内联进 `ufiSharedAxisLayer`；时长见 `UfiNavTransitionDurationTest` |
+| 角色判定（谁是**下层**） | `navigation/Navigation.kt` | `UfiNavRecedeRole.recedingEntryId`，由 `detailSharedAxisExit`（push ⇒ `initialState.id`）/ `detailSharedAxisPopEnter`（pop ⇒ `targetState.id`）写入；图层侧 `ufiSharedAxisLayer(isReceding = …)` 比对 id | ⚠ **不要改回 `navController.visibleEntries` 栈顶**（2026-09-05 P0 修）。`populateVisibleEntries()` 先收 `transitionsInProgress` 里 `maxLifecycle < STARTED` 的 entry（含已出栈、正在跑退场动画的那页）再收 `backQueue`，所以 `.last()` 的语义是「**进场页**」而不是「前景页」—— pop 时进场页恰恰是下层 ⇒ 角色判反，返回动画里 detail 吃缩放+scrim、宿主完全不动。也**不要**改用 `PostExit`（那是「离场页」，pop 方向同样错）。「下层」必须由**方向**决定，而方向就藏在「哪一组转场函数被调用」里。持有者刻意是普通 `var`（非 `MutableState`）⇒ 只在 `graphicsLayer` / `drawWithContent` 的 lambda 里读，零重组 |
+| 离场页遮罩浓度 | `MotionTokens.kt`（`NavRecede.ScrimAlpha`） | `NavRecede.ScrimAlpha = 0.30f`，色取 `palette.scrim` | 峰值 0.30（原 0.12 在真机几乎看不出压暗，被不透明进场页进一步遮住，用户报"完全没暗的效果"，2026-09-13 提到 0.30）。scrim 画在**同一条 modifier 链**的 `drawWithContent` 里（不另起 `Box` + `background`，那样多一个 layout 节点与一层绘制） |
 
 ### 1.15 间距
 

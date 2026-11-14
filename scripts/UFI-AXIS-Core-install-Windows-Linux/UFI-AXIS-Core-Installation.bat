@@ -15,6 +15,12 @@ set "KNOWN_PKG=com.ufi_axis_core"
 set "TMPOUT=%TEMP%\ufiaxis_out.txt"
 set "TMPBEFORE=%TEMP%\ufiaxis_pkgs_before.txt"
 set "TMPAFTER=%TEMP%\ufiaxis_pkgs_after.txt"
+rem 给 PowerShell 用的同名环境变量：路径不能直接插进 PS 的单引号字符串，
+rem 用户名含撇号（如 C:\Users\O'Brien\...）会让字符串提前闭合、解析失败，
+rem 报错还被 2^>nul 吞掉，表现成「未能自动识别包名」
+set "UFI_TMPOUT=%TMPOUT%"
+set "UFI_TMPBEFORE=%TMPBEFORE%"
+set "UFI_TMPAFTER=%TMPAFTER%"
 
 rem ======== 日志：直接写文件，不再用 PowerShell 管道包装（管道会吞掉交互提示）========
 if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
@@ -140,7 +146,7 @@ for %%c in (%KNOWN_PKG%) do (
     )
 )
 if defined NEWPKG goto pkg_done
-for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$b=@(); if (Test-Path -LiteralPath '%TMPBEFORE%') { $b=@(Get-Content -LiteralPath '%TMPBEFORE%' | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'package:*' }) }; if ($b.Count -gt 0 -and (Test-Path -LiteralPath '%TMPAFTER%')) { Get-Content -LiteralPath '%TMPAFTER%' | ForEach-Object { $_.Trim() } | Where-Object { $_ -and ($b -notcontains $_) } | ForEach-Object { $_ -replace '^package:','' } | Select-Object -First 1 }" 2^>nul`) do set "NEWPKG=%%a"
+for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "$b=@(); if (Test-Path -LiteralPath $env:UFI_TMPBEFORE) { $b=@(Get-Content -LiteralPath $env:UFI_TMPBEFORE | ForEach-Object { $_.Trim() } | Where-Object { $_ -like 'package:*' }) }; if ($b.Count -gt 0 -and (Test-Path -LiteralPath $env:UFI_TMPAFTER)) { Get-Content -LiteralPath $env:UFI_TMPAFTER | ForEach-Object { $_.Trim() } | Where-Object { $_ -and ($b -notcontains $_) } | ForEach-Object { $_ -replace '^package:','' } | Select-Object -First 1 }" 2^>nul`) do set "NEWPKG=%%a"
 :pkg_done
 if defined NEWPKG goto pkg_ok
 set /p "NEWPKG=未能自动识别包名，请手动输入（直接回车跳过）: "
@@ -153,38 +159,48 @@ if not defined NEWPKG goto skip_pkg_ops
 
 rem 先授权再启动：首启缺权限时应用可能弹系统授权框，导致启动流程卡住
 call :say "[5/6] 正在授予权限 ..."
-for %%p in (
-    READ_EXTERNAL_STORAGE
-    WRITE_EXTERNAL_STORAGE
-    MANAGE_EXTERNAL_STORAGE
-    ACCESS_FINE_LOCATION
-    ACCESS_COARSE_LOCATION
-    READ_PHONE_STATE
-    READ_SMS
-    RECEIVE_SMS
-    RECEIVE_MMS
-    READ_CELL_BROADCASTS
-    POST_NOTIFICATIONS
-    REQUEST_INSTALL_PACKAGES
-) do (
-    set "ST=FAIL"
-    "%ADB%" -s !ADDR! shell pm grant !NEWPKG! android.permission.%%p >nul 2>&1
-    if not errorlevel 1 (
-        set "ST=OK"
-    ) else (
-        "%ADB%" -s !ADDR! shell appops set !NEWPKG! %%p allow >nul 2>&1
-        if not errorlevel 1 set "ST=OK"
-    )
-    if "!ST!"=="OK" (call :say "    [OK] %%p") else (call :say "    [--] %%p 未自动授权")
+rem 读设备 API level，用于跳过本机不适用的权限；读不到就全部逐项尝试。
+rem exec-out 不分配 pty，输出不会被转成 CRLF，省去清洗 \r。
+set "SDK="
+"%ADB%" -s !ADDR! exec-out getprop ro.build.version.sdk >"%TMPOUT%" 2>nul
+for /f "usebackq tokens=1 delims= " %%s in ("%TMPOUT%") do if not defined SDK set "SDK=%%s"
+echo(!SDK!| findstr /R "^[0-9][0-9]*$" >nul 2>&1
+if errorlevel 1 set "SDK="
+if defined SDK (
+    call :say "       设备 API level: !SDK!"
+) else (
+    call :say "       [提示] 读取设备 API level 失败，将逐项尝试全部权限"
 )
+rem 清单与 core 的 AndroidManifest 对齐（core 加了新权限必须同步这里，
+rem 否则装完是「装上了但功能用不了」）。给 core 没声明的权限做 grant 是无效动作。
+rem 每项格式：权限名:minSdk:maxSdk:方式[:appops 名]
+for %%e in (
+    "READ_EXTERNAL_STORAGE:0:32:grant"
+    "WRITE_EXTERNAL_STORAGE:0:29:grant"
+    "MANAGE_EXTERNAL_STORAGE:30:999:appop"
+    "READ_MEDIA_IMAGES:33:999:grant"
+    "READ_MEDIA_VIDEO:33:999:grant"
+    "READ_MEDIA_AUDIO:33:999:grant"
+    "ACCESS_FINE_LOCATION:0:999:grant"
+    "ACCESS_COARSE_LOCATION:0:999:grant"
+    "READ_PHONE_STATE:0:999:grant"
+    "READ_PHONE_NUMBERS:0:999:grant"
+    "SEND_SMS:0:999:grant"
+    "READ_SMS:0:999:grant"
+    "POST_NOTIFICATIONS:33:999:grant"
+    "REQUEST_INSTALL_PACKAGES:0:999:appop"
+    "PACKAGE_USAGE_STATS:0:999:appop:GET_USAGE_STATS"
+    "SCHEDULE_EXACT_ALARM:31:999:appop"
+) do call :grant_one %%e
 call :say "[完成] 权限授予完成。"
-call :say "提示: 如系统设置中仍有权限显示未开启，可手动允许。"
+call :say "提示: 标 [跳过] 的是本机 API 不适用（正常）；标 [--] 的才是没授上，可在系统设置里手动允许。"
 call :say ""
+
 
 call :say "正在启动应用 !NEWPKG! ..."
 set "LAUNCH_COMP="
 "%ADB%" -s !ADDR! shell cmd package resolve-activity --brief !NEWPKG! >"%TMPOUT%" 2>&1
-for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "if (Test-Path -LiteralPath '%TMPOUT%') { Get-Content -LiteralPath '%TMPOUT%' | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[A-Za-z0-9_.]+/' } | Select-Object -First 1 }" 2^>nul`) do set "LAUNCH_COMP=%%a"
+for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "if (Test-Path -LiteralPath $env:UFI_TMPOUT) { Get-Content -LiteralPath $env:UFI_TMPOUT | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^[A-Za-z0-9_.]+/' } | Select-Object -First 1 }" 2^>nul`) do set "LAUNCH_COMP=%%a"
 if not defined LAUNCH_COMP goto launch_monkey
 "%ADB%" -s !ADDR! shell am start -n !LAUNCH_COMP! >"%TMPOUT%" 2>&1
 call :dump "%TMPOUT%"
@@ -275,6 +291,63 @@ pause
 exit /b 1
 
 rem ======== 子过程 ========
+rem 授予单条权限。参数格式：权限名:minSdk:maxSdk:方式[:appops 名]
+rem   grant = 先 pm grant，失败再回退 appops
+rem   appop = 只走 appops（MANAGE_EXTERNAL_STORAGE / REQUEST_INSTALL_PACKAGES /
+rem           PACKAGE_USAGE_STATS / SCHEDULE_EXACT_ALARM 这类 appop 控制的权限，
+rem           pm grant 对它们必然失败，直接走 appops 少一次无效调用和一条误导日志）
+rem   appops 名默认与权限名相同，例外：PACKAGE_USAGE_STATS 的 appop 叫 GET_USAGE_STATS
+:grant_one
+set "GP_P="
+set "GP_MIN="
+set "GP_MAX="
+set "GP_MODE="
+set "GP_OP="
+for /f "tokens=1,2,3,4,5 delims=:" %%a in ("%~1") do (
+    set "GP_P=%%a"
+    set "GP_MIN=%%b"
+    set "GP_MAX=%%c"
+    set "GP_MODE=%%d"
+    set "GP_OP=%%e"
+)
+if not defined GP_OP set "GP_OP=!GP_P!"
+if defined SDK (
+    if !SDK! LSS !GP_MIN! (
+        call :say "    [跳过] !GP_P!（设备 API !SDK! 低于 !GP_MIN!，本机无此权限）"
+        goto :eof
+    )
+    if !SDK! GTR !GP_MAX! (
+        call :say "    [跳过] !GP_P!（设备 API !SDK! 高于 !GP_MAX!，该权限已被取代）"
+        goto :eof
+    )
+)
+set "GP_ST=FAIL"
+if /i "!GP_MODE!"=="grant" (
+    "%ADB%" -s !ADDR! shell pm grant !NEWPKG! android.permission.!GP_P! >"%TMPOUT%" 2>&1
+    call :cmd_ok "%TMPOUT%"
+    if not errorlevel 1 set "GP_ST=OK"
+)
+if not "!GP_ST!"=="OK" (
+    "%ADB%" -s !ADDR! shell appops set !NEWPKG! !GP_OP! allow >"%TMPOUT%" 2>&1
+    call :cmd_ok "%TMPOUT%"
+    if not errorlevel 1 set "GP_ST=OK"
+)
+if "!GP_ST!"=="OK" (
+    call :say "    [OK] !GP_P!"
+) else (
+    call :say "    [--] !GP_P! 未自动授权"
+    call :logonly "%TMPOUT%"
+)
+goto :eof
+
+rem 判定设备侧命令是否成功：返回 0 成功、1 失败。
+rem 不能看 adb 的退出码 —— 那是 adb 客户端的，设备侧 pm/appops 失败时它照样是 0。
+rem pm grant / appops set 成功时没有输出，失败才打印异常文本，所以按输出判定。
+:cmd_ok
+findstr /I /C:"Exception" /C:"Error" /C:"Failure" /C:"not allowed" /C:"Unknown" /C:"denied" "%~1" >nul 2>&1
+if errorlevel 1 exit /b 0
+exit /b 1
+
 :say
 setlocal disabledelayedexpansion
 echo(%~1

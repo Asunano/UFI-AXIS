@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <strong>把随身 WiFi / CPE 变成一台可远程管理的设备：设备侧后端 + Compose 手机端 + 浏览器面板</strong>
+  <strong>把随身 WiFi / CPE 变成一台可远程管理的随身服务器：设备侧后端 + Compose 手机端 + 浏览器面板</strong>
 </p>
 
 <p align="center">
@@ -31,9 +31,9 @@
 
 **UFI-AXIS** 不是「App 直连设备网页」的工具，而是一套 **上位机系统**：把一个 Ktor 后端服务（`:core`）装进随身 WiFi 设备自身的 Android 系统里常驻运行，由它统一对接 goform 协议、AT 指令与本机 `/proc`、`/sys`，再通过 HTTP + WebSocket 把统一后的数据与控制能力交给两个客户端。
 
-- **`:core`（`com.ufi_axis_core`）** — 运行在设备上的后端 APK。Ktor Netty 监听 `0.0.0.0:8088`，负责采集、告警、调度、设备控制、文件/下载/内网穿透，并内置浏览器面板静态资源。
-- **`:app`（`com.ufi_axis`）** — 手机端 App，100% Jetpack Compose，5 个主 Tab + 约 55 条二级路由，自带完整设计系统与自研页面切换器。
-- **`web/`** — Vue 3 单页面板，构建产物随 `:core` APK 打包进 `assets/web`，也可脱离 APK 单独 OTA 更新。
+- **`:core`（`com.ufi_axis_core`）** — 运行在设备上的后端 APK。Ktor Netty 监听 `0.0.0.0:8088`，负责采集、告警、调度、设备控制、文件/媒体/下载/内网穿透，并内置浏览器面板静态资源。
+- **`:app`（`com.ufi_axis`）** — 手机端 App，100% Jetpack Compose，底部 Dock 5 个主入口 + 大量二级路由，自带完整设计系统与自研页面切换器。
+- **`web/`** — Vue 3 单页面板，构建产物随 `:core` APK 打包进 `assets/web`，也可脱离 APK 单独 OTA 更新（PWA）。
 
 三端共享一份冻结契约（`core/contract`），并由 CI 脚本守门，避免「改了一侧忘了另一侧」。
 
@@ -61,18 +61,17 @@
 - **会话自治**：session 缓存 90s、定期校验、登录失败指数退避（上限 10s）；检测到官方后台占用 session 时主动让位 30s
 - **批量读取与限流**：`multi_data=1` 一次取多字段，外加并发许可 + 短时查询快照，避免把设备 CPU 打满；响应编码错误自动回退 GBK，截断响应会被识别并失效缓存
 - **AT 透传**：`sendat` 二进制经 Binder IPC 下发（展锐平台），带最小指令间隔与连续失败熔断
-- **设备适配层**：`core/device-schema` 用 `DeviceProfile` + `FieldSpec` 声明字段组、解码器与敏感级别，新机型只加一份 profile
-
+- **设备适配层**：`core/device-schema` 用 `DeviceProfile` + `FieldSpec` 声明字段组、解码器与敏感级别；设备协议实现已下沉为可插拔插件，新机型只加一份 profile
 
 ### 2. 连接感知的采集调度
 
-`DataScheduler` 用 8 条并发协程分别负责 CPU/内存、信号+流量、月流量、短信、电池、设备事件、本地告警扫描、旧数据清理。
+`DataScheduler` 用并发协程分别负责 CPU/内存、信号+流量、月流量、短信、电池、设备事件、本地告警扫描、旧数据清理。
 
 | 采集项 | 有客户端连接 | 无连接 |
 |--------|------------|--------|
 | CPU / 内存 | 自适应 ~1.5–4.5s（基准 3s） | 60s |
 | 信号 + 流量（合并为 1 次 goform 查询） | 自适应 ~1.5–4.5s | 60s |
-| 月流量 | 15s | 15s |
+| 月流量（按小时入库，按日/周/月/年出桶） | 15s | 15s |
 | 短信 | 5s | 15s |
 | 电池 | 30s | 30s |
 | 在线设备变更 | 60s | 60s |
@@ -80,13 +79,12 @@
 
 - **自适应间隔**：按 shell / goform 实时负载在基准值的 0.5–1.5 倍之间浮动
 - **冷热解耦**：采集是否运行只看监控总开关；是否广播只看 WebSocket 连接数——前端断开只停推送、不停记录
-- **写入合并**：5 个内存缓冲每 30s 合并为**一个** Room 事务落盘（WAL 模式）
-- **两级响应缓存**：设备读取与最终 JSON 各有一层 LRU + TTL 缓存，同 key 并发只打设备一次；服务停止后只回旧值、不再打设备
-
+- **写入合并**：内存缓冲定期合并为**单个** Room 事务落盘（WAL 模式）；流量按小时聚合，出桶查询不再扫描原始明细
+- **两级响应缓存**：设备读取与最终 JSON 各有一层 LRU + TTL 缓存，同 key 并发只打设备一次
 
 ### 3. 不会变成通知风暴的告警引擎
 
-`AlertEngine` 支持 8 类告警，全部走「边沿触发 + 聚合累加」。
+`AlertEngine` 支持 9 类告警，全部走「边沿触发 + 聚合累加」。
 
 | 类型 | 触发条件 | 默认阈值（warning / critical） |
 |------|---------|------------------------------|
@@ -97,6 +95,7 @@
 | `signal` | RSRP | -100 dBm / -115 dBm |
 | `connectivity` | 外网可达性变化 | 状态机，无阈值 |
 | `device_online` / `device_offline` | WiFi 客户端上下线 | 无 |
+| `plan_expiry` | 套餐到期（fixed 累计有效期模式） | 日历提醒 |
 
 - **边沿触发**：级别未跃迁不产生新记录；跌回正常标记 `resolved`，不再插行
 - **连通性确认窗**：新状态需连续保持 **60s** 才判定，杜绝 WiFi 抖动刷屏；判据是外网真实可达（`NET_CAPABILITY_VALIDATED`），不是 modem 注册态
@@ -106,13 +105,11 @@
 
 ### 4. 邮件通知（SMTP 在设备侧）
 
-告警、短信、验证码、流量预警、下载完成、隧道异常等 **8 个场景**各有独立开关与模板，由设备侧直发 SMTP：465 端口走 SSL、587 走 STARTTLS，投递期间只短暂持有带超时的 WakeLock。场景开关的唯一真源在 `:core`，App 只负责展示与上报。
+告警、短信、验证码、流量预警/报告、下载完成、隧道异常等场景各有独立开关与模板，由设备侧直发 SMTP：465 端口走 SSL、587 走 STARTTLS，投递期间只短暂持有带超时的 WakeLock。场景开关的唯一真源在 `:core`，App 只负责展示与上报。
 
 - 邮件模板 HTML + 纯文本双份，不引用任何外部字体与图片（兼容 Outlook / Gmail，也不泄露阅读行为）
-- 验证码提取需先命中提示词（验证码/校验码/动态码/口令/code/OTP）才抓 4–8 位数字，避免把「余额 123456」当成验证码
-- **投递记录是三态**：每次投递逐条留档为「已发出 / 没发出 / 已跳过」，跳过带中文原因（免打扰、场景未勾选、级别不够、配额用尽）。失败数与跳过数分开统计、不相加。App 与 Web 控制台都能按渠道查看、筛选与清空
-
-
+- 验证码提取需先命中提示词（验证码/校验码/动态码/口令/code/OTP）才抓 4–8 位数字
+- **投递记录是三态**：每次投递逐条留档为「已发出 / 没发出 / 已跳过」，跳过带中文原因（免打扰、场景未勾选、级别不够、配额用尽）。失败数与跳过数分开统计、不相加
 
 ### 5. 设备身份认证
 
@@ -120,16 +117,16 @@
 
 ### 6. 实时推送与后台通知
 
-- **WebSocket**：`/ws/realtime`，握手必须带签名参数；按频道订阅，未订阅的不推。**最大连接数 4**（App 与 Web 共享）——每多一个连接设备侧采集就会提速，不设上限等于给低端设备无限加压；超限以 1013 关闭并允许退避重连
+- **WebSocket**：`/ws/realtime`，握手必须带签名参数；按频道订阅，未订阅的不推。**最大连接数 4**（App 与 Web 共享）——超限以 1013 关闭并允许退避重连
 - **独立通知进程**：App 内 `:ufi_notify` 第二进程只跑通知分发与保活，不加载 Compose 与 ViewModel。去重游标的单写者在此进程，不会一条告警响两次
 - **场景化通知**：`NotifyScene` 枚举统一管开关 / 限频 / 免打扰 / channel（告警可突破免打扰、短信与验证码静默、下载与流量预警走各自 channel）
-- **兜底而非常驻**：后台守护是 WorkManager 周期任务（15/30/60 分钟，带联网约束，开关全关时零网络开销）；及时性依赖设备侧事件驱动，不靠周期闹钟或常驻 WakeLock 硬扛
+- **兜底而非常驻**：后台守护是 WorkManager 周期任务（15/30/60 分钟，带联网约束，开关全关时零网络开销）
 
 ### 7. 一套自建设计系统
 
-App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动态取色，主题与动效令牌各有单一真源，54 个 `Ufi*` 共享组件，以及一个自研页面切换器（支持横滑手势、可打断、可反向，6 种内置转场）。
+App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动态取色，主题与动效令牌各有单一真源，70+ 个 `Ufi*` 共享组件，以及一个自研页面切换器（支持横滑手势、可打断、可反向，6 种内置转场）。
 
-两个用来防腐的机制：**组件画廊**（设置 → 外观 → 组件画廊，可切明暗预览，专门暴露「没跟随主题变」和「同类组件不一致」）；**字面量基线**（Gradle 任务 `checkLiteralBaseline` 统计非 theme 源码里的裸 `dp` / `Color(0x…)` / `sp` / `tween(数字)`，与 `config/literal-baseline.properties` 比对，只允许降不允许升）。
+两个用来防腐的机制：**组件画廊**（设置 → 外观 → 组件画廊，可切明暗预览）；**字面量基线**（Gradle 任务 `checkLiteralBaseline` 统计非 theme 源码里的裸 `dp` / `Color(0x…)` / `sp` / `tween(数字)`，与 `config/literal-baseline.properties` 比对，只允许降不允许升）。
 
 改主题去哪改，见 `docs/app-theme-token-index.md`。
 
@@ -138,38 +135,44 @@ App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动�
 
 ## 功能特性
 
-### 手机端（5 个主 Tab）
+### 手机端（底部 Dock 5 个主入口）
 
-| Tab | 主要能力 |
+| 入口 | 主要能力 |
 |-----|---------|
-| **仪表盘** | 连接状态卡、设备信息、实时指标卡与指标详情、网络明细图表 |
-| **网络** | 网络模式切换、频段锁定、小区锁定、蜂窝高级参数、在线设备列表、WiFi / DHCP 设置 |
+| **仪表盘** | 连接状态卡、设备信息、实时指标卡与指标详情、网络明细图表、天气与每日一言挂件 |
 | **监控** | 实时曲线与概览、事件中心、聚合事件视图、数据导出，以及 6 组监控设置（采集 / 指标 / 图表 / 行为 / 调度 / 存储） |
+| **网络** | 网络模式切换、频段锁定、小区锁定、蜂窝高级参数、在线设备列表、WiFi / DHCP 设置、流量限额与流量历史 |
 | **工具** | 高级控制台、测速、流量管理与限额、定时任务与自动化规则、内网穿透（frp / Cloudflare）、调试日志 |
 | **我的** | 服务端与配对配置、通知与守护、告警设置、每日报告、邮件通知、外观设置、设备控制、数据管理、诊断、关于 |
 
-另有文件管理（含文本编辑器 / 图片查看 / Media3 播放）、下载管理（任务 + 限速 + Tracker + 高级设置）、短信会话、应用管理等页面，从 Tab 内部进入。
+另有**媒体中心**（音乐 / 视频 / 图片三库，锁屏与通知栏控制、退出界面继续播放、播放队列持久化、歌词与歌单、视频字幕与缩略图）、文件管理（文本编辑器 / 图片查看 / Media3 播放）、下载管理（任务 + 限速 + Tracker + 高级设置）、短信会话、应用管理、启动页与首屏预加载等模块。
 
 ### 设备侧能力（`:core`）
 
 - **网络控制**：网络模式（别名 → goform `BearerPreference` 映射统一走契约层）、LTE/NR 频段锁定、WiFi 设置、DHCP、数据开关
-- **流量治理**：套餐限额、用量统计、到量自动断网守卫
-- **短信**：读取 / 发送 / 会话缓存 / 已读状态 / 验证码提取与定期清理，转发邮件由设备侧事件驱动
-- **定时任务与自动化**：Cron 解析 + 条件引擎 + 10 种动作（`data_toggle` `wifi_toggle` `airplane_toggle` `reboot` `shutdown` `led_toggle` `performance_mode` `roaming_toggle` `network_mode` `custom_shell`）
+- **流量治理**：套餐限额（monthly / fixed 两种模式）、用量统计、到量自动断网守卫、小时级入库与日/周/月/年报表、出网地区判定
+- **短信**：读取 / 发送 / 会话缓存 / 已读状态 / 验证码提取与定期清理、转发规则，转发邮件由设备侧事件驱动
+- **定时任务与自动化**：Cron 解析 + 条件引擎 + **13 种动作**（`data_toggle` `wifi_toggle` `airplane_toggle` `reboot` `shutdown` `led_toggle` `performance_mode` `roaming_toggle` `network_mode` `custom_shell` `speedtest` `remote_backup` `traffic_report`）
+- **测速**：手动 + 定时（Room 历史、结果推送、App/Web/core 三端同步）
+- **媒体服务**：媒体库扫描与分组聚合、音频标签、歌词、字幕、**在线播放票据**（浏览器边下边播并可拖动进度）、视频缩略图抽帧（成功即落盘缓存，避免重复计算）
+- **文件服务**：浏览 / 上传（分片会话、断点续传、进度与取消）/ 下载 / 编辑；远端存储源（FTP / WebDAV / SMB / S3）增删改与连接测试
+- **远程备份**：配置加密备份包推送到远端存储源，滚动保留 7 份
+- **诊断工具集**：ping / DNS / TCP / TTL traceroute（无 root）
+- **真终端**：ttyd PTY + WebSocket 反代（凭票验签、可开关、状态行与手动停止）
 - **下载器**：Aria2 引擎 + 任务管理 + Tracker 列表维护
-- **内网穿透**：frpc 与 cloudflared 双引擎，二进制按 `version.json` 声明的 URL + SHA-256 下发校验安装（当前 frpc `0.71.0`、cloudflared `2026.8.3`）
+- **内网穿透**：frpc 与 cloudflared 双引擎，二进制按 `version.json` 声明的 URL + SHA-256 下发校验安装
 - **应用管理 / ADB / Shell**：包列表与安装卸载、AT 终端、受 QoS 限流的 shell 执行
-- **文件服务**：浏览 / 上传 / 下载 / 编辑
-- **测速与 QoS 配置**、**OTA**：前端 APK、后端 APK 与 Web 面板三条独立更新通道（Web 面板走 ZIP + SHA-256 校验 + 原子覆盖，失败回滚）
+- **OTA**：前端 APK、后端 APK 与 Web 面板三条独立更新通道（Web 面板走 ZIP + SHA-256 校验 + 原子覆盖，失败回滚）
 
 ### 浏览器面板（`web/`）
 
-登录、仪表盘、网络、设备、短信、任务、监控、终端、告警、应用、文件、下载、隧道、设置（8 个子面板）共 14 条路由，全部动态加载。
+登录、仪表盘、网络、设备、短信、任务、监控、媒体、文件、下载、隧道、终端、告警、应用、流量、图库、设置（10 个子面板）等页面，全部动态加载。
 
 - **请求可取消**：`useRequestScope` 收集组件内全部 `AbortController`，卸载时统一 abort；被取消的请求不抛错，而是返回 `{ __canceled: true }`，不会弹误报 toast
-- **切后台自动停轮询**：`visibilitychange` 统一暂停所有活跃轮询，回到前台再恢复——面板留在手机后台标签页时不再持续吃蜂窝流量
+- **切后台自动停轮询**：`visibilitychange` 统一暂停所有活跃轮询，回到前台再恢复——面板留在后台标签页时不再持续吃蜂窝流量
 - **轮询防重入**：慢接口不会堆积并发请求；间隔支持跟随用户设置动态变化
 - **WebSocket 单例**：连接生命周期只由布局层管理，视图只能订阅；指数退避重连（上限 9 次 / 30s），1008 直接放弃并展示原因
+- **PWA + 浏览器通知**：可安装到桌面；Service Worker 对 `/api`、`/ws` 强制 network-only
 - **首屏瘦身**：签名用的椭圆曲线库动态加载、Naive UI 按需引入、echarts 与 vendor 单独分包
 - **严格类型**：`strict` + `noUncheckedIndexedAccess` + `verbatimModuleSyntax`，`vue-tsc` 类型错误即断构建
 
@@ -182,7 +185,7 @@ App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动�
 ```
 ┌──────────────────────┐          ┌──────────────────────┐
 │   手机端 App          │          │   浏览器面板          │
-│  com.ufi_axis        │          │  Vue 3 SPA           │
+│  com.ufi_axis        │          │  Vue 3 SPA (PWA)     │
 │  Compose + :ufi_notify│         │ （内置于 core APK）    │
 └──────────┬───────────┘          └──────────┬───────────┘
            │   HTTP + WebSocket（ECDSA P-256 签名）        │
@@ -205,7 +208,7 @@ App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动�
 ├──────────────────────────────────────────────────────────┤
 │ core:network         Ktor HttpServer + 静态资源 + SPA 兜底   │
 ├──────────────────────────────────────────────────────────┤
-│ core:api             40 组 Routes + DataHub + 鉴权 + 配对    │
+│ core:api             42 组 Routes + DataHub + 鉴权 + 配对    │
 ├──────────────────────────────────────────────────────────┤
 │ core:alert   core:scheduler   core:controller  ← 稳定门面   │
 ├──────────────────────────────────────────────────────────┤
@@ -220,21 +223,20 @@ App 的视觉与交互收敛在 `:app:ui`：6 套预设皮肤 + Android 12+ 动�
 
 ### `:app` 分层
 
-`:app` 是入口壳，实际内容在 5 层：`app:feature-*`（9 个页面模块）→ `app:viewmodel`（`MainViewModel` + module/state 拆分）→ `app:data`（api / repository / model / 通知 / 日志）→ `app:ui`（主题令牌 / 动效 / 共享组件 / 导航骨架）。feature 模块统一依赖 `:app:viewmodel + :app:data + :app:ui`，**不依赖 `:app`**，以避免与入口模块形成循环依赖。5 个主 Tab 也不是 5 个导航目的地，而是收敛进单一宿主目的地内 `UfiPageSwitcher` 的 5 页。
-
+`:app` 是入口壳，实际内容在 5 层：`app:feature-*`（10 个页面模块）→ `app:viewmodel`（`MainViewModel` + module/state 拆分）→ `app:data`（api / repository / model / 通知 / 日志）→ `app:ui`（主题令牌 / 动效 / 共享组件 / 导航骨架）。feature 模块统一依赖 `:app:viewmodel + :app:data + :app:ui`，**不依赖 `:app`**，以避免与入口模块形成循环依赖。5 个主入口不是 5 个导航目的地，而是收敛进单一宿主目的地内 `UfiPageSwitcher` 的 5 页。
 
 ### 数据存储
 
-设备侧 Room 库 `ufi_axis_core.db`（**v8**，WAL 模式），优先落在 `/data/ufiaxis/db`（可写时），否则回退应用私有目录。9 张表：`traffic_records`、`signal_history`、`alert_records`、`sms_records`、`sms_read_state`、`sms_verification_codes`、`cpu_history`、`memory_history`、`battery_history`。5 个显式迁移（3→8）全部保留，不使用破坏性回退。
+设备侧 Room 库 `ufi_axis_core.db`（**v15**，WAL 模式），优先落在 `/data/ufiaxis/db`（可写时），否则回退应用私有目录。15 张表：`traffic_records`、`traffic_hourly`、`signal_history`、`alert_records`、`sms_records`、`sms_read_state`、`sms_verification_codes`、`sms_rule`、`sms_blocked_log`、`cpu_history`、`memory_history`、`battery_history`、`mail_send_records`、`console_history`、`speedtest_history`。全部迁移保留，不使用破坏性回退。
 
 ---
 
 ## 技术栈
 
-- **Kotlin 2.2.10** + Java 17 目标；AGP 9.2.1 + KSP；26 个 Gradle 模块；`minSdk 31` / `targetSdk 36`，release 仅打 `arm64-v8a`
-- **设备侧后端**：Ktor 2.3.12（Netty / WebSockets / CORS）+ Ktor Client CIO + Room 2.8.4 + JavaMail
+- **Kotlin 2.2.10** + Java 17 目标；AGP 9.2.1 + KSP；33 个 Gradle 模块；`minSdk 31` / `targetSdk 36`，release 仅打 `arm64-v8a`
+- **设备侧后端**：Ktor 2.3.12（Netty / WebSockets / CORS）+ Ktor Client CIO + Room 2.8.4 + JavaMail；FFmpeg 走 4KB 页对齐的通用 JNI 桥（独立仓库 [FFmpeg-Android-4KB](https://github.com/Asunano/FFmpeg-Android-4KB)）
 - **手机端**：Jetpack Compose（BOM 2026.02.01）+ Material 3 + Navigation Compose + 自研 `UfiPageSwitcher`；Retrofit / OkHttp、Coroutines + Flow、WorkManager、Media3、Coil
-- **浏览器面板**：Vue 3.5 + Vite 6 + TypeScript 5.6 + Pinia + Naive UI + ECharts + Tailwind
+- **浏览器面板**：Vue 3.5 + Vite 6 + TypeScript 5.6 + Pinia + Naive UI + ECharts + Tailwind + xterm
 - **测试**：JUnit + MockK / Mockito + Robolectric + `kotlinx-coroutines-test`；Room 迁移有 androidTest 覆盖
 - **CI/CD**：GitHub Actions（JDK 21 + SDK 36；push/PR 构建双端 debug 并校验版本源，tag 触发签名发版与 Web 更新包）
 
@@ -252,27 +254,27 @@ UFI-AXIS/
 │   ├── contract/                # 跨端冻结契约：Endpoints / Enums / DeviceFields / ErrorCode
 │   ├── device-schema/           # DeviceProfile / FieldSpec / ZteGoformProfile
 │   ├── common/                  # DeviceAuth 签名、AppLogger、Shell/Goform QoS、AppSettings、CronParser
-│   ├── goform/                  # goform 协议防腐层：GoformClient + 6 个领域客户端 + Codec
+│   ├── goform/                  # goform 协议防腐层：GoformClient + 领域客户端 + Codec
 │   ├── collector/               # 本机采集：system / telephony / signal / AT 通道
 │   ├── cache/                   # ResponseCache + JsonResponseCache
-│   ├── database/                # Room v8：9 Entity / 9 DAO / 5 迁移
+│   ├── database/                # Room v15：15 Entity / 16 DAO / 全量迁移
 │   ├── websocket/               # WebSocketManager + WebSocketPushService
-│   ├── alert/                   # AlertEngine（8 类告警 / 边沿触发 / 聚合 / 版本锁）
+│   ├── alert/                   # AlertEngine（9 类告警 / 边沿触发 / 聚合 / 版本锁）
 │   ├── scheduler/               # DataScheduler / TaskScheduler / ConditionEngine / ActionExecutor
-│   ├── controller/              # 网络 / 短信 / 系统 / 应用 / Aria2 下载 / frp & cloudflared / ADB
-│   ├── api/                     # 40 组 Routes + DataHub + AuthMiddleware + PairingManager + OTA
+│   ├── controller/              # 网络 / 短信 / 系统 / 应用 / Aria2 下载 / frp & cloudflared / ADB / ttyd
+│   ├── api/                     # 48 组 Routes + DataHub + AuthMiddleware + PairingManager + OTA
 │   └── network/                 # HttpServer（Netty 8088，静态资源 + SPA 兜底 + web 构建挂钩）
 ├── app/                         # 手机端（com.ufi_axis）
 │   ├── src/                     # MainActivity / CrashHandler / NotifyService(:ufi_notify)
-│   ├── ui/                      # 主题令牌 / 动效 / 54 个 Ufi* 组件 / 导航骨架 / 组件画廊
+│   ├── ui/                      # 主题令牌 / 动效 / 70+ 个 Ufi* 组件 / 导航骨架 / 组件画廊
 │   ├── data/                    # api / model / repository / NotificationCenter / DebugLog
 │   ├── viewmodel/               # MainViewModel + module/* + state/* + BackgroundManager
-│   └── feature-*/               # dashboard network monitor tools settings files download sms apps
+│   └── feature-*/               # dashboard monitor network tools settings files download sms apps media
 ├── web/                         # 浏览器面板（Vue 3 + Vite），产物内置进 core APK
 │   ├── src/api/contract.ts      # core:contract 的 TS 镜像（改一侧必须同步）
 │   ├── src/composables/         # useApi / useCancellableApi / useRequestScope / useRealtime
 │   ├── src/stores/              # app / dashboard / service / websocket
-│   └── src/views/               # 14 个页面 + settings 的 8 个子面板
+│   └── src/views/               # 页面 + settings 子面板
 ├── config/literal-baseline.properties   # UI 字面量基线（只降不升）
 ├── scripts/verify-api-contract.mjs      # 双端契约一致性校验
 ├── docs/                        # 项目文档：设备侧接口参考 · 主题令牌索引
@@ -336,7 +338,7 @@ package-web.bat           # Windows（不要用 Compress-Archive，见下方 FAQ
 
 ### 支持哪些设备？
 
-目前只有一份设备 profile（ZTE goform 系、运行 Android 的随身 WiFi，如 F50 / U30 Air 等）。设备适配层已把「字段名 / 解码规则 / 写命令」抽成 `DeviceProfile`，新增机型只需加一份 profile 并在配置里指定 `deviceProfileId`——**不做自动探测**，因为探测本身就需要先知道用哪套字段。
+目前以 ZTE goform 系、运行 Android 的随身 WiFi（如 F50 / U30 Air 等）为主。设备适配层已把「字段名 / 解码规则 / 写命令」抽成 `DeviceProfile`，且协议实现已下沉为可插拔插件，新增机型只需加一份 profile 并在配置里指定 `deviceProfileId`——**不做自动探测**，因为探测本身就需要先知道用哪套字段。
 
 ### 一定要 root 吗？
 
@@ -382,6 +384,7 @@ package-web.bat           # Windows（不要用 Compress-Archive，见下方 FAQ
 - 敏感字段分级（`PUBLIC` / `MASKED` / `SECRET`），日志自动脱敏（IP / IMEI / Token / Authorization）
 - 配置读取时 `goform_password` 等字段返回脱敏值，回写脱敏值会被拒绝
 - 邮件模板不引用任何外部资源，避免泄露阅读行为
+- 远端存储源（WebDAV 等）跳过证书校验时仍校验主机名；媒体目录白名单为分隔符敏感 + 真实路径判定
 
 ### 部署注意
 
@@ -395,7 +398,7 @@ package-web.bat           # Windows（不要用 Compress-Archive，见下方 FAQ
 
 - **调试日志**：App 内「工具 → 调试日志」实时查看，分类过滤、脱敏输出；release 构建只保留 WARN/ERROR 与崩溃 dump 缓冲
 - **网络日志通道**：设备侧 `AppLogger.net()` 单独记录 goform / AT 交互；SMTP 会话原样重定向进日志，发信失败可直接看协议对话
-- **诊断页**：「我的 → 诊断」汇总服务状态、连通性、配对与权限检查
+- **诊断页**：「我的 → 诊断」汇总服务状态、连通性、配对与权限检查，并内置 ping / DNS / TCP / traceroute 诊断工具
 - **崩溃处理**：全局 `UncaughtExceptionHandler` 捕获后落盘，下次启动展示
 - **契约校验**：`node scripts/verify-api-contract.mjs` 比对 `core/contract` 与 `web/src/api/contract.ts`，防止端点 / 频道 / 字段名单侧漂移
 
@@ -430,4 +433,6 @@ package-web.bat           # Windows（不要用 Compress-Archive，见下方 FAQ
 ## 感谢
 
 - [frp](https://github.com/fatedier/frp) · [cloudflared](https://github.com/cloudflare/cloudflared) — 内网穿透能力
+- [ttyd](https://github.com/tsl0922/ttyd) — 真 PTY 终端
+- [FFmpeg](https://ffmpeg.org) — 视频缩略图抽帧（独立仓库 [FFmpeg-Android-4KB](https://github.com/Asunano/FFmpeg-Android-4KB)）
 - [Ktor](https://ktor.io/) · [Jetpack Compose](https://developer.android.com/compose) · [Vue](https://vuejs.org/) · [Naive UI](https://www.naiveui.com/)
