@@ -27,6 +27,24 @@ import com.ufi_axis.ui.theme.UfiMotion
  *
  * 若将来 `:app:ui` 接入了 Compose UI Test，应把本文件替换为真正的交互测试
  * （`composeTestRule.onNodeWithContentDescription(...).performClick()` + 帧推进断言）。
+ *
+ * ## ★ 2026-09-24：悬浮胶囊 → 贴底通栏低栏（迁移阶段 2.5）
+ * 底部导航的形态已从「悬浮胶囊」（wrap-content 的独立 Dialog 窗口、`LayoutParams.y` 抬离底边、
+ * 收起/展开状态机、横向拖拽切页）换成「贴底通栏低栏」（`MATCH_PARENT` 宽、`gravity=BOTTOM`、
+ * `y=0`、上圆角 22dp、内容高 58dp、标签常显、安全区靠栏内 Spacer 让位）。
+ * 计划与逐条决策见 `docs/bottom-dock-migration-plan.md`（§4 护栏处置、§5 边缘情况）。
+ *
+ * 本批对每条护栏只问一个问题：**它当年防的那个真机 bug，在通栏形态下还会不会发生？**
+ * - 还会 ⇒ 断言改写到新形态的等价机制上，方法名同步改准（例如触摸穿透、安全区让位、进出场锚点）；
+ * - 不可能再发生（前提随形态消失）⇒ 删除，并在原位留一段**墓碑注释**说明原委。
+ *
+ * ⚠ 守护对象有两类，不要混：
+ * - `UfiBottomDock.kt` / `UfiCapsuleBlurHost.kt` / `MainNavGraph.kt` 是**在线**形态，
+ *   它们的护栏是真正在守当前产品；
+ * - `UfiCapsuleTabBar.kt` 自 `USE_BOTTOM_DOCK = true` 起**已不再挂载**，只等阶段 3 整体删除。
+ *   本批刻意**不动**那些只读 tabBar 的护栏（选中态插值 / 归位时序 / 组合期读三组）：
+ *   它们仍然全绿，且在阶段 3 删除旧组件时正好充当「别顺手改错东西」的对照。
+ *   阶段 3 删 tabBar 时这些护栏一并退休，不要那时才临时决定去留。
  */
 class CapsuleRegressionGuardTest {
 
@@ -34,6 +52,15 @@ class CapsuleRegressionGuardTest {
 
     private val tabBarPath =
         "src/main/java/com/ufi_axis/ui/components/common/UfiCapsuleTabBar.kt"
+
+    /**
+     * 贴底通栏低栏的本体（2026-09-24 起的**在线**形态，见 `MainNavGraph.USE_BOTTOM_DOCK`）。
+     *
+     * 它承接了原来分散在窗口层与胶囊内部的三件事：底色铺满（含安全区）、安全区靠栏内
+     * `Spacer` 让位、选中药丸只画在内容区。这三条各自对应一条新护栏。
+     */
+    private val bottomDockPath =
+        "src/main/java/com/ufi_axis/ui/components/common/UfiBottomDock.kt"
 
     private val blurHostPath =
         "src/main/java/com/ufi_axis/ui/components/common/UfiCapsuleBlurHost.kt"
@@ -155,7 +182,12 @@ class CapsuleRegressionGuardTest {
      *
      * 因此断言从「时长 > 0」改为「三条通道都真的挂在 factor 上」：
      * 只要有人把其中任何一条写成 `if (selected) A else B` 的硬切，本条立刻红灯。
-     * 另外守住 `EXPAND_SPRING` 不得被换成 `snap()`（展开/收起若瞬变，整体收缩交互失去意义）。
+     *
+     * ★ 已删除第 4 条断言（2026-09-24，迁移阶段 2.5）：原来还要求
+     *   `EXPAND_SPRING` 后 40 字符内含 `spring(`（「展开/收起不得瞬变」）。
+     *   通栏低栏没有收起态，`EXPAND_SPRING` 属于阶段 3 的删除清单，这条断言守的
+     *   「整体收缩交互」在新形态下不存在。前 3 条保留：颜色 lerp / alpha 插值 /
+     *   `selectionFactor` 是**选中态**动画的护栏，与收起无关。
      */
     @Test
     fun iconTransitions_mustBeDrivenByContinuousFactor() {
@@ -176,10 +208,6 @@ class CapsuleRegressionGuardTest {
         assertTrue(
             "找不到 selectionFactor —— 连续选中进度是上面三条通道的唯一驱动源",
             code.contains("selectionFactor")
-        )
-        assertTrue(
-            "EXPAND_SPRING 必须是 spring(...)；换成 snap() 会让展开/收起瞬变，整体收缩交互失去意义",
-            Regex("""EXPAND_SPRING[^\n=]*=\s*[\s\S]{0,40}?spring\(""").containsMatchIn(code)
         )
     }
 
@@ -233,20 +261,92 @@ class CapsuleRegressionGuardTest {
         )
     }
 
-    // ── 触摸穿透红线：胶囊不得撑满宽度 ──────────────────────────────────────
+    // ── 触摸穿透红线：栏以上区域必须穿透到页面 ──────────────────────────────
 
     /**
-     * 胶囊本体不得 `fillMaxWidth()`。
+     * 栏必须是**通栏**（`MATCH_PARENT` 宽 + `gravity=BOTTOM` + `y=0`），
+     * 同时「**栏以上**区域的触摸仍必须穿透到页面」。
      *
-     * 它活在 Popup 里，撑满宽度会让 Popup 窗口横贯整屏、吞掉整条底部触摸区域 ——
-     * 「胶囊之外的点击必须穿透到下方页面」是产品红线。
+     * ## 本条是改写（2026-09-24，迁移阶段 2.5）
+     * 原名 `capsule_mustNotFillMaxWidth_soTouchesPassThrough`，断言是
+     * 「`UfiCapsuleTabBar` 不得出现 `fillMaxWidth`」。理由是：悬浮胶囊的窗口是
+     * wrap-content，内容一撑满宽度窗口矩形就横贯整屏，而 `FLAG_NOT_TOUCH_MODAL`
+     * 只放行窗口矩形**之外**的触摸 ⇒ 胶囊左右两侧的页面内容点不动。
+     *
+     * 通栏低栏把这个前提反转了：窗口**就是** `MATCH_PARENT` 宽，占满那条带子是设计目标。
+     * 但原护栏守的那个**真实风险仍然存在** —— 只是搬了家：
+     * 现在能吞掉页面触摸的不再是"宽度"，而是**窗口高度**。窗口一旦变成全屏高
+     * （有人"顺手"把 height 也写成 `MATCH_PARENT`，或让 `naturalSize.height` 那条链路失效
+     * 退化成某个大值），整页的点击就全被这个 Dialog 圈进窗口矩形，
+     * `FLAG_NOT_TOUCH_MODAL` 再也无从放行 —— 表现是「除了底栏，整个 App 点不动」。
+     *
+     * 所以三件套必须齐全（§2.1 表 + §5.4）：
+     * 1. 几何：width = `MATCH_PARENT`、`Gravity.BOTTOM`、`y = 0`（少一项就不是"贴底通栏"）；
+     * 2. 窗口高度**只能**来自内容测量（`naturalSize.height`，未测得退 `WRAP_CONTENT`）——
+     *    窗口只有栏那么高，栏以上区域才在窗口矩形之外；
+     * 3. `FLAG_NOT_TOUCH_MODAL` 在线，且二级页整块不吃触摸的 `FLAG_NOT_TOUCHABLE` gate 在线。
+     *
+     * 刻意**不**用 `constraints.maxWidth` 之类的绕法改写内容层断言 —— 那只是把护栏
+     * 留成噪音；触摸能不能穿透是**窗口层**的事实，断言就该落在窗口层。
      */
     @Test
-    fun capsule_mustNotFillMaxWidth_soTouchesPassThrough() {
-        val code = executableCode(source(tabBarPath))
+    fun dockWindow_mustBeFullWidthBottomAnchored_andPassTouchesAboveIt() {
+        val code = executableCode(source(blurHostPath))
+
+        assertTrue(
+            "窗口宽度不再是 MATCH_PARENT —— 贴底通栏的前提没了（应为 " +
+                "`val desiredWidth: Int = ViewGroup.LayoutParams.MATCH_PARENT`）。",
+            Regex("""desiredWidth\s*:\s*Int\s*=\s*ViewGroup\.LayoutParams\.MATCH_PARENT""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "窗口 gravity 不是 Gravity.BOTTOM —— 配合 FLAG_LAYOUT_NO_LIMITS 它才把参考系钉在" +
+                "屏幕真实底边；改掉之后栏会离开底边（通栏就不通了）。",
+            Regex("""desiredGravity\s*:\s*Int\s*=\s*Gravity\.BOTTOM""").containsMatchIn(code)
+        )
+        assertTrue(
+            "窗口 y 不再恒 0 —— 任何 y > 0 都会在栏与屏幕底边之间露出一条页面内容。" +
+                "安全区的让位是**栏内 Spacer** 的职责，不是窗口偏移（见 " +
+                "bottomSafeArea_mustBeConsumedInsideDock_notByWindowY）。",
+            Regex("""desiredY\s*:\s*Int\s*=\s*0\b""").containsMatchIn(code)
+        )
+
+        assertTrue(
+            "窗口高度不再由 `naturalSize.value.height` 决定 —— 它必须只有**栏那么高**：" +
+                "窗口矩形一旦长过栏（尤其被写成 MATCH_PARENT），栏以上区域的点击就全被这个 " +
+                "Dialog 圈走，FLAG_NOT_TOUCH_MODAL 只放行窗口**之外**的触摸，" +
+                "真机表现是「除了底栏，整个 App 点不动」。",
+            Regex("""desiredHeight\s*:\s*Int\s*=\s*if\s*\(\s*naturalSize\.value\.height\s*>\s*0\s*\)""")
+                .containsMatchIn(code)
+        )
         assertFalse(
-            "UfiCapsuleTabBar 的可执行代码中出现了 fillMaxWidth()，会让 Popup 窗口横贯整屏并吞掉底部点击",
-            code.contains("fillMaxWidth")
+            "窗口高度的表达式里出现了 MATCH_PARENT —— 那是全屏高的浮窗，等于把整页触摸吞掉（同上）。",
+            code.substringAfter("desiredHeight: Int =", "")
+                .substringBefore("desiredGravity")
+                .contains("MATCH_PARENT")
+        )
+
+        assertTrue(
+            "缺少 FLAG_NOT_TOUCH_MODAL —— Dialog 默认是模态的，不显式清除，栏以上区域的" +
+                "触摸一律被吃掉（产品红线：栏之外的点击必须穿透到页面）。",
+            code.contains("FLAG_NOT_TOUCH_MODAL")
+        )
+        assertTrue(
+            "二级页的 FLAG_NOT_TOUCHABLE gate 不见了 —— 通栏后窗口矩形更宽，二级页里" +
+                "底部那条带子若仍吃触摸，用户会发现「返回详情页后底部点不动」（计划 §5.4）。",
+            code.contains("FLAG_NOT_TOUCHABLE")
+        )
+        assertTrue(
+            "窗口层不再读 `CapsuleTouchGate.interactive` —— FLAG_NOT_TOUCHABLE 的唯一驱动源被" +
+                "切断，gate 形同虚设（二级页底部依旧吃触摸）。",
+            Regex("""CapsuleTouchGate\.interactive""").containsMatchIn(code)
+        )
+        assertTrue(
+            "MainNavGraph 不再写 `CapsuleTouchGate.interactive.value = showBottomBar` —— " +
+                "gate 没有写入方：栏窗口从第一次进入 MAIN 起常驻（挂载后不再卸载），" +
+                "二级页里它仍然圈着底部那条更宽的矩形，点击穿不下去（§5.4）。",
+            Regex("""CapsuleTouchGate\.interactive\.value\s*=""")
+                .containsMatchIn(executableCode(source(navGraphPath)))
         )
     }
 
@@ -280,111 +380,35 @@ class CapsuleRegressionGuardTest {
         )
     }
 
-    // ── 整体收缩 / 展开状态机（本轮交互改造）────────────────────────────────
-
-    /**
-     * 自动收起延迟必须是 1500ms。
-     *
-     * 这是产品明确定的交互契约：「点击后展开，1.5 秒无操作自动收起」。
-     * 调小会让用户还没看完标签就缩回去，调大则胶囊长时间占着放大态遮挡内容。
-     */
-    @Test
-    fun collapseDelay_mustBe1500ms() {
-        val code = executableCode(source(tabBarPath))
-        val delayMs = matchOne(
-            code, """COLLAPSE_DELAY_MS\s*=\s*(\d+)L""", "COLLAPSE_DELAY_MS"
-        ).toLong()
-        assertEquals("自动收起延迟应为 1500ms（产品定义的交互契约）", 1500L, delayMs)
-    }
-
-    /**
-     * 收起态的整体缩放必须「看得出来」又「看得清」。
-     *
-     * 低于 0.80f：20dp 图标被缩到 16dp 以下，边缘发糊且点击目标偏小；
-     * 高于 0.92f：与展开态差异不足 8%，用户分辨不出收起/展开两个状态，改造等于白做。
-     */
-    @Test
-    fun collapsedScale_mustBePerceptibleButLegible() {
-        val code = executableCode(source(tabBarPath))
-        val scale = matchOne(
-            code, """COLLAPSED_SCALE\s*=\s*([\d.]+)f""", "COLLAPSED_SCALE"
-        ).toFloat()
-
-        assertTrue(
-            "COLLAPSED_SCALE($scale) 低于 0.80f 时图标发糊、点击目标过小",
-            scale >= 0.80f
-        )
-        assertTrue(
-            "COLLAPSED_SCALE($scale) 高于 0.92f 时收起态与展开态肉眼无差别，整体收缩交互失去意义",
-            scale <= 0.92f
-        )
-    }
-
-    /**
-     * 收起倒计时必须**每次点击都重新计时**。
-     *
-     * 实现手段（2026-09-05 第四版起）：`resetToken` 是自动收起计时器判据快照
-     * `CapsuleCollapseProbe` 的一个字段，点击时无条件自增 —— 新值到达即让 `collectLatest`
-     * 取消上一次 body、让 `delay(COLLAPSE_DELAY_MS)` 从头开始。
-     *
-     * ## 为什么本护栏被改写（原来断言的是 effect 的 key）
-     * 旧实现是 `LaunchedEffect(expanded, resetToken, isScrolling, isDragging)`，护栏因此
-     * 直接检查 key 列表里有 `expanded` 与 `resetToken`。但那份 key 里的 `isScrolling`
-     * 是**组合期读**，横滑一次翻转两下就是 `UfiCapsuleTabBar` 整体重组两次（跨窗口渲染，
-     * 且正好落在 settle 后仍有可见运动的窗口里）—— 见
-     * [settleDrivers_mustNotReadIsScrollingDuringComposition]。判据整组挪进协程后，
-     * key 已不再是这条不变量的载体，**探针字段 + collectLatest** 才是。
-     * 被守护的行为一字未改：任何一次点击都必须让倒计时重新开始。
-     *
-     * 回归场景：若有人把探针里的 `resetToken` 删掉（"反正 expanded 已经在里面了"），
-     * 展开态下的再次点击就不会产生新值，倒计时继续跑，胶囊会在用户还在连续点 Tab 时突然缩回去。
-     */
-    @Test
-    fun expandTimer_mustResetOnEveryTap() {
-        val code = executableCode(source(tabBarPath))
-
-        assertTrue(
-            "找不到 resetToken —— 「1.5s 内再次点击则重新计时」的实现载体被移除了",
-            code.contains("resetToken")
-        )
-
-        // `(?<!class\s)`：跳过 `private data class CapsuleCollapseProbe(...)` 那个**声明**，
-        // 只看真正的构造点（声明里的字段名同样含 expanded / resetToken，会误命中）。
-        val probe = Regex("""(?<!class\s)CapsuleCollapseProbe\(([\s\S]*?)\)""")
-            .findAll(code)
-            .firstOrNull { m ->
-                val fields = m.groupValues[1]
-                fields.contains("expanded") && fields.contains("resetToken")
-            }
-        assertNotNull(
-            "自动收起计时器的判据快照 CapsuleCollapseProbe 必须同时含 expanded 与 resetToken，" +
-                "否则展开态下的再次点击不会产生新值、delay 不会重新开始计时",
-            probe
-        )
-
-        // 该判据必须真的驱动一次「可被打断的倒计时」：
-        // distinctUntilChanged ≡ 原来的「key 是否变化」，collectLatest ≡「key 变了就取消重启」。
-        val body = code.substring(probe!!.range.last)
-            .substringBefore("LaunchedEffect")
-        assertTrue(
-            "CapsuleCollapseProbe 之后没有 `distinctUntilChanged()` —— 判据没变也会重跑倒计时。",
-            body.contains("distinctUntilChanged()")
-        )
-        assertTrue(
-            "CapsuleCollapseProbe 之后没有 `collectLatest` —— 少了它，新值到达时上一次的 " +
-                "delay 不会被取消，「再次点击重新计时」就失效了（旧实现靠 effect 重启达到同样效果）。",
-            body.contains("collectLatest")
-        )
-        assertTrue(
-            "自动收起的判据链里没有 delay(COLLAPSE_DELAY_MS)，倒计时并未生效",
-            body.contains("delay(COLLAPSE_DELAY_MS)")
-        )
-        assertTrue(
-            "收起条件必须读探针字段 `probe.expanded` —— 读闭包捕获的组合值会一直停在" +
-                "首次组合那一份（本 effect 不再随组合重启）。",
-            body.contains("probe.expanded")
-        )
-    }
+    // ── 整体收缩 / 展开状态机（已随悬浮胶囊形态退休）────────────────────────────
+    //
+    // ★★ 墓碑（2026-09-24，贴底通栏低栏迁移阶段 2.5）★★
+    //
+    // 这一节原有三条护栏，全部随「收起 / 展开状态机」一起删除：
+    //
+    // 1. `collapseDelay_mustBe1500ms`
+    //    守的是产品交互契约「点击后展开，1.5s 无操作自动收起」（断言 COLLAPSE_DELAY_MS == 1500L）。
+    //    前提消失：通栏低栏**没有收起态**，标签常显、格宽等分、整条不缩放，
+    //    "多久之后自动收回去"这个问题本身不存在。常量属于阶段 3 的删除清单。
+    //
+    // 2. `collapsedScale_mustBePerceptibleButLegible`
+    //    守的是收起态整体缩放必须落在 [0.80f, 0.92f]：低于下限图标发糊、点击目标过小，
+    //    高于上限两个状态肉眼无差别。前提消失：同上，没有第二个状态可比。
+    //
+    // 3. `expandTimer_mustResetOnEveryTap`
+    //    守的是「1.5s 内再次点击必须重新计时」，6 条断言围绕自动收起链路
+    //    （`resetToken` / `CapsuleCollapseProbe` / `distinctUntilChanged` / `collectLatest` /
+    //    `delay(COLLAPSE_DELAY_MS)` / `probe.expanded`）。防的真机 bug 是「用户连续点 Tab 时
+    //    胶囊突然缩回去」。前提消失：没有倒计时，也就没有"重新计时"。
+    //
+    // ⚠ 为什么是删除而不是改写：这三条守的不是某个通用不变量，而是**收起态这个形态本身**。
+    //   通栏低栏里找不到语义对应物（不是"换个写法实现同一意图"，而是意图消失）。
+    //   与它们相对，同一批里「触摸穿透」「安全区不能丢」「进出场锚点」都是**改写**而非删除
+    //   —— 那三个 bug 在新形态下依然可能发生，只是机制换了。
+    //
+    // ⚠ 删除时机说明：本批**并未**删除 `UfiCapsuleTabBar` 的收起/展开实现（那是阶段 3），
+    //   所以这三条如果留着此刻仍会绿。删掉的理由不是"它会红"，而是它守的产品形态已下线 ——
+    //   留着会让后人以为「自动收起」仍是现行契约，在通栏栏上重新实现一遍。
 
     /**
      * 旧的「每个 Tab 各自一套展开进度」机制必须彻底清除。
@@ -447,39 +471,66 @@ class CapsuleRegressionGuardTest {
         )
     }
 
-    /** 胶囊窗口必须锚定在底部居中，否则会跑到屏幕中央（Dialog 的默认 gravity）。 */
+    /**
+     * 栏窗口必须锚定屏幕**底边**，且不得再带水平居中。
+     *
+     * ## 本条是改写（2026-09-24，迁移阶段 2.5）
+     * 原名 `dialogHost_mustAnchorBottomCenter`，断言 `Gravity.BOTTOM` **与**
+     * `Gravity.CENTER_HORIZONTAL` 同时在线 —— 后者是 wrap-content 小窗时代的必需品
+     * （窄窗口得自己居中，否则会贴到屏幕左边）。
+     *
+     * 通栏后窗口宽度是 `MATCH_PARENT`，"水平居中"已无余量可居中：留着它不会有视觉后果，
+     * 但会误导后人以为窗口还是个可左右摆放的小窗（也就可能顺手把 width 改回 wrap-content）。
+     * 所以新不变量是「只有 BOTTOM，不许再出现 CENTER_HORIZONTAL」。
+     *
+     * `Gravity.BOTTOM` 本身**仍是红线**：Dialog 的默认 gravity 是屏幕中央，
+     * 少了它栏会飘到屏幕正中间。
+     */
     @Test
-    fun dialogHost_mustAnchorBottomCenter() {
+    fun dialogHost_mustAnchorBottomWithoutHorizontalCentering() {
         val code = executableCode(source(blurHostPath))
 
         assertTrue(
-            "Dialog 宿主缺少 Gravity.BOTTOM —— 胶囊会停在屏幕中央",
+            "Dialog 宿主缺少 Gravity.BOTTOM —— Dialog 默认 gravity 是屏幕中央，栏会停在屏幕正中间",
             code.contains("Gravity.BOTTOM")
         )
-        assertTrue(
-            "Dialog 宿主缺少 Gravity.CENTER_HORIZONTAL —— 胶囊不会水平居中",
+        assertFalse(
+            "Dialog 宿主又出现了 Gravity.CENTER_HORIZONTAL —— 窗口已是 MATCH_PARENT 宽，" +
+                "水平居中没有任何余量可居中；它是 wrap-content 小窗时代的残留，" +
+                "留着会让人误以为窗口还能左右摆放（进而把 width 改回 wrap-content，通栏就断了）。",
             code.contains("Gravity.CENTER_HORIZONTAL")
         )
     }
 
     /**
-     * 胶囊窗口必须保持 wrap-content，且不得退回 Popup。
+     * 底栏必须由 **Dialog** 承载，且平台默认宽度约束必须被解除（不得退回 Popup）。
      *
-     * `usePlatformDefaultWidth = false` 是关键：不设它，Dialog 会被强制拉到平台默认宽度
-     * （接近整屏宽），窗口横贯底部并吞掉整条触摸区域 —— 与 `fillMaxWidth` 是同一个 bug 的
-     * 另一种触发方式。同时 `Popup(` 不得回归：Popup 没有 Window 对象，拿不到窗口内背景模糊。
+     * ## 本条只改了名字与注释（2026-09-24，迁移阶段 2.5）
+     * 原名 `capsuleWindow_mustStayWrapContent` —— 名字是错的、而且现在会误导人：
+     * 三条断言其实一条都不查 wrap-content，查的是 `Dialog(` / `usePlatformDefaultWidth = false`
+     * / 无 `Popup(`；而通栏迁移正是要把窗口宽度改成 `MATCH_PARENT`。
+     * 留着旧名字，下一个人读到「mustStayWrapContent 还是绿的」会以为窗口仍是小窗。
+     *
+     * 三条断言本身**一字未改**，它们守的是两件与形态无关的事：
+     * 1. `Dialog(` —— 只有 Dialog 才有 `Window` 对象，才能在窗口层统一施加触摸穿透 flag、
+     *    底边锚定、透明背景。Popup 拿不到 Window（当年还牵着窗口内背景模糊）。
+     * 2. `usePlatformDefaultWidth = false` —— 不设它，平台会把 Dialog 拉到默认宽度
+     *    （接近整屏但**不等于**整屏，且由平台说了算）。宽度必须由我们自己在 LayoutParams 里
+     *    决定：2026-09-24 之前是 wrap-content，之后是 `MATCH_PARENT`。
+     *    写成 true 就等于把窗口矩形的控制权交回平台 —— 两种形态都会出错。
      */
     @Test
-    fun capsuleWindow_mustStayWrapContent() {
+    fun bottomBarWindow_mustBeDialogWithPlatformWidthOverridden() {
         val code = executableCode(source(navGraphPath))
 
         assertTrue(
-            "胶囊不再由 Dialog 承载 —— Popup 路径拿不到窗口内背景模糊，真模糊会永久失效",
+            "底栏不再由 Dialog 承载 —— Popup 没有 Window 对象，窗口层的触摸穿透 flag、" +
+                "底边锚定与透明背景全都无从施加",
             code.contains("Dialog(")
         )
         assertTrue(
-            "缺少 usePlatformDefaultWidth = false —— Dialog 会被拉到平台默认宽度，" +
-                "窗口横贯底部并吞掉整条触摸区域",
+            "缺少 usePlatformDefaultWidth = false —— 窗口宽度会被交回平台决定，" +
+                "我们对窗口矩形（通栏形态下 = MATCH_PARENT）的控制权就没了",
             Regex("""usePlatformDefaultWidth\s*=\s*false""").containsMatchIn(code)
         )
         assertFalse(
@@ -701,6 +752,17 @@ class CapsuleRegressionGuardTest {
      *
      * 18dp 是产品拍板的折中值：全局卡片圆角 10dp 对高 ≈56dp 的胶囊过于方正，
      * 满药丸（≈28dp）又与页面卡片语言脱节。
+     *
+     * ## ⚠ 2026-09-24 通栏迁移：本条**刻意保持 18dp 不变**
+     * 迁移计划 §4.1 曾提议把它改成 22dp（通栏低栏的上圆角）。复核后**不改**，理由：
+     * - 通栏低栏的圆角真源是 `UfiBottomDock` 自己的 `DOCK_SHAPE`（上 22dp / 下 0），
+     *   它与窗口侧这个常量**不构成一对** —— 窗口背景恒 null，两者之间没有"错边"可言；
+     * - 本条守的"窗口侧 18 ≡ 内容侧 18"这一对**仍然成立**：另一半是
+     *   `UfiCapsuleTabBar.CAPSULE_CORNER`，那个文件要到阶段 3 才删；
+     * - 真模糊那条 dead 分支（含本常量）该不该一起删，计划 §5.10 明确要求**单独决策、
+     *   单独一次改动**，混进本批会让 diff 无法审查。
+     * 阶段 3 删 `UfiCapsuleTabBar` 时，本条与 [bottomInsetCorner_mustNotBePill] 一并重新决策：
+     * 要么随 dead 分支删掉，要么改成守 `DOCK_SHAPE` 的 22dp。
      */
     @Test
     fun bottomInsetCorner_mustSyncTo18dp() {
@@ -735,42 +797,71 @@ class CapsuleRegressionGuardTest {
         )
     }
 
-    /**
-     * 收起/展开的缩放锚点必须是**几何中心**。
-     *
-     * 产品要求：收起时胶囊四周同时向**自身中心**收拢（整颗变小），
-     * 而不是吸附在底边上只往上收。实现手段是根 Box `graphicsLayer` 的
-     * `transformOrigin = TransformOrigin.Center`（等价写法 `TransformOrigin(0.5f, 0.5f)` 也放行）。
-     *
-     * 回归场景：`TransformOrigin` 只是一行赋值，改回底边中点后编译照过、单测照绿，
-     * 只有在真机上盯着收起动画才看得出差别。
-     */
-    @Test
-    fun collapseOrigin_mustBeCenter() {
-        val code = executableCode(source(tabBarPath))
-        assertTrue(
-            "UfiCapsuleTabBar 的 graphicsLayer 里找不到 TransformOrigin.Center（或等价的 " +
-                "TransformOrigin(0.5f, 0.5f)）—— 收起动画必须以几何中心为锚点等比收拢",
-            code.contains("TransformOrigin.Center") ||
-                Regex("""TransformOrigin\(\s*0\.5f\s*,\s*0\.5f\s*\)""").containsMatchIn(code)
-        )
-    }
+    // ★★ 墓碑（2026-09-24，贴底通栏低栏迁移阶段 2.5）★★
+    //
+    // 已删除：`collapseOrigin_mustBeCenter`
+    // 它断言 `UfiCapsuleTabBar` 的 `graphicsLayer` 里有 `TransformOrigin.Center`
+    // （或等价的 `TransformOrigin(0.5f, 0.5f)`），守的是产品要求「收起时胶囊四周同时向
+    // **自身中心**收拢，而不是吸附在底边上只往上收」。
+    //
+    // 前提消失：通栏低栏没有收起态，那个做整体缩放的 `graphicsLayer` 在阶段 3 会整块删掉，
+    // 届时文件里根本不存在 transformOrigin，断言只会变成「找不到 ⇒ 红灯」的噪音。
+    //
+    // 与之成对的 `collapseOrigin_mustNotBeBottom` **没有删**，而是改写到了新形态上 ——
+    // 见下面 [dockEnterExit_mustSlideVerticallyNotScaleFromBottom]：
+    // 「底边中点锚点」这个东西在通栏形态下依然存在、依然会坏事，只是它搬去了
+    // `MainNavGraph` 的**进出场**动画里（原来那条护栏只检查 tabBar，够不到那里）。
 
     /**
-     * 收起锚点**不得**退回底边中点。
+     * 底栏的**进出场**必须是整条纵向滑动，不得是「从底部中心缩放」。
      *
-     * 与 [collapseOrigin_mustBeCenter] 成对锁死：只断言"必须有 Center"不够 ——
-     * 若有人新增一处 `TransformOrigin(0.5f, 1f)` 并让它后写生效，前一条仍会绿。
-     * `TransformOrigin(0.5f, 1f)` 是被本轮改造替换掉的旧锚点（胶囊底边纹丝不动、
-     * 只往上收），与新视觉冲突。
+     * ## 本条是改写（2026-09-24，迁移阶段 2.5）
+     * 原名 `collapseOrigin_mustNotBeBottom`，检查的是 `UfiCapsuleTabBar` 里不得出现
+     * `TransformOrigin(0.5f, 1f)`（被替换掉的收起锚点：胶囊底边纹丝不动、只往上收）。
+     *
+     * 那条护栏此刻已经没有守护对象了：
+     * - 它只读 `UfiCapsuleTabBar.kt`，而该组件自 `USE_BOTTOM_DOCK = true` 起不再挂载；
+     * - 而真正**在线**的「底部锚点缩放」恰恰在 `MainNavGraph` 的进出场 `graphicsLayer` 里
+     *   —— 旧实现就是 `scaleX/scaleY = p` + `transformOrigin = TransformOrigin(0.5f, 1f)`，
+     *   老护栏够不到那个文件（旧注释里明确写着"护栏不检查该文件"）。
+     *
+     * 所以断言整体搬家，守的 bug 也从"收起动画锚点错"换成新形态下的等价错误：
+     * 贴底通栏是一条横贯整屏、下边与屏幕底边重合的带子，按底部中心缩放会把它缩成屏幕
+     * 正下方一小块、两侧露出页面 —— 出场看起来像"从地板中间长出一块方糖"。
+     * 整条上下滑进滑出（`translationY` 从栏总高到 0）才是底栏的语言（§5.5）。
+     *
+     * 顺带钉死滑动距离的来源：必须是「安全区 + 内容区高」这个**栏总高**。
+     * 迁移前那里是 `safeDrawing.getBottom(density) + 38.dp`，那个 38 照抄的是胶囊的
+     * 「抬高 30 + 间距 8」—— 贴底之后它会让栏从屏幕外 38dp 处开始动（滑进来时"先慢半拍"）。
      */
     @Test
-    fun collapseOrigin_mustNotBeBottom() {
-        val code = executableCode(source(tabBarPath))
+    fun dockEnterExit_mustSlideVerticallyNotScaleFromBottom() {
+        val code = executableCode(source(navGraphPath))
+
+        assertTrue(
+            "进出场不再是 `translationY = (1f - p) * dockTotalHeightPx` —— 贴底通栏的进出场" +
+                "必须是整条纵向滑动（p→0 整条滑到屏幕底边之下，p→1 滑回原位）。",
+            Regex("""translationY\s*=\s*\(\s*1f\s*-\s*p\s*\)\s*\*\s*dockTotalHeightPx""")
+                .containsMatchIn(code)
+        )
         assertFalse(
-            "UfiCapsuleTabBar 的可执行代码里又出现了 TransformOrigin(0.5f, 1f) —— " +
-                "那是被替换掉的底边中点锚点，会让胶囊收起时只往上收而非向中心收拢",
-            Regex("""TransformOrigin\(\s*0\.5f\s*,\s*1(?:\.0)?f\s*\)""").containsMatchIn(code)
+            "MainNavGraph 的可执行代码里又出现了 TransformOrigin —— 「从底部中心缩放」是悬浮" +
+                "胶囊的进出场语言；通栏用它会缩成屏幕正下方一小块、两侧漏出页面。",
+            code.contains("TransformOrigin")
+        )
+        listOf("scaleX", "scaleY").forEach { token ->
+            assertFalse(
+                "MainNavGraph 的可执行代码里又出现了 `$token` —— 底栏进出场不得做缩放（同上）。",
+                code.contains(token)
+            )
+        }
+        assertTrue(
+            "滑动距离不再由「安全区 + 内容区高」推导 —— 它必须是**栏总高**：" +
+                "`WindowInsets.safeDrawing.getBottom(density) + DOCK_CONTENT_MIN_HEIGHT`。" +
+                "迁移前这里是 `+ 38.dp`（照抄胶囊的抬高 30 + 间距 8），贴底后栏会从屏幕外 " +
+                "38dp 处开始动。也不要在这里另写一个 58：常量必须复用通栏组件那一份。",
+            Regex("""safeDrawing\.getBottom\(density\)[\s\S]{0,80}?DOCK_CONTENT_MIN_HEIGHT""")
+                .containsMatchIn(code)
         )
     }
 
@@ -790,6 +881,11 @@ class CapsuleRegressionGuardTest {
      *
      * 刻意**不**断言具体颜色字面量：浅色/深色取色属于可调的产品参数，
      * 锁死它会让每次微调配色都要改测试，护栏就会被当成噪音关掉。
+     *
+     * ⚠ 2026-09-24：本条只读 `UfiCapsuleTabBar.kt`（已不再挂载，等阶段 3 删除）。
+     *   **在线**形态的同一条红线由 [dockSurface_mustBeContentLayer_andWindowBackgroundStayNull]
+     *   守着（指纹相同，另加窗口侧的 `setBackgroundDrawable(null)` + `wantBlur = false`）。
+     *   阶段 3 删旧组件时，本条一并删除，不要以为红线跟着没了。
      */
     @Test
     fun capsuleBackground_mustBeContentLayer() {
@@ -825,58 +921,104 @@ class CapsuleRegressionGuardTest {
     }
 
     /**
-     * 视觉抬高量 `CAPSULE_LIFT` 必须真的接进窗口 y 偏移。
+     * 底部安全区必须由**栏内 Spacer** 让位，而不是窗口 y 偏移。
      *
-     * 只声明常量不接线是最隐蔽的回归形态：常量还在、注释还在，真机上胶囊却没抬起来，
-     * 而且 IDE 只会给一个灰色的 unused 提示。因此这里既查**声明**，也查它是否出现在
-     * `bottomOffsetPx` 的**赋值表达式**里。
+     * ## 本条是改写（2026-09-24，迁移阶段 2.5）
+     * 原名 `capsuleLift_mustBeWired`，4 条断言：`CAPSULE_LIFT` 声明存在、且
+     * `bottomOffsetPx` 的赋值表达式里同时含 `CAPSULE_LIFT` / `reservedPx` /
+     * `capsuleGapFor` / `CAPSULE_SHADOW_ROOM`（视觉抬高只能**追加**在定位基线三项之上）。
      *
-     * 同时守 R3：定位基线三项（`reservedPx` + `capsuleGapFor(...)` − `CAPSULE_SHADOW_ROOM`）
-     * 必须原样保留 —— [CAPSULE_LIFT] 是**追加项**，不是替换项。把安全间距 8dp 直接调大
-     * 来实现抬高，会把「已验证的跨设备安全下限」和「产品审美参数」混成一个数，
-     * 日后无从区分，也无法单独回归。
+     * 那四个概念**整条退休**：通栏低栏的窗口 `y` 恒 0（抬高与"贴底"直接矛盾），
+     * `bottomOffsetPx` / `capsuleGapFor` / `CAPSULE_SHADOW_ROOM` / `CAPSULE_LIFT` 都已删除。
+     *
+     * 但那条护栏真正守的东西**一点没变**：**安全区不能丢**。
+     * 它只是换了消费方 —— 从「窗口 y 把整条栏抬到手势热区之上」变成
+     * 「栏自己在内部留一段只有底色的 `Spacer`，图标不进那条带子」（§3 的两层分离）。
+     * 丢掉它的真机后果与当年一模一样：图标/标签压在手势小白条上，点不动、或一点就回桌面。
+     *
+     * 因此断言改写成新链路的三段（缺一段安全区就丢了）：
+     * 1. 窗口侧：`y` 恒 0，且旧的抬高概念不得复活（`CAPSULE_LIFT` / `capsuleGapFor` /
+     *    `bottomOffsetPx` 一个都不许回来 —— 它们与"贴底"互斥）；
+     * 2. 下发侧：宿主必须把算好的 `reservedPx` 经 `LocalCapsuleBottomReserved` 交给栏内容
+     *    （**不能**让栏自己去读 WindowInsets：取值口径与防自激振荡的那套逻辑全在
+     *    `readBottomReservedPx` 里，见 [insetListener_mustNotConsume]）；
+     * 3. 消费侧：栏内必须真的有一段高 = 安全区的 `Spacer` —— 只下发不消费是最隐蔽的回归
+     *    （值还在、注释还在，真机上图标却压着小白条，IDE 只会给一个灰色 unused 提示）。
      */
     @Test
-    fun capsuleLift_mustBeWired() {
-        val code = executableCode(source(blurHostPath))
+    fun bottomSafeArea_mustBeConsumedInsideDock_notByWindowY() {
+        val host = executableCode(source(blurHostPath))
 
         assertTrue(
-            "UfiCapsuleBlurHost 里找不到 CAPSULE_LIFT 的声明 —— 产品向的视觉抬高量被删除了",
-            Regex("""val\s+CAPSULE_LIFT\s*:\s*Dp\s*=""").containsMatchIn(code)
+            "窗口 y 不再恒 0（应为 `val desiredY: Int = 0`）—— 通栏形态下任何 y > 0 都会在栏与" +
+                "屏幕底边之间露出一条页面内容。",
+            Regex("""desiredY\s*:\s*Int\s*=\s*0\b""").containsMatchIn(host)
         )
-
-        val assignAt = code.indexOf("bottomOffsetPx =")
-        assertTrue(
-            "找不到 bottomOffsetPx 的赋值点（CapsuleWindowMetrics 的构造调用），" +
-                "窗口 y 偏移的计算表达式可能已被重写",
-            assignAt >= 0
-        )
-        // 赋值表达式 = 从 `bottomOffsetPx =` 起，到构造调用的下一个具名参数 `cornerRadiusPx` 之前。
-        val expression = code.substring(assignAt).substringBefore("cornerRadiusPx")
-
-        assertTrue(
-            "CAPSULE_LIFT 已声明却没有出现在 bottomOffsetPx 的表达式里 —— 常量没接线，" +
-                "真机上胶囊不会被抬高（当前表达式：${expression.trim()}）",
-            expression.contains("CAPSULE_LIFT")
-        )
-
         listOf(
-            "reservedPx" to "底部系统预留区高度（跨设备定位的基准）",
-            "capsuleGapFor" to "按导航模式分发的安全间距（已验证的 8dp 下限）",
-            "CAPSULE_SHADOW_ROOM" to "投影留白扣减项"
+            "CAPSULE_LIFT" to "悬浮胶囊的视觉抬高量（把整条栏抬离底边）",
+            "capsuleGapFor" to "「预留区顶边 → 胶囊底边」的呼吸间距",
+            "bottomOffsetPx" to "窗口 y 偏移的计算式"
         ).forEach { (token, what) ->
-            assertTrue(
-                "bottomOffsetPx 的表达式里缺少 `$token`（$what）—— 红线 R3 回归：" +
-                    "CAPSULE_LIFT 只能**追加**在定位基线三项之上，不得替换其中任何一项，" +
-                    "否则跨设备安全间距与产品审美抬高会被混成同一个数",
-                expression.contains(token)
+            assertFalse(
+                "UfiCapsuleBlurHost 里又出现了 `$token`（$what）—— 它属于**悬浮**形态，" +
+                    "与「贴底通栏」的前提直接矛盾：窗口 y 必须恒 0，安全区改由栏内 Spacer 让位。",
+                host.contains(token)
             )
         }
+
+        assertTrue(
+            "宿主没有把算好的 reservedPx 经 `LocalCapsuleBottomReserved provides` 下发 —— " +
+                "栏内的安全区 Spacer 会恒高 0（默认值），图标直接压在手势小白条上。" +
+                "⚠ 不要让栏自己去读 WindowInsets：取宿主 Activity 全屏 insets、取 " +
+                "max(navigationBars, systemGestures)、手势导航兜底 24dp、允许下降这几条" +
+                "都封在 readBottomReservedPx 里，是踩过自激振荡的单一真源。",
+            Regex("""LocalCapsuleBottomReserved\s+provides\s+reservedPx""").containsMatchIn(host)
+        )
+
+        val dock = executableCode(source(bottomDockPath))
+        assertTrue(
+            "UfiBottomDock 不再读 `LocalCapsuleBottomReserved.current` —— 安全区的取值链路断了。",
+            Regex("""LocalCapsuleBottomReserved\.current""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "UfiBottomDock 里找不到「让位给系统栏本体」的那段 Spacer（应为 " +
+                "`Spacer(modifier = Modifier.fillMaxWidth().height(bottomPadDp))`）—— " +
+                "沉浸的实现就是这一句：底色铺到屏幕真实底边，**内容**靠这段 Spacer 让位。" +
+                "只下发不消费时真机上图标会压在手势小白条上（点不动 / 误触返回桌面）。",
+            Regex("""Spacer\([\s\S]{0,120}?height\(\s*bottomPadDp\s*\)""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "预留区的**上半段** Spacer 不见了（应为 `height(topPadDp)`）—— " +
+                "2026-09-24 起预留区被拆成上下两段：下方只让开系统栏本体（navigationBars），" +
+                "手势热区超出的那部分挪到内容区上方。少了上半段，栏总高会比页面 inset " +
+                "少算一截（页面最后一行会被栏压住）。",
+            Regex("""Spacer\([\s\S]{0,120}?height\(\s*topPadDp\s*\)""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "上下两段的和不再恒等于 reservedDp（应为 `val topPadDp: Dp = reservedDp - bottomPadDp`）" +
+                "—— 这条恒等式是「栏总高不变」的全部依据：页面底部 inset、进出场滑动距离、" +
+                "窗口高度三处都按 reservedDp 算，拆分只许改**内容的位置**，不许改总高。",
+            Regex("""topPadDp\s*:\s*Dp\s*=\s*reservedDp\s*-\s*bottomPadDp""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "下半段不再取「系统栏本体」（应为 `LocalCapsuleBottomSystemBar.current` 并 " +
+                "`coerceAtMost(reservedDp)`）—— 若改回整段 reservedPx，图标会重新被手势热区" +
+                "顶高约 (systemGestures − navigationBars)（真机 112 vs 56 px），" +
+                "就是「图标离屏幕下部分太远」那条反馈。",
+            Regex("""LocalCapsuleBottomSystemBar\.current""").containsMatchIn(dock) &&
+                Regex("""coerceAtMost\(\s*reservedDp\s*\)""").containsMatchIn(dock)
+        )
     }
 
     /**
      * 胶囊「实时追踪」接线护栏：MainNavGraph 必须把 Pager 连续进度经
      * onSelectionProgressChange 接回 LocalUfiCapsuleSelectionProgress。
+     *
+     * ⚠ 2026-09-24：通栏低栏**暂不消费**这条进度（药丸只按 `selectedIndex` 走
+     *   `animateFloatAsState`），当前它只服务于尚未删除的 `UfiCapsuleTabBar`。
+     *   本条保持原样：把「手指滑到哪、指示器就到哪」的实时联动移植到通栏栏上时，
+     *   这条线是唯一的数据源；现在拆掉、将来还得重接，且中间的窗口期无人守。
+     *   阶段 3 删旧组件时一并决策：移植 ⇒ 断言不动；确定不做 ⇒ 连线与本条一起删。
      */
     @Test
     fun capsuleSelectionProgress_mustBeWired() {
@@ -1099,8 +1241,16 @@ class CapsuleRegressionGuardTest {
      *    `if (settleNeedsConfirmWindow(` —— 无条件 delay 就是回归；
      * 2. 两条归位驱动都必须把 `motionSettlePending` 传进 `awaitSettleAuthority`
      *    （**同一份快照状态**，两条驱动读到的值必须相同，否则又会错开 80ms）；
-     * 3. `motionSettlePending` 的写入点齐全：点击清零、滑动/拖拽置真。少了置真那半边，
+     * 3. `motionSettlePending` 的写入点齐全：点击清零、滑动置真。少了置真那半边，
      *    横滑收尾就会丢掉防抖保护、「滑块抽搐」回归。
+     *
+     * ## ★ 2026-09-24（迁移阶段 2.5）：置真的入口从两处变一处
+     * 原断言是「`motionSettlePending = true` **至少两处**」（页面横滑的 isScrolling 收集器 +
+     * 抓住滑块拖动的 `onDragStarted`）。横向拖拽整套已删除（计划 §5.2），
+     * 于是置真只剩**横滑**这一个入口。本条改为断言**恰好一处**：
+     * 少了它（0 处）横滑收尾丢防抖保护，滑块抽搐回归；多出来（≥2 处）说明有人给点击路径
+     * 也补了置真 —— 那正好把「点击零延迟」这条链堵死，回到"胶囊不跟手"。
+     * 两个方向都得守，所以用 `assertEquals` 而不是 `>=`。
      */
     @Test
     fun settleConfirmWindow_mustBeSkippedOnClickPath() {
@@ -1137,11 +1287,13 @@ class CapsuleRegressionGuardTest {
             1,
             Regex("""motionSettlePending\s*=\s*false""").findAll(code).count()
         )
-        assertTrue(
-            "`motionSettlePending = true` 少于两处 —— 置真的两个入口（页面横滑的 isScrolling 收集器、" +
-                "抓住滑块拖动的 onDragStarted）缺了一个，那条路径会误走「点击零延迟」分支，" +
-                "手势收尾的防抖保护失效 ⇒ 滑块抽搐回归。",
-            Regex("""motionSettlePending\s*=\s*true""").findAll(code).count() >= 2
+        assertEquals(
+            "`motionSettlePending = true` 应恰好一处 —— 横向拖拽删除后（2026-09-24，计划 §5.2）" +
+                "置真只剩「页面横滑的 isScrolling 收集器」这一个入口。" +
+                "0 处 ⇒ 横滑收尾丢掉防抖保护、滑块抽搐回归；" +
+                "≥2 处 ⇒ 大概率是给点击路径也补了置真，那会把「点击零延迟」堵死（胶囊不跟手）。",
+            1,
+            Regex("""motionSettlePending\s*=\s*true""").findAll(code).count()
         )
     }
 
@@ -1224,8 +1376,20 @@ class CapsuleRegressionGuardTest {
      *    且不得再有 `var isScrolling` 的委托写法；
      * 3. 两条归位驱动必须各自构造一次 [CapsuleSettleProbe]（滑块位置 + 图标着色），
      *    并走 `distinctUntilChanged()`（≡ 原来的「key 是否变化」）；
-     * 4. 分支选择必须读探针字段而不是闭包捕获的组合值 —— `probe.dragging` /
-     *    `probe.scrolling` / `probe.settleIndex` 三者齐全，否则四分支互斥语义已被改写。
+     * 4. 分支选择必须读探针字段而不是闭包捕获的组合值 —— `probe.scrolling` /
+     *    `probe.settleIndex` 齐全，否则分支互斥语义已被改写。
+     *
+     * ## ★ 2026-09-24（迁移阶段 2.5）：两处随横向拖拽退休
+     * - 第 4 条原来还要求 `probe.dragging`。拖拽整套已删除（计划 §5.2：贴底后栏的左右边缘
+     *   约 24dp 是系统返回手势热区，拖着切 tab 会被判成返回），`dragging` 的唯一来源
+     *   `isDragging` 没了，判据恒为 false，字段已从探针里删除 ⇒ 断言随之删除。
+     *   分支数也从四分支降为三分支（settling / scrolling / 常规归位）。
+     * - 同时**新增**一条：`settleIndex` 必须仍在探针里、且必须在**点击**时被赋值。
+     *   它极易被当成"拖拽的配套状态"一起删掉，但它防的是 **pager 的逐页扫场**：
+     *   pager 收到跨多页切换请求时 `selectionProgress` 是从起点一路扫过来的，
+     *   滑块若去跟它，观感就是「被拽回原处再追一遍」。而**点击跨多页同样触发逐页扫场**
+     *   （点第 1 格直接跳第 4 格），拖拽只是当年最容易复现的入口，不是唯一入口。
+     *   删拖拽后它只是把赋值时机从「松手」改到「点击」。
      */
     @Test
     fun settleDrivers_mustNotReadIsScrollingDuringComposition() {
@@ -1266,11 +1430,38 @@ class CapsuleRegressionGuardTest {
             Regex("""distinctUntilChanged\(\)""").findAll(code).count() >= 3
         )
 
-        listOf("probe.dragging", "probe.scrolling", "probe.settleIndex").forEach { field ->
+        listOf("probe.scrolling", "probe.settleIndex").forEach { field ->
             assertTrue(
-                "四分支互斥的判据里找不到 `$field` —— 分支选择又改回读闭包捕获的组合值了。" +
+                "分支互斥的判据里找不到 `$field` —— 分支选择又改回读闭包捕获的组合值了。" +
                     "探针化之后 `LaunchedEffect` 不再随组合重启，闭包里的值会一直停在首次组合那一份。",
                 code.contains(field)
+            )
+        }
+
+        // ★ settleIndex 的存在性与赋值时机（2026-09-24 新增，见上方 KDoc）。
+        assertTrue(
+            "`CapsuleSettleProbe` 里不再有 `settleIndex` —— 它防的不是拖拽而是 **pager 逐页扫场**：" +
+                "跨多页切换时连续进度从起点一路扫来，滑块跟着它就表现为「先被拽回原处、再追一遍」。" +
+                "点击跨多页（点第 1 格直接跳第 4 格）同样会触发，所以拖拽删掉后它必须留下。",
+            Regex("""class\s+CapsuleSettleProbe\([\s\S]{0,200}?settleIndex\s*:\s*Int\?""")
+                .containsMatchIn(code)
+        )
+        assertTrue(
+            "找不到「点击时登记 settleIndex」（应为 CapsuleTab.onClick 里的 `settleIndex = index`）—— " +
+                "拖拽删除后点击是它**唯一**的赋值入口；漏掉它等于 settleIndex 恒 null，" +
+                "跨多页点击时滑块会去跟 pager 的逐页扫场。",
+            Regex("""settleIndex\s*=\s*index\b""").containsMatchIn(code)
+        )
+        listOf(
+            "probe.dragging" to "探针字段（来源 isDragging）",
+            ".draggable(" to "横向拖拽手势本体",
+            "onDragStopped" to "松手吸附回调"
+        ).forEach { (token, what) ->
+            assertFalse(
+                "UfiCapsuleTabBar 的可执行代码里又出现了 `$token`（$what）—— 横向拖拽已于 " +
+                    "2026-09-24 整套删除（计划 §5.2）：贴底后栏的左右边缘约 24dp 是系统返回手势" +
+                    "热区，拖着切 tab 会被判成返回；重新引入还需要 setSystemGestureExclusionRects()。",
+                code.contains(token)
             )
         }
     }
@@ -1313,6 +1504,381 @@ class CapsuleRegressionGuardTest {
                 "底色 alpha 与高光强度会退化成单一档（深浅共用一个值）。",
             Regex("""palette\.isDark|LocalResolvedPalette\.current\.isDark""")
                 .containsMatchIn(code)
+        )
+    }
+
+    // ── 贴底通栏低栏的新红线（2026-09-24，迁移阶段 2.5 新增）────────────────────
+    //
+    // 这几条守的都是**通栏形态独有**的不变量：它们在悬浮胶囊时代不存在（没有"铺满安全区的
+    // 底色"、没有"内容区与安全区分层"、也没有"常显标签"），所以不是改写而是新增。
+    // 共同特征与上面那批一致：一行就能改回去、回归后只在真机上肉眼可见。
+
+    /**
+     * 栏底色必须画在 **Compose 内容层**，窗口背景必须恒为 `null`（红线 R1 在通栏形态下的版本）。
+     *
+     * `capsuleBackground_mustBeContentLayer` 守的是同一条红线，但它只读
+     * `UfiCapsuleTabBar.kt` —— 那个组件已不再挂载。在线形态的底色在 `UfiBottomDock` 里，
+     * 所以这一条把指纹挪过来，并把窗口侧的另一半一起钉死：
+     *
+     * - 内容层指纹：`clip(` + `RoundedCornerShape(` + `drawBehind { drawRect(…) }`；
+     *   通栏的底色是竖向渐变 + 上缘高光 + 顶边发丝线三层，都必须在 `drawBehind` 里
+     *   （且 `clip` 必须在它之前，否则三者不会被 22dp 上圆角裁住，§5.8）。
+     * - 窗口层：`setBackgroundDrawable(null)` + `setFormat(PixelFormat.TRANSLUCENT)`，
+     *   且真模糊那条分支必须保持 `val wantBlur = false`（唯一会挂 drawable 的分支就是它）。
+     *
+     * 一旦有人把底色挪回 `Window.setBackgroundDrawable` 或主题 `windowBackground`，
+     * 会复活两个已修复的真机 bug：系统沿 drawable 形状描出的**外圈 1px 细线**，
+     * 以及部分 ROM 把浮窗 Surface 退回**不透明黑底**（盖住下方内容）。
+     *
+     * 刻意**不**断言具体颜色字面量：取色是可调的产品参数，锁死它会让每次微调配色都要改测试。
+     */
+    @Test
+    fun dockSurface_mustBeContentLayer_andWindowBackgroundStayNull() {
+        val dock = executableCode(source(bottomDockPath))
+
+        listOf(
+            ".clip(" to "圆角裁剪（必须在 drawBehind 之前，否则底色/高光/发丝线不被上圆角裁住）",
+            "RoundedCornerShape(" to "圆角形状（DOCK_SHAPE：上 22dp、下 0）",
+            "drawBehind" to "内容层绘制入口",
+            "drawRect(" to "底色本体（竖向渐变 + 上缘高光 + 顶边发丝线都走它）"
+        ).forEach { (token, what) ->
+            assertTrue(
+                "UfiBottomDock 的可执行代码里找不到 `$token` —— 缺少$what。" +
+                    "栏底色必须活在 Compose 内容层；若被挪回 Window.setBackgroundDrawable / " +
+                    "主题 windowBackground，会复活「外圈 1px 细线」与「浮窗黑底」两个真机 bug。",
+                dock.contains(token)
+            )
+        }
+        // clip 必须在 drawBehind 之前（§5.8）—— 顺序错了编译照过，真机上是圆角处漏出直角。
+        // ⚠ 用 `drawBehind {`（带花括号）定位调用点：裸的 `drawBehind` 会先命中 import 行。
+        val clipAt = dock.indexOf(".clip(")
+        val drawBehindAt = Regex("""drawBehind\s*\{""").find(dock)?.range?.first ?: -1
+        assertTrue("找不到 `drawBehind {` 的调用点。", drawBehindAt >= 0)
+        assertTrue(
+            "UfiBottomDock 里 `.clip(` 出现在 `drawBehind {` **之后** —— 底色、上缘高光、" +
+                "顶边发丝线就不会被 22dp 上圆角裁住，栏的两个上角会漏出直角。",
+            clipAt in 0 until drawBehindAt
+        )
+
+        val host = executableCode(source(blurHostPath))
+        assertTrue(
+            "窗口背景不再被显式清成 null（`setBackgroundDrawable(null)`）—— 红线 R1：" +
+                "窗口一旦挂上 drawable，系统会沿它的形状描出外圈 1px 细线。",
+            Regex("""setBackgroundDrawable\(\s*null\s*\)""").containsMatchIn(host)
+        )
+        assertTrue(
+            "清掉背景后没有 `setFormat(PixelFormat.TRANSLUCENT)` —— 部分 ROM 会把无背景浮窗" +
+                "渲染成不透明黑色，盖住下方内容（红线 R1 的另一半）。",
+            host.contains("setFormat(PixelFormat.TRANSLUCENT)")
+        )
+        assertTrue(
+            "真模糊分支不再是恒关（应保留 `val wantBlur = false`）—— 那是全文件**唯一**会给窗口" +
+                "挂上 drawable 的分支（setBackgroundDrawable(capsuleBackground)）。" +
+                "要重新启用真模糊必须单独立项，连带复核外圈细线与黑底两个 bug。",
+            Regex("""val\s+wantBlur\s*=\s*false""").containsMatchIn(host)
+        )
+    }
+
+    /**
+     * 安全区只能是「有底色、无内容」的一段，**选中药丸不得覆盖它**。
+     *
+     * 通栏形态的两层结构（§3）：
+     * ```
+     * Column(clip + drawBehind{ 底色铺满整个 Column，含安全区 })
+     *   ├ Box{ Row(heightIn(min=58dp), drawBehind{ 选中药丸 }) }   ← 内容区
+     *   └ Spacer(height = 安全区)                                  ← 只有底色
+     * ```
+     * 药丸画在**内容区**的 `drawBehind` 里，垂直范围天然只覆盖那 58dp。
+     * 回归形态是「顺手」把药丸挪到根 `Column` 的 `drawBehind`（那里已经有底色绘制代码，
+     * 看起来更"集中"）—— 三键导航下安全区约 48dp，栏总高 106dp，药丸会按 106dp 垂直居中，
+     * 肉眼就是**明显偏下、压进手势/按键区**（§5.1）。
+     *
+     * 断言用源码顺序表达这个层级：底色绘制 → 内容区限高 → 药丸 → 安全区 Spacer。
+     */
+    @Test
+    fun dockSelectionPill_mustBeDrawnInsideContentAreaOnly() {
+        val dock = executableCode(source(bottomDockPath))
+
+        val surfaceAt = dock.indexOf("drawRect(color = dockSurface")
+        val contentAt = dock.indexOf("heightIn(min = DOCK_CONTENT_MIN_HEIGHT)")
+        val pillAt = dock.indexOf("drawSelectionPill(")
+        val safeAreaAt = dock.indexOf("height(bottomPadDp)")
+
+        assertTrue(
+            "找不到「底色铺满（含安全区）」的那句 `drawRect(color = dockSurface)` —— " +
+                "沉浸的前提是底色铺到屏幕真实底边。" +
+                "（2026-09-24 起底色是**实色**，原来是 `Brush.verticalGradient`：" +
+                "两端只差 4% 亮度、真机读不出渐变，只读出「上下不一样干净」，用户定稿改实色。）",
+            surfaceAt >= 0
+        )
+        assertTrue(
+            "找不到内容区的 `heightIn(min = DOCK_CONTENT_MIN_HEIGHT)` —— 内容区与安全区的分层没了。",
+            contentAt >= 0
+        )
+        assertTrue("找不到 `drawSelectionPill(` —— 选中态的唯一视觉载体被移除了。", pillAt >= 0)
+        assertTrue("找不到安全区 Spacer 的 `height(bottomPadDp)`。", safeAreaAt >= 0)
+
+        assertTrue(
+            "底色不再画在内容区**之前**（应在根 Column 的 drawBehind 里）—— " +
+                "底色必须铺满整条栏含安全区，只覆盖内容区的话安全区那段会透出页面像素。",
+            surfaceAt < contentAt
+        )
+        assertTrue(
+            "`drawSelectionPill(` 不在内容区的 drawBehind 里（当前出现在 " +
+                "`heightIn(min = DOCK_CONTENT_MIN_HEIGHT)` 之前）—— 药丸一旦画到根 Column 上，" +
+                "垂直居中就会按**栏总高**算：三键导航（安全区≈48dp）下药丸明显偏下、压进按键区（§5.1）。",
+            contentAt < pillAt
+        )
+        assertTrue(
+            "安全区 Spacer 不在药丸之后 —— 结构已被改写；药丸的垂直范围必须只由内容区决定。",
+            pillAt < safeAreaAt
+        )
+    }
+
+    /**
+     * 通栏低栏内部**不得**出现 `fillMaxHeight` / `fillMaxSize`。
+     *
+     * ## 真机现象：整个屏幕都变成导航栏
+     * 2026-09-24 首次装包就撞上。`DockTab` 当时写的是 `Modifier.fillMaxHeight()`，而 tabs 行
+     * 只有 `heightIn(min = 58dp)` —— 那是**下限**，maxHeight 没有上界：底栏 Dialog 的窗口高是
+     * `WRAP_CONTENT` / 实测高，传给内容的 maxHeight 仍然是整屏高度。于是单格撑满整屏，
+     * 一路把 Row → Box → 根 `Column` 撑满，根 Column 的 `drawBehind` 底色随之铺满整个屏幕。
+     *
+     * 悬浮胶囊时代**不会**暴露这个写法：那时窗口是 wrap-content 的小窗，maxHeight 本身就只有
+     * 胶囊那么高，`fillMaxHeight` 填出来的正好是胶囊高度。通栏把窗口放大到整屏宽、
+     * 高度交给内容决定之后，同一句 modifier 的含义就彻底变了 —— 这是"形态迁移改变了既有写法的语义"
+     * 的典型案例，光看那一行代码看不出问题，所以必须用护栏钉住。
+     *
+     * 正确写法是给**下限**（`defaultMinSize(minHeight = …)` / `heightIn(min = …)`），
+     * 上限永远交给内容，让栏总高由「内容 + 安全区 Spacer」决定。
+     */
+    @Test
+    fun dockMustNotFillAvailableHeight_orTheBarEatsTheWholeScreen() {
+        val dock = executableCode(source(bottomDockPath))
+
+        assertFalse(
+            "`UfiBottomDock` 里出现了 `fillMaxHeight` —— 通栏窗口传下来的 maxHeight 是**整屏高度**，" +
+                "填满它会让底色铺满整个屏幕（真机现象：整屏都是导航栏）。高度只能给下限，" +
+                "上限交给内容：用 `defaultMinSize(minHeight = …)` 或 `heightIn(min = …)`。",
+            dock.contains("fillMaxHeight")
+        )
+        assertFalse(
+            "`UfiBottomDock` 里出现了 `fillMaxSize` —— 同上，纵向会吃掉整屏。",
+            dock.contains("fillMaxSize")
+        )
+        assertTrue(
+            "格高的下限约束不见了（应为 `defaultMinSize(minHeight = …)`）—— " +
+                "少了它单格只有图标+标签那么高，触摸目标会跌破 48dp（§5.20）。",
+            dock.contains("defaultMinSize(minHeight =")
+        )
+    }
+
+    /**
+     * 通栏低栏**不得**长出收起态那一套，标签必须常显且单行。
+     *
+     * 承接两条老护栏的意图（它们只读 `UfiCapsuleTabBar`，够不到新组件）：
+     * - `legacyPerTabExpansionMachinery_mustBeGone` 的 `showLabel` 警戒 ——
+     *   标签常显时极容易顺手起这个名字，然后就有人给它接一个"滑动时隐藏标签"的动画；
+     * - 已删除的 `collapseDelay_mustBe1500ms` / `collapsedScale_*` 的形态约束。
+     *
+     * 另外钉死 §5.11 / §5.13 两条真机约束：
+     * - 内容区必须是 `heightIn(min = …)` 而不是固定 `height(…)`：系统字体 1.5× 时 10sp 标签
+     *   渲染成 15sp，固定高度会把内容压扁 / 裁切；
+     * - 标签必须 `maxLines = 1` + `Ellipsis`：一换行就把内容区顶破 58dp，
+     *   栏总高与页面 inset 一起跳（5 tab × 360dp 窄屏每格只有 72dp）。
+     */
+    @Test
+    fun dockMustNotGrowCollapseMachinery_andLabelsStayVisibleSingleLine() {
+        val dock = executableCode(source(bottomDockPath))
+
+        listOf(
+            "showLabel" to "标签常显，不存在「要不要显示标签」这个状态",
+            "labelReveal" to "标签淡入淡出进度（收起态的产物）",
+            "COLLAPSE_DELAY_MS" to "自动收起倒计时",
+            "COLLAPSED_SCALE" to "收起态整体缩放",
+            "expandProgress" to "展开进度（通栏的几何全部是常量，不随任何进度插值）"
+        ).forEach { (symbol, why) ->
+            assertFalse(
+                "UfiBottomDock 里出现了 `$symbol` —— $why。通栏低栏**没有收起态**：" +
+                    "标签常显、格宽等分、整条不缩放。把收起那一套搬回来等于把两种形态的" +
+                    "几何假设混在一起（迁移计划 §2.4 / §4.2）。",
+                dock.contains(symbol)
+            )
+        }
+
+        assertTrue(
+            "内容区不再是 `heightIn(min = DOCK_CONTENT_MIN_HEIGHT)` —— 固定 `height(58.dp)` 在" +
+                "系统字体 1.5× 时会把内容压扁 / 裁切（§5.13）。必须允许长高，栏总高随之变大。",
+            dock.contains("heightIn(min = DOCK_CONTENT_MIN_HEIGHT)")
+        )
+        assertFalse(
+            "内容区被改成了固定高 `height(DOCK_CONTENT_MIN_HEIGHT)` —— 同上（§5.13）。" +
+                "注意 `heightIn(` 不在本条管辖内：它与 `height(` 是两个不同的 token。",
+            Regex("""height\(\s*DOCK_CONTENT_MIN_HEIGHT""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "标签缺少 `maxLines = 1` —— 换行会把内容区顶破 58dp，栏总高与页面 inset 一起跳" +
+                "（5 tab × 360dp 窄屏每格仅 72dp，很容易触发，§5.11）。",
+            Regex("""maxLines\s*=\s*1\b""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "标签缺少 `TextOverflow.Ellipsis` —— 放不下时必须省略，而不是换行或裁半个字。",
+            dock.contains("TextOverflow.Ellipsis")
+        )
+    }
+
+    /**
+     * 页面底部 inset 必须是「内容区高 + 安全区」，且 58 这个数只能有**一份**。
+     *
+     * 通栏形态下栏自己覆盖了安全区那条带子（背景铺满 + 栏内 Spacer 让位），
+     * 所以页面要避开的是「内容区高 + 安全区」这一整块 —— 既没有悬浮时代的 8dp 间隙，
+     * 也没有抬升量。算少了页面最后一行被栏压住，算多了底部空一条。
+     *
+     * 两条断言：
+     * 1. 计算式必须是 `DOCK_CONTENT_MIN_HEIGHT + reservedPx.toDp()`（复用通栏组件的常量）；
+     * 2. `UfiCapsuleBlurHost` 里**不得**另写一个 `58.dp`。
+     *    两处各写一份数字迟早漂移 —— 这正是当年把 `CAPSULE_SHADOW_ROOM` 收成单一真源的理由。
+     *
+     * 配套的「测量完成前不发布」闸门由 `NavInsetHandoffGuardTest` 那两条守（语义不变）。
+     */
+    @Test
+    fun dockPageInset_mustBeContentHeightPlusSafeArea() {
+        val host = executableCode(source(blurHostPath))
+        val dock = executableCode(source(bottomDockPath))
+
+        assertTrue(
+            "页面底部 inset 的计算式不再是「内容区高 + 安全区」—— 应为 " +
+                "`DOCK_CONTENT_MIN_HEIGHT + with(density) { reservedPx.toDp() }`。" +
+                "少算会让页面最后一行被栏压住，多算会在底部空出一条。",
+            Regex("""DOCK_CONTENT_MIN_HEIGHT\s*\+\s*with\(density\)\s*\{\s*reservedPx\.toDp\(\)""")
+                .containsMatchIn(host)
+        )
+        assertFalse(
+            "UfiCapsuleBlurHost 里又出现了字面量 `58.dp` —— 内容区高只能有一份真源" +
+                "（`UfiBottomDock.DOCK_CONTENT_MIN_HEIGHT`）。两处各写一份数字迟早漂移。",
+            host.contains("58.dp")
+        )
+
+        val contentHeight = matchOne(
+            dock, """DOCK_CONTENT_MIN_HEIGHT\s*:\s*Dp\s*=\s*([\d.]+)\.dp""",
+            "DOCK_CONTENT_MIN_HEIGHT"
+        )
+        assertEquals(
+            "内容区高应为 58dp（§1 参数表定稿值 = 图标 24 + 间距 3 + 标签 10sp≈14 + 上下 8.5×2）。" +
+                "改它要同时复核：触摸目标 ≥48dp、药丸 inset 4dp 后的高度、以及页面 inset。",
+            "58",
+            contentHeight
+        )
+        assertTrue(
+            "`DOCK_CONTENT_MIN_HEIGHT` 不再是 `internal` —— 页面 inset 的计算式（在 " +
+                "UfiCapsuleBlurHost）要复用它；收回 private 会逼着那边另写一个 58。",
+            Regex("""internal\s+val\s+DOCK_CONTENT_MIN_HEIGHT""").containsMatchIn(dock)
+        )
+    }
+
+    /**
+     * 栏底色必须是**一个 palette token**（且只有一份），并且手势小白条的明暗必须由它推出来。
+     *
+     * ## 演进（两次改判都留在这里，别再走回头路）
+     * - 初版：`if (palette.isDark) lerp(cardBg, Color.Black, 0.10f) else lerp(cardBg, textPrimary, 0.06f)`
+     *   —— 本意是让栏比卡片稍深好跟页面分开。当时护栏钉的是「两支必须分开写」，因为
+     *   合成一条 `lerp(cardBg, textPrimary, x)` 在深色主题下会把栏**提亮**（textPrimary 是浅色），
+     *   方向正好反掉。这个坑本身仍然真实 —— 只是现在**根本不做这种混色**了。
+     * - 2026-09-24（用户定稿"改成白底"）：底色直接就是 `palette.cardBg`。栏与卡片同色，
+     *   分界交给顶边发丝线；深浅两套主题不需要各写一套系数，因为 palette 本身已按主题解析。
+     *
+     * ## 为什么必须是 `internal` 的单一函数
+     * 手势小白条的明暗**不是**平台自动按背后像素反色的（§5.3 的原假设已被真机证伪），
+     * 它只看窗口的 `isAppearanceLightNavigationBars`。栏贴底之后小白条正好压在这块颜色上，
+     * 所以 `UfiCapsuleBlurHost` 必须拿**同一个**颜色算亮度。两个文件各算一份的后果是
+     * 静默的：颜色一改、小白条就在某些皮肤下隐形，而编译与其它测试全绿。
+     */
+    @Test
+    fun dockSurfaceColor_mustBeSinglePaletteToken_andDriveGestureHandleAppearance() {
+        val dock = executableCode(source(bottomDockPath))
+        val blurHost = executableCode(source(blurHostPath))
+
+        assertFalse(
+            "UfiBottomDock 里出现了 `isSystemInDarkTheme()` —— 它绕过「设置 → 外观 → 外观模式」：" +
+                "强制浅色 / 强制深色时，栏底色会跟着**系统**明暗走，而 cardBg / accent 已经" +
+                "按用户选择解析过了。唯一正确的判据是 `LocalResolvedPalette.current`。",
+            Regex("""\bisSystemInDarkTheme\s*\(""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "`dockSurfaceColor` 不再是 `internal fun … = palette.cardBg` —— 它是跨文件的单一真源：" +
+                "窗口层要用同一个颜色去定手势小白条的明暗。改成 private、或在这里自己混色，" +
+                "都会让两处口径漂移（后果是小白条在某些皮肤下隐形，且没有任何编译错误）。",
+            Regex("""internal\s+fun\s+dockSurfaceColor\s*\([^)]*\)\s*:\s*Color\s*=\s*palette\.cardBg""")
+                .containsMatchIn(dock)
+        )
+        assertTrue(
+            "`UfiCapsuleBlurHost` 没有用 `dockSurfaceColor(palette).luminance()` 推 " +
+                "`lightNavHandleSurface` —— 判据必须来自栏**实际画的那块颜色**，" +
+                "不能用 `palette.isDark`（皮肤里存在偏亮的深色底 / 偏暗的浅色底）。",
+            Regex("""lightNavHandleSurface\s*=\s*dockSurfaceColor\(palette\)\.luminance\(\)\s*>""")
+                .containsMatchIn(blurHost)
+        )
+        assertTrue(
+            "底栏 Dialog 窗口没有设 `isAppearanceLightNavigationBars` —— 手势小白条**不会**" +
+                "自己按背后像素反色（§5.3 原假设已被真机证伪）。不设它就取默认的「深背景」，" +
+                "小白条恒为白，压在白底栏上直接看不见。",
+            Regex("""isAppearanceLightNavigationBars\s*=\s*metrics\.lightNavHandleSurface""")
+                .containsMatchIn(blurHost)
+        )
+        assertTrue(
+            "药丸内的图标/文字颜色不再按 accent 亮度择一 —— 实色 accent 配白字，在偏亮的配色" +
+                "（浅黄绿 / 浅青）上对比度不足 3:1，直接不可读（§5.14）。" +
+                "判据应是 `palette.accent.luminance() > …`。",
+            Regex("""accent\.luminance\(\)\s*>""").containsMatchIn(dock)
+        )
+    }
+
+    /**
+     * 选中药丸的横向内缩必须**引用** `Spacing.CardHorizontalMargin`，不许写成数字。
+     *
+     * ## 2026-09-25（用户定稿）：药丸的左右边缘要和上方卡片对在同一条竖线上
+     * 这条约束表达的是「跟卡片对齐」这个**关系**，不是「内缩 16dp」这个数字。卡片横向外边距的
+     * 唯一真源是 `Spacing.CardHorizontalMargin`（`UfiCardDefaults.horizontalMargin` 与
+     * `UfiBannerDefaults.sideMargin` 都从它取）。写成 `16.dp` 字面量的后果是**静默失配**：
+     * 将来有人把卡片外边距调成 20dp，药丸还停在 16dp —— 编译绿、全部单测绿，
+     * 只有真机上能看出两条竖线错开 4dp。这与「页面 inset 里那个第二份 58」是同类问题
+     * （见 `dockPageInset_mustBeContentHeightPlusSafeArea`）。
+     *
+     * 第二条断言封的是绕路：有人可能先写一个本地 `private val DOCK_PILL_SIDE = 16.dp` 再引用它，
+     * 形式上"用了常量"，实际仍是第二份真源。所以直接禁掉本文件里的 `16.dp` 字面量 ——
+     * 本文件里 16 这个数只有一个含义，就是这条对齐边距。
+     *
+     * ⚠ 本条**不**管图标与标签的位置。它们由「等分格 + 格内居中」决定（`(格宽 − 内容宽) / 2`，
+     * 393dp 屏上约 24~29dp），用户明确表示那个布局已经很完美、只要药丸对齐卡片。
+     * 「药丸对齐卡片」与「图标对齐卡片」是两件事，不要把这条护栏读成后者。
+     */
+    @Test
+    fun dockPillInset_mustReferenceCardHorizontalMargin_notALiteral() {
+        val dock = executableCode(source(bottomDockPath))
+
+        assertTrue(
+            "`PILL_INSET_H` 的定义式不再是 `Spacing.CardHorizontalMargin - DOCK_ROW_H_PADDING`。" +
+                "药丸外缘压在卡片那条竖线上，靠的是这条恒等式：" +
+                "`DOCK_ROW_H_PADDING + PILL_INSET_H ≡ Spacing.CardHorizontalMargin`" +
+                "（屏边 → 8dp 行内边距 → 格0左缘 → 8dp 药丸内缩 → 药丸左缘 = 16dp）。" +
+                "把它写成独立数值，两个数一改就错开，而且编译绿、单测绿，只有真机能看出来。" +
+                "想调药丸宽窄请改 `DOCK_ROW_H_PADDING`（内缩会自动跟着变），别单独改本常量。",
+            Regex(
+                """val\s+PILL_INSET_H\s*:\s*Dp\s*=\s*""" +
+                    """Spacing\.CardHorizontalMargin\s*-\s*DOCK_ROW_H_PADDING"""
+            ).containsMatchIn(dock)
+        )
+        assertTrue(
+            "tabs 行没有 `padding(horizontal = DOCK_ROW_H_PADDING)` —— 上面那条恒等式的另一半。" +
+                "少了它，药丸外缘会从 16dp 跑到 8dp（格0左缘就是屏幕左缘），与卡片错开一半。",
+            Regex("""padding\(\s*horizontal\s*=\s*DOCK_ROW_H_PADDING\s*\)""").containsMatchIn(dock)
+        )
+        assertFalse(
+            "UfiBottomDock 的可执行代码里出现了 `16.dp` 字面量 —— 本文件里 16 这个数只有一个含义：" +
+                "「与卡片对齐的药丸横向内缩」，它必须来自 `Spacing.CardHorizontalMargin`。" +
+                "先定义一个本地 `private val … = 16.dp` 再引用它，同样是绕过单一真源 " +
+                "（形式上用了常量，实际是第二份数字），本条一并封死。",
+            dock.contains("16.dp")
         )
     }
 }

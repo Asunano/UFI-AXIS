@@ -1,7 +1,16 @@
 package com.ufi_axis.ui.components.common
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.ContentTransform
+import androidx.compose.animation.SizeTransform
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
@@ -14,6 +23,8 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -21,6 +32,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +48,157 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiMotion
 
 /**
+ * 标题两侧为动作位预留的宽度（左返回键 / 右 actions 都是 48dp 触区）。
+ *
+ * 之所以是常量而不是"有返回键才留"：`actions` 是一个 `@Composable` lambda，组合前无法判断它
+ * 是否真的画了东西；左右不对称留白又会让居中标题偏轴。留固定值最省心，代价只是极长标题
+ * 早一点出现省略号。
+ */
+private val HEADER_TITLE_SIDE_RESERVE = 52.dp
+
+/*
+ * 标题栏上下内边距（2026-09-17 放大约 20%；2026-09-18 再放大一档，与标题字号
+ * 22sp → 26sp 同步）。
+ *
+ * 原来是 4 / 8dp，标题挤在状态栏与内容之间。字号与高度必须一起改：只加字号会让标题
+ * 贴住上下边缘，只加高度则显得空。
+ *
+ * 带「正在播放」的那一套更高：右侧是双行（曲名·歌手 + 歌词），需要更多竖向空间。
+ */
+private val HEADER_PADDING_TOP = 12.dp
+private val HEADER_PADDING_BOTTOM = 16.dp
+private val HEADER_PADDING_TOP_NOW_PLAYING = 16.dp
+/**
+ * 带挂件时的底部内边距。
+ *
+ * 2026-09-19 从 22dp 收到 10dp：底下多出来的那截原本是给"右侧双行挂件"留的呼吸，
+ * 但挂件现在自己定高（[UfiHeaderSlotDefaults]），这 22dp 就纯粹变成了诗句与内容区
+ * 之间的一段空白 —— 诗句看着像掉在标题栏外面。
+ */
+private val HEADER_PADDING_BOTTOM_NOW_PLAYING = 10.dp
+
+/**
+ * 标题栏右侧「正在播放」区的注入口（2026-09-17）。
+ *
+ * ## 为什么是全局单例而不是形参
+ * 这块内容要出现在**每一个**页面的标题栏上（音乐在后台放着，用户走到哪都该能控制），
+ * 而它的实现要连 MediaSession（在 `:app:feature-media`）—— 本模块不依赖那一层。
+ * 逐个页面传形参等于改几十处调用；所以留一个注入口：`:app` 启动时把实现塞进来，
+ * 页壳只管渲染。与 [CapsuleInsetHolder] / [CapsuleTouchGate] 是同一种做法。
+ *
+ * ## [active] 为什么必须单独给
+ * `content` 是个 `@Composable` lambda，**组合前无法知道它会不会真的画东西**（没在播时它
+ * 什么都不画）。而标题栏版式要据此切换：有内容时标题靠左、右侧让位；没有时标题保持居中。
+ * 所以由内容侧显式告知"我现在有东西要显示"。
+ */
+object UfiNowPlayingSlot {
+    /** 标题栏右侧的内容（由 `:app` 注入，实现在 `:app:feature-media`）。 */
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+
+    /** 此刻是否真的有东西要显示（由内容侧写入）。false = 标题栏保持原来的居中版式。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+/**
+ * 标题栏右侧「今日天气」区的注入口（2026-09-17）。
+ *
+ * 与 [UfiNowPlayingSlot] 共用同一块位置（标题栏右侧），**优先级低于它**：
+ * 正在放歌时那块地给播放控制，没在放才显示天气。理由是播放态是可操作的、且转瞬即变，
+ * 天气是纯展示、慢变量 —— 让可操作的那个赢。两个都想占位的话就成了会互相盖住的假开关。
+ *
+ * 实现放在 `:app:feature-settings`（那边有 viewModel 与设置页），`:app` 启动时注入。
+ */
+/**
+ * 标题栏**右侧天气**的注入口（2026-09-18 第二版）。
+ *
+ * 位置演化说明（别再来回搬）：
+ * - 09-17 天气在右侧，与「正在播放」抢同一块地、靠优先级互相让位；
+ * - 09-18 上午挪到标题下方小字，与诗词并排 —— 但两个都开时一行小字塞不下；
+ * - 09-18 现在：**天气回到右侧（信息可以更全）、诗词占标题下方小字**，各有其位。
+ *
+ * 与 [UfiNowPlayingSlot] 仍然共用右侧那块地，取舍不变：**放歌时播放控制优先**，
+ * 天气暂时隐藏。理由是播放态可操作、且转瞬即变，天气是纯展示的慢变量。
+ */
+object UfiWeatherSlot {
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+
+    /** 开关开着、城市设过、且已取到数据时才为 true（由内容侧写入）。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+/**
+ * 标题栏**标题下方小字**的注入口（2026-09-18）。
+ *
+ * ## 它和 subtitle 不是一回事
+ * [UfiHeader] 的 `subtitle` 是**页面说明**（属于这个页面本身，如二级页的"连接模式 · 网络制式"）；
+ * 这里的 caption 是**挂件**（今日诗词），与页面内容无关、随设置开关出现或消失，
+ * 而且要出现在很多页面上。两者语义不同，所以不复用同一个参数：
+ * 让页面把诗词当"页面说明"传进来，就等于每个页面都要知道诗词功能的存在。
+ *
+ * 与 [UfiNowPlayingSlot] / [UfiWeatherSlot] 同一种做法：`:app` 启动时注入实现，页壳只渲染。
+ */
+object UfiHeaderCaptionSlot {
+    val content: MutableState<(@Composable () -> Unit)?> = mutableStateOf(null)
+    /** 此刻是否真的有东西要显示（由内容侧写入）。 */
+    val active: MutableState<Boolean> = mutableStateOf(false)
+}
+
+/**
+ * 标题栏右侧这块地此刻归谁（[UfiNowPlayingSlot] 优先，其次 [UfiWeatherSlot]）。
+ *
+ * 之所以要这么一个枚举，而不是直接把槽里的 lambda 交给 `AnimatedContent`：
+ * 槽存的是 `@Composable` lambda，注入侧每次重组都会给出**新实例**，
+ * 用它当 `targetState` 等于每一帧都判定"目标变了" —— 挂件会永远停在过渡中。
+ * 所以先把判定压成这个稳定值，内容再从槽里取。
+ */
+private enum class UfiHeaderSlotTarget { NowPlaying, Weather }
+
+/**
+ * 标题栏右侧挂件的交叉过渡（2026-09-20）。
+ *
+ * 在此之前天气与播放挂件是**硬切**的：暂停 30s 让位那一下，右侧直接从双行挂件跳成天气。
+ * 两者占的是同一个位置，所以用淡入淡出 + 轻微**竖向**位移 —— 横向滑会与页面本身的
+ * 横向转场撞成两个方向的运动。位移量与 chip 内部换歌词那一套同源（1/3 自身高度，
+ * 见 `MediaNowPlayingChip` 的 `chipTextTransition`），不是整屏量级。
+ *
+ * "槽整体消失"（没在放歌又没有天气）不在这里处理：那时 header 的版式要从"标题左对齐"
+ * 回到"标题居中"，而版式由 `nowPlaying == null` 决定，留在过渡里反而会让标题跳两次。
+ */
+@Composable
+private fun UfiHeaderSlotSwitcher(target: UfiHeaderSlotTarget) {
+    AnimatedContent(
+        targetState = target,
+        transitionSpec = { headerSlotTransition() },
+        label = "headerRightSlot"
+    ) { shown ->
+        when (shown) {
+            UfiHeaderSlotTarget.NowPlaying -> UfiNowPlayingSlot.content.value?.invoke()
+            UfiHeaderSlotTarget.Weather -> UfiWeatherSlot.content.value?.invoke()
+        }
+    }
+}
+
+private fun AnimatedContentTransitionScope<UfiHeaderSlotTarget>.headerSlotTransition():
+    ContentTransform {
+    val ms = UfiMotion.Duration.Standard
+    return (
+        fadeIn(tween(ms)) +
+            slideInVertically(tween(ms)) { it / HEADER_SLOT_SLIDE_DIVISOR }
+        ) togetherWith (
+        fadeOut(tween(ms)) +
+            slideOutVertically(tween(ms)) { -it / HEADER_SLOT_SLIDE_DIVISOR }
+        ) using
+        // clip = false：两块挂件宽度差不小（播放挂件带 48dp 封面 + 两行文字，天气窄得多），
+        // 容器宽度收缩时裁剪会把正在淡出的那块切成硬边。不裁剪只是让它在透明度掉到 0 前
+        // 多往左借几十 dp，而那一带是标题与挂件之间的留白。
+        SizeTransform(clip = false) { _, _ -> tween(ms) }
+}
+
+/** 挂件切换时的竖向位移取自身高度的 1/3：两块内容都在标题栏内，整高位移会越出标题栏。 */
+private const val HEADER_SLOT_SLIDE_DIVISOR = 3
+
+
+/**
  * Custom header bar matching UFITOOLSWidget style:
  * Centered title (28sp bold) + optional subtitle, back button on the left, actions on the right.
  *
@@ -46,9 +209,18 @@ import com.ufi_axis.ui.theme.UfiMotion
 private fun UfiHeader(
     title: String,
     subtitle: String? = null,
+    /**
+     * 标题下方的小字（天气 / 今日诗词）。由 [UfiHeaderCaptionSlot] 注入，
+     * **不是页面说明** —— 页面说明是 [subtitle]。
+     */
+    caption: (@Composable () -> Unit)? = null,
     showBack: Boolean = false,
     onBack: (() -> Unit)? = null,
     navigationIcon: @Composable (() -> Unit)? = null,
+    /**
+     * 标题栏右侧的「正在播放」区（[UfiNowPlayingSlot] 注入，非 null 时标题改为左对齐）。
+     */
+    nowPlaying: (@Composable () -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {}
 ) {
     val palette = LocalResolvedPalette.current
@@ -60,7 +232,26 @@ private fun UfiHeader(
             // 状态栏安全区由 [UfiScreenScaffold] 的根 Column 统一消费一次
             // （`statusBarsPadding()`，2026-09-04 由宿主 Scaffold 移交至此），
             // header 只保留 4.dp 的视觉顶间距。两处都加会把标题往下推两倍状栏高。
-            .padding(top = 4.dp, bottom = 8.dp)
+            //
+            // 带「正在播放」时整条**加高**：右侧那块是双行（曲名/歌手 + 歌词），
+            // 按原来的高度会挤到标题栏边缘。
+            //
+            // 2026-09-17：两套高度整体再放大约 20%（全局）—— 原来的标题栏偏紧，
+            // 标题基线离状态栏与内容区都太近。这里只加内边距、不动文字样式，
+            // 所以标题与右侧动作的对齐关系不变。
+            .then(
+                if (nowPlaying != null) {
+                    Modifier.padding(
+                        top = HEADER_PADDING_TOP_NOW_PLAYING,
+                        bottom = HEADER_PADDING_BOTTOM_NOW_PLAYING
+                    )
+                } else {
+                    Modifier.padding(
+                        top = HEADER_PADDING_TOP,
+                        bottom = HEADER_PADDING_BOTTOM
+                    )
+                }
+            )
             .padding(horizontal = Spacing.HeaderPaddingH)
     ) {
         // Back button (left) — 优先使用自定义 navigationIcon（如带文字的"退出"按钮），
@@ -102,7 +293,8 @@ private fun UfiHeader(
             }
         }
 
-        // Centered title + subtitle
+        // 标题入场模糊。放在 UfiHeader 而不是 [UfiHeaderTitleBlock] 里：挂件出现 / 消失会切分支，
+        // Animatable 建在子组件里就会随分支重建、让标题白白再模糊一次。
         val titleBlur = remember { Animatable(8f) }
         LaunchedEffect(title) {
             titleBlur.snapTo(8f)
@@ -111,47 +303,144 @@ private fun UfiHeader(
             // 已改名为 HEADER_TITLE_BLUR_MS，值 350ms 不变（有意例外，理由见其 KDoc）。
             titleBlur.animateTo(0f, tween(UfiMotion.HEADER_TITLE_BLUR_MS))
         }
-        Column(
-            modifier = Modifier.align(Alignment.Center),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = title,
-                style = UfiTextStyles.headerTitle,
-                color = palette.textPrimary,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.graphicsLayer {
-                    val r = titleBlur.value
-                    if (r > 0.5f) {
-                        renderEffect = android.graphics.RenderEffect.createBlurEffect(
-                            r, r, android.graphics.Shader.TileMode.CLAMP
-                        ).asComposeRenderEffect()
-                    }
-                    alpha = if (r > 4f) 0.6f else 1f
-                }
-            )
-            if (subtitle != null) {
-                Text(
-                    text = subtitle,
-                    style = UfiTextStyles.headerSubtitle,
-                    color = palette.textPrimary.copy(alpha = 0.45f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.padding(top = 2.dp)
+
+        if (nowPlaying != null) {
+            /*
+             * 有挂件时：**一行两列的真 Row**（2026-09-21 从"两个绝对定位层"改过来）。
+             *
+             * 旧结构是同一个 Box 里两个 `align()` 的层：标题列 `fillMaxWidth(0.44f)`、
+             * 挂件层 `matchParentSize()` + `align(CenterEnd)`。两个问题：
+             *  1. **诗句被按比例截断**。标题列宽度写死成内容宽的 44%，完全不看挂件实际多宽 ——
+             *     天气挂件只占 110dp 左右、那一行明显有空余时，诗句照样在 44% 处省略号。
+             *  2. **左右会重叠**。两个绝对定位层互不相让：窄屏 + 长歌名时
+             *     标题列 144dp + 挂件 202dp > 内容宽 328dp，挂件直接压在诗句上。
+             *     以前挂件有半透明底色，重叠看着像"字在块下面"，不容易发现。
+             *
+             * 改成 Row 之后两件事同时解决：标题列 `weight(1f)` 吃**剩余**宽度（挂件宽则诗句窄、
+             * 挂件窄则诗句宽），而 Row 本身保证不重叠。
+             *
+             * `height(IntrinsicSize.Min)` 是替代 `matchParentSize()` 的那一环：它让 Row 的高度
+             * 等于"最高子项"（即标题列），于是挂件的 `fillMaxHeight()` 拿到的就是标题列的高度，
+             * 两侧依旧自动等高、依旧不需要任何写死的 dp。
+             *
+             * ⚠ 挂件自身的宽度必须**与内容长短无关**（音乐挂件靠 `CHIP_TEXT_MAX_WIDTH` 封顶、
+             * 长歌词靠横向滚动）。否则每换一行歌词这里的分配就变一次，标题与诗句会来回伸缩。
+             */
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(IntrinsicSize.Min)
+                    // 返回键仍是下面那个绝对定位的 Box，这里让开它的位置
+                    .padding(
+                        start = if (showBack || navigationIcon != null) {
+                            HEADER_TITLE_SIDE_RESERVE
+                        } else {
+                            0.dp
+                        }
+                    ),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                UfiHeaderTitleBlock(
+                    title = title,
+                    subtitle = subtitle,
+                    caption = caption,
+                    centered = false,
+                    blurRadius = { titleBlur.value },
+                    modifier = Modifier.weight(1f)
                 )
+                // 挂件排在页面自己的 actions 之前（更靠左），这样各页右上角原有按钮的位置
+                // 不会因为音乐在放而左右跳动。
+                Row(
+                    modifier = Modifier.fillMaxHeight(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    nowPlaying()
+                    actions()
+                }
+            }
+        } else {
+            // 无挂件：标题**居中绝对定位**，两侧各留一个动作位（48dp 触区 + 4dp 呼吸），
+            // 长标题（视频播放页的文件名）省略号而不是压在返回键 / actions 上面。
+            // 左右对称留白是为了让标题保持真正居中。
+            UfiHeaderTitleBlock(
+                title = title,
+                subtitle = subtitle,
+                caption = caption,
+                centered = true,
+                blurRadius = { titleBlur.value },
+                modifier = Modifier
+                    .align(Alignment.Center)
+                    .padding(horizontal = HEADER_TITLE_SIDE_RESERVE)
+            )
+            Row(
+                modifier = Modifier.align(Alignment.CenterEnd),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                actions()
             }
         }
+    }
+}
 
-        // Actions (right)
-        Row(
-            modifier = Modifier.align(Alignment.CenterEnd),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-            content = actions
+/**
+ * 标题栏左侧那一列：标题 / 页面说明 / 挂件小字（天气 · 诗词）。
+ *
+ * 抽出来是因为「有挂件」与「无挂件」两个分支的**外层布局完全不同**（Row 的 weight 项
+ * vs Box 里的居中层），但列内容一模一样 —— 写两份的代价是文案与间距迟早分叉。
+ *
+ * @param centered 无挂件时标题居中；有挂件时左对齐（右侧要让位）。
+ * @param blurRadius 入场模糊半径。传 lambda 而不是 Float：让 `.value` 的读取留在
+ *   `graphicsLayer` 的**绘制**阶段，否则动画那 350ms 会把整条标题栏每帧重组一次。
+ */
+@Composable
+private fun UfiHeaderTitleBlock(
+    title: String,
+    subtitle: String?,
+    caption: (@Composable () -> Unit)?,
+    centered: Boolean,
+    blurRadius: () -> Float,
+    modifier: Modifier = Modifier
+) {
+    val palette = LocalResolvedPalette.current
+    Column(
+        modifier = modifier,
+        horizontalAlignment = if (centered) Alignment.CenterHorizontally else Alignment.Start
+    ) {
+        Text(
+            text = title,
+            style = UfiTextStyles.headerTitle,
+            color = palette.textPrimary,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = if (centered) TextAlign.Center else TextAlign.Start,
+            modifier = Modifier.graphicsLayer {
+                val r = blurRadius()
+                if (r > 0.5f) {
+                    renderEffect = android.graphics.RenderEffect.createBlurEffect(
+                        r, r, android.graphics.Shader.TileMode.CLAMP
+                    ).asComposeRenderEffect()
+                }
+                alpha = if (r > 4f) 0.6f else 1f
+            }
         )
+        if (subtitle != null) {
+            Text(
+                text = subtitle,
+                style = UfiTextStyles.headerSubtitle,
+                color = palette.textPrimary.copy(alpha = 0.45f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = if (centered) TextAlign.Center else TextAlign.Start,
+                modifier = Modifier.padding(top = 2.dp)
+            )
+        }
+        // 标题下方小字（天气 / 今日诗词，2026-09-18）。排在 subtitle 之下：
+        // 页面说明是页面自己的属性、优先靠近标题；挂件是外挂信息，垫在最后一行。
+        if (caption != null) {
+            Box(modifier = Modifier.padding(top = 3.dp)) { caption() }
+        }
     }
 }
 
@@ -221,6 +510,23 @@ fun UfiScreenScaffold(
     navController: NavHostController? = null,
     showBack: Boolean = false,
     showHeader: Boolean = true,  // 2026-08-11：新增，子页面被外层 Tab 嵌套调用时传 false 避免多重标题栏
+    /**
+     * 整页底色的额外一层渐变（2026-09-16 新增，默认 null = 只用 `pageBg`）。
+     *
+     * 加它是因为「顶栏与内容不同色」：音乐播放页的内容区自己画了一层 accent 渐变，
+     * 而标题栏在本壳里、只有 `pageBg`，于是标题栏与下方内容之间有一道明显的色阶。
+     * 传进来的画刷会铺满**整壳**（含标题栏与状态栏区域），页面内容区因此不必再自己画背景。
+     */
+    backgroundBrush: Brush? = null,
+    /**
+     * 是否在本页标题栏显示「正在播放」区（默认 **不显示**）。
+     *
+     * 默认关掉是因为它会改变标题栏版式（标题左对齐 + 整条加高）：二级页的标题栏往上下都塞满了
+     * 东西（返回键、长文件名、页面自己的动作），跟着一起变会把那些页面的布局挤坏。
+     * 现在只有首页那 5 个 Tab（仪表盘 / 网络设置 / 监控中心 / 工具 / 设置）显式打开它 ——
+     * 那几页的标题栏本来就只有一个标题，位置最富余。
+     */
+    showNowPlaying: Boolean = false,
     navigationIcon: @Composable (() -> Unit)? = null,
     actions: @Composable RowScope.() -> Unit = {},
     onBack: (() -> Unit)? = null,
@@ -230,6 +536,20 @@ fun UfiScreenScaffold(
     val focusManager = LocalFocusManager.current
     val keyboardController = LocalSoftwareKeyboardController.current
 
+    // 标题栏右侧归谁：正在播放优先，其次今日天气（2026-09-18 天气回到右侧）。
+    // 两者共用同一块地：播放态可操作、且转瞬即变，所以它赢；天气是慢变量，放歌期间暂时隐藏。
+    //
+    // 判定提到这里、并压成一个枚举，是为了让下面那次切换能走 AnimatedContent ——
+    // 槽里的 `@Composable` lambda 每次注入都是新实例，不能直接当过渡的 targetState。
+    val slotTarget = when {
+        !showNowPlaying -> null
+        UfiNowPlayingSlot.active.value && UfiNowPlayingSlot.content.value != null ->
+            UfiHeaderSlotTarget.NowPlaying
+        UfiWeatherSlot.active.value && UfiWeatherSlot.content.value != null ->
+            UfiHeaderSlotTarget.Weather
+        else -> null
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -238,14 +558,17 @@ fun UfiScreenScaffold(
             // 2026-09-04（转场中上下各一道白框）：上一轮把 `statusBarsPadding()` 加到这里时
             // **没有**给本 Column 铺底色，页面底色完全靠祖先（目的地 Box / 宿主 Scaffold
             // 的 containerColor / `window` 背景）兜底。于是状态栏与手势条那两条带子并不是
-            // 「本页自己的像素」——转场中本页整体平移 / 缩放（`ufiNavRecedeLayer` 的
-            // `CompositingStrategy.Offscreen` 会把内容裁到图层边界）时，那两条带子露出的是
-            // 图层外的窗口底色，真机观感就是「上下各一道白框，且因卡片阴影更明显」。
+            // 「本页自己的像素」——转场中本页整体平移（不再缩放、不再离屏裁剪）时，
+            // 那两条带子露出的就是祖先兜底的非本页像素 —— 窗口底色，真机观感就是
+            // 「上下各一道白框，且因卡片阴影更明显」。
             //
             // 现在本壳自持底色：`background` 排在 `statusBarsPadding()` **之前**，
             // 所以底色铺到屏幕物理边缘、inset 只收内容 —— 无论祖先画不画、图层怎么裁，
             // 这两条带子永远是页面底色。
             .background(palette.pageBg)
+            // 页面自带的渐变（可选）：铺在 pageBg 之上、inset 之前，所以标题栏与状态栏区域
+            // 都会被它盖住 —— 这正是"顶栏与内容同色"的做法。
+            .then(if (backgroundBrush != null) Modifier.background(backgroundBrush) else Modifier)
             // ★ 状态栏安全区的唯一落点（2026-09-04 从 MainNavGraph 的 Scaffold innerPadding
             //   移交至此，理由见本函数 KDoc）。用 statusBarsPadding() 而不是
             //   windowInsetsPadding(safeDrawing)：底部由下面那个内容 Box 单独处理
@@ -275,6 +598,13 @@ fun UfiScreenScaffold(
                     else -> null
                 },
                 navigationIcon = navigationIcon,
+                // 标题栏右侧：归属由上面的 slotTarget 定，切换走 AnimatedContent（见 UfiHeaderSlotSwitcher）。
+                // 右侧一旦有内容，标题就改为**左对齐**（见 UfiHeader）。
+                nowPlaying = slotTarget?.let { target -> { UfiHeaderSlotSwitcher(target) } },
+                // 标题下方小字：今日诗词。与右侧插槽互不影响，两个功能各占一处。
+                caption = if (!showNowPlaying) null else {
+                    UfiHeaderCaptionSlot.content.value?.takeIf { UfiHeaderCaptionSlot.active.value }
+                },
                 actions = actions
             )
         }
@@ -308,6 +638,10 @@ fun UfiScreenScaffold(
                 }
         ) {
             content(PaddingValues(0.dp))
+
+            // 2026-09-19：天气下拉浮层（覆盖在内容上方、带遮罩、从顶部滑入）。
+            // 放在 content 之后（同一个 Box 内）使它叠在内容上面。
+            UfiHeaderDrawerHost()
         }
     }
 }

@@ -6,6 +6,7 @@ import android.content.Intent
 import com.ufi_axis.data.model.AlertRecord
 import com.ufi_axis.util.AppJson
 import com.ufi_axis.util.DebugLog
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 
 /**
@@ -17,9 +18,13 @@ import kotlinx.serialization.encodeToString
  * - 同一条告警在两个进程各自判定为"新" → 重复响铃/震动（通知 id 固定 1000，视觉上只覆盖一条）；
  * - 并发写同一 key 时 last-writer-wins → 游标被回退或跳过 → **漏通知**。
  *
- * 收敛方案：系统通知只在本进程发射。主进程调用 [dispatch] 把告警转交过来。
+ * 收敛方案：系统通知只在本进程发射。主进程调用 [dispatch] 把告警转交过来；
+ * 其余场景（短信 / 验证码 / 下载 / 测试等）经 [dispatchScene] / [dispatchTest] 转交，
+ * 由 [NotificationCenter.notify] 的进程门统一收口。
  * 由于是显式 Intent 指向本应用组件，不受 Android 8+ 隐式广播限制；
  * 且 Manifest 声明的接收器会在必要时**自动拉起** `:ufi_notify` 进程 —— 守护服务被杀时通知依然可达。
+ *
+ * 该广播**不会**反向拉起主进程：所有处理都在本接收器内完成。
  */
 class NotifyDispatchReceiver : BroadcastReceiver() {
 
@@ -28,6 +33,18 @@ class NotifyDispatchReceiver : BroadcastReceiver() {
 
         // ⓿ 开关镜像：主进程随每次通信下发最新开关快照，规避 MODE_PRIVATE 读过期（见 NotifyPrefs）
         NotifyPrefs.applySnapshot(context, intent.getStringExtra(EXTRA_SWITCH_SNAPSHOT))
+
+        // ⓪b 跨进程场景通知 / 测试通知（主进程 → :ufi_notify 唯一系统发射）
+        val sceneJson = intent.getStringExtra(EXTRA_NOTIFY_SCENE)
+        if (!sceneJson.isNullOrEmpty()) {
+            handleSceneRequest(context, sceneJson)
+            return
+        }
+        if (intent.getBooleanExtra(EXTRA_NOTIFY_TEST, false)) {
+            DebugLog.i(TAG, "收到测试通知转交，在 ${android.app.Application.getProcessName()} 内发射")
+            NotificationCenter(context).sendTestNotification()
+            return
+        }
 
         // ① 连接参数变更（重新配对 / 改 IP 端口）：转发给 NotifyService 重建 WS 与 API
         val newBaseUrl = intent.getStringExtra(EXTRA_BASE_URL)
@@ -72,6 +89,41 @@ class NotifyDispatchReceiver : BroadcastReceiver() {
         NotificationCenter(context).consumeDispatchedAlerts(alerts)
     }
 
+    private fun handleSceneRequest(context: Context, json: String) {
+        val req = try {
+            AppJson.decodeFromString<CrossProcessSceneRequest>(json)
+        } catch (e: Exception) {
+            DebugLog.w(TAG, "解析跨进程场景通知失败: ${e.message}")
+            return
+        }
+        val scene = NotifyScene.entries.find { it.sceneId == req.sceneId }
+        if (scene == null) {
+            DebugLog.w(TAG, "未知通知场景: ${req.sceneId}")
+            return
+        }
+        DebugLog.d(TAG, "在 ${android.app.Application.getProcessName()} 发射场景通知 ${req.sceneId}")
+        val center = NotificationCenter(context)
+        center.notify(
+            scene = scene,
+            payload = NotifyPayload(
+                title = req.title,
+                message = req.message,
+                bigText = req.bigText,
+                notificationId = req.notificationId,
+                deDupKey = req.deDupKey,
+                deDupValue = req.deDupValue,
+                silent = req.silent,
+                groupKey = req.groupKey,
+                category = req.category,
+                priority = req.priority,
+                autoCancel = req.autoCancel,
+                tapType = req.tapType,
+                smsPhone = req.smsPhone,
+                onTap = center.resolveOnTap(req.tapType, req.smsPhone)
+            )
+        )
+    }
+
     companion object {
         private const val TAG = "NotifyDispatch"
 
@@ -84,6 +136,12 @@ class NotifyDispatchReceiver : BroadcastReceiver() {
 
         /** 开关快照 extra（主进程 → `:ufi_notify` 镜像，见 [NotifyPrefs.snapshot]）。 */
         const val EXTRA_SWITCH_SNAPSHOT = "extra_switch_snapshot"
+
+        /** 跨进程场景通知 JSON（[CrossProcessSceneRequest]）。 */
+        const val EXTRA_NOTIFY_SCENE = "extra_notify_scene"
+
+        /** 测试通知转交标记。 */
+        const val EXTRA_NOTIFY_TEST = "extra_notify_test"
 
 
         /**
@@ -111,6 +169,64 @@ class NotifyDispatchReceiver : BroadcastReceiver() {
                 context.sendBroadcast(intent)
             } catch (e: Exception) {
                 DebugLog.w(TAG, "转交广播发送失败: ${e.message}")
+            }
+        }
+
+        /**
+         * 主进程 → `:ufi_notify` 转交通用场景通知（[NotificationCenter.notify] 的进程门出口）。
+         *
+         * @return 广播是否发出（发射结果在目标进程内异步完成，本返回值只表示「已交给系统」）。
+         */
+        fun dispatchScene(
+            context: Context,
+            scene: NotifyScene,
+            payload: NotifyPayload
+        ): Boolean {
+            val req = CrossProcessSceneRequest(
+                sceneId = scene.sceneId,
+                title = payload.title,
+                message = payload.message,
+                bigText = payload.bigText,
+                notificationId = payload.notificationId,
+                deDupKey = payload.deDupKey,
+                deDupValue = payload.deDupValue,
+                silent = payload.silent,
+                groupKey = payload.groupKey,
+                category = payload.category,
+                priority = payload.priority,
+                autoCancel = payload.autoCancel,
+                tapType = payload.tapType,
+                smsPhone = payload.smsPhone
+            )
+            val json = try {
+                AppJson.encodeToString(req)
+            } catch (e: Exception) {
+                DebugLog.w(TAG, "序列化场景通知失败: ${e.message}")
+                return false
+            }
+            val intent = Intent(context, NotifyDispatchReceiver::class.java)
+                .putExtra(EXTRA_NOTIFY_SCENE, json)
+                .putExtra(EXTRA_SWITCH_SNAPSHOT, NotifyPrefs.snapshot(context))
+            return try {
+                context.sendBroadcast(intent)
+                true
+            } catch (e: Exception) {
+                DebugLog.w(TAG, "场景通知转交失败: ${e.message}")
+                false
+            }
+        }
+
+        /** 主进程 → `:ufi_notify` 转交测试通知（设置页「发送测试」）。 */
+        fun dispatchTest(context: Context): Boolean {
+            val intent = Intent(context, NotifyDispatchReceiver::class.java)
+                .putExtra(EXTRA_NOTIFY_TEST, true)
+                .putExtra(EXTRA_SWITCH_SNAPSHOT, NotifyPrefs.snapshot(context))
+            return try {
+                context.sendBroadcast(intent)
+                true
+            } catch (e: Exception) {
+                DebugLog.w(TAG, "测试通知转交失败: ${e.message}")
+                false
             }
         }
 
@@ -157,3 +273,24 @@ class NotifyDispatchReceiver : BroadcastReceiver() {
     }
 }
 
+/**
+ * 主进程 → `:ufi_notify` 的场景通知载荷（可序列化；PendingIntent 不跨进程，
+ * 点击行为用 [tapType]/[smsPhone] 语义在目标进程内重建）。
+ */
+@Serializable
+data class CrossProcessSceneRequest(
+    val sceneId: String,
+    val title: String,
+    val message: String,
+    val bigText: String? = null,
+    val notificationId: Int,
+    val deDupKey: String? = null,
+    val deDupValue: String? = null,
+    val silent: Boolean = false,
+    val groupKey: String? = null,
+    val category: String? = null,
+    val priority: Int? = null,
+    val autoCancel: Boolean = true,
+    val tapType: String? = null,
+    val smsPhone: String? = null
+)

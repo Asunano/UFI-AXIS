@@ -251,27 +251,218 @@ class AppPreferences(private val context: Context) {
         get() = prefs.getString(KEY_FILE_VIEW_MODE, "LIST") ?: "LIST"
         set(value) = prefs.edit().putString(KEY_FILE_VIEW_MODE, value).apply()
 
+    // ── 媒体页展示偏好（2026-09-16 媒体中心拆成视频/音乐/图片三页）──
+    //
+    // 视图与排序是**纯展示偏好**，与 [fileViewMode] 同一口径：留在客户端本地，不往 core 写
+    // （core 只存"这台设备的媒体库范围"那种设备配置）。
+    //
+    // key 带类型后缀 = **按类型各存一份**：三页是独立页面，"视频看网格、音乐看列表"是
+    // 正常诉求，共用一份偏好会让切页面时视图莫名其妙地变。
+    //
+    // 图片页默认网格（默认值里唯一的例外）：一屏能看到的图越多越有用，列表反而在浪费横向空间。
+
+    /** @param type `video` / `audio` / `image` */
+    fun mediaGridView(type: String): Boolean =
+        prefs.getBoolean("media_grid_view_$type", type == "image")
+
+    fun setMediaGridView(type: String, grid: Boolean) {
+        prefs.edit().putBoolean("media_grid_view_$type", grid).apply()
+    }
+
+    /** 媒体页排序字段：`date` / `name` / `size`（与 core `/api/media/list` 的取值一致）。 */
+    fun mediaSort(type: String): String =
+        prefs.getString("media_sort_$type", "date") ?: "date"
+
+    /** 媒体页排序方向：`desc` / `asc`。 */
+    fun mediaOrder(type: String): String =
+        prefs.getString("media_order_$type", "desc") ?: "desc"
+
+    fun setMediaSort(type: String, sort: String, order: String) {
+        prefs.edit()
+            .putString("media_sort_$type", sort)
+            .putString("media_order_$type", order)
+            .apply()
+    }
+
+    // ── 音乐：播放队列快照（2026-09-23）─────────────────────────────────────
+    //
+    // 为什么要存：用户可以往队列里插歌（「下一首播放」）、移除、拖拽排序。这份自定义顺序
+    // **不能**从「作用域」推导出来 —— 作用域只知道"这是某个专辑/歌单的全部歌"，
+    // 不知道用户把第 7 首挪到了第 2 位。服务被杀（onTaskRemoved → stopSelf）之后
+    // 不存就永久丢失。
+    //
+    // 只存路径列表而不是 MediaItem：后者不可序列化。URL 恢复时用 AppPreferences 里的
+    // 主机与端口现场重建（`streamUrl` 本来也就只依赖这两个），所以换了设备地址也能重建 ——
+    // 但**路径在新设备上不一定存在**，所以换设备时必须整份清掉（见 clearAudioQueue 的调用方）。
+
+    /** 播放队列快照的原始 JSON。空串 = 没有快照。结构见 `UfiAudioQueueStore`。 */
+    var audioQueueJson: String
+        get() = prefs.getString(KEY_AUDIO_QUEUE, "").orEmpty()
+        set(value) = prefs.edit().putString(KEY_AUDIO_QUEUE, value).apply()
+
+    /** 换设备 / 换地址时清掉队列快照：旧设备的文件路径在新设备上基本不成立。 */
+    fun clearAudioQueue() {
+        prefs.edit().remove(KEY_AUDIO_QUEUE).apply()
+    }
+
+    // ── 音乐：循环 / 随机模式（2026-09-22）───────────────────────────────────
+
+    //
+    // 为什么必须持久化：这两个模式原来**只活在 MediaSession 的 ExoPlayer 里**，而服务
+    // 在「没在播 + 任务被划掉」时会 stopSelf()、onDestroy 里 release 掉 player。下一次
+    // 连上拿到的是全新 ExoPlayer，默认 REPEAT_MODE_OFF / shuffle=false —— 用户选的
+    // 单曲循环就这么静默消失了，界面上也没有任何提示（表现就是"循环功能时好时坏"）。
+    //
+    // 存本地而不是 core：这是"我想怎么听"，属于个人播放偏好，和媒体库范围那类设备配置不同。
+
+    /**
+     * 循环模式。取值直接沿用 media3 的 `Player.REPEAT_MODE_*`（0=不循环 / 1=单曲 / 2=列表）。
+     *
+     * 刻意**不**自定义枚举再映射：全站只有这一个消费者（播放服务），多一层映射就多一个
+     * 会漂的地方，而 media3 那三个常量本身就是稳定的公开 API。
+     *
+     * getter 夹到合法区间：SharedPreferences 是可以被外部写脏的（adb / 备份恢复 / 降级），
+     * 把非法值直接塞给 `player.repeatMode` 会让播放器行为未定义。
+     */
+    var audioRepeatMode: Int
+        get() = prefs.getInt(KEY_AUDIO_REPEAT_MODE, 0).coerceIn(0, 2)
+        set(value) = prefs.edit().putInt(KEY_AUDIO_REPEAT_MODE, value.coerceIn(0, 2)).apply()
+
+    /** 随机播放是否开启。 */
+    var audioShuffleEnabled: Boolean
+        get() = prefs.getBoolean(KEY_AUDIO_SHUFFLE, false)
+        set(value) = prefs.edit().putBoolean(KEY_AUDIO_SHUFFLE, value).apply()
+
+    // ── 媒体：播放进度（2026-09-16）──
+
+
+    /**
+     * 上次播放到哪（毫秒）。0 = 没有记录 / 已看完。
+     *
+     * 存**本地**而不是 core：这是"我看到哪儿了"，属于个人观看进度，两台手机各自记自己的
+     * 才合理；core 那边存的是"这台设备的媒体库范围"那类设备配置。
+     *
+     * key 用路径的 SHA-256 前 16 位十六进制：路径可能很长、含中文与空格，直接当 key
+     * 既难读也容易踩到 SharedPreferences 的边界。
+     */
+    fun mediaPlaybackPosition(path: String): Long =
+        prefs.getLong(mediaPositionKey(path), 0L)
+
+    /**
+     * 记下播放位置。[positionMs] <= 0 视为清除（看完了就别再"续播"到片尾）。
+     *
+     * 顺带做**条数上限**（[MEDIA_POSITION_LIMIT]）：按写入顺序淘汰最早的，
+     * 否则看过几千个文件之后这个 prefs 会一直长。
+     */
+    fun setMediaPlaybackPosition(path: String, positionMs: Long) {
+        val key = mediaPositionKey(path)
+        // 读改写整串必须串行（见 mediaListLock）：并发时后写覆盖前写，
+        // 淘汰队列丢条目就会留下永不回收的 media_pos_* 残键。
+        synchronized(mediaListLock) {
+            if (positionMs <= 0L) {
+                val order = mediaPositionOrder().filterNot { it == key }
+                prefs.edit()
+                    .remove(key)
+                    .putString(KEY_MEDIA_POSITION_ORDER, order.joinToString(","))
+                    .apply()
+                return
+            }
+            // 重新入队到末尾（既是"最近写入"也是淘汰顺序）
+            val order = (mediaPositionOrder().filterNot { it == key } + key).toMutableList()
+            val editor = prefs.edit().putLong(key, positionMs)
+            while (order.size > MEDIA_POSITION_LIMIT) {
+                editor.remove(order.removeAt(0))
+            }
+            editor.putString(KEY_MEDIA_POSITION_ORDER, order.joinToString(",")).apply()
+        }
+    }
+
+    private fun mediaPositionOrder(): List<String> =
+        prefs.getString(KEY_MEDIA_POSITION_ORDER, "")
+            ?.split(',')
+            ?.filter { it.isNotBlank() }
+            ?: emptyList()
+
+    private fun mediaPositionKey(path: String): String {
+        val digest = runCatching {
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(path.toByteArray())
+                .take(8)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrElse { Integer.toHexString(path.hashCode()) }
+        return "media_pos_$digest"
+    }
+
+    // ── 媒体：抽帧开关 & 最近播放（2026-09-16 第三轮）──
+
+    /**
+     * 最近播放（首页横向列表）。存 `path|name|id` 三段，最新的在前，最多 [MEDIA_RECENT_LIMIT] 条。
+     *
+     * 用分隔符拼串而不是 JSON：这里只有三个字段且都不含换行，引一份序列化器不划算；
+     * 路径里可能出现 `|` 的概率不为零，所以取值时按**前两个**分隔符切，第三段之后整体保留。
+     */
+    fun mediaRecentPlays(): List<Triple<String, String, Long>> =
+        prefs.getString(KEY_MEDIA_RECENT, "")
+            ?.split('\n')
+            ?.filter { it.isNotBlank() }
+            ?.mapNotNull { line ->
+                val parts = line.split('|')
+                if (parts.size < 3) return@mapNotNull null
+                val id = parts.last().toLongOrNull() ?: return@mapNotNull null
+                val path = parts[0]
+                val name = parts.subList(1, parts.size - 1).joinToString("|")
+                if (path.isBlank()) null else Triple(path, name, id)
+            }
+            ?: emptyList()
+
+    /** 记一条最近播放：已存在的先摘掉再插到最前（"最近"而不是"第一次"）。 */
+    fun addMediaRecentPlay(path: String, name: String, id: Long) {
+        if (path.isBlank()) return
+        val line = "$path|${name.replace('\n', ' ')}|$id"
+        // 与 setMediaPlaybackPosition 同锁：整串读改写，并发会丢条目
+        synchronized(mediaListLock) {
+            val kept = mediaRecentPlays()
+                .filterNot { it.first == path }
+                .take(MEDIA_RECENT_LIMIT - 1)
+                .map { "${it.first}|${it.second}|${it.third}" }
+            prefs.edit()
+                .putString(KEY_MEDIA_RECENT, (listOf(line) + kept).joinToString("\n"))
+                .apply()
+        }
+    }
+
+    /** 清空最近播放（设置页给的动作；不影响播放进度记录）。 */
+    fun clearMediaRecentPlays() {
+        synchronized(mediaListLock) {
+            prefs.edit().remove(KEY_MEDIA_RECENT).apply()
+        }
+    }
+
+
     // ── 更新源 / 镜像源设置（2026-08-10：前端直连 GitHub + 镜像加速） ──
 
-    /** 更新源模式："auto"（按国家自动切换）/ "mirror"（强制镜像）/ "direct"（GitHub 直连），默认 auto */
+    /**
+     * 下载方式："auto"（按地区自动切换）/ "mirror"（强制镜像）/ "direct"（GitHub 直连），默认 auto。
+     *
+     * 2026-09-22：**真源是 core**（`GET /api/config` 的 `update_source_mode`，决策在
+     * core 的 `MirrorResolver`）。这里只是回读下来的缓存，作用有两个：弹窗打开时有值可显示，
+     * 以及 core 不可达时给 [UpdateSource.candidateUrls] 兜底（那时 app 只能靠这份记忆判断
+     * 用户到底要不要镜像）。
+     */
     var updateSourceMode: String
         get() = prefs.getString(KEY_UPDATE_SOURCE_MODE, "auto") ?: "auto"
         set(value) = prefs.edit().putString(KEY_UPDATE_SOURCE_MODE, value).apply()
 
-    /** 镜像源下标（UpdateSource.MIRROR_PREFIXES 列表索引），默认 0 */
-    var updateMirrorIndex: Int
-        get() = prefs.getInt(KEY_UPDATE_MIRROR_INDEX, 0)
-        set(value) = prefs.edit().putInt(KEY_UPDATE_MIRROR_INDEX, value.coerceIn(0, 2)).apply()
 
-    /** 自定义镜像前缀（URL 前直接拼接；非空时优先于 updateMirrorIndex 使用），默认空 */
-    var updateMirrorCustom: String
-        get() = prefs.getString(KEY_UPDATE_MIRROR_CUSTOM, "") ?: ""
-        set(value) {
-            val v = value.trim().trimEnd('/')
-            prefs.edit().putString(KEY_UPDATE_MIRROR_CUSTOM, if (v.isEmpty()) "" else "$v/").apply()
-        }
+    /**
+     * core 给出的出网国家码的**本地缓存**（"CN"/"US"/"" 表示未知），默认 ""。
+     *
+     * 2026-09-18：app 不再自己做地理检测（原 `GeoDetector` 已删），真源是 core 的
+     * `GET /api/geo`。这里只由 [UpdateSource.countryForDisplay] 在读到 core 结果时回写，
+     * 且**只用于 core 不可达时的界面显示** —— 选源一律按 core 的决策
+     * （`GET /api/update/source`）走，不拿这份缓存自己判断。
+     */
 
-    /** 最近一次国家检测结果缓存（"CN"/"US"/"" 表示未知），默认 "" */
     var lastCountry: String
         get() = prefs.getString(KEY_LAST_COUNTRY, "") ?: ""
         set(value) = prefs.edit().putString(KEY_LAST_COUNTRY, value).apply()
@@ -281,10 +472,6 @@ class AppPreferences(private val context: Context) {
         get() = prefs.getBoolean(KEY_AUTO_CHECK_UPDATE, true)
         set(value) = prefs.edit().putBoolean(KEY_AUTO_CHECK_UPDATE, value).apply()
 
-    /** 最近一次自动检查前端更新的时间（epoch ms；24h 节流），默认 0 = 从未自动检查 */
-    var lastAutoCheckTime: Long
-        get() = prefs.getLong(KEY_LAST_AUTO_CHECK_TIME, 0L)
-        set(value) = prefs.edit().putLong(KEY_LAST_AUTO_CHECK_TIME, value).apply()
 
     /**
      * 短信页「通知」页签角标的已读水位：用户看过的最大验证码 msgId，默认 0 = 全部未看。
@@ -313,6 +500,48 @@ class AppPreferences(private val context: Context) {
     var smsBlockedSeenId: Long
         get() = prefs.getLong(KEY_SMS_BLOCKED_SEEN_ID, 0L)
         set(value) = prefs.edit().putLong(KEY_SMS_BLOCKED_SEEN_ID, value).apply()
+
+    // ── 短信四项配置的本地镜像（真源仍在 core）────────────────────────────────
+    //
+    // 2026-09-14：这四项此前**只有** ViewModel 内存态一份（`ToolsState`，默认全 false），
+    // 唯一写入者是 `GET /api/config` 成功那一次。于是 app 进程被回收重建、而 core 恰好连不上
+    // （两次 GET 都失败 → 沿用"本地" = 默认值）时，开关就显示成关 —— 用户看到的
+    // 「自动解析验证码存不住」正是这个。同函数里 `goform_port` / `update_mirror_base` /
+    // 日志四开关都落了 prefs，偏偏短信这几项没落。
+    //
+    // 键名与 core 字段逐字一致；默认值必须与 core `AppSettings` 和 `AppConfig` 逐字一致，
+    // 否则就是本仓禁止的「假开关」。
+
+    /** 自动解析验证码（core 真源 `sms_code_enabled`）。 */
+    var smsCodeEnabled: Boolean
+        get() = prefs.getBoolean(KEY_SMS_CODE_ENABLED, false)
+        set(value) = prefs.edit().putBoolean(KEY_SMS_CODE_ENABLED, value).apply()
+
+    /** 验证码缓存自动清理间隔（小时，0 = 永不清理；core 真源 `sms_code_cleanup_hours`）。 */
+    var smsCodeCleanupHours: Int
+        get() = prefs.getInt(KEY_SMS_CODE_CLEANUP_HOURS, 24)
+        set(value) = prefs.edit().putInt(KEY_SMS_CODE_CLEANUP_HOURS, value).apply()
+
+    /**
+     * 自动复制验证码到剪贴板（core 真源 `sms_code_auto_copy`）。
+     *
+     * 键必须用 [com.ufi_axis.data.notification.NotificationCenter.KEY_SMS_CODE_AUTO_COPY] ——
+     * 后台执行闸门 `NotificationCenter.copyVerificationCodeToClipboard` 读的就是这个键，
+     * 而它在 2026-09-13 之前**没有任何写入方**，闸门恒为 false（开关是假的）。
+     * 它同时在 `NotifyPrefs.MIRRORED_BOOL_KEYS` 里，写进本文件即可随快照下发给 `:ufi_notify`。
+     */
+    var smsCodeAutoCopy: Boolean
+        get() = prefs.getBoolean(
+            com.ufi_axis.data.notification.NotificationCenter.KEY_SMS_CODE_AUTO_COPY, false
+        )
+        set(value) = prefs.edit().putBoolean(
+            com.ufi_axis.data.notification.NotificationCenter.KEY_SMS_CODE_AUTO_COPY, value
+        ).apply()
+
+    /** 验证码豁免关键词拦截（core 真源 `sms_filter_exempt_verification_code`，默认 **true**）。 */
+    var smsFilterExemptVerificationCode: Boolean
+        get() = prefs.getBoolean(KEY_SMS_FILTER_EXEMPT_VC, true)
+        set(value) = prefs.edit().putBoolean(KEY_SMS_FILTER_EXEMPT_VC, value).apply()
 
     /**
      * 从系统「最近任务 / 概览」列表中隐藏本应用（excludeFromRecents）。
@@ -364,6 +593,15 @@ class AppPreferences(private val context: Context) {
         get() = serverIp.isNotBlank()
 
     companion object {
+        /**
+         * 媒体"列表型"prefs（播放进度淘汰队列 / 最近播放）的读改写锁。
+         *
+         * 放在 companion 而不是实例上：这两块都是"读出整串 → 改 → 整串写回"，
+         * 而**每处调用点都各自 new 一个 AppPreferences**、共享同一份 prefs 文件；
+         * 实例锁根本挡不住播放服务线程与 UI 线程互相覆盖（后写赢，留下永不回收的残键）。
+         */
+        private val mediaListLock = Any()
+
         private const val KEY_SERVER_IP = "server_ip"
         private const val KEY_SERVER_PORT = "server_port"
         private const val KEY_TOKEN = "token"
@@ -388,17 +626,45 @@ class AppPreferences(private val context: Context) {
         private const val KEY_GOFORM_PORT = "goform_port"
         private const val KEY_FILE_VIEW_MODE = "file_view_mode"
 
+
+        /** 音乐循环模式（media3 `Player.REPEAT_MODE_*` 原值）。 */
+        private const val KEY_AUDIO_REPEAT_MODE = "audio_repeat_mode"
+
+        /** 音乐随机播放开关。 */
+        private const val KEY_AUDIO_SHUFFLE = "audio_shuffle_enabled"
+
+        /** 播放队列快照（JSON）。 */
+        private const val KEY_AUDIO_QUEUE = "audio_queue_snapshot"
+
+
+        /** 播放进度的淘汰队列（逗号分隔的 key），与 [MEDIA_POSITION_LIMIT] 配合限制条数。 */
+        private const val KEY_MEDIA_POSITION_ORDER = "media_pos_order"
+
+        /** 最多记住多少个文件的播放进度。200 条够覆盖"最近在看的"，再多是负担不是功能。 */
+        private const val MEDIA_POSITION_LIMIT = 200
+
+
+        /** 最近播放（换行分隔的 `path|name|id`）。 */
+        private const val KEY_MEDIA_RECENT = "media_recent_plays"
+
+        /** 最近播放条数。首页那条横向列表滑两下就到底才有"最近"的意思。 */
+        private const val MEDIA_RECENT_LIMIT = 6
+
+
         // ── 更新源 / 镜像源设置（2026-08-10） ──
         private const val KEY_UPDATE_SOURCE_MODE = "update_source_mode"
-        private const val KEY_UPDATE_MIRROR_INDEX = "update_mirror_index"
-        private const val KEY_UPDATE_MIRROR_CUSTOM = "update_mirror_custom"
         private const val KEY_LAST_COUNTRY = "last_country"
 
         // ── 自动检查更新（2026-08-12） ──
         private const val KEY_AUTO_CHECK_UPDATE = "auto_check_update"
-        private const val KEY_LAST_AUTO_CHECK_TIME = "last_auto_check_time"
         private const val KEY_SMS_CODE_SEEN_MSG_ID = "sms_code_seen_msg_id"
+
         private const val KEY_SMS_BLOCKED_SEEN_ID = "sms_blocked_seen_id"
+        // 短信四项配置的本地镜像键 —— 与 core 字段名逐字一致（auto_copy 直接复用
+        // NotificationCenter.KEY_SMS_CODE_AUTO_COPY，见该属性 KDoc）
+        private const val KEY_SMS_CODE_ENABLED = "sms_code_enabled"
+        private const val KEY_SMS_CODE_CLEANUP_HOURS = "sms_code_cleanup_hours"
+        private const val KEY_SMS_FILTER_EXEMPT_VC = "sms_filter_exempt_verification_code"
         /** 从系统最近任务列表隐藏本应用（excludeFromRecents），默认 false。 */
         private const val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
 

@@ -99,14 +99,14 @@ fun UfiCustomDialog(
             // 自定义确认/取消按钮：放在 content 之后。
             // 对齐旧 Material AlertDialog 习惯：dismissButton 居左、confirmButton 居右。
             confirmButton != null -> {
-                // 2026-09-04：内容→按钮的间距原为 DialogPaddingH(18) + Row 的 vertical 12 = 30dp，
-                // 而标题→内容只有 12dp，同一个弹窗里两处"块间距"差了 2.5 倍。
-                // 现在统一成 Spacing.Large(12dp)：标题→内容、内容→按钮同值，按钮下方再留 12dp。
+                // 纵向节奏（2026-09-18 统一）：标题→内容 12dp（shell 的 Spacer）、
+                // 内容内部 12dp（UfiDialogBody 的 spacedBy）、内容→按钮 12dp（下面这个 Spacer）、
+                // 按钮→下边框 18dp（由 shell 的 bottom padding 统一提供，与左右 18dp 同值）。
+                // 本组件**不再**自带按钮区底部 padding —— 那会和 shell 的叠成 20dp，
+                // 表现为"按钮离下边框比离左右都远"。
                 Spacer(Modifier.height(Spacing.Large))
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = Spacing.Large),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -136,11 +136,10 @@ fun UfiCustomDialog(
             // 仅 dismissButton（无 confirmButton）：全宽展示 + 底部留白。
             // FIX-7：底部关闭按钮已迁到右上角 ×（showCloseIcon），故此处不再补默认"关闭"。
             dismissButton != null -> {
-                Spacer(Modifier.height(Spacing.DialogPaddingH))
+                // 与上面同一套节奏：内容→按钮 12dp，按钮→下边框交给 shell。
+                Spacer(Modifier.height(Spacing.Large))
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center
                 ) {
                     dismissButton()
@@ -274,10 +273,12 @@ fun UfiScrollableDialog(
                 Spacer(Modifier.height(Spacing.Medium))
                 val palette = LocalResolvedPalette.current
                 HorizontalDivider(color = palette.divider.copy(alpha = 0.08f))
+                // 2026-09-19：只留 top padding。按钮→下边框由 shell 的 18dp 统一提供，
+                // 这里再带 bottom 12dp 会叠成 30dp（与 UfiCustomDialog 的按钮区不一致）。
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                        .padding(top = Spacing.Large),
                     horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
                 ) {
                     // 各包入 weight(1f) Box：按钮内部 fillMaxWidth 仅填满半行 Box，
@@ -304,7 +305,7 @@ fun UfiScrollableDialog(
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = Spacing.Large),
+                        .padding(top = Spacing.Large),
                     horizontalArrangement = Arrangement.Center
                 ) {
                     dismissButton()
@@ -316,10 +317,24 @@ fun UfiScrollableDialog(
         }
 
         // FIX-24：actions slot 渲染在 confirmButton/dismissButton 之后（互斥，建议 caller 二选一）。
-        // 同样加分隔线 + 上下 Spacing.Large padding，与 confirmButton 行视觉一致。
+        //
+        // 2026-09-22：补回「内容 → 按钮区」的间隔。上面这条注释一直声称"加分隔线 + 上下
+        // Spacing.Large padding"，但实现里**只有分隔线**：滚动内容紧贴分隔线、分隔线又紧贴按钮，
+        // 于是走 actions 槽位的那批弹窗（WiFi 热点 / DHCP / 设备后台 / 配对…）内容与按钮粘在一起。
+        //
+        // 节奏对齐上面 confirmButton 分支这条**唯一基准**：
+        //   内容 —8dp— 分隔线 —12dp— 按钮 —18dp— 下边框（最后一段由 shell 的 bottom padding 提供）
+        // 第一段刻意用 Medium(8dp) 而不是 DialogPaddingH(18dp)：18dp 会让按钮上方留白
+        // （18+1+12=31dp）远大于下方 18dp，观感是"按钮往下沉"。
+        //
+        // 为什么不把间隔加回 UfiDialogActions 自身：2026-09-18 刚因为"它会与 UfiDialogBody 的
+        // spacedBy(12dp) 叠成 30dp"而删掉（见该组件注释）。加回去会让**塞在 body 里**的调用点
+        // 重犯那个 bug —— 间隔只能由"按钮区在谁下面"这一侧提供，不能两边都给。
         if (actions != null) {
             val palette = LocalResolvedPalette.current
+            Spacer(Modifier.height(Spacing.Medium))
             HorizontalDivider(color = palette.divider.copy(alpha = 0.08f))
+            Spacer(Modifier.height(Spacing.Large))
             actions()
         }
     }

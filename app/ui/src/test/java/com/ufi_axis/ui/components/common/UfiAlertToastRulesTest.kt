@@ -38,7 +38,15 @@ class UfiAlertToastRulesTest {
 
     @Test
     fun unknown_alert_type_falls_back_to_raw_value() {
-        assertEquals("CPU 温度", UfiAlertToastRules.alertTypeLabel("cpu_temp"))
+        // 已登记的 type 走中文标签。
+        assertEquals("设备温度", UfiAlertToastRules.alertTypeLabel("temperature"))
+        // 未登记的一律回落成 type 本身。
+        //
+        // `cpu_temp` 在这里是**有意**的用例：它曾经有中文标签，但 2026-09-21 对齐
+        // AlertEngine 实际的 8 个 type 时被删掉（引擎里从来没产出过这个 type，是早期设计残留）。
+        // 本条断言原来写的是 `alertTypeLabel("cpu_temp") == "CPU 温度"`，删除后一直是红的 ——
+        // 它断言的是已经不正确的旧行为，不是发现了 bug。
+        assertEquals("cpu_temp", UfiAlertToastRules.alertTypeLabel("cpu_temp"))
         assertEquals("some_new_type", UfiAlertToastRules.alertTypeLabel("some_new_type"))
     }
 }

@@ -26,8 +26,13 @@ class ColorTest {
      *
      * - amber / lime / emerald 的**浅色态**：设计稿主色是高亮黄绿（#F59E0B / #A3E635 / #4ADE80），
      *   压在纯白卡上 2.15 / 2.24 / 2.34:1。
-     * - violet 的**深色态**：#7C3AED 压在 `cardBgDark`（#261346，同色相深紫）上 2.92:1，
-     *   差门槛 3%。它是 6 套彩色皮肤里色相最暗的一套，卡面又是自身色相调出来的。
+     * - violet 的**深色态**：#7C3AED 压在 `cardBgDark`（#2B1450，同色相深紫）上 **2.79:1**。
+     *   它是 6 套彩色皮肤里色相最暗的一套，卡面又是自身色相调出来的。
+     *   2026-09-24 之前这一项是 2.92:1（卡面为 #261346，差门槛 3%）；那天按用户定稿把本套的
+     *   `cardBgDark` 抬亮一档以修"卡片浮不起来"（见 `ThemePresets.Violet` 与
+     *   [MIN_SURFACE_DELTA_L_DARK]），**抬亮卡面必然让这一项更低** —— 这是一次有意的取舍：
+     *   accent 的可读兜底本来就是 `accentSecondary`（同卡面 8.63:1，由下面那条无例外地守着），
+     *   而"卡片是否浮起来"影响的是整个深色界面。清单**没有变长**，只是这一项的数值更低了。
      *
      * 这几项都要重新标定对应预设的 accent 槽才能修（会明显改动它们的品牌观感），
      * 属于独立的设计决策。它们的可读兜底是 `accentSecondary`（深色态取亮、浅色态取深），
@@ -236,18 +241,27 @@ class ColorTest {
      * 2026-09-05 傍晚：`orange` / `cyan` 两套皮肤删除，对应的两组期望值一并删除（共 7 组）。
      * 期望表**多余的键不会红灯**（只按 allPresets 遍历取），但留着就是孤立数据，
      * 下一个人会以为还有那两套皮肤 —— 所以删皮肤必须顺手清这里。
+     *
+     * 2026-09-24：**玫红 / 紫色的第 4 项（深色 accentMuted）换值**，方向是"跟着 cardBg 走"。
+     * `accentMuted = srgbMix(accent, cardBg, 60%)`，本批把这两套的 `cardBgDark` 从统一系数
+     * 58% 改成 per-preset 50%（见 `ThemePresets`），所以这两个派生色**必然**跟着变：
+     * 玫红 `#801D38` → `#861D3A`、紫色 `#482389` → `#4B238F`（都只是随卡面抬亮了一档）。
+     * 这不是"断言被放宽"：本条钉的是**推导结果**而不是某条下限，
+     * 输入变了它就该变，它的职责是让"梯度色被静默改掉"变得不可能。
+     * 三个 accentStrong 项（第 1 / 3 列）与 cardBg 无关，逐位未变。
      */
     @Test
     fun `accent gradient values are pinned for every preset`() {
         val expected = mapOf(
             // 2026-09-08：default 的深色两项随 accentDark 重标定（#555555 → #B0B0B0）而变。
             "default" to listOf("#1D1D1D", "#A7A7A7", "#BDBDBD", "#606060"),
-            "rose" to listOf("#C72B50", "#F8ADBF", "#F05479", "#801D38"),
+            // 2026-09-24：玫红 / 紫色的深色 accentMuted 随 cardBgDark 的 per-preset 覆盖而变。
+            "rose" to listOf("#C72B50", "#F8ADBF", "#F05479", "#861D3A"),
             "amber" to listOf("#CE8509", "#FBD89D", "#F7AE32", "#84510C"),
             "lime" to listOf("#89C12D", "#DAF5AE", "#B2EA55", "#55791E"),
             "emerald" to listOf("#3EBA6C", "#B7F2CC", "#67E394", "#277645"),
             "blue" to listOf("#1F53C5", "#A8C1F7", "#487CEE", "#1A3A85"),
-            "violet" to listOf("#6831C7", "#CBB0F8", "#915AF0", "#482389")
+            "violet" to listOf("#6831C7", "#CBB0F8", "#915AF0", "#4B238F")
         )
         for (preset in ThemePresets.allPresets) {
             val l = preset.resolve(isDark = false)
@@ -333,19 +347,34 @@ class ColorTest {
      *    副文案走的是 12sp 的 `UfiTextStyles.note`，不属于"大字"豁免；
      * 3. `iconTint` vs `cardBg` ≥ [MIN_NON_TEXT_CONTRAST]（3.0，非文本图形）
      * 4. `cardBg` vs `pageBg` 肉眼可分 —— 判据是 CIE L\* 差 ≥ [MIN_SURFACE_DELTA_L]，
-     *    **不是** WCAG 对比度（理由见 [surfacesAreDistinguishable] 的 KDoc）；
+     *    **不是** WCAG 对比度（理由见 [surfacesAreDistinguishable] 的 KDoc）。
+     *    ⚠ 深色态另有一条**更严**的下限 [MIN_SURFACE_DELTA_L_DARK]，在
+     *    [`dark surfaces carry the elevation and lines stay lighter than surfaces`] 里验 ——
+     *    本条的 2.0 在深色态从来没红过（实测最小 6.46），留着只是为了让两态判据同构；
      * 5. `onAccent` vs **accent 实底** ≥ [MIN_NON_TEXT_CONTRAST]，且 `onGradient` vs
-     *    **Hero 渐变最亮停止点**（浅色态 = accent 往白混 22%）也要 ≥ 3:1。
+     *    **Hero 渐变最亮停止点**（浅色态 = accent 往白混 [GRADIENT_TOP_LIGHTEN] 22%、
+     *    深色态 = accent 往白混 [GRADIENT_TOP_LIGHTEN_DARK] 16%）也要 ≥ 3:1。
      *    第 5 条是三套亮色皮肤的必然问题，见 `ThemePresets` 的类 KDoc。
      *
      * 顺带量一遍 `textPrimary` vs `pageBg`：有些设置行直接铺在页面底上而非卡上。
      *
-     * ## 当前的余量分布（2026-09-05 傍晚删掉橙 / 青之后实测）
+     * ## 当前的余量分布（2026-09-05 傍晚删掉橙 / 青之后实测，深色态一列 2026-09-24 重测）
      * 最紧的一项是 **玫红浅色态的第 5 条**：`onGradient`（白）对渐变最亮停止点 3.12:1，
-     * 门槛 3.0，余量只有 4%。第二紧的是宝蓝浅色态同一项 3.49:1。
+     * 门槛 3.0，余量只有 4%。第二紧的是**玫红深色态**同一项 3.37:1（2026-09-24 新增，见下），
+     * 第三紧是宝蓝浅色态 3.49:1。
      * 正文类（4.5 门槛）最紧的是**柠绿深色态** `textSecondary` 对卡面 6.04:1 ——
      * 删掉青色之前那个位置是青色浅色态的 5.36:1。
      * 也就是说**动 accent 比动正文色危险得多**：改玫红 / 宝蓝的 accent 前务必先跑本测试。
+     *
+     * ## 2026-09-24：深色态第 5 条**不再是白送的**
+     * 那天按用户定稿把四张 Hero 卡的深色渐变从"往黑混"改成"往白提亮 16%"
+     * （见 [GRADIENT_TOP_LIGHTEN_DARK]），[heroGradientBrightestStop] 的深色分支同步
+     * 从"直接返回 accent"改成"accent 往白混 16%"。本条断言的**代码一字未改**
+     * （它一开始就把 isDark 交给判据函数，而不是自己内联"深色态最亮点 = accent"那条结论），
+     * 但它现在真的在守一条新的红线：白字三套皮肤深色态的实测值由
+     * 玫红 4.01 / 宝蓝 5.17 / 紫色 5.70（对 accent 实底）降到
+     * **3.37 / 3.89 / 4.28**（对提亮 16% 的最亮停止点）。
+     * 若有人把那个常量再往上调导致本条红灯，**正确处置是把常量调小，不是放宽 3.0 这个门槛**。
      */
     @Test
     fun `every preset meets the contrast floor in both modes`() {        for (preset in ThemePresets.allPresets) {
@@ -396,6 +425,69 @@ class ColorTest {
                     surfacesAreDistinguishable(p.cardBg, p.pageBg)
                 )
             }
+        }
+    }
+
+    /**
+     * **深色态专用**的两条层次不变式（2026-09-24 新增，7 套预设逐套验）：
+     *
+     * 1. `ΔL*(cardBg, pageBg) ≥` [MIN_SURFACE_DELTA_L_DARK]（6.0）—— 卡片要真的浮起来；
+     * 2. `ΔL*(divider, cardBg) ≤ ΔL*(cardBg, pageBg) ×` [MAX_LINE_TO_SURFACE_DELTA_RATIO]（1.0）
+     *    —— **线不许比面响**。
+     *
+     * ## 为什么这两条必须单独存在
+     * 上面那条 `every preset meets the contrast floor in both modes` 里第 4 项已经在验
+     * "卡面与页面底可分"，但它用的是通用下限 [MIN_SURFACE_DELTA_L] = 2.0，而深色态的实测最小值
+     * 当时是玫红 **5.59** —— 2.8 倍余量，**这条断言在深色态永远不会红**。
+     * 于是 2026-09-24 用户反馈的"玫红深色模式背景不美观"这个真实缺陷，在既有测试里
+     * **完全不可见**：卡片浮不起来（5.59，全表最小）、而分隔线是卡/页明度差的 **2.64 倍**
+     * （`divider` = 卡面混 15% 白，ΔL\* 14.74），两项都过了当时的全部断言。
+     * 阈值的出处、锚点与"红灯该怎么处置"写在两个常量自己的 KDoc 里，这里不重复。
+     *
+     * ## 这条测试锚在哪
+     * 第 1 条的锚点是**宝蓝 6.46**（本批未调整、用户未反馈问题的最暗一档）；
+     * 第 2 条的锚点是**默认皮肤 0.54**（唯一没被抱怨过的一套，线比面轻）。
+     * 修复后的实测值（深色态）：
+     *
+     * | 预设 | ΔL\*(卡,页) | ΔL\*(线,卡) | 比值 |
+     * |---|---|---|---|
+     * | default | 7.80 | 4.18 | 0.54 |
+     * | rose    | 7.58 | 5.30 | 0.70 |
+     * | amber   | 7.17 | 6.07 | 0.85 |
+     * | lime    | 9.12 | 5.55 | 0.61 |
+     * | emerald | 9.16 | 5.52 | 0.60 |
+     * | blue    | **6.46** | 5.96 | **0.92** |
+     * | violet  | 7.50 | 5.78 | 0.77 |
+     *
+     * 宝蓝是两条判据同时最紧的一套，它也是 [DIVIDER_ALPHA_DARK] 只能取 6%（而不是用户原本
+     * 批准的 7%）的原因：7% 下它的比值是 1.12。
+     *
+     * ⚠ 浅色态**刻意不纳入**本测试：浅色态 `ΔL*(cardBg, pageBg)` 只有 2.42，卡片边界**只能**
+     * 靠线表达（白卡压在近白页面底上），第 2 条在那里是反的 —— 强行套用会逼着把浅色分隔线
+     * 调弱到看不见。这正是 `DIVIDER_ALPHA` 当初必须拆成
+     * [DIVIDER_ALPHA_LIGHT] / [DIVIDER_ALPHA_DARK] 两个常量的同一个理由。
+     */
+    @Test
+    fun `dark surfaces carry the elevation and lines stay lighter than surfaces`() {
+        for (preset in ThemePresets.allPresets) {
+            val p = preset.resolve(isDark = true)
+            val surface = surfaceDeltaL(p.cardBg, p.pageBg)
+            val line = surfaceDeltaL(p.divider, p.cardBg)
+            assertTrue(
+                "${preset.id}(深色) ΔL*(cardBg, pageBg) 只有 ${"%.2f".format(surface)}，" +
+                    "低于深色态下限 $MIN_SURFACE_DELTA_L_DARK —— 卡片浮不起来（用户 2026-09-24 反馈的" +
+                    "「深色模式背景不美观」就是这一项）。正确处置是抬 cardBgDark 的明度，" +
+                    "不是放宽本阈值，理由见 MIN_SURFACE_DELTA_L_DARK 的 KDoc。",
+                surface >= MIN_SURFACE_DELTA_L_DARK
+            )
+            assertTrue(
+                "${preset.id}(深色) ΔL*(divider, cardBg) = ${"%.2f".format(line)}，达到 " +
+                    "ΔL*(cardBg, pageBg) = ${"%.2f".format(surface)} 的 " +
+                    "${"%.2f".format(line / surface)} 倍，超过上限 $MAX_LINE_TO_SURFACE_DELTA_RATIO —— " +
+                    "线比面响，卡片会糊成一堆格子（默认皮肤这个比值是 0.54，那是本条的锚点）。" +
+                    "正确处置是调小 DIVIDER_ALPHA_DARK 或抬 cardBgDark，不是放宽本比值。",
+                line <= surface * MAX_LINE_TO_SURFACE_DELTA_RATIO
+            )
         }
     }
 

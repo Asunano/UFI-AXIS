@@ -202,7 +202,7 @@ fun UfiSkeletonBlock(
 }
 
 /**
- * 一条列表项骨架：左侧图标圆块 + 右侧两行文字条。
+ * 一条列表项骨架：左侧图标块 + 右侧两行文字条。
  *
  * 比例是对着三页真实行版式取的公约数（文件行 / 会话行 / 下载任务卡都是
  * 「40dp 左图标 + 主标题 + 次要信息」）：主行 45% 宽、次行 28% 宽 —— 不写满宽是因为
@@ -210,9 +210,24 @@ fun UfiSkeletonBlock(
  *
  * 高度不写死：由内容（图标 40dp + 上下 14dp 内边距）自然撑出，和真实行同源，
  * 这样数据到位后行高不变、列表不跳。
+ *
+ * ## 前置槽尺寸为什么可配（2026-09-16 纯追加，默认值 = 原行为）
+ * 骨架的意义在于"把真实行的形状先占出来"。媒体列表的前置槽不是 40dp 圆块而是
+ * **72×44 的 16:9 缩略图**，仍用圆块占位会在数据到位那一帧看到明显的形状跳变。
+ * 所以开了三个参数：宽、高、是否圆形。**不要**为了别的形状再新写一个骨架行组件 ——
+ * 那样列表骨架就有两份视觉了。
+ *
+ * @param leadingWidth 前置槽宽（圆形时忽略，用 [leadingHeight] 当直径）
+ * @param leadingHeight 前置槽高（也决定整行高度）
+ * @param leadingCircle true = 圆块（头像 / 图标），false = 圆角矩形（缩略图）
  */
 @Composable
-fun UfiSkeletonListItem(modifier: Modifier = Modifier) {
+fun UfiSkeletonListItem(
+    modifier: Modifier = Modifier,
+    leadingWidth: Dp = 40.dp,
+    leadingHeight: Dp = 40.dp,
+    leadingCircle: Boolean = true
+) {
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -220,11 +235,57 @@ fun UfiSkeletonListItem(modifier: Modifier = Modifier) {
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        UfiSkeletonCircle(size = 40.dp)
+        if (leadingCircle) {
+            UfiSkeletonCircle(size = leadingHeight)
+        } else {
+            UfiSkeletonBlock(
+                modifier = Modifier.width(leadingWidth),
+                height = leadingHeight,
+                cornerRadius = UfiCardDefaults.cornerRadius
+            )
+        }
         Spacer(Modifier.width(12.dp))
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             UfiSkeletonLine(widthFraction = 0.45f, height = 12.dp)
             UfiSkeletonLine(widthFraction = 0.28f, height = 10.dp)
+        }
+    }
+}
+
+/**
+ * 网格页首屏骨架：[columns] 列 × 若干行等高格子。
+ *
+ * 与 [UfiSkeletonList] 同一条理由存在：网格页（图片墙、视频网格）的真实版式是"等高格子"，
+ * 用列表骨架去占位会在数据到位那一帧整体重排。格高由调用方给（真实格子多高就传多高）。
+ *
+ * 同样不用 LazyVerticalGrid：格数固定且小，Lazy 的复用池是净开销。
+ *
+ * @param cells 总格数（默认 9 = 3×3，够铺满一屏）
+ */
+@Composable
+fun UfiSkeletonGrid(
+    modifier: Modifier = Modifier,
+    columns: Int = 3,
+    cells: Int = 9,
+    cellHeight: Dp = 108.dp,
+    spacing: Dp = 4.dp
+) {
+    val safeColumns = columns.coerceAtLeast(1)
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(spacing)
+    ) {
+        val rows = (cells + safeColumns - 1) / safeColumns
+        repeat(rows) {
+            Row(horizontalArrangement = Arrangement.spacedBy(spacing)) {
+                repeat(safeColumns) {
+                    UfiSkeletonBlock(
+                        modifier = Modifier.weight(1f),
+                        height = cellHeight,
+                        cornerRadius = UfiCardDefaults.cornerRadius
+                    )
+                }
+            }
         }
     }
 }
@@ -237,16 +298,28 @@ fun UfiSkeletonListItem(modifier: Modifier = Modifier) {
  * 而骨架屏只活几百毫秒，不值得为它引入一层额外布局。
  *
  * 不用 LazyColumn：条数固定且很小，Lazy 的复用池反而是净开销。
+ *
+ * 前置槽三个参数直接透传给 [UfiSkeletonListItem]（2026-09-16）：调用方的真实行长什么样，
+ * 骨架就该占成什么样 —— 缩略图列表传 `leadingWidth/Height + leadingCircle = false`。
  */
 @Composable
 fun UfiSkeletonList(
     rows: Int = 6,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    leadingWidth: Dp = 40.dp,
+    leadingHeight: Dp = 40.dp,
+    leadingCircle: Boolean = true
 ) {
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(UfiCardDefaults.padding)
     ) {
-        repeat(rows) { UfiSkeletonListItem() }
+        repeat(rows) {
+            UfiSkeletonListItem(
+                leadingWidth = leadingWidth,
+                leadingHeight = leadingHeight,
+                leadingCircle = leadingCircle
+            )
+        }
     }
 }

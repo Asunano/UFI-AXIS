@@ -47,7 +47,8 @@ internal fun buildColorSchemeFromPalette(resolved: ResolvedPalette): ColorScheme
     //   （UfiInput / UfiDropdown / UfiStandardDialogs 的 unfocusedBorderColor）与同为 12% 的
     //   chipUnselectedBorder。原来接 textSecondary 是**中灰实色**，比自研描边重一个数量级，
     //   于是同一屏里出现两种描边强度——"一个界面出现多种 UI"的一种形态。
-    //   不接更弱的 cardBorder(6~8%)：那是卡片外框的量级，压在可点控件上会几乎看不见，
+    //   不接更弱的 cardBorder(深色 5% / 浅色 6%，深色档 2026-09-24 由 8% 降下来)：那是卡片外框的
+    //   量级，压在可点控件上会几乎看不见，
     //   outline 要的是"能看出这里可交互"，12% 是本仓交互描边的既有档位。
     //
     // outlineVariant 保持 resolved.divider（本次不动）

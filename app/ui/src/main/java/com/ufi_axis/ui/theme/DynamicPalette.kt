@@ -34,9 +34,14 @@ import androidx.compose.ui.graphics.Color
  *
  * - `textPrimary` / `textSecondary` / `iconTint` / `divider` / `pageBg` / `cardBg`
  *   **一律取 neutral 梯度**，不碰 accent。档位差已经保证了对比度。
- * - `onAccent` / `onGradient` / `gradientMuted`（accent 实底之上的前景）**在运行时算**：
- *   [onColorFor] 从"近黑 / 近白"两个候选里选对比度更高的那个。
- *   这是纯函数，由 `DynamicPaletteTest` 直接钉住，不依赖 Android 运行时。
+ * - `onAccent` / `onGradient` / `gradientMuted`（accent 实底 / Hero 渐变之上的前景）
+ *   **在运行时算**：[pickOnColor]（与自定义皮肤链路**同一份实现**，2026-09-24 从 private 提为
+ *   internal）从"近黑 / 近白"两个候选里挑 **maximin** 最优者 —— 对每个候选取它在所有背景上的
+ *   最差对比度，再选最差值更大的那个。这是纯函数，由 `DynamicPaletteTest` 直接钉住，
+ *   不依赖 Android 运行时。
+ *   ⚠ 2026-09-24 之前这里走的是 [onColorFor] + **只传渐变最亮端**。那是一个系统性高估深色前景
+ *   的判据（浅色 Hero 渐变的最暗端就是未提亮的 accent 本身），表现正是用户反馈的
+ *   "浅色模式仪表盘 hero 卡文字被判成黑色、压在哑蓝渐变上读不清"。
  *
  * ## 与「皮肤 id」的关系
  * 动态取色**不是**第 10 套皮肤。它是一个独立开关（`ThemeManager.dynamicEnabled`），
@@ -105,8 +110,9 @@ data class DynamicSourceColors(
     val neutral2_200: Color
 )
 
-// Hero 渐变最亮停止点的比例 [GRADIENT_TOP_LIGHTEN]、分隔线透明度档 [DIVIDER_ALPHA]
-// 与 sRGB 混色 [blendSrgb] 都在 `ColorContrast.kt`（internal，本包共用）。
+// Hero 渐变最亮停止点的比例 [GRADIENT_TOP_LIGHTEN]、分隔线的两个透明度档
+// （[DIVIDER_ALPHA_LIGHT] 15% / [DIVIDER_ALPHA_DARK] 6%，2026-09-24 从单常量拆开，
+// 理由见后者 KDoc）与 sRGB 混色 [blendSrgb] 都在 `ColorContrast.kt`（internal，本包共用）。
 // 本文件曾各自复制一份，与 `CustomPalette.kt` 逐字节相同 —— 改一个漏一个会让
 // 动态取色与自定义皮肤的分隔线 / 渐变判据静默分叉。渐变判据统一走
 // [heroGradientBrightestStop]，它与四张 Hero 卡实际画的像素同一份实现（[ufiShade]）。
@@ -117,25 +123,82 @@ data class DynamicSourceColors(
  * 前景槽的取色纪律（这是当年删掉 `dynamic` 的直接原因，现在正面解决）：
  * - `textPrimary` / `textSecondary` / `iconTint` / `divider` / `pageBg` / `cardBg`
  *   **只取 neutral 梯度**，对比度由档位差保证，不受壁纸主色影响；
- * - `onAccent` / `onGradient` / `gradientMuted` 走 [onColorFor] **运行时算**，
+ * - `onAccent` / `onGradient` / `gradientMuted` 走 [pickOnColor] **运行时算**，
  *   候选是 `neutral1_900`（近黑）与 `neutral1_50`（近白）。
+ *   三个槽**不再共用一个值**（2026-09-24），因为它们的背景不同 —— 见函数体内的注释。
  */
 fun buildDynamicPalette(source: DynamicSourceColors): ThemePalette {
     val ink = source.neutral1_900
     val paper = source.neutral1_50
-    // 浅色态：判据取渐变最亮点；深色态：渐变最亮点就是 accent 本身（往暗混）。
-    // 两态都交给 heroGradientBrightestStop —— 之前浅色态内联写 mix(accent, White, 22%)、
-    // 深色态直接传 accent，正是该函数两个分支的手写版。
-    val onAccentLight = onColorFor(
-        background = heroGradientBrightestStop(source.accent1_600, isDark = false),
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // accent 之上的前景：唯一在运行时算的一组
+    //
+    // ## 原来是怎么写的、为什么
+    // 2026-09-24 之前这里只算**一个**值：`onColorFor(heroGradientBrightestStop(accent, isDark))`，
+    // 然后同时塞进 `onAccent` / `onGradient` / `gradientMuted` 三对槽。
+    // 当时的理由是"渐变最亮端是浅色前景最容易失守的位置，按最坏点判就够了"——
+    // 这句话对**近白候选**成立，对**近黑候选**恰好反过来，而当时只有一个判据口径。
+    //
+    // ## 这次为什么改（三条缺陷，按影响排序）
+    // 1. **只按渐变最亮端判 ⇒ 系统性高估深色前景**。浅色态 Hero 渐变是
+    //    `accent → +12% 白 → +22% 白`（见 GRADIENT_TOP_LIGHTEN 与 ufiShade），
+    //    最暗端是 **accent 本身**。黑字在"accent+22% 白"上也许有 5:1，但它还要压在
+    //    未提亮的 accent 上 —— 那一端可能只有 2:1。用户反馈的"浅色模式 hero 卡文字被判成黑色、
+    //    压在哑蓝/中间调渐变上很难读"就是这条。
+    // 2. **`onAccent` 与 `onGradient` 共用一个值，可它们的背景不同**。`onAccent` 用在**实色**
+    //    accent 按钮 / 药丸上（没有任何渐变提亮），共用等于让它也按"提亮后的背景"判，偏乐观。
+    // 3. **`gradientMuted` 的背景是渐变**，却跟着 `onAccent` 走。它应与 `onGradient` 同源。
+    //
+    // ## 改完的判据
+    // - `onGradient` = [pickOnColor] 对**两个渐变端点**取 maximin：`accent 实底`
+    //   与 `heroGradientBrightestStop(accent, isDark)`。渐变卡内的文字要在**整条**渐变上成立，
+    //   所以取"两端里较差的那个"最优者，而不是只看某一端；
+    // - `onAccent` **单独算**，背景只有 `accent` 实底一个（实色按钮 / 药丸没有提亮端）；
+    // - `gradientMuted` = `onGradient`（同背景 ⇒ 同源）。
+    //
+    // 判据函数与自定义皮肤链路是**同一个** [pickOnColor]（同包，2026-09-24 从 private 提为
+    // internal，逻辑一字未动）—— 两条链路犯的是同一个错，修法必须只有一份实现。
+    // 候选仍是 `ink = neutral1_900`（tone 10 近黑）与 `paper = neutral1_50`（tone 95 近白），
+    // **不换成纯黑纯白**：理由见 DynamicSourceColors.neutral1_900 的 KDoc
+    // （纯黑压在彩色实底上偏硬，带一点壁纸色味的深色更协调）。
+    //
+    // ⚠ 本次**没有**动 heroGradientBrightestStop / GRADIENT_TOP_LIGHTEN* / 任何 floor 阈值：
+    // maximin 保证的是"不存在更好的候选"，**不保证**"选出来的一定 ≥ 3:1"——
+    // 候选来自壁纸的 neutral 梯度，本文件控制不了它。
+    // 2026-09-24 的扫描实测（468 个合成 accent × 两态，见 `DynamicPaletteTest`）：
+    // 两个候选**都**不达标的样本 0 条，但中间调那一段余量极薄 ——
+    // 浅色态最坏是哑蓝 `hsl(240, 10%, 45%)` 的 **3.19:1**（门槛 3.0，余量 6%）。
+    // 把 accent 推离这个中间带属于下一批（②，改渐变本身 / 夹取 accent 明度），
+    // 当前由那条扫描式护栏**只记录不判红**。
+
+    // ══════════════════════════════════════════════════════════════════════════
+    val onGradientLight = pickOnColor(
         dark = ink,
-        light = paper
+        light = paper,
+        backgrounds = listOf(
+            source.accent1_600,
+            heroGradientBrightestStop(source.accent1_600, isDark = false)
+        )
     )
-    val onAccentDark = onColorFor(
-        background = heroGradientBrightestStop(source.accent1_200, isDark = true),
+    // 深色态同构。这里**不内联**"深色最亮端 = accent"那条结论：2026-09-24 那天四张 Hero 卡的
+    // 深色渐变从"往黑混 -0.14/-0.04/0"改成"往白提亮 0/+8%/+16%"，最亮端就不再等于 accent 了
+    // （见 GRADIENT_TOP_LIGHTEN_DARK）。把 isDark 交给判据函数去判，正是为了让这类改动
+    // 只需要动一处。
+    val onGradientDark = pickOnColor(
         dark = ink,
-        light = paper
+        light = paper,
+        backgrounds = listOf(
+            source.accent1_200,
+            heroGradientBrightestStop(source.accent1_200, isDark = true)
+        )
     )
+    // 实色 accent 的前景：背景只有 accent 实底。单元素列表下 pickOnColor 退化成 onColorFor，
+    // 刻意仍走同一个函数 —— `on*` 三个槽的裁决口径必须是同一份实现，
+    // 分成两个函数之后"改判据"就会漏掉一处。
+    val onAccentLight = pickOnColor(dark = ink, light = paper, backgrounds = listOf(source.accent1_600))
+    val onAccentDark = pickOnColor(dark = ink, light = paper, backgrounds = listOf(source.accent1_200))
+
 
     return ThemePalette(
         id = DYNAMIC_THEME_ID,
@@ -152,17 +215,19 @@ fun buildDynamicPalette(source: DynamicSourceColors): ThemePalette {
         textPrimaryDark = paper,
         textSecondaryLight = source.neutral2_700,
         textSecondaryDark = source.neutral2_200,
-        dividerLight = blendSrgb(source.neutral1_0, ink, DIVIDER_ALPHA),
-        dividerDark = blendSrgb(source.neutral1_800, paper, DIVIDER_ALPHA),
+        dividerLight = blendSrgb(source.neutral1_0, ink, DIVIDER_ALPHA_LIGHT),
+        dividerDark = blendSrgb(source.neutral1_800, paper, DIVIDER_ALPHA_DARK),
 
         iconTintLight = ink,
         iconTintDark = paper,
         onAccentLight = onAccentLight,
         onAccentDark = onAccentDark,
-        onGradientLight = onAccentLight,
-        onGradientDark = onAccentDark,
-        gradientMutedLight = onAccentLight,
-        gradientMutedDark = onAccentDark
+        onGradientLight = onGradientLight,
+        onGradientDark = onGradientDark,
+        // gradientMuted 的背景是渐变卡，所以它跟 onGradient 同源。
+        // 2026-09-24 之前它跟的是 onAccent —— 背景对不上，属本次修的第 3 条缺陷。
+        gradientMutedLight = onGradientLight,
+        gradientMutedDark = onGradientDark
     )
 }
 

@@ -57,7 +57,7 @@ object UfiPageTransitions {
     /** 当前已注册的全部策略，按注册顺序返回。设置页「切换动画」下拉直接消费此列表。 */
     fun all(): List<UfiPageTransition> = registry.values.toList()
 
-    /** 渐入渐出。复刻现有 `tabEnter` 观感，是默认值，保证零视觉回归。由 T03 装配。 */
+    /** 渐入渐出。承接原 Tab 切换过渡的观感，是默认值，保证零视觉回归。由 T03 装配。 */
     lateinit var Fade: UfiPageTransition
 
     /** 水平平移。由 T03 装配。 */
@@ -94,7 +94,7 @@ object UfiPageTransitions {
  *
  * 映射规格与 T03 的 `FadeTransition` 一致：
  * - `alpha = (1 - |p| * 1.6) coerceIn 0..1` —— 交叉淡化，中段短暂重叠
- * - `scale = lerp(0.98, 1, 1 - |p|)`        —— 轻微缩放，复刻 `tabEnter` 的 `scaleIn(0.98f)`
+ * - `scale = lerp(0.98, 1, 1 - |p|)`        —— 轻微缩放，承接原 Tab 切换过渡的 `scaleIn(0.98f)`
  */
 private val FALLBACK_FADE: UfiPageTransition = object : UfiPageTransition {
 

@@ -1,6 +1,8 @@
 package com.ufi_axis.util
 
+import com.ufi_axis_core.util.dataSizeUnitLabel
 import com.ufi_axis_core.util.formatDataSize
+import com.ufi_axis_core.util.formatDataSizeValueInUnit
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -35,6 +37,19 @@ object FormatUtils {
      */
     fun formatSize(bytes: Long, zeroText: String = "0 B"): String =
         if (bytes <= 0L) zeroText else formatDataSize(bytes)
+
+    /**
+     * 图表 Y 轴刻度的**裸数值**（不带单位）。单位由 [dataSizeUnit] 写在轴头。
+     *
+     * [unitBytes] 由图表组件（`UfiBarChart` 的 `ufiBarChartAxis`）按峰值定，
+     * 它保证同一根轴上每一格在这个单位下都是整齐的刻度。
+     * 浮层里的数值仍走 [formatSize]（自动单位 + 一位小数）。
+     */
+    fun formatSizeValueInUnit(bytes: Long, unitBytes: Long): String =
+        formatDataSizeValueInUnit(bytes, unitBytes)
+
+    /** 图表 Y 轴轴头的单位名（"MB" / "GB"）。 */
+    fun dataSizeUnit(unitBytes: Long): String = dataSizeUnitLabel(unitBytes)
 
     /**
      * 速率展示（字节/秒）：B/s → KB/s → MB/s → GB/s。
@@ -108,16 +123,16 @@ object FormatUtils {
         return String.format("%.2f V", v)
     }
 
-    fun getSignalLevel(rsrp: Int?): String {
-        if (rsrp == null) return "未知"
-        return when {
-            rsrp >= -80 -> "极好"
-            rsrp >= -90 -> "好"
-            rsrp >= -100 -> "一般"
-            rsrp >= -115 -> "差"
-            else -> "极差"
-        }
-    }
+    // 2026-10-11 删除 `getSignalLevel(rsrp)`。
+    //
+    // 它与 app/ui 的 `signalLevelText(rsrp)` 是**同一套 5 档分档的两份实现**，
+    // 而且文案不一致（本函数"极好/好/一般/差/极差" vs signalLevelText 同档同义）。
+    // 查全仓调用点：本函数**零调用** —— 属于死代码。
+    //
+    // 留着比删掉更危险：谁哪天看到 FormatUtils 里有"信号等级"就会直接用，
+    // 于是同一个 RSRP 在不同页面显示不同措辞，而且分档阈值将来只改一处就悄悄分叉。
+    // 信号分档的唯一真源是 app/ui/UfiSignalBars.kt 的 signalLevelText / signalBars /
+    // signalColor（三者同源，改动请一并改）。
 
     fun getSignalBars(rsrp: Int?): Int {
         if (rsrp == null) return 0

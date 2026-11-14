@@ -41,6 +41,10 @@ import androidx.compose.runtime.setValue
  *            UfiTrafficTile, UfiInfoRow, UfiInfoCell, UfiLogPanel, UfiCodeEditorCard
  * - Badges: UfiBadge
  * - Charts: UfiMonitorChart, SeriesLegendChips
+ * - Guided forms: UfiWizard(steps, currentStep, onStepChange, onFinish), UfiWizardStep,
+ *                 UfiWizardReviewCard, UfiWizardReviewRow
+ *                 （分步表单的唯一入口；字段多的编辑页用它，不要再写"一根长滚动条 + 右上角 ✓"，
+ *                  那种版式的校验失败只能静默）
  *
  * ## Animation Modifiers (from com.ufi_axis.ui.animation)
  * - Modifier.blurEntrance(key) — fade + translateY 页面入场（只在首次 / key 变化时播）

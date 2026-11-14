@@ -19,8 +19,11 @@ enum class ThemeMode { AUTO, LIGHT, DARK }
  * @param observeExternal 是否注册跨实例 SharedPreferences 监听。
  *   MainActivity 用默认 true（同进程其它 ThemeManager 实例写入后，本实例也能收到）。
  *   设置页等短生命周期屏幕用 false，避免泄漏监听。
+ *
+ *   存成属性（而不是只做构造参数）是为了让 [dispose] 能知道当初到底有没有注册过 ——
+ *   反注册必须与注册严格配对。
  */
-class ThemeManager(context: Context, observeExternal: Boolean = true) {
+class ThemeManager(context: Context, private val observeExternal: Boolean = true) {
 
     private val prefs = context.getSharedPreferences("ufi_axis_prefs", Context.MODE_PRIVATE)
 
@@ -308,6 +311,27 @@ class ThemeManager(context: Context, observeExternal: Boolean = true) {
             }
         }
         if (observeExternal) prefs.registerOnSharedPreferenceChangeListener(prefListener)
+    }
+
+    /**
+     * 解除 [init] 里注册的 SharedPreferences 监听。
+     *
+     * `observeExternal = true` 的实例被 `remember` 持有在组合里（胶囊三处），
+     * 组件销毁时若不反注册，监听就一直挂在 SharedPreferences 上 ——
+     * SharedPreferences 是进程级单例，它持有的是**强引用**，实例连同它捕获的那批
+     * flow 一起活到进程结束。所以每个 `observeExternal = true` 的构造点都必须配一个
+     * `DisposableEffect { onDispose { dispose() } }`。
+     *
+     * ★ 反注册必须传**同一个**监听器实例，否则是静默无效的 ——
+     *   [prefListener] 本来就是字段（不是匿名局部变量），这一点天然成立。
+     *
+     * ★ 只解监听，**不动**任何 companion 共享 flow：那些值是进程内共享的，
+     *   一个实例销毁不代表别的实例不再需要（清掉就会让别处的皮肤 / 时长瞬间回落）。
+     *
+     * 幂等：重复调用无副作用（`unregister` 一个没注册过的监听器是空操作）。
+     */
+    fun dispose() {
+        if (observeExternal) prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
     }
 
     /**

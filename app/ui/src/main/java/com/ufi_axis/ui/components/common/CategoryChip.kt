@@ -20,6 +20,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.ufi_axis.ui.animation.ufiPressScale
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.UfiWeight
@@ -97,7 +98,11 @@ fun CategoryChip(
                 indication = null,
                 onClick = onClick
             )
-            .padding(horizontal = 12.dp, vertical = 6.dp),
+            // 2026-10-11：改走 [Spacing.ChipPaddingH] token，并把纵向留白从 6dp 提到
+            // 8dp —— 原来硬编码的 12/6dp 让 chip 偏矮、点击区偏小（与 SegmentHeight 同款问题）。
+            // 用 token 而不是再写死数值：本文件此前完全没引用 Spacing，是全站少数
+            // 绕过 token 直接写 dp 的地方之一。
+            .padding(horizontal = Spacing.ChipPaddingH, vertical = 8.dp),
         contentAlignment = Alignment.Center
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {

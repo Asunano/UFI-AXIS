@@ -124,6 +124,24 @@ enum class NotifyScene(
         rateLimitMinutes = 0
     ),
 
+    /** 流量报告（日报/周报/月报，2026-10-06；依附事件 channel） */
+    TRAFFIC_REPORT(
+        sceneId = "trafficReport",
+        channelId = NotificationCenter.CHANNEL_EVENTS,
+        defaultEnabled = false,
+        importance = NotificationManager.IMPORTANCE_DEFAULT,
+        rateLimitMinutes = 0
+    ),
+
+    /** 套餐到期（fixed 模式有效期提醒，2026-10-07；依附事件 channel） */
+    PLAN_EXPIRY(
+        sceneId = "planExpiry",
+        channelId = NotificationCenter.CHANNEL_EVENTS,
+        defaultEnabled = false,
+        importance = NotificationManager.IMPORTANCE_DEFAULT,
+        rateLimitMinutes = 0
+    ),
+
     /** 设备事件（WiFi 客户端上下线，默认关闭） */
     DEVICE_EVENTS(
         sceneId = "events",
@@ -175,6 +193,14 @@ data class NotifyPayload(
     val deDupValue: String? = null,
     /** 点击跳转 PendingIntent；null=打开 App 主界面 */
     val onTap: PendingIntent? = null,
+    /**
+     * 跨进程转交时的点击语义（PendingIntent 不能跨进程传递）。
+     * `"alert"`=事件中心；`"sms"`=短信对话（配合 [smsPhone]）；null=主界面。
+     * 仅主进程 → `:ufi_notify` 转交时使用。
+     */
+    val tapType: String? = null,
+    /** [tapType] 为 `"sms"` 时的手机号。 */
+    val smsPhone: String? = null,
     /** 通知优先级（NotificationCompat.PRIORITY_*）；null=按场景 importance 派生 */
     val priority: Int? = null,
     /** 强制静默（不响铃不震动）；免打扰命中时自动置 true */

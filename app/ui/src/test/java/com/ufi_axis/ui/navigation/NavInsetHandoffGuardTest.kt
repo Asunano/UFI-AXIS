@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.navigation
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,6 +75,17 @@ class NavInsetHandoffGuardTest {
     private val capsuleHostPath =
         "src/main/java/com/ufi_axis/ui/components/common/UfiCapsuleBlurHost.kt"
 
+    /**
+     * 贴底通栏低栏本体（2026-09-24 起挂载的形态，见 `MainNavGraph.USE_BOTTOM_DOCK`）。
+     *
+     * 它是「测量完成前不发布」那道闸门的**供数方**：闸门的判据是
+     * `naturalSize.value.height > 0`，而这个值只能由**当前挂载的那个栏**回写。
+     * 见 [capsuleInset_measuredHeightMustBeSuppliedByMountedBar]。
+     */
+    private val bottomDockPath =
+        "src/main/java/com/ufi_axis/ui/components/common/UfiBottomDock.kt"
+
+
     private val themeManagerPath =
         "src/main/java/com/ufi_axis/ui/theme/ThemeManager.kt"
 
@@ -121,6 +133,51 @@ class NavInsetHandoffGuardTest {
      * `contentWindowInsets` / `beyondViewportPageCount` 都在注释里出现多次），
      * 直接全文搜索必然误报，必须先去注释再断言。
      */
+    /**
+     * 2026-10-11：二级页转场的位移起点必须走 [slideStartOffsetGuarded] 下限保护。
+     *
+     * 用户实测症状：概率性「二级页从右下角长出来」，复现路径是"进应用管理页、
+     * 骨架屏还在加载时退出并立刻进别的二级页"。判断为 `slideInHorizontally { it }`
+     * 的 `it`（目标页**那一帧**测量的宽度）在转场被中途打断时尚未落定，起点退化成近零。
+     *
+     * ⚠ 本修正**未经真机验证**（用户反馈 logcat 不便，加日志实测改到下一批次）。
+     * 判定依据是测量竞态推断。若后续实测发现正常帧的 `it` 本就偏小，应重新评估本保护。
+     *
+     * 守护点：四处 detail 位移（enter / exit / popEnter / popExit）都必须过保护，
+     * 且 rise 系列（垂直）**不得**被牵连改签名。
+     */
+    @Test
+    fun detailSlideStart_mustUseGuardedFallback() {
+        val code = executableCode(source(navigationPath))
+        assertTrue(
+            "必须保留 slideStartOffsetGuarded 下限保护（转场中途打断时 it 未落定 → 从右下角长出来）",
+            code.contains("slideStartOffsetGuarded")
+        )
+        // 四处 detail 位移全部走保护
+        val guarded = Regex("slideStartOffsetGuarded\\(it, fallbackWidth\\)").findAll(code).count()
+        assertEquals("四处 detail 位移（enter/exit/popEnter/popExit）都应走保护，实际 $guarded 处", 4, guarded)
+        // rise 系列保持原签名，不接受 fallbackWidth
+        assertFalse(
+            "rise 系列（垂直位移）不应被牵连加 fallbackWidth 参数",
+            Regex("fun AnimatedContentTransitionScope<androidx\\.navigation\\.NavBackStackEntry>\\.rise\\w+\\([^)]*fallbackWidth").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 2026-10-11：`fallbackWidth` 必须来自 `LocalConfiguration.screenWidthDp` 换算的**整屏宽度**。
+     *
+     * 用 `LocalDensity` 是为了 dp→px 的换算（`toPx()` 需要 Density scope），
+     * 但宽度本身只能来自 Configuration —— 不能用某个 dp 常量乘 density 猜。
+     */
+    @Test
+    fun fallbackSlideWidth_mustComeFromScreenConfiguration() {
+        val code = executableCode(source(navGraphPath))
+        assertTrue(
+            "兜底宽度应取 LocalConfiguration.screenWidthDp 换算的整屏宽度",
+            code.contains("screenWidthDp")
+        )
+    }
+
     private fun executableCode(text: String): String =
         text.replace(Regex("""/\*[\s\S]*?\*/"""), "")
             .lines()
@@ -181,9 +238,8 @@ class NavInsetHandoffGuardTest {
      * `background(palette.pageBg)` 必须排在 `statusBarsPadding()` **之前**。
      *
      * 反过来（或干脆不画背景，让祖先兜底）会让状态栏 / 手势条那两条带子不属于本页像素：
-     * 转场中页面整体平移 + `ufiNavRecedeLayer` 的 `CompositingStrategy.Offscreen` 把内容裁到
-     * 图层边界，那两条带子露出的就是图层外的窗口底色 —— 真机是「上下各一道白框」，
-     * 卡片阴影让它更显眼。
+     * 转场中页面整体平移（不再缩放、不再离屏裁剪），那两条带子露出的就是祖先兜底的非本页
+     * 像素 —— 窗口底色，真机是「上下各一道白框」，卡片阴影让它更显眼。
      */
     @Test
     fun ufiScreenScaffold_mustPaintPageBgBeforeInsetPadding() {
@@ -838,28 +894,56 @@ class NavInsetHandoffGuardTest {
     }
 
 
-    // ── 返回时的「阴影闪烁」（2026-09-04） ────────────────────────────────────
+    // ── 转场深度层：不缩放、不离屏合成，深度只靠 scrim（2026-09-13） ──────────
 
     /**
-     * 下层的缩放图层必须在**缩放期间**离屏合成一次，且**静止时退回 `Auto`**。
+     * 下层图层**不得**缩放、**不得**离屏合成；圆角改用 in-place `clipPath`；深度感由 scrim 承担。
      *
-     * - 少了 `Offscreen`：子树里几十张 `ufiCardShadow` 卡片的阴影会随 `scale 0.96→1`
-     *   逐帧按新比例重新光栅化，边缘亮度抖动 —— 用户实测能看到的「阴影闪烁」。
-     * - 写成无条件 `Offscreen`：宿主页 99% 的时间静止，却常驻一张≈屏幕大小的离屏纹理
-     *   （1080×2340 ARGB8888 ≈ 10MB 显存），纯浪费。
+     * 2026-09-13 二次修订（对应问题 1/2/3/4 的修复）：
+     * - 一次修订把离场页的 `scale 0.96 + CompositingStrategy.Offscreen` 删掉，改成
+     *   `graphicsLayer { clip = true; shape = RoundedCornerShape }` 给进场页做圆角。但
+     *   `graphicsLayer` 一带**非矩形 shape** 就走 `clipToOutline`、**强制分配整屏离屏缓冲**：
+     *   该缓冲被父级 `slide` 平移时合成到错误偏移 → 整页「从下方/右下角飘上来」（问题 1/4，
+     *   多次返回必现）；圆角半径逐帧变化 → 缓冲每帧重分配 → 连续/快速返回掉帧（问题 2）；
+     *   缓冲在未铺满屏时被遮 → 「新页圆角完全没有」（问题 3）。
+     * - 二次修订：圆角改在 `DrawScope` 里用 `canvas.clipPath(roundRectPath)` **原地裁剪**
+     *   （不分配任何层），`graphicsLayer`/`CompositingStrategy.Offscreen`/`scaleX`/`scaleY`
+     *   全部不得出现；scrim 仍由 `drawRect` + `sharedAxisScrimAlpha()` 承担（问题「压暗看不见」落点）。
      */
     @Test
-    fun ufiNavRecedeLayer_mustCompositeOffscreenOnlyWhileScaling() {
+    fun ufiSharedAxisLayer_mustClipInPlaceNotOffscreenAndMustScrim() {
         val code = executableCode(source(navigationPath))
-        assertTrue(
-            "ufiNavRecedeLayer 的缩放图层必须在缩放期间用 CompositingStrategy.Offscreen：" +
-                "否则子树里的 ufiCardShadow 阴影会逐帧重光栅化，真机可见阴影闪烁。",
+        // 1) 离屏合成整段移除 —— 否则预测性返回掉帧 + 首帧飞角复发。
+        assertFalse(
+            "ufiSharedAxisLayer 不得再用 CompositingStrategy.Offscreen：" +
+                "非矩形 shape 的 graphicsLayer 会 clipToOutline 强制整屏离屏缓冲，" +
+                "被父级 slide 平移时合成到错误偏移（问题 1/4），且逐帧重分配致掉帧（问题 2）。",
             code.contains("CompositingStrategy.Offscreen")
         )
+        // 2) 不得再出现任何 graphicsLayer（避免再次引入离屏层）。
+        assertFalse(
+            "ufiSharedAxisLayer 不得再出现 graphicsLayer：" +
+                "它一旦带非矩形 shape 就强开整屏离屏缓冲，正是问题 1/2/4 的根因。",
+            code.contains("graphicsLayer")
+        )
+        // 3) 两层都不做缩放（不得再出现 scaleX / scaleY）。
+        assertFalse(
+            "receding / entering 两层都不得出现 scaleX / scaleY（不得再缩放）。",
+            code.contains("scaleX") || code.contains("scaleY")
+        )
+        // 4) 圆角改用 in-place clipPath（不分配离屏缓冲）。
         assertTrue(
-            "静止（scale == 1f）时必须退回 CompositingStrategy.Auto：常开离屏会白占约 10MB 显存。",
-            Regex("""scale\s*==\s*1f\s*\)?\s*CompositingStrategy\.Auto""")
-                .containsMatchIn(code.replace(Regex("""\s+"""), " "))
+            "进场新页圆角必须改用 canvas.clipPath 原地裁剪（不开离屏层），否则问题 1/2/4 复发。",
+            code.contains("clipPath")
+        )
+        // 5) scrim（压暗修复落点）必须仍在：drawRect + sharedAxisScrimAlpha。
+        assertTrue(
+            "深度感改由 scrim 承担，drawRect 必须在（否则压暗消失）。",
+            code.contains("drawRect")
+        )
+        assertTrue(
+            "scrim 浓度必须仍由 sharedAxisScrimAlpha() 读 token（落点：UfiMotion.NavRecede.ScrimAlpha）。",
+            code.contains("sharedAxisScrimAlpha")
         )
     }
 
@@ -888,6 +972,11 @@ class NavInsetHandoffGuardTest {
      * 首帧 `naturalSize` 为 0，无条件写入会先发布一个矮 ~50dp 的假值，
      * 于是所有读 `LocalCapsuleBottomInset` 的长列表在返回动画途中要多重排一次，
      * 底部卡片上下跳 ⇒ 阴影再闪一次。
+     *
+     * ★ 2026-09-24（贴底通栏低栏迁移）：本条**语义不变**，继续守这道闸门。
+     *   计算式已从「胶囊高 + 8dp + 安全区」换成「58dp + 安全区」（不再依赖 naturalSize），
+     *   但闸门仍要留着 —— 它现在起的是「等栏真的立起来再让页面重排」的时序作用。
+     *   供数方见 [capsuleInset_measuredHeightMustBeSuppliedByMountedBar]。
      */
     @Test
     fun capsuleInset_mustNotPublishBeforeMeasured() {
@@ -896,6 +985,46 @@ class NavInsetHandoffGuardTest {
             "写 CapsuleInsetHolder.bottomInset 前必须判 `naturalSize.value.height > 0`：" +
                 "测量前发布的是矮 ~50dp 的假值，会让页面在转场途中多重排一次。",
             Regex("""naturalSize\.value\.height\s*>\s*0""").containsMatchIn(code)
+        )
+    }
+
+    /**
+     * 「测量完成前不发布」这道闸门必须有**供数方**：当前挂载的底栏要回写实测高度。
+     *
+     * ## 为什么单独一条（2026-09-24 通栏迁移的实测教训）
+     * 闸门判据是 `naturalSize.value.height > 0`，而 `LocalCapsuleNaturalSize` 原来
+     * **只有 `UfiCapsuleTabBar` 写**（在它自定义 `Layout` 的固有测量阶段）。
+     * 通栏迁移阶段 1 新建 `UfiBottomDock` 时漏了这一处：开关切到通栏后闸门**永不放行**，
+     * 所有读 `ufiCapsuleBottomInset` 的页面（监控 / 仪表盘的长列表）一直停在 88dp 兜底值
+     * —— 底部留白与真实栏高不符，且没有任何报错。
+     *
+     * 同一个值还钉着**窗口高度**（`applyCapsuleWindowParams` 用它代替 WRAP_CONTENT），
+     * 缺供数方时窗口会一直是 WRAP_CONTENT —— 靠内容撑开虽然也能对，但窗口矩形不再受控。
+     *
+     * 断言两件事：
+     * 1. 栏根节点挂了 `onSizeChanged` 并写 `LocalCapsuleNaturalSize`；
+     * 2. 写入前有相等性判断 —— `onSizeChanged` 回调里无条件写 `MutableState` 会
+     *    「写 → 重组 → 重新测量 → 再写」空转。
+     */
+    @Test
+    fun capsuleInset_measuredHeightMustBeSuppliedByMountedBar() {
+        val dock = executableCode(source(bottomDockPath))
+
+        assertTrue(
+            "UfiBottomDock 不再读 `LocalCapsuleNaturalSize` —— 「测量完成前不发布」那道闸门就没有" +
+                "供数方了：判据 `naturalSize.value.height > 0` 永不成立，所有页面的底部留白" +
+                "会一直停在 88dp 兜底值（且不报错）；窗口高度也会退回 WRAP_CONTENT。",
+            dock.contains("LocalCapsuleNaturalSize")
+        )
+        assertTrue(
+            "栏根节点没有挂 `onSizeChanged` 回写实测尺寸 —— 同上。" +
+                "必须是**实测值**而不是「58 + 安全区」常量：fontScale 1.5× 时栏会长高。",
+            Regex("""onSizeChanged\s*\{""").containsMatchIn(dock)
+        )
+        assertTrue(
+            "回写 naturalSize 时缺少相等性判断（应为 `if (naturalSize.value != size) …`）—— " +
+                "onSizeChanged 里无条件写 MutableState 会「写 → 重组 → 重新测量 → 再写」空转。",
+            Regex("""if\s*\(\s*naturalSize\.value\s*!=\s*size\s*\)""").containsMatchIn(dock)
         )
     }
 
@@ -918,7 +1047,7 @@ class NavInsetHandoffGuardTest {
      * 于是 pop 期间角色整个判反：正整屏右滑出去的 detail 吃 `scale 1→0.96` + scrim，
      * 宿主则完全不变换、复位动画根本没播 —— 用户报的「退出偏快 / 卡顿跳帧 / 下层表现不对 /
      * 收尾没滑完就消失」都在这里。现在角色由**方向**决定（`UfiNavRecedeRole`：
-     * `detailExit` 记 `initialState.id`、`detailPopEnter` 记 `targetState.id`），
+     * `detailSharedAxisExit` 记 `initialState.id`、`detailSharedAxisPopEnter` 记 `targetState.id`），
      * 不再读 `visibleEntries`，顺带把手势返回「松手瞬间角色互换」也一并修掉。
      */
     @Test
@@ -937,15 +1066,15 @@ class NavInsetHandoffGuardTest {
         )
         val navigation = executableCode(source(navigationPath))
         assertTrue(
-            "detailExit 必须把 push 方向的下层（留在后面的旧页 = initialState）记进 role。",
+            "detailSharedAxisExit 必须把 push 方向的下层（留在后面的旧页 = initialState）记进 role。",
             Regex("""role\.recedingEntryId\s*=\s*initialState\.id""").containsMatchIn(navigation)
         )
         assertTrue(
-            "detailPopEnter 必须把 pop 方向的下层（回来的旧页 = targetState）记进 role。",
+            "detailSharedAxisPopEnter 必须把 pop 方向的下层（回来的旧页 = targetState）记进 role。",
             Regex("""role\.recedingEntryId\s*=\s*targetState\.id""").containsMatchIn(navigation)
         )
         assertFalse(
-            "ufiNavRecedeLayer 的形参又叫回 `isFront` —— 语义已取反为 `isReceding`（本页是否是下层），" +
+            "ufiSharedAxisLayer 的形参又叫回 `isFront` —— 语义已取反为 `isReceding`（本页是否是下层），" +
                 "两套命名混用必然再判反一次。",
             navigation.contains("isFront")
         )
@@ -992,6 +1121,58 @@ class NavInsetHandoffGuardTest {
                 "实例永不变 ⇒ static local 永不触发整树重组，快照读留给消费方的 layout 阶段。",
             Regex("""remember\s*\{\s*\{\s*CapsuleInsetHolder\.bottomInset\.value\s*\}\s*\}""")
                 .containsMatchIn(navGraph)
+        )
+    }
+
+    /**
+     * ★ 配对约定（2026-09-24，贴底通栏低栏 §5.21 / §7-2.9 ①）：
+     * 「页壳 padding navigationBars」与「inset 消费侧扣减 navigationBars」必须**同时在线**。
+     *
+     * `LocalCapsuleBottomInset` 发布的是底栏**自身总高**（内容 58dp + 安全区，**含**安全区），
+     * 而 `UfiScreenScaffold` 的内容 `Box` 已经 `windowInsetsPadding(WindowInsets.navigationBars)`
+     * —— 两者相加就是双算，6 个主 Tab 页各多留一个 navigationBars（手势≈24dp / 三键≈48dp）。
+     * 悬浮胶囊时代窗口 `y` 抬高 30dp 恰好抵掉了这一项，通栏形态抬升归 0 后双算立刻显形。
+     *
+     * 裁决是**不动页壳**（二级页确实需要那段 padding），改由消费侧显式减掉：
+     * `(底栏总高 − navigationBars.bottom).coerceAtLeast(0.dp) + extra`（见 `capsuleBottomClearance`）。
+     *
+     * 于是这条护栏盯两端：任何一端被单独改掉（消费侧不再减 ⇒ 双算回归；页壳那句被删 ⇒
+     * 反过来变成少留一个 navigationBars、内容压在手势条上）都会变红。
+     */
+    @Test
+    fun capsuleInset_mustDeductShellConsumedNavigationBars() {
+        val host = executableCode(source(capsuleHostPath))
+        assertTrue(
+            "扣减 navigationBars 的唯一落点 `Density.capsuleBottomClearance(` 不见了：" +
+                "它是底部留白与浮动控件抬升共用的那份算式，删掉任一端都会让两处各写一份数字。",
+            Regex("""fun\s+Density\.capsuleBottomClearance\(""").containsMatchIn(host)
+        )
+        val clearance = functionBody(host, "Density.capsuleBottomClearance")
+            .replace(Regex("""\s+"""), "")
+        assertTrue(
+            "capsuleBottomClearance 必须减掉页壳已消费的 `navigationBars.getBottom(this).toDp()`：" +
+                "少了这一步就是「底栏总高 + 页壳 padding」双算，每个主 Tab 页多留 24~48dp 白。",
+            clearance.contains("navigationBars.getBottom(this).toDp()")
+        )
+        assertTrue(
+            "扣减结果必须 `.coerceAtLeast(0.dp)`：栏比安全区还矮时（旧悬浮胶囊分支 / 未发布真值" +
+                "的兜底值）差值会变负，负高度会把呼吸间距一起吃掉。",
+            clearance.contains(".coerceAtLeast(0.dp)")
+        )
+        assertTrue(
+            "`Modifier.ufiCapsuleBottomInset` 必须走 capsuleBottomClearance —— 6 个主 Tab 页的" +
+                "底部留白都从这里出，自己再拼一遍 `insetOf() + extra` 就是双算回归。",
+            functionBody(host, "Modifier.ufiCapsuleBottomInset")
+                .contains("capsuleBottomClearance(")
+        )
+
+        // ── 配对的另一端：页壳那句必须还在 ──
+        // 消费侧减了、页壳却不再 padding，就从"多留"翻成"少留"（列表末行被手势条压住）。
+        val scaffoldBody = functionBody(executableCode(source(scaffoldPath)), "UfiScreenScaffold")
+        assertTrue(
+            "UfiScreenScaffold 的内容 Box 必须保留 `windowInsetsPadding(WindowInsets.navigationBars)`：" +
+                "`ufiCapsuleBottomInset` 是按「页壳已经消费过它」的前提在扣减的，两端必须成对存在。",
+            scaffoldBody.contains("windowInsetsPadding(WindowInsets.navigationBars)")
         )
     }
 }

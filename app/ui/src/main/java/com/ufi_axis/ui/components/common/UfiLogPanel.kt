@@ -113,8 +113,14 @@ fun UfiLogDialog(
         visible = visible,
         onDismiss = onDismiss,
         title = title,
+        // 「复制」不关弹窗，所以不经 close；「关闭」要走 shell 的关闭时序（离场 backdrop
+        // 必须播完才卸载窗口），见 LocalUfiDialogClose。两个 slot 都在 shell 内部组合，
+        // 因此 local 在这里读得到真实实现。
         dismissButton = onCopy?.let { copy -> { UfiButton(variant = UfiButtonVariant.Secondary, text = "复制", onClick = copy) } },
-        confirmButton = { UfiButton(text = "关闭", onClick = onDismiss) }
+        confirmButton = {
+            val close = LocalUfiDialogClose.current
+            UfiButton(text = "关闭", onClick = { close(onDismiss) })
+        }
     ) {
         Surface(
             color = palette.pageBg,

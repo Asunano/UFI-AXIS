@@ -38,7 +38,7 @@ object UfiPageSwitcherDefaults {
     /**
      * 默认转场策略。
      *
-     * 取 [UfiPageTransitions.Fade]，其观感复刻现有 `tabEnter`（`fadeIn(220) + scaleIn(0.98f)`），
+     * 取 [UfiPageTransitions.Fade]，其观感承接原 Tab 切换过渡（`fadeIn(220) + scaleIn(0.98f)`），
      * 保证接入后**零视觉回归**。
      */
     val DefaultTransition: UfiPageTransition

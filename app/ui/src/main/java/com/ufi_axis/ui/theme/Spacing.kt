@@ -147,7 +147,11 @@ object Spacing {
      * ⚠ 与 [SwitchTrackHeight] 无关，**不要互相借用**（本文件的「一个 token 只服务
      * 一个语义」原则：改开关轨道高度不该连带改分段控件）。
      */
-    val SegmentHeight = 32.dp
+    val SegmentHeight = 36.dp
+    // 2026-10-11：32 → 36dp（用户裁决「略微调大，不要过度」）。
+    // 改动理由与影响面：该 token 只服务分段/芯片选择器，全站 26 个调用点、15 个页面
+    // （监控、下载、流量、调试日志、外观设置…）。所以这是**全站可见**的一处改动，
+    // 不是只影响网络制式弹窗 —— 后续若某页觉得偏大，优先在调用处覆盖，别再回头动这个 token。
 
     // Navigation bar metrics (no longer used for bottom nav, kept for compatibility)
     val NavBarCornerRadius = 0.dp
@@ -202,6 +206,44 @@ object Spacing {
      * 改按钮描边不该连带改提示卡的框。
      */
     val NoticeBorderWidth = 1.dp
+
+    // Wizard metrics（2026-09-21 引导式表单 UfiWizard）
+    // 放令牌层而不是组件里写死：checkLiteralBaseline 的 dp 基线只许下降，
+    // 组件里写字面量会顶穿基线；而"步骤圆点多大"本身就该全站一致。
+    /**
+     * 步骤条圆点的直径。
+     *
+     * 32dp 的依据：比 [ChipHeight]（36dp）小一档 —— 圆点是**状态指示**而不是主操作按钮，
+     * 不该和同页的 chip 抢视觉重量；同时又要容得下 [WizardStepCheck] 的勾选图标 + 两位序号。
+     * 点击命中区由整列（含下方标签）承担，所以圆点本身小于 48dp 不影响可点性。
+     */
+    val WizardStepDot = 32.dp
+    /** 步骤之间连接线的粗细，同时用作步骤圆点的描边宽度（两者同源才看得出是"一条线串起来的点"）。 */
+    val WizardStepConnector = 2.dp
+    /** 步骤圆点内「已完成」勾选图标的尺寸。比 [IconSizeSmall]（18dp）小一档，留出圆点内的呼吸空间。 */
+    val WizardStepCheck = 16.dp
+    /**
+     * 向导页顶部品牌行的图标尺寸。
+     *
+     * 向导把「步骤条 + 面板 + 固定底栏」三段都塞进一屏，顶部品牌区必须收成一行 ——
+     * 48dp 与 [ButtonHeight] 同高，图标与右侧两行标题的视觉重量刚好持平；
+     * 落地页那种 120dp 居中大图标在向导里会把面板挤没。
+     */
+    val WizardHeaderIcon = 48.dp
+    /**
+     * 当前步圆点的阴影高度。
+     *
+     * 当前步与已完成步同为 accent 实底（整条已走过的链路要连贯），区分靠「序号 vs 勾选」+ 缩放 + 这层阴影。
+     * 取 6dp：比普通卡片（4dp）高一档 —— 它是页面上唯一需要"浮起来"的小元素。
+     */
+    val WizardActiveDotElevation = 6.dp
+    /**
+     * 向导确认页信息卡的描边宽度。
+     *
+     * 与 [NoticeBorderWidth] 同值（1dp）但**不复用** —— 本文件的"一个 token 只服务一个语义"原则：
+     * 改提示卡的框不该连带改确认页的卡。
+     */
+    val WizardCardBorder = 1.dp
 
     // Text editor metrics（2026-09-11 文本预览/编辑重写）
     // 行号列的宽度是**算出来的**（位数 × 字宽 + 间距），不是写死值 ——

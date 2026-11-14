@@ -238,9 +238,13 @@ private const val L_ON_INK: Float = 0.08f
 /** `on*` 的近白候选明度档。比 [L_PAPER] 更亮，理由同 [L_ON_INK]。 */
 private const val L_ON_PAPER: Float = 0.99f
 
-// 分隔线的透明度档 [DIVIDER_ALPHA] 在 `ColorContrast.kt`（internal，7 套预设 / 自定义 /
-// 动态取色同值）—— 本文件与 `DynamicPalette.kt` 曾各自复制一份，改一个漏一个会让
-// 自定义皮肤与动态取色的分隔线静默分叉。
+// 分隔线的透明度档在 `ColorContrast.kt`（internal，7 套预设 / 自定义 / 动态取色同值）——
+// 本文件与 `DynamicPalette.kt` 曾各自复制一份，改一个漏一个会让自定义皮肤与动态取色的
+// 分隔线静默分叉。
+// 2026-09-24 起那里是**两个**常量：[DIVIDER_ALPHA_LIGHT]（15%，往 ink 混，未变）与
+// [DIVIDER_ALPHA_DARK]（6%，往 paper 混，原 15%）。拆开的理由见后者的 KDoc：
+// 两态是往相反方向混的，深色态"线比面响"才是本次玫红观感缺陷的病灶，而浅色态的白卡
+// 恰恰只能靠线来界定 —— 一个常量管两态时，"调这个数"在两态里是两种相反的诉求。
 
 
 /**
@@ -271,7 +275,12 @@ private const val ACCENT_SECONDARY_PAPER_MIX: Float = 0.45f
  *
  * 口径与四张 Hero 卡真正画出来的像素同源（都走 [ufiShade]）：
  * - **浅色态**：`accent` 往白混 [GRADIENT_TOP_LIGHTEN]（22%），那是白字最容易失守的位置；
- * - **深色态**：那四处渐变是往黑混 4% / 14%，所以最亮点就是 `accent` 自己。
+ * - **深色态**：`accent` 往白混 [GRADIENT_TOP_LIGHTEN_DARK]（16%）。
+ *
+ * ⚠ 深色分支 2026-09-24 之前**直接返回 accent**：那时四处渐变是往黑混（`-0.14 / -0.04 / 0`），
+ * 最亮点就是 accent 自己。当天按用户定稿把深色渐变改成往白提亮（`0 / +8% / +16%`）后，
+ * 这条判据必须跟着走 —— 否则判据算的不是真实最亮点，卡内文字会在最亮那一端掉到 3:1 以下。
+ * 完整推导（含为什么是 16%、以及想再调大必须一起动哪几处）见 [GRADIENT_TOP_LIGHTEN_DARK]。
  *
  * 提升为生产代码（而不是继续留在 `ColorTest` 的 private 扩展里）的理由与
  * `ColorContrast.kt` 当初的提升完全相同：取色器的**确认闸门**要在运行时算这条判据，
@@ -279,15 +288,24 @@ private const val ACCENT_SECONDARY_PAPER_MIX: Float = 0.45f
  * 漂移的表现是"单测全绿但真机上那套自定义配色不合格"。
  */
 fun heroGradientBrightestStop(accent: Color, isDark: Boolean): Color =
-    if (isDark) accent else accent.ufiShade(GRADIENT_TOP_LIGHTEN)
+    if (isDark) accent.ufiShade(GRADIENT_TOP_LIGHTEN_DARK) else accent.ufiShade(GRADIENT_TOP_LIGHTEN)
+
 
 
 /**
- * 在**两个背景**上都要可读时挑前景色 —— [onColorFor] 的两背景版。
+ * 在**多个背景**上都要可读时挑前景色 —— [onColorFor] 的多背景版（maximin）。
+ *
+ * ## 可见性沿革（2026-09-24，本函数逻辑一字未动）
+ * 原为 `private`：当时只有自定义皮肤链路需要"两背景"。同日动态取色链路被发现犯的是
+ * **同一个错**（只按渐变最亮端判 ⇒ 系统性高估深色前景，浅色 Hero 卡文字被判成黑色、
+ * 压在哑蓝渐变上读不清），所以提为 `internal` 让同包的 `DynamicPalette.kt` 直接复用。
+ * 判据只能有一份 —— 两份实现必然漂移，漂移的表现是"自定义皮肤读得清、动态取色读不清"。
+ * ⚠ 提可见性时**不许顺手动逻辑**：`CustomPaletteTest` 的全部断言就是"自定义皮肤行为逐位不变"
+ * 的证据，它红了就说明改错了。
  *
  * ## 为什么不能直接用 [onColorFor]
- * 动态取色那边只按渐变最亮点算一次就够了，因为壁纸生成的 accent 亮度分布温和。
- * 自定义种子是**任意**的，会落进一个 [onColorFor] 处理不了的死角：
+ * [onColorFor] 只吃**一个**背景，而 Hero 渐变有两端（浅色态 `accent → +12% 白 → +22% 白`，
+ * 最暗端就是 accent 本身）。只按最亮端算会落进一个死角：
  *
  * `accent` 亮度 `Y ≈ 0.09`（约 `#545454` 这一档中灰）时，它的渐变最亮点被提亮到
  * `Y ≈ 0.19` —— 单看最亮点，近黑候选赢（`3.4:1` vs 近白的 `3.3:1`），于是选近黑；
@@ -308,12 +326,36 @@ fun heroGradientBrightestStop(accent: Color, isDark: Boolean): Color =
  * 离 0.292 还差一截 ⇒ 那个交集是**空的**，至少一个候选必然 ≥ 3:1。
  * 全域扫描实测下界 3.35:1（见 `CustomPaletteTest`），与上面的解析结论一致。
  *
+ * 深色态（2026-09-24 起也是两个背景）走同一条论证，只是提亮幅度换成
+ * [GRADIENT_TOP_LIGHTEN_DARK]（16%）：`Y_a = 0.123` 时最坏色相（纯灰）的 `Y_g` 只被推到
+ * **0.202**，比 22% 那一档更远离 0.292，所以结论更宽松 —— 提亮深色渐变不会动摇这条保证。
+ *
+ * ## ⚠ 上面那条保证**只对自定义皮肤的候选成立**
+ * 推导里用到的 `Y_ink` / `Y_paper` 是 [L_ON_INK] / [L_ON_PAPER] 这两个**常量档**算出来的。
+ * 动态取色链路复用本函数时，候选换成了壁纸的 `neutral1_900` / `neutral1_50`
+ * （见 `DynamicPalette.kt`）—— 那两个色由壁纸决定，`Y_ink` 可能更高、`Y_paper` 可能更低，
+ * 于是"交集是空的"这个结论**不再自动成立**：中间调 accent 上两个候选可能都 < 3:1。
+ * 本函数的职责因此严格限于"在给定候选与给定背景下挑出 maximin 最优者"——
+ * 它保证的是**不存在更好的选择**，而不是"选出来的一定达标"。
+ * 动态链路那半边达标性属于另一批（改渐变本身把 accent 推离中间调），
+ * 当前由 `DynamicPaletteTest` 的扫描式护栏**只记录不判红**，见那条测试的 KDoc
+ * （2026-09-24 实测：468 个合成 accent × 两态里两候选都不达标的 **0 条**，但浅色态
+ * 中间带最薄处只有 3.19:1 / 余量 6%）。
+
+ *
+ * ## 背景列表允许只有一个元素
+ * 那时它退化成 [onColorFor]（`minOf` 对单元素即恒等）。动态链路的 `onAccent` 就是这么调的
+ * —— 实色 accent 按钮 / 药丸**没有**渐变提亮，背景只有 accent 实底一个。
+ * 刻意仍走本函数而不是 [onColorFor]：`on*` 三个槽的裁决口径必须是同一份实现，
+ * 分成两个函数之后"改判据"就会漏掉一处。
+
+ *
  * @return 两个候选中"最坏情况对比度"更高者；相等时返回 [dark]（确定性优先，同 [onColorFor]）。
  *
  * 背景用 `List<Color>` 而不是 `vararg`：`Color` 是 `@JvmInline value class`，
  * Kotlin 禁止值类作为 vararg 元素类型（`Prohibited vararg parameter type 'Color'`）。
  */
-private fun pickOnColor(dark: Color, light: Color, backgrounds: List<Color>): Color {
+internal fun pickOnColor(dark: Color, light: Color, backgrounds: List<Color>): Color {
     val darkWorst = backgrounds.minOf { contrastRatio(dark, it) }
     val lightWorst = backgrounds.minOf { contrastRatio(light, it) }
     return if (darkWorst >= lightWorst) dark else light
@@ -336,7 +378,7 @@ private fun pickOnColor(dark: Color, light: Color, backgrounds: List<Color>): Co
  * | `cardBg` | `#FFFFFF` | `hsl(p.h, tint×2.2, .132)` |
  * | `textPrimary` / `iconTint` | `ink` = `hsl(p.h, tint×1.6, .145)` | `paper` |
  * | `textSecondary` | `hsl(p.h, tint×1.6, .38)` | `hsl(p.h, tint×1.6, .70)` |
- * | `divider` | `mix(cardBg, ink, 15%)` | `mix(cardBg, paper, 15%)` |
+ * | `divider` | `mix(cardBg, ink, 15%)` | `mix(cardBg, paper, 6%)` |
  * | `onAccent` / `onGradient` / `gradientMuted` | [pickOnColor] 运行时算 | 同 |
  *
  * 关键点：中间那五行**完全不读 `p.l`**，只读 `p.h` / `p.s`（而 `p.s` 只用来算 tint，
@@ -382,8 +424,17 @@ fun buildCustomPalette(seed: Color): ThemePalette {
             heroGradientBrightestStop(accentLight, isDark = false)
         )
     )
-    // 深色态渐变往黑混，最亮点就是 accent 本身 ⇒ 只有一个背景。
-    val onAccentDark = pickOnColor(dark = onInk, light = onPaper, backgrounds = listOf(accentDark))
+    // 深色态 2026-09-24 起与浅色态同构：渐变最亮点被提亮到 accent 混 16% 白
+    // （见 GRADIENT_TOP_LIGHTEN_DARK），所以这里也必须是**两个背景**的 maximin。
+    // 之前只传 accent 一个背景是正确的 —— 那时深色渐变往黑混、最亮点就是 accent 本身。
+    val onAccentDark = pickOnColor(
+        dark = onInk,
+        light = onPaper,
+        backgrounds = listOf(
+            accentDark,
+            heroGradientBrightestStop(accentDark, isDark = true)
+        )
+    )
 
     return ThemePalette(
         id = CUSTOM_THEME_ID,
@@ -400,8 +451,8 @@ fun buildCustomPalette(seed: Color): ThemePalette {
         textPrimaryDark = paper,
         textSecondaryLight = hslColor(p.hue, tint * TINT_SCALE_INK, L_TEXT_SECONDARY_LIGHT),
         textSecondaryDark = hslColor(p.hue, tint * TINT_SCALE_INK, L_TEXT_SECONDARY_DARK),
-        dividerLight = blendSrgb(cardLight, ink, DIVIDER_ALPHA),
-        dividerDark = blendSrgb(cardDark, paper, DIVIDER_ALPHA),
+        dividerLight = blendSrgb(cardLight, ink, DIVIDER_ALPHA_LIGHT),
+        dividerDark = blendSrgb(cardDark, paper, DIVIDER_ALPHA_DARK),
         iconTintLight = ink,
         iconTintDark = paper,
         onAccentLight = onAccentLight,

@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -62,10 +63,13 @@ import com.ufi_axis.ui.theme.UfiMotion
  *
  * 维护约定：新增共享组件时**必须**在这里补一条预览。删除组件时同步删预览（编译会提醒）。
  *
- * 覆盖范围：按钮 / chip 与徽章 / 列表行 / 卡片 / 容器卡 / 输入 / 开关与勾选 / 反馈态 /
- * 分段控件 / 弹窗 / 图标一致性，共 11 个分区。
+ * 覆盖范围：按钮 / chip 与徽章 / 列表行 / 卡片 / 容器卡 / 向导确认卡 / 输入 / 开关与勾选 /
+ * 反馈态 / 分段控件 / 弹窗 / 图标一致性，共 12 个分区。
  * 刻意不含：需要真实数据或宿主环境的组件（`UfiChart`、`UfiCapsuleTabBar`、页面切换器、
  * 文件与短信等业务组件）—— 它们在画廊里只能造假数据，看了也说明不了一致性问题。
+ * 同样不含 [com.ufi_axis.ui.components.common.UfiWizard]：它是 `fillMaxSize` 的整页骨架
+ * （步骤条 + 面板 + 固定底栏），塞进本页这条 `verticalScroll` 列里高度约束是无限，撑不起来；
+ * 它唯一可独立预览的部件 `UfiWizardReviewCard` 已单列一节。
  */
 @Composable
 fun UfiGalleryScreen(navController: NavHostController) {
@@ -463,6 +467,20 @@ fun UfiGalleryScreen(navController: NavHostController) {
                         severity = UfiNoticeSeverity.WARNING,
                         title = "UfiNoticeCard · WARNING",
                         message = "需要留意的事：淡底 + 淡描边，带标题时标题在图标右侧。"
+                    )
+                }
+
+                // 向导（UfiWizard）本体是 fillMaxSize 的整页骨架，放不进这条滚动列 ——
+                // 这里只铺它的确认页信息卡，那是唯一能独立存在的部件（理由见本文件头「刻意不含」）。
+                GallerySection("向导确认卡 · UfiWizardReviewCard") {
+                    UfiWizardReviewCard(
+                        title = "执行动作",
+                        icon = Icons.Filled.Bolt,
+                        rows = listOf(
+                            UfiWizardReviewRow("动作", "移动数据"),
+                            UfiWizardReviewRow("分类", "网络"),
+                            UfiWizardReviewRow("状态", "开启")
+                        )
                     )
                 }
 
