@@ -131,6 +131,8 @@ dependencies {
     // 入口来自 feature-tools 的隧道设置与 feature-settings 的服务器配置，两者都经
     // Routes.DETAIL_RESOURCES 跳转，因此这里是**唯一**依赖本模块的地方。
     implementation(project(":app:feature-resources"))
+    // 应用商店（2026-10-31）：第三方 Linux 程序的安装 / 启停 / 打开；入口在工具页。
+    implementation(project(":app:feature-programs"))
 
     // ★ 共享数据工具（DownsampledPoint 等，经 :app:data 的 api 透传引用）
     implementation(project(":core:common"))

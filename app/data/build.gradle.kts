@@ -23,6 +23,14 @@ android {
         aidl = true
     }
     lint { abortOnError = false }
+
+    testOptions {
+        // 2026-11-14：`android.util.Log` 在 JVM 单测里默认抛 "not mocked"，
+        // 而鉴权判据（AuthRejectionPolicy）内部会经 DebugLog 碰它 ——
+        // 于是"删配对会不会被踢"这条最该被测的阈值逻辑反而测不了。
+        // 返回默认值（no-op）即可，断言只关心 Verdict。
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {

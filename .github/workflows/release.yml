@@ -150,7 +150,10 @@ jobs:
       - name: Set up Node.js (web build)
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # Node 22 LTS：vitest 5 的 engines 是 ^22.12 || ^24 || >=26，
+          # 而 Node 20 已于 2026-04 EOL。三个 workflow 必须同版本，
+          # 否则「本地能跑、发版构建用另一套 Node」会重新变成一类悬案。
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
@@ -165,7 +168,7 @@ jobs:
       # 再补一条纯 JVM 模块 :core:device-schema 的 test（它没有 debug 变体）。
       # F15 为 androidTest（MigrationTestHelper，需设备/模拟器），仍不在此处运行。
       - name: Run unit tests (release gate)
-        run: ./gradlew testDebugUnitTest :core:device-schema:test
+        run: ./gradlew testDebugUnitTest :core:contract:test :core:device-schema:test
 
       # release 变体不挂签名（signingConfigs 里的 `ufi` 只服务 benchmark 变体，
       # 且需要本地 keystore.properties；CI 无此文件），这里产出未签名 release APK
@@ -401,8 +404,9 @@ jobs:
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "version.json 回写后："
           cat version.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 仓库只允许 Asunano 作为提交作者（2026-11-09），不要改回 bot 身份
+          git config user.name "Asunano"
+          git config user.email "3233353454@qq.com"
           git add version.json
           git commit -m "ci: 回写 release ${{ github.ref_name }} apkUrl/apkSize/apkSha256/publishedAt/tagName" \
             || echo "version.json 无变更，跳过 commit"

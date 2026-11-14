@@ -76,18 +76,28 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # Node 22 LTS：vitest 5 的 engines 是 ^22.12 || ^24 || >=26，
+          # 而 Node 20 已于 2026-04 EOL。三个 workflow 必须同版本，
+          # 否则「本地能跑、发版构建用另一套 Node」会重新变成一类悬案。
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
       - name: Install web dependencies
         run: cd web && npm ci
 
-      # ── Web UI 基线门禁（2026-10-14 补，与 build.yml 同一条）──
+      # ── Web 静态门禁（2026-10-14 补，2026-10-30 扩到整条 lint）──
       # 发布路径上再卡一次：只改 web 的更新包走的是本工作流，不经过 build.yml，
       # 少了这一步就等于"发版可以绕过 UI 基线"。
-      - name: Check web UI baseline
-        run: cd web && npm run check:ui
+      # 2026-10-30：与 build.yml 同步改为 `npm run lint`（eslint + prettier + check:ui），
+      # 理由见 build.yml 里那段的演进史 —— 存量已清完，不再需要为了绕开红链而只跑最后一段。
+      - name: Lint web (eslint + prettier + UI baseline)
+        run: cd web && npm run lint
+
+      # 单元测试与 build.yml 同一套（纯逻辑，不碰 DOM）。发版前再跑一次：
+      # 只改 web 的更新包不经过 build.yml，少了这步等于「可以带着红用例发版」。
+      - name: Run web unit tests
+        run: cd web && npm test
 
       # ── 构建（vue-tsc -b && vite build）──
       # vite.config.ts 的 webVersionPlugin 会读**根目录 version.json 的 web.version** 生成
@@ -170,8 +180,9 @@ jobs:
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "version.json 的 web 段回写后："
           jq .web version.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 仓库只允许 Asunano 作为提交作者（2026-11-09），不要改回 bot 身份
+          git config user.name "Asunano"
+          git config user.email "3233353454@qq.com"
           git add version.json
           git commit -m "ci: 回写 web release ${{ github.ref_name }} 的 apkUrl/apkSize/apkSha256/publishedAt/tagName" \
             || echo "version.json 无变更，跳过 commit"

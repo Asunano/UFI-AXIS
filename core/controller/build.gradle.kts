@@ -41,7 +41,17 @@ dependencies {
     // 那三件事对"往用户填的公网 URL 发一条通知"全是错的。
     implementation(libs.ktor.client.core)
     implementation(libs.ktor.client.cio)
+    // 运营商账单（2026-10-31）：OkHttp 的 CookieJar/连接池/超时控制比 Ktor CIO 更直接；
+    // :core:api 已在用同一版本，不新增依赖版本。
+    implementation(libs.okhttp.core)
 
     // SmsCodeExtractor / WebhookDelivery 是纯函数（无 Android / 无 Room 依赖），单测只需要 junit。
     testImplementation(libs.junit)
+    // NetworkControllerModeSwitchTest（2026-10-31）：制式切换后恢复移动数据的编排是纯 JVM 逻辑
+    // （goform 写 + 一次连接状态读），用 mockk 打桩、不需要 Robolectric 起安卓运行时。
+    testImplementation(libs.mockk)
+    testImplementation(libs.kotlinx.coroutines.test)
+    // 测试里要自己造一份 `NormalizedFields`（ppp_status 取值）。它经 :core:goform 的
+    // api(:core:device-schema) 在 classpath 上，但直接用的类型要显式声明 —— 口径同主源集那两条。
+    testImplementation(project(":core:device-schema"))
 }

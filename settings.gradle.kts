@@ -70,3 +70,4 @@ include(":app:feature-monitor")    // 监控中心（Monitor）
 // feature-settings 的服务器配置）都要跳过来，放进任何一边都会让三个 feature 模块之间
 // 长出一条横向依赖；独立模块则两侧都只经 :app:ui 的 Routes 常量跳转，零新增依赖。
 include(":app:feature-resources")  // 资源中心（Web ZIP / frpc / cloudflared）
+include(":app:feature-programs")   // 应用商店（第三方 Linux 程序：OpenList 等）

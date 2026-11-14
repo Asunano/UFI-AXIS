@@ -1,27 +1,42 @@
 # =============================================================================
-# 可选二进制组件版本跟踪（frpc / cloudflared）
+# 可选二进制组件 + 应用商店程序版本跟踪（frpc / cloudflared / 商店程序）
 # =============================================================================
-# 背景：2026-09-01 起 frpc 与 cloudflared 不再随 core APK 分发（两者解压后合计约 50MB，
-# 曾占 APK 压缩体积的一半）。改为由设备端按需从**上游官方 release 直链**下载，
-# 直链与校验和写在根目录 version.json 的 `components` 段里，由本工作流每天刷新。
+# 背景：
+#   · 2026-09-01 起 frpc 与 cloudflared 不再随 core APK 分发（两者解压后合计约 50MB，
+#     曾占 APK 压缩体积的一半）。改为由设备端按需从**上游官方 release 直链**下载，
+#     直链与校验和写在根目录 version.json 的 `components` 段里；
+#   · 应用商店程序（OpenList / Syncthing / Cloudreve / dufs / ddns-go）同样是
+#     「APK 零二进制、用户点安装才下载」，版本/直链/sha256/size 写在 version.json 的
+#     `programs` 段里，由同一个工作流每天刷新。
+#   两段共用同一个 version.json、同一个 concurrency 组，所以合并成一个工作流，
+#   避免两个 job 同时 commit 造成 non-fast-forward。
 #
 # 为什么不需要配置个人 token（PAT）：
 #   - 匿名调 GitHub API 是「每 IP 每小时 60 次」，而 GitHub 托管 runner 的出口 IP 是共享的，
 #     匿名会偶发 403；
 #   - Actions 自带的 `secrets.GITHUB_TOKEN` 是「每仓库每小时 1000 次」，而本工作流一天只用
-#     2 次请求，绰绰有余。只有在 main 开了分支保护、禁止 GITHUB_TOKEN 推送时才需要换成 PAT。
+#     7 次请求（2 个组件 + 5 个程序），绰绰有余。只有在 main 开了分支保护、禁止
+#     GITHUB_TOKEN 推送时才需要换成 PAT。
 #
-# 校验和来源（组件是要被 execve 执行的二进制，无校验的公网下载一律拒绝安装）：
+# 校验和来源（组件与程序都是要被 execve 执行的二进制，无校验的公网下载一律拒绝安装）：
 #   - frp     ：官方 release 自带 `frp_sha256_checksums.txt`，直接解析，**不下载二进制**；
 #   - cloudflared：官方没有稳定的校验和文件，只能下载后 sha256sum 自算（约 36MB，几秒）。
 #     注意：这里只算哈希，不重打包也不转存，version.json 里写的仍是上游直链。
+#   - 商店程序：上游校验和格式不统一（OpenList 只发 MD5，dufs 没有 checksum 文件，
+#     Syncthing 是 PGP 签名的 sha256sum），而设备端还要求 tar 里的 entry 与 ELF 链接方式
+#     正确，所以统一「版本变化时下载一次 + 自算 sha256 + 解包体检 entry/ELF」。
+#     日常 no-op 运行只查 release 元数据，不产生大流量。
 #
-# 设备端消费方式见 core/api/.../components/ComponentManager.kt：
-#   拉 version.json → components.<id> → 镜像前缀（大陆加速）→ 流式下载 + SHA-256 →
-#   tar.gz 则提取 entry → ELF(aarch64) 体检 → 原子安装到 filesDir/components/。
+# 商店程序的资产/entry/链接方式约定见下方 PROGRAMS 表：
+#   上游改名、换 entry、把静态改成 glibc 动态 → 工作流直接失败，不静默写一个
+#   「能装不能跑」的版本。version.json 是设备端唯一信任锚点，内置 catalog 只是兜底。
+#
+# 设备端消费方式：
+#   components → core/api/.../components/ComponentManager.kt
+#   programs   → core/api/.../program/ProgramInstaller.kt（sha256 + tar entry + ElfInspector）
 # =============================================================================
 
-name: Component Versions (frp / cloudflared)
+name: Component & Program Versions (frp / cloudflared / store programs)
 
 on:
   schedule:
@@ -32,7 +47,7 @@ on:
 permissions:
   contents: write
 
-# 与 release.yml 共用同一个组：两者都会 commit 根目录 version.json，
+# 与 release.yml / web-release.yml 共用同一个组：三者都会 commit 根目录 version.json，
 # 并发跑会撞 non-fast-forward。
 concurrency:
   group: version-json
@@ -40,7 +55,7 @@ concurrency:
 
 jobs:
   track:
-    name: Refresh components in version.json
+    name: Refresh components & programs in version.json
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -142,21 +157,173 @@ jobs:
             version.json > version.json.tmp && mv version.json.tmp version.json
           echo "cloudflared → $VERSION ($ACTUAL_SIZE bytes, 声明 $SIZE)"
 
+      # ── 应用商店程序：版本变化时下载、自算 sha256、解包体检 entry/ELF ──
+      # 每一项的格式：id | 上游仓库 | 资产正则 | 包内 entry | 期望链接方式
+      # 资产正则锚定 ^...$，避免误选 lite / musl / 其它架构的同名资产。
+      - name: Track programs
+        run: |
+          set -euo pipefail
+
+          # 与 core 的 ProgramManifestCodec.MAX_ARTIFACT_BYTES 保持一致：
+          # 压缩包和 entry 都不能超过 256MB，否则设备端会拒绝安装。
+          MAX_ARTIFACT_BYTES=$((256 * 1024 * 1024))
+
+          PROGRAMS=(
+            'openlist|OpenListTeam/OpenList|^openlist-android-arm64\.tar\.gz$|openlist|android-dynamic'
+            'syncthing|syncthing/syncthing|^syncthing-linux-arm64-v.*\.tar\.gz$|syncthing|static'
+            'cloudreve|cloudreve/cloudreve|^cloudreve_.*_linux_arm64\.tar\.gz$|cloudreve|static'
+            'dufs|sigoden/dufs|^dufs-v.*-aarch64-unknown-linux-musl\.tar\.gz$|dufs|static'
+            'ddns-go|jeessy2/ddns-go|^ddns-go_.*_android_arm64\.tar\.gz$|ddns-go|android-dynamic'
+          )
+
+          for ROW in "${PROGRAMS[@]}"; do
+            IFS='|' read -r ID REPO ASSET_RE ENTRY EXPECTED_LINKAGE <<< "$ROW"
+            echo "── $ID ──"
+
+            REL="$(gh api "repos/$REPO/releases/latest")"
+            TAG="$(jq -r '.tag_name' <<<"$REL")"
+            VERSION="${TAG#v}"
+
+            CUR="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.version // ""' version.json)"
+            CUR_URL="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.url // ""' version.json)"
+            if [ -z "$CUR" ]; then
+              echo "::error::version.json 里没有程序 $ID（内置 catalog 加条目时必须同步远端 programs 段）"
+              exit 1
+            fi
+
+            # 工作流只处理「tar.gz + arm64-v8a」，且 entry/linkage 必须与下表一致。
+            # 清单被手改错时在这里就失败，而不是等设备端装不上。
+            M_ARCHIVE="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.archive // ""' version.json)"
+            M_ENTRY="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.entry // ""' version.json)"
+            M_ABI="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.abi // ""' version.json)"
+            M_LINKAGE="$(jq -r --arg id "$ID" '.programs[] | select(.id == $id) | .artifact.linkage // ""' version.json)"
+            if [ "$M_ARCHIVE" != "tar.gz" ] || [ "$M_ENTRY" != "$ENTRY" ] || \
+               [ "$M_ABI" != "arm64-v8a" ] || [ "$M_LINKAGE" != "$EXPECTED_LINKAGE" ]; then
+              echo "::error::$ID 清单的 archive/entry/abi/linkage 与工作流表不一致（当前：$M_ARCHIVE / $M_ENTRY / $M_ABI / $M_LINKAGE）"
+              exit 1
+            fi
+
+            if [ "$VERSION" = "$CUR" ] && [ -n "$CUR_URL" ]; then
+              echo "$ID 已是 $VERSION，跳过"
+              continue
+            fi
+
+            ASSET="$(jq -c --arg re "$ASSET_RE" '.assets[] | select(.name | test($re))' <<<"$REL" | head -n1)"
+            if [ -z "$ASSET" ]; then
+              echo "::error::$ID $TAG 未找到匹配 $ASSET_RE 的资产（上游改名了？）"
+              exit 1
+            fi
+            NAME="$(jq -r '.name' <<<"$ASSET")"
+            URL="$(jq -r '.browser_download_url' <<<"$ASSET")"
+            SIZE="$(jq -r '.size' <<<"$ASSET")"
+
+            TMP="$(mktemp -d)"
+            ARCHIVE="$TMP/$NAME"
+            # 大资产（OpenList ~52MB）在跨洋链路上可能很慢；给足 10 分钟并重试 3 次，
+            # 避免工作流因为一次连接卡死而一直挂着。
+            curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 --max-time 600 \
+              "$URL" -o "$ARCHIVE"
+
+            # 体积与 API 声明不一致 → 上游/网络有问题，不写清单
+            ACTUAL_SIZE="$(stat -c %s "$ARCHIVE")"
+            if [ "$ACTUAL_SIZE" != "$SIZE" ]; then
+              echo "::error::$ID 下载体积 $ACTUAL_SIZE 与 release 声明的 $SIZE 不一致"
+              exit 1
+            fi
+            if [ "$ACTUAL_SIZE" -gt "$MAX_ARTIFACT_BYTES" ]; then
+              echo "::error::$ID 压缩包 $ACTUAL_SIZE 字节，超过设备端 256MB 上限"
+              exit 1
+            fi
+            SHA="$(sha256sum "$ARCHIVE" | awk '{print $1}')"
+
+            # 包内 entry 必须存在，且同名条目可能不止一个：
+            # Syncthing 的 tar 里有 etc/freebsd-rc/syncthing、etc/firewall-ufw/syncthing
+            # 和真正的 31MB 二进制。与设备端 TarGzExtractor 保持一致，取同名条目中最大的。
+            ENTRY_LINE="$(tar tvzf "$ARCHIVE" | awk -v n="$ENTRY" '
+              $1 ~ /^-/ && $NF ~ ("(^|/)" n "$") { print $3, $NF }
+            ' | sort -nr | head -n1)"
+            if [ -z "$ENTRY_LINE" ]; then
+              echo "::error::$ID 的 $NAME 里找不到 entry「$ENTRY」"
+              exit 1
+            fi
+            ENTRY_SIZE="${ENTRY_LINE%% *}"
+            ENTRY_PATH="${ENTRY_LINE#* }"
+            if [ "$ENTRY_SIZE" -le 0 ]; then
+              echo "::error::$ID 的 entry「$ENTRY」是空文件"
+              exit 1
+            fi
+            if [ "$ENTRY_SIZE" -gt "$MAX_ARTIFACT_BYTES" ]; then
+              echo "::error::$ID 解包后 entry $ENTRY_SIZE 字节，超过设备端 256MB 上限"
+              exit 1
+            fi
+            tar xzf "$ARCHIVE" -C "$TMP" "$ENTRY_PATH"
+            BIN="$TMP/$ENTRY_PATH"
+            ACTUAL_ENTRY_SIZE="$(stat -c %s "$BIN")"
+            if [ "$ACTUAL_ENTRY_SIZE" != "$ENTRY_SIZE" ]; then
+              echo "::error::$ID 解包后 entry 体积 $ACTUAL_ENTRY_SIZE 与 tar 头声明 $ENTRY_SIZE 不一致"
+              exit 1
+            fi
+
+            # ELF 体检：架构 + 链接方式必须与清单声明一致
+            FILE_INFO="$(file -b "$BIN")"
+            echo "asset: $NAME ($ACTUAL_SIZE bytes)"
+            echo "elf:   $FILE_INFO"
+            case "$FILE_INFO" in
+              *"ELF 64-bit"*"ARM aarch64"*) : ;;
+              *) echo "::error::$ID 的 entry 不是 ELF64 aarch64: $FILE_INFO"; exit 1 ;;
+            esac
+            case "$FILE_INFO" in
+              *"statically linked"*|*"static-pie linked"*) ACTUAL_LINKAGE="static" ;;
+              *"interpreter /system/bin/linker64"*) ACTUAL_LINKAGE="android-dynamic" ;;
+              *"interpreter "*) echo "::error::$ID 使用了 Android 不支持的动态链接解释器: $FILE_INFO"; exit 1 ;;
+              *) echo "::error::$ID 无法判定链接方式: $FILE_INFO"; exit 1 ;;
+            esac
+            if [ "$ACTUAL_LINKAGE" != "$EXPECTED_LINKAGE" ]; then
+              echo "::error::$ID 实际链接方式 $ACTUAL_LINKAGE 与清单声明 $EXPECTED_LINKAGE 不一致"
+              exit 1
+            fi
+            rm -rf "$TMP"
+
+            # 只改 artifact 四件套：版本、直链、sha256、size。
+            # archive/entry/abi/linkage 由清单维护，工作流只校验不改写。
+            jq --arg id "$ID" --arg v "$VERSION" --arg u "$URL" --arg s "$SHA" --argjson z "$SIZE" \
+              '.programs = [.programs[] | if .id == $id then
+                 .artifact.version = $v
+                 | .artifact.url = $u
+                 | .artifact.sha256 = $s
+                 | .artifact.size = $z
+               else . end]' \
+              version.json > version.json.tmp && mv version.json.tmp version.json
+            echo "$ID → $VERSION ($NAME, $ACTUAL_SIZE bytes, $ACTUAL_LINKAGE)"
+          done
+
+          # 防止 version.json 新增了程序、但工作流 PROGRAMS 表忘了加：两者必须一一对应。
+          # （表里每个程序还需要人工指定资产正则/entry/链接方式，不能自动推断。）
+          TRACKED_IDS="$(for ROW in "${PROGRAMS[@]}"; do echo "${ROW%%|*}"; done | sort)"
+          DECLARED_IDS="$(jq -r '.programs[].id' version.json | sort)"
+          if [ "$TRACKED_IDS" != "$DECLARED_IDS" ]; then
+            echo "::error::version.json.programs 与工作流 PROGRAMS 表不一致（新增程序时两边都要改）"
+            diff <(echo "$TRACKED_IDS") <(echo "$DECLARED_IDS") || true
+            exit 1
+          fi
+
       - name: Commit version.json if changed
         run: |
           set -euo pipefail
           if git diff --quiet -- version.json; then
-            echo "components 无变化，跳过 commit"
+            echo "components / programs 无变化，跳过 commit"
             exit 0
           fi
           echo "version.json 更新后："
-          jq '.components' version.json
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          jq '{components: .components, programs: [.programs[] | {id, version: .artifact.version}]}' version.json
+          # 仓库只允许 Asunano 作为提交作者（2026-11-09），不要改回 bot 身份
+          git config user.name "Asunano"
+          git config user.email "3233353454@qq.com"
           git add version.json
           FRP_V="$(jq -r '.components.frpc.version' version.json)"
           CF_V="$(jq -r '.components.cloudflared.version' version.json)"
-          git commit -m "ci: 更新可选组件版本（frpc $FRP_V / cloudflared $CF_V）"
+          PROGRAMS="$(jq -r '[.programs[] | "\(.id) \(.artifact.version)"] | join(" / ")' version.json)"
+          git commit -m "ci: 更新可选组件与商店程序版本（frpc $FRP_V / cloudflared $CF_V / $PROGRAMS）"
           # 期间可能有人推了别的提交，rebase 后再推
           git pull --rebase origin main
           git push origin HEAD:main

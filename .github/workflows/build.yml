@@ -97,23 +97,34 @@ jobs:
       - name: Set up Node.js (web build)
         uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # Node 22 LTS：vitest 5 的 engines 是 ^22.12 || ^24 || >=26，
+          # 而 Node 20 已于 2026-04 EOL。三个 workflow 必须同版本，
+          # 否则「本地能跑、发版构建用另一套 Node」会重新变成一类悬案。
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
       - name: Install web dependencies
         run: cd web && npm ci
 
-      # ── Web UI 基线门禁（2026-10-14 补）──
-      # 这个脚本自 2026-09-19 写下基线以来**从来没有在 CI 里跑过** —— 它挂在
-      # `npm run lint` 的最后一段，而所有 workflow 只跑 `npm ci` + `npm run build`。
-      # 后果：基线写的是 13/41，实测已经漂到 26/49，全程无人发现（每次 UI 提交都只是
-      # 在记账，账从来没被核对过）。这里把它单独提出来跑，不跑整条 `npm run lint`：
-      # 那条链上的 `eslint .`（public/sw.js 的存量报错）与
-      # `prettier --check .`（21 个文件的存量未格式化）都还没清完，混在一起会让这条
-      # 门禁一上来就是红的，等于没加。两者各自清完后应改为直接跑 `npm run lint`。
-      - name: Check web UI baseline
-        run: cd web && npm run check:ui
+      # ── Web 全部静态门禁：eslint + prettier + UI 基线 ──
+      # 演进史（别再把链条拆开跑）：
+      #   · 2026-10-14 只挂了 `check:ui`。当时 `npm run lint` 整条链是红的
+      #     （public/sw.js 的存量 no-undef、21 个文件未格式化），混在一起会让门禁一上来就失败，
+      #     所以注释里留了一句"两者清完后应改为直接跑 npm run lint"。
+      #   · 2026-10-30 这两笔债已经清完（实测 0 error / 全部文件格式正确），于是按当时的约定
+      #     直接跑整条 `npm run lint` —— 它的最后一段就是 check:ui，不是删掉基线门禁。
+      #     现在 lint 一次覆盖三件事：eslint 规则、prettier 格式、UI 令牌基线。
+      - name: Lint web (eslint + prettier + UI baseline)
+        run: cd web && npm run lint
+
+      # ── Web 单元测试（2026-10-30 补）──
+      # 覆盖三个「错了也不会在构建期报出来」的纯逻辑模块：utils（格式化/分档/错误提取）、
+      # api/contract（契约取值语义，端点存在性由下面的契约脚本管）、deviceIdentity
+      # （请求签名的 URI 归一化，错一个字符就是全站 401）。
+      # 它们不碰 DOM，跑一次 <1s，所以放在 build 之前 —— 失败得越早越便宜。
+      - name: Run web unit tests
+        run: cd web && npm test
 
       # ── 诊断项跨端归属门禁（2026-10-14 补）──
       # 诊断中心两端各有一份注册表：查 core/设备状态的项（scope=core）**必须两端都有**，
@@ -124,6 +135,15 @@ jobs:
       # （挂在那边会在只检出 web 的场景里假失败，位置本身也在误导"这是 web 的检查"）。
       - name: Check diagnostics scope (web ↔ app)
         run: node scripts/check-diagnostics-scope.mjs
+
+      # ── API 契约漂移门禁（2026-10-30 补）──
+      # `scripts/verify-api-contract.mjs` 从 core 的 Ktor 路由、app 的 Retrofit 注解、
+      # web 的 /api 字面量、docs 的 API 文档四个来源各自抽端点集合再交叉比对（P0：客户端有、
+      # core 没有；P1：Endpoints.kt 清单漂移）。它一直存在、也能跑通，但**从没进过任何 workflow**
+      # —— README 里"三端共享一份冻结契约，由 CI 脚本守门"这句因此只是宣称。
+      # 放在这里（而不是 web 目录下）是因为它跨端；脚本自己按仓库根定位，任何 cwd 都能跑。
+      - name: Check API contract drift (core ↔ app ↔ web ↔ docs)
+        run: node scripts/verify-api-contract.mjs
 
       # ── 单一版本源校验：version.json 双对象与 gradle 默认一致 ──
       # 发版流程：先改根目录 version.json → CI 校验通过 → 打 v<backend.version> tag → release.yml 发布
@@ -146,6 +166,19 @@ jobs:
             echo "::error::version.json 与 gradle.properties 不一致，请先修改 version.json（单一版本源）"
             exit 1
           fi
+
+      # 单元测试（2026-11-14 补）：此前 CI 只 assembleDebug，**从不跑单测** ——
+      # 结果是一条守门测试（UpperLayerGoformFreeGuardTest）红了很久没人知道，本地也只有靠人记得手动跑。
+      # 单测里有纯逻辑用例，也有 Robolectric（JVM 里的 Android Context / SharedPreferences /
+      # Room，需要 `unitTests.isIncludeAndroidResources`），跑一次几分钟，比等到发版后回滚便宜。
+      #
+      # 不用 `--rerun-tasks`：CI 是全新 checkout，没有 up-to-date 状态可骗。
+      # 但**本地收尾**时务必对 `:core:device-plugins` 加 `--rerun-tasks` ——
+      # 那条守门扫的是别的 module 的源码，增量构建察觉不到（原因见该测试的文件头）。
+      - name: Run unit tests
+        # :core:contract 是 kotlin.jvm 模块，任务名是 `test`（没有 testDebugUnitTest 变体）——
+        # 不显式列出来的话，它那几条守卫（ppp 连通判据 / 信号合理性 / 运营商名）在 CI 里从不执行。
+        run: ./gradlew testDebugUnitTest :core:contract:test
 
       - name: Build debug APKs
         run: ./gradlew :core:assembleDebug :app:assembleDebug

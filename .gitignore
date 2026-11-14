@@ -126,3 +126,22 @@ generated-images/
 UFI-TOOLS-REF/
 ufi-ui-kit/
 .ai-memory/
+
+# ── 公开发布前的本地调试产物（2026-11-12）────────────────────────────────────
+# 这些目录包含浏览器 Cookie/登录库、UI dump、抓包与研究缓存，不能进入公开仓库。
+/.chrome-tmp/
+/.shots/
+/.shots-prof/
+/.dumps/
+/.probe/
+/.research/
+/.navsrc/
+/.impeccable/
+# 本地打包产物与设计稿（APK 已由 *.apk 忽略，这里补上同目录的临时 HTML/PNG）
+/dist/
+# 实现者内部方案/审查记录；已跟踪的单篇调研文档不受影响
+/dev-docs/
+# 界面设计稿（HTML/PNG/SVG）是施工过程产物，不是源码，也不是对外交付文档：
+# 一律放 dev-docs/mockups/，随 /dev-docs/ 一起忽略。docs/ 只收对外可交付文档。
+# 锚定仓库根（前缀 /），避免吞掉任何子模块下同名目录。
+/docs/mockups/
