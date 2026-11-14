@@ -1,0 +1,32 @@
+{
+  "retDesc": "SUCCESS",
+  "retCode": "000000",
+  "rspBody": {
+    "userTel": "anJCTWyIFvoaaPBGlaoYXg==",
+    "userInfo": {
+      "userBrand": "09",
+      "userLevel": "100",
+      "userStatus": "00",
+      "userBegin": "2021-10-01 10:07:17",
+      "userID": "00",
+      "starLevel": "1",
+      "starScore": "0",
+      "starTime": "2027-01-16",
+      "realNameInfo": "3",
+      "email": "",
+      "userAdd": "",
+      "zipCode": "",
+      "userNum": "",
+      "userType": "00",
+      "userAge": "5年1个月",
+      "flag4G": "0",
+      "volteFlag": "0",
+      "accountDay": "5",
+      "gsmState": "6",
+      "userName": "张*",
+      "userChannel": "示例分公司",
+      "birthday": "20050702",
+      "businessHallAdd": ""
+    }
+  }
+}

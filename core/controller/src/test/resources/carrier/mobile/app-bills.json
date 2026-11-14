@@ -1,0 +1,130 @@
+{
+  "retCode": "000000",
+  "retDesc": "SUCCESS",
+  "rspBody": {
+    "historyBillInfo": [
+      {
+        "inBill": "202610",
+        "totalBill": "11.05",
+        "billCycleStartDate": "2026-10-01",
+        "billCycleEndDate": "2026-10-31",
+        "reductionBill": "0.00",
+        "realConsumeBill": "11.05",
+        "realPayBill": "11.05",
+        "billFlag": "1",
+        "billMaterialRes": [
+          {
+            "billEntries": "01",
+            "billEntriesValue": "8.00",
+            "billEntriesOPValue": "8.00",
+            "billEntriesSaveValue": "-0.00",
+            "thirdBillMaterialInfo": [
+              {
+                "thirdItemsName": "8元自由选套餐（100MB流量）",
+                "thirdItemsValue": "8.00",
+                "thirdItemsRealValue": "8.00",
+                "thirdItemsInfo": "【套餐说明】1、本套餐生效后原主资费套餐、原非标准的2/3G手机流量或GPRS套餐将失效；2、套餐月租费8元，包含来电显示、和彩云、国内被叫免费、国内通用流量100MB；3、超出套餐后资费标准：1）语音及短彩信资费：国内主叫国内0.25元/分钟（不含港澳台及视频通话）、短信0.1元/条、彩信0.3元/条、国内视频主叫国内0.29元/分钟（不含港澳台）；2）流量资费：套餐外上网0.29元/MB，累计10元可免费使用至100M，累计30元可免费使用至1G；3）其他资费：按照号码归属品牌标准资费计费。4、流量封顶规则：流量费用500元（不含套餐费）、流量30G封顶（不含套餐内流量），达30G时将暂停上网功能，通过办理流量叠加包可恢复使用；当月总流量达到200G时，将关闭上网功能，次月自动恢复正常，套餐保持不变。5、以上套餐所含的国内语音主叫（含视频通话）、国内上网均不适用于港澳台。",
+                "businessdetailsInfo": {
+                  "businessdetailsList": [
+                    {
+                      "title": "业务介绍",
+                      "titleValue": "【套餐说明】1、本套餐生效后原主资费套餐、原非标准的2/3G手机流量或GPRS套餐将失效；2、套餐月租费8元，包含来电显示、和彩云、国内被叫免费、国内通用流量100MB；3、超出套餐后资费标准：1）语音及短彩信资费：国内主叫国内0.25元/分钟（不含港澳台及视频通话）、短信0.1元/条、彩信0.3元/条、国内视频主叫国内0.29元/分钟（不含港澳台）；2）流量资费：套餐外上网0.29元/MB，累计10元可免费使用至100M，累计30元可免费使用至1G；3）其他资费：按照号码归属品牌标准资费计费。4、流量封顶规则：流量费用500元（不含套餐费）、流量30G封顶（不含套餐内流量），达30G时将暂停上网功能，通过办理流量叠加包可恢复使用；当月总流量达到200G时，将关闭上网功能，次月自动恢复正常，套餐保持不变。5、以上套餐所含的国内语音主叫（含视频通话）、国内上网均不适用于港澳台。"
+                    },
+                    {
+                      "title": "减免明细"
+                    }
+                  ]
+                },
+                "doubleReturnFlag": "1"
+              }
+            ]
+          },
+          {
+            "billEntries": "02",
+            "billEntriesValue": "2.25",
+            "billEntriesOPValue": "2.25",
+            "billEntriesSaveValue": "-0.00",
+            "thirdBillMaterialInfo": [
+              {
+                "thirdItemsName": "基本通话费",
+                "thirdItemsValue": "1.75",
+                "thirdItemsRealValue": "1.75",
+                "businessdetailsInfo": {
+                  "businessdetailsList": [
+                    {
+                      "title": "业务介绍"
+                    },
+                    {
+                      "title": "减免明细"
+                    }
+                  ]
+                },
+                "doubleReturnFlag": "1"
+              },
+              {
+                "thirdItemsName": "视频通话",
+                "thirdItemsValue": "0.50",
+                "thirdItemsRealValue": "0.50",
+                "businessdetailsInfo": {
+                  "businessdetailsList": [
+                    {
+                      "title": "业务介绍"
+                    },
+                    {
+                      "title": "减免明细"
+                    }
+                  ]
+                },
+                "doubleReturnFlag": "1"
+              }
+            ]
+          },
+          {
+            "billEntries": "04",
+            "billEntriesValue": "0.80",
+            "billEntriesOPValue": "0.80",
+            "billEntriesSaveValue": "-0.00",
+            "thirdBillMaterialInfo": [
+              {
+                "thirdItemsName": "平台上行短信费",
+                "thirdItemsValue": "0.10",
+                "thirdItemsRealValue": "0.10",
+                "businessdetailsInfo": {
+                  "businessdetailsList": [
+                    {
+                      "title": "业务介绍"
+                    },
+                    {
+                      "title": "减免明细"
+                    }
+                  ]
+                },
+                "doubleReturnFlag": "1"
+              },
+              {
+                "thirdItemsName": "外网短信通讯费",
+                "thirdItemsValue": "0.70",
+                "thirdItemsRealValue": "0.70",
+                "businessdetailsInfo": {
+                  "businessdetailsList": [
+                    {
+                      "title": "业务介绍"
+                    },
+                    {
+                      "title": "减免明细"
+                    }
+                  ]
+                },
+                "doubleReturnFlag": "1"
+              }
+            ]
+          }
+        ],
+        "gsmState": "7",
+        "starLevel": "1",
+        "mZoneState": "1"
+      }
+    ],
+    "oprTime": "2026-10-31 01:21:36"
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "retCode": "000000",
+  "retDesc": "Success",
+  "rspBody": {
+    "oprTime": "2026-10-31 01:21:40",
+    "accoutQryInfoHis": [
+      {
+        "allLastMonthBill": "34.87",
+        "billCycleStartDate": "20261001",
+        "allThisMonthEntryBill": "0.00",
+        "accoutType": "0",
+        "accoutQryInfo": [
+          {
+            "thisMonthOutBillmsg": [
+              {
+                "expendNum": "8.00",
+                "expendName": "销账"
+              },
+              {
+                "expendNum": "0.10",
+                "expendName": "销账"
+              },
+              {
+                "expendNum": "1.75",
+                "expendName": "销账"
+              },
+              {
+                "expendNum": "0.65",
+                "expendName": "销账"
+              },
+              {
+                "expendNum": "0.25",
+                "expendName": "销账"
+              },
+              {
+                "expendNum": "0.30",
+                "expendName": "销账"
+              }
+            ],
+            "lastMonthBill": "34.87",
+            "thisMonthOutBill": "11.05",
+            "thisMonthBill": "23.82",
+            "thisMonthEntryBill": "0.00",
+            "accoutState": "0",
+            "accoutTypeName": "通用话费账本"
+          },
+          {
+            "lastMonthBill": "0.00",
+            "thisMonthOutBill": "0.00",
+            "thisMonthBill": "0.00",
+            "thisMonthEntryBill": "0.00",
+            "accoutState": "1",
+            "accoutTypeName": "其他话费账本"
+          }
+        ],
+        "allThisMonthBill": "23.82",
+        "allThisMonthOutBill": "11.05",
+        "specialTTZ": "N",
+        "inBill": "202610",
+        "customizeInfo": [
+          {
+            "values": "11.05",
+            "type": "2"
+          }
+        ],
+        "billCycleEndDate": "20261031"
+      }
+    ]
+  }
+}

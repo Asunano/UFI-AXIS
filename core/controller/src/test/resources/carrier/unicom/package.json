@@ -1,0 +1,422 @@
+{
+  "onlineCustomerServiceSwitch": false,
+  "newTwFlag": "1",
+  "chargingCapacityLink": "https://u.10010.cn/uAAwq",
+  "buyVoiceLink": "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://c.newbuy.chinaunicom.cn/spnew/gzclzx/H5/voiceStation.html?sys=qk&channelCode=BYA",
+  "packageID": "91296262",
+  "canUseSmsAll": "0",
+  "RzbResources": [
+    {
+      "details": [],
+      "rzbAllUse": "0.0"
+    }
+  ],
+  "useDailyPercent": "0",
+  "unlimitExclusiveFeeIdSet": [],
+  "Topblock": "0",
+  "flowTypeTwoDesc": "即指在使用指定手机应用、内容时，消耗所订购的专属流量包的流量",
+  "XsbResources": [
+    {
+      "details": []
+    }
+  ],
+  "flowSumList": [
+    {
+      "elemtype": "3",
+      "flowtype": "1",
+      "xcanusevalue": "18379.32",
+      "xusedvalue": "17894.06"
+    },
+    {
+      "elemtype": "3",
+      "flowtype": "2",
+      "xcanusevalue": "512000.00",
+      "xusedvalue": "40960.00"
+    },
+    {
+      "elemtype": "3",
+      "flowtype": "3",
+      "xcanusevalue": "178138.98",
+      "xusedvalue": "231466.37"
+    }
+  ],
+  "rzbAllUse": "0.0",
+  "csImg": "https://m1.img.10010.com/resources/7188192A31B5AE06E41B64DA6D65A9B0/20200110/png/20200110153645.png",
+  "languageflag": "0",
+  "sumPercent": "0",
+  "hasOtherTypeFlowExceptRzb": "1",
+  "MlResources": [
+    {
+      "details": [
+        {
+          "elemType": "3",
+          "endDate": "",
+          "endXsbDate": "",
+          "feePolicyId": "10007",
+          "feePolicyName": "其他（免流）",
+          "flowType": "3",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "1",
+          "showTokenKey": false,
+          "use": "0.92",
+          "usedPercent": "0"
+        },
+        {
+          "elemType": "3",
+          "endDate": "",
+          "endXsbDate": "",
+          "feePolicyId": "10047",
+          "feePolicyName": "腾讯游戏",
+          "flowType": "3",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "1",
+          "showTokenKey": false,
+          "use": "2.89",
+          "usedPercent": "0"
+        },
+        {
+          "elemType": "3",
+          "endDate": "",
+          "endXsbDate": "",
+          "feePolicyId": "10006",
+          "feePolicyName": "手机电视（免流）",
+          "flowType": "3",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "1",
+          "showTokenKey": false,
+          "use": "1.54",
+          "usedPercent": "0"
+        }
+      ],
+      "type": "MlFlowdetailsList",
+      "userResource": "5.35"
+    }
+  ],
+  "canuseVoiceAllUnit": "分钟",
+  "crowdfundingFlag": true,
+  "smsHeadUsed": 0,
+  "allUserFlow": "290315.06",
+  "TwResources": [],
+  "canUseFlowAll": "191.91",
+  "flowTypeOneDesc": "即在全国范围(不含港澳台地区)内，任何时间均可使用的月包流量，超出后补充订购优先展示实时剩余量",
+  "feePolicyIds": "73400411,75787775,76086542,76086956,82025483",
+  "accountBAR": [
+    {
+      "businessCode": "10026",
+      "buttonName": "充流量",
+      "createTime": "2021-02-20 16:42:17",
+      "creator": "YH_songnazb",
+      "creatorProvinceCode": "098",
+      "id": "8dd4df06-3e59-4d9b-9ed4-530d407e33bb",
+      "linkUrl": "https://img.client.10010.com/liuliangbaoliebiaov3/index.html",
+      "nettype": "01;02;03;04;05;07;08;09;10;11;12;13;14;99",
+      "orderNumber": "210",
+      "paymentType": "1;2",
+      "province": "051",
+      "status": "00",
+      "userId": ""
+    }
+  ],
+  "subscribeToTextMessagesLink": "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://c.newbuy.chinaunicom.cn/spnew/gzclzx/H5/noteStation.html?sys=qk&channelCode=BYA",
+  "voiceExceed": 0,
+  "code": "0000",
+  "canuseFlowAllUnit": "GB",
+  "sumresource": 290315.06,
+  "fresSumList": [
+    {
+      "elemtype": "3",
+      "flowtype": "1",
+      "xcanusevalue": "18379.32",
+      "xexceedvalue": "0.00",
+      "xusedvalue": "17894.06"
+    },
+    {
+      "elemtype": "3",
+      "flowtype": "2",
+      "xcanusevalue": "512000.00",
+      "xexceedvalue": "0.00",
+      "xusedvalue": "40960.00"
+    },
+    {
+      "elemtype": "3",
+      "flowtype": "3",
+      "xcanusevalue": "178138.98",
+      "xexceedvalue": "0.00",
+      "xusedvalue": "231466.37"
+    }
+  ],
+  "flowTypeFourDesc": "指使用中国联通号码在境外（含中国港澳台地区）接入当地移动网络（包含飞机、游轮等场景下使用的卫星网络）所产生的数据流量。",
+  "cityCode": "556",
+  "flowTypeThreeDesc": "即指定时间段、指定网络类型、指定区域等可使用的流量（包括国际漫游、闲时、区域、小时、多日、季度、年包、公免流量等）",
+  "sum": "290320.44",
+  "usedVoiceNounExplain": "余量查询涉及计费相关规则，即国内通话拨打按分钟计费，每次通话不足1分钟的部分，按照1分钟计费。",
+  "csEntranceUrl": "https://cc.10010.com/cs/ccc/online/redirect/welcome.html?encryptdata=2uzglzqmE%2BHz2eSc%2B%2BwLoJxShKJcYagw0U%2FAH7LklSNzXQ%2F7gY%2BeSun3pVxYFWjzlQSQ2a9vz0xV%0ArliMtvYdjH7qx4xrvc8l1qKCNrKeuurBr7vnFv4rd2dWxN%2BfERvL4fa9YiXBbgyDxR%2FoMpJuElFA%0AgRWC0HZtpB9qtPFlNoy23LO%2BHU3iNVEuw2%2FZE999518450wdS98e0GCQX7VhDcBS8Yx8MhPvMk%2Fb%0AkICrp129qv%2BB3WyuWqtMnoBWL3Xuvyzj3bRQ8qa1LMrNq0S%2FzlwyzRFsH%2BIFoKBlnRJQDEY2s2X4%0AVe0GmA%3D%3D",
+  "flowExceed": 0.0,
+  "balancesumqry": "1",
+  "wangTTcUrl": "https://img.client.10010.com/wodetaocanwt2024/index.html",
+  "usePercent": [
+    {
+      "Value": "0",
+      "value": "0"
+    },
+    {
+      "Value": "0",
+      "value": "0"
+    },
+    {
+      "Value": "0",
+      "value": "0"
+    },
+    {
+      "Value": "100",
+      "value": "100"
+    }
+  ],
+  "voiceSumresource": 9,
+  "packageName": "联通沃派数字人套餐39元",
+  "wangTkfUrl": "https://cc.10010.com/cs/ccc/online/web/hollysns/web/page/robot.html?channelId=dd31a8d2c0bd4ae3a2cf53416a854546",
+  "otherTypeFlowSum": {
+    "$ref": "$.fresSumList[2]"
+  },
+  "canUseValueAll": "91",
+  "summary": {
+    "domesticDailyFlow": "0.00",
+    "fengdingstate": "0",
+    "freeFlow": "5.35",
+    "freePercent": "0",
+    "percent": [
+      {
+        "Value": "0",
+        "value": "0"
+      },
+      {
+        "Value": "100",
+        "value": "100"
+      },
+      {
+        "Value": "0",
+        "value": "0"
+      }
+    ],
+    "remainFengDing": "0",
+    "remainPercent": "100",
+    "sum": "290320.44",
+    "usePercent": "0"
+  },
+  "s1HistoryFlowDetails": [],
+  "reminder": "1.此界面仅提供3G、4G、5G套餐用户的当月余量和上月结转流量的余量信息查询，2G套餐用户暂不提供该服务；如您在产品规定的使用范围外使用，将按照标准资费计费，请注意。</br>2.因单位换算原因，当明细中的月使用量小于5M时，查询结果可能有误差，敬请谅解。</br>3.本页面流量数值为精确到小数点后2位，2位小数之后数据暂时无法展示。</br>4.由于部分资源包有使用范围限制，故可能出现部分资源包有剩余量，但同时也有超出量的情况。</br>5.部分专属流量包目前无法在此页面查询使用量情况，请根据其办理页面提示路径单独查询。</br>",
+  "provinceCode": "051",
+  "packageId": "91296262",
+  "usefreePercent": "0",
+  "mobile": "vyNdjOe+9BH09BYLpZ0zCG5zkVsVeaXlmIOr7nD019u9V4zVoVJwvkIBvQqX6y4TEUm6lTQcWXG9WvwAXRyh2cFbuvcqEsAKgzZRkFlh+mbNSRJ+KHXelUQgdRZLvp7zxQCaOA0V0SWvVqMcVaw25YSIB04jpiHEc6VhSgcOVLI=",
+  "resources": [
+    {
+      "details": [
+        {
+          "addUpItemName": "套餐内流量(400.00G)",
+          "addupItemCode": "40026",
+          "elemType": "3",
+          "endDate": "2027年02月28日到期",
+          "endDate1": "2027-02-28 23:59:59",
+          "endXsbDate": "2027.02.28 23:59:59",
+          "feePolicyId": "73400411",
+          "feePolicyName": "广东沃派专属校区流量加油包400G（立即生效）",
+          "flowType": "3",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "rbFlag": "0",
+          "realresourcetype": "01",
+          "remain": "178138.97",
+          "resourceSource": "0",
+          "resourceType": "01",
+          "showTokenKey": false,
+          "total": "409600.00",
+          "typemark": "1",
+          "use": "231461.02",
+          "usedPercent": "57",
+          "xexceedvalue": "0.00"
+        },
+        {
+          "addUpItemName": "套餐内流量(40.00G)",
+          "addupItemCode": "40001",
+          "elemType": "3",
+          "endDate": "长期有效",
+          "endDate1": "2029-12-31 23:59:59",
+          "endXsbDate": "长期有效",
+          "feePolicyId": "76086542",
+          "feePolicyName": "广东沃派专属40GB省内定向流量",
+          "flowType": "2",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "rbFlag": "0",
+          "realresourcetype": "13",
+          "remain": "0.00",
+          "resourceSource": "0",
+          "resourceType": "13",
+          "showTokenKey": false,
+          "total": "40960.00",
+          "typemark": "1",
+          "use": "40960.00",
+          "usedPercent": "100",
+          "xexceedvalue": "0.00"
+        },
+        {
+          "addUpItemName": "套内国内流量(15.00G)",
+          "addupItemCode": "40025",
+          "elemType": "3",
+          "endDate": "长期有效",
+          "endDate1": "2029-12-31 23:59:59",
+          "endXsbDate": "长期有效",
+          "feePolicyId": "76086956",
+          "feePolicyName": "广东沃派专属15GB全国通用流量",
+          "flowType": "1",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "rbFlag": "0",
+          "realresourcetype": "01",
+          "remain": "0.00",
+          "resourceSource": "0",
+          "resourceType": "01",
+          "showTokenKey": false,
+          "total": "15360.00",
+          "typemark": "1",
+          "use": "15360.00",
+          "usedPercent": "100",
+          "xexceedvalue": "0.00"
+        },
+        {
+          "addUpItemName": "套餐内专享免费流量(500.00G)",
+          "addupItemCode": "40008",
+          "elemType": "3",
+          "endDate": "长期有效",
+          "endDate1": "2029-12-31 23:59:59",
+          "endXsbDate": "长期有效",
+          "feePolicyId": "82025483",
+          "feePolicyName": "联通云盘定向流量500G 0元/月-立即生效",
+          "flowType": "2",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "rbFlag": "0",
+          "realresourcetype": "13",
+          "remain": "512000.00",
+          "resourceSource": "0",
+          "resourceType": "13",
+          "showTokenKey": false,
+          "total": "512000.00",
+          "typemark": "1",
+          "use": "0.00",
+          "usedPercent": "0",
+          "xexceedvalue": "0.00"
+        },
+        {
+          "addUpItemName": "套内国内流量(15.00G)",
+          "addupItemCode": "40025",
+          "beforeRemain": "3019.31",
+          "beforeTotal": "5553.37",
+          "beforeUse": "2534.06",
+          "elemType": "3",
+          "endDate": "",
+          "endDate1": "2029-12-31 23:59:59",
+          "endXsbDate": "长期有效",
+          "fKusedPercent": "0",
+          "feePolicyId": "75787775",
+          "feePolicyName": "联通沃派数字人套餐39元（首月按天折算）",
+          "flowType": "1",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "mergeFlag": "1",
+          "rbFlag": "0",
+          "realresourcetype": "01",
+          "remain": "18379.31",
+          "resourceSource": "0",
+          "resourceType": "01",
+          "showTokenKey": false,
+          "total": "20913.371",
+          "typemark": "1",
+          "use": "2534.06",
+          "usedPercent": "12",
+          "xexceedvalue": "0.00",
+          "zKusedPercent": "0"
+        }
+      ],
+      "remainResource": "708518.3",
+      "type": "flow",
+      "url": "https://u.10010.cn/uAaLr",
+      "userResource": "290315.06",
+      "wTurl": "https://u.10010.cn/uAaLQ",
+      "wangTurl": "https://iservice.10010.com/e4/miniservice/query/detailQuery.html"
+    },
+    {
+      "details": [
+        {
+          "addUpItemName": "语音",
+          "addupItemCode": "40000",
+          "elemType": "1",
+          "endDate": "长期有效",
+          "endDate1": "2029-12-31 23:59:59",
+          "endXsbDate": "长期有效",
+          "feePolicyId": "75787775",
+          "feePolicyName": "联通沃派数字人套餐39元（首月按天折算）",
+          "hide": false,
+          "hideCarryForwardLabel": false,
+          "hideUnsharedLabel": false,
+          "limited": "0",
+          "rbFlag": "0",
+          "realresourcetype": "02",
+          "remain": "91",
+          "resourceSource": "0",
+          "resourceType": "02",
+          "showTokenKey": false,
+          "total": "100",
+          "typemark": "1",
+          "use": "9",
+          "usedPercent": "9",
+          "xexceedvalue": "0"
+        }
+      ],
+      "remainResource": "91",
+      "type": "Voice",
+      "url": "",
+      "userResource": "9",
+      "wTurl": "",
+      "wangTurl": "https://iservice.10010.com/e4/miniservice/query/detailQuery.html"
+    },
+    {
+      "details": [],
+      "remainResource": "0",
+      "type": "smsList",
+      "url": "https://u.10010.cn/uAaLr",
+      "userResource": "0",
+      "wTurl": "https://u.10010.cn/uAaLQ",
+      "wangTurl": "https://iservice.10010.com/e4/miniservice/query/detailQuery.html"
+    }
+  ],
+  "trafficPromptsAreExempted": "已免流量包含在已用流量中，参与流量封顶限速计算（计入总量限速，但不计入一次限速）",
+  "leftMonth": 9,
+  "canuseSmsAllUnit": "条",
+  "voiceHeadUsed": 9,
+  "s2HistoryFlowDetails": [],
+  "time": "2026-10-29 01:59:27",
+  "businessType": "4g",
+  "MlProgrammeFlag": "A",
+  "smsSumresource": 0,
+  "balancedetailqry": "1",
+  "newVersion": true,
+  "smsExceed": 0
+}

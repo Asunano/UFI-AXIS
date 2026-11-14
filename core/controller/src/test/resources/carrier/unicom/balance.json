@@ -1,0 +1,372 @@
+{
+  "msg": "",
+  "curntbalancecust": "7.12",
+  "switchFlag": false,
+  "directionalPsntFeeTotal": "0.00",
+  "carryBillInfoList": null,
+  "homeAccountTitle": "",
+  "freePayFeeInfoList": [],
+  "newCarryBillInfoList": [],
+  "noneExplanation": "<div><b>1. 账户当前可用余额：</b>展示为正数，是指您现在剩余可使用的金额，如果为负数，指您需要补交的金额。</div><div><b>2. 自由金额：</b>账户中没有业务使用限制，可以任意用于该账户下所有号码和所有费用项目的金额。</div><div><b>3. 定向金额：</b>是您账户中有业务使用限制，只能用于部分特定项目或特定号码的金额。</div><div><b>4. 实时话费：</b>账户中当月所产生的各项费用之和。</div><div><b>5. 月初结转欠费：</b>需要在本月底前交纳的各项通信业务消费总额，不含本月话费。</div><div><b>6. 未使用定向金额：</b>定向金额中，当前暂时不可用的金额。</div><div><b>7. 账户未返金额：</b>您参加活动中尚未返还的金额。</div>",
+  "psntFeeInfoList": [],
+  "depositForTheMonth": "0.00",
+  "canuselimitcust": "10.00",
+  "stayTimeThreshold": -1,
+  "totalrealfee": "39.00",
+  "triggerFlag": false,
+  "newRebateOfTheMonth": "0.00",
+  "realFeeFlag": false,
+  "newCarryOverArrears": "36.12",
+  "grandLedgerSubProvince": false,
+  "freePayFeeTotal": "0.00",
+  "carryOverFeeNounExplanation": "指上月结转到本月金额。上月如有欠费，展示欠费金额；上月如有余额，展示结转金额。",
+  "frozeninfolist": [
+    {
+      "actionmoney": "10.00",
+      "serialnumber": "131****0721",
+      "actioneventid": "-1",
+      "depositcode": "1504",
+      "actioncode": "-1",
+      "actionname": "特殊非现金-基本月租专款",
+      "leftmoney": "10.00",
+      "startcycle": "2026年11月",
+      "actiondepart": "联通渠道",
+      "acctbalanceid": "2622003153917724",
+      "outertradeid": "-1",
+      "endcycle": "2026年12月",
+      "usedmoney": "0.00"
+    }
+  ],
+  "directionalCarryInfoList": [
+    {
+      "money": "10.00",
+      "canusemoney": "10.00",
+      "limitcode": "1",
+      "canumoneydirect": "0.00",
+      "canumoneywriteoff1": "10.00",
+      "canumoneydirectreal": "0.00",
+      "canumoneydirectowe": "0.00",
+      "canumoneywriteoff1real": "10.00",
+      "canumoneywriteoff1owe": "0.00"
+    }
+  ],
+  "popUpLogo": false,
+  "freeFlag": true,
+  "newPage": true,
+  "depositDetailEmptyPrompt": "尊敬的用户，您当前暂无存入明细",
+  "directionalPsntFeeInfoList": [],
+  "canuseprecust": "36.12",
+  "unavailablelimitfeecust": "0.00",
+  "unusedDirectionalFlag": false,
+  "freeCarryInfoList": [
+    {
+      "money": "36.12",
+      "canusemoney": "36.12",
+      "limitcode": "0",
+      "canumoneydirect": "0.00",
+      "canumoneywriteoff1": "0.00",
+      "canumoneydirectreal": "0.00",
+      "canumoneydirectowe": "0.00",
+      "canumoneywriteoff1real": "0.00",
+      "canumoneywriteoff1owe": "0.00"
+    }
+  ],
+  "lszdBusinessLink": "https://img.client.10010.com/huafeiyuzhangdan2/index.html?ticket=null&ticketPhone=null&ticketChannel=null",
+  "allbowefeecust": "0.00",
+  "code": "0000",
+  "qjfLink": "/pages/payFee/payFee",
+  "paySekiUrl": "https://m.client.10010.com/mobileService/openPlatform/openPlatLineNew.htm?to_url=https://upay.10010.com/npfwap/npfMobWeb/bankcharge/init?serviceType=01",
+  "carryForwardFromLastMonth": "46.12",
+  "jfObjectList": [
+    {
+      "traceId": "10000220261029015928562018165616",
+      "sessionId": null,
+      "isNewUser": "2",
+      "list": [],
+      "batchId": null,
+      "title": null,
+      "currentSortList": null,
+      "brandNameList": null,
+      "reqFlag": null,
+      "goodsUrl": null,
+      "currentTouch": "1000231247",
+      "policyPrice": null,
+      "totalPages": null,
+      "viceTitle": null,
+      "labelNameList": null,
+      "isCard": null,
+      "id": null,
+      "imgSrc": null,
+      "channelCode": "100002"
+    }
+  ],
+  "newCarryForwardFromLastMonth": "36.12",
+  "warmPromptNewStyle": "0",
+  "limitInfoList": [],
+  "visitTimesThreshold": -1,
+  "realfeecustnew": "29.00",
+  "payFeeInfoList": [
+    {
+      "Recvfee": "10.00",
+      "Dptcurbalance": "0.00",
+      "Recvtime": "2026.10.25"
+    }
+  ],
+  "newDepositForTheMonth": "0.00",
+  "newMonthlyRechargeBill": "0.00",
+  "revisedVersionByProvince": true,
+  "feefrozen": "10.00",
+  "monthlyRechargeBill": "0.00",
+  "showArrearsDetail": true,
+  "freePsntFeeInfoList": [],
+  "newPayFeeInfoList": [
+    {
+      "recvTime": "2026.10.25",
+      "preChargeFee": "0.00",
+      "canNotUseFee": "10.00",
+      "recvFee": "10.00",
+      "dptCurBalance": "0.00"
+    }
+  ],
+  "reminder": "1、每月月末的最后一天晚7：00至次月2日早8：00为系统出账期，为您提供相关查询服务可能不准确，请您于每月2日早8：00以后进行查询，敬请谅解。</br>2、带有(**预估费用**)的费用仅供参考，不作为实际出账计费依据，实际话费请以实际出账金额为准。</br>3、若您存在多个账户统一缴费的情况，剩余话费和当月已消费为您多个账户合并计算的金额。</br>4、如核对账单中遇到问题，请拨打10010进行咨询解决。",
+  "largeLedgerUserID": false,
+  "directionalPayFeeTotal": "0.00",
+  "rebateOfTheMonth": "0.00",
+  "canusefeecustNew": "46.12",
+  "spayfeecust": "39.00",
+  "carryOverArrears": "46.12",
+  "realfeecust": "39.00",
+  "frozenFeeFlag": true,
+  "allbOweFlag": false,
+  "uAndF": "10.00",
+  "limitPeriodFlag": false,
+  "zongFeeSum": "0.00",
+  "homeAccountUrl": "",
+  "freePsntFeeTotal": "0.00",
+  "directionalPayFeeInfoList": [],
+  "queryTime": "2026-10-29 01:59:28",
+  "directionalFlag": true,
+  "canusefeecust": "46.12",
+  "allbillfee": "39.00",
+  "newPsntFeeInfoList": [
+    {
+      "recvTime": "2026.10.01",
+      "preChargeFee": "10.00",
+      "canNotUseFee": "0.00",
+      "recvFee": "10.00",
+      "dptCurBalance": "0.00"
+    }
+  ],
+  "newVersion": true,
+  "visitTimes": 12,
+  "realTimeFeeSpecialFlagThree": [
+    {
+      "subItems": [
+        {
+          "subItems": [
+            {
+              "bill": {
+                "parentitemcode": "921230",
+                "realfee": "0.00",
+                "directfee": "0.00",
+                "adiscnt": "30.00",
+                "fee": "0.00",
+                "adjustbefore": "0.00",
+                "writeofffee1": "0.00",
+                "spayfee": "0.00",
+                "billfee": "30.00",
+                "specialflag": "3",
+                "paylatefee": "0.00",
+                "integrateitemcode": "16474",
+                "integrateitem": "流量叠加包月套餐费",
+                "adjustafter": "0.00",
+                "payfee": "0.00",
+                "balance": "0.00",
+                "price": "30.00",
+                "latefee": "0.00"
+              }
+            },
+            {
+              "bill": {
+                "parentitemcode": "921230",
+                "realfee": "0.00",
+                "directfee": "0.00",
+                "adiscnt": "40.00",
+                "fee": "0.00",
+                "adjustbefore": "0.00",
+                "writeofffee1": "0.00",
+                "spayfee": "0.00",
+                "billfee": "40.00",
+                "specialflag": "3",
+                "paylatefee": "0.00",
+                "integrateitemcode": "16478",
+                "integrateitem": "其他定向流量包月租费",
+                "adjustafter": "0.00",
+                "payfee": "0.00",
+                "balance": "0.00",
+                "price": "40.00",
+                "latefee": "0.00"
+              }
+            }
+          ],
+          "bill": {
+            "parentitemcode": "1001",
+            "realfee": "0.00",
+            "directfee": "0.00",
+            "adiscnt": "70.00",
+            "fee": "0.00",
+            "adjustbefore": "0.00",
+            "writeofffee1": "0.00",
+            "spayfee": "0.00",
+            "billfee": "70.00",
+            "specialflag": "2",
+            "paylatefee": "0.00",
+            "integrateitemcode": "921230",
+            "integrateitem": "叠加包",
+            "adjustafter": "0.00",
+            "payfee": "0.00",
+            "balance": "0.00",
+            "price": "70.00",
+            "latefee": "0.00"
+          }
+        },
+        {
+          "subItems": [
+            {
+              "bill": {
+                "parentitemcode": "21229",
+                "realfee": "39.00",
+                "directfee": "0.00",
+                "adiscnt": "0.00",
+                "fee": "39.00",
+                "adjustbefore": "0.00",
+                "writeofffee1": "0.00",
+                "spayfee": "39.00",
+                "billfee": "39.00",
+                "specialflag": "3",
+                "paylatefee": "0.00",
+                "integrateitemcode": "20895",
+                "integrateitem": "月套餐费",
+                "adjustafter": "0.00",
+                "payfee": "0.00",
+                "balance": "39.00",
+                "price": "39.00",
+                "latefee": "0.00"
+              }
+            }
+          ],
+          "bill": {
+            "parentitemcode": "1001",
+            "realfee": "39.00",
+            "directfee": "0.00",
+            "adiscnt": "0.00",
+            "fee": "39.00",
+            "adjustbefore": "0.00",
+            "writeofffee1": "0.00",
+            "spayfee": "39.00",
+            "billfee": "39.00",
+            "specialflag": "2",
+            "paylatefee": "0.00",
+            "integrateitemcode": "21229",
+            "integrateitem": "基本套餐费",
+            "adjustafter": "0.00",
+            "payfee": "0.00",
+            "balance": "39.00",
+            "price": "39.00",
+            "latefee": "0.00"
+          }
+        }
+      ],
+      "bill": {
+        "parentitemcode": "-1",
+        "realfee": "39.00",
+        "directfee": "0.00",
+        "adiscnt": "70.00",
+        "fee": "39.00",
+        "adjustbefore": "0.00",
+        "writeofffee1": "0.00",
+        "spayfee": "39.00",
+        "billfee": "109.00",
+        "specialflag": "1",
+        "paylatefee": "0.00",
+        "integrateitemcode": "1001",
+        "integrateitem": "月固定费",
+        "adjustafter": "0.00",
+        "payfee": "0.00",
+        "balance": "39.00",
+        "price": "109.00",
+        "latefee": "0.00"
+      }
+    },
+    {
+      "subItems": [
+        {
+          "subItems": [
+            {
+              "bill": {
+                "parentitemcode": "436789",
+                "realfee": "0.00",
+                "directfee": "0.00",
+                "adiscnt": "5.00",
+                "fee": "0.00",
+                "adjustbefore": "0.00",
+                "writeofffee1": "0.00",
+                "spayfee": "0.00",
+                "billfee": "5.00",
+                "specialflag": "3",
+                "paylatefee": "0.00",
+                "integrateitemcode": "36789",
+                "integrateitem": "增值业务-联通邮箱套餐专享版",
+                "adjustafter": "0.00",
+                "payfee": "0.00",
+                "balance": "0.00",
+                "price": "5.00",
+                "latefee": "0.00"
+              }
+            }
+          ],
+          "bill": {
+            "parentitemcode": "1002",
+            "realfee": "0.00",
+            "directfee": "0.00",
+            "adiscnt": "5.00",
+            "fee": "0.00",
+            "adjustbefore": "0.00",
+            "writeofffee1": "0.00",
+            "spayfee": "0.00",
+            "billfee": "5.00",
+            "specialflag": "2",
+            "paylatefee": "0.00",
+            "integrateitemcode": "436789",
+            "integrateitem": "增值业务-联通邮箱套餐专享版",
+            "adjustafter": "0.00",
+            "payfee": "0.00",
+            "balance": "0.00",
+            "price": "5.00",
+            "latefee": "0.00"
+          }
+        }
+      ],
+      "bill": {
+        "parentitemcode": "-1",
+        "realfee": "0.00",
+        "directfee": "0.00",
+        "adiscnt": "5.00",
+        "fee": "0.00",
+        "adjustbefore": "0.00",
+        "writeofffee1": "0.00",
+        "spayfee": "0.00",
+        "billfee": "5.00",
+        "specialflag": "1",
+        "paylatefee": "0.00",
+        "integrateitemcode": "1002",
+        "integrateitem": "增值业务费",
+        "adjustafter": "0.00",
+        "payfee": "0.00",
+        "balance": "0.00",
+        "price": "5.00",
+        "latefee": "0.00"
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "retCode": "000000",
+  "retDesc": "SUCCESS",
+  "rspBody": {
+    "curFeeTotal": "23.82",
+    "curFee": "23.82",
+    "realFee": "0.00",
+    "oweFee": "0.00",
+    "realBalanceFee": "23.82",
+    "otherFee": "0.00",
+    "otherFeeInfo": [
+      {
+        "otherFeeName": "应缴费用",
+        "otherFeeValue": "0.00"
+      }
+    ]
+  }
+}

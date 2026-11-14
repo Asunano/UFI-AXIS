@@ -1,0 +1,219 @@
+{
+  "retCode": "000000",
+  "retDesc": "Success",
+  "rspBody": {
+    "newPlanRemainQryRes": {
+      "planRemianFlowListRes": {
+        "usedtotal": "1.41",
+        "unit": "04",
+        "limitType": "01",
+        "state": "00",
+        "limiteRemainNum": "0.00",
+        "planRemianFlowRes": [
+          {
+            "flowtype": "0",
+            "flowSumNum": "2248",
+            "flowUsdNum": "473.30",
+            "flowRemainNum": "1774.70",
+            "unit": "03",
+            "planRemianFlowInfoRes": [
+              {
+                "planID": "prod.10086000019345",
+                "planName": "8元自由选套餐（100MB流量）",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-05 00:00:00",
+                "expireDate": "2026-11-05 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G流量上月结转",
+                    "flowContinueFlag": "0",
+                    "totalRes": "100.00",
+                    "usedRes": "98.32",
+                    "remainRes": "1.68",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511111",
+                    "flowInstanceId": "76706854251948",
+                    "flowValidDate": "2026-09-05 00:00:00",
+                    "flowExpireDate": "2026-10-11 02:31:14"
+                  }
+                ]
+              },
+              {
+                "planID": "prod.10086000019345",
+                "planName": "8元自由选套餐（100MB流量）",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-05 00:00:00",
+                "expireDate": "2026-12-05 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G流量",
+                    "totalRes": "100.00",
+                    "usedRes": "0.00",
+                    "remainRes": "100.00",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511111",
+                    "flowInstanceId": "76706854251948",
+                    "flowValidDate": "2026-10-05 00:00:00",
+                    "flowExpireDate": "2026-10-05 00:00:00"
+                  }
+                ]
+              },
+              {
+                "planID": "prod.10086000048162",
+                "planName": "参与线上活动享1GB流量1天包",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-30 14:11:21",
+                "expireDate": "2026-10-31 14:16:19",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G灵活账期流量",
+                    "totalRes": "1024.00",
+                    "usedRes": "68.47",
+                    "remainRes": "955.53",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64561111",
+                    "flowInstanceId": "76722149462715",
+                    "flowValidDate": "2026-10-30 14:11:21",
+                    "flowExpireDate": "2026-10-30 23:57:33"
+                  }
+                ]
+              },
+              {
+                "planID": "prod.10086000026549",
+                "planName": "统一营销流量月包-1GB",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-14 00:00:00",
+                "expireDate": "2026-11-01 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G流量",
+                    "totalRes": "1024.00",
+                    "usedRes": "306.51",
+                    "remainRes": "717.49",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511111",
+                    "flowInstanceId": "76722008114020",
+                    "flowValidDate": "2026-10-14 00:00:00",
+                    "flowExpireDate": "2026-10-29 23:59:30"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "flowtype": "1",
+            "flowSumNum": "112640",
+            "flowUsdNum": "973.63",
+            "flowRemainNum": "111666.37",
+            "unit": "03",
+            "planRemianFlowInfoRes": [
+              {
+                "planID": "JTPRO2.2023999900052875",
+                "planName": "移动云手机0元30GB定向流量包",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-01 00:00:00",
+                "expireDate": "2026-11-01 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G定向流量",
+                    "totalRes": "30720.00",
+                    "usedRes": "2.52",
+                    "remainRes": "30717.48",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511121",
+                    "flowInstanceId": "76719293100306",
+                    "flowValidDate": "2026-10-01 00:00:00",
+                    "flowExpireDate": "2026-10-14 23:28:12"
+                  }
+                ],
+                "appInfoRes": [
+                  {
+                    "appType": "1750000112",
+                    "appID": "1750000112",
+                    "appTag": ""
+                  }
+                ]
+              },
+              {
+                "planID": "prod.10086000074862",
+                "planName": "中国移动咪咕快游0元50GB定向流量包（2025版）",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-01 00:00:00",
+                "expireDate": "2026-11-01 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G定向流量",
+                    "totalRes": "51200.00",
+                    "usedRes": "971.11",
+                    "remainRes": "50228.89",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511121",
+                    "flowInstanceId": "76716280370065",
+                    "flowValidDate": "2026-10-01 00:00:00",
+                    "flowExpireDate": "2026-10-18 02:08:56"
+                  }
+                ],
+                "appInfoRes": [
+                  {
+                    "appType": "中国移动精品APP",
+                    "appID": "1750000034",
+                    "appTag": "咪咕快游"
+                  }
+                ]
+              },
+              {
+                "planID": "JTPRO2.2021999900054730",
+                "planName": "30GB移动云盘定向流量免费服务",
+                "plantype": "01",
+                "isMultiTerm": "1",
+                "validDate": "2026-10-01 00:00:00",
+                "expireDate": "2026-11-01 00:00:00",
+                "expireFlag": "0",
+                "flowInfoRes": [
+                  {
+                    "flowName": "国内2/3/4/5G定向流量",
+                    "totalRes": "30720.00",
+                    "usedRes": "0.00",
+                    "remainRes": "30720.00",
+                    "unit": "03",
+                    "gATFlag": "1",
+                    "flowID": "64511121",
+                    "flowInstanceId": "76713475121575",
+                    "flowValidDate": "2026-10-01 00:00:00",
+                    "flowExpireDate": "2026-10-01 00:00:00"
+                  }
+                ],
+                "appInfoRes": [
+                  {
+                    "appType": "中国移动精品APP",
+                    "appID": "1750000068",
+                    "appTag": "和彩云"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "currentTime": "2026-10-31 01:21:33:409"
+  }
+}
