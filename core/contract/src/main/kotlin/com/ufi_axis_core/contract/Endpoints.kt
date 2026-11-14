@@ -371,6 +371,28 @@ object Endpoints {
         const val UNINSTALL = "$BASE/uninstall"
     }
 
+    /**
+     * 第三方程序商店（`ProgramRoutes`，2026-10-31 入 contract）。
+     *
+     * 与 [Apps]（APK 管理）完全不同；程序是带 data/conf/run/state 的 Linux 进程。
+     * `{id}` 是程序 id（小写字母/数字/下划线/连字符），由调用方替换。
+     */
+    object Programs {
+        const val BASE = "$API/programs"
+        const val STATUS = "$BASE/status"
+        const val LOGS = "$BASE/{id}/logs"
+        const val INSTALL = "$BASE/{id}/install"
+        const val UPLOAD = "$BASE/{id}/upload"
+        const val UNINSTALL = "$BASE/{id}/uninstall"
+        const val START = "$BASE/{id}/start"
+        const val STOP = "$BASE/{id}/stop"
+        const val RESTART = "$BASE/{id}/restart"
+        const val ACCESS_MODE = "$BASE/{id}/access-mode"
+        const val OPEN = "$BASE/{id}/open"
+        const val SECRET = "$BASE/{id}/secret"
+        const val RESET_SECRET = "$BASE/{id}/reset-secret"
+    }
+
     /** 健康检查（core 进程存活探针，无鉴权）。 */
     const val HEALTH = "health"
 }

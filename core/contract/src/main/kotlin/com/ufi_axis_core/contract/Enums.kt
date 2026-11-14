@@ -323,6 +323,18 @@ object Alerts {
 object WsChannel {
     const val TRAFFIC = "traffic"
     const val SIGNAL = "signal"
+
+    /**
+     * 实时连接态（`ppp_status`），2026-11-07 新增。
+     *
+     * core 的 `DataScheduler.collectSignal()` 在采集 signal 的**同一次** goform 查询里
+     * 已经带上了 `ppp_status`（`FieldGroup.SIGNAL` 的 cmd 列表里有它），所以这条频道
+     * 与 [SIGNAL] 同频推送，**不额外打设备**。客户端用它把「已连接/未连接」从 10s
+     * 轮询降到 3~4.5s 推送；它只表示链路态，不是移动数据开关（开关是用户意图，
+     * 见 `DeviceFields.Connection` 的 KDoc）。
+     */
+    const val CONNECTION = "connection"
+
     const val CPU = "cpu"
     const val MEMORY = "memory"
     const val ALERT = "alert"
@@ -333,7 +345,7 @@ object WsChannel {
 
     /** core 真正会广播的全部频道（`broadcast("x")` / `broadcaster("x")` 的字面量）。 */
     val ALL: List<String> = listOf(
-        TRAFFIC, SIGNAL, CPU, MEMORY, ALERT, NOTIFICATION, DATA_CHANGED, CONFIG_CHANGED, UPDATE
+        TRAFFIC, SIGNAL, CONNECTION, CPU, MEMORY, ALERT, NOTIFICATION, DATA_CHANGED, CONFIG_CHANGED, UPDATE
     )
 
     /**

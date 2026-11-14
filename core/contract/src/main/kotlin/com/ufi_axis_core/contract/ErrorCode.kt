@@ -58,6 +58,15 @@ object ErrorCode {
     const val INVALID_CODE = "INVALID_CODE"
     const val ALREADY_PAIRED = "ALREADY_PAIRED"
     const val INVALID_PASSWORD = "INVALID_PASSWORD"
+
+    /**
+     * 备份档案口令错（2026-11-14）。
+     *
+     * 原先复用 [INVALID_PASSWORD]，而客户端把它当作"主人密码门"的判据 ——
+     * 用户恢复备份时口令打错一个字，界面弹出的是"输入配对密码"，还会把刚记住的
+     * 正确主人密码清掉、重传整个备份包。两者语义无关，必须分开。
+     */
+    const val WRONG_BACKUP_PASSPHRASE = "WRONG_BACKUP_PASSPHRASE"
     const val PASSWORD_REQUIRED = "PASSWORD_REQUIRED"
     const val MISSING_PASSWORD = "MISSING_PASSWORD"
     const val WRONG_OLD_PASSWORD = "WRONG_OLD_PASSWORD"

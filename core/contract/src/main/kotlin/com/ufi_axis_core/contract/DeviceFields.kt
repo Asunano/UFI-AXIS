@@ -417,6 +417,28 @@ object DeviceFields {
         const val NETWORK_PROVIDER = "network_provider"
 
         val ALL = listOf(PPP_STATUS, NETWORK_TYPE, NETWORK_PROVIDER)
+
+        /**
+         * `ppp_status` 是否表示「已连接」。
+         *
+         * 设备侧取值形如 `"ppp_connected"` / `"ppp_disconnected"`，**不能用 equals 判**：
+         *   · 不同固件的前缀不一样（`ppp_` / 无前缀 / `dial_`），所以只能看子串；
+         *   · `"disconnected"` 里**也含** `"connected"` —— 必须先认 connected、再排除 disconnected
+         *     （反过来写恒为 false）。
+         *
+         * 为什么放在 contract：core 里有三处要判它（切制式前读一次、链路状态、诊断），
+         * 把两行子串逻辑各写一份迟早会分叉。
+         *
+         * ⚠ **它不是「移动数据开关」的状态**（2026-11-02 起明确拆开）：`ppp_status` 是链路态，
+         * 切制式 / 锁频后设备会先拆链再重拨，十几~几十秒里它必然是断的。开关态是**用户意图**，
+         * 由 `NetworkController` 的 `MobileDataIntent` 记、经 `/api/network/status` 的
+         * `mobile_data` 对外。客户端别再从 `ppp_status` 推开关（会显示成"关闭"）。
+         */
+        fun isPppConnected(raw: String?): Boolean {
+            val text = raw.orEmpty()
+            return text.contains("connected", ignoreCase = true) &&
+                !text.contains("disconnected", ignoreCase = true)
+        }
     }
 
     // ───────────────────────── 布尔值编码 ─────────────────────────
