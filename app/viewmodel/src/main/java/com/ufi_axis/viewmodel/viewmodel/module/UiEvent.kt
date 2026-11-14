@@ -21,5 +21,35 @@ sealed class UiEvent {
      * 一个界面上往往有多个写操作，泛化文案让用户分不清生效的是哪个。
      * [subtitle] 用来补后果说明（例如「热点正在重启，连接会中断约 10 秒」）。
      */
-    data class ShowWriteNotice(val message: String, val subtitle: String? = null) : UiEvent()
+    data class ShowWriteNotice(
+        val message: String,
+        val subtitle: String? = null,
+        /**
+         * 语义类型。默认 SUCCESS 保持既有行为（30+ 调用点不用改）。
+         *
+         * 为什么需要它：写操作的结果不都是"成功"——「未保存：需要配对密码」既不是错误
+         * （门按设计工作），也不该配一个绿色对勾。类型交给 UI 决定图标与配色。
+         */
+        val type: WriteNoticeType = WriteNoticeType.SUCCESS
+    ) : UiEvent()
+}
+
+/**
+ * 写操作提示的语义类型。
+ *
+ * 与 `:app:ui` 的 [ToastType] 一一对应，但**不能直接复用**：`:app:viewmodel` 不依赖 `:app:ui`
+ * （依赖方向是 ui → viewmodel），在这里引用会把依赖反过来。UI 层负责映射。
+ */
+enum class WriteNoticeType {
+    /** 写操作落地 */
+    SUCCESS,
+
+    /** 中性说明（保存了，但还差一步） */
+    INFO,
+
+    /** 受保护/被拦下：门按设计工作，不是错误 */
+    WARNING,
+
+    /** 真的失败（网络、服务端拒绝） */
+    ERROR,
 }

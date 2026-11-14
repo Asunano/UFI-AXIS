@@ -1,4 +1,5 @@
 package com.ufi_axis.ui.diagnose
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -52,9 +53,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 诊断中心 —— **注册表驱动的渲染区**（2026-10-14）。
@@ -118,6 +123,27 @@ fun DiagnosticSection(
 
     // 输入框内容：键是 item.id。放页面而不是描述符里（见 DiagInput 的 KDoc）。
     var inputs by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+
+    /*
+     * 网络四条工具的默认目标由 core 提供，app 不再硬编码 223.5.5.5 / 192.168.0.1:80。
+     * 端点失败时回落到与 core 相同的默认值，旧 core 也仍能正常使用。
+     */
+    LaunchedEffect(Unit) {
+        val preset = runCatching { api.rawGetJson("/api/diagnostic/presets") }.getOrNull()
+        val network = preset?.get("network")?.jsonObject
+        val host = network?.get("host")?.jsonPrimitive?.contentOrNull?.trim()
+            ?.takeIf { it.isNotEmpty() } ?: "www.baidu.com"
+        val port = network?.get("port")?.jsonPrimitive?.contentOrNull?.toIntOrNull()
+            ?.takeIf { it in 1..65535 } ?: 443
+        if (inputs.isEmpty()) {
+            inputs = mapOf(
+                "network.ping" to host,
+                "network.dns" to host,
+                "network.tcp" to "$host:$port",
+                "network.traceroute" to host,
+            )
+        }
+    }
     // 描述符按当前输入重建：描述符是冻结数据，值通过构造参数注入（这也是 inputs 变化时
     // 唯一需要重建的东西 —— 结果与展开态都按 id 存在下面两个 map 里，不受影响）。
     // context 只给"本机状态"类检查用（`env.notifypermission` 要读系统通知权限与渠道），
@@ -290,7 +316,7 @@ fun DiagnosticSection(
                             onRun = { scope.launch { runOne(descriptor) } },
                             onInputChange = { inputs = inputs + (descriptor.id to it) },
                             onOpenRoute = { route ->
-                                navController.navigate(route) { launchSingleTop = true }
+                                navController.ufiNavigateOnce(route) { launchSingleTop = true }
                             },
                             onToast = onToast,
                         )
@@ -522,8 +548,11 @@ private fun DiagnosticCard(
     //     只关掉弹窗等于让用户自己去猜成没成；
     //  ③ 成功之后**重跑这一条**：卡片上那份结论是写之前的，不重跑就会看到
     //     "权限已补全"旁边还挂着"缺 3 项权限"（同一个数字两种说法）。
-    pendingWrite?.let { write ->
+    val dialogPendingWrite = rememberLastNonNull(pendingWrite)
+    if (dialogPendingWrite != null) {
+        val write = dialogPendingWrite
         UfiConfirmDialog(
+        visible = pendingWrite != null,
             title = write.confirmTitle,
             text = write.confirmBody,
             confirmText = if (write.destructive) "确认执行" else "确认",

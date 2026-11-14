@@ -84,7 +84,10 @@ fun AppearanceSettingsScreen(
     val context = LocalContext.current
     val themeManager = remember { ThemeManager(context, observeExternal = false) }
     val themeMode by themeManager.themeMode.collectAsState()
+    // 主界面（Tab）切换时长
     val transitionDurationMs by themeManager.transitionDurationMs.collectAsState()
+    // 二级页转场时长（2026-11-02 与主界面拆分）
+    val detailTransitionDurationMs by themeManager.detailTransitionDurationMs.collectAsState()
     val blurEnabled by themeManager.blurEnabled.collectAsState()
     // 2026-10-14：二级页转场的压暗 / 圆角（与「过渡模糊」同一个弹窗里的三项）。
     val navScrimEnabled by themeManager.navScrimEnabled.collectAsState()
@@ -189,25 +192,43 @@ fun AppearanceSettingsScreen(
                     )
                 }
 
-                // ═══ 入口 4：切换动画 ═══
+                // ═══ 入口 4：主界面切换动画（底部 5 个 Tab 之间）═══
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = AppIconTransition,
-                        title = "切换动画",
+                        title = "主界面切换动画",
                         description = buildString {
+                            append("底部 5 个 Tab 之间 · ")
                             append(UfiPageTransitions.byId(pageTransitionId).displayName)
                             append(" · ")
-                            // 2026-09-04（P2f）：新增「关闭」档，摘要里必须能看出来，
-                            // 否则关掉之后这里会显示成 "0ms"，像是坏了。
                             if (transitionDurationMs <= ThemeManager.TRANSITION_DURATION_OFF) {
-                                append("转场已关闭")
+                                append("已关闭")
                             } else {
-                                append(transitionDurationMs)
-                                append("ms")
+                                append("${transitionDurationMs}ms")
                             }
-                            if (blurEnabled) append(" · 模糊开启")
+                            if (blurEnabled) append(" · 模糊开")
                         },
-                        onClick = { openDialog = AppearanceDialog.PAGE_TRANSITION },
+                        onClick = { openDialog = AppearanceDialog.TAB_TRANSITION },
+                        trailing = { UfiSettingsChevron() }
+                    )
+                }
+
+                // ═══ 入口 4b：二级页转场动画（与主界面分开一组）═══
+                UfiSettingsRowCard {
+                    UfiSettingsItem(
+                        icon = AppIconTransition,
+                        title = "二级页转场动画",
+                        description = buildString {
+                            append("进/出二级页 · ")
+                            if (detailTransitionDurationMs <= ThemeManager.TRANSITION_DURATION_OFF) {
+                                append("已关闭")
+                            } else {
+                                append("${detailTransitionDurationMs}ms")
+                            }
+                            if (navScrimEnabled) append(" · 压暗")
+                            if (navCornersEnabled) append(" · 圆角")
+                        },
+                        onClick = { openDialog = AppearanceDialog.DETAIL_TRANSITION },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -523,11 +544,9 @@ fun AppearanceSettingsScreen(
             }
         }
 
-        AppearanceDialog.PAGE_TRANSITION -> {
+        AppearanceDialog.TAB_TRANSITION -> {
+            // ── 主界面（底部 5 个 Tab 之间）──
             var draftTransitionId by remember { mutableStateOf(pageTransitionId) }
-            // P2f：0 是「关闭」的持久化表示，但滑块只在 150..600 之间取值。
-            // 因此拆成两个 draft：开关 + 时长。关闭状态下时长保留上一次的可用值
-            // （落到默认档），这样用户关掉再打开不会丢失自己调过的时长。
             var draftTransitionOff by remember {
                 mutableStateOf(transitionDurationMs <= ThemeManager.TRANSITION_DURATION_OFF)
             }
@@ -541,18 +560,11 @@ fun AppearanceSettingsScreen(
                 )
             }
             var draftBlur by remember { mutableStateOf(blurEnabled) }
-            // 2026-10-14：二级页转场另外两项的草稿值（确认时才落盘，与其他 draft 一致）。
-            var draftScrim by remember { mutableStateOf(navScrimEnabled) }
-            var draftCorners by remember { mutableStateOf(navCornersEnabled) }
-            // 2026-10-19：可预测性返回（跟手预览）**没有草稿** —— 见下方开关处的注释：
-            // 这一项改完即落盘，否则「拨完开关直接退出/返回」时选择只活在这个草稿里，
-            // 冷启动读不到键就回落到默认 true，表现正是「关了重进又自动开启」。
-
 
             UfiCustomDialog(
                 visible = true,
                 onDismiss = { openDialog = null },
-                title = "切换动画",
+                title = "主界面切换动画",
                 icon = rememberVectorPainter(AppIconTransition),
                 confirmButton = null,
                 dismissButton = null,
@@ -561,68 +573,34 @@ fun AppearanceSettingsScreen(
                 Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
                     UfiDialogBody {
                         Text(
-                            "主页底部 Tab 切换时的过渡效果。",
+                            "只影响底部 5 个 Tab 之间的切换；进/出二级页在上一页单独设置。",
                             style = MaterialTheme.typography.bodyMedium,
                             color = palette.textSecondary
                         )
-                        // 切换动画类型选择器：双栏网格，减小弹窗体积。
-                        // 数据源直接来自 UfiPageTransitions 注册表（内置 6 种 + 任意运行时注册）。
                         val transitions = UfiPageTransitions.all()
                         UfiOptionGrid(
-                            options = transitions.map { t ->
-                                UfiOptionItem(
-                                    value = t.id,
-                                    label = t.displayName
-                                )
-                            },
+                            options = transitions.map { t -> UfiOptionItem(value = t.id, label = t.displayName) },
                             selectedValue = draftTransitionId,
                             onSelect = { draftTransitionId = it },
                             columns = 2
                         )
-                        // P2f（2026-09-04）：转场时长新增「关闭」档。
-                        // 为什么是独立开关而不是把滑块下限拉到 0：0 与 150 之间**刻意没有中间档**
-                        // （150ms 以下的整屏转场接近瞬变，只会被感知成闪帧，比干脆关掉更差），
-                        // 塞进滑块会得到一个不等距的档位表，滑到那一段还会显示成"0ms 的动画"。
-                        // 关闭时隐藏滑块，避免出现"开关已关、下面还让你调时长"的自相矛盾。
                         Row(
                             Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                "关闭转场动画",
-                                style = UfiTextStyles.listItemTitle,
-                                color = palette.textPrimary
-                            )
-                            UfiSwitch(
-                                checked = draftTransitionOff,
-                                onCheckedChange = { draftTransitionOff = it }
-                            )
+                            Text("关闭切换动画", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                            UfiSwitch(checked = draftTransitionOff, onCheckedChange = { draftTransitionOff = it })
                         }
                         if (!draftTransitionOff) {
-                            /*
-                             * 「动画时长」2026-10-14：滑块 → 下拉框。
-                             *
-                             * 它本来就是 150,200,…,600 共 **9 个离散档位**（下面的区间推导一字未改），
-                             * 滑块只是把这 9 个点摊在一根轨道上：想落到 300 要试着拖，而且看不出
-                             * 还有哪几档。下拉框把 9 档一次列全，当前值直接显示在触发器上。
-                             */
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically,
                                 horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Text(
-                                    "动画时长",
-                                    // 2026-10-19 修复：原来用 labelMedium（12sp），与同弹窗里
-                                    // 「关闭转场动画 / 过渡模糊 / 压暗 / 圆角」的 listItemTitle（16sp）
-                                    // 不一致 —— 用户看到的就是"有的大有的小"。统一走列表项标题样式。
-                                    style = UfiTextStyles.listItemTitle,
-                                    color = palette.textPrimary
-                                )
+                                Text("动画时长", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
                                 UfiDropdown(
                                     selectedValue = draftDuration,
-                                    // 区间与档距由 ThemeManager 的 MIN/MAX 推导，不写死 150..600
                                     options = (ThemeManager.TRANSITION_DURATION_MIN_MS..
                                         ThemeManager.TRANSITION_DURATION_MAX_MS step 50).toList(),
                                     onValueSelected = { draftDuration = it },
@@ -636,73 +614,110 @@ fun AppearanceSettingsScreen(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                "过渡模糊",
-                                style = UfiTextStyles.listItemTitle,
-                                color = palette.textPrimary
-                            )
-                            UfiSwitch(
-                                checked = draftBlur,
-                                onCheckedChange = { draftBlur = it }
-                            )
+                            Text("过渡模糊", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                            UfiSwitch(checked = draftBlur, onCheckedChange = { draftBlur = it })
                         }
-                        // 2026-10-14：二级页转场的另外两项效果（用户要求：一个入口 + 一个弹窗就够，
-                        // 不再为它们单开二级页）。两项默认都开，与改动前的写死行为一致。
+                    }
+                    DialogButtonRow(
+                        confirmText = "确认",
+                        onConfirm = {
+                            if (draftTransitionId != pageTransitionId) themeManager.setPageTransition(draftTransitionId)
+                            val targetDuration =
+                                if (draftTransitionOff) ThemeManager.TRANSITION_DURATION_OFF else draftDuration
+                            if (targetDuration != transitionDurationMs) {
+                                themeManager.setTransitionDurationMs(targetDuration)
+                            }
+                            if (draftBlur != blurEnabled) themeManager.setBlurEnabled(draftBlur)
+                            openDialog = null
+                        },
+                        dismissText = "取消",
+                        onDismiss = { openDialog = null }
+                    )
+                }
+            }
+        }
+
+        AppearanceDialog.DETAIL_TRANSITION -> {
+            // ── 二级页（进/出二级页）──
+            var draftDetailOff by remember {
+                mutableStateOf(detailTransitionDurationMs <= ThemeManager.TRANSITION_DURATION_OFF)
+            }
+            var draftDetailDuration by remember {
+                mutableIntStateOf(
+                    if (detailTransitionDurationMs <= ThemeManager.TRANSITION_DURATION_OFF) {
+                        ThemeManager.TRANSITION_DURATION_DEFAULT_MS
+                    } else {
+                        detailTransitionDurationMs
+                    }
+                )
+            }
+            var draftScrim by remember { mutableStateOf(navScrimEnabled) }
+            var draftCorners by remember { mutableStateOf(navCornersEnabled) }
+
+            UfiCustomDialog(
+                visible = true,
+                onDismiss = { openDialog = null },
+                title = "二级页转场动画",
+                icon = rememberVectorPainter(AppIconTransition),
+                confirmButton = null,
+                dismissButton = null,
+                showCloseButton = false
+            ) {
+                Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                    UfiDialogBody {
+                        Text(
+                            "只影响「进入 / 返回二级页」的转场；底部 Tab 之间的切换在上一页单独设置。",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = palette.textSecondary
+                        )
                         Row(
                             Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                "压暗",
-                                style = UfiTextStyles.listItemTitle,
-                                color = palette.textPrimary
-                            )
-                            UfiSwitch(
-                                checked = draftScrim,
-                                onCheckedChange = { draftScrim = it }
-                            )
+                            Text("关闭二级页转场", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                            UfiSwitch(checked = draftDetailOff, onCheckedChange = { draftDetailOff = it })
+                        }
+                        if (!draftDetailOff) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text("动画时长", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                                UfiDropdown(
+                                    selectedValue = draftDetailDuration,
+                                    options = (ThemeManager.TRANSITION_DURATION_MIN_MS..
+                                        ThemeManager.TRANSITION_DURATION_MAX_MS step 50).toList(),
+                                    onValueSelected = { draftDetailDuration = it },
+                                    modifier = Modifier.width(120.dp),
+                                    unitSuffix = "ms"
+                                )
+                            }
                         }
                         Row(
                             Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                "圆角",
-                                style = UfiTextStyles.listItemTitle,
-                                color = palette.textPrimary
-                            )
-                            UfiSwitch(
-                                checked = draftCorners,
-                                onCheckedChange = { draftCorners = it }
-                            )
+                            Text("压暗", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                            UfiSwitch(checked = draftScrim, onCheckedChange = { draftScrim = it })
                         }
-                        // 2026-10-19：可预测性返回开关。关掉后返回一律按设定时长播放，
-                        // 不再被"快滑"缩短；开着重启跟手预览。
-                        //
-                        // 2026-10-21（用户："关闭可预测性返回…退出重进又自动开启"）：本项
-                        // **刻意不走同弹窗的"草稿 - 确认"**，改成一拨就落盘（与「动态取色」行同口径）。
-                        // 根因：原先它只写本地草稿 `draftPredictiveBack`，唯一落盘点是弹窗底部那颗
-                        // 「确认」；而弹窗的另外三个关闭入口（系统返回键 / 点空白处 / 直接离开本页）
-                        // 走的都是 `onDismiss`（取消），草稿被整组丢弃 ⇒ `ufi_nav_predictive_back`
-                        // 一次都没写过 ⇒ 冷启动 `ThemeManager` 的播种读不到键、回落到默认 `true`，
-                        // 用户看到的就是"关了、重进又开着"。
-                        // 为什么这一项可以脱离草稿：它是纯两态、没有"预览"语义（不像皮肤 / 时长
-                        // 那样确认前需要看效果），即时生效不会产生"确认了还没变"的中间态。
                         Row(
                             Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(
-                                "可预测性返回",
-                                style = UfiTextStyles.listItemTitle,
-                                color = palette.textPrimary
-                            )
+                            Text("圆角", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
+                            UfiSwitch(checked = draftCorners, onCheckedChange = { draftCorners = it })
+                        }
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text("可预测性返回", style = UfiTextStyles.listItemTitle, color = palette.textPrimary)
                             UfiSwitch(
-                                // 直接读共享 flow 的持久化值：开关显示态与实际生效值同一个来源
-                                //（MainNavGraph 也 collect 这条 flow），不存在"界面开了、实际没开"。
                                 checked = navPredictiveBack,
                                 onCheckedChange = { themeManager.setNavPredictiveBack(it) }
                             )
@@ -717,20 +732,13 @@ fun AppearanceSettingsScreen(
                     DialogButtonRow(
                         confirmText = "确认",
                         onConfirm = {
-                            if (draftTransitionId != pageTransitionId) themeManager.setPageTransition(draftTransitionId)
-                            // P2f：关闭 → 写 0（ThemeManager 会把它规整成 TRANSITION_DURATION_OFF）；
-                            // 未关闭 → 写滑块值。只有真的变了才落盘，与其他 draft 一致。
-                            val targetDuration =
-                                if (draftTransitionOff) ThemeManager.TRANSITION_DURATION_OFF else draftDuration
-                            if (targetDuration != transitionDurationMs) {
-                                themeManager.setTransitionDurationMs(targetDuration)
+                            val target =
+                                if (draftDetailOff) ThemeManager.TRANSITION_DURATION_OFF else draftDetailDuration
+                            if (target != detailTransitionDurationMs) {
+                                themeManager.setDetailTransitionDurationMs(target)
                             }
-                            if (draftBlur != blurEnabled) themeManager.setBlurEnabled(draftBlur)
-                            // 2026-10-14：同样只在真的变了才落盘。
                             if (draftScrim != navScrimEnabled) themeManager.setNavScrimEnabled(draftScrim)
                             if (draftCorners != navCornersEnabled) themeManager.setNavCornersEnabled(draftCorners)
-                            // 可预测性返回不在这里落盘：它在开关本身上即时写入（见那一段的长注释），
-                            // 确认/取消都不该再改它一次 —— 否则"取消"会把用户刚拨的开关又盖回去。
                             openDialog = null
                         },
                         dismissText = "取消",
@@ -744,8 +752,15 @@ fun AppearanceSettingsScreen(
     }
 }
 
-/** 外观页弹窗类型（2026-10-15：`UI_SCALE` 已删 —— 界面缩放改成行内下拉框，不再进弹窗） */
-private enum class AppearanceDialog { THEME_MODE, THEME_SKIN, PAGE_TRANSITION, CUSTOM_COLOR }
+/**
+ * 外观页弹窗类型。
+ *
+ * 2026-11-02：`PAGE_TRANSITION` 拆成 [TAB_TRANSITION]（主界面 5 个 Tab 之间）与
+ * [DETAIL_TRANSITION]（进/出二级页）。原来一个弹窗同时管两件事 —— 里面既有
+ * 「切换动画类型（只对 Tab 生效）」又有「压暗 / 圆角 / 可预测性返回（只对二级页生效）」，
+ * 用户没法判断某个开关到底作用于哪一层。
+ */
+private enum class AppearanceDialog { THEME_MODE, THEME_SKIN, TAB_TRANSITION, DETAIL_TRANSITION, CUSTOM_COLOR }
 
 /** 色相滑块的上界（度）。放在这里而不是内联 360f，是为了让三个滑块的区间口径都有名字。 */
 private const val HUE_MAX: Float = 360f

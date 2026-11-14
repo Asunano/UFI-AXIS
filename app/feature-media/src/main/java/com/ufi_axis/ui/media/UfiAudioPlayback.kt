@@ -312,7 +312,7 @@ class UfiAudioPlaybackService : MediaSessionService() {
  * ## 为什么**不带**曲名 / 艺术家（2026-09-16）
  * media3 的 `Player.mediaMetadata` 是「[MediaItem] 自带的 metadata」与「流内解析出的
  * ID3 / FLAC 标签」的合并结果，且 **MediaItem 的字段优先**。原来这里塞了 `title = 文件名`，
- * 于是内嵌的真曲名永远被文件名压住 —— 页面与通知栏显示的都是 `带我走-杨丞琳.flac` 这种东西。
+ * 于是内嵌的真曲名永远被文件名压住 —— 页面与通知栏显示的都是 `示例歌曲-示例歌手.flac` 这种东西。
  * 现在只交出地址与封面，曲名/艺术家/专辑一律由播放器从文件里解析（页面侧再按
  * 「内嵌 → 媒体库字段 → 文件名」兜底显示）。
  *

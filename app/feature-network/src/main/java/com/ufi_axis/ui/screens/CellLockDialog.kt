@@ -283,7 +283,7 @@ fun CellLockScreen(viewModel: MainViewModel, navController: NavHostController) {
                         UfiButton(
                             variant = UfiButtonVariant.Secondary,
                             text = "刷新",
-                            onClick = { isLoading = true; viewModel.network.loadCellInfo() },
+                            onClick = { isLoading = true; viewModel.network.loadCellInfo(force = true) },
                             modifier = Modifier.weight(1f)
                         )
                         UfiButton(

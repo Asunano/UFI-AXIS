@@ -127,6 +127,14 @@ private const val UFI_RISE_CLOSE_FRACTION = 0.08f
  * 4dp 就够，且换来了"一起手就跟手"的手感（见 `awaitEachGesture` 那段说明）。
  */
 private val UFI_RISE_CLOSE_DRAG_SLOP = 4.dp
+/**
+ * 下拉关闭相对横向翻页的方向优势。
+ *
+ * 封面页里左右划是翻页、上下划是关闭；两条手势都从同一个 down 出发。只有纵向位移
+ * 明显大于横向位移时才认作关闭，否则让 HorizontalPager 自己处理。取 1.2 而不是 1.0：
+ * 斜划时留一段缓冲，避免手指的轻微纵向抖动把翻页抢成关闭。
+ */
+private const val UFI_RISE_CLOSE_VERTICAL_DOMINANCE = 1.2f
 
 /** 下拉关闭的绝对位移阈值：拖过这么多就一定关（与比例阈值取"或"）。 */
 private val UFI_RISE_CLOSE_MIN_DRAG = 36.dp
@@ -786,21 +794,37 @@ internal fun MediaAudioRisePanel(
                     val minDragPx = UFI_RISE_CLOSE_MIN_DRAG.toPx()
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
+                        var totalX = 0f
                         var totalY = 0f
                         var claimed = false
                         while (true) {
                             val event = awaitPointerEvent()
                             val change = event.changes.firstOrNull { it.id == down.id } ?: break
                             if (!change.pressed) break
+                            val dx = change.position.x - change.previousPosition.x
                             val dy = change.position.y - change.previousPosition.y
+                            totalX += dx
                             totalY += dy
                             if (!claimed) {
-                                if (totalY > slopPx) {
-                                    claimed = true
-                                    UfiAudioRisePanel.onCloseDragStart(minDragPx)
-                                } else if (totalY < -slopPx) {
-                                    // 向上：这一页没有"再往上"的语义，整个手势让给子节点
+                                // 横向 Pager 已经消费这一笔（或明显横向移动）：绝不抢成关闭。
+                                if (change.isConsumed) return@awaitEachGesture
+                                val absX = abs(totalX)
+                                val absY = abs(totalY)
+                                if (absX > slopPx && absX >= absY) {
                                     return@awaitEachGesture
+                                }
+                                if (absY > slopPx) {
+                                    if (totalY < 0) {
+                                        // 向上：这一页没有"再往上"的语义，整个手势让给子节点
+                                        return@awaitEachGesture
+                                    }
+                                    if (absY > absX * UFI_RISE_CLOSE_VERTICAL_DOMINANCE) {
+                                        claimed = true
+                                        UfiAudioRisePanel.onCloseDragStart(minDragPx)
+                                    } else {
+                                        // 斜向且优势不足：先不接管，继续观察；横向一旦占优就退出。
+                                        continue
+                                    }
                                 } else {
                                     continue
                                 }

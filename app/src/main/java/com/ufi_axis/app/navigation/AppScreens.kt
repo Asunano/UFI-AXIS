@@ -24,6 +24,7 @@ import com.ufi_axis.ui.media.MediaVideoSettingsScanScreen
 import com.ufi_axis.ui.media.MediaVideoSettingsScreen
 import com.ufi_axis.ui.navigation.AppScreen
 import com.ufi_axis.ui.navigation.Routes
+import com.ufi_axis.ui.programs.ProgramStoreScreen
 import com.ufi_axis.ui.resources.ResourcesScreen
 import com.ufi_axis.ui.screens.*
 import com.ufi_axis.ui.screens.AboutDeviceScreen
@@ -79,6 +80,15 @@ private fun rawAppScreens(
 
     Routes.DETAIL_SERVER_CONFIG to { _, nc -> ServerConfigScreen(viewModel, onServerConfigChanged, nc) },
     Routes.DETAIL_TOOLS_ADVANCED to { _, nc -> AdvancedConsoleScreen(viewModel, nc) },
+    Routes.DETAIL_BILL to { _, nc -> BillScreen(viewModel, nc) },
+    Routes.DETAIL_BILL_SETTINGS to { _, nc -> BillSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_BILL_SETTINGS_AUTO_LOGIN to { _, nc -> AutoLoginSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_BILL_SETTINGS_ACCOUNTS to { _, nc -> BillAccountsSettingsScreen(viewModel, nc) },
+    Routes.DETAIL_BILL_ADD to { _, nc -> BillScreen(viewModel, nc, isAdd = true) },
+    Routes.DETAIL_BILL_ACCOUNT to { entry, nc ->
+        BillScreen(viewModel, nc, accountId = entry.arguments?.getString("accountId"))
+    },
+    Routes.DETAIL_REMOTE_SCREEN to { _, nc -> RemoteScreenScreen(viewModel, nc) },
     // 2026-10-10 暂时隐藏：真 PTY 终端的路由注册也一并撤下。
     // 只藏 UI 入口不够 —— 路由表留着的话，任何能触发导航的地方（深链、外部 Intent、
     // 后续误加的入口）仍能直接把这页打开。恢复时解除下面一行注释即可。
@@ -99,6 +109,7 @@ private fun rawAppScreens(
         val prefs = remember { AppPreferences(ctx) }
         AppManagerScreen(viewModel, prefs, nc)
     },
+    Routes.DETAIL_PROGRAM_STORE to { _, nc -> ProgramStoreScreen(nc) },
     Routes.DETAIL_TASKS to { _, nc -> TaskScreen(viewModel, nc) },
     Routes.DETAIL_EMAIL_NOTIFY to { _, nc -> EmailNotifyScreen(viewModel, nc) },
     // 推送渠道总览 → Webhook 配置（2026-09-09 新增）。

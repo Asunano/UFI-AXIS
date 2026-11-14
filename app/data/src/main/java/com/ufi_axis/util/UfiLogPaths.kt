@@ -141,6 +141,10 @@ object UfiLogPaths {
      * @param sub 可选子类，目前只有崩溃 dump 用（[CRASH_DIR]）—— 崩溃是单独的文件形态，
      *   和逐行导出的日志文本混在同一个日期目录里会让用户分不清哪个是哪个。
      */
+    @Deprecated(
+        "日志/崩溃导出已改为 SAF 选位置（2026-10-30 M1/M1.5）；本函数只被旧测试引用，M2 删除。",
+        level = DeprecationLevel.WARNING
+    )
     fun exportRelative(source: String, date: String, sub: String? = null): String =
         if (sub == null) relative(LOG_DIR, EXPORT_DIR, source, date)
         else relative(LOG_DIR, EXPORT_DIR, source, sub, date)
@@ -154,6 +158,10 @@ object UfiLogPaths {
     fun monitorExportRelative(date: String): String = relative(EXPORT_DIR, MONITOR_DIR, date)
 
     /** 日志导出文件名：`{类型}_{级别}_{HHmmss}.txt`，未筛选的那一维传 [UNFILTERED]。 */
+    @Deprecated(
+        "导出文件名改由 LogExport.defaultLogExportFileName 生成（2026-10-30 M1）；M2 删除。",
+        level = DeprecationLevel.WARNING
+    )
     fun exportFileName(kind: String, level: String, stamp: String): String =
         "${kind}_${level}_$stamp.txt"
 
@@ -253,6 +261,10 @@ object UfiLogPaths {
      * 日志导出目录。**不回退私有目录**（理由见类 KDoc），准备失败返回 null，
      * 调用方必须给出明确的失败提示而不是静默。
      */
+    @Deprecated(
+        "导出不再写固定目录（2026-10-30 M1/M1.5：SAF 选位置）；本函数只被旧测试引用，M2 删除。",
+        level = DeprecationLevel.WARNING
+    )
     fun exportDir(source: String, date: String = today(), sub: String? = null): File? =
         externalDir(exportRelative(source, date, sub))?.takeIf { it.exists() || it.mkdirs() }
 

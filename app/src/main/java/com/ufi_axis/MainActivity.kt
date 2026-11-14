@@ -23,7 +23,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -39,6 +38,7 @@ import com.ufi_axis.ui.components.UnifiedUpdateDialog
 import com.ufi_axis.ui.components.common.ToastMessage
 import com.ufi_axis.ui.components.common.ToastType
 import com.ufi_axis.ui.components.common.UfiAlertToastBridge
+import com.ufi_axis.ui.components.common.UfiOwnerPasswordDialog
 import com.ufi_axis.ui.components.common.UfiPairingApprovalDialog
 import com.ufi_axis.ui.components.common.UfiErrorBanner
 import com.ufi_axis.ui.components.common.UfiToastHost
@@ -57,6 +57,7 @@ import com.ufi_axis.ui.components.common.UfiDialogPasswordField
 import com.ufi_axis.ui.components.common.UfiScrollableDialog
 import com.ufi_axis.ui.components.common.LocalUfiDialogClose
 import com.ufi_axis.ui.navigation.Routes
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 import com.ufi_axis.ui.animation.page.LocalUfiReduceMotion
 import com.ufi_axis.ui.animation.page.registerBuiltInTransitions
 import com.ufi_axis.ui.navigation.MainNavGraph
@@ -66,14 +67,17 @@ import com.ufi_axis.ui.media.UfiAudioNowPlayingProbe
 import com.ufi_axis.ui.screens.SetupScreen
 import com.ufi_axis.ui.screens.UfiHeaderCaptionProbe
 import com.ufi_axis.ui.theme.LocalResolvedPalette
+import com.ufi_axis.ui.theme.applySystemBarAppearance
+import com.ufi_axis.ui.theme.resolveBootDarkTheme
+import com.ufi_axis.ui.theme.resolveDarkTheme
 import com.ufi_axis.ui.theme.ThemeManager
-import com.ufi_axis.ui.theme.ThemeMode
 import com.ufi_axis.ui.theme.UFIAXISTheme
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.util.DebugLog
 import com.ufi_axis_core.util.UiLogBridge
 import com.ufi_axis.util.NetworkMonitor
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.viewmodel.module.WriteNoticeType
 import com.ufi_axis.viewmodel.module.isForegroundDataFresh
 
 /**
@@ -110,7 +114,7 @@ class MainActivity : ComponentActivity() {
         // 且 `nightMode = MODE_NIGHT_YES` ⇒ `isNavigationBarContrastEnforced` 在
         // `EdgeToEdgeApi29`（`:293-294`）里直接算出 false，不必再靠下面那行补救
         //（那行保留，作为「将来换库版本、默认值又变回 auto」的双保险）。
-        // appearance（图标明暗）由下方 setContent 里那个 LaunchedEffect 按**应用内** isDark 覆盖。
+        // appearance（图标明暗）由下方冷启动同步 + setContent 里的 SideEffect 按**应用内** isDark 覆盖。
         //
         // ⚠ 复盘：这一处**不是**真机上那条「底部白带」的因（换成透明后白带照旧）。
         //   真因是底栏那个 Dialog 窗口缺 `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS`，
@@ -142,6 +146,11 @@ class MainActivity : ComponentActivity() {
         // 在此把 sink 指向它，UI 层的日志才能进「关于设备 → 调试日志」的「手机 APP」页签。
         // 用 w 而非 i：i 受「详细日志」开关约束，w 无条件记录，用户不必先开开关。
         UiLogBridge.sink = { tag, msg -> DebugLog.w(tag, msg) }
+
+        // 冷启动首帧：enableEdgeToEdge(SystemBarStyle.dark(...)) 的初始 appearance 是
+        // “深底浅图标”，浅色主题下会先闪一帧白图标。这里在 setContent 之前按持久化的
+        // ThemeMode 同步一次；之后由 Compose 里的 SideEffect 跟随运行期变化。
+        applySystemBarAppearance(resolveBootDarkTheme(this))
 
         setContent {
             val themeManager = remember { ThemeManager(applicationContext) }
@@ -176,11 +185,7 @@ class MainActivity : ComponentActivity() {
 
             // 外观模式 → 是否深色（AUTO 跟随系统）
             val systemDark = isSystemInDarkTheme()
-            val isDark = when (themeMode) {
-                ThemeMode.AUTO -> systemDark
-                ThemeMode.LIGHT -> false
-                ThemeMode.DARK -> true
-            }
+            val isDark = resolveDarkTheme(themeMode, systemDark)
 
             // `getCurrentPalette()` 是**非 Composable** 的 `.value` 直读，它自己不会因为 flow
             // 变化而重算，所以 remember 的 key 必须**覆盖它读的全部输入**。
@@ -207,15 +212,10 @@ class MainActivity : ComponentActivity() {
             // 而 `isDark` 已经足够：页面底色的明暗本来就由它决定。
             // 底栏所在的 Dialog 窗口是另一个窗口、有自己的 appearance，判据更精细
             //（按栏底色的实际亮度），见 `UfiCapsuleBlurHost` 的 `CapsuleWindowMetrics.lightNavHandleSurface`。
-            val lightSystemBarIcons = !isDark
-            LaunchedEffect(lightSystemBarIcons) {
-                val controller = WindowInsetsControllerCompat(window, window.decorView)
-                if (controller.isAppearanceLightNavigationBars != lightSystemBarIcons) {
-                    controller.isAppearanceLightNavigationBars = lightSystemBarIcons
-                }
-                if (controller.isAppearanceLightStatusBars != lightSystemBarIcons) {
-                    controller.isAppearanceLightStatusBars = lightSystemBarIcons
-                }
+            // 用 SideEffect 而不是 LaunchedEffect：冷启动首帧已在 onCreate 里同步，
+            // 这里只需保证主题切换与当前帧同帧落到两条系统栏（helper 内部会跳过未变化的值）。
+            SideEffect {
+                applySystemBarAppearance(isDark)
             }
 
             UFIAXISTheme(palette = palette, darkTheme = isDark, uiScalePercent = uiScalePercent) {
@@ -367,15 +367,31 @@ class MainActivity : ComponentActivity() {
                     // 这里只把"实时通道断了"告诉用户。
                     DisposableEffect(wsRepo) {
                         wsRepo.onAuthRejected = {
+                            // 只提示是不够的：如果配对真的被别的设备删掉了，用户会被永远留在这个
+                            // 已死的界面上（数据走 WS，HTTP 444 的阈值攒不到 —— 2026-11-14 实测）。
+                            // 这里发一串**带鉴权的探测**，让唯一那份阈值继续做判定：
+                            // 时钟没校准 → HTTP 自愈、探测 200、什么都不会发生；
+                            // 真被删配对 → 连续 444 → 清凭据回配对页。
+                            viewModel.verifyCredentialsAfterWsRejection()
                             runOnUiThread {
                                 toastMessage = ToastMessage(
-                                    "实时通道连接被拒，实时数据暂时中断（不影响配对）",
+                                    "实时通道连接被拒，正在核对登录状态…",
                                     ToastType.WARNING
                                 )
                             }
                         }
                         onDispose { wsRepo.onAuthRejected = null }
                     }
+
+                    // 实时通道断了、且 8 秒内没自己恢复 → 主动核对一次登录状态。
+                    //
+                    // 这条兜住的是"被别的设备删掉配对"：WS 被服务端断开后，App 只会显示
+                    // 「实时连接已断开，数据可能过期」，而它几乎所有数据都走 WS、几乎不发 HTTP，
+                    // 于是 444 的清凭据阈值（3 次 / ≥10s）永远攒不到，人就被留在这个死界面上。
+                    //
+                    // 探测是普通 HTTP：core 只是重启/断网 → 传输层失败（不清凭据，等它回来）；
+                    // core 好好的但我们已经不在配对表里 → 连续 444 → 清凭据回配对页。
+                    // 周期探测由 MainViewModel 的 `startCredentialWatchdog()` 负责（不依赖组合生命周期）。
                     // F12：绑定网络恢复监听 + App 回到前台主动重连（网络/前台恢复）
                     // 2026-09：同时接健康检查前后台闸门 —— 后台停周期 /health，回前台静默探一次再恢复。
                     DisposableEffect(wsRepo, viewModel) {
@@ -591,6 +607,26 @@ class MainActivity : ComponentActivity() {
                         UfiAlertToastBridge(
                             onAck = { item -> viewModel.dashboard.ackAlertByBanner(item.type) }
                         )
+
+                        // ── 主人密码（破坏性操作保护）：**全局**弹窗 ──
+                        //
+                        // core 的 OwnerGate 开关打开后，不可逆操作（恢复出厂 / 恢复备份 / root shell /
+                        // 自定义 shell 任务 / 删全部日志 / 移除配对设备 / 解封黑名单）会先回
+                        // 401 MISSING_PASSWORD。`OwnerPasswordGate` 把这次询问桥过来，而 OkHttp 的
+                        // 拦截器此刻正阻塞在网络线程上等一个答复 —— 所以这个弹窗必须挂在根部：
+                        // 用户在哪个页面撞上它，就得在哪里能答。
+                        //
+                        // 开关默认关，关着时这段永远不会渲染。
+                        val ownerPrompt by com.ufi_axis.data.api.OwnerPasswordGate.prompt.collectAsState()
+                        ownerPrompt?.let { prompt ->
+                            UfiOwnerPasswordDialog(
+                                hint = prompt.hint,
+                                onConfirm = { password, remember ->
+                                    com.ufi_axis.data.api.OwnerPasswordGate.submit(password, remember)
+                                },
+                                onCancel = { com.ufi_axis.data.api.OwnerPasswordGate.submit(null) }
+                            )
+                        }
 
                         // ── 新设备批准（2026-10-15）：**全局**弹窗 ──
                         //
@@ -820,7 +856,17 @@ class MainActivity : ComponentActivity() {
                             viewModel.dismissWriteNotice()
                             toastMessage = ToastMessage(
                                 text = notice.message,
-                                type = ToastType.SUCCESS,
+                                // 提示的语义由事件决定，不再一律 SUCCESS：
+                                // 「未保存：需要配对密码」是门按设计工作，配绿色对勾会自相矛盾。
+                                type = notice.type.toToastType(),
+                                // 两行的警示/错误给更长时间，否则副标题还没读完就淡出了。
+                                durationMs = if (notice.type == WriteNoticeType.WARNING ||
+                                    notice.type == WriteNoticeType.ERROR
+                                ) {
+                                    4_500L
+                                } else {
+                                    3_000L
+                                },
                                 subtitle = notice.subtitle
                             )
                         }
@@ -855,7 +901,7 @@ class MainActivity : ComponentActivity() {
                             // 去别的页面前必须先让这一页让开，否则它会把目标页整个盖住
                             onOpenServerConfig = {
                                 viewModel.skipConnectionNotice()
-                                navController.navigate(Routes.DETAIL_SERVER_CONFIG)
+                                navController.ufiNavigateOnce(Routes.DETAIL_SERVER_CONFIG)
                             },
                             onSetup = {
                                 viewModel.skipConnectionNotice()
@@ -907,3 +953,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
+
+/** 写操作提示的语义类型 → Toast 形态。两层各自独立（viewmodel 不依赖 ui），这里做唯一的映射点。 */
+private fun WriteNoticeType.toToastType(): ToastType = when (this) {
+    WriteNoticeType.SUCCESS -> ToastType.SUCCESS
+    WriteNoticeType.INFO -> ToastType.INFO
+    WriteNoticeType.WARNING -> ToastType.WARNING
+    WriteNoticeType.ERROR -> ToastType.ERROR
+}
+

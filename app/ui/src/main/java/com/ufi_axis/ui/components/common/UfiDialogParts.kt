@@ -225,14 +225,17 @@ fun UfiDialogChipSelector(
     options: List<Pair<String, String>>,
     selectedValue: String,
     onSelect: (String) -> Unit,
-    wrap: Boolean = false
+    wrap: Boolean = false,
+    /** 个别选项置灰（例如「含凭据的程序不能选外部存储」）。 */
+    disabledValues: Set<String> = emptySet()
 ) {
     UfiDialogField(label) {
         UfiSingleChipSelector(
             options = options,
             selectedValue = selectedValue,
             onSelect = onSelect,
-            wrap = wrap
+            wrap = wrap,
+            disabledValues = disabledValues
         )
     }
 }

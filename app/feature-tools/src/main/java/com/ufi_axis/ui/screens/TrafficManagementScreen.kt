@@ -31,6 +31,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
 import com.ufi_axis_core.contract.Capability
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 // 2026-09-05：私有 `Color.shade` 已删除 —— 与 HomeConnectionCard / NetworkScreen 是逐字节
 // 相同的三份拷贝（MonitorOverview 还有一份 Oklab lerp 版，像素并不相同）。现统一走主题层
@@ -368,7 +369,7 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                         description = "日报 / 周报 / 月报：区间合计与逐日用量",
                         value = "查看",
                         icon = Icons.Default.CalendarMonth,
-                        onClick = { navController.navigate(Routes.DETAIL_TRAFFIC_REPORT) }
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TRAFFIC_REPORT) }
                     )
 
                     UfiDivider(modifier = Modifier.padding(vertical = 2.dp))
@@ -447,9 +448,8 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
     // ── 套餐模式弹窗（2026-10-07 到量/到期融合）────────────────────────
     // monthly=现状（总量+清零日走设备）；fixed=累计有效期包（生效日+天数走 core，
     // 保存时强制 autoClear=false 并立即 saveDataLimit 固化——固件月清会打断累计口径）。
-    if (showPlanDialog) {
         UfiCustomDialog(
-            visible = true,
+            visible = showPlanDialog,
             onDismiss = { showPlanDialog = false },
             title = "套餐模式",
             icon = rememberVectorPainter(Icons.Filled.Event),
@@ -518,11 +518,9 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 }
             }
         }
-    }
 
-    if (showCalibrateDialog) {
         UfiCustomDialog(
-            visible = true,
+            visible = showCalibrateDialog,
             onDismiss = { showCalibrateDialog = false },
             title = "流量校准",
             icon = rememberVectorPainter(Icons.Filled.Tune),
@@ -578,7 +576,6 @@ fun TrafficManagementScreen(viewModel: MainViewModel, navController: NavHostCont
                 }
             }
         }
-    }
 }
 
 /**

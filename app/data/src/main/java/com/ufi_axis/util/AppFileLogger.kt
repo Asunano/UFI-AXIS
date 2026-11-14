@@ -26,8 +26,11 @@ import java.util.Locale
  * [ApiErrorLogger] 各自维护，所以下面所有列举/清理都只认 `yyyy-MM-dd` 形态的日期目录 ——
  * 别让运行日志的保留天数和体积预算把崩溃证据一起删了。
  * 超过 [MAX_FILE_BYTES] 轮转成 `*.log.1`（只留一代），整个 app 日志根目录不超过
- * [MAX_DIR_BYTES]，并且只保留最近 [KEEP_DAYS] 天 —— 这三道闸门是为了避免重演
- * core 那次「几天涨到 500MB」。
+ * [MAX_DIR_BYTES]（这两道容量闸门是手机存储保护）。
+ *
+ * **不再按天删除**（2026-10-30，与 core 同口径）：用户明确要求「取消日上限、按日保存」——
+ * 日期目录只负责把不同天的日志分开，不负责过期删除。占用由日志页的
+ * [usage] 摘要 + core 的低磁盘保护（剩余 < 256MB 停写）共同兜底。
  *
  * **与 core 完全隔离**：[deleteAll] 只删手机上的 app 日志，core 的日志文件由
  * `DELETE /api/debug-logs/files` 单独删，互不牵连。
@@ -42,7 +45,6 @@ object AppFileLogger {
 
     private const val MAX_FILE_BYTES = 5L * 1024 * 1024
     private const val MAX_DIR_BYTES = 40L * 1024 * 1024
-    private const val KEEP_DAYS = 7
 
     /** 合法相对路径（`2026-08-28/net.log` / `2026-08-28/error.log.1`），防目录穿越。 */
     private val LOG_FILE_NAME = Regex("""^\d{4}-\d{2}-\d{2}/(runtime|net|error)\.log(\.1)?$""")
@@ -83,7 +85,9 @@ object AppFileLogger {
      * 一条日志只写一个文件，不做镜像 —— 镜像等于体积翻倍，而错误在筛选里本来就能挑出来。
      */
     fun append(entry: LogEntry) {
-        if (!DebugLog.active) return
+        // 2026-10-30 F1：与 DebugLog.emit 共用同一判据（WARN/ERROR 只受 app 子开关约束），
+        // 再叠加详细开关 —— 否则会出现“App 缓冲里有 WARN、文件里没有”。
+        if (!DebugLog.shouldEmit(entry.level, DebugLog.masterEnabled, DebugLog.appEnabled)) return
         if (entry.level < LogLevel.WARN && !DebugLog.enabled) return
         val base = root ?: return
         val fileName = when {
@@ -151,6 +155,59 @@ object AppFileLogger {
 
     fun totalBytes(): Long = allFiles().sumOf { it.length() }
 
+    /**
+     * 占用摘要（2026-10-30）：总量 / 今日 / 跨度 / 剩余空间。
+     *
+     * 与 core 的 `AppLogger.usageSummary()` 同一组字段，UI 两侧可以用同一段文案。
+     * 只在打开日志文件弹窗时调用，不缓存。
+     */
+    fun usage(): LogUsage {
+        val files = allFiles()
+        val today = dateFormat.format(Date())
+        return LogUsage(
+            totalBytes = files.sumOf { it.length() },
+            todayBytes = files.filter { it.parentFile?.name == today }.sumOf { it.length() },
+            days = files.mapNotNull { it.parentFile?.name }.distinct().size,
+            freeBytes = root?.let { runCatching { it.usableSpace }.getOrNull() } ?: -1L,
+        )
+    }
+
+    /**
+     * 打包用：读取全部运行时日志文件（2026-10-30 M2）。
+     *
+     * 每个文件最多 [perFileMaxBytes]（默认 2MB）尾部，总量最多 [totalMaxBytes]（默认 32MB）——
+     * ZIP 要一次性写进用户选的位置，不能把几百 MB 全塞内存。
+     *
+     * @return (文件列表, 被跳过的数量)。跳过原因：读失败 / 单文件或总量超限。
+     */
+    fun collectForBundle(
+        perFileMaxBytes: Int = 2 * 1024 * 1024,
+        totalMaxBytes: Long = 32L * 1024 * 1024,
+    ): Pair<List<Pair<String, ByteArray>>, Int> {
+        var total = 0L
+        var skipped = 0
+        val collected = mutableListOf<Pair<String, ByteArray>>()
+        for (info in listFiles()) {
+            if (total >= totalMaxBytes) {
+                skipped += 1
+                continue
+            }
+            val text = readTail(info.name, perFileMaxBytes)
+            if (text == null) {
+                skipped += 1
+                continue
+            }
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            if (total + bytes.size > totalMaxBytes) {
+                skipped += 1
+                continue
+            }
+            total += bytes.size
+            collected += info.name to bytes
+        }
+        return collected to skipped
+    }
+
     /** 读某个文件的尾部（默认 256KB）；名字非法或文件不存在返回 null。 */
     fun readTail(name: String, maxBytes: Int = 256 * 1024): String? {
         val base = root ?: return null
@@ -192,20 +249,14 @@ object AppFileLogger {
         }
     }
 
-    /** 按日期目录清理过期日志（保留最近 [KEEP_DAYS] 天），再校一次总量预算。 */
+    /**
+     * 日期切换时的维护（2026-10-30 起**不再按天删除**）。
+     *
+     * 保留这个入口只是为了跑一次容量预算：目录超过 [MAX_DIR_BYTES] 时按修改时间删最旧的，
+     * 这是手机存储保护，不是保留策略。用户明确要求「日志按日保存、不设日上限」。
+     */
     private fun cleanOldLogs() {
-        val base = root ?: return
-        val cutoff = System.currentTimeMillis() - KEEP_DAYS * 24L * 60 * 60 * 1000
-        base.listFiles()?.forEach { day ->
-            // 只清日期目录：同级的 crash/ 与 api-error/ 各有各的保留策略，不归这里管
-            if (!day.isDirectory || !UfiLogPaths.isDateDirName(day.name)) return@forEach
-            val date = runCatching { dateFormat.parse(day.name) }.getOrNull() ?: return@forEach
-
-            if (date.time < cutoff) {
-                day.listFiles()?.forEach { it.delete() }
-                day.delete()
-            }
-        }
+        if (root == null) return
         enforceTotalBudget()
     }
 
@@ -224,6 +275,15 @@ object AppFileLogger {
         }
     }
 }
+
+/** app 侧日志占用摘要（2026-10-30，与 core `usageSummary()` 字段对齐）。 */
+data class LogUsage(
+    val totalBytes: Long = 0,
+    val todayBytes: Long = 0,
+    val days: Int = 0,
+    /** 日志目录所在卷剩余字节；-1 = 读不到。 */
+    val freeBytes: Long = -1,
+)
 
 /** 日志文件条目（app 侧本地文件，与 core 的 `DebugLogFileItem` 同构）。 */
 data class LogFileInfo(

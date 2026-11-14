@@ -31,11 +31,11 @@ interface UfiAxisApi {
     suspend fun getDeviceVersion(): DeviceVersionResponse
 
     /**
-     * EPS 承载 QoS（QCI / 上下行 AMBR，2026-09-22）。
+     * EPS 承载 QoS（QCI / 上下行 AMBR）。
      *
-     * core 侧走 `AT+CGEQOSRDP`，5 分钟缓存。**不要放进仪表盘的 10s 轮询** ——
-     * AT 通道全局互斥，抢锁超时会把整张仪表盘一起拖住。进页面静默拉一次就够
-     * （`DashboardModule.loadDeviceQosSilently`，与固件版本同一手法）。
+     * core 侧走 `AT+CGEQOSRDP`，5 分钟缓存。**不得放入仪表盘的 10s 轮询** ——
+     * AT 通道全局互斥，抢锁超时会把整张仪表盘一起拖住。进入页面时静默拉取一次即可
+     * （`DashboardModule.loadDeviceQosSilently`，与固件版本相同的方式）。
      *
      * AT 不可用时仍回 200 + `available = false`，不抛异常。
      */
@@ -69,7 +69,7 @@ interface UfiAxisApi {
 
     /**
      * Core 进程首次启动时间（绝对 epoch ms，UTC）。用于监控页"自定义时间范围"对话框 minDateMs 下限。
-     * 2026-08-08 12:09 新增：返回 Long 不需要额外 model（retrofit 自动解析 JSON 数字）。
+     * 返回 Long 不需要额外 model（retrofit 自动解析 JSON 数字）。
      */
     @GET("api/system/startup-time")
     suspend fun getStartupTime(): Long
@@ -100,7 +100,7 @@ interface UfiAxisApi {
     ): TrafficUsageResponse
 
     /**
-     * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`，2026-10-06 拍板第4项）。
+     * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`）。
      *
      * 与 [getTrafficUsage] 的分工：那个回**给图表用的分桶序列**（桶粒度随 range 变、可左右翻页），
      * 本端点回**按自然日聚合的报表**（日报 1 行 / 周报 7 行 / 月报 28~31 行）+ core 生成的一句话摘要。
@@ -108,24 +108,24 @@ interface UfiAxisApi {
      *
      * 三处契约要点：
      * - [period] 只认 `day` / `week` / `month`，**其它值 core 回 400**（不是像 `/usage` 那样
-     *   静默回落到 day）—— 所以调用方必须把 400 与网络错误分开处理，别把参数写错报成"设备离线"。
+     *   静默回落到 day）—— 所以调用方必须把 400 与网络错误分开处理，避免把参数错误报成"设备离线"。
      * - 区间按**自然日**出桶，`range_end` 排他，因此 `period=day` 永远只有一行、且"今天"是残缺的一天。
      * - 空桶照样返回（没记录的那天是三个 0），客户端不需要"补空行"。
      */
     @GET("api/traffic/report")
     suspend fun getTrafficReport(@Query("period") period: String = "week"): TrafficReportResponse
 
-    // ========== Media Center（媒体中心，2026-09-16）==========
+    // ========== Media Center（媒体中心）==========
     //
     // core 侧查系统媒体库（MediaStore）。**播放 / 查看仍走 `/api/files/stream?path=`**，
     // 这里不出现第二条取字节流的路径；缩略图是唯一的例外（它是 core 生成的 JPEG，不是原文件）。
 
-    /** 三类媒体各自的授权状态 + 当前扫描目录。某类未授权时界面要显示引导，不许显示空列表。 */
+    /** 三类媒体各自的授权状态 + 当前扫描目录。某类未授权时界面必须显示引导，不得显示空列表。 */
     @GET("api/media/status")
     suspend fun getMediaStatus(): MediaStatusResponse
 
     /**
-     * 2026-10-05 G5：视频元信息（ffmpeg 探测，core 永久缓存）。
+     * 视频元信息（ffmpeg 探测，core 永久缓存）。
      * MediaStore 列在本机经常缺 duration/width/height，此端点给真值。
      * 404 = 无法解析（损坏/不支持容器）。
      */
@@ -142,11 +142,11 @@ interface UfiAxisApi {
      * @param artist 只列这个歌手（**仅音频**）
      * @param dir 只列这个目录（**仅音频**，目录绝对路径）
      *
-     * 后三个是 2026-09-20 为音频分组回查加的，与 core 侧的扫描目录过滤是 **AND** 关系
+     * 后三个用于音频分组回查，与 core 侧的扫描目录过滤是 **AND** 关系
      * （超出扫描范围的专辑筛不出东西是预期行为）。传空串等于没传 —— core 按"参数缺失"处理，
      * 会回整库，所以分组里 key 为空串的那一组不能走这条路回查。
      *
-     * ## 后三个必须传**已编码**的值（`encoded = true`，2026-09-21 修"专辑里没有歌"）
+     * ## 后三个必须传**已编码**的值（`encoded = true`）
      * Retrofit 默认会帮忙编码，但它底层的 OkHttp 在 query 里**不编码 `+`** ——
      * 而 Ktor 解 query 时按 form 语义把 `+` 当空格。于是专辑名 `万岁2001 新曲+精选`
      * 传到 core 变成 `万岁2001 新曲 精选`，一条曲目都匹配不上。
@@ -200,7 +200,7 @@ interface UfiAxisApi {
     /**
      * 写某一类的扫描目录。空数组 = 这一类不限目录（列整个媒体库里的该类型）。
      *
-     * 按类型分开存（2026-09-16 媒体中心拆成三页）：视频页只改视频那一份，
+     * 按类型分开存（媒体中心分为三个页面）：视频页只改视频那一份，
      * 所以三页各有可写入口也不会互相覆盖。
      */
     @PUT("api/media/config")
@@ -209,7 +209,7 @@ interface UfiAxisApi {
         @Body body: MediaDirsRequest
     ): MediaConfigResponse
 
-    // ── DLNA MediaServer（/api/dlna，2026-10-09） ──
+    // ── DLNA MediaServer（/api/dlna） ──
 
     @GET("api/dlna/status")
     suspend fun getDlnaStatus(): DlnaStatusResponse
@@ -266,13 +266,13 @@ interface UfiAxisApi {
      *  3. **设备上客户端回传的成果**（core 的 `filesDir/thumbs/`）← 本条清的是这层。
      *
      * `/thumbnail` 是"缓存命中就直接返回"，而 URL 只含 (type, id) 不含内容指纹。
-     * 于是一张算错的图（典型：抽到黑场）会一直被原样发下去 ——
-     * 只清前两层的话，再次请求又被设备上的旧图命中，表现就是"怎么清都还是那张黑图"。
+     * 于是一张算错的图（典型：抽到黑场）会一直被原样返回 ——
+     * 只清前两层时，再次请求仍会命中设备上的旧图，表现为缓存无法清除。
      *
      * [type] 省略清全部；给了只清那一类（换抽帧策略时通常只需重算 video）。
      */
     /**
-     * 2026-10-07：手动重抽封面用 —— 拿 Response 以便读取 X-Thumb-Source 头与 404 reason
+     * 手动重抽封面用 —— 拿 Response 以便读取 X-Thumb-Source 头与 404 reason
      * （普通 ResponseBody 变体拿不到这两样）。
      */
     @GET("api/media/thumbnail")
@@ -282,38 +282,70 @@ interface UfiAxisApi {
         @Query("size") size: Int = 256
     ): Response<okhttp3.ResponseBody>
 
-    /** 2026-10-07：手动跑一轮封面预热（需先开 thumb_prewarm_enabled；进度走 WS 广播）。 */
+    /** 手动执行一轮封面预热（需先开启 thumb_prewarm_enabled；进度经 WS 广播）。 */
     @POST("api/media/thumbnail-prewarm")
     suspend fun runThumbnailPrewarm(): JsonElement
 
     /**
-     * 2026-10-07：封面预热状态快照（core 落盘，随时可查——解决"退出页面重进看不到状态"）。
+     * 封面预热状态快照（core 落盘，可随时查询，重新进入页面后仍可读取）。
      * snapshot=false = core 从未跑过预热；其余字段 done/total/failed/running/current_name/
      * started_at/updated_at。
      */
     @GET("api/media/thumbnail-prewarm")
     suspend fun getThumbnailPrewarmState(): JsonElement
 
-    /** 2026-10-07：真 PTY 终端状态（enabled=开关、running=ttyd 进程）。 */
+    /** 真 PTY 终端状态（enabled=开关、running=ttyd 进程）。 */
     @GET("api/terminal/status")
     suspend fun ttydStatus(): JsonElement
 
-    /** 2026-10-07：停掉设备后台常驻的 ttyd 进程（开关保持）。 */
+    /** 停掉设备后台常驻的 ttyd 进程（开关保持）。 */
     @POST("api/terminal/stop")
     suspend fun ttydStop(): JsonElement
 
     /**
-     * 2026-10-10：签发真 PTY 票据（app 端原生终端用）。
+     * 签发真 PTY 票据（app 端原生终端用）。
      * 返回 `{"ticket": "...", "session_id": "...", "port": 17682}`。
      * 403 = `ttyd_enabled` 开关未开（与 core 侧同一防御模型）。
      */
     @POST("api/terminal/pty-ticket")
     suspend fun ptyTicket(): JsonElement
 
+    // ========== 远程屏幕 ==========
+
+    /**
+     * 投屏开关 / 会话状态。
+     *
+     * 返回 `{enabled, active, scrcpy_version, downstream_bytes, upstream_bytes, pid}`。
+     * 与 `/api/terminal/status` 同形：**enabled 才是安全闸**，`active` 只表示当前有没有人在看。
+     */
+    @GET("api/screen/status")
+    suspend fun screenStatus(): JsonElement
+
+    /**
+     * 签发投屏票据（WS 握手用）。
+     *
+     * 返回 `{ticket, ws_path, expires_in, scrcpy_version, size_source, max_size, max_fps, bit_rate}`。
+     * 403 = `screen_enabled` 未开；票据 TTL 60s 且**一次性**，刷新/重连都要重新换一张。
+     */
+    @POST("api/screen/session")
+    suspend fun screenSession(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
+
+    /**
+     * 设备原生像素截图（PNG 原样透传）。
+     *
+     * **响应体是图片二进制**，不是 JSON —— 与 [getWifiQrCode] 同一形态，所以返回
+     * [ResponseBody] 让调用方自己 decode。core 侧只认 PNG 魔数、拿不到就回 503，
+     * 因此正常不会出现"200 但内容是 HTML"；真出现了说明路由又丢了（SPA 兜底）。
+     */
+    @Streaming
+    @GET("api/screen/screenshot")
+    suspend fun screenScreenshot(): ResponseBody
+
+
     @DELETE("api/media/thumbnail-cache")
     suspend fun clearMediaThumbnailCache(
         @Query("type") type: String? = null,
-        // 2026-10-07：可选 id —— 传了只清那一条（「重新获取封面」菜单项用）
+        // 可选 id —— 传了只清那一条（「重新获取封面」菜单项用）
         @Query("id") id: Long? = null
     ): JsonElement
 
@@ -327,7 +359,7 @@ interface UfiAxisApi {
     @GET("api/media/tags")
     suspend fun getMediaTags(@Query("id") id: Long): MediaTagsResponse
 
-    // ========== 音频歌单（2026-09-21）==========
+    // ========== 音频歌单 ==========
     //
     // 歌单存在 core，app 与 web 看同一份。曲目以**真实路径**为标识（MediaStore id 重扫会变，
     // 拿它存歌单等于存一个会失效的引用），所以写操作传的都是 paths。
@@ -340,7 +372,7 @@ interface UfiAxisApi {
      * 某个歌单的曲目。
      *
      * 回的 item 与 [getMediaList] 的完全同构（多一个 `missing`），所以曲目列表组件可以直接复用。
-     * **顺序就是播放顺序** —— 不要再按音乐页的排序偏好重排；已失效的条目照样在列表里
+     * **顺序就是播放顺序** —— 不得再按音乐页的排序偏好重排；已失效的条目照样在列表里
      * （`missing = true`，`id = 0`），画占位而不是隐藏。
      */
     @GET("api/playlists/{id}/items")
@@ -399,17 +431,17 @@ interface UfiAxisApi {
         @Body body: PlaylistPathsRequest
     ): JsonElement
 
-    // ========== 从音乐库移除 / 删除文件（2026-09-23）==========
+    // ========== 从音乐库移除 / 删除文件 ==========
     //
-    // 两件事刻意分成两个接口，**不要**合成一个带 mode 参数的：
-    // 一个可撤销（只改名单）、一个不可逆（删磁盘上的字节）。合在一起迟早有客户端传错那个参数。
+    // 两件事刻意分成两个接口，**不得**合成一个带 mode 参数的：
+    // 一个可撤销（只改名单）、一个不可逆（删磁盘上的字节）。合并后客户端可能传错该参数。
 
     /**
      * 当前「从音乐库移除」的路径名单。
      *
      * 给管理页用 —— 没有这个页面就不该放开排除功能，误操作无法恢复。
      * 响应里的 `max` / `full` 是硬上限（名单会变成 SQL 的 `NOT IN (?,…)`，绑定变量有限），
-     * 客户端据此提前提示，而不是让用户点了才发现没生效。
+     * 客户端据此提前提示，避免操作后才发现未生效。
      */
     @GET("api/media/excluded")
     suspend fun getExcludedMedia(): MediaExcludedResponse
@@ -427,11 +459,11 @@ interface UfiAxisApi {
     // `POST /api/files/delete` 只有一条，不为音乐库再开一个同路径的重载：那样两处签名迟早分叉。
     // 没有「所有文件访问权限」时 core 回 403 + `needsAllFilesAccess`，调用方按状态码引导授权。
 
-    // ========== Weather（2026-09-17，core 代理 Open-Meteo）==========
+    // ========== Weather（core 代理 Open-Meteo）==========
 
     /**
      * 当前天气。默认用设备上保存的坐标；[lat]/[lon] 只在「设置页里选了城市、想先看一眼」
-     * 时传（保存前的预览），正常显示不要传。
+     * 时传（保存前的预览），正常显示不得传。
      */
     @GET("api/weather")
     suspend fun getWeatherNow(
@@ -454,7 +486,7 @@ interface UfiAxisApi {
     @PUT("api/weather/config")
     suspend fun updateWeatherConfig(@Body body: WeatherConfigRequest): WeatherConfigUpdateResponse
 
-    // ========== 今日诗词（2026-09-18，core 代理 jinrishici v2）==========
+    // ========== 今日诗词（core 代理 jinrishici v2）==========
 
     /**
      * 当前推荐的一句诗。标签匹配由上游按设备 IP 自动完成（季节/天气/时辰/地理），
@@ -473,14 +505,14 @@ interface UfiAxisApi {
     @PUT("api/poetry/config")
     suspend fun updatePoetryConfig(@Body body: PoetryConfigRequest): PoetryConfigUpdateResponse
 
-    // ========== 出网国家/地区（2026-09-18，检测在 core）==========
+    // ========== 出网国家/地区（检测在 core）==========
 
     /**
-     * 设备的出网国家/地区。**app 不再自己做地理检测** —— 判据是出网 IP 的归属，
+     * 设备的出网国家/地区。**app 不做地理检测** —— 判据是出网 IP 的归属，
      * 而设备才是出网点；每端各测一次只会得到几份可能不一致的结果。
      *
      * core 在自己启动时已经测过一次并落盘，这里通常是直接读那份结果（`source=cache`）；
-     * 结果缺失或超过 7 天时 core 会顺手重测（`source=fresh`），故本调用偶尔会慢几秒。
+     * 结果缺失或超过 7 天时 core 会重新检测（`source=fresh`），故本调用偶尔会慢几秒。
      */
     @GET("api/geo")
     suspend fun getGeo(): GeoResponse
@@ -537,12 +569,12 @@ interface UfiAxisApi {
     suspend fun shellExec(@Body body: ShellExecRequest): ShellExecResponse
 
     /**
-     * 读一个系统属性（`GET /api/shell/prop/{key}`，2026-10-14 接入）。
+     * 读一个系统属性（`GET /api/shell/prop/{key}`）。
      *
-     * **这是读只读系统属性的唯一入口**，不要用 [shellExec] 拼 `getprop <key>`：
+     * **这是读取只读系统属性的唯一入口**，不得用 [shellExec] 拼 `getprop <key>`：
      * 本端点的 key 由 core 用白名单（只许 `[a-zA-Z0-9._]`）校验、非法回 400，
      * 而 exec 是把整条命令交给 shell、校验责任在调用方；且 exec 会在设备端的终端历史里
-     * 记一笔，读属性不该污染用户的历史。理由与形状见 [ShellPropResponse]。
+     * 落一条记录，读属性不应污染该历史。理由与形状见 [ShellPropResponse]。
      *
      * @param key 只许 `[a-zA-Z0-9._]`（如 `ro.product.model`）；含其它字符时 core 回 400。
      */
@@ -550,7 +582,7 @@ interface UfiAxisApi {
     suspend fun getShellProp(@Path("key") key: String): ShellPropResponse
 
     // ========== 终端命令历史（core 存，app / web 共享） ==========
-    /** @param channel `shell` / `at`，不传则两个通道混排 */
+    /** @param channel `shell` / `at`，不传则两个通道混排。 */
     @GET("api/console/history")
     suspend fun getConsoleHistory(
         @Query("channel") channel: String? = null,
@@ -590,12 +622,12 @@ interface UfiAxisApi {
 
     /**
      * 告警列表。core 把 `limit` 钳制在 1..200（[com.ufi_axis_core.contract.Alerts.ListQuery]），
-     * 传更大的值不会报错但只返回 200 条 —— 要取全量必须用 `cursor` 逐页拉（T12）。
+     * 传更大的值不会报错但只返回 200 条 —— 要取全量必须用 `cursor` 逐页拉取。
      *
      * `cursor` 是响应里的 `nextCursor`（base64 的 `ts.id`），向更早的记录翻页；
      * `level`/`type`/`unread` 为服务端过滤，响应的 `counts` 与过滤条件一致。
      */
-    /** 按天的事件计数（2026-10-23）：月历热力用，返回 `{days:{yyyy-MM-dd:count}, total}`。 */
+    /** 按天的事件计数：月历热力用，返回 `{days:{yyyy-MM-dd:count}, total}`。 */
     @GET("api/alerts/daily_counts")
     suspend fun getAlertDailyCounts(
         @Query("start") start: Long,
@@ -650,10 +682,10 @@ interface UfiAxisApi {
     /**
      * WiFi 频段切换（`POST /api/wifi/band`，body `{ "chip": "chip1" | "chip2" }`）。
      *
-     * **和 `/config` 是两条路**：频段不能塞进 `setWifiConfig` 的 `chip_index` —— 那一项落到
-     * 设备的 `setAccessPointInfo → ChipIndex`，**设备不认**（用户实测「改了没反应」）。
-     * 真正换频段的设备命令是 `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`
-     * （2026-09-22 真机抓包，chip1 = 2.4G、chip2 = 5G），core 把它包成本端点。
+     * **与 `/config` 是两条路径**：频段不能塞进 `setWifiConfig` 的 `chip_index` —— 那一项落到
+     * 设备的 `setAccessPointInfo → ChipIndex`，**设备不生效**。
+     * 真正切换频段的设备命令是 `goformId=switchWiFiChip&ChipEnum=chip1|chip2&GuestEnable=0`
+     * （真机抓包确认：chip1 = 2.4G、chip2 = 5G），core 把它包成本端点。
      *
      * 取值只认 `chip1` / `chip2`：`"0"`/`"1"`（读侧编码）与 `"2.4G"`/`"5G"`（界面文案）都不是
      * 传输值，core 侧 profile 的 validate 会直接回 400 + 原因。
@@ -680,7 +712,7 @@ interface UfiAxisApi {
      * WiFi 接入控制名单（拉黑）。
      *
      * 设备侧只有「整表替换」一条命令，读-改-写全部收在 core：这里**只发单台设备的 mac/name**，
-     * 不要自己拼完整名单。三个写端点回的都是 core 写完**回读设备**的真实名单，直接覆盖本地状态。
+     * 不得自行拼接完整名单。三个写端点回的都是 core 写完**回读设备**的真实名单，直接覆盖本地状态。
      * 重复拉黑 / 解除不在名单里的设备都是幂等成功。
      */
     @GET("api/wifi/acl")
@@ -727,11 +759,11 @@ interface UfiAxisApi {
     @POST("api/device/debug")
     suspend fun setDeviceMode(@Body body: Map<String, Boolean>): DeviceDebugResponse
 
-    // ========== Service Control（2026-08-26） ==========
+    // ========== Service Control ==========
     // 停/启的是后端"后台采集服务"，HTTP 服务不受影响 —— 停止后仍可远程再启动。
     // 路径**故意保留字面量**：`scripts/verify-api-contract.mjs` 靠扫描字面量比对 core 路由，
-    // 换成常量后校验器会看不到这 5 个端点（实测 app 端点数 173→168）。
-    // 与 contract 的一致性由 `ServiceEndpointContractTest` 用反射断言锁死。
+    // 换成常量后校验器会看不到这 5 个端点（端点计数会从 173 降到 168）。
+    // 与 contract 的一致性由 `ServiceEndpointContractTest` 用反射断言固定。
     @GET("api/service/status")
     suspend fun getServiceStatus(): ServiceStatusResponse
 
@@ -749,12 +781,12 @@ interface UfiAxisApi {
     suspend fun setServiceAutoStart(@Body body: Map<String, Boolean>): ServiceStatusResponse
 
     /**
-     * 上一次 core 崩溃信息（2026-09-04）。core 崩溃后由 keepalive 脚本 / START_STICKY 自动拉起，
-     * app 此前完全无感（只表现为数据断一下）。连上设备后拉一次，与本地"已提示过的时间戳"
-     * 比对，不同就弹一次窗。去重放本地而不是服务端 ack —— 否则 app 一 ack，web 就再也看不到。
+     * 上一次 core 崩溃信息。core 崩溃后由 keepalive 脚本 / START_STICKY 自动拉起，
+     * app 侧此前不可见（只表现为数据中断）。连上设备后拉取一次，与本地"已提示过的时间戳"
+     * 比对，不同就弹一次窗。去重状态存本地而不是服务端 ack —— 否则 app 一 ack，web 就再也看不到。
      *
-     * 2026-10-23：是否"值得提示"由 core 的 `recent`（同一时钟算的 7 天窗口）判定，
-     * 三个月前的历史崩溃不会再触发启动弹窗，判据见 `CoreCrashPolicy`。
+     * 是否"值得提示"由 core 的 `recent`（同一时钟算的 7 天窗口）判定，
+     * 三个月前的历史崩溃不会触发启动弹窗，判据见 `CoreCrashPolicy`。
      */
     @GET("api/service/crash")
     suspend fun getCoreCrashReport(): CoreCrashResponse
@@ -766,10 +798,21 @@ interface UfiAxisApi {
     @GET("api/device/settings")
     suspend fun getDeviceSettings(): DeviceSettingsResponse
 
+    /**
+     * 同 [getDeviceSettings]，但带 `?fresh=1` **绕过 core 的 5 分钟读缓存**。
+     *
+     * 写后回读确认专用：core 的 `device:settings` TTL 是 5 分钟，写成功只清一次缓存；
+     * 如果第一次回读正好落在设备还没应用完的窗口里，那份**旧快照会被重新缓存 5 分钟**，
+     * 后面无论读多少次都看不到变化（web 端 `loadDeviceSettings(api, { fresh: true })`
+     * 就是为这个问题加的）。漫游 / 制式切换这类「必须看到设备变」的路径必须走这条。
+     */
+    @GET("api/device/settings?fresh=1")
+    suspend fun getDeviceSettingsFresh(): DeviceSettingsResponse
+
     @POST("api/device/data-limit")
     suspend fun setDataLimit(@Body body: Map<String, @JvmSuppressWildcards Any>): SuccessResponse
 
-    // 套餐档案（2026-10-07 到量/到期融合）：core 语义层，goform 无套餐概念
+    // 套餐档案（到量 / 到期融合）：core 语义层，goform 无套餐概念
     @GET("api/device/plan")
     suspend fun getPlanProfile(): PlanProfileResponse
 
@@ -803,7 +846,7 @@ interface UfiAxisApi {
 
     /**
      * 邻区列表（实时向设备查询，**不走 core 的 responseCache**）。
-     * 一次调用会向设备发一次 goform 查询，所以只在用户手动刷新时调，不要放进定时轮询。
+     * 一次调用会向设备发一次 goform 查询，因此只在手动刷新时调用，不得放入定时轮询。
      * 设备侧不支持时回空数组而不是错误；core 完全没有查询通道时才回 503。
      */
     @GET("api/network/neighbor-cells")
@@ -813,11 +856,11 @@ interface UfiAxisApi {
     @POST("api/sms/delete")
     suspend fun deleteSms(@Body body: Map<String, String>): SmsActionResponse
 
-    /** 按号码删除整段会话（2026-09-21）。 */
+    /** 按号码删除整段会话。 */
     @POST("api/sms/delete-conversation")
     suspend fun deleteConversation(@Body body: Map<String, String>): SmsActionResponse
 
-    /** 批量删除多条短信（2026-09-21）。 */
+    /** 批量删除多条短信。 */
     @POST("api/sms/delete-batch")
     suspend fun deleteBatch(@Body body: Map<String, @JvmSuppressWildcards Any>): SmsActionResponse
 
@@ -840,7 +883,7 @@ interface UfiAxisApi {
     // app 这七个端点只做「规则的增删改查」与「拦截记录的读/清」，**不做任何判定**。
     //
     // 刻意没有 `rules/test`（试算）：去掉正则之后 contains/equals/prefix/suffix 行为可预测，
-    // 「我的规则有没有生效」由 hit_count + 拦截记录回答。
+    // 规则是否生效由 hit_count + 拦截记录回答。
 
     @GET("api/sms/rules")
     suspend fun getSmsRules(): SmsRuleListResponse
@@ -884,7 +927,7 @@ interface UfiAxisApi {
     @GET("api/config/version")
     suspend fun getServerVersion(): ServerVersionInfo
 
-    // ========== 配置备份与恢复（2026-09-11） ==========
+    // ========== 配置备份与恢复 ==========
     // 三条与二进制打交道的端点都不是 JSON：导出**回** ZIP，预览/恢复**收** ZIP。
     // 口令走 X-Backup-Passphrase 请求头而不是 query —— query 会进访问日志。
 
@@ -916,7 +959,7 @@ interface UfiAxisApi {
         @Header("X-Backup-Passphrase") passphrase: String? = null
     ): BackupImportResponse
 
-    // ========== Update（2026-08-10：后端自拉取 + 前端兜底推送） ==========
+    // ========== Update（后端自拉取 + 前端兜底推送） ==========
     @POST("api/update/check")
     suspend fun triggerDeviceUpdate(): UpdateStatusResponse
 
@@ -933,12 +976,12 @@ interface UfiAxisApi {
     @POST("api/update/reset")
     suspend fun resetDeviceUpdate(): UpdateStatusResponse
 
-    // ========== Frontend App Update（2026-08-10 C5：经 Core 转发前端更新信息） ==========
+    // ========== Frontend App Update（经 Core 转发前端更新信息） ==========
     @GET("api/update/frontend-info")
     suspend fun getFrontendUpdateInfo(): FrontendUpdateInfo
 
     /**
-     * Core 自身的更新信息（**只检查、不安装**，2026-09-06）。
+     * Core 自身的更新信息（**只检查、不安装**）。
      *
      * core 读清单 backend 对象并自己做版本比对，返回 `has_update` —— 这是 App 端判断
      * 「设备上的 core 有没有新版本」的唯一正确数据源。真正触发安装仍走
@@ -949,7 +992,7 @@ interface UfiAxisApi {
     @GET("api/update/backend-info")
     suspend fun getBackendUpdateInfo(): BackendUpdateInfo
 
-    // ========== Web 控制面板资源（2026-08-27） ==========
+    // ========== Web 控制面板资源 ==========
     // 换的是 core 里那份 Web 控制面板产物（override 落在 filesDir/web），跟 core APK 更新是两套东西。
     // 路径同样保留字面量，一致性由 ServiceEndpointContractTest 反射断言兜住。
     /** 返回 `{mode:"override"|"bundled", version, bundledVersion, hasBackup, ...}`，字段随 core 演进故用 JsonElement。 */
@@ -1000,7 +1043,7 @@ interface UfiAxisApi {
     suspend fun updateConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): ConfigUpdateResponse
 
     /**
-     * 同步更新源 / 镜像前缀到设备端 Core（2026-08-12）：
+     * 同步更新源 / 镜像前缀到设备端 Core：
      * body 传 `update_url`（后端 version.json URL）+ `update_mirror_base`（镜像前缀，空串=直连）。
      * 与 [updateConfig] 同路由，语义独立便于调用方表达意图。
      */
@@ -1008,7 +1051,7 @@ interface UfiAxisApi {
     suspend fun updateUpdateSource(@Body body: Map<String, @JvmSuppressWildcards Any>): ConfigUpdateResponse
 
     /**
-     * core 的更新源决策（2026-09-22）。app 的 APK 自更新刻意不走 core 代理
+     * core 的更新源决策。app 的 APK 自更新刻意不走 core 代理
      * （core 挂了也得能更新自己），所以只取决策、自己拼 URL 下载。
      */
     @GET("api/update/source")
@@ -1067,7 +1110,7 @@ interface UfiAxisApi {
     /**
      * 读邮件通知全量配置。
      *
-     * 2026-09-10 起响应里也带「规则同构」那一组：`min_level` / `daily_limit` 两个旋钮，
+     * 响应里带「规则同构」那一组：`min_level` / `daily_limit` 两个旋钮，
      * `sent_today` / `quota_remaining` 两个只读位（`daily_limit = 0` 时后者是 **null** =
      * 不限），以及 `levels` / `daily_limit_min|max` 三个值域。全部是 core 的判据，UI 直接渲染。
      */
@@ -1077,9 +1120,9 @@ interface UfiAxisApi {
     /**
      * 写邮件通知配置。
      *
-     * **2026-09-10 起可能返回 400**（Retrofit 抛 `HttpException`）：`daily_limit` 越界
-     * 或 `min_level` 认不出时。此前这个端点没有任何校验、永远 `success:true`，
-     * 所以调用方必须有失败分支 —— 错误体是 `{"error": 中文原因}`，把那句话原样显示出来
+     * **可能返回 400**（Retrofit 抛 `HttpException`）：`daily_limit` 越界
+     * 或 `min_level` 认不出时。该端点不再是无校验、永远 `success:true`，
+     * 因此调用方必须有失败分支 —— 错误体是 `{"error": 中文原因}`，把那句话原样显示出来
      * 比"保存失败"有用（口径同 Webhook / 本机短信的 PUT）。
      */
     @POST("api/sms-forward/config")
@@ -1128,7 +1171,7 @@ interface UfiAxisApi {
     /**
      * 删单条投递记录（详情弹窗「删除」）。
      *
-     * 旧 core 无此端点会回 404/405，调用方需按「设备端不支持」提示，不要当网络故障重试刷屏。
+     * 旧 core 无此端点会回 404/405，调用方需按「设备端不支持」提示，不得当作网络故障重试。
      */
     @DELETE("api/sms-forward/history/{id}")
     suspend fun deleteMailHistoryById(
@@ -1180,7 +1223,7 @@ interface UfiAxisApi {
 
     /**
      * 发一条测试短信。**这会真的从设备 SIM 发出一条短信、产生费用、并消耗一条今日配额** ——
-     * 所以 UI 必须在调用之前让用户确认（不是"点了再说"的按钮）。
+     * 所以 UI 必须在调用之前让用户确认（不能是先点后确认的按钮）。
      * 响应带固件结论、是否计入配额与剩余配额。
      */
     @POST("api/notify/sms/test")
@@ -1278,7 +1321,7 @@ interface UfiAxisApi {
     suspend fun unlockAllCell(): SuccessResponse
 
     // ========== Device Capabilities ==========
-    // 设备能力集（计划书 §7 阶段 3 的 3.5）。core 侧在装配组件图时算一次的**静态快照**，
+    // 设备能力集。core 侧在装配组件图时计算一次的**静态快照**，
     // 不发任何设备查询，所以 app 侧缓存到进程生命周期就够（见 NetworkModule.loadDeviceCapabilities）。
     @GET("api/device/capabilities")
     suspend fun getDeviceCapabilities(): DeviceCapabilitiesResponse
@@ -1316,7 +1359,7 @@ interface UfiAxisApi {
     suspend fun speedTestUpload(@Body body: okhttp3.RequestBody): ResponseBody
 
     /**
-     * 定时测速历史（2026-10-06 批C；core SpeedTestRoutes /history，新的在前）。
+     * 定时测速历史（core SpeedTestRoutes /history，新的在前）。
      * 返回 `{ "items": [ { timestamp, download_mbps, upload_mbps, latency_ms, jitter_ms, trigger } ] }`，
      * 数值是字符串化的（core 侧用 "%.2f".format 产出），消费端按 Double.parseDouble 解。
      */
@@ -1338,7 +1381,7 @@ interface UfiAxisApi {
      * 读取单个落盘日志文件的**尾部**（core 侧限制 1KB~2MB，默认 256KB）。
      * 返回 `text/plain` 原文，不是 JSON——单文件可达几十 MB，整读会 OOM。
      *
-     * ## 路径形状只有一种（2026-08-30 统一）
+     * ## 路径形状只有一种
      * core 侧是**唯一一条尾通配路由** `get("/{name...}")`（`DebugLogRoutes.kt`），把捕获到的
      * 各段用 `/` 拼回来后按 `^\d{4}-\d{2}-\d{2}/(app|at|error)\.log(\.1)?$` 白名单校验。
      * 也就是说 [name] 是**带一个斜杠的相对路径**（`2026-08-28/app.log`），不是两个独立参数
@@ -1354,6 +1397,143 @@ interface UfiAxisApi {
         @Path(value = "name", encoded = true) name: String,
         @Query("max_bytes") maxBytes: Int = 256 * 1024
     ): ResponseBody
+
+    // ========== 运营商账单 ==========
+    @GET("api/carrier/status")
+    suspend fun getCarrierStatus(): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/account")
+    suspend fun switchCarrierAccount(@Body body: Map<String, String>): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/mobile/login/request")
+    suspend fun requestCarrierCode(@Body body: Map<String, String>): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/mobile/login/verify")
+    suspend fun verifyCarrierCode(@Body body: Map<String, String>): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/unicom/login/qr")
+    suspend fun startUnicomQr(
+        @Query("refresh") refresh: Int = 0,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/unicom/login/password")
+    suspend fun loginUnicomWithPassword(
+        @Body body: Map<String, String>,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @GET("api/carrier/unicom/login/status")
+    suspend fun pollUnicomQr(): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @GET("api/carrier/bill")
+    suspend fun getCarrierBill(@Query("refresh") refresh: Int = 0): com.ufi_axis.data.model.CarrierBillResponse
+
+    // ── 多账号 ─────────────────────────────────────────────────────────────
+    //
+    // 老接口语义 = 当前账号，保持原样；下面这一组带 /accounts/{id} 前缀。
+    // 老 core 没有这些路由 → 404，调用方据此降级成单账号。
+
+    @GET("api/carrier/accounts")
+    suspend fun getCarrierAccounts(): com.ufi_axis.data.model.CarrierAccountsResponse
+
+    @POST("api/carrier/accounts")
+    suspend fun addCarrierAccount(@Body body: Map<String, String>): com.ufi_axis.data.model.CarrierAccountDto
+
+    /** 新增物联卡账号（body: access_method=iot_card, provider=cloud|xj, card, label）。 */
+    @POST("api/carrier/accounts")
+    suspend fun addIotCardAccount(@Body body: Map<String, String>): com.ufi_axis.data.model.CarrierAccountDto
+
+    @PATCH("api/carrier/accounts/{id}")
+    suspend fun renameCarrierAccount(
+        @Path("id") id: String,
+        @Body body: Map<String, String>,
+    ): kotlinx.serialization.json.JsonElement
+
+    @DELETE("api/carrier/accounts/{id}")
+    suspend fun deleteCarrierAccount(@Path("id") id: String): kotlinx.serialization.json.JsonElement
+
+    @POST("api/carrier/accounts/{id}/activate")
+    suspend fun activateCarrierAccount(@Path("id") id: String): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/accounts/{id}/login/mobile/request")
+    suspend fun requestCarrierCodeFor(
+        @Path("id") id: String,
+        @Body body: Map<String, String>,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/accounts/{id}/login/mobile/verify")
+    suspend fun verifyCarrierCodeFor(
+        @Path("id") id: String,
+        @Body body: Map<String, String>,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/accounts/{id}/login/unicom/qr")
+    suspend fun startUnicomQrFor(
+        @Path("id") id: String,
+        @Query("refresh") refresh: Int = 0,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @POST("api/carrier/accounts/{id}/login/unicom/password")
+    suspend fun loginUnicomWithPasswordFor(
+        @Path("id") id: String,
+        @Body body: Map<String, String>,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @GET("api/carrier/accounts/{id}/login/unicom/status")
+    suspend fun pollUnicomQrFor(@Path("id") id: String): com.ufi_axis.data.model.CarrierStatusResponse
+
+    /** 物联卡充值号登录（body: card, verify；小鲸卡 verify=绑定手机号后四位）。 */
+    @POST("api/carrier/accounts/{id}/login/cloud")
+    suspend fun loginCloudCardFor(
+        @Path("id") id: String,
+        @Body body: Map<String, String>,
+    ): com.ufi_axis.data.model.CarrierStatusResponse
+
+    @GET("api/carrier/accounts/{id}/bill")
+    suspend fun getCarrierBillOf(
+        @Path("id") id: String,
+        @Query("refresh") refresh: Int = 0,
+    ): com.ufi_axis.data.model.CarrierBillResponse
+
+    @GET("api/carrier/accounts/{id}/auto-login")
+    suspend fun getCarrierAutoLoginOf(@Path("id") id: String): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    @PUT("api/carrier/accounts/{id}/auto-login")
+    suspend fun saveCarrierAutoLoginOf(
+        @Path("id") id: String,
+        @Body body: com.ufi_axis.data.model.CarrierAutoLoginConfigBody,
+    ): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    @POST("api/carrier/accounts/{id}/auto-login/run")
+    suspend fun runCarrierAutoLoginOf(@Path("id") id: String): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    @GET("api/carrier/auto-login")
+    suspend fun getCarrierAutoLogin(): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    @PUT("api/carrier/auto-login")
+    suspend fun saveCarrierAutoLogin(
+        @Body body: com.ufi_axis.data.model.CarrierAutoLoginConfigBody,
+    ): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    @POST("api/carrier/auto-login/run")
+    suspend fun runCarrierAutoLogin(): com.ufi_axis.data.model.CarrierAutoLoginState
+
+    // ── 设备级账单设置 ──────────────────────────────────────────────
+    @GET("api/carrier/bill/settings")
+    suspend fun getCarrierBillSettings(): com.ufi_axis.data.model.CarrierBillSettingsState
+
+    @PUT("api/carrier/bill/settings")
+    suspend fun saveCarrierBillSettings(
+        @Body body: JsonObject,
+    ): com.ufi_axis.data.model.CarrierBillSettingsState
+
+    @PUT("api/carrier/bill/settings/accounts/{id}")
+    suspend fun setCarrierKeepAliveParticipating(
+        @Path("id") id: String,
+        @Body body: com.ufi_axis.data.model.CarrierParticipatingBody,
+    ): com.ufi_axis.data.model.CarrierBillSettingsState
+
+    @POST("api/carrier/logout")
+    suspend fun logoutCarrier(): com.ufi_axis.data.model.CarrierStatusResponse
 
     /** 删除 core 全部落盘日志文件（内存缓冲用 [clearDebugLogs] 清）。 */
     @HTTP(method = "DELETE", path = "api/debug-logs/files", hasBody = false)
@@ -1465,10 +1645,10 @@ interface UfiAxisApi {
     suspend fun testStorageSourceConfig(@Body body: StorageSourceRequest): StorageSourceTestResponse
 
     // ========== Monitor ==========
-    // points 默认 240（2026-08-26 性能：原 360）——图表宽度只有约 1000px，
+    // points 默认 240（性能取值，曾为 360）——图表宽度只有约 1000px，
     // 更细的桶换不来任何可见精度，却要多付 JSON 解析与曲线几何构建的开销。
     //
-    // bucketMs（2026-09-03）：显式指定桶宽，服务端优先采用它而不是按 (end-start)/points 自算。
+    // bucketMs：显式指定桶宽，服务端优先采用它而不是按 (end-start)/points 自算。
     // 增量刷新的请求窗口只有一两个桶那么长，让服务端自算会得到远细于首屏的网格，两批点的 t
     // 互不相交，客户端按 t 去重就完全失效（点数无上限增长、尾部时间重复）。
     @GET("api/monitor/history")
@@ -1495,12 +1675,12 @@ interface UfiAxisApi {
     @POST("api/monitor/clean")
     suspend fun cleanHistory(@Body body: CleanHistoryRequest): CleanHistoryResponse
 
-    /** 监控总开关（P6-a）：enabled=false 停止 DataScheduler 采集；请求体 {"enabled": true|false} */
+    /** 监控总开关：enabled=false 停止 DataScheduler 采集；请求体 {"enabled": true|false} */
     @POST("api/monitor/control")
     suspend fun setMonitorControl(@Body body: Map<String, Boolean>): JsonElement
 
     /**
-     * 监控个性化偏好（T40-5）：core 是唯一真源，app 的 `monitor_settings_v1` 降级为缓存。
+     * 监控个性化偏好：core 是唯一真源，app 的 `monitor_settings_v1` 降级为缓存。
      * 不含 `collectEnabled`（真源在 `/api/service/status`）。
      */
     @GET("api/monitor/preferences")
@@ -1512,8 +1692,8 @@ interface UfiAxisApi {
 
     // ========== Notifications ==========
     /**
-     * 客户端通知配置（T40-6）：core 是唯一真源，app 的 `ufi_axis_prefs` 那 10 个键降级为缓存。
-     * 与 `/api/alerts/config` 的边界：这里是「客户端要不要投递」，那里是「服务端要不要产生告警」。
+     * 客户端通知配置：core 是唯一真源，app 的 `ufi_axis_prefs` 那 10 个键降级为缓存。
+     * 与 `/api/alerts/config` 的边界：这里是「客户端是否投递」，那里是「服务端是否产生告警」。
      */
     @GET("api/notifications/config")
     suspend fun getNotificationConfig(): NotificationConfigDto
@@ -1571,8 +1751,8 @@ interface UfiAxisApi {
     /**
      * 解除全部配对（POST api/pairing/unpair）。
      *
-     * 2026-10-21（审计 §B1）：core 现在**要求配对密码** —— "踢掉所有人"与"踢掉一个设备"
-     * 必须是同一道门槛（之前这条反而免密码，双因素被绕过）。缺密码回 401 MISSING_PASSWORD。
+     * core **要求配对密码** ——"踢掉所有人"与"踢掉一个设备"必须是同一道门槛，
+     * 否则双因素认证可被绕过。缺密码回 401 MISSING_PASSWORD。
      */
     @POST("api/pairing/unpair")
     suspend fun unpairAll(@Body body: Map<String, String>): JsonElement
@@ -1587,7 +1767,7 @@ interface UfiAxisApi {
     @PUT("api/pairing/config")
     suspend fun updatePairingConfig(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
 
-    // ========== Pairing Devices（2026-08-11：配对密码认证 + 配对设备管理） ==========
+    // ========== Pairing Devices（配对密码认证 + 配对设备管理） ==========
     /** 已配对设备列表（Bearer；GET /api/pairing/devices）。 */
     @GET("api/pairing/devices")
     suspend fun getPairedDevices(): JsonElement
@@ -1599,43 +1779,37 @@ interface UfiAxisApi {
         @Body body: Map<String, String>
     ): JsonElement
 
-    /** 移除已配对设备（Bearer + 配对密码；body {password}；最后一台移除触发 token 轮换）。 */
-    @HTTP(method = "DELETE", path = "api/pairing/devices/{fingerprint}", hasBody = true)
-    suspend fun removePairedDevice(
-        @Path("fingerprint") fingerprint: String,
-        @Body body: Map<String, String>
-    ): JsonElement
+    /** 移除已配对设备（Bearer；无 body）。 */
+    @DELETE("api/pairing/devices/{fingerprint}")
+    suspend fun removePairedDevice(@Path("fingerprint") fingerprint: String): JsonElement
 
     /** 修改配对密码（root 路径免鉴权，旧密码即门禁；body {old_password, new_password}）。 */
     @POST("pairing/change-password")
     suspend fun changeDevicePassword(@Body body: Map<String, String>): JsonElement
 
-    // ========== Pairing Blacklist（2026-10-15：配对设备黑名单） ==========
+    // ========== Pairing Blacklist（配对设备黑名单） ==========
     //
     // 读侧拦截不在这几个端点上：被拉黑设备的**配对与密码登录**由 core 的
     // `PairingManager.confirm` 直接拦（403 DEVICE_BLOCKED），已鉴权请求由 444 拦。
-    // 这里只是管理面（增删查），写操作一律要配对密码（与移除设备同一套双因素）。
+    // 这里只是管理面（增删查），只要求 Bearer。
 
     /** 黑名单列表（Bearer；GET /api/pairing/blacklist）。旧版 core 无此端点 → 404。 */
     @GET("api/pairing/blacklist")
     suspend fun getPairingBlacklist(): JsonElement
 
-    /** 拉黑一台设备（Bearer + 配对密码；body {fingerprint, hw_id, name, reason, password}）。 */
+    /** 拉黑一台设备（Bearer；body {fingerprint, hw_id, name, reason}）。 */
     @POST("api/pairing/blacklist")
     suspend fun blockPairedDevice(@Body body: Map<String, @JvmSuppressWildcards Any>): JsonElement
 
-    /** 解除拉黑（Bearer + 配对密码；body {password}）。 */
-    @HTTP(method = "DELETE", path = "api/pairing/blacklist/{fingerprint}", hasBody = true)
-    suspend fun unblockPairedDevice(
-        @Path("fingerprint") fingerprint: String,
-        @Body body: Map<String, String>
-    ): JsonElement
+    /** 解除拉黑（Bearer；无 body）。 */
+    @DELETE("api/pairing/blacklist/{fingerprint}")
+    suspend fun unblockPairedDevice(@Path("fingerprint") fingerprint: String): JsonElement
 
-    /** 全部解除（Bearer + 配对密码；body {password}）。 */
+    /** 全部解除（Bearer；无 body）。 */
     @POST("api/pairing/blacklist/clear")
-    suspend fun clearPairingBlacklist(@Body body: Map<String, String>): JsonElement
+    suspend fun clearPairingBlacklist(): JsonElement
 
-    // ========== Pairing Approval（2026-10-15：新设备需机主批准） ==========
+    // ========== Pairing Approval（新设备需机主批准） ==========
 
     /** 待批准列表（Bearer；GET /api/pairing/approvals）。**响应含 6 位配对码**，供弹窗显示。 */
     @GET("api/pairing/approvals")
@@ -1746,8 +1920,8 @@ interface UfiAxisApi {
     @POST("api/tunnel/cf/stop")
     suspend fun stopAllCf(): JsonElement
 
-    // ========== 可选二进制组件（2026-09-01：frpc / cloudflared 不随 APK 分发） ==========
-    // 组件解压后合计约 50MB，曾占 core APK 压缩体积的一半，改为用户按需下载。
+    // ========== 可选二进制组件（frpc / cloudflared 不随 APK 分发） ==========
+    // 组件解压后合计约 50MB，占 core APK 压缩体积的一半，改为按需下载。
     // 本地上传兜底（POST /api/components/{id}/upload）只在 Web 面板提供：
     // App 端要走 SAF 选文件 + 几十 MB 流式上传，收益不足，离线场景用 Web 面板覆盖。
 
@@ -1771,7 +1945,7 @@ interface UfiAxisApi {
     suspend fun uninstallComponent(@Path("id") id: String): JsonElement
 
     /**
-     * CPU 控制能力探测（2026-10-08，GET /api/cpu-probe）。
+     * CPU 控制能力探测（GET /api/cpu-probe）。
      * core 会发 20+ 条只读/写回原值的 shell 命令（5~15s），返回 cpufreq policy 矩阵、
      * per-cpu online 节点可写性、governor 可选值与 thermal zone 快照。
      * 用 [JsonElement] 承接：结果形状按内核漂移（policy 数、键集合），强类型解析遇新键就空白，
@@ -1780,14 +1954,14 @@ interface UfiAxisApi {
     @GET("api/cpu-probe")
     suspend fun getCpuProbe(): JsonElement
 
-    // ========== 诊断 / 运维（2026-08-30：喂给「运行诊断」页） ==========
+    // ========== 诊断 / 运维（供「运行诊断」页使用） ==========
     // 这一组读的都是 **core 自己的状态**，不打设备，所以可以随页面刷新自由调用。
     // 唯一例外是 [getDiagnose] 带 fields=1 的那条路径 —— 见它的 KDoc。
 
     /**
      * core 诊断快照。
      * @param fields 传 `1` 才计算字段覆盖率，而那会**逐分组向设备发查询**（最多 10 组）。
-     *   默认 null = 不算；诊断页只有用户点「检测字段覆盖率」时才传 1，绝不能进轮询。
+     *   默认 null = 不算；诊断页只在用户点「检测字段覆盖率」时才传 1，不得进入轮询。
      */
     @GET("api/diagnose")
     suspend fun getDiagnose(@Query("fields") fields: String? = null): DiagnoseResponse
@@ -1822,13 +1996,13 @@ interface UfiAxisApi {
     @GET("api/shell/root")
     suspend fun getShellRoot(): ShellRootResponse
 
-    // ========== 赞助感谢名单（2026-10-14） ==========
+    // ========== 赞助感谢名单 ==========
     //
     // 回 `{ source: "bundled"|"remote", updatedAt, sponsors: [...] }`（core 侧 SponsorRoutes）。
     //
     // **刻意声明成 JsonElement 而不是新建 data class**：
     //  1. 条目对象是**原样透传**的（core 只校验、不重塑），将来远端给某条加 `link`/`avatar`
-    //     之类的字段时，强类型模型会把它们静默丢掉 —— 而这一页展示的就是"人家给了什么"；
+    //     之类的字段时，强类型模型会把它们静默丢掉 —— 而这一页展示的正是远端给出的内容；
     //  2. 消费端（SponsorsScreen）**必须**按 sponsors.json 的字段规则逐条校验（远端那份来自
     //     12 小时一次的后台拉取，不经过编译期校验），校验本来就是手写 JSON 遍历，
     //     强类型解析只是多一层会把"不合规"变成"字段缺省值"的转译 —— 那正是要避免的静默失败。
@@ -1836,6 +2010,80 @@ interface UfiAxisApi {
     // 唯一的写权限新增注解就是这一条：诊断中心那一批端点全部复用上面已有的方法。
     @GET("api/sponsors")
     suspend fun getSponsors(): JsonElement
+
+    // ========== 第三方程序商店（应用商店） ==========
+    //
+    // 与上面的「应用管理 / APK」完全不同：这些端点由 core 的 ProgramRuntime 执行
+    // Linux 程序，数据/配置/运行态都在设备上。写操作只要求已配对身份（Bearer + 设备签名）。
+    //
+    // 单槽：同一时刻最多一个程序在跑；start/stop/restart/open 都会校验 currentId。
+
+    @GET("api/programs")
+    suspend fun listPrograms(): ProgramListResponse
+
+    /** 单个程序的**详细**信息（含磁盘占用；列表接口为了不每 10s 扫目录，used_bytes 恒为 0）。 */
+    @GET("api/programs/{id}")
+    suspend fun getProgram(@Path("id") id: String): com.ufi_axis.data.model.ProgramItemDto
+
+    @GET("api/programs/status")
+    suspend fun getProgramStatus(): ProgramStatusDto
+
+    @POST("api/programs/{id}/install")
+    suspend fun installProgram(
+        @Path("id") id: String,
+        @Query("storage") storage: String? = null,
+        @Query("access_mode") accessMode: String? = null,
+        /** 内容目录的父路径；null/空 = 内部默认。只有声明了内容目录的程序才传。 */
+        @Query("content_root") contentRoot: String? = null,
+    ): JsonElement
+
+    /** 内容目录可选落点（内部 / 公共存储 / SD 卡），由 core 枚举。 */
+    @GET("api/programs/volumes")
+    suspend fun getProgramVolumes(): com.ufi_axis.data.model.ProgramVolumesResponse
+
+    @POST("api/programs/{id}/uninstall")
+    suspend fun uninstallProgram(
+        @Path("id") id: String,
+        /** true = 彻底卸载，连 `log/programs/<id>/` 一起删；默认保留日志。 */
+        @Query("delete_logs") deleteLogs: Boolean = false,
+    ): JsonElement
+
+    @POST("api/programs/{id}/start")
+    suspend fun startProgram(@Path("id") id: String): JsonElement
+
+    @POST("api/programs/{id}/stop")
+    suspend fun stopProgram(@Path("id") id: String): JsonElement
+
+    @POST("api/programs/{id}/restart")
+    suspend fun restartProgram(@Path("id") id: String): JsonElement
+
+    @POST("api/programs/{id}/access-mode")
+    suspend fun setProgramAccessMode(
+        @Path("id") id: String,
+        @Query("mode") mode: String,
+    ): JsonElement
+
+    /** 程序设置（访问方式 / 端口 / 开机自启）；运行中改端口会被 core 409 拒绝。 */
+    @PATCH("api/programs/{id}/settings")
+    suspend fun updateProgramSettings(
+        @Path("id") id: String,
+        @Body body: ProgramSettingsRequest,
+    ): JsonElement
+
+    @POST("api/programs/{id}/open")
+    suspend fun openProgram(@Path("id") id: String): ProgramOpenDto
+
+    @GET("api/programs/{id}/logs")
+    suspend fun getProgramLogs(
+        @Path("id") id: String,
+        @Query("tail") tail: Int = 200,
+    ): ProgramLogsDto
+
+    @POST("api/programs/{id}/secret")
+    suspend fun consumeProgramSecret(@Path("id") id: String): ProgramSecretDto
+
+    @POST("api/programs/{id}/reset-secret")
+    suspend fun resetProgramSecret(@Path("id") id: String): ProgramSecretDto
 }
 
 @Serializable
@@ -2025,8 +2273,8 @@ data class FileReadResponse(
     /**
      * 内容不可用的具体原因：`too_large` / `binary` / `not_file`；内容完整时为 null。
      *
-     * 2026-09-11 新增。此前三种情况都只置 `truncated = true` 并把说明文字塞进 [content]，
-     * 客户端无法区分，只能给一句「服务端已截断」的误导文案。老版本 core 不回这个字段，
+     * 三种情况不再只置 `truncated = true` 并把说明文字塞进 [content]：
+     * 客户端无法区分，只能显示「服务端已截断」这类误导文案。老版本 core 不回这个字段，
      * 客户端按 `truncated` 回落（见 `FileManagerModule.readTextFile`）。
      */
     val reason: String? = null,

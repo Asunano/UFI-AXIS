@@ -55,6 +55,7 @@ import android.content.Context
 import android.widget.Toast
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
+import com.ufi_axis.util.stripShellPrompt
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
@@ -492,7 +493,13 @@ private fun ConsoleMessageBubble(message: ConsoleMessage, isShell: Boolean) {
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
                     onClick = {},
-                    onLongClick = { copyText(message.text) }
+                    onLongClick = {
+                        // 2026-10-31：Shell 消息的 `$ ` / `# ` 是界面提示符，不是命令的一部分；
+                        // 复制时去掉，粘贴回终端才不会变成「执行 $ 命令」。
+                        copyText(
+                            if (isUser && isShell) stripShellPrompt(message.text) else message.text
+                        )
+                    }
                 )
                 .background(bubbleColor, bubbleShape)
                 .padding(horizontal = 12.dp, vertical = 10.dp)

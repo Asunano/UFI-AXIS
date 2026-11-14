@@ -25,6 +25,7 @@ import com.ufi_axis.viewmodel.state.DownloadState
 import com.ufi_axis.viewmodel.state.DuplicateInfo
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -35,12 +36,12 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 批量清除确认
     var showBatchDeleteConfirm by remember { mutableStateOf(false) }
 
-    // 批量操作所需分组（与原 DownloadTasksUi 的过滤逻辑保持一致）
+    // 批量操作所需分组（过滤口径与 DownloadTasksUi 一致）
     val failedTasks = state.tasks.filter { it.status == "error" }
     val completedTasks = state.tasks.filter { it.status == "completed" }
     val hasCompleted = completedTasks.isNotEmpty()
 
-    // 前台可见性：只在 ON_RESUME 期间轮询，切后台立刻停（与 MonitorScreen 同款门控）
+    // 前台可见性：仅在 ON_RESUME 期间轮询，切到后台立即停止（门控方式与 MonitorScreen 一致）
     var lifecycleResumed by remember { mutableStateOf(true) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -54,20 +55,18 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 实时轮询：有活跃任务 2s，否则 6s 心跳。
-    // 注意：旧实现在"没有 downloading/pending/meta 任务"时一次请求都不发，
-    // 于是 meta→downloading→completed 这类由后端驱动的跃迁在界面上完全看不见
-    // （典型表现：一直显示"获取种子信息中"，再看已经 100%）。心跳必须无条件发。
+    // 实时轮询：存在活跃任务时 2s，否则 6s 心跳。
+    // 心跳必须无条件发送：若在「没有 downloading/pending/meta 任务」时不发请求，由后端
+    // 驱动的 meta→downloading→completed 跃迁在界面上不可见（表现为长期停留在「获取种子
+    // 信息中」，随后直接显示 100%）。
     //
-    // 2026-09-05（新鲜度闸门落地后）两个调用点的 force 分工，改动前请先读
-    // `DownloadModule.loadDownloads` 的 KDoc：
-    // ① 进页面首帧**刻意不 force** —— 它正是要被 10s 新鲜窗口挡掉的那一次。
-    //    用户反馈"从工具页进下载管理会自动播刷新动画"，页面内的 loading 动画早已删净，
-    //    真正还在发生的就是这次无条件重拉带来的整页状态写。10s 内来回进出时数据本来就是
-    //    轮询刚拉的，重拉纯属白付；超过 10s 或本进程首次进入时闸门自动放行，不会空页面。
-    // ② 轮询**必须 force** —— 2s 周期比 10s 新鲜窗口短，不绕过闸门的话每 5 次里有 4 次
-    //    会被判成"数据还新鲜"而直接 return，实际刷新间隔退化成 10s，
-    //    等于把"下载进度实时可见"降级掉（进度条会看起来卡住不动）。
+    // 两个调用点的 force 分工见 `DownloadModule.loadDownloads` 的 KDoc：
+    // ① 进入页面的首帧刻意不 force —— 它正是要被 10s 新鲜窗口拦下的那一次。
+    //    页面内已无加载动画，剩余可感知的刷新来自该次无条件重拉带来的整页状态写入；
+    //    10s 内往返进出时数据由轮询刚拉取，重拉无收益；超过 10s 或本进程首次进入时窗口
+    //    自动放行，不会出现空白页。
+    // ② 轮询必须 force —— 2s 周期短于 10s 新鲜窗口，不绕过窗口时多数轮次会被判定为数据
+    //    仍新鲜而直接返回，实际刷新间隔退化为 10s，下载进度的实时可见性随之失效。
     LaunchedEffect(lifecycleResumed) {
         if (!lifecycleResumed) return@LaunchedEffect
         viewModel.downloads.loadDownloads()
@@ -87,7 +86,7 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
         navController = navController,
         showBack = true,
         actions = {
-            // 溢出菜单：批量操作（重试失败 / 清除已完成）—— 与文件管理同款 UfiPopupMenu
+            // 溢出菜单：批量操作（重试失败 / 清除已完成），与文件管理使用同一个 UfiPopupMenu
             Box(
                 modifier = Modifier.onGloballyPositioned { coords ->
                     val r = coords.boundsInWindow()
@@ -114,7 +113,7 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
                             onClick = {
                                 val count = failedTasks.size
                                 failedTasks.forEach { viewModel.downloads.retryDownload(it.id) }
-                                toastMessage = ToastMessage("已重试 $count 个失败任务", ToastType.INFO)
+                                toastMessage = ToastMessage("已重试 $count 个失败任务", ToastType.SUCCESS)
                             }
                         ),
                         UfiPopupOption(
@@ -126,58 +125,51 @@ fun DownloadScreen(viewModel: MainViewModel, navController: NavHostController) {
                     )
                 )
             }
-            // 2026-10-21：顶栏「刷新」按钮删除（用户要求）。
-            // 本页有 2s/6s 常驻轮询保鲜，批量刷新走溢出菜单的「重试失败」，
-            // 另留一个整页重拉按钮只会让人以为数据不会自己更新。
-            // 下载设置：跳转新界面
-            IconButton(onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_SETTINGS) }) {
+            // 顶栏不提供「刷新」按钮：本页有 2s/6s 常驻轮询，批量操作走溢出菜单的
+            //「重试失败」；额外的整页重拉按钮会使用户误认为数据不会自动更新。
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DOWNLOAD_SETTINGS) }) {
                 Icon(Icons.Default.Settings, contentDescription = "下载设置")
             }
         }
     ) { padding ->
         Box(Modifier.fillMaxSize()) {
-            // 2026-09-04 去掉下拉刷新：原来这里是
-            // `PullToRefreshBox(isRefreshing = state.isLoading, onRefresh = { loadDownloads() })`。
-            // 删的理由不只是观感统一 —— 本页有 2s/6s 的常驻轮询，`isRefreshing` 接 isLoading 时，
-            // 任何一次非静默重载都会在顶部甩出转圈；历史上「每 2s 闪一次刷新圈」就是这么来的
-            // （靠 loadDownloads(silent = true) 修掉，那条链路本次一行未动）。
-            // 手势本身也和列表滚动抢通道。原先补在顶栏的那个手动刷新按钮也在 2026-10-21 删除
-            // （页面靠轮询保鲜），本页已无手动刷新入口 —— 不要再把它接回来。
+            // 不使用下拉刷新：`PullToRefreshBox(isRefreshing = state.isLoading)` 形态下，
+            // 本页有 2s/6s 常驻轮询，`isRefreshing` 接 isLoading 时任何一次非静默重载都会在
+            // 顶部显示转圈；下拉手势还与列表纵向滚动竞争同一手势通道。
+            // 轮询走 `loadDownloads(silent = true)`，因此不产生转圈；本页不设手动刷新入口，
+            // 不应重新引入。
             Box(Modifier.padding(padding).fillMaxSize()) {
                 Column(Modifier.fillMaxSize()) {
                     state.errorMessage?.let { error -> UfiErrorBanner(message = error) }
-                    // 2026-09-04：首屏骨架（`if (state.isLoading && state.tasks.isEmpty()) UfiSkeletonList(rows = 5)`）
-                    // 整段删除，且**不换任何加载动画**——用户明确不要动画。
+                    // 首屏不使用骨架屏，也不替换为其他加载动画。
                     //
-                    // 那个骨架为什么会"闪一下"（机械原因，删掉才算彻底解决）：
-                    // ① 进页面的 `LaunchedEffect(lifecycleResumed)` 第一件事就是 `loadDownloads()`（非 silent），
-                    //    DownloadModule 里第一行便是 `isLoading = true`；
-                    // ② core 是本机 HTTP，`GET /api/downloads` 通常 100~300ms 就回来，随后 isLoading=false
-                    //    且 tasks 非空 —— 骨架的存活期就是这几帧到几百毫秒，典型的"一闪而过"；
-                    // ③ 更糟的是它和列表是**互斥的两棵子树**：骨架挂/卸的同时 DownloadTasksTab 整棵
-                    //    （分段 Tab + LazyColumn）跟着卸/挂，一次硬切换。已有任务时 tasks 从"上一次的列表"
-                    //    经历过渡再回到列表，于是看到的是 列表→骨架→列表 两次子树替换，闪得更明显。
-                    // 删掉之后 DownloadTasksTab 从第一帧就挂在树上，首屏只是"它里面还没有 item"，
-                    // 没有子树替换，也就没有任何可闪的东西。
+                    // 骨架屏闪烁的成因：
+                    // ① 进入页面时 `LaunchedEffect(lifecycleResumed)` 首先调用
+                    //    `loadDownloads()`（非 silent），DownloadModule 中第一行即
+                    //    `isLoading = true`；
+                    // ② core 为本机 HTTP，`GET /api/downloads` 通常在 100~300ms 内返回，
+                    //    随后 isLoading=false 且 tasks 非空 —— 骨架存活时间仅为数帧至数百
+                    //    毫秒；
+                    // ③ 骨架与列表是互斥的两棵子树：骨架挂载 / 卸载的同时 DownloadTasksTab
+                    //    （分段 Tab + LazyColumn）整棵卸载 / 挂载，构成一次硬切换。已有任务时
+                    //    列表经历 列表→骨架→列表 两次子树替换，闪烁更明显。
+                    // 移除后 DownloadTasksTab 从第一帧起常驻组合树，首屏只表现为其内部暂无
+                    // item，不存在子树替换。
                     //
-                    // 首屏无数据时画什么（2026-09-05 更新）：DownloadTasksTab 里那条空态 item
-                    // **恒定挂载**，只有文案按 downloadEmptyPhase 分档 —— 首屏未加载完说"正在读取
-                    // 下载任务"，加载过之后才说"还没有下载任务"。原来的判定带 `&& !state.isLoading`，
-                    // 空态会随加载态挂/卸，那正是用户说的"中间那块图标和描述闪一下"。
+                    // 首屏无数据时：DownloadTasksTab 中的空态 item 恒定挂载，仅文案按
+                    // downloadEmptyPhase 分档 —— 加载未完成时显示「正在读取下载任务」，加载
+                    // 完成后显示「还没有下载任务」。若空态的挂载条件包含 `!state.isLoading`，
+                    // 空态会随加载态挂载 / 卸载，产生可见闪烁。
                     //
-                    // 2026-09-04 补充（第二轮：用户反馈"还有全屏刷新动画"）：
-                    // 本页**页面内**已不存在任何入场/加载动效与子树互斥切换 ——
-                    // DownloadTasksTab 里最后一处 `if (空) 空态 else LazyColumn` 也已改为
-                    // 「LazyColumn 恒定挂载 + 空态降级为一条 item」，见该文件内说明。
-                    // 仍然看得见的"整屏动效"只剩下**公共层**两处，按约定不在本次改动范围内：
-                    //   ① 路由转场：本页是 DETAIL 路由（AppScreens.kt: Routes.DETAIL_DOWNLOADS），
-                    //      MainNavGraph 给所有 DETAIL 页统一挂 `detailSharedAxisEnter` =
-                    //      slideInHorizontally { it }（**整屏**，无 fade），
-                    //      时长跟随「外观」页设置（默认 380ms）。2026-09-05 位移由半屏改成整屏以与退出对称，
-                    //      观感就是"整页从右边刷进来"。进页面必播一次。
-                    //   ② 标题栏：UfiScreenScaffold → UfiHeader 里标题有 350ms 的
-                    //      RenderEffect 模糊入场（UfiScaffold.kt:105-112，HEADER_TITLE_BLUR_MS）。
-                    // 这两处改了会影响全站所有页面，需要用户决策，故只在汇报里指出。
+                    // 页面内不存在任何入场 / 加载动效与子树互斥切换。仍可见的整屏动效来自
+                    // 公共层两处，改动会影响全站所有页面：
+                    //   ① 路由转场：本页为 DETAIL 路由（AppScreens.kt:
+                    //      Routes.DETAIL_DOWNLOADS），MainNavGraph 为所有 DETAIL 页统一挂
+                    //      `detailSharedAxisEnter` = slideInHorizontally { it }（整屏，无
+                    //      fade），时长跟随「外观」页设置（默认 380ms）；进入页面必然播放
+                    //      一次。
+                    //   ② 标题栏：UfiScreenScaffold → UfiHeader 的标题有 350ms RenderEffect
+                    //      模糊入场（UfiScaffold.kt:105-112，HEADER_TITLE_BLUR_MS）。
                     DownloadTasksTab(state, viewModel)
                 }
             }

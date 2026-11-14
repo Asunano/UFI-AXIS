@@ -17,6 +17,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis_core.contract.NetworkMode
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 蜂窝网络高级设置（二级页面）
@@ -112,7 +113,9 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
                 UfiSettingsToggle(
                     icon = Icons.Default.Public,
                     title = "数据漫游",
-                    description = if (roamingEnabled) "漫游中" else "已关闭",
+                    // 2026-11-08：roamingEnabled 是「允许漫游」的配置，不是「当前正在漫游」。
+                    // 原来写「漫游中」会让非漫游状态下的用户以为开关在显示实时状态/没生效。
+                    description = if (roamingEnabled) "已开启" else "已关闭",
                     checked = roamingEnabled,
                     onCheckedChange = { viewModel.network.setRoamingEnabled(it) }
                 )
@@ -161,7 +164,7 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
                     icon = Icons.Default.Tune,
                     title = "频段锁定",
                     description = "锁定指定 LTE / NR 频段",
-                    onClick = { navController.navigate("detail/band-lock") },
+                    onClick = { navController.ufiNavigateOnce("detail/band-lock") },
                     trailing = { UfiSettingsChevron() }
                 )
             }
@@ -170,7 +173,7 @@ fun CellularAdvancedScreen(viewModel: MainViewModel, navController: NavHostContr
                     icon = Icons.Default.GpsFixed,
                     title = "基站信息",
                     description = "查看/锁定邻区基站",
-                    onClick = { navController.navigate("detail/cell-lock") },
+                    onClick = { navController.ufiNavigateOnce("detail/cell-lock") },
                     trailing = { UfiSettingsChevron() }
                 )
             }

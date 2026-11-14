@@ -52,6 +52,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import java.text.SimpleDateFormat
 import java.util.*
 import com.ufi_axis.ui.theme.UfiMotion
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -96,8 +97,8 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             }
             IconButton(onClick = {
-                if (selectedTab == 0) navController.navigate("detail/task-edit")
-                else navController.navigate("detail/rule-edit")
+                if (selectedTab == 0) navController.ufiNavigateOnce("detail/task-edit")
+                else navController.ufiNavigateOnce("detail/rule-edit")
             }) {
                 Icon(Icons.Default.Add, if (selectedTab == 0) "新建定时任务" else "新建条件规则")
             }
@@ -141,7 +142,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                         modifier = Modifier.fillMaxSize(),
                         action = {
                             Button(
-                                onClick = { navController.navigate("detail/task-edit") },
+                                onClick = { navController.ufiNavigateOnce("detail/task-edit") },
                                 shape = UfiCardDefaults.capsuleShape,
                                 colors = ButtonDefaults.buttonColors(containerColor = palette.accent)
                             ) {
@@ -155,7 +156,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(state.tasks, key = { it.id }) { task ->
                             TaskCard(task = task,
-                                onEdit = { navController.navigate("detail/task-edit?id=${it.id}") },
+                                onEdit = { navController.ufiNavigateOnce("detail/task-edit?id=${it.id}") },
                                 onDelete = { pendingDeleteTask = it },
                                 onToggle = { viewModel.tools.updateTask(it.id, it.copy(enabled = !it.enabled)) },
                                 onShowLogs = { viewModel.tools.loadTaskLogs(it.id); viewingTaskLogs = it }
@@ -176,7 +177,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                         modifier = Modifier.fillMaxSize(),
                         action = {
                             Button(
-                                onClick = { navController.navigate("detail/rule-edit") },
+                                onClick = { navController.ufiNavigateOnce("detail/rule-edit") },
                                 shape = UfiCardDefaults.capsuleShape,
                                 colors = ButtonDefaults.buttonColors(containerColor = palette.accent)
                             ) {
@@ -190,7 +191,7 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
                     LazyColumn(Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(state.rules, key = { it.id }) { rule ->
                             RuleCard(rule = rule,
-                                onEdit = { navController.navigate("detail/rule-edit?id=${it.id}") },
+                                onEdit = { navController.ufiNavigateOnce("detail/rule-edit?id=${it.id}") },
                                 onDelete = { pendingDeleteRule = it },
                                 onToggle = { viewModel.tools.updateRule(it.id, it.copy(enabled = !it.enabled)) },
                                 onShowLogs = { viewModel.tools.loadRuleLogs(it.id); viewingRuleLogs = it }
@@ -218,8 +219,11 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
             }
         )
     }
-    pendingDeleteTask?.let { task ->
+    val dialogPendingDeleteTask = rememberLastNonNull(pendingDeleteTask)
+    if (dialogPendingDeleteTask != null) {
+        val task = dialogPendingDeleteTask
         UfiConfirmDialog(
+        visible = pendingDeleteTask != null,
             title = "删除任务",
             text = "确定删除「${task.name.ifBlank { "未命名任务" }}」？删除后不可恢复。",
             confirmText = "删除",
@@ -228,8 +232,11 @@ fun TaskScreen(viewModel: MainViewModel, navController: NavHostController) {
             onConfirm = { pendingDeleteTask = null; viewModel.tools.deleteTask(task.id) }
         )
     }
-    pendingDeleteRule?.let { rule ->
+    val dialogPendingDeleteRule = rememberLastNonNull(pendingDeleteRule)
+    if (dialogPendingDeleteRule != null) {
+        val rule = dialogPendingDeleteRule
         UfiConfirmDialog(
+        visible = pendingDeleteRule != null,
             title = "删除规则",
             text = "确定删除「${rule.name.ifBlank { "未命名规则" }}」？删除后不可恢复。",
             confirmText = "删除",

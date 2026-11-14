@@ -308,9 +308,11 @@ fun SmsFilterRulesScreen(viewModel: MainViewModel, navController: NavHostControl
         }
 
         // ── 删除规则 ──
-        pendingDeleteRule?.let { rule ->
+        val dialogPendingDeleteRule = rememberLastNonNull(pendingDeleteRule)
+        if (dialogPendingDeleteRule != null) {
+            val rule = dialogPendingDeleteRule
             UfiConfirmDialog(
-                visible = true,
+                visible = pendingDeleteRule != null,
                 title = "删除规则",
                 text = "删除「${rule.pattern}」后符合该规则的短信将恢复正常提醒与转发。已产生的拦截记录不受影响，仍可查看。",
                 confirmText = "删除",

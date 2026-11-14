@@ -99,6 +99,34 @@ object Routes {
     const val DETAIL_SERVER_CONFIG = "detail/server-config"
     const val DETAIL_TOOLS_ADVANCED = "detail/tools-advanced"
 
+    /** 话费账单（2026-10-31）：余额、流量与到期提醒。 */
+    const val DETAIL_BILL = "detail/bill"
+
+    /**
+     * 话费账单 · 添加运营商账号（2026-11-07）。
+     *
+     * 独立路由而不是页内状态：这样「列表 → 添加/明细」走的是 **NavHost 的二级页转场**，
+     * 有完整的裁剪、层级和返回栈，不会出现两个页面在同一张滚动容器里互相叠字。
+     */
+    const val DETAIL_BILL_ADD = "detail/bill/add"
+
+    /** 话费账单 · 单个运营商账号（明细 / 重新登录）。 */
+    const val DETAIL_BILL_ACCOUNT = "detail/bill/account/{accountId}"
+
+    /** 话费账单 · 设备级设置（后台更新 / 自动登录），2026-11-12。 */
+    const val DETAIL_BILL_SETTINGS = "detail/bill/settings"
+
+    /** 话费账单 · 自动登录独立设置页，2026-11-13。 */
+    const val DETAIL_BILL_SETTINGS_AUTO_LOGIN = "detail/bill/settings/auto-login"
+
+    /** 话费账单 · 参与账号子页（账号多时用 LazyColumn，不拉长设置主页），2026-11-13。 */
+    const val DETAIL_BILL_SETTINGS_ACCOUNTS = "detail/bill/settings/accounts"
+
+    fun billAccountRoute(accountId: String) = "detail/bill/account/$accountId"
+
+    /** 远程屏幕（2026-11-01）：app 内页面，不跳外部浏览器。 */
+    const val DETAIL_REMOTE_SCREEN = "detail/remote-screen"
+
     /**
      * 真 PTY 终端（app 端原生，2026-10-10）。
      *
@@ -133,6 +161,12 @@ object Routes {
     const val DETAIL_SMS_BLOCKED = "detail/sms-blocked"
 
     const val DETAIL_APPS = "detail/apps"
+
+    /**
+     * 应用商店（2026-10-31）：第三方 Linux 程序（OpenList 等）的安装/启停/访问。
+     * 与 [DETAIL_APPS] 的 APK 管理是两件事，入口在工具页。
+     */
+    const val DETAIL_PROGRAM_STORE = "detail/program-store"
     const val DETAIL_TASKS = "detail/tasks"
     /**
      * 邮件通知配置页（2026-08-29 由「短信转发」改造）。
@@ -561,6 +595,19 @@ val appRoutes: List<AppRoute> = listOf(
 
     AppRoute(Routes.DETAIL_SERVER_CONFIG, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TOOLS_ADVANCED, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BILL, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BILL_SETTINGS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BILL_SETTINGS_AUTO_LOGIN, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BILL_SETTINGS_ACCOUNTS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_BILL_ADD, TransitionType.DETAIL),
+    AppRoute(
+        route = Routes.DETAIL_BILL_ACCOUNT,
+        transition = TransitionType.DETAIL,
+        arguments = listOf(
+            navArgument("accountId") { type = NavType.StringType; defaultValue = ""; nullable = true }
+        )
+    ),
+    AppRoute(Routes.DETAIL_REMOTE_SCREEN, TransitionType.DETAIL),
     // 2026-10-24：PTY 页面绑定仍是注释（见 AppScreens.rawAppScreens），路由不能再留着。
     // 只藏绑定不撤路由，深链/外部 Intent 仍能导航到这个地址，而
     // `screens[appRoute.route]?.invoke(...)` 拿到 null → 白屏。
@@ -575,6 +622,7 @@ val appRoutes: List<AppRoute> = listOf(
     AppRoute(Routes.DETAIL_SMS_BLOCKED, TransitionType.DETAIL),
 
     AppRoute(Routes.DETAIL_APPS, TransitionType.DETAIL),
+    AppRoute(Routes.DETAIL_PROGRAM_STORE, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_TASKS, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_EMAIL_NOTIFY, TransitionType.DETAIL),
     AppRoute(Routes.DETAIL_PUSH_CHANNELS, TransitionType.DETAIL),

@@ -294,9 +294,11 @@ fun SmsBlockedScreen(viewModel: MainViewModel, navController: NavHostController)
         // ── 「不再按此规则拦截」= 把命中的那条规则 enabled 置 false ──
         // 刻意**不做**「恢复这条短信」：邮件已经没发、推送已经没推，事后补不回来，
         // 提供一个做不到的动作比不提供更糟。
-        pendingDisableLog?.let { log ->
+        val dialogPendingDisableLog = rememberLastNonNull(pendingDisableLog)
+        if (dialogPendingDisableLog != null) {
+            val log = dialogPendingDisableLog
             UfiConfirmDialog(
-                visible = true,
+                visible = pendingDisableLog != null,
                 title = "不再按此规则拦截",
                 text = "将停用规则「${log.rulePattern}」，之后符合它的短信恢复正常提醒与转发。" +
                     "这条已被拦下的短信无法恢复 —— 邮件没有发出、通知没有推送，事后补不回来。",
@@ -314,9 +316,11 @@ fun SmsBlockedScreen(viewModel: MainViewModel, navController: NavHostController)
         }
 
         // ── 删除单条记录 ──
-        pendingDeleteLog?.let { log ->
+        val dialogPendingDeleteLog = rememberLastNonNull(pendingDeleteLog)
+        if (dialogPendingDeleteLog != null) {
+            val log = dialogPendingDeleteLog
             UfiConfirmDialog(
-                visible = true,
+                visible = pendingDeleteLog != null,
                 title = "删除这条记录",
                 text = "只删除这条自查记录，不影响规则本身。",
                 confirmText = "删除",

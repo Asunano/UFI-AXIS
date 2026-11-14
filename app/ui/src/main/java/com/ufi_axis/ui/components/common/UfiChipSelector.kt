@@ -1,6 +1,9 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.components.common
 
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
@@ -96,7 +99,23 @@ fun UfiSingleChipSelector(
      */
     wrap: Boolean = false,
     /** 2026-08-31 新增：整组置灰不可点（如后台守护未开启时的巡检间隔 chip 组）。 */
-    enabled: Boolean = true
+    enabled: Boolean = true,
+    /**
+     * 段高（2026-11-08 新增，默认 [Spacing.SegmentHeight]）。
+     *
+     * 用于「主切换器」这类需要更醒目的场合（如账号登录方式二选一）：
+     * 只放大段高，字号/配色/滑块动画都不变，既有调用点一个都不用改。
+     */
+    segmentHeight: androidx.compose.ui.unit.Dp = Spacing.SegmentHeight,
+    /** 段的最小宽度（0 = 按内容自适应）。主切换器想更宽时传值。 */
+    segmentMinWidth: androidx.compose.ui.unit.Dp = 0.dp,
+    /**
+     * 个别选项禁用（2026-11-08 新增，默认空 = 全部可选）。
+     *
+     * 用例：安装程序时「数据目录含凭据 → 外部存储不可选」，语义是"看得见但点不动"，
+     * 比直接不渲染更诚实（用户知道有这么个选项、只是这台设备/这个程序不允许）。
+     */
+    disabledValues: Set<String> = emptySet()
 ) {
     val palette = LocalResolvedPalette.current
     // wrapContent = true 表示「按内容宽度排布」，此时轨道也不必撑满
@@ -116,8 +135,10 @@ fun UfiSingleChipSelector(
                 UfiSegment(
                     label = label,
                     selected = value == selectedValue,
-                    enabled = enabled,
+                    enabled = enabled && value !in disabledValues,
                     paintSelectedBackground = true,
+                    height = segmentHeight,
+                    minWidth = segmentMinWidth,
                     onClick = { onSelect(value) }
                 )
             }
@@ -179,9 +200,11 @@ fun UfiSingleChipSelector(
                     UfiSegment(
                         label = label,
                         selected = value == selectedValue,
-                        enabled = enabled,
+                        enabled = enabled && value !in disabledValues,
                         // 底由滑块统一画，段自己不画（否则切换时两处底同时出现 = 双层底）
                         paintSelectedBackground = false,
+                        height = segmentHeight,
+                        minWidth = segmentMinWidth,
                         modifier = (if (wrapContent) Modifier else Modifier.weight(1f))
                             .onSizeChanged { segmentWidths[index] = it.width.toFloat() },
                         onClick = { onSelect(value) }
@@ -204,6 +227,9 @@ private fun UfiSegment(
     enabled: Boolean,
     paintSelectedBackground: Boolean,
     modifier: Modifier = Modifier,
+    /** 段高；主切换器可以传大一点（默认与全站 chip 一致）。 */
+    height: androidx.compose.ui.unit.Dp = Spacing.SegmentHeight,
+    minWidth: androidx.compose.ui.unit.Dp = 0.dp,
     onClick: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -231,7 +257,8 @@ private fun UfiSegment(
     )
     Box(
         modifier = modifier
-            .height(Spacing.SegmentHeight)
+            .height(height)
+            .then(if (minWidth > 0.dp) Modifier.widthIn(min = minWidth) else Modifier)
             // 无阴影：滑块与轨道是同一块实底上的两层，阴影只会显脏。
             .clip(UfiCardDefaults.shape)
             .background(background, UfiCardDefaults.shape)
@@ -287,7 +314,9 @@ private fun UfiSegment(
  * 几何改为复用令牌（`SegmentHeight` + `Spacing.Medium`），与 [UfiSingleChipSelector] 的段等高 ——
  * 原来靠 FilterChip 的默认 32dp 高，换掉实现后必须自己钉住，否则两种 chip 并排会差几个 dp。
  *
- * 公开签名与 2026-08-31 版一致（[F24] STABLE-UI-API），只换内部实现。
+ * 公开签名与 2026-08-31 版向后兼容（[F24] STABLE-UI-API）：2026-11-08 只追加了
+ * 三个**带默认值**的尺寸参数（[chipHeight] / [chipPaddingH] / [chipTextStyle]），
+ * 不传时仍走原来的 `SegmentHeight` + `Spacing.Medium` + `captionEmphasis`，既有调用点零改动。
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -301,7 +330,13 @@ fun UfiMultiChipSelector(
      * 供「一组 chip 自带语义色」的场景使用（如 NetworkScreen 的 LTE 绿 / NR 紫频段组），
      * 避免各页面为了换个颜色又手绘一遍 FilterChip。
      */
-    accentColor: Color? = null
+    accentColor: Color? = null,
+    /** chip 高度；默认 [Spacing.SegmentHeight]，频段锁定页传更大的值。 */
+    chipHeight: Dp = Spacing.SegmentHeight,
+    /** chip 横向内边距；默认 [Spacing.Medium]，频段锁定页传更大的值。 */
+    chipPaddingH: Dp = Spacing.Medium,
+    /** chip 文字样式；默认 [UfiTextStyles.captionEmphasis]。 */
+    chipTextStyle: TextStyle = UfiTextStyles.captionEmphasis,
 ) {
     val palette = LocalResolvedPalette.current
     val accent = accentColor ?: palette.accent
@@ -318,6 +353,9 @@ fun UfiMultiChipSelector(
                 selected = value in selectedValues,
                 accent = accent,
                 selectedContainer = selectedContainer,
+                chipHeight = chipHeight,
+                chipPaddingH = chipPaddingH,
+                chipTextStyle = chipTextStyle,
                 onClick = { onToggle(value) }
             )
         }
@@ -373,6 +411,9 @@ private fun UfiMultiChip(
     selected: Boolean,
     accent: Color,
     selectedContainer: Color,
+    chipHeight: Dp,
+    chipPaddingH: Dp,
+    chipTextStyle: TextStyle,
     onClick: () -> Unit
 ) {
     val palette = LocalResolvedPalette.current
@@ -394,7 +435,7 @@ private fun UfiMultiChip(
     )
     Box(
         modifier = Modifier
-            .height(Spacing.SegmentHeight)
+            .height(chipHeight)
             .ufiPressScale(
                 interactionSource = interactionSource,
                 pressedScale = ThemeMotion.PressScale.Chip,
@@ -411,13 +452,13 @@ private fun UfiMultiChip(
                 indication = null,
                 onClick = onClick
             )
-            .padding(horizontal = Spacing.Medium),
+            .padding(horizontal = chipPaddingH),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = label,
             // 与 UfiSegment 同款：两态同字重，避免选中时文本宽度变化导致 FlowRow 重排跳动
-            style = UfiTextStyles.captionEmphasis,
+            style = chipTextStyle,
             color = labelColor,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis

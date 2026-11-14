@@ -29,6 +29,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 监控设置页（v2：入口 + 二级设置界面组合，参考网络/主设置页模式）。
@@ -100,7 +101,7 @@ fun MonitorSettingsScreen(
                 MonitorSettingsGroup.entries.forEach { group ->
                     MonitorSettingsEntryCard(
                         group = group,
-                        onClick = { navController.navigate(group.route) }
+                        onClick = { navController.ufiNavigateOnce(group.route) }
                     )
                 }
             }

@@ -29,6 +29,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「Webhook 通知」配置页（2026-09-09）。入口在 [PushChannelsScreen]。
@@ -299,7 +300,7 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
                         icon = Icons.Default.VpnKey,
                         title = "用引导配置",
                         description = "分 4 步问清：推到哪个服务、那串密钥、推什么级别与场景，填完直接启用",
-                        onClick = { navController.navigate(Routes.DETAIL_WEBHOOK_SETUP) }
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_WEBHOOK_SETUP) }
                     )
                 }
             }
@@ -538,7 +539,7 @@ fun WebhookNotifyScreen(viewModel: MainViewModel, navController: NavHostControll
                         skippedTotal = toolsState.deliveryHistorySkippedTotal
                     ),
                     onClick = {
-                        navController.navigate(Routes.deliveryHistory(DELIVERY_CHANNEL_WEBHOOK))
+                        navController.ufiNavigateOnce(Routes.deliveryHistory(DELIVERY_CHANNEL_WEBHOOK))
                     }
                 )
             }

@@ -35,6 +35,7 @@ import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.launch
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 视频设置 → **封面与下载**（2026-10-14 从 `MediaVideoSettingsScreen` 拆出，内容原样搬运）。
@@ -131,7 +132,7 @@ fun MediaVideoSettingsCoversScreen(
                         },
                         icon = Icons.Default.History,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_DOWNLOADS) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_DOWNLOADS) }
                     )
                 }
             }

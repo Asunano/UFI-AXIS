@@ -129,6 +129,11 @@ class MediaModule(
         scope.launch {
             try {
                 val status = api.getMediaStatus()
+                // 2026-11-03：进媒体页时这次写入会整页重组，正好撞在进场动画里（日志里
+                // `media/status` 的回包时间落在每次 [NavAnim] 的那一帧上）。请求照发，
+                // 只把**落地**压到转场结束 —— 与 ToolsModule / FileManagerModule 同一条做法，
+                // 理由见 `awaitTransitionIdle` 的 KDoc。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 _state.update { s ->
                     s.copy(
                         allFilesAccess = status.all_files_access,
@@ -170,6 +175,9 @@ class MediaModule(
                     limit = PAGE_SIZE,
                     offset = 0
                 )
+                // 首屏列表回包是进场时最重的一次重组（整页列表 + 缩略图）。同 loadStatus：
+                // 请求不推迟，只把写入压到转场之后，避免"动画还在跑、屏幕先跳一下"。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 updateTab(type) {
                     it.copy(
                         items = resp.items,
@@ -217,6 +225,8 @@ class MediaModule(
                     sort = tab.sort,
                     order = tab.order
                 )
+                // 打开目录是"页内布局整体替换"，落地在转场里同样是一帧大重组。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 updateBrowse(type) {
                     it.copy(
                         path = resp.path,

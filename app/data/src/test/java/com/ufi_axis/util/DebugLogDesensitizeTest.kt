@@ -30,6 +30,13 @@ class DebugLogDesensitizeTest {
     }
 
     @Test
+    fun `desensitize masks ticket in query string`() {
+        // 与 core 的 AppLoggerDesensitizeTest 同一条断言（正则逐字一致）
+        assertEquals("ticket***", DebugLog.desensitize("ticket=abc123"))
+        assertEquals("/files/stream?ticket***&x=1", DebugLog.desensitize("/files/stream?ticket=abc123&x=1"))
+    }
+
+    @Test
     fun `desensitize masks password equals value`() {
         assertEquals("password***", DebugLog.desensitize("password=secret123"))
     }

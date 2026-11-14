@@ -35,8 +35,12 @@ class DownloadModule(
      * 文案要说清是**哪一项**（「基础设置已保存」而不是「已保存」）：下载设置有 4 个子页
      * 加一个 Tracker 列表，泛化文案让用户分不清落地的是哪一份。
      */
-    private fun emitWriteNotice(message: String, subtitle: String? = null) {
-        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    private fun emitWriteNotice(
+        message: String,
+        subtitle: String? = null,
+        type: WriteNoticeType = WriteNoticeType.SUCCESS,
+    ) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle, type))
     }
 
     /**

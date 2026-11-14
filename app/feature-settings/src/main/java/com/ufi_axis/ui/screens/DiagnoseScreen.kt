@@ -39,6 +39,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * **诊断中心**（2026-08-30 建页；2026-10-14 改造为注册表驱动）。
@@ -177,7 +178,7 @@ fun DiagnoseScreen(
                                         com.ufi_axis.ui.diagnose.DiagnosticGroup.NETWORK -> "network"
                                         else -> "service"
                                     }
-                                    navController.navigate(Routes.diagnoseGroupRoute(key)) {
+                                    navController.ufiNavigateOnce(Routes.diagnoseGroupRoute(key)) {
                                         launchSingleTop = true
                                     }
                                 },
@@ -191,7 +192,7 @@ fun DiagnoseScreen(
                             title = "高级诊断",
                             description = "字段归一化 / 字段覆盖率 / 响应缓存（会打设备或带写入动作）",
                             onClick = {
-                                navController.navigate(Routes.diagnoseGroupRoute("advanced")) {
+                                navController.ufiNavigateOnce(Routes.diagnoseGroupRoute("advanced")) {
                                     launchSingleTop = true
                                 }
                             },

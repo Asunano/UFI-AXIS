@@ -394,6 +394,13 @@ data class PairingState(
     val notifyEmail: Boolean = false,
     /** 配对申请是否发 Webhook（默认关）。 */
     val notifyWebhook: Boolean = false,
+    /**
+     * 破坏性操作是否额外要配对密码（`OwnerGate`）。**默认 false**。
+     *
+     * 打开后只影响不可逆操作（恢复出厂 / 恢复备份 / root shell / 自定义 shell 任务 /
+     * 删全部日志 / 移除配对设备 / 解封黑名单）；安装 APK、装程序、组件更新、隧道配置不受影响。
+     */
+    val ownerGateEnabled: Boolean = false,
     val devices: List<PairedDeviceItem> = emptyList(),
     /**
      * 配对设备黑名单（2026-10-15）。

@@ -17,8 +17,11 @@ import android.util.Log
  *    拼接/序列化（只有 `DashboardModule` 一处手工加了 `if (DebugLog.enabled)` 守卫），
  *    每 5s 一次的仪表盘轮询就在白烧 CPU。新代码请用 `DebugLog.d("Tag") { "..." }`。
  *
- * 级别策略与 core 的 `AppLogger` 对齐：`w`/`e` 无条件记录（关掉日志也要留错误痕迹），
- * `d`/`i`/`json` 受 [enabled] 控制。
+ * 级别策略与 core 的 `AppLogger.shouldEmit` 对齐（2026-10-30 F1）：`w`/`e` **不受 [masterEnabled]
+ * 约束**（关掉日志也要留错误痕迹），只受 [appEnabled] 约束；`d`/`i`/`json` 还要 [enabled]。
+ *
+ * 对齐前的不一致：core 侧 WARN/ERROR 会无视总开关落盘，而 App 侧 `emit` 第一行 `if (!active) return`
+ * 把错误也拦了 —— 默认部署（总开关 false）下手机端一条错误都不留，与上面这句注释相反。
  */
 object DebugLog {
     private const val GLOBAL_TAG = "UFI-AXIS"
@@ -74,7 +77,7 @@ object DebugLog {
      * 值字符类排除 `&` / `;`，避免 `secret=def&token=ghi` 被整段吞掉。
      */
     private val SENSITIVE_PATTERN = Regex(
-        "(?i)(token|secret|password|bearer)\\b[ \\t]*[\"']?[ \\t]*:?[ \\t]*=?[ \\t]*" +
+        "(?i)(token|secret|password|bearer|ticket|pairing_code|approval_code)\\b[ \\t]*[\"']?[ \\t]*:?[ \\t]*=?[ \\t]*" +
             "(?:\"[^\"']*|'[^ \"']*|[^\"'\r\n\\s,;&}]{1,128})"
     )
 
@@ -145,8 +148,8 @@ object DebugLog {
 
     /** 唯一出口：开关 → 重复折叠 → 脱敏 → Logcat → 内存缓冲。 */
     private fun emit(level: LogLevel, tag: String, msg: String, tr: Throwable? = null) {
-        // 开关：关闭后连脱敏正则都不跑（高频日志下正则才是真开销）
-        if (!active) return
+        // 2026-10-30 F1：与 core `AppLogger.shouldEmit` 同口径（见 [shouldEmit]）
+        if (!shouldEmit(level, masterEnabled, appEnabled)) return
         // 重复折叠：设备离线时同一条失败日志会按轮询节拍无限重复（实测 2s 一条，
         // 一次 20 分钟离线写出 600 行一模一样的 ConnectException）。
         val gated = repeatGate(level, tag, msg) ?: return
@@ -161,6 +164,21 @@ object DebugLog {
         // 异常堆栈并进同一条，否则日志页里「错误」和「它的堆栈」会被筛选拆开
         val buffered = if (tr == null) safe else "$safe\n${tr.stackTraceToString()}"
         AppLogBuffer.add(level, tag, buffered)
+    }
+
+    /**
+     * 这一条是否应记录（2026-10-30 F1，纯函数便于单测）。
+     *
+     * 与 core `AppLogger.shouldEmit` **逐条同口径**：
+     * - [appEnabled] 是「这台手机要不要日志」的显式选择，关掉就一条不记（含 WARN/ERROR）；
+     * - [masterEnabled] 是总闸，只压 DEBUG/INFO —— WARN/ERROR 仍要留痕，
+     *   否则默认部署（总开关 false）下手机端一条错误都没有，排障时无从下手。
+     *
+     * 之所以抽成纯函数：`emit` 里要调 `android.util.Log`，JVM 单测一碰就抛，门禁逻辑就测不到。
+     */
+    internal fun shouldEmit(level: LogLevel, masterEnabled: Boolean, appEnabled: Boolean): Boolean {
+        if (!appEnabled) return false
+        return level >= LogLevel.WARN || masterEnabled
     }
 
     // ── 重复行折叠（2026-09-04，与 core `AppLogger.repeatGate` 同一策略）──

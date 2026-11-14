@@ -254,8 +254,13 @@ fun ServerConfigScreen(
                             Text("配对密码", style = MaterialTheme.typography.titleSmall,
                                 color = palette.accent)
                             Text(
-                                "客户端连接本服务时验证的密码；修改后旧密码立即失效，" +
-                                    "已配对的客户端下次验证需使用新密码。",
+                                // 2026-11-14 实测纠正：这句原来是「修改后旧密码立即失效，
+                                // 已配对的客户端下次验证需使用新密码」—— 前半句对，后半句错。
+                                // `changePassword(revokeAllDevices = false)`（默认）只换密码，
+                                // 已配对设备用各自的 ECDSA 凭据，**不会**掉线；
+                                // 新密码只影响「后续配对」与「主人密码门」。
+                                "用于新设备配对，以及开启「不可逆操作保护」后确认破坏性操作。" +
+                                    "修改后旧密码立即失效；已配对的设备不受影响，无需重新配对。",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = palette.textSecondary
                             )

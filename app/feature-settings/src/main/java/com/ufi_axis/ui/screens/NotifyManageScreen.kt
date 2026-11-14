@@ -29,6 +29,7 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「通知管理」——通知类开关 + 告警类设置 + 系统通知记录。
@@ -214,7 +215,7 @@ fun NotifyManageScreen(
                     description = "离线上线 · 流量预警 · 短信 · 下载 · 设备事件 · 内网穿透",
                     value = "$dailyOn/${DAILY_NOTIFY_SCENES.size} 项开启",
                     enabled = gateOn,
-                    onClick = { navController.navigate(Routes.DETAIL_DAILY_NOTIFY) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DAILY_NOTIFY) }
                 )
             }
 
@@ -293,7 +294,7 @@ fun NotifyManageScreen(
                     title = "系统通知记录",
                     description = "每条提醒的结果，包括没提醒成功的原因",
                     value = if (toolsState.notifyHistoryLoaded) "共 ${toolsState.notifyHistoryTotal} 条" else "加载中",
-                    onClick = { navController.navigate(Routes.DETAIL_NOTIFY_HISTORY) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_NOTIFY_HISTORY) }
                 )
             }
 

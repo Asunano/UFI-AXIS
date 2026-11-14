@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.resources
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import android.content.Context
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -244,10 +245,12 @@ fun ResourceCard(
         }
     }
 
-    pendingConfirm?.let { confirm ->
+    val dialogConfirm = rememberLastNonNull(pendingConfirm)
+    if (dialogConfirm != null) {
+        val confirm = dialogConfirm
         when (confirm) {
             is Confirm.Uninstall -> UfiConfirmDialog(
-                visible = true,
+                visible = pendingConfirm != null,
                 title = "卸载 ${confirm.title}",
                 text = "会删除设备上「${descriptor.name}」的这一份文件与元数据。" +
                     "已有配置不受影响，但在重新安装前对应功能无法启动。",
@@ -261,7 +264,7 @@ fun ResourceCard(
             )
 
             Confirm.Rollback -> UfiConfirmDialog(
-                visible = true,
+                visible = pendingConfirm != null,
                 title = "回滚「${descriptor.name}」",
                 text = "将把设备上的「${descriptor.name}」换回上一个版本。\n\n" +
                     "备份只有一份，回滚后即被消耗，无法再回滚。",
@@ -275,7 +278,7 @@ fun ResourceCard(
             )
 
             Confirm.Clear -> UfiConfirmDialog(
-                visible = true,
+                visible = pendingConfirm != null,
                 title = "恢复内置「${descriptor.name}」",
                 text = "将删除设备上已上传的「${descriptor.name}」及其备份，改用随包分发的版本。\n\n" +
                     "删除后无法回滚到已上传版本，需要时请重新上传。",

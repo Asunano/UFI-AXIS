@@ -123,7 +123,7 @@ fun SponsorsScreen(navController: NavHostController) {
             remote = parsed
         } else if (notifyFailure) {
             // 校验不过与请求失败在这里是同一句：对用户来说都是"没拿到能用的名单"
-            toastMessage = ToastMessage("没拿到可用的名单，继续显示内置那份", ToastType.ERROR)
+            toastMessage = ToastMessage("没拿到可用的名单，继续显示内置那份", ToastType.WARNING)
         }
     }
 

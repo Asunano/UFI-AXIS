@@ -4,9 +4,9 @@ package com.ufi_axis.ui.components.common
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,8 +37,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
@@ -134,7 +136,8 @@ private const val UfiDropdownDisabledAlpha = 0.4f
 /**
  * 下拉单选字段 —— 全站唯一实现。
  *
- * 触发器：[UfiDropdownTriggerHeight] 高的 `surfaceMuted` 卡片，值居中 + 可选单位后缀 + 线性下箭头。
+ * 触发器：[UfiDropdownTriggerHeight] 高的 `surfaceMuted` 软填充（2026-11-11 用户要求去掉灰色
+ * 描边：可点性靠这层中性浅底表达，不再画边框），值居中 + 可选单位后缀 + 线性下箭头。
  * 弹层：手写 [Popup]（**不用 M3 `DropdownMenu`** —— 它内部自带 `verticalScroll`，再套一层会以
  * 无限高度约束测量而抛 `IllegalStateException`，且容器色不走 palette），宽度 = 触发器**实测宽度**、
  * [maxVisibleItems] 项限高滚动、打开时自动把选中项滚到可见区、下方空间不足时向上弹、
@@ -232,12 +235,18 @@ fun <T> UfiDropdown(
             }
         }
 
+        // 让 Popup 的锚点就是触发器本身。此前 Popup 挂在 BoxWithConstraints 下，
+        // 锚点其实是外层字段（可能比触发器宽），菜单会从触发器右侧多出一截。
+        Box(
+            modifier = Modifier.then(
+                if (fillWidth) Modifier.fillMaxWidth() else Modifier.wrapContentWidth()
+            )
+        ) {
         Surface(
             onClick = { expanded = !expanded },
             enabled = enabled,
             shape = shape,
             color = palette.surfaceMuted,
-            border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.6f)),
             // 2026-10-10：**宽度**也扁平化 —— 原 fillMaxWidth() 触发器撑满整行，在「标签: 控件」
             // 同行布局下控件宽度与左侧标签相加远超一行，视觉上仍是「一个大盒子」。改为按内容宽度
             // 撑开（wrapContentWidth），并用 [UfiDropdownTriggerMinWidth] 保底：太窄的触发器
@@ -330,8 +339,10 @@ fun <T> UfiDropdown(
 
                 Surface(
                     shape = shape,
-                    color = palette.cardBg,
-                    border = BorderStroke(1.dp, palette.textSecondary.copy(alpha = 0.5f)),
+                    // 去掉描边后不能再和白色卡片同底，否则浮层与背景融成一片，
+                    // 选项看起来像直接浮在卡片文字上。用 pageBg 再压 5% 中性色，
+                    // 浅色/深色两种主题都能看出这是一块独立面板。
+                    color = lerp(palette.pageBg, palette.textPrimary, 0.05f),
                     modifier = Modifier
                         .width(triggerWidth)
                         .heightIn(max = popupMaxHeight)
@@ -360,7 +371,13 @@ fun <T> UfiDropdown(
                             val selected = option == selectedValue
                             // 选中态底色/文字色 tween 过渡，避免点选瞬间的硬切换
                             val rowBg by animateColorAsState(
-                                targetValue = if (selected) palette.accent.copy(alpha = 0.12f) else palette.cardBg,
+                                // 未选中项必须透明：菜单底已经是一层带色面板，
+                                // 再铺 cardBg 会把整块菜单刷回白色，和卡片融在一起。
+                                targetValue = if (selected) {
+                                    palette.accent.copy(alpha = 0.12f)
+                                } else {
+                                    Color.Transparent
+                                },
                                 animationSpec = tween(ThemeMotion.Duration.Base),
                                 label = "dropdownItemBg"
                             )
@@ -402,6 +419,7 @@ fun <T> UfiDropdown(
                     }
                 }
             }
+        }
         }
     }
 }
@@ -445,7 +463,8 @@ private class UfiDropdownPositionProvider(
         val openUpward = popupContentSize.height > spaceBelow && spaceAbove > spaceBelow
         onOpenUpwardChange(openUpward)
 
-        val x = anchorBounds.left.coerceIn(
+        // 设置行里的下拉都靠右；浮层右边对齐触发器右边，避免从触发器右侧多出一截。
+        val x = (anchorBounds.right - popupContentSize.width).coerceIn(
             edgeMarginPx,
             (windowSize.width - popupContentSize.width - edgeMarginPx).coerceAtLeast(edgeMarginPx)
         )

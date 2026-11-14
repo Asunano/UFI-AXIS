@@ -207,6 +207,36 @@ class AppPreferences(private val context: Context) {
         get() = prefs.getBoolean(KEY_CORE_LOG_ENABLED, true)
         set(value) = prefs.edit().putBoolean(KEY_CORE_LOG_ENABLED, value).apply()
 
+    /** 远程屏幕渲染方式：true = Surface 直绘（GPU），false = 像素路径。 */
+    var screenSurfaceMode: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_SURFACE_MODE, true)
+        set(value) = prefs.edit().putBoolean(KEY_SCREEN_SURFACE_MODE, value).apply()
+
+    /**
+     * 一次性迁移标记：Surface 是新的默认渲染方式。
+     * 旧安装里可能残留 false（像素路径），首次进入远程屏幕时升级到 Surface；
+     * 之后用户仍可在菜单里主动切回像素路径，并会正常持久化。
+     */
+    var screenSurfaceDefaultMigrated: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_SURFACE_DEFAULT_MIGRATED, false)
+        set(value) = prefs.edit().putBoolean(KEY_SCREEN_SURFACE_DEFAULT_MIGRATED, value).apply()
+
+    /**
+     * 远程屏幕**画面模式**：`true` = 快照（兼容模式，1–2 fps），`false` = 硬解（实时）。
+     *
+     * 默认 `false`（硬解）：硬解是正常路径，快照只是兼容手段 —— 没有 Surface、
+     * 厂商解码器不兼容、或网络只允许轮询时才用得上。用户手动切过就以他的选择为准，
+     * 但**自动降级不写这里**（见 RemoteScreenScreen 里 6 秒兜底那段）。
+     */
+    var screenStillMode: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_STILL_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_SCREEN_STILL_MODE, value).apply()
+
+    /** 见 [KEY_SCREEN_SURFACE_PENDING]：只用于崩溃自愈，不要当业务状态读。 */
+    var screenSurfacePending: Boolean
+        get() = prefs.getBoolean(KEY_SCREEN_SURFACE_PENDING, false)
+        set(value) = prefs.edit().putBoolean(KEY_SCREEN_SURFACE_PENDING, value).apply()
+
     var debugMode: Boolean
         get() = prefs.getBoolean(KEY_DEBUG_MODE, false)
         set(value) {
@@ -737,6 +767,20 @@ class AppPreferences(private val context: Context) {
         private const val KEY_APP_LOG_ENABLED = "app_log_enabled"
         private const val KEY_CORE_LOG_ENABLED = "core_log_enabled"
         private const val KEY_DEBUG_MODE = "debug_mode"
+    /** 远程屏幕渲染方式：true = Surface 直绘（GPU 合成），false = 像素路径（Bitmap + 逐像素换算） */
+    private const val KEY_SCREEN_SURFACE_MODE = "screen_surface_mode"
+    private const val KEY_SCREEN_SURFACE_DEFAULT_MIGRATED = "screen_surface_default_migrated"
+
+    /** 画面模式（快照 / 硬解），见 [screenStillMode]。默认硬解。 */
+    private const val KEY_SCREEN_STILL_MODE = "screen_still_mode"
+    /**
+     * "进了 Surface 路径但没干净退出"的标记。
+     *
+     * Surface 渲染一旦 native 崩溃，Java 层兜不住、也没有机会写日志 ——
+     * 唯一可靠的自救是**进路径前先落标记、正常释放时清掉**；下次进来若发现标记还在，
+     * 说明上一次是异常死亡，自动回退到像素路径，避免崩溃循环。
+     */
+    private const val KEY_SCREEN_SURFACE_PENDING = "screen_surface_pending"
         /** 本机调试入口解锁标记（与 core 的 `debug_mode` 无关，见 [debugEntryUnlocked]）。 */
         private const val KEY_DEBUG_ENTRY_UNLOCKED = "debug_entry_unlocked"
         /** 已提示过的 core 崩溃时间戳（见 [coreCrashShownAt]）。 */

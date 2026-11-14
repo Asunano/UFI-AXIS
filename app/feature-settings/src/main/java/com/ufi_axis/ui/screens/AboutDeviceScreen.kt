@@ -57,61 +57,36 @@ import com.ufi_axis.util.UpdateSource
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
- * 关于页（2026-08-12 重构，对齐旧项目 UFITOOLS-Widget About 界面；2026-08-13 融合「关于 + 更新」）。
+ * 「关于」页。
  *
- * - 顶部：App 图标（自动获取桌面图标）+ 版本号文本（"Version x.x.x"）+ 一句话简介——
- *   版本号连续点击 5 次激活调试模式，激活后再点击直接跳转 DebugLog 页（Routes.DETAIL_DEBUG_LOG）；
- * - 「更新」区：「更新设置」行 → UpdateSettingsDialog；「检查更新」主按钮 → 打开**全局唯一**的
- *   统一更新弹窗（UnifiedUpdateDialog，由 MainActivity 渲染，本页只负责触发检查并 show()）；
- * - 「项目」卡片组：开源地址 / 作者博客（blog.losn.cc）。
+ * 结构：
+ * - 顶部身份区：应用图标（取自桌面图标）、版本号文本（"Version x.x.x"）与一句话定位。
+ *   版本号连续点击 5 次解锁调试入口（相邻点击间隔不超过 1500ms），解锁后再点击直接进入
+ *   调试日志页（[Routes.DETAIL_DEBUG_LOG]）；
+ * - 「更新」区：「更新设置」行 → UpdateSettingsDialog；「检查更新」主按钮 → 打开全局唯一的
+ *   统一更新弹窗（UnifiedUpdateDialog 实例挂在 MainActivity，本页只触发检查并调用 show()）；
+ * - 常显入口：「备份与恢复」「诊断中心」「资源中心」「赞助与感谢」；
+ * - 「调试」组（仅解锁后可见）：调试模式开关、调试日志、组件画廊；
+ * - 「项目」区：开源地址、作者博客、开源许可（第三方组件声明）。
  *
- * 2026-08-27：
- * - 删除「设备信息」组（固件/基带/型号）——固件与基带首页 HomeDeviceInfoCard 已展示，设备型号是本机
- *   Build.MODEL 而非 UFI 设备，放在「关于 UFI-AXIS」里语义错位；
- * - 删除「工具 → 日志管理」入口，日志页只保留版本号连点这一条隐藏入口（调试日志开关随之迁进日志页本身）。
+ * 调试入口的解锁状态存于 [AppPreferences.debugEntryUnlocked]，它是纯本机 UI 门禁，与
+ * [AppPreferences.debugMode]（日志详细级别，真源在 core）是两个独立状态：解锁只控制入口
+ * 显形，日志级别只在日志页修改并下发 core。两者合并会使解锁动作同时打开全量 DEBUG/INFO
+ * 落盘（仅写本地、不下发，与 core 的值分叉），并在下一次 `refreshDeviceConfig()` 时被
+ * core 的 false 覆写。
  *
- * 调试入口的解锁状态用 [AppPreferences.debugEntryUnlocked]（**纯本机 UI 门禁**）。
- * 2026-09-04：此前这里复用的是 [AppPreferences.debugMode] —— 那是「日志详细级别」，真源在 core。
- * 结果连点解锁会顺手把全量 DEBUG/INFO 落盘打开（只写本地、不下发，与 core 分叉），
- * 而下一次 `refreshDeviceConfig()` 又会用 core 的 false 把解锁状态清掉。
- * 现在两者彻底分开：解锁只是本机的显形开关，日志开关只在日志页里改并下发给 core。
+ * 诊断中心在本页常显，且本页是它唯一的常显入口：其用途正是服务异常时的排查，而隐藏在
+ * 需要解锁的组里会使其在最需要时不可达。该路由（[Routes.DETAIL_DIAGNOSE]）只有这一个页面。
  *
- * 2026-08-30：调试模式激活后额外显形「调试」卡片组（调试日志 / 运行诊断）。
- * 2026-10-14：诊断中心在**本页**浮到常显（见下），"运行诊断只经隐藏调试入口进入"那句口径
- *   就此作废。它**只有本页这一个常显入口** —— 中途一度在设置页（Hero 卡正下方）补过一颗
- *   浅入口，同日按用户要求撤回（原话：「诊断中心入口放在关于界面，**不要在设置界面
- *   （Hero 卡正下方）出现**」）。调试组里那条「运行诊断」保留（同一个页面，不是第二个诊断页）。
- * 2026-09-26：该组首行补了「调试模式」开关 —— 解锁此前是**单向**的（只有 `= true`），
- * 关不掉，用户只能清数据才能把调试入口收回去。
+ * 赞赏只有一颗按钮，动作是打开 [DonateDialog]（支付宝 / 微信两张码）。本页不提供其他赞赏
+ * 入口，也不存在独立的赞赏页：额外入口会成为同一批位图的第二个解码 / 渲染点，而多实例
+ * 渲染是该大尺寸位图解码问题的复发条件（见 [rememberDonateQrBitmaps] 的三层设防）。
  *
- * 2026-10-14：新增两颗**常显**行卡 —— 「诊断中心」（→ [Routes.DETAIL_DIAGNOSE]）与
- * 「赞助与感谢」（→ [Routes.DETAIL_SPONSORS]）。
- *  · 诊断中心从隐藏调试组里"浮"到常显：那一组要连点版本号 5 次才出现，而"服务不对劲"
- *    正是最需要它的时候 —— 用户不会先去解锁一个隐藏入口。
- *  · 「赞助与感谢」= 赞助名单（→ [Routes.DETAIL_SPONSORS]），与赞赏码是两件事。
- *
- * 2026-10-14（同日收口）：**赞赏恢复成"按钮 + 弹窗"，而且只有那一颗按钮**。
- * 这一块反复过一轮，结论钉在这里，别再改回去：
- *  · 中途曾把赞赏码拆成独立整页 `DonateScreen`（路由 `detail/donate`），本页再加一颗
- *    「赞赏」行卡作为入口；
- *  · 用户随后报障并明确要求：「赞赏按钮打开闪退，app 端恢复之前的赞赏按钮修改，
- *    **不需要额外的赞赏入口，只需要按钮即可**」—— 于是：
- *      - 删掉本页那颗「赞赏」行卡（就是"额外的赞赏入口"）；
- *      - 那颗 `UfiButtonVariant.Donate` 按钮改回**打开赞赏弹窗**（两张码：支付宝 / 微信），
- *        见 [DonateDialog]；
- *      - `DonateScreen.kt` / `Routes.DETAIL_DONATE` / `appRoutes` 条目 / `AppScreens` 登记
- *        **四处一并删除**。按钮不再指向它，留着就是一条没有任何入口的死路由；更要紧的是
- *        它会成为同一批 1260px 位图的**第二个解码 / 渲染点**，而"打开赞赏就崩"正是那种
- *        多点渲染才复发的问题（见下面那三个私有件的注释）。
- *  · 全仓**只有** [DonateDialog] 一处渲染那两张赞赏码位图。
- *
- * 2026-10-14（同日）：再补一颗常显行卡「资源中心」（→ [Routes.DETAIL_RESOURCES]）。
- * 该页此前**只**挂在内网穿透设置与服务器配置里，那两处都是"缺了组件 / 面板坏了，顺路去装"
- * 的上下文入口 —— 缺一条**与具体故障无关**的常规入口，用户不点进内网穿透就看不到这一页。
- * 内网穿透 / 服务器配置那两处上下文入口**保留不动**（用途不同：那两处是"正好在这儿，顺手装"，
- * 这里这颗是"我要找可下载的资源"）。详见下方行卡处的注释。
+ * 「资源中心」另有两处上下文入口（内网穿透设置、服务器配置），用途不同：那两处是
+ * 「缺组件时就地安装」，本页这一颗与具体故障无关。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -135,28 +110,26 @@ fun AboutDeviceScreen(
     // 后端 Core 版本：走 DashboardModule 的 /api/config/version（UpdateState.serverVersion）。
     // 不用 tools.updateDeviceState.current_version —— 本页的 LaunchedEffect 会把那个 state 重置成 null。
     val serverUpdateState by viewModel.updateState.collectAsState()
-    // 2026-09-06：本页不再持有「更新弹窗是否可见」的布尔开关，也不再自己渲染更新弹窗 ——
-    // 可见性的唯一真源是 viewModel.updatePrompt（UpdatePromptModule），弹窗实例只有一个，
-    // 挂在 MainActivity 上。本页点「检查更新」只做两件事：触发检查、调 show() 打开那个槽。
-    // 原来这里是 `var showUpdateCheckDialog by remember`，与 MainActivity 的
-    // `var showUpdateDialog by remember` 互不知情，两个弹窗会叠加成两层 scrim。
+    // 更新弹窗的可见性唯一真源是 viewModel.updatePrompt（UpdatePromptModule），弹窗实例
+    // 只有一个、挂在 MainActivity 上。本页的「检查更新」只做两件事：触发检查、调用 show()。
+    // 本页不持有弹窗可见性布尔值，也不渲染弹窗实例：两处各自持有实例会叠加出两层遮罩。
     //
-    // checkRequested 保留：它不是弹窗开关，而是"本次停留里用户主动点过检查"的闸 ——
-    // frontendUpdateState 是 ViewModel 级的，上次检查的结果会留在里面，
-    // 没有这个闸，进关于页的第一帧就会因为旧 state 弹 toast / 打开弹窗。
+    // checkRequested 是「当前停留期间用户主动触发过检查」的闸，与弹窗可见性无关：
+    // frontendUpdateState 属 ViewModel 级，上一次检查的结果会保留；缺少该闸时，进入本页的
+    // 第一帧就会依据旧 state 弹 toast 或打开弹窗。
     var checkRequested by remember { mutableStateOf(false) }
     var showUpdateSettingsDialog by remember { mutableStateOf(false) }
     var showApkPushDialog by remember { mutableStateOf(false) }
-    // 赞赏弹窗（2026-10-14 恢复）：本页那颗「赞赏」按钮**唯一**的动作。
+    // 赞赏弹窗可见性：本页「赞赏」按钮唯一的动作。
     //
-    // ★ 它同时是解码闸门：`visible == false` 时一张位图都不解（见 [rememberDonateQrBitmaps]
-    //   的 `enabled`）。两张 1260px 级的码合计 565K，进关于页就同步解会在首帧顿一下 ——
-    //   而"进关于页"比"点赞赏"频繁得多，所以解码必须挂在弹窗可见性上，不能挂在页面组合上。
+    // 它同时是解码闸门：`visible == false` 时不解码任何位图（见 [rememberDonateQrBitmaps]
+    // 的 `enabled`）。两张 1260px 级位图合计 565K，页面组合时同步解码会拖慢首帧；进入本页
+    // 的频率远高于打开赞赏弹窗，因此解码必须挂在弹窗可见性上。
     var showDonateDialog by remember { mutableStateOf(false) }
     var updateSourceMode by remember { mutableStateOf(prefs.updateSourceMode) }
-    // 打开「更新设置」那一刻的下载方式快照，用于关闭时判断是否真的改过。
-    // 之前是无条件同步：每次点开再关就打一次设备写请求，还弹一次 toast；设备不在线时
-    // 更是每次都弹「同步失败」，而用户其实什么都没改。
+    // 打开「更新设置」时的下载方式快照，用于关闭时判断是否确有变更。
+    // 无条件下发会在每次打开后关闭时产生一次设备写请求与一次 toast；设备不在线时还会在
+    // 用户未做任何修改的情况下报同步失败。
     var modeOnOpen by remember { mutableStateOf("") }
 
     // 「当前国家/地区」只做展示：真源在 core（启动时自动检测一次并落盘，见 `/api/geo`）。
@@ -198,23 +171,23 @@ fun AboutDeviceScreen(
         }
     }
 
-    // 调试模式激活状态 + 版本号点击计数（对齐旧项目 AboutActivity：1.5s 内连续点击）
+    // 调试模式激活状态 + 版本号点击计数（连续点击窗口 1500ms）
     var debugActivated by remember { mutableStateOf(prefs.debugEntryUnlocked) }
     var versionClickCount by remember { mutableIntStateOf(0) }
     var versionClickLastTime by remember { mutableLongStateOf(0L) }
 
     LaunchedEffect(Unit) {
-        // 2026-09-14：更新期间这两件事都不能做。
-        // 用户在等设备升级时最可能停留的就是本页，而返回再进来会重跑这个 LaunchedEffect：
-        // - resetUpdateDeviceState() 会清掉进度状态并**停掉轮询** —— 那是「读到安装结果」的
-        //   唯一通道，掐掉之后设备端状态机就再没人能把它从 installing 里领出来
-        //   （详见 core 的 UpdateManager.selfHealStuckState）；
-        // - checkForUpdate() 此刻必然失败，只会多冒一句「检查更新失败」。
+        // 更新期间不得执行以下两项操作：此时用户最可能停留在本页，重新进入会重跑本
+        // LaunchedEffect。
+        // - resetUpdateDeviceState() 会清除进度状态并停止轮询，而轮询是读取安装结果的唯一
+        //   通道；停止后设备端状态机可能停留在 installing（见 core 的
+        //   UpdateManager.selfHealStuckState）；
+        // - checkForUpdate() 在更新期间必然失败，只会额外产生一条「检查更新失败」。
         if (viewModel.tools.coreUpdating.value) return@LaunchedEffect
-        // P0：进入关于页时重置推送状态，防止残留 uploading/installing 导致弹窗误显示
+        // 进入本页时重置推送状态，避免残留的 uploading / installing 使弹窗误显示。
         viewModel.tools.resetUpdateDeviceState()
-        // 补拉一次后端版本：UpdateState 是 ViewModel 级的，App 启动那次若后端不可达，
-        // catch 分支会把 serverVersion 重置为 null 且不再自动重试。只是一个轻量 GET。
+        // 补拉一次后端版本：UpdateState 属 ViewModel 级，应用启动时若后端不可达，
+        // 失败分支会把 serverVersion 置为 null 且不再自动重试。该请求为轻量 GET。
         viewModel.dashboard.checkForUpdate()
     }
 
@@ -227,14 +200,14 @@ fun AboutDeviceScreen(
         when {
             debugActivated -> {
                 // 调试模式已激活 → 直接进入日志页。
-                // launchSingleTop：连点版本号会一次点一次 navigate，不加就会往返回栈里堆
-                // 多个日志页实例（表现为「重复进入」，退出要按好几次返回）。
+                // launchSingleTop：连续点击会逐次触发 navigate，缺此参数会在返回栈中堆积
+                // 多个日志页实例，表现为重复进入、需要多次返回。
                 versionClickCount = 0
-                navController.navigate(Routes.DETAIL_DEBUG_LOG) { launchSingleTop = true }
+                navController.ufiNavigateOnce(Routes.DETAIL_DEBUG_LOG) { launchSingleTop = true }
             }
             versionClickCount >= 5 -> {
-                // 只解锁本机的调试入口显形；**不动**日志开关（那是 core 的 debug_mode，
-                // 要改请去日志页，那里会下发给 core 并回读确认）
+                // 只解锁本机调试入口的显形，不修改日志开关（后者对应 core 的 debug_mode，
+                // 需在日志页修改，那里会下发 core 并回读确认）。
                 prefs.debugEntryUnlocked = true
                 debugActivated = true
                 versionClickCount = 0
@@ -305,18 +278,18 @@ fun AboutDeviceScreen(
                             .clickable { onVersionClick() }
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
-                    // 后端 Core 版本单独一行：前端与后端是两个独立发版的 APK（version.json 里
-                    // frontend / backend 各一个对象），版本号经常不一致，只显示前端的会让人误判。
-                    // 拿不到时显示「未连接」而不是隐藏 —— 空着会让人以为这一行不存在。
+                    // 后端 Core 版本单独一行：前端与后端是独立发版的两个 APK（version.json
+                    // 中 frontend / backend 各一个对象），版本号经常不一致，只显示前端版本
+                    // 会造成误判。取不到时显示「未连接」而非隐藏：空白会被理解为该信息不存在。
                     Text(
                         text = "Core ${serverUpdateState.serverVersion ?: "未连接"}",
                         style = UfiTextStyles.caption,
                         color = palette.textSecondary.copy(alpha = 0.7f)
                     )
-                    // 折合简介：与 README / 仓库 About 同一口径的一句话定位。
-                    // 放在版本号下方而不是单独开一组——「关于」页顶部本来就是身份区（图标 + 名称 + 版本），
-                    // 简介属于同一块信息，单独成组会让首屏出现两个都在讲「这是什么」的卡片。
-                    // 注意：不要在这段里塞技术栈或模块清单，那些在仓库 README 里，写进 App 只会随迭代过期。
+                    // 一句话定位：与 README / 仓库 About 保持同一口径。
+                    // 位于版本号下方而不单独成组：本页顶部是身份区（图标 + 名称 + 版本），
+                    // 简介属于同一块信息，单独成组会使首屏出现两张都描述「这是什么」的卡片。
+                    // 此处不列技术栈或模块清单：这类信息随迭代变化，只维护在仓库 README。
                     Spacer(Modifier.height(Spacing.Medium))
                     Text(
                         text = "为随身 WiFi / CPE 提供第三方管理端：后端服务运行在设备本身，" +
@@ -329,16 +302,13 @@ fun AboutDeviceScreen(
                         modifier = Modifier.padding(horizontal = Spacing.CardPadding)
                     )
 
-                    // ── 赞赏入口（对齐旧项目 activity_about 的 btn_donate）──
-                    // 走公共 UfiButton 的 Donate 档（DonatePink 描边，几何同 Secondary），
-                    // 而不是手搓一个 Row+Icon 的伪按钮：关于页只有这一个可点操作，
-                    // 几何必须和全站按钮一致，只有配色是刻意例外。
+                    // ── 赞赏入口 ──
+                    // 使用公共 UfiButton 的 Donate 档（DonatePink 描边，几何同 Secondary），
+                    // 不使用手写的 Row + Icon 伪按钮：本页只有一个可点操作，几何必须与全站
+                    // 按钮一致，仅配色刻意例外。
                     //
-                    // 2026-10-14：动作回到**打开赞赏弹窗**（[DonateDialog]，两张码：支付宝 / 微信）。
-                    // 中途改成跳 `detail/donate` 整页的那一版已随该页一起删除 —— 用户要的是
-                    // 「不需要额外的赞赏入口，只需要按钮即可」，所以这里也是全页唯一的赞赏入口
-                    //（原来下方还有一颗同样指向赞赏码的「赞赏」行卡，已删）。
-                    // 按钮本身、Donate 档与 DonatePink 配色都不动。
+                    // 动作是打开赞赏弹窗（[DonateDialog]，两张码：支付宝 / 微信）。本页不设
+                    // 指向赞赏码的独立页面或其他行卡：该按钮即唯一的赞赏入口。
                     Spacer(Modifier.height(Spacing.Large))
                     UfiButton(
                         text = "赞赏",
@@ -347,8 +317,8 @@ fun AboutDeviceScreen(
                         size = UfiButtonSize.Small,
                         onClick = { showDonateDialog = true }
                     )
-                    // 底部不再补 Spacer：UfiSettingsGroup 自身已有 Spacing.CardPadding（20dp）内距，
-                    // 再加一个 Medium 会让卡片下缘空出 28dp，整张身份卡看着重心下坠。
+                    // 底部不追加 Spacer：UfiSettingsGroup 自带 Spacing.CardPadding（20dp）
+                    // 内距，再加一个 Medium 会使卡片下缘留出 28dp 空白，身份区重心下移。
                 }
             }
 
@@ -374,8 +344,8 @@ fun AboutDeviceScreen(
 
                 )
                 Spacer(Modifier.height(Spacing.Medium))
-                // 「检查更新」放进卡片内部：原来它是卡片之间的一个独立按钮，
-                // 左右靠 CardHorizontalMargin 对齐但上下间距与卡片间距叠加，看着像浮在两组之间。
+                // 「检查更新」置于卡片内部：作为卡片之间的独立按钮时，它同时受
+                // CardHorizontalMargin 约束与卡片间距叠加，视觉上浮在两组之间。
                 UfiButton(
                     text = if (frontendState.state == "checking") "正在检查更新…" else "检查更新",
                     enabled = frontendState.state !in setOf("checking", "downloading", "installing"),
@@ -388,13 +358,13 @@ fun AboutDeviceScreen(
                     }
                 )
             }
-            // 检查完成决策：App 侧无更新→toast；有更新→打开**统一更新弹窗**那个唯一的槽
-            //（弹窗实例在 MainActivity；本页只 show()，所以不可能与自动提示叠加）。
-            // 必须由 checkRequested 把闸——LaunchedEffect 首次组合就会跑一遍，
-            // 上次检查留下的 state（例如 no_update）会让人一进关于页就弹一个莫名其妙的提示。
+            // 检查完成后的分支：App 侧无更新→toast；有更新→打开统一更新弹窗唯一的那个槽
+            //（弹窗实例在 MainActivity，本页只调用 show()，因此不会与自动提示叠加）。
+            // 必须由 checkRequested 把闸：LaunchedEffect 首次组合即执行一次，
+            // 上一次检查留下的 state（例如 no_update）会导致进入本页时立即弹出无关提示。
             //
-            // no_update 走 toast 而不是打开弹窗：core 那侧若有更新，自动提示已经弹过一次了，
-            // 这里再开一个"App 已最新 + Core 有更新"的弹窗属于重复打扰。
+            // no_update 走 toast 而非打开弹窗：若 core 侧有更新，自动提示已经给出；
+            // 再弹一个「App 已最新 + Core 有更新」的弹窗属于重复提示。
             LaunchedEffect(frontendState.state, frontendState.latestVersion) {
                 if (!checkRequested) return@LaunchedEffect
                 when (frontendState.state) {
@@ -416,93 +386,85 @@ fun AboutDeviceScreen(
             }
 
             // ══════════ 备份与恢复 ══════════
-            // 放在关于页而不是设置一级页：它是整机维护动作，与设置页那些"改某一项配置"的入口
-            // 不是同一类；和更新一样，一年用不到几次。
+            // 该入口位于关于页而非设置一级页：它是对整机的维护动作，与设置页「修改某一项
+            // 配置」的入口不同类，使用频率与更新相当。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = Icons.Filled.Backup,
                     title = "备份与恢复",
                     description = "导出配置备份包 · 从备份文件恢复",
                     onClick = {
-                        navController.navigate(Routes.DETAIL_BACKUP_RESTORE) { launchSingleTop = true }
+                        navController.ufiNavigateOnce(Routes.DETAIL_BACKUP_RESTORE) { launchSingleTop = true }
                     },
                     trailing = { UfiSettingsChevron() }
                 )
             }
 
-            // ══════════ 诊断中心（2026-10-14 从隐藏调试组浮到常显）══════════
-            // 为什么不继续只留隐藏入口：那一组要连点版本号 5 次才出现，而"服务不对劲"正是
-            // 最需要这一页的时候 —— 用户不会先去解锁一个隐藏入口。诊断中心的意义就是
-            // 服务不对劲时用它，所以它必须在**不需要解锁**的地方有一个入口。
-            // （路由复用既有的 Routes.DETAIL_DIAGNOSE，没有第二个诊断页。）
+            // ══════════ 诊断中心（常显）══════════
+            // 不置于仅解锁后可见的组内：该组需连续点击版本号 5 次才出现，而诊断中心正是服务
+            // 异常时需要的功能，用户不会先行解锁。因此必须在不需解锁的位置有入口。
+            // 路由复用既有的 Routes.DETAIL_DIAGNOSE，不存在第二个诊断页。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = Icons.AutoMirrored.Filled.FactCheck,
                     title = "诊断中心",
                     description = "设备权限 · 网络连通 · 后台服务 · 导出诊断包",
                     onClick = {
-                        navController.navigate(Routes.DETAIL_DIAGNOSE) { launchSingleTop = true }
+                        navController.ufiNavigateOnce(Routes.DETAIL_DIAGNOSE) { launchSingleTop = true }
                     },
                     trailing = { UfiSettingsChevron() }
                 )
             }
 
-            // ══════════ 资源中心（2026-10-14）══════════
-            // 为什么在这里补一颗：资源中心此前**只**挂在内网穿透设置与服务器配置里，
-            // 那两处都是"缺了 frpc / 面板坏了，顺路去装"的上下文入口 —— 也就是说，
-            // 一个还没有具体故障、只是想找"能下载安装的东西在哪"的用户，在 App 里
-            // 没有任何一条入口可走（用户报障："资源中心等新界面在 App 端没有入口"）。
-            // 这一颗就是那条**与具体故障无关**的常规入口。
+            // ══════════ 资源中心 ══════════
+            // 内网穿透设置与服务器配置中的入口都是「缺组件时就地安装」的上下文入口；
+            // 若资源中心只有这两处入口，尚未遇到具体故障、只想查找可下载资源的用户
+            // 在应用内即无常规入口。本行卡提供这条与具体故障无关的常规入口。
             //
-            // 那两处上下文入口**不删**：它们的价值是"正好在这一页，顺手就能装"，
-            // 与本颗"我要找可下载的资源"是两个不同的进入意图；资源中心是同一个页面，
-            // 多入口不会造成两个页面各说一套（本仓忌讳的是同一件事拆成两个页面）。
+            // 上述两处上下文入口保留：其价值是在对应页面内直接安装，与本行卡「查找可下载
+            // 资源」的意图不同；资源中心是同一个页面，多入口不会产生两套内容。
             //
-            // 描述必须自己说清这一页是干什么的：用户是带着"我要装 frpc"或"面板要换回
-            // 内置版"这样的具体目的来的，所以逐项列出它管的东西（Web 前端 ZIP /
-            // frpc / cloudflared），而不是写成"资源中心"四个字的同义反复。
+            // 描述逐项列出该页管理的内容（Web 前端 ZIP / frpc / cloudflared），使用户可按
+            // 具体目的判断是否进入，而非复述页面标题。
             //
-            // 图标复用仓内已有的 Icons.Filled.CloudDownload（工具页「下载管理」同款）：
-            // 语义是"把东西取到设备上"，正是这一页的动作；不引入新图标依赖。
+            // 图标复用仓内既有的 Icons.Filled.CloudDownload（工具页「下载管理」同款）：
+            // 语义为「将文件取到设备上」，与该页动作一致，且不引入新图标依赖。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = Icons.Filled.CloudDownload,
                     title = "资源中心",
                     description = "Web 前端资源 ZIP · frpc / cloudflared 的下载、安装与卸载",
                     onClick = {
-                        navController.navigate(Routes.DETAIL_RESOURCES) { launchSingleTop = true }
+                        navController.ufiNavigateOnce(Routes.DETAIL_RESOURCES) { launchSingleTop = true }
                     },
                     trailing = { UfiSettingsChevron() }
                 )
             }
 
-            // ══════════ 赞助与感谢（2026-10-14）══════════
-            // 这里是**名单**，不是赞赏码 —— 码在那颗「赞赏」按钮的弹窗里（[DonateDialog]）。
-            // 2026-10-14：原来它上面还有一颗同样指向赞赏码的「赞赏」行卡，已按用户要求删除
-            //（「不需要额外的赞赏入口，只需要按钮即可」）。本页因此只剩这一颗名单入口。
+            // ══════════ 赞助与感谢 ══════════
+            // 此处是赞助名单，不是赞赏码：赞赏码只在那颗「赞赏」按钮的弹窗里（[DonateDialog]）。
+            // 本页不设指向赞赏码的行卡，名单入口因此只有这一颗。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = Icons.Filled.FavoriteBorder,
                     title = "赞助与感谢",
                     description = "感谢名单",
                     onClick = {
-                        navController.navigate(Routes.DETAIL_SPONSORS) { launchSingleTop = true }
+                        navController.ufiNavigateOnce(Routes.DETAIL_SPONSORS) { launchSingleTop = true }
                     },
                     trailing = { UfiSettingsChevron() }
                 )
             }
 
-            // ══════════ 调试（隐藏组：仅在版本号连点 5 次激活调试模式后出现）══════════
-            // 为什么不做成「连点直接跳诊断页」：连点这一个手势已经被「进日志页」占了，
-            // 再叠一个目的地就没法区分意图。改成激活后显形一组入口，常规界面依旧看不到。
+            // ══════════ 调试（隐藏组：仅在版本号连续点击 5 次、解锁调试入口后出现）══════════
+            // 不采用「连续点击直接跳诊断页」：该手势已用于进入日志页，叠加第二个目的地无法
+            // 区分意图。改为解锁后显形一组入口，常规界面不出现。
             if (debugActivated) {
                 UfiSettingsGroup {
                     UfiGroupHeader("调试")
-                    // 2026-09-26：补一个能**关**的开关。此前 `debugEntryUnlocked` 全仓只有
-                    // 连点解锁那一处 `= true`，没有任何 set false 路径 —— 一旦解锁，调试组就
-                    // 永久显形，用户只能清数据才收得回去。
-                    // 开关连同整组一起收起是预期的：这一组本来就是隐藏入口，藏起来之后靠
-                    // 连点版本号 5 次重新解锁，不需要再给它留一个常显容器。
+                    // 调试模式开关：解锁路径只有置 true，缺少关闭路径，解锁后调试组会
+                    // 永久显形，只能通过清除应用数据恢复。开关连同整组一起收起是预期行为：
+                    // 该组本就是隐藏入口，收起后可通过再次连续点击版本号 5 次解锁。
                     UfiSettingsItem(
                         title = "调试模式",
                         description = "关闭后收起本组调试入口；连点版本号 5 次可重新解锁",
@@ -513,8 +475,8 @@ fun AboutDeviceScreen(
                                     prefs.debugEntryUnlocked = it
                                     debugActivated = it
                                     if (!it) {
-                                        // 归零连点计数：关掉的这一下不该算进"再点 N 次解锁"里，
-                                        // 否则用户手上残留的计数会让下一次解锁提前触发
+                                        // 连点计数归零：关闭动作不计入「再点击 N 次解锁」，
+                                        // 否则残留计数会使下一次解锁提前触发。
                                         versionClickCount = 0
                                         toastMessage = ToastMessage(
                                             "已退出调试模式，连点版本号 5 次可重新解锁",
@@ -530,26 +492,27 @@ fun AboutDeviceScreen(
                         title = "调试日志",
                         description = "抓包记录 · 日志开关",
                         modifier = Modifier.clickable {
-                            navController.navigate(Routes.DETAIL_DEBUG_LOG) { launchSingleTop = true }
+                            navController.ufiNavigateOnce(Routes.DETAIL_DEBUG_LOG) { launchSingleTop = true }
                         }
                     )
                     UfiDivider()
-                    // 2026-10-20：删除「运行诊断」入口 —— 与「诊断中心」重复（同一个页面）。
-                    // 2026-09-05 从「设置 → 外观」搬来：组件画廊是开发自用的组件预览页
-                    //（按族铺开 + 明暗对照），普通用户用不到，不该常驻在外观设置里。
+                    // 本组不设「运行诊断」：它与「诊断中心」指向同一页面。
+                    // 组件画廊位于本组：它是开发用的组件预览页（按族铺开、明暗对照），
+                    // 普通用户不需要，不应常驻外观设置。
                     UfiSettingsItem(
                         title = "组件画廊",
                         description = "预览全部共享组件 · 可切换明暗对照",
                         modifier = Modifier.clickable {
-                            navController.navigate(Routes.DETAIL_UI_GALLERY) { launchSingleTop = true }
+                            navController.ufiNavigateOnce(Routes.DETAIL_UI_GALLERY) { launchSingleTop = true }
                         }
                     )
                 }
             }
 
             // ══════════ 项目（对齐设置页：每项一张独立行卡 + 图标 + 右侧 chevron）══════════
-            // 原来是「UfiSettingsGroup + UfiGroupHeader("项目") + 两行 + 分隔线」，
-            // 但这两项各自是一个跳外链的独立入口、彼此无从属关系，套一个分组标题反而像"项目"是个设置类目。
+            // ══════════ 项目（与设置页一致：每项一张独立行卡 + 图标 + 右侧 chevron）══════════
+            // 不使用分组标题 + 分隔线：这两项各自是跳转外链的独立入口，彼此无从属关系，
+            // 加分组标题会使其看起来像一个设置类目。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = AppIconGitHub,
@@ -568,13 +531,13 @@ fun AboutDeviceScreen(
                     trailing = { UfiSettingsChevron() }
                 )
             }
-            // 2026-09-06 开源许可入口。
-            // 为什么必须有：core APK 打包了 aria2c / socat 等 GPL 系预编译二进制
-            //（core/src/main/assets/shell/），分发时有"附许可证 + 提供对应源码"的义务，
-            // 而这个义务最终要在**用户能到达的地方**兑现。app 与 core 是同一仓库的两个产物，
-            // 所以两端的「关于」都放一个入口指向同一份声明（web 侧见 AboutPanel.vue）。
-            // 走外链而不是内置页面：声明文件在 core 的 assets 里，app 读不到；
-            // 而它需要随二进制版本更新，放 GitHub 上是唯一真源。
+            // 开源许可入口。
+            // core APK 打包了 aria2c / socat 等 GPL 系预编译二进制
+            //（core/src/main/assets/shell/），分发时须附许可证并提供对应源码，该义务必须在
+            // 用户可达的位置兑现。app 与 core 是同一仓库的两个产物，因此两端「关于」都提供
+            // 指向同一份声明的入口（web 侧见 AboutPanel.vue）。
+            // 使用外链而非内置页面：声明文件在 core 的 assets 中，app 无法读取；该声明随
+            // 二进制版本更新，GitHub 上的文件是唯一真源。
             UfiSettingsRowCard {
                 UfiSettingsItem(
                     icon = Icons.Default.Gavel,
@@ -585,8 +548,8 @@ fun AboutDeviceScreen(
                 )
             }
 
-            // ══════════ 页脚署名（对齐旧项目 UFITOOLS-Widget activity_about 底部那行）══════════
-            // 低对比度、居中、不可点击——它是签名不是入口，做成可点会引导用户去点。
+            // ══════════ 页脚署名 ══════════
+            // 低对比度、居中、不可点击：它是署名而非入口，可点击会引导用户点击。
             Spacer(Modifier.height(Spacing.SectionSpacing))
             Text(
                 text = "Made with ❤ for UFI devices",
@@ -598,9 +561,9 @@ fun AboutDeviceScreen(
             Spacer(Modifier.height(Spacing.SectionSpacing))
 
             // ══════════ 更新弹窗（设置 / 推送 APK 进度）══════════
-            // 「检查结果」弹窗不在这里 —— 它是全局唯一的 UnifiedUpdateDialog，挂在 MainActivity 上，
-            // 本页通过 viewModel.updatePrompt.show() 打开同一个槽。若在这里再渲染一个实例，
-            // 同一个 visible 会同时点亮两个平台 Window，等于把叠加问题原样搬回来。
+            // 「检查结果」弹窗不在此处：它是全局唯一的 UnifiedUpdateDialog，挂在 MainActivity
+            // 上，本页通过 viewModel.updatePrompt.show() 打开同一个槽。若在此再渲染一个实例，
+            // 同一 visible 会同时点亮两个平台 Window，导致遮罩叠加。
             // 推送 APK 进度弹窗（监听 updateDeviceState 实时显示上传/安装阶段）
             ApkPushDialog(
                 visible = showApkPushDialog,
@@ -630,9 +593,9 @@ fun AboutDeviceScreen(
                         showUpdateSettingsDialog = false
                         filePicker.launch(arrayOf("application/vnd.android.package-archive"))
                     },
-                    // 关闭时**仅在下载方式确有变化**才下发（2026-09-05）。
-                    // 原来是无条件同步：点开看一眼再关也打一次设备写请求 + 弹一次 toast；
-                    // 设备不在线时更是每次都弹「同步失败」，而用户其实什么都没改。
+                    // 关闭时仅在下载方式确有变化时下发。
+                    // 无条件同步会使「打开后立即关闭」也发起一次设备写请求并弹一次 toast；
+                    // 设备不在线时则在用户未做任何修改的情况下报同步失败。
                     onDismiss = {
                         showUpdateSettingsDialog = false
                         if (updateSourceMode != modeOnOpen) {
@@ -641,7 +604,7 @@ fun AboutDeviceScreen(
                                     if (ok) "已同步更新源设置到设备" else "设备未连接，同步失败",
                                     if (ok) ToastType.SUCCESS else ToastType.ERROR
                                 )
-                                // 同步失败时不要把快照推进到新值，否则下次关闭会被判成"没改过"而永远不再重试
+                                // 同步失败时不推进快照，否则下次关闭会被判定为「未修改」而不再重试
                                 if (ok) modeOnOpen = updateSourceMode
                             }
                         }
@@ -651,9 +614,9 @@ fun AboutDeviceScreen(
             }
 
             // ══════════ 赞赏弹窗（支付宝 / 微信两张码）══════════
-            // 挂在 UfiPageBackground 内部只是"跟着页面组合"的位置选择 —— 弹窗渲染在**自己的
-            // 平台 Window** 里（见 UfiDialogShell），所以它不受本页那一层 verticalScroll 影响；
-            // 反过来说，弹窗**内部**的滚动也绝不能与本页那一层发生嵌套（见 [DonateDialog]）。
+            // 位置在 UfiPageBackground 内部只决定组合层级：弹窗渲染在自己的平台 Window 中
+            //（见 UfiDialogShell），不受本页 verticalScroll 影响；反之弹窗内部的滚动也不得
+            // 与本页滚动嵌套（见 [DonateDialog]）。
             DonateDialog(visible = showDonateDialog, onDismiss = { showDonateDialog = false })
         }
         UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
@@ -681,56 +644,54 @@ private fun loadAppIconBitmap(context: Context): ImageBitmap? = runCatching {
 /**
  * 第三方组件许可声明的地址。
  *
- * 单一真源在 `core/src/main/assets/shell/THIRD-PARTY-NOTICES.md`（声明的是 core 打包的
- * 那几个预编译二进制），这里只指过去 —— 声明会随二进制版本变化，抄一份进 app 必然漂移。
+ * 单一真源是 `core/src/main/assets/shell/THIRD-PARTY-NOTICES.md`（声明 core 打包的
+ * 预编译二进制），此处只做引用：声明随二进制版本变化，复制进 app 必然产生偏差。
  */
 private const val THIRD_PARTY_NOTICES_URL =
     "https://github.com/Asunano/UFI-AXIS/blob/main/core/src/main/assets/shell/THIRD-PARTY-NOTICES.md"
 
 // ────────────────────────── 赞赏弹窗（两张赞赏码） ──────────────────────────
 //
-// 2026-10-14：`DONATE_QR_WIDTH_FRACTION` / `rememberDonateQrBitmaps` / `decodeDownsampledBitmap`
-// 三个私有件回到本文件 —— 它们中途随赞赏码搬去过 `SponsorsScreen.kt`，再搬去独立的
-// `DonateScreen.kt`；用户要求「不需要额外的赞赏入口，只需要按钮即可」之后那一页被删除，
-// 于是又搬回来，服务本文件里的 [DonateDialog]。**全仓只有这一处解码与渲染那两张位图** ——
-// 多点渲染正是「打开赞赏就崩」会复发的成因（见 [rememberDonateQrBitmaps] 的三层设防）。
+// `DONATE_QR_WIDTH_FRACTION` / `rememberDonateQrBitmaps` / `decodeDownsampledBitmap`
+// 三个私有件只服务本文件中的 [DonateDialog]。全仓只有这一处解码与渲染那两张位图：
+// 多实例渲染是大尺寸位图解码问题复发的条件（见 [rememberDonateQrBitmaps] 的三层设防）。
 
 /**
- * 赞赏弹窗：两张赞赏码（**左支付宝、右微信**）+ 一句"赞赏完全自愿"的说明。
+ * 赞赏弹窗：两张赞赏码（支付宝在左、微信在右）+ 一句「赞赏完全自愿」的说明。
  *
- * ## ★ 高度与滚动：这里只滚一层，而且是弹窗自带的那一层
- * [UfiScrollableDialog] 的 content 槽**本身**就是一个可滚动的 `Column`：它先把内容
- * `heightIn(max = maxScrollH)` 夹到有限高度（`maxScrollH = 0.82×屏高 − 标题 − 页脚`，
- * 见 `UfiCustomDialog.kt`），再套一层 `verticalScroll`。所以：
- *  · 本弹窗的内容里**一个 `verticalScroll` / `LazyColumn` 都没有** —— 有的话就是
- *    「纵向可滚动套纵向可滚动」，正是本次崩溃（2026-10-14）的形态，而弹窗比整页更容易犯；
- *  · 窄屏上下堆叠两张竖版码、内容超出 maxScrollH 时，由**弹窗那一层**滚；
- *    实测排布见下，正常机型上两张并排时根本到不了这个上限。
- * 结论：**永远只滚一层，且那一层属于弹窗**。不要为了"更好看"在这里加任何滚动容器。
+ * ## 高度与滚动：只滚一层，且该层属于弹窗
+ * [UfiScrollableDialog] 的 content 槽本身是一个可滚动的 `Column`：它先将内容
+ * `heightIn(max = maxScrollH)` 限制到有限高度（`maxScrollH = 0.82×屏高 − 标题 − 页脚`，
+ * 见 `UfiCustomDialog.kt`），再套一层 `verticalScroll`。因此：
+ *  · 本弹窗内容中不含任何 `verticalScroll` / `LazyColumn`：纵向滚动嵌套纵向滚动会导致
+ *    弹窗崩溃，且弹窗场景比整页更易触发；
+ *  · 窄屏下两张竖版码上下堆叠、内容超出 maxScrollH 时，由弹窗那一层滚动；常规机型上
+ *    两张并排时不会达到该上限。
+ * 约束：只允许一层滚动，且该层由弹窗提供；本弹窗内不得添加任何滚动容器。
  *
- * ## 高度怎么给（两张图比例不同，这是本弹窗最容易写错的地方）
- * 支付宝 1260×1890（≈ 1:1.50）、微信 1308×1781（≈ 1:1.36）。所以：
- *  · 并排时**绝不**给同一个固定高度（如 `Modifier.height(200.dp)`）—— 固定高度只会把其中
- *    一张拉伸/压扁，而**压扁的二维码扫不出来**（模块从正方变成矩形，识别率断崖式下降）；
- *  · 两张都走 `fillMaxWidth()` + `ContentScale.FillWidth`：只给宽度，高度由**这张图自己的**
- *    宽高比算出来（= web 侧 `width` + `height: auto` 的等价写法）。并排时两张高度因此本来就
- *    不一样，这是正确结果，**不要去"对齐"它们**。
- *  · `ContentScale.FillWidth` 在无界高度下也是安全的：它算缩放只用到宽度，高度由图片自身
- *    比例得出（有限值），所以它不会像 `verticalScroll` 那样被 Infinity 约束打崩。
+ * ## 高度取值（两张图比例不同，此处最易出错）
+ * 支付宝 1260×1890（≈ 1:1.50）、微信 1308×1781（≈ 1:1.36）。因此：
+ *  · 并排时不得给同一个固定高度（如 `Modifier.height(200.dp)`）：固定高度会把其中一张
+ *    拉伸或压扁，而压扁的二维码会从正方模块变为矩形，识别率显著下降；
+ *  · 两张均使用 `fillMaxWidth()` + `ContentScale.FillWidth`：只约束宽度，高度按各自宽高比
+ *    计算（等价于 web 侧 `width` + `height: auto`）。并排时两张高度不同是正确结果，
+ *    不需要对齐。
+ *  · `ContentScale.FillWidth` 在无界高度下是安全的：缩放只依赖宽度，高度由图片自身比例
+ *    得出为有限值，不会像 `verticalScroll` 那样受 Infinity 约束影响。
  *
- * ## 并排还是上下堆叠：判据只算一次，同时喂给排布与解码
- * 见 [DonateCodeLayout] 与 [donateQrTargetWidthPx]。两处各算一次的话，某个宽度区间会出现
- * "按并排解、按堆叠显示"—— 位图被放大到两倍以上，二维码模块边缘发虚，同样是扫不出来的糊。
+ * ## 并排与堆叠：判据只计算一次，同时用于排布与解码
+ * 见 [DonateCodeLayout] 与 [donateQrTargetWidthPx]。两处各算一次时，在某个宽度区间会出现
+ * 「按并排解码、按堆叠显示」，位图被放大两倍以上，二维码模块边缘模糊，同样无法识别。
  */
 @Composable
 private fun DonateDialog(visible: Boolean, onDismiss: () -> Unit) {
     val palette = LocalResolvedPalette.current
 
-    // 排布判据：屏宽 ≥ [SIDE_BY_SIDE_MIN_WIDTH_DP] 才并排，否则上下堆叠。
-    // 它**同时**决定排布与解码目标宽度（理由见上面那段注释）。
+    // 排布判据：屏宽 ≥ [SIDE_BY_SIDE_MIN_WIDTH_DP] 时并排，否则上下堆叠。
+    // 该判据同时决定排布与解码目标宽度（理由见上）。
     val sideBySide = LocalConfiguration.current.screenWidthDp >= SIDE_BY_SIDE_MIN_WIDTH_DP
 
-    // ★ 解码闸门：弹窗没打开时 `enabled = false`，一张位图都不解（见 [rememberDonateQrBitmaps]）。
+    // 解码闸门：弹窗未打开时 enabled = false，不解码任何位图（见 [rememberDonateQrBitmaps]）。
     val codes = rememberDonateQrBitmaps(enabled = visible, sideBySide = sideBySide)
 
     UfiScrollableDialog(
@@ -749,7 +710,7 @@ private fun DonateDialog(visible: Boolean, onDismiss: () -> Unit) {
                 textAlign = TextAlign.Center
             )
             Spacer(Modifier.height(Spacing.Small))
-            // 自愿与"不影响功能"必须写在码旁边，而不是只写在仓库文档里：用户扫之前要能看见。
+            // 自愿与「不影响功能」必须标注在码旁，而非仅写在仓库文档中：用户扫描前需要看到。
             Text(
                 text = "赞赏完全自愿，不影响任何功能 —— 所有功能对所有用户都是完整开放的。",
                 style = UfiTextStyles.note,
@@ -765,9 +726,9 @@ private fun DonateDialog(visible: Boolean, onDismiss: () -> Unit) {
 /**
  * 一张赞赏码的静态描述。
  *
- * @param aspectRatio **宽 / 高**。两张图不同（1260:1890 ≈ 0.667、1308:1781 ≈ 0.734）——
- *   它同时被用在两处：① 图未解码完时的占位框比例（避免先画一个方框再跳成竖长条）；
- *   ② 解码目标宽度的换算（见 [donateQrTargetWidthPx]）。两处都必须逐张取，不能共用。
+ * @param aspectRatio 宽 / 高。两张图不同（1260:1890 ≈ 0.667、1308:1781 ≈ 0.734），
+ *   该值用于两处：① 位图解码完成前的占位框比例（避免先绘制方形再变为竖长条）；
+ *   ② 解码目标宽度的换算（见 [donateQrTargetWidthPx]）。两处都必须逐张取值，不能共用。
  */
 private data class DonateCodeSpec(
     val resId: Int,
@@ -775,30 +736,30 @@ private data class DonateCodeSpec(
     val aspectRatio: Float,
 )
 
-/** 两张码：**支付宝在左、微信在右**（组合顺序即视觉顺序，窄屏改成上下堆叠时顺序不变）。 */
+/** 两张码：支付宝在左、微信在右（组合顺序即视觉顺序，窄屏改为上下堆叠时顺序不变）。 */
 private val DONATE_CODES = listOf(
     DonateCodeSpec(resId = R.drawable.img_donate_alipay, label = "支付宝", aspectRatio = 1260f / 1890f),
     DonateCodeSpec(resId = R.drawable.img_donate_wechat, label = "微信", aspectRatio = 1308f / 1781f),
 )
 
 /**
- * 并排显示所需的最小屏宽（dp）；低于它就改成上下堆叠（见 [DonateCodeLayout]）。
+ * 并排显示所需的最小屏宽（dp）；低于该值时改为上下堆叠（见 [DonateCodeLayout]）。
  *
- * 判据取**屏宽**而不是卡片内容宽：解码目标宽度只能从屏宽推（弹窗里拿不到"内容区到底还剩
- * 多少"），而"怎么排"与"解多大"必须是同一个判据（理由见 [DonateDialog]）。
- * 手机竖屏普遍在 360~412dp，落在堆叠一侧 —— 弹窗内容区约 256~303dp，两张并排各只有
- * 130~150dp，那个尺寸在手机屏幕上不好扫；堆叠后每张能拿到整宽，由弹窗那一层滚动来看。
+ * 判据取屏宽而非卡片内容宽：解码目标宽度只能由屏宽推算（弹窗内无法获知内容区剩余宽度），
+ * 而排布方式与解码尺寸必须使用同一判据（理由见 [DonateDialog]）。
+ * 手机竖屏普遍为 360~412dp，落在堆叠一侧：弹窗内容区约 256~303dp，两张并排时各仅
+ * 130~150dp，该尺寸在手机屏幕上难以扫描；堆叠后每张可获得整宽，由弹窗那一层滚动查看。
  */
 private const val SIDE_BY_SIDE_MIN_WIDTH_DP = 420
 
 /**
  * 两张码的排布：宽屏并排（支付宝左 / 微信右），窄屏上下堆叠、居中。
  *
- * ★ 本函数**不含任何滚动容器**：它只负责排布。滚不滚由外层的 [UfiScrollableDialog] 决定
- *   （唯一一层），见 [DonateDialog] 的「高度与滚动」。
+ * 本函数不含任何滚动容器，只负责排布。滚动由外层 [UfiScrollableDialog] 承担（唯一一层），
+ * 见 [DonateDialog] 的「高度与滚动」。
  *
- * @param sideBySide 由 [DonateDialog] 统一判定后传进来 —— 这里**不再自己算一次**
- *   （两处判据一旦漂移，就会出现"按并排解、按堆叠显示"的糊码，见那边的注释）。
+ * @param sideBySide 由 [DonateDialog] 统一判定后传入，此处不重新计算
+ *   （判据不一致会导致「按并排解码、按堆叠显示」，位图放大后二维码不可识别，见该处注释）。
  */
 @Composable
 private fun DonateCodeLayout(codes: List<ImageBitmap?>, sideBySide: Boolean) {
@@ -806,14 +767,14 @@ private fun DonateCodeLayout(codes: List<ImageBitmap?>, sideBySide: Boolean) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(Spacing.Large),
-            // 顶对齐：两张的高度不同（比例不同），居中会让其中一张看起来"没对齐"
+            // 顶对齐：两张高度不同（比例不同），居中会使其中一张看起来未对齐
             verticalAlignment = Alignment.Top
         ) {
             DONATE_CODES.forEachIndexed { index, spec ->
                 DonateCodeColumn(
                     spec = spec,
                     bitmap = codes.getOrNull(index),
-                    // 两张**等宽**：宽度是排布决定的，高度才由各自的比例决定
+                    // 两张等宽：宽度由排布决定，高度由各自比例决定
                     modifier = Modifier.weight(1f)
                 )
             }
@@ -836,11 +797,11 @@ private fun DonateCodeLayout(codes: List<ImageBitmap?>, sideBySide: Boolean) {
 }
 
 /**
- * 一张码 + 它下面的渠道名。
+ * 一张码 + 其下方的渠道名。
  *
- * 图用 `fillMaxWidth()` + [ContentScale.FillWidth]：**只给宽度，高度按这张图自己的比例出来**
- * （等价于 web 侧的 `width` + `height: auto`）。刻意不写任何 `.height(...)` ——
- * 两张比例不同，一个固定高度就是压扁其中一张（见 [DonateDialog]）。
+ * 图片使用 `fillMaxWidth()` + [ContentScale.FillWidth]：只约束宽度，高度按该图自身比例
+ * 计算（等价于 web 侧 `width` + `height: auto`）。不设置任何 `.height(...)`：
+ * 两张比例不同，固定高度会压扁其中一张（见 [DonateDialog]）。
  */
 @Composable
 private fun DonateCodeColumn(spec: DonateCodeSpec, bitmap: ImageBitmap?, modifier: Modifier) {
@@ -856,9 +817,9 @@ private fun DonateCodeColumn(spec: DonateCodeSpec, bitmap: ImageBitmap?, modifie
                     .clip(UfiCardDefaults.shape)
             )
         } else {
-            // 解码在 IO 线程，首帧会空一下；按**这张图自己的**比例先占住位置
-            // （两张比例不同，占位高度也就不同 —— 这不是 bug，见 DonateCodeSpec.aspectRatio）。
-            // `aspectRatio` 在无界高度下安全：它先试"按 maxWidth 定宽"，宽度有界就能算出有限高度。
+            // 解码在 IO 线程执行，首帧为空；按该图自身比例先行占位
+            //（两张比例不同，占位高度因此不同，见 DonateCodeSpec.aspectRatio）。
+            // `aspectRatio` 在无界高度下安全：先按 maxWidth 定宽，宽度有界即可算出有限高度。
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -869,7 +830,7 @@ private fun DonateCodeColumn(spec: DonateCodeSpec, bitmap: ImageBitmap?, modifie
             }
         }
         Spacer(Modifier.height(Spacing.Small))
-        // 渠道名标在**每张码下面**，而不是顶部统一说明：并排时用户要能一眼看出哪个是哪个
+        // 渠道名标注在每张码下方，而非顶部统一说明：并排时用户需能区分两张码
         Text(
             text = spec.label,
             style = UfiTextStyles.bodyEmphasis,
@@ -879,48 +840,48 @@ private fun DonateCodeColumn(spec: DonateCodeSpec, bitmap: ImageBitmap?, modifie
 }
 
 /**
- * 弹窗内容区宽度占屏宽的**上界**比例（只用于算解码目标宽度）。
+ * 弹窗内容区宽度占屏宽的上界比例（仅用于计算解码目标宽度）。
  *
  * 弹窗内容宽 = `0.90 × 屏宽`（`UfiDialogShell` 的 `fillMaxWidth(0.90f)`）
  *            − `32dp`（shell 的 `padding(horizontal = 16.dp)`）
  *            − `36dp`（卡片内边距 `Spacing.DialogPaddingH = 18.dp`）
- *          = `0.90 × 屏宽 − 68dp`，在 360~480dp 的机型上约是屏宽的 0.71~0.74 倍。
+ *          = `0.90 × 屏宽 − 68dp`，在 360~480dp 的机型上约为屏宽的 0.71~0.74 倍。
  *
- * 这里取 0.78 —— 刻意取**上界**，因为两个方向的代价不对称：
- *  · 取大了只是多解几百 KB（解码尺寸 ≥ 显示尺寸，不会被二次缩放）；
- *  · 取小了位图小于显示尺寸，会被放大 —— 二维码模块边缘发虚，**扫不出来**。
- * 宁可偏大。这段算式与 shell 的实际几何绑在一起，改 `UfiDialogShell` 的宽度或内边距时
- * 必须回来核对（本文件拿不到它的测量值，只能这样表达）。
+ * 此处取 0.78，刻意取上界，因为两个方向的代价不对称：
+ *  · 偏大只增加解码内存，且解码尺寸 ≥ 显示尺寸，不会被二次缩放；
+ *  · 偏小则位图小于显示尺寸，会被放大，二维码模块边缘模糊，无法扫描。
+ * 该算式与 shell 的实际几何绑定：修改 `UfiDialogShell` 的宽度或内边距时必须同步核对
+ *（本文件无法获取其测量值，只能以此常量表达）。
  */
 private const val DONATE_QR_WIDTH_FRACTION = 0.78f
 
 /**
  * 单列（上下堆叠）时允许的解码高度上限（占屏高的比例）。
  *
- * 堆叠时一张码的显示高度约是弹窗内容宽的 1.5 倍，长屏上会到屏高的一半以上。它由弹窗滚动
- * 承载，但没必要为此解一张比屏幕还高的位图 —— 超过这个上限就按屏高折回宽度。
- * 取值刻意宽松（0.9），正常机型上不会触发，它只挡极端比例。
+ * 堆叠时一张码的显示高度约为弹窗内容宽的 1.5 倍，长屏上会超过屏高的一半。该高度由弹窗
+ * 滚动承载，但无需为此解码一张高于屏幕的位图：超过此上限时按屏高折回宽度。
+ * 取值刻意宽松（0.9），常规机型不会触发，仅用于限制极端比例。
  */
 private const val DONATE_QR_MAX_HEIGHT_FRACTION = 0.9f
 
 /**
- * 把两张赞赏码解码成 [ImageBitmap]（全仓**唯一**解码它们的地方）。
+ * 将两张赞赏码解码为 [ImageBitmap]（全仓唯一解码它们的位置）。
  *
- * **为什么不能直接 `painterResource`**：这两张图是 1260×1890 与 1308×1781 的 PNG。若放在普通
- * `drawable/` 下，aapt 按 mdpi 基线对待，`decodeResource` 会按设备密度放大 —— 3x 机型上
- * 变成 3780×5670 与 3924×5343，ARGB_8888 各约 80MB，一张图就能把一次 Activity 的位图预算
- * 吃穿（旧项目遇到的「打开赞赏就崩」正是这个成因）。
+ * 不使用 `painterResource` 的原因：这两张图是 1260×1890 与 1308×1781 的 PNG。若放在普通
+ * `drawable/` 下，aapt 按 mdpi 基线处理，`decodeResource` 会按设备密度放大 —— 3x 机型上
+ * 变为 3780×5670 与 3924×5343，ARGB_8888 各约 80MB，单张即可超出一次 Activity 的位图
+ * 预算。
  *
- * 三层设防（**全部保留**，缺一层这个弹窗就会重新变成崩溃源）：
- * 1. 资源放在 `res/drawable-nodpi/` —— 从源头禁止密度缩放；
- * 2. 按弹窗内容宽度降采样，并用 `RGB_565`（赞赏码是纯黑白，565 无可见损失，内存砍半）；
- * 3. 解码放到 [Dispatchers.IO]。
+ * 三层设防（全部保留，缺一层该弹窗即恢复为崩溃源）：
+ * 1. 资源放在 `res/drawable-nodpi/`，从源头禁止密度缩放；
+ * 2. 按弹窗内容宽度降采样，并使用 `RGB_565`（赞赏码为纯黑白，565 无可见损失，内存减半）；
+ * 3. 解码在 [Dispatchers.IO] 上执行。
  *
- * @param enabled **解码闸门**：只有弹窗真的打开时才解（`false` → 直接回空列表）。
- *   两张图合计 565K，进关于页就同步解两张 1260px 级的位图会让首帧顿一下；而"进关于页"
- *   比"点赞赏"频繁得多。关掉弹窗时列表被清空，位图随即可回收。
- * @param sideBySide 排布判据，由 [DonateDialog] 算好后传进来（**不要**在这里重算一次，
- *   理由见那边的注释）。它进 [produceState] 的 key：横竖屏切换导致排布变化时会重新解码。
+ * @param enabled 解码闸门：仅在弹窗确实打开时解码（false → 直接返回空列表）。
+ *   两张图合计 565K，进入本页即同步解码两张 1260px 级位图会拖慢首帧；而进入本页的频率
+ *   远高于打开赞赏弹窗。关闭弹窗时列表清空，位图随即被回收。
+ * @param sideBySide 排布判据，由 [DonateDialog] 计算后传入（不在此处重算，理由见该处注释）。
+ *   该参数进入 [produceState] 的 key：横竖屏切换导致排布变化时会重新解码。
  */
 @Composable
 private fun rememberDonateQrBitmaps(enabled: Boolean, sideBySide: Boolean): List<ImageBitmap?> {
@@ -937,7 +898,7 @@ private fun rememberDonateQrBitmaps(enabled: Boolean, sideBySide: Boolean): List
         density,
         sideBySide
     ) {
-        // 闸门在这一层：没打开就什么都不做，也不持有任何位图
+        // 闸门位于这一层：未打开时不做任何事，也不持有任何位图
         if (!enabled) {
             value = emptyList()
             return@produceState
@@ -955,18 +916,18 @@ private fun rememberDonateQrBitmaps(enabled: Boolean, sideBySide: Boolean): List
 }
 
 /**
- * 算出**这一张**码在当前排布下的解码目标宽度（像素）。
+ * 计算单张码在当前排布下的解码目标宽度（像素）。
  *
- * 宽度来自排布（并排 = 内容区的一半，堆叠 = 整宽），但**逐张**算，因为两张图的宽高比不同：
- * 支付宝 1260:1890（≈ 1:1.50）、微信 1308:1781（≈ 1:1.36）。同一个显示宽度下左边那张要高 10%，
- * 所以"高度上限"折回来的宽度对两张是**两个不同的数**；共用一个数会让其中一张要么被二次缩放
- * （糊，扫描识别率下降），要么白占内存。同一个目标宽度下，`inSampleSize` 也会按各自的源宽度
- * （1260 / 1308）分别算出来（见 [decodeDownsampledBitmap] 的循环）。
+ * 宽度来自排布（并排 = 内容区的一半，堆叠 = 整宽），但必须逐张计算，因为两张图的宽高比
+ * 不同：支付宝 1260:1890（≈ 1:1.50）、微信 1308:1781（≈ 1:1.36）。同一显示宽度下左侧
+ * 那张高约 10%，因此由「高度上限」折回的宽度对两张是两个不同的值；共用一个值会使其中
+ * 一张被二次缩放（模糊、识别率下降），或占用多余内存。同一目标宽度下，`inSampleSize`
+ * 也按各自的源宽度（1260 / 1308）分别计算（见 [decodeDownsampledBitmap] 的循环）。
  *
- * 两个约束取小：
- *  · **显示宽度**：保证解码尺寸 ≥ 显示尺寸（这是"不被二次缩放"的下限）；
- *  · **高度上限**：堆叠时一张码的显示高度会到内容宽的 1.5 倍上下，超过
- *    [DONATE_QR_MAX_HEIGHT_FRACTION] 就按屏高折回宽度（只挡极端比例，正常机型不触发）。
+ * 两个约束取较小值：
+ *  · 显示宽度：保证解码尺寸 ≥ 显示尺寸（不被二次缩放的下限）；
+ *  · 高度上限：堆叠时一张码的显示高度约为内容宽的 1.5 倍，超过
+ *    [DONATE_QR_MAX_HEIGHT_FRACTION] 时按屏高折回宽度（仅限制极端比例，常规机型不触发）。
  */
 private fun donateQrTargetWidthPx(
     spec: DonateCodeSpec,
@@ -976,20 +937,20 @@ private fun donateQrTargetWidthPx(
     sideBySide: Boolean,
 ): Int {
     val cardWidthPx = screenWidthDp * density * DONATE_QR_WIDTH_FRACTION
-    // 并排时先扣掉中间那条间距再对半。间距直接取 `Spacing.Large.value` ——
-    // DonateCodeLayout 用的就是 `Arrangement.spacedBy(Spacing.Large)`，
-    // 抄一个常量过来迟早会和它分叉（差一点点就开始糊）。
+    // 并排时先扣除中间间距再对半。间距直接取 `Spacing.Large.value`：
+    // DonateCodeLayout 使用 `Arrangement.spacedBy(Spacing.Large)`，另抄一个常量会与其不一致
+    //（间距偏差会使解码宽度不足，导致显示放大）。
     val displayWidthPx =
         if (sideBySide) (cardWidthPx - Spacing.Large.value * density) / 2f else cardWidthPx
-    // 宽度 → 高度用**这张图自己的**比例（aspectRatio = 宽 / 高）
+    // 宽度 → 高度使用该图自身比例（aspectRatio = 宽 / 高）
     val maxHeightPx = screenHeightDp * density * DONATE_QR_MAX_HEIGHT_FRACTION
     val heightCappedWidthPx = maxHeightPx * spec.aspectRatio
     return minOf(displayWidthPx, heightCappedWidthPx).toInt().coerceAtLeast(1)
 }
 
 /**
- * 降采样解码：先只读尺寸算 `inSampleSize`（必须是 2 的幂），再正式解码。
- * `inScaled = false` + `openRawResource` 一起用，跳过 `decodeResource` 的密度缩放。
+ * 降采样解码：先只读尺寸计算 `inSampleSize`（必须是 2 的幂），再正式解码。
+ * `inScaled = false` 与 `openRawResource` 同时使用，跳过 `decodeResource` 的密度缩放。
  */
 private fun decodeDownsampledBitmap(context: Context, resId: Int, targetWidth: Int): Bitmap? {
     return runCatching {
@@ -1017,9 +978,9 @@ private fun decodeDownsampledBitmap(context: Context, resId: Int, targetWidth: I
 /**
  * 赞赏：描边爱心。
  *
- * 用 stroke 而非 fill，是为了跟 Donate 档那个描边按钮同构 —— 实心心形塞在描边按钮里
- * 会比文字重一截，视觉上像两个不同层级的元素拼在一起。
- * 两瓣用对称的三次贝塞尔起手，收笔汇到 (12, 21) 的尖端。
+ * 使用 stroke 而非 fill，以与 Donate 档描边按钮保持同构：实心心形置于描边按钮内会明显
+ * 重于文字，视觉上表现为两个不同层级的元素拼接。两瓣各以对称的三次贝塞尔起笔，收笔汇于
+ * (12, 21) 的尖端。
  */
 private val AppIconHeart: ImageVector = ImageVector.Builder(
     name = "AppIconHeart", defaultWidth = Spacing.IconCanvas, defaultHeight = Spacing.IconCanvas,
@@ -1047,11 +1008,11 @@ private val AppIconHeart: ImageVector = ImageVector.Builder(
 /**
  * GitHub 官方 mark 轮廓（实心）。
  *
- * 这一个**不手绘**：品牌标识画歪了比不画更糟，所以直接用官方 24×24 路径，
- * 经 [addPathNodes] 解析而不是手抄成 PathBuilder 调用（几十个控制点手抄必错）。
+ * 该图标不手绘：品牌标识绘制偏差比缺少图标更不利，因此直接使用官方 24×24 路径，经
+ * [addPathNodes] 解析，而非手抄为 PathBuilder 调用（数十个控制点手工转写必然出错）。
  *
- * 源 SVG 带 `fill-rule="evenodd"`，所以这里必须显式传 [PathFillType.EvenOdd] ——
- * 用默认的 NonZero 会把猫身与尾巴之间的镂空填实，图标变成一个糊掉的实心块。
+ * 源 SVG 带 `fill-rule="evenodd"`，因此必须显式传入 [PathFillType.EvenOdd]：
+ * 默认的 NonZero 会填充猫身与尾巴之间的镂空，图标变为实心块。
  */
 private val AppIconGitHub: ImageVector = ImageVector.Builder(
     name = "AppIconGitHub", defaultWidth = Spacing.IconCanvas, defaultHeight = Spacing.IconCanvas,
@@ -1066,13 +1027,12 @@ private val AppIconGitHub: ImageVector = ImageVector.Builder(
 
 // 官方 mark 原始 pathData。
 //
-// 2026-09-05（P3 超长行）：由单行 705 字符折成 8 段字面量拼接。
-// **拆分只允许发生在原串已有的空格处，且空格留在前一段的末尾** —— 这样 `+` 拼回来的结果
-// 与原串逐字节相同（改完当场做过 round-trip 比对）。`const val` 允许编译期常量拼接，
-// 所以这仍是一个编译期常量，调用点拿到的东西没变。
+// 由单行 705 字符折成 8 段字面量拼接：拆分只允许发生在原串已有的空格处，且空格保留在前
+// 一段末尾，使 `+` 拼接结果与原串逐字节相同。`const val` 支持编译期常量拼接，因此它仍是
+// 一个编译期常量，调用点取值不变。
 //
-// ⚠ 不要在数字中间断行、不要为了对齐加/删空白：一处错位会把坐标解析成另一个值，
-// 而结果只是"图标看着有点怪"，不会报错，极难回溯。
+// 不得在数字中间断行，也不得为对齐增删空白：一处错位会把坐标解析成另一个值，且结果仅为
+// 图标形状异常，不会报错，难以回溯。
 private const val GITHUB_MARK_PATH =
     "M12 0c6.63 0 12 5.276 12 11.79-.001 5.067-3.29 9.567-8.175 11.187-.6.118-.825-.25-.825-.56 " +
     "0-.398.015-1.665.015-3.242 0-1.105-.375-1.813-.81-2.181 2.67-.295 5.475-1.297 5.475-5.822 " +

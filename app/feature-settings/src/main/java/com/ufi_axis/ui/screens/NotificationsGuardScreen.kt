@@ -40,6 +40,7 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis_core.contract.Alerts
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「通知与守护」聚合入口页。
@@ -426,7 +427,7 @@ fun NotificationsGuardScreen(
                         alertTypesOn == 0 -> "未选类型"
                         else -> "$alertTypesOn/${ALERT_TYPE_KEYS.size} 类检测"
                     },
-                    onClick = { navController.navigate(Routes.DETAIL_ALERT_SETTINGS) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_ALERT_SETTINGS) }
                 )
             }
 
@@ -440,7 +441,7 @@ fun NotificationsGuardScreen(
                         else -> "$categoriesOn 类开启"
                     },
                     enabled = gateOn,
-                    onClick = { navController.navigate(Routes.DETAIL_NOTIFY_MANAGE) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_NOTIFY_MANAGE) }
                 )
             }
 
@@ -467,7 +468,7 @@ fun NotificationsGuardScreen(
                     // `mailAllowed`、Webhook 的在 `NotificationDispatcher.emit`，两者第一条
                     // 都是 master_enabled。实时推送那一行只是说明文字，不构成"能点进去改"的理由。
                     enabled = gateOn,
-                    onClick = { navController.navigate(Routes.DETAIL_PUSH_CHANNELS) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_PUSH_CHANNELS) }
                 )
             }
 
@@ -488,7 +489,7 @@ fun NotificationsGuardScreen(
                         else -> "已关闭"
                     },
                     enabled = gateOn,
-                    onClick = { navController.navigate(Routes.DETAIL_BACKGROUND_GUARD) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_BACKGROUND_GUARD) }
                 )
             }
 

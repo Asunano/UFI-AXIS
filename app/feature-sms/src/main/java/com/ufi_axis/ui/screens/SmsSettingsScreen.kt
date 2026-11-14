@@ -33,6 +33,7 @@ import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 验证码缓存自动清理间隔档位（小时；"0" = 永不清理）。
@@ -194,7 +195,7 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                                     size = UfiButtonSize.Small,
                                     text = "去开启",
                                     onClick = {
-                                        navController.navigate(Routes.DETAIL_BACKGROUND_GUARD)
+                                        navController.ufiNavigateOnce(Routes.DETAIL_BACKGROUND_GUARD)
                                     }
                                 )
                             }
@@ -228,7 +229,7 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                 // 0 条时不亮角标（`takeIf`），空规则表本身由规则页的空态解释。
                 badgeText = toolsState.smsRules.size.takeIf { it > 0 }?.let { "$it 条" },
                 badgeType = UfiBadgeType.INFO,
-                onClick = { navController.navigate(Routes.DETAIL_SMS_FILTER_RULES) }
+                onClick = { navController.ufiNavigateOnce(Routes.DETAIL_SMS_FILTER_RULES) }
             )
 
             // 拦截是「静默丢消息」的功能，用户能不能发现"我是不是漏了什么"全靠这个入口。
@@ -240,7 +241,7 @@ fun SmsSettingsScreen(viewModel: MainViewModel, navController: NavHostController
                 icon = Icons.Default.Block,
                 badgeText = toolsState.smsBlockedUnviewed.takeIf { it > 0 }?.toString(),
                 badgeType = UfiBadgeType.WARNING,
-                onClick = { navController.navigate(Routes.DETAIL_SMS_BLOCKED) }
+                onClick = { navController.ufiNavigateOnce(Routes.DETAIL_SMS_BLOCKED) }
             )
 
             // 2026-09-08：原来这里还有一个「其它」分组（设备短信条数只读行 + 全部标为已读）。

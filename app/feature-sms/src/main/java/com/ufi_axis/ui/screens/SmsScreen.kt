@@ -73,8 +73,8 @@ import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
 import com.ufi_axis_core.contract.Capability
 import com.ufi_axis.ui.navigation.LocalPendingSmsPhone
 import com.ufi_axis.ui.navigation.Routes
-// 2026-10-14：页内「列表 ⇄ 对话」转场改为与导航层二级界面同源，直接复用这两个来源
-// （时长换算与视差分母）—— 避免同一个 app 里两种"二级界面"各有一套数。
+// 页内「列表 ⇄ 对话」转场与导航层二级界面同源，复用以下两个来源
+// （时长换算与视差分母），避免同一应用内两类「二级界面」使用不同参数。
 import com.ufi_axis.ui.navigation.SHARED_AXIS_X_PARALLAX
 import com.ufi_axis.ui.navigation.ufiSharedAxisDurationMs
 import java.text.SimpleDateFormat
@@ -87,6 +87,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import com.ufi_axis.ui.theme.UfiMotion
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 // ════════════════════════════════════════════════════
 // 短信主入口 — 标准手机短信界面风格
@@ -101,22 +102,22 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     val palette = LocalResolvedPalette.current
     val toolsState by viewModel.toolsState.collectAsState()
 
-    // 设备能力集（批 O / 3.5）：core 只在 `POST /api/sms/send` 上有门禁
-    // （`RootSmsRoutes.kt:103`，判据是 profile.smsSpec()，短信不走 SettingKey）。
-    // 那是全仓唯一一条「往外发短信」的入口，所以本页只灰**发信**入口：
-    // 新建短信 FAB + 对话里的输入栏 + 长按菜单的「重新发送」。
+    // 设备能力集：core 仅在 `POST /api/sms/send` 上设门禁
+    // （`RootSmsRoutes.kt:103`，判据为 profile.smsSpec()，短信不经由 SettingKey）。
+    // 该接口是唯一「向外发送短信」的入口，因此本页仅置灰**发信**入口：
+    // 新建短信 FAB + 对话中的输入栏 + 长按菜单的「重新发送」。
     //
-    // 信箱的读 / 删 / 标已读 / 验证码 / 黑名单 / 转发规则**一律不灰** —— 它们不在这个域里，
-    // 也没有门禁。「这台设备不能发短信」不等于「不能看收到的短信」。
+    // 信箱的读取 / 删除 / 标已读 / 验证码 / 黑名单 / 转发规则**一律不置灰** —— 它们不属于该域，
+    // 也不受门禁约束。「本设备不能发送短信」不等于「不能查看已收到的短信」。
     //
-    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可发。
+    // 能力集未拉取 / 拉取失败时 supports() 恒为 true，此时保持可发送状态。
     val capabilities by viewModel.network.capabilityState.collectAsState()
     val smsSupported = capabilities.supports(Capability.SMS)
-    // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进页面都发请求。
+    // 能力集自带「本进程只成功拉取一次」的闸门，重复调用不会每次进入页面都发请求。
     LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
 
-    // ── lifecycle 门控（2026-09-21）──
-    // 不轮询时在后台白打 HTTP；本页不是底部 Tab 页，不需要 pageForeground。
+    // ── lifecycle 门控 ──
+    // 页面不可见时不发起 HTTP 请求；本页不是底部 Tab 页，无需 pageForeground。
     var lifecycleResumed by remember { mutableStateOf(true) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -136,49 +137,48 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     var showOptInDialog by remember { mutableStateOf(false) }
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
     // 点击验证码卡片后要展示详情的那一条（null = 不显示弹窗）。
-    // 2026-08-29：原来点卡片是 openVerificationCodeSource(source) → 切到「消息」页签并打开该号码的
-    // 对话。但用户点验证码卡片的意图基本是"看清完整内容 / 再确认一遍码"，被弹到另一个页签反而
-    // 丢失了当前浏览位置（回来还要再点回「通知」）。改成原地弹窗，跳转降级为弹窗里的一个按钮。
+    // 点击卡片不跳转到「消息」页签并打开对应号码的对话：该操作会使当前浏览位置丢失
+    //（返回后需重新点回「通知」）。因此改为原地弹窗，跳转降级为弹窗内的一个按钮。
     var codeDetail by remember { mutableStateOf<VerificationCode?>(null) }
     // 会话行长按「加入黑名单」的二次确认对象（null = 不显示）。
-    // 提到屏幕层持有而不是放在行里：确认结果要弹 Toast，而 UfiToastHost 挂在这一层；
-    // 放在行内的话，列表刷新（10s 静默轮询）重组时那一行连带弹窗会被整块换掉。
+    // 提到屏幕层持有而不是放在行内：确认结果需要弹 Toast，而 UfiToastHost 挂在该层；
+    // 若放在行内，列表刷新（10s 静默轮询）重组时该行连同弹窗会被整体替换。
     var pendingBlacklistPhone by remember { mutableStateOf<String?>(null) }
     var pendingDeleteConversationPhone by remember { mutableStateOf<String?>(null) }
-    // 「查看原对话」跳走前暂存的那条：对话关闭后原样弹回来，让用户回到点跳转之前的状态
+    // 「查看原对话」跳转前暂存的那条：对话关闭后原样恢复，使用户回到跳转前的状态。
     var reopenCodeAfterConversation by remember { mutableStateOf<VerificationCode?>(null) }
-    // 两个列表的滚动位置提到屏幕级持有。对话页是根 AnimatedContent 的另一层，
-    // 切过去时列表层整块被卸载，remember 在里面的 LazyListState 会一起没掉 ——
-    // 于是"滑到中间点进对话、返回后回到顶部"。挂在这里就能跨转场保留。
+    // 两个列表的滚动位置提升到屏幕级持有。对话页是根 AnimatedContent 的另一层，
+    // 切换时列表层整体卸载，其中的 remember LazyListState 会同时丢失，
+    // 导致「滑到中间进入对话、返回后回到顶部」。提升到该层可跨转场保留。
     val contactsListState = rememberLazyListState()
     val codesListState = rememberLazyListState()
     val context = LocalContext.current
 
-    // ── 首屏骨架的判据：「本次进入页面，这份数据还没出过任何结果」──────────────────
-    // 为什么不能直接看 isLoading（更早一版就是这么写的）：
-    //  1) 进页面第一帧 isLoading 还是 false（loadSmsContacts 要等 LaunchedEffect 才发出去），
-    //     直接看它会先闪一帧「暂无短信」空态、再跳骨架、再跳列表 —— 连跳两次；
-    //  2) isLoading 之后每次手动刷新 / 重新拉取都会再翻 true，直接看它等于"刷新也放骨架"，
-    //     而按需求刷新必须完全无动画。
-    // 也不能去嗅 isLoading 的下降沿（上一版）：见 rememberFirstLoadPending 的注释。
-    // 现在统一读 ViewModel 给的「已完成过一次加载尝试」标记，成功/失败/空结果都能收场。
+    // ── 首屏骨架的判据：「本次进入页面后，该数据尚未产生任何结果」──────────────
+    // 不能直接使用 isLoading：
+    //  1) 进入页面第一帧 isLoading 仍为 false（loadSmsContacts 由 LaunchedEffect 触发），
+    //     直接使用会先闪现一帧「暂无短信」空态、再切换到骨架、再切换到列表；
+    //  2) 手动刷新 / 重新拉取都会再次将 isLoading 置为 true，直接使用会使刷新也显示骨架，
+    //     而刷新必须无动画。
+    // 也不能检测 isLoading 的下降沿：见 rememberFirstLoadPending 的注释。
+    // 因此统一读取 ViewModel 提供的「已完成一次加载尝试」标记，成功/失败/空结果均可结束骨架。
     val contactsFirstLoadPending = rememberFirstLoadPending { toolsState.smsContactsLoaded }
     val codesFirstLoadPending = rememberFirstLoadPending { toolsState.verificationCodesLoaded }
 
-    // 未读数优先取 /count 的全局值，它没读到才回落联系人求和（会偏小，因为联系人列表
-    // 只覆盖有会话记录的号码）。口径说明见 ToolsState.smsCount。
-    // 2026-09-08 从短信设置页搬来，连口径一起搬 —— 不要在两处各算一版。
+    // 未读数优先取 /count 的全局值，仅在未读到该值时回落为联系人求和（结果偏小，
+    // 因为联系人列表只覆盖有会话记录的号码）。口径说明见 ToolsState.smsCount。
+    // 该口径必须只有一份实现，不得在多处各算一版。
     val unreadTotal = toolsState.smsCount?.unread ?: toolsState.smsContacts.sumOf { it.unread }
 
-    // 发完短信后要把会话列表拉回顶部。
-    // 列表 `items(contacts, key = { it.phoneNumber })` 是带 key 的，而后端按最新消息时间重排，
-    // 刚更新的会话会插到 index 0；带 key 的 LazyColumn 会把视口锚定在**原来的首个 key** 上，
-    // 于是新置顶的那条被挤到视口上方 —— 表现就是"发完列表没变化，得手动往上划才看得到"。
-    // 用一个待办标记 + 等列表真正刷新后再滚：sendSms 是异步的，立刻滚只会滚到旧数据上。
+    // 发送短信后需将会话列表滚动到顶部。
+    // 列表 `items(contacts, key = { it.phoneNumber })` 带 key，而后端按最新消息时间重排，
+    // 刚更新的会话会插入 index 0；带 key 的 LazyColumn 会将视口锚定在**原来的首个 key** 上，
+    // 因此新置顶的条目被挤到视口上方，表现为「发送后列表无变化，需手动上滑才能看到」。
+    // 使用待办标记并在列表真正刷新后滚动：sendSms 为异步操作，立即滚动只会作用于旧数据。
     var pendingScrollContactsTop by remember { mutableStateOf(false) }
     LaunchedEffect(toolsState.smsContacts, toolsState.conversationPhone) {
-        // 只在列表层真正可见时滚：对话里发完消息也会置这个标记，那时列表还没组合，
-        // 滚动请求会挂在没有布局信息的 LazyListState 上白丢一次 —— 等返回列表再滚。
+        // 仅在列表层可见时滚动：对话内发送消息同样会置该标记，此时列表尚未组合，
+        // 滚动请求会作用于没有布局信息的 LazyListState 而失效，应等返回列表后再滚动。
         if (pendingScrollContactsTop && toolsState.conversationPhone.isEmpty() &&
             toolsState.smsContacts.isNotEmpty()) {
             pendingScrollContactsTop = false
@@ -186,9 +186,9 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 会话列表自动刷新：设备收到新短信、或短信从别处发出，都不会主动推给 app ——
-    // 不轮询的话列表要等用户下拉 / 重进页面才更新。静默刷新，不点亮下拉指示器。
-    // 只在「消息」页签且没打开对话时跑：对话层有自己的刷新路径，页面离开时 LaunchedEffect 自动取消。
+    // 会话列表自动刷新：设备收到新短信或短信从其它客户端发出时，不会主动推送给 app，
+    // 不轮询则列表需等待用户下拉 / 重新进入页面才更新。刷新为静默模式，不显示下拉指示器。
+    // 仅在「消息」页签且未打开对话时执行：对话层有独立刷新路径，页面离开时 LaunchedEffect 自动取消。
     LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
         if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 0 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
@@ -199,9 +199,9 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     }
 
     // 验证码（通知页签）实时刷新：
-    // 2026-09-13 修复：自动复制验证码已迁移至 `:ufi_notify` 进程后台触发（见 NotificationCenter），
-    // 不再依赖本页面的 UI 轮询。这里的轮询仅用于「通知」页签列表刷新和未读角标计算。
-    // 仅「通知」页签且没打开对话时跑，复用联系人轮询同样的间隔与生命周期。
+    // 自动复制验证码由 `:ufi_notify` 进程在后台触发（见 NotificationCenter），
+    // 不依赖本页面的 UI 轮询。此处轮询仅用于「通知」页签列表刷新与未读角标计算。
+    // 仅在「通知」页签且未打开对话时执行，复用联系人轮询的间隔与生命周期。
     LaunchedEffect(toolsState.smsTab, toolsState.conversationPhone, lifecycleResumed) {
         if (!lifecycleResumed) return@LaunchedEffect
         if (toolsState.smsTab != 1 || toolsState.conversationPhone.isNotEmpty()) return@LaunchedEffect
@@ -214,12 +214,12 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     LaunchedEffect(Unit) {
         viewModel.tools.loadSmsContacts()
         viewModel.tools.refreshDeviceConfig()
-        // 设备短信条数 / 未读数（列表首行那条信息行要用）。
-        // 2026-09-08 从短信设置页搬来：条数与「全部标为已读」现在长在消息 Tab 上，
-        // 拉取自然也跟着搬 —— 留在设置页的话，不进设置页就永远拿不到这两个数。
+        // 设备短信条数 / 未读数（列表首行的信息行使用）。
+        // 条数与「全部标为已读」位于消息 Tab，拉取也应在此发起；
+        // 若留在设置页，不进入设置页时这两个值始终无法取得。
         viewModel.tools.loadSmsCount()
-        // 进入页面时也静默拉一次验证码：否则停在「消息」页签时 unread 恒为 0，
-        // 「通知」角标要等用户点进去才算得出来（点进去又立刻清零）→ 角标永远不亮。
+        // 进入页面时静默拉取一次验证码：否则停留在「消息」页签时 unread 恒为 0，
+        // 「通知」角标需进入该页签才能计算（进入后立即清零），导致角标始终不显示。
         viewModel.tools.loadVerificationCodes()
     }
     rememberResumeRefresh {
@@ -250,8 +250,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     }
 
     // ViewModel 内部发起的跳转（如验证码弹窗里的「查看原对话」）：打开对话层。
-    // 注意这里**不切页签** —— 对话是覆盖整屏的一层，底下停在哪个页签不影响显示，
-    // 而关掉对话时正好原样落回「通知」页签（旧实现顺手把 smsTab 置 0，返回就掉到消息列表了）。
+    // 注意此处**不切换页签** —— 对话是覆盖整屏的一层，底层停留在哪个页签不影响显示，
+    // 关闭对话时会原样回到「通知」页签（若将 smsTab 置 0，返回后会落到消息列表）。
     LaunchedEffect(toolsState.navigateToPhone) {
         val phone = toolsState.navigateToPhone
         if (phone.isNotEmpty()) {
@@ -261,8 +261,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 对话关闭后，把跳转前暂存的验证码弹窗恢复出来（配合上面不切页签 + 列表滚动位置提到屏幕级，
-    // 「看一眼原对话再返回」能完整回到点跳转之前的状态）
+    // 对话关闭后，恢复跳转前暂存的验证码弹窗（配合不切页签与屏幕级滚动位置，
+    // 「查看原对话后返回」可以完整回到跳转前的状态）。
     LaunchedEffect(toolsState.conversationPhone) {
         if (toolsState.conversationPhone.isEmpty()) {
             reopenCodeAfterConversation?.let {
@@ -272,9 +272,9 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // 对话态：系统返回键先关对话回到列表，而不是直接退出短信页。
-    // 新建短信 2026-08-29 由整页改成弹窗，返回键由 UfiCustomDialog 自己吃掉，
-    // 这里只保留 `!isComposing` 作为显式优先级说明。
+    // 对话态：系统返回键优先关闭对话回到列表，而不是直接退出短信页。
+    // 新建短信为弹窗形式，返回键由 UfiCustomDialog 消费；
+    // 此处保留 `!isComposing` 仅作为显式优先级说明。
     BackHandler(enabled = !isComposing && toolsState.conversationPhone.isNotEmpty()) {
         viewModel.tools.closeConversation()
     }
@@ -283,10 +283,10 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         title = "短信",
         navController = navController,
         showBack = true,
-        // 2026-10-14：底部输入法 inset 交给外壳统一处理（navigationBars ∪ ime）。
-        // 对话页的输入栏贴在底部，键盘弹出时整块面板要上移；原先在 SmsConversationView 的根
-        // Column 上挂 `imePadding()`，而外壳的内容 Box 已经应用过 navigationBars，两者相加 →
-        // 输入栏悬在键盘上方约一个导航栏的高度（与控制台同一个 bug）。
+        // 底部输入法 inset 由外壳统一处理（navigationBars ∪ ime）。
+        // 对话页输入栏贴底，键盘弹出时整块面板需上移；若在 SmsConversationView 的根
+        // Column 上再挂 `imePadding()`，与外壳内容 Box 已应用的 navigationBars 叠加，
+        // 输入栏会上移约一个导航栏高度。
         imeAwareBottomInset = true,
         navigationIcon = {
             // 上下文感知返回按钮：对话打开时关闭对话，否则退出短信页面
@@ -323,36 +323,34 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             }
         },
         actions = {
-            // 2026-10-21：顶栏「刷新」按钮删除（用户要求）。
-            // 会话列表与验证码列表都各有 10s 静默轮询 + 重进页面刷新（rememberResumeRefresh），
-            // 手动再刷一遍是多余的；对话层本来就只有分页加载，顶栏刷新更容易让人以为是刷对话。
-            // 齿轮 → 独立的「短信设置」页面。
-            // 2026-09-08：这里原来是 `showSettingsDialog = true` 弹一个 UfiCustomDialog，
-            // 那个弹窗已连同它的状态一起删除 —— 拦截规则与拦截记录是两个各自带列表的二级页，
-            // 从弹窗里再弹一层窗口既没地方放、返回栈也说不清。不保留两个入口。
-            IconButton(onClick = { navController.navigate(Routes.DETAIL_SMS_SETTINGS) }) {
+            // 顶栏不提供「刷新」按钮：会话列表与验证码列表各有 10s 静默轮询 + 重进页面刷新
+            //（rememberResumeRefresh），手动刷新属于冗余；对话层仅支持分页加载，
+            // 顶栏刷新容易被理解为刷新对话。
+            // 齿轮入口指向独立的「短信设置」页面，不使用弹窗：
+            // 拦截规则与拦截记录均为带列表的二级页，弹窗内无法容纳，
+            // 且返回栈语义不清晰，因此不提供两个入口。
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.DETAIL_SMS_SETTINGS) }) {
                 Icon(Icons.Default.Settings, "设置", tint = palette.textSecondary)
             }
         }
     ) { padding ->
         UfiPageBackgroundBox(modifier = Modifier.fillMaxSize().padding(padding)) {
-            // 「列表层 ⇄ 对话层」的转场提到这里做，是修"切换抽搐"的关键。
-            // 旧结构：Tab 栏靠 `if (conversationPhone.isEmpty())` 增删，转场在 Tab 栏**下方**的内容
-            // 区里跑 —— 转场第 1 帧 Tab 栏节点就被移除，内容区高度瞬间抽高一截，动画中途整块内容
-            // 跳一下。现在两层都是铺满整屏的兄弟节点，列表层（含 Tab 栏）作为一个整体平移出去，
-            // 转场期间没有任何节点增删、没有高度变化，所以不会抽。
-            // sizeTransform = null 同理：不让 AnimatedContent 去补间容器尺寸。
-            // 2026-10-14：转场口径改为与**导航层二级界面**（TransitionType.DETAIL 的共享轴）完全同源。
+            // 「列表层 ⇄ 对话层」的转场在此层执行。
+            // 两层均为铺满整屏的兄弟节点，列表层（含 Tab 栏）作为整体平移，
+            // 转场期间没有节点增删与高度变化，因此不会出现布局跳动。
+            // 若将 Tab 栏放在 `if (conversationPhone.isEmpty())` 内增删，转场第 1 帧
+            // Tab 栏节点即被移除，内容区高度突变，动画中途整块内容跳动。
+            // sizeTransform = null 同理：不让 AnimatedContent 补间容器尺寸。
+            // 转场口径与**导航层二级界面**（TransitionType.DETAIL 的共享轴）完全同源。
             //
-            // 改动前这里是自己一套：进/出用**两条不同的曲线**（EmphasizedIn / EmphasizedOut）、
-            // 视差 1/4、并且叠了 fadeIn/fadeOut。三处都偏离了共享轴的既定口径：
-            //   1. 共享轴两页是**同时**平移的，曲线必须同一条 —— 一边加速一边减速会让上下层的
-            //      视差关系在中途走歪，观感是两层"错位 / 拉扯"。`Navigation.kt` 的
-            //      `sharedAxisSpec` 注释里明确记过这条，并记录过换 emphasized 曲线后回退；
-            //   2. 视差 1/4 比导航层的 1/6 深 ⇒ 同一个 app 里两种"二级界面"的层次不一致；
+            // 必须遵守共享轴的约定：
+            //   1. 共享轴两页**同时**平移，进出必须使用同一条曲线 —— 一边加速一边减速会使
+            //      上下层的视差关系在中途偏移，表现为两层错位；`Navigation.kt` 的
+            //      `sharedAxisSpec` 注释记录了这一约束；
+            //   2. 视差取 1/6（与导航层一致），1/4 会使同一应用内两类「二级界面」层次不一致；
             //   3. 共享轴**不引入 alpha 淡入淡出**（见 Navigation.kt 顶部的口径）。
-            //      整屏平移上再叠淡入，新页会显得"发虚"，而不是实心压上来。
-            // 现在时长与视差都直接取导航层的来源，曲线取同一条 `Easing.Standard`。
+            //      整屏平移叠加淡入会使新页显得发虚，而不是实心覆盖。
+            // 因此时长与视差均取自导航层来源，曲线使用同一条 `Easing.Standard`。
             val smsAxisSpec = tween<IntOffset>(
                 ufiSharedAxisDurationMs(UfiMotion.Duration.Sweeping),
                 easing = UfiMotion.Easing.Standard
@@ -371,8 +369,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                         slideInHorizontally(smsAxisSpec) { -it / SHARED_AXIS_X_PARALLAX } togetherWith
                             slideOutHorizontally(smsAxisSpec) { it }
                     }
-                    // 进入对话时新页在上（zIndex 1），返回时旧页在上盖住新页 —— 这才是 push/pop
-                    // 该有的遮挡关系；不设的话两页同层，看着就是个交叉淡入淡出
+                    // 进入对话时新页在上（zIndex 1），返回时旧页在上覆盖新页 —— 符合 push/pop
+                    // 的遮挡关系；若不设置，两页同层，表现为交叉淡入淡出。
                     transform.targetContentZIndex = if (enteringConversation) 1f else 0f
                     transform using null
                 },
@@ -394,13 +392,13 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                     )
                 } else {
                     Column(Modifier.fillMaxSize()) {
-                        // 2026-09-05：错误横幅移除 —— ToolsState 的 errorMessage 现在由 Activity 级
-                        // 全局错误浮层统一展示（MainActivity 读 viewModel.globalError）。
-                        // 留在这里会和全局那张卡同位重叠（两者都是屏幕顶部 48dp 的 Popup）。
+                        // 错误不在此处渲染 —— ToolsState 的 errorMessage 由 Activity 级
+                        // 全局错误浮层统一展示（MainActivity 读取 viewModel.globalError）。
+                        // 若保留在此处，会与全局卡片位置重叠（两者均为屏幕顶部 48dp 的 Popup）。
 
-                        // 顶部滑块 Tab 栏 —— 与「自动化」页同款，统一全站 Tab 视觉。
-                        // 角标走公共组件的 badges 槽位；计数是**未读水位**（verificationCodesUnread），
-                        // 不是缓存总条数 —— 后者看过也不会变，角标会永久挂着。
+                        // 顶部滑块 Tab 栏，与「自动化」页一致，统一全站 Tab 视觉。
+                        // 角标使用公共组件的 badges 槽位；计数为**未读水位**（verificationCodesUnread），
+                        // 不是缓存总条数 —— 后者在查看后不会变化，角标会长期存在。
                         UfiScrollableTabRow(
                             selectedTabIndex = toolsState.smsTab,
                             onTabSelected = { viewModel.tools.switchSmsTab(it) },
@@ -409,26 +407,27 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                             badges = listOf(null, toolsState.verificationCodesUnread)
                         )
 
-                        // 置灰原因（只在不支持时出现，且只在「消息」页签 —— 「通知」页签里
-                        // 全是本地解析出来的验证码，跟能不能发短信无关）。
-                        // 只说「设备不支持」：这台设备压根没有发信能力，没有任何地方可开。
+                        // 置灰原因（仅在不支持时显示，且仅在「消息」页签 —— 「通知」页签
+                        // 全部为本地解析的验证码，与能否发送短信无关）。
+                        // 仅说明「设备不支持」：该设备不具备发信能力，不存在可开启的开关。
                         if (!smsSupported && toolsState.smsTab == 0) {
+                            // UfiNoticeCard 内部已带 CardHorizontalMargin(16dp)；
+                            // 此处再加 16dp 会使其比列表窄一圈。
                             UfiNoticeCard(
                                 message = deviceUnsupportedNote("发送短信"),
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                                modifier = Modifier.padding(vertical = 4.dp)
                             )
                         }
 
-                        // 内容区。用 BoxWithConstraints 是为了让 FAB 的边距按**实际可用区域**
-                        // 取百分比（见下方 fabEndPad / fabBottomPad），而不是写死 dp ——
-                        // 写死值在小屏上顶边、在平板上又离内容太远。
+                        // 内容区。使用 BoxWithConstraints 以便 FAB 边距按**实际可用区域**
+                        // 取百分比（见下方 fabEndPad / fabBottomPad）；固定 dp 在小屏上会贴边、
+                        // 在平板上又离内容过远。
                         BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
                             if (toolsState.smsTab == 0) {
-                                // 2026-09-04 去掉下拉刷新：原来这里是 `PullToRefreshBox(indicator = {})`，
-                                // 即「保留手势、不画指示器」的折中版。现在连手势一起删掉 ——
-                                // 一个既不给任何视觉反馈、又会和列表滚动抢通道的手势，用户只会误触，
-                                // 触发了也不知道发生了什么。顶栏那个刷新按钮同样在 2026-10-21 删除，
-                                // 数据保鲜改由 10s 静默轮询 + 重进页面负责。
+                                // 不使用下拉刷新：`PullToRefreshBox(indicator = {})` 属于
+                                // 「保留手势、不绘制指示器」的折中方案，该手势既无视觉反馈，
+                                // 又会与列表滚动争用同一通道，容易误触且触发后无任何提示。
+                                // 顶栏同样不提供刷新按钮；数据更新由 10s 静默轮询 + 重进页面负责。
                                 Box(Modifier.fillMaxSize()) {
                                     when {
                                         toolsState.smsContacts.isNotEmpty() -> {
@@ -442,8 +441,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                                 unreadTotal = unreadTotal,
                                                 onMarkAllRead = {
                                                     scope.launch {
-                                                        // markAllSmsRead 内部成功后已经重拉联系人与 /count
-                                                        // （ToolsModule.kt:850-861），这里不要再补一次。
+                                                        // markAllSmsRead 成功后已在内部重新拉取联系人与 /count
+                                                        //（ToolsModule.kt:850-861），此处无需再次拉取。
                                                         val ok = viewModel.tools.markAllSmsRead()
                                                         toastMessage = if (ok) ToastMessage("已全部标为已读", ToastType.SUCCESS)
                                                         else ToastMessage("操作失败，请重试", ToastType.ERROR)
@@ -465,17 +464,17 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                                     if (latest != null) {
                                                         viewModel.tools.markSmsUnread(latest.id)
                                                     } else {
-                                                        toastMessage = ToastMessage("没有可标记的短信", ToastType.ERROR)
+                                                        toastMessage = ToastMessage("没有可标记的短信", ToastType.INFO)
                                                     }
                                                 },
                                                 onRequestDeleteConversation = { pendingDeleteConversationPhone = it },
                                                 onRequestBlacklist = { pendingBlacklistPhone = it }
                                             )
                                         }
-                                        // 首屏骨架：从未加载过且列表为空。
-                                        // 判据是闩锁而不是 isLoading —— 后者会让每次刷新都重放骨架，
-                                        // 而"已有数据时刷新"根本走不到这里（上面那个分支先命中），
-                                        // "空列表时刷新"也不该再放动画。
+                                        // 首屏骨架：从未加载成功且列表为空。
+                                        // 判据为闩锁而不是 isLoading —— 后者会使每次刷新都重放骨架；
+                                        // 已有数据时刷新不会进入本分支（上一分支先命中），
+                                        // 空列表时刷新也不应播放动画。
                                         contactsFirstLoadPending -> {
                                             UfiSkeletonList(
                                                 modifier = Modifier.padding(
@@ -500,8 +499,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                                     }
                                 }
                             } else {
-                                // 通知 Tab：验证码面板（下拉手势同样删除；顶栏刷新按钮 2026-10-21 也删了，
-                                // 靠下方 10s 静默轮询保鲜）
+                                // 通知 Tab：验证码面板（同样不提供下拉手势与顶栏刷新按钮，
+                                // 数据由下方 10s 静默轮询更新）
                                 Box(Modifier.fillMaxSize()) {
                                     VerificationCodePanel(
                                         codes = toolsState.verificationCodes,
@@ -520,9 +519,9 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                             }
 
                             // FAB（仅消息 Tab）：公共 UfiFloatingActionButton（带按压弹性缩放）。
-                            // 边距按可用区域百分比给（原来是写死的四边 12dp / 后来 24+40dp）：
-                            // 固定 dp 在小屏上贴边压住最后一条会话行的未读角标、也顶到系统手势区，
-                            // 在平板上又离内容太远。coerceIn 兜住极端长宽比，不会缩到贴边或飘到屏幕中间。
+                            // 边距按可用区域百分比计算：固定 dp 在小屏上会贴边压住最后一条会话行的
+                            // 未读角标并侵入系统手势区，在平板上又离内容过远。
+                            // coerceIn 限制极端长宽比下的取值，避免贴边或过度居中。
                             if (toolsState.smsTab == 0) {
                                 val fabEndPad = (maxWidth * 0.07f).coerceIn(20.dp, 36.dp)
                                 val fabBottomPad = (maxHeight * 0.07f).coerceIn(28.dp, 64.dp)
@@ -544,9 +543,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     }
 
     // ── 引导对话框 ──
-    if (showOptInDialog) {
         UfiCustomDialog(
-            visible = true,
+            visible = showOptInDialog,
             onDismiss = {
                 showOptInDialog = false
                 viewModel.tools.switchSmsTab(0)
@@ -580,7 +578,6 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                 topSpacing = Spacing.Large
             )
         }
-    }
 
     // ── 新建短信弹窗（原整屏写信页）──
     if (isComposing) {
@@ -590,8 +587,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             onSend = { phone, msg ->
                 viewModel.tools.sendSms(phone.trim(), msg)
                 isComposing = false
-                // 发完落回「消息」页签并把列表滚到顶部：新会话/刚更新的会话就在 index 0，
-                // 不滚的话它在视口上方，用户以为没发出去（见 pendingScrollContactsTop 注释）
+                // 发送后切回「消息」页签并将列表滚到顶部：新会话或刚更新的会话位于 index 0，
+                // 不滚动会停留在视口上方，造成未发送成功的误解（见 pendingScrollContactsTop 注释）。
                 viewModel.tools.switchSmsTab(0)
                 pendingScrollContactsTop = true
             }
@@ -603,25 +600,25 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         val fullTime = remember(vc.timestamp) {
             SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date(vc.timestamp))
         }
-        // 打开时不再回查原文：core 从 DB v8 起把原短信全文一并存进验证码缓存
-        // （snippet 仍是 80 字预览），列表拿到的那一条就已经带全文，弹窗直接渲染，
-        // 不会像"先显示 snippet、请求回来再换成全文"那样闪一下。
+        // 打开时不回查原文：core 自 DB v8 起将原短信全文一并存入验证码缓存
+        // （snippet 仍为 80 字预览），列表取得的记录已包含全文，弹窗直接渲染，
+        // 不会出现「先显示 snippet、请求返回后替换为全文」的闪烁。
         // body 为空 = 旧数据 / core 版本较旧 → 回退 snippet。
         val closeDialog = { codeDetail = null }
-        // 改用 UfiScrollableDialog：短信正文要**完整显示**，原来给正文单独套
-        // `heightIn(220dp) + verticalScroll` —— 长短信被压在一个矮框里内部滚动，
-        // 看着就像被截断了。现在正文按内容自然铺开，超出弹窗预算时由弹窗整体滚动，
-        // 动作区走 actions 槽位固定在底部（塞进 content 会导致底部留白，见 FIX-24）。
+        // 使用 UfiScrollableDialog：短信正文需**完整显示**；若为正文单独套
+        // `heightIn(220dp) + verticalScroll`，长短信会在矮框内内部滚动，表现为被截断。
+        // 正文按内容自然铺开，超出弹窗预算时由弹窗整体滚动；
+        // 动作区通过 actions 槽位固定在底部（放入 content 会导致底部留白）。
         UfiScrollableDialog(
             visible = true,
             onDismiss = closeDialog,
             title = "验证码详情",
             icon = rememberVectorPainter(Icons.Filled.VerifiedUser),
-            // 右上角关闭按钮去掉：底部已有「确认」，两个等价的关闭入口是噪音
+            // 不显示右上角关闭按钮：底部已有「确认」，两个等价的关闭入口属于冗余。
             showCloseButton = false,
             actions = {
-                // 左「删除」右「确认」：走公共 UfiDialogActions 的 dismissDestructive 槽位，
-                // 间距 / 底边距 / 按钮样式全部继承标准弹窗，不在这里手搓 Row + 两个按钮。
+                // 左「删除」右「确认」：使用公共 UfiDialogActions 的 dismissDestructive 槽位，
+                // 间距 / 底边距 / 按钮样式均继承标准弹窗，不在此处自行组合 Row 与按钮。
                 UfiDialogActions(
                     onDismiss = {
                         viewModel.tools.deleteVerificationCode(vc.msgId)
@@ -635,7 +632,7 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             }
         ) {
             UfiDialogBody {
-                // 验证码本体：等宽大字 + 一键复制。放在最上面，因为"再看一眼码"是点进来的主要动机
+                // 验证码本体：等宽大字 + 一键复制。置于顶部，因为查看验证码是打开该弹窗的主要目的。
                 Surface(
                     shape = UfiCardDefaults.dialogShape,
                     color = palette.accent.copy(alpha = 0.10f),
@@ -653,8 +650,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                             style = UfiTextStyles.monoCode,
                             color = palette.textPrimary
                         )
-                        // 复制走公共 UfiButton（Primary + Small）：原来是 M3 原生 FilledTonalButton，
-                        // 取色走 colorScheme 而不是 palette，深浅主题下和卡片同色系对不上
+                        // 复制按钮使用公共 UfiButton（Primary + Small），不使用 M3 原生 FilledTonalButton：
+                        // 后者取色走 colorScheme 而非 palette，深浅主题下与卡片色系不一致。
                         UfiButton(
                             size = UfiButtonSize.Small,
                             text = "复制",
@@ -687,19 +684,19 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
                         modifier = Modifier.padding(12.dp)
                     )
                 }
-                // 跳转走公共 UfiButton（variant = Secondary）：原来是 M3 原生 TextButton 挤在标题行右侧，
-                // 既不是公共组件、点击区域也只有文字那么大。
+                // 跳转按钮使用公共 UfiButton（variant = Secondary），不使用 M3 原生 TextButton：
+                // 后者非公共组件，且点击区域仅限文字范围。
                 //
-                // 关闭动作交给 shell 排时序：离场 backdrop 要播完才卸载窗口，见 LocalUfiDialogClose。
-                // 这个 local 必须在弹窗自己的 lambda 内部读，在外面读会拿到"直接执行"的默认实现。
+                // 关闭动作交由 shell 排时序：离场 backdrop 需播放完毕后才卸载窗口，见 LocalUfiDialogClose。
+                // 该 local 必须在弹窗自身的 lambda 内部读取，在外部读取得到的是「直接执行」的默认实现。
                 val closeDetail = LocalUfiDialogClose.current
                 UfiButton(
                     variant = UfiButtonVariant.Secondary,
                     text = "查看原对话",
                     onClick = {
                         closeDetail {
-                            // 暂存当前这条：对话关掉后弹窗自动回来，不切页签也不丢滚动位置。
-                            // 同时把 msgId 带过去 —— 对话打开后直接滚到并高亮这条验证码短信。
+                            // 暂存当前记录：对话关闭后弹窗自动恢复，不切换页签且保留滚动位置。
+                            // 同时传递 msgId —— 对话打开后直接滚动到并高亮该验证码短信。
                             reopenCodeAfterConversation = vc
                             codeDetail = null
                             viewModel.tools.openVerificationCodeSource(vc.source, vc.msgId)
@@ -711,11 +708,13 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
     }
 
     // ── 会话行长按「加入黑名单」的二次确认 ──
-    // 文案必须把后果说全：这是「静默丢消息」的操作，用户点之前得知道它拦到什么程度、
-    // 以及历史短信不受影响（core 明确不做追溯，见设计文档「明确不做追溯」）。
-    pendingBlacklistPhone?.let { phone ->
+    // 文案必须完整说明后果：该操作会「静默丢弃消息」，确认前需说明拦截范围，
+    // 以及历史短信不受影响（core 不做追溯）。
+    val dialogPendingBlacklistPhone = rememberLastNonNull(pendingBlacklistPhone)
+    if (dialogPendingBlacklistPhone != null) {
+        val phone = dialogPendingBlacklistPhone
         UfiConfirmDialog(
-            visible = true,
+            visible = pendingBlacklistPhone != null,
             title = "加入黑名单",
             text = "该号码之后的短信不再提醒、不再转发，也不会出现在列表里，" +
                 "可在「短信设置 → 已拦截」中查看。已收到的历史短信不受影响。",
@@ -725,8 +724,8 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
             onConfirm = {
                 pendingBlacklistPhone = null
                 scope.launch {
-                    // 规则形态固定 scope=sender / match=equals，由 ViewModel 负责，
-                    // app 这一层只负责"用户按了确认"这件事。
+                    // 规则形态固定为 scope=sender / match=equals，由 ViewModel 负责；
+                    // app 层仅处理「用户已确认」这一动作。
                     val ok = viewModel.tools.addSmsSenderBlacklist(phone)
                     toastMessage = if (ok) ToastMessage("已把 $phone 加入黑名单", ToastType.SUCCESS)
                     else ToastMessage("加入黑名单失败，请重试", ToastType.ERROR)
@@ -735,15 +734,16 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
         )
     }
 
-    // 2026-09-08：原来这里是「短信设置」UfiCustomDialog（含验证码开关 / 清理间隔 / 设备短信
-    // 条数 / 全部标为已读）+ 一个「打开时才拉 /api/sms/count」的 LaunchedEffect。
-    // 整段已搬到独立页面 SmsSettingsScreen（齿轮改为 navigate），弹窗与状态一并删除 ——
-    // 同一个设置留两个入口，改了一边另一边就是错的。
+    // 「短信设置」（验证码开关 / 清理间隔 / 设备短信条数 / 全部标为已读）位于独立页面
+    // SmsSettingsScreen，由齿轮入口导航进入，不使用弹窗。
+    // 同一设置不得保留两个入口：两者会出现状态不一致。
 
     // ── 会话行长按「删除整段会话」的二次确认 ──
-    pendingDeleteConversationPhone?.let { phone ->
+    val dialogPendingDeleteConversationPhone = rememberLastNonNull(pendingDeleteConversationPhone)
+    if (dialogPendingDeleteConversationPhone != null) {
+        val phone = dialogPendingDeleteConversationPhone
         UfiConfirmDialog(
-            visible = true,
+            visible = pendingDeleteConversationPhone != null,
             title = "删除整段会话",
             text = "将删除与 $phone 的全部短信记录，此操作不可恢复。",
             confirmText = "删除全部",
@@ -764,15 +764,14 @@ fun SmsScreen(viewModel: MainViewModel, navController: NavHostController) {
 /**
  * 会话列表。
  *
- * 2026-08-29：这里**只剩列表**。原来它同时承担「列表 ⇄ 对话」的切换，转场发生在 Tab 栏
- * 下方的内容区里，而 Tab 栏本身又靠 `if (conversationPhone.isEmpty())` 增删 ——
- * 转场一开始 Tab 栏就被移除，内容区高度突然抽高一截，于是看到"抽搐"。
- * 现在切换整体上提到 SmsScreen 的根 AnimatedContent：对话页是覆盖整屏的另一层，
- * 列表层（含 Tab 栏）作为一个整体平移出去，中途没有任何节点增删，高度恒定。
+ * 该组件只负责列表。切换由 SmsScreen 根部的 AnimatedContent 统一处理：对话页是覆盖整屏的
+ * 另一层，列表层（含 Tab 栏）作为整体平移，中途没有节点增删、高度恒定。
+ * 若将 Tab 栏放在 `if (conversationPhone.isEmpty())` 内增删，转场第 1 帧 Tab 栏即被移除，
+ * 内容区高度突变，动画会表现为跳动。
  *
- * @param deviceSmsTotal 设备短信总条数。**为 null 时整条信息行不渲染** —— 读不到就别占位，
- *        更不要在列表上方留一条常驻空行。
- * @param unreadTotal 未读总数（口径见调用点）。> 0 时信息行才出现「全部标为已读」动作。
+ * @param deviceSmsTotal 设备短信总条数。**为 null 时整条信息行不渲染** —— 读不到时不占位，
+ *        也不在列表上方保留一条常驻空行。
+ * @param unreadTotal 未读总数（口径见调用点）。> 0 时信息行才显示「全部标为已读」动作。
  */
 @Composable
 private fun SmsConversationList(
@@ -785,20 +784,20 @@ private fun SmsConversationList(
     onMarkAllRead: () -> Unit,
     /** 长按菜单「标记已读」：整段会话标已读，结果由屏幕层弹 Toast。 */
     onMarkRead: (String) -> Unit,
-    /** 长按菜单「标记未读」：把该会话最新一条收到的短信标未读（2026-09-21）。 */
+    /** 长按菜单「标记未读」：将该会话最新一条收到的短信标为未读。 */
     onMarkUnread: (String) -> Unit,
-    /** 长按菜单「删除整段会话」：只上报意图，二次确认与删除在屏幕层做（2026-09-21）。 */
+    /** 长按菜单「删除整段会话」：仅上报意图，二次确认与删除在屏幕层执行。 */
     onRequestDeleteConversation: (String) -> Unit,
     /** 长按菜单「加入黑名单」：只上报意图，二次确认与写入在屏幕层做。 */
     onRequestBlacklist: (String) -> Unit
 ) {
     // ── 懒加载 = 渐进渲染（不是真分页）────────────────────────────────────────────
     // 依据：会话列表来自 `GET /api/sms/contacts`（RootSmsRoutes.kt），后端按号码聚合后
-    // 一次性回全量，没有 offset/limit；app 侧 `getSmsContacts()` 也是无参。不动 core。
+    // 一次性返回全量，无 offset/limit；app 侧 `getSmsContacts()` 同样无参。
     //
-    // 注意：**对话内部（SmsConversationView）走的是真分页**，`GET /api/sms/list` 支持
-    // limit/offset，ToolsModule 的 openConversation / loadMoreConversation 已经在用。
-    // 两处机制不同是因为接口能力不同，不是实现不一致。
+    // 注意：**对话内部（SmsConversationView）使用真分页**，`GET /api/sms/list` 支持
+    // limit/offset，ToolsModule 的 openConversation / loadMoreConversation 已在使用。
+    // 两处机制不同源于接口能力不同，并非实现不一致。
     var renderLimit by remember { mutableStateOf(SMS_RENDER_PAGE) }
     val rendered = contacts.take(renderLimit)
     LaunchedEffect(listState, contacts.size) {
@@ -819,30 +818,30 @@ private fun SmsConversationList(
         contentPadding = PaddingValues(horizontal = Spacing.CardHorizontalMargin, vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // ── 设备短信信息行（2026-09-08 从短信设置页「其它」分组搬来）─────────────────
-        // 放在 LazyColumn **里面**当第一个 item，而不是列表外面的固定行：
-        // 用户明确说了「不要常驻」——往下翻会话时它跟着滚出视口，回到顶部又能看到。
-        // 固定在列表外等于永久占掉一条高度，正是被否掉的那个形态。
+        // ── 设备短信信息行 ─────────────────────────────────────────────────────────
+        // 作为 LazyColumn 的**第一个 item**，而不是列表外的固定行：
+        // 下翻会话时该行随内容滚出视口，回到顶部时重新可见。
+        // 固定在列表外会永久占用一条高度，不符合该信息行的定位。
         //
-        // 用 [UfiStatusCard] 而不是 [UfiSectionHeader]：它就是「一行式某某当前状态 +
-        // trailing 动作槽」——条数进状态徽标、未读进副文案、动作进 trailing，三样都有位置；
-        // UfiSectionHeader 只有标题 + trailing，条数和未读得挤进同一个标题字符串里。
-        // 也不手搓 Surface + Row：那会顶高 checkLiteralBaseline 的 dp / m3 两个类别。
+        // 使用 [UfiStatusCard] 而不是 [UfiSectionHeader]：前者为「单行状态 + trailing 动作槽」——
+        // 条数进入状态徽标、未读进入副文案、动作进入 trailing，三者各有位置；
+        // UfiSectionHeader 只有标题 + trailing，条数与未读需挤进同一标题字符串。
+        // 也不自行组合 Surface + Row：那会改变 checkLiteralBaseline 的 dp / m3 类别基线。
         if (deviceSmsTotal != null) {
             item(key = "device-sms-info") {
                 UfiStatusCard(
-                    // 2026-10-13：本 LazyColumn 已用 contentPadding 给了 16dp 横向内距
-                    //（与下面 SmsConversationRow 共用同一条基线），而 UfiStatusCard 现在自带
-                    // 同一个 CardHorizontalMargin —— 两边都留就是 32dp 的双重内距，卡片会比
-                    // 会话行窄一圈。所以这里显式关掉组件自带的那一层。
+                    // 本 LazyColumn 已通过 contentPadding 提供 16dp 横向内距
+                    //（与下方 SmsConversationRow 共用同一基线），而 UfiStatusCard 自带
+                    // 相同的 CardHorizontalMargin；两者同时生效会形成 32dp 双重内距，
+                    // 使卡片比会话行窄一圈。因此此处显式关闭组件自带的横向内距。
                     horizontalMargin = 0.dp,
                     title = "设备短信",
                     statusText = "$deviceSmsTotal 条",
-                    // 有未读才用 WARNING 让徽标亮起来；全读完是常态，常态不该是彩色。
+                    // 存在未读时使用 WARNING 使徽标高亮；全部已读为常态，常态不使用强调色。
                     statusType = if (unreadTotal > 0) UfiBadgeType.WARNING else UfiBadgeType.DEFAULT,
                     subtitle = if (unreadTotal > 0) "$unreadTotal 条未读" else "没有未读短信",
-                    // 「全部标为已读」只在真有未读时出现。不做"常驻但置灰"——
-                    // 一个永远点不动的按钮比没有这个按钮更让人困惑。
+                    // 「全部标为已读」仅在存在未读时显示。不采用「常驻但置灰」：
+                    // 无法点击的按钮比不显示该按钮更容易造成困惑。
                     trailing = if (unreadTotal > 0) {
                         {
                             UfiButton(
@@ -866,9 +865,9 @@ private fun SmsConversationList(
                 onRequestBlacklist = { onRequestBlacklist(contact.phoneNumber) }
             )
         }
-        // 2026-09-04 删掉尾部 `item("render-footer") { UfiSkeletonListItem() }`：
-        // 渐进渲染是纯本地 `contacts.take(renderLimit)`，下一批在同一帧就能画出来，不等任何 IO。
-        // 给它挂一条 shimmer 骨架，本质就是"底部加载动画" —— 而这一页要的是"只有进入时有动画"。
+        // 不使用尾部 `item("render-footer") { UfiSkeletonListItem() }`：
+        // 渐进渲染为纯本地 `contacts.take(renderLimit)`，下一批可在同一帧绘制，不等待 IO。
+        // 添加 shimmer 骨架等同于底部加载动画，而本页仅应在进入时播放动画。
     }
 }
 
@@ -879,16 +878,16 @@ private fun SmsConversationList(
 /**
  * 单条会话行。
  *
- * 2026-09-08 加长按菜单：**直接复用消息气泡那一套范式**（见 [ChatBubbleRow]）——
- * `combinedClickable` 取长按 + `onGloballyPositioned { boundsInWindow() }` 采锚点 +
- * [UfiPopupMenu]。不要退回 M3 原生 `DropdownMenu`：它在部分机型不继承自定义 colorScheme
- * 会出现白底（那正是 UfiPopupMenu 存在的原因）。
+ * 长按菜单复用消息气泡的实现方式（见 [ChatBubbleRow]）：
+ * `combinedClickable` 获取长按 + `onGloballyPositioned { boundsInWindow() }` 采集锚点 +
+ * [UfiPopupMenu]。不得改用 M3 原生 `DropdownMenu`：它在部分机型不继承自定义 colorScheme，
+ * 会出现白底，这也是 UfiPopupMenu 存在的原因。
  *
- * 全仓没有 swipe-to-action 组件，所以行内动作走长按菜单而不是侧滑。
+ * 仓库中没有 swipe-to-action 组件，因此行内动作使用长按菜单而不是侧滑。
  *
- * 菜单里**没有「删除会话」**：core 只有 `POST /api/sms/delete`（按单条 id 删），
- * 没有按号码整段删的端点。在 app 侧先拉全部消息再逐条删属于业务编排，
- * 按「core 负责业务、app 只做展示」的分工不该写在这里。
+ * 菜单中**不含「删除会话」**：core 仅有 `POST /api/sms/delete`（按单条 id 删除），
+ * 没有按号码整段删除的端点。在 app 侧先拉取全部消息再逐条删除属于业务编排，
+ * 按「core 负责业务、app 只负责展示」的分工不应实现在此处。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -925,8 +924,8 @@ private fun SmsConversationRow(
             .fillMaxWidth()
             .ufiCardShadow(elevation = 3.dp, shape = cardShape)
             .border(1.dp, palette.divider.copy(alpha = 0.4f), cardShape)
-            // 从 `Surface(onClick = …)` 改成 combinedClickable：那个重载只有单击，
-            // 挂不上长按。点击行为保持不变（打开会话）。
+            // 使用 combinedClickable 而不是 `Surface(onClick = …)`：后者仅支持单击，
+            // 无法挂载长按。点击行为保持不变（打开会话）。
             .combinedClickable(
                 onClick = onClick,
                 onLongClick = {
@@ -1028,10 +1027,10 @@ private fun SmsConversationRow(
                             Text(
                                 text = if (contact.unread > 99) "99+" else "${contact.unread}",
                                 style = UfiTextStyles.caption.copy(fontWeight = UfiWeight.Hero),
-                                // 2026-09-03（P1c）：原为写死 `Color.White`。徽标底色是上一行的
-                                // `palette.accent`（不是 error），所以配 onAccent —— 换配色时若某主题
-                                // 的 accent 是浅色，写死白字会直接在圆片上消失，未读数就看不见了。
-                                // 同页 ChatBubbleRow 的发出方内容色 2026-08-29 已按同样理由改成 onAccent。
+                                // 使用 onAccent 而不是写死 `Color.White`：徽标底色为
+                                // `palette.accent`（不是 error），若某主题的 accent 为浅色，
+                                // 写死白字会与圆片同色而不可见。
+                                // ChatBubbleRow 的发出方内容色同样使用 onAccent。
                                 color = palette.onAccent,
                                 modifier = Modifier.padding(horizontal = 5.dp)
                             )
@@ -1155,12 +1154,11 @@ private fun SmsConversationView(
     // 只带号码过来的话对话只会停在最新一条，用户还得自己往上翻 —— 这里滚到目标并短暂高亮。
     var targetScrolled by remember(targetMsgId) { mutableStateOf(false) }
     var highlightId by remember(targetMsgId) { mutableStateOf<Long?>(null) }
-    // 目标不在已加载页里时向上补页的次数上限（每页 100 条；封顶避免"目标已被设备删掉"时无限翻页）
+    // 目标不在已加载页中时向上补页的次数上限（每页 100 条；设上限以避免目标已被设备删除时无限翻页）。
     var seekAttempts by remember(targetMsgId) { mutableIntStateOf(0) }
-    // 列表首项可能是「查看更早的消息」按钮，消息下标要整体后移一位。
-    // 2026-09-04：原判据是 `isLoading || (hasMore && messages.isNotEmpty())` —— 那时首项还可能是
-    // 「加载中」转圈 item。转圈删掉后（见下方 LazyColumn），isLoading 不再影响首项，判据同步收窄；
-    // 首屏骨架只在 messages 为空时存在，那种情况下这个 offset 用不上。
+    // 列表首项可能是「查看更早的消息」按钮，消息下标需整体后移一位。
+    // 判据为 `hasMore && messages.isNotEmpty()`：加载指示器已移除（见下方 LazyColumn），
+    // isLoading 不再影响首项；首屏骨架仅在 messages 为空时存在，该场景不需要此 offset。
     val headerOffset = if (hasMore && messages.isNotEmpty()) 1 else 0
 
     LaunchedEffect(messages, targetMsgId, isLoading) {
@@ -1208,8 +1206,8 @@ private fun SmsConversationView(
         if (initialScrolled && messages.size > prevListSize && prevListSize > 0) {
             pendingAnchorKey?.let { key ->
                 val idx = messages.indexOfFirst { "${it.id}-${it.timestamp}" == key }
-                // 原来写死 +1（假设首项一定有 header）。首项条件已经收窄成 headerOffset，
-                // 这里跟着用同一个值：最后一页拉完 hasMore 变 false、header 消失时不会错位一格。
+                // 使用与首项条件一致的 headerOffset，而不是固定 +1：
+                // 最后一页加载完成、hasMore 变为 false 且 header 消失时，滚动位置不会偏移一行。
                 if (idx >= 0) listState.scrollToItem(idx + headerOffset, 0)
             }
             pendingAnchorKey = null
@@ -1230,21 +1228,21 @@ private fun SmsConversationView(
         headers
     }
 
-    // 2026-10-14 修正：这里**刻意不再有 `imePadding()`**。
+    // 此处**不使用 `imePadding()`**。
     //
-    // 原写法是「外壳已应用 navigationBars」+「本页再 imePadding()」，而 Android 的 IME inset
-    // 本身就覆盖导航栏那一段 ⇒ 底部被算两次，输入栏会"悬浮"在键盘上方约一个导航栏的高度。
-    // 现在底部 inset 由 `UfiScreenScaffold(imeAwareBottomInset = true)` 在外壳层一次性应用
-    // （`navigationBars ∪ ime`，取较大值而非相加），本页只负责让消息列表用 weight(1f) 让出高度
-    // —— 父级让出空间后列表自动压缩，"最后一条消息 + 输入栏"始终同时可见。
+    // 若外壳已应用 navigationBars，本页再调用 imePadding()，而 Android 的 IME inset
+    // 本身覆盖导航栏段，底部 inset 会被计算两次，输入栏会悬浮在键盘上方约一个导航栏高度。
+    // 底部 inset 由 `UfiScreenScaffold(imeAwareBottomInset = true)` 在外壳层统一应用
+    // （`navigationBars ∪ ime`，取较大值而非相加）；本页通过 weight(1f) 让出高度，
+    // 父级让出空间后列表自动压缩，「最后一条消息 + 输入栏」始终同时可见。
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(palette.pageBg)
     ) {
-        // 顶栏直接坐在 pageBg 上：不再包 `Surface(cardBg, tonalElevation=2, ufiCardShadow)`。
-        // 那一层在浅色主题下是"浅灰底 + 底边阴影"，和下面的 pageBg 只差一点点亮度，
-        // 看起来就是一道脏边而不是层次。去掉之后顶栏与聊天区同底，靠字号/字重区分层级。
+        // 顶栏直接置于 pageBg 上，不使用 `Surface(cardBg, tonalElevation=2, ufiCardShadow)`：
+        // 该层在浅色主题下表现为「浅灰底 + 底边阴影」，与下方 pageBg 亮度接近，
+        // 视觉上形成边界杂色而非层次。移除后顶栏与聊天区同底，由字号/字重区分层级。
         ConversationTopBar(phone = phone, total = totalCount, onBack = onBack)
 
         // 消息列表
@@ -1254,28 +1252,23 @@ private fun SmsConversationView(
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // 2026-10-14（用户要求）：**删掉进入对话的首屏骨架**，只保留懒加载。
+            // 进入对话不显示首屏骨架：数据到达前列表为空，到位后一次性铺出。
             //
-            // 原来这里在「一条消息都没有 + 正在拉第一页」时插一个 `ConversationEntrySkeleton()`
-            // （6 行交替气泡占位 + shimmer）。用户反馈两件事，都成立：
-            //   ① 那是本页唯一的加载动画，而进入对话只需要"懒加载"—— 数据到位直接出现即可；
-            //   ② 它会**闪**：骨架是固定 44dp 高的灰块，与真实气泡高度并不相等，
-            //      数据一到整块被真实气泡顶掉，形态与高度同时变（原注释说"只是灰块变成文字"
-            //      并不成立），于是进入对话时有一次可见跳动。
-            // 现在什么都不画：数据到达前列表为空，到位后一次性铺出来。
+            // 不使用 `ConversationEntrySkeleton()`（6 行交替气泡占位 + shimmer）：
+            //   ① 本页只需懒加载，数据到位直接出现即可；
+            //   ② 骨架为固定 44dp 高的灰块，与真实气泡高度不等，数据到达时整块被替换，
+            //      形态与高度同时变化，会产生一次可见跳动。
             //
-            // 「查看更早的消息」按钮不受影响（它要求 messages 非空），翻页期间的视觉行为不变。
-            // 「查看更早的消息」：只要还有更早的就常驻，**不会因为 isLoading 换成转圈**。
-            // 2026-09-04 删掉了这里的 `if (isLoading) 圆圈 item else if (hasMore) 按钮`：
-            // 两者互斥意味着点一下按钮就被圆圈顶掉、加载完又换回来 —— 每次翻页闪一次版式，
-            // 而且这个圆圈在"进入对话"那一瞬间也会出现（messages 空 + loading），
-            // 正是用户看到的那个圆圈之一。现在按钮原地不动，翻页期间视觉上什么都不发生。
+            // 「查看更早的消息」按钮不受影响（要求 messages 非空）。
+            // 该按钮在存在更早消息时始终显示，**不因 isLoading 切换为加载指示器**：
+            // 两者互斥会导致每次翻页都闪一次版式，且加载指示器在「messages 为空 + loading」
+            // 时同样出现，造成进入对话时的可见闪烁。翻页期间视觉状态保持不变。
             if (hasMore && messages.isNotEmpty()) {
                 item(key = "load_more") {
                     TextButton(
                         onClick = {
                             // 锚点 = 当前第一个可见的**消息**项（跳过本按钮自己）。
-                            // 「entry-skeleton」已在 2026-10-14 随骨架屏一起删除，不再需要排除它。
+                            // 骨架屏已移除，无需再排除「entry-skeleton」项。
                             listState.layoutInfo.visibleItemsInfo
                                 .firstOrNull { (it.key as? String)?.let { k -> k != "load_more" } == true }
                                 ?.key?.let { pendingAnchorKey = it as? String }
@@ -1332,15 +1325,15 @@ private fun SmsConversationView(
             }
         }
 
-        // 输入栏：直接坐在 pageBg 上，**不再包 Surface**。
-        // 上一版取色仍然不对的根因就在这里：ChatInputBar 内部的卡片是 palette.cardBg，
-        // 外面又套了 `Surface(color = palette.cardBg, tonalElevation = 4.dp)` —— 同色贴同色，
-        // 卡片轮廓和描边全被吃掉，看起来还是一片平的底。控制台那边输入栏外面没有任何容器，
-        // 卡片直接浮在 pageBg 上，才有"悬浮卡"的层次。这里对齐它。
+        // 输入栏：直接置于 pageBg 上，**不包裹 Surface**。
+        // ChatInputBar 内部的卡片为 palette.cardBg；若外层再套
+        // `Surface(color = palette.cardBg, tonalElevation = 4.dp)`，同色叠加会吞掉
+        // 卡片轮廓与描边，视觉上仍是平底。控制台页的输入栏外层没有任何容器，
+        // 卡片直接浮于 pageBg 之上，层次清晰；此处保持一致。
         ChatInputBar(
             value = messageText,
             onValueChange = { messageText = it },
-            // 发信能力（批 O / 3.5）。判据与 SmsScreen 那处同源，都读 network.capabilityState。
+            // 发信能力。判据与 SmsScreen 一致，均读取 network.capabilityState。
             enabled = viewModel.network.capabilityState.collectAsState().value
                 .supports(Capability.SMS),
             onSend = {
@@ -1352,40 +1345,38 @@ private fun SmsConversationView(
             }
         )
     }
-    // 2026-09-04 删掉「加载遮罩」：原来这里是
-    //   `if (messages.isEmpty() && isLoading) Box(fillMaxSize, pageBg 60%) { UfiLoadingIndicator(36dp) }`
-    // 它是 Column 的兄弟节点、画在最后 ⇒ 盖在整页之上。**这就是用户说的"进入瞬间那个圆圈"**：
-    // openConversation 先把 conversationMessages 清空并置 conversationLoading=true，
-    // 所以每次点进对话（含通知深链接直接进对话）第一帧必然满足条件，一个 36dp 转圈盖住全屏；
-    // 发完短信重拉对话也会再盖一次。首屏改由列表内的骨架 item 表达，遮罩没有存在意义。
+    // 不使用全屏「加载遮罩」（`if (messages.isEmpty() && isLoading) Box(fillMaxSize, pageBg 60%) { ... }`）：
+    // 该遮罩是 Column 的兄弟节点且最后绘制，会覆盖整页。openConversation 会先清空
+    // conversationMessages 并置 conversationLoading=true，因此每次进入对话
+    //（含通知深链接直接进入）第一帧必然满足条件，以 36dp 加载指示器覆盖全屏；
+    // 发送短信后重新拉取对话也会再次覆盖。首屏状态由列表内的骨架 item 表达，遮罩无必要。
 }
 
-// 2026-10-14（用户要求）：`ConversationEntrySkeleton()` 与它的 `CONVERSATION_SKELETON_WIDTHS`
-// 已**整体删除**。它是"6 行交替气泡占位 + shimmer"的进入动画，而用户明确不要加载动画：
-// 进入对话只需要懒加载 —— 数据到位直接铺出来即可。删除理由与副作用见对话页 LazyColumn 里
-// 那处调用的注释（骨架的固定 44dp 高度与真实气泡高度并不相等，数据到达那一下是可见的跳动）。
+// 不提供进入动画（原 `ConversationEntrySkeleton()` 与 `CONVERSATION_SKELETON_WIDTHS` 已移除）：
+// 进入对话只需懒加载 —— 数据到位直接铺出即可。
+// 该骨架为固定 44dp 高度，与真实气泡高度不等，数据到达时会产生可见跳动，
+// 详见对话页 LazyColumn 中调用处的注释。
 
 /**
- * 「首屏是否还没出过结果」闩锁：返回 true = 该画骨架；false = 已经落地过一次，永久不再画。
+ * 「首屏是否尚未产生结果」闩锁：返回 true = 应显示骨架；false = 已落地一次，之后不再显示。
  *
- * [loaded] 用 lambda 传进来（而不是传 Boolean 值）：本函数只在首次组合时启动一个
- * `LaunchedEffect(Unit)`，lambda 里读的是 collectAsState 那个稳定 State 实例，
- * 所以协程里能一直拿到最新值，而不是被首帧的值冻住。
+ * [loaded] 以 lambda 传入（而不是 Boolean 值）：本函数仅在首次组合时启动一个
+ * `LaunchedEffect(Unit)`，lambda 内读取的是 collectAsState 的稳定 State 实例，
+ * 因此协程中始终取得最新值，不会被首帧的值固定。
  *
- * 判据是 ViewModel 侧给的「这份数据已完成过一次加载尝试」（成功 / 失败都算），
- * 而**不是**去嗅 loading 的 true→false 边沿。
- * 2026-09-08 事故：上一版靠 `loading / hasData / failed` 三个信号里的边沿判断，
- * 验证码那份数据的 loading 从来没被置 true、失败又被静默吞掉 —— 三条全不动，
- * `first {}` 永不返回、`settled` 永远是 false，页面永久停在骨架上，
- * "暂无验证码通知"空态成了不可达代码。落地信号是单调的（只 false→true），
- * 不存在"边沿被 snapshot 合并掉"这类问题。
+ * 判据为 ViewModel 提供的「该数据已完成一次加载尝试」（成功 / 失败均计入），
+ * **不检测** loading 的 true→false 边沿。
+ * 边沿判断依赖 `loading / hasData / failed` 三个信号同时变化；若某份数据的 loading
+ * 从未置为 true、失败又被静默吞掉，`first {}` 将永不返回、`settled` 恒为 false，
+ * 页面会永久停留在骨架状态，对应空态不可达。落地信号单调（仅 false→true），
+ * 不存在「边沿被 snapshot 合并」的问题。
  *
- * `remember` 的初值直接读一次 [loaded]：重进页面时 VM 里的数据还在，
- * 不该为了等一帧 LaunchedEffect 再闪一下骨架。
+ * `remember` 的初值直接读取一次 [loaded]：重进页面时 VM 中数据仍在，
+ * 不应为等待一帧 LaunchedEffect 而再次显示骨架。
  *
- * 2026-09-08 从 `private` 放宽到 `internal`：同包的 [SmsFilterRulesScreen] 与
- * [SmsBlockedScreen] 也要用它（两个列表各一份闩锁）。Kotlin 的 `private` 是文件级可见性，
- * 同包不同文件调不到；复制一份出去等于让"骨架判据"出现第二种实现。
+ * 可见性为 `internal`：同包的 [SmsFilterRulesScreen] 与 [SmsBlockedScreen] 也需要使用
+ * （各自一份闩锁）。Kotlin 的 `private` 为文件级可见性，同包不同文件无法调用；
+ * 复制实现会使「骨架判据」出现第二种版本。
  */
 @Composable
 internal fun rememberFirstLoadPending(loaded: () -> Boolean): Boolean {
@@ -1404,10 +1395,10 @@ internal fun rememberFirstLoadPending(loaded: () -> Boolean): Boolean {
 /**
  * 对话顶栏。
  *
- * 2026-08-29 重做配色：原来头像是 `accent@15%` 的淡色圆底 + accent 文字 —— 浅色主题下几乎看不见
- * 底，深色下又糊成一团；返回箭头连 tint 都没给，跟着 LocalContentColor 走，在自定义 palette 下
- * 经常偏色。现在头像用**实心 accent + onAccent 首字**（accent 面上一律用 onAccent，不写死白色），
- * 副标题降到 textSecondary 做层级。
+ * 配色约定：头像使用**实心 accent + onAccent 首字**（accent 面上一律使用 onAccent，
+ * 不写死白色）。`accent@15%` 淡色圆底 + accent 文字在浅色主题下对比度不足，深色主题下层次不清。
+ * 返回箭头显式指定 tint（palette.textPrimary），不依赖 LocalContentColor，
+ * 避免在自定义 palette 下偏色。副标题使用 textSecondary 以区分层级。
  */
 @Composable
 private fun ConversationTopBar(phone: String, total: Int, onBack: () -> Unit) {
@@ -1464,18 +1455,17 @@ private fun ConversationTopBar(phone: String, total: Int, onBack: () -> Unit) {
 /**
  * 单条消息气泡。
  *
- * 2026-08-29 重做：
- * - **收到方**气泡原来是 `divider@35%` —— divider 本来是给分割线用的极低对比色，拿来当气泡底
- *   在浅色主题下几乎和页面同色，看着像没有气泡。改成 `cardBg` + 1dp 细描边，浮在 pageBg 上，
- *   和全站卡片语言一致。
- * - **发出方**内容色从写死的 `Color.White` 改成 `palette.onAccent`（自定义主题下 accent 可能是
- *   浅色，白字会看不见）。
- * - **时间戳移到气泡外**：原来它占气泡内独立一行且靠右，"好"这种一个字的消息也被撑成一整行宽；
- *   移出去之后气泡完全贴合文字，且不用再在 accent 面上找一个能看清的弱化色。
- * - **长按菜单**换成项目公共组件 [UfiPopupMenu]（文件管理器长按菜单同一套），菜单中心对齐长按点
- *   出现、点外部关闭，并从只有「删除」扩展到复制 / 重发（仅发出方）/ 删除 —— 都不需要新接口：
- *   重发直接复用 sendSms。不要退回 M3 原生 DropdownMenu：它在部分机型不继承自定义 colorScheme
- *   会出现白底（这也是 UfiPopupMenu 存在的原因）。
+ * 配色与布局约定：
+ * - **收到方**气泡使用 `cardBg` + 1dp 细描边，浮于 pageBg 之上，与全站卡片语言一致。
+ *   `divider` 是为分割线设计的极低对比色，作为气泡底色在浅色主题下与页面几乎同色。
+ * - **发出方**内容色使用 `palette.onAccent`，不写死 `Color.White`
+ *（自定义主题下 accent 可能为浅色，白字不可见）。
+ * - **时间戳置于气泡外**：若放在气泡内独立一行且靠右，单字消息（如「好」）也会被撑满整行宽；
+ *   移出后气泡贴合文字，且无需在 accent 面上另选弱化色。
+ * - **长按菜单**使用公共组件 [UfiPopupMenu]（与文件管理器长按菜单一致），菜单中心对齐长按点，
+ *   点击外部关闭；选项为复制 / 重发（仅发出方）/ 删除，均无需新增接口：重发复用 sendSms。
+ *   不得改用 M3 原生 DropdownMenu：它在部分机型不继承自定义 colorScheme，会出现白底，
+ *   这也是 UfiPopupMenu 存在的原因。
  */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -1505,7 +1495,7 @@ private fun ChatBubbleRow(
                 targetValue = 1f,
                 animationSpec = repeatable(
                     iterations = 8,
-                    // 2026-09-04（P2b）：250 → Duration.Fluid（同为 250，零观感变化）。
+                    // 使用 Duration.Fluid（250ms），与原有 250ms 一致，观感不变。
                     animation = tween(
                         durationMillis = UfiMotion.Duration.Fluid,
                         easing = UfiMotion.Easing.Linear,
@@ -1580,9 +1570,9 @@ private fun ChatBubbleRow(
                     )
                 }
 
-                // 「重新发送」也走 POST /api/sms/send，所以同样受 Capability.SMS 门禁。
-                // 判据必须取在这里而不是下面的 buildList 里 —— 那个 lambda 不是 @Composable，
-                // collectAsState() 放进去编译不过。
+                // 「重新发送」同样走 POST /api/sms/send，因此受 Capability.SMS 门禁约束。
+                // 判据必须在此处获取而不是在下方 buildList 中 —— 该 lambda 不是 @Composable，
+                // 在其中调用 collectAsState() 无法通过编译。
                 val smsSupported by viewModel.network.capabilityState.collectAsState()
                 UfiPopupMenu(
                     visible = showActions,
@@ -1602,9 +1592,9 @@ private fun ChatBubbleRow(
                                 }
                             )
                         )
-                        // 不支持发信时**整项不加**，而不是灰着显示：长按菜单不是设置面板，
-                        // 没有放原因文案的位置，灰掉一行却不说为什么只会让人反复戳。
-                        // 原因由对话输入栏的占位文字与消息列表页顶那张说明卡承担。
+                        // 不支持发信时**不添加该项**，而不是显示为置灰：长按菜单不是设置面板，
+                        // 没有显示原因文案的位置；置灰而不说明原因会导致反复尝试。
+                        // 原因由对话输入栏的占位文字与消息列表页顶部的说明卡呈现。
                         if (!isReceived && smsSupported.supports(Capability.SMS)) {
                             add(
                                 UfiPopupOption(
@@ -1681,24 +1671,22 @@ private fun SmsAvatarMini(identifier: String, modifier: Modifier = Modifier) {
 // ═══════════════════════════════════════════════
 
 /**
- * 吸底输入栏 — 与「高级控制台」的 ConsoleInputBar 同款：卡片容器 + BasicTextField + 方形发送键。
+ * 吸底输入栏 —— 与「高级控制台」的 ConsoleInputBar 一致：卡片容器 + BasicTextField + 方形发送键。
  *
- * 2026-08-29 二次调整，补上第一版漏掉的三件事：
+ * **取色**：卡片使用 `palette.cardBg`，且外层不再包裹
+ * `Surface(color = palette.cardBg, tonalElevation = 4.dp)` —— 同色叠加会吞掉轮廓与描边。
+ * 卡片直接浮于 pageBg 之上；描边随聚焦在 `divider@30%` ⇄ `accent@55%` 之间过渡，
+ * 阴影同步 2dp ⇄ 6dp，深浅色两套主题均由 palette 推导，无硬编码色值。
  *
- * **取色**：第一版只把卡片色从写死的 `divider@15%` 换成 `palette.cardBg`，但调用处外面还套着
- * `Surface(color = palette.cardBg, tonalElevation = 4.dp)` —— cardBg 卡片贴在 cardBg 底上，
- * 轮廓和描边全被吃掉，看着还是一片平的。这版把外层 Surface 去掉（见 SmsConversationView），
- * 卡片直接浮在 pageBg 上；描边随聚焦在 `divider@30%` ⇄ `accent@55%` 之间过渡，
- * 阴影同步 2dp ⇄ 6dp，深浅色两套主题都由 palette 推导，无硬编码色值。
- *
- * **上移**：`imePadding()` 加在 SmsConversationView 的根 Column 上（控制台同样做法），
- * 键盘弹出时整个面板上移；本组件只保留 `navigationBarsPadding()` 处理无键盘时的导航栏避让。
+ * **键盘避让**：本组件只保留 `navigationBarsPadding()` 处理无键盘时的导航栏避让；
+ * 输入法 inset 由 `UfiScreenScaffold(imeAwareBottomInset = true)` 在外壳层统一应用，
+ * 此处不得再挂 `imePadding()`（会导致底部 inset 重复计算）。
  *
  * **动画**：
- * - 聚焦：描边色 + 阴影高度用 `animateColorAsState`/`animateDpAsState` 过渡（220ms），
- *   给出"这个框激活了"的反馈，取代第一版毫无状态变化的静态框；
- * - 发送键：`canSend` 翻转时做 0.8→1 的弹性缩放（spring，带轻微回弹）+ 背景色过渡，
- *   输入第一个字符时按钮"弹出来"，清空时缩回去。
+ * - 聚焦：描边色与阴影高度通过 `animateColorAsState`/`animateDpAsState` 过渡（220ms），
+ *   提供输入框激活的反馈；
+ * - 发送键：`canSend` 翻转时执行 0.8→1 的弹性缩放（spring，带轻微回弹）+ 背景色过渡，
+ *   输入首个字符时展开，清空时收回。
  */
 @Composable
 private fun ChatInputBar(
@@ -1706,9 +1694,9 @@ private fun ChatInputBar(
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
     /**
-     * `false` = 这台设备不支持发短信（批 O / 3.5）。输入框不可编辑、发送键灰掉，
-     * 占位文字换成原因 —— 输入栏本身就是"在这里写字然后发出去"的承诺，
-     * 让人打完一段字才发现发不出去，比一开始就说清楚更糟。
+     * `false` = 本设备不支持发送短信。输入框不可编辑、发送键置灰，
+     * 占位文字替换为原因 —— 输入栏即「在此输入并发送」的承诺，
+     * 应在输入前明确告知不可发送，而不是在用户完成输入后才提示。
      */
     enabled: Boolean = true
 ) {
@@ -1722,8 +1710,8 @@ private fun ChatInputBar(
             .navigationBarsPadding()
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
-        // 2026-08-31：卡壳与发送键改用公共 UfiInputBarCard / UfiSendButton
-        //（阴影 6/2dp、禁用底色 0.35、贴底对齐都保持本页原值，观感不变）
+        // 卡壳与发送键使用公共 UfiInputBarCard / UfiSendButton
+        //（阴影 6/2dp、禁用底色 0.35、贴底对齐沿用本页原值，观感不变）
         UfiInputBarCard(
             focused = isFocused,
             focusedElevation = 6.dp,
@@ -1803,12 +1791,12 @@ private fun VerificationCodePanel(
         return
     }
 
-    // 首屏：还没出过结果且一条都没有 → 骨架屏。
-    // 2026-09-04 改动：原来这里是「保持空白一瞬」（`if (isLoading) return`），当初那么写是为了
-    // 躲开"转圈 → 空态 → 列表"连跳两次。骨架屏没有这个毛病 —— 它本身就预示了列表版式，
-    // 数据到位是原地落位而不是换一种形态，所以可以放心画出来，比空白更能说明"在加载"。
-    // 判据换成 firstLoadPending（闩锁）而不是 isLoading：否则"空列表 + 顶栏点刷新"会再放一次骨架，
-    // 而刷新按需求必须完全无动画。
+    // 首屏：尚未产生结果且列表为空 → 显示骨架。
+    // 不使用「保持空白一瞬」（`if (isLoading) return`）：该写法用于避免
+    //「加载指示器 → 空态 → 列表」的连续跳变。骨架本身预示列表版式，
+    // 数据到位时原地替换而非切换形态，比空白更能表达加载状态。
+    // 判据使用 firstLoadPending（闩锁）而不是 isLoading：否则「空列表 + 顶栏刷新」
+    // 会再次显示骨架，而刷新必须无动画。
     if (codes.isEmpty()) {
         if (firstLoadPending) {
             UfiSkeletonList(rows = 5, modifier = Modifier.padding(Spacing.Large))
@@ -1824,8 +1812,8 @@ private fun VerificationCodePanel(
     }
 
     // ── 懒加载 = 渐进渲染（不是真分页）────────────────────────────────────────────
-    // 依据：core 的 `GET /api/sms/verification-codes`（RootSmsRoutes.kt）回的是整份解析缓存，
-    // 没有 offset/limit；app 侧 `getVerificationCodes()` 同样无参。不动 core，故客户端分批渲染。
+    // 依据：core 的 `GET /api/sms/verification-codes`（RootSmsRoutes.kt）返回整份解析缓存，
+    // 无 offset/limit；app 侧 `getVerificationCodes()` 同样无参。因此由客户端分批渲染。
     var renderLimit by remember { mutableStateOf(SMS_RENDER_PAGE) }
     val renderedCodes = codes.take(renderLimit)
     LaunchedEffect(listState, codes.size) {
@@ -1866,11 +1854,11 @@ private const val SMS_RENDER_LOAD_AHEAD = 5
 /**
  * 验证码卡片。
  *
- * 2026-08-29 重做：这个界面的唯一主角是**验证码本身**，所以码放大到 headlineMedium 等宽，
- * 复制做成一眼可点的图标按钮；正文降级为一行"智能摘要"——
- * 原来直接铺 2 行 snippet，屏幕上全是「请勿泄露给他人，如非本人操作请忽略」这类模板话，
- * 反而把码挤小了。摘要规则见 [smsDigest]；`【】` 签名单独抽出来当来源标签（见 [smsSignature]），
- * 比裸号码好认。完整正文点开弹窗看。
+ * 该界面的主体为**验证码本身**：验证码使用 headlineMedium 等宽字体，复制按钮为可直接点击的图标；
+ * 正文降级为一行「智能摘要」。直接展示 2 行 snippet 时，界面大部分被
+ * 「请勿泄露给他人…」类模板文案占据，压缩了验证码的显示空间。
+ * 摘要规则见 [smsDigest]；`【】` 签名单独作为来源标签（见 [smsSignature]），
+ * 比原始号码更易识别。完整正文在详情弹窗中查看。
  */
 @Composable
 private fun VerificationCodeCard(
@@ -1970,15 +1958,15 @@ private fun smsSignature(text: String): String? {
 }
 
 /**
- * 一行摘要：只做**去签名 + 压空白**，不裁字。
+ * 一行摘要：只做**去签名 + 压缩空白**，不裁剪文本。
  *
- * 2026-08-29 改：原实现先"切到第一个句末标点"再"30 字封顶"，两条规则都跟内容走 ——
- * 有的短信第一个句号在第 6 个字（"验证码123456。"），有的整条没有句号直接吃满 30 字，
- * 于是列表里每张卡截断长度都不一样，看着像 bug。现在交给 Compose：
- * 文本原样给出去，`maxLines = 1` + `TextOverflow.Ellipsis` 让它按**实际可用宽度**
- * 截一行加省略号，短的就完整显示 —— 所有卡片的截断位置天然对齐。
+ * 不使用「截取到第一个句末标点」或「30 字上限」等按内容计算的规则：
+ * 有的短信首个句号出现在第 6 个字符（「验证码123456。」），有的整条无句号而占满 30 字，
+ * 导致每张卡片的截断长度不一致。
+ * 文本原样输出，由 `maxLines = 1` + `TextOverflow.Ellipsis` 按**实际可用宽度**
+ * 截为一行并加省略号，短文本完整显示，各卡片的截断位置自然对齐。
  *
- * 仍然去掉 `【】` 签名：它已经作为来源标签单独显示在上一行，重复出现纯占宽度。
+ * 仍需移除 `【】` 签名：该签名已作为来源标签单独显示在上一行，重复出现只占用宽度。
  */
 private fun smsDigest(text: String): String =
     text.trim()
@@ -2013,18 +2001,18 @@ private fun CodeDetailRow(label: String, value: String) {
 }
 
 // ═══════════════════════════════════════════════
-// 新建短信 — 弹窗（2026-08-29 由整屏写信页改造）
+// 新建短信 — 弹窗
 // ═══════════════════════════════════════════════
 
 /**
  * 新建短信弹窗。
  *
- * 2026-08-29 从整屏 `SmsComposerScreen` 改成弹窗：写一条短信只有"号码 + 正文"两个字段，
- * 整页会顶掉列表上下文（发完还得再返回），而且为了撑满一屏塞了顶栏、模板区、字数行等
- * 一堆自绘部件。弹窗形态既保留列表可见，也让所有部件直接落到公共弹窗组件上。
+ * 使用弹窗而不是整屏写信页：写一条短信仅需「号码 + 正文」两个字段，
+ * 整页会顶掉列表上下文（发送后还需返回），且需要为撑满一屏额外放置顶栏、模板区、字数行等部件。
+ * 弹窗形态保留列表可见，并使各部件直接复用公共弹窗组件。
  *
- * 走 [UfiScrollableDialog] 而不是 UfiCustomDialog：正文框最多 6 行 + 联想列表最多 4 条，
- * 小屏（尤其键盘弹起）时总高会超出弹窗预算，需要内容区可滚动、动作区固定在底部。
+ * 使用 [UfiScrollableDialog] 而不是 UfiCustomDialog：正文框最多 6 行 + 联想列表最多 4 条，
+ * 小屏（尤其键盘弹起时）总高会超出弹窗预算，需要内容区可滚动、动作区固定在底部。
  */
 @Composable
 private fun SmsComposerDialog(
@@ -2039,8 +2027,8 @@ private fun SmsComposerDialog(
     val canSend = phone.isNotBlank() && message.isNotBlank()
 
     // ── 收件人智能补全 ──
-    // 用输入的数字去匹配短信列表里出现过的号码；候选走公共 UfiPopupMenu（项目唯一菜单实现，
-    // M3 DropdownMenu 在部分机型不继承自定义 colorScheme 会出白底，明令禁用）。
+    // 以输入的数字匹配短信列表中出现过的号码；候选项使用公共 UfiPopupMenu
+    //（项目唯一菜单实现）。M3 DropdownMenu 在部分机型不继承自定义 colorScheme，会出现白底，禁止使用。
     var fieldBounds by remember { mutableStateOf(IntRect.Zero) }
     // 手动关掉候选后不再自动弹回来，直到输入再变化
     var suggestDismissed by remember { mutableStateOf(false) }
@@ -2063,7 +2051,7 @@ private fun SmsComposerDialog(
         icon = rememberVectorPainter(Icons.Filled.ChatBubbleOutline),
         showCloseButton = false,
         actions = {
-            // 发送键跟 canSend 联动：号码或正文为空时置灰，比整页时代"点了没反应"清楚
+            // 发送键与 canSend 联动：号码或正文为空时置灰，避免点击后无反馈。
             UfiDialogActions(
                 onDismiss = onClose,
                 onConfirm = { if (canSend) onSend(phone, message) },

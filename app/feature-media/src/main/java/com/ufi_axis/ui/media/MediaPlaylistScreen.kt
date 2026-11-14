@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.media
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -238,9 +239,12 @@ fun MediaPlaylistScreen(
         onRemoveFromPlaylist = { pendingRemove = it }
     )
 
-    pendingRemove?.let { item ->
+    val dialogPendingRemove = rememberLastNonNull(pendingRemove)
+    if (dialogPendingRemove != null) {
+        val item = dialogPendingRemove
 
         UfiConfirmDialog(
+        visible = pendingRemove != null,
             title = "移出歌单",
             text = "把「${audioDisplayTitle(item)}」从这个歌单里移出？文件本身不会被删除。",
             confirmText = "移出",

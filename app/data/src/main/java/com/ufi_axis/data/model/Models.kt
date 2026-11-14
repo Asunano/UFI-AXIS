@@ -62,7 +62,7 @@ data class CpuCore(
     val freq_display: String = ""
 )
 
-/** 全量热区（GET api/device/thermal，2026-10-08 只读监控档：关键温度进 CPU 弹窗）。 */
+/** 全量热区（`GET /api/device/thermal`，只读监控数据；关键温度用于 CPU 弹窗）。 */
 @Serializable
 data class ThermalZoneItem(
     val name: String,
@@ -95,8 +95,8 @@ data class BatteryInfo(
     val voltage: Double,
     val is_charging: Boolean,
     val plugged: String,
-    // 设备是否真的具备电池能力（core 批M 起下发）。false 时 percent / is_charging 仍是系统值
-    // （F50 无电池却恒报 level=50, scale=100），core 对这类设备不入库也不做电池告警。
+    // 设备是否真的具备电池能力（由 core 下发）。false 时 percent / is_charging 仍是系统值
+    // （F50 无电池，恒报 level=50、scale=100），core 对这类设备不入库也不做电池告警。
     //
     // 默认 true 是**兼容性判据，不是产品取舍**：旧版 core 的响应里没有这个键，
     // 默认 false 会让所有旧部署都被判成「可能无电池」并弹出提示。
@@ -175,8 +175,8 @@ data class TrafficSummary(
  *   注意日桶在 DST 切换日是 23 / 25 个（core 的 `TrafficUsageWindow` 明确如此，硬凑 24 会让
  *   切换点之后每小时的流量错位一格），所以界面**不得假设恒 24**。
  * - [label] 是这一段的中文文案（"9月14日 周一" / "9月13日-9月19日" / "2026年9月" / "2026年"），
- *   [TrafficUsageBucket.label] 是 X 轴刻度文案，两者都直接展示。同一份文案两端各拼一遍的
- *   下场见 [TrafficLimitConfig] 的注释。
+ *   [TrafficUsageBucket.label] 是 X 轴刻度文案，两者都直接展示。两端各拼一份文案必然分叉，
+ *   详见 [TrafficLimitConfig] 的说明。
  * - [peak_bytes] = 所有桶 [TrafficUsageBucket.total_bytes] 的最大值（Y 轴峰值用）。
  * - [earliest_data_at] **可空**：null = 表里还没有任何记录。非 null 且晚于 [range_start] 时
  *   界面必须明说，否则用户会把"没记录"读成"那天没用流量"。
@@ -200,7 +200,7 @@ data class TrafficUsageResponse(
     val next_anchor: Long = 0,
     /** 下一段是否已经开始。false 时不该让用户往未来翻 —— 翻过去只有一屏空柱。 */
     val has_next: Boolean = false,
-    /** 有记录的最早时刻；null = 一条记录都还没有（**不是** 0，别拿 0 当哨兵）。 */
+    /** 有记录的最早时刻；null = 一条记录都还没有（**不是** 0，不得以 0 作哨兵值）。 */
     val earliest_data_at: Long? = null
 )
 
@@ -224,9 +224,9 @@ data class TrafficUsageBucket(
 )
 
 /**
- * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`，2026-10-06 拍板第4项）。
+ * 流量日报 / 周报 / 月报（`GET /api/traffic/report?period=day|week|month`）。
  *
- * ## 与 [TrafficUsageResponse] 的边界（两者都在 `/api/traffic` 下，不要混用）
+ * ## 与 [TrafficUsageResponse] 的边界（两者都在 `/api/traffic` 下，不得混用）
  * - [TrafficUsageResponse] 是**给图表用的分桶序列**：桶粒度随 `range` 变（日=小时、年=月），
  *   由 core 的 `resolveTrafficUsageWindow` 定窗口，带 `prev_anchor` / `next_anchor` 供左右翻页；
  * - 本端点是**给"报表"用的按自然日聚合**：永远是日桶（日报 1 行、周报 7 行、月报 28~31 行），
@@ -235,7 +235,7 @@ data class TrafficUsageBucket(
  * 数据源同为 `traffic_hourly`，但出桶口径、行数与消费场景都不同，所以 core 侧是两个端点，
  * app 侧也就保持两个 DTO —— 合并成一个只会让两边各长一半用不上的字段。
  *
- * ## 单位与形状（2026-10-14 读 core 源码确认，勿猜）
+ * ## 单位与形状（已按 core 源码确认）
  * - [range_start] / [range_end] / [TrafficReportDay.day_start] 都是 **epoch 毫秒**：
  *   `TrafficReportGenerator.dayStartOf/weekStartOf/monthStartOf` 全部用 `Calendar.timeInMillis`
  *   产出，`TrafficRoutes` 的 `get("/report")` 把这些 Long 原样放进 JSON。
@@ -245,7 +245,7 @@ data class TrafficUsageBucket(
  *   `summarizeLine()` 拼好的整句（例："本周流量 12.3 GB（↓11.0 GB ↑1.3 GB），日均 1.8 GB，最高周六 4.1 GB"）。
  *   app **原样显示**，不拆字段、不重算日均 —— 两端各拼一份必然分叉，而它正是用户看到的那句话。
  * - [TrafficReportDay.day_label] 是 core 用 `SimpleDateFormat("MM-dd", Locale.CHINA)` 格式化好的
- *   （见 `TrafficRoutes` 的 `fmt`），**直接显示**；不要自己格式化 `day_start` ——
+ *   （见 `TrafficRoutes` 的 `fmt`），**直接显示**；不得自行格式化 `day_start` ——
  *   时区口径统一在 core（`TimeZone.getDefault()`，与 web 流量页同一份）。
  *
  * 字段名与 JSON 逐字对应（snake_case），不做 `@SerialName` 重命名；全部带默认值，
@@ -288,8 +288,8 @@ data class TrafficReportDay(
  *
  * core 已经把设备侧的复合串（`"470_1024"` = 470 GB）拆成 [limit_value] +
  * [limit_unit_display] + [limit_bytes]，**客户端不再解析任何复合格式**。
- * 告警判定一律用 [limit_bytes]（0 = 未设限额）—— 历史上这里各写了一份解析，
- * 其中一份读不出复合格式，导致 GB 档位的流量告警永不触发。
+ * 告警判定一律用 [limit_bytes]（0 = 未设限额）：自行解析复合格式曾导致 GB 档位的
+ * 流量告警永不触发。
  */
 @Serializable
 data class TrafficLimitConfig(
@@ -333,8 +333,8 @@ data class TrafficAutoOffConfig(
 /**
  * 信号详情（`GET /api/network/signal`，以及 WS `signal` 频道的载荷）。
  *
- * 下半部分是**服务小区统一字段**（计划书 1.10 / 决策 D2）：core 已按「字段存在性」
- * 做了 NR 优先、LTE 兜底的合并，客户端**不要再按制式 if**，也不要自己拼 `n`/`B` 前缀
+ * 下半部分是**服务小区统一字段**：core 已按「字段存在性」
+ * 做了 NR 优先、LTE 兜底的合并，客户端**不得按制式分支**，也不得自行拼接 `n`/`B` 前缀
  * （[band_label] 就是拼好的）。`nr_*` / `lte_*` 原字段仍在响应里（NSA 双连接要看两边），
  * 但只有排查双连接时才需要读。
  *
@@ -368,10 +368,9 @@ data class SignalInfo(
     /**
      * 频段的**显示**文案：`band_label` 去掉首尾空白后的值，空值返回 null。
      *
-     * 2026-10-11：原先这里做 `.uppercase()`（core 当时拼的是小写 `n78`），
-     * 现已改为**在 core 源头拼大写**（`ServingCell.derive` 拼 `"N$num"`）——
-     * 源头改一次、app 与 web 两端自动都对，不必各改一处、各出一个包。
-     * 所以本属性现在只做 trim 与空值归一，不再转大小写。
+     * 大小写**在 core 源头统一**（`ServingCell.derive` 拼 `"N$num"`）：
+     * 源头处理一次，app 与 web 两端自动一致。
+     * 所以本属性只做 trim 与空值归一，不做大小写转换。
      *
      * 判据一侧不受影响：[isNr] 用 `startsWith("n", ignoreCase = true)`，大小写不敏感。
      */
@@ -382,13 +381,20 @@ data class SignalInfo(
 @Serializable
 data class NetworkStatusResponse(
     val network: NetworkState = NetworkState(),
+    /**
+     * 移动数据**开关**（核心记的用户意图），直接绑界面上的 Switch。
+     *
+     * 它不是 `ppp_status` 的投影：换制式后设备先拆链再重拨，这十几到几十秒内
+     * `ppp_status` 为断，但开关本身并未关闭 —— 以链路状态代替会表现为开关自行开关。
+     */
     val mobile_data: Boolean = false,
+    /** 链路态（设备原值，空串 = 这次没读到）。判断"现在通不通"读它，不是 [mobile_data]。 */
     val ppp_status: String = "",
     val operator: String = "",
     val network_type: String = ""
 ) {
-    /** 参考 UFI-TOOLS-REF: 用 ppp_status goform 字段判断蜂窝数据真实连接状态。
-     *  ZTE 设备上 ConnectivityManager 不反映 modem PPP 链路状态，必须用此字段。 */
+    /** 用 goform 的 `ppp_status` 字段判断蜂窝数据真实连接状态。
+     *  ZTE 设备上 ConnectivityManager 不反映 modem 的 PPP 链路状态，必须使用该字段。 */
     val isCellularConnected: Boolean get() =
         ppp_status.contains("connected", ignoreCase = true) &&
         !ppp_status.contains("disconnected", ignoreCase = true)
@@ -414,7 +420,7 @@ data class SuccessResponse(
     val success: Boolean
 )
 
-/** 套餐档案（2026-10-07，GET /api/device/plan；core 语义层，goform 无套餐概念） */
+/** 套餐档案（`GET /api/device/plan`；core 语义层，goform 无套餐概念）。 */
 @Serializable
 data class PlanProfileResponse(
     val mode: String = "monthly",
@@ -545,7 +551,7 @@ object SmsRuleScope {
     const val BOTH = "both"
 }
 
-/** [SmsRule.matchType] 取值。**没有正则**（决策已定），四种都是可预测的字符串匹配。 */
+/** [SmsRule.matchType] 取值。**没有正则**，四种都是可预测的字符串匹配。 */
 object SmsRuleMatch {
     const val CONTAINS = "contains"
     const val EQUALS = "equals"
@@ -557,7 +563,7 @@ object SmsRuleMatch {
  * 短信拦截规则（`GET/POST /api/sms/rules`、`PUT/DELETE /api/sms/rules/{id}`）。
  *
  * 字段名与 core entity 的 snake_case 一一对应（[matchType] / [hitCount] / …），
- * Kotlin 侧用驼峰，靠 `@SerialName` 桥接 —— 别把驼峰名直接发给 core，core 读的是 snake_case。
+ * Kotlin 侧用驼峰，靠 `@SerialName` 桥接 —— 不得把驼峰名直接发给 core，core 读的是 snake_case。
  *
  * 全字段带默认值：`AppJson` 是 lenient + ignoreUnknownKeys，但**缺字段**在没有默认值时
  * 仍会抛 `MissingFieldException`。老 core 少回一个字段不该让整个列表解析失败。
@@ -607,7 +613,7 @@ data class SmsRuleRequest(
  * 短信拦截记录（`GET /api/sms/blocked`）。
  *
  * [rulePattern] / [ruleScope] / [ruleMatch] 是**规则快照**：规则被删之后这条记录
- * 仍然读得懂「当时是被哪条规则拦的」，展示侧一律读快照，**不要**拿 [ruleId] 回查规则表。
+ * 仍然读得懂「当时是被哪条规则拦的」，展示侧一律读快照，**不得**用 [ruleId] 回查规则表。
  */
 @Serializable
 data class SmsBlockedLog(
@@ -674,7 +680,7 @@ data class MailSendRecord(
      * 投递结果的**线上口径原值**（core DB v12 新增的 `outcome` 列）：
      * `sent` / `failed` / `skipped`，老 core 不回这个键时是空串。
      *
-     * **不要直接比这个字符串做分类**，走 [deliveryOutcome] —— 那是全 app 唯一一处判定，
+     * **不得直接比较该字符串做分类**，走 [deliveryOutcome] —— 那是全 app 唯一一处判定，
      * 它同时处理了"老 core 没有这一列"的情况。
      */
     val outcome: String = "",
@@ -689,9 +695,8 @@ data class MailSendRecord(
      * 结果说明（≤200 字）：failed 时是异常链摊平，skipped 时是跳过原因的中文说明
      * （如「通知总开关已关闭」/「处于免打扰时段」），sent 时空串。
      *
-     * 原因文案由 core 生成，app 侧**不维护第二张原因映射表** —— 抄一份的结果是
-     * core 加了一种跳过原因、app 这边显示成空白或"未知"。2026-09-10 core 把原来的
-     * 一档 `GATE`（"通知总开关关闭或处于免打扰时段"）拆成了两档，app 侧一行都不用改，
+     * 原因文案由 core 生成，app 侧**不维护第二张原因映射表**：复制一份后，core 新增
+     * 跳过原因时 app 只能显示空白或"未知"。core 把 `GATE` 一档拆成两档时 app 无需改动，
      * 正是因为这里只**显示**它、不按文案分类（分类只看 [outcome]，见 [deliveryOutcome]）。
      */
     val error: String = "",
@@ -714,12 +719,12 @@ enum class DeliveryOutcome {
  * 把 [MailSendRecord.outcome] 读成三态结论。**全 app 唯一一处分类判定。**
  *
  * `outcome` 为空时回落到 [MailSendRecord.success]。这不是兼容层，是**外部响应的版本容错**：
- * app 与 core 是两个独立安装的 APK，用户完全可能 app 已经升到这一版、设备上的 core 还是
- * DB v11（没有 `outcome` 列）。而这一页是诊断页 —— 把「失败」渲染成「已发出」是它最不能犯的错，
- * 用户会因此停止排查。老 core 只记发起过投递的行，所以那时 `success` 就是完整判据，
- * 回落不会把任何东西说错（那种 core 根本不产生 skipped 行）。
+ * app 与 core 是两个独立安装的 APK，app 已升级而设备上的 core 仍是 DB v11（没有 `outcome` 列）
+ * 是合法状态。而这一页是诊断页 —— 把「失败」渲染成「已发出」是它最不能犯的错，
+ * 会让排查在此中断。老 core 只记录发起过投递的行，所以那时 `success` 就是完整判据，
+ * 回落不会产生错误结论（该版本 core 不产生 skipped 行）。
  *
- * core 全量升到 v12（`outcome` 恒有值）之后，`outcome.isEmpty()` 这个分支可以删掉。
+ * core 全部升级到 v12（`outcome` 恒有值）后，`outcome.isEmpty()` 分支不再被触发。
  */
 val MailSendRecord.deliveryOutcome: DeliveryOutcome
     get() = when {
@@ -799,14 +804,14 @@ data class ShellExecResponse(
 )
 
 /**
- * 单个系统属性（`GET /api/shell/prop/{key}`，2026-10-14 接入）。
+ * 单个系统属性（`GET /api/shell/prop/{key}`）。
  *
  * ## 为什么单独一条端点，而不是 `POST /api/shell/exec` 拼 `getprop <key>`
  * 1. **校验责任在 core**：本端点的 key 由 core 用 `PROP_KEY_PATTERN`（只许 `[a-zA-Z0-9._]`）
  *    白名单校验，非法直接回 400（见 `ShellRoutes` 的 `get("/prop/{key}")`）。走 exec 是把
- *    一整条命令交给 shell，转义/注入由**调用方**负责 —— 每个调用点都得自己保证拼对了。
+ *    一整条命令交给 shell，转义与注入防护由**调用方**负责，每个调用点都必须自行拼接正确。
  * 2. **不污染终端历史**：exec 每次执行都会由 `ConsoleHistoryRecorder` 在设备端落一行记录
- *    （那是给用户查"我发过什么命令"用的）。读几个只读属性不该在用户的历史里留痕。
+ *    （供终端历史列表展示）。读只读属性不应进入该历史。
  *
  * ## 形状
  * [value] 是 `getprop <key>` 的**原始 stdout**，**含结尾换行** —— 展示前必须 `trim()`。
@@ -896,23 +901,22 @@ data class PlatformInfo(
 
 @Serializable
 data class AlertConfig(
-    // 2026-08-09 19:57 字段全部加默认值（与后端 AlertEngine 默认值匹配）：
-    // 前端 AppJson 虽启用 ignoreUnknownKeys+coerceInputValues，但 coerceInputValues 不处理缺失字段，
-    // 缺字段时若字段无默认值会抛 MissingFieldException → alertsState.config=null → 4 类阈值不渲染。
-    // 2026-08-23 P2 扩展：多端同步字段全部带默认值，旧 core 不返回也不崩。
-    // 2026-09-07：默认 false（用户要求告警不默认开启，需手动打开）。
+    // 字段全部带默认值（与后端 AlertEngine 默认值匹配）：
+    // AppJson 启用了 ignoreUnknownKeys + coerceInputValues，但 coerceInputValues 不处理缺失字段，
+    // 缺字段且字段无默认值时会抛 MissingFieldException → alertsState.config = null → 4 类阈值不渲染。
+    // 多端同步字段同样全部带默认值：旧 core 不返回这些键也不应导致解析失败。
+    // enabled 默认 false：告警默认不开启，需手动打开。
     // 与 core AlertEngine.AlertConfig.enabled / NotificationsGuardScreen 的 `?: false` 逐字一致。
     val enabled: Boolean = false,                // 总开关（core 端唯一真源）
-    // 2026-09-08：删掉 notifyEnabled —— 它自称"投递开关"，但 core 全仓只有邮件转发读它，
-    // WS 推送与入库都无条件执行。邮件是否放行改由 NotificationConfig 的
-    // master_enabled + mail_respect_dnd 决定（判定只在 core 的 mailAllowed 一处）。
+    // 不存在 notifyEnabled：core 仅有邮件转发读取该语义，WS 推送与入库都无条件执行。
+    // 邮件是否放行由 NotificationConfig 的 master_enabled + mail_respect_dnd 决定
+    // （判定只在 core 的 mailAllowed 一处）。
     val perType: Map<String, Boolean> = emptyMap(), // 分类开关 type->enabled
-    // 2026-09-21：删掉 minIntervalSec —— 它自称「同 (type,level) 最小聚合间隔秒」，
-    // 但 core 的聚合走 `bumpExisting`（同 type+level 未确认行就累加），压根没有时间窗，
-    // 引擎从来不读这个字段。第三个被清掉的假开关（前两个是 edgeTriggeredOnly / maxRows）。
+    // 不存在 minIntervalSec：core 的聚合走 `bumpExisting`（同 type+level 未确认行即累加），
+    // 没有时间窗，引擎不读该字段。
     val configVersion: Long = 1L,                // 多端同步版本号（单调递增）
-    // 温度阈值 2026-09-21 从 45/55 重定为 65/75：旧值与 core 温控熔断的
-    // monitorThermalWarnC=70 自相矛盾，而 Unisoc 稳态就在 50~60°C（开机后即恒 critical）。
+    // 温度阈值 65/75 必须与 core 温控熔断的 monitorThermalWarnC=70 协调；
+    // Unisoc 平台稳态温度在 50~60°C，阈值取更低值会使告警恒为 critical。
     // 必须与 core AlertEngine.AlertConfig 逐字一致 —— 这份是镜像，不是第二真源。
     val temperatureWarning: Double = 65.0,
     val temperatureCritical: Double = 75.0,
@@ -940,7 +944,7 @@ data class AlertListResponse(
     val hasMore: Boolean = false
 )
 
-/** 告警聚合计数（对应 Core AlertEngine.AlertCounts；P1 列表 API 新增）。 */
+/** 告警聚合计数（对应 Core AlertEngine.AlertCounts）。 */
 @Serializable
 data class AlertCounts(
     val total: Int = 0,
@@ -1007,7 +1011,7 @@ data class WifiPasswordRequest(
 )
 
 // WiFi 设置 / 客户端列表的强类型响应见 DeviceResponses.kt
-// （WifiSettingsResponse / WifiClientsResponse，阶段 4.3 从 typealias = JsonElement 收敛）
+// （WifiSettingsResponse / WifiClientsResponse，已由 typealias = JsonElement 收敛为具体类型）
 
 // ========== Device Control ==========
 
@@ -1037,13 +1041,13 @@ data class ServiceStatusResponse(
 )
 
 /**
- * 上一次 core 崩溃信息（`GET /api/service/crash`，2026-09-04）。
+ * 上一次 core 崩溃信息（`GET /api/service/crash`）。
  *
  * `timestamp` 是去重键：app 把它与 `AppPreferences.coreCrashShownAt` 比对，不同才弹窗。
  * 老 core 没有这个端点（404）→ 调用方按"没崩溃"处理即可。
  *
- * 2026-10-23：新增 [ageMs] / [recent]。`crashed` 只说明"历史上崩过"，三个月前的记录
- * 也会一直是 true；真正的"值不值得在启动时提示"由 core 用**同一时钟**算出的 [recent]
+ * [ageMs] / [recent] 区分"历史上崩过"与"值得提示"：`crashed` 对三个月前的记录
+ * 同样为 true；"值不值得在启动时提示"由 core 用**同一时钟**算出的 [recent]
  * 决定（窗口见 `ServiceRoutes.CRASH_NOTICE_WINDOW_MS`），判定收敛在 `CoreCrashPolicy`。
  */
 @Serializable
@@ -1058,8 +1062,8 @@ data class CoreCrashResponse(
     /**
      * 崩溃年龄（毫秒，core 用自己这台设备的时钟计算）。
      *
-     * `-1` = 从未崩溃 / 老 core 未提供。**不要**在客户端用 `now - timestamp` 代替：
-     * 手机与设备时钟漂移 >5min 在本仓是真实发生过的，会把"刚崩"误判成"很久以前"。
+     * `-1` = 从未崩溃 / 老 core 未提供。客户端**不得**用 `now - timestamp` 代替：
+     * 手机与设备时钟漂移可超过 5 分钟，会把"刚崩"误判成"很久以前"。
      */
     @SerialName("age_ms") val ageMs: Long = -1L,
     /**
@@ -1112,7 +1116,7 @@ data class SimSwitchResponse(
     val success: Boolean,
     // core 返回的是 goform 卡槽字符串（"0"/"1"/"2"/"11"），不是数字：
     // `toJsonElement(mapOf("success" to success, "slot" to targetSlot))` 里 targetSlot 是 String。
-    // 以前写成 Int，反序列化必然抛类型异常（调用方 try/catch 吞掉，表现为"切换失败"提示）。
+    // 写成 Int 会在反序列化时抛类型异常，且该异常被调用方捕获，表现为"切换失败"提示。
     val slot: String
 )
 
@@ -1123,12 +1127,11 @@ data class AppConfig(
     val port: Int,
     val auto_start_on_boot: Boolean,
     /**
-     * 跨设备的已读水位（2026-10-19）。
+     * 跨设备的已读水位。
      *
-     * 验证码「通知」页签与「已拦截」角标原来只在 App 本地记水位，换设备后归零 ⇒
-     * 把所有历史记录都算未读（角标显示成总数）。现在真源在 core：
-     * 客户端标记已读时 `PUT /api/config` 写回，另一台设备 `GET /api/config` 读取。
-     * null = 老 core 没给这个字段，别动本地镜像。
+     * 只存本地时换设备即归零，全部历史记录会被算作未读（角标显示成总数）。
+     * 真源在 core：客户端标记已读时 `PUT /api/config` 写回，另一台设备 `GET /api/config` 读取。
+     * null = 老 core 没给这个字段，不得改动本地镜像。
      */
     val sms_code_seen_msg_id: Long? = null,
     val sms_blocked_seen_msg_id: Long? = null,
@@ -1140,10 +1143,10 @@ data class AppConfig(
     val qos_cache_ttl_ms: Int = 2000,
     val qos_goform_query_max: Int = 4,
     val qos_goform_set_max: Int = 2,
-    // ── 短信四项（2026-09-14 全部改为可空，理由同下面的日志四层开关）──
-    // 这四项真源在 core，`refreshDeviceConfig()` 会用它们覆盖本地镜像。原来非空 + 有默认值，
-    // 于是「core 响应里没有这个 key」与「core 明确说它是这个值」不可区分 —— 老 core / 裁剪过的
-    // 响应会把用户刚开的开关按默认值刷回去。null 现在的语义是「core 没给，别动本地镜像」。
+    // ── 短信四项（全部可空，理由同下面的日志四层开关）──
+    // 这四项真源在 core，`refreshDeviceConfig()` 会用它们覆盖本地镜像。若非空且带默认值，
+    // 「core 响应里没有这个 key」与「core 明确说它是这个值」不可区分 —— 老 core 或裁剪过的
+    // 响应会把刚打开的开关按默认值刷回去。null 的语义是「core 没给，不得改动本地镜像」。
     val sms_code_enabled: Boolean? = null,
     val sms_code_cleanup_hours: Int? = null,
     /** 自动复制验证码到剪贴板（需先开启系统无障碍服务，否则不生效） */
@@ -1155,15 +1158,15 @@ data class AppConfig(
      * 的号码黑名单约束** —— 拉黑号码是明确意图，不该被豁免绕过。
      *
      * 本地镜像的默认值在 `AppPreferences.smsFilterExemptVerificationCode`（true），
-     * 必须与 core 一致：不一致会让开关一进页面就显示成关，
-     * 用户「打开」它其实什么都没改，正是「假开关」。
+     * 必须与 core 一致：不一致会让开关进入页面即显示为关闭，
+     * 打开后实际不产生任何改动，即「假开关」。
      */
     val sms_filter_exempt_verification_code: Boolean? = null,
-    // ── 日志四层开关（2026-09-04 全部改为可空）──
+    // ── 日志四层开关（全部可空）──
     // 为什么可空：这四个字段的唯一真源在 core，app 侧 `refreshDeviceConfig()` 会用它们**覆盖**
-    // 本地缓存。原来它们是非空 + 默认 true，于是「core 响应里没有这个 key」和
-    // 「core 明确说它是 true」在 app 看来完全一样 —— 任何字段缺失（老 core、响应被裁剪、
-    // 契约漂移）都会把用户刚关掉的开关重新打开。null 现在的语义是「core 没给，别动本地」。
+    // 本地缓存。若非空且默认 true，「core 响应里没有这个 key」和
+    // 「core 明确说它是 true」在 app 看来完全相同 —— 任何字段缺失（老 core、响应被裁剪、
+    // 契约漂移）都会把刚关闭的开关重新打开。null 的语义是「core 没给，不得改动本地」。
     /** 日志总开关（core 端真源；关闭后 core 不写缓冲/文件/logcat。app 侧 `AppPreferences.logEnabled` 是它的缓存） */
     val log_enabled: Boolean? = null,
     /** core 端日志子开关（从属于 log_enabled） */
@@ -1175,26 +1178,26 @@ data class AppConfig(
     /**
      * 字段归一化总开关（core 真源 `AppSettings.fieldNormalizationEnabled`，默认 **true**）。
      *
-     * 关掉 = core 读侧不再按 profile 归一化，原样透传设备原始字段名（决策 D7 的排障回退开关）。
+     * 关闭 = core 读侧不再按 profile 归一化，原样透传设备原始字段名（排障用回退开关）。
      *
      * **可空且没有默认值兜底**（语义：`null` = core 的 `GET /api/config` 里没有这个键）。
-     * 这一点对本项尤其关键：core 是 2026-09-22 才把它补进 `AppSettings.toMap()` 的，
-     * 之前的版本读回来一定是 null。若在这里写成 `Boolean = true`，
-     * 「老 core 没这个键」与「core 说它是 true」就不可区分，UI 只能展示一个拖了也不生效的
-     * 假开关（本仓明令禁止）。app 侧据此把开关置为禁用态并说明原因，见 `DiagnoseScreen`。
+     * 这一点对本项尤其关键：老版本 core 不把它放进 `AppSettings.toMap()`，
+     * 读回来一定是 null。写成 `Boolean = true` 会使
+     * 「老 core 没这个键」与「core 说它是 true」不可区分，UI 只能展示一个操作后不生效的
+     * 假开关。app 侧据此把开关置为禁用态并说明原因，见 `DiagnoseScreen`。
      *
      * **不热生效**：core 只在构造组件图时读一次（`ComponentFactory.resolveDeviceProfile()`），
      * 改完必须重启后台服务；而 `PUT /api/config` 的 `needs_restart` **不含**这个键
      * （那份清单只覆盖认证/端口），所以重启提示必须由 UI 自己写死。
      */
     val field_normalization_enabled: Boolean? = null,
-    // 2026-08-12：后端更新源 / 镜像前缀（GET /api/config 返回；AppJson ignoreUnknownKeys 下缺省安全）
+    // 后端更新源 / 镜像前缀（GET /api/config 返回；AppJson ignoreUnknownKeys 下缺省安全）
     val update_url: String = "",
     val update_mirror_base: String = "",
-    // 2026-09-22：下载方式（auto/mirror/direct）。**core 是这一项的真源**，app 只读回来显示，
+    // 下载方式（auto/mirror/direct）。**core 是这一项的真源**，app 只读回来显示，
     // 并在 core 不可达时作为选源兜底。空串 = 老 core 没这个字段，此时保持本地缓存不动。
     val update_source_mode: String = "",
-    // ── 媒体封面预热（2026-10-05 G6，FFmpeg 接入计划书 §4.2）──
+    // ── 媒体封面预热 ──
     // 真源在 core，**可空**：null = core 没返回这个键（老版本），UI 据此禁用开关，
     // 不拿默认值冒充真值（口径同上面 sms_* / field_normalization_enabled 那批字段）。
     val thumb_prewarm_enabled: Boolean? = null,
@@ -1202,9 +1205,9 @@ data class AppConfig(
 )
 
 /**
- * `PUT /api/config` 被拒字段（C03）。
+ * `PUT /api/config` 被拒字段。
  * reason 取值见 core `ErrorCode`：OUT_OF_RANGE（带 min/max）/ MASKED_VALUE / BLANK_VALUE / WRONG_TYPE。
- * 改造前这些字段是"静默丢弃 + success:true"，客户端只能靠 updated_fields 反推且拿不到原因。
+ * 被拒字段不再静默丢弃并回 `success: true`：那种响应下客户端只能靠 updated_fields 反推，且拿不到原因。
  */@Serializable
 data class ConfigRejectedField(
     val field: String,
@@ -1237,8 +1240,8 @@ data class ConfigResetResponse(
 )
 
 /**
- * `GET /api/update/source`：core 给出的更新源决策（2026-09-22 决策下沉 core）。
- * app 不再自己判断走不走镜像，只按这份结果拼 URL 下载自己的 APK。
+ * `GET /api/update/source`：core 给出的更新源决策。
+ * app 不自行判断是否走镜像，只按这份结果拼 URL 下载自己的 APK。
  */
 @Serializable
 data class UpdateSourceInfo(
@@ -1253,19 +1256,17 @@ data class UpdateSourceInfo(
 /**
  * 邮件通知配置。
  *
- * 2026-08-29：`method` / `curl_*` / `dingtalk_*` 全部删除 —— 渠道收敛为只有 SMTP 邮件。
- * 新增 [scenes]：允许转成邮件的 **app 通知场景 id**（`NotifyScene.sceneId`），
+ * 渠道只有 SMTP 邮件：`method` / `curl_*` / `dingtalk_*` 均已删除。
+ * [scenes]：允许转成邮件的 **app 通知场景 id**（`NotifyScene.sceneId`），
  * 空集合 = 只转发设备短信、不转发 app 通知。
  *
- * 2026-09-10「规则同构」：补上 [min_level] / [daily_limit] 两个旋钮与它们的只读伴生位。
- * 三条渠道（邮件 / Webhook / 本机短信）现在有**同一组**字段，界面因此可以共用同一批行
+ * [min_level] / [daily_limit] 与另两条渠道（Webhook / 本机短信）**同构**，因此界面共用同一批行
  * （见 `NotifyChannelRules.kt`）。区间与默认值刻意各不相同 —— 邮件是 0..500、默认不限，
- * 值域读 [daily_limit_min] / [daily_limit_max]，别在 app 里抄第二份。
+ * 值域读 [daily_limit_min] / [daily_limit_max]，app 侧不得复制第二份。
  *
  * **本 DTO 同时是 GET 响应与 POST 请求体**，而 [sent_today] / [quota_remaining] 是只读位：
- * POST 时会被原样回传，**core 忽略它们**。契约上把只读位塞进写请求确实不干净
- * （Webhook / 本机短信那两条用独立的 `XxxConfigPatch` 分开了），但给邮件单开一个 patch DTO
- * 要动 core 的既有端点形状，收益不抵改动 —— 2026-09-10 裁决留着现状，别再"顺手重构"。
+ * POST 时会被原样回传，**core 忽略它们**。Webhook / 本机短信两条渠道用独立的 `XxxConfigPatch`
+ * 分离读写；邮件单开一个 patch DTO 需要改动 core 的既有端点形状，收益不抵改动，故保持现状。
  *
  * 真正要紧的是 [min_level] / [daily_limit]：POST 发的是整个对象，未编辑时必须从 GET 的值
  * 原样带回，否则会被默认值覆盖。
@@ -1284,11 +1285,11 @@ data class SmsForwardConfig(
      * 「能不能发出去」的判据 —— **core 的 `SmsForwardController.isSendable()` 那一份**
      * （enabled + smtp_host + smtp_user + smtp_pass + smtp_to 五项齐全）。
      *
-     * 2026-09-11 新增。app 侧**不许**再用 `smtp_host.isBlank() || smtp_to.isBlank()`
-     * 之类的组合自算一套：只填服务器与收件地址时那套会判"已配置"，而一封都发不出去。
+     * app 侧**不得**再用 `smtp_host.isBlank() || smtp_to.isBlank()`
+     * 之类的组合自算一套：只填服务器与收件地址时那套会判"已配置"，而实际一封都发不出去。
      * 口径与 `/api/notify/{sms,webhook}/config` 的 `configured` 对齐（字段名沿用
      * `/diagnose` 已在用的 `sendable`）。老 core 不回这个字段时默认 false ——
-     * 宁可显示"配置不完整"，也不要承诺一件发不出去的事。
+     * 宁可显示"配置不完整"，也不承诺无法发出的投递。
      */
     val sendable: Boolean = false,
     val forward_dev_info: Boolean = false,
@@ -1497,7 +1498,7 @@ data class ServerVersionInfo(
     val update_url: String
 )
 
-/** 设备更新状态（2026-08-10，对应后端 UpdateManager.UpdateStatus） */
+/** 设备更新状态（对应后端 UpdateManager.UpdateStatus）。 */
 @Serializable
 data class UpdateStatusResponse(
     val state: String = "idle",           // idle/downloading/verifying/installing/done/failed
@@ -1506,7 +1507,7 @@ data class UpdateStatusResponse(
     val current_version: String = "",
     val latest_version: String? = null,
     val apk_path: String? = null,
-    val reconnecting: Boolean = false     // P0-7 前端断连过渡态：轮询失败连续 N 次置 true（设备重启中）
+    val reconnecting: Boolean = false     // 前端断连过渡态：轮询连续失败 N 次置 true（设备重启中）
 )
 
 /** APK 上传结果（兜底推送） */
@@ -1525,14 +1526,14 @@ data class UpdateInstallResponse(
 )
 
 /**
- * 前端 App 更新信息（2026-08-10 C5：经 Core 转发仓库根 version.json 的 frontend 对象；
- * 2026-08-12 对齐旧项目 UFITOOLS-Widget 的 camelCase 字段 apkUrl/apkSha256）。
+ * 前端 App 更新信息（经 Core 转发仓库根 version.json 的 frontend 对象，字段为 camelCase：
+ * apkUrl / apkSha256）。
  * 字段与后端 UpdateManager.FrontendUpdateInfo 保持一致（version/versionCode/changelog/apkUrl/apkSha256）；
  * 经 @JsonNames 同时兼容旧 snake_case（apk_url/sha256）命名。
  */
 @Serializable
 data class FrontendUpdateInfo(
-    // C6：新格式 versionName（对齐旧项目 UFITOOLS-Widget），兼容旧 version
+    // 新格式 versionName，兼容旧 version 字段
     @JsonNames("versionName") val version: String = "",
     val versionCode: Int = 0,
     val changelog: String = "",
@@ -1541,7 +1542,7 @@ data class FrontendUpdateInfo(
 )
 
 /**
- * 后端 core 自身的更新信息（`GET /api/update/backend-info`，2026-09-06）。
+ * 后端 core 自身的更新信息（`GET /api/update/backend-info`）。
  *
  * 与 [FrontendUpdateInfo] 的区别：那个是「App 自己的新版本」（前端直连 GitHub 清单拿到），
  * 这个是「设备上跑的 core 有没有新版本」——由 core 读清单 backend 对象并**自己**做版本比对，
@@ -1572,7 +1573,7 @@ data class DeviceVersionResponse(
 )
 
 /**
- * EPS 承载 QoS（`GET /api/device/qos`，2026-09-22）。
+ * EPS 承载 QoS（`GET /api/device/qos`）。
  *
  * core 侧用 `AT+CGEQOSRDP` 查当前承载协商到的 QoS，取默认承载（优先 cid=1）。
  * 仅供仪表盘设备信息卡显示。
@@ -1601,16 +1602,16 @@ data class DeviceQosResponse(
     val hasData: Boolean get() = available && qci > 0
 }
 
-// 设备能力集（`GET /api/device/capabilities`，2026-09-25 批 O / 计划书 §7 阶段 3 的 3.5）。
+// 设备能力集（`GET /api/device/capabilities`）。
 //
 // 形状：{ "plugin_id": "zte-f50", "capabilities": ["sms", "band_lock", …] }
 //
 // [capabilities] 是 wire 名数组，解析成枚举集合由
 // `com.ufi_axis.viewmodel.state.DeviceCapabilityState.fromWires` 负责 ——
-// 本层只管把 JSON 拿进来，认不认识哪个名字是上层的事。
+// 本层只负责把 JSON 解析进来，名称语义由上层处理。
 //
-// 默认值都给空：core 的取值在装配组件图时就定死了，但**拉取失败一律按"全部支持"降级**
-// （见 DeviceCapabilityState 的说明），所以这里不需要"失败时的假值"。
+// 默认值都给空：core 的取值在装配组件图时即确定，而**拉取失败一律按"全部支持"降级**
+// （见 DeviceCapabilityState 的说明），因此这里不需要"失败时的假值"。
 @Serializable
 data class DeviceCapabilitiesResponse(
     val plugin_id: String = "",
@@ -1630,7 +1631,7 @@ data class MonitorHistoryResponse(
     val period_hours: Int,
     val bucket_seconds: Int,
     /**
-     * 服务端实际生效的桶宽（毫秒，2026-09-03 精度重写新增）。
+     * 服务端实际生效的桶宽（毫秒）。
      *
      * 有了它，UI 才能判断「相邻两点差得远 = 中间是空桶」并把折线断开，而不是把几小时的
      * 数据空洞连成一条直线。默认 0 是为了兼容还没升级的 core（字段缺失时不解析失败，
@@ -1733,7 +1734,7 @@ const val BACKUP_CLIENT_APP = "app"
 const val BACKUP_MODE_MERGE = "merge"
 const val BACKUP_MODE_REPLACE = "replace"
 
-// ========== Media Center（媒体中心，2026-09-16）==========
+// ========== Media Center（媒体中心）==========
 //
 // 数据全部由 core 的 `/api/media` 一组端点给出（它查系统媒体库 MediaStore）。
 // **播放 / 查看仍走 `/api/files/stream?path=`** —— 那条链路已经支持 Range 与签名鉴权，
@@ -1782,7 +1783,7 @@ data class MediaLibraryItem(
     /**
      * 内嵌标签里的曲名（**仅音频**，core 从 `MediaStore.Audio.Media.TITLE` 取）。
      *
-     * 与 [name] 的区别：[name] 是文件名（`带我走-杨丞琳.flac`），这个才是歌名（`带我走`）。
+     * 与 [name] 的区别：[name] 是文件名（`示例歌曲-示例歌手.flac`），这个才是歌名（`示例歌曲`）。
      * 取不到时是空串 —— core 不拿文件名冒充曲名，兜底显示由客户端决定
      * （见 `audioDisplayTitle`）。
      */
@@ -1799,7 +1800,7 @@ data class MediaLibraryItem(
      *
      * 歌单存的是路径，文件被删 / 卡没插 / 还没被系统扫到时 core 就回不出完整信息，
      * 于是带上这个标记 + 加入歌单时的快照字段（[title]/[artist]/[album]/[duration_ms]），
-     * 此时 [id] 恒为 0。UI 要画"已失效"占位并禁止播放，**不要自动帮用户移出** ——
+     * 此时 [id] 恒为 0。UI 要画"已失效"占位并禁止播放，**不得自动移出** ——
      * 拔一次卡就清空歌单是不可接受的。
      *
      * 其它端点（`/list`、`/browse`）永远是 false。
@@ -1811,8 +1812,8 @@ data class MediaLibraryItem(
  * 一条外挂字幕（`GET /api/media/subtitles` 的 items 元素）。
  *
  * [supported] = 播放器能不能解析这个格式。false 的条目 core 也会返回
- * （MicroDVD `.sub`、SAMI `.smi`）—— 目录里明明有文件却在界面上查无此项，
- * 用户只会以为 App 瞎了，所以照常列出但标成"格式不支持"。
+ * （MicroDVD `.sub`、SAMI `.smi`）—— 目录中存在文件却在界面上查无此项，
+ * 会被理解为功能缺失，因此照常列出但标成"格式不支持"。
  *
  * [label] 是从文件名里猜的语言/版本标记（`movie.zh-CN.srt` → `zh-CN`），
  * 猜错了不影响播放（播放看 [mime]），只影响字幕轨列表上显示的那个名字。
@@ -1925,15 +1926,15 @@ data class MediaGroupsResponse(
 )
 
 /**
- * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。 *
+ * `GET /api/media/status`：三类媒体各自的授权状态与扫描范围。
  * [granted] 与 [scan_dirs] 的 key 都是 [MEDIA_TYPE_VIDEO] 等。某一类 granted 为 false 时
  * 对应页面必须显示未授权引导 —— 显示空列表等于告诉用户"设备里没有视频"。
  *
- * [scan_dirs] 自 2026-09-16 起**按类型各一份**（媒体中心拆成三个独立页，每页管自己的范围）；
+ * [scan_dirs] **按类型各一份**（媒体中心拆成三个独立页，每页管自己的范围）；
  * 某一类为空数组 = 这一类不限目录。
  */
 /**
- * 2026-10-05 G5：视频元信息（FFmpeg 接入计划书 §4.1）。
+ * 视频元信息。
  * core 用 ffmpeg 探测真值（MediaStore 列在本机经常缺失），永久缓存。
  * [source]：cache（缓存命中）| ffmpeg（本次探测）。
  */
@@ -1974,7 +1975,7 @@ data class MediaDirsRequest(
     val dirs: List<String> = emptyList()
 )
 
-// ── DLNA MediaServer（/api/dlna，2026-10-09） ──────────────────────────
+// ── DLNA MediaServer（/api/dlna） ──────────────────────────────────────
 
 /** `GET /api/dlna/status`：开关态 + 运行态 + 就绪态（目录未配置时 ready=false，开关置灰依据）。 */
 @Serializable
@@ -2038,7 +2039,7 @@ data class MediaTagsResponse(
     val duration_ms: Long = 0
 )
 
-// ========== 音频歌单（2026-09-21）==========
+// ========== 音频歌单 ==========
 //
 // core 侧 `PlaylistRoutes`（`/api/playlists`）。歌单**存在 core**，两端看到同一份。
 // 曲目以真实路径为标识（不是 MediaStore id —— 那个重扫会变，歌单会整份失效），
@@ -2070,7 +2071,7 @@ data class PlaylistsResponse(
 /**
  * `GET /api/playlists/{id}/items`：歌单曲目。
  *
- * [items] 的顺序**就是播放顺序**（用户手排的）—— 不要再按音乐页的排序偏好重排一次。
+ * [items] 的顺序**就是播放顺序**（由用户手动排序）—— 不得再按音乐页的排序偏好重排。
  * 已失效的条目照样在列表里，带 [MediaLibraryItem.missing] = true，[missing_count] 是它们的条数。
  */
 @Serializable
@@ -2107,13 +2108,13 @@ data class PlaylistPathsRequest(
     val position: Int? = null
 )
 
-// ── 从音乐库移除 / 删除文件（2026-09-23）──────────────────────────────────────
+// ── 从音乐库移除 / 删除文件 ────────────────────────────────────────────
 
 /**
  * 排除名单（「从音乐库移除」的那一份路径清单）。
  *
  * @param max 名单硬上限。**这不是产品上的取舍**：名单会变成 SQL 的 `_data NOT IN (?,…)`，
- *   每条占一个绑定变量，SQLite 上限 999。客户端据此提前提示，别让用户点了才发现没生效。
+ *   每条占一个绑定变量，SQLite 上限 999。客户端据此提前提示，避免操作后才发现未生效。
  * @param full 已满。等价于 `total >= max`，由 core 算好，省得两端各算一遍。
  */
 @Serializable
@@ -2168,7 +2169,7 @@ data class PlaylistRemoveResponse(
 )
 
 
-// ══════════════════════════ 天气（2026-09-17）══════════════════════════
+// ══════════════════════════ 天气 ══════════════════════════
 //
 // core 侧代理 Open-Meteo，app 只做展示。字段口径与 WeatherRoutes.parseForecast 一一对应，
 // **描述文案与 weather_code → 中文的映射都在 core**，app 不再自己翻一份。
@@ -2253,11 +2254,11 @@ data class WeatherSearchResponse(
     val total: Int = 0
 )
 
-// ══════════════════════════ 今日诗词（2026-09-18）══════════════════════════
+// ══════════════════════════ 今日诗词 ══════════════════════════
 //
 // core 侧代理 jinrishici v2。标签匹配（季节 / 天气 / 时辰 / 地理）由**上游按设备 IP
-// 自动完成**，命中的标签在 [PoetryResponse.match_tags] 里回传 —— 我们既不传 tag、
-// 也不自己算季节，v2 接口本身没有 tag 参数。
+// 自动完成**，命中的标签在 [PoetryResponse.match_tags] 里回传 —— app 既不传 tag、
+// 也不自行计算季节，v2 接口本身没有 tag 参数。
 
 /** `GET /api/poetry`。 */
 @Serializable
@@ -2306,7 +2307,7 @@ data class PoetryConfigUpdateResponse(
     val config: PoetryConfigResponse = PoetryConfigResponse()
 )
 
-// ══════════════════════════ 出网国家/地区（2026-09-18）══════════════════════════
+// ══════════════════════════ 出网国家/地区 ══════════════════════════
 //
 // 检测在 core（`/api/geo`）：判据是出网 IP 的归属，而设备才是出网点。app 只读结果，
 // 唯一消费方是更新源自动选择（见 [com.ufi_axis.util.UpdateSource]）。

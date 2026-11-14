@@ -96,6 +96,14 @@ class WebSocketRepository(
     /** 还剩几次"被拒后重连"的机会（给 /health 校时留时间，2026-10-22）。 */
     private var authRetriesLeft = 0
 
+    /**
+     * 「凭据探测成功 → 重连」这条恢复路径已经用了几次。
+     *
+     * 上限 3：防止"探测 200 但握手一直 1008"（例如服务端时钟/签名校验有更深的毛病）时
+     * 与实时通道形成 8 秒一轮的无限重连。连接成功时清零，下一次掉线还能再恢复。
+     */
+    private var authRecoveryAttempts = 0
+
     /** 当前订阅频道（重连后按此列表重新订阅）。 */
     private var subscribedTopics: List<String> = DEFAULT_TOPICS
 
@@ -170,6 +178,8 @@ class WebSocketRepository(
                 DebugLog.d("WS", "Connected to $baseUrl/ws/realtime")
                 _connectionState.value = ConnectionState.CONNECTED
                 retryCount = 0
+                // 连上就说明"鉴权恢复"这一轮结束了，下一次掉线还能重新走恢复路径
+                authRecoveryAttempts = 0
                 subscribeToTopics(subscribedTopics)
                 // 2026-09-12：WS（重）连后主动补一次控制台历史对齐。
                 // 连上期间另一端的命令已通过 data_changed 实时同步；但若本次连接是「断线后重连」，
@@ -327,6 +337,33 @@ class WebSocketRepository(
         }
     }
 
+    /**
+     * 「凭据经 HTTP 探测确认有效」之后，把实时通道从"鉴权被拒"的终态里拉回来。
+     *
+     * 2026-11-14：`authRejected=true` 之后 [scheduleReconnect] 直接 return，唯一复位点是
+     * [connect]，而它只由回前台/网络变化/换端点触达 —— 于是"凭据其实是好的、只是这一次
+     * 握手被拒"（冷启动时钟未校准、core 启动窗口配对库降级）这一格没有出口：
+     * 探测拿 200、不 WIPE、也不重连，用户永远停在"实时连接已断开"。
+     *
+     * @return true = 已经发起了一次重连
+     */
+    fun retryAfterAuthProbe(): Boolean {
+        if (_connectionState.value == ConnectionState.CONNECTED) return false
+        val current = scope ?: return false
+        if (authRecoveryAttempts >= MAX_AUTH_RECOVERY) {
+            DebugLog.w("WS", "鉴权恢复已达上限（$MAX_AUTH_RECOVERY 次），等待用户手动操作")
+            return false
+        }
+        authRecoveryAttempts++
+        authRejected = false
+        retryCount = 0
+        DebugLog.w("WS", "凭据探测通过，重建实时通道（第 $authRecoveryAttempts 次）")
+        runCatching { webSocket?.close(1000, "Credential re-verified") }
+        webSocket = null
+        connect(current)
+        return true
+    }
+
     fun reconnect() {
         retryJob?.cancel()
         retryCount = 0
@@ -406,6 +443,14 @@ class WebSocketRepository(
          */
         private const val AUTH_RETRY_MAX = 2
         private const val AUTH_RETRY_DELAY_MS = 1_200L
+
+        /**
+         * 「凭据探测成功 → 重建实时通道」最多几次（见 [retryAfterAuthProbe]）。
+         *
+         * 上限存在的意义：防止"探测 200、握手却一直 1008"（服务端时钟/签名有更深的问题）时
+         * 与实时通道形成 8 秒一轮的无限重连。连上即清零。
+         */
+        private const val MAX_AUTH_RECOVERY = 3
 
         // 2026-10-05 R3-12 修复：OkHttpClient 进程级单例，Activity 重建不再新建 client
         // （连接池 / Dispatcher 线程池 / WS ping 调度器不随组合重建而泄漏堆积）

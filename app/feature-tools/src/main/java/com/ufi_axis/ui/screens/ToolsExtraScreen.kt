@@ -14,6 +14,7 @@ import com.ufi_axis.ui.components.common.UfiPageBackground
 import com.ufi_axis.ui.components.common.UfiScreenScaffold
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 工具入口的一条记录。
@@ -32,14 +33,19 @@ internal data class ToolEntry(
 /**
  * 日常工具：一级页直接显示。
  *
- * 判据是**使用频率**，不是技术实现 —— 这七项里文件/媒体/下载/短信/流量都是隔几天就要点的，
+ * 判据是**使用频率**，不是技术实现 —— 这八项里文件/媒体/下载/短信/流量都是隔几天就要点的，
  * 而收进进阶页的那几项（见 [TOOLS_EXTRA]）一周未必用一次。
  *
  * 视频 / 音乐 / 图片占了三格：2026-09-16 从「媒体中心」一张卡拆开的，
  * 三类各有各的扫描范围与授权状态，合在一页里要先选栏才能看。这里保留拆开的形态。
+ *
+ * 应用商店（2026-10-31）：与文件管理同层的第三方程序入口，复用 [ToolGrid]/[UfiGridCard]。
  */
 internal val TOOLS_PRIMARY = listOf(
     ToolEntry("文件管理", Icons.Default.FolderOpen, "浏览/复制/移动/上传", Routes.DETAIL_FILES),
+    // 2026-10-31：第三方 Linux 程序商店。放在文件管理旁边，复用同一张 UfiGridCard，
+    // 不单独写通栏卡 / 不复制样式；入口与视频/音乐等日常项同层级。
+    ToolEntry("应用商店", Icons.Default.Storefront, "第三方程序安装", Routes.DETAIL_PROGRAM_STORE),
     // ★ 2026-09-24（用户定稿："音乐/视频/图片 的描述太普通，图片改成相册"）：
     //   三条标题+副标题按各自页面**实际提供的能力**重写，而不是复述文件类型。
     //   - 视频：`MediaVideoScreen` 是「首页 / 媒体库」两栏，首页是最近与继续观看 ⇒ 标题保留"视频"
@@ -55,7 +61,14 @@ internal val TOOLS_PRIMARY = listOf(
     ToolEntry("相册", Icons.Default.Image, "时间轴 · 按文件夹浏览", Routes.MEDIA_LIBRARY_IMAGE),
     ToolEntry("下载管理", Icons.Default.CloudDownload, "远程下载/aria2", Routes.DETAIL_DOWNLOADS),
     ToolEntry("短信", Icons.Default.Sms, "收发短信", Routes.DETAIL_SMS),
-    ToolEntry("流量管理", Icons.Default.DataUsage, "限额与统计", Routes.DETAIL_TRAFFIC_MGMT)
+    ToolEntry("流量管理", Icons.Default.DataUsage, "限额与统计", Routes.DETAIL_TRAFFIC_MGMT),
+    // 2026-11-01：远程屏幕从「通栏卡」改为**与视频/音乐同一种网格卡**。
+    // 上一版它各占一整行，理由是"隔几天看一眼的独立入口"，但用户明确要求统一形态 ——
+    // 同一页出现两种卡宽会让视线断一下，这条判据本来就是这个文件自己写的。
+    //
+    // 2026-11-05：话费账单一行已移到「设置 → 小功能」（用户要求）。它与天气/诗词/DLNA 同属
+    // "隔很久才看一眼、且不需要从工具页顺手打开"的东西，留在这一页反而稀释了工具页的密度。
+    ToolEntry("远程屏幕", Icons.Default.PhoneAndroid, "查看 · 操作设备", Routes.DETAIL_REMOTE_SCREEN)
 )
 
 /**
@@ -87,7 +100,8 @@ internal val TOOLS_EXTRA = listOf(
  * 「进阶工具」自己也是一张入口卡，和日常七项**同在一个网格里**。
  *
  * 一开始把它做成通栏卡（想用宽度区分"通往一组东西"和"一个功能"），实测割裂感强 ——
- * 同一页出现两种卡宽，视线在第 8 格那里断一下。统一成网格第 8 格，两列正好四行。
+ * 同一页出现两种卡宽，视线会在那里断一下。统一成网格里的最后一格；加入应用商店后
+ * 两列共五行（第九格是进阶入口）。
  *
  * description 写得短：半宽卡装不下四个全名，写全了会截断成更难读的样子。
  */
@@ -98,7 +112,7 @@ internal val TOOLS_EXTRA_ENTRY = ToolEntry(
     route = Routes.DETAIL_TOOLS_EXTRA
 )
 
-/** 一级页实际渲染的八格：日常七项 + 进阶入口。 */
+/** 一级页实际渲染的九格：日常八项 + 进阶入口（两列五行的最后一格为进阶）。 */
 internal val TOOLS_PRIMARY_GRID = TOOLS_PRIMARY + TOOLS_EXTRA_ENTRY
 
 /** 入口卡之间的间距。两列网格，横竖同值才不会看出"行比列挤"。 */
@@ -130,7 +144,7 @@ internal fun ToolGrid(
                 title = entry.title,
                 icon = entry.icon,
                 description = entry.description,
-                onClick = { navController.navigate(entry.route) },
+                onClick = { navController.ufiNavigateOnce(entry.route) },
                 horizontalMargin = 0.dp
             )
         }

@@ -15,6 +15,7 @@ import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * Cloudflare Tunnel 隧道列表页（2026-08-26 重构）。
@@ -77,7 +78,7 @@ fun CfDetailScreen(viewModel: MainViewModel, navController: NavHostController) {
                             title = item.name,
                             subtitle = if (item.tokenSet) "token 已配置" else "缺少 token",
                             icon = Icons.Default.Cloud,
-                            onClick = { navController.navigate(Routes.tunnelCfTunnel(item.name)) },
+                            onClick = { navController.ufiNavigateOnce(Routes.tunnelCfTunnel(item.name)) },
                             badgeText = if (item.running) "运行中" else null,
                             highlighted = item.name == state.cfActiveTunnel,
                             iconTint = if (item.running) palette.accent else palette.textSecondary
@@ -88,9 +89,8 @@ fun CfDetailScreen(viewModel: MainViewModel, navController: NavHostController) {
                 Spacer(Modifier.height(Spacing.Medium))
             }
 
-            if (showNewTunnel) {
                 UfiCustomDialog(
-                    visible = true,
+                    visible = showNewTunnel,
                     onDismiss = { showNewTunnel = false },
                     title = "新建隧道"
                 ) {
@@ -134,7 +134,6 @@ fun CfDetailScreen(viewModel: MainViewModel, navController: NavHostController) {
                         )
                     }
                 }
-            }
 
             UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
         }

@@ -1,6 +1,7 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结，请勿在无向后兼容前提下修改；实验性组件请使用 @UfiExperimentalApi（见 UfiStableApi.kt / UfiExperimentalApi.kt）。
 package com.ufi_axis.ui.screens
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -195,7 +196,7 @@ fun TunnelSettingsComponentsScreen(viewModel: MainViewModel, navController: NavH
                                             onClick = {
                                                 viewModel.tunnel.installComponent(c.id)
                                                 toastMessage =
-                                                    ToastMessage("已开始下载，可离开本页", ToastType.INFO)
+                                                    ToastMessage("已开始下载，可离开本页", ToastType.SUCCESS)
                                             },
                                             enabled = c.available && !task.active
                                         )
@@ -239,9 +240,11 @@ fun TunnelSettingsComponentsScreen(viewModel: MainViewModel, navController: NavH
         UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
     }
 
-    pendingUninstall?.let { id ->
+    val dialogPendingUninstall = rememberLastNonNull(pendingUninstall)
+    if (dialogPendingUninstall != null) {
+        val id = dialogPendingUninstall
         UfiConfirmDialog(
-            visible = true,
+            visible = pendingUninstall != null,
             title = "卸载 $id",
             text = "会删除该二进制与元数据。隧道配置不受影响，但在重新安装前无法启动。",
             confirmText = "卸载",

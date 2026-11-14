@@ -30,6 +30,7 @@ import com.ufi_axis.ui.components.common.UfiSettingsRowCard
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 视频页设置（右上角齿轮进来）—— **入口列表页**（2026-10-14 由"一页装全部"拆成入口 + 三个子页）。
@@ -104,7 +105,7 @@ fun MediaVideoSettingsScreen(
                         },
                         icon = Icons.Default.FolderOpen,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_SETTINGS_SCAN) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_SETTINGS_SCAN) }
                     )
                 }
 
@@ -121,7 +122,7 @@ fun MediaVideoSettingsScreen(
                         },
                         icon = Icons.Default.History,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_SETTINGS_PLAYBACK) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_SETTINGS_PLAYBACK) }
                     )
                 }
 
@@ -132,7 +133,7 @@ fun MediaVideoSettingsScreen(
                         description = "海报墙列数、字幕显示与样式。",
                         icon = Icons.Default.Subtitles,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_SETTINGS_DISPLAY) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_SETTINGS_DISPLAY) }
                     )
                 }
 
@@ -143,7 +144,7 @@ fun MediaVideoSettingsScreen(
                         description = "本机记录，最多 6 条，可逐条续播。",
                         icon = Icons.Default.History,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_RECENT) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_RECENT) }
                     )
                 }
 
@@ -162,7 +163,7 @@ fun MediaVideoSettingsScreen(
                         },
                         icon = Icons.Default.Image,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_VIDEO_SETTINGS_COVERS) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_SETTINGS_COVERS) }
                     )
                 }
             }

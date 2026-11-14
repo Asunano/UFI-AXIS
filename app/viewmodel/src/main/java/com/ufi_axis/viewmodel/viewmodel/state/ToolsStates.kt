@@ -409,6 +409,14 @@ data class DebugLogState(
 data class CoreLogFilesState(
     val files: List<com.ufi_axis.data.model.DebugLogFileItem> = emptyList(),
     val totalBytes: Long = 0,
+    /** 今天的写入量（2026-10-30 占用提示）。 */
+    val todayBytes: Long = 0,
+    /** 落盘日志跨了多少天；日志不按天删除，这个值只用于展示。 */
+    val days: Int = 0,
+    /** 日志卷剩余可用字节；-1 = 读不到。 */
+    val diskFreeBytes: Long = -1,
+    /** 可用空间不足，core 已暂停写文件。 */
+    val degraded: Boolean = false,
     /** core 侧日志目录绝对路径（同一路径在设备的文件管理器里可直接打开）。 */
     val dir: String = "",
     /** 正在查看的文件名；null = 只在看列表。 */

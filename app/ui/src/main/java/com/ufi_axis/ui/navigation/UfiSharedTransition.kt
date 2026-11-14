@@ -2,6 +2,7 @@
 
 package com.ufi_axis.ui.navigation
 
+import androidx.compose.runtime.ProvidableCompositionLocal
 import androidx.compose.animation.AnimatedVisibilityScope
 import androidx.compose.animation.ExperimentalSharedTransitionApi
 import androidx.compose.animation.SharedTransitionScope
@@ -216,4 +217,26 @@ fun Modifier.ufiSharedBounds(key: String, scaleContent: Boolean = true): Modifie
             },
         )
     }
+}
+
+/**
+ * 二级页转场的**实际时长（毫秒）**，供"页内二级视图"复用。
+ *
+ * 为什么需要它：有些页面在自己的路由内部还有一层"列表 → 明细"（例如话费账单的
+ * 账号列表 → 账号明细）。这一层切换不在 NavHost 里，拿不到 `AnimatedContentScope`，
+ * 但它必须和全局二级页转场**同一条曲线、同一段时长**，否则用户会觉得"点进去没有动画"
+ * 或"动画比别处快一截"。
+ *
+ * 由 `MainNavGraph` 统一 provide（`ufiSharedAxisDurationMs(navTransitionMs)`），
+ * 页面里直接 `LocalUfiDetailTransitionMs.current`；`0` = 关闭转场（降低动效 / 用户关闭）。
+ */
+val LocalUfiDetailTransitionMs: ProvidableCompositionLocal<Int> =
+    compositionLocalOf { 0 }
+
+/** 页内"列表 → 明细"应当使用的时长：与全局二级页一致，且尊重降低动效。 */
+@Composable
+fun ufiDetailTransitionMs(): Int {
+    val configured = LocalUfiDetailTransitionMs.current
+    val reduceMotion = com.ufi_axis.ui.animation.page.LocalUfiReduceMotion.current
+    return if (reduceMotion) 0 else configured
 }

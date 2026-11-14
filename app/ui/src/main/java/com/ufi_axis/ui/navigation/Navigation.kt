@@ -2,6 +2,7 @@ package com.ufi_axis.ui.navigation
 
 import android.graphics.RenderEffect
 import android.graphics.Shader
+import android.os.SystemClock
 import androidx.compose.animation.*
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.tween
@@ -26,11 +27,15 @@ import com.ufi_axis.ui.components.common.UfiDialogAnim
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.ThemeManager
 import com.ufi_axis.ui.theme.UfiMotion
+import com.ufi_axis.util.DebugLog
 import com.ufi_axis_core.util.UiFrameGate
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
-// === 二级页：Material Shared Axis X + 旧页压暗 / 新页圆角（2026-09）===
+// === 二级页：Material Shared Axis X + 旧页压暗 / 新页圆角 ===
 //
 // 位移仍是纯水平 Shared Axis。深度图层 [ufiSharedAxisLayer] 按 **方向感知的下层角色**
 // （[UfiNavRecedeRole]）分配，不用 `targetState` 猜 —— pop 时「离场页」是上层 detail，
@@ -45,15 +50,15 @@ import kotlin.math.roundToInt
 /**
  * Shared Axis 视差分母：旧页走整屏的 1/6（与历史 HOST_PARALLAX 对齐，大位移更易掉帧）。
  *
- * 2026-10-14：`private` → 公开。**页内**的「列表 ⇄ 详情」共享轴（短信对话页）必须用同一个
- * 分母，否则同一个 app 里两种"二级界面"的视差深度不一样 —— 那正是这次要修的不一致。
+ * **页内**的「列表 ⇄ 详情」共享轴（短信对话页）也使用这个分母：反之同一个 app 里
+ * 两种"二级界面"的视差深度会不一致。
  */
 const val SHARED_AXIS_X_PARALLAX = 6
 
 /**
  * 上层进场页圆角峰值（dp）。落位必须精确回到 0。
  *
- * 2026-09-15：20 → 36。20dp 在整屏尺度上几乎看不出弧度（用户："圆角可以裁切大一点"）。
+ * 20dp 在整屏尺度上几乎看不出弧度，故取 36dp。
  */
 private const val SHARED_AXIS_ENTER_CORNER_DP = 46f // 2026-10-14：36 → 46（用户："圆角的圆心放下一点"）
 
@@ -63,9 +68,9 @@ private fun sharedAxisScrimAlpha(): Float = UfiMotion.NavRecede.ScrimAlpha
 /**
  * 上层进场圆角半径（dp）随落位进度 `p` 的变化：**前 75% 保持峰值，最后 25% 抹平**。
  *
- * 抽成函数不是为了复用，而是为了让「圆角要不要画」的判据（[ufiSharedAxisLayer] 里的
- * `cornerRadiusDp`）与真正画圆角时用的半径**出自同一个式子**。两处各写一遍迟早漂移，
- * 而漂移的表现是"圆角分支在半径已经小于 0.5dp 时还在裁剪"——白付一次整页重录。
+ * 抽成函数不是为复用，而是为了让「是否绘制圆角」的判据（[ufiSharedAxisLayer] 里的
+ * `cornerRadiusDp`）与真正绘制时的半径**出自同一个式子**。两处各写一遍会漂移，
+ * 漂移表现为"半径已小于 0.5dp 时仍在裁剪"，多付一次整页重录。
  *
  * @param p 落位进度：1 = 严丝合缝铺满、0 = 完全离屏（进出两个方向同义）。
  */
@@ -73,7 +78,7 @@ private fun enterCornerDp(p: Float): Float =
     lerp(SHARED_AXIS_ENTER_CORNER_DP, 0f, ((p - 0.75f) / 0.25f).coerceIn(0f, 1f))
 
 /**
- * 下层压暗的量化档数（2026-10-14）。
+ * 下层压暗的量化档数。
  *
  * 把连续的「被盖住程度」（0..1）切成 32 档，即 alpha 的最小台阶约 1.6%
  * （峰值 0.5 时一档 0.0156）。取值理由与 [underlayBlurStep] 的 12 档同源：
@@ -82,9 +87,17 @@ private fun enterCornerDp(p: Float): Float =
  */
 private const val SHARED_AXIS_SCRIM_STEPS = 32
 
+/**
+ * 转场结束后继续压住数据层的时长（毫秒）。
+ *
+ * 与 `UfiPageSwitcherHost.FRAME_GATE_TAIL_MS` 同值同义：把"攒了一路的 WS 更新一次性刷入"
+ * 从**转场最后一帧**推到"画面已经静止之后"，静止帧上的一次重组肉眼看不见。
+ */
+private const val FRAME_GATE_TAIL_MS: Long = 150L
 
 
-// ── 下层背景模糊（2026-09-20，只服务升起面板）─────────────────────────────────
+
+// ── 下层背景模糊（只服务升起面板）─────────────────────────────────
 //
 // 为什么这条链路与公共弹窗（[UfiDialogShell]）**实现不同但取值同源**：
 // 弹窗是独立 Window，能用 `FLAG_BLUR_BEHIND + blurBehindRadius` 让系统去模糊
@@ -105,9 +118,30 @@ private const val SHARED_AXIS_SCRIM_STEPS = 32
  *
  * 量化的动机与弹窗那边同源（见 [UfiDialogAnim.BackdropSteps]）：半径这种视觉量 12 档
  * 已经看不出台阶，而**逐帧新半径**意味着逐帧 `createBlurEffect`（JNI + 原生对象分配）——
- * 页面切换那侧早就为此加过缓存（见 `UfiPageSwitcherHost` 的 `blurEffectCache`）。
+ * 页面切换侧已为此加过缓存（见 `UfiPageSwitcherHost` 的 `blurEffectCache`）。
  * 量化之后整段转场最多命中 12 个不同半径，配合 [underlayBlurEffect] 的缓存即为零分配。
  */
+/**
+ * 转场期下层模糊的**峰值半径**（设备像素）。
+ *
+ * 不复用弹窗的 `UfiDialogAnim.BlurRadius`（110px）：那个值是为**静止的弹窗背景**定的，
+ * 背景不动，可以完全模糊；而二级页转场的下层是**一页正在做视差平移的整屏内容**，
+ * 110px 在前 1/4 行程就已模糊到看不清内容。
+ *
+ * 36px 的依据：在 3x 屏上约 12dp，正好是"看得出层次、还认得出内容"的量级；
+ * 再叠下面 [sharedAxisBlurFraction] 的缓入曲线，前 20% 的行程几乎不糊。
+ */
+private const val SHARED_AXIS_BLUR_PEAK_PX: Float = 36f
+
+/**
+ * 进度 → 模糊系数的曲线（0..1）。
+ *
+ * 线性映射（`1 - progress` 直接当系数）会使 4% 行程就跨过第 1 档（≈3px）、
+ * 25% 达到 1/4 峰值。改为 `t^1.8` 缓入：前 20% 行程只到 3%，中点约 34%，落定前才接近满值。
+ * 指数 1.8 是前段明显更慢、后段仍平滑的折中（1.4 接近线性，2.2 在后半程会突然变模糊）。
+ */
+private fun sharedAxisBlurFraction(t: Float): Float = t.coerceIn(0f, 1f).pow(1.8f)
+
 private fun underlayBlurStep(fraction: Float): Int =
     (fraction.coerceIn(0f, 1f) * UfiDialogAnim.BackdropSteps).roundToInt()
 
@@ -129,13 +163,13 @@ private val underlayBlurEffects = HashMap<Int, androidx.compose.ui.graphics.Rend
 private fun underlayBlurEffect(step: Int): androidx.compose.ui.graphics.RenderEffect? {
     if (step <= 0) return null
     return underlayBlurEffects.getOrPut(step) {
-        val radius = UfiDialogAnim.BlurRadius.toFloat() * step / UfiDialogAnim.BackdropSteps
+        val radius = SHARED_AXIS_BLUR_PEAK_PX * step / UfiDialogAnim.BackdropSteps
         RenderEffect.createBlurEffect(radius, radius, Shader.TileMode.CLAMP).asComposeRenderEffect()
     }
 }
 
 /**
- * 二级页转场相对「转场时长」滑块的放慢系数（2026-09-15）。
+ * 二级页转场相对「转场时长」滑块的放慢系数。
  *
  * 为什么不是直接把 `ThemeManager.TRANSITION_DURATION_DEFAULT_MS` 调大：那个值同时驱动
  * Tab 横滑切页，而且只影响**没改过设置**的用户（存过值的人不会变）。这里改系数，
@@ -161,10 +195,9 @@ fun ufiSharedAxisDurationMs(durationMillis: Int): Int =
  * 两个页面在 Shared Axis 里是**同时**平移的，所以进/出必须用**同一条**曲线：
  * 一边加速一边减速会让上下层的视差关系在中途走歪（观感是两层之间"错位/拉扯"）。
  *
- * 2026-09-15 试过换成 M3 emphasized decelerate（`Easing.EmphasizedIn`），**已回退**：
- * 那条曲线在前 25% 的时间里就走完约 70% 的位移，整屏平移用它的观感是"页面猛地弹到位、
- * 最后几像素再慢慢爬"，用户直接反馈"动画异常的快 + 闪"。emphasized 系列是给
- * 小元件入场用的，整屏位移要的是全程匀顺 —— 回到 `Easing.Standard`（FastOutSlowIn）。
+ * 不使用 M3 emphasized decelerate（`Easing.EmphasizedIn`）：该曲线在前 25% 的时间里
+ * 走完约 70% 的位移，整屏平移的观感是页面猛地弹到位、最后几像素再缓慢移动。
+ * emphasized 系列面向小元件入场，整屏位移需要全程匀顺，故用 `Easing.Standard`（FastOutSlowIn）。
  * 放慢仍由 [SHARED_AXIS_SLOWDOWN] 负责，那是"总时长"而不是"前后快慢分配"。
  */
 private fun <T> sharedAxisSpec(durationMillis: Int) =
@@ -173,9 +206,9 @@ private fun <T> sharedAxisSpec(durationMillis: Int) =
 /**
  * 位移起点的**下限保护**。
  *
- * ## 现象（用户实测，2026-10-11）
- * 概率性出现「二级页从右下角长出来」，后续再进就正常。复现路径：进应用管理页、
- * **骨架屏还在加载时**退出并立刻进别的二级页。
+ * ## 现象
+ * 概率性出现「二级页从右下角长出来」，后续再进就正常。复现路径：进入应用管理页、
+ * **骨架屏仍在加载时**退出并立即进入其它二级页。
  *
  * ## 判断
  * `slideInHorizontally` 的起点由 `{ it }` 给出，`it` 是**目标页在那一帧被测量的宽度**。
@@ -184,17 +217,15 @@ private fun <T> sharedAxisSpec(durationMillis: Int) =
  * 转场起点同时发生；当那一帧测量尚未落定（`it` 极小或0），位移起点就从"右缘一个点"
  * 变成近零 —— 观感正是**从右下角长出来**。
  *
- * 这与本文件 546/637 行记的病史同源：**slide 起点依赖当帧测量**。那次是从
- * `graphicsLayer{RoundedCornerShape}` 那侧绕过去的，这次是测量竞态那侧。
+ * 与下文「禁止离屏合成」那节同源：**slide 起点依赖当帧测量**，只是成因在测量竞态一侧。
  *
  * ## 为什么加下限而不是改成固定屏宽
  * `{ it }` 的语义是"按自身宽度位移"，全站二级页一致，**正常帧它是对的**。
  * 直接换成屏宽会失去自适应（若将来有宽度不同的目的地就会错位）。
  * 所以只在**明显异常**（宽度不足全屏一半）时兜底，正常路径一个字节都不变。
  *
- * ⚠ 本修正**未经真机验证**（用户反馈 logcat 不便，改到下一批次加日志实测）。
- * 判定依据是上述测量竞态推断。留此注记，便于后续拿到实测数据后回来核对：
- * 若实测发现正常帧的 `it` 本就小于阈值，说明该推断有误，应撤掉本保护。
+ * ⚠ 该保护基于上述测量竞态推断，尚未经真机验证。校验方式：若正常帧的 `it`
+ * 本就小于阈值，说明推断有误，应撤掉本保护。
  */
 private fun slideStartOffsetGuarded(width: Int, fallbackWidth: Int): Int =
     if (width <= 0 || width * 2 < fallbackWidth) fallbackWidth else width
@@ -212,18 +243,18 @@ fun detailSharedAxisEnter(durationMillis: Int, fallbackWidth: Int): EnterTransit
  *
  * 赋值排在 `<= 0` 早退之前，保证关闭档也刷新角色（与 [detailSharedAxisExit] 同理）。
  *
- * @param blur 本页作为下层时是否叠**真实**背景模糊。默认 `false`；2026-10-24 起二级页调用点统一传 true。
+ * @param blur 本页作为下层时是否叠**真实**背景模糊。默认 `false`。
  *
- *   ## 2026-10-24：用户明确要求二级页也启用（`MainNavGraph` 已全部传 true）。
+ *   ## 二级页的调用点当前传 true，但绘制期不会真正模糊
  *   二级页的下层在转场**全程**都在做 1/6 屏视差平移，而这条链路的模糊是
  *   「每帧重录整棵下层子树（`blurLayer.record`）＋ 每帧全屏 `RenderEffect` 合成」，
  *   峰值半径 110px（`UfiDialogAnim.BlurRadius`，那是为**静止**的弹窗背景定的值）。
- *   逐帧账见 `MainNavGraph` 的 DETAIL 循环开头；结论是：**下层在动时不做实时模糊**，
+ *   逐帧开销见 `MainNavGraph` 的 DETAIL 循环开头；结论是：**下层在动时不做实时模糊**，
  *   层次交给压暗 + 视差 + 上层圆角。
  *
  *   仍然需要模糊的是 RISE 面板那条路径 —— 它的下层**静止**、被面板整块盖住，
  *   由 [riseUnderlayExit] / [riseUnderlayPopEnter] / [risePanelExit] / [risePanelPopEnter]
- *   硬编码 `recedingBlur = true`，**不经过本形参**。所以本形参现在是一个**显式的扩展开关**，
+ *   硬编码 `recedingBlur = true`，**不经过本形参**。因此本形参是一个**显式的扩展开关**，
  *   不是"忘了接线"：哪天有一台设备真的扛得住移动中的全屏模糊，从这里打开即可。
  */
 fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.detailSharedAxisExit(
@@ -276,11 +307,11 @@ fun detailSharedAxisPopExit(durationMillis: Int, fallbackWidth: Int): ExitTransi
 }
 
 
-// === 升起面板：音乐播放页专用（2026-09-20）=====================================
+// === 升起面板：音乐播放页专用 =====================================
 //
 // 为什么这一页要从共用的横向共享轴里摘出来：迷你控制条的封面到播放页封面是一条共享元素
 // （[UFI_SHARED_KEY_AUDIO_COVER]），它的行程几乎是纯竖直的"原地长大"。页面同时整屏横移，
-// 等于让同一块封面同时被两个方向拽 —— 观感就是两个动画在打架。改成"面板自迷你条上沿升起 /
+// 等于让同一块封面同时被两个方向牵引 —— 观感就是两个动画方向冲突。改成"面板自迷你条上沿升起 /
 // 落回那条线"后（起点见 [riseStartOffset]），页面位移与共享元素同向，封面看起来是被它所在的
 // 面板一起带上来的。
 //
@@ -291,7 +322,7 @@ fun detailSharedAxisPopExit(durationMillis: Int, fallbackWidth: Int): ExitTransi
 //   怎么动"落在列表页的 DETAIL 登记上，由 [riseUnderlayExit] / [riseUnderlayPopEnter]
 //   通过 [isUfiRiseRoute] 识别对端后接管。
 //
-// ★ 2026-09-20 二次修订：**升起语义只在有起点时才成立**。
+// ★ **升起语义只在有起点时才成立**。
 //   这套动画的起点是迷你控制条的上沿（[riseStartOffset]），前提是那条线此刻真的在屏上 ——
 //   也就是只有从挂着迷你条的页面（[isUfiMiniBarHostRoute]）进来才成立。从别处进播放页
 //   （Tab 页标题栏的「正在播放」挂件）时没有这个起点，面板会从屏幕外整整一屏下方飞上来；
@@ -315,10 +346,9 @@ fun detailSharedAxisPopExit(durationMillis: Int, fallbackWidth: Int): ExitTransi
  * 仍然独立成一个函数而不是直接调 `sharedAxisSpec`：两者语义不同（横向共享轴 / 竖向面板），
  * 日后单独调其中一条时不该牵连另一条。
  *
- * 曲线取 [UfiMotion.Easing.Standard]，**没有**用 `EmphasizedIn/Out`：`sharedAxisSpec` 的
- * 注释里记着 2026-09-15 那次回退 —— emphasized 系列会把七成行程压进前四分之一时间，
- * 在**整屏尺度**的位移上观感是"猛地弹到位、最后几像素再慢慢爬"。面板行程是整屏高度，
- * 与那次是同一类，没有理由再试一遍。
+ * 曲线取 [UfiMotion.Easing.Standard]，**不用** `EmphasizedIn/Out`：emphasized 系列会把
+ * 七成行程压进前四分之一时间，在**整屏尺度**的位移上表现为"猛地弹到位、最后几像素再缓慢移动"。
+ * 面板行程是整屏高度，属于同一类，因此同样不适用。
  */
 private fun <T> riseSpec(durationMillis: Int) =
     tween<T>(ufiSharedAxisDurationMs(durationMillis), easing = UfiMotion.Easing.Standard)
@@ -446,17 +476,17 @@ fun risePanelPopExit(durationMillis: Int): ExitTransition {
  * 面板升起时的**下层**：留在原位，吃 scrim + 逐渐模糊。
  *
  * 由下层自己那条 DETAIL 登记调用（对端是 RISE 时），不是播放页调用的。
- * 下层不动是有意的：上层面板正在往上长，下层再横滑就成了两层往两个方向晃 ——
- * 这正是本轮要修掉的观感；而"被面板逐渐盖住"本身已经是足够的层次反馈，
+ * 下层不动是有意的：上层面板正在往上长，下层再横滑会形成两层反向移动 ——
+ * 这正是要避免的观感；而"被面板逐渐盖住"本身已经是足够的层次反馈，
  * 深度由 [ufiSharedAxisLayer] 的 scrim **与背景模糊**表达（所以这里仍要登记 [UfiNavRecedeRole]）。
  *
- * ★ 2026-09-20：这里把 [UfiNavRecedeRole.recedingBlur] 置 true，图层侧据此才会给这一页
+ * ★ 这里把 [UfiNavRecedeRole.recedingBlur] 置 true，图层侧据此才会给这一页
  *   上模糊。判据刻意与登记入口绑在一起 —— 只有"我正在给一个升起的面板当垫底"这一种
  *   处境才会走到本函数（DETAIL 登记处的 `isUfiRiseRoute(对端)` 分支），
  *   普通详情页当垫底走的是 [detailSharedAxisExit]，那条把标志复位成 false。
  *
  * ★ `targetAlpha = 1f` 的淡出是一条**零视觉效果**的动画，唯一作用是给退场页一个明确的
- *   时长。别因为"看起来没用"把它删成 [ExitTransition.None]：AnimatedContent 只在所有
+ *   时长。不得因为"看起来没用"把它删成 [ExitTransition.None]：AnimatedContent 只在所有
  *   动画跑完后才回收退场内容，没有任何动画的那一侧会在第一帧就被回收掉 ——
  *   面板升起时底下会露出 Scaffold 的空底色而不是那张列表。
  */
@@ -491,7 +521,7 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
 }
 
 /**
- * Shared Axis 的深度图层（2026-09-13 二次修订：改用 in-place canvas clipPath）。
+ * Shared Axis 的深度图层（使用 in-place canvas clipPath）。
  *
  * - **下层**（[isReceding]）：只压暗（scrim），**不做任何变换**。
  * - **上层且正在进场**：满屏只平移，叠圆角 20dp→0（**in-place `clipPath`，不开离屏层**）；
@@ -499,17 +529,15 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
  * - **上层且正在离场**（pop 的 detail）：零变换，纯平移。
  *
  * ## ★ 为什么是 `drawWithContent { canvas.clipPath(...) }` 而不是 `graphicsLayer { clip, shape }`
- * 上一轮（2026-09-13 一次修订）把离场页的 `scale 0.96 + CompositingStrategy.Offscreen` 删掉、
- * 换成 `graphicsLayer { clip = true; shape = RoundedCornerShape }` 来给进场页做圆角。
- * 但 `graphicsLayer` 一旦带了**非矩形的 `shape`**，Compose 会走 `clipToOutline` —— 它**强制
- * 分配一张整屏离屏缓冲**（无法像矩形那样原地裁剪）。这张缓冲在被父级 `slide` 平移的过程中
- * 合成到错误偏移，于是：整页「从下方 / 右下角飘上来」（问题 1 / 问题 4，多次返回必现）；
- * 且圆角半径逐帧变化 → 离屏缓冲每帧重分配 → 连续 / 快速返回明显掉帧（问题 2）；
- * 缓冲在未铺满屏时又被遮住，于是「新页圆角完全没有」（问题 3）。
- * 改成在 `DrawScope` 里用 `canvas.clipPath(roundRectPath)` **原地裁剪**（不分配任何层），
+ * `graphicsLayer { clip = true; shape = RoundedCornerShape }` 方案的问题：`graphicsLayer` 一旦
+ * 带**非矩形 `shape`**，Compose 会走 `clipToOutline` —— 它**强制分配一张整屏离屏缓冲**
+ * （无法像矩形那样原地裁剪）。该缓冲被父级 `slide` 平移时会合成到错误偏移，于是整页
+ * 「从下方 / 右下角飘上来」；圆角半径逐帧变化 → 离屏缓冲每帧重分配 → 连续 / 快速返回
+ * 明显掉帧；缓冲在页面未铺满屏时被遮住，于是「新页圆角完全没有」。
+ * 改为在 `DrawScope` 里用 `canvas.clipPath(roundRectPath)` **原地裁剪**（不分配任何层），
  * 上述三项一并消失：裁剪随父级平移正确跟随、无缓冲开销、圆角真正裁到页面底色。
  *
- * ## ★ 圆角滞后收起（问题 3 的落点）
+ * ## ★ 圆角滞后收起
  * 圆角不再与位移同进度抹平 —— 那种写法下圆角在页面还停在屏外右侧（progress≈0）时就是峰值、
  * 一旦滑入屏内（progress 大半）已归零，于是「新页完全看不到圆角」。现改为前 75% 保持
  * [SHARED_AXIS_ENTER_CORNER_DP]、最后 25% 才抹平，保证进场全程圆角清晰可见，
@@ -518,7 +546,7 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
  * 进度挂在本目的地的 [AnimatedVisibilityScope.transition] 上，可被预测性返回 seek。
  * 只在 `drawWithContent` 里读 progress / [isReceding]，零重组。
  *
- * ★ 2026-10-14（DETAIL 转场卡顿）：**连"逐帧重画"也被压到最小**。
+ * ★ **逐帧重画也被压到最小**。
  * 两个分支读的不再是连续进度，而是两个 `derivedStateOf`（量化半径 / 量化压暗档位）：
  * 前 75% 的行程里上层半径恒为峰值 ⇒ 它一帧都不失效 ⇒ 这一页不再逐帧重录整棵子树的
  * display list（NavHost 的 slide 只平移图层，内容本来不需要重画）。逐帧账见下方
@@ -529,15 +557,15 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
  *
  * @param isReceding 本页是否是本次转场的下层（旧页）。判据见 [UfiNavRecedeRole]。
  * @param durationMillis 与位移同一时长；`<= 0` 时只留空 RenderNode 边界。
- * @param clipCorners 这**一次**转场里，要不要给**上层**叠 [SHARED_AXIS_ENTER_CORNER_DP]→0 的
+ * @param clipCorners 这**一次**转场里，是否给**上层**叠 [SHARED_AXIS_ENTER_CORNER_DP]→0 的
  *                    圆角裁剪。返回 `false` 时整段 clipPath 分支被跳过（scrim 不受影响，那是下层的事）。
  *                    圆角是"一张卡片从旁边推进来"的语言：它要让人看出上层是有边界的一块、
  *                    盖在下层之上。而升起面板（[risePanelEnter]）是从屏幕下沿贴着长上来、
  *                    左右两边始终贴屏幕边缘，给它加圆角会读成"一张圆角卡片浮在屏幕上"，
  *                    与"贴底升起的整块面板"这个语义冲突 —— 所以只有走升起语义那一次才返回 false。
  *
- *   ## 为什么是 `() -> Boolean` 而不是 Boolean（2026-09-20 二次修订）
- *   播放页**同一条路由**现在有两种转场语义：来源挂着迷你条时升起（不要圆角），从别处进来时
+ *   ## 为什么是 `() -> Boolean` 而不是 Boolean
+ *   播放页**同一条路由**有两种转场语义：来源挂着迷你条时升起（不启用圆角），从别处进来时
  *   退回横向共享轴（要圆角，否则那条路径会变成"方角整屏硬切"）。而"来源是谁"只有**转场发生
  *   的那一刻**才知道，本函数却是在**目的地登记处**调用的（一个目的地一份、组合期就定了）。
  *   做成绘制期才问的 lambda，判定就能来自 [UfiNavRecedeRole]（由登记函数按来源写入），
@@ -545,7 +573,7 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
 
  * @param blurUnderlay 本页**作为下层时**是否允许叠背景模糊（默认关，现有页面的转场一字不变）。
  *
- *   ⚠ 2026-10-14：只有**静止**的下层值得开这一项（当前唯一使用者：RISE 面板垫底）。
+ *   ⚠ 只有**静止**的下层适合开启这一项（当前唯一使用者：RISE 面板垫底）。
  *   下层**在动**的转场（DETAIL，1/6 屏视差）已经撤掉这条模糊 —— 它每帧要重录整棵下层
  *   子树再挂全屏 110px `RenderEffect`，是二级页转场卡顿的根因，逐帧账见
  *   `detailSharedAxisExit` 的 `blur` 形参说明。
@@ -553,7 +581,7 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
  *   ## 为什么它只是"允许"，真正的判定还要看 [underlayBlurActive]
  *   本形参是**登记期**的常量（每个目的地一个值），只承担与具体那一次转场无关的三道闸门：
  *   用户的「过渡模糊」开关、设备能否扛住满屏模糊（`UfiPageSwitcherDefaults.isBlurSupported`）、
- *   以及"这个目的地压根不参与"。它同时决定**要不要分配那张离屏图层** ——
+ *   以及该目的地是否参与转场。它同时决定**是否分配那张离屏图层** ——
  *   所以必须是编译期就定下来的 Boolean，不能是 lambda。
  *
  *   而"这一次转场的下层该不该模糊"是**运行期**才知道的：同一张音乐列表页既可能给升起的
@@ -566,21 +594,21 @@ fun AnimatedContentTransitionScope<androidx.navigation.NavBackStackEntry>.riseUn
  *   改成录一层 [rememberGraphicsLayer] 再给它设 `renderEffect`：半径只在**绘制期**变，
  *   零重组（与本文件"只在 drawWithContent 里读 progress"的既有约定一致）。
  *
- *   ## 与 2026-09-13 那次"禁止离屏合成"的关系（这条别误读成推翻）
- *   当时删掉的是 `CompositingStrategy.Offscreen` + `graphicsLayer{非矩形 shape}`：
- *   前者给**每一次**二级页转场的下层都开整屏纹理，后者因为圆角半径逐帧变化导致
+ *   ## 与"禁止离屏合成"约定的关系
+ *   该约定针对 `CompositingStrategy.Offscreen` + `graphicsLayer{非矩形 shape}`：
+ *   前者给**每一次**二级页转场的下层都开整屏纹理，后者因圆角半径逐帧变化导致
  *   **缓冲逐帧重分配**，且被父级 slide 平移时合成到错误偏移。这里三条都不成立：
  *   (a) 只有升起面板这一种转场、且要额外通过用户开关与机型闸门；
  *   (b) 图层尺寸全程不变，只换 `renderEffect`，不重分配；
  *   (c) `record` 是在当前 DrawScope 的坐标里录制、`drawLayer` 原地画回，
  *       与 `UfiPageSwitcherHost` 那张快照层同一套用法，不存在偏移问题。
- *   模糊在本质上必须有一张离屏缓冲 —— 这是"下层像弹窗背景那样糊掉"的最小代价，
- *   所以代价被限制在一种转场里，而不是放回到所有转场上。
+ *   模糊在本质上必须有一张离屏缓冲 —— 这是"下层像弹窗背景那样模糊"的最小代价，
+ *   因此代价被限制在一种转场里，而不放回到所有转场。
  * @param underlayBlurActive 这**一次**转场的下层该不该模糊，只在 [blurUnderlay] 为真时被问。
  *   判据的唯一来源是 [UfiNavRecedeRole.recedingBlur]（由登记函数按方向写入），
  *   与 [isReceding] 一样做成 lambda 是为了**在绘制期**读、不建立快照依赖 ⇒ 零重组。
- *   默认 `{ true }`：只翻 [blurUnderlay] 的调用方会立刻看到效果，
- *   而不是掉进"开关开了却什么都没发生"的坑。
+ *   默认 `{ true }`：只切换 [blurUnderlay] 的调用方会立刻看到效果，
+ *   避免出现"开关打开却没有任何变化"的状态。
  */
 @OptIn(ExperimentalAnimationApi::class)
 @Composable
@@ -591,7 +619,7 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
     blurUnderlay: Boolean = false,
     underlayBlurActive: () -> Boolean = { true },
     /**
-     * 下层是否压暗（2026-10-14 新增，用户可在「外观 → 切换动画」里关掉）。
+     * 下层是否压暗（可在「外观 → 切换动画」里关闭）。
      *
      * 关掉后两层之间只靠位移与圆角表达层次，没有那层 scrim —— 观感更"平"，
      * 但也少一次整屏 `drawRect`。默认 true = 改动前的行为。
@@ -612,17 +640,17 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
     // 同一个调用点的取值不会在重组之间翻转（用户改开关会让整个 MainNavGraph 重建这条链）。
     val blurLayer = if (blurUnderlay) rememberGraphicsLayer() else null
 
-    // 2026-10-14：圆角裁剪路径**跨帧复用**。
-    // 原实现是每帧 `Path().apply { addRoundRect(...) }`，而这一支在转场尾段（p 0.75→1，约 6~10 帧）
-    // 每帧都跑 —— 每个二级页转场白分配 6~10 个 Path（外加同样数量的 RoundRect）。
+    // 圆角裁剪路径**跨帧复用**。
+    // 每帧 `Path().apply { addRoundRect(...) }` 会在转场尾段（p 0.75→1，约 6~10 帧）
+    // 每帧分配一个 Path（外加同样数量的 RoundRect）。
     // Path 只在本次 draw 内被 `clipPath` 消费，跨帧 reset 复用是安全的：
-    // 绘制发生在主线程、同一图层内不会有并发访问。观感零变化。
+    // 绘制发生在主线程、同一图层内无并发访问。观感不变。
     val cornerPath = remember { Path() }
 
-    // ★★ 2026-10-14（DETAIL 转场卡顿 · 每帧重录整页 display list）★★
+    // ★★ 避免每帧重录整页 display list ★★
     //
-    // ## 原来的账
-    // 本 block 旧写法在**顶部**无条件 `val p = progress.value`，于是整段转场里**每帧**失效一次。
+    // ## 逐帧开局面的成因
+    // 若在 block 顶部无条件 `val p = progress.value`，整段转场里本节点**每帧**失效一次。
     // 而 NavHost 给每个正在转场的目的地都套了 `placeWithLayer`（compose-animation 1.10.4
     // `EnterExitTransitionModifierNode.measure` → `placeable.placeWithLayer(offset, layerBlock)`），
     // 位移只是那个图层的一个平移矩阵 —— **内容不需要重录**。
@@ -639,11 +667,11 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
     // 尾段半径每帧掉约 7dp，量化值逐帧变，照常逐帧重画（那 7~8 帧本来就每帧都在变）。
     //
     // ## 观感差异
-    // 前 75%：半径与改动前**逐位相同**（都是 46dp），零差异。
+    // 前 75%：半径恒定（46dp），无差异。
     // 尾段（以及手势返回慢速 seek 时）：量化步长取 **0.5dp**，与连续值的差 ≤ 0.25dp
     // （3x 屏上不到 1px）；而慢速拖动时半径本来就在每帧缩小，台阶间距远小于可辨阈值。
-    // 之所以不用整 dp：预测性返回可以被手指慢慢拖，半径会跟着进度逐帧变，0.5dp 的台阶
-    // 更保险。量化步长只影响"要不要重画"，不影响其它任何像素。
+    // 不用整 dp 量化：预测性返回可被手指缓慢拖动，半径随进度逐帧变化，0.5dp 的台阶更稳妥。
+    // 量化步长只影响"是否重画"，不影响其它任何像素。
     val cornerRadiusDp: State<Float> = remember(progress) {
         derivedStateOf {
             // ×2 → round → ÷2：即量化到 0.5dp。
@@ -651,11 +679,11 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
         }
     }
 
-    // 下层压暗的连续 alpha（2026-10-24）。
+    // 下层压暗的连续 alpha。
     //
-    // 原实现量化到 32 档（每档 1.6%），本意是减少下层重录；实测深色主题 + 慢速返回手势下
-    // 台阶看得出来，观感就是"压暗频闪"。改为连续值：下层本来每帧都要重录（模糊/视差），
-    // 量化并没有省下合成，只省了一次 drawRect 的失效判定，不值得用可见台阶去换。
+    // 量化到 32 档（每档 1.6%）在深色主题 + 慢速返回手势下台阶可见，表现为压暗频闪。
+    // 下层本来每帧都要重录（模糊/视差），量化并未省下合成，只省一次 drawRect 的失效判定，
+    // 不值得以可见台阶为代价。
     val scrimAlphaState: State<Float> = remember(progress) {
         derivedStateOf {
             if (!scrimEnabled) 0f
@@ -671,15 +699,15 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
             // 下层：内容（可能带模糊）+ 压暗 scrim，零变换、零裁剪。
             //
             // ★ 层次顺序是有意的：模糊只包住 `drawContent()`，scrim 画在**模糊之后**。
-            //   反过来（先画 scrim 再一起模糊）会把那层压暗也糊开，观感是"脏了一层"
-            //   而不是"背景糊了"，而且 scrim 的边界会随半径溢出到屏幕外。
+            //   反过来（先画 scrim 再一起模糊）会把压暗层一并模糊，观感是整层发灰
+            //   而不是"背景模糊"，且 scrim 的边界会随半径溢出到屏幕外。
             //
-            // ★ 2026-10-14：进度**只在真的要做模糊时**才逐帧读（只有"给升起面板垫底"那一种），
+            // ★ 进度**只在真的要做模糊时**才逐帧读（只有"给升起面板垫底"那一种），
             //   普通二级页转场的下层改读量化档位 `scrimStep`（见其说明）。
             //   压暗与模糊仍然出自同一条进度（不另开 animateFloat），只是压暗不再需要
             //   逐帧精度 —— 32 档台阶（峰值处 1.6% alpha）在整屏遮罩上不可见。
             val effect = if (blurLayer != null && underlayBlurActive()) {
-                underlayBlurEffect(underlayBlurStep(1f - progress.value.coerceIn(0f, 1f)))
+                underlayBlurEffect(underlayBlurStep(sharedAxisBlurFraction(1f - progress.value.coerceIn(0f, 1f))))
             } else {
                 null
             }
@@ -705,8 +733,8 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
         // graphicsLayer{RoundedCornerShape} 在整屏强开离屏层导致的首帧偏移/从下方飞上来
         // 与逐帧缓冲重分配。
         //
-        // 2026-09-15：去掉原来的 `enteringUpper` 闸门 —— 它只让 **push 进场**的新页有圆角，
-        // 返回时正在右滑出去的 detail 是方角，用户反馈"缺少圆角"就是这一半。
+        // 不使用 `enteringUpper` 闸门 —— 它只让 **push 进场**的新页有圆角，
+        // 返回时正在右滑出去的 detail 是方角。
         // `p` 在两个方向上的语义都是"落位程度"（1 = 严丝合缝铺满、0 = 完全离屏），
         // 所以同一条公式对进场与离场都成立：只要没落位就有圆角。
         // 峰值保持到 75%（原 60%）再抹平，圆角在整段位移里都看得见。
@@ -716,7 +744,7 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
         // 那一次（来源没有迷你条）必须照常带圆角** —— 所以这里是绘制期问一次，不是登记期常量。
         // 理由详见形参注释。
         //
-        // ★ 2026-10-14：判据从"每帧算一次连续半径"改成"读量化半径"（[cornerRadiusDp]）。
+        // ★ 判据从"每帧计算连续半径"改为"读取量化半径"（[cornerRadiusDp]）。
         //   短路顺序有意：先问 clipCorners()（普通 var、零订阅），它为 false 时**连半径都不读**
         //   ⇒ 升起面板那一页整段转场一次都不失效。半径归零时（静止 / 尾段已抹平）同样不订阅。
         val radiusDp: Float = if (clipCorners()) cornerRadiusDp.value else 0f
@@ -724,12 +752,11 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
             val r = radiusDp * density
             // 复用同一只 Path（见 [cornerPath] 的说明）：reset 后重填，不新建对象。
             //
-            // 2026-10-14（DETAIL 转场卡顿 · 复查结论）：这里仍会每帧构造一次 `RoundRect`
-            // （内部一个 10 个 float 的数组），而这一支现在只在**半径还在变**的那几帧重跑
-            // （量化后约 7~8 帧），即每个二级页转场最多 8 个短命对象 —— 量级是
-            // 「几十字节 / 帧」，与本节其它项（每帧重录整页、全屏模糊、每帧重组整页）
-            // 差着几个数量级，**不值得为它换实现**。特意记在这里，避免下一个人把它当成
-            // "漏掉的优化"再翻一遍：Compose 1.10.4 的 `Path` 只有
+            // 这里仍会每帧构造一次 `RoundRect`（内部一个 10 个 float 的数组），而这一支
+            // 只在**半径还在变化**的那几帧重跑（量化后约 7~8 帧），即每个二级页转场最多
+            // 8 个短命对象 —— 量级是「几十字节 / 帧」，与本节其它项（每帧重录整页、全屏模糊、
+            // 每帧重组整页）差几个数量级，不值得为它更换实现。记录在此以免被误判为遗漏的优化：
+            // Compose 1.10.4 的 `Path` 只有
             // `addRoundRect(RoundRect, Direction)` 一个重载，没有 float 版；绕到
             // `nativeCanvas` 反而要引入一次跨层强转（测试 / 非 Android 画布下会抛
             // ClassCastException），收益与风险不成比例。
@@ -739,10 +766,9 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
             drawContext.canvas.clipPath(cornerPath, ClipOp.Intersect)
             drawContent()
             drawContext.canvas.restore()
-            // 圆角外那四小块**什么都不画**（2026-09-15 按用户要求）：
-            // 曾经在这里用 ClipOp.Difference 填过一层深色底做边界，但那层黑角在整屏尺度上
-            // 比圆角本身更抢眼。现在露出的就是下层页面（它正带着 scrim 和反向视差在动），
-            // 圆角的可见性由"两页错位"提供。
+            // 圆角外那四小块**不绘制任何内容**：
+            // 用 ClipOp.Difference 填一层深色底做边界时，那层黑角在整屏尺度上比圆角本身更显眼。
+            // 露出下层页面（它正带着 scrim 和反向视差在动），圆角的可见性由"两页错位"提供。
         } else {
             drawContent()
         }
@@ -752,71 +778,59 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
 
 // === Page transition — 统一 detail 风格 ===
 //
-// 2026-09-04（二级页返回观感 + 可预测性返回）三条约定，改这里前先读完：
+// 二级页转场的三条约定，修改前必须完整阅读：
 //
-// 1. **只平移，不改 alpha**。2026-08-30 已经踩过：任何一侧用 fade，手势返回过程中都会
-//    透出下层 / 背景变淡（detail 页 fadeOut 让自己变透，宿主 fadeIn 让底层由淡变实）。
-//    所以下面全部是位移，禁止再加 fadeOut/fadeIn 到 pop 方向。
-// 2. **下层要有反向视差**。原来 pop 方向下层是 `EnterTransition.None`（完全静止），
-//    只有上层在平移 —— 单层平移没有层次感，落地那一刻下层"凭空出现"，就是"不够优雅"
-//    和"卡一下"的观感来源。现在下层从 -1/[SHARED_AXIS_X_PARALLAX] 屏滑回 0，
-//    与上层同一 easing、同一时长：两层同时动、速度不同，才是标准的返回视差。
-//    这同时让**可预测性手势返回**的预览是对的：手势 seek 时下层跟着手指走。
+// 1. **只平移，不改 alpha**。任何一侧使用 fade，手势返回过程中都会透出下层 / 背景变淡
+//    （detail 页 fadeOut 让自己变透，宿主 fadeIn 让底层由淡变实）。
+//    因此下面全部是位移，禁止在 pop 方向添加 fadeOut/fadeIn。
+// 2. **下层要有反向视差**。下层若为 `EnterTransition.None`（完全静止），
+//    只有上层在平移 —— 单层平移没有层次感，落地那一刻下层如同凭空出现。
+//    下层从 -1/[SHARED_AXIS_X_PARALLAX] 屏滑回 0，与上层同一 easing、同一时长：
+//    两层同时动、速度不同，才是标准的返回视差。
+//    这同时保证**可预测性手势返回**的预览正确：手势 seek 时下层跟着手指走。
 // 3. **时长跟随用户设置**，唯一来源见 [ufiNavTransitionDurationMs]。
-//    ⚠ 2026-09-04（卡片浮起）此条**已修正**：原文写的是"时长用页面转场锚点
-//    UfiMotion.Duration.Sweeping（320ms）"，也就是写死在本文件里的一个常量。
-//    可 Tab 切页早就在用 `ThemeManager.transitionDurationMs`（默认 380，区间 150..600，
-//    0=关闭）—— 于是"用户把转场时长拖到 600"只对 Tab 生效、二级页仍然 320，
-//    这正是本文件第 3 条自己想避免的"三个数各行其是"。现在两条链路共用同一个用户设置。
+//    时长不得写死为本文件常量：Tab 切页与二级页必须共用 `ThemeManager.transitionDurationMs`
+//    （默认 380，区间 150..600，0=关闭），否则"把转场时长拖到 600"只对 Tab 生效。
 //
-// === 2026-09-04：二级页转场的深度层次 —— 「离场页后退」模型 ===
+// === 二级页转场的深度层次 —— 「离场页后退」模型 ===
 //
-// 本轮（同日二次修订）把上午的「卡片浮起」推翻，改成 Material 共享轴 + 深度 /
-// Android 预测性返回的标准做法。两条铁律：
+// 采用 Material 共享轴 + 深度 / Android 预测性返回的标准做法。两条铁律：
 //
 // ★ 铁律 A：**进场页永远满屏铺满** —— 只平移，不缩放、不圆角、不投影。
-//   原始理由（2026-09-04 上午）是这个 App 的 chrome **不在动画容器里**：`MainNavGraph`
-//   把 `Scaffold` 的 `innerPadding`（= safeDrawing，含状态栏 / 导航栏）加在**包着
-//   NavHost 的那个 Box** 上，于是状态栏色带与底部色带由 `Scaffold` 的 `containerColor`
-//   静态绘制，进场页一旦 `scale < 1` 就会露出这些**静止**的 chrome，圆角与投影还会把
-//   这条缝描得更清楚 —— 也就是用户说的「顶部标题上方一块不动、屏幕下方一块不动、割裂」。
-//
-//   ⚠ 2026-09-04（转场区满屏化）**这条理由已经不再成立**：`Scaffold` 的
+//   历史成因是 `Scaffold` 的 `innerPadding`（= safeDrawing，含状态栏 / 导航栏）加在
+//   **包着 NavHost 的那个 Box** 上，状态栏与底部色带由 `Scaffold` 的 `containerColor`
+//   静态绘制，`scale < 1` 会露出这些**静止**的 chrome。该成因已不成立：
 //   `contentWindowInsets` 已清零，安全区改由页面侧的 `UfiScreenScaffold` 消费，
-//   转场容器就是整块屏幕，状态栏 / 底部两条带子现在**随页面一起平移**。
+//   转场容器即整块屏幕，两条带子**随页面一起平移**。
 //
-//   但铁律 A **依然保留**，理由换成两条：
+//   铁律 A 依然保留，理由为：
 //   1. 底部悬浮胶囊 `UfiCapsuleTabBar` 活在**独立的 `Dialog` 窗口**里，永远不在这棵
 //      Compose 树上、永远不会跟着缩 —— 进场页缩放依旧会在胶囊四周露出错位；
 //   2. 「进场页不做任何变换」是 [ufiSharedAxisLayer] 零开销的前提（非 `isReceding()` 分支
-//      **不读** progress，整段转场里这一层一次都不会被动画失效）。破掉它等于把
-//      整屏缩放 + 离屏裁剪重新请回来 —— 那正是上一版卡顿的来源。
+//      **不读** progress，整段转场里这一层一次都不会被动画失效）。破坏它等于重新引入
+//      整屏缩放 + 离屏裁剪，而那是卡顿的来源。
 
 //
 // ★ 铁律 B：**深度感由下层承担** —— 离场页（退到后面那页）只叠 scrim（峰值 30%，
 //   [UfiMotion.NavRecede.ScrimAlpha]），**不再缩放**。它在下层、被进场页逐步覆盖，
 //   压暗表达「退到后面去」的层次；代价只有一次 `drawRect`，零额外 transform。
 //
-//   ⚠ 2026-09-13 修订：原 `scale 1 → 0.96` + `CompositingStrategy.Offscreen` 已删除。
+//   ⚠ 不使用 `scale 1 → 0.96` + `CompositingStrategy.Offscreen`：
 //   缩放 + 离屏合成在「系统预测性返回」逐帧 seek 时会把整块全屏纹理反复重渲染
-//   → 慢速拖动掉帧（问题 3）；且与圆角 clip 叠加在首帧会渲染到错误偏移
-//   → 新页「从右下角飞上来」（问题 4）。去掉缩放后两者一并消失，深度改由更深的 scrim 承担。
+//   → 慢速拖动掉帧；且与圆角 clip 叠加在首帧会渲染到错误偏移 → 新页从右下角飞上来。
+//   深度改由更深的 scrim 承担。
 //
-// ★ 顺带修掉卡顿：删掉的正是最贵的两项 —— 整屏 `shadowElevation`（大面积
-//   RenderNode 投影，每帧重算）与 `clip = true`（离屏裁剪）。scrim 一直画在
-//   同一条 modifier 链的 `drawWithContent` 里，不额外起 layout 节点。
+// ★ 性能约束：不使用最贵的两项 —— 整屏 `shadowElevation`（大面积
+//   RenderNode 投影，每帧重算）与 `clip = true`（离屏裁剪）。scrim 画在
+//   同一条 modifier 链的 `drawWithContent` 里，不额外创建 layout 节点。
 //
-//   ⚠ 2026-09-13（预测性返回掉帧 / 首帧飞角）最终修订：**不再使用任何离屏合成**。
-//   此前（2026-09-04）为省掉子树几十张卡片的逐帧阴影重光栅化，转场中临时开了
-//   `CompositingStrategy.Offscreen` 把子树录进纹理再缩放 —— 但它在预测性返回逐帧
-//   seek 时把整块全屏纹理反复重渲染（问题 3 掉帧），且与圆角 clip 叠加在首帧
-//   渲染到错误偏移（问题 4 新页从右下角飞上来）。现改为：下层不缩放、不开 Offscreen，
+//   ⚠ **不使用任何离屏合成**。下层不缩放、不开 Offscreen，
 //   深度只由 scrim 表达；上层进场圆角用**纯 canvas clip**（`compositingStrategy` 保持
-//   默认 `Auto`），既不再有纹理开销、也不再有首帧偏移。静止 / 非进场时一律退回
-//   矩形、不裁剪，零常驻缓冲。
+//   默认 `Auto`），无纹理开销、无首帧偏移。静止 / 非进场时一律退回矩形、不裁剪，
+//   零常驻缓冲。
 
 //
-// ★ 单一进度/时长来源（这条约束从上午起未变，别再破）：
+// ★ 单一进度/时长来源（不得破坏）：
 //   - 时长：[ufiNavTransitionDurationMs]（把 ThemeManager 的用户值 + 系统降低动效
 //     合并成**一个数**，`0` 即"不播"）；
 //   - 曲线 + spec 实例：同一条 `sharedAxisSpec`（平移 / 后退进度全部引用它）；
@@ -842,7 +856,7 @@ fun AnimatedVisibilityScope.ufiSharedAxisLayer(
  *
  * 为什么把哨兵单独兜住：`ThemeManager` 的进程级共享 flow 在从 prefs 播种前是
  * `TRANSITION_DURATION_UNSEEDED = -1`。若照 `coerceAtLeast(1)` 处理会得到 1ms（瞬变），
- * 若照 `<= 0 → 关闭` 处理又会把"还没读盘"误判成"用户关了转场"（P2f 修过同款 bug）。
+ * 若照 `<= 0 → 关闭` 处理又会把"尚未读盘"误判成"用户关闭了转场"。
  * 这里显式回落到默认档 [ThemeManager.TRANSITION_DURATION_DEFAULT_MS]。
  *
  * @param rawMs              `ThemeManager.transitionDurationMs` 的原始值（可能是 -1 / 0 / 越界值）。
@@ -863,10 +877,10 @@ fun ufiNavTransitionDurationMs(rawMs: Int, systemReduceMotion: Boolean): Int = w
 /**
  * 本次转场里**哪一页扮演「下层」**（= 退到后面去、要吃 scale + scrim 的那一页）。
  *
- * ## ★ 为什么不能用 `NavController.visibleEntries` 的栈顶（2026-09-05 P0 根因）
- * 旧实现（`MainNavGraph` 里的 `isFrontEntry`）判据是
- * `visibleEntries.value.lastOrNull()?.id == entry.id`，注释断言「pop 时被关掉的那页仍在栈顶」。
- * **这条断言是错的。** navigation-runtime 2.8.0 `NavController.kt:1192 populateVisibleEntries()`
+ * ## ★ 为什么不能用 `NavController.visibleEntries` 的栈顶
+ * 该判据 `visibleEntries.value.lastOrNull()?.id == entry.id` 假设「pop 时被关掉的那页
+ * 仍在栈顶」。**该假设不成立。** navigation-runtime 2.8.0
+ * `NavController.kt:1192 populateVisibleEntries()`
  * 的排序规则是：**先**收 `transitionsInProgress` 里 `maxLifecycle < STARTED` 的 entry
  * （含**已经出栈、正在跑退场动画**的那页），**再**收 `backQueue` 里 `>= STARTED` 的。
  * 库自己的 KDoc（`NavController.kt:134-151`）写得很清楚：
@@ -875,10 +889,9 @@ fun ufiNavTransitionDurationMs(rawMs: Int, systemReduceMotion: Boolean): Int = w
  * - push：`[host(CREATED), detail(STARTED)]` → `.last()` = detail = **进场页**（恰好也是前景页，蒙对）；
  * - pop： `[detail(CREATED, 已出栈), host(STARTED)]` → `.last()` = **host** = 进场页，但它是**下层**。
  *
- * 也就是说 `.last()` 的语义从来是「**进场页**」而不是「前景页」，两者只在 push 方向重合。
- * pop 期间旧判据把角色整个判反：正在整屏右滑出去的 detail 拿到 `scale 1→0.96` + scrim（错），
- * 宿主则完全不做变换、复位动画根本没播（错）。用户报的「退出偏快、卡顿跳帧、下层表现不对、
- * 收尾没滑完就消失」四条症状全部指向这里。
+ * 也就是说 `.last()` 的语义是「**进场页**」而不是「前景页」，两者只在 push 方向重合。
+ * pop 期间该判据会把角色判反：正在整屏右滑出去的 detail 拿到 `scale 1→0.96` + scrim，
+ * 宿主则完全不做变换、复位动画未播放。
  * 交叉验证：`NavHost.kt:540-551` 自己就是拿 `visibleEntries.lastOrNull()` 当
  * `AnimatedContent` 的 targetState —— pop 转场能启动，本身就反证 `.last()` 已经变成 host。
  *
@@ -919,7 +932,7 @@ class UfiNavRecedeRole {
     var recedingEntryId: String? = null
 
     /**
-     * 本次转场的下层要不要**背景模糊**（2026-09-20）。
+     * 本次转场的下层是否要**背景模糊**。
      *
      * 为什么这条判定必须活在角色对象里、而不是图层的形参里：图层是在**目的地登记处**
      * 构造的（一个目的地一份），而"下层是在给升起面板垫底、还是在给普通详情页垫底"
@@ -939,7 +952,7 @@ class UfiNavRecedeRole {
     var recedingBlur: Boolean = false
 
     /**
-     * 本次转场里，**播放页作为上层**时走的是不是「升起语义」（2026-09-20 二次修订）。
+     * 本次转场里，**播放页作为上层**时走的是否是「升起语义」。
      *
      * 只有一个消费者：[ufiSharedAxisLayer] 的 `clipCorners` —— 升起语义要方角（贴底长出来的
      * 一整块），退化成横向共享轴时要照常带圆角（从旁边推进来的卡片）。
@@ -979,17 +992,24 @@ class UfiNavRecedeRole {
  * 用 `currentState != targetState` 而非时间判据：可预测性手势返回是被手势进度 seek 的，
  * 没有固定时长，只有「状态尚未落定」这一个可靠信号。
  *
- * ⚠ 2026-09-05：本函数曾经还向下 provide 一个 `LocalUfiNavTransitionActive`，供
- * `PagerBackend` 在转场期间把 `beyondViewportPageCount` 降到 0（pop 首帧只组合当前 Tab 页）。
- * 那条链路已整体回退 —— 转场途中改 Pager 入参会触发 LazyLayout 重测量，撞上正在跑的
- * `animateScrollToPage` 会让页面停在两页之间，而胶囊已经落到目标下标，于是出现
- * 「胶囊显示 a、实际是 b」。理由详见 `UfiPageSwitcherHost` 里 `baseBeyond` 的注释。
- * 本函数现在只做帧闸门这一件事，不再有 CompositionLocal 副作用。
+ * ⚠ 本函数**不得**再向下 provide `LocalUfiNavTransitionActive` 之类的 CompositionLocal：
+ * 那类设计用于在转场期间把 `beyondViewportPageCount` 降到 0，但转场途中修改 Pager 入参
+ * 会触发 LazyLayout 重测量，与正在运行的 `animateScrollToPage` 竞争，使页面停在两页之间，
+ * 而胶囊已落到目标下标，表现为「胶囊显示 a、实际是 b」。理由详见 `UfiPageSwitcherHost`
+ * 里 `baseBeyond` 的注释。本函数只负责帧闸门。
  */
 @OptIn(ExperimentalAnimationApi::class)
 @Composable
-fun AnimatedVisibilityScope.UfiNavFrameGate(content: @Composable () -> Unit) {
-    // ★★ 2026-10-14（DETAIL 转场卡顿 · 动画状态读进组合作用域）★★
+fun AnimatedVisibilityScope.UfiNavFrameGate(
+    /**
+     * 本目的地的路由，只用于 `[NavAnim]` 诊断日志。
+     *
+     * 没有它，日志只能告诉你"有一次转场掉了 X ms"，无法回答"是哪一页"——
+     * 而在 120Hz 设备上逐页对比启动延迟，正是下一步定位首帧组合成本的前提。
+     */    route: String,
+    content: @Composable () -> Unit,
+) {
+    // ★★ 动画状态不得读进组合作用域 ★★
     //
     // 旧写法是 `if (transition.currentState != transition.targetState) { DisposableEffect(Unit) {…} }`。
     // 那是**组合期**读 Transition 的两个 State：每次转场开始 / 结束各翻转一次，
@@ -1004,20 +1024,89 @@ fun AnimatedVisibilityScope.UfiNavFrameGate(content: @Composable () -> Unit) {
     //   3. 组合销毁 / 协程取消 ⇒ `finally` 补一次 end（旧：onDispose）；
     //   4. 连续翻转不会 begin/begin 或 end/end（`held` 守住，旧：DisposableEffect 的 key 语义）。
     //
-    // 与 `UfiPageSwitcherHost` 里那条长驻协程是同一手法、同一理由（那里记着更长的病史）。
+    // 与 `UfiPageSwitcherHost` 里那条长驻协程是同一手法、同一理由（那里有更详细的说明）。
     val navTransition = transition
+
+    // ── 帧时间 trace（与 Tab 切页那条同款、同格式） ──
+    //
+    // 二级页的"卡"目前只有手感，没有数字。这里把每次转场的总帧数、最差帧与
+    // **启动延迟**写进日志（开「详细日志」后可在 App 内「工具 → 日志（App 侧）」看到
+    // `[NavAnim]` 行）。
+    //
+    // ## 三个字段怎么读
+    // - `hz=`：本次转场时这块屏幕的刷新率。**没有它，`最差帧` 无法解读** ——
+    //   60Hz 下 16.7ms 是"满帧"，120Hz 下同一数字却是"掉了 1 帧"。
+    //   缺少刷新率时两次采样不可比（一次 120Hz、一次 60Hz 会得到相反结论）。
+    // - `最差帧`：转场**开始之后**的最大 vsync 间隔。≈ 1000/hz ⇒ 一帧没掉；
+    //   ≈ 2×1000/hz ⇒ 掉了 1 帧。
+    // - `最差帧@n`：`n` 是它落在第几帧。`@1` = 新页首帧（组合 + 首绘），
+    //   末帧附近 = 落位那一帧（收尾 / 闸门放行）。定责全靠这个位置。
+    // - `启动`：导航发起（push 与 pop 都算）→ 转场第一帧的耗时。这段时间在 `最差帧` 里
+    //   完全看不到，却正是"点了 / 按了返回以后愣一下才开始动"的来源。
+    //
+    // ⚠ `启动` 的时刻由 `ufiNavStartedAtFor(route)` 给：导航发起（**push 与 pop 都算**，
+    //   由目的地变化回调打点）→ 转场第一帧。它同时校验「目的地一致」与「1s 内」——
+    //   否则会拿一次陈旧的导航相减（只比时间戳时曾出现 2319ms 的噪声）。
+    val viewForHz = androidx.compose.ui.platform.LocalView.current
+    val refreshHz = remember(viewForHz) {
+        runCatching { viewForHz.display?.refreshRate ?: 60f }.getOrDefault(60f)
+    }
+    LaunchedEffect(navTransition) {
+        val startedAtMs = ufiNavStartedAtFor(route)
+        var lastNanos = 0L
+        var worstMs = 0.0
+        var worstAt = 0
+        var frames = 0
+        var startupMs = -1L
+        while (navTransition.currentState != navTransition.targetState) {
+            androidx.compose.runtime.withFrameNanos { now: Long ->
+                if (frames == 0 && startedAtMs > 0L) {
+                    startupMs = SystemClock.uptimeMillis() - startedAtMs
+                }
+                if (lastNanos != 0L) {
+                    val dt = (now - lastNanos) / 1_000_000.0
+                    if (dt > worstMs) {
+                        worstMs = dt
+                        // 掉在第几帧：1 = 转场的第一帧（= 新页首帧组合 + 首绘），
+                        // 末帧附近 = 落位那一帧（收尾 / 闸门放行）。定责全靠这个数。
+                        worstAt = frames
+                    }
+                }
+                lastNanos = now
+                frames++
+            }
+        }
+        if (frames > 2) {
+            DebugLog.i("NavAnim") {
+                val startup = if (startupMs in 0L..3_000L) " 启动=${startupMs}ms" else ""
+                "二级页转场 route=$route hz=${"%.0f".format(refreshHz)} " +
+                    "frames=$frames 最差帧=${"%.1f".format(worstMs)}ms@$worstAt$startup"
+            }
+        }
+    }
+
     LaunchedEffect(navTransition) {
         var held = false
         try {
             snapshotFlow { navTransition.currentState != navTransition.targetState }
                 .distinctUntilChanged()
-                .collect { running ->
+                // ★ 转场结束后**不得立刻**放开闸门。
+                //
+                // 闸门举起期间，数据层把 WS 推送攒着；放开的那一刻会把攒了一路的更新
+                // **一次性刷进来**（整屏重组）。在 `currentState == targetState` 的
+                // 同一帧放行正是转场的最后一帧：新页刚落位，几十条状态一起写进来，
+                // 观感就是"动画结束的一瞬间顿一下"。它不是掉帧预算不够，是**时机**不对。
+                //
+                // 加一个尾巴把它推到静止之后（与 UfiPageSwitcherHost 里那条同款、同值）。
+                // `collectLatest` 保证尾巴期间又开新转场时，这次放行被取消、闸门保持举起。
+                .collectLatest { running ->
                     if (running) {
                         if (!held) {
                             UiFrameGate.begin()
                             held = true
                         }
                     } else if (held) {
+                        delay(FRAME_GATE_TAIL_MS)
                         UiFrameGate.end()
                         held = false
                     }

@@ -62,6 +62,16 @@ data class DebugLogFileItem(
 data class DebugLogFilesResponse(
     val files: List<DebugLogFileItem> = emptyList(),
     val total_bytes: Long = 0,
+    /** 今天的写入量（只算今天那个日期目录）。 */
+    val today_bytes: Long = 0,
+    /** 落盘日志跨了多少天（日期目录个数）；**不参与清理**，只用于展示。 */
+    val days: Int = 0,
+    /** 最早一天的目录名（`yyyy-MM-dd`），空串 = 还没有日志。 */
+    val oldest_day: String = "",
+    /** 日志卷剩余可用字节；-1 = 读不到。 */
+    val disk_free_bytes: Long = -1,
+    /** 可用空间不足，core 已暂停写文件（内存日志仍在）。 */
+    val degraded: Boolean = false,
     /** core 侧日志目录绝对路径，UI 上直接显示，用户可拿文件管理器去同一路径查看。 */
     val dir: String = ""
 )

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 8 根光芒：四正向长、四斜向短，旋转时能看出错落。 -->
+    <path
+        android:fillColor="@android:color/transparent"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M18.6 12L21.4 12M12 5.4L12 2.6M5.4 12L2.6 12M12 18.6L12 21.4M16.67 7.33L17.73 6.27M7.33 7.33L6.27 6.27M7.33 16.67L6.27 17.73M16.67 16.67L17.73 17.73" />
+</vector>

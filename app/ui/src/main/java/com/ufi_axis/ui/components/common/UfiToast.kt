@@ -29,6 +29,7 @@ enum class ToastType { SUCCESS, ERROR, INFO, WARNING }
 internal fun ResolvedPalette.toUfiToastColors(): UfiToastColors = UfiToastColors(
     cardBg = cardBg.toArgbInt(),
     textPrimary = textPrimary.toArgbInt(),
+    textSecondary = textSecondary.toArgbInt(),
     accent = accent.toArgbInt(),
     success = success.toArgbInt(),
     error = error.toArgbInt(),

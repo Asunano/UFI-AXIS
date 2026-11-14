@@ -148,7 +148,7 @@ fun WeatherSettingsScreen(viewModel: MainViewModel, navController: NavHostContro
 }
 
 /**
- * 摘要卡内容：大字温度 + 手绘图标 + 一排次要读数 chip + 刷新。
+ * 摘要卡内容：大字温度 + Tabler 天气图标 + 一排次要读数 chip + 刷新。
  *
  * ## 为什么把读数放最上、还做成这个形态
  * 原来是「当前读数」卡里 8 行 `label —— value`，排在两张设置卡下面。两个问题：
@@ -156,7 +156,7 @@ fun WeatherSettingsScreen(viewModel: MainViewModel, navController: NavHostContro
  * 现在主读数（温度 / 天气 / 城市）用大小字号分层一眼可读，其余压成一行 chip，
  * 整卡高度不到原来一半。
  *
- * 图标直接复用标题栏那套手绘 [WeatherGlyph]（同一个 `weather_code` → 同一张图），
+ * 图标直接复用标题栏那套 Tabler [WeatherGlyph]（同一个 `weather_code` → 同一张图），
  * 这一页就是它的"预览"，两处不一致才是 bug。尺寸给 44dp 而不是标题栏的
  * [WEATHER_GLYPH_SIZE]：这里是主视觉，与 28sp 的温度同排。
  *

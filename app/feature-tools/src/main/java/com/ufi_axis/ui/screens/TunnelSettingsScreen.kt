@@ -24,6 +24,7 @@ import com.ufi_axis.ui.components.common.UfiSettingsRowCard
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 内网穿透通用设置 —— **入口列表页**（2026-10-14 由"一页装全部"拆成入口 + 三个子页）。
@@ -99,7 +100,7 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                         },
                         icon = Icons.Default.SystemUpdate,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.DETAIL_RESOURCES) }
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_RESOURCES) }
                     )
                 }
 
@@ -116,7 +117,7 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                         },
                         icon = Icons.Default.RestartAlt,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.DETAIL_TUNNEL_SETTINGS_RECONNECT) }
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_SETTINGS_RECONNECT) }
                     )
                 }
 
@@ -129,7 +130,7 @@ fun TunnelSettingsScreen(viewModel: MainViewModel, navController: NavHostControl
                         description = "清除日志、日志保留与查看方式；隧道类型与配置文件 / token 路径",
                         icon = Icons.AutoMirrored.Filled.Article,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.DETAIL_TUNNEL_SETTINGS_LOG) }
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_SETTINGS_LOG) }
                     )
                 }
             }

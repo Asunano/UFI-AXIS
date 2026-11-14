@@ -16,7 +16,6 @@ import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
-import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.launch
 
@@ -41,7 +40,8 @@ fun ToolsScreen(viewModel: MainViewModel, navController: NavHostController) {
             // 与同文件下方那条 isLoading 漏显 bug 同一个成因。现在错误统一由 Activity 级
             // 全局浮层展示（MainActivity 读 viewModel.globalError）。
 
-            // 工具入口：日常七项 + 「进阶工具」，八格两列正好四行。
+            // 工具入口：日常八项 + 「进阶工具」，九格两列；应用商店/文件/视频等
+            // 全部由同一份 TOOLS_PRIMARY_GRID + UfiGridCard 渲染，不另写通栏样式。
             //
             // 2026-09-20 拆页：原来 11 张卡平铺，内网穿透 / 定时任务 / 应用管理 / 高级控制台
             // 这四项是"低频 + 需要先懂点什么才敢点"的东西，混在日常入口里既把常用的挤到下面，

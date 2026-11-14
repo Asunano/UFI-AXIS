@@ -18,6 +18,7 @@ import retrofit2.Retrofit
 import retrofit2.Invocation
 import retrofit2.http.Streaming
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import java.io.IOException
 
 /**
@@ -163,6 +164,82 @@ object RetrofitClient {
      * 用 encoded 形式而不是解码后的值，是因为百分号编码的大小写/保留字符处理在两端不可能
      * 保证一致，一旦不一致就是 100% 验签失败。
      */
+    /**
+     * 主人密码重试拦截器（破坏性操作保护，`OwnerGate`）。
+     *
+     * ## 做什么
+     *
+     * core 只在设置里打开「不可逆操作需配对密码」时才回 `401 MISSING_PASSWORD`；关着时
+     * 整段不会命中（绝大多数用户的默认状态）。命中时问用户要一次密码，**带同一个请求头重发**。
+     *
+     * ## 为什么必须在最外层
+     *
+     * 重发要经过 [dynamicHostInterceptor] 与 [authInterceptor]（重新签名），否则发出去的是
+     * 一个没有 `X-Timestamp/X-Nonce/X-Signature` 的请求，稳定 444。所以本拦截器必须是
+     * `addInterceptor` 的第一个 —— 它内部的 `chain.proceed` 才会再走一遍内层那几道。
+     *
+     * ## 为什么阻塞
+     *
+     * OkHttp 拦截器不是 suspend，而这里要等一个真人打字。等待发生在 OkHttp 的网络线程上
+     * （见 [OwnerPasswordGate] 的说明与超时兜底），不卡 UI。
+     *
+     * ## `INVALID_PASSWORD` 只清缓存不重试
+     *
+     * 密码错就是错了，重试没有意义；清掉缓存让下一次操作重新弹框，避免拿旧值把
+     * `PasswordAttemptLimiter` 的 5 次锁定额度撞掉。
+     */
+    /**
+     * 主人密码最多追问几次。
+     *
+     * 2 = 「缺密码」问一次 + 「密码错了」再问一次。再多就是死循环。
+     */
+    private const val MAX_PROMPTS = 2
+
+    fun ownerPasswordInterceptor(): Interceptor = Interceptor { chain ->
+        val request = chain.request()
+        if (!request.url.encodedPath.startsWith("/api/")) return@Interceptor chain.proceed(request)
+
+        var response = chain.proceed(request)
+        var prompted = 0
+
+        // 最多追问两次：一次是「缺密码」，一次是「密码错了/改过了」。
+        // 再多就是死循环（密码真的不对时应该让上层报错，而不是无限弹框）。
+        while (response.code == 401) {
+            when (parseErrorCode(response)) {
+                "MISSING_PASSWORD", "INVALID_PASSWORD" -> {
+                    val invalid = parseErrorCode(response) == "INVALID_PASSWORD"
+                    if (invalid) {
+                        // 缓存里那个密码是错的（改过密码、或上次手误存进去的）。
+                        // 原先只清缓存就把 401 交给上层 —— 用户看到「保存失败: HTTP 401」，
+                        // 完全不知道是密码错了，也没有重输的机会。
+                        OwnerPasswordGate.clear()
+                    }
+                    if (prompted >= MAX_PROMPTS) return@Interceptor response
+
+                    val password = runBlocking {
+                        OwnerPasswordGate.obtain(if (invalid) "配对密码不正确，请重新输入" else null)
+                    }
+                    if (password == null) {
+                        // 用户取消：抛专用异常，别把 401 丢给上层当"服务器错误"。
+                        // 调用方据此给「需要配对密码」的提示，而不是「保存失败: HTTP 401」。
+                        response.close()
+                        throw OwnerPasswordRequiredException()
+                    }
+                    prompted++
+                    // 必须关掉旧响应，否则这条连接不会归还连接池（响应体一直没被消费）。
+                    response.close()
+                    response = chain.proceed(
+                        request.newBuilder()
+                            .header(OwnerPasswordGate.HEADER, password)
+                            .build()
+                    )
+                }
+                else -> return@Interceptor response
+            }
+        }
+        response
+    }
+
     fun authInterceptor(prefsProvider: () -> AppPreferences): Interceptor =
         Interceptor { chain -> proceedWithAuth(chain, prefsProvider()) }
 
@@ -208,7 +285,11 @@ object RetrofitClient {
                     continue
                 }
             }
-            if (verdict == AuthRejectionPolicy.Verdict.WIPE) onUnauthorized?.invoke()
+            if (verdict == AuthRejectionPolicy.Verdict.WIPE) {
+                // 换过一次身份了，旧设备的主人口令不该留在内存里继续给下一次操作用。
+                OwnerPasswordGate.clear()
+                onUnauthorized?.invoke()
+            }
             return response
         }
     }
@@ -385,6 +466,8 @@ object RetrofitClient {
         val client = OkHttpClientProvider.shared.newBuilder()
             // 2026-10-21（审计 §A4）：baseUrl 不再"烧死"在 Retrofit 里。
             // 换设备/改 IP 后，持有旧 api 实例的 module 也能打到新设备。
+            // 最外层：重发要再走一遍内层的 host 改写与签名（见 ownerPasswordInterceptor 的说明）。
+            .addInterceptor(ownerPasswordInterceptor())
             .addInterceptor(dynamicHostInterceptor { prefs })
             .addInterceptor(authInterceptor { prefs })
             .addInterceptor(errorCaptureInterceptor(baseUrl))
@@ -428,7 +511,13 @@ object RetrofitClient {
  * **不碰 Keystore**：这条路只清 token + 配对标记，设备私钥留着（重新配对仍是同一台设备、
  * 复用原槽位）。删密钥只有 `MainActivity.onRepairRequested` 一条显式入口。
  */
-private object AuthRejectionPolicy {
+/**
+ * 鉴权拒绝的定性策略（internal 可见性：`AuthRejectionPolicyTest` 直接驱动它的阈值）。
+ *
+ * 之所以要能被测：这里是"被删配对后会不会被踢"的唯一判据，而它此前零测试 ——
+ * 把阈值改错（例如把跨度判断写反）不会有任何测试变红，只是行为悄悄变了。
+ */
+internal object AuthRejectionPolicy {
 
     /** 一次鉴权响应的处置结论。 */
     enum class Verdict {

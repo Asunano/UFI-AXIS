@@ -32,6 +32,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 下载设置总入口（二级页）。
@@ -64,7 +65,7 @@ fun DownloadSettingsScreen(
                     subtitle = "并发 ${config.maxConcurrent} · 连接 ${config.maxConnectionsPerServer} · " +
                         (if (config.globalSpeedLimit > 0) "${FormatUtils.formatBytes(config.globalSpeedLimit)}/s" else "不限速"),
                     icon = Icons.Default.Download,
-                    onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_BASIC) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DOWNLOAD_BASIC) }
                 )
                 SettingsEntryRow(
                     title = "智能性能控制",
@@ -84,19 +85,19 @@ fun DownloadSettingsScreen(
                         }
                     },
                     icon = Icons.Default.Speed,
-                    onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_THROTTLE) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DOWNLOAD_THROTTLE) }
                 )
                 SettingsEntryRow(
                     title = "BT / Tracker",
                     subtitle = "${state.trackerCount} 条 · ${state.trackerStatus}",
                     icon = Icons.Default.Share,
-                    onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_TRACKER) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DOWNLOAD_TRACKER) }
                 )
                 SettingsEntryRow(
                     title = "高级设置",
                     subtitle = "分片 ${config.splitCount} · BT节点 ${config.btMaxPeers}",
                     icon = Icons.Default.Tune,
-                    onClick = { navController.navigate(Routes.DETAIL_DOWNLOAD_ADVANCED) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DOWNLOAD_ADVANCED) }
                 )
             }
         }

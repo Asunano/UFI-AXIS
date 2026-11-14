@@ -16,6 +16,7 @@ import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * FRP 隧道列表页（2026-08-26 重构）。
@@ -42,7 +43,7 @@ fun FrpDetailScreen(viewModel: MainViewModel, navController: NavHostController) 
         navController = navController,
         showBack = true,
         actions = {
-            IconButton(onClick = { navController.navigate(Routes.DETAIL_TUNNEL_FRP_NEW) }) {
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_FRP_NEW) }) {
                 Icon(Icons.Default.Add, contentDescription = "新建隧道", tint = palette.accent)
             }
         }
@@ -77,7 +78,7 @@ fun FrpDetailScreen(viewModel: MainViewModel, navController: NavHostController) 
                                 append(" · ${item.proxyCount} 个代理")
                             },
                             icon = Icons.Default.Dns,
-                            onClick = { navController.navigate(Routes.tunnelFrpChannel(item.name)) },
+                            onClick = { navController.ufiNavigateOnce(Routes.tunnelFrpChannel(item.name)) },
                             badgeText = if (item.running) "运行中" else null,
                             highlighted = item.name == state.frpActiveConfig,
                             iconTint = if (item.running) palette.accent else palette.textSecondary

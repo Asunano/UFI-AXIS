@@ -1,11 +1,14 @@
 package com.ufi_axis.viewmodel
 
+import com.ufi_axis.viewmodel.gatedByTransitionGate
 import android.content.Context
 import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.bill.BillRepositoryProvider
+import com.ufi_axis.data.bill.CoreBillRepository
 import com.ufi_axis.data.update.SharedPreferencesCoreUpdatePersistence
 import com.ufi_axis.data.model.BatteryInfo
 import com.ufi_axis.data.model.CpuInfo
@@ -90,16 +93,16 @@ private const val CORE_UPDATE_EXEMPT_TICK_MS = 30_000L
 /**
  * 启动页最长展示时间（ms）。
  *
- * 兜底用，不是常规路径 —— 预加载正常情况下 2 秒内跑完。它防的是"某一步挂住 120s
- *（OkHttp readTimeout）导致启动页永远不消失"。宁可让用户进到一个数据还没齐的界面，
- * 也不能把人锁在加载页上。
+ * 兜底路径，非常规路径：预加载正常情况下 2 秒内完成。用于防止「某一步挂起 120s
+ *（OkHttp readTimeout）导致启动页永不消失」。允许用户进入数据尚未齐全的界面，
+ * 但不能停留在加载页。
  */
 private const val STARTUP_GATE_TIMEOUT_MS = 8_000L
 
 /**
  * 启动页最短展示时间（ms）。
  *
- * 局域网上预加载可能几百毫秒就完事，不设下限时启动页会"闪一下" —— 比不显示更难看。
+ * 局域网内预加载可能在几百毫秒内完成，不设下限时启动页会一闪而过，观感差于不显示。
  */
 private const val STARTUP_GATE_MIN_MS = 600L
 
@@ -107,8 +110,8 @@ private const val STARTUP_GATE_MIN_MS = 600L
  * 全局错误：一条待展示的错误文案 + 它来自哪里。
  *
  * 刻意**不带** retry lambda —— 见 [MainViewModel.globalError] 的说明。
- * 也不带 `retryable`：2026-09-05 第二版把展示通道换成 Toast 之后，全局层不再提供重试按钮
- *（仪表盘/网络/监控本来就有轮询 + 回前台重取，tools/service 从来就没有通用重试语义）。
+ * 也不带 `retryable`：展示通道改为 Toast 后，全局层不再提供重试按钮
+ *（仪表盘/网络/监控本身有轮询 + 回前台重取，tools/service 没有通用重试语义）。
  */
 data class GlobalError(
     val message: String,
@@ -116,24 +119,27 @@ data class GlobalError(
 )
 
 /**
- * 写操作成功提示（2026-09-22）。与 [GlobalError] **对称**的成功通道。
+ * 写操作成功提示。与 [GlobalError] **对称**的成功通道。
  *
  * [seq] 是自增序号，唯一作用是**让同一条文案能连续触发两次**：
  * 全局错误有 30s 同文案去重（防轮询刷屏），但成功提示不能去重 ——
  * 用户连着保存两次就该看到两次确认。少了 seq，第二次的 `WriteNotice` 与第一次 equals 相等，
- * 宿主的 `LaunchedEffect(notice)` 不会重新触发，表现就是"第二次点保存没反应"。
+ * 宿主的 `LaunchedEffect(notice)` 不会重新触发，表现为「第二次点保存无反应」。
  */
 data class WriteNotice(
     val message: String,
     val subtitle: String? = null,
+    /** 语义类型（UI 据此选图标与配色）。默认 SUCCESS 与旧行为一致。 */
+    val type: com.ufi_axis.viewmodel.module.WriteNoticeType =
+        com.ufi_axis.viewmodel.module.WriteNoticeType.SUCCESS,
     val seq: Long
 )
 
 /**
  * 全局连接态。**app 里判断「能不能用」只看这一个枚举**。
  *
- * 语义分工（这是本类型存在的全部理由 —— 三个旧信号各说各话正是"连不上却不提示"的根因）：
- * - [CHECKING]：还没探出结论（冷启动首屏）。**不要显示任何错误提示**，否则每次开 app 都先红一下。
+ * 语义分工（本类型存在的目的：三个旧信号各自独立，正是「连不上却不提示」的根因）：
+ * - [CHECKING]：尚未得出结论（冷启动首屏）。**不得显示任何错误提示**，否则每次启动都会先闪现错误状态。
  * - [ONLINE]：`/health` 探通。这是唯一能证明 core 可达的证据。
  * - [NO_LOCAL_NETWORK]：手机压根没连网络（`NetworkMonitor.hasNetwork` 为 false）。
  * - [NOT_CONFIGURED]：还没配过设备地址（`serverIp` 为空）。
@@ -154,11 +160,11 @@ data class ConnectivityUiState(
     val title: String? = null,
     val detail: String? = null
 ) {
-    /** 是否处于「连不上」状态。CHECKING 不算 —— 没结论就别吓用户。 */
+    /** 是否处于「连不上」状态。CHECKING 不计入，尚未得出结论时不提示。 */
     val hasProblem: Boolean
         get() = status != ConnectivityStatus.ONLINE && status != ConnectivityStatus.CHECKING
 
-    /** 是否是「配都没配」——UI 可据此把按钮从「重试」换成「去配对」。 */
+    /** 是否尚未配置设备地址：UI 可据此把按钮从「重试」换成「去配对」。 */
     val needsSetup: Boolean get() = status == ConnectivityStatus.NOT_CONFIGURED
 }
 
@@ -170,11 +176,11 @@ class MainViewModel(
 ) : ViewModel() {
 
     // ── Modules ──
-    // 首屏仅 Dashboard 立即初始化；其余非首屏模块改为惰性加载（by lazy），
-    // 延后到对应页面访问 viewModel.xxx 或 LaunchedEffect 触发，降低冷启动负担。
-    // 注：network/tools 仍会在 MainViewModel 构造期因跨模块事件收集被提前初始化，
-    // 但 files/apps/downloads 等重型模块已真正推迟到首次访问。
-    // P2 多端同步：告警配置仓库（core 唯一真源镜像；连接即拉取，绝不推送默认）
+    // 首屏仅 Dashboard 立即初始化；其余非首屏模块惰性加载（by lazy），
+    // 延后到对应页面访问 viewModel.xxx 或 LaunchedEffect 触发，降低冷启动开销。
+    // 注：network/tools 仍会因跨模块事件收集在 MainViewModel 构造期被提前初始化，
+    // files/apps/downloads 等重型模块则推迟到首次访问。
+    // 多端同步：告警配置仓库（core 唯一真源镜像；连接即拉取，不下发默认值）
     val alertPrefs = AlertPrefsRepository()
 
     /**
@@ -183,20 +189,20 @@ class MainViewModel(
      */
     private val coreUpdatePersistence = SharedPreferencesCoreUpdatePersistence(appContext)
 
-    /** 只用来读「设备地址配过没有」（[connectivity] 的归因分支）。构造一次，别在 combine 里反复 new。 */
+    /** 只用于读取「设备地址是否已配置」（[connectivity] 的归因分支）。构造一次并复用，不在 combine 中重复实例化。 */
     private val appPrefs = AppPreferences(appContext)
 
     // 跨模块 UI 事件汇聚点（eager 创建、开销极小）：各 module 构造时接收该 sink，
-    // 把自己的事件转发/直投到此。collectCrossModuleEvents 仅订阅本 sink，
-    // 不会在构造期触发 network / tools 的 by lazy 求值（修复冷启动 eager 加载，风险 #6）。
+    // 将自己的事件转发/直投到此。collectCrossModuleEvents 仅订阅本 sink，
+    // 不会在构造期触发 network / tools 的 by lazy 求值（避免冷启动 eager 加载）。
     //
     // 声明位置必须在 [dashboard] **之前**：Kotlin 按声明顺序初始化属性，
-    // 而 dashboard 是 eager 的，构造时就要拿到这个 sink；顺序反了传进去的是 null。
+    // 而 dashboard 是 eager 的，构造时就需要该 sink；顺序颠倒时传入的是 null。
     private val crossModuleEventSink = MutableSharedFlow<UiEvent>(extraBufferCapacity = 64)
 
     val dashboard = DashboardModule(
         api, webSocketRepository, networkMonitor, appContext, viewModelScope, alertPrefs,
-        // 2026-09-22：监控设置四个二级页的写结果要能到全局提示出口，所以 dashboard 也拿这个 sink。
+        // 监控设置四个二级页的写结果需要到达全局提示出口，因此 dashboard 也接收此 sink。
         crossModuleEventSink = crossModuleEventSink
     )
 
@@ -206,21 +212,25 @@ class MainViewModel(
      */
     val health = HealthModule(api, viewModelScope)
 
-    val network by lazy { NetworkModule(api, appContext, viewModelScope, crossModuleEventSink) }
+    // 网络页 hero 卡的信号读数必须与仪表盘同源：把 WS 消息流传入，
+    // 由 NetworkModule 自行订阅 `signal` 频道（见 collectSignalFromWs 的注释）。
+    val network by lazy {
+        NetworkModule(api, appContext, viewModelScope, crossModuleEventSink, webSocketRepository.messages)
+    }
     val tools by lazy { ToolsModule(api, appContext, viewModelScope, crossModuleEventSink, alertPrefs, coreUpdatePersistence) }
     val files by lazy { FileManagerModule(api, appContext, FileShortcutRepository(appContext), viewModelScope) }
     // 外部存储源（FTP / WebDAV）配置：只管 /api/storage/sources 这组 CRUD，
     // 源里的列目录与读写仍由 files 走 remote: 前缀路径完成（core 侧派发）。
-    // by lazy：绝大多数用户一个源都不配，不该在 ViewModel 构造时就占一份 state。
+    // by lazy：多数用户不配置任何源，不应在 ViewModel 构造期分配 state。
     val storageSources by lazy { StorageSourceModule(api, viewModelScope) }
 
     /**
-     * 真 PTY 终端会话（app 端原生，2026-10-10）。
+     * 真 PTY 终端会话（app 端原生）。
      *
-     * 独立 repository 而非塞进 `WebSocketRepository`：那是 /ws/realtime 推送通道，
+     * 独立 repository 而非并入 `WebSocketRepository`：后者是 /ws/realtime 推送通道，
      * 带订阅主题/重连退避/data_changed 扇出，与终端的帧协议和生命周期都不同（详见
-     * `PtySessionRepository` 类文档）。`by lazy` — 绝大多数用户不进终端页，
-     * 不该在 ViewModel 构造时就建 OkHttpClient。
+     * `PtySessionRepository` 类文档）。`by lazy`：多数用户不会进入终端页，
+     * 不应在 ViewModel 构造期创建 OkHttpClient。
      *
      * 设备地址/token 每次现取 [AppPreferences]：设备重新配对后 baseUrl/token 会变，
      * 长驻实例拿着旧值会连不上（与 RetrofitClient.recreate 同一理由）。
@@ -232,7 +242,7 @@ class MainViewModel(
         ).also { ptySessionRef = it }
 
     private var ptySessionRef: com.ufi_axis.data.repository.PtySessionRepository? = null
-    // 媒体中心（工具 → 媒体中心，2026-09-16）：列设备端的视频 / 音乐 / 图片。
+    // 媒体中心（工具 → 媒体中心）：列设备端的视频 / 音乐 / 图片。
     // 数据来自 core 的 /api/media（它查系统媒体库），播放仍走 /api/files/stream。
     val media by lazy { MediaModule(api, appContext, viewModelScope) }
     val apps by lazy { AppManagerModule(api, appContext, viewModelScope) }
@@ -241,28 +251,28 @@ class MainViewModel(
     val backup by lazy { BackupModule(api) }
 
     /**
-     * 标题栏天气小功能（2026-09-17）：数据来自 core 的 `/api/weather`（它代理 Open-Meteo）。
+     * 标题栏天气小功能：数据来自 core 的 `/api/weather`（代理 Open-Meteo）。
      *
-     * by lazy：默认是关的，只有开了开关的用户才会有人访问它。
+     * by lazy：该功能默认关闭，仅启用后的用户会访问。
      */
     val weather by lazy { WeatherModule(api, viewModelScope, crossModuleEventSink) }
 
     /**
-     * 标题栏今日诗词（2026-09-18）：数据来自 core 的 `/api/poetry`（它代理 jinrishici v2）。
+     * 标题栏今日诗词：数据来自 core 的 `/api/poetry`（代理 jinrishici v2）。
      *
      * by lazy 同上：默认关闭。挑诗的智能匹配在上游，本模块只负责取数与节流。
      */
     val poetry by lazy { PoetryModule(api, viewModelScope, crossModuleEventSink) }
 
-    /** DLNA MediaServer（2026-10-09）：设置 → DLNA 服务。默认关。 */
+    /** DLNA MediaServer：设置 → DLNA 服务。默认关闭。 */
     val dlna by lazy { DlnaModule(api, viewModelScope, crossModuleEventSink) }
 
     /**
-     * 更新提示的唯一状态槽（2026-09-06）。
+     * 更新提示的唯一状态槽。
      *
      * 只聚合 [tools] 的 App 自更新状态与 [dashboard] 的 core 版本状态并持有唯一的 visible，
      * 自身不发请求。有它之后「App 有新版」和「Core 有新版」是同一个弹窗里的两块内容，
-     * 不再是两个各自 remember 布尔开关的独立平台 Window（原来会叠加两层 scrim）。
+     * 而不是两个独立的 remember 布尔开关各自弹出平台 Window（后者会叠加两层 scrim）。
      *
      * by lazy：首帧就会被 MainActivity 订阅，等于随首屏初始化；写成 eager 只会把
      * tools 的构造提前到 MainViewModel 构造期，没有收益。
@@ -280,42 +290,58 @@ class MainViewModel(
 
     val backgroundManager = BackgroundManager(appContext)
 
-    // 后台守护调度器（T05 Part 3.4 S6）：WorkManager 周期任务封装，UI 经此读写开关/间隔/状态
+    // 后台守护调度器：WorkManager 周期任务封装，UI 经此读写开关/间隔/状态
     val backgroundGuard by lazy { GuardScheduler(appContext, api) }
 
-    // ── StateFlows (backward-compatible) ──
-    val dashboardState: StateFlow<DashboardState> get() = dashboard.dashboardState
-    // ── 按字段派生的 StateFlow（各 screen 按需订阅，避免全量重组） ──
-    val dashboardCpuInfo: StateFlow<CpuInfo?> get() = dashboard.cpuInfoState
-    val dashboardMemoryInfo: StateFlow<MemoryInfo?> get() = dashboard.memoryInfoState
-    val dashboardTrafficRealtime: StateFlow<TrafficRealtime?> get() = dashboard.trafficRealtimeState
-    val dashboardSignalInfo: StateFlow<SignalInfo?> get() = dashboard.signalInfoState
-    val dashboardBatteryInfo: StateFlow<BatteryInfo?> get() = dashboard.batteryInfoState
-    val dashboardIsLoading: StateFlow<Boolean> get() = dashboard.isLoadingState
-    val networkState: StateFlow<NetworkState> get() = network.networkState
-    /** 后端健康状态（周期探活 + 出错复查），UI 可据此展示"后端是否在线"。 */
-    val healthState: StateFlow<HealthState> get() = health.healthState
+    /**
+     * 统一的「转场期暂缓发布」包装。
+     *
+     * 每条对外暴露的 StateFlow 都经过这一层：转场期间暂存、落定后只提交最新值。
+     * 这样**新页面 / 新模块无需各自维护闸门**，状态从这里输出即自动生效。
+     * 实现与取舍见 [gatedByTransitionGate] 的 KDoc。
+     *
+     * 缓存是必需的：`get()` 每次被访问都会重新求值，若每次都新建一条包装流，
+     * `collectAsState()` 会在每次重组时重订阅、并留下没人取消的收集协程。
+     */
+    private val gatedFlows = HashMap<StateFlow<*>, StateFlow<*>>()
 
-    // ── 全局连接态（2026-09-21）────────────────────────────────────────────────
+    @Suppress("UNCHECKED_CAST")
+    private fun <T> StateFlow<T>.ui(): StateFlow<T> =
+        gatedFlows.getOrPut(this) { gatedByTransitionGate(viewModelScope) } as StateFlow<T>
+
+    // ── StateFlows (backward-compatible) ──
+    val dashboardState: StateFlow<DashboardState> get() = dashboard.dashboardState.ui()
+    // ── 按字段派生的 StateFlow（各 screen 按需订阅，避免全量重组） ──
+    val dashboardCpuInfo: StateFlow<CpuInfo?> get() = dashboard.cpuInfoState.ui()
+    val dashboardMemoryInfo: StateFlow<MemoryInfo?> get() = dashboard.memoryInfoState.ui()
+    val dashboardTrafficRealtime: StateFlow<TrafficRealtime?> get() = dashboard.trafficRealtimeState.ui()
+    val dashboardSignalInfo: StateFlow<SignalInfo?> get() = dashboard.signalInfoState.ui()
+    val dashboardBatteryInfo: StateFlow<BatteryInfo?> get() = dashboard.batteryInfoState.ui()
+    val dashboardIsLoading: StateFlow<Boolean> get() = dashboard.isLoadingState.ui()
+    val networkState: StateFlow<NetworkState> get() = network.networkState.ui()
+    /** 后端健康状态（周期探活 + 出错复查），UI 可据此展示「后端是否在线」。 */
+    val healthState: StateFlow<HealthState> get() = health.healthState.ui()
+
+    // ── 全局连接态 ─────────────────────────────────────────────────────────────
     //
-    // 在这之前 app 有三个互不相干的信号，没有一个是「手机能不能到 core」的权威态：
-    //   · healthState        —— 唯一正确的那个，但**零 UI 消费者**（注释里写着"供 UI 展示"，没人展示）
-    //   · wsConnectionState  —— WS 通道状态，只有仪表盘读
-    //   · dashboardState.isOffline —— 其实是「手机有没有外网」，却被首页渲染成"后端服务未连接"
+    // 收敛前存在三个互不相关的信号，没有一个是「手机能否到达 core」的权威状态：
+    //   · healthState        —— 唯一正确的判据，但**零 UI 消费者**（注释声明「供 UI 展示」，实际无人使用）
+    //   · wsConnectionState  —— WS 通道状态，仅仪表盘读取
+    //   · dashboardState.isOffline —— 实际语义是「手机是否有外网」，却被首页渲染为「后端服务未连接」
     //
-    // 后者是「连不上设备却没有任何提示」的直接原因：手机连着设备热点但 core 没跑时，
+    // 后者是「连不上设备却无任何提示」的直接原因：手机连接设备热点但 core 未运行时，
     // 手机的 INTERNET 能力通常仍为 true → isOffline=false → 永不提示；
-    // 反过来连了个没外网的热点又会误报"后端服务未连接"。
+    // 反之连接无外网的热点又会误报「后端服务未连接」。
     //
-    // 现在收敛成一个权威态：**可达性只信 /health 探活**，[NetworkMonitor] 与「地址是否配过」
-    // 只用来给失败**归因**，不参与"是否可达"的判定。
+    // 因此收敛为单一权威状态：**可达性只依据 /health 探活**，[NetworkMonitor] 与「地址是否配置」
+    // 仅用于失败**归因**，不参与「是否可达」的判定。
     val connectivity: StateFlow<ConnectivityUiState> = combine(
         health.healthState,
         networkMonitor.hasNetwork
     ) { hs, hasNet ->
         when {
             hs.status == HealthStatus.HEALTHY -> ConnectivityUiState(ConnectivityStatus.ONLINE)
-            // 还没探出结论（冷启动首屏）→ 不显示任何横幅，避免"打开就报错"的观感
+            // 尚未得出结论（冷启动首屏）→ 不显示任何横幅，避免「打开即报错」的观感
             hs.status == HealthStatus.UNKNOWN -> ConnectivityUiState(ConnectivityStatus.CHECKING)
             // 已确证不可达，下面只是给原因排序：手机没网 > 没配地址 > 摸不到设备
             !hasNet -> ConnectivityUiState(
@@ -323,9 +349,8 @@ class MainViewModel(
                 "手机未连接网络",
                 "请连接设备的 WiFi 热点后重试"
             )
-            // isConfigValid 之前是死代码（定义了但全仓无调用），这里给它一个真实用途：
-            // serverIp 为空时 baseUrl 会静默回落到 gatewayIp(192.168.0.1)，
-            // 探不通的真正原因是"压根没配过地址"，不能笼统说"设备离线"。
+            // isConfigValid 的用途：serverIp 为空时 baseUrl 会静默回落到
+            // gatewayIp(192.168.0.1)，此时探不通的原因是未配置地址，不能笼统判定为「设备离线」。
             !appPrefs.isConfigValid -> ConnectivityUiState(
                 ConnectivityStatus.NOT_CONFIGURED,
                 "未配置设备地址",
@@ -356,42 +381,42 @@ class MainViewModel(
      */
     fun onApiTransportFailure() = health.notifyTransportFailure()
 
-    // ── 实时连接状态转发（供 UI 展示 WS 连接状态，避免各屏重复订阅 repository，T01/UID-006） ──
+    // ── 实时连接状态转发（供 UI 展示 WS 连接状态，避免各屏重复订阅 repository） ──
     val wsConnectionState: StateFlow<ConnectionState>
         get() = webSocketRepository.connectionState
 
-    // ── 测速取消透传（UID-010, Wave 2）：转发 NetworkModule.cancelSpeedTest() ──
+    // ── 测速取消透传：转发 NetworkModule.cancelSpeedTest() ──
     fun cancelSpeedTest() = network.cancelSpeedTest()
-    val toolsState: StateFlow<ToolsState> get() = tools.toolsState
-    val tunnelState: StateFlow<TunnelState> get() = tunnel.state
-    val alertsState: StateFlow<AlertsState> get() = tools.alertsState
-    val updateState: StateFlow<UpdateState> get() = dashboard.updateState
+    val toolsState: StateFlow<ToolsState> get() = tools.toolsState.ui()
+    val tunnelState: StateFlow<TunnelState> get() = tunnel.state.ui()
+    val alertsState: StateFlow<AlertsState> get() = tools.alertsState.ui()
+    val updateState: StateFlow<UpdateState> get() = dashboard.updateState.ui()
     /** 统一更新提示（App 项 + Core 项聚合）；MainActivity 自动提示与关于页手动检查共用此槽。 */
-    val updatePromptState: StateFlow<UpdatePromptState> get() = updatePrompt.promptState
-    val tasksState: StateFlow<TasksState> get() = tools.tasksState
-    val smsForwardState: StateFlow<SmsForwardState> get() = tools.smsForwardState
+    val updatePromptState: StateFlow<UpdatePromptState> get() = updatePrompt.promptState.ui()
+    val tasksState: StateFlow<TasksState> get() = tools.tasksState.ui()
+    val smsForwardState: StateFlow<SmsForwardState> get() = tools.smsForwardState.ui()
     /** 通用 Webhook 渠道（`/api/notify/webhook`）：推送渠道页与 Webhook 配置页共读这一份。 */
-    val webhookState: StateFlow<WebhookState> get() = tools.webhookState
+    val webhookState: StateFlow<WebhookState> get() = tools.webhookState.ui()
 
     /** 本机短信回发渠道（`/api/notify/sms`）：推送渠道页与本机短信配置页共读这一份。 */
-    val localSmsState: StateFlow<LocalSmsState> get() = tools.localSmsState
-    val appManageState: StateFlow<AppManageState> get() = apps.state
-    val deviceSettingsState: StateFlow<DeviceSettingsState> get() = network.deviceSettingsState
-    val serviceState: StateFlow<ServiceControlState> get() = network.serviceState
-    val speedTestState: StateFlow<SpeedTestState> get() = network.speedTestState
+    val localSmsState: StateFlow<LocalSmsState> get() = tools.localSmsState.ui()
+    val appManageState: StateFlow<AppManageState> get() = apps.state.ui()
+    val deviceSettingsState: StateFlow<DeviceSettingsState> get() = network.deviceSettingsState.ui()
+    val serviceState: StateFlow<ServiceControlState> get() = network.serviceState.ui()
+    val speedTestState: StateFlow<SpeedTestState> get() = network.speedTestState.ui()
 
-    /** 定时测速历史（2026-10-06 批C 对齐；NetworkModule 拉取，Screen 消费）。 */
-    val speedTestHistory: StateFlow<List<SpeedTestHistoryEntry>> get() = network.speedTestHistory
-    val fileManagerState: StateFlow<FileManagerState> get() = files.state
+    /** 定时测速历史（NetworkModule 拉取，Screen 消费）。 */
+    val speedTestHistory: StateFlow<List<SpeedTestHistoryEntry>> get() = network.speedTestHistory.ui()
+    val fileManagerState: StateFlow<FileManagerState> get() = files.state.ui()
     /** 外部存储源配置页（文件管理器 → 更多 → 外部存储）的状态槽。 */
-    val storageSourceState: StateFlow<StorageSourceState> get() = storageSources.state
-    val debugLogState: StateFlow<DebugLogState> get() = tools.debugLogState
-    val diagnoseState: StateFlow<DiagnoseState> get() = tools.diagnoseState
-    val trafficManagementState: StateFlow<TrafficManagementState> get() = tools.trafficManagementState
-    val monitorState: StateFlow<MonitorState> get() = dashboard.monitorState
-    val downloadState: StateFlow<DownloadState> get() = downloads.state
+    val storageSourceState: StateFlow<StorageSourceState> get() = storageSources.state.ui()
+    val debugLogState: StateFlow<DebugLogState> get() = tools.debugLogState.ui()
+    val diagnoseState: StateFlow<DiagnoseState> get() = tools.diagnoseState.ui()
+    val trafficManagementState: StateFlow<TrafficManagementState> get() = tools.trafficManagementState.ui()
+    val monitorState: StateFlow<MonitorState> get() = dashboard.monitorState.ui()
+    val downloadState: StateFlow<DownloadState> get() = downloads.state.ui()
 
-    // ── P2 多端同步：连接恢复时拉取最新告警配置镜像（绝不推送默认，防 ab 设备回弹） ──
+    // ── 多端同步：连接恢复时拉取最新告警配置镜像（不下发默认值，防止设备间配置回弹） ──
     fun refreshAlertConfig() {
         viewModelScope.launch { alertPrefs.refreshFromCore(api) }
     }
@@ -408,9 +433,9 @@ class MainViewModel(
      * App 回前台：静默探活一次后再恢复周期（见 [HealthModule.onAppForegrounded]）。
      * 由 MainActivity `ON_RESUME` 调用；与 WS 重连并行。
      *
-     * 2026-10-21：顺带立刻拉一次**待批准列表**。App 在后台时 WS 帧可能已被系统裁掉、进程被冻，
-     * 不补这一次，机主切回 App 后还要再等最多 30s 才看见弹窗（那正是"弹窗慢"的另一半）。
-     * 不依赖推送是否到达 —— 拉一次是幂等且便宜的。
+     * 同时立即拉取一次**待批准列表**。App 在后台时 WS 帧可能已被系统裁掉、进程被冻结，
+     * 不做这次补拉，机主切回 App 后需再等待最多 30s 才能看到弹窗。
+     * 不依赖推送是否到达：该请求幂等且开销低。
      */
     fun onAppForegrounded() {
         health.onAppForegrounded(HEALTH_CHECK_INTERVAL_MS)
@@ -427,15 +452,18 @@ class MainViewModel(
 
     // ── Init & Cleanup ──
     init {
+        // 话费账单：生产默认走 core 的 /api/carrier/bill；演示数据只留给 Preview/无 core 调试。
+        BillRepositoryProvider.repository = CoreBillRepository(api)
+
         // Start modules
         dashboard.init()
 
-        // Core 升级期间跳过周期取数（2026-09-14）。
-        // 升级会让设备端 HTTP 中断约 1 分钟，30s 全局告警轮询与 5s 首页刷新会持续失败并把
-        // errorMessage 写进 state —— 用户看到满屏「加载告警失败」。闸门读的是 ToolsModule
-        // 那个唯一真源（`markCoreUpdating` 同时落 SP 与推 StateFlow），
-        // 轮询只是"跳过一轮"，闸门放开后自然继续，不需要谁去负责重启。
-        // Toast 出口那一侧另有静默，见 [globalError]。
+        // Core 升级期间跳过周期取数。
+        // 升级会使设备端 HTTP 中断约 1 分钟，30s 全局告警轮询与 5s 首页刷新会持续失败并把
+        // errorMessage 写入 state，界面上表现为连续的「加载告警失败」。闸门读取 ToolsModule
+        // 的唯一真源（`markCoreUpdating` 同时写入 SP 并推送 StateFlow）；
+        // 轮询仅「跳过一轮」，闸门放开后自然继续，无需额外负责重启。
+        // Toast 出口侧另有静默，见 [globalError]。
         dashboard.pollGate = { tools.coreUpdating.value }
 
         // 后端健康检查：周期探活（前台 30s）+ 传输层失败时即时复查（见 HealthModule）。
@@ -454,7 +482,12 @@ class MainViewModel(
         // data_changed 事件 → 精准增量刷新
         collectDataChangedEvents()
 
-        // 天气 & 诗词预加载（2026-09-19）：在 UI 布局可见之前就取数据，避免用户看到空白顶栏。
+        // 凭据看门狗：实时通道断了就定期核一次身份。
+        // 放这里而不是 Compose 的 LaunchedEffect：组合会被页面/分支反复创建销毁，
+        // 而"我是不是已经被别的设备删掉配对"这件事必须一直有人盯着（2026-11-14）。
+        startCredentialWatchdog()
+
+        // 天气 & 诗词预加载：在 UI 布局可见之前取数据，避免出现空白顶栏。
         // loadConfig 内部已经 if (enabled) refresh()，所以一次调用足够。
         // 注：访问 weather/poetry 会触发 by lazy 初始化，代价是两次轻量 HTTP（core 本地）。
         weather.loadConfig()
@@ -468,9 +501,78 @@ class MainViewModel(
         collectThumbPrewarmFromWs()
     }
 
+    /**
+     * WS 握手被拒之后核对一次登录状态（2026-11-14）。
+     *
+     * ## 为什么需要
+     *
+     * 机主在 A 上删掉 B 的配对后，B 的 App 仍停在仪表盘：它的数据几乎全走 WS，
+     * 而 HTTP 444 的清凭据阈值（`AuthRejectionPolicy`，3 次 / 跨度 ≥10s）根本没机会攒到 ——
+     * 界面上只有一个反复出现的"实时通道连接被拒"提示（`onAuthRejected`），人被留在原地。
+     *
+     * ## 为什么不在 `onAuthRejected` 里直接清凭据
+     *
+     * 那条路会被"冷启动时钟未校准"误伤（WS 先于 /health 校时发起握手 → 必然 1008），
+     * 2026-10-22 修过一次同样的坑。所以这里只**发探测请求**，让唯一那份阈值继续做决定：
+     * - 时钟问题：HTTP 会先自愈（校时重试），探测拿到 200，什么都不会发生；
+     * - 真被删配对：探测连续吃 444，阈值到点 → `onUnauthorized` → 清凭据回配对页。
+     *
+     * 3 次 × 5s：既满足"≥3 次且跨度 ≥10s"的阈值，又能在 ~15s 内给出结论。
+     */
+    fun verifyCredentialsAfterWsRejection() {
+        if (!authProbeStarted.compareAndSet(false, true)) {
+            return
+        }
+        if (!appPrefs.isSetupComplete) {
+            authProbeStarted.set(false)
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 一次调用 = 一次探测。连续三次（≥10s 跨度）由调用方的周期驱动，
+                // 正好喂满 `AuthRejectionPolicy` 的阈值；成功后 streak 会自己清零。
+                val r = runCatching { api.getDeviceVersion() }
+                // 探测通过 = 凭据没问题，那问题在实时通道那一次的握手上：
+                // 把它从 `authRejected` 的终态里拉回来，否则"实时连接已断开"会永久成立
+                //（`authRejected=true` 后 scheduleReconnect 直接 return）。
+                if (r.isSuccess) {
+                    webSocketRepository.retryAfterAuthProbe()
+                }
+                com.ufi_axis.util.DebugLog.w(
+                    "AuthProbe",
+                    "凭据探测：${if (r.isSuccess) "OK" else (r.exceptionOrNull()?.message ?: "失败")}"
+                )
+            } finally {
+                authProbeStarted.set(false)
+            }
+        }
+    }
+
+    /**
+     * 实时通道不在线时，每 8 秒核一次凭据（`AuthRejectionPolicy` 要 3 次 444 且跨度 ≥10s）。
+     *
+     * 只在"WS 不是 CONNECTED"时探测：
+     * - core 重启/断网 → 探测在传输层失败，策略不计入吊销，等它回来；
+     * - 配对被别的设备删了 → 连续 444 → 阈值到点 → 清凭据回配对页。
+     */
+    private fun startCredentialWatchdog() {
+        viewModelScope.launch(Dispatchers.IO) {
+            while (true) {
+                delay(8_000)
+                val st = webSocketRepository.connectionState.value
+                if (st != ConnectionState.CONNECTED) {
+                    verifyCredentialsAfterWsRejection()
+                }
+            }
+        }
+    }
+
+    /** 上面那条探测的在途标记，避免 WS 反复握手失败时并发起一堆探测。 */
+    private val authProbeStarted = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** 收集跨模块 UiEvent，统一分发到目标 Module。
-     * 订阅 eager 创建的汇聚 sink（crossModuleEventSink），不再访问 network / tools 的
-     * events 流，因此不会在构建期触发这两个模块的 by lazy 求值（修复冷启动 eager 加载，风险 #6）。
+     * 订阅 eager 创建的汇聚 sink（crossModuleEventSink），不访问 network / tools 的
+     * events 流，因此不会在构建期触发这两个模块的 by lazy 求值（避免冷启动 eager 加载）。
      * NetworkModule / ToolsModule 在构造时接收同一 sink，并把自己的 _events 转发到该 sink。 */
     private fun collectCrossModuleEvents() {
         viewModelScope.launch {
@@ -485,6 +587,7 @@ class MainViewModel(
                         _writeNotice.value = WriteNotice(
                             message = event.message,
                             subtitle = event.subtitle,
+                            type = event.type,
                             seq = ++writeNoticeSeq
                         )
                     }
@@ -497,21 +600,21 @@ class MainViewModel(
     private fun collectDataChangedEvents() {
         viewModelScope.launch {
             webSocketRepository.dataChanged.collect { changedType ->
-                // 2026-10-05 P5：原 when 直发的四个前缀分支改为 dispatchChanged ——
-                // 按前缀分组 + 800ms 窗口尾沿统一分发，见 [dispatchChanged]。
+                // 前缀分支统一交给 dispatchChanged：按前缀分组 + 800ms 窗口尾沿分发，
+                // 见 [dispatchChanged]。
                 dispatchChanged(changedType)
             }
         }
     }
 
-    // ── 2026-10-05 P5：data_changed 去抖合并（尾沿触发，防事件风暴）──────────────
-    // invalidateAll（P1）已把单次写操作压成 1 条事件；但通配失效（device:*）等仍可能多条
+    // ── data_changed 去抖合并（尾沿触发，防事件风暴）────────────────────────────
+    // invalidateAll 已将单次写操作压成 1 条事件；但通配失效（device:*）等仍可能多条
     // 密集到达。按前缀分组、800ms 窗口尾沿统一分发：组内所有 key 一轮刷完，不丢 key。
     // 两个 map 均只在主线程（viewModelScope 的 collect 协程）读写，无需并发容器。
     private val pendingByGroup = mutableMapOf<String, MutableSet<String>>()
     private val debounceJobs = mutableMapOf<String, Job>()
 
-    /** P5 去抖窗口（尾沿触发）。 */
+    /** 去抖窗口（尾沿触发）。 */
     private val DISPATCH_DEBOUNCE_MS = 800L
 
     private fun groupOf(changed: String): String = when {
@@ -526,15 +629,15 @@ class MainViewModel(
     }
 
     private fun dispatchChanged(changedType: String) {
-        // 2026-10-21：配对待批准是**模态事件**（要立刻弹窗逼机主做决定），不能吃 P5 的
-        // 800ms 尾沿去抖 —— 它也不属于任何既有分组（device/wifi/network/tools/media），
-        // 直接短路最清楚。core 侧 `ApprovalPushNudger` 会快速补发几帧，所以这里必须
-        // 高效且幂等（`loadApprovals` 内部有在途合并）。
+        // 配对待批准是**模态事件**（需立即弹窗要求机主决策），不经过 800ms 尾沿去抖；
+        // 它也不属于任何既有分组（device/wifi/network/tools/media），直接短路处理。
+        // core 侧 `ApprovalPushNudger` 会快速补发多帧，因此此处必须高效且幂等
+        // （`loadApprovals` 内部已有在途合并）。
         if (changedType == WsDataTopic.PAIRING_APPROVALS) {
             network.loadApprovalsFromPush()
             return
         }
-        // P6 联动：网络相关前缀记外部变更信号（loadNetworkAll 闸门豁免的依据）
+        // 网络相关前缀记录外部变更信号（loadNetworkAll 闸门豁免的依据）
         if (changedType == WsDataTopic.RECONNECTED ||
             changedType.startsWith(WsDataTopic.PREFIX_DEVICE) || changedType.startsWith(WsDataTopic.PREFIX_WIFI) ||
             changedType.startsWith(WsDataTopic.PREFIX_NETWORK) || changedType.startsWith("hub:") ||
@@ -560,7 +663,7 @@ class MainViewModel(
         }
     }
 
-    /** P5：原 collect 里的前缀路由（与原 when 逐条对应，另补 hub:/summary 两条）。 */
+    /** 前缀路由（另含 hub: / summary 两条）。 */
     private fun routeToModules(changedType: String) {
         when {
             // Dashboard: 设备信息类变更
@@ -576,29 +679,28 @@ class MainViewModel(
             }
             // Tools: 定时任务 / 自动化规则（core 侧增删改、以及任务自己触发后写日志）、
             // 控制台历史（另一端敲了命令）。
-            // 2026-09-21：这两组分支原来**完全不存在** —— core 一直在推，app 这边
-            // 分发层直接丢掉，`ToolsModule.smartRefresh` 的 console 分支从没被调用过。
+            // 这两组分支必须存在：core 会持续推送，若分发层丢弃，
+            // `ToolsModule.smartRefresh` 的 console 分支将永远不会被调用。
             changedType.startsWith(WsDataTopic.PREFIX_TASK) ||
             changedType.startsWith(WsDataTopic.PREFIX_CONSOLE) -> {
                 tools.smartRefresh(changedType)
             }
-            // Media: 音频歌单（另一端 —— 通常是 web —— 建了 / 改了 / 删了歌单）。
-            // 2026-09-21：与上面那两组一样，core 侧 PlaylistStore 一直在推
-            // `media:playlists`，但这里原来没有分支 —— web 改完歌单，app 必须
-            // 退出页面再进才看得见。
+            // Media: 音频歌单（另一客户端，通常为 web，创建 / 修改 / 删除歌单）。
+            // core 侧 PlaylistStore 会持续推送 `media:playlists`；缺少该分支时，
+            // web 端修改歌单后，app 必须退出页面再进入才能看到。
             changedType.startsWith(WsDataTopic.PREFIX_MEDIA) -> {
                 media.smartRefresh(changedType)
             }
-            // 2026-10-05 P5 新增：hub 泛型 key（G2 修复后 core 开始广播）→ network + dashboard
+            // hub 泛型 key（core 广播）→ network + dashboard
             changedType.startsWith("hub:") -> {
                 network.smartRefresh(changedType)
                 dashboard.smartRefresh(changedType)
             }
-            // 2026-10-05 P5 新增：summary 失效（G7）→ dashboard
+            // summary 失效 → dashboard
             changedType == "summary" -> dashboard.smartRefresh(changedType)
-            // 2026-10-21：配对相关（目前只有 pairing:approvals）。正常情况下已在
-            // [dispatchChanged] 里短路（不吃去抖），这条是防御性兜底 —— 别删，否则将来有人
-            // 把短路删掉时这里会静默吞掉整个批准弹窗链路。
+            // 配对相关（目前只有 pairing:approvals）。正常情况下已在 [dispatchChanged] 中
+            // 短路（不经过去抖）；此分支为防御性兜底，必须保留：否则短路逻辑一旦移除，
+            // 整个批准弹窗链路会被静默丢弃。
             changedType.startsWith(WsDataTopic.PREFIX_PAIRING) -> network.loadApprovalsFromPush()
         }
     }
@@ -606,11 +708,11 @@ class MainViewModel(
     /**
      * 设备连接就绪后回读设备配置（含短信解析开关真源 `sms_code_enabled`）。
      *
-     * 2026-09-13 修复：此前回读只挂在 `SmsSettingsScreen` 的 `LaunchedEffect(Unit)` 上，
-     * 冷启动若首屏不是短信设置页、或首轮 WS 握手/鉴权尚未完成导致首轮 `GET /api/config`
-     * 抛异常被静默吞掉，本地镜像就会停在默认 false —— 表现为「彻底关掉 app 再打开，
-     * 解析开关变回关」。现改为订阅 [webSocketRepository.connectionState]，每次迁到
-     * `CONNECTED`（首连 / 回前台重连 / 断线恢复）都触发一次回读，覆盖冷启动与重连的时序窗口。
+     * 回读不能只挂在 `SmsSettingsScreen` 的 `LaunchedEffect(Unit)` 上：冷启动首屏若不是
+     * 短信设置页，或首轮 WS 握手/鉴权未完成导致首轮 `GET /api/config` 抛异常被静默吞掉，
+     * 本地镜像会停留在默认 false，表现为「彻底关闭 app 再打开，解析开关变回关」。
+     * 因此订阅 [webSocketRepository.connectionState]，每次迁移到 `CONNECTED`
+     *（首连 / 回前台重连 / 断线恢复）都触发一次回读，覆盖冷启动与重连的时序窗口。
      */
     private fun collectDeviceConfigOnConnect() {
         viewModelScope.launch {
@@ -618,6 +720,13 @@ class MainViewModel(
                 .collect { state ->
                     if (state == ConnectionState.CONNECTED) {
                         tools.refreshDeviceConfig()
+                        // 天气 / 诗词也要补：冷启动那次预加载只要撞上"core 还没起来 / 刚重启 /
+                        // 网络还没通"，就再没有任何重试 —— 顶栏会一直空着，直到用户点进
+                        // 「小功能 → 今日天气」才恢复（2026-11-14 实测：装完 core 后 App 顶栏
+                        // 一直没有天气，进一次设置页就出来了）。
+                        // 判据用"数据缺不缺"而不是 configLoaded：配置读到了但取数 502 时也要补。
+                        if (weather.state.value.now == null) weather.loadConfig()
+                        if (poetry.state.value.poem == null) poetry.loadConfig()
                     }
                 }
         }
@@ -625,7 +734,7 @@ class MainViewModel(
 
     /** sms_contacts WS 推送 → 直接更新联系人列表（免 HTTP 请求） */
     private fun collectSmsContactsFromWs() {
-        // Dispatchers.Default：JSON 反序列化不占主线程（2026-08-31 转场掉帧治理）。
+        // Dispatchers.Default：JSON 反序列化不占用主线程。
         viewModelScope.launch(Dispatchers.Default) {
             webSocketRepository.messages.collect { message ->
                 if (message.type == "sms_contacts") {
@@ -643,12 +752,12 @@ class MainViewModel(
 
     /**
      * update WS 推送 → 设备更新状态。
-     * 后端 UpdateManager 在恢复（新 Core 启动读 RESULT 日志）后，会通过 WS 下发当前更新结果；
+     * 后端 UpdateManager 在恢复（新 Core 启动读取 RESULT 日志）后，会通过 WS 下发当前更新结果；
      * 前端订阅 "update" 主题（见 WebSocketRepository）后，连接建立/恢复时即可收到快照，
-     * 解决「手动推送 APK 后未收到更新成功推送」的问题。
+     * 保证「手动推送 APK 后能收到更新结果推送」。
      */
     /**
-     * 2026-10-07：封面预热进度。core 的 ThumbPrewarmWorker 把进度挂在
+     * 封面预热进度。core 的 ThumbPrewarmWorker 把进度挂在
      * `data_changed` 消息里（changed = media:thumb-progress + done/total/failed/running），
      * 设置页订阅 [MediaModule.thumbPrewarmProgress] 显示「预热中 12/85（失败 3）」。
      */
@@ -662,7 +771,7 @@ class MainViewModel(
                 val total = obj["total"]?.jsonPrimitive?.intOrNull ?: 0
                 val failed = obj["failed"]?.jsonPrimitive?.intOrNull ?: 0
                 val running = obj["running"]?.jsonPrimitive?.booleanOrNull ?: false
-                // 2026-10-07：带上当前条目名，设置页显示"正在处理 xxx.mkv"
+                // 带上当前条目名，设置页显示「正在处理 xxx.mkv」
                 val current = obj["current_name"]?.jsonPrimitive?.contentOrNull ?: ""
                 media.onThumbPrewarmProgress(done, total, failed, running, current)
             }
@@ -689,7 +798,7 @@ class MainViewModel(
      *
      * 刻意不关 ViewModel 自身：回配对页后重建的是 Activity 内容树，同一 VM 仍被记住；
      * 下一次配对成功会走 [onServerEndpointChanged] 重新拉数。
-     * Dashboard Room 缓存必须清 —— 否则换设备后首屏会先闪上一台的 CPU/流量。
+     * Dashboard Room 缓存必须清除：否则换设备后首屏会先闪现上一台设备的 CPU/流量。
      */
     fun prepareDeviceSwitch() {
         viewModelScope.launch {
@@ -698,12 +807,12 @@ class MainViewModel(
             clearError()
             network.clearServiceError()
             skipConnectionNotice()
-            // 新鲜度戳必须跟着缓存一起清：只清 Room 不清戳，新设备的页面会因为
-            // 旧设备的戳还在窗口内而跳过请求，屏幕上留着上一台的信号与 WiFi 名。
+            // 新鲜度基准必须随缓存一起清：只清 Room 不清基准，新设备页面会因旧基准
+            // 仍在窗口内而跳过请求，界面上保留上一台设备的信号与 WiFi 名。
             dashboard.resetFreshness()
             network.resetFreshness()
-            // 播放队列快照一起清：里面存的是**旧设备上的文件路径**，在新设备上基本不成立。
-            // 不清的话换设备后音乐全放不出来，队列面板还列着一堆上一台设备的歌。
+            // 播放队列快照一并清除：其中保存的是**旧设备上的文件路径**，在新设备上通常无效。
+            // 不清除时换设备后音频无法播放，队列面板仍会列出上一台设备的曲目。
             AppPreferences(appContext).clearAudioQueue()
             // 让下一次 ONLINE 为新设备重新跑一轮预加载，并重新挂起启动页
             preload.reset()
@@ -713,14 +822,14 @@ class MainViewModel(
     }
 
     /**
-     * 凭据 / 设备地址变更后重新绑定实时通道（2026-10-21，审计 §A4）。
+     * 凭据 / 设备地址变更后重新绑定实时通道。
      *
-     * HTTP 侧靠 `RetrofitClient.dynamicHostInterceptor` 每次请求重取 baseUrl，已经没有"旧地址"问题；
-     * 但 WS 是**长连接**，它把 url 与 token 存成字段，必须显式换并重连。
+     * HTTP 侧依靠 `RetrofitClient.dynamicHostInterceptor` 每次请求重取 baseUrl，不存在「旧地址」问题；
+     * 但 WS 是**长连接**，它把 url 与 token 存为字段，必须显式替换并重连。
      *
-     * 之前这条更新只作用在 `MainActivity` 里 `remember { WebSocketRepository(...) }` 拿到的实例上，
-     * 而 VM 里跑的是**它自己构造时那个**实例 —— 重新配对（SetupScreen 分支重建了组合）之后，
-     * 被更新的恰恰是"从未 connect 的新实例"，真正在连的那个还在用旧 token/旧主机。
+     * 该更新必须作用于 VM 自身使用的实例：若只更新 `MainActivity` 中
+     * `remember { WebSocketRepository(...) }` 取得的实例，重新配对（SetupScreen 分支重建组合）
+     * 后，被更新的是从未 connect 的新实例，真正在连的实例仍使用旧 token/旧主机。
      *
      * @param wsUrl 新的 WebSocket 地址（`ws://host:port/ws/realtime` 的 base 部分）
      * @param token 新设备 token
@@ -730,25 +839,25 @@ class MainViewModel(
     }
 
     /**
-     * 本 VM 正在使用的实时通道实例（2026-10-21，审计 §A4）。
+     * 本 VM 正在使用的实时通道实例。
      *
      * Activity 的生命周期钩子（回前台重连、网络恢复重连、握手被拒回调）必须作用在**这一个**对象上：
-     * 重新配对会把 SetupScreen 分支重新组合，`remember { WebSocketRepository(...) }` 会造出一个
-     * 全新且从未 connect 的实例，钩子挂在它上面等于什么都没做。
+     * 重新配对会重新组合 SetupScreen 分支，`remember { WebSocketRepository(...) }` 会创建
+     * 全新且从未 connect 的实例，作用于该实例的钩子不会产生效果。
      */
     fun webSocket(): WebSocketRepository = webSocketRepository
 
     /**
-     * 服务器地址变更后的会话刷新（P2）。
+     * 服务器地址变更后的会话刷新。
      *
-     * @param hostChanged IP 或端口变了 —— 必须丢缓存，避免把旧设备数据贴到新地址上。
-     *   同机改端口 / 再存同一地址时只轻量刷新，不闪空屏。
+     * @param hostChanged IP 或端口变化时必须丢弃缓存，避免把旧设备数据关联到新地址。
+     *   同机改端口 / 重复保存同一地址时仅做轻量刷新，不出现空屏。
      */
     fun onServerEndpointChanged(hostChanged: Boolean) {
         if (hostChanged) {
             viewModelScope.launch { runCatching { dashboard.clearDashboardCache() } }
             clearError()
-            // 换的是另一台设备：同 prepareDeviceSwitch，戳与预加载一并复位
+            // 切换的是另一台设备：与 prepareDeviceSwitch 一致，基准与预加载一并复位
             dashboard.resetFreshness()
             network.resetFreshness()
             // 队列快照里存的是旧设备的路径，换地址后必须清（见 prepareDeviceSwitch 的说明）
@@ -768,30 +877,29 @@ class MainViewModel(
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    // 全局错误（2026-09-05）
+    // 全局错误
     // ══════════════════════════════════════════════════════════════════════
     //
-    // 在此之前错误提示是**页面级**的：每个页面自己 `state.errorMessage?.let { UfiErrorBanner(...) }`。
-    // 后果有三：
-    // 1. 「我的」页一条都没有 —— 而 `ServiceControlState.errorMessage`（启停/重启服务、关机、
-    //    重启设备四个危险操作）一直在写、全仓零读取，失败时界面完全没反馈；
-    // 2. 「工具」页自己不发请求、产不出错误，它那条横幅显示的其实是 tools 域**别的页面**的错误
-    //    （ToolsState 是整个 tools 域共享的一份），谁在哪报的错说不清；
-    // 3. 同一个 errorMessage 要在 N 个页面各写一遍渲染代码，漏一个页面就静默失败。
+    // 页面级错误提示存在三个问题：
+    // 1. 「我的」页没有任何提示 —— `ServiceControlState.errorMessage`（启停/重启服务、关机、
+    //    重启设备四个危险操作）持续写入但全仓零读取，失败时界面完全无反馈；
+    // 2. 「工具」页自身不发请求、产不出错误，其横幅显示的是 tools 域**其它页面**的错误
+    //    （ToolsState 是整个 tools 域共享的一份），无法定位错误来源；
+    // 3. 同一个 errorMessage 要在 N 个页面各写一遍渲染代码，漏一个页面即静默失败。
     //
-    // 现在收敛成一条流 + 一个 Activity 级宿主（见 MainActivity 的全局错误浮层）：
-    // 五个来源按严重度取第一个非空，浮层自动收起时回调 [dismissGlobalError] 把该来源清干净
-    //（否则错误会一直挂在 state 上，切回页面又弹一次陈旧错误）。
+    // 因此收敛为一条流 + 一个 Activity 级宿主（见 MainActivity 的全局错误浮层）：
+    // 各来源按严重度取第一个非空，浮层自动收起时回调 [dismissGlobalError] 清除该来源
+    //（否则错误会一直挂在 state 上，切回页面会再次弹出陈旧错误）。
     //
-    // 为什么 [GlobalError] 里不放 retry lambda：那样每次 combine 都产生新实例、equals 恒为 false，
-    // 宿主的 LaunchedEffect 会被每一轮轮询重启。改成只带 [GlobalErrorSource] 枚举，
-    // 重试动作由来源分派 —— 值语义干净，宿主可以安心用它当 key。
+    // [GlobalError] 不携带 retry lambda：否则每次 combine 都产生新实例、equals 恒为 false，
+    // 宿主的 LaunchedEffect 会被每一轮轮询重启。改为只带 [GlobalErrorSource] 枚举，
+    // 重试动作由来源分派 —— 值语义稳定，宿主可安全地将其作为 key。
     //
-    // 2026-09-22：拆成两层 combine。`deviceSettingsState` 是第 6 个来源，而 Kotlin 的
-    // `combine` 具名重载只到 5 参，第 6 个起要走 vararg 版本（元素类型被擦成 Array<*>，
-    // 取值得强转，写错了编译器也不报）。内层先把原来的 5 个按严重度排成有序列表，
-    // 外层再把设备设置插到正确位置 —— 比 vararg + 下标可读得多，也不必为了凑 5 个
-    // 把某个来源塞进别人的 state。
+    // 采用两层 combine：`deviceSettingsState` 是第 6 个来源，而 Kotlin 的
+    // `combine` 具名重载只到 5 参，第 6 个起需走 vararg 版本（元素类型被擦除为 Array<*>，
+    // 取值需强转，错误无法由编译器发现）。内层先将原有 5 个按严重度排成有序列表，
+    // 外层再把设备设置插入正确位置 —— 比 vararg + 下标更可读，也无需为凑足 5 个
+    // 而把某个来源并入其它 state。
     private val baseGlobalErrors: Flow<List<GlobalError>> = combine(
         dashboard.dashboardState,
         network.networkState,
@@ -810,27 +918,25 @@ class MainViewModel(
     }
 
     /**
-     * 2026-09-22 新接入 `deviceSettingsState`：FOTA / 性能模式 / 指示灯 / 数据漫游 /
-     * WiFi 休眠 / Samba / 定时重启这 7 个写操作**一直在往它的 errorMessage 写、却零消费** ——
-     * 全仓没有一处读它，于是这 7 项失败时界面完全没反馈。这正是本段注释开头说的
-     * `ServiceControlState` 同一个坑，换了个 state 复发。
+     * 接入 `deviceSettingsState`：FOTA / 性能模式 / 指示灯 / 数据漫游 /
+     * WiFi 休眠 / Samba / 定时重启这 7 个写操作会写入其 errorMessage，若无人消费，
+     * 这 7 项失败时界面完全无反馈。这与 `ServiceControlState` 属于同一类缺陷。
      *
      * 严重度插在 SERVICE 之后、DASHBOARD 之前：它们都是用户主动发起的设备级写操作，
      * 比页面取数失败更需要被看到。
      *
-     * 附带的行为变化：`deviceSettingsState` 的**加载**失败（loadDeviceSettings 的 catch）
-     * 原来也是静默的，现在会一起冒 Toast。这是刻意的一致化 —— 其他 4 个来源的加载失败
-     * 早就在弹了；Core 升级期间的噪音由 [globalError] 出口已有的静默闸门兜住。
+     * 行为约定：`deviceSettingsState` 的**加载**失败（loadDeviceSettings 的 catch）
+     * 同样上报 Toast。这是一致化选择 —— 其他 4 个来源的加载失败早已上报；
+     * Core 升级期间的噪音由 [globalError] 出口已有的静默闸门拦截。
      *
-     * 2026-09-22 同轮接入 `downloads.state`：下载模块的 14 个写操作（创建/暂停/恢复/删除/
-     * 重试/重命名/清空/改配置/Tracker 刷新与保存…）**一直在写它的 errorMessage、同样零消费**
-     * —— 全仓没有一处读，于是「下载设置改一项」失败时界面只弹一句乐观的「已保存」。
-     * 这是 `deviceSettingsState` 那个坑的第三次复发，按 §4.8 一次接全（枚举 + combine +
-     * dismiss 分派三处同步）。
+     * 同时接入 `downloads.state`：下载模块的 14 个写操作（创建/暂停/恢复/删除/
+     * 重试/重命名/清空/改配置/Tracker 刷新与保存…）会写入其 errorMessage，若无人消费，
+     * 「下载设置改一项」失败时界面只显示乐观的「已保存」。
+     * 新增来源时必须同步三处：枚举 + combine + dismiss 分派。
      *
      * 代价：本属性是 eager 初始化的，读 `downloads.state` 会把 `downloads` 的 by lazy 提前求值。
-     * 可接受 —— `DownloadModule` 的构造只是 new 一个 `MutableStateFlow(DownloadState())`，
-     * 不发请求、不注册监听；而 `network` / `tools` 早就因为同一个原因被这里提前求值了。
+     * 可接受 —— `DownloadModule` 的构造只创建一个 `MutableStateFlow(DownloadState())`，
+     * 不发请求、不注册监听；而 `network` / `tools` 已因同一原因在此处被提前求值。
      */
     private val rawGlobalError: Flow<GlobalError?> = combine(
         baseGlobalErrors,
@@ -856,14 +962,14 @@ class MainViewModel(
     /**
      * 全局错误的**唯一**出口，Core 更新期间整体静默。
      *
-     * 2026-09-14：升级 Core 时设备端 HTTP 必然中断 1 分钟左右，这期间所有取数失败
-     * **都是预期结果**，不是用户需要知道的故障。原来这里没有任何闸门，于是升级过程中
-     * 满屏「加载告警失败」「连接失败」 —— 30s 全局告警轮询、5s 首页刷新、WS 重连
-     * 各贡献一份，且 `silent=true` 只压 `isLoading`、压不住 errorMessage。
+     * 升级 Core 时设备端 HTTP 必然中断 1 分钟左右，这期间所有取数失败
+     * **均为预期结果**，不属于需要提示的故障。若出口无闸门，升级过程中会出现
+     * 连续的「加载告警失败」「连接失败」—— 30s 全局告警轮询、5s 首页刷新、WS 重连
+     * 各贡献一份，且 `silent=true` 只抑制 `isLoading`，不抑制 errorMessage。
      *
-     * 在**出口**静默而不是去改十几个取数点：出口只有一条（这里 → MainActivity 的 Toast），
-     * 取数点有十几处且还会继续增加，改出口才不会漏。
-     * 真正该停下来的周期任务由 [collectCoreUpdatingGate] 暂停。
+     * 在**出口**静默而不是修改十余个取数点：出口只有一条（此处 → MainActivity 的 Toast），
+     * 取数点有十余处且会继续增加，只有改出口才不会遗漏。
+     * 应停止的周期任务由 [collectCoreUpdatingGate] 暂停。
      */
     val globalError: StateFlow<GlobalError?> = combine(
         rawGlobalError,
@@ -872,13 +978,14 @@ class MainViewModel(
         if (updating) null else err
     }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, null)
 
-    // ── 写操作成功提示（2026-09-22）──────────────────────────────────────────
+    // ── 写操作成功提示 ────────────────────────────────────────────────────────
     //
-    // 与 [globalError] 同构：一条流 + 一个 Activity 级宿主。理由也一样 —— 让每个页面
-    // 自己 `var toastMessage by remember` 就会抄 N 遍渲染代码，漏一个页面就变成静默成功。
+    // 与 [globalError] 同构：一条流 + 一个 Activity 级宿主。理由相同 —— 若每个页面
+    // 自行维护 `var toastMessage by remember`，会重复实现 N 遍渲染代码，
+    // 漏一个页面即表现为静默成功。
     //
-    // 这里刻意**不做**同文案去重（错误通道有 30s 去重是为了压住轮询刷屏）：
-    // 连续保存两次就该看到两次确认，去重会让第二次看起来"没反应"。由 [WriteNotice.seq] 保证。
+    // 此处**不做**同文案去重（错误通道的 30s 去重用于抑制轮询刷屏）：
+    // 连续保存两次应看到两次确认，去重会使第二次看起来「无反应」。由 [WriteNotice.seq] 保证。
     private val _writeNotice = MutableStateFlow<WriteNotice?>(null)
     val writeNotice: StateFlow<WriteNotice?> = _writeNotice.asStateFlow()
 
@@ -891,68 +998,67 @@ class MainViewModel(
     }
 
     /**
-     * **纯本地**写操作的成功提示入口（2026-09-22）。
+     * **纯本地**写操作的成功提示入口。
      *
-     * 只给"没有任何 module 负责、也没有网络请求可以失败"的那类写用 —— 目前只有
-     * 「服务器配置 → 连接配置」的 Core IP / 端口（它写的是本机 `AppPreferences`）。
-     * 这类操作没有失败分支，所以不需要 module 层的成功/失败收尾，但成功提示仍然要走
-     * **同一个宿主**，否则又会在页面里长出一份私有 toast（见 [globalError] 那段注释里
-     * 反复出现的"抄 N 遍就会漏"）。
+     * 仅用于「没有对应 module、也没有网络请求可能失败」的写操作 —— 目前只有
+     * 「服务器配置 → 连接配置」的 Core IP / 端口（写入本机 `AppPreferences`）。
+     * 这类操作没有失败分支，无需 module 层的成功/失败收尾，但成功提示仍必须经过
+     * **同一个宿主**，否则页面内会出现私有 toast（见 [globalError] 中关于渲染代码重复的说明）。
      *
-     * 有网络请求的写操作**不要**用它：那些必须在 module 里等结果，成功才发 notice。
+     * 有网络请求的写操作**不得**使用：它们必须在 module 中等待结果，成功后才发 notice。
      */
     fun notifyLocalWriteSucceeded(message: String, subtitle: String? = null) {
         crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
     }
 
-    // ── 「连不上设备」的唯一展示面：启动页（2026-09-22 二次收敛）────────────────
+    // ── 「连不上设备」的唯一展示面：启动页 ───────────────────────────────────
     //
-    // 演进三步，后人别再倒退回前两步：
-    // 1. 断线时首页同时出现三处提示 —— 顶部全局横幅 + 卡内「服务状态条」+ 模态弹窗，
-    //    且横幅与弹窗来自两套判据不同的检测器。
-    // 2. 收敛成一处模态弹窗，全部派生自 [connectivity]（/health 连击确证，唯一权威可达性）。
-    // 3. **弹窗也撤掉**，改由[启动页]承担：加载中显示预加载进度，连不上就在同一个面上
-    //    显示病因 + 动作。理由是用户的原话「我更需要这个来显示」——
-    //    冷启动连不上时，一个铺满屏幕、写清病因和下一步的页面比一个盖在空界面上的弹窗清楚。
+    // 设计约束：以下三点不得回退。
+    // 1. 断线时不得同时在首页出现三处提示（顶部全局横幅 + 卡内「服务状态条」+ 模态弹窗，
+    //    且横幅与弹窗来自判据不同的两套检测器）。
+    // 2. 收敛为一处模态弹窗，全部派生自 [connectivity]（/health 连续探测确证，唯一权威可达性来源）。
+    // 3. **不使用模态弹窗**，改由[启动页]承担：加载中显示预加载进度，连不上时在同一界面
+    //    显示病因与操作入口。冷启动连不上时，一个铺满屏幕、写明病因和下一步操作的页面，
+    //    比覆盖在空界面上的弹窗更清晰。
     //
-    // 顺带修掉旧链的一个真实缺陷：它的 45s 去抖按**错误文本**分组
+    // 旧的提示链路另有缺陷：其 45s 去抖按**错误文本**分组
     //（`err.message == lastHandledMessage`），而断线时各模块会依次抛出措辞不同的错误，
-    // 每换一条文本就绕过去抖 —— 用户点掉弹窗后马上会被另一条文本再弹一次。
-    // 派生态没有"触发"的概念，同一轮掉线只有一个状态，不存在重复弹。
+    // 每换一条文本即绕过去抖，用户关闭弹窗后会立即被另一条文本再次弹出。
+    // 派生状态不存在「触发」概念，同一轮掉线只有一个状态，不会重复弹出。
 
     /**
-     * 用户点了「先进入应用」：本轮掉线不再用启动页挡着。恢复 ONLINE 后复位，下次掉线重新挡。
+     * 用户选择「先进入应用」后，本轮掉线不再由启动页拦截；恢复 ONLINE 后复位，下次掉线重新拦截。
      *
-     * 必须留这个出口：三种病因里有两种不是在这个页面里能解决的 ——
-     * 「手机未连接网络」要去系统 WiFi 设置、「未配置设备地址」要走配对流程。
-     * 没有出口就等于把用户锁在一个按不动的页面上。让开之后仪表盘卡内状态条
-     * 仍然显示「后端服务未连接」，信息不会丢。
+     * 必须保留该出口：三种病因中有两种无法在本页解决 ——
+     * 「手机未连接网络」需前往系统 WiFi 设置，「未配置设备地址」需走配对流程。
+     * 缺少出口会使页面无法离开。跳过之后仪表盘卡内状态条
+     * 仍显示「后端服务未连接」，信息不会丢失。
      */
     private val _connectionNoticeSkipped = MutableStateFlow(false)
 
     /**
      * 本轮「Core 更新中」豁免的起始时刻（0 = 当前未处于豁免）。
      *
-     * 只在 [coreUpdateExempt] 那条流的收集协程里读写（单协程顺序执行），
-     * 不再在 [startupProblem] 的变换体里改实例字段。
+     * 仅在 [coreUpdateExempt] 流的收集协程中读写（单协程顺序执行），
+     * 不在 [startupProblem] 的变换体内修改实例字段。
      */
     private var coreUpdateExemptSince = 0L
 
     /**
-     * 「Core 更新中」豁免此刻是否仍然生效。
+     * 「Core 更新中」豁免当前是否生效。
      *
-     * 三条上游：`coreUpdating` / `updateDeviceState` 负责"更新开始/结束"的即时反应，
-     * 时间节拍负责"豁免到期"—— 更新卡死时前两条是去重的 StateFlow，不会再发值，
-     * 没有节拍就永远算不出超时（见 [CORE_UPDATE_EXEMPT_TICK_MS]）。
+     * 三条上游：`coreUpdating` / `updateDeviceState` 负责「更新开始/结束」的即时响应，
+     * 时间节拍负责「豁免到期」—— 更新卡死时前两条为去重的 StateFlow，不再发值，
+     * 缺少节拍则永远无法算出超时（见 [CORE_UPDATE_EXEMPT_TICK_MS]）。
      */
     private val coreUpdateExempt: Flow<Boolean> = combine(
         tools.coreUpdating,
         tools.updateDeviceState,
         flow<Long> {
             while (true) {
-                // 2026-10-05 R1-12 修复：计时口径从墙上时钟（System.currentTimeMillis）改为
-                // 单调时钟（SystemClock.elapsedRealtime）——NTP 校时跳变不再破坏 5 分钟豁免
-                // 窗口（回跳曾导致豁免无限延长）。与 startupGate 同一口径；差值同为毫秒。
+                // 计时口径使用单调时钟（SystemClock.elapsedRealtime）而不是墙上时钟
+                // （System.currentTimeMillis）：NTP 校时跳变会破坏 5 分钟豁免窗口
+                //（时间回跳会导致豁免无限延长）。与 startupGate 口径一致；差值同为毫秒。
                 emit(android.os.SystemClock.elapsedRealtime())
                 delay(CORE_UPDATE_EXEMPT_TICK_MS)
             }
@@ -963,21 +1069,21 @@ class MainViewModel(
             false
         } else {
             if (coreUpdateExemptSince == 0L) coreUpdateExemptSince = nowMs
-            // 豁免超时（更新卡死）→ 不再豁免，照常报，否则用户永远看不到异常
+            // 豁免超时（更新卡死）→ 取消豁免并照常上报，否则异常永远不会显示
             nowMs - coreUpdateExemptSince < CORE_UPDATE_EXEMPT_TIMEOUT_MS
         }
     }.distinctUntilChanged()
 
     /**
-     * 启动页当前要不要显示「连不上」那一态，以及显示什么。null = 正常（显示加载进度）。
+     * 启动页是否显示「连不上」状态及其内容。null = 正常（显示加载进度）。
      *
-     * 两道闸：
-     * 1. [connectivity] 确证不可达（CHECKING 不算，冷启动首屏不吓人）；
-     * 2. 不在 Core 更新豁免窗内（见 [coreUpdateExempt]）——
-     *    升级 Core 时 8088 必然断联约 1 分钟，那是预期结果，不该拿一整页去报。
+     * 两个条件同时满足才显示：
+     * 1. [connectivity] 确证不可达（CHECKING 不计入，冷启动首屏不提示）；
+     * 2. 不处于 Core 更新豁免窗口内（见 [coreUpdateExempt]）——
+     *    升级 Core 时 8088 必然断联约 1 分钟，属于预期结果，不应整页上报。
      *
-     * 这里的变换是纯函数：豁免的判定与计时全在 [coreUpdateExempt] 里，
-     * 所以启动页不会因为"上游不再发值"而卡在某一态。
+     * 本变换为纯函数：豁免判定与计时全在 [coreUpdateExempt] 中，
+     * 因此启动页不会因「上游不再发值」而停留在某一状态。
      */
     val startupProblem: StateFlow<ConnectivityUiState?> = combine(
         connectivity,
@@ -1001,8 +1107,8 @@ class MainViewModel(
     private fun isCoreUpdateInterruptingBackend(): Boolean {
         if (coreUpdatePersistence.isCoreUpdating()) return true
         val st = tools.updateDeviceState.value
-        // 2026-10-07 修复：补齐 downloading/verifying —— 之前只认 uploading/installing，
-        // 而下载阶段（几十 MB，最久的就是它）app 会照常弹「无法连接到设备」。
+        // 必须包含 downloading/verifying：仅识别 uploading/installing 时，
+        // 下载阶段（数十 MB，耗时最长）app 仍会弹出「无法连接到设备」。
         // 与 core 侧 UpdateManager.BUSY_STATES（DOWNLOADING/VERIFYING/INSTALLING/UPLOADING）对齐。
         return st?.state in CORE_UPDATE_BUSY_STATES || st?.reconnecting == true
     }
@@ -1013,11 +1119,11 @@ class MainViewModel(
     }
 
     /**
-     * 连接恢复时复位「先进入应用」：否则让开过一次之后，这台设备再也不会用启动页挡。
+     * 连接恢复时复位「先进入应用」状态：否则跳过一次之后，该设备不会再由启动页拦截。
      *
-     * 顺带承担首屏预加载的**启动闸门**：预加载必须等 `/health` 确证在线才能发，
-     * 否则十来个必定失败的请求会自己把 `HealthModule` 的"3 秒内 2 次失败"确证坐实，
-     * 变成开机就报连不上（见 [PreloadCoordinator] 的第 3 条约束）。
+     * 同时承担首屏预加载的**启动闸门**：预加载必须等 `/health` 确证在线后才能发出，
+     * 否则十余个必定失败的请求会使 `HealthModule` 的「3 秒内 2 次失败」确证成立，
+     * 导致启动即报连不上（见 [PreloadCoordinator] 的第 3 条约束）。
      */
     private fun collectConnectivityRecovery() {
         viewModelScope.launch {
@@ -1030,27 +1136,27 @@ class MainViewModel(
         }
     }
 
-    // ── 首屏预加载 + 启动页（2026-09-22）──────────────────────────────────────
+    // ── 首屏预加载 + 启动页 ───────────────────────────────────────────────────
     private val preload by lazy {
         PreloadCoordinator(viewModelScope, dashboard, network, tools)
     }
 
     /** 启动页那行小字与计数的数据源。 */
-    val preloadProgress: StateFlow<PreloadProgress> get() = preload.progress
+    val preloadProgress: StateFlow<PreloadProgress> get() = preload.progress.ui()
 
     /** 启动阶段（探活出结论 → 预加载发完 → 首份数据落地）是否已经走完。 */
     private val _startupPhaseDone = MutableStateFlow(false)
 
     /**
-     * 启动页是否还挡着。
+     * 启动页是否仍处于显示状态。
      *
-     * 两种挡的理由，合并成一个布尔：
-     * 1. **启动阶段没走完** —— 正常的"正在加载"。
-     * 2. **连不上设备** —— 这一条就是原来那个模态弹窗的职责。用户点「先进入应用」
-     *    可以让开（[skipConnectionNotice]），恢复 ONLINE 后自动复位。
+     * 两种显示理由合并为一个布尔：
+     * 1. **启动阶段未完成** —— 正常的「正在加载」。
+     * 2. **连不上设备** —— 承担原模态弹窗的职责。用户选择「先进入应用」后
+     *    可跳过（[skipConnectionNotice]），恢复 ONLINE 后自动复位。
      *
-     * 存在 ViewModel 而不是 Activity 的 `remember`：VM 跨 Activity 重建存活，
-     * 所以旋转屏幕 / 从最近任务回来不会再看一遍启动页（参考实现那边用
+     * 该状态保存在 ViewModel 而不是 Activity 的 `remember`：VM 跨 Activity 重建存活，
+     * 因此旋转屏幕 / 从最近任务返回不会重新显示启动页（参考实现以
      * `hasCompletedFirstRefresh` 达到同样效果）。
      */
     val startupOverlayVisible: StateFlow<Boolean> = combine(
@@ -1066,29 +1172,29 @@ class MainViewModel(
     }.distinctUntilChanged().stateIn(viewModelScope, SharingStarted.Eagerly, true)
 
     /**
-     * 启动阶段的收尾条件。**注意它只负责「加载中」那一态的结束**，
-     * 连不上时页面继续挡着是 [startupOverlayVisible] 那边的事。
+     * 启动阶段的收尾条件。**该条件只负责结束「加载中」状态**，
+     * 连不上时页面继续显示由 [startupOverlayVisible] 负责。
      *
-     * ## 为什么不是"等预加载全部完成"
-     * [PreloadProgress.finished] 只代表所有步骤**已发起**（module 里那些 `loadXxx()` 是
-     * fire-and-forget），此刻回包可能还没落地，放行就会看到一屏骨架。所以再叠一个
-     * **数据就绪**判据：仪表盘拿到 `deviceInfo`（那是全站唯一的骨架屏判据）。
+     * ## 不以「预加载全部完成」为判据
+     * [PreloadProgress.finished] 只代表所有步骤**已发起**（module 中的 `loadXxx()` 为
+     * fire-and-forget），此时回包可能尚未落地，直接放行会显示一屏骨架。因此叠加
+     * **数据就绪**判据：仪表盘已取得 `deviceInfo`（全站唯一的骨架屏判据）。
      *
-     * ## 为什么每条路都必须有终局
-     * 参考实现（UFITOOLS-Widget）在 ViewModel 注释里记过这个坑：拦停既不算成功也不算失败，
-     * 若某条分支静默返回，调用方就无从得知本次刷新已结束，**加载动画会永远停在"请稍候"**。
-     * 这里的三条终局：
+     * ## 每条路径都必须有终局
+     * 拦截操作既不算成功也不算失败；若某条分支静默返回，调用方无法得知本次刷新已结束，
+     * **加载动画会永远停留在「请稍候」**。
+     * 此处有三条终局：
      * 1. 预加载步骤发完 **且** `deviceInfo != null`；
-     * 2. `connectivity` 确证**不可达**（不启动预加载，直接结束"加载中"，
-     *    页面随即切到「连不上」那一态）；
-     * 3. [STARTUP_GATE_TIMEOUT_MS] 兜底 —— 上面两条都没成立也必须收尾。
+     * 2. `connectivity` 确证**不可达**（不启动预加载，直接结束「加载中」，
+     *    页面随即切换到「连不上」状态）；
+     * 3. [STARTUP_GATE_TIMEOUT_MS] 兜底 —— 上述两条均未成立时也必须收尾。
      *
-     * 另有 [STARTUP_GATE_MIN_MS] 最短展示：局域网上预加载可能几百毫秒就完事，
-     * 不设下限的话启动页会"闪一下"，比不显示更难看。
+     * 另有 [STARTUP_GATE_MIN_MS] 最短展示：局域网内预加载可能在几百毫秒内完成，
+     * 不设下限时启动页会一闪而过，观感差于不显示。
      */
     private fun startupGate() {
-        // 重进闸门（切设备）必须先取消上一条：旧协程可能还卡在 8s 超时或最短展示的 delay 上，
-        // 它醒来后那句 `_startupPhaseDone = true` 会把新设备的启动页提前放掉。
+        // 重进闸门（切设备）必须先取消上一条：旧协程可能仍阻塞在 8s 超时或最短展示的 delay 上，
+        // 其恢复后的 `_startupPhaseDone = true` 会提前关闭新设备的启动页。
         startupGateJob?.cancel()
         startupGateJob = viewModelScope.launch {
             val begunAt = SystemClock.elapsedRealtime()

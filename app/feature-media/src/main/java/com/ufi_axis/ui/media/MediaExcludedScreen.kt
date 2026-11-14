@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.media
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -164,9 +165,8 @@ fun MediaExcludedScreen(
         }
     }
 
-    if (confirmRestoreAll) {
         UfiCustomDialog(
-            visible = true,
+            visible = confirmRestoreAll,
             onDismiss = { confirmRestoreAll = false },
             title = "全部恢复",
             confirmButton = {
@@ -198,11 +198,12 @@ fun MediaExcludedScreen(
                 )
             }
         }
-    }
 
-    failure?.let { msg ->
+    val dialogFailure = rememberLastNonNull(failure)
+    if (dialogFailure != null) {
+        val msg = dialogFailure
         UfiCustomDialog(
-            visible = true,
+            visible = failure != null,
             onDismiss = { failure = null },
             title = "恢复失败",
             confirmButton = { UfiButton(text = "知道了", onClick = { failure = null }) }

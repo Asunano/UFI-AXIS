@@ -81,6 +81,13 @@ internal fun MediaAudioList(
             .toList()
     }
     LaunchedEffect(headUrls) {
+        // ★ 2026-11-03（日志实测）：进场转场期间**先不发这批缩略图**。
+        //
+        // 8 张缩略图几乎同时返回（日志里 36KB~358KB 共 7 张挤在 40ms 内），Coil 随即连续
+        // 解码、上传纹理、逐个 item 重组 —— 那一帧实测 49.7ms（掉 3 帧），正好压在进场动画上。
+        // 等转场落定再发：用户先看到占位色块，落定后 1~2 帧内补齐，动画全程干净。
+        // 闸门空闲时 `awaitIdle` 立即返回，稳态零开销。
+        com.ufi_axis_core.util.UiFrameGate.awaitIdle()
         val px = with(thumbDensity) { MEDIA_AUDIO_THUMB_SIZE.roundToPx() }
         UfiAudioCoverPrefetch.thumbs(thumbContext, headUrls, px)
     }

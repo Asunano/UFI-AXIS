@@ -38,6 +38,8 @@ import androidx.compose.ui.unit.dp
 object UfiCardDefaults {
 
     // ═══════ 大卡片（Hero 状态卡） ═══════
+    /** 仪表盘 / 网络页 Hero 共用的最小高度：两页并排切换时卡片总高度一致。 */
+    val heroMinHeight: Dp = 166.dp
     val largeCornerRadius: Dp = Spacing.CornerBase
     val largeShape: RoundedCornerShape
         get() = RoundedCornerShape(largeCornerRadius)

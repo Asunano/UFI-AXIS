@@ -69,7 +69,12 @@ fun UfiConfirmDialog(
     onDismiss: () -> Unit,
     destructive: Boolean = false,
     visible: Boolean = true,
-    icon: Painter? = null
+    icon: Painter? = null,
+    /**
+     * 确认后立刻执行 onConfirm，不等待弹窗离场动画。
+     * 只给"确认即离开当前页面"这类流程用（如远程屏幕退出）；默认仍走统一离场时序。
+     */
+    immediateConfirm: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
     val warning = palette.warning
@@ -90,7 +95,8 @@ fun UfiConfirmDialog(
             confirmColor = if (destructive) warning else palette.accent,   // 原 palette.error(红) → 橙色
             dividerColor = if (destructive) warning.copy(alpha = if (palette.isDark) 0.25f else 0.18f) else null,
             outlineColor = if (destructive) warning else null,
-            outlineTextColor = if (destructive) warning else null
+            outlineTextColor = if (destructive) warning else null,
+            immediateConfirm = immediateConfirm
         )
     }
 }

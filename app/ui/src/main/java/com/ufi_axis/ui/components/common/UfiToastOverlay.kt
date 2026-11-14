@@ -1,11 +1,14 @@
 // [F24] STABLE-UI-API：公共组件签名已冻结。UfiToastOverlay 为平台层单例，
-// 仿 UFITOOLS-Widget 的 ToastUtil，把 Toast 直接 add 到 Activity.decorView（顶层 FrameLayout），
+// 平台层 Toast：卡片视觉对齐 class-schedule 的 AppToastCard（2026-11-10），
 // 彻底脱离 Compose 视图树 —— 因此不会随页面滚动 / NavHost 转场而跟随移动或错位。
 package com.ufi_axis.ui.components.common
 
 import android.app.Activity
 import android.content.Context
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.drawable.GradientDrawable
 import android.os.Handler
 import android.os.Looper
@@ -19,6 +22,7 @@ import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.graphics.Typeface
 import kotlin.math.roundToInt
 import com.ufi_axis.ui.theme.UfiMotion
 
@@ -28,17 +32,21 @@ import com.ufi_axis.ui.theme.UfiMotion
 data class UfiToastColors(
     val cardBg: Int,
     val textPrimary: Int,
+    /** 次级文字色：INFO 的线性图标用它，和 class-schedule 的 ToastIcon 一致。 */
+    val textSecondary: Int,
     val accent: Int,
     val success: Int,
     val error: Int,
     val warning: Int,
+    /** 兼容旧调用方保留；当前 class-schedule 样式不再使用 warningContainer。 */
     val warningContainer: Int,
+    /** 兼容旧调用方保留；Info 描边改用 class-schedule 的黑 16% / 白 31%。 */
     val toastBorder: Int,
     val isDark: Boolean
 )
 
 /**
- * Toast 平台层单例 —— 仿 UFITOOLS-Widget ToastUtil 的水滴下落 Toast。
+ * Toast 平台层单例 —— 水滴下落 + 顶部卡片。
  *
  * 与 Compose Popup 不同，本实现把卡片直接挂到 [Activity.window.decorView]，
  * 完全脱离 Compose 视图树，因此：
@@ -46,9 +54,10 @@ data class UfiToastColors(
  *  - 不拦截点击（独立 FrameLayout，仅卡片区域消费事件，且默认不抢焦点）；
  *  - 调用方（UfiToastHost 外壳）无需关心 Activity / 生命周期，传入 Activity 即可。
  *
- * 视觉完全对齐 UFITOOLS-Widget ToastUtil：
- *  圆角 14dp、1dp 描边、elevation 16、图标 22dp 圆形底色块 + 白色符号、
- *  主文 15sp Bold、副文 13sp 0.55 alpha、WARNING 用底色叠红 + 红描边。
+ * 视觉完全对齐 class-schedule 的 `AppToastCard`：
+ *  14dp 圆角、1dp 描边、22dp 线性图标（无圆形底色）、
+ *  非 Info 用 10% 语气色底 + 55% 语气色描边，Info 用中性卡底 + 黑 16% / 白 31% 描边；
+ *  主文 15sp medium、副文 13sp 0.55 alpha；最多 6 行，整卡点击收起。
  */
 object UfiToastOverlay {
 
@@ -273,21 +282,39 @@ object UfiToastOverlay {
      * 不一致，[popDialogHost] 的相等判据就失真了（要么漏清理、要么误清理）。
      */
     private fun resolveHost(context: Context?): ToastHost? {
-        val topDialog = synchronized(dialogHostWindows) { dialogHostWindows.lastOrNull() }
-        (topDialog?.decorView as? ViewGroup)?.let { return ToastHost(it, topDialog) }
+        // 2026-11-10：只认「还活着」的弹窗。弹窗关闭后 Window 仍可能在栈里停留到
+        // Compose dispose 完成；此时把 toast add 到它的 decor，动画照跑但窗口不可见，
+        // 表现就是"toast 永远不出现"（安装/卸载确认后点确定最容易复现）。
+        synchronized(dialogHostWindows) {
+            val iterator = dialogHostWindows.listIterator(dialogHostWindows.size)
+            while (iterator.hasPrevious()) {
+                val window = iterator.previous()
+                val decor = window.peekDecorView()
+                if (decor == null || !decor.isAttachedToWindow || !decor.isShown ||
+                    decor.windowVisibility != View.VISIBLE || !decor.hasWindowFocus()
+                ) {
+                    iterator.remove()
+                    continue
+                }
+                (decor as? ViewGroup)?.let { return ToastHost(it, window) }
+            }
+        }
         val activity = findActivity(context) ?: return null
         val decor = activity.window.decorView as? ViewGroup ?: return null
         return ToastHost(decor, null)
     }
 
-    // ── 常量（与 ToastUtil 对齐）──
-    private const val TOP_MARGIN_DP = 48
-    private const val MAX_WIDTH_RATIO = 0.82f
-    private val DROP_DURATION: Long = UfiMotion.Duration.Reveal.toLong()
+    // ── 常量（与 class-schedule AppToastCard 对齐）──
+    /** class-schedule 同款：状态栏下 28dp；弹窗窗口自己已让开系统栏，用 0 inset。 */
+    private const val TOP_GAP_DP = 28
+    private const val MAX_WIDTH_RATIO = 0.86f
+    /** class-schedule 同款下落 600ms。 */
+    private const val DROP_DURATION = 600L
     /** 退场 250ms：刻意不在 UfiMotion.Duration 的档位上（Standard 220 与 Gentle 280 之间），本文件是它的唯一来源。 */
     private const val EXIT_DURATION = 250L
     private const val RIPPLE_PUSH_DP = 5f
     private const val RIPPLE_REBOUND_DP = 6f
+    private const val EXIT_LIFT_DP = 8f
 
     /** 沿 ContextWrapper 链向上查找真正的 Activity（兼容 ContextThemeWrapper / Compose Context 包裹）。 */
     private fun findActivity(context: Context?): Activity? {
@@ -337,55 +364,36 @@ object UfiToastOverlay {
         val screenWidth = activity.resources.displayMetrics.widthPixels
         val maxWidth = (screenWidth * MAX_WIDTH_RATIO).toInt()
 
-        val isWarning = type == ToastType.WARNING
-
-        // ── 卡片底色 / 描边 ──
-        val bgColor = if (isWarning) colors.warningContainer else colors.cardBg
-        val borderColor = if (isWarning) {
-            // 警告：红色描边（warning 色 + 0x50 alpha），与 ToastUtil 一致
-            (colors.warning and 0x00FFFFFF) or 0x50000000.toInt()
-        } else {
-            colors.toastBorder
+        // ── class-schedule 同款配色：非 Info 用 10% 语气色底 + 55% 语气色描边 ──
+        val typeColor = when (type) {
+            ToastType.SUCCESS -> colors.success
+            ToastType.ERROR -> colors.error
+            ToastType.WARNING -> colors.warning
+            ToastType.INFO -> colors.textSecondary
         }
-
-        // ── 图标符号 + 圆形底色 ──
-        val (symbol, iconBg) = when (type) {
-            ToastType.SUCCESS -> "✓" to colors.success
-            ToastType.ERROR -> "✕" to colors.error
-            ToastType.WARNING -> "!" to colors.warning
-            ToastType.INFO -> "i" to colors.accent
-        }
+        val tinted = type != ToastType.INFO
+        val bgColor = if (tinted) blend(colors.cardBg, typeColor, 0.10f) else colors.cardBg
+        val borderColor = if (tinted) withAlpha(typeColor, 0.55f) else neutralBorder(colors.isDark)
+        val titleColor = if (tinted) typeColor else colors.textPrimary
 
         val toastView = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(18), dp(14), dp(18), dp(14))
-
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 setColor(bgColor)
                 cornerRadius = 14f * density
                 setStroke(dp(1), borderColor)
             }
-            elevation = 16f
+            elevation = dp(10).toFloat()
 
-            // ── 圆形图标（色块 + 白色符号）──
-            addView(FrameLayout(activity).apply {
+            // 线性图标（不是旧版的圆形色块 + 白符号），与 class-schedule 的 ToastIcon 一致。
+            addView(ToastIconView(activity, type, typeColor).apply {
                 layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.OVAL
-                    setColor(iconBg)
-                }
-                addView(TextView(activity).apply {
-                    gravity = Gravity.CENTER
-                    text = symbol
-                    textSize = 14f
-                    setTextColor(Color.WHITE)
-                    includeFontPadding = false
-                })
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             })
 
-            // ── 文字区域 ──
             addView(LinearLayout(activity).apply {
                 orientation = LinearLayout.VERTICAL
                 layoutParams = LinearLayout.LayoutParams(
@@ -395,9 +403,10 @@ object UfiToastOverlay {
                 addView(TextView(activity).apply {
                     text = title
                     textSize = 15f
-                    paint.isFakeBoldText = true
-                    setTextColor(colors.textPrimary)
+                    typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+                    setTextColor(titleColor)
                     includeFontPadding = false
+                    maxLines = 6
                 })
 
                 if (!subtitle.isNullOrBlank()) {
@@ -407,6 +416,8 @@ object UfiToastOverlay {
                         setTextColor(colors.textPrimary)
                         alpha = 0.55f
                         includeFontPadding = false
+                        maxLines = 6
+                        setLineSpacing(0f, 1.3f)
                         layoutParams = LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.WRAP_CONTENT,
                             ViewGroup.LayoutParams.WRAP_CONTENT
@@ -426,12 +437,15 @@ object UfiToastOverlay {
 
         // 添加到 DecorView（顶层 FrameLayout，Gravity.TOP|CENTER_HORIZONTAL 固定屏幕顶部居中，
         // 彻底脱离 Compose 视图树，不随页面滚动 / 转场移动）
+        // class-schedule：状态栏下 28dp；若挂在弹窗窗口里，窗口已让开系统栏，inset=0。
+        val topInset = if (host.window != null) 0 else statusBarHeightPx(activity)
+        val topMargin = topInset + dp(TOP_GAP_DP)
         val lp = android.widget.FrameLayout.LayoutParams(
             toastWidth,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            topMargin = dp(TOP_MARGIN_DP)
+            this.topMargin = topMargin
         }
         decorView.addView(toastView, lp)
         // 读屏用户：Toast 是挂在 decorView 上的独立浮层，不会自动获得焦点，
@@ -462,14 +476,13 @@ object UfiToastOverlay {
         toastView.addOnAttachStateChangeListener(detachWatcher)
         toastView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
-        // 初始隐藏在屏幕上方
-        val topTarget = dp(TOP_MARGIN_DP).toFloat()
-        toastView.translationY = -toastHeight - topTarget - dp(40).toFloat()
+        // 初始隐藏在屏幕上方；layout 已带 topMargin，所以最终 translationY=0。
+        toastView.translationY = -toastHeight - dp(40).toFloat()
         toastView.alpha = 0f
 
-        // 下落入场（带弹性弹跳）
+        // 下落入场（class-schedule 同款 600ms + Overshoot 1.25）
         toastView.animate()
-            .translationY(topTarget)
+            .translationY(0f)
             .alpha(1f)
             .setDuration(DROP_DURATION)
             .setInterpolator(OvershootInterpolator(1.25f))
@@ -482,6 +495,13 @@ object UfiToastOverlay {
                 exitAndRemove(toastView, decorView, onDismiss)
             }
             toastView.postDelayed(pendingRemoveRunnable, durationMs)
+        }
+
+        // 入场动画期间也允许点掉；放在 postDelayed 之后，点击时能稳妥取消自动移除。
+        toastView.setOnClickListener {
+            pendingRemoveRunnable?.let { runnable -> toastView.removeCallbacks(runnable) }
+            pendingRemoveRunnable = null
+            exitAndRemove(toastView, decorView, onDismiss)
         }
     }
 
@@ -558,7 +578,7 @@ object UfiToastOverlay {
         toast.animate().cancel()
         toast.animate()
             .alpha(0f)
-            .translationYBy(-16f)
+            .translationYBy(-EXIT_LIFT_DP * toast.resources.displayMetrics.density)
             .setDuration(EXIT_DURATION)
             .setInterpolator(AccelerateInterpolator(1.5f))
             .withEndAction {
@@ -575,4 +595,115 @@ object UfiToastOverlay {
             }
             .start()
     }
+
+    // ── class-schedule 同款样式工具 ──
+
+    /** 将 [overlay] 以 [ratio] 混到 [base] 上（alpha 强制不透明，等价 Compose 的 lerp）。 */
+    private fun blend(base: Int, overlay: Int, ratio: Float): Int {
+        val r = ratio.coerceIn(0f, 1f)
+        fun channel(b: Int, o: Int): Int = (b * (1f - r) + o * r).roundToInt().coerceIn(0, 255)
+        return Color.argb(
+            255,
+            channel(Color.red(base), Color.red(overlay)),
+            channel(Color.green(base), Color.green(overlay)),
+            channel(Color.blue(base), Color.blue(overlay)),
+        )
+    }
+
+    private fun withAlpha(color: Int, alpha: Float): Int =
+        (color and 0x00FFFFFF) or ((alpha.coerceIn(0f, 1f) * 255f).roundToInt() shl 24)
+
+    /** 中性提示描边：class-schedule 深色白 31% / 浅色黑 16%。 */
+    private fun neutralBorder(isDark: Boolean): Int =
+        if (isDark) Color.argb(0x4F, 255, 255, 255) else Color.argb(0x29, 0, 0, 0)
+
+    private fun statusBarHeightPx(activity: Activity): Int {
+        val resId = activity.resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resId > 0) {
+            activity.resources.getDimensionPixelSize(resId)
+        } else {
+            (24f * activity.resources.displayMetrics.density).roundToInt()
+        }
+    }
+
+    /**
+     * class-schedule `ToastIcon` 的原生复刻：22dp 线性图标。
+     * success = 对勾；info = 圆圈 + i；warning/error = 圆圈 + 感叹号。
+     */
+    private class ToastIconView(
+        context: Context,
+        private val type: ToastType,
+        private val tint: Int,
+    ) : View(context) {
+        private val density = resources.displayMetrics.density
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+            color = tint
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            val stroke = 1.8f * density
+            val cx = w / 2f
+            val cy = h / 2f
+            val r = minOf(w, h) / 2f - stroke / 2f
+            paint.color = tint
+
+            when (type) {
+                ToastType.SUCCESS -> {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = stroke * 1.4f
+                    val path = Path().apply {
+                        moveTo(w * 0.18f, h * 0.52f)
+                        lineTo(w * 0.42f, h * 0.76f)
+                        lineTo(w * 0.84f, h * 0.26f)
+                    }
+                    canvas.drawPath(path, paint)
+                }
+
+                ToastType.INFO -> {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = stroke
+                    canvas.drawCircle(cx, cy, r, paint)
+                    paint.style = Paint.Style.FILL
+                    canvas.drawCircle(cx, h * 0.32f, stroke * 0.9f, paint)
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = stroke * 1.4f
+                    canvas.drawLine(cx, h * 0.46f, cx, h * 0.72f, paint)
+                }
+
+                // 2026-11-14：WARNING 与 ERROR 原先共用「圆 + 叹号」，只剩颜色区分 ——
+                // 色弱用户与黑白截图里完全分不出来。现在四种形态各不相同：
+                // 对勾 / 圆 i / 三角 ! / 圆 ×。
+                ToastType.WARNING -> {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = stroke
+                    val triangle = Path().apply {
+                        moveTo(cx, h * 0.15f)
+                        lineTo(w * 0.92f, h * 0.84f)
+                        lineTo(w * 0.08f, h * 0.84f)
+                        close()
+                    }
+                    canvas.drawPath(triangle, paint)
+                    paint.strokeWidth = stroke * 1.4f
+                    canvas.drawLine(cx, h * 0.45f, cx, h * 0.63f, paint)
+                    paint.style = Paint.Style.FILL
+                    canvas.drawCircle(cx, h * 0.74f, stroke * 0.9f, paint)
+                }
+
+                ToastType.ERROR -> {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = stroke
+                    canvas.drawCircle(cx, cy, r, paint)
+                    paint.strokeWidth = stroke * 1.4f
+                    canvas.drawLine(w * 0.34f, h * 0.34f, w * 0.66f, h * 0.66f, paint)
+                    canvas.drawLine(w * 0.66f, h * 0.34f, w * 0.34f, h * 0.66f, paint)
+                }
+            }
+        }
+    }
+
 }

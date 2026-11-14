@@ -40,7 +40,10 @@ internal fun networkModeLabel(alias: String): String = NetworkMode.label(alias)
  *    没有固定布局、chip 调用错误」）；
  * ⑦ 制式名放大到 displayMedium、信号评级改 [UfiBadge] 居中、2×2 改 [UfiInfoCell]
  *    上下排（修「频点换行、没有间隔」）；
- * ⑧ 整体间距加宽（用户「太挤了」）。
+ * ⑧ 整体间距加宽（用户「太挤了」）；
+ * ⑨ 2026-11-08：**取消左右两栏**——制式名整行居中、不缩字号（45sp），
+ *    原右栏的 2×2 网格挪到信号质量下方。触发的直接原因是「5G/4G/3G」在半栏里
+ *    被截断；用户明确否决了「自动缩小字号」的方案。
  *
  * ## 数据来源（④ 新增）
  * PCI / 频点 / SINR / RSRQ 全部读 [NetworkState.signalInfo]（`GET /api/device/signal` 的
@@ -143,109 +146,81 @@ fun NetworkModeDialog(
             // 不该在单页私自改。所以这里在 Body 内**自己套一层 Column** 控制块间距，
             // 而不是去改公共组件或给 Body 传参（Body 也没有间距参数）。
             Column(verticalArrangement = Arrangement.spacedBy(Spacing.XLarge)) {
-            // ── 顶部：左「制式名 + 信号强度」，右「网络信息 2×2」──
+            // ── 顶部：制式名 + 信号质量 + 网络信息 ──
             //
-            // 2026-10-10 用户裁决：左右互换（制式在左），四行读数改 2×2 网格，
-            // 制式名字号放大到与 2×2 那一块的上下宽度对齐。
-            //
-            // 为什么左右两边都 weight(1f)：制式名「5G/4G/3G」这类最长文案要能撑住左半，
-            // 而右边 2×2 每格label+值也要够宽 —— 任一边固定宽度都会让另一边挤。
-            Row(
+            // 2026-11-08 用户裁决：制式名不再为了塞进半屏而缩字号，改成**整行居中**；
+            // 右侧的 PCI / 频点 / SINR / RSRQ 2×2 网格挪到「信号质量」下方。
+            // 整行宽度（360dp 机型约 270dp）下 displayMedium 45sp 的「5G/4G/3G」
+            // 也放得下，且不再有左右两栏高度互相牵连的问题。
+            Column(
                 Modifier.fillMaxWidth(),
-                // 2026-10-11 用户「制式和 2×2 信息中间间隔增大一点」：
-                // Medium(8) → **XLarge(16dp)**。这一行是弹窗内唯一的横向分隔，
-                // 8dp 在 displayMedium 大字旁边显得太紧，两栏内容糊成一片。
-                horizontalArrangement = Arrangement.spacedBy(Spacing.XLarge)
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(Spacing.Large)
             ) {
-                // 左：制式名（大字）+ 紧邻其下的信号强度评级
-                Column(
-                    Modifier.weight(1f),
-                    // 居中：制式名 / 信号徽章 / 状态徽章成一列，同一条中轴线。
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    // 2026-10-11 用户「间隔加宽、当前太挤」：块内间距 Small(4) → Large(12)。
-                    verticalArrangement = Arrangement.spacedBy(Spacing.Large)
-                ) {
-                    // 制式名是这个弹窗的主角，用 displaySmall（比 dialogTitle 大两档）。
-                    //
-                    // 2026-10-11「界面错乱、没有固定布局」的另一半根因：原来 maxLines = 2 让
-                    // 「5G/4G/3G」这类长文案折成两行 → 左栏高度随文案长度跳变，
-                    // 与右边**恒为两行**的 2×2 网格对不齐，两栏看起来一高一低。
-                    // 左边是一个"值"、右边是一个固定形状的网格，两者高度必须恒定才对得起来。
-                    //
-                    // 所以 maxLines = 1：代价是极端长文案会被 ellipsis 截断，
-                    // 换来的是**布局恒定** —— 对「当前状态展示区」而言恒定布局优先于完整文案。
-                    // 制式名本身很短（最长「5G/4G/3G」），实际极少触发截断。
-                    // 制式名是这个弹窗的主角。2026-10-11 用户要求"再大一点"：
-                    // displaySmall → **displayMedium**（再上一档）。
-                    // maxLines = 1 + Ellipsis：左边是一个"值"、右边是恒为两行的 2×2 网格，
-                    // 高度必须恒定才对得起来（见本文件 KDoc ⑥）。
-                    Text(
-                        text = modeLabel,
-                        style = MaterialTheme.typography.displayMedium.copy(fontWeight = UfiWeight.Strong),
-                        color = palette.textPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Center
-                    )
-                    // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
-                    // 5G SA 下常为 null，所以**不用它判等级**，只当右侧那格读数展示 ——
-                    // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
-                    //
-                    // 2026-10-11：文字 → 公共 [UfiBadge]，与制式名同列居中。
-                    // 之前是 bodySmall 裸文字，和右边读数同一档、看不出是"状态"；
-                    // badge 有底色和描边，一眼就能和静态读数区分开。
-                    val rsrp = state.signalInfo?.rsrp
+                // 制式名是这个弹窗的主角，displayMedium（45sp），整行居中。
+                // 用户明确要求「不缩小了」，所以不接 TextAutoSize；maxLines = 1 +
+                // Ellipsis 只作为极端窄屏的兜底。
+                Text(
+                    text = modeLabel,
+                    style = MaterialTheme.typography.displayMedium.copy(fontWeight = UfiWeight.Strong),
+                    color = palette.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+                // 信号评级按 **RSRP** 判（那是跨制式都有的主指标）。RSRQ 是 LTE 指标、
+                // 5G SA 下常为 null，所以**不用它判等级**，只当下面网格里的读数展示 ——
+                // 否则会出现"评级来自 RSRP、旁边 RSRQ 却是--"的错配感。
+                //
+                // 2026-10-11：文字 → 公共 [UfiBadge]，与制式名同列居中。
+                // 之前是 bodySmall 裸文字，和读数同一档、看不出是"状态"；
+                // badge 有底色和描边，一眼就能和静态读数区分开。
+                val rsrp = state.signalInfo?.rsrp
+                UfiBadge(
+                    text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
+                    // 徽章色走 [signalBars] 的等级（1..5），**不自己判 dBm 阈值**。
+                    // signalLevelText / signalBars 是唯一分档真源（UfiSignalBars.kt:20-42），
+                    // 那里的 KDoc 明确写了「与外部调用点同源，别分叉」——
+                    // 本轮之前我就在这里手写过一套 -90/-105 的阈值，把「差」错标成 INFO。
+                    type = when (rsrp?.let { signalBars(it) }) {
+                        4, 5 -> UfiBadgeType.SUCCESS
+                        3 -> UfiBadgeType.INFO
+                        else -> UfiBadgeType.WARNING
+                    },
+                    modifier = Modifier.align(Alignment.CenterHorizontally)
+                )
+                if (switching || state.modeSwitchTimedOut) {
                     UfiBadge(
-                        text = if (rsrp == null) "信号未知" else "信号${signalLevelText(rsrp)}",
-                        // 徽章色走 [signalBars] 的等级（1..5），**不自己判 dBm 阈值**。
-                        // signalLevelText / signalBars 是唯一分档真源（UfiSignalBars.kt:20-42），
-                        // 那里的 KDoc 明确写了「与外部调用点同源，别分叉」——
-                        // 本轮之前我就在这里手写过一套 -90/-105 的阈值，把「差」错标成 INFO。
-                        type = when (rsrp?.let { signalBars(it) }) {
-                            4, 5 -> UfiBadgeType.SUCCESS
-                            3 -> UfiBadgeType.INFO
-                            else -> UfiBadgeType.WARNING
-                        },
+                        text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
+                        type = UfiBadgeType.WARNING,
                         modifier = Modifier.align(Alignment.CenterHorizontally)
                     )
-                    if (switching || state.modeSwitchTimedOut) {
-                        UfiBadge(
-                            text = if (state.modeSwitchTimedOut) "尚未完成切换" else "切换中",
-                            type = UfiBadgeType.WARNING,
-                            modifier = Modifier.align(Alignment.CenterHorizontally)
-                        )
-                    }
                 }
-                // 右：PCI / 频点 / SINR / RSRQ —— 2×2 网格
+
+                // ── 网络信息 2×2（信号质量下方，整块居中）──
                 //
-                // 2026-10-11 用 [UfiInfoCell] 而不是 [UfiDialogInfoRow]：
-                // 后者是**左右**分列（Row: 左 label 右 value），格子只有半屏宽时长值
-                // 会被挤进省略号或直接换行（用户报的"频点出现换行"）。而 [UfiInfoCell] 是
-                // **上下**排 —— 标签一行、值一行，值固定 maxLines=1 + Ellipsis。
-                // 它的 KDoc 早就写明了这条取舍：「格子宽度只有半屏时，左右分列会让长值
-                // 立刻被挤进省略号，所以网格里必须上下排」「值换行会把同排另一格顶歪」。
-                // 换句话说：这不是新需求，是公共组件早就为这种网格准备好的形态。
+                // 2026-11-08 用户裁决：从右栏挪到信号质量下方；随后又要求 2×2 也居中。
+                // 这里不直接改公共 [UfiInfoCell]（其它页面仍是左对齐），而是：
+                // 1) 网格整体收窄到 86% 宽，由父 Column 的 CenterHorizontally 居中；
+                // 2) 每个格子用 [CenteredInfoCell] 把 label/value 也居中。
                 Column(
-                    Modifier.weight(1f),
-                    // 行间 Medium(8) → Large(12)（同上，用户反馈太挤）
+                    Modifier.fillMaxWidth(0.86f),
                     verticalArrangement = Arrangement.spacedBy(Spacing.Large)
                 ) {
-                    // 行内横向留 Spacing.Medium：两格都是 weight(1f)，不给间距时
-                    // 「频点」的长值会紧贴右边那格的标签（用户报的"没有间隔"）。
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
                     ) {
-                        UfiInfoCell("PCI", state.signalInfo?.pci?.toString() ?: "--", Modifier.weight(1f))
-                        UfiInfoCell("频点", state.signalInfo?.arfcn?.toString() ?: "--", Modifier.weight(1f))
+                        CenteredInfoCell("PCI", state.signalInfo?.pci?.toString() ?: "--", Modifier.weight(1f))
+                        CenteredInfoCell("频点", state.signalInfo?.arfcn?.toString() ?: "--", Modifier.weight(1f))
                     }
                     Row(
                         Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(Spacing.Medium)
                     ) {
-                        UfiInfoCell("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", Modifier.weight(1f))
-                        UfiInfoCell("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", Modifier.weight(1f))
+                        CenteredInfoCell("SINR", state.signalInfo?.sinr?.let { "$it dB" } ?: "--", Modifier.weight(1f))
+                        CenteredInfoCell("RSRQ", state.signalInfo?.rsrq?.let { "$it dB" } ?: "--", Modifier.weight(1f))
                     }
                 }
             }
@@ -312,4 +287,33 @@ internal fun netModeOf(settings: DeviceSettingsResponse?): String {
     val netSelect = settings?.netSelect?.takeIf { it.isNotBlank() }
     if (netSelect != null) return netSelect
     return settings?.bearerPreference?.takeIf { it.isNotBlank() } ?: NetworkMode.AUTO
+}
+
+/** 网络制式弹窗里的居中读数格：label + value 都居中；不修改公共 UfiInfoCell 的对齐。 */
+@Composable
+private fun CenteredInfoCell(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
+    val palette = LocalResolvedPalette.current
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = label,
+            style = UfiTextStyles.note,
+            color = palette.textSecondary,
+            textAlign = TextAlign.Center
+        )
+        Text(
+            text = value,
+            style = UfiTextStyles.bodyEmphasis,
+            color = palette.textPrimary,
+            textAlign = TextAlign.Center,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
 }

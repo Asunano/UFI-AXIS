@@ -105,7 +105,7 @@ fun MediaImageScreen(
         // 目录入口只留设置页一处（与音乐页一致）：两处都能改会出现"改完这边那边不知道"的错觉
         showDirAction = false,
         actions = {
-            IconButton(onClick = { navController.navigate(Routes.MEDIA_IMAGE_SETTINGS) }) {
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.MEDIA_IMAGE_SETTINGS) }) {
                 Icon(
                     Icons.Default.Settings,
                     contentDescription = "图片设置",

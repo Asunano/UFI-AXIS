@@ -26,6 +26,7 @@ import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「推送渠道」总览页（2026-09-09）。
@@ -100,7 +101,7 @@ fun PushChannelsScreen(viewModel: MainViewModel, navController: NavHostControlle
                     description = "SMTP 发信 · 场景勾选 · 发送记录",
                     value = summarizeMailChannel(mailState.loaded, mailState.config, masterOn),
                     icon = Icons.Default.Email,
-                    onClick = { navController.navigate(Routes.DETAIL_EMAIL_NOTIFY) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_EMAIL_NOTIFY) }
                 )
             }
 
@@ -110,7 +111,7 @@ fun PushChannelsScreen(viewModel: MainViewModel, navController: NavHostControlle
                     description = "Bark / ntfy / 群机器人 / 自建服务，按模板发 HTTP 请求",
                     value = summarizeWebhookChannel(webhookState.loaded, webhookState.config, masterOn),
                     icon = Icons.Default.Http,
-                    onClick = { navController.navigate(Routes.DETAIL_WEBHOOK_NOTIFY) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_WEBHOOK_NOTIFY) }
                 )
             }
 
@@ -121,7 +122,7 @@ fun PushChannelsScreen(viewModel: MainViewModel, navController: NavHostControlle
                     description = "由本机 SIM 发出，会产生短信费用；网络中断或套餐用尽时仍可送达",
                     value = summarizeLocalSmsChannel(localSmsState.loaded, localSmsState.config, masterOn),
                     icon = Icons.Default.Sms,
-                    onClick = { navController.navigate(Routes.DETAIL_LOCAL_SMS_NOTIFY) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_LOCAL_SMS_NOTIFY) }
                 )
             }
 

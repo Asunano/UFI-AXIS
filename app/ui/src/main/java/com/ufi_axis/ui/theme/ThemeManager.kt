@@ -136,6 +136,12 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
     private val _transitionDurationMs: MutableStateFlow<Int> = sharedTransitionDurationMs
     val transitionDurationMs: StateFlow<Int> = _transitionDurationMs.asStateFlow()
 
+    // ── 二级页转场时长（毫秒），与「主界面切换动画」**分开**（2026-11-02 用户要求拆分设置） ──
+    //    主界面那档读 [transitionDurationMs]，二级页这档读本项；两档互不影响。
+    //    冷启动播种优先读自己的键，没有则回落到旧键 —— 老用户不会因为拆分而突然变快/变慢。
+    private val _detailTransitionDurationMs: MutableStateFlow<Int> = sharedDetailTransitionDurationMs
+    val detailTransitionDurationMs: StateFlow<Int> = _detailTransitionDurationMs.asStateFlow()
+
     // ── 过渡模糊开关（默认开启） ──
     //
     // ★★ 2026-09-05：改为**进程内共享** —— 与 [pageTransition] / [transitionDurationMs] 同一病根 ★★
@@ -251,6 +257,10 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
             KEY_PAGE_TRANSITION -> {
                 _pageTransition.value = prefs.getString(KEY_PAGE_TRANSITION, "fade") ?: "fade"
             }
+            KEY_DETAIL_TRANSITION_DURATION_MS -> _detailTransitionDurationMs.value =
+                normalizeTransitionDuration(
+                    prefs.getInt(KEY_DETAIL_TRANSITION_DURATION_MS, TRANSITION_DURATION_DEFAULT_MS)
+                )
             KEY_TRANSITION_DURATION_MS -> _transitionDurationMs.value =
                 normalizeTransitionDuration(
                     prefs.getInt(KEY_TRANSITION_DURATION_MS, TRANSITION_DURATION_DEFAULT_MS)
@@ -300,6 +310,15 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
             if (sharedTransitionDurationMs.value == TRANSITION_DURATION_UNSEEDED) {
                 sharedTransitionDurationMs.value = normalizeTransitionDuration(
                     prefs.getInt(KEY_TRANSITION_DURATION_MS, TRANSITION_DURATION_DEFAULT_MS)
+                )
+            }
+            // 二级页时长：自己的键不存在时**继承旧键**（拆分前的值），避免老用户被重置
+            if (sharedDetailTransitionDurationMs.value == TRANSITION_DURATION_UNSEEDED) {
+                sharedDetailTransitionDurationMs.value = normalizeTransitionDuration(
+                    prefs.getInt(
+                        KEY_DETAIL_TRANSITION_DURATION_MS,
+                        prefs.getInt(KEY_TRANSITION_DURATION_MS, TRANSITION_DURATION_DEFAULT_MS)
+                    )
                 )
             }
             // 模糊开关的播种：Boolean 没有可当哨兵的非法值（true / false 都合法），
@@ -511,6 +530,17 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
     }
 
     /**
+     * 设置**二级页**转场时长（毫秒）。取值口径与 [setTransitionDurationMs] 完全一致
+     * （0 = 关闭二级页转场，其余夹在 150..600）—— 两个开关的意义相同，只是作用对象不同：
+     * 前者管底部 Tab 之间的切换，后者管「进/出二级页」。
+     */
+    fun setDetailTransitionDurationMs(ms: Int) {
+        val clamped = normalizeTransitionDuration(ms)
+        _detailTransitionDurationMs.value = clamped
+        prefs.edit().putInt(KEY_DETAIL_TRANSITION_DURATION_MS, clamped).apply()
+    }
+
+    /**
      * 设置过渡模糊是否启用。
      *
      * `_blurEnabled` 指向进程内共享的 flow（见其声明处），所以这一行写入**立刻**对所有
@@ -718,6 +748,8 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         private const val KEY_THEME_MODE = "ufi_theme_mode"
         private const val KEY_PAGE_TRANSITION = "ufi_page_transition"
         private const val KEY_TRANSITION_DURATION_MS = "ufi_transition_duration_ms"
+        /** 二级页转场时长（与主界面那档分开，2026-11-02） */
+        private const val KEY_DETAIL_TRANSITION_DURATION_MS = "ufi_detail_transition_duration_ms"
         private const val KEY_BLUR_ENABLED = "ufi_blur_enabled"
         // 2026-10-14：二级页转场效果（压暗 / 圆角）。新键，无历史包袱。
         private const val KEY_NAV_SCRIM_ENABLED = "ufi_nav_scrim_enabled"
@@ -791,6 +823,7 @@ class ThemeManager(context: Context, private val observeExternal: Boolean = true
         private val sharedPageTransition = MutableStateFlow("")
         private const val TRANSITION_DURATION_UNSEEDED = -1
         private val sharedTransitionDurationMs = MutableStateFlow(TRANSITION_DURATION_UNSEEDED)
+        private val sharedDetailTransitionDurationMs = MutableStateFlow(TRANSITION_DURATION_UNSEEDED)
 
         // 2026-09-05：过渡模糊开关也并入共享（原先是实例级 flow，正是「改了要杀进程」的成因）。
         //

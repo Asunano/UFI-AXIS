@@ -393,15 +393,13 @@ internal fun MediaLyricsFullView(
                     .clickable { showSource = true }
                     .padding(top = 4.dp, bottom = 4.dp, start = 12.dp, end = 12.dp)
             )
-            if (showSource) {
                 UfiCustomDialog(
-                    visible = true,
+                    visible = showSource,
                     onDismiss = { showSource = false },
                     title = "歌词来源"
                 ) {
                     UfiDialogNote(source)
                 }
-            }
         }
     }
 }

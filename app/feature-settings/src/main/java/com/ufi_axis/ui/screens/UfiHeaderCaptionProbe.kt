@@ -668,6 +668,6 @@ internal fun clampPoem(content: String, budget: Int = POEM_BUDGET): String {
 private val POEM_BREAKS = charArrayOf('，', '。', '；', '！', '？', '、', ',', '.', ';', '!', '?')
 
 // 2026-09-22：`weatherIcon`（WMO code → Material ImageVector）与 `weatherIconTint`
-// （按天气分色的单一 tint）已删除，整体换成 Canvas 自绘的多色图形 —— 见 WeatherGlyph.kt。
+// （按天气分色的单一 tint）已删除，整体换成 Tabler SVG 派生的 VectorDrawable —— 见 WeatherGlyph.kt。
 // 那两个函数只服务于挂件这一个调用点，换掉之后没有任何残留用途。
 

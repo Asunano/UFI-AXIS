@@ -107,31 +107,33 @@ import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 /**
- * 音乐播放页（媒体中心 → 音乐 → 点某一首）。2026-09-16 第二版：对齐参考图 + 接入系统媒体控制。
+ * 音乐播放页（媒体中心 → 音乐 → 点某一首）。
  *
- * ## 版式（照参考图）
+ * ## 版式
  * 顶部左对齐的曲名 / 艺术家 → 大圆角封面 → **封面下方三行歌词**（当前句亮）→ 极细进度条 →
  * 左「已播」右「总时长」→ 三个大图标 → 底部一排次要动作。点歌词区进**整屏歌词**（当前句放大、
  * 自动滚动），再点回封面。
  *
- * 与第一版的三处修正（都是用户实测反馈）：
- * 1. 封面用 `/api/media/cover`（原始内嵌封面）而不是 256px 缩略图 —— 260dp 的框喂 256px 必糊；
- * 2. 暂停时封面只缩到 [AUDIO_COVER_PAUSED_SCALE]（0.96），不是 0.88 —— 原来幅度大得像在抖；
- * 3. 右侧时间显示**总时长**，不是负的剩余时间（参考图就是总时长）。
+ * 以下三项为版式与资源的硬性取舍：
+ * 1. 封面使用 `/api/media/cover`（原始内嵌封面）而非 256px 缩略图：260dp 的容器使用
+ *    256px 缩略图会明显模糊；
+ * 2. 暂停时封面仅缩到 [AUDIO_COVER_PAUSED_SCALE]（0.96），不取 0.88：幅度过大会产生抖动感；
+ * 3. 右侧时间显示**总时长**，而非负的剩余时间。
  *
  * ## 播放器不在这一页里
- * 播放交给 [UfiAudioPlaybackService]（MediaSession 前台服务），本页只是它的一个**遥控器**
+ * 播放交给 [UfiAudioPlaybackService]（MediaSession 前台服务），本页仅作为其**控制界面**
  * （[rememberUfiAudioController]）。所以：锁屏 / 通知栏 / 快捷设置里有真的媒体控制，耳机暂停键
- * 也能用，退出这一页音乐不会断。控制器连接是异步的，没连上时显示加载 —— 不画一套点不动的按钮。
+ * 也能用，退出这一页音乐不会中断。控制器连接是异步的，未连接时显示加载状态，
+ * 不呈现不可操作的按钮。
  *
  * ## 底部一排只放**真有能力**的动作
  * 循环模式（关 / 列表 / 单曲）、随机、播放队列 —— 全部是播放器自带能力。参考图里的定时关闭、
  * 音效、更多没有对应能力，所以不摆图标。
  *
- * ## 破例说明：进度条是自绘的，没用 UfiSlider
+ * ## 进度条为自绘实现，未使用 UfiSlider
  * `UfiSlider` 是"设置项里的滑块"（有标签、明显滑块、44dp 触控区），这里要的是"平时极细、
  * 按住变粗、没有滑块"。形态诉求冲突，所以在本模块内自绘（[MediaSeekBar]），颜色全部走令牌，
- * 且不放进 `app/ui` 公共组件 —— 破例范围仅限媒体中心。
+ * 且不放入 `app/ui` 公共组件 —— 例外范围仅限媒体中心。
  */
 @Composable
 fun MediaAudioPlayerScreen(
@@ -139,9 +141,9 @@ fun MediaAudioPlayerScreen(
     navController: NavHostController,
     filePath: String,
     /**
-     * 播放范围（2026-09-21）。由路由带进来。
+     * 播放范围，由路由传入。
      *
-     * **空串 = 没指定范围**，不是整库：迷你条 / 标题栏挂件 / 通知栏深链接只知道"正在播这首歌"，
+     * **空串表示未指定范围**，而非整库：迷你条 / 标题栏挂件 / 通知栏深链接只知道「正在播这首歌」，
      * 不知道当前队列是按歌单还是专辑装的，所以它们不带这两个参数，本页收到空值时
      * **沿用现有队列**（见装队列 effect 的第一条分支）。
      * 「全部」页点歌会显式带 `scope=all`，那才是"请按整库重建队列"。
@@ -150,27 +152,27 @@ fun MediaAudioPlayerScreen(
     scopeKind: String? = null,
     scopeKey: String? = null,
     /**
-     * 顶栏返回键的动作（2026-10-14 新增，默认 null = 走页壳默认的 `popBackStack`）。
+     * 顶栏返回键的动作（默认 null = 使用页壳默认的 `popBackStack`）。
      *
      * 音乐页的「上滑跟手面板」把这一页直接装进页内浮层（见 MediaAudioRisePanel.kt），
-     * 那时它**不是**一个导航目的地，按返回该关面板而不是把音乐页弹掉，所以由宿主传进来。
+     * 此时它**不是**导航目的地，返回操作应关闭面板而非弹出音乐页，因此由宿主传入。
      * 系统返回键不经过这里，由宿主自己加 `BackHandler` —— 这是页壳 KDoc 里记着的分工。
      */
     onBack: (() -> Unit)? = null,
     /**
-     * 是否挂共享元素（2026-10-14 新增，默认 true）。
+     * 是否启用共享元素（默认 true）。
      *
-     * 页内浮层那条路径传 `false`：面板与迷你条同处一棵树，同一个 key 在同一帧出现两次
-     * 正是 `UfiSharedTransition.kt` 记下的禁区；而且那条路径本来就是"整块面板升起"，
-     * 没有跨页面可言。走导航的那条路径一个字节都没变。
+     * 页内浮层路径传入 `false`：面板与迷你条同处一棵树，同一个 key 在同一帧出现两次
+     * 属于 `UfiSharedTransition.kt` 记录的禁用情形；且该路径本身是「整块面板升起」，
+     * 不存在跨页面转场。导航路径的行为不变。
      */
     shareElements: Boolean = true,
     /**
-     * 封面是否"跟着手指从迷你条飞过来"（2026-10-14 新增，默认 false）。
+     * 封面是否跟随手势从迷你条飞入（默认 false）。
      *
-     * 只有页内浮层那条路径传 true（见 [MediaAudioRisePanel]）：共享元素那套在页内用不了
+     * 仅页内浮层路径传入 true（见 [MediaAudioRisePanel]）：共享元素机制不适用于页内浮层
      * （同一棵树里同一个 key 不能出现两次，而且它的进度由导航转场驱动、不跟手指），
-     * 所以封面改由覆盖层里那张"飞行封面"顶着（[UfiRiseFlyingCover]），这一页只报出槽位
+     * 因此封面改由覆盖层中的「飞行封面」承担（[UfiRiseFlyingCover]），本页仅上报槽位
      * 并在飞行期间把自己藏起来（见 [ufiRiseCoverSlot]）。与 [shareElements] 互斥。
      */
     riseFollow: Boolean = false
@@ -184,16 +186,16 @@ fun MediaAudioPlayerScreen(
      * `null` = 路由**没指定**范围（迷你条 / 标题栏挂件 / 通知栏进来的），
      * 此时队列一律沿用播放器里现有的那份，详见装队列 effect 的第一条分支。
      *
-     * ## 为什么不再用 `state.tab(MEDIA_TYPE_AUDIO).items`（2026-09-21 改）
+     * ## 不使用 `state.tab(MEDIA_TYPE_AUDIO).items` 作为队列
      *
-     * 那是「全部」页的**第一页**（100 首）。用它当队列会同时制造三个问题：
-     *  1. 从专辑/歌手/文件夹点歌，队列仍是整库 —— 「只播这个歌手」根本做不到，
-     *     「下一首」跑去整库的下一首，shuffle 在整库里随机；
-     *  2. 点的歌不在前 100 条内时 `indexOf` 返回 -1，旧代码 `?: 0` 兜成 0，
-     *     **播的是整库第一首**（点第 300 首播第 1 首），UI 也跟着显示错的；
-     *  3. 专辑超过 100 首时，第 101 首之后进不了队列，「下一首」会在第 100 首处停下。
+     * 该状态是「全部」页的**第一页**（100 首）。以它作为队列会同时产生三个问题：
+     *  1. 从专辑/歌手/文件夹点歌时队列仍是整库，「只播这个歌手」无法实现；
+     *     「下一首」会切到整库中的下一首，shuffle 也在整库范围内随机；
+     *  2. 点的歌不在前 100 条内时 `indexOf` 返回 -1，若回退为 0，则**播放整库第一首**
+     *     （点第 300 首却播第 1 首），UI 也显示错误；
+     *  3. 专辑超过 100 首时，第 101 首之后无法进入队列，「下一首」会在第 100 首处停止。
      *
-     * 现在按作用域一次性拉齐（[MediaModule.queueItemsOf]），队列 = 这个范围的全集。
+     * 因此按作用域一次性加载完整队列（[MediaModule.queueItemsOf]），队列即该范围的全集。
      */
     val queueScope = remember(scopeKind, scopeKey) { AudioQueueScope.of(scopeKind, scopeKey) }
     var tracks by remember { mutableStateOf<List<MediaLibraryItem>>(emptyList()) }
@@ -210,16 +212,15 @@ fun MediaAudioPlayerScreen(
 
 
     /*
-     * 控制器：**优先复用 App 壳里那个常驻探针已经连好的那一份**（`UfiNowPlayingState`）。
+     * 控制器：**优先复用 App 壳中常驻探针已建立的那一份**（`UfiNowPlayingState`）。
      *
-     * 2026-10-20（修「刚上滑时画面突然变一下」）：页内面板是"第一下拖动才进组合"的。
-     * 这一页如果在这里再开一条 `MediaController` 连接，面板的头几帧只能是"正在连接播放服务…"
-     * 那个加载态，等 binder 回来才换成真内容 —— 用户看到的正是"上滑刚起步、画面突然变一下"。
-     * 探针在 `MainActivity` 顶层一直连着（迷你条之所以能显示，就是因为它已经在播），
-     * 直接复用就能**第一帧就有内容**：封面槽、歌词、队列都不必再等一次往返。
+     * 页内面板在第一下拖动时才进入组合。若本页在此另开一条 `MediaController` 连接，
+     * 面板的头几帧只能是「正在连接播放服务…」加载态，待 binder 返回后才换成真实内容，
+     * 表现为上滑刚起步时画面突然变化。探针在 `MainActivity` 顶层持续连接（迷你条能够显示，
+     * 即因为它已在播放），直接复用可在**第一帧就有内容**：封面槽、歌词、队列均无需等待往返。
      *
-     * 只有探针还没连上（App 极早期 / 探针被销毁）时才自己连，行为与从前一致。
-     * 生命周期不变：这里只加/摘监听，**不释放**共享的那一份。
+     * 仅当探针尚未连接（App 极早期 / 探针被销毁）时才自行连接，行为与既有实现一致。
+     * 生命周期不变：此处只添加/移除监听，**不释放**共享实例。
      */
     val sharedController = UfiNowPlayingState.controller.value
     val ownController = if (sharedController == null) rememberUfiAudioController() else null
@@ -227,11 +228,11 @@ fun MediaAudioPlayerScreen(
 
     var currentIndex by remember { mutableIntStateOf(-1) }
     /*
-     * 初值直接问一次控制器（2026-10-20）。
+     * 初值直接向控制器查询一次。
      *
-     * 原来恒从 false 起步：播放态下第一帧会按"暂停"画封面（0.96 缩放），等队列 effect
-     * 回读完才长回 1.0 —— 时间点正好压在「上滑完成、真封面接手」那一刻，看起来就是
-     * "封面到位之后又缩/弹一下"。现在第一帧就是真实播放态，暂停态也直接是 0.96。
+     * 若恒从 false 起步，播放态下第一帧会按「暂停」绘制封面（0.96 缩放），待队列 effect
+     * 回读后才恢复 1.0；该时间点恰在「上滑完成、真封面接手」时，表现为封面到位后又缩放一次。
+     * 现在第一帧即为真实播放态，暂停态直接为 0.96。
      */
     var isPlaying by remember { mutableStateOf(controller?.ufiPlayIntent() == true) }
     var positionMs by remember { mutableLongStateOf(0L) }
@@ -244,7 +245,7 @@ fun MediaAudioPlayerScreen(
     val seekState = rememberMediaSeekState()
 
     var showQueue by remember { mutableStateOf(false) }
-    /** 「定时关闭」设置弹窗（2026-10-14）。定时本身的状态在进程级单例里，见 MediaSleepTimer.kt。 */
+    /** 「定时关闭」设置弹窗。定时状态在进程级单例中维护，见 MediaSleepTimer.kt。 */
     var showSleepTimer by remember { mutableStateOf(false) }
 
     /** 「加入歌单」面板的目标曲目。null = 面板不显示（见本文件末尾的 MediaAddToPlaylistHost）。 */
@@ -264,9 +265,10 @@ fun MediaAudioPlayerScreen(
     /**
      * 播放器给出的**当前曲目元信息**（内嵌 ID3 / FLAC 标签解析结果）。
      *
-     * 曲名与歌手只能从这里来：媒体库那份记录只有文件名（`带我走-杨丞琳.flac` 这种），
-     * 而 `MediaStore` 的 artist 在不少 FLAC 上是空的。播放器解容器时会读出真标签，
-     * 通过 [Player.Listener.onMediaMetadataChanged] 送来 —— 这也是通知栏/锁屏显示的同一份。
+     * 媒体库记录只有文件名（如 `曲名-歌手.flac`），且 `MediaStore` 的 artist 在部分 FLAC
+     * 上为空。播放器解析容器时会读出真实标签，经 [Player.Listener.onMediaMetadataChanged]
+     * 送达，这也是通知栏/锁屏显示的同一份数据；它是曲名/歌手取值链的一级
+     * （见 [title] / [artist]）。
      */
     var trackMeta by remember { mutableStateOf<MediaMetadata?>(null) }
 
@@ -289,13 +291,12 @@ fun MediaAudioPlayerScreen(
     /**
      * 单曲兜底队列项。
      *
-     * 封面**能查到就给**：迷你条与标题栏挂件读的是队列项的 `artworkUri`（见
-     * `UfiAudioNowPlayingProbe`），给 null 的那一版会让那两处只剩一个占位音符 ——
-     * 而播放页自己是按 `MediaLibraryItem.id` 查封面的，所以这一屏看不出问题，
-     * bug 就是这么溜过去的（2026-09-23）。
+     * 封面**能查到就提供**：迷你条与标题栏挂件读取队列项的 `artworkUri`（见
+     * `UfiAudioNowPlayingProbe`），若给 null，这两处只显示占位音符；而播放页自身按
+     * `MediaLibraryItem.id` 查封面，因此本屏无法暴露该问题。
      *
-     * 查不到（这首歌不在当前范围里）才只能给 null：cover 接口只认 MediaStore 的 id，
-     * 光有路径拼不出 URL。
+     * 仅当查不到（该曲目不在当前范围）时才给 null：cover 接口只接受 MediaStore id，
+     * 仅凭路径无法拼出 URL。
      */
     val fallbackTrack: (String) -> UfiAudioTrack = { p ->
         UfiAudioTrack(
@@ -309,26 +310,26 @@ fun MediaAudioPlayerScreen(
      * 装队列。
      *
      * ## 两条规则
-     * 1. **路由指定哪一首，就从 0 播哪一首**（2026-09-19）。[filePath] 在 effect key 里，
-     *    每次路由换歌都重跑；跳转一律 `seekTo(index, 0L)` 而不是 `seekToDefaultPosition`。
-     * 2. **同作用域才复用队列，换作用域就整体重装**（2026-09-21）。作用域记在
-     *    [AudioQueueOwner]（进程内，不随页面销毁丢失）—— 从 A 目录切到 B 目录时，
-     *    队列必须整体换成 B 的，否则「下一首」还会跑回 A。
+     * 1. **路由指定哪一首，就从 0 播哪一首**。[filePath] 在 effect key 中，
+     *    每次路由换歌都重跑；跳转一律使用 `seekTo(index, 0L)`，不使用 `seekToDefaultPosition`。
+     * 2. **同作用域才复用队列，换作用域则整体重装**。作用域记录在
+     *    [AudioQueueOwner]（进程内，不随页面销毁丢失）：从 A 目录切到 B 目录时，
+     *    队列必须整体替换为 B，否则「下一首」仍会回到 A 范围。
      *
      * 分支：
-     *  · 范围还没拉齐 → **什么都不做**。宁可等一下，也不要先装个半截队列再重装（会听到重新开始）；
-     *  · **路由没带范围**（[queueScope] 为 null）→ 沿用播放器里现有的队列，只跳到这一首。
-     *    迷你条 / 标题栏挂件 / 通知栏就走这条：它们只知道"正在播这首歌"，不知道队列是按
-     *    歌单还是专辑装的，没有资格要求重建。少了这条分支，从歌单「播放全部」之后再从挂件
-     *    点回播放页，队列会被静默重装成整库 —— 歌还是那首，但「下一首」已经跑出歌单了
-     *    （2026-09-21 实测到的 bug）；
-     *  · 这首歌不在范围内 → 装单曲队列。**绝不用索引 0 兜底**：那会播成别的歌（旧版的 bug）。
-     *    同时清掉 owner —— 这个队列不代表任何作用域，下次进来必须重装；
-     *  · 同作用域且队列内容一致 → 只跳到路由那一首；
-     *  · 其余（换作用域 / 换排序 / 首次进页）→ 整体重装，从路由那一首开始。
+     *  · 范围尚未加载完成 → **不做任何操作**。不得先装入半截队列再重装（会重新开始播放）；
+     *  · **路由未带范围**（[queueScope] 为 null）→ 沿用播放器现有队列，仅跳到这一首。
+     *    迷你条 / 标题栏挂件 / 通知栏走此分支：它们只知道「正在播这首歌」，不知道队列按
+     *    歌单还是专辑组织，不应要求重建。若缺少该分支，从歌单「播放全部」后再从挂件
+     *    返回播放页，队列会被静默重装为整库：歌曲不变，但「下一首」已超出歌单范围；
+     *  · 这首歌不在范围内 → 装入单曲队列。**不得以索引 0 兜底**：那会播放成其他歌曲。
+     *    同时清除 owner：该队列不代表任何作用域，下次进入必须重装；
+     *  · 同作用域且队列内容一致 → 仅跳到路由指定的曲目；
+     *  · 其余情况（换作用域 / 换排序 / 首次进页）→ 整体重装，从路由指定的曲目开始。
      *
      * 最后无条件回读播放器状态：media3 的 [Player.Listener] 只在**变化**时回调，不补发当前值。
-     * 少这一步，页面在"服务已经在播"的情况下会显示暂停图标、循环/随机显示关 —— 那就是假状态。
+     * 缺少此步骤时，页面在「服务已在播放」的情况下会显示暂停图标、循环/随机显示关闭，
+     * 即呈现错误状态。
      */
     LaunchedEffect(controller, tracks, scopeLoaded, filePath, queueScope) {
         val c = controller ?: return@LaunchedEffect
@@ -356,24 +357,23 @@ fun MediaAudioPlayerScreen(
             }
 
             /*
-             * 用户手工改过队列（插入 / 移除 / 重排）、还在同一个作用域、**而且路由那一首就在
-             * 这个队列里** → 只跳过去，绝不重装。
+             * 用户手工修改过队列（插入 / 移除 / 重排）、仍在同一作用域、**且路由指定的曲目
+             * 就在该队列中** → 仅跳转，不重装。
              *
-             * 这一条是「虚拟播放列表」能不能存在的前提。下面 `loaded == paths` 那条判据
-             * 比的是"队列内容与作用域推导出的列表逐项相等"，而：
-             * · 拖拽排过序 → 顺序不同，不相等；
-             * · 「下一首播放」插进来的歌**很可能根本不在这个作用域里**（从专辑 A 插一首专辑 B 的）
-             *   → 永远不可能相等。
-             * 少了这条分支，每次回到播放页都会全量重装一次，用户排的顺序当场消失。
+             * 这是「虚拟播放列表」存在的前提。下文的 `loaded == paths` 比较的是「队列内容与
+             * 作用域推导出的列表逐项相等」，而：
+             * · 拖拽排序后顺序不同，不相等；
+             * · 「下一首播放」插入的曲目可能不在该作用域内（从专辑 A 插入专辑 B 的曲目），
+             *   永远不可能相等。
+             * 若缺少该分支，每次返回播放页都会全量重装，用户排序立即丢失。
              *
-             * ## `loaded.contains(filePath)` 这个条件是后补的（2026-09-23 修「播放队列完全错误」）
-             * 原来这里只判"同作用域 + 改过 + 队列非空"，队列里没有路由那一首时**什么都不做**，
-             * 理由写的是"保留用户排的队列更重要"。那个理由错了：
-             * 从列表点一首歌是**明确的指令**（"放这首"），而当时的表现是点下去毫无反应 ——
-             * 播放器还在放旧队列（重启后恢复的那份可能只剩几首），页面却显示着新点的歌，
-             * 「下一首」因为旧队列已到底而变灰，循环模式看起来也全乱。
-             * 现在这种情况直接落到下面的重装分支：用户既然点了整库/专辑里的一首，
-             * 那就按那个范围重建队列 —— 自定义顺序只在"点的是队列里的歌"时才需要保住。
+             * ## `loaded.contains(filePath)` 的附加条件
+             * 若只判断「同作用域 + 已修改 + 队列非空」，队列中不含路由曲目时不做任何操作，
+             * 依据是「保留用户排序更重要」。该判断不成立：从列表点歌是**明确指令**（「播放这首」），
+             * 而不作反应会使播放器继续播放旧队列（重启后恢复的队列可能仅剩几首），页面却显示
+             * 新点的歌曲；「下一首」因旧队列到底而置灰，循环模式也显示异常。
+             * 因此该情况落入下文的重装分支：用户点选了整库/专辑中的曲目，即按该范围重建队列；
+             * 自定义顺序仅在「点选队列内曲目」时需要保留。
              */
             sameScope && AudioQueueOwner.isUserEdited() && loaded.contains(filePath) -> {
                 val inQueue = loaded.indexOf(filePath)
@@ -424,15 +424,14 @@ fun MediaAudioPlayerScreen(
             }
 
             /*
-             * 播放/暂停图标读的是**播放意图**（[Player.ufiPlayIntent]），不是 `isPlaying`。
+             * 播放/暂停图标读取**播放意图**（[Player.ufiPlayIntent]），而非 `isPlaying`。
              *
-             * 2026-09-22 修「切歌时播放键抽搐」：`Player.isPlaying` 的定义是
-             * `playWhenReady && playbackState == READY && 没有被抑制`。切歌那一下
-             * playbackState 会掉进 **BUFFERING** 再回 READY，于是 isPlaying 短暂变 false ——
-             * 图标先翻成"播放"（= 显示为已暂停）再翻回来，而音频一秒都没停。
+             * `Player.isPlaying` 的定义是 `playWhenReady && playbackState == READY && 未被抑制`。
+             * 切歌时 playbackState 会进入 **BUFFERING** 再回到 READY，isPlaying 因此短暂为 false：
+             * 图标先翻转为「播放」（显示为已暂停）再翻回，而音频并未中断。
              *
-             * 所以这里既订阅 onIsPlayingChanged（缓冲结束、焦点恢复这类真实变化），
-             * 也订阅 onPlayWhenReadyChanged（用户点了播放/暂停），两边都重算同一个意图值。
+             * 因此同时订阅 onIsPlayingChanged（缓冲结束、焦点恢复等真实变化）
+             * 与 onPlayWhenReadyChanged（用户播放/暂停操作），两者均重算同一意图值。
              */
             override fun onIsPlayingChanged(playing: Boolean) {
                 isPlaying = c.ufiPlayIntent()
@@ -478,28 +477,27 @@ fun MediaAudioPlayerScreen(
     /*
      * 当前是第几首。
      *
-     * [currentIndex] 初值是 -1（"还没从播放器回读过"），这时用路由带来的那一首 —— 直接写 0
-     * 会让页面在回读之前的那一帧显示**列表第一首**的曲名与封面，而用户点的是另一首。
+     * [currentIndex] 初值为 -1（尚未从播放器回读），此时使用路由指定的曲目：若直接写 0，
+     * 页面会在回读前的帧显示**列表第一首**的曲名与封面，而用户点选的是另一首。
      *
-     * 2026-09-21：去掉 `coerceAtLeast(0)`。路由这首不在当前范围里时（比如从通知栏深链接
-     * 进来、而范围已经换了），indexOf 是 -1，钳到 0 就会显示**范围里第一首**的曲名/封面/歌词，
-     * 而实际在播的是路由那一首 —— 显示与播放不是同一首歌。`getOrNull(-1)` 回 null，
-     * 下游的 `current?.path ?: filePath` 会正确降级到路由那一首。
+     * 不使用 `coerceAtLeast(0)`：路由曲目不在当前范围时（如从通知栏深链接进入且范围已更换），
+     * indexOf 为 -1，钳到 0 会显示**范围内第一首**的曲名/封面/歌词，而实际播放的是路由曲目，
+     * 造成显示与播放不一致。`getOrNull(-1)` 返回 null，下游 `current?.path ?: filePath`
+     * 会正确降级到路由曲目。
      */
     val resolvedIndex = if (currentIndex >= 0) currentIndex else paths.indexOf(filePath)
     /*
-     * 2026-10-07 修「排序后播放与显示彻底错乱」：
+     * 以 **timeline 为权威**取当前曲目。
      *
-     * 原来这里直接 `tracks.getOrNull(resolvedIndex)` —— 把**播放器 timeline 的下标**当
-     * **浏览列表的下标**用。两者只有在"队列刚按作用域原样装入"时才恰好相等；用户在队列
-     * 面板 ↑↓ 排序之后（或「下一首播放」插过歌），timeline 的顺序就与 `tracks` 分道扬镳，
-     * 而 `currentIndex` 仍随播放推进在 timeline 里走 —— 于是 `current` 取出来是另一首歌：
-     * 曲名、封面、歌词、标签全都显示成错的，看起来就是"播放的歌曲与显示的不一致"、
-     * "点列表的歌播了别的歌"（点歌本身播对了，是这页顶部显示错了）。
+     * 若直接 `tracks.getOrNull(resolvedIndex)`，即把**播放器 timeline 下标**当作
+     * **浏览列表下标**。两者仅在「队列刚按作用域原样装入」时相等；用户在队列面板排序后
+     * （或「下一首播放」插入曲目后），timeline 顺序与 `tracks` 分离，而 `currentIndex`
+     * 仍随播放推进在 timeline 中移动，于是 `current` 取到另一首歌曲：曲名、封面、歌词、
+     * 标签全部错误，表现为「播放的歌曲与显示不一致」「点列表的歌却显示别的歌」。
      *
-     * 现在以 **timeline 为权威**：当前项 = `queueIds[currentIndex]`（mediaId = 路径），
-     * 元信息去 `trackByPath` 按路径查。顺序怎么排都错不了；查不到（单曲兜底那首不在
-     * 浏览范围内）降级到路由那一首，行为与旧版的"查不到显示文件名"一致。
+     * 因此当前项取 `queueIds[currentIndex]`（mediaId = 路径），元信息经 `trackByPath`
+     * 按路径查询，与排序无关；查不到（单曲兜底曲目不在浏览范围内）时降级到路由曲目，
+     * 行为与「查不到显示文件名」的既有实现一致。
      */
     val playingPath = queueIds.getOrNull(currentIndex) ?: filePath
     val current = trackByPath[playingPath]
@@ -517,20 +515,20 @@ fun MediaAudioPlayerScreen(
     val trackAnimKey = current?.id ?: -1L
 
     /**
-     * 封面预取（2026-09-22 修「播到没加载过的歌时先闪一下白底」）。
+     * 封面预取。
      *
-     * ## 为什么是"前后各 [UfiAudioCoverPrefetch.QUEUE_WINDOW] 首"而不是整队列
-     * `/api/media/cover` 是**按需解析**的：core 每次要去读文件、把内嵌封面抽出来。
-     * 而 `MediaLibraryItem` 里**没有任何"这首有没有封面"的标志**（全仓只有 web 端两个
-     * 局部派生的 `hasCover`，不是接口字段）—— 也就是说预取整队列就是对每一首都发一次
-     * 解析请求，**没封面的那些也照样占一次往返**。队列可以是几百首，那会把 Coil 的请求
-     * 队列和 core 的文件 IO 一起灌满，反过来拖慢用户真正在看的这一张。
+     * ## 为什么只预取前后各 [UfiAudioCoverPrefetch.QUEUE_WINDOW] 首而非整个队列
+     * `/api/media/cover` 是**按需解析**的：core 每次需读取文件并抽取内嵌封面。
+     * 而 `MediaLibraryItem` 中**没有「该曲目是否有封面」的标志**（仅有 web 端两处
+     * 局部派生的 `hasCover`，并非接口字段），因此预取整个队列等于对每首曲目各发一次
+     * 解析请求，无封面的曲目同样占用一次往返。队列可达数百首，会使 Coil 的请求队列
+     * 与 core 的文件 IO 同时饱和，反而拖慢当前显示的封面。
      *
-     * 窗口取 3（2026-10-21 由 2 提到 3）覆盖"连点几下下一首"与自动续播；再大就要先让
-     * core 在列表接口里带上 hasCover，才能只对真有封面的那些发请求。
+     * 窗口取 3，覆盖「连续点击下一首」与自动续播；若需更大窗口，应先由 core 在列表接口中
+     * 提供 `hasCover`，以便只对确实有封面的曲目发请求。
      *
-     * 具体的请求构造（尺寸、内存缓存键）收在 [UfiAudioCoverPrefetch] 里 —— 它和列表首屏
-     * 那条预取是同一套口径，散在两边写迟早走样。
+     * 请求构造（尺寸、内存缓存键）收敛在 [UfiAudioCoverPrefetch] 中：与列表首屏的预取
+     * 使用同一套口径，分散实现会导致口径漂移。
      */
     val coverContext = LocalPlatformContext.current
     val coverDensity = LocalDensity.current
@@ -542,8 +540,8 @@ fun MediaAudioPlayerScreen(
      */
     val coverPx = with(coverDensity) { AUDIO_COVER_SIZE.roundToPx() }
     LaunchedEffect(playingPath, tracks) {
-        // 2026-10-07：预取邻居改为**按 timeline 顺序**找（与 current 的修法同一口径）。
-        // 原来按 tracks 下标取邻居，排序后取到的是"显示顺序的邻居"而不是"接下来要播的"。
+        // 预取邻居必须**按 timeline 顺序**查找（与 current 的取法同一口径）。
+        // 按 `tracks` 下标取邻居会在排序后取到「显示顺序的邻居」，而非「接下来要播的曲目」。
         val pos = queueIds.indexOf(playingPath)
         if (pos < 0) return@LaunchedEffect
         val window = UfiAudioCoverPrefetch.QUEUE_WINDOW
@@ -559,36 +557,36 @@ fun MediaAudioPlayerScreen(
 
 
     /*
-     * 音乐**不做播放进度记忆**（2026-09-19 去掉）。
+     * 音乐**不做播放进度记忆**。
      *
-     * 之前这里会按 `MediaPlaybackProgress` 的存档 seek 回上次离开的位置，于是
-     * "播 A → 播 B → 再点 A"时 A 从中段接着放 —— 点一首歌就是要听这首歌，续播是视频的
-     * 需求（一集看到一半），不是音乐的。存档与续播留给视频播放页（[MediaVideoPlayerScreen]）。
+     * 若按 `MediaPlaybackProgress` 的存档 seek 回上次位置，「播 A → 播 B → 再点 A」时 A 会
+     * 从中段继续播放。点选一首歌即期望完整播放；续播属于视频场景（如剧集中途），
+     * 不适用于音乐。存档与续播由视频播放页承担（[MediaVideoPlayerScreen]）。
      *
-     * [prefs] 仍要留着：歌词与封面的接口客户端都从它拿设备凭据。
+     * [prefs] 仍需保留：歌词与封面的接口客户端均从它获取设备凭据。
      */
     val context = LocalContext.current
     val prefs = remember(context) { AppPreferences(context) }
     val currentPath = current?.path ?: filePath
 
     /*
-     * 封面 URL：列表还没拉到时**先用探针那一条**（2026-10-20）。
+     * 封面 URL：列表尚未加载时**先使用探针提供的 URL**。
      *
-     * `current` 来自异步拉的 `tracks`（打开一次面板就是一次拉取），所以这一页的头几帧
-     * `current` 是 null —— 此前封面那张 AsyncImage 整块不组合，框里只剩 `surfaceMuted`
-     * （浅色主题近白），等图加载完再淡入。用户逐次开关播放页看到的就是「封面变白再重新加载」。
+     * `current` 来自异步加载的 `tracks`（打开面板即触发一次拉取），因此页面头几帧 `current`
+     * 为 null。若此时不提供封面 URL，`AsyncImage` 整块不参与组合，框内仅有 `surfaceMuted`
+     * （浅色主题近白），待图片加载完成后再淡入；反复开关播放页时表现为「封面变白后重新加载」。
      *
-     * `UfiNowPlayingState.artworkUrl` 由常驻探针维护、**打开第一帧就有值**，而且队列项里
-     * 的 artworkUri 与 [media.coverUrl] 是同一个 URL（见 `toUfiMediaItem`），所以它到
-     * `current` 解析出来时不会换地址、也就不会重新加载。
+     * `UfiNowPlayingState.artworkUrl` 由常驻探针维护，**打开第一帧即有值**；且队列项的
+     * artworkUri 与 [media.coverUrl] 为同一 URL（见 `toUfiMediaItem`），因此 `current`
+     * 解析完成后 URL 不变，不会触发重新加载。
      *
-     * 只在"探针那一首就是本页要放的那一首"时才用（[playingPath] 相等）：点列表另一首进播放页时
-     * 两首不是同一首，用探针那张会先闪一下**上一首**的封面 —— 那种情况退回原来的"等列表"。
+     * 仅当探针曲目与本页播放曲目相同（[playingPath] 相等）时使用；否则会先显示上一首的封面，
+     * 该情况退回「等待列表」。
      *
-     * 2026-10-21：比的对象从路由带来的 [filePath] 改成 [playingPath]。原来的写法只在"页刚打开
-     * 且就是那一首"时成立 —— 页内切到下一首之后 `filePath` 永远是打开时那一首，这条兜底
-     * 当场失效；而队列里查不到那首（单曲兜底 / 刚"下一首播放"插进来）时 `current` 也是 null，
-     * 于是 `coverUrl` 变成 null、封面那张 AsyncImage 整块不组合 ⇒ 又一段近白底。
+     * 比较对象必须为 [playingPath]，而非路由传入的 [filePath]：后者仅在「页面刚打开且就是
+     * 该曲目」时成立；页内切到下一首后 `filePath` 始终为打开时那一首，该兜底即失效。
+     * 队列中查不到该曲目（单曲兜底 / 刚插入「下一首播放」）时 `current` 也为 null，
+     * `coverUrl` 随之变为 null，`AsyncImage` 整块不组合，再次出现近白底。
      */
     val probeArtwork = UfiNowPlayingState.artworkUrl.value
     val probeMediaId = UfiNowPlayingState.mediaId.value
@@ -596,26 +594,25 @@ fun MediaAudioPlayerScreen(
         ?: probeArtwork.takeIf { probeMediaId.isNotBlank() && probeMediaId == playingPath }
 
     /**
-     * 上一张**真的画出来了**的封面 URL（2026-10-21，`onSuccess` 时更新）。
+     * 上一张**已成功绘制**的封面 URL（`onSuccess` 时更新）。
      *
-     * 换歌时把它当占位图传给新请求（见下面的 `placeholderMemoryCacheKey`）：Coil 会**同步**
-     * 从内存缓存里取出这一张来画，于是换歌第一帧画出来的还是旧封面，等新的解出来再接上。
-     * 用户报的"切到没放过的歌会闪一下白屏再出图"就是这一帧没东西可画的空档。
+     * 换歌时将其作为占位图传入新请求（见下方 `placeholderMemoryCacheKey`）：Coil 会**同步**
+     * 从内存缓存取出该图绘制，因此换歌第一帧绘制的是旧封面，待新图解码完成后再替换。
+     * 「切到未播放过的歌曲时先闪白屏再出图」即该帧无内容可绘制的空档。
      */
     var shownCoverUrl by remember { mutableStateOf<String?>(null) }
 
     /*
-     * 封面请求**记住**（2026-10-20 六修）。
+     * 封面请求对象需**记忆化**。
      *
-     * 这一页里很多状态都会触发重组（分页切换、歌词、进度……），而请求对象原来是在组合里
-     * 逐次 `ImageRequest.Builder(...).build()` 出来的新实例 —— 对 Coil 来说"模型变了"，
-     * 于是重新走一遍加载（哪怕内存缓存命中，也会有一帧空白/重新淡入）。
-     * 左右划"封面/歌词"时这一页会重组一次，用户看到的就是"手动拖拽时封面抽搐"。
-     * 按 `coverUrl` 记住之后，同一首歌从头到尾都是同一个请求对象。
+     * 本页大量状态会触发重组（分页切换、歌词、进度等）。若在组合中逐次
+     * `ImageRequest.Builder(...).build()` 生成新实例，Coil 会认为「模型变了」并重新执行加载
+     * （即使内存缓存命中，也会有一帧空白或重新淡入）。左右划「封面/歌词」时本页重组一次，
+     * 表现为手动拖拽时封面抖动。按 `coverUrl` 记忆化后，同一首歌始终使用同一个请求对象。
      *
-     * ★ 2026-10-21 加了两样：显式**内存缓存键**（与预取侧共用 [audioCoverMemoryCacheKey]，
-     *   换歌才能是真正的内存命中）与**上一张封面作占位**（兜住缓存没命中的那几帧）。
-     *   `coverPx` 用的是上面预取那段算出来的同一个值。
+     * ★ 另外两项：显式**内存缓存键**（与预取侧共用 [audioCoverMemoryCacheKey]，
+     *   换歌时才能真正命中内存缓存）与**上一张封面作占位**（覆盖缓存未命中的帧）。
+     *   `coverPx` 使用上方预取段计算出的同一个值。
      */
     val coverImageRequest = remember(coverUrl, coverPx) {
         coverUrl?.let { url ->
@@ -654,14 +651,13 @@ fun MediaAudioPlayerScreen(
     val lyricsHttpClient = remember(context) { UfiStreamHttpClient.get(context.applicationContext) }
     val lyricsApi = remember(prefs) { RetrofitClient.getApiService(prefs) }
     /*
-     * 歌词状态**跨曲目暂留**（2026-10-21）。
+     * 歌词状态**跨曲目暂留**。
      *
-     * 原来 `remember(currentPath)` + "换歌先清空"：切歌那一刻 lyrics 变空 → 歌词块淡出，
-     * 几十~几百毫秒后新歌词到位 → 再淡入。用户看到的其实是**两段动画中间空一下**
-     * （"有词 ⇄ 无词不够优雅"真正的来源）。
+     * 若使用 `remember(currentPath)` 并在换歌时清空，切歌瞬间 lyrics 变空 → 歌词块淡出，
+     * 数十至数百毫秒后新歌词到位 → 再淡入，形成**两段动画之间的空白**。
      *
-     * 现在换歌**不清空**：旧歌词先顶着，等新的一份（或"确认这首没词"的结论）到位再一次性替换。
-     * 于是"有词 → 有词"根本不需要淡出，只是内容换了一版；只有真的切到没词的歌才会走淡出。
+     * 因此换歌时**不清空**：旧歌词先行显示，待新歌词（或「确认该曲无歌词」的结论）到位后
+     * 一次性替换。「有词 → 有词」无需淡出，仅内容更新；只有切到确实无歌词的曲目才淡出。
      */
     var lyrics by remember {
         mutableStateOf(UfiAudioLyrics.cached(currentPath)?.lines.orEmpty())
@@ -678,9 +674,9 @@ fun MediaAudioPlayerScreen(
             return@LaunchedEffect
         }
         // 取词结束（`null` = 各级都没找到，`UfiAudioLyrics` 会把"确实没有"一起记进缓存）。
-        // ★ 这里**必须**清空：否则上一首的歌词会一直挂在屏幕上 —— 用户报的
-        //   "切到无歌词的歌之后歌词还在"就是这个 `?: return` 留下的。
-        //   "暂留"只负责**加载期间**不闪，答案来了就要如实反映。
+        // ★ 此处**必须清空**：否则上一首的歌词会持续显示在屏幕上
+        //   （「切到无歌词的歌后歌词仍在」即该 `?: return` 所致）。
+        //   「暂留」仅负责**加载期间**不闪烁，结果返回后必须如实反映。
         val found = UfiAudioLyrics.load(
             api = lyricsApi,
             mediaId = current?.id,
@@ -702,15 +698,15 @@ fun MediaAudioPlayerScreen(
     }
 
     /*
-     * 曲名 / 歌手的取值链（2026-09-16）。
+     * 曲名 / 歌手的取值链。
      *
-     * 之前直接显示 `item.name`，于是页面上写的是 `带我走-杨丞琳.flac` —— 那是**文件名**，
-     * 不是歌名。现在按可信度排：
+     * 若直接显示 `item.name`，页面显示的是 `曲名-歌手.flac`，即**文件名**而非歌名。
+     * 因此按可信度排序取值：
      *  1. **core 解析的标签**（[tags]，服务端直接读文件的 ID3 / FLAC 标签）——进页面就有，
      *     不必等播放器解容器；
      *  2. **列表里带的标签**（`/api/media/list` 的 title/artist，系统扫描时解析好的）；
      *  3. **播放器解出的元信息**（[trackMeta]）——前两级都拿不到时的兜底；
-     *  4. **文件名拆分**（`歌名-歌手`，见 [splitFileNameTitleArtist]）：纯属猜测，放最后。
+     *  4. **文件名拆分**（`歌名-歌手`，见 [splitFileNameTitleArtist]）：属于推测，置于最后。
      */
     val fallbackBase = audioFileBase(current?.name ?: filePath.substringAfterLast('/'))
     val guessed = remember(fallbackBase) { splitFileNameTitleArtist(fallbackBase) }
@@ -726,21 +722,20 @@ fun MediaAudioPlayerScreen(
         ?: ""
 
     /*
-     * 队列面板的数据 —— **按播放器里真实的队列**渲染，不是按浏览列表。
+     * 队列面板的数据 —— **按播放器中的真实队列**渲染，而非按浏览列表。
      *
-     * 2026-09-21 改：原来直接把 `tracks` 映射成面板行。在"队列恒等于整库第一页"的年代
-     * 这没问题（两者恰好是同一份），但引入作用域后会错位：`target < 0` 那条路径装的是
-     * **单曲队列**，而 `tracks` 是整个范围 —— 面板会列出上百行，点第 50 行执行
-     * `seekTo(50)` 打到一个只有 1 项的 timeline 上。
+     * 若直接将 `tracks` 映射为面板行：在队列恒等于整库第一页时两者恰好相同，但引入作用域
+     * 后会错位 —— `target < 0` 路径装入的是**单曲队列**，而 `tracks` 是整个范围，
+     * 面板会列出数百行，点击第 50 行执行 `seekTo(50)` 将作用于仅含 1 项的 timeline。
      *
-     * 所以面板的行数与顺序只认 [queueIds]（`ufiAudioQueueIds()` 的回读），
-     * 元信息去 `tracks` 里按 path 查；查不到（单曲兜底那首不在范围内）就用当前曲目的
-     * 标题/歌手兜底，至少不会出现"面板空白但音乐在放"。
+     * 因此面板的行数与顺序只取 [queueIds]（`ufiAudioQueueIds()` 的回读），
+     * 元信息按 path 在 `tracks` 中查询；查不到（单曲兜底曲目不在范围内）时使用当前曲目的
+     * 标题/歌手兜底，避免出现「面板空白但音乐在播放」。
      */
     val queueRows = remember(queueIds, trackByPath, filePath, title, artist, durationMs) {
         val ids = queueIds.ifEmpty { listOf(filePath) }
         // key 必须唯一：LazyColumn 的 itemsIndexed 用它做移动动画与复用。
-        // 「下一首播放」允许把同一首歌插多次（没有去重），裸用路径做 key 会撞
+        // 「下一首播放」允许把同一首歌插多次（没有去重），直接使用路径作为 key 会冲突
         // "Key was already used" 直接崩；给重复项追加出现序号。
         val seen = HashMap<String, Int>()
         ids.map { id ->
@@ -769,13 +764,13 @@ fun MediaAudioPlayerScreen(
     }
 
     /*
-     * 「封面 / 歌词」两页（2026-09-16 第三版）。
+     * 「封面 / 歌词」两页。
      *
-     * 上一版是"点歌词进整屏、左右划切换"，两个问题：手势要和整屏歌词里的点句跳转、
-     * 纵向滚动抢事件；而且没有任何可见入口，用户不知道能划。现在改成**左右 Tab + Pager**：
-     * Tab 是看得见的入口，滑动由 Pager 自己处理，与页内纵向滚动天然分工。
+     * 早期方案为「点歌词进入整屏、左右划切换」，存在两个问题：手势与整屏歌词内的点句跳转、
+     * 纵向滚动冲突；且没有可见入口。现改为**左右 Tab + Pager**：Tab 提供可见入口，
+     * 横向滑动由 Pager 处理，与页内纵向滚动天然分工。
      *
-     * 状态提到这里（而不是留在 Column 里）是因为 Tab 与 Pager 分属两个子树、都要读它。
+     * 状态提升到此处（而非留在 Column 内）是因为 Tab 与 Pager 分属两个子树、均需读取。
      */
     val pagerState = rememberPagerState(initialPage = AUDIO_PAGE_COVER) { AUDIO_PAGE_COUNT }
     val pagerScope = rememberCoroutineScope()
@@ -783,10 +778,10 @@ fun MediaAudioPlayerScreen(
     /*
      * 返回键只拦截**队列面板**这一层浮层。
      *
-     * 歌词页不再拦：Tab 一直摆在那儿（点一下就回封面），左右划也能切，用不着再占用返回键。
-     * 之前在歌词页按返回是"先回封面、再按才退出"，等于要按两次才离开播放页 —— 对着
-     * 一个平级的 Tab 页做返回栈语义，只会让人以为返回失灵了。现在歌词页按返回直接退出
-     * 整个播放页（走页壳的 popBackStack）。
+     * 歌词页不拦截：Tab 始终可见（点击即回封面），也可左右划切换，无需占用返回键。
+     * 若在歌词页按返回先回封面、再按才退出，离开播放页需要两次返回；对平级 Tab 页
+     * 采用返回栈语义会被误认为返回失灵。因此歌词页按返回直接退出整个播放页
+     * （走页壳的 popBackStack）。
      */
     BackHandler(enabled = showQueue) {
         showQueue = false
@@ -814,8 +809,8 @@ fun MediaAudioPlayerScreen(
                 )
             }
         },
-        // 顶栏与内容同色（2026-09-16）：渐变交给页壳铺满整页（含标题栏与状态栏区域），
-        // 内容区不再自己画背景 —— 否则标题栏只有 pageBg，与下面的 accent 渐变之间有一道色阶。
+        // 顶栏与内容同色：渐变由页壳铺满整页（含标题栏与状态栏区域），
+        // 内容区不再自绘背景 —— 否则标题栏仅有 pageBg，与下方 accent 渐变之间出现色阶。
         backgroundBrush = Brush.verticalGradient(
             colors = listOf(palette.accent.copy(alpha = AUDIO_GRADIENT_ALPHA), palette.pageBg)
         )
@@ -846,19 +841,19 @@ fun MediaAudioPlayerScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = AUDIO_PAGE_PADDING)
-                    // 2026-10-20（用户要求）：有歌词时「封面 / 歌词」这一块整体偏下，
-                    // 整块上移 12dp（两页一起动，Tab 与页面对齐关系不变）。
+                    // 有歌词时「封面 / 歌词」区域整体偏下，此处整体上移 12dp
+                    // （两页同步移动，Tab 与页面的对齐关系不变）。
                     .offset(y = (-12).dp)
             ) {
                 /*
-                 * Tab 与 Pager 的状态在本 composable 顶层（返回键要用），这里只做编排。
+                 * Tab 与 Pager 的状态位于本 composable 顶层（返回键需要），此处仅做编排。
                  *
-                 * ★ 2026-10-20 六修：`selected` 传的是**取值 lambda**，不是 `pagerState.currentPage`
-                 *   的直接读值。直接读会把"当前页"这条 State 的读发生在**本页组合作用域**里 ——
-                 *   手指左右划、`currentPage` 在临界点来回翻的时候，整页（含 Pager 里的封面）
-                 *   会跟着一次次重组；而重组会重建封面请求、重建 Pager 内容，观感就是
-                 *   "手动拖拽时封面抽搐"。改成在 [MediaPlayerTabs] 内部取值之后，翻页只会
-                 *   重组那一排 Tab（很轻），封面一个字节都不动。
+                 * ★ `selected` 传入的是**取值 lambda**，而非直接读取 `pagerState.currentPage`。
+                 *   直接读取会使「当前页」State 的读发生在**本页组合作用域**内：手指左右划、
+                 *   `currentPage` 在临界点反复切换时，整页（含 Pager 内的封面）会随之反复重组；
+                 *   重组会重建封面请求与 Pager 内容，表现为手动拖拽时封面抖动。
+                 *   在 [MediaPlayerTabs] 内部取值后，翻页只会重组那一排 Tab（开销很小），
+                 *   封面不受影响。
                  */
                 MediaPlayerTabs(
                     selected = { pagerState.currentPage },
@@ -875,31 +870,29 @@ fun MediaAudioPlayerScreen(
                         .weight(1f),
                     pageSpacing = Spacing.Medium,
                     /*
-                     * 关掉这个 Pager 自己的**边界回弹**（2026-10-20 七修）。
+                     * 关闭该 Pager 自身的**边界回弹**。
                      *
-                     * 用户报「只在拖到两端（页边）时封面位置在抖」。两端唯一多出来的东西
-                     * 就是 overscroll：Android 12+ 的拉伸回弹会给整块内容逐帧套一个
-                     * `RenderEffect`，而封面自己是一摞图层（缩放 / 阴影 / 圆角裁剪 / 切歌模糊）——
-                     * 拉伸效果套在这摞图层上时，边缘会跟着逐帧重采样，观感就是"封面在抖"。
+                     * 仅在拖到两端（页边）时出现封面位置抖动。两端唯一新增的因素是
+                     * overscroll：Android 12+ 的拉伸回弹会给整块内容逐帧应用 `RenderEffect`，
+                     * 而封面由多个图层叠加（缩放 / 阴影 / 圆角裁剪 / 切歌模糊）；拉伸效果
+                     * 作用于这些图层时，边缘会逐帧重采样，表现为封面抖动。
                      *
-                     * 这个 Pager 只有「封面 / 歌词」两页，位置反馈由上面那排 Tab 负责，
-                     * 边界弹一下并不是必需的信息。所以这里直接把这个 Pager 的 overscroll
-                     * 置空（只影响横向翻页；歌词页内部那个纵向列表的 overscroll 不受影响，
-                     * 它自己走 `rememberOverscrollEffect()`）。
+                     * 该 Pager 仅含「封面 / 歌词」两页，位置反馈由上方 Tab 承担，
+                     * 边界回弹不是必需信息。因此将本 Pager 的 overscroll 置空（仅影响横向翻页；
+                     * 歌词页内部纵向列表的 overscroll 不受影响，其自行使用
+                     * `rememberOverscrollEffect()`）。
                      */
                     overscrollEffect = null,
                     /*
-                     * 这个对齐现在**管不到任何东西**（2026-10-14）：两页都是 fillMaxSize ——
-                     * 封面页自己占满整页并在内部居中，歌词页（MediaLyrics.kt）也是整页。
-                     * Pager 的 verticalAlignment 只对"比页面矮"的内容有意义，保留 Top
-                     * 只是不去依赖 Pager 那个默认值。
+                     * 该对齐当前**不影响布局**：两页均为 fillMaxSize —— 封面页占满整页并在
+                     * 内部居中，歌词页（MediaLyrics.kt）同样占满整页。Pager 的 verticalAlignment
+                     * 仅对「矮于页面」的内容有意义，保留 Top 是为了不依赖 Pager 默认值。
                      *
-                     * 2026-09-22 这里曾是修「切歌时封面上下抖动」的关键：当时封面页是一个
-                     * wrap-content 的 Column，高度跟着曲目变（歌词块有无差 86dp、曲名 1 行还是
-                     * 2 行差一个行高、歌手为空时那一行连 Spacer 一起消失），居中会把高度差的
-                     * **一半分给上方**，于是封面自己跟着上下跳。
-                     * 那条取舍现在由封面页自己承担：它居中的那一组高度是定值（曲名
-                     * minLines = maxLines = 2、歌手行恒渲染），理由见该页开头那段。
+                     * 该值曾是修复「切歌时封面上下抖动」的关键：当时封面页为 wrap-content 的
+                     * Column，高度随曲目变化（歌词块有无相差 86dp、曲名 1 行与 2 行相差一个行高、
+                     * 歌手为空时该行连同 Spacer 一起消失），居中会把高度差的一半分配到上方，
+                     * 导致封面上下跳动。该问题现由封面页自身处理：其中居中的一组高度为定值
+                     * （曲名 minLines = maxLines = 2、歌手行恒定渲染），理由见该页开头的说明。
                      */
                     verticalAlignment = Alignment.Top
                 ) { page ->
@@ -918,21 +911,18 @@ fun MediaAudioPlayerScreen(
                         )
                     } else {
                         /*
-                         * 封面页（2026-10-14 重排）：**「封面 + 歌名 + 歌手」这一组永远居中，
-                         * 歌词区不参与这个居中**。
+                         * 封面页：**「封面 + 歌名 + 歌手」这一组始终居中，歌词区不参与该居中**。
                          *
-                         * 用户报的问题：没有歌词时歌词块已经不渲染了，可这一页是 wrap-content
-                         * 的 Column、靠 Pager 顶部对齐 —— 内容变短之后整块贴在顶上，下面空出
-                         * 一大片，观感从"歌词区是空的"变成了"整页偏上"。
+                         * 若歌词块不渲染时仍按 Pager 顶部对齐，内容变短后整块会贴在顶部、
+                         * 下方留出大片空白，观感由「歌词区为空」变为「整页偏上」。
                          *
-                         * 修法**不是**把 Pager 的对齐换成 CenterVertically：那样歌词会算进
-                         * 被居中的那一块，有歌词时这一组被顶上去半个歌词块 —— 换一首有无歌词的歌
-                         * 封面就上下跳一次，正是 2026-09-22 修掉的那个病。所以这里让 Column 占满
-                         * 整页并居中，再把歌词从"参与居中的高度"里摘出去（做法见下面歌词那一段）。
+                         * 解法**不是**将 Pager 对齐改为 CenterVertically：那样歌词会计入被居中的
+                         * 区域，有歌词时该组会上移半个歌词块的高度，切换有无歌词的曲目时封面
+                         * 上下跳动。因此此处让 Column 占满整页并居中，再将歌词从「参与居中的高度」
+                         * 中排除（做法见下文歌词段）。
                          *
-                         * 敢居中的前提是这一组的高度是**定值**：封面 260dp、歌名
-                         * minLines = maxLines = 2、歌手行恒渲染 —— 三条都是 2026-09-22 那次
-                         * 修「封面上下抖动」留下的约束，这里正是它们的回报。
+                         * 居中的前提是该组高度为**定值**：封面 260dp、歌名
+                         * minLines = maxLines = 2、歌手行恒定渲染。
                          */
                         Column(
                             modifier = Modifier
@@ -944,44 +934,29 @@ fun MediaAudioPlayerScreen(
                             verticalArrangement = AUDIO_COVER_PAGE_ARRANGEMENT
                         ) {
                             /*
-                             * 切歌过渡（2026-09-22 重做）：淡叠 + 超调落位 + 景深对焦。
+                             * 切歌过渡：淡入 + 超调落位 + 景深对焦。
                              *
-                             * key 用当前曲目的 id：换歌才动，播放/暂停或进度变化不触发。
+                             * key 使用当前曲目 id：换歌才触发，播放/暂停或进度变化不触发。
                              *
-                             * **没有方向**。旧实现用 `targetState >= initialState` 比较 id 来决定
-                             * 往左还是往右，那在随机播放或乱序队列下是错的（id 大小与队列顺序无关）。
-                             * 现在进出都是同心缩放 + 淡入淡出，「下一首 / 上一首 / 点队列里某一首 /
-                             * 自动续播」全是同一个动作，不需要也不读方向。
+                             * ## 封面不放入 AnimatedContent 内
+                             * 1. **切歌闪烁**：AnimatedContent 切换期间会同时保留旧内容与新内容，
+                             *    常量 key `UFI_SHARED_KEY_AUDIO_COVER` 会在同一帧出现两个节点，
+                             *    属于 `UfiSharedTransition.kt` 记录的「同帧重复 key」禁用情形；
+                             *    曲名/歌手正因此被移出 AnimatedContent。
+                             * 2. **从迷你条进入时封面短暂模糊**：列表异步加载，`current` 由 null
+                             *    变为真实曲目时 `targetState` 从 -1L 变为真实 id，该时间点恰在
+                             *    导航 RISE 转场中，进场模糊与超调会叠加在共享元素飞入上。
                              *
-                             * 位移与模糊的具体参数、以及为什么超调用 keyframes 而不是 spring，
-                             * 见文件末尾 AUDIO_SWITCH_* 那一组常量上方的说明。
-                             */
-                            /*
-                             * 切歌过渡（2026-09-22 二次修正）：淡入 + 超调落位 + 景深对焦。
+                             * ## 当前做法
+                             * 封面为**单个节点**，缩放与模糊由 [rememberAudioSwitchProgress] 驱动
+                             * （与曲名/歌手同一机制）。节点不复制，不会出现重复 key；首次组合
+                             * 仅 snap 到终态，进页不播放效果。
                              *
-                             * ## 为什么封面**不再**放在 AnimatedContent 里
-                             * 第一版把封面留在 AnimatedContent 里，结果两个真实 bug：
+                             * 代价：旧封面没有独立离场动画（同一节点，图片直接替换）。
+                             * 该方案同一时刻只有一个元素做几何变化。
                              *
-                             * 1. **切歌闪烁**。AnimatedContent 在切换期间会同时保留旧内容与新内容，
-                             *    于是 `UFI_SHARED_KEY_AUDIO_COVER` 这个**常量** key 在同一帧出现两个节点
-                             *    —— 正是 UfiSharedTransition.kt 记过的「同帧重复 key」禁区，
-                             *    也正是曲名/歌手当初被移出 AnimatedContent 的原因。封面当时没被移出去，
-                             *    是因为横滑+淡入把闪烁盖住了；换成 blur 之后就藏不住了。
-                             * 2. **从迷你条点进来时封面闪一下模糊**。列表是异步拉的，`current` 从 null
-                             *    变成真正那一首时 `targetState` 就从 -1L 变成真实 id —— 时间点正好压在
-                             *    导航 RISE 转场中间，于是「进场模糊 + 超调」叠在共享元素的飞入上。
-                             *
-                             * ## 现在的做法
-                             * 封面是**单个节点**，缩放与模糊由一个 [rememberAudioSwitchProgress] 驱动
-                             *（与曲名/歌手同一套机制）。节点不复制 ⇒ 不可能出现重复 key；
-                             * 首次组合只 snap 到终态 ⇒ 进页不播效果。
-                             *
-                             * 代价：旧封面没有独立的离场动画（同一个节点，图片直接换）。
-                             * 这就是设计评审里 V2「只进不出」那一档 —— 同一时刻只有一个元素在做几何变化，
-                             * 本来就是四套方案里观感最干净的。
-                             *
-                             * **没有方向**。旧实现用 `targetState >= initialState` 比较 id 来定方向，
-                             * 那在随机播放或乱序队列下是错的（id 大小与队列顺序无关）。
+                             * **无方向**：若以 `targetState >= initialState` 比较 id 决定方向，
+                             * 在随机播放或乱序队列下不成立（id 大小与队列顺序无关）。
                              */
                             run {
                                 Column(
@@ -1002,28 +977,27 @@ fun MediaAudioPlayerScreen(
                                     val switchScale = audioSwitchScaleAt(switchProgress)
                                     val switchBlur = AUDIO_SWITCH_BLUR_IN * (1f - switchProgress)
                                     /*
-                                     * 阴影的显示系数（2026-10-20）：0 = 没阴影，1 = [AUDIO_COVER_SHADOW]。
+                                     * 阴影的显示系数：0 = 无阴影，1 = [AUDIO_COVER_SHADOW]。
                                      *
-                                     * 页内浮层那条路径上，封面是"从飞行封面手里接过来"的：原来
-                                     * `.shadow(18.dp)` 是静态的，接手那一刻阴影一刀切地出现 —— 用户
-                                     * 报的就是"会突然出现阴影"。现在跟着打开/收起补一条 280ms 的淡入淡出。
+                                     * 页内浮层路径中，封面由飞行封面交接而来：
+                                     * 静态 `.shadow(18.dp)` 会在交接帧突然出现。
+                                     * 因此随打开/收起补一条 280ms 的淡入淡出。
                                      *
-                                     * 导航那条路（riseFollow=false）没有这个接手过程，系数恒为 1，
-                                     * 与改动前逐像素一致。
+                                     * 导航路径（riseFollow=false）无此交接过程，系数恒为 1，
+                                     * 与既有实现逐像素一致。
                                      */
                                     val coverShadowFactor = rememberCoverShadowFactor(riseFollow)
                                     /*
-                                     * 封面刻意分成两层 Box（2026-09-20）：
-                                     * - 外层只有固定尺寸 + 共享元素标记，几何稳定；
-                                     * - 内层才做播放/暂停的 0.96 缩放、以及切歌的缩放与模糊。
+                                     * 封面分为两层 Box：
+                                     * - 外层仅含固定尺寸与共享元素标记，几何稳定；
+                                     * - 内层承担播放/暂停的 0.96 缩放，以及切歌的缩放与模糊。
                                      *
-                                     * 合成一层会打架：共享元素靠**测量出来的位置与尺寸**做补间，
-                                     * 而 graphicsLayer 的 scale 是绘制期变换 —— 转场进行中
-                                     * 暂停/播放一下，缩放会叠在补间的边界上，观感是封面抽一下、
-                                     * 且落点与终点差一截。分层后共享元素读到的始终是 260dp 这个
-                                     * 确定的框，scale 只在框内缩放内容。
+                                     * 合并为一层会产生冲突：共享元素基于**测量得到的位置与尺寸**做补间，
+                                     * 而 graphicsLayer 的 scale 是绘制期变换。转场进行中切换播放/暂停时，
+                                     * 缩放会叠加在补间边界上，导致封面位置突变且落点与终点不一致。
+                                     * 分层后共享元素读取的始终是 260dp 的固定框，scale 仅缩放框内内容。
                                      *
-                                     * 共享元素的对端是迷你控制条那张 48dp 的封面
+                                     * 共享元素的对端是迷你控制条中 48dp 的封面
                                      * （同一个 [UFI_SHARED_KEY_AUDIO_COVER]）。
                                      */
                                     Box(
@@ -1040,38 +1014,36 @@ fun MediaAudioPlayerScreen(
                                             .size(AUDIO_COVER_SIZE)
                                             .graphicsLayer {
                                                 // 两个缩放相乘而不是各占一层：播放/暂停与切歌
-                                                // 可以同时发生，叠两层 graphicsLayer 只是白付一次离屏。
+                                                // 可以同时发生，叠加两层 graphicsLayer 只会造成一次无意义的离屏。
                                                 scaleX = coverScale * switchScale
                                                 scaleY = coverScale * switchScale
                                                 /*
-                                                 * 缩放 / 阴影 / 圆角裁剪合成**同一层**（2026-10-20 七修）。
+                                                 * 缩放 / 阴影 / 圆角裁剪合并到**同一图层**。
                                                  *
-                                                 * 原来这里是四层嵌套：scale 图层 + `.shadow()` 图层
-                                                 * + `.blur()`（它看到 edgeTreatment.shape 就 clip = true，
-                                                 * 哪怕半径是 0 也照样加一层）+ `.clip()` 图层。
-                                                 * 分页拖拽时，这一摞图层要在**亚像素位置**逐帧重新栅格化，
-                                                 * 用户看到的是"封面位置在抖"—— 其实不是布局在动，是
-                                                 * 多层裁剪/阴影重采样的边缘在逐帧跳。
+                                                 * 若使用四层嵌套（scale 图层 + `.shadow()` 图层 + `.blur()`
+                                                 * 图层 + `.clip()` 图层），分页拖拽时这些图层需在**亚像素位置**
+                                                 * 逐帧重新栅格化，表现为封面位置抖动 —— 并非布局变化，
+                                                 * 而是多层裁剪/阴影重采样的边缘逐帧跳变。
                                                  *
-                                                 * 合成一层之后滚动时只有一次缩放 + 一次圆角裁剪：
+                                                 * 合并后滚动时仅执行一次缩放与一次圆角裁剪：
                                                  * · 阴影用图层 elevation（panel 路径需要它逐帧淡入，
-                                                 *   导航路径系数恒为 1，与原来 `.shadow(18.dp)` 等价）；
-                                                 * · clip = true 负责圆角裁剪，原来的 `.clip()` 不再需要。
+                                                 *   导航路径系数恒为 1，与写死的 `.shadow(18.dp)` 等价）；
+                                                 * · clip = true 负责圆角裁剪，原 `.clip()` 不再需要。
                                                  */
                                                 shadowElevation =
                                                     AUDIO_COVER_SHADOW.toPx() * coverShadowFactor.value
                                                 shape = AUDIO_COVER_SHAPE
                                                 clip = true
                                             }
-                                            // 落点挂在**缩放这一层之内**（2026-10-20）：飞行封面要
-                                            // 落到"真实封面画出来的那个矩形"，暂停态的 0.96 也得算进去，
-                                            // 否则交给真封面那一下会缩 4%。排在 graphicsLayer 之后，
-                                            // 量到的 bounds 才会带上这个缩放。
+                                            // 落点上报挂在**缩放层之内**：飞行封面需
+                                            // 落到「真实封面绘制出的矩形」，暂停态的 0.96 也需计入，
+                                            // 否则交接时会缩 4%。该 Modifier 位于 graphicsLayer 之后，
+                                            // 测量的 bounds 才包含该缩放。
                                             .ufiRiseCoverSlotReportIf(riseFollow, pagerState, AUDIO_PAGE_COVER)
-                                            // 模糊只在"切歌那一段"真的需要时才挂（2026-10-20 七修）：
-                                            // 静止时 switchBlur 是 0，而 `Modifier.blur` 只要带圆角
-                                            // edgeTreatment 就仍然会加一层裁剪图层 —— 白付一次离屏，
-                                            // 还要在滚动时跟着重新栅格化。
+                                            // 仅在**切歌期间**需要时挂载模糊：
+                                            // 静止时 switchBlur 为 0，而 `Modifier.blur` 只要带圆角
+                                            // edgeTreatment 仍会添加裁剪图层，造成一次多余的离屏
+                                            // 与滚动时的重新栅格化。
                                             .then(
                                                 if (switchBlur > 0.dp) {
                                                     Modifier.blur(
@@ -1098,14 +1070,14 @@ fun MediaAudioPlayerScreen(
                                                 contentDescription = null,
                                                 contentScale = ContentScale.Crop,
                                                 /*
-                                                 * 图真的画出来了才允许交接（2026-10-20）：
-                                                 * 面板那侧只有在收到这个信号之后才把飞行封面撤掉
+                                                 * 图片绘制完成后才允许交接：
+                                                 * 面板侧收到该信号后才撤除飞行封面
                                                  * （见 [UfiAudioRisePanel.isPlayerCoverReady]），
-                                                 * 否则归位那一刻会露出这块 `surfaceMuted` 近白底。
+                                                 * 否则归位瞬间会露出 `surfaceMuted` 近白底。
                                                  */
                                                 onSuccess = {
-                                                    // 这一张画出来了：下一首换图时拿它当占位，
-                                                    // 换歌那一帧因此不会露出这块近白底（见所示变量）
+                                                    // 该图已绘制完成：下一首换图时作为占位，
+                                                    // 换歌那一帧因此不会露出近白底（见 `shownCoverUrl`）
                                                     shownCoverUrl = coverUrl
                                                     if (riseFollow) {
                                                         coverUrl?.let {
@@ -1133,32 +1105,31 @@ fun MediaAudioPlayerScreen(
                             /*
                              * ── 封面下方：歌名，其下歌手 ──
                              *
-                             * 这两行**刻意放在切歌那个 AnimatedContent 之外**（2026-09-20）。
+                             * 这两行**刻意放在切歌 AnimatedContent 之外**。
                              *
                              * 它们要挂共享元素（对端是迷你条那两行），而共享元素的 key 是常量：
                              * 放在 AnimatedContent 里面时，切歌那一刻旧内容与新内容会同时在树上，
-                             * 同一个 key 短时间出现**两个**候选 —— 上一轮"连贯动画丢失"就是这么来的。
-                             * 而这一页进来时几乎必然会切一次：列表是异步拉的，`current` 从 null
-                             * 变成真正那一首时 `targetState` 就变了，时间点正好压在导航转场中间。
+                             * 同一个 key 会短暂出现**两个**候选，导致连贯动画失效。
+                             * 页面进入时几乎必然切歌一次：列表异步加载，`current` 由 null 变为
+                             * 真实曲目时 `targetState` 变化，时间点恰在导航转场中。
                              *
-                             * 代价是切歌时这两行不能跟着封面一起被 AnimatedContent 搬运。
-                             * 2026-09-22 补上等价效果：改为对**同一个节点**做 alpha + 4dp 上浮
-                             *（[audioMetaEnterModifier]），节点不复制，所以常量 key 不会同帧出现两次。
-                             * 三行按 `STAGGER_DELAY_MS` 顺延，让信息有阅读顺序。
-                             * 修饰符接在 `ufiSharedBounds` **之后**：几何仍由共享元素接管，这里只动
+                             * 代价是切歌时这两行无法随封面一起由 AnimatedContent 搬运。
+                             * 因此改为对**同一节点**应用 alpha + 4dp 上浮
+                             *（[audioMetaEnterModifier]），节点不复制，常量 key 不会同帧出现两次。
+                             * 三行按 `STAGGER_DELAY_MS` 顺延，形成阅读顺序。
+                             * 修饰符位于 `ufiSharedBounds` **之后**：几何仍由共享元素接管，此处仅修改
                              * alpha 与 translationY。
                              */
                             Spacer(Modifier.height(Spacing.Large))
                             /*
-                             * 曲名：固定**两行高**的框，文字在其中垂直居中（2026-10-14）。
+                             * 曲名：固定**两行高**的框，文字在其中垂直居中。
                              *
-                             * 用户报"歌名与歌手之间隔得太远，砍掉一半"。原因不在下面那 4dp 间距，
-                             * 而在这一条：曲名框按两行留（为的是换歌时高度不跳），而绝大多数曲名
-                             * 只有一行 —— 空出来的整整一行就落在文字与歌手之间。
+                             * 曲名框按两行预留（使换歌时高度不变），而多数曲名仅一行，
+                             * 空出的一整行落在文字与歌手之间，造成两者间距过大。
                              *
-                             * 现在让文字在两行框里居中：这段空白一半挪到文字上方、一半留在下方，
-                             * 歌名 → 歌手的距离正好减半；**框高仍然是两行**，所以整组高度不随曲名
-                             * 长短变，换歌时封面不会上下跳（`minLines = 2` 当初就是为这个加的）。
+                             * 因此使文字在两行框内居中：空白一半移至文字上方、一半留在下方，
+                             * 歌名 → 歌手距离减半；**框高仍为两行**，整组高度不随曲名长度变化，
+                             * 换歌时封面不会上下跳动（`minLines = 2` 即为此设置）。
                              */
                             val titleLineHeight = with(LocalDensity.current) {
                                 UfiTextStyles.sectionTitle.lineHeight.toDp()
@@ -1227,37 +1198,33 @@ fun MediaAudioPlayerScreen(
                             )
 
                             /*
-                             * 歌词预览（2026-10-14 重排）。
+                             * 歌词预览。
                              *
-                             * ## 它怎么做到"不影响组的居中，又紧贴在组下面"
-                             * 由父 Column 的 [AudioCoverPageArrangement] 负责：那一条排布规则
-                             * 把**第一个孩子**（也就是上面那一组）放在整页正中，把第二个孩子
-                             * 放在它的正下方 —— 歌词不参与"居中"这个计算，所以有歌词时组不会被
-                             * 顶上去，换一首有无歌词的歌封面也不会跳。
+                             * ## 如何在不影响组居中的前提下紧贴其下
+                             * 由父 Column 的 [AudioCoverPageArrangement] 负责：该排布规则将**第一个
+                             * 孩子**（即上方那一组）置于整页正中，第二个孩子置于其正下方。歌词不参与
+                             * 「居中」计算，因此有歌词时组不会被上移，切换有无歌词的曲目时封面不跳动。
                              *
-                             * 这里**不再**自己垫 `Spacer(Spacing.Large)`：间距是排布规则的一部分
-                             * （它得知道自己排的是哪两个东西），垫在子树里会让"组 + 间距 + 歌词"
-                             * 变成一个整体，居中又要重新算一遍。
+                             * 此处**不再**自行添加 `Spacer(Spacing.Large)`：间距属于排布规则的一部分，
+                             * 添加在子树内会使「组 + 间距 + 歌词」成为一个整体，居中需重新计算。
                              *
                              * ## 判据
-                             * 与 MediaLyricsPreview 内部那条守卫**逐字一致**（空行 / 无时间轴都算
-                             * "没有"），否则版式会与实际渲染的内容对不上 —— 那正是上一次修错位时
-                             * 定下的规矩。代价仍有：有歌词 ⇄ 无歌词 的歌之间切歌时，歌词块会整块
-                             * 出现 / 消失；但它挂在组的**下方**，不会带动封面位移，所以不会复发
-                             * "封面上下抖动"。
+                             * 与 MediaLyricsPreview 内部的守卫**完全一致**（空行 / 无时间轴均视为
+                             * 「没有」），否则版式与实际渲染内容不一致。代价是：在有歌词与无歌词的
+                             * 曲目之间切歌时，歌词块会整块出现 / 消失；但它位于组的**下方**，
+                             * 不会带动封面位移，因此不会复现「封面上下抖动」。
                              */
                             val hasLyrics = lyrics.isNotEmpty() && lyrics.first().timeMs >= 0L
                             /*
-                             * 有歌词 ⇄ 无歌词的切歌（2026-10-21）。
+                             * 有歌词 ⇄ 无歌词的切歌。
                              *
-                             * 原来是 `if (hasLyrics) { … }` 硬挂载/卸载：从有词切到无词时，
-                             * 那三行预览**整块消失**，观感是"画面忽然少了一块"。现在走
-                             * [AnimatedVisibility] 的淡入淡出（末段略上移 4dp）。
+                             * 若使用 `if (hasLyrics) { … }` 直接挂载/卸载，从有词切到无词时三行预览
+                             * **整块消失**。因此改用 [AnimatedVisibility] 淡入淡出（末段上移 4dp）。
                              *
-                             * 为什么用 `fadeIn/fadeOut` 而不是 `expandVertically/shrinkVertically`：
-                             * 前面那条 [AudioCoverPageArrangement] 是按"歌词块占多高"来摆组的 ——
-                             * 让高度一起补间，组会在整段动画里被一点点顶上去（正是 2026-09-22
-                             * 修掉的"换歌封面上下跳"）。只动 alpha，高度就是两档定值，组不挪。
+                             * 使用 `fadeIn/fadeOut` 而非 `expandVertically/shrinkVertically`：
+                             * [AudioCoverPageArrangement] 按「歌词块高度」摆放组，若高度参与补间，
+                             * 组会在整段动画中被逐步上移（即「换歌封面上下跳」）。仅改变 alpha 时
+                             * 高度为两档定值，组不移动。
                              */
                             AnimatedVisibility(
                                 visible = hasLyrics,
@@ -1327,7 +1294,7 @@ fun MediaAudioPlayerScreen(
 
                 Spacer(Modifier.height(Spacing.Medium))
 
-                // ── 三键：无底色、中间最大，每个键下面写清楚它是什么（2026-09-16）──
+                // ── 三键：无底色、中间最大，每个键下方标注名称 ──
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.Top,
@@ -1338,8 +1305,8 @@ fun MediaAudioPlayerScreen(
                         label = "上一首",
                         iconSize = 34.dp,
                         enabled = controller.ufiCanSkipToPrevious(),
-                        // 2026-09-20：迷你条补上"上一首"之后这颗才有对端，于是也挂上 key。
-                        // 三颗键同时参与转场，整组一起长大 / 缩回，不会只有中间两颗在动。
+                        // 迷你条已提供「上一首」对端，因此该键也挂 key。
+                        // 三颗键同时参与转场，整组同步缩放，不会只有中间两颗在动。
                         sharedKey = UFI_SHARED_KEY_AUDIO_PREV.takeIf { shareElements },
                         onClick = { controller.ufiSkipToPrevious() }
                     )
@@ -1366,16 +1333,16 @@ fun MediaAudioPlayerScreen(
 
                 Spacer(Modifier.height(Spacing.Medium))
 
-                // ── 底部一排次要动作：模式 / 定时 / 队列（三个都是播放器自带能力，各带文字）──
+                // ── 底部一排次要动作：模式 / 定时 / 队列（均为播放器能力，各带文字）──
                 //
-                // 三等分而不是 SpaceEvenly（2026-09-19）：这三个按钮的文字长度会随状态变
-                // （"不循环" ↔ "列表循环"、"队列（3）" ↔ "队列（128）"），SpaceEvenly 按实际
-                // 宽度分配剩余空间，任何一个字数一变、三个按钮就一起横向挪位。改成每个占
-                // weight(1f) 的固定格子、内部居中，这样只有格子里的文字变，图标位置钉死不动。
+                // 采用三等分而非 SpaceEvenly：这三个按钮的文字长度会随状态变化
+                // （「不循环」↔「列表循环」、「队列（3）」↔「队列（128）」）。SpaceEvenly 按实际
+                // 宽度分配剩余空间，任一按钮字数变化会使三个按钮整体横向移动。改为各自
+                // weight(1f) 的固定格子并内部居中，使图标位置固定、仅格内文字变化。
                 //
-                // 2026-10-14：原来是 循环 / 随机 / 队列。用户要求把"随机"从独立开关收进
-                // **一个四档模式**（列表循环 / 单曲循环 / 不循环 / 随机模式），空出来的那一格
-                // 给"定时关闭"（见 MediaSleepTimer.kt）。
+                // 底部三格为 模式 / 定时 / 队列。随机模式已并入
+                // **单一四档模式**（列表循环 / 单曲循环 / 不循环 / 随机模式），空出的一格
+                // 用于「定时关闭」（见 MediaSleepTimer.kt）。
                 val playMode = AudioPlayMode.of(repeatMode, shuffle)
                 val sleepTimerLabel = rememberSleepTimerLabel()
                 Row(
@@ -1435,16 +1402,15 @@ fun MediaAudioPlayerScreen(
 
             // ── 队列：公共弹窗（[UfiCustomDialog]，标题 + 右上角 ×）──
             //
-            // 2026-10-14（修「队列里点一首歌，弹窗的关闭动画丢失」）：
-            // 这里**不再**用 `if (showQueue)` 把整棵子树摘掉，改成常驻组合 + 只翻 `visible`。
-            // 弹窗的离场由两件事负责 —— 平台窗口动画（`UfiDialogAnimation`）与 shell 的
-            // mounted-state ramp —— 两者都只在"窗口还在、`visible` 翻 false"时才跑得起来。
-            // 摘子树等于当场销毁窗口：动画一帧都没播，观感就是"点一下，弹窗瞬间没了"。
+            // 不使用 `if (showQueue)` 摘除整棵子树，而是常驻组合 + 仅翻转 `visible`。
+            // 弹窗离场由两部分负责：平台窗口动画（`UfiDialogAnimation`）与 shell 的
+            // mounted-state ramp；二者均要求窗口仍存在且 `visible` 翻为 false。
+            // 摘除子树会立即销毁窗口，动画未执行，表现为「点击后弹窗瞬间消失」。
             /*
-             * 队列面板里的一行提示（目前只有"已关闭随机播放"那一条）。
-             * 放在这一层而不是面板内部：它由面板的回调触发，但面板**每次打开**都该是干净的。
-             * 原来靠 `remember(showQueue)` 在关闭时重置；现在子树常驻，改成"打开那一刻清掉" ——
-             * 这样离场动画期间那一行还在，不会在弹窗消失到一半时先闪掉。
+             * 队列面板的一行提示（目前仅「已关闭随机播放」）。
+             * 放在本层而非面板内部：它由面板回调触发，但面板**每次打开**都应处于干净状态。
+             * 子树常驻组合后，重置时机改为「打开那一刻清空」，使离场动画期间该行仍存在，
+             * 不会在弹窗消失过程中提前闪掉。
              */
             var queueHint by remember { mutableStateOf<String?>(null) }
             LaunchedEffect(showQueue) { if (showQueue) queueHint = null }
@@ -1461,9 +1427,9 @@ fun MediaAudioPlayerScreen(
                 },
                 onRemove = { idx ->
                     controller.ufiRemoveFromQueue(idx)
-                    // 回读：removeMediaItem 之后 timeline 变了，面板要按新队列重排。
-                    // media3 的 Listener 只在变化时回调，这里是本地发起的改动，
-                    // 顺手同步比等回调更可靠（也避免面板闪一帧旧数据）。
+                    // 回读：removeMediaItem 后 timeline 变化，面板需按新队列重排。
+                    // media3 的 Listener 仅在变化时回调；本改动由本地发起，直接同步
+                    // 比等待回调更可靠（也避免面板显示一帧旧数据）。
                     queueIds = controller.ufiAudioQueueIds()
                     currentIndex = controller.currentMediaItemIndex
                     // 队列被清空 → 面板没有任何内容可显示，留着是个空壳
@@ -1474,11 +1440,10 @@ fun MediaAudioPlayerScreen(
                     queueIds = controller.ufiAudioQueueIds()
                     currentIndex = controller.currentMediaItemIndex
                     /*
-                     * 排序时若随机播放开着，自动关掉它并告知（E13）。
+                     * 排序时若随机播放开启，关闭随机并提示。
                      *
-                     * 否则用户排了半天顺序，实际播放仍按打乱的序走 —— 那是"功能看起来生效了
-                     * 其实没有"，比直接禁掉排序更糟。关掉随机是符合此刻意图的解释：
-                     * 他既然在手排顺序，就是想按这个顺序听。
+                     * 否则用户完成排序后，实际播放仍按乱序进行，表现为「功能看似生效但实际无效」，
+                     * 比禁用排序更差。关闭随机符合当前意图：用户正在手工排序，即希望按该顺序播放。
                      */
                     if (controller.shuffleModeEnabled) {
                         controller.shuffleModeEnabled = false
@@ -1490,8 +1455,8 @@ fun MediaAudioPlayerScreen(
             )
 
             /*
-             * 定时关闭的设置弹窗（2026-10-14）：与队列弹窗同一套壳，同样**常驻组合 + 只翻
-             * `visible`** —— 摘子树会把离场动画一起摘掉，这条在队列弹窗那边刚踩过。
+             * 定时关闭设置弹窗：与队列弹窗同一套壳，同样**常驻组合 + 仅翻转 `visible`** ——
+             * 摘除子树会一并移除离场动画。
              */
             UfiSleepTimerDialog(
                 visible = showSleepTimer,
@@ -1513,38 +1478,32 @@ fun MediaAudioPlayerScreen(
 /**
  * 播放队列弹窗。
  *
- * 2026-09-19 改用公共弹窗组件 [UfiCustomDialog]：标题与右上角 × 都由它给，
- * 这里只铺内容。之前是自己用 `Dialog` 画的一整页（自绘顶栏 + 返回箭头），
- * 与全 App 其他弹窗不是一套观感，而"队列"本来就是一层浮层、不是一个页面。
+ * 使用公共弹窗组件 [UfiCustomDialog]：标题与右上角 × 由其提供，本组件仅填充内容。
+ * 队列本身是一层浮层而非独立页面，因此不自绘顶栏。
  *
- * ## 2026-09-22 改版（"序号 + 律动条"）
+ * ## 版式要点
  *
- * 四处改动，每一处都对应旧版一个具体问题：
+ * 1. **leading 使用「序号槽」**。若在 leading 中同时放置 accent 竖条与
+ *    PlayArrow/MusicNote 图标，二者表达同一语义（当前项）；且竖条在非当前项时
+ *    「透明但仍占宽度」，会使每行文字右移 3dp + 间距。当前槽位显示序号，
+ *    非当前项显示 `1 2 3…`，当前项替换为 [UfiPlayingBars]。
+ * 2. **显示序号**：「第几首 / 共几首」是队列的核心信息。
+ * 3. **「共 N 首」移至标题栏右侧**，并以 `3 / 24` 形式呈现，避免单独占用一行高度。
+ * 4. **打开时自动滚到当前项**：队列可达数百首，若停留在顶部，正在播放的曲目可能
+ *    位于第 80 行而不可见。
  *
- * 1. **leading 由「透明竖条 + 图标」换成「序号槽」**。旧版在 leading 里塞了两个东西：
- *    一条 accent 竖条和一个 PlayArrow/MusicNote 图标 —— 它们表达的是**同一件事**
- *    （这是当前项）。更糟的是那条竖条在非当前项时是"透明但仍占宽度"，于是**每一行**的
- *    文字都被无谓地往右推了 3dp + 间距。现在那个槽位放序号，非当前项显示 `1 2 3…`，
- *    当前项换成 [UfiPlayingBars]。
- * 2. **补上序号**。"这是第几首、还剩几首"是队列最有用的信息之一，旧版完全读不到。
- * 3. **"共 N 首"从正文挪到标题栏右侧**，并改成 `3 / 24`。旧版它单独占一整行，
- *    用一行高度换一条低信息量文字。
- * 4. **打开时自动滚到当前项**。这是行为不是样式：队列可能上百首，旧版打开停在顶部，
- *    正在播的那首可能在第 80 行 —— 高亮做得再好也看不见。
- *
- * 列表仍带 [AUDIO_QUEUE_LIST_MAX_HEIGHT] 上限：不限高会把弹窗撑出屏幕。
+ * 列表仍受 [AUDIO_QUEUE_LIST_MAX_HEIGHT] 上限约束：不限高会使弹窗超出屏幕。
  */
 @Composable
 internal fun NowPlayingQueueDialog(
     /**
-     * 弹窗是否可见（2026-10-14 修「点歌后关闭动画丢失」）。
+     * 弹窗是否可见。
      *
-     * 这个参数是必须的：弹窗的离场动画由 [UfiDialogShell] 的 mounted-state 模式负责
-     * （先跑离场 ramp，跑完才真正卸载窗口），而它**只在 `visible` 翻 false 时才启动**。
-     * 之前这里硬写 `visible = true`、由调用点用 `if (showQueue)` 把整棵子树摘掉 ——
-     * 子树一摘，ramp 根本没有机会跑，于是"点一首歌 → 弹窗瞬间消失"。
-     * 现在调用点常驻组合这棵子树、只翻 `visible`，关闭那条路（点外部 / 返回键 / ×）
-     * 也照样有动画。
+     * 该参数为必需：弹窗的离场动画由 [UfiDialogShell] 的 mounted-state 模式负责
+     * （先执行离场 ramp，完成后才卸载窗口），且**仅在 `visible` 翻为 false 时启动**。
+     * 若硬写 `visible = true`、由调用点用 `if (showQueue)` 摘除整棵子树，ramp 无法执行，
+     * 表现为「点一首歌 → 弹窗瞬间消失」。因此调用点常驻组合该子树、仅翻转 `visible`，
+     * 使关闭路径（点外部 / 返回键 / ×）同样具有动画。
      */
     visible: Boolean,
     queueRows: List<AudioQueueRow>,
@@ -1559,24 +1518,23 @@ internal fun NowPlayingQueueDialog(
     val listState = rememberLazyListState()
 
     /*
-     * 「编辑顺序」模式：开了之后每行右侧从「时长 + −」换成「↑ ↓ −」。
+     * 「编辑顺序」模式：开启后每行右侧由「时长 + −」替换为「↑ ↓ −」。
      *
-     * ## 为什么是模式切换 + 按钮，不是长按拖拽
-     * 拖拽是更好的交互，但这里的行是 `UfiListRowCard`（冻结签名的公共件，内部自带
-     * `combinedClickable`）。要在它外面接 `detectDragGesturesAfterLongPress`，就得和它
-     * 内部的点击手势争仲裁 —— 谁先消费长按、拖拽中要不要屏蔽 onClick、跨行边界时
-     * LazyColumn 的自动滚边怎么接，每一条都只能在真机上试出来。
-     * 那是一轮独立的工作，不该夹在这次改动里半做。
+     * ## 使用模式切换 + 按钮而非长按拖拽
+     * 行组件为 `UfiListRowCard`（签名冻结的公共组件，内部自带 `combinedClickable`）。
+     * 若在其外部接入 `detectDragGesturesAfterLongPress`，需与其内部点击手势做仲裁：
+     * 长按由谁消费、拖拽期间是否屏蔽 onClick、跨行边界时 LazyColumn 的自动滚动如何接入，
+     * 均需真机验证，属于独立工作。
      *
-     * ↑↓ 按钮在功能上是完备的（任意顺序都排得出来），只是慢一点。
+     * ↑↓ 按钮在功能上完备（可实现任意顺序），仅效率较低。
      *
-     * ## 为什么要模式而不是常显 ↑↓
-     * 一行右侧本来已经有「时长 + −」，再塞两个图标要挤掉时长 —— 而时长是平时更常看的信息。
-     * 排序是低频操作，值得多点一下进模式。
+     * ## 使用模式而非常显 ↑↓
+     * 行右侧已有「时长 + −」，再添加两个图标将挤占时长；时长为更高频信息。
+     * 排序是低频操作，进入模式所需的一次额外点击可以接受。
      */
     var reorderMode by remember { mutableStateOf(false) }
-    // 每次打开都回到"不编辑顺序"（2026-10-14）：这棵子树现在常驻组合（见 [visible] 的说明），
-    // 不重置的话上次退出时的编辑态会跨次保留 —— 而 `if (showQueue)` 那个版本天然没这问题。
+    // 每次打开都重置为「不编辑顺序」：该子树常驻组合（见 [visible] 的说明），
+    // 不重置会使上次退出时的编辑态保留。
     LaunchedEffect(visible) { if (visible) reorderMode = false }
 
 
@@ -1749,19 +1707,19 @@ private fun QueueRowIconButton(
 }
 
 /**
- * 「这一首正在播」的三根律动条（2026-10-21 由 `QueuePlayingBars` 改名并 internal 化）。
+ * 「这一首正在播」的三根律动条。
  *
- * 只是"在播"的视觉暗示，**不是频谱** —— 它不读音频数据，就是三根按固定节奏反向来回的条。
- * 真做频谱要接 `Visualizer`，那需要录音权限，为一个 20dp 的装饰不值得。
+ * 仅作为「在播」的视觉提示，**不是频谱**：不读取音频数据，仅由三根条按固定节奏反向运动。
+ * 实现真实频谱需接入 `Visualizer` 并申请录音权限，对一个 20dp 的装饰元素不适用。
  *
- * 三根条的峰高与起跳延迟都写死（[EQ_BARS]）：错开才像在跳，同步就成了一个整体在缩放。
+ * 三根条的峰高与起跳延迟固定（[EQ_BARS]）：错开相位才能呈现跳动效果，同步会表现为整体缩放。
  *
- * 两处共用：队列弹窗的行首，以及音乐列表（[MediaAudioList]）封面上那层角标。共用同一个
- * 高度与条宽，两处才不会出现"弹窗里是 14dp、列表里变成 10dp"的错位。
+ * 队列弹窗行首与音乐列表（[MediaAudioList]）封面角标共用该组件，高度与条宽保持一致，
+ * 避免两处尺寸不一致。
  *
- * @param playing 暂停时画成**静止**的三根条：仍然一眼看出"这是当前这首"，但不假装还在跳。
- *   实现上刻意用 `state.value`（而不是 `by` 委托）读动画值 —— 暂停分支不读就不会订阅，
- *   无限动画也就不再逐帧请求下一帧。
+ * @param playing 暂停时绘制**静止**的三根条：仍可识别为当前曲目，但不表现持续跳动。
+ *   实现上使用 `state.value`（而非 `by` 委托）读取动画值：暂停分支不读取即不订阅，
+ *   无限动画因此不再逐帧请求下一帧。
  */
 @Composable
 internal fun UfiPlayingBars(color: Color, playing: Boolean = true) {
@@ -1817,66 +1775,60 @@ internal data class AudioQueueRow(
 )
 
 
-// internal 而不是 private（2026-10-14）：覆盖层里那张"飞行封面"要用同一套尺寸与圆角，
-// 否则它和播放页这张在交接那一刻会有肉眼可见的错位/圆角差。
+// 声明为 internal 而非 private：覆盖层中的「飞行封面」需使用同一套尺寸与圆角，
+// 否则交接时与播放页封面存在可见错位或圆角差异。
 internal val AUDIO_COVER_SIZE = 260.dp
 internal val AUDIO_COVER_CORNER = 20.dp
 
 /**
- * 播放页那张封面在 Coil **内存缓存**里的键（2026-10-21）。
+ * 播放页封面在 Coil **内存缓存**中的键。
  *
- * ## 为什么要自己拼一个
- * Coil 的默认键里含它内部解析出来的请求选项，**预取**（`enqueue`，无 target）与**显示**
- * （`AsyncImage`，带约束）两条路径各自 build 出来的请求很难保证逐字节相同 —— 于是预取
- * 白做：显示那一刻仍然是"解一帧空白"。自己拼一个只含「尺寸 + URL」的键之后，两边必然对上。
+ * ## 为什么需要自定义键
+ * Coil 的默认键包含其内部解析出的请求选项，**预取**（`enqueue`，无 target）与**显示**
+ * （`AsyncImage`，带约束）两条路径构建的请求难以保证完全一致，导致预取失效：
+ * 显示时仍需解码，出现空白帧。自定义键仅含「尺寸 + URL」，两侧必然一致。
  *
- * 尺寸必须进键：迷你条那 48dp、飞行封面那 260dp 会解出不同像素的位图，共用一个键的话
- * 小图会顶掉大图（封面被放大成一团糊）。
+ * 尺寸必须计入键：迷你条 48dp 与飞行封面 260dp 会解码出不同像素的位图，
+ * 共用一个键会使小图覆盖大图（封面被放大后模糊）。
  */
 internal fun audioCoverMemoryCacheKey(url: String, px: Int): String = "audio-cover@${px}px:$url"
 
-/** 封面的圆角形状。**常量化**：图层参数比较的是引用，逐帧新建会被当成"形状变了"。 */
+/** 封面的圆角形状。**必须常量化**：图层参数按引用比较，逐帧新建会被判定为「形状变化」。 */
 private val AUDIO_COVER_SHAPE = RoundedCornerShape(AUDIO_COVER_CORNER)
 
 /**
- * 封面阴影的满档高度。见 [rememberCoverShadowFactor]：页内浮层那条路会在打开/收起时
- * 沿 [UfiMotion.Duration.Gentle] 淡入淡出，导航那条路恒为满档（与原来的 `.shadow(18.dp)` 等价）。
- * internal：覆盖层里那张飞行封面要按同一个值长阴影（见 `UfiRiseFlyingCover`）。
+ * 封面阴影的满档高度。见 [rememberCoverShadowFactor]：页内浮层路径在打开/收起时
+ * 沿 [UfiMotion.Duration.Gentle] 淡入淡出，导航路径恒为满档（与原 `.shadow(18.dp)` 等价）。
+ * internal：覆盖层中的飞行封面需按同一值绘制阴影（见 `UfiRiseFlyingCover`）。
  */
 internal val AUDIO_COVER_SHADOW = 18.dp
 
 /**
- * 暂停时封面缩到这个比例。
+ * 暂停时封面缩放到的比例。
  *
- * 2026-09-16 从 0.88 收到 0.96：0.88 在 260dp 上是 31dp 的位移，暂停/播放来回按几次像在抖，
- * 而这个动作要表达的只是"停住了"这一点点状态差。
+ * 取 0.96 而非 0.88：0.88 在 260dp 上产生 31dp 位移，反复播放/暂停时呈抖动感，
+ * 而该动作仅需表达「已暂停」的状态差异。
  */
 private const val AUDIO_COVER_PAUSED_SCALE = 0.96f
 
-// ── 切歌动画（2026-09-22 重做：淡叠 + 超调落位 + 景深对焦 + 时序递进）────────────
-//
-// ## 为什么整段推翻重写
-// 旧实现是「封面横滑屏宽 1/3 + 淡入」，只有封面参与，且方向由
-// `targetState >= initialState`（比较曲目 **id**）决定 —— 随机播放或乱序队列下方向是错的。
-// 新方案**不需要方向**：随机播放、点队列里任意一首、自动续播都是同一个动作。
+// ── 切歌动画（淡叠 + 超调落位 + 景深对焦 + 时序递进）────────────
 //
 // ## 动作构成
-// · 新封面：`1.05 → 0.996 → 1`（超调一下再落位）叠加 `blur 9dp → 0`（像镜头对焦）
-// · 旧封面：缩到 0.96 + 糊到 7dp 淡出
-// · 文字：4dp 上浮，曲名 / 歌手 / 歌词按 `UfiMotion.STAGGER_DELAY_MS` 顺延
+// · 新封面：`1.05 → 0.996 → 1`（超调后落位）叠加 `blur 9dp → 0`（景深对焦）
+// · 旧封面：缩到 0.96 + 模糊到 7dp 后淡出
+// · 文字：上浮 4dp，曲名 / 歌手 / 歌词按 `UfiMotion.STAGGER_DELAY_MS` 顺延
 //
-// ## 三条约束（改之前先读）
-// 1. **blur 只能加在内层、且要在 clip 之前**。封面是两层 Box：外层挂 shared element
-//    且几何必须稳定，内层才做变换（见上方约 630 行的注释）。这里用
-//    `BlurredEdgeTreatment(圆角)` 把糊出来的边直接裁掉，否则会溢出圆角。
-//    `Modifier.blur` 在 **API < 31 上静默无效果**（不是崩）—— 那正是本方案的回落形态：
-//    低版本退化成「只有超调 + 递进」，观感仍然成立。
-// 2. **超调必须用 keyframes，不要用 spring**。这里是「1.05 → 0.996 → 1」三段定值，
-//    keyframes 可控可测；spring 的停顿点会随起始速度变，连点下一首时每次幅度都不一样。
-// 3. **文字不能进 AnimatedContent**（理由见约 700 行的注释），所以它的进场是对
-//    **同一个节点**做 alpha + translationY，节点不复制。
+// ## 三条约束
+// 1. **blur 只能加在内层、且位于 clip 之前**。封面为两层 Box：外层挂 shared element
+//    且几何必须稳定，内层才做变换。此处用 `BlurredEdgeTreatment(圆角)` 裁掉模糊边缘，
+//    否则会溢出圆角。`Modifier.blur` 在 **API < 31 上静默无效**（不崩溃），
+//    本方案在该版本回落为「仅超调 + 递进」，观感仍成立。
+// 2. **超调必须使用 keyframes，不使用 spring**。此处为「1.05 → 0.996 → 1」三段定值，
+//    keyframes 可控可测；spring 的停顿点会随起始速度变化，连续点击下一首时幅度不一致。
+// 3. **文字不进入 AnimatedContent**，因此其进场是对**同一节点**应用 alpha + translationY，
+//    节点不复制。
 
-/** 切歌动画基准时长。取现成档位而不是写裸数字（调参停在 290，最近的档位是 280）。 */
+/** 切歌动画基准时长。使用现成档位而非裸数字（调整值为 290，最近的档位为 280）。 */
 private const val AUDIO_SWITCH_MS = UfiMotion.Duration.Gentle
 
 /**
@@ -1898,15 +1850,15 @@ private const val AUDIO_SWITCH_OVERSHOOT_AT = 0.62f
 private val AUDIO_SWITCH_BLUR_IN = 14.dp
 
 /**
- * 换封面时的交叉淡入淡出时长（2026-10-21）。
+ * 换封面时的交叉淡入淡出时长。
  *
- * 用户报「切歌那一下封面是硬换的，过渡不流畅」。原来请求里写的是 `crossfade(false)` ——
- * 新图解好就直接替换像素。现在交给 Coil 的 `CrossfadeTransition`：它从**上一张**
- * （也就是 `placeholderMemoryCacheKey` 给的那张旧封面）淡到新的，中间不会露出近白底。
+ * 请求使用 Coil 的 `CrossfadeTransition` 而非 `crossfade(false)`：后者在新图解码完成后
+ * 直接替换像素；前者从**上一张**（即 `placeholderMemoryCacheKey` 提供的那张旧封面）
+ * 淡入新图，中间不会露出近白底。
  *
- * 260ms 比切歌动画本身（[AUDIO_SWITCH_COVER_MS] = 320ms）略短，于是"图像换完"发生在
- * "缩放/模糊落位"之前一点点 —— 观感上是先对上焦、再站稳，而不是两件事同时结束。
- * 冷启动后第一次加载（还没有旧封面可淡）时，这一段就是"从背景淡入"，也不突兀。
+ * 260ms 略短于切歌动画本身（[AUDIO_SWITCH_COVER_MS] = 320ms），使「图像替换完成」略早于
+ * 「缩放/模糊落位」：观感为先对焦、再落位，而非两者同时结束。冷启动后首次加载
+ * （尚无旧封面可淡）时，该段表现为从背景淡入，同样自然。
  */
 private const val AUDIO_COVER_CROSSFADE_MS = 260
 
@@ -1945,24 +1897,23 @@ private fun audioSwitchScaleAt(progress: Float): Float =
     }
 
 /**
- * 封面阴影的显示系数（2026-10-20）：`0` = 没有阴影，`1` = 满档 [AUDIO_COVER_SHADOW]。
+ * 封面阴影的显示系数：`0` = 无阴影，`1` = 满档 [AUDIO_COVER_SHADOW]。
  *
- * 只对页内浮层那条路径（[riseFollow]）做淡入淡出：封面是从飞行封面手里接过来的，
- * 静态阴影会在接手那一帧"一刀切"出现（用户报的"阴影突然出现"）。
- * 导航那条路没有这个时刻，恒为 1 —— 与原来写死的 `.shadow(18.dp)` 逐像素一致。
+ * 仅对页内浮层路径（[riseFollow]）做淡入淡出：封面由飞行封面交接而来，静态阴影会在
+ * 交接帧突然出现。导航路径无此交接时刻，系数恒为 1，与原写死的 `.shadow(18.dp)` 逐像素一致。
  *
- * 返回 `State` 而不是 `Float`：调用点只把它交给 `graphicsLayer {}`，绘制期读值就够，
- * **不会**让整块封面（含 AsyncImage）每帧重组。
+ * 返回 `State` 而非 `Float`：调用点仅将其交给 `graphicsLayer {}`，绘制期读值即可，
+ * **不会**使整块封面（含 AsyncImage）每帧重组。
  */
 @Composable
 private fun rememberCoverShadowFactor(riseFollow: Boolean): State<Float> {
     /*
-     * ★ 2026-10-20 六修：`UfiAudioRisePanel.open` **不能在组合里读**。
+     * ★ `UfiAudioRisePanel.open` **不得在组合中读取**。
      *
-     * 它恰好是在"按下返回（close）"那一帧翻转的状态。在组合期读它 = 那一下让**整页**重组；
-     * 而这一帧正是关闭动画起步的一帧 —— 用户报的「按下返回的瞬间抖一下」最可能就出在这里。
-     * 现在改成 snapshotFlow 在 effect 里观察：组合期一个 State 都不读，翻转只推动这个
-     * Animatable（它只在 `graphicsLayer` 里被读到，属于绘制期），页面不重组。
+     * 该状态在「按下返回（close）」那一帧翻转。在组合期读取会使**整页**在该帧重组，
+     * 而这一帧正是关闭动画起始帧，表现为「按下返回瞬间抖动」。
+     * 因此改用 snapshotFlow 在 effect 中观察：组合期不读取任何 State，翻转仅推动该
+     * Animatable（仅在 `graphicsLayer` 中被读取，属于绘制期），页面不重组。
      */
     val factor = remember { Animatable(1f) }
     if (!riseFollow) return remember { mutableStateOf(1f) }
@@ -1989,21 +1940,21 @@ private fun rememberCoverShadowFactor(riseFollow: Boolean): State<Float> {
 }
 
 /**
- * 切歌进度：`0` = 刚换歌，`1` = 已落位。封面的缩放与模糊都由它派生。
+ * 切歌进度：`0` = 刚换歌，`1` = 已落位。封面的缩放与模糊均由其派生。
  *
- * ## 为什么"首次组合"和"从没有曲目到有曲目"都不播
- * 列表是异步拉的：这一页刚组合时 `current` 还是 null（trackKey = -1），几帧后才变成真正那一首。
- * 只对"首次组合"做 snap 是不够的 —— -1 → 真 id 同样会触发一次播放，而时间点正好压在
- * 打开动画（导航 RISE 或页内上滑）的后半段。落位那一刻真封面接手时它还在 1.05 → 1.0 的
- * 收尾里，用户看到的就是「封面到位后又缩一下」（2026-10-20 报的就是这条）。
+ * ## 首次组合与「从无曲目到有曲目」均不播放动画
+ * 列表异步加载：页面刚组合时 `current` 为 null（trackKey = -1），数帧后才变为真实曲目。
+ * 仅对「首次组合」做 snap 不足：-1 → 真实 id 同样会触发一次播放，且时间点落在
+ * 打开动画（导航 RISE 或页内上滑）的后半段。落位时真封面接手，动画仍处于 1.05 → 1.0
+ * 的收尾阶段，表现为「封面到位后又缩放一次」。
  *
- * 所以判据改成"上一次的键是否存在且是真实曲目"：`-1` 只表示"还没拿到曲目"，
- * 从它到真曲目是**初始化**，不是换歌。
+ * 因此判据改为「上一次的键存在且为真实曲目」：`-1` 仅表示「尚未取得曲目」，
+ * 从它到真实曲目属于**初始化**，不是换歌。
  *
- * ## 为什么 remember 不放在 reduceMotion 判断后面
- * 条件式 `remember` 是 Compose 的硬错误：`reduceMotion` 在运行期可以被用户改，
- * 一变就会让后面的 remember 槽位整体错位。所以无论如何都先 remember，
- * 分支只写在 [LaunchedEffect] 里面。
+ * ## remember 不放在 reduceMotion 判断之后
+ * 条件式 `remember` 是 Compose 的硬错误：`reduceMotion` 可在运行期被用户修改，
+ * 一旦变化会使后续 remember 槽位整体错位。因此始终先执行 remember，
+ * 条件分支仅写在 [LaunchedEffect] 内。
  */
 @Composable
 private fun rememberAudioSwitchProgress(trackKey: Long, reduceMotion: Boolean): Float {
@@ -2075,21 +2026,21 @@ private fun audioMetaEnterModifier(
 }
 
 /*
- * ── 共享元素的开关版（2026-10-14）────────────────────────────────────────────
+ * ── 共享元素的开关版本 ────────────────────────────────────────────
  *
  * 本页有两条呈现路径：导航目的地（`Routes.MEDIA_AUDIO`）与音乐页的页内浮层
- * （[MediaAudioRisePanel]，见那个文件的说明）。后者与迷你条同处一棵树，同一个 key
- * 同帧出现两次是 `UfiSharedTransition.kt` 里记下的禁区，所以那条路径整页不挂共享元素。
+ * （[MediaAudioRisePanel]）。后者与迷你条同处一棵树，同一个 key 同帧出现两次属于
+ * `UfiSharedTransition.kt` 记录的禁用情形，因此该路径整页不挂共享元素。
  *
- * 写成 `xxxIf` 而不是在调用点铺 `if`：调用点有五处（封面 / 歌名 / 歌手 / 进度条 / 三颗键），
- * 每处都写一遍条件既啰嗦又容易漏 —— 漏一处的表现是"面板打开时某个节点突然开始参与匹配"，
- * 属于最难查的那类。这里一处开关，五个调用点跟着走。
+ * 统一封装为 `xxxIf` 而非在各调用点写 `if`：调用点有五处（封面 / 歌名 / 歌手 / 进度条 /
+ * 三颗键），逐一编写条件既冗余又易漏；漏一处会使某个节点在面板打开时意外参与匹配。
+ * 此处集中开关，五个调用点统一遵循。
  */
 @Composable
 private fun Modifier.ufiSharedElementIf(enabled: Boolean, key: String): Modifier =
     if (enabled) ufiSharedElement(key) else this
 
-/** 见 [ufiSharedElementIf]。文字类要传 `scaleContent = false`，理由见 `ufiSharedBounds`。 */
+/** 见 [ufiSharedElementIf]。文字类传入 `scaleContent = false`，理由见 `ufiSharedBounds`。 */
 @Composable
 private fun Modifier.ufiSharedBoundsIf(
     enabled: Boolean,
@@ -2098,14 +2049,14 @@ private fun Modifier.ufiSharedBoundsIf(
 ): Modifier = if (enabled) ufiSharedBounds(key, scaleContent) else this
 
 /**
- * 页内浮层那条路径的封面槽**上报**（2026-10-20 拆成两个开关）。
+ * 页内浮层路径的封面槽**上报**（拆为两个开关）。
  *
- * 为什么拆：上报要挂在**带缩放的那一层**（暂停 0.96 / 切歌缩放都要算进飞行封面的落点），
- * 而"藏起真封面"要挂在**外层**（缩放不该影响让位/透明度）。合成一个 modifier 时两者只能
- * 选同一层，于是要么落点不含缩放（交接缩 4%）、要么让位也跟着缩放。
+ * 拆分原因：上报需挂在**带缩放的图层**（暂停 0.96 / 切歌缩放均需计入飞行封面落点），
+ * 而「隐藏真封面」需挂在外层（缩放不应影响让位/透明度）。合并为一个 modifier 时两者只能
+ * 选同一层，导致落点不含缩放（交接缩 4%）或让位也随缩放变化。
  *
- * 2026-10-20 五修：把 `pagerState` 传进去，只在封面页**停稳**时上报 —— 详见
- * `ufiRiseCoverSlotReport` 的说明（分页滑动会把这一块的窗口坐标带着左右跑）。
+ * `pagerState` 传入后仅在封面页**停稳**时上报，详见 `ufiRiseCoverSlotReport` 的说明
+ * （分页滑动会带动该区域的窗口坐标）。
  */
 @Composable
 private fun Modifier.ufiRiseCoverSlotReportIf(
@@ -2128,8 +2079,8 @@ private const val AUDIO_GRADIENT_ALPHA = 0.22f
 /**
  * 页面左右内边距。
  *
- * 2026-09-16 从 `Spacing.Large`（12dp）加到 24dp：12dp 在 6 英寸屏上让封面与文字几乎贴边，
- * 底部两排控件也被挤到屏幕边缘。播放页是"只看一件事"的页面，边距该比列表页更松。
+ * 取 24dp 而非 `Spacing.Large`（12dp）：12dp 在 6 英寸屏上使封面与文字几乎贴边，
+ * 底部两排控件也被挤至屏幕边缘。播放页为单一焦点页面，边距应大于列表页。
  */
 private val AUDIO_PAGE_PADDING = 24.dp
 
@@ -2139,24 +2090,24 @@ private const val AUDIO_PAGE_LYRICS = 1
 private const val AUDIO_PAGE_COUNT = 2
 
 /**
- * 翻页效果的三个幅度（2026-10-21）。
+ * 翻页效果的三个幅度。
  *
- * 离场那一页：透明度 → 1 − 0.55、缩放 → 0.94、上移 18dp。三样都刻意取小：
- * 目的是让两页"分层"，不是做成卡片轮播 —— 幅度一大，封面在划到一半时就会明显跳一下。
+ * 离场页：透明度 → 1 − 0.55、缩放 → 0.94、上移 18dp。三者均取小值：
+ * 目的是使两页「分层」，而非卡片轮播；幅度过大时封面在划到一半时会明显跳动。
  */
 private const val AUDIO_PAGE_SWITCH_FADE = 0.55f
 private const val AUDIO_PAGE_SWITCH_SHRINK = 0.06f
 private val AUDIO_PAGE_SWITCH_RISE = 18.dp
 
 /**
- * 封面 ⇄ 歌词翻页时，两页各自的进场 / 退场效果。
+ * 封面 ⇄ 歌词翻页时两页各自的进场 / 退场效果。
  *
- * 读 `pagerState` 的位置**只在绘制期**（`graphicsLayer` 的块每帧末执行），所以：
- * · 手指划到哪儿效果就跟到哪儿，不需要另起一条动画去对时；
- * · 不会因为读 State 把整页（尤其封面）重组 —— 与 Tab 那条 `selected = { }` 同一个理由。
+ * `pagerState` 的位置**仅在绘制期**读取（`graphicsLayer` 块每帧末执行），因此：
+ * · 手指划到何处效果即跟随到何处，无需另起动画对时；
+ * · 不会因读取 State 使整页（尤其封面）重组 —— 与 Tab 的 `selected = { }` 同理。
  *
- * `alpha` 留了 45% 的底而不是淡到 0：两页的底色是同一张 accent 渐变，淡到 0 会在
- * 交界处露出后面的空白，看着像"抽搐一下"。
+ * `alpha` 保留 45% 底值而不淡到 0：两页底色为同一张 accent 渐变，淡到 0 会在交界处
+ * 露出后方空白，产生抖动感。
  */
 private fun Modifier.ufiPageSwitchEffect(state: PagerState, page: Int): Modifier =
     this.graphicsLayer {
@@ -2171,30 +2122,29 @@ private fun Modifier.ufiPageSwitchEffect(state: PagerState, page: Int): Modifier
     }
 
 /**
- * 封面页的纵向排布（2026-10-14）：**「封面 + 歌名 + 歌手」这一组居中，歌词挂在它的正下方**。
+ * 封面页的纵向排布：**「封面 + 歌名 + 歌手」这一组居中，歌词位于其正下方**。
  *
- * ## 为什么不直接用 `Arrangement.Center`
- * 用 Center 的话，歌词会被算进"要居中的那一整块"里：有歌词时整块变高、组被顶上去半个
- * 歌词块，于是换一首有无歌词的歌，封面就上下跳一次 —— 正是 2026-09-22 修掉的那个病。
- * 用户要的是"没有歌词时忽略歌词区域、重新居中"，反过来也必须是同一句话：
- * **歌词区永远不参与这一组的居中**。所以这里自己写一条排布规则。
+ * ## 不使用 `Arrangement.Center`
+ * 使用 Center 会将歌词计入「需居中的整块」：有歌词时整块变高、组上移半个歌词块高度，
+ * 切换有无歌词的曲目时封面上下跳动。因此自定义排布规则，保证
+ * **歌词区始终不参与该组的居中**。
  *
- * ## 这一页的孩子不是一个，是五个（2026-10-14 修 "歌名跑到封面上方"）
- * 第一版把 `sizes[0]` 当成"那一组"、`sizes[1]` 当成歌词，只给这两个下标写了位置 ——
- * 而真实的 Column 里那一组是**五个并列的孩子**：封面 / 间距 / 歌名 / 间距 / 歌手
- *（`Arrangement.arrange` 只拿到每个孩子的尺寸，不知道谁包着谁）。
- * 于是第 3 个孩子往后全落在 `outPositions` 的默认值 0 上 —— 表现就是**歌名与歌手被顶到
- * 页面最上方、压在封面之上**，有歌词时歌词又正好落在它们原来的位置上，看起来像重叠。
- * 现在按 [groupChildCount] 逐个排下去，最后一个孩子（如果有）才是歌词。
+ * ## 该页包含五个孩子
+ * 若仅将 `sizes[0]` 视为组、`sizes[1]` 视为歌词，只设置这两个下标的位置，则真实的
+ * Column 中该组是**五个并列的孩子**：封面 / 间距 / 歌名 / 间距 / 歌手
+ * （`Arrangement.arrange` 只能取得每个孩子的尺寸，不知道嵌套关系）。
+ * 第 3 个孩子之后的位置将保持 `outPositions` 的默认值 0，表现为**歌名与歌手被顶到
+ * 页面最上方、覆盖在封面之上**；有歌词时歌词落在其原位置，形成重叠。
+ * 因此按 [groupChildCount] 逐项排列，最后一个孩子（若存在）为歌词。
  *
- * ## 放不下的时候
- * 组的居中优先；只有当"组 + 间距 + 歌词"超出可用高度时，才把组上移**恰好够放下歌词**
- * （不会越过顶边）—— 小屏上宁可少一点留白，也不要把歌词裁掉。
- * 这一段只在屏幕真的放不下时才生效，那时封面位移的幅度也远小于"整块居中"的跳法。
+ * ## 高度不足时
+ * 组居中优先；仅当「组 + 间距 + 歌词」超出可用高度时，才将组上移**恰好容纳歌词**的量
+ * （不越过顶边）。小屏上宁可减少留白，也不裁掉歌词。
+ * 该分支仅在屏幕确实放不下时生效，此时封面位移幅度远小于「整块居中」的方案。
  *
  * @param groupChildCount 参与居中的孩子个数（封面 / 间距 / 歌名 / 间距 / 歌手 = 5）。
- *   剩下的那个孩子是歌词：它不参与居中，被摆到组的正下方。调用点必须与实际的孩子数一致，
- *   多一个少一个都会让歌词被当成组的一部分（或反过来）。
+ *   剩余孩子为歌词：不参与居中，置于组的正下方。调用点必须与实际孩子数一致，
+ *   多一个或少一个都会改变歌词与组的划分。
  */
 private class AudioCoverPageArrangement(private val groupChildCount: Int) : Arrangement.Vertical {
     override fun Density.arrange(totalSize: Int, sizes: IntArray, outPositions: IntArray) {
@@ -2223,11 +2173,11 @@ private class AudioCoverPageArrangement(private val groupChildCount: Int) : Arra
 }
 
 /**
- * 封面页里"参与居中的那一组"由几个孩子组成：封面 / 间距 / 歌名 / 间距 / 歌手。
+ * 封面页中「参与居中的那一组」的孩子个数：封面 / 间距 / 歌名 / 间距 / 歌手。
  *
- * ⚠ 改这一页的版式时（比如给歌名下面再加一行专辑名）**必须同步改这个数** ——
- * 排布规则靠"前 N 个是组、第 N+1 个是歌词"来分工，数字对不上就会出现
- * 2026-10-14 那个 bug 的翻版：多出来的孩子被当成歌词摆到组的下方去。
+ * 修改该页版式时（例如在歌名下方增加专辑名行）**必须同步修改该值**：
+ * 排布规则按「前 N 个为组、第 N+1 个为歌词」划分，数字不一致会使多出的孩子被当作歌词
+ * 摆到组的下方。
  */
 private const val AUDIO_COVER_PAGE_GROUP_CHILDREN = 5
 
@@ -2244,8 +2194,8 @@ private val AUDIO_TAB_INDICATOR_HEIGHT = 3.dp
 /**
  * 底部控件区与屏幕底边之间的留白。
  *
- * 页面壳已经扣掉了导航栏/手势条的安全区，这一段是额外的**手够得着**余量：
- * 贴着屏幕最下沿的按钮拇指要伸到边缘才点得到，且容易与系统的边缘手势打架。
+ * 页面壳已扣除导航栏/手势条的安全区，该段为额外的**可触达余量**：
+ * 贴近屏幕最下沿的按钮需要拇指伸至边缘才能点击，且易与系统边缘手势冲突。
  */
 private val AUDIO_CONTROLS_BOTTOM_LIFT = 40.dp
 
@@ -2317,8 +2267,8 @@ private val MEDIA_CONTROL_ICON_SLOT = 52.dp
 @Composable
 private fun MediaPlayerTabs(
     /*
-     * 取值 lambda 而不是 Int（2026-10-20 六修）：见调用点那段说明 —— 把
-     * `pagerState.currentPage` 的读作用域收进本函数，翻页时才不会连累整页（尤其封面）重组。
+     * 取值 lambda 而非 Int：将 `pagerState.currentPage` 的读取作用域限制在本函数内，
+     * 翻页时才不会引起整页（尤其封面）重组。
      */
     selected: () -> Int,
     onSelect: (Int) -> Unit
@@ -2335,12 +2285,11 @@ private fun MediaPlayerTabs(
         AUDIO_TAB_LABELS.forEachIndexed { index, label ->
             val active = index == selectedIndex
             /*
-             * 切页的过渡（2026-10-21）：选中态原来是**硬切**（文字样式、颜色、下划线底一次跳完），
-             * 配合下面 Pager 的翻页动画会显得"两件事各做各的"。现在三样各自补间：
-             * · 下划线宽度 0 → 满档（像从文字中间长出来）；
+             * 切页过渡：选中态由**瞬时切换**改为三项分别补间：
+             * · 下划线宽度 0 → 满档（从文字中间展开）；
              * · 下划线颜色 透明 → accent；
              * · 文字颜色 secondary → primary。
-             * 时长统一走 [UfiMotion.Duration.Standard]，与 Pager 那一侧同一节奏。
+             * 时长统一使用 [UfiMotion.Duration.Standard]，与 Pager 侧保持同一节奏。
              */
             val indicatorWidth by animateDpAsState(
                 targetValue = if (active) AUDIO_TAB_INDICATOR_WIDTH else 0.dp,
@@ -2383,15 +2332,15 @@ private fun MediaPlayerTabs(
 }
 
 /**
- * 播放控制里的一个动作：图标 + **下方文字说明**。
+ * 播放控制中的一个动作：图标 + **下方文字说明**。
  *
- * 2026-09-16 加文字：纯图标对"循环 / 随机"这类三态开关尤其不友好 —— 图标只能表达
- * "有这个功能"，表达不了"现在是哪一档"。文字与图标一起变（"列表循环" / "单曲循环" / "不循环"）。
+ * 纯图标对「循环 / 随机」这类三态开关表达不足：图标只能表达「具备该功能」，
+ * 无法表达「当前档位」。文字与图标同步变化（「列表循环」/「单曲循环」/「不循环」）。
  *
- * @param active 高亮态（循环/随机开启时用 accent），与 [enabled]（能不能点）是两件事。
- * @param sharedKey 跨页面共享元素的 key（见 [ufiSharedBounds]）；`null` = 这颗键在迷你条上
- *                  没有对端，不参与转场。主控三键（上一首 / 播放暂停 / 下一首）都传值，
- *                  下面那排次要动作（循环 / 随机 / 队列）迷你条上没有，所以都是 null。
+ * @param active 高亮态（循环/随机开启时使用 accent），与 [enabled]（是否可点击）含义不同。
+ * @param sharedKey 跨页面共享元素的 key（见 [ufiSharedBounds]）；`null` 表示该键在迷你条上
+ *                  没有对端，不参与转场。主控三键（上一首 / 播放暂停 / 下一首）均传值；
+ *                  次要动作（循环 / 随机 / 队列）在迷你条上没有对端，均为 null。
  */
 @Composable
 private fun MediaControlAction(
@@ -2417,23 +2366,23 @@ private fun MediaControlAction(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         /*
-         * 图标放进一个**固定尺寸的正方形槽**里居中，而不是直接摆 Icon。
+         * 图标放入**固定尺寸的正方形槽**内居中，而非直接放置 Icon。
          *
-         * 2026-09-20 修①：这一排三个键的图标不一样大（上/下首 34dp、播放 52dp），
-         * 外层 Row 又是 `Alignment.Top` —— 于是三个图标的**顶边**对齐，圆心差了 9dp，
-         * 看着就是播放键偏下、文字也跟着错行。统一槽高之后圆心与下方文字都在同一水平线上。
+         * 该排三个键的图标尺寸不同（上/下首 34dp、播放 52dp），外层 Row 使用
+         * `Alignment.Top`，三个图标的**顶边**对齐而圆心相差 9dp，表现为播放键偏下、
+         * 文字随之错行。统一槽高后，圆心与下方文字位于同一水平线。
          *
-         * 2026-09-20 修②：槽从 `height()` 改成 `size()`。只约束高度时宽度是 wrap content
-         * （= 图标宽度），于是这个槽的长宽比随图标大小变（34×52 / 52×52）；而迷你条那端
-         * 是 40×40 的正方形，共享元素补间时两端长宽比不同，图标就在一个被拉扁/拉长的框里跳。
-         * 定成正方形之后两端只差"尺寸"、不差"比例"，缩放才是单纯的变大变小。
+         * 槽使用 `size()` 而非 `height()`：仅约束高度时宽度为 wrap content（= 图标宽度），
+         * 槽的长宽比会随图标尺寸变化（34×52 / 52×52）；而迷你条对端为 40×40 正方形，
+         * 共享元素补间时两端长宽比不同，图标会在被拉伸的框内跳动。固定为正方形后，
+         * 两端仅尺寸不同、比例一致，缩放即单纯的等比变化。
          *
-         * 共享元素也挂在这个槽上，而不是整个 Column：Column 里还有文字，
-         * 把文字一起补间会让"暂停"两个字从迷你条那颗光秃秃的按钮里凭空长出来。
-         * 槽的尺寸是常量、与图标大小无关，是这一列里几何最稳的那个节点。
+         * 共享元素挂在该槽上而非整个 Column：Column 还包含文字，若文字一并补间，
+         * 会从迷你条的纯按钮中「长出」文字。槽尺寸为常量、与图标尺寸无关，
+         * 是该列中几何最稳定的节点。
          *
-         * 用 ufiSharedBounds 而不是 ufiSharedElement：两端尺寸差 12dp 且内容是**不会**
-         * 随约束自适应的图标，必须整体缩放而不是重新测量，理由见该函数的注释。
+         * 使用 ufiSharedBounds 而非 ufiSharedElement：两端尺寸相差 12dp，且内容为
+         * **不会**随约束自适应的图标，需整体缩放而非重新测量，理由见该函数注释。
          */
         val sharedSlot = if (sharedKey != null) {
             Modifier.ufiSharedBounds(sharedKey)
@@ -2469,15 +2418,15 @@ private fun MediaControlAction(
  * 那个在列表里 0 就该什么都不显示。
  */
 /**
- * 播放模式（2026-10-14）：把原来的"循环"与"随机"两个开关收成**一个四档模式**。
+ * 播放模式：将原「循环」与「随机」两个开关合并为**单一四档模式**。
  *
- * ## 为什么合成一档
- * 那两个开关本来是正交的（可以"随机 + 单曲循环"），但那个组合在用户眼里几乎无法理解 ——
- * 单曲循环下随机其实不生效，而界面上两颗键都亮着。用户要的是"我现在处于哪种播放方式"，
- * 所以收成一个循环切换的四档。
+ * ## 合并原因
+ * 两个开关原为正交（可组合为「随机 + 单曲循环」），但该组合难以理解：单曲循环下随机
+ * 实际不生效，而界面两键同时高亮。用户需要的是「当前处于哪种播放方式」，
+ * 因此合并为一个可循环切换的四档模式。
  *
  * ## 顺序
- * 列表循环 → 单曲循环 → 不循环 → 随机模式，用户给的顺序，`next()` 按它循环。
+ * 列表循环 → 单曲循环 → 不循环 → 随机模式，`next()` 按该顺序循环。
  */
 private enum class AudioPlayMode(val label: String) {
     ListLoop("列表循环"),
@@ -2505,9 +2454,9 @@ private enum class AudioPlayMode(val label: String) {
 /**
  * 把一档模式写回播放器。
  *
- * 随机模式配的是 **REPEAT_MODE_ALL**，不是 OFF：随机的语义是"把整个列表打乱着放"，
- * 放到头就该绕回去；配 OFF 的话随机放完最后一首就停了，与"随机模式"这个名字给人的预期不符。
- * （用户说随机的细节"另外讨论"，这里先按最不意外的一种落地，改动只在 `applyPlayMode` 一处。）
+ * 随机模式对应 **REPEAT_MODE_ALL**，而非 OFF：随机的语义是「将整个列表打乱后播放」，
+ * 播放到末尾应回到开头；若配置 OFF，随机播放完最后一首即停止，与「随机模式」的预期不符。
+ * 实现集中在 `applyPlayMode` 一处。
  */
 private fun applyPlayMode(controller: Player, mode: AudioPlayMode) {
     controller.shuffleModeEnabled = mode == AudioPlayMode.Shuffle

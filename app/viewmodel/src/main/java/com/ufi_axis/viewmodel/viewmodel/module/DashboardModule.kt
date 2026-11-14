@@ -13,7 +13,8 @@ import com.ufi_axis.data.repository.WebSocketRepository
 import com.ufi_axis.data.notification.NotificationCenter
 import com.ufi_axis.data.notification.NotifyPrefs
 import com.ufi_axis.util.*
-// 2026-10-05 P5：smartRefresh 消费 summary / RECONNECTED sentinel（contract 唯一取值表）
+// smartRefresh 消费 summary / RECONNECTED sentinel（取值以 contract 为准）
+import com.ufi_axis_core.contract.WsChannel
 import com.ufi_axis_core.contract.WsDataTopic
 import com.ufi_axis_core.util.UiFrameGate
 import com.ufi_axis.viewmodel.repository.AlertPrefsRepository
@@ -35,16 +36,16 @@ class DashboardModule(
     private val scope: CoroutineScope,
     private val alertPrefs: AlertPrefsRepository,
     /**
-     * 跨模块 UI 事件出口（2026-09-22，阶段 3.3）。
+     * 跨模块 UI 事件出口。
      *
      * **刻意不把 [_events] 整条转发到这个 sink**（Network / Tools 是那么做的）：
      * `_events` 现在只跑 `AlertDeleted`，由 `MonitorScreen` 直接收集 `dashboard.events` 处理；
      * 整条转发会让 `AlertDeleted` 也流经 `MainViewModel.collectCrossModuleEvents`，
-     * 虽然那边现在是空分支、行为不变，但等于给一条已经工作的链路加了第二个订阅者。
-     * 写操作提示直投 sink，两条路各自独立 —— 改这一条不会碰到删除成功那一条。
+     * 该分支当前为空、行为不变，但仍会为一条已工作的链路增加第二个订阅者。
+     * 写操作提示直接投递到 sink，两条链路相互独立，修改其一不影响另一条。
      *
-     * 给了默认值只为让**单元测试**能继续用原来的 6 参构造（它们测的是取数与并发，
-     * 不关心提示通道）。生产路径由 `MainViewModel` 显式传入真 sink。
+     * 默认值仅用于让**单元测试**沿用六参构造（测试关注取数与并发，不涉及提示通道）。
+     * 生产路径由 `MainViewModel` 显式传入真实 sink。
      */
     private val crossModuleEventSink: MutableSharedFlow<UiEvent> =
         MutableSharedFlow(extraBufferCapacity = 16)
@@ -65,7 +66,7 @@ class DashboardModule(
     private val _monitorState = MutableStateFlow(MonitorState())
     val monitorState: StateFlow<MonitorState> = _monitorState.asStateFlow()
 
-    /** 按天事件计数（月历热力，2026-10-23）：`yyyy-MM-dd` → 条数。 */
+    /** 按天事件计数（月历热力）：`yyyy-MM-dd` → 条数。 */
     private val _alertDailyCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
     val alertDailyCounts: StateFlow<Map<String, Int>> = _alertDailyCounts.asStateFlow()
 
@@ -89,14 +90,18 @@ class DashboardModule(
     val events: SharedFlow<UiEvent> = _events.asSharedFlow()
 
     /**
-     * 写操作成功提示（2026-09-22）：直投 [crossModuleEventSink] → `MainViewModel.writeNotice`
-     * → Activity 级 Toast 宿主，与失败提示同一个出口。
+     * 写操作成功提示：直接投递到 [crossModuleEventSink] → `MainViewModel.writeNotice`
+     * → Activity 级 Toast 宿主，与失败提示共用同一个出口。
      *
-     * 文案要说清**是哪一项**生效了：监控设置四个二级页共用同一个 [setMonitorSettings]，
-     * 「保存成功」这种泛化文案让用户分不清落地的是采集间隔还是保留天数。
+     * 文案必须指明**生效的是哪一项**：监控设置四个二级页共用同一个 [setMonitorSettings]，
+     * 泛化的「保存成功」无法区分落地的是采集间隔还是保留天数。
      */
-    private fun emitWriteNotice(message: String, subtitle: String? = null) {
-        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    private fun emitWriteNotice(
+        message: String,
+        subtitle: String? = null,
+        type: WriteNoticeType = WriteNoticeType.SUCCESS,
+    ) {
+        crossModuleEventSink.tryEmit(UiEvent.ShowWriteNotice(message, subtitle, type))
     }
 
     private val _updateState = MutableStateFlow(UpdateState())
@@ -116,10 +121,10 @@ class DashboardModule(
      *
      * 只服务于「页面前台化时该不该立刻重拉」这一个判断，见 [foregroundRefreshDelayMs]。
      * 与 [dashboardSummaryCacheTime] 的分工：后者是**响应体缓存**的 TTL（3s，可以让一次
-     * 重拉直接吃缓存，但仍然会走一遍状态写 + 重组）；本字段管的是**连请求都不要发**。
+     * 重拉直接命中缓存，但仍会走一遍状态写 + 重组）；本字段决定是否连请求都不发送。
      *
      * 刻意用 `SystemClock.elapsedRealtime()` 而不是 `System.currentTimeMillis()`：
-     * 后者可被用户改，改一下就会把陈旧数据判成新鲜（或反之）。理由详见 `DataFreshness.kt`。
+     * 后者可被系统时间调整改写，会把陈旧数据判成新鲜（或反之）。理由详见 `DataFreshness.kt`。
      */
     @Volatile private var dashboardSuccessElapsed: Long = 0L
     private val DASHBOARD_CACHE_TTL_MS = 3000L
@@ -148,8 +153,8 @@ class DashboardModule(
      *
      * core 的 `WebSocketPushService` 把 `id`/`value`/`threshold` 放在 `data.extra` 里，
      * 顶层只有 `type`/`level`/`title`/`message`/`timestamp`（ms）。
-     * 此前从顶层取这三个字段 → 恒为 id=0、value=""、threshold=""，
-     * 导致告警详情无值、且 NotificationCenter 的 (timestamp, id) 复合游标退化。
+     * 从顶层取这三个字段会得到恒定的 id=0、value=""、threshold=""，
+     * 导致告警详情无值，并使 NotificationCenter 的 (timestamp, id) 复合游标退化。
      */
     private fun parsePushedAlert(dataObj: JsonObject): AlertRecord {
         val extra = dataObj["extra"] as? JsonObject
@@ -168,8 +173,8 @@ class DashboardModule(
     /**
      * 这条推送是不是「看着像告警但不是告警记录」的类型（`download` / `tunnel`）。
      *
-     * 2026-09-07：这两种推送 core **不写 alert_records** —— 包进 [parsePushedAlert] 塞进
-     * `MonitorState.alerts` 只会让事件中心多出两条列表里查不到的"告警"，还会推进告警游标。
+     * 这两种推送 core **不写 alert_records**：包进 [parsePushedAlert] 再写入
+     * `MonitorState.alerts` 只会让事件中心多出两条列表里查不到的「告警」，还会推进告警游标。
      * 而它们的系统通知已经由 `:ufi_notify` 的 `NotifyService` 渲染
      * （`notifyDownloadResult` / `notifyTunnelFailure`），再走 `maybeNotifyNewAlerts`
      * 就是同一个事件渲染两遍：app 在前台时主进程还会把它转交给通知进程。
@@ -177,9 +182,9 @@ class DashboardModule(
      * 判定与「只提醒一次」的记账全在 core（`DownloadManager.notifyTaskResult` /
      * `TunnelManager.notifyGiveUp`），app 这边只是丢弃，不做任何判断。
      *
-     * 两条 WS 分支都要用它：`WebSocketPushService.push` 把同一份载荷同时广播到
-     * `notification` 与 `alert` 两个频道。将来若有页面需要跟着刷新（如下载列表），
-     * 单独接一条明确的路径，别再把它们塞回告警流。
+     * 两条 WS 分支都必须调用该判定：`WebSocketPushService.push` 把同一份载荷同时广播到
+     * `notification` 与 `alert` 两个频道。若页面需要跟随刷新（如下载列表），
+     * 应接一条独立路径，不应写回告警流。
      */
     private fun isNonAlertPush(dataObj: JsonObject?): Boolean =
         when (dataObj?.get("type")?.jsonPrimitive?.content) {
@@ -207,8 +212,8 @@ class DashboardModule(
             appContext.registerReceiver(alertReceiver, filter)
         }
 
-        // 首刷仅需让出启动间隙（WS 连接/缓存装配），150ms 足够；
-        // 旧 500ms 叠加后端聚合串行延迟，仪表盘首屏明显慢于其他页面
+        // 首刷只需让出启动间隙（WS 连接/缓存装配），150ms 足够；
+        // 500ms 会与后端聚合的串行延迟叠加，使仪表盘首屏明显慢于其他页面
         scope.launch { delay(150); refreshDashboard() }
         checkForUpdate()
     }
@@ -226,8 +231,8 @@ class DashboardModule(
     /**
      * 丢掉本机仪表盘 Room 缓存（切换/退出设备时）。
      *
-     * 缓存是**全局一份**、不按设备分桶：换到另一台 Core 后若不清，
-     * 首屏会先 paint 上一台的 CPU/流量再被新数据盖掉，看起来像「数据串台」。
+     * 缓存为**全局一份**、不按设备分桶：切换到另一台 Core 后若不清除，
+     * 首屏会先渲染上一台的 CPU/流量，随后被新数据覆盖，表现为「数据串台」。
      */
     suspend fun clearDashboardCache() {
         runCatching { cacheManager.clearCache() }
@@ -306,22 +311,31 @@ class DashboardModule(
     // ── WebSocket ──
 
     /**
-     * 转场期间攒下的实时指标（2026-08-31 掉帧治理③）。
+     * 转场期间暂存的实时指标。
      *
      * `scope` 是 viewModelScope（主线程），而页面在根节点收 `dashboardState` 这一个大对象 ——
-     * 一条 WS 推送就是一次整屏重组。稳态无所谓，但落在转场那 300ms 里会与
-     * 「两页同时绘制 + 全屏模糊」叠加，直接超帧预算（表现为转场随机卡一下）。
+     * 一条 WS 推送就是一次整屏重组。稳态下无影响，但落在转场那 300ms 内会与
+     * 「两页同时绘制 + 全屏模糊」叠加，直接超出帧预算（表现为转场偶发掉帧）。
      *
-     * 所以转场进行中（[UiFrameGate.isBusy]）把 cpu/内存/流量/信号这四个**可延迟**的指标
-     * 攒进这里，转场结束后一次性刷入。告警 / 通知 / 配置同步不走这条路 —— 那些要求即时可见。
+     * 所以转场进行中（[UiFrameGate.isBusy]）把 cpu/内存/流量/信号/连接态这五个**可延迟**的
+     * 指标攒进这里，转场结束后一次性刷入。告警 / 通知 / 配置同步不走这条路 —— 那些要求即时可见。
      */
     @Volatile private var pendingRealtime: DashboardState? = null
+
+    /**
+     * 转场期间暂存的 `ppp_status`。
+     *
+     * 单独存一个字段而不是复用 [pendingRealtime] 的 `networkStatus`：flush 时只能把
+     * `ppp_status` 合并到**当前**的 `networkStatus` 上，不能整体覆盖 —— 转场那几百毫秒里
+     * summary REST 可能刚落地了更新的 operator / mobile_data / network_type。
+     */
+    @Volatile private var pendingPppStatus: String? = null
     private var realtimeFlushJob: Job? = null
 
     /**
-     * 写入一个实时指标：空闲时立即生效，转场进行中先攒着。
+     * 写入一个实时指标：空闲时立即生效，转场进行中先暂存。
      *
-     * flush 时只覆盖四个实时字段（不是整体覆盖 `pendingRealtime`）——
+     * flush 时只覆盖实时字段（不是整体覆盖 `pendingRealtime`）——
      * 转场那几百毫秒里 REST 刷新也可能落地，整体覆盖会把它的结果冲掉。
      */
     private fun applyRealtime(transform: (DashboardState) -> DashboardState) {
@@ -333,15 +347,54 @@ class DashboardModule(
         if (realtimeFlushJob?.isActive == true) return
         realtimeFlushJob = scope.launch(Dispatchers.Default) {
             UiFrameGate.awaitIdle()
-            val pending = pendingRealtime ?: return@launch
+            val pending = pendingRealtime
+            val pendingPpp = pendingPppStatus
             pendingRealtime = null
-            _dashboardState.update {
-                it.copy(
-                    cpuInfo = pending.cpuInfo,
-                    memoryInfo = pending.memoryInfo,
-                    trafficRealtime = pending.trafficRealtime,
-                    signalInfo = pending.signalInfo,
-                )
+            pendingPppStatus = null
+            _dashboardState.update { current ->
+                var next = current
+                if (pending != null) {
+                    next = next.copy(
+                        cpuInfo = pending.cpuInfo,
+                        memoryInfo = pending.memoryInfo,
+                        trafficRealtime = pending.trafficRealtime,
+                        signalInfo = pending.signalInfo,
+                    )
+                }
+                // 只合并 ppp_status，不能整体覆盖 networkStatus —— 转场期间 summary REST
+                // 可能刚落地了更新的 operator / mobile_data / network_type。
+                if (pendingPpp != null && next.networkStatus != null) {
+                    next = next.copy(networkStatus = next.networkStatus.copy(ppp_status = pendingPpp))
+                }
+                next
+            }
+        }
+    }
+
+    /**
+     * 写入一条实时连接态。
+     *
+     * 与 [applyRealtime] 同一套转场门控，但**不碰** `networkStatus` 的其它字段：
+     * 只对 `ppp_status` 做 merge。这样 summary REST（operator / mobile_data / network_type）
+     * 与 connection WS（ppp）可以并行落地，谁都不会把对方冲掉。
+     */
+    private fun applyConnectionRealtime(pppStatus: String) {
+        if (!UiFrameGate.isBusy) {
+            _dashboardState.update { state ->
+                state.copy(networkStatus = state.networkStatus?.copy(ppp_status = pppStatus))
+            }
+            return
+        }
+        pendingPppStatus = pppStatus
+        if (realtimeFlushJob?.isActive == true) return
+        realtimeFlushJob = scope.launch(Dispatchers.Default) {
+            UiFrameGate.awaitIdle()
+            val pendingPpp = pendingPppStatus ?: return@launch
+            pendingPppStatus = null
+            _dashboardState.update { current ->
+                if (current.networkStatus != null) {
+                    current.copy(networkStatus = current.networkStatus.copy(ppp_status = pendingPpp))
+                } else current
             }
         }
     }
@@ -375,16 +428,24 @@ class DashboardModule(
                                 changed = true
                             }
                         } catch (e: Exception) { DebugLog.parseError("WS", "traffic", message.data?.toString() ?: "", e) }
-                        "signal" -> try {
-                            message.data?.let { element ->
-                                val parsed = AppJson.decodeFromJsonElement<SignalInfo>(element)
-                                applyRealtime { it.copy(signalInfo = parsed) }
-                                changed = true
-                            }
-                        } catch (e: Exception) { DebugLog.parseError("WS", "signal", message.data?.toString() ?: "", e) }
+                        // 与网络页共用同一个解码函数（RealtimeSignalParser.kt）。
+                        // 两处各写一份 when/decode，频道名与坏帧语义会逐渐分叉，
+                        // 进而出现「仪表盘正常、网络页一直无服务」这类通路不一致问题。
+                        WsChannel.SIGNAL -> signalFromWsMessage(message)?.let { parsed ->
+                            applyRealtime { it.copy(signalInfo = parsed) }
+                            changed = true
+                        }
+                        // 实时连接态。core 在采集 signal 的同一次 goform 查询中已取得 ppp_status，
+                        // 该频道不产生额外设备开销；缺少它时，仪表盘 hero 卡的
+                        // 「已连接/未连接」只能等待 10s 的 summary 轮询。
+                        WsChannel.CONNECTION -> pppStatusFromWsMessage(message)?.let { ppp ->
+                            applyConnectionRealtime(ppp)
+                            // 不置 changed：networkStatus 不进 Room 缓存（saveToCache 没有它），
+                            // 置了只会把 debounceSaveToCache 的 5s 计时再推后一次。
+                        }
                         "alert" -> {
-                            // P0-C：后端 WS alert payload 已升级为包含完整详情，
-                            // 2026-08-25：优先尝试直接处理推送数据，失败则回退拉取列表
+                            // WS alert 载荷包含完整详情：优先直接处理推送数据，
+                            // 失败时回退为拉取列表。
                             try {
                                 val dataObj = message.data as? JsonObject
                                 when {
@@ -415,12 +476,12 @@ class DashboardModule(
                         "notification" -> {
                             // 业务类推送（短信 / 验证码 / 下载 / 隧道）的**主进程入口**。
                             //
-                            // 2026-09-14：主进程此前不订阅 `notification`（`WsChannel.UI_TOPICS` 把它剔除了），
-                            // 而短信 / 验证码只在这个频道广播（`PushChannel.SINGLE_TOPIC_SCENES`），
-                            // 唯一订阅方 `:ufi_notify` 又只在「前台服务保活」开启后才建 WS ——
-                            // 于是保活关着时这几类系统通知一条都发不出来（邮件由 core 自己发，照常）。
-                            // 现在主进程订上该频道并把载荷交给 NotificationCenter，由它的进程门
-                            // 转交 `:ufi_notify` 发射（显式广播会自动拉起那个进程）。
+                            // 短信 / 验证码只在该频道广播（`PushChannel.SINGLE_TOPIC_SCENES`），
+                            // 而 `WsChannel.UI_TOPICS` 不包含 `notification`，唯一订阅方 `:ufi_notify`
+                            // 也只在「前台服务保活」开启后才建立 WS；保活关闭时这类系统通知无法发出
+                            // （邮件由 core 自行发送，不受影响）。
+                            // 因此主进程订阅该频道并把载荷交给 NotificationCenter，由它的进程门
+                            // 转交 `:ufi_notify` 发射（显式广播会自动拉起该进程）。
                             //
                             // 这里**只认业务类 type**：告警形状的载荷仍由 `alert` 分支独家处理，
                             // 否则 core 的 `notification` + `alert` 双发会让同一条告警被处理两遍。
@@ -474,7 +535,7 @@ class DashboardModule(
                             }
                         }
                         "config_changed" -> try {
-                            // P2 多端同步：另一设备（或本机其他端）改了告警配置 → 即时覆盖本地镜像。
+                            // 多端同步：另一设备（或本机其他端）修改告警配置后，立即覆盖本地镜像。
                             // payload.data.config 是 AlertConfig 的 JSON 字符串。
                             val dataObj = message.data as? JsonObject
                             val configJson = dataObj?.get("config")?.toString()
@@ -533,10 +594,10 @@ class DashboardModule(
      * 预加载 / 前台化用的刷新入口。与 [refreshDashboard] 的**唯一**区别：
      * 不取消在飞的刷新，数据够新时直接不发请求。
      *
-     * 为什么需要单独一个入口：[refreshDashboard] 无条件 `refreshJob?.cancel()`，
-     * 那是"手动刷新"该有的语义（用户按了按钮，上一次的结果已经不重要了）。
-     * 但预加载与页面自身的首次加载几乎同时发生，两边都调 [refreshDashboard] 就是
-     * 后来的把前面的掐掉、来回浪费一次聚合请求。这里改成"已经有人在拉就让它拉完"。
+     * 需要独立入口的原因：[refreshDashboard] 无条件执行 `refreshJob?.cancel()`，
+     * 这符合手动刷新的语义（用户已触发新请求，上一次的结果不再重要）。
+     * 但预加载与页面自身的首次加载几乎同时发生，两者都调用 [refreshDashboard] 时，
+     * 后发请求会取消先发请求，浪费一次聚合请求。本入口在已有请求在飞时直接返回。
      *
      * 新鲜度窗口用默认的 [FOREGROUND_REFRESH_INTERVAL_MS]（= 页面轮询周期），
      * 语义与 `startAutoRefresh` 的首轮 hold-off 一致，不会出现"轮询刚刷过、
@@ -553,8 +614,8 @@ class DashboardModule(
     }
 
     /**
-     * 换设备 / 换地址后丢掉新鲜度基准。与 [clearDashboardCache] 同一批调用 ——
-     * 只清 Room 不清戳，新设备首屏会因为旧戳还在窗口内而跳过请求。
+     * 换设备 / 换地址后清除新鲜度基准。与 [clearDashboardCache] 同批调用：
+     * 只清 Room 缓存而不清基准时，新设备首屏会因旧基准仍在窗口内而跳过请求。
      */
     fun resetFreshness() {
         dashboardSuccessElapsed = 0L
@@ -562,31 +623,31 @@ class DashboardModule(
 
     /**
      * 实际刷新逻辑（suspend）。
-     * - 15 秒超时保护，防止 API 挂起导致下拉动画卡死
+     * - 15 秒超时保护，避免 API 挂起导致下拉动画无法结束
      * - forceRefresh 绕过前端 5 秒缓存
      * - auto-refresh 直接调用此方法，确保等待完成后才 delay
      *
-     * #15 dashboard/summary 已切到结构化模型 [DashboardSummaryResponse]（kotlinx.serialization），
-     * 直接按字段取用，无需逐字段 Gson 解析。
+     * dashboard/summary 使用结构化模型 [DashboardSummaryResponse]（kotlinx.serialization），
+     * 按字段直接取用，无需逐字段 Gson 解析。
      */
     private suspend fun refreshDashboardInternal(forceRefresh: Boolean = false) {
         // 增加并发守卫：避免 auto-refresh 与 manual-refresh 同时打向后端聚合接口
         refreshSemaphore.withPermit {
-            // ── 「有数据时静默刷新」（2026-09-05 掉帧治理：横滑落定后的重组风暴）──
+            // ── 有数据时静默刷新 ──
             //
-            // 这一行原来是无条件 `it.copy(isLoading = true, errorMessage = null)`。
-            // 它是**同步整页写**：`scope` 是 viewModelScope（`Dispatchers.Main.immediate`）+
-            // `CoroutineStart.DEFAULT`，主线程调用时 `isDispatchNeeded == false`，协程体内联开跑，
-            // 于是 `pageForeground` 翻转的那一帧里 `DashboardState` 实例就换了一份 ——
-            // `DashboardScreen` 整页 + 3 张大卡 + `MonitorScreen`（也 collect 了 dashboardState）
-            // 全部重组。横滑落定时屏幕上还有可见运动（胶囊归位 +80~460ms），这一下就是"顿"。
+            // 无条件执行 `it.copy(isLoading = true, errorMessage = null)` 会产生一次
+            // **同步整页写**：`scope` 是 viewModelScope（`Dispatchers.Main.immediate`）+
+            // `CoroutineStart.DEFAULT`，主线程调用时 `isDispatchNeeded == false`，协程体内联执行，
+            // 因此 `pageForeground` 翻转的那一帧会替换 `DashboardState` 实例，
+            // 使 `DashboardScreen` 整页 + 3 张大卡 + `MonitorScreen`（也 collect 了 dashboardState）
+            // 全部重组。横滑落定时屏幕上仍有可见运动（胶囊归位 +80~460ms），叠加后表现为顿挫。
             //
-            // 而 `isLoading` 唯一的可见用途是骨架屏，判据是
-            // `state.isLoading && state.deviceInfo == null`（DashboardScreen）——
-            // 也就是说**有数据时把它翻成 true 没有任何 UI 效果**，纯粹是白付一次整页重组。
-            // 所以：没数据才写 loading（首次加载的骨架屏反馈完整保留）；有数据时只在确实
-            // 需要清错误横幅时写一次；两者都不满足就原样返回 —— `MutableStateFlow` 对
-            // 结构相等的新值不会发射（`DashboardState` 是 data class），零重组。
+            // `isLoading` 唯一的可见用途是骨架屏，判据为
+            // `state.isLoading && state.deviceInfo == null`（DashboardScreen），
+            // 即**有数据时将其置为 true 不产生任何 UI 效果**，只会多付一次整页重组。
+            // 因此：无数据时才写 loading（首次加载的骨架屏反馈完整保留）；有数据时仅在
+            // 需要清除错误横幅时写一次；两者都不满足则原样返回 —— `MutableStateFlow` 对
+            // 结构相等的新值不发射（`DashboardState` 是 data class），不产生重组。
             _dashboardState.update { current ->
                 when {
                     current.deviceInfo == null -> current.copy(isLoading = true, errorMessage = null)
@@ -615,12 +676,25 @@ class DashboardModule(
                     return
                 }
 
-                // 注意：参数在调用前求值，所以这里必须先判 enabled —— 否则日志关掉了也照样把
-                // 整个 dashboard 响应序列化一遍（每 5s 一次自动刷新都在白烧 CPU）
+                // 参数在调用前求值，因此必须先判断 enabled；否则即使日志已关闭，仍会序列化
+                // 整个 dashboard 响应（每 5s 一次自动刷新持续消耗 CPU）
                 if (DebugLog.enabled) {
                     DebugLog.json("Dashboard", "Summary response", AppJson.encodeToString<DashboardSummaryResponse>(response).take(2000))
                 }
 
+                // 切 Tab 落定前的顿挫：把本次结果延后到转场结束之后再写。
+                //
+                // 链路：点 Tab → 入页 `pageForeground` 翻真 → 立刻发 summary，同时在
+                // `primeRealtimeFieldsIfMissing()` 里再补 2~3 个请求。局域网内这批响应落在
+                // **30–250ms** 之后，正好压在页面转场（≈350–420ms）的**最后 100–200ms**。
+                // 而这里的 `_dashboardState.update` 是一次**同步整页写**：仪表盘整页 +
+                // MonitorScreen（它也 collect 同一个 state）一起重组，叠加在 Pager 的
+                // 逐帧滚动上，表现为动画结尾的顿挫。
+                //
+                // 转场闸门即为此存在（WS 指标路径已采用，见 `applyRealtime`），
+                // 此处将同一条约束应用到 HTTP 路径：转场中先暂存，落定后立刻写。
+                // 代价：数据晚 ~100–300ms 出现，而这段时间页面仍在滑入，观感上不可见。
+                if (UiFrameGate.isBusy) UiFrameGate.awaitIdle()
                 _dashboardState.update { current ->
                     current.copy(
                         deviceInfo = response.device_info,
@@ -629,35 +703,42 @@ class DashboardModule(
                         uptimeInfo = response.uptime,
                         trafficSummary = response.traffic_summary,
                         trafficLimitConfig = response.traffic_limit,
-                        networkStatus = response.network_status,
+                        // summary 的 ppp_status 为空串表示本轮未读到，不能据此判定为断开。
+                        // 保留上一帧的非空值；真正的实时值由 connection WS 持续覆盖。
+                        networkStatus = response.network_status?.let { fresh ->
+                            val prev = current.networkStatus
+                            if (fresh.ppp_status.isBlank() && prev != null) {
+                                fresh.copy(ppp_status = prev.ppp_status)
+                            } else fresh
+                        } ?: current.networkStatus,
                         isLoading = false, errorMessage = null,
                         lastUpdated = System.currentTimeMillis()
                     )
                 }
                 saveToCache()
-                // 2026-09-07：cpu/memory/signal 不在 summary 里（只走 WS 推送）。首次连接时
-                // Room 缓存为空，而 core 的实时采集循环在无连接期间躺在 idle 间隔上，首帧可能
-                // 迟到十几秒到一分钟——表现就是「仪表盘首连 CPU/内存/hero 制式一直是占位，
-                // 退出 App 重进才有」（重进是缓存命中）。这里对仍为空的字段做一次 REST 补拉。
+                // cpu/memory/signal 不在 summary 里（只走 WS 推送）。首次连接时
+                // Room 缓存为空，而 core 的实时采集循环在无连接期间处于 idle 间隔，首帧可能
+                // 迟到十几秒到一分钟，表现为「仪表盘首连 CPU/内存/hero 制式一直是占位，
+                // 退出 App 重进才有」（重进为缓存命中）。因此对仍为空的字段做一次 REST 补拉。
                 primeRealtimeFieldsIfMissing()
-                // 新鲜度基准：只在**成功落地**后记，失败/超时/取消都不记 ——
-                // 否则一次失败会把接下来 10s 的重拉全部跳过（"越坏越不刷"）。
+                // 新鲜度基准：仅在**成功落地**后记录，失败/超时/取消均不记录，
+                // 否则一次失败会跳过接下来 10s 的全部重拉。
                 dashboardSuccessElapsed = SystemClock.elapsedRealtime()
-                // T09：固件版本来自独立的 goform 接口，首页设备信息卡需要。
+                // 固件版本来自独立的 goform 接口，首页设备信息卡需要。
                 if (_dashboardState.value.deviceVersion == null) {
                     loadDeviceVersionSilently()
                 }
-                // 2026-09-22：EPS 承载 QoS（AT+CGEQOSRDP）同样走独立端点。
+                // EPS 承载 QoS（AT+CGEQOSRDP）同样走独立端点。
                 //
-                // 只在**还没拿到**时拉，绝不跟着 10s 轮询走：AT 通道全局互斥，
-                // core 侧虽然有 5 分钟缓存挡着，但缓存过期那一次仍要真发 AT，
-                // 落在 summary 的关键路径上就可能把整张仪表盘拖住。
-                // 重新驻网后的新值靠用户重进页面（或 App 重启）刷新，够用。
+                // 仅在**尚未取得**时拉取，不跟随 10s 轮询：AT 通道全局互斥，
+                // core 侧虽有 5 分钟缓存，但缓存过期那一次仍需实际发送 AT 指令，
+                // 若落在 summary 的关键路径上会拖慢整张仪表盘。
+                // 重新驻网后的新值依赖重进页面（或 App 重启）刷新。
                 if (_dashboardState.value.deviceQos == null) {
                     loadDeviceQosSilently()
                 }
             } catch (e: Exception) {
-                // 更加鲁棒的取消判定：只要 coroutine 被取消，或者 OkHttp 抛出 Canceled 异常，均视为正常取消。
+                // 取消判定：协程被取消，或 OkHttp 抛出 Canceled 异常，均视为正常取消。
                 val isCancelled = e is CancellationException || 
                                  !currentCoroutineContext().isActive ||
                                  e.message?.contains("Canceled", ignoreCase = true) == true ||
@@ -680,30 +761,30 @@ class DashboardModule(
     /**
      * 启动前台轮询。
      *
-     * ## 「数据新鲜就别重拉」（2026-09-05 掉帧治理）
-     * 本方法的调用点是 `DashboardScreen` 里那条以 `pageForeground` 为 key 的
-     * `DisposableEffect` —— 也就是说**每次横滑回到首页都会重新进来一次**。
-     * 原实现无条件先跑一次 `refreshDashboardInternal()`，于是 settle 后 0~500ms 内
-     * 必然有一次 REST 回包整页写（还叠着 traffic/wifi 两路），落在胶囊归位的可见运动窗口里。
+     * ## 数据新鲜时跳过重拉
+     * 调用点是 `DashboardScreen` 中那条以 `pageForeground` 为 key 的
+     * `DisposableEffect`，即**每次横滑回到首页都会重新进入一次**。
+     * 若无条件先执行一次 `refreshDashboardInternal()`，settle 后 0~500ms 内
+     * 必然出现一次 REST 回包整页写（还叠加 traffic/wifi 两路），落在胶囊归位的可见运动窗口内。
      *
-     * 现在先问一次 [foregroundRefreshDelayMs]：上次成功拉取仍在新鲜窗口内就**只补定时器**
-     * （delay 掉剩余时长），不发这次请求。稳态节奏完全不变 —— 第一次请求恰好落在
-     * "上次成功 + [FOREGROUND_REFRESH_INTERVAL_MS]"那一刻，与一直停留在本页时的时序一致。
+     * 因此先经 [foregroundRefreshDelayMs] 判断：上次成功拉取仍在新鲜窗口内时**只补定时器**
+     * （delay 掉剩余时长），不发送本次请求。稳态节奏不变：第一次请求恰好落在
+     * 「上次成功 + [FOREGROUND_REFRESH_INTERVAL_MS]」那一刻，与一直停留在本页时的时序一致。
      *
-     * 期间数据并不会变旧到看得出来：cpu / 内存 / 流量 / 信号四项走 WebSocket 实时推送，
-     * 被跳过的只有 dashboard/summary 那批"分钟级才会变"的字段（设备信息 / 电池 / 存储 / 运行时长）。
+     * 期间数据不会明显变旧：cpu / 内存 / 流量 / 信号四项走 WebSocket 实时推送，
+     * 被跳过的只有 dashboard/summary 中分钟级变化的字段（设备信息 / 电池 / 存储 / 运行时长）。
      */
     /**
-     * 周期取数暂停闸门（2026-09-14）。返回 true 时下面两个轮询**跳过本轮请求**、只 delay。
+     * 周期取数暂停闸门。返回 true 时下方两个轮询**跳过本轮请求**，仅执行 delay。
      *
-     * 目前唯一的接线方是 `MainViewModel`，接的是「设备端 Core 正在更新」。
-     * 升级期间 HTTP 必然中断约 1 分钟，这两条轮询会持续失败并把 errorMessage 写进 state，
-     * 用户看到满屏「加载告警失败」「连接失败」。
+     * 唯一接线方是 `MainViewModel`，接入的是「设备端 Core 正在更新」。
+     * 升级期间 HTTP 必然中断约 1 分钟，这两条轮询会持续失败并把 errorMessage 写入 state，
+     * 界面上表现为连续的「加载告警失败」「连接失败」。
      *
-     * 为什么是「跳过一轮」而不是 cancel job：这两个 job 的启停归 UI 宿主
-     * （`MainActivity` 管告警轮询、`DashboardScreen` 管首页刷新），从这里 cancel 之后
-     * 谁负责重启就变成了一个需要跨层协调的问题 —— 而且很容易在 Activity 处于后台时
-     * 把轮询重新拉起来。跳过一轮则**零协调、自动恢复**：闸门一放开，下一轮自然继续。
+     * 采用「跳过一轮」而非 cancel job：这两个 job 的启停归 UI 宿主
+     * （`MainActivity` 管告警轮询、`DashboardScreen` 管首页刷新），在此处 cancel 后
+     * 由谁重启需要跨层协调，且容易在 Activity 处于后台时重新拉起轮询。
+     * 跳过一轮则无需协调且能自动恢复：闸门放开后，下一轮自然继续。
      */
     var pollGate: () -> Boolean = { false }
 
@@ -734,8 +815,8 @@ class DashboardModule(
         stopAlertPolling()
         alertPollingJob = scope.launch {
             while (isActive) {
-                // 2026-08-25: 使用 silent=true 避免非监控页刷新时闪烁
-                // 注意 silent 只压 isLoading、压不住 errorMessage，所以更新期间必须靠 pollGate 跳过
+                // silent=true 避免非监控页刷新时闪烁；silent 只抑制 isLoading，不抑制 errorMessage，
+                // 因此 Core 更新期间必须依赖 pollGate 跳过
                 if (!pollGate()) loadAlerts(_monitorState.value.alertRange, silent = true)
                 delay(intervalMs)
             }
@@ -749,11 +830,11 @@ class DashboardModule(
 
     // ── History ──
     companion object {
-        /** 历史记录最大条数：360 ≈ 10秒间隔 × 1小时，UI 图表不需要完整24小时数据 */
+        /** 历史记录最大条数：360 ≈ 10 秒间隔 × 1 小时；UI 图表不需要完整 24 小时数据 */
         private const val MAX_HISTORY_RECORDS = 360
-        /** T12 告警页大小：core 把 limit 钳制在 1..200，传更大只会被静默截断 */
+        /** 告警页大小：core 将 limit 钳制在 1..200，传入更大值会被静默截断 */
         private const val ALERT_PAGE_SIZE = com.ufi_axis_core.contract.Alerts.ListQuery.LIMIT_MAX
-        /** T12 翻页安全上限：10 × 200 = 2000 = core 环形表 `MAX_ALERT_ROWS` 容量 */
+        /** 翻页安全上限：10 × 200 = 2000，等于 core 环形表 `MAX_ALERT_ROWS` 容量 */
         private const val ALERT_MAX_PAGES = 10
     }
 
@@ -777,13 +858,13 @@ class DashboardModule(
 
     // ── Update Check（core 侧）──
     /**
-     * 检查设备端 core 有没有新版本。
+     * 检查设备端 core 是否有新版本。
      *
-     * 2026-09-06 修复：判据原来是 `compareVersions(versionInfo.version, "1.0") > 0` ——
-     * 拿 core 自报版本去跟写死的字符串 "1.0" 比，语义根本不成立：core 0.0.x 恒为 false
-     * （所以一直不弹），而版本号一旦跨过 1.0 就变成**每次冷启动都提示更新**。
-     * 现在改用 `GET /api/update/backend-info` 的 `has_update`：版本比对由 core 自己对着
-     * 清单 backend 对象做，App 端只消费结论，并顺带把 latest_version / changelog 带给弹窗。
+     * 判据为 `GET /api/update/backend-info` 的 `has_update`：版本比对由 core 针对清单
+     * backend 对象完成，App 端只消费结论，并顺带把 latest_version / changelog 传给弹窗。
+     *
+     * 不得用 core 自报版本与写死的 "1.0" 比较（`compareVersions(versionInfo.version, "1.0") > 0`）：
+     * core 0.0.x 恒为 false（永不提示），版本号跨过 1.0 后则**每次冷启动都提示更新**。
      *
      * 两个请求的失败语义**刻意不同**：
      * - `GET /api/config/version` 失败 = 设备不可达 → 整体算失败（写 errorMessage）；
@@ -811,9 +892,9 @@ class DashboardModule(
                     )
                 }
             } catch (e: Exception) {
-                // 只写失败原因，**不要构造新 state** —— 构造会把上一次成功读到的
-                // serverVersion/latestVersion/changelog 全部清空，等于设备临时不可达一次
-                // 就把关于页那行「Core x.y.z」也一起打掉（与本函数 KDoc 的降级约定相反）。
+                // 只更新失败原因，**不构造新 state**：构造会清空上一次成功读到的
+                // serverVersion/latestVersion/changelog，使设备一次临时不可达就抹掉
+                // 关于页的「Core x.y.z」行（与本函数 KDoc 的降级约定相反）。
                 _updateState.update {
                     it.copy(checking = false, errorMessage = "检查更新失败: ${e.message}")
                 }
@@ -830,6 +911,7 @@ class DashboardModule(
     private suspend fun loadDeviceVersionSilently() {
         try {
             val ver = api.getDeviceVersion()
+            if (UiFrameGate.isBusy) UiFrameGate.awaitIdle()
             _dashboardState.update { it.copy(deviceVersion = ver) }
         } catch (_: Exception) {
             // 静默：版本加载失败仅留空，不影响首页其余信息
@@ -837,7 +919,7 @@ class DashboardModule(
     }
 
     /**
-     * 静默加载 EPS 承载 QoS（`AT+CGEQOSRDP` → QCI / 上下行 AMBR），2026-09-22。
+     * 静默加载 EPS 承载 QoS（`AT+CGEQOSRDP` → QCI / 上下行 AMBR）。
      *
      * 与 [loadDeviceVersionSilently] 同一手法：非关键展示字段，失败只留空，不弹错误条。
      *
@@ -847,14 +929,15 @@ class DashboardModule(
     private suspend fun loadDeviceQosSilently() {
         try {
             val qos = api.getDeviceQos()
+            if (UiFrameGate.isBusy) UiFrameGate.awaitIdle()
             _dashboardState.update { it.copy(deviceQos = qos) }
         } catch (_: Exception) {
             // 静默：AT 通道在很多设备上本就不存在，这不是错误
         }
     }
 
-    // 2026-10-08 只读监控档：热区温度拉取（CPU 弹窗展示关键热区）。失败静默——热区读不到
-    // 弹窗就不显示该区，不影响仪表盘其它数据。
+    // 热区温度拉取（CPU 弹窗展示关键热区）。失败静默：热区读不到时弹窗不显示该区，
+    // 不影响仪表盘其它数据。
     private suspend fun loadThermalZonesSilently() {
         try {
             val resp = AppJson.decodeFromJsonElement<ThermalZonesResponse>(api.getThermalZones())
@@ -868,7 +951,7 @@ class DashboardModule(
 
     /**
      * 加载后端 Core 进程首次启动时间（UTC epoch ms）。用于监控页"自定义时间范围"对话框 minDateMs 下限。
-     * 2026-08-08 12:09 新增：app 启动时调用一次即可（startupTime 是常量），不需刷新。
+     * App 启动时调用一次即可（startupTime 为常量），无需刷新。
      */
     fun loadStartupTime() {
         if (_monitorState.value.startupTimeMs != null) return
@@ -945,20 +1028,20 @@ class DashboardModule(
     }
 
     /**
-     * 按类批量清理（2026-09-09：存储管理的清理弹窗支持多选范围）。
+     * 按类批量清理（存储管理的清理弹窗支持多选范围）。
      *
      * core 的 `POST /api/monitor/clean` 一次只吃一个 `type`，所以多类只能逐个发。这里刻意
-     * **在同一个协程里顺序发**，而不是让 UI 循环调 [cleanHistory]：
-     * - 那样会同时起 N 个协程 → N 个并发 POST 打向设备那台单线程 HTTP 服务；
-     * - 每个都会各自写一次 `cleanMessage`、各自触发一次历史 + 存储统计重载，
-     *   最后 toast 只剩最后一条、统计被刷 N 遍。
+     * **在同一个协程里顺序发送**，而不是让 UI 循环调用 [cleanHistory]：
+     * - 后者会同时启动 N 个协程，向设备的单线程 HTTP 服务发出 N 个并发 POST；
+     * - 每个请求都会各写一次 `cleanMessage`、各触发一次历史 + 存储统计重载，
+     *   导致 toast 只保留最后一条、统计被重复刷新 N 次。
      *
-     * 现在：逐个清完汇总成一条消息，历史与统计各只重载一次。
-     * 单类失败不中断后面的（用户选了 5 类，不该因为第 2 类超时就放弃剩下 3 类），
-     * 失败数量并入结果文案 —— 不能只报成功数，那会把"部分失败"说成全成功。
+     * 因此逐个清理后汇总为一条消息，历史与统计各只重载一次。
+     * 单类失败不中断后续类型（例如选中 5 类时，第 2 类超时不应放弃剩余 3 类），
+     * 失败数量并入结果文案 —— 只报成功数会把「部分失败」表述为全部成功。
      *
-     * **全选不要走这里**：调用方应短路成 `cleanHistory(type = "all")` 一个请求
-     *（是否"全选"取决于 UI 那份可清理表清单，本层不做判断）。
+     * **全选不走此路径**：调用方应短路为 `cleanHistory(type = "all")` 单个请求
+     *（是否「全选」取决于 UI 的可清理表清单，本层不做判断）。
      */
     fun cleanHistoryBatch(types: List<String>, days: Int) {
         if (types.isEmpty()) return
@@ -998,10 +1081,10 @@ class DashboardModule(
      * - 默认 range = 今天（MonitorTimeRange.today()，00:00 ~ now，isRealTime=true → 告警轮询）。
      * - 传入历史/自定义 range 时，按 range.queryStartMs/queryEndMs 向后端区间查询（start_time/end_time），
      *   拉取的列表即该日期范围内的全部告警；limit 放大到足够大，避免区间被截断。
-     * - 所有旧调用点 loadAlerts() 仍编译通过（默认今天），行为与原 limit=50 等价。
+     * - 既有调用点 `loadAlerts()` 无需修改（默认今天），行为与 limit=50 等价。
      */
     /**
-     * v20c：事件中心「全部」日期筛选 —— 拉取后端保留的全部告警。
+     * 事件中心「全部」日期筛选：拉取后端保留的全部告警。
      * 不传 start_time/end_time（走后端 limit/cursor 分支）；alertRange 记 Preset(168) 近似
      * （保证告警轮询语义仍开启）。
      */
@@ -1017,16 +1100,16 @@ class DashboardModule(
     }
 
     /**
-     * T12：按游标逐页拉取告警。
+     * 按游标逐页拉取告警。
      *
-     * core 把 `limit` 钳制在 1..200（`Alerts.ListQuery`），旧代码传 `limit = 5000` 时
-     * **服务端静默截断成 200 条** —— "全量"其实只有 200 条，统计与列表都偏少。
+     * core 将 `limit` 钳制在 1..200（`Alerts.ListQuery`）；传入 `limit = 5000` 时
+     * **服务端静默截断为 200 条**，所谓「全量」实际只有 200 条，统计与列表都会偏少。
      *
      * 页大小取 contract 的 `LIMIT_MAX`，页数上限取 core 环形表容量 / 页大小：
      * core 侧 alert_records 是环形表（超过 `AlertEngine.MAX_ALERT_ROWS` = 2000 自动淘汰最旧），
      * 所以 10 页 = 2000 条已覆盖服务端可能保留的全部记录，本地按整表聚合的未读数/分类计数因此仍然准确
      * （这也是没有改用响应里 `counts` 的原因：UI 的计数还叠了客户端日期/已读过滤，
-     * 直接换成服务端计数会改变语义；真正需要服务端计数的是 T40 的服务端过滤场景）。
+     * 直接改用服务端计数会改变语义；服务端计数仅适用于服务端过滤场景）。
      */
     private suspend fun fetchAlertsPaged(
         startTimeMs: Long? = null,
@@ -1061,7 +1144,7 @@ class DashboardModule(
     /**
      * 加载告警列表。
      *
-     * 性能（2026-08-26）：**首页到手立刻渲染，剩余页后台补齐**。
+     * 性能：**首屏立即渲染，剩余页后台补齐**。
      * 区间查询（含默认「今天」）必须翻页才能拿到完整计数（core 把单页 limit 钳在 200，
      * 见 [fetchAlertsPaged] 的说明），但如果等 N 页全部串行拉完再写 state，
      * 进监控页就要干等好几个 RTT 才出内容。所以先用第一页点亮首屏（hero + 聚合列表），
@@ -1089,6 +1172,9 @@ class DashboardModule(
                 return@launch
             }
             DebugLog.d("Dashboard", "loadAlerts first page: ${firstPage.alerts.size} hasMore=${firstPage.hasMore}")
+            // 告警列表同样受转场闸门管辖（与本文件图表序列那条同一纪律）：
+            // 它会一次性替换整个告警列表，落在转场里就是监控页整块重组。
+            if (UiFrameGate.isBusy) UiFrameGate.awaitIdle()
             _monitorState.update { s ->
                 s.copy(
                     alerts = firstPage.alerts,
@@ -1097,7 +1183,7 @@ class DashboardModule(
                     alertsLoaded = true
                 )
             }
-            // 2026-08-25: 修复多进程去重逻辑后，在此处触发主进程 Toast
+            // 多进程去重由 NotificationCenter 承担，此处只触发主进程 Toast
             notificationCenter.maybeNotifyNewAlerts(firstPage.alerts)
 
             val cursor = firstPage.nextCursor
@@ -1127,7 +1213,7 @@ class DashboardModule(
     }
 
     /** 全部已读（总览事件卡「全部已读」按钮）：按当前 alertRange 重拉。
-     *  P3-5：改用 POST /ack-all 批量接口，消除逐条 ack 的 N+1 请求。 */
+     *  使用 POST /ack-all 批量接口，消除逐条 ack 的 N+1 请求。 */
     fun ackAllAlerts() {
         val pending = _monitorState.value.alerts.filter { !it.acknowledged }
         if (pending.isEmpty()) return
@@ -1166,10 +1252,10 @@ class DashboardModule(
     }
 
     /**
-     * P3（应用内通知）：banner 关闭时的已读处理。
+     * 应用内通知：banner 关闭时的已读处理。
      *
-     * 语义：用户通过 banner 看到并关闭某条告警 → 将该类型（type）全部未读一次性置为已读，
-     * 而非只 ack 单条——banner 代表的是「该类事件已注意到」。走 POST /ack-all 批量接口，
+     * 语义：用户通过 banner 看到并关闭某条告警时，将该类型（type）的全部未读一次性置为已读，
+     * 而非只 ack 单条——banner 代表「该类事件已注意到」。走 POST /ack-all 批量接口，
      * 一次请求完成，消除逐条 N+1。成功后按当前 alertRange 重拉对账。
      *
      * @param type banner 关闭时携带的告警类型（作为批量定位条件）
@@ -1190,10 +1276,10 @@ class DashboardModule(
      * 删除单条告警（事件中心「长按事件卡 → 删除」，UI 侧已做二次确认）。
      *
      * 采用「乐观更新 + 失败回滚」：
-     * - 先把该条从 [MonitorState.alerts] 摘掉 → 列表立刻消失，无需等网络往返（本机 Core，通常 <50ms，
-     *   但轮询间隔下若等重拉会有明显迟滞感）；
-     * - 成功后按当前 alertRange 重拉，与服务端对账（顺带纠正并发新增/其它端删除）；
-     * - 失败则回填错误提示并重拉，把被乐观移除的那条恢复回来（数据源仍是服务端，天然不会脏）。
+     * - 先从 [MonitorState.alerts] 摘除该条，列表立即消失，无需等待网络往返（本机 Core 通常 <50ms，
+     *   但按轮询间隔等待重拉会有明显迟滞）；
+     * - 成功后按当前 alertRange 重拉，与服务端对账（同时纠正并发新增/其它端删除）；
+     * - 失败则回填错误提示并重拉，恢复被乐观移除的条目（数据源仍为服务端，不存在本地不一致）。
      *
      * @param id 告警主键
      */
@@ -1217,25 +1303,25 @@ class DashboardModule(
         }
     }
 
-    // ── Monitor: P2 时间范围 / 区间查询 / 阈值 ──
+    // ── Monitor: 时间范围 / 区间查询 / 阈值 ──
 
     /**
-     * 按时间范围加载 8 类监控历史（P2）。
+     * 按时间范围加载 8 类监控历史。
      * - Preset 走旧 hours 路径（向后兼容）；Custom 走区间模式（points=720，SQL 层桶聚合）。
-     * - 与旧 [loadMonitorHistory] 共享 5s 冷却与 Semaphore(4)，避免区间+预设 5s 内互刷。
+     * - 与 [loadMonitorHistory] 共享 5s 冷却与 Semaphore(4)，避免区间与预设路径在 5s 内互相刷新。
      * - 切换区间即清空增量游标。
      */
     /**
-     * 加载监控历史（区间）。P9：新增 silent 参数支持「无感刷新」——轮询后台静默更新数据，
-     * 不置 isLoading=true（否则图表卡每次轮询闪 loading 动画 → 布局抽搐）。
+     * 加载监控历史（区间）。silent 参数支持「无感刷新」：轮询在后台静默更新数据，
+     * 不置 isLoading=true（否则图表卡每次轮询都会闪现 loading 动画，导致布局抖动）。
      *
-     * 性能（2026-08-26）：8 个指标**并发拉取、一次性合并写入**。
-     * 之前每个类型成功后各自 `_monitorState.update{}`，一次进页就是 10 次 StateFlow 发射；
+     * 性能：8 个指标**并发拉取、一次性合并写入**。
+     * 若每个类型成功后各自 `_monitorState.update{}`，一次进页会产生 10 次 StateFlow 发射；
      * 而 MonitorState 含 9 个 List 字段（Compose 视为 unstable），监控页整棵子树因此不可跳过，
-     * 每次发射都要重跑「今日峰值」的 O(8×720) 派生 —— 这是切进监控页卡顿的主因。
-     * 合并后一次加载只发射 2 次（开始 isLoading=true、结束带全部序列）。
-     * 另外 `ensureSettingsLoaded()` 会读 SharedPreferences + 反序列化 JSON，
-     * 原来在调用方（LaunchedEffect 的同步段）跑在主线程上，现在挪进 IO 线程。
+     * 每次发射都要重跑「今日峰值」的 O(8×720) 派生，这是进入监控页卡顿的主因。
+     * 合并后一次加载只发射 2 次（开始 isLoading=true、结束携带全部序列）。
+     * 另外 `ensureSettingsLoaded()` 会读取 SharedPreferences 并反序列化 JSON，
+     * 不得在调用方（LaunchedEffect 的同步段）的主线程上执行，本方法将其放入 IO 线程。
      */
     fun loadMonitorHistoryRange(range: MonitorTimeRange, force: Boolean = false, silent: Boolean = false) {
         val now = System.currentTimeMillis()
@@ -1254,7 +1340,7 @@ class DashboardModule(
                 it.copy(
                     selectedHours = (range as? MonitorTimeRange.Preset)?.hours ?: it.selectedHours,
                     selectedRange = range,
-                    // 2026-08-09 18:44 silent=true 时保留原 isLoading（不置 true）——无感刷新不闪 loading
+                    // silent=true 时保留原 isLoading（不置 true），无感刷新不闪 loading
                     isLoading = if (silent) it.isLoading else true,
                     errorMessage = null
                 )
@@ -1293,10 +1379,10 @@ class DashboardModule(
         }
     }
 
-    // ── Monitor 懒加载（2026-09-02）─────────────────────────────────────────────
+    // ── Monitor 懒加载 ─────────────────────────────────────────────────────────
     //
-    // 背景：原来进监控页就一次拉满 8 类指标。而图表 Tab 的 4 个区块在 LazyColumn 里，
-    // 首屏通常只看得到 1~2 个 —— 其余请求纯属浪费，还全都打在切页那一刻（最容易掉帧的时候）。
+    // 背景：进入监控页时一次性拉满 8 类指标。图表 Tab 的 4 个区块位于 LazyColumn 中，
+    // 首屏通常只可见 1~2 个，其余请求没有收益，且全部集中在切页那一刻（最易掉帧）。
     //
     // 方案：区块**可见才拉自己那几类**。LazyColumn 只组合视口附近的 item，所以「组合」本身
     // 就是可见性信号，区块里一个 `LaunchedEffect(range, types)` 就够，不需要额外的可见性检测。
@@ -1358,7 +1444,7 @@ class DashboardModule(
         // 已在主线程时 cancel() 会**同步内联**跑完被取消协程的 finally —— 而那个 finally
         // 正是 monitorLoadJobs.remove(job)。直接 monitorLoadJobs.forEach { it.cancel() }
         // 等于在遍历中结构性修改同一个 LinkedHashSet，下一次 next() 必然
-        // ConcurrentModificationException（2026-09-03 线上闪退）。
+        // ConcurrentModificationException。
         val inflight: List<Job> = monitorLoadJobs.toList()
         monitorLoadJobs.clear()
         inflight.forEach { it.cancel() }
@@ -1383,8 +1469,8 @@ class DashboardModule(
     /**
      * 只切换时间窗口，**不发任何请求**。
      *
-     * 取代过去「切区间 = 立刻全量重拉 8 类」的写法：拉取交给当时真正可见的区块自己去做
-     * （它们的 `LaunchedEffect` 以 range 为 key）。没露面的区块等露面时再拉。
+     * 不采用「切区间即立刻全量重拉 8 类」的做法：拉取交由当时真正可见的区块执行
+     * （其 `LaunchedEffect` 以 range 为 key），未露面的区块在露面时再拉。
      */
     fun selectMonitorRange(range: MonitorTimeRange) {
         syncMonitorRangeKey(range)
@@ -1427,9 +1513,8 @@ class DashboardModule(
                 val pending: List<String> = types.filter { type ->
                     type in settings.enabledTypes && (force || type !in loadedMonitorTypes)
                 }
-                // 诊断日志（2026-10-12，临时；定位「图表暂无数据」用，定位完删）：
-                // pending 为空但界面没数据 =记账说"拉过了"而实际没数据，是记账与取数脱节；
-                // 这两种情况在UI 上都是"暂无数据"，必须靠这行日志区分。
+                // 诊断日志：区分「已记账但无数据」与「尚未请求」两种「暂无数据」状态。
+                // pending 为空而界面无数据，说明记账与取数脱节，需靠该日志定位。
                 DebugLog.i("ChartDbg") {
                     "loadMonitorTypes req=${types.joinToString(",")} pending=${pending.joinToString(",")} " +
                         "loaded=${loadedMonitorTypes.joinToString(",")} force=$force " +
@@ -1448,7 +1533,7 @@ class DashboardModule(
                             async { sem.withPermit { type to fetchMonitorHistoryRange(type, range) } }
                         }.awaitAll()
                     }
-                    // 区间已经换过：这批结果属于旧窗口，写进去就是脏数据。
+                    // 区间已经换过：这批结果属于旧窗口，写入后即为过期数据。
                     if (generation != monitorRangeGeneration) return@launch
                     val cursorMs: Long = range.queryEndMs
                     loaded.forEach { (type, resp) ->
@@ -1459,6 +1544,11 @@ class DashboardModule(
                     val serverBucketMs: Long = loaded.firstNotNullOfOrNull { (_, resp) ->
                         resp?.bucket_ms?.takeIf { it > 0 }
                     } ?: estimateBucketMs(range)
+                    // 图表数据同样受转场闸门管辖。
+                    // 监控页图表是全 App 最重的子树（8 类序列 + 绘制），这批数据在拖动过程中
+                    // 落地即触发一次整页重组；而 UiFrameGate 原本只覆盖「WS 高频指标」路径。
+                    // 此处将同一约束应用到图表路径：转场中先暂存，落定后立刻写。
+                    if (UiFrameGate.isBusy) UiFrameGate.awaitIdle()
                     _monitorState.update { state ->
                         var next = state.copy(bucketMs = serverBucketMs)
                         loaded.forEach { (type, resp) ->
@@ -1497,7 +1587,7 @@ class DashboardModule(
     /**
      * 轮询用：只刷「此刻仍可见」且已经拉过的指标；没有就什么都不做。
      *
-     * 这是懒加载在刷新侧的对应物 —— 用户看不见的图表不该在后台一直被刷。
+     * 这是懒加载在刷新侧的对应实现：不可见的图表不应在后台持续刷新。
      * 取 [visibleMonitorTypeRefs] 与 [loadedMonitorTypes] 的交集：前者保证"还看得见"，
      * 后者保证"已经有数据了"（还没拉过的交给区块自己的首次加载，避免和它抢同一批请求）。
      */
@@ -1535,7 +1625,7 @@ class DashboardModule(
         }
 
     /**
-     * Custom 且含实时尾窗时的增量刷新（P2）。
+     * Custom 且含实时尾窗时的增量刷新。
      * 每类指标从自己的游标 [monitorTypeCursorMs] 回退 1 桶宽起拉（重叠一桶，避免边界漏点），endMs=now；
      * 新点按 t 与旧序列合并（t 相同替换），裁剪窗口外点（< queryStartMs），按 t 升序。
      * 增量失败静默（不闪 loading）。
@@ -1555,9 +1645,9 @@ class DashboardModule(
                 }
                 // 总开关停用：不发任何请求
                 if (!settings.collectEnabled) return@launch
-                // ★ 懒加载：只刷此刻可见且已有数据的类型。
-                // 此前这里无条件取 enabledMonitorTypes(settings)（8 类全拉），而默认区间
-                // today() 恒为实时 Custom —— 也就是在最常见的路径上，轮询把懒加载整个抵消掉了。
+                // 懒加载：只刷此刻可见且已有数据的类型。
+                // 无条件取 enabledMonitorTypes(settings)（8 类全拉）会抵消懒加载：默认区间
+                // today() 恒为实时 Custom，即最常见的路径上每轮轮询都会拉取全部指标。
                 val types: List<String> = visibleMonitorTypeRefs.keys.filter {
                     it in loadedMonitorTypes && it in settings.enabledTypes
                 }
@@ -1616,7 +1706,7 @@ class DashboardModule(
      * 公式必须与 core 的 `MonitorRoutes.resolveBucketMs` 完全一致（同样向上取整到整秒）：
      * 首屏与增量都把这个值作为 `bucket_ms` 传给服务端，桶原点又是 epoch 绝对网格，
      * 两批点的 `t` 才落在同一条网格上，[mergePoints] 按 t 去重才有意义。
-     * （原注释写 720、代码用的是 MAX_POINTS=240，且是向下取整——短区间会算出 0 而被钳到 1s。）
+     * 注意必须向上取整：向下取整时短区间会算出 0，并被钳制到 1s。
      */
     private fun estimateBucketMs(range: MonitorTimeRange): Long {
         val raw = range.spanMs / MonitorTimeRange.MAX_POINTS
@@ -1624,7 +1714,7 @@ class DashboardModule(
     }
 
     /**
-     * 惰性加载监控设置（P5c-1）：首次读取持久化设置写入 [MonitorState.settings]。
+     * 惰性加载监控设置：首次读取持久化设置写入 [MonitorState.settings]。
      * - 幂等：仅首次真正读盘，之后直接短路（@Volatile 标志 + 非对称锁）。
      * - 在 [init] 与各监控加载入口调用，保证设置先于任何加载/轮询生效。
      */
@@ -1638,26 +1728,24 @@ class DashboardModule(
     }
 
     /**
-     * 保存监控设置（P5c-1）：持久化 + 更新 [MonitorState.settings] + 下发到 core。
+     * 保存监控设置：持久化 + 更新 [MonitorState.settings] + 下发到 core。
      * - 持久化失败静默（MonitorPreferences 内部已兜底）。
-     * - **只在 `collectEnabled` 真正变化时**才下发 `POST /api/monitor/control`（T19 复核修正）：
-     *   该端点现在会写持久化真源 `AppSettings.backgroundServiceEnabled`，若像原来那样每次保存
+     * - **只在 `collectEnabled` 真正变化时**才下发 `POST /api/monitor/control`：
+     *   该端点会写入持久化真源 `AppSettings.backgroundServiceEnabled`。若每次保存
      *   任意无关设置（时长/间隔/指标开关…）都无条件重发本地默认值 `true`，会把用户在设置页
-     *   或 web 端显式停掉的后台服务静默改回"已启动"。
-     * - 个性化 7 项（T40-5）同理只在真正变化时 `PUT /api/monitor/preferences`，并以服务端回显覆盖本地。
+     *   或 web 端显式停掉的后台服务静默改回「已启动」。
+     * - 个性化 7 项同理只在真正变化时 `PUT /api/monitor/preferences`，并以服务端回显覆盖本地。
      *
-     * ## 2026-09-22：从"fire-and-forget + 只打日志"改成有反馈（阶段 3.3）
-     * 原来两个请求都是发出去就不管了，失败只 `DebugLog.w` —— 而这里是**即改即存**的界面，
-     * 没有保存按钮可以停在"保存中"，用户唯一能观察到的就是"我改的设置过一会儿又变回去了"
-     *（下次进页面回读被服务端值覆盖）。原注释自己写下了这个症状。
+     * ## 写操作反馈
+     * 本界面为**即改即存**，没有保存按钮可以停留在「保存中」；若请求发出后不处理结果，
+     * 用户唯一能观察到的是「改过的设置过一会儿又变回去了」（下次进页面回读被服务端值覆盖）。
      *
-     * 现在：成功发 [emitWriteNotice]（说清是哪一项），失败写 `monitorState.errorMessage`
-     *（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast）并**回读服务端真值**，
-     * 让界面上那个已经被用户拨过去的开关/滑杆立刻弹回设备真值（§4.11），
-     * 而不是留一个"看着改了、其实没改"的假状态。
+     * 因此：成功时调用 [emitWriteNotice]（指明是哪一项），失败时写 `monitorState.errorMessage`
+     *（已接入 `MainViewModel.rawGlobalError`，会显示红色 Toast）并**回读服务端真值**，
+     * 使界面上已被拨动的开关/滑杆立即回到设备真值，而不是停留在未落地的状态。
      *
-     * 两个请求合并进**同一个协程**串行发（原来是两个 `scope.launch`）：一次保存最多只该
-     * 出现一条提示，拆成两个协程时"同时改了总开关和采集间隔"会弹两条、失败时还会写两次
+     * 两个请求必须在**同一个协程**中串行发送：一次保存最多只应产生一条提示；
+     * 拆成两个协程时「同时修改总开关与采集间隔」会产生两条提示，失败时还会写两次
      * errorMessage 互相覆盖。
      */
     fun setMonitorSettings(settings: MonitorSettings) {
@@ -1670,7 +1758,7 @@ class DashboardModule(
         val prefsChanged = payload != previous.toRemotePayload()
         if (!collectChanged && !prefsChanged) return
 
-        // 文案在发请求之前算：算的是"用户这次改了什么"，与请求结果无关
+        // 文案在发请求之前计算：内容是「本次改了什么」，与请求结果无关
         val label = monitorSettingsChangeLabel(previous, settings)
 
         scope.launch {
@@ -1691,8 +1779,8 @@ class DashboardModule(
                 // 以服务端回显为准：core 会做取值域校验，若本地传了越界值，服务端返回的才是真实生效值。
                 applyRemotePreferences(echoed)
             }
-            // 开关类说"已开启/已关闭"，数值类说"已保存"：对开关而言"已保存"没有告诉用户
-            // 现在是开还是关，而这恰恰是他刚做的那个决定。
+            // 开关类提示「已开启/已关闭」，数值类提示「已保存」：对开关而言「已保存」无法说明
+            // 当前是开还是关，而这是用户本次操作的核心信息。
             emitWriteNotice(
                 if (collectChanged) {
                     if (settings.collectEnabled) "后台采集已开启" else "后台采集已关闭"
@@ -1706,25 +1794,25 @@ class DashboardModule(
     /**
      * 监控设置下发失败的统一收尾。
      *
-     * 回读放在写 errorMessage **之后**：`refreshMonitorSettingsFromBackend` 内部对
-     * "两个请求都失败"是直接 return（沿用本地缓存），不会把刚写的错误文案顶掉；
+     * 回读放在写 errorMessage **之后**：`refreshMonitorSettingsFromBackend` 在
+     * 「两个请求都失败」时直接 return（沿用本地缓存），不会覆盖刚写入的错误文案；
      * 而它一旦成功，`settings` 变化会让界面上的控件自己回到设备真值。
      */
     private suspend fun monitorSettingsFailed(label: String, cause: Throwable?) {
         val reason = cause?.message ?: "设备未接受这次修改"
         DebugLog.w("Monitor", "监控设置下发失败（$label）: $reason", cause)
         _monitorState.update { it.copy(errorMessage = "$label 保存失败：$reason") }
-        // 本地缓存已经被乐观地改过了，必须拉回 core 真值，否则界面停在一个没落地的值上
+        // 本地缓存已做乐观更新，必须拉回 core 真值，否则界面会停留在未落地的值上
         refreshMonitorSettingsFromBackend()
     }
 
     /**
      * 这次改动最该被报出来的那一项（名词短语，调用方自己拼"已保存"之类的尾巴）。
      *
-     * 为什么要挑一项而不是笼统说「监控设置」：四个二级页（采集 / 图表 / 调度 / 导出）共用
-     * 本方法，每页又有好几个滑杆，泛化文案等于没说（§4.15）。UI 一次交互只改一个字段，
-     * 所以"第一个不相等的字段"就是用户刚动的那个；真出现多字段同时变（指标开关弹窗的
-     * 批量勾选）时按声明顺序取第一个，仍然指向用户正在看的那一组。
+     * 需要挑出一项而非笼统报「监控设置」：四个二级页（采集 / 图表 / 调度 / 导出）共用
+     * 本方法，每页有多个滑杆，泛化文案不提供有效信息。UI 一次交互只改一个字段，
+     * 因此「第一个不相等的字段」即用户本次修改的字段；若出现多字段同时变化（指标开关弹窗的
+     * 批量勾选），按声明顺序取第一个，仍指向用户正在查看的那一组。
      */
     private fun monitorSettingsChangeLabel(prev: MonitorSettings, next: MonitorSettings): String = when {
         prev.collectEnabled != next.collectEnabled -> "后台采集"
@@ -1747,9 +1835,9 @@ class DashboardModule(
     }
 
     /**
-     * 从后端回读监控相关真源并覆盖本地缓存（T19 + T40-5）。
+     * 从后端回读监控相关真源并覆盖本地缓存。
      *
-     * 两件事**必须在同一个协程里串行做完**：`collectEnabled` 来自 `/api/service/status`，
+     * 两项回读**必须在同一个协程里串行完成**：`collectEnabled` 来自 `/api/service/status`，
      * 另外 7 项来自 `/api/monitor/preferences`。若拆成两个协程各自 `read-modify-save`，
      * 两边都基于同一份旧 `settings` 做 copy，后写的那个会把前一个的结果冲掉。
      *
@@ -1781,10 +1869,10 @@ class DashboardModule(
         _monitorState.update { it.copy(settings = merged) }
     }
 
-    /** 当前启用的指标 apiKey 列表（单指标开关过滤，P5c-1） */    private fun enabledMonitorTypes(settings: MonitorSettings): List<String> =
+    /** 当前启用的指标 apiKey 列表（按单指标开关过滤） */    private fun enabledMonitorTypes(settings: MonitorSettings): List<String> =
         MonitorMetricType.entries.map { it.apiKey }.filter { it in settings.enabledTypes }
 
-    /** 按当前 selectedRange 强制重拉（P3 下拉 / 返回刷新入口） */
+    /** 按当前 selectedRange 强制重拉（下拉刷新 / 返回刷新入口） */
     fun refreshCurrentRange() {
         loadMonitorHistoryRange(_monitorState.value.selectedRange, force = true)
     }
@@ -1820,10 +1908,10 @@ class DashboardModule(
     /**
      * 合并新旧序列：t 相同新点替换旧点；裁剪 < windowStartMs 的旧点；按 t 升序。
      *
-     * 按 t 去重的前提是两批点同网格（见 [estimateBucketMs]）。即便如此仍加一道硬上限：
-     * 页面长时间开着，窗口右端一直往后推，序列会单向变长（"今天"这一档窗口起点不动，
-     * 老点不会被 windowStartMs 裁掉）；超过 MAX_POINTS 的 2 倍就只保留最新的那批，
-     * 图表可视精度用不到更多点，多留只是白付几何构建开销。
+     * 按 t 去重的前提是两批点同网格（见 [estimateBucketMs]）。即便如此仍设硬上限：
+     * 页面长时间开启时，窗口右端持续后移，序列会单向变长（「今天」这一档窗口起点不动，
+     * 旧点不会被 windowStartMs 裁掉）；超过 MAX_POINTS 的 2 倍时只保留最新的一批，
+     * 图表可视精度用不到更多点，多保留只会增加几何构建开销。
      */
     private fun mergePoints(old: List<DownsampledPoint>, fresh: List<DownsampledPoint>, windowStartMs: Long): List<DownsampledPoint> {
         val byT = LinkedHashMap<Long, DownsampledPoint>()
@@ -1836,10 +1924,10 @@ class DashboardModule(
 
     fun smartRefresh(changedType: String) {
         when {
-            // 2026-10-05 P5：summary 失效事件（P1 invalidateAll 广播）复用既有 summary 拉取
+            // summary 失效事件（invalidateAll 广播）复用既有 summary 拉取
             changedType == "summary" -> refreshDashboard()
-            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 全量补拉一轮（非 force，
-            // 走既有新鲜度/轮询闸门，断线短时多数被挡住）
+            // WS 重连 sentinel：全量补拉一轮（非 force，走既有的新鲜度/轮询闸门，
+            // 短暂断线时多数请求会被挡住）
             changedType == WsDataTopic.RECONNECTED -> refreshDashboard()
             changedType.startsWith("device:") -> refreshDashboard(forceRefresh = true)
         }
@@ -1854,8 +1942,7 @@ class DashboardModule(
     }
 
     // ── Utility ──
-    // 2026-09-06：原来这里有一份 private compareVersions()，唯一调用点是 checkForUpdate()
-    // 里那条写死跟 "1.0" 比的判据。判据改成 core 的 has_update 后它就没有调用方了，
-    // 一并删除 —— 版本比对现在只存在两处：core 的 UpdateManager.compareVersions（core 自身/清单）
-    // 与 ToolsModule.compareVersions（App 自身/清单），两者解析规则一致。
+    // 本模块不提供版本比较：判据为 core 的 has_update。App 侧版本比对只存在两处：
+    // core 的 UpdateManager.compareVersions（core 自身/清单）与 ToolsModule.compareVersions
+    // （App 自身/清单），两者解析规则一致。
 }

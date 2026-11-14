@@ -77,62 +77,61 @@ import kotlin.text.Charsets
 import com.ufi_axis.ui.theme.UfiMotion
 
 /**
- * 初次连接引导（Onboarding）重构后的 SetupScreen。
+ * 初次连接引导（Onboarding）界面。
  *
- * 探测链（所有路径收敛到同一配对端点 /pairing/info + /pairing/confirm）：
- *   ① 读本机网关直连探测（设备即网关，:PAIRING_PORT）→ ② 失败则手动输入 IP:端口。
- *   不再使用 mDNS，简化发现逻辑、消除跨模块依赖。
- * 发现候选（可能多台）后展示列表含 device_id 供用户确认连哪台（边缘情况 #2）；
- * 选定后拉取配对信息并点"配对"完成握手，凭据落盘后进入正常连接。
+ * 设备发现与配对收敛到 /pairing/info 与 /pairing/confirm 两个端点：
+ *   ① 读取本机 DHCP 网关直连探测（设备即网关，端口为 [PAIRING_PORT]）；
+ *   ② 探测失败则进入手动输入地址与端口的分支。
+ * 不使用 mDNS：发现逻辑保持单一来源，且不引入跨模块依赖。
+ * 探测到候选设备（可能多台）后展示设备列表，列表项含 device_id 供用户确认目标设备；
+ * 选定设备后拉取配对信息，提交配对完成握手，凭据落盘后进入正常连接流程。
  *
- * 边缘情况落点：
- *   - #12 已 isSetupComplete 时不进入本屏（由 MainActivity 控制）。
- *   - #1/#3 凭据失效（401）由 RetrofitClient.onUnauthorized 触发回到本屏。
- *   - #7 错误文案区分"设备不可达 / 已配对 / 配对码无效"。
- *   - #8 并发配对第二台 confirm 返回 409 → 提示。
- *   - #15 配对中被杀 → 回前台重新拉取 /pairing/info，若 409 则给出解除配对引导。
+ * 行为约束：
+ *   - 已 isSetupComplete 时不进入本屏，入口由 MainActivity 控制。
+ *   - 凭据失效（401）由 RetrofitClient.onUnauthorized 触发回到本屏。
+ *   - 错误文案区分「设备不可达 / 已配对 / 配对码无效」三类结果。
+ *   - 并发配对时第二台的 confirm 返回 409，界面据此提示。
+ *   - 配对过程中进程被杀：重启后重新拉取 /pairing/info，返回 409 时给出解除配对引导。
  *
- * 2026-08-11 阶段 3（配对密码认证）：
- *   - /pairing/info 增 device_name / has_default_password 解析；CONFIRM 文案"设备标识"→"设备名"。
- *   - 密码输入 UI：has_default_password=true → "设置配对密码"（新密码+确认+使用默认 admin）；
- *     false → "输入配对密码"（单框）。
- *   - doPair 携带 password + device_name（本机 Settings.Global.DEVICE_NAME，读不到可空）。
- *   - ConfirmOutcome 增 InvalidPassword / PasswordLocked 分支。
+ * 配对密码认证：
+ *   - /pairing/info 解析 device_name 与 has_default_password；确认页文案使用「设备名」。
+ *   - 密码输入形态由 has_default_password 派生：true 为「设置配对密码」（新密码 + 确认，
+ *     两个输入框均可留空，表示使用默认密码 admin）；false 为「输入配对密码」（单输入框）。
+ *   - doPair 提交 password 与 device_name（取自 Settings.Global.DEVICE_NAME，读取失败时为空）。
+ *   - ConfirmOutcome 区分 InvalidPassword 与 PasswordLocked 两种失败。
  *
- * 2026-08-11 阶段 4（UI 异常修复 + 动画增强）：
- *   - AnimatedContent 内 when 分支外层包 Column(verticalArrangement = spacedBy)，修复按钮/输入框/提示文字重叠
- *   - DISCOVER 阶段进度指示+文字改为 Row(Icon + Text) 水平排列 + 小间距
- *   - 路由器呼吸脉冲：周期 1200ms → 900ms，scale 0.92-1.08 → 0.88-1.12，幅度更明显
- *   - 标题淡入 800ms → 600ms 加快节奏；外圈光环 alpha 上限 0.18 → 0.24
+ * 布局与交互约定：
+ *   - 各阶段内容由 SetupCard 的 Column(spacedBy) 统一排版，分支内不自行堆叠，
+ *     否则按钮、输入框与提示文字会出现重叠。
+ *   - DISCOVER 阶段的进度指示与文案以 Row(Icon + Text) 水平排列。
+ *   - 应用图标固定 88dp，不随阶段切换改变尺寸，避免切页时出现缩放。
+ *   - 错误反馈优先使用字段级 supportingText 与错误边框；Toast 仅用于网络、服务端与
+ *     批准流程这类无法归属到单个字段的结果。
+ *   - 设备列表返回时以 cacheStale 作废旧配对码，同时保留 cachedInfo.deviceName，
+ *     列表不会退回显示设备 ID。
  *
- * 2026-10-24（布局与动效收敛）：
- *   - **卡片单独垂直居中**；品牌位于卡片上方、随卡片一起移动，但不参与卡片的居中计算
- *     （卡片下方补一段与「品牌 + 间距」等高的留白抵消其高度）。内容超高时整组滚动。
- *   - 每个阶段 / 首配子步骤是一张完整的卡片；外层 `AnimatedContent` 以
- *     `SetupCardKey` 为目标状态，让**整张卡**（背景、边框、按钮、内容）一起做
- *     fade + scale 过渡，而不是只有卡片下半部分变高。
- *   - 应用图标固定 88dp：删除进入配对向导时 88 → 76 的尺寸切换，消除切页时的“异常缩放”。
- *   - 错误反馈从“只弹顶部 Toast”改为字段级 `supportingText` + 红框；Toast 仍保留给
- *     网络 / 服务端 / 批准流程这类无法落到单个字段的结果。
- *   - 设备列表返回时用 `cacheStale` 只作废旧配对码，保留 `cachedInfo.deviceName`，
- *     不会再退回设备 ID。
+ * 卡片布局与动效：
+ *   - 卡片单独垂直居中；品牌块位于卡片上方并随卡片一起移动，但不参与卡片的居中计算
+ *     （卡片下方补一段与「品牌 + 间距」等高的留白，抵消其高度）。内容超高时整组滚动。
+ *   - 每个阶段 / 首配子步骤是一张完整卡片；外层 AnimatedContent 以 [SetupCardKey] 为目标状态，
+ *     使整张卡（背景、边框、按钮、内容）一起执行 fade + scale 过渡，而非仅卡片下半部分增高。
  */
 
-/** 后端默认监听端口（来自 AppSettings.DEFAULT_PORT / HttpServer 默认 8088），用于网关探测与手动兜底。 */
+/** 后端默认监听端口（与 AppSettings.DEFAULT_PORT、HttpServer 默认值 8088 一致），用于网关探测与手动输入的默认值。 */
 private const val PAIRING_PORT = 8088
 
-// 2026-10-14：地址校验（isValidIpv4 / isValidHost）抽到同包的 ServerAddress.kt，
-// 纯函数 + internal 才能被 ServerAddressTest 逐条覆盖（规则漂移不会有任何异常信号）。
-// 支持域名后，"服务器地址"这一栏走 isValidHost；网关探测（startDiscovery）那条路仍然是纯 IP。
+// 地址校验（isValidIpv4 / isValidHost）位于同包的 ServerAddress.kt：纯函数 + internal，
+// 才可由 ServerAddressTest 逐条覆盖——校验规则发生漂移时不会产生任何运行时异常信号。
+// 服务器地址字段使用 isValidHost（支持域名）；网关探测（startDiscovery）仅接受 IP。
 
 private enum class SetupPhase { DISCOVER, CANDIDATES, CONFIRM, MANUAL }
 
 /**
- * 发现/手动输入的设备。
+ * 发现或手动输入的设备。
  *
- * [cacheStale] 与 `cachedInfo == null` 分开：返回设备列表时只把缓存**标记为过期**，
- * 保留 `cachedInfo` 里的设备名用于列表展示；下一次选中时按 `cacheStale` 强制重取
- * `/pairing/info`（配对码可能已被服务端轮换），不会拿旧码去 confirm。
+ * [cacheStale] 与 `cachedInfo == null` 语义不同：返回设备列表时只将缓存标记为过期，
+ * 保留 `cachedInfo` 中的设备名用于列表展示；下次选中该设备时按 [cacheStale] 强制重取
+ * /pairing/info（配对码可能已被服务端轮换），不会用旧码发起 confirm。
  */
 private data class DiscoveredDevice(
     val deviceId: String,
@@ -143,9 +142,9 @@ private data class DiscoveredDevice(
 )
 
 /**
- * 卡片整体过渡的目标状态。用独立类型而不是 `phase`，是为了让 `AnimatedContent`
- * 的**旧卡片**继续按进入时的状态渲染（否则切换瞬间新旧两张卡都会读到新 phase，
- * 既看不到交叉过渡，也会在过渡期闪内容）。
+ * 卡片整体过渡的目标状态。独立于 `phase` 定义，使 AnimatedContent 的旧卡片继续按进入时的
+ * 状态渲染：若直接使用 `phase`，切换瞬间新旧两张卡都会读到新 phase，既没有交叉过渡，
+ * 过渡期间还会出现内容闪烁。
  */
 private sealed interface SetupCardKey {
     data object Discover : SetupCardKey
@@ -165,8 +164,8 @@ private data class PasswordValidation(
 /**
  * 配对密码的唯一校验口径。
  *
- * 首配（[needsSetup] = true）允许两个框都留空 —— 表示使用默认密码 admin；
- * 但只填一个、长度不对、两次不一致都必须拦下。登录（false）只要求非空，
+ * 首配（[needsSetup] = true）允许两个输入框都留空，表示使用默认密码 admin；
+ * 仅填写一个、长度不合规、两次输入不一致均必须拒绝。登录（false）只要求非空，
  * 长度与正确性由服务端判定。
  */
 private fun validatePairingPassword(
@@ -204,7 +203,7 @@ private data class PairingInfo(
     val isExternalStorageManager: Boolean,
     val deviceName: String = "",
     val hasDefaultPassword: Boolean = true,
-    /** 设备上已配对记录数（`/pairing/info` 的 `paired_count`，2026-10-22 起返回）。 */
+    /** 设备上已配对记录数（/pairing/info 的 `paired_count`）。 */
     val pairedCount: Int = 0
 )
 
@@ -223,14 +222,14 @@ private sealed class ConfirmOutcome {
     object PasswordLocked : ConfirmOutcome()
 
     /**
-     * 新设备需要机主批准（2026-10-21，审计 §A1）。
+     * 新设备需要机主批准。
      *
-     * core 的批准闸门对所有设备生效（`pairingApprovalRequired` + 已有已配对设备 + 指纹未配对），
-     * 之前 App 端完全没有请求方链路，于是这个开关一开新手机就永远配不上。
-     * 收到本结果 → 登记一次申请并进入等待态（见 `startApprovalRequest`）。
+     * core 的批准闸门对所有设备生效（`pairingApprovalRequired` + 已有已配对设备 + 指纹未配对）。
+     * App 端必须实现请求方链路，否则该开关开启后新设备无法完成配对。
+     * 收到本结果后登记一次申请并进入等待态（见 `startApprovalRequest`）。
      */
     object ApprovalRequired : ConfirmOutcome()
-    /** 设备身份验签失败 / 挑战过期：重新走一遍 challenge→confirm 即可，不是用户输入问题 */
+    /** 设备身份验签失败或挑战过期：重新执行 challenge→confirm 即可，与用户输入无关。 */
     object DeviceKeyRejected : ConfirmOutcome()
     data class Unreachable(val msg: String) : ConfirmOutcome()
     data class Error(val msg: String) : ConfirmOutcome()
@@ -257,10 +256,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     var manualError by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
 
-    // 配对密码（阶段3）：首次配对设置（新+确认）/ 再次配对校验（单框）
+    // 配对密码：首次配对设置（新密码 + 确认），再次配对校验（单输入框）
     var password by remember { mutableStateOf("") }
     var confirmPassword by remember { mutableStateOf("") }
-    /** 提交后才点亮字段错误，避免用户刚进页面就看到一片红。输入变化时清除。 */
+    /** 提交后才显示字段错误，避免用户刚进入页面即看到大量错误提示。输入变化时清除。 */
     var showPasswordErrors by remember { mutableStateOf(false) }
     /** 服务端明确拒绝密码后的字段提示（登录时显示在密码框下方）。 */
     var passwordServerError by remember { mutableStateOf<String?>(null) }
@@ -283,33 +282,34 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     // 密码不从本地读回（本地不再存明文，见 AppPreferences.goformPasswordSet）：留空即沿用 core 现值
     var goformPassword by remember { mutableStateOf("") }
 
-    // v3（2026-08-11）：Toast 反馈（UfiToastHost 持有 state）
+    // Toast 反馈（由 UfiToastHost 持有状态）
     var toastMessage by remember { mutableStateOf<ToastMessage?>(null) }
-    // 自动搜索 Job 必须 remember 才有意义：普通局部变量每次重组都会归 null，
-    // 用户点「手动输入地址」时 `discoveryJob?.cancel()` 实际取消不到任何东西，
-    // 5 秒超时分支随后会把已进入 CONFIRM 的用户强行拉回 MANUAL。
+    // 自动搜索 Job 必须由 remember 持有：普通局部变量在每次重组时都会归 null，
+    // 用户点「手动输入地址」时 `discoveryJob?.cancel()` 取消不到任何任务，
+    // 5 秒超时分支随后会把已进入 CONFIRM 的用户强制拉回 MANUAL。
     var discoveryJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    // 每次搜索/取消都自增；旧 Job 即使因 HttpURLConnection 不可协作取消而晚返回，
-    // 也会在写 phase 前发现 token 已过期而放弃 —— 单靠 Job.cancel() 挡不住这种竞态。
+    // 每次搜索/取消都自增；旧 Job 即使因 HttpURLConnection 不可协作取消而延迟返回，
+    // 也会在写 phase 前发现 token 已过期并放弃——仅靠 Job.cancel() 无法消除该竞态。
     var discoveryToken by remember { mutableStateOf(0L) }
-    // 每次选中设备/返回列表都自增：Loading 卡片上的「返回」不能让上一次 /pairing/info
-    // 晚到的成功结果把界面重新拉回那台设备。
+    // 每次选中设备/返回列表都自增：Loading 卡片上的「返回」必须使上一次 /pairing/info
+    // 延迟返回的成功结果失效，否则界面会被重新拉回那台设备。
     var selectionToken by remember { mutableStateOf(0L) }
 
-    // ── 新设备批准：请求方这一半（2026-10-21，审计 §A1）──
+    // ── 新设备批准：请求方链路 ──
     //
-    // core 的批准闸门对**所有**设备生效（没有"只覆盖 Web"的判据），所以 App 必须也能走
-    // 「登记申请 → 等机主批准 → 带同一个 sid 重试 confirm」，否则该开关一开新手机就永远配不上。
+    // core 的批准闸门对所有设备生效（无「仅覆盖 Web」判据），因此 App 也必须实现
+    // 「登记申请 → 等待机主批准 → 携带同一 sid 重试 confirm」，否则该开关开启后
+    // 新设备无法完成配对。
     var approvalWaiting by remember { mutableStateOf(false) }
     var approvalSid by remember { mutableStateOf("") }
     var approvalStatusText by remember { mutableStateOf("") }
     var approvalRetryCode by remember { mutableStateOf("") }
     var approvalPollJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
-    /** 需要"发起一次申请"（doPair 收到 403 时置位，由 LaunchedEffect 接力，避免局部函数互递归）。 */
+    /** 需要「发起一次申请」（doPair 收到 403 时置位，由 LaunchedEffect 接力，避免局部函数互递归）。 */
     var approvalRequestPending by remember { mutableStateOf(false) }
     /** 已批准、需要重试 confirm（同上，由 LaunchedEffect 接力）。 */
     var approvalRetryPending by remember { mutableStateOf(false) }
-    /** 「本机旧配对自救」弹窗（2026-10-21 决策 D6-2）。 */
+    /** 「本机旧配对自救」弹窗。 */
     var showSelfRescue by remember { mutableStateOf(false) }
     var selfRescuePwd by remember { mutableStateOf("") }
     var selfRescueBusy by remember { mutableStateOf(false) }
@@ -330,14 +330,11 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         busy = true
         manualError = false
         discoveryJob = scope.launch {
-            // v3（2026-08-11 修复"点一下秒超时"）：探测常见网关列表，且无论成功/失败至少展示 5s 雷达动画。
-            // 2026-08-21 修复「已找到设备却仍被 5 秒超时强制退出到手动输入」：
-            //   旧实现把"补足 5s 雷达动画"的 delay 也包在 withTimeoutOrNull(5000) 内——设备一旦
-            //   被找到(foundAny=true)后仍在 timeout 作用域内 delay，5000ms 边界上 timeout 取消与
-            //   block 返回的竞态会偶发把 found 判成 null，进而 if(!found) 把 phase 强制改回 MANUAL，
-            //   覆盖用户已点进去的 CANDIDATES/CONFIRM（配对/设密码）状态。
-            //   修复要点：① 超时只用于「放弃继续探测」，绝不用于判定 found（找到即 return，保留 found=true）；
-            //           ② 补足动画的 delay 移到 if(!found) 分支，处于 timeout 作用域之外，消除竞态。
+            // 探测常见网关列表；无论成功或失败，DISCOVER 进度动画至少展示 5s。
+            // 并发约束：超时只用于放弃继续探测，不参与 found 判定（找到即 return，保留 found = true）；
+            // 补足动画的 delay 置于 withTimeoutOrNull 作用域之外。若 delay 位于超时作用域内，
+            // 5s 边界上超时取消与 block 返回的竞态会将 found 判为 false，随后把 phase 强制改回 MANUAL，
+            // 覆盖用户已进入的 CANDIDATES/CONFIRM（配对、设置密码）状态。
             val start = System.currentTimeMillis()
             val gwCandidates = buildList {
                 getOwnGateway(context)?.let { add(it) }
@@ -346,8 +343,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             var found = false
             withTimeoutOrNull(5000) {
                 for (gw in gwCandidates) {
-                    // Job.cancel() 对阻塞中的 HttpURLConnection 不一定立刻生效；
-                    // token 是第二道闸：旧搜索晚返回时不能再改 phase。
+                    // Job.cancel() 对阻塞中的 HttpURLConnection 不一定立即生效；
+                    // token 是第二重判定：旧的搜索延迟返回时不得再修改 phase。
                     if (discoveryToken != token) return@withTimeoutOrNull
                     when (val r = httpGetPairingInfo(gw, PAIRING_PORT)) {
                         is InfoOutcome.Success -> {
@@ -380,7 +377,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     }
                 }
             }
-            // 超时或遍历完毕仍未找到 → 补足 5s 雷达动画后回手动输入兜底 + Toast 提示
+            // 超时或遍历完毕仍未找到 → 补足 5s 雷达动画后回到手动输入兜底，并给出 Toast 提示
             if (!found) {
                 if (discoveryToken != token) return@launch
                 val elapsed = System.currentTimeMillis() - start
@@ -390,32 +387,32 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                 busy = false
                 toastMessage = ToastMessage("未发现附近设备，请手动输入设备地址和端口。", ToastType.INFO)
             }
-            // found=true 时到此结束，绝不再触碰 phase —— 避免覆盖用户已进入的 CANDIDATES/CONFIRM 状态
+            // found = true 时到此结束，不再修改 phase，避免覆盖用户已进入的 CANDIDATES/CONFIRM 状态
         }
     }
 
     fun selectDevice(device: DiscoveredDevice) {
-        // 手动输入时初始探测可能还在跑：这里先取消，避免它 5 秒后把用户从 CONFIRM 拉回 MANUAL。
+        // 手动输入时初始探测可能仍在执行：此处先取消，避免它 5 秒后把用户从 CONFIRM 拉回 MANUAL。
         cancelDiscovery()
         selectionToken += 1
         val token = selectionToken
         selected = device
-        // 2026-08-22 修复「登录/配对混淆」：删除 isPrevPairedDevice 静默重连分支。
-        //   旧逻辑只要本地 serverIp:port 命中就静默 confirm——
-        //     ① 后端重置（初始化态）会被静默以 admin 落库配对，跳过"设置密码+GoForm"首次配对向导；
-        //     ② 指纹被设备移除时 confirm 回 InvalidCode → 退回 MANUAL，手动输入又命中同一分支 → 死循环，
-        //       永远到不了密码登录界面。
-        //   现在统一走 CONFIRM 阶段，模式完全由后端权威字段 has_default_password 派生：
-        //     true  → 配对（首次初始化）：两步向导（设置配对密码 → GoForm 后台配置 → 配对）；
-        //     false → 登录（普通连接）：仅输入配对密码即可连接（后端已支持配对码消耗后凭密码登录）。
+        // 所有设备统一走 CONFIRM 阶段，连接模式完全由后端权威字段 has_default_password 派生：
+        //   true  → 配对（首次初始化）：两步向导（设置配对密码 → GoForm 后台配置 → 配对）；
+        //   false → 登录（普通连接）：仅输入配对密码即可连接（后端支持配对码被消耗后凭密码登录）。
+        //
+        // 不得按本地 serverIp:port 命中执行静默重连，原因有二：
+        //   ① 后端重置（初始化态）会被静默以 admin 落库配对，跳过「设置密码 + GoForm」首次配对向导；
+        //   ② 指纹被设备移除时 confirm 返回 InvalidCode → 退回 MANUAL，手动输入再次命中同一分支，
+        //      反复回到该入口，始终无法进入密码登录界面。
         pairingInfo = null
         busy = true
         manualError = false
         showPasswordErrors = false
         passwordServerError = null
         phase = SetupPhase.CONFIRM
-        // 只有**新鲜**缓存才直接复用；返回设备列表时缓存的配对码可能已被服务端轮换，
-        // 复用它会必然 INVALID_CODE。cacheStale 只丢弃码，保留设备名用于列表展示。
+        // 仅新鲜缓存可直接复用；返回设备列表时缓存的配对码可能已被服务端轮换，
+        // 复用必然得到 INVALID_CODE。cacheStale 只丢弃配对码，保留设备名用于列表展示。
         if (!device.cacheStale) {
             device.cachedInfo?.let {
                 pairingInfo = it
@@ -425,14 +422,14 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         }
         scope.launch {
             val result = httpGetPairingInfo(device.host, device.port)
-            // 用户已经返回列表/选了别的设备：这次晚到的结果必须丢弃。
+            // 用户已返回列表或选择了其他设备：这次延迟返回的结果必须丢弃。
             if (selectionToken != token) return@launch
             when (result) {
                 is InfoOutcome.Success -> {
                     val fresh = device.copy(cachedInfo = result.info, cacheStale = false)
                     selected = fresh
                     pairingInfo = result.info
-                    // 同步候选列表里的缓存与名称，返回列表时不会退回设备 ID。
+                    // 同步候选列表中的缓存与名称，返回列表时不会退回设备 ID。
                     candidates = candidates.map { c ->
                         if (c.deviceId == device.deviceId && c.host == device.host && c.port == device.port) {
                             c.copy(cachedInfo = result.info, cacheStale = false)
@@ -443,7 +440,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     busy = false
                 }
                 is InfoOutcome.AlreadyPaired -> {
-                    // 已配对时不再卡住界面，提示后回 MANUAL 让用户重选
+                    // 已配对时结束加载态，提示后回到 MANUAL 让用户重新选择
                     busy = false
                     phase = SetupPhase.MANUAL
                     toastMessage = ToastMessage(
@@ -472,9 +469,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     }
 
     fun connectManual() {
-        // 2026-10-14：主机校验与端口校验合并到 checkServerEndpoint（ServerAddress.kt）。
+        // 主机校验与端口校验由 checkServerEndpoint（ServerAddress.kt）统一承担，
         // 判定规则与设置页「连接配置」共用同一份；具体原因由输入框的 supportingText 显示，
-        // 不再用一条 3 秒后消失的顶部 Toast 承担。
+        // 不再使用 3 秒后消失的顶部 Toast。
         when (val r = checkServerEndpoint(manualIp, manualPort)) {
             is ServerEndpoint.Valid -> selectDevice(DiscoveredDevice("", r.host, r.port))
             ServerEndpoint.BlankHost,
@@ -488,10 +485,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         val device = selected ?: return
         val info = pairingInfo ?: return
         val needsGoformSetup = info.hasDefaultPassword
-        // 重新提交时先摘掉上一次的服务端错误，避免它盖住本次的格式校验提示。
+        // 重新提交时先清除上一次的服务端错误，避免它覆盖本次的格式校验提示。
         passwordServerError = null
 
-        // 密码校验与「下一步」共用同一个纯函数，避免两处规则/顺序漂移。
+        // 密码校验与「下一步」共用同一个纯函数，避免两处规则与顺序出现分歧。
         val validation = validatePairingPassword(password, confirmPassword, needsGoformSetup)
         if (validation.passwordError != null || validation.confirmError != null) {
             showPasswordErrors = true
@@ -503,7 +500,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             return
         }
         showPasswordErrors = false
-        // 默认密码只在本次请求里生效，不写回输入框 —— 失败后复核页仍然显示「使用默认密码 admin」。
+        // 默认密码只在本次请求中生效，不写回输入框——失败后复核页仍显示「使用默认密码 admin」。
         val effectivePassword = if (
             needsGoformSetup && password.isBlank() && confirmPassword.isBlank()
         ) {
@@ -512,9 +509,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             password
         }
 
-        // GoForm 配置解析与校验（仅在「初始化状态/首次设置」时收集并提交）：
-        //   「正常状态」（后端已被配置过）不再让用户重填 GoForm，goform_ip/port/password 全部传 null，
-        //   后端 persistGoformSettings 不会覆盖已有值（参考 PairingManager.confirm 的 goform 参数处理）。
+        // GoForm 配置解析与校验（仅在「初始化状态 / 首次设置」时收集并提交）：
+        //   「正常状态」（后端已被配置过）不再要求用户重填 GoForm，goform_ip/port/password 全部传 null，
+        //   后端 persistGoformSettings 不会覆盖已有值（参见 PairingManager.confirm 的 goform 参数处理）。
         var gfIpToSend: String? = null
         var gfPortToSend: Int? = null
         var gfPwToSend: String? = null
@@ -522,11 +519,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             val gfParts = goformAddress.split(":")
             val gfIp = gfParts.getOrNull(0)?.trim().orEmpty()
             val gfPort = gfParts.getOrNull(1)?.trim()?.toIntOrNull()
-            // GoForm 后台地址同样放行域名（2026-10-14）：路由器后台用 `tplogin.cn` /
-            // `router.local` 是真实场景，而且 core 侧 goform_ip 只是个字符串（Web 端
-            // 只查非空就能用），本屏若继续只认 IPv4 会与既有链路不一致。
+            // GoForm 后台地址同样允许域名：路由器后台使用 tplogin.cn / router.local 是常见配置，
+            // 且 core 侧 goform_ip 只是字符串（Web 端仅校验非空）；本屏若只接受 IPv4 会与既有链路不一致。
             if (gfIp.isNotBlank() && (!isValidHost(gfIp) || gfPort == null || gfPort !in 1..65535)) {
-                // 跳回 GoForm 步骤，让红框和 supportingText 可见，而不是只在顶部闪一句 Toast。
+                // 回到 GoForm 步骤，使错误边框与 supportingText 可见，而非仅在顶部闪过一条 Toast。
                 confirmStep = 1
                 toastMessage = ToastMessage("GoForm 地址格式不正确，请检查后重试。", ToastType.WARNING)
                 return
@@ -545,8 +541,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                 val r = httpConfirmPairing(
                     context, device.host, device.port, info.pairingCode, effectivePassword, deviceName,
                     gfIpToSend, gfPortToSend, gfPwToSend,
-                    // 2026-10-21（审计 §A1）：批准流程的两个字段。没走批准时都是空，
-                    // core 按"不需要批准"处理，行为与改动前完全一致。
+                    // 批准流程的两个字段。未走批准流程时均为空，core 按「不需要批准」处理，
+                    // 行为与未启用该开关时一致。
                     sid = approvalSid,
                     approvalCode = approvalRetryCode.takeIf { it.isNotBlank() }
                 )
@@ -573,8 +569,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                 }
                 is ConfirmOutcome.InvalidPassword -> {
                     busy = false
-                    // 登录场景把原因固定显示在密码框下方；首配的密码是本次新设的，
-                    // 服务端不会返回这个分支，保持顶部提示即可。
+                    // 登录场景将原因固定显示在密码框下方；首配的密码是本次新设的，
+                    // 服务端不会返回该分支，保持顶部提示即可。
                     if (!needsGoformSetup) {
                         passwordServerError = "配对密码错误，请重新输入。"
                         confirmStep = 0
@@ -593,10 +589,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     toastMessage = ToastMessage("设备身份校验失败，请重新配对。", ToastType.WARNING)
                 }
                 is ConfirmOutcome.ApprovalRequired -> {
-                    // 2026-10-21（审计 §A1）：机主开了「新设备需批准」。登记一次申请并进等待态。
-                    // 用一个 state 标记转交，而不是直接调 startApprovalRequest()：
-                    // 那个函数要调 doPair()（批准后重试），而 doPair() 又要调它 —— Kotlin 的
-                    // 局部函数不支持前向引用/互递归，用 LaunchedEffect 接力最干净。
+                    // 机主启用了「新设备需批准」。登记一次申请并进入等待态。
+                    // 以 state 标记转交，而非直接调用 startApprovalRequest()：该函数需要调用 doPair()
+                    // （批准后重试），而 doPair() 又需要调用它；Kotlin 局部函数不支持前向引用与互递归，
+                    // 因此用 LaunchedEffect 接力。
                     busy = false
                     approvalRequestPending = true
                 }
@@ -615,7 +611,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         }
     }
 
-    /** 收尾：停轮询、清等待态与 sid（下次要重新登记）。 */
+    /** 收尾：停止轮询、清除等待态与 sid（下次需重新登记）。 */
     fun cancelApproval() {
         approvalPollJob?.cancel()
         approvalPollJob = null
@@ -626,10 +622,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     }
 
     /**
-     * 每 1.5 秒问一次批准状态；批准后交给 LaunchedEffect 去重试 confirm。
+     * 每 1.5 秒查询一次批准状态；批准后交由 LaunchedEffect 重试 confirm。
      *
-     * 15 分钟上限与服务端的待批准 TTL 对齐：过了 TTL 服务端已经把这条请求清掉，
-     * 再问只会一直拿到 expired。
+     * 15 分钟上限与服务端待批准请求的 TTL 对齐：超过 TTL 后服务端已清除该请求，
+     * 继续查询只会得到 expired。
      */
     fun pollApprovalStatus(device: DiscoveredDevice) {
         approvalPollJob?.cancel()
@@ -658,8 +654,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                         toastMessage = ToastMessage("配对申请已过期，请重新发起。", ToastType.WARNING)
                         return@launch
                     }
-                    // null = 这次请求本身失败（网络抖动 / 429 限速），继续等下一轮；
-                    // 绝不能把抖动当成过期 —— 与 web 端 fetchApprovalStatus 同一约定。
+                    // null = 本次请求自身失败（网络波动 / 429 限速），继续等待下一轮；
+                    // 不得将网络波动当作过期——与 Web 端 fetchApprovalStatus 的约定一致。
                     else -> Unit
                 }
             }
@@ -667,10 +663,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     }
 
     /**
-     * 登记一次批准申请并开始轮询（2026-10-21，审计 §A1）。
+     * 登记一次批准申请并开始轮询。
      *
-     * 只在 doPair 收到 403 APPROVAL_REQUIRED 之后调用 —— 与 web 端同一原则：
-     * **不能**每次配对都先登记一次，否则机主把批准关着时，每次登录都会凭空造一条待批准记录。
+     * 仅在 doPair 收到 403 APPROVAL_REQUIRED 之后调用，与 Web 端原则一致：
+     * 不得在每次配对时预先登记，否则批准功能关闭期间，每次登录都会凭空生成一条待批准记录。
      */
     fun startApprovalRequest() {
         val device = selected ?: return
@@ -697,9 +693,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
     }
 
     LaunchedEffect(Unit) {
-        // 2026-10-22：上一次是被"踢回来"的吗？读一次、清掉、把原因告诉用户。
-        // 没有这句，用户只会看到"又要配对"，而掉线原因（凭据被移除/被拉黑/设备库恢复）
-        // 在界面上完全不可见 —— "每次打开都要重新登录"这类问题就是这样变得无从查起的。
+        // 上一次连接被服务端终止时，读取并清除记录的原因，在进入本屏时告知用户。
+        // 缺少该提示时，用户只会看到需要重新配对，而掉线原因（凭据被移除 / 被拉黑 /
+        // 设备库恢复）在界面上完全不可见。
         val reasonPrefs = AppPreferences(context)
         val lastReason = reasonPrefs.lastLogoutReason
         if (lastReason.isNotBlank()) {
@@ -708,7 +704,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         }
         startDiscovery()
     }
-    // 批准流程的两个"接力"（避免局部函数互递归，见 approvalRequestPending 的注释）
+    // 批准流程的两个接力点（避免局部函数互递归，见 approvalRequestPending 的注释）
     LaunchedEffect(approvalRequestPending) {
         if (approvalRequestPending) {
             approvalRequestPending = false
@@ -721,8 +717,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             doPair()
         }
     }
-    // 切换设备/重新拉取信息时重置密码输入与子步骤（避免沿用上一台/上一次输入，并回到第 1 步）。
-    // 2026-08-22：needsGoformSetup 派生自 pairingInfo.hasDefaultPassword，每次切设备自动重新派生，不再需要单独的 reconnectMode state 重置。
+    // 切换设备或重新拉取信息时重置密码输入与子步骤：不沿用上一台设备的输入，并回到第 1 步。
+    // needsGoformSetup 派生自 pairingInfo.hasDefaultPassword，切换设备后自动重新派生，
+    // 无需单独的 reconnectMode 状态。
     LaunchedEffect(pairingInfo) {
         password = ""
         confirmPassword = ""
@@ -736,29 +733,25 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
 
     Scaffold(
         containerColor = palette.pageBg,
-        // ★★ 2026-09-04（转场区满屏化 · 全库第二处）★★
-        //
-        // 本页**不走 MainNavGraph**（`MainActivity` 在未配对时直接渲染它）。
-        // 默认的 `ScaffoldDefaults.contentWindowInsets`（= safeDrawing）会把 padding 加在
-        // 滚动视口之外，内容在安全区边界被裁掉、下方留一条静态色带。
-        // 这里清零，由页内自己分层处理：
+        // 本页不经过 MainNavGraph（MainActivity 在未配对时直接渲染它）。
+        // 默认的 ScaffoldDefaults.contentWindowInsets（= safeDrawing）会把 padding 加在
+        // 滚动视口之外，内容在安全区边界被裁切，下方留下一条静态色带。
+        // 这里清零，由页内分层处理：
         //   - 外层 Column：systemBars ∪ displayCutout（品牌贴顶时避开状态栏 / 导航栏 / 刘海）；
-        //   - 卡片滚动区：ime（键盘弹出时卡片在键盘上方重新居中，品牌不跟着跳）。
+        //   - 卡片滚动区：ime（键盘弹出时卡片在键盘上方重新居中，品牌不随之移动）。
         contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { padding ->
-        // App 品牌标记（2026-08-11 v3：静态呈现，移除所有缩放/呼吸/光环/淡入动画）
-        // 用户反馈"标题顶部的图标不要动来动去"——保持克制安静，依赖纯视觉权重传达品牌
-        // 2026-09-07：改为直接渲染「应用自己的启动图标」，不再用手抄的矢量副本 + tint。
-        // 旧写法（ic_app_logo.xml 副本 + Icon(tint = accent) + 12% 强调色圆底）有两个问题：
-        //   ① Icon 会把矢量按 alpha 整体重染成单色，图标自带配色全部丢失；
-        //   ② 再叠一层低不透明度强调色圆底，观感就是「灰底 + 单色线条」，不是真正的应用图标。
-        // 为什么走 PackageManager 而不是 painterResource：本屏在 :app:feature-settings（library）
-        // 模块里，依赖方向是 :app → :app:feature-settings，反向拿不到 :app 的 @mipmap/ic_launcher。
-        // getApplicationIcon() 取的正是 manifest android:icon 指向的那份 adaptive-icon
-        // （背景层 + 前景层都在），所以换图标时这里自动跟随，不需要再维护任何副本。
+        // 应用品牌标记：静态呈现，不做缩放、呼吸、光环或淡入动画，以视觉权重传达品牌。
+        // 直接渲染应用自身的启动图标，不维护手抄的矢量副本，也不叠加 tint：
+        // Icon 会把矢量按 alpha 整体重染为单色，图标自带配色会全部丢失；
+        // 再叠加低不透明度强调色圆底，观感即为「灰底 + 单色线条」，并非真实应用图标。
+        // 使用 PackageManager 而非 painterResource：本屏位于 :app:feature-settings（library）模块，
+        // 依赖方向为 :app → :app:feature-settings，无法反向引用 :app 的 @mipmap/ic_launcher。
+        // getApplicationIcon() 返回 manifest android:icon 指向的 adaptive-icon（含背景层与前景层），
+        // 图标变更时自动跟随，无需维护副本。
         //
-        // 所有阶段共用同一张品牌块与同一份图标位图；按 120dp 解码、显示时固定 88dp，
-        // 既保留高分屏余量，也不会因为阶段切换改尺寸而重新解码或缩放。
+        // 所有阶段共用同一张品牌块与同一份图标位图：按 120dp 解码、显示时固定 88dp，
+        // 既保留高分屏余量，也不会因阶段切换改变尺寸而重新解码或缩放。
         val iconSizePx = with(LocalDensity.current) { 120.dp.roundToPx() }
         val appIconBitmap = remember(iconSizePx) {
             val drawable = context.packageManager.getApplicationIcon(context.applicationInfo)
@@ -772,18 +765,18 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         fun backToDeviceChoice() {
             focusManager.clearFocus()
             keyboardController?.hide()
-            // 让还在路上的 /pairing/info 结果作废，并结束 Loading 态。
+            // 使仍在途的 /pairing/info 结果作废，并结束 Loading 态。
             selectionToken += 1
             busy = false
             phase = if (candidates.isNotEmpty()) SetupPhase.CANDIDATES else SetupPhase.MANUAL
             selected = null
             pairingInfo = null
-            // 2026-10-21（审计 §B6）：core 在 confirm 任何失败后都可能轮换配对码。
-            // 不能继续复用 cachedInfo 里的旧码，否则返回后重选同一台设备必然 INVALID_CODE。
-            // 但也不能把 cachedInfo 整个丢掉 —— 设备名就在里面，丢了列表会退回设备 ID。
-            // cacheStale 只让 selectDevice 重新拉一次 /pairing/info，展示字段原样保留。
+            // core 在 confirm 任意失败后都可能轮换配对码，因此不得复用 cachedInfo 中的旧码，
+            // 否则返回后重选同一台设备必然得到 INVALID_CODE。
+            // 也不可整体丢弃 cachedInfo：设备名保存在其中，丢弃后列表会退回显示设备 ID。
+            // cacheStale 只让 selectDevice 重新拉取一次 /pairing/info，展示字段原样保留。
             candidates = candidates.map { it.copy(cacheStale = true) }
-            // 批准等待态一并收尾：换了设备，旧的 sid 已经没有意义
+            // 批准等待态一并收尾：设备已更换，旧的 sid 不再有意义
             cancelApproval()
             showPasswordErrors = false
             passwordServerError = null
@@ -860,18 +853,18 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
         }
 
         BackHandler(
-            // 对话框自己处理返回键；DISCOVER 是根页面，按返回退出 App 符合预期。
-            // 注意**不能**把 busy 写进 enabled：BackHandler 关闭时系统返回会直接 finish Activity，
-            // 登录/读信息请求在途时按返回会变成「退出 App」，比原来的「无拦截」更糟。
+            // 对话框自行处理返回键；DISCOVER 是根页面，按返回退出 App 符合预期。
+            // busy 不得写入 enabled：BackHandler 关闭时系统返回会直接 finish Activity，
+            // 登录或读取信息请求在途时按返回将变成「退出 App」，比不拦截更严重。
             enabled = !approvalWaiting && !showSelfRescue && phase != SetupPhase.DISCOVER
         ) {
             when {
                 busy && phase == SetupPhase.CONFIRM && info == null -> {
-                    // 读取 pairingInfo 期间：等价于 Loading 卡片上的「返回」，并让晚到的结果作废。
+                    // 读取 pairingInfo 期间：等价于 Loading 卡片上的「返回」，并使延迟返回的结果作废。
                     backToDeviceChoice()
                 }
                 busy -> {
-                    // 登录 / 配对提交在途：消费返回键，避免退出 App；请求有超时，不会永久卡住。
+                    // 登录或配对提交在途：消费返回键，避免退出 App；请求设有超时，不会永久停留。
                     toastMessage = ToastMessage("正在处理，请稍候…", ToastType.INFO)
                 }
                 phase == SetupPhase.CONFIRM && needsGoformNow && confirmStep > 0 -> {
@@ -1052,8 +1045,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                             modifier = Modifier.fillMaxWidth(),
                                             horizontalArrangement = Arrangement.spacedBy(Spacing.Large)
                                         ) {
-                                            // 设备行本身是主操作，这两个是次要动作：
-                                            // 用 Standard 档（48dp）而不是 Large，320dp 窄屏也不会被省略号截断。
+                                            // 设备行本身是主操作，两个按钮为次要动作：
+                                            // 使用 Standard 档（48dp）而非 Large，320dp 窄屏下也不会被省略号截断。
                                             UfiButton(
                                                 text = "重新搜索",
                                                 variant = UfiButtonVariant.Secondary,
@@ -1216,8 +1209,8 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                                             loading = busy,
                                             modifier = Modifier.fillMaxWidth()
                                         )
-                                        // 次要动作也必须是按钮（2026-10-23 用户反馈）：
-                                        // M3 的 TextButton 没有描边也没有底色，在卡内看起来就是一行普通文字。
+                                        // 次要动作同样使用按钮：M3 的 TextButton 既无描边也无底色，
+                                        // 在卡片内视觉上等同于一行普通文字。
                                         UfiButton(
                                             variant = UfiButtonVariant.Secondary,
                                             text = "选择其他设备",
@@ -1406,18 +1399,17 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
             }
         }
 
-        // v3（2026-08-11）：Toast 反馈宿主（搜索超时提示等）
+        // Toast 反馈宿主（搜索超时提示等）
         UfiToastHost(toastMessage = toastMessage, onDismiss = { toastMessage = null })
 
-        // ── 等待机主批准（2026-10-21，审计 §A1）──
+        // ── 等待机主批准 ──
         //
-        // App 作为**请求方**的这一半：core 的批准闸门对所有设备生效，
-        // 之前这里缺了整条链路，导致开关一开新手机永远配不上。
-        // 三条出路：机主在已配对设备上点「允许」（轮询自动完成）/ 输入外部通知里的 6 位码 /
-        // 放弃这次申请重新来。
-        if (approvalWaiting) {
+        // App 作为请求方的链路：core 的批准闸门对所有设备生效，缺少该链路时，
+        // 该开关一旦开启，新设备无法完成配对。
+        // 三条出路：机主在已配对设备上点「允许」（轮询自动完成）、输入外部通知中的 6 位码、
+        // 或放弃本次申请重新发起。
             UfiScrollableDialog(
-                visible = true,
+                visible = approvalWaiting,
                 onDismiss = { cancelApproval() },
                 title = "等待机主批准",
                 showCloseButton = false,
@@ -1425,9 +1417,9 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     UfiDialogActions(
                         onDismiss = { cancelApproval() },
                         onConfirm = {
-                            // 带输入框里的码重试 confirm：码正确时 core 直接视为已批准。
-                            // 注意**不能**先 cancelApproval() —— 那会把 approvalSid 和刚输入的码一起清掉，
-                            // 服务端就匹配不回这条待批准请求了。只收起弹窗，让 doPair 用现有 sid + 码去试。
+                            // 携带输入框中的码重试 confirm：码正确时 core 直接视为已批准。
+                            // 此处不得先调用 cancelApproval()：那会同时清除 approvalSid 与刚输入的码，
+                            // 服务端无法匹配回这条待批准请求。只收起弹窗，由 doPair 使用现有 sid 与码重试。
                             approvalPollJob?.cancel()
                             approvalPollJob = null
                             approvalWaiting = false
@@ -1456,7 +1448,7 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                         label = "6 位批准码（没有可留空）",
                         value = approvalRetryCode,
                         onValueChange = { v ->
-                            // 码是大写字母 + 数字：统一转大写并剔除其它字符（审计 §C5）
+                            // 批准码由大写字母与数字组成：统一转大写并剔除非字母数字字符
                             approvalRetryCode = v.uppercase().filter { it.isLetterOrDigit() }.take(6)
                         }
                     )
@@ -1464,13 +1456,12 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                         "批准码由机主在已配对设备的弹窗中查看，或通过机主配置的邮件、Webhook、" +
                             "系统通知发送；它不是设备屏幕上显示的配对码。"
                     )
-                    // 自救入口（2026-10-21 决策 D6-2；2026-10-22 按 paired_count 收紧）：
-                    // 设备里可能还留着一条**已经死掉**的旧配对记录（本机清过数据 / 重装，
-                    // 密钥已删、永远登录不上），它仍然满足"存在已配对设备"，于是这台手机永远
-                    // 等不到批准。这里给一条自救路：用配对密码清空整份配对后重新配对。
+                    // 自救入口：设备中可能残留一条已失效的旧配对记录（本机清除数据或重装后
+                    // 密钥已删除，永远无法登录），它仍满足「存在已配对设备」的条件，导致本机
+                    // 无法获得批准。此处提供一条自救路径：使用配对密码清空整份配对后重新配对。
                     //
-                    // 文案按实际条数生成 —— 之前固定写"这台手机就是唯一已配对设备"，在设备上
-                    // 还有别的手机时是假话，也让用户误以为和配对码重复。
+                    // 文案按实际条数生成：固定写「这台手机是唯一已配对设备」在设备上还有其他手机时
+                    // 与事实不符，也会让用户误以为与配对码有关。
                     val pairedCount = pairingInfo?.pairedCount ?: 0
                     if (pairedCount > 0) {
                         TextButton(onClick = { showSelfRescue = true }) {
@@ -1485,12 +1476,10 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     }
                 }
             }
-        }
 
         // 自救：清空整份配对（需要配对密码，走 root 端点，不放宽任何安全边界）
-        if (showSelfRescue) {
             UfiScrollableDialog(
-                visible = true,
+                visible = showSelfRescue,
                 onDismiss = { if (!selfRescueBusy) { showSelfRescue = false; selfRescuePwd = "" } },
                 title = "删除旧配对并重新开始",
                 showCloseButton = false,
@@ -1543,12 +1532,11 @@ fun SetupScreen(onSetupComplete: (ip: String, port: Int, token: String) -> Unit)
                     )
                 }
             }
-        }
     }
 }
 
 // ───────────────────────────────────────────────────────────
-// 模块级网络 / 发现辅助（直接使用 HttpURLConnection，支持动态地址；不走固定 baseUrl 的 Retrofit）
+// 模块级网络 / 发现辅助（直接使用 HttpURLConnection，支持动态地址；不使用固定 baseUrl 的 Retrofit）
 // ───────────────────────────────────────────────────────────
 
 /** 读取本机 DHCP 网关 IP（用于网关探测兜底；设备即网关）。 */
@@ -1570,8 +1558,8 @@ private fun readDeviceName(context: Context): String? {
 
 /**
  * GET /pairing/info（免鉴权），返回设备信息或状态。
- * 429（后端每 IP 3s 限流）：等待限流窗口后自动重试一次，仍 429 才报错——
- * 避免"自动发现刚探测过设备→立即选择/手动连接"被误判为设备异常（不可达）。
+ * 429（后端按 IP 限流）：等待限流窗口后自动重试一次，仍为 429 才报错，
+ * 避免「自动发现刚探测过设备 → 立即选择或手动连接」被误判为设备不可达。
  */
 private suspend fun httpGetPairingInfo(host: String, port: Int, allowRetry: Boolean = true): InfoOutcome =
     withContext(Dispatchers.IO) {
@@ -1600,7 +1588,7 @@ private suspend fun httpGetPairingInfo(host: String, port: Int, allowRetry: Bool
                 }
                 409 -> InfoOutcome.AlreadyPaired
                 429 -> if (allowRetry) {
-                    // 后端限流窗口 1s：稍等越过窗口后重试一次
+                    // 后端按 IP 限流：延迟 1.2s 越过窗口后重试一次
                     kotlinx.coroutines.delay(1200)
                     httpGetPairingInfo(host, port, allowRetry = false)
                 } else {
@@ -1615,8 +1603,8 @@ private suspend fun httpGetPairingInfo(host: String, port: Int, allowRetry: Bool
     }
 
 /**
- * POST /pairing/challenge 取一次性挑战。
- * 免鉴权（此刻还没有凭据），失败返回 null，调用方按"设备不可达/异常"处理。
+ * POST /pairing/challenge 获取一次性挑战。
+ * 免鉴权（此时尚无凭据），失败返回 null，调用方按「设备不可达 / 异常」处理。
  */
 private suspend fun httpGetPairingChallenge(host: String, port: Int): String? =
     withContext(Dispatchers.IO) {
@@ -1639,19 +1627,19 @@ private suspend fun httpGetPairingChallenge(host: String, port: Int): String? =
  * POST /pairing/confirm {pairing_code, device_pubkey, challenge, signature, device_hwid,
  * password, device_name, goform_ip, goform_port, goform_password}，成功返回 {token, fingerprint}。
  *
- * 设备身份是 [DeviceKeyStore] 里**不可导出**的私钥：这里上报公钥并对服务端下发的挑战签名，
- * 服务端据公钥自己算指纹。客户端不再上报 `app_fingerprint`——那个值可被任意伪造，
- * 是"Web 端所有浏览器共用一个指纹导致配对上限失效"的同源问题。
+ * 设备身份使用 [DeviceKeyStore] 中不可导出的私钥：此处上报公钥并对服务端下发的挑战签名，
+ * 服务端据公钥自行计算指纹。客户端不再上报 `app_fingerprint`：该值可被任意伪造，
+ * 与「Web 端所有浏览器共用一个指纹，导致配对上限失效」属于同一类问题。
  *
- * ## 2026-10-21 新增两个字段（审计 §A1）
- * core 的「新设备需批准」闸门对**所有**设备生效（没有"只覆盖 Web"的判据），所以 App 也必须
- * 走请求方那一半：先 `POST /pairing/request-approval` 拿 `sid`，confirm 时带上它；
- * 机主批准后同一个 sid 重试即可通过。`approval_code` 是"机主从通知里读到的 6 位码"那条路。
+ * ## 批准流程字段
+ * core 的「新设备需批准」闸门对所有设备生效（无「仅覆盖 Web」判据），因此 App 也必须实现
+ * 请求方链路：先 POST /pairing/request-approval 获取 `sid`，confirm 时携带；
+ * 机主批准后以同一 sid 重试即可通过。`approval_code` 对应「机主从通知中读取的 6 位码」这条路径。
  *
- * @param context 用于读取 [AppPreferences.deviceHwid]（硬件派生的稳定标识）。后端**仅**用它
- *   合并"同一台手机换了密钥"产生的重复记录，不参与任何安全判定。
+ * @param context 用于读取 [AppPreferences.deviceHwid]（硬件派生的稳定标识）。后端仅用它合并
+ *   「同一台手机更换密钥」产生的重复记录，不参与任何安全判定。
  * @param sid 批准会话随机数；未走批准流程时为空串。
- * @param approvalCode 机主回传的 6 位配对码；没有则 null。
+ * @param approvalCode 机主回传的 6 位批准码；没有则为 null。
  */
 private suspend fun httpConfirmPairing(
     context: Context,
@@ -1678,11 +1666,11 @@ private suspend fun httpConfirmPairing(
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.connectTimeout = 10_000
-            // 2026-10-21（审计 §B5）：readTimeout 必须盖住 core 的**失败退避阶梯**
-            // （`PairingAttemptLimiter`：1s→2s→4s→8s→30s→2min→10min，且是在 confirm 之前 delay）。
-            // 之前是 5s：用户连错两三次密码之后，服务端还在退避里等待，客户端已经先超时，
-            // 界面报"设备不可达: Read timed out" —— 真实原因（密码错/被限流）被完全掩盖，
-            // 用户按"网络问题"继续点，退避越涨越高。30s 覆盖到前四档，更长的档位靠文案说明。
+            // readTimeout 必须覆盖 core 的失败退避阶梯
+            // （`PairingAttemptLimiter`：1s→2s→4s→8s→30s→2min→10min，且 delay 发生在 confirm 之前）。
+            // 若超时早于服务端退避结束，界面会报「设备不可达: Read timed out」，
+            // 真实原因（密码错误 / 被限流）被完全掩盖，用户会按网络问题继续重试，退避时间随之升高。
+            // 30s 覆盖前四档，更长的档位由文案说明。
             conn.readTimeout = 30_000
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
@@ -1695,8 +1683,8 @@ private suspend fun httpConfirmPairing(
                 put("device_hwid", AppPreferences(context).deviceHwid)
                 put("password", password)
                 if (!deviceName.isNullOrBlank()) put("device_name", deviceName)
-                // 批准流程（2026-10-21）：登记过的会话随机数 + 机主回传的 6 位码。
-                // 两者都没走时留空 —— core 按"不需要批准"处理。
+                // 批准流程：登记过的会话随机数与机主回传的 6 位码。
+                // 两者均未使用时留空——core 按「不需要批准」处理。
                 if (sid.isNotBlank()) put("sid", sid)
                 if (!approvalCode.isNullOrBlank()) put("approval_code", approvalCode.trim().uppercase())
                 // GoForm 后台连接配置（可选，首次配对一并提交，后端 persistGoformSettings 落库）
@@ -1716,15 +1704,15 @@ private suspend fun httpConfirmPairing(
                 }
                 409 -> ConfirmOutcome.AlreadyPaired
                 403 -> {
-                    // 2026-10-21（审计 §B3）：403 不止"隧道来源"一种。
-                    // 之前一律按局域网限制来写文案，于是「新设备需批准」和「已拉黑/冷却中」
-                    // 都被显示成"该操作只能在局域网内完成"——用户完全不知道下一步该做什么。
-                    // 注意 errorStream 只能读一次，所以 code/error/retry 一起取（见 readErrorBody）。
+                    // 403 不只有「隧道来源」一种含义：统一按局域网限制撰写文案时，
+                    // 「新设备需批准」与「已拉黑 / 冷却中」都会显示为「该操作只能在局域网内完成」，
+                    // 用户无法判断下一步操作。
+                    // errorStream 只能读取一次，因此 code/error/retry 一并读取（见 readErrorBody）。
                     val err = readErrorBody(conn)
                     when (err.code) {
                         "APPROVAL_REQUIRED" -> ConfirmOutcome.ApprovalRequired
                         "DEVICE_BLOCKED" -> {
-                            // 2026-10-21（决策 D4）：把"还要等多久"直接写出来。
+                            // 明确给出剩余等待时间。
                             val wait = describeCooldown(err.retryAfterSeconds)
                             ConfirmOutcome.Error(
                                 "本设备已被拉黑，无法配对。" +
@@ -1743,11 +1731,11 @@ private suspend fun httpConfirmPairing(
                         "PASSWORD_REQUIRED" -> ConfirmOutcome.Error("配对密码已设置，请输入配对密码")
                         "PASSWORD_LOCKED" -> ConfirmOutcome.PasswordLocked
                         "INVALID_DEVICE_KEY", "INVALID_CHALLENGE" -> ConfirmOutcome.DeviceKeyRejected
-                        // 2026-10-21（审计 §B4）：后台地址格式错被归到"配对码无效"，指错方向。
+                        // 后台地址格式错误不得归入「配对码无效」，否则会指向错误的排查方向。
                         "INVALID_GOFORM_CONFIG" -> ConfirmOutcome.Error(
                             err.error.ifBlank { "设备后台配置无效（IP/端口/密码格式错误）" }
                         )
-                        // core 对「首次配对要配对码但没给」回 400 BAD_REQUEST，别再让人以为是码错了。
+                        // core 对「首次配对需要配对码但未提供」返回 400 BAD_REQUEST，不应表现为配对码错误。
                         "BAD_REQUEST" -> ConfirmOutcome.Error(
                             err.error.ifBlank { "配对参数缺失，请返回重新选择设备" }
                         )
@@ -1791,10 +1779,10 @@ private fun readErrorMessage(conn: HttpURLConnection): String {
 }
 
 /**
- * 一次读完错误体的 `code` / `error` / `retry_after_seconds`（2026-10-21）。
+ * 一次读完错误体的 `code` / `error` / `retry_after_seconds`。
  *
- * `errorStream` 只能读一次 —— 先 [readErrorCode] 再 [readErrorMessage] 时第二次必然拿到空串，
- * 于是"按 code 分流、再退回服务端文案"的写法会静默丢掉服务端那句话。
+ * `errorStream` 只能读取一次：先调用 [readErrorCode] 再调用 [readErrorMessage] 时，
+ * 第二次必然得到空串，于是「按 code 分流、再回退到服务端文案」的写法会静默丢失服务端文案。
  */
 private data class ErrorBody(
     val code: String,
@@ -1817,10 +1805,10 @@ private fun readErrorBody(conn: HttpURLConnection): ErrorBody {
 }
 
 /**
- * 把"还要等多久"翻成一句人话（2026-10-21 决策 D4）。
+ * 将剩余冷却时间格式化为面向用户的文案。
  *
- * core 在 403 DEVICE_BLOCKED 里带 `retry_after_seconds`：解除拉黑不清冷却（最长 1 小时），
- * 之前只能写"最长 1 小时"，用户不知道该等 5 分钟还是一小时，反复重试反而在刷新冷却。
+ * core 在 403 DEVICE_BLOCKED 中返回 `retry_after_seconds`；解除拉黑不重置冷却（最长 1 小时）。
+ * 仅给出上限时用户无法判断应等待 5 分钟还是 1 小时，反复重试反而会刷新冷却。
  */
 private fun describeCooldown(seconds: Long): String = when {
     seconds <= 0L -> ""
@@ -1831,12 +1819,11 @@ private fun describeCooldown(seconds: Long): String = when {
 /**
  * `POST /pairing/unpair`（root，需要配对密码）→ 清空整份配对并重新进入配对模式。
  *
- * 2026-10-21（决策 D6-2）：这是 App 侧**唯一**能自救"设备里还留着一条已死记录、
- * 而自己又被批准闸门挡住"的入口 —— 那条记录的密钥已经随「清除数据 / 重新配对」消失，
- * 永远登录不上，却仍然满足"存在已配对设备"，于是没人能批准新的这台。
- * 走的是带密码的 root 端点，不需要放宽任何安全边界。
+ * 这是 App 侧唯一可用于解除「设备中残留已失效配对记录、同时受批准闸门阻止」状态的自救入口：
+ * 该记录的密钥已随清除数据 / 重新配对消失，永远无法登录，却仍满足「存在已配对设备」的条件，
+ * 导致没有任何设备可以批准新设备。该接口为带密码的 root 端点，不放宽任何安全边界。
  *
- * @return null = 成功；否则是给人看的错误文案。
+ * @return null 表示成功；否则返回面向用户的错误文案。
  */
 private suspend fun httpUnpairAll(host: String, port: Int, password: String): String? =
     withContext(Dispatchers.IO) {
@@ -1860,7 +1847,7 @@ private suspend fun httpUnpairAll(host: String, port: Int, password: String): St
         }.getOrElse { "设备不可达: ${it.message}" }
     }
 
-/** 生成一次批准申请的会话随机数（128-bit hex，与 web 的 sid 同构）。 */
+/** 生成一次批准申请的会话随机数（128 位 hex，与 Web 端 sid 同构）。 */
 private fun newApprovalSid(): String {
     val bytes = ByteArray(16)
     java.security.SecureRandom().nextBytes(bytes)
@@ -1868,10 +1855,10 @@ private fun newApprovalSid(): String {
 }
 
 /**
- * `POST /pairing/request-approval` 登记一次待批准请求（2026-10-21，审计 §A1）。
+ * `POST /pairing/request-approval` 登记一次待批准请求。
  *
- * 与 confirm 同一套裸 `HttpURLConnection`：此刻 App 还没有任何凭据，走不了 Retrofit。
- * @return true = 已登记（含"本来就在等"的幂等命中）
+ * 与 confirm 使用同一套裸 `HttpURLConnection`：此时 App 尚无任何凭据，无法使用 Retrofit。
+ * @return true 表示已登记（包含「原本就在等待」的幂等命中）
  */
 private suspend fun httpRequestApproval(
     host: String,
@@ -1894,7 +1881,7 @@ private suspend fun httpRequestApproval(
             put("device_name", deviceName)
         }.toString()
         conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        // 200 = 登记成功；429 = 申请过于频繁；501 = 设备端没启用批准（旧 core）
+        // 200 = 登记成功；429 = 申请过于频繁；501 = 设备端未启用批准（旧版本 core）
         conn.responseCode == 200
     }.getOrDefault(false)
 }
@@ -1902,8 +1889,8 @@ private suspend fun httpRequestApproval(
 /**
  * `GET /pairing/approval-status?sid=` → `pending` / `approved` / `rejected` / `expired`。
  *
- * @return 状态字符串；**网络/服务端失败返回 null**（调用方继续等，别把抖动当过期 ——
- *   这条约定与 web 端 `fetchApprovalStatus` 完全一致）。
+ * @return 状态字符串；网络或服务端失败返回 null（调用方继续等待，不得将网络波动当作过期，
+ *   该约定与 Web 端 `fetchApprovalStatus` 一致）。
  */
 private suspend fun httpGetApprovalStatus(host: String, port: Int, sid: String): String? =
     withContext(Dispatchers.IO) {
@@ -1920,10 +1907,10 @@ private suspend fun httpGetApprovalStatus(host: String, port: Int, sid: String):
     }
 
 // ───────────────────────────────────────────────────────────
-// 配对 / 登录屏的视觉组件（2026-10-22）
+// 配对 / 登录屏的视觉组件
 //
-// 全部取自主题：LocalResolvedPalette 的颜色 token、Spacing 的间距、UfiCardDefaults 形状。
-// **这里不新增任何颜色常量** —— 换皮肤 / 深色模式时这一屏跟着走。
+// 颜色取自 LocalResolvedPalette 的 token，间距取自 Spacing，形状取自 UfiCardDefaults。
+// 本区域不新增任何颜色常量：换肤 / 深色模式下本屏随主题变化。
 // ───────────────────────────────────────────────────────────
 
 /** 背景装饰：点阵 + 同心圆，颜色由 palette token 派生（纯装饰，不承载信息）。 */
@@ -1966,7 +1953,7 @@ private fun SetupCard(content: @Composable ColumnScope.() -> Unit) {
     val shape = UfiCardDefaults.largeShape
     Column(
         modifier = Modifier
-            // 先夹宽度再 fillMaxWidth：宽屏 / 横屏下卡片不会铺成一条横带。
+            // 先限制最大宽度再 fillMaxWidth：宽屏 / 横屏下卡片不会铺展为一条横带。
             .widthIn(max = 420.dp)
             .fillMaxWidth()
             // 同一张卡内部的高度变化（错误 supportingText 出现 / 消失）也要平滑；
@@ -1985,12 +1972,12 @@ private fun SetupCard(content: @Composable ColumnScope.() -> Unit) {
 /**
  * 品牌块：图标 + 标题 +（设备名 / 地址 / 说明）。
  *
- * 位于卡片上方，与卡片同属一条竖列并随卡片一起移动。图标**始终 88dp**：
- * 旧实现会在进入配对向导时从 88 切成 76，用户看到的就是「切页面时图标莫名缩放」。
- * 标题/地址/说明随阶段变化时只让品牌块高度平滑变化，图标本身不缩放。
+ * 位于卡片上方，与卡片同属一条竖列并随卡片一起移动。图标始终 88dp，不随阶段切换改变尺寸，
+ * 否则切换页面时会出现图标缩放。标题 / 地址 / 说明随阶段变化时仅平滑改变品牌块高度，
+ * 图标本身不缩放。
  *
- * 设备名与地址各占一行：拼成「客厅路由 · 192.168.8.1:8088」时，长 IP/域名会把设备名
- * 挤成省略号，而且两者字号与字体本就不同（名字用正文字体，地址用等宽）。
+ * 设备名与地址各占一行：拼成「客厅路由 · 192.168.8.1:8088」时，长 IP / 域名会把设备名
+ * 挤成省略号，且两者字号与字体不同（名称使用正文字体，地址使用等宽字体）。
  */
 @Composable
 private fun SetupBrand(
@@ -2005,14 +1992,14 @@ private fun SetupBrand(
     Column(
         modifier = modifier
             .widthIn(max = 420.dp)
-            // 固定宽度后 animateContentSize 只动高度：标题/设备名/地址切换时
-            // 不会出现品牌块横向拉伸，也不会带动上方图标做视觉缩放。
+            // 固定宽度后 animateContentSize 仅改变高度：标题 / 设备名 / 地址切换时
+            // 品牌块不会横向拉伸，也不会带动上方图标产生视觉缩放。
             .fillMaxWidth()
             .animateContentSize(animationSpec = tween(220), alignment = Alignment.TopCenter),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // 2026-10-23：不要大圆角 —— 与全局图标圆角一致（Spacing.CornerTag = 5dp）。
+        // 不使用大圆角：与全局图标圆角一致（Spacing.CornerTag = 5dp）。
         Image(
             bitmap = bitmap,
             contentDescription = null,

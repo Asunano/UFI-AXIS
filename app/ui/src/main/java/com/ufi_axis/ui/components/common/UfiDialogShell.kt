@@ -2,6 +2,9 @@
 package com.ufi_axis.ui.components.common
 
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.animateContentSize
 import com.ufi_axis.ui.R as UiR
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -605,6 +608,12 @@ internal fun UfiDialogShell(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(max = maxDialogH)
+                            // 2026-11-08：内容高度变化（换选项、说明从一行变两行、展开/收起）
+                            // 用动画过渡，避免卡片"啪"地跳一下。放在 shadow/background 之前，
+                            // 阴影与底色跟着动画后的尺寸走。
+                            .animateContentSize(
+                                animationSpec = if (reduceMotion) snap() else tween(220)
+                            )
                             .ufiCardShadow(elevation = UfiCardDefaults.elevationLevel3Dp, shape = UfiCardDefaults.dialogShape)
                             .background(cardContainer, UfiCardDefaults.dialogShape)
                             .border(
@@ -739,7 +748,9 @@ fun DialogButtonRow(
     outlineColor: Color? = null,
     outlineTextColor: Color? = null,
     enabled: Boolean = true,
-    loading: Boolean = false
+    loading: Boolean = false,
+    /** true：确认按钮直接执行 onConfirm，不等离场 ramp；供"退出页面"类流程使用。 */
+    immediateConfirm: Boolean = false
 ) {
     val palette = LocalResolvedPalette.current
     // 2026-09-18：两个按钮的动作统一经 [LocalUfiDialogClose] 排时序 —— 弹窗离场的
@@ -801,7 +812,9 @@ fun DialogButtonRow(
             }
         }
         Button(
-            onClick = { close(onConfirm) },
+            onClick = {
+                if (immediateConfirm) onConfirm() else close(onConfirm)
+            },
             colors = ButtonDefaults.buttonColors(
                 containerColor = confirmColor,
                 contentColor = palette.onAccent

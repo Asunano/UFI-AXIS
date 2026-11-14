@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.media
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -128,14 +129,16 @@ internal fun mediaTrackActionsFor(
 @Composable
 internal fun MediaTrackInfoDialog(
     item: MediaLibraryItem,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    /** 调用方按"目标是否为空"传入；默认 true 保持既有调用点不变。 */
+    visible: Boolean = true
 ) {
     val palette = LocalResolvedPalette.current
     val clipboard = LocalClipboardManager.current
     var copied by remember { mutableStateOf(false) }
 
     UfiCustomDialog(
-        visible = true,
+        visible = visible,
         onDismiss = onDismiss,
         title = "歌曲信息",
         confirmButton = {
@@ -311,13 +314,22 @@ internal fun MediaTrackActionHost(
 
     MediaAddToPlaylistHost(media = media, target = addTarget, onDone = { addTarget = null })
 
-    infoTarget?.let { item ->
-        MediaTrackInfoDialog(item = item, onDismiss = { infoTarget = null })
+    val dialogInfoTarget = rememberLastNonNull(infoTarget)
+    if (dialogInfoTarget != null) {
+        val item = dialogInfoTarget
+        // 保持挂载：目标置空时让弹窗自己走离场动画，而不是整棵树被摘掉。
+        MediaTrackInfoDialog(
+            item = item,
+            onDismiss = { infoTarget = null },
+            visible = infoTarget != null,
+        )
     }
 
-    blockedMessage?.let { msg ->
+    val dialogBlockedMessage = rememberLastNonNull(blockedMessage)
+    if (dialogBlockedMessage != null) {
+        val msg = dialogBlockedMessage
         UfiCustomDialog(
-            visible = true,
+            visible = blockedMessage != null,
             onDismiss = { blockedMessage = null },
             title = "暂时无法下载",
             confirmButton = {
@@ -332,9 +344,11 @@ internal fun MediaTrackActionHost(
 
     // 「从音乐库移除」的确认。它是可撤销的，所以这一档不用 Danger 按钮 ——
     // 把两种破坏性程度画成同一个红色，用户就学不会区分了。
-    excludeTarget?.let { item ->
+    val dialogExcludeTarget = rememberLastNonNull(excludeTarget)
+    if (dialogExcludeTarget != null) {
+        val item = dialogExcludeTarget
         UfiCustomDialog(
-            visible = true,
+            visible = excludeTarget != null,
             onDismiss = { if (!busy) excludeTarget = null },
             title = "从音乐库移除",
             confirmButton = {
@@ -381,9 +395,11 @@ internal fun MediaTrackActionHost(
 
     // 「删除文件」的确认。不可逆，所以必须写清文件名**与完整路径** ——
     // 同名文件在不同目录里很常见，只给曲名的确认框等于让用户凭猜确认。
-    deleteTarget?.let { item ->
+    val dialogDeleteTarget = rememberLastNonNull(deleteTarget)
+    if (dialogDeleteTarget != null) {
+        val item = dialogDeleteTarget
         UfiCustomDialog(
-            visible = true,
+            visible = deleteTarget != null,
             onDismiss = { if (!busy) deleteTarget = null },
             title = "永久删除文件",
             confirmButton = {
@@ -438,9 +454,11 @@ internal fun MediaTrackActionHost(
 
     // 执行结果。只有"有话要说"时才弹：干净成功的情况下列表里那一行已经消失了，
     // 再弹一个"已移除"只是多一次点击。
-    resultMessage?.let { msg ->
+    val dialogResultMessage = rememberLastNonNull(resultMessage)
+    if (dialogResultMessage != null) {
+        val msg = dialogResultMessage
         UfiCustomDialog(
-            visible = true,
+            visible = resultMessage != null,
             onDismiss = { resultMessage = null },
             title = "没能全部完成",
             confirmButton = {

@@ -37,6 +37,7 @@ import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 import com.ufi_axis.viewmodel.state.MEDIA_GROUP_KINDS
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 音乐页设置（右上角齿轮进来）。
@@ -125,7 +126,7 @@ fun MediaAudioSettingsScreen(
                         },
                         icon = Icons.Default.MusicOff,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_AUDIO_EXCLUDED) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_AUDIO_EXCLUDED) }
                     )
                 }
 
@@ -146,7 +147,7 @@ fun MediaAudioSettingsScreen(
                         },
                         icon = Icons.Default.History,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_AUDIO_RECENT) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_AUDIO_RECENT) }
                     )
                 }
 
@@ -160,7 +161,7 @@ fun MediaAudioSettingsScreen(
                         },
                         icon = Icons.Default.Download,
                         trailing = { UfiSettingsChevron() },
-                        onClick = { navController.navigate(Routes.MEDIA_AUDIO_DOWNLOADS) }
+                        onClick = { navController.ufiNavigateOnce(Routes.MEDIA_AUDIO_DOWNLOADS) }
                     )
                 }
                 /*

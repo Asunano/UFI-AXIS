@@ -23,6 +23,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「本机短信」通知渠道配置页（2026-09-09 阶段 3）。入口在 [PushChannelsScreen]。
@@ -306,7 +307,7 @@ fun LocalSmsNotifyScreen(viewModel: MainViewModel, navController: NavHostControl
                         skippedTotal = toolsState.deliveryHistorySkippedTotal
                     ),
                     onClick = {
-                        navController.navigate(Routes.deliveryHistory(DELIVERY_CHANNEL_LOCAL_SMS))
+                        navController.ufiNavigateOnce(Routes.deliveryHistory(DELIVERY_CHANNEL_LOCAL_SMS))
                     }
                 )
             }

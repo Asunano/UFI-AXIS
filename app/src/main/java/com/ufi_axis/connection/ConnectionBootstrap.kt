@@ -46,8 +46,16 @@ object ConnectionBootstrap {
         prefs: AppPreferences,
         onUnauthorized: () -> Unit
     ) {
-        // 2026-10-05 R3-9 修复：弱引用持有回调 + 配对注销，避免静态字段滞留已销毁 Activity
-        onUnauthorizedRef = java.lang.ref.WeakReference(onUnauthorized)
+        // 2026-11-14：**改回强引用**。原先是 WeakReference（2026-10-05 R3-9 为防静态字段滞留
+        // 已销毁 Activity），但 MainActivity 传进来的是内联 lambda —— 除了这个弱引用没人持有它，
+        // 一次 GC 就能回收，`onUnauthorizedRef?.get()` 随即返回 null：
+        // 吊销判定（WIPE）照常执行、`isSetupComplete=false` 也写进了 prefs，
+        // **但界面当场毫无反应**，用户只能重启 App 才被踢回配对页
+        //（实测：删配对后日志显示 "WIPE 执行：handler=有"，界面却一直停在仪表盘）。
+        //
+        // 防泄漏改由「生命周期配对」保证：注册方在 DisposableEffect 的 onDispose 里调用
+        // [unregisterUnauthorizedHandler]（MainActivity 已如此），静态字段不会滞留。
+        onUnauthorizedHandler = onUnauthorized
         RetrofitClient.onUnauthorized = {
             val runnable = Runnable {
                 // 2026-10-22：先把"为什么掉线"记下来，配对页会读一次并提示。
@@ -59,17 +67,23 @@ object ConnectionBootstrap {
                 }"
                 prefs.token = ""
                 prefs.isSetupComplete = false
-                onUnauthorizedRef?.get()?.invoke()
+                onUnauthorizedHandler?.invoke()
             }
             if (context is ComponentActivity) context.runOnUiThread(runnable) else runnable.run()
         }
     }
 
-    // 2026-10-05 R3-9 修复：注销回调，与 registerUnauthorizedHandler 生命周期配对
-    private var onUnauthorizedRef: java.lang.ref.WeakReference<(() -> Unit)?>? = null
+    /**
+     * 吊销回调（强引用，见 [registerUnauthorizedHandler] 里的说明）。
+     *
+     * 生命周期与本对象的 `register`/`unregister` 配对：Activity 在 `onDispose` 里注销，
+     * 静态字段不会滞留已销毁的 Activity。
+     */
+    @Volatile
+    private var onUnauthorizedHandler: (() -> Unit)? = null
 
     fun unregisterUnauthorizedHandler() {
-        onUnauthorizedRef = null
+        onUnauthorizedHandler = null
         RetrofitClient.onUnauthorized = null
     }
 

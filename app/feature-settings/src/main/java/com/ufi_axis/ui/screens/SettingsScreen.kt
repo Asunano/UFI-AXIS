@@ -25,6 +25,7 @@ import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.ui.theme.ufiCardShadow
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -187,7 +188,7 @@ fun SettingsScreen(
                         icon = Icons.Default.Palette,
                         title = "外观",
                         description = "主题、深色模式、配色预设",
-                        onClick = { navController?.navigate(Routes.DETAIL_APPEARANCE) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_APPEARANCE) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -198,7 +199,7 @@ fun SettingsScreen(
                         icon = Icons.Default.WbSunny,
                         title = "小功能",
                         description = "标题栏天气 · 今日诗词",
-                        onClick = { navController?.navigate(Routes.DETAIL_UI_EXTRAS) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_UI_EXTRAS) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -211,7 +212,7 @@ fun SettingsScreen(
                         icon = Icons.Default.Insights,
                         title = "监控设置",
                         description = "数据采集 · 图表显示 · 调度 · 存储",
-                        onClick = { navController?.navigate(Routes.DETAIL_MONITOR_SETTINGS) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_MONITOR_SETTINGS) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -223,7 +224,7 @@ fun SettingsScreen(
                         icon = Icons.Default.Dns,
                         title = "服务器",
                         description = "Core API · 设备控制 · 配对管理",
-                        onClick = { navController?.navigate(Routes.DETAIL_SERVER) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_SERVER) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -233,7 +234,7 @@ fun SettingsScreen(
                         icon = Icons.Default.NotificationsActive,
                         title = "通知与守护",
                         description = "系统告警 · 后台通知",
-                        onClick = { navController?.navigate(Routes.DETAIL_NOTIFICATIONS_GUARD) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_NOTIFICATIONS_GUARD) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -243,7 +244,7 @@ fun SettingsScreen(
                         icon = Icons.Default.Info,
                         title = "关于设备",
                         description = "固件版本 · 基带版本 · 设备信息",
-                        onClick = { navController?.navigate(Routes.DETAIL_ABOUT) },
+                        onClick = { navController?.ufiNavigateOnce(Routes.DETAIL_ABOUT) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }

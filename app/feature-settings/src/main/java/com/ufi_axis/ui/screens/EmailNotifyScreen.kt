@@ -21,6 +21,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「邮件通知」二级页（2026-08-29 由原「短信转发」页改造）。
@@ -356,7 +357,7 @@ fun EmailNotifyScreen(viewModel: MainViewModel, navController: NavHostController
                         skippedTotal = toolsState.deliveryHistorySkippedTotal
                     ),
                     onClick = {
-                        navController.navigate(Routes.deliveryHistory(DELIVERY_CHANNEL_MAIL))
+                        navController.ufiNavigateOnce(Routes.deliveryHistory(DELIVERY_CHANNEL_MAIL))
                     }
                 )
             }

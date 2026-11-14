@@ -29,6 +29,7 @@ import com.ufi_axis.ui.theme.UfiCardDefaults
 import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * FIX-9（2026-08-23）：内网穿透主页改为入口卡片式列表（两个独立入口，无通用设置卡）。
@@ -76,7 +77,7 @@ fun TunnelScreen(viewModel: MainViewModel, navController: NavHostController) {
                 }
             }
             // 通用设置（通知/重连/日志）此前没有任何入口，路由注册了却进不去
-            IconButton(onClick = { navController.navigate(Routes.DETAIL_TUNNEL_SETTINGS) }) {
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_SETTINGS) }) {
                 Icon(Icons.Default.Settings, contentDescription = "隧道设置")
             }
         }
@@ -105,12 +106,12 @@ fun TunnelScreen(viewModel: MainViewModel, navController: NavHostController) {
                     running = state.frpRunningCount > 0,
                     installed = state.frpInstalled,
                     version = state.frpVersion,
-                    onClick = { navController.navigate(Routes.DETAIL_TUNNEL_FRP) },
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_FRP) },
                     // 2026-10-14：未安装时的快捷安装入口（跳到资源中心）。
                     // 从前这里只写一个"未安装"就没了，而整张卡的点击**一律**进隧道详情页 ——
                     // 详情页里能新建/改配置，却没有任何一处能装二进制，用户只能自己猜到
                     // 「隧道设置 → 组件管理」去。现在这一层就把路指出来。
-                    onInstallClick = { navController.navigate(Routes.DETAIL_RESOURCES) }
+                    onInstallClick = { navController.ufiNavigateOnce(Routes.DETAIL_RESOURCES) }
                 )
 
                 // ── Cloudflare Tunnel 入口卡片 ──
@@ -121,8 +122,8 @@ fun TunnelScreen(viewModel: MainViewModel, navController: NavHostController) {
                     running = state.cfRunningCount > 0,
                     installed = state.cfInstalled,
                     version = state.cfVersion,
-                    onClick = { navController.navigate(Routes.DETAIL_TUNNEL_CF) },
-                    onInstallClick = { navController.navigate(Routes.DETAIL_RESOURCES) }
+                    onClick = { navController.ufiNavigateOnce(Routes.DETAIL_TUNNEL_CF) },
+                    onInstallClick = { navController.ufiNavigateOnce(Routes.DETAIL_RESOURCES) }
                 )
 
                 Spacer(Modifier.height(Spacing.Medium))

@@ -36,7 +36,9 @@ fun DhcpSettingsDialog(
     val state by viewModel.networkState.collectAsState()
 
     LaunchedEffect(visible) {
-        if (visible && state.lanSettings == null) viewModel.network.loadLanSettings()
+        // 2026-11-07：不再只在 null 时拉 —— 30s 新鲜度闸门会复用首屏预取；
+        // 超过窗口则重新读，避免打开弹窗看到上一次会话的 LAN 配置。
+        if (visible) viewModel.network.loadLanSettings()
     }
 
     val lan = state.lanSettings
@@ -65,7 +67,8 @@ fun DhcpSettingsDialog(
                         if (dhcpEnabled) "SERVER" else "DISABLE",
                         dhcpStart, dhcpEnd, dhcpLease
                     )
-                    viewModel.network.loadLanSettings()
+                    // 回读由 setDhcpSetting 内部在 500ms 后 force 执行；这里再发一次
+                    // 只会拿到设备还没应用完的旧值（2026-11-07 去重）。
                     onDismiss()
                 },
                 confirmText = "保存"

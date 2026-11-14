@@ -23,6 +23,7 @@ import com.ufi_axis.ui.theme.LocalResolvedPalette
 import com.ufi_axis.ui.theme.Spacing
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「服务器」二级入口主页。
@@ -58,7 +59,7 @@ fun ServerScreen(
                         title = "服务器配置",
                         // 2026-10-24：Web 面板已迁到资源中心，入口描述里不再列它。
                         description = "连接地址 · 设备后台",
-                        onClick = { navController.navigate(Routes.DETAIL_SERVER_CONFIG) },
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_SERVER_CONFIG) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -69,7 +70,7 @@ fun ServerScreen(
                         icon = Icons.Default.Devices,
                         title = "设备控制",
                         description = "指示灯 · 性能模式 · WiFi 休眠 · 定时重启",
-                        onClick = { navController.navigate(Routes.DETAIL_DEVICE_CONTROL) },
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_DEVICE_CONTROL) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }
@@ -81,13 +82,13 @@ fun ServerScreen(
                 // 这一轮又加了黑名单、批准策略与它的通知渠道 —— 内容早就不止"配对与访问"。
                 // 再开一页只会把同一件事拆到两处，用户得猜哪个在哪。
                 // 2026-10-24：配对密码的修改入口已移到「服务器配置 → 连接配置」，
-                // 描述里不再列它；本页只剩配对密码作为破坏性操作的门禁。
+                // 描述里不再列它；安全中心不再承担任何密码校验入口。
                 UfiSettingsRowCard {
                     UfiSettingsItem(
                         icon = Icons.Default.Smartphone,
                         title = "安全中心",
                         description = "配对设备 · 黑名单 · 批准",
-                        onClick = { navController.navigate(Routes.DETAIL_PAIRING) },
+                        onClick = { navController.ufiNavigateOnce(Routes.DETAIL_PAIRING) },
                         trailing = { UfiSettingsChevron() }
                     )
                 }

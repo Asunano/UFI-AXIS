@@ -4,7 +4,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.*
@@ -17,15 +16,20 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation.NavHostController
+import com.ufi_axis.data.repository.ConnectionState
 import com.ufi_axis.ui.navigation.Routes
 import com.ufi_axis.ui.animation.page.isUfiPageForeground
 import com.ufi_axis.ui.components.*
 import com.ufi_axis.ui.components.common.*
 import com.ufi_axis.ui.theme.*
 import com.ufi_axis.viewmodel.MainViewModel
-import com.ufi_axis.viewmodel.state.deviceUnsupportedNote
-import com.ufi_axis_core.contract.Capability
+import com.ufi_axis.viewmodel.module.FOREGROUND_REFRESH_INTERVAL_MS
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -57,6 +61,32 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 直接拿它门控会被误判成后台页而永不加载数据。isUfiPageForeground() 在「非宿主管理」
     // 场景恒返回 true，保持原有行为不受影响。
     val pageForeground = isUfiPageForeground()
+    val wsState by viewModel.wsConnectionState.collectAsState()
+
+    // ── 「页面真的可见」判定（2026-11-07，10s 轻量轮询的启停条件）──
+    // pageForeground 只回答「这个 Tab 是不是当前选中页」，**不回答**「有没有二级页盖在上面」。
+    // 用户从网络页点进「蜂窝网络高级设置 / 频段锁定」时，Tab 仍处于选中态，pageForeground
+    // 仍是 true —— 仅用它门控会让 10s 轮询在二级页背后继续空跑。
+    //
+    // LocalLifecycleOwner 在 Navigation Compose 里是**当前 NavBackStackEntry**（这里是 MAIN），
+    // 二级页压栈时它退到 STARTED，返回时重新 RESUMED。用它补上「二级页是否盖住」这一维。
+    // 默认 true：首次组合时 MAIN 就是 RESUMED；被预组合的离屏页由 pageForeground 拦住。
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var lifecycleResumed by remember(lifecycleOwner) {
+        // 不能用恒 true：本页可能在某条二级页压栈期间被预组合，observer 挂上时
+        // MAIN 已经是 STARTED，收不到那次 ON_PAUSE。按当前状态播种才准。
+        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            lifecycleResumed = event == Lifecycle.Event.ON_RESUME
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            lifecycleResumed = false
+        }
+    }
 
     // 首次加载：仅在页面处于前台时才拉，离屏预组合时一个请求都不发。
     // pageForeground 作为 key：用户首次切到本 Tab 时 LaunchedEffect 以新协程重启并自动补拉。
@@ -77,7 +107,7 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     // 连接二维码弹窗开关（2026-10-14：从 WiFi 设置弹窗里拆出来的独立入口）
     var showWifiQrDialog by remember { mutableStateOf(false) }
 
-    // 出错 5s 后自动重试，最多 3 次（网络界面无轮询，不重试会导致出错后永久卡住）。
+    // 出错 5s 后自动重试，最多 3 次（本页只有 10s 轻量轮询，出错后不重试会卡住）。
     // 同样只在页面前台时重试：后台 Tab 出错先躺着，等用户切回来（pageForeground 变 true
     // 会重启本效应）再补，避免看不见的页面在后台反复空转重试。
     LaunchedEffect(state.errorMessage, pageForeground) {
@@ -90,9 +120,9 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
         }
     }
 
-    // UID-007 (Wave 2)：返回前台自动刷新一次（仅 ON_RESUME 触发，不引入常轮询）。
-    // ON_RESUME 是 Activity 级事件，会广播给所有存活的页面，因此必须在回调体内再判一次
-    // 页面前台，否则息屏解锁一次，5 个保活 Tab 会各刷一遍。
+    // UID-007 (Wave 2)：返回前台自动刷新一次（ON_RESUME 触发；另有下面的 10s 轻量轮询）。
+    // ON_RESUME 在 MAIN 这个 NavBackStackEntry 上触发，5 个保活 Tab 共享同一个 entry，
+    // 因此必须在回调体内再判一次页面前台，否则息屏解锁一次，5 个 Tab 会各刷一遍。
     // 这里用 rememberUpdatedState 而非直接捕获 pageForeground：rememberResumeRefresh 内部的
     // DisposableEffect 只以 lifecycleOwner 为 key，观察者闭包在首次组合后就固定下来，
     // 直接捕获的是那一刻的 Boolean 快照（永远是首次值）；捕获 State 才能读到调用时的最新值。
@@ -100,6 +130,29 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
     rememberResumeRefresh {
         // 不 force：回前台时若数据还在 30s 新鲜窗口内就不必重取（息屏几秒解锁属常态）。
         if (foregroundForResume) viewModel.network.loadNetworkAll()
+    }
+
+    // ── 10s 轻量轮询（2026-11-07，与 Web 网络页对齐）────────────────────────
+    // WS 负责 signal / connection；但 networkStatus 与 wifiClients 没有高频频道，
+    // 且设备面板直改（绕过 core）只有轮询能发现。所以和 Web 一样每 10s 补两个请求：
+    //   · GET /api/network/status  → 连接态 + 移动数据开关 + 运营商/制式
+    //   · GET /api/wifi/clients    → 在线设备数
+    // WS 断线时再额外拉一次 signal，顶住实时信号（与 Web 的 `wsStore.status !== 'connected'`
+    // 分支同口径）。WS 在线时 signal 走推送，这里不发。
+    //
+    // 只在这页**真的可见**时跑：pageForeground（选中该 Tab）+ lifecycleResumed（没有被
+    // 二级页盖住、App 在前台）。两个条件任一为 false 都会取消协程，不会后台空转。
+    // 用 rememberUpdatedState 而不是把 wsState 放进 LaunchedEffect 的 key：WS 状态每变一次
+    // 就重启 10s 计时器，在反复重连时 REST 兜底可能永远轮不到。捕获 State 读最新值即可。
+    val wsStateForPoll by rememberUpdatedState(wsState)
+    LaunchedEffect(pageForeground, lifecycleResumed) {
+        if (!pageForeground || !lifecycleResumed) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(FOREGROUND_REFRESH_INTERVAL_MS)
+            viewModel.network.refreshNetworkLive(
+                includeSignal = wsStateForPoll != ConnectionState.CONNECTED
+            )
+        }
     }
 
     // 顶栏不放手动刷新：本页有 ON_RESUME 自动重取，错误横幅自带「重试」，手动按钮属重复能力。
@@ -173,7 +226,7 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                             icon = Icons.Default.CellTower,
                             title = "蜂窝网络高级设置",
                             description = "网络模式 · 频段锁定 · 基站信息",
-                            onClick = { navController.navigate("detail/cellular-advanced") },
+                            onClick = { navController.ufiNavigateOnce("detail/cellular-advanced") },
                             trailing = { UfiSettingsChevron() }
                         )
                     }
@@ -218,7 +271,7 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                             icon = Icons.Default.Speed,
                             title = "网速测试",
                             description = lastResult ?: "内网上下行 / 外网下行 · 多流并发测速",
-                            onClick = { navController.navigate(Routes.DETAIL_SPEED_TEST) },
+                            onClick = { navController.ufiNavigateOnce(Routes.DETAIL_SPEED_TEST) },
                             trailing = { UfiSettingsChevron() }
                         )
                     }
@@ -231,7 +284,7 @@ fun NetworkScreen(viewModel: MainViewModel, navController: NavHostController) {
                             icon = Icons.Default.Devices,
                             title = "在线设备",
                             description = if (allStations.isEmpty()) "暂无连接设备" else "${allStations.size} 台设备 · WiFi 与 LAN",
-                            onClick = { navController.navigate(Routes.DETAIL_ONLINE_DEVICES) },
+                            onClick = { navController.ufiNavigateOnce(Routes.DETAIL_ONLINE_DEVICES) },
                             trailing = { UfiSettingsChevron() }
                         )
                     }
@@ -283,13 +336,20 @@ private fun CellularStatusCard(
     val rawRat = sig?.rat?.takeIf { it.isNotBlank() && it != "WiFi" }
         ?: net?.network_type?.takeIf { it.isNotBlank() && it != "WiFi" }
     // 制式显示标签（用于右上胶囊）
+    val isNsa = rawRat?.let {
+        it.contains("NSA", true) || it.contains("ENDC", true) || it.contains("EN-DC", true)
+    } == true
     val networkTypeLabel = when {
         rawRat == null -> ""
+        // EN-DC/ENDC 是 LTE 锚点 + NR 的 NSA 5G，不是独立制式。
+        isNsa -> "5G NSA"
         rawRat.contains("5G", true) || rawRat.contains("NR", true) -> "5G"
         rawRat.contains("4G", true) || rawRat.contains("LTE", true) -> "4G"
         else -> rawRat
     }
-    val operator = sig?.operator?.takeIf { it.isNotBlank() } ?: net?.operator?.takeIf { it.isNotBlank() } ?: "未知"
+    val operator = com.ufi_axis.data.model.CarrierNames
+        .displayName(sig?.operator?.takeIf { it.isNotBlank() } ?: net?.operator)
+        .ifBlank { "未知" }
     // 右上胶囊：制式 + 频段
     val pillText = buildString {
         append(networkTypeLabel)
@@ -297,10 +357,15 @@ private fun CellularStatusCard(
         if (band != null) append(" $band")
     }.takeIf { it.isNotBlank() }
     // 副标题：本机号码(msisdn) + IMEI（取自设备身份信息，无数据时 —）
-    val msisdn = state.deviceIdentity?.get("msisdn")?.takeIf { it.isNotBlank() } ?: "—"
+    // 手机号按用户要求显示完整号码，并去掉中国大陆区号前缀；不做 *** 脱敏。
+    val msisdn = state.deviceIdentity?.get("msisdn")
+        ?.takeIf { it.isNotBlank() }
+        ?.let(::displayPhone)
+        ?: "—"
     val imei = state.deviceIdentity?.get("imei")?.takeIf { it.isNotBlank() } ?: "—"
     val rsrpVal = sig?.rsrp
     val bars = rsrpVal?.let { signalBars(it) } ?: 0
+    val isConnected = net?.isCellularConnected == true
 
     // ── 渐变：与首页 Hero 一致的 accent 明暗衍生色（阶梯口径见 theme 层的 Color.ufiShade）──
     // 深色档系数改自 GRADIENT_MID_LIGHTEN_DARK / GRADIENT_TOP_LIGHTEN_DARK 常量，理由见常量定义。
@@ -340,343 +405,230 @@ private fun CellularStatusCard(
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             // ═══ 行1：图标 + 标题(运营商) + 胶囊(制式频段) + 副标题(IP) / 信号条右上 ═══
-            // heroIconSize：左侧图标圆底的直径。
-            // 2026-10-12：外层对齐由 Alignment.Top 改为 CenterVertically（见下方长注释）。
-            val heroIconSize = 36.dp
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(
-                    shape = CircleShape,
-                    color = palette.gradientMuted.copy(alpha = 0.18f),  // 原 Color.White 18%：图标圆底
-                    modifier = Modifier.size(heroIconSize)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            Icons.Default.SatelliteAlt,
-                            contentDescription = null,
-                            modifier = Modifier.size(20.dp),
-                            tint = palette.onGradient  // 原 Color.White：卫星图标
-                        )
-                    }
-                }
-                Spacer(Modifier.width(10.dp))
+            // 与仪表盘 Hero 一致：左上只有运营商 + 制式胶囊，右上连接状态 + 信号条。
+            // 不再放左侧卫星图标；网络详情改用下方扁平指标行展示。
+            Row(verticalAlignment = Alignment.Top) {
                 Column(modifier = Modifier.weight(1f)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             text = operator,
-                            // 2026-10-12：screenTitle(22sp) → metricValueCompact(19sp)，与首页
-                            // HomeConnectionCard 的运营商字号**逐值对齐**（用户反馈两页字号不一致）。
-                            // 为什么不用改 screenTitle token：那个 token 有 9 个文件在用（各页大标题），
-                            // 改 token 会波及所有页面标题；只有这一处是"渐变卡内的运营商名"，
-                            // 与首页那处是同一语义，理应同 token。
                             style = UfiTextStyles.metricValueCompact,
-                            color = palette.onGradient,  // 原 Color.White：运营商主标题
+                            color = palette.onGradient,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            // 与仪表盘 Hero 同样的光学校正：中文粗体字形比下方小字略右偏。
+                            modifier = Modifier
+                                .weight(1f, fill = false)
+                                .offset(x = (-0.7).dp)
                         )
                         Spacer(Modifier.width(8.dp))
                         pillText?.let {
                             Surface(
-                                color = palette.gradientMuted.copy(alpha = 0.2f),  // 原 Color.White 20%：制式胶囊底
-                                shape = UfiCardDefaults.microShape
+                                color = palette.gradientMuted.copy(alpha = 0.18f),
+                                shape = UfiCardDefaults.tagShape
                             ) {
                                 Text(
-                                    text = " $it ",
-                                    // 2026-10-12：tag(13sp/横10纵4) → label(12sp/横7纵1.5)，
-                                    // 与首页 HomeConnectionCard 制式胶囊**逐值对齐**（含内边距）。
+                                    text = it,
                                     modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.5.dp),
-                                    color = palette.onGradient,  // 原 Color.White：胶囊内文字
-                                    style = UfiTextStyles.label.copy(fontWeight = UfiWeight.Emphasis)
+                                    color = palette.onGradient,
+                                    style = UfiTextStyles.label.copy(fontWeight = UfiWeight.Emphasis),
+                                    maxLines = 1,
                                 )
                             }
                         }
                     }
+                    // 与仪表盘 Hero 的第二行同款：运营商下方放一行弱化身份/网络副标题。
+                    // 有本机号码时显示号码；没有就显示“蜂窝网络”，保持两行结构不塌。
+                    Text(
+                        text = "蜂窝网络",
+                        style = UfiTextStyles.note.copy(fontWeight = UfiWeight.Medium),
+                        color = palette.gradientMuted.copy(alpha = 0.7f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
                 Spacer(Modifier.width(10.dp))
-                // 右上角信号条（不显示 dBm 文字，dBm 数值在下方三张 HeroMetric）
-                //
-                // 2026-10-12：原来套一层 `Box(Modifier.height(heroIconSize), Center)`，把 14dp 的
-                // 信号条**居中放进 36dp 空容器**，于是它顶边在 11dp、底边在 25dp；左边图标圆底
-                // 占 0~36dp、运营商文字占 0~26dp —— 三个底边各在一处，视觉上"一上一下"
-                //（用户反馈）。这层空容器没有任何语义，纯粹是上一轮"用图标高度当对齐轴"
-                // 的遗留，而外层 Row 已经是 CenterVertically，**删掉它信号条自然与文字行同中心**。
-                UfiGradientSignalBar(bars = bars)
+                Row(
+                    modifier = Modifier.padding(top = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(7.dp)
+                            .clip(UfiCardDefaults.pillShape)
+                            .background(
+                                if (isConnected) StatusOnline
+                                else palette.gradientMuted.copy(alpha = 0.4f)
+                            )
+                    )
+                    Text(
+                        text = if (isConnected) "已连接" else "未连接",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.gradientMuted.copy(alpha = 0.9f),
+                        maxLines = 1
+                    )
+                    Spacer(Modifier.width(2.dp))
+                    UfiGradientSignalBar(bars = if (isConnected) bars else 0)
+                }
             }
 
-            Spacer(Modifier.height(10.dp))
-            // 本机号码 / IMEI：左右两张小指标卡（与下方 HeroMetric 同款值+标签）
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                IdentityMetric(msisdn, "本机号码", Modifier.weight(1f))
-                IdentityMetric(imei, "IMEI", Modifier.weight(1f))
+            Spacer(Modifier.height(18.dp))
+            // 中间只放三项核心信号读数：RSRP / SNR / RSRQ。
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(IntrinsicSize.Min),
+            ) {
+                NetworkHeroMetric(sig?.rsrp?.toString() ?: "—", "RSRP dBm", Modifier.weight(1f))
+                NetworkHeroDivider()
+                NetworkHeroMetric(sig?.sinr?.toString() ?: "—", "SNR dB", Modifier.weight(1f))
+                NetworkHeroDivider()
+                NetworkHeroMetric(sig?.rsrq?.toString() ?: "—", "RSRQ dB", Modifier.weight(1f))
             }
-            Spacer(Modifier.height(12.dp))
-
-            // ═══ 行2：RSRP / SNR / RSRQ 三 metric（半透明白卡，一行） ═══
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                HeroMetric(sig?.rsrp?.toString() ?: "—", "RSRP dBm", Modifier.weight(1f))
-                HeroMetric(sig?.sinr?.toString() ?: "—", "SNR dB", Modifier.weight(1f))
-                HeroMetric(sig?.rsrq?.toString() ?: "—", "RSRQ dB", Modifier.weight(1f))
+            Spacer(Modifier.height(19.dp))
+            // 与仪表盘网速胶囊同一套材质和几何：两枚等宽半透明胶囊。
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                NetworkHeroCapsule(
+                    label = "手机号",
+                    value = msisdn,
+                    // 手机号与 IMEI 各占一半；完整值放在标签下方，避免横向挤压省略。
+                    modifier = Modifier.weight(1f)
+                )
+                NetworkHeroCapsule(
+                    label = "IMEI",
+                    value = imei,
+                    modifier = Modifier.weight(1f)
+                )
             }
 
         }
     }
 }
 
-// hero 卡上的「本机号码 / IMEI」小指标卡（与 HeroMetric 同款值+标签，值较长带 ellipsis）
+/** 网络 Hero 底部胶囊：与仪表盘 SpeedCapsule 同一档半透明底、圆角和内边距。 */
 @Composable
-private fun IdentityMetric(value: String, label: String, modifier: Modifier = Modifier) {
+private fun NetworkHeroCapsule(
+    label: String,
+    value: String,
+    modifier: Modifier = Modifier,
+) {
     val palette = LocalResolvedPalette.current
     Surface(
         modifier = modifier,
-        color = palette.gradientMuted.copy(alpha = 0.12f),  // 原 Color.White 12%：小卡底
+        color = palette.gradientMuted.copy(alpha = 0.15f),
         shape = UfiCardDefaults.subtleShape
     ) {
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(vertical = 10.dp, horizontal = 6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
-            Text(
-                value,
-                style = UfiTextStyles.bodyEmphasis,
-                color = palette.onGradient,  // 原 Color.White：值
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                label,
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.gradientMuted.copy(alpha = 0.7f)  // 原 Color.White 70%：标签
-            )
-        }
-    }
-}
-
-
-
-// ═══════════════════════════════════════════════
-// 频段锁定组件（被 BandLockDialog 复用）
-// ═══════════════════════════════════════════════
-
-@Composable
-fun BandLockSection(viewModel: MainViewModel, state: com.ufi_axis.viewmodel.state.NetworkState) {
-    var selectedLte by remember { mutableStateOf(setOf<Int>()) }
-    var selectedNr by remember { mutableStateOf(setOf<Int>()) }
-    val supportLte = listOf(1, 3, 5, 8, 34, 38, 39, 40, 41)
-    val supportNr = listOf(1, 5, 8, 28, 41, 78)
-    val palette = LocalResolvedPalette.current
-    val lteColor = BandLte
-    val nrColor = BandNr
-
-    // 设备能力集（批 O / 3.5）：core 在 `POST /api/network/band` 上有一处 route 门禁
-    // （`NetworkRoutes.kt:139`），lock 与 unlock 都走这一个端点，所以一处就覆盖了整个域。
-    // 于是这里只灰「锁定所选」「全部解锁」两个按钮。
-    //
-    // 状态卡与频段选择区**刻意不灰**：它们是读侧 + 纯本地选择，没有门禁 ——
-    // 「不支持锁频段」不等于「不能看当前锁了哪些」。
-    //
-    // ⚠ 能力集未拉到 / 拉失败时 supports() 恒为 true —— 保持现状，照旧可点。
-    val capabilities by viewModel.network.capabilityState.collectAsState()
-    val bandLockSupported = capabilities.supports(Capability.BAND_LOCK)
-
-    // 本段被 BandLockDialog 复用，那条路径未必走过 loadNetworkAll，所以自己拉一次。
-    // 能力集自带"本进程只成功拉一次"的闸门，无条件调不会每次进来都发请求。
-    LaunchedEffect(Unit) { viewModel.network.loadDeviceCapabilities() }
-
-    LaunchedEffect(state.bandStatus) {
-        // 逗号串 → Set<Int> 的解析在 BandStatusResponse 里（"0"/"all" = 未锁定）
-        selectedLte = state.bandStatus?.lteBands ?: emptySet()
-        selectedNr = state.bandStatus?.nrBands ?: emptySet()
-    }
-
-    val isFullyUnlocked = selectedLte.isEmpty() && selectedNr.isEmpty()
-
-    Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
-        // 置灰原因（只在不支持时出现）。本段有 2 个写按钮，原因只说一次。
-        // 口径：只说「设备不支持」，不说"功能未开启"或"权限不足" —— 这台设备压根没有这个
-        // 能力，没地方可开，那两句会把用户引向一场白费的寻找。
-        if (!bandLockSupported) {
-            UfiNoticeCard(message = deviceUnsupportedNote("频段锁定"))
-        }
-        // ── 状态卡 ──
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .ufiStandardCard(elevation = 3.dp)
-                .padding(16.dp)
-        ) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text("LTE 频段", style = UfiTextStyles.labelStrong, color = lteColor)
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        "已锁定 ${selectedLte.size} 个",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.textSecondary
-                    )
-                }
-                Spacer(Modifier.width(Spacing.Medium))
-                Column(Modifier.weight(1f)) {
-                    Text("NR 频段", style = UfiTextStyles.labelStrong, color = nrColor)
-                    Spacer(Modifier.height(2.dp))
-                    Text(
-                        "已锁定 ${selectedNr.size} 个",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = palette.textSecondary
-                    )
-                }
-                Spacer(Modifier.width(Spacing.Medium))
-                Surface(
-                    color = if (isFullyUnlocked) palette.accent.copy(alpha = 0.12f) else palette.warning.copy(alpha = 0.18f),
-                    shape = UfiCardDefaults.microShape
+            // 按可用宽度自适应：空间够就「标签 + 值」一行，不够才上下排。
+            // 估算按 13sp 数字的保守字宽；IMEI 比手机号长，通常更早进入上下排。
+            val inlineThreshold = (label.length * 12 + value.length * 9 + 6).dp + 24.dp
+            val inline = maxWidth >= inlineThreshold
+            if (inline) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        if (isFullyUnlocked) "未锁定" else "已锁定",
-                        Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        style = UfiTextStyles.caption,
-                        color = if (isFullyUnlocked) palette.accent else palette.warning
+                        label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.gradientMuted.copy(alpha = 0.75f),
+                        maxLines = 1
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        value,
+                        style = UfiTextStyles.bodyStrong.copy(fontSize = 13.sp),
+                        color = palette.onGradient,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            } else {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = palette.gradientMuted.copy(alpha = 0.75f),
+                        maxLines = 1
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        value,
+                        style = UfiTextStyles.bodyStrong.copy(fontSize = 13.sp),
+                        color = palette.onGradient,
+                        maxLines = 1,
+                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Start,
+                        modifier = Modifier.fillMaxWidth()
                     )
                 }
             }
         }
-
-        // ── 频段选择区（统一卡片包裹，与状态卡/按钮卡对齐） ──
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .ufiStandardCard()
-                .padding(16.dp)
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(Spacing.Medium)) {
-                // ── LTE 频段（绿） ──
-                Text("LTE 频段", style = UfiTextStyles.labelStrong, color = lteColor)
-                Spacer(Modifier.height(4.dp))
-                // 2026-08-31：手绘 FilterChip FlowRow → 公共 UfiMultiChipSelector（accentColor 保留 LTE 绿）
-                UfiMultiChipSelector(
-                    options = supportLte.map { it.toString() to "B$it" },
-                    selectedValues = selectedLte.map { it.toString() }.toSet(),
-                    onToggle = { v ->
-                        val band = v.toInt()
-                        selectedLte = if (band in selectedLte) selectedLte - band else selectedLte + band
-                    },
-                    accentColor = lteColor
-                )
-
-                // ── NR 频段（紫） ──
-                Text("NR 频段", style = UfiTextStyles.labelStrong, color = nrColor)
-                Spacer(Modifier.height(4.dp))
-                // 2026-08-31：同上，accentColor 保留 NR 紫
-                UfiMultiChipSelector(
-                    options = supportNr.map { it.toString() to "N$it" },
-                    selectedValues = selectedNr.map { it.toString() }.toSet(),
-                    onToggle = { v ->
-                        val band = v.toInt()
-                        selectedNr = if (band in selectedNr) selectedNr - band else selectedNr + band
-                    },
-                    accentColor = nrColor
-                )
-            }
-        }
-
-        // ── 操作按钮（收进卡片内） ──
-        Box(
-            Modifier
-                .fillMaxWidth()
-                .ufiStandardCard()
-                .padding(Spacing.CardPadding)
-        ) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                UfiButton(
-                    text = "锁定所选",
-                    onClick = {
-                        // 2026-10-05 P7：lockBands 签名由 String? 改为 Set<Int>?（P7 唯一签名变更点），
-                        // 集合相等判定不再依赖调用方拼字符串顺序
-                        viewModel.network.lockBands(
-                            if (selectedLte.isNotEmpty()) selectedLte else null,
-                            if (selectedNr.isNotEmpty()) selectedNr else null
-                        )
-                    },
-                    enabled = bandLockSupported,
-                    modifier = Modifier.weight(1f)
-                )
-                UfiButton(
-                    variant = UfiButtonVariant.Secondary,
-                    text = "全部解锁",
-                    onClick = {
-                        viewModel.network.lockBands(null, null)
-                        selectedLte = emptySet(); selectedNr = emptySet()
-                    },
-                    enabled = bandLockSupported,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
     }
 }
-
-// ═══════════════════════════════════════════════
-// 内部辅助函数
-// ═══════════════════════════════════════════════
-
-// 2026-09-22：原来这里有个私有 `loadNetworkAll(viewModel)`，把 6 个请求扇出写在页面里。
-// 已搬到 `NetworkModule.loadNetworkAll(force, silent)` —— 首屏预加载协调器要发同一批，
-// 而"该不该发"的判据（新鲜度戳）必须只有一份、且存在 module 里才能跨组合存活。
-
-
-// ═══════════════════════════════════════════════
-// Hero 卡辅助组件（与首页 HomeConnectionCard 视觉统一）
-// ═══════════════════════════════════════════════
-
-// 2026-09-05：私有 `Color.shade` 已删除 —— 与 HomeConnectionCard / TrafficManagementScreen 是
-// 逐字节相同的三份拷贝（MonitorOverview 还有一份 Oklab lerp 版，像素并不相同）。
-// 现统一走主题层 [com.ufi_axis.ui.theme.ufiShade]，它同时是 `onGradient` 判据
-// （`heroGradientBrightestStop`）的输入 —— 运行时画的和测试判的只有一份实现。
 
 /**
- * 2026-08-31：私有 GradientSignalBar 已删除 —— 与 HomeConnectionCard 那份是同一段代码，
- * 已合并到公共层 [com.ufi_axis.ui.components.common.UfiGradientSignalBar]。
+ * 手机号展示：完整显示，不脱敏；只去掉 core 透传的 +86 / 86 国家码前缀。
+ * 设备可能回 `+86138…`、`86138…` 或本地 `138…`，三种都归一到 11 位本地号码。
  */
-
-/** 半透明白底 metric 小卡（大号数值 + 小标签，与截图一致） */
-@Composable
-private fun HeroMetric(value: String, label: String, modifier: Modifier = Modifier) {
-    // 2026-09-04（P2-中）：本函数原有 3 处写死 Color.White（小卡底 12% / 数值不透明 / 标签 70%）。
-    // 它铺在外层渐变 Hero 卡上，换配色时渐变随 accent 变、这三处不变 ⇒ 浅色 accent 主题下残留。
-    // 私有 composable，加一行 palette 读取即可，公共组件签名不受影响。
-    val palette = LocalResolvedPalette.current
-    Surface(
-        modifier = modifier,
-        color = palette.gradientMuted.copy(alpha = 0.12f),  // 原 Color.White 12%：小卡半透明底
-        shape = UfiCardDefaults.subtleShape
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 10.dp, horizontal = 6.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            // 2026-10-14（用户要求）：RSRP / SNR / RSRQ 数值接入滚轮动画，与仪表盘的实时读数同款。
-            //
-            // 这里用 UfiRollingText 而**不是** UfiRollingMetric：本卡的**单位在下方 label 里**
-            // （"RSRP dBm" / "SNR dB"），数值串是纯整数（空值哨兵是 "—"），不存在自适应单位换档
-            // —— 而「998 KB/s → 1.0 MB/s」那种换档正是 UfiRollingMetric 存在的唯一理由
-            // （见 HomeConnectionCard 实时速率那处的注释）。
-            //
-            // 注意 UfiRollingText 没有 `maxLines`：它按定义就是单行（宽度 = 字形实测和），
-            // 原来的 `maxLines = 1` 是多余的。居中由外层 Column 的 CenterHorizontally 负责。
-            UfiRollingText(
-                text = value,
-                style = UfiTextStyles.panelTitleStrong,
-                color = palette.onGradient  // 原 Color.White：RSRP/SNR/RSRQ 数值
-            )
-            Spacer(Modifier.height(2.dp))
-            Text(
-                label,
-                style = MaterialTheme.typography.labelSmall,
-                color = palette.gradientMuted.copy(alpha = 0.7f)  // 原 Color.White 70%：指标单位标签
-            )
-        }
+private fun displayPhone(raw: String): String {
+    val text = raw.trim()
+    return when {
+        text.startsWith("+86") -> text.removePrefix("+86").trim()
+        text.startsWith("86") && text.length > 11 -> text.removePrefix("86").trim()
+        else -> text
     }
 }
+
+/** 网络 Hero 的扁平指标格：与仪表盘 Hero 的指标行同一套字号/留白。 */
+@Composable
+private fun NetworkHeroMetric(value: String, label: String, modifier: Modifier = Modifier) {
+    val palette = LocalResolvedPalette.current
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Text(
+            value,
+            style = UfiTextStyles.metricValue,
+            color = palette.onGradient,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+        )
+        Text(
+            label,
+            style = MaterialTheme.typography.labelSmall,
+            color = palette.gradientMuted.copy(alpha = 0.7f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.Center,
+        )
+    }
+}
+
+@Composable
+private fun NetworkHeroDivider() {
+    val palette = LocalResolvedPalette.current
+    Box(
+        Modifier
+            .fillMaxHeight()
+            .width(1.dp)
+            .background(palette.gradientMuted.copy(alpha = 0.18f))
+    )
+}
+
 

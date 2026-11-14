@@ -262,6 +262,9 @@ class FileManagerModule(
             try {
                 val resp = api.listFiles(path)
                 val sorted = sortFiles(resp.files, _state.value.sortBy)
+                // 进场/切目录的转场期间不落库：一整个目录的文件列表要一次性建起来，
+                // 那次重组落在转场里就是"进目录卡一下"。见 awaitTransitionIdle 的说明。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 _state.update { it.copy(
                     currentPath = resp.path,
                     files = sorted,

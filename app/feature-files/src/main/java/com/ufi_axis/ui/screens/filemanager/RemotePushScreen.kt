@@ -1,5 +1,6 @@
 package com.ufi_axis.ui.screens.filemanager
 
+import com.ufi_axis.ui.components.common.rememberLastNonNull
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -146,12 +147,14 @@ fun RemotePushScreen(
     }
 
     // 失败详情：等宽字体 + 可滚动 + 一键复制。
-    detailJob?.let { job ->
+    val dialogDetailJob = rememberLastNonNull(detailJob)
+    if (dialogDetailJob != null) {
+        val job = dialogDetailJob
         val detail = job.error_detail?.takeIf { it.isNotBlank() }
             ?: job.error?.takeIf { it.isNotBlank() }
             ?: "设备端没有回传更详细的原因（可能是旧版 core）。"
         UfiCustomDialog(
-            visible = true,
+            visible = detailJob != null,
             onDismiss = { detailJob = null },
             title = "失败详情",
             showCloseButton = true

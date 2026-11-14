@@ -5,6 +5,7 @@ import android.content.Intent
 import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.ufi_axis.data.api.UfiAxisApi
+import com.ufi_axis.data.bill.BillRepositoryProvider
 import com.ufi_axis.data.model.*
 import com.ufi_axis.data.update.CoreUpdatePersistence
 import com.ufi_axis.data.notification.NotificationCenter
@@ -27,6 +28,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import com.ufi_axis_core.contract.ErrorCode
@@ -56,7 +58,7 @@ class ToolsModule(
     // ── State ──
     // 短信四项配置的初值取本地镜像（真源仍在 core，由 refreshDeviceConfig 回读覆盖）。
     // 与下面 _logSwitchState 同一手法：不这么做，进程重建 + core 暂时连不上时开关会显示成
-    // 编译期默认值，用户看到的就是「自动解析验证码存不住」（2026-09-14）。
+    // 编译期默认值，表现为「自动解析验证码开关无法持久化」。
     private val _toolsState = MutableStateFlow(
         AppPreferences(appContext).let { p ->
             ToolsState(
@@ -72,19 +74,19 @@ class ToolsModule(
     /** 短信四项配置的写请求在飞数量，见 [putSmsConfig]。 */
     private var smsConfigWritesInFlight = 0
 
-    // ── Core 更新中标记（2026-09-14 起对外可观测）──
+    // ── Core 更新中标记 ──
 
     private val _coreUpdating = MutableStateFlow(coreUpdatePersistence.isCoreUpdating())
 
     /**
      * 设备端 Core 是否正在更新。
      *
-     * 之前这个状态只存在 SharedPreferences 里（[CoreUpdatePersistence]），只有「掉线弹窗豁免」
-     * 和「冷启动接管进度」两个消费者去**主动读**它 —— 没有任何取数链路知道自己该停下来。
-     * 于是升级期间 30s 全局告警轮询、5s 首页刷新、30s 探活、WS 重连风暴全都照跑，
-     * 用户看到满屏「加载告警失败」。
+     * 该状态原先仅保存在 SharedPreferences（[CoreUpdatePersistence]），只有「掉线弹窗豁免」
+     * 与「冷启动接管进度」两个消费者主动读取，没有任何取数链路据此暂停。于是升级期间
+     * 30s 全局告警轮询、5s 首页刷新、30s 探活、WS 重连风暴均照常运行，
+     * 用户看到大量「加载告警失败」。
      *
-     * 暴露成 StateFlow 之后，`MainViewModel` 能在**一个地方**同时做两件事：
+     * 暴露为 StateFlow 后，`MainViewModel` 可在一处同时完成两项操作：
      * 更新期间静默全局错误 Toast，以及暂停 / 恢复周期取数。
      */
     val coreUpdating: StateFlow<Boolean> = _coreUpdating.asStateFlow()
@@ -93,7 +95,7 @@ class ToolsModule(
      * 置位/清位「更新中」。**所有**改这个状态的地方都必须走这里。
      *
      * 落 SP 是为了「app 被杀后重启还能接管进度」；同时推 StateFlow 是为了让取数闸门
-     * 能实时响应。两者漏掉任何一个都会退化成之前那种「标记有了但没人听」。
+     * 能实时响应。两者缺一都会退化为「标记存在但无人监听」的情形。
      */
     private fun markCoreUpdating(updating: Boolean) {
         coreUpdatePersistence.setCoreUpdating(updating)
@@ -115,7 +117,7 @@ class ToolsModule(
     private val _coreLogFilesState = MutableStateFlow(CoreLogFilesState())
     val coreLogFilesState: StateFlow<CoreLogFilesState> = _coreLogFilesState.asStateFlow()
 
-    // ── 日志四层开关（2026-09-04）：唯一真源在 core，这里只是镜像 ──
+    // ── 日志四层开关：唯一真源在 core，此处仅为镜像 ──
     // 初值用本地缓存填，仅为首帧不闪；loaded=false 期间 UI 禁用开关，
     // 等 loadLogSwitches() 从 core 回读成功才允许修改。
     private val _logSwitchState = MutableStateFlow(
@@ -130,13 +132,537 @@ class ToolsModule(
     )
     val logSwitchState: StateFlow<LogSwitchState> = _logSwitchState.asStateFlow()
 
-    // ── core 崩溃提醒（2026-09-04）──
+    /**
+     * 日志开关的「写代」计数器。
+     *
+     * 场景：进页面的 `GET /api/config` 还在路上，用户已经点了开关 → `PUT` 成功把镜像改成
+     * true；随后那个**早于写入发出**的 GET 返回旧值 false，把镜像又盖回去。UI 于是永远
+     * 停留在关闭态（core 实际已开启），且没有后续请求会再纠正它。
+     *
+     * 每次发起写入就 +1；GET 返回时若计数变了，说明这次读已经过时，直接丢弃。
+     */
+    private var logSwitchGeneration = 0
+
+    // ── 话费账单 ──
+    //
+    // 数据源通过 BillRepositoryProvider 注入；当前默认是演示数据（见 SampleBillRepository），
+    // 真实接入时替换 provider 即可，本模块与 UI 都不用改。
+    private val _billState = MutableStateFlow<BillUiState>(BillUiState.Loading)
+    val billState: StateFlow<BillUiState> = _billState.asStateFlow()
+    private var billLoadJob: Job? = null
+
+    // 运营商登录状态（移动/联通共用）。UI 用它决定显示账单还是登录卡。
+    private val _carrierStatus = MutableStateFlow<com.ufi_axis.data.model.CarrierStatusResponse?>(null)
+    val carrierStatus: StateFlow<com.ufi_axis.data.model.CarrierStatusResponse?> = _carrierStatus.asStateFlow()
+
+    // ── 设备级账单设置（2026-11-12）──
+    //
+    // 设置页的所有开关/数值都走这一份状态；不再按账号拉 auto-login 配置。
+    // 写入用 generation 作废在途的旧响应：用户连续拨两个开关时，不能拿第一个
+    // 请求的返回把第二个开关的界面结果覆盖掉（与 logSwitchGeneration 同一手法）。
+    private val _billSettings =
+        MutableStateFlow<com.ufi_axis.data.model.CarrierBillSettingsState?>(null)
+    val billSettings: StateFlow<com.ufi_axis.data.model.CarrierBillSettingsState?> =
+        _billSettings.asStateFlow()
+    private var billSettingsGeneration = 0
+
+    fun loadBillSettings(
+        onResult: (Result<com.ufi_axis.data.model.CarrierBillSettingsState>) -> Unit = {},
+    ) {
+        val generation = ++billSettingsGeneration
+        scope.launch {
+            val result = runCatching { api.getCarrierBillSettings() }
+            result.onFailure {
+                DebugLog.w("Tools", "读取账单设置失败: ${it.message}")
+            }
+            // 过期的 GET 不回调：否则一次旧失败会在新写入成功后把"上次同步失败"又点亮。
+            if (generation == billSettingsGeneration) {
+                result.onSuccess { _billSettings.value = it }
+                onResult(result)
+            }
+        }
+    }
+
+    fun saveBillSettings(
+        body: kotlinx.serialization.json.JsonObject,
+        onResult: (Result<com.ufi_axis.data.model.CarrierBillSettingsState>) -> Unit = {},
+    ) {
+        val generation = ++billSettingsGeneration
+        scope.launch {
+            val result = runCatching { api.saveCarrierBillSettings(body) }
+            if (generation == billSettingsGeneration) {
+                result.onSuccess { _billSettings.value = it }
+            }
+            onResult(result)
+        }
+    }
+
+    fun setKeepAliveParticipating(
+        accountId: String,
+        participating: Boolean,
+        onResult: (Result<com.ufi_axis.data.model.CarrierBillSettingsState>) -> Unit = {},
+    ) {
+        val generation = ++billSettingsGeneration
+        scope.launch {
+            val result = runCatching {
+                api.setCarrierKeepAliveParticipating(
+                    accountId,
+                    com.ufi_axis.data.model.CarrierParticipatingBody(participating),
+                )
+            }
+            if (generation == billSettingsGeneration) {
+                result.onSuccess { _billSettings.value = it }
+            }
+            onResult(result)
+        }
+    }
+
+    /** 设置页的「立即」：手动触发一次自动登录（会产生真实短信）。 */
+    fun runAccountAutoLogin(
+        accountId: String,
+        onResult: (Result<com.ufi_axis.data.model.CarrierAutoLoginState>) -> Unit = {},
+    ) {
+        scope.launch {
+            val result = runCatching { api.runCarrierAutoLoginOf(accountId) }
+            result.onFailure {
+                DebugLog.w("Tools", "触发账号自动登录失败($accountId): ${it.message}")
+            }
+            onResult(result)
+        }
+    }
+
+    fun refreshCarrierStatus() {
+        scope.launch {
+            runCatching { api.getCarrierStatus() }.onSuccess { _carrierStatus.value = it }
+        }
+    }
+
+    fun requestCarrierCode(phone: String, onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit) {
+        scope.launch {
+            val result = runCatching { api.requestCarrierCode(mapOf("phone" to phone)) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun verifyCarrierCode(code: String, onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit) {
+        scope.launch {
+            val result = runCatching { api.verifyCarrierCode(mapOf("code" to code)) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    /**
+     * 账号维度发码。
+     *
+     * phone 可以传空：core 的 `requestMobileCodeFor` 会用账号里已缓存的完整手机号，
+     * 用户重新登录时不用再输一次。老接口 `requestCarrierCode(phone)` 没有这个能力。
+     */
+    fun requestCarrierCodeFor(
+        accountId: String,
+        phone: String,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching { api.requestCarrierCodeFor(accountId, mapOf("phone" to phone)) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun verifyCarrierCodeFor(
+        accountId: String,
+        code: String,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching { api.verifyCarrierCodeFor(accountId, mapOf("code" to code)) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun startUnicomQrFor(
+        accountId: String,
+        force: Boolean,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching { api.startUnicomQrFor(accountId, if (force) 1 else 0) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun pollUnicomQrFor(
+        accountId: String,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching { api.pollUnicomQrFor(accountId) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    /**
+     * 联通服务密码登录。
+     *
+     * 用账号维度接口：添加页刚建出来的临时账号也能直接用。
+     */
+    fun loginUnicomWithPassword(
+        accountId: String?,
+        phone: String,
+        password: String,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching {
+                if (accountId.isNullOrBlank()) {
+                    api.loginUnicomWithPassword(mapOf("phone" to phone, "password" to password))
+                } else {
+                    api.loginUnicomWithPasswordFor(
+                        accountId,
+                        mapOf("phone" to phone, "password" to password),
+                    )
+                }
+            }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    /**
+     * 拉联通二维码。
+     *
+     * @param force true = 用户点了「刷新二维码」，必须换一张；
+     *   false = 进入扫码页/切回扫码方式，core 会用 TTL 内缓存的那张。
+     */
+    fun startUnicomQr(
+        force: Boolean = false,
+        onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit,
+    ) {
+        scope.launch {
+            val result = runCatching { api.startUnicomQr(if (force) 1 else 0) }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun pollUnicomQr(onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit) {
+        scope.launch {
+            val result = runCatching { api.pollUnicomQr() }
+            result.onSuccess { _carrierStatus.value = it }
+            onResult(result)
+        }
+    }
+
+    fun logoutCarrier(onResult: (Result<com.ufi_axis.data.model.CarrierStatusResponse>) -> Unit = {}) {
+        scope.launch {
+            val result = runCatching { api.logoutCarrier() }
+            result.onSuccess {
+                _carrierStatus.value = it
+                _billState.value = BillUiState.NeedsLogin()
+            }
+            onResult(result)
+        }
+    }
+
+    /** 把 core 的 `respondFail` 信封解成一句用户能看懂的话；解不出来回退 HTTP 文案。 */
+    /** 把运营商接口的失败翻成能显示的文案（HTTP 401/409 的业务 message 在 body 里）。 */
+    fun carrierErrorText(error: Throwable): String =
+        carrierErrorMessage(error) ?: error.message ?: "操作失败"
+
+    /** 设置页专用：旧 core 没有 /bill/settings，404/501 直接提示升级，而不是 "HTTP 404"。 */
+    fun billSettingsErrorText(error: Throwable): String = when {
+        error is retrofit2.HttpException && (error.code() == 404 || error.code() == 501) ->
+            "设备 core 版本过旧，账单设置暂不可用；请先升级 core"
+        else -> carrierErrorText(error)
+    }
+
+    private fun carrierErrorMessage(error: Throwable): String? {
+        if (error !is retrofit2.HttpException) return error.message
+        return runCatching {
+            val raw = error.response()?.errorBody()?.string().orEmpty()
+            val obj = AppJson.parseToJsonElement(raw).jsonObject
+            obj["error"]?.jsonPrimitive?.contentOrNull
+                ?: obj["message"]?.jsonPrimitive?.contentOrNull
+        }.getOrNull() ?: error.message()
+    }
+
+    /**
+     * 加载话费账单。
+     *
+     * @param force true = 忽略正在进行的请求（下拉/点刷新时用）；否则复用当前请求。
+     * 失败转成 [BillUiState.Error]，由页面给重试入口。
+     */
+    fun loadBill(force: Boolean = false) {
+        if (!force && billLoadJob?.isActive == true) return
+        billLoadJob?.cancel()
+        billLoadJob = scope.launch {
+            // 只有**用户主动刷新**（force = true）才回到 Loading 显示转圈。
+            // 从登录页返回列表时会执行一次 loadBill(force = false)，
+            // 而详情页在退场动画期间仍在组合里 —— 那时置 Loading 就会在卡片上闪一个圆环。
+            if (force) _billState.value = BillUiState.Loading
+            _billState.value = fetchBill(accountId = null, force = force)
+        }
+    }
+
+    // ── 多账号 ──
+    //
+    // 设计口径：账单页默认就是「账号卡片列表」，所以账号列表与每个账号的
+    // 首屏账单要在同一次加载里都拿到。请求**串行**（E7）：N 个账号并发打 core，
+    // 每账号背后又是一串营业厅请求，低端机上会互相拖慢。
+
+    private val _carrierAccounts =
+        MutableStateFlow<List<com.ufi_axis.data.model.CarrierAccountDto>>(emptyList())
+    val carrierAccounts: StateFlow<List<com.ufi_axis.data.model.CarrierAccountDto>> =
+        _carrierAccounts.asStateFlow()
+
+    private val _activeCarrierAccountId = MutableStateFlow<String?>(null)
+    val activeCarrierAccountId: StateFlow<String?> = _activeCarrierAccountId.asStateFlow()
+
+    /** accountId → 该账号的账单状态。 */
+    private val _accountBills = MutableStateFlow<Map<String, BillUiState>>(emptyMap())
+    val accountBills: StateFlow<Map<String, BillUiState>> = _accountBills.asStateFlow()
+
+    /** accountId → 该账号账单的拉取时刻（列表卡片上的"x 分钟前更新"）。 */
+    private val _accountBillAt = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val accountBillAt: StateFlow<Map<String, Long>> = _accountBillAt.asStateFlow()
+
+    /** 账号列表是否正在拉取：列表页据此显示骨架卡而不是空态。 */
+    private val _carrierAccountsLoading = MutableStateFlow(false)
+    val carrierAccountsLoading: StateFlow<Boolean> = _carrierAccountsLoading.asStateFlow()
+
+    /**
+     * 账号列表代际：切账号 / 删账号 / 重新拉取时 +1。
+     *
+     * 串行加载期间如果用户删了一个账号，正在跑的那轮不应该再把它的账单写回来
+     * （否则列表里会闪一下幽灵卡）。做法与 [logSwitchGeneration] 同一套。
+     */
+    private var accountsGeneration = 0
+
+    /**
+     * 拉账号列表 + 每个账号的首屏账单。
+     *
+     * 老 core（没有 `/carrier/accounts`）→ 404，这里静默失败，`carrierAccounts` 保持空，
+     * UI 据此退回单账号模式（计划 E4）。
+     */
+    fun loadCarrierAccounts() {
+        val generation = ++accountsGeneration
+        scope.launch {
+            _carrierAccountsLoading.value = true
+            val resp = runCatching { api.getCarrierAccounts() }
+                .onFailure { DebugLog.w("Tools", "读取运营商账号列表失败: ${it.message}") }
+                .getOrNull()
+            _carrierAccountsLoading.value = false
+            if (resp == null) return@launch
+            if (generation != accountsGeneration) return@launch
+            _carrierAccounts.value = resp.accounts
+            _activeCarrierAccountId.value = resp.activeId
+            // 清掉已删除账号的旧账单状态
+            val alive = resp.accounts.mapTo(HashSet()) { it.id }
+            _accountBills.update { bills -> bills.filterKeys { it in alive } }
+
+            resp.accounts.forEach { account ->
+                if (generation != accountsGeneration) return@launch
+                // 已有数据时**不**回退到 Loading：否则从明细返回列表，每张卡都会闪一下
+                // 显示「读取中…」，高度随之跳变。
+                // 只在"还没有任何结果"时才显示读取中；NeedsLogin / Error 也保留，
+                // 否则刷新期间卡片会从「需要登录」闪成「读取中…」再闪回来。
+                val existing = _accountBills.value[account.id]
+                if (existing == null || existing is BillUiState.Loading) {
+                    _accountBills.update { it + (account.id to BillUiState.Loading) }
+                }
+                val state = fetchBill(accountId = account.id, force = false)
+                if (generation != accountsGeneration) return@launch
+                _accountBills.update { it + (account.id to state) }
+                billAtOf(state)?.let { at ->
+                    _accountBillAt.update { it + (account.id to at) }
+                }
+            }
+        }
+    }
+
+    /** 单独刷新某个账号的账单（卡片下拉 / 明细页刷新）。 */
+    fun loadAccountBill(accountId: String, force: Boolean = false) {
+        scope.launch {
+            // 手动刷新同理：有旧数据就继续显示，直到新结果回来再替换。
+            val previous = _accountBills.value[accountId]
+            if (previous == null || previous is BillUiState.Loading) {
+                _accountBills.update { it + (accountId to BillUiState.Loading) }
+            }
+            val state = fetchBill(accountId = accountId, force = force)
+            _accountBills.update { it + (accountId to state) }
+            billAtOf(state)?.let { at ->
+                _accountBillAt.update { it + (accountId to at) }
+            }
+        }
+    }
+
+    fun activateCarrierAccount(accountId: String) {
+        scope.launch {
+            runCatching { api.activateCarrierAccount(accountId) }
+                .onSuccess { _activeCarrierAccountId.value = accountId }
+                .onFailure { DebugLog.w("Tools", "切换运营商账号失败: ${it.message}") }
+            // 切完之后当前账号的旧状态（carrierStatus/billState）也要跟着刷新，
+            // 否则明细页还会显示上一个号的余额。
+            refreshCarrierStatus()
+            loadBill(force = true)
+        }
+    }
+
+    fun addCarrierAccount(
+        carrier: String,
+        phone: String,
+        label: String,
+        onResult: (String?) -> Unit = {},
+    ) {
+        scope.launch {
+            val error = runCatching {
+                api.addCarrierAccount(
+                    mapOf("carrier" to carrier, "phone" to phone, "label" to label)
+                )
+            }.exceptionOrNull()
+            onResult(error?.message)
+            if (error == null) {
+                refreshCarrierStatus()
+                loadCarrierAccounts()
+                loadBillSettings()
+            }
+        }
+    }
+
+    /**
+     * 新增物联卡 / 云上卡并立即使用充值号登录。
+     *
+     * 没有短信/扫码：先 POST /accounts 建账号，再 POST /accounts/{id}/login/cloud。
+     * 成功后由调用方走统一的 onLoggedIn（刷新列表/账单/返回列表）。
+     */
+    fun addAndLoginIotCard(
+        cardNo: String,
+        verify: String = "",
+        provider: String = "cloud",
+        label: String = "",
+        onResult: (Result<Unit>) -> Unit = {},
+    ) {
+        scope.launch {
+            val result = runCatching {
+                val account = api.addIotCardAccount(
+                    mapOf(
+                        "access_method" to "iot_card",
+                        "provider" to provider,
+                        "card" to cardNo,
+                        "label" to label,
+                    )
+                )
+                val body = buildMap {
+                    put("card", cardNo)
+                    verify.trim().takeIf { it.isNotEmpty() }?.let { put("verify", it) }
+                }
+                val status = api.loginCloudCardFor(account.id, body)
+                _carrierStatus.value = status
+                if (status.state != "ready") {
+                    error(status.message ?: "登录未完成，请检查验证信息")
+                }
+                Unit
+            }
+            result.onFailure { DebugLog.w("Tools", "物联卡登录失败: ${it.message}") }
+            onResult(result)
+        }
+    }
+
+    /** 已存在的物联卡账号重新登录（会话过期/换卡）；小鲸卡需 verify（手机号后四位）。 */
+    fun loginCloudCardFor(
+        accountId: String,
+        cardNo: String,
+        verify: String = "",
+        onResult: (Result<Unit>) -> Unit = {},
+    ) {
+        scope.launch {
+            val result = runCatching {
+                val body = buildMap {
+                    put("card", cardNo)
+                    verify.trim().takeIf { it.isNotEmpty() }?.let { put("verify", it) }
+                }
+                val status = api.loginCloudCardFor(accountId, body)
+                _carrierStatus.value = status
+                if (status.state != "ready") {
+                    error(status.message ?: "登录未完成，请检查验证信息")
+                }
+                Unit
+            }
+            result.onFailure { DebugLog.w("Tools", "物联卡重新登录失败: ${it.message}") }
+            onResult(result)
+        }
+    }
+
+    fun renameCarrierAccount(accountId: String, label: String) {
+        scope.launch {
+            runCatching { api.renameCarrierAccount(accountId, mapOf("label" to label)) }
+                .onFailure { DebugLog.w("Tools", "账号改名失败: ${it.message}") }
+            loadCarrierAccounts()
+            loadBillSettings()
+        }
+    }
+
+    fun removeCarrierAccount(accountId: String) {
+        scope.launch {
+            runCatching { api.deleteCarrierAccount(accountId) }
+                .onFailure { DebugLog.w("Tools", "删除运营商账号失败: ${it.message}") }
+            accountsGeneration++
+            _accountBills.update { it - accountId }
+            refreshCarrierStatus()
+            loadCarrierAccounts()
+            loadBillSettings()
+            // 删的可能就是当前账号：账单页要回到正确的空态/新当前账号
+            loadBill(force = true)
+        }
+    }
+
+    /**
+     * 统一的账单请求 → UI 状态映射。
+     *
+     * @param accountId null = 当前账号（老接口，老 core 也能用）
+     */
+    private suspend fun fetchBill(accountId: String?, force: Boolean): BillUiState =
+        runCatching { BillRepositoryProvider.repository.loadBill(accountId, force) }
+            .fold(
+                onSuccess = { snapshot ->
+                    // core 会带缓存返回 login_required。
+                    // 有 cachedBill 时状态仍是 NeedsLogin（页面要显示登录卡），
+                    // 但 UI 会在登录卡上方同时渲染这份最近数据。
+                    if (snapshot.loginRequired) {
+                        BillUiState.NeedsLogin(cachedBill = snapshot)
+                    } else {
+                        BillUiState.Ready(snapshot)
+                    }
+                },
+                onFailure = { e ->
+                    DebugLog.w("Tools", "读取话费账单失败(${accountId ?: "active"}): ${e.message}")
+                    if (e is retrofit2.HttpException && e.code() == 409) {
+                        BillUiState.NeedsLogin(carrierErrorMessage(e))
+                    } else {
+                        BillUiState.Error(e.message ?: "读取话费账单失败")
+                    }
+                },
+            )
+
+    /** 账单状态 → 缓存/拉取时刻；列表卡片的「x 分钟前更新」用。 */
+    private fun billAtOf(state: BillUiState): Long? = when (state) {
+        is BillUiState.Ready -> state.bill.cachedAt ?: System.currentTimeMillis()
+        is BillUiState.NeedsLogin -> state.cachedBill?.cachedAt
+        else -> null
+    }
+
+    // ── core 崩溃提醒 ──
     // core 崩溃后由 keepalive / START_STICKY 自动拉起，app 此前完全无感（只表现为数据断一下）。
     // 非空 = 有一次**尚未向用户提示过**的 core 崩溃，由 MainActivity 弹窗。
     private val _coreCrashNotice = MutableStateFlow<CoreCrashNotice?>(null)
     val coreCrashNotice: StateFlow<CoreCrashNotice?> = _coreCrashNotice.asStateFlow()
 
-    // ── 运行诊断（2026-08-30）：diagnose / qos / cache / root-check / shell-root 聚合 ──
+    // ── 运行诊断：diagnose / qos / cache / root-check / shell-root 聚合 ──
     private val _diagnoseState = MutableStateFlow(DiagnoseState())
     val diagnoseState: StateFlow<DiagnoseState> = _diagnoseState.asStateFlow()
 
@@ -149,11 +675,11 @@ class ToolsModule(
     /** 终端历史每次拉取的条数；core 侧每通道保留 500 条。 */
     private val CONSOLE_HISTORY_PAGE = 200
 
-    // ── 设备更新状态（2026-08-10：后端自拉取 + 前端兜底推送） ──
+    // ── 设备更新状态（后端自拉取 + 前端兜底推送） ──
     private val _updateDeviceState = MutableStateFlow<UpdateStatusResponse?>(null)
     val updateDeviceState: StateFlow<UpdateStatusResponse?> = _updateDeviceState.asStateFlow()
 
-    /** P0-7：轮询失败连续次数（Core 重启窗口 8088 不可达时累计；恢复后清零） */
+    /** 轮询失败连续次数（Core 重启窗口 8088 不可达时累计；恢复后清零） */
     private var deviceUpdatePollFailures = 0
 
     /**
@@ -164,21 +690,20 @@ class ToolsModule(
      * 在「core 断联」期间**豁免弹「无法连接到设备」**的唯一依据（见
      * [MainViewModel.isCoreUpdateInterruptingBackend]）。
      *
-     * ⚠️ 2026-10-10 修复（真机实锤：更新中弹全屏「无法连接到设备」+ 更新状态全程无数据）：
-     * 标记必须**先于**请求写，且**失败时不能清**。
+     * 标记必须**先于**请求写入，且**失败时不得清除**。
      *
-     * 1. 顺序：`POST /api/update/check` 的语义是「让 core 立刻开始下载+安装+重启」，
-     *    应答返回时 core 已经在下载了。旧实现把 `markCoreUpdating(true)` 放在 `onSuccess`
-     *    分支里 —— 一旦这次请求因 core 正在重启而失败（这是更新的**必然结果**，不是意外），
-     *    runCatching 走 onFailure，标记就永远没落地：core 确实在更（所以断联），
-     *    app 却不知道 → 健康检查照常弹全屏提示，且更新状态从头到尾没有数据。
-     * 2. 失败不清标记：「请求失败」≠「core 没开始」——core 完全可能已经拉起来了
-     *    （正是上面那种情况）。改成起轮询去读**真实**状态：读到 done/failed 会自己清；
-     *    真失败则走 [deviceUpdatePollFailures] 的 5 分钟失联阈值自己清。
-     *    早于请求先清过一次（旧行为）会让这个 bug 稳定复现。
+     * 1. 顺序：`POST /api/update/check` 的语义是「让 core 立即开始下载、安装并重启」，
+     *    应答返回时 core 已在下载。若把 `markCoreUpdating(true)` 放在 `onSuccess` 分支中，
+     *    一旦该请求因 core 正在重启而失败（这是更新的**必然结果**，并非异常），
+     *    runCatching 进入 onFailure，标记将永远不会落地：core 确实在更新（因此断联），
+     *    App 却无法得知，导致健康检查照常弹出全屏提示，且更新状态始终没有数据。
+     * 2. 失败不清标记：「请求失败」不等于「core 未开始」—— core 可能已经启动更新
+     *    （即上述情况）。因此启动轮询读取**真实**状态：读到 done/failed 时自行清除；
+     *    真实失败则由 [deviceUpdatePollFailures] 的 5 分钟失联阈值清除。
+     *    在请求前提前清除（旧行为）会使该问题稳定复现。
      *
-     * 对照：`pushApkAndInstall`（本地 APK 推送）那条路径本来就是「先写标记再上传」，
-     * 顺序正确 —— 这也是为什么只有 core 自更新这条路径出问题，正好佐证了上面的根因。
+     * 对照：`pushApkAndInstall`（本地 APK 推送）路径本就是「先写标记再上传」，顺序正确；
+     * 这也解释了为何仅 core 自更新路径出现该问题。
      */
     fun triggerDeviceUpdate() {
         markCoreUpdating(true)
@@ -190,7 +715,7 @@ class ToolsModule(
                 }
                 .onFailure { e ->
                     // 不清标记、不报终态失败：见 KDoc 第 2 条。先显示「已触发」过渡态，
-                    // 让 UI 不要停在旧状态，然后由轮询去读 core 的真实进度。
+                    // 使 UI 不停留在旧状态，然后由轮询读取 core 的真实进度。
                     _updateDeviceState.value = UpdateStatusResponse(
                         state = "installing",
                         message = "已触发更新，等待设备响应…"
@@ -202,10 +727,10 @@ class ToolsModule(
     }
 
     /**
-     * 轮询设备更新状态（P0-7：失败连续 3 次 → 过渡态「设备重启中…」，恢复后清除；
-     * P1 A5/E21：连续失败超过 150 次（约 2s×150 ≈ 5 分钟）→ 失联红字「设备更新可能失败」）。
-     * Core 主动重启（force-stop + startservice）期间 8088 不可达，轮询会短暂失败——
-     * 此时不显示错误红字，改为过渡态；恢复后读回后端真实 status。
+     * 轮询设备更新状态：失败连续 3 次 → 过渡态「设备重启中…」，恢复后清除；
+     * 连续失败超过 150 次（约 2s×150 ≈ 5 分钟）→ 失联提示「设备更新可能失败」。
+     * Core 主动重启（force-stop + startservice）期间 8088 不可达，轮询会短暂失败，
+     * 此时不显示错误提示，改为过渡态；恢复后读回后端真实 status。
      */
     private var updatePollJob: Job? = null
 
@@ -218,9 +743,9 @@ class ToolsModule(
     /**
      * 后端状态连续处于 busy 的起始时刻（0 = 当前不在 busy）。
      *
-     * 2026-10-23 小修补用：以前的超时判据只看「请求失败」（[deviceUpdatePollFailures]），
-     * 于是「后端已经重启成功、接口也能返回，但状态一直停在 installing」这种情形会无限等待 ——
-     * 用户看到的就是弹窗卡在"安装中 / 等待重启"。
+     * 补充判据：仅依据「请求失败」（[deviceUpdatePollFailures]）时，
+     * 「后端已重启成功、接口可返回，但状态一直停在 installing」的情形会无限等待，
+     * 表现为弹窗停留在「安装中 / 等待重启」。
      */
     private var busySinceMs: Long = 0L
 
@@ -287,7 +812,7 @@ class ToolsModule(
                             )
                         markCoreUpdating(false)
                     }
-                    // P0-7 断连过渡态：保持 installing 语义，busy 轮询不中断
+                    // 断连过渡态：保持 installing 语义，busy 轮询不中断
                     deviceUpdatePollFailures >= DEVICE_UPDATE_POLL_FAILURE_THRESHOLD -> {
                         _updateDeviceState.value = (prev ?: UpdateStatusResponse())
                             .copy(
@@ -311,16 +836,15 @@ class ToolsModule(
     /**
      * 启动设备更新轮询循环。
      *
-     * 2026-08-20 修复（issue #2）：此前 [pollDeviceUpdateStatus] 从未被任何调用方触发，
-     * 导致手动推送 APK 后 Core 重启（force-stop + startservice）期间 8088 不可达，
-     * 前端永远停留在 installing，无法收到更新成功/失败结果。
-     * 现在 [pushApkAndInstall] / [triggerDeviceUpdate] 触发本循环，每 2s 轮询一次，
+     * 手动推送 APK 后 Core 重启（force-stop + startservice），期间 8088 不可达；
+     * 若没有轮询，前端将永远停留在 installing，无法取得更新成功 / 失败结果。
+     * [pushApkAndInstall] / [triggerDeviceUpdate] 触发本循环，每 2s 轮询一次，
      * 直到终态（done/failed）或外部 [stopDeviceUpdatePolling] 停止。
      */
     fun startDeviceUpdatePolling() {
         updatePollJob?.cancel()
-        // 重新开始一轮等待：上一次残留的失败计数 / busy 起始时刻不能带进来，
-        // 否则新的更新一开始就被判成"失联"或"停顿超时"。
+        // 重新开始一轮等待：上一次残留的失败计数与 busy 起始时刻不得带入，
+        // 否则新一轮更新会被立即判为「失联」或「停顿超时」。
         deviceUpdatePollFailures = 0
         busySinceMs = 0L
         updatePollJob = scope.launch {
@@ -354,11 +878,11 @@ class ToolsModule(
                 stopDeviceUpdatePolling()
                 markCoreUpdating(false)
             } else if (resp.state in UPDATE_BUSY_STATES) {
-                // 2026-10-07 修复：**别人**（web 端 / core 自更新）发起的更新，app 以前完全
-                // 不知情——markCoreUpdating(true) 只在 app 自己触发的两条路径里调。
-                // 结果下载/安装导致 core 断联时，健康检查照常弹全屏「无法连接到设备」，
-                // 而且"更新状态"从头到尾没有数据（没人轮询）。
-                // 现在收到任一占线态就置「更新中」标记并起轮询，与 app 自行触发同一套待遇。
+                // **外部**（web 端 / core 自更新）发起的更新也必须感知：
+                // 若仅在 App 自行触发的两条路径调用 markCoreUpdating(true)，下载 / 安装导致
+                // core 断联时，健康检查会照常弹出全屏「无法连接到设备」，且更新状态始终无数据
+                // （无轮询）。因此收到任一忙碌态即置「更新中」标记并启动轮询，
+                // 与 App 自行触发的更新采用同一处理。
                 markCoreUpdating(true)
                 startDeviceUpdatePolling()
             }
@@ -413,7 +937,7 @@ class ToolsModule(
                     return@launch
                 }
                 // ── 本地安装 ──
-                // 注意：自更新会杀掉 Core 进程（PackageInstaller.commit 终止 Core），
+                // 注意：自更新会终止 Core 进程（PackageInstaller.commit 终止 Core），
                 // 因此 installLocalApk 的 HTTP 响应常常因连接被重置/超时而中断并抛异常。
                 // 这是预期行为，并非安装失败。故安装调用异常时不直接判失败，而是进入
                 // 「设备重启中」过渡态并启动轮询，由重连后的 getDeviceUpdateStatus / WS 快照
@@ -454,9 +978,9 @@ class ToolsModule(
                 // 无论 installLocalApk 成功返回还是因重启抛异常，都启动轮询等待真实终态（done/failed）
                 startDeviceUpdatePolling()
             } catch (e: Exception) {
-                // 2026-09-14：原来这里只有 "推送安装失败: ${e.message}"，而 Retrofit 对非 2xx
-                // 直接抛 HttpException —— 上面 `upload.ok` 那段分支对 409/400 **根本不可达**，
-                // core 精心写好的中文原因和 `code` 全被丢掉，用户只看到 "HTTP 409 Conflict"。
+                // 仅返回 `"推送安装失败: ${e.message}"` 时，Retrofit 对非 2xx 直接抛出
+                // HttpException，使上文 `upload.ok` 分支对 409/400 不可达，
+                // core 返回的中文原因与 `code` 均被丢弃，用户只能看到 "HTTP 409 Conflict"。
                 val msg = "推送安装失败: ${describePushFailure(e)}"
                 _updateDeviceState.value = UpdateStatusResponse(state = "failed", message = msg)
                 markCoreUpdating(false)
@@ -492,7 +1016,7 @@ class ToolsModule(
     }
 
     /**
-     * 推包前的本地包名预检（2026-09-14）。
+     * 推包前的本地包名预检。
      *
      * core 侧有权威的精确校验（`UpdateManager.rejectReasonForApk` 比对自身 packageName），
      * 这里只做一次**便宜的粗筛**：目的是别让用户白等几十 MB 上传完才被告知选错了包。
@@ -533,7 +1057,7 @@ class ToolsModule(
     }
 
     /**
-     * 同步「下载方式」到设备端 core（2026-09-22：core 成为唯一决策方）。
+     * 同步「下载方式」到设备端 core：core 为唯一决策方。
      *
      * 只发 `update_source_mode`。**老 core 兼容**：它不认这个键，`updated_fields` 里不会有它，
      * 此时回退成老口径（写 `update_mirror_base`：direct → 空串，其余 → 第一个内置前缀）。
@@ -569,7 +1093,7 @@ class ToolsModule(
         }
     }
 
-    // ── 前端 App 更新（2026-08-10 C6：前端直连 GitHub 清单 + 镜像源，去 Core 化） ──
+    // ── 前端 App 更新（前端直连 GitHub 清单 + 镜像源，去 Core 化） ──
     private val _frontendUpdateState = MutableStateFlow(FrontendUpdateState())
     val frontendUpdateState: StateFlow<FrontendUpdateState> = _frontendUpdateState.asStateFlow()
 
@@ -601,7 +1125,7 @@ class ToolsModule(
                 val hasUpdate = latest.isNotBlank() && current.isNotBlank() &&
                     compareVersions(latest, current) > 0
                 _frontendUpdateState.update { prev ->
-                    // 同一版本的下载成果要保留：原来这里是 `FrontendUpdateState(...)` 构造调用，
+                    // 同一版本的下载成果需保留：若以 `FrontendUpdateState(...)` 构造调用，
                     // 会把 downloadProgress/downloadedApkPath 一起清 0/清 null，于是
                     // 「下载完 → 再点一次检查更新 → 安装」直接报"APK 未下载"。
                     // 反过来版本变了就必须丢弃旧路径，否则"安装"会把旧包装回去。
@@ -760,7 +1284,7 @@ class ToolsModule(
     /**
      * 版本号比较（返回 >0 表示 v1 新）。
      *
-     * 2026-08-28 修复：原实现 `split(".").mapNotNull { it.toIntOrNull() }` 会把非纯数字段
+     * 版本号解析不得使用 `split(".").mapNotNull { it.toIntOrNull() }`：该实现会把非纯数字段
      * **丢弃**而不是当 0 —— 清单里写 "v1.2" 就变成 [2]，与本机 "1.2"→[1,2] 比较时
      * 2>1 判定"有新版"，装完版本名没变，于是每次检查都提示更新、重复下载。
      * 与 core 的 `UpdateManager.compareVersions` 保持同一套解析规则。
@@ -780,7 +1304,7 @@ class ToolsModule(
         return 0
     }
 
-    // ══════════════ 运行诊断（2026-08-30） ══════════════
+    // ══════════════ 运行诊断 ══════════════
     // 五个只读端点一次并发拉齐。任一失败只打日志、保留上一次的值，不写 errorMessage ——
     // 这是排障页，比「整页红条」更重要的是把还能读到的信息显示出来。
 
@@ -820,7 +1344,7 @@ class ToolsModule(
     }
 
     /**
-     * CPU 控制能力探测（2026-10-08）。
+     * CPU 控制能力探测。
      *
      * core 侧要发 20+ 条 shell（ADB 优先、普通 shell 兜底），实测 5~15s —— 所以独立按钮 +
      * 独立 loading（[ToolsStates.DiagnoseState.cpuProbing]），不挂进 [loadDiagnostics] 的并行组：
@@ -852,7 +1376,7 @@ class ToolsModule(
         }
     }
 
-    // ══════════════ 字段归一化排障开关（2026-09-22） ══════════════
+    // ══════════════ 字段归一化排障开关 ══════════════
     // 归属这一节而不是「日志开关」那一节：它与上面的字段覆盖率诊断是**同一个排障场景** ——
     // 覆盖率卡看的是归一化后的命中情况，这个开关关掉归一化去比对设备原始字段。
     //
@@ -1017,14 +1541,18 @@ class ToolsModule(
     }
 
     /**
-     * 写操作成功提示（2026-09-22）。走跨模块事件 → `MainViewModel.writeNotice` →
+     * 写操作成功提示。走跨模块事件 → `MainViewModel.writeNotice` →
      * Activity 级 Toast 宿主，与失败提示同一个出口（同 `NetworkModule.emitWriteNotice`）。
      *
      * 文案要说清**是哪一项**生效了：tools 域一个页面上往往有十几个开关，
      * 「保存成功」这种泛化文案让用户分不清落地的是哪个。
      */
-    private fun emitWriteNotice(message: String, subtitle: String? = null) {
-        _events.tryEmit(UiEvent.ShowWriteNotice(message, subtitle))
+    private fun emitWriteNotice(
+        message: String,
+        subtitle: String? = null,
+        type: WriteNoticeType = WriteNoticeType.SUCCESS,
+    ) {
+        _events.tryEmit(UiEvent.ShowWriteNotice(message, subtitle, type))
     }
 
     /**
@@ -1313,6 +1841,9 @@ class ToolsModule(
             if (!silent) _toolsState.value = _toolsState.value.copy(isLoading = true)
             try {
                 val resp = api.getSmsContacts()
+                // 进场动画期间不落库：短信列表是本 App 最重的一屏之一（几百条卡片），
+                // 这次写入会触发整页重组，正好撞在进场动画里。见 awaitTransitionIdle 的说明。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 _toolsState.value = _toolsState.value.copy(
                     smsContacts = resp.contacts, isLoading = false, smsContactsLoaded = true
                 )
@@ -1407,7 +1938,7 @@ class ToolsModule(
      * 打开联系人对话：加载最近一页消息（按号码过滤），自动标记已读。
      *
      * @param targetMsgId 打开后要定位并高亮的消息 id（0 = 不定位，停在最新一条）。
-     *        由「查看原对话」带过来；从联系人列表进来时是 0，会顺手把上一次的目标清掉。
+     *        由「查看原对话」带过来；从联系人列表进入时是 0，会一并清除上一次的目标。
      */
     fun openConversation(phone: String, targetMsgId: Long = 0L) {
         scope.launch {
@@ -1422,6 +1953,8 @@ class ToolsModule(
                 // 后端返回 DESC（最新在前），转为 ASC 用于对话展示
                 val msgs = resp.messages.sortedBy { it.timestamp }
                 val total = resp.total.coerceAtLeast(msgs.size.coerceAtLeast(resp.count))
+                // 同上：一整段对话的消息要一次性铺出来，是这条链路上最重的一次重组。
+                com.ufi_axis.viewmodel.viewmodel.awaitTransitionIdle()
                 _toolsState.update {
                     it.copy(conversationMessages = msgs,
                         conversationOffset = msgs.size,
@@ -1430,7 +1963,7 @@ class ToolsModule(
                         conversationTotal = total)
                 }
                 // 打开对话 → 自动标记该对话所有消息为已读。
-                // 标记已读是「尽力而为」的副作用：即便后端动作接口抖动也不要污染对话展示，
+                // 标记已读是「尽力而为」的副作用：即便后端动作接口抖动也不得污染对话展示，
                 // 否则会因 SmsActionResponse 解析/网络异常把已成功加载的对话打成「对话加载失败」。
                 try {
                     api.markConversationRead(mapOf("phone" to phone))
@@ -1511,12 +2044,12 @@ class ToolsModule(
             prefs.smsCodeSeenMsgId = maxOf(prefs.smsCodeSeenMsgId, codes.maxOf { it.msgId })
         }
         _toolsState.update { it.copy(verificationCodesUnread = 0) }
-        // 2026-10-19：水位写回 core（跨设备同步）。
+        // 水位写回 core（跨设备同步）。
         pushSeenWatermarks()
     }
 
     /**
-     * 已读水位的**跨设备同步**（2026-10-19）。
+     * 已读水位的**跨设备同步**。
      *
      * 水位本地仍留一份镜像（读起来是同步的、角标不闪烁），但真源放 core：
      * - 拉：首次加载时 `GET /api/config` 取 core 上的水位，与本地的取 max 合并；
@@ -1561,8 +2094,8 @@ class ToolsModule(
     /**
      * 拉取验证码缓存。
      *
-     * 2026-08-29：改为**无感刷新** —— 不翻任何加载态，数据静默替换。
-     * 2026-09-08：无感刷新那次顺手删掉了页面唯一的"落地"信号，导致首屏骨架永久挂死
+     * 采用**无感刷新**：不切换任何加载态，数据静默替换。
+     * 但必须保留页面的「落地」信号，否则首屏骨架会永久挂起
      * （详见 [ToolsState.verificationCodesLoaded]）。现在成功与失败两条路都把
      * [ToolsState.verificationCodesLoaded] 置 true：它只表示"这次尝试结束了"，
      * 不是加载态，因此既能让首屏骨架收场（空列表 → 空态），又不会让后续刷新闪骨架。
@@ -1575,7 +2108,7 @@ class ToolsModule(
         scope.launch {
             try {
                 val resp = api.getVerificationCodes()
-                // 2026-10-19：先合并 core 上的已读水位（换设备后角标才是对的）。
+                // 先合并 core 上的已读水位（换设备后角标才正确）。
                 syncSeenWatermarksFromCore()
                 val prefs = AppPreferences(appContext)
                 val onNotifyTab = _toolsState.value.smsTab == 1
@@ -1590,7 +2123,7 @@ class ToolsModule(
                         verificationCodesUnread = resp.codes.count { c -> c.msgId > seen }
                     )
                 }
-                // 2026-09-13 修复：自动复制已迁移至 `:ufi_notify` 进程后台触发，
+                // 自动复制已迁移至 `:ufi_notify` 进程后台触发，
                 // 且由 NotificationCenter 统一管控。此处原有的 UI 侧自动复制逻辑已删除，
                 // 避免在打开页面时与后台逻辑冲突产生双重复制。
             } catch (e: Exception) {
@@ -1605,11 +2138,11 @@ class ToolsModule(
     /**
      * 验证码开关。
      *
-     * 乐观更新 + **失败回滚**。2026-09-08：原实现是 `catch (_: Exception) {}` ——
+     * 乐观更新 + **失败回滚**。`catch (_: Exception) {}` 会吞掉失败，
      * 请求失败时本地已经翻成新值、core 那边没变，下一次 [refreshDeviceConfig] 回读又把它
      * 拨回去，用户看到的就是「设置自己弹回来」而且中间没有任何提示。
      *
-     * 2026-09-14：写成功后同步落 [AppPreferences] 镜像（见 [refreshDeviceConfig]），
+     * 写成功后同步落 [AppPreferences] 镜像（见 [refreshDeviceConfig]），
      * 否则进程重建 + core 连不上时会回到编译期默认值。
      */
     fun setSmsCodeEnabled(enabled: Boolean) {
@@ -1621,7 +2154,7 @@ class ToolsModule(
                 return@launch
             }
             AppPreferences(appContext).smsCodeEnabled = enabled
-            // 二级：拉验证码缓存。2026-09-13 修复——此前它与写核心同处一个 try，
+            // 二级：拉验证码缓存。若与写核心同处一个 try，
             // 拉缓存一旦抛异常会把主开关回滚到 previous(false)，尽管 core 早已写成 true，
             // 表现为「开关存不住 / 自己弹回关」。现在独立 try，失败只兜底、绝不回滚主开关。
             if (enabled) {
@@ -1673,9 +2206,9 @@ class ToolsModule(
     /**
      * 自动复制开关（`sms_code_auto_copy`）。
      *
-     * 2026-09-13：功能已迁移至 `:ufi_notify` 进程后台触发，由 [NotificationCenter] 管控。
+     * 该功能已迁移至 `:ufi_notify` 进程后台触发，由 [NotificationCenter] 管控。
      *
-     * 2026-09-14 修复：这里原来**只** PUT 给 core，而执行闸门
+     * 此处**仅** PUT 给 core，而执行闸门
      * `NotificationCenter.copyVerificationCodeToClipboard` 判的是本地 `ufi_axis_prefs` 里的
      * 同名键 —— 全仓没有任何写入方，闸门恒为 false，开关是假的。现在写本地镜像
      * （`AppPreferences.smsCodeAutoCopy` 用的就是 `NotificationCenter.KEY_SMS_CODE_AUTO_COPY`），
@@ -1768,7 +2301,7 @@ class ToolsModule(
      *
      * 这里做乐观更新是因为开关必须立刻跟手（等一个来回会让人以为没点上），
      * 而失败时把那一条按 id 精准还原 —— 不是整列表重拉，那会把用户同时改的其它行也覆盖掉。
-     * 请求体只带 `enabled`：core 的 PUT 是字段级合并，不会顺手把 pattern/scope 重置。
+     * 请求体只带 `enabled`：core 的 PUT 是字段级合并，不会一并重置 pattern/scope。
      */
     suspend fun setSmsRuleEnabled(id: Long, enabled: Boolean): Boolean {
         val previous = _toolsState.value.smsRules.firstOrNull { it.id == id } ?: return false
@@ -1838,7 +2371,7 @@ class ToolsModule(
         scope.launch {
             try {
                 val resp = api.getSmsBlocked(limit = SMS_BLOCKED_PAGE_SIZE)
-                // 2026-10-19：先合并 core 上的已读水位（跨设备）。
+                // 先合并 core 上的已读水位（跨设备）。
                 syncSeenWatermarksFromCore()
                 val prefs = AppPreferences(appContext)
                 val seen = prefs.smsBlockedSeenId
@@ -1851,7 +2384,7 @@ class ToolsModule(
                         smsBlockedCursorId = resp.nextCursorId,
                         smsBlockedHasMore = resp.hasMore,
                         smsBlockedTotal = resp.total,
-                        // 2026-10-19 修正：之前只在「当前已加载的一页」里数 id > 水位，
+                        // 不得只在「当前已加载的一页」中统计 id > 水位，
                         // 首屏最多 50 条 ⇒ 角标最多显示 50（实际可能有几百条）。
                         // 从没看过（水位 = 0）时直接用服务端 total；看过之后只统计已加载页里
                         // 比水位新的那部分（更旧的分页已被丢弃，这是能做到的准确上限）。
@@ -1923,7 +2456,7 @@ class ToolsModule(
             prefs.smsBlockedSeenId = maxOf(prefs.smsBlockedSeenId, records.maxOf { it.id })
         }
         _toolsState.update { it.copy(smsBlockedUnviewed = 0) }
-        // 2026-10-19：水位写回 core（跨设备同步）。
+        // 水位写回 core（跨设备同步）。
         pushSeenWatermarks()
     }
 
@@ -1941,7 +2474,7 @@ class ToolsModule(
      * 删除单条拦截记录。乐观移除 + 失败还原。
      *
      * 回滚只还原**列表**，total 用 `+1` 对称乐观分支的 `-1`：`snapshot` 只是已加载的那一页
-     * （每页 50），而 total 是服务端全表总数（上限 500）。原来回滚时写 `snapshot.size`，
+     * （每页 50），而 total 是服务端全表总数（上限 500）。若回滚时写入 `snapshot.size`，
      * 一次删除失败就能把「共 500 条」直接掉成「共 50 条」。
      */
     suspend fun deleteSmsBlocked(id: Long): Boolean {
@@ -1964,7 +2497,7 @@ class ToolsModule(
         }
     }
 
-    // ══════════════════ 通知历史（2026-09-08） ══════════════════
+    // ══════════════════ 通知历史 ══════════════════
     //
     // 两个数据源、两套 keyset 游标分页，刻意不合并成一个列表：
     // - 系统通知历史在**本机 Room**（`notify_history`），写入方是 `:ufi_notify`；
@@ -2209,7 +2742,7 @@ class ToolsModule(
      * 清空**当前渠道**的投递记录（`DELETE …/history?channel=…`）。
      *
      * 只清当前渠道：三条渠道共用一张表，但用户是在某一条渠道的记录页里点的清空，
-     * 顺手把另两条也删掉属于越权。成功后先把本渠道的列表与三个计数归零（不等重拉回来，
+     * 一并删除另两条属于越权。成功后先将本渠道的列表与三个计数归零（无需等待重新拉取，
      * 否则会有一段时间"点了清空但列表还在"），再按当前筛选重拉一次拿准确的空态。
      */
     suspend fun clearDeliveryHistory(): Boolean = try {
@@ -2350,7 +2883,7 @@ class ToolsModule(
     /**
      * 以 core 为唯一真源回读设备配置，并覆盖本地缓存。
      *
-     * 2026-08-26（T40-4）：原来这里叫 `loadSmsConfig()`，拿到整个 `GET /api/config` 却**只取
+     * `loadSmsConfig()` 会获取整个 `GET /api/config`，却**只取
      * `sms_code_enabled` / `sms_code_cleanup_hours` 两个字段**，其余全部丢弃 —— 于是 core 那份
      * GET 对 app 等于不存在，`debug_mode` / `goform_port` / `update_mirror_base` 全靠本地
      * SharedPreferences 各存一份、只写不读。web 在另一端改过之后，app 这边显示的还是旧值，
@@ -2364,7 +2897,7 @@ class ToolsModule(
         scope.launch {
             // 冷启动首屏：设备连接/鉴权可能尚未就绪，首轮 GET 容易抛异常被静默吞掉、
             // 本地镜像停在默认 false（表现为「彻底关 app 再开，解析开关变回关」）。
-            // 加一次退避重试兜底瞬时失败；两次都失败才沿用本地缓存（2026-09-13 修复）。
+            // 增加一次退避重试以兜底瞬时失败；两次均失败才沿用本地缓存。
             var cfg: com.ufi_axis.data.model.AppConfig? = null
             for (attempt in 0..1) {
                 cfg = try {
@@ -2383,7 +2916,7 @@ class ToolsModule(
             val prefs = AppPreferences(appContext)
             // core 明确给了值才覆盖（这四项已改为可空，见 AppConfig）；同时把新值落进
             // AppPreferences 镜像 —— 否则 app 进程重建 + core 暂时连不上时，ToolsState 会回到
-            // 编译期默认值，表现为「自动解析验证码开关存不住」（2026-09-14 修复）。
+            // 编译期默认值，表现为「自动解析验证码开关无法持久化」。
             //
             // 写请求在飞时整段跳过：本函数挂在「WS 每次进入 CONNECTED」上（含断线重连），
             // 而开关是乐观更新 + 异步 PUT。GET 抢在 PUT 落库前返回旧值就会把开关刷回去 ——
@@ -2410,11 +2943,11 @@ class ToolsModule(
                 NotifyDispatchReceiver.dispatchSwitchSnapshot(appContext)
             }
             // core 为真源：直接覆盖本地缓存。
-            // 2026-09-04：日志四层开关改成「只有 core 明确给了值才覆盖」。
-            // 这四个字段在 AppConfig 里已改为可空（null = 响应里没有这个 key）——原来它们非空 +
-            // 默认 true，「core 没返回」与「core 说 true」不可区分，于是老 core / 裁剪过的响应
-            // 会把用户刚关掉的开关重新打开。其余字段沿用「有默认值也照写」的旧行为，
-            // 因为它们不是开关、写错了不会产生持续的副作用（日志会一直写盘）。
+            // 日志四层开关仅在 core 明确给出值时覆盖。
+            // 这四个字段在 AppConfig 中已改为可空（null = 响应中无该 key）。若保持非空 +
+            // 默认 true，则「core 未返回」与「core 返回 true」不可区分，老 core / 裁剪过的响应
+            // 会把用户刚关闭的开关重新打开。其余字段沿用「有默认值也照写」的行为，
+            // 因为这些字段不是开关，写错不会产生持续副作用（日志会持续写盘）。
             applyLogSwitchesFromCore(safeCfg)
             prefs.goformPort = safeCfg.goform_port
             // core 是下载方式的真源；空串 = 老 core 没这个字段，此时保持本地缓存不动
@@ -2452,7 +2985,7 @@ class ToolsModule(
      * 打开某个号码的对话，并定位到指定消息（验证码详情弹窗的「查看原对话」）。
      *
      * 刻意**不动 smsTab**：对话是覆盖整屏的一层，底下停在哪个页签不影响显示；
-     * 旧实现顺手 `smsTab = 0`，结果用户从「通知」跳进对话、返回时落在消息列表，
+     * 若一并设置 `smsTab = 0`，会导致用户从「通知」跳进对话、返回时落在消息列表，
      * 丢掉了原来的浏览位置。
      *
      * @param msgId 验证码来源短信的 id。只带号码的话对话只会停在最新一条，
@@ -2501,7 +3034,7 @@ class ToolsModule(
                 return@launch
             }
             com.ufi_axis.data.notification.NotificationConfigSync.applyRemote(appContext, remote, guard)
-            // 2026-10-12（跨设备一致性）：applyRemote 把 core 真值写回 prefs，但**没有通知 UI**。
+            // applyRemote 把 core 真值写回 prefs，但**未通知 UI**。
             // 「通知与守护」那一页的开关全是 remember { prefs.getBoolean(...) } 初始化的，
             // 进页面后不再读 prefs —— 于是 B 设备（没在本机开过总闸）进页面永远停在 false，
             // 入口全部置灰，尽管 core 上的配置是好的。
@@ -2517,16 +3050,16 @@ class ToolsModule(
      *
      * 只传改动的键：core 做字段级合并，整体回传会把别端刚改的项用本地值覆盖掉。
      *
-     * ## 2026-09-22：失败不再只打日志（阶段 3.4）
+     * ## 失败不再仅记录日志
      * 原来失败只 `DebugLog.w`，于是「告警设置 → 套餐限额 / 设备接入 / 设备离开」这三项的
      * 二级取数闸门（`traffic_80_enabled` / `device_events_enabled`）是**完全静默**的：
      * 本地 prefs 已改、core 没改，下次回读又弹回去。现在失败写 `toolsState.errorMessage`
      *（已接入 `MainViewModel.rawGlobalError`，会冒红色 Toast），并**回读 core 真值**把本地
-     * 镜像拉回去（§4.11）——`applyRemote` 会重写 prefs，跟着 prefs 的 UI 自己就回到真值。
+     * 镜像写回 —— `applyRemote` 会重写 prefs，跟随 prefs 的 UI 即回到真值。
      *
-     * **不要**把失败写进 `alertsState.errorMessage`：那个字段的唯一消费点
+     * **不得**将失败写入 `alertsState.errorMessage`：那个字段的唯一消费点
      *（`AlertSettingsScreen`）固定把它包装成「无法读取设备上的告警配置…」，
-     * 保存失败写进去会显示成"读不到"，属于误导（§4.12）。
+     * 保存失败写入会显示为「读不到」，属于误导。
      *
      * @param successNotice 非 null 时，成功后发一条全局成功提示。
      *   **默认 null 是刻意的**：本方法有 6 个调用页，其中邮件 / Webhook / 本机短信 /
@@ -2595,7 +3128,7 @@ class ToolsModule(
         /** 前端更新信息源：GitHub 仓库根 version.json（raw；release.yml 发布时自动回写 apkUrl/apkSha256，也可手动填写） */
         const val RAW_VERSION_URL = "https://raw.githubusercontent.com/Asunano/UFI-AXIS/main/version.json"
 
-        /** P0-7：轮询失败连续 N 次判定为「设备重启中」过渡态（Core 重启窗口 8088 不可达） */
+        /** 轮询失败连续 N 次判定为「设备重启中」过渡态（Core 重启窗口 8088 不可达） */
         private const val DEVICE_UPDATE_POLL_FAILURE_THRESHOLD = 3
 
         /** P1 A5/E21：轮询失败连续 N 次（约 2s×150 = 5 分钟）判定为失联，提示「设备更新可能失败」 */
@@ -2672,7 +3205,7 @@ class ToolsModule(
     }
 
     /**
-     * 删除整段会话（按号码，2026-09-21）。
+     * 删除整段会话（按号码）。
      * 成功后从联系人列表移除该号码、清空当前对话（如果恰好在看这段会话）。
      */
     fun deleteConversation(phone: String) {
@@ -2695,7 +3228,7 @@ class ToolsModule(
     }
 
     /**
-     * 标记单条短信为未读（2026-09-21）。
+     * 标记单条短信为未读。
      * API 已有 `POST /api/sms/read` 支持 `read=false`，UI 原来没入口。
      */
     fun markSmsUnread(id: Long) {
@@ -2726,7 +3259,7 @@ class ToolsModule(
      *
      * 注意：core 契约入参是 slot，值域为 1/2/3（第 N 个物理槽）或字符串 "external"；
      * 现在 UfiAxisApi.switchSimSlot 声明成 Map<String, Int> 带不了 "external"，启用前要一起改。
-     * 不要退回旧入参 goformSlot——它的值域是运营商编码（"1" = 电信），和 slot 的槽位编号重叠，会静默切错卡。
+     * 不得退回旧入参 goformSlot——它的值域是运营商编码（"1" = 电信），和 slot 的槽位编号重叠，会静默切错卡。
      */
     fun switchSimSlot(slot: Int) {
         scope.launch {
@@ -2758,7 +3291,7 @@ class ToolsModule(
                 )
                 // P2 多端同步：拉取成功后同步镜像（连接即拉取，绝不推送默认）
                 rConfig.getOrNull()?.let { alertPrefs.applyRemote(it) }
-                // 2026-08-09 19:03 系统通知推送（alert-notification-plan 阶段 B3）：
+                // 系统通知推送：
                 // 拉取成功后差异检测新告警——统一委托 NotificationCenter（开关关→零开销 return）
                 rList.getOrNull()?.alerts?.let { notificationCenter.maybeNotifyNewAlerts(it) }
             } catch (e: Exception) { _alertsState.value = _alertsState.value.copy(isLoading = false, errorMessage = "加载告警失败: ${e.message}") }
@@ -2863,7 +3396,7 @@ class ToolsModule(
     /**
      * 写邮件通知配置。
      *
-     * **2026-09-10：这个端点会 400 了**（`daily_limit` 越界 / `min_level` 认不出）。
+     * 该端点会返回 400（`daily_limit` 越界 / `min_level` 无法识别）。
      * 此前它永不报错，所以这里原来只有一句 `e.message` —— 那会把 core 写好的中文原因
      * 换成 `HTTP 400 Bad Request`。现在走 [coreErrorMessage]，口径与另两条渠道一致。
      *
@@ -2918,7 +3451,7 @@ class ToolsModule(
     // ── Webhook 通知渠道（/api/notify/webhook）──
     //
     // 三个动作各自只碰自己那一位 in-flight 标记（loading / saving / testing），
-    // 理由见 WebhookState 的注释：邮件那侧共用一个 isLoading 已经踩过坑。
+    // 理由见 WebhookState 的注释：邮件侧共用一个 isLoading 已出现问题。
 
     private val _webhookState = MutableStateFlow(WebhookState())
     val webhookState: StateFlow<WebhookState> = _webhookState.asStateFlow()
@@ -3091,7 +3624,7 @@ class ToolsModule(
     /**
      * 发一条**真实**测试短信。调用方必须先让用户确认（会产生话费、消耗一条配额）。
      *
-     * 成功后顺手回读一次配置：`sent_today` / `quota_remaining` 变了，
+     * 成功后一并回读一次配置：`sent_today` / `quota_remaining` 变化后，
      * 而配置页上那行"今日 N/M"读的就是配置里的这两个字段 —— 不回读就会停在旧数字上。
      */
     fun testLocalSms() {
@@ -3114,7 +3647,7 @@ class ToolsModule(
     /**
      * 拉任务列表。
      *
-     * 三件事都是 2026-09-20 修的，原因同一个 bug（Web 端新建任务，App 第一次进页面看不到）：
+     * 以下三项由同一缺陷导致（Web 端新建任务后，App 首次进入页面看不到）：
      *
      * 1. **只动 `tasksLoading`**，不再碰规则那一位 —— 两个加载是并发发起的，
      *    共用一位会让先回来的那个把"还在读"宣布结束，界面当即画出空态；
@@ -3164,7 +3697,7 @@ class ToolsModule(
     /**
      * 更新任务（含 Switch 开关、编辑对话框保存）。
      *
-     * 2026-08-18 修复 P1 定时任务失效：
+     * 定时任务失效的原因：
      *  - `AppJson.encodeDefaults = true` 已保证 body 包含所有字段（含 `enabled=true` 默认值），
      *    后端 PUT 路由 `p["xxx"] ?: existing.xxx` 才能拿到新值，开关才不回弹。
      *  - 加乐观更新：立刻把本地 `state.tasks` 里同 id 的 task 替换成新 task，UI 即时反馈；
@@ -3393,6 +3926,97 @@ class ToolsModule(
     }
 
     /** 拉取 core 落盘日志文件列表（`GET /api/debug-logs/files`）。 */
+    /**
+     * 导出日志时获取设备型号。
+     *
+     * 失败/离线返回 null —— 导出文件头省略该行，**绝不阻塞导出**。
+     * 只在用户点导出时调用一次，不走缓存（型号不会变，但缓存会让"换设备后导出"带旧型号）。
+     */
+    suspend fun fetchDeviceModelForExport(): String? = runCatching {
+        val model = api.getDeviceModel()
+        listOf(model.brand, model.model)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString(" ")
+            .ifBlank { null }
+    }.getOrNull()
+
+    /**
+     * 打包用：取回 core 侧全部落盘文件。
+     *
+     * 每个文件最多 [perFileMaxBytes]（core 接口上限 2MB），总量最多 [totalMaxBytes]。
+     * 逐个取、失败即跳过 —— 一个文件读不到不该让整包失败。
+     *
+     * @return (文件列表, 被跳过的数量)
+     */
+    suspend fun collectCoreLogFilesForBundle(
+        perFileMaxBytes: Int = 2 * 1024 * 1024,
+        totalMaxBytes: Long = 32L * 1024 * 1024,
+    ): Pair<List<Pair<String, ByteArray>>, Int> {
+        val files = runCatching { api.getDebugLogFiles().files }
+            .getOrElse { return emptyList<Pair<String, ByteArray>>() to 0 }
+        var total = 0L
+        var skipped = 0
+        val collected = mutableListOf<Pair<String, ByteArray>>()
+        for (file in files) {
+            if (total >= totalMaxBytes) {
+                skipped += 1
+                continue
+            }
+            val bytes = runCatching {
+                api.getDebugLogFileTail(file.name, perFileMaxBytes).use { it.bytes() }
+            }.getOrNull()
+            if (bytes == null) {
+                skipped += 1
+                continue
+            }
+            if (total + bytes.size > totalMaxBytes) {
+                skipped += 1
+                continue
+            }
+            total += bytes.size
+            collected += file.name to bytes
+        }
+        return collected to skipped
+    }
+
+    /**
+     * 直接读取 core 文件尾部：导出用，不修改查看器状态。
+     *
+     * 与 [loadCoreLogFileTail] 的区别：那个会把正文塞进 `coreLogFilesState`（UI 显示用），
+     * 导出单个文件不应一并替换正在查看的另一个文件。
+     */
+    /**
+     * 刷新 core 落盘日志的**占用摘要**（日志页顶部设备卡）。
+     *
+     * 只更新 total/today/days/free/degraded 与目录，不动 `files` 与 `viewing*` ——
+     * 页面上没有文件列表时没必要拉一份全量清单做展示。
+     */
+    fun refreshCoreLogUsage() {
+        scope.launch {
+            runCatching { api.getDebugLogFiles() }.onSuccess { resp ->
+                _coreLogFilesState.update {
+                    it.copy(
+                        totalBytes = resp.total_bytes,
+                        todayBytes = resp.today_bytes,
+                        days = resp.days,
+                        diskFreeBytes = resp.disk_free_bytes,
+                        degraded = resp.degraded,
+                        dir = resp.dir
+                    )
+                }
+            }
+        }
+    }
+
+    /** core 已运行时长（毫秒）；取不到返回 null（设备卡显示“—”而不是假数据）。 */
+    suspend fun fetchServiceUptimeMs(): Long? =
+        runCatching { api.getServiceStatus().uptimeMs }.getOrNull()
+
+    suspend fun readCoreLogFileTail(name: String, maxBytes: Int = 2 * 1024 * 1024): String? =
+        runCatching { api.getDebugLogFileTail(name, maxBytes).use { it.string() } }.getOrNull()
+
     fun loadCoreLogFiles() {
         scope.launch {
             _coreLogFilesState.value = _coreLogFilesState.value.copy(isLoading = true, errorMessage = null)
@@ -3404,6 +4028,10 @@ class ToolsModule(
                     it.copy(
                         files = resp.files,
                         totalBytes = resp.total_bytes,
+                        todayBytes = resp.today_bytes,
+                        days = resp.days,
+                        diskFreeBytes = resp.disk_free_bytes,
+                        degraded = resp.degraded,
                         dir = resp.dir,
                         isLoading = false,
                         errorMessage = null
@@ -3464,7 +4092,7 @@ class ToolsModule(
     }
 
     // ══════════════════════════════════════════════════════════════
-    //  日志四层开关（2026-09-04 重写）
+    //  日志四层开关
     //
     //  修的缺陷：原来这四个方法都是「先写本地 AppPreferences，再 fire-and-forget 地
     //  PUT /api/config，失败只 DebugLog.w 一行」。后果是**两端永久分叉**：
@@ -3484,17 +4112,22 @@ class ToolsModule(
      * 从 core 回读四层开关（进日志页时调用）。失败只置 [LogSwitchState.errorMessage]，
      * 不动本地缓存 —— 连不上设备时把开关改掉毫无道理。
      */
-    fun loadLogSwitches() {
+    fun loadLogSwitches(silent: Boolean = false) {
+        val generation = logSwitchGeneration
         scope.launch {
             val cfg = try {
                 api.getConfig()
             } catch (e: Exception) {
-                _logSwitchState.value = _logSwitchState.value.copy(
-                    isSaving = false,
-                    errorMessage = "读取设备日志开关失败：${e.message}"
-                )
+                if (!silent) {
+                    _logSwitchState.value = _logSwitchState.value.copy(
+                        isSaving = false,
+                        errorMessage = "读取设备日志开关失败：${e.message}"
+                    )
+                }
                 return@launch
             }
+            // 读取期间发生过写入 → 这份结果比写入旧，不能拿它覆盖镜像
+            if (generation != logSwitchGeneration) return@launch
             applyLogSwitchesFromCore(cfg)
         }
     }
@@ -3504,7 +4137,7 @@ class ToolsModule(
         _logSwitchState.value = _logSwitchState.value.copy(errorMessage = null)
     }
 
-    // ── core 崩溃提醒（2026-09-04）──
+    // ── core 崩溃提醒 ──
 
     /**
      * 拉一次 `GET /api/service/crash`，若这次崩溃**值得提示且尚未提示过**就抛给 UI 弹窗。
@@ -3512,7 +4145,7 @@ class ToolsModule(
      * 调用时机：MainActivity 首帧 + 每次重新连上设备。**失败一律静默** —— 这只是个提醒，
      * 老 core 没有这个端点（404）也走这条路，不该给用户报错。
      *
-     * 2026-10-23：两处时序修正。
+     * 两处时序修正：
      * - **先过滤新鲜度**：`crashed` 对三个月前的记录也恒为 true，只有 core 的 `recent`
      *   （同一时钟算的 7 天窗口）能把它挡掉，判据集中在 [CoreCrashPolicy]。
      * - **记账提前到发出提示之前**：原来等用户点「知道了」才写 `coreCrashShownAt`，
@@ -3577,7 +4210,7 @@ class ToolsModule(
      * 需要它是因为「打开总开关时连带打开详细」不能拆成两次调用 —— [isSaving] 会把第二次直接吞掉。
      * 只要有任一字段未被 core 采纳就整体算失败，不做部分成功（本地与 core 半同步比整体失败更难查）。
      *
-     * 2026-09-22：补 [successNotice]。这四个开关原来只有失败提示（`LogSwitchState.errorMessage`
+     * 补充 [successNotice]：这四个开关原先只有失败提示（`LogSwitchState.errorMessage`
      * 由日志页消费），成功是静默的 —— 而它们改的是**设备侧**行为，界面上除了开关本身没有
      * 任何变化可看，用户无法确认 core 到底收下了没有。
      */
@@ -3588,6 +4221,7 @@ class ToolsModule(
         mirror: (LogSwitchState) -> LogSwitchState
     ) {
         if (_logSwitchState.value.isSaving) return
+        logSwitchGeneration += 1
         _logSwitchState.value = _logSwitchState.value.copy(isSaving = true, errorMessage = null)
         scope.launch {
             try {
@@ -3601,6 +4235,9 @@ class ToolsModule(
                 _logSwitchState.value = mirror(_logSwitchState.value)
                     .copy(loaded = true, isSaving = false, errorMessage = null)
                 emitWriteNotice(successNotice)
+                // 回读确认 core 真的落盘了（而不是只看 updated_fields）；代计数保证不会
+                // 把本次读取结果与更新写入的顺序颠倒。
+                loadLogSwitches(silent = true)
             } catch (e: Exception) {
                 DebugLog.w("Tools", "下发日志开关 $fields 失败: ${e.message}")
                 _logSwitchState.value = _logSwitchState.value.copy(
@@ -3612,50 +4249,32 @@ class ToolsModule(
     }
 
     /**
-     * 日志总开关 `log_enabled`：关闭后 core 连缓冲/文件/logcat 都不写。
+     * 日志总开关 `log_enabled`。
      *
-     * **打开时连带打开「详细」（`debug_mode`）**：总闸只放开 WARN/ERROR，DEBUG/INFO 还要过
-     * `DebugLog.verbose` / `AppLogger` 的详细闸门。一次正常会话里可能一条 WARN/ERROR 都不产生，
-     * 于是用户「开了总开关，日志页还是空的」—— 表现和开关坏了一样。
-     * 打开即记全量，用户嫌吵可以再单独关掉「详细」。
+     * **不再连带打开 `debug_mode`**。
+     * 为避免开启总闸后仍为空，打开时同时将详细级别置为 true；而 Web 仅提交修改过的
+     * 字段、不会这么做 —— 同一个开关在两端落地结果不同（App 立刻全量 DEBUG 落盘，Web 不会）。
+     * 现在统一为「总闸只放开 INFO/WARN；要看每个请求一行的 DEBUG 请单独开详细」。
      *
-     * **关闭时也一并关掉 `debug_mode`**（2026-09-26 修）：原来关总闸刻意不动它，本意是
-     * "别把用户手动关掉的详细又翻回来"，实际造成一个关不掉的死循环 —— DebugLogScreen 在总闸
-     * 关闭时会隐藏「详细」chip，想关详细必须先开总闸，而一开总闸上面那条 `alsoVerbose`
-     * 又把详细自动置 true。口径改成「总闸关 = 详细一起关」：两者同生同灭，任何一条路径都能
-     * 把详细收回去，也不会再出现"总闸是关的、详细却留着 true"这种看不见的残留状态。
+     * **关闭时仍一并关掉 `debug_mode`**：总闸关掉后日志页会隐藏「详细」入口，
+     * 保留 true 会形成不可见的残留状态（仅需保留死循环修复的这一半）。
      */
     fun syncLogEnabled(enabled: Boolean) {
-        val alsoVerbose = enabled && !_logSwitchState.value.debugMode
         pushLogSwitches(
             fields = buildMap {
                 put("log_enabled", enabled)
-                if (alsoVerbose) put("debug_mode", true)
                 if (!enabled) put("debug_mode", false)
             },
-            // 连带打开了详细就要说出来，否则用户下次看到"详细"是开的会以为自己记错了
-            successNotice = when {
-                !enabled -> "日志记录已关闭（含详细级别）"
-                alsoVerbose -> "日志记录已开启（含详细级别）"
-                else -> "日志记录已开启"
-            },
+            successNotice = if (enabled) "日志记录已开启" else "日志记录已关闭（含详细级别）",
             applyLocal = { prefs ->
                 prefs.logEnabled = enabled
-                if (alsoVerbose) prefs.debugMode = true
-                if (!enabled) prefs.debugMode = false
-                // 关闸后清掉 app 侧内存缓冲：留着只会让日志页显示一批"已经不再更新"的旧行
-                if (!enabled) AppLogBuffer.clear()
+                if (!enabled) {
+                    prefs.debugMode = false
+                    // 关闸后清掉 app 侧内存缓冲：留着只会让日志页显示一批"已经不再更新"的旧行
+                    AppLogBuffer.clear()
+                }
             },
-            mirror = { s ->
-                s.copy(
-                    logEnabled = enabled,
-                    debugMode = when {
-                        !enabled -> false
-                        alsoVerbose -> true
-                        else -> s.debugMode
-                    }
-                )
-            }
+            mirror = { s -> s.copy(logEnabled = enabled, debugMode = if (enabled) s.debugMode else false) }
         )
     }
 
@@ -3700,12 +4319,12 @@ class ToolsModule(
     /**
      * 读流量限额配置（`getTrafficLimit`）。首页 hero 卡的「本月流量」与「工具-流量管理」同源。
      *
-     * ## 为什么要有 [force]（2026-09-05 掉帧治理）
+     * ## 为什么需要 [force]
      * 本方法的调用点包含 `DashboardScreen` 那条以 `pageForeground` 为 key 的 `LaunchedEffect`
      * —— 每次横滑回到首页都会再进来一次，于是 settle 后必然多一次 REST 回包整页写，
      * 落在胶囊归位的可见运动窗口里（就是"顿一下"）。而限额是**用户设定的配置**，
      * 除了本 App 自己改、或 core 推 `device:traffic-limit`，它根本不会变 ——
-     * 前台化重拉纯属白付重组。
+     * 前台化重拉只会造成无意义的重组。
      *
      * 所以默认走新鲜度闸门（[isForegroundDataFresh]，窗口取
      * [FOREGROUND_REFRESH_INTERVAL_MS]，与首页轮询周期同源；对一个配置项来说这已经很保守）。
@@ -3714,7 +4333,7 @@ class ToolsModule(
      *
      * ## loading 态也只在没数据时写
      * 骨架屏判据是 `state.isLoading && cfg == null`（`TrafficManagementScreen`）——
-     * 有配置时把 `isLoading` 翻成 true 没有任何 UI 效果，只是白付一次重组。
+     * 有配置时把 `isLoading` 翻成 true 没有任何 UI 效果，只会造成一次无意义的重组。
      * 首次加载（`limitConfig == null`）的骨架屏反馈完整保留。
      */
     fun loadTrafficLimit(force: Boolean = false) {
@@ -3774,7 +4393,7 @@ class ToolsModule(
                     "enabled" to enabled, "limit_value" to limitValue, "limit_unit" to limitUnit,
                     "alert_percent" to alertPercent, "auto_clear" to autoClear, "clear_date" to clearDate)
                 // 只在用户确实改过时才发这两个键 —— core 收不到就保持原值，于是
-                // 「启用流量限额」这类只带设备参数的调用不会顺手把自动关网关掉。
+                // 「启用流量限额」这类只带设备参数的调用不会一并关闭自动关网关。
                 autoOffEnabled?.let { body["auto_off_enabled"] = it }
                 autoOffRestore?.let { body["auto_off_restore"] = it }
                 val resp = api.setDataLimit(body)
@@ -3790,7 +4409,7 @@ class ToolsModule(
     }
 
     /**
-     * 保存套餐档案（2026-10-07，POST /api/device/plan）。
+     * 保存套餐档案（POST /api/device/plan）。
      *
      * monthly 模式：只切模式，fixed 专属键由 core 自清。
      * fixed 模式：生效日（yyyy-MM-dd）+ 天数 + 到期提醒天数；保存后调用方应把设备侧
@@ -3812,7 +4431,7 @@ class ToolsModule(
         }
     }
 
-    /** 拉套餐档案（2026-10-07）：失败静默（monthly 是缺省语义，拉不到就当没配） */
+    /** 拉取套餐档案：失败静默（monthly 是缺省语义，拉不到视为未配置） */
     fun loadPlanProfile() {
         scope.launch {
             runCatching { api.getPlanProfile() }.onSuccess { plan ->
@@ -3877,7 +4496,7 @@ class ToolsModule(
      * 左右翻页：[forward] 为 false 看上一段（前一天/周/月/年），为 true 看下一段。
      *
      * 锚点直接取接口回的 `prev_anchor` / `next_anchor`，不在客户端做日历运算 ——
-     * 月有 28~31 天、闰年、DST 这些坑 core 侧已经用 `java.time` 处理过一遍了。
+     * 月份 28~31 天、闰年、DST 等边界情况 core 侧已由 `java.time` 处理。
      * 往未来翻在 `has_next` 为 false 时被挡住：翻过去只有一屏空柱，不如不动。
      */
     fun shiftTrafficHistory(forward: Boolean) {
@@ -3905,7 +4524,7 @@ class ToolsModule(
      *
      * ## loading 态只在"这一段还没有数据"时写
      * 卡片判据是 `isLoading && data == null`。已经有图时翻 `isLoading` 不改变任何像素，
-     * 只是白付一次重组；翻页时旧图还在屏幕上，翻它反而让人以为图丢了。
+     * 只会造成一次无意义的重组；翻页时旧图仍在屏幕上，翻它反而让人以为图丢了。
      */
     fun loadTrafficHistory(force: Boolean = false) {
         val snapshot = _trafficHistoryState.value
@@ -3955,12 +4574,12 @@ class ToolsModule(
     }
 
     /**
-     * 预热**其余三个区间**的当前段（2026-09-16）。
+     * 预热**其余三个区间**的当前段。
      *
      * 为什么要预热：四个区间各存一份数据（[trafficHistorySuccessElapsed] 的注释解释了为什么
      * 不能共用一个新鲜度戳），于是"没打开过的区间"第一次切过去时 `data == null` ——
      * 界面会先掉成"—" + 空图，等接口回来再填一次，用户看到的是**两跳**而不是一次滚动。
-     * 打开弹窗时顺手把另外三个拉回来，切过去就是现成的。
+     * 打开弹窗时一并拉取其余三个区间，切换后即可直接使用。
      *
      * 三条刻意的约束：
      * - **只预热 anchor = null 的当前段**。翻页的历史段是无穷多的，预热它们没有边界。
@@ -4002,12 +4621,12 @@ class ToolsModule(
      * [password] 为 null/空白时**不发送该字段** —— core 的 `PUT /api/config` 对缺失键是
      * `?: return` 跳过，所以不传就等于「保持 core 现有密码不变」。这样本地就不需要留明文副本。
      *
-     * ## 2026-09-22：改成等结果并返回（阶段 3.2）
+     * ## 改为等待结果并返回
      * 原来是 fire-and-forget、失败只 `DebugLog.w`，而调用方（`ServerConfigScreen` 的
      * 「设备后台」弹窗）在调用完就关窗 + 弹绿色「设备后台配置已保存」—— 典型的假成功：
      * core 没起来、地址被拒，界面照样说保存好了。
      *
-     * `rejected_fields` 命中我们这次发的键也算失败：core 会返回 `success:true` 但把该字段
+     * `rejected_fields` 命中本次请求发送的键也算失败：core 会返回 `success:true` 但把该字段
      * 放进 `rejected_fields`（口径同 [pushLogSwitches] 的 `updated_fields` 校验），
      * 只看 HTTP 200 就是把"被拒"读成"成功"。
      *
@@ -4061,7 +4680,7 @@ class ToolsModule(
             // 这是「在任务页不动、也能看到变化」的唯一来源 —— 任务列表没有轮询。
             changedType == WsDataTopic.TASK_LIST -> loadTaskList()
             changedType == WsDataTopic.TASK_RULES -> loadRuleList()
-            // 2026-10-05 P5（修 G1）：WS 重连 sentinel —— 工具域按既有入口补拉一轮
+            // WS 重连 sentinel —— 工具域按既有入口补拉一轮
             //（console 历史 + 任务/规则列表；其余各函数自带闸门/幂等，无风暴风险）
             changedType == WsDataTopic.RECONNECTED -> {
                 refreshConsoleHistory(CONSOLE_CHANNEL_AT)
@@ -4072,7 +4691,7 @@ class ToolsModule(
         }
     }
 
-    // ── 真 PTY 终端（ttyd，2026-10-07）──
+    // ── 真 PTY 终端（ttyd）──
 
     /**
      * ttyd 配置三元组：(enabled 开关, running 设备上进程是否在跑, expired 会话是否已过期)。
@@ -4097,8 +4716,108 @@ class ToolsModule(
         api.ttydStop()
     }
 
+    // ── 远程屏幕 ──
+
     /**
-     * 签发真 PTY 票据并交给 [connect] 建立 WS 会话（app 端原生终端入口，2026-10-10）。
+     * 投屏开关状态。读失败返回 null —— 调用方必须区分「关」和「读不到」，
+     * 否则网络瞬断会被画成「功能未开启」，用户会去乱点开关。
+     */
+    suspend fun screenEnabled(): Boolean? = runCatching {
+        api.screenStatus().jsonObject["enabled"]?.jsonPrimitive?.booleanOrNull
+    }.getOrNull()
+
+    /**
+     * 打开/关闭投屏开关。
+     *
+     * 走 `PUT /api/config` 而不是自造端点：配置写入只有这一个入口，
+     * 键名/校验/`updated_fields` 的语义都在那里。
+     *
+     * @return null = 成功；非 null 是一句可以直接显示给用户的原因。
+     *   把错误文案收在这里而不是抛给页面：`feature-*` 模块不依赖 retrofit，
+     *   页面拿不到 `HttpException.code()`，只能显示"HTTP 401"这种没用的东西。
+     */
+    suspend fun setScreenEnabled(enabled: Boolean): String? = runCatching {
+        api.updateConfig(mapOf("screen_enabled" to enabled))
+        null
+    }.getOrElse { e ->
+        // 协程取消不是"失败"：吞掉会让页面显示一句 "The coroutine scope left the composition"
+        if (e is kotlinx.coroutines.CancellationException) throw e
+        when ((e as? retrofit2.HttpException)?.code()) {
+            403 -> carrierErrorMessage(e) ?: "没有权限修改该开关"
+            else -> carrierErrorMessage(e) ?: "开启失败：${e.javaClass.simpleName}"
+        }
+    }
+
+    /**
+     * 换一张投屏票据（`POST /api/screen/session`）。
+     *
+     * 票据 60 秒过期、**一次性**：每次连接/重连都要重新换。返回 null = 拿不到
+     * （403 开关未开、503 adb 不可用、网络断了）—— 调用方按"控制通道建不起来"处理，
+     * 而不是当成画面失败：快照模式没有控制通道也能出图。
+     */
+    suspend fun screenTicket(params: com.ufi_axis.data.screen.ScreenStreamClient.VideoParams): ScreenTicket? =
+        runCatching {
+            val o = api.screenSession(
+                mapOf(
+                    "max_size" to params.maxSize,
+                    "max_fps" to params.maxFps,
+                    "bit_rate" to params.bitRate,
+                )
+            ).jsonObject
+            val ticket = o["ticket"]?.jsonPrimitive?.contentOrNull ?: return@runCatching null
+            ScreenTicket(
+                ticket = ticket,
+                // ★ 回显的是**服务端钳制后**的实际值。UI 必须拿它回写滑块，
+                // 否则用户设置的数值被服务端钳制后，UI 仍显示原值，表现为「修改未生效」。
+                maxSize = o["max_size"]?.jsonPrimitive?.intOrNull ?: params.maxSize,
+                maxFps = o["max_fps"]?.jsonPrimitive?.intOrNull ?: params.maxFps,
+                bitRate = o["bit_rate"]?.jsonPrimitive?.intOrNull ?: params.bitRate,
+            )
+        }.getOrNull()
+
+    /**
+     * 取一张设备截图（PNG）。
+     *
+     * 四种结果各有各的处置，见 [com.ufi_axis.data.screen.ScreenShot] 的注释；这里只补两点：
+     * 1. **contentType 不是 image/\* 一律算失败**。`/api/screen/screenshot` 若在 core 侧丢失，
+     *    请求会落到 SPA 兜底并回 `200 text/html` —— 那是个 200，光看状态码永远发现不了。
+     * 2. 403/429 走专用分支而不是拼字符串：轮询端要靠它们决定"开开关"还是"跳过这一拍"。
+     */
+    suspend fun screenShot(): com.ufi_axis.data.screen.ScreenShot = runCatching {
+        val body = api.screenScreenshot()
+        val type = body.contentType()?.toString().orEmpty()
+        // ★ 读 body 必须切到 IO：`@Streaming` 下 Retrofit 只把 socket 交给调用方，
+        // `bytes()` 的阻塞读发生在**当前线程** —— 在主线程上就是 NetworkOnMainThreadException
+        // 真机表现为：截图始终失败，仅在响应恰好已被 OkHttp 缓冲完成时偶尔成功。
+        val bytes = withContext(Dispatchers.IO) { body.bytes() }
+        if (!type.startsWith("image/")) {
+            body.close()
+            return@runCatching com.ufi_axis.data.screen.ScreenShot.Failed(
+                "接口返回了非图片内容（${type.ifBlank { "未知类型" }}，${bytes.size}B）：core 可能缺少 /api/screen/screenshot"
+            )
+        }
+        if (bytes.isEmpty()) {
+            com.ufi_axis.data.screen.ScreenShot.Failed("截图响应为空")
+        } else {
+            com.ufi_axis.data.screen.ScreenShot.Ok(bytes)
+        }
+    }.getOrElse { e ->
+        if (e is kotlinx.coroutines.CancellationException) throw e
+        when ((e as? retrofit2.HttpException)?.code()) {
+            403 -> com.ufi_axis.data.screen.ScreenShot.Disabled
+            // 429 = 上一张还没跑完。轮询端应跳过这一拍，绝不能当错误弹出来
+            429 -> com.ufi_axis.data.screen.ScreenShot.Busy
+            503 -> com.ufi_axis.data.screen.ScreenShot.Failed(
+                carrierErrorMessage(e) ?: "设备截图失败（adb 通道不可用 / display 未就绪）"
+            )
+            else -> com.ufi_axis.data.screen.ScreenShot.Failed(
+                carrierErrorMessage(e) ?: "截图失败：${e.javaClass.simpleName}"
+            )
+        }
+    }
+
+    /**
+     * 签发真 PTY 票据并交给 [connect] 建立 WS 会话（App 端原生终端入口）。
      *
      * 票据端点走标准头部鉴权（Bearer + 设备签名），成功即证明调用方过了完整鉴权；
      * 403 = `ttyd_enabled` 开关未开（core 侧的安全边界），这里把原因写进 UI 可见的
@@ -4125,4 +4844,11 @@ class ToolsModule(
 private data class ConsoleHistoryPayload(
     val at: List<ConsoleMessage> = emptyList(),
     val shell: List<ConsoleMessage> = emptyList()
+)
+/** `/api/screen/session` 的签发结果（含服务端钳制后的实际参数）。 */
+data class ScreenTicket(
+    val ticket: String,
+    val maxSize: Int,
+    val maxFps: Int,
+    val bitRate: Int,
 )

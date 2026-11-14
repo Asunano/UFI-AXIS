@@ -15,7 +15,7 @@ import com.ufi_axis.viewmodel.MainViewModel
 /**
  * 频段锁定 — 独立页面（路由 detail/band-lock）。
  * 由 NetworkScreen「频段锁定」导航进入，自带返回按钮（UfiScreenScaffold）。
- * 复用 BandLockSection 组件（定义在 NetworkScreen.kt，同 package 可见）。
+ * 复用 BandLockSection 组件（定义在 BandLockSection.kt，同 package 可见）。
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -32,7 +32,7 @@ fun BandLockScreen(viewModel: MainViewModel, navController: NavHostController) {
         navController = navController,
         showBack = true,
         actions = {
-            IconButton(onClick = { viewModel.network.loadBandStatus() }) {
+            IconButton(onClick = { viewModel.network.loadBandStatus(force = true) }) {
                 Icon(Icons.Default.Refresh, null)
             }
         }

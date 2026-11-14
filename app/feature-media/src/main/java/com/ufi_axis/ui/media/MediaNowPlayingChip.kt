@@ -79,6 +79,7 @@ import com.ufi_axis.ui.theme.UfiTextStyles
 import com.ufi_axis.util.AppPreferences
 import com.ufi_axis.viewmodel.MainViewModel
 import kotlinx.coroutines.delay
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 /**
  * 「正在播放」的当前状态（进程级单例）。
@@ -404,7 +405,7 @@ fun UfiAudioNowPlayingChip(navController: NavHostController) {
             modifier = Modifier
                 .widthIn(max = CHIP_TEXT_MAX_WIDTH)
                 .clip(RoundedCornerShape(Spacing.Small))
-                .clickable { navController.navigate(mediaRouteOf("media/audio", mediaId)) }
+                .clickable { navController.ufiNavigateOnce(mediaRouteOf("media/audio", mediaId)) }
                 .padding(horizontal = 2.dp),
             horizontalAlignment = Alignment.End
         ) {
@@ -527,7 +528,7 @@ fun UfiAudioNowPlayingChip(navController: NavHostController) {
             onDismiss = { dialogOpen = false },
             onGoToPlayer = {
                 dialogOpen = false
-                navController.navigate(mediaRouteOf("media/audio", mediaId))
+                navController.ufiNavigateOnce(mediaRouteOf("media/audio", mediaId))
             }
         )
     }

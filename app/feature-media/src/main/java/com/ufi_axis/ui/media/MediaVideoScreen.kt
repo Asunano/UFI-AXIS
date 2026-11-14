@@ -63,6 +63,7 @@ import com.ufi_axis.viewmodel.state.AUDIO_SCOPE_ALL
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
+import com.ufi_axis.ui.navigation.ufiNavigateOnce
 
 
 /**
@@ -145,7 +146,7 @@ fun MediaVideoScreen(
         runCatching {
             AppPreferences(context).addMediaRecentPlay(MEDIA_TYPE_VIDEO, item.path, item.name, item.id)
         }
-        navController.navigate(mediaRouteOf("media/video", item.path))
+        navController.ufiNavigateOnce(mediaRouteOf("media/video", item.path))
     }
 
     /** 下载：入队 + 唤起 Worker。子目录按"相对当前根"镜像，避免全平铺互相覆盖。 */
@@ -224,7 +225,7 @@ fun MediaVideoScreen(
         navController = navController,
         showBack = true,
         actions = {
-            IconButton(onClick = { navController.navigate(Routes.MEDIA_VIDEO_SETTINGS) }) {
+            IconButton(onClick = { navController.ufiNavigateOnce(Routes.MEDIA_VIDEO_SETTINGS) }) {
                 Icon(
                     Icons.Default.Settings,
                     contentDescription = "视频设置",

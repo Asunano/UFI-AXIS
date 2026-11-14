@@ -30,9 +30,9 @@ import com.ufi_axis.viewmodel.state.PairedDeviceItem
 /**
  * 配对与访问：本机配对信息、已配对设备列表、配对数量限制、解除全部配对。
  *
- * 配对密码是本页所有破坏性操作的门禁（配对确认、移除设备、解除全部配对都校验它），
- * 但**修改入口已于 2026-10-24 移到「服务器 → 服务器配置 → 连接配置」**（与设备后台
- * 同一套两页签布局），本页不再提供修改，只保留校验用途。
+ * 配对密码只在「配对确认」与「解除全部配对」两处校验（2026-11-03：移除设备与黑名单
+ * 的二次确认已撤销，只要求已配对身份）。**修改入口已于 2026-10-24 移到
+ * 「服务器 → 服务器配置 → 连接配置」**（与设备后台同一套两页签布局），本页不再提供修改。
  *
  * 视觉与交互一律走 `ui/components/common` 的公共组件（2026-09-10 收敛：卡内标题、
  * 信息格、设备行、分隔线、进度条、按钮、弹窗按钮此前都是本页手搓）。
@@ -50,6 +50,8 @@ fun PairingConfigScreen(
     var maxDevices by remember { mutableIntStateOf(0) }
     // 安全中心：批准策略与三个外部通知渠道（2026-10-15，默认全关）
     var approvalRequired by remember { mutableStateOf(false) }
+    // 破坏性操作的主人口令门（默认关）。打开后只影响不可逆操作，安装/更新不受影响。
+    var ownerGateEnabled by remember { mutableStateOf(false) }
     var notifySystem by remember { mutableStateOf(false) }
     var notifyEmail by remember { mutableStateOf(false) }
     var notifyWebhook by remember { mutableStateOf(false) }
@@ -89,6 +91,7 @@ fun PairingConfigScreen(
             pairingEnabled = pairingState.pairingEnabled
             maxDevices = pairingState.pairingMaxDevices
             approvalRequired = pairingState.approvalRequired
+            ownerGateEnabled = pairingState.ownerGateEnabled
             notifySystem = pairingState.notifySystem
             notifyEmail = pairingState.notifyEmail
             notifyWebhook = pairingState.notifyWebhook
@@ -331,6 +334,30 @@ fun PairingConfigScreen(
                     }
                 }
 
+                // ═══════════ 安全中心：破坏性操作保护（默认关） ═══════════
+                //
+                // 刻意不铺到「安装 / 更新 / 隧道」—— 那些操作可重做，拦它的收益远小于打断
+                // 用户的成本。2026-10-30 那版把门铺到 40 个端点，实机反馈是「装个程序也要输密码」。
+                UfiSettingsRowCard(
+                    contentPadding = PaddingValues(horizontal = Spacing.XLarge, vertical = Spacing.Small)
+                ) {
+                    UfiSettingsToggle(
+                        title = "不可逆操作需配对密码",
+                        description = if (ownerGateEnabled) {
+                            "恢复出厂、恢复备份、root shell、删全部日志、移除设备等操作需输入配对密码"
+                        } else {
+                            "关闭时不额外要密码；安装 APK、装程序、组件更新、隧道配置始终不受影响"
+                        },
+                        checked = ownerGateEnabled,
+                        onCheckedChange = {
+                            ownerGateEnabled = it
+                            viewModel.network.updatePairingConfig(
+                                pairingEnabled, maxDevices, ownerGateEnabled = it
+                            )
+                        }
+                    )
+                }
+
                 // ═══════════ 配对限制配置 ═══════════
                 UfiSettingsRowCard(
                     contentPadding = PaddingValues(horizontal = Spacing.XLarge, vertical = Spacing.Small)
@@ -440,13 +467,14 @@ fun PairingConfigScreen(
         )
     }
 
-    // ─ 移除单个设备（阶段3：需配对密码，DELETE /api/pairing/devices/{fp}） ──
+    // ─ 移除单个设备（阶段3：DELETE /api/pairing/devices/{fp}） ──
     // 按钮走 actions 槽位而不是塞进 body：塞进 body 会让底部按钮参与内容滚动，
     // 且 footer 高度预算算不准（见 UfiScrollableDialog 的 FIX-24）。
-    pendingRemoveFp?.let { fp ->
-        var pwd by remember(fp) { mutableStateOf("") }
+    val dialogPendingRemoveFp = rememberLastNonNull(pendingRemoveFp)
+    if (dialogPendingRemoveFp != null) {
+        val fp = dialogPendingRemoveFp
         UfiScrollableDialog(
-            visible = true,
+            visible = pendingRemoveFp != null,
             onDismiss = { pendingRemoveFp = null },
             title = "移除设备",
             icon = rememberVectorPainter(Icons.Filled.Link),
@@ -455,25 +483,19 @@ fun PairingConfigScreen(
                 UfiDialogActions(
                     onDismiss = { pendingRemoveFp = null },
                     onConfirm = {
-                        viewModel.network.removeDevice(fp, pwd)
+                        viewModel.network.removeDevice(fp)
                         pendingRemoveFp = null
                     },
                     confirmText = "移除",
-                    confirmDestructive = true,
-                    enabled = pwd.isNotBlank()
+                    confirmDestructive = true
                 )
             }
         ) {
             UfiDialogBody {
                 Text(
-                    "移除后该客户端需要重新配对才能连接。请输入配对密码确认。",
+                    "移除后该客户端需要重新配对才能连接。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.textSecondary
-                )
-                UfiDialogPasswordField(
-                    label = "配对密码",
-                    value = pwd,
-                    onValueChange = { pwd = it }
                 )
             }
         }
@@ -486,15 +508,16 @@ fun PairingConfigScreen(
     // 这里保留 `loadApprovals()`（进页面时刷一次，让下面的待批准提示与状态一致），
     // 但**不再**自己弹窗，避免同一个请求弹两次。
 
-    // ─ 拉黑设备（2026-10-15：POST /api/pairing/blacklist，需配对密码） ──
+    // ─ 拉黑设备（2026-10-15：POST /api/pairing/blacklist） ──
     //
     // 与「移除设备」的区别写进正文了：用户最容易误解的就是"移除=拉黑"。
     // hwId 一并提交：指纹是权威键但清 App 数据就换，hwId 跨重装稳定 —— 两条一起才挡得住
     // "清数据再配对"。它可伪造，所以只算提高门槛。
-    pendingBlockItem?.let { item ->
-        var pwd by remember(item.fingerprint) { mutableStateOf("") }
+    val dialogPendingBlockItem = rememberLastNonNull(pendingBlockItem)
+    if (dialogPendingBlockItem != null) {
+        val item = dialogPendingBlockItem
         UfiScrollableDialog(
-            visible = true,
+            visible = pendingBlockItem != null,
             onDismiss = { pendingBlockItem = null },
             title = "拉黑设备",
             showCloseButton = false,
@@ -502,17 +525,15 @@ fun PairingConfigScreen(
                 UfiDialogActions(
                     onDismiss = { pendingBlockItem = null },
                     onConfirm = {
-                        viewModel.network.blockDevice(
+                        viewModel.network.blockPairingDevice(
                             fingerprint = item.fingerprint,
                             name = item.deviceName,
-                            hwId = item.hwId,
-                            password = pwd
+                            hwId = item.hwId
                         )
                         pendingBlockItem = null
                     },
                     confirmText = "拉黑",
-                    confirmDestructive = true,
-                    enabled = pwd.isNotBlank()
+                    confirmDestructive = true
                 )
             }
         ) {
@@ -520,25 +541,20 @@ fun PairingConfigScreen(
                 Text(
                     "拉黑后这台设备不能重新配对、也不能用配对密码登录；若它当前在线会立刻掉线。" +
                         "即使它清除 App 数据换了密钥，也会被硬件标识挡住。\n\n" +
-                        "与「移除设备」不同：移除只是撤销授权，对方拿密码还能回来；拉黑是明确拒绝。" +
-                        "解除拉黑需要配对密码。",
+                        "与「移除设备」不同：移除只是撤销授权，对方拿密码还能回来；拉黑是明确拒绝。",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.textSecondary
-                )
-                UfiDialogPasswordField(
-                    label = "配对密码",
-                    value = pwd,
-                    onValueChange = { pwd = it }
                 )
             }
         }
     }
 
-    // ─ 解除拉黑 / 全部解除（同一套密码门禁） ──
-    pendingUnblockItem?.let { item ->
-        var pwd by remember(item.fingerprint) { mutableStateOf("") }
+    // ─ 解除拉黑 / 全部解除 ──
+    val dialogPendingUnblockItem = rememberLastNonNull(pendingUnblockItem)
+    if (dialogPendingUnblockItem != null) {
+        val item = dialogPendingUnblockItem
         UfiScrollableDialog(
-            visible = true,
+            visible = pendingUnblockItem != null,
             onDismiss = { pendingUnblockItem = null },
             title = "解除拉黑",
             showCloseButton = false,
@@ -546,11 +562,10 @@ fun PairingConfigScreen(
                 UfiDialogActions(
                     onDismiss = { pendingUnblockItem = null },
                     onConfirm = {
-                        viewModel.network.unblockDevice(item.fingerprint, pwd)
+                        viewModel.network.unblockPairingDevice(item.fingerprint)
                         pendingUnblockItem = null
                     },
-                    confirmText = "解除",
-                    enabled = pwd.isNotBlank()
+                    confirmText = "解除"
                 )
             }
         ) {
@@ -561,19 +576,12 @@ fun PairingConfigScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.textSecondary
                 )
-                UfiDialogPasswordField(
-                    label = "配对密码",
-                    value = pwd,
-                    onValueChange = { pwd = it }
-                )
             }
         }
     }
 
-    if (showClearBlacklistDialog) {
-        var pwd by remember { mutableStateOf("") }
         UfiScrollableDialog(
-            visible = true,
+            visible = showClearBlacklistDialog,
             onDismiss = { showClearBlacklistDialog = false },
             title = "全部解除拉黑",
             showCloseButton = false,
@@ -581,12 +589,11 @@ fun PairingConfigScreen(
                 UfiDialogActions(
                     onDismiss = { showClearBlacklistDialog = false },
                     onConfirm = {
-                        viewModel.network.clearBlacklist(pwd)
+                        viewModel.network.clearBlacklist()
                         showClearBlacklistDialog = false
                     },
                     confirmText = "全部解除",
-                    confirmDestructive = true,
-                    enabled = pwd.isNotBlank()
+                    confirmDestructive = true
                 )
             }
         ) {
@@ -596,14 +603,8 @@ fun PairingConfigScreen(
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.textSecondary
                 )
-                UfiDialogPasswordField(
-                    label = "配对密码",
-                    value = pwd,
-                    onValueChange = { pwd = it }
-                )
             }
         }
-    }
 
     // 2026-10-24：修改配对密码的弹窗已搬到 `ServerConfigScreen` 的「连接配置 → 配对密码」
     // 页签（与设备后台同一套布局）。本页不再持有任何修改入口。
@@ -616,9 +617,8 @@ fun PairingConfigScreen(
      * 系统通知是那种状态下唯一的快通道，而它默认关。不改默认值，但在这唯一一个
      * "用户主动打开批准"的时刻把利弊说清，并给一键开启。
      */
-    if (showApprovalNotifyHint) {
         UfiScrollableDialog(
-            visible = true,
+            visible = showApprovalNotifyHint,
             onDismiss = { showApprovalNotifyHint = false },
             title = "建议同时开启系统通知",
             showCloseButton = false,
@@ -647,16 +647,15 @@ fun PairingConfigScreen(
                 )
             }
         }
-    }
 
     // ── 解除全部配对确认（2026-10-21：改为**必须输入配对密码**，审计 §B1） ──
     //
     // 之前这条是"点一下全部踢掉"，而「移除单台」反倒要密码 —— 破坏性最强的操作门槛最低，
     // 双因素等于被绕过。core 的两条 unpair 端点已同步收紧，这里补输入框。
-    if (showUnpairDialog) {
-        var pwd by remember { mutableStateOf("") }
-        UfiScrollableDialog(
-            visible = true,
+    // 密码状态提到外面：弹窗要保持挂载才能在关闭时播离场动画。
+    var pwd by remember { mutableStateOf("") }
+    UfiScrollableDialog(
+        visible = showUnpairDialog,
             onDismiss = { showUnpairDialog = false },
             title = "解除全部配对",
             showCloseButton = false,
@@ -689,7 +688,6 @@ fun PairingConfigScreen(
                 )
             }
         }
-    }
 }
 
 /** 格式化 epoch millis 为 "yyyy-MM-dd HH:mm"（本地时区）；非法/0 返回 "—"。 */
