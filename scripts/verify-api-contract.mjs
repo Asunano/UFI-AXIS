@@ -106,7 +106,10 @@ const VERB = /(?<![.\w])(get|post|put|delete|patch|head|options|webSocket)\s*\(\
 const VERB_NOPATH = /(?<![.\w])(get|post|put|delete|patch|head|options|webSocket)\s*\{/g
 const ROUTE_EXT_DEF = /\b(?:fun\s+Route\s*\.\s*(\w+)\s*\(|class\s+(\w+Routes)\b)/
 // 两种挂载写法：扩展函数 `alertRoutes(...)`；或类实例 `pairingRoutes.register(this)`
-const ROUTE_MOUNT = /\b(\w*[Rr]outes)\s*(?:\?)?\s*(?:\.\s*register\s*\(|\()/g
+// `register(` 之外还有 registerPublic / registerAuthed（配对审批就分这两处挂载），
+// 只认 `register(` 会让这些路由丢掉父级前缀，把 `/pairing/approval-status`
+// 记成 `/approval-status`，客户端调用因此被误报为「core 不存在」。
+const ROUTE_MOUNT = /\b(\w*[Rr]outes)\s*(?:\?)?\s*(?:\.\s*(register\w*)\s*\(|\()/g
 
 
 /**
@@ -115,8 +118,35 @@ const ROUTE_MOUNT = /\b(\w*[Rr]outes)\s*(?:\?)?\s*(?:\.\s*register\s*\(|\()/g
  * 决定了 `AlertRoutes.kt` 中 `get("/list")` 的真实路径是 `/api/alerts/list`。
  * 不解析这层映射就无法还原完整路径，会把 core 已有的端点误报为缺失。
  */
+/**
+ * `val xxxRoutes = XxxDeviceRoutes(...)`：变量名与类名常常对不上
+ * （配对审批就是 `pairedApprovalRoutes = PairedDeviceApprovalRoutes(...)`）。
+ *
+ * 挂载点在 HttpServer 里写的是**变量名**，而 `parseCore` 是按**类名/扩展函数名**查前缀，
+ * 不建这层别名就会让这些路由丢掉 `/pairing`，把客户端调用误报成「core 不存在」。
+ */
+function parseSymbolAliases() {
+  const aliases = new Map() // 变量名(lower) -> 类名(lower)
+  for (const f of walk(join(ROOT, 'core'), ['.kt'])) {
+    if (f.includes(`${join('src', 'test')}`)) continue
+    const text = readFileSync(f, 'utf8')
+    // 构造常跨行、且常写全限定名：
+    //     val pairedApprovalRoutes =
+    //         com.ufi_axis_core.api.routes.PairedDeviceApprovalRoutes(...)
+    const re = /\bval\s+(\w+)\s*(?::\s*[\w.]+\??\s*)?=\s*([\w.]+)\s*\(/g
+    let m
+    while ((m = re.exec(text)) !== null) {
+      aliases.set(m[1].toLowerCase(), m[2].split('.').pop().toLowerCase())
+    }
+  }
+  return aliases
+}
+
 function parseMountPrefixes() {
-  const prefixes = new Map() // 扩展函数名 -> 挂载前缀
+  // 扩展函数名 -> 挂载前缀集合。同一份路由可能既挂在 `/pairing`（免鉴权）
+  // 又挂在 `/api/pairing`（需鉴权），只记一个会把另一条路径漏掉。
+  const prefixes = new Map()
+  const aliases = parseSymbolAliases()
   const files = walk(join(ROOT, 'core'), ['.kt']).filter((f) =>
     /HttpServer\.kt$/.test(f)
   )
@@ -133,8 +163,25 @@ function parseMountPrefixes() {
       let m
       ROUTE_MOUNT.lastIndex = 0
       while ((m = ROUTE_MOUNT.exec(line)) !== null) {
+        // 同一个类可能分多处挂载（`registerPublic` 在 /pairing、`registerAuthed` 在 /api），
+        // 只按类记前缀会把公开端点也算到 /api 下（/api/approval-status 这种幽灵路径）。
+        // 所以先记一份「类.方法」的精确前缀。
+        const method = (m[2] || '').toLowerCase()
+        if (method) {
+          // 变量名与类名可能不同（`pairedApprovalRoutes = PairedDeviceApprovalRoutes`），
+          // 方法级键两种都记，parseCore 里按类名查得到。
+          const names = [m[1].toLowerCase(), aliases.get(m[1].toLowerCase())].filter(Boolean)
+          for (const n of names) {
+            const mk = `${n}.${method}`
+            if (!prefixes.has(mk)) prefixes.set(mk, new Set())
+            prefixes.get(mk).add(prefix)
+          }
+        }
         const key = m[1].toLowerCase()
-        if (!prefixes.has(key)) prefixes.set(key, prefix)
+        for (const k of [key, aliases.get(key)].filter(Boolean)) {
+          if (!prefixes.has(k)) prefixes.set(k, new Set())
+          prefixes.get(k).add(prefix)
+        }
       }
 
       for (const ch of line) {
@@ -163,15 +210,25 @@ function parseCore() {
     /** 每个元素 = { prefix, depth }，depth 为该 route 块开始时的花括号深度 */
     const stack = []
     let depth = 0
-    let mountPrefix = ''
+    let mountPrefixes = ['']
+    let symbol = ''
     for (const rawLine of lines) {
       const line = rawLine.replace(/\/\/.*$/, '')
       const before = depth
 
+      // 前缀只在**声明处**更新，不能每行都回退到文件级 ——
+      // 否则 `fun registerPublic` 里设好的 `/pairing` 会被下一行的文件级集合
+      // （含 `registerAuthed` 的 `/api`）覆盖，公开端点又被算到 `/api` 下。
       const fnDef = line.match(ROUTE_EXT_DEF)
       if (fnDef) {
-        const name = (fnDef[1] || fnDef[2] || '').toLowerCase()
-        if (mounts.has(name)) mountPrefix = mounts.get(name)
+        symbol = (fnDef[1] || fnDef[2] || '').toLowerCase()
+        mountPrefixes = symbol && mounts.has(symbol) ? [...mounts.get(symbol)] : ['']
+      }
+      // 方法级优先：`fun registerPublic(...)` 与 `fun registerAuthed(...)` 挂载前缀不同
+      const mdef = line.match(/\bfun\s+(register\w+)\s*\(/)
+      if (mdef) {
+        const methodKey = `${symbol}.${mdef[1].toLowerCase()}`
+        if (mounts.has(methodKey)) mountPrefixes = [...mounts.get(methodKey)]
       }
 
 
@@ -180,23 +237,27 @@ function parseCore() {
         stack.push({ prefix: routeMatch[1], depth: before })
       }
 
-      const prefix = [mountPrefix, ...stack.map((s) => s.prefix)].join('/')
+      const inner = stack.map((s) => s.prefix).join('/')
 
 
       let m
-      VERB.lastIndex = 0
-      while ((m = VERB.exec(line)) !== null) {
-        const p = norm(prefix + '/' + m[2])
-        if (!p) continue
-        if (!found.has(p)) found.set(p, new Set())
-        found.get(p).add(relative(ROOT, file))
-      }
-      VERB_NOPATH.lastIndex = 0
-      while ((m = VERB_NOPATH.exec(line)) !== null) {
-        const p = norm(prefix)
-        if (!p) continue
-        if (!found.has(p)) found.set(p, new Set())
-        found.get(p).add(relative(ROOT, file))
+      FOR_PREFIX:
+      for (const mp of mountPrefixes) {
+        const prefix = [mp, inner].join('/')
+        VERB.lastIndex = 0
+        while ((m = VERB.exec(line)) !== null) {
+          const p = norm(prefix + '/' + m[2])
+          if (!p) continue
+          if (!found.has(p)) found.set(p, new Set())
+          found.get(p).add(relative(ROOT, file))
+        }
+        VERB_NOPATH.lastIndex = 0
+        while ((m = VERB_NOPATH.exec(line)) !== null) {
+          const p = norm(prefix)
+          if (!p) continue
+          if (!found.has(p)) found.set(p, new Set())
+          found.get(p).add(relative(ROOT, file))
+        }
       }
 
       // 更新花括号深度并弹出已闭合的 route 块
@@ -237,7 +298,11 @@ const WEB_CALL = /\b(?:api|axios|http|request)\s*\.\s*(?:get|post|put|delete|pat
 const WEB_LITERAL = /([`'"])(\/api\/[^`'"\s]*)\1/g
 
 function parseWeb() {
-  const files = walk(join(ROOT, 'web', 'src'), ['.ts', '.js', '.vue', '.tsx'])
+  // 跳过测试文件：`.spec.ts` 里那些字符串是**测试夹具**（`toSignableUri('http://h:1/api/x')`），
+  // 不是客户端真的会调的端点，扫进来就是稳定的假阳性。
+  const files = walk(join(ROOT, 'web', 'src'), ['.ts', '.js', '.vue', '.tsx']).filter(
+    (f) => !/\.(spec|test)\.[tj]sx?$/.test(f)
+  )
   const found = new Map()
   const add = (p, file) => {
     if (!p || !isContractPath(p)) return
@@ -459,7 +524,9 @@ function parseWsChannels() {
  */
 function coreHas(corePaths, clientPath) {
   if (corePaths.has(clientPath)) return true
-  const tail = clientPath.replace(/^api\//, '')
+  // core 侧归一化后不带前导斜杠（`pairing/approval-status`），客户端路径是带斜杠的
+  // （`/pairing/approval-status`）。只剥 `api/` 的话，非 `/api` 开头的路径永远匹配不上。
+  const tail = clientPath.replace(/^api\//, '').replace(/^\//, '')
   if (!tail) return false
   for (const cp of corePaths.keys()) {
     if (cp === tail || cp.endsWith('/' + tail)) return true
